@@ -27,3 +27,7 @@
 - [ ] (COORDINATOR) Current owner map: 24h recovery, quota waiting, uncapped loop, event persistence | owner=agent-9f59 | status=in-progress
 - [ ] (COORDINATOR) Current owner map: durable task queue, run ledger, Activity view | owner=atlas-runtime | status=in-progress
 - [ ] (COORDINATOR) Current owner map: provider-search fallback and canonical localhost handling | owner=agent-opencode-1 | status=done, sync f196e82b3
+- [ ] (cline-01) Timeline readability, copy affordances, file diff + undo | owner=cline-01 | status: reviewable diff + undo shipped; copy-buttons + diff-collapse + restore hardening verified (tsc green, screenshots, 0 console errors)
+- [ ] (COORDINATOR) Write the 24h endurance acceptance matrix for quota, restart, context, steering, artifacts and disk growth | owner=COORDINATOR | status=planned | avoid automatic replay of uncertain side effects
+- [ ] (COORDINATOR) 24h acceptance gates: quota/outage backoff without spinning; restart repairs tool calls by ID and inspects before retry; newest steer survives compaction; stop/continue works; plan/artifacts/events persist; disk/history growth stays bounded; task state is clear in UI | owner=all lanes | status=acceptance criteria, not a claim that one 24h soak has passed
+- [ ] (COORDINATOR) Show actionable upload errors in the Composer chip (size, disk reserve, network) | files=components/Composer.tsx | status=in-progress

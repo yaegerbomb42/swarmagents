@@ -56,6 +56,22 @@ function endedWithError(sessionId: string): boolean {
   return tail.some((e) => e.type === "notice" && e.level === "error");
 }
 
+/** The text of the last error notice from this run, if the run ended on an error. */
+function fatalMessage(sessionId: string): string | null {
+  const s = session(sessionId);
+  if (!s) return "Session not found.";
+  for (let i = s.events.length - 1; i >= 0 && i >= s.events.length - 8; i--) {
+    const e = s.events[i];
+    if (e.type === "notice" && e.level === "error") return e.text;
+  }
+  return null;
+}
+
+/** Errors the user must fix in Settings; retrying would just burn attempts. */
+function isConfigProblem(message: string): boolean {
+  return /no (llm )?provider|api key|not configured|missing key|unauthorized|401|invalid.*key/i.test(message);
+}
+
 export function bootstrapRuntime(): void {
   const g = globalThis as unknown as { __swarmRuntimeBooted?: boolean };
   if (g.__swarmRuntimeBooted) return;
@@ -101,10 +117,16 @@ export function bootstrapRuntime(): void {
       }
 
       const summary = lastSummary(task.sessionId);
-      const failed = endedWithError(task.sessionId);
+      const fatal = fatalMessage(task.sessionId);
+      if (fatal) {
+        // A configuration problem (no provider/key) is not retryable: surface it and wait
+        // for the user instead of burning attempts.
+        if (isConfigProblem(fatal)) return { summary: fatal, verified: false, needs: { kind: "input", message: fatal } };
+        throw new Error(fatal);
+      }
       return {
         summary,
-        verified: !failed,
+        verified: !endedWithError(task.sessionId),
         outputs: [],
       };
     },

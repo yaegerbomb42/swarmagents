@@ -169,7 +169,17 @@ function validUrl(u: string, field = "URL") {
 // ---------- tool keys ----------
 
 function loadTools(): ToolKey[] {
-  return readJson<{ tools?: ToolKey[] }>(CONNECTIONS, {}).tools ?? [];
+  const file = readJson<{ tools?: ToolKey[]; importedLegacySearch?: boolean }>(CONNECTIONS, {});
+  const tools = file.tools ?? [];
+  // One-time import of the older single search key (settings.json `search`) so it shows up here.
+  if (!file.importedLegacySearch) {
+    // Only the stored key: env keys are read live and must not be copied to disk.
+    const legacy = readJson<{ search?: { provider?: string; apiKey?: string } }>(path.join(HOME, "settings.json"), {}).search;
+    const preset = legacy && TOOL_PRESETS.find((p) => p.id === legacy.provider);
+    if (legacy?.apiKey && preset && !tools.some((t) => t.preset === preset.id)) tools.push({ id: newId(), preset: preset.id, label: preset.label, envVar: preset.envVar, apiKey: legacy.apiKey, enabled: true });
+    if (legacy?.apiKey) writeJson(CONNECTIONS, { ...file, version: 1, tools, importedLegacySearch: true });
+  }
+  return tools;
 }
 
 function saveTools(tools: ToolKey[]) {

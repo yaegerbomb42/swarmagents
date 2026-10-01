@@ -89,8 +89,15 @@ function argSummary(name: string, input: Record<string, unknown>, preview?: stri
       return pick("query");
     case "web_fetch":
       return pick("url");
-    case "browser":
-      return [pick("action"), pick("url") || pick("text") || pick("key") || (input?.index != null ? `#${input.index}` : "")].filter(Boolean).join(" ");
+    case "browser": {
+      const action = pick("action");
+      const url = pick("url");
+      const idx = input?.index != null ? `#${input.index}` : "";
+      const sel = pick("selector");
+      const text = (pick("text") || pick("key") || pick("value") || "").slice(0, 60);
+      const tab = input?.tab != null ? `tab ${input.tab}` : "";
+      return [action, url || idx || sel || (sel ? "" : text ? `"${text}"` : "") || tab].filter(Boolean).join(" ");
+    }
     case "plan":
       return "";
     default: {

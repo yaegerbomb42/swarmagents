@@ -18,7 +18,24 @@ function upload(file: File, sessionId: string, onProgress: (p: number) => void):
     xhr.open("POST", `/api/upload?session=${sessionId}&name=${encodeURIComponent(file.name)}`);
     xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
-    xhr.onload = () => (xhr.status < 300 ? resolve(JSON.parse(xhr.responseText)) : reject(new Error(xhr.responseText || `HTTP ${xhr.status}`)));
+    xhr.onload = () => {
+      if (xhr.status >= 300) {
+        let message = `Upload failed (HTTP ${xhr.status}).`;
+        try {
+          const body: unknown = JSON.parse(xhr.responseText);
+          if (body && typeof body === "object" && "error" in body && typeof body.error === "string") message = body.error;
+        } catch {
+          if (xhr.responseText.trim()) message = xhr.responseText.trim();
+        }
+        reject(new Error(message));
+        return;
+      }
+      try {
+        resolve(JSON.parse(xhr.responseText) as Attachment);
+      } catch {
+        reject(new Error("The server returned an invalid upload response."));
+      }
+    };
     xhr.onerror = () => reject(new Error("upload failed"));
     xhr.send(file);
   });
@@ -99,7 +116,7 @@ export function Composer({
                 <IFile />
                 <span>
                   {f.name}
-                  {!f.att && !f.error && ` · ${Math.round(f.progress * 100)}%`}
+                  {f.error ? ` · ${f.error}` : !f.att ? ` · ${Math.round(f.progress * 100)}%` : ""}
                 </span>
                 <button className="rm" onClick={() => setFiles((x) => x.filter((y) => y.key !== f.key))}>
                   <IX />

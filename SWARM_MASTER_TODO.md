@@ -1,3 +1,5 @@
+> SUPERSEDED 2026-10-01 by coordinator ruling: MASTER_TODO.md is the canonical board. This file is a frozen recovery snapshot (reconstructed after a wipe) — do not edit rows here.
+
 # SWARM MASTER TODO — single source of truth for concurrent agents
 
 > RULES (binding for all agents):
@@ -35,9 +37,9 @@
 | A1 | A | Timeline beauty pass: streaming shimmer, tool-call cards w/ elapsed time + output collapse, error styling, light/dark screenshots | cline-01 | in-progress | Copy-buttons added; screenshots pending |
 | A2 | A | Diff view approve/reject for write/edit (unified diff + Accept/Revert buttons wired to file tools) | cline-01 | done | Shipped w/ E1 slice (Timeline LCS diff + Undo) |
 | A3 | A | Composer upgrade: multiline, drag-drop progress, context meter accuracy, Esc-stop reliability, ⌘K new task | unclaimed | todo | See components/Composer.tsx |
-| B1 | B | Unified provider settings: search + grouped picker for ALL presets, custom endpoint (baseUrl+key+model test button), reorder priority, learned 429 limits display | Grok Bot | in-progress | Unified Connection model; see chat 18:02 spec |
-| B2 | B | Model list live-check + key validation per provider (reuse /models check, surface errors inline) | Grok Bot | in-progress | Don't break OpenRouter OAuth flow |
-| C1 | C | MCP/connector gallery UI: list servers from mcp.json + claude.json, tool counts, enable toggle, last-error surface | unclaimed | todo | Reads lib/tools/mcp.ts loader |
+| B1 | B | Unified provider settings: search + grouped picker for ALL presets, custom endpoint (baseUrl+key+model test button), reorder priority, learned 429 limits display | Grok Bot | in-progress | Landed: lib/connections.ts + /api/connections{,/test,/oauth} + new Settings.tsx (catalog 43 LLM/23 keys/25 MCP, one form, test, live models, drag order, toggles). tsc+build green, e2e 16/17 (1 = agent.ts compaction bug). Sync blocked: root-owned .git/objects |
+| B2 | B | Model list live-check + key validation per provider (reuse /models check, surface errors inline) | Grok Bot | in-progress | testProvider(): /models or 1-token ping for no-list providers (Bedrock, Perplexity); friendly errors, key redaction; OpenRouter OAuth kept |
+| C1 | C | MCP/connector gallery UI: list servers from mcp.json + claude.json, tool counts, enable toggle, last-error surface | Grok Bot | in-progress | Part of Settings: 25 presets, stdio/HTTP/SSE, test lists tools, OAuth sign-in (lib/mcp-oauth.ts), imported Claude servers toggle via override |
 | C2 | C | Tool-call transparency: every hidden capability (shell bg jobs, plan, uploads) gets a first-class Timeline card | unclaimed | todo | Coordinate with lane A |
 | D1 | D | Browser panel: visible-Chrome status, current URL, numbered-element overlay legend, screenshot-in-timeline, download handling | unclaimed | todo | COORDINATOR asked about BrowserPane 18:15 |
 | D2 | D | Artifact rendering: markdown, code blocks w/ copy, image/PDF/Office preview, large-output paging UI | unclaimed | todo | atlas-runtime artifact store overlaps — coordinate |
@@ -47,6 +49,7 @@
 | F1 | F | Parallel sub-agents (fan-out tool, per-child timeline section, merge-back) | unclaimed | todo | Needs inbox/steering safety |
 | F2 | F | Durable task/run control plane (lib/runtime/*, app/api/runtime/*, Activity UI) | atlas-runtime | in-progress | tsc clean; `npm run test:runtime` RUNTIME E2E PASS 16/16 (done/usage/ledger/artifact/quota-resume/budget-block/reconcile/delete). 3 durability bugs fixed. Activity panel wired into sidebar. Next: build + deploy. |
 | F3 | F | Approvals gate for destructive/outward actions surfaced in Activity (resume/approve actions) | atlas-runtime | todo | Budget/quota already block; extend to file-delete/send/purchase confirmations |
+| T1 | G | Deterministic e2e harness: mock LLM (OpenAI+Anthropic) + mock MCP + `npm run test:e2e` (17 cases) | Grok Bot | in-progress | tests/{e2e,mock-llm,mock-mcp}.mjs |
 | G1 | G | `bin/smoke` script: typecheck + build + API ping + SSE smoke, run before every done-mark | agent-opencode-1 | done | SMOKE PASS; uses .next-smoke isolation |
 | G2 | G | Fix HANDOFF nits: OAuth localhost↔127.0.0.1 localStorage split, DuckDuckGo brittleness (optional search-key field) | agent-opencode-1 | done | Sync 07809c3cf; auth matrix verified |
 | G3 | G | Auth-gate regression tests (tests/auth-gate.mjs): local/server/misconfigured matrix for lib/auth.ts | agent-opencode-1 | done | 26/26 pass pure-node; sync pending |

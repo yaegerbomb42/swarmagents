@@ -183,6 +183,13 @@ const cases = {
     return `${llm.length} LLM presets, ${tool.length} tool keys, ${mcp.length} MCP servers`;
   },
 
+  async page() {
+    const r = await fetch(`${BASE}/`);
+    const html = await r.text();
+    assert(r.status === 200 && html.includes("<html"), `GET / returned ${r.status}`);
+    return "app shell renders";
+  },
+
   async connections() {
     // Validation errors are friendly 400s.
     let r = await api("POST", "/api/connections", { type: "llm", preset: "custom", apiKey: "x", model: "mock" });

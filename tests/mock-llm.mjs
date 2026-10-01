@@ -59,7 +59,7 @@ function analyze(proto, body) {
   let lastUser = -1;
   for (let i = msgs.length - 1; i >= 0; i--) {
     // Skip text the agent itself injects (tool images, loop/plan nudges, steering markers): it isn't a new request.
-    if (msgs[i].role === "user" && msgs[i].text && !/^\((images returned)|^\[Automatic check/.test(msgs[i].text)) {
+    if (msgs[i].role === "user" && msgs[i].text && !/^\((images returned)|^\[Automatic (check|note)/.test(msgs[i].text)) {
       lastUser = i;
       break;
     }

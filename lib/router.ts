@@ -56,7 +56,11 @@ function benchFor(id: string, minMs = 0): number {
 }
 
 /** Out of credits/quota: retrying soon is pointless, but the user may top up, so wait instead of giving up. */
-const isExhausted = (msg: string) => /insufficient.?(quota|credit|balance|funds)|credit balance|billing|payment required|out of credits|quota exceeded|exceeded your current quota/i.test(msg);
+function isExhausted(err: ProviderError) {
+  // A short retry hint or a per-minute limit is ordinary throttling, even when the text links to a billing page.
+  if ((err.retryAfterMs !== undefined && err.retryAfterMs < 5 * MINUTE) || /per minute|\b[rt]pm\b|try again in [\d.]+m?s/i.test(err.message)) return false;
+  return /insufficient.?(quota|credits?|balance|funds)|credit balance is too low|payment required|out of credits|exceeded your current quota|quota exceeded for|daily (limit|quota)|per.?day/i.test(err.message);
+}
 
 /** How long we must wait before this provider can take a request of `tokens` without exceeding learned limits. */
 function waitNeeded(p: ProviderConfig, tokens: number): number {
@@ -143,7 +147,7 @@ export async function routeTurn(req: ChatRequest, cb: StreamCallbacks, hooks: Ro
     } catch (e) {
       const err = e instanceof ProviderError ? e : new ProviderError("transient", String(e));
       if (err.kind === "aborted" || err.kind === "context") throw err;
-      if (isExhausted(err.message)) {
+      if (isExhausted(err)) {
         const ms = benchFor(p.id, 5 * MINUTE);
         updateLimits(p.id, (x) => ({ ...x, lastError: err.message.slice(0, 300) }));
         hooks.onNotice("warn", `${p.label} is out of credits or quota. ${live.length > 1 ? "Failing over" : `Retrying in ${Math.round(ms / MINUTE)}m`}; top up or add another provider in Settings.`);

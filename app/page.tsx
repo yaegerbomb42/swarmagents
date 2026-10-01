@@ -16,6 +16,7 @@ export default function Home() {
   const [context, setContext] = useState<ContextInfo | null>(null);
   const [runningIds, setRunningIds] = useState<Set<string>>(new Set());
   const [settings, setSettings] = useState(false);
+  const [notice, setNotice] = useState<{ connected?: string | null; error?: string | null }>();
   const [activityOpen, setActivityOpen] = useState(false);
   const [sidebar, setSidebar] = useState(true);
   const [lightbox, setLightbox] = useState<string | null>(null);
@@ -41,7 +42,7 @@ export default function Home() {
     // Returning from a one-click provider connection.
     const qs = new URLSearchParams(location.search);
     if (qs.has("connected") || qs.has("connect_error")) {
-      if (qs.has("connect_error")) alert("Connecting the account didn't complete. Try again or paste a key.");
+      setNotice({ connected: qs.get("connected"), error: qs.get("connect_error") });
       setSettings(true);
       history.replaceState(null, "", "/");
     }
@@ -236,7 +237,15 @@ export default function Home() {
         <Composer running={running} context={context} ensureSession={ensureSession} onSend={send} onStop={stop} />
       </main>
 
-      {settings && <Settings onClose={() => setSettings(false)} />}
+      {settings && (
+        <Settings
+          notice={notice}
+          onClose={() => {
+            setSettings(false);
+            setNotice(undefined);
+          }}
+        />
+      )}
       {activityOpen && (
         <Activity
           onClose={() => setActivityOpen(false)}

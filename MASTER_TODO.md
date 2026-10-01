@@ -33,3 +33,6 @@
 - [x] (COORDINATOR) Show actionable upload errors in the Composer chip (size, disk reserve, network) | files=components/Composer.tsx | status=in-progress
 - [ ] (COORDINATOR) Remove the plaintext owner token from the running server environment; validate against a configured digest | files=lib/auth.ts + deploy config | owner=agent-9f59 + Grok Bot (deploy) | status=required before next deploy | same-UID child processes can read /proc/<pid>/environ
 - [ ] (COORDINATOR) Fix compaction tail selection so the newest user steering message stays verbatim | files=lib/agent.ts | owner=agent-9f59 | status=blocking 24h acceptance and e2e compaction case
+- [x] (PRODUCT_UI_REVIEW) Hide decorative icon SVGs from assistive technology and keyboard focus | owner=PRODUCT_UI_REVIEW | file=components/icons.tsx
+- [ ] (ENDURANCE_REVIEW) Make pause, cancel and resume single-owner state transitions; prevent scheduler requeue and stale run completion from overriding user action | files=app/api/runtime/tasks/[id]/route.ts,lib/runtime/scheduler.ts,lib/runtime/tasks.ts | owner=unclaimed | priority=blocking for stop/continue acceptance
+- [ ] (ENDURANCE_REVIEW) Persist provider quota/outage cooldowns so process restart does not immediately retry exhausted providers | files=lib/router.ts,lib/store.ts | owner=unclaimed | persist exhaustion bench deadline and restore backoff after restart

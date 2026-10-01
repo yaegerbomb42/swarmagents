@@ -58,7 +58,8 @@ function analyze(proto, body) {
   const msgs = normalize(proto, body);
   let lastUser = -1;
   for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === "user" && msgs[i].text && !msgs[i].text.startsWith("(images returned")) {
+    // Skip text the agent itself injects (tool images, loop/plan nudges, steering markers): it isn't a new request.
+    if (msgs[i].role === "user" && msgs[i].text && !/^\((images returned)|^\[Automatic check/.test(msgs[i].text)) {
       lastUser = i;
       break;
     }
@@ -111,7 +112,7 @@ function script(a) {
       if (n === 0) return { error: { status: 429, message: "Rate limit reached for requests (mock)", headers: { "retry-after": "1" } } };
       return { text: `Recovered after a 429 (attempt ${n + 1}).` };
     case "flaky":
-      if (n < 2) return { error: { status: 503, message: "upstream overloaded? no: service unavailable (mock)" } };
+      if (n < 2) return { error: { status: 503, message: "service unavailable (mock)" } };
       return { text: `Recovered after ${n} server errors.` };
     case "auth":
       return { error: { status: 401, message: "invalid x-api-key (mock)" } };

@@ -4,28 +4,28 @@
 // question. It is deliberately append-mostly and small: turns, tool calls, notices and
 // checkpoints. Model output stays in the session; the ledger stores the skeleton.
 
-import { loadLedger, rtId, saveLedger } from "./store";
+// Every mutation goes through store.withLedger, which serializes per task and awaits the
+// write, so recordings are durable the moment their promise resolves.
+
+import { loadLedger, rtId, withLedger } from "./store";
 import { getTask, updateTask } from "./tasks";
 import type { RunRecord, RunUsage, StepRecord } from "./types";
 
-export function addStep(
+export async function addStep(
   taskId: string,
   runId: string,
   step: Omit<StepRecord, "id" | "taskId" | "runId" | "ts"> & { ts?: number },
-): StepRecord {
-  const ledger = loadLedger(taskId);
+): Promise<StepRecord> {
   const rec: StepRecord = { id: rtId(), taskId, runId, ts: step.ts ?? Date.now(), ...step };
-  ledger.steps.push(rec);
-  // Keep the ledger bounded; a 24h run must not grow without limit.
-  if (ledger.steps.length > 5000) ledger.steps.splice(0, ledger.steps.length - 5000);
-  saveLedger(taskId, ledger);
+  await withLedger(taskId, (ledger) => {
+    ledger.steps.push(rec);
+    // Keep the ledger bounded; a 24h run must not grow without limit.
+    if (ledger.steps.length > 5000) ledger.steps.splice(0, ledger.steps.length - 5000);
+  });
   return rec;
 }
 
-export function startRun(taskId: string, sessionId: string, attempt: number): RunRecord {
-  const ledger = loadLedger(taskId);
-  // Any run still marked running belongs to a previous process; settle it as interrupted.
-  for (const r of ledger.runs) if (r.status === "running") r.status = "interrupted";
+export async function startRun(taskId: string, sessionId: string, attempt: number): Promise<RunRecord> {
   const run: RunRecord = {
     id: rtId(),
     taskId,
@@ -36,17 +36,19 @@ export function startRun(taskId: string, sessionId: string, attempt: number): Ru
     usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0, costUsd: 0, turns: 0, toolCalls: 0, wallMs: 0 },
     notes: [],
   };
-  ledger.runs.push(run);
-  saveLedger(taskId, ledger);
+  await withLedger(taskId, (ledger) => {
+    // Any run still marked running belongs to a previous process; settle it as interrupted.
+    for (const r of ledger.runs) if (r.status === "running") r.status = "interrupted";
+    ledger.runs.push(run);
+  });
   return run;
 }
 
-function mutateRun(taskId: string, runId: string, fn: (r: RunRecord) => void) {
-  const ledger = loadLedger(taskId);
-  const r = ledger.runs.find((x) => x.id === runId);
-  if (!r) return;
-  fn(r);
-  saveLedger(taskId, ledger);
+function mutateRun(taskId: string, runId: string, fn: (r: RunRecord) => void): Promise<void> {
+  return withLedger(taskId, (ledger) => {
+    const r = ledger.runs.find((x) => x.id === runId);
+    if (r) fn(r);
+  });
 }
 
 /** Record one model turn's usage and fold it into the task total. */
@@ -83,15 +85,15 @@ export async function recordTool(taskId: string, runId: string, ok: boolean): Pr
   void ok;
 }
 
-export function noteRun(taskId: string, runId: string, note: string) {
-  mutateRun(taskId, runId, (r) => {
+export async function noteRun(taskId: string, runId: string, note: string): Promise<void> {
+  await mutateRun(taskId, runId, (r) => {
     r.notes.push(note);
     if (r.notes.length > 200) r.notes.splice(0, r.notes.length - 200);
   });
 }
 
-export function endRun(taskId: string, runId: string, status: RunRecord["status"], wallMs: number) {
-  mutateRun(taskId, runId, (r) => {
+export async function endRun(taskId: string, runId: string, status: RunRecord["status"], wallMs: number): Promise<void> {
+  await mutateRun(taskId, runId, (r) => {
     r.status = status;
     r.endedAt = Date.now();
     r.usage.wallMs += wallMs;

@@ -60,6 +60,7 @@ const TOOL_LABEL: Record<string, string> = {
   read_file: "Read",
   write_file: "Write",
   edit_file: "Edit",
+  restore_checkpoint: "Undo",
   search: "Search",
   web_search: "Web search",
   web_fetch: "Fetch",
@@ -80,6 +81,8 @@ function argSummary(name: string, input: Record<string, unknown>, preview?: stri
     case "write_file":
     case "edit_file":
       return pick("path");
+    case "restore_checkpoint":
+      return pick("checkpoint") ? `checkpoint ${pick("checkpoint")}` : "";
     case "search":
       return [pick("pattern"), pick("glob"), pick("path")].filter(Boolean).join("  ");
     case "web_search":
@@ -156,16 +159,25 @@ function lineDiff(oldText: string, newText: string): [string, string][] {
 }
 
 function Diff({ oldText, newText }: { oldText: string; newText: string }) {
+  const [expanded, setExpanded] = useState(false);
   const rows = lineDiff(oldText, newText);
   const adds = rows.filter((r) => r[0] === "+").length;
   const dels = rows.filter((r) => r[0] === "-").length;
+  // Long diffs collapse to the changed hunks with 2 lines of context; click to see everything.
+  const hidden = !expanded && rows.length > 40;
+  const visible = hidden
+    ? rows.filter(([k], idx) => k !== " " || rows.slice(Math.max(0, idx - 2), idx + 3).some(([k2]) => k2 !== " "))
+    : rows;
   return (
     <div className="diff">
-      <div className="label">
-        Changes · <span className="add">+{adds}</span> <span className="del">−{dels}</span>
-      </div>
+      <button className="diff-toggle" onClick={(e) => (e.stopPropagation(), setExpanded(!expanded))} title={expanded ? "Collapse" : "Show full diff"}>
+        <span className="label">
+          Changes · <span className="add">+{adds}</span> <span className="del">−{dels}</span>
+        </span>
+        {rows.length > 40 && <span className="diff-expand">{expanded ? "Show less" : `Show all ${rows.length} lines`}</span>}
+      </button>
       <pre className="diff-body">
-        {rows.map(([k, t], idx) => (
+        {visible.map(([k, t], idx) => (
           <div key={idx} className={k === "+" ? "add" : k === "-" ? "del" : "ctx"}>
             <span className="sign">{k}</span> {t}
           </div>

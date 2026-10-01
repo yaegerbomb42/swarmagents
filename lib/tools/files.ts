@@ -133,11 +133,16 @@ export const checkpointMarker = (checkpointId: string, absPath: string) =>
 
 export function restoreCheckpoint(sessionId: string, checkpointId: string): { ok: boolean; message: string } {
   if (!/^[a-f0-9]+$/.test(checkpointId)) return { ok: false, message: "Bad checkpoint id." };
-  const bak = path.join(checkpointsDir(sessionId), `${checkpointId}.bak`);
+  // Defense in depth: the id is hex-only and checkpointsDir is fixed, so no traversal is possible,
+  // but resolve + prefix-check anyway in case the id source ever changes.
+  const dir = checkpointsDir(sessionId);
+  const bak = path.resolve(dir, `${checkpointId}.bak`);
+  if (!bak.startsWith(dir + path.sep)) return { ok: false, message: "Bad checkpoint id." };
   const meta = `${bak}.json`;
   if (!fs.existsSync(bak) || !fs.existsSync(meta)) return { ok: false, message: `Checkpoint ${checkpointId} not found for this task.` };
   try {
     const { path: absPath } = JSON.parse(fs.readFileSync(meta, "utf8")) as { path: string };
+    if (typeof absPath !== "string" || !path.isAbsolute(absPath)) return { ok: false, message: "Checkpoint record is invalid; refusing to restore." };
     fs.mkdirSync(path.dirname(absPath), { recursive: true });
     fs.copyFileSync(bak, absPath);
     return { ok: true, message: `Restored ${absPath} from checkpoint ${checkpointId}.` };

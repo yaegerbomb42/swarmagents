@@ -168,6 +168,15 @@ export function dueTasks(now = Date.now()): Task[] {
   );
 }
 
+/** Move a waiting task back to the queue after its wait elapses. */
+export async function requeueTask(id: string): Promise<Task | null> {
+  return updateTask(id, (t) => {
+    if (t.status !== "waiting") return;
+    t.status = "queued";
+    t.wait = undefined;
+  });
+}
+
 /** Running tasks, used to enforce concurrency. */
 export function runningTasks(): Task[] {
   return loadTasks().filter((t) => t.status === "running");

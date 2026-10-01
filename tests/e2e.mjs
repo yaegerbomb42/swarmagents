@@ -158,6 +158,20 @@ const summarize = (evs) => evs.map((e) => `${e.type}${e.name ? `:${e.name}` : ""
 
 const ctx = {};
 
+/** Run fn with a fresh provider as the only enabled one, then restore the main mock provider. */
+async function withScratchProvider(label, fn) {
+  const r = await api("POST", "/api/connections", { type: "llm", preset: "custom", label, baseUrl: `${MOCK}/v1`, apiKey: "scratch-key", model: "mock" });
+  const id = r.json.id;
+  await api("POST", "/api/connections", { type: "llm", id: ctx.openaiId, enabled: false });
+  const t0 = Date.now();
+  try {
+    return { ...(await fn()), ms: Date.now() - t0 };
+  } finally {
+    await api("DELETE", `/api/connections?type=llm&id=${id}`);
+    await api("POST", "/api/connections", { type: "llm", id: ctx.openaiId, enabled: true });
+  }
+}
+
 const cases = {
   async catalog() {
     const r = await api("GET", "/api/connections");
@@ -273,15 +287,15 @@ const cases = {
   },
 
   async ratelimit() {
-    const t0 = Date.now();
-    const { events } = await runTask("[mock:ratelimit] go", { timeout: 90_000 });
+    // Throttling teaches the router a limit for that provider, so use a throwaway one.
+    const { events, ms } = await withScratchProvider("Throttled mock", () => runTask("[mock:ratelimit] go", { timeout: 90_000 }));
     assert(/Recovered after a 429/.test(texts(events)), "did not recover from 429", summarize(events));
     assert(notices(events).some((n) => /rate|limit|wait|pac/i.test(n.text)), "no visible notice about the 429", summarize(events));
-    return `429 + retry-after handled in ${((Date.now() - t0) / 1000).toFixed(1)}s`;
+    return `429 + retry-after handled in ${(ms / 1000).toFixed(1)}s`;
   },
 
   async flaky() {
-    const { events } = await runTask("[mock:flaky] go", { timeout: 120_000 });
+    const { events } = await withScratchProvider("Flaky mock", () => runTask("[mock:flaky] go", { timeout: 120_000 }));
     assert(/Recovered after 2 server errors/.test(texts(events)), "did not recover from 503s", summarize(events));
     return "two 503s retried";
   },
@@ -343,6 +357,16 @@ const cases = {
       await api("DELETE", `/api/connections?type=llm&id=${anthId}`);
     }
     return "native Anthropic stream + tools + bearer header";
+  },
+
+  async compaction() {
+    // The mock reports a 125k-token prompt; on the next message the agent must compact (window guess 128k).
+    const first = await runTask("[mock:bigcontext] fill the window", { timeout: 60_000 });
+    const { events } = await runTask("[mock:echo] after the squeeze", { sessionId: first.sid, timeout: 120_000 });
+    const comp = events.filter((e) => e.type === "compaction");
+    assert(comp.length && comp.every((e) => e.done), "no completed compaction", summarize(events));
+    assert(/Echo: after the squeeze/.test(texts(events)), "no answer after compaction", summarize(events));
+    return `${comp.length} compaction step(s): ${comp.map((e) => e.reason).join(", ")}`;
   },
 
   async loop() {

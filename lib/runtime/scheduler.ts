@@ -14,7 +14,7 @@
 import { requireAdapter } from "./resume";
 import { addStep, checkBudget, endRun, fmtDuration, noteRun, recordTool, recordTurn, startRun } from "./ledger";
 import { registerArtifact } from "./artifacts";
-import { dueTasks, finishTask, getTask, listTasks, runningTasks, setStatus, waitTask } from "./tasks";
+import { dueTasks, finishTask, getTask, listTasks, requeueTask, runningTasks, setStatus, waitTask } from "./tasks";
 import { loadRuntimeSettings } from "./store";
 
 const TICK_MS = 2000;
@@ -71,7 +71,7 @@ class Scheduler {
       if (slots > 0) {
         // Re-queue any due waiting tasks so they are picked up by runnable ordering.
         for (const t of dueTasks()) {
-          await waitTask(t.id, { kind: "backoff", message: "Resuming.", resumeAt: Date.now() });
+          await requeueTask(t.id);
         }
         const runnable = listTasks().filter((t) => t.status === "queued");
         for (const t of runnable.slice(0, slots)) {
@@ -92,30 +92,39 @@ class Scheduler {
     const running = await setStatus(taskId, "running");
     if (!running) return;
     const attempt = running.attempts;
-    const run = startRun(taskId, running.sessionId, attempt);
-    addStep(taskId, run.id, { kind: "checkpoint", label: `Attempt ${attempt} started`, detail: running.prompt.slice(0, 200) });
+    const run = await startRun(taskId, running.sessionId, attempt);
+    await addStep(taskId, run.id, { kind: "checkpoint", label: `Attempt ${attempt} started`, detail: running.prompt.slice(0, 200) });
 
     const controller = new AbortController();
     let parked = false;
+    // Recorder hook promises. They are fire-and-forget during the run so hooks never
+    // block the agent, but we flush them before any decision that reads usage (budget).
+    const pending = new Set<Promise<unknown>>();
+    const track = <T,>(p: Promise<T>): void => {
+      pending.add(p);
+      void p.finally(() => pending.delete(p));
+    };
+    const flush = () => Promise.all([...pending]);
 
     try {
       const outcome = await adapter.run(running, {
         signal: controller.signal,
-        onTurn: (u) => void recordTurn(taskId, run.id, u),
+        onTurn: (u) => track(recordTurn(taskId, run.id, u)),
         onTool: (name, ok) => {
-          void recordTool(taskId, run.id, ok);
-          addStep(taskId, run.id, { kind: "tool", label: name, ok });
+          track(recordTool(taskId, run.id, ok));
+          track(addStep(taskId, run.id, { kind: "tool", label: name, ok }));
         },
-        onNote: (text) => noteRun(taskId, run.id, text),
+        onNote: (text) => track(noteRun(taskId, run.id, text)),
         onQuotaWait: (ms, message) => {
           parked = true;
-          void waitTask(taskId, { kind: "quota", message, resumeAt: Date.now() + ms });
-          addStep(taskId, run.id, { kind: "notice", label: "Paused on quota", detail: `${message} (${fmtDuration(ms)})` });
+          track(waitTask(taskId, { kind: "quota", message, resumeAt: Date.now() + ms }));
+          track(addStep(taskId, run.id, { kind: "notice", label: "Paused on quota", detail: `${message} (${fmtDuration(ms)})` }));
         },
       });
+      await flush();
 
       if (parked) {
-        endRun(taskId, run.id, "interrupted", Date.now() - t0);
+        await endRun(taskId, run.id, "interrupted", Date.now() - t0);
         return;
       }
 
@@ -127,20 +136,20 @@ class Scheduler {
 
       if (outcome.needs) {
         await waitTask(taskId, { kind: outcome.needs.kind, message: outcome.needs.message });
-        endRun(taskId, run.id, "interrupted", Date.now() - t0);
-        addStep(taskId, run.id, { kind: "notice", label: "Waiting on you", detail: outcome.needs.message });
+        await endRun(taskId, run.id, "interrupted", Date.now() - t0);
+        await addStep(taskId, run.id, { kind: "notice", label: "Waiting on you", detail: outcome.needs.message });
         return;
       }
 
       const budget = checkBudget(taskId);
       if (budget.exceeded) {
         await waitTask(taskId, { kind: "approval", message: `${budget.reason} Approve continuing.` });
-        endRun(taskId, run.id, "interrupted", Date.now() - t0);
+        await endRun(taskId, run.id, "interrupted", Date.now() - t0);
         return;
       }
 
-      endRun(taskId, run.id, "done", Date.now() - t0);
-      addStep(taskId, run.id, { kind: "checkpoint", label: "Finished", detail: outcome.summary.slice(0, 300), ok: true });
+      await endRun(taskId, run.id, "done", Date.now() - t0);
+      await addStep(taskId, run.id, { kind: "checkpoint", label: "Finished", detail: outcome.summary.slice(0, 300), ok: true });
       await finishTask(taskId, {
         summary: outcome.summary,
         artifactIds,
@@ -149,8 +158,8 @@ class Scheduler {
       });
     } catch (e) {
       const msg = (e as Error).message || String(e);
-      endRun(taskId, run.id, "failed", Date.now() - t0);
-      addStep(taskId, run.id, { kind: "notice", label: "Run failed", detail: msg, ok: false });
+      await endRun(taskId, run.id, "failed", Date.now() - t0);
+      await addStep(taskId, run.id, { kind: "notice", label: "Run failed", detail: msg, ok: false });
       // A failed attempt is not fatal: retry with backoff unless the budget says stop.
       const budget = checkBudget(taskId);
       if (budget.exceeded) {

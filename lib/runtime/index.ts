@@ -17,6 +17,7 @@ export {
   dueTasks,
   runningTasks,
   runnableTasks,
+  requeueTask,
   progressOf,
   subscribeRuntime,
   type RuntimeEvent,

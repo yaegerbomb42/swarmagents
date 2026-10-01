@@ -31,6 +31,7 @@ function guessKind(p: string | undefined, mime: string | undefined): ArtifactKin
   if (["diff", "patch"].includes(ext)) return "diff";
   if (["log", "out", "err"].includes(ext)) return "log";
   if (["json", "csv", "tsv", "yaml", "yml", "xml"].includes(ext)) return "data";
+  if (["txt", "md", "markdown", "rst", "text"].includes(ext) || mime === "text/plain" || mime === "text/markdown") return "text";
   return p ? "file" : "text";
 }
 
@@ -50,8 +51,13 @@ export async function registerArtifact(input: RegisterArtifactInput): Promise<Ar
     }
   }
 
-  // Auto-classify when the caller passed a generic kind.
-  kind = kind || guessKind(input.path, mime);
+  // Auto-classify when the caller passed a generic kind. A caller that says "file" is
+  // usually satisfied with a more specific kind (text/data/log/image) that lets the UI
+  // preview it, so refine "file" via the path/mime when we can.
+  if (!kind || kind === "file") {
+    const guessed = guessKind(input.path, mime);
+    if (guessed !== "file" || !kind) kind = guessed;
+  }
 
   let text = input.text;
   // Inline small text files so the UI can render them without a second request.

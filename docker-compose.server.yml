@@ -1,0 +1,58 @@
+# swarmagents v2 on the VPS (https://swarmagents.codes). Used only by `./infra/deploy.sh swarmagents`:
+#   docker compose -p swarmagents-v2 -f ~/infra/apps/swarmagents/v2/docker-compose.server.yml ...
+# It's kept out of infra/docker-compose.yml so this deploy never loads or touches another service.
+# The agent has a full shell INSIDE this container, so it runs non-root (uid 10001) with all caps dropped,
+# no-new-privileges and resource limits. All state is on the swarmagents-data volume, and it has its own
+# network, so other infra containers aren't reachable by name or IP (host-published ports still are).
+# Owner auth: SWARM_MODE=server + SWARM_AUTH_TOKEN from ../.env.v2 (server-only, mode 600, written by
+# deploy.sh from the Mac's ~/.swarmagents/deploy-owner-credentials.txt, and never committed).
+name: swarmagents-v2
+services:
+  swarmagents-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: swarmagents-v2:latest
+    container_name: swarmagents-dashboard
+    restart: unless-stopped
+    env_file:
+      - path: ../.env.v2
+        required: false # missing token + SWARM_MODE=server => the app answers 503 (fails closed)
+    environment:
+      - SWARM_MODE=server
+      - SWARM_ALLOWED_HOSTS=swarmagents.codes
+      - SWARM_HOME=/data
+      - HOME=/data/home
+      - PORT=3400
+      - NEXT_TELEMETRY_DISABLED=1
+    volumes:
+      - swarmagents-data:/data
+    # Only on the docker0 bridge IP: Nginx Proxy Manager (traffic-controller) forwards
+    # swarmagents.codes -> 172.17.0.1:3400, and the static-landings :8085 vhost does the same. Not 0.0.0.0.
+    ports:
+      - "172.17.0.1:3400:3400"
+    mem_limit: 4g
+    memswap_limit: 4g
+    cpus: 2
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null --header 'Host: swarmagents.codes' http://127.0.0.1:3400/login || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    networks:
+      - swarmagents-isolated
+
+networks:
+  swarmagents-isolated:
+    name: swarmagents-isolated
+    driver: bridge
+
+volumes:
+  swarmagents-data:
+    name: swarmagents-data

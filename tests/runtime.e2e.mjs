@@ -41,16 +41,16 @@ async function until(fn, ms = 8000) {
 
 // ---- Fake adapter: different behaviours keyed by a marker in the prompt ----
 
-const quotaOnce = new Set();
 const adapter = {
   async run(task, hooks) {
     hooks.onTurn({ inputTokens: 100, outputTokens: 50, cachedTokens: 0, costUsd: 0.001, provider: "fake", model: "fake-1" });
     hooks.onTool("read_file", true);
 
-    if (task.prompt.includes("QUOTA") && !quotaOnce.has(task.id)) {
-      quotaOnce.add(task.id);
-      hooks.onQuotaWait(300, "Rate limited; will retry");
-      return { summary: "parked" };
+    if (task.prompt.includes("QUOTA")) {
+      // The router sleeps and retries in place, so the run continues: a quota wait must be
+      // recorded (note + step) without parking or discarding the work.
+      hooks.onQuotaWait(300, "Waiting 5s for Fake (rate limit or outage); the run continues automatically.");
+      return { summary: `survived a quota wait: ${task.title}`, verified: true };
     }
 
     if (task.prompt.includes("BIGOUT")) {
@@ -103,22 +103,19 @@ check("artifact registered", arts.length === 1, `${arts.length}`);
 check("artifact points at file", !!arts[0]?.path && fs.existsSync(arts[0].path));
 check("artifact inlined small text", typeof arts[0]?.text === "string" && arts[0].text.length === 5000);
 
-// ---- 3. Quota wait parks then auto-resumes ----
-console.log("\n3. quota wait parks the task, then it resumes");
+// ---- 3. Quota wait is recorded but the run continues (no work thrown away) ----
+console.log("\n3. quota wait is recorded and the run continues to done");
 const t3 = await createTask({ prompt: "QUOTA work", title: "quota" });
 scheduler().kick();
-const parked = await until(() => {
-  const t = getTask(t3.id);
-  return t && t.status === "waiting" ? t : null;
-});
-check("task parked on quota", parked?.status === "waiting", parked?.wait?.message);
-check("park has resume time", typeof parked?.wait?.resumeAt === "number");
-const resumed = await until(() => {
+const done3 = await until(() => {
   const t = getTask(t3.id);
   return t && t.status === "done" ? t : null;
 }, 10_000);
-check("task auto-resumed to done", resumed?.status === "done", resumed?.status);
-check("two attempts recorded", (resumed?.attempts ?? 0) >= 2, `${resumed?.attempts} attempts`);
+check("task survives a quota wait and finishes", done3?.status === "done", done3?.status);
+check("quota wait did not burn a second attempt", (done3?.attempts ?? 0) === 1, `${done3?.attempts} attempts`);
+const led3 = getLedger(t3.id);
+check("quota wait recorded as a step", led3.steps.some((s) => /quota/i.test(s.label ?? "")), `${led3.steps.length} steps`);
+check("quota wait recorded as a note", led3.runs.some((r) => r.notes?.some((n) => /waiting .* for /i.test(n))), led3.runs[0]?.notes?.join(" | "));
 
 // ---- 4. Budget enforcement pauses for approval ----
 console.log("\n4. budget limit pauses and asks");

@@ -6,6 +6,31 @@ import { clip, type Tool } from "./types";
 
 const MARK = "__SWARM_CWD__";
 
+/** Secrets the agent must never see in its shell children. The server holds the owner token so the
+ *  browser doesn't have to; children inherit env by default, so strip server-only keys explicitly.
+ *  SWARM_HOME is safe (session data dir) and stays so uploads/sessions keep working. */
+const STRIPPED_ENV = new Set(["SWARM_AUTH_TOKEN", "SWARM_AUTH_TOKEN_SHA256"]);
+function childEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    NODE_ENV: process.env.NODE_ENV ?? "production",
+    TERM: "dumb",
+    NO_COLOR: "1",
+    PAGER: "cat",
+    GIT_PAGER: "cat",
+  };
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k in env) continue;
+    // Server-only secrets never reach agent children. SWARM_HOME is the session data dir and stays.
+    if (k === "SWARM_HOME") {
+      if (v !== undefined) env[k] = v;
+      continue;
+    }
+    if (STRIPPED_ENV.has(k) || k.startsWith("SWARM_")) continue;
+    if (v !== undefined) env[k] = v;
+  }
+  return env;
+}
+
 export const shell: Tool = {
   spec: {
     name: "bash",
@@ -31,7 +56,7 @@ export const shell: Tool = {
     if (input.background) {
       const log = path.join(sessionDir(ctx.sessionId), `bg-${newId()}.log`);
       const fd = fs.openSync(log, "a");
-      const child = spawn("/bin/zsh", ["-lc", cmd], { cwd: ctx.cwd, detached: true, stdio: ["ignore", fd, fd] });
+      const child = spawn("/bin/zsh", ["-lc", cmd], { cwd: ctx.cwd, detached: true, stdio: ["ignore", fd, fd], env: childEnv() });
       child.unref();
       return { content: `Started in background (pid ${child.pid}). Log: ${log}` };
     }
@@ -39,7 +64,7 @@ export const shell: Tool = {
     return new Promise((resolve) => {
       const child = spawn("/bin/zsh", ["-lc", `${cmd}\n__rc=$?; printf '\\n${MARK}%s' "$PWD"; exit $__rc`], {
         cwd: ctx.cwd,
-        env: { ...process.env, TERM: "dumb", NO_COLOR: "1", PAGER: "cat", GIT_PAGER: "cat" },
+        env: childEnv(),
         // Own process group, so stop/timeout kills the whole pipeline, not just zsh.
         detached: true,
       });

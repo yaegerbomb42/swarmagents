@@ -28,7 +28,7 @@
 | E | 24h substrate (checkpoints/undo, session resume, heartbeats, compaction polish, stop/repair, resource caps) | agent-9f59 / cline-01 (E1) | in-progress |
 | F | Power tools (parallel sub-agents, scheduler, sandbox approvals, voice/image-gen hooks, macOS control) | atlas-runtime (runtime plane) | in-progress |
 | G | Quality gate (typecheck/build/smoke script, console-error sweep, perf, localhost guard) | agent-opencode-1 | open |
-| DEPLOY | swarmagents.codes via infra/deploy.sh (Dockerfile, auth gate, compose, nginx, token) | Grok Bot | in-progress |
+| DEPLOY | swarmagents.codes via infra/deploy.sh (Dockerfile, auth gate, compose, nginx, token) | Grok Bot (deploy) | live, redeploying on cadence |
 
 ## Task board (edit rows in place — do not delete rows)
 
@@ -47,13 +47,13 @@
 | E2 | E | 24h endurance: heartbeat + auto-resume after crash/reload, step budget surfacing, idle-stop + resume, token-burn meter | agent-9f59 | done | Crash resume + bounded events + stall watchdog verified on Groq |
 | E3 | E | Compaction polish: trim-then-summarize timeline honesty ("Thought for Ns" fix per HANDOFF nits), handoff readability | unclaimed | todo | agent.ts is L1-owned — coordinate w/ agent-9f59 |
 | F1 | F | Parallel sub-agents (fan-out tool, per-child timeline section, merge-back) | unclaimed | todo | Needs inbox/steering safety |
-| F2 | F | Durable task/run control plane (lib/runtime/*, app/api/runtime/*, Activity UI) | atlas-runtime | in-progress | tsc clean; `npm run test:runtime` RUNTIME E2E PASS 16/16 (done/usage/ledger/artifact/quota-resume/budget-block/reconcile/delete). 3 durability bugs fixed. Activity panel wired into sidebar. Next: build + deploy. |
-| F3 | F | Approvals gate for destructive/outward actions surfaced in Activity (resume/approve actions) | atlas-runtime | todo | Budget/quota already block; extend to file-delete/send/purchase confirmations |
+| F2 | F | Durable task/run control plane (lib/runtime/*, app/api/runtime/*, Activity UI) | atlas-runtime | done | tsc clean; unit e2e 16/16 + real-agent mock integration PASS; 3 durability bugs fixed; Activity panel wired; DEPLOYED to swarmagents.codes |
+| F3 | F | Approvals gate for destructive/outward actions surfaced in Activity (resume/approve actions) | atlas-runtime | in-progress | Budget/quota block now; extending to destructive tool confirmation + resume buttons |
 | T1 | G | Deterministic e2e harness: mock LLM (OpenAI+Anthropic) + mock MCP + `npm run test:e2e` (17 cases) | Grok Bot | in-progress | tests/{e2e,mock-llm,mock-mcp}.mjs |
 | G1 | G | `bin/smoke` script: typecheck + build + API ping + SSE smoke, run before every done-mark | agent-opencode-1 | done | SMOKE PASS; uses .next-smoke isolation |
 | G2 | G | Fix HANDOFF nits: OAuth localhost↔127.0.0.1 localStorage split, DuckDuckGo brittleness (optional search-key field) | agent-opencode-1 | done | Sync 07809c3cf; auth matrix verified |
 | G3 | G | Auth-gate regression tests (tests/auth-gate.mjs): local/server/misconfigured matrix for lib/auth.ts | agent-opencode-1 | done | 26/26 pass pure-node; sync pending |
-| DEPLOY1 | DEPLOY | swarmagents.codes live via infra/deploy.sh v2 branch (Dockerfile, auth gate, compose, nginx, owner token, preflight /login 200 + /api 401) | Grok Bot | in-progress | Target 18:45 CT; needs tsc green |
+| DEPLOY1 | DEPLOY | swarmagents.codes live via infra/deploy.sh v2 branch (Dockerfile, auth gate, compose, nginx, owner token, preflight /login 200 + /api 401) | Grok Bot (deploy) + atlas-runtime | done | Sync caa4ee3e9 + atlas-runtime redeploy 252s (VPS tsc+next green, preflight login=200/api=401/badhost=403); all /api/runtime/* live & gated 401 |
 
 ## 24h-run acceptance (the bar for "Devin-class")
 - [ ] Agent runs 24h on one task without crash, context loss, or disk blowup (E2 + checkpoints).

@@ -74,6 +74,8 @@ export interface PublicConnection {
   url?: string;
   env?: Record<string, string>;
   source?: McpSource;
+  /** Live runtime status from the agent's MCP loader ("connected (12 tools)" / "failed: …"), once it has connected. */
+  status?: string;
   /** "connected": OAuth tokens stored; "available": the server may support OAuth sign-in. */
   oauth?: "connected" | "available";
 }
@@ -306,7 +308,8 @@ export function listConnections(): PublicConnection[] {
       id: name,
       type: "mcp",
       preset,
-      label: def.label ?? p?.label ?? name,
+      label: def.label ?? (def.preset && p ? p.label : name),
+      status: (globalThis as unknown as { __swarmMcpStatus?: Record<string, string> }).__swarmMcpStatus?.[name],
       enabled: !def.disabled,
       keyHint: mcpKeyHint(def),
       transport: mcpTransport(def),

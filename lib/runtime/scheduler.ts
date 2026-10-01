@@ -116,9 +116,12 @@ class Scheduler {
         },
         onNote: (text) => track(noteRun(taskId, run.id, text)),
         onQuotaWait: (ms, message) => {
-          parked = true;
-          track(waitTask(taskId, { kind: "quota", message, resumeAt: Date.now() + ms }));
-          track(addStep(taskId, run.id, { kind: "notice", label: "Paused on quota", detail: `${message} (${fmtDuration(ms)})` }));
+          // A quota wait only parks the task when the run was actually aborted. If the agent
+          // is still working (the router sleeps and retries in place), the wait is recorded
+          // and the run continues - that is what lets one task survive for 24h+ on a limited key.
+          if (controller.signal.aborted) parked = true;
+          track(noteRun(taskId, run.id, message));
+          track(addStep(taskId, run.id, { kind: "notice", label: "Waiting on quota", detail: `${message} (${fmtDuration(ms)})` }));
         },
       });
       await flush();

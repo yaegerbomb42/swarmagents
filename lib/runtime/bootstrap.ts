@@ -103,8 +103,13 @@ export function bootstrapRuntime(): void {
           });
         } else if (e.type === "tool") {
           hooks.onTool(e.name, e.status === "ok");
-        } else if (e.type === "notice" && e.level !== "info") {
-          hooks.onNote(e.text);
+        } else if (e.type === "notice") {
+          // A quota wait is reported so the ledger/UI can show it, but the run keeps going:
+          // the router sleeps and retries in place, so the work is not thrown away. We only
+          // park (see the scheduler) when the user aborts or the run genuinely cannot proceed.
+          const q = /Waiting (\d+)(s|m) for /.exec(e.text);
+          if (q) hooks.onNote(e.text);
+          else if (e.level !== "info") hooks.onNote(e.text);
         }
       };
       s.subs.add(mirror);

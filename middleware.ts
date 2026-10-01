@@ -27,4 +27,5 @@ export function middleware(req: NextRequest) {
 
 // Everything except static assets. Uploads bypass middleware (it buffers bodies with a size cap) and call
 // isLocal themselves.
-export const config = { matcher: ["/((?!_next/static|_next/image|favicon|api/upload).*)"] };
+// Node runtime: lib/auth hashes with node:crypto synchronously, so every caller (uploads included) stays sync.
+export const config = { matcher: ["/((?!_next/static|_next/image|favicon|api/upload).*)"], runtime: "nodejs" };

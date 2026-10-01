@@ -225,7 +225,8 @@ function number(lines: string[], start: number) {
 export const writeFile: Tool = {
   spec: {
     name: "write_file",
-    description: "Create or overwrite a file with the given content. Parent folders are created.",
+    description:
+      "Create or overwrite a file with the given content. Parent folders are created. A pre-write snapshot is taken automatically; the checkpoint id in the result can be passed to restore_checkpoint to undo.",
     schema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] },
   },
   async run(input, ctx) {
@@ -256,7 +257,7 @@ export const editFile: Tool = {
   spec: {
     name: "edit_file",
     description:
-      "Replace an exact string in a file. old_string must match exactly (including whitespace) and be unique unless replace_all is true. Read the file first.",
+      "Replace an exact string in a file. old_string must match exactly (including whitespace) and be unique unless replace_all is true. Read the file first. A pre-edit snapshot is taken automatically; the checkpoint id in the result can be passed to restore_checkpoint to undo.",
     schema: {
       type: "object",
       properties: { path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" }, replace_all: { type: "boolean" } },

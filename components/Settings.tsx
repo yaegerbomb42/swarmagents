@@ -457,7 +457,8 @@ function ConnRow(props: {
     if (c.source && c.source !== "swarm") sub.push(SOURCE_LABEL[c.source]);
     if (c.oauth === "connected") sub.push("signed in");
   }
-  const err = c.type === "llm" ? l?.lastError : undefined;
+  if (c.type === "mcp" && c.status && !c.status.startsWith("failed")) sub.push(c.status);
+  const err = c.type === "llm" ? l?.lastError : c.status?.startsWith("failed") ? c.status : undefined;
   return (
     <div
       className={`prov st-row${c.enabled ? "" : " off"}${props.dragging ? " dragging" : ""}`}

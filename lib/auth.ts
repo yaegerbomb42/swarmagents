@@ -1,15 +1,28 @@
-// Access control. Runs in middleware (edge runtime), so no Node imports.
+// Access control, shared by middleware (Node runtime) and route handlers that bypass it.
 //
 // With SWARM_AUTH_TOKEN unset the app is local-only: requests must come from 127.0.0.1/localhost pages.
 // With it set (any deployment), every request needs the token, via the httpOnly cookie set by /login or an
 // `Authorization: Bearer` header. Locality grants nothing then: behind a reverse proxy every request looks local.
+// On a server, set SWARM_AUTH_TOKEN_SHA256 (hex sha256 of the token) instead of the token itself: the agent runs
+// as the same user and can read this process's environment, so the plaintext must never be on the server.
 // SWARM_MODE=server fails closed: without a token nothing is served. SWARM_ALLOWED_HOSTS (comma list), when
 // set, restricts which Host names are answered at all.
 
+import { createHash, timingSafeEqual } from "node:crypto";
+
 export const AUTH_COOKIE = "swarm_auth";
 
-const token = () => process.env.SWARM_AUTH_TOKEN ?? "";
-export const authEnabled = () => token().length > 0;
+const sha256 = (s: string) => createHash("sha256").update(s).digest();
+
+/** Digest of the access token, or null when sign-in is not configured. */
+function expected(): Buffer | null {
+  const hex = (process.env.SWARM_AUTH_TOKEN_SHA256 ?? "").trim().toLowerCase();
+  if (/^[0-9a-f]{64}$/.test(hex)) return Buffer.from(hex, "hex");
+  const raw = process.env.SWARM_AUTH_TOKEN ?? "";
+  return raw ? sha256(raw) : null;
+}
+
+export const authEnabled = () => expected() !== null;
 export const serverMode = () => process.env.SWARM_MODE === "server";
 /** Server mode with no token configured: refuse everything rather than fall back to open. */
 export const misconfigured = () => serverMode() && !authEnabled();
@@ -33,14 +46,11 @@ export function clientIp(req: Request) {
   return xff.length >= 2 ? xff[xff.length - 2] : (xff[0] ?? req.headers.get("x-real-ip") ?? "local");
 }
 
-function safeEqual(a: string, b: string) {
-  if (!a || a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
+/** Compares digests, so the check is constant-time and never depends on the token's length. */
+export function checkToken(candidate: string) {
+  const want = expected();
+  return !!want && candidate.length > 0 && timingSafeEqual(sha256(candidate), want);
 }
-
-export const checkToken = (candidate: string) => authEnabled() && safeEqual(candidate, token());
 
 function cookie(req: Request, name: string) {
   for (const part of (req.headers.get("cookie") ?? "").split(";")) {

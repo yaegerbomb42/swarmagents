@@ -62,7 +62,7 @@ const TYPE_LABEL: Record<ConnType, string> = {
 };
 const TYPE_HINT: Record<ConnType, string> = {
   llm: "The agent uses the first enabled model and fails over down the list. Drag to reorder. Rate limits are learned from real 429s.",
-  tool: "Keys for services the agent's tools call. Each one is also available in the agent's shell as an environment variable.",
+  tool: "Keys for services the agent's tools call. web_search uses the search keys; connectors started as local commands get every key as an environment variable.",
   mcp: "MCP servers add tools: local commands or remote URLs. Servers you set up in Claude Code or Claude Desktop appear here automatically.",
 };
 

@@ -23,6 +23,13 @@ class Scheduler {
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
   private started = false;
+  /**
+   * Runs currently in flight, keyed by task. This is the single source of truth for "can this
+   * task be stopped", so pause/cancel go through the scheduler instead of reaching into the
+   * agent directly. It also lets a late-settling run detect that it has been superseded and
+   * must not overwrite the newer state.
+   */
+  private active = new Map<string, { controller: AbortController; runId: string; attempt: number }>();
 
   start() {
     if (this.started) return;
@@ -61,6 +68,26 @@ class Scheduler {
     void this.tick();
   }
 
+  /**
+   * Stop the live run for a task, if any, and hand back the task to the caller after it has
+   * settled. Aborting through the scheduler's own controller is what makes pause/cancel
+   * reliable: the agent stops, the run unwinds, and the stale-completion guard (isCurrent)
+   * keeps that unwinding run from overwriting the state the caller sets next.
+   */
+  async stopTask(taskId: string): Promise<void> {
+    const run = this.active.get(taskId);
+    if (!run) return;
+    run.controller.abort();
+    // Give the in-flight run a moment to settle so its guarded transitions don't race ours.
+    await Promise.resolve();
+    this.active.delete(taskId);
+  }
+
+  /** Is this run still the one we are tracking for the task? False once stopped or superseded. */
+  private isCurrent(taskId: string, runId: string): boolean {
+    return this.active.get(taskId)?.runId === runId;
+  }
+
   private async tick() {
     if (this.ticking) return;
     this.ticking = true;
@@ -96,6 +123,7 @@ class Scheduler {
     await addStep(taskId, run.id, { kind: "checkpoint", label: `Attempt ${attempt} started`, detail: running.prompt.slice(0, 200) });
 
     const controller = new AbortController();
+    this.active.set(taskId, { controller, runId: run.id, attempt });
     let parked = false;
     // Recorder hook promises. They are fire-and-forget during the run so hooks never
     // block the agent, but we flush them before any decision that reads usage (budget).
@@ -125,6 +153,13 @@ class Scheduler {
         },
       });
       await flush();
+
+      // If the user paused/cancelled (or the task was superseded) while we ran, this run is
+      // stale: record it as interrupted and return without touching the task's newer state.
+      if (!this.isCurrent(taskId, run.id)) {
+        await endRun(taskId, run.id, "interrupted", Date.now() - t0);
+        return;
+      }
 
       if (parked) {
         await endRun(taskId, run.id, "interrupted", Date.now() - t0);
@@ -160,6 +195,11 @@ class Scheduler {
         outcome: "success",
       });
     } catch (e) {
+      // A stopped/superseded run must not write failure state over a user's pause/cancel.
+      if (!this.isCurrent(taskId, run.id)) {
+        await endRun(taskId, run.id, "interrupted", Date.now() - t0);
+        return;
+      }
       const msg = (e as Error).message || String(e);
       await endRun(taskId, run.id, "failed", Date.now() - t0);
       await addStep(taskId, run.id, { kind: "notice", label: "Run failed", detail: msg, ok: false });
@@ -170,6 +210,9 @@ class Scheduler {
       } else {
         await waitTask(taskId, { kind: "backoff", message: `Retrying after error: ${msg.slice(0, 120)}`, resumeAt: Date.now() + 5000 });
       }
+    } finally {
+      // Release the slot only if we are still the registered run; a newer attempt owns it otherwise.
+      if (this.isCurrent(taskId, run.id)) this.active.delete(taskId);
     }
   }
 }

@@ -46,20 +46,19 @@ export async function POST(req: Request, { params }: Ctx) {
 
   switch (body.action) {
     case "cancel": {
-      // Stop the live run first so we don't orphan it, then mark cancelled.
-      try {
-        requireAdapter().stop(task.sessionId);
-      } catch {}
+      // Stop the live run through the scheduler first so it cannot overwrite the cancelled
+      // state when it unwinds, then mark cancelled.
+      await scheduler().stopTask(id);
       await cancelTask(id);
       return Response.json({ task: getTask(id) });
     }
     case "pause": {
-      try {
-        requireAdapter().stop(task.sessionId);
-      } catch {}
+      // Pause holds the task for the user, so it must NOT auto-resume: block on input rather
+      // than waiting (a waiting task with no resumeAt is treated as due and would restart).
+      await scheduler().stopTask(id);
       await updateTask(id, (t) => {
-        t.status = "waiting";
-        t.wait = { kind: "backoff", message: "Paused by the user.", resumeAt: undefined };
+        t.status = "blocked";
+        t.wait = { kind: "input", message: "Paused by the user. Press Resume to continue." };
       });
       return Response.json({ task: getTask(id) });
     }

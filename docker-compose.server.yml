@@ -20,7 +20,7 @@ services:
         required: false # missing token + SWARM_MODE=server => the app answers 503 (fails closed)
     environment:
       - SWARM_MODE=server
-      - SWARM_ALLOWED_HOSTS=swarmagents.codes
+      - SWARM_ALLOWED_HOSTS=swarmagents.codes,www.swarmagents.codes
       - SWARM_HOME=/data
       - HOME=/data/home
       - PORT=3400

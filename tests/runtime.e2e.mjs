@@ -53,6 +53,17 @@ const adapter = {
       return { summary: `survived a quota wait: ${task.title}`, verified: true };
     }
 
+    if (task.prompt.includes("HANG")) {
+      // Runs until aborted, so tests can pause/cancel a live run deterministically.
+      hooks.onQuotaWait(0, "working");
+      await new Promise((res) => {
+        if (hooks.signal.aborted) return res();
+        hooks.signal.addEventListener("abort", () => res(), { once: true });
+        setTimeout(res, 30_000).unref?.();
+      });
+      return { summary: "stopped" };
+    }
+
     if (task.prompt.includes("BIGOUT")) {
       const p = path.join(home, "big.txt");
       fs.writeFileSync(p, "x".repeat(5000));
@@ -147,6 +158,38 @@ const t6 = await createTask({ prompt: "delete me", title: "deletable" });
 const before = listTasks().length;
 await rt.deleteTask(t6.id, true);
 check("task removed from board", listTasks().length === before - 1);
+
+// ---- 7. Pause a live run: it stops, stays paused, and the stale run must not overwrite ----
+console.log("\n7. pausing a live run stops it without the stale run overwriting state");
+const t7 = await createTask({ prompt: "HANG please", title: "pausable" });
+scheduler().kick();
+await until(() => getTask(t7.id)?.status === "running", 8000);
+check("task is running before pause", getTask(t7.id)?.status === "running", getTask(t7.id)?.status);
+// Mirror the API route: stop through the scheduler, then hold the task (blocked, needs input).
+await scheduler().stopTask(t7.id);
+await updateTask(t7.id, (t) => {
+  t.status = "blocked";
+  t.wait = { kind: "input", message: "Paused by the user. Press Resume to continue." };
+});
+// Let the aborted run fully unwind; it must not flip the task back to done/running.
+await sleep(400);
+const afterPause = getTask(t7.id);
+check("task stays blocked after pause", afterPause?.status === "blocked", afterPause?.status);
+check("pause did not auto-resume", afterPause?.status !== "waiting", afterPause?.status);
+const led7 = getLedger(t7.id);
+check("stopped run recorded as interrupted", led7.runs.some((r) => r.status === "interrupted"), led7.runs.map((r) => r.status).join(","));
+
+// Resume then cancel a live run: cancel must stick and not be overwritten.
+await rt.updateTask(t7.id, (t) => {
+  t.status = "queued";
+  t.wait = undefined;
+});
+scheduler().kick();
+await until(() => getTask(t7.id)?.status === "running", 8000);
+await scheduler().stopTask(t7.id);
+await rt.cancelTask(t7.id);
+await sleep(400);
+check("cancel sticks after the run unwinds", getTask(t7.id)?.status === "cancelled", getTask(t7.id)?.status);
 
 console.log(`\n${failures === 0 ? "RUNTIME E2E PASS" : `RUNTIME E2E FAIL (${failures})`}`);
 process.exit(failures === 0 ? 0 : 1);

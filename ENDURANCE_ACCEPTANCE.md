@@ -13,7 +13,7 @@ This is the release gate for claiming that SwarmAgents can keep one task moving 
 | Context pressure | Drive estimated context past each compaction threshold repeatedly | Preserve original goal, recent user steering, current plan, tool outcomes and file paths; resume with a valid provider transcript | compaction events, pre/post token estimates, retained-tail inspection |
 | Stop and continue | Stop during a tool call, then continue the task | Stop promptly; represent uncertainty honestly; continue only after state inspection; no orphaned running indicator | stop latency, tool state, subsequent action trace |
 | Durable artifacts | Create/edit files, checkpoints, plans and task events, then restart | All completed artifacts and undo checkpoints remain available and correspond to disk state | paths, checkpoint IDs, hashes, before/after restart |
-| Storage bounds | Upload near-limit and over-limit files; interrupt transfers; repeat until disk reserve boundary | Reject over-limit input before/while streaming, preserve configured free-space reserve, remove partial uploads, explain failure in Composer | configured cap/reserve, bytes written, free-space before/after, partial-file scan |
+| Storage bounds | Upload near-limit and over-limit files; interrupt transfers; restart mid-transfer; repeat concurrent uploads until disk reserve boundary | Reject over-limit input before/while streaming, reserve aggregate declared bytes across concurrent requests, atomically expose completed files, remove request failures and crash-left partials, explain failure in Composer | configured cap/reserve, bytes written, free-space before/after, partial-file scan |
 | UI state | Observe waiting, running, tool execution, recovery, stop, completion and failure | One task view always distinguishes these states; elapsed time/progress reflect persisted events and never imply success after failure | screenshots plus session/event timestamps |
 | Secret handling | Run shell and MCP child processes while auth and provider secrets are configured | Children receive only credentials explicitly required for that integration; owner auth token is not exposed; settings/API responses redact secrets | child environment key names, API response scan, deploy env mode (never capture secret values) |
 
@@ -29,4 +29,6 @@ This is the release gate for claiming that SwarmAgents can keep one task moving 
 
 - Acceptance criteria documented; no 24-hour soak has been run or passed.
 - Known blocker: compaction tail selection must preserve the newest user steer verbatim.
+- Stop/pause race fix is integrated: scheduler-owned abort controller, run ownership checks, and blocked/input pause state prevent duplicate scheduling and stale completion writes. Owner reports the runtime suite passed 20/20; this has not been independently re-run in this coordinator pass.
+- Provider cooldowns still need restart-persistent exhaustion/transient backoff; rate-limit cooldown persistence alone does not cover process-local bench state.
 - Short deterministic e2e harness has reported compaction as its sole failing case; latest owner report is pending.

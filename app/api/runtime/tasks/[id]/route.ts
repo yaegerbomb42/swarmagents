@@ -5,7 +5,6 @@ import {
   getTask,
   listArtifacts,
   progressOf,
-  requireAdapter,
   scheduler,
   setKept,
   summarizeUsage,

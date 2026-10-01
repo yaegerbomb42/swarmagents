@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
@@ -584,12 +584,17 @@ export async function testConnection(input: ConnectionInput): Promise<TestResult
     return { ok: false, message: (e as Error).message };
   }
   const name = found?.name ?? "connection-test";
-  const secrets = [...Object.values(def.env ?? {}), ...Object.values(def.headers ?? {})];
+  const env = def.url ? {} : mcpEnv(def.env);
+  const secrets = [...Object.values(def.env ?? {}), ...Object.keys(def.env ?? {}).map((k) => env[k]), ...Object.values(def.headers ?? {})].filter((v) => v && v.length >= 6);
   const { client, close } = mcpClient();
+  // For a local command, keep the tail of its stderr so a crash says why (missing file, bad flag…).
+  let stderrTail = "";
+  const transport = def.url ? transportFor(name, def) : new StdioClientTransport({ command: def.command!, args: def.args ?? [], env, stderr: "pipe" });
+  if (transport instanceof StdioClientTransport) transport.stderr?.on("data", (b: Buffer) => (stderrTail = (stderrTail + b.toString()).slice(-2000)));
   try {
     const { tools } = await withTimeout(
       (async () => {
-        await client.connect(transportFor(name, def));
+        await client.connect(transport);
         return client.listTools();
       })(),
       def.url ? 20_000 : 90_000,
@@ -599,7 +604,11 @@ export async function testConnection(input: ConnectionInput): Promise<TestResult
   } catch (e) {
     if (e instanceof UnauthorizedError || /401|unauthorized|invalid_token/i.test(String((e as Error).message)))
       return { ok: false, needsAuth: true, message: def.url ? "This server needs you to sign in." : "The server rejected its credentials." };
-    return { ok: false, message: redact(errMessage(e), secrets) };
+    const lines = stderrTail.split("\n").map((l) => l.trim()).filter((l) => l && !/^at /.test(l));
+    const errLine = lines.filter((l) => /\b(error|cannot|not found|enoent|eacces|denied|failed|invalid|missing|required|unknown)\b/i.test(l)).at(-1);
+    const why = (errLine ?? lines.slice(-2).join(" · ")).slice(0, 300);
+    const msg = errMessage(e);
+    return { ok: false, message: redact(why ? `${/connection closed/i.test(msg) ? "The command exited" : msg}: ${why}` : /connection closed/i.test(msg) ? "The command exited before it started an MCP server. Check the command and arguments." : msg, secrets) };
   } finally {
     await close();
   }
@@ -615,7 +624,29 @@ export function transportFor(name: string, def: McpDef) {
     const opts = { requestInit: { headers: def.headers }, authProvider: hasMcpTokens(name) ? new McpOAuthProvider(name) : undefined };
     return def.type === "sse" ? new SSEClientTransport(new URL(def.url), opts) : new StreamableHTTPClientTransport(new URL(def.url), opts);
   }
-  return new StdioClientTransport({ command: def.command!, args: def.args ?? [], env: { ...(process.env as Record<string, string>), ...toolEnv(), ...def.env }, stderr: "ignore" });
+  return new StdioClientTransport({ command: def.command!, args: def.args ?? [], env: mcpEnv(def.env), stderr: "ignore" });
+}
+
+/** Non-secret variables a local server may need to find its runtime, locale, temp dir, proxy and CA certs. */
+const MCP_PASSTHROUGH = /^(LANG|LC_[A-Z]+|TZ|TMPDIR|TEMP|TMP|XDG_[A-Z_]+|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|HTTPS?_PROXY|NO_PROXY|https?_proxy|no_proxy|NVM_DIR|NVM_BIN|VOLTA_HOME|PNPM_HOME|BUN_INSTALL|PYENV_ROOT|UV_[A-Z_]+|COLORTERM)$/;
+
+/**
+ * Environment for a local (stdio) MCP server: least privilege. A third-party connector package gets the
+ * SDK's minimal set (HOME, PATH, SHELL, TERM, USER, LOGNAME), a few non-secret runtime variables, and the
+ * variables its own definition sets. It never inherits the server's environment (owner token, provider
+ * keys) or other connectors' keys. A value can reference a saved Tool key or an env var as `${VAR}`
+ * (Claude Code's syntax), so a key is only handed to the connector that names it. SWARM_* never resolves.
+ */
+export function mcpEnv(own: Record<string, string> = {}): Record<string, string> {
+  const env: Record<string, string> = getDefaultEnvironment();
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && MCP_PASSTHROUGH.test(k)) env[k] = v;
+  const keys = toolEnv();
+  const lookup = (name: string) => (name.startsWith("SWARM_") ? "" : (keys[name] ?? process.env[name] ?? ""));
+  for (const [k, v] of Object.entries(own)) {
+    if (k.startsWith("SWARM_")) continue;
+    env[k] = String(v).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g, (_, name: string, dflt?: string) => lookup(name) || dflt || "");
+  }
+  return env;
 }
 
 function mcpClient() {

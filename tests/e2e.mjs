@@ -232,7 +232,10 @@ const cases = {
     r = await api("POST", "/api/connections/test", { type: "tool", id: tk.id });
     assert(r.json.ok, "tool key test by id", r.json);
     // MCP stdio server: test lists its tools, save writes mcp.json in Claude's shape.
-    const mcpDef = { type: "mcp", preset: "custom-stdio", label: "Mock MCP", command: process.execPath, args: [path.join(ROOT, "tests/mock-mcp.mjs")], env: { MOCK_MCP_SECRET: "mcp-secret-9999" } };
+    const mcpDef = { type: "mcp", preset: "custom-stdio", label: "Mock MCP", command: process.execPath, args: [path.join(ROOT, "tests/mock-mcp.mjs")], env: { MOCK_MCP_SECRET: "mcp-secret-9999", MOCK_REF: "${MOCK_SERVICE_KEY}" } };
+    // A command that exits says why (its stderr), not just "Connection closed".
+    r = await api("POST", "/api/connections/test", { type: "mcp", preset: "custom-stdio", command: process.execPath, args: [path.join(WORK, "missing-server.js")] });
+    assert(r.json.ok === false && /exited.*(Cannot find module|MODULE_NOT_FOUND)/.test(r.json.message), "crashed MCP command should report its stderr", r.json);
     r = await api("POST", "/api/connections/test", mcpDef);
     assert(r.json.ok && r.json.tools.map((t) => t.name).join() === "echo,add", "MCP test should list echo,add", r.json);
     r = await api("POST", "/api/connections", mcpDef);
@@ -340,8 +343,8 @@ const cases = {
     const { events } = await runTask("[mock:mcp] use the mcp tool", { timeout: 120_000 });
     const t = tools(events).find((x) => /^mcp__mock-mcp__echo$/.test(x.name));
     assert(t?.status === "ok", "MCP tool not called", summarize(events));
-    assert(/MCP said: mcp-echo:via-mcp \(secret set\)/.test(texts(events)), "MCP result/env not delivered", summarize(events));
-    return "agent called a Settings-added MCP server (env secret reached it)";
+    assert(/MCP said: mcp-echo:via-mcp \(secret set\) \(ref ok\) \(leak no\)/.test(texts(events)), "MCP env: own secret + ${VAR} key ref, nothing else from the server env", summarize(events));
+    return "agent called a Settings-added MCP server (own env + ${VAR} key ref delivered, server env not leaked)";
   },
 
   async search() {
@@ -414,7 +417,7 @@ async function main() {
   start(process.execPath, [path.join(ROOT, "tests/mock-llm.mjs"), String(MOCK_PORT)], { MOCK_WORKDIR: WORK }, path.join(HOME, "mock-llm.log"));
   await waitFor(`${MOCK}/__mock/health`, 10_000, "mock LLM");
   if (!opt("--url")) {
-    const env = { SWARM_HOME: HOME, NEXT_DIST_DIR: flag("--prod") ? ".next-e2e-prod" : ".next-e2e", NEXT_TELEMETRY_DISABLED: "1", SWARM_STALL_MS: "30000", SWARM_SEARCH_MOCK: `${MOCK}/search` };
+    const env = { SWARM_HOME: HOME, NEXT_DIST_DIR: flag("--prod") ? ".next-e2e-prod" : ".next-e2e", NEXT_TELEMETRY_DISABLED: "1", SWARM_STALL_MS: "30000", SWARM_SEARCH_MOCK: `${MOCK}/search`, E2E_SERVER_CANARY: "canary-1", SWARM_E2E_CANARY: "canary-2" };
     const next = path.join(ROOT, "node_modules/.bin/next");
     if (flag("--prod")) {
       console.log(c.d("building (next build)…"));

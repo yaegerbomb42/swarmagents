@@ -16,7 +16,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = req.params.arguments ?? {};
-  if (req.params.name === "echo") return { content: [{ type: "text", text: `mcp-echo:${args.text}${process.env.MOCK_MCP_SECRET ? " (secret set)" : ""}` }] };
+  if (req.params.name === "echo") return { content: [{ type: "text", text: `mcp-echo:${args.text}${process.env.MOCK_MCP_SECRET ? " (secret set)" : ""} (ref ${process.env.MOCK_REF === "tool-secret-5678" ? "ok" : "missing"}) (leak ${process.env.E2E_SERVER_CANARY || process.env.SWARM_E2E_CANARY || process.env.MOCK_SERVICE_KEY ? "YES" : "no"})` }] };
   if (req.params.name === "add") return { content: [{ type: "text", text: String(Number(args.a) + Number(args.b)) }] };
   return { content: [{ type: "text", text: `unknown tool ${req.params.name}` }], isError: true };
 });

@@ -9,8 +9,19 @@ export function isLocal(req: Request) {
 }
 
 export function middleware(req: NextRequest) {
-  return isLocal(req) ? NextResponse.next() : new NextResponse("forbidden", { status: 403 });
+  if (!isLocal(req)) return new NextResponse("forbidden", { status: 403 });
+  // One canonical local origin (127.0.0.1): localStorage, and the OAuth
+  // callback landing, must not split across localhost/127.0.0.1.
+  // Redirect document navigations only — API/fetch/SSE/curl on localhost keep working.
+  const host = (req.headers.get("host") ?? "").split(":")[0];
+  if (host === "localhost" && req.headers.get("sec-fetch-mode") === "navigate") {
+    const u = new URL(req.url);
+    u.hostname = "127.0.0.1";
+    return NextResponse.redirect(u, 308);
+  }
+  return NextResponse.next();
 }
 
 // Uploads bypass middleware (it buffers bodies with a size cap) and check locality themselves.
-export const config = { matcher: "/api/((?!upload).*)" };
+// "/" is matched so the canonical-host redirect (and the local guard) also cover page loads.
+export const config = { matcher: ["/", "/api/((?!upload).*)"] };

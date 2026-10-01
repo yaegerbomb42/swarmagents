@@ -1,3 +1,4 @@
+import { getSearchConfig } from "../store";
 import { clip, type Tool } from "./types";
 
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36";
@@ -28,11 +29,39 @@ export const webSearch: Tool = {
     schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
   },
   async run(input, ctx) {
+    // Preferred path when the user configured a search key (env TAVILY_API_KEY /
+    // SEARCH_API_KEY, or settings.json `search`); otherwise fall back to scraping.
+    const cfg = getSearchConfig();
+    if (cfg?.provider === "tavily" && cfg.apiKey) {
+      try {
+        return await tavilySearch(String(input.query), cfg.apiKey, ctx.signal);
+      } catch (e) {
+        return { content: `Search API error (${e instanceof Error ? e.message : e}); no fallback results.` };
+      }
+    }
+    return duckScrape(String(input.query), ctx.signal);
+  },
+};
+
+async function tavilySearch(query: string, apiKey: string, signal: AbortSignal) {
+  const res = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({ query, max_results: 10, search_depth: "basic", include_answer: false }),
+    signal,
+  });
+  if (!res.ok) return { content: `Search API error (${res.status}); try again or check the key.`, isError: true };
+  const d = (await res.json()) as { results?: { title?: string; url?: string; content?: string }[] };
+  const results = (d.results ?? []).slice(0, 10).map((r, i) => `${i + 1}. ${r.title ?? r.url ?? ""}\n   ${r.url ?? ""}\n   ${(r.content ?? "").replace(/\s+/g, " ").slice(0, 500)}`);
+  return { content: results.join("\n\n") || "No results." };
+}
+
+async function duckScrape(query: string, signal: AbortSignal) {
     const res = await fetch("https://html.duckduckgo.com/html/", {
       method: "POST",
       headers: { "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ q: String(input.query) }),
-      signal: ctx.signal,
+      body: new URLSearchParams({ q: query }),
+      signal,
     });
     const html = await res.text();
     const results: string[] = [];
@@ -45,8 +74,7 @@ export const webSearch: Tool = {
       if (results.length >= 10) break;
     }
     return { content: results.join("\n\n") || "No results (search may be blocked; try the browser tool with a search engine)." };
-  },
-};
+}
 
 export const webFetch: Tool = {
   spec: {

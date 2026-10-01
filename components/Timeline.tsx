@@ -105,6 +105,106 @@ function toolName(name: string) {
   return TOOL_LABEL[name] ?? name;
 }
 
+/** Parse "[checkpoint <id> path=<abs>]" markers out of tool output. */
+function checkpoints(output: string): { id: string; path: string }[] {
+  const out: { id: string; path: string }[] = [];
+  for (const m of output.matchAll(/\[checkpoint ([a-f0-9]+) path=([^\]]+)\]/g)) out.push({ id: m[1], path: m[2] });
+  return out;
+}
+
+/** Split tool output into pre/diff/post around --- old / +++ new style sections. Returns null if no diff present. */
+function splitDiff(output: string): { head: string; oldText: string; newText: string; tail: string } | null {
+  const lines = output.split("\n");
+  const oldIdx = lines.findIndex((l) => l.trim() === "--- old" || l.startsWith("--- before"));
+  if (oldIdx < 0) return null;
+  const plusIdx = lines.findIndex((l, i) => i > oldIdx && (l.trim() === "+++ new" || l.startsWith("+++ after")));
+  if (plusIdx < 0) return null;
+  return {
+    head: lines.slice(0, oldIdx).filter((l) => !l.startsWith("[checkpoint ")).join("\n").trim(),
+    oldText: lines.slice(oldIdx + 1, plusIdx).join("\n"),
+    newText: lines.slice(plusIdx + 1).join("\n"),
+    tail: "",
+  };
+}
+
+/** Tiny line diff: returns rows of [kind, text] where kind is " " | "-" | "+". */
+function lineDiff(oldText: string, newText: string): [string, string][] {
+  const a = oldText.split("\n");
+  const b = newText.split("\n");
+  // Simple LCS on capped inputs so huge outputs stay fast.
+  const A = a.slice(0, 400);
+  const B = b.slice(0, 400);
+  const n = A.length;
+  const m = B.length;
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--) dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const rows: [string, string][] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m && rows.length < 300) {
+    if (A[i] === B[j]) {
+      rows.push([" ", A[i].slice(0, 300)]);
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) rows.push(["-", A[i++].slice(0, 300)]);
+    else rows.push(["+", B[j++].slice(0, 300)]);
+  }
+  while (i < n && rows.length < 300) rows.push(["-", A[i++].slice(0, 300)]);
+  while (j < m && rows.length < 300) rows.push(["+", B[j++].slice(0, 300)]);
+  return rows;
+}
+
+function Diff({ oldText, newText }: { oldText: string; newText: string }) {
+  const rows = lineDiff(oldText, newText);
+  const adds = rows.filter((r) => r[0] === "+").length;
+  const dels = rows.filter((r) => r[0] === "-").length;
+  return (
+    <div className="diff">
+      <div className="label">
+        Changes · <span className="add">+{adds}</span> <span className="del">−{dels}</span>
+      </div>
+      <pre className="diff-body">
+        {rows.map(([k, t], idx) => (
+          <div key={idx} className={k === "+" ? "add" : k === "-" ? "del" : "ctx"}>
+            <span className="sign">{k}</span> {t}
+          </div>
+        ))}
+      </pre>
+    </div>
+  );
+}
+
+function UndoButton({ checkpoint, path }: { checkpoint: string; path: string }) {
+  const [state, setState] = useState<"idle" | "doing" | "done" | "error">("idle");
+  if (state === "done") return <span className="undo done">✓ Restored</span>;
+  return (
+    <button
+      className="undo"
+      disabled={state === "doing"}
+      title={`Restore ${path} to before this edit`}
+      onClick={async (e) => {
+        e.stopPropagation();
+        setState("doing");
+        try {
+          const r = await fetch("/api/checkpoints/restore", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ checkpoint }),
+          });
+          setState(r.ok ? "done" : "error");
+          if (!r.ok) setTimeout(() => setState("idle"), 2500);
+        } catch {
+          setState("error");
+          setTimeout(() => setState("idle"), 2500);
+        }
+      }}
+    >
+      {state === "doing" ? "Restoring…" : state === "error" ? "Failed — retry?" : "Undo this edit"}
+    </button>
+  );
+}
+
 function Tool({ e, onImage }: { e: Ev<"tool">; onImage: (src: string) => void }) {
   const live = e.status === "running" || e.status === "streaming";
   const [open, setOpen] = useState<boolean | null>(null);
@@ -135,7 +235,26 @@ function Tool({ e, onImage }: { e: Ev<"tool">; onImage: (src: string) => void })
           {(e.output || e.status === "running") && (
             <>
               <div className="label">Output</div>
-              <pre className={e.status === "error" ? "err" : ""}>{e.output || "…"}</pre>
+              {(() => {
+                const d = e.output ? splitDiff(e.output) : null;
+                const cps = e.output ? checkpoints(e.output) : [];
+                if (!d)
+                  return <pre className={e.status === "error" ? "err" : ""}>{e.output || "…"}</pre>;
+                return (
+                  <>
+                    {d.head && <pre className="head-pre">{d.head}</pre>}
+                    <Diff oldText={d.oldText} newText={d.newText} />
+                    {!!cps.length && (
+                      <div className="undo-row">
+                        <UndoButton checkpoint={cps[0].id} path={cps[0].path} />
+                        <span className="undo-hint" title={cps[0].path}>
+                          Restores {cps[0].path.split("/").slice(-2).join("/")}
+                        </span>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
             </>
           )}
           {!!e.images?.length && (

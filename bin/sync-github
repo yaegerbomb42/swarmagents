@@ -1,0 +1,32 @@
+#!/bin/bash
+# Push the current state of this folder to https://github.com/yaegerbomb42/swarmagents (main).
+# Usage: bin/sync-github "short message about what changed"
+# Builds a commit on top of the remote main from this folder only (respects .gitignore),
+# never touches the monorepo's index or history, and refuses to push if it finds API keys.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+REMOTE=https://github.com/yaegerbomb42/swarmagents.git
+MSG="${1:-sync}"
+ROOT=$(git rev-parse --show-toplevel)
+PREFIX=$(git rev-parse --show-prefix); PREFIX=${PREFIX%/}
+LOCK=/tmp/swarmagents-sync.lock
+for i in $(seq 1 60); do mkdir "$LOCK" 2>/dev/null && break; sleep 1; [ "$i" = 60 ] && { echo "sync lock busy (another agent is pushing). Try again."; exit 1; }; done
+TMPIDX=$(mktemp)
+trap 'rm -rf "$LOCK" "$TMPIDX"' EXIT
+export GIT_INDEX_FILE="$TMPIDX"
+git -C "$ROOT" read-tree --empty
+git -C "$ROOT" add -A -- "$PREFIX"
+TREE=$(git -C "$ROOT" write-tree --prefix="$PREFIX/")
+unset GIT_INDEX_FILE
+if git -C "$ROOT" grep -I -n -E 'sk-ant-[A-Za-z0-9_-]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|sk-or-v1-[a-f0-9]{30,}|AIza[0-9A-Za-z_-]{35}|ghp_[A-Za-z0-9]{30,}|gsk_[A-Za-z0-9]{30,}|xai-[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY' "$TREE" >&2; then
+  echo "Refusing to push: possible secret above. Remove it (keys belong in ~/.swarmagents) and retry." >&2; exit 1
+fi
+for attempt in 1 2 3; do
+  git -C "$ROOT" fetch -q "$REMOTE" main
+  PARENT=$(git -C "$ROOT" rev-parse FETCH_HEAD)
+  if [ "$(git -C "$ROOT" rev-parse "$PARENT^{tree}")" = "$TREE" ]; then echo "Nothing new to push."; exit 0; fi
+  C=$(git -C "$ROOT" commit-tree "$TREE" -p "$PARENT" -m "$MSG")
+  if git -C "$ROOT" push -q "$REMOTE" "$C:refs/heads/main"; then echo "Pushed ${C:0:9} to $REMOTE: $MSG"; exit 0; fi
+  sleep 3
+done
+echo "Push failed after 3 attempts." >&2; exit 1

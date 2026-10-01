@@ -2,14 +2,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { AppendField, AgentEvent, Attachment, Block, ContextInfo, Msg, PlanItem, ProviderConfig, SessionMeta, StreamOp } from "./types";
-import { getMeta, loadEvents, loadHistory, newId, saveEvents, saveHistory, saveMeta, UPLOADS_DIR } from "./store";
+import { getMeta, listSessions, loadEvents, loadHistory, newId, saveEvents, saveHistory, saveMeta, UPLOADS_DIR } from "./store";
 import { contextWindow, estimateTokens, routeTurn, setLearnedContext, activeProviders } from "./router";
 import { ProviderError } from "./providers/types";
 import { allTools } from "./tools";
 import type { Tool } from "./tools/types";
 
 const READ_ONLY = new Set(["read_file", "search", "web_search", "web_fetch"]);
-const MAX_STEPS = 400;
+/** Identical tool calls in a row before the agent is told it is looping, and before the run is stopped. */
+const LOOP_WARN = 5;
+const LOOP_STOP = 10;
+/** Times the agent is sent back to an unfinished plan without making progress before we accept its stop. */
+const MAX_PLAN_NUDGES = 2;
 
 function systemPrompt(cwd: string, tools: Tool[]) {
   const mcp = [...new Set(tools.filter((t) => t.spec.name.startsWith("mcp__")).map((t) => t.spec.name.split("__")[1]))];
@@ -36,7 +40,7 @@ class Session {
   running = false;
   abort: AbortController | null = null;
   subs = new Set<(op: StreamOp) => void>();
-  inbox: { text: string; attachments: Attachment[] }[] = [];
+  inbox: { text: string; attachments: Attachment[]; resumeNote?: string }[] = [];
   context: ContextInfo = { tokens: 0, window: 200_000 };
   /** Tokens the provider counts beyond our history estimate (system prompt, tool schemas, estimate error). */
   private overhead = 0;
@@ -141,6 +145,25 @@ class Session {
     this.emit({ op: "running", running: r });
   }
 
+  private setActive(a: boolean) {
+    if (!!this.meta.active === a) return;
+    this.meta.active = a;
+    saveMeta(this.meta);
+  }
+
+  /** Continue a run that was cut off by a crash or restart. */
+  resume() {
+    if (this.running) return;
+    this.repairHistory("[interrupted: the agent process restarted while this was running]");
+    this.add({ type: "notice", level: "info", text: "Resumed after a restart. Interrupted tool calls were cancelled; the agent will re-check state and continue." } as AgentEvent);
+    this.inbox.push({
+      text: "",
+      attachments: [],
+      resumeNote: "[Automatic note, not from the user] The agent process restarted mid-task. Any tool calls in flight were interrupted and may have partially run. Re-check the current state (files, processes, browser) before continuing, then carry on with the task.",
+    });
+    void this.loop();
+  }
+
   setContext(tokens: number, p?: ProviderConfig) {
     this.context = { tokens, window: contextWindow(p ?? activeProviders()[0]), provider: p?.label, model: p?.model };
     this.emit({ op: "context", context: this.context });
@@ -168,6 +191,7 @@ class Session {
     for (const [i, m] of items.entries()) {
       if (this.running && i === 0 && this.history.length && this.history.at(-1)?.role === "user")
         blocks.push({ type: "text", text: "[The user sent this while you were working. Take it into account now.]" });
+      if (m.resumeNote) blocks.push({ type: "text", text: m.resumeNote });
       for (const a of m.attachments) blocks.push(...attachmentBlocks(a));
       if (m.text) blocks.push({ type: "text", text: m.text });
     }
@@ -188,10 +212,17 @@ class Session {
     }
     const toolMap = new Map(tools.map((t) => [t.spec.name, t]));
     const planEv = { current: null as AgentEvent | null };
+    this.setActive(true);
+    let stopReason: "done" | "user" | "error" = "done";
+    let lastSig = "";
+    let repeats = 0;
+    let nudges = 0;
+    let doneAtNudge = -1;
 
     try {
       this.pushUser(this.drainInbox());
-      for (let step = 0; step < MAX_STEPS; step++) {
+      // No step cap: a long task may take thousands of steps. Loops are caught by the repetition check below.
+      for (;;) {
         await this.maybeCompact(signal, false);
         const turn = await this.runTurn(tools, signal);
         this.history.push({ role: "assistant", blocks: turn.blocks });
@@ -207,16 +238,49 @@ class Session {
             this.pushUser(this.drainInbox());
             continue;
           }
+          // Hold the agent to its own plan: stopping with open steps is usually premature on long tasks.
+          const open = (this.meta.plan ?? []).filter((i) => i.status !== "done");
+          const done = (this.meta.plan ?? []).length - open.length;
+          if (turn.stop === "end" && open.length && planEv.current) {
+            if (done > doneAtNudge) nudges = 0;
+            if (nudges < MAX_PLAN_NUDGES) {
+              nudges++;
+              doneAtNudge = done;
+              this.add({ type: "notice", level: "info", text: `Plan has ${open.length} open step${open.length > 1 ? "s" : ""}; asking the agent to continue.` } as AgentEvent);
+              this.history.push({
+                role: "user",
+                blocks: [
+                  {
+                    type: "text",
+                    text: `[Automatic check, not from the user] Your plan still has open steps:\n${open.map((i) => `- ${i.text}`).join("\n")}\nIf they are still needed, keep working on them now. If they are finished or no longer needed, update the plan to reflect that. If you are genuinely blocked on the user, say exactly what you need and stop.`,
+                  },
+                ],
+              });
+              continue;
+            }
+          }
+          break;
+        }
+
+        const sig = JSON.stringify(calls.map((c) => [c.name, c.input]));
+        repeats = sig === lastSig ? repeats + 1 : 1;
+        lastSig = sig;
+        if (repeats >= LOOP_STOP) {
+          this.history.push({ role: "user", blocks: calls.map((c) => ({ type: "tool_result" as const, id: c.id, content: "[not run: identical call repeated too many times]", isError: true })) });
+          this.add({ type: "notice", level: "warn", text: `Stopped: the agent repeated the same ${calls[0].name} call ${repeats} times in a row. Send a message to steer it.` } as AgentEvent);
           break;
         }
 
         const results = await this.runTools(calls, toolMap, signal, planEv);
-        this.history.push({ role: "user", blocks: [...results, ...this.drainInbox()] });
+        const warn: Block[] =
+          repeats >= LOOP_WARN ? [{ type: "text", text: `[Automatic check, not from the user] You have made this exact call ${repeats} times in a row. If you are deliberately polling, put a longer sleep in the command itself; otherwise this is not making progress, so change approach.` }] : [];
+        this.history.push({ role: "user", blocks: [...results, ...warn, ...this.drainInbox()] });
         this.flush();
       }
     } catch (e) {
       const err = e as ProviderError;
-      if (err.kind === "aborted" || signal.aborted) {
+      stopReason = err.kind === "aborted" || signal.aborted ? "user" : "error";
+      if (stopReason === "user") {
         this.add({ type: "notice", level: "info", text: "Stopped." } as AgentEvent);
         this.repairHistory();
       } else {
@@ -226,6 +290,8 @@ class Session {
     } finally {
       for (const ev of this.events) if ("done" in ev && ev.done === false) this.patch(ev, { done: true } as Partial<AgentEvent>);
       this.abort = null;
+      // Only a clean finish, an error or a user stop clears this; a crash leaves it set so boot resumes the run.
+      if (!this.inbox.length || stopReason !== "done") this.setActive(false);
       this.flush();
       this.setRunning(false);
       if (this.inbox.length) void this.loop();
@@ -239,11 +305,11 @@ class Session {
   }
 
   /** Keep history valid for the next turn after an interruption: every tool_call needs a result. */
-  private repairHistory() {
+  private repairHistory(note = "[interrupted by user]") {
     const last = this.history.at(-1);
     if (last?.role === "assistant") {
       const calls = last.blocks.filter((b) => b.type === "tool_call") as Extract<Block, { type: "tool_call" }>[];
-      if (calls.length) this.history.push({ role: "user", blocks: calls.map((c) => ({ type: "tool_result", id: c.id, content: "[interrupted by user]", isError: true })) });
+      if (calls.length) this.history.push({ role: "user", blocks: calls.map((c) => ({ type: "tool_result", id: c.id, content: note, isError: true })) });
     }
     if (last?.role === "user" && !last.blocks.length) this.history.pop();
   }
@@ -344,6 +410,8 @@ class Session {
             signal,
             onOutput: (chunk) => this.patch(ev, {}, { field: "output", value: chunk }),
             setPlan: (items: PlanItem[]) => {
+              this.meta.plan = items;
+              saveMeta(this.meta);
               if (planEv.current) this.patch(planEv.current, { items } as Partial<AgentEvent>);
               else planEv.current = this.add({ type: "plan", items } as AgentEvent);
             },
@@ -478,6 +546,11 @@ export function session(id: string): Session | null {
     sessions.set(id, s);
   }
   return s;
+}
+
+/** Called once at server boot: pick up every run that was still going when the process died. */
+export function resumeActiveSessions() {
+  for (const m of listSessions()) if (m.active) session(m.id)?.resume();
 }
 
 export function dropSession(id: string) {

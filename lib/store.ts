@@ -37,7 +37,31 @@ export function getProviders(): ProviderConfig[] {
 }
 
 export function saveProviders(providers: ProviderConfig[]) {
-  writeJson(SETTINGS, { providers });
+  // Preserve sibling settings fields (e.g. search) that live in the same file.
+  const cur = readJson<Record<string, unknown>>(SETTINGS, {});
+  writeJson(SETTINGS, { ...cur, providers });
+}
+
+// ---- Web search (optional API key; lane B may surface this in Settings UI) ----
+
+export interface SearchConfig {
+  provider: "tavily";
+  apiKey: string;
+}
+
+export function getSearchConfig(): SearchConfig | null {
+  const s = readJson<{ search?: SearchConfig }>(SETTINGS, {});
+  if (s.search?.apiKey) return s.search;
+  const env = process.env.TAVILY_API_KEY || process.env.SEARCH_API_KEY;
+  if (env) return { provider: "tavily", apiKey: env };
+  return null;
+}
+
+export function saveSearchConfig(search: SearchConfig | null) {
+  const cur = readJson<Record<string, unknown>>(SETTINGS, {});
+  if (search) cur.search = search;
+  else delete cur.search;
+  writeJson(SETTINGS, cur);
 }
 
 // ---- Learned rate limits (persist across restarts) ----

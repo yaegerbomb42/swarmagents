@@ -137,14 +137,23 @@ export async function routeTurn(req: ChatRequest, cb: StreamCallbacks, hooks: Ro
       const r = p.kind === "anthropic" ? await streamAnthropic(p, req, cb) : await streamOpenAI(p, req, cb);
       const l = getLimits()[p.id];
       if (l?.lastError) updateLimits(p.id, (x) => ({ ...x, lastError: undefined }));
+      streaks.delete(p.id);
+      bench.delete(p.id);
       return { ...r, provider: p };
     } catch (e) {
       const err = e instanceof ProviderError ? e : new ProviderError("transient", String(e));
       if (err.kind === "aborted" || err.kind === "context") throw err;
+      if (isExhausted(err.message)) {
+        const ms = benchFor(p.id, 5 * MINUTE);
+        updateLimits(p.id, (x) => ({ ...x, lastError: err.message.slice(0, 300) }));
+        hooks.onNotice("warn", `${p.label} is out of credits or quota. ${live.length > 1 ? "Failing over" : `Retrying in ${Math.round(ms / MINUTE)}m`}; top up or add another provider in Settings.`);
+        continue;
+      }
       if (err.kind === "rate_limit") {
         const cur = windowFor(p.id);
         const load = cur.reduce((s, x) => s + x.tokens, 0);
-        const cooldown = err.retryAfterMs ?? Math.min(MINUTE, 5000 * 2 ** Math.min(4, (getLimits()[p.id]?.throttles ?? 0) % 5));
+        // Repeated throttles with no success in between mean a long-window quota, so back off further each time.
+        const cooldown = err.retryAfterMs ?? benchFor(p.id);
         const l = updateLimits(p.id, (x) => ({
           ...x,
           throttles: x.throttles + 1,
@@ -171,9 +180,9 @@ export async function routeTurn(req: ChatRequest, cb: StreamCallbacks, hooks: Ro
       // transient
       transientTries++;
       if (transientTries > 4) {
-        dead.add(p.id);
         transientTries = 0;
-        hooks.onNotice("warn", `${p.label} keeps failing (${err.message.slice(0, 120)}). Moving on.`);
+        const ms = benchFor(p.id, 30_000);
+        hooks.onNotice("warn", `${p.label} keeps failing (${err.message.slice(0, 120)}). ${live.length > 1 ? "Moving on" : `Pausing ${Math.ceil(ms / 1000)}s before retrying`}.`);
         continue;
       }
       const delay = err.retryAfterMs ?? 1000 * 2 ** transientTries;

@@ -1,10 +1,53 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { HOME } from "../store";
 import { clip, type Tool } from "./types";
 
 export const resolvePath = (p: string, cwd: string) => path.resolve(cwd, String(p).replace(/^~(?=$|\/)/, os.homedir()));
+
+/** Checkpoints: full-file snapshots taken before every write/edit, stored per session. */
+const checkpointsDir = (sessionId: string) => {
+  const d = path.join(HOME, "checkpoints", sessionId);
+  fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  return d;
+};
+
+export function snapshotFile(sessionId: string, absPath: string): string | null {
+  try {
+    if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) return null;
+    if (fs.statSync(absPath).size > 25_000_000) return null; // don't snapshot huge files
+    const id = crypto.randomBytes(6).toString("hex");
+    const dest = path.join(checkpointsDir(sessionId), `${id}.bak`);
+    fs.copyFileSync(absPath, dest);
+    // Sidecar records which file this snapshot belongs to.
+    fs.writeFileSync(`${dest}.json`, JSON.stringify({ path: absPath, at: Date.now() }), { mode: 0o600 });
+    return id;
+  } catch {
+    return null;
+  }
+}
+
+/** Marker line the Timeline parses to render diffs + an undo affordance. Survives compaction as plain text. */
+export const checkpointMarker = (checkpointId: string, absPath: string) =>
+  `[checkpoint ${checkpointId} path=${absPath}]`;
+
+export function restoreCheckpoint(sessionId: string, checkpointId: string): { ok: boolean; message: string } {
+  if (!/^[a-f0-9]+$/.test(checkpointId)) return { ok: false, message: "Bad checkpoint id." };
+  const bak = path.join(checkpointsDir(sessionId), `${checkpointId}.bak`);
+  const meta = `${bak}.json`;
+  if (!fs.existsSync(bak) || !fs.existsSync(meta)) return { ok: false, message: `Checkpoint ${checkpointId} not found for this task.` };
+  try {
+    const { path: absPath } = JSON.parse(fs.readFileSync(meta, "utf8")) as { path: string };
+    fs.mkdirSync(path.dirname(absPath), { recursive: true });
+    fs.copyFileSync(bak, absPath);
+    return { ok: true, message: `Restored ${absPath} from checkpoint ${checkpointId}.` };
+  } catch (e) {
+    return { ok: false, message: `Restore failed: ${(e as Error).message}` };
+  }
+}
 
 const IMAGE: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
 
@@ -87,8 +130,23 @@ export const writeFile: Tool = {
     const f = resolvePath(String(input.path), ctx.cwd);
     fs.mkdirSync(path.dirname(f), { recursive: true });
     const existed = fs.existsSync(f);
+    let before = "";
+    if (existed) {
+      try {
+        const buf = fs.readFileSync(f);
+        before = buf.includes(0) ? `[binary, ${buf.length} bytes — no text preview]` : buf.toString("utf8").slice(0, 4000);
+      } catch {
+        before = "";
+      }
+    }
+    const cp = snapshotFile(ctx.sessionId, f);
     fs.writeFileSync(f, String(input.content ?? ""));
-    return { content: `${existed ? "Overwrote" : "Created"} ${f} (${String(input.content ?? "").split("\n").length} lines)` };
+    const lines = String(input.content ?? "").split("\n").length;
+    const head = [`${existed ? "Overwrote" : "Created"} ${f} (${lines} lines)`];
+    if (cp) head.push(checkpointMarker(cp, f));
+    if (existed && before) head.push("--- before (first 4k)---", clip(before, 3000));
+    head.push("+++ after (first 4k) +++", clip(String(input.content ?? "").slice(0, 4000), 3000));
+    return { content: head.join("\n") };
   },
 };
 
@@ -111,10 +169,27 @@ export const editFile: Tool = {
     const count = oldS ? src.split(oldS).length - 1 : 0;
     if (!count) return { content: `old_string not found in ${f}. Re-read the file and match it exactly.`, isError: true };
     if (count > 1 && !input.replace_all) return { content: `old_string occurs ${count} times in ${f}. Add surrounding context or set replace_all.`, isError: true };
+    const cp = snapshotFile(ctx.sessionId, f);
     const out = input.replace_all ? src.split(oldS).join(newS) : src.replace(oldS, () => newS);
     fs.writeFileSync(f, out);
     const line = src.slice(0, src.indexOf(oldS)).split("\n").length;
-    return { content: `Edited ${f} (${count} replacement${count > 1 ? "s" : ""}, near line ${line})\n--- old\n${clip(oldS, 3000)}\n+++ new\n${clip(newS, 3000)}` };
+    const head = [`Edited ${f} (${count} replacement${count > 1 ? "s" : ""}, near line ${line})`];
+    if (cp) head.push(checkpointMarker(cp, f));
+    head.push("--- old", clip(oldS, 3000), "+++ new", clip(newS, 3000));
+    return { content: head.join("\n") };
+  },
+};
+
+export const undoEdit: Tool = {
+  spec: {
+    name: "restore_checkpoint",
+    description:
+      "Undo a write_file/edit_file by restoring the file to its checkpoint snapshot. The checkpoint id appears in the tool output as [checkpoint <id> path=...]. Only restores files changed in this task.",
+    schema: { type: "object", properties: { checkpoint: { type: "string" } }, required: ["checkpoint"] },
+  },
+  async run(input, ctx) {
+    const r = restoreCheckpoint(ctx.sessionId, String(input.checkpoint ?? ""));
+    return { content: r.message, isError: !r.ok };
   },
 };
 

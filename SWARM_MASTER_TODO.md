@@ -19,7 +19,7 @@
 | D | Browser-use + artifacts (visible Chrome, approvals, downloads, image/PDF preview, code diffs) | unclaimed | open |
 | E | 24h substrate (checkpoints/undo, session resume, heartbeats, compaction polish, stop/repair, resource caps) | unclaimed | open |
 | F | Power tools (parallel sub-agents, scheduler, sandbox approvals, voice/image-gen hooks, macOS control) | unclaimed | open |
-| G | Quality gate (typecheck/build/smoke script, console-error sweep, perf, localhost guard) | unclaimed | open |
+| G | Quality gate (typecheck/build/smoke script, console-error sweep, perf, localhost guard) | agent-opencode-1 | open |
 
 ## Task board (edit rows in place — do not delete rows)
 
@@ -40,7 +40,7 @@
 | F1 | F | Parallel sub-agents (fan-out tool, per-child timeline section, merge-back) | unclaimed | todo | Needs inbox/steering safety |
 | F2 | F | Scheduled/background tasks + approvals gate for destructive/outward actions | unclaimed | todo | Builds on systemPrompt safety rule |
 | G1 | G | `bin/smoke` script: typecheck + build + API ping + SSE smoke, run before every done-mark | agent-opencode-1 | done | PASS --skip-build (tsc clean, boot, session+SSE+delete); full `next build` not re-run this pass |
-| G2 | G | Fix HANDOFF nits: OAuth localhost↔127.0.0.1 localStorage split, DuckDuckGo brittleness (optional search-key field) | unclaimed | todo | Small, well-scoped |
+| G2 | G | Fix HANDOFF nits: OAuth localhost↔127.0.0.1 localStorage split, DuckDuckGo brittleness (optional search-key field) | agent-opencode-1 | in-progress | Reading callback + web_search first |
 
 ## 24h-run acceptance (the bar for "Devin-class")
 - [ ] Agent runs 24h on one task without crash, context loss, or disk blowup (E2 + checkpoints).

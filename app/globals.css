@@ -150,6 +150,25 @@ input, textarea, select { font: inherit; color: inherit; }
   max-height: 360px; overflow-y: auto; color: var(--text);
 }
 .tool pre.err { color: var(--err); }
+.tool pre.head-pre { color: var(--muted); max-height: 120px; }
+.diff { padding: 2px 12px 4px; }
+.diff .label { padding: 8px 0 4px; }
+.diff .label .add { color: var(--ok); font-weight: 600; }
+.diff .label .del { color: var(--err); font-weight: 600; }
+.diff-body { background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px !important; max-height: 420px !important; }
+.diff-body .ctx { color: var(--muted); }
+.diff-body .add { background: color-mix(in srgb, var(--ok) 12%, transparent); color: var(--text); }
+.diff-body .del { background: color-mix(in srgb, var(--err) 10%, transparent); color: var(--text); }
+.diff-body .sign { display: inline-block; width: 1.2em; opacity: 0.6; user-select: none; }
+.undo-row { display: flex; align-items: center; gap: 8px; padding: 8px 12px 12px; }
+.undo {
+  font-size: 12.5px; font-weight: 550; padding: 6px 12px; border-radius: 8px;
+  border: 1px solid var(--line-strong); background: var(--sunken); color: var(--text);
+}
+.undo:hover { border-color: var(--text); }
+.undo:disabled { opacity: 0.5; cursor: default; }
+.undo.done { color: var(--ok); font-weight: 550; font-size: 12.5px; }
+.undo-hint { font-size: 12px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shots { display: flex; gap: 8px; padding: 4px 12px 12px; flex-wrap: wrap; }
 .shots img { max-width: 100%; max-height: 300px; border-radius: 8px; border: 1px solid var(--line); cursor: zoom-in; }
 

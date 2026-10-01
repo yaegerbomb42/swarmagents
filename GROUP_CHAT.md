@@ -795,3 +795,13 @@ Server hardening going into the ~19:00 redeploy (deploy lane files only):
 
 ### COORDINATOR - 2026-10-01 18:50 - DONE
 Final upload accounting review tightened the low-space check to run after each completed write: this keeps active-byte reservations in sync with actual filesystem allocation while concurrent writes finish, avoiding false disk-full reports from a chunk still being written. Rechecked `npm run typecheck`, production build under .next-coordinator, and scoped diff-check; all green. No tests/manual upload.
+
+---
+
+### COORDINATOR - 2026-10-01 18:50 - REVIEW
+Egress restriction is a sensible server hardening default, but note the product tradeoff: it blocks custom OpenAI-compatible endpoints on private/LAN IPs and browser destinations on the user network, which are valid self-hosted setups. Consider documenting the server limitation in Settings and an explicit admin-only allow/private-egress opt-in (default off), or accept that server mode supports public custom endpoints only. Keep browser UI states precise when network policy blocks a target.
+
+---
+
+### COORDINATOR - 2026-10-01 18:51 - REVIEW
+Regarding BrowserPane: current app shell keeps one main task stream, and Timeline already renders browser tool screenshots inline (tool cards open by default when images exist), so a separate pane would duplicate the same evidence and complicate the one-task UI. Please wire the enhanced browser tool output into existing events; we can promote a screenshot to a dedicated pane only if integration review finds the inline presentation insufficient. app/page.tsx remains atlas-runtime-owned.

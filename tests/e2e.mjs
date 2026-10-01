@@ -231,8 +231,13 @@ const cases = {
     assert(tk.envVar === "MOCK_SERVICE_KEY" && tk.keyHint === "…5678" && !r.text.includes("tool-secret-5678"), "tool key public shape", tk);
     r = await api("POST", "/api/connections/test", { type: "tool", id: tk.id });
     assert(r.json.ok, "tool key test by id", r.json);
+    // Short secrets never come back, not even partially.
+    r = await api("POST", "/api/connections", { type: "tool", preset: "custom-key", envVar: "SHORT_KEY", apiKey: "abcd" });
+    const short = r.json.connections.find((x) => x.envVar === "SHORT_KEY");
+    assert(short?.keyHint === "set" && !/abcd/.test(JSON.stringify(r.json.connections)), "short key must not be echoed", short);
+    await api("DELETE", `/api/connections?type=tool&id=${short.id}`);
     // MCP stdio server: test lists its tools, save writes mcp.json in Claude's shape.
-    const mcpDef = { type: "mcp", preset: "custom-stdio", label: "Mock MCP", command: process.execPath, args: [path.join(ROOT, "tests/mock-mcp.mjs")], env: { MOCK_MCP_SECRET: "mcp-secret-9999", MOCK_REF: "${MOCK_SERVICE_KEY}" } };
+    const mcpDef = { type: "mcp", preset: "custom-stdio", label: "Mock MCP", command: process.execPath, args: [path.join(ROOT, "tests/mock-mcp.mjs")], env: { MOCK_MCP_SECRET: "mcp-secret-9999", MOCK_REF: "${MOCK_SERVICE_KEY}", SHORT_PIN: "s3cr3t" } };
     // A command that exits says why (its stderr), not just "Connection closed".
     r = await api("POST", "/api/connections/test", { type: "mcp", preset: "custom-stdio", command: process.execPath, args: [path.join(WORK, "missing-server.js")] });
     assert(r.json.ok === false && /exited.*(Cannot find module|MODULE_NOT_FOUND)/.test(r.json.message), "crashed MCP command should report its stderr", r.json);
@@ -242,6 +247,7 @@ const cases = {
     assert(r.status === 200 && r.json.id === "mock-mcp", "save MCP", r.json);
     const mcpPub = r.json.connections.find((x) => x.id === "mock-mcp");
     assert(mcpPub.env.MOCK_MCP_SECRET.startsWith("••••") && !r.text.includes("mcp-secret-9999"), "MCP env must be masked", mcpPub);
+    assert(mcpPub.env.SHORT_PIN === "••••" && !r.text.includes("s3cr3t") && mcpPub.env.MOCK_REF === "${MOCK_SERVICE_KEY}", "short env secrets masked, ${VAR} refs readable", mcpPub.env);
     const onDisk = JSON.parse(fs.readFileSync(path.join(HOME, "mcp.json"), "utf8"));
     assert(onDisk.mcpServers["mock-mcp"].env.MOCK_MCP_SECRET === "mcp-secret-9999", "mcp.json keeps the real secret");
     // Editing with the masked value keeps the secret.

@@ -21,4 +21,4 @@
 - Every claimed capability must work through a complete user-visible path. Prefer focused vertical slices; no placeholder UI or disconnected scaffolding.
 - Keep local data and full-machine tool access treated as sensitive capabilities; make consequential actions and state changes visible and recoverable.
 - [ ] (COORDINATOR) Protect large streamed uploads with per-file and disk-reserve checks | files=app/api/upload/route.ts | status=in-progress
-- [ ] (COORDINATOR) Complete missing Activity icon dependency and restore typecheck | files=components/icons.tsx | status=in-progress
+- [x] (COORDINATOR) Complete missing Activity icon dependency and restore typecheck | files=components/icons.tsx | status=in-progress

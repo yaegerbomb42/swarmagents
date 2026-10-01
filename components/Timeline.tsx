@@ -227,14 +227,14 @@ function Tool({ e, onImage }: { e: Ev<"tool">; onImage: (src: string) => void })
         <div className="io">
           {inputText && e.name !== "bash" && (
             <>
-              <div className="label">Input</div>
+              {labelWithCopy("Input", inputText)}
               <pre>{inputText}</pre>
             </>
           )}
           {e.name === "bash" && <pre style={{ color: "var(--muted)" }}>$ {argSummary("bash", input, e.inputPreview)}</pre>}
           {(e.output || e.status === "running") && (
             <>
-              <div className="label">Output</div>
+              {e.output ? labelWithCopy("Output", e.output) : <div className="label">Output</div>}
               {(() => {
                 const d = e.output ? splitDiff(e.output) : null;
                 const cps = e.output ? checkpoints(e.output) : [];
@@ -267,6 +267,44 @@ function Tool({ e, onImage }: { e: Ev<"tool">; onImage: (src: string) => void })
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      className="copy-btn"
+      title={copied ? "Copied!" : "Copy output"}
+      onClick={async (e) => {
+        e.stopPropagation();
+        try {
+          await navigator.clipboard.writeText(text);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        } catch {}
+      }}
+    >
+      {copied ? (
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <path d="M2 6.5 5 9.5 10 2.5" />
+        </svg>
+      ) : (
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <rect x="4" y="4" width="7" height="7" rx="1.5" />
+          <path d="M8 4V2.5A1.5 1.5 0 0 0 6.5 1H2.5A1.5 1.5 0 0 0 1 2.5v4A1.5 1.5 0 0 0 2.5 8H4" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
+function labelWithCopy(label: string, text: string) {
+  return (
+    <div className="label-row">
+      <span className="label">{label}</span>
+      <CopyButton text={text} />
     </div>
   );
 }

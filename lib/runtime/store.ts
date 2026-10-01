@@ -42,19 +42,27 @@ function readJson<T>(file: string, fallback: T): T {
   }
 }
 
-// Serialize writes per file so two async mutations cannot clobber each other.
+// Serialize writes per file so two async mutations cannot clobber each other. Each call
+// returns a promise the caller can await: durability matters more than latency here, and
+// callers that fire-and-forget still get a clean chain.
 const writeChains = new Map<string, Promise<void>>();
 
-function writeJson(file: string, data: unknown, mode = 0o600): void {
+function writeJson(file: string, data: unknown, mode = 0o600): Promise<void> {
   const prev = writeChains.get(file) ?? Promise.resolve();
   const next = prev
     .catch(() => {})
     .then(() => {
-      const tmp = `${file}.${process.pid}.tmp`;
+      const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode });
       fs.renameSync(tmp, file);
     });
   writeChains.set(file, next);
+  return next;
+}
+
+/** Await every write scheduled so far. Used by tests and graceful shutdown. */
+export function flushWrites(): Promise<void> {
+  return Promise.all([...writeChains.values()]).then(() => undefined);
 }
 
 // ---- Tasks ----
@@ -64,14 +72,21 @@ export function loadTasks(): Task[] {
   return Array.isArray(tasks) ? tasks : [];
 }
 
-export function saveTasks(tasks: Task[]): void {
-  writeJson(TASKS_FILE, tasks);
+export function saveTasks(tasks: Task[]): Promise<void> {
+  return writeJson(TASKS_FILE, tasks);
 }
 
-/** A tiny in-process mutex around read-modify-write on the task index. */
+/** A tiny in-process mutex around read-modify-write on the task index. The mutation is
+ *  persisted before the promise resolves, so a caller that awaited a change can rely on
+ *  it surviving a crash. */
 let taskLock: Promise<unknown> = Promise.resolve();
 export function withTasks<T>(fn: (tasks: Task[]) => T | Promise<T>): Promise<T> {
-  const run = taskLock.then(async () => fn(loadTasks()));
+  const run = taskLock.then(async () => {
+    const tasks = loadTasks();
+    const result = await fn(tasks);
+    await saveTasks(tasks);
+    return result;
+  });
   // Keep the chain alive even if fn throws, but surface errors to the caller.
   taskLock = run.then(
     () => undefined,
@@ -94,12 +109,33 @@ export function loadLedger(taskId: string): Ledger {
   return { runs: Array.isArray(l.runs) ? l.runs : [], steps: Array.isArray(l.steps) ? l.steps : [] };
 }
 
-export function saveLedger(taskId: string, ledger: Ledger): void {
-  writeJson(ledgerFile(taskId), ledger);
+export function saveLedger(taskId: string, ledger: Ledger): Promise<void> {
+  return writeJson(ledgerFile(taskId), ledger);
 }
 
 export function deleteLedger(taskId: string): void {
   fs.rmSync(ledgerFile(taskId), { force: true });
+}
+
+// Per-task ledger mutex: read-modify-write with the write awaited, so concurrent turn/tool
+// recordings never lose each other and a caller that awaited can trust the record exists.
+const ledgerLocks = new Map<string, Promise<unknown>>();
+export function withLedger<T>(taskId: string, fn: (ledger: Ledger) => T | Promise<T>): Promise<T> {
+  const prev = ledgerLocks.get(taskId) ?? Promise.resolve();
+  const run = prev.then(async () => {
+    const ledger = loadLedger(taskId);
+    const result = await fn(ledger);
+    await saveLedger(taskId, ledger);
+    return result;
+  });
+  ledgerLocks.set(
+    taskId,
+    run.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return run;
 }
 
 // ---- Artifacts ----
@@ -109,13 +145,18 @@ export function loadArtifacts(): Artifact[] {
   return Array.isArray(a) ? a : [];
 }
 
-export function saveArtifacts(artifacts: Artifact[]): void {
-  writeJson(ARTIFACTS_FILE, artifacts);
+export function saveArtifacts(artifacts: Artifact[]): Promise<void> {
+  return writeJson(ARTIFACTS_FILE, artifacts);
 }
 
 let artifactLock: Promise<unknown> = Promise.resolve();
 export function withArtifacts<T>(fn: (artifacts: Artifact[]) => T | Promise<T>): Promise<T> {
-  const run = artifactLock.then(async () => fn(loadArtifacts()));
+  const run = artifactLock.then(async () => {
+    const artifacts = loadArtifacts();
+    const result = await fn(artifacts);
+    await saveArtifacts(artifacts);
+    return result;
+  });
   artifactLock = run.then(
     () => undefined,
     () => undefined,

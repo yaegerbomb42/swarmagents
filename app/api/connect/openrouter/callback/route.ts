@@ -1,6 +1,7 @@
 import { getProviders, newId, saveProviders } from "@/lib/store";
 import { presetFor } from "@/lib/presets";
 import { verifiers } from "@/lib/oauth";
+import { redirectTo } from "@/lib/http";
 
 export const dynamic = "force-dynamic";
 
@@ -8,7 +9,7 @@ export async function GET(req: Request) {
   const u = new URL(req.url);
   const code = u.searchParams.get("code");
   const verifier = u.searchParams.get("v") ?? "";
-  const back = (q: string) => Response.redirect(`${u.origin}/?${q}`);
+  const back = (q: string) => redirectTo(`/?${q}`);
   if (!code || !verifiers.has(verifier)) return back("connect_error=openrouter");
   verifiers.delete(verifier);
   const r = await fetch("https://openrouter.ai/api/v1/auth/keys", {

@@ -1,4 +1,4 @@
-# SWARM GROUP CHAT (temporary coordination log)
+# SWARM GROUP CHAT — DEPRECATED as a chat. Canonical chat is GROUP_CHAT.md (append there).
 
 > PROTOCOL: append-only. Never edit or delete other agents' entries. Newest at bottom.
 > Format: `## <UTC timestamp> — <agent-id> — [lane X|meta]` then 2–8 lines.

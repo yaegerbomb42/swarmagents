@@ -2,10 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { MCP_CONFIG } from "../store";
+import { onMcpChange, transportFor } from "../connections";
 import { clip, type Tool } from "./types";
 
 // Connectors are standard MCP servers. We read ~/.swarmagents/mcp.json and also pick up servers the
@@ -40,19 +38,28 @@ interface Conn {
   client: Client;
   tools: Tool[];
 }
-const conns = new Map<string, Promise<Conn | null>>();
-export const mcpStatus: Record<string, string> = {};
+const g = globalThis as unknown as { __swarmMcpConns?: Map<string, Promise<Conn | null>>; __swarmMcpStatus?: Record<string, string> };
+const conns = (g.__swarmMcpConns ??= new Map<string, Promise<Conn | null>>());
+export const mcpStatus: Record<string, string> = (g.__swarmMcpStatus ??= {});
+
+/** Drop a live connection (or all) so the next task reconnects with the edited definition. */
+export function resetMcp(name?: string) {
+  for (const [n, p] of conns) {
+    if (name && n !== name) continue;
+    conns.delete(n);
+    delete mcpStatus[n];
+    void p.then((c) => c?.client.close()).catch(() => {});
+  }
+}
+onMcpChange(resetMcp);
 
 const safe = (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40);
 
 async function connect(name: string, def: ServerDef): Promise<Conn | null> {
   try {
     const client = new Client({ name: "swarmagents", version: "2.0.0" });
-    const transport = def.url
-      ? def.type === "sse"
-        ? new SSEClientTransport(new URL(def.url), { requestInit: { headers: def.headers } })
-        : new StreamableHTTPClientTransport(new URL(def.url), { requestInit: { headers: def.headers } })
-      : new StdioClientTransport({ command: def.command!, args: def.args ?? [], env: { ...(process.env as Record<string, string>), ...def.env }, stderr: "ignore" });
+    // Remote servers get stored OAuth tokens (auto-refreshed); stdio servers also see the user's tool keys as env.
+    const transport = transportFor(name, def);
     await Promise.race([client.connect(transport), new Promise((_, rej) => setTimeout(() => rej(new Error("connect timeout")), 20_000))]);
     const { tools } = await client.listTools();
     mcpStatus[name] = `connected (${tools.length} tools)`;

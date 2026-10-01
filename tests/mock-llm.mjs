@@ -10,7 +10,8 @@
 // the model name ("mock-tools"), else "echo". The step within a scenario is the number of tool-result
 // rounds since that user message, so replies are a pure function of the conversation.
 //
-// Scenarios: echo, tools, parallel, plan, ratelimit, flaky, auth, slow, bigcontext, loop, badtool, long.
+// Scenarios: echo, tools, parallel, plan, ratelimit, flaky, auth, slow, bigcontext, loop, badtool, long, mcp
+// (mcp calls the first offered tool named mcp__*__echo).
 // A key of "bad-key" is rejected with 401 everywhere. GET /__mock/requests returns the request log
 // (method, path, headers minus auth values, scenario, step); DELETE /__mock/requests clears it.
 
@@ -24,7 +25,7 @@ const PORT = Number(process.argv[2] || process.env.MOCK_PORT || 37901);
 const WORKDIR = process.env.MOCK_WORKDIR || path.join(os.tmpdir(), "swarm-mock-work");
 fs.mkdirSync(WORKDIR, { recursive: true });
 
-const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long"];
+const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp"];
 const log = [];
 const attempts = new Map(); // conversation hash -> request count, for ratelimit/flaky
 
@@ -123,6 +124,12 @@ function script(a) {
     case "badtool":
       if (a.step === 0) return { calls: [{ name: "no_such_tool", input: { x: 1 } }] };
       return { text: `Tool error seen: ${a.toolOutputs.some((t) => /unknown|not found|no such/i.test(t)) ? "yes" : "no"}.` };
+    case "mcp": {
+      const echo = a.tools.find((t) => /^mcp__.*__echo$/.test(t ?? ""));
+      if (!echo) return { text: "No MCP echo tool was offered." };
+      if (a.step === 0) return { calls: [{ name: echo, input: { text: "via-mcp" } }] };
+      return { text: `MCP said: ${a.toolOutputs.at(-1) ?? "nothing"}` };
+    }
     case "long":
       return { text: "## Long answer\n\n" + Array.from({ length: 200 }, (_, i) => `- line ${i + 1}: the quick brown fox jumps over the lazy dog.`).join("\n") };
     default:

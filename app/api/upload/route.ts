@@ -59,7 +59,7 @@ export async function POST(req: Request) {
     return Response.json({ error: `This file exceeds the configured ${MAX_UPLOAD_LABEL} upload limit.` }, { status: 413 });
   }
 
-  const name = path.basename(u.searchParams.get("name") || "file").replace(/[^\w.\- ()]/g, "_");
+  const name = path.basename(u.searchParams.get("name") || "file").replace(/[^\w.\- ()]/g, "_").slice(0, 180);
   const dir = uploadDir(sessionId);
   let reserved: { file: string; fd: number } | undefined;
   let writeStream: fs.WriteStream | null = null;
@@ -98,13 +98,20 @@ export async function POST(req: Request) {
     return Response.json(att);
   } catch (error) {
     if (reserved) {
-      if (writeStream) writeStream.destroy();
-      else try { fs.closeSync(reserved.fd); } catch {}
+      if (writeStream) {
+        writeStream.destroy();
+      } else {
+        try {
+          fs.closeSync(reserved.fd);
+        } catch {}
+      }
       try {
         fs.unlinkSync(reserved.file);
       } catch {}
     }
     const failure = error instanceof UploadError ? error : null;
-    return Response.json({ error: failure?.message ?? "Could not save the uploaded file." }, { status: failure?.status ?? 500 });
+    const noSpace = error instanceof Error && "code" in error && error.code === "ENOSPC";
+    const message = failure?.message ?? (noSpace ? "There is not enough free disk space to save this file." : "Could not save the uploaded file.");
+    return Response.json({ error: message }, { status: failure?.status ?? (noSpace ? 507 : 500) });
   }
 }

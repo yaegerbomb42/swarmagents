@@ -150,6 +150,12 @@ input, textarea, select { font: inherit; color: inherit; }
   max-height: 360px; overflow-y: auto; color: var(--text);
 }
 .tool pre.err { color: var(--err); }
+.tool .label-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 0 12px; }
+.tool .label-row .label { padding: 0; }
+.copy-btn { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; color: var(--faint); opacity: 0; }
+.tool .io:hover .copy-btn { opacity: 1; }
+.copy-btn:hover { background: var(--line); color: var(--text); }
+.copy-btn:focus-visible { opacity: 1; }
 .tool pre.head-pre { color: var(--muted); max-height: 120px; }
 .diff { padding: 2px 12px 4px; }
 .diff .label { padding: 8px 0 4px; }

@@ -8,12 +8,15 @@
     "build": "next build",
     "start": "next start -H 127.0.0.1 -p 3777",
     "typecheck": "tsc --noEmit",
-    "browser:install": "playwright-core install chromium"
+    "browser:install": "playwright-core install chromium",
+    "test:e2e": "node tests/e2e.mjs",
+    "mock-llm": "node tests/mock-llm.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.3",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "tsx": "^4.23.15",
     "typescript": "^6.0.3"
   },
   "dependencies": {

@@ -2,11 +2,13 @@ import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { mcpServerDef, onMcpChangeNotify } from "@/lib/connections";
 import { McpOAuthProvider, pendingStates } from "@/lib/mcp-oauth";
 
+import { publicOrigin, redirectTo } from "@/lib/http";
+
 export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
   const u = new URL(req.url);
-  const back = (q: string) => Response.redirect(`${u.origin}/?${q}`);
+  const back = (q: string) => redirectTo(`/?${q}`);
   const state = u.searchParams.get("state") ?? "";
   const code = u.searchParams.get("code");
   const pending = pendingStates.get(state);
@@ -16,7 +18,7 @@ export async function GET(req: Request) {
   const def = mcpServerDef(pending.name);
   if (!def?.url) return back(`connect_error=${encodeURIComponent("That MCP server was removed.")}`);
   try {
-    const provider = new McpOAuthProvider(pending.name, `${u.origin}/api/connections/oauth/callback`);
+    const provider = new McpOAuthProvider(pending.name, `${publicOrigin(req)}/api/connections/oauth/callback`);
     await auth(provider, { serverUrl: def.url, authorizationCode: code });
     onMcpChangeNotify(pending.name);
     return back(`connected=${encodeURIComponent(`mcp:${pending.name}`)}`);

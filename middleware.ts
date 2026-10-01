@@ -13,17 +13,15 @@ export function middleware(req: NextRequest) {
   if (!isAllowed(req)) {
     if (!authEnabled()) return new NextResponse("forbidden", { status: 403 });
     if (pathname.startsWith("/api/")) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
-    // Relative Location: behind the proxy req.url carries the internal host and port.
-    return new NextResponse(null, { status: 303, headers: { Location: `/login?next=${encodeURIComponent(pathname + search)}` } });
+    // Build the target from the public Host header (already allowlisted): behind the proxy req.url carries the
+    // internal host and port, and middleware rejects relative Locations.
+    const proto = req.headers.get("x-forwarded-proto") ?? req.nextUrl.protocol.replace(":", "");
+    const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host");
+    return NextResponse.redirect(`${proto}://${host}/login?next=${encodeURIComponent(pathname + search)}`, 303);
   }
-  // Local mode: one canonical origin (127.0.0.1) so localStorage and the OAuth callback don't split across
-  // localhost/127.0.0.1. Document navigations only; API/fetch/SSE on localhost keep working.
-  const host = (req.headers.get("host") ?? "").split(":")[0];
-  if (!authEnabled() && host === "localhost" && req.headers.get("sec-fetch-mode") === "navigate") {
-    const u = new URL(req.url);
-    u.hostname = "127.0.0.1";
-    return NextResponse.redirect(u, 308);
-  }
+  // Local mode: the localhost→127.0.0.1 canonicalization is client-side (lib/canonical.ts in page.tsx).
+  // A server redirect was tried and reverted: Next normalizes middleware redirect Locations to the
+  // request host, producing a same-URL 308 that loops browsers forever. Do not re-add it here.
   return NextResponse.next();
 }
 

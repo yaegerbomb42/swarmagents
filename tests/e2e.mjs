@@ -344,6 +344,28 @@ const cases = {
     return "agent called a Settings-added MCP server (env secret reached it)";
   },
 
+  async search() {
+    // web_search uses Settings tool keys in catalog order; a rejected Brave key falls through to Tavily.
+    let r = await api("POST", "/api/connections", { type: "tool", preset: "brave", apiKey: "bad-key" });
+    assert(r.status === 200, "save brave key", r.json);
+    const braveId = r.json.connections.find((x) => x.type === "tool" && x.preset === "brave")?.id;
+    r = await api("POST", "/api/connections", { type: "tool", preset: "tavily", apiKey: "tvly-e2e-0000" });
+    const tavilyId = r.json.connections.find((x) => x.type === "tool" && x.preset === "tavily")?.id;
+    assert(braveId && tavilyId, "tool key ids", r.json);
+    await fetch(`${MOCK}/__mock/requests`, { method: "DELETE" });
+    try {
+      const { events } = await runTask("[mock:search] look it up", { timeout: 90_000 });
+      const out = texts(events);
+      assert(/Search said: 1\. Mock tavily result for swarm agents \| via=tavily/.test(out), "web_search should fall through to tavily", summarize(events));
+      const hits = (await (await fetch(`${MOCK}/__mock/requests`)).json()).requests.filter((x) => x.search);
+      assert(hits.map((x) => `${x.search}:${x.status}`).join(",") === "brave:401,tavily:200", "search order", hits);
+      return "brave 401 → tavily 200, result reached the model";
+    } finally {
+      await api("DELETE", `/api/connections?type=tool&id=${braveId}`);
+      await api("DELETE", `/api/connections?type=tool&id=${tavilyId}`);
+    }
+  },
+
   async anthropic() {
     // Same tool script over the native Anthropic protocol, with a Bedrock-style bearer header.
     const r = await api("POST", "/api/connections", { type: "llm", preset: "custom-anthropic", label: "Mock Anthropic", baseUrl: MOCK, apiKey: "e2e-key-anthropic-4321", model: "mock", headers: { Authorization: "Bearer {key}" } });
@@ -392,7 +414,7 @@ async function main() {
   start(process.execPath, [path.join(ROOT, "tests/mock-llm.mjs"), String(MOCK_PORT)], { MOCK_WORKDIR: WORK }, path.join(HOME, "mock-llm.log"));
   await waitFor(`${MOCK}/__mock/health`, 10_000, "mock LLM");
   if (!opt("--url")) {
-    const env = { SWARM_HOME: HOME, NEXT_DIST_DIR: flag("--prod") ? ".next-e2e-prod" : ".next-e2e", NEXT_TELEMETRY_DISABLED: "1", SWARM_STALL_MS: "30000" };
+    const env = { SWARM_HOME: HOME, NEXT_DIST_DIR: flag("--prod") ? ".next-e2e-prod" : ".next-e2e", NEXT_TELEMETRY_DISABLED: "1", SWARM_STALL_MS: "30000", SWARM_SEARCH_MOCK: `${MOCK}/search` };
     const next = path.join(ROOT, "node_modules/.bin/next");
     if (flag("--prod")) {
       console.log(c.d("building (next build)…"));

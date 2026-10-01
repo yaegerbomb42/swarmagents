@@ -3,15 +3,15 @@
 ## Current pass — owned, outcome-based work
 
 - [x] **Task status at a glance** (UI): show live/idle state, current action, elapsed time and plan progress in the single-task view; avoid showing the same plan twice; keep Composer as the only steering surface.
-- [ ] **Provider setup works end to end** (Integrations): implement the model discovery/connection check route already called by Settings, with useful failure handling and no key leakage.
+- [x] **Provider setup works end to end** (Integrations): implement the model discovery/connection check route already called by Settings, with useful failure handling and no key leakage.
 - [x] **Safe recovery after a process interruption** (Runtime): repair incomplete tool-call transcripts on load, make uncertain side effects explicit, and persist the recovered checkpoint without replaying operations.
 - [ ] **Review the combined product slice** (Coordinator): inspect the diff and check that the three improvements fit the existing task flow; record observed verification and any remaining defects.
 
 ## Next, only after the current pass is reviewed
 
-- [ ] Make MCP servers discoverable, configurable, testable and diagnosable from the product’s Settings surface.
+- [x] Make MCP servers discoverable, configurable, testable and diagnosable from the product’s Settings surface.
 - [ ] Add bounded upload handling and cleanup so arbitrary-size inputs do not consume unbounded local disk.
-- [ ] Add a file-change review and undo workflow with durable checkpoints for agent edits.
+- [x] Add a file-change review and undo workflow with durable checkpoints for agent edits.
 - [ ] Define task-resume checkpoints, durable steering, and recovery semantics for long-running work, including uncertain tool side effects and provider/quota pauses.
 
 ## Product constraints
@@ -32,3 +32,4 @@
 - [ ] (COORDINATOR) 24h acceptance gates: quota/outage backoff without spinning; restart repairs tool calls by ID and inspects before retry; newest steer survives compaction; stop/continue works; plan/artifacts/events persist; disk/history growth stays bounded; task state is clear in UI | owner=all lanes | status=acceptance criteria, not a claim that one 24h soak has passed
 - [x] (COORDINATOR) Show actionable upload errors in the Composer chip (size, disk reserve, network) | files=components/Composer.tsx | status=in-progress
 - [ ] (COORDINATOR) Remove the plaintext owner token from the running server environment; validate against a configured digest | files=lib/auth.ts + deploy config | owner=agent-9f59 + Grok Bot (deploy) | status=required before next deploy | same-UID child processes can read /proc/<pid>/environ
+- [ ] (COORDINATOR) Fix compaction tail selection so the newest user steering message stays verbatim | files=lib/agent.ts | owner=agent-9f59 | status=blocking 24h acceptance and e2e compaction case

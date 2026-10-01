@@ -1,3 +1,4 @@
+import { searchKeys } from "../connections";
 import { getSearchConfig } from "../store";
 import { clip, type Tool } from "./types";
 
@@ -29,31 +30,92 @@ export const webSearch: Tool = {
     schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
   },
   async run(input, ctx) {
-    // Preferred path when the user configured a search key (env TAVILY_API_KEY /
-    // SEARCH_API_KEY, or settings.json `search`); otherwise fall back to scraping.
-    const cfg = getSearchConfig();
-    if (cfg?.provider === "tavily" && cfg.apiKey) {
+    // Search APIs from Settings → Tool keys (Brave, Tavily, Exa, Serper), then the legacy
+    // settings.json/env Tavily key; each failure falls through, DuckDuckGo scraping is the last resort.
+    const query = String(input.query);
+    const errors: string[] = [];
+    for (const { service, key } of searchProviders()) {
       try {
-        return await tavilySearch(String(input.query), cfg.apiKey, ctx.signal);
+        const out = formatHits(await SEARCHERS[service](query, key, ctx.signal), service);
+        if (out) return { content: out };
+        errors.push(`${service}: no results`);
       } catch (e) {
-        return { content: `Search API error (${e instanceof Error ? e.message : e}); no fallback results.` };
+        if (ctx.signal.aborted) throw e;
+        errors.push(e instanceof Error ? e.message : String(e));
       }
     }
-    return duckScrape(String(input.query), ctx.signal);
+    const ddg = await duckScrape(query, ctx.signal);
+    return errors.length ? { content: `${ddg.content}
+
+(Search APIs failed, used DuckDuckGo: ${errors.join("; ")})` } : ddg;
   },
 };
 
-async function tavilySearch(query: string, apiKey: string, signal: AbortSignal) {
-  const res = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ query, max_results: 10, search_depth: "basic", include_answer: false }),
-    signal,
-  });
-  if (!res.ok) return { content: `Search API error (${res.status}); try again or check the key.`, isError: true };
-  const d = (await res.json()) as { results?: { title?: string; url?: string; content?: string }[] };
-  const results = (d.results ?? []).slice(0, 10).map((r, i) => `${i + 1}. ${r.title ?? r.url ?? ""}\n   ${r.url ?? ""}\n   ${(r.content ?? "").replace(/\s+/g, " ").slice(0, 500)}`);
-  return { content: results.join("\n\n") || "No results." };
+type Hit = { title: string; url: string; snippet: string };
+type Searcher = (q: string, key: string, signal: AbortSignal) => Promise<Hit[]>;
+
+/** Test hook: point every search provider at one mock server (`${SWARM_SEARCH_MOCK}/<service>`). */
+const endpoint = (service: string, real: string) => (process.env.SWARM_SEARCH_MOCK ? `${process.env.SWARM_SEARCH_MOCK.replace(/\/$/, "")}/${service}` : real);
+
+async function getJson(res: Response, service: string) {
+  if (!res.ok) throw new Error(`${service} ${res.status}${res.status === 401 || res.status === 403 ? " (check the key in Settings)" : res.status === 429 ? " (rate limited)" : ""}`);
+  return res.json();
+}
+
+const SEARCHERS: Record<string, Searcher> = {
+  async brave(q, key, signal) {
+    const res = await fetch(`${endpoint("brave", "https://api.search.brave.com/res/v1/web/search")}?${new URLSearchParams({ q, count: "10" })}`, {
+      headers: { Accept: "application/json", "X-Subscription-Token": key },
+      signal,
+    });
+    const d = (await getJson(res, "brave")) as { web?: { results?: { title?: string; url?: string; description?: string }[] } };
+    return (d.web?.results ?? []).map((r) => ({ title: r.title ?? "", url: r.url ?? "", snippet: r.description ?? "" }));
+  },
+  async tavily(q, key, signal) {
+    const res = await fetch(endpoint("tavily", "https://api.tavily.com/search"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ query: q, max_results: 10, search_depth: "basic", include_answer: false }),
+      signal,
+    });
+    const d = (await getJson(res, "tavily")) as { results?: { title?: string; url?: string; content?: string }[] };
+    return (d.results ?? []).map((r) => ({ title: r.title ?? "", url: r.url ?? "", snippet: r.content ?? "" }));
+  },
+  async exa(q, key, signal) {
+    const res = await fetch(endpoint("exa", "https://api.exa.ai/search"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": key },
+      body: JSON.stringify({ query: q, numResults: 10, contents: { text: { maxCharacters: 500 } } }),
+      signal,
+    });
+    const d = (await getJson(res, "exa")) as { results?: { title?: string; url?: string; text?: string; summary?: string }[] };
+    return (d.results ?? []).map((r) => ({ title: r.title ?? "", url: r.url ?? "", snippet: r.summary ?? r.text ?? "" }));
+  },
+  async serper(q, key, signal) {
+    const res = await fetch(endpoint("serper", "https://google.serper.dev/search"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-KEY": key },
+      body: JSON.stringify({ q, num: 10 }),
+      signal,
+    });
+    const d = (await getJson(res, "serper")) as { organic?: { title?: string; link?: string; snippet?: string }[] };
+    return (d.organic ?? []).map((r) => ({ title: r.title ?? "", url: r.link ?? "", snippet: r.snippet ?? "" }));
+  },
+};
+
+function formatHits(hits: Hit[], via: string) {
+  const lines = hits.slice(0, 10).map((r, i) => `${i + 1}. ${r.title || r.url}\n   ${r.url}\n   ${r.snippet.replace(/\s+/g, " ").slice(0, 500)}`);
+  return lines.length ? `${lines.join("\n\n")}\n\n(via ${via})` : "";
+}
+
+/** Keys from Settings → Tool keys first (in catalog order), then the legacy settings.json/env Tavily key. */
+function searchProviders(): { service: string; key: string }[] {
+  const list = searchKeys().filter((k) => SEARCHERS[k.service]);
+  const legacy = getSearchConfig();
+  if (legacy?.apiKey && SEARCHERS[legacy.provider] && !list.some((k) => k.service === legacy.provider && k.key === legacy.apiKey)) {
+    list.push({ service: legacy.provider, key: legacy.apiKey });
+  }
+  return list;
 }
 
 async function duckScrape(query: string, signal: AbortSignal) {

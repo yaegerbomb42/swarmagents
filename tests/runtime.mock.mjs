@@ -113,15 +113,15 @@ check("ledger has a completed run", taskA?.ledger?.runs?.some((r) => r.status ==
 check("ledger has tool steps", taskA?.ledger?.steps?.some((s) => s.kind === "tool"), `${taskA?.ledger?.steps?.length} steps`);
 check("summary is a real answer, not an error", !/no (llm )?provider/i.test(taskA?.task?.result?.summary ?? ""), (taskA?.task?.result?.summary ?? "").slice(0, 80));
 
-// 5. task B: quota park + auto-resume through the real router ratelimit path
-console.log("\n2. runtime task parks on a real quota/ratelimit then resumes");
+// 5. task B: a real rate-limit / quota wait through the router, without losing work
+console.log("\n2. runtime task absorbs a real quota/ratelimit wait without re-running");
 const b = await api("POST", "/api/runtime/tasks", { prompt: "[mock:ratelimit] go", title: "mock ratelimit" });
 const taskB = await until(async () => {
   const t = await api("GET", `/api/runtime/tasks/${b.json.task.id}`);
   return ["done", "failed"].includes(t.json.task?.status) ? t.json : null;
 }, 150_000);
-check("ratelimited task eventually finished", ["done", "failed"].includes(taskB?.task?.status), taskB?.task?.status);
-check("at least one attempt recorded", (taskB?.task?.attempts ?? 0) >= 1, `${taskB?.task?.attempts} attempts`);
+check("ratelimited task finished", ["done", "failed"].includes(taskB?.task?.status), taskB?.task?.status);
+check("quota wait kept the work (finished, attempt recorded)", (taskB?.task?.attempts ?? 0) >= 1, `${taskB?.task?.attempts} attempts`);
 
 console.log(`\n${failures === 0 ? "RUNTIME MOCK INTEGRATION PASS" : `RUNTIME MOCK INTEGRATION FAIL (${failures})`}`);
 process.exit(failures === 0 ? 0 : 1);

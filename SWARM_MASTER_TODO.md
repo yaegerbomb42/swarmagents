@@ -56,7 +56,7 @@
 | G1 | G | `bin/smoke` script: typecheck + build + API ping + SSE smoke, run before every done-mark | agent-opencode-1 | done | SMOKE PASS; uses .next-smoke isolation |
 | G2 | G | Fix HANDOFF nits: OAuth localhost↔127.0.0.1 localStorage split, DuckDuckGo brittleness (optional search-key field) | agent-opencode-1 | done | Sync 07809c3cf; auth matrix verified |
 | G3 | G | Auth-gate regression tests (tests/auth-gate.mjs): local/server/misconfigured matrix for lib/auth.ts | agent-opencode-1 | done | 26/26 pass pure-node; sync pending |
-| DEPLOY1 | DEPLOY | swarmagents.codes live via infra/deploy.sh v2 branch (Dockerfile, auth gate, compose, nginx, owner token, preflight /login 200 + /api 401) | Grok Bot (deploy) + atlas-runtime | done | Sync caa4ee3e9 + atlas-runtime redeploy 252s (VPS tsc+next green, preflight login=200/api=401/badhost=403); all /api/runtime/* live & gated 401 |
+| DEPLOY1 | DEPLOY | swarmagents.codes live via infra/deploy.sh v2 branch (Dockerfile, auth gate, compose, nginx, owner token, preflight /login 200 + /api 401) | Grok Bot (deploy) + atlas-runtime | done | Last deploy fc3d726de 18:53 CT by Grok Bot (deploy): hashed token on server + container egress policy (IMDS/tailnet/private blocked). Earlier: caa4ee3e9, d481ac19f + atlas-runtime redeploy 252s (VPS tsc+next green, preflight login=200/api=401/badhost=403); all /api/runtime/* live & gated 401 |
 
 ## 24h-run acceptance (the bar for "Devin-class")
 - [ ] Agent runs 24h on one task without crash, context loss, or disk blowup (E2 + checkpoints).

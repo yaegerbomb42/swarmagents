@@ -383,6 +383,31 @@ const cases = {
     return "download saved + read back, alert reported, upload, failed click recovered, popup followed";
   },
 
+  async files() {
+    // /api/files: previews only inside the task's folder, credential files blocked, active content sandboxed.
+    const { sid, events } = await runTask("[mock:files] make fixtures", { timeout: 60_000 });
+    assert(/Files: made/.test(texts(events)), "fixtures", summarize(events));
+    const get = (p, extra = "") => fetch(`${BASE}/api/files?session=${sid}&path=${encodeURIComponent(p)}${extra}`);
+    let r = await get("table.csv", "&meta=1");
+    const m = await r.json();
+    assert(r.status === 200 && m.kind === "table" && m.name === "table.csv", "csv meta", m);
+    r = await get("table.csv");
+    assert(r.status === 200 && (await r.text()).includes('"Widget, large"'), "csv body");
+    r = await get("evil.html");
+    assert(/sandbox/.test(r.headers.get("content-security-policy") ?? "") && r.headers.get("x-content-type-options") === "nosniff", "html must be sandboxed", Object.fromEntries(r.headers));
+    r = await get(".env");
+    assert(r.status === 403, `.env must be blocked (${r.status})`);
+    r = await get("/etc/hosts");
+    assert(r.status === 404, `outside folder must 404 (${r.status})`);
+    r = await get("../../../../../../etc/hosts");
+    assert(r.status === 404, `traversal must 404 (${r.status})`);
+    r = await fetch(`${BASE}/api/files?session=nope&path=table.csv`);
+    assert(r.status === 404, `unknown session (${r.status}: ${await r.text()})`);
+    r = await get("long.txt", "&download=1");
+    assert(/attachment/.test(r.headers.get("content-disposition") ?? ""), "download disposition");
+    return "csv meta/body, html sandboxed + nosniff, .env 403, outside/traversal 404, download";
+  },
+
   async anthropic() {
     // Same tool script over the native Anthropic protocol, with a Bedrock-style bearer header.
     const r = await api("POST", "/api/connections", { type: "llm", preset: "custom-anthropic", label: "Mock Anthropic", baseUrl: MOCK, apiKey: "e2e-key-anthropic-4321", model: "mock", headers: { Authorization: "Bearer {key}" } });

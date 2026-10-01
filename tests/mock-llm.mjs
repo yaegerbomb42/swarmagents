@@ -27,7 +27,7 @@ const PORT = Number(process.argv[2] || process.env.MOCK_PORT || 37901);
 const WORKDIR = process.env.MOCK_WORKDIR || path.join(os.tmpdir(), "swarm-mock-work");
 fs.mkdirSync(WORKDIR, { recursive: true });
 
-const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser"];
+const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files"];
 const log = [];
 const attempts = new Map(); // conversation hash -> request count, for ratelimit/flaky
 
@@ -156,6 +156,19 @@ function script(a) {
       return {
         text: `Browser: download=${has(/Downloaded report\.csv/)} dialog=${has(/alert dialog: "hello from alert"/)} upload=${has(/picked:upload-me\.txt/)} recover=${has(/Action click failed[\s\S]*Interactive elements/)} popup=${has(/new tab opened[\s\S]*Popup page/)} file=${has(/^1,2/m)}`,
       };
+    }
+    case "files": {
+      // Makes preview fixtures in the work dir (and cds there so the session's folder is the work dir).
+      const cmd = [
+        `cd ${JSON.stringify(WORKDIR)}`,
+        `printf 'name,qty\\n"Widget, large",3\\nGadget,5\\n' > table.csv`,
+        `printf '<script>parent.fetch("/api/sessions")</script>' > evil.html`,
+        `printf 'TOKEN=abc' > .env`,
+        `seq 1 1000 > long.txt`,
+        "echo made",
+      ].join(" && ");
+      if (a.step === 0) return { calls: [{ name: "bash", input: { command: cmd } }] };
+      return { text: `Files: ${a.toolOutputs.at(-1)?.includes("made") ? "made" : "FAILED"}` };
     }
     case "long":
       return { text: "## Long answer\n\n" + Array.from({ length: 200 }, (_, i) => `- line ${i + 1}: the quick brown fox jumps over the lazy dog.`).join("\n") };

@@ -369,6 +369,14 @@ const cases = {
     }
   },
 
+  async browser() {
+    // Real headless Chrome via the browser tool against the mock site.
+    const { events } = await runTask("[mock:browser] try the browser", { timeout: 150_000 });
+    const out = texts(events);
+    assert(/Browser: download=ok dialog=ok upload=ok recover=ok popup=ok file=ok/.test(out), "browser download/dialog/upload/recover/popup", { said: out.slice(-400), tools: tools(events).map((t) => `${t.name}:${t.status}`) });
+    return "download saved + read back, alert reported, upload, failed click recovered, popup followed";
+  },
+
   async anthropic() {
     // Same tool script over the native Anthropic protocol, with a Bedrock-style bearer header.
     const r = await api("POST", "/api/connections", { type: "llm", preset: "custom-anthropic", label: "Mock Anthropic", baseUrl: MOCK, apiKey: "e2e-key-anthropic-4321", model: "mock", headers: { Authorization: "Bearer {key}" } });
@@ -417,7 +425,7 @@ async function main() {
   start(process.execPath, [path.join(ROOT, "tests/mock-llm.mjs"), String(MOCK_PORT)], { MOCK_WORKDIR: WORK }, path.join(HOME, "mock-llm.log"));
   await waitFor(`${MOCK}/__mock/health`, 10_000, "mock LLM");
   if (!opt("--url")) {
-    const env = { SWARM_HOME: HOME, NEXT_DIST_DIR: flag("--prod") ? ".next-e2e-prod" : ".next-e2e", NEXT_TELEMETRY_DISABLED: "1", SWARM_STALL_MS: "30000", SWARM_SEARCH_MOCK: `${MOCK}/search`, E2E_SERVER_CANARY: "canary-1", SWARM_E2E_CANARY: "canary-2" };
+    const env = { SWARM_HOME: HOME, NEXT_DIST_DIR: flag("--prod") ? ".next-e2e-prod" : ".next-e2e", NEXT_TELEMETRY_DISABLED: "1", SWARM_STALL_MS: "30000", SWARM_SEARCH_MOCK: `${MOCK}/search`, E2E_SERVER_CANARY: "canary-1", SWARM_E2E_CANARY: "canary-2", SWARM_BROWSER_HEADLESS: "1" };
     const next = path.join(ROOT, "node_modules/.bin/next");
     if (flag("--prod")) {
       console.log(c.d("building (next build)…"));

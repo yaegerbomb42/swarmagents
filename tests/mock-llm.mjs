@@ -12,6 +12,7 @@
 //
 // Scenarios: echo, tools, parallel, plan, ratelimit, flaky, auth, slow, bigcontext, loop, badtool, long, mcp
 // (mcp calls the first offered tool named mcp__*__echo; search calls web_search and reports which API answered).
+// browser drives the real browser tool through /site/ (download, alert, upload, a failing click, a popup).
 // Mock search APIs: /search/{brave,tavily,exa,serper} in each provider's response shape (key "bad-key" gets 401).
 // A key of "bad-key" is rejected with 401 everywhere. GET /__mock/requests returns the request log
 // (method, path, headers minus auth values, scenario, step); DELETE /__mock/requests clears it.
@@ -26,7 +27,7 @@ const PORT = Number(process.argv[2] || process.env.MOCK_PORT || 37901);
 const WORKDIR = process.env.MOCK_WORKDIR || path.join(os.tmpdir(), "swarm-mock-work");
 fs.mkdirSync(WORKDIR, { recursive: true });
 
-const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search"];
+const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser"];
 const log = [];
 const attempts = new Map(); // conversation hash -> request count, for ratelimit/flaky
 
@@ -136,6 +137,25 @@ function script(a) {
       if (a.step === 0) return { calls: [{ name: "web_search", input: { query: "swarm agents" } }] };
       const out = a.toolOutputs.at(-1) ?? "";
       return { text: `Search said: ${out.split("\n")[0]} | via=${out.match(/\(via (\w+)\)/)?.[1] ?? "none"}` };
+    }
+    case "browser": {
+      const site = `http://127.0.0.1:${PORT}/site/`;
+      const steps = [
+        { name: "bash", input: { command: `cd ${JSON.stringify(WORKDIR)} && rm -rf downloads && printf 'hi' > upload-me.txt && echo ready` } },
+        { name: "browser", input: { action: "goto", url: site } },
+        { name: "browser", input: { action: "click", selector: "#dl" } },
+        { name: "browser", input: { action: "click", selector: "#al" } },
+        { name: "browser", input: { action: "upload", selector: "#f", path: "upload-me.txt" } },
+        { name: "browser", input: { action: "click", selector: "#does-not-exist" } },
+        { name: "browser", input: { action: "click", selector: "#pop" } },
+        { name: "bash", input: { command: "cat downloads/report.csv" } },
+      ];
+      if (a.step < steps.length) return { calls: [steps[a.step]] };
+      const o = a.toolOutputs;
+      const has = (re) => (o.some((t) => re.test(t)) ? "ok" : "MISSING");
+      return {
+        text: `Browser: download=${has(/Downloaded report\.csv/)} dialog=${has(/alert dialog: "hello from alert"/)} upload=${has(/picked:upload-me\.txt/)} recover=${has(/Action click failed[\s\S]*Interactive elements/)} popup=${has(/new tab opened[\s\S]*Popup page/)} file=${has(/^1,2/m)}`,
+      };
     }
     case "long":
       return { text: "## Long answer\n\n" + Array.from({ length: 200 }, (_, i) => `- line ${i + 1}: the quick brown fox jumps over the lazy dog.`).join("\n") };
@@ -248,6 +268,23 @@ const server = http.createServer(async (req, res) => {
   const entry = { at: Date.now(), method: req.method, path: p, headers: safeHeaders(req.headers) };
   log.push(entry);
   if (log.length > 500) log.shift();
+
+  if (p === "/site") {
+    res.writeHead(200, { "Content-Type": "text/html" });
+    return res.end(`<!doctype html><title>Mock site</title><h1>Mock site</h1>
+<a id="dl" href="/site/report.csv" download>Download report</a>
+<button id="al" onclick="alert('hello from alert')">Show alert</button>
+<input id="f" type="file" onchange="document.title='picked:'+this.files[0].name">
+<a id="pop" href="/site/popup" target="_blank">Open popup</a>`);
+  }
+  if (p === "/site/report.csv") {
+    res.writeHead(200, { "Content-Type": "text/csv", "Content-Disposition": 'attachment; filename="report.csv"' });
+    return res.end("1,2\n3,4\n");
+  }
+  if (p === "/site/popup") {
+    res.writeHead(200, { "Content-Type": "text/html" });
+    return res.end("<!doctype html><title>Popup page</title><p>popup</p>");
+  }
 
   const search = p.match(/^\/search\/(brave|tavily|exa|serper)$/);
   if (search) {

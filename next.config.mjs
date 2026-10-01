@@ -5,6 +5,8 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Lets parallel builds/dev servers use separate output dirs (NEXT_DIST_DIR=.next-x). Default unchanged.
+  distDir: process.env.NEXT_DIST_DIR || ".next",
   // Server-only packages with native/dynamic requires stay out of the bundle.
   serverExternalPackages: ["playwright-core", "@modelcontextprotocol/sdk"],
   devIndicators: false,

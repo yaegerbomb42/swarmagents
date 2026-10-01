@@ -1,13 +1,23 @@
-import { getLimits, getProviders, newId, saveProviders } from "@/lib/store";
-import { PRESETS, presetFor } from "@/lib/presets";
-import type { ProviderConfig, PublicProvider } from "@/lib/types";
+import { getLimits, getProviders } from "@/lib/store";
+import { PRESETS } from "@/lib/presets";
+import { InputError, deleteConnection, reorderProviders, setEnabled, upsertConnection, type ConnectionInput } from "@/lib/connections";
+import type { PublicProvider } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
+// LLM-provider view of the unified connections API (/api/connections), kept for existing callers.
+
 function publicList(): PublicProvider[] {
   const limits = getLimits();
-  return getProviders().map(({ apiKey, ...p }) => ({ ...p, keyHint: apiKey ? `…${apiKey.slice(-4)}` : "", limits: limits[p.id] ?? { throttles: 0 } }));
+  return getProviders().map(({ apiKey, headers, ...p }) => ({
+    ...p,
+    headers: headers ? Object.fromEntries(Object.keys(headers).map((k) => [k, "••••"])) : undefined,
+    keyHint: apiKey ? `…${apiKey.slice(-4)}` : "",
+    limits: limits[p.id] ?? { throttles: 0 },
+  }));
 }
+
+const fail = (e: unknown) => Response.json({ error: e instanceof InputError ? e.message : "Couldn't save the provider.", providers: publicList() }, { status: e instanceof InputError ? 400 : 500 });
 
 export async function GET() {
   return Response.json({ providers: publicList(), presets: PRESETS });
@@ -15,37 +25,29 @@ export async function GET() {
 
 /** Upsert. Omitting apiKey on an existing provider keeps the stored key. */
 export async function POST(req: Request) {
-  const body = (await req.json()) as Partial<ProviderConfig>;
-  const list = getProviders();
-  const existing = body.id ? list.find((p) => p.id === body.id) : undefined;
-  if (existing) Object.assign(existing, { ...body, apiKey: body.apiKey || existing.apiKey });
-  else {
-    const preset = presetFor(body.kind ?? "custom");
-    list.push({
-      id: newId(),
-      kind: preset.kind,
-      label: body.label || preset.label,
-      apiKey: body.apiKey ?? "",
-      baseUrl: body.baseUrl ?? preset.baseUrl,
-      model: body.model || preset.model,
-      enabled: true,
-    });
+  try {
+    const body = (await req.json()) as Omit<ConnectionInput, "type"> & { kind?: string };
+    if (body.id && Object.keys(body).every((k) => k === "id" || k === "enabled")) setEnabled("llm", body.id, !!body.enabled);
+    else upsertConnection({ ...body, type: "llm", preset: body.preset ?? body.kind });
+    return Response.json({ providers: publicList() });
+  } catch (e) {
+    return fail(e);
   }
-  saveProviders(list);
-  return Response.json({ providers: publicList() });
 }
 
 /** Reorder: body { order: string[] } */
 export async function PUT(req: Request) {
-  const { order } = (await req.json()) as { order: string[] };
-  const list = getProviders();
-  list.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
-  saveProviders(list);
-  return Response.json({ providers: publicList() });
+  try {
+    const { order } = (await req.json()) as { order: string[] };
+    reorderProviders(Array.isArray(order) ? order.map(String) : []);
+    return Response.json({ providers: publicList() });
+  } catch (e) {
+    return fail(e);
+  }
 }
 
 export async function DELETE(req: Request) {
   const id = new URL(req.url).searchParams.get("id");
-  saveProviders(getProviders().filter((p) => p.id !== id));
+  if (id) deleteConnection("llm", id);
   return Response.json({ providers: publicList() });
 }

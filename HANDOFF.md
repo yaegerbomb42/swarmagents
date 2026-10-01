@@ -55,8 +55,12 @@ screenshots.
 
 ## Known nits
 - "Thought for Ns" understates the time (summarized thinking arrives in a burst; timing starts at the first delta).
-- The OAuth callback returns to `localhost` (not 127.0.0.1), so localStorage (last open session) differs per host.
-- Web search scrapes DuckDuckGo HTML, which is brittle. Consider adding an optional search API key.
+- ~~OAuth callback returns to `localhost`~~ FIXED 2026-10-01 (G2): client-side canonical swap
+  (`lib/canonical.ts`, page.tsx mount effect) moves any localhost page to 127.0.0.1 preserving path+query,
+  so localStorage never splits. (Server-side redirect was tried and reverted: Next normalizes middleware
+  redirect Locations to the request host, which would loop.)
+- ~~Web search scrapes DuckDuckGo HTML~~ MITIGATED 2026-10-01 (G2): web_search uses Tavily when
+  `TAVILY_API_KEY`/`SEARCH_API_KEY` or settings.json `search` is set, else the DDG scrape as before.
 
 ## Next up (proposed to the user, awaiting their pick)
 1. Checkpoints/undo for file edits  2. Memory across tasks  3. Parallel sub-agents  4. Diff view with approve/reject

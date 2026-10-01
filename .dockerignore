@@ -1,0 +1,16 @@
+node_modules
+.next
+.next-*
+*.tsbuildinfo
+.env
+.env.*
+.DS_Store
+.git
+coordination
+.swarm-coordination
+GROUP_CHAT.md
+SWARM_GROUP_CHAT.md
+SWARM_MASTER_TODO.md
+current
+.last_build_hash
+.last_npm_hash

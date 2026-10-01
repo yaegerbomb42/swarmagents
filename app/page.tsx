@@ -4,7 +4,9 @@ import type { AgentEvent, Attachment, ContextInfo, SessionMeta, StreamOp } from 
 import { Timeline } from "@/components/Timeline";
 import { Composer } from "@/components/Composer";
 import { Settings } from "@/components/Settings";
-import { IPlus, ISettings, ISidebar, IX } from "@/components/icons";
+import { Activity } from "@/components/Activity";
+import { IActivity, IPlus, ISettings, ISidebar, IX } from "@/components/icons";
+import { canonicalHostSwap } from "@/lib/canonical";
 
 export default function Home() {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
@@ -14,6 +16,7 @@ export default function Home() {
   const [context, setContext] = useState<ContextInfo | null>(null);
   const [runningIds, setRunningIds] = useState<Set<string>>(new Set());
   const [settings, setSettings] = useState(false);
+  const [activityOpen, setActivityOpen] = useState(false);
   const [sidebar, setSidebar] = useState(true);
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -25,6 +28,12 @@ export default function Home() {
   const refresh = useCallback(() => fetch("/api/sessions").then((r) => r.json()).then((d) => setSessions(d.sessions)), []);
 
   useEffect(() => {
+    // One local origin: localhost and 127.0.0.1 have separate localStorage.
+    const swap = canonicalHostSwap(location.href);
+    if (swap) {
+      location.replace(swap);
+      return;
+    }
     refresh();
     fetch("/api/providers")
       .then((r) => r.json())
@@ -171,6 +180,10 @@ export default function Home() {
           ))}
         </div>
         <div className="side-foot">
+          <button className="side-item" onClick={() => setActivityOpen(true)}>
+            <IActivity />
+            <span className="t">Activity</span>
+          </button>
           <button className="side-item" onClick={() => setSettings(true)}>
             <ISettings />
             <span className="t">Settings</span>
@@ -224,6 +237,15 @@ export default function Home() {
       </main>
 
       {settings && <Settings onClose={() => setSettings(false)} />}
+      {activityOpen && (
+        <Activity
+          onClose={() => setActivityOpen(false)}
+          onOpenSession={(id) => {
+            setActive(id);
+            setActivityOpen(false);
+          }}
+        />
+      )}
       {lightbox && (
         <div className="lightbox" onClick={() => setLightbox(null)}>
           <img src={lightbox} alt="" />

@@ -2,6 +2,12 @@ import OpenAI from "openai";
 import type { Block, Msg, ProviderConfig } from "../types";
 import { classifyHttp, ProviderError, type ChatRequest, type StreamCallbacks, type TurnResult } from "./types";
 
+function client(p: ProviderConfig, opts: { maxRetries: number; timeout?: number }) {
+  const headers: Record<string, string> = {};
+  for (const [k, v] of Object.entries(p.headers ?? {})) if (k.trim()) headers[k.trim()] = String(v).split("{key}").join(p.apiKey ?? "");
+  return new OpenAI({ apiKey: p.apiKey || "none", baseURL: p.baseUrl || "https://api.openai.com/v1", defaultHeaders: headers, ...opts });
+}
+
 type ChatMsg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
 function toParams(system: string, messages: Msg[]): ChatMsg[] {
@@ -37,7 +43,7 @@ function toParams(system: string, messages: Msg[]): ChatMsg[] {
 }
 
 export async function streamOpenAI(p: ProviderConfig, req: ChatRequest, cb: StreamCallbacks): Promise<TurnResult> {
-  const client = new OpenAI({ apiKey: p.apiKey || "none", baseURL: p.baseUrl || "https://api.openai.com/v1", maxRetries: 0, timeout: 15 * 60_000 });
+  const api = client(p, { maxRetries: 0, timeout: 15 * 60_000 });
   const body: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
     model: p.model,
     messages: toParams(req.system, req.messages),
@@ -59,7 +65,7 @@ export async function streamOpenAI(p: ProviderConfig, req: ChatRequest, cb: Stre
   };
 
   try {
-    const stream = await client.chat.completions.create(body, { signal: req.signal });
+    const stream = await api.chat.completions.create(body, { signal: req.signal });
     for await (const chunk of stream) {
       if (chunk.usage) {
         const cached = (chunk.usage as { prompt_tokens_details?: { cached_tokens?: number } }).prompt_tokens_details?.cached_tokens ?? 0;
@@ -121,9 +127,9 @@ export async function streamOpenAI(p: ProviderConfig, req: ChatRequest, cb: Stre
 }
 
 export async function listOpenAIModels(p: ProviderConfig) {
-  const client = new OpenAI({ apiKey: p.apiKey || "none", baseURL: p.baseUrl || "https://api.openai.com/v1", maxRetries: 1 });
+  const api = client(p, { maxRetries: 1, timeout: 30_000 });
   const out: { id: string; context?: number }[] = [];
-  for await (const m of client.models.list()) {
+  for await (const m of api.models.list()) {
     const ctx = (m as unknown as { context_length?: number }).context_length;
     out.push({ id: m.id.replace(/^models\//, ""), context: ctx });
   }

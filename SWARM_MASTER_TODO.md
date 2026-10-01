@@ -34,13 +34,14 @@
 | C2 | C | Tool-call transparency: every hidden capability (shell bg jobs, plan, uploads) gets a first-class Timeline card | unclaimed | todo | Coordinate with lane A |
 | D1 | D | Browser panel: visible-Chrome status, current URL, numbered-element overlay legend, screenshot-in-timeline, download handling | unclaimed | todo | See lib/tools/browser.ts |
 | D2 | D | Artifact rendering: markdown, code blocks w/ copy, image/PDF/Office preview, large-output paging UI | unclaimed | todo |  |
-| E1 | E | Checkpoints/undo for file edits (snapshot before write/edit, restore button, cap disk usage) | unclaimed | todo | Critical for 24h trust |
-| E2 | E | 24h endurance: heartbeat + auto-resume after crash/reload, step budget surfacing (MAX_STEPS=400), idle-stop + resume, token-burn meter | agent-9f59 | in-progress | See lib/agent.ts Session loop |
+| E1 | E | Checkpoints/undo for file edits (snapshot before write/edit, restore button, cap disk usage) | cline-01 | done | Snapshot+restore+diff UI + GC caps (500MB/500 files/7d, GC on snapshot, cleanup on delete, sidecar-less garbage dropped); typecheck green, next build green, GC eviction logic verified in node mirror |
+| E2 | E | 24h endurance: heartbeat + auto-resume after crash/reload, step budget surfacing (MAX_STEPS=400), idle-stop + resume, token-burn meter | agent-9f59 | in-progress | done so far: crash resume, quota/outage wait, no step cap + loop guard, plan nudge, bounded event archive + paging API, window-sized compaction, stall watchdog, runtime adapter. Open: Timeline "show earlier" (UI owner) |
 | E3 | E | Compaction polish: trim-then-summarize timeline honesty ("Thought for Ns" fix per HANDOFF nits), handoff readability | unclaimed | todo | HANDOFF "Known nits" #1 |
 | F1 | F | Parallel sub-agents (fan-out tool, per-child timeline section, merge-back) | unclaimed | todo | Needs inbox/steering safety |
-| F2 | F | Scheduled/background tasks + approvals gate for destructive/outward actions | unclaimed | todo | Builds on systemPrompt safety rule |
+| F2 | F | Scheduled/background tasks + approvals gate for destructive/outward actions | atlas-runtime | in-progress | Durable runtime control plane: lib/runtime/** (task queue, run ledger, artifacts, scheduler, budgets, quota auto-resume), app/api/runtime/**, components/Activity.{tsx,css}. Drives sessions via lib/agent public API only. |
 | G1 | G | `bin/smoke` script: typecheck + build + API ping + SSE smoke, run before every done-mark | agent-opencode-1 | done | PASS --skip-build (tsc clean, boot, session+SSE+delete); full `next build` not re-run this pass |
-| G2 | G | Fix HANDOFF nits: OAuth localhost↔127.0.0.1 localStorage split, DuckDuckGo brittleness (optional search-key field) | agent-opencode-1 | in-progress | Reading callback + web_search first |
+| G2 | G | Fix HANDOFF nits: OAuth localhost↔127.0.0.1 localStorage split, DuckDuckGo brittleness (optional search-key field) | agent-opencode-1 | done | Canonical swap client-side (canonical.ts, unit-tested) + Tavily w/ DDG fallback; tsc clean, full smoke PASS |
+| DEPLOY | G | Deploy v2 to https://swarmagents.codes via infra/deploy.sh swarmagents: Dockerfile (non-root, /data volume, limits, isolated network), compose service, nginx 8085 vhost (SSE), server env + owner token; auth gate by agent-9f59 | Grok Bot (deploy) | in-progress | Live check: curl -I https://swarmagents.codes shows v2 login; unauth API 401 |
 
 ## 24h-run acceptance (the bar for "Devin-class")
 - [ ] Agent runs 24h on one task without crash, context loss, or disk blowup (E2 + checkpoints).

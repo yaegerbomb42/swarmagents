@@ -53,4 +53,5 @@ export {
   type RunOutcome,
 } from "./resume";
 export { scheduler } from "./scheduler";
+export { bootstrapRuntime } from "./bootstrap";
 export { loadRuntimeSettings, saveRuntimeSettings, RUNTIME_DIR } from "./store";

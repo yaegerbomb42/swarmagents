@@ -1,10 +1,10 @@
-import { listTasks, progressOf, scheduler, subscribeRuntime, summarizeUsage, type RuntimeEvent } from "@/lib/runtime";
+import { bootstrapRuntime, listTasks, progressOf, subscribeRuntime, summarizeUsage, type RuntimeEvent } from "@/lib/runtime";
 
 export const dynamic = "force-dynamic";
 
 // Live task-board stream. Mirrors the agent session stream so the UI can bind to it the
 // same way. We always send a snapshot first, then incremental task updates.
-scheduler().start();
+bootstrapRuntime();
 
 export async function GET(req: Request) {
   const enc = new TextEncoder();

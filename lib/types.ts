@@ -11,6 +11,12 @@ export interface ProviderConfig {
   baseUrl?: string;
   model: string;
   enabled: boolean;
+  /** Catalog entry this connection was created from (lib/presets.ts id). Defaults to `kind`. */
+  preset?: string;
+  /** Extra request headers. Values may contain "{key}", replaced with apiKey at request time. */
+  headers?: Record<string, string>;
+  /** Last live model list, cached for the picker. */
+  models?: string[];
 }
 
 /** Provider as sent to the browser: the key is masked. */
@@ -111,4 +117,6 @@ export interface SessionMeta {
   active?: boolean;
   /** Latest plan, kept across runs so the agent can be held to it. */
   plan?: PlanItem[];
+  /** Older events moved to the append-only archive; the live stream holds only the rest. */
+  archivedEvents?: number;
 }

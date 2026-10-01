@@ -15,6 +15,102 @@ const checkpointsDir = (sessionId: string) => {
   return d;
 };
 
+/** Retention policy: keeps 24h trust without disk blowup on long runs. */
+export const CHECKPOINT_LIMITS = {
+  /** Max total bytes kept per session dir. Oldest snapshots evicted first. */
+  maxBytesPerSession: 500_000_000,
+  /** Max age before a snapshot is eligible for GC. */
+  maxAgeMs: 7 * 24 * 60 * 60 * 1000,
+  /** Max snapshots kept per session dir. */
+  maxFilesPerSession: 500,
+};
+
+function checkpointMeta(bak: string): { path: string; at: number } | null {
+  try {
+    return JSON.parse(fs.readFileSync(`${bak}.json`, "utf8")) as { path: string; at: number };
+  } catch {
+    return null;
+  }
+}
+
+function listSnapshots(sessionId: string): { bak: string; bytes: number; at: number }[] {
+  const d = path.join(HOME, "checkpoints", sessionId);
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(d);
+  } catch {
+    return [];
+  }
+  const out: { bak: string; bytes: number; at: number }[] = [];
+  for (const n of names) {
+    if (!n.endsWith(".bak")) continue;
+    const bak = path.join(d, n);
+    try {
+      const st = fs.statSync(bak);
+      // A snapshot without a readable sidecar is un-restorable — treat it as garbage and drop it on next GC.
+      const meta = checkpointMeta(bak);
+      if (!meta) {
+        removeSnapshot(bak);
+        continue;
+      }
+      out.push({ bak, bytes: st.size, at: meta.at ?? st.mtimeMs });
+    } catch {
+      // dangling sidecar or removed file — ignore
+    }
+  }
+  return out.sort((a, b) => a.at - b.at);
+}
+
+function removeSnapshot(bak: string) {
+  try {
+    fs.rmSync(bak, { force: true });
+  } catch {}
+  try {
+    fs.rmSync(`${bak}.json`, { force: true });
+  } catch {}
+}
+
+/** Evict oldest snapshots until the session dir is back inside CHECKPOINT_LIMITS. Returns evicted count. */
+export function gcCheckpoints(sessionId: string): number {
+  const snaps = listSnapshots(sessionId);
+  if (!snaps.length) return 0;
+  const now = Date.now();
+  let evicted = 0;
+  // Age-based first.
+  for (const s of snaps) {
+    if (now - s.at > CHECKPOINT_LIMITS.maxAgeMs) {
+      removeSnapshot(s.bak);
+      evicted++;
+    }
+  }
+  let live = listSnapshots(sessionId);
+  const totalBytes = () => live.reduce((n, s) => n + s.bytes, 0);
+  // Count-based, then size-based — oldest first.
+  while (live.length > CHECKPOINT_LIMITS.maxFilesPerSession) {
+    removeSnapshot(live[0].bak);
+    evicted++;
+    live = live.slice(1);
+  }
+  while (live.length && totalBytes() > CHECKPOINT_LIMITS.maxBytesPerSession) {
+    removeSnapshot(live[0].bak);
+    evicted++;
+    live = live.slice(1);
+  }
+  return evicted;
+}
+
+/** Remove every snapshot for a session (called on session delete). */
+export function clearCheckpoints(sessionId: string) {
+  try {
+    fs.rmSync(path.join(HOME, "checkpoints", sessionId), { recursive: true, force: true });
+  } catch {}
+}
+
+export function checkpointUsage(sessionId: string): { files: number; bytes: number } {
+  const snaps = listSnapshots(sessionId);
+  return { files: snaps.length, bytes: snaps.reduce((n, s) => n + s.bytes, 0) };
+}
+
 export function snapshotFile(sessionId: string, absPath: string): string | null {
   try {
     if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) return null;
@@ -24,6 +120,7 @@ export function snapshotFile(sessionId: string, absPath: string): string | null 
     fs.copyFileSync(absPath, dest);
     // Sidecar records which file this snapshot belongs to.
     fs.writeFileSync(`${dest}.json`, JSON.stringify({ path: absPath, at: Date.now() }), { mode: 0o600 });
+    gcCheckpoints(sessionId);
     return id;
   } catch {
     return null;

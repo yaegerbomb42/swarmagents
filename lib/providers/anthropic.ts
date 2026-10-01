@@ -2,6 +2,26 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { Block, Msg, ProviderConfig } from "../types";
 import { classifyHttp, ProviderError, type ChatRequest, type StreamCallbacks, type TurnResult } from "./types";
 
+/**
+ * Build a client. Base URL and key are always explicit so ANTHROPIC_* env vars never leak in. A custom
+ * "Authorization: Bearer …" header (Bedrock, gateways) becomes authToken, which also keeps the SDK from
+ * falling back to the machine's default credential chain.
+ */
+function client(p: ProviderConfig, opts: { maxRetries: number; timeout?: number }) {
+  const headers: Record<string, string> = {};
+  let authToken: string | null = null;
+  for (const [k, v] of Object.entries(p.headers ?? {})) {
+    if (!k.trim()) continue;
+    const val = String(v).split("{key}").join(p.apiKey ?? "");
+    const bearer = /^authorization$/i.test(k.trim()) && val.match(/^Bearer\s+(.+)$/i);
+    if (bearer) authToken = bearer[1];
+    else headers[k.trim()] = val;
+  }
+  return authToken
+    ? new Anthropic({ apiKey: null, authToken, baseURL: p.baseUrl || "https://api.anthropic.com", defaultHeaders: headers, ...opts })
+    : new Anthropic({ apiKey: p.apiKey, baseURL: p.baseUrl || "https://api.anthropic.com", defaultHeaders: headers, ...opts });
+}
+
 // Adaptive thinking exists on the 4.6+ families; older models take no thinking config here.
 const ADAPTIVE = /claude-(opus|sonnet|fable|mythos)-(5|4-[678])/;
 
@@ -39,7 +59,7 @@ function toParams(messages: Msg[], model: string): Anthropic.MessageParam[] {
 }
 
 export async function streamAnthropic(p: ProviderConfig, req: ChatRequest, cb: StreamCallbacks): Promise<TurnResult> {
-  const client = new Anthropic({ apiKey: p.apiKey, baseURL: p.baseUrl || "https://api.anthropic.com", maxRetries: 0, timeout: 15 * 60_000 });
+  const api = client(p, { maxRetries: 0, timeout: 15 * 60_000 });
   const params: Record<string, unknown> = {
     model: p.model,
     max_tokens: req.maxTokens ?? 64000,
@@ -55,14 +75,14 @@ export async function streamAnthropic(p: ProviderConfig, req: ChatRequest, cb: S
   }
 
   try {
-    return await run(client, params, req, cb, p.model);
+    return await run(api, params, req, cb, p.model);
   } catch (e) {
     // Gateways/proxies can re-bind the conversation, invalidating replayed thinking signatures.
     // The API's own guidance is to drop the blocks; do that once and retry.
     if (e instanceof ProviderError && e.kind === "fatal" && /signature/i.test(e.message)) {
       const msgs = params.messages as Anthropic.MessageParam[];
       params.messages = msgs.map((m) => ({ ...m, content: Array.isArray(m.content) ? m.content.filter((c) => c.type !== "thinking" && c.type !== "redacted_thinking") : m.content }));
-      return run(client, params, req, cb, p.model);
+      return run(api, params, req, cb, p.model);
     }
     throw e;
   }
@@ -108,8 +128,8 @@ async function run(client: Anthropic, params: Record<string, unknown>, req: Chat
 }
 
 export async function listAnthropicModels(p: ProviderConfig) {
-  const client = new Anthropic({ apiKey: p.apiKey, baseURL: p.baseUrl || "https://api.anthropic.com", maxRetries: 1 });
+  const api = client(p, { maxRetries: 1, timeout: 30_000 });
   const out: { id: string; context?: number }[] = [];
-  for await (const m of client.models.list({ limit: 100 })) out.push({ id: m.id, context: (m as unknown as { max_input_tokens?: number }).max_input_tokens });
+  for await (const m of api.models.list({ limit: 100 })) out.push({ id: m.id, context: (m as unknown as { max_input_tokens?: number }).max_input_tokens });
   return out;
 }

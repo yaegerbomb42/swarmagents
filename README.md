@@ -16,6 +16,10 @@ images, PDFs and Office docs supported), ripgrep search, web search and fetch, a
 persistent logins, a live plan, and every MCP connector configured in `~/.swarmagents/mcp.json`,
 `~/.claude.json` or Claude Desktop.
 
+Web search uses DuckDuckGo HTML scraping by default. For reliable results set a Tavily key via
+`TAVILY_API_KEY` (or `SEARCH_API_KEY`) in the server environment, or a `{"search":{"provider":"tavily","apiKey":"..."}}`
+entry in `~/.swarmagents/settings.json`.
+
 **Context:** at 75% of the model's window, old tool outputs and screenshots are trimmed first. If that isn't
 enough, earlier work is summarized into a handoff. Both appear in the timeline, and the summary is readable.
 Messages sent while the agent works are injected at its next step. Esc stops it.

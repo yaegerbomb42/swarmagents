@@ -107,6 +107,10 @@ export function saveMeta(meta: SessionMeta) {
 export function deleteSession(id: string) {
   fs.rmSync(sdir(id), { recursive: true, force: true });
   fs.rmSync(path.join(UPLOADS_DIR, id), { recursive: true, force: true });
+  // File-edit snapshots (lib/tools/files.ts) live outside the session dir; remove them too (best-effort).
+  try {
+    fs.rmSync(path.join(HOME, "checkpoints", id), { recursive: true, force: true });
+  } catch {}
 }
 
 export function loadHistory(id: string): Msg[] {
@@ -123,6 +127,26 @@ export function loadEvents(id: string): AgentEvent[] {
 
 export function saveEvents(id: string, events: AgentEvent[]) {
   writeJson(path.join(sdir(id), "events.json"), events);
+}
+
+// Long runs produce unbounded events. The oldest settled ones move to an append-only JSONL archive that is
+// written once and never rewritten, so saves and the live snapshot stay small however long a task runs.
+const archiveFile = (id: string) => path.join(sdir(id), "events-archive.jsonl");
+
+export function archiveEvents(id: string, events: AgentEvent[]) {
+  fs.appendFileSync(archiveFile(id), events.map((e) => JSON.stringify(e)).join("\n") + "\n", { mode: 0o600 });
+}
+
+/** Archived events [before - limit, before), oldest first. Indexes count from the start of the session. */
+export function loadArchivedEvents(id: string, before: number, limit: number): AgentEvent[] {
+  let lines: string[];
+  try {
+    lines = fs.readFileSync(archiveFile(id), "utf8").split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+  const end = Math.min(before, lines.length);
+  return lines.slice(Math.max(0, end - limit), end).map((l) => JSON.parse(l) as AgentEvent);
 }
 
 export function sessionDir(id: string) {

@@ -2,13 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { AppendField, AgentEvent, Attachment, Block, ContextInfo, Msg, PlanItem, ProviderConfig, SessionMeta, StreamOp } from "./types";
-import { getMeta, listSessions, loadEvents, loadHistory, newId, saveEvents, saveHistory, saveMeta, UPLOADS_DIR } from "./store";
+import { archiveEvents, getMeta, listSessions, loadEvents, loadHistory, newId, saveEvents, saveHistory, saveMeta, UPLOADS_DIR } from "./store";
 import { contextWindow, estimateTokens, routeTurn, setLearnedContext, activeProviders } from "./router";
 import { ProviderError } from "./providers/types";
 import { allTools } from "./tools";
 import type { Tool } from "./tools/types";
+import { setAgentAdapter } from "./runtime/resume";
 
 const READ_ONLY = new Set(["read_file", "search", "web_search", "web_fetch"]);
+/** Live events kept in memory and in the snapshot; past ARCHIVE_AT the oldest settled ones are archived. */
+const KEEP_EVENTS = 1500;
+const ARCHIVE_AT = 2500;
 /** Identical tool calls in a row before the agent is told it is looping, and before the run is stopped. */
 const LOOP_WARN = 5;
 const LOOP_STOP = 10;
@@ -134,15 +138,38 @@ class Session {
   flush() {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = null;
+    this.archiveOld();
     saveEvents(this.meta.id, this.events);
     saveHistory(this.meta.id, this.history);
     this.meta.updatedAt = Date.now();
     saveMeta(this.meta);
   }
 
+  private archiveOld() {
+    if (this.events.length <= ARCHIVE_AT) return;
+    let cut = this.events.length - KEEP_EVENTS;
+    // Never archive something still streaming or running; it must stay patchable.
+    const open = this.events.findIndex((e) => ("done" in e && e.done === false) || (e.type === "tool" && (e.status === "running" || e.status === "streaming")));
+    if (open >= 0) cut = Math.min(cut, open);
+    if (cut <= 0) return;
+    // Archive first: a crash between the two writes duplicates a few events rather than losing them.
+    archiveEvents(this.meta.id, this.events.slice(0, cut));
+    this.events = this.events.slice(cut);
+    this.meta.archivedEvents = (this.meta.archivedEvents ?? 0) + cut;
+  }
+
   setRunning(r: boolean) {
     this.running = r;
     this.emit({ op: "running", running: r });
+    if (!r && !this.inbox.length) for (const f of this.idleWaiters.splice(0)) f();
+  }
+
+  private idleWaiters: (() => void)[] = [];
+
+  /** Resolves once the session has no run in progress and nothing queued. */
+  whenIdle(): Promise<void> {
+    if (!this.running && !this.inbox.length) return Promise.resolve();
+    return new Promise((res) => this.idleWaiters.push(res));
   }
 
   private setActive(a: boolean) {
@@ -502,7 +529,7 @@ class Session {
             blocks: [
               {
                 type: "text",
-                text: `Summarize this session for continuation. Include: the user's goals and explicit instructions (verbatim where it matters), key facts discovered, files touched (full paths) and their state, commands that worked/failed, current plan and exactly what remains, and any open questions. Be dense and specific; omit pleasantries.\n\n<log>\n${transcript.slice(-600_000)}\n</log>`,
+                text: `Summarize this session for continuation. Include: the user's goals and explicit instructions (verbatim where it matters), key facts discovered, files touched (full paths) and their state, commands that worked/failed, current plan and exactly what remains, and any open questions. Be dense and specific; omit pleasantries.\n\n<log>\n${fitLog(transcript, Math.floor(window * 0.55 * 4))}\n</log>`,
               },
             ],
           },
@@ -532,6 +559,13 @@ function attachmentBlocks(a: Attachment): Block[] {
   return [{ type: "text", text: `${(note as { text: string }).text}\nIt is too large or not plain text to inline; use read_file (paged) or search/bash to work with it.` }];
 }
 
+/** Fit a log into `max` chars, keeping the opening (the user's original instructions) and the most recent work. */
+function fitLog(log: string, max: number) {
+  if (log.length <= max) return log;
+  const head = Math.min(20_000, Math.floor(max / 5));
+  return `${log.slice(0, head)}\n…[middle of the log omitted to fit the model's context]…\n${log.slice(-(max - head))}`;
+}
+
 const fmtBytes = (n: number) => (n > 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n > 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.ceil(n / 1e3)} KB`);
 
 const g = globalThis as unknown as { __swarmSessions?: Map<string, Session> };
@@ -552,6 +586,45 @@ export function session(id: string): Session | null {
 export function resumeActiveSessions() {
   for (const m of listSessions()) if (m.active) session(m.id)?.resume();
 }
+
+// The task runtime (lib/runtime) drives the agent through this adapter: it queues a task, we run it as a normal
+// message in the task's session and report turns, tools and quota waits back for its ledger and budgets.
+setAgentAdapter({
+  async run(task, hooks) {
+    const s = session(task.sessionId);
+    if (!s) throw new Error(`Session ${task.sessionId} not found`);
+    // Text events are patched in place as they stream, so holding the latest one gives the final reply.
+    let reply: AgentEvent | null = null;
+    const sub = (op: StreamOp) => {
+      if (op.op === "add" && op.event.type === "text") reply = op.event;
+      else if (op.op === "add" && op.event.type === "turn") {
+        const t = op.event;
+        hooks.onTurn({ inputTokens: t.inputTokens, outputTokens: t.outputTokens, cachedTokens: t.cachedTokens, provider: t.provider, model: t.model });
+      } else if (op.op === "add" && op.event.type === "notice") {
+        const m = /Waiting (\d+)(s|m) for /.exec(op.event.text);
+        if (m) hooks.onQuotaWait(+m[1] * (m[2] === "m" ? 60_000 : 1000), op.event.text);
+        else hooks.onNote(op.event.text);
+      } else if (op.op === "patch" && "status" in op.patch && (op.patch.status === "ok" || op.patch.status === "error")) {
+        const ev = s.events.find((e) => e.id === op.id);
+        if (ev?.type === "tool") hooks.onTool(ev.name, op.patch.status === "ok");
+      }
+    };
+    const onAbort = () => s.stop();
+    s.subs.add(sub);
+    hooks.signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      s.send(task.prompt, []);
+      await s.whenIdle();
+    } finally {
+      s.subs.delete(sub);
+      hooks.signal.removeEventListener("abort", onAbort);
+    }
+    const last = reply as AgentEvent | null;
+    return { summary: last?.type === "text" ? last.text : "" };
+  },
+  stop: (sessionId) => sessions.get(sessionId)?.stop(),
+  isRunning: (sessionId) => !!sessions.get(sessionId)?.running,
+});
 
 export function dropSession(id: string) {
   sessions.get(id)?.stop();

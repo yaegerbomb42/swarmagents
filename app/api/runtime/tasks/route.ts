@@ -1,10 +1,10 @@
-import { createTask, listTasks, loadRuntimeSettings, progressOf, scheduler, summarizeUsage } from "@/lib/runtime";
+import { bootstrapRuntime, createTask, listTasks, loadRuntimeSettings, progressOf, scheduler, summarizeUsage } from "@/lib/runtime";
 
 export const dynamic = "force-dynamic";
 
-// Ensure the scheduler is running whenever the runtime API is touched. This is the
-// single place the background loop is guaranteed to come up, even after a cold restart.
-scheduler().start();
+// Bring the runtime up on first touch: this registers the agent adapter and starts the
+// background scheduler, so the loop is guaranteed to run even after a cold restart.
+bootstrapRuntime();
 
 /** Task board: every task with its rolled-up progress and usage. */
 export async function GET() {

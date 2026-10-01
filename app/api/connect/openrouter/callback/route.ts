@@ -22,7 +22,7 @@ export async function GET(req: Request) {
   const list = getProviders();
   const existing = list.find((p) => p.kind === "openrouter");
   if (existing) existing.apiKey = d.key;
-  else list.push({ id: newId(), kind: "openrouter", label: preset.label, apiKey: d.key, baseUrl: preset.baseUrl, model: preset.model, enabled: true });
+  else list.push({ id: newId(), kind: "openrouter", preset: preset.id, label: preset.label, apiKey: d.key, baseUrl: preset.baseUrl, model: preset.model, enabled: true });
   saveProviders(list);
   return back("connected=openrouter");
 }

@@ -4,6 +4,8 @@
 # Usage: ./bin/smoke [--skip-build]
 set -e
 cd "$(dirname "$0")/.."
+# Isolated dist dir: never fight a concurrent `next dev` over .next (dev writes there too).
+export NEXT_DIST_DIR=.next-smoke
 SKIP_BUILD=0
 [ "${1:-}" = "--skip-build" ] && SKIP_BUILD=1
 

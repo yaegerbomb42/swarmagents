@@ -98,6 +98,41 @@ const sleep = (ms: number, signal: AbortSignal) =>
     signal.addEventListener("abort", () => (clearTimeout(t), rej(new ProviderError("aborted", "stopped"))), { once: true });
   });
 
+/** A stream silent this long is presumed hung (dead connection, wedged proxy) and is retried. */
+const STALL_MS = Number(process.env.SWARM_STALL_MS) || 5 * MINUTE;
+
+/** Run one provider call under a watchdog that aborts it if no stream activity arrives for STALL_MS. */
+async function watched(p: ProviderConfig, req: ChatRequest, cb: StreamCallbacks): Promise<TurnResult> {
+  const ac = new AbortController();
+  const onOuter = () => ac.abort();
+  req.signal.addEventListener("abort", onOuter, { once: true });
+  let last = Date.now();
+  let stalled = false;
+  const beat =
+    <A extends unknown[]>(f: (...a: A) => void) =>
+    (...a: A) => {
+      last = Date.now();
+      f(...a);
+    };
+  const timer = setInterval(() => {
+    if (Date.now() - last > STALL_MS) {
+      stalled = true;
+      ac.abort();
+    }
+  }, 5000);
+  const wcb: StreamCallbacks = { onThinking: beat(cb.onThinking), onText: beat(cb.onText), onToolStart: beat(cb.onToolStart), onToolInput: beat(cb.onToolInput), onBlockEnd: beat(cb.onBlockEnd) };
+  const wreq = { ...req, signal: ac.signal };
+  try {
+    return p.kind === "anthropic" ? await streamAnthropic(p, wreq, wcb) : await streamOpenAI(p, wreq, wcb);
+  } catch (e) {
+    if (stalled && !req.signal.aborted) throw new ProviderError("transient", `no response for ${Math.round(STALL_MS / 1000)}s (stream stalled)`);
+    throw e;
+  } finally {
+    clearInterval(timer);
+    req.signal.removeEventListener("abort", onOuter);
+  }
+}
+
 export interface RouterHooks {
   onNotice(level: "info" | "warn", text: string): void;
   /** Called before each attempt so the UI can reset partially streamed output from a failed attempt. */
@@ -138,7 +173,7 @@ export async function routeTurn(req: ChatRequest, cb: StreamCallbacks, hooks: Ro
     hooks.onAttempt(p);
 
     try {
-      const r = p.kind === "anthropic" ? await streamAnthropic(p, req, cb) : await streamOpenAI(p, req, cb);
+      const r = await watched(p, req, cb);
       const l = getLimits()[p.id];
       if (l?.lastError) updateLimits(p.id, (x) => ({ ...x, lastError: undefined }));
       streaks.delete(p.id);

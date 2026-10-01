@@ -114,17 +114,17 @@ export async function POST(req: Request) {
         size += data.length;
         const writeChunk = (offset: number) => {
           if (offset === data.length) return callback();
-          try {
-            if (availableBytes(dir) < MIN_FREE_BYTES + uploadRuntime.reservedBytes) {
-              return callback(new UploadError("Upload stopped to preserve the configured free disk space reserve.", 507));
-            }
-          } catch {
-            return callback(new UploadError("Could not confirm available disk space; upload stopped safely.", 507));
-          }
           fs.write(reserved!.fd, data, offset, data.length - offset, null, (error, written) => {
             if (error) return callback(error);
             uploadRuntime.reservedBytes -= written;
             remainingBudget -= written;
+            try {
+              if (availableBytes(dir) < MIN_FREE_BYTES + uploadRuntime.reservedBytes) {
+                return callback(new UploadError("Upload stopped to preserve the configured free disk space reserve.", 507));
+              }
+            } catch {
+              return callback(new UploadError("Could not confirm available disk space; upload stopped safely.", 507));
+            }
             writeChunk(offset + written);
           });
         };

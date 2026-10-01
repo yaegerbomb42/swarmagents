@@ -109,14 +109,20 @@ export class InputError extends Error {}
 // ---------- helpers ----------
 
 const MASK = "••••";
-const hint = (s?: string) => (s ? `…${s.slice(-4)}` : "");
+/** Public hint for a stored key: the last 4 characters only when that's a small fraction of a long key. */
+export const keyHint = (s?: string) => (!s ? "" : s.length >= 12 ? `…${s.slice(-4)}` : "set");
+const hint = keyHint;
 const isMasked = (v: unknown) => typeof v === "string" && v.startsWith(MASK);
+/** Values that carry no secret themselves: a `{key}` template or a `${VAR}` reference to a saved key. */
+const isReference = (v: string) => v.includes("{key}") || /^\$\{[A-Za-z_][A-Za-z0-9_]*(:-[^}]*)?\}$/.test(v.trim());
+/** Header names whose values are protocol metadata, never credentials. */
+const PLAIN_HEADERS = /^(content-type|accept|user-agent|anthropic-version|anthropic-beta|http-referer|referer|x-title|notion-version|openai-beta)$/i;
 
-/** Mask secret-looking values. Templates ("Bearer {key}") and short flags stay readable. */
+/** Mask every stored env/header value (short ones too). Only references and protocol headers stay readable. */
 function maskValues(rec?: Record<string, string>) {
   if (!rec) return undefined;
   const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(rec)) out[k] = v.includes("{key}") || v.length <= 6 ? v : `${MASK}${v.slice(-4)}`;
+  for (const [k, v] of Object.entries(rec)) out[k] = isReference(v) || PLAIN_HEADERS.test(k) ? v : v.length >= 12 ? `${MASK}${v.slice(-4)}` : MASK;
   return out;
 }
 

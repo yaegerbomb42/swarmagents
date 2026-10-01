@@ -63,7 +63,7 @@ const TYPE_LABEL: Record<ConnType, string> = {
 const TYPE_HINT: Record<ConnType, string> = {
   llm: "The agent uses the first enabled model and fails over down the list. Drag to reorder. Rate limits are learned from real 429s.",
   tool: "Keys for services the agent's tools call. web_search uses the search keys. To hand a key to a local connector, set one of its env values to ${VAR}, e.g. GITHUB_TOKEN = ${GITHUB_TOKEN}.",
-  mcp: "MCP servers add tools: local commands or remote URLs. Servers you set up in Claude Code or Claude Desktop appear here automatically.",
+  mcp: "MCP servers add tools: local commands or remote URLs. Servers set up in Claude Code or Claude Desktop on the machine Swarm runs on appear here automatically.",
 };
 
 const toRows = (rec?: Record<string, string>): Row[] =>
@@ -116,7 +116,16 @@ export function Settings({
   const searchRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async () => {
-    const d = await (await fetch("/api/connections")).json();
+    let d: { connections: PublicConnection[]; catalog: Catalog; error?: string };
+    try {
+      const r = await fetch("/api/connections");
+      d = await r.json();
+      if (!r.ok || !Array.isArray(d.connections)) throw new Error(d.error || `The server answered ${r.status}.`);
+    } catch (e) {
+      setBanner({ ok: false, text: `Couldn't load settings: ${e instanceof Error && !/JSON|fetch/i.test(e.message) ? e.message : "the server didn't answer."} Reopen Settings to retry.` });
+      setLoaded(true);
+      return null;
+    }
     setConns(d.connections);
     if (d.catalog) setCat(d.catalog);
     setLoaded(true);
@@ -125,7 +134,7 @@ export function Settings({
 
   useEffect(() => {
     load().then((d) => {
-      if (!d.connections.some((c) => c.type === "llm")) setView("catalog");
+      if (d && !d.connections.some((c) => c.type === "llm")) setView("catalog");
     });
     const qs = new URLSearchParams(location.search);
     const ok = notice?.connected ?? qs.get("connected");
@@ -371,7 +380,7 @@ export function Settings({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(toInput(d)),
       });
-      const res = (await r.json()) as TestResult;
+      const res = (await r.json().catch(() => ({ ok: false, message: `The server answered ${r.status}.` }))) as TestResult;
       setCheck({
         state: res.ok ? "ok" : "err",
         msg: res.message,
@@ -394,7 +403,7 @@ export function Settings({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(toInput(draft)),
       });
-      const d = await r.json();
+      const d = await r.json().catch(() => ({ error: `The server answered ${r.status}.` }));
       if (!r.ok) {
         setFormError(d.error ?? "Couldn't save.");
         return;
@@ -409,6 +418,8 @@ export function Settings({
           text: `Saved ${draft.label || presetOf(draft.type, draft.preset)?.label || "connection"}.`,
         });
       }
+    } catch {
+      setFormError("Couldn't reach the Swarm server. Your changes weren't saved.");
     } finally {
       setSaving(false);
     }
@@ -417,12 +428,18 @@ export function Settings({
   // ---------- list actions ----------
 
   const post = async (body: unknown, method = "POST", qs = "") => {
-    const r = await fetch(`/api/connections${qs}`, {
-      method,
-      headers: { "Content-Type": "application/json" },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    const d = await r.json();
+    let r: Response;
+    try {
+      r = await fetch(`/api/connections${qs}`, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch {
+      setBanner({ ok: false, text: "Couldn't reach the Swarm server." });
+      return;
+    }
+    const d = await r.json().catch(() => ({ error: `The server answered ${r.status}.` }));
     if (d.connections) setConns(d.connections);
     if (!r.ok) setBanner({ ok: false, text: d.error ?? "That didn't work." });
   };
@@ -445,12 +462,18 @@ export function Settings({
   };
   const rowTest = async (c: PublicConnection) => {
     setRowTests((t) => ({ ...t, [c.id]: { state: "busy" } }));
-    const r = await fetch("/api/connections/test", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: c.type, id: c.id }),
-    });
-    const res = (await r.json()) as TestResult;
+    let r: Response;
+    try {
+      r = await fetch("/api/connections/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: c.type, id: c.id }),
+      });
+    } catch {
+      setRowTests((t) => ({ ...t, [c.id]: { state: "err", msg: "Couldn't reach the Swarm server." } }));
+      return;
+    }
+    const res = (await r.json().catch(() => ({ ok: false, message: `The test request failed (${r.status}).` }))) as TestResult;
     setRowTests((t) => ({
       ...t,
       [c.id]: { state: res.ok ? "ok" : "err", msg: res.message, result: res },

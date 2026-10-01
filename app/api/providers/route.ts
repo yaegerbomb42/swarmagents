@@ -1,6 +1,6 @@
 import { getLimits, getProviders } from "@/lib/store";
 import { PRESETS } from "@/lib/presets";
-import { InputError, deleteConnection, reorderProviders, setEnabled, upsertConnection, type ConnectionInput } from "@/lib/connections";
+import { InputError, keyHint, deleteConnection, reorderProviders, setEnabled, upsertConnection, type ConnectionInput } from "@/lib/connections";
 import type { PublicProvider } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -12,7 +12,7 @@ function publicList(): PublicProvider[] {
   return getProviders().map(({ apiKey, headers, ...p }) => ({
     ...p,
     headers: headers ? Object.fromEntries(Object.keys(headers).map((k) => [k, "••••"])) : undefined,
-    keyHint: apiKey ? `…${apiKey.slice(-4)}` : "",
+    keyHint: keyHint(apiKey),
     limits: limits[p.id] ?? { throttles: 0 },
   }));
 }

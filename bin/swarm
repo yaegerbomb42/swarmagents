@@ -1,0 +1,8 @@
+#!/bin/bash
+# Build (when sources changed) and start Swarm on http://127.0.0.1:3777, then open it.
+set -e
+cd "$(dirname "$0")/.."
+[ -d node_modules ] || npm install
+if [ ! -f .next/BUILD_ID ] || [ -n "$(find app lib components middleware.ts -newer .next/BUILD_ID -print -quit)" ]; then npx next build; fi
+(for i in $(seq 1 40); do curl -s -o /dev/null http://127.0.0.1:3777 && open http://127.0.0.1:3777 && exit; sleep 0.25; done) &
+exec npx next start -H 127.0.0.1 -p 3777

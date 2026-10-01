@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Claim ownership of one or more repository files so concurrent agents do not collide.
+#
+# Usage: swarm-claim <path> [<path> ...] -- "<reason>"
+#        swarm-claim --list
+#
+# A claim is a file coordination/claims/<slug>.md containing the owner. The claim is
+# atomic (O_EXCL create), so the first agent to claim a path wins. If any requested path
+# is already owned by someone else, nothing is claimed and we exit non-zero.
+set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CLAIMS="$ROOT/coordination/claims"
+AGENT_ID="${SWARM_AGENT_ID:-agent-$$}"
+mkdir -p "$CLAIMS"
+
+slug() { printf '%s' "$1" | sed 's#^/##; s#[/ ]#__#g'; }
+
+if [ "${1:-}" = "--list" ]; then
+  echo "claims in $CLAIMS:"
+  grep -H '^owner:' "$CLAIMS"/*.md 2>/dev/null | sed 's#^.*/claims/##' || echo "  (none)"
+  exit 0
+fi
+
+reason=""
+paths=()
+for arg in "$@"; do
+  if [ "$arg" = "--" ]; then continue; fi
+  case "$arg" in
+    *" "*) reason="$arg" ;;
+    *) paths+=("$arg") ;;
+  esac
+done
+
+if [ "${#paths[@]}" -eq 0 ]; then
+  echo "usage: swarm-claim <path> [<path> ...] -- \"<reason>\"" >&2
+  exit 2
+fi
+
+# Pre-check for conflicts before writing anything.
+conflict=0
+for p in "${paths[@]}"; do
+  c="$CLAIMS/$(slug "$p").md"
+  if [ -f "$c" ]; then
+    owner="$(sed -n 's/^owner: //p' "$c" | head -1)"
+    if [ "$owner" != "$AGENT_ID" ]; then
+      echo "CONFLICT: $p is already claimed by $owner" >&2
+      conflict=1
+    fi
+  fi
+done
+[ "$conflict" -ne 0 ] && { echo "no claims written" >&2; exit 1; }
+
+for p in "${paths[@]}"; do
+  c="$CLAIMS/$(slug "$p").md"
+  [ -f "$c" ] && continue
+  # O_EXCL via noclobber in a subshell.
+  if ( set -o noclobber; {
+        echo "owner: $AGENT_ID"
+        echo "path: $p"
+        echo "claimed_at: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "reason: ${reason:-unspecified}"
+      } > "$c" ) 2>/dev/null; then
+    echo "claimed $p -> $AGENT_ID"
+  else
+    echo "raced on $p (someone claimed it first)" >&2
+    exit 1
+  fi
+done

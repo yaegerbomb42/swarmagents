@@ -1,0 +1,34 @@
+#!/bin/bash
+# Swarm smoke gate — run before marking any MASTER_TODO row done.
+# Checks: typecheck, production build, server boot, API ping, SSE stream.
+# Usage: ./bin/smoke [--skip-build]
+set -e
+cd "$(dirname "$0")/.."
+SKIP_BUILD=0
+[ "${1:-}" = "--skip-build" ] && SKIP_BUILD=1
+
+echo "== 1/4 typecheck =="
+npx tsc --noEmit
+echo OK
+
+if [ "$SKIP_BUILD" = "0" ]; then
+  echo "== 2/4 build =="
+  npx next build --no-lint 2>&1 | tail -5
+else
+  echo "== 2/4 build (skipped) =="
+fi
+
+echo "== 3/4 boot + API ping =="
+PORT=3779
+(npx next start -H 127.0.0.1 -p "$PORT" >/tmp/swarm-smoke.log 2>&1 &) 
+for i in $(seq 1 60); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/sessions" && break; sleep 0.5; [ "$i" = 60 ] && { tail -30 /tmp/swarm-smoke.log; exit 1; }; done
+echo "GET /api/sessions: $(curl -s "http://127.0.0.1:$PORT/api/sessions")"
+echo "GET /api/providers: $(curl -s "http://127.0.0.1:$PORT/api/providers" | head -c 200)..."
+
+echo "== 4/4 session create + SSE snapshot =="
+SID=$(curl -s -X POST "http://127.0.0.1:$PORT/api/sessions" | python3 -c "import sys,json;print(json.load(sys.stdin)['session']['id'])")
+echo "session: $SID"
+curl -sN --max-time 8 "http://127.0.0.1:$PORT/api/sessions/$SID" | head -c 500; echo
+curl -s -X DELETE "http://127.0.0.1:$PORT/api/sessions/$SID" >/dev/null
+pkill -f "next start -H 127.0.0.1 -p $PORT" 2>/dev/null || true
+echo; echo "SMOKE PASS"

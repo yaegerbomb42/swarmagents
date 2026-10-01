@@ -1,0 +1,30 @@
+{
+  "name": "swarmagents",
+  "version": "2.0.0",
+  "private": true,
+  "description": "One chat bar. One agent. Every tool. Nothing hidden.",
+  "scripts": {
+    "dev": "next dev -H 127.0.0.1 -p 3777",
+    "build": "next build",
+    "start": "next start -H 127.0.0.1 -p 3777",
+    "typecheck": "tsc --noEmit",
+    "browser:install": "playwright-core install chromium"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.130.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "next": "^15.5.27",
+    "openai": "^7.25.0",
+    "playwright-core": "^1.63.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  }
+}

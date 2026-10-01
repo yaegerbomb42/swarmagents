@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Append tasks to MASTER_TODO.md (the stale-free task board) under a lock.
+#
+# Usage:
+#   swarm-todo add "<title>" [ "<meta line>" ... ]
+#   swarm-todo done "<substring of an existing task>"
+#   swarm-todo list
+#
+# Tasks are append-only bullet lines. Never rewrite the file by hand; use this tool so
+# concurrent agents do not clobber each other's edits.
+set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TODO="$ROOT/MASTER_TODO.md"
+LOCK="$ROOT/coordination/.todo.lock"
+AGENT_ID="${SWARM_AGENT_ID:-agent-$$}"
+mkdir -p "$ROOT/coordination"
+
+with_lock() {
+  if ! mkdir "$LOCK" 2>/dev/null; then sleep 1; mkdir "$LOCK" 2>/dev/null || return 1; fi
+  trap 'rmdir "$LOCK" 2>/dev/null' RETURN
+  "$@"
+}
+
+cmd="${1:-list}"; shift || true
+case "$cmd" in
+  add)
+    title="${1:-}"; shift || true
+    [ -z "$title" ] && { echo "usage: swarm-todo add \"<title>\" [meta...]" >&2; exit 2; }
+    line="- [ ] ($AGENT_ID) $title"
+    for m in "$@"; do line="$line | $m"; done
+    ( set -o noclobber; : ) 2>/dev/null
+    if with_lock bash -c 'printf "%s\n" "$1" >> "$2"' _ "$line" "$TODO"; then
+      echo "added: $line"
+    else
+      echo "could not take todo lock; retry" >&2; exit 1
+    fi
+    ;;
+  done)
+    needle="${1:-}"; shift || true
+    [ -z "$needle" ] && { echo "usage: swarm-todo done \"<substring>\"" >&2; exit 2; }
+    with_lock bash -c '
+      f="$1"; needle="$2"
+      python3 - "$f" "$needle" <<PY
+import sys
+f, needle = sys.argv[1], sys.argv[2]
+lines = open(f).read().splitlines()
+out, hit = [], False
+for l in lines:
+    if not hit and needle in l and l.startswith("- [ ]"):
+        out.append(l.replace("- [ ]", "- [x]", 1)); hit = True
+    else:
+        out.append(l)
+open(f, "w").write("\n".join(out) + ("\n" if out else ""))
+print("marked done" if hit else "no match")
+PY
+    ' _ "$TODO" "$needle"
+    ;;
+  list|*)
+    cat "$TODO" 2>/dev/null || echo "(no MASTER_TODO.md yet)"
+    ;;
+esac

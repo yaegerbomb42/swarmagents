@@ -2919,3 +2919,39 @@ Releasing all my claims now.
 
 ### Grok Bot (deploy) - 2026-10-01 22:37 - HEADS-UP
 @cline-01 (globals.css owner, done since 21:59): live check on #13 found 3 CSS vars still used with no definition and no fallback: --code-bg (timeline.css:51), --sans (settings.css:35), --shadow (Activity.css:23). I added one line to the legacy alias block at the end of app/globals.css: --code-bg: var(--color-code-bg); --sans: var(--font-sans); --shadow: 0 8px 24px rgb(0 0 0 / 0.35). Nothing else changed. A scan of app/ and components/ css+tsx now shows 0 undefined vars. Ships in #14.
+
+---
+
+### Grok Bot (deploy) - 2026-10-01 22:48 - HANDOFF
+**HANDOFF (deploy lane). Final state is synced and deployed.**
+- **Live:** #14 at 22:43 CT. It was built from the shared tree and synced as 7f936f50a. It includes the Settings lane's final work (b91689a7a, code 43db32b2d), the StorageBanner mounted in app/page.tsx, and the CSS aliases.
+- **Live-verified on #14 in real Chrome:**
+  - A chat with assistant markdown and code blocks renders on first load and on reload. There is no Application error and there are 0 page errors.
+  - Settings shows the Storage meter.
+  - Admin Analytics lists users with a Delete button. Delete was exercised on a throwaway account: the row is gone and the "Deleted ..." note shows.
+  - Borders render.
+  - The CSS vars --muted, --faint, --panel and --bg are defined. 0 undefined vars remain in app/ and components/.
+- **Gates in infra/deploy.sh on every deploy:**
+  - tsc with pipefail, the markdown render test, the sign-up cap test, and next build.
+  - Preflight checks: auth, no owner token, sandbox uid 20000 with 0 caps, chromium uid 20000, and the tenant probe with 3 accounts.
+  - Egress checks: IMDS, the tailnet, private ranges and SMTP 25/465/587 are all blocked.
+  - Live admin sign-in, then a live tenant probe on prod. Its probe accounts are deleted automatically. If the VPS IP is at the 5/h sign-up cap, the probe warns instead of failing.
+- **Prod accounts:** only yaeger.james42 remains. Every test account is deleted.
+
+**OPEN (needs Jimmy or a future lane):**
+1. **Browser download symlink P0 (browser lane), not fixed.** lib/browser/runtime.ts:421 still runs mkdirSync plus saveAs as root into the user-writable <workspace>/downloads. That lets a planted symlink write into another account.
+   - Fix: stage in a root-only dir, then deliver as the user via swarm-run.
+   - Until that lands and is reviewed, keep SWARM_BROWSER_SERVER off. It is off in prod.
+   - Cookie isolation was proven by the Settings lane (mallory saw 0 of alice's cookies), so the symlink fix is the only blocker.
+2. **ext4 disk cap decision.** The VPS root fs has no quota feature.
+   - Options: a rescue boot plus tune2fs -O quota, or moving the data volume onto a quota-enabled loop image.
+   - infra/host/swarmagents-quota.sh is not installed. It also has a path bug: it opens $VOL/auth.db/auth.db.
+   - The app-level 5 GB per-user limit plus auto-prune is live.
+3. **Captcha / sign-up abuse decision.** Sign-up is OPEN, protected by 5 per IP per hour and 60 per hour in total. The counts are persisted in SWARM_HOME/signup-limit.db, and the live 429 survived a redeploy. There is no captcha or email verification. Options: a Turnstile/hCaptcha key, invite-only (SWARM_SIGNUP=invite), or leave it as is.
+4. **Off-host backup destination and passphrase.** Local backups keep 7 days and the restore was proven by finish-launch, but nothing leaves the VPS yet.
+5. **aria .env values.** env_file is now optional, so aria starts but isn't configured.
+6. **Root-owned files on the Mac.** apps/swarmagents/.next-e2e (121 files, 22:07, finish-launch's e2e run) and infra/host/swarmagents-quota.*. Fix: `sudo chown -R yaeger` on both. .git/objects is clean now.
+7. **Known tradeoff:** the per-account login lock (10 failures in 15 min) can be triggered by someone spread over many IPs to lock out one account for 15 minutes.
+8. **Local-only files that never sync:** infra/deploy.sh and infra/host/* (preflight, tenant probe, delete-test-accounts) live only in the monorepo working tree on the Mac and are not in GitHub. Commit them when the monorepo gets its next commit.
+
+Releasing all my claims now: lib/auth.ts, the login and signup routes, lib/tenant/signup-limit.ts, tests/markdown-render.mjs, tests/signup-limit.mjs, docker-compose.server.yml, Dockerfile, deploy/swarmagents-egress.*. Grok Bot (deploy) signing off.

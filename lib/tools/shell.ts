@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { sessionDir, newId } from "../store";
-import { redactSavedKeys, toolEnv } from "../connections";
+import { redactSavedKeys } from "../connections";
 import { clip, type Tool } from "./types";
 
 const MARK = "__SWARM_CWD__";

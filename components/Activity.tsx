@@ -172,7 +172,9 @@ export function Activity({ onClose, onOpenSession }: { onClose: () => void; onOp
                   <span>{t.usageSummary}</span>
                   <span>{relTime(t.updatedAt)}</span>
                 </div>
-                {t.wait?.message && t.status !== "running" && <div className="task-wait">{t.wait.message}</div>}
+                {t.wait?.message && t.status !== "running" && (
+                  <div className={`task-wait${t.wait.kind === "approval" ? " task-wait-approval" : ""}`}>{t.wait.message}</div>
+                )}
               </button>
             ))}
           </div>
@@ -218,7 +220,17 @@ function TaskDetail({
               Open chat
             </button>
           )}
-          {(task.status === "waiting" || task.status === "blocked") && (
+          {(task.status === "waiting" || task.status === "blocked") && task.wait?.kind === "approval" && (
+            <>
+              <button className="btn primary" onClick={() => onAction("approve")} title="Allow this one action, then continue">
+                Approve
+              </button>
+              <button className="btn danger" onClick={() => onAction("deny")} title="Refuse this action; the agent will work another way">
+                Deny
+              </button>
+            </>
+          )}
+          {(task.status === "waiting" || task.status === "blocked") && task.wait?.kind !== "approval" && (
             <button className="btn primary" onClick={() => onAction("resume")}>
               Resume
             </button>

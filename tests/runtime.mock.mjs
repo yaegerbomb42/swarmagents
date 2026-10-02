@@ -123,5 +123,23 @@ const taskB = await until(async () => {
 check("ratelimited task finished", ["done", "failed"].includes(taskB?.task?.status), taskB?.task?.status);
 check("quota wait kept the work (finished, attempt recorded)", (taskB?.task?.attempts ?? 0) >= 1, `${taskB?.task?.attempts} attempts`);
 
+// 6. task C: a destructive action parks the task for approval, then Approve releases it
+console.log("\n3. destructive action blocks for approval, then Approve resumes it");
+const c = await api("POST", "/api/runtime/tasks", { prompt: "[mock:risky] clean up", title: "mock risky" });
+const blockedC = await until(async () => {
+  const t = await api("GET", `/api/runtime/tasks/${c.json.task.id}`);
+  return t.json.task?.status === "blocked" ? t.json : null;
+}, 60_000);
+check("destructive action blocked the task", blockedC?.task?.status === "blocked", blockedC?.task?.status);
+check("wait is an approval with a bound token", blockedC?.task?.wait?.kind === "approval" && !!blockedC?.task?.wait?.token, blockedC?.task?.wait?.message?.slice(0, 80));
+const approved = await api("POST", `/api/runtime/tasks/${c.json.task.id}`, { action: "approve" });
+check("approve accepted", approved.status === 200, `status ${approved.status}`);
+const doneC = await until(async () => {
+  const t = await api("GET", `/api/runtime/tasks/${c.json.task.id}`);
+  return ["done", "failed", "blocked"].includes(t.json.task?.status) ? t.json : null;
+}, 60_000);
+check("approved task finished without blocking again", doneC?.task?.status === "done", `${doneC?.task?.status} / ${doneC?.task?.result?.summary}`);
+check("ledger recorded the approval decision", doneC?.ledger?.steps?.some((s) => /approv/i.test(s.label ?? "")), "approval step");
+
 console.log(`\n${failures === 0 ? "RUNTIME MOCK INTEGRATION PASS" : `RUNTIME MOCK INTEGRATION FAIL (${failures})`}`);
 process.exit(failures === 0 ? 0 : 1);

@@ -158,6 +158,8 @@ class Session {
     this.archiveOld();
     saveEvents(this.meta.id, this.events);
     saveHistory(this.meta.id, this.history);
+    // Drained messages are now in the saved history; only what is still queued stays pending.
+    this.meta.pendingInput = this.inbox.filter((m) => !m.resumeNote).map(({ text, attachments }) => ({ text, attachments }));
     this.meta.updatedAt = Date.now();
     saveMeta(this.meta);
   }
@@ -205,6 +207,8 @@ class Session {
       attachments: [],
       resumeNote: "[Automatic note, not from the user] The agent process restarted mid-task. Any tool calls in flight were interrupted and may have partially run. Re-check the current state (files, processes, browser) before continuing, then carry on with the task.",
     });
+    // Messages the user sent that never reached the saved history (they are already in the timeline).
+    for (const m of this.meta.pendingInput ?? []) this.inbox.push({ ...m });
     void this.loop();
   }
 
@@ -222,6 +226,9 @@ class Session {
     }
     this.add({ type: "user", text, attachments } as AgentEvent);
     this.inbox.push({ text, attachments });
+    // Durable before anything else happens: cleared by flush() once history containing it is on disk.
+    this.meta.pendingInput = [...(this.meta.pendingInput ?? []), { text, attachments }];
+    saveMeta(this.meta);
     if (!this.running) void this.loop();
   }
 
@@ -646,7 +653,7 @@ export function session(id: string): Session | null {
 
 /** Called once at server boot: pick up every run that was still going when the process died. */
 export function resumeActiveSessions() {
-  for (const m of listSessions()) if (m.active) session(m.id)?.resume();
+  for (const m of listSessions()) if (m.active || m.pendingInput?.length) session(m.id)?.resume();
 }
 
 // The task runtime (lib/runtime) drives the agent through this adapter: it queues a task, we run it as a normal

@@ -121,4 +121,6 @@ export interface SessionMeta {
   plan?: PlanItem[];
   /** Older events moved to the append-only archive; the live stream holds only the rest. */
   archivedEvents?: number;
+  /** Messages sent but not yet saved into history; redelivered after a crash so no steer is lost. */
+  pendingInput?: { text: string; attachments: Attachment[] }[];
 }

@@ -113,6 +113,15 @@
   padding: 5px 8px;
 }
 
+/* An approval wait is a decision the user must make, so it reads as a call to action, not a footnote. */
+.task-wait-approval {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-left: 3px solid var(--accent);
+  font-weight: 500;
+  white-space: normal;
+}
+
 /* ---- Detail ---- */
 .activity-detail { flex: 1; overflow-y: auto; padding: 18px 22px 40px; min-width: 0; }
 .detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }

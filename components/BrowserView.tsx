@@ -50,7 +50,7 @@ export function describeAction(input: Record<string, unknown>): string {
     input.index != null ? `[${input.index}]` : input.selector ? clip(str(input.selector), 40) : input.text ? `"${clip(str(input.text), 40)}"` : "";
   switch (a) {
     case "goto":
-      return `Opened ${clip(str(input.url), 80)}`;
+      return `Opened ${clip(hostOf(str(input.url)).host || str(input.url), 60)}`;
     case "click":
       return `Clicked ${tgt}`.trim();
     case "type":
@@ -127,7 +127,7 @@ export function BrowserView({
   const src = shot ? `data:${shot.mediaType};base64,${shot.data}` : "";
   const url = snap?.url || (input.action === "goto" ? str(input.url) : "");
   const h = hostOf(url);
-  const happenings = (snap?.note ?? []).filter((l) => l.startsWith("•")).map((l) => l.replace(/^•\s*/, ""));
+  const happenings = (snap?.note ?? []).filter((l) => l.startsWith("•")).map((l) => l.replace(/^•\s*/, "").replace(/ to \/\S*\/(downloads\/[^\s/]+)$/, " to $1"));
   const failLine = snap?.failed ? snap.note[0] : !snap && status === "error" ? (output ?? "").split("\n")[0] : "";
 
   return (

@@ -27,7 +27,7 @@ const PORT = Number(process.argv[2] || process.env.MOCK_PORT || 37901);
 const WORKDIR = process.env.MOCK_WORKDIR || path.join(os.tmpdir(), "swarm-mock-work");
 fs.mkdirSync(WORKDIR, { recursive: true });
 
-const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files", "api", "fetch"];
+const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files", "api", "fetch", "risky"];
 const log = [];
 const attempts = new Map(); // conversation hash -> request count, for ratelimit/flaky
 
@@ -106,6 +106,11 @@ function script(a) {
         return { calls: [{ name: "read_file", input: { path: file } }, { name: "search", input: { pattern: "parallel-a", path: WORKDIR } }, { name: "bash", input: { command: "echo parallel-b" } }] };
       }
       return { text: `Parallel results: ${a.toolOutputs.length} outputs; ${a.toolOutputs.some((t) => t.includes("parallel-a")) ? "saw A" : "no A"}, ${a.toolOutputs.some((t) => t.includes("parallel-b")) ? "saw B" : "no B"}.` };
+    case "risky":
+      // Exercises the approval gate: a destructive call must park the task, and after the user approves
+      // (which grants that exact action) the resumed run executes it and finishes.
+      if (a.step === 0) return { thinking: "Cleaning up.", calls: [{ name: "bash", input: { command: `rm -rf ${path.join(WORKDIR, "doomed")}` } }] };
+      return { text: `Cleanup ${a.toolOutputs.some((t) => t.includes("awaiting the user's approval")) ? "was gated" : "ran"}; done.` };
     case "plan":
       if (a.step === 0) return { calls: [{ name: "plan", input: { items: [{ text: "Inspect", status: "done" }, { text: "Change", status: "active" }, { text: "Verify", status: "pending" }] } }] };
       if (a.step === 1) return { calls: [{ name: "plan", input: { items: [{ text: "Inspect", status: "done" }, { text: "Change", status: "done" }, { text: "Verify", status: "done" }] } }] };

@@ -35,7 +35,7 @@ with sync_playwright() as p:
         "diff_blocks": len(pg.query_selector_all(".diff")),
         "undo_buttons": len(pg.query_selector_all(".undo")),
         "copy_buttons": len(pg.query_selector_all(".copy-btn")),
-        "preview_chips": len(pg.query_selector_all(".preview-chips .chip")),
+        "preview_chips": len(pg.query_selector_all(".fp-chip")),
     }
     print("rendered:", checks)
     ctx = b.new_context(viewport={"width": 1280, "height": 900}, color_scheme="dark")

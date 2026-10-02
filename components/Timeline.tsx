@@ -171,6 +171,8 @@ function Diff({ oldText, newText }: { oldText: string; newText: string }) {
   const rows = lineDiff(oldText, newText);
   const adds = rows.filter((r) => r[0] === "+").length;
   const dels = rows.filter((r) => r[0] === "-").length;
+  // Identical content (e.g. a re-write of the same bytes) is not a change: don't imply one.
+  if (adds === 0 && dels === 0) return null;
   // Long diffs collapse to the changed hunks with 2 lines of context; click to see everything.
   const hidden = !expanded && rows.length > 40;
   const visible = hidden

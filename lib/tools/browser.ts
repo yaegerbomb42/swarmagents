@@ -172,6 +172,27 @@ async function settleDownloads(ms = 30_000) {
     );
 }
 
+const MARKS_ON = `(() => {
+  const host = document.createElement('div');
+  host.id = '__swarm_marks';
+  host.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647';
+  let n = 0;
+  for (const el of document.querySelectorAll('[data-swarm-id]')) {
+    const r = el.getBoundingClientRect();
+    if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth || r.width < 2) continue;
+    const b = document.createElement('div');
+    b.style.cssText = 'position:fixed;left:' + r.left + 'px;top:' + r.top + 'px;width:' + r.width + 'px;height:' + r.height + 'px;outline:2px solid rgba(232,67,147,.9);outline-offset:-1px;border-radius:2px';
+    const t = document.createElement('span');
+    t.textContent = el.getAttribute('data-swarm-id');
+    t.style.cssText = 'position:absolute;left:-1px;top:' + (r.top > 14 ? '-15px' : '0') + ';background:rgb(232,67,147);color:#fff;font:600 11px/14px system-ui,sans-serif;padding:0 3px;border-radius:2px';
+    b.appendChild(t); host.appendChild(b);
+    if (++n >= 150) break;
+  }
+  document.documentElement.appendChild(host);
+  return n > 0;
+})()`;
+const MARKS_OFF = `document.getElementById('__swarm_marks')?.remove()`;
+
 async function observe(p: Page, note: string, full = false) {
   // A click may have opened a tab (target=_blank, window.open); report the tab we're now controlling.
   await new Promise((r) => setTimeout(r, 150));
@@ -195,9 +216,13 @@ async function observe(p: Page, note: string, full = false) {
       elements: "",
       text: "",
     }))) as Record<string, string>;
+  // Set-of-marks: draw each element's number on the screenshot so the model (and the user reading the
+  // timeline) can match "[12] button" to what's on screen. Removed right after the capture.
+  const marks = process.env.SWARM_BROWSER_MARKS !== "0" && (await p.evaluate(MARKS_ON).catch(() => false));
   const shot = await p
     .screenshot({ type: "jpeg", quality: 60 })
     .catch(() => null);
+  if (marks) await p.evaluate(MARKS_OFF).catch(() => {});
   const tabs = p.context().pages();
   return {
     content: clip(

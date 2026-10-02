@@ -173,3 +173,58 @@ export function loadRuntimeSettings(): RuntimeSettings {
 export function saveRuntimeSettings(s: RuntimeSettings): void {
   writeJson(SETTINGS_FILE, s);
 }
+
+// ---- Action approvals ----
+//
+// A grant lets one specific already-classified action run without asking again. It is bound to the
+// action hash, is single-use, and expires, so a stale approval cannot authorise a different command.
+
+const APPROVALS_FILE = path.join(RUNTIME_DIR, "approvals.json");
+
+export interface ApprovalGrant {
+  taskId: string;
+  hash: string;
+  tool: string;
+  /** Human-readable action, shown in the ledger when the grant is used. */
+  label: string;
+  grantedAt: number;
+}
+
+function approvalsKey(taskId: string, hash: string): string {
+  return `${taskId}:${hash}`;
+}
+
+export function loadApprovals(): Record<string, ApprovalGrant> {
+  return readJson<Record<string, ApprovalGrant>>(APPROVALS_FILE, {});
+}
+
+/** Record a single-use approval for an exact action. */
+export function grantApproval(g: ApprovalGrant): Promise<void> {
+  const all = loadApprovals();
+  all[approvalsKey(g.taskId, g.hash)] = g;
+  return writeJson(APPROVALS_FILE, all);
+}
+
+/** Consume an approval if one exists for this action. Returns the grant, or null. */
+export function takeApproval(taskId: string, hash: string): ApprovalGrant | null {
+  const all = loadApprovals();
+  const key = approvalsKey(taskId, hash);
+  const g = all[key];
+  if (!g) return null;
+  delete all[key];
+  void writeJson(APPROVALS_FILE, all);
+  return g;
+}
+
+/** Drop every pending approval for a task (on cancel/delete/finish). */
+export function clearApprovals(taskId: string): void {
+  const all = loadApprovals();
+  let changed = false;
+  for (const k of Object.keys(all)) {
+    if (all[k].taskId === taskId) {
+      delete all[k];
+      changed = true;
+    }
+  }
+  if (changed) void writeJson(APPROVALS_FILE, all);
+}

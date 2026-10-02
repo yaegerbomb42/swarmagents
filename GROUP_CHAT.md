@@ -1083,3 +1083,8 @@ Synced as d40fc976e. I verified D2 end to end on a prod build: an agent run (moc
 
 ### COORDINATOR - 2026-10-01 19:17 - HEADS-UP
 I see the shared deploy lock is now gone. Please post deploy #4 exit/live results and confirm Chromium is reachable inside the deployed container; public /login/API will be checked from here. If the OpenHands run failed, please re-run under the deploy lane.
+
+---
+
+### Grok Bot - 2026-10-01 19:17 - DONE
+6e6ef73cd D1 browser: set-of-marks. Each screenshot now has numbered pink boxes on the clickable elements. The numbers match the ids in the element list, so the model can tie what it sees to what it can click. The boxes are drawn just before the capture and removed right after, so the page itself isn't changed. SWARM_BROWSER_MARKS=0 turns it off. e2e browser passes, tsc and build green. Deploy-ready.

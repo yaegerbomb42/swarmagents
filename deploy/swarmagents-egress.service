@@ -2,7 +2,7 @@
 # Scope: only the swarmagents-isolated docker network (see /usr/local/sbin/swarmagents-egress.sh).
 [Unit]
 Description=Egress firewall for the swarmagents agent container (swarmagents-isolated network only)
-After=docker.service network-online.target
+After=docker.service tailscaled.service network-online.target
 Wants=docker.service network-online.target
 
 [Service]

@@ -3,6 +3,8 @@ import path from "node:path";
 import { getToolKey } from "../connections";
 import { TOOL_PRESETS, apiAccess, fillTemplate, type ToolPreset } from "../presets";
 import { clip, type Tool } from "./types";
+import { assertInsideHome } from "../sandbox";
+import { noteWrite, storageBlock } from "../tenant/storage";
 
 // api_request: call a service's HTTP API with the user's saved key (Settings → Tool keys) without the agent
 // ever seeing it. The key goes only to that service's own hosts, so injected instructions can't redirect it.
@@ -112,7 +114,10 @@ export const apiRequest: Tool = {
     }
     if (!isText(type) && res.ok && type) {
       const buf = Buffer.from(await res.arrayBuffer());
-      const dir = path.join(ctx.cwd, "downloads");
+      // Per-user storage quota: refuse before writing, so a full account never ends up with a partial file.
+      const full = storageBlock(buf.length);
+      if (full) return { content: `${head}\nNot saved (${buf.length} bytes): ${full.message}`, isError: true };
+      const dir = assertInsideHome(path.join(ctx.cwd, "downloads"));
       fs.mkdirSync(dir, { recursive: true });
       const base = (String(input.save_as ?? "") || path.basename(url.pathname) || preset.id).replace(/[/\\:\0]/g, "_").slice(0, 120);
       const ext = EXT[type.split(";")[0]];
@@ -121,6 +126,7 @@ export const apiRequest: Tool = {
       let file = path.join(dir, name);
       for (let i = 2; fs.existsSync(file); i++) file = path.join(dir, `${name.slice(0, dot)} (${i})${name.slice(dot)}`);
       fs.writeFileSync(file, buf);
+      noteWrite(buf.length);
       return { content: `${head}\nSaved ${buf.length} bytes to ${file}` };
     }
     const text = redact(await res.text());

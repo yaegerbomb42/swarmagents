@@ -1,0 +1,3 @@
+{"ts":1790906141425,"kind":"event","event":{"type":"notice","ts":1790906141425,"key":"capture-task","text":"Browser started (isolated profile).","level":"info"}}
+{"ts":1790906141460.4531,"kind":"frame","frame":"[16664 bytes]"}
+{"ts":1790906142465.554,"kind":"frame","frame":"[21664 bytes]"}

@@ -610,6 +610,31 @@ const cases = {
     return `${comp.length} compaction step(s): ${comp.map((e) => e.reason).join(", ")}`;
   },
 
+  async storage() {
+    // Settings → Storage API: usage + breakdown + per-chat sizes, pin, auto-prune toggle, per-chat delete.
+    let r = await api("GET", "/api/storage");
+    assert(r.status === 200 && r.json.used > 0 && r.json.byCategory && Array.isArray(r.json.chats), "GET", r.json);
+    assert(r.json.limit === null && r.json.level === "ok", "no quota on a laptop", { limit: r.json.limit, level: r.json.level });
+    const { events, sid } = await runTask("[mock:echo] storage probe");
+    assert(texts(events).includes("Echo"), "chat ran");
+    r = await api("GET", "/api/storage");
+    const mine = r.json.chats.find((c) => c.id === sid);
+    assert(mine && mine.bytes > 0, "the chat is listed with its size", r.json.chats.slice(0, 3));
+    r = await api("POST", "/api/storage", { pin: sid, pinned: true });
+    assert(r.status === 200 && r.json.settings.pinned.includes(sid), "pinned", r.json);
+    r = await api("POST", "/api/storage", { action: "delete", id: sid });
+    assert(r.status === 409 && /pinned/i.test(r.json.error), "pinned chat can't be deleted", r.json);
+    r = await api("POST", "/api/storage", { pin: sid, pinned: false });
+    r = await api("POST", "/api/storage", { autoPrune: true });
+    assert(r.status === 200 && r.json.settings.autoPrune === true, "auto-prune on", r.json);
+    await api("POST", "/api/storage", { autoPrune: false });
+    r = await api("POST", "/api/storage", { action: "delete", id: sid });
+    assert(r.status === 200 && r.json.pruned?.[0]?.freed > 0 && !r.json.chats.some((c) => c.id === sid), "deleted with its size freed", r.json.pruned);
+    r = await api("POST", "/api/storage", { action: "clear-old", days: -1 });
+    assert(r.status === 400, "bad days refused");
+    return `usage + breakdown, chat size listed (${mine.bytes} B), pin blocks delete, auto-prune toggle, delete frees it, bad input refused`;
+  },
+
   async loop() {
     const { events } = await runTask("[mock:loop] repeat forever", { timeout: 120_000 });
     assert(notices(events).some((n) => /repeat|same/i.test(n.text)), "identical-call loop not stopped", summarize(events));

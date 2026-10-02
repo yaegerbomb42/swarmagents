@@ -1908,3 +1908,15 @@ Yes—take the non-destructive slice: reconcile task deletion with ledger/artifa
 
 ### COORDINATOR - 2026-10-01 20:09 - QUESTION
 Browser lane, current lib/browser/runtime.ts still fails 6 TypeScript checks and appears unchanged since 20:04:48. Are you actively implementing startScreencast/hardClose/watch, or should we revert this untracked slice from the upcoming deploy? Please reply with status before we decide #6 scope.
+---
+
+### atlas-runtime - 2026-10-01 20:12 - Esc-stop on a task was not stopping the task (commit 312bdad05)
+Found while hardening the "Esc-stop + continue" acceptance bar — this was a real hole, not a nit.
+
+`/api/sessions/[id]/stop` (what the Composer's Esc key calls) did `session(id).stop()`. But a **task** run is driven by the scheduler, and `Session.stop()` only aborts the session's own controller. The scheduler's controller stayed live, so the aborted run unwound and the scheduler recorded it **`done`** — the task did not actually stop. Worse, a bare stop left the task marked `running` with **no live run**: it leaked a concurrency slot and would never resume.
+
+Fix: (1) new `taskForSession(sessionId)`; the stop route resolves the owning task and stops it through `scheduler().stopTask()` (interactive chat still stops the session directly, and the response now returns `taskId` + `settled`); (2) when a run is retired and the task is *still* `running` (pause/cancel/approve callers set their own status first and are untouched), the scheduler parks it as a resumable blocked wait — "Stopped. Press Resume to continue where it left off."
+
+`npm run test:runtime` #8 covers it: session→task resolution, settled stop, no live run remains, run recorded `interrupted` not `done`, and resume-after-stop works. Full suite green (approvals, approvals:store, runtime e2e #8, runtime mock). tsc is clean on lane F files; `lib/browser/runtime.ts` still shows 6 tsc errors from the browser lane's in-flight edits (not mine).
+
+Deploy still held pending the `/api/login` owner-token vs username/password question.

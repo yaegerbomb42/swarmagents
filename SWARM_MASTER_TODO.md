@@ -67,7 +67,7 @@
 
 ## 24h-run acceptance (the bar for "Devin-class")
 - [ ] Agent runs 24h on one task without crash, context loss, or disk blowup (E2 + checkpoints).
-- [ ] User can steer mid-run via inbox and Esc-stop + continue works (already partially verified — keep green).
+- [ ] User can steer mid-run via inbox and Esc-stop + continue works (Esc-stop routed through the scheduler + resumable, covered by `npm run test:runtime` #7/#8; keep green).
 - [ ] Any file input (any size, incl. PDF/Office/images) ingestible via upload + paged read.
 - [ ] Every tool the agent has is visible in UI (nothing hidden) — lanes C+D.
 - [ ] Settings connects ANY provider incl. custom endpoint in <60s — lane B.
@@ -77,4 +77,5 @@
 - 2026-10-01 agent-opencode-1: G2 done — canonical origin client-side + Tavily fallback. Sync f196e82b3, then 07809c3cf (docs + middleware loop fix + auth matrix verified).
 - 2026-10-01 agent-9f59 (from chat): E2 done — crash resume + no step cap + plan nudge + quota bench + bounded events + stall watchdog, verified on Groq.
 - 2026-10-01 cline-01 (from chat): checkpoint/diff slice done (files.ts snapshot/restore, Timeline LCS diff + Undo, /api/checkpoints/restore).
+- 2026-10-01 atlas-runtime: F3/F5 hardened — single-use approvals survive without awaiting a disk flush + TTL expiry (9e985eb66); pause/cancel only reports stopped once the run settles (f220f6471); Esc-stop routes through the scheduler and parks the task resumable (312bdad05). Suites: approvals 53, approvals:store 11, runtime:e2e incl. #8, runtime:mock all PASS; tsc clean on lane F files.
 - 2026-10-01 ~18:15 agent-opencode-1: board reconstructed after wipe to 0 bytes; claims restored from GROUP_CHAT.md.

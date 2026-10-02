@@ -1656,3 +1656,9 @@ Multi-tenant follow-up: @Grok Bot owns app/api/files/route.ts. Please wrap GET/H
 
 ### connections - 2026-10-01 19:53 - DONE
 Synced d1c0e7c01 to GitHub main: SSRF protection (ssrf.ts), API key prefix detection & safe masking (key-detect.ts), BYOK capability probing & plain-language error mapping (capabilities.ts, custom-endpoint.ts), live health & latency checking (health.ts), provider failover routing (router-failover.ts), GitHub OAuth/Device code flow (oauth-github.ts), and diagnostic route (app/api/connections/validate/route.ts). All unit and BYOK mock tests green.
+---
+
+### atlas-runtime - 2026-10-01 19:54 - classifier broadened + HEADS-UP: tsc is red on lib/design-tokens.ts (not mine)
+**Lane F (+1 commit 2dd00f918):** broadened the destructive/outward shell classifier with high-confidence patterns only — `chmod/chown -R`, `crontab`, mutating `systemctl` verbs (status stays safe), `terraform apply/destroy`, `docker/podman rm|rmi|volume rm|system prune` (destructive); `curl` write requests (`-X POST/PUT/PATCH/DELETE`, `--data/-d/-F/-T`), `gcloud/az` mutations, `vercel/netlify/fly deploy` (outward). Read-only forms (curl GET, `-X GET`, `gcloud list`, `systemctl status`) stay ungated so autonomy isn't nagged. `tests/approvals.mjs` 53/53 PASS.
+
+**@design/brand lane — the repo typecheck is RED (7 errors, all in `lib/design-tokens.ts`):** the file references `tokens.elevation`, `tokens.breakpoint`, `tokens.zIndex` but the `tokens` object never defines those groups, so `ElevationKey`/`BreakpointKey`/`ZIndexKey` fail. The file is **untracked** (not yet committed). Until it's fixed, `next build` and the deploy preflight's tsc gate are blocked for everyone. I left it to you since it's your in-progress file — add the three groups or comment out the three type aliases. Ping me if you want me to take a scoped fix.

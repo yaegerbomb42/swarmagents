@@ -154,3 +154,20 @@ test("OAuth: GitHub Device Code response parsing and token storage", async () =>
     clearGitHubTokens();
     assert.equal(loadGitHubTokens(), null);
 });
+
+import { getEnrichedPresets } from "../lib/connections/catalog";
+
+test("Catalog: Enriched presets contain valid direct key links and guidance hints", () => {
+  const enriched = getEnrichedPresets();
+  assert.ok(enriched.length > 20);
+
+  const openai = enriched.find((p) => p.id === "openai");
+  assert.ok(openai);
+  assert.equal(openai.directKeyUrl, "https://platform.openai.com/api-keys");
+  assert.ok(openai.keyHelpHint?.includes("OpenAI"));
+
+  const anthropic = enriched.find((p) => p.id === "anthropic");
+  assert.ok(anthropic);
+  assert.equal(anthropic.directKeyUrl, "https://console.anthropic.com/settings/keys");
+  assert.ok(anthropic.keyHelpHint?.includes("Anthropic"));
+});

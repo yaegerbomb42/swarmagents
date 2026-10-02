@@ -5,7 +5,7 @@
 // server boot (from instrumentation-node.ts) or from any runtime API route; it is
 // idempotent.
 
-import { session } from "../agent";
+import { session, setTaskGuard, clearTaskGuard } from "../agent";
 import { setAgentAdapter, type RunHooks, type RunOutcome } from "./resume";
 import { scheduler } from "./scheduler";
 import type { Task } from "./types";
@@ -83,6 +83,8 @@ export function bootstrapRuntime(): void {
       if (!s) throw new Error(`Session ${task.sessionId} not found for task ${task.id}.`);
 
       // A resumed task's session may already hold prior turns; send() appends safely.
+      s.pendingApproval = null;
+      setTaskGuard(s.meta.id, task.id);
       s.send(task.prompt, []);
 
       // Bridge the abort signal into the session so the scheduler can stop it.
@@ -118,7 +120,14 @@ export function bootstrapRuntime(): void {
         await waitUntilIdle(task.sessionId, hooks.signal, hooks.onNote);
       } finally {
         s.subs.delete(mirror);
+        clearTaskGuard(s.meta.id);
         hooks.signal.removeEventListener("abort", onAbort);
+      }
+
+      const pending = (s as { pendingApproval: { message: string; token: string } | null }).pendingApproval;
+      s.pendingApproval = null;
+      if (pending) {
+        return { summary: `Paused for approval: ${pending.message}`, verified: false, needs: { kind: "approval", message: pending.message, token: pending.token } };
       }
 
       const summary = lastSummary(task.sessionId);

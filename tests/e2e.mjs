@@ -441,6 +441,24 @@ const cases = {
     return "csv inline, pdf saved to downloads, png as image, dead host explained";
   },
 
+  async shellkey() {
+    // Saved tool keys are exported to the agent's shell, and their values are masked in the output.
+    if (!fs.readFileSync(path.join(ROOT, "lib/tools/shell.ts"), "utf8").includes("toolEnv")) return "skipped: lib/tools/shell.ts doesn't export saved keys yet";
+    const key = "shellkey-secret-0000WXYZ";
+    const r = await api("POST", "/api/connections", { type: "tool", preset: "custom-key", envVar: "SHELLKEY_TEST_TOKEN", apiKey: key });
+    assert(r.status === 200, "save key", r.json);
+    const id = r.json.connections.find((x) => x.envVar === "SHELLKEY_TEST_TOKEN")?.id;
+    try {
+      const { events } = await runTask("[mock:shellkey] use my key", { timeout: 60_000 });
+      const out = texts(events);
+      assert(/ShellKey: exported=ok masked=ok/.test(out), "key exported to the shell and masked", { said: out.slice(-300) });
+      assert(!JSON.stringify(events).includes(key), "key must not appear anywhere in the session events");
+    } finally {
+      if (id) await api("DELETE", `/api/connections?type=tool&id=${id}`);
+    }
+    return "saved key reached the shell as its env var; value shown as ••••WXYZ";
+  },
+
   async anthropic() {
     // Same tool script over the native Anthropic protocol, with a Bedrock-style bearer header.
     const r = await api("POST", "/api/connections", { type: "llm", preset: "custom-anthropic", label: "Mock Anthropic", baseUrl: MOCK, apiKey: "e2e-key-anthropic-4321", model: "mock", headers: { Authorization: "Bearer {key}" } });

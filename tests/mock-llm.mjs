@@ -27,7 +27,7 @@ const PORT = Number(process.argv[2] || process.env.MOCK_PORT || 37901);
 const WORKDIR = process.env.MOCK_WORKDIR || path.join(os.tmpdir(), "swarm-mock-work");
 fs.mkdirSync(WORKDIR, { recursive: true });
 
-const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files", "api", "fetch", "risky"];
+const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files", "api", "fetch", "risky", "shellkey"];
 const log = [];
 const attempts = new Map(); // conversation hash -> request count, for ratelimit/flaky
 
@@ -193,6 +193,12 @@ function script(a) {
         text: `API: list=${has(/github-token \(GitHub token\)/)} auth=${has(/"auth": "ours"[\s\S]*"q": "1"/)} refused=${has(/only sent to api\.github\.com/)} nospoof=${has(/"auth": "ours"[\s\S]*"extra": "yes"/)} saved=${has(/Saved 4 bytes to .*hello\.mp3/)} redirect=${has(/Redirects to: https:\/\/cdn\.example\.com\/file/)}`,
       };
     }
+    case "shellkey":
+      // A saved tool key reaches the shell as its env var, and its value is masked in what comes back.
+      if (a.step === 0) return { calls: [{ name: "bash", input: { command: 'echo "k=$SHELLKEY_TEST_TOKEN len=${#SHELLKEY_TEST_TOKEN}"' } }] };
+      return {
+        text: `ShellKey: exported=${a.toolOutputs.some((t) => /len=24\b/.test(t)) ? "ok" : "MISSING"} masked=${a.toolOutputs.some((t) => t.includes("k=••••WXYZ")) && !a.toolOutputs.some((t) => t.includes("shellkey-secret-0000WXYZ")) ? "ok" : "LEAKED"}`,
+      };
     case "fetch": {
       const base = `http://127.0.0.1:${PORT}/site`;
       const steps = [

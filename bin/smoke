@@ -14,10 +14,7 @@ npx tsc --noEmit
 echo OK
 
 echo "== 2/5 fast suites (no server needed) =="
-node --experimental-strip-types tests/auth-gate.mjs 2>&1 | grep -v -i "warning\|repars\|trace-warnings"
-node tests/shell-env.mjs 2>&1 | tail -n 1
-node tests/checkpoint-restore.mjs 2>&1 | tail -n 1
-node tests/timeline-ui.mjs 2>&1 | tail -n 1
+npm test 2>&1 | grep -v -i "warning\|repars\|trace-warnings\|MODULE_TYPELESS"
 
 if [ "$SKIP_BUILD" = "0" ] || [ ! -f ".next-smoke/BUILD_ID" ]; then
   echo "== 3/5 build =="

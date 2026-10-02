@@ -8,9 +8,22 @@ import { ProviderError } from "./providers/types";
 import { allTools } from "./tools";
 import type { Tool } from "./tools/types";
 import { setAgentAdapter } from "./runtime/resume";
+import { riskOf, actionHash, describe, type Risk } from "./runtime/approvals";
+import { takeApproval } from "./runtime/store";
 import { subagentTool } from "./subagents";
 
 const READ_ONLY = new Set(["read_file", "search", "web_search", "web_fetch"]);
+
+/** Set by the task runtime while a task runs, so the tool loop can gate risky actions for that task.
+ *  Absent for ordinary chat, which the user drives directly and can stop at any moment. */
+const taskGuards = new Map<string, { taskId: string }>();
+
+function setTaskGuard(sessionId: string, taskId: string): void {
+  taskGuards.set(sessionId, { taskId });
+}
+function clearTaskGuard(sessionId: string): void {
+  taskGuards.delete(sessionId);
+}
 /** Live events kept in memory and in the snapshot; past ARCHIVE_AT the oldest settled ones are archived. */
 const KEEP_EVENTS = 1500;
 const ARCHIVE_AT = 2500;
@@ -48,6 +61,8 @@ class Session {
   subs = new Set<(op: StreamOp) => void>();
   inbox: { text: string; attachments: Attachment[]; resumeNote?: string }[] = [];
   context: ContextInfo = { tokens: 0, window: 200_000 };
+  /** Set when a run stopped because a risky tool needs the user's decision. Read by the task adapter. */
+  pendingApproval: { message: string; risk: Risk } | null = null;
   /** Tokens the provider counts beyond our history estimate (system prompt, tool schemas, estimate error). */
   private overhead = 0;
   private saveTimer: NodeJS.Timeout | null = null;

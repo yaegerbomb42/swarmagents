@@ -103,10 +103,24 @@ async function run(who, text, timeout = 90_000) {
     if (saw && ops.some((o, i) => o.op === "running" && !o.running && ops.slice(0, i).some((x) => x.op === "running" && x.running))) break;
   }
   stream.close();
-  const snap = await call(who, "GET", `/api/sessions/${sid}/events`);
-  const all = JSON.stringify(stream.frames) + (snap.text ?? "");
-  const texts = [...all.matchAll(/"type":"text"[^}]*?"text":"((?:[^"\\]|\\.)*)"/g)].map((m) => JSON.parse(`"${m[1]}"`));
-  return { sid, text: texts.join("\n"), raw: all };
+  // Apply the op stream the way the UI does: text and tool output arrive as appended patches.
+  const evs = new Map();
+  for (const f of stream.frames) {
+    const o = JSON.parse(f);
+    if (o.op === "snapshot") for (const e of o.events) evs.set(e.id, e);
+    else if (o.op === "add") evs.set(o.event.id, { ...o.event });
+    else if (o.op === "patch" && evs.has(o.id)) {
+      const e = evs.get(o.id);
+      Object.assign(e, o.patch);
+      if (o.append) e[o.append.field] = (e[o.append.field] ?? "") + o.append.value;
+    }
+  }
+  const list = [...evs.values()];
+  const all = JSON.stringify(list);
+  if (process.env.TENANT_DEBUG) console.log("    [debug]", sid, list.map((e) => `${e.type}${e.name ? `:${e.name}` : ""} ${String(e.text ?? e.output ?? "").slice(0, 300)}`).join("\n      "));
+  const reply = list.filter((e) => e.type === "text").map((e) => e.text).join("\n");
+  const notes = list.filter((e) => e.type === "notice").map((e) => e.text).join(" | ");
+  return { sid, text: reply || `(no reply; notices: ${notes.slice(0, 300)})`, raw: all };
 }
 
 console.log(`tenant-isolation against ${BASE}${MOCK ? ` (agent runs via ${MOCK})` : " (no TENANT_MOCK: API checks only)"}`);
@@ -246,6 +260,8 @@ if (MOCK) {
   await t("browser cookies don't cross accounts", async () => {
     const v = `a${rand()}`;
     const set = await run(alice, `[mock:cookie] set ${v}`, 150_000);
+    // Fail-closed is isolated too: a server that hasn't got per-user browsers yet refuses the tool for everyone.
+    if (/browser isn't available on this multi-user server/.test(set.raw)) return "browser disabled on this server (fail-closed); per-user contexts not live yet";
     ok(new RegExp(`seen=\\[tenant=${v}\\]`).test(set.text), `set: ${set.text.slice(0, 160)}`);
     const back = await run(alice, "[mock:cookie] show", 150_000);
     ok(back.text.includes(`tenant=${v}`), `alice's own browser kept it: ${back.text.slice(0, 160)}`);

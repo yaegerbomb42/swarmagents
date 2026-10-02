@@ -67,6 +67,7 @@ function db(): DatabaseSync {
   d.exec("CREATE TABLE IF NOT EXISTS uid_counter (id INTEGER PRIMARY KEY CHECK (id = 1), next INTEGER NOT NULL)");
   d.exec("INSERT OR IGNORE INTO uid_counter (id, next) VALUES (1, 20000)");
   for (const r of d.prepare("SELECT id FROM users WHERE os_uid IS NULL").all() as { id: string }[]) assignUid(d, r.id);
+  migrateAccountExtras(d);
   return (g.__swarmAuthDb = d);
 }
 
@@ -74,6 +75,53 @@ function assignUid(d: DatabaseSync, userId: string) {
   const { next } = d.prepare("UPDATE uid_counter SET next = next + 1 WHERE id = 1 RETURNING next - 1 AS next").get() as { next: number };
   d.prepare("UPDATE users SET os_uid = ? WHERE id = ?").run(next, userId);
   return next;
+}
+
+// ---- email, storage quota, last seen (tenant lane, Grok Bot; announced in GROUP_CHAT 20:49) ----
+// email: the admin is seeded by email (lib/tenant/admin.ts) and can sign in with it. Sign-up never sets it, so no
+// sign-up can claim the admin's address. quota_bytes: a per-user storage limit the admin can change (null = the
+// role default in lib/tenant/storage.ts). last_seen_at: bumped at most once a minute by userForToken (Analytics).
+function migrateAccountExtras(d: DatabaseSync) {
+  const has = (c: string) => !!d.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = ?").get(c);
+  if (!has("email")) d.exec("ALTER TABLE users ADD COLUMN email TEXT COLLATE NOCASE");
+  if (!has("quota_bytes")) d.exec("ALTER TABLE users ADD COLUMN quota_bytes INTEGER");
+  if (!has("last_seen_at")) d.exec("ALTER TABLE users ADD COLUMN last_seen_at INTEGER");
+  d.exec("CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email) WHERE email IS NOT NULL");
+}
+
+export interface AccountRow extends User {
+  email: string | null;
+  quotaBytes: number | null;
+  lastSeenAt: number | null;
+  disabled: boolean;
+}
+
+const toRow = (r: Record<string, unknown>): AccountRow => ({
+  ...toUser(r),
+  email: r.email == null ? null : String(r.email),
+  quotaBytes: r.quota_bytes == null ? null : Number(r.quota_bytes),
+  lastSeenAt: r.last_seen_at == null ? null : Number(r.last_seen_at),
+  disabled: !!r.disabled,
+});
+
+export function findUserByEmail(email: string): AccountRow | null {
+  const r = db().prepare("SELECT * FROM users WHERE email = ?").get(email.trim()) as Record<string, unknown> | undefined;
+  return r ? toRow(r) : null;
+}
+
+export function userById(id: string): AccountRow | null {
+  const r = db().prepare("SELECT * FROM users WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  return r ? toRow(r) : null;
+}
+
+/** Every account, for the admin's Analytics view. */
+export function listAccounts(): AccountRow[] {
+  return (db().prepare("SELECT * FROM users ORDER BY created_at").all() as Record<string, unknown>[]).map(toRow);
+}
+
+/** Set (bytes) or clear (null) a user's storage quota. */
+export function setUserQuota(id: string, bytes: number | null): boolean {
+  return Number(db().prepare("UPDATE users SET quota_bytes = ? WHERE id = ?").run(bytes, id).changes) > 0;
 }
 
 /** The OS uid (and gid) a user's tool processes run as. */
@@ -116,11 +164,11 @@ export function validateCredentials(username: string, password: string): string 
   return null;
 }
 
-export function createUser(username: string, password: string, isAdmin = false): User {
+export function createUser(username: string, password: string, isAdmin = false, email: string | null = null): User {
   const id = randomBytes(8).toString("hex");
   const now = Date.now();
   const d = db();
-  d.prepare("INSERT INTO users (id, username, pw_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)").run(id, username, hashPassword(password), isAdmin ? 1 : 0, now);
+  d.prepare("INSERT INTO users (id, username, pw_hash, is_admin, created_at, email) VALUES (?, ?, ?, ?, ?, ?)").run(id, username, hashPassword(password), isAdmin ? 1 : 0, now, email);
   assignUid(d, id);
   return { id, username, isAdmin, createdAt: now };
 }
@@ -130,7 +178,8 @@ export function usernameTaken(username: string) {
 }
 
 export function authenticate(username: string, password: string): User | null {
-  const row = db().prepare("SELECT * FROM users WHERE username = ? AND disabled = 0").get(username) as Record<string, unknown> | undefined;
+  // Username, or the email an account was seeded with (the admin signs in with an email address).
+  const row = db().prepare(`SELECT * FROM users WHERE ${username.includes("@") ? "email" : "username"} = ? AND disabled = 0`).get(username.trim()) as Record<string, unknown> | undefined;
   if (!row) {
     verifyPassword(password, DUMMY);
     return null;
@@ -161,6 +210,7 @@ export function userForToken(token: string): User | null {
     .get(sha(token)) as Record<string, unknown> | undefined;
   if (!row || Number(row.exp) < now) return null;
   if (Number(row.exp) - now < SESSION_MS - TOUCH_MS) db().prepare("UPDATE login_sessions SET expires_at = ? WHERE token_hash = ?").run(now + SESSION_MS, sha(token));
+  if (now - Number(row.last_seen_at ?? 0) > 60_000) db().prepare("UPDATE users SET last_seen_at = ? WHERE id = ?").run(now, String(row.id));
   return toUser(row);
 }
 

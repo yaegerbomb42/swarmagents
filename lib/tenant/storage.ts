@@ -15,16 +15,31 @@
 import fs from "node:fs";
 import path from "node:path";
 import { allUserIds, currentUser, userHome } from "../store";
+import { userById } from "../users";
 
 export const MB = 1024 * 1024;
 const RECONCILE_MS = 15_000;
 const BACKGROUND_MS = 5 * 60_000;
 
-/** The per-account limit in bytes (Infinity = no limit). */
+const envMB = (v: string | undefined) => {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n * MB) : null;
+};
+
+/**
+ * The per-account limit in bytes (Infinity = no limit): the admin-set per-user quota if there is one, else the role
+ * default, 5 GB for admins and 0.5 GB for everyone else (SWARM_ADMIN_STORAGE_QUOTA_MB / SWARM_STORAGE_QUOTA_MB
+ * override the defaults). Locally there is no limit unless SWARM_STORAGE_QUOTA_MB is set.
+ */
 export function storageLimit(userId = currentUser()): number {
-  const env = Number(process.env.SWARM_STORAGE_QUOTA_MB);
-  if (Number.isFinite(env) && env > 0) return Math.floor(env * MB);
-  return userId === "local" ? Infinity : 512 * MB;
+  if (userId === "local") return envMB(process.env.SWARM_STORAGE_QUOTA_MB) ?? Infinity;
+  let row: { isAdmin: boolean; quotaBytes: number | null } | null = null;
+  try {
+    row = userById(userId);
+  } catch {}
+  if (row?.quotaBytes && row.quotaBytes > 0) return row.quotaBytes;
+  if (row?.isAdmin) return envMB(process.env.SWARM_ADMIN_STORAGE_QUOTA_MB) ?? 5 * 1024 * MB;
+  return envMB(process.env.SWARM_STORAGE_QUOTA_MB) ?? 512 * MB;
 }
 
 export type StorageCategory = "chats" | "trajectories" | "files" | "browser" | "other";

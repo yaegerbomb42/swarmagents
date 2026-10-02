@@ -279,8 +279,34 @@ export class BrowserSession {
     }
   }
 
-  private guard(_c: BrowserContext) {
-    // Route guard placeholder
+  /**
+   * Navigation guard for the sandbox: pages can never read the server's disk over file://, and the
+   * deploy lane can pin extra origins (the app's own host) as off limits with SWARM_BROWSER_BLOCK_ORIGINS.
+   * Private ranges, the tailnet and cloud metadata are already dropped by the egress firewall; this is
+   * the defence that lives inside the browser itself.
+   */
+  private guard(c: BrowserContext) {
+    const block = (route: import("playwright-core").Route) => {
+      const url = route.request().url();
+      if (/^(file|chrome|chrome-extension):/i.test(url)) this.log(`Blocked ${url.split(":")[0]}:// request (the sandbox never reads the server's disk).`);
+      route.abort("accessdenied").catch(() => {});
+    };
+    c.route("file://**", block).catch(() => {});
+    const hosts = (process.env.SWARM_BROWSER_BLOCK_ORIGINS ?? "")
+      .split(",")
+      .map((h) => h.trim())
+      .filter(Boolean);
+    if (hosts.length)
+      c.route("**/*", (route) => {
+        try {
+          const u = new URL(route.request().url());
+          if (hosts.includes(u.host) || hosts.includes(u.hostname)) {
+            this.log(`Blocked a request to ${u.host} (origin blocked for the sandbox).`);
+            return route.abort("accessdenied");
+          }
+        } catch {}
+        return route.continue();
+      }).catch(() => {});
   }
 
   private explainLaunchError(e: unknown) {

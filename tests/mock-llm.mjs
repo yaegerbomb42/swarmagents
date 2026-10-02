@@ -475,4 +475,6 @@ const server = http.createServer(async (req, res) => {
   json(404, { error: { message: `mock: no route ${req.method} ${p}` } });
 });
 
-server.listen(PORT, "127.0.0.1", () => console.log(`mock-llm listening on http://127.0.0.1:${PORT}/v1 (workdir ${WORKDIR})`));
+// MOCK_HOST=0.0.0.0 lets a server in a container reach it (tests/tenant-isolation.mjs); the default stays loopback.
+const HOST = process.env.MOCK_HOST || "127.0.0.1";
+server.listen(PORT, HOST, () => console.log(`mock-llm listening on http://${HOST}:${PORT}/v1 (workdir ${WORKDIR})`));

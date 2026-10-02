@@ -35,8 +35,8 @@ COPY --from=build /app/next.config.mjs ./next.config.mjs
 # Static files (brand icons, manifest images): `next start` serves ./public; without this they 404.
 COPY --from=build /app/public ./public
 # Per-user OS sandbox launchers (lib/sandbox.ts, SWARM_SANDBOX=uid): run a user's tools as their own uid with no caps.
-COPY sandbox/swarm-run sandbox/chromium-as /usr/local/bin/
-RUN rm -rf .next/cache && chown -R root:root /app && chmod -R a+rX /app && chmod 755 /usr/local/bin/swarm-run /usr/local/bin/chromium-as
+COPY sandbox/swarm-run sandbox/chromium-as bin/swarm-chromium /usr/local/bin/
+RUN rm -rf .next/cache && chown -R root:root /app && chmod -R a+rX /app && chmod 755 /usr/local/bin/swarm-run /usr/local/bin/chromium-as /usr/local/bin/swarm-chromium
 ENV PORT=3400 HOSTNAME=0.0.0.0 SWARM_HOME=/data HOME=/data/home SHELL=/bin/zsh \
     SWARM_CHROME_PATH=/usr/bin/chromium SWARM_BROWSER_HEADLESS=1 SWARM_BROWSER_NO_SANDBOX=1
 USER swarm

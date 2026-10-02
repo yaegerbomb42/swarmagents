@@ -4,6 +4,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import type { AgentEvent, Attachment, ContextInfo, SessionMeta, StreamOp } from "@/lib/types";
 import { Timeline, LoadEarlier } from "@/components/Timeline";
 import { ProgressBar } from "@/components/ProgressBar";
+import { AwayRecap } from "@/components/AwayRecap";
+import { ChangedFilesTree } from "@/components/ChangedFilesTree";
 import { Composer } from "@/components/Composer";
 import { Settings } from "@/components/Settings";
 import { Activity } from "@/components/Activity";
@@ -345,6 +347,8 @@ export default function Home() {
           ) : (
             <div className="col">
               <ProgressBar events={visible} running={running} context={context} startTs={visible.find((e) => e.type === "user")?.ts ?? 0} />
+              <AwayRecap events={visible} running={running} sessionId={active ?? undefined} />
+              <ChangedFilesTree events={visible} session={active ?? undefined} />
               {active && archivedEvents > 0 && <LoadEarlier archivedCount={archivedEvents} sessionId={active} />}
               <Timeline events={visible} onImage={setLightbox} session={active ?? undefined} />
               {running && !livePlanOpen && visible.at(-1)?.type !== "thinking" && visible.at(-1)?.type !== "text" && (

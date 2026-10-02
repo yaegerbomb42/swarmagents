@@ -601,3 +601,122 @@
 
 .icon-btn.attach { width: 36px; height: 36px; display: grid; place-items: center; border-radius: var(--radius-md); color: var(--color-text-muted); }
 .icon-btn.attach:hover { background: var(--color-line); color: var(--color-text); }
+
+/* ═══════ Away Recap Banner ═══════ */
+.away-recap-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  margin: 8px 0 14px;
+  border-radius: var(--radius-md, 10px);
+  background: color-mix(in srgb, var(--color-run, #3b6fd8) 8%, var(--color-bg-elevated, #1a1a19));
+  border: 1px solid color-mix(in srgb, var(--color-run, #3b6fd8) 30%, transparent);
+  animation: in 0.2s ease-out;
+}
+.away-recap-content {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+.away-recap-badge {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--color-run, #3b6fd8);
+  color: #fff;
+}
+.away-recap-text {
+  color: var(--color-text, #ecebe8);
+}
+.away-recap-close {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  color: var(--color-text-faint, #66655f);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.away-recap-close:hover {
+  color: var(--color-text, #ecebe8);
+  background: var(--color-line, #262624);
+}
+
+/* ═══════ Changed Files Tree ═══════ */
+.changed-files-tree {
+  margin: 10px 0;
+  border: 1px solid var(--color-line, #262624);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-bg-elevated, #191918);
+  overflow: hidden;
+}
+.changed-files-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  color: var(--color-text-muted, #9a9993);
+  text-align: left;
+  cursor: pointer;
+}
+.changed-files-toggle:hover {
+  background: var(--color-bg-sunken, #161615);
+  color: var(--color-text, #ecebe8);
+}
+.changed-files-title {
+  font-weight: 550;
+  flex: 1;
+}
+.changed-files-list {
+  padding: 4px 8px 8px;
+  border-top: 1px solid var(--color-line, #262624);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.changed-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+}
+.changed-file-row:hover {
+  background: var(--color-bg-sunken, #161615);
+}
+.changed-file-badge {
+  font-size: 10px;
+  font-weight: 700;
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+}
+.changed-file-badge.created { background: color-mix(in srgb, var(--color-ok, #4cb67c) 20%, transparent); color: var(--color-ok, #4cb67c); }
+.changed-file-badge.edited  { background: color-mix(in srgb, var(--color-warn, #d9a441) 20%, transparent); color: var(--color-warn, #d9a441); }
+.changed-file-badge.produced { background: color-mix(in srgb, var(--color-run, #6f98f0) 20%, transparent); color: var(--color-run, #6f98f0); }
+.changed-file-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.changed-file-dir { color: var(--color-text-faint, #66655f); }
+.changed-file-name { color: var(--color-text, #ecebe8); font-weight: 500; }
+.changed-file-actions { flex-shrink: 0; }
+

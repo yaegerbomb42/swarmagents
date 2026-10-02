@@ -91,7 +91,7 @@ with sync_playwright() as p:
         rawInputs: [...document.querySelectorAll('.tool')].filter(t => t.textContent.includes('"action"')).length,
     })"""
     )
-    pg.screenshot(path="/tmp/browser-view.png")
+    pg.screenshot(path=f"/tmp/browser-view-cline-{sid}.png")
     b.close()
     print("rendered:", ui)
     print("console errors:", len(errors))

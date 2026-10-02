@@ -236,6 +236,11 @@ const cases = {
     const short = r.json.connections.find((x) => x.envVar === "SHORT_KEY");
     assert(short?.keyHint === "set" && !/abcd/.test(JSON.stringify(r.json.connections)), "short key must not be echoed", short);
     await api("DELETE", `/api/connections?type=tool&id=${short.id}`);
+    // A key can't take over a variable that changes how every command runs.
+    for (const name of ["NODE_OPTIONS", "PATH", "SWARM_AUTH_TOKEN", "DYLD_INSERT_LIBRARIES"]) {
+      r = await api("POST", "/api/connections", { type: "tool", preset: "custom-key", envVar: name, apiKey: "x".repeat(16) });
+      assert(r.status === 400 && /reserved/.test(r.json.error ?? ""), `reserved env name ${name} refused`, r.json);
+    }
     // MCP stdio server: test lists its tools, save writes mcp.json in Claude's shape.
     const mcpDef = { type: "mcp", preset: "custom-stdio", label: "Mock MCP", command: process.execPath, args: [path.join(ROOT, "tests/mock-mcp.mjs")], env: { MOCK_MCP_SECRET: "mcp-secret-9999", MOCK_REF: "${MOCK_SERVICE_KEY}", SHORT_PIN: "s3cr3t" } };
     // A command that exits says why (its stderr), not just "Connection closed".

@@ -213,11 +213,30 @@ export function searchKeys(): { service: string; key: string }[] {
   });
 }
 
+// Names a saved key may never take over: they would change how every child process runs, or reach
+// server-only settings. A key saved under one of these is simply not exported.
+const RESERVED_ENV = /^(SWARM_|PATH$|HOME$|USER$|SHELL$|PWD$|TMPDIR$|NODE_OPTIONS$|NODE_PATH$|LD_|DYLD_|BASH_ENV$|ENV$|ZDOTDIR$|PYTHONPATH$|PYTHONSTARTUP$|PERL5OPT$|RUBYOPT$|GIT_SSH|GIT_CONFIG|GIT_EXEC_PATH$|SSH_AUTH_SOCK$)/i;
+
 /** Environment variables for the agent's shell: every enabled tool key under its variable name. */
 export function toolEnv(): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const t of loadTools()) if (t.enabled && t.apiKey && t.envVar) env[t.envVar] = t.apiKey;
+  for (const t of loadTools())
+    if (t.enabled && t.apiKey && t.envVar && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t.envVar) && !RESERVED_ENV.test(t.envVar))
+      env[t.envVar] = t.apiKey;
   return env;
+}
+
+/** Masks every saved tool key that appears in `text` (e.g. `echo $GITHUB_TOKEN` output) as ••••last4,
+ *  so keys exported to the shell don't land in the transcript or the model's context by accident. */
+export function redactSavedKeys(text: string): string {
+  if (!text) return text;
+  const keys = loadTools()
+    .map((t) => t.apiKey ?? "")
+    .filter((k) => k.length >= 8)
+    .sort((a, b) => b.length - a.length);
+  let out = text;
+  for (const k of keys) if (out.includes(k)) out = out.split(k).join(`••••${k.length >= 12 ? k.slice(-4) : ""}`);
+  return out;
 }
 
 // ---------- MCP servers ----------
@@ -371,6 +390,7 @@ function buildTool(input: ConnectionInput, existing?: ToolKey): ToolKey {
   const preset = toolPreset(input.preset ?? existing?.preset ?? "custom-key");
   const envVar = (str(input.envVar, "Variable name", 80) || existing?.envVar || preset.envVar).toUpperCase();
   if (!/^[A-Z_][A-Z0-9_]*$/.test(envVar)) throw new InputError("Variable name must look like MY_API_KEY.");
+  if (RESERVED_ENV.test(envVar)) throw new InputError(`${envVar} is reserved (it changes how every command runs). Pick another name, like MY_API_KEY.`);
   const apiKey = str(input.apiKey, "API key") || existing?.apiKey || "";
   if (!apiKey) throw new InputError("Paste the API key.");
   const testUrl = str(input.testUrl, "Test URL") || (input.testUrl === "" ? undefined : existing?.testUrl);

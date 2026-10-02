@@ -31,6 +31,126 @@ function childEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+// ---- 24h growth guards: a long run must not fill memory or disk ----
+
+/** Foreground output kept in memory before the older part is spilled to disk. */
+const CAPTURE_BYTES = 4 * 1024 * 1024;
+/** Newest slice of the capture always kept in memory (it holds the trailing cwd marker). */
+const CAPTURE_TAIL_BYTES = 1024 * 1024;
+/** Live output forwarded to the tool card; past this the full log is on disk instead. */
+const STREAM_BYTES = 256 * 1024;
+/** Total out-*.log + bg-*.log budget per session. */
+const LOG_BUDGET_BYTES = 200 * 1024 * 1024;
+/** Head kept when an oversized log is shrunk in place (startup errors are the useful part). */
+const LOG_HEAD_BYTES = 64 * 1024;
+/** A log touched this recently may still be written, so it is not simply deleted. */
+const ACTIVE_LOG_MS = 10 * 60 * 1000;
+
+export const fmtSize = (n: number) => (n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB` : n >= 1 << 10 ? `${Math.round(n / 1024)} KB` : `${n} B`);
+
+interface LogFile {
+  f: string;
+  size: number;
+  mtime: number;
+}
+
+function sessionLogs(sessionId: string): LogFile[] {
+  const dir = sessionDir(sessionId);
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: LogFile[] = [];
+  for (const n of names) {
+    if (!/^(out|bg)-.*\.log$/.test(n)) continue;
+    const f = path.join(dir, n);
+    try {
+      const st = fs.statSync(f);
+      out.push({ f, size: st.size, mtime: st.mtimeMs });
+    } catch {
+      // raced with a delete; ignore
+    }
+  }
+  return out.sort((a, b) => a.mtime - b.mtime);
+}
+
+/** Keep a session's shell logs inside LOG_BUDGET_BYTES. Settled logs are deleted oldest-first; a log
+ *  that may still be appended to is shrunk in place (head kept) instead, because deleting a file that
+ *  an open writer still holds does not reclaim its blocks on unix. Returns bytes reclaimed. */
+export function pruneLogs(sessionId: string): number {
+  const logs = sessionLogs(sessionId);
+  let total = logs.reduce((n, l) => n + l.size, 0);
+  if (total <= LOG_BUDGET_BYTES) return 0;
+  const before = total;
+  const now = Date.now();
+  for (const l of logs) {
+    if (total <= LOG_BUDGET_BYTES) break;
+    if (now - l.mtime < ACTIVE_LOG_MS) continue;
+    try {
+      fs.rmSync(l.f, { force: true });
+      total -= l.size;
+    } catch {}
+  }
+  for (const l of logs) {
+    if (total <= LOG_BUDGET_BYTES) break;
+    if (now - l.mtime >= ACTIVE_LOG_MS) continue;
+    try {
+      if (l.size <= LOG_HEAD_BYTES) continue;
+      const head = fs.readFileSync(l.f).subarray(0, LOG_HEAD_BYTES);
+      fs.writeFileSync(l.f, head);
+      total -= l.size - head.length;
+    } catch {}
+  }
+  return before - total;
+}
+
+/** Disk footprint of a session's shell logs (used by tests and diagnostics). */
+export function logUsage(sessionId: string): { files: number; bytes: number } {
+  const logs = sessionLogs(sessionId);
+  return { files: logs.length, bytes: logs.reduce((n, l) => n + l.size, 0) };
+}
+
+// Background jobs the agent started, per session, so they can be stopped with the task.
+const bgProcs = new Map<string, Set<number>>();
+
+function trackBackground(sessionId: string, child: { pid?: number; on(ev: string, cb: () => void): void }) {
+  if (!child.pid) return;
+  const set = bgProcs.get(sessionId) ?? new Set<number>();
+  set.add(child.pid);
+  bgProcs.set(sessionId, set);
+  child.on("exit", () => {
+    set.delete(child.pid!);
+    if (!set.size) bgProcs.delete(sessionId);
+    pruneLogs(sessionId);
+  });
+}
+
+export function backgroundCount(sessionId: string): number {
+  return bgProcs.get(sessionId)?.size ?? 0;
+}
+
+/** Stop every background job this session started (kills the whole process group). Returns how many. */
+export function killSessionBackground(sessionId: string): number {
+  const set = bgProcs.get(sessionId);
+  if (!set) return 0;
+  let killed = 0;
+  for (const pid of set) {
+    try {
+      process.kill(-pid, "SIGTERM");
+      killed++;
+    } catch {}
+    setTimeout(() => {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {}
+    }, 3000);
+  }
+  bgProcs.delete(sessionId);
+  return killed;
+}
+
 export const shell: Tool = {
   spec: {
     name: "bash",

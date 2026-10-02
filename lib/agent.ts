@@ -460,6 +460,7 @@ class Session {
    */
   private gate(name: string, input: Record<string, unknown>): "run" | "ask" | "denied" {
     const guard = taskGuards.get(this.meta.id);
+    if (process.env.SWARM_DEBUG_APPROVAL) console.error(`[gate] session=${this.meta.id} guard=${JSON.stringify(guard)} tool=${name}`);
     if (!guard) return "run";
     const risk = riskOf(name, input);
     if (!risk) return "run";
@@ -682,6 +683,7 @@ setAgentAdapter({
     s.subs.add(sub);
     s.pendingApproval = null;
     setTaskGuard(s.meta.id, task.id);
+    if (process.env.SWARM_DEBUG_APPROVAL) console.error(`[adapter.run] session=${s.meta.id} task=${task.id} guardSet`);
     hooks.signal.addEventListener("abort", onAbort, { once: true });
     try {
       s.send(task.prompt, []);

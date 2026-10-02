@@ -32,6 +32,19 @@ for (const cmd of ["ls -la", "npm test", "git status", "git commit -m wip", "nod
 // Deleting a file via its own tool is destructive.
 check("delete_file is destructive", riskOf("delete_file", { path: "/x" })?.level === "destructive");
 
+// API writes are gated; reads are not.
+check("api_request GET is safe", riskOf("api_request", { service: "github-token", url: "/repos", method: "GET" }) === null);
+check("api_request DELETE is gated", riskOf("api_request", { service: "github-token", url: "/repos/x", method: "DELETE" })?.level === "outward");
+check("api_request POST is gated", riskOf("api_request", { service: "replicate", url: "/x", method: "POST" })?.level === "outward");
+check("api_request service list is safe", riskOf("api_request", { service: "list" }) === null);
+
+// Browser: committing forms are gated, plain navigation/reads are not.
+check("browser goto is safe", riskOf("browser", { action: "goto", url: "https://x" }) === null);
+check("browser read is safe", riskOf("browser", { action: "read" }) === null);
+check("browser plain type is safe", riskOf("browser", { action: "type", text: "hi" }) === null);
+check("browser type submit is gated", riskOf("browser", { action: "type", text: "hi", submit: true })?.level === "outward");
+check("browser press Enter is gated", riskOf("browser", { action: "press", key: "Enter" })?.level === "outward");
+
 // The hash binds an action to its exact content: approving one command must not approve another.
 check("hash is stable", actionHash("bash", { command: "rm -rf a" }) === actionHash("bash", { command: "rm -rf a" }));
 check("hash differs by command", actionHash("bash", { command: "rm -rf a" }) !== actionHash("bash", { command: "rm -rf b" }));

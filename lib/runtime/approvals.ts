@@ -69,8 +69,27 @@ export function riskOf(toolName: string, input: Record<string, unknown>): Risk |
   if (toolName === "delete_file" || toolName === "remove_file") {
     return { level: "destructive", why: "deletes a file" };
   }
-  if (toolName === "browser" && typeof input.action === "string" && /submit|purchase|buy|send|post/i.test(input.action)) {
-    return { level: "outward", why: `performs a web action (${input.action})` };
+  // Calling a service's API is fine for reads; a write can change the user's data or spend money.
+  if (toolName === "api_request") {
+    const method = String(input.method ?? "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD" && input.service !== "list") {
+      return { level: "outward", why: `${method}s to a saved service` };
+    }
+    return null;
+  }
+  if (toolName === "browser") {
+    const action = typeof input.action === "string" ? input.action : "";
+    // A plain click/type can be anything, so only the clearly committing forms are gated: submitting a
+    // form or pressing Enter/Return. The coordinator's note asks exactly this until control-label
+    // classification (which button this really is) is available.
+    if (action === "type" && input.submit === true) return { level: "outward", why: "submits a form" };
+    if (action === "press" && /^(enter|return)$/i.test(String(input.key ?? ""))) {
+      return { level: "outward", why: "presses Enter (may submit)" };
+    }
+    if (/submit|purchase|buy|checkout|send|post/i.test(action)) {
+      return { level: "outward", why: `performs a web action (${action})` };
+    }
+    return null;
   }
   if (toolName === "send_email" || toolName === "post_message") {
     return { level: "outward", why: "sends a message on your behalf" };

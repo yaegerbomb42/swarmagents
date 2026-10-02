@@ -68,7 +68,7 @@ const TYPE_LABEL: Record<ConnType, string> = {
 };
 const TYPE_HINT: Record<ConnType, string> = {
   llm: "The agent uses the first enabled model and fails over down the list. Drag to reorder. Rate limits are learned from real 429s.",
-  tool: "Keys for services the agent's tools call. The agent uses them through web_search and api_request: each key is added on the server and only sent to its own service. Local connectors can reference one as ${VAR}.",
+  tool: "Keys for services the agent's tools call. The agent uses them through web_search and api_request: each key is added on the server and only sent to its own service. Local connectors can reference one as ${VAR}. A key reaches the agent's terminal only if you turn that on for the key.",
   mcp: "MCP servers add tools: local commands or remote URLs. Servers set up in Claude Code or Claude Desktop on the machine SwarmAgents runs on appear here automatically.",
 };
 

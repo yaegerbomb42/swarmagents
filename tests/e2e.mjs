@@ -665,7 +665,8 @@ async function main() {
   start(process.execPath, [path.join(ROOT, "tests/mock-llm.mjs"), String(MOCK_PORT)], { MOCK_WORKDIR: WORK }, path.join(HOME, "mock-llm.log"));
   await waitFor(`${MOCK}/__mock/health`, 10_000, "mock LLM");
   if (!opt("--url")) {
-    const env = { SWARM_HOME: HOME, NEXT_DIST_DIR: flag("--prod") ? ".next-e2e-prod" : ".next-e2e", NEXT_TELEMETRY_DISABLED: "1", SWARM_STALL_MS: "30000", SWARM_SEARCH_MOCK: `${MOCK}/search`, E2E_SERVER_CANARY: "canary-1", SWARM_E2E_CANARY: "canary-2", SWARM_BROWSER_HEADLESS: "1", SWARM_API_MOCK: MOCK };
+    // E2E_DIST_DIR: a private build dir when several agents run e2e at once.
+    const env = { SWARM_HOME: HOME, NEXT_DIST_DIR: process.env.E2E_DIST_DIR || (flag("--prod") ? ".next-e2e-prod" : ".next-e2e"), NEXT_TELEMETRY_DISABLED: "1", SWARM_STALL_MS: "30000", SWARM_SEARCH_MOCK: `${MOCK}/search`, E2E_SERVER_CANARY: "canary-1", SWARM_E2E_CANARY: "canary-2", SWARM_BROWSER_HEADLESS: "1", SWARM_API_MOCK: MOCK };
     const next = path.join(ROOT, "node_modules/.bin/next");
     if (flag("--prod")) {
       console.log(c.d("building (next build)…"));

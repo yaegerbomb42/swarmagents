@@ -270,14 +270,14 @@ function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) =
       </button>
       {shown && (
         <div className="io">
-          {inputText && e.name !== "bash" && (
+          {inputText && e.name !== "bash" && e.name !== "browser" && (
             <>
               {labelWithCopy("Input", inputText)}
               <pre>{inputText}</pre>
             </>
           )}
           {e.name === "bash" && <pre style={{ color: "var(--muted)" }}>$ {argSummary("bash", input, e.inputPreview)}</pre>}
-          {(e.output || e.status === "running") && (
+          {(e.output || e.status === "running") && e.name !== "browser" && (
             <>
               {e.output ? labelWithCopy("Output", e.output) : <div className="label">Output</div>}
               {(() => {
@@ -307,7 +307,11 @@ function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) =
               })()}
             </>
           )}
-          {!!e.images?.length && (
+          {/* Browser actions get the browser-window card (address bar, set-of-marks shot, events). */}
+          {e.name === "browser" && (
+            <BrowserView input={input} output={e.output} images={e.images} status={e.status} onImage={onImage} />
+          )}
+          {!!e.images?.length && e.name !== "browser" && (
             <div className="shots">
               {e.images.map((im, i) => {
                 const src = `data:${im.mediaType};base64,${im.data}`;

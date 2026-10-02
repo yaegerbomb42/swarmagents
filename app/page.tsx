@@ -230,6 +230,8 @@ export default function Home() {
             </div>
           ) : (
             <div className="col">
+              <ProgressBar events={visible} running={running} context={context} startTs={visible.find((e) => e.type === "user")?.ts ?? 0} />
+              {active && archivedEvents > 0 && <LoadEarlier archivedCount={archivedEvents} sessionId={active} />}
               <Timeline events={visible} onImage={setLightbox} session={active ?? undefined} />
               {running && !livePlanOpen && visible.at(-1)?.type !== "thinking" && visible.at(-1)?.type !== "text" && (
                 <div className="ev thinking">

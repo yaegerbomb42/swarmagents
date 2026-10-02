@@ -818,6 +818,7 @@ function ConnRow(props: {
           </span>
         )}
         {rank !== undefined && <span className="rank">{rank}</span>}
+        <span className={`st-health ${err ? "err" : l?.cooldownUntil && l.cooldownUntil > Date.now() ? "warn" : l?.throttles ? "throttled" : c.type === "mcp" && c.status?.startsWith("failed") ? "err" : "ok"}`} title={err ? "Error" : l?.cooldownUntil && l.cooldownUntil > Date.now() ? "Cooling down" : "Connected"} />
         <span className="nm">{c.label}</span>
         {c.type === "llm" && <span className="mdl">{c.model}</span>}
         <span className="spacer" />

@@ -171,3 +171,53 @@ test("Catalog: Enriched presets contain valid direct key links and guidance hint
   assert.equal(anthropic.directKeyUrl, "https://console.anthropic.com/settings/keys");
   assert.ok(anthropic.keyHelpHint?.includes("Anthropic"));
 });
+
+import { constructAzureUrl, validateAzureEndpoint } from "../lib/connections/azure";
+
+test("Azure OpenAI: URL construction and parameter handling", () => {
+  const url1 = constructAzureUrl({
+    resourceName: "eastus-ai-res",
+    deploymentName: "gpt-4o-deploy",
+    apiVersion: "2024-06-01",
+  });
+  assert.equal(url1, "https://eastus-ai-res.openai.azure.com/openai/deployments/gpt-4o-deploy/chat/completions?api-version=2024-06-01");
+
+  const url2 = constructAzureUrl({
+    customBaseUrl: "https://gateway.internal.net/azure-proxy",
+    deploymentName: "o1-mini",
+  });
+  assert.equal(url2, "https://gateway.internal.net/azure-proxy/openai/deployments/o1-mini/chat/completions?api-version=2024-02-15-preview");
+});
+
+test("Azure OpenAI: Mock server validation with streaming & tools verification", async () => {
+  const server = http.createServer((req, res) => {
+    assert.equal(req.headers["api-key"], "mock-azure-key");
+    if (req.method === "POST") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+      });
+      res.end("data: {\"choices\":[{\"delta\":{\"content\":\"azure ok\"}}]}\n\ndata: [DONE]\n\n");
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+
+  const result = await validateAzureEndpoint({
+    customBaseUrl: `http://127.0.0.1:${port}/azure-mock`,
+    deploymentName: "gpt-4o-deploy",
+    apiKey: "mock-azure-key",
+    allowLocalhost: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.capabilities?.streaming, true);
+  assert.equal(result.normalizedConfig?.model, "gpt-4o-deploy");
+  assert.equal(result.normalizedConfig?.headers?.["api-version"], "2024-02-15-preview");
+
+  await new Promise((resolve) => server.close(resolve));
+});

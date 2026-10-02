@@ -1,280 +1,340 @@
-/* timeline.css */
-/* Premium styles for Timeline component */
+/*
+ * timeline.css — Premium timeline styles for SwarmAgents.
+ * Complements globals.css, never overrides its core tokens.
+ * Imported by Timeline.tsx.
+ */
 
-/* 1. Step icons */
+/* ═══════ Step Icons ═══════ */
 .step-icon {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: var(--faint);
+  transition: color 0.15s;
+}
+.ev:hover .step-icon,
+.tool .head:hover .step-icon {
   color: var(--muted);
-  opacity: 0.8;
+}
+
+/* ═══════ Tool Card Accent Borders ═══════ */
+.tool-accent-shell  { border-left: 2.5px solid var(--run); }
+.tool-accent-file   { border-left: 2.5px solid var(--ok); }
+.tool-accent-browser { border-left: 2.5px solid #a78bfa; }
+.tool-accent-search  { border-left: 2.5px solid var(--warn); }
+.tool-accent-api     { border-left: 2.5px solid #f59e0b; }
+.tool-accent-mcp     { border-left: 2.5px solid #22d3ee; }
+
+/* Active/running tool glow */
+.tool.is-active {
+  border-color: color-mix(in srgb, var(--run) 40%, var(--line));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--run) 12%, transparent),
+              0 2px 8px color-mix(in srgb, var(--run) 8%, transparent);
+}
+
+/* ═══════ Step Grouping ═══════ */
+.step-group {
+  margin: 6px 0;
+  animation: in 0.18s ease-out;
+}
+.step-group-toggle {
   display: flex;
   align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  transition: color 0.2s ease, opacity 0.2s ease;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
 }
-
-.step-icon:hover {
-  opacity: 1;
+.step-group-toggle:hover {
+  background: var(--sunken);
+  border-color: var(--line-strong);
   color: var(--text);
 }
-
-/* 2. Step groups */
-.step-group {
-  margin: 4px 0;
-  padding: 4px 0;
+.step-group-toggle .step-icon {
+  color: var(--faint);
+}
+.step-group-count {
+  font-weight: 550;
+  color: var(--text);
+}
+.step-group-dur {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.step-group-items {
+  padding: 2px 0 2px 28px;
   border-left: 1px solid var(--line);
   margin-left: 8px;
-  padding-left: 12px;
 }
 
-.step-group-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  padding: 4px 8px;
-  border-radius: var(--radius);
-  color: var(--muted);
-  font-size: 0.85rem;
-  transition: background 0.15s ease, color 0.15s ease;
-  user-select: none;
-}
-
-.step-group-header:hover {
-  background: var(--sunken);
-  color: var(--text);
-}
-
-.step-group-content {
-  overflow: hidden;
-  transition: max-height 0.25s ease-in-out, opacity 0.25s ease;
-}
-
-.step-group-content.collapsed {
-  max-height: 0;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.step-group-content.expanded {
-  max-height: 2000px;
-  opacity: 1;
-}
-
-/* 3. Content-visibility virtualization */
+/* ═══════ Content-Visibility Virtualization ═══════ */
 .ev-virtual {
   content-visibility: auto;
-  contain-intrinsic-size: auto 60px;
+  contain-intrinsic-size: auto 56px;
 }
 
-/* 4. ANSI colors */
-.ansi-black { color: #000000; }
-.ansi-red { color: #cc0000; }
-.ansi-green { color: #008800; }
-.ansi-yellow { color: #ddb600; }
-.ansi-blue { color: #0000ee; }
-.ansi-magenta { color: #cc00cc; }
-.ansi-cyan { color: #00cccc; }
-.ansi-white { color: #eeeeee; }
-
-.ansi-bright-black { color: #555555; }
-.ansi-bright-red { color: #ff0000; }
-.ansi-bright-green { color: #00ff00; }
-.ansi-bright-yellow { color: #ffff00; }
-.ansi-bright-blue { color: #5c5cff; }
-.ansi-bright-magenta { color: #ff00ff; }
-.ansi-bright-cyan { color: #00ffff; }
-.ansi-bright-white { color: #ffffff; }
-
-.ansi-bold { font-weight: bold; }
-.ansi-dim { opacity: 0.7; }
-.ansi-italic { font-style: italic; }
-.ansi-underline { text-decoration: underline; }
-.ansi-strikethrough { text-decoration: line-through; }
-.ansi-inverse { filter: invert(1); }
-
-/* 5. Improved tool cards */
-.tool-premium {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 12px;
-  margin: 8px 0;
-  box-shadow: 0 2px 4px var(--shadow);
-  position: relative;
-  overflow: hidden;
-  transition: box-shadow 0.2s ease, border-color 0.2s ease;
-}
-
-.tool-premium:hover {
-  border-color: var(--line-strong);
-  box-shadow: 0 4px 8px var(--shadow);
-}
-
-/* 9. Step type colors (border left accent per tool type) */
-.tool-premium.type-shell { border-left: 3px solid var(--accent); }
-.tool-premium.type-file { border-left: 3px solid var(--ok); }
-.tool-premium.type-browser { border-left: 3px solid #8e44ad; } /* purple-ish for browser */
-.tool-premium.type-search { border-left: 3px solid var(--warn); }
-.tool-premium.type-mcp { border-left: 3px solid var(--run); } 
-
-/* 6. Sub-agent tree */
-.subagent-tree {
-  margin-left: 16px;
-  padding-left: 16px;
-  border-left: 1px dashed var(--line);
-  position: relative;
-}
-
-.subagent-node {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 0;
-}
-
-.subagent-status {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--muted);
-  transition: background-color 0.3s ease;
-}
-.subagent-status.running { background: var(--run); }
-.subagent-status.done { background: var(--ok); }
-.subagent-status.error { background: var(--err); }
-
-/* 7. Progress hero bar */
+/* ═══════ Progress Hero Bar ═══════ */
 .progress-hero {
   position: sticky;
   top: 0;
-  z-index: 10;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 12px 16px;
-  background: color-mix(in srgb, var(--bg) 80%, transparent);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  z-index: 8;
+  padding: 10px 16px;
+  margin: -8px -24px 12px;
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--line);
-  font-family: var(--sans);
-  font-size: 0.85rem;
-  color: var(--text);
-  gap: 16px;
 }
-
-.progress-hero-item {
+.progress-hero-inner {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  flex-wrap: wrap;
+  max-width: 780px;
+  margin: 0 auto;
+}
+.progress-cell {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  padding: 4px 10px;
+  min-width: 0;
 }
-.progress-hero-label {
-  color: var(--muted);
-  font-size: 0.75rem;
+.progress-goal {
+  flex: 2 1 180px;
+  max-width: 300px;
+}
+.progress-step {
+  flex: 2 1 140px;
+  position: relative;
+}
+.progress-step .pulse-dot {
+  position: absolute;
+  top: 6px;
+  left: 2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--run);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.progress-step:has(.pulse-dot) {
+  padding-left: 16px;
+}
+.progress-plan,
+.progress-elapsed,
+.progress-tokens,
+.progress-cost {
+  flex: 0 1 auto;
+}
+.progress-label {
+  font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  line-height: 1;
 }
-.progress-hero-value {
-  font-weight: 500;
+.progress-value {
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+.progress-value.tabnum {
+  font-variant-numeric: tabular-nums;
   font-family: var(--mono);
+  font-size: 12px;
+}
+.progress-bar-mini {
+  display: inline-block;
+  width: 40px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line);
+  vertical-align: middle;
+  margin-left: 6px;
+  overflow: hidden;
+}
+.progress-bar-fill {
+  height: 100%;
+  background: var(--ok);
+  border-radius: 2px;
+  transition: width 0.3s ease;
 }
 
-/* 8. Archived events button */
+/* ═══════ Load Earlier Button ═══════ */
 .load-earlier {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   width: 100%;
   padding: 8px;
-  margin: 16px 0;
-  text-align: center;
-  background: transparent;
-  border: 1px dashed var(--line);
-  border-radius: var(--radius);
+  margin: 0 0 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
   color: var(--muted);
+  font-size: 12.5px;
   cursor: pointer;
-  font-size: 0.85rem;
-  transition: all 0.2s ease;
+  transition: background 0.12s, color 0.12s;
+  background: transparent;
 }
 .load-earlier:hover {
   background: var(--sunken);
   color: var(--text);
-  border-color: var(--line-strong);
+}
+.load-earlier:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
-/* 10. Smooth transitions */
-.ev-status-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  transition: background-color 0.3s ease, box-shadow 0.3s ease;
-}
+/* ═══════ ANSI Terminal Colors ═══════ */
+/* Foreground: standard */
+.ansi-fg-black   { color: #555; }
+.ansi-fg-red     { color: #e74c3c; }
+.ansi-fg-green   { color: #2ecc71; }
+.ansi-fg-yellow  { color: #f1c40f; }
+.ansi-fg-blue    { color: #3498db; }
+.ansi-fg-magenta { color: #9b59b6; }
+.ansi-fg-cyan    { color: #1abc9c; }
+.ansi-fg-white   { color: #ecf0f1; }
+/* Foreground: bright */
+.ansi-fg-bright-black   { color: #7f8c8d; }
+.ansi-fg-bright-red     { color: #ff6b6b; }
+.ansi-fg-bright-green   { color: #69f0ae; }
+.ansi-fg-bright-yellow  { color: #ffd93d; }
+.ansi-fg-bright-blue    { color: #74b9ff; }
+.ansi-fg-bright-magenta { color: #d980fa; }
+.ansi-fg-bright-cyan    { color: #81ecec; }
+.ansi-fg-bright-white   { color: #ffffff; }
+/* Background: standard */
+.ansi-bg-black   { background: #2c3e50; }
+.ansi-bg-red     { background: rgba(231,76,60,.2); }
+.ansi-bg-green   { background: rgba(46,204,113,.15); }
+.ansi-bg-yellow  { background: rgba(241,196,15,.15); }
+.ansi-bg-blue    { background: rgba(52,152,219,.15); }
+.ansi-bg-magenta { background: rgba(155,89,182,.15); }
+.ansi-bg-cyan    { background: rgba(26,188,156,.15); }
+.ansi-bg-white   { background: rgba(236,240,241,.15); }
+/* Background: bright */
+.ansi-bg-bright-black   { background: rgba(127,140,141,.2); }
+.ansi-bg-bright-red     { background: rgba(255,107,107,.2); }
+.ansi-bg-bright-green   { background: rgba(105,240,174,.15); }
+.ansi-bg-bright-yellow  { background: rgba(255,217,61,.15); }
+.ansi-bg-bright-blue    { background: rgba(116,185,255,.15); }
+.ansi-bg-bright-magenta { background: rgba(217,128,250,.15); }
+.ansi-bg-bright-cyan    { background: rgba(129,236,236,.15); }
+.ansi-bg-bright-white   { background: rgba(255,255,255,.1); }
+/* Decorations */
+.ansi-bold      { font-weight: 700; }
+.ansi-dim       { opacity: 0.65; }
+.ansi-italic    { font-style: italic; }
+.ansi-underline { text-decoration: underline; }
+.ansi-strike    { text-decoration: line-through; }
 
-/* 12. Keyboard focus */
-.ev:focus-within {
+/* ═══════ Focus & Keyboard ═══════ */
+.tool:focus-within {
+  outline: 2px solid color-mix(in srgb, var(--run) 50%, transparent);
+  outline-offset: 1px;
+}
+.ev button:focus-visible {
   outline: 2px solid var(--run);
-  outline-offset: 2px;
-  border-radius: var(--radius);
+  outline-offset: 1px;
+  border-radius: 6px;
 }
 
-/* 14. Neon glow effects */
-.step-running {
-  box-shadow: 0 0 10px color-mix(in srgb, var(--run) 30%, transparent);
-  border-color: var(--run);
+/* ═══════ Sub-agent Tree ═══════ */
+.subagent-tree {
+  margin: 4px 0 4px 24px;
+  padding-left: 16px;
+  border-left: 1px dashed color-mix(in srgb, var(--run) 30%, var(--line));
 }
-.step-active {
-  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 30%, transparent);
-}
-
-/* 15. File tree */
-.file-tree {
-  margin: 8px 0;
-  padding: 8px 12px;
-  background: var(--code-bg);
-  border-radius: var(--radius);
-  font-family: var(--mono);
-  font-size: 0.8rem;
-}
-
-.file-tree-item {
+.subagent-header {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 2px 0;
-  color: var(--text);
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+  padding: 4px 0;
 }
-.file-tree-item .type-icon {
-  color: var(--faint);
-  width: 14px;
-  height: 14px;
+.subagent-header .status {
+  width: 7px;
+  height: 7px;
 }
 
-/* 13. Mobile responsive */
+/* ═══════ File Change Tree ═══════ */
+.file-tree {
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.file-tree-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: 12px var(--mono);
+  color: var(--muted);
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--sunken);
+}
+.file-tree-item.added   { color: var(--ok); }
+.file-tree-item.removed { color: var(--err); }
+.file-tree-item.changed { color: var(--warn); }
+
+/* ═══════ Responsive ═══════ */
 @media (max-width: 760px) {
   .progress-hero {
-    flex-wrap: wrap;
-    gap: 8px;
+    margin: -8px -16px 8px;
+    padding: 8px 12px;
   }
-  .progress-hero-item {
-    flex: 1 1 30%;
+  .progress-cell {
+    padding: 3px 8px;
+  }
+  .progress-goal {
+    flex-basis: 100%;
+    max-width: none;
   }
 }
 
 @media (max-width: 375px) {
-  .tool-premium {
-    padding: 8px;
+  .progress-hero-inner {
+    gap: 0;
   }
-  .subagent-tree {
-    margin-left: 8px;
-    padding-left: 8px;
+  .progress-cell {
+    flex: 1 1 45%;
+  }
+  .step-group-items {
+    padding-left: 16px;
+    margin-left: 4px;
   }
 }
 
-/* 11. @media (prefers-reduced-motion: reduce) */
+/* ═══════ Reduced Motion ═══════ */
 @media (prefers-reduced-motion: reduce) {
-  *, ::before, ::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
+  .step-icon,
+  .tool.is-active,
+  .step-group-toggle,
+  .load-earlier,
+  .progress-bar-fill,
+  .ev-status-dot {
+    transition: none;
+  }
+  .pulse-dot {
+    animation: none;
+    opacity: 1;
   }
 }

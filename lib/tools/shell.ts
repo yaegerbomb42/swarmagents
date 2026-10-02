@@ -32,7 +32,7 @@ function childEnv(): NodeJS.ProcessEnv {
   // NOTE: saved tool keys are deliberately NOT exported here. The coordinator declined global
   // saved-key injection into the shell env (GROUP_CHAT 19:38): an agent-run `env` would expose every
   // saved credential at once. Keys stay reachable through api_request (host-scoped) and MCP per-server
-  // auth. redactSavedKeys below is still applied so no key ever reaches the transcript or a log file.
+  // auth; output paths are still passed through redactSavedKeys so no key reaches the transcript.
   return env;
 }
 

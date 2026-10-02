@@ -181,6 +181,13 @@ export function saveRuntimeSettings(s: RuntimeSettings): void {
 
 const APPROVALS_FILE = path.join(RUNTIME_DIR, "approvals.json");
 
+/**
+ * How long an approval stays valid. A resume normally consumes the grant within seconds; the window
+ * exists so a grant made just before a restart or a long tool step still counts, while an approval the
+ * user gave hours ago cannot silently authorise the same action deep into an unattended 24h+ run.
+ */
+export const APPROVAL_TTL_MS = 60 * 60 * 1000;
+
 export interface ApprovalGrant {
   taskId: string;
   hash: string;
@@ -205,7 +212,7 @@ export function grantApproval(g: ApprovalGrant): Promise<void> {
   return writeJson(APPROVALS_FILE, all);
 }
 
-/** Consume an approval if one exists for this action. Returns the grant, or null. */
+/** Consume an approval if one exists for this action and has not expired. Returns the grant, or null. */
 export function takeApproval(taskId: string, hash: string): ApprovalGrant | null {
   const all = loadApprovals();
   const key = approvalsKey(taskId, hash);
@@ -213,6 +220,9 @@ export function takeApproval(taskId: string, hash: string): ApprovalGrant | null
   if (!g) return null;
   delete all[key];
   void writeJson(APPROVALS_FILE, all);
+  // Consumed either way (single-use). An expired grant returns null so the caller re-parks and asks
+  // again: the safe default when the user is no longer watching.
+  if (Date.now() - g.grantedAt > APPROVAL_TTL_MS) return null;
   return g;
 }
 

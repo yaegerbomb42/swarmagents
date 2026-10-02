@@ -3,7 +3,7 @@
 // Locally there are no limits unless the env vars are set.
 //
 //   SWARM_QUOTA_RUNS   concurrent runs per account (server default 2)
-//   SWARM_QUOTA_STEPS  model steps per run (server default 300)
+//   SWARM_QUOTA_STEPS  model steps per run (server default 1000; a stopped run continues on the next message)
 
 import { currentUser } from "../store";
 
@@ -16,7 +16,7 @@ export function runQuota(userId = currentUser()) {
   const local = userId === "local";
   return {
     runs: num(process.env.SWARM_QUOTA_RUNS, local ? Infinity : 2),
-    steps: num(process.env.SWARM_QUOTA_STEPS, local ? Infinity : 300),
+    steps: num(process.env.SWARM_QUOTA_STEPS, local ? Infinity : 1000),
   };
 }
 

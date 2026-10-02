@@ -3,7 +3,7 @@ import { authenticate, endSession, startSession } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
 
-/** Sign in: { username, password } → session cookie. */
+/** Sign in: { username, password } → session cookie. "username" may be the account's email (the seeded admin). */
 export async function POST(req: Request) {
   if (!serverMode()) return Response.json({ error: "Accounts are only used on a hosted server." }, { status: 400 });
   if (throttled(req)) return Response.json({ error: "Too many attempts. Try again in a minute." }, { status: 429 });
@@ -11,7 +11,7 @@ export async function POST(req: Request) {
   const user = authenticate(String(username ?? "").trim(), String(password ?? ""));
   if (!user) {
     await noteFailure(req);
-    return Response.json({ error: "Wrong username or password." }, { status: 401 });
+    return Response.json({ error: "Wrong username, email or password." }, { status: 401 });
   }
   clearFailures(req);
   const res = Response.json({ ok: true, user: { username: user.username, isAdmin: user.isAdmin } });

@@ -14,6 +14,8 @@ import { takeApproval, isDenied } from "./runtime/store";
 import { subagentTool } from "./subagents";
 import { defaultCwd, identity } from "./sandbox";
 import { subagentPolicy } from "./subagent-settings";
+import { acquireRun, RunQuotaError, stepLimitReached } from "./tenant/quotas";
+import { storageBlock } from "./tenant/storage";
 
 const READ_ONLY = new Set(["read_file", "search", "web_search", "web_fetch"]);
 
@@ -272,6 +274,22 @@ class Session {
   }
 
   async loop() {
+    // Per-account limits on a server (lib/tenant): concurrent runs, and no new run once storage is full.
+    // A refused run keeps the user's message in history so nothing is lost; they can send again later.
+    let release: (() => void) | null = null;
+    const refuse = (text: string) => {
+      this.pushUser(this.drainInbox());
+      this.add({ type: "notice", level: "warn", text } as AgentEvent);
+      this.flush();
+    };
+    const full = storageBlock(0, {}, this.userId);
+    if (full) return refuse(full.message);
+    try {
+      release = acquireRun(this.meta.id, this.userId);
+    } catch (e) {
+      if (e instanceof RunQuotaError) return refuse(e.message);
+      throw e;
+    }
     this.setRunning(true);
     this.abort = new AbortController();
     const signal = this.abort.signal;
@@ -295,7 +313,14 @@ class Session {
     try {
       this.pushUser(this.drainInbox());
       // No step cap: a long task may take thousands of steps. Loops are caught by the repetition check below.
+      let steps = 0;
       for (;;) {
+        // Per-run step cap and the storage hard stop (2% grace so a run can finish writing its current step).
+        const stop = stepLimitReached(steps++, this.userId) ?? storageBlock(0, { grace: 0.02 }, this.userId)?.message;
+        if (stop) {
+          this.add({ type: "notice", level: "warn", text: stop } as AgentEvent);
+          break;
+        }
         await this.maybeCompact(signal, false);
         const turn = await this.runTurn(tools, signal);
         this.history.push({ role: "assistant", blocks: turn.blocks });
@@ -370,6 +395,7 @@ class Session {
     } finally {
       for (const ev of this.events) if ("done" in ev && ev.done === false) this.patch(ev, { done: true } as Partial<AgentEvent>);
       this.abort = null;
+      release?.();
       // Only a clean finish, an error or a user stop clears this; a crash leaves it set so boot resumes the run.
       if (!this.inbox.length || stopReason !== "done") this.setActive(false);
       this.flush();

@@ -179,7 +179,7 @@ export function usernameTaken(username: string) {
 
 export function authenticate(username: string, password: string): User | null {
   // Username, or the email an account was seeded with (the admin signs in with an email address).
-  const row = db().prepare(`SELECT * FROM users WHERE ${username.includes("@") ? "email" : "username"} = ? AND disabled = 0`).get(username.trim()) as Record<string, unknown> | undefined;
+  const row = db().prepare(`SELECT * FROM users WHERE ${username.includes("@") ? "email" : "username"} = ? AND disabled = 0`).get(username.includes("@") ? username.trim().toLowerCase() : username.trim()) as Record<string, unknown> | undefined;
   if (!row) {
     verifyPassword(password, DUMMY);
     return null;

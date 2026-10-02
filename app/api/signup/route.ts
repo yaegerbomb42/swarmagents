@@ -1,11 +1,13 @@
 import { checkOwnerToken, clearFailures, noteFailure, serverMode, sessionCookie, throttled } from "@/lib/auth";
+import { adminEmail } from "@/lib/tenant/admin";
 import { consumeInvite, createUser, inviteValid, signupMode, startSession, transaction, userCount, usernameTaken, validateCredentials } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
 
 /**
  * Create an account: { username, password, invite }. The very first account must present the owner token as its
- * invite and becomes the admin. After that, SWARM_SIGNUP decides: "invite" (default) needs an unused invite from
+ * invite and becomes the admin, unless SWARM_ADMIN_EMAIL is set (then the admin is seeded at boot and no sign-up is
+ * ever admin; a sign-up can't set an email). After that, SWARM_SIGNUP decides: "invite" (default) needs an unused invite from
  * an admin, "open" needs nothing, "closed" refuses.
  */
 export async function POST(req: Request) {
@@ -18,7 +20,9 @@ export async function POST(req: Request) {
   const bad = validateCredentials(username, password);
   if (bad) return Response.json({ error: bad }, { status: 400 });
 
-  const first = userCount() === 0;
+  // With SWARM_ADMIN_EMAIL configured, the admin comes only from bootstrapAdmin() at boot: no sign-up is ever admin.
+  // Without it (legacy installs), the very first account is the admin and must present the owner token.
+  const first = userCount() === 0 && !adminEmail();
   const mode = signupMode();
   if (!first && mode === "closed") return Response.json({ error: "Sign-ups are closed." }, { status: 403 });
   if (first && !checkOwnerToken(invite)) {

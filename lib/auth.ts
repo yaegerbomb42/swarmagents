@@ -14,6 +14,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { runAs } from "./store";
 import { SandboxUnavailableError } from "./sandbox";
 import { userForToken, type User } from "./users";
+import { storageBlock, storageFullResponse } from "./tenant/storage";
 
 export const AUTH_COOKIE = "swarm_auth";
 /** Set by middleware on every forwarded request (any client-sent value is overwritten): the signed-in user's id. */
@@ -145,6 +146,12 @@ export function scoped<A extends unknown[]>(handler: (req: Request, ...rest: A) 
     const user = requestUser(req);
     if (!user) return Response.json({ error: "Sign in required." }, { status: serverMode() ? 401 : 403 });
     try {
+      // Storage hard stop: at 100% of the account's quota, refuse new writes with a 507 and a clear message.
+      // Reads, deletes, sign-out and the storage page itself stay open so the user can always free space.
+      if (writeGated(req)) {
+        const full = storageBlock(0, {}, user.id);
+        if (full) return storageFullResponse(full);
+      }
       return await runAs(user.id, () => handler(req, ...rest));
     } catch (e) {
       // A multi-user server without its sandbox refuses tool work; say so instead of a bare 500.
@@ -152,4 +159,11 @@ export function scoped<A extends unknown[]>(handler: (req: Request, ...rest: A) 
       throw e;
     }
   };
+}
+
+/** Requests that add data, so the storage hard stop applies to them. */
+function writeGated(req: Request): boolean {
+  if (["GET", "HEAD", "OPTIONS", "DELETE"].includes(req.method)) return false;
+  const p = new URL(req.url).pathname;
+  return !/^\/api\/(storage|login|logout|signup|admin)(\/|$)/.test(p) && !/\/(stop|cancel|deny|reject)$/.test(p);
 }

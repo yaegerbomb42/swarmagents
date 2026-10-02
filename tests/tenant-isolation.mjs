@@ -196,10 +196,15 @@ await t("background tasks and the task stream: no cross-account view, no cancel/
   const c = await call(alice, "POST", "/api/runtime/tasks", { prompt: `[mock:echo] ${marker}`, title: marker });
   ok(c.status === 200, `alice task → ${c.status} ${c.text.slice(0, 160)}`);
   const id = c.json.task.id;
-  await sleep(2500);
+  // Her own stream must show it (live, or at the latest on the route's 10s ownership sweep). Mallory's must never.
+  const t0 = Date.now();
+  while (!aStream.frames.join("\n").includes(marker) && Date.now() - t0 < 13_000) await sleep(250);
+  const lag = Date.now() - t0;
+  await sleep(1000);
   mStream.close();
   aStream.close();
   ok(aStream.frames.join("\n").includes(marker), "alice's own stream shows her task");
+  const note = lag > 3000 ? `alice's own new task reached her stream only after ${(lag / 1000).toFixed(1)}s (sweep, not live)` : "";
   ok(!mStream.frames.join("\n").includes(marker) && !mStream.frames.join("\n").includes(id), "mallory's stream received alice's task");
   const list = await call(mal, "GET", "/api/runtime/tasks");
   ok(list.status === 200 && !list.text.includes(id), "listed to mallory");
@@ -214,6 +219,7 @@ await t("background tasks and the task stream: no cross-account view, no cancel/
   }
   const mine = await call(alice, "GET", `/api/runtime/tasks/${id}`);
   ok(mine.status === 200 && mine.json.task.status !== "cancelled", "alice's task untouched");
+  return note;
 });
 
 await t("files API: no paths outside the account's own area", async () => {

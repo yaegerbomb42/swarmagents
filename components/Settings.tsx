@@ -10,6 +10,8 @@ import type {
 import type { PublicConnection, TestResult } from "@/lib/connections";
 import { IArrowDown, IArrowUp, IX } from "./icons";
 import { SubagentSettings } from "./SubagentSettings";
+import { StorageSettings } from "./StorageSettings";
+import { AdminAnalytics } from "./AdminAnalytics";
 import "./settings.css";
 
 // Settings = every connection in one place: models (LLM providers, failover order), tool keys, MCP connectors.
@@ -609,6 +611,8 @@ export function Settings({
                 + Add a model, key or connector
               </button>
               <SubagentSettings />
+              <StorageSettings />
+              <AdminAnalytics />
             </>
           )}
 

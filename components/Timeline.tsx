@@ -7,6 +7,7 @@ import { IChevron, IFile } from "./icons";
 import { stepIcon, toolAccent } from "./StepIcons";
 import { AnsiRenderer, hasAnsi } from "./AnsiRenderer";
 import { PreviewChip, producedFiles } from "./FilePreview";
+import { BrowserView } from "./BrowserView";
 import "./timeline.css";
 
 type Ev<T extends AgentEvent["type"]> = Extract<AgentEvent, { type: T }>;
@@ -246,7 +247,8 @@ function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) =
   const live = e.status === "running" || e.status === "streaming";
   const [open, setOpen] = useState<boolean | null>(null);
   const now = useNow(live);
-  const shown = open ?? (live || e.status === "error" || !!e.images?.length);
+  // Browser steps are the ones a user wants to see unfold, so their window card opens by default.
+  const shown = open ?? (live || e.status === "error" || !!e.images?.length || e.name === "browser");
   const input = (e.input ?? {}) as Record<string, unknown>;
   const hasInput = Object.keys(input).length > 0;
   const inputText = hasInput ? JSON.stringify(input, null, 2) : e.inputPreview || "";

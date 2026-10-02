@@ -18,6 +18,12 @@ import { dueTasks, finishTask, getTask, listTasks, requeueTask, runningTasks, se
 import { loadRuntimeSettings } from "./store";
 
 const TICK_MS = 2000;
+/**
+ * How long stopTask waits for an aborted run to unwind before it answers anyway. Long enough for a
+ * cooperative tool to finish its current step, short enough that pause/cancel never feels hung when a
+ * tool ignores the abort signal.
+ */
+const STOP_SETTLE_MS = 8000;
 
 class Scheduler {
   private timer: NodeJS.Timeout | null = null;
@@ -29,7 +35,7 @@ class Scheduler {
    * agent directly. It also lets a late-settling run detect that it has been superseded and
    * must not overwrite the newer state.
    */
-  private active = new Map<string, { controller: AbortController; runId: string; attempt: number }>();
+  private active = new Map<string, { controller: AbortController; runId: string; attempt: number; settled: Promise<void> }>();
 
   start() {
     if (this.started) return;
@@ -69,18 +75,28 @@ class Scheduler {
   }
 
   /**
-   * Stop the live run for a task, if any, and hand back the task to the caller after it has
-   * settled. Aborting through the scheduler's own controller is what makes pause/cancel
-   * reliable: the agent stops, the run unwinds, and the stale-completion guard (isCurrent)
-   * keeps that unwinding run from overwriting the state the caller sets next.
+   * Stop the live run for a task and hand the task back to the caller once the run has settled.
+   * Aborting through the scheduler's own controller is what makes pause/cancel reliable: the agent
+   * stops, the run unwinds, and the stale-completion guard (isCurrent) keeps that unwinding run from
+   * overwriting the state the caller sets next.
+   *
+   * A tool that ignores the abort signal can keep a run alive past the moment we want to answer the
+   * user, so we wait only up to STOP_SETTLE_MS. If the run has not settled by then we still release
+   * the slot (so pause/cancel is never wedged) and report false, letting the caller represent the
+   * task as "stopping" instead of falsely "stopped" while side effects may still be unwinding.
    */
-  async stopTask(taskId: string): Promise<void> {
+  async stopTask(taskId: string): Promise<boolean> {
     const run = this.active.get(taskId);
-    if (!run) return;
-    run.controller.abort();
-    // Give the in-flight run a moment to settle so its guarded transitions don't race ours.
-    await Promise.resolve();
+    if (!run) return true;
+    // Retire the run from the registry *before* unwinding so its stale-completion guard sees it as
+    // superseded and records "interrupted" instead of writing done/failed over the pause/cancel.
     this.active.delete(taskId);
+    run.controller.abort();
+    const settled = await Promise.race([
+      run.settled.then(() => true),
+      new Promise<boolean>((r) => setTimeout(() => r(false), STOP_SETTLE_MS).unref?.()),
+    ]);
+    return settled;
   }
 
   /** Is this run still the one we are tracking for the task? False once stopped or superseded. */
@@ -123,7 +139,11 @@ class Scheduler {
     await addStep(taskId, run.id, { kind: "checkpoint", label: `Attempt ${attempt} started`, detail: running.prompt.slice(0, 200) });
 
     const controller = new AbortController();
-    this.active.set(taskId, { controller, runId: run.id, attempt });
+    // A promise that resolves when this run's finally block has run. stopTask awaits it (bounded) so
+    // pause/cancel only reports "stopped" once the run has actually handed control back.
+    let markSettled!: () => void;
+    const settled = new Promise<void>((r) => (markSettled = r));
+    this.active.set(taskId, { controller, runId: run.id, attempt, settled });
     let parked = false;
     // Recorder hook promises. They are fire-and-forget during the run so hooks never
     // block the agent, but we flush them before any decision that reads usage (budget).
@@ -213,6 +233,8 @@ class Scheduler {
     } finally {
       // Release the slot only if we are still the registered run; a newer attempt owns it otherwise.
       if (this.isCurrent(taskId, run.id)) this.active.delete(taskId);
+      // Wake any stopTask that is waiting on this run to unwind.
+      markSettled();
     }
   }
 }

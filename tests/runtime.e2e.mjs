@@ -166,7 +166,8 @@ scheduler().kick();
 await until(() => getTask(t7.id)?.status === "running", 8000);
 check("task is running before pause", getTask(t7.id)?.status === "running", getTask(t7.id)?.status);
 // Mirror the API route: stop through the scheduler, then hold the task (blocked, needs input).
-await scheduler().stopTask(t7.id);
+const stopSettled = await scheduler().stopTask(t7.id);
+check("stopTask reports the run settled for a cooperative tool", stopSettled === true, String(stopSettled));
 await updateTask(t7.id, (t) => {
   t.status = "blocked";
   t.wait = { kind: "input", message: "Paused by the user. Press Resume to continue." };

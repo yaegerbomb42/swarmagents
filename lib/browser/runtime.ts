@@ -111,3 +111,176 @@ function browserEnv() {
 
 const fmtSize = (n: number) =>
   n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
+
+function uniquePath(dir: string, name: string) {
+  const safe = (name || "download").replace(/[/\\:\0]/g, "_").slice(0, 180);
+  const ext = path.extname(safe);
+  const stem = safe.slice(0, safe.length - ext.length);
+  let file = path.join(dir, safe);
+  for (let i = 2; fs.existsSync(file); i++) file = path.join(dir, `${stem} (${i})${ext}`);
+  return file;
+}
+
+/** One isolated browser session: its own Chromium context, profile, downloads and limits. */
+export class BrowserSession {
+  readonly key: string;
+  readonly dir: string;
+  readonly downloadsDir: string;
+  readonly limits: BrowserLimits;
+  readonly startedAt = Date.now();
+  lastActiveAt = Date.now();
+  controller: "agent" | "user" = "agent";
+  paused = false;
+  note?: string;
+  pointer: BrowserPointer | null = null;
+  frames = 0;
+
+  private ctx: BrowserContext | null = null;
+  private launching: Promise<BrowserContext> | null = null;
+  private active: Page | null = null;
+  private cdp: CDPSession | null = null;
+  private frameSubs = new Set<(f: ScreencastFrame) => void>();
+  private eventSubs = new Set<(e: BrowserEvent) => void>();
+  private recent: string[] = [];
+  private downloadList: { name: string; bytes: number; path: string; at: number }[] = [];
+  private downloadedBytes = 0;
+  private pendingDownloads = new Set<Promise<void>>();
+  private screencastOn = false;
+  private closed = false;
+  private waiters = new Set<() => void>();
+  private watched = new WeakSet<Page>();
+
+  constructor(key: string, limits: BrowserLimits = DEFAULT_LIMITS, root = path.join(ROOT, "browsers")) {
+    this.key = key;
+    this.limits = limits;
+    this.dir = path.join(root, keySlug(key));
+    this.downloadsDir = path.join(this.dir, "downloads");
+  }
+
+  // ---- events ----
+
+  private emitSpec(e: BrowserEvent) {
+    for (const cb of this.eventSubs) {
+      try {
+        cb(e);
+      } catch {}
+    }
+  }
+
+  emit(e: BrowserEvent) {
+    this.emitSpec(e);
+  }
+
+  /** A human-readable happening (download, dialog, popup) surfaced with the next observation. */
+  log(text: string) {
+    this.recent.push(text);
+    if (this.recent.length > 50) this.recent.shift();
+  }
+
+  /** Take (and clear) the happenings since the last call. */
+  drainNotes() {
+    return this.recent.splice(0);
+  }
+
+  onFrame(cb: (f: ScreencastFrame) => void) {
+    this.frameSubs.add(cb);
+    if (this.screencastOn) void this.startScreencast();
+    return () => this.frameSubs.delete(cb);
+  }
+
+  onEvent(cb: (e: BrowserEvent) => void) {
+    this.eventSubs.add(cb);
+    return () => this.eventSubs.delete(cb);
+  }
+
+  touch() {
+    this.lastActiveAt = Date.now();
+  }
+
+  get isClosed() {
+    return this.closed;
+  }
+
+  // ---- lifecycle ----
+
+  private launchOptions() {
+    const exe = process.env.SWARM_CHROME_PATH || process.env.CHROME_PATH;
+    const args = [`--window-size=${this.limits.viewport.width},${this.limits.viewport.height}`];
+    if (process.platform === "linux") args.push("--disable-dev-shm-usage");
+    if (process.env.SWARM_BROWSER_NO_SANDBOX === "1") args.push("--no-sandbox");
+    const h = headless();
+    return {
+      exe,
+      base: {
+        headless: h,
+        acceptDownloads: true,
+        args,
+        env: browserEnv(),
+        viewport: h ? this.limits.viewport : null,
+      },
+    };
+  }
+
+  /** Launch (or reuse) the isolated persistent context. Clears a stale profile lock left by a crash. */
+  async context(): Promise<BrowserContext> {
+    if (this.closed) throw new Error("This browser session was closed.");
+    if (this.ctx) return this.ctx;
+    if (this.launching) return this.launching;
+    fs.mkdirSync(this.dir, { recursive: true });
+    fs.mkdirSync(this.downloadsDir, { recursive: true });
+    const { exe, base } = this.launchOptions();
+    const attempt = () =>
+      (exe
+        ? chromium.launchPersistentContext(this.dir, { ...base, executablePath: exe })
+        : chromium
+            .launchPersistentContext(this.dir, { ...base, channel: "chrome" })
+            .catch(() => chromium.launchPersistentContext(this.dir, { ...base, viewport: base.viewport ?? this.limits.viewport }))) as Promise<BrowserContext>;
+    const self = this;
+    this.launching = (async function launch() {
+      try {
+        return await attempt();
+      } catch (first) {
+        // A crashed browser leaves SingletonLock behind; Chrome then refuses to start. Clear and retry once.
+        for (const f of ["SingletonLock", "SingletonCookie", "SingletonSocket"])
+          try {
+            fs.rmSync(path.join(self.dir, f), { force: true });
+          } catch {}
+        try {
+          return await attempt();
+        } catch (second) {
+          throw new Error(self.explainLaunchError(second ?? first));
+        }
+      }
+    })();
+    try {
+      const c = await this.launching;
+      this.ctx = c;
+      c.on("close", () => this.hardClose("browser closed"));
+      c.on("page", (p) => {
+        this.watch(p);
+        if (this.active && !this.active.isClosed()) this.log("A new tab opened; now controlling it. Use tab_switch to go back.");
+        this.active = p;
+        this.emitSpec({ type: "tab", ts: Date.now(), key: this.key, index: c.pages().indexOf(p) + 1, count: c.pages().length, url: p.url() });
+      });
+      c.pages().forEach((p) => this.watch(p));
+      this.active = c.pages().find((p) => !p.isClosed()) ?? null;
+      this.emitSpec({ type: "notice", ts: Date.now(), key: this.key, text: "Browser started (isolated profile).", level: "info" });
+      void this.startScreencast();
+      return c;
+    } catch (e) {
+      this.launching = null;
+      this.ctx = null;
+      throw e;
+    }
+  }
+
+  private explainLaunchError(e: unknown) {
+    const msg = String((e as Error)?.message ?? e);
+    if (/Executable doesn't exist|not found|ENOENT|install/i.test(msg))
+      return "No Chrome/Chromium is installed for the browser tool. Install Google Chrome (desktop) or chromium (server) and set SWARM_CHROME_PATH if it isn't on the default path.";
+    if (/display|X server|ozone/i.test(msg)) return "Chrome couldn't open a window (no display). Set SWARM_BROWSER_HEADLESS=1 to run it headless.";
+    if (/SingletonLock|ProcessSingleton|profile appears to be in use/i.test(msg))
+      return "The browser profile was locked by another process; the lock was cleared and the retry also failed. Try again.";
+    return `Couldn't start the browser: ${msg.split("\n")[0]}`;
+  }
+}

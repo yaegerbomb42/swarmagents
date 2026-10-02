@@ -3,13 +3,14 @@ import { mcpServerDef } from "@/lib/connections";
 import { McpOAuthProvider } from "@/lib/mcp-oauth";
 
 import { publicOrigin, redirectTo } from "@/lib/http";
+import { scoped } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
 // One-click sign-in for a remote MCP server: discovery, dynamic client registration and PKCE via the MCP SDK.
 // GET ?name=<server> redirects the browser to the server's login page; the callback stores the tokens.
 
-export async function GET(req: Request) {
+async function handleGET(req: Request) {
   const u = new URL(req.url);
   const name = u.searchParams.get("name") ?? "";
   const back = (q: string) => redirectTo(`/?${q}`);
@@ -27,3 +28,6 @@ export async function GET(req: Request) {
     return back(`connect_error=${encodeURIComponent(`${name}: ${msg.slice(0, 160)}`)}`);
   }
 }
+
+// Every handler runs as the signed-in account, so all storage it touches is that account's (lib/store userHome()).
+export const GET = scoped(handleGET);

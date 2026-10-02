@@ -1,5 +1,6 @@
 import { InputError, catalog, deleteConnection, listConnections, reorderProviders, setEnabled, upsertConnection, type ConnectionInput } from "@/lib/connections";
 import type { ConnType } from "@/lib/presets";
+import { scoped } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -23,12 +24,12 @@ async function body<T>(req: Request): Promise<T> {
   }
 }
 
-export async function GET() {
+async function handleGET() {
   return list({ catalog: catalog() });
 }
 
 /** Upsert: { type, id?, preset, ...fields }. Toggle only: { type, id, enabled }. */
-export async function POST(req: Request) {
+async function handlePOST(req: Request) {
   try {
     const b = await body<ConnectionInput>(req);
     if (!TYPES.includes(b.type)) throw new InputError("Unknown connection type.");
@@ -45,7 +46,7 @@ export async function POST(req: Request) {
 }
 
 /** Reorder LLM providers (failover priority): { order: string[] }. */
-export async function PUT(req: Request) {
+async function handlePUT(req: Request) {
   try {
     const { order } = await body<{ order: unknown }>(req);
     if (!Array.isArray(order) || order.some((x) => typeof x !== "string")) throw new InputError("order must be a list of provider ids.");
@@ -57,7 +58,7 @@ export async function PUT(req: Request) {
 }
 
 /** DELETE ?type=llm|tool|mcp&id=… */
-export async function DELETE(req: Request) {
+async function handleDELETE(req: Request) {
   try {
     const u = new URL(req.url);
     const type = u.searchParams.get("type") as ConnType;
@@ -69,3 +70,9 @@ export async function DELETE(req: Request) {
     return fail(e);
   }
 }
+
+// Every handler runs as the signed-in account, so all storage it touches is that account's (lib/store userHome()).
+export const GET = scoped(handleGET);
+export const POST = scoped(handlePOST);
+export const PUT = scoped(handlePUT);
+export const DELETE = scoped(handleDELETE);

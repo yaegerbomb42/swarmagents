@@ -51,21 +51,28 @@ export async function POST(req: Request, { params }: Ctx) {
   switch (body.action) {
     case "cancel": {
       // Stop the live run through the scheduler first so it cannot overwrite the cancelled
-      // state when it unwinds, then mark cancelled.
-      await scheduler().stopTask(id);
+      // state when it unwinds, then mark cancelled. If the run ignored the abort and did not
+      // settle in time, say so rather than implying its side effects have stopped.
+      const settled = await scheduler().stopTask(id);
       await cancelTask(id);
       clearApprovals(id);
       clearDenials(id);
+      if (!settled) {
+        await addStep(id, "", { kind: "notice", label: "Cancellation requested", detail: "A running tool is still unwinding; it will be told to stop but may finish its current step." });
+      }
       return Response.json({ task: getTask(id) });
     }
     case "pause": {
       // Pause holds the task for the user, so it must NOT auto-resume: block on input rather
       // than waiting (a waiting task with no resumeAt is treated as due and would restart).
-      await scheduler().stopTask(id);
+      const settled = await scheduler().stopTask(id);
       await updateTask(id, (t) => {
         t.status = "blocked";
         t.wait = { kind: "input", message: "Paused by the user. Press Resume to continue." };
       });
+      if (!settled) {
+        await addStep(id, "", { kind: "notice", label: "Pause requested", detail: "A running tool ignored the stop signal and is finishing its current step." });
+      }
       return Response.json({ task: getTask(id) });
     }
     case "approve": {

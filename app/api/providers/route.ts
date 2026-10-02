@@ -2,6 +2,7 @@ import { getLimits, getProviders } from "@/lib/store";
 import { PRESETS } from "@/lib/presets";
 import { InputError, keyHint, deleteConnection, reorderProviders, setEnabled, upsertConnection, type ConnectionInput } from "@/lib/connections";
 import type { PublicProvider } from "@/lib/types";
+import { scoped } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
@@ -19,12 +20,12 @@ function publicList(): PublicProvider[] {
 
 const fail = (e: unknown) => Response.json({ error: e instanceof InputError ? e.message : "Couldn't save the provider.", providers: publicList() }, { status: e instanceof InputError ? 400 : 500 });
 
-export async function GET() {
+async function handleGET() {
   return Response.json({ providers: publicList(), presets: PRESETS });
 }
 
 /** Upsert. Omitting apiKey on an existing provider keeps the stored key. */
-export async function POST(req: Request) {
+async function handlePOST(req: Request) {
   try {
     const body = (await req.json()) as Omit<ConnectionInput, "type"> & { kind?: string };
     if (body.id && Object.keys(body).every((k) => k === "id" || k === "enabled")) setEnabled("llm", body.id, !!body.enabled);
@@ -36,7 +37,7 @@ export async function POST(req: Request) {
 }
 
 /** Reorder: body { order: string[] } */
-export async function PUT(req: Request) {
+async function handlePUT(req: Request) {
   try {
     const { order } = (await req.json()) as { order: string[] };
     reorderProviders(Array.isArray(order) ? order.map(String) : []);
@@ -46,8 +47,14 @@ export async function PUT(req: Request) {
   }
 }
 
-export async function DELETE(req: Request) {
+async function handleDELETE(req: Request) {
   const id = new URL(req.url).searchParams.get("id");
   if (id) deleteConnection("llm", id);
   return Response.json({ providers: publicList() });
 }
+
+// Every handler runs as the signed-in account, so all storage it touches is that account's (lib/store userHome()).
+export const GET = scoped(handleGET);
+export const POST = scoped(handlePOST);
+export const PUT = scoped(handlePUT);
+export const DELETE = scoped(handleDELETE);

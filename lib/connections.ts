@@ -6,7 +6,7 @@ import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotoc
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
-import { HOME, MCP_CONFIG, getLimits, getProviders, newId, saveProviders } from "./store";
+import { currentUser, getLimits, getProviders, mcpConfig, newId, saveProviders, userHome } from "./store";
 import { MCP_PRESETS, PRESETS, TOOL_PRESETS, apiAccess, fillTemplate, mcpPreset, presetFor, toolPreset, type ConnType, type McpTransport } from "./presets";
 import { testProvider } from "./providers";
 import { McpOAuthProvider, forgetMcpAuth, hasMcpTokens } from "./mcp-oauth";
@@ -19,9 +19,13 @@ import type { LearnedLimits, ProviderConfig } from "./types";
 //   mcp  -> mcp.json       { mcpServers: { name: def } }     (lib/tools/mcp.ts; same shape as Claude's)
 // Every file is written atomically at mode 0600. Secrets never leave the server: the browser gets a hint.
 
-const CONNECTIONS = path.join(HOME, "connections.json");
+// Per account: on a server every signed-in user has their own connections.json and mcp.json under userHome().
+const connectionsFile = () => path.join(userHome(), "connections.json");
 const CLAUDE_CODE = path.join(os.homedir(), ".claude.json");
 const CLAUDE_DESKTOP = path.join(os.homedir(), "Library/Application Support/Claude/claude_desktop_config.json");
+/** Claude Code / Claude Desktop servers belong to whoever owns this machine: only the local user gets them, never
+ *  server accounts (their env often holds the machine owner's secrets). */
+const hostMcpFile = (f: string) => (currentUser() === "local" ? readMcpFile(f) : {});
 
 export interface ToolKey {
   id: string;
@@ -179,22 +183,22 @@ function validUrl(u: string, field = "URL") {
 // ---------- tool keys ----------
 
 function loadTools(): ToolKey[] {
-  const file = readJson<{ tools?: ToolKey[]; importedLegacySearch?: boolean }>(CONNECTIONS, {});
+  const file = readJson<{ tools?: ToolKey[]; importedLegacySearch?: boolean }>(connectionsFile(), {});
   const tools = file.tools ?? [];
   // One-time import of the older single search key (settings.json `search`) so it shows up here.
   if (!file.importedLegacySearch) {
     // Only the stored key: env keys are read live and must not be copied to disk.
-    const legacy = readJson<{ search?: { provider?: string; apiKey?: string } }>(path.join(HOME, "settings.json"), {}).search;
+    const legacy = readJson<{ search?: { provider?: string; apiKey?: string } }>(path.join(userHome(), "settings.json"), {}).search;
     const preset = legacy && TOOL_PRESETS.find((p) => p.id === legacy.provider);
     if (legacy?.apiKey && preset && !tools.some((t) => t.preset === preset.id)) tools.push({ id: newId(), preset: preset.id, label: preset.label, envVar: preset.envVar, apiKey: legacy.apiKey, enabled: true });
-    if (legacy?.apiKey) writeJson(CONNECTIONS, { ...file, version: 1, tools, importedLegacySearch: true });
+    if (legacy?.apiKey) writeJson(connectionsFile(), { ...file, version: 1, tools, importedLegacySearch: true });
   }
   return tools;
 }
 
 function saveTools(tools: ToolKey[]) {
-  const cur = readJson<Record<string, unknown>>(CONNECTIONS, {});
-  writeJson(CONNECTIONS, { ...cur, version: 1, tools });
+  const cur = readJson<Record<string, unknown>>(connectionsFile(), {});
+  writeJson(connectionsFile(), { ...cur, version: 1, tools });
 }
 
 /** The key for a tool service (e.g. "brave"), from Settings or else the environment. */
@@ -202,6 +206,9 @@ export function getToolKey(service: string): string | undefined {
   const t = loadTools().find((k) => k.preset === service && k.enabled && k.apiKey);
   if (t) return t.apiKey;
   const envVar = TOOL_PRESETS.find((p) => p.id === service)?.envVar;
+  // The machine's environment is the local owner's. Server accounts bring their own keys and never borrow the
+  // operator's (an env GITHUB_TOKEN would otherwise let any account act as the operator through api_request).
+  if (currentUser() !== "local") return undefined;
   return (envVar && process.env[envVar]) || undefined;
 }
 
@@ -249,17 +256,17 @@ interface McpFile {
 const readMcpFile = (f: string) => readJson<McpFile>(f, {}).mcpServers ?? {};
 
 function saveSwarmMcp(servers: Record<string, McpDef>) {
-  const cur = readJson<McpFile>(MCP_CONFIG, {});
-  writeJson(MCP_CONFIG, { ...cur, mcpServers: servers });
+  const cur = readJson<McpFile>(mcpConfig(), {});
+  writeJson(mcpConfig(), { ...cur, mcpServers: servers });
 }
 
 const mcpTransport = (d: McpDef): McpTransport => (d.url ? (d.type === "sse" ? "sse" : "http") : "stdio");
 
 /** All MCP servers with their source; mcp.json entries override same-named imports (same rule as the loader). */
 function allMcp(): { name: string; def: McpDef; source: McpSource; overridden: boolean }[] {
-  const desktop = readMcpFile(CLAUDE_DESKTOP);
-  const code = readMcpFile(CLAUDE_CODE);
-  const swarm = readMcpFile(MCP_CONFIG);
+  const desktop = hostMcpFile(CLAUDE_DESKTOP);
+  const code = hostMcpFile(CLAUDE_CODE);
+  const swarm = readMcpFile(mcpConfig());
   const out = new Map<string, { name: string; def: McpDef; source: McpSource; overridden: boolean }>();
   for (const [name, def] of Object.entries(desktop)) out.set(name, { name, def, source: "claude-desktop", overridden: false });
   for (const [name, def] of Object.entries(code)) out.set(name, { name, def, source: "claude-code", overridden: false });
@@ -340,7 +347,7 @@ export function listConnections(): PublicConnection[] {
       type: "mcp",
       preset,
       label: def.label ?? (def.preset && p ? p.label : name),
-      status: (globalThis as unknown as { __swarmMcpStatus?: Record<string, string> }).__swarmMcpStatus?.[name],
+      status: (globalThis as unknown as { __swarmMcpStatus?: Record<string, string> }).__swarmMcpStatus?.[`${currentUser()}\u0000${name}`],
       enabled: !def.disabled,
       keyHint: mcpKeyHint(def),
       transport: mcpTransport(def),
@@ -463,7 +470,7 @@ export function upsertConnection(input: ConnectionInput): { id: string } {
     saveTools(list);
     return { id: next.id };
   }
-  const swarm = readMcpFile(MCP_CONFIG);
+  const swarm = readMcpFile(mcpConfig());
   const all = allMcp();
   const found = input.id ? all.find((s) => s.name === input.id) : undefined;
   if (input.id && !found) throw new InputError("That server no longer exists.");
@@ -491,7 +498,7 @@ export function setEnabled(type: ConnType, id: string, enabled: boolean) {
   } else {
     const s = allMcp().find((x) => x.name === id);
     if (!s) throw new InputError("Not found.");
-    const swarm = readMcpFile(MCP_CONFIG);
+    const swarm = readMcpFile(mcpConfig());
     swarm[id] = { ...s.def, disabled: enabled ? undefined : true };
     saveSwarmMcp(swarm);
     mcpChanged(id);
@@ -504,8 +511,8 @@ export function deleteConnection(type: ConnType, id: string) {
   else {
     const s = allMcp().find((x) => x.name === id);
     if (!s) return;
-    const swarm = readMcpFile(MCP_CONFIG);
-    const imported = readMcpFile(CLAUDE_CODE)[id] ?? readMcpFile(CLAUDE_DESKTOP)[id];
+    const swarm = readMcpFile(mcpConfig());
+    const imported = hostMcpFile(CLAUDE_CODE)[id] ?? hostMcpFile(CLAUDE_DESKTOP)[id];
     // Imported servers live in Claude's config, which we never edit; "removing" hides them here instead.
     if (imported) swarm[id] = { ...imported, disabled: true };
     else delete swarm[id];
@@ -673,7 +680,9 @@ export function mcpEnv(own: Record<string, string> = {}): Record<string, string>
   const env: Record<string, string> = getDefaultEnvironment();
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined && MCP_PASSTHROUGH.test(k)) env[k] = v;
   const keys = toolEnv();
-  const lookup = (name: string) => (name.startsWith("SWARM_") ? "" : (keys[name] ?? process.env[name] ?? ""));
+  // ${VAR} falls back to the machine's environment only for the local owner; server accounts can't read it this way.
+  const local = currentUser() === "local";
+  const lookup = (name: string) => (name.startsWith("SWARM_") ? "" : (keys[name] ?? (local ? process.env[name] : undefined) ?? ""));
   for (const [k, v] of Object.entries(own)) {
     if (k.startsWith("SWARM_")) continue;
     env[k] = String(v).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g, (_, name: string, dflt?: string) => lookup(name) || dflt || "");

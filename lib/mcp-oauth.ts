@@ -3,13 +3,14 @@ import path from "node:path";
 import crypto from "node:crypto";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { HOME } from "./store";
+import { currentUser, userHome } from "./store";
 
 // OAuth for remote MCP servers (Linear, Notion, Sentry…): discovery, dynamic client registration and PKCE
 // are done by the MCP SDK; this file persists the results per server in ~/.swarmagents/mcp-auth/<name>.json
 // (mode 0600) so tokens survive restarts and refresh automatically during long runs.
 
-const DIR = path.join(HOME, "mcp-auth");
+// Per account: OAuth tokens for remote connectors live under the signed-in user's home.
+const dir = () => path.join(userHome(), "mcp-auth");
 
 interface Saved {
   redirectUrl?: string;
@@ -19,7 +20,7 @@ interface Saved {
   verifier?: string;
 }
 
-const fileFor = (name: string) => path.join(DIR, `${name.replace(/[^a-zA-Z0-9_.-]/g, "_")}.json`);
+const fileFor = (name: string) => path.join(dir(), `${name.replace(/[^a-zA-Z0-9_.-]/g, "_")}.json`);
 
 function load(name: string): Saved {
   try {
@@ -30,7 +31,7 @@ function load(name: string): Saved {
 }
 
 function save(name: string, patch: Partial<Saved>) {
-  fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(dir(), { recursive: true, mode: 0o700 });
   const next = { ...load(name), ...patch };
   const f = fileFor(name);
   const tmp = `${f}.${process.pid}.tmp`;
@@ -47,7 +48,8 @@ export function forgetMcpAuth(name: string) {
 }
 
 // In-flight logins: OAuth `state` -> server name. Kept on globalThis so dev hot reloads don't drop a login.
-const g = globalThis as unknown as { __mcpOAuthStates?: Map<string, { name: string; at: number }> };
+// Each state is bound to the account that started the login, so a callback can only finish its own user's login.
+const g = globalThis as unknown as { __mcpOAuthStates?: Map<string, { name: string; at: number; user: string }> };
 export const pendingStates = (g.__mcpOAuthStates ??= new Map());
 
 export class McpOAuthProvider implements OAuthClientProvider {
@@ -80,7 +82,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   state() {
-    pendingStates.set(this.stateValue, { name: this.name, at: Date.now() });
+    pendingStates.set(this.stateValue, { name: this.name, at: Date.now(), user: currentUser() });
     for (const [k, v] of pendingStates) if (Date.now() - v.at > 15 * 60_000) pendingStates.delete(k);
     return this.stateValue;
   }

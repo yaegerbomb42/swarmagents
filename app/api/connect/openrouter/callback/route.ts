@@ -1,17 +1,23 @@
 import { getProviders, newId, saveProviders } from "@/lib/store";
 import { presetFor } from "@/lib/presets";
 import { verifiers } from "@/lib/oauth";
+import { currentUser } from "@/lib/store";
 import { redirectTo } from "@/lib/http";
+import { scoped } from "@/lib/auth";
+
+// Which account started each OpenRouter login (verifier -> user), so a callback only finishes its own user's login.
+const owners = ((globalThis as unknown as { __swarmOrOwners?: Map<string, string> }).__swarmOrOwners ??= new Map<string, string>());
 
 export const dynamic = "force-dynamic";
 
-export async function GET(req: Request) {
+async function handleGET(req: Request) {
   const u = new URL(req.url);
   const code = u.searchParams.get("code");
   const verifier = u.searchParams.get("v") ?? "";
   const back = (q: string) => redirectTo(`/?${q}`);
-  if (!code || !verifiers.has(verifier)) return back("connect_error=openrouter");
+  if (!code || !verifiers.has(verifier) || owners.get(verifier) !== currentUser()) return back("connect_error=openrouter");
   verifiers.delete(verifier);
+  owners.delete(verifier);
   let r: Response;
   try {
     r = await fetch("https://openrouter.ai/api/v1/auth/keys", {
@@ -37,3 +43,6 @@ export async function GET(req: Request) {
   saveProviders(list);
   return back("connected=openrouter");
 }
+
+// Every handler runs as the signed-in account, so all storage it touches is that account's (lib/store userHome()).
+export const GET = scoped(handleGET);

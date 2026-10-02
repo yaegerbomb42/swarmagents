@@ -8,6 +8,28 @@ export { isAllowed as isLocal } from "./lib/auth";
 /** Reachable signed out: the sign-in page and the endpoints it uses. */
 const PUBLIC = new Set(["/login", "/api/login", "/api/signup", "/api/me"]);
 
+/** Never let an untrusted X-Forwarded-Host turn the sign-in redirect into an open redirect. */
+function redirectOrigin(req: NextRequest): string {
+  const allowed = (process.env.SWARM_ALLOWED_HOSTS ?? "")
+    .split(",")
+    .map((h) => h.trim().toLowerCase().split(":")[0])
+    .filter(Boolean);
+  const fallbackHost = req.headers.get("host") ?? ""; // hostAllowed(req) checked this at the top of middleware.
+  const forwardedHost = (req.headers.get("x-forwarded-host") ?? "").trim();
+  let host = fallbackHost;
+  if (allowed.length && forwardedHost && !/[\\/@?#,]/.test(forwardedHost)) {
+    try {
+      const parsed = new URL(`http://${forwardedHost}`);
+      if (parsed.pathname === "/" && !parsed.username && !parsed.password && allowed.includes(parsed.hostname.toLowerCase())) host = parsed.host;
+    } catch {
+      // Ignore malformed proxy metadata and keep the already allowlisted Host.
+    }
+  }
+  const forwardedProto = (req.headers.get("x-forwarded-proto") ?? "").trim().toLowerCase();
+  const proto = forwardedProto === "http" || forwardedProto === "https" ? forwardedProto : req.nextUrl.protocol.replace(":", "");
+  return `${proto}://${host}`;
+}
+
 export function middleware(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
   if (!hostAllowed(req)) return new NextResponse("forbidden", { status: 403 });
@@ -22,9 +44,7 @@ export function middleware(req: NextRequest) {
     if (pathname.startsWith("/api/")) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
     // Build the target from the public Host header (already allowlisted): behind the proxy req.url carries the
     // internal host and port, and middleware rejects relative Locations.
-    const proto = req.headers.get("x-forwarded-proto") ?? req.nextUrl.protocol.replace(":", "");
-    const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host");
-    return NextResponse.redirect(`${proto}://${host}/login?next=${encodeURIComponent(pathname + search)}`, 303);
+    return NextResponse.redirect(`${redirectOrigin(req)}/login?next=${encodeURIComponent(pathname + search)}`, 303);
   }
   // Local mode: one canonical origin (127.0.0.1) so localStorage and the OAuth callback don't split across
   // localhost/127.0.0.1. Document navigations only; API/fetch/SSE on localhost keep working.

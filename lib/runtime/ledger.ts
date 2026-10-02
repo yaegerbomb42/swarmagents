@@ -12,6 +12,9 @@ import { appendStep, loadLedger, rtId, withLedger } from "./store";
 import { getTask, updateTask } from "./tasks";
 import type { RunRecord, RunUsage, StepRecord } from "./types";
 
+/** How many recent runs we retain per task. Older attempts are dropped; the UI shows recent history. */
+const RUN_KEEP = 200;
+
 export async function addStep(
   taskId: string,
   runId: string,

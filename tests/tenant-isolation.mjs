@@ -112,6 +112,13 @@ async function run(who, text, timeout = 90_000) {
 console.log(`tenant-isolation against ${BASE}${MOCK ? ` (agent runs via ${MOCK})` : " (no TENANT_MOCK: API checks only)"}`);
 
 const anon = null;
+// A brand-new server may still want the first account to present a bootstrap invite (older account layer). For a
+// throwaway test server only: TENANT_FIRST_INVITE creates a scratch first account so the three below are ordinary.
+const me = await call(anon, "GET", "/api/me");
+if (me.json?.needsAdmin && process.env.TENANT_FIRST_INVITE) {
+  const r = await fetch(`${BASE}/api/signup`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: `first-${rand()}`, password: crypto.randomBytes(16).toString("base64url"), invite: process.env.TENANT_FIRST_INVITE }) });
+  if (r.status !== 200) throw new Error(`first account → ${r.status}`);
+}
 const alice = await signup("alice");
 const bob = await signup("bob");
 const mal = await signup("mallory");

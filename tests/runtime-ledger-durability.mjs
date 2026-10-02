@@ -116,5 +116,11 @@ fs.writeFileSync(
 const legacy = getLedger(legacyId);
 check("a legacy ledger with inline steps still loads them", legacy.steps.some((s) => s.label === "old inline step"), `${legacy.steps.length} steps`);
 
+// ---- Run records are capped too (a task that restarts many times must not grow forever) ----
+const { startRun } = rt;
+for (let i = 0; i < 260; i++) await startRun(t.id, "sess", i + 1);
+const runs = getLedger(t.id).runs;
+check("run history is capped", runs.length <= 200, `${runs.length} runs kept`);
+
 console.log(failures === 0 ? "\nLEDGER DURABILITY PASS" : `\nLEDGER DURABILITY FAIL (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

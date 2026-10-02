@@ -72,6 +72,12 @@ class Session {
     this.meta = meta;
     this.events = loadEvents(meta.id);
     this.history = loadHistory(meta.id);
+    // Restore messages that were sent but never saved into history, before anything below can flush. Their
+    // timeline card may also have missed the debounced save, so re-add any that is absent.
+    for (const m of meta.pendingInput ?? []) {
+      this.inbox.push({ ...m });
+      if (!this.events.some((e) => e.type === "user" && e.text === m.text)) this.events.push({ id: newId(), ts: Date.now(), type: "user", text: m.text, attachments: m.attachments });
+    }
     let repaired = false;
     // A tool can have taken effect before a crash prevented its result from being checkpointed.
     // Close every dangling tool call with an explicit unknown outcome; never replay it blindly.
@@ -208,8 +214,6 @@ class Session {
       attachments: [],
       resumeNote: "[Automatic note, not from the user] The agent process restarted mid-task. Any tool calls in flight were interrupted and may have partially run. Re-check the current state (files, processes, browser) before continuing, then carry on with the task.",
     });
-    // Messages the user sent that never reached the saved history (they are already in the timeline).
-    for (const m of this.meta.pendingInput ?? []) this.inbox.push({ ...m });
     void this.loop();
   }
 

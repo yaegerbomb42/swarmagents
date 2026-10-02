@@ -12,6 +12,18 @@ let current: Page | null = null;
 const notes: string[] = [];
 const pendingDownloads = new Set<Promise<void>>();
 let downloadDir = path.join(process.cwd(), "downloads");
+// What each numbered element on the last observed page is ("button "Place order""), so an approval
+// gate can see what a click on [12] would actually press before it runs.
+let lastElements = new Map<number, string>();
+
+/** Plain-words description of what a browser action would act on, from the last observation:
+ *  e.g. `button "Place order"` for {action:"click", index:12}. Undefined when unknown. */
+export function browserTargetLabel(input: Record<string, unknown>): string | undefined {
+  if (input.index != null) return lastElements.get(Number(input.index));
+  if (typeof input.text === "string" && input.action !== "type") return `"${input.text}"`;
+  if (typeof input.selector === "string") return input.selector;
+  return undefined;
+}
 
 const headless = () =>
   process.env.SWARM_BROWSER_HEADLESS === "1" ||
@@ -216,6 +228,14 @@ async function observe(p: Page, note: string, full = false) {
       elements: "",
       text: "",
     }))) as Record<string, string>;
+  lastElements = new Map(
+    String(snap.elements ?? "")
+      .split("\n")
+      .flatMap((l) => {
+        const m = /^\[(\d+)\]\s+(.*?)(?:\s+->\s.*)?$/.exec(l.trim());
+        return m ? [[Number(m[1]), m[2]] as [number, string]] : [];
+      }),
+  );
   // Set-of-marks: draw each element's number on the screenshot so the model (and the user reading the
   // timeline) can match "[12] button" to what's on screen. Removed right after the capture.
   const marks = process.env.SWARM_BROWSER_MARKS !== "0" && (await p.evaluate(MARKS_ON).catch(() => false));

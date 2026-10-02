@@ -168,15 +168,19 @@ export const shell: Tool = {
   },
   async run(input, ctx) {
     const cmd = String(input.command ?? "");
+    const dir = sessionDir(ctx.sessionId);
     const spill = (full: string) => {
-      const f = path.join(sessionDir(ctx.sessionId), `out-${newId()}.log`);
+      const f = path.join(dir, `out-${newId()}.log`);
       fs.writeFileSync(f, full);
+      pruneLogs(ctx.sessionId);
       return f;
     };
     if (input.background) {
-      const log = path.join(sessionDir(ctx.sessionId), `bg-${newId()}.log`);
+      const log = path.join(dir, `bg-${newId()}.log`);
       const fd = fs.openSync(log, "a");
       const child = spawn("/bin/zsh", ["-lc", cmd], { cwd: ctx.cwd, detached: true, stdio: ["ignore", fd, fd], env: childEnv() });
+      trackBackground(ctx.sessionId, child);
+      pruneLogs(ctx.sessionId);
       child.unref();
       return { content: `Started in background (pid ${child.pid}). Log: ${log}` };
     }

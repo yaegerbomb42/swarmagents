@@ -24,9 +24,11 @@ else
 fi
 
 echo "== 4/5 boot + API ping =="
-PORT=3779
-(npx next start -H 127.0.0.1 -p "$PORT" >/tmp/swarm-smoke.log 2>&1 &) 
-for i in $(seq 1 60); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/sessions" && break; sleep 0.5; [ "$i" = 60 ] && { tail -30 /tmp/swarm-smoke.log; exit 1; }; done
+# Free port: parallel gates must never fight over one.
+PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])")
+SMOKE_LOG=$(mktemp -t swarm-smoke.XXXXXX.log)
+(npx next start -H 127.0.0.1 -p "$PORT" >"$SMOKE_LOG" 2>&1 &)
+for i in $(seq 1 60); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/sessions" && break; sleep 0.5; [ "$i" = 60 ] && { tail -30 "$SMOKE_LOG"; exit 1; }; done
 echo "GET /api/sessions: $(curl -s "http://127.0.0.1:$PORT/api/sessions")"
 echo "GET /api/providers: $(curl -s "http://127.0.0.1:$PORT/api/providers" | head -c 200)..."
 
@@ -36,4 +38,7 @@ echo "session: $SID"
 curl -sN --max-time 8 "http://127.0.0.1:$PORT/api/sessions/$SID" | head -c 500; echo
 curl -s -X DELETE "http://127.0.0.1:$PORT/api/sessions/$SID" >/dev/null
 pkill -f "next start -H 127.0.0.1 -p $PORT" 2>/dev/null || true
+rm -f "$SMOKE_LOG"
+# Whoever ran this owns the build output; hand it to the repo owner so the next agent is never locked out.
+chown -R "$(stat -f '%Su' . 2>/dev/null || stat -c '%U' .)" .next-smoke 2>/dev/null || true
 echo; echo "SMOKE PASS"

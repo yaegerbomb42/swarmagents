@@ -4,8 +4,9 @@
 # The agent has a full shell INSIDE this container, so it runs non-root (uid 10001) with all caps dropped,
 # no-new-privileges and resource limits. All state is on the swarmagents-data volume, and it has its own
 # network, so other infra containers aren't reachable by name or IP (host-published ports still are).
-# Owner auth: SWARM_MODE=server + SWARM_AUTH_TOKEN from ../.env.v2 (server-only, mode 600, written by
+# Owner auth: SWARM_MODE=server + token from ../.env.v2 (server-only, mode 600, written by
 # deploy.sh from the Mac's ~/.swarmagents/deploy-owner-credentials.txt, and never committed).
+# Prefer SWARM_AUTH_TOKEN_SHA256 (hex digest); a raw SWARM_AUTH_TOKEN also works but keep plaintext off the server.
 name: swarmagents-v2
 services:
   swarmagents-dashboard:

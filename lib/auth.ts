@@ -40,10 +40,14 @@ export function hostAllowed(req: Request) {
   return list.includes((req.headers.get("host") ?? "").split(":")[0].toLowerCase());
 }
 
-/** Client IP for rate limiting. Behind nginx plus a proxy manager the real client is second from the right in X-Forwarded-For. */
+/**
+ * Client IP for rate limiting. Each trusted proxy appends the address it saw, so with N hops (SWARM_TRUSTED_PROXY_HOPS,
+ * default 1) the real client is the Nth entry from the right; anything further left is client-supplied and forgeable.
+ */
 export function clientIp(req: Request) {
   const xff = (req.headers.get("x-forwarded-for") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  return xff.length >= 2 ? xff[xff.length - 2] : (xff[0] ?? req.headers.get("x-real-ip") ?? "local");
+  const hops = Math.max(1, Math.floor(Number(process.env.SWARM_TRUSTED_PROXY_HOPS ?? 1)) || 1);
+  return xff.length >= hops ? xff[xff.length - hops] : (req.headers.get("x-real-ip") ?? "local");
 }
 
 /** Compares digests, so the check is constant-time and never depends on the token's length. */

@@ -137,16 +137,50 @@ export function archiveEvents(id: string, events: AgentEvent[]) {
   fs.appendFileSync(archiveFile(id), events.map((e) => JSON.stringify(e)).join("\n") + "\n", { mode: 0o600 });
 }
 
-/** Archived events [before - limit, before), oldest first. Indexes count from the start of the session. */
-export function loadArchivedEvents(id: string, before: number, limit: number): AgentEvent[] {
-  let lines: string[];
+/**
+ * Archived events [before - limit, before), oldest first. Indexes count from the start of the session; `total` is
+ * the archived count. The file is read backwards in chunks, so recent pages cost O(page) however big the archive.
+ */
+export function loadArchivedEvents(id: string, before: number, limit: number, total: number): AgentEvent[] {
+  let fd: number;
   try {
-    lines = fs.readFileSync(archiveFile(id), "utf8").split("\n").filter(Boolean);
+    fd = fs.openSync(archiveFile(id), "r");
   } catch {
     return [];
   }
-  const end = Math.min(before, lines.length);
-  return lines.slice(Math.max(0, end - limit), end).map((l) => JSON.parse(l) as AgentEvent);
+  try {
+    const end = Math.min(before, total);
+    const start = Math.max(0, end - limit);
+    const skip = total - end; // lines after the page, counted from the end of the file
+    const want = end - start;
+    const out: string[] = [];
+    let pos = fs.fstatSync(fd).size;
+    let carry = Buffer.alloc(0);
+    let seen = 0;
+    const CHUNK = 1 << 20;
+    while (pos > 0 && out.length < want) {
+      const n = Math.min(CHUNK, pos);
+      pos -= n;
+      const buf = Buffer.alloc(n);
+      fs.readSync(fd, buf, 0, n, pos);
+      carry = Buffer.concat([buf, carry]);
+      let nl = carry.lastIndexOf(10, carry.length - 2);
+      // Peel complete lines off the end; the remainder before the first newline waits for the next chunk.
+      while (nl >= 0 && out.length < want) {
+        const line = carry.subarray(nl + 1).toString("utf8").trim();
+        carry = carry.subarray(0, nl + 1);
+        if (line && seen++ >= skip) out.push(line);
+        nl = carry.lastIndexOf(10, carry.length - 2);
+      }
+    }
+    if (pos === 0 && out.length < want) {
+      const line = carry.toString("utf8").trim();
+      if (line && seen++ >= skip) out.push(line);
+    }
+    return out.reverse().map((l) => JSON.parse(l) as AgentEvent);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 export function sessionDir(id: string) {

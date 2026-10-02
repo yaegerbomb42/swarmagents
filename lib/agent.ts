@@ -500,7 +500,9 @@ class Session {
 
     // Stage 2: summarize everything before a clean cut point, streamed so the user can read it.
     let cut = -1;
-    for (let i = this.history.length - 4; i > 0; i--) {
+    // Search from the very end: compaction often fires right after the user's newest message was appended, and
+    // that message must survive verbatim rather than be folded into the summary.
+    for (let i = this.history.length - 1; i > 0; i--) {
       const m = this.history[i];
       if (m.role === "user" && !m.blocks.some((b) => b.type === "tool_result")) {
         cut = i;

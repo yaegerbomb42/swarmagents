@@ -408,6 +408,26 @@ const cases = {
     return "csv meta/body, html sandboxed + nosniff, .env 403, outside/traversal 404, download";
   },
 
+  async api() {
+    // api_request: saved keys reach only their own service (mock host allowed via SWARM_API_MOCK), never the agent.
+    let r = await api("POST", "/api/connections", { type: "tool", preset: "github-token", apiKey: "e2e-gh-key-123456789" });
+    const gh = r.json.connections.find((x) => x.preset === "github-token")?.id;
+    r = await api("POST", "/api/connections", { type: "tool", preset: "elevenlabs", apiKey: "e2e-eleven-key-12345" });
+    const el = r.json.connections.find((x) => x.preset === "elevenlabs")?.id;
+    try {
+      const { events } = await runTask("[mock:api] call the apis", { timeout: 90_000 });
+      const out = texts(events);
+      assert(/API: list=ok auth=ok refused=ok nospoof=ok saved=ok redirect=ok/.test(out), "api_request behaviour", { said: out.slice(-300), tools: tools(events).map((t) => `${t.name}:${t.status}`) });
+      const leaked = tools(events).filter((t) => /e2e-gh-key-123456789|e2e-eleven-key-12345/.test(JSON.stringify(t)));
+      assert(!leaked.length, "a saved key appeared in a tool event", leaked.map((t) => t.output?.slice(0, 200)));
+      assert(fs.existsSync(path.join(WORK, "downloads", "hello.mp3")), "binary response saved");
+      return "key injected server-side, foreign host refused, auth not spoofable, binary saved, redirect not followed, key never shown";
+    } finally {
+      if (gh) await api("DELETE", `/api/connections?type=tool&id=${gh}`);
+      if (el) await api("DELETE", `/api/connections?type=tool&id=${el}`);
+    }
+  },
+
   async anthropic() {
     // Same tool script over the native Anthropic protocol, with a Bedrock-style bearer header.
     const r = await api("POST", "/api/connections", { type: "llm", preset: "custom-anthropic", label: "Mock Anthropic", baseUrl: MOCK, apiKey: "e2e-key-anthropic-4321", model: "mock", headers: { Authorization: "Bearer {key}" } });
@@ -456,7 +476,7 @@ async function main() {
   start(process.execPath, [path.join(ROOT, "tests/mock-llm.mjs"), String(MOCK_PORT)], { MOCK_WORKDIR: WORK }, path.join(HOME, "mock-llm.log"));
   await waitFor(`${MOCK}/__mock/health`, 10_000, "mock LLM");
   if (!opt("--url")) {
-    const env = { SWARM_HOME: HOME, NEXT_DIST_DIR: flag("--prod") ? ".next-e2e-prod" : ".next-e2e", NEXT_TELEMETRY_DISABLED: "1", SWARM_STALL_MS: "30000", SWARM_SEARCH_MOCK: `${MOCK}/search`, E2E_SERVER_CANARY: "canary-1", SWARM_E2E_CANARY: "canary-2", SWARM_BROWSER_HEADLESS: "1" };
+    const env = { SWARM_HOME: HOME, NEXT_DIST_DIR: flag("--prod") ? ".next-e2e-prod" : ".next-e2e", NEXT_TELEMETRY_DISABLED: "1", SWARM_STALL_MS: "30000", SWARM_SEARCH_MOCK: `${MOCK}/search`, E2E_SERVER_CANARY: "canary-1", SWARM_E2E_CANARY: "canary-2", SWARM_BROWSER_HEADLESS: "1", SWARM_API_MOCK: MOCK };
     const next = path.join(ROOT, "node_modules/.bin/next");
     if (flag("--prod")) {
       console.log(c.d("building (next build)…"));

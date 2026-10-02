@@ -7,7 +7,7 @@ export const isLocal = isAllowed;
 
 export function middleware(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
-  if (misconfigured()) return new NextResponse("Server mode requires SWARM_AUTH_TOKEN; refusing to serve.", { status: 503 });
+  if (misconfigured()) return new NextResponse("Server mode requires SWARM_AUTH_TOKEN_SHA256 (or SWARM_AUTH_TOKEN); refusing to serve.", { status: 503 });
   if (!hostAllowed(req)) return new NextResponse("forbidden", { status: 403 });
   if (pathname === "/login" || pathname === "/api/login") return NextResponse.next();
   if (!isAllowed(req)) {

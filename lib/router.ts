@@ -42,7 +42,9 @@ export function estimateTokens(v: unknown): number {
 }
 
 // Long runs must outlast outages and exhausted quotas, so a provider that keeps failing is benched for an
-// escalating period rather than dropped. Consecutive failures reset on the first success.
+// escalating period rather than dropped. Consecutive failures reset on the first success. The deadline is
+// persisted in LearnedLimits (benchUntil) because a restart must not immediately retry a provider we already
+// know is out of credits - that is the whole point on a 24h run.
 const bench = new Map<string, number>();
 const streaks = new Map<string, number>();
 const MAX_BENCH = 15 * MINUTE;
@@ -51,8 +53,17 @@ function benchFor(id: string, minMs = 0): number {
   const n = (streaks.get(id) ?? 0) + 1;
   streaks.set(id, n);
   const ms = Math.min(MAX_BENCH, Math.max(minMs, 5000 * 2 ** Math.min(n - 1, 8)));
-  bench.set(id, Date.now() + ms);
+  const until = Date.now() + ms;
+  bench.set(id, until);
+  updateLimits(id, (x) => ({ ...x, benchUntil: until }));
   return ms;
+}
+
+/** Bench deadline for a provider, honouring what a previous process persisted. */
+function benchUntil(id: string): number {
+  const mem = bench.get(id) ?? 0;
+  const disk = getLimits()[id]?.benchUntil ?? 0;
+  return Math.max(mem, disk);
 }
 
 /** Out of credits/quota: retrying soon is pointless, but the user may top up, so wait instead of giving up. */
@@ -66,7 +77,7 @@ function isExhausted(err: ProviderError) {
 function waitNeeded(p: ProviderConfig, tokens: number): number {
   const l = getLimits()[p.id];
   const now = Date.now();
-  const benched = bench.get(p.id) ?? 0;
+  const benched = benchUntil(p.id);
   if (benched > now) return Math.max(benched - now, l?.cooldownUntil && l.cooldownUntil > now ? l.cooldownUntil - now : 0);
   if (l?.cooldownUntil && l.cooldownUntil > now) return l.cooldownUntil - now;
   if (!l) return 0;
@@ -175,7 +186,7 @@ export async function routeTurn(req: ChatRequest, cb: StreamCallbacks, hooks: Ro
     try {
       const r = await watched(p, req, cb);
       const l = getLimits()[p.id];
-      if (l?.lastError) updateLimits(p.id, (x) => ({ ...x, lastError: undefined }));
+      if (l?.lastError || l?.benchUntil) updateLimits(p.id, (x) => ({ ...x, lastError: undefined, benchUntil: undefined }));
       streaks.delete(p.id);
       bench.delete(p.id);
       return { ...r, provider: p };

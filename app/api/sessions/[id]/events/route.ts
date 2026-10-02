@@ -13,6 +13,6 @@ export async function GET(req: Request, { params }: Ctx) {
   const total = meta.archivedEvents ?? 0;
   const before = Math.min(total, Math.max(0, Number(q.get("before") ?? total) || 0));
   const limit = Math.min(1000, Math.max(1, Number(q.get("limit") ?? 300) || 300));
-  const events = loadArchivedEvents(id, before, limit);
+  const events = loadArchivedEvents(id, before, limit, total);
   return Response.json({ events, start: before - events.length, total });
 }

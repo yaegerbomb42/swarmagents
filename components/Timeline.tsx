@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { AgentEvent } from "@/lib/types";
 import { IChevron, IFile } from "./icons";
+import { PreviewChip, producedFiles } from "./FilePreview";
 
 type Ev<T extends AgentEvent["type"]> = Extract<AgentEvent, { type: T }>;
 
@@ -224,7 +225,7 @@ function UndoButton({ checkpoint, path }: { checkpoint: string; path: string }) 
   );
 }
 
-function Tool({ e, onImage }: { e: Ev<"tool">; onImage: (src: string) => void }) {
+function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) => void; session?: string }) {
   const live = e.status === "running" || e.status === "streaming";
   const [open, setOpen] = useState<boolean | null>(null);
   const now = useNow(live);
@@ -233,6 +234,12 @@ function Tool({ e, onImage }: { e: Ev<"tool">; onImage: (src: string) => void })
   const input = (e.input ?? {}) as Record<string, unknown>;
   const hasInput = Object.keys(input).length > 0;
   const inputText = hasInput ? JSON.stringify(input, null, 2) : e.inputPreview || "";
+  // Files this call produced: the written path for write/edit, or paths parsed from the output.
+  const previewPaths = (() => {
+    if (!e.output) return [];
+    if (e.name === "write_file" || e.name === "edit_file") return typeof input.path === "string" ? [input.path] : [];
+    return producedFiles(e.output).slice(0, 4);
+  })();
   return (
     <div className="ev tool">
       <button className="head" onClick={() => setOpen(!shown)}>
@@ -282,6 +289,13 @@ function Tool({ e, onImage }: { e: Ev<"tool">; onImage: (src: string) => void })
                 const src = `data:${im.mediaType};base64,${im.data}`;
                 return <img key={i} src={src} alt="" onClick={() => onImage(src)} />;
               })}
+            </div>
+          )}
+          {!!session && !!previewPaths.length && (
+            <div className="chips preview-chips">
+              {previewPaths.map((p) => (
+                <PreviewChip key={p} session={session} path={p} />
+              ))}
             </div>
           )}
         </div>
@@ -364,7 +378,7 @@ export function PlanCard({ e }: { e: Ev<"plan"> }) {
   );
 }
 
-export function Timeline({ events, onImage }: { events: AgentEvent[]; onImage: (s: string) => void }) {
+export function Timeline({ events, onImage, session }: { events: AgentEvent[]; onImage: (s: string) => void; session?: string }) {
   return (
     <>
       {events.map((e) => {
@@ -395,7 +409,7 @@ export function Timeline({ events, onImage }: { events: AgentEvent[]; onImage: (
               </div>
             ) : null;
           case "tool":
-            return <Tool key={e.id} e={e} onImage={onImage} />;
+            return <Tool key={e.id} e={e} onImage={onImage} session={session} />;
           case "compaction":
             return <Compaction key={e.id} e={e} />;
           case "plan":

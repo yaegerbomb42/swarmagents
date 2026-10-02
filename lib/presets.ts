@@ -116,8 +116,9 @@ export const presetFor = (idOrKind: string) =>
   PRESETS.find((p) => p.id === idOrKind) ?? PRESETS.find((p) => p.kind === idOrKind) ?? PRESETS.find((p) => p.id === "custom")!;
 
 // ---- Tool API keys ----
-// Keys for services the agent's tools use. Each key is also exposed to the agent's shell as `envVar`,
-// so the agent can call any of these APIs directly. `test` is a cheap read-only request that proves the key works.
+// Keys for services the agent's tools use. The agent calls these APIs through the `api_request` tool, which
+// adds the key server-side and only sends it to the service's own hosts (`api`, else derived from `test`).
+// `test` is a cheap read-only request that proves the key works.
 
 export interface KeyTest {
   method?: "GET" | "POST";
@@ -136,8 +137,21 @@ export interface ToolPreset {
   keyUrl?: string;
   blurb: string;
   test?: KeyTest;
-  /** Used by built-in tools (e.g. web_search) in addition to the shell env. */
+  /** Used by built-in tools (e.g. web_search) in addition to api_request. */
   builtin?: "search";
+  /** Where api_request may send this key and how. Defaults: the test URL's host, and the test's {key} headers/query. */
+  api?: { hosts?: string[]; auth?: Record<string, string>; docs?: string };
+}
+
+/** How api_request authenticates to a service: allowed hosts, auth headers ({key} templates), auth query params. */
+export function apiAccess(p: ToolPreset): { hosts: string[]; headers: Record<string, string>; query: Record<string, string>; docs?: string } | null {
+  const test = p.test ? new URL(p.test.url) : null;
+  const hosts = p.api?.hosts ?? (test ? [test.host] : []);
+  const headers = p.api?.auth ?? p.test?.headers ?? {};
+  const query: Record<string, string> = {};
+  if (!p.api?.auth && test) for (const [k, v] of test.searchParams) if (v.includes("{key}")) query[k] = v;
+  if (!hosts.length || (!Object.values(headers).some((v) => v.includes("{key}")) && !Object.keys(query).length)) return null;
+  return { hosts, headers, query, docs: p.api?.docs };
 }
 
 const bearer = { Authorization: "Bearer {key}" };
@@ -151,24 +165,24 @@ export const TOOL_PRESETS: ToolPreset[] = [
   { id: "kagi", label: "Kagi", group: "Search", envVar: "KAGI_API_KEY", keyUrl: "https://kagi.com/settings?p=api", blurb: "Ad-free search API.", test: { url: "https://kagi.com/api/v0/search?q=swarm&limit=1", headers: { Authorization: "Bot {key}" } } },
 
   { id: "firecrawl", label: "Firecrawl", group: "Web & scraping", envVar: "FIRECRAWL_API_KEY", keyUrl: "https://www.firecrawl.dev/app/api-keys", blurb: "Crawl and scrape sites to clean markdown.", test: { url: "https://api.firecrawl.dev/v1/team/credit-usage", headers: bearer } },
-  { id: "jina", label: "Jina Reader", group: "Web & scraping", envVar: "JINA_API_KEY", keyUrl: "https://jina.ai/api-dashboard", blurb: "URL to LLM-ready text, higher rate limits.", test: { url: "https://r.jina.ai/https://example.com", headers: { ...bearer, Accept: "text/plain" } } },
+  { id: "jina", api: { hosts: ["r.jina.ai", "s.jina.ai", "api.jina.ai"], auth: { Authorization: "Bearer {key}" } }, label: "Jina Reader", group: "Web & scraping", envVar: "JINA_API_KEY", keyUrl: "https://jina.ai/api-dashboard", blurb: "URL to LLM-ready text, higher rate limits.", test: { url: "https://r.jina.ai/https://example.com", headers: { ...bearer, Accept: "text/plain" } } },
   { id: "browserbase", label: "Browserbase", group: "Web & scraping", envVar: "BROWSERBASE_API_KEY", keyUrl: "https://www.browserbase.com/settings", blurb: "Hosted headless browsers.", test: { url: "https://api.browserbase.com/v1/projects", headers: { "X-BB-API-Key": "{key}" } } },
 
-  { id: "replicate", label: "Replicate", group: "Images & video", envVar: "REPLICATE_API_TOKEN", keyUrl: "https://replicate.com/account/api-tokens", blurb: "Run image, video and audio models.", test: { url: "https://api.replicate.com/v1/account", headers: bearer } },
-  { id: "fal", label: "fal.ai", group: "Images & video", envVar: "FAL_KEY", keyUrl: "https://fal.ai/dashboard/keys", blurb: "Fast image and video generation." },
+  { id: "replicate", api: { hosts: ["api.replicate.com"], auth: { Authorization: "Bearer {key}" }, docs: "POST /v1/models/<owner>/<name>/predictions with {input:{…}} and header Prefer: wait" }, label: "Replicate", group: "Images & video", envVar: "REPLICATE_API_TOKEN", keyUrl: "https://replicate.com/account/api-tokens", blurb: "Run image, video and audio models.", test: { url: "https://api.replicate.com/v1/account", headers: bearer } },
+  { id: "fal", api: { hosts: ["fal.run", "queue.fal.run", "rest.alpha.fal.ai"], auth: { Authorization: "Key {key}" }, docs: "POST https://fal.run/<model-id> with the model's JSON input" }, label: "fal.ai", group: "Images & video", envVar: "FAL_KEY", keyUrl: "https://fal.ai/dashboard/keys", blurb: "Fast image and video generation." },
   { id: "stability", label: "Stability AI", group: "Images & video", envVar: "STABILITY_API_KEY", keyUrl: "https://platform.stability.ai/account/keys", blurb: "Stable Diffusion image models.", test: { url: "https://api.stability.ai/v1/user/account", headers: bearer } },
 
-  { id: "elevenlabs", label: "ElevenLabs", group: "Voice", envVar: "ELEVENLABS_API_KEY", keyUrl: "https://elevenlabs.io/app/settings/api-keys", blurb: "Text to speech and voice cloning.", test: { url: "https://api.elevenlabs.io/v1/models", headers: { "xi-api-key": "{key}" } } },
+  { id: "elevenlabs", api: { hosts: ["api.elevenlabs.io"], auth: { "xi-api-key": "{key}" }, docs: "POST /v1/text-to-speech/<voice_id> {text} returns audio/mpeg (saved to downloads)" }, label: "ElevenLabs", group: "Voice", envVar: "ELEVENLABS_API_KEY", keyUrl: "https://elevenlabs.io/app/settings/api-keys", blurb: "Text to speech and voice cloning.", test: { url: "https://api.elevenlabs.io/v1/models", headers: { "xi-api-key": "{key}" } } },
   { id: "deepgram", label: "Deepgram", group: "Voice", envVar: "DEEPGRAM_API_KEY", keyUrl: "https://console.deepgram.com", blurb: "Speech to text.", test: { url: "https://api.deepgram.com/v1/projects", headers: { Authorization: "Token {key}" } } },
   { id: "assemblyai", label: "AssemblyAI", group: "Voice", envVar: "ASSEMBLYAI_API_KEY", keyUrl: "https://www.assemblyai.com/app/api-keys", blurb: "Speech to text and audio intelligence.", test: { url: "https://api.assemblyai.com/v2/transcript?limit=1", headers: { Authorization: "{key}" } } },
 
-  { id: "github-token", label: "GitHub token", group: "Dev & data", envVar: "GITHUB_TOKEN", keyUrl: "https://github.com/settings/personal-access-tokens", blurb: "gh, git push and the GitHub API.", test: { url: "https://api.github.com/user", headers: { ...bearer, "User-Agent": "swarmagents" } } },
+  { id: "github-token", api: { hosts: ["api.github.com", "uploads.github.com"], auth: { Authorization: "Bearer {key}", "User-Agent": "swarmagents", "X-GitHub-Api-Version": "2022-11-28" } }, label: "GitHub token", group: "Dev & data", envVar: "GITHUB_TOKEN", keyUrl: "https://github.com/settings/personal-access-tokens", blurb: "gh, git push and the GitHub API.", test: { url: "https://api.github.com/user", headers: { ...bearer, "User-Agent": "swarmagents" } } },
   { id: "vercel-token", label: "Vercel token", group: "Dev & data", envVar: "VERCEL_TOKEN", keyUrl: "https://vercel.com/account/settings/tokens", blurb: "Deploy and manage Vercel projects.", test: { url: "https://api.vercel.com/v2/user", headers: bearer } },
   { id: "cloudflare-token", label: "Cloudflare token", group: "Dev & data", envVar: "CLOUDFLARE_API_TOKEN", keyUrl: "https://dash.cloudflare.com/profile/api-tokens", blurb: "Wrangler, DNS, Workers.", test: { url: "https://api.cloudflare.com/client/v4/user/tokens/verify", headers: bearer, okField: "success" } },
   { id: "linear-key", label: "Linear", group: "Dev & data", envVar: "LINEAR_API_KEY", keyUrl: "https://linear.app/settings/account/security", blurb: "Issues and projects.", test: { method: "POST", url: "https://api.linear.app/graphql", headers: { Authorization: "{key}" }, body: { query: "{ viewer { id } }" }, okField: "data" } },
-  { id: "notion-key", label: "Notion", group: "Dev & data", envVar: "NOTION_API_KEY", keyUrl: "https://www.notion.so/profile/integrations", blurb: "Pages and databases.", test: { url: "https://api.notion.com/v1/users/me", headers: { ...bearer, "Notion-Version": "2022-06-28" } } },
+  { id: "notion-key", api: { hosts: ["api.notion.com"], auth: { Authorization: "Bearer {key}", "Notion-Version": "2022-06-28" } }, label: "Notion", group: "Dev & data", envVar: "NOTION_API_KEY", keyUrl: "https://www.notion.so/profile/integrations", blurb: "Pages and databases.", test: { url: "https://api.notion.com/v1/users/me", headers: { ...bearer, "Notion-Version": "2022-06-28" } } },
   { id: "slack-bot", label: "Slack bot token", group: "Dev & data", envVar: "SLACK_BOT_TOKEN", keyUrl: "https://api.slack.com/apps", blurb: "Read and post in Slack.", test: { method: "POST", url: "https://slack.com/api/auth.test", headers: bearer, okField: "ok" } },
-  { id: "hf-token", label: "Hugging Face token", group: "Dev & data", envVar: "HF_TOKEN", keyUrl: "https://huggingface.co/settings/tokens", blurb: "Datasets, models, Spaces.", test: { url: "https://huggingface.co/api/whoami-v2", headers: bearer } },
+  { id: "hf-token", api: { hosts: ["huggingface.co", "router.huggingface.co", "api-inference.huggingface.co", "datasets-server.huggingface.co"], auth: { Authorization: "Bearer {key}" } }, label: "Hugging Face token", group: "Dev & data", envVar: "HF_TOKEN", keyUrl: "https://huggingface.co/settings/tokens", blurb: "Datasets, models, Spaces.", test: { url: "https://huggingface.co/api/whoami-v2", headers: bearer } },
 
   { id: "custom-key", label: "Other API key", group: "Custom", envVar: "", blurb: "Any key, exposed to the agent's shell under the variable name you choose." },
 ];

@@ -12,6 +12,7 @@
     "test:e2e": "node tests/e2e.mjs",
     "test:runtime": "tsx tests/runtime.e2e.mjs",
     "test:runtime:mock": "node tests/runtime.mock.mjs",
+    "test:router": "tsx tests/router.bench.mjs",
     "mock-llm": "node tests/mock-llm.mjs"
   },
   "devDependencies": {

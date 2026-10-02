@@ -33,6 +33,8 @@ export interface LearnedLimits {
   throttles: number;
   lastThrottleAt?: number;
   cooldownUntil?: number;
+  /** Bench deadline for a provider that is failing repeatedly or is out of credits; survives restarts. */
+  benchUntil?: number;
   contextWindow?: number;
   lastError?: string;
 }

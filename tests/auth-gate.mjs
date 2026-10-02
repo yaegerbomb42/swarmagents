@@ -5,6 +5,7 @@ import {
   AUTH_COOKIE,
   authEnabled,
   checkToken,
+  clientIp,
   hostAllowed,
   isAllowed,
   isAuthorized,
@@ -118,6 +119,49 @@ ok(
   ),
   "allowlist: token does not override host block",
 );
+
+// ---- clientIp: only the trusted tail of XFF is infrastructure-written ----
+{
+  delete process.env.SWARM_TRUSTED_PROXY_HOPS;
+  ok(
+    clientIp(req({ "x-forwarded-for": "1.2.3.4" })) === "1.2.3.4",
+    "clientIp: single hop returns the client",
+  );
+  ok(
+    clientIp(req({ "x-forwarded-for": "9.9.9.9, 1.2.3.4" })) === "1.2.3.4",
+    "clientIp: forged left entries ignored, rightmost kept",
+  );
+  ok(
+    clientIp(req({ "x-forwarded-for": "9.9.9.9" })) === "9.9.9.9",
+    "clientIp: lone entry is the client, not 'local'",
+  );
+  ok(
+    clientIp(req({ "x-real-ip": "5.6.7.8" })) === "5.6.7.8",
+    "clientIp: falls back to x-real-ip without XFF",
+  );
+  ok(clientIp(req()) === "local", "clientIp: falls back to 'local'");
+  process.env.SWARM_TRUSTED_PROXY_HOPS = "2";
+  ok(
+    clientIp(req({ "x-forwarded-for": "9.9.9.9, 1.2.3.4, 10.0.0.1" })) === "1.2.3.4",
+    "clientIp: 2 hops takes second from right",
+  );
+  ok(
+    clientIp(req({ "x-forwarded-for": "1.2.3.4" })) === "local",
+    "clientIp: too-short XFF is untrusted, falls back",
+  );
+  delete process.env.SWARM_TRUSTED_PROXY_HOPS;
+
+  // ---- hash-only server token ----
+  resetEnv();
+  const { createHash } = await import("node:crypto");
+  const digest = createHash("sha256").update("owner-secret").digest("hex");
+  process.env.SWARM_MODE = "server";
+  process.env.SWARM_AUTH_TOKEN_SHA256 = digest;
+  ok(authEnabled(), "sha256: auth enabled by digest env");
+  ok(checkToken("owner-secret"), "sha256: correct token verifies");
+  ok(!checkToken("wrong"), "sha256: wrong token rejected");
+  resetEnv();
+}
 
 console.log(`\nauth-gate: ${pass} pass, ${fail} fail`);
 process.exit(fail ? 1 : 0);

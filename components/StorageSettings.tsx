@@ -81,6 +81,7 @@ export function StorageSettings() {
   const [busy, setBusy] = useState(false);
   const [days, setDays] = useState(30);
   const [note, setNote] = useState("");
+  const [showAll, setShowAll] = useState(false);
 
   const load = useCallback(() => {
     fetch("/api/storage")
@@ -118,6 +119,7 @@ export function StorageSettings() {
 
   const limit = r.limit;
   const chats = [...r.chats].sort((a, b) => b.bytes - a.bytes);
+  const shown = showAll ? chats : chats.slice(0, 25);
   const old = r.chats.filter((c) => !c.pinned && !c.busy && c.updatedAt < Date.now() - days * 86_400_000);
   const oldBytes = old.reduce((s, c) => s + c.bytes, 0);
 
@@ -147,14 +149,24 @@ export function StorageSettings() {
           </span>
         ))}
       </div>
-      {r.message && <div className={`stg-banner ${r.level}`}>{r.message}</div>}
+      {r.message && (
+        <div className={`stg-banner ${r.level}`} role={r.level === "full" ? "alert" : "status"}>
+          <span>
+            {r.message}
+            {r.level === "full" && " New messages, runs and uploads are paused until you free space. Nothing you already have is lost."}
+          </span>
+          <button className="btn" disabled={busy} onClick={() => post({ action: "prune-now" }, "Free space now? Screenshots and step detail of your least recently used chats go first, then whole chats if needed. Pinned and running chats are kept.")}>
+            Free space now
+          </button>
+        </div>
+      )}
 
       <div className="sa-row">
         <span className="sa-label">Auto-prune</span>
         <label className="stg-toggle">
           <input type="checkbox" checked={r.settings.autoPrune} disabled={busy} onChange={(e) => post({ autoPrune: e.target.checked })} />
           <span>
-            When you pass {Math.round(r.autoPrune.startsAt * 100)}%, free space down to {Math.round(r.autoPrune.target * 100)}%: screenshots first, then step detail, then the oldest chats. Pinned and running chats are never touched.
+            When you pass {Math.round(r.autoPrune.startsAt * 100)}%, free space down to {Math.round(r.autoPrune.target * 100)}%, least recently used chats first: their screenshots, then step detail, then whole chats. Pinned and running chats are never touched. Off by default.
           </span>
         </label>
       </div>
@@ -174,12 +186,12 @@ export function StorageSettings() {
       {(note || err) && <div className={`st-result ${err ? "err" : "ok"}`}>{err || note}</div>}
 
       <div className="stg-chats">
-        {chats.map((c) => (
+        {shown.map((c) => (
           <div key={c.id} className="stg-chat">
             <span className="stg-title" title={c.title}>
               {c.title || "Untitled"}
             </span>
-            <span className="stg-when">{ago(c.updatedAt)}</span>
+            <span className="stg-when">{c.busy ? <b className="stg-busy">running</b> : ago(c.updatedAt)}</span>
             <span className="stg-size">{fmtBytes(c.bytes)}</span>
             <button className={`stg-pin${c.pinned ? " on" : ""}`} aria-pressed={c.pinned} title={c.pinned ? "Pinned: never pruned" : "Pin: never prune this chat"} disabled={busy} onClick={() => post({ pin: c.id, pinned: !c.pinned })}>
               {c.pinned ? "Pinned" : "Pin"}
@@ -190,6 +202,11 @@ export function StorageSettings() {
           </div>
         ))}
         {!chats.length && <div className="st-empty">No chats yet.</div>}
+        {chats.length > shown.length && (
+          <button className="st-mini stg-more" onClick={() => setShowAll(true)}>
+            Show all {chats.length} chats
+          </button>
+        )}
       </div>
 
       {!!r.log.length && (

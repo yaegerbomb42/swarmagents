@@ -246,6 +246,11 @@ export class BrowserSession {
   async context(): Promise<BrowserContext> {
     if (this.closed) throw new Error("This browser session was closed.");
     if (this.ctx) return this.ctx;
+    // Fail closed on a multi-user server: the per-user Chromium path (sandbox uid, uid-owned profile and
+    // downloads) must be verified on that deployment before other tenants are exposed to it. The operator
+    // turns it on per deployment with SWARM_BROWSER_SERVER=on (see docs/browser-runtime.md).
+    if (process.env.SWARM_MODE === "server" && process.env.SWARM_BROWSER_SERVER !== "on")
+      throw new Error("The browser is switched off on this server. Ask the operator to set SWARM_BROWSER_SERVER=on.");
     if (this.launching) return this.launching;
     // Per-user sandbox: on a multi-user server Chromium runs as the user's uid (bin/swarm-chromium via
     // chromiumLaunch) with a uid-owned profile inside the user's workspace, kept apart from the

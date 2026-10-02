@@ -216,6 +216,9 @@ try {
   out = await run({ action: "reload", screenshot: false });
   check("tool: screenshot:false skips the image", !out.images?.length);
 
+  out = await run({ action: "goto", url: site.url + "/login" });
+  check("tool: a sign-in wall is called out in the observation", /password field/.test(out.content), out.content.split("\n").slice(0, 3).join(" | "));
+
   await run({ action: "goto", url: site.url + "/files" });
   out = await run({ action: "upload", selector: "#f", path: "upload-me.txt" });
   check("tool: upload attaches the workspace file", /Attached upload-me\.txt/.test(out.content), out.content.split("\n")[0]);

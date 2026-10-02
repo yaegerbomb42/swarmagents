@@ -32,6 +32,14 @@ Hard caps, all overridable with `SWARM_BROWSER_*`:
 | `SWARM_BROWSER_MAX_LIVE` | 4 | live browsers before the LRU one is evicted |
 | `SWARM_BROWSER_HEADLESS` / `_NO_SANDBOX` / `_CHROME_PATH` | — | how Chromium runs (the container sets these) |
 | `SWARM_BROWSER_BLOCK_ORIGINS` | empty | extra origins the agent may not request |
+| `SWARM_BROWSER_SERVER` | off | on a `SWARM_MODE=server` deployment the browser refuses to start unless this is `on` |
+
+## On a multi-user server the browser is off until an operator turns it on
+
+`context()` refuses on `SWARM_MODE=server` unless `SWARM_BROWSER_SERVER=on`. The per-user path (Chromium
+as the sandbox uid, a uid-owned profile and downloads folder inside the user's workspace) has to be
+verified on that deployment before other tenants can be exposed to it. The security test asserts both
+halves: fail-closed by default, and unlocked by name. See `deploy/SANDBOX_DESIGN.md`.
 
 Downloads are filtered by extension and by size, and a refused download is reported back to the model.
 

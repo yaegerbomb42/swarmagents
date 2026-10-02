@@ -160,7 +160,18 @@ export default function Home() {
   }, [active, refresh]);
 
   // Visible events (handles archived events)
-  const visible = events;
+  const [visible, setVisible] = useState<AgentEvent[]>(events);
+  
+  // Sync visible with events when they change (new session, etc.)
+  useEffect(() => {
+    setVisible(events);
+    setArchivedEvents(0); // Will be updated from SSE snapshot
+  }, [events]);
+
+  const handleLoadEarlier = useCallback((newEvents: AgentEvent[], remaining: number) => {
+    setVisible((prev) => [...newEvents, ...prev]);
+    setArchivedEvents(remaining);
+  }, []);
 
   // Session title for topbar
   const title = sessions.find((s) => s.id === active)?.title ?? null;
@@ -349,7 +360,7 @@ export default function Home() {
               <ProgressBar events={visible} running={running} context={context} startTs={visible.find((e) => e.type === "user")?.ts ?? 0} />
               <AwayRecap events={visible} running={running} sessionId={active ?? undefined} />
               <ChangedFilesTree events={visible} session={active ?? undefined} />
-              {active && archivedEvents > 0 && <LoadEarlier archivedCount={archivedEvents} sessionId={active} />}
+              {active && archivedEvents > 0 && <LoadEarlier archivedCount={archivedEvents} sessionId={active} onLoad={handleLoadEarlier} />}
               <Timeline events={visible} onImage={setLightbox} session={active ?? undefined} />
               {running && !livePlanOpen && visible.at(-1)?.type !== "thinking" && visible.at(-1)?.type !== "text" && (
                 <div className="ev thinking">

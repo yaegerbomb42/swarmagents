@@ -100,6 +100,32 @@ try {
   await site.close().catch(() => {});
 }
 
+// ── 5. Multi-user server: fail-closed by default, unlocked by name ──
+{
+  const rt = browserRuntime();
+  process.env.SWARM_MODE = "server";
+  delete process.env.SWARM_BROWSER_SERVER;
+  const locked = rt.acquire("sec-guard-off");
+  const refused = await locked
+    .context()
+    .then(() => false)
+    .catch((e) => /switched off on this server/.test(String(e.message)));
+  check("server mode refuses the browser by default (fail-closed)", refused);
+  await rt.release("sec-guard-off", "guard test").catch(() => {});
+
+  process.env.SWARM_BROWSER_SERVER = "on";
+  const unlocked = rt.acquire("sec-guard-on");
+  const launched = await unlocked
+    .context()
+    .then(() => true)
+    .catch(() => false);
+  if (launched) check("SWARM_BROWSER_SERVER=on unlocks the browser on a server", true);
+  else checkWhere("SWARM_BROWSER_SERVER=on unlocks the browser on a server", false, "needs the container's sandbox uid (verified on the VPS)");
+  await rt.release("sec-guard-on", "guard test").catch(() => {});
+  delete process.env.SWARM_MODE;
+  delete process.env.SWARM_BROWSER_SERVER;
+}
+
 // ── 3. The viewer endpoints require a signed-in account (server mode) ──
 const PORT = Number(process.env.SEC_PORT || 3791);
 const BASE = `http://127.0.0.1:${PORT}`;

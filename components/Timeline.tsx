@@ -8,6 +8,7 @@ import { IChevron, IFile, ICheck, IX, ICopy } from "./icons";
 import { stepIcon, toolAccent } from "./StepIcons";
 import { AnsiRenderer, hasAnsi } from "./AnsiRenderer";
 import { PreviewChip, producedFiles } from "./FilePreview";
+import { BrowserView } from "./BrowserView";
 import "./timeline.css";
 
 type Ev<T extends AgentEvent["type"]> = Extract<AgentEvent, { type: T }>;
@@ -311,6 +312,7 @@ function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) =
     return producedFiles(e.output).slice(0, 4);
   })();
   const accent = toolAccent(e.name);
+  const isBrowser = e.name === "browser";
 
   return (
     <div className={`ev ev-virtual tool ${accent}${live ? " is-active" : ""}`}>
@@ -324,44 +326,49 @@ function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) =
       </button>
       {shown && (
         <div className="io">
-          {inputText && e.name !== "bash" && (
+          {!isBrowser && inputText && e.name !== "bash" && (
             <>
               {labelWithCopy("Input", inputText)}
               <pre>{inputText}</pre>
             </>
           )}
           {e.name === "bash" && <pre style={{ color: "var(--muted)" }}>$ {argSummary("bash", input, e.inputPreview)}</pre>}
-          {(e.output || e.status === "running") && (
-            <>
-              {e.output ? labelWithCopy("Output", e.output) : <div className="label">Output</div>}
-              {(() => {
-                const d = e.output ? splitDiff(e.output) : null;
-                const cps = e.output ? checkpoints(e.output) : [];
-                if (!d) {
+          {isBrowser ? (
+            // Browser steps get their browser window; running ones show it live even before output lands.
+            <BrowserView input={input} output={e.output} images={e.images} status={e.status} onImage={onImage} />
+          ) : (
+            (e.output || e.status === "running") && (
+              <>
+                {e.output ? labelWithCopy("Output", e.output) : <div className="label">Output</div>}
+                {(() => {
+                  const d = e.output ? splitDiff(e.output) : null;
+                  const cps = e.output ? checkpoints(e.output) : [];
+                  if (!d) {
+                    return (
+                      <pre className={e.status === "error" ? "err" : ""}>
+                        {useAnsi ? <AnsiRenderer text={e.output!} /> : (e.output || "…")}
+                      </pre>
+                    );
+                  }
                   return (
-                    <pre className={e.status === "error" ? "err" : ""}>
-                      {useAnsi ? <AnsiRenderer text={e.output!} /> : (e.output || "…")}
-                    </pre>
+                    <>
+                      {d.head && <pre className="head-pre">{d.head}</pre>}
+                      <Diff oldText={d.oldText} newText={d.newText} />
+                      {!!cps.length && (
+                        <div className="undo-row">
+                          <UndoButton checkpoint={cps[0].id} path={cps[0].path} session={session} />
+                          <span className="undo-hint" title={cps[0].path}>
+                            Restores {cps[0].path.split("/").slice(-2).join("/")}
+                          </span>
+                        </div>
+                      )}
+                    </>
                   );
-                }
-                return (
-                  <>
-                    {d.head && <pre className="head-pre">{d.head}</pre>}
-                    <Diff oldText={d.oldText} newText={d.newText} />
-                    {!!cps.length && (
-                      <div className="undo-row">
-                        <UndoButton checkpoint={cps[0].id} path={cps[0].path} session={session} />
-                        <span className="undo-hint" title={cps[0].path}>
-                          Restores {cps[0].path.split("/").slice(-2).join("/")}
-                        </span>
-                      </div>
-                    )}
-                  </>
-                );
-              })()}
-            </>
+                })()}
+              </>
+            )
           )}
-          {!!e.images?.length && (
+          {!!e.images?.length && !isBrowser && (
             <div className="shots">
               {e.images.map((im, i) => {
                 const src = `data:${im.mediaType};base64,${im.data}`;

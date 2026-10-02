@@ -157,8 +157,13 @@ export interface RouterHooks {
  * Run one model turn. Providers are tried in the user's order. Rate limits are learned and routed
  * around; transient errors retry with backoff; context overflows are raised for the agent to compact.
  */
-export async function routeTurn(req: ChatRequest, cb: StreamCallbacks, hooks: RouterHooks): Promise<TurnResult & { provider: ProviderConfig }> {
-  const providers = activeProviders();
+export async function routeTurn(
+  req: ChatRequest,
+  cb: StreamCallbacks,
+  hooks: RouterHooks,
+  overrideProviders?: ProviderConfig[],
+): Promise<TurnResult & { provider: ProviderConfig }> {
+  const providers = overrideProviders && overrideProviders.length ? overrideProviders : activeProviders();
   if (!providers.length) throw new ProviderError("fatal", "No LLM provider configured. Open Settings and add an API key.");
   const tokens = estimateTokens(req.messages) + estimateTokens(req.system) + estimateTokens(req.tools);
   // Only bad keys and permanently rejected requests remove a provider; everything else is waited out.

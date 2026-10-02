@@ -52,20 +52,30 @@ interface Budget {
   used: number;
 }
 
-async function runChild(job: Job, tools: Tool[], ctx: ToolContext, log: (s: string) => void, maxSteps: number, budget: Budget): Promise<string> {
+async function runChild(
+  job: Job,
+  tools: Tool[],
+  ctx: ToolContext,
+  log: (s: string) => void,
+  maxSteps: number,
+  budget: Budget,
+  providerOverride: import("./types").ProviderConfig | null,
+): Promise<string> {
   const toolMap = new Map(tools.map((t) => [t.spec.name, t]));
   const history: Msg[] = [{ role: "user", blocks: [{ type: "text", text: job.prompt }] }];
   let cwd = ctx.cwd;
   let lastText = "";
   const quiet = { onThinking() {}, onText() {}, onToolStart() {}, onToolInput() {}, onBlockEnd() {} };
+  const childProvs = providerOverride ? [providerOverride] : undefined;
 
   for (let step = 0; step < maxSteps; step++) {
     if (budget.limit != null && budget.used >= budget.limit) return `[stopped: sub-agent token budget of ${budget.limit} reached]\n${lastText}`;
-    trim(history, contextWindow(activeProviders()[0]));
+    trim(history, contextWindow(providerOverride ?? activeProviders()[0]));
     const r = await routeTurn(
       { system: childSystem(cwd, job.title), messages: history, tools: tools.map((t) => t.spec), signal: ctx.signal },
       quiet,
       { onNotice: (_l, t) => log(`· ${t}`), onAttempt() {} },
+      childProvs,
     );
     budget.used += (r.usage?.input ?? 0) + (r.usage?.output ?? 0);
     history.push({ role: "assistant", blocks: r.blocks });
@@ -142,7 +152,7 @@ export function subagentTool(tools: Tool[]): Tool {
         log("started");
         try {
           const own = i === 0 ? base : base.filter((t) => !EXCLUSIVE.has(t.spec.name));
-          const report = await runChild(job, own, ctx, log, pol.maxStepsPerChild, budget);
+          const report = await runChild(job, own, ctx, log, pol.maxStepsPerChild, budget, pol.provider);
           log("done");
           return { job, ok: true, report };
         } catch (e) {

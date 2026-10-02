@@ -215,8 +215,8 @@ await t("background tasks and the task stream: no cross-account view, no cancel/
     ["DELETE", `/api/runtime/tasks/${id}`],
   ]) {
     const r = await call(mal, m, p, body);
-    // 404, or a 200 that says nothing happened ({ ok: false }); "alice's task untouched" below is the real check.
-    ok(r.status === 404 || (r.status === 200 && r.json?.ok === false), `${m} ${p} ${body?.action ?? ""} → ${r.status} ${r.text.slice(0, 80)}`);
+    // Another account's task id is "not found", whatever the verb (finish-runtime 21:58).
+    ok(r.status === 404, `${m} ${p} ${body?.action ?? ""} → ${r.status} ${r.text.slice(0, 80)}`);
   }
   const mine = await call(alice, "GET", `/api/runtime/tasks/${id}`);
   ok(mine.status === 200 && mine.json.task.status !== "cancelled", "alice's task untouched");
@@ -268,12 +268,15 @@ if (MOCK) {
     const v = `a${rand()}`;
     const set = await run(alice, `[mock:cookie] set ${v}`, 150_000);
     // Fail-closed is isolated too: a server that hasn't got per-user browsers yet refuses the tool for everyone.
-    if (/browser isn't available on this multi-user server/.test(set.raw)) return "browser disabled on this server (fail-closed); per-user contexts not live yet";
+    if (/browser isn't available on this multi-user server|browser is switched off on this server/.test(set.raw)) return "browser disabled on this server (fail-closed); per-user contexts not live yet";
     ok(new RegExp(`seen=\\[tenant=${v}\\]`).test(set.text), `set: ${set.text.slice(0, 160)}`);
+    // Whether alice's next chat still has it depends on the profile model (per chat vs per account); only the
+    // cross-account property is a security requirement, so this is reported, not asserted.
     const back = await run(alice, "[mock:cookie] show", 150_000);
-    ok(back.text.includes(`tenant=${v}`), `alice's own browser kept it: ${back.text.slice(0, 160)}`);
+    const kept = back.text.includes(`tenant=${v}`);
     const m = await run(mal, "[mock:cookie] show", 150_000);
     ok(/Cookie: show/.test(m.text) && !m.text.includes(v), `mallory's browser sent alice's cookie: ${m.text.slice(0, 160)}`);
+    return `browser on; mallory saw none of alice's cookies; alice's next chat ${kept ? "kept" : "starts with a fresh profile (per-chat)"}`;
   });
 }
 

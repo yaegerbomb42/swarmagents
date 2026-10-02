@@ -7,7 +7,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { HOME, MCP_CONFIG, getLimits, getProviders, newId, saveProviders } from "./store";
-import { MCP_PRESETS, PRESETS, TOOL_PRESETS, fillTemplate, mcpPreset, presetFor, toolPreset, type ConnType, type McpTransport } from "./presets";
+import { MCP_PRESETS, PRESETS, TOOL_PRESETS, apiAccess, fillTemplate, mcpPreset, presetFor, toolPreset, type ConnType, type McpTransport } from "./presets";
 import { testProvider } from "./providers";
 import { McpOAuthProvider, forgetMcpAuth, hasMcpTokens } from "./mcp-oauth";
 import type { LearnedLimits, ProviderConfig } from "./types";
@@ -74,6 +74,8 @@ export interface PublicConnection {
   url?: string;
   env?: Record<string, string>;
   source?: McpSource;
+  /** Tool keys: hosts the api_request tool may send this key to. */
+  hosts?: string[];
   /** Live runtime status from the agent's MCP loader ("connected (12 tools)" / "failed: …"), once it has connected. */
   status?: string;
   /** "connected": OAuth tokens stored; "available": the server may support OAuth sign-in. */
@@ -304,6 +306,10 @@ export function listConnections(): PublicConnection[] {
     enabled: t.enabled,
     keyHint: hint(t.apiKey),
     envVar: t.envVar,
+    hosts: (() => {
+      const p = toolPreset(t.preset);
+      return p ? apiAccess(p)?.hosts : undefined;
+    })(),
     testUrl: t.testUrl,
   }));
   const mcp: PublicConnection[] = allMcp().map(({ name, def, source }) => {
@@ -333,7 +339,7 @@ export function listConnections(): PublicConnection[] {
 
 /** The catalog shipped to the browser. */
 export function catalog() {
-  return { llm: PRESETS, tool: TOOL_PRESETS, mcp: MCP_PRESETS };
+  return { llm: PRESETS, tool: TOOL_PRESETS.map((t) => ({ ...t, apiHosts: apiAccess(t)?.hosts })), mcp: MCP_PRESETS };
 }
 
 // ---------- building configs from form input ----------

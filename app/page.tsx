@@ -224,7 +224,7 @@ export default function Home() {
             </div>
           ) : (
             <div className="col">
-              <Timeline events={visible} onImage={setLightbox} />
+              <Timeline events={visible} onImage={setLightbox} session={active ?? undefined} />
               {running && !livePlanOpen && visible.at(-1)?.type !== "thinking" && visible.at(-1)?.type !== "text" && (
                 <div className="ev thinking">
                   <span className="shimmer">Working…</span>

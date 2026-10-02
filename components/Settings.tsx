@@ -62,7 +62,7 @@ const TYPE_LABEL: Record<ConnType, string> = {
 };
 const TYPE_HINT: Record<ConnType, string> = {
   llm: "The agent uses the first enabled model and fails over down the list. Drag to reorder. Rate limits are learned from real 429s.",
-  tool: "Keys for services the agent's tools call. web_search uses the search keys. To hand a key to a local connector, set one of its env values to ${VAR}, e.g. GITHUB_TOKEN = ${GITHUB_TOKEN}.",
+  tool: "Keys for services the agent's tools call. The agent uses them through web_search and api_request: each key is added on the server and only sent to its own service. Local connectors can reference one as ${VAR}.",
   mcp: "MCP servers add tools: local commands or remote URLs. Servers set up in Claude Code or Claude Desktop on the machine Swarm runs on appear here automatically.",
 };
 
@@ -776,8 +776,8 @@ function ConnRow(props: {
         `cooling down ${Math.ceil((l.cooldownUntil - Date.now()) / 1000)}s`,
       );
   } else if (c.type === "tool") {
-    sub.push(`$${c.envVar}`);
     if (c.keyHint) sub.push(`key ${c.keyHint}`);
+    sub.push(c.hosts?.length ? `api_request → ${c.hosts[0]}${c.hosts.length > 1 ? ` +${c.hosts.length - 1}` : ""}` : `\${${c.envVar}} for connectors`);
   } else {
     sub.push(
       c.transport === "stdio"
@@ -1034,7 +1034,12 @@ function Form(props: {
             }
           />
           <span className="st-help">
-            The agent can use it as ${d.envVar || "MY_API_KEY"} in commands.
+            {tool?.apiHosts?.length
+              ? `The agent calls ${tool.apiHosts.join(", ")} with it through api_request; the key is added on the server and never shown to the agent. `
+              : ""}
+            A local connector can use it by setting an env value to ${"${"}
+            {d.envVar || "MY_API_KEY"}
+            {"}"}.
           </span>
         </div>
       )}

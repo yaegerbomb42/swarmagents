@@ -141,6 +141,8 @@ export interface ToolPreset {
   builtin?: "search";
   /** Where api_request may send this key and how. Defaults: the test URL's host, and the test's {key} headers/query. */
   api?: { hosts?: string[]; auth?: Record<string, string>; docs?: string };
+  /** Filled in by the server's catalog (apiAccess(...).hosts) so the UI can say where the key goes. */
+  apiHosts?: string[];
 }
 
 /** How api_request authenticates to a service: allowed hosts, auth headers ({key} templates), auth query params. */

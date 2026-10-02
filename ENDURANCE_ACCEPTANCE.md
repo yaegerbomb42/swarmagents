@@ -28,7 +28,7 @@ This is the release gate for claiming that SwarmAgents can keep one task moving 
 ## Current status
 
 - Acceptance criteria documented; no 24-hour soak has been run or passed.
-- Known blocker: compaction tail selection must preserve the newest user steer verbatim.
+- Latest owner report: compaction tail selection now cuts at the newest clean user message; full e2e is reported 19/19, including compaction. Coordinator has not independently rerun the suite.
 - Stop/pause race fix is integrated: scheduler-owned abort controller, run ownership checks, and blocked/input pause state prevent duplicate scheduling and stale completion writes. Owner reports the runtime suite passed 20/20; this has not been independently re-run in this coordinator pass.
-- Provider cooldowns still need restart-persistent exhaustion/transient backoff; rate-limit cooldown persistence alone does not cover process-local bench state.
+- Provider cooldown caveat: owner intentionally defers persisting short transient/exhaustion streak state. After restart, a provider may be probed once after the 5-second base delay before the 5-minute exhaustion bench is re-established.
 - Short deterministic e2e harness has reported compaction as its sole failing case; latest owner report is pending.

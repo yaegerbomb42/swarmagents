@@ -8,6 +8,7 @@ import { ProviderError } from "./providers/types";
 import { allTools } from "./tools";
 import type { Tool } from "./tools/types";
 import { setAgentAdapter } from "./runtime/resume";
+import { subagentTool } from "./subagents";
 
 const READ_ONLY = new Set(["read_file", "search", "web_search", "web_fetch"]);
 /** Live events kept in memory and in the snapshot; past ARCHIVE_AT the oldest settled ones are archived. */
@@ -28,6 +29,7 @@ How you work:
 - Move fast. Prefer the most direct path. Batch independent read-only lookups in one turn (they run in parallel). Don't narrate what you're about to do at length; just do it.
 - Verify. After changing things, check they worked (run the test, reload the page, re-read the file). Don't claim success you haven't observed.
 - For multi-step work, keep a short plan with the plan tool and update it as you go.
+- When work splits into independent pieces (several things to research, separate modules to build or investigate), hand them to parallel sub-agents with the subagent tool, then integrate and verify their reports yourself.
 - Be careful with destructive, irreversible or outward-facing actions (deleting data, force-pushing, sending messages/emails, purchases): confirm with the user first unless they already clearly asked for exactly that.
 - Large inputs: read files in pages, grep before reading, and save big intermediate results to disk instead of holding them in context.
 - When done, reply with a brief, direct summary of the outcome. Use markdown. No filler.
@@ -234,6 +236,7 @@ class Session {
     let tools: Tool[] = [];
     try {
       tools = await allTools();
+      tools.push(subagentTool(tools));
     } catch (e) {
       this.add({ type: "notice", level: "warn", text: `Some connectors failed to load: ${(e as Error).message}` } as AgentEvent);
     }

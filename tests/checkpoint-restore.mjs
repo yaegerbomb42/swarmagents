@@ -33,14 +33,19 @@ function restoreCheckpoint(sessionId, checkpointId) {
     return { ok: false, message: `Restore failed: ${e.message}` };
   }
 }
-// --- mirror of the route's session scan ---
-function routeRestore(checkpoint) {
+// --- mirror of the route's session scan (with the optional session scope) ---
+function routeRestore(checkpoint, session = "") {
   if (!checkpoint || !/^[a-f0-9]+$/.test(checkpoint)) return { status: 400 };
-  let sessions = [];
-  try {
-    sessions = fs.readdirSync(path.join(HOME, "checkpoints"));
-  } catch {
-    return { status: 404 };
+  if (session && !/^[a-f0-9]{16}$/.test(session)) return { status: 400 };
+  let sessions;
+  if (session) {
+    sessions = [session];
+  } else {
+    try {
+      sessions = fs.readdirSync(path.join(HOME, "checkpoints"));
+    } catch {
+      return { status: 404 };
+    }
   }
   for (const s of sessions) {
     const r = restoreCheckpoint(s, checkpoint);
@@ -82,4 +87,14 @@ assert.equal(fs.readFileSync(t2, "utf8"), "KEEP ME");
 const CID3 = "c0ffee123456";
 fs.writeFileSync(path.join(dir, `${CID3}.bak`), "orphan");
 assert.equal(routeRestore(CID3).status, 404, "sidecar-less snapshot must not restore");
-console.log("checkpoint-restore: 6/6 pass");
+// 7. Session scope: the owning session restores, an unrelated session cannot reach it.
+fs.writeFileSync(target, "MODIFIED AGAIN\n");
+assert.equal(routeRestore(CID, SID).status, 200, "owning session should restore");
+assert.equal(fs.readFileSync(target, "utf8"), "ORIGINAL CONTENT\n");
+fs.writeFileSync(target, "STILL MODIFIED\n");
+assert.equal(routeRestore(CID, "0000000000000000").status, 404, "another session must not reach this snapshot");
+assert.equal(fs.readFileSync(target, "utf8"), "STILL MODIFIED\n", "target must be untouched by the refused call");
+// 8. Malformed session id is rejected before any lookup.
+assert.equal(routeRestore(CID, "not-a-session").status, 400);
+assert.equal(routeRestore(CID, "../etc").status, 400);
+console.log("checkpoint-restore: 8/8 pass");

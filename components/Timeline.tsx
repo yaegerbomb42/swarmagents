@@ -272,7 +272,7 @@ function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) =
                     <Diff oldText={d.oldText} newText={d.newText} />
                     {!!cps.length && (
                       <div className="undo-row">
-                        <UndoButton checkpoint={cps[0].id} path={cps[0].path} />
+                        <UndoButton checkpoint={cps[0].id} path={cps[0].path} session={session} />
                         <span className="undo-hint" title={cps[0].path}>
                           Restores {cps[0].path.split("/").slice(-2).join("/")}
                         </span>

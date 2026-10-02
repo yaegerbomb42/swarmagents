@@ -19,21 +19,21 @@ node tests/shell-env.mjs 2>&1 | tail -n 1
 node tests/checkpoint-restore.mjs 2>&1 | tail -n 1
 node tests/timeline-ui.mjs 2>&1 | tail -n 1
 
-if [ "$SKIP_BUILD" = "0" ]; then
+if [ "$SKIP_BUILD" = "0" ] || [ ! -f ".next-smoke/BUILD_ID" ]; then
   echo "== 3/5 build =="
   npx next build --no-lint 2>&1 | tail -5
 else
   echo "== 3/5 build (skipped) =="
 fi
 
-echo "== 3/4 boot + API ping =="
+echo "== 4/5 boot + API ping =="
 PORT=3779
 (npx next start -H 127.0.0.1 -p "$PORT" >/tmp/swarm-smoke.log 2>&1 &) 
 for i in $(seq 1 60); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/sessions" && break; sleep 0.5; [ "$i" = 60 ] && { tail -30 /tmp/swarm-smoke.log; exit 1; }; done
 echo "GET /api/sessions: $(curl -s "http://127.0.0.1:$PORT/api/sessions")"
 echo "GET /api/providers: $(curl -s "http://127.0.0.1:$PORT/api/providers" | head -c 200)..."
 
-echo "== 4/4 session create + SSE snapshot =="
+echo "== 5/5 session create + SSE snapshot =="
 SID=$(curl -s -X POST "http://127.0.0.1:$PORT/api/sessions" | python3 -c "import sys,json;print(json.load(sys.stdin)['session']['id'])")
 echo "session: $SID"
 curl -sN --max-time 8 "http://127.0.0.1:$PORT/api/sessions/$SID" | head -c 500; echo

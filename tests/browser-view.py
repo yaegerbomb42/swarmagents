@@ -68,9 +68,17 @@ with sync_playwright() as p:
     pg = ctx.new_page()
     errors = []
     pg.on("pageerror", lambda e: errors.append(str(e)[:200]))
-    pg.goto(f"http://127.0.0.1:{PORT}/", wait_until="domcontentloaded", timeout=30000)
-    pg.wait_for_selector(".bv", timeout=20_000)
+    pg.goto(f"http://127.0.0.1:{PORT}/", wait_until="domcontentloaded", timeout=60_000)
+    # A cold dev-server compiles the page on first hit, so allow a generous window for the cards.
+    pg.wait_for_selector(".tool, .bv", timeout=60_000)
+    # A provider/connection prompt may overlay the app on a fresh SWARM_HOME; dismiss it.
+    for _ in range(3):
+        pg.keyboard.press("Escape")
+        pg.wait_for_timeout(300)
+    pg.wait_for_selector(".bv", timeout=60_000)
     pg.wait_for_timeout(1200)
+    pg.evaluate("() => document.querySelector('.bv')?.scrollIntoView({block: 'center'})")
+    pg.wait_for_timeout(300)
 
     ui = pg.evaluate(
         """() => ({

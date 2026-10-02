@@ -60,15 +60,6 @@ export const mcpConfig = () => path.join(userHome(), "mcp.json");
 const settingsFile = () => path.join(userHome(), "settings.json");
 const limitsFile = () => path.join(userHome(), "limits.json");
 
-/** @deprecated Server-global, not per user. Use userHome(). Kept only until every module has migrated. */
-export const HOME = ROOT;
-/** @deprecated Use uploadsDir(). */
-export const UPLOADS_DIR = path.join(ROOT, "uploads");
-/** @deprecated Use browserProfile(). */
-export const BROWSER_PROFILE = path.join(ROOT, "browser-profile");
-/** @deprecated Use mcpConfig(). */
-export const MCP_CONFIG = path.join(ROOT, "mcp.json");
-
 export const newId = () => crypto.randomBytes(8).toString("hex");
 
 function readJson<T>(file: string, fallback: T): T {

@@ -550,7 +550,7 @@ export function LoadEarlier({ archivedCount, sessionId, onLoad }: LoadEarlierPro
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/sessions/${sessionId}/events?limit=100`);
+      const res = await fetch(`/api/sessions/${sessionId}/events?limit=100&before=${archivedCount}`);
       if (res.ok) {
         const data = await res.json();
         // data.events are oldest-first, but we want to prepend them
@@ -559,7 +559,7 @@ export function LoadEarlier({ archivedCount, sessionId, onLoad }: LoadEarlierPro
     } finally {
       setLoading(false);
     }
-  }, [sessionId, onLoad]);
+  }, [sessionId, archivedCount, onLoad]);
 
   if (archivedCount <= 0) return null;
 

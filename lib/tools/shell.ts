@@ -4,7 +4,7 @@ import path from "node:path";
 import { sessionDir, newId } from "../store";
 import { redactSavedKeys, terminalEnv } from "../connections";
 import { clip, type Tool } from "./types";
-import { identity, sandboxCommand, sandboxEnv } from "../sandbox";
+import { identity, sandboxCommand, sandboxEnv, sandboxKill } from "../sandbox";
 
 const MARK = "__SWARM_CWD__";
 
@@ -162,14 +162,9 @@ export function killSessionBackground(sessionId: string): number {
   if (!set) return 0;
   let killed = 0;
   for (const pid of set) {
-    try {
-      process.kill(-pid, "SIGTERM");
-      killed++;
-    } catch {}
+    if (sandboxKill(-pid, "SIGTERM")) killed++;
     setTimeout(() => {
-      try {
-        process.kill(-pid, "SIGKILL");
-      } catch {}
+      sandboxKill(-pid, "SIGKILL");
     }, 3000);
   }
   bgProcs.delete(sessionId);
@@ -285,9 +280,7 @@ export const shell: Tool = {
       const kill = () => {
         for (const sig of ["SIGTERM", "SIGKILL"] as const)
           setTimeout(() => {
-            try {
-              process.kill(-child.pid!, sig);
-            } catch {}
+            if (child.pid) sandboxKill(-child.pid, sig);
           }, sig === "SIGKILL" ? 3000 : 0);
       };
       const timer = setTimeout(() => {

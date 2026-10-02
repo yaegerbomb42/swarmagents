@@ -64,6 +64,8 @@ export interface Task {
   origin?: "human" | "schedule" | "subagent";
   priority: number;
   tags: string[];
+  /** Owner user ID when running in multi-tenant/server mode */
+  userId?: string;
 }
 
 export interface RunUsage {

@@ -1486,3 +1486,195 @@ input, textarea, select {
   height: auto;
   opacity: 0.9;
 }
+
+/* Enhanced login page styles */
+.login-subtitle {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--type-size-0);
+  text-align: center;
+  line-height: 1.5;
+}
+
+.login-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  background: var(--color-bg-sunken);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--space-2);
+}
+
+.login-tab {
+  padding: var(--space-1) 0;
+  font-size: var(--type-size-0);
+  font-weight: var(--type-weight-medium);
+  border: 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  background: transparent;
+  color: var(--color-text-muted);
+  transition: all var(--transition-fast);
+}
+
+.login-tab:hover:not(.active) {
+  color: var(--color-text);
+  background: var(--color-bg-elevated);
+}
+
+.login-tab.active {
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  box-shadow: var(--elevation-1);
+}
+
+.login-fields {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.field-label {
+  font-size: var(--type-size--1);
+  font-weight: var(--type-weight-medium);
+  color: var(--color-text);
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.field-hint {
+  font-size: var(--type-size--1);
+  font-weight: var(--type-weight-regular);
+  color: var(--color-text-faint);
+}
+
+.input-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.input-wrapper input {
+  width: 100%;
+  padding: var(--space-3) var(--space-3);
+  font-size: var(--type-size-0);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-line-strong);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  outline: none;
+  transition: border-color var(--transition-colors), box-shadow var(--transition-shadow);
+}
+
+.input-wrapper input:focus {
+  border-color: var(--color-run);
+  box-shadow: var(--elevation-glow-run);
+}
+
+.input-wrapper input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.password-wrapper .toggle-visibility {
+  position: absolute;
+  right: var(--space-2);
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: var(--space-1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.password-wrapper .toggle-visibility:hover {
+  color: var(--color-text);
+}
+
+.password-rules {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--type-size--1);
+  color: var(--color-text-muted);
+  background: var(--color-bg-sunken);
+  border-radius: var(--radius-md);
+  list-style: none;
+  display: grid;
+  gap: var(--space-1);
+}
+
+.password-rules li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  transition: color var(--transition-fast);
+}
+
+.password-rules li::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid var(--color-line-strong);
+  flex-shrink: 0;
+  transition: all var(--transition-fast);
+}
+
+.password-rules li.met::before {
+  background: var(--color-ok);
+  border-color: var(--color-ok);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='20 6 9 17 4 12'%3E%3C/polyline%3E%3C/svg%3E");
+  background-size: 10px;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+.password-rules li.unmet::before {
+  background: transparent;
+  border-color: var(--color-line-strong);
+}
+
+.login-submit {
+  margin-top: var(--space-2);
+}
+
+.login-footer {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-line);
+  text-align: center;
+}
+
+.forgot-password {
+  background: none;
+  border: none;
+  color: var(--color-run);
+  font-size: var(--type-size-0);
+  font-weight: var(--type-weight-medium);
+  cursor: pointer;
+  padding: 0;
+  transition: color var(--transition-fast);
+}
+
+.forgot-password:hover {
+  color: var(--color-run-glow);
+  text-decoration: underline;
+}
+
+/* Mobile responsiveness */
+@media (max-width: 480px) {
+  .login-form {
+    padding: var(--space-4);
+    max-width: 100%;
+  }
+  
+  .login-tabs {
+    grid-template-columns: 1fr;
+  }
+}

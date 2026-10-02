@@ -16,12 +16,14 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { ROOT, browserProfile, currentUser, uploadsDir, userHome } from "./store";
 import { osUid } from "./users";
 
 export const serverMode = () => process.env.SWARM_MODE === "server";
 const enabled = () => process.env.SWARM_SANDBOX === "uid";
 const SETPRIV = process.env.SWARM_SETPRIV ?? "/usr/bin/setpriv";
+const SWARM_RUN = process.env.SWARM_RUN_PATH ?? "/usr/local/bin/swarm-run";
 
 export class SandboxUnavailableError extends Error {
   constructor() {
@@ -160,5 +162,50 @@ export function assertInsideHome(p: string): string {
       rest = rest ? path.join(path.basename(probe), rest) : path.basename(probe);
       probe = parent;
     }
+  }
+}
+
+/**
+ * Signal a process (or process group if pid < 0). In server sandbox mode, dispatches the signal as the user's
+ * uid via swarm-run (or setpriv fallback) so the server process does not need the KILL privilege (CAP_KILL).
+ * Locally falls back to process.kill.
+ */
+export function sandboxKill(pid: number, sig: NodeJS.Signals | number = "SIGTERM"): boolean {
+  const id = identity();
+  if (!id) {
+    try {
+      process.kill(pid, sig);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  const sigName = typeof sig === "number" ? String(sig) : sig.replace(/^SIG/, "");
+  // Try swarm-run <uid> -- kill -<sig> <pid>
+  try {
+    const res = spawnSync(SWARM_RUN, [String(id.uid), "--", "kill", `-${sigName}`, String(pid)], { stdio: "ignore" });
+    if (res.status === 0) return true;
+  } catch {}
+  // Fallback to setpriv --reuid=<uid> --regid=<gid> -- kill -<sig> <pid>
+  try {
+    const res = spawnSync(SETPRIV, [
+      `--reuid=${id.uid}`,
+      `--regid=${id.gid}`,
+      "--clear-groups",
+      "--no-new-privs",
+      "--inh-caps=-all",
+      "--",
+      "kill",
+      `-${sigName}`,
+      String(pid),
+    ], { stdio: "ignore" });
+    if (res.status === 0) return true;
+  } catch {}
+  // Ultimate fallback to process.kill
+  try {
+    process.kill(pid, sig);
+    return true;
+  } catch {
+    return false;
   }
 }

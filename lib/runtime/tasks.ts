@@ -6,7 +6,7 @@
 // bind to; it is intentionally separate from the agent's AgentEvent stream because it
 // describes orchestration, not model output.
 
-import { createSession, deleteSession } from "../store";
+import { createSession, currentUser, deleteSession } from "../store";
 import { loadRuntimeSettings, loadTasks, rtId, withTasks } from "./store";
 import {
   DEFAULT_BUDGET,
@@ -18,7 +18,9 @@ import {
   type WaitReason,
 } from "./types";
 
-export type RuntimeEvent = { type: "task"; task: Task } | { type: "removed"; id: string };
+export type RuntimeEvent =
+  | { type: "task"; task: Task; userId?: string }
+  | { type: "removed"; id: string; userId?: string };
 
 const subs = new Set<(e: RuntimeEvent) => void>();
 
@@ -30,6 +32,14 @@ export function subscribeRuntime(fn: (e: RuntimeEvent) => void): () => void {
 }
 
 function announce(e: RuntimeEvent) {
+  let uid: string | undefined;
+  try {
+    uid = currentUser();
+  } catch {}
+  if (uid) {
+    if (!e.userId) e.userId = uid;
+    if (e.type === "task" && e.task && !e.task.userId) e.task.userId = uid;
+  }
   for (const s of subs) {
     try {
       s(e);
@@ -72,6 +82,13 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
     origin: input.origin ?? "human",
     priority: input.priority ?? 0,
     tags: input.tags ?? [],
+    userId: (() => {
+      try {
+        return currentUser();
+      } catch {
+        return undefined;
+      }
+    })(),
   };
   await withTasks((tasks) => {
     tasks.push(task);

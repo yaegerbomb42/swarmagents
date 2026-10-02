@@ -139,8 +139,11 @@ export const POST = scoped(async (req: Request, { params }: Ctx) => {
 
 export const DELETE = scoped(async (_req: Request, { params }: Ctx) => {
   const id = (await params).id;
+  const task = getTask(id);
+  if (!task) return new Response("not found", { status: 404 });
   const ok = await deleteTask(id, true);
   clearApprovals(id);
   clearDenials(id);
+  if (!ok) return new Response("not found", { status: 404 });
   return Response.json({ ok });
 });

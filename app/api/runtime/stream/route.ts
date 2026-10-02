@@ -23,6 +23,7 @@ export const GET = scoped(async (req: Request) => {
 
   const enc = new TextEncoder();
   let sub: ((e: RuntimeEvent) => void) | null = null;
+  let unsub: (() => void) | null = null;
   let ping: NodeJS.Timeout | null = null;
   let sweep: NodeJS.Timeout | null = null;
 
@@ -40,7 +41,7 @@ export const GET = scoped(async (req: Request) => {
       sub = (e) => {
         if (filter.admit(e as never)) send({ op: "task", event: e });
       };
-      subscribeRuntime(sub);
+      unsub = subscribeRuntime(sub);
       // Safety net: refresh ownership and push a fresh snapshot when the account's task set changed.
       sweep = setInterval(() => {
         const before = filter.ids();
@@ -50,10 +51,17 @@ export const GET = scoped(async (req: Request) => {
         if (next.size !== size || [...next].some((id) => !before.has(id))) send({ op: "snapshot", tasks: snapshot(), uid });
       }, 10_000);
       ping = setInterval(() => ctrl.enqueue(enc.encode(": ping\n\n")), 20_000);
-      req.signal.addEventListener("abort", () => {
-        if (sub) sub = null;
+      const cleanup = () => {
+        try {
+          if (unsub) unsub();
+        } catch {}
+        sub = null;
+        unsub = null;
         if (ping) clearInterval(ping);
         if (sweep) clearInterval(sweep);
+      };
+      req.signal.addEventListener("abort", () => {
+        cleanup();
         try {
           ctrl.close();
         } catch {}
@@ -62,7 +70,13 @@ export const GET = scoped(async (req: Request) => {
     cancel() {
       if (ping) clearInterval(ping);
       if (sweep) clearInterval(sweep);
-      sub = null;
+      if (sub) {
+        try {
+          if (unsub) unsub();
+        } catch {}
+        sub = null;
+        unsub = null;
+      }
     },
   });
 

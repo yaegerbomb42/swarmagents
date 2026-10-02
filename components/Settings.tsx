@@ -163,7 +163,7 @@ export function Settings({
     const esc = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       if (view === "form") setView(draft?.id ? "list" : "catalog");
-      else if (view === "catalog" && conns.length) setView("list");
+      else if (view === "catalog") setView("list");
       else onClose();
     };
     window.addEventListener("keydown", esc);
@@ -527,13 +527,13 @@ export function Settings({
       <div className="modal st-modal" role="dialog" aria-label="Settings">
         <div className="modal-head">
           <div className="st-head">
-            {view !== "list" && (conns.length > 0 || view === "form") && (
+            {view !== "list" && (
               <button
                 className="st-back"
                 onClick={() =>
                   setView(view === "form" && !draft?.id ? "catalog" : "list")
                 }
-                title="Back"
+                title={view === "catalog" ? "Back to Settings (storage, sub-agents, connections)" : "Back"}
               >
                 ‹
               </button>
@@ -625,7 +625,10 @@ export function Settings({
               {!llms.length && (
                 <p className="sub">
                   Connect at least one model to get started. Everything else is
-                  optional.
+                  optional.{" "}
+                  <button className="st-link" onClick={() => setView("list")}>
+                    Storage and other settings ›
+                  </button>
                 </p>
               )}
               <div className="st-cat-top">

@@ -117,6 +117,25 @@ const PAGES = {
 </script>`,
     "Shadow",
   ),
+
+  "/drag": html(
+    `${NAV}<h1>Drag</h1>
+<div id="src" draggable="true" style="padding:10px;border:1px solid #333;width:120px">drag me</div>
+<div id="dst" style="padding:24px;border:1px dashed #333;margin-top:16px;width:160px">drop here</div>
+<script>
+  const dst = document.getElementById('dst');
+  dst.addEventListener('dragover', e => e.preventDefault());
+  dst.addEventListener('drop', e => { e.preventDefault(); document.title = 'dropped'; dst.textContent = 'dropped'; });
+</script>`,
+    "Drag",
+  ),
+
+  "/echo": html(
+    `${NAV}<h1>Echo</h1>
+<input id="box" oninput="document.getElementById('seen').textContent = 'seen:' + this.value">
+<p id="seen">seen:</p>`,
+    "Echo",
+  ),
 };
 
 export function startSite(port = 0) {

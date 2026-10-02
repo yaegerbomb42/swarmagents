@@ -17,7 +17,9 @@ export async function GET(req: Request) {
   const accounts = listAccounts();
   const known = new Set(allUserIds());
 
-  const day = (t: number) => new Date(t).toLocaleDateString("en-CA"); // YYYY-MM-DD in the server's zone
+  // YYYY-MM-DD in the admin's zone (SWARM_TZ, default America/Chicago), not the container's UTC.
+  const timeZone = process.env.SWARM_TZ || "America/Chicago";
+  const day = (t: number) => new Date(t).toLocaleDateString("en-CA", { timeZone });
   const perDay = new Map<string, number>();
   for (let i = DAYS - 1; i >= 0; i--) perDay.set(day(now - i * 86_400_000), 0);
   for (const a of accounts) {

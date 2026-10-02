@@ -34,17 +34,17 @@ function childEnv(): NodeJS.ProcessEnv {
 // ---- 24h growth guards: a long run must not fill memory or disk ----
 
 /** Foreground output kept in memory before the older part is spilled to disk. */
-const CAPTURE_BYTES = 4 * 1024 * 1024;
+export const CAPTURE_BYTES = 4 * 1024 * 1024;
 /** Newest slice of the capture always kept in memory (it holds the trailing cwd marker). */
-const CAPTURE_TAIL_BYTES = 1024 * 1024;
+export const CAPTURE_TAIL_BYTES = 1024 * 1024;
 /** Live output forwarded to the tool card; past this the full log is on disk instead. */
-const STREAM_BYTES = 256 * 1024;
+export const STREAM_BYTES = 256 * 1024;
 /** Total out-*.log + bg-*.log budget per session. */
-const LOG_BUDGET_BYTES = 200 * 1024 * 1024;
+export const LOG_BUDGET_BYTES = 200 * 1024 * 1024;
 /** Head kept when an oversized log is shrunk in place (startup errors are the useful part). */
-const LOG_HEAD_BYTES = 64 * 1024;
+export const LOG_HEAD_BYTES = 64 * 1024;
 /** A log touched this recently may still be written, so it is not simply deleted. */
-const ACTIVE_LOG_MS = 10 * 60 * 1000;
+export const ACTIVE_LOG_MS = 10 * 60 * 1000;
 
 export const fmtSize = (n: number) => (n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB` : n >= 1 << 10 ? `${Math.round(n / 1024)} KB` : `${n} B`);
 
@@ -192,12 +192,47 @@ export const shell: Tool = {
         // Own process group, so stop/timeout kills the whole pipeline, not just zsh.
         detached: true,
       });
+      // Rolling capture: older output is spilled to disk the moment it passes CAPTURE_BYTES, so a
+      // command that runs for hours cannot grow this process without bound. The newest slice stays in
+      // memory (it carries the cwd marker), and the whole stream still ends up on disk.
       let out = "";
+      let spillPath = "";
+      let spillFd = -1;
+      let dropped = 0;
+      let streamed = 0;
+      let streamNotified = false;
+
+      const capture = (s: string) => {
+        out += s;
+        if (out.length <= CAPTURE_BYTES) return;
+        if (spillFd < 0) {
+          spillPath = path.join(dir, `out-${newId()}.log`);
+          spillFd = fs.openSync(spillPath, "a");
+        }
+        const cut = out.length - CAPTURE_TAIL_BYTES;
+        try {
+          fs.writeSync(spillFd, out.slice(0, cut));
+        } catch {}
+        dropped += cut;
+        out = out.slice(cut);
+      };
+
       const onData = (d: Buffer) => {
         const s = d.toString();
-        out += s;
+        capture(s);
+        // Live feed to the user, also bounded: the tool card stores whatever it is handed.
         const visible = s.split(MARK)[0];
-        if (visible) ctx.onOutput(visible);
+        if (!visible) return;
+        if (streamed >= STREAM_BYTES) {
+          if (!streamNotified) {
+            streamNotified = true;
+            ctx.onOutput(`\n[live output capped at ${fmtSize(STREAM_BYTES)} — the final result and the session log hold the rest]\n`);
+          }
+          return;
+        }
+        const slice = visible.slice(0, STREAM_BYTES - streamed);
+        streamed += slice.length;
+        ctx.onOutput(slice);
       };
       child.stdout.on("data", onData);
       child.stderr.on("data", onData);
@@ -218,12 +253,24 @@ export const shell: Tool = {
         clearTimeout(timer);
         const i = out.lastIndexOf(MARK);
         if (i >= 0) {
-          const dir = out.slice(i + MARK.length).trim();
-          if (dir && fs.existsSync(dir)) ctx.setCwd(dir);
+          const nextDir = out.slice(i + MARK.length).trim();
+          if (nextDir && fs.existsSync(nextDir)) ctx.setCwd(nextDir);
           out = out.slice(0, i);
         }
         out = out.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").trimEnd();
-        resolve({ content: clip(`${out || "(no output)"}\n[exit ${code ?? "killed"} · cwd ${ctx.cwd}]`, 30_000, spill), isError: code !== 0 });
+        if (spillFd >= 0) {
+          // Finish the one full log on disk, then point at it instead of writing a second file.
+          try {
+            fs.writeSync(spillFd, out);
+            fs.closeSync(spillFd);
+          } catch {}
+          spillFd = -1;
+          pruneLogs(ctx.sessionId);
+        }
+        const note = dropped ? `[earlier output (${fmtSize(dropped)}) saved to ${spillPath}]\n` : "";
+        const body = `${note}${out || "(no output)"}\n[exit ${code ?? "killed"} · cwd ${ctx.cwd}]`;
+        const content = spillPath && dropped ? (body.length > 30_000 ? clip(body, 30_000, () => spillPath) : body) : clip(body, 30_000, spill);
+        resolve({ content, isError: code !== 0 });
       });
     });
   },

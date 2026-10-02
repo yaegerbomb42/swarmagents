@@ -382,10 +382,32 @@ const cases = {
 
   async browser() {
     // Real headless Chrome via the browser tool against the mock site.
-    const { events } = await runTask("[mock:browser] try the browser", { timeout: 150_000 });
+    const { sid, events } = await runTask("[mock:browser] try the browser", { timeout: 150_000 });
     const out = texts(events);
     assert(/Browser: download=ok dialog=ok upload=ok recover=ok popup=ok file=ok/.test(out), "browser download/dialog/upload/recover/popup", { said: out.slice(-400), tools: tools(events).map((t) => `${t.name}:${t.status}`) });
-    return "download saved + read back, alert reported, upload, failed click recovered, popup followed";
+    const done = "download saved + read back, alert reported, upload, failed click recovered, popup followed";
+    // The timeline shows those steps as browser windows (components/BrowserView.tsx), once Timeline renders it.
+    if (!fs.readFileSync(path.join(ROOT, "components/Timeline.tsx"), "utf8").includes("BrowserView")) return `${done}; timeline card skipped (not wired)`;
+    const { chromium } = await import("playwright-core");
+    const exe = process.env.SWARM_CHROME_PATH || process.env.CHROME_PATH;
+    const b = await chromium.launch({ headless: true, ...(exe ? { executablePath: exe } : { channel: "chrome" }) });
+    try {
+      const p = await b.newPage({ viewport: { width: 1280, height: 900 } });
+      await p.addInitScript((id) => localStorage.setItem("swarm.active", id), sid);
+      await p.goto(BASE + "/", { waitUntil: "networkidle" });
+      await p.waitForSelector(".bv", { timeout: 20_000 });
+      const ui = await p.evaluate(() => ({
+        cards: document.querySelectorAll(".bv").length,
+        shots: document.querySelectorAll(".bv-view img").length,
+        url: document.querySelector(".bv-url")?.textContent ?? "",
+        notes: [...document.querySelectorAll(".bv-notes li")].map((e) => e.textContent).join(" | "),
+        fail: document.querySelector(".bv-fail")?.textContent ?? "",
+      }));
+      assert(ui.cards >= 6 && ui.shots >= 5 && /127\.0\.0\.1/.test(ui.url) && /Downloaded report\.csv/.test(ui.notes) && /dialog/i.test(ui.notes) && /^Failed:/.test(ui.fail), "timeline browser cards", ui);
+      return `${done}; ${ui.cards} browser cards in the timeline`;
+    } finally {
+      await b.close();
+    }
   },
 
   async files() {

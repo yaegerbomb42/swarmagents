@@ -31,3 +31,10 @@ export const IFile = P("M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V
 export const IActivity = P("M3 12h4l3-8 4 16 3-8h4");
 export const IArrowUp = P("M18 15l-6-6-6 6", 14);
 export const IArrowDown = P("M6 9l6 6 6-6", 14);
+
+// New icons for Composer
+export const ISlash = P("M12 3v18|M3 12h18", 16);
+export const IModel = P("M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z|M3.27 6.96 12 12.01 20.73 6.96", 16);
+export const IKeyboard = P("M20 5H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2z|M8 12h8|M12 8v8", 16);
+export const ICopy = P("M16 1H4a2 2 0 0 0-2 2v14h2M16 1v14M8 17H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7", 16);
+export const ICheck = P("M20 6 9 17l-5-5", 16);

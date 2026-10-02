@@ -1,0 +1,11 @@
+# Overlay: one-time admin bootstrap (the app creates the admin account from these if it doesn't exist).
+# infra/deploy.sh adds it only when the app supports SWARM_ADMIN_PASSWORD_FILE AND the per-user sandbox overlay is
+# active: the password file is root-only (0600) on the VPS (/etc/swarmagents/admin-password, outside the repo), so
+# only the root server process can read it; sandboxed tool processes (their own uids) cannot.
+services:
+  swarmagents-dashboard:
+    environment:
+      - SWARM_ADMIN_EMAIL=yaeger.james42@gmail.com
+      - SWARM_ADMIN_PASSWORD_FILE=/run/secrets/swarm-admin-password
+    volumes:
+      - /etc/swarmagents/admin-password:/run/secrets/swarm-admin-password:ro

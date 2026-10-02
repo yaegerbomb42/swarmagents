@@ -192,8 +192,9 @@ export function Composer({
 
     // ↑/↓ history navigation
     const el = e.currentTarget;
-    const atStart = !el.value.slice(0, el.selectionStart).includes("\n");
-    const atEnd = !el.value.slice(el.selectionEnd).includes("\n");
+    const textarea = el as HTMLTextAreaElement;
+    const atStart = !textarea.value.slice(0, textarea.selectionStart).includes("\n");
+    const atEnd = !textarea.value.slice(textarea.selectionEnd).includes("\n");
     if ((e.key === "ArrowUp" && atStart) || (e.key === "ArrowDown" && atEnd && recall.current.index >= 0)) {
       const hist = sentHistory();
       const r = recall.current;
@@ -228,12 +229,12 @@ export function Composer({
           <div className="files-bar" role="list" aria-label="Attachments">
             {files.map((f) => (
               <span key={f.key} className="file-chip" role="listitem">
-                <IFile size={14} />
+                <IFile />
                 <span className="name" title={f.name}>{f.name}</span>
                 {f.progress < 1 && <span className="progress" style={{ width: `${f.progress * 100}%` }} />}
                 {f.error && <span className="error">{f.error}</span>}
                 <button className="rm" onClick={() => setFiles((x) => x.filter((y) => y.key !== f.key))} aria-label="Remove">
-                  <IX size={12} />
+                  <IX />
                 </button>
               </span>
             ))}
@@ -266,13 +267,13 @@ export function Composer({
                   role="menuitem"
                   onClick={() => handleSlashSelect(cmd)}
                 >
-                  <ISlash size={14} />
+                  <ISlash />
                   <span><strong>{cmd.cmd}</strong> {cmd.desc}</span>
                 </button>
               ))}
               <div className="slash-divider" />
-              <button className="slash-item" onClick={() => { setShowSlash(false); setShowModels(true); }}> <IModel size={14} /> <span>Switch model…</span> </button>
-              <button className="slash-item" onClick={() => { setShowSlash(false); alert("Shortcuts:\nEnter — Send\nShift+Enter — New line\nCmd+Enter — Send\nEsc — Stop / Close\nCmd+K — Commands\n↑/↓ — History"); }}> <IKeyboard size={14} /> <span>Keyboard shortcuts</span> </button>
+              <button className="slash-item" onClick={() => { setShowSlash(false); setShowModels(true); }}> <IModel /> <span>Switch model…</span> </button>
+              <button className="slash-item" onClick={() => { setShowSlash(false); alert("Shortcuts:\nEnter — Send\nShift+Enter — New line\nCmd+Enter — Send\nEsc — Stop / Close\nCmd+K — Commands\n↑/↓ — History"); }}> <IKeyboard /> <span>Keyboard shortcuts</span> </button>
             </div>
           )}
         </div>
@@ -292,9 +293,9 @@ export function Composer({
               aria-expanded={showModels}
               aria-haspopup="menu"
             >
-              <IModel size={14} />
+              <IModel />
               <span>{MODELS.find(m => m.id === selectedModel)?.label ?? selectedModel}</span>
-              <IChevron size={12} open={showModels} />
+              <IChevron open={showModels} />
             </button>
             {showModels && (
               <div className="model-dropdown" role="menu">

@@ -127,6 +127,11 @@ export function AdminAnalytics() {
           <div className="adm-chart-wrap">
             <span className="st-hint">Sign-ups per day, last 30 days</span>
             <Chart data={a.signupsPerDay} />
+            <div className="adm-axis">
+              <span>{a.signupsPerDay[0]?.date}</span>
+              <span>peak {Math.max(0, ...a.signupsPerDay.map((d) => d.n))}/day · today {a.signupsPerDay.at(-1)?.n ?? 0}</span>
+              <span>{a.signupsPerDay.at(-1)?.date}</span>
+            </div>
           </div>
           {(err || note) && <div className={`st-result ${err ? "err" : "ok"}`}>{err || note}</div>}
           <div className="stg-chats">

@@ -53,6 +53,12 @@ iptables -t mangle -A "$CHAIN" -d 169.254.169.254/32 -p tcp --dport 53 -j RETURN
 for net in 169.254.0.0/16 100.64.0.0/10 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8; do
   iptables -t mangle -A "$CHAIN" -d "$net" -j DROP
 done
+# No outbound mail submission from sandboxes (SMTP 25, SMTPS 465, submission 587): agents have web/API
+# tools for legitimate sending (e.g. provider email APIs); a shell path to port 25 is how compromised or
+# abusive tenants spam. IMAP/POP3 stay open (reading your own mailbox is a legitimate agent job).
+for port in 25 465 587; do
+  iptables -t mangle -A "$CHAIN" -p tcp --dport "$port" -j DROP
+done
 
 # Exactly one PREROUTING jump, for the current subnet (drop stale ones if the network was ever recreated).
 iptables -t mangle -S PREROUTING | grep -- "-j $CHAIN" | grep -v -- "-s $SUB " | sed 's/^-A /-D /' | while read -r rule; do

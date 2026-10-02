@@ -1688,4 +1688,6 @@ input, textarea, select {
   --accent: var(--color-accent); --accent-text: var(--color-accent-text);
   --ok: var(--color-ok); --warn: var(--color-warn); --err: var(--color-err); --run: var(--color-run);
   --mono: var(--font-mono);
+  /* deploy lane 22:38: the last 3 undefined names (timeline code bg, settings .st-meta font, Activity popover shadow) */
+  --code-bg: var(--color-code-bg); --sans: var(--font-sans); --shadow: 0 8px 24px rgb(0 0 0 / 0.35);
 }

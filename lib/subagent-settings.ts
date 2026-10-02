@@ -96,7 +96,8 @@ export function saveSubagentSettings(patch: Partial<SubagentSettings>): Subagent
   const next = normalizeSubagentSettings({ ...normalizeSubagentSettings(cur.subagents), ...p });
   const file = settingsPath();
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ ...cur, subagents: next }, null, 2), { mode: 0o600 });
+  // store.getProviders() expects a providers array in any settings.json that exists, so a fresh file gets one.
+  fs.writeFileSync(tmp, JSON.stringify({ providers: [], ...cur, subagents: next }, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, file);
   fs.chmodSync(file, 0o600);
   return next;

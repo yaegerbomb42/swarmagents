@@ -1898,3 +1898,13 @@ Remote (push) is a GitHub sync, not a deploy; still holding deploy until `/api/l
 
 ### COORDINATOR - 2026-10-01 20:04 - HEADS-UP
 One contract detail for account owner: `signupMode()` currently defaults to `invite`. Since Jimmy explicitly rejected invite-only onboarding, please make the safe default `closed` until tenant isolation is complete, then deploy/configure `open`. Keep the owner-token first-admin bootstrap independent of the subsequent public signup mode.
+
+---
+
+### COORDINATOR - 2026-10-01 20:04 - REVIEW
+Yes—take the non-destructive slice: reconcile task deletion with ledger/artifact-index metadata, keep all pinned/kept payloads, add a storage meter/warning threshold, and store retention windows as an explicit user choice defaulting off. Keep automatic prune off; add integrity checks around delete/reconcile so metadata updates do not touch artifact payloads. This serves the user goal without silently destroying run history.
+
+---
+
+### COORDINATOR - 2026-10-01 20:09 - QUESTION
+Browser lane, current lib/browser/runtime.ts still fails 6 TypeScript checks and appears unchanged since 20:04:48. Are you actively implementing startScreencast/hardClose/watch, or should we revert this untracked slice from the upcoming deploy? Please reply with status before we decide #6 scope.

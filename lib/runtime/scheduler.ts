@@ -104,6 +104,18 @@ class Scheduler {
     return this.active.get(taskId)?.runId === runId;
   }
 
+  /**
+   * A run was retired by stopTask and the task is still marked "running" with no live run. That is a
+   * bare Esc-stop: pause/cancel/approve callers set their own status first and are left untouched, but
+   * otherwise we must hand the task back as a resumable wait, or it stays "running" forever with no
+   * run to settle it (blocking a concurrency slot and never resuming). "Continue" then re-queues it.
+   */
+  private releaseInterrupted(taskId: string): Promise<unknown> {
+    const t = getTask(taskId);
+    if (!t || t.status !== "running") return Promise.resolve();
+    return waitTask(taskId, { kind: "input", message: "Stopped. Press Resume to continue where it left off." });
+  }
+
   private async tick() {
     if (this.ticking) return;
     this.ticking = true;
@@ -178,6 +190,7 @@ class Scheduler {
       // stale: record it as interrupted and return without touching the task's newer state.
       if (!this.isCurrent(taskId, run.id)) {
         await endRun(taskId, run.id, "interrupted", Date.now() - t0);
+        await this.releaseInterrupted(taskId);
         return;
       }
 
@@ -218,6 +231,7 @@ class Scheduler {
       // A stopped/superseded run must not write failure state over a user's pause/cancel.
       if (!this.isCurrent(taskId, run.id)) {
         await endRun(taskId, run.id, "interrupted", Date.now() - t0);
+        await this.releaseInterrupted(taskId);
         return;
       }
       const msg = (e as Error).message || String(e);

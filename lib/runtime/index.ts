@@ -8,6 +8,7 @@ export {
   createTask,
   listTasks,
   getTask,
+  taskForSession,
   updateTask,
   setStatus,
   finishTask,

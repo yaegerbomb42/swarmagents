@@ -20,7 +20,8 @@
     "test:router": "tsx tests/router.bench.mjs",
     "test:approvals": "tsx tests/approvals.mjs",
     "test:approvals:store": "tsx tests/approvals.store.mjs",
-    "mock-llm": "node tests/mock-llm.mjs"
+    "mock-llm": "node tests/mock-llm.mjs",
+    "test:tenant": "tsx tests/tenant-connections.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.3",

@@ -94,6 +94,15 @@ export function getTask(id: string): Task | null {
   return loadTasks().find((t) => t.id === id) ?? null;
 }
 
+/**
+ * The live task bound to a session, if any. A task run drives a normal session, so the session's
+ * stop route must find the owning task and abort it through the scheduler - otherwise stopping the
+ * session lets the scheduler's run settle as "done" and the task does not actually stop.
+ */
+export function taskForSession(sessionId: string): Task | null {
+  return loadTasks().find((t) => t.sessionId === sessionId && (t.status === "running" || t.status === "queued" || t.status === "waiting")) ?? null;
+}
+
 /** Apply a mutation to one task atomically and announce the result. */
 export async function updateTask(id: string, fn: (t: Task) => void): Promise<Task | null> {
   let out: Task | null = null;

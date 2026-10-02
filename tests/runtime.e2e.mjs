@@ -192,5 +192,28 @@ await rt.cancelTask(t7.id);
 await sleep(400);
 check("cancel sticks after the run unwinds", getTask(t7.id)?.status === "cancelled", getTask(t7.id)?.status);
 
+console.log("\n8. Esc-stop on a task's session routes through the scheduler (bar: Esc-stop + continue)");
+const t8 = await createTask({ prompt: "HANG please", title: "esc-stop" });
+scheduler().kick();
+await until(() => getTask(t8.id)?.status === "running", 8000);
+const sess8 = getTask(t8.id)?.sessionId;
+check("task exposes its session", !!sess8, sess8 ?? "none");
+const owner = rt.taskForSession(sess8);
+check("taskForSession resolves the live task", owner?.id === t8.id, owner?.id ?? "none");
+// Mirror /api/sessions/[id]/stop: stop the owning task through the scheduler.
+const settled8 = await scheduler().stopTask(owner.id);
+check("session stop reports settled", settled8 === true, String(settled8));
+check("no live run remains for the task", rt.taskForSession(sess8) === null);
+await sleep(300);
+const led8 = getLedger(t8.id);
+check("task run recorded interrupted, not done", led8.runs.some((r) => r.status === "interrupted") && !led8.runs.some((r) => r.status === "done"), led8.runs.map((r) => r.status).join(","));
+check("task parked as resumable, not left running", getTask(t8.id)?.status === "blocked", getTask(t8.id)?.status);
+// It can be resumed (queued again) after an Esc-stop.
+await rt.updateTask(t8.id, (t) => { t.status = "queued"; t.wait = undefined; });
+scheduler().kick();
+await until(() => getTask(t8.id)?.status === "running", 8000);
+check("task resumes after Esc-stop", getTask(t8.id)?.status === "running", getTask(t8.id)?.status);
+await scheduler().stopTask(t8.id);
+
 console.log(`\n${failures === 0 ? "RUNTIME E2E PASS" : `RUNTIME E2E FAIL (${failures})`}`);
 process.exit(failures === 0 ? 0 : 1);

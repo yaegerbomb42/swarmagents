@@ -283,4 +283,57 @@ export class BrowserSession {
       return "The browser profile was locked by another process; the lock was cleared and the retry also failed. Try again.";
     return `Couldn't start the browser: ${msg.split("\n")[0]}`;
   }
+
+  // ---- pages & tabs ----
+
+  /** The page the agent controls right now (recovering from a closed tab or a crash). */
+  async page(): Promise<Page> {
+    const c = await this.context();
+    if (!this.active || this.active.isClosed()) this.active = c.pages().find((p) => !p.isClosed()) ?? (await this.newRawPage());
+    return this.active;
+  }
+
+  private async newRawPage(): Promise<Page> {
+    const p = await this.ctx!.newPage();
+    this.watch(p);
+    this.active = p;
+    return p;
+  }
+
+  /** Open a tab, enforcing the per-session tab cap. */
+  async newPage(url?: string): Promise<Page> {
+    const c = await this.context();
+    if (c.pages().filter((p) => !p.isClosed()).length >= this.limits.maxTabs)
+      throw new Error(`Tab limit reached (${this.limits.maxTabs}). Close a tab before opening another.`);
+    const p = await this.newRawPage();
+    if (url) await p.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
+    this.touch();
+    return p;
+  }
+
+  livePages() {
+    return this.ctx?.pages().filter((p) => !p.isClosed()) ?? [];
+  }
+
+  tabs() {
+    return this.livePages().map((p, i) => ({ index: i + 1, url: p.url(), active: p === this.active }));
+  }
+
+  async switchTab(n: number) {
+    const pages = this.livePages();
+    const p = pages[n - 1];
+    if (!p) throw new Error(`No tab ${n} (there ${pages.length === 1 ? "is 1 tab" : `are ${pages.length} tabs`}).`);
+    this.active = p;
+    await p.bringToFront().catch(() => {});
+    this.touch();
+    return p;
+  }
+
+  async closeTab(n?: number) {
+    const pages = this.livePages();
+    const p = n ? pages[n - 1] : this.active;
+    if (p) await p.close().catch(() => {});
+    this.active = null;
+    return this.page();
+  }
 }

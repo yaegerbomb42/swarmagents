@@ -32,6 +32,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 COPY --from=build /app/.next ./.next
 COPY --from=build /app/next.config.mjs ./next.config.mjs
+# Static files (brand icons, manifest images): `next start` serves ./public; without this they 404.
+COPY --from=build /app/public ./public
 RUN rm -rf .next/cache && chown -R root:root /app && chmod -R a+rX /app
 ENV PORT=3400 HOSTNAME=0.0.0.0 SWARM_HOME=/data HOME=/data/home SHELL=/bin/zsh \
     SWARM_CHROME_PATH=/usr/bin/chromium SWARM_BROWSER_HEADLESS=1 SWARM_BROWSER_NO_SANDBOX=1

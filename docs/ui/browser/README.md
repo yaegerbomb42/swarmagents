@@ -9,7 +9,10 @@ fixture site with the real runtime and saves what the live panel streams.
 | `viewer-modal-open.jpg` | the same page with the modal open |
 | `viewer-after-confirm.jpg` | after the agent confirms the dialog |
 | `viewer-multistep-form.jpg` | the agent part-way through the 3-step form |
-| `session-replay.jsonl` | the bounded replay log the runtime keeps for "replay what happened" |
+| `recording.html` + `recording.jsonl` | the recorded session (keyframes + events); open `recording.html` in a browser to watch it with play/scrub |
+| `public-site-run.jpg` | the real public-site run (`npm run test:browser:public`) reading a docs page |
+
+Regenerate everything with `npm run test:browser:capture` (and `test:browser:public` for the last one).
 
 ## How the stream works
 

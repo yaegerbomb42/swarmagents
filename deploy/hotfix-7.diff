@@ -1,0 +1,12 @@
+--- a/lib/browser/runtime.ts	2026-10-01 21:29:10
++++ b/lib/browser/runtime.ts	2026-10-01 21:29:10
+@@ -246,6 +246,9 @@
+   async context(): Promise<BrowserContext> {
+     if (this.closed) throw new Error("This browser session was closed.");
+     if (this.ctx) return this.ctx;
++    // DEPLOY #7 (deploy lane, snapshot only): the browser stays off on the multi-user server until the per-user
++    // Chromium path (uid profile + downloads handled by root) is reviewed. Jimmy 21:26: ship with the browser off.
++    if (process.env.SWARM_MODE === "server" && process.env.SWARM_BROWSER_SERVER !== "on") throw new Error("The browser isn't available on this multi-user server yet.");
+     if (this.launching) return this.launching;
+     // Per-user sandbox: on a multi-user server Chromium runs as the user's uid (bin/swarm-chromium via
+     // chromiumLaunch) with a uid-owned profile inside the user's workspace, kept apart from the

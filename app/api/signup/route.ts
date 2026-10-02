@@ -1,4 +1,5 @@
-import { checkOwnerToken, clearFailures, noteFailure, serverMode, sessionCookie, throttled } from "@/lib/auth";
+import { checkOwnerToken, clearFailures, clientIp, noteFailure, serverMode, sessionCookie, throttled } from "@/lib/auth";
+import { noteSignup, signupBlocked } from "@/lib/tenant/signup-limit"; // deploy lane: cap successful sign-ups
 import { adminEmail } from "@/lib/tenant/admin";
 import { consumeInvite, createUser, inviteValid, signupMode, startSession, transaction, userCount, usernameTaken, validateCredentials } from "@/lib/users";
 
@@ -30,6 +31,10 @@ export async function POST(req: Request) {
     return Response.json({ error: "The first account needs the server's owner token as its invite code." }, { status: 403 });
   }
 
+  // deploy lane: cap successful sign-ups per client and per hour (lib/tenant/signup-limit.ts).
+  const capped = first ? null : signupBlocked(clientIp(req));
+  if (capped) return Response.json({ error: capped }, { status: 429 });
+
   // Check the invite before the username, so someone without one can't probe which usernames exist.
   if (!first && mode === "invite" && !inviteValid(invite)) {
     await noteFailure(req);
@@ -50,6 +55,7 @@ export async function POST(req: Request) {
     return Response.json({ error: e.message }, { status: e.status });
   }
   clearFailures(req);
+  if (!first) noteSignup(clientIp(req)); // deploy lane
   const res = Response.json({ ok: true, user: { username: created.username, isAdmin: created.isAdmin } });
   res.headers.append("Set-Cookie", sessionCookie(req, startSession(created.id)));
   return res;

@@ -1,0 +1,38 @@
+/* SwarmAgents agent icon tokens (BRAND2). Mirrors tokens.color.agentIcon in lib/design-tokens.ts. */
+:root {
+  --agent-icon-gold: #E8B84A;
+  --agent-icon-orange: #C97A3C;
+  --agent-icon-dot: #5FB0D8;
+  --agent-icon-tile: #0E1118;
+  --agent-icon-fold: #1B2130;
+  --agent-icon-tile-edge: #2A3142;
+}
+/* Light surfaces: deeper gold/orange/blue keep 3:1+ contrast on near-white. Scoped by the light color-scheme so a
+   dark-only app keeps the dark values. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --agent-icon-gold: #A87613;
+    --agent-icon-orange: #B4592A;
+    --agent-icon-dot: #2A86B8;
+    --agent-icon-tile: #F6F2E9;
+    --agent-icon-fold: #E7E0D0;
+    --agent-icon-tile-edge: #DDD5C4;
+  }
+}
+:root[data-theme="light"] {
+  --agent-icon-gold: #A87613;
+  --agent-icon-orange: #B4592A;
+  --agent-icon-dot: #2A86B8;
+  --agent-icon-tile: #F6F2E9;
+  --agent-icon-fold: #E7E0D0;
+  --agent-icon-tile-edge: #DDD5C4;
+}
+
+.agent-icon { display: inline-block; flex-shrink: 0; vertical-align: middle; overflow: visible; }
+/* Mono: everything follows the text color (e.g. inside muted UI, selected rows, print). */
+.agent-icon--mono { --agent-icon-gold: currentColor; --agent-icon-orange: currentColor; --agent-icon-dot: currentColor; }
+
+/* Section headers: icon + label on one baseline. */
+.agent-icon-h { display: inline-flex; align-items: center; gap: 8px; }
+/* Empty states: tile above the message. */
+.agent-icon-empty { display: block; margin: 0 auto 10px; }

@@ -48,6 +48,20 @@ export const tokens = {
     // Code
     codeBg: "#080808",
     codeLine: "#1a1a1a",
+
+    // Agent icon set (components/agent-icons.tsx): gold strokes, orange secondary strokes, blue node dots
+    agentIconGold: "#E8B84A",
+    agentIconOrange: "#C97A3C",
+    agentIconDot: "#5FB0D8",
+    agentIconTile: "#0E1118",
+  },
+
+  // Agent icon colors on light surfaces (applied by components/agent-icons.css under prefers-color-scheme: light)
+  agentIconLight: {
+    gold: "#A87613",
+    orange: "#B4592A",
+    dot: "#2A86B8",
+    tile: "#F6F2E9",
   },
 
   // ── Spacing ──
@@ -253,6 +267,10 @@ export const cssVars = {
   neonStrong: "--color-neon-strong",
   codeBg: "--color-code-bg",
   codeLine: "--color-code-line",
+  agentIconGold: "--agent-icon-gold",
+  agentIconOrange: "--agent-icon-orange",
+  agentIconDot: "--agent-icon-dot",
+  agentIconTile: "--agent-icon-tile",
 
   // Space (mapped to --space-{n})
   space: (n: number | string) => `--space-${n}`,

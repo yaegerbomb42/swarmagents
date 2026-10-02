@@ -28,6 +28,33 @@ const write = (name, buf) => {
   console.log(`wrote docs/ui/browser/${name} (${(buf.length / 1024).toFixed(1)} KB)`);
 };
 
+/** Self-contained player: open docs/ui/browser/recording.html to watch the session frame by frame. */
+const PLAYER = `<!doctype html><meta charset="utf-8"><title>SwarmAgents browser session replay</title>
+<style>body{margin:0;background:#111;color:#eee;font:14px system-ui;padding:16px}img{max-width:100%;border:1px solid #333;border-radius:8px;background:#fff;display:block;min-height:200px}.bar{display:flex;gap:8px;align-items:center;margin:12px 0}button{font:inherit;padding:4px 10px;border-radius:6px;border:1px solid #555;background:#222;color:#eee;cursor:pointer}input{flex:1}meta{color:#999;font-size:12px}</style>
+<div class="bar"><button id="play">Play</button><input id="scrub" type="range" min="0" value="0"><span id="t">&ndash;</span></div>
+<img id="frame" alt="first frame">
+<meta id="meta">loading&hellip;
+<script>
+fetch('./recording.jsonl').then(function(r){return r.text();}).then(function(txt){
+  var entries = txt.split('\\n').filter(Boolean).map(function(l){return JSON.parse(l);});
+  var frames = entries.filter(function(e){return e.kind==='frame';});
+  var events = entries.filter(function(e){return e.kind==='event';});
+  var img = document.getElementById('frame'), scrub = document.getElementById('scrub'), t = document.getElementById('t');
+  document.getElementById('meta').textContent = frames.length + ' frames, ' + events.length + ' events: ' + events.map(function(e){return e.event.type;}).join(', ');
+  scrub.max = Math.max(0, frames.length - 1);
+  var i = 0, timer = null;
+  function show(n){ i = Math.max(0, Math.min(frames.length - 1, n)); var f = frames[i] || {}; img.src = 'data:image/jpeg;base64,' + f.frame;
+    scrub.value = i; t.textContent = (i + 1) + '/' + frames.length + ' ' + (f.ts ? new Date(f.ts).toLocaleTimeString() : ''); }
+  show(0);
+  document.getElementById('play').onclick = function(){
+    if (timer) { clearInterval(timer); timer = null; this.textContent = 'Play'; return; }
+    this.textContent = 'Pause'; var btn = this;
+    timer = setInterval(function(){ if (i >= frames.length - 1) { clearInterval(timer); timer = null; btn.textContent = 'Play'; return; } show(i + 1); }, 400);
+  };
+  scrub.oninput = function(){ show(Number(scrub.value)); };
+});
+</script>`;
+
 try {
   const s = rt.acquire("capture-task");
   const page = await s.page();
@@ -67,4 +94,4 @@ try {
   fs.rmSync(HOME, { recursive: true, force: true });
 }
 
-console.log(failures ? `\n${failures} capture check(s) failed` : "\ncapture artifacts written");
+console.log("\ncapture artifacts written to docs/ui/browser/ (open recording.html to watch)");

@@ -564,3 +564,195 @@ export class BrowserSession {
     this.releaseWaiters();
   }
 }
+
+/** One recorded entry in a session's replay log. */
+export interface ReplayEntry {
+  ts: number;
+  kind: "event" | "frame";
+  event?: BrowserEvent;
+  /** base64 JPEG for keyframes (recorded at ~1/s, not every frame). */
+  frame?: string;
+}
+
+export interface ControlCommand {
+  controller?: "agent" | "user";
+  paused?: boolean;
+  stop?: boolean;
+}
+
+/**
+ * Owns every live browser session. Lives on globalThis so it survives Next's module reloads,
+ * and reaps idle/over-limit sessions so a long run can't leak Chromium processes.
+ */
+export class BrowserRuntime {
+  readonly limits: BrowserLimits;
+  readonly root: string;
+  private sessions = new Map<string, BrowserSession>();
+  private recorder = new Map<string, { entries: ReplayEntry[]; lastFrame: number; subs: (() => void)[] }>();
+  private timer: NodeJS.Timeout | null = null;
+
+  constructor(limits: BrowserLimits = DEFAULT_LIMITS, root = path.join(ROOT, "browsers")) {
+    this.limits = limits;
+    this.root = root;
+    fs.mkdirSync(root, { recursive: true });
+  }
+
+  /** Start the reaper once (idempotent). */
+  watch() {
+    if (this.timer) return;
+    this.timer = setInterval(() => void this.reap(), 30_000);
+    this.timer.unref?.();
+  }
+
+  /** The isolated session for a key, launching it on first use. */
+  acquire(key: string, limits: Partial<BrowserLimits> = {}): BrowserSession {
+    this.watch();
+    const existing = this.sessions.get(key);
+    if (existing && !existing.isClosed) {
+      existing.touch();
+      return existing;
+    }
+    this.evictIfNeeded(key);
+    const s = new BrowserSession(key, { ...this.limits, ...limits }, this.root);
+    this.sessions.set(key, s);
+    this.startRecording(s);
+    return s;
+  }
+
+  get(key: string): BrowserSession | undefined {
+    const s = this.sessions.get(key);
+    return s && !s.isClosed ? s : undefined;
+  }
+
+  /** Live sessions for the status endpoint / grid view. */
+  list() {
+    return [...this.sessions.values()].filter((s) => !s.isClosed).map((s) => s.status());
+  }
+
+  async release(key: string, reason = "stopped") {
+    const s = this.sessions.get(key);
+    if (!s) return false;
+    await s.close(reason);
+    this.sessions.delete(key);
+    this.stopRecording(key);
+    return true;
+  }
+
+  /** Apply a viewer control command (take-over / hand-back / pause / resume / stop). */
+  async control(key: string, cmd: ControlCommand) {
+    const s = this.get(key);
+    if (!s) return { ok: false as const, error: "no live browser session", status: null };
+    if (cmd.stop) {
+      await this.release(key, "stopped by user");
+      return { ok: true as const, status: null };
+    }
+    if (cmd.controller) s.setController(cmd.controller);
+    if (typeof cmd.paused === "boolean") s.setPaused(cmd.paused);
+    s.touch();
+    return { ok: true as const, status: s.status() };
+  }
+
+  /** Close sessions past their wall-clock or idle cap, and drop dead entries. */
+  async reap() {
+    const now = Date.now();
+    for (const [key, s] of [...this.sessions]) {
+      if (s.isClosed) {
+        this.sessions.delete(key);
+        this.stopRecording(key);
+        continue;
+      }
+      if (this.limits.wallMs && now - s.startedAt > this.limits.wallMs) {
+        await this.release(key, "session time limit reached");
+        continue;
+      }
+      if (this.limits.idleMs && now - s.lastActiveAt > this.limits.idleMs) await this.release(key, "closed after inactivity");
+    }
+  }
+
+  private evictIfNeeded(incoming: string) {
+    const live = [...this.sessions.values()].filter((s) => !s.isClosed && s.key !== incoming);
+    if (live.length < this.limits.maxLive) return;
+    // Close the least-recently-used session to stay within the live-browser cap.
+    const oldest = live.sort((a, b) => a.lastActiveAt - b.lastActiveAt)[0];
+    void this.release(oldest.key, "evicted (too many live browsers)");
+  }
+
+  /** Reopen the sessions that were live before a restart (best-effort, capped). */
+  async resumeAll() {
+    let dirs: string[] = [];
+    try {
+      dirs = fs.readdirSync(this.root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch {
+      return [];
+    }
+    const resumed: string[] = [];
+    for (const dir of dirs) {
+      if (this.sessions.size >= this.limits.maxLive) break;
+      const stateFile = path.join(this.root, dir, "session-state.json");
+      if (!fs.existsSync(stateFile)) continue;
+      try {
+        const { key, urls } = JSON.parse(fs.readFileSync(stateFile, "utf8")) as { key?: string; urls?: string[] };
+        if (!key || !urls?.length || this.sessions.has(key)) continue;
+        const s = new BrowserSession(key, this.limits, this.root);
+        this.sessions.set(key, s);
+        this.startRecording(s);
+        await s.resume();
+        resumed.push(key);
+      } catch {}
+    }
+    return resumed;
+  }
+
+  // ---- recording / replay ----
+
+  private startRecording(s: BrowserSession) {
+    const rec = { entries: [] as ReplayEntry[], lastFrame: 0, subs: [] as (() => void)[] };
+    rec.subs.push(
+      s.onEvent((e) => {
+        rec.entries.push({ ts: e.ts, kind: "event", event: e });
+        this.trim(rec);
+      }),
+    );
+    rec.subs.push(
+      s.onFrame((f) => {
+        // Keep ~1 keyframe per second so replay stays cheap but still shows the story.
+        if (f.ts - rec.lastFrame < 1000) return;
+        rec.lastFrame = f.ts;
+        rec.entries.push({ ts: f.ts, kind: "frame", frame: f.data });
+        this.trim(rec);
+      }),
+    );
+    this.recorder.set(s.key, rec);
+  }
+
+  private stopRecording(key: string) {
+    const rec = this.recorder.get(key);
+    if (!rec) return;
+    for (const off of rec.subs) off();
+    rec.subs = [];
+    // Persist the tail so the user can replay a session after it has closed.
+    try {
+      const file = path.join(this.root, keySlug(key), "recording.jsonl");
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.appendFileSync(file, rec.entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    } catch {}
+    this.recorder.delete(key);
+  }
+
+  /** Bound the in-memory replay buffer (~40 min at 1 keyframe/s plus events). */
+  private trim(rec: { entries: ReplayEntry[] }) {
+    if (rec.entries.length > 2400) rec.entries.splice(0, rec.entries.length - 2400);
+  }
+
+  /** In-memory replay log for a key: the keyframes and events recorded so far. */
+  replay(key: string): ReplayEntry[] {
+    return [...(this.recorder.get(key)?.entries ?? [])];
+  }
+}
+
+const g = globalThis as unknown as { __swarmBrowser?: BrowserRuntime };
+/** The process-wide browser runtime (survives Next module reloads in dev). */
+export function browserRuntime(): BrowserRuntime {
+  if (!g.__swarmBrowser) g.__swarmBrowser = new BrowserRuntime();
+  return g.__swarmBrowser;
+}

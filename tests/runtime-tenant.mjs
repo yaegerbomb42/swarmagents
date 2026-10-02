@@ -33,7 +33,7 @@ function makeSession(title) {
   return m.id;
 }
 
-const { setAgentAdapter, scheduler, createTask, getTask, listTasks, grantApproval, takeApproval, recordDenial, isDenied, runtimeDir, loadRuntimeSettings, saveRuntimeSettings } = rt;
+const { setAgentAdapter, scheduler, createTask, getTask, listTasks, grantApproval, takeApproval, recordDenial, isDenied, runtimeDir, loadRuntimeSettings, saveRuntimeSettings, subscribeRuntime } = rt;
 const { runAs, allUserIds } = store;
 
 const A = "aaaaaaaaaaaaaaaa";
@@ -144,6 +144,25 @@ try {
     const settled = await runAs(B, () => scheduler().stopTask(aTaskId));
     assert.equal(settled, true);
     assert.equal(runAs(A, () => getTask(aTaskId)).status, "done");
+  });
+
+  await t("a created task is announced only after it is committed, so the stream can prove ownership", async () => {
+    // The live task stream (app/api/runtime/stream/route.ts) admits an unknown id by re-reading the
+    // account's own task list through lib/runtime/stream-filter.ts. That only works if the row is on
+    // disk by the time the event fires — otherwise the account's own new task is denied and surfaces
+    // only on the 10s safety sweep (measured ~9.8s dead latency). Lock the ordering in.
+    const marker = "announce-order-probe";
+    const seen = [];
+    const off = subscribeRuntime((e) => {
+      if (e.type !== "task" || !e.task.prompt.includes(marker)) return;
+      // At announce time the task MUST already be persisted and visible to a fresh read.
+      seen.push({ id: e.task.id, persisted: runAs(A, () => getTask(e.task.id)) });
+    });
+    const created = await runAs(A, () => createTask({ prompt: `${marker} task`, sessionId: makeSession("announce probe") }));
+    off();
+    assert.equal(seen.length, 1, `exactly one create event, saw ${seen.length}`);
+    assert.equal(seen[0].id, created.id, "event carries the created task id");
+    assert.ok(seen[0].persisted, "the task is on disk when the create event fires");
   });
 
   console.log(`\nRUNTIME TENANT PASS (${pass})`);

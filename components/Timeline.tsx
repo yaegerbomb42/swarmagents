@@ -2,7 +2,6 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import rehypeShiki from "@shikijs/rehype";
 import type { AgentEvent } from "@/lib/types";
 import { IChevron, IFile, ICheck, IX, ICopy } from "./icons";
 import { stepIcon, toolAccent } from "./StepIcons";
@@ -18,22 +17,18 @@ const fmtDur = (ms: number) => (ms < 1000 ? `${ms}ms` : ms < 60000 ? `${(ms / 10
 
 // ═══════ Shared helpers ═══════
 
+// HOTFIX #9 (deploy lane, 21:50 CT): @shikijs/rehype is async, and react-markdown renders synchronously, so it threw
+// "`runSync` finished async" and crashed every chat with an assistant reply ("Application error"). Markdown now
+// renders synchronously with plain code blocks; each block is highlighted afterwards in the browser (lazy shiki
+// import, plain text stays if it fails). Guarded by tests/markdown-render.mjs.
 const Md = memo(function Md({ text, streaming }: { text: string; streaming?: boolean }) {
   return (
     <div className={`md${streaming ? " caret" : ""}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[[rehypeShiki, { theme: "github-dark" }]]}
         components={{
           a: (p) => <a {...p} target="_blank" rel="noreferrer" />,
-          code: (p) => {
-            const { children, ...props } = p;
-            const childStr = typeof children === "string" ? children : "";
-            const inline = !childStr.includes("\n");
-            if (inline) return <code {...props}>{children}</code>;
-            return <pre><code {...props}>{children}</code></pre>;
-          },
-          pre: (p) => <CodeBlock {...p} />,
+          pre: (p) => <CodeBlock {...p} streaming={streaming} />,
         }}
       >
         {text}
@@ -42,41 +37,57 @@ const Md = memo(function Md({ text, streaming }: { text: string; streaming?: boo
   );
 });
 
-function CodeBlock({ children, className, ...props }: React.HTMLAttributes<HTMLPreElement>) {
+const HIGHLIGHT_MAX = 20_000;
+
+function CodeBlock({ children, streaming }: React.HTMLAttributes<HTMLPreElement> & { streaming?: boolean }) {
   const [copied, setCopied] = useState(false);
-  const codeRef = useRef<HTMLPreElement>(null);
-  
+  const [html, setHtml] = useState<string | null>(null);
+  // react-markdown gives <pre><code className="language-x">…</code></pre>; read the language and text off the code child.
+  const child = (Array.isArray(children) ? children[0] : children) as React.ReactElement<{ className?: string; children?: React.ReactNode }> | undefined;
+  const codeClass = child && typeof child === "object" && "props" in child ? child.props.className ?? "" : "";
+  const raw = child && typeof child === "object" && "props" in child ? child.props.children : children;
+  const code = (Array.isArray(raw) ? raw.join("") : typeof raw === "string" ? raw : "").replace(/\n$/, "");
+  const language = (codeClass.match(/language-([\w+#.-]+)/) ?? [])[1] ?? "";
+
+  useEffect(() => {
+    setHtml(null);
+    if (streaming || !language || !code || code.length > HIGHLIGHT_MAX) return;
+    let cancelled = false;
+    import("shiki")
+      .then(({ codeToHtml }) => codeToHtml(code, { lang: language, theme: "github-dark" }))
+      .then((out) => {
+        if (!cancelled) setHtml(out);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [code, language, streaming]);
+
   const copy = async () => {
-    if (codeRef.current) {
-      const code = codeRef.current.querySelector("code");
-      if (code) {
-        await navigator.clipboard.writeText(code.textContent || "");
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      }
-    }
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
   };
 
-  // Extract language from className (shiki adds language-* class)
-  const langMatch = (className as string || "").match(/language-(\w+)/);
-  const language = langMatch ? langMatch[1] : "";
-
   return (
-    <div className={`code-block ${className || ""}`}>
+    <div className={`code-block${language ? ` language-${language}` : ""}`}>
       <div className="code-block-header">
         {language && <span className="code-lang">{language}</span>}
-        <button
-          className="code-copy-btn"
-          onClick={copy}
-          aria-label={copied ? "Copied!" : "Copy code"}
-          title={copied ? "Copied!" : "Copy code"}
-        >
+        <button className="code-copy-btn" onClick={copy} aria-label={copied ? "Copied!" : "Copy code"} title={copied ? "Copied!" : "Copy code"}>
           {copied ? <ICheck /> : <ICopy />}
         </button>
       </div>
-      <pre ref={codeRef} className={className as string}>
-        {children}
-      </pre>
+      {html ? (
+        // shiki escapes the code it tokenizes; the markup is its own <pre class="shiki"> spans.
+        <div className="code-block-hl" dangerouslySetInnerHTML={{ __html: html }} />
+      ) : (
+        <pre className={codeClass || undefined}>
+          <code className={codeClass || undefined}>{code}</code>
+        </pre>
+      )}
     </div>
   );
 }

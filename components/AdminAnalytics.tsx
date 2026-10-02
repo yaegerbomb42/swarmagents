@@ -55,6 +55,7 @@ export function AdminAnalytics() {
   const [admin, setAdmin] = useState(false);
   const [a, setA] = useState<A | null>(null);
   const [err, setErr] = useState("");
+  const [note, setNote] = useState("");
 
   useEffect(() => {
     fetch("/api/me")
@@ -78,6 +79,17 @@ export function AdminAnalytics() {
     const quotaMB = v === "default" ? null : Number(v);
     const r = await fetch("/api/admin/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ userId: u.id, quotaMB }) });
     if (!r.ok) setErr((await r.json().catch(() => ({}))).error ?? `HTTP ${r.status}`);
+    load();
+  };
+
+  const remove = async (u: U) => {
+    const typed = window.prompt(`Delete ${u.username} and everything they stored (${fmtBytes(u.storage.used)}: chats, files, keys)? Their running work is stopped and they are signed out. This can't be undone.\n\nType the username to confirm:`);
+    if (typed === null) return;
+    setErr("");
+    const r = await fetch("/api/admin/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ userId: u.id, action: "delete", confirm: typed.trim() }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) setErr(d.error ?? `HTTP ${r.status}`);
+    else setNote(`Deleted ${d.username}: ${d.chats} chats, ${fmtBytes(d.freed)} freed.`);
     load();
   };
 
@@ -116,7 +128,7 @@ export function AdminAnalytics() {
             <span className="st-hint">Sign-ups per day, last 30 days</span>
             <Chart data={a.signupsPerDay} />
           </div>
-          {err && <div className="st-result err">{err}</div>}
+          {(err || note) && <div className={`st-result ${err ? "err" : "ok"}`}>{err || note}</div>}
           <div className="stg-chats">
             {a.users.map((u) => (
               <div key={u.id} className="adm-user">
@@ -140,6 +152,13 @@ export function AdminAnalytics() {
                   ))}
                   {u.storage.custom && u.storage.limit && ![256, 512, 1024, 2048, 5120, 10240].includes(Math.round(u.storage.limit / 1024 ** 2)) && <option value={String(Math.round(u.storage.limit / 1024 ** 2))}>{fmtBytes(u.storage.limit)}</option>}
                 </select>
+                {u.isAdmin ? (
+                  <span className="adm-del-gap" />
+                ) : (
+                  <button className="stg-del" title={`Delete ${u.username} and all their data`} onClick={() => remove(u)}>
+                    Delete
+                  </button>
+                )}
               </div>
             ))}
           </div>

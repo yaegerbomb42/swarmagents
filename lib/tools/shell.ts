@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { sessionDir, newId } from "../store";
-import { redactSavedKeys } from "../connections";
+import { redactSavedKeys, terminalEnv } from "../connections";
 import { clip, type Tool } from "./types";
 import { identity, sandboxCommand, sandboxEnv } from "../sandbox";
 
@@ -40,10 +40,11 @@ function childEnv(): NodeJS.ProcessEnv {
   const sb = sandboxEnv();
   if (Object.keys(sb).length) delete env.SWARM_HOME;
   Object.assign(env, sb);
-  // NOTE: saved tool keys are deliberately NOT exported here. The coordinator declined global
-  // saved-key injection into the shell env (GROUP_CHAT 19:38): an agent-run `env` would expose every
-  // saved credential at once. Keys stay reachable through api_request (host-scoped) and MCP per-server
-  // auth; output paths are still passed through redactSavedKeys so no key reaches the transcript.
+  // K2 (Grok Bot, announced 21:31): only keys the user opted in one by one (Settings → key → "Available in the
+  // terminal", off by default). terminalEnv() never returns SWARM_*/PATH/HOME/LD_* names; output stays masked below.
+  Object.assign(env, terminalEnv());
+  // Saved keys are NOT exported wholesale (GROUP_CHAT 19:38: an agent-run `env` would expose every credential).
+  // Only the per-key opt-ins above are; api_request (host-scoped) and MCP per-server auth cover the rest.
   return env;
 }
 

@@ -75,9 +75,13 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
   };
   await withTasks((tasks) => {
     tasks.push(task);
-    announce({ type: "task", task });
     return tasks;
   });
+  // Announce only after the write has committed: a subscriber that re-reads storage to prove
+  // ownership (lib/runtime/stream-filter.ts) must be able to see the row it is being told about.
+  // Announcing inside withTasks() fired before saveTasks(), so a brand-new task was invisible to
+  // the account's own stream until the 10s sweep — measured ~9.8s of dead latency on create.
+  announce({ type: "task", task });
   return task;
 }
 
@@ -112,8 +116,10 @@ export async function updateTask(id: string, fn: (t: Task) => void): Promise<Tas
     fn(t);
     t.updatedAt = Date.now();
     out = { ...t };
-    announce({ type: "task", task: out });
   });
+  // Announced after commit, not inside the write (see createTask): the stream proves ownership by
+  // re-reading storage, which must already contain the update we are broadcasting.
+  if (out) announce({ type: "task", task: out });
   return out;
 }
 
@@ -165,8 +171,8 @@ export async function deleteTask(id: string, removeSession = true): Promise<bool
     found = true;
     const [t] = tasks.splice(i, 1);
     if (removeSession) deleteSession(t.sessionId);
-    announce({ type: "removed", id });
   });
+  if (found) announce({ type: "removed", id }); // after commit (see createTask)
   return found;
 }
 

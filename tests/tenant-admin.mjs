@@ -124,6 +124,25 @@ try {
     assert.equal(st.storageLimit(bob.id), 512 * 1024 * 1024, "back to the default");
   });
 
+  await t("delete user: admin only, needs the username, never an admin; removes the account, its logins and its data", async () => {
+    const home = (await import("../lib/store.ts")).userHome;
+    const bobHome = home(bob.id);
+    fs.writeFileSync(path.join(bobHome, "note.txt"), "bob's data");
+    const del = (token, body) => adminUsers.POST(req("/api/admin/users", { method: "POST", token, body: { action: "delete", ...body } }));
+    assert.equal((await del(aliceToken, { userId: bob.id, confirm: "bob" })).status, 403, "a non-admin can't delete anyone");
+    assert.equal((await del(adminToken, { userId: bob.id, confirm: "not-bob" })).status, 400, "wrong confirmation refused");
+    assert.equal((await del(adminToken, { userId: adminUser.id, confirm: adminUser.username })).status, 409, "an admin can't be deleted");
+    assert.ok(fs.existsSync(path.join(bobHome, "note.txt")), "nothing removed by refused calls");
+    const r = await del(adminToken, { userId: bob.id, confirm: "BOB" });
+    assert.equal(r.status, 200, await r.clone().text());
+    assert.equal(users.userById(bob.id), null, "account gone");
+    assert.equal(users.userForToken(bobToken), null, "his login no longer works");
+    assert.equal(users.authenticate("bob", "bob-password-1234"), null, "can't sign in");
+    assert.ok(!fs.existsSync(bobHome), "his files are gone");
+    assert.equal((await del(adminToken, { userId: bob.id, confirm: "bob" })).status, 404, "second delete: no such user");
+    assert.ok(users.userById(adminUser.id) && users.authenticate("admin-test-2", "x") === null);
+  });
+
   console.log(`tenant-admin: ${pass}/${pass} pass`);
 } catch (e) {
   console.error(`  FAIL after ${pass} passed:`, e?.message ?? e);

@@ -124,6 +124,21 @@ export function setUserQuota(id: string, bytes: number | null): boolean {
   return Number(db().prepare("UPDATE users SET quota_bytes = ? WHERE id = ?").run(bytes, id).changes) > 0;
 }
 
+/**
+ * Admin delete: remove an account and its logins. Returns the row as it was (with its OS uid), or null if it didn't
+ * exist. Admin accounts are refused here; the caller removes the account's files and stops its runs.
+ */
+export function deleteUser(id: string): (AccountRow & { osUid: number | null }) | null {
+  const d = db();
+  return transaction(() => {
+    const r = d.prepare("SELECT * FROM users WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    if (!r || r.is_admin) return null;
+    d.prepare("DELETE FROM login_sessions WHERE user_id = ?").run(id);
+    d.prepare("DELETE FROM users WHERE id = ?").run(id);
+    return { ...toRow(r), osUid: r.os_uid == null ? null : Number(r.os_uid) };
+  });
+}
+
 /** The OS uid (and gid) a user's tool processes run as. */
 export function osUid(userId: string): number {
   const d = db();

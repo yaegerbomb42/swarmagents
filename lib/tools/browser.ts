@@ -1,19 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
-import { chromium, type BrowserContext, type Page } from "playwright-core";
-import { BROWSER_PROFILE } from "../store";
+import type { Page } from "playwright-core";
+import { browserRuntime, type BrowserSession } from "../browser";
 import { clip, type Tool } from "./types";
 
-// One persistent Chrome for the whole app: visible on a desktop so the user can watch, headless on a
-// server without a display. Logins stick between tasks.
-let ctxP: Promise<BrowserContext> | null = null;
-let current: Page | null = null;
-/** Things that happened outside the action itself (downloads, dialogs, new tabs); reported with the next observation. */
-const notes: string[] = [];
-const pendingDownloads = new Set<Promise<void>>();
-let downloadDir = path.join(process.cwd(), "downloads");
-// What each numbered element on the last observed page is ("button "Place order""), so an approval
-// gate can see what a click on [12] would actually press before it runs.
+// The tool is a thin layer over lib/browser (the browser runtime): every task gets its own isolated
+// Chromium context, profile and downloads folder with hard limits, the runtime watches downloads,
+// dialogs and popups, and it streams a CDP screencast to the live viewer. This file turns model
+// actions into page operations plus the compact observation the model reasons from.
+//
+// Control lives in the runtime: if the user has hit "Take over" (a login, a 2FA code, a captcha), the
+// next action waits until they hand the browser back instead of fighting them for the mouse.
+
+/** What each numbered element on the last observed page is ("button \"Place order\""), so an approval
+ *  gate can see what a click on [12] would actually press before it runs. Keyed by task so a
+ *  sub-agent never reads another task's labels; `lastElements` tracks the most recent task. */
+const elementsByTask = new Map<string, Map<number, string>>();
 let lastElements = new Map<number, string>();
 
 /** Plain-words description of what a browser action would act on, from the last observation:
@@ -25,134 +27,23 @@ export function browserTargetLabel(input: Record<string, unknown>): string | und
   return undefined;
 }
 
-const headless = () =>
-  process.env.SWARM_BROWSER_HEADLESS === "1" ||
-  (process.platform === "linux" &&
-    !process.env.DISPLAY &&
-    !process.env.WAYLAND_DISPLAY);
-
-function launchOptions() {
-  const exe = process.env.SWARM_CHROME_PATH || process.env.CHROME_PATH;
-  const args = ["--window-size=1280,900"];
-  if (process.platform === "linux") args.push("--disable-dev-shm-usage");
-  if (process.env.SWARM_BROWSER_NO_SANDBOX === "1") args.push("--no-sandbox");
-  const h = headless();
-  return {
-    exe,
-    base: {
-      headless: h,
-      acceptDownloads: true,
-      args,
-      env: browserEnv(),
-      viewport: h ? { width: 1280, height: 860 } : null,
-    },
-  };
-}
-
-/** Chrome doesn't need the server's secrets: drop SWARM_* and anything that looks like a credential. */
-function browserEnv() {
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env))
-    if (v !== undefined && !k.startsWith("SWARM_") && !/KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH/i.test(k)) env[k] = v;
-  return env;
-}
-
-function uniquePath(dir: string, name: string) {
-  const safe = (name || "download").replace(/[/\\:\0]/g, "_").slice(0, 180);
-  const ext = path.extname(safe);
-  const stem = safe.slice(0, safe.length - ext.length);
-  let file = path.join(dir, safe);
-  for (let i = 2; fs.existsSync(file); i++)
-    file = path.join(dir, `${stem} (${i})${ext}`);
-  return file;
-}
-
-const fmtSize = (n: number) =>
-  n < 1024
-    ? `${n} B`
-    : n < 1024 ** 2
-      ? `${(n / 1024).toFixed(1)} KB`
-      : `${(n / 1024 ** 2).toFixed(1)} MB`;
-
-function watch(p: Page) {
-  p.on("download", (d) => {
-    const job = (async () => {
-      try {
-        fs.mkdirSync(downloadDir, { recursive: true });
-        const file = uniquePath(downloadDir, d.suggestedFilename());
-        await d.saveAs(file);
-        notes.push(
-          `Downloaded ${path.basename(file)} (${fmtSize(fs.statSync(file).size)}) to ${file}`,
-        );
-      } catch (e) {
-        notes.push(
-          `Download of ${d.suggestedFilename()} failed: ${(e as Error).message.split("\n")[0]}`,
-        );
-      }
-    })();
-    pendingDownloads.add(job);
-    job.finally(() => pendingDownloads.delete(job));
-  });
-  p.on("dialog", (d) => {
-    notes.push(
-      `Page ${d.type()} dialog: "${d.message().slice(0, 300)}" (accepted)`,
-    );
-    d.accept(d.type() === "prompt" ? d.defaultValue() : undefined).catch(
-      () => {},
-    );
-  });
-}
-
-async function context() {
-  if (!ctxP) {
-    const { exe, base } = launchOptions();
-    ctxP = (
-      exe
-        ? chromium.launchPersistentContext(BROWSER_PROFILE, {
-            ...base,
-            executablePath: exe,
-          })
-        : chromium.launchPersistentContext(BROWSER_PROFILE, {
-            ...base,
-            channel: "chrome",
-          })
-    ).catch(() =>
-      chromium.launchPersistentContext(BROWSER_PROFILE, {
-        ...base,
-        viewport: base.viewport ?? { width: 1280, height: 860 },
-      }),
-    );
-    const c = await ctxP.catch((e) => {
-      ctxP = null;
-      const msg = String((e as Error).message ?? e);
-      throw new Error(
-        /Executable doesn't exist|not found|ENOENT|install/i.test(msg)
-          ? "No Chrome/Chromium is installed for the browser tool. Install Google Chrome (desktop) or chromium (server) and set SWARM_CHROME_PATH if it isn't on the default path."
-          : /display|X server|ozone/i.test(msg)
-            ? "Chrome couldn't open a window (no display). Set SWARM_BROWSER_HEADLESS=1 to run it headless."
-            : `Couldn't start the browser: ${msg.split("\n")[0]}`,
-      );
-    });
-    c.on("close", () => ((ctxP = null), (current = null)));
-    c.pages().forEach(watch);
-    c.on("page", (p) => {
-      watch(p);
-      if (current && !current.isClosed())
-        notes.push(
-          `A new tab opened${p.url() && p.url() !== "about:blank" ? ` (${p.url()})` : ""}; now controlling it. Use tab_switch to go back.`,
-        );
-      current = p;
-    });
+/** The task's browser session (created on first use) and the label map the approval gate reads. */
+export function browserSession(key: string): BrowserSession {
+  const s = browserRuntime().acquire(key);
+  let labels = elementsByTask.get(key);
+  if (!labels) {
+    labels = new Map();
+    if (elementsByTask.size > 64) elementsByTask.delete(elementsByTask.keys().next().value as string);
+    elementsByTask.set(key, labels);
   }
-  return ctxP;
+  lastElements = labels;
+  return s;
 }
 
-async function page() {
-  const c = await context();
-  if (!current || current.isClosed())
-    current = c.pages().find((p) => !p.isClosed()) ?? (await c.newPage());
-  return current;
-}
+// Snapshot / observation helpers only from here on: launching, limits, downloads, dialogs, tabs and
+// the screencast all belong to lib/browser/runtime.ts.
+
+// Watch/launch/tabs/downloads/dialogs now come from BrowserSession (lib/browser/runtime.ts).
 
 // Label interactive elements with numbers so the model can act by index, like a human pointing.
 const SNAPSHOT = `(() => {
@@ -171,18 +62,6 @@ const SNAPSHOT = `(() => {
   const text = document.body.innerText.replace(/\\n\\s*\\n+/g,'\\n').slice(0, 12000);
   return { title: document.title, url: location.href, elements: out.slice(0, 400).join('\\n'), text };
 })()`;
-
-async function settleDownloads(ms = 30_000) {
-  if (!pendingDownloads.size) return;
-  await Promise.race([
-    Promise.allSettled([...pendingDownloads]),
-    new Promise((r) => setTimeout(r, ms)),
-  ]);
-  if (pendingDownloads.size)
-    notes.push(
-      `${pendingDownloads.size} download(s) still in progress; they'll be reported when done.`,
-    );
-}
 
 const MARKS_ON = `(() => {
   const host = document.createElement('div');
@@ -205,21 +84,22 @@ const MARKS_ON = `(() => {
 })()`;
 const MARKS_OFF = `document.getElementById('__swarm_marks')?.remove()`;
 
-async function observe(p: Page, note: string, full = false) {
+async function observe(s: BrowserSession, p0: Page, note: string, full = false, wantShot = true) {
   // A click may have opened a tab (target=_blank, window.open); report the tab we're now controlling.
   await new Promise((r) => setTimeout(r, 150));
-  if (current && current !== p && !current.isClosed()) p = current;
-  if (p.isClosed()) p = await page();
+  let p = p0;
+  try {
+    const active = await s.page();
+    if (!active.isClosed() && active !== p) p = active;
+  } catch {}
+  if (p.isClosed()) p = await s.page();
   await p
     .waitForLoadState("domcontentloaded", { timeout: 10_000 })
     .catch(() => {});
   await p.waitForTimeout(400);
-  await settleDownloads();
-  if (notes.length)
-    note = `${note}\n${notes
-      .splice(0)
-      .map((n) => `• ${n}`)
-      .join("\n")}`;
+  await s.settleDownloads();
+  const happenings = s.drainNotes();
+  if (happenings.length) note = `${note}\n${happenings.map((n) => `• ${n}`).join("\n")}`;
   const snap = (await p
     .evaluate(SNAPSHOT)
     .catch(() => ({
@@ -228,30 +108,28 @@ async function observe(p: Page, note: string, full = false) {
       elements: "",
       text: "",
     }))) as Record<string, string>;
-  lastElements = new Map(
-    String(snap.elements ?? "")
-      .split("\n")
-      .flatMap((l) => {
-        const m = /^\[(\d+)\]\s+(.*?)(?:\s+->\s.*)?$/.exec(l.trim());
-        return m ? [[Number(m[1]), m[2]] as [number, string]] : [];
-      }),
-  );
+  // Refill in place: browserTargetLabel reads this same Map for the approval gate.
+  lastElements.clear();
+  for (const l of String(snap.elements ?? "").split("\n")) {
+    const m = /^\[(\d+)\]\s+(.*?)(?:\s+->\s.*)?$/.exec(l.trim());
+    if (m) lastElements.set(Number(m[1]), m[2]);
+  }
   // Set-of-marks: draw each element's number on the screenshot so the model (and the user reading the
   // timeline) can match "[12] button" to what's on screen. Removed right after the capture.
-  const marks = process.env.SWARM_BROWSER_MARKS !== "0" && (await p.evaluate(MARKS_ON).catch(() => false));
-  const shot = await p
-    .screenshot({ type: "jpeg", quality: 60 })
-    .catch(() => null);
+  const marks = wantShot && process.env.SWARM_BROWSER_MARKS !== "0" && (await p.evaluate(MARKS_ON).catch(() => false));
+  const shot = wantShot
+    ? await p
+        .screenshot({ type: "jpeg", quality: 55 })
+        .catch(() => null)
+    : null;
   if (marks) await p.evaluate(MARKS_OFF).catch(() => {});
-  const tabs = p.context().pages();
+  const tabs = s.livePages();
   return {
     content: clip(
       `${note}\nTab ${tabs.indexOf(p) + 1}/${tabs.length}: ${snap.title}\n${snap.url}\n\nInteractive elements:\n${snap.elements || "(none)"}${full ? `\n\nPage text:\n${snap.text}` : ""}`,
       40_000,
     ),
-    images: shot
-      ? [{ mediaType: "image/jpeg", data: shot.toString("base64") }]
-      : undefined,
+    images: shot ? [{ mediaType: "image/jpeg", data: shot.toString("base64") }] : undefined,
   };
 }
 
@@ -262,11 +140,31 @@ const target = (p: Page, input: Record<string, unknown>) =>
       ? p.locator(String(input.selector)).first()
       : p.getByText(String(input.text), { exact: false }).first();
 
+/**
+ * Wait while the user holds the browser (after "Take over") or while it is paused, so a login, a 2FA
+ * code or a captcha is theirs to finish. Resolves false when it is safe to act, true if we were stopped.
+ */
+function waitWhileTaken(s: BrowserSession, signal: AbortSignal): Promise<boolean> {
+  if (s.controller !== "user" && !s.paused) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (stopped: boolean) => {
+      if (done) return;
+      done = true;
+      signal.removeEventListener("abort", finishSignal);
+      resolve(stopped);
+    };
+    const finishSignal = () => finish(true);
+    signal.addEventListener("abort", finishSignal, { once: true });
+    s.whenAgentTurn().then(() => finish(false));
+  });
+}
+
 export const browser: Tool = {
   spec: {
     name: "browser",
     description:
-      "Control a real Chrome window (visible to the user, persistent logins). Every action returns a screenshot plus numbered interactive elements; target elements by `index` from the latest observation (or `selector` / `text`). Actions: goto(url), click, type(text, submit?), press(key), scroll(dy), select(value), hover, back, forward, reload, read (full page text), eval(js), tab_new(url?), tab_switch(tab), tab_close, wait(ms), screenshot, upload(path, plus index/selector of the file input or the button that opens the picker). Downloads are saved to <cwd>/downloads and reported; alerts/confirms are accepted and reported.",
+      "Drive a real browser, isolated per task (its own profile, logins, downloads; limits on tabs, download size and session time). Every action returns a compact observation — tab number, URL, title, numbered interactive elements and anything that happened along the way (downloads, dialogs, new tabs). Pass screenshot:false to skip the image when you are reasoning from the text alone. Target elements by `index` from the latest observation, or `selector` / `text`, or by x/y page coordinates as a screenshot fallback. Actions: goto(url), click, type(text, submit?), press(key), scroll(dy), select(value), hover, drag (from_index/from_selector → to_index/to_selector), back, forward, reload, read (full page text), eval(js), wait(ms), wait_for(selector or text, state, timeout_ms), tab_new(url?), tab_switch(tab), tab_close, screenshot, upload(path, plus index/selector of the file input or the button that opens the picker). Downloads land in <cwd>/downloads and are checked for type and size; alerts/confirms are accepted and reported. If you hit a captcha or a sign-in wall, say so and stop — the user can press Take over in the live view to finish it, and your next action waits for the hand-back.",
     schema: {
       type: "object",
       properties: {
@@ -280,15 +178,17 @@ export const browser: Tool = {
             "scroll",
             "select",
             "hover",
+            "drag",
             "back",
             "forward",
             "reload",
             "read",
             "eval",
+            "wait",
+            "wait_for",
             "tab_new",
             "tab_switch",
             "tab_close",
-            "wait",
             "screenshot",
             "upload",
           ],
@@ -304,6 +204,17 @@ export const browser: Tool = {
         js: { type: "string" },
         tab: { type: "number" },
         ms: { type: "number" },
+        x: { type: "number", description: "click: page coordinate fallback (use with y)" },
+        y: { type: "number", description: "click: page coordinate fallback (use with x)" },
+        to_index: { type: "number", description: "drag: destination element number" },
+        to_selector: { type: "string", description: "drag: destination CSS selector" },
+        state: {
+          type: "string",
+          enum: ["visible", "hidden", "attached", "detached"],
+          description: "wait_for: the state to wait for (default visible)",
+        },
+        timeout_ms: { type: "number", description: "wait_for: how long to wait (default 10000)" },
+        screenshot: { type: "boolean", description: "set false to skip the screenshot image" },
         path: {
           type: "string",
           description: "upload: file path (relative to the working directory)",
@@ -313,24 +224,23 @@ export const browser: Tool = {
     },
   },
   async run(input, ctx) {
-    // per-user sandbox: this browser is one process-wide Chromium (shared cookies and logins, server uid), so it
-    // must never serve a multi-user server. The isolated runtime in lib/browser takes over there.
-    if (process.env.SWARM_MODE === "server")
-      return { content: "The browser isn't available on this multi-user server yet; use web_fetch / web_search instead.", isError: true };
-    downloadDir = path.join(ctx.cwd, "downloads");
-    const p = await page();
+    // One isolated context per task (own profile, own downloads, hard limits) — so this is safe on a
+    // multi-user server as well as on a laptop. Downloads belong to the task's workspace.
+    const s = browserSession(ctx.sessionId);
+    s.useWorkspace(ctx.cwd);
+    // If the user has taken the browser over (login, 2FA, captcha) or paused it, wait for the hand-back.
+    if (await waitWhileTaken(s, ctx.signal))
+      return { content: "[paused: the user has the browser] Wait, or do other work meanwhile.", isError: false };
+    const p = await s.page();
     try {
-      return await act(p, input, ctx.cwd);
+      return await act(s, p, input, ctx.cwd);
     } catch (e) {
       if (ctx.signal.aborted) throw e;
       // Show the model where things stand instead of a bare stack, so it can pick another element.
       const msg = String((e as Error).message ?? e)
         .split("\n")[0]
         .replace(/^locator\.\w+: /, "");
-      const out = await observe(
-        p,
-        `Action ${String(input.action)} failed: ${msg}`,
-      ).catch(() => ({
+      const out = await observe(s, p, `Action ${String(input.action)} failed: ${msg}`, false, input.screenshot !== false).catch(() => ({
         content: `Action ${String(input.action)} failed: ${msg}`,
       }));
       return { ...out, isError: true };
@@ -338,9 +248,31 @@ export const browser: Tool = {
   },
 };
 
-async function act(p: Page, input: Record<string, unknown>, cwd: string) {
+/** Retry once when an element goes stale mid-action (the page re-rendered under us). */
+const STALE = /stale|not attached|detached|intercepts pointer|element is not visible|waiting for (locator|element)/i;
+async function once<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (!STALE.test(String((e as Error)?.message ?? e))) throw e;
+    return fn();
+  }
+}
+
+/** Point the live viewer's cursor at what the agent is about to touch, so the user can follow. */
+async function point(s: BrowserSession, p: Page, input: Record<string, unknown>, label: string) {
+  try {
+    const b = await target(p, input).boundingBox({ timeout: 1500 });
+    if (b) s.pointer = { x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2), label };
+  } catch {}
+}
+
+async function act(s: BrowserSession, p0: Page, input: Record<string, unknown>, cwd: string) {
+  let p = p0;
   const a = String(input.action);
   const T = { timeout: 15_000 };
+  const shot = input.screenshot !== false;
+  const obs = (page: Page, note: string, full = false) => observe(s, page, note, full, shot);
   switch (a) {
     case "goto": {
       let url = String(input.url);
@@ -350,15 +282,11 @@ async function act(p: Page, input: Record<string, unknown>, cwd: string) {
           waitUntil: "domcontentloaded",
           timeout: 45_000,
         });
-        return observe(p, `Navigated (${r?.status() ?? "?"}).`);
+        return obs(p, `Navigated (${r?.status() ?? "?"}).`);
       } catch (e) {
         // Direct links to files (PDF, zip, csv…) start a download instead of a page load.
-        if (
-          /Download is starting|net::ERR_ABORTED/.test(
-            String((e as Error).message),
-          )
-        )
-          return observe(p, `${url} is a file; downloading it.`);
+        if (/Download is starting|net::ERR_ABORTED/.test(String((e as Error).message)))
+          return obs(p, `${url} is a file; downloading it.`);
         throw e;
       }
     }
@@ -367,84 +295,116 @@ async function act(p: Page, input: Record<string, unknown>, cwd: string) {
       if (!input.path || !fs.existsSync(file))
         return { content: `No file at ${file}.`, isError: true };
       const t = target(p, input);
+      await point(s, p, input, `upload ${path.basename(file)}`);
       try {
-        await t.setInputFiles(file, { timeout: 5_000 });
+        await once(() => t.setInputFiles(file, { timeout: 5_000 }));
       } catch {
         // Not an <input type=file>: click it and answer the file chooser it opens.
-        const [chooser] = await Promise.all([
-          p.waitForEvent("filechooser", T),
-          t.click(T),
-        ]);
+        const [chooser] = await Promise.all([p.waitForEvent("filechooser", T), once(() => t.click(T))]);
         await chooser.setFiles(file);
       }
-      return observe(p, `Attached ${path.basename(file)}.`);
+      return obs(p, `Attached ${path.basename(file)}.`);
     }
-    case "click":
-      await target(p, input).click(T);
-      return observe(p, "Clicked.");
+    case "click": {
+      // Screenshot fallback: with no element target, x/y in page coordinates still clicks.
+      if (input.index == null && !input.selector && input.text == null && typeof input.x === "number" && typeof input.y === "number") {
+        s.pointer = { x: input.x, y: input.y, label: "click" };
+        await p.mouse.click(input.x, input.y);
+        return obs(p, "Clicked at coordinates.");
+      }
+      await point(s, p, input, String(input.selector ?? (input.index != null ? `[${input.index}]` : `"${String(input.text ?? "")}"`)));
+      await once(() => target(p, input).click(T));
+      return obs(p, "Clicked.");
+    }
     case "type": {
       const t = target(p, input);
-      await t
-        .fill(String(input.text ?? input.value ?? ""), T)
-        .catch(async () => {
+      await point(s, p, input, "type here");
+      await once(() =>
+        t.fill(String(input.text ?? input.value ?? ""), T).catch(async () => {
           await t.click(T);
           await p.keyboard.type(String(input.text ?? input.value ?? ""));
-        });
+        }),
+      );
       if (input.submit) await p.keyboard.press("Enter");
-      return observe(p, "Typed.");
+      return obs(p, "Typed.");
     }
     case "press":
       await p.keyboard.press(String(input.key));
-      return observe(p, `Pressed ${input.key}.`);
+      return obs(p, `Pressed ${input.key}.`);
     case "scroll":
       await p.mouse.wheel(0, Number(input.dy ?? 700));
-      return observe(p, "Scrolled.");
+      return obs(p, "Scrolled.");
     case "select":
-      await target(p, input).selectOption(String(input.value), T);
-      return observe(p, "Selected.");
+      await point(s, p, input, "select");
+      await once(() => target(p, input).selectOption(String(input.value), T));
+      return obs(p, "Selected.");
     case "hover":
-      await target(p, input).hover(T);
-      return observe(p, "Hovered.");
+      await point(s, p, input, String(input.selector ?? `[${input.index ?? ""}]`));
+      await once(() => target(p, input).hover(T));
+      return obs(p, "Hovered.");
+    case "drag": {
+      const from = target(p, input);
+      const to = target(p, { index: input.to_index, selector: input.to_selector, text: undefined });
+      await point(s, p, input, "drag from");
+      const box = await from.boundingBox(T).catch(() => null);
+      if (box) s.pointer = { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2), label: "drag" };
+      await once(() =>
+        from.dragTo(to, { timeout: 15_000 }).catch(async () => {
+          // Dragging an element the browser won't release: fall back to raw mouse moves.
+          const a1 = await from.boundingBox(T);
+          const b1 = await to.boundingBox(T);
+          if (!a1 || !b1) throw new Error("Drag source or destination is not visible.");
+          await p.mouse.move(a1.x + a1.width / 2, a1.y + a1.height / 2);
+          await p.mouse.down();
+          await p.mouse.move(b1.x + b1.width / 2, b1.y + b1.height / 2, { steps: 12 });
+          await p.mouse.up();
+        }),
+      );
+      s.pointer = null;
+      return obs(p, "Dragged.");
+    }
     case "back":
       await p.goBack();
-      return observe(p, "Back.");
+      return obs(p, "Back.");
     case "forward":
       await p.goForward();
-      return observe(p, "Forward.");
+      return obs(p, "Forward.");
     case "reload":
       await p.reload();
-      return observe(p, "Reloaded.");
+      return obs(p, "Reloaded.");
     case "read":
-      return observe(p, "Page contents:", true);
+      return obs(p, "Page contents:", true);
     case "eval": {
       const v = await p.evaluate(String(input.js));
       return {
-        content: clip(
-          typeof v === "string"
-            ? v
-            : (JSON.stringify(v, null, 2) ?? "undefined"),
-          40_000,
-        ),
+        content: clip(typeof v === "string" ? v : (JSON.stringify(v, null, 2) ?? "undefined"), 40_000),
       };
     }
-    case "tab_new":
-      current = p = await p.context().newPage();
-      if (input.url)
-        await p.goto(String(input.url), { waitUntil: "domcontentloaded" });
-      return observe(p, "Opened tab.");
-    case "tab_switch": {
-      const tabs = p.context().pages();
-      current = p = tabs[Number(input.tab) - 1] ?? p;
-      await p.bringToFront();
-      return observe(p, "Switched tab.");
-    }
-    case "tab_close":
-      await p.close();
-      return observe(await page(), "Closed tab.");
-    case "wait":
+    case "wait": {
       await p.waitForTimeout(Math.min(60_000, Number(input.ms ?? 1500)));
-      return observe(p, "Waited.");
+      return obs(p, "Waited.");
+    }
+    case "wait_for": {
+      // "Something appears" without guessing: waits for an element (or the text) to reach a state.
+      const timeout = Math.min(60_000, Number(input.timeout_ms ?? 10_000));
+      const state = String(input.state ?? "visible") as "visible" | "hidden" | "attached" | "detached";
+      const how = input.selector ? p.locator(String(input.selector)) : p.getByText(String(input.text ?? ""), { exact: false });
+      await how.first().waitFor({ state, timeout });
+      return obs(p, `Found it (${state}).`);
+    }
+    case "tab_new":
+      p = await s.newPage(typeof input.url === "string" ? String(input.url) : undefined);
+      return obs(p, "Opened tab.");
+    case "tab_switch":
+      p = await s.switchTab(Number(input.tab));
+      return obs(p, "Switched tab.");
+    case "tab_close":
+      await s.closeTab(input.tab != null ? Number(input.tab) : undefined);
+      p = await s.page();
+      return obs(p, "Closed tab.");
+    case "screenshot":
+      return obs(p, "Screenshot.");
     default:
-      return observe(p, "Current page.");
+      return obs(p, "Current page.");
   }
 }

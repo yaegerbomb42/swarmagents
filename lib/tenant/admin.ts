@@ -15,14 +15,18 @@ const EMAIL = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
 
 export const adminEmail = () => (process.env.SWARM_ADMIN_EMAIL ?? "").trim().toLowerCase();
 
+let fileError = "";
+
 function readPassword(): string {
   const file = process.env.SWARM_ADMIN_PASSWORD_FILE;
   let pw = "";
+  fileError = "";
   if (file) {
     try {
       pw = fs.readFileSync(file, "utf8").replace(/\r?\n$/, "");
-    } catch {
+    } catch (e) {
       pw = "";
+      fileError = `can't read SWARM_ADMIN_PASSWORD_FILE (${(e as NodeJS.ErrnoException).code ?? "error"})`; // never the contents
     }
   }
   if (!pw) pw = process.env.SWARM_ADMIN_PASSWORD ?? "";
@@ -50,7 +54,7 @@ export function bootstrapAdmin(log: (s: string) => void = (s) => console.log(s))
     log(`[admin] WARNING: ${email} belongs to a non-admin account; it was NOT promoted. Fix it by hand.`);
     return { status: "conflict", reason: "a non-admin account has that email" };
   }
-  if (!password) return { status: "skipped", reason: "no admin password configured" };
+  if (!password) return { status: "skipped", reason: fileError || "no admin password configured" };
   const bad = validateCredentials("admin", password);
   if (bad) return { status: "skipped", reason: bad };
   const made = transaction((): User | null => (findUserByEmail(email) ? null : createUser(usernameFor(email), password, true, email)));

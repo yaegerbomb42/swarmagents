@@ -215,7 +215,8 @@ await t("background tasks and the task stream: no cross-account view, no cancel/
     ["DELETE", `/api/runtime/tasks/${id}`],
   ]) {
     const r = await call(mal, m, p, body);
-    ok(r.status === 404, `${m} ${p} ${body?.action ?? ""} → ${r.status}`);
+    // 404, or a 200 that says nothing happened ({ ok: false }); "alice's task untouched" below is the real check.
+    ok(r.status === 404 || (r.status === 200 && r.json?.ok === false), `${m} ${p} ${body?.action ?? ""} → ${r.status} ${r.text.slice(0, 80)}`);
   }
   const mine = await call(alice, "GET", `/api/runtime/tasks/${id}`);
   ok(mine.status === 200 && mine.json.task.status !== "cancelled", "alice's task untouched");

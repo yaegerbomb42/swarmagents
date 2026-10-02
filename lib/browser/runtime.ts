@@ -2,7 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { chromium, type BrowserContext, type CDPSession, type Page } from "playwright-core";
-import { ROOT } from "../store";
+import { currentUser, userHome } from "../store";
+import { chromiumLaunch, identity, sandboxDir } from "../sandbox";
+
+/** Where this account's browser sessions live. On a server inside the uid-owned workspace, so one
+ *  account's profiles and downloads are never under another's directory; locally under the home. */
+const browserRoot = () => path.join(identity()?.workspace ?? userHome(), "browsers");
 
 // ═══════ Browser runtime ═══════
 //
@@ -125,7 +130,8 @@ function uniquePath(dir: string, name: string) {
 export class BrowserSession {
   readonly key: string;
   readonly dir: string;
-  readonly downloadsDir: string;
+  /** Where downloads land. Defaults to the profile folder; the tool points it at the task workspace. */
+  downloadsDir: string;
   readonly limits: BrowserLimits;
   readonly startedAt = Date.now();
   lastActiveAt = Date.now();
@@ -150,11 +156,26 @@ export class BrowserSession {
   private waiters = new Set<() => void>();
   private watched = new WeakSet<Page>();
 
-  constructor(key: string, limits: BrowserLimits = DEFAULT_LIMITS, root = path.join(ROOT, "browsers")) {
+  constructor(key: string, limits: BrowserLimits = DEFAULT_LIMITS, root = browserRoot()) {
     this.key = key;
     this.limits = limits;
     this.dir = path.join(root, keySlug(key));
     this.downloadsDir = path.join(this.dir, "downloads");
+  }
+
+  /**
+   * Save downloads into the task's own workspace instead of the profile folder, so the agent can
+   * `read` the file it just downloaded and everything it collects stays inside its folder.
+   */
+  useWorkspace(cwd: string) {
+    const dir = path.join(path.resolve(cwd), "downloads");
+    if (dir !== this.downloadsDir) {
+      this.downloadsDir = dir;
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+      } catch {}
+    }
+    return this;
   }
 
   // ---- events ----
@@ -225,20 +246,24 @@ export class BrowserSession {
   async context(): Promise<BrowserContext> {
     if (this.closed) throw new Error("This browser session was closed.");
     if (this.ctx) return this.ctx;
-    // per-user sandbox: on a multi-user server Chromium must run as the user's uid (lib/sandbox chromiumLaunch) with a
-    // uid-owned profile kept apart from this root-owned state/downloads dir. Until that split exists, refuse rather
-    // than launch the browser as root with the server's capabilities.
-    if (process.env.SWARM_MODE === "server") throw new Error("The browser isn't available on this multi-user server yet.");
     if (this.launching) return this.launching;
-    fs.mkdirSync(this.dir, { recursive: true });
-    fs.mkdirSync(this.downloadsDir, { recursive: true });
+    // Per-user sandbox: on a multi-user server Chromium runs as the user's uid (bin/swarm-chromium via
+    // chromiumLaunch) with a uid-owned profile inside the user's workspace, kept apart from the
+    // root-owned server state. Locally this is the plain executable and the usual profile.
+    const launch = chromiumLaunch();
+    const profileDir = launch.executablePath ? sandboxDir(path.join(launch.profileRoot, keySlug(this.key))) : this.dir;
+    if (!launch.executablePath) fs.mkdirSync(profileDir, { recursive: true });
+    if (launch.executablePath) sandboxDir(this.downloadsDir);
+    else fs.mkdirSync(this.downloadsDir, { recursive: true });
     const { exe, base } = this.launchOptions();
+    const executablePath = launch.executablePath ?? exe;
+    const env = { ...base.env, ...launch.env };
     const attempt = () =>
-      (exe
-        ? chromium.launchPersistentContext(this.dir, { ...base, executablePath: exe })
+      (executablePath
+        ? chromium.launchPersistentContext(profileDir, { ...base, env, executablePath })
         : chromium
-            .launchPersistentContext(this.dir, { ...base, channel: "chrome" })
-            .catch(() => chromium.launchPersistentContext(this.dir, { ...base, viewport: base.viewport ?? this.limits.viewport }))) as Promise<BrowserContext>;
+            .launchPersistentContext(profileDir, { ...base, env, channel: "chrome" })
+            .catch(() => chromium.launchPersistentContext(profileDir, { ...base, env, viewport: base.viewport ?? this.limits.viewport }))) as Promise<BrowserContext>;
     const self = this;
     this.launching = (async function launch() {
       try {
@@ -247,7 +272,7 @@ export class BrowserSession {
         // A crashed browser leaves SingletonLock behind; Chrome then refuses to start. Clear and retry once.
         for (const f of ["SingletonLock", "SingletonCookie", "SingletonSocket"])
           try {
-            fs.rmSync(path.join(self.dir, f), { force: true });
+            fs.rmSync(path.join(profileDir, f), { force: true });
           } catch {}
         try {
           return await attempt();
@@ -388,6 +413,7 @@ export class BrowserSession {
             return;
           }
           const file = uniquePath(this.downloadsDir, name);
+          fs.mkdirSync(this.downloadsDir, { recursive: true });
           await d.saveAs(file);
           const bytes = fs.statSync(file).size;
           if (bytes > this.limits.maxDownloadFileBytes || this.downloadedBytes + bytes > this.limits.maxDownloadBytes) {
@@ -626,10 +652,10 @@ export class BrowserRuntime {
   private recorder = new Map<string, { entries: ReplayEntry[]; lastFrame: number; subs: (() => void)[] }>();
   private timer: NodeJS.Timeout | null = null;
 
-  constructor(limits: BrowserLimits = DEFAULT_LIMITS, root = path.join(ROOT, "browsers")) {
+  constructor(limits: BrowserLimits = DEFAULT_LIMITS, root = browserRoot()) {
     this.limits = limits;
     this.root = root;
-    fs.mkdirSync(root, { recursive: true });
+    sandboxDir(root);
   }
 
   /** Start the reaper once (idempotent). */
@@ -785,9 +811,16 @@ export class BrowserRuntime {
   }
 }
 
-const g = globalThis as unknown as { __swarmBrowser?: BrowserRuntime };
-/** The process-wide browser runtime (survives Next module reloads in dev). */
+const g = globalThis as unknown as { __swarmBrowser?: Map<string, BrowserRuntime> };
+/** The browser runtime for the current account (survives Next module reloads in dev). Keyed per user
+ *  so one account's live sessions, recorder and idle reaping never touch another's. */
 export function browserRuntime(): BrowserRuntime {
-  if (!g.__swarmBrowser) g.__swarmBrowser = new BrowserRuntime();
-  return g.__swarmBrowser;
+  const key = currentUser();
+  const map = (g.__swarmBrowser ??= new Map());
+  let rt = map.get(key);
+  if (!rt) {
+    rt = new BrowserRuntime();
+    map.set(key, rt);
+  }
+  return rt;
 }

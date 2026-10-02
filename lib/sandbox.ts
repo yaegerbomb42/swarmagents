@@ -48,6 +48,23 @@ function prepareDir(dir: string, uid: number, mode: number) {
   prepared.add(k);
 }
 
+/** Create (or confirm) a directory owned by the current user's sandbox uid, so their tools can write
+ *  into it. On a server the server process is root, so any dir it makes under the workspace must be
+ *  handed to the uid; locally this is a plain mkdir. Returns the path. Ancestors up to the workspace
+ *  are kept traversable and root-owned. */
+export function sandboxDir(dir: string): string {
+  const id = identity();
+  if (!id) {
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+  const abs = path.resolve(dir);
+  const { workspace } = id;
+  if (abs !== workspace && !abs.startsWith(workspace + path.sep)) throw new Error("sandboxDir outside the workspace");
+  for (let d = abs; d !== workspace && d !== path.dirname(d); d = path.dirname(d)) prepareDir(d, id.uid, 0o700);
+  return abs;
+}
+
 /** Who the current user's tool processes run as, or null when tools run unsandboxed (local mode). */
 export function identity(): Identity | null {
   if (!serverMode()) return null;

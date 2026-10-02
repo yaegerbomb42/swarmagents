@@ -720,3 +720,54 @@
 .changed-file-name { color: var(--color-text, #ecebe8); font-weight: 500; }
 .changed-file-actions { flex-shrink: 0; }
 
+
+/* ═══════ Code Block (shiki) ═══════ */
+.code-block {
+  position: relative;
+  margin: var(--space-3) 0;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--color-line);
+  background: var(--color-code-bg);
+}
+.code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-bg-sunken);
+  border-bottom: 1px solid var(--color-line);
+  font-size: var(--type-size--1);
+  color: var(--color-text-muted);
+}
+.code-lang {
+  font-family: var(--font-mono);
+  font-weight: var(--type-weight-medium);
+  text-transform: uppercase;
+  font-size: var(--type-size--1);
+}
+.code-copy-btn {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-faint);
+  background: var(--color-bg);
+  border: 1px solid var(--color-line);
+  transition: all var(--transition-fast);
+}
+.code-copy-btn:hover {
+  background: var(--color-line);
+  color: var(--color-text);
+}
+.code-block pre {
+  margin: 0;
+  padding: var(--space-4);
+  overflow-x: auto;
+}
+.code-block code {
+  font-family: var(--font-mono);
+  font-size: var(--type-size--1);
+  line-height: var(--line-height-code);
+}

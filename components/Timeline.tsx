@@ -1,9 +1,10 @@
 "use client";
-import { memo, useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeShiki from "@shikijs/rehype";
 import type { AgentEvent } from "@/lib/types";
-import { IChevron, IFile, ICheck, IX } from "./icons";
+import { IChevron, IFile, ICheck, IX, ICopy } from "./icons";
 import { stepIcon, toolAccent } from "./StepIcons";
 import { AnsiRenderer, hasAnsi } from "./AnsiRenderer";
 import { PreviewChip, producedFiles } from "./FilePreview";
@@ -19,12 +20,65 @@ const fmtDur = (ms: number) => (ms < 1000 ? `${ms}ms` : ms < 60000 ? `${(ms / 10
 const Md = memo(function Md({ text, streaming }: { text: string; streaming?: boolean }) {
   return (
     <div className={`md${streaming ? " caret" : ""}`}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: (p) => <a {...p} target="_blank" rel="noreferrer" /> }}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[[rehypeShiki, { theme: "github-dark" }]]}
+        components={{
+          a: (p) => <a {...p} target="_blank" rel="noreferrer" />,
+          code: (p) => {
+            const { children, ...props } = p;
+            const childStr = typeof children === "string" ? children : "";
+            const inline = !childStr.includes("\n");
+            if (inline) return <code {...props}>{children}</code>;
+            return <pre><code {...props}>{children}</code></pre>;
+          },
+          pre: (p) => <CodeBlock {...p} />,
+        }}
+      >
         {text}
       </ReactMarkdown>
     </div>
   );
 });
+
+function CodeBlock({ children, className, ...props }: React.HTMLAttributes<HTMLPreElement>) {
+  const [copied, setCopied] = useState(false);
+  const codeRef = useRef<HTMLPreElement>(null);
+  
+  const copy = async () => {
+    if (codeRef.current) {
+      const code = codeRef.current.querySelector("code");
+      if (code) {
+        await navigator.clipboard.writeText(code.textContent || "");
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }
+    }
+  };
+
+  // Extract language from className (shiki adds language-* class)
+  const langMatch = (className as string || "").match(/language-(\w+)/);
+  const language = langMatch ? langMatch[1] : "";
+
+  return (
+    <div className={`code-block ${className || ""}`}>
+      <div className="code-block-header">
+        {language && <span className="code-lang">{language}</span>}
+        <button
+          className="code-copy-btn"
+          onClick={copy}
+          aria-label={copied ? "Copied!" : "Copy code"}
+          title={copied ? "Copied!" : "Copy code"}
+        >
+          {copied ? <ICheck /> : <ICopy />}
+        </button>
+      </div>
+      <pre ref={codeRef} className={className as string}>
+        {children}
+      </pre>
+    </div>
+  );
+}
 
 function Chevron({ open }: { open: boolean }) {
   return (

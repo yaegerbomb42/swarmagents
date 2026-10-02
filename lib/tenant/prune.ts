@@ -169,10 +169,36 @@ function pruneLedgers(): number {
     names = fs.readdirSync(dir);
   } catch {}
   for (const n of names) {
+    const f = path.join(dir, n);
+    if (n.endsWith(".steps.ndjson")) {
+      // Append-only step logs: keep the last few lines, compacted. The task id is the file's stem.
+      const id = n.replace(/\.steps\.ndjson$/, "");
+      if (!finished.has(id)) continue;
+      const before = fileSize(f);
+      let lines: string[] = [];
+      try {
+        lines = fs.readFileSync(f, "utf8").split("\n").filter(Boolean);
+      } catch {
+        continue;
+      }
+      if (lines.length <= 20) continue;
+      const out = lines.slice(-20).map((l) => {
+        try {
+          return JSON.stringify(compactEvent(JSON.parse(l) as Json));
+        } catch {
+          return l;
+        }
+      });
+      writeAtomic(f, out.join("\n") + "\n");
+      freed += Math.max(0, before - fileSize(f));
+      continue;
+    }
+    if (!n.endsWith(".json")) continue;
     const id = n.replace(/\.json$/, "");
     if (!finished.has(id)) continue;
-    const f = path.join(dir, n);
     const before = fileSize(f);
+    // Legacy ledgers may still carry an inline steps array; trim it. Steps normally live in the
+    // sibling .steps.ndjson handled above.
     const l = readJson<{ runs?: unknown[]; steps?: Json[] } | null>(f, null);
     if (!l || !Array.isArray(l.steps) || l.steps.length <= 20) continue;
     l.steps = l.steps.slice(-20).map(compactEvent);

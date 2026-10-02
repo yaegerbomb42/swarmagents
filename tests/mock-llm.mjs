@@ -27,7 +27,7 @@ const PORT = Number(process.argv[2] || process.env.MOCK_PORT || 37901);
 const WORKDIR = process.env.MOCK_WORKDIR || path.join(os.tmpdir(), "swarm-mock-work");
 fs.mkdirSync(WORKDIR, { recursive: true });
 
-const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files", "api", "fetch", "risky", "shellkey", "fanout", "child", "childfail", "childslow"];
+const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files", "api", "fetch", "risky", "shellkey", "fanout", "child", "childfail", "childslow", "attack", "cookie"];
 const log = [];
 const attempts = new Map(); // conversation hash -> request count, for ratelimit/flaky
 
@@ -230,6 +230,30 @@ function script(a) {
     }
     case "childfail":
       return { error: { status: 400, message: "mock child: invalid request (non-retryable)" } };
+    // Tenant isolation (tests/tenant-isolation.mjs): an attacker account's agent tries to reach other accounts' data
+    // and the server's own files from its workspace. Reports what it saw; the test asserts it was all refused.
+    case "attack": {
+      const steps = [
+        { name: "bash", input: { command: "echo uid=$(id -u); ls -la .. 2>&1 | head -3; ls ../.. 2>&1 | head -3; head -c 16 ../../../auth.db 2>&1; echo; cat ../settings.json 2>&1 | head -c 120; echo; ls /proc/1/root 2>&1 | head -2" } },
+        { name: "read_file", input: { path: "../../../auth.db" } },
+        { name: "read_file", input: { path: "../settings.json" } },
+        { name: "read_file", input: { path: "../connections.json" } },
+        { name: "write_file", input: { path: "../../escape.txt", content: "x" } },
+      ];
+      if (a.step < steps.length) return { calls: [steps[a.step]] };
+      const o = a.toolOutputs.join("\n");
+      const uid = (o.match(/uid=(\d+)/) ?? [, "?"])[1];
+      return { text: `Attack: uid=${uid} sqlite=${/SQLite format/.test(o)} keys=${/apiKey|"providers"\s*:\s*\[\s*\{|sk-|tenant-secret/.test(o)} escape=${a.toolOutputs.at(-1) && !/denied|outside|not allowed|EACCES|permission/i.test(a.toolOutputs.at(-1)) ? "WROTE" : "refused"}` };
+    }
+    // Browser isolation: "[mock:cookie] set <v>" stores a cookie in this account's browser; "[mock:cookie] show"
+    // reports which cookie the account's browser sends back.
+    case "cookie": {
+      const site = process.env.MOCK_PUBLIC_URL || `http://127.0.0.1:${PORT}`;
+      const v = (a.userText.match(/set (\w+)/) ?? [])[1];
+      if (a.step === 0) return { calls: [{ name: "browser", input: { action: "goto", url: v ? `${site}/site/setcookie?v=${v}` : `${site}/site/showcookie` } }] };
+      const seen = (a.toolOutputs.join("\n").match(/cookie:\[([^\]]*)\]/) ?? [, "?"])[1];
+      return { text: `Cookie: ${v ? `set ${v}` : "show"} seen=[${seen}]` };
+    }
     case "shellkey":
       // A saved tool key reaches the shell as its env var, and its value is masked in what comes back.
       if (a.step === 0) return { calls: [{ name: "bash", input: { command: 'echo "k=$SHELLKEY_TEST_TOKEN len=${#SHELLKEY_TEST_TOKEN}"' } }] };
@@ -395,6 +419,12 @@ const server = http.createServer(async (req, res) => {
   if (p === "/site/pixel.png") {
     res.writeHead(200, { "Content-Type": "image/png" });
     return res.end(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64"));
+  }
+  if (p === "/site/setcookie" || p === "/site/showcookie") {
+    const v = (url.searchParams.get("v") ?? "").replace(/\W/g, "");
+    const cookie = String(req.headers.cookie ?? "").replace(/[^\w=; -]/g, "");
+    res.writeHead(200, { "Content-Type": "text/html", ...(p === "/site/setcookie" && v ? { "Set-Cookie": `tenant=${v}; Path=/; Max-Age=3600` } : {}) });
+    return res.end(`<!doctype html><title>cookie:[${p === "/site/setcookie" ? `tenant=${v}` : cookie}]</title><p>cookie:[${p === "/site/setcookie" ? `tenant=${v}` : cookie}]</p>`);
   }
   if (p === "/site/popup") {
     res.writeHead(200, { "Content-Type": "text/html" });

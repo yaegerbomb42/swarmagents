@@ -29,3 +29,17 @@
 .stg-log { margin-top: 10px; font-size: 12px; color: var(--muted); }
 .stg-log summary { cursor: pointer; }
 .stg-logrow { display: grid; grid-template-columns: 150px 1fr auto; gap: 10px; padding: 3px 0; font-variant-numeric: tabular-nums; }
+
+/* Admin Analytics (components/AdminAnalytics.tsx) */
+.adm-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin: 6px 0 12px; }
+.adm-tiles > div { border: 1px solid var(--line); border-radius: 11px; padding: 9px 11px; display: flex; flex-direction: column; gap: 2px; }
+.adm-tiles b { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text); }
+.adm-tiles span { font-size: 11.5px; color: var(--muted); }
+.adm-chart-wrap { margin-bottom: 10px; }
+.adm-chart { width: 100%; height: 70px; display: block; }
+.adm-chart rect { fill: var(--run); opacity: 0.85; }
+.adm-user { display: grid; grid-template-columns: 1fr auto auto auto auto; gap: 10px; align-items: center; padding: 6px 10px; font-size: 12.5px; border-bottom: 1px solid var(--line); }
+.adm-user:last-child { border-bottom: 0; }
+.adm-live { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--line-strong); margin-right: 7px; }
+.adm-live.on { background: var(--ok); }
+.adm-quota { font-size: 12px; padding: 2px 6px; width: auto; }

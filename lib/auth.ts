@@ -12,6 +12,7 @@
 
 import { createHash, timingSafeEqual } from "node:crypto";
 import { runAs } from "./store";
+import { SandboxUnavailableError } from "./sandbox";
 import { userForToken, type User } from "./users";
 
 export const AUTH_COOKIE = "swarm_auth";
@@ -143,6 +144,12 @@ export function scoped<A extends unknown[]>(handler: (req: Request, ...rest: A) 
   return async (req: Request, ...rest: A): Promise<Response> => {
     const user = requestUser(req);
     if (!user) return Response.json({ error: "Sign in required." }, { status: serverMode() ? 401 : 403 });
-    return runAs(user.id, () => handler(req, ...rest));
+    try {
+      return await runAs(user.id, () => handler(req, ...rest));
+    } catch (e) {
+      // A multi-user server without its sandbox refuses tool work; say so instead of a bare 500.
+      if (e instanceof SandboxUnavailableError) return Response.json({ error: e.message }, { status: 503 });
+      throw e;
+    }
   };
 }

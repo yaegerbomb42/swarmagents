@@ -4,10 +4,11 @@
 // question. It is deliberately append-mostly and small: turns, tool calls, notices and
 // checkpoints. Model output stays in the session; the ledger stores the skeleton.
 
-// Every mutation goes through store.withLedger, which serializes per task and awaits the
-// write, so recordings are durable the moment their promise resolves.
+// Runs and their usage are mutated through store.withLedger (serialized per task, write awaited).
+// Steps are appended to an append-only log so a long run records them at O(1) cost instead of
+// rewriting the whole ledger on every turn.
 
-import { loadLedger, rtId, withLedger } from "./store";
+import { appendStep, loadLedger, rtId, withLedger } from "./store";
 import { getTask, updateTask } from "./tasks";
 import type { RunRecord, RunUsage, StepRecord } from "./types";
 
@@ -17,11 +18,9 @@ export async function addStep(
   step: Omit<StepRecord, "id" | "taskId" | "runId" | "ts"> & { ts?: number },
 ): Promise<StepRecord> {
   const rec: StepRecord = { id: rtId(), taskId, runId, ts: step.ts ?? Date.now(), ...step };
-  await withLedger(taskId, (ledger) => {
-    ledger.steps.push(rec);
-    // Keep the ledger bounded; a 24h run must not grow without limit.
-    if (ledger.steps.length > 5000) ledger.steps.splice(0, ledger.steps.length - 5000);
-  });
+  // Steps go to an append-only log (one line, O(1)); the file is compacted to a bounded number of
+  // recent lines, so a 24h run never grows the ledger without limit or rewrites it on every step.
+  await appendStep(taskId, rec);
   return rec;
 }
 

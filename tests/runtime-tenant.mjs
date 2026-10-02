@@ -19,6 +19,20 @@ const store = await import("../lib/store.ts");
 const rtStore = await import("../lib/runtime/store.ts");
 const flushWrites = rtStore.flushWrites;
 const rt = await import("../lib/runtime/index.ts");
+
+/**
+ * Build a session by hand for each account. store.createSession() needs the per-user OS sandbox on
+ * a server, which this unit test does not run (same approach as tests/tenant-storage.mjs). We are
+ * testing the runtime control plane's storage/scheduler isolation, not sandboxing.
+ */
+function makeSession(title) {
+  const m = { id: store.newId(), title, createdAt: Date.now(), updatedAt: Date.now(), cwd: "/tmp" };
+  fs.mkdirSync(store.sessionDir(m.id), { recursive: true });
+  store.saveMeta(m);
+  store.saveEvents(m.id, []);
+  return m.id;
+}
+
 const { setAgentAdapter, scheduler, createTask, getTask, listTasks, grantApproval, takeApproval, recordDenial, isDenied, runtimeDir, loadRuntimeSettings, saveRuntimeSettings } = rt;
 const { runAs, allUserIds } = store;
 
@@ -57,7 +71,7 @@ try {
   // ---- Isolation of the task board ----
   let aTaskId = "";
   await t("account A can create a task; account B cannot see it", async () => {
-    aTaskId = (await runAs(A, () => createTask({ prompt: "A's secret task" }))).id;
+    aTaskId = (await runAs(A, () => createTask({ prompt: "A's secret task", sessionId: makeSession("A chat") }))).id;
     const aTasks = runAs(A, () => listTasks());
     const bTasks = runAs(B, () => listTasks());
     assert.equal(aTasks.length, 1);
@@ -108,8 +122,8 @@ try {
       },
     });
     // B creates its own task too, and both are queued.
-    runAs(B, () => createTask({ prompt: "B's task" }));
-    await runAs(B, () => createTask({ prompt: "B's task 2" }));
+    runAs(B, () => createTask({ prompt: "B's task", sessionId: makeSession("B chat") }));
+    await runAs(B, () => createTask({ prompt: "B's task 2", sessionId: makeSession("B chat 2") }));
     scheduler().start();
     scheduler().kick();
     const done = await until(() => runAs(A, () => getTask(aTaskId))?.status === "done" && runAs(B, () => listTasks()).every((x) => x.status === "done"), 10_000);

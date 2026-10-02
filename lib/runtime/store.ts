@@ -107,19 +107,126 @@ export interface Ledger {
   steps: StepRecord[];
 }
 
+/**
+ * Steps live in their own append-only file, not in the ledger JSON.
+ *
+ * A 24h+ run records tens of thousands of steps. Rewriting the whole ledger on every turn/tool
+ * is O(n²) write amplification (measured: ~1.8 GB of writes for 3k steps) and would thrash the
+ * server disk. Appending one line per step is O(1); the runs (small, mutated rarely) stay in the
+ * JSON file. loadLedger merges the two so callers still see one {runs, steps} shape.
+ */
 const ledgerFile = (taskId: string) => path.join(ledgerDir(), `${taskId}.json`);
+const stepsFile = (taskId: string) => path.join(ledgerDir(), `${taskId}.steps.ndjson`);
 
-export function loadLedger(taskId: string): Ledger {
-  const l = readJson<Ledger>(ledgerFile(taskId), { runs: [], steps: [] });
-  return { runs: Array.isArray(l.runs) ? l.runs : [], steps: Array.isArray(l.steps) ? l.steps : [] };
+/** How many of the most recent steps we keep in memory (and serve). Older lines are compacted away. */
+const STEP_KEEP = 5000;
+/** Compact the steps file back to STEP_KEEP lines once it has grown this many lines past the cap. */
+const STEP_COMPACT_AT = STEP_KEEP + 2000;
+
+// Per-path cache of the last STEP_KEEP steps, so Activity reads are O(1) instead of re-reading a
+// multi-MB file, and appends update it without a disk round-trip. Keyed by resolved file path so
+// accounts never share state.
+const stepCache = new Map<string, StepRecord[]>();
+
+function readSteps(taskId: string): StepRecord[] {
+  const file = stepsFile(taskId);
+  const cached = stepCache.get(file);
+  if (cached) return cached;
+  const steps: StepRecord[] = [];
+  try {
+    if (fs.existsSync(file)) {
+      for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+        if (!line) continue;
+        try {
+          steps.push(JSON.parse(line) as StepRecord);
+        } catch {
+          // A torn final line (crash mid-append) is skipped; earlier lines are intact.
+        }
+      }
+    }
+  } catch {
+    // Unreadable steps file: behave as if empty rather than failing the whole ledger read.
+  }
+  const trimmed = steps.length > STEP_KEEP ? steps.slice(-STEP_KEEP) : steps;
+  stepCache.set(file, trimmed);
+  return trimmed;
 }
 
+export function loadLedger(taskId: string): Ledger {
+  // Runs live in the JSON file; a legacy file may still carry an inline steps array — honor it.
+  const l = readJson<Ledger>(ledgerFile(taskId), { runs: [], steps: [] });
+  const runs = Array.isArray(l.runs) ? l.runs : [];
+  const legacySteps = Array.isArray(l.steps) ? l.steps : [];
+  const steps = readSteps(taskId);
+  return { runs, steps: legacySteps.length > 0 ? [...legacySteps, ...steps].slice(-STEP_KEEP) : steps };
+}
+
+/** Persist just the runs (the runner metadata). Steps are appended separately — never written here. */
 export function saveLedger(taskId: string, ledger: Ledger): Promise<void> {
-  return writeJson(ledgerFile(taskId), ledger);
+  return writeJson(ledgerFile(taskId), { runs: ledger.runs });
+}
+
+/**
+ * Append one step durably (one line, O(1)). Updates the in-memory cache synchronously so a reader
+ * in the same process sees it immediately, and compacts rarely (amortized O(1)) so the file and
+ * the cache stay bounded on a run that never ends.
+ */
+export function appendStep(taskId: string, rec: StepRecord): Promise<void> {
+  const file = stepsFile(taskId);
+  const cache = stepCache.get(file);
+  if (cache) {
+    cache.push(rec);
+    if (cache.length > STEP_KEEP) cache.splice(0, cache.length - STEP_KEEP);
+  } else {
+    // First touch of this task in this process: load existing lines so a later read is complete.
+    readSteps(taskId).push(rec);
+    const c = stepCache.get(file);
+    if (c && c.length > STEP_KEEP) c.splice(0, c.length - STEP_KEEP);
+  }
+  return new Promise<void>((resolve) => {
+    fs.mkdirSync(ledgerDir(), { recursive: true });
+    fs.appendFile(file, JSON.stringify(rec) + "\n", (err) => {
+      if (err) {
+        // A failed append must not wedge the run; the step is still in the in-memory cache.
+        resolve();
+        return;
+      }
+      resolve();
+      void maybeCompactSteps(taskId, file);
+    });
+  });
+}
+
+let compacting = new Set<string>();
+async function maybeCompactSteps(taskId: string, file: string): Promise<void> {
+  if (compacting.has(file)) return;
+  let lines = 0;
+  try {
+    const buf = await fs.promises.readFile(file, "utf8");
+    lines = buf.length === 0 ? 0 : buf.split("\n").length - 1;
+  } catch {
+    return;
+  }
+  if (lines <= STEP_COMPACT_AT) return;
+  compacting.add(file);
+  try {
+    const steps = stepCache.get(file) ?? readSteps(taskId);
+    const kept = steps.slice(-STEP_KEEP);
+    const tmp = file + ".tmp";
+    await fs.promises.writeFile(tmp, kept.map((s) => JSON.stringify(s) + "\n").join(""));
+    await fs.promises.rename(tmp, file);
+    stepCache.set(file, kept);
+  } catch {
+    // Compaction is best-effort; the log stays correct (just longer) if it fails.
+  } finally {
+    compacting.delete(file);
+  }
 }
 
 export function deleteLedger(taskId: string): void {
   fs.rmSync(ledgerFile(taskId), { force: true });
+  fs.rmSync(stepsFile(taskId), { force: true });
+  stepCache.delete(stepsFile(taskId));
 }
 
 // Per-task ledger mutex keyed by the resolved file path, so identical task ids under different

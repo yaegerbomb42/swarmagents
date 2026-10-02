@@ -225,6 +225,10 @@ export class BrowserSession {
   async context(): Promise<BrowserContext> {
     if (this.closed) throw new Error("This browser session was closed.");
     if (this.ctx) return this.ctx;
+    // per-user sandbox: on a multi-user server Chromium must run as the user's uid (lib/sandbox chromiumLaunch) with a
+    // uid-owned profile kept apart from this root-owned state/downloads dir. Until that split exists, refuse rather
+    // than launch the browser as root with the server's capabilities.
+    if (process.env.SWARM_MODE === "server") throw new Error("The browser isn't available on this multi-user server yet.");
     if (this.launching) return this.launching;
     fs.mkdirSync(this.dir, { recursive: true });
     fs.mkdirSync(this.downloadsDir, { recursive: true });

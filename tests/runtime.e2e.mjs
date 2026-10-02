@@ -64,6 +64,16 @@ const adapter = {
       return { summary: "stopped" };
     }
 
+    if (task.prompt.includes("APPROVE")) {
+      // Simulate a destructive action that must park for approval the first time it is seen. The
+      // token is the action hash the user will grant. Once granted, the run proceeds (the grant is
+      // single-use, so a second identical action would ask again).
+      if (!task.prompt.includes("APPROVED2")) {
+        return { summary: "needs approval to proceed", verified: false, needs: { kind: "approval", message: "Approve: rm -rf build", token: "hash-rm-build" } };
+      }
+      return { summary: "proceeded after approval", verified: true };
+    }
+
     if (task.prompt.includes("BIGOUT")) {
       const p = path.join(home, "big.txt");
       fs.writeFileSync(p, "x".repeat(5000));
@@ -214,6 +224,38 @@ scheduler().kick();
 await until(() => getTask(t8.id)?.status === "running", 8000);
 check("task resumes after Esc-stop", getTask(t8.id)?.status === "running", getTask(t8.id)?.status);
 await scheduler().stopTask(t8.id);
+
+console.log("\n9. approval survives a restart and is not auto-resumed");
+const t9 = await createTask({ prompt: "APPROVE first", title: "approve-restart" });
+scheduler().kick();
+const blocked9 = await until(() => (getTask(t9.id)?.status === "blocked" ? getTask(t9.id) : null), 8000);
+check("task parked on approval", blocked9?.wait?.kind === "approval", blocked9?.status);
+check("approval token is bound to the action", blocked9?.wait?.token === "hash-rm-build", blocked9?.wait?.token);
+// Simulate a process restart with autoResume ON: reconcile() must still leave the blocked
+// approval task alone, or a destructive action would re-run without the user approving it.
+await rt.saveRuntimeSettings({ ...rt.loadRuntimeSettings(), autoResume: true });
+scheduler().stop();
+scheduler().start();
+await sleep(200);
+const afterRestart9 = getTask(t9.id);
+check("blocked approval task is NOT auto-resumed by reconcile (autoResume on)", afterRestart9?.status === "blocked", afterRestart9?.status);
+check("approval token survives the restart", afterRestart9?.wait?.token === "hash-rm-build", afterRestart9?.wait?.token);
+// Mirror /api/runtime/tasks/[id] approve: grant the exact action, then resume.
+await rt.grantApproval({ taskId: t9.id, hash: "hash-rm-build", tool: "bash", label: "rm -rf build", grantedAt: Date.now() });
+const grantsOnDisk = JSON.parse(fs.readFileSync(path.join(rt.RUNTIME_DIR, "approvals.json"), "utf8"));
+check("grant is persisted to disk (survives a real restart)", grantsOnDisk[`${t9.id}:hash-rm-build`]?.hash === "hash-rm-build");
+const consumed9 = rt.takeApproval(t9.id, "hash-rm-build");
+check("grant is consumable after restart", consumed9?.hash === "hash-rm-build", consumed9?.tool);
+check("grant is single-use after restart", rt.takeApproval(t9.id, "hash-rm-build") === null);
+// Resume the task (as the approve route does) and let it finish without re-asking.
+await rt.updateTask(t9.id, (t) => {
+  t.status = "queued";
+  t.wait = undefined;
+  t.prompt = "APPROVED2 continue";
+});
+scheduler().kick();
+await until(() => ["done", "failed"].includes(getTask(t9.id)?.status ?? ""), 8000);
+check("task finishes after approval", getTask(t9.id)?.status === "done", `${getTask(t9.id)?.status} / ${getTask(t9.id)?.result?.summary}`);
 
 console.log(`\n${failures === 0 ? "RUNTIME E2E PASS" : `RUNTIME E2E FAIL (${failures})`}`);
 process.exit(failures === 0 ? 0 : 1);

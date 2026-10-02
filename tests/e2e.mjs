@@ -524,10 +524,40 @@ const cases = {
     assert(card && /## Sub-agent 3: gamma \(failed\)/.test(card.output ?? ""), "lead sees each child's report", card?.output);
     assert(/\[1·alpha\] started/.test(live) && /\[2·beta\]/.test(live) && /\[3·gamma\] failed/.test(live), "child progress streamed live into the tool card", { live: live.slice(-600) });
     const secs = (Date.now() - t0) / 1000;
-    // Known SA2 gap (19:53): a child's 429 with retry-after: 1 makes the router hold the lead for ~58s afterwards.
+    // SA2: a child's 429 with retry-after: 1 must not teach the router a tiny rpm that then holds the lead (~58s before the fix).
     const stall = events.find((e) => e.type === "notice" && /Waiting (\d+)s/.test(e.text ?? e.message ?? ""));
     const waited = stall ? Number(/Waiting (\d+)s/.exec(stall.text ?? stall.message)[1]) : 0;
-    return `3 children (ok, throttled+slow, failed) → 2 reports + 1 failure in ${secs.toFixed(1)}s; progress streamed${waited > 5 ? ` · WARN lead then waited ${waited}s after a child's 1s retry-after (SA2)` : ""}`;
+    assert(waited <= 5 && secs < 30, "a child's short retry-after doesn't stall the lead", { waited, secs });
+
+    // Settings → Sub-agents drive the runtime: fixed 2 at once queues the third child; Off removes the tool.
+    const file = path.join(HOME, "settings.json");
+    const before = JSON.parse(fs.readFileSync(file, "utf8")).subagents;
+    let gated = "";
+    try {
+      let r = await api("PUT", "/api/settings/subagents", { mode: "fixed", maxParallel: 2 });
+      assert(r.status === 200, "set fixed 2", r.json);
+      live = "";
+      await runTask("[mock:fanout] split this up, two at a time", {
+        timeout: 60_000,
+        onEvent: (e) => {
+          if (e.type === "tool" && e.status === "running" && typeof e.output === "string" && e.output.length > live.length) live = e.output;
+        },
+      });
+      const at = (re) => live.search(re);
+      const firstDone = Math.min(...[at(/\[1·alpha\] done/), at(/\[2·beta\] done/)].filter((i) => i >= 0));
+      assert(at(/\[2·beta\] started/) >= 0 && at(/\[3·gamma\] started/) > firstDone, "with 2 at once, the third child waits for a free slot", { live: live.slice(0, 600) });
+      r = await api("PUT", "/api/settings/subagents", { mode: "off" });
+      assert(r.status === 200, "set off", r.json);
+      const off = texts((await runTask("[mock:fanout] split this up, if you can")).events);
+      assert(/Fanout: no sub-agent tool offered/.test(off), "Off hides the sub-agent tool", off.slice(-300));
+      gated = "; fixed 2 queues the 3rd; Off hides the tool";
+    } finally {
+      const cur = JSON.parse(fs.readFileSync(file, "utf8"));
+      delete cur.subagents;
+      if (before) cur.subagents = before;
+      fs.writeFileSync(file, JSON.stringify(cur, null, 2), { mode: 0o600 });
+    }
+    return `3 children (ok, throttled+slow, failed) → 2 reports + 1 failure in ${secs.toFixed(1)}s; progress streamed; no lead stall${gated}`;
   },
 
   async shellkey() {

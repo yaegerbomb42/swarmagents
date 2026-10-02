@@ -1,0 +1,71 @@
+--- a/lib/users.ts
++++ b/lib/users.ts
+@@ -102,6 +102,12 @@
+   return { id, username, isAdmin, createdAt: now };
+ }
+ 
++/** The oldest enabled admin: the account the owner token signs in as. */
++export function firstAdmin(): User | null {
++  const row = db().prepare("SELECT * FROM users WHERE is_admin = 1 AND disabled = 0 ORDER BY created_at ASC LIMIT 1").get() as Record<string, unknown> | undefined;
++  return row ? toUser(row) : null;
++}
++
+ export function usernameTaken(username: string) {
+   return !!db().prepare("SELECT 1 FROM users WHERE username = ?").get(username);
+ }
+--- a/app/api/login/route.ts
++++ b/app/api/login/route.ts
+@@ -1,5 +1,6 @@
+-import { clearFailures, noteFailure, serverMode, sessionCookie, sessionToken, throttled } from "@/lib/auth";
+-import { authenticate, endSession, startSession } from "@/lib/users";
++import { randomBytes } from "node:crypto";
++import { checkOwnerToken, clearFailures, noteFailure, serverMode, sessionCookie, sessionToken, throttled } from "@/lib/auth";
++import { authenticate, createUser, endSession, firstAdmin, startSession, transaction, usernameTaken } from "@/lib/users";
+ 
+ export const dynamic = "force-dynamic";
+ 
+@@ -7,7 +8,19 @@
+ export async function POST(req: Request) {
+   if (!serverMode()) return Response.json({ error: "Accounts are only used on a hosted server." }, { status: 400 });
+   if (throttled(req)) return Response.json({ error: "Too many attempts. Try again in a minute." }, { status: 429 });
+-  const { username, password } = (await req.json().catch(() => ({}))) as { username?: string; password?: string };
++  const { username, password, token } = (await req.json().catch(() => ({}))) as { username?: string; password?: string; token?: string };
++  // Owner token: always signs in as the first admin (created on first use), so the owner can never be locked out.
++  if (token !== undefined) {
++    if (!checkOwnerToken(String(token))) {
++      await noteFailure(req);
++      return Response.json({ error: "Wrong owner token." }, { status: 401 });
++    }
++    const owner = transaction(() => firstAdmin() ?? createUser(usernameTaken("owner") ? `owner-${randomBytes(3).toString("hex")}` : "owner", randomBytes(32).toString("hex"), true));
++    clearFailures(req);
++    const res = Response.json({ ok: true, user: { username: owner.username, isAdmin: owner.isAdmin } });
++    res.headers.append("Set-Cookie", sessionCookie(req, startSession(owner.id)));
++    return res;
++  }
+   const user = authenticate(String(username ?? "").trim(), String(password ?? ""));
+   if (!user) {
+     await noteFailure(req);
+--- a/app/api/signup/route.ts
++++ b/app/api/signup/route.ts
+@@ -18,6 +18,7 @@
+   const bad = validateCredentials(username, password);
+   if (bad) return Response.json({ error: bad }, { status: 400 });
+ 
++  // Fast pre-checks only; the authoritative first-admin decision is re-made inside the write transaction below.
+   const first = userCount() === 0;
+   const mode = signupMode();
+   if (!first && mode === "closed") return Response.json({ error: "Sign-ups are closed." }, { status: 403 });
+@@ -36,8 +37,11 @@
+   try {
+     created = transaction(() => {
+       if (usernameTaken(username)) throw new SignupError("That username is taken.", 409);
+-      const user = createUser(username, password, first);
+-      if (!first && mode === "invite" && !consumeInvite(invite, user.id)) throw new SignupError("That invite code is not valid or was already used.", 403);
++      const isFirst = userCount() === 0; // atomic: same BEGIN IMMEDIATE transaction as the insert
++      if (first && !isFirst) throw new SignupError("The admin account already exists.", 409);
++      if (!isFirst && mode === "closed") throw new SignupError("Sign-ups are closed.", 403);
++      const user = createUser(username, password, isFirst);
++      if (!isFirst && mode === "invite" && !consumeInvite(invite, user.id)) throw new SignupError("That invite code is not valid or was already used.", 403);
+       return user;
+     });
+   } catch (e) {

@@ -67,6 +67,9 @@ function benchUntil(id: string): number {
 }
 
 /** Out of credits/quota: retrying soon is pointless, but the user may top up, so wait instead of giving up. */
+/** A retry-after at or under this is a precise "come back in N s", not evidence about the per-minute ceiling. */
+const SHORT_RETRY_MS = 10_000;
+
 function isExhausted(err: ProviderError) {
   // A short retry hint or a per-minute limit is ordinary throttling, even when the text links to a billing page.
   if ((err.retryAfterMs !== undefined && err.retryAfterMs < 5 * MINUTE) || /per minute|\b[rt]pm\b|try again in [\d.]+m?s/i.test(err.message)) return false;
@@ -217,9 +220,15 @@ export async function routeTurn(req: ChatRequest, cb: StreamCallbacks, hooks: Ro
           throttles: x.throttles + 1,
           lastThrottleAt: Date.now(),
           cooldownUntil: Date.now() + cooldown,
-          // Only tighten on a real signal; one-request windows say nothing about RPM.
-          rpm: cur.length > 1 ? Math.min(x.rpm ?? Infinity, cur.length - 1) : x.rpm,
-          tpm: load > tokens ? Math.min(x.tpm ?? Infinity, load - tokens) : tokens < (x.tpm ?? Infinity) && cur.length === 1 ? tokens : x.tpm,
+          // Only tighten on a real signal; one-request windows say nothing about RPM. A short retry-after is the
+          // provider telling us exactly when to come back: honor it and keep the learned ceilings, since under
+          // parallel sub-agents the minute window is mostly siblings' requests and would teach a far-too-low rpm.
+          ...(err.retryAfterMs !== undefined && err.retryAfterMs <= SHORT_RETRY_MS
+            ? {}
+            : {
+                rpm: cur.length > 1 ? Math.min(x.rpm ?? Infinity, cur.length - 1) : x.rpm,
+                tpm: load > tokens ? Math.min(x.tpm ?? Infinity, load - tokens) : tokens < (x.tpm ?? Infinity) && cur.length === 1 ? tokens : x.tpm,
+              }),
           lastError: err.message.slice(0, 300),
         }));
         hooks.onNotice(

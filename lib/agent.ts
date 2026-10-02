@@ -12,6 +12,7 @@ import { setAgentAdapter } from "./runtime/resume";
 import { riskOf, actionHash, describe, type Risk } from "./runtime/approvals";
 import { takeApproval, isDenied } from "./runtime/store";
 import { subagentTool } from "./subagents";
+import { subagentPolicy } from "./subagent-settings";
 
 const READ_ONLY = new Set(["read_file", "search", "web_search", "web_fetch"]);
 
@@ -276,7 +277,8 @@ class Session {
     let tools: Tool[] = [];
     try {
       tools = await allTools();
-      tools.push(subagentTool(tools));
+      // Settings → Sub-agents: Off hides the tool entirely.
+      if (subagentPolicy().enabled) tools.push(subagentTool(tools));
     } catch (e) {
       this.add({ type: "notice", level: "warn", text: `Some connectors failed to load: ${(e as Error).message}` } as AgentEvent);
     }

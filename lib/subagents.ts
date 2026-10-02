@@ -3,13 +3,14 @@ import type { Block, Msg } from "./types";
 import { contextWindow, estimateTokens, routeTurn, activeProviders } from "./router";
 import { ProviderError } from "./providers/types";
 import type { Tool, ToolContext, ToolResult } from "./tools/types";
+import { subagentPolicy } from "./subagent-settings";
 
 // Sub-agents: the main agent hands independent pieces of work to child agents that run in parallel, each with its
 // own context window, and gets back one concise report per child. Children are headless (no plan, no steering),
 // can't spawn further children, and their progress streams into the parent's tool card so nothing is hidden.
 
-const MAX_CHILDREN = 4;
-const MAX_CHILD_STEPS = 150;
+/** Hard ceiling per call; Settings → Sub-agents decides how many run at once (subagentPolicy().parallel). */
+const MAX_CHILDREN = 10;
 const READ_ONLY = new Set(["read_file", "search", "web_search", "web_fetch"]);
 /** One shared Chrome: concurrent children driving it would trample each other. */
 const EXCLUSIVE = new Set(["browser"]);
@@ -45,20 +46,28 @@ function trim(history: Msg[], window: number) {
   });
 }
 
-async function runChild(job: Job, tools: Tool[], ctx: ToolContext, log: (s: string) => void): Promise<string> {
+/** Tokens used by all children of one fan-out call, checked against the Settings budget before each step. */
+interface Budget {
+  limit: number | null;
+  used: number;
+}
+
+async function runChild(job: Job, tools: Tool[], ctx: ToolContext, log: (s: string) => void, maxSteps: number, budget: Budget): Promise<string> {
   const toolMap = new Map(tools.map((t) => [t.spec.name, t]));
   const history: Msg[] = [{ role: "user", blocks: [{ type: "text", text: job.prompt }] }];
   let cwd = ctx.cwd;
   let lastText = "";
   const quiet = { onThinking() {}, onText() {}, onToolStart() {}, onToolInput() {}, onBlockEnd() {} };
 
-  for (let step = 0; step < MAX_CHILD_STEPS; step++) {
+  for (let step = 0; step < maxSteps; step++) {
+    if (budget.limit != null && budget.used >= budget.limit) return `[stopped: sub-agent token budget of ${budget.limit} reached]\n${lastText}`;
     trim(history, contextWindow(activeProviders()[0]));
     const r = await routeTurn(
       { system: childSystem(cwd, job.title), messages: history, tools: tools.map((t) => t.spec), signal: ctx.signal },
       quiet,
       { onNotice: (_l, t) => log(`· ${t}`), onAttempt() {} },
     );
+    budget.used += (r.usage?.input ?? 0) + (r.usage?.output ?? 0);
     history.push({ role: "assistant", blocks: r.blocks });
     const text = r.blocks.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("\n").trim();
     if (text) lastText = text;
@@ -91,7 +100,7 @@ async function runChild(job: Job, tools: Tool[], ctx: ToolContext, log: (s: stri
     const results = calls.every((c) => READ_ONLY.has(c.name)) ? await Promise.all(calls.map(runOne)) : await calls.reduce<Promise<Block[]>>(async (acc, c) => [...(await acc), await runOne(c)], Promise.resolve([]));
     history.push({ role: "user", blocks: results });
   }
-  return `[stopped after ${MAX_CHILD_STEPS} steps]\n${lastText}`;
+  return `[stopped after ${maxSteps} steps]\n${lastText}`;
 }
 
 /** The fan-out tool. `tools` is the parent's toolset; children get it minus this tool (no recursion). */
@@ -118,24 +127,37 @@ export function subagentTool(tools: Tool[]): Tool {
       },
     },
     async run(input, ctx) {
+      const pol = subagentPolicy();
+      if (!pol.enabled) return { content: "Sub-agents are turned off in Settings → Sub-agents. Do the work yourself.", isError: true };
       const jobs = ((input.tasks as Job[]) ?? []).filter((j) => j?.prompt).slice(0, MAX_CHILDREN);
       if (!jobs.length) return { content: "No tasks given.", isError: true };
+      const budget: Budget = { limit: pol.budgetTokens, used: 0 };
+      const width = Math.max(1, Math.min(pol.parallel || 1, jobs.length));
       const base = tools.filter((t) => t.spec.name !== "subagent");
       const started = Date.now();
-      const reports = await Promise.all(
-        jobs.map(async (job, i) => {
-          const tag = `[${i + 1}·${job.title.slice(0, 40)}]`;
-          const log = (s: string) => ctx.onOutput(`${tag} ${s}\n`);
-          log("started");
-          try {
-            const own = i === 0 ? base : base.filter((t) => !EXCLUSIVE.has(t.spec.name));
-            const report = await runChild(job, own, ctx, log);
-            log("done");
-            return { job, ok: true, report };
-          } catch (e) {
-            const msg = e instanceof ProviderError && e.kind === "aborted" ? "stopped" : (e as Error).message;
-            log(`failed: ${msg}`);
-            return { job, ok: false, report: `Failed: ${msg}` };
+      // At most `width` children run at once; the rest queue and start as slots free up.
+      const runJob = async (job: Job, i: number) => {
+        const tag = `[${i + 1}·${job.title.slice(0, 40)}]`;
+        const log = (s: string) => ctx.onOutput(`${tag} ${s}\n`);
+        log("started");
+        try {
+          const own = i === 0 ? base : base.filter((t) => !EXCLUSIVE.has(t.spec.name));
+          const report = await runChild(job, own, ctx, log, pol.maxStepsPerChild, budget);
+          log("done");
+          return { job, ok: true, report };
+        } catch (e) {
+          const msg = e instanceof ProviderError && e.kind === "aborted" ? "stopped" : (e as Error).message;
+          log(`failed: ${msg}`);
+          return { job, ok: false, report: `Failed: ${msg}` };
+        }
+      };
+      const reports: Awaited<ReturnType<typeof runJob>>[] = new Array(jobs.length);
+      let next = 0;
+      await Promise.all(
+        Array.from({ length: width }, async () => {
+          while (next < jobs.length) {
+            const i = next++;
+            reports[i] = await runJob(jobs[i], i);
           }
         }),
       );

@@ -1,3 +1,4 @@
+import { scoped } from "@/lib/auth";
 import { getProviders } from "@/lib/store";
 import { PARALLEL_MAX, PARALLEL_MIN, SUBAGENT_DEFAULTS, SubagentSettingsError, getSubagentSettings, saveSubagentSettings, type SubagentSettings } from "@/lib/subagent-settings";
 
@@ -10,11 +11,9 @@ function body() {
   return { settings: getSubagentSettings(), defaults: SUBAGENT_DEFAULTS, limits: { parallelMin: PARALLEL_MIN, parallelMax: PARALLEL_MAX }, providers };
 }
 
-export async function GET() {
-  return Response.json(body());
-}
+export const GET = scoped(async () => Response.json(body()));
 
-export async function PUT(req: Request) {
+export const PUT = scoped(async (req: Request) => {
   const patch = (await req.json().catch(() => null)) as Partial<SubagentSettings> | null;
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) return Response.json({ error: "Send a JSON object." }, { status: 400 });
   const allowed = new Set(Object.keys(SUBAGENT_DEFAULTS));
@@ -27,4 +26,4 @@ export async function PUT(req: Request) {
     if (e instanceof SubagentSettingsError) return Response.json({ error: e.message }, { status: 400 });
     throw e;
   }
-}
+});

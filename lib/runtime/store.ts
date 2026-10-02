@@ -201,20 +201,26 @@ function approvalsKey(taskId: string, hash: string): string {
   return `${taskId}:${hash}`;
 }
 
+// Grants/denials are read-modify-written synchronously (takeApproval must be single-use even when it
+// is called without awaiting a flush), so the map is the source of truth and writes only persist it.
+let approvalsCache: Record<string, ApprovalGrant> | null = null;
+function approvals(): Record<string, ApprovalGrant> {
+  return (approvalsCache ??= readJson<Record<string, ApprovalGrant>>(APPROVALS_FILE, {}));
+}
+
 export function loadApprovals(): Record<string, ApprovalGrant> {
-  return readJson<Record<string, ApprovalGrant>>(APPROVALS_FILE, {});
+  return approvals();
 }
 
 /** Record a single-use approval for an exact action. */
 export function grantApproval(g: ApprovalGrant): Promise<void> {
-  const all = loadApprovals();
-  all[approvalsKey(g.taskId, g.hash)] = g;
-  return writeJson(APPROVALS_FILE, all);
+  approvals()[approvalsKey(g.taskId, g.hash)] = g;
+  return writeJson(APPROVALS_FILE, approvals());
 }
 
 /** Consume an approval if one exists for this action and has not expired. Returns the grant, or null. */
 export function takeApproval(taskId: string, hash: string): ApprovalGrant | null {
-  const all = loadApprovals();
+  const all = approvals();
   const key = approvalsKey(taskId, hash);
   const g = all[key];
   if (!g) return null;
@@ -228,7 +234,7 @@ export function takeApproval(taskId: string, hash: string): ApprovalGrant | null
 
 /** Drop every pending approval for a task (on cancel/delete/finish). */
 export function clearApprovals(taskId: string): void {
-  const all = loadApprovals();
+  const all = approvals();
   let changed = false;
   for (const k of Object.keys(all)) {
     if (all[k].taskId === taskId) {
@@ -259,18 +265,22 @@ function denialsKey(taskId: string, hash: string): string {
   return `${taskId}:${hash}`;
 }
 
+let denialsCache: Record<string, DenialRecord> | null = null;
+function denials(): Record<string, DenialRecord> {
+  return (denialsCache ??= readJson<Record<string, DenialRecord>>(DENIALS_FILE, {}));
+}
+
 export function recordDenial(d: DenialRecord): Promise<void> {
-  const all = readJson<Record<string, DenialRecord>>(DENIALS_FILE, {});
-  all[denialsKey(d.taskId, d.hash)] = d;
-  return writeJson(DENIALS_FILE, all);
+  denials()[denialsKey(d.taskId, d.hash)] = d;
+  return writeJson(DENIALS_FILE, denials());
 }
 
 export function isDenied(taskId: string, hash: string): boolean {
-  return !!readJson<Record<string, DenialRecord>>(DENIALS_FILE, {})[denialsKey(taskId, hash)];
+  return !!denials()[denialsKey(taskId, hash)];
 }
 
 export function clearDenials(taskId: string): void {
-  const all = readJson<Record<string, DenialRecord>>(DENIALS_FILE, {});
+  const all = denials();
   let changed = false;
   for (const k of Object.keys(all)) {
     if (all[k].taskId === taskId) {

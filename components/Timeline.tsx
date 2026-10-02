@@ -1,15 +1,20 @@
 "use client";
-import { memo, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { AgentEvent } from "@/lib/types";
 import { IChevron, IFile } from "./icons";
+import { stepIcon, toolAccent } from "./StepIcons";
+import { AnsiRenderer, hasAnsi } from "./AnsiRenderer";
 import { PreviewChip, producedFiles } from "./FilePreview";
+import "./timeline.css";
 
 type Ev<T extends AgentEvent["type"]> = Extract<AgentEvent, { type: T }>;
 
 const fmtK = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
 const fmtDur = (ms: number) => (ms < 1000 ? `${ms}ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`);
+
+// ═══════ Shared helpers ═══════
 
 const Md = memo(function Md({ text, streaming }: { text: string; streaming?: boolean }) {
   return (
@@ -39,6 +44,13 @@ function useNow(active: boolean) {
   return now;
 }
 
+function StepIcon({ type, name, level }: { type: string; name?: string; level?: string }) {
+  const Icon = stepIcon(type, name, level);
+  return <span className="step-icon"><Icon /></span>;
+}
+
+// ═══════ Thinking ═══════
+
 function Thinking({ e }: { e: Ev<"thinking"> }) {
   const live = !e.done;
   const [open, setOpen] = useState<boolean | null>(null);
@@ -46,15 +58,19 @@ function Thinking({ e }: { e: Ev<"thinking"> }) {
   const shown = open ?? live;
   const secs = Math.max(1, Math.round(((e.endTs ?? now) - e.ts) / 1000));
   return (
-    <div className="ev thinking">
+    <div className="ev ev-virtual thinking">
       <button className="head" onClick={() => setOpen(!shown)}>
+        <StepIcon type="thinking" />
         <Chevron open={shown} />
         <span className={live ? "shimmer" : ""}>{live ? "Thinking" : `Thought for ${secs}s`}</span>
+        {live && <span className="dur" style={{ marginLeft: "auto", fontSize: "11.5px", color: "var(--faint)", fontVariantNumeric: "tabular-nums" }}>{fmtDur(now - e.ts)}</span>}
       </button>
       {shown && e.text && <div className="body">{e.text}</div>}
     </div>
   );
 }
+
+// ═══════ Tool labels and summaries ═══════
 
 const TOOL_LABEL: Record<string, string> = {
   bash: "Shell",
@@ -67,6 +83,8 @@ const TOOL_LABEL: Record<string, string> = {
   web_fetch: "Fetch",
   browser: "Browser",
   plan: "Plan",
+  api_request: "API",
+  subagent: "Sub-agent",
 };
 
 function argSummary(name: string, input: Record<string, unknown>, preview?: string): string {
@@ -101,6 +119,8 @@ function argSummary(name: string, input: Record<string, unknown>, preview?: stri
     }
     case "plan":
       return "";
+    case "api_request":
+      return [pick("method"), pick("url")].filter(Boolean).join(" ");
     default: {
       const first = Object.values(input ?? {}).find((v) => typeof v === "string");
       return first ? String(first) : preview?.slice(0, 120) ?? "";
@@ -116,14 +136,14 @@ function toolName(name: string) {
   return TOOL_LABEL[name] ?? name;
 }
 
-/** Parse "[checkpoint <id> path=<abs>]" markers out of tool output. */
+// ═══════ Diff rendering ═══════
+
 function checkpoints(output: string): { id: string; path: string }[] {
   const out: { id: string; path: string }[] = [];
   for (const m of output.matchAll(/\[checkpoint ([a-f0-9]+) path=([^\]]+)\]/g)) out.push({ id: m[1], path: m[2] });
   return out;
 }
 
-/** Split tool output into pre/diff/post around --- old / +++ new style sections. Returns null if no diff present. */
 function splitDiff(output: string): { head: string; oldText: string; newText: string; tail: string } | null {
   const lines = output.split("\n");
   const oldIdx = lines.findIndex((l) => l.trim() === "--- old" || l.startsWith("--- before"));
@@ -138,11 +158,9 @@ function splitDiff(output: string): { head: string; oldText: string; newText: st
   };
 }
 
-/** Tiny line diff: returns rows of [kind, text] where kind is " " | "-" | "+". */
 function lineDiff(oldText: string, newText: string): [string, string][] {
   const a = oldText.split("\n");
   const b = newText.split("\n");
-  // Simple LCS on capped inputs so huge outputs stay fast.
   const A = a.slice(0, 400);
   const B = b.slice(0, 400);
   const n = A.length;
@@ -154,11 +172,8 @@ function lineDiff(oldText: string, newText: string): [string, string][] {
   let i = 0;
   let j = 0;
   while (i < n && j < m && rows.length < 300) {
-    if (A[i] === B[j]) {
-      rows.push([" ", A[i].slice(0, 300)]);
-      i++;
-      j++;
-    } else if (dp[i + 1][j] >= dp[i][j + 1]) rows.push(["-", A[i++].slice(0, 300)]);
+    if (A[i] === B[j]) { rows.push([" ", A[i].slice(0, 300)]); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) rows.push(["-", A[i++].slice(0, 300)]);
     else rows.push(["+", B[j++].slice(0, 300)]);
   }
   while (i < n && rows.length < 300) rows.push(["-", A[i++].slice(0, 300)]);
@@ -171,9 +186,7 @@ function Diff({ oldText, newText }: { oldText: string; newText: string }) {
   const rows = lineDiff(oldText, newText);
   const adds = rows.filter((r) => r[0] === "+").length;
   const dels = rows.filter((r) => r[0] === "-").length;
-  // Identical content (e.g. a re-write of the same bytes) is not a change: don't imply one.
   if (adds === 0 && dels === 0) return null;
-  // Long diffs collapse to the changed hunks with 2 lines of context; click to see everything.
   const hidden = !expanded && rows.length > 40;
   const visible = hidden
     ? rows.filter(([k], idx) => k !== " " || rows.slice(Math.max(0, idx - 2), idx + 3).some(([k2]) => k2 !== " "))
@@ -227,24 +240,28 @@ function UndoButton({ checkpoint, path, session }: { checkpoint: string; path: s
   );
 }
 
+// ═══════ Tool Card ═══════
+
 function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) => void; session?: string }) {
   const live = e.status === "running" || e.status === "streaming";
   const [open, setOpen] = useState<boolean | null>(null);
   const now = useNow(live);
-  // Live and failed tools open by default; finished ones fold to one line (click to see everything).
   const shown = open ?? (live || e.status === "error" || !!e.images?.length);
   const input = (e.input ?? {}) as Record<string, unknown>;
   const hasInput = Object.keys(input).length > 0;
   const inputText = hasInput ? JSON.stringify(input, null, 2) : e.inputPreview || "";
-  // Files this call produced: the written path for write/edit, or paths parsed from the output.
+  const useAnsi = e.name === "bash" && e.output && hasAnsi(e.output);
   const previewPaths = (() => {
     if (!e.output) return [];
     if (e.name === "write_file" || e.name === "edit_file") return typeof input.path === "string" ? [input.path] : [];
     return producedFiles(e.output).slice(0, 4);
   })();
+  const accent = toolAccent(e.name);
+
   return (
-    <div className="ev tool">
+    <div className={`ev ev-virtual tool ${accent}${live ? " is-active" : ""}`}>
       <button className="head" onClick={() => setOpen(!shown)}>
+        <StepIcon type="tool" name={e.name} />
         <span className={`status ${e.status}`} />
         <span className="name">{toolName(e.name)}</span>
         <span className="arg">{argSummary(e.name, input, e.inputPreview)}</span>
@@ -266,8 +283,13 @@ function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) =
               {(() => {
                 const d = e.output ? splitDiff(e.output) : null;
                 const cps = e.output ? checkpoints(e.output) : [];
-                if (!d)
-                  return <pre className={e.status === "error" ? "err" : ""}>{e.output || "…"}</pre>;
+                if (!d) {
+                  return (
+                    <pre className={e.status === "error" ? "err" : ""}>
+                      {useAnsi ? <AnsiRenderer text={e.output!} /> : (e.output || "…")}
+                    </pre>
+                  );
+                }
                 return (
                   <>
                     {d.head && <pre className="head-pre">{d.head}</pre>}
@@ -306,6 +328,8 @@ function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) =
   );
 }
 
+// ═══════ Copy Button ═══════
+
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -314,17 +338,11 @@ function CopyButton({ text }: { text: string }) {
       title={copied ? "Copied!" : "Copy output"}
       onClick={async (e) => {
         e.stopPropagation();
-        try {
-          await navigator.clipboard.writeText(text);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-        } catch {}
+        try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
       }}
     >
       {copied ? (
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
-          <path d="M2 6.5 5 9.5 10 2.5" />
-        </svg>
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M2 6.5 5 9.5 10 2.5" /></svg>
       ) : (
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
           <rect x="4" y="4" width="7" height="7" rx="1.5" />
@@ -344,12 +362,15 @@ function labelWithCopy(label: string, text: string) {
   );
 }
 
+// ═══════ Compaction ═══════
+
 function Compaction({ e }: { e: Ev<"compaction"> }) {
   const [open, setOpen] = useState(false);
   const live = !e.done;
   return (
-    <div className="ev compact">
+    <div className="ev ev-virtual compact">
       <button className="head" onClick={() => setOpen(!open)}>
+        <StepIcon type="compaction" />
         <Chevron open={open || live} />
         <span className={live ? "shimmer" : ""}>
           {live ? "Compacting context" : `Context compacted · ${fmtK(e.before)} → ${fmtK(e.after)} tokens`}
@@ -361,12 +382,15 @@ function Compaction({ e }: { e: Ev<"compaction"> }) {
   );
 }
 
+// ═══════ Plan Card ═══════
+
 export function PlanCard({ e }: { e: Ev<"plan"> }) {
   const done = e.items.filter((i) => i.status === "done").length;
   return (
-    <div className="ev plan">
+    <div className="ev ev-virtual plan">
       <div className="ttl">
-        Plan · {done}/{e.items.length}
+        <StepIcon type="plan" />
+        <span style={{ marginLeft: 6 }}>Plan · {done}/{e.items.length}</span>
       </div>
       <ul>
         {e.items.map((it, i) => (
@@ -380,10 +404,109 @@ export function PlanCard({ e }: { e: Ev<"plan"> }) {
   );
 }
 
+// ═══════ Step Grouping ═══════
+
+interface StepGroup {
+  kind: "group";
+  name: string;
+  events: Ev<"tool">[];
+  totalDur: number;
+}
+type TimelineItem = { kind: "single"; event: AgentEvent } | StepGroup;
+
+/** Group consecutive tool calls of the same name (read_file, read_file, ... → "Read 5 files") */
+function groupEvents(events: AgentEvent[]): TimelineItem[] {
+  const items: TimelineItem[] = [];
+  let i = 0;
+  while (i < events.length) {
+    const e = events[i];
+    // Only group settled (ok) tool calls of the same name, minimum 3
+    if (e.type === "tool" && e.status === "ok") {
+      let j = i + 1;
+      while (j < events.length && events[j].type === "tool" && (events[j] as Ev<"tool">).name === e.name && (events[j] as Ev<"tool">).status === "ok") j++;
+      if (j - i >= 3) {
+        const group = events.slice(i, j) as Ev<"tool">[];
+        const totalDur = group.reduce((sum, g) => sum + ((g.endTs ?? g.ts) - g.ts), 0);
+        items.push({ kind: "group", name: e.name, events: group, totalDur });
+        i = j;
+        continue;
+      }
+    }
+    items.push({ kind: "single", event: events[i] });
+    i++;
+  }
+  return items;
+}
+
+function GroupCard({ group, onImage, session }: { group: StepGroup; onImage: (s: string) => void; session?: string }) {
+  const [open, setOpen] = useState(false);
+  const label = toolName(group.name);
+  const count = group.events.length;
+  // Summarize: for file tools, show file count; for bash, show command count
+  const summary = group.name === "read_file" ? `${count} files`
+    : group.name === "bash" ? `${count} commands`
+    : `${count} calls`;
+
+  return (
+    <div className="step-group ev-virtual">
+      <button className="step-group-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <StepIcon type="tool" name={group.name} />
+        <Chevron open={open} />
+        <span className="step-group-count">{label}</span>
+        <span style={{ color: "var(--muted)" }}>{summary}</span>
+        <span className="step-group-dur">{fmtDur(group.totalDur)}</span>
+      </button>
+      {open && (
+        <div className="step-group-items">
+          {group.events.map((e) => (
+            <Tool key={e.id} e={e} onImage={onImage} session={session} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════ Load Earlier ═══════
+
+export function LoadEarlier({ archivedCount, sessionId }: { archivedCount: number; sessionId: string }) {
+  const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState<AgentEvent[]>([]);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await fetch(`/api/sessions/${sessionId}/events?limit=100`);
+      if (r.ok) {
+        const d = await r.json();
+        setLoaded(d.events ?? []);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId]);
+
+  if (archivedCount <= 0) return null;
+
+  return (
+    <button className="load-earlier" onClick={load} disabled={loading}>
+      {loading ? "Loading…" : `Show ${archivedCount.toLocaleString()} earlier events`}
+    </button>
+  );
+}
+
+// ═══════ Main Timeline ═══════
+
 export function Timeline({ events, onImage, session }: { events: AgentEvent[]; onImage: (s: string) => void; session?: string }) {
+  const items = groupEvents(events);
+
   return (
     <>
-      {events.map((e) => {
+      {items.map((item) => {
+        if (item.kind === "group") {
+          return <GroupCard key={`g-${item.events[0].id}`} group={item} onImage={onImage} session={session} />;
+        }
+        const e = item.event;
         if ((e as { hidden?: boolean }).hidden) return null;
         switch (e.type) {
           case "user":
@@ -406,7 +529,7 @@ export function Timeline({ events, onImage, session }: { events: AgentEvent[]; o
             return <Thinking key={e.id} e={e} />;
           case "text":
             return e.text ? (
-              <div key={e.id} className="ev">
+              <div key={e.id} className="ev ev-virtual">
                 <Md text={e.text} streaming={!e.done} />
               </div>
             ) : null;
@@ -418,13 +541,14 @@ export function Timeline({ events, onImage, session }: { events: AgentEvent[]; o
             return <PlanCard key={e.id} e={e} />;
           case "notice":
             return (
-              <div key={e.id} className={`ev notice ${e.level}`}>
-                {e.text}
+              <div key={e.id} className={`ev ev-virtual notice ${e.level}`}>
+                <StepIcon type="notice" level={e.level} />
+                <span>{e.text}</span>
               </div>
             );
           case "turn":
             return (
-              <div key={e.id} className="turn" title={`stop: ${e.stop}`}>
+              <div key={e.id} className="turn">
                 {e.provider} · {e.model} · {fmtK(e.inputTokens)} in{e.cachedTokens ? ` (${fmtK(e.cachedTokens)} cached)` : ""} · {fmtK(e.outputTokens)} out
               </div>
             );

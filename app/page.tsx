@@ -1,7 +1,8 @@
 "use client";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { AgentEvent, Attachment, ContextInfo, SessionMeta, StreamOp } from "@/lib/types";
-import { Timeline } from "@/components/Timeline";
+import { Timeline, LoadEarlier } from "@/components/Timeline";
+import { ProgressBar } from "@/components/ProgressBar";
 import { Composer } from "@/components/Composer";
 import { Settings } from "@/components/Settings";
 import { Activity } from "@/components/Activity";
@@ -21,6 +22,7 @@ export default function Home() {
   const [activityOpen, setActivityOpen] = useState(false);
   const [sidebar, setSidebar] = useState(true);
   const [lightbox, setLightbox] = useState<string | null>(null);
+  const [archivedEvents, setArchivedEvents] = useState(0);
   const [now, setNow] = useState(Date.now());
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -69,6 +71,7 @@ export default function Home() {
         setEvents(op.events);
         setRunning(op.running);
         setContext(op.context);
+        setArchivedEvents(op.meta?.archivedEvents ?? 0);
       } else if (op.op === "add") setEvents((x) => [...x, op.event]);
       else if (op.op === "patch")
         setEvents((x) =>

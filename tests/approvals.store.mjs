@@ -53,6 +53,9 @@ check("clearApprovals leaves other tasks alone", takeApproval("t5", "k2") !== nu
 clearDenials("t2");
 check("clearDenials forgets the task's refusal", isDenied("t2", "d1") === false);
 
+// Let the fire-and-forget persistence writes settle before removing the temp home, so cleanup
+// cannot race a queued writeFileSync.
+await new Promise((r) => setTimeout(r, 50));
 fs.rmSync(HOME, { recursive: true, force: true });
 
 if (failures) {

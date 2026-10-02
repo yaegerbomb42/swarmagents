@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isAllowed } from "@/lib/auth";
-import { UPLOADS_DIR, getMeta, sessionDir } from "@/lib/store";
+import { isAllowed, scoped } from "@/lib/auth";
+import { ROOT, currentUser, getMeta, sessionDir, uploadsDir, userHome } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
 
@@ -43,7 +43,8 @@ function realOrNull(p: string) {
   }
 }
 
-export async function GET(req: Request) {
+// scoped(): runs as the signed-in user, so the session lookup and every root below are that user's own.
+export const GET = scoped(async (req: Request) => {
   if (!isAllowed(req)) return Response.json({ error: "Sign in required." }, { status: 401 });
   const u = new URL(req.url);
   const sid = u.searchParams.get("session") ?? "";
@@ -55,9 +56,15 @@ export async function GET(req: Request) {
   if (!meta) return Response.json({ error: "Unknown session." }, { status: 404 });
   if (!want) return Response.json({ error: "Missing path." }, { status: 400 });
 
-  const roots = [meta.cwd, os.homedir(), UPLOADS_DIR, sessionDir(meta.id)].map(realOrNull).filter((r): r is string => !!r);
-  const file = realOrNull(path.resolve(meta.cwd, want.replace(/^~(?=\/|$)/, process.env.HOME ?? "~")));
+  // The machine's home folder is a root only for the single local user; accounts on a server never get it.
+  const local = currentUser() === "local";
+  const roots = [meta.cwd, local ? os.homedir() : null, uploadsDir(), sessionDir(meta.id)].map((r) => (r ? realOrNull(r) : null)).filter((r): r is string => !!r);
+  const file = realOrNull(path.resolve(meta.cwd, want.replace(/^~(?=\/|$)/, local ? (process.env.HOME ?? "~") : meta.cwd)));
   if (!file || !roots.some((r) => within(r, file))) return Response.json({ error: "That file isn't in this task's working folder." }, { status: 404 });
+  // Swarm's own data folder: only the current user's part of it, never another account's keys or sessions.
+  const dataRoot = realOrNull(ROOT);
+  const mine = realOrNull(userHome());
+  if (!local && dataRoot && within(dataRoot, file) && !(mine && within(mine, file))) return Response.json({ error: "That file isn't in this task's working folder." }, { status: 404 });
   if (SECRETISH.test(file)) return Response.json({ error: "Previews of credential files are blocked." }, { status: 403 });
   const st = fs.statSync(file);
   if (!st.isFile()) return Response.json({ error: "Not a file." }, { status: 400 });
@@ -84,4 +91,4 @@ export async function GET(req: Request) {
     "Content-Disposition": `${download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(path.basename(file))}`,
   };
   return new Response(fs.createReadStream(file) as unknown as ReadableStream, { headers });
-}
+});

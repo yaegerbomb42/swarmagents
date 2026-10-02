@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { HOME, getProviders } from "./store";
+import { getProviders, userHome } from "./store";
 import type { ProviderConfig } from "./types";
 
 // SA3: the user's sub-agent preferences, stored under `subagents` in settings.json.
@@ -36,11 +36,12 @@ export const SUBAGENT_DEFAULTS: SubagentSettings = {
 export const PARALLEL_MIN = 2;
 export const PARALLEL_MAX = 10;
 
-const SETTINGS = path.join(HOME, "settings.json");
+// Per user: on a server each account has its own settings.json (lib/store userHome()).
+const settingsPath = () => path.join(userHome(), "settings.json");
 
 function readSettings(): Record<string, unknown> {
   try {
-    return JSON.parse(fs.readFileSync(SETTINGS, "utf8")) as Record<string, unknown>;
+    return JSON.parse(fs.readFileSync(settingsPath(), "utf8")) as Record<string, unknown>;
   } catch {
     return {};
   }
@@ -93,11 +94,11 @@ export function saveSubagentSettings(patch: Partial<SubagentSettings>): Subagent
   }
   const cur = readSettings();
   const next = normalizeSubagentSettings({ ...normalizeSubagentSettings(cur.subagents), ...p });
-  fs.mkdirSync(HOME, { recursive: true, mode: 0o700 });
-  const tmp = `${SETTINGS}.${process.pid}.${Date.now()}.tmp`;
+  const file = settingsPath();
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify({ ...cur, subagents: next }, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, SETTINGS);
-  fs.chmodSync(SETTINGS, 0o600);
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
   return next;
 }
 

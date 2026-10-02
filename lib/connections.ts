@@ -37,6 +37,8 @@ export interface ToolKey {
   enabled: boolean;
   /** Custom keys only: a GET endpoint that proves the key works (Bearer auth). */
   testUrl?: string;
+  /** K2: export this key into the agent's terminal as $envVar. Off unless the user turns it on for this key. */
+  terminal?: boolean;
 }
 
 /** An MCP server definition in mcp.json. Extra swarm fields are ignored by Claude and by the loader. */
@@ -72,6 +74,8 @@ export interface PublicConnection {
   // tool
   envVar?: string;
   testUrl?: string;
+  /** Tool keys: exported into the agent's terminal (K2 opt-in, default off). */
+  terminal?: boolean;
   // mcp
   transport?: McpTransport;
   command?: string;
@@ -103,6 +107,7 @@ export interface ConnectionInput {
   // tool
   envVar?: string;
   testUrl?: string;
+  terminal?: boolean;
   // mcp
   transport?: McpTransport;
   command?: string;
@@ -225,11 +230,24 @@ export function searchKeys(): { service: string; key: string }[] {
 // server-only settings. A key saved under one of these is simply not exported.
 const RESERVED_ENV = /^(SWARM_|PATH$|HOME$|USER$|SHELL$|PWD$|TMPDIR$|NODE_OPTIONS$|NODE_PATH$|LD_|DYLD_|BASH_ENV$|ENV$|ZDOTDIR$|PYTHONPATH$|PYTHONSTARTUP$|PERL5OPT$|RUBYOPT$|GIT_SSH|GIT_CONFIG|GIT_EXEC_PATH$|SSH_AUTH_SOCK$)/i;
 
-/** Environment variables for the agent's shell: every enabled tool key under its variable name. */
+/** Every enabled tool key under its variable name (for host-scoped tools; NOT the shell, see terminalEnv). */
 export function toolEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const t of loadTools())
     if (t.enabled && t.apiKey && t.envVar && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t.envVar) && !RESERVED_ENV.test(t.envVar))
+      env[t.envVar] = t.apiKey;
+  return env;
+}
+
+/**
+ * K2: the keys the user opted in to the agent's terminal, one by one (Settings → key → "Available in the
+ * terminal"). Default off: a key the user never switched on is never in the shell env, so an agent-run `env`
+ * can't list every saved credential. Values that do reach the shell are still masked by redactSavedKeys().
+ */
+export function terminalEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const t of loadTools())
+    if (t.terminal === true && t.enabled && t.apiKey && t.envVar && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t.envVar) && !RESERVED_ENV.test(t.envVar))
       env[t.envVar] = t.apiKey;
   return env;
 }
@@ -256,7 +274,7 @@ interface McpFile {
 
 const readMcpFile = (f: string) => readJson<McpFile>(f, {}).mcpServers ?? {};
 
-function saveSwarmMcp(servers: Record<string, McpDef>) {
+function saveSwarmAgentsMcp(servers: Record<string, McpDef>) {
   const cur = readJson<McpFile>(mcpConfig(), {});
   writeJson(mcpConfig(), { ...cur, mcpServers: servers });
 }
@@ -338,6 +356,7 @@ export function listConnections(): PublicConnection[] {
       return p ? apiAccess(p)?.hosts : undefined;
     })(),
     testUrl: t.testUrl,
+    terminal: t.terminal === true,
   }));
   const mcp: PublicConnection[] = allMcp().map(({ name, def, source }) => {
     const preset = def.preset ?? (def.url ? "custom-http" : "custom-stdio");
@@ -410,6 +429,8 @@ function buildTool(input: ConnectionInput, existing?: ToolKey): ToolKey {
     apiKey,
     enabled: input.enabled ?? existing?.enabled ?? true,
     testUrl: testUrl ? validUrl(testUrl, "test URL") : undefined,
+    // Only an explicit true opts a key in; anything else (missing, "yes", 1) keeps or sets it off.
+    terminal: input.terminal === undefined ? existing?.terminal === true : input.terminal === true,
   };
 }
 

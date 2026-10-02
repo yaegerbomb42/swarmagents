@@ -29,7 +29,7 @@ export const AGENT_ICON_LABELS: Record<AgentIconName, string> = {
   trigger: "Trigger",
   observer: "Observer",
   approvalGate: "Approval gate",
-  swarm: "Swarm",
+  swarm: "SwarmAgents",
 };
 
 // Fallbacks keep the icons colored even where agent-icons.css isn't loaded.

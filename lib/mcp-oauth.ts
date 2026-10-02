@@ -73,7 +73,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   get clientMetadata(): OAuthClientMetadata {
     return {
-      client_name: "Swarm",
+      client_name: "SwarmAgents",
       redirect_uris: this.redirectUrl ? [String(this.redirectUrl)] : [],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],

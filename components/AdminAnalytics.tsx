@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { fmtBytes } from "./StorageSettings";
 import "./storage.css";
+import { AgentIcon } from "./agent-icons";
 
 // Admin-only Analytics (Settings). Renders nothing unless /api/me says the signed-in user is an admin, and the API
 // itself answers 403 to everyone else. Live users (seen in the last 5 minutes), sign-ups (total + per day), running
@@ -84,7 +85,7 @@ export function AdminAnalytics() {
   return (
     <section className="st-section adm">
       <div className="st-section-head">
-        <h3>Analytics</h3>
+        <h3 className="agent-icon-h"><AgentIcon name="observer" />Analytics</h3>
         <span className="stg-total">admin only</span>
       </div>
       {!a ? (

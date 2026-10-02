@@ -9,6 +9,7 @@ import type {
 } from "@/lib/presets";
 import type { PublicConnection, TestResult } from "@/lib/connections";
 import { IArrowDown, IArrowUp, IX } from "./icons";
+import { AgentIcon } from "./agent-icons";
 import { SubagentSettings } from "./SubagentSettings";
 import { StorageSettings } from "./StorageSettings";
 import { AdminAnalytics } from "./AdminAnalytics";
@@ -36,6 +37,8 @@ interface Draft {
   headers: Row[];
   envVar: string;
   testUrl: string;
+  /** K2: export this key into the agent's terminal (off by default). */
+  terminal: boolean;
   transport: McpTransport;
   command: string;
   args: string;
@@ -66,7 +69,7 @@ const TYPE_LABEL: Record<ConnType, string> = {
 const TYPE_HINT: Record<ConnType, string> = {
   llm: "The agent uses the first enabled model and fails over down the list. Drag to reorder. Rate limits are learned from real 429s.",
   tool: "Keys for services the agent's tools call. The agent uses them through web_search and api_request: each key is added on the server and only sent to its own service. Local connectors can reference one as ${VAR}.",
-  mcp: "MCP servers add tools: local commands or remote URLs. Servers set up in Claude Code or Claude Desktop on the machine Swarm runs on appear here automatically.",
+  mcp: "MCP servers add tools: local commands or remote URLs. Servers set up in Claude Code or Claude Desktop on the machine SwarmAgents runs on appear here automatically.",
 };
 
 const toRows = (rec?: Record<string, string>): Row[] =>
@@ -253,6 +256,7 @@ export function Settings({
     headers: [],
     envVar: "",
     testUrl: "",
+    terminal: false,
     transport: "stdio",
     command: "",
     args: "",
@@ -301,7 +305,7 @@ export function Settings({
         headers: toRows(c.headers),
       });
     if (c.type === "tool")
-      Object.assign(d, { envVar: c.envVar ?? "", testUrl: c.testUrl ?? "" });
+      Object.assign(d, { envVar: c.envVar ?? "", testUrl: c.testUrl ?? "", terminal: c.terminal === true });
     if (c.type === "mcp")
       Object.assign(d, {
         transport: c.transport ?? "stdio",
@@ -352,7 +356,7 @@ export function Settings({
       };
     }
     if (d.type === "tool")
-      return { ...base, envVar: d.envVar, testUrl: d.testUrl };
+      return { ...base, envVar: d.envVar, testUrl: d.testUrl, terminal: d.terminal };
     const args = d.args
       .split("\n")
       .map((a) => a.trim())
@@ -422,7 +426,7 @@ export function Settings({
         });
       }
     } catch {
-      setFormError("Couldn't reach the Swarm server. Your changes weren't saved.");
+      setFormError("Couldn't reach the SwarmAgents server. Your changes weren't saved.");
     } finally {
       setSaving(false);
     }
@@ -439,7 +443,7 @@ export function Settings({
         body: body ? JSON.stringify(body) : undefined,
       });
     } catch {
-      setBanner({ ok: false, text: "Couldn't reach the Swarm server." });
+      setBanner({ ok: false, text: "Couldn't reach the SwarmAgents server." });
       return;
     }
     const d = await r.json().catch(() => ({ error: `The server answered ${r.status}.` }));
@@ -453,7 +457,7 @@ export function Settings({
     if (
       confirm(
         imported
-          ? `Hide ${c.label}? It stays in your Claude config; Swarm just won't use it.`
+          ? `Hide ${c.label}? It stays in your Claude config; SwarmAgents just won't use it.`
           : `Remove ${c.label}?`,
       )
     )
@@ -473,7 +477,7 @@ export function Settings({
         body: JSON.stringify({ type: c.type, id: c.id }),
       });
     } catch {
-      setRowTests((t) => ({ ...t, [c.id]: { state: "err", msg: "Couldn't reach the Swarm server." } }));
+      setRowTests((t) => ({ ...t, [c.id]: { state: "err", msg: "Couldn't reach the SwarmAgents server." } }));
       return;
     }
     const res = (await r.json().catch(() => ({ ok: false, message: `The test request failed (${r.status}).` }))) as TestResult;
@@ -557,7 +561,7 @@ export function Settings({
                 return (
                   <section key={type} className="st-section">
                     <div className="st-section-head">
-                      <h3>{TYPE_LABEL[type]}</h3>
+                      <h3 className="agent-icon-h"><AgentIcon name={type === "llm" ? "modelCore" : "toolConnector"} />{TYPE_LABEL[type]}</h3>
                       <button
                         className="st-link"
                         onClick={() => {
@@ -784,6 +788,7 @@ function ConnRow(props: {
   } else if (c.type === "tool") {
     if (c.keyHint) sub.push(`key ${c.keyHint}`);
     sub.push(c.hosts?.length ? `api_request → ${c.hosts[0]}${c.hosts.length > 1 ? ` +${c.hosts.length - 1}` : ""}` : `\${${c.envVar}} for connectors`);
+    if (c.terminal) sub.push(`$${c.envVar} in terminal`);
   } else {
     sub.push(
       c.transport === "stdio"
@@ -1047,6 +1052,29 @@ function Form(props: {
             A local connector can use it by setting an env value to ${"${"}
             {d.envVar || "MY_API_KEY"}
             {"}"}.
+          </span>
+        </div>
+      )}
+
+      {d.type === "tool" && (
+        <div className="field">
+          <label>Terminal</label>
+          <div className="st-term">
+            <button
+              type="button"
+              className={`toggle${d.terminal ? " on" : ""}`}
+              onClick={() => patch({ terminal: !d.terminal })}
+              aria-pressed={d.terminal}
+              aria-label={`Make ${d.envVar || "this key"} available in the agent's terminal`}
+            />
+            <span>
+              Available in the agent&apos;s terminal as <code>${d.envVar || "MY_API_KEY"}</code>
+            </span>
+          </div>
+          <span className="st-help">
+            Off by default. When on, any command the agent runs (for example <code>gh</code>, <code>curl</code>, a
+            CLI) can read this key. Its value is masked as ••••{d.keyHint?.slice(-4) || "last4"} in everything the
+            agent and you see, but only turn it on for keys you trust the agent with.
           </span>
         </div>
       )}

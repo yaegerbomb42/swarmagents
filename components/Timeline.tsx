@@ -315,7 +315,7 @@ function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) =
   return (
     <div className={`ev ev-virtual tool ${accent}${live ? " is-active" : ""}`}>
       <button className="head" onClick={() => setOpen(!shown)}>
-        <StepIcon type="tool" name={e.name} />
+        <StepIcon type="tool" name={e.name} level={e.status === "error" ? "error" : undefined} />
         <span className={`status ${e.status}`} />
         <span className="name">{toolName(e.name)}</span>
         <span className="arg">{argSummary(e.name, input, e.inputPreview)}</span>

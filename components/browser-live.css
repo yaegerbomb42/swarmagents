@@ -49,7 +49,23 @@
 .bl-dl { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 10px 10px; }
 .bl-dl-item { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
 @keyframes bl-rot { to { transform: rotate(360deg); } }
+
+/* Dock mode (default): floats on the right with no layout change in the host page, so mounting is one line. */
+.bl-dock {
+  position: fixed;
+  top: 54px;
+  right: 14px;
+  bottom: 96px;
+  width: min(560px, 44vw);
+  z-index: 60;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(2px);
+}
+@media (max-width: 900px) {
+  .bl-dock { top: 48px; right: 8px; bottom: 84px; width: min(92vw, 520px); }
+}
 @media (max-width: 640px) {
   .bl-view img { max-height: 44vh; }
   .bl-host { max-width: 45%; }
+  .bl-dock { left: 8px; right: 8px; width: auto; }
 }

@@ -4,6 +4,8 @@
  * These use currentColor and inherit the parent's text color.
  */
 
+import { AgentIcons, agentIconForStep, type AgentIconName } from "./agent-icons";
+
 const size = 16;
 const vb = "0 0 24 24";
 const base = { width: size, height: size, viewBox: vb, fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round" as const, strokeLinejoin: "round" as const, "aria-hidden": true as const, focusable: false as unknown as boolean };
@@ -153,6 +155,9 @@ export const IAlert = () => (
 
 /** Get the icon component for a given step. */
 export function stepIcon(type: string, name?: string, level?: string): React.ComponentType {
+  // Brand agent icons first (components/agent-icons.tsx owns the mapping); the mono icons below are the fallback.
+  const agent: AgentIconName | null = agentIconForStep(type, name, level);
+  if (agent) return AgentIcons[(agent[0].toUpperCase() + agent.slice(1)) as keyof typeof AgentIcons];
   if (type === "thinking") return IBrain;
   if (type === "text") return IMessage;
   if (type === "compaction") return ICompress;

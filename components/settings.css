@@ -140,3 +140,7 @@
   .sa-note { margin-left: 0; }
   .sa-range, .sa-select, .sa-inline { max-width: none; }
 }
+
+/* K2: per-key "Available in the terminal" opt-in (Grok Bot) */
+.st-term { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.st-term code, .st-help code { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; }

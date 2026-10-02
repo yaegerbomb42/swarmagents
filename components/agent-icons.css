@@ -36,3 +36,5 @@
 .agent-icon-h { display: inline-flex; align-items: center; gap: 8px; }
 /* Empty states: tile above the message. */
 .agent-icon-empty { display: block; margin: 0 auto 10px; }
+.step-icon .agent-icon { display: block; }
+.task-wait-icon { vertical-align: -2px; margin-right: 2px; }

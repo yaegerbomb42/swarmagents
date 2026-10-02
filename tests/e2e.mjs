@@ -561,21 +561,35 @@ const cases = {
   },
 
   async shellkey() {
-    // Saved tool keys are exported to the agent's shell, and their values are masked in the output.
-    if (!fs.readFileSync(path.join(ROOT, "lib/tools/shell.ts"), "utf8").includes("toolEnv")) return "skipped: lib/tools/shell.ts doesn't export saved keys yet";
+    // K2: a saved tool key reaches the agent's shell only if the user opted that key in (off by default),
+    // and its value is masked in everything the agent and the user see.
+    if (!fs.readFileSync(path.join(ROOT, "lib/tools/shell.ts"), "utf8").includes("terminalEnv")) return "skipped: lib/tools/shell.ts doesn't merge terminalEnv() yet";
     const key = "shellkey-secret-0000WXYZ";
     const r = await api("POST", "/api/connections", { type: "tool", preset: "custom-key", envVar: "SHELLKEY_TEST_TOKEN", apiKey: key });
     assert(r.status === 200, "save key", r.json);
     const id = r.json.connections.find((x) => x.envVar === "SHELLKEY_TEST_TOKEN")?.id;
+    const said = async (label) => {
+      const { events } = await runTask(`[mock:shellkey] ${label}`, { timeout: 60_000 });
+      assert(!JSON.stringify(events).includes(key), "key must not appear anywhere in the session events", { label });
+      return texts(events);
+    };
     try {
-      const { events } = await runTask("[mock:shellkey] use my key", { timeout: 60_000 });
-      const out = texts(events);
-      assert(/ShellKey: exported=ok masked=ok/.test(out), "key exported to the shell and masked", { said: out.slice(-300) });
-      assert(!JSON.stringify(events).includes(key), "key must not appear anywhere in the session events");
+      const listed = (await api("GET", "/api/connections")).json.connections.find((x) => x.id === id);
+      assert(listed && listed.terminal === false, "a new key is off for the terminal by default", listed);
+      let out = await said("default off");
+      assert(/ShellKey: exported=MISSING/.test(out), "a key the user never opted in must not be in the shell", { said: out.slice(-300) });
+      const on = await api("POST", "/api/connections", { type: "tool", id, terminal: true });
+      assert(on.status === 200 && on.json.connections.find((x) => x.id === id)?.terminal === true, "opt in", on.json);
+      out = await said("opted in");
+      assert(/ShellKey: exported=ok masked=ok/.test(out), "opted-in key exported to the shell and masked", { said: out.slice(-300) });
+      const junk = await api("POST", "/api/connections", { type: "tool", id, terminal: "yes" });
+      assert(junk.json.connections.find((x) => x.id === id)?.terminal === false, "only an explicit true opts in", junk.json);
+      out = await said("opted out again");
+      assert(/ShellKey: exported=MISSING/.test(out), "opting out removes it from the shell", { said: out.slice(-300) });
     } finally {
       if (id) await api("DELETE", `/api/connections?type=tool&id=${id}`);
     }
-    return "saved key reached the shell as its env var; value shown as ••••WXYZ";
+    return "off by default (not in the shell) → opted in: exported, shown as ••••WXYZ → opted out: gone";
   },
 
   async anthropic() {

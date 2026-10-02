@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import type { SubagentMode, SubagentSettings as S } from "@/lib/subagent-settings";
+import { AgentIcon } from "./agent-icons";
 
 // Settings → Sub-agents (SA3). Saves each change straight away; the server validates and clamps.
 
@@ -74,7 +75,7 @@ export function SubagentSettings() {
     return (
       <section className="st-section sa">
         <div className="st-section-head">
-          <h3>Sub-agents</h3>
+          <h3 className="agent-icon-h"><AgentIcon name="swarm" />Sub-agents</h3>
         </div>
         <div className="st-empty">{state || "Loading…"}</div>
       </section>
@@ -89,7 +90,7 @@ export function SubagentSettings() {
   return (
     <section className="st-section sa">
       <div className="st-section-head">
-        <h3>Sub-agents</h3>
+        <h3 className="agent-icon-h"><AgentIcon name="swarm" />Sub-agents</h3>
         <span className={`sa-state${err ? " err" : ""}`} role="status">
           {state === "saving" ? "Saving…" : state === "saved" ? "Saved" : ""}
         </span>

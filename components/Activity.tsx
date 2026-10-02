@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Artifact, RunRecord, RuntimeSettings, StepRecord, Task, TaskStatus } from "@/lib/runtime/types";
 import "./Activity.css";
+import { AgentIcon } from "./agent-icons";
 
 interface BoardTask extends Task {
   progress?: { pct: number; label: string };
@@ -145,6 +146,7 @@ export function Activity({ onClose, onOpenSession }: { onClose: () => void; onOp
           <div className="activity-list">
             {!tasks.length && (
               <div className="activity-empty">
+                <AgentIcon name="scheduler" size={56} tile className="agent-icon-empty" />
                 <p>No tasks yet.</p>
                 <p className="dim">
                   Ask the agent for something. Long jobs land here, keep running when paused on quota, and survive restarts.
@@ -173,7 +175,7 @@ export function Activity({ onClose, onOpenSession }: { onClose: () => void; onOp
                   <span>{relTime(t.updatedAt)}</span>
                 </div>
                 {t.wait?.message && t.status !== "running" && (
-                  <div className={`task-wait${t.wait.kind === "approval" ? " task-wait-approval" : ""}`}>{t.wait.message}</div>
+                  <div className={`task-wait${t.wait.kind === "approval" ? " task-wait-approval" : ""}`}>{t.wait.kind === "approval" && <AgentIcon name="approvalGate" size={14} className="task-wait-icon" />} {t.wait.message}</div>
                 )}
               </button>
             ))}

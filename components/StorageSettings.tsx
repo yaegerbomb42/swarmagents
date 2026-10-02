@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import "./storage.css";
+import { AgentIcon } from "./agent-icons";
 
 // Settings → Storage: the per-account quota meter (chats / trajectories / files / browser / other), warnings at 80%
 // and 95%, the auto-prune toggle, one-click "clear old chats", per-chat sizes with pin and delete, and a log of
@@ -109,7 +110,7 @@ export function StorageSettings() {
     return (
       <section className="st-section stg">
         <div className="st-section-head">
-          <h3>Storage</h3>
+          <h3 className="agent-icon-h"><AgentIcon name="memory" />Storage</h3>
         </div>
         <div className="st-empty">{err || "Loading…"}</div>
       </section>
@@ -123,7 +124,7 @@ export function StorageSettings() {
   return (
     <section className="st-section stg">
       <div className="st-section-head">
-        <h3>Storage</h3>
+        <h3 className="agent-icon-h"><AgentIcon name="memory" />Storage</h3>
         <span className="stg-total">
           {fmtBytes(r.used)}
           {limit ? ` of ${fmtBytes(limit)} (${Math.min(100, Math.floor(r.pct * 100))}%)` : " used"}

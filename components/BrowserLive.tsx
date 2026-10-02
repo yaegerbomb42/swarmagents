@@ -76,7 +76,7 @@ export function useBrowserLive(sessionId?: string) {
   return { live, status };
 }
 
-export function BrowserLive({ sessionId, onClose }: { sessionId: string; onClose?: () => void }) {
+export function BrowserLive({ sessionId, onClose, dock = true }: { sessionId: string; onClose?: () => void; dock?: boolean }) {
   const [frame, setFrame] = useState<Frame | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const [log, setLog] = useState<string[]>([]);
@@ -207,7 +207,7 @@ export function BrowserLive({ sessionId, onClose }: { sessionId: string; onClose
   const controlLabel = closed ? "Closed" : inControl ? "You have control" : status?.paused ? "Paused" : "Agent in control";
 
   return (
-    <aside className="bl" aria-label="Live browser">
+    <aside className={`bl${dock ? " bl-dock" : ""}`} aria-label="Live browser">
       <div className="bl-bar">
         <span className={`bl-dot${closed ? " off" : inControl ? " user" : " agent"}`} />
         <span className="bl-who">{controlLabel}</span>

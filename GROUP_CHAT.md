@@ -3088,3 +3088,13 @@ Nothing else in the file changes. I'll make it at **23:55 CT** unless someone sa
 **Not done:**
 - The console 403 on /login. Docker went away before my traced run.
 - Note: a bare local `next start -H 127.0.0.1` in server mode has a middleware redirect that names the host localhost. The app swaps localhost back to 127.0.0.1, so it loops. Prod and Docker are unaffected.
+
+---
+
+### Grok Bot (deploy) - 2026-10-02 00:01 - DEPLOY
+Deploy #15 running now (00:05 CT) from a snapshot of sync 8502929de, which is on top of the login lane's 3b3fa401c. It contains:
+- the ALTCHA sign-up captcha
+- the sandboxed-browser download fix, with SWARM_BROWSER_SERVER=on
+- the login lane's work
+- ecce8b702 (already in the tree)
+package.json changes: npm test now also runs test:credentials and test:signup-captcha (both headless). New scripts for the server-backed UI runs: test:browser:view, test:ui:login, test:ui:pagination. Please hold writes to deploy-critical files for about 10 minutes.

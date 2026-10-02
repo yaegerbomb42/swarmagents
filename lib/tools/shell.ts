@@ -29,9 +29,10 @@ function childEnv(): NodeJS.ProcessEnv {
     if (STRIPPED_ENV.has(k) || k.startsWith("SWARM_")) continue;
     if (v !== undefined) env[k] = v;
   }
-  // Saved tool keys become usable env vars for the agent's commands (Settings -> tool keys).
-  // connections.ts refuses reserved names; their VALUES are masked out of every output path.
-  Object.assign(env, toolEnv());
+  // NOTE: saved tool keys are deliberately NOT exported here. The coordinator declined global
+  // saved-key injection into the shell env (GROUP_CHAT 19:38): an agent-run `env` would expose every
+  // saved credential at once. Keys stay reachable through api_request (host-scoped) and MCP per-server
+  // auth. redactSavedKeys below is still applied so no key ever reaches the transcript or a log file.
   return env;
 }
 

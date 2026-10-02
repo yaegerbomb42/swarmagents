@@ -1,58 +1,25 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import type { AgentEvent, PlanItem, ContextInfo } from "@/lib/types";
 
 interface ProgressBarProps {
   events: AgentEvent[];
   running: boolean;
   context: ContextInfo | null;
-  startTs: number; // timestamp of first user message
+  startTs: number;
 }
 
-function fmtK(n: number): string {
-  if (n >= 1000) {
-    return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
-  }
-  return String(n);
-}
-
-function getGoal(events: AgentEvent[]): string {
-  const msg = events.find(
-    (e: any) => e.type === "user_message" || (e.type === "message" && e.role === "user")
-  ) as any;
-  const text = msg?.content || "";
-  if (text.length > 60) return text.substring(0, 60) + "...";
-  return text || "Processing...";
-}
-
-function getCurrentStep(events: AgentEvent[], running: boolean): string {
-  if (!running && events.length > 0) return "Done";
-  if (events.length === 0) return "Starting...";
-  const last = events[events.length - 1] as any;
-  switch (last.type) {
-    case "tool_call":
-      return `Running ${last.toolName}...`;
-    case "thought":
-      return "Thinking...";
-    case "message_chunk":
-    case "message":
-      if (last.role === "assistant") return "Writing...";
-      return "Processing...";
-    default:
-      return "Processing...";
-  }
-}
+const fmtK = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n));
 
 function formatElapsed(ms: number): string {
   if (ms < 0) ms = 0;
   const s = Math.floor(ms / 1000);
   const m = Math.floor(s / 60);
   const h = Math.floor(m / 60);
-  const sec = s % 60;
-  if (h > 0) return `${h}h ${m % 60}m ${sec}s`;
-  if (m > 0) return `${m}m ${sec}s`;
-  return `${sec}s`;
+  if (h > 0) return `${h}h ${m % 60}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
 }
 
 export function ProgressBar({ events, running, context, startTs }: ProgressBarProps) {
@@ -60,59 +27,104 @@ export function ProgressBar({ events, running, context, startTs }: ProgressBarPr
 
   useEffect(() => {
     if (!running) return;
-    const interval = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(interval);
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
   }, [running]);
 
-  if (!running && events.length === 0) return null;
+  // Goal: first user message, truncated
+  const goal = useMemo(() => {
+    const user = events.find((e) => e.type === "user");
+    if (!user || user.type !== "user") return "";
+    const t = user.text || "";
+    return t.length > 80 ? t.slice(0, 77) + "…" : t;
+  }, [events]);
 
-  const goal = getGoal(events);
-  const currentStep = getCurrentStep(events, running);
-
-  let inputTokens = 0;
-  let outputTokens = 0;
-  for (const e of events) {
-    const anyE = e as any;
-    if (anyE.type === "turn" && anyE.metrics) {
-      inputTokens += anyE.metrics.inputTokens || 0;
-      outputTokens += anyE.metrics.outputTokens || 0;
+  // Current step: last active event
+  const currentStep = useMemo(() => {
+    if (!running) return "Done";
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.type === "thinking" && !e.done) return "Thinking…";
+      if (e.type === "text" && !e.done) return "Writing…";
+      if (e.type === "tool" && (e.status === "running" || e.status === "streaming")) {
+        const label = e.name.startsWith("mcp__")
+          ? e.name.split("__").slice(1).join(" · ")
+          : ({ bash: "Shell", read_file: "Reading", write_file: "Writing", edit_file: "Editing", search: "Searching", web_search: "Web search", web_fetch: "Fetching", browser: "Browser" } as Record<string, string>)[e.name] ?? e.name;
+        const arg = Object.values((e.input ?? {}) as Record<string, unknown>).find((v) => typeof v === "string");
+        return arg ? `${label} · ${String(arg).slice(0, 60)}` : label;
+      }
     }
-  }
+    return "Working…";
+  }, [events, running]);
 
-  const cost = ((inputTokens / 1000000) * 3 + (outputTokens / 1000000) * 15).toFixed(4);
+  // Token totals from turn events
+  const { inputTokens, outputTokens, cachedTokens } = useMemo(() => {
+    let inp = 0, out = 0, cached = 0;
+    for (const e of events) {
+      if (e.type === "turn") {
+        inp += e.inputTokens;
+        out += e.outputTokens;
+        cached += e.cachedTokens;
+      }
+    }
+    return { inputTokens: inp, outputTokens: out, cachedTokens: cached };
+  }, [events]);
 
-  // Parse plan from context if available
-  const planSteps: PlanItem[] = (context as any)?.plan || [];
-  const totalSteps = planSteps.length;
-  const completedSteps = planSteps.filter((s: any) => s.status === "completed" || s.status === "done").length;
+  // Plan progress from plan events
+  const planInfo = useMemo(() => {
+    const plans = events.filter((e) => e.type === "plan") as Extract<AgentEvent, { type: "plan" }>[];
+    const latest = plans.at(-1);
+    if (!latest) return null;
+    const done = latest.items.filter((i) => i.status === "done").length;
+    return { done, total: latest.items.length };
+  }, [events]);
 
-  const lastEventTs = events.length > 0 ? (events[events.length - 1] as any).ts : 0;
-  const elapsedMs = running ? now - startTs : (lastEventTs || now) - startTs;
+  const cost = ((inputTokens / 1e6) * 3 + (outputTokens / 1e6) * 15);
+  const elapsed = startTs > 0 ? (running ? now : (events.at(-1)?.ts ?? now)) - startTs : 0;
+
+  if (!events.length) return null;
 
   return (
-    <div className="progress-hero">
+    <div className="progress-hero" role="status" aria-label="Task progress">
       <div className="progress-hero-inner">
-        <div className="progress-goal">
-          <span className="label">Goal:</span> {goal}
-        </div>
-        <div className="progress-step">
-          {running && <span className="pulse-dot" />}
-          <span className="label">Current:</span> {currentStep}
-        </div>
-        {totalSteps > 0 && (
-          <div className="progress-plan">
-            <span className="label">Plan:</span> {completedSteps}/{totalSteps} steps
+        {goal && (
+          <div className="progress-cell progress-goal" title={goal}>
+            <span className="progress-label">Goal</span>
+            <span className="progress-value">{goal}</span>
           </div>
         )}
-        <div className="progress-elapsed">
-          <span className="label">Elapsed:</span> {formatElapsed(elapsedMs)}
+        <div className="progress-cell progress-step">
+          {running && <span className="pulse-dot" />}
+          <span className="progress-label">Step</span>
+          <span className="progress-value">{currentStep}</span>
         </div>
-        <div className="progress-tokens">
-          <span className="label">Tokens:</span> {fmtK(inputTokens)} in &middot; {fmtK(outputTokens)} out
+        {planInfo && (
+          <div className="progress-cell progress-plan">
+            <span className="progress-label">Plan</span>
+            <span className="progress-value">
+              {planInfo.done}/{planInfo.total}
+              <span className="progress-bar-mini">
+                <span className="progress-bar-fill" style={{ width: `${(planInfo.done / planInfo.total) * 100}%` }} />
+              </span>
+            </span>
+          </div>
+        )}
+        <div className="progress-cell progress-elapsed">
+          <span className="progress-label">Elapsed</span>
+          <span className="progress-value tabnum">{formatElapsed(elapsed)}</span>
         </div>
-        <div className="progress-cost">
-          <span className="label">Cost:</span> ~${cost}
+        <div className="progress-cell progress-tokens">
+          <span className="progress-label">Tokens</span>
+          <span className="progress-value tabnum">
+            {fmtK(inputTokens)} in{cachedTokens > 0 ? ` (${fmtK(cachedTokens)} cached)` : ""} · {fmtK(outputTokens)} out
+          </span>
         </div>
+        {cost >= 0.001 && (
+          <div className="progress-cell progress-cost">
+            <span className="progress-label">Cost</span>
+            <span className="progress-value tabnum">~${cost < 0.01 ? cost.toFixed(4) : cost < 1 ? cost.toFixed(3) : cost.toFixed(2)}</span>
+          </div>
+        )}
       </div>
     </div>
   );

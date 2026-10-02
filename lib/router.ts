@@ -161,6 +161,7 @@ export async function routeTurn(req: ChatRequest, cb: StreamCallbacks, hooks: Ro
   // Only bad keys and permanently rejected requests remove a provider; everything else is waited out.
   const dead = new Set<string>();
   let transientTries = 0;
+  let badOutputTries = 0;
 
   for (;;) {
     const live = providers.filter((p) => !dead.has(p.id));
@@ -193,6 +194,13 @@ export async function routeTurn(req: ChatRequest, cb: StreamCallbacks, hooks: Ro
     } catch (e) {
       const err = e instanceof ProviderError ? e : new ProviderError("transient", String(e));
       if (err.kind === "aborted" || err.kind === "context") throw err;
+      // A provider rejecting the model's own malformed output (an invented tool name, broken tool JSON) is a sampling
+      // glitch, whatever status it came with: resample right away. A reset header on it is about quota, not this.
+      if (/tool call validation failed|failed to (call a function|parse tool call)|tool_use_failed|invalid tool call/i.test(err.message) && badOutputTries++ < 3) {
+        hooks.onNotice("info", `${p.label} rejected a malformed tool call from the model; resampling.`);
+        await sleep(500, req.signal);
+        continue;
+      }
       if (isExhausted(err)) {
         const ms = benchFor(p.id, 5 * MINUTE);
         updateLimits(p.id, (x) => ({ ...x, lastError: err.message.slice(0, 300) }));

@@ -1,0 +1,14 @@
+# Installed by `infra/deploy.sh swarmagents`. Re-applies the agent container's egress firewall after a reboot.
+# Scope: only the swarmagents-isolated docker network (see /usr/local/sbin/swarmagents-egress.sh).
+[Unit]
+Description=Egress firewall for the swarmagents agent container (swarmagents-isolated network only)
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/swarmagents-egress.sh
+
+[Install]
+WantedBy=multi-user.target

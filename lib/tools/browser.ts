@@ -31,9 +31,18 @@ function launchOptions() {
       headless: h,
       acceptDownloads: true,
       args,
+      env: browserEnv(),
       viewport: h ? { width: 1280, height: 860 } : null,
     },
   };
+}
+
+/** Chrome doesn't need the server's secrets: drop SWARM_* and anything that looks like a credential. */
+function browserEnv() {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env))
+    if (v !== undefined && !k.startsWith("SWARM_") && !/KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH/i.test(k)) env[k] = v;
+  return env;
 }
 
 function uniquePath(dir: string, name: string) {

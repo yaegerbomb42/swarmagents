@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { passwordLengthError, signupCredentialsError, usernameError } from "./credentials";
 
 const HOME = process.env.SWARM_HOME || path.join(process.env.HOME ?? "/tmp", ".swarmagents");
 const SESSION_MS = 30 * 24 * 3600_000;
@@ -172,11 +173,9 @@ export function userCount(): number {
   return Number((db().prepare("SELECT COUNT(*) AS n FROM users").get() as { n: number }).n);
 }
 
-export function validateCredentials(username: string, password: string): string | null {
-  if (!/^[a-zA-Z0-9_.-]{3,32}$/.test(username)) return "Username must be 3–32 letters, digits, dots, dashes or underscores.";
-  if (password.length < 10) return "Password must be at least 10 characters.";
-  if (password.length > 256) return "Password is too long.";
-  return null;
+/** Rules for a new account (lib/credentials.ts, shared with the sign-up form). `lengthOnly` is for the boot-seeded admin. */
+export function validateCredentials(username: string, password: string, opts: { lengthOnly?: boolean } = {}): string | null {
+  return opts.lengthOnly ? (usernameError(username) ?? passwordLengthError(password)) : signupCredentialsError(username, password);
 }
 
 export function createUser(username: string, password: string, isAdmin = false, email: string | null = null): User {

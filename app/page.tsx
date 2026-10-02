@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AgentEvent, Attachment, ContextInfo, SessionMeta, StreamOp } from "@/lib/types";
 import { Timeline, LoadEarlier } from "@/components/Timeline";
 import { ProgressBar } from "@/components/ProgressBar";
@@ -8,12 +8,14 @@ import { AwayRecap } from "@/components/AwayRecap";
 import { ChangedFilesTree } from "@/components/ChangedFilesTree";
 import { Composer } from "@/components/Composer";
 import { Settings } from "@/components/Settings";
+import { BrowserLive, useBrowserLive } from "@/components/BrowserLive"; // deploy lane 23:20: browser lane snippet (watch-live dock)
 import { StorageBanner } from "@/components/StorageSettings"; // deploy lane 22:29: storage warning banner (Settings lane leftover)
 import { Activity } from "@/components/Activity";
 import { IActivity, IPlus, ISettings, ISidebar, IX } from "@/components/icons";
 import { HexagonMark, Wordmark, MiniHexagon, WrenchMark } from "@/components/Brand";
 import { LivingHexagon, EmptyStateHexagon, useHexagonState } from "@/components/HexagonMark";
 import { canonicalHostSwap } from "@/lib/canonical";
+import { Welcome, FIRST_TASKS } from "@/components/Welcome"; // Grok Bot: first-run welcome (Jimmy 23:12)
 
 export default function Home() {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
@@ -27,7 +29,13 @@ export default function Home() {
   const [activityOpen, setActivityOpen] = useState(false);
   const [sidebar, setSidebar] = useState(true);
   const [lightbox, setLightbox] = useState<string | null>(null);
+  const browser = useBrowserLive(active ?? undefined);
+  const [livePanel, setLivePanel] = useState(true);
   const [archivedEvents, setArchivedEvents] = useState(0);
+  // First run: null until /api/providers answers; `welcome` stays on from "no model yet" until the first task starts.
+  const [hasModel, setHasModel] = useState<boolean | null>(null);
+  const [welcome, setWelcome] = useState(false);
+  const [primaryModel, setPrimaryModel] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
   const [mainAmbient, setMainAmbient] = useState<"idle" | "thinking" | "working" | "error">("idle");
   const scroller = useRef<HTMLDivElement>(null);
@@ -44,6 +52,20 @@ export default function Home() {
   }, [hexagonState]);
 
   const refresh = useCallback(() => fetch("/api/sessions").then((r) => r.json()).then((d) => setSessions(d.sessions)), []);
+  const checkModel = useCallback(
+    () =>
+      fetch("/api/providers")
+        .then((r) => r.json())
+        .then((d: { providers?: { label?: string; model?: string; enabled?: boolean }[] }) => {
+          const has = !!d.providers?.length;
+          const first = d.providers?.find((p) => p.enabled !== false);
+          setPrimaryModel(first ? [first.label, first.model].filter(Boolean).join(" · ") : "");
+          setHasModel(has);
+          return has;
+        })
+        .catch(() => null),
+    [],
+  );
 
   useEffect(() => {
     // One local origin: localhost and 127.0.0.1 have separate localStorage.
@@ -53,9 +75,7 @@ export default function Home() {
       return;
     }
     refresh();
-    fetch("/api/providers")
-      .then((r) => r.json())
-      .then((d) => !d.providers.length && setSettings(true));
+    checkModel().then((has) => has === false && setWelcome(true));
     // Returning from a one-click provider connection.
     const qs = new URLSearchParams(location.search);
     if (qs.has("connected") || qs.has("connect_error")) {
@@ -66,7 +86,7 @@ export default function Home() {
     const last = localStorage.getItem("swarm.active");
     if (last) setActive(last);
     if (window.innerWidth < 760) setSidebar(false);
-  }, [refresh]);
+  }, [refresh, checkModel]);
 
   // Live stream for the open session.
   useEffect(() => {
@@ -74,6 +94,8 @@ export default function Home() {
       active ? localStorage.setItem("swarm.active", active) : localStorage.removeItem("swarm.active");
     } catch {}
     setEvents([]);
+    setEarlier([]);
+    setArchivedEvents(0);
     setContext(null);
     setRunning(false);
     if (!active) return;
@@ -160,19 +182,33 @@ export default function Home() {
     refresh();
   }, [active, refresh]);
 
-  // Visible events (handles archived events)
-  const [visible, setVisible] = useState<AgentEvent[]>(events);
-  
-  // Sync visible with events when they change (new session, etc.)
-  useEffect(() => {
-    setVisible(events);
-    setArchivedEvents(0); // Will be updated from SSE snapshot
-  }, [events]);
+  // Earlier events paged in by "Show earlier" (GET /api/sessions/:id/events?before=). They live apart from the
+  // streamed `events`, so a snapshot or a new token never drops them; the SSE effect resets them on session switch.
+  // archivedEvents comes from the snapshot, then counts down as pages load. Merged by id, so nothing shows twice.
+  const [earlier, setEarlier] = useState<AgentEvent[]>([]);
+  const visible = useMemo(() => {
+    if (!earlier.length) return events;
+    const live = new Set(events.map((e) => e.id));
+    return [...earlier.filter((e) => !live.has(e.id)), ...events];
+  }, [earlier, events]);
 
-  const handleLoadEarlier = useCallback((newEvents: AgentEvent[], remaining: number) => {
-    setVisible((prev) => [...newEvents, ...prev]);
-    setArchivedEvents(remaining);
+  const handleLoadEarlier = useCallback((older: AgentEvent[], remaining: number) => {
+    setEarlier((prev) => {
+      const have = new Set(prev.map((e) => e.id));
+      return [...older.filter((e) => !have.has(e.id)), ...prev];
+    });
+    setArchivedEvents(Math.max(0, remaining));
   }, []);
+
+  // A suggested task: one click creates the task and starts it.
+  const runTask = useCallback(
+    async (text: string) => {
+      await send(text, []);
+      setWelcome(false);
+      refresh();
+    },
+    [send, refresh],
+  );
 
   // Session title for topbar
   const title = sessions.find((s) => s.id === active)?.title ?? null;
@@ -276,93 +312,32 @@ export default function Home() {
           }}
         >
           {!visible.length ? (
-            <div className="empty">
-              <div className="empty-content">
-                <EmptyStateHexagon state={hexagonState} className="empty-hexagon" />
-                <h1>What should we get done?</h1>
-                <p>Shell, files, browser, web and your connectors. Every step shows here as it happens.</p>
-                <div className="empty-examples" style={{ marginTop: "var(--space-6)", display: "flex", flexWrap: "wrap", gap: "var(--space-2)", justifyContent: "center" }}>
-                  <button
-                    className="example-chip"
-                    onClick={() => {
-                      // This would need a callback to set composer text
-                    }}
-                    style={{
-                      padding: "var(--space-2) var(--space-3)",
-                      background: "var(--color-bg-elevated)",
-                      border: "1px solid var(--color-line)",
-                      borderRadius: "var(--radius-full)",
-                      fontSize: "var(--type-size--1)",
-                      color: "var(--color-text-muted)",
-                      cursor: "pointer",
-                      transition: "all var(--transition-fast)",
-                    }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.borderColor = "var(--color-run)";
-                      e.currentTarget.style.color = "var(--color-run)";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.borderColor = "var(--color-line)";
-                      e.currentTarget.style.color = "var(--color-text-muted)";
-                    }}
-                  >
-                    "Refactor the auth module"
-                  </button>
-                  <button
-                    className="example-chip"
-                    style={{
-                      padding: "var(--space-2) var(--space-3)",
-                      background: "var(--color-bg-elevated)",
-                      border: "1px solid var(--color-line)",
-                      borderRadius: "var(--radius-full)",
-                      fontSize: "var(--type-size--1)",
-                      color: "var(--color-text-muted)",
-                      cursor: "pointer",
-                      transition: "all var(--transition-fast)",
-                    }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.borderColor = "var(--color-run)";
-                      e.currentTarget.style.color = "var(--color-run)";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.borderColor = "var(--color-line)";
-                      e.currentTarget.style.color = "var(--color-text-muted)";
-                    }}
-                  >
-                    "Add tests for the API layer"
-                  </button>
-                  <button
-                    className="example-chip"
-                    style={{
-                      padding: "var(--space-2) var(--space-3)",
-                      background: "var(--color-bg-elevated)",
-                      border: "1px solid var(--color-line)",
-                      borderRadius: "var(--radius-full)",
-                      fontSize: "var(--type-size--1)",
-                      color: "var(--color-text-muted)",
-                      cursor: "pointer",
-                      transition: "all var(--transition-fast)",
-                    }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.borderColor = "var(--color-run)";
-                      e.currentTarget.style.color = "var(--color-run)";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.borderColor = "var(--color-line)";
-                      e.currentTarget.style.color = "var(--color-text-muted)";
-                    }}
-                  >
-                    "Build a dashboard component"
-                  </button>
+            welcome || hasModel === false ? (
+              <div className="empty">
+                <Welcome connected={!!hasModel} onConnected={checkModel} onOpenSettings={() => setSettings(true)} onRunTask={runTask} />
+              </div>
+            ) : (
+              <div className="empty">
+                <div className="empty-content">
+                  <EmptyStateHexagon state={hexagonState} className="empty-hexagon" />
+                  <h1>What should we get done?</h1>
+                  <p>Shell, files, browser, web and your connectors. Every step shows here as it happens.</p>
+                  <div className="empty-examples" style={{ marginTop: "var(--space-6)", display: "flex", flexWrap: "wrap", gap: "var(--space-2)", justifyContent: "center" }}>
+                    {FIRST_TASKS.map((t) => (
+                      <button key={t.title} type="button" className="example-chip" title={t.text} onClick={() => runTask(t.text).catch(() => {})}>
+                        {t.title}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
-            </div>
+            )
           ) : (
             <div className="col">
               <ProgressBar events={visible} running={running} context={context} startTs={visible.find((e) => e.type === "user")?.ts ?? 0} />
               <AwayRecap events={visible} running={running} sessionId={active ?? undefined} />
               <ChangedFilesTree events={visible} session={active ?? undefined} />
-              {active && archivedEvents > 0 && <LoadEarlier archivedCount={archivedEvents} sessionId={active} onLoad={handleLoadEarlier} />}
+              {active && archivedEvents > 0 && <LoadEarlier key={active} archivedCount={archivedEvents} sessionId={active} onLoad={(older, start) => activeRef.current === active && handleLoadEarlier(older, start)} />}
               <Timeline events={visible} onImage={setLightbox} session={active ?? undefined} />
               {running && !livePlanOpen && visible.at(-1)?.type !== "thinking" && visible.at(-1)?.type !== "text" && (
                 <div className="ev thinking">
@@ -373,7 +348,7 @@ export default function Home() {
           )}
         </div>
 
-        <Composer running={running} context={context} ensureSession={ensureSession} onSend={send} onStop={stop} />
+        <Composer running={running} context={context} ensureSession={ensureSession} onSend={send} onStop={stop} primary={primaryModel} />
       </main>
 
       {settings && (
@@ -382,6 +357,7 @@ export default function Home() {
           onClose={() => {
             setSettings(false);
             setNotice(undefined);
+            checkModel(); // a model added in Settings moves the welcome card to step 2
           }}
         />
       )}
@@ -394,6 +370,7 @@ export default function Home() {
           }}
         />
       )}
+      {browser.live && livePanel && active && <BrowserLive sessionId={active} onClose={() => setLivePanel(false)} />}
       {lightbox && (
         <div className="lightbox" onClick={() => setLightbox(null)}>
           <img src={lightbox} alt="" />

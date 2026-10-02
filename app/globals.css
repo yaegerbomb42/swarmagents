@@ -1691,3 +1691,24 @@ input, textarea, select {
   /* deploy lane 22:38: the last 3 undefined names (timeline code bg, settings .st-meta font, Activity popover shadow) */
   --code-bg: var(--color-code-bg); --sans: var(--font-sans); --shadow: 0 8px 24px rgb(0 0 0 / 0.35);
 }
+
+/* Sign-up human check (deploy lane 23:30, components/SignupCaptcha.tsx): the ALTCHA widget in the login card's tokens. */
+.signup-captcha {
+  --altcha-color-base: var(--color-bg-elevated);
+  --altcha-color-base-content: var(--color-text);
+  --altcha-color-neutral: var(--color-line-strong);
+  --altcha-color-neutral-content: var(--color-text-muted);
+  --altcha-color-primary: var(--color-accent);
+  --altcha-color-primary-content: var(--color-accent-text);
+  --altcha-color-success: var(--color-ok);
+  --altcha-color-error: var(--color-err);
+  --altcha-border-color: var(--color-line-strong);
+  --altcha-border-width: 1px;
+  --altcha-border-radius: 10px;
+  --altcha-max-width: 100%;
+  --altcha-shadow: none;
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+.signup-captcha altcha-widget { display: block; width: 100%; }
+.signup-captcha-placeholder { padding: 12px 14px; border: 1px solid var(--color-line-strong); border-radius: 10px; }

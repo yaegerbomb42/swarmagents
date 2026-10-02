@@ -3,6 +3,7 @@ import path from "node:path";
 import type { Page } from "playwright-core";
 import { browserRuntime, type BrowserSession } from "../browser";
 import { clip, type Tool } from "./types";
+import { assertInsideHome } from "../sandbox";
 
 // The tool is a thin layer over lib/browser (the browser runtime): every task gets its own isolated
 // Chromium context, profile and downloads folder with hard limits, the runtime watches downloads,
@@ -300,7 +301,13 @@ async function act(s: BrowserSession, p0: Page, input: Record<string, unknown>, 
       }
     }
     case "upload": {
-      const file = path.resolve(cwd, String(input.path ?? ""));
+      let file = path.resolve(cwd, String(input.path ?? ""));
+      // On a server this runs as root: only files inside the account's own workspace/uploads (symlinks resolved).
+      try {
+        file = assertInsideHome(file);
+      } catch (e) {
+        return { content: (e as Error).message, isError: true };
+      }
       if (!input.path || !fs.existsSync(file))
         return { content: `No file at ${file}.`, isError: true };
       const t = target(p, input);

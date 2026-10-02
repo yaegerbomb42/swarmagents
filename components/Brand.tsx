@@ -105,8 +105,8 @@ export function Wordmark({
     <svg
       className={className}
       width={width}
-      height={width * 0.28}
-      viewBox="0 0 200 56"
+      height={(width * 56) / 356}
+      viewBox="0 0 356 56"
       fill="none"
       xmlns="http://www.w3.org/2000/svg"
       aria-hidden="true"
@@ -121,6 +121,8 @@ export function Wordmark({
         fontWeight="600"
         fill="var(--color-neon)"
         letterSpacing="-0.02em"
+        textLength={262}
+        lengthAdjust="spacingAndGlyphs"
         style={{
           filter: "drop-shadow(0 0 4px var(--color-neon-strong)) drop-shadow(0 0 8px var(--color-neon-med))",
         }}
@@ -128,13 +130,15 @@ export function Wordmark({
         SwarmAgents
       </text>
       <text
-        x="138"
+        x="270"
         y="42"
         fontFamily="var(--font-mono)"
         fontSize="22"
         fontWeight="500"
         fill="var(--color-text-muted)"
         letterSpacing="0.02em"
+        textLength={84}
+        lengthAdjust="spacingAndGlyphs"
       >
         .codes
       </text>

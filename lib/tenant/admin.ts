@@ -55,7 +55,7 @@ export function bootstrapAdmin(log: (s: string) => void = (s) => console.log(s))
     return { status: "conflict", reason: "a non-admin account has that email" };
   }
   if (!password) return { status: "skipped", reason: fileError || "no admin password configured" };
-  const bad = validateCredentials("admin", password);
+  const bad = validateCredentials("admin", password, { lengthOnly: true }); // never lock out an existing admin password
   if (bad) return { status: "skipped", reason: bad };
   const made = transaction((): User | null => (findUserByEmail(email) ? null : createUser(usernameFor(email), password, true, email)));
   if (!made) return { status: "exists" };

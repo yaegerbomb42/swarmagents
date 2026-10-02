@@ -1,0 +1,219 @@
+/* First-run welcome card (components/Welcome.tsx). Uses the --color-* / --space-* tokens from app/globals.css. */
+.welcome {
+  width: 100%;
+  max-width: 560px;
+  margin: 0 auto;
+  padding: var(--space-6);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--elevation-2, 0 4px 16px rgb(0 0 0 / 0.2));
+  text-align: left;
+  display: grid;
+  gap: var(--space-3);
+}
+.welcome h1 {
+  margin: 0;
+  font-size: var(--type-size-2);
+  font-weight: var(--type-weight-semibold);
+  letter-spacing: var(--letter-spacing-tight);
+}
+.welcome-step {
+  margin: 0;
+  font-size: var(--type-size--1);
+  color: var(--color-run);
+  font-weight: var(--type-weight-medium);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.welcome-lead,
+.welcome-foot {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--type-size-0);
+  line-height: 1.5;
+}
+.welcome-providers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.welcome-provider {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-line-strong);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-size: var(--type-size--1);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+.welcome-provider:hover {
+  border-color: var(--color-run);
+}
+.welcome-provider.active {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+}
+.welcome-steps {
+  margin: 0;
+  padding-left: var(--space-5);
+  display: grid;
+  gap: var(--space-4);
+}
+.welcome-steps > li {
+  display: grid;
+  gap: var(--space-1);
+}
+.welcome-steps > li::marker {
+  color: var(--color-text-faint);
+}
+.welcome-keylink {
+  color: var(--color-run);
+  font-weight: var(--type-weight-semibold);
+  text-decoration: none;
+  width: fit-content;
+}
+.welcome-keylink:hover {
+  text-decoration: underline;
+}
+.welcome-label {
+  font-weight: var(--type-weight-medium);
+}
+.welcome-sub {
+  font-size: var(--type-size--1);
+  color: var(--color-text-faint);
+}
+.welcome-input {
+  width: 100%;
+  padding: var(--space-3);
+  font-size: var(--type-size-0);
+  font-family: var(--font-mono);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-line-strong);
+  background: var(--color-bg);
+  color: var(--color-text);
+  outline: none;
+}
+.welcome-input:focus {
+  border-color: var(--color-run);
+  box-shadow: var(--elevation-glow-run);
+}
+.welcome-test {
+  margin: 0;
+  min-height: 1.4em;
+  font-size: var(--type-size--1);
+  color: var(--color-text-faint);
+  overflow-wrap: anywhere;
+}
+.welcome-test.testing {
+  color: var(--color-text-muted);
+}
+.welcome-test.ok {
+  color: var(--color-ok);
+}
+.welcome-test.err {
+  color: var(--color-err);
+}
+.welcome-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  justify-content: space-between;
+}
+.welcome-actions .btn.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.welcome-more {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--color-text-muted);
+  font-size: var(--type-size--1);
+  cursor: pointer;
+}
+.welcome-more:hover {
+  color: var(--color-text);
+  text-decoration: underline;
+}
+.welcome-tasks {
+  display: grid;
+  gap: var(--space-2);
+}
+.welcome-task {
+  display: grid;
+  gap: var(--space-1);
+  text-align: left;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-lg, var(--radius-md));
+  border: 1px solid var(--color-line);
+  background: var(--color-bg);
+  color: var(--color-text);
+  cursor: pointer;
+  transition: border-color var(--transition-fast);
+}
+.welcome-task:hover:not(:disabled),
+.welcome-task.suggested {
+  border-color: var(--color-run);
+}
+.welcome-task:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+.welcome-task-title {
+  font-weight: var(--type-weight-semibold);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.welcome-badge {
+  font-size: var(--type-size--1);
+  font-weight: var(--type-weight-medium);
+  color: var(--color-run);
+  border: 1px solid var(--color-run);
+  border-radius: var(--radius-full);
+  padding: 0 var(--space-2);
+}
+.welcome-task-text {
+  font-size: var(--type-size--1);
+  color: var(--color-text-muted);
+  line-height: 1.45;
+}
+.welcome-task-go {
+  font-size: var(--type-size--1);
+  color: var(--color-run);
+}
+@media (max-width: 480px) {
+  /* The empty state's 48px padding leaves the card too narrow on a phone. */
+  .empty:has(> .welcome) {
+    padding: var(--space-3);
+    justify-content: flex-start;
+  }
+  .welcome {
+    padding: var(--space-4);
+    border-radius: var(--radius-lg, var(--radius-md));
+  }
+  .welcome-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+/* The regular empty state's example chips (app/page.tsx): one click starts that task. */
+.example-chip {
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-full);
+  font-size: var(--type-size--1);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
+}
+.example-chip:hover:not(:disabled) {
+  border-color: var(--color-run);
+  color: var(--color-run);
+}

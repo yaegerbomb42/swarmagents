@@ -1,6 +1,7 @@
 import { checkOwnerToken, clearFailures, clientIp, noteFailure, serverMode, sessionCookie, throttled } from "@/lib/auth";
 import { noteSignup, signupBlocked } from "@/lib/tenant/signup-limit"; // deploy lane: cap successful sign-ups
 import { adminEmail } from "@/lib/tenant/admin";
+import { signupCaptchaError, signupChallenge } from "@/lib/tenant/captcha"; // deploy lane: ALTCHA sign-up captcha
 import { consumeInvite, createUser, inviteValid, signupMode, startSession, transaction, userCount, usernameTaken, validateCredentials } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
@@ -11,10 +12,17 @@ export const dynamic = "force-dynamic";
  * ever admin; a sign-up can't set an email). After that, SWARM_SIGNUP decides: "invite" (default) needs an unused invite from
  * an admin, "open" needs nothing, "closed" refuses.
  */
+/** A fresh ALTCHA proof-of-work challenge for the sign-up form (lib/tenant/captcha.ts). */
+export async function GET() {
+  if (!serverMode()) return Response.json({ error: "Accounts are only used on a hosted server." }, { status: 400 });
+  if (signupMode() === "closed") return Response.json({ error: "Sign-ups are closed." }, { status: 403 });
+  return Response.json(await signupChallenge(), { headers: { "Cache-Control": "no-store" } });
+}
+
 export async function POST(req: Request) {
   if (!serverMode()) return Response.json({ error: "Accounts are only used on a hosted server." }, { status: 400 });
   if (throttled(req)) return Response.json({ error: "Too many attempts. Try again in a minute." }, { status: 429 });
-  const body = (await req.json().catch(() => ({}))) as { username?: string; password?: string; invite?: string };
+  const body = (await req.json().catch(() => ({}))) as { username?: string; password?: string; invite?: string; altcha?: string };
   const username = String(body.username ?? "").trim();
   const password = String(body.password ?? "");
   const invite = String(body.invite ?? "").trim();
@@ -26,6 +34,11 @@ export async function POST(req: Request) {
   const first = userCount() === 0 && !adminEmail();
   const mode = signupMode();
   if (!first && mode === "closed") return Response.json({ error: "Sign-ups are closed." }, { status: 403 });
+  // deploy lane: every sign-up (except the legacy owner-token first account) must carry a solved, unused ALTCHA.
+  if (!first) {
+    const captcha = await signupCaptchaError(body.altcha);
+    if (captcha) return Response.json({ error: captcha, captcha: true }, { status: 400 });
+  }
   if (first && !checkOwnerToken(invite)) {
     await noteFailure(req);
     return Response.json({ error: "The first account needs the server's owner token as its invite code." }, { status: 403 });

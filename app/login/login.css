@@ -1,0 +1,40 @@
+/* Sign-in page fixes on top of the login styles in app/globals.css (kept here so globals.css stays untouched). */
+/* Room for the Show/Hide button inside the password field. */
+.password-wrapper input {
+  padding-right: 64px;
+}
+.password-wrapper .toggle-visibility {
+  font-size: var(--type-size--1);
+  font-weight: var(--type-weight-medium);
+  font-family: var(--font-sans);
+  min-width: 44px;
+  min-height: 32px;
+}
+.field-label {
+  flex-wrap: wrap;
+}
+/* The checklist is visible from the first keystroke on sign-up, so make the unmet state readable, not alarming. */
+.password-rules li.met {
+  color: var(--color-text);
+}
+.login-footer .login-subtitle {
+  margin-top: var(--space-2);
+  font-size: var(--type-size--1);
+}
+@media (max-width: 480px) {
+  .login-page {
+    padding: var(--space-3);
+    align-items: start;
+  }
+  /* Two tabs side by side still fit at 320px; stacking them read like two buttons. */
+  .login-tabs {
+    grid-template-columns: 1fr 1fr;
+  }
+  .login-brand .wordmark {
+    max-width: 180px;
+  }
+  /* 16px inputs stop iOS Safari from zooming the page on focus. */
+  .input-wrapper input {
+    font-size: 16px;
+  }
+}

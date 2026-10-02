@@ -50,7 +50,7 @@ async function call(who, method, p, body, extra = {}) {
 
 async function signup(name) {
   const username = `${name}-${rand()}`;
-  const password = crypto.randomBytes(16).toString("base64url");
+  const password = crypto.randomBytes(16).toString("base64url") + "Aa1!"; // meets lib/credentials.ts
   const r = await fetch(`${BASE}/api/signup`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }) });
   const set = r.headers.getSetCookie?.() ?? [r.headers.get("set-cookie") ?? ""];
   const c = set.map((s) => s.split(";")[0]).find((s) => s.startsWith("swarm_auth="));
@@ -130,7 +130,7 @@ const anon = null;
 // throwaway test server only: TENANT_FIRST_INVITE creates a scratch first account so the three below are ordinary.
 const me = await call(anon, "GET", "/api/me");
 if (me.json?.needsAdmin && process.env.TENANT_FIRST_INVITE) {
-  const r = await fetch(`${BASE}/api/signup`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: `first-${rand()}`, password: crypto.randomBytes(16).toString("base64url"), invite: process.env.TENANT_FIRST_INVITE }) });
+  const r = await fetch(`${BASE}/api/signup`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: `first-${rand()}`, password: crypto.randomBytes(16).toString("base64url") + "Aa1!", invite: process.env.TENANT_FIRST_INVITE }) });
   if (r.status !== 200) throw new Error(`first account → ${r.status}`);
 }
 const alice = await signup("alice");

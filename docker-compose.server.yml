@@ -26,6 +26,10 @@ services:
       # on the deployed image. Successful sign-ups are capped (lib/tenant/signup-limit.ts: 5/IP/hour, 60/hour), failed
       # logins/sign-ups throttled (lib/auth throttled). Set back to closed to stop new accounts. Deploy lane.
       - SWARM_SIGNUP=open
+      # Sandboxed browser on (Jimmy 23:09). Chromium runs as each account's uid with its profile in that account's
+      # workspace; state/recordings stay root-only outside it; downloads are copied in by the uid with O_NOFOLLOW.
+      # deploy.sh runs tests/browser-download-sandbox.mjs + browser-sandbox.mjs inside the new image first. Deploy lane.
+      - SWARM_BROWSER_SERVER=on
       - SWARM_HOME=/data
       - HOME=/data/home
       - PORT=3400

@@ -1,4 +1,4 @@
-owner: browser
+owner: Grok Bot (deploy)
 path: lib/tools/browser.ts
-claimed_at: 2026-10-01 21:14:27
-reason: browser lane handoff attempt
+claimed_at: 2026-10-01 23:14:48
+reason: DEPLOY (Jimmy 23:09): browser download symlink P0 fix + enable browser in prod

@@ -15,7 +15,7 @@ const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-tenant-admin-"));
 const pwFile = path.join(home, "admin-password");
 const ADMIN_PW = crypto.randomBytes(18).toString("base64url"); // random per run, never printed
 fs.writeFileSync(pwFile, ADMIN_PW + "\n", { mode: 0o600 });
-Object.assign(process.env, { SWARM_HOME: home, SWARM_MODE: "server", SWARM_SIGNUP: "open", SWARM_ADMIN_EMAIL: "Admin.Test@Example.com", SWARM_ADMIN_PASSWORD_FILE: pwFile, SWARM_ADMIN_PASSWORD: "env-copy-must-vanish-123" });
+Object.assign(process.env, { SWARM_HOME: home, SWARM_MODE: "server", SWARM_SIGNUP: "open", SWARM_SIGNUP_CAPTCHA: "off" /* captcha has its own test: tests/signup-captcha.mjs */, SWARM_ADMIN_EMAIL: "Admin.Test@Example.com", SWARM_ADMIN_PASSWORD_FILE: pwFile, SWARM_ADMIN_PASSWORD: "env-copy-must-vanish-123" });
 delete process.env.SWARM_STORAGE_QUOTA_MB;
 
 const users = await import("../lib/users.ts");
@@ -63,15 +63,15 @@ try {
 
   let bobToken, aliceToken, adminToken, bob;
   await t("a normal sign-up never gets admin, even with the admin's email or username", async () => {
-    let r = await signup.POST(req("/api/signup", { method: "POST", body: { username: "admin.test@example.com", password: "bob-password-1234" } }));
+    let r = await signup.POST(req("/api/signup", { method: "POST", body: { username: "admin.test@example.com", password: "Bob-password-1234" } }));
     assert.equal(r.status, 400, "an email can't be a username");
-    r = await signup.POST(req("/api/signup", { method: "POST", body: { username: "bob", password: "bob-password-1234", email: "admin.test@example.com" } }));
+    r = await signup.POST(req("/api/signup", { method: "POST", body: { username: "bob", password: "Bob-password-1234", email: "admin.test@example.com" } }));
     assert.equal(r.status, 200);
-    bob = users.authenticate("bob", "bob-password-1234");
+    bob = users.authenticate("bob", "Bob-password-1234");
     assert.ok(bob && !bob.isAdmin, "bob is not admin");
     assert.equal(users.userById(bob.id).email, null, "sign-up can't set an email");
-    r = await signup.POST(req("/api/signup", { method: "POST", body: { username: "admin.test-2", password: "alice-password-123" } }));
-    const alice = users.authenticate("admin.test-2", "alice-password-123");
+    r = await signup.POST(req("/api/signup", { method: "POST", body: { username: "admin.test-2", password: "Alice-password-123" } }));
+    const alice = users.authenticate("admin.test-2", "Alice-password-123");
     assert.ok(alice && !alice.isAdmin);
     bobToken = users.startSession(bob.id);
     aliceToken = users.startSession(alice.id);
@@ -137,7 +137,7 @@ try {
     assert.equal(r.status, 200, await r.clone().text());
     assert.equal(users.userById(bob.id), null, "account gone");
     assert.equal(users.userForToken(bobToken), null, "his login no longer works");
-    assert.equal(users.authenticate("bob", "bob-password-1234"), null, "can't sign in");
+    assert.equal(users.authenticate("bob", "Bob-password-1234"), null, "can't sign in");
     assert.ok(!fs.existsSync(bobHome), "his files are gone");
     assert.equal((await del(adminToken, { userId: bob.id, confirm: "bob" })).status, 404, "second delete: no such user");
     assert.ok(users.userById(adminUser.id) && users.authenticate("admin-test-2", "x") === null);

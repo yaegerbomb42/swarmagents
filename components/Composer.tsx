@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { Attachment, ContextInfo } from "@/lib/types";
-import { IAttach, IFile, IStop, IUp, IX, ISlash, IModel, IKeyboard, IChevron } from "./icons";
+import { IAttach, IFile, IStop, IUp, IX, ISlash, IModel, IKeyboard } from "./icons";
 import { fmtK } from "./Timeline";
 
 interface Pending {
@@ -62,39 +62,31 @@ const SLASH_COMMANDS = [
   { cmd: "/help", desc: "Show shortcuts", action: "help" },
 ];
 
-// Model options (would come from settings in real app)
-const MODELS = [
-  { id: "gpt-4o", label: "GPT-4o", provider: "openai" },
-  { id: "gpt-4o-mini", label: "GPT-4o mini", provider: "openai" },
-  { id: "claude-3-5-sonnet", label: "Claude 3.5 Sonnet", provider: "anthropic" },
-  { id: "claude-3-haiku", label: "Claude 3 Haiku", provider: "anthropic" },
-];
-
 export function Composer({
   running,
   context,
   ensureSession,
   onSend,
   onStop,
+  primary = null,
 }: {
   running: boolean;
   context: ContextInfo | null;
   ensureSession: () => Promise<string>;
   onSend: (text: string, atts: Attachment[]) => void;
   onStop: () => void;
+  /** The model that will answer: the first enabled provider (failover order), "" for none, null while loading. */
+  primary?: string | null;
 }) {
   const [text, setText] = useState("");
   const [files, setFiles] = useState<Pending[]>([]);
   const [drag, setDrag] = useState(false);
   const [showSlash, setShowSlash] = useState(false);
-  const [showModels, setShowModels] = useState(false);
-  const [selectedModel, setSelectedModel] = useState(MODELS[0].id);
   const dragDepth = useRef(0);
   const recall = useRef({ index: -1, draft: "" });
   const ta = useRef<HTMLTextAreaElement>(null);
   const picker = useRef<HTMLInputElement>(null);
   const slashRef = useRef<HTMLDivElement>(null);
-  const modelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const saved = store.get(DRAFT_KEY);
@@ -113,11 +105,11 @@ export function Composer({
     ta.current?.focus();
   }, []);
 
+
   // Close dropdowns on outside click
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
       if (slashRef.current && !slashRef.current.contains(e.target as Node)) setShowSlash(false);
-      if (modelRef.current && !modelRef.current.contains(e.target as Node)) setShowModels(false);
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
@@ -175,11 +167,10 @@ export function Composer({
       return;
     }
 
-    // Esc = Stop (when running) or Clear slash/model dropdowns
+    // Esc = Stop (when running) or close the slash menu
     if (e.key === "Escape") {
       if (running) { onStop(); return; }
       setShowSlash(false);
-      setShowModels(false);
       return;
     }
 
@@ -272,7 +263,6 @@ export function Composer({
                 </button>
               ))}
               <div className="slash-divider" />
-              <button className="slash-item" onClick={() => { setShowSlash(false); setShowModels(true); }}> <IModel /> <span>Switch model…</span> </button>
               <button className="slash-item" onClick={() => { setShowSlash(false); alert("Shortcuts:\nEnter — Send\nShift+Enter — New line\nCmd+Enter — Send\nEsc — Stop / Close\nCmd+K — Commands\n↑/↓ — History"); }}> <IKeyboard /> <span>Keyboard shortcuts</span> </button>
             </div>
           )}
@@ -285,36 +275,13 @@ export function Composer({
           </button>
           <input ref={picker} type="file" multiple hidden onChange={(e) => e.target.files && (add(e.target.files), (e.target.value = ""))} />
 
-          {/* Model picker chip */}
-          <div className="model-picker" ref={modelRef}>
-            <button
-              className="model-chip"
-              onClick={() => setShowModels(!showModels)}
-              aria-expanded={showModels}
-              aria-haspopup="menu"
-            >
+          {/* The real model (no fake picker): models and their failover order are chosen in Settings. */}
+          {primary !== null && (
+            <span className="model-chip" title={primary ? "Models and failover order are set in Settings" : "Connect a model to start"}>
               <IModel />
-              <span>{MODELS.find(m => m.id === selectedModel)?.label ?? selectedModel}</span>
-              <span style={{ display: "inline-flex", transform: showModels ? "rotate(90deg)" : "none", transition: "transform .15s" }}>
-                <IChevron />
-              </span>
-            </button>
-            {showModels && (
-              <div className="model-dropdown" role="menu">
-                {MODELS.map((m) => (
-                  <button
-                    key={m.id}
-                    className={`model-option ${selectedModel === m.id ? "selected" : ""}`}
-                    role="menuitem"
-                    onClick={() => { setSelectedModel(m.id); setShowModels(false); }}
-                  >
-                    <span>{m.label}</span>
-                    <span className="provider">{m.provider}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
+              <span>{context?.model || primary || "No model connected"}</span>
+            </span>
+          )}
 
           {context && context.tokens > 0 && (
             <span className="meter" title={`${context.tokens.toLocaleString()} / ${context.window.toLocaleString()} tokens${context.model ? ` · ${context.model}` : ""}`}>

@@ -1,13 +1,102 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { execFile, spawnSync } from "node:child_process";
 import { chromium, type BrowserContext, type CDPSession, type Page } from "playwright-core";
 import { currentUser, userHome } from "../store";
-import { chromiumLaunch, identity, sandboxDir } from "../sandbox";
+import { chromiumLaunch, identity, sandboxCommand, sandboxEnv, serverMode } from "../sandbox";
 
-/** Where this account's browser sessions live. On a server inside the uid-owned workspace, so one
- *  account's profiles and downloads are never under another's directory; locally under the home. */
-const browserRoot = () => path.join(identity()?.workspace ?? userHome(), "browsers");
+/** Where this account's server-owned browser state lives (resume state, recordings). Always under the
+ *  account's home, which on a server is root-owned and not writable by the sandbox uid, so the server (root)
+ *  never writes through a path the agent could have swapped for a symlink. (Deploy lane 23:15: this used to be
+ *  <workspace>/browsers, uid-owned, and root wrote session-state.json and recording.jsonl there.) Profiles and
+ *  downloads, which Chromium writes as the uid, live in the workspace. */
+const browserRoot = () => path.join(userHome(), "browsers");
+
+// ═══════ Downloads without root touching user paths ═══════
+//
+// On a server Chromium runs as the account's uid and saves each download into a uid-owned folder. Copying it
+// into <cwd>/downloads is done by this helper, also running as the uid (setpriv via sandboxCommand), so a
+// symlink planted anywhere along either path can only lead where that uid could already write. On top of that
+// the helper opens the source with O_NOFOLLOW (regular file only), refuses a destination dir that is a symlink
+// or resolves outside the workspace, creates the target with O_CREAT|O_EXCL|O_NOFOLLOW and enforces the byte
+// cap while copying. Locally it runs as the person at the keyboard with the same checks (minus the workspace).
+// argv: src destDir name maxBytes workspace(""=none) unlinkSrc("1"/"0"). Prints one JSON line.
+const DELIVER = String.raw`
+const fs = require("fs"), path = require("path");
+const [src, destDir, name, maxS, ws, unlinkSrc] = process.argv.slice(1);
+const out = (o) => { process.stdout.write(JSON.stringify(o) + "\n"); process.exit(0); };
+const C = fs.constants, max = Number(maxS);
+let fd = -1, wfd = -1, dest = "";
+try {
+  fd = fs.openSync(src, C.O_RDONLY | C.O_NOFOLLOW);
+  const st = fs.fstatSync(fd);
+  if (!st.isFile()) out({ error: "not a regular file", reason: "type" });
+  if (st.size > max) { if (unlinkSrc === "1") try { fs.unlinkSync(src); } catch {} out({ error: "too large", reason: "size", bytes: st.size }); }
+  fs.mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  const l = fs.lstatSync(destDir);
+  if (l.isSymbolicLink() || !l.isDirectory()) out({ error: "the downloads folder is a link or not a folder", reason: "path" });
+  const real = fs.realpathSync(destDir);
+  if (ws) {
+    const root = fs.realpathSync(ws);
+    if (real !== root && !real.startsWith(root + path.sep)) out({ error: "the downloads folder resolves outside the workspace", reason: "path" });
+  }
+  const safe = (name || "download").replace(/[\/\\:\0]/g, "_").replace(/^\.+/, "_").slice(0, 180);
+  const ext = path.extname(safe), stem = safe.slice(0, safe.length - ext.length);
+  for (let i = 1; i < 1000 && wfd < 0; i++) {
+    dest = path.join(real, i === 1 ? safe : stem + " (" + i + ")" + ext);
+    try { wfd = fs.openSync(dest, C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o600); }
+    catch (e) { if (e.code !== "EEXIST" && e.code !== "ELOOP") throw e; }
+  }
+  if (wfd < 0) out({ error: "no free file name", reason: "path" });
+  const buf = Buffer.alloc(1 << 20); let total = 0, n;
+  while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+    total += n;
+    if (total > max) { fs.closeSync(wfd); fs.unlinkSync(dest); out({ error: "too large", reason: "size", bytes: total }); }
+    fs.writeSync(wfd, buf, 0, n);
+  }
+  fs.closeSync(wfd);
+  if (unlinkSrc === "1") try { fs.unlinkSync(src); } catch {}
+  out({ ok: true, path: dest, bytes: total });
+} catch (e) { out({ error: String((e && e.message) || e).split("\n")[0], reason: e && e.code === "ELOOP" ? "path" : "io" }); }
+`;
+
+/** A minimal environment for helpers run as the uid: no server secrets, only PATH and the sandbox HOME. */
+const userEnv = () => ({ PATH: "/usr/local/bin:/usr/bin:/bin", ...sandboxEnv() }) as unknown as NodeJS.ProcessEnv;
+
+type Delivered = { ok?: boolean; path?: string; bytes?: number; error?: string; reason?: string };
+
+/** Run DELIVER as the current account's uid (as-is locally). Never throws. */
+export function deliverDownload(src: string, destDir: string, name: string, maxBytes: number): Promise<Delivered> {
+  const id = identity();
+  const argv = ["-e", DELIVER, src, destDir, name, String(Math.max(0, Math.floor(maxBytes))), id?.workspace ?? "", id ? "1" : "0"];
+  const { command, args } = sandboxCommand(process.execPath, argv);
+  return new Promise((resolve) =>
+    execFile(command, args, { env: userEnv(), timeout: 120_000, maxBuffer: 1 << 16 }, (err: Error | null, stdout: string | Buffer) => {
+      try {
+        resolve(JSON.parse(String(stdout).trim().split("\n").pop() || "{}") as Delivered);
+      } catch {
+        resolve({ error: (err?.message ?? "download helper failed").split("\n")[0], reason: "io" });
+      }
+    }),
+  );
+}
+
+/** Create dirs as the account's uid (never as root), then confirm each resolves inside the workspace and is
+ *  not a symlink. Throws when a planted link points anywhere else. Server only. */
+export function userDirs(workspace: string, dirs: string[]) {
+  const { command, args } = sandboxCommand("/bin/mkdir", ["-p", "-m", "700", "--", ...dirs]);
+  const r = spawnSync(command, args, { env: userEnv(), stdio: "ignore", timeout: 15_000 });
+  const root = fs.realpathSync(workspace);
+  for (const d of dirs) {
+    let ok = false;
+    try {
+      const real = fs.realpathSync(d);
+      ok = r.status === 0 && !fs.lstatSync(d).isSymbolicLink() && real.startsWith(root + path.sep);
+    } catch {}
+    if (!ok) throw new Error("The browser folder in your workspace is a link or points outside it; remove it and try again.");
+  }
+}
 
 // ═══════ Browser runtime ═══════
 //
@@ -117,15 +206,6 @@ function browserEnv() {
 const fmtSize = (n: number) =>
   n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
 
-function uniquePath(dir: string, name: string) {
-  const safe = (name || "download").replace(/[/\\:\0]/g, "_").slice(0, 180);
-  const ext = path.extname(safe);
-  const stem = safe.slice(0, safe.length - ext.length);
-  let file = path.join(dir, safe);
-  for (let i = 2; fs.existsSync(file); i++) file = path.join(dir, `${stem} (${i})${ext}`);
-  return file;
-}
-
 /** One isolated browser session: its own Chromium context, profile, downloads and limits. */
 export class BrowserSession {
   readonly key: string;
@@ -171,9 +251,11 @@ export class BrowserSession {
     const dir = path.join(path.resolve(cwd), "downloads");
     if (dir !== this.downloadsDir) {
       this.downloadsDir = dir;
-      try {
-        fs.mkdirSync(dir, { recursive: true });
-      } catch {}
+      // On a server the folder is created by the download helper as the uid; root never mkdirs in a workspace.
+      if (!serverMode())
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+        } catch {}
     }
     return this;
   }
@@ -256,16 +338,29 @@ export class BrowserSession {
     // chromiumLaunch) with a uid-owned profile inside the user's workspace, kept apart from the
     // root-owned server state. Locally this is the plain executable and the usual profile.
     const launch = chromiumLaunch();
-    const profileDir = launch.executablePath ? sandboxDir(path.join(launch.profileRoot, keySlug(this.key))) : this.dir;
-    if (!launch.executablePath) fs.mkdirSync(profileDir, { recursive: true });
-    if (launch.executablePath) sandboxDir(this.downloadsDir);
-    else fs.mkdirSync(this.downloadsDir, { recursive: true });
+    const id = identity();
+    let profileDir = this.dir;
+    // Where Chromium (as the uid) writes downloads before the helper copies them; locally Playwright's temp dir.
+    let chromeDownloads: string | undefined;
+    if (id) {
+      // Created by the uid itself, then checked: root never mkdirs or chowns inside a workspace (a planted
+      // .browser -> /etc or -> another account's folder would otherwise be chowned to this uid).
+      profileDir = path.join(launch.profileRoot, keySlug(this.key));
+      chromeDownloads = path.join(launch.profileRoot, `${keySlug(this.key)}.downloads`);
+      userDirs(id.workspace, [launch.profileRoot, profileDir, chromeDownloads]);
+      if (!this.downloadsDir.startsWith(id.workspace + path.sep)) this.downloadsDir = path.join(id.workspace, "downloads");
+    } else {
+      fs.mkdirSync(profileDir, { recursive: true });
+      fs.mkdirSync(this.downloadsDir, { recursive: true });
+    }
+    fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     const { exe, base } = this.launchOptions();
     const executablePath = launch.executablePath ?? exe;
     const env = { ...base.env, ...launch.env };
+    const dl = chromeDownloads ? { downloadsPath: chromeDownloads } : {};
     const attempt = () =>
       (executablePath
-        ? chromium.launchPersistentContext(profileDir, { ...base, env, executablePath })
+        ? chromium.launchPersistentContext(profileDir, { ...base, env, executablePath, ...dl })
         : chromium
             .launchPersistentContext(profileDir, { ...base, env, channel: "chrome" })
             .catch(() => chromium.launchPersistentContext(profileDir, { ...base, env, viewport: base.viewport ?? this.limits.viewport }))) as Promise<BrowserContext>;
@@ -275,10 +370,16 @@ export class BrowserSession {
         return await attempt();
       } catch (first) {
         // A crashed browser leaves SingletonLock behind; Chrome then refuses to start. Clear and retry once.
-        for (const f of ["SingletonLock", "SingletonCookie", "SingletonSocket"])
-          try {
-            fs.rmSync(path.join(profileDir, f), { force: true });
-          } catch {}
+        const locks = ["SingletonLock", "SingletonCookie", "SingletonSocket"].map((f) => path.join(profileDir, f));
+        if (id) {
+          // As the uid: the profile is the user's folder.
+          const { command, args } = sandboxCommand("/bin/rm", ["-f", "--", ...locks]);
+          spawnSync(command, args, { env: userEnv(), stdio: "ignore", timeout: 15_000 });
+        } else
+          for (const f of locks)
+            try {
+              fs.rmSync(f, { force: true });
+            } catch {}
         try {
           return await attempt();
         } catch (second) {
@@ -417,16 +518,21 @@ export class BrowserSession {
             this.emitSpec({ type: "download", ts: Date.now(), key: this.key, name, bytes: 0, path: "", blocked: "type" });
             return;
           }
-          const file = uniquePath(this.downloadsDir, name);
-          fs.mkdirSync(this.downloadsDir, { recursive: true });
-          await d.saveAs(file);
-          const bytes = fs.statSync(file).size;
-          if (bytes > this.limits.maxDownloadFileBytes || this.downloadedBytes + bytes > this.limits.maxDownloadBytes) {
-            fs.rmSync(file, { force: true });
-            this.log(`Blocked download ${name}: ${fmtSize(bytes)} exceeds the download limit.`);
-            this.emitSpec({ type: "download", ts: Date.now(), key: this.key, name, bytes, path: "", blocked: "size" });
+          // Never d.saveAs(): that copies as root into a user-writable folder. Wait for Chromium to finish, then
+          // let the helper (as the uid) copy it in with the size cap and the symlink/workspace checks.
+          const src = await d.path();
+          const max = Math.min(this.limits.maxDownloadFileBytes, this.limits.maxDownloadBytes - this.downloadedBytes);
+          const r = await deliverDownload(src, this.downloadsDir, name, max);
+          if (!r.ok || !r.path) {
+            const bytes = r.bytes ?? 0;
+            if (r.reason === "size") this.log(`Blocked download ${name}: ${bytes ? fmtSize(bytes) + " " : ""}exceeds the download limit.`);
+            else this.log(`Download of ${name} failed: ${r.error ?? "unknown error"}`);
+            const blocked = r.reason === "size" ? "size" : r.reason === "type" ? "type" : "path";
+            this.emitSpec({ type: "download", ts: Date.now(), key: this.key, name, bytes, path: "", blocked });
             return;
           }
+          const file = r.path;
+          const bytes = r.bytes ?? 0;
           this.downloadedBytes += bytes;
           this.downloadList.push({ name: path.basename(file), bytes, path: file, at: Date.now() });
           this.log(`Downloaded ${path.basename(file)} (${fmtSize(bytes)}) to ${file}`);
@@ -660,7 +766,8 @@ export class BrowserRuntime {
   constructor(limits: BrowserLimits = DEFAULT_LIMITS, root = browserRoot()) {
     this.limits = limits;
     this.root = root;
-    sandboxDir(root);
+    // Root-owned server state (see browserRoot): plain mkdir, never handed to the uid.
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   }
 
   /** Start the reaper once (idempotent). */
@@ -799,8 +906,16 @@ export class BrowserRuntime {
     // Persist the tail so the user can replay a session after it has closed.
     try {
       const file = path.join(this.root, keySlug(key), "recording.jsonl");
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.appendFileSync(file, rec.entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      const body = rec.entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+      // Outside the account's storage quota now, so keep one bounded file per session (latest run wins past 64 MB).
+      let size = 0;
+      try {
+        size = fs.statSync(file).size;
+      } catch {}
+      if (size + body.length > 64 * 1024 * 1024) fs.writeFileSync(file, body);
+      else fs.appendFileSync(file, body);
+
     } catch {}
     this.recorder.delete(key);
   }

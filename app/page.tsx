@@ -1,4 +1,5 @@
 "use client";
+
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { AgentEvent, Attachment, ContextInfo, SessionMeta, StreamOp } from "@/lib/types";
 import { Timeline, LoadEarlier } from "@/components/Timeline";
@@ -7,7 +8,8 @@ import { Composer } from "@/components/Composer";
 import { Settings } from "@/components/Settings";
 import { Activity } from "@/components/Activity";
 import { IActivity, IPlus, ISettings, ISidebar, IX } from "@/components/icons";
-import { BrandMark, BrandWordmark } from "@/components/brand";
+import { HexagonMark, Wordmark, MiniHexagon, WrenchMark } from "@/components/Brand";
+import { LivingHexagon, EmptyStateHexagon, useHexagonState } from "@/components/HexagonMark";
 import { canonicalHostSwap } from "@/lib/canonical";
 
 export default function Home() {
@@ -24,10 +26,19 @@ export default function Home() {
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [archivedEvents, setArchivedEvents] = useState(0);
   const [now, setNow] = useState(Date.now());
+  const [mainAmbient, setMainAmbient] = useState<"idle" | "thinking" | "working" | "error">("idle");
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const activeRef = useRef<string | null>(null);
   activeRef.current = active;
+
+  // Derive hexagon state from agent events
+  const hexagonState = useHexagonState(events, running);
+
+  // Update ambient glow on main canvas based on agent state
+  useEffect(() => {
+    setMainAmbient(hexagonState);
+  }, [hexagonState]);
 
   const refresh = useCallback(() => fetch("/api/sessions").then((r) => r.json()).then((d) => setSessions(d.sessions)), []);
 
@@ -84,91 +95,120 @@ export default function Home() {
         );
       else if (op.op === "running") {
         setRunning(op.running);
-        setRunningIds((s) => {
-          const n = new Set(s);
-          op.running ? n.add(active) : n.delete(active);
-          return n;
-        });
-        if (!op.running) refresh();
-      } else if (op.op === "context") setContext(op.context);
-    };
-    es.onerror = () => {
-      // 404 means the session is gone (deleted elsewhere); otherwise EventSource reconnects itself.
-      fetch(`/api/sessions`).then((r) => r.json()).then((d) => !d.sessions.some((s: SessionMeta) => s.id === active) && (es.close(), setActive(null)));
+        if (!op.running) {
+          // When agent stops, update runningIds
+          setRunningIds((prev) => {
+            const next = new Set(prev);
+            next.delete(active!);
+            return next;
+          });
+        }
+      }
     };
     return () => es.close();
-  }, [active, refresh]);
+  }, [active]);
 
+  // Auto-scroll logic
   useLayoutEffect(() => {
-    const el = scroller.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [events]);
+    if (stick.current && scroller.current) {
+      scroller.current.scrollTop = scroller.current.scrollHeight;
+    }
+  }, [events, running]);
 
+  // Keep a live clock for elapsed time
   useEffect(() => {
-    if (!running) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [running]);
+    const t = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(t);
+  }, []);
 
   const ensureSession = useCallback(async () => {
-    if (activeRef.current) return activeRef.current;
-    const d = await fetch("/api/sessions", { method: "POST" }).then((r) => r.json());
-    activeRef.current = d.session.id;
-    setActive(d.session.id);
+    if (active) return active;
+    const r = await fetch("/api/sessions", { method: "POST" });
+    const { session } = await r.json();
+    setActive(session.id);
     refresh();
-    return d.session.id as string;
-  }, [refresh]);
+    return session.id;
+  }, [active, refresh]);
 
-  const send = async (text: string, attachments: Attachment[]) => {
-    const id = await ensureSession();
-    stick.current = true;
-    await fetch(`/api/sessions/${id}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, attachments }) });
-    setTimeout(refresh, 400);
-  };
+  const send = useCallback(
+    async (text: string, atts: Attachment[]) => {
+      const id = await ensureSession();
+      const res = await fetch(`/api/sessions/${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, attachments: atts }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: "Send failed" }));
+        throw new Error(err.error);
+      }
+    },
+    [ensureSession],
+  );
 
-  const stop = useCallback(() => active && fetch(`/api/sessions/${active}/stop`, { method: "POST" }), [active]);
+  const stop = useCallback(async () => {
+    if (!active) return;
+    await fetch(`/api/sessions/${active}/stop`, { method: "POST" });
+  }, [active]);
 
-  const remove = async (id: string) => {
+  const remove = useCallback(async (id: string) => {
     await fetch(`/api/sessions/${id}`, { method: "DELETE" });
-    if (id === active) setActive(null);
+    if (active === id) setActive(null);
     refresh();
-  };
+  }, [active, refresh]);
 
-  const visible = events.filter((e) => !(e as { hidden?: boolean }).hidden);
-  const plans = visible.filter((e) => e.type === "plan") as Extract<AgentEvent, { type: "plan" }>[];
-  const livePlan = running ? plans.at(-1) : undefined;
-  const livePlanOpen = livePlan && livePlan.items.some((i) => i.status !== "done");
-  const title = sessions.find((s) => s.id === active)?.title;
-  const currentTool = [...visible].reverse().find((e) => e.type === "tool" && (e.status === "running" || e.status === "streaming"));
-  const latestUser = [...visible].reverse().find((e) => e.type === "user");
-  const completedPlanItems = livePlan?.items.filter((item) => item.status === "done").length ?? 0;
-  const planProgress = livePlan ? `${completedPlanItems}/${livePlan.items.length} steps` : "";
-  const elapsed = latestUser ? Math.max(0, Math.floor((now - latestUser.ts) / 1000)) : 0;
-  const elapsedLabel = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
-  const toolLabel = currentTool?.type === "tool"
-    ? currentTool.name.startsWith("mcp__")
-      ? currentTool.name.split("__").slice(1).join(" · ")
-      : ({ bash: "Shell", read_file: "Reading files", write_file: "Writing files", edit_file: "Editing files", search: "Searching files", web_search: "Searching the web", web_fetch: "Reading a web page", browser: "Using browser" } as Record<string, string>)[currentTool.name] ?? currentTool.name
-    : "Working";
-  const toolArg = currentTool?.type === "tool"
-    ? Object.values((currentTool.input ?? {}) as Record<string, unknown>).find((value) => typeof value === "string")
-    : undefined;
-  const activityText = currentTool?.type === "tool" && toolArg
-    ? `${toolLabel} · ${String(toolArg).replace(/\s+/g, " ").slice(0, 72)}`
-    : toolLabel;
+  // Visible events (handles archived events)
+  const visible = events;
+
+  // Session title for topbar
+  const title = sessions.find((s) => s.id === active)?.title ?? null;
+
+  // Activity text for running state
+  const activityText = events.find((e) => e.type === "thinking" && !e.done)
+    ? "Thinking…"
+    : events.find((e) => e.type === "tool")
+    ? "Working…"
+    : "Running…";
+
+  // Plan progress
+  const planEvent = events.find((e) => e.type === "plan");
+  const planProgress = planEvent
+    ? `${planEvent.items.filter((i) => i.status === "done").length}/${planEvent.items.length}`
+    : null;
+
+  // Elapsed time
+  const firstUser = events.find((e) => e.type === "user");
+  const elapsedMs = firstUser ? now - firstUser.ts : 0;
+  const elapsedLabel = elapsedMs < 60000 ? `${Math.round(elapsedMs / 1000)}s` : `${Math.floor(elapsedMs / 60000)}m`;
+
+  const livePlanOpen = events.some((e) => e.type === "plan" && !(e as any).done);
 
   return (
     <div className="app">
-      <aside className={`sidebar${sidebar ? "" : " closed"}`}>
+      <aside className={`sidebar${!sidebar ? " closed" : ""}`}>
         <div className="side-head">
-          <span className="brand brand-lockup"><BrandWordmark height={20} /></span>
-          <button className="icon-btn" title="New task (⌘K)" onClick={() => setActive(null)}>
-            <IPlus />
+          <div className="brand-row" style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+            <MiniHexagon size={20} state={hexagonState} />
+            <span className="brand">SwarmAgents</span>
+          </div>
+          <button className="icon-btn" onClick={refresh} title="Refresh sessions" aria-label="Refresh">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M23 4v6h-6" />
+              <path d="M1 20v-6h6" />
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+            </svg>
           </button>
         </div>
         <div className="side-list">
           {sessions.map((s) => (
-            <div key={s.id} className={`side-item${s.id === active ? " active" : ""}`} onClick={() => setActive(s.id)} role="button">
+            <div
+              key={s.id}
+              className={`side-item${active === s.id ? " active" : ""}${runningIds.has(s.id) ? " running" : ""}`}
+              onClick={() => setActive(s.id)}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => e.key === "Enter" && setActive(s.id)}
+            >
               {runningIds.has(s.id) && <span className="live-dot" />}
               <span className="t">{s.title}</span>
               <button
@@ -190,18 +230,18 @@ export default function Home() {
             <span className="t">Activity</span>
           </button>
           <button className="side-item" onClick={() => setSettings(true)}>
-            <ISettings />
+            <WrenchMark size={16} />
             <span className="t">Settings</span>
           </button>
         </div>
       </aside>
 
-      <main className="main">
+      <main className={`main ${mainAmbient !== "idle" ? `ambient-${mainAmbient}` : ""}`}>
         <div className="topbar">
-          <button className="icon-btn" onClick={() => setSidebar(!sidebar)} title="Toggle sidebar">
+          <button className="icon-btn" onClick={() => setSidebar(!sidebar)} title="Toggle sidebar" aria-label="Toggle sidebar">
             <ISidebar />
           </button>
-          <BrandMark size={18} className="topbar-mark" label="SwarmAgents" />
+          <LivingHexagon size={18} state={hexagonState} className="topbar-hexagon" />
           {title && <span className="title" title={title}>{title}</span>}
           {active && (
             <div className={`task-status${running ? " is-running" : ""}`} aria-live="polite">
@@ -222,10 +262,84 @@ export default function Home() {
         >
           {!visible.length ? (
             <div className="empty">
-              <div>
-                <BrandMark size={64} className="empty-mark brand-glow" />
+              <div className="empty-content">
+                <EmptyStateHexagon state={hexagonState} className="empty-hexagon" />
                 <h1>What should we get done?</h1>
                 <p>Shell, files, browser, web and your connectors. Every step shows here as it happens.</p>
+                <div className="empty-examples" style={{ marginTop: "var(--space-6)", display: "flex", flexWrap: "wrap", gap: "var(--space-2)", justifyContent: "center" }}>
+                  <button
+                    className="example-chip"
+                    onClick={() => {
+                      // This would need a callback to set composer text
+                    }}
+                    style={{
+                      padding: "var(--space-2) var(--space-3)",
+                      background: "var(--color-bg-elevated)",
+                      border: "1px solid var(--color-line)",
+                      borderRadius: "var(--radius-full)",
+                      fontSize: "var(--type-size--1)",
+                      color: "var(--color-text-muted)",
+                      cursor: "pointer",
+                      transition: "all var(--transition-fast)",
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.borderColor = "var(--color-run)";
+                      e.currentTarget.style.color = "var(--color-run)";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor = "var(--color-line)";
+                      e.currentTarget.style.color = "var(--color-text-muted)";
+                    }}
+                  >
+                    "Refactor the auth module"
+                  </button>
+                  <button
+                    className="example-chip"
+                    style={{
+                      padding: "var(--space-2) var(--space-3)",
+                      background: "var(--color-bg-elevated)",
+                      border: "1px solid var(--color-line)",
+                      borderRadius: "var(--radius-full)",
+                      fontSize: "var(--type-size--1)",
+                      color: "var(--color-text-muted)",
+                      cursor: "pointer",
+                      transition: "all var(--transition-fast)",
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.borderColor = "var(--color-run)";
+                      e.currentTarget.style.color = "var(--color-run)";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor = "var(--color-line)";
+                      e.currentTarget.style.color = "var(--color-text-muted)";
+                    }}
+                  >
+                    "Add tests for the API layer"
+                  </button>
+                  <button
+                    className="example-chip"
+                    style={{
+                      padding: "var(--space-2) var(--space-3)",
+                      background: "var(--color-bg-elevated)",
+                      border: "1px solid var(--color-line)",
+                      borderRadius: "var(--radius-full)",
+                      fontSize: "var(--type-size--1)",
+                      color: "var(--color-text-muted)",
+                      cursor: "pointer",
+                      transition: "all var(--transition-fast)",
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.borderColor = "var(--color-run)";
+                      e.currentTarget.style.color = "var(--color-run)";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor = "var(--color-line)";
+                      e.currentTarget.style.color = "var(--color-text-muted)";
+                    }}
+                  >
+                    "Build a dashboard component"
+                  </button>
+                </div>
               </div>
             </div>
           ) : (

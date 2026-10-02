@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { BrandLogo } from "@/components/brand";
+import { Wordmark, HexagonMark } from "@/components/Brand";
 
 interface Me {
   mode: "local" | "server";
@@ -11,13 +11,13 @@ interface Me {
 }
 
 const field: React.CSSProperties = {
-  padding: "10px 12px",
-  fontSize: 15,
-  borderRadius: 8,
-  border: "1px solid var(--line-strong)",
-  background: "var(--sunken)",
-  color: "var(--text)",
-  fontFamily: "inherit",
+  padding: "var(--space-3) var(--space-3)",
+  fontSize: "var(--type-size-0)",
+  borderRadius: "var(--radius-md)",
+  border: "1px solid var(--color-line-strong)",
+  background: "var(--color-bg)",
+  color: "var(--color-text)",
+  fontFamily: "var(--font-mono)",
 };
 
 export default function Login() {
@@ -70,28 +70,41 @@ export default function Login() {
   const title = me?.needsAdmin ? "Create the admin account" : tab === "signin" ? "Sign in" : "Create an account";
 
   return (
-    <main style={{ minHeight: "100dvh", display: "grid", placeItems: "center", padding: 16, background: "var(--bg)", color: "var(--text)", fontFamily: "var(--sans)" }}>
-      <form
-        onSubmit={submit}
-        style={{ width: "100%", maxWidth: 380, display: "grid", gap: 12, padding: 24, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: "var(--radius)", boxShadow: "var(--shadow)" }}
-      >
-        <h1 style={{ margin: "4px 0 2px" }}><BrandLogo className="login-logo brand-glow" /></h1>
-        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
-          <span style={{ color: "var(--muted)", fontSize: 13 }}>{title}</span>
+    <main className="login-page">
+      <form className="login-form" onSubmit={submit}>
+        <div className="login-brand">
+          <HexagonMark size={56} state="idle" />
+          <Wordmark width={220} />
         </div>
+        <h1>{title}</h1>
         {me?.needsAdmin ? (
-          <p style={{ margin: 0, color: "var(--muted)", fontSize: 14 }}>This server has no accounts yet. Use the owner token from the deploy as the invite code; this account becomes the admin.</p>
+          <p style={{ margin: 0, color: "var(--color-text-muted)", fontSize: "var(--type-size-0)" }}>
+            This server has no accounts yet. Use the owner token from the deploy as the invite code; this account becomes the admin.
+          </p>
         ) : (
           canSignup && (
-            <div role="tablist" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, padding: 3, background: "var(--sunken)", borderRadius: 8 }}>
+            <div role="tablist" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--space-1)", padding: "var(--space-1)", background: "var(--color-bg-sunken)", borderRadius: "var(--radius-md)" }}>
               {(["signin", "signup"] as const).map((t) => (
                 <button
                   key={t}
                   type="button"
                   role="tab"
                   aria-selected={tab === t}
-                  onClick={() => (setTab(t), setError(""))}
-                  style={{ padding: "6px 0", fontSize: 13, fontWeight: 500, border: 0, borderRadius: 6, cursor: "pointer", background: tab === t ? "var(--panel)" : "transparent", color: tab === t ? "var(--text)" : "var(--muted)", boxShadow: tab === t ? "var(--shadow)" : undefined }}
+                  onClick={() => {
+                    setTab(t);
+                    setError("");
+                  }}
+                  style={{
+                    padding: "var(--space-1) 0",
+                    fontSize: "var(--type-size-0)",
+                    fontWeight: "var(--type-weight-medium)",
+                    border: 0,
+                    borderRadius: "var(--radius-sm)",
+                    cursor: "pointer",
+                    background: tab === t ? "var(--color-bg-elevated)" : "transparent",
+                    color: tab === t ? "var(--color-text)" : "var(--color-text-muted)",
+                    boxShadow: tab === t ? "var(--elevation-1)" : undefined,
+                  }}
                 >
                   {t === "signin" ? "Sign in" : "Create account"}
                 </button>
@@ -109,12 +122,19 @@ export default function Login() {
           onChange={(e) => setPassword(e.target.value)}
         />
         {tab === "signup" && needInvite && (
-          <input style={{ ...field, fontFamily: "var(--mono)" }} autoComplete="off" placeholder={me?.needsAdmin ? "Owner token" : "Invite code"} value={invite} onChange={(e) => setInvite(e.target.value)} />
+          <input
+            style={{ ...field, fontFamily: "var(--font-mono)" }}
+            autoComplete="off"
+            placeholder={me?.needsAdmin ? "Owner token" : "Invite code"}
+            value={invite}
+            onChange={(e) => setInvite(e.target.value)}
+          />
         )}
-        {error && <p style={{ margin: 0, color: "var(--err)", fontSize: 13 }}>{error}</p>}
+        {error && <p className="error">{error}</p>}
         <button
+          className="btn primary"
           disabled={busy || !username || !password || (tab === "signup" && needInvite && !invite)}
-          style={{ padding: "10px 12px", fontSize: 15, fontWeight: 600, borderRadius: 8, border: 0, background: "var(--accent)", color: "var(--accent-text)", cursor: busy ? "wait" : "pointer", opacity: busy ? 0.6 : 1 }}
+          type="submit"
         >
           {busy ? "…" : tab === "signin" ? "Sign in" : "Create account"}
         </button>

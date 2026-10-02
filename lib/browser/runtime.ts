@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { chromium, type BrowserContext, type CDPSession, type Page } from "playwright-core";
-import { BROWSER_PROFILE, ROOT } from "../store";
+import { ROOT } from "../store";
 
 // ═══════ Browser runtime ═══════
 //

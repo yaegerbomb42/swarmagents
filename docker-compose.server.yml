@@ -22,6 +22,9 @@ services:
     environment:
       - SWARM_MODE=server
       - SWARM_ALLOWED_HOSTS=swarmagents.codes,www.swarmagents.codes
+      # Account sign-ups stay CLOSED in production (the owner-token first admin is still allowed) until tenant data
+      # and per-user execution isolation are verified; then this flips to open (the target product). Deploy lane.
+      - SWARM_SIGNUP=closed
       - SWARM_HOME=/data
       - HOME=/data/home
       - PORT=3400

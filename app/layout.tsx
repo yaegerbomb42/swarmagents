@@ -1,5 +1,4 @@
 import "./globals.css";
-import "../components/brand.css";
 import type { Metadata, Viewport } from "next";
 
 // Icons come from the app-dir conventions: app/favicon.ico (16/32/48), app/icon.png (512), app/apple-icon.png (180),

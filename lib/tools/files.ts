@@ -191,14 +191,29 @@ export const readFile: Tool = {
     const ext = path.extname(f).toLowerCase();
     if (IMAGE[ext] && st.size < 20_000_000) return { content: `Image ${f} (${st.size} bytes)`, images: [{ mediaType: IMAGE[ext], data: fs.readFileSync(f).toString("base64") }] };
 
-    let text: string;
+    let text = "";
     if ([".pdf", ".docx", ".doc", ".rtf", ".pptx", ".xlsx", ".odt", ".pages"].includes(ext)) {
-      // macOS ships textutil (docs) and mdimport/strings; pdftotext if the user has poppler.
-      const r =
-        ext === ".pdf"
-          ? runSync("/bin/zsh", ["-lc", `pdftotext -layout ${JSON.stringify(f)} - 2>/dev/null || python3 -c "import sys;from pypdf import PdfReader;print('\\n'.join(p.extract_text() or '' for p in PdfReader(sys.argv[1]).pages))" ${JSON.stringify(f)} 2>/dev/null || mdls -raw -name kMDItemTextContent ${JSON.stringify(f)}`], { maxBuffer: 1 << 30 })
-          : runSync("textutil", ["-convert", "txt", "-stdout", f], { maxBuffer: 1 << 30 });
-      text = r.stdout?.toString() ?? "";
+      if (ext === ".pdf") {
+        // Try pdftotext -> python3 pypdf -> mdls sequentially with direct arguments, no shell.
+        const p1 = runSync("pdftotext", ["-layout", f, "-"], { maxBuffer: 1 << 30 });
+        if (p1.stdout && p1.stdout.toString().trim()) {
+          text = p1.stdout.toString();
+        } else {
+          const pyScript = "import sys\nfrom pypdf import PdfReader\nprint('\\n'.join(p.extract_text() or '' for p in PdfReader(sys.argv[1]).pages))";
+          const p2 = runSync("python3", ["-c", pyScript, f], { maxBuffer: 1 << 30 });
+          if (p2.stdout && p2.stdout.toString().trim()) {
+            text = p2.stdout.toString();
+          } else {
+            const p3 = runSync("mdls", ["-raw", "-name", "kMDItemTextContent", f], { maxBuffer: 1 << 30 });
+            if (p3.stdout && p3.stdout.toString().trim()) {
+              text = p3.stdout.toString();
+            }
+          }
+        }
+      } else {
+        const r = runSync("textutil", ["-convert", "txt", "-stdout", f], { maxBuffer: 1 << 30 });
+        text = r.stdout?.toString() ?? "";
+      }
       if (!text.trim()) return { content: `Could not extract text from ${f}. Try the bash tool (e.g. pip install pypdf / brew install poppler).`, isError: true };
     } else {
       // Stream only what we need so multi-GB files are fine.

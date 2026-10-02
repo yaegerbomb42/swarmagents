@@ -49,6 +49,26 @@ try {
       assert.equal(conn.mcpServerDef(mcpId), undefined);
       assert.equal(sub.getSubagentSettings().mode, "auto");
     }));
+  t("K2: no key reaches the terminal unless that key is opted in; per account; masked", () =>
+    store.runAs(A, () => {
+      assert.deepEqual(conn.terminalEnv(), {}, "off by default");
+      const id = conn.listConnections().find((c) => c.envVar === "A_ONLY_KEY").id;
+      const other = conn.upsertConnection({ type: "tool", preset: "custom-key", envVar: "A_OTHER_KEY", apiKey: "a-other-key-222222" }).id;
+      conn.upsertConnection({ type: "tool", id, terminal: true });
+      assert.deepEqual(conn.terminalEnv(), { A_ONLY_KEY: "a-secret-key-111111" }, "only the opted-in key");
+      assert.equal(conn.listConnections().find((c) => c.id === id).terminal, true);
+      assert.ok(!JSON.stringify(conn.listConnections()).includes("a-secret-key-111111"), "the list never carries the value");
+      assert.equal(conn.redactSavedKeys("k=a-secret-key-111111"), "k=••••1111");
+      conn.upsertConnection({ type: "tool", id, label: "renamed" });
+      assert.equal(conn.terminalEnv().A_ONLY_KEY, "a-secret-key-111111", "an unrelated edit keeps the choice");
+      conn.setEnabled("tool", id, false);
+      assert.deepEqual(conn.terminalEnv(), {}, "a disabled key is never exported");
+      conn.setEnabled("tool", id, true);
+      store.runAs(B, () => assert.deepEqual(conn.terminalEnv(), {}, "B never gets A's opt-ins"));
+      conn.upsertConnection({ type: "tool", id, terminal: "yes" });
+      assert.deepEqual(conn.terminalEnv(), {}, "only an explicit true opts in");
+      conn.deleteConnection("tool", other);
+    }));
   t("files live under each account's own home", () => {
     assert.ok(fs.existsSync(path.join(home, "users", A, "connections.json")));
     assert.ok(fs.existsSync(path.join(home, "users", A, "mcp.json")));
@@ -68,7 +88,7 @@ try {
     store.runAs(B, () => {
       assert.ok(!conn.listConnections().some((c) => c.type === "mcp" && c.source && c.source !== "swarm"));
     }));
-  console.log(`tenant-connections: ${pass}/6 pass`);
+  console.log(`tenant-connections: ${pass}/${pass} pass`);
 } finally {
   fs.rmSync(home, { recursive: true, force: true });
 }

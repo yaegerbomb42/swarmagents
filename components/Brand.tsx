@@ -58,7 +58,7 @@ export function HexagonMark({
   );
 }
 
-// Wrench icon — for Settings
+// Wrench icon — for Settings (thicker at small sizes for visibility next to other sidebar icons)
 export function WrenchMark({
   className = "",
   size = 20,
@@ -68,6 +68,8 @@ export function WrenchMark({
   size?: number;
   ariaLabel?: string;
 }) {
+  // Use thicker stroke at 16px and below
+  const strokeWidth = size <= 16 ? 2.5 : 2;
   return (
     <svg
       className={className}
@@ -76,7 +78,7 @@ export function WrenchMark({
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
-      strokeWidth="2"
+      strokeWidth={strokeWidth}
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"

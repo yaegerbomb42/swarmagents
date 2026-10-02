@@ -520,17 +520,28 @@ function GroupCard({ group, onImage, session }: { group: StepGroup; onImage: (s:
 
 // ═══════ Load Earlier ═══════
 
-export function LoadEarlier({ archivedCount, sessionId }: { archivedCount: number; sessionId: string }) {
+interface LoadEarlierProps {
+  archivedCount: number;
+  sessionId: string;
+  onLoad: (events: AgentEvent[], remaining: number) => void;
+}
+
+export function LoadEarlier({ archivedCount, sessionId, onLoad }: LoadEarlierProps) {
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      await fetch(`/api/sessions/${sessionId}/events?limit=100`);
+      const res = await fetch(`/api/sessions/${sessionId}/events?limit=100`);
+      if (res.ok) {
+        const data = await res.json();
+        // data.events are oldest-first, but we want to prepend them
+        onLoad(data.events, data.start);
+      }
     } finally {
       setLoading(false);
     }
-  }, [sessionId]);
+  }, [sessionId, onLoad]);
 
   if (archivedCount <= 0) return null;
 

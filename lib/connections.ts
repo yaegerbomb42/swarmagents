@@ -498,7 +498,7 @@ export function upsertConnection(input: ConnectionInput): { id: string } {
   if (input.id && !found) throw new InputError("That server no longer exists.");
   const name = found?.name ?? slugName(str(input.label, "Name", 80) || mcpPreset(input.preset ?? "")?.label || "server", new Set(all.map((s) => s.name)));
   swarm[name] = buildMcp(input, found?.def);
-  saveSwarmMcp(swarm);
+  saveSwarmAgentsMcp(swarm);
   mcpChanged(name);
   return { id: name };
 }
@@ -522,7 +522,7 @@ export function setEnabled(type: ConnType, id: string, enabled: boolean) {
     if (!s) throw new InputError("Not found.");
     const swarm = readMcpFile(mcpConfig());
     swarm[id] = { ...s.def, disabled: enabled ? undefined : true };
-    saveSwarmMcp(swarm);
+    saveSwarmAgentsMcp(swarm);
     mcpChanged(id);
   }
 }
@@ -538,7 +538,7 @@ export function deleteConnection(type: ConnType, id: string) {
     // Imported servers live in Claude's config, which we never edit; "removing" hides them here instead.
     if (imported) swarm[id] = { ...imported, disabled: true };
     else delete swarm[id];
-    saveSwarmMcp(swarm);
+    saveSwarmAgentsMcp(swarm);
     forgetMcpAuth(id);
     mcpChanged(id);
   }

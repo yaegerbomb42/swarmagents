@@ -15,7 +15,7 @@ import { deleteSession, getMeta, listSessions, runAs, sessionDir, userHome } fro
 import type { SessionMeta } from "../types";
 import { dropSession } from "../agent";
 import { getAgentAdapter } from "../runtime/resume";
-import { fmtMB, invalidate, onReconcile, reconcile, startStorageReconciler, storageLimit, usage, type Usage } from "./storage";
+import { fmtMB, invalidate, onPressure, onReconcile, reconcile, startStorageReconciler, storageLimit, usage, type Usage } from "./storage";
 
 export const PRUNE_AT = 0.9;
 export const PRUNE_TO = 0.75;
@@ -292,6 +292,8 @@ if (!gp.__swarmAutoPrune) {
   onReconcile((uid, u) => {
     runAs(uid, () => maybeAutoPrune(u));
   });
+  // A write or run check near the limit prunes right away (when auto-prune is on) instead of refusing.
+  onPressure((uid) => runAs(uid, () => maybeAutoPrune(usage(uid, true)).length > 0));
 }
 startStorageReconciler();
 

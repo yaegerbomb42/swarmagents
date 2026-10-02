@@ -185,6 +185,32 @@ try {
       assert.equal(store.getMeta(fresh.id), null);
     }));
 
+  t("auto-prune on: a write or run near the limit prunes the least recently used data first instead of refusing", () =>
+    store.runAs("cccccccccccccccc", () => {
+      const stale = chat("stale, screenshots", { shots: 8, daysAgo: 30 }); // ~320 KB of images, least recently used
+      const recent = chat("recent, screenshots", { shots: 3, daysAgo: 1 });
+      const keep = chat("pinned, oldest", { shots: 3, daysAgo: 90 });
+      pr.saveStorageSettings({ pinned: [keep.id] });
+      const ws = path.join(store.userHome(), "workspace");
+      fs.mkdirSync(ws, { recursive: true });
+      const need = Math.ceil(LIMIT - st.usage(undefined, true).used) + 1024; // just over 100%
+      fs.writeFileSync(path.join(ws, "fill.bin"), Buffer.alloc(need));
+      st.invalidate();
+      st.resetPressureThrottle();
+      assert.ok(st.storageBlock(), "auto-prune off: refused at 100%");
+      assert.equal(store.loadEvents(stale.id).filter((e) => e.images).length, 8, "off means nothing is removed");
+      pr.saveStorageSettings({ autoPrune: true });
+      st.resetPressureThrottle();
+      assert.equal(st.storageBlock(), null, "auto-prune on: space was freed, so the write goes through");
+      assert.equal(store.loadEvents(stale.id).filter((e) => e.images).length, 0, "the least recently used chat's screenshots went first");
+      assert.equal(store.loadEvents(recent.id).filter((e) => e.images).length, 3, "a recently used chat is untouched while older data suffices");
+      assert.equal(store.loadEvents(keep.id).filter((e) => e.images).length, 3, "pinned is never touched, however old");
+      assert.ok(store.getMeta(stale.id) && store.getMeta(recent.id), "no chat deleted while screenshots were enough");
+      const log = pr.pruneLog();
+      assert.ok(log.length && log.every((l) => l.auto) && log[0].sessionId === stale.id, JSON.stringify(log));
+      assert.ok(st.usage(undefined, true).used <= pr.PRUNE_TO * LIMIT);
+    }));
+
   t("accounts are independent: A's prune and quota never touch B", () => {
     const aIds = store.runAs(A, () => store.listSessions().map((m) => m.id));
     store.runAs(B, () => {

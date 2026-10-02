@@ -60,7 +60,10 @@ const SNAPSHOT = `(() => {
     out.push('['+i+'] '+tag+(label?' "'+label+'"':'')+(el.href?' -> '+el.getAttribute('href').slice(0,80):''));
   }
   const text = document.body.innerText.replace(/\\n\\s*\\n+/g,'\\n').slice(0, 12000);
-  return { title: document.title, url: location.href, elements: out.slice(0, 400).join('\\n'), text };
+  const consent = !!document.querySelector('[id*="cookie" i],[class*="cookie" i],[id*="consent" i],[class*="consent" i],[aria-label*="consent" i],[id*="gdpr" i]');
+  const captcha = !!document.querySelector('iframe[src*="recaptcha"],iframe[src*="hcaptcha"],iframe[src*="turnstile"],.g-recaptcha,[id*="captcha" i],[class*="captcha" i]');
+  const signin = !!document.querySelector('input[type="password"]');
+  return { title: document.title, url: location.href, elements: out.slice(0, 400).join('\\n'), text, consent, captcha, signin };
 })()`;
 
 const MARKS_ON = `(() => {
@@ -107,13 +110,19 @@ async function observe(s: BrowserSession, p0: Page, note: string, full = false, 
       url: p.url(),
       elements: "",
       text: "",
-    }))) as Record<string, string>;
+    }))) as Record<string, unknown>;
   // Refill in place: browserTargetLabel reads this same Map for the approval gate.
   lastElements.clear();
   for (const l of String(snap.elements ?? "").split("\n")) {
     const m = /^\[(\d+)\]\s+(.*?)(?:\s+->\s.*)?$/.exec(l.trim());
     if (m) lastElements.set(Number(m[1]), m[2]);
   }
+  // Common blockers worth telling the model about (we never click them for it — that could be wrong).
+  const flags: string[] = [];
+  if (snap.captcha) flags.push("A CAPTCHA is on this page — the user can press Take over in the live view to solve it.");
+  if (snap.signin) flags.push("A password field is here (a sign-in wall) — log in only with credentials you were given; otherwise ask the user or stop.");
+  if (snap.consent) flags.push("A cookie/consent banner looks present — dismiss it (click its Accept/Agree button) before reading the page.");
+  if (flags.length) note = `${note}\n${flags.map((f) => `! ${f}`).join("\n")}`;
   // Set-of-marks: draw each element's number on the screenshot so the model (and the user reading the
   // timeline) can match "[12] button" to what's on screen. Removed right after the capture.
   const marks = wantShot && process.env.SWARM_BROWSER_MARKS !== "0" && (await p.evaluate(MARKS_ON).catch(() => false));

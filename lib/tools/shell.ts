@@ -11,7 +11,13 @@ const MARK = "__SWARM_CWD__";
 /** Secrets the agent must never see in its shell children. The server holds the owner token so the
  *  browser doesn't have to; children inherit env by default, so strip server-only keys explicitly.
  *  SWARM_HOME is safe (session data dir) and stays so uploads/sessions keep working. */
-const STRIPPED_ENV = new Set(["SWARM_AUTH_TOKEN", "SWARM_AUTH_TOKEN_SHA256"]);
+const STRIPPED_ENV = new Set([
+  "SWARM_AUTH_TOKEN",
+  "SWARM_AUTH_TOKEN_SHA256",
+  "SWARM_ADMIN_EMAIL",
+  "SWARM_ADMIN_PASSWORD",
+  "SWARM_ADMIN_PASSWORD_FILE",
+]);
 function childEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     NODE_ENV: process.env.NODE_ENV ?? "production",

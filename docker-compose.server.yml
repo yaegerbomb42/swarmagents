@@ -22,9 +22,10 @@ services:
     environment:
       - SWARM_MODE=server
       - SWARM_ALLOWED_HOSTS=swarmagents.codes,www.swarmagents.codes
-      # Account sign-ups stay CLOSED in production (the owner-token first admin is still allowed) until tenant data
-      # and per-user execution isolation are verified; then this flips to open (the target product). Deploy lane.
-      - SWARM_SIGNUP=closed
+      # Public sign-up (Jimmy 21:26). Opened in deploy #8 after deploy #7's alice/bob/mallory cross-account probe passed
+      # on the deployed image. Successful sign-ups are capped (lib/tenant/signup-limit.ts: 5/IP/hour, 60/hour), failed
+      # logins/sign-ups throttled (lib/auth throttled). Set back to closed to stop new accounts. Deploy lane.
+      - SWARM_SIGNUP=open
       - SWARM_HOME=/data
       - HOME=/data/home
       - PORT=3400

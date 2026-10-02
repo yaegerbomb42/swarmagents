@@ -5,7 +5,13 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 
 // --- mirror of lib/tools/shell.ts childEnv() ---
-const STRIPPED_ENV = new Set(["SWARM_AUTH_TOKEN", "SWARM_AUTH_TOKEN_SHA256"]);
+const STRIPPED_ENV = new Set([
+  "SWARM_AUTH_TOKEN",
+  "SWARM_AUTH_TOKEN_SHA256",
+  "SWARM_ADMIN_EMAIL",
+  "SWARM_ADMIN_PASSWORD",
+  "SWARM_ADMIN_PASSWORD_FILE",
+]);
 function childEnv(process_env) {
   const env = {
     NODE_ENV: process_env.NODE_ENV ?? "production",
@@ -31,6 +37,9 @@ function childEnv(process_env) {
   const src = {
     SWARM_AUTH_TOKEN: "owner-secret",
     SWARM_AUTH_TOKEN_SHA256: "abc123",
+    SWARM_ADMIN_EMAIL: "admin@example.com",
+    SWARM_ADMIN_PASSWORD: "secret-password",
+    SWARM_ADMIN_PASSWORD_FILE: "/run/secrets/admin-pw",
     SWARM_BROWSER_HEADLESS: "1",
     SWARM_HOME: "/tmp/swarm-home",
     PATH: "/usr/bin:/bin",
@@ -40,6 +49,9 @@ function childEnv(process_env) {
   const env = childEnv(src);
   assert.equal(env.SWARM_AUTH_TOKEN, undefined, "owner token must not reach children");
   assert.equal(env.SWARM_AUTH_TOKEN_SHA256, undefined, "token hash must not reach children");
+  assert.equal(env.SWARM_ADMIN_EMAIL, undefined, "admin email must not reach children");
+  assert.equal(env.SWARM_ADMIN_PASSWORD, undefined, "admin password must not reach children");
+  assert.equal(env.SWARM_ADMIN_PASSWORD_FILE, undefined, "admin password file path must not reach children");
   assert.equal(env.SWARM_BROWSER_HEADLESS, undefined, "all SWARM_* are server config");
   assert.equal(env.SWARM_HOME, "/tmp/swarm-home", "SWARM_HOME must survive (session data dir)");
   assert.equal(env.PATH, "/usr/bin:/bin", "PATH must survive or bash breaks");

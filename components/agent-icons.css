@@ -7,19 +7,10 @@
   --agent-icon-fold: #1B2130;
   --agent-icon-tile-edge: #2A3142;
 }
-/* Light surfaces: deeper gold/orange/blue keep 3:1+ contrast on near-white. Scoped by the light color-scheme so a
-   dark-only app keeps the dark values. */
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    --agent-icon-gold: #A87613;
-    --agent-icon-orange: #B4592A;
-    --agent-icon-dot: #2A86B8;
-    --agent-icon-tile: #F6F2E9;
-    --agent-icon-fold: #E7E0D0;
-    --agent-icon-tile-edge: #DDD5C4;
-  }
-}
-:root[data-theme="light"] {
+/* Light surfaces: deeper gold/orange/blue keep 3:1+ contrast on near-white. The app is dark-only today, so the light
+   palette is opt-in: set data-theme="light" on <html> (a future light theme) or add .agent-icon--light to an icon that
+   sits on a light surface. The static public/brand/icons/*.svg files follow prefers-color-scheme on their own. */
+:root[data-theme="light"], .agent-icon--light {
   --agent-icon-gold: #A87613;
   --agent-icon-orange: #B4592A;
   --agent-icon-dot: #2A86B8;

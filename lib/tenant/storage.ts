@@ -98,7 +98,13 @@ export function classify(rel: string): { cat: StorageCategory; session?: string 
 }
 
 type Cache = { usage: Usage; pending: number };
-const g = globalThis as unknown as { __swarmStorage?: Map<string, Cache>; __swarmStorageTimer?: NodeJS.Timeout };
+const g = globalThis as unknown as {
+  __swarmStorage?: Map<string, Cache>;
+  __swarmStorageTimer?: NodeJS.Timeout;
+  // Global, not module-level: Next bundles routes and instrumentation separately, and the hooks must reach all.
+  __swarmStorageHooks?: Hook[];
+  __swarmStoragePressure?: { hooks: PressureHook[]; last: Map<string, number> };
+};
 const cache = (g.__swarmStorage ??= new Map());
 
 /** Walk the user's whole tree now and reset the running total. */
@@ -161,7 +167,9 @@ export class StorageFullError extends Error {
 export function storageBlock(extra = 0, opts: { grace?: number } = {}, userId = currentUser()): StorageFullError | null {
   const limit = storageLimit(userId);
   if (!Number.isFinite(limit)) return null;
-  const used = usage(userId).used;
+  let used = usage(userId).used;
+  // Near the limit, let auto-prune (if the user turned it on) free space before anything is refused.
+  if (used + Math.max(0, extra) >= limit * PRESSURE_AT && relieve(userId)) used = usage(userId, true).used;
   const allowed = limit * (1 + Math.max(0, opts.grace ?? 0));
   return used + Math.max(0, extra) > allowed || (extra === 0 && used >= allowed) ? new StorageFullError(used, limit) : null;
 }
@@ -180,7 +188,7 @@ export function storageFullResponse(e: StorageFullError) {
 // ---- background reconcile + auto-prune hook ----
 
 type Hook = (userId: string, u: Usage) => void | Promise<void>;
-const hooks: Hook[] = [];
+const hooks = (g.__swarmStorageHooks ??= []);
 /** Run after every background reconcile (lib/tenant/prune.ts registers auto-prune here). */
 export function onReconcile(h: Hook) {
   hooks.push(h);
@@ -199,4 +207,37 @@ export async function reconcileAll() {
       for (const h of hooks) await h(uid, u);
     } catch {}
   }
+}
+
+// ---- storage pressure: prune on demand, not only on the 5-minute reconcile ----
+
+type PressureHook = (userId: string) => boolean;
+const pressure = (g.__swarmStoragePressure ??= { hooks: [] as PressureHook[], last: new Map<string, number>() });
+/** Usage fraction at which a write or run check asks the pressure hooks (auto-prune) to free space first. */
+export const PRESSURE_AT = 0.9;
+const PRESSURE_EVERY_MS = 30_000;
+
+/** Register a hook that tries to free space for a user and says whether it freed anything (prune.ts). */
+export function onPressure(h: PressureHook) {
+  pressure.hooks.push(h);
+}
+
+/** Ask the pressure hooks to free space, at most every 30s per user. True if something was freed. */
+function relieve(userId: string): boolean {
+  if (!pressure.hooks.length) return false;
+  const now = Date.now();
+  if (now - (pressure.last.get(userId) ?? 0) < PRESSURE_EVERY_MS) return false;
+  pressure.last.set(userId, now);
+  let freed = false;
+  for (const h of pressure.hooks) {
+    try {
+      freed = h(userId) || freed;
+    } catch {}
+  }
+  return freed;
+}
+
+/** Tests: forget the 30s pressure throttle. */
+export function resetPressureThrottle() {
+  pressure.last.clear();
 }

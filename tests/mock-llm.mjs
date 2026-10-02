@@ -27,7 +27,7 @@ const PORT = Number(process.argv[2] || process.env.MOCK_PORT || 37901);
 const WORKDIR = process.env.MOCK_WORKDIR || path.join(os.tmpdir(), "swarm-mock-work");
 fs.mkdirSync(WORKDIR, { recursive: true });
 
-const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files", "api", "fetch", "risky", "shellkey"];
+const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files", "api", "fetch", "risky", "shellkey", "fanout", "child", "childfail", "childslow"];
 const log = [];
 const attempts = new Map(); // conversation hash -> request count, for ratelimit/flaky
 
@@ -193,6 +193,43 @@ function script(a) {
         text: `API: list=${has(/github-token \(GitHub token\)/)} auth=${has(/"auth": "ours"[\s\S]*"q": "1"/)} refused=${has(/only sent to api\.github\.com/)} nospoof=${has(/"auth": "ours"[\s\S]*"extra": "yes"/)} saved=${has(/Saved 4 bytes to .*hello\.mp3/)} redirect=${has(/Redirects to: https:\/\/cdn\.example\.com\/file/)}`,
       };
     }
+    // Sub-agents (SA5): the lead fans out three children; each child's prompt carries its own marker.
+    // child: runs one command and reports. childfail: a non-retryable provider error. childslow: a 429 first
+    // (throttling), then a 1.5s-slow reply, so a parallel fan-out finishes well under the sum of its children.
+    case "fanout": {
+      const sub = a.tools.find((t) => t === "subagent" || /spawn_?subagents?/.test(t ?? ""));
+      if (!sub) return { text: "Fanout: no sub-agent tool offered." };
+      if (a.step === 0)
+        return {
+          calls: [
+            {
+              name: sub,
+              input: {
+                tasks: [
+                  { title: "alpha", prompt: "[mock:child] alpha: echo your name and report." },
+                  { title: "beta", prompt: "[mock:childslow] beta: report slowly." },
+                  { title: "gamma", prompt: "[mock:childfail] gamma: this one breaks." },
+                ],
+              },
+            },
+          ],
+        };
+      const o = a.toolOutputs.join("\n");
+      const ok = (o.match(/child-done:\w+/g) ?? []).length;
+      return { text: `Fanout: reports=${ok} alpha=${/child-done:alpha saw=ok/.test(o) ? "ok" : "MISSING"} beta=${/child-done:beta/.test(o) ? "ok" : "MISSING"} gamma=${/gamma[\s\S]{0,40}\(failed\)|Failed:/.test(o) ? "failed" : "MISSING"} summary=${(o.match(/\d+\/\d+ sub-agents finished/) ?? ["none"])[0]}` };
+    }
+    case "child": {
+      const name = (a.userText.match(/\] (\w+):/) ?? [, "x"])[1];
+      if (a.step === 0) return { calls: [{ name: "bash", input: { command: `echo child-${name}` } }] };
+      return { text: `child-done:${name} saw=${a.toolOutputs.some((t) => t.includes(`child-${name}`)) ? "ok" : "no"}` };
+    }
+    case "childslow": {
+      const name = (a.userText.match(/\] (\w+):/) ?? [, "x"])[1];
+      if (n === 0) return { error: { status: 429, message: "Rate limit reached (mock child)", headers: { "retry-after": "1" } } };
+      return { text: `child-done:${name} after ${n} throttle(s)`, delayMs: 500 };
+    }
+    case "childfail":
+      return { error: { status: 400, message: "mock child: invalid request (non-retryable)" } };
     case "shellkey":
       // A saved tool key reaches the shell as its env var, and its value is masked in what comes back.
       if (a.step === 0) return { calls: [{ name: "bash", input: { command: 'echo "k=$SHELLKEY_TEST_TOKEN len=${#SHELLKEY_TEST_TOKEN}"' } }] };

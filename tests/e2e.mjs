@@ -507,6 +507,29 @@ const cases = {
     return "GET/PUT, validation (2–10, modes, provider, budget, unknown keys), child model, persisted 0600, hand edits clamped";
   },
 
+  async fanout() {
+    // SA5: the lead fans out 3 sub-agents. One succeeds, one is throttled (429) and then slow, one fails for good.
+    // The lead must get both reports plus a clear failure, the children must run in parallel, and progress must stream.
+    const t0 = Date.now();
+    let live = "";
+    const { events } = await runTask("[mock:fanout] split this up", {
+      timeout: 120_000,
+      onEvent: (e) => {
+        if (e.type === "tool" && e.status === "running" && typeof e.output === "string" && e.output.length > live.length) live = e.output;
+      },
+    });
+    const out = texts(events);
+    assert(/Fanout: reports=2 alpha=ok beta=ok gamma=failed summary=2\/3 sub-agents finished/.test(out), "fan-out: 2 reports + 1 failure", { said: out.slice(-400), tools: tools(events).map((t) => `${t.name}:${t.status}`) });
+    const card = tools(events).find((t) => t.name === "subagent" || /spawn_?subagents?/.test(t.name));
+    assert(card && /## Sub-agent 3: gamma \(failed\)/.test(card.output ?? ""), "lead sees each child's report", card?.output);
+    assert(/\[1·alpha\] started/.test(live) && /\[2·beta\]/.test(live) && /\[3·gamma\] failed/.test(live), "child progress streamed live into the tool card", { live: live.slice(-600) });
+    const secs = (Date.now() - t0) / 1000;
+    // Known SA2 gap (19:53): a child's 429 with retry-after: 1 makes the router hold the lead for ~58s afterwards.
+    const stall = events.find((e) => e.type === "notice" && /Waiting (\d+)s/.test(e.text ?? e.message ?? ""));
+    const waited = stall ? Number(/Waiting (\d+)s/.exec(stall.text ?? stall.message)[1]) : 0;
+    return `3 children (ok, throttled+slow, failed) → 2 reports + 1 failure in ${secs.toFixed(1)}s; progress streamed${waited > 5 ? ` · WARN lead then waited ${waited}s after a child's 1s retry-after (SA2)` : ""}`;
+  },
+
   async shellkey() {
     // Saved tool keys are exported to the agent's shell, and their values are masked in the output.
     if (!fs.readFileSync(path.join(ROOT, "lib/tools/shell.ts"), "utf8").includes("toolEnv")) return "skipped: lib/tools/shell.ts doesn't export saved keys yet";

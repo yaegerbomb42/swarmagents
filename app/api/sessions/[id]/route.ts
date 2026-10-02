@@ -1,3 +1,4 @@
+import { scoped } from "@/lib/auth";
 import { session, dropSession } from "@/lib/agent";
 import { deleteSession } from "@/lib/store";
 import type { Attachment, StreamOp } from "@/lib/types";
@@ -7,7 +8,7 @@ export const dynamic = "force-dynamic";
 type Ctx = { params: Promise<{ id: string }> };
 
 /** Live event stream: a snapshot, then every add/patch as it happens. */
-export async function GET(req: Request, { params }: Ctx) {
+async function getHandler(req: Request, { params }: Ctx) {
   const s = session((await params).id);
   if (!s) return new Response("not found", { status: 404 });
   const enc = new TextEncoder();
@@ -40,7 +41,7 @@ export async function GET(req: Request, { params }: Ctx) {
   return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" } });
 }
 
-export async function POST(req: Request, { params }: Ctx) {
+async function postHandler(req: Request, { params }: Ctx) {
   const s = session((await params).id);
   if (!s) return new Response("not found", { status: 404 });
   const { text, attachments } = (await req.json()) as { text: string; attachments?: Attachment[] };
@@ -48,9 +49,16 @@ export async function POST(req: Request, { params }: Ctx) {
   return Response.json({ ok: true });
 }
 
-export async function DELETE(_: Request, { params }: Ctx) {
+async function deleteHandler(_: Request, { params }: Ctx) {
   const id = (await params).id;
+  // Resolves only within the caller's own data, so another account's session is simply not found.
+  if (!session(id)) return new Response("not found", { status: 404 });
   dropSession(id);
   deleteSession(id);
   return Response.json({ ok: true });
 }
+
+// Every handler runs as the signed-in user, so all store paths resolve to that user's data.
+export const GET = scoped(getHandler);
+export const POST = scoped(postHandler);
+export const DELETE = scoped(deleteHandler);

@@ -15,3 +15,5 @@ current
 .last_build_hash
 .last_npm_hash
 deploy
+# BRAND: original artwork; derived assets live in public/brand
+brand-src/

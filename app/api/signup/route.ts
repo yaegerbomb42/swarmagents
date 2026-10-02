@@ -1,5 +1,5 @@
 import { checkOwnerToken, clearFailures, noteFailure, serverMode, sessionCookie, throttled } from "@/lib/auth";
-import { consumeInvite, createUser, signupMode, startSession, transaction, userCount, usernameTaken, validateCredentials } from "@/lib/users";
+import { consumeInvite, createUser, inviteValid, signupMode, startSession, transaction, userCount, usernameTaken, validateCredentials } from "@/lib/users";
 
 export const dynamic = "force-dynamic";
 
@@ -24,6 +24,12 @@ export async function POST(req: Request) {
   if (first && !checkOwnerToken(invite)) {
     await noteFailure(req);
     return Response.json({ error: "The first account needs the server's owner token as its invite code." }, { status: 403 });
+  }
+
+  // Check the invite before the username, so someone without one can't probe which usernames exist.
+  if (!first && mode === "invite" && !inviteValid(invite)) {
+    await noteFailure(req);
+    return Response.json({ error: "That invite code is not valid or was already used." }, { status: 403 });
   }
 
   let created;

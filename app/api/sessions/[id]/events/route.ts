@@ -1,3 +1,4 @@
+import { scoped } from "@/lib/auth";
 import { getMeta, loadArchivedEvents } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
@@ -5,7 +6,7 @@ export const dynamic = "force-dynamic";
 type Ctx = { params: Promise<{ id: string }> };
 
 /** Page through archived (older) events: GET ?before=<index>&limit=<n>, newest page first. */
-export async function GET(req: Request, { params }: Ctx) {
+async function getHandler(req: Request, { params }: Ctx) {
   const id = (await params).id;
   const meta = /^[a-f0-9]{16}$/.test(id) ? getMeta(id) : null;
   if (!meta) return new Response("not found", { status: 404 });
@@ -16,3 +17,6 @@ export async function GET(req: Request, { params }: Ctx) {
   const events = loadArchivedEvents(id, before, limit, total);
   return Response.json({ events, start: before - events.length, total });
 }
+
+// Every handler runs as the signed-in user, so all store paths resolve to that user's data.
+export const GET = scoped(getHandler);

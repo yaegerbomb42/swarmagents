@@ -1,3 +1,4 @@
+import { scoped } from "@/lib/auth";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -74,7 +75,7 @@ function cleanupOrphanPartials(dir: string) {
 }
 
 /** Streams uploads to disk with a configurable per-file ceiling and free-space reserve. */
-export async function POST(req: Request) {
+async function postHandler(req: Request) {
   if (!isLocal(req)) return new Response("forbidden", { status: 403 });
   const u = new URL(req.url);
   const sessionId = u.searchParams.get("session") ?? "";
@@ -179,3 +180,6 @@ export async function POST(req: Request) {
     if (budgetReserved) uploadRuntime.reservedBytes -= remainingBudget;
   }
 }
+
+// Every handler runs as the signed-in user, so all store paths resolve to that user's data.
+export const POST = scoped(postHandler);

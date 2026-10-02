@@ -11,6 +11,7 @@
 // that creates the first, admin account. Keep only the digest on a server: the agent can read this process's env.
 
 import { createHash, timingSafeEqual } from "node:crypto";
+import { runAs } from "./store";
 import { userForToken, type User } from "./users";
 
 export const AUTH_COOKIE = "swarm_auth";
@@ -105,7 +106,9 @@ export const isAllowed = (req: Request) => requestUser(req) !== null;
 /** Cookie for a fresh login session. Secure on servers, and whenever the client reached us over https. */
 export function sessionCookie(req: Request, token: string, maxAgeSec = 60 * 60 * 24 * 30) {
   const secure = serverMode() || (req.headers.get("x-forwarded-proto") ?? new URL(req.url).protocol.replace(":", "")) === "https";
-  return `${AUTH_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSec}${secure ? "; Secure" : ""}`;
+  // Lax, not Strict: the redirect back from an OAuth provider is a cross-site navigation, and a Strict cookie
+  // would make that callback look signed out. Cross-site POSTs still get no cookie, and sameOrigin() blocks them.
+  return `${AUTH_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}${secure ? "; Secure" : ""}`;
 }
 
 // Failed logins and signups are limited per client and globally, so passwords and invites can't be guessed online.
@@ -130,3 +133,16 @@ export async function noteFailure(req: Request) {
 }
 
 export const clearFailures = (req: Request) => failures.delete(clientIp(req));
+
+/**
+ * Wrap a route handler so it runs as the signed-in user: every store path it touches resolves to that user's
+ * data. It re-resolves the session itself (no trust in forwarded headers), so it also guards routes that bypass
+ * middleware. Usage: `export const GET = scoped(async (req, ctx) => { ... })`.
+ */
+export function scoped<A extends unknown[]>(handler: (req: Request, ...rest: A) => Response | Promise<Response>) {
+  return async (req: Request, ...rest: A): Promise<Response> => {
+    const user = requestUser(req);
+    if (!user) return Response.json({ error: "Sign in required." }, { status: serverMode() ? 401 : 403 });
+    return runAs(user.id, () => handler(req, ...rest));
+  };
+}

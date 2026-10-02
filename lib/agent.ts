@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { AppendField, AgentEvent, Attachment, Block, ContextInfo, Msg, PlanItem, ProviderConfig, SessionMeta, StreamOp } from "./types";
-import { archiveEvents, getMeta, listSessions, loadEvents, loadHistory, newId, saveEvents, saveHistory, saveMeta, UPLOADS_DIR } from "./store";
+import { allUserIds, archiveEvents, currentUser, getMeta, listSessions, loadEvents, loadHistory, newId, runAs, saveEvents, saveHistory, saveMeta, uploadsDir } from "./store";
 import { contextWindow, estimateTokens, routeTurn, setLearnedContext, activeProviders } from "./router";
 import { ProviderError } from "./providers/types";
 import { allTools } from "./tools";
@@ -49,12 +49,14 @@ How you work:
 - Large inputs: read files in pages, grep before reading, and save big intermediate results to disk instead of holding them in context.
 - When done, reply with a brief, direct summary of the outcome. Use markdown. No filler.
 
-Environment: macOS, home ${os.homedir()}, current directory ${cwd}, user uploads in ${UPLOADS_DIR}. Date ${new Date().toDateString()}.`;
+Environment: macOS, home ${os.homedir()}, current directory ${cwd}, user uploads in ${uploadsDir()}. Date ${new Date().toDateString()}.`;
 }
 
 // ---- Session runtime (kept on globalThis so dev hot-reloads don't orphan running agents) ----
 
 class Session {
+  /** The account this session belongs to; all of its work runs as this user (see store.ts tenancy). */
+  readonly userId = currentUser();
   events: AgentEvent[];
   history: Msg[];
   meta: SessionMeta;
@@ -161,6 +163,11 @@ class Session {
   }
 
   flush() {
+    // Debounced saves fire from timers; pin them to this session's owner explicitly.
+    runAs(this.userId, () => this.flushNow());
+  }
+
+  private flushNow() {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = null;
     this.archiveOld();
@@ -215,7 +222,7 @@ class Session {
       attachments: [],
       resumeNote: "[Automatic note, not from the user] The agent process restarted mid-task. Any tool calls in flight were interrupted and may have partially run. Re-check the current state (files, processes, browser) before continuing, then carry on with the task.",
     });
-    void this.loop();
+    void this.start();
   }
 
   setContext(tokens: number, p?: ProviderConfig) {
@@ -235,7 +242,7 @@ class Session {
     // Durable before anything else happens: cleared by flush() once history containing it is on disk.
     this.meta.pendingInput = [...(this.meta.pendingInput ?? []), { text, attachments }];
     saveMeta(this.meta);
-    if (!this.running) void this.loop();
+    if (!this.running) void this.start();
   }
 
   stop() {
@@ -256,6 +263,11 @@ class Session {
   }
 
   // ---- The agent loop ----
+
+  /** Start the agent loop in this session's tenant context, whoever triggered it (a request, a timer, boot). */
+  private start() {
+    return runAs(this.userId, () => this.loop());
+  }
 
   async loop() {
     this.setRunning(true);
@@ -359,7 +371,7 @@ class Session {
       if (!this.inbox.length || stopReason !== "done") this.setActive(false);
       this.flush();
       this.setRunning(false);
-      if (this.inbox.length) void this.loop();
+      if (this.inbox.length) void this.start();
     }
   }
 
@@ -645,21 +657,26 @@ const fmtBytes = (n: number) => (n > 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n > 1e
 
 const g = globalThis as unknown as { __swarmSessions?: Map<string, Session> };
 const sessions = (g.__swarmSessions ??= new Map());
+/** Sessions are cached per owner: a session id from another account never resolves. */
+const key = (id: string) => `${currentUser()}:${id}`;
 
 export function session(id: string): Session | null {
-  let s = sessions.get(id);
+  let s = sessions.get(key(id));
   if (!s) {
     const meta = getMeta(id);
     if (!meta) return null;
     s = new Session(meta);
-    sessions.set(id, s);
+    sessions.set(key(id), s);
   }
   return s;
 }
 
 /** Called once at server boot: pick up every run that was still going when the process died. */
 export function resumeActiveSessions() {
-  for (const m of listSessions()) if (m.active || m.pendingInput?.length) session(m.id)?.resume();
+  for (const uid of allUserIds())
+    runAs(uid, () => {
+      for (const m of listSessions()) if (m.active || m.pendingInput?.length) session(m.id)?.resume();
+    });
 }
 
 // The task runtime (lib/runtime) drives the agent through this adapter: it queues a task, we run it as a normal
@@ -703,17 +720,17 @@ setAgentAdapter({
     if (pending) return { summary: `Paused for approval: ${pending.message}`, verified: false, needs: { kind: "approval", message: pending.message, token: pending.token } };
     return { summary: last?.type === "text" ? last.text : "" };
   },
-  stop: (sessionId) => sessions.get(sessionId)?.stop(),
-  isRunning: (sessionId) => !!sessions.get(sessionId)?.running,
+  stop: (sessionId) => sessions.get(key(sessionId))?.stop(),
+  isRunning: (sessionId) => !!sessions.get(key(sessionId))?.running,
 });
 
 export function dropSession(id: string) {
-  sessions.get(id)?.stop();
-  sessions.delete(id);
+  sessions.get(key(id))?.stop();
+  sessions.delete(key(id));
 }
 
 export const uploadDir = (id: string) => {
-  const d = path.join(UPLOADS_DIR, id);
+  const d = path.join(uploadsDir(), id);
   fs.mkdirSync(d, { recursive: true });
   return d;
 };

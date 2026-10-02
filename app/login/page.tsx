@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { BrandLogo } from "@/components/brand";
 
 interface Me {
   mode: "local" | "server";
@@ -74,8 +75,8 @@ export default function Login() {
         onSubmit={submit}
         style={{ width: "100%", maxWidth: 380, display: "grid", gap: 12, padding: 24, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: "var(--radius)", boxShadow: "var(--shadow)" }}
       >
+        <h1 style={{ margin: "4px 0 2px" }}><BrandLogo className="login-logo brand-glow" /></h1>
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
-          <h1 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>Swarm</h1>
           <span style={{ color: "var(--muted)", fontSize: 13 }}>{title}</span>
         </div>
         {me?.needsAdmin ? (

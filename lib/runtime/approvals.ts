@@ -25,23 +25,36 @@ const DESTRUCTIVE = [
   { re: /\brm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i, why: "deletes files recursively" },
   { re: /\brm\s+-[a-z]*f/i, why: "force-deletes files" },
   { re: /\bgit\s+push\b/i, why: "pushes commits to a remote" },
-  { re: /\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f)/i, why: "discards local work" },
+  { re: /\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f|restore\s+--source)/i, why: "discards local work" },
   { re: /\b(truncate|shred|dd)\b\s/i, why: "overwrites data" },
   { re: /\bmkfs\b|\bformat\b/i, why: "formats a filesystem" },
   { re: /\b(shutdown|reboot|halt|killall|pkill)\b/i, why: "affects the running machine" },
   { re: /\b(DROP|TRUNCATE)\s+TABLE\b/i, why: "destroys database data" },
   { re: /\bsudo\b/i, why: "runs with elevated privileges" },
+  // Recursively loosening or reassigning ownership of a whole tree.
+  { re: /\bch(mod|own)\s+-R\b/i, why: "recursively changes permissions or ownership" },
+  // Scheduling or editing system state. `systemctl status|list|show|is-active` is read-only and stays safe.
+  { re: /\bcrontab\b/i, why: "changes scheduled jobs" },
+  { re: /\bsystemctl\s+(start|stop|restart|reload|enable|disable|mask|unmask|daemon-reload)\b/i, why: "changes system services" },
+  // Infrastructure teardown.
+  { re: /\bterraform\s+(apply|destroy)\b/i, why: "changes real infrastructure" },
+  { re: /\b(docker|podman)\s+(rm|rmi|volume\s+rm|system\s+prune)\b/i, why: "removes containers, images or volumes" },
 ];
 
 // Reaching the network, spending money, or publishing. Outward actions are usually what the user
 // wants a say in when they did not explicitly ask for it.
 const OUTWARD = [
   { re: /\b(curl|wget)\b[^|;&]*\|\s*(ba)?sh\b/i, why: "pipes a download straight into a shell" },
+  // A raw HTTP write from the shell: reads are fine, but POST/PUT/PATCH/DELETE or a request body can
+  // change someone's data or spend money. -X GET and plain GETs stay ungated.
+  { re: /\bcurl\b[^|;&]*(-X|--request)\s*(POST|PUT|PATCH|DELETE)\b/i, why: "sends a write request to a service" },
+  { re: /\bcurl\b[^|;&]*(\s-d\s|\s--data\b|\s-F\s|\s--form\b|\s-T\s|\s--upload-file\b)/i, why: "uploads data to a service" },
   { re: /\b(gh|git)\s+(pr|release|issue)\s+create\b/i, why: "publishes to GitHub" },
   { re: /\bnpm\s+publish\b/i, why: "publishes a package" },
   { re: /\bdocker\s+push\b/i, why: "pushes an image to a registry" },
-  { re: /\baws\s+.*\b(create|delete|put|terminate)\b/i, why: "changes cloud resources" },
+  { re: /\b(aws|gcloud|az)\s+.*\b(create|delete|put|update|terminate|deploy|set)\b/i, why: "changes cloud resources" },
   { re: /\b(kubectl|helm)\s+(apply|delete|upgrade|rollout)\b/i, why: "changes cluster state" },
+  { re: /\b(vercel|netlify|fly|flyctl)\s+(deploy|--prod)\b/i, why: "deploys a site or app" },
 ];
 
 /**

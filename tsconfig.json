@@ -33,15 +33,17 @@
     "**/*.ts",
     "**/*.tsx",
     ".next-atlas/types/**/*.ts",
+    ".next-brand/types/**/*.ts",
     ".next-coordinator/types/**/*.ts",
     ".next-dev/types/**/*.ts",
     ".next-e2e/types/**/*.ts",
     ".next-g2/types/**/*.ts",
     ".next-grok/types/**/*.ts",
     ".next-smoke/types/**/*.ts",
+    ".next-visual/types/**/*.ts",
     ".next/types/**/*.ts",
     "next-env.d.ts",
-    ".next-visual/types/**/*.ts"
+    ".next-cline/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

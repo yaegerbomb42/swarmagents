@@ -4,3 +4,5 @@ next-env.d.ts
 *.tsbuildinfo
 .DS_Store
 .next-*
+# BRAND: original artwork; derived assets live in public/brand
+brand-src/

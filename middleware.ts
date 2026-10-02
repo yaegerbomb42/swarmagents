@@ -39,4 +39,4 @@ export function middleware(req: NextRequest) {
 
 // Everything except static assets. Uploads bypass middleware (it buffers bodies with a size cap) and call
 // isLocal themselves. Node runtime: sessions are looked up in SQLite and hashed with node:crypto, synchronously.
-export const config = { matcher: ["/((?!_next/static|_next/image|favicon|api/upload).*)"], runtime: "nodejs" };
+export const config = { matcher: ["/((?!_next/static|_next/image|favicon|icon.png|apple-icon.png|manifest.webmanifest|brand/|api/upload).*)"], runtime: "nodejs" };

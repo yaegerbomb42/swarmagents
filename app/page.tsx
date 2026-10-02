@@ -6,6 +6,7 @@ import { Composer } from "@/components/Composer";
 import { Settings } from "@/components/Settings";
 import { Activity } from "@/components/Activity";
 import { IActivity, IPlus, ISettings, ISidebar, IX } from "@/components/icons";
+import { BrandMark, BrandWordmark } from "@/components/brand";
 import { canonicalHostSwap } from "@/lib/canonical";
 
 export default function Home() {
@@ -157,7 +158,7 @@ export default function Home() {
     <div className="app">
       <aside className={`sidebar${sidebar ? "" : " closed"}`}>
         <div className="side-head">
-          <span className="brand">Swarm</span>
+          <span className="brand brand-lockup"><BrandWordmark height={20} /></span>
           <button className="icon-btn" title="New task (⌘K)" onClick={() => setActive(null)}>
             <IPlus />
           </button>
@@ -197,6 +198,7 @@ export default function Home() {
           <button className="icon-btn" onClick={() => setSidebar(!sidebar)} title="Toggle sidebar">
             <ISidebar />
           </button>
+          <BrandMark size={18} className="topbar-mark" label="SwarmAgents" />
           {title && <span className="title" title={title}>{title}</span>}
           {active && (
             <div className={`task-status${running ? " is-running" : ""}`} aria-live="polite">
@@ -218,6 +220,7 @@ export default function Home() {
           {!visible.length ? (
             <div className="empty">
               <div>
+                <BrandMark size={64} className="empty-mark brand-glow" />
                 <h1>What should we get done?</h1>
                 <p>Shell, files, browser, web and your connectors. Every step shows here as it happens.</p>
               </div>

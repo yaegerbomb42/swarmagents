@@ -34,6 +34,7 @@
     "**/*.tsx",
     ".next-atlas/types/**/*.ts",
     ".next-brand/types/**/*.ts",
+    ".next-cline/types/**/*.ts",
     ".next-coordinator/types/**/*.ts",
     ".next-dev/types/**/*.ts",
     ".next-e2e/types/**/*.ts",
@@ -43,7 +44,7 @@
     ".next-visual/types/**/*.ts",
     ".next/types/**/*.ts",
     "next-env.d.ts",
-    ".next-cline/types/**/*.ts"
+    ".next-browser-sec/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

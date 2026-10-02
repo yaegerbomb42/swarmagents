@@ -11,16 +11,21 @@ export const dynamic = "force-dynamic";
 // owner of a task can watch or drive its browser. Input is accepted only while the user holds
 // control ("take over"), never while the agent is driving.
 
+/** Session ids are 16 hex chars (lib/store). Validate before touching the store so a bogus id is a
+ *  clean 404 rather than a thrown "bad session id". */
+const SESSION_ID = /^[a-f0-9]{16}$/;
+
 /** The user may only act on a task they own. */
 function ownedBy(sid: string) {
-  return !!sid && !!session(sid);
+  return SESSION_ID.test(sid) && !!session(sid);
 }
 
 async function getHandler(req: Request) {
   const url = new URL(req.url);
-  const sid = url.searchParams.get("session");
+  const sid = url.searchParams.get("session") ?? "";
   const rt = browserRuntime();
-  if (sid) {
+  // A `session` param that is present must be valid; omitting it asks for the grid listing.
+  if (url.searchParams.has("session")) {
     if (!ownedBy(sid)) return Response.json({ error: "No such task." }, { status: 404 });
     const s = rt.get(sid);
     return Response.json({ status: s ? s.status() : { key: sid, live: false }, replay: s ? rt.replay(sid).length : 0 });

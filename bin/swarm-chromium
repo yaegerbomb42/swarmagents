@@ -1,0 +1,10 @@
+#!/bin/sh
+# Launch Chromium as a per-user uid on the multi-user server (see lib/sandbox.ts chromiumLaunch).
+# The server, running as root with CAP_SETUID/SETGID, executes this; it drops to the account's uid with no
+# groups, no capabilities and no-new-privs before the browser starts. It refuses to run without a uid.
+[ -n "$SWARM_RUN_UID" ] || { echo "swarm-chromium: SWARM_RUN_UID is required" >&2; exit 1; }
+case "$SWARM_RUN_UID" in *[!0-9]*) echo "swarm-chromium: bad uid" >&2; exit 1 ;; esac
+[ "$SWARM_RUN_UID" -ge 20000 ] || { echo "swarm-chromium: uid must be a sandbox uid" >&2; exit 1; }
+real="${SWARM_CHROME_REAL:-/usr/bin/chromium}"
+exec /usr/bin/setpriv --reuid="$SWARM_RUN_UID" --regid="$SWARM_RUN_UID" --clear-groups --no-new-privs --inh-caps=-all -- \
+  /usr/bin/env -u SWARM_RUN_UID -u SWARM_CHROME_REAL "$real" "$@"

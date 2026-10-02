@@ -1,3 +1,4 @@
+import { scoped } from "@/lib/auth";
 import {
   addStep,
   cancelTask,
@@ -21,7 +22,7 @@ export const dynamic = "force-dynamic";
 type Ctx = { params: Promise<{ id: string }> };
 
 /** Full detail for one task: task record, ledger (runs+steps) and artifacts. */
-export async function GET(_req: Request, { params }: Ctx) {
+export const GET = scoped(async (_req: Request, { params }: Ctx) => {
   const id = (await params).id;
   const task = getTask(id);
   if (!task) return new Response("not found", { status: 404 });
@@ -31,13 +32,13 @@ export async function GET(_req: Request, { params }: Ctx) {
     ledger,
     artifacts: listArtifacts(id),
   });
-}
+});
 
 /**
  * Actions on a task. Kept as explicit verbs rather than a generic PATCH so the intent is
  * obvious and the state machine stays in one place.
  */
-export async function POST(req: Request, { params }: Ctx) {
+export const POST = scoped(async (req: Request, { params }: Ctx) => {
   const id = (await params).id;
   const task = getTask(id);
   if (!task) return new Response("not found", { status: 404 });
@@ -134,12 +135,12 @@ export async function POST(req: Request, { params }: Ctx) {
     default:
       return Response.json({ error: "unknown action" }, { status: 400 });
   }
-}
+});
 
-export async function DELETE(_req: Request, { params }: Ctx) {
+export const DELETE = scoped(async (_req: Request, { params }: Ctx) => {
   const id = (await params).id;
   const ok = await deleteTask(id, true);
   clearApprovals(id);
   clearDenials(id);
   return Response.json({ ok });
-}
+});

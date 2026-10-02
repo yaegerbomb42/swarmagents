@@ -60,7 +60,28 @@ function db(): DatabaseSync {
       used_at INTEGER
     );
   `);
+  // Each account gets its own OS uid for sandboxed tool processes. Assigned once and never reused, so a new account
+  // can never inherit files a deleted one left behind.
+  if (!(d.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = 'os_uid'").get())) d.exec("ALTER TABLE users ADD COLUMN os_uid INTEGER");
+  d.exec("CREATE UNIQUE INDEX IF NOT EXISTS users_os_uid ON users(os_uid)");
+  d.exec("CREATE TABLE IF NOT EXISTS uid_counter (id INTEGER PRIMARY KEY CHECK (id = 1), next INTEGER NOT NULL)");
+  d.exec("INSERT OR IGNORE INTO uid_counter (id, next) VALUES (1, 20000)");
+  for (const r of d.prepare("SELECT id FROM users WHERE os_uid IS NULL").all() as { id: string }[]) assignUid(d, r.id);
   return (g.__swarmAuthDb = d);
+}
+
+function assignUid(d: DatabaseSync, userId: string) {
+  const { next } = d.prepare("UPDATE uid_counter SET next = next + 1 WHERE id = 1 RETURNING next - 1 AS next").get() as { next: number };
+  d.prepare("UPDATE users SET os_uid = ? WHERE id = ?").run(next, userId);
+  return next;
+}
+
+/** The OS uid (and gid) a user's tool processes run as. */
+export function osUid(userId: string): number {
+  const d = db();
+  const row = d.prepare("SELECT os_uid FROM users WHERE id = ?").get(userId) as { os_uid: number | null } | undefined;
+  if (!row) throw new Error("unknown user");
+  return row.os_uid ?? assignUid(d, userId);
 }
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -98,7 +119,9 @@ export function validateCredentials(username: string, password: string): string 
 export function createUser(username: string, password: string, isAdmin = false): User {
   const id = randomBytes(8).toString("hex");
   const now = Date.now();
-  db().prepare("INSERT INTO users (id, username, pw_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)").run(id, username, hashPassword(password), isAdmin ? 1 : 0, now);
+  const d = db();
+  d.prepare("INSERT INTO users (id, username, pw_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)").run(id, username, hashPassword(password), isAdmin ? 1 : 0, now);
+  assignUid(d, id);
   return { id, username, isAdmin, createdAt: now };
 }
 

@@ -2,15 +2,24 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
-import { HOME } from "../store";
+import { spawnSync, type SpawnSyncOptionsWithBufferEncoding, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
+import { userHome } from "../store";
 import { clip, type Tool } from "./types";
+import { assertInsideHome, defaultCwd, giveCreated, sandboxCommand } from "../sandbox";
 
-export const resolvePath = (p: string, cwd: string) => path.resolve(cwd, String(p).replace(/^~(?=$|\/)/, os.homedir()));
+// per-user sandbox: these tools run inside the server process, so on a server every path is confined to the
+// user's workspace/uploads (symlinks resolved), "~" means that workspace, and helpers run as the user's uid.
+export const resolvePath = (p: string, cwd: string) => assertInsideHome(path.resolve(cwd, String(p).replace(/^~(?=$|\/)/, defaultCwd(os.homedir()))));
+function runSync(cmd: string, args: string[], opts: SpawnSyncOptionsWithStringEncoding): SpawnSyncReturns<string>;
+function runSync(cmd: string, args: string[], opts?: SpawnSyncOptionsWithBufferEncoding): SpawnSyncReturns<Buffer>;
+function runSync(cmd: string, args: string[], opts: SpawnSyncOptionsWithStringEncoding | SpawnSyncOptionsWithBufferEncoding = {}): SpawnSyncReturns<string | Buffer> {
+  const sb = sandboxCommand(cmd, args);
+  return spawnSync(sb.command, sb.args, opts);
+}
 
 /** Checkpoints: full-file snapshots taken before every write/edit, stored per session. */
 const checkpointsDir = (sessionId: string) => {
-  const d = path.join(HOME, "checkpoints", sessionId);
+  const d = path.join(userHome(), "checkpoints", sessionId);
   fs.mkdirSync(d, { recursive: true, mode: 0o700 });
   return d;
 };
@@ -34,7 +43,7 @@ function checkpointMeta(bak: string): { path: string; at: number } | null {
 }
 
 function listSnapshots(sessionId: string): { bak: string; bytes: number; at: number }[] {
-  const d = path.join(HOME, "checkpoints", sessionId);
+  const d = path.join(userHome(), "checkpoints", sessionId);
   let names: string[] = [];
   try {
     names = fs.readdirSync(d);
@@ -102,7 +111,7 @@ export function gcCheckpoints(sessionId: string): number {
 /** Remove every snapshot for a session (called on session delete). */
 export function clearCheckpoints(sessionId: string) {
   try {
-    fs.rmSync(path.join(HOME, "checkpoints", sessionId), { recursive: true, force: true });
+    fs.rmSync(path.join(userHome(), "checkpoints", sessionId), { recursive: true, force: true });
   } catch {}
 }
 
@@ -143,8 +152,10 @@ export function restoreCheckpoint(sessionId: string, checkpointId: string): { ok
   try {
     const { path: absPath } = JSON.parse(fs.readFileSync(meta, "utf8")) as { path: string };
     if (typeof absPath !== "string" || !path.isAbsolute(absPath)) return { ok: false, message: "Checkpoint record is invalid; refusing to restore." };
-    fs.mkdirSync(path.dirname(absPath), { recursive: true });
+    assertInsideHome(absPath);
+    const made = fs.mkdirSync(path.dirname(absPath), { recursive: true });
     fs.copyFileSync(bak, absPath);
+    giveCreated(absPath, made);
     return { ok: true, message: `Restored ${absPath} from checkpoint ${checkpointId}.` };
   } catch (e) {
     return { ok: false, message: `Restore failed: ${(e as Error).message}` };
@@ -185,8 +196,8 @@ export const readFile: Tool = {
       // macOS ships textutil (docs) and mdimport/strings; pdftotext if the user has poppler.
       const r =
         ext === ".pdf"
-          ? spawnSync("/bin/zsh", ["-lc", `pdftotext -layout ${JSON.stringify(f)} - 2>/dev/null || python3 -c "import sys;from pypdf import PdfReader;print('\\n'.join(p.extract_text() or '' for p in PdfReader(sys.argv[1]).pages))" ${JSON.stringify(f)} 2>/dev/null || mdls -raw -name kMDItemTextContent ${JSON.stringify(f)}`], { maxBuffer: 1 << 30 })
-          : spawnSync("textutil", ["-convert", "txt", "-stdout", f], { maxBuffer: 1 << 30 });
+          ? runSync("/bin/zsh", ["-lc", `pdftotext -layout ${JSON.stringify(f)} - 2>/dev/null || python3 -c "import sys;from pypdf import PdfReader;print('\\n'.join(p.extract_text() or '' for p in PdfReader(sys.argv[1]).pages))" ${JSON.stringify(f)} 2>/dev/null || mdls -raw -name kMDItemTextContent ${JSON.stringify(f)}`], { maxBuffer: 1 << 30 })
+          : runSync("textutil", ["-convert", "txt", "-stdout", f], { maxBuffer: 1 << 30 });
       text = r.stdout?.toString() ?? "";
       if (!text.trim()) return { content: `Could not extract text from ${f}. Try the bash tool (e.g. pip install pypdf / brew install poppler).`, isError: true };
     } else {
@@ -196,15 +207,15 @@ export const readFile: Tool = {
       fs.readSync(fd, head, 0, head.length, 0);
       if (isBinary(head)) {
         fs.closeSync(fd);
-        const r = spawnSync("file", ["-b", f]);
+        const r = runSync("file", ["-b", f]);
         return { content: `Binary file ${f} (${st.size} bytes): ${r.stdout?.toString().trim()}. Use bash (xxd, strings, unzip, sqlite3, …) to inspect.` };
       }
       fs.closeSync(fd);
       if (st.size > 50_000_000) {
         const offset = Math.max(1, Number(input.offset ?? 1));
         const limit = Number(input.limit ?? 2000);
-        const r = spawnSync("sed", ["-n", `${offset},${offset + limit - 1}p`, f], { maxBuffer: 1 << 28 });
-        const total = spawnSync("wc", ["-l", f]).stdout.toString().trim().split(/\s+/)[0];
+        const r = runSync("sed", ["-n", `${offset},${offset + limit - 1}p`, f], { maxBuffer: 1 << 28 });
+        const total = runSync("wc", ["-l", f]).stdout.toString().trim().split(/\s+/)[0];
         return { content: clip(number(r.stdout.toString().split("\n"), offset) + `\n[lines ${offset}-${offset + limit - 1} of ${total}]`, 60_000) };
       }
       text = fs.readFileSync(f, "utf8");
@@ -231,7 +242,7 @@ export const writeFile: Tool = {
   },
   async run(input, ctx) {
     const f = resolvePath(String(input.path), ctx.cwd);
-    fs.mkdirSync(path.dirname(f), { recursive: true });
+    const madeDir = fs.mkdirSync(path.dirname(f), { recursive: true });
     const existed = fs.existsSync(f);
     let before = "";
     if (existed) {
@@ -244,6 +255,8 @@ export const writeFile: Tool = {
     }
     const cp = snapshotFile(ctx.sessionId, f);
     fs.writeFileSync(f, String(input.content ?? ""));
+    // per-user sandbox: a file the server created belongs to the user, so their own shell can edit it later.
+    if (!existed) giveCreated(f, madeDir);
     const lines = String(input.content ?? "").split("\n").length;
     const head = [`${existed ? "Overwrote" : "Created"} ${f} (${lines} lines)`];
     if (cp) head.push(checkpointMarker(cp, f));
@@ -327,7 +340,7 @@ export const grep: Tool = {
       args.push("-e", pattern);
     }
     args.push(dir);
-    const r = spawnSync("rg", args, { maxBuffer: 1 << 28, encoding: "utf8" });
+    const r = runSync("rg", args, { maxBuffer: 1 << 28, encoding: "utf8" });
     const out = (r.stdout || "").trim();
     if (!out) return { content: r.stderr?.trim() || "No matches." };
     const lines = out.split("\n");

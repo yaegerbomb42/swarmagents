@@ -1,18 +1,19 @@
 // Durable storage for the runtime control plane.
 //
-// Layout under $SWARM_HOME (default ~/.swarmagents):
+// Layout under the current user's home (userHome()/runtime):
 //   runtime/tasks.json     - the task index (all tasks, small records)
 //   runtime/ledger/<id>.json  - per-task run + step history, kept out of the hot file
 //   runtime/artifacts.json - artifact index (payloads live where the agent wrote them)
 //   runtime/settings.json  - runtime settings
 //
-// Writes are atomic (tmp + rename) and use a per-process queue so concurrent async
+// Writes are atomic (tmp + rename) and use a per-file queue so concurrent async
 // callers never interleave. Reads are tolerant: a corrupt file degrades to a default
-// rather than taking the whole runtime down.
+// rather than taking the whole runtime down. Every path resolves per user on each call,
+// so on a server no account can see another's tasks, ledger, artifacts or approvals.
 
 import fs from "node:fs";
 import path from "node:path";
-import { HOME, newId } from "../store";
+import { newId, userHome } from "../store";
 import {
   DEFAULT_RUNTIME_SETTINGS,
   type Artifact,
@@ -22,13 +23,16 @@ import {
   type Task,
 } from "./types";
 
-export const RUNTIME_DIR = path.join(HOME, "runtime");
-const LEDGER_DIR = path.join(RUNTIME_DIR, "ledger");
-const TASKS_FILE = path.join(RUNTIME_DIR, "tasks.json");
-const ARTIFACTS_FILE = path.join(RUNTIME_DIR, "artifacts.json");
-const SETTINGS_FILE = path.join(RUNTIME_DIR, "settings.json");
-
-fs.mkdirSync(LEDGER_DIR, { recursive: true, mode: 0o700 });
+// Paths resolve against the current user's home on every call, never at module load: on a server
+// every account must see only its own tasks, ledger, artifacts and approvals. Each helper is
+// called inside a runAs()/scoped() context, so userHome() is that user's directory.
+export const runtimeDir = () => path.join(userHome(), "runtime");
+const ledgerDir = () => path.join(runtimeDir(), "ledger");
+const tasksFile = () => path.join(runtimeDir(), "tasks.json");
+const artifactsFile = () => path.join(runtimeDir(), "artifacts.json");
+const settingsFile = () => path.join(runtimeDir(), "settings.json");
+const approvalsFile = () => path.join(runtimeDir(), "approvals.json");
+const denialsFile = () => path.join(runtimeDir(), "denials.json");
 
 export const rtId = () => newId();
 
@@ -52,6 +56,7 @@ function writeJson(file: string, data: unknown, mode = 0o600): Promise<void> {
   const next = prev
     .catch(() => {})
     .then(() => {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
       const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode });
       fs.renameSync(tmp, file);
@@ -68,12 +73,12 @@ export function flushWrites(): Promise<void> {
 // ---- Tasks ----
 
 export function loadTasks(): Task[] {
-  const tasks = readJson<Task[]>(TASKS_FILE, []);
+  const tasks = readJson<Task[]>(tasksFile(), []);
   return Array.isArray(tasks) ? tasks : [];
 }
 
 export function saveTasks(tasks: Task[]): Promise<void> {
-  return writeJson(TASKS_FILE, tasks);
+  return writeJson(tasksFile(), tasks);
 }
 
 /** A tiny in-process mutex around read-modify-write on the task index. The mutation is
@@ -102,7 +107,7 @@ export interface Ledger {
   steps: StepRecord[];
 }
 
-const ledgerFile = (taskId: string) => path.join(LEDGER_DIR, `${taskId}.json`);
+const ledgerFile = (taskId: string) => path.join(ledgerDir(), `${taskId}.json`);
 
 export function loadLedger(taskId: string): Ledger {
   const l = readJson<Ledger>(ledgerFile(taskId), { runs: [], steps: [] });
@@ -117,11 +122,13 @@ export function deleteLedger(taskId: string): void {
   fs.rmSync(ledgerFile(taskId), { force: true });
 }
 
-// Per-task ledger mutex: read-modify-write with the write awaited, so concurrent turn/tool
+// Per-task ledger mutex keyed by the resolved file path, so identical task ids under different
+// accounts never share a lock. Read-modify-write with the write awaited, so concurrent turn/tool
 // recordings never lose each other and a caller that awaited can trust the record exists.
 const ledgerLocks = new Map<string, Promise<unknown>>();
 export function withLedger<T>(taskId: string, fn: (ledger: Ledger) => T | Promise<T>): Promise<T> {
-  const prev = ledgerLocks.get(taskId) ?? Promise.resolve();
+  const file = ledgerFile(taskId);
+  const prev = ledgerLocks.get(file) ?? Promise.resolve();
   const run = prev.then(async () => {
     const ledger = loadLedger(taskId);
     const result = await fn(ledger);
@@ -129,7 +136,7 @@ export function withLedger<T>(taskId: string, fn: (ledger: Ledger) => T | Promis
     return result;
   });
   ledgerLocks.set(
-    taskId,
+    file,
     run.then(
       () => undefined,
       () => undefined,
@@ -141,25 +148,31 @@ export function withLedger<T>(taskId: string, fn: (ledger: Ledger) => T | Promis
 // ---- Artifacts ----
 
 export function loadArtifacts(): Artifact[] {
-  const a = readJson<Artifact[]>(ARTIFACTS_FILE, []);
+  const a = readJson<Artifact[]>(artifactsFile(), []);
   return Array.isArray(a) ? a : [];
 }
 
 export function saveArtifacts(artifacts: Artifact[]): Promise<void> {
-  return writeJson(ARTIFACTS_FILE, artifacts);
+  return writeJson(artifactsFile(), artifacts);
 }
 
-let artifactLock: Promise<unknown> = Promise.resolve();
+// Per-file artifact lock: each user serializes only their own artifacts.json.
+const artifactLocks = new Map<string, Promise<unknown>>();
 export function withArtifacts<T>(fn: (artifacts: Artifact[]) => T | Promise<T>): Promise<T> {
-  const run = artifactLock.then(async () => {
+  const file = artifactsFile();
+  const prev = artifactLocks.get(file) ?? Promise.resolve();
+  const run = prev.then(async () => {
     const artifacts = loadArtifacts();
     const result = await fn(artifacts);
     await saveArtifacts(artifacts);
     return result;
   });
-  artifactLock = run.then(
-    () => undefined,
-    () => undefined,
+  artifactLocks.set(
+    file,
+    run.then(
+      () => undefined,
+      () => undefined,
+    ),
   );
   return run;
 }
@@ -167,19 +180,17 @@ export function withArtifacts<T>(fn: (artifacts: Artifact[]) => T | Promise<T>):
 // ---- Settings ----
 
 export function loadRuntimeSettings(): RuntimeSettings {
-  return { ...DEFAULT_RUNTIME_SETTINGS, ...readJson<Partial<RuntimeSettings>>(SETTINGS_FILE, {}) };
+  return { ...DEFAULT_RUNTIME_SETTINGS, ...readJson<Partial<RuntimeSettings>>(settingsFile(), {}) };
 }
 
 export function saveRuntimeSettings(s: RuntimeSettings): void {
-  writeJson(SETTINGS_FILE, s);
+  writeJson(settingsFile(), s);
 }
 
 // ---- Action approvals ----
 //
 // A grant lets one specific already-classified action run without asking again. It is bound to the
 // action hash, is single-use, and expires, so a stale approval cannot authorise a different command.
-
-const APPROVALS_FILE = path.join(RUNTIME_DIR, "approvals.json");
 
 /**
  * How long an approval stays valid. A resume normally consumes the grant within seconds; the window
@@ -203,9 +214,17 @@ function approvalsKey(taskId: string, hash: string): string {
 
 // Grants/denials are read-modify-written synchronously (takeApproval must be single-use even when it
 // is called without awaiting a flush), so the map is the source of truth and writes only persist it.
-let approvalsCache: Record<string, ApprovalGrant> | null = null;
+// One cache per file: on a server each account has its own approvals.json, so we must not share a
+// single in-memory map across users.
+const approvalsCache = new Map<string, Record<string, ApprovalGrant>>();
 function approvals(): Record<string, ApprovalGrant> {
-  return (approvalsCache ??= readJson<Record<string, ApprovalGrant>>(APPROVALS_FILE, {}));
+  const file = approvalsFile();
+  let cache = approvalsCache.get(file);
+  if (!cache) {
+    cache = readJson<Record<string, ApprovalGrant>>(file, {});
+    approvalsCache.set(file, cache);
+  }
+  return cache;
 }
 
 export function loadApprovals(): Record<string, ApprovalGrant> {
@@ -215,7 +234,7 @@ export function loadApprovals(): Record<string, ApprovalGrant> {
 /** Record a single-use approval for an exact action. */
 export function grantApproval(g: ApprovalGrant): Promise<void> {
   approvals()[approvalsKey(g.taskId, g.hash)] = g;
-  return writeJson(APPROVALS_FILE, approvals());
+  return writeJson(approvalsFile(), approvals());
 }
 
 /** Consume an approval if one exists for this action and has not expired. Returns the grant, or null. */
@@ -225,7 +244,7 @@ export function takeApproval(taskId: string, hash: string): ApprovalGrant | null
   const g = all[key];
   if (!g) return null;
   delete all[key];
-  void writeJson(APPROVALS_FILE, all);
+  void writeJson(approvalsFile(), all);
   // Consumed either way (single-use). An expired grant returns null so the caller re-parks and asks
   // again: the safe default when the user is no longer watching.
   if (Date.now() - g.grantedAt > APPROVAL_TTL_MS) return null;
@@ -242,7 +261,7 @@ export function clearApprovals(taskId: string): void {
       changed = true;
     }
   }
-  if (changed) void writeJson(APPROVALS_FILE, all);
+  if (changed) void writeJson(approvalsFile(), all);
 }
 
 // ---- Action denials ----
@@ -250,8 +269,6 @@ export function clearApprovals(taskId: string): void {
 // A denial is durable for the life of the task: it tells the agent "the user said no to this exact
 // action, do not ask again or find a way around it". Without it, a resumed run would simply re-propose
 // the same call and block again forever.
-
-const DENIALS_FILE = path.join(RUNTIME_DIR, "denials.json");
 
 export interface DenialRecord {
   taskId: string;
@@ -265,14 +282,20 @@ function denialsKey(taskId: string, hash: string): string {
   return `${taskId}:${hash}`;
 }
 
-let denialsCache: Record<string, DenialRecord> | null = null;
+const denialsCache = new Map<string, Record<string, DenialRecord>>();
 function denials(): Record<string, DenialRecord> {
-  return (denialsCache ??= readJson<Record<string, DenialRecord>>(DENIALS_FILE, {}));
+  const file = denialsFile();
+  let cache = denialsCache.get(file);
+  if (!cache) {
+    cache = readJson<Record<string, DenialRecord>>(file, {});
+    denialsCache.set(file, cache);
+  }
+  return cache;
 }
 
 export function recordDenial(d: DenialRecord): Promise<void> {
   denials()[denialsKey(d.taskId, d.hash)] = d;
-  return writeJson(DENIALS_FILE, denials());
+  return writeJson(denialsFile(), denials());
 }
 
 export function isDenied(taskId: string, hash: string): boolean {
@@ -288,5 +311,5 @@ export function clearDenials(taskId: string): void {
       changed = true;
     }
   }
-  if (changed) void writeJson(DENIALS_FILE, all);
+  if (changed) void writeJson(denialsFile(), all);
 }

@@ -242,7 +242,7 @@ check("blocked approval task is NOT auto-resumed by reconcile (autoResume on)", 
 check("approval token survives the restart", afterRestart9?.wait?.token === "hash-rm-build", afterRestart9?.wait?.token);
 // Mirror /api/runtime/tasks/[id] approve: grant the exact action, then resume.
 await rt.grantApproval({ taskId: t9.id, hash: "hash-rm-build", tool: "bash", label: "rm -rf build", grantedAt: Date.now() });
-const grantsOnDisk = JSON.parse(fs.readFileSync(path.join(rt.RUNTIME_DIR, "approvals.json"), "utf8"));
+const grantsOnDisk = JSON.parse(fs.readFileSync(path.join(rt.runtimeDir(), "approvals.json"), "utf8"));
 check("grant is persisted to disk (survives a real restart)", grantsOnDisk[`${t9.id}:hash-rm-build`]?.hash === "hash-rm-build");
 const consumed9 = rt.takeApproval(t9.id, "hash-rm-build");
 check("grant is consumable after restart", consumed9?.hash === "hash-rm-build", consumed9?.tool);

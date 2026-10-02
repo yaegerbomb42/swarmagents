@@ -28,10 +28,12 @@ const check = (name, cond, extra = "") => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Local-mode requests: 127.0.0.1 with no Origin resolves to the single local user (lib/auth).
-const api = (p) => new Request(`http://127.0.0.1:3781${p}`, { headers: { Accept: "text/event-stream" } });
+// Local-mode requests: 127.0.0.1 with no Origin resolves to the single local user (lib/auth). A
+// manually built Request carries no Host header (fetch adds it at send time), so set it explicitly.
+const HOST = { host: "127.0.0.1:3781" };
+const api = (p) => new Request(`http://127.0.0.1:3781${p}`, { headers: { ...HOST, Accept: "text/event-stream" } });
 const post = (p, body) =>
-  new Request(`http://127.0.0.1:3781${p}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  new Request(`http://127.0.0.1:3781${p}`, { method: "POST", headers: { ...HOST, "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 const site = await startSite();
 const rt = browserRuntime();

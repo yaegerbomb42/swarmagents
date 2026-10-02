@@ -1,0 +1,7 @@
+#!/bin/sh
+# Playwright executablePath wrapper: start Chromium as the per-user sandbox uid (SWARM_SANDBOX_UID, set by
+# lib/sandbox.ts sandboxBrowserEnv). Address space uncapped (V8/Chromium reserve huge virtual ranges); the
+# container cgroup bounds real memory.
+set -eu
+[ -n "${SWARM_SANDBOX_UID:-}" ] || { echo "chromium-as: SWARM_SANDBOX_UID not set" >&2; exit 126; }
+exec /usr/local/bin/swarm-run "$SWARM_SANDBOX_UID" --mem 0 --nproc 512 --cpu 86400 -- "${SWARM_CHROME_REAL:-/usr/bin/chromium}" "$@"

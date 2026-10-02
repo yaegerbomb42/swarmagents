@@ -1,3 +1,4 @@
+import { scoped } from "@/lib/auth";
 import { bootstrapRuntime, listTasks, progressOf, subscribeRuntime, summarizeUsage, type RuntimeEvent } from "@/lib/runtime";
 
 export const dynamic = "force-dynamic";

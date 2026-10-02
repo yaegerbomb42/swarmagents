@@ -1,3 +1,4 @@
+import { scoped } from "@/lib/auth";
 import { bootstrapRuntime, createTask, listTasks, loadRuntimeSettings, progressOf, scheduler, summarizeUsage } from "@/lib/runtime";
 
 export const dynamic = "force-dynamic";
@@ -7,16 +8,16 @@ export const dynamic = "force-dynamic";
 bootstrapRuntime();
 
 /** Task board: every task with its rolled-up progress and usage. */
-export async function GET() {
+export const GET = scoped(async () => {
   const tasks = listTasks().map((t) => ({
     ...t,
     progress: progressOf(t),
     usageSummary: summarizeUsage(t.usage),
   }));
   return Response.json({ tasks, settings: loadRuntimeSettings() });
-}
+});
 
-export async function POST(req: Request) {
+export const POST = scoped(async (req: Request) => {
   const body = (await req.json().catch(() => ({}))) as {
     prompt?: string;
     title?: string;
@@ -38,4 +39,4 @@ export async function POST(req: Request) {
   });
   scheduler().kick();
   return Response.json({ task });
-}
+});

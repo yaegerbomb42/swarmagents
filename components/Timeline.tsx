@@ -1,9 +1,10 @@
 "use client";
-import { memo, useCallback, useEffect, useState } from "react";
+
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { AgentEvent } from "@/lib/types";
-import { IChevron, IFile } from "./icons";
+import { IChevron, IFile, ICopy, ICheck, IX } from "./icons";
 import { stepIcon, toolAccent } from "./StepIcons";
 import { AnsiRenderer, hasAnsi } from "./AnsiRenderer";
 import { PreviewChip, producedFiles } from "./FilePreview";
@@ -20,7 +21,16 @@ const fmtDur = (ms: number) => (ms < 1000 ? `${ms}ms` : ms < 60000 ? `${(ms / 10
 const Md = memo(function Md({ text, streaming }: { text: string; streaming?: boolean }) {
   return (
     <div className={`md${streaming ? " caret" : ""}`}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: (p) => <a {...p} target="_blank" rel="noreferrer" /> }}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+        a: (p) => <a {...p} target="_blank" rel="noreferrer" />,
+        code: (p) => {
+          const { children, ...props } = p;
+          const inline = !children.includes("\n");
+          if (inline) return <code {...props}>{children}</code>;
+          return <pre><code {...props}>{children}</code></pre>;
+        },
+        pre: (p) => <div className="code-block"><pre {...p} /></div>,
+      }}>
         {text}
       </ReactMarkdown>
     </div>
@@ -29,9 +39,28 @@ const Md = memo(function Md({ text, streaming }: { text: string; streaming?: boo
 
 function Chevron({ open }: { open: boolean }) {
   return (
-    <span style={{ display: "inline-flex", transform: open ? "rotate(90deg)" : "none", transition: "transform .15s" }}>
+    <span style={{ display: "inline-flex", transform: open ? "rotate(90deg)" : "none", transition: "transform 150ms cubic-bezier(0.16, 1, 0.3, 1)" }}>
       <IChevron />
     </span>
+  );
+}
+
+function CopyButton({ text, label = "Copy" }: { text: string; label?: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    await navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+  return (
+    <button
+      className="copy-btn"
+      onClick={copy}
+      aria-label={copied ? "Copied!" : label}
+      title={copied ? "Copied!" : label}
+    >
+      {copied ? <ICheck size={12} /> : <ICopy size={12} />}
+    </button>
   );
 }
 
@@ -64,7 +93,7 @@ function Thinking({ e }: { e: Ev<"thinking"> }) {
         <StepIcon type="thinking" />
         <Chevron open={shown} />
         <span className={live ? "shimmer" : ""}>{live ? "Thinking" : `Thought for ${secs}s`}</span>
-        {live && <span className="dur" style={{ marginLeft: "auto", fontSize: "11.5px", color: "var(--faint)", fontVariantNumeric: "tabular-nums" }}>{fmtDur(now - e.ts)}</span>}
+        {live && <span className="dur" style={{ marginLeft: "auto", fontSize: "11.5px", color: "var(--color-text-faint)", fontVariantNumeric: "tabular-nums" }}>{fmtDur(now - e.ts)}</span>}
       </button>
       {shown && e.text && <div className="body">{e.text}</div>}
     </div>
@@ -92,278 +121,119 @@ function argSummary(name: string, input: Record<string, unknown>, preview?: stri
   const pick = (k: string) => {
     if (input?.[k] != null) return String(input[k]);
     const m = preview?.match(new RegExp(`"${k}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`));
-    return m ? m[1].replace(/\\n/g, " ").replace(/\\"/g, '"') : "";
+    return m ? m[1].replace(/\\n/g, " ").replace(/\\\"/g, '"') : "";
   };
   switch (name) {
-    case "bash":
-      return pick("command");
+    case "bash": return pick("command");
     case "read_file":
     case "write_file":
-    case "edit_file":
-      return pick("path");
-    case "restore_checkpoint":
-      return pick("checkpoint") ? `checkpoint ${pick("checkpoint")}` : "";
-    case "search":
-      return [pick("pattern"), pick("glob"), pick("path")].filter(Boolean).join("  ");
-    case "web_search":
-      return pick("query");
-    case "web_fetch":
-      return pick("url");
+    case "edit_file": return pick("path");
+    case "restore_checkpoint": return pick("checkpoint") ? `checkpoint ${pick("checkpoint")}` : "";
+    case "search": return [pick("pattern"), pick("glob"), pick("path")].filter(Boolean).join("  ");
+    case "web_search": return pick("query");
+    case "web_fetch": return pick("url");
     case "browser": {
       const action = pick("action");
       const url = pick("url");
       const idx = input?.index != null ? `#${input.index}` : "";
       const sel = pick("selector");
-      const text = (pick("text") || pick("key") || pick("value") || "").slice(0, 60);
-      const tab = input?.tab != null ? `tab ${input.tab}` : "";
-      return [action, url || idx || sel || (sel ? "" : text ? `"${text}"` : "") || tab].filter(Boolean).join(" ");
+      const text = (pick("text") || pick("key") || pick("value") || "").slice(0, 40);
+      return [action, url, idx, sel, text].filter(Boolean).join(" → ");
     }
-    case "plan":
-      return "";
-    case "api_request":
-      return [pick("method"), pick("url")].filter(Boolean).join(" ");
-    default: {
-      const first = Object.values(input ?? {}).find((v) => typeof v === "string");
-      return first ? String(first) : preview?.slice(0, 120) ?? "";
-    }
+    case "plan": return "";
+    case "api_request": return pick("method") ? `${pick("method")} ${pick("url")}` : pick("url") ?? "";
+    case "subagent": return pick("task")?.slice(0, 60) ?? "";
+    default: return "";
   }
 }
 
-function toolName(name: string) {
-  if (name.startsWith("mcp__")) {
-    const [, server, tool] = name.split("__");
-    return `${server} · ${tool}`;
-  }
-  return TOOL_LABEL[name] ?? name;
-}
+// ═══════ Tool ═══════
 
-// ═══════ Diff rendering ═══════
-
-function checkpoints(output: string): { id: string; path: string }[] {
-  const out: { id: string; path: string }[] = [];
-  for (const m of output.matchAll(/\[checkpoint ([a-f0-9]+) path=([^\]]+)\]/g)) out.push({ id: m[1], path: m[2] });
-  return out;
-}
-
-function splitDiff(output: string): { head: string; oldText: string; newText: string; tail: string } | null {
-  const lines = output.split("\n");
-  const oldIdx = lines.findIndex((l) => l.trim() === "--- old" || l.startsWith("--- before"));
-  if (oldIdx < 0) return null;
-  const plusIdx = lines.findIndex((l, i) => i > oldIdx && (l.trim() === "+++ new" || l.startsWith("+++ after")));
-  if (plusIdx < 0) return null;
-  return {
-    head: lines.slice(0, oldIdx).filter((l) => !l.startsWith("[checkpoint ")).join("\n").trim(),
-    oldText: lines.slice(oldIdx + 1, plusIdx).join("\n"),
-    newText: lines.slice(plusIdx + 1).join("\n"),
-    tail: "",
-  };
-}
-
-function lineDiff(oldText: string, newText: string): [string, string][] {
-  const a = oldText.split("\n");
-  const b = newText.split("\n");
-  const A = a.slice(0, 400);
-  const B = b.slice(0, 400);
-  const n = A.length;
-  const m = B.length;
-  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
-  for (let i = n - 1; i >= 0; i--)
-    for (let j = m - 1; j >= 0; j--) dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
-  const rows: [string, string][] = [];
-  let i = 0;
-  let j = 0;
-  while (i < n && j < m && rows.length < 300) {
-    if (A[i] === B[j]) { rows.push([" ", A[i].slice(0, 300)]); i++; j++; }
-    else if (dp[i + 1][j] >= dp[i][j + 1]) rows.push(["-", A[i++].slice(0, 300)]);
-    else rows.push(["+", B[j++].slice(0, 300)]);
-  }
-  while (i < n && rows.length < 300) rows.push(["-", A[i++].slice(0, 300)]);
-  while (j < m && rows.length < 300) rows.push(["+", B[j++].slice(0, 300)]);
-  return rows;
-}
-
-function Diff({ oldText, newText }: { oldText: string; newText: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const rows = lineDiff(oldText, newText);
-  const adds = rows.filter((r) => r[0] === "+").length;
-  const dels = rows.filter((r) => r[0] === "-").length;
-  if (adds === 0 && dels === 0) return null;
-  const hidden = !expanded && rows.length > 40;
-  const visible = hidden
-    ? rows.filter(([k], idx) => k !== " " || rows.slice(Math.max(0, idx - 2), idx + 3).some(([k2]) => k2 !== " "))
-    : rows;
-  return (
-    <div className="diff">
-      <button className="diff-toggle" onClick={(e) => (e.stopPropagation(), setExpanded(!expanded))} title={expanded ? "Collapse" : "Show full diff"}>
-        <span className="label">
-          Changes · <span className="add">+{adds}</span> <span className="del">−{dels}</span>
-        </span>
-        {rows.length > 40 && <span className="diff-expand">{expanded ? "Show less" : `Show all ${rows.length} lines`}</span>}
-      </button>
-      <pre className="diff-body">
-        {visible.map(([k, t], idx) => (
-          <div key={idx} className={k === "+" ? "add" : k === "-" ? "del" : "ctx"}>
-            <span className="sign">{k}</span> {t}
-          </div>
-        ))}
-      </pre>
-    </div>
-  );
-}
-
-function UndoButton({ checkpoint, path, session }: { checkpoint: string; path: string; session?: string }) {
-  const [state, setState] = useState<"idle" | "doing" | "done" | "error">("idle");
-  if (state === "done") return <span className="undo done">✓ Restored</span>;
-  return (
-    <button
-      className="undo"
-      disabled={state === "doing"}
-      title={`Restore ${path} to before this edit`}
-      onClick={async (e) => {
-        e.stopPropagation();
-        setState("doing");
-        try {
-          const r = await fetch("/api/checkpoints/restore", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ checkpoint, session }),
-          });
-          setState(r.ok ? "done" : "error");
-          if (!r.ok) setTimeout(() => setState("idle"), 2500);
-        } catch {
-          setState("error");
-          setTimeout(() => setState("idle"), 2500);
-        }
-      }}
-    >
-      {state === "doing" ? "Restoring…" : state === "error" ? "Failed — retry?" : "Undo this edit"}
-    </button>
-  );
-}
-
-// ═══════ Tool Card ═══════
-
-function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (src: string) => void; session?: string }) {
-  const live = e.status === "running" || e.status === "streaming";
-  const [open, setOpen] = useState<boolean | null>(null);
+function Tool({ e, onImage, session }: { e: Ev<"tool">; onImage: (s: string) => void; session?: string }) {
+  const name = e.name;
+  const label = TOOL_LABEL[name] ?? name;
+  const accentClass = toolAccent(name);
+  const live = !e.done;
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
   const now = useNow(live);
-  // Browser steps are the ones a user wants to see unfold, so their window card opens by default.
-  const shown = open ?? (live || e.status === "error" || !!e.images?.length || e.name === "browser");
-  const input = (e.input ?? {}) as Record<string, unknown>;
-  const hasInput = Object.keys(input).length > 0;
-  const inputText = hasInput ? JSON.stringify(input, null, 2) : e.inputPreview || "";
-  const useAnsi = e.name === "bash" && e.output && hasAnsi(e.output);
-  const previewPaths = (() => {
-    if (!e.output) return [];
-    if (e.name === "write_file" || e.name === "edit_file") return typeof input.path === "string" ? [input.path] : [];
-    return producedFiles(e.output).slice(0, 4);
-  })();
-  const accent = toolAccent(e.name);
+  const duration = live ? now - e.ts : (e.endTs ?? now) - e.ts;
+
+  const copyOutput = async () => {
+    const outputText = typeof e.output === "string" ? e.output : JSON.stringify(e.output, null, 2);
+    await navigator.clipboard.writeText(outputText);
+    setCopied("output");
+    setTimeout(() => setCopied(null), 1500);
+  };
+
+  const copyInput = async () => {
+    await navigator.clipboard.writeText(JSON.stringify(e.input, null, 2));
+    setCopied("input");
+    setTimeout(() => setCopied(null), 1500);
+  };
+
+  const isDiff = name === "edit_file" || name === "write_file";
+  const showDiff = isDiff && e.output && typeof e.output === "object" && "diff" in e.output;
 
   return (
-    <div className={`ev ev-virtual tool ${accent}${live ? " is-active" : ""}`}>
-      <button className="head" onClick={() => setOpen(!shown)}>
-        <StepIcon type="tool" name={e.name} />
-        <span className={`status ${e.status}`} />
-        <span className="name">{toolName(e.name)}</span>
-        <span className="arg">{argSummary(e.name, input, e.inputPreview)}</span>
-        <span className="dur">{e.status === "streaming" ? "writing…" : fmtDur((e.endTs ?? now) - e.ts)}</span>
-        <Chevron open={shown} />
+    <div className={`ev ev-virtual tool ${accentClass} ${live ? "is-active" : ""} ${open ? "open" : ""}`}>
+      <button className="head" onClick={() => setOpen(!open)}>
+        <StepIcon type={name} name={name} />
+        <Chevron open={open || live} />
+        <span className="tool-info">
+          <span className="tool-name">{label}</span>
+          <span className="tool-args">{argSummary(name, e.input as Record<string, unknown>, e.output as string)}</span>
+        </span>
+        <span className="tool-meta">
+          {live && <span className="dur">{fmtDur(duration)}</span>}
+          {!live && e.exitCode !== undefined && (
+            <span className={`exit ${e.exitCode === 0 ? "ok" : "err"}`}>
+              {e.exitCode === 0 ? <ICheck size={10} /> : <IX size={10} />} {e.exitCode}
+            </span>
+          )}
+          {open && (
+            <>
+              <CopyButton text={JSON.stringify(e.input, null, 2)} label="Copy input" />
+              {e.output && <CopyButton text={typeof e.output === "string" ? e.output : JSON.stringify(e.output, null, 2)} label="Copy output" />}
+            </>
+          )}
+        </span>
       </button>
-      {shown && (
-        <div className="io">
-          {inputText && e.name !== "bash" && e.name !== "browser" && (
-            <>
-              {labelWithCopy("Input", inputText)}
-              <pre>{inputText}</pre>
-            </>
-          )}
-          {e.name === "bash" && <pre style={{ color: "var(--muted)" }}>$ {argSummary("bash", input, e.inputPreview)}</pre>}
-          {(e.output || e.status === "running") && e.name !== "browser" && (
-            <>
-              {e.output ? labelWithCopy("Output", e.output) : <div className="label">Output</div>}
-              {(() => {
-                const d = e.output ? splitDiff(e.output) : null;
-                const cps = e.output ? checkpoints(e.output) : [];
-                if (!d) {
-                  return (
-                    <pre className={e.status === "error" ? "err" : ""}>
-                      {useAnsi ? <AnsiRenderer text={e.output!} /> : (e.output || "…")}
-                    </pre>
-                  );
-                }
-                return (
-                  <>
-                    {d.head && <pre className="head-pre">{d.head}</pre>}
-                    <Diff oldText={d.oldText} newText={d.newText} />
-                    {!!cps.length && (
-                      <div className="undo-row">
-                        <UndoButton checkpoint={cps[0].id} path={cps[0].path} session={session} />
-                        <span className="undo-hint" title={cps[0].path}>
-                          Restores {cps[0].path.split("/").slice(-2).join("/")}
-                        </span>
-                      </div>
-                    )}
-                  </>
-                );
-              })()}
-            </>
-          )}
-          {/* Browser actions get the browser-window card (address bar, set-of-marks shot, events). */}
-          {e.name === "browser" && (
-            <BrowserView input={input} output={e.output} images={e.images} status={e.status} onImage={onImage} />
-          )}
-          {!!e.images?.length && e.name !== "browser" && (
-            <div className="shots">
-              {e.images.map((im, i) => {
-                const src = `data:${im.mediaType};base64,${im.data}`;
-                return <img key={i} src={src} alt="" onClick={() => onImage(src)} />;
-              })}
+      {(open || live) && (
+        <div className="body">
+          {showDiff && (
+            <div className="diff-view">
+              <DiffView diff={(e.output as any).diff} />
             </div>
           )}
-          {!!session && !!previewPaths.length && (
-            <div className="chips preview-chips">
-              {previewPaths.map((p) => (
-                <PreviewChip key={p} session={session} path={p} />
-              ))}
+          {e.output && !showDiff && (
+            <div className="tool-output">
+              {hasAnsi(e.output as string) ? (
+                <AnsiRenderer text={e.output as string} />
+              ) : (
+                <pre>{typeof e.output === "string" ? e.output : JSON.stringify(e.output, null, 2)}</pre>
+              )}
             </div>
           )}
+          {e.error && <div className="tool-error">{e.error}</div>}
         </div>
       )}
     </div>
   );
 }
 
-// ═══════ Copy Button ═══════
+// ═══════ Diff View ═══════
 
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
+function DiffView({ diff }: { diff: string }) {
+  const lines = diff.split("\n");
   return (
-    <button
-      className="copy-btn"
-      title={copied ? "Copied!" : "Copy output"}
-      onClick={async (e) => {
-        e.stopPropagation();
-        try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {}
-      }}
-    >
-      {copied ? (
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M2 6.5 5 9.5 10 2.5" /></svg>
-      ) : (
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
-          <rect x="4" y="4" width="7" height="7" rx="1.5" />
-          <path d="M8 4V2.5A1.5 1.5 0 0 0 6.5 1H2.5A1.5 1.5 0 0 0 1 2.5v4A1.5 1.5 0 0 0 2.5 8H4" />
-        </svg>
-      )}
-    </button>
-  );
-}
-
-function labelWithCopy(label: string, text: string) {
-  return (
-    <div className="label-row">
-      <span className="label">{label}</span>
-      <CopyButton text={text} />
+    <div className="diff">
+      {lines.map((line, i) => {
+        if (line.startsWith("+")) return <div key={i} className="line add"><span className="marker">+</span>{line.slice(1)}</div>;
+        if (line.startsWith("-")) return <div key={i} className="line remove"><span className="marker">-</span>{line.slice(1)}</div>;
+        if (line.startsWith("@")) return <div key={i} className="line hunk">{line}</div>;
+        return <div key={i} className="line context"><span className="marker"> </span>{line}</div>;
+      })}
     </div>
   );
 }
@@ -381,7 +251,7 @@ function Compaction({ e }: { e: Ev<"compaction"> }) {
         <span className={live ? "shimmer" : ""}>
           {live ? "Compacting context" : `Context compacted · ${fmtK(e.before)} → ${fmtK(e.after)} tokens`}
         </span>
-        <span style={{ marginLeft: "auto", color: "var(--faint)", fontSize: 12 }}>{e.reason}</span>
+        <span style={{ marginLeft: "auto", color: "var(--color-text-faint)", fontSize: "11.5px" }}>{e.reason}</span>
       </button>
       {(open || live) && e.summary && <div className="body">{e.summary}</div>}
     </div>
@@ -396,12 +266,12 @@ export function PlanCard({ e }: { e: Ev<"plan"> }) {
     <div className="ev ev-virtual plan">
       <div className="ttl">
         <StepIcon type="plan" />
-        <span style={{ marginLeft: 6 }}>Plan · {done}/{e.items.length}</span>
+        Plan · {done}/{e.items.length}
       </div>
       <ul>
         {e.items.map((it, i) => (
           <li key={i} className={it.status}>
-            <span className={`box ${it.status}`}>{it.status === "done" && <svg width="8" height="8" viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.5 8.5 2.5" stroke="#fff" strokeWidth="1.8" fill="none" /></svg>}</span>
+            <span className={`box ${it.status}`}>{it.status === "done" && <ICheck size={8} />}</span>
             {it.text}
           </li>
         ))}
@@ -410,57 +280,49 @@ export function PlanCard({ e }: { e: Ev<"plan"> }) {
   );
 }
 
-// ═══════ Step Grouping ═══════
+// ═══════ Grouping ═══════
 
-interface StepGroup {
-  kind: "group";
-  name: string;
-  events: Ev<"tool">[];
-  totalDur: number;
-}
-type TimelineItem = { kind: "single"; event: AgentEvent } | StepGroup;
+function groupEvents(events: AgentEvent[]) {
+  const items: Array<{ kind: "event"; event: AgentEvent } | { kind: "group"; events: AgentEvent[]; totalDur: number }> = [];
+  let currentGroup: AgentEvent[] = [];
+  let groupStart = 0;
 
-/** Group consecutive tool calls of the same name (read_file, read_file, ... → "Read 5 files") */
-function groupEvents(events: AgentEvent[]): TimelineItem[] {
-  const items: TimelineItem[] = [];
-  let i = 0;
-  while (i < events.length) {
-    const e = events[i];
-    // Only group settled (ok) tool calls of the same name, minimum 3
-    if (e.type === "tool" && e.status === "ok") {
-      let j = i + 1;
-      while (j < events.length && events[j].type === "tool" && (events[j] as Ev<"tool">).name === e.name && (events[j] as Ev<"tool">).status === "ok") j++;
-      if (j - i >= 3) {
-        const group = events.slice(i, j) as Ev<"tool">[];
-        const totalDur = group.reduce((sum, g) => sum + ((g.endTs ?? g.ts) - g.ts), 0);
-        items.push({ kind: "group", name: e.name, events: group, totalDur });
-        i = j;
-        continue;
-      }
+  const flushGroup = () => {
+    if (currentGroup.length > 1) {
+      const totalDur = currentGroup.reduce((sum, ev) => sum + (ev.type === "tool" && ev.endTs ? ev.endTs - ev.ts : 0), 0);
+      items.push({ kind: "group", events: currentGroup, totalDur });
+    } else if (currentGroup.length === 1) {
+      items.push({ kind: "event", event: currentGroup[0] });
     }
-    items.push({ kind: "single", event: events[i] });
-    i++;
+    currentGroup = [];
+  };
+
+  for (const e of events) {
+    if (e.type === "tool") {
+      currentGroup.push(e);
+      if (!groupStart) groupStart = e.ts;
+    } else {
+      flushGroup();
+      items.push({ kind: "event", event: e });
+    }
   }
+  flushGroup();
   return items;
 }
 
-function GroupCard({ group, onImage, session }: { group: StepGroup; onImage: (s: string) => void; session?: string }) {
+function GroupCard({ group, onImage, session }: { group: { events: AgentEvent[]; totalDur: number }; onImage: (s: string) => void; session?: string }) {
   const [open, setOpen] = useState(false);
-  const label = toolName(group.name);
-  const count = group.events.length;
-  // Summarize: for file tools, show file count; for bash, show command count
-  const summary = group.name === "read_file" ? `${count} files`
-    : group.name === "bash" ? `${count} commands`
-    : `${count} calls`;
+  const firstTool = group.events[0];
+  const label = TOOL_LABEL[firstTool.name] ?? firstTool.name;
+  const accentClass = toolAccent(firstTool.name);
 
   return (
-    <div className="step-group ev-virtual">
-      <button className="step-group-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
-        <StepIcon type="tool" name={group.name} />
-        <Chevron open={open} />
-        <span className="step-group-count">{label}</span>
-        <span style={{ color: "var(--muted)" }}>{summary}</span>
+    <div className="step-group">
+      <button className="step-group-toggle" onClick={() => setOpen(!open)}>
+        <StepIcon type={firstTool.name} name={firstTool.name} />
+        <span className="step-group-count">{group.events.length} × {label}</span>
         <span className="step-group-dur">{fmtDur(group.totalDur)}</span>
+        <Chevron open={open} />
       </button>
       {open && (
         <div className="step-group-items">
@@ -507,8 +369,8 @@ export function Timeline({ events, onImage, session }: { events: AgentEvent[]; o
   const items = groupEvents(events);
 
   return (
-    <>
-      {items.map((item) => {
+    <>{
+      items.map((item) => {
         if (item.kind === "group") {
           return <GroupCard key={`g-${item.events[0].id}`} group={item} onImage={onImage} session={session} />;
         }

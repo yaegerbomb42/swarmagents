@@ -14,8 +14,9 @@
 import { requireAdapter } from "./resume";
 import { addStep, checkBudget, endRun, fmtDuration, noteRun, recordTool, recordTurn, startRun } from "./ledger";
 import { registerArtifact } from "./artifacts";
-import { dueTasks, finishTask, getTask, listTasks, requeueTask, runningTasks, setStatus, waitTask } from "./tasks";
+import { dueTasks, finishTask, getTask, listTasks, requeueTask, setStatus, waitTask } from "./tasks";
 import { loadRuntimeSettings } from "./store";
+import { allUserIds, currentUser, runAs } from "../store";
 
 const TICK_MS = 2000;
 /**
@@ -30,12 +31,17 @@ class Scheduler {
   private ticking = false;
   private started = false;
   /**
-   * Runs currently in flight, keyed by task. This is the single source of truth for "can this
-   * task be stopped", so pause/cancel go through the scheduler instead of reaching into the
-   * agent directly. It also lets a late-settling run detect that it has been superseded and
-   * must not overwrite the newer state.
+   * Runs currently in flight, keyed by `${user}::${task}`. This is the single source of truth for
+   * "can this task be stopped", so pause/cancel go through the scheduler instead of reaching into
+   * the agent directly. It also lets a late-settling run detect that it has been superseded and
+   * must not overwrite the newer state. The user is part of the key so two accounts' tasks never
+   * collide on a shared task id.
    */
   private active = new Map<string, { controller: AbortController; runId: string; attempt: number; settled: Promise<void> }>();
+
+  private key(taskId: string, user = currentUser()): string {
+    return `${user}::${taskId}`;
+  }
 
   start() {
     if (this.started) return;
@@ -52,11 +58,28 @@ class Scheduler {
     this.started = false;
   }
 
-  /** A crash leaves tasks marked running with no live run. Settle them so they can resume. */
+  /**
+   * A crash leaves tasks marked running with no live run. Settle them so they can resume.
+   * Runs per user: each account's tasks are settled under its own context, so a server never
+   * touches (or leaks) another account's tasks.
+   */
   private reconcile() {
+    for (const uid of allUserIds()) {
+      try {
+        runAs(uid, () => this.reconcileUser(uid));
+      } catch {
+        // A broken account must not stop the others from reconciling.
+      }
+    }
+  }
+
+  private reconcileUser(uid: string): void {
     const settings = loadRuntimeSettings();
     for (const t of listTasks()) {
       if (t.status !== "running") continue;
+      // A task we already hold a live run for is not stale (e.g. boot-time reconcile racing a
+      // fresh run); leave it to that run.
+      if (this.active.has(this.key(t.id, uid))) continue;
       if (settings.autoResume) {
         void waitTask(t.id, {
           kind: "backoff",
@@ -86,11 +109,11 @@ class Scheduler {
    * task as "stopping" instead of falsely "stopped" while side effects may still be unwinding.
    */
   async stopTask(taskId: string): Promise<boolean> {
-    const run = this.active.get(taskId);
+    const run = this.active.get(this.key(taskId));
     if (!run) return true;
     // Retire the run from the registry *before* unwinding so its stale-completion guard sees it as
     // superseded and records "interrupted" instead of writing done/failed over the pause/cancel.
-    this.active.delete(taskId);
+    this.active.delete(this.key(taskId));
     run.controller.abort();
     const settled = await Promise.race([
       run.settled.then(() => true),
@@ -100,8 +123,8 @@ class Scheduler {
   }
 
   /** Is this run still the one we are tracking for the task? False once stopped or superseded. */
-  private isCurrent(taskId: string, runId: string): boolean {
-    return this.active.get(taskId)?.runId === runId;
+  private isCurrent(taskId: string, runId: string, user = currentUser()): boolean {
+    return this.active.get(this.key(taskId, user))?.runId === runId;
   }
 
   /**
@@ -120,17 +143,13 @@ class Scheduler {
     if (this.ticking) return;
     this.ticking = true;
     try {
-      const settings = loadRuntimeSettings();
-      const active = runningTasks().length;
-      const slots = Math.max(0, settings.concurrency - active);
-      if (slots > 0) {
-        // Re-queue any due waiting tasks so they are picked up by runnable ordering.
-        for (const t of dueTasks()) {
-          await requeueTask(t.id);
-        }
-        const runnable = listTasks().filter((t) => t.status === "queued");
-        for (const t of runnable.slice(0, slots)) {
-          void this.runTask(t.id);
+      // Each account is scheduled under its own context. A failure in one must not stall the loop
+      // for everyone else, so per-user work is wrapped and its errors are swallowed here.
+      for (const uid of allUserIds()) {
+        try {
+          await runAs(uid, () => this.tickUser(uid));
+        } catch {
+          // Isolated: another account's error never stops this account from being scheduled.
         }
       }
     } finally {
@@ -138,7 +157,30 @@ class Scheduler {
     }
   }
 
-  private async runTask(taskId: string) {
+  private async tickUser(uid: string): Promise<void> {
+    const settings = loadRuntimeSettings();
+    // Count only this user's live runs against this user's concurrency budget.
+    let active = 0;
+    for (const k of this.active.keys()) if (k.startsWith(`${uid}::`)) active++;
+    const slots = Math.max(0, settings.concurrency - active);
+    if (slots <= 0) return;
+    // Re-queue any due waiting tasks so they are picked up by runnable ordering.
+    for (const t of dueTasks()) {
+      await requeueTask(t.id);
+    }
+    const runnable = listTasks().filter((t) => t.status === "queued");
+    for (const t of runnable.slice(0, slots)) {
+      void this.runTask(uid, t.id);
+    }
+  }
+
+  private async runTask(uid: string, taskId: string) {
+    // The whole run executes under the owner's context so every store read/write (task, ledger,
+    // artifacts) resolves to that account. AsyncLocalStorage keeps the context across awaits.
+    return runAs(uid, () => this.runTaskBody(uid, taskId));
+  }
+
+  private async runTaskBody(uid: string, taskId: string) {
     const t0 = Date.now();
     if (!getTask(taskId)) return;
     const adapter = requireAdapter();
@@ -155,7 +197,8 @@ class Scheduler {
     // pause/cancel only reports "stopped" once the run has actually handed control back.
     let markSettled!: () => void;
     const settled = new Promise<void>((r) => (markSettled = r));
-    this.active.set(taskId, { controller, runId: run.id, attempt, settled });
+    const runKey = this.key(taskId, uid);
+    this.active.set(runKey, { controller, runId: run.id, attempt, settled });
     let parked = false;
     // Recorder hook promises. They are fire-and-forget during the run so hooks never
     // block the agent, but we flush them before any decision that reads usage (budget).
@@ -188,7 +231,7 @@ class Scheduler {
 
       // If the user paused/cancelled (or the task was superseded) while we ran, this run is
       // stale: record it as interrupted and return without touching the task's newer state.
-      if (!this.isCurrent(taskId, run.id)) {
+      if (!this.isCurrent(taskId, run.id, uid)) {
         await endRun(taskId, run.id, "interrupted", Date.now() - t0);
         await this.releaseInterrupted(taskId);
         return;
@@ -229,7 +272,7 @@ class Scheduler {
       });
     } catch (e) {
       // A stopped/superseded run must not write failure state over a user's pause/cancel.
-      if (!this.isCurrent(taskId, run.id)) {
+      if (!this.isCurrent(taskId, run.id, uid)) {
         await endRun(taskId, run.id, "interrupted", Date.now() - t0);
         await this.releaseInterrupted(taskId);
         return;
@@ -246,7 +289,7 @@ class Scheduler {
       }
     } finally {
       // Release the slot only if we are still the registered run; a newer attempt owns it otherwise.
-      if (this.isCurrent(taskId, run.id)) this.active.delete(taskId);
+      if (this.isCurrent(taskId, run.id, uid)) this.active.delete(runKey);
       // Wake any stopTask that is waiting on this run to unwind.
       markSettled();
     }

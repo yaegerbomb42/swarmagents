@@ -12,6 +12,7 @@ import { setAgentAdapter } from "./runtime/resume";
 import { riskOf, actionHash, describe, type Risk } from "./runtime/approvals";
 import { takeApproval, isDenied } from "./runtime/store";
 import { subagentTool } from "./subagents";
+import { defaultCwd, identity } from "./sandbox";
 import { subagentPolicy } from "./subagent-settings";
 
 const READ_ONLY = new Set(["read_file", "search", "web_search", "web_fetch"]);
@@ -50,7 +51,7 @@ How you work:
 - Large inputs: read files in pages, grep before reading, and save big intermediate results to disk instead of holding them in context.
 - When done, reply with a brief, direct summary of the outcome. Use markdown. No filler.
 
-Environment: macOS, home ${os.homedir()}, current directory ${cwd}, user uploads in ${uploadsDir()}. Date ${new Date().toDateString()}.`;
+Environment: ${process.env.SWARM_MODE === "server" ? "Linux, in your own private sandbox (you can only reach your workspace and uploads)" : "macOS"}, home ${defaultCwd(os.homedir())}, current directory ${cwd}, user uploads in ${uploadsDir()}. Date ${new Date().toDateString()}.`;
 }
 
 // ---- Session runtime (kept on globalThis so dev hot-reloads don't orphan running agents) ----
@@ -734,5 +735,7 @@ export function dropSession(id: string) {
 export const uploadDir = (id: string) => {
   const d = path.join(uploadsDir(), id);
   fs.mkdirSync(d, { recursive: true });
+  // per-user sandbox: server-owned, but the user's tools must reach files in it by path (never list it).
+  if (identity()) for (const x of [uploadsDir(), d]) fs.chmodSync(x, 0o711);
   return d;
 };

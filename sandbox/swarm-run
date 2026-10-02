@@ -1,0 +1,39 @@
+#!/bin/sh
+# swarm-run: run one command as a per-user sandbox uid, with resource limits. Server mode with SWARM_SANDBOX=uid;
+# called by lib/sandbox.ts (sandboxCommand / chromiumWrapper). Installed in the image as /usr/local/bin/swarm-run.
+#
+#   swarm-run <uid> [--cwd DIR] [--cpu SECONDS] [--mem MB] [--nproc N] [--fsize MB] [--nofile N] -- <cmd> [args...]
+#
+# Drops to uid:gid <uid> with no supplementary groups, no capabilities (inheritable, ambient and bounding set
+# cleared) and no_new_privs, so the child can never regain root. umask 077. Env is passed through unchanged:
+# the caller scrubs it. Refuses uids outside the sandbox range so a bug can't run tools as root or as the server.
+set -eu
+die() { echo "swarm-run: $*" >&2; exit 126; }
+[ "$#" -ge 3 ] || die "usage: swarm-run <uid> [limits] -- <cmd> [args...]"
+uid=$1; shift
+case "$uid" in ''|*[!0-9]*) die "bad uid '$uid'" ;; esac
+[ "$uid" -ge 20000 ] && [ "$uid" -le 59999 ] || die "uid $uid outside sandbox range 20000-59999"
+cwd="" cpu=3600 mem=2048 nproc=256 fsize=2048 nofile=1024
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cwd) cwd=$2; shift 2 ;;
+    --cpu) cpu=$2; shift 2 ;;
+    --mem) mem=$2; shift 2 ;;
+    --nproc) nproc=$2; shift 2 ;;
+    --fsize) fsize=$2; shift 2 ;;
+    --nofile) nofile=$2; shift 2 ;;
+    --) shift; break ;;
+    *) die "unknown option $1" ;;
+  esac
+done
+[ "$#" -ge 1 ] || die "missing command"
+for n in "$cpu" "$mem" "$nproc" "$fsize" "$nofile"; do case "$n" in ''|*[!0-9]*) die "bad limit '$n'" ;; esac; done
+[ -z "$cwd" ] || cd "$cwd" || die "cannot cd to $cwd"
+umask 077
+# RLIMIT_NPROC counts every process of this uid in the container (all of this user's tools together).
+# --mem 0 = no address-space cap (Chromium/V8 reserve far more virtual memory than they use; the container's
+# 4g cgroup limit still applies to real memory).
+as=""; [ "$mem" -gt 0 ] && as="--as=$((mem * 1024 * 1024))"
+# shellcheck disable=SC2086
+exec prlimit --cpu="$cpu" $as --nproc="$nproc" --fsize=$((fsize * 1024 * 1024)) --nofile="$nofile" -- \
+  setpriv --reuid="$uid" --regid="$uid" --clear-groups --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs -- "$@"

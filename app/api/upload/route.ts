@@ -1,4 +1,5 @@
 import { scoped } from "@/lib/auth";
+import { giveToUser } from "@/lib/sandbox";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -143,6 +144,8 @@ async function postHandler(req: Request) {
     uploadRuntime.activePartials.delete(reserved.file);
     reserved = { ...finalReserved, fd: -1 };
     finalReserved = undefined;
+    // per-user sandbox: the upload belongs to the user, so their sandboxed tools can read it.
+    giveToUser(reserved.file);
     const att: Attachment = {
       name: path.basename(reserved.file),
       path: reserved.file,

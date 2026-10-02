@@ -263,6 +263,7 @@ export class BrowserSession {
         this.emitSpec({ type: "tab", ts: Date.now(), key: this.key, index: c.pages().indexOf(p) + 1, count: c.pages().length, url: p.url() });
       });
       c.pages().forEach((p) => this.watch(p));
+      this.guard(c);
       this.active = c.pages().find((p) => !p.isClosed()) ?? null;
       this.emitSpec({ type: "notice", ts: Date.now(), key: this.key, text: "Browser started (isolated profile).", level: "info" });
       void this.startScreencast();

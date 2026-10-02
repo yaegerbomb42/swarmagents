@@ -15,10 +15,14 @@ const enc = new TextEncoder();
 /** ~12 fps to viewers: enough to look live, cheap enough to stay under SMB on a phone. */
 const MIN_FRAME_GAP_MS = 80;
 
+/** Session ids are 16 hex chars (lib/store). Validate before touching the store so a bogus id is a
+ *  clean 404 rather than a thrown "bad session id". */
+const SESSION_ID = /^[a-f0-9]{16}$/;
+
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const sid = url.searchParams.get("session") ?? "";
-  if (!sid || !session(sid)) return Response.json({ error: "No such task." }, { status: 404 });
+  if (!SESSION_ID.test(sid) || !session(sid)) return Response.json({ error: "No such task." }, { status: 404 });
 
   const rt = browserRuntime();
   const send = (ctrl: ReadableStreamDefaultController<Uint8Array>, data: unknown) => {

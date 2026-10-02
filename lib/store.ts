@@ -3,6 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { defaultCwd } from "./sandbox";
 import type { AgentEvent, LearnedLimits, Msg, ProviderConfig, SessionMeta } from "./types";
 
 // ---- Tenancy ----
@@ -136,7 +137,7 @@ const sdir = (id: string) => {
 };
 
 export function createSession(): SessionMeta {
-  const meta: SessionMeta = { id: newId(), title: "New task", createdAt: Date.now(), updatedAt: Date.now(), cwd: os.homedir() };
+  const meta: SessionMeta = { id: newId(), title: "New task", createdAt: Date.now(), updatedAt: Date.now(), cwd: defaultCwd(os.homedir()) };
   fs.mkdirSync(sdir(meta.id), { recursive: true });
   saveMeta(meta);
   return meta;

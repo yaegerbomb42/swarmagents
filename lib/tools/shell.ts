@@ -4,6 +4,7 @@ import path from "node:path";
 import { sessionDir, newId } from "../store";
 import { redactSavedKeys } from "../connections";
 import { clip, type Tool } from "./types";
+import { identity, sandboxCommand, sandboxEnv } from "../sandbox";
 
 const MARK = "__SWARM_CWD__";
 
@@ -29,6 +30,10 @@ function childEnv(): NodeJS.ProcessEnv {
     if (STRIPPED_ENV.has(k) || k.startsWith("SWARM_")) continue;
     if (v !== undefined) env[k] = v;
   }
+  // per-user sandbox: on a server the child gets its own HOME/TMPDIR and no pointer into server data.
+  const sb = sandboxEnv();
+  if (Object.keys(sb).length) delete env.SWARM_HOME;
+  Object.assign(env, sb);
   // NOTE: saved tool keys are deliberately NOT exported here. The coordinator declined global
   // saved-key injection into the shell env (GROUP_CHAT 19:38): an agent-run `env` would expose every
   // saved credential at once. Keys stay reachable through api_request (host-scoped) and MCP per-server
@@ -189,9 +194,15 @@ export const shell: Tool = {
       return f;
     };
     if (input.background) {
-      const log = path.join(dir, `bg-${newId()}.log`);
+      // per-user sandbox: the session dir is server-private there, so put the log where the agent can read it.
+      const id = identity();
+      const logDir = id ? path.join(id.workspace, ".swarm-logs") : dir;
+      if (id) fs.mkdirSync(logDir, { recursive: true });
+      const log = path.join(logDir, `bg-${newId()}.log`);
       const fd = fs.openSync(log, "a");
-      const child = spawn("/bin/zsh", ["-lc", cmd], { cwd: ctx.cwd, detached: true, stdio: ["ignore", fd, fd], env: childEnv() });
+      if (id) fs.fchownSync(fd, id.uid, id.gid);
+      const sb = sandboxCommand("/bin/zsh", ["-lc", cmd]);
+      const child = spawn(sb.command, sb.args, { cwd: ctx.cwd, detached: true, stdio: ["ignore", fd, fd], env: childEnv() });
       trackBackground(ctx.sessionId, child);
       pruneLogs(ctx.sessionId);
       child.unref();
@@ -199,7 +210,9 @@ export const shell: Tool = {
     }
     const timeout = Math.max(1, Number(input.timeout_sec ?? 600)) * 1000;
     return new Promise((resolve) => {
-      const child = spawn("/bin/zsh", ["-lc", `${cmd}\n__rc=$?; printf '\\n${MARK}%s' "$PWD"; exit $__rc`], {
+      // per-user sandbox: runs as the user's own uid on a server (unchanged locally).
+      const sb = sandboxCommand("/bin/zsh", ["-lc", `${cmd}\n__rc=$?; printf '\\n${MARK}%s' "$PWD"; exit $__rc`]);
+      const child = spawn(sb.command, sb.args, {
         cwd: ctx.cwd,
         env: childEnv(),
         // Own process group, so stop/timeout kills the whole pipeline, not just zsh.

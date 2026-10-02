@@ -1,0 +1,21 @@
+# Overlay for per-user OS isolation (layer 3). infra/deploy.sh adds it automatically
+# (`-f docker-compose.server.yml -f docker-compose.sandbox.yml`) once the app ships lib/sandbox.ts with
+# SWARM_SANDBOX support; never deploy it with an app that doesn't sandbox its tools (they would run as root).
+#
+# The server runs as root inside the container with ONLY the capabilities needed to drop each user's tool
+# processes to that user's own uid (lib/sandbox.ts + /usr/local/bin/swarm-run): SETUID/SETGID to switch uid,
+# CHOWN/FOWNER to hand a workspace to its uid, DAC_OVERRIDE to manage files across user-owned dirs, KILL to stop a
+# user's runaway processes. Everything else stays dropped (cap_drop ALL in the base file), no-new-privileges
+# stays on, and the 4g / 2 CPU / 512 pids limits and the host egress firewall still apply to the whole container.
+services:
+  swarmagents-dashboard:
+    user: "0:0"
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+      - KILL
+    environment:
+      - SWARM_SANDBOX=uid

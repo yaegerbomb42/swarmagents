@@ -1,12 +1,13 @@
+import { scoped } from "@/lib/auth";
 import { loadRuntimeSettings, saveRuntimeSettings, scheduler, type RuntimeSettings } from "@/lib/runtime";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export const GET = scoped(async () => {
   return Response.json({ settings: loadRuntimeSettings() });
-}
+});
 
-export async function PUT(req: Request) {
+export const PUT = scoped(async (req: Request) => {
   const patch = (await req.json().catch(() => ({}))) as Partial<RuntimeSettings>;
   const next: RuntimeSettings = { ...loadRuntimeSettings(), ...patch };
   // Keep concurrency sane; the scheduler reads this on every tick.
@@ -14,4 +15,4 @@ export async function PUT(req: Request) {
   saveRuntimeSettings(next);
   scheduler().kick();
   return Response.json({ settings: next });
-}
+});

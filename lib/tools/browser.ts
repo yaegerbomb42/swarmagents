@@ -313,6 +313,10 @@ export const browser: Tool = {
     },
   },
   async run(input, ctx) {
+    // per-user sandbox: this browser is one process-wide Chromium (shared cookies and logins, server uid), so it
+    // must never serve a multi-user server. The isolated runtime in lib/browser takes over there.
+    if (process.env.SWARM_MODE === "server")
+      return { content: "The browser isn't available on this multi-user server yet; use web_fetch / web_search instead.", isError: true };
     downloadDir = path.join(ctx.cwd, "downloads");
     const p = await page();
     try {

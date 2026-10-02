@@ -1,7 +1,8 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+
+import { useEffect, useRef, useState, useCallback } from "react";
 import type { Attachment, ContextInfo } from "@/lib/types";
-import { IAttach, IFile, IStop, IUp, IX } from "./icons";
+import { IAttach, IFile, IStop, IUp, IX, ISlash, IModel, IKeyboard } from "./icons";
 import { fmtK } from "./Timeline";
 
 interface Pending {
@@ -18,25 +19,14 @@ const DRAFT_KEY = "swarm.draft";
 const HISTORY_KEY = "swarm.sent";
 const store = {
   get(k: string) {
-    try {
-      return localStorage.getItem(k);
-    } catch {
-      return null;
-    }
+    try { return localStorage.getItem(k); } catch { return null; }
   },
   set(k: string, v: string | null) {
-    try {
-      if (v === null) localStorage.removeItem(k);
-      else localStorage.setItem(k, v);
-    } catch {}
+    try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch {}
   },
 };
 const sentHistory = (): string[] => {
-  try {
-    return JSON.parse(store.get(HISTORY_KEY) ?? "[]") as string[];
-  } catch {
-    return [];
-  }
+  try { return JSON.parse(store.get(HISTORY_KEY) ?? "[]") as string[]; } catch { return []; }
 };
 
 function upload(file: File, sessionId: string, onProgress: (p: number) => void): Promise<Attachment> {
@@ -51,22 +41,34 @@ function upload(file: File, sessionId: string, onProgress: (p: number) => void):
         try {
           const body: unknown = JSON.parse(xhr.responseText);
           if (body && typeof body === "object" && "error" in body && typeof body.error === "string") message = body.error;
-        } catch {
-          if (xhr.responseText.trim()) message = xhr.responseText.trim();
-        }
+        } catch { if (xhr.responseText.trim()) message = xhr.responseText.trim(); }
         reject(new Error(message));
         return;
       }
-      try {
-        resolve(JSON.parse(xhr.responseText) as Attachment);
-      } catch {
-        reject(new Error("The server returned an invalid upload response."));
-      }
+      try { resolve(JSON.parse(xhr.responseText) as Attachment); } catch { reject(new Error("The server returned an invalid upload response.")); }
     };
     xhr.onerror = () => reject(new Error("connection lost"));
     xhr.send(file);
   });
 }
+
+// Slash commands
+const SLASH_COMMANDS = [
+  { cmd: "/plan", desc: "Create a plan", action: "plan" },
+  { cmd: "/search", desc: "Search the web", action: "search" },
+  { cmd: "/browser", desc: "Open browser", action: "browser" },
+  { cmd: "/compact", desc: "Compact context", action: "compact" },
+  { cmd: "/clear", desc: "Clear conversation", action: "clear" },
+  { cmd: "/help", desc: "Show shortcuts", action: "help" },
+];
+
+// Model options (would come from settings in real app)
+const MODELS = [
+  { id: "gpt-4o", label: "GPT-4o", provider: "openai" },
+  { id: "gpt-4o-mini", label: "GPT-4o mini", provider: "openai" },
+  { id: "claude-3-5-sonnet", label: "Claude 3.5 Sonnet", provider: "anthropic" },
+  { id: "claude-3-haiku", label: "Claude 3 Haiku", provider: "anthropic" },
+];
 
 export function Composer({
   running,
@@ -84,20 +86,21 @@ export function Composer({
   const [text, setText] = useState("");
   const [files, setFiles] = useState<Pending[]>([]);
   const [drag, setDrag] = useState(false);
-  // dragenter/leave fire for every child element; count them so the highlight doesn't flicker.
+  const [showSlash, setShowSlash] = useState(false);
+  const [showModels, setShowModels] = useState(false);
+  const [selectedModel, setSelectedModel] = useState(MODELS[0].id);
   const dragDepth = useRef(0);
-  // Position while browsing sent messages with ↑/↓ (-1 = editing a fresh draft), and the draft it replaced.
   const recall = useRef({ index: -1, draft: "" });
+  const ta = useRef<HTMLTextAreaElement>(null);
+  const picker = useRef<HTMLInputElement>(null);
+  const slashRef = useRef<HTMLDivElement>(null);
+  const modelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const saved = store.get(DRAFT_KEY);
     if (saved) setText(saved);
   }, []);
-  useEffect(() => {
-    store.set(DRAFT_KEY, text || null);
-  }, [text]);
-  const ta = useRef<HTMLTextAreaElement>(null);
-  const picker = useRef<HTMLInputElement>(null);
+  useEffect(() => { store.set(DRAFT_KEY, text || null); }, [text]);
 
   useEffect(() => {
     const el = ta.current;
@@ -108,156 +111,223 @@ export function Composer({
 
   useEffect(() => {
     ta.current?.focus();
-    // Esc stops the run, unless it is closing something else (a dialog, an overlay, an IME composition).
-    const esc = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || !running || e.defaultPrevented || e.isComposing) return;
-      if (document.querySelector('[role="dialog"], .overlay, .activity-overlay')) return;
-      onStop();
+  }, []);
+
+  // Close dropdowns on outside click
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (slashRef.current && !slashRef.current.contains(e.target as Node)) setShowSlash(false);
+      if (modelRef.current && !modelRef.current.contains(e.target as Node)) setShowModels(false);
     };
-    window.addEventListener("keydown", esc);
-    return () => window.removeEventListener("keydown", esc);
-  }, [running, onStop]);
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, []);
 
-  const start = (key: string, f: File, sid: string) => {
-    const set = (patch: Partial<Pending>) => setFiles((x) => x.map((y) => (y.key === key ? { ...y, ...patch } : y)));
-    upload(f, sid, (progress) => set({ progress }))
-      .then((att) => set({ att, progress: 1 }))
-      .catch((e: Error) => set({ error: e.message }));
-  };
+  const add = useCallback((fileList: FileList) => {
+    Array.from(fileList).forEach((file) => {
+      const key = `${file.name}-${file.size}-${Date.now()}-${Math.random()}`;
+      setFiles((prev) => [...prev, { key, name: file.name, progress: 0, file }]);
+      ensureSession().then((sessionId) => {
+        upload(file, sessionId, (p) => setFiles((prev) => prev.map((f) => (f.key === key ? { ...f, progress: p } : f))))
+          .then((att) => setFiles((prev) => prev.map((f) => (f.key === key ? { ...f, att, progress: 1 } : f))))
+          .catch((err) => setFiles((prev) => prev.map((f) => (f.key === key ? { ...f, error: err.message, progress: 0 } : f))));
+      });
+    });
+  }, [ensureSession]);
 
-  const add = async (list: FileList | File[]) => {
-    const sid = await ensureSession();
-    for (const f of Array.from(list)) {
-      const key = `${f.name}-${f.size}-${Math.random()}`;
-      setFiles((x) => [...x, { key, name: f.name, progress: 0, file: f }]);
-      start(key, f, sid);
-    }
-  };
+  const retry = useCallback((f: Pending) => {
+    setFiles((prev) => prev.map((x) => (x.key === f.key ? { ...x, progress: 0, error: undefined } : x)));
+    ensureSession().then((sessionId) =>
+      upload(f.file, sessionId, (p) => setFiles((prev) => prev.map((x) => (x.key === f.key ? { ...x, progress: p } : x))))
+        .then((att) => setFiles((prev) => prev.map((x) => (x.key === f.key ? { ...x, att, progress: 1 } : x))))
+        .catch((err) => setFiles((prev) => prev.map((x) => (x.key === f.key ? { ...x, error: err.message, progress: 0 } : x))))
+    );
+  }, [ensureSession]);
 
-  const retry = async (p: Pending) => {
-    const sid = await ensureSession();
-    setFiles((x) => x.map((y) => (y.key === p.key ? { ...y, error: undefined, progress: 0 } : y)));
-    start(p.key, p.file, sid);
-  };
+  const canSend = text.trim().length > 0 || files.some((f) => f.att);
 
-  const uploading = files.some((f) => !f.att && !f.error);
-  const canSend = (text.trim() || files.some((f) => f.att)) && !uploading;
-
-  const send = () => {
+  const send = useCallback(() => {
     if (!canSend) return;
-    const msg = text.trim();
-    onSend(msg, files.filter((f) => f.att).map((f) => f.att!));
-    if (msg) store.set(HISTORY_KEY, JSON.stringify([...sentHistory().filter((h) => h !== msg), msg].slice(-50)));
-    recall.current = { index: -1, draft: "" };
+    const atts = files.filter((f) => f.att).map((f) => f.att!);
+    const currentText = text;
     setText("");
     setFiles([]);
+    setShowSlash(false);
+    store.set(HISTORY_KEY, JSON.stringify([currentText, ...sentHistory()].slice(0, 50)));
+    recall.current = { index: -1, draft: "" };
+    onSend(currentText, atts);
+  }, [canSend, files, onSend, text]);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.nativeEvent.isComposing) return;
+
+    // Cmd+Enter = Send
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      send();
+      return;
+    }
+
+    // Enter = Send (no shift)
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+      return;
+    }
+
+    // Esc = Stop (when running) or Clear slash/model dropdowns
+    if (e.key === "Escape") {
+      if (running) { onStop(); return; }
+      setShowSlash(false);
+      setShowModels(false);
+      return;
+    }
+
+    // Cmd+K = Focus composer (already focused) / Show shortcuts
+    if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+      e.preventDefault();
+      setShowSlash(true);
+      return;
+    }
+
+    // ↑/↓ history navigation
+    const el = e.currentTarget;
+    const atStart = !el.value.slice(0, el.selectionStart).includes("\n");
+    const atEnd = !el.value.slice(el.selectionEnd).includes("\n");
+    if ((e.key === "ArrowUp" && atStart) || (e.key === "ArrowDown" && atEnd && recall.current.index >= 0)) {
+      const hist = sentHistory();
+      const r = recall.current;
+      const next = e.key === "ArrowUp" ? (r.index < 0 ? hist.length - 1 : r.index - 1) : r.index + 1;
+      if (e.key === "ArrowUp" && (next < 0 || !hist.length)) return;
+      e.preventDefault();
+      if (r.index < 0) r.draft = text;
+      if (next >= hist.length) { r.index = -1; setText(r.draft); }
+      else { r.index = next; setText(hist[next]); }
+    }
+
+    // Trigger slash menu on /
+    if (e.key === "/" && atStart && text === "") {
+      e.preventDefault();
+      setShowSlash(true);
+    }
+  }, [running, onStop, send, text]);
+
+  const handleSlashSelect = (cmd: typeof SLASH_COMMANDS[0]) => {
+    setText(cmd.cmd + " ");
+    setShowSlash(false);
+    ta.current?.focus();
   };
 
-  const pct = context?.window ? Math.min(100, (context.tokens / context.window) * 100) : 0;
+  const pct = context && context.window > 0 ? Math.min(100, (context.tokens / context.window) * 100) : 0;
 
   return (
     <div className="composer-wrap">
-      <div
-        className={`composer${drag ? " drag" : ""}`}
-        onDragEnter={(e) => {
-          if (!e.dataTransfer.types.includes("Files")) return;
-          dragDepth.current++;
-          setDrag(true);
-        }}
-        onDragOver={(e) => e.preventDefault()}
-        onDragLeave={() => {
-          dragDepth.current = Math.max(0, dragDepth.current - 1);
-          if (!dragDepth.current) setDrag(false);
-        }}
-        onDrop={(e) => {
-          e.preventDefault();
-          dragDepth.current = 0;
-          setDrag(false);
-          if (e.dataTransfer.files.length) add(e.dataTransfer.files);
-        }}
-      >
-        {!!files.length && (
-          <div className="chips">
+      <div className="composer">
+        {/* Attachments bar */}
+        {files.length > 0 && (
+          <div className="files-bar" role="list" aria-label="Attachments">
             {files.map((f) => (
-              <span key={f.key} className="chip" title={f.error ?? f.att?.path} style={f.error ? { color: "var(--err)" } : undefined}>
-                <IFile />
-                <span>
-                  {f.name}
-                  {f.error ? ` · ${f.error}` : !f.att ? ` · ${Math.round(f.progress * 100)}%` : ""}
-                </span>
-                {f.error && (
-                  <button className="rm" title="Retry upload" onClick={() => retry(f)} style={{ width: "auto", padding: "0 4px", fontSize: 12 }}>
-                    Retry
-                  </button>
-                )}
-                <button className="rm" onClick={() => setFiles((x) => x.filter((y) => y.key !== f.key))}>
-                  <IX />
+              <span key={f.key} className="file-chip" role="listitem">
+                <IFile size={14} />
+                <span className="name" title={f.name}>{f.name}</span>
+                {f.progress < 1 && <span className="progress" style={{ width: `${f.progress * 100}%` }} />}
+                {f.error && <span className="error">{f.error}</span>}
+                <button className="rm" onClick={() => setFiles((x) => x.filter((y) => y.key !== f.key))} aria-label="Remove">
+                  <IX size={12} />
                 </button>
               </span>
             ))}
           </div>
         )}
-        <textarea
-          ref={ta}
-          rows={1}
-          value={text}
-          placeholder={running ? "Add guidance while it works…" : "What should we get done?"}
-          onChange={(e) => setText(e.target.value)}
-          onPaste={(e) => {
-            if (e.clipboardData.files.length) {
-              e.preventDefault();
-              add(e.clipboardData.files);
-            }
-          }}
-          onKeyDown={(e) => {
-            if (e.nativeEvent.isComposing) return;
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              send();
-              return;
-            }
-            // ↑ on the first line / ↓ on the last line walk sent messages, like a shell.
-            const el = e.currentTarget;
-            const atStart = !el.value.slice(0, el.selectionStart).includes("\n");
-            const atEnd = !el.value.slice(el.selectionEnd).includes("\n");
-            if ((e.key === "ArrowUp" && atStart) || (e.key === "ArrowDown" && atEnd && recall.current.index >= 0)) {
-              const hist = sentHistory();
-              const r = recall.current;
-              const next = e.key === "ArrowUp" ? (r.index < 0 ? hist.length - 1 : r.index - 1) : r.index + 1;
-              if (e.key === "ArrowUp" && (next < 0 || !hist.length)) return;
-              e.preventDefault();
-              if (r.index < 0) r.draft = text;
-              if (next >= hist.length) {
-                r.index = -1;
-                setText(r.draft);
-              } else {
-                r.index = next;
-                setText(hist[next]);
-              }
-            }
-          }}
-        />
+
+        {/* Textarea */}
+        <div style={{ position: "relative" }}>
+          <textarea
+            ref={ta}
+            rows={1}
+            value={text}
+            placeholder={running ? "Add guidance while it works…" : "What should we get done?"}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={handleKeyDown}
+            onPaste={(e) => {
+              if (e.clipboardData.files.length) { e.preventDefault(); add(e.clipboardData.files); }
+            }}
+            onFocus={() => { if (text.startsWith("/")) setShowSlash(true); }}
+            aria-label="Message composer"
+          />
+
+          {/* Slash command dropdown */}
+          {showSlash && (
+            <div className="slash-menu" ref={slashRef} role="menu">
+              {SLASH_COMMANDS.map((cmd) => (
+                <button
+                  key={cmd.cmd}
+                  className="slash-item"
+                  role="menuitem"
+                  onClick={() => handleSlashSelect(cmd)}
+                >
+                  <ISlash size={14} />
+                  <span><strong>{cmd.cmd}</strong> {cmd.desc}</span>
+                </button>
+              ))}
+              <div className="slash-divider" />
+              <button className="slash-item" onClick={() => { setShowSlash(false); setShowModels(true); }}> <IModel size={14} /> <span>Switch model…</span> </button>
+              <button className="slash-item" onClick={() => { setShowSlash(false); alert("Shortcuts:\nEnter — Send\nShift+Enter — New line\nCmd+Enter — Send\nEsc — Stop / Close\nCmd+K — Commands\n↑/↓ — History"); }}> <IKeyboard size={14} /> <span>Keyboard shortcuts</span> </button>
+            </div>
+          )}
+        </div>
+
+        {/* Footer row */}
         <div className="row">
-          <button className="icon-btn" title="Attach files (any size)" onClick={() => picker.current?.click()}>
+          <button className="icon-btn attach" title="Attach files (any size)" onClick={() => picker.current?.click()} aria-label="Attach files">
             <IAttach />
           </button>
           <input ref={picker} type="file" multiple hidden onChange={(e) => e.target.files && (add(e.target.files), (e.target.value = ""))} />
+
+          {/* Model picker chip */}
+          <div className="model-picker" ref={modelRef}>
+            <button
+              className="model-chip"
+              onClick={() => setShowModels(!showModels)}
+              aria-expanded={showModels}
+              aria-haspopup="menu"
+            >
+              <IModel size={14} />
+              <span>{MODELS.find(m => m.id === selectedModel)?.label ?? selectedModel}</span>
+              <IChevron size={12} open={showModels} />
+            </button>
+            {showModels && (
+              <div className="model-dropdown" role="menu">
+                {MODELS.map((m) => (
+                  <button
+                    key={m.id}
+                    className={`model-option ${selectedModel === m.id ? "selected" : ""}`}
+                    role="menuitem"
+                    onClick={() => { setSelectedModel(m.id); setShowModels(false); }}
+                  >
+                    <span>{m.label}</span>
+                    <span className="provider">{m.provider}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
           {context && context.tokens > 0 && (
             <span className="meter" title={`${context.tokens.toLocaleString()} / ${context.window.toLocaleString()} tokens${context.model ? ` · ${context.model}` : ""}`}>
               {fmtK(context.tokens)} / {fmtK(context.window)}
-              <span className="track">
-                <span className="fill" style={{ width: `${pct}%`, display: "block", background: pct > 75 ? "var(--warn)" : undefined }} />
-              </span>
+              <span className="track"><span className="fill" style={{ width: `${pct}%` }} /></span>
             </span>
           )}
           {!context?.tokens && <span className="spacer" />}
+
           {running && (
-            <button className="send" style={{ background: "var(--sunken)", color: "var(--text)", border: "1px solid var(--line-strong)" }} title="Stop (Esc)" onClick={onStop}>
+            <button className="send stop" title="Stop (Esc)" onClick={onStop} aria-label="Stop">
               <IStop />
             </button>
           )}
           {(!running || text.trim()) && (
-            <button className="send" disabled={!canSend} onClick={send} title="Send (Enter)">
+            <button className="send" disabled={!canSend} onClick={send} title="Send (Enter)" aria-label="Send">
               <IUp />
             </button>
           )}

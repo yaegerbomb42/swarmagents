@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { scoped } from "@/lib/auth";
 import { getArtifact } from "@/lib/runtime";
 
 export const dynamic = "force-dynamic";
@@ -29,7 +30,7 @@ function safeHeaders(mime: string, filename: string, download: boolean): Record<
  * ever reads paths the agent itself produced. Every response is sandboxed so agent-written
  * HTML/SVG/XML cannot run script in this origin (same policy as /api/files).
  */
-export async function GET(req: Request, { params }: Ctx) {
+export const GET = scoped(async (req: Request, { params }: Ctx) => {
   const id = (await params).id;
   const artifact = getArtifact(id);
   if (!artifact) return new Response("not found", { status: 404 });
@@ -56,7 +57,7 @@ export async function GET(req: Request, { params }: Ctx) {
 
   if (artifact.url) return Response.redirect(artifact.url, 302);
   return new Response("artifact has no content", { status: 410 });
-}
+});
 
 function basename(p: string): string {
   return p.split("/").pop() ?? p;

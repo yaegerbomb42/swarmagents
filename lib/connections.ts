@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { sandboxCommand, sandboxEnv } from "./sandbox";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
@@ -628,7 +629,7 @@ export async function testConnection(input: ConnectionInput): Promise<TestResult
   const { client, close } = mcpClient();
   // For a local command, keep the tail of its stderr so a crash says why (missing file, bad flag…).
   let stderrTail = "";
-  const transport = def.url ? transportFor(name, def) : new StdioClientTransport({ command: def.command!, args: def.args ?? [], env, stderr: "pipe" });
+  const transport = def.url ? transportFor(name, def) : new StdioClientTransport({ ...sandboxCommand(def.command!, def.args ?? []), env: { ...env, ...sandboxEnv() }, stderr: "pipe" }) // per-user sandbox;
   if (transport instanceof StdioClientTransport) transport.stderr?.on("data", (b: Buffer) => (stderrTail = (stderrTail + b.toString()).slice(-2000)));
   try {
     const { tools } = await withTimeout(
@@ -663,7 +664,7 @@ export function transportFor(name: string, def: McpDef) {
     const opts = { requestInit: { headers: def.headers }, authProvider: hasMcpTokens(name) ? new McpOAuthProvider(name) : undefined };
     return def.type === "sse" ? new SSEClientTransport(new URL(def.url), opts) : new StreamableHTTPClientTransport(new URL(def.url), opts);
   }
-  return new StdioClientTransport({ command: def.command!, args: def.args ?? [], env: mcpEnv(def.env), stderr: "ignore" });
+  return new StdioClientTransport({ ...sandboxCommand(def.command!, def.args ?? []), env: { ...mcpEnv(def.env), ...sandboxEnv() }, stderr: "ignore" }) // per-user sandbox;
 }
 
 /** Non-secret variables a local server may need to find its runtime, locale, temp dir, proxy and CA certs. */

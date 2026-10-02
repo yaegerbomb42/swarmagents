@@ -195,7 +195,67 @@ try {
   const replay = rt.replay("task-a");
   check("session is recorded for replay", replay.some((e) => e.kind === "frame") && replay.some((e) => e.kind === "event"), `${replay.length} entries`);
 
-  // ── 12. Resume after a restart (new process would rebuild from the profile dir) ──
+  // ── 12. The TOOL itself: the fixture flows run through lib/tools/browser, not the runtime directly ──
+  const { browser, browserSession } = await import("../lib/tools/browser.ts");
+  const { browserRuntime } = await import("../lib/browser/runtime.ts");
+  const toolRt = browserRuntime();
+  const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-tool-work-"));
+  fs.writeFileSync(path.join(WORK, "upload-me.txt"), "hello from the workspace");
+  const ctl = new AbortController();
+  const toolCtx = { sessionId: "tool-task", cwd: WORK, signal: ctl.signal, onOutput: () => {}, setCwd: () => {}, setPlan: () => {} };
+  const run = (input) => browser.run(input, toolCtx);
+
+  let out = await run({ action: "goto", url: site.url + "/echo" });
+  check("tool: goto returns an observation", /Interactive elements:/.test(out.content), out.content.split("\n")[0]);
+  check("tool: goto includes a screenshot by default", !!out.images?.length);
+
+  out = await run({ action: "type", selector: "#box", text: "hello" });
+  out = await run({ action: "read" });
+  check("tool: typed text lands in the page", /seen:hello/.test(out.content), out.content.split("\n").slice(-4).join(" "));
+
+  out = await run({ action: "reload", screenshot: false });
+  check("tool: screenshot:false skips the image", !out.images?.length);
+
+  await run({ action: "goto", url: site.url + "/files" });
+  out = await run({ action: "upload", selector: "#f", path: "upload-me.txt" });
+  check("tool: upload attaches the workspace file", /Attached upload-me\.txt/.test(out.content), out.content.split("\n")[0]);
+
+  out = await run({ action: "click", selector: "#dl" });
+  const wsDl = path.join(WORK, "downloads", "report.csv");
+  check("tool: download lands in the task workspace", fs.existsSync(wsDl) && /Downloaded report\.csv/.test(out.content), wsDl.replace(WORK, "~"));
+
+  await run({ action: "goto", url: site.url + "/drag" });
+  out = await run({ action: "drag", selector: "#src", to_selector: "#dst" });
+  out = await run({ action: "read" });
+  check("tool: drag drops the element", /dropped/.test(out.content), out.content.split("\n").slice(-3).join(" "));
+
+  out = await run({ action: "goto", url: site.url + "/vanish" });
+  await run({ action: "click", selector: "#trap" });
+  await sleep(450);
+  out = await run({ action: "click", selector: "#gone" });
+  check("tool: a vanished element reports a re-observation instead of a stack trace", out.isError === true && /Interactive elements:/.test(out.content), out.content.split("\n")[0]);
+
+  out = await run({ action: "tab_new", url: site.url + "/tab-one" });
+  check("tool: tab_new opens a second tab", /Tab 2\/2: Tab one/.test(out.content), out.content.split("\n")[1]);
+  out = await run({ action: "tab_switch", tab: 1 });
+  check("tool: tab_switch returns to the first tab", /Tab 1\/2/.test(out.content), out.content.split("\n")[1]);
+  await run({ action: "tab_close" });
+
+  // Take-over: while the user holds the browser the tool waits instead of fighting for the mouse.
+  const toolSession = browserSession("tool-task");
+  toolSession.setController("user");
+  const ctl2 = new AbortController();
+  let heldDone = false;
+  const held = browser.run({ action: "reload" }, { ...toolCtx, signal: ctl2.signal }).then((r) => ((heldDone = true), r));
+  await sleep(200);
+  check("tool: the agent holds while the user has the browser", !heldDone);
+  ctl2.abort();
+  const heldRes = await held;
+  check("tool: an abort during take-over returns cleanly", /paused/.test(String(heldRes.content)), heldRes.content);
+  toolSession.setController("agent");
+  await toolRt.release("tool-task", "tool test done");
+
+  // ── 13. Resume after a restart (new process would rebuild from the profile dir) ──
   await p.goto(site.url + "/scroll", { waitUntil: "domcontentloaded" });
   await a.rememberState();
   const savedUrls = a.lastUrls();

@@ -53,10 +53,12 @@ try {
   await page.waitForTimeout(200);
   write("viewer-multistep-form.jpg", Buffer.from((frames.at(-1)?.data ?? ""), "base64"));
 
-  // The replay log the runtime keeps for the "replay what happened" panel.
+  // The replay log the runtime keeps for the "replay what happened" panel, saved with its frames so
+  // the recording can be watched straight from the repo (docs/ui/browser/recording.html).
   const replay = rt.replay("capture-task");
-  fs.writeFileSync(path.join(OUT, "session-replay.jsonl"), replay.map((e) => JSON.stringify({ ...e, frame: e.frame ? `[${e.frame.length} bytes]` : undefined })).join("\n") + "\n");
-  console.log(`wrote docs/ui/browser/session-replay.jsonl (${replay.length} entries)`);
+  fs.writeFileSync(path.join(OUT, "recording.jsonl"), replay.map((e) => JSON.stringify(e)).join("\n") + "\n");
+  fs.writeFileSync(path.join(OUT, "recording.html"), PLAYER);
+  console.log(`wrote docs/ui/browser/recording.jsonl (${replay.length} entries, frames included) + recording.html`);
   console.log(`captured ${frames.length} screencast frames`);
   off();
   await s.close("capture done");
@@ -64,3 +66,5 @@ try {
   await site.close().catch(() => {});
   fs.rmSync(HOME, { recursive: true, force: true });
 }
+
+console.log(failures ? `\n${failures} capture check(s) failed` : "\ncapture artifacts written");

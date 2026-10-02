@@ -25,7 +25,8 @@ const Md = memo(function Md({ text, streaming }: { text: string; streaming?: boo
         a: (p) => <a {...p} target="_blank" rel="noreferrer" />,
         code: (p) => {
           const { children, ...props } = p;
-          const inline = !children.includes("\n");
+          const childStr = typeof children === "string" ? children : "";
+          const inline = !childStr.includes("\n");
           if (inline) return <code {...props}>{children}</code>;
           return <pre><code {...props}>{children}</code></pre>;
         },
@@ -271,7 +272,7 @@ export function PlanCard({ e }: { e: Ev<"plan"> }) {
       <ul>
         {e.items.map((it, i) => (
           <li key={i} className={it.status}>
-            <span className={`box ${it.status}`}>{it.status === "done" && <ICheck size={8} />}</span>
+            <span className={`box ${it.status}`}>{it.status === "done" && <ICheck />}</span>
             {it.text}
           </li>
         ))}
@@ -312,7 +313,7 @@ function groupEvents(events: AgentEvent[]) {
 
 function GroupCard({ group, onImage, session }: { group: { events: AgentEvent[]; totalDur: number }; onImage: (s: string) => void; session?: string }) {
   const [open, setOpen] = useState(false);
-  const firstTool = group.events[0];
+  const firstTool = group.events[0] as Ev<"tool">;
   const label = TOOL_LABEL[firstTool.name] ?? firstTool.name;
   const accentClass = toolAccent(firstTool.name);
 
@@ -327,7 +328,7 @@ function GroupCard({ group, onImage, session }: { group: { events: AgentEvent[];
       {open && (
         <div className="step-group-items">
           {group.events.map((e) => (
-            <Tool key={e.id} e={e} onImage={onImage} session={session} />
+            <Tool key={e.id} e={e as Ev<"tool">} onImage={onImage} session={session} />
           ))}
         </div>
       )}

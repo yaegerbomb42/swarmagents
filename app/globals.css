@@ -1678,3 +1678,14 @@ input, textarea, select {
     grid-template-columns: 1fr;
   }
 }
+
+/* Legacy token aliases (Grok Bot, BLOCK 21:58): component CSS (settings, timeline, Activity, storage, preview,
+   browser-view, browser-live) still uses these names; they follow the --color-* tokens above, themes included. */
+:root {
+  --bg: var(--color-bg); --panel: var(--color-bg-elevated); --sunken: var(--color-bg-sunken);
+  --line: var(--color-line); --line-strong: var(--color-line-strong);
+  --text: var(--color-text); --muted: var(--color-text-muted); --faint: var(--color-text-faint);
+  --accent: var(--color-accent); --accent-text: var(--color-accent-text);
+  --ok: var(--color-ok); --warn: var(--color-warn); --err: var(--color-err); --run: var(--color-run);
+  --mono: var(--font-mono);
+}

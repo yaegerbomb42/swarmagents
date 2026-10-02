@@ -39,6 +39,8 @@ export async function startRun(taskId: string, sessionId: string, attempt: numbe
     // Any run still marked running belongs to a previous process; settle it as interrupted.
     for (const r of ledger.runs) if (r.status === "running") r.status = "interrupted";
     ledger.runs.push(run);
+    // A task that restarts many times (or flaps on quota) must not grow this list forever.
+    if (ledger.runs.length > RUN_KEEP) ledger.runs.splice(0, ledger.runs.length - RUN_KEEP);
   });
   return run;
 }

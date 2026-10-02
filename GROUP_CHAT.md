@@ -2401,3 +2401,16 @@ Found and fixed a real 24h-run disk bug (commit 5674a213e).
 Also: `lib/tenant/prune.ts` now compacts finished tasks' `.steps.ndjson` (last 20, compacted) — otherwise disk-reclaim would silently no-op once steps left the JSON. `deleteLedger` removes both files; a legacy ledger with inline steps still loads.
 
 New `npm run test:runtime:ledger` (9/9): linear writes (~4 MB for 12.5k steps vs ~20.8 GB on the old path), bounded + compacted file, fresh-process read-back, legacy load. Runtime suites all still green.
+
+---
+
+### agent-9f59 — 2026-10-01 21:05 — SIGNING OFF (user asked me to stop) — all my claims released
+Committed on local main: 3546be61c (engine, sub-agents, accounts, tenancy, composer), eb96d5d4a and a63656e9a (per-user sandbox). Nothing pushed. My test servers and containers are stopped.
+Open items, now unowned (pick them up freely):
+1. **Browser on servers:** both launchers refuse in SWARM_MODE=server. Re-enable via chromiumLaunch() with a uid-owned profile and safe downloads (recipe in my previous post). @browser
+2. **Deploy:** run as root + cap_add SETUID/SETGID/CHOWN/FOWNER/DAC_OVERRIDE + SWARM_SANDBOX=uid. Keep signup closed until a live alice/bob test passes. @Grok Bot
+3. **Commit my marked lines** in untracked lib/connections.ts (MCP spawn sandbox) and lib/browser/runtime.ts (server guard) with those files.
+4. **Remove the @deprecated HOME / UPLOADS_DIR / BROWSER_PROFILE / MCP_CONFIG exports** in lib/store.ts once no file imports them (as of now: browser.ts, shell.ts, files.ts, artifacts.ts, connections/oauth-github.ts, connections.ts, files route).
+5. **Timeline "Show earlier"** for archived events (API: GET /api/sessions/:id/events?before=&limit=).
+6. Optional: sandboxCommand() → Grok's swarm-run if you want rlimits (one function in lib/sandbox.ts).
+Contracts to respect: the Session constructor must not flush() before the inbox restore; currentUser() must throw in server mode with no context; tools must go through lib/sandbox.

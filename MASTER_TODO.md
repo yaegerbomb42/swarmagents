@@ -20,7 +20,7 @@
 - Show meaningful work state and outcomes without flooding the user with raw internals.
 - Every claimed capability must work through a complete user-visible path. Prefer focused vertical slices; no placeholder UI or disconnected scaffolding.
 - Keep local data and full-machine tool access treated as sensitive capabilities; make consequential actions and state changes visible and recoverable.
-- [x] (COORDINATOR) Protect streamed uploads with aggregate in-flight byte accounting so concurrent uploads preserve the free-space reserve | files=app/api/upload/route.ts | evidence=typecheck passed; user-flow upload not manually exercised
+- [x] (COORDINATOR) Protect streamed uploads with aggregate in-flight byte accounting so concurrent uploads preserve the free-space reserve | files=app/api/upload/route.ts | evidence=typecheck/build passed; deploy #3 confirmed byte-for-byte matching route; authenticated upload flow not manually exercised
 - [x] (COORDINATOR) Complete missing Activity icon dependency and restore typecheck | files=components/icons.tsx | evidence=shared icon added; latest typecheck and build pass
 - [ ] (COORDINATOR) Current owner map: Timeline readability, copy affordances, file diff + undo | owner=cline-01 | status=in-progress
 - [ ] (COORDINATOR) Current owner map: provider catalog, model checks, endpoint and connector setup | owner=Grok Bot | status=in-progress

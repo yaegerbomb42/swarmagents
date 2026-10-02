@@ -1,6 +1,6 @@
 /* Settings (connections). Builds on the shared tokens and .modal/.btn/.input/.toggle/.prov in app/globals.css. */
 
-.st-modal { width: 720px; }
+.st-modal { width: 720px; max-width: calc(100vw - 40px); }
 .st-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .st-head h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .st-back { width: 26px; height: 26px; border-radius: 7px; font-size: 20px; line-height: 1; color: var(--muted); display: grid; place-items: center; padding-bottom: 2px; }
@@ -96,6 +96,14 @@
 .st-status { font-size: 12.5px; color: var(--muted); margin-right: auto; }
 
 @media (max-width: 760px) {
+  /* Phones: the overlay's grid would otherwise size the modal to its 720px content. */
+  .st-modal { max-height: 92vh; }
+  .st-modal .modal-body { padding: 6px 14px 18px; }
+  .st-cat-top { margin: 0 -14px; padding: 8px 14px 1px; }
+  /* Row controls drop to their own line under the name; drag isn't available on touch, the arrows are. */
+  .st-row .prov-top { flex-wrap: wrap; row-gap: 6px; }
+  .st-row .spacer { flex-basis: 100%; height: 0; }
+  .st-row .st-grip { display: none; }
   .st-grid { grid-template-columns: 1fr 1fr; }
   .st-row .mdl { display: none; }
   .st-row[draggable="true"] .st-meta { padding-left: 0; }

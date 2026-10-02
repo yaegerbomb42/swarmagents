@@ -55,4 +55,5 @@ export {
 } from "./resume";
 export { scheduler } from "./scheduler";
 export { bootstrapRuntime } from "./bootstrap";
-export { loadRuntimeSettings, saveRuntimeSettings, RUNTIME_DIR } from "./store";
+export { loadRuntimeSettings, saveRuntimeSettings, RUNTIME_DIR, grantApproval, takeApproval, loadApprovals, clearApprovals, recordDenial, isDenied, clearDenials } from "./store";
+export { riskOf, actionHash, describe } from "./approvals";

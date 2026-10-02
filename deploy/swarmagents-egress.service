@@ -1,14 +1,19 @@
 # Installed by `infra/deploy.sh swarmagents`. Re-applies the agent container's egress firewall after a reboot.
 # Scope: only the swarmagents-isolated docker network (see /usr/local/sbin/swarmagents-egress.sh).
+# Ordered BEFORE docker.service so the rules exist before any container starts (no unfiltered window), and after
+# the host's own firewall loaders (netfilter-persistent / ufw) so they cannot flush it. The rules sit in the mangle
+# table, which neither Docker nor Tailscale flushes when they start.
 [Unit]
 Description=Egress firewall for the swarmagents agent container (swarmagents-isolated network only)
-After=docker.service tailscaled.service network-online.target
-Wants=docker.service network-online.target
+DefaultDependencies=yes
+After=network-pre.target netfilter-persistent.service ufw.service
+Before=docker.service
+Wants=network-pre.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/sbin/swarmagents-egress.sh
+ExecStart=/usr/local/sbin/swarmagents-egress.sh --boot
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target docker.service

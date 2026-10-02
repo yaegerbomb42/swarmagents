@@ -54,7 +54,7 @@ export function describeAction(input: Record<string, unknown>): string {
     case "click":
       return `Clicked ${tgt}`.trim();
     case "type":
-      return `Typed "${clip(str(input.value ?? input.text), 50)}"${input.index != null || input.selector ? ` into ${tgt}` : ""}${input.submit ? " and pressed Enter" : ""}`;
+      return `Typed "${clip(str(input.text ?? input.value), 50)}"${input.index != null ? ` into [${input.index}]` : input.selector ? ` into ${clip(str(input.selector), 40)}` : ""}${input.submit ? " and pressed Enter" : ""}`;
     case "press":
       return `Pressed ${str(input.key) || "a key"}`;
     case "scroll":
@@ -80,7 +80,7 @@ export function describeAction(input: Record<string, unknown>): string {
     case "tab_close":
       return "Closed a tab";
     case "wait":
-      return input.text ? `Waited for "${clip(str(input.text), 40)}"` : `Waited ${Number(input.ms) || 1000} ms`;
+      return `Waited ${((Number(input.ms) || 1500) / 1000).toFixed(1).replace(/\.0$/, "")}s`;
     case "screenshot":
       return "Took a screenshot";
     case "upload":

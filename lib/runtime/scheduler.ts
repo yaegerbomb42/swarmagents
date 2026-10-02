@@ -173,7 +173,7 @@ class Scheduler {
       }
 
       if (outcome.needs) {
-        await waitTask(taskId, { kind: outcome.needs.kind, message: outcome.needs.message });
+        await waitTask(taskId, { kind: outcome.needs.kind, message: outcome.needs.message, token: outcome.needs.token });
         await endRun(taskId, run.id, "interrupted", Date.now() - t0);
         await addStep(taskId, run.id, { kind: "notice", label: "Waiting on you", detail: outcome.needs.message });
         return;

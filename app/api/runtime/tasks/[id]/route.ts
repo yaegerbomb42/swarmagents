@@ -1,10 +1,15 @@
 import {
+  addStep,
   cancelTask,
+  clearApprovals,
+  clearDenials,
   deleteTask,
   getLedger,
   getTask,
+  grantApproval,
   listArtifacts,
   progressOf,
+  recordDenial,
   scheduler,
   setKept,
   summarizeUsage,
@@ -37,7 +42,7 @@ export async function POST(req: Request, { params }: Ctx) {
   const task = getTask(id);
   if (!task) return new Response("not found", { status: 404 });
   const body = (await req.json().catch(() => ({}))) as {
-    action?: "resume" | "pause" | "cancel" | "retry" | "keep-artifact" | "set-budget";
+    action?: "resume" | "pause" | "cancel" | "retry" | "approve" | "deny" | "keep-artifact" | "set-budget";
     artifactId?: string;
     kept?: boolean;
     budget?: Record<string, number>;
@@ -49,6 +54,8 @@ export async function POST(req: Request, { params }: Ctx) {
       // state when it unwinds, then mark cancelled.
       await scheduler().stopTask(id);
       await cancelTask(id);
+      clearApprovals(id);
+      clearDenials(id);
       return Response.json({ task: getTask(id) });
     }
     case "pause": {
@@ -59,6 +66,42 @@ export async function POST(req: Request, { params }: Ctx) {
         t.status = "blocked";
         t.wait = { kind: "input", message: "Paused by the user. Press Resume to continue." };
       });
+      return Response.json({ task: getTask(id) });
+    }
+    case "approve": {
+      // Authorise exactly the action the task is blocked on, then resume. The grant is bound to the
+      // action hash stored on the wait, so it cannot authorise a different command later.
+      const t = getTask(id);
+      const token = t?.wait?.kind === "approval" ? t.wait.token : undefined;
+      if (token) {
+        const tool = /^(\w+)/.exec(t?.wait?.message ?? "")?.[1] ?? "action";
+        await grantApproval({ taskId: id, hash: token, tool, label: t?.wait?.message ?? "", grantedAt: Date.now() });
+        await addStep(id, "", { kind: "notice", label: "Approved", detail: t?.wait?.message ?? "Action approved by the user." });
+      }
+      await updateTask(id, (x) => {
+        x.status = "queued";
+        x.wait = undefined;
+        x.finishedAt = undefined;
+        x.result = undefined;
+      });
+      scheduler().kick();
+      return Response.json({ task: getTask(id) });
+    }
+    case "deny": {
+      // Refuse exactly the action the task is blocked on, then resume so the agent can work another way.
+      const t = getTask(id);
+      const token = t?.wait?.kind === "approval" ? t.wait.token : undefined;
+      if (token) {
+        await recordDenial({ taskId: id, hash: token, tool: "action", label: t?.wait?.message ?? "", deniedAt: Date.now() });
+        await addStep(id, "", { kind: "notice", label: "Denied", detail: t?.wait?.message ?? "Action denied by the user." });
+      }
+      await updateTask(id, (x) => {
+        x.status = "queued";
+        x.wait = undefined;
+        x.finishedAt = undefined;
+        x.result = undefined;
+      });
+      scheduler().kick();
       return Response.json({ task: getTask(id) });
     }
     case "resume":
@@ -89,5 +132,7 @@ export async function POST(req: Request, { params }: Ctx) {
 export async function DELETE(_req: Request, { params }: Ctx) {
   const id = (await params).id;
   const ok = await deleteTask(id, true);
+  clearApprovals(id);
+  clearDenials(id);
   return Response.json({ ok });
 }

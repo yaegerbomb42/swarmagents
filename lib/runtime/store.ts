@@ -228,3 +228,45 @@ export function clearApprovals(taskId: string): void {
   }
   if (changed) void writeJson(APPROVALS_FILE, all);
 }
+
+// ---- Action denials ----
+//
+// A denial is durable for the life of the task: it tells the agent "the user said no to this exact
+// action, do not ask again or find a way around it". Without it, a resumed run would simply re-propose
+// the same call and block again forever.
+
+const DENIALS_FILE = path.join(RUNTIME_DIR, "denials.json");
+
+export interface DenialRecord {
+  taskId: string;
+  hash: string;
+  tool: string;
+  label: string;
+  deniedAt: number;
+}
+
+function denialsKey(taskId: string, hash: string): string {
+  return `${taskId}:${hash}`;
+}
+
+export function recordDenial(d: DenialRecord): Promise<void> {
+  const all = readJson<Record<string, DenialRecord>>(DENIALS_FILE, {});
+  all[denialsKey(d.taskId, d.hash)] = d;
+  return writeJson(DENIALS_FILE, all);
+}
+
+export function isDenied(taskId: string, hash: string): boolean {
+  return !!readJson<Record<string, DenialRecord>>(DENIALS_FILE, {})[denialsKey(taskId, hash)];
+}
+
+export function clearDenials(taskId: string): void {
+  const all = readJson<Record<string, DenialRecord>>(DENIALS_FILE, {});
+  let changed = false;
+  for (const k of Object.keys(all)) {
+    if (all[k].taskId === taskId) {
+      delete all[k];
+      changed = true;
+    }
+  }
+  if (changed) void writeJson(DENIALS_FILE, all);
+}

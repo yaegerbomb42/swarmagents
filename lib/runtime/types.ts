@@ -20,6 +20,8 @@ export interface WaitReason {
   message: string;
   /** Epoch ms at which we will retry. Absent for approval/input waits. */
   resumeAt?: number;
+  /** For approval waits: the exact action hash the user must approve. Lets Approve authorise one action. */
+  token?: string;
 }
 
 export interface TaskBudget {

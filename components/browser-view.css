@@ -1,0 +1,38 @@
+/* Browser tool card (components/BrowserView.tsx). Prefixed bv- so nothing leaks into the timeline. */
+.bv { margin: 2px 12px 12px; border: 1px solid var(--line-strong); border-radius: 10px; overflow: hidden; background: var(--panel); }
+.bv.bv-error { border-color: color-mix(in srgb, #c0392b 45%, var(--line-strong)); }
+.bv-bar { display: flex; align-items: center; gap: 10px; padding: 7px 10px; background: var(--sunken); border-bottom: 1px solid var(--line); }
+.bv-dots { display: inline-flex; gap: 5px; flex-shrink: 0; }
+.bv-dots i { width: 9px; height: 9px; border-radius: 50%; background: var(--line-strong); display: block; }
+.bv-url { flex: 1; min-width: 0; display: flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); font-size: 12px; line-height: 1.4; white-space: nowrap; overflow: hidden; }
+.bv-lock { color: var(--muted); flex-shrink: 0; }
+.bv-host { color: var(--text); font-weight: 550; flex-shrink: 0; max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
+.bv-path { color: var(--muted); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.bv-tabs { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.bv-action { display: flex; align-items: baseline; gap: 6px; padding: 7px 12px 6px; font-size: 12.5px; min-width: 0; }
+.bv-verb { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%; }
+.bv-verb.live { animation: bv-pulse 1.4s ease-in-out infinite; }
+.bv-title { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.bv-fail { margin: 0 12px 6px; padding: 6px 10px; border-radius: 7px; font-size: 12px; color: #c0392b; background: color-mix(in srgb, #c0392b 8%, transparent); }
+.bv-notes { margin: 0 12px 6px; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 3px; }
+.bv-notes li { font-size: 12px; padding: 4px 10px; border-radius: 7px; background: var(--sunken); color: var(--text); overflow-wrap: anywhere; }
+.bv-notes li::before { content: "↳ "; color: var(--muted); }
+.bv-view { background: var(--sunken); border-top: 1px solid var(--line); }
+.bv-view img { display: block; width: 100%; max-height: 520px; object-fit: contain; object-position: top; cursor: zoom-in; background: #fff; }
+.bv-loading, .bv-empty { display: flex; align-items: center; justify-content: center; gap: 8px; height: 120px; font-size: 12.5px; color: var(--muted); }
+.bv-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line-strong); border-top-color: var(--text); animation: bv-rot 0.8s linear infinite; }
+.bv-tabsbar { display: flex; gap: 4px; padding: 6px 8px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.bv-tabsbar button { font: inherit; font-size: 11.5px; color: var(--muted); background: none; border: 1px solid transparent; border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+.bv-tabsbar button:hover { color: var(--text); background: var(--sunken); }
+.bv-tabsbar button.on { color: var(--text); border-color: var(--line); background: var(--sunken); }
+.bv-els { margin: 0; padding: 4px 0; list-style: none; max-height: 280px; overflow: auto; border-top: 1px solid var(--line); font-size: 12px; }
+.bv-els li { display: flex; gap: 8px; padding: 2px 12px; align-items: baseline; overflow-wrap: anywhere; }
+.bv-n { flex-shrink: 0; min-width: 22px; text-align: center; font-size: 10.5px; font-weight: 700; color: #fff; background: rgb(232, 67, 147); border-radius: 4px; padding: 0 4px; font-variant-numeric: tabular-nums; }
+.bv-pre { margin: 0; padding: 8px 12px; max-height: 320px; overflow: auto; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-word; }
+@keyframes bv-pulse { 50% { opacity: 0.55; } }
+@keyframes bv-rot { to { transform: rotate(360deg); } }
+@media (max-width: 640px) {
+  .bv { margin: 2px 8px 10px; }
+  .bv-dots { display: none; }
+  .bv-view img { max-height: 360px; }
+}

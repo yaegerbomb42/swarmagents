@@ -9,7 +9,7 @@ import { allTools } from "./tools";
 import type { Tool } from "./tools/types";
 import { setAgentAdapter } from "./runtime/resume";
 import { riskOf, actionHash, describe, type Risk } from "./runtime/approvals";
-import { takeApproval } from "./runtime/store";
+import { takeApproval, isDenied } from "./runtime/store";
 import { subagentTool } from "./subagents";
 
 const READ_ONLY = new Set(["read_file", "search", "web_search", "web_fetch"]);
@@ -62,7 +62,7 @@ class Session {
   inbox: { text: string; attachments: Attachment[]; resumeNote?: string }[] = [];
   context: ContextInfo = { tokens: 0, window: 200_000 };
   /** Set when a run stopped because a risky tool needs the user's decision. Read by the task adapter. */
-  pendingApproval: { message: string; risk: Risk } | null = null;
+  pendingApproval: { message: string; risk: Risk; token: string } | null = null;
   /** Tokens the provider counts beyond our history estimate (system prompt, tool schemas, estimate error). */
   private overhead = 0;
   private saveTimer: NodeJS.Timeout | null = null;
@@ -317,6 +317,13 @@ class Session {
         }
 
         const results = await this.runTools(calls, toolMap, signal, planEv);
+        // A risky action was intercepted: keep its result in history (so the model knows the action is
+        // pending) but stop the run so the runtime can block the task and ask the user.
+        if (this.pendingApproval) {
+          this.history.push({ role: "user", blocks: [...results, ...this.drainInbox()] });
+          this.flush();
+          break;
+        }
         const warn: Block[] =
           repeats >= LOOP_WARN ? [{ type: "text", text: `[Automatic check, not from the user] You have made this exact call ${repeats} times in a row. If you are deliberately polling, put a longer sleep in the command itself; otherwise this is not making progress, so change approach.` }] : [];
         this.history.push({ role: "user", blocks: [...results, ...warn, ...this.drainInbox()] });
@@ -364,6 +371,8 @@ class Session {
     let text: AgentEvent | null = null;
     const toolEvs = new Map<string, AgentEvent>();
     const attemptEvents: AgentEvent[] = [];
+    // Thinking often arrives as one summarized burst at the end, so time it from when the request went out.
+    let sentAt = Date.now();
     const endBlocks = () => {
       if (thinking) this.patch(thinking, { done: true, endTs: Date.now() } as Partial<AgentEvent>);
       if (text) this.patch(text, { done: true } as Partial<AgentEvent>);
@@ -374,7 +383,7 @@ class Session {
         { system: systemPrompt(this.meta.cwd, tools), messages: this.history, tools: tools.map((t) => t.spec), signal },
         {
           onThinking: (d) => {
-            if (!thinking) attemptEvents.push((thinking = this.add({ type: "thinking", text: "", done: false } as AgentEvent)));
+            if (!thinking) attemptEvents.push((thinking = this.add({ type: "thinking", text: "", done: false, ts: sentAt } as AgentEvent)));
             this.patch(thinking, {}, { field: "text", value: d });
           },
           onText: (d) => {
@@ -401,6 +410,7 @@ class Session {
             for (const ev of attemptEvents.splice(0)) this.remove(ev);
             toolEvs.clear();
             thinking = text = null;
+            sentAt = Date.now();
           },
         },
       );
@@ -434,16 +444,48 @@ class Session {
 
   private turnToolEvents = new Map<string, AgentEvent>();
 
+  /**
+   * Classify this call against the approval gate for the current task run.
+   *  - "run"    ordinary call, or an action the user already approved (grant consumed here)
+   *  - "ask"    destructive/outward with no grant: park the run for a decision
+   *  - "denied" the user already refused this exact action for this task
+   * Only applies to task runs: interactive chat is user-driven and can be stopped at any moment.
+   */
+  private gate(name: string, input: Record<string, unknown>): "run" | "ask" | "denied" {
+    const guard = taskGuards.get(this.meta.id);
+    if (!guard) return "run";
+    const risk = riskOf(name, input);
+    if (!risk) return "run";
+    const hash = actionHash(name, input);
+    if (takeApproval(guard.taskId, hash)) return "run"; // approved this exact action, once
+    if (isDenied(guard.taskId, hash)) return "denied";
+    const message = describe(name, input, risk);
+    this.pendingApproval = { message, risk, token: hash };
+    this.add({ type: "notice", level: "warn", text: `Paused for your approval — ${message}` } as AgentEvent);
+    return "ask";
+  }
+
   private async runTools(calls: Extract<Block, { type: "tool_call" }>[], toolMap: Map<string, Tool>, signal: AbortSignal, planEv: { current: AgentEvent | null }): Promise<Block[]> {
     const runOne = async (c: (typeof calls)[number]): Promise<Block> => {
       const ev = this.turnToolEvents.get(c.id) ?? this.add({ type: "tool", name: c.name, input: c.input, status: "running" } as AgentEvent);
       this.patch(ev, { status: "running", output: "" } as Partial<AgentEvent>);
       const tool = toolMap.get(c.name);
       const input = (c.input ?? {}) as Record<string, unknown>;
+      const verdict = tool && !("__invalid_json" in input) ? this.gate(c.name, input) : "run";
       let res;
       if (!tool) res = { content: `Unknown tool "${c.name}".`, isError: true };
       else if ("__invalid_json" in input) res = { content: `Your tool input was not valid JSON: ${String(input.__invalid_json).slice(0, 500)}`, isError: true };
-      else {
+      else if (verdict === "ask") {
+        // Destructive/outward action with no prior grant: stop here and ask. The card stays open so the
+        // user sees exactly what was proposed; the adapter turns this into a "blocked - needs approval".
+        const pending = this.pendingApproval;
+        res = {
+          content: `[awaiting the user's approval] ${pending?.message ?? "This action needs a decision before it can run."} The action has NOT run yet. Continue with anything else you can do without it, or stop and wait.`,
+          isError: false,
+        };
+      } else if (verdict === "denied") {
+        res = { content: "The user denied this action. Do not retry it or look for a way around it; continue with another approach or finish and explain what is blocked.", isError: true };
+      } else {
         try {
           res = await tool.run(input, {
             sessionId: this.meta.id,
@@ -631,15 +673,21 @@ setAgentAdapter({
     };
     const onAbort = () => s.stop();
     s.subs.add(sub);
+    s.pendingApproval = null;
+    setTaskGuard(s.meta.id, task.id);
     hooks.signal.addEventListener("abort", onAbort, { once: true });
     try {
       s.send(task.prompt, []);
       await s.whenIdle();
     } finally {
       s.subs.delete(sub);
+      clearTaskGuard(s.meta.id);
       hooks.signal.removeEventListener("abort", onAbort);
     }
+    const pending = (s as { pendingApproval: Session["pendingApproval"] }).pendingApproval;
+    s.pendingApproval = null;
     const last = reply as AgentEvent | null;
+    if (pending) return { summary: `Paused for approval: ${pending.message}`, verified: false, needs: { kind: "approval", message: pending.message, token: pending.token } };
     return { summary: last?.type === "text" ? last.text : "" };
   },
   stop: (sessionId) => sessions.get(sessionId)?.stop(),

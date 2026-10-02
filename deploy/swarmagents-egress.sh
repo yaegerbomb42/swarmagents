@@ -1,7 +1,10 @@
 #!/bin/sh
 # Egress policy for the swarmagents agent container ONLY (docker network "swarmagents-isolated").
-# Installed on the VPS as /usr/local/sbin/swarmagents-egress.sh by `infra/deploy.sh swarmagents`, and run at
-# boot by swarmagents-egress.service (after docker and tailscaled). Idempotent.
+# Installed on the VPS as /usr/local/sbin/swarmagents-egress.sh by `infra/deploy.sh swarmagents`. Idempotent.
+#   (no args)  deploy path: read the network's subnet from docker, save it to $SUBFILE, apply.
+#   --boot     swarmagents-egress.service, BEFORE docker.service starts any container: apply using the saved
+#              subnet without calling docker (calling it would socket-activate docker and stall boot), so
+#              there is no window after a reboot where the agent container runs unfiltered.
 #
 # The agent has a shell, so from its network we drop new connections to: cloud instance metadata (169.254/16;
 # DNS to the VCN resolver 169.254.169.254:53 stays allowed), the tailnet (100.64/10: the owner's own machines),
@@ -16,13 +19,22 @@ set -eu
 NET=swarmagents-isolated
 CHAIN=SWARMAGENTS-EGRESS
 
-i=0
-until docker network inspect "$NET" >/dev/null 2>&1; do
-  i=$((i + 1)); [ "$i" -ge 90 ] && { echo "swarmagents-egress: docker network $NET not available" >&2; exit 1; }
-  sleep 2
-done
-SUB=$(docker network inspect "$NET" -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
-[ -n "$SUB" ] || { echo "swarmagents-egress: no subnet for $NET" >&2; exit 1; }
+SUBFILE=/etc/swarmagents-egress.subnet
+
+if [ "${1:-}" = "--boot" ]; then
+  SUB=$(cat "$SUBFILE" 2>/dev/null || true)
+  [ -n "$SUB" ] || { echo "swarmagents-egress: $SUBFILE missing; run infra/deploy.sh swarmagents --egress-only" >&2; exit 1; }
+else
+  i=0
+  until docker network inspect "$NET" >/dev/null 2>&1; do
+    i=$((i + 1)); [ "$i" -ge 90 ] && { echo "swarmagents-egress: docker network $NET not available" >&2; exit 1; }
+    sleep 2
+  done
+  SUB=$(docker network inspect "$NET" -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
+  [ -n "$SUB" ] || { echo "swarmagents-egress: no subnet for $NET" >&2; exit 1; }
+  echo "$SUB" > "$SUBFILE"
+fi
+case "$SUB" in */*) ;; *) echo "swarmagents-egress: bad subnet '$SUB'" >&2; exit 1 ;; esac
 
 # Remove the earlier filter-table version of this policy (DOCKER-USER hook), if present.
 if iptables -S DOCKER-USER >/dev/null 2>&1; then

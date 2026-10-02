@@ -36,7 +36,7 @@ export interface RunOutcome {
   /** Did the agent verify its own work? */
   verified?: boolean;
   /** If the agent stopped because it needs the user, say so; the task becomes blocked. */
-  needs?: { kind: "approval" | "input"; message: string };
+  needs?: { kind: "approval" | "input"; message: string; token?: string };
 }
 
 export interface AgentAdapter {

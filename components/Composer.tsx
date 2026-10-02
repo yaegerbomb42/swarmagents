@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { Attachment, ContextInfo } from "@/lib/types";
-import { IAttach, IFile, IStop, IUp, IX, ISlash, IModel, IKeyboard } from "./icons";
+import { IAttach, IFile, IStop, IUp, IX, ISlash, IModel, IKeyboard, IChevron } from "./icons";
 import { fmtK } from "./Timeline";
 
 interface Pending {
@@ -295,7 +295,9 @@ export function Composer({
             >
               <IModel />
               <span>{MODELS.find(m => m.id === selectedModel)?.label ?? selectedModel}</span>
-              <IChevron open={showModels} />
+              <span style={{ display: "inline-flex", transform: showModels ? "rotate(90deg)" : "none", transition: "transform .15s" }}>
+                <IChevron />
+              </span>
             </button>
             {showModels && (
               <div className="model-dropdown" role="menu">

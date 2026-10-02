@@ -275,6 +275,10 @@ export class BrowserSession {
     }
   }
 
+  private guard(_c: BrowserContext) {
+    // Route guard placeholder
+  }
+
   private explainLaunchError(e: unknown) {
     const msg = String((e as Error)?.message ?? e);
     if (/Executable doesn't exist|not found|ENOENT|install/i.test(msg))

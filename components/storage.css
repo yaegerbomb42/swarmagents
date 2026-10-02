@@ -1,0 +1,31 @@
+/* Settings → Storage (components/StorageSettings.tsx) */
+.stg-total { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.stg-meter { position: relative; display: flex; height: 10px; border-radius: 6px; background: var(--sunken); border: 1px solid var(--line); overflow: hidden; margin: 8px 0 6px; }
+.stg-seg { height: 100%; }
+.stg-seg.chats, .stg-dot.chats { background: var(--run); }
+.stg-seg.trajectories, .stg-dot.trajectories { background: color-mix(in srgb, var(--run) 55%, var(--ok)); }
+.stg-seg.files, .stg-dot.files { background: var(--ok); }
+.stg-seg.browser, .stg-dot.browser { background: color-mix(in srgb, var(--muted) 70%, var(--run)); }
+.stg-seg.other, .stg-dot.other { background: var(--faint); }
+.stg-meter.critical, .stg-meter.full { border-color: var(--err); }
+.stg-tick { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line-strong); }
+.stg-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11.5px; color: var(--muted); margin-bottom: 8px; font-variant-numeric: tabular-nums; }
+.stg-dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: 0; }
+.stg-banner { font-size: 12.5px; padding: 8px 11px; border-radius: 9px; margin: 6px 0 10px; display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+.stg-banner.warn { background: color-mix(in srgb, #d99a00 12%, transparent); color: color-mix(in srgb, #d99a00 70%, var(--text)); }
+.stg-banner.critical, .stg-banner.full { background: color-mix(in srgb, var(--err) 10%, transparent); color: var(--err); }
+.stg-toggle { display: flex; gap: 8px; align-items: flex-start; font-size: 12.5px; color: var(--muted); flex: 1; min-width: 240px; }
+.stg-toggle input { margin-top: 2px; }
+.stg-chats { margin-top: 10px; border: 1px solid var(--line); border-radius: 11px; max-height: 280px; overflow: auto; }
+.stg-chat { display: grid; grid-template-columns: 1fr auto auto auto auto; gap: 10px; align-items: center; padding: 6px 10px; font-size: 12.5px; border-bottom: 1px solid var(--line); }
+.stg-chat:last-child { border-bottom: 0; }
+.stg-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.stg-when { color: var(--faint); font-size: 11.5px; }
+.stg-size { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 58px; text-align: right; }
+.stg-pin, .stg-del { font: inherit; font-size: 11.5px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line); background: none; color: var(--muted); cursor: pointer; }
+.stg-pin.on { color: var(--run); border-color: color-mix(in srgb, var(--run) 40%, var(--line)); }
+.stg-del:hover:not(:disabled) { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--line)); }
+.stg-pin:disabled, .stg-del:disabled { opacity: 0.45; cursor: default; }
+.stg-log { margin-top: 10px; font-size: 12px; color: var(--muted); }
+.stg-log summary { cursor: pointer; }
+.stg-logrow { display: grid; grid-template-columns: 150px 1fr auto; gap: 10px; padding: 3px 0; font-variant-numeric: tabular-nums; }

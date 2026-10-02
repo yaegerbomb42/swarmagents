@@ -25,6 +25,10 @@
 .fp-table tr:hover td { background: var(--sunken); }
 .fp-foot { padding: 6px 10px; color: var(--muted); font-size: 11.5px; }
 .fp-chip-wrap { display: contents; }
+/* In a row of chips (Timeline .preview-chips), an open preview takes the full width below the chips. */
+.chips.preview-chips { flex-wrap: wrap; align-items: flex-start; justify-content: flex-start; gap: 6px; margin-top: 8px; }
+.fp-chip-wrap > .fp { flex: 1 0 100%; order: 1; margin: 2px 0 0; }
+.fp-chip { align-self: flex-start; line-height: 1.6; }
 .fp-chip { font-size: 11.5px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); background: none; cursor: pointer; }
 .fp-chip:hover, .fp-chip.on { color: var(--text); border-color: var(--line-strong); }
 @media (max-width: 760px) {

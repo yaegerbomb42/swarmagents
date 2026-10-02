@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Visual check of the Timeline diff/undo/preview UI: boots mock LLM + a dev server,
+# drives a real write_file through the mock agent, then screenshots the task view.
+set -u
+cd "$(dirname "$0")/.."
+PORT="${VIS_PORT:-3789}"
+MOCK_PORT=37911
+export NEXT_DIST_DIR=.next-visual
+
+pkill -f "next dev.*-p $PORT" 2>/dev/null || true
+rm -rf /tmp/swarm-visual && mkdir -p /tmp/swarm-visual
+
+MOCK_PORT=$MOCK_PORT node tests/mock-llm.mjs >/tmp/visual-mock.log 2>&1 &
+SWARM_HOME=/tmp/swarm-visual NEXT_DIST_DIR=.next-visual npx next dev -H 127.0.0.1 -p "$PORT" >/tmp/visual-next.log 2>&1 &
+
+for i in $(seq 1 40); do
+  curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/sessions" && break
+  sleep 0.5
+done
+curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/sessions" || { echo "server did not boot"; tail -20 /tmp/visual-next.log; exit 1; }
+
+MOCK_PORT=$MOCK_PORT node tests/e2e.mjs --url "http://127.0.0.1:$PORT" --only tools 2>&1 | tail -4
+
+# Find the session that actually ran tools and screenshot it.
+SID=$(curl -s "http://127.0.0.1:$PORT/api/sessions" | python3 -c 'import sys,json;print(json.load(sys.stdin)["sessions"][0]["id"])')
+echo "session: $SID"
+VIS_PORT="$PORT" VIS_SID="$SID" python3 tests/visual-shot.py || exit 1
+echo "screenshots: /tmp/visual-light.png /tmp/visual-dark.png"

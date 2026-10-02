@@ -37,10 +37,11 @@
     ".next-dev/types/**/*.ts",
     ".next-e2e/types/**/*.ts",
     ".next-g2/types/**/*.ts",
+    ".next-grok/types/**/*.ts",
     ".next-smoke/types/**/*.ts",
     ".next/types/**/*.ts",
     "next-env.d.ts",
-    ".next-grok/types/**/*.ts"
+    ".next-visual/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

@@ -113,28 +113,52 @@ export function sessionCookie(req: Request, token: string, maxAgeSec = 60 * 60 *
   return `${AUTH_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSec}${secure ? "; Secure" : ""}`;
 }
 
-// Failed logins and signups are limited per client and globally, so passwords and invites can't be guessed online.
-const failures = new Map<string, { n: number; at: number }>();
-let globalFailures = { n: 0, at: 0 };
+// Failed logins and sign-ups are limited per client IP and per account (deploy lane, 21:58 CT; replaces the global
+// 60/min cap, which let one attacker lock every user out of signing in):
+//  - per IP: 10 failures in 5 minutes blocks that IP's logins/sign-ups until the window drains;
+//  - per account (lower-cased username/email): 10 failures in 15 minutes blocks logins to THAT account only, so a
+//    botnet spread over many IPs still can't guess one password, and nobody else is affected.
+// A successful login clears only that account's counter, never the IP's, so an attacker can't reset their IP budget
+// by signing in to an account of their own between guesses. Every failure also costs 500 ms.
+const IP_MAX = 10, IP_WINDOW = 5 * 60_000;
+const ACCT_MAX = 10, ACCT_WINDOW = 15 * 60_000;
+const ipFails = new Map<string, number[]>();
+const acctFails = new Map<string, number[]>();
+const acctKey = (account?: string) => (account ?? "").trim().toLowerCase().slice(0, 320);
 
-export function throttled(req: Request) {
-  const now = Date.now();
-  if (now - globalFailures.at > 60_000) globalFailures = { n: 0, at: now };
-  const f = failures.get(clientIp(req));
-  return (!!f && f.n >= 5 && now - f.at < 60_000) || globalFailures.n >= 60;
+function recentCount(map: Map<string, number[]>, key: string, window: number, now: number) {
+  const list = (map.get(key) ?? []).filter((t) => now - t < window);
+  if (list.length) map.set(key, list);
+  else map.delete(key);
+  return list.length;
 }
 
-export async function noteFailure(req: Request) {
+function bump(map: Map<string, number[]>, key: string, window: number, now: number) {
+  if (map.size > 50_000) map.clear();
+  map.set(key, [...(map.get(key) ?? []).filter((t) => now - t < window), now]);
+}
+
+/** True when this client IP, or (for logins) this account, has too many recent failures. */
+export function throttled(req: Request, account?: string) {
   const now = Date.now();
-  const who = clientIp(req);
-  const f = failures.get(who);
-  failures.set(who, { n: (f && now - f.at < 60_000 ? f.n : 0) + 1, at: now });
-  globalFailures.n++;
-  if (failures.size > 10_000) failures.clear();
+  if (recentCount(ipFails, clientIp(req), IP_WINDOW, now) >= IP_MAX) return true;
+  const k = acctKey(account);
+  return !!k && recentCount(acctFails, k, ACCT_WINDOW, now) >= ACCT_MAX;
+}
+
+export async function noteFailure(req: Request, account?: string) {
+  const now = Date.now();
+  bump(ipFails, clientIp(req), IP_WINDOW, now);
+  const k = acctKey(account);
+  if (k) bump(acctFails, k, ACCT_WINDOW, now);
   await new Promise((r) => setTimeout(r, 500));
 }
 
-export const clearFailures = (req: Request) => failures.delete(clientIp(req));
+/** After a successful login: forget that account's failures (the IP's stay until they age out). */
+export const clearFailures = (_req: Request, account?: string) => {
+  const k = acctKey(account);
+  if (k) acctFails.delete(k);
+};
 
 /**
  * Wrap a route handler so it runs as the signed-in user: every store path it touches resolves to that user's

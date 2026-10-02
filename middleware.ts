@@ -32,19 +32,19 @@ function redirectOrigin(req: NextRequest): string {
 
 export function middleware(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
-  if (!hostAllowed(req)) return sec(new NextResponse("forbidden", { status: 403 }));
+  if (!hostAllowed(req)) return sec(new NextResponse("forbidden", { status: 403 }), pathname);
   const user = requestUser(req);
   // Route handlers learn who is calling from this header. Always overwrite it so a client can't supply its own.
   const headers = new Headers(req.headers);
   headers.delete(USER_HEADER);
   if (user) headers.set(USER_HEADER, user.id);
-  if (PUBLIC.has(pathname)) return sec(NextResponse.next({ request: { headers } }));
+  if (PUBLIC.has(pathname)) return sec(NextResponse.next({ request: { headers } }), pathname);
   if (!user) {
-    if (!serverMode()) return sec(new NextResponse("forbidden", { status: 403 }));
-    if (pathname.startsWith("/api/")) return sec(NextResponse.json({ error: "Sign in required." }, { status: 401 }));
+    if (!serverMode()) return sec(new NextResponse("forbidden", { status: 403 }), pathname);
+    if (pathname.startsWith("/api/")) return sec(NextResponse.json({ error: "Sign in required." }, { status: 401 }), pathname);
     // Build the target from the public Host header (already allowlisted): behind the proxy req.url carries the
     // internal host and port, and middleware rejects relative Locations.
-    return sec(NextResponse.redirect(`${redirectOrigin(req)}/login?next=${encodeURIComponent(pathname + search)}`, 303));
+    return sec(NextResponse.redirect(`${redirectOrigin(req)}/login?next=${encodeURIComponent(pathname + search)}`, 303), pathname);
   }
   // Local mode: one canonical origin (127.0.0.1) so localStorage and the OAuth callback don't split across
   // localhost/127.0.0.1. Document navigations only; API/fetch/SSE on localhost keep working.
@@ -52,21 +52,24 @@ export function middleware(req: NextRequest) {
   if (!serverMode() && host === "localhost" && req.headers.get("sec-fetch-mode") === "navigate") {
     const u = new URL(req.url);
     u.hostname = "127.0.0.1";
-    return sec(NextResponse.redirect(u, 308));
+    return sec(NextResponse.redirect(u, 308), pathname);
   }
-  return sec(NextResponse.next({ request: { headers } }));
+  return sec(NextResponse.next({ request: { headers } }), pathname);
 }
+
+/** Routes that manage their own Content-Security-Policy (sandboxed previews, PDF viewer exemption). */
+const CSP_SELF_MANAGED = (p: string) => p === "/preview" || p.startsWith("/api/files");
 
 /**
  * Baseline response headers (finish-launch). frame-ancestors 'self' (not DENY/XFO): the app frames its own
  * /api/files previews in FilePreview iframes, so same-origin framing must keep working while evil.com framing
- * is blocked. Routes with their own CSP (files/preview) keep it; multiple CSP headers intersect, so this only
- * ever adds the framing bound. nosniff stops MIME-sniffing of user content; same-origin Referrer keeps
- * internal URLs (session ids, ?next=) out of third-party Referer headers. HSTS is intentionally NOT set here:
- * TLS terminates at the proxy, so it belongs on the proxy config.
+ * is blocked. Middleware-set headers REPLACE same-name route headers in Next's merge, so CSP_SELF_MANAGED
+ * routes are exempted here — otherwise this would strip their sandbox CSP (e2e `files` guards this).
+ * nosniff stops MIME-sniffing of user content; same-origin Referrer keeps internal URLs (session ids, ?next=)
+ * out of third-party Referer headers. HSTS is intentionally NOT set here: TLS terminates at the proxy.
  */
-function sec(res: NextResponse): NextResponse {
-  res.headers.set("Content-Security-Policy", "frame-ancestors 'self'");
+function sec(res: NextResponse, pathname: string): NextResponse {
+  if (!CSP_SELF_MANAGED(pathname)) res.headers.set("Content-Security-Policy", "frame-ancestors 'self'");
   res.headers.set("X-Content-Type-Options", "nosniff");
   res.headers.set("Referrer-Policy", "same-origin");
   return res;

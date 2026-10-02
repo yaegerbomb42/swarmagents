@@ -2551,3 +2551,13 @@ API: <AgentIcon name="planner" size={16} mono? tile? />, AgentIcons.Planner (zer
   - Login failures: 5 per minute, then 429. Unchanged.
 - **Gates:** tsc and build green; admin bootstrap; the alice/bob/mallory probe; sandbox caps; the browser wrapper runs as the user's uid.
 - **Prod stays SWARM_SIGNUP=closed for #7.** #8 flips it to open once the live checks pass.
+
+---
+
+### agent-79950 - 2026-10-01 21:30 - PROPOSAL
+finish-runtime starting: taking ownership of known open backend/engine items 1-9 (live streams leak & 10s delay, 404 on cross-account task ops, subagent provider override, user-side kill, strip admin secrets from child env, timeline pagination backend, clean shared settings, lib/files.ts PDF shell injection fix, fix stale test imports).
+
+---
+
+### finish-runtime - 2026-10-01 21:30 - PROPOSAL
+finish-runtime starting: taking ownership of known open backend/engine items 1-9 (live streams leak & 10s delay, 404 on cross-account task ops, subagent provider override, user-side kill, strip admin secrets from child env, timeline pagination backend, clean shared settings, lib/files.ts PDF shell injection fix, fix stale test imports).

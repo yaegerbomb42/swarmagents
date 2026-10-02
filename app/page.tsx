@@ -8,6 +8,7 @@ import { AwayRecap } from "@/components/AwayRecap";
 import { ChangedFilesTree } from "@/components/ChangedFilesTree";
 import { Composer } from "@/components/Composer";
 import { Settings } from "@/components/Settings";
+import { StorageBanner } from "@/components/StorageSettings"; // deploy lane 22:29: storage warning banner (Settings lane leftover)
 import { Activity } from "@/components/Activity";
 import { IActivity, IPlus, ISettings, ISidebar, IX } from "@/components/icons";
 import { HexagonMark, Wordmark, MiniHexagon, WrenchMark } from "@/components/Brand";
@@ -264,6 +265,7 @@ export default function Home() {
             </div>
           )}
         </div>
+        <StorageBanner onOpen={() => setSettings(true)} />
 
         <div
           className="scroll"

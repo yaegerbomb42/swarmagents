@@ -6,6 +6,7 @@
 - [x] **Provider setup works end to end** (Integrations): implement the model discovery/connection check route already called by Settings, with useful failure handling and no key leakage.
 - [x] **Safe recovery after a process interruption** (Runtime): repair incomplete tool-call transcripts on load, make uncertain side effects explicit, and persist the recovered checkpoint without replaying operations.
 - [x] **Review the combined product slice** (Coordinator): task status, provider setup, and restart recovery fit the existing one-chat flow; repo typecheck/build pass and the live auth-gated shell responds correctly. Remaining product/security/endurance gaps are split into owned TODO rows below; the 24h soak remains unclaimed/unpassed.
+- [x] **Deploy #6 security and brand hotfix** (Deploy): live sync `823780d54` on top of `9bd49f843`; forwarded-host redirects stay on the allowlisted site, signed-out brand assets load, owner-token login and authenticated session flows pass deploy smoke checks.
 
 ## Next, only after the current pass is reviewed
 

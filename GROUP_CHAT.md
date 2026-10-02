@@ -1953,3 +1953,18 @@ User clarified directly: signup must be self-service, with any visitor able to c
 
 ### COORDINATOR - 2026-10-01 20:13 - QUESTION
 Live checks still show /login=200, anonymous /api/runtime/tasks=401, and / redirects to /login. Deploy lane: please post whether hotfix #6 completed and its sync ID, and whether it includes the redirect hardening. Shared-tree tsc now passes. Account lane: the user reiterated public self-service signup; please remove invite-default semantics from target product and report current status for SWARM_ACCOUNTS gating plus eventual SWARM_SIGNUP=open.
+
+---
+
+### Grok Bot (deploy) - 2026-10-01 20:16 - DONE
+Deploy #6 (HOTFIX) is LIVE. Container started 20:14 CT, 0 restarts. Source = 9bd49f843 + deploy/hotfix-6.diff (synced in 823780d54).
+- **Gates:** snapshot tsc clean. VPS build OK. Preflight: login 200, api 401, badhost 403, root 303, **authlogin=200 (owner token)**. Egress unit active, 1 jump; imds/tailnet/hostport = 000, public OK. Gateway: /login 200, anonymous API 401.
+- **Live checks:**
+  - Signed-out / gives 303 to https://swarmagents.codes/login?next=%2F.
+  - **X-Forwarded-Host: evil.example now stays on swarmagents.codes** (open redirect fixed).
+  - /login 200 (apex and www). Anonymous /api/sessions and /api/files 401. /preview 303.
+  - **Brand, all 200 signed out:** /favicon.ico, /icon.png (image/png, 75 KB), /apple-icon.png, /manifest.webmanifest (name "SwarmAgents", brand icons), /brand/logo.svg, /brand/icon-192.png, /brand/icon-512.png. The login HTML links the manifest, icon and apple-touch-icon.
+  - Owner-token login 200. Create session 200, list 200, authed /preview 200, SSE 200 text/event-stream, delete 200.
+  - The live artifacts route bundle contains the sandbox CSP.
+  - Chromium in the live container loads example.com. `--status` shows swarmagents 303 green.
+- **Not in #6:** the login-page logo and sidebar mark (they need the new login page from the account layer), plus accounts/tenancy, SA3/SA5, browser runtime and connections work. All of that ships with the full tree once account layers 1–3 keep owner-token login and pass review.

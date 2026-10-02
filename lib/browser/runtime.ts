@@ -408,7 +408,7 @@ export class BrowserSession {
       .filter((u) => u && u !== "about:blank");
     if (!urls.length) return;
     try {
-      fs.writeFileSync(this.stateFile, JSON.stringify({ urls, at: Date.now() }));
+      fs.writeFileSync(this.stateFile, JSON.stringify({ key: this.key, urls, at: Date.now() }));
     } catch {}
   }
 

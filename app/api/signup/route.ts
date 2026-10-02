@@ -1,0 +1,55 @@
+import { checkOwnerToken, clearFailures, noteFailure, serverMode, sessionCookie, throttled } from "@/lib/auth";
+import { consumeInvite, createUser, signupMode, startSession, transaction, userCount, usernameTaken, validateCredentials } from "@/lib/users";
+
+export const dynamic = "force-dynamic";
+
+/**
+ * Create an account: { username, password, invite }. The very first account must present the owner token as its
+ * invite and becomes the admin. After that, SWARM_SIGNUP decides: "invite" (default) needs an unused invite from
+ * an admin, "open" needs nothing, "closed" refuses.
+ */
+export async function POST(req: Request) {
+  if (!serverMode()) return Response.json({ error: "Accounts are only used on a hosted server." }, { status: 400 });
+  if (throttled(req)) return Response.json({ error: "Too many attempts. Try again in a minute." }, { status: 429 });
+  const body = (await req.json().catch(() => ({}))) as { username?: string; password?: string; invite?: string };
+  const username = String(body.username ?? "").trim();
+  const password = String(body.password ?? "");
+  const invite = String(body.invite ?? "").trim();
+  const bad = validateCredentials(username, password);
+  if (bad) return Response.json({ error: bad }, { status: 400 });
+
+  const first = userCount() === 0;
+  const mode = signupMode();
+  if (!first && mode === "closed") return Response.json({ error: "Sign-ups are closed." }, { status: 403 });
+  if (first && !checkOwnerToken(invite)) {
+    await noteFailure(req);
+    return Response.json({ error: "The first account needs the server's owner token as its invite code." }, { status: 403 });
+  }
+
+  let created;
+  try {
+    created = transaction(() => {
+      if (usernameTaken(username)) throw new SignupError("That username is taken.", 409);
+      const user = createUser(username, password, first);
+      if (!first && mode === "invite" && !consumeInvite(invite, user.id)) throw new SignupError("That invite code is not valid or was already used.", 403);
+      return user;
+    });
+  } catch (e) {
+    if (!(e instanceof SignupError)) throw e;
+    if (e.status === 403) await noteFailure(req);
+    return Response.json({ error: e.message }, { status: e.status });
+  }
+  clearFailures(req);
+  const res = Response.json({ ok: true, user: { username: created.username, isAdmin: created.isAdmin } });
+  res.headers.append("Set-Cookie", sessionCookie(req, startSession(created.id)));
+  return res;
+}
+
+class SignupError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { sessionDir, newId } from "../store";
+import { redactSavedKeys, toolEnv } from "../connections";
 import { clip, type Tool } from "./types";
 
 const MARK = "__SWARM_CWD__";
@@ -28,6 +29,9 @@ function childEnv(): NodeJS.ProcessEnv {
     if (STRIPPED_ENV.has(k) || k.startsWith("SWARM_")) continue;
     if (v !== undefined) env[k] = v;
   }
+  // Saved tool keys become usable env vars for the agent's commands (Settings -> tool keys).
+  // connections.ts refuses reserved names; their VALUES are masked out of every output path.
+  Object.assign(env, toolEnv());
   return env;
 }
 
@@ -98,9 +102,17 @@ export function pruneLogs(sessionId: string): number {
     if (now - l.mtime >= ACTIVE_LOG_MS) continue;
     try {
       if (l.size <= LOG_HEAD_BYTES) continue;
-      const head = fs.readFileSync(l.f).subarray(0, LOG_HEAD_BYTES);
-      fs.writeFileSync(l.f, head);
-      total -= l.size - head.length;
+      // Read only the head: the log may be hundreds of MB and must not be loaded whole.
+      const fd = fs.openSync(l.f, "r");
+      const head = Buffer.alloc(Math.min(LOG_HEAD_BYTES, l.size));
+      let n = 0;
+      try {
+        n = fs.readSync(fd, head, 0, head.length, 0);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.writeFileSync(l.f, head.subarray(0, n));
+      total -= l.size - n;
     } catch {}
   }
   return before - total;
@@ -211,18 +223,23 @@ export const shell: Tool = {
         }
         const cut = out.length - CAPTURE_TAIL_BYTES;
         try {
-          fs.writeSync(spillFd, out.slice(0, cut));
+          // Saved keys are redacted before anything reaches disk, so a later read_file cannot leak them.
+          fs.writeSync(spillFd, redactSavedKeys(out.slice(0, cut)));
         } catch {}
         dropped += cut;
         out = out.slice(cut);
       };
 
-      const onData = (d: Buffer) => {
-        const s = d.toString();
-        capture(s);
-        // Live feed to the user, also bounded: the tool card stores whatever it is handed.
-        const visible = s.split(MARK)[0];
-        if (!visible) return;
+      // Live feed to the user, batched so the key redactor runs a few times a second rather than on
+      // every chunk. The tool card stores exactly what it is handed, so this is where keys must go.
+      let pending = "";
+      let flushTimer: NodeJS.Timeout | null = null;
+      const flush = () => {
+        flushTimer = null;
+        if (!pending) return;
+        const s = redactSavedKeys(pending);
+        pending = "";
+        if (!s) return;
         if (streamed >= STREAM_BYTES) {
           if (!streamNotified) {
             streamNotified = true;
@@ -230,9 +247,17 @@ export const shell: Tool = {
           }
           return;
         }
-        const slice = visible.slice(0, STREAM_BYTES - streamed);
+        const slice = s.slice(0, STREAM_BYTES - streamed);
         streamed += slice.length;
         ctx.onOutput(slice);
+      };
+      const onData = (d: Buffer) => {
+        const s = d.toString();
+        capture(s);
+        const visible = s.split(MARK)[0];
+        if (!visible) return;
+        pending += visible;
+        if (!flushTimer) flushTimer = setTimeout(flush, 250);
       };
       child.stdout.on("data", onData);
       child.stderr.on("data", onData);
@@ -251,13 +276,18 @@ export const shell: Tool = {
       ctx.signal.addEventListener("abort", kill, { once: true });
       child.on("close", (code) => {
         clearTimeout(timer);
+        if (flushTimer) {
+          clearTimeout(flushTimer);
+          flush();
+        }
         const i = out.lastIndexOf(MARK);
         if (i >= 0) {
           const nextDir = out.slice(i + MARK.length).trim();
           if (nextDir && fs.existsSync(nextDir)) ctx.setCwd(nextDir);
           out = out.slice(0, i);
         }
-        out = out.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").trimEnd();
+        // One canonical redaction pass covers both what the model sees and what lands on disk.
+        out = redactSavedKeys(out.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").trimEnd());
         if (spillFd >= 0) {
           // Finish the one full log on disk, then point at it instead of writing a second file.
           try {

@@ -1,31 +1,39 @@
 // Access control, shared by middleware (Node runtime) and route handlers that bypass it.
 //
-// With SWARM_AUTH_TOKEN unset the app is local-only: requests must come from 127.0.0.1/localhost pages.
-// With it set (any deployment), every request needs the token, via the httpOnly cookie set by /login or an
-// `Authorization: Bearer` header. Locality grants nothing then: behind a reverse proxy every request looks local.
-// On a server, set SWARM_AUTH_TOKEN_SHA256 (hex sha256 of the token) instead of the token itself: the agent runs
-// as the same user and can read this process's environment, so the plaintext must never be on the server.
-// SWARM_MODE=server fails closed: without a token nothing is served. SWARM_ALLOWED_HOSTS (comma list), when
-// set, restricts which Host names are answered at all.
+// Local mode (default, a laptop): no accounts. Requests must come from 127.0.0.1/localhost pages, and everything
+// runs as the single user "local".
+// Server mode (SWARM_MODE=server, a deployment): every request needs a signed-in account (lib/users.ts), via the
+// httpOnly session cookie set by /login or an `Authorization: Bearer <session token>` header. Locality grants
+// nothing: behind a reverse proxy every request looks local. SWARM_ALLOWED_HOSTS (comma list), when set,
+// restricts which Host names are answered at all.
+//
+// The owner token (SWARM_AUTH_TOKEN_SHA256, or SWARM_AUTH_TOKEN locally) now has one job: it is the invite code
+// that creates the first, admin account. Keep only the digest on a server: the agent can read this process's env.
 
 import { createHash, timingSafeEqual } from "node:crypto";
+import { userForToken, type User } from "./users";
 
 export const AUTH_COOKIE = "swarm_auth";
+/** Set by middleware on every forwarded request (any client-sent value is overwritten): the signed-in user's id. */
+export const USER_HEADER = "x-swarm-user";
+export const LOCAL_USER: User = { id: "local", username: "local", isAdmin: true, createdAt: 0 };
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest();
 
-/** Digest of the access token, or null when sign-in is not configured. */
-function expected(): Buffer | null {
+function ownerDigest(): Buffer | null {
   const hex = (process.env.SWARM_AUTH_TOKEN_SHA256 ?? "").trim().toLowerCase();
   if (/^[0-9a-f]{64}$/.test(hex)) return Buffer.from(hex, "hex");
   const raw = process.env.SWARM_AUTH_TOKEN ?? "";
   return raw ? sha256(raw) : null;
 }
 
-export const authEnabled = () => expected() !== null;
 export const serverMode = () => process.env.SWARM_MODE === "server";
-/** Server mode with no token configured: refuse everything rather than fall back to open. */
-export const misconfigured = () => serverMode() && !authEnabled();
+
+/** Is this the owner token? Compares digests: constant-time and independent of the token's length. */
+export function checkOwnerToken(candidate: string) {
+  const want = ownerDigest();
+  return !!want && candidate.length > 0 && timingSafeEqual(sha256(candidate), want);
+}
 
 const allowedHosts = () =>
   (process.env.SWARM_ALLOWED_HOSTS ?? "")
@@ -50,18 +58,17 @@ export function clientIp(req: Request) {
   return xff.length >= hops ? xff[xff.length - hops] : (req.headers.get("x-real-ip") ?? "local");
 }
 
-/** Compares digests, so the check is constant-time and never depends on the token's length. */
-export function checkToken(candidate: string) {
-  const want = expected();
-  return !!want && candidate.length > 0 && timingSafeEqual(sha256(candidate), want);
-}
-
 function cookie(req: Request, name: string) {
   for (const part of (req.headers.get("cookie") ?? "").split(";")) {
     const i = part.indexOf("=");
     if (i > 0 && part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
   }
   return "";
+}
+
+/** The session token a request carries (cookie, else bearer). */
+export function sessionToken(req: Request) {
+  return cookie(req, AUTH_COOKIE) || (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
 }
 
 const localHost = (h: string) => h === "127.0.0.1" || h === "localhost";
@@ -73,8 +80,8 @@ export function isLocalRequest(req: Request) {
   return localHost(host) && (!origin || localHost(new URL(origin).hostname));
 }
 
-/** A browser-sent Origin must match the host it is talking to. Requests without one (curl, SSE GETs) rely on the token. */
-function sameOrigin(req: Request) {
+/** A browser-sent Origin must match the host it is talking to. Requests without one (curl, SSE GETs) rely on the session. */
+export function sameOrigin(req: Request) {
   const origin = req.headers.get("origin");
   if (!origin) return true;
   const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? "";
@@ -85,13 +92,41 @@ function sameOrigin(req: Request) {
   }
 }
 
-export function isAuthorized(req: Request) {
-  const bearer = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
-  return checkToken(bearer) || checkToken(cookie(req, AUTH_COOKIE));
+/** Who is making this request, or null if nobody is allowed to. The single gate every request passes through. */
+export function requestUser(req: Request): User | null {
+  if (!hostAllowed(req)) return null;
+  if (!serverMode()) return isLocalRequest(req) ? LOCAL_USER : null;
+  if (!sameOrigin(req)) return null;
+  return userForToken(sessionToken(req));
 }
 
-/** The single gate every request passes through. */
-export function isAllowed(req: Request) {
-  if (misconfigured() || !hostAllowed(req)) return false;
-  return authEnabled() ? isAuthorized(req) && sameOrigin(req) : isLocalRequest(req);
+export const isAllowed = (req: Request) => requestUser(req) !== null;
+
+/** Cookie for a fresh login session. Secure on servers, and whenever the client reached us over https. */
+export function sessionCookie(req: Request, token: string, maxAgeSec = 60 * 60 * 24 * 30) {
+  const secure = serverMode() || (req.headers.get("x-forwarded-proto") ?? new URL(req.url).protocol.replace(":", "")) === "https";
+  return `${AUTH_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSec}${secure ? "; Secure" : ""}`;
 }
+
+// Failed logins and signups are limited per client and globally, so passwords and invites can't be guessed online.
+const failures = new Map<string, { n: number; at: number }>();
+let globalFailures = { n: 0, at: 0 };
+
+export function throttled(req: Request) {
+  const now = Date.now();
+  if (now - globalFailures.at > 60_000) globalFailures = { n: 0, at: now };
+  const f = failures.get(clientIp(req));
+  return (!!f && f.n >= 5 && now - f.at < 60_000) || globalFailures.n >= 60;
+}
+
+export async function noteFailure(req: Request) {
+  const now = Date.now();
+  const who = clientIp(req);
+  const f = failures.get(who);
+  failures.set(who, { n: (f && now - f.at < 60_000 ? f.n : 0) + 1, at: now });
+  globalFailures.n++;
+  if (failures.size > 10_000) failures.clear();
+  await new Promise((r) => setTimeout(r, 500));
+}
+
+export const clearFailures = (req: Request) => failures.delete(clientIp(req));

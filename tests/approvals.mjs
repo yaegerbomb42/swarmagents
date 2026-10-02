@@ -45,6 +45,13 @@ check("browser plain type is safe", riskOf("browser", { action: "type", text: "h
 check("browser type submit is gated", riskOf("browser", { action: "type", text: "hi", submit: true })?.level === "outward");
 check("browser press Enter is gated", riskOf("browser", { action: "press", key: "Enter" })?.level === "outward");
 
+// Target-label classification (from the browser's last observation): clicking a control that reads like
+// it commits is gated, while ordinary links stay safe. Label is passed in to keep approvals.ts import-free.
+check("browser click on ordinary link is safe", riskOf("browser", { action: "click", index: 3 }, 'link "Read more"') === null);
+check("browser click on submit control is gated", riskOf("browser", { action: "click", index: 4 }, 'button "Place order"')?.level === "outward");
+check("browser click on Delete is gated", riskOf("browser", { action: "click", index: 5 }, 'button "Delete account"')?.level === "outward");
+check("browser click with no label is safe", riskOf("browser", { action: "click", index: 6 }) === null);
+
 // The hash binds an action to its exact content: approving one command must not approve another.
 check("hash is stable", actionHash("bash", { command: "rm -rf a" }) === actionHash("bash", { command: "rm -rf a" }));
 check("hash differs by command", actionHash("bash", { command: "rm -rf a" }) !== actionHash("bash", { command: "rm -rf b" }));

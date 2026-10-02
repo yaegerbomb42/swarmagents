@@ -463,6 +463,50 @@ const cases = {
     return "csv inline, pdf saved to downloads, png as image, dead host explained";
   },
 
+  async subagents() {
+    // SA3: sub-agent preferences live under `subagents` in settings.json and are validated on save.
+    const file = path.join(HOME, "settings.json");
+    let r = await api("GET", "/api/settings/subagents");
+    assert(r.status === 200 && r.json.settings.mode && r.json.limits.parallelMax === 10, "GET", r.json);
+    const before = JSON.parse(fs.readFileSync(file, "utf8"));
+    try {
+      r = await api("PUT", "/api/settings/subagents", { mode: "fixed", maxParallel: 6, budgetTokens: 1000000, maxStepsPerChild: 40 });
+      assert(r.status === 200 && r.json.settings.mode === "fixed" && r.json.settings.maxParallel === 6 && r.json.settings.budgetTokens === 1000000, "PUT valid", r.json);
+      const disk = JSON.parse(fs.readFileSync(file, "utf8"));
+      assert(disk.subagents?.maxParallel === 6 && JSON.stringify(disk.providers) === JSON.stringify(before.providers), "persisted, providers untouched", disk.subagents);
+      assert((fs.statSync(file).mode & 0o777) === 0o600, "settings.json stays 0600");
+      for (const [bad, re] of [
+        [{ maxParallel: 11 }, /2 to 10/],
+        [{ maxParallel: 1 }, /2 to 10/],
+        [{ mode: "turbo" }, /off, auto or fixed/],
+        [{ childProvider: "nope" }, /doesn't exist/],
+        [{ budgetTokens: 5 }, /at least 1,000/],
+        [{ evil: 1 }, /Unknown setting/],
+      ]) {
+        r = await api("PUT", "/api/settings/subagents", bad);
+        assert(r.status === 400 && re.test(r.json.error ?? ""), `refused ${JSON.stringify(bad)}`, r.json);
+      }
+      const prov = r.json && (await api("GET", "/api/settings/subagents")).json.providers.find((p) => p.enabled);
+      if (prov) {
+        r = await api("PUT", "/api/settings/subagents", { childProvider: prov.id, childModel: "mock-small" });
+        assert(r.status === 200 && r.json.settings.childProvider === prov.id && r.json.settings.childModel === "mock-small", "child provider + model", r.json);
+        assert(!JSON.stringify(r.json).includes("e2e-key"), "no keys in the response");
+      }
+      // Hand edits are clamped, not trusted.
+      fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), subagents: { mode: "fixed", maxParallel: 99, maxStepsPerChild: -3 } }, null, 2), { mode: 0o600 });
+      r = await api("GET", "/api/settings/subagents");
+      assert(r.json.settings.maxParallel === 10 && r.json.settings.maxStepsPerChild === 5, "hand edits clamped", r.json.settings);
+      r = await api("PUT", "/api/settings/subagents", { mode: "off" });
+      assert(r.json.settings.mode === "off", "off");
+    } finally {
+      const cur = JSON.parse(fs.readFileSync(file, "utf8"));
+      delete cur.subagents;
+      if (before.subagents) cur.subagents = before.subagents;
+      fs.writeFileSync(file, JSON.stringify(cur, null, 2), { mode: 0o600 });
+    }
+    return "GET/PUT, validation (2–10, modes, provider, budget, unknown keys), child model, persisted 0600, hand edits clamped";
+  },
+
   async shellkey() {
     // Saved tool keys are exported to the agent's shell, and their values are masked in the output.
     if (!fs.readFileSync(path.join(ROOT, "lib/tools/shell.ts"), "utf8").includes("toolEnv")) return "skipped: lib/tools/shell.ts doesn't export saved keys yet";

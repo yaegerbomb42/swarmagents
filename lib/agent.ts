@@ -6,6 +6,7 @@ import { archiveEvents, getMeta, listSessions, loadEvents, loadHistory, newId, s
 import { contextWindow, estimateTokens, routeTurn, setLearnedContext, activeProviders } from "./router";
 import { ProviderError } from "./providers/types";
 import { allTools } from "./tools";
+import { browserTargetLabel } from "./tools/browser";
 import type { Tool } from "./tools/types";
 import { setAgentAdapter } from "./runtime/resume";
 import { riskOf, actionHash, describe, type Risk } from "./runtime/approvals";
@@ -466,7 +467,7 @@ class Session {
   private gate(name: string, input: Record<string, unknown>): "run" | "ask" | "denied" {
     const guard = taskGuards.get(this.meta.id);
     if (!guard) return "run";
-    const risk = riskOf(name, input);
+    const risk = riskOf(name, input, name === "browser" ? browserTargetLabel(input) : undefined);
     if (!risk) return "run";
     const hash = actionHash(name, input);
     if (takeApproval(guard.taskId, hash)) return "run"; // approved this exact action, once

@@ -74,7 +74,11 @@ export async function GET(req: Request) {
     "Content-Type": mime.startsWith("text/") ? `${mime}; charset=utf-8` : mime,
     "Content-Length": String(st.size),
     // Chrome won't render a PDF under a sandbox CSP; its viewer runs PDF script in its own isolated process anyway.
-    ...(mime === "application/pdf" ? {} : { "Content-Security-Policy": "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'" }),
+    // Everything else is served into an opaque sandbox with no scripts, no inline styles, no form posts and no
+    // object/embed: agent-written HTML/SVG/XML cannot reach the real origin or exfiltrate. (Reviewer-recommended set.)
+    ...(mime === "application/pdf"
+      ? {}
+      : { "Content-Security-Policy": "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'; object-src 'none'" }),
     "X-Content-Type-Options": "nosniff",
     "Cache-Control": "private, no-store",
     "Content-Disposition": `${download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(path.basename(file))}`,

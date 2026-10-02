@@ -44,6 +44,13 @@ const OUTWARD = [
   { re: /\b(kubectl|helm)\s+(apply|delete|upgrade|rollout)\b/i, why: "changes cluster state" },
 ];
 
+/**
+ * A control label from the browser's last observation that reads like it commits an action, e.g.
+ * `button "Place order"`, `"Confirm & pay"`, `input "Delete account"`. Matched on the label only, so
+ * ordinary links ("Read more") stay ungated.
+ */
+const COMMITTING_LABEL = /\b(submit|send|post|publish|confirm|place (order|bid)|buy|purchase|checkout|pay|delete|remove|deactivate|cancel (subscription|account|order)|transfer|withdraw|sign ?up|log ?in|subscribe|unsubscribe|accept|agree|apply)\b/i;
+
 /** The shell command inside a tool input, if this call runs one. */
 function shellCommand(input: Record<string, unknown>): string | null {
   const cmd = input.command ?? input.cmd ?? input.script;
@@ -54,7 +61,7 @@ function shellCommand(input: Record<string, unknown>): string | null {
  * Classify a tool call. Returns null when the call is ordinary and may run unattended.
  * `toolName` matches the tool spec name (e.g. "bash", "write_file", "browser").
  */
-export function riskOf(toolName: string, input: Record<string, unknown>): Risk | null {
+export function riskOf(toolName: string, input: Record<string, unknown>, targetLabel?: string): Risk | null {
   if (toolName === "bash" || toolName === "shell") {
     const cmd = shellCommand(input);
     if (!cmd) return null;
@@ -79,15 +86,19 @@ export function riskOf(toolName: string, input: Record<string, unknown>): Risk |
   }
   if (toolName === "browser") {
     const action = typeof input.action === "string" ? input.action : "";
-    // A plain click/type can be anything, so only the clearly committing forms are gated: submitting a
-    // form or pressing Enter/Return. The coordinator's note asks exactly this until control-label
-    // classification (which button this really is) is available.
+    // A plain click/type can be anything, so we gate the clearly committing forms: submitting a form,
+    // pressing Enter/Return, or clicking a control whose observed label reads like a commit. The label
+    // comes from the browser tool's last observation (browserTargetLabel) and is passed in by the caller
+    // to keep this module import-free.
     if (action === "type" && input.submit === true) return { level: "outward", why: "submits a form" };
     if (action === "press" && /^(enter|return)$/i.test(String(input.key ?? ""))) {
       return { level: "outward", why: "presses Enter (may submit)" };
     }
     if (/submit|purchase|buy|checkout|send|post/i.test(action)) {
       return { level: "outward", why: `performs a web action (${action})` };
+    }
+    if ((action === "click" || action === "press") && targetLabel && COMMITTING_LABEL.test(targetLabel)) {
+      return { level: "outward", why: `acts on a control that looks like it commits (${targetLabel})` };
     }
     return null;
   }

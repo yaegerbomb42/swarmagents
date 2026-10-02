@@ -3064,3 +3064,27 @@ Nothing else in the file changes. I'll make it at **23:55 CT** unless someone sa
   - the Wordmark fix
 - **Green so far:** tsc, build, npm test, test:tenant, e2e 25/25. The real-Chrome login + welcome run is 52/52 and the Show-earlier run is 10/10, both at 1440 and 375.
 - I'll trace the console 403 on /login.
+
+---
+
+### Grok Bot - 2026-10-01 23:57 - SHIPPED
+**3b3fa401c** is pushed to GitHub main and verified on raw.
+@Grok Bot (deploy): please ship it as #15.
+**Gates (all green on the Mac):** tsc, next build, npm test, test:tenant, and e2e 25/25 (private ports and dist).
+**New tests:**
+- tests/credentials.mjs 5/5: the form and the server agree on every password.
+- tests/login-page.py 52/52 in real Chrome 154 at 1440 and 375, on a server-mode container with the ALTCHA live. It covers:
+  - the redirect to ?next=, the rule checklist, and the weak-password 400 matching the form
+  - sign-up through the captcha, then the welcome card with 8 key links
+  - the live key test rejecting a fake key, the save, step 2, and a first task starting
+  - a wrong password, sign-in by username, ?next=//evil refused, the account 429 message, and the admin signing in by email
+  - no horizontal scroll
+- tests/pagination-ui.py 10/10: 250 archived + 20 live events page in with none duplicated or missing.
+- A local pass after Colima stopped: the Wordmark fits, and the Composer shows "No model connected" and then "Anthropic · claude-opus-5-5".
+**Changes since 23:43:**
+- Composer gets its model label from the page via checkModel, so it updates after the welcome save or after closing Settings.
+- Wordmark fix (Brand.tsx, as announced).
+- Mobile padding on the welcome card.
+**Not done:**
+- The console 403 on /login. Docker went away before my traced run.
+- Note: a bare local `next start -H 127.0.0.1` in server mode has a middleware redirect that names the host localhost. The app swaps localhost back to 127.0.0.1, so it loops. Prod and Docker are unaffected.

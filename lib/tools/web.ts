@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { searchKeys } from "../connections";
 import { getSearchConfig } from "../store";
 import { clip, type Tool } from "./types";
@@ -138,21 +140,64 @@ async function duckScrape(query: string, signal: AbortSignal) {
     return { content: results.join("\n\n") || "No results (search may be blocked; try the browser tool with a search engine)." };
 }
 
+const MODEL_IMAGES = /^image\/(png|jpeg|gif|webp)$/;
+const TEXTISH = /^text\/|json|xml|javascript|ecmascript|svg|x-www-form-urlencoded|yaml|csv|graphql/i;
+const MAX_INLINE_IMAGE = 3_500_000;
+
+/** Save a binary response under <cwd>/downloads (name from Content-Disposition or the URL). */
+function saveDownload(cwd: string, res: Response, buf: Buffer) {
+  const cd = res.headers.get("content-disposition") ?? "";
+  const fromHeader = /filename\*=UTF-8''([^;]+)/i.exec(cd)?.[1] ?? /filename="?([^";]+)"?/i.exec(cd)?.[1];
+  let name = "";
+  try {
+    name = decodeURIComponent(fromHeader ?? path.basename(new URL(res.url).pathname));
+  } catch {
+    name = fromHeader ?? "";
+  }
+  name = (name || "download").replace(/[/\\:\0]/g, "_").slice(0, 150);
+  const dir = path.join(cwd, "downloads");
+  fs.mkdirSync(dir, { recursive: true });
+  const dot = name.lastIndexOf(".") > 0 ? name.lastIndexOf(".") : name.length;
+  let file = path.join(dir, name);
+  for (let i = 2; fs.existsSync(file); i++) file = path.join(dir, `${name.slice(0, dot)} (${i})${name.slice(dot)}`);
+  fs.writeFileSync(file, buf);
+  return file;
+}
+
+const fmtSize = (n: number) => (n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`);
+
 export const webFetch: Tool = {
   spec: {
     name: "web_fetch",
-    description: "Fetch a URL and return readable text (HTML converted). Use the browser tool for JS-heavy pages, logins or interaction.",
+    description:
+      "Fetch a URL and return readable text (HTML converted). Images come back as images; PDFs, archives, audio and other files are saved under ./downloads and the path is returned. Use the browser tool for JS-heavy pages, logins or interaction.",
     schema: { type: "object", properties: { url: { type: "string" }, raw: { type: "boolean", description: "Return raw body" } }, required: ["url"] },
   },
   async run(input, ctx) {
-    const res = await fetch(String(input.url), { headers: { "User-Agent": UA, Accept: "text/html,application/json,*/*" }, signal: ctx.signal, redirect: "follow" });
-    const type = res.headers.get("content-type") ?? "";
-    if (/image\//.test(type)) {
+    let res: Response;
+    try {
+      res = await fetch(String(input.url), {
+        headers: { "User-Agent": UA, Accept: "text/html,application/json,*/*" },
+        signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(60_000)]),
+        redirect: "follow",
+      });
+    } catch (e) {
+      if (ctx.signal.aborted) throw e;
+      const err = e as Error & { cause?: { code?: string; message?: string } };
+      const why = err.cause?.code ?? err.cause?.message ?? err.message;
+      return { content: err.name === "TimeoutError" ? `${input.url} didn't answer within 60s.` : `Couldn't fetch ${input.url}: ${why}`, isError: true };
+    }
+    const type = (res.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+    const head = `[${res.status}] ${res.url}`;
+    if (!TEXTISH.test(type) && type && !/html/.test(type)) {
       const buf = Buffer.from(await res.arrayBuffer());
-      return { content: `Image from ${res.url}`, images: [{ mediaType: type.split(";")[0], data: buf.toString("base64") }] };
+      if (MODEL_IMAGES.test(type) && buf.length <= MAX_INLINE_IMAGE) return { content: `${head}\nImage (${type}, ${fmtSize(buf.length)})`, images: [{ mediaType: type, data: buf.toString("base64") }], isError: !res.ok };
+      const file = saveDownload(ctx.cwd, res, buf);
+      const hint = type === "application/pdf" ? " To read it: open it with the browser tool (file:// URL), or extract text with `pdftotext` / python if available." : "";
+      return { content: `${head}\nSaved ${fmtSize(buf.length)} (${type || "unknown type"}) to ${file}.${hint}`, isError: !res.ok };
     }
     const body = await res.text();
     const text = input.raw || !/html/.test(type) ? body : htmlToText(body);
-    return { content: clip(`[${res.status}] ${res.url}\n\n${text}`, 50_000), isError: !res.ok };
+    return { content: clip(`${head}\n\n${text}`, 50_000), isError: !res.ok };
   },
 };

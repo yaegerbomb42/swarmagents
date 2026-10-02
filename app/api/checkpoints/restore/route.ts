@@ -1,20 +1,29 @@
 import { restoreCheckpoint } from "@/lib/tools/files";
 
-/** Undo a file edit: restore the pre-edit snapshot. Body: { checkpoint }.
- *  Scoped to the checkpoint's own session dir would be ideal; the id is random
- *  per snapshot so we search this server's checkpoint dirs for it. */
+/** Undo a file edit: restore the pre-edit snapshot. Body: { checkpoint, session? }.
+ *  `session` scopes the lookup to that task's snapshots (the UI always knows it);
+ *  without it we still search this server's checkpoint dirs, because ids are random
+ *  per snapshot and only one dir can hold a given id in practice. */
 export async function POST(req: Request) {
-  const { checkpoint } = (await req.json().catch(() => ({}))) as { checkpoint?: string };
+  const body = (await req.json().catch(() => ({}))) as { checkpoint?: string; session?: string };
+  const checkpoint = body.checkpoint ?? "";
+  const session = body.session ?? "";
   if (!checkpoint || !/^[a-f0-9]+$/.test(checkpoint)) return new Response("bad checkpoint", { status: 400 });
+  // Enter a session-scoped request only through the session-id format the store enforces.
+  if (session && !/^[a-f0-9]{16}$/.test(session)) return new Response("bad session", { status: 400 });
   const { HOME } = await import("@/lib/store");
   const fs = await import("node:fs");
   const path = await import("node:path");
   const base = path.join(HOME, "checkpoints");
-  let sessions: string[] = [];
-  try {
-    sessions = fs.readdirSync(base);
-  } catch {
-    return new Response("checkpoint not found", { status: 404 });
+  let sessions: string[];
+  if (session) {
+    sessions = [session];
+  } else {
+    try {
+      sessions = fs.readdirSync(base);
+    } catch {
+      return new Response("checkpoint not found", { status: 404 });
+    }
   }
   for (const s of sessions) {
     const r = restoreCheckpoint(s, checkpoint);

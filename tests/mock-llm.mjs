@@ -27,7 +27,7 @@ const PORT = Number(process.argv[2] || process.env.MOCK_PORT || 37901);
 const WORKDIR = process.env.MOCK_WORKDIR || path.join(os.tmpdir(), "swarm-mock-work");
 fs.mkdirSync(WORKDIR, { recursive: true });
 
-const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files", "api"];
+const SCENARIOS = ["echo", "tools", "parallel", "plan", "ratelimit", "flaky", "auth", "slow", "bigcontext", "loop", "badtool", "long", "mcp", "search", "browser", "files", "api", "fetch"];
 const log = [];
 const attempts = new Map(); // conversation hash -> request count, for ratelimit/flaky
 
@@ -188,6 +188,20 @@ function script(a) {
         text: `API: list=${has(/github-token \(GitHub token\)/)} auth=${has(/"auth": "ours"[\s\S]*"q": "1"/)} refused=${has(/only sent to api\.github\.com/)} nospoof=${has(/"auth": "ours"[\s\S]*"extra": "yes"/)} saved=${has(/Saved 4 bytes to .*hello\.mp3/)} redirect=${has(/Redirects to: https:\/\/cdn\.example\.com\/file/)}`,
       };
     }
+    case "fetch": {
+      const base = `http://127.0.0.1:${PORT}/site`;
+      const steps = [
+        { name: "bash", input: { command: `cd ${JSON.stringify(WORKDIR)} && rm -rf downloads && echo ready` } },
+        { name: "web_fetch", input: { url: `${base}/report.csv` } },
+        { name: "web_fetch", input: { url: `${base}/doc.pdf` } },
+        { name: "web_fetch", input: { url: `${base}/pixel.png` } },
+        { name: "web_fetch", input: { url: "http://127.0.0.1:59999/nothing" } },
+      ];
+      if (a.step < steps.length) return { calls: [steps[a.step]] };
+      const o = a.toolOutputs;
+      const has = (re) => (o.some((t) => re.test(t)) ? "ok" : "MISSING");
+      return { text: `Fetch: csv=${has(/^1,2/m)} pdf=${has(/Saved .* \(application\/pdf\) to .*downloads\/doc\.pdf/)} png=${has(/Image \(image\/png/)} dead=${has(/Couldn't fetch .*(ECONNREFUSED|refused)/i)}` };
+    }
     case "long":
       return { text: "## Long answer\n\n" + Array.from({ length: 200 }, (_, i) => `- line ${i + 1}: the quick brown fox jumps over the lazy dog.`).join("\n") };
     default:
@@ -325,6 +339,14 @@ const server = http.createServer(async (req, res) => {
   if (p === "/site/report.csv") {
     res.writeHead(200, { "Content-Type": "text/csv", "Content-Disposition": 'attachment; filename="report.csv"' });
     return res.end("1,2\n3,4\n");
+  }
+  if (p === "/site/doc.pdf") {
+    res.writeHead(200, { "Content-Type": "application/pdf" });
+    return res.end("%PDF-1.4\n%mock\n");
+  }
+  if (p === "/site/pixel.png") {
+    res.writeHead(200, { "Content-Type": "image/png" });
+    return res.end(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64"));
   }
   if (p === "/site/popup") {
     res.writeHead(200, { "Content-Type": "text/html" });

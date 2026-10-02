@@ -195,7 +195,7 @@ function Diff({ oldText, newText }: { oldText: string; newText: string }) {
   );
 }
 
-function UndoButton({ checkpoint, path }: { checkpoint: string; path: string }) {
+function UndoButton({ checkpoint, path, session }: { checkpoint: string; path: string; session?: string }) {
   const [state, setState] = useState<"idle" | "doing" | "done" | "error">("idle");
   if (state === "done") return <span className="undo done">✓ Restored</span>;
   return (
@@ -210,7 +210,7 @@ function UndoButton({ checkpoint, path }: { checkpoint: string; path: string }) 
           const r = await fetch("/api/checkpoints/restore", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ checkpoint }),
+            body: JSON.stringify({ checkpoint, session }),
           });
           setState(r.ok ? "done" : "error");
           if (!r.ok) setTimeout(() => setState("idle"), 2500);

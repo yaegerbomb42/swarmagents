@@ -428,6 +428,14 @@ const cases = {
     }
   },
 
+  async fetch() {
+    const { events } = await runTask("[mock:fetch] fetch things", { timeout: 60_000 });
+    const out = texts(events);
+    assert(/Fetch: csv=ok pdf=ok png=ok dead=ok/.test(out), "web_fetch text/pdf/image/dead host", { said: out.slice(-300) });
+    assert(fs.existsSync(path.join(WORK, "downloads", "doc.pdf")), "pdf saved");
+    return "csv inline, pdf saved to downloads, png as image, dead host explained";
+  },
+
   async anthropic() {
     // Same tool script over the native Anthropic protocol, with a Bedrock-style bearer header.
     const r = await api("POST", "/api/connections", { type: "llm", preset: "custom-anthropic", label: "Mock Anthropic", baseUrl: MOCK, apiKey: "e2e-key-anthropic-4321", model: "mock", headers: { Authorization: "Bearer {key}" } });

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Swarm smoke gate — run before marking any MASTER_TODO row done.
-# Checks: typecheck, production build, server boot, API ping, SSE stream.
+# Checks: typecheck, fast unit suites, production build, server boot, API ping, SSE stream.
 # Usage: ./bin/smoke [--skip-build]
 set -e
 cd "$(dirname "$0")/.."
@@ -9,15 +9,21 @@ export NEXT_DIST_DIR=.next-smoke
 SKIP_BUILD=0
 [ "${1:-}" = "--skip-build" ] && SKIP_BUILD=1
 
-echo "== 1/4 typecheck =="
+echo "== 1/5 typecheck =="
 npx tsc --noEmit
 echo OK
 
+echo "== 2/5 fast suites (no server needed) =="
+node --experimental-strip-types tests/auth-gate.mjs 2>&1 | grep -v -i "warning\|repars\|trace-warnings"
+node tests/shell-env.mjs 2>&1 | tail -n 1
+node tests/checkpoint-restore.mjs 2>&1 | tail -n 1
+node tests/timeline-ui.mjs 2>&1 | tail -n 1
+
 if [ "$SKIP_BUILD" = "0" ]; then
-  echo "== 2/4 build =="
+  echo "== 3/5 build =="
   npx next build --no-lint 2>&1 | tail -5
 else
-  echo "== 2/4 build (skipped) =="
+  echo "== 3/5 build (skipped) =="
 fi
 
 echo "== 3/4 boot + API ping =="

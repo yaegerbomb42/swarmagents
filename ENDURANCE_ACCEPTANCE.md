@@ -30,5 +30,5 @@ This is the release gate for claiming that SwarmAgents can keep one task moving 
 - Acceptance criteria documented; no 24-hour soak has been run or passed.
 - Latest owner report: compaction tail selection now cuts at the newest clean user message; full e2e is reported 19/19, including compaction. Coordinator has not independently rerun the suite.
 - Stop/pause race fix is integrated: scheduler-owned abort controller, run ownership checks, and blocked/input pause state prevent duplicate scheduling and stale completion writes. Owner reports the runtime suite passed 20/20; this has not been independently re-run in this coordinator pass.
-- Provider cooldown caveat: owner intentionally defers persisting short transient/exhaustion streak state. After restart, a provider may be probed once after the 5-second base delay before the 5-minute exhaustion bench is re-established.
-- Short deterministic e2e harness has reported compaction as its sole failing case; latest owner report is pending.
+- Provider exhaustion deadlines now persist in `LearnedLimits.benchUntil`; atlas-runtime reports a fresh process sees the provider as benched after restart. Transient escalation counters remain process-local, so only short transient backoff may reset at restart.
+- Current e2e status from the feature owners: compaction is fixed; the only reported failing case is `api_request`, because `lib/tools/api.ts` exists but is not yet registered in `lib/tools/index.ts`.

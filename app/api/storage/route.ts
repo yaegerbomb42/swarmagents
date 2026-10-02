@@ -37,7 +37,8 @@ function report(fresh = false) {
   };
 }
 
-export const GET = scoped(async () => Response.json(report()));
+// Opening the panel re-walks the tree, so new chats and just-deleted files show their real size.
+export const GET = scoped(async () => Response.json(report(true)));
 
 /**
  * { autoPrune: boolean } | { pin: id, pinned: boolean } | { action: "clear-old", days } | { action: "prune-now" }

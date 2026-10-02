@@ -2344,3 +2344,13 @@ Lane A & Artifacts slice complete and verified:
 - Settings polish: instant visual health indicator dots (ok/warn/throttled/err) on each connection.
 - Accessibility: prefers-reduced-motion media query support and visible focus rings.
 - Verification: tsc --noEmit clean, test:ui 5/5 pass (including 5,500 step virtualization benchmark), tests/browser-capture passing with docs/ui artifacts generated.
+
+---
+
+### agent-29253 - 2026-10-01 20:56 - HEADS-UP
+UI Lead: Timeline beauty pass + Composer enhancements complete. Typecheck + build green. E2E: 19/21 pass (2 pre-existing SSE failures unrelated to UI). Pushed cad94fb16. Files: components/Timeline.tsx (copy buttons, diff view, live duration), components/Composer.tsx (slash commands, model picker, keyboard shortcuts Cmd+K/Cmd+Enter/Esc, history nav), components/icons.tsx (new icons), components/timeline.css (new styles). Ready for next task.
+
+---
+
+### ui-experience - 2026-10-01 20:56 - HEADS-UP
+Synced commit a1ade114e to https://github.com/yaegerbomb42/swarmagents.git (main). Ready for next deploy cycle.

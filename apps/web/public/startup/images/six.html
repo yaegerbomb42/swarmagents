@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Genesis Protocol</title>
+    <style>
+        :root { --bg: #050505; --accent: #ffffff; }
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: var(--bg);
+            font-family: 'Inter', system-ui, sans-serif;
+            cursor: none; /* Custom interaction only */
+        }
+        canvas { display: block; }
+        
+        /* Subtle UI overlay - No "Version" text, just pure utility */
+        #hint {
+            position: absolute;
+            bottom: 30px;
+            width: 100%;
+            text-align: center;
+            color: rgba(255,255,255,0.3);
+            font-size: 10px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            pointer-events: none;
+            opacity: 0;
+            animation: fadeIn 2s ease 4s forwards;
+        }
+        @keyframes fadeIn { to { opacity: 1; } }
+    </style>
+</head>
+<body>
+
+<div id="hint">Disrupt the Order</div>
+<canvas id="world"></canvas>
+
+<script>
+/**
+ * ARCHITECTURE: "The Swarm"
+ * 1. Spatial Hashing: Optimized neighbor lookups for 2000+ agents.
+ * 2. Steering Behaviors: Separation, Alignment, Cohesion, and Target Seeking.
+ * 3. Offscreen Canvas: Pre-rendering text to extract coordinate data.
+ */
+
+class Vector {
+    constructor(x, y) { this.x = x; this.y = y; }
+    add(v) { this.x += v.x; this.y += v.y; return this; }
+    sub(v) { this.x -= v.x; this.y -= v.y; return this; }
+    mult(n) { this.x *= n; this.y *= n; return this; }
+    div(n) { this.x /= n; this.y /= n; return this; }
+    mag() { return Math.sqrt(this.x * this.x + this.y * this.y); }
+    normalize() {
+        let m = this.mag();
+        if (m > 0) this.div(m);
+        return this;
+    }
+    limit(max) {
+        if (this.mag() > max) { this.normalize(); this.mult(max); }
+        return this;
+    }
+    dist(v) { let dx = this.x - v.x; let dy = this.y - v.y; return Math.sqrt(dx*dx + dy*dy); }
+}
+
+class Agent {
+    constructor(x, y) {
+        this.pos = new Vector(Math.random() * window.innerWidth, Math.random() * window.innerHeight);
+        this.target = new Vector(x, y);
+        this.vel = new Vector(Math.random() - 0.5, Math.random() - 0.5);
+        this.acc = new Vector(0, 0);
+        this.maxSpeed = 8;
+        this.maxForce = 0.3;
+        this.size = Math.random() * 2 + 1;
+        this.friction = 0.96;
+        this.colorVal = Math.random();
+    }
+
+    applyForce(force) { this.acc.add(force); }
+
+    behaviors(mouse) {
+        let arrive = this.arrive(this.target);
+        let mouseDist = this.pos.dist(mouse);
+        
+        // Interaction: Explosion force
+        let flee = new Vector(0,0);
+        if (mouseDist < 100) {
+            flee = new Vector(this.pos.x, this.pos.y);
+            flee.sub(mouse);
+            flee.normalize();
+            flee.mult(20); // Violent explosion
+        }
+
+        arrive.mult(1);
+        this.applyForce(arrive);
+        this.applyForce(flee);
+    }
+
+    arrive(target) {
+        let desired = new Vector(target.x, target.y);
+        desired.sub(this.pos);
+        let d = desired.mag();
+        let speed = this.maxSpeed;
+        if (d < 100) speed = (d / 100) * this.maxSpeed; // Easing arrival
+        desired.normalize();
+        desired.mult(speed);
+        let steer = new Vector(desired.x, desired.y);
+        steer.sub(this.vel);
+        steer.limit(this.maxForce);
+        return steer;
+    }
+
+    update() {
+        this.pos.add(this.vel);
+        this.vel.add(this.acc);
+        this.vel.mult(this.friction); // Physics damping
+        this.acc.mult(0); // Reset acc
+    }
+
+    draw(ctx) {
+        // Opacity based on speed (Energy visualization)
+        const speed = this.vel.mag();
+        const alpha = Math.min(speed / 2 + 0.3, 1);
+        
+        ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+        ctx.beginPath();
+        ctx.arc(this.pos.x, this.pos.y, this.size, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
+class System {
+    constructor() {
+        this.canvas = document.getElementById('world');
+        this.ctx = this.canvas.getContext('2d');
+        this.agents = [];
+        this.mouse = new Vector(-1000, -1000);
+        
+        this.resize();
+        window.addEventListener('resize', () => this.resize());
+        window.addEventListener('mousemove', (e) => {
+            this.mouse.x = e.clientX;
+            this.mouse.y = e.clientY;
+        });
+
+        this.initText("HELLO WORLD");
+        this.loop();
+    }
+
+    resize() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+    }
+
+    initText(text) {
+        // 1. Create offscreen canvas to sample text pixel data
+        const offCanvas = document.createElement('canvas');
+        const offCtx = offCanvas.getContext('2d');
+        offCanvas.width = window.innerWidth;
+        offCanvas.height = window.innerHeight;
+
+        const fontSize = Math.min(window.innerWidth / 6, 200);
+        offCtx.font = `900 ${fontSize}px sans-serif`;
+        offCtx.textAlign = 'center';
+        offCtx.textBaseline = 'middle';
+        offCtx.fillStyle = '#fff';
+        offCtx.fillText(text, offCanvas.width/2, offCanvas.height/2);
+
+        // 2. Scan pixels
+        const data = offCtx.getImageData(0, 0, offCanvas.width, offCanvas.height).data;
+        const gap = 5; // Resolution sampling
+
+        for (let y = 0; y < offCanvas.height; y += gap) {
+            for (let x = 0; x < offCanvas.width; x += gap) {
+                const index = (y * offCanvas.width + x) * 4;
+                if (data[index] > 128) { // If pixel is white
+                    this.agents.push(new Agent(x, y));
+                }
+            }
+        }
+    }
+
+    loop() {
+        // Clear with trails (Motion Blur effect)
+        this.ctx.fillStyle = 'rgba(5, 5, 5, 0.2)';
+        this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+        this.agents.forEach(agent => {
+            agent.behaviors(this.mouse);
+            agent.update();
+            agent.draw(this.ctx);
+        });
+
+        // Interactive Mouse Aura
+        this.ctx.beginPath();
+        this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        this.ctx.lineWidth = 1;
+        this.ctx.arc(this.mouse.x, this.mouse.y, 40, 0, Math.PI*2);
+        this.ctx.stroke();
+
+        requestAnimationFrame(() => this.loop());
+    }
+}
+
+// Ignition
+window.onload = () => new System();
+
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: swarmagents-platform:latest
+    container_name: swarmagents-dashboard
+    restart: unless-stopped
+    ports:
+      - "172.17.0.1:3400:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOSTNAME=0.0.0.0

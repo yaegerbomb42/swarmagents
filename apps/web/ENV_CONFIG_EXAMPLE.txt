@@ -1,0 +1,30 @@
+# SwarmAgents Dashboard — Environment Configuration
+# Copy to .env.local for local development. Never commit secrets.
+
+# ── Unified engine (required in production) ──────────────────────────────
+# Server-side proxy target (Docker internal hostname or localhost)
+ENGINE_URL=http://localhost:8400
+
+# Leave unset in the browser so fetches go through same-origin /api/engine
+# NEXT_PUBLIC_ENGINE_URL=http://localhost:8400
+# NEXT_PUBLIC_ENGINE_WS_URL=ws://localhost:8400
+
+# ── Optional standalone backends (legacy fallbacks) ──────────────────────
+# BROWSER_BACKEND_URL=http://localhost:8002
+# QUANTUM_BACKEND_URL=http://localhost:8001
+
+# ── Local inference ──────────────────────────────────────────────────────
+# OLLAMA_URL=http://localhost:11434
+# NEXT_PUBLIC_OLLAMA_URL=http://localhost:11434
+
+# ── Auth / JWT (engine /api/auth) ────────────────────────────────────────
+# AUTH secrets live on the engine process — do not put provider API keys here.
+# Configure OpenAI/Anthropic/Groq/etc. keys in the Settings UI (/settings)
+# or in engine/decomposition/provider_config.yaml via ${ENV_VAR} substitution.
+
+# ── Production checklist ─────────────────────────────────────────────────
+# 1. ENGINE_URL points at the unified FastAPI process (:8400)
+# 2. Dashboard has no NEXT_PUBLIC_* secrets
+# 3. Provider API keys saved via /settings (stored in dashboard/.data/, gitignored)
+# 4. TLS terminates at reverse proxy; engine not exposed publicly if possible
+# 5. make / npm run build succeeds with tsc clean on changed modules

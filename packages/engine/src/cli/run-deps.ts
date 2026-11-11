@@ -1,0 +1,232 @@
+import { join } from 'node:path';
+import { findAnthropicKey, findProviderKey } from '../auth/keys.js';
+import { loadConfig } from '../config/load.js';
+import type { ConfigInput, OmnexxConfig } from '../config/schema.js';
+import { parseDuration } from '../config/duration.js';
+import { realClock, type Clock } from '../core/clock.js';
+import { resolvePaths, type OmnexxPaths } from '../core/paths.js';
+import type { RunDeps, RunHooks } from '../core/run.js';
+import { UsageError } from '../errors.js';
+import { AnthropicProvider } from '../providers/anthropic.js';
+import { withStickyRandom } from '../providers/sticky.js';
+import { withToolRepair } from '../providers/repair.js';
+import { withKeyRotation } from '../providers/key-rotation.js';
+import { makeEndpointProvider } from '../providers/make.js';
+import { ProviderRouter } from '../providers/router.js';
+import { ProviderCircuitBreaker } from '../providers/circuit-breaker.js';
+import { QuotaLedger } from '../providers/quota-ledger.js';
+import { withTurnEffort } from '../providers/turn-effort.js';
+import type { Provider } from '../providers/types.js';
+import type { CliIO } from './io.js';
+
+export interface ResolvedDeps {
+  config: OmnexxConfig;
+  paths: OmnexxPaths;
+  clock: Clock;
+  deps: RunDeps;
+}
+
+const DEFAULT_STALL_MS = 3 * 60_000;
+const LOCAL_URL = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])[:/]/i;
+
+/** An endpoint's stall cut-off: as configured, else 3 min for remote endpoints and off for local. */
+export function stallTimeoutMs(setting: string | undefined, baseUrl: string): number | undefined {
+  if (setting === 'off') return undefined;
+  if (setting !== undefined) return parseDuration(setting);
+  return LOCAL_URL.test(baseUrl) ? undefined : DEFAULT_STALL_MS;
+}
+
+/** "auto" = 1h for runs longer than an hour (gates between cycles outlast 5 minutes). */
+export function prefixTtl(setting: 'auto' | '5m' | '1h', maxHours: number): '5m' | '1h' {
+  if (setting !== 'auto') return setting;
+  return maxHours > 1 ? '1h' : '5m';
+}
+
+/** Whether `name` is on the pool's provider allow-list (only meaningful when non-empty). */
+const poolListed = (config: OmnexxConfig, name: string): boolean =>
+  config.pool.providers.includes(name);
+
+/**
+ * Drop models on providers that were not built (a pool-listed provider with no key is
+ * skipped, not fatal) from the run-role chains. A role left with nothing keeps its
+ * configured chain: the pool filter in Run falls back to it instead of failing the run.
+ */
+function pruneChainsToBuilt(
+  config: OmnexxConfig,
+  built: ReadonlyMap<string, unknown>,
+  warn: (msg: string) => void,
+): void {
+  const models = config.models as unknown as Record<string, string | string[] | undefined>;
+  for (const role of ['planner', 'worker', 'cheap', 'helpers'] as const) {
+    const chain = models[role];
+    if (!chain) continue;
+    const refs = typeof chain === 'string' ? [chain] : chain;
+    const kept = refs.filter((r) => built.has(r.slice(0, r.indexOf(':'))));
+    if (kept.length === refs.length) continue;
+    if (kept.length === 0) {
+      warn(`role "${role}" has no usable provider; keeping its configured chain`);
+      continue;
+    }
+    models[role] = kept;
+  }
+}
+
+/** Config + key + provider for any command that talks to the model. The key never leaves this process. */
+export async function resolveRunDeps(
+  io: CliIO,
+  cwd: string,
+  flags: ConfigInput = {},
+  hooks?: RunHooks,
+): Promise<ResolvedDeps> {
+  const { config } = await loadConfig({ cwd, env: io.env, flags });
+  const enabledWorker = Object.entries(config.workers.backends).find(([, w]) => w.enabled);
+  if (enabledWorker) {
+    throw new UsageError(
+      `worker "${enabledWorker[0]}" is enabled, but worker adapters are not available until M3`,
+      `set [workers.${enabledWorker[0]}] enabled = false`,
+    );
+  }
+  const paths = resolvePaths(io.env);
+  // Only the providers some role's chain actually uses need a key.
+  const used = new Set(
+    [config.models.planner, config.models.worker, config.models.cheap, config.models.helpers ?? []]
+      .flatMap((c) => (typeof c === 'string' ? [c] : c))
+      .map((ref) => ref.slice(0, ref.indexOf(':'))),
+  );
+  const secrets: string[] = [];
+  const providers = new Map<string, Provider>();
+  const warn = (msg: string): void => {
+    io.stderr.write(`omnexx: ${msg}\n`);
+  };
+  if (used.has('anthropic')) {
+    const key = await findAnthropicKey(paths, io.env);
+    if (!key && !poolListed(config, 'anthropic')) {
+      throw new UsageError(
+        'no Anthropic API key found',
+        'set ANTHROPIC_API_KEY or run `omnexx auth set anthropic`',
+      );
+    }
+    if (!key) {
+      // A pool-listed provider with no key is skipped, not fatal (run-deps prunes its
+      // models from the chains below); the pool filter then falls back if it must.
+      warn('anthropic is in [pool] providers but no key was found; skipping it');
+    } else {
+      secrets.push(key.key);
+      const anthropic = config.providers.anthropic;
+      providers.set(
+        'anthropic',
+        new AnthropicProvider({
+          apiKey: key.key,
+          ...(anthropic.base_url ? { baseURL: anthropic.base_url } : {}),
+          cacheTtl: anthropic.cache_ttl,
+          prefixTtl: prefixTtl(anthropic.prefix_cache_ttl, config.budget.max_hours),
+          timeoutMs: parseDuration(anthropic.request_timeout),
+        }),
+      );
+    }
+  }
+  for (const [name, ep] of Object.entries(config.providers.endpoints)) {
+    if (!used.has(name)) continue;
+    const apiKey = (await findProviderKey(paths, io.env, name, ep.api_key_env))?.key;
+    if (ep.api_key_env && !apiKey && !poolListed(config, name)) {
+      throw new UsageError(
+        `provider "${name}" needs ${ep.api_key_env}`,
+        `export ${ep.api_key_env}=… or run \`omnexx auth set ${name}\``,
+      );
+    }
+    if (ep.api_key_env && !apiKey) {
+      warn(`provider "${name}" is in [pool] providers but ${ep.api_key_env} is unset; skipping it`);
+      continue;
+    }
+    if (apiKey) secrets.push(apiKey);
+    const opts = {
+      name,
+      baseUrl: ep.base_url,
+      apiKey,
+      timeoutMs: parseDuration(ep.request_timeout),
+      stallTimeoutMs: stallTimeoutMs(ep.stall_timeout, ep.base_url),
+      ...(ep.auth ? { auth: ep.auth } : {}),
+      ...(ep.headers ? { headers: ep.headers } : {}),
+      ...(io.fetch ? { fetch: io.fetch } : {}),
+    };
+    const extraNamed = (ep.api_key_envs ?? []).flatMap((n) => {
+      const k = io.env[n]?.trim();
+      return k && k !== apiKey ? [{ env: n, key: k }] : [];
+    });
+    const extra = extraNamed.map((x) => x.key);
+    secrets.push(...extra);
+    // Key slots by env var NAME only (never the key) so a rejected key can be reported.
+    const slots: { env: string; key: string }[] = [];
+    for (const x of [
+      ...(apiKey ? [{ env: ep.api_key_env ?? name, key: apiKey }] : []),
+      ...extraNamed,
+    ])
+      if (!slots.some((y) => y.key === x.key)) slots.push(x);
+    const keys = slots.map((x) => x.key);
+    const inner =
+      keys.length > 1
+        ? withKeyRotation(
+            keys.map((k) => makeEndpointProvider(ep.kind, { ...opts, apiKey: k })),
+            undefined,
+            (i, status) => {
+              io.stderr.write(
+                `omnexx: ${name}: ${slots[i]?.env ?? `key ${String(i + 1)}`} was rejected (HTTP ${String(status)}); skipping it for this run\n`,
+              );
+            },
+          )
+        : makeEndpointProvider(ep.kind, opts);
+    // Weaker and local models often emit broken tool JSON; repair it before the loop sees it.
+    const repaired = withToolRepair(inner);
+    providers.set(
+      name,
+      ep.sticky_random
+        ? withStickyRandom(repaired, {
+            baseUrl: ep.base_url,
+            apiKey,
+            stateFile: join(paths.configHome, `sticky-${name}.json`),
+            ...(io.fetch ? { fetch: io.fetch } : {}),
+          })
+        : repaired,
+    );
+  }
+  // Only providers that were actually built can take a call: drop the rest from the
+  // run-role chains, so a key-less pool provider is never attempted. The pool filter in
+  // Run then falls back to the pruned chain when the list leaves nothing usable.
+  pruneChainsToBuilt(config, providers, warn);
+  // Effort per turn ([agent] turn_effort) rides on every call this run makes.
+  const circuits = new Map<string, ProviderCircuitBreaker>();
+  for (const [name, ep] of Object.entries(config.providers.endpoints)) {
+    if (!used.has(name)) continue;
+    circuits.set(
+      name,
+      new ProviderCircuitBreaker({
+        failureThreshold: ep.breaker_failures,
+        baseCooloffMs: parseDuration(ep.breaker_cooloff),
+        maxCooloffMs: parseDuration(ep.breaker_max_cooloff),
+      }),
+    );
+  }
+  const quota = new QuotaLedger(join(paths.configHome, 'quota.json'), () => clock.now());
+  const provider: Provider = withTurnEffort(
+    io.makeProvider
+      ? io.makeProvider(secrets[0] ?? '')
+      : new ProviderRouter({ providers, circuits, quota }),
+    config.agent.turn_effort,
+  );
+  const clock = io.clock ?? realClock;
+  return {
+    config,
+    paths,
+    clock,
+    deps: {
+      config,
+      paths,
+      env: io.env,
+      clock,
+      provider,
+      fetch: io.fetch ?? globalThis.fetch,
+      secrets,
+      ...(hooks ? { hooks } : {}),
+    },
+  };
+}

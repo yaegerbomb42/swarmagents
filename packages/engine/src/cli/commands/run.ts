@@ -1,0 +1,323 @@
+import { startTracking } from '../bootstrap.js';
+import { isWritingGoal, resolveWriting } from '../../core/writing.js';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import pc from 'picocolors';
+import { buildCodemap } from '../../agent/codemap.js';
+import { runPlanner } from '../../agent/planner.js';
+import { writeJsonAtomic } from '../../core/atomic.js';
+import { createRun } from '../../core/create.js';
+import { compactPlanView } from '../../core/plan.js';
+import { Run } from '../../core/run.js';
+import { formatEstimate } from '../../core/run-estimate.js';
+import { estimateForRun, PROGRESS_EVENTS, remainingForRun } from '../../core/run-estimate-io.js';
+import { UsageError } from '../../errors.js';
+import { parseDuration } from '../../config/duration.js';
+import { parseTokensPerTurn } from '../../agent/turn-budget.js';
+import type { ConfigInput } from '../../config/schema.js';
+import { selfEntry, spawnDetached } from '../../daemon/detach.js';
+import { brand } from '../brand.js';
+import { EventTail, LiveFeed } from '../../telemetry/feed.js';
+import { verbosityFrom } from '../../telemetry/humanize.js';
+import { println, type CliIO } from '../io.js';
+import { RUN_FLAGS_FILE, superviseForeground } from './control.js';
+import { resolveRunDeps } from '../run-deps.js';
+import { EXIT } from '../exit-codes.js';
+import { bootstrapEmptyProject, isEmptyProject, projectFolderFor } from '../bootstrap.js';
+
+export interface RunFlags {
+  goalFile?: string;
+  planOnly?: boolean;
+  budget?: string;
+  /** Per-task dollar cap; the task is parked (checkpointed) when it is reached. */
+  taskBudget?: string;
+  /** Per-task token cap. */
+  taskTokens?: string;
+  /** Per-turn input context budget: a number ("4096") or k shorthand ("16k"). */
+  tokensPerTurn?: string;
+  hours?: string;
+  /** Run-level turn cap: stop as expired after this many worker + planner turns. */
+  maxTurns?: string;
+  /** Autonomous mode for this long, e.g. "8h" or "2d". */
+  for?: string;
+  /** Improvement rounds after the goal is met (default 0; opt in per run). */
+  beyond?: string;
+  gate?: string[];
+  sandbox?: string;
+  modelWorker?: string;
+  push?: string;
+  from?: string;
+  /** auto | fast | full */
+  plan?: string;
+  /** auto | code | writing */
+  kind?: string;
+  /** swe | general: the work domain (documents/data/research instead of code). */
+  mode?: string;
+  planHelpers?: string;
+  planMilestones?: string;
+  /** full | lazy: tool discovery mode */
+  toolDiscovery?: string;
+}
+
+export function flagsToConfig(f: RunFlags): ConfigInput {
+  const num = (v: string | undefined, name: string): number | undefined => {
+    if (v === undefined) return undefined;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0)
+      throw new UsageError(`--${name} expects a positive number, got "${v}"`);
+    return n;
+  };
+  const posInt = (v: string | undefined, name: string): number | undefined => {
+    const n = num(v, name);
+    if (n !== undefined && !Number.isInteger(n))
+      throw new UsageError(`--${name} expects a whole number, got "${v}"`);
+    return n;
+  };
+  /** --hours accepts bare hours ("0.5", "2") or a duration ("30m", "1h30m"). */
+  const hoursValue = (v: string | undefined): number | undefined => {
+    if (v === undefined) return undefined;
+    let hours: number;
+    try {
+      hours = parseDuration(v) / 3_600_000;
+    } catch {
+      return num(v, 'hours');
+    }
+    if (!Number.isFinite(hours) || hours <= 0)
+      throw new UsageError(`--hours expects a positive number, got "${v}"`);
+    return hours;
+  };
+  const auto = autonomousHours(f);
+  const budget = {
+    max_usd: num(f.budget, 'budget'),
+    ...(f.taskBudget ? { task_max_usd: num(f.taskBudget, 'task-budget') } : {}),
+    ...(f.taskTokens ? { task_max_tokens: Math.floor(num(f.taskTokens, 'task-tokens') ?? 0) } : {}),
+    ...(f.maxTurns ? { max_turns: posInt(f.maxTurns, 'max-turns') } : {}),
+    max_hours: auto ?? hoursValue(f.hours),
+    // A day of work is many cycles; the clock is the cap, not the cycle count.
+    ...(auto ? { max_cycles: AUTONOMOUS_MAX_CYCLES } : {}),
+  };
+  return {
+    ...(auto ? { autonomous: { enabled: true } } : {}),
+    ...(Object.values(budget).some((v) => v !== undefined)
+      ? { budget: Object.fromEntries(Object.entries(budget).filter(([, v]) => v !== undefined)) }
+      : {}),
+    ...(f.gate?.length ? { gates: f.gate.map((run, i) => ({ name: `gate${i + 1}`, run })) } : {}),
+    ...(f.sandbox ? { sandbox: f.sandbox as 'host' } : {}),
+    ...(f.modelWorker
+      ? {
+          models: {
+            worker: f.modelWorker.includes(':') ? f.modelWorker : `anthropic:${f.modelWorker}`,
+          },
+        }
+      : {}),
+    ...(f.push ? { git: { push: f.push as 'none' } } : {}),
+    ...(f.toolDiscovery ? { tools: { discovery: f.toolDiscovery as 'full' | 'lazy' } } : {}),
+    ...(f.tokensPerTurn ? { agent: { tokens_per_turn: parseTokensPerTurn(f.tokensPerTurn) } } : {}),
+    ...planFlags(f),
+    ...domainFlag(f),
+    ...beyondFlag(f),
+  };
+}
+
+/** `--beyond N` as a [beyond] layer (highest precedence). */
+function beyondFlag(f: RunFlags): ConfigInput {
+  if (f.beyond === undefined) return {};
+  const n = Number(f.beyond);
+  if (!Number.isInteger(n) || n < 0 || n > 20)
+    throw new UsageError(`--beyond expects a whole number from 0 to 20, got "${f.beyond}"`);
+  return { beyond: { max_rounds: n } };
+}
+
+const WORK_DOMAIN_FLAG = ['swe', 'general'] as const;
+
+/** `--mode <swe|general>` as an [execution] domain layer (highest precedence). */
+function domainFlag(f: RunFlags): ConfigInput {
+  if (f.mode === undefined) return {};
+  if (!(WORK_DOMAIN_FLAG as readonly string[]).includes(f.mode))
+    throw new UsageError(
+      `--mode is one of ${WORK_DOMAIN_FLAG.join(', ')}, got "${f.mode}"`,
+      'swe is software engineering; general is documents, data and research',
+    );
+  return { execution: { domain: f.mode as (typeof WORK_DOMAIN_FLAG)[number] } };
+}
+
+const PLAN_MODES = ['auto', 'fast', 'full'] as const;
+const RUN_KINDS = ['auto', 'code', 'writing'] as const;
+
+/** `--plan`, `--plan-helpers`, `--plan-milestones` as a [plan] layer. */
+function planFlags(f: RunFlags): ConfigInput {
+  const int = (v: string | undefined, name: string, min: number, max: number) => {
+    if (v === undefined) return undefined;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < min || n > max)
+      throw new UsageError(`--${name} expects a whole number from ${min} to ${max}, got "${v}"`);
+    return n;
+  };
+  if (f.plan !== undefined && !(PLAN_MODES as readonly string[]).includes(f.plan))
+    throw new UsageError(`--plan is one of ${PLAN_MODES.join(', ')}, got "${f.plan}"`);
+  if (f.kind !== undefined && !(RUN_KINDS as readonly string[]).includes(f.kind))
+    throw new UsageError(`--kind is one of ${RUN_KINDS.join(', ')}, got "${f.kind}"`);
+  const plan = {
+    ...(f.plan ? { mode: f.plan as (typeof PLAN_MODES)[number] } : {}),
+    ...(f.kind ? { kind: f.kind as (typeof RUN_KINDS)[number] } : {}),
+    ...(f.planHelpers === undefined ? {} : { helpers: int(f.planHelpers, 'plan-helpers', 0, 8) }),
+    ...(f.planMilestones === undefined
+      ? {}
+      : { milestones: int(f.planMilestones, 'plan-milestones', 1, 30) }),
+  };
+  return Object.keys(plan).length ? { plan } : {};
+}
+
+const AUTONOMOUS_MAX_CYCLES = 100_000;
+
+/** `--for 8h`: autonomous mode's time budget in hours, or undefined without the flag. */
+function autonomousHours(f: RunFlags): number | undefined {
+  if (f.for === undefined) return undefined;
+  if (f.hours !== undefined) throw new UsageError('give --for or --hours, not both');
+  let ms: number;
+  try {
+    ms = parseDuration(f.for);
+  } catch {
+    throw new UsageError(`--for expects a duration like "45m", "8h" or "2d", got "${f.for}"`);
+  }
+  if (ms <= 0) throw new UsageError(`--for expects a positive duration, got "${f.for}"`);
+  return ms / 3_600_000;
+}
+
+export async function readGoal(
+  io: CliIO,
+  goal: string | undefined,
+  goalFile: string | undefined,
+): Promise<string> {
+  if (goal && goalFile) throw new UsageError('give a goal or --goal-file, not both');
+  if (goalFile) return readFile(resolve(io.cwd, goalFile), 'utf8');
+  if (!goal?.trim())
+    throw new UsageError('missing goal', 'omnexx run "make the test suite pass on Node 24"');
+  return goal;
+}
+
+/** `run --plan-only`: create the run, build the codemap, run the cycle-0 planner, print the plan. */
+export async function runPlanOnly(io: CliIO, goal: string, flags: RunFlags): Promise<number> {
+  const { paths, clock, deps } = await resolveRunDeps(io, io.cwd, flagsToConfig(flags));
+  const store = await createRun({
+    paths,
+    cwd: io.cwd,
+    goal,
+    now: clock.now(),
+    executionMode: deps.config.execution.mode,
+    workDomain: deps.config.execution.domain,
+    ...(flags.from ? { from: flags.from } : {}),
+  });
+  const run = await Run.open(deps, store.runId);
+  run.events.emit('run.start', { mode: 'plan-only', repo: run.state.repoName });
+  await writeJsonAtomic(store.file('codemap.json'), await buildCodemap(run.worktree));
+  await run.setPhase('planning');
+  const plan = await runPlanner(run, { kind: 'initial' });
+  run.state.status = 'planned';
+  await run.setPhase('done');
+  run.events.emit('run.finish', { status: 'planned', usd: run.state.spend.usd });
+  println(io.stdout, pc.bold(`Run ${run.state.runId} (plan only)`));
+  println(io.stdout, compactPlanView(plan, undefined));
+  println(io.stdout, '');
+  println(
+    io.stdout,
+    `Planner spend: $${run.state.spend.usd.toFixed(4)}. Plan: ${store.file('plan.json')}`,
+  );
+  return EXIT.ok;
+}
+
+export interface FullRunFlags extends RunFlags {
+  detach?: boolean;
+  iKnowThereAreNoChecks?: boolean;
+  quiet?: boolean;
+  verbose?: boolean;
+  debug?: boolean;
+}
+
+/** `omnexx run`: create the run, then supervise it here or in a detached process. */
+export async function runCommand(
+  callerIo: CliIO,
+  goal: string,
+  flags: FullRunFlags,
+): Promise<number> {
+  const folder = await projectFolderFor(callerIo.cwd, goal);
+  const io: CliIO = { ...callerIo, cwd: folder.dir };
+  if (folder.created)
+    println(io.stderr, `started from ${callerIo.cwd}: working in a new folder, ${folder.dir}`);
+  const overrides = flagsToConfig(flags);
+  const writingAsked = flags.kind === 'writing' || (flags.kind !== 'code' && isWritingGoal(goal));
+  if (await isEmptyProject(io.cwd)) {
+    const files = await bootstrapEmptyProject(io.cwd, { writing: writingAsked });
+    println(
+      io.stderr,
+      `empty folder: started a ${writingAsked ? 'writing ' : ''}project (git init, ${files.join(', ')})`,
+    );
+  }
+  if (await startTracking(io.cwd))
+    println(
+      io.stderr,
+      'not a git repository: started one (git init, a .gitignore, a first commit) so every change can be undone',
+    );
+  const { config, paths, clock } = await resolveRunDeps(io, io.cwd, overrides);
+  const writing = resolveWriting(config, goal);
+  if (!config.gates.length)
+    println(
+      io.stderr,
+      writing
+        ? 'writing run: no tests needed; each piece is checked by its plan and reviewed before it is kept'
+        : config.execution.domain === 'general'
+          ? 'general run: no gates configured; each artifact is checked by its task checks and a reviewer'
+          : 'no tests configured: each change is checked by its task checks and a reviewer (add tests with `omnexx init` for stronger checks)',
+    );
+  const store = await createRun({
+    paths,
+    cwd: io.cwd,
+    goal,
+    now: clock.now(),
+    noChecks: !config.gates.length,
+    writing,
+    executionMode: config.execution.mode,
+    workDomain: config.execution.domain,
+    ...(flags.from ? { from: flags.from } : {}),
+  });
+  await writeJsonAtomic(store.file(RUN_FLAGS_FILE), overrides);
+  const estimate = await estimateForRun(paths, config, io.cwd, goal);
+  println(io.stderr, formatEstimate(estimate));
+  if (flags.detach) {
+    const pid = spawnDetached(
+      io.entry ?? selfEntry(),
+      ['supervise', store.runId],
+      store.file('supervisor.log'),
+      io.env,
+    );
+    println(io.stdout, store.runId);
+    println(
+      io.stderr,
+      `supervisor pid ${pid}; \`omnexx status ${store.runId}\`, \`omnexx logs -f ${store.runId}\``,
+    );
+    return EXIT.ok;
+  }
+  const b = brand(io);
+  println(
+    io.stderr,
+    `${b.green('omnexx')} run ${b.cyan(store.runId)} on ${(await store.readState()).branch}`,
+  );
+  const startedAt = clock.now();
+  // The live feed tails the run's own event log, so it shows exactly what `logs -f` would.
+  const feed = new LiveFeed(new EventTail(store.eventsPath), {
+    out: io.stderr,
+    brand: b,
+    verbosity: verbosityFrom(flags),
+    footer: io.isTTY,
+    after: (e) =>
+      PROGRESS_EVENTS.has(e.type)
+        ? remainingForRun(store, estimate, e.ts - startedAt).then((l) => l && b.dim(l))
+        : Promise.resolve(undefined),
+  });
+  feed.start();
+  try {
+    return await superviseForeground(io, store.runId, undefined, () => feed.stop());
+  } finally {
+    await feed.stop();
+  }
+}

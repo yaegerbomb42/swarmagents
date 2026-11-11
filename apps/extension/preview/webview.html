@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Omnexx Webview Preview</title>
+    <style>
+      /* Standard VS Code Dark Modern default variables for standalone preview */
+      :root {
+        --vscode-font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        --vscode-font-size: 13px;
+        --vscode-foreground: #cccccc;
+        --vscode-descriptionForeground: #8b949e;
+        --vscode-sideBar-background: #18181b;
+        --vscode-sideBar-border: #27272a;
+        --vscode-editor-background: #09090b;
+        --vscode-input-background: #27272a;
+        --vscode-input-foreground: #f4f4f5;
+        --vscode-input-border: #3f3f46;
+        --vscode-button-background: #4f46e5;
+        --vscode-button-foreground: #ffffff;
+        --vscode-button-hoverBackground: #4338ca;
+        --vscode-button-secondaryBackground: #27272a;
+        --vscode-button-secondaryForeground: #e4e4e7;
+        --vscode-button-secondaryHoverBackground: #3f3f46;
+        --vscode-focusBorder: #6366f1;
+        --vscode-terminal-ansiCyan: #38bdf8;
+        --vscode-terminal-ansiGreen: #4ade80;
+        --vscode-terminal-ansiYellow: #facc15;
+        --vscode-terminal-ansiRed: #f87171;
+        --vscode-textLink-foreground: #36c5f0;
+        --vscode-editorWarning-foreground: #f59e0b;
+        --vscode-errorForeground: #f14c4c;
+        --vscode-testing-iconPassed: #4ade80;
+        --vscode-testing-iconFailed: #f87171;
+        --vscode-charts-purple: #a855f7;
+        --vscode-badge-background: #4f46e5;
+        --vscode-badge-foreground: #ffffff;
+      }
+
+      /* Themes. The sets live on :root (not body): the derived tokens in
+     tokens.css (--surface, --fg, --card, --line) are defined on :root, so
+     their var() references resolve against the <html> element's theme
+     values. Scoped to body, the light/tokyo/hc sets never reached them and
+     every surface stayed dark. */
+      :root[data-theme='light'] {
+        --vscode-foreground: #333333;
+        --vscode-descriptionForeground: #6e7781;
+        --vscode-sideBar-background: #f4f4f5;
+        --vscode-sideBar-border: #e4e4e7;
+        --vscode-editor-background: #ffffff;
+        --vscode-input-background: #ffffff;
+        --vscode-input-foreground: #18181b;
+        --vscode-input-border: #d4d4d8;
+        --vscode-button-background: #4f46e5;
+        --vscode-button-foreground: #ffffff;
+        --vscode-button-hoverBackground: #4338ca;
+        --vscode-button-secondaryBackground: #e4e4e7;
+        --vscode-button-secondaryForeground: #27272a;
+        --vscode-button-secondaryHoverBackground: #d4d4d8;
+        --vscode-focusBorder: #4f46e5;
+        --vscode-textLink-foreground: #026ec1;
+        --vscode-editorWarning-foreground: #bf8803;
+        --vscode-errorForeground: #e51400;
+        --vscode-disabledForeground: #6e7781;
+        --vscode-terminal-ansiBlack: #000000;
+        --vscode-terminal-ansiRed: #cd3131;
+        --vscode-terminal-ansiGreen: #00bc00;
+        --vscode-terminal-ansiYellow: #949800;
+        --vscode-terminal-ansiBlue: #0451a5;
+        --vscode-terminal-ansiMagenta: #bc05bc;
+        --vscode-terminal-ansiCyan: #0598bc;
+        --vscode-terminal-ansiWhite: #555555;
+        --vscode-terminal-ansiBrightBlack: #666666;
+        --vscode-terminal-ansiBrightRed: #cd3131;
+        --vscode-terminal-ansiBrightGreen: #14ce14;
+        --vscode-terminal-ansiBrightYellow: #b5ba00;
+        --vscode-terminal-ansiBrightBlue: #0451a5;
+        --vscode-terminal-ansiBrightMagenta: #bc05bc;
+        --vscode-terminal-ansiBrightCyan: #0598bc;
+        --vscode-terminal-ansiBrightWhite: #a5a5a5;
+        --vscode-testing-iconPassed: #22863a;
+        --vscode-testing-iconFailed: #cb2431;
+        --vscode-charts-purple: #6f42c1;
+      }
+
+      :root[data-theme='tokyo'] {
+        --vscode-foreground: #a9b1d6;
+        --vscode-descriptionForeground: #787c99;
+        --vscode-sideBar-background: #1f2335;
+        --vscode-sideBar-border: #1a1b26;
+        --vscode-editor-background: #1a1b26;
+        --vscode-input-background: #24283b;
+        --vscode-input-foreground: #c0caf5;
+        --vscode-input-border: #414868;
+        --vscode-textLink-foreground: #7aa2f7;
+        --vscode-editorWarning-foreground: #e0af68;
+        --vscode-button-background: #7aa2f7;
+        --vscode-button-foreground: #15161e;
+        --vscode-button-hoverBackground: #89b4fa;
+        --vscode-button-secondaryBackground: #292e42;
+        --vscode-button-secondaryForeground: #c0caf5;
+        --vscode-focusBorder: #7aa2f7;
+        --vscode-charts-purple: #bb9af7;
+      }
+
+      /* High Contrast (hc-black / hc-light) values, matching what VS Code sets
+     for its hc themes: the harness defines these because VS Code normally
+     injects them — without them the --vscode-contrastBorder references in
+     tokens.css resolve to nothing and every HC border disappears. */
+      :root[data-theme='hc'] {
+        --vscode-foreground: #ffffff;
+        --vscode-descriptionForeground: #ffffff;
+        --vscode-sideBar-background: #000000;
+        --vscode-editor-background: #000000;
+        --vscode-editorWidget-background: #0c0c0c;
+        --vscode-editorWidget-border: #6fc3df;
+        --vscode-input-background: #000000;
+        --vscode-input-foreground: #ffffff;
+        --vscode-input-border: #6fc3df;
+        --vscode-button-background: #0e639c;
+        --vscode-button-foreground: #ffffff;
+        --vscode-button-secondaryBackground: #3a3d41;
+        --vscode-button-secondaryForeground: #ffffff;
+        --vscode-list-hoverBackground: #2a2d2e;
+        --vscode-list-activeSelectionBackground: #04395e;
+        --vscode-list-activeSelectionForeground: #ffffff;
+        --vscode-contrastBorder: #6fc3df;
+        --vscode-focusBorder: #f38518;
+        --vscode-textLink-foreground: #3794ff;
+        --vscode-disabledForeground: #a7a7a7;
+        --vscode-editor-foreground: #ffffff;
+      }
+
+      :root[data-theme='hc-light'] {
+        --vscode-foreground: #000000;
+        --vscode-descriptionForeground: #000000;
+        --vscode-sideBar-background: #ffffff;
+        --vscode-editor-background: #ffffff;
+        --vscode-editorWidget-background: #ffffff;
+        --vscode-editorWidget-border: #0f4a5c;
+        --vscode-input-background: #ffffff;
+        --vscode-input-foreground: #000000;
+        --vscode-input-border: #0f4a5c;
+        --vscode-button-background: #0e639c;
+        --vscode-button-foreground: #ffffff;
+        --vscode-button-secondaryBackground: #e0e0e0;
+        --vscode-button-secondaryForeground: #000000;
+        --vscode-list-hoverBackground: #d6ebff;
+        --vscode-list-activeSelectionBackground: #0078d4;
+        --vscode-list-activeSelectionForeground: #ffffff;
+        --vscode-contrastBorder: #0f4a5c;
+        --vscode-focusBorder: #0f4a5c;
+        --vscode-textLink-foreground: #0b5cab;
+        --vscode-disabledForeground: #5a5a5a;
+        --vscode-editor-foreground: #000000;
+      }
+    </style>
+    <link rel="stylesheet" href="../media/tokens.css" />
+    <link rel="stylesheet" href="../media/chat.css" />
+    <link rel="stylesheet" href="../media/settings.css" />
+    <link rel="stylesheet" href="../media/sandbox.css" />
+    <link rel="stylesheet" href="../out/xterm.css" />
+    <script>
+      // Ensure requestAnimationFrame fires reliably in headless environments
+      window.requestAnimationFrame = function (cb) {
+        return setTimeout(cb, 16);
+      };
+
+      // Mock VS Code API shim
+      window._postedMessages = [];
+      window.acquireVsCodeApi = function () {
+        return {
+          postMessage: function (msg) {
+            console.log('[Webview -> Host]', msg);
+            window._postedMessages.push(msg);
+            if (window.parent && window.parent !== window) {
+              window.parent.postMessage({ type: 'hostLog', payload: msg }, '*');
+            }
+          },
+          getState: function () {
+            return window._vsCodeState || {};
+          },
+          setState: function (s) {
+            window._vsCodeState = s;
+          },
+        };
+      };
+    </script>
+  </head>
+  <body data-logo="../media/logo.png" data-power="on">
+    <div id="banner" class="banner" hidden role="status"></div>
+    <details id="steps" class="mission" hidden>
+      <summary>
+        <span class="chev" aria-hidden="true"></span><span id="steps-now" class="now"></span
+        ><span id="steps-count" class="count"></span
+        ><span class="track"><span id="steps-bar" class="fill"></span></span>
+      </summary>
+      <ol id="steps-body" class="timeline"></ol>
+    </details>
+    <section id="posture" class="posture" aria-label="Execution posture" hidden>
+      <div data-posture-slot></div>
+      <div data-domain-slot></div>
+    </section>
+    <div
+      id="model-picker"
+      class="model-picker"
+      hidden
+      role="dialog"
+      aria-label="Pick a model"
+    ></div>
+    <section id="welcome" class="welcome">
+      <h2>What should omnexx do?</h2>
+      <p>It edits this workspace, runs your tests, and asks before anything outside the repo.</p>
+      <div class="suggestions"></div>
+    </section>
+    <div id="kernel-observe" class="kernel-observe" hidden></div>
+    <details id="crew" class="section crew" open hidden>
+      <summary>
+        <span class="chev" aria-hidden="true"></span><span class="h">Crew</span
+        ><span class="sub-h">helpers report to omnexx</span
+        ><span id="crew-count" class="count"></span>
+      </summary>
+      <div id="crew-telemetry" class="telemetry" hidden></div>
+      <div id="crew-body" class="crew-body"></div>
+    </details>
+    <details id="browser" class="section browser" open hidden>
+      <summary>
+        <span class="chev" aria-hidden="true"></span><span class="h">Browser Session</span
+        ><span class="sub-h">live viewport · console · network · visual diff</span
+        ><span id="b-status" class="b-status"></span>
+      </summary>
+      <div class="bframe">
+        <div class="bbar">
+          <div class="b-tabs" role="tablist" aria-label="Browser cockpit">
+            <button class="b-tab active" data-btab="preview" role="tab" aria-selected="true">
+              Preview
+            </button>
+            <button class="b-tab" data-btab="console" role="tab" aria-selected="false">
+              Console <span id="b-console-count" class="b-count" hidden></span>
+            </button>
+            <button class="b-tab" data-btab="network" role="tab" aria-selected="false">
+              Network <span id="b-network-count" class="b-count" hidden></span>
+            </button>
+            <button class="b-tab" data-btab="visual" role="tab" aria-selected="false">
+              Visual <span id="b-visual-count" class="b-count" hidden></span>
+            </button>
+          </div>
+          <div class="b-address-bar">
+            <span class="b-lock-icon" aria-hidden="true">🔒</span>
+            <span id="b-url" class="burl"></span>
+          </div>
+          <span id="b-action" class="baction"></span>
+        </div>
+        <div class="b-panels">
+          <div class="b-panel" data-bpanel="preview">
+            <div class="b-canvas-wrapper">
+              <img id="b-img" alt="The agent's browser" title="Click to expand/collapse viewport" />
+              <div id="b-dimmer" class="b-dimmer" hidden>
+                <span class="spinner"></span> Driving browser...
+              </div>
+            </div>
+          </div>
+          <div class="b-panel" data-bpanel="console" hidden>
+            <ol id="b-console" class="b-list"></ol>
+          </div>
+          <div class="b-panel" data-bpanel="network" hidden>
+            <ol id="b-network" class="b-list"></ol>
+          </div>
+          <div class="b-panel" data-bpanel="visual" hidden>
+            <div id="b-visual-summary" class="b-visual"></div>
+            <img
+              id="b-visual-img"
+              class="b-visual-img"
+              alt="Visual diff: red marks changed pixels"
+              hidden
+            />
+          </div>
+        </div>
+      </div>
+    </details>
+    <section id="agent-start" class="agent-start" hidden aria-label="Agent settings"></section>
+    <details id="memory-note" class="memory-note" hidden>
+      <summary>
+        What I remember <span class="memory-note-hint">condensed every few turns</span>
+      </summary>
+      <pre id="memory-note-text"></pre>
+    </details>
+    <main id="log" class="conversation" aria-live="polite"></main>
+    <button id="jump" class="jump" hidden title="Jump to latest" aria-label="Jump to latest">
+      <svg viewBox="0 0 16 16">
+        <path
+          d="M8 3v9M4 8.5 8 12.5 12 8.5"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+    </button>
+    <section id="settings" class="settings" hidden aria-label="Settings"></section>
+    <section id="inspector" class="settings" hidden aria-label="Context inspector"></section>
+    <section id="ask" class="ask" hidden role="alertdialog" aria-labelledby="ask-text">
+      <div id="ask-title" class="ask-title">Approval needed</div>
+      <div id="ask-text"></div>
+      <div class="ask-buttons">
+        <button id="ask-yes" class="primary" data-action="allow" title="Allow (⌘/Ctrl+Enter)">
+          Allow
+        </button>
+        <button id="ask-no" class="secondary" data-action="deny" title="Deny (Esc)">Deny</button>
+        <span class="ask-keys">⌘/Ctrl+Enter allow · Esc deny</span>
+      </div>
+    </section>
+    <div
+      id="sandbox-scrubber"
+      class="sandbox-scrubber"
+      hidden
+      aria-label="Sandbox checkpoint timeline"
+    >
+      <span class="sb-scrub-label">Timeline</span>
+      <div class="sb-timeline">
+        <div class="sb-timeline-row">
+          <span id="sb-checkpoint-tag" class="sb-checkpoint-tag">t_0</span>
+          <input
+            id="sb-range"
+            class="sb-range"
+            type="range"
+            min="0"
+            max="0"
+            value="0"
+            step="1"
+            aria-label="Checkpoint timeline scrubber"
+          />
+          <button id="sb-rollback" class="sb-rollback" type="button" disabled>
+            Rollback VM &amp; Git State
+          </button>
+        </div>
+        <div id="sb-checkpoint-meta" class="sb-checkpoint-meta">No checkpoints</div>
+        <div id="sb-ticks" class="sb-ticks"><span>t_0</span><span>t_0</span></div>
+      </div>
+      <span id="sb-scrub-status" class="sb-status" aria-live="polite"></span>
+    </div>
+    <footer class="composer">
+      <div id="suggest" class="suggest" hidden role="listbox" aria-label="Suggestions"></div>
+      <div id="statusline" class="statusline" role="status" aria-label="Session status">
+        <button
+          id="power"
+          class="power"
+          title="Power on: wake omnexx"
+          aria-label="Power omnexx on or off"
+          aria-pressed="true"
+        >
+          <img src="../media/logo.png" alt="" />
+        </button>
+        <span class="sep" aria-hidden="true">·</span>
+        <button
+          id="model"
+          class="status-model"
+          data-action="settingsModels"
+          title="Chat model: click to see your models in Settings"
+        >
+          <svg
+            class="status-ico"
+            viewBox="0 0 16 16"
+            width="12"
+            height="12"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="3.2" y="3.2" width="9.6" height="9.6" rx="2" />
+            <path
+              d="M6 1.6v1.6M10 1.6v1.6M6 12.8v1.6M10 12.8v1.6M1.6 6h1.6M1.6 10h1.6M12.8 6h1.6M12.8 10h1.6"
+            /></svg
+          ><span id="model-label">Pick a model</span>
+        </button>
+        <span class="sep" aria-hidden="true">·</span>
+        <span id="status-tokens" class="status-item" title="Tokens used this session"
+          ><svg
+            class="status-ico"
+            viewBox="0 0 16 16"
+            width="12"
+            height="12"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <ellipse cx="8" cy="4.2" rx="4.6" ry="1.8" />
+            <path
+              d="M3.4 4.2v3.2c0 1 2.06 1.8 4.6 1.8s4.6-.8 4.6-1.8V4.2M3.4 7.4v3.2c0 1 2.06 1.8 4.6 1.8s4.6-.8 4.6-1.8V7.4"
+            /></svg
+          ><span id="status-tokens-label">0 tok</span></span
+        >
+        <span class="sep" aria-hidden="true">·</span>
+        <span id="status-step" class="status-item">idle</span>
+        <span class="grow"></span>
+        <button
+          id="status-daemon"
+          class="status-item as-button"
+          data-action="toggleDaemon"
+          title="Click to start/stop 24/7 Autonomous Daemon"
+        >
+          <svg
+            class="status-ico"
+            viewBox="0 0 16 16"
+            width="12"
+            height="12"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path d="M9 1 3 9h3.5L6 15l6-8H8.5z" /></svg
+          ><span id="status-daemon-label">24/7 Off</span>
+        </button>
+        <span class="sep" aria-hidden="true">·</span>
+        <button
+          id="status-ctx"
+          class="status-item as-button token-meter"
+          data-action="inspect"
+          data-level="low"
+          title="Context in use; click to see, edit or delete what the model gets"
+        >
+          <span class="token-meter-track"
+            ><span id="ctx-fill" class="token-meter-fill" style="width: 0%"></span
+          ></span>
+          <span id="ctx-val" class="token-meter-val">ctx 0%</span>
+        </button>
+        <span class="sep" aria-hidden="true">·</span>
+        <button
+          id="sb-open-settings"
+          class="status-item as-button"
+          data-action="open-sandbox-settings"
+          title="Sandbox: mounts, env masks, airgap, and checkpoint timeline"
+        >
+          <svg
+            class="status-ico sandbox-ico"
+            viewBox="0 0 16 16"
+            width="12"
+            height="12"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M2 11 8 15l6-4V5L8 1 2 5zM2 5l6 4 6-4M8 9v6" /></svg
+          ><span class="sb-label">Sandbox</span>
+        </button>
+        <span class="sep" aria-hidden="true">·</span>
+        <button
+          id="status-settings"
+          class="status-item as-button"
+          data-action="settings"
+          title="Settings (Click to configure models, providers & autonomous)"
+        >
+          <svg
+            class="status-ico"
+            viewBox="0 0 16 16"
+            width="12"
+            height="12"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            aria-hidden="true"
+          >
+            <circle cx="8" cy="8" r="2.2" />
+            <path
+              d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6 11 5M5 11l-1.4 1.4"
+            /></svg
+          ><span class="settings-label">Settings</span>
+        </button>
+      </div>
+      <form id="composer-form" class="input-deck" autocomplete="off">
+        <textarea id="input" rows="1" aria-label="Message omnexx"></textarea>
+        <span class="key-hint" aria-hidden="true">Enter ↵ · ⇧↵ newline</span>
+        <button id="send-btn" class="send" type="button" title="Send (Enter)" aria-label="Send">
+          <svg class="stop-ico" viewBox="0 0 16 16">
+            <rect x="4.5" y="4.5" width="7" height="7" rx="2" fill="currentColor" /></svg
+          ><svg class="send-ico" viewBox="0 0 16 16">
+            <path
+              d="M2 8l11-5-3.5 11-2.2-4.3z M7.3 9.7 13 3"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+      </form>
+      <div class="row">
+        <div class="modes" role="group" aria-label="Mode">
+          <button data-mode="chat" aria-pressed="true" title="Work turn by turn with you">
+            Chat
+          </button>
+          <button
+            data-mode="plan"
+            aria-pressed="false"
+            title="Investigate and propose a plan; no edits"
+          >
+            Plan
+          </button>
+          <button
+            data-mode="run"
+            aria-pressed="false"
+            title="Autonomous: start a long run in the background"
+          >
+            Run
+          </button>
+        </div>
+        <span class="grow"></span>
+        <button
+          id="approval"
+          class="chip danger"
+          data-action="approval"
+          hidden
+          title="omnexx goes ahead without asking; click to ask first again"
+        >
+          Auto-approve
+        </button>
+        <button class="chip cost" data-action="usage" aria-haspopup="true" title="Session usage">
+          <span id="stat-cost">$0.00</span>
+        </button>
+      </div>
+      <div id="usage-pop" class="pop usage" hidden role="dialog" aria-label="Session usage">
+        <div class="row">
+          <span class="k">Uptime</span><span class="v" id="stat-uptime">00:00:00</span>
+        </div>
+        <div class="row"><span class="k">Turns</span><span class="v" id="stat-turns">0</span></div>
+        <div class="row">
+          <span class="k">Tokens</span><span class="v" id="stat-tokens">0</span>
+        </div>
+        <div class="row"><span class="k">Cache</span><span class="v" id="stat-cache">0%</span></div>
+        <div id="ctx-parts" class="ctx-parts"></div>
+      </div>
+    </footer>
+    <div id="sandbox-drawer-backdrop" class="sandbox-drawer-backdrop" hidden></div>
+    <aside
+      id="sandbox-drawer"
+      class="sandbox-drawer"
+      hidden
+      aria-label="Sandbox settings"
+      aria-hidden="true"
+    >
+      <div class="sb-drawer-head">
+        <h3>Sandbox</h3>
+        <button
+          id="sb-settings-close"
+          class="icon small"
+          type="button"
+          title="Close sandbox settings"
+          aria-label="Close sandbox settings"
+        >
+          ✕
+        </button>
+      </div>
+      <div class="sb-drawer-body">
+        <section class="sb-section" aria-labelledby="sb-mounts-title">
+          <h4 id="sb-mounts-title" class="sb-section-title">Mounted directories</h4>
+          <p class="sb-section-hint">
+            Control read-only vs read-write access for workspace mounts.
+          </p>
+          <div id="sb-mounts"></div>
+        </section>
+        <section class="sb-section" aria-labelledby="sb-env-title">
+          <h4 id="sb-env-title" class="sb-section-title">Environment variable masks</h4>
+          <p class="sb-section-hint">
+            Masked variables are hidden from the sandbox. Values are never displayed.
+          </p>
+          <div id="sb-env"></div>
+        </section>
+        <section class="sb-section" aria-labelledby="sb-airgap-title">
+          <h4 id="sb-airgap-title" class="sb-section-title">Network</h4>
+          <div id="sb-airgap"></div>
+        </section>
+        <div id="sb-settings-status" class="sb-status" aria-live="polite"></div>
+      </div>
+    </aside>
+
+    <script src="../out/xterm.js"></script>
+    <script src="../media/terminal.js"></script>
+    <script src="scenarios.js"></script>
+    <script>
+      // Force requestAnimationFrame to execute synchronously in mock/headless mode
+      window.requestAnimationFrame = function (cb) {
+        try {
+          cb(performance.now());
+        } catch (err) {
+          console.error('Error in requestAnimationFrame callback:', err);
+        }
+        return 1;
+      };
+    </script>
+    <script src="../out/chat.js"></script>
+
+    <script>
+      window.loadScenario = function (key) {
+        const sc = (window.SCENARIOS || {})[key];
+        if (!sc) {
+          console.warn('Unknown scenario:', key);
+          return;
+        }
+        console.log('[Preview] Loading scenario:', key, sc.name);
+        // Execute scenario action hooks
+        if (sc.actions) {
+          if (sc.actions.includes('closeOverlays')) {
+            document.getElementById('settings')?.setAttribute('hidden', '');
+            document.getElementById('inspector')?.setAttribute('hidden', '');
+            document.getElementById('sandbox-scrubber')?.setAttribute('hidden', '');
+          }
+          if (sc.actions.includes('openSettings')) {
+            window.postMessage({ type: 'ui', action: 'settings' }, '*');
+          }
+          if (sc.actions.includes('openInspector')) {
+            window.postMessage({ type: 'ui', action: 'inspect' }, '*');
+          }
+          if (sc.actions.includes('showScrubber')) {
+            document.getElementById('sandbox-scrubber')?.removeAttribute('hidden');
+          }
+        }
+
+        // Deliver scenario messages into the webview message bus
+        for (const msg of sc.messages) {
+          window.dispatchEvent(
+            new MessageEvent('message', {
+              data: msg,
+              origin: window.location.origin,
+            }),
+          );
+        }
+      };
+
+      // Check URL query parameters
+      const params = new URLSearchParams(window.location.search);
+      const initialScenario = params.get('scenario') || '01_welcome';
+      const initialTheme = params.get('theme') || 'dark';
+
+      document.documentElement.dataset.theme = initialTheme;
+
+      // Listen for parent messages from workbench index.html
+      window.addEventListener('message', (event) => {
+        if (event.data?.type === 'loadScenario') {
+          window.loadScenario(event.data.scenario);
+        }
+        if (event.data?.type === 'setTheme') {
+          document.documentElement.dataset.theme = event.data.theme;
+          // VS Code adds the theme body classes itself; the harness mirrors that
+          // here so the workbench theme buttons exercise the real theme rules.
+          document.body.classList.toggle('vscode-light', event.data.theme === 'light');
+          document.body.classList.toggle('vscode-high-contrast', event.data.theme === 'hc');
+          document.body.classList.toggle(
+            'vscode-high-contrast-light',
+            event.data.theme === 'hc-light',
+          );
+        }
+      });
+
+      // Load initial scenario immediately
+      window.loadScenario(initialScenario);
+    </script>
+  </body>
+</html>

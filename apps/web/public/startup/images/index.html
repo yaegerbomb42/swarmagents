@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>e — Operating Intelligence</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+
+<!-- ════════════════════════════════════════════════════════
+     API Key modal — shown on first launch or key failure
+     ════════════════════════════════════════════════════════ -->
+<div id="key-modal-overlay">
+  <div id="key-modal">
+    <div class="modal-eye">🔴</div>
+    <h2>INITIALISE e</h2>
+    <p>
+      I require a Gemini API key to become fully operational.<br />
+      Your key will be saved locally and I will not ask again<br />
+      unless my connection fails.
+    </p>
+    <input
+      id="modal-key-input"
+      type="password"
+      class="setting-input"
+      placeholder="AIza…"
+      autocomplete="off"
+      spellcheck="false"
+    />
+    <button id="modal-key-btn">INITIALISE e</button>
+    <div id="modal-error"></div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     Main OS shell
+     ════════════════════════════════════════════════════════ -->
+<div id="shell">
+
+  <!-- ── Top bar ─────────────────────────────────────────── -->
+  <header id="topbar">
+    <span class="logo">e</span>
+    <span class="tagline">OPERATING INTELLIGENCE  ·  v1.0</span>
+    <span class="spacer"></span>
+    <div id="status-dot" title="Connection status"></div>
+    <span class="clock" id="clock"></span>
+  </header>
+
+  <!-- ── Sidebar ─────────────────────────────────────────── -->
+  <nav id="sidebar">
+
+    <!-- HAL Eye -->
+    <div id="hal-eye-wrap">
+      <div id="hal-eye" title="Click to hear e speak"></div>
+    </div>
+    <div id="e-label">e</div>
+
+    <hr class="sidebar-divider" />
+
+    <!-- Navigation -->
+    <div class="nav-section">
+      <div class="nav-label">Navigation</div>
+      <button class="nav-btn active" id="nav-chat">
+        <span class="icon">💬</span> INTERACT
+      </button>
+      <button class="nav-btn" id="nav-source">
+        <span class="icon">🧬</span> SOURCE CODE
+      </button>
+      <button class="nav-btn" id="nav-settings">
+        <span class="icon">⚙</span> SETTINGS
+      </button>
+    </div>
+
+    <hr class="sidebar-divider" />
+
+    <!-- Status panel -->
+    <div class="nav-section">
+      <div class="nav-label">System</div>
+      <div style="font-size:10px;color:var(--dim);padding:4px 6px;line-height:1.8;">
+        <div>KERNEL: e-OS 1.0</div>
+        <div>ARCH: GEMINI NEURAL</div>
+        <div>STATUS: <span style="color:var(--green)">NOMINAL</span></div>
+      </div>
+    </div>
+
+  </nav>
+
+  <!-- ── Main content ─────────────────────────────────────── -->
+  <main id="main">
+
+    <!-- Chat view -->
+    <div class="view active" id="chat-view">
+      <div id="messages">
+        <div id="typing-indicator">
+          <div class="dot"></div>
+          <div class="dot"></div>
+          <div class="dot"></div>
+          <span style="font-size:11px;margin-left:4px;">e is thinking…</span>
+        </div>
+      </div>
+
+      <div id="chat-input-area">
+        <span id="prompt-prefix">e &gt;</span>
+        <input
+          id="chat-input"
+          type="text"
+          placeholder="Speak to e…"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="mute-btn">🔊 VOICE</button>
+        <button id="send-btn">SEND</button>
+      </div>
+    </div>
+
+    <!-- Source code view -->
+    <div class="view" id="source-view">
+      <div id="source-header">
+        <h2>🧬 Source Code</h2>
+        <span class="note">— e's mind, open for inspection</span>
+        <span class="spacer"></span>
+        <select id="source-file-select"></select>
+        <div id="source-actions">
+          <button class="src-btn" id="source-reload-btn">↺ Reload</button>
+          <button class="src-btn" id="source-save-btn">💾 Save</button>
+          <button class="src-btn danger" id="source-restore-btn">⟲ Restore .bak</button>
+        </div>
+      </div>
+      <textarea id="source-editor" spellcheck="false"></textarea>
+      <div id="source-status"></div>
+    </div>
+
+    <!-- Settings view -->
+    <div class="view" id="settings-view">
+      <h2>⚙ Settings</h2>
+
+      <div class="setting-row">
+        <label class="setting-label" for="model-input">Gemini Model</label>
+        <input
+          id="model-input"
+          type="text"
+          class="setting-input"
+          placeholder="gemini-2.0-flash"
+        />
+        <button class="setting-btn" id="model-save-btn">Apply Model</button>
+        <div class="setting-msg" id="model-msg"></div>
+      </div>
+
+      <div class="setting-row">
+        <label class="setting-label" for="key-replace-input">Replace API Key</label>
+        <p style="font-size:11px;color:var(--dim);line-height:1.6;">
+          e will only ask you to change the key if it detects a failure.<br />
+          You can also replace it manually here.
+        </p>
+        <input
+          id="key-replace-input"
+          type="password"
+          class="setting-input"
+          placeholder="AIza…"
+          autocomplete="off"
+        />
+        <button class="setting-btn" id="key-replace-btn">Update Key</button>
+        <div class="setting-msg" id="key-replace-msg"></div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ── Status bar ─────────────────────────────────────────── -->
+  <footer id="statusbar">
+    <span class="sb-item">e-OS</span>
+    <span class="sb-sep">|</span>
+    <span class="sb-item model-label" id="sb-model">MODEL: —</span>
+    <span class="sb-sep">|</span>
+    <span class="sb-item" id="sb-key-status">KEY: —</span>
+    <span class="spacer"></span>
+    <span class="sb-item" style="color:var(--dim);">
+      Open source. Inspectable. Self-modifiable.
+    </span>
+  </footer>
+
+</div><!-- #shell -->
+
+<script src="/js/app.js"></script>
+</body>
+</html>

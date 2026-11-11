@@ -1,0 +1,216 @@
+/* Neo-cyberpunk glassmorphic card system — GPU-friendly 60fps micro-animations */
+
+.glass-card {
+  --glass-accent: rgba(0, 245, 255, 0.85);
+  --glass-accent-dim: rgba(0, 245, 255, 0.16);
+  --glass-sheen: rgba(255, 255, 255, 0.08);
+  --glass-text-primary: rgba(255, 255, 255, 0.95);
+  --glass-text-secondary: rgba(255, 255, 255, 0.82);
+  --glass-text-muted: rgba(200, 210, 230, 0.78);
+  position: relative;
+  border-radius: 1rem;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.06) 0%, transparent 42%),
+    linear-gradient(180deg, rgba(8, 10, 28, 0.82) 0%, rgba(4, 4, 14, 0.92) 100%);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  box-shadow:
+    0 0 0 1px rgba(0, 245, 255, 0.04) inset,
+    0 12px 40px -16px rgba(0, 0, 0, 0.65);
+  transform: translateZ(0);
+  will-change: transform, box-shadow;
+  transition:
+    transform 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 220ms ease,
+    border-color 180ms ease;
+  overflow: hidden;
+}
+
+.glass-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    120deg,
+    transparent 0%,
+    var(--glass-sheen) 45%,
+    transparent 70%
+  );
+  opacity: 0;
+  transform: translateX(-30%);
+  transition: opacity 200ms ease, transform 600ms cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: none;
+}
+
+.glass-card--interactive:hover {
+  transform: translateY(-2px) translateZ(0);
+  border-color: rgba(0, 245, 255, 0.22);
+  box-shadow:
+    0 0 0 1px rgba(0, 245, 255, 0.08) inset,
+    0 0 28px -8px var(--glass-accent-dim),
+    0 18px 48px -20px rgba(0, 0, 0, 0.75);
+}
+
+.glass-card--interactive:hover::before {
+  opacity: 1;
+  transform: translateX(20%);
+}
+
+.glass-card--interactive:active {
+  transform: translateY(0) scale(0.995) translateZ(0);
+  transition-duration: 70ms;
+}
+
+.glass-card--interactive:focus {
+  outline: none;
+}
+
+.glass-card--interactive:focus-visible {
+  outline: 2px solid var(--glass-accent);
+  outline-offset: 3px;
+  border-color: var(--glass-accent);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.12) inset,
+    0 0 0 4px var(--glass-accent-dim),
+    0 0 32px -6px var(--glass-accent-dim),
+    0 18px 48px -20px rgba(0, 0, 0, 0.75);
+}
+
+.glass-card--cyan {
+  --glass-accent: rgba(120, 250, 255, 0.95);
+  --glass-accent-dim: rgba(0, 245, 255, 0.18);
+}
+
+.glass-card--purple {
+  --glass-accent: rgba(196, 140, 255, 0.95);
+  --glass-accent-dim: rgba(168, 85, 247, 0.18);
+}
+
+.glass-card--magenta {
+  --glass-accent: rgba(255, 130, 190, 0.95);
+  --glass-accent-dim: rgba(236, 72, 153, 0.18);
+}
+
+.glass-card__glow {
+  position: absolute;
+  inset: -40% -20% auto;
+  height: 55%;
+  background: radial-gradient(ellipse at center, var(--glass-accent-dim), transparent 68%);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+.glass-card__scanline {
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(255, 255, 255, 0.015) 2px,
+    rgba(255, 255, 255, 0.015) 3px
+  );
+  opacity: 0.35;
+  pointer-events: none;
+  mix-blend-mode: overlay;
+}
+
+.glass-card__shimmer {
+  position: absolute;
+  inset: -50% -80%;
+  background: linear-gradient(
+    105deg,
+    transparent 38%,
+    rgba(255, 255, 255, 0.06) 48%,
+    rgba(0, 245, 255, 0.12) 50%,
+    rgba(255, 255, 255, 0.06) 52%,
+    transparent 62%
+  );
+  transform: translateX(-100%) rotate(8deg);
+  animation: glass-shimmer-sweep 5.5s ease-in-out infinite;
+  pointer-events: none;
+  z-index: 2;
+}
+
+@keyframes glass-shimmer-sweep {
+  0%, 72% { transform: translateX(-100%) rotate(8deg); opacity: 0; }
+  78% { opacity: 1; }
+  100% { transform: translateX(120%) rotate(8deg); opacity: 0; }
+}
+
+.glass-card__header {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 1rem 1.125rem 0.5rem;
+}
+
+.glass-card__title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--glass-text-primary);
+}
+
+.glass-card__subtitle {
+  font-size: 0.72rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--glass-accent);
+  text-shadow: 0 0 12px rgba(0, 0, 0, 0.45);
+}
+
+.glass-card__body {
+  position: relative;
+  z-index: 1;
+  padding: 0.5rem 1.125rem 1.125rem;
+  color: var(--glass-text-secondary);
+}
+
+.glass-card__footer {
+  position: relative;
+  z-index: 1;
+  padding: 0 1.125rem 1rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  margin-top: 0.25rem;
+  padding-top: 0.75rem;
+  color: var(--glass-text-muted);
+  font-size: 0.85rem;
+}
+
+@keyframes glass-card-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px rgba(0, 245, 255, 0.04) inset,
+      0 0 18px -10px var(--glass-accent-dim);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px rgba(0, 245, 255, 0.1) inset,
+      0 0 26px -6px var(--glass-accent-dim);
+  }
+}
+
+.glass-card--pulse {
+  animation: glass-card-pulse 2.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .glass-card,
+  .glass-card::before,
+  .glass-card--pulse,
+  .glass-card__shimmer {
+    animation: none;
+    transition: none;
+  }
+
+  .glass-card--interactive:hover {
+    transform: none;
+  }
+}

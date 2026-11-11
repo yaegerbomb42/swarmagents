@@ -1,0 +1,403 @@
+import { createHash } from 'node:crypto';
+import { appendFile, mkdir, readdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { z } from 'zod';
+import { EXECUTION_MODES } from '../config/execution.js';
+import { WORK_MODES } from '../config/work-mode.js';
+import { StateError } from '../errors.js';
+import { readJson, readTextOr, writeFileAtomic, writeJsonAtomic } from './atomic.js';
+import { notesSchema, renderNotes, type Note } from './notes.js';
+import { runDir, runsDir, type OmnexxPaths } from './paths.js';
+import { planSchema, type Plan } from './plan.js';
+
+export const PHASES = [
+  'init',
+  'planning',
+  'select',
+  'act',
+  'verify',
+  'commit',
+  'rollback',
+  'record',
+  'guard',
+  'wrapup',
+  'landing',
+  'done',
+] as const;
+export type Phase = (typeof PHASES)[number];
+
+/**
+ * Run lifecycle states. The canonical terminal states are finished (goal met),
+ * blocked (needs a human decision), expired (a budget ran out), stuck (a loop
+ * was detected) and failed (an unexpected error). The older names
+ * needs-human, budget-stop and error are kept so state.json files written
+ * before the rename still parse; new runs never produce them.
+ */
+export const RUN_STATUS = [
+  'planned',
+  'running',
+  'paused',
+  'finished',
+  'blocked',
+  'expired',
+  'stuck',
+  'failed',
+  'needs-human',
+  'budget-stop',
+  'user-stop',
+  'error',
+] as const;
+export type RunStatus = (typeof RUN_STATUS)[number];
+export const TERMINAL: readonly RunStatus[] = [
+  'planned',
+  'finished',
+  'blocked',
+  'expired',
+  'stuck',
+  'failed',
+  'needs-human',
+  'budget-stop',
+  'user-stop',
+];
+
+const gateSnapshotSchema = z.object({
+  exitCode: z.number(),
+  timedOut: z.boolean(),
+  failureIds: z.array(z.string()),
+  tests: z
+    .object({ total: z.number(), passed: z.number(), failed: z.number(), skipped: z.number() })
+    .optional(),
+});
+export type GateSnapshot = z.infer<typeof gateSnapshotSchema>;
+export const baselineSchema = z.record(z.string(), gateSnapshotSchema);
+export type Baseline = z.infer<typeof baselineSchema>;
+
+export const tokenUsageSchema = z.object({
+  uncached: z.number().default(0),
+  cacheWrite: z.number().default(0),
+  cacheRead: z.number().default(0),
+  output: z.number().default(0),
+});
+export type TokenUsage = z.infer<typeof tokenUsageSchema>;
+
+const pendingSchema = z.object({
+  verdict: z.enum(['accept', 'reject']),
+  taskId: z.string(),
+  done: z.boolean(),
+  reasons: z.array(z.string()),
+  signature: z.string(),
+  diffHash: z.string(),
+  baseline: baselineSchema.optional(),
+  summary: z.string(),
+  /** What the model should see next attempt if this is rejected (failures, violations). */
+  evidence: z.string().default(''),
+  changedFiles: z.array(z.string()).default([]),
+  diffStats: z
+    .object({ files: z.number(), added: z.number(), removed: z.number() })
+    .default({ files: 0, added: 0, removed: 0 }),
+  stuck: z.array(z.string()).default([]),
+  testsPassed: z.number().optional(),
+  worker: z.string().optional(),
+});
+export type PendingVerdict = z.infer<typeof pendingSchema>;
+
+export const stateSchema = z.object({
+  version: z.literal(1),
+  runId: z.string(),
+  repoRoot: z.string(),
+  repoName: z.string(),
+  worktree: z.string(),
+  branch: z.string(),
+  startRef: z.string(),
+  lastGreen: z.string(),
+  greenHistory: z.array(z.object({ sha: z.string(), cycle: z.number() })).default([]),
+  phase: z.enum(PHASES),
+  status: z.enum(RUN_STATUS),
+  statusReason: z.string().optional(),
+  cycle: z.number().int().nonnegative(),
+  taskId: z.string().optional(),
+  startedAt: z.number(),
+  updatedAt: z.number(),
+  /** Wall-clock already spent before the current supervisor started (resume keeps the clock honest). */
+  activeMs: z.number().default(0),
+  goalHash: z.string(),
+  baseline: baselineSchema.optional(),
+  /** Baseline at the starting commit, never overwritten (for the report's test deltas). */
+  initialBaseline: baselineSchema.optional(),
+  setupDone: z.boolean().default(false),
+  spend: z
+    .object({
+      usd: z.number().default(0),
+      tokens: tokenUsageSchema.prefault({}),
+      turns: z.number().default(0),
+      llmCalls: z.number().default(0),
+      byModel: z.record(z.string(), z.number()).default({}),
+      byProvider: z.record(z.string(), z.number()).default({}),
+    })
+    .prefault({}),
+  acceptedCommits: z.number().default(0),
+  /** Improvement rounds planned after the goal was met (beyond mode). */
+  beyondRounds: z.number().int().default(0),
+  /**
+   * Consecutive cycles rejected with no diff, no budget interruption, and no failing
+   * check (doom-loop detector; see guard/stuck.ts isIdleCycle). Any cycle with a diff
+   * resets it; guardPre ends the run as `stuck` at stuck.max_idle_cycles. Reset to 0
+   * when the run stops stuck, so a resume gets a fresh window.
+   */
+  idleCycles: z.number().int().default(0),
+  /** Autonomous mode: improvement rounds in a row that added nothing. */
+  idleRounds: z.number().int().default(0),
+  /** Paths earlier improvement rounds were shown as evidence, so each round gets fresh ones. */
+  evidenceShown: z.array(z.string()).default([]),
+  /** The PR `[git] open_pr` opened for this run's branch. */
+  prUrl: z.string().optional(),
+  /** Pre-finish audits run so far (each may add a milestone of gaps to close). */
+  auditRounds: z.number().int().default(0),
+  /** The cycle the latest audit round's work was planned at, while that work is open. */
+  auditWorkFrom: z.number().int().optional(),
+  /** The spec-first acceptance tests (see verify/spec-tests.ts) and their fix rounds so far. */
+  specTests: z
+    .object({
+      status: z.enum(['written', 'fixing', 'passed', 'skipped', 'failed-open']),
+      rounds: z.number().int().default(0),
+      taskId: z.string().optional(),
+      reason: z.string().optional(),
+      /** The judge's last rejected dispute: carried into the next fix task's evidence. */
+      ruling: z.string().optional(),
+      /** The commit a fix round started from, its cycle, and how many spec tests failed then. */
+      fromSha: z.string().optional(),
+      fromCycle: z.number().int().optional(),
+      failedBefore: z.number().int().optional(),
+    })
+    .optional(),
+  /** The fast path (one pass on the whole goal before planning): tried, then failed if it fell back. */
+  fastPath: z.enum(['tried', 'failed']).optional(),
+  /** A think-loop session reviewed its whole diff against the goal: the pre-finish audit is done. */
+  loopReviewed: z.boolean().optional(),
+  rejectedCycles: z.number().default(0),
+  lastProgressAt: z.number().optional(),
+  lastProgressCycle: z.number().default(0),
+  /** Autonomous no-progress recoveries since the last accepted commit (each parks the stuck work). */
+  recoveries: z.number().int().default(0),
+  warned: z.array(z.string()).default([]),
+  pending: pendingSchema.optional(),
+  /** Result of ACT, persisted so VERIFY can resume after a crash. */
+  act: z
+    .object({
+      summary: z.string(),
+      end: z.string(),
+      turns: z.number(),
+      usd: z.number(),
+      worker: z.string().optional(),
+      stuck: z.object({ signal: z.string(), detail: z.string() }).optional(),
+      /** A think-loop session ran its end review of the whole diff (see core/think-loop.ts). */
+      reviewed: z.boolean().optional(),
+    })
+    .optional(),
+  /** Token totals of recent cycles, for the in-cycle burn-rate signal. */
+  cycleTokens: z.array(z.number()).default([]),
+  recordedCycle: z.number().default(0),
+  checkpoints: z
+    .array(
+      z.object({
+        milestoneId: z.string(),
+        sha: z.string(),
+        tag: z.string(),
+        at: z.number(),
+        usd: z.number(),
+        tests: z.number().optional(),
+      }),
+    )
+    .default([]),
+  disabledWorkers: z.array(z.string()).default([]),
+  noChecks: z.boolean().default(false),
+  /** A writing run (prose, no tests): see core/writing.ts. */
+  writing: z.boolean().default(false),
+  /** The execution mode the run currently runs under (see src/config/execution.ts). */
+  executionMode: z.enum(EXECUTION_MODES).default('normal'),
+  /** The work domain the run runs under (see src/config/work-mode.ts). */
+  workDomain: z.enum(WORK_MODES).default('swe'),
+  /** Set when a pre-flight check refused a call for max_usd; cleared when a supervisor starts. */
+  budgetExhausted: z.boolean().default(false),
+  /** The task a per-task cap parked: why, when, and what it had spent. */
+  taskCapHit: z
+    .object({
+      taskId: z.string(),
+      kind: z.enum(['task_max_tokens', 'task_max_usd']),
+      cycle: z.number().int().nonnegative(),
+      at: z.number(),
+      usd: z.number().default(0),
+      tokens: z.number().default(0),
+      detail: z.string().default(''),
+      checkpoint: z.string().optional(),
+    })
+    .optional(),
+  /** Set when every model stayed unavailable past budget.max_provider_wait: why. */
+  providersUnavailable: z.string().optional(),
+  /** Recent spend with timestamps, for the rolling daily cap (pruned to the last 25 h). */
+  /** A call was refused for max_usd_per_day: pause at the next boundary. */
+  dailyCapHit: z.boolean().default(false),
+  spendLedger: z
+    .array(z.object({ at: z.number(), usd: z.number(), provider: z.string().optional() }))
+    .default([]),
+});
+export type RunState = z.infer<typeof stateSchema>;
+
+export const controlSchema = z.object({
+  request: z.enum(['pause', 'resume', 'stop', 'stop-now']),
+  at: z.number(),
+});
+export type ControlRequest = z.infer<typeof controlSchema>;
+
+export const heartbeatSchema = z.object({
+  ts: z.number(),
+  pid: z.number(),
+  phase: z.string(),
+  status: z.string(),
+  cycle: z.number(),
+  task: z.string().optional(),
+  spentUsd: z.number(),
+  lastGreen: z.string(),
+});
+export type Heartbeat = z.infer<typeof heartbeatSchema>;
+
+export const sha256 = (s: string): string => createHash('sha256').update(s).digest('hex');
+
+/** Every file of one run, under `$OMNEXX_HOME/runs/<runId>/` (outside the repo, plan §3.3). */
+export class RunStore {
+  readonly dir: string;
+  /** The omnexx home (runs, repo memory), for state that outlives this run. */
+  readonly home: string;
+
+  constructor(
+    paths: OmnexxPaths,
+    readonly runId: string,
+  ) {
+    this.dir = runDir(paths, runId);
+    this.home = paths.home;
+  }
+
+  file(name: string): string {
+    return join(this.dir, name);
+  }
+  get eventsPath(): string {
+    return this.file('events.jsonl');
+  }
+  get logsDir(): string {
+    return this.file('logs');
+  }
+
+  async init(): Promise<void> {
+    for (const d of ['', 'logs', 'rejected', 'salvage', 'checkpoints'])
+      await mkdir(join(this.dir, d), { recursive: true, mode: 0o700 });
+  }
+
+  async readState(): Promise<RunState> {
+    let raw: unknown;
+    try {
+      raw = await readJson(this.file('state.json'));
+    } catch (err) {
+      throw new StateError(
+        `cannot read state for ${this.runId}: ${(err as Error).message}`,
+        'check `omnexx runs`',
+      );
+    }
+    const parsed = stateSchema.safeParse(raw);
+    if (!parsed.success)
+      throw new StateError(
+        `state.json for ${this.runId} is invalid: ${parsed.error.issues[0]?.message ?? ''}`,
+      );
+    return parsed.data;
+  }
+
+  async writeState(state: RunState): Promise<void> {
+    await writeJsonAtomic(this.file('state.json'), stateSchema.parse(state));
+  }
+
+  async readPlan(): Promise<Plan | undefined> {
+    const text = await readTextOr(this.file('plan.json'), '');
+    if (!text) return undefined;
+    return planSchema.parse(JSON.parse(text));
+  }
+
+  async writePlan(plan: Plan): Promise<void> {
+    await writeJsonAtomic(this.file('plan.json'), planSchema.parse(plan));
+  }
+
+  /**
+   * A parked task's state, written before the run stops so a person can see exactly where the
+   * budget ran out and resume from the worktree/plan without digging through the transcript.
+   */
+  async writeTaskCheckpoint(name: string, data: unknown): Promise<string> {
+    const file = this.file(`checkpoints/${name.replace(/[^\w.-]+/g, '-')}.json`);
+    await writeJsonAtomic(file, data);
+    return file;
+  }
+
+  async readGoal(): Promise<{ text: string; hash: string }> {
+    const text = await readTextOr(this.file('goal.md'), '');
+    return { text, hash: sha256(text) };
+  }
+
+  async writeGoal(text: string): Promise<void> {
+    await writeFileAtomic(this.file('goal.md'), text.endsWith('\n') ? text : `${text}\n`);
+  }
+
+  async readNotes(): Promise<Note[]> {
+    const text = await readTextOr(this.file('notes.json'), '[]');
+    return notesSchema.parse(JSON.parse(text));
+  }
+
+  async writeNotes(notes: Note[]): Promise<void> {
+    await writeJsonAtomic(this.file('notes.json'), notes);
+    await writeFileAtomic(this.file('notes.md'), `# Lessons\n\n${renderNotes(notes)}\n`);
+  }
+
+  /** Append one journal entry per cycle; a replay after a crash doesn't add a duplicate. */
+  async appendProgress(cycle: number, body: string): Promise<boolean> {
+    const marker = `## Cycle ${cycle}\n`;
+    const existing = await readTextOr(this.file('progress.md'), '');
+    if (new RegExp(`^${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(existing))
+      return false;
+    await appendFile(this.file('progress.md'), `${marker}${body.trim()}\n\n`, { mode: 0o600 });
+    return true;
+  }
+
+  async progressTail(n: number): Promise<string> {
+    if (n === 0) return '';
+    const text = await readTextOr(this.file('progress.md'), '');
+    const entries = text.split(/^(?=## Cycle \d+\n)/m).filter((e) => e.startsWith('## Cycle'));
+    return entries.slice(-n).join('').trim();
+  }
+
+  async readControl(): Promise<ControlRequest | undefined> {
+    const text = await readTextOr(this.file('control.json'), '');
+    if (!text) return undefined;
+    const parsed = controlSchema.safeParse(JSON.parse(text));
+    return parsed.success ? parsed.data : undefined;
+  }
+
+  async writeControl(req: ControlRequest): Promise<void> {
+    await writeJsonAtomic(this.file('control.json'), req);
+  }
+
+  async readHeartbeat(): Promise<Heartbeat | undefined> {
+    const text = await readTextOr(this.file('heartbeat.json'), '');
+    if (!text) return undefined;
+    const parsed = heartbeatSchema.safeParse(JSON.parse(text));
+    return parsed.success ? parsed.data : undefined;
+  }
+
+  async writeHeartbeat(hb: Heartbeat): Promise<void> {
+    await writeJsonAtomic(this.file('heartbeat.json'), hb);
+  }
+}
+
+export async function listRunIds(paths: OmnexxPaths): Promise<string[]> {
+  try {
+    return (await readdir(runsDir(paths))).filter((d) => d.startsWith('r_')).sort();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+}

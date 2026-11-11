@@ -1,0 +1,430 @@
+import { gunzipSync } from 'node:zlib';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
+import type { CatalogEntry } from './catalog.js';
+
+export const MCP_REGISTRY_URL = 'https://registry.modelcontextprotocol.io/v0/servers';
+
+export interface RegistryServerRecord {
+  id: string;
+  kind: 'mcp';
+  name: string;
+  description: string;
+  server: string;
+  version?: string | undefined;
+  status?: string | undefined;
+  source: 'mcp-registry';
+  installable: true;
+  install?:
+    | {
+        registryType?: string | undefined;
+        identifier?: string | undefined;
+        version?: string | undefined;
+        remoteType?: string | undefined;
+        url?: string | undefined;
+      }
+    | undefined;
+}
+
+export interface RegistrySnapshot {
+  source: string;
+  fetchedAt: string;
+  rawCount: number;
+  latestCount: number;
+  note?: string;
+  servers: RegistryServerRecord[];
+  /** Live pagination stopped early on the time budget (partial snapshot). */
+  truncated?: boolean;
+}
+
+export interface RegistryLoadResult {
+  snapshot: RegistrySnapshot;
+  /** `none` = no cache, network, or bundled snapshot was found (likely a packaging bug). */
+  from: 'live' | 'cache' | 'bundled' | 'none';
+  entries: Omit<CatalogEntry, 'tokens'>[];
+  /** Corrupt/invalid snapshot files that were skipped (integrity failures). */
+  issues?: string[];
+}
+
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Total budget for one live registry pagination (all pages, not per request).
+ * A slow registry must never hold a caller hostage.
+ */
+export const LIVE_REGISTRY_TIMEOUT_MS = 15_000;
+
+/** Per-request ceiling for a single registry page. */
+const PAGE_TIMEOUT_MS = 30_000;
+
+function cachePath(env: NodeJS.ProcessEnv = process.env): string {
+  // `||` on purpose: an empty env var must fall back too.
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+  const home = env.OMNEXX_CONFIG_HOME || env.XDG_CONFIG_HOME || join(homedir(), '.config');
+  return join(home, 'omnexx', 'cache', 'mcp-registry-snapshot.json.gz');
+}
+
+export function bundledCandidates(moduleUrl = import.meta.url): string[] {
+  const snap = 'mcp-registry-snapshot.json.gz';
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (p: string) => {
+    if (!seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  };
+  // Walk up from this module (works for src/, dist/ chunks and global installs regardless
+  // of cwd) and probe each known layout at every ancestor.
+  let dir = dirname(fileURLToPath(moduleUrl));
+  for (let depth = 0; depth < 6; depth++) {
+    add(join(dir, 'data', snap));
+    add(join(dir, 'dist', 'data', snap));
+    add(join(dir, 'src', 'runtime', 'kernel', 'data', snap));
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return out;
+}
+
+/** Structural integrity check: a corrupt/truncated snapshot must fail loudly, not load partial. */
+export function validateRegistrySnapshot(value: unknown): RegistrySnapshot {
+  if (!value || typeof value !== 'object') throw new Error('registry snapshot: not an object');
+  const snap = value as Partial<RegistrySnapshot>;
+  if (!Array.isArray(snap.servers)) throw new Error('registry snapshot: servers is not an array');
+  if (typeof snap.fetchedAt !== 'string' || !Number.isFinite(Date.parse(snap.fetchedAt)))
+    throw new Error('registry snapshot: invalid fetchedAt');
+  if (typeof snap.latestCount === 'number' && snap.latestCount !== snap.servers.length)
+    throw new Error(
+      `registry snapshot: latestCount ${snap.latestCount} != ${snap.servers.length} servers (truncated?)`,
+    );
+  for (const [i, rec] of snap.servers.entries()) {
+    const r = rec as Partial<RegistryServerRecord> | null;
+    if (
+      !r ||
+      typeof r.id !== 'string' ||
+      typeof r.server !== 'string' ||
+      typeof r.name !== 'string'
+    )
+      throw new Error(`registry snapshot: malformed server record #${i}`);
+  }
+  return snap as RegistrySnapshot;
+}
+
+async function readGzipJson(path: string): Promise<RegistrySnapshot> {
+  const buf = await readFile(path);
+  let json: string;
+  try {
+    json = gunzipSync(buf).toString('utf8');
+  } catch (err) {
+    throw new Error(`registry snapshot: corrupt gzip (${(err as Error).message})`, {
+      cause: err,
+    });
+  }
+  return validateRegistrySnapshot(JSON.parse(json));
+}
+
+/** Read a snapshot, recording integrity failures (but not plain "file missing"). */
+async function readSnapshotNoting(
+  path: string,
+  issues: string[],
+): Promise<RegistrySnapshot | undefined> {
+  try {
+    return await readGzipJson(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+      issues.push(`${path}: ${(err as Error).message}`);
+    return undefined;
+  }
+}
+
+async function writeGzipJson(path: string, snap: RegistrySnapshot): Promise<void> {
+  const { gzipSync } = await import('node:zlib');
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, gzipSync(Buffer.from(JSON.stringify(snap))));
+}
+
+/** Paginate the live official MCP Registry; keep latest per server name. */
+export async function fetchLiveRegistry(
+  opts: {
+    limit?: number;
+    fetchImpl?: typeof fetch;
+    maxPages?: number;
+    /** Total budget for the whole pagination (ms). 0 = unbounded (per-page limit only). */
+    timeoutMs?: number;
+  } = {},
+): Promise<RegistrySnapshot> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const pageSize = opts.limit ?? 100;
+  const maxPages = opts.maxPages ?? 250;
+  const budget = opts.timeoutMs ?? LIVE_REGISTRY_TIMEOUT_MS;
+  const deadline = budget > 0 ? Date.now() + budget : undefined;
+  let cursor: string | undefined;
+  let truncated = false;
+  const raw: unknown[] = [];
+  for (let page = 0; page < maxPages; page++) {
+    const remaining = deadline === undefined ? PAGE_TIMEOUT_MS : deadline - Date.now();
+    if (remaining <= 0) {
+      truncated = true;
+      break;
+    }
+    const url = new URL(MCP_REGISTRY_URL);
+    url.searchParams.set('limit', String(pageSize));
+    if (cursor) url.searchParams.set('cursor', cursor);
+    let res: Response;
+    try {
+      res = await fetchImpl(url, {
+        headers: { accept: 'application/json', 'user-agent': 'omnexx-kernel/1.0' },
+        signal: AbortSignal.timeout(Math.max(1, Math.min(PAGE_TIMEOUT_MS, remaining))),
+      });
+    } catch (err) {
+      // Ran out of budget mid-request: keep the pages we already have.
+      if (deadline !== undefined && Date.now() >= deadline) {
+        truncated = true;
+        break;
+      }
+      throw err;
+    }
+    if (!res.ok) throw new Error(`MCP registry HTTP ${res.status}`);
+    const body = (await res.json()) as {
+      servers?: unknown[];
+      metadata?: { nextCursor?: string };
+    };
+    const rows = body.servers ?? [];
+    raw.push(...rows);
+    cursor = body.metadata?.nextCursor;
+    if (!cursor || rows.length === 0) break;
+  }
+
+  const latest = new Map<string, RegistryServerRecord>();
+  for (const row of raw) {
+    if (!row || typeof row !== 'object') continue;
+    const r = row as {
+      server?: Record<string, unknown>;
+      _meta?: Record<string, Record<string, unknown>>;
+    };
+    const srv = r.server;
+    if (!srv || typeof srv.name !== 'string') continue;
+    const name = srv.name;
+    const meta = r._meta?.['io.modelcontextprotocol.registry/official'] ?? {};
+    const packages = Array.isArray(srv.packages) ? srv.packages : [];
+    const remotes = Array.isArray(srv.remotes) ? srv.remotes : [];
+    let install: RegistryServerRecord['install'];
+    if (packages[0] && typeof packages[0] === 'object') {
+      const p0 = packages[0] as Record<string, unknown>;
+      install = {
+        registryType: typeof p0.registryType === 'string' ? p0.registryType : undefined,
+        identifier:
+          typeof p0.identifier === 'string'
+            ? p0.identifier
+            : typeof p0.name === 'string'
+              ? p0.name
+              : undefined,
+        version: typeof p0.version === 'string' ? p0.version : undefined,
+      };
+    } else if (remotes[0] && typeof remotes[0] === 'object') {
+      const r0 = remotes[0] as Record<string, unknown>;
+      install = {
+        remoteType: typeof r0.type === 'string' ? r0.type : undefined,
+        url: typeof r0.url === 'string' ? r0.url : undefined,
+      };
+    }
+    const rec: RegistryServerRecord = {
+      id: `registry:mcp:${name}`,
+      kind: 'mcp',
+      name:
+        typeof srv.title === 'string'
+          ? srv.title
+          : // `||`: a trailing slash yields '' and must fall back to the full name.
+            // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
+            name.split('/').pop() || name,
+      description: typeof srv.description === 'string' ? srv.description.slice(0, 500) : '',
+      server: name,
+      version: typeof srv.version === 'string' ? srv.version : undefined,
+      status: typeof meta.status === 'string' ? meta.status : 'active',
+      source: 'mcp-registry',
+      installable: true,
+      ...(install ? { install } : {}),
+    };
+    const prev = latest.get(name);
+    if (!prev || meta.isLatest === true) latest.set(name, rec);
+  }
+
+  const servers = [...latest.values()]
+    .filter((s) => s.status === 'active')
+    .sort((a, b) => a.server.localeCompare(b.server));
+
+  return {
+    source: MCP_REGISTRY_URL,
+    fetchedAt: new Date().toISOString(),
+    rawCount: raw.length,
+    latestCount: servers.length,
+    note: 'Live fetch from official MCP Registry (latest per server name).',
+    servers,
+    ...(truncated ? { truncated: true } : {}),
+  };
+}
+
+/** Union live refresh with a floor snapshot so a bounded fetch never shrinks the catalog. */
+export function mergeWithFloor(live: RegistrySnapshot, floor: RegistrySnapshot): RegistrySnapshot {
+  const map = new Map<string, RegistryServerRecord>();
+  for (const s of floor.servers) map.set(s.server, s);
+  for (const s of live.servers) map.set(s.server, s); // live wins on conflict
+  const servers = [...map.values()].sort((a, b) => a.server.localeCompare(b.server));
+  const shrunk = live.latestCount < floor.latestCount;
+  return {
+    source: live.source,
+    fetchedAt: live.fetchedAt,
+    rawCount: Math.max(live.rawCount, floor.rawCount),
+    latestCount: servers.length,
+    note: shrunk
+      ? `Live refresh (${live.latestCount}) merged with bundled/cache floor (${floor.latestCount}) so the catalog never shrinks.`
+      : (live.note ?? 'Live fetch from official MCP Registry (latest per server name).'),
+    servers,
+  };
+}
+
+export async function readBundledSnapshot(
+  moduleUrl: string,
+): Promise<RegistrySnapshot | undefined> {
+  for (const path of bundledCandidates(moduleUrl)) {
+    try {
+      const snap = await readGzipJson(path);
+      if (snap.servers.length) return snap;
+    } catch {
+      // try next
+    }
+  }
+  return undefined;
+}
+
+/** Load registry: prefer fresh cache, else live refresh, else bundled snapshot. */
+export async function loadRegistry(opts?: {
+  env?: NodeJS.ProcessEnv;
+  fetchImpl?: typeof fetch;
+  /** Skip live network (tests / offline). */
+  offline?: boolean;
+  moduleUrl?: string;
+  /** Total budget for the live pagination (ms). 0 = unbounded. */
+  timeoutMs?: number;
+}): Promise<RegistryLoadResult> {
+  const env = opts?.env ?? process.env;
+  const cache = cachePath(env);
+  const issues: string[] = [];
+  const withIssues = (r: RegistryLoadResult): RegistryLoadResult =>
+    issues.length ? { ...r, issues: [...new Set(issues)] } : r;
+
+  // 1. Fresh local cache
+  {
+    const snap = await readSnapshotNoting(cache, issues);
+    const age = snap ? Date.now() - Date.parse(snap.fetchedAt) : NaN;
+    if (snap && Number.isFinite(age) && age >= 0 && age < CACHE_TTL_MS && snap.servers.length) {
+      return { snapshot: snap, from: 'cache', entries: toCatalogEntries(snap) };
+    }
+  }
+
+  // 2. Live refresh (unless offline) — never shrink below bundled/cache floor (#19).
+  if (!opts?.offline) {
+    try {
+      let snap = await fetchLiveRegistry({
+        ...(opts?.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+        maxPages: 80, // bounded refresh; floor merge restores the rest
+        ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+      });
+      const truncated = snap.truncated === true;
+      const bundled = await readBundledSnapshot(opts?.moduleUrl ?? import.meta.url);
+      let cachedFloor: RegistrySnapshot | undefined;
+      try {
+        const cached = await readGzipJson(cache);
+        if (cached.servers.length) cachedFloor = cached;
+      } catch {
+        // no cache
+      }
+      const floorCandidates = [bundled, cachedFloor].filter((s): s is RegistrySnapshot =>
+        Boolean(s?.servers.length),
+      );
+      if (floorCandidates.length) {
+        const floor = floorCandidates.reduce((a, b) => (a.latestCount >= b.latestCount ? a : b));
+        snap = mergeWithFloor(snap, floor);
+      }
+      // A truncated refresh is not a full snapshot: don't pin it as the fresh cache.
+      if (!truncated) await writeGzipJson(cache, snap).catch(() => undefined);
+      return withIssues({ snapshot: snap, from: 'live', entries: toCatalogEntries(snap) });
+    } catch {
+      // fall through
+    }
+  }
+
+  // 3. Stale cache still better than nothing
+  {
+    const snap = await readSnapshotNoting(cache, issues);
+    if (snap?.servers.length)
+      return withIssues({ snapshot: snap, from: 'cache', entries: toCatalogEntries(snap) });
+  }
+
+  // 4. Bundled snapshot shipped with Omnexx
+  for (const path of bundledCandidates(opts?.moduleUrl ?? import.meta.url)) {
+    const snap = await readSnapshotNoting(path, issues);
+    if (snap?.servers.length)
+      return withIssues({ snapshot: snap, from: 'bundled', entries: toCatalogEntries(snap) });
+  }
+
+  return withIssues({
+    snapshot: {
+      source: MCP_REGISTRY_URL,
+      fetchedAt: new Date(0).toISOString(),
+      rawCount: 0,
+      latestCount: 0,
+      servers: [],
+      note: 'No registry data available (bundled snapshot missing — packaging bug?)',
+    },
+    from: 'none',
+    entries: [],
+  });
+}
+
+export function toCatalogEntries(snap: RegistrySnapshot): Omit<CatalogEntry, 'tokens'>[] {
+  return snap.servers.map((s) => ({
+    id: s.id,
+    kind: 'mcp' as const,
+    name: s.name,
+    description: s.description,
+    server: s.server,
+    // No inputSchema until the server is installed + mounted (lazy).
+  }));
+}
+
+/** Human-readable install suggestion — never executes untrusted code. */
+/** The real CLI entry point for adding a registry MCP server (see `omnexx mcp add --help`). */
+export function mcpAddCommand(server: string): string {
+  const short = server.split('/').pop() ?? server;
+  return `omnexx mcp add ${short} --pick ${server}`;
+}
+
+/** The real CLI entry points for skills (`omnexx skills search` / `omnexx skills add <path|url>`). */
+export function skillInstallHint(name: string): string {
+  return `Find it with \`omnexx skills search ${name}\`, then \`omnexx skills add <path|url>\``;
+}
+
+export function installSuggestion(rec: RegistryServerRecord): string {
+  const lines = [
+    `Capability "${rec.id}" is in the official MCP Registry but is NOT installed locally.`,
+    `Server: ${rec.server}${rec.version ? `@${rec.version}` : ''}`,
+    rec.description ? `About: ${rec.description}` : '',
+    'Omnexx will not download or run it automatically.',
+    `To enable it, run \`${mcpAddCommand(rec.server)}\` (or add it in the VS Code MCP gallery), then remount.`,
+  ];
+  if (rec.install?.identifier) {
+    lines.push(
+      `Registry package hint: ${rec.install.registryType ?? 'package'} ${rec.install.identifier}` +
+        (rec.install.version ? `@${rec.install.version}` : ''),
+    );
+  }
+  if (rec.install?.url) {
+    lines.push(`Remote MCP URL hint: ${rec.install.url} (${rec.install.remoteType ?? 'remote'})`);
+  }
+  return lines.filter(Boolean).join('\n');
+}

@@ -1,0 +1,545 @@
+{
+  "name": "omnexx",
+  "displayName": "omnexx",
+  "description": "Autonomous coding agent for VS Code. Plan, code, test, and run unattended in your codebase with zero-config local Ollama or cloud models.",
+  "version": "1.0.0",
+  "publisher": "yaegerbomb42",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yaegerbomb42/omnexx.git",
+    "directory": "vscode"
+  },
+  "homepage": "https://omnexx.org",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "agent",
+    "coding agent",
+    "autonomous",
+    "ollama"
+  ],
+  "main": "./out/extension.cjs",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "omnexx",
+          "title": "omnexx",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "omnexx": [
+        {
+          "type": "webview",
+          "id": "omnexx.chat",
+          "name": "Chat"
+        },
+        {
+          "id": "omnexx.runs",
+          "name": "History"
+        },
+        {
+          "id": "omnexx.autonomousQueueView",
+          "name": "Autonomous Queue"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "omnexx.runs",
+        "contents": "No chats or runs for this folder yet.\n[Start run](command:omnexx.startRun)\n[Autonomous for N hours](command:omnexx.startAutonomous)\n[Open chat in terminal](command:omnexx.openChat)"
+      },
+      {
+        "view": "omnexx.autonomousQueueView",
+        "contents": "No daemon work queued yet.\n[Refresh](command:omnexx.refreshAutonomousQueue)"
+      }
+    ],
+    "commands": [
+      {
+        "command": "omnexx.startRun",
+        "title": "Start Run",
+        "category": "omnexx",
+        "icon": "$(play)"
+      },
+      {
+        "command": "omnexx.startAutonomous",
+        "title": "Autonomous for N Hours",
+        "category": "omnexx",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "omnexx.openChat",
+        "title": "Open Chat in Terminal",
+        "category": "omnexx",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "omnexx.refresh",
+        "title": "Refresh History",
+        "category": "omnexx",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "omnexx.showHistory",
+        "title": "Show History",
+        "category": "omnexx",
+        "icon": "$(history)"
+      },
+      {
+        "command": "omnexx.attach",
+        "title": "Watch in Terminal",
+        "category": "omnexx",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "omnexx.pause",
+        "title": "Pause Run",
+        "category": "omnexx",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "omnexx.resume",
+        "title": "Resume Run",
+        "category": "omnexx",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "omnexx.stop",
+        "title": "Stop Run",
+        "category": "omnexx",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "omnexx.focusChat",
+        "title": "Open Chat",
+        "category": "omnexx",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "omnexx.newChat",
+        "title": "New Chat",
+        "category": "omnexx",
+        "icon": "$(add)"
+      },
+      {
+        "command": "omnexx.pickModel",
+        "title": "Pick Chat Model",
+        "category": "omnexx",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "omnexx.restartChat",
+        "title": "Restart Chat",
+        "category": "omnexx",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "omnexx.openSettings",
+        "title": "Settings",
+        "category": "omnexx",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "omnexx.inspectContext",
+        "title": "Inspect Context",
+        "category": "omnexx",
+        "icon": "$(layers)"
+      },
+      {
+        "command": "omnexx.toggleApproval",
+        "title": "Toggle Auto-Approve",
+        "category": "omnexx"
+      },
+      {
+        "command": "omnexx.toggleTrace",
+        "title": "Toggle Per-Turn Trace",
+        "category": "omnexx"
+      },
+      {
+        "command": "omnexx.undoLast",
+        "title": "Undo Last Message's Edits",
+        "category": "omnexx",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "omnexx.compactChat",
+        "title": "Compact Conversation",
+        "category": "omnexx",
+        "icon": "$(fold)"
+      },
+      {
+        "command": "omnexx.refreshAutonomousQueue",
+        "title": "Refresh Autonomous Queue",
+        "category": "omnexx",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "omnexx.showQueueDiff",
+        "title": "Show Queued Diff",
+        "category": "omnexx",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "omnexx.approveDiff",
+        "title": "Approve Diff",
+        "category": "omnexx",
+        "icon": "$(check)"
+      },
+      {
+        "command": "omnexx.rejectDiff",
+        "title": "Reject Diff",
+        "category": "omnexx",
+        "icon": "$(circle-slash)"
+      },
+      {
+        "command": "omnexx.toggleAutonomousDaemon",
+        "title": "Toggle 24/7 Autonomous Daemon",
+        "category": "omnexx",
+        "icon": "$(play)"
+      },
+      {
+        "command": "omnexx.openTerminal",
+        "title": "Open Live Terminal",
+        "category": "omnexx",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "omnexx.toggleSplitView",
+        "title": "Toggle Split View: Chat / Terminal",
+        "category": "omnexx",
+        "icon": "$(split-horizontal)"
+      },
+      {
+        "command": "omnexx.reviewDiff",
+        "title": "Review Patch Diff",
+        "category": "omnexx",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "omnexx.acceptPatch",
+        "title": "Accept Patch",
+        "category": "omnexx",
+        "icon": "$(check)"
+      },
+      {
+        "command": "omnexx.rejectPatch",
+        "title": "Reject Patch & Re-roll",
+        "category": "omnexx",
+        "icon": "$(circle-slash)"
+      },
+      {
+        "command": "omnexx.openSplitDiff",
+        "title": "Open Split Diff Viewer",
+        "category": "omnexx",
+        "icon": "$(split-horizontal)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "omnexx.startRun",
+          "when": "view == omnexx.runs",
+          "group": "navigation@1"
+        },
+        {
+          "command": "omnexx.startAutonomous",
+          "when": "view == omnexx.runs",
+          "group": "navigation@2"
+        },
+        {
+          "command": "omnexx.openChat",
+          "when": "view == omnexx.runs",
+          "group": "navigation@3"
+        },
+        {
+          "command": "omnexx.refresh",
+          "when": "view == omnexx.runs",
+          "group": "navigation@4"
+        },
+        {
+          "command": "omnexx.toggleAutonomousDaemon",
+          "when": "view == omnexx.autonomousQueueView",
+          "group": "navigation@0"
+        },
+        {
+          "command": "omnexx.refreshAutonomousQueue",
+          "when": "view == omnexx.autonomousQueueView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "omnexx.toggleAutonomousDaemon",
+          "when": "view == omnexx.chat",
+          "group": "navigation@0"
+        },
+        {
+          "command": "omnexx.newChat",
+          "when": "view == omnexx.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "omnexx.pickModel",
+          "when": "view == omnexx.chat",
+          "group": "navigation@2"
+        },
+        {
+          "command": "omnexx.restartChat",
+          "when": "view == omnexx.chat",
+          "group": "overflow@1"
+        },
+        {
+          "command": "omnexx.openChat",
+          "when": "view == omnexx.chat",
+          "group": "overflow@2"
+        },
+        {
+          "command": "omnexx.inspectContext",
+          "when": "view == omnexx.chat",
+          "group": "navigation@3"
+        },
+        {
+          "command": "omnexx.openSettings",
+          "when": "view == omnexx.chat",
+          "group": "navigation@4"
+        },
+        {
+          "command": "omnexx.toggleApproval",
+          "when": "view == omnexx.chat",
+          "group": "overflow@0"
+        },
+        {
+          "command": "omnexx.toggleTrace",
+          "when": "view == omnexx.chat",
+          "group": "overflow@0"
+        },
+        {
+          "command": "omnexx.undoLast",
+          "when": "view == omnexx.chat",
+          "group": "overflow@1"
+        },
+        {
+          "command": "omnexx.compactChat",
+          "when": "view == omnexx.chat",
+          "group": "overflow@1"
+        },
+        {
+          "command": "omnexx.openTerminal",
+          "when": "view == omnexx.chat",
+          "group": "overflow@3"
+        },
+        {
+          "command": "omnexx.toggleSplitView",
+          "when": "view == omnexx.chat",
+          "group": "overflow@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "omnexx.refreshAutonomousQueue",
+          "when": "view == omnexx.autonomousQueueView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "omnexx.showQueueDiff",
+          "when": "view == omnexx.autonomousQueueView && viewItem =~ /^autonomousTask/",
+          "group": "inline@1"
+        },
+        {
+          "command": "omnexx.attach",
+          "when": "view == omnexx.runs && viewItem =~ /^run\\./",
+          "group": "inline@1"
+        },
+        {
+          "command": "omnexx.pause",
+          "when": "view == omnexx.runs && viewItem == run.active",
+          "group": "inline@2"
+        },
+        {
+          "command": "omnexx.stop",
+          "when": "view == omnexx.runs && viewItem =~ /^run\\.(active|fix)$/",
+          "group": "inline@3"
+        },
+        {
+          "command": "omnexx.resume",
+          "when": "view == omnexx.runs && viewItem =~ /^run\\.(ended|fix)$/",
+          "group": "inline@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "omnexx.attach",
+          "when": "false"
+        },
+        {
+          "command": "omnexx.pause",
+          "when": "false"
+        },
+        {
+          "command": "omnexx.resume",
+          "when": "false"
+        },
+        {
+          "command": "omnexx.stop",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "omnexx",
+      "properties": {
+        "omnexx.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the omnexx executable. Empty uses omnexx on PATH (install with: npm i -g omnexx).",
+          "scope": "machine-overridable"
+        },
+        "omnexx.showAllRuns": {
+          "type": "boolean",
+          "default": false,
+          "description": "List runs from every repository, not only the open folders."
+        },
+        "omnexx.refreshSeconds": {
+          "type": "number",
+          "default": 5,
+          "minimum": 2,
+          "description": "How often the sidebar re-reads a live run's todo list. Takes effect after a reload."
+        },
+        "omnexx.lazyToolDiscovery": {
+          "type": "boolean",
+          "default": true,
+          "description": "Lazy tool discovery: send a compact tool index and load full tool definitions on demand (saves tokens). Turn off to send every tool definition each request (same as --tool-discovery full)."
+        },
+        "omnexx.autoApprove": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start chats in auto-approve mode: omnexx goes ahead without asking before guarded actions (hard-blocked commands stay blocked)."
+        },
+        "omnexx.kernel.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Adaptive Runtime Kernel (on by default): per-turn role/tool allocation via local Ollama + deterministic telemetry, with heuristic fallback when Ollama is absent. Turn off to disable."
+        },
+        "omnexx.kernel.ollamaUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "Ollama base URL used by the Adaptive Runtime Kernel meta-router."
+        },
+        "omnexx.kernel.ollamaModel": {
+          "type": "string",
+          "default": "qwen2.5:3b",
+          "description": "Local Ollama chat model for the Adaptive Runtime Kernel (kept warm with keep_alive: -1)."
+        },
+        "omnexx.kernel.maxMounted": {
+          "type": "integer",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 32,
+          "description": "Maximum number of dynamic tools and skills mounted into the active set per turn."
+        },
+        "omnexx.kernel.registry": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable official MCP registry discovery in the Adaptive Runtime Kernel."
+        },
+        "omnexx.kernel.publicSkills": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable public skills catalog indexing in the Adaptive Runtime Kernel."
+        },
+        "omnexx.systemOne.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "System-1 (Jev-style) decision gates around the agent loop: destructive-command pre-flight, lazy-patch rejection, tool-output triage, intent routing with speculative pre-fetch, and early stopping. Works offline with calibrated local models; add a TYPESAFE_API_KEY for TypeSafe Jev."
+        },
+        "omnexx.systemOne.backend": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "typesafe",
+            "ollama",
+            "local"
+          ],
+          "default": "auto",
+          "description": "auto: TypeSafe Jev when TYPESAFE_API_KEY (or a custom base URL) is set, else local Ollama, else calibrated local models."
+        },
+        "omnexx.systemOne.model": {
+          "type": "string",
+          "default": "jev-latest",
+          "description": "System-1 model on the /v1/systemone endpoint (e.g. jev-latest, jev-1.14.0)."
+        },
+        "omnexx.systemOne.baseUrl": {
+          "type": "string",
+          "default": "https://api.typesafe.ai/v1/systemone",
+          "description": "System-1 endpoint (TypeSafe Jev, or a local Kev / Clef / OpenRouter System-1 server)."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "omnexx.focusChat",
+        "key": "ctrl+alt+o",
+        "mac": "cmd+alt+o"
+      },
+      {
+        "command": "omnexx.showHistory",
+        "key": "ctrl+alt+h",
+        "mac": "cmd+alt+h"
+      },
+      {
+        "command": "omnexx.pause",
+        "key": "ctrl+shift+alt+p",
+        "mac": "cmd+shift+alt+p",
+        "when": "view == omnexx.chat"
+      },
+      {
+        "command": "omnexx.resume",
+        "key": "ctrl+shift+alt+r",
+        "mac": "cmd+shift+alt+r",
+        "when": "view == omnexx.chat"
+      },
+      {
+        "command": "omnexx.stop",
+        "key": "ctrl+shift+alt+s",
+        "mac": "cmd+shift+alt+s",
+        "when": "view == omnexx.chat"
+      },
+      {
+        "command": "omnexx.newChat",
+        "key": "ctrl+shift+alt+n",
+        "mac": "cmd+shift+alt+n",
+        "when": "view == omnexx.chat"
+      },
+      {
+        "command": "omnexx.undoLast",
+        "key": "ctrl+shift+alt+z",
+        "mac": "cmd+shift+alt+z",
+        "when": "view == omnexx.chat"
+      },
+      {
+        "command": "omnexx.pickModel",
+        "key": "ctrl+shift+alt+m",
+        "mac": "cmd+shift+alt+m",
+        "when": "view == omnexx.chat"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "package": "node build.mjs && npx @vscode/vsce package --no-dependencies",
+    "preview:capture": "node scripts/capture-ui.mjs"
+  },
+  "devDependencies": {
+    "puppeteer": "^25.16.0"
+  }
+}

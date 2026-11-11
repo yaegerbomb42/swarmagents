@@ -1,0 +1,16 @@
+FROM node:20-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3400
+ENV HOSTNAME="0.0.0.0"
+
+# Copy standalone Next.js server & assets
+COPY .next/standalone ./
+COPY .next/static ./.next/static
+COPY public ./public
+
+EXPOSE 3400
+
+CMD ["node", "server.js"]

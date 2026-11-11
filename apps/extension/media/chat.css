@@ -1,0 +1,4646 @@
+/*
+ * omnexx chat panel. Tokens live in tokens.css (loaded first); this file
+ * holds component rules only — conversation, composer, popovers, HUD.
+ */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
+}
+
+/* Thin themed scrollbars (Chromium): transparent track, pill thumb. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--fg) 22%, transparent);
+  border: 2px solid transparent;
+  border-radius: var(--radius-full);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--fg) 34%, transparent);
+  border: 2px solid transparent;
+  border-radius: var(--radius-full);
+  background-clip: padding-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  color: var(--fg);
+  background: var(--surface);
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+/* Micro-press feedback on every button (theme buttons keep their own
+   background transitions; the transform transition above still applies). */
+
+.btn-icon,
+.btn-ghost,
+.btn-secondary {
+  border-radius: var(--radius-sm);
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
+}
+
+.btn-icon:hover,
+.btn-ghost:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(255, 255, 255, 0.08));
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+/* Header & Top Bar */
+.top {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: 6px var(--pad-x);
+  gap: var(--space-3);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  flex: none;
+}
+
+.top .logo {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.chip {
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: var(--radius-full);
+  padding: 1px var(--space-4);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip:hover {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, var(--card));
+}
+
+.top .chip.model {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+}
+
+.chip.model::after {
+  content: ' ▾';
+  color: var(--muted);
+}
+
+.chip.cost {
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+}
+
+.chip.danger {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+}
+
+.icon {
+  border: 0;
+  background: none;
+  padding: 3px;
+  border-radius: var(--radius-md);
+  color: var(--muted);
+}
+
+.icon:hover:not(:disabled) {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--accent) 12%, var(--vscode-toolbar-hoverBackground));
+}
+
+.icon.small {
+  padding: var(--space-1);
+  margin-left: auto;
+}
+
+.icon.copied {
+  color: var(--ok);
+}
+
+.k {
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+  color: var(--muted);
+}
+
+.v {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.track {
+  flex: 1;
+  height: 4px;
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--muted) 22%, transparent);
+  overflow: hidden;
+}
+
+.fill {
+  height: 100%;
+  width: 0;
+  border-radius: var(--radius-xs);
+  background: var(--accent);
+  transition: width var(--dur-slow) var(--ease);
+}
+
+.fill.hot {
+  background: var(--warn);
+}
+
+/* Usage Popover */
+.mission .track {
+  display: block;
+  height: 3px;
+  border-radius: var(--radius-xs);
+  background: var(--line);
+  overflow: hidden;
+}
+
+.mission .fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width var(--dur-slow) var(--ease);
+}
+
+.pop {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 8px;
+  z-index: var(--z-pop);
+  min-width: 190px;
+  padding: 6px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--vscode-editorWidget-border, var(--line));
+  background: var(--vscode-editorWidget-background, var(--surface));
+  box-shadow: 0 6px 20px rgb(0 0 0 / 32%);
+}
+
+.pop.usage {
+  top: auto;
+  bottom: calc(100% - 4px);
+}
+
+.pop.usage .row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-5);
+  padding: 3px 4px;
+}
+
+.pop.usage .ctx-parts {
+  padding: 4px 4px 0;
+  border-top: 1px solid var(--line);
+  margin-top: var(--space-2);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-family: var(--mono);
+}
+
+.pop.menu button {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  width: 100%;
+  border: 0;
+  background: none;
+  padding: 5px 8px;
+  border-radius: 5px;
+  text-align: left;
+}
+
+.pop.menu button:hover {
+  background: var(--vscode-list-hoverBackground, var(--card));
+}
+
+/* ==========================================================================
+   .t-div {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line);
+}
+
+Execution Posture pill, cockpit telemetry, swarm crew cards
+   ========================================================================== */
+
+/* The posture + work-mode pills sit together in a single compact segmented strip in the
+   chat header; the same markup renders in Settings cards. Descriptions live in tooltips,
+   so the strip stays one short row instead of tall multi-line text. */
+.posture {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  padding: 8px var(--pad-x);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+/* Merge both slots into the one flex row so the two groups form a single strip. */
+.posture [data-posture-slot],
+.posture [data-domain-slot] {
+  display: contents;
+}
+
+.posture-pill {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  gap: 3px;
+  padding: 3px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface) 74%, transparent);
+}
+
+.posture-pill button {
+  flex: 1 1 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border: 0;
+  border-radius: var(--radius-full);
+  padding: 4px 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  white-space: nowrap;
+  transition:
+    color var(--dur-fast) var(--ease),
+    background var(--dur-base) var(--ease),
+    box-shadow var(--dur-base) var(--ease);
+}
+
+.posture-pill button:hover {
+  color: var(--fg);
+}
+
+/* Selected segment: a subtle glass card background with a hairline ring and a sleek
+   accent glow — shared by the posture and work-mode groups. */
+.posture-pill button[aria-pressed='true'] {
+  background: var(--card);
+  color: var(--fg);
+  box-shadow:
+    inset 0 0 0 1px var(--line),
+    0 1px 8px color-mix(in srgb, var(--accent) 32%, transparent);
+  text-shadow: none;
+}
+
+body.vscode-high-contrast .posture-pill button[aria-pressed='true'],
+body.vscode-high-contrast-light .posture-pill button[aria-pressed='true'] {
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: inset 0 0 0 2px var(--vscode-focusBorder);
+}
+
+/* High contrast: the faint 7–10% borders that read as subtle depth in dark
+   mode are invisible against an HC background — force them to the contrast
+   border (--line resolves to --vscode-contrastBorder here). The live-state
+   accent borders are untouched: --accent is the focus color in HC, so they
+   already read. */
+body.vscode-high-contrast .msg.assistant,
+body.vscode-high-contrast .msg.user,
+body.vscode-high-contrast .tool,
+body.vscode-high-contrast pre,
+body.vscode-high-contrast .tools-fold > summary.tools-summary,
+body.vscode-high-contrast .tools-count-pill,
+body.vscode-high-contrast-light .msg.assistant,
+body.vscode-high-contrast-light .msg.user,
+body.vscode-high-contrast-light .tool,
+body.vscode-high-contrast-light pre,
+body.vscode-high-contrast-light .tools-fold > summary.tools-summary,
+body.vscode-high-contrast-light .tools-count-pill {
+  border-color: var(--line);
+}
+
+.posture-ico {
+  font-size: 0.95em;
+  line-height: 1;
+}
+
+/* Work Domain selector: the posture pill's neutral sibling. In the header it joins the
+   posture strip above; in Settings cards it keeps a little breathing room. */
+[data-domain-slot] {
+  display: block;
+  margin-top: 10px;
+}
+
+/* Cockpit telemetry strip (real session usage), over the crew cards. */
+.telemetry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 0 0 var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  box-shadow: none;
+}
+
+.t-cell {
+  display: grid;
+  gap: 0;
+}
+
+.t-label {
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.t-value {
+  font-family: var(--mono);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.b-visual-bar {
+  display: block;
+  height: 6px;
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--muted) 22%, transparent);
+  overflow: hidden;
+}
+.b-visual-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: var(--radius-xs);
+  background: var(--accent);
+}
+
+/* Swarm crew: the head agent chip and one card per helper. The list is a
+   scrollable region — max-height with overflow-y: auto, and nothing overriding it. */
+.section.crew {
+  flex: none;
+  max-height: 44%;
+  overflow-y: auto;
+  margin: 10px var(--pad-x) 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  box-shadow: none;
+}
+
+.section.crew > summary,
+.section.browser > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 7px var(--space-5);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.section.crew > summary .h,
+.section.browser > summary .h {
+  font-weight: 600;
+}
+
+.section.crew > summary .sub-h,
+.section.browser > summary .sub-h {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.section.crew > summary .count {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.crew-body {
+  padding: 0 10px 10px;
+}
+
+.head-agent {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 3px 10px 3px var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-full);
+  background: var(--card);
+  font-weight: 600;
+  font-size: var(--fs-sm);
+}
+
+.head-agent img {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+}
+
+.helpers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.helper {
+  position: relative;
+  margin-top: var(--space-4);
+  --role: var(--accent);
+}
+
+.helper.accent-amber {
+  --role: var(--warn);
+}
+
+.helper.accent-violet {
+  --role: var(--violet);
+}
+
+.helper.accent-green {
+  --role: var(--ok);
+}
+
+.helper.accent-blue {
+  --role: var(--accent);
+}
+
+/* The wire from the head agent down to each helper card. */
+.helper .wire {
+  position: absolute;
+  left: 17px;
+  top: -8px;
+  width: 2px;
+  height: 8px;
+  background: color-mix(in srgb, var(--role) 55%, transparent);
+}
+
+.h-card {
+  border: 1px solid color-mix(in srgb, var(--role) 32%, var(--line));
+  border-left: 3px solid var(--role);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  box-shadow:
+    none,
+    0 0 18px -6px color-mix(in srgb, var(--role) 45%, transparent);
+  padding: 9px 12px;
+  display: grid;
+  gap: var(--space-2);
+}
+
+.helper.stopped .h-card {
+  opacity: 0.72;
+}
+
+.h-top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  color: hsl(var(--h, 210) 85% 72%);
+  background: hsl(var(--h, 210) 70% 45% / 22%);
+  box-shadow: inset 0 0 0 1px hsl(var(--h, 210) 70% 55% / 45%);
+}
+
+.head-agent-pill {
+  border-radius: var(--radius-full);
+  padding: 3px 12px;
+}
+.helper .wire.wire-working {
+  background: var(--accent);
+}
+.helper .wire.wire-done {
+  background: var(--ok);
+}
+.helper .wire.wire-stopped {
+  background: var(--muted);
+}
+
+/* Model picker: a searchable popover whose provider headers stay in view and fold. */
+.model-picker {
+  position: fixed;
+  left: 10px;
+  right: 10px;
+  z-index: var(--z-picker);
+  max-height: min(60vh, 460px);
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  /* Slightly translucent over a blur so the popover reads as floating glass
+     above the conversation, not another flat card. */
+  background: color-mix(
+    in srgb,
+    var(--vscode-editorWidget-background, var(--surface)) 94%,
+    transparent
+  );
+  backdrop-filter: blur(8px);
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+}
+
+.mp-search {
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--line);
+}
+
+.mp-search input {
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--vscode-input-border, var(--line));
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  font: inherit;
+}
+
+.mp-search input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+
+.mp-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 4px 4px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
+}
+
+.mp-group {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  margin: 0;
+}
+
+.mp-group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  width: 100%;
+  padding: 7px 8px 6px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--vscode-editorWidget-background, var(--surface));
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-align: left;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.mp-group-head:hover {
+  background: color-mix(
+    in srgb,
+    var(--violet) 8%,
+    color-mix(in srgb, var(--accent) 12%, transparent)
+  );
+}
+
+.mp-group-head .badge {
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+  font-size: 0.85em;
+}
+
+.mp-group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-count {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.92em;
+  letter-spacing: 0;
+}
+
+.mp-chev {
+  flex: none;
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.mp-group-head[aria-expanded='false'] .mp-chev {
+  transform: rotate(-90deg);
+}
+
+.mp-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: 6px 10px 6px 30px;
+  border-left: 2px solid transparent;
+  border-radius: var(--radius-md);
+  font-family: var(--mono);
+  font-size: 0.9em;
+  cursor: pointer;
+}
+
+.mp-item:hover {
+  background: color-mix(
+    in srgb,
+    var(--violet) 6%,
+    color-mix(in srgb, var(--accent) 10%, transparent)
+  );
+}
+
+.mp-item.active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.mp-item.current {
+  border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.mp-item.current .mp-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.mp-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-meta {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.82em;
+  opacity: 0.8;
+}
+
+.mp-tag {
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-full);
+  white-space: nowrap;
+}
+
+.mp-tag-free {
+  border-color: color-mix(in srgb, var(--vscode-charts-green, var(--ok)) 45%, transparent);
+  color: var(--vscode-charts-green, var(--ok));
+}
+
+.mp-check {
+  flex: none;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.mp-empty {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: 14px 12px;
+  color: var(--muted);
+}
+
+.mp-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: 6px 8px;
+  border-top: 1px solid var(--line);
+  font-size: var(--fs-xs);
+}
+
+.mp-foot .ghost {
+  margin-left: auto;
+}
+
+.mp-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  color: var(--vscode-editorWarning-foreground);
+  font-size: var(--fs-xs);
+}
+
+.mp-note-label {
+  font-weight: 600;
+}
+
+.mp-warn-pill {
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--vscode-editorWarning-foreground) 35%, transparent);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 14%, transparent);
+  color: var(--vscode-editorWarning-foreground);
+  font-family: var(--mono);
+}
+
+.mp-custom-entry {
+  border-top: 1px dashed var(--line);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  font-weight: 500;
+}
+
+.mp-custom-entry strong {
+  color: var(--accent);
+}
+
+/* Model picker loading + tag states (folded from the old polish appendix). */
+.mp-skeleton {
+  height: 28px;
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+  animation: ls-shimmer 1.6s ease-in-out infinite alternate;
+}
+
+.mp-search-icon {
+  flex: none;
+  color: var(--muted);
+}
+
+.mp-clear {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: var(--fs-sm);
+}
+
+.mp-hints {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  padding: var(--space-2) var(--space-3);
+}
+
+.mp-tag-vision {
+  border-color: color-mix(in srgb, var(--violet) 45%, transparent);
+  color: var(--violet);
+}
+
+.mp-tag-reasoning {
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  color: var(--warn);
+}
+
+/* The chat model field in Settings: a badge, the model name, and where it runs. */
+.field.picker {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--vscode-input-border, var(--line));
+  border-radius: var(--radius-md);
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  text-align: left;
+  cursor: pointer;
+}
+
+.field.picker:hover {
+  border-color: var(--accent);
+}
+
+.pk-name {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--mono);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pk-sub {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.caret {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.h-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.h-role {
+  flex: none;
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  color: var(--role);
+}
+
+.h-top .spinner,
+.h-top .h-ok,
+.h-top .h-warn {
+  margin-left: auto;
+  flex: none;
+}
+
+.h-ok {
+  color: var(--ok);
+  font-weight: 700;
+}
+
+.h-warn {
+  color: var(--warn);
+  font-weight: 700;
+}
+
+.h-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  color: var(--role);
+}
+
+.h-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--role);
+}
+
+.helper.working .h-dot {
+  animation: mcp-pulse 1.6s var(--ease-soft) infinite;
+}
+
+.helper.done .h-status {
+  color: var(--ok);
+}
+
+.helper.done .h-dot {
+  background: var(--ok);
+}
+
+.helper.stopped .h-status {
+  color: var(--warn);
+}
+
+.helper.stopped .h-dot {
+  background: var(--warn);
+  box-shadow: none;
+}
+
+.h-task {
+  font-size: var(--fs-sm);
+  color: var(--fg);
+  opacity: 0.9;
+  overflow-wrap: anywhere;
+}
+
+.h-foot {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.h-live {
+  color: var(--role);
+}
+
+/* Mission & Step Timeline */
+.mission {
+  flex: none;
+  border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, var(--line));
+  max-height: 32%;
+  overflow-y: auto;
+  background: var(--card);
+}
+
+.mission > summary {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 2px 6px;
+  padding: 7px var(--pad-x) var(--space-3);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.mission > summary::-webkit-details-marker,
+.section > summary::-webkit-details-marker {
+  display: none;
+}
+
+.mission > summary:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.mission .now {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.mission .count {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.mission > summary .track {
+  grid-column: 1 / -1;
+}
+
+.chev {
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid var(--muted);
+  border-bottom: 1.5px solid var(--muted);
+  transform: rotate(-45deg) translateY(-2px);
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.section[open] > summary .chev,
+.mission[open] > summary .chev {
+  transform: rotate(45deg) translateY(-2px);
+}
+
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0 var(--space-4) var(--space-3) 28px;
+  position: relative;
+}
+
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 14px;
+  top: 8px;
+  bottom: 12px;
+  width: 2px;
+  background: var(--line);
+}
+
+.step {
+  position: relative;
+  margin-top: 3px;
+}
+
+.node {
+  position: absolute;
+  left: -19px;
+  top: 6px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  background: var(--surface);
+}
+
+.step.done .node {
+  border-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 30%, var(--surface));
+}
+
+.step.active .node {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow:
+    0 0 0 3px var(--accent-soft),
+    0 0 8px var(--accent);
+}
+
+.step.waiting .node {
+  border-color: var(--warn);
+}
+
+.step .card {
+  padding: 2px var(--space-3);
+  border-radius: var(--radius-md);
+}
+
+.step.active .card {
+  background: var(--card);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  padding-block: 4px;
+}
+
+.title {
+  display: flex;
+  gap: 5px;
+  align-items: flex-start;
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+}
+
+.title .icon {
+  padding: 0;
+  margin-top: 2px;
+  flex: none;
+}
+
+.title .label {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  flex: none;
+}
+
+.step.done .title .icon {
+  color: var(--ok);
+}
+
+.step.active .title .icon,
+.step.active .label {
+  color: var(--accent);
+}
+
+.step.waiting .title .icon {
+  color: var(--warn);
+}
+
+.step.queued .card {
+  opacity: 0.55;
+}
+
+.step.queued .title {
+  font-weight: normal;
+}
+
+.sub {
+  margin-top: 0;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: 3px;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--accent);
+}
+
+.doing {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  font-size: var(--fs-xs);
+}
+
+.doing li {
+  overflow-wrap: anywhere;
+}
+
+.doing li::before {
+  content: '▸  ';
+  color: var(--muted);
+}
+
+/* Spinner */
+.spinner {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  flex: none;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--accent) 25%, transparent);
+  border-top-color: var(--accent);
+  animation: spin 0.75s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Rolling memory note: what the agent remembers, collapsible above the chat. */
+.memory-note {
+  border-bottom: 1px solid var(--vscode-sideBar-border, transparent);
+  padding: 0 var(--pad-x);
+}
+.memory-note > summary {
+  padding: 7px 0;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  font-weight: 600;
+}
+.memory-note > summary::-webkit-details-marker {
+  display: none;
+}
+.memory-note > summary:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+.memory-note-hint {
+  font-weight: 400;
+  opacity: 0.7;
+  margin-left: 6px;
+}
+.memory-note pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  margin: 0 0 10px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+/* Conversation & Keyed Reconciler Slots */
+.conversation {
+  flex: 1;
+  min-height: 120px;
+  overflow-y: auto;
+  padding: var(--space-5) var(--pad-x) var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.blocks-root,
+.live-root {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.block-slot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.history-overflow {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.msg {
+  overflow-wrap: anywhere;
+  animation: msg-in var(--dur-slow) var(--ease) both;
+}
+
+@keyframes msg-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+}
+
+.msg.user {
+  position: relative;
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--card) 72%, transparent);
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 1px 0 rgb(0 0 0 / 4%);
+  padding: 10px 14px;
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
+}
+
+.msg.user:hover {
+  border-color: color-mix(in srgb, var(--line) 110%, transparent);
+  background: color-mix(in srgb, var(--card) 82%, transparent);
+}
+
+.msg.user .who {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  font-weight: 600;
+  margin-bottom: var(--space-2);
+}
+
+.msg.user .who .msg-time {
+  margin-left: auto;
+}
+
+/* Reuse action: a labeled pill ("Edit / Resend") that fades in next to the
+   sender name on hover / focus, with the timestamp anchored to the right edge. */
+.reuse-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px 9px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--vscode-font-family);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  opacity: 0;
+  transform: translateY(1px);
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    transform var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+.reuse-btn svg {
+  flex: none;
+}
+
+.reuse-label {
+  white-space: nowrap;
+}
+
+.msg.user:hover .reuse-btn,
+.msg.user .reuse-btn:focus-visible,
+.msg.user .reuse-btn:focus-within {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.reuse-btn:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+/* Hover Edit / Resend: a small pill button with icon + label, not a bare glyph. */
+.msg.user .reuse-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: var(--space-2);
+  padding: 2px var(--space-3);
+  border-radius: var(--radius-full);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.msg.user .reuse-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.msg.user .reuse-btn .reuse-label {
+  white-space: nowrap;
+}
+
+.msg.user .text {
+  white-space: pre-wrap;
+  line-height: 1.55;
+}
+
+.msg.assistant {
+  position: relative;
+  line-height: 1.6;
+  /* A sleek card, not a bare column: a soft border and radius over a faint
+     tint, keeping the accent guide on the left edge. */
+  margin: 2px 0;
+  padding: 8px 10px 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--fg) 7%, transparent);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--fg) 2.5%, transparent);
+
+  line-height: 1.66;
+  padding: 4px 2px 4px 12px;
+  /* Minimal custom design: soft vertical guide on assistant replies */
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.msg.assistant > :first-child {
+  margin-top: 0;
+}
+
+.msg.assistant p,
+.msg.assistant ul,
+.msg.assistant ol,
+.msg.assistant pre,
+.msg.assistant blockquote,
+.msg.assistant table {
+  margin: var(--space-3) 0;
+}
+
+.msg.assistant p {
+  letter-spacing: -0.005em;
+}
+
+.msg.assistant p:first-of-type {
+  margin-top: 0;
+}
+
+.msg.assistant ul,
+.msg.assistant ol {
+  padding-left: 20px;
+}
+
+.msg.assistant h3,
+.msg.assistant h4,
+.msg.assistant h5,
+.msg.assistant h6 {
+  margin: 10px 0 2px;
+  letter-spacing: -0.02em;
+}
+
+/* GFM tables inside assistant replies: a light-bordered grid with roomy cells,
+   a zebra tint, and horizontal scroll on narrow panes. The header row sits on
+   a solid surface so it reads as pinned ("sticky-feel") under thin lines. */
+.msg.assistant .table-wrap {
+  margin: var(--space-3) 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.msg.assistant table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+
+.msg.assistant th,
+.msg.assistant td {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.msg.assistant thead th {
+  background: var(--card);
+  color: var(--fg);
+  font-weight: 600;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 130%, transparent);
+}
+
+.msg.assistant tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--fg) 2.5%, transparent);
+}
+
+.msg.assistant tbody tr:hover {
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+
+.msg.assistant th code,
+.msg.assistant td code {
+  font-size: 0.92em;
+}
+
+.stream-cursor {
+  display: inline-block;
+  width: 6px;
+  height: 13px;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  background: var(--accent);
+  animation: cursor-blink 0.9s steps(2, start) infinite;
+}
+
+@keyframes cursor-blink {
+  to {
+    opacity: 0;
+  }
+}
+
+.msg-actions {
+  position: absolute;
+  top: -4px;
+  right: 0;
+  display: flex;
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  opacity: 0;
+  transition: opacity var(--dur-fast);
+}
+
+.msg.assistant:hover .msg-actions,
+.msg-actions:focus-within {
+  opacity: 1;
+}
+
+.msg.error {
+  color: var(--bad);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  white-space: pre-wrap;
+  border-left: 2px solid var(--bad);
+  background: color-mix(in srgb, var(--bad) 8%, transparent);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  padding: var(--space-2) var(--space-4);
+}
+
+.msg.note {
+  font-size: var(--fs-xs);
+  line-height: 1.35;
+  color: var(--amber);
+  white-space: pre-wrap;
+}
+
+.msg-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  font-size: var(--fs-xs);
+}
+.msg-time {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+.msg-accent {
+  display: block;
+  height: 2px;
+  border-radius: var(--radius-xs);
+  margin: var(--space-2) 0;
+  opacity: 0.85;
+  /* Token gradient (was a hardcoded #7c5cff → #f5a623 inline style). */
+  background: linear-gradient(90deg, var(--accent), var(--violet));
+  border: 0;
+}
+.msg-brand {
+  display: block;
+  margin-bottom: var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  background: linear-gradient(100deg, var(--accent), var(--violet));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Code Blocks & Inline Diff Highlighting — code renders as a "stream" panel;
+   lines the markdown already marks .diff-add/.diff-del get the green/red tinting. */
+pre {
+  position: relative;
+  background: color-mix(in srgb, var(--vscode-foreground) 3.5%, var(--surface));
+  border: 1px solid var(--border);
+  padding: 0 var(--space-4) var(--space-3);
+  border-radius: var(--radius-md);
+  box-shadow: none;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
+}
+
+pre[data-streaming='true'] {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+pre code {
+  line-height: 1.55;
+}
+
+/* Top bar: language badge (left), streaming pulse dot, copy button (right). */
+.code-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 calc(-1 * var(--space-4)) var(--space-2);
+  padding: 4px var(--space-2) 4px var(--space-4);
+  border-bottom: 1px solid var(--border);
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  font-family: var(--vscode-font-family);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+/* Language badge: a small mono pill; text comes from data-lang (typescript, json, …). */
+.code-lang {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 9px;
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.code-lang:empty::before {
+  content: 'text';
+}
+
+/* Code copy: the button fades in over the bar on hover / focus. */
+.code-bar [data-copy-code] {
+  opacity: 0;
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+pre:hover .code-bar [data-copy-code],
+.code-bar [data-copy-code]:focus-visible {
+  opacity: 1;
+}
+
+/* Copied feedback: a spring pop in the success color while the check shows. */
+[data-copy-code].copied,
+[data-copy-block].copied {
+  color: var(--ok);
+  animation: copied-pop var(--dur-base) var(--ease-spring);
+}
+
+@keyframes copied-pop {
+  0% {
+    transform: scale(0.8);
+  }
+  55% {
+    transform: scale(1.16);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.code-stream-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: code-stream-pulse 1.6s var(--ease-soft) infinite;
+}
+
+@keyframes code-stream-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+    opacity: 1;
+  }
+  50% {
+    box-shadow: 0 0 0 5px transparent;
+    opacity: 0.55;
+  }
+}
+
+/* Copy button hover feedback: dim until the block is hovered, lit on hover. */
+.code-bar [data-copy-code] {
+  opacity: 0.55;
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+pre:hover .code-bar [data-copy-code],
+.code-bar [data-copy-code]:focus-visible {
+  opacity: 1;
+}
+
+.code-bar [data-copy-code]:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.code-bar [data-copy-code].copied {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+}
+
+.diff-line {
+  display: block;
+  padding: 0 var(--space-2);
+  margin: 0 calc(-1 * var(--space-2));
+  border-radius: var(--radius-xs);
+}
+
+.diff-add {
+  background: color-mix(in srgb, var(--emerald) 16%, transparent);
+  color: var(--emerald);
+}
+
+.diff-del {
+  background: color-mix(in srgb, var(--rose) 16%, transparent);
+  color: var(--rose);
+}
+
+.diff-hunk {
+  color: var(--violet);
+  opacity: 0.85;
+}
+
+.diff-meta {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* File diff card: a fenced diff/patch block as one collapsible card. The
+   header names the file and carries the +/− stat pills; the body keeps the
+   existing diff-line tinting, flush against the card (no double border). */
+.diff-card {
+  margin: var(--space-2) 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  overflow: hidden;
+}
+
+.diff-card > summary.diff-card-head {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-xs);
+  user-select: none;
+}
+
+.diff-card > summary.diff-card-head::-webkit-details-marker {
+  display: none;
+}
+
+.diff-card[open] > summary .chev {
+  transform: rotate(45deg) translateY(-2px);
+}
+
+.diff-card-file {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--fg);
+}
+
+.diff-card pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  /* No top border: the code-bar's bottom border is the only divider, so the
+     header + code-bar read as one unified toolbar above the diff lines. */
+}
+
+/* Inside a diff card the code-bar sits flush on the diff lines (no 4px gap)
+   and its label lines up with the diff text (pre padding + span padding). */
+.diff-card .code-bar {
+  margin-bottom: 0;
+  padding-left: calc(var(--space-4) + var(--space-2));
+}
+
+.diff-card > summary.diff-card-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.diff-card {
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease);
+}
+
+.diff-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+}
+
+.diff-card > summary.diff-card-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.diff-card {
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease);
+}
+
+.diff-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+
+:not(pre) > code {
+  background: var(--vscode-textCodeBlock-background, var(--card));
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+}
+
+code.path,
+.path {
+  color: var(--accent);
+  cursor: pointer;
+}
+
+code.path:hover,
+.path:hover {
+  text-decoration: underline;
+}
+
+a {
+  color: var(--vscode-textLink-foreground);
+}
+
+blockquote {
+  border-left: 3px solid var(--line);
+  padding-left: 8px;
+  color: var(--muted);
+}
+
+/* Markdown tables: thin borders, alternating subtle rows, comfortable padding.
+   Outer table scrolls horizontally; thead/tbody stay table-sized so the
+   rounded frame + cell borders survive on narrow panes. */
+table {
+  width: 100%;
+  max-width: 100%;
+  display: block;
+  overflow-x: auto;
+  margin: var(--space-3) 0;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+table thead,
+table tbody {
+  display: table;
+  width: 100%;
+}
+
+table th,
+table td {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+table th {
+  font-weight: 700;
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  white-space: nowrap;
+}
+
+table td {
+  color: var(--fg);
+}
+
+/* Alternating body rows: every even row gets the subtle card tint. */
+table tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--card) 40%, transparent);
+}
+
+table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+table tbody tr:hover td {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.code-line {
+  display: flex;
+  gap: var(--space-3);
+}
+.code-ln {
+  flex: none;
+  width: 2.5em;
+  text-align: right;
+  color: var(--muted);
+  font-family: var(--mono);
+  user-select: none;
+}
+
+/* Thinking Accordion (`}`) */
+*
+  Translucent
+  glass
+  card
+  with
+  a
+  hairline
+  border.
+  The
+  accordion
+  opens
+  while
+  *
+  reasoning
+  streams
+  and
+  collapses
+  by
+  default
+  once
+  thinking
+  completes,
+keeping
+  *
+  the
+  assistant's answer in focus — the summary pill stays visible either way.
+ */
+
+/* Glass card: hairline border, tinted translucent surface, soft shadow. */
+.msg.think {
+  position: relative;
+  margin: var(--space-4) 0;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--violet);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--violet) 6%, var(--surface));
+  box-shadow: var(--shadow-sm);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--fg);
+  transition:
+    border-color var(--dur-base) var(--ease),
+    background var(--dur-base) var(--ease),
+    box-shadow var(--dur-base) var(--ease);
+  /* Lets ::details-content interpolate height from 0 → auto (spring open). */
+  interpolate-size: allow-keyframes;
+}
+
+.msg.think.is-streaming {
+  border-color: color-mix(in srgb, var(--violet) 28%, var(--line));
+  background: color-mix(in srgb, var(--violet) 10%, var(--surface));
+  box-shadow:
+    var(--shadow-sm),
+    0 0 0 1px color-mix(in srgb, var(--violet) 14%, transparent);
+}
+
+/* Compact single-thought line: flat, always expanded, no toggle. */
+.msg.think.compact {
+  border: 0;
+  border-left: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+  margin: var(--space-2) 0;
+}
+.msg.think.compact .think-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 3px var(--space-4);
+  cursor: default;
+}
+.msg.think.compact .think-content {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* Summary row: icon · state · label · badge · chevron. */
+details.msg.think > summary.think-summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  user-select: none;
+}
+
+details.msg.think > summary.think-summary::-webkit-details-marker {
+  display: none;
+}
+
+.think-header {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.think-header svg {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  color: var(--violet);
+  opacity: 0.92;
+  transition:
+    color var(--dur-fast) var(--ease),
+    opacity var(--dur-fast) var(--ease);
+}
+
+/* Gentle ambient pulse while reasoning streams. */
+.think-live-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--violet);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--violet) 55%, transparent);
+  animation: think-dot-pulse 1.5s var(--ease-soft) infinite;
+}
+
+/* Quiet check badge once reasoning completes. */
+.think-complete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ok);
+}
+.think-complete svg {
+  width: 11px;
+  height: 11px;
+  stroke-width: 1.7;
+  opacity: 0.9;
+}
+
+@keyframes think-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--violet) 50%, transparent);
+  }
+  50% {
+    opacity: 0.8;
+    transform: scale(1.05);
+    box-shadow: 0 0 0 7px color-mix(in srgb, var(--violet) 30%, transparent);
+  }
+}
+
+.think-title {
+  color: color-mix(in srgb, var(--fg) 85%, var(--muted));
+  font-size: 0.96em;
+  letter-spacing: 0.02em;
+}
+
+.think-live-dot {
+  display: none;
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--violet);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--violet) 45%, transparent);
+}
+
+.msg.think.is-streaming .think-live-dot {
+  display: inline-block;
+  animation: think-dot-pulse 1.35s var(--ease-soft) infinite;
+}
+
+@keyframes think-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--violet) 40%, transparent);
+  }
+  50% {
+    opacity: 0.72;
+    transform: scale(0.92);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--violet) 0%, transparent);
+  }
+}
+
+.think-title {
+  color: color-mix(in srgb, var(--fg) 88%, var(--violet));
+  letter-spacing: 0.01em;
+}
+
+.think-token-chip,
+.think-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--mono);
+  font-size: calc(var(--fs-xs) * 0.95);
+  font-weight: 500;
+  line-height: 1.4;
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  border: 1px solid color-mix(in srgb, var(--violet) 20%, transparent);
+  background: color-mix(in srgb, var(--violet) 8%, var(--surface));
+  color: color-mix(in srgb, var(--violet) 75%, var(--fg));
+  white-space: nowrap;
+}
+
+.think-summary-text {
+  flex: 1;
+  min-width: 0;
+  color: color-mix(in srgb, var(--muted) 75%, transparent);
+  font-size: 0.92em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+
+details.msg.think[open] .think-summary-text {
+  display: none;
+}
+
+/* Chevron: crisp rotation on open/close. */
+details.msg.think > summary.think-summary::after,
+details.msg.think > summary::after {
+  content: '';
+  flex: none;
+  width: 10px;
+  height: 10px;
+  margin-left: auto;
+  border-right: 2px solid color-mix(in srgb, var(--muted) 55%, transparent);
+  border-bottom: 2px solid color-mix(in srgb, var(--muted) 55%, transparent);
+  transform: rotate(45deg);
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+details.msg.think[open] > summary.think-summary::after,
+details.msg.think[open] > summary::after {
+  transform: rotate(-135deg);
+}
+
+/* Spring-accordion expansion: the thought body unfolds on open. */
+details.msg.think::details-content {
+  overflow: hidden;
+  animation: think-unfold var(--dur-base) var(--ease-spring);
+}
+
+@keyframes think-unfold {
+  from {
+    height: 0;
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    height: auto;
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Thought body: dimmed mono transcript with a minimal scrollbar. */
+.think-content {
+  margin-top: var(--space-3);
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  border-top: 1px solid color-mix(in srgb, var(--violet) 15%, var(--line));
+  font-family: var(--mono);
+  font-style: normal;
+  font-size: 0.94em;
+  line-height: 1.5;
+  color: var(--muted);
+  max-height: 260px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--fg) 18%, transparent) transparent;
+}
+
+.think-content::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.think-content::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.think-content::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--fg) 18%, transparent);
+  border-radius: 3px;
+}
+
+.think-content::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--fg) 30%, transparent);
+}
+
+.msg.think:hover {
+  border-color: color-mix(in srgb, var(--violet) 35%, var(--line));
+  border-left-color: var(--violet);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg.think,
+  .msg.think *,
+  .msg.think *::before,
+  .msg.think *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  details.msg.think::details-content {
+    animation: none;
+  }
+}
+
+
+/* Frontier Tool Execution Cluster & Minimal Custom Pills */
+.tools-cluster,
+.tool-cluster {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 3px 0;
+}
+
+.tools-fold {
+  margin: 2px 0;
+}
+
+.tools-fold > summary.tools-summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 6px 10px;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  user-select: none;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--card) 85%, transparent);
+  border: 1px solid color-mix(in srgb, var(--fg) 9%, transparent);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--fg) 3%, transparent);
+  transition:
+    background var(--dur-base) var(--ease),
+    border-color var(--dur-base) var(--ease),
+    color var(--dur-base) var(--ease),
+    box-shadow var(--dur-base) var(--ease);
+}
+
+.tools-fold > summary.tools-summary::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  opacity: 0.75;
+  transition: transform var(--dur-base) var(--ease), opacity var(--dur-base) var(--ease);
+}
+
+.tools-fold[open] > summary.tools-summary::before {
+  transform: rotate(45deg);
+}
+
+.tools-fold > summary.tools-summary:hover {
+  background: color-mix(in srgb, var(--card) 92%, var(--accent) 4%);
+  border-color: color-mix(in srgb, var(--accent) 22%, var(--line));
+  color: var(--fg);
+}
+
+.tools-fold > summary.tools-summary::-webkit-details-marker {
+  display: none;
+}
+
+.tools-summary-main {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--fg);
+  letter-spacing: 0.01em;
+}
+
+.tools-count-pill {
+  font-family: var(--mono);
+  padding: 1px 8px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--fg) 5%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  color: var(--fg);
+}
+
+.tools-expand-hint {
+  flex: none;
+  color: var(--accent);
+  font-size: calc(var(--fs-xs) * 0.96);
+  opacity: 0.9;
+}
+
+.msg.tools {
+  list-style: none;
+  margin: 0 0 0 2px;
+  padding: 2px 0 2px 10px;
+  border-left: 1.5px solid color-mix(in srgb, var(--accent) 24%, var(--line));
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tool,
+.act {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 4px 8px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--card) 85%, transparent);
+  border: 1px solid color-mix(in srgb, var(--fg) 7%, transparent);
+  min-width: 0;
+  transition:
+    background var(--dur-base) var(--ease),
+    border-color var(--dur-base) var(--ease),
+    box-shadow var(--dur-base) var(--ease);
+}
+
+.tool:hover {
+  background: color-mix(in srgb, var(--card) 95%, var(--accent) 3%);
+  border-color: color-mix(in srgb, var(--accent) 20%, var(--line));
+}
+
+.tool.is-live {
+  background: color-mix(in srgb, var(--accent) 8%, var(--card));
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--fg);
+}
+
+/* File action clusters: adjacent reads/edits as a tactile wrapped strip */
+.file-cluster-row {
+  align-items: flex-start;
+  padding: 5px 8px;
+}
+.file-cluster-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  flex: 1;
+}
+.file-cluster-chip {
+  display: inline-flex;
+  max-width: 100%;
+}
+.file-cluster-chip.is-live .action-pill {
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.action-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 8px 3px 6px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface) 70%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--fg);
+  transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+}
+.action-pill:hover {
+  border-color: color-mix(in srgb, var(--accent) 22%, var(--line));
+  background: color-mix(in srgb, var(--card) 92%, transparent);
+}
+.action-verb {
+  flex: none;
+  font-size: calc(var(--fs-xs) * 0.92);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.action-pill.k-edit .action-verb { color: color-mix(in srgb, var(--violet) 85%, var(--muted)); }
+.action-pill.k-read .action-verb { color: color-mix(in srgb, var(--teal) 85%, var(--muted)); }
+.action-pill.k-diff .action-verb { color: color-mix(in srgb, var(--amber) 85%, var(--muted)); }
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 1px 6px 1px 2px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+}
+.file-chip:hover {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.file-chip-ico {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.file-chip-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-chip-dir {
+  color: var(--muted);
+  opacity: 0.85;
+}
+.file-chip-base {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.tool-ico {
+  flex: none;
+  display: inline-flex;
+  color: var(--muted);
+}
+
+/* Tool verbs: distinct semantic chip colors. */
+.tool-badge,
+.act .tool-badge {
+  flex: none;
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  color: var(--fg);
+}
+
+.tool-badge.k-read {
+  color: var(--omnexx-accent-cyan, #06b6d4);
+  background: color-mix(in srgb, var(--omnexx-accent-cyan, #06b6d4) 16%, transparent);
+}
+.tool-badge.k-edit {
+  color: var(--violet);
+  background: color-mix(in srgb, var(--violet) 16%, transparent);
+}
+.tool-badge.k-run {
+  color: var(--emerald);
+  background: color-mix(in srgb, var(--emerald) 16%, transparent);
+}
+.tool-badge.k-test {
+  color: var(--emerald);
+  background: color-mix(in srgb, var(--emerald) 18%, transparent);
+}
+.tool-badge.k-diff {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 16%, transparent);
+}
+.tool-badge.k-search {
+  color: var(--teal);
+  background: color-mix(in srgb, var(--teal) 16%, transparent);
+}
+
+.tool .tool-ico {
+  background: none !important;
+}
+
+.tool-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-cmd {
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--fg) 8%, var(--card));
+  border: 1px solid var(--line);
+  color: var(--fg);
+}
+
+.diff-stat-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 2px;
+}
+
+.diff-stat {
+  font-family: var(--mono);
+  font-size: calc(var(--fs-xs) * 0.96);
+  font-weight: 700;
+  line-height: 1.4;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  border: 1px solid transparent;
+  letter-spacing: 0.01em;
+}
+
+.diff-stat.add {
+  color: color-mix(in srgb, var(--emerald) 92%, var(--fg));
+  background: color-mix(in srgb, var(--emerald) 14%, transparent);
+  border-color: color-mix(in srgb, var(--emerald) 22%, transparent);
+}
+
+.diff-stat.del {
+  color: color-mix(in srgb, var(--rose) 92%, var(--fg));
+  background: color-mix(in srgb, var(--rose) 14%, transparent);
+  border-color: color-mix(in srgb, var(--rose) 22%, transparent);
+}
+
+.test-pill {
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  padding: 0 5px;
+  border-radius: var(--radius-sm);
+}
+
+.test-pill.pass {
+  color: var(--emerald);
+  background: color-mix(in srgb, var(--emerald) 18%, transparent);
+}
+
+.test-pill.fail {
+  color: var(--rose);
+  background: color-mix(in srgb, var(--rose) 18%, transparent);
+}
+
+.tool-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: mcp-pulse 1.6s var(--ease-soft) infinite;
+}
+
+.tool-run-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--muted);
+  margin: var(--space-3) 0 var(--space-2);
+}
+
+/* Tool execution card: active cluster as an elevated, tactile collapsible card. */
+.msg.tool-card {
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--card) 85%, transparent);
+  padding: 2px;
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--fg) 3%, transparent);
+  transition:
+    border-color var(--dur-base) var(--ease),
+    box-shadow var(--dur-base) var(--ease),
+    background var(--dur-base) var(--ease);
+}
+
+.msg.tool-card.is-active {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+  box-shadow:
+    0 1px 0 color-mix(in srgb, var(--fg) 3%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--accent) 8%, transparent),
+    0 8px 24px -18px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.tool-card-fold > summary.tool-card-head {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: 7px 10px;
+  font-size: var(--fs-xs);
+  user-select: none;
+  border-radius: calc(var(--radius-md) - 2px);
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.tool-card-fold > summary.tool-card-head:hover {
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+}
+
+.tool-card-fold > summary.tool-card-head::-webkit-details-marker {
+  display: none;
+}
+
+.tool-card-fold[open] > summary .chev {
+  transform: rotate(45deg) translateY(-2px);
+}
+
+.tool-card-head .tool-elapsed {
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  padding: 2px 7px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.tool-stdout-pill {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  border: 1px solid color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+.msg.tool-card .msg.tools {
+  margin: 0 8px 8px;
+  padding-top: 4px;
+  border-top: 1px solid color-mix(in srgb, var(--fg) 7%, transparent);
+  border-left-color: color-mix(in srgb, var(--accent) 18%, var(--line));
+}
+
+/* Terminal pill: tactile execution bubble with status, elapsed, and copyable output. */
+.term-pill {
+  list-style: none;
+  margin: 0;
+  font-family: var(--vscode-editor-font-family, var(--mono));
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  border-radius: var(--radius-md);
+  padding: 0;
+  background: color-mix(in srgb, var(--card) 85%, transparent);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--fg) 3%, transparent);
+  transition:
+    border-color var(--dur-base) var(--ease),
+    box-shadow var(--dur-base) var(--ease),
+    background var(--dur-base) var(--ease);
+}
+
+.term-pill:hover {
+  border-color: color-mix(in srgb, var(--accent) 18%, var(--line));
+}
+
+.term-pill-fold > summary.term-pill-head {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: 6px 10px;
+  font-size: var(--fs-xs);
+  user-select: none;
+  border-radius: var(--radius-md);
+}
+
+.term-pill-fold > summary.term-pill-head::-webkit-details-marker {
+  display: none;
+}
+
+.term-pill-fold[open] > summary .chev {
+  transform: rotate(45deg) translateY(-2px);
+}
+
+.term-pill-cmd {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--fg);
+}
+
+.term-pill-cmd code {
+  font-family: inherit;
+  color: inherit;
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+}
+
+.term-pill-prompt {
+  color: color-mix(in srgb, var(--emerald) 78%, var(--fg));
+  font-weight: 700;
+  margin-right: 2px;
+}
+
+.term-pill-status {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: calc(var(--fs-xs) * 0.96);
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  border: 1px solid transparent;
+  line-height: 1.35;
+}
+
+.pill-badge-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 0.95em;
+}
+
+.pill-exit,
+.pill-elapsed {
+  opacity: 0.92;
+  font-weight: 600;
+}
+
+.pill-spin {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, currentColor 28%, transparent);
+  border-top-color: currentColor;
+  animation: spin var(--dur-spin, 0.75s) linear infinite;
+}
+
+.term-pill-status.is-running {
+  color: color-mix(in srgb, var(--teal) 88%, var(--fg));
+  background: color-mix(in srgb, var(--teal) 12%, transparent);
+  border-color: color-mix(in srgb, var(--teal) 20%, transparent);
+}
+
+.term-pill:has(.term-pill-status.is-running) {
+  border-color: color-mix(in srgb, var(--teal) 28%, var(--line));
+  box-shadow:
+    0 1px 0 color-mix(in srgb, var(--fg) 3%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--teal) 8%, transparent);
+}
+
+.term-pill:has(.term-pill-status.is-running) .term-pill-head {
+  background: color-mix(in srgb, var(--teal) 5%, transparent);
+}
+
+.term-pill-status.is-success {
+  color: color-mix(in srgb, var(--emerald) 82%, var(--fg));
+  background: color-mix(in srgb, var(--emerald) 11%, transparent);
+  border-color: color-mix(in srgb, var(--emerald) 18%, transparent);
+}
+
+.term-pill-status.is-error {
+  color: color-mix(in srgb, var(--rose) 88%, var(--fg));
+  background: color-mix(in srgb, var(--rose) 11%, transparent);
+  border-color: color-mix(in srgb, var(--rose) 20%, transparent);
+}
+
+.term-pill-head .tool-elapsed {
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  padding: 2px 7px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  border: 1px solid color-mix(in srgb, var(--fg) 8%, transparent);
+}
+
+.term-pill-body {
+  margin: 0 8px 8px;
+  border: 1px solid color-mix(in srgb, var(--fg) 8%, transparent);
+  border-radius: calc(var(--radius-md) - 2px);
+  overflow: hidden;
+  background: color-mix(in srgb, #000 28%, var(--vscode-editor-background, var(--surface)));
+}
+
+.term-pill-body-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 2px 4px;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--fg) 7%, transparent);
+  min-height: 24px;
+}
+
+.term-copy-btn {
+  opacity: 0.72;
+  transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.term-copy-btn:hover {
+  opacity: 1;
+  color: var(--accent);
+}
+
+.term-pill-term {
+  height: 140px;
+  max-height: 40vh;
+  overflow: hidden;
+  background: color-mix(in srgb, #000 35%, var(--vscode-terminal-background, var(--vscode-editor-background, #111)));
+  padding: 6px 8px;
+}
+
+.term-pill-term .xterm {
+  height: 100%;
+}
+
+.term-pill-fallback {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 6px 8px;
+  height: 100%;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--vscode-editor-font-family, var(--mono));
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--vscode-terminal-foreground, var(--fg));
+  background: transparent;
+}
+
+/* Active Working Cockpit HUD */
+.working.cockpit-hud {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  padding: 5px 8px;
+  border-radius: var(--radius-md);
+  background: var(--card);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  min-width: 0;
+}
+
+.active-tool-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 1;
+  min-width: 0;
+  padding: 2px var(--space-4);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  box-shadow: none;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+}
+
+.active-tool-pill .pill-ico {
+  flex: none;
+  display: inline-flex;
+}
+
+.active-tool-pill .pill-tag {
+  flex: none;
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  opacity: 0.9;
+}
+
+.active-tool-pill .pill-body {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.working .eta {
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.tag {
+  flex: none;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius-full);
+  padding: 0 var(--space-3);
+}
+
+.working-copy {
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  /* The HUD is one line: the copy truncates instead of forcing the row (and
+     its pill) past the panel edge in split view. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.working.cockpit-hud.is-thinking .working-copy {
+  color: var(--violet);
+}
+.working.cockpit-hud.is-tool .working-copy {
+  color: var(--warn);
+}
+.working.cockpit-hud.is-paused .working-copy {
+  color: var(--muted);
+}
+.ls-skeleton {
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+  animation: ls-shimmer 1.6s var(--ease-soft, ease-in-out) infinite alternate;
+}
+@keyframes ls-shimmer {
+  from {
+    opacity: 0.45;
+  }
+  to {
+    opacity: 0.9;
+  }
+}
+
+/* Banner, Ask & Composer */
+/* Empty state: a quiet, centered hint when there are no runs yet. */
+.conversation .empty {
+  padding: 24px var(--pad-x);
+  color: var(--muted);
+  text-align: center;
+}
+
+.suggestions {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.suggestions button {
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: var(--radius-md);
+  padding: 7px 10px;
+  color: var(--accent);
+  text-align: left;
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
+}
+
+.suggestions button:hover {
+  background: var(--vscode-list-hoverBackground);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+}
+
+/* Suggestion cards: icon on top, title and hint stacked — the title keeps the
+   accent, the hint drops to muted so the two lines read as a pair. */
+.suggestion-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.suggestion-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
+.suggestion-title {
+  font-weight: 600;
+}
+
+.suggestion-hint {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+}
+
+.banner,
+.ask {
+  margin: 0 var(--pad-x) 8px;
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  flex: none;
+}
+
+.banner {
+  display: flex;
+  gap: var(--gap);
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.banner.error {
+  border: 1px solid var(--bad);
+  background: color-mix(in srgb, var(--bad) 10%, transparent);
+}
+
+.banner.info {
+  border: 1px solid var(--line);
+  background: var(--card);
+}
+
+.ask {
+  border: 1px solid var(--vscode-inputValidation-warningBorder, var(--warn));
+  background: var(--vscode-inputValidation-warningBackground, var(--card));
+}
+
+.ask-title {
+  color: var(--vscode-editorWarning-foreground, var(--warn));
+  font-size: var(--fs-xs);
+  font-weight: 600;
+}
+
+.ask p {
+  margin: var(--space-2) 0;
+}
+
+.ask-buttons {
+  display: flex;
+  align-items: center;
+  gap: var(--gap);
+  margin-top: var(--space-3);
+}
+
+.ask .primary {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border-radius: var(--radius-sm);
+  padding: 3px 12px;
+  border: 0;
+  font-weight: 600;
+}
+
+.ask .primary:hover {
+  background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+}
+
+.ask .secondary {
+  background: var(--vscode-button-secondaryBackground, transparent);
+  color: var(--vscode-button-secondaryForeground, var(--fg));
+  border-radius: var(--radius-sm);
+  padding: 3px 12px;
+  border: 1px solid transparent;
+}
+
+.ask-keys {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.empty-sub {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+.empty-hint {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+/* The `/run <goal>` pill must read against its code-block background: muted
+   text on near-black is unreadable, so the code chip takes the foreground. */
+.empty-hint code {
+  color: var(--fg);
+  border: 1px solid var(--line);
+}
+
+/* Composer: the input is one flat card — borderless textarea inside, a filled
+   round send button, and the focus ring on the card, not the textarea. */
+/* Floating bottom composer dock: an inset card on the panel surface — model
+   selector (#model in the statusline) and action pills unchanged inside it.
+   It stays pinned to the bottom as the body's
+  last
+  flex
+  child.
+  */
+  .composer {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin: 0 var(--pad-x) var(--space-4);
+  padding: var(--space-4) var(--space-5) var(--space-5);
+  background: var(--omnexx-bg-card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: var(--shadow-md);
+  flex: none;
+}
+
+.input-deck {
+  position: relative;
+  min-width: 0;
+  background: var(--vscode-input-background);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease);
+}
+
+/* `.input-wrap` is the historical name; `.input-deck` is the current deck. */
+.input-wrap:focus-within,
+.input-deck:focus-within {
+  border-color: var(--accent, var(--vscode-focusBorder));
+  /* Ambient glow: a crisp accent edge plus a short, soft halo. */
+  box-shadow:
+    0 0 0 1px var(--accent),
+    0 0 12px var(--accent-glow);
+}
+
+/* The deck itself lights up while the input has focus — a soft glow around
+   the whole composer, not just the textarea. */
+.composer:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  box-shadow:
+    var(--shadow-lg),
+    0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* Ghost keyboard hint, tucked into the deck's right side (left of Send). It
+   only shows while the composer is empty; typing fades it out (.has-text). */
+.key-hint {
+  position: absolute;
+  top: 50%;
+  right: 44px;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  pointer-events: none;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-family: var(--mono);
+  white-space: nowrap;
+  letter-spacing: 0.01em;
+  opacity: 0.9;
+  transition: opacity var(--dur-fast) var(--ease);
+  user-select: none;
+}
+
+.input-deck.has-text .key-hint {
+  opacity: 0;
+}
+
+textarea {
+  width: 100%;
+  resize: none;
+  min-height: 44px;
+  max-height: 180px;
+  padding: 11px 48px 11px 13px;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  color: var(--vscode-input-foreground);
+  font: inherit;
+  line-height: 1.45;
+  display: block;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+textarea::-webkit-scrollbar {
+  width: 6px;
+}
+
+textarea::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 3px;
+}
+
+textarea::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+textarea:focus {
+  outline: none;
+}
+
+textarea::placeholder {
+  color: var(--vscode-input-placeholderForeground);
+}
+
+.send {
+  position: absolute;
+  right: 7px;
+  bottom: 7px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--vscode-button-background, var(--accent));
+  color: var(--vscode-button-foreground, #fff);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 18%);
+  transition:
+    background var(--dur-base) var(--ease),
+    color var(--dur-base) var(--ease),
+    box-shadow var(--dur-base) var(--ease),
+    opacity var(--dur-fast) var(--ease),
+    transform var(--dur-fast) var(--ease);
+}
+
+.send:hover:not(:disabled) {
+  background: var(--vscode-button-hoverBackground, var(--vscode-button-background, var(--accent)));
+  /* Tactile lift: the button rises a hair and casts a colored shadow. */
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 38%, transparent);
+}
+
+.send:active:not(:disabled) {
+  transform: translateY(0) scale(0.94);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 22%);
+}
+
+.send:disabled {
+  background: var(--card);
+  color: var(--muted);
+  opacity: 0.65;
+  box-shadow: none;
+}
+
+/* Both glyphs share one grid cell; busy morphs Send into a red Stop square. */
+.send svg {
+  grid-area: 1 / 1;
+  width: 15px;
+  height: 15px;
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    transform var(--dur-base) var(--ease-spring);
+}
+
+.send .send-ico {
+  opacity: 1;
+  transform: scale(1) rotate(0deg);
+}
+
+.send .stop-ico {
+  opacity: 0;
+  transform: scale(0.45) rotate(-90deg);
+}
+
+.send.as-stop {
+  background: color-mix(in srgb, var(--bad) 92%, #000);
+  color: var(--vscode-button-foreground, #fff);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 22%);
+}
+
+.send.as-stop:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--bad) 94%, #fff);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--bad) 45%, transparent);
+}
+
+.send.as-stop .send-ico {
+  opacity: 0;
+  transform: scale(0.45) rotate(90deg);
+}
+
+.send.as-stop .stop-ico {
+  opacity: 1;
+  transform: scale(1) rotate(0deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .send,
+  .send svg {
+    transition: none;
+  }
+}
+
+.composer .row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.composer .grow {
+  flex: 1 1 auto;
+}
+
+.composer .chip {
+  border: 1px solid var(--line);
+  background: var(--card);
+  border-radius: var(--radius-full);
+  padding: 2px var(--space-4);
+  color: var(--muted);
+}
+
+.composer .chip:hover {
+  background: color-mix(in srgb, var(--accent) 12%, var(--vscode-toolbar-hoverBackground));
+  color: var(--fg);
+}
+
+.modes {
+  position: relative;
+  display: inline-flex;
+  gap: 0;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-full);
+  background: var(--card);
+  isolation: isolate;
+}
+
+/* The glider: one pill that slides between the three equal segments. */
+.modes::before {
+  content: '';
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc((100% - 4px) / 3);
+  border-radius: var(--radius-full);
+  background: var(--accent-soft);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent),
+    0 1px 4px rgb(0 0 0 / 14%);
+  transition:
+    transform var(--dur-base) var(--ease-spring),
+    background var(--dur-base) var(--ease);
+  z-index: 0;
+}
+
+.modes:has(button[data-mode='plan'][aria-pressed='true'])::before {
+  transform: translateX(100%);
+}
+
+.modes:has(button[data-mode='run'][aria-pressed='true'])::before {
+  transform: translateX(200%);
+}
+
+.modes button {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 0;
+  min-width: 4.5em;
+  border: 0;
+  background: none;
+  border-radius: var(--radius-full);
+  padding: 3px 9px;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  transition:
+    color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
+}
+
+.modes button:hover:not([aria-pressed='true']) {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--fg);
+}
+
+.modes button[aria-pressed='true'] {
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modes::before {
+    transition: none;
+  }
+}
+
+/* Status line: one quiet row — model · tokens · step — with the context meter at the
+   end. The model name is the picker button; everything else is plain muted text. */
+.statusline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  /* One rhythm for every status cell: the same --gap the composer uses. */
+  column-gap: var(--gap);
+  row-gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-1) 0 0;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.statusline .sep {
+  opacity: 0.6;
+}
+
+/* Inline status icons are clean 12px SVGs (same 16-grid as the tool icons),
+   never emoji: they inherit the item color, including the daemon's on-state. */
+.statusline .status-ico {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  display: inline-block;
+  opacity: 0.9;
+}
+
+.statusline .status-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  white-space: nowrap;
+}
+
+.status-model {
+  /* The model is the picker's anchor: it grows first and never collapses to
+     a couple of characters — the other items wrap instead of squeezing it. */
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 auto;
+  min-width: 110px;
+  max-width: 55%;
+  overflow: hidden;
+  white-space: nowrap;
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  text-align: left;
+}
+
+/* The model name keeps the ellipsis; the icon and caret never shrink. */
+.status-model #model-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-model:hover,
+.status-item.as-button:hover {
+  color: var(--accent);
+}
+
+.status-model::after {
+  content: '▾';
+  flex: none;
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.status-item.as-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  transition: color var(--dur-fast) var(--ease);
+}
+
+#status-daemon.on {
+  color: var(--omnexx-accent-cyan, #06b6d4);
+  font-weight: 600;
+}
+
+#status-daemon.on:hover {
+  color: var(--accent);
+}
+
+/* Token meter: a tiny context-window gauge inside the ctx button — a hairline
+   track with a proportional fill that shifts green → amber → red as the
+   window fills. The meter track is fixed-width so digits don't jiggle it. */
+.token-meter {
+  display: inline-flex;
+  align-items: center;
+}
+
+.token-meter-track {
+  position: relative;
+  flex: none;
+  width: 34px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--muted) 25%, transparent);
+}
+
+.token-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  border-radius: inherit;
+  background: var(--ok);
+  transition:
+    width var(--dur-base) var(--ease),
+    background var(--dur-base) var(--ease);
+}
+
+.token-meter[data-level='mid'] .token-meter-fill {
+  background: var(--warn);
+}
+
+.token-meter[data-level='high'] .token-meter-fill {
+  background: var(--bad);
+}
+
+.token-meter:hover .token-meter-fill {
+  filter: brightness(1.15);
+}
+
+.token-meter-val {
+  color: inherit;
+}
+
+/* Power: the control board. Dormant by default (body[data-power='off']):
+   the whole panel is desaturated and dimmed; only the logo power button
+   stays lit, pulsing gently until it is woken. Waking replays a ~600ms
+   color sweep. The kill switch posts the existing pause/resume over the
+   webview protocol (see webview/chat.ts); no new message type was needed. */
+
+/* The logo is the power button: first in the statusline, always visible. */
+.power {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: var(--radius-full);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.power img {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+/* Lit: a soft accent halo that breathes while the board is on. */
+body[data-power='on'] .power {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent),
+    0 0 8px var(--accent-glow);
+  animation: power-halo 3.2s var(--ease-soft) infinite;
+}
+
+@keyframes power-halo {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent) 38%, transparent),
+      0 0 6px color-mix(in srgb, var(--accent) 28%, transparent);
+  }
+
+  50% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent),
+      0 0 13px var(--accent-glow);
+  }
+}
+
+/* Dormant: the board is grey and dim. The button lives in the statusline,
+   so the filter targets everything except it. */
+body[data-power='off'] > :not(.composer),
+body[data-power='off'] .composer > :not(.statusline),
+body[data-power='off'] .statusline > :not(#power) {
+  filter: grayscale(1) brightness(0.72);
+  opacity: 0.8;
+  transition:
+    filter var(--dur-slow) var(--ease),
+    opacity var(--dur-slow) var(--ease);
+}
+
+body[data-power='off'] .power {
+  animation: power-beacon 2.4s var(--ease-soft) infinite;
+}
+
+@keyframes power-beacon {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent),
+      0 0 6px var(--accent-glow);
+  }
+
+  50% {
+    box-shadow:
+      0 0 0 5px transparent,
+      0 0 12px var(--accent-glow);
+  }
+}
+
+/* Wake: color sweeps back in with a brief bright flash, ~600ms. */
+body.waking > :not(.composer),
+body.waking .composer > :not(.statusline),
+body.waking .statusline > :not(#power) {
+  animation: power-on var(--dur-wake) var(--ease) both;
+}
+
+body.waking #power {
+  animation: power-glow var(--dur-wake) var(--ease) both;
+}
+
+@keyframes power-on {
+  from {
+    filter: grayscale(1) brightness(0.6);
+    opacity: 0.7;
+  }
+
+  60% {
+    filter: grayscale(0.15) brightness(1.06);
+    opacity: 1;
+  }
+
+  to {
+    filter: grayscale(0) brightness(1);
+    opacity: 1;
+  }
+}
+
+@keyframes power-glow {
+  from {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 70%, transparent);
+  }
+
+  to {
+    box-shadow: 0 0 0 8px transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body[data-power='off'] .power,
+  body[data-power='on'] .power {
+    animation: none;
+  }
+
+  body.waking > :not(.composer),
+  body.waking .composer > :not(.statusline),
+  body.waking .statusline > :not(#power),
+  body.waking #power {
+    animation-duration: 1ms;
+  }
+}
+
+.jump {
+  position: absolute;
+  right: 14px;
+  /* Above the floating composer dock (dock height + bottom margin). */
+  bottom: 156px;
+  z-index: var(--z-float);
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--vscode-widget-border, var(--line));
+  background: var(--vscode-editorWidget-background, var(--surface));
+  color: var(--fg);
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgb(0 0 0 / 35%));
+}
+
+/* Suggest Widget */
+.suggest {
+  position: absolute;
+  left: var(--pad-x);
+  right: var(--pad-x);
+  bottom: calc(100% - 4px);
+  z-index: var(--z-suggest);
+  max-height: 240px;
+  overflow-y: auto;
+  padding: var(--space-1);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--vscode-editorSuggestWidget-border, var(--line));
+  background: var(--vscode-editorSuggestWidget-background, var(--surface));
+  box-shadow: 0 4px 14px var(--vscode-widget-shadow, rgb(0 0 0 / 36%));
+}
+
+.sg-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-4);
+  padding: 3px var(--space-3);
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  color: var(--vscode-editorSuggestWidget-foreground, var(--fg));
+}
+
+.sg-item.on {
+  background: var(
+    --vscode-editorSuggestWidget-selectedBackground,
+    var(--vscode-list-activeSelectionBackground)
+  );
+  color: var(
+    --vscode-editorSuggestWidget-selectedForeground,
+    var(--vscode-list-activeSelectionForeground, var(--fg))
+  );
+}
+
+.sg-label {
+  flex: none;
+  font-family: var(--mono);
+}
+
+.sg-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+@keyframes mcp-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* Empty-state quick-start cards (emptyState.ts): icon, title, hint as a card.
+   These were commented out, so cards rendered as bare buttons; restored. */
+.empty-chat {
+  padding-top: var(--space-7);
+}
+
+.empty-title {
+  color: var(--fg);
+  font-size: var(--fs-lg);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0 0 var(--space-3);
+}
+
+.empty-chat .suggestions {
+  margin: var(--space-5) auto var(--space-4);
+  max-width: 380px;
+  text-align: left;
+}
+
+.suggestions .suggestion-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+  text-align: left;
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--card);
+  cursor: pointer;
+  color: var(--fg);
+  transition:
+    transform var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
+}
+.suggestions .suggestion-card:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--card));
+}
+.suggestion-icon {
+  color: var(--accent);
+  font-size: var(--fs-lg);
+  line-height: 1.2;
+}
+.suggestion-title {
+  font-weight: 600;
+  font-size: var(--fs-md);
+}
+.suggestion-hint {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.section.browser {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  margin: var(--space-4) var(--space-5);
+  background: var(--surface);
+  overflow: hidden;
+  transition: all var(--dur-base) var(--ease);
+}
+
+.section.browser.big {
+  margin: 8px 4px;
+}
+
+.b-status {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  margin-left: auto;
+  margin-right: 8px;
+}
+
+.bframe {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+}
+
+.bbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: 6px 10px;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-xs);
+}
+
+.b-nav-btns {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.b-ctrl-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  cursor: pointer;
+  padding: 2px var(--space-3);
+  font-size: var(--fs-md);
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition:
+    background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
+}
+
+.b-ctrl-btn:hover {
+  background: color-mix(in srgb, var(--accent) 12%, var(--card));
+  border-color: var(--line);
+}
+
+.b-address-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 1;
+  min-width: 0;
+  padding: 3px 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+}
+
+.b-lock-icon {
+  font-size: var(--fs-xs);
+  opacity: 0.7;
+}
+
+.burl {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+}
+
+.baction {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 2px var(--space-3);
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+}
+
+.b-canvas-wrapper {
+  position: relative;
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.b-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-shrink: 0;
+}
+
+.b-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
+}
+
+.b-tab:hover {
+  background: color-mix(in srgb, var(--accent) 12%, var(--card));
+  color: var(--fg);
+}
+
+.b-tab.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.b-count {
+  min-width: 14px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--line);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  line-height: 14px;
+  text-align: center;
+}
+
+.b-count.bad {
+  background: color-mix(in srgb, var(--bad) 20%, transparent);
+  color: var(--rose);
+}
+
+.b-count.ok {
+  background: color-mix(in srgb, var(--ok) 20%, transparent);
+  color: var(--ok);
+}
+
+.b-panels {
+  min-height: 80px;
+}
+
+.b-panel {
+  min-height: 0;
+}
+
+.b-list {
+  margin: 0;
+  padding: var(--space-4) 10px;
+  max-height: 280px;
+  overflow: auto;
+  list-style: none;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+.b-issue {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: var(--space-3);
+  align-items: baseline;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--line);
+  word-break: break-word;
+}
+
+.b-issue:last-child {
+  border-bottom: 0;
+}
+
+.b-issue code {
+  color: var(--fg);
+  font-family: var(--mono);
+  white-space: pre-wrap;
+}
+
+.b-issue.bad .b-tag {
+  color: var(--rose);
+  background: color-mix(in srgb, var(--bad) 14%, transparent);
+}
+
+.b-issue.warn .b-tag {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+}
+
+.b-tag {
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--card);
+  color: var(--muted);
+}
+
+.b-method {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.b-loc {
+  grid-column: 3;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.b-empty {
+  padding: 14px 10px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.b-visual {
+  padding: 10px var(--space-5);
+  border-bottom: 1px solid var(--line);
+}
+
+.b-visual-verdict {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+.b-visual-verdict.ok {
+  color: var(--ok);
+}
+
+.b-visual-verdict.bad {
+  color: var(--rose);
+}
+
+.b-visual-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-5);
+  margin-top: var(--space-2);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.b-visual-files code {
+  display: block;
+  margin-top: var(--space-2);
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.b-visual-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  background: var(--surface);
+}
+
+#b-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  cursor: zoom-in;
+  transition: max-width var(--dur-base) var(--ease);
+}
+
+.section.browser.big #b-img {
+  cursor: zoom-out;
+  width: 100%;
+}
+
+.b-dimmer {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-4);
+  color: var(--fg);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner,
+  .tool-pulse,
+  .code-stream-dot,
+  .stream-cursor,
+  .ls-skeleton,
+  .mp-skeleton,
+  .msg {
+    animation: none;
+  }
+
+  details.msg.think[open] .think-content,
+  .term-pill-status.is-running::before {
+    animation: none;
+  }
+
+  .fill,
+  .chev {
+    transition: none;
+  }
+}
+
+/* Observe-only Kernel disclosure: one quiet line (phase pills) with the detail
+   collapsed behind it. No card chrome — the panel is telemetry, not content. */
+.kernel-observe {
+  margin: var(--space-4) 0;
+}
+
+.ko {
+  font-size: var(--fs-sm);
+}
+
+.ko-summary {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  cursor: pointer;
+  list-style: none;
+}
+
+.ko-summary::-webkit-details-marker {
+  display: none;
+}
+
+.ko[open] > summary .chev {
+  transform: rotate(45deg) translateY(-2px);
+}
+
+.ko-title {
+  font-weight: 600;
+}
+
+.ko-meta,
+.ko-dim {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+}
+
+.ko-phases {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.ko-phase {
+  padding: var(--space-1) var(--space-4);
+  border-radius: var(--radius-full);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+  transition:
+    background var(--dur-base) var(--ease),
+    color var(--dur-base) var(--ease);
+}
+
+.ko-phase.on {
+  color: var(--fg);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.ko-caps {
+  list-style: none;
+  margin: var(--space-3) 0 0 0;
+  padding: 0 0 0 var(--space-5);
+  display: grid;
+  gap: var(--space-1);
+}
+
+.ko-caps li {
+  display: flex;
+  gap: var(--space-3);
+  align-items: baseline;
+  min-width: 0;
+}
+
+.ko-kind {
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.ko-cap {
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+
+.ko-empty {
+  color: var(--muted);
+}
+
+.ko-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin: var(--space-2) 0 0 0;
+  padding-left: var(--space-5);
+}
+
+.ko-label {
+  color: var(--muted);
+}
+
+.ko-value {
+  font-family: var(--mono);
+  text-align: right;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ko-phase {
+    transition: none;
+  }
+}
+
+/* Live terminal drawer (Phase 9): xterm.js canvas in a docked drawer under the
+   conversation, or a fixed right-hand pane in split-view. All surfaces use the
+   --omnexx-* tokens. */
+.terminal-drawer {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  height: 260px;
+  min-height: 0;
+  margin: 0 var(--pad-x) var(--space-3);
+  background: var(--omnexx-bg-primary);
+  border: 1px solid var(--omnexx-border-subtle);
+  border-radius: var(--omnexx-radius);
+  overflow: hidden;
+}
+
+.terminal-drawer.collapsed {
+  height: 34px;
+}
+
+.terminal-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 34px;
+  padding: 0 var(--space-3);
+  background: var(--omnexx-bg-card);
+  border-bottom: 1px solid var(--omnexx-border-subtle);
+  font-size: var(--fs-xs);
+  color: var(--omnexx-text-muted);
+  user-select: none;
+}
+
+.terminal-head .t-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+
+.terminal-head .t-status {
+  flex: none;
+  font-family: var(--mono);
+}
+
+.terminal-head button {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--omnexx-text-muted);
+  font-size: var(--fs-sm);
+  line-height: 1;
+}
+
+.terminal-head button:hover {
+  background: color-mix(in srgb, var(--omnexx-accent) 12%, transparent);
+  color: var(--fg);
+}
+
+.terminal-body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.terminal-screen {
+  position: absolute;
+  inset: 0;
+  padding: var(--space-2) var(--space-3);
+}
+
+.terminal-screen .xterm {
+  height: 100%;
+}
+
+/* Fallback renderer when xterm.js failed to load: a plain <pre> with a small
+   ANSI color parser (terminal.js) and a one-line input for typing. */
+.terminal-fallback-wrap {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.terminal-fallback {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  overflow-y: auto;
+  background: transparent;
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.terminal-fallback-input {
+  flex: none;
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--omnexx-border-subtle);
+  background: var(--omnexx-bg-card);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  padding: var(--space-2) var(--space-3);
+}
+
+.ansi-1 {
+  font-weight: 700;
+}
+/* Terminal ANSI colors resolve through the VS Code terminal palette (hex is
+   only the fallback when the theme does not define the variable), so high
+   contrast themes recolor them instead of leaving hardcoded colors. */
+.ansi-30 {
+  color: var(--vscode-terminal-ansiBlack, #7a7a7a);
+}
+.ansi-31 {
+  color: var(--vscode-terminal-ansiRed, #f87171);
+}
+.ansi-32 {
+  color: var(--vscode-terminal-ansiGreen, #3fb950);
+}
+.ansi-33 {
+  color: var(--vscode-terminal-ansiYellow, #f59e0b);
+}
+.ansi-34 {
+  color: var(--vscode-terminal-ansiBlue, #58a6ff);
+}
+.ansi-35 {
+  color: var(--vscode-terminal-ansiMagenta, #c084fc);
+}
+.ansi-36 {
+  color: var(--vscode-terminal-ansiCyan, #2dd4bf);
+}
+.ansi-37 {
+  color: var(--vscode-terminal-ansiWhite, #d4d4d4);
+}
+.ansi-90 {
+  color: var(--vscode-terminal-ansiBrightBlack, #9d9d9d);
+}
+.ansi-91 {
+  color: var(--vscode-terminal-ansiBrightRed, #ffa198);
+}
+.ansi-92 {
+  color: var(--vscode-terminal-ansiBrightGreen, #56d364);
+}
+.ansi-93 {
+  color: var(--vscode-terminal-ansiBrightYellow, #e3b341);
+}
+.ansi-94 {
+  color: var(--vscode-terminal-ansiBrightBlue, #79c0ff);
+}
+.ansi-95 {
+  color: var(--vscode-terminal-ansiBrightMagenta, #d2a8ff);
+}
+.ansi-96 {
+  color: var(--vscode-terminal-ansiBrightCyan, #39c5cf);
+}
+.ansi-97 {
+  color: var(--vscode-terminal-ansiBrightWhite, #f0f0f0);
+}
+
+/* Split view: conversation on the left, live terminal fixed on the right.
+   The body's right padding narrows every panel child (log, composer) so the
+   fixed drawer never overlaps them. */
+body.split-view {
+  padding-right: min(46%, 720px);
+}
+
+body.split-view .terminal-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: var(--z-float);
+  width: min(46%, 720px);
+  height: auto;
+  margin: 0;
+  border: 0;
+  border-left: 1px solid var(--omnexx-border-subtle);
+  border-radius: 0;
+}
+
+body.split-view .terminal-drawer.collapsed {
+  height: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .terminal-head button {
+    transition: none;
+  }
+}
+
+/* === Additional UI polish === */
+.term-pill-fold > summary.term-pill-head:focus-visible,
+.tool-card-fold > summary.tool-card-head:focus-visible,
+.tools-fold > summary.tools-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.empty-chat .empty-title {
+  animation: empty-fade 360ms var(--ease);
+}
+
+@keyframes empty-fade {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.empty-hint code {
+  transition:
+    background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
+}
+
+.empty-hint code:hover {
+  background: color-mix(in srgb, var(--accent) 10%, var(--card));
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
+}
+
+/* ==========================================================================
+   #inspector — Context Cockpit: segmented token progress bar with glowing
+   borders and clean percentage badges.
+   Segments: System (cyan), Tools (emerald), Notes (amber), History (purple).
+   ========================================================================== */
+
+/* Meter track: flat card surface with a thin inner stroke and subtle depth. */
+#inspector .ci-meter,
+.ci-meter {
+  display: flex;
+  height: 10px;
+  width: 100%;
+  background: var(--card);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  box-shadow:
+    inset 0 1px 2px color-mix(in srgb, var(--fg) 6%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--fg) 8%, transparent);
+}
+
+/* Each segment: glowing fill, hairline separator, smooth width transitions. */
+#inspector .ci-meter i,
+.ci-meter i {
+  height: 100%;
+  border-right: 1px solid color-mix(in srgb, var(--fg) 6%, transparent);
+  transition:
+    width var(--dur-slow) var(--ease),
+    filter var(--dur-fast) var(--ease);
+}
+
+#inspector .ci-meter i:hover,
+.ci-meter i:hover {
+  filter: brightness(1.15);
+}
+
+/* System — cyan */
+#inspector .ci-m-system,
+.ci-m-system {
+  background: var(--teal);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--teal) 55%, transparent);
+}
+
+/* Tools — emerald */
+#inspector .ci-m-tools,
+.ci-m-tools {
+  background: var(--emerald);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--ok) 55%, transparent);
+}
+
+/* Notes — amber */
+#inspector .ci-m-notes,
+.ci-m-notes {
+  background: var(--amber);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--warn) 55%, transparent);
+}
+
+/* History — purple */
+#inspector .ci-m-chat,
+.ci-m-chat {
+  background: var(--violet);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--violet) 55%, transparent);
+}
+
+/* Percentage badges — clean pill chips on the legend row. */
+#inspector .ci-leg-item,
+.ci-leg-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: var(--radius-full);
+  border: 1px solid color-mix(in srgb, var(--fg) 15%, transparent);
+  background: color-mix(in srgb, var(--fg) 6%, var(--surface));
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--muted);
+  transition: all var(--dur-fast) var(--ease);
+}
+
+#inspector .ci-leg-item:hover,
+.ci-leg-item:hover {
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--fg) 14%, var(--surface));
+  color: var(--fg);
+  transform: translateY(-1px);
+}
+
+#inspector .ci-dot,
+.ci-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: 0 0 8px currentColor;
+}

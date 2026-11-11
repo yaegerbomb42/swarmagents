@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SwarmAgents mark</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+  #c { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script src="https://unpkg.com/three@0.147.0/build/three.min.js"></script>
+<script>
+'use strict';
+(function () {
+  const params = new URLSearchParams(location.search);
+  const text = params.get('text') || 'S';
+  const n = Math.min(6000, Math.max(800, parseInt(params.get('n') || '2400', 10)));
+  const canvas = document.getElementById('c');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: true, powerPreference: 'high-performance' });
+  renderer.setClearColor(0x000000, 0);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 200);
+  camera.position.set(0, 0.35, 28);
+
+  const group = new THREE.Group();
+  scene.add(group);
+
+  function sampleGlyph(label, count) {
+    const fontOf = px => `900 ${px}px "Arial Black","Helvetica Neue",Arial,sans-serif`;
+    const c = document.createElement('canvas');
+    let ctx = c.getContext('2d', { willReadFrequently: true });
+    let px = 280;
+    ctx.font = fontOf(px);
+    const m = ctx.measureText(label);
+    const w = Math.ceil(m.width + px * 0.5);
+    const h = Math.ceil(px * 1.25);
+    c.width = w; c.height = h;
+    ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.font = fontOf(px);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, w / 2, h / 2 + px * 0.02);
+    const data = ctx.getImageData(0, 0, w, h).data;
+    const cand = [];
+    for (let y = 0; y < h; y += 2) {
+      for (let x = 0; x < w; x += 2) {
+        if (data[(y * w + x) * 4 + 3] > 120) cand.push(x, y);
+      }
+    }
+    const world = 14;
+    const scale = world / w;
+    const positions = new Float32Array(count * 3);
+    const pick = Math.min(count, cand.length / 2);
+    for (let i = 0; i < pick; i++) {
+      const p = Math.min((cand.length / 2) - 1, ((i + Math.random()) / pick * (cand.length / 2)) | 0);
+      const gx = cand[p * 2], gy = cand[p * 2 + 1];
+      positions[i * 3] = (gx - w / 2) * scale + (Math.random() - 0.5) * scale * 0.4;
+      positions[i * 3 + 1] = (h / 2 - gy) * scale + (Math.random() - 0.5) * scale * 0.4;
+      positions[i * 3 + 2] = (Math.random() - 0.5) * 1.2;
+    }
+    for (let i = pick; i < count; i++) {
+      const src = (Math.random() * pick) | 0;
+      positions[i * 3] = positions[src * 3] + (Math.random() - 0.5) * scale;
+      positions[i * 3 + 1] = positions[src * 3 + 1] + (Math.random() - 0.5) * scale;
+      positions[i * 3 + 2] = positions[src * 3 + 2];
+    }
+    return positions;
+  }
+
+  const nText = Math.floor(n * 0.78);
+  const nSwarm = n - nText;
+  const total = n;
+  const positions = new Float32Array(total * 3);
+  const colors = new Float32Array(total * 3);
+  const sizes = new Float32Array(total);
+  positions.set(sampleGlyph(text, nText), 0);
+  for (let i = 0; i < nText; i++) {
+    const r = Math.random();
+    if (r < 0.55) { colors[i * 3] = 0; colors[i * 3 + 1] = 1; colors[i * 3 + 2] = 1; }
+    else if (r < 0.8) { colors[i * 3] = 0.2; colors[i * 3 + 1] = 1; colors[i * 3 + 2] = 0.95; }
+    else { colors[i * 3] = 0; colors[i * 3 + 1] = 0.75; colors[i * 3 + 2] = 1; }
+    sizes[i] = 0.22 + Math.random() * 0.28;
+  }
+  const swarm = [];
+  for (let i = 0; i < nSwarm; i++) {
+    const idx = nText + i;
+    const hx = (Math.random() * 2 - 1) * 9;
+    const hy = (Math.random() * 2 - 1) * 9;
+    const hz = (Math.random() * 2 - 1) * 5;
+    positions[idx * 3] = hx; positions[idx * 3 + 1] = hy; positions[idx * 3 + 2] = hz;
+    const r = Math.random();
+    if (r < 0.45) { colors[idx * 3] = 1; colors[idx * 3 + 1] = 0; colors[idx * 3 + 2] = 1; }
+    else if (r < 0.75) { colors[idx * 3] = 0.8; colors[idx * 3 + 1] = 0; colors[idx * 3 + 2] = 1; }
+    else { colors[idx * 3] = 1; colors[idx * 3 + 1] = 0.24; colors[idx * 3 + 2] = 0.75; }
+    sizes[idx] = 0.35 + Math.random() * 0.55;
+    swarm.push({
+      o: idx * 3, hx, hy, hz,
+      vx: (Math.random() - 0.5) * 2, vy: (Math.random() - 0.5) * 2, vz: (Math.random() - 0.5) * 2,
+      phase: Math.random() * Math.PI * 2, freq: 0.5 + Math.random() * 1.2, wob: 0.6 + Math.random() * 0.9
+    });
+  }
+
+  const glow = (() => {
+    const S = 48; const c = document.createElement('canvas'); c.width = c.height = S;
+    const g = c.getContext('2d');
+    const grad = g.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.35, 'rgba(255,255,255,0.55)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = grad; g.fillRect(0, 0, S, S);
+    return new THREE.CanvasTexture(c);
+  })();
+
+  const geometry = new THREE.BufferGeometry();
+  const posAttr = new THREE.BufferAttribute(positions, 3);
+  posAttr.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute('position', posAttr);
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+  const material = new THREE.PointsMaterial({
+    size: 1, map: glow, vertexColors: true, blending: THREE.AdditiveBlending,
+    transparent: true, depthWrite: false, sizeAttenuation: true, opacity: 0.95
+  });
+  material.onBeforeCompile = (shader) => {
+    let vs = shader.vertexShader;
+    if (vs.includes('uniform float size;')) vs = vs.replace('uniform float size;', 'attribute float aSize;');
+    if (vs.includes('gl_PointSize = size;')) vs = vs.replace('gl_PointSize = size;', 'gl_PointSize = aSize;');
+    shader.vertexShader = vs;
+  };
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  group.add(points);
+
+  function resize() {
+    const w = canvas.clientWidth || 64;
+    const h = canvas.clientHeight || 64;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / Math.max(h, 1);
+    camera.updateProjectionMatrix();
+  }
+  resize();
+  window.addEventListener('resize', resize, { passive: true });
+
+  const clock = new THREE.Clock();
+  let t = 0;
+  const orbitAxis = new THREE.Vector3(0, 1, 0);
+  const target = new THREE.Vector3(0, 0, 0);
+  const offset = new THREE.Vector3();
+
+  function frame() {
+    requestAnimationFrame(frame);
+    const dt = Math.min(clock.getDelta(), 0.05);
+    t += dt;
+
+    // Orbit camera; glyph always faces viewer
+    offset.copy(camera.position).sub(target);
+    offset.applyAxisAngle(orbitAxis, 0.35 * dt);
+    camera.position.copy(target).add(offset);
+    camera.lookAt(target);
+    group.quaternion.copy(camera.quaternion);
+    group.position.y = Math.sin(t * 0.9) * 0.25;
+    material.opacity = 0.88 + 0.1 * Math.sin(t * 1.7);
+
+    for (let i = 0; i < swarm.length; i++) {
+      const p = swarm[i];
+      const o = p.o;
+      const x = positions[o], y = positions[o + 1], z = positions[o + 2];
+      const wa = 2.4 * p.wob;
+      const ax = (p.hx - x) * 0.9 + Math.sin(t * p.freq + p.phase) * wa;
+      const ay = (p.hy - y) * 0.9 + Math.cos(t * p.freq * 0.9 + p.phase * 1.7) * wa * 0.8;
+      const az = (p.hz - z) * 0.9 + Math.sin(t * p.freq * 1.2 + p.phase * 2.1) * wa * 0.9;
+      const damp = Math.exp(-1.7 * dt);
+      p.vx = (p.vx + ax * dt) * damp;
+      p.vy = (p.vy + ay * dt) * damp;
+      p.vz = (p.vz + az * dt) * damp;
+      positions[o] = x + p.vx * dt;
+      positions[o + 1] = y + p.vy * dt;
+      positions[o + 2] = z + p.vz * dt;
+    }
+    posAttr.needsUpdate = true;
+    renderer.render(scene, camera);
+  }
+  frame();
+})();
+</script>
+</body>
+</html>

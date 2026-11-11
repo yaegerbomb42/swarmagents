@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CORE::INIT_SEQUENCE</title>
+    <style>
+        :root { --bg: #050505; --accent: #00ffcc; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: var(--bg); font-family: monospace; }
+        canvas { display: block; }
+        #ui-layer { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--accent); pointer-events: none; text-align: center; mix-blend-mode: screen; transition: opacity 0.5s; }
+        .blink { animation: blink 1s infinite; }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+        #overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; z-index: 10; cursor: pointer; }
+        #overlay.hidden { display: none; }
+        .btn { border: 1px solid var(--accent); padding: 10px 20px; color: var(--accent); text-transform: uppercase; letter-spacing: 2px; font-weight: bold; background: transparent; transition: all 0.2s; }
+        .btn:hover { background: var(--accent); color: var(--bg); box-shadow: 0 0 15px var(--accent); }
+    </style>
+</head>
+<body>
+
+    <div id="overlay">
+        <div class="btn">Initialize System</div>
+    </div>
+
+    <canvas id="stage"></canvas>
+
+    <script>
+    /**
+     * ARCHITECTURE: CORE ENGINE
+     * MODULE: Main Loop & State Management
+     */
+    class Engine {
+        constructor() {
+            this.canvas = document.getElementById('stage');
+            this.ctx = this.canvas.getContext('2d');
+            this.width = window.innerWidth;
+            this.height = window.innerHeight;
+            this.particles = [];
+            this.targets = [];
+            this.running = false;
+            
+            // Sub-systems
+            this.audio = new AudioSynth();
+            this.physics = { friction: 0.94, ease: 0.08 };
+            
+            this.resize();
+            window.addEventListener('resize', () => this.resize());
+            
+            // Interaction
+            const overlay = document.getElementById('overlay');
+            overlay.addEventListener('click', () => {
+                overlay.classList.add('hidden');
+                this.boot();
+            });
+        }
+
+        resize() {
+            this.width = window.innerWidth;
+            this.height = window.innerHeight;
+            this.canvas.width = this.width;
+            this.canvas.height = this.height;
+            // Re-scan text on resize to center it
+            if(this.running) this.scanTextTargets();
+        }
+
+        /**
+         * Converts text to vector coordinates via off-screen rendering
+         */
+        scanTextTargets() {
+            const offCanvas = document.createElement('canvas');
+            const offCtx = offCanvas.getContext('2d');
+            offCanvas.width = this.width;
+            offCanvas.height = this.height;
+
+            const fontSize = Math.min(this.width / 6, 150);
+            offCtx.font = `900 ${fontSize}px "Courier New", monospace`;
+            offCtx.fillStyle = 'white';
+            offCtx.textAlign = 'center';
+            offCtx.textBaseline = 'middle';
+            offCtx.fillText('HELLO WORLD', this.width / 2, this.height / 2);
+
+            const data = offCtx.getImageData(0, 0, this.width, this.height).data;
+            this.targets = [];
+
+            // Sampling rate (skip pixels for performance/style)
+            const gap = 4; 
+
+            for (let y = 0; y < this.height; y += gap) {
+                for (let x = 0; x < this.width; x += gap) {
+                    const alpha = data[(y * this.width + x) * 4 + 3];
+                    if (alpha > 128) {
+                        this.targets.push({ x, y });
+                    }
+                }
+            }
+            this.spawnParticles();
+        }
+
+        spawnParticles() {
+            // Pool management: reuse or create
+            const diff = this.targets.length - this.particles.length;
+            
+            if (diff > 0) {
+                for(let i = 0; i < diff; i++) {
+                    this.particles.push(new Particle(this.width, this.height));
+                }
+            } else if (diff < 0) {
+                this.particles.splice(0, -diff);
+            }
+
+            // Assign targets
+            this.particles.forEach((p, i) => {
+                if (this.targets[i]) {
+                    p.setTarget(this.targets[i].x, this.targets[i].y);
+                }
+            });
+        }
+
+        boot() {
+            this.running = true;
+            this.audio.playBootSound();
+            this.scanTextTargets();
+            this.loop();
+        }
+
+        loop() {
+            // Clear with trail effect
+            this.ctx.fillStyle = 'rgba(5, 5, 5, 0.3)';
+            this.ctx.fillRect(0, 0, this.width, this.height);
+
+            this.particles.forEach(p => {
+                p.update(this.physics);
+                p.draw(this.ctx);
+            });
+
+            // Holographic scanline
+            this.drawScanline();
+
+            requestAnimationFrame(() => this.loop());
+        }
+
+        drawScanline() {
+            const time = Date.now() * 0.002;
+            const y = (Math.sin(time) * 0.5 + 0.5) * this.height;
+            this.ctx.strokeStyle = 'rgba(0, 255, 204, 0.1)';
+            this.ctx.lineWidth = 2;
+            this.ctx.beginPath();
+            this.ctx.moveTo(0, y);
+            this.ctx.lineTo(this.width, y);
+            this.ctx.stroke();
+        }
+    }
+
+    /**
+     * MODULE: Physics Entity
+     */
+    class Particle {
+        constructor(w, h) {
+            // Start at random edge positions (Big Bang style)
+            this.x = Math.random() * w;
+            this.y = Math.random() * h;
+            this.tx = this.x; // Target X
+            this.ty = this.y; // Target Y
+            this.vx = (Math.random() - 0.5) * 10;
+            this.vy = (Math.random() - 0.5) * 10;
+            this.color = `hsl(${160 + Math.random() * 40}, 100%, 50%)`;
+            this.size = Math.random() * 2 + 1;
+        }
+
+        setTarget(x, y) {
+            this.tx = x;
+            this.ty = y;
+        }
+
+        update(physics) {
+            // Steering behavior: Seek target
+            const dx = this.tx - this.x;
+            const dy = this.ty - this.y;
+            
+            this.vx += dx * 0.01; // Acceleration
+            this.vy += dy * 0.01;
+            
+            this.vx *= physics.friction;
+            this.vy *= physics.friction;
+            
+            this.x += this.vx;
+            this.y += this.vy;
+
+            // Jitter for "glitch" effect
+            if (Math.random() > 0.99) {
+                this.x += (Math.random() - 0.5) * 10;
+            }
+        }
+
+        draw(ctx) {
+            ctx.fillStyle = this.color;
+            ctx.fillRect(this.x, this.y, this.size, this.size);
+        }
+    }
+
+    /**
+     * MODULE: Procedural Audio Synthesis
+     * Philosophy: No mp3s. Only Math.
+     */
+    class AudioSynth {
+        constructor() {
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        playBootSound() {
+            if (this.ctx.state === 'suspended') this.ctx.resume();
+
+            const t = this.ctx.currentTime;
+            
+            // Oscillator 1: The Bass Swell
+            const osc1 = this.ctx.createOscillator();
+            const gain1 = this.ctx.createGain();
+            osc1.type = 'sawtooth';
+            osc1.frequency.setValueAtTime(50, t);
+            osc1.frequency.exponentialRampToValueAtTime(120, t + 2);
+            gain1.gain.setValueAtTime(0, t);
+            gain1.gain.linearRampToValueAtTime(0.2, t + 0.5);
+            gain1.gain.exponentialRampToValueAtTime(0.01, t + 3);
+            
+            // Oscillator 2: The Digital High Shimmer
+            const osc2 = this.ctx.createOscillator();
+            const gain2 = this.ctx.createGain();
+            osc2.type = 'square';
+            osc2.frequency.setValueAtTime(800, t);
+            osc2.frequency.linearRampToValueAtTime(2000, t + 0.2);
+            // Random arpeggio simulation via frequency modulation
+            osc2.frequency.setValueAtTime(1200, t + 0.3);
+            osc2.frequency.setValueAtTime(2400, t + 0.4);
+            
+            gain2.gain.setValueAtTime(0, t);
+            gain2.gain.linearRampToValueAtTime(0.05, t + 0.1);
+            gain2.gain.exponentialRampToValueAtTime(0.001, t + 1.5);
+
+            // Filter
+            const filter = this.ctx.createBiquadFilter();
+            filter.type = 'lowpass';
+            filter.frequency.setValueAtTime(200, t);
+            filter.frequency.linearRampToValueAtTime(3000, t + 2);
+
+            // Wiring
+            osc1.connect(filter);
+            osc2.connect(filter);
+            filter.connect(gain1); // Merging gains loosely for simplicity in this monolith
+            gain1.connect(this.ctx.destination);
+            gain2.connect(this.ctx.destination);
+
+            osc1.start(t);
+            osc2.start(t);
+            osc1.stop(t + 4);
+            osc2.stop(t + 4);
+        }
+    }
+
+    // Initialize Architecture
+    window.onload = () => new Engine();
+
+    </script>
+</body>
+</html>

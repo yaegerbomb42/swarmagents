@@ -1,0 +1,34 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": []
+  },
+  "include": [
+    "chat.ts",
+    "render.ts",
+    "settings.ts",
+    "modelPicker.ts",
+    "crew.ts",
+    "roles.ts",
+    "contextPage.ts",
+    "mcp.ts",
+    "agentCard.ts",
+    "browserCockpit.ts",
+    // xterm.js bundle entry (terminal drawer) + the CSS-import declaration it needs.
+    "xterm-shim.ts",
+    "css.d.ts",
+    // Split-diff viewer bundle entry.
+    "diffView.ts",
+    // Terminal pill renderer (rides in out/chat.js via the chat.ts import).
+    "terminalPill.ts",
+    // Sandbox drawer & checkpoint scrubber (Phase 9.4 / 9.5).
+    "sandboxSettings.ts",
+    "sandboxScrubber.ts",
+    // Context inspector HUD (Phase 9.6).
+    "contextInspector.ts",
+    // DOM test of roles.ts: typechecked here, with the DOM lib, not by the root config.
+    "../../../test/unit/vscode-roles-providers.test.ts"
+  ],
+  "exclude": []
+}

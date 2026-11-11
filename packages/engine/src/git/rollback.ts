@@ -1,0 +1,65 @@
+import { writeFile } from 'node:fs/promises';
+import { isSecretPath } from '../security/paths.js';
+import { git } from './git.js';
+import { clearStaleGitLocks } from './locks.js';
+import { workingTreeDiff } from './repo.js';
+
+/** Drop per-file sections for credential-looking paths, then redact what's left. */
+export function sanitizePatch(patch: string, redact: (s: string) => string): string {
+  const sections = patch.split(/^(?=diff --git )/m);
+  const kept = sections.filter((s) => {
+    const m = /^diff --git a\/(.+?) b\/(.+)/.exec(s);
+    return !m || !(isSecretPath(m[1] ?? '') || isSecretPath(m[2] ?? ''));
+  });
+  return redact(kept.join(''));
+}
+
+/**
+ * Save the failed attempt as a (sanitized) patch, then hard-reset the worktree to `lastGreen`.
+ * Only ever called on Omnexx's own worktree; ignored files (node_modules) survive `clean -fd`.
+ */
+export async function rollbackTo(
+  cwd: string,
+  lastGreen: string,
+  save?: { path: string; redact: (s: string) => string },
+): Promise<{ savedPatch: boolean; exact: boolean }> {
+  let savedPatch = false;
+  let exact = false;
+  if (save) {
+    const raw = (await workingTreeDiff(cwd, lastGreen)).patch;
+    const patch = sanitizePatch(raw, save.redact);
+    if (patch.trim()) {
+      await writeFile(save.path, patch, { mode: 0o600 });
+      savedPatch = true;
+      // Nothing redacted or dropped: the saved patch can be applied again as is.
+      exact = patch === raw;
+    }
+  }
+  // A git process that died mid-run may have left an `index.lock` in the
+  // worktree's git dir, which would wedge the hard reset below and leave the
+  // speculative changes in place. Clear lock files first (best-effort).
+  // Rollback is a recovery path on an Omnexx-owned worktree — no git process
+  // should be writing to it concurrently — so clear regardless of age.
+  await clearStaleGitLocks(cwd, { minAgeMs: 0 }).catch(() => undefined);
+  await git(cwd, ['reset', '-q', '--hard', lastGreen]);
+  await git(cwd, [
+    'clean',
+    '-q',
+    '-fdx',
+    '-e',
+    'node_modules',
+    '-e',
+    '.venv',
+    '-e',
+    'venv',
+    '-e',
+    'target',
+    '-e',
+    'vendor',
+    // Omnexx's own spec-test suite and dispute note live untracked (info/exclude) across
+    // rollbacks; wiping them loses a worker's pending dispute.
+    '-e',
+    '.omnexx-spec*',
+  ]);
+  return { savedPatch, exact };
+}

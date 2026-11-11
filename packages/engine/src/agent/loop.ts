@@ -1,0 +1,1591 @@
+import {
+  callOrder,
+  RATE_LIMITED_FOR_MS,
+  skipsOutModels,
+  sticksOnRateLimit,
+  type Strategy,
+} from '../config/routing.js';
+import type { OmnexxConfig } from '../config/schema.js';
+import type { Clock } from '../core/clock.js';
+import type { EventLog } from '../core/events.js';
+import {
+  loadTokenRatios,
+  observeTokenRatio,
+  saveTokenRatio,
+  tokenRatio,
+  type TokenRatios,
+} from '../core/token-calibration.js';
+import { applyTokenRatio, estimateTokens } from '../core/tokens.js';
+import { preflight, type BudgetStop } from '../guard/budget.js';
+import type { TaskGovernor } from '../guard/task-governor.js';
+import { costUsd, type ResolvedModel } from '../providers/pricing.js';
+import { ProvidersUnavailable, StopRequested, withRetry } from '../providers/retry.js';
+import type { CallMeta, CallPurpose } from '../providers/usage-ledger.js';
+import { narrateTool } from '../telemetry/narrate.js';
+import { shouldFailover } from '../providers/router.js';
+import { isQuotaError } from '../providers/sticky.js';
+import { ProviderError } from '../errors.js';
+import {
+  budgetTokens,
+  totalInput,
+  type CompletionRequest,
+  type CompletionResponse,
+  type ContentBlock,
+  type Message,
+  type Provider,
+  type SystemBlock,
+  type ToolSpec,
+  type Usage,
+} from '../providers/types.js';
+import type { Tool, ToolContext } from '../tools/types.js';
+import type { SystemOneMiddleware } from '../runtime/system-one/middleware.js';
+import { autoLoadToolGroup, type LoadedToolsState } from '../tools/request-tools.js';
+import {
+  contextTokens,
+  manageContext,
+  missAwareSettings,
+  type CompactionSettings,
+  type Summarize,
+} from './compaction.js';
+import {
+  appendTranscriptFile,
+  condenseRolling,
+  shouldCondense,
+  DEFAULT_CONDENSE_EVERY,
+  DEFAULT_KEEP_TURNS,
+} from './rolling-memory.js';
+import { turnRequest } from './context.js';
+import { TurnBudgetAllocator, type TurnBudgetPlan } from './turn-budget.js';
+import { VerificationCoalescer } from './redundant-read.js';
+import {
+  ToolEpoch,
+  capabilityDirective,
+  estimateTokens as estimateJsonTokens,
+} from '../runtime/kernel/cache-epoch.js';
+import { isRealVerification } from '../runtime/kernel/optimizer.js';
+import type { InCycleWatch, StuckFinding } from '../guard/stuck.js';
+import type { DoomLoopRatchet } from '../core/doom-loop-ratchet.js';
+import type { AdaptiveRuntimeKernel } from '../runtime/kernel/index.js';
+import type { SpeculativeBranchRollbackManager } from './runtime/rollback.js';
+import type { CascadeCircuitBreaker } from '../router/circuit-breaker.js';
+import { buildEscalationHandoff } from '../router/escalation-handoff.js';
+import { toolStateProgress } from '../runtime/kernel/telemetry.js';
+import { todoItemsOf, todoNudge, todoTool, type TodoItem } from '../tools/todo.js';
+
+/** Thrown inside the retry loop when a pre-flight check refuses the call; ends the cycle, never retried. */
+class BudgetStopSignal extends Error {
+  constructor(
+    readonly stop: BudgetStop,
+    readonly detail: string,
+  ) {
+    super(detail);
+  }
+}
+
+function buildToolMap(
+  tools: readonly Tool[],
+  warnDuplicate?: (name: string) => void,
+): Map<string, Tool> {
+  const map = new Map<string, Tool>();
+  for (const t of tools) {
+    if (map.has(t.name) && warnDuplicate) {
+      warnDuplicate(t.name);
+    }
+    map.set(t.name, t);
+  }
+  return map;
+}
+
+function resolveKernelObjective(deps: LoopDeps, messages: readonly Message[]): string {
+  if (deps.kernelObjective && deps.kernelObjective.trim().length > 0) {
+    return deps.kernelObjective.trim();
+  }
+  if (deps.rolling?.goal && deps.rolling.goal.trim().length > 0) {
+    return deps.rolling.goal.trim();
+  }
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role === 'user' && Array.isArray(msg.content)) {
+      const textBlock = msg.content.find(
+        (b): b is Extract<ContentBlock, { type: 'text' }> =>
+          b.type === 'text' && Boolean(b.text.trim()),
+      );
+      if (textBlock?.text.trim()) return textBlock.text.trim();
+    }
+  }
+  return 'general task';
+}
+
+/**
+ * Tool names models invent for tools that exist under another name (DeepSeek called
+ * print_tree and list_files in its first real run). They run the real tool instead of failing.
+ */
+const TOOL_ALIASES: Record<string, string> = {
+  print_tree: 'outline',
+  tree: 'outline',
+  ls: 'outline',
+  list_files: 'outline',
+  list_dir: 'outline',
+  list_directory: 'outline',
+  file_tree: 'outline',
+  find_files: 'outline',
+  glob: 'outline',
+  list: 'outline',
+  grep: 'search',
+  list_capabilities: 'manage_capabilities',
+  ripgrep: 'search',
+  search_files: 'search',
+  search_code: 'search',
+  code_search: 'search',
+  cat: 'read',
+  read_file: 'read',
+  open_file: 'read',
+  view_file: 'read',
+  view: 'read',
+  create_file: 'write_file',
+  write: 'write_file',
+  edit: 'str_replace',
+  edit_file: 'str_replace',
+  replace: 'str_replace',
+  shell: 'bash',
+  run: 'bash',
+  run_command: 'bash',
+  execute: 'bash',
+  exec: 'bash',
+  terminal: 'bash',
+};
+
+/** What the model is told when it seems stuck in an interactive turn. */
+/** Argument names models use for the ones our tools take. */
+
+/**
+ * Step 3.7: tools that mutate the workspace and warrant a speculative checkpoint before running.
+ * These are the RISKY_CHECKPOINT tools from the rollback spec (bash, multi_edit).
+ */
+const RISKY_CHECKPOINT_TOOLS: ReadonlySet<string> = new Set(['bash', 'multi_edit']);
+
+const ARG_SYNONYMS: Record<string, string> = {
+  file_path: 'path',
+  filepath: 'path',
+  filename: 'path',
+  file: 'path',
+  dir: 'path',
+  directory: 'path',
+  line_start: 'start',
+  start_line: 'start',
+  from_line: 'start',
+  line_end: 'end',
+  end_line: 'end',
+  to_line: 'end',
+  offset: 'start',
+  limit: 'end',
+  query: 'pattern',
+  regex: 'pattern',
+  cmd: 'command',
+  script: 'command',
+  code: 'command',
+  old_string: 'old_str',
+  new_string: 'new_str',
+  old_text: 'old_str',
+  new_text: 'new_str',
+  old_content: 'old_str',
+  new_content: 'new_str',
+  text: 'content',
+};
+
+/**
+ * The input with synonyms renamed and keys the tool doesn't take dropped, or undefined when
+ * nothing changed. Only for tools whose schema is a plain object.
+ */
+export function lenientInput(schema: unknown, input: unknown): Record<string, unknown> | undefined {
+  const shape = (schema as { shape?: Record<string, unknown> }).shape;
+  if (!shape || typeof input !== 'object' || input === null || Array.isArray(input))
+    return undefined;
+  const out: Record<string, unknown> = {};
+  let changed = false;
+  for (const [k, v] of Object.entries(input)) {
+    const name: string | undefined = k in shape ? k : ARG_SYNONYMS[k];
+    if (name && name in shape && !(name in out)) {
+      out[name] = v;
+      if (name !== k) changed = true;
+    } else changed = true;
+  }
+  return changed ? out : undefined;
+}
+
+export function stuckNudge(detail: string): string {
+  return `[harness] You seem to be going in circles (${detail}). If the request is done, stop calling tools and give your summary now. If not, say in one line what is blocking you, then take a different approach; don't repeat the same searches or commands.`;
+}
+
+export type ControlSignal = 'continue' | 'pause' | 'stop' | 'stop-now';
+
+/** `rounds_spent`: a think-loop session used every check round without passing its checks. */
+export type LoopEnd =
+  'done' | 'stop' | 'stop-now' | BudgetStop | 'refusal' | 'stuck' | 'rounds_spent';
+
+export interface LoopResult {
+  end: LoopEnd;
+  turns: number;
+  finalText: string;
+  usage: Usage;
+  usd: number;
+  messages: Message[];
+  /** Set when the loop ended as `stuck`. */
+  stuck?: StuckFinding;
+  /** Why it ended, for ends that need explaining (`providers_unavailable`). */
+  detail?: string;
+}
+
+export interface LoopDeps {
+  provider: Provider;
+  /** The role's failover chain: tried in order, skipping providers that are blocked. */
+  models: readonly ResolvedModel[];
+  /** Why a provider can't take a call now (its own caps, cooling after a failure), or undefined. */
+  providerBlocked?: (provider: string) => string | undefined;
+  /** Skip this provider for a while after it failed. */
+  coolProvider?: (provider: string, ms: number) => void;
+  /** Whether this provider:model is out of quota (skipped until its quota resets). */
+  modelExhausted?: (ref: string) => boolean;
+  /** Record that this provider:model is out of quota, so the chain moves past it. */
+  markExhausted?: (ref: string) => void;
+  /** Record that this provider:model is rate-limited for `ms` (fallback lists move past it). */
+  markRateLimited?: (ref: string, ms: number) => void;
+  /** How the chain is used per call (routing.ts): random reshuffles, priority ignores quota marks. */
+  strategy?: Strategy;
+  tools: readonly Tool[];
+  toolCtx: ToolContext;
+  /** Lazy tool discovery state (persists across context compaction). */
+  loadedToolsState?: LoadedToolsState | null;
+  budget: OmnexxConfig['budget'];
+  maxTokens: number;
+  clock: Clock;
+  events: EventLog;
+  /** Stable id for this run, sent as OpenAI's prompt_cache_key. */
+  cacheKey?: string;
+  /**
+   * What this loop exists for: main agent, a helper, or a think loop. Every billed call inherits
+   * it, so the usage ledger can explain spend without guessing from the prompt text.
+   */
+  purpose?: CallPurpose;
+  /** The task the loop is working on, read at call time (`run.state.taskId`). */
+  taskId?: () => string | undefined;
+  /** The run's cycle, read at call time. */
+  cycle?: () => number;
+  /** Per-task token/dollar caps; checked before every call. */
+  taskBudget?: TaskGovernor;
+  /** Spend so far across the run, before this call. */
+  spentUsd: () => number;
+  /** Spend in the rolling 24 h window, for the daily cap. */
+  spentTodayUsd?: () => number;
+  /** Persist spend after every call so a crash never forgets money already spent. */
+  onUsage: (
+    usage: Usage,
+    usd: number,
+    model: string,
+    provider: string,
+    meta?: CallMeta,
+  ) => Promise<void>;
+  control: () => Promise<ControlSignal>;
+  /** How often to re-check control.json while paused. */
+  pausePollMs?: number;
+  /** Notifies the supervisor's heartbeat that we're paused or running. */
+  onPauseChange?: (paused: boolean) => void;
+  retry?: {
+    baseDelayMs?: number;
+    maxDelayMs?: number;
+    /** Give up after this long with no provider able to take the call. */
+    giveUpAfterMs?: number;
+    onOutage?: (ms: number) => void;
+  };
+  signal?: AbortSignal;
+  /** Run deadline in ms (wall clock active); used to annotate tool results with time left. */
+  deadlineMs?: number;
+  /** A model request is about to go out (for "waiting on the model" estimates). */
+  onRequest?: (r: { model: string; inputTokens: number }) => void;
+  /** A model request answered, after `ms`. */
+  onResponse?: (r: { model: string; inputTokens: number; ms: number }) => void;
+  /** In-cycle context control; off when unset. */
+  compaction?: { settings: CompactionSettings; summarize?: Summarize };
+  /** User-settable per-turn input budget (1k–256k); undefined preserves existing behavior. */
+  tokensPerTurn?: number;
+  /**
+   * Rolling memory condensation (`memory: rolling`, the default): every few turns the working
+   * memory is rewritten into a compact note and only the last turns stay raw, so the prompt
+   * stays flat. Off when unset (`memory: full` keeps the token-threshold fold only).
+   */
+  rolling?: {
+    /** Turns between condensations (default 7). */
+    every?: number;
+    /** Raw turns kept after the note (default 2). */
+    keepTurns?: number;
+    /** The current goal, for the note's first section. */
+    goal?: string;
+    /** Read a repo file's current content, for file hashes; no hashes when unset. */
+    readFile?: (path: string) => Promise<string | undefined>;
+    /** Where the folded transcript goes; default: logs/transcript.md (redacted). */
+    persistTranscript?: (text: string) => Promise<void>;
+    /** The rewritten note, each time it changes (the UI shows it). */
+    onNote?: (note: string, turn: number) => void;
+  };
+  /** In-cycle stuck detection; off when unset. */
+  watch?: InCycleWatch;
+  /**
+   * What a stuck signal does: "stop" ends the turn (unattended cycles start fresh anyway); "nudge"
+   * (interactive chat) tells the model first and stops only if the same signal fires again.
+   */
+  watchMode?: 'stop' | 'nudge';
+  /** How many `task` calls from one turn run at once (default 1). */
+  parallelTasks?: number;
+  /** Interactive chat: stream text and reasoning as the model writes them. */
+  onDelta?: CompletionRequest['onDelta'];
+  /**
+   * Interactive chat: messages the person typed while the agent was working. Drained after
+   * every step and added to the conversation right away, so they steer the current turn.
+   */
+  pendingInput?: () => string[];
+  /**
+   * `token-calibration.json` beside latency.json. Unset: every estimate stays at ratio 1.
+   * The loop loads it once and writes the EMA after each turn that reports prompt tokens.
+   */
+  calibrationFile?: string;
+  /**
+   * Optional function to refresh the tool list (for lazy tool discovery).
+   * When set, called at the start of every turn to get the current tool list and specs.
+   * When undefined, behavior is identical to before (tools fixed for the whole cycle).
+   */
+  refreshTools?: () => { tools: readonly Tool[]; specs: ToolSpec[] };
+  /** Anti-doom-loop ratchet tracking repeated tool failures and enforcing rollback on broken verifications. */
+  doomLoopRatchet?: DoomLoopRatchet;
+  /**
+   * Step 3.7 speculative branch rollback. When set, a GitTreeSnapshotter checkpoint is armed before
+   * risky mutating tools (bash, multi_edit); if a risky tool errors or the stuck-nudge trips, the
+   * workspace is restored to the checkpoint ref and a `<system_intervention type="branch_rollback">`
+   * message is injected so the model pivots. Omit (default) for zero behavior change.
+   */
+  rollback?: SpeculativeBranchRollbackManager;
+  /**
+   * Step 4.4 / Step 4.5: Cascade Circuit Breaker tracking tiered failures and triggering
+   * context-preserving escalation handoffs to Tier 3. Omit for default routing behavior.
+   */
+  circuitBreaker?: CascadeCircuitBreaker;
+  /**
+   * Opt-in Adaptive Runtime Kernel. When set, each turn allocates roles/tools/budgets and
+   * mutating tools are checkpointed. Omit (default) for zero behavior change.
+   */
+  kernel?: AdaptiveRuntimeKernel;
+  /**
+   * System-1 interceptor gates (intent + speculative pre-fetch, destructive-command guardrail,
+   * patch sanity, output triage, early stop). Off when unset.
+   */
+  systemOne?: Pick<SystemOneMiddleware, 'onPrompt' | 'beforeTool' | 'afterTool' | 'afterTurn'>;
+  /** Goal text the kernel uses for allocation; falls back to rolling.goal when unset. */
+  kernelObjective?: string;
+  /** In-memory skills to index into the kernel catalog on its first warm. */
+  kernelSkills?: readonly { name: string; description: string; triggerConditions?: string }[];
+}
+
+/** Uncalibrated size of the prompt the provider will see, and that size scaled by the model's ratio. */
+function pricedPrompt(
+  ratios: TokenRatios,
+  model: { provider: string; id: string },
+  req: { system: unknown; tools: unknown; messages: unknown },
+): { key: string; raw: number; estimate: number } {
+  const raw = estimateTokens(JSON.stringify([req.system, req.tools, req.messages]));
+  const key = `${model.provider}:${model.id}`;
+  return { key, raw, estimate: applyTokenRatio(raw, tokenRatio(ratios, key)) };
+}
+
+/** How messages typed mid-turn reach the model. */
+export const steeringText = (msgs: readonly string[]): string =>
+  `The user sent ${msgs.length === 1 ? 'a message' : 'messages'} while you were working. Read ${msgs.length === 1 ? 'it' : 'them'} now and adjust:\n${msgs.map((m) => `> ${m}`).join('\n')}`;
+
+/** Look-around tools: a turn spent on just one of these, before any edit, is a wasted round trip. */
+const EXPLORE_TOOLS: ReadonlySet<string> = new Set(['read', 'outline', 'search', 'read_symbol']);
+
+/**
+ * A later turn whose cache read is under 80% of the previous prompt. The first turn has nothing
+ * cached yet, so it is never a miss.
+ */
+export function cacheShortfall(
+  turn: number,
+  previousPromptTokens: number,
+  cacheRead: number,
+): { turn: number; expected: number; got: number } | undefined {
+  if (turn < 2 || previousPromptTokens <= 0) return undefined;
+  if (cacheRead / previousPromptTokens >= 0.8) return undefined;
+  return { turn, expected: previousPromptTokens, got: cacheRead };
+}
+
+/** Said once per loop, after the first turn that explored with a single call. */
+export const BATCH_HINT =
+  'Tip: each turn is a full round trip. Send every read, search and outline you need together in one turn, or use read with files: [{path, start, end}, ...] and outline with paths: [...]. Several search terms fit in one regex (a|b).';
+
+/** Calls that keep notes rather than do the work. */
+const BOOKKEEPING_TOOLS: ReadonlySet<string> = new Set([
+  'todo',
+  'running_context',
+  'remember',
+  'context',
+  'recall',
+]);
+
+/** Said once per loop, after the first turn of nothing but bookkeeping. */
+export const BOOKKEEPING_HINT =
+  'Tip: that turn only kept notes, and each turn is a full round trip. Send todo, running_context, remember and context alongside the reads, edits or commands of the same step.';
+
+/** Extra tries for a 400 on one call (a pool may route the retry to another model). */
+const BAD_REQUEST_RETRIES = 2;
+
+/** Failed attempts with a server error before checking whether the provider itself is up. */
+export const POISON_PROBE_AFTER = 3;
+
+/** The provider answers a trivial request but keeps failing this one: retrying can't help. */
+class PoisonedRequest extends Error {}
+
+/**
+ * Top-level string values that hold a JSON array or object, decoded (once; nested strings too).
+ * The input itself when nothing needed decoding, so callers can tell.
+ */
+export function decodeJsonStrings(input: unknown): unknown {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return input;
+  let changed = false;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+    out[k] = v;
+    if (typeof v !== 'string') continue;
+    const t = v.trim();
+    if (!(t.startsWith('[') && t.endsWith(']')) && !(t.startsWith('{') && t.endsWith('}')))
+      continue;
+    try {
+      out[k] = JSON.parse(t) as unknown;
+      changed = true;
+    } catch {
+      // Not JSON after all: leave it for the schema to reject.
+    }
+  }
+  return changed ? out : input;
+}
+
+/** Estimated tokens of the conversation by kind: tool results (by tool), tool calls, text. */
+export function messageSegments(messages: readonly Message[]): {
+  messages: number;
+  toolResults: number;
+  byTool: Record<string, number>;
+} {
+  const names = new Map<string, string>();
+  const byTool: Record<string, number> = {};
+  let toolResults = 0;
+  for (const m of messages)
+    for (const b of m.content) {
+      if (b.type === 'tool_use') names.set(b.id, b.name);
+      else if (b.type === 'tool_result') {
+        const t = estimateTokens(b.content);
+        toolResults += t;
+        const name = names.get(b.toolUseId) ?? 'unknown';
+        byTool[name] = (byTool[name] ?? 0) + t;
+      }
+    }
+  return { messages: contextTokens(messages), toolResults, byTool };
+}
+
+/** The tool a call names, directly or through an alias models invent (cat → read). */
+function resolveTool(byName: ReadonlyMap<string, Tool>, name: string): Tool | undefined {
+  return byName.get(name) ?? byName.get(TOOL_ALIASES[name.toLowerCase()] ?? '');
+}
+
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += Math.max(1, size)) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Calls grouped for execution, order kept: each run of consecutive concurrency-safe calls is
+ * one batch, every other call is a batch of its own.
+ */
+export function concurrentRuns<T extends { name: string }>(
+  calls: readonly T[],
+  isConcurrent: (name: string) => boolean,
+): T[][] {
+  return calls.reduce<T[][]>((batches, call) => {
+    const last = batches.at(-1);
+    const safe = isConcurrent(call.name);
+    if (safe && last && isConcurrent(last[0]?.name ?? ''))
+      return [...batches.slice(0, -1), [...last, call]];
+    return [...batches, [call]];
+  }, []);
+}
+
+function summarizeInput(input: unknown): string {
+  const s = JSON.stringify(input);
+  return s.length > 300 ? `${s.slice(0, 300)}…` : s;
+}
+
+/**
+ * The agent loop for one cycle: turn → tools → turn … until the model stops calling tools, a
+ * cap would be crossed (checked before every call), or a control request arrives. Pause blocks
+ * here at a turn boundary; no tokens are spent while paused or while a command runs.
+ */
+export async function runAgentLoop(
+  ctx: {
+    system: SystemBlock[];
+    first: Message;
+    tools: ToolSpec[];
+    /** Earlier turns of an interactive chat, sent before `first`. */
+    history?: readonly Message[];
+    /**
+     * The message compaction keeps at the top (it must be `history[0]`). Defaults to `first`;
+     * a think-loop session continues one conversation, so its opening context stays the anchor.
+     */
+    anchor?: Message;
+    /** Text a fold keeps word for word: the think phase's analysis. */
+    pinned?: string;
+  },
+  deps: LoopDeps,
+): Promise<LoopResult> {
+  let messages: Message[] = [...(ctx.history ?? []), ctx.first];
+  if (deps.systemOne) {
+    // The pre-fetch rides in the new user turn, after the cached history and system prefix.
+    const prompt = ctx.first.content
+      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    const spec = await deps.systemOne.onPrompt(prompt);
+    if (spec)
+      messages[messages.length - 1] = {
+        ...ctx.first,
+        content: [...ctx.first.content, { type: 'text', text: spec }],
+      };
+  }
+  const usage: Usage = { uncached: 0, cacheWrite5m: 0, cacheWrite1h: 0, cacheRead: 0, output: 0 };
+  let usd = 0;
+  let turns = 0;
+  let cacheMisses = 0;
+  let cycleTokens = 0;
+  let finalText = '';
+  let todos: readonly TodoItem[] = [];
+  let todoNudged = false;
+  let lastCondenseTurn = 0;
+  const end = (e: LoopEnd): LoopResult => ({ end: e, turns, finalText, usage, usd, messages });
+  // Per-turn input budget: one deterministic plan per epoch (stable tools/system → no cache bust).
+  const budgetAllocator = new TurnBudgetAllocator();
+  const budgetPlan: TurnBudgetPlan | undefined =
+    deps.tokensPerTurn !== undefined ? budgetAllocator.planFor(deps.tokensPerTurn) : undefined;
+  // Turn-efficiency deduplication state (unchanged re-reads + redundant verification).
+  const verificationCoalescer = new VerificationCoalescer();
+  let toolSeq = 0;
+  let lastMutationSeq = 0;
+  // The stable prefix never changes within a cycle; size it once for the per-turn breakdown.
+  const prefixTokens = {
+    system: estimateTokens(ctx.system.map((b) => b.text).join('\n')),
+    tools: estimateTokens(JSON.stringify(ctx.tools)),
+  };
+
+  let tokenRatios: TokenRatios = deps.calibrationFile
+    ? await loadTokenRatios(deps.calibrationFile)
+    : {};
+  const nudged = new Set<string>();
+  let batchHinted = false;
+  let previousPromptTokens = 0;
+  let bookkeepingHinted = false;
+  let changedSomething = false;
+  // Mutable copy of ctx so we can refresh tools each turn when refreshTools is provided.
+  let liveCtx = ctx;
+  const warnDup = (name: string) => {
+    deps.events.emit('tool.duplicate', { name });
+  };
+  // byName must be rebuilt when tools change.
+  let byName = buildToolMap(deps.tools, warnDup);
+  let turnMaxTokens = deps.maxTokens;
+  // Kernel: the full tool pool it allocates from (byName narrows to the mounted set).
+  let kernelPool: Tool[] = [...deps.tools];
+  const toolEpoch = new ToolEpoch();
+  let pendingFold = false;
+  let forcedSummaryTurn = false;
+  let turnDirective = '';
+  for (;;) {
+    // Refresh tools at the start of each turn if refreshTools is provided (lazy mode).
+    if (deps.refreshTools) {
+      const { tools: freshTools, specs: freshSpecs } = deps.refreshTools();
+      byName = buildToolMap(freshTools, warnDup);
+      kernelPool = [...freshTools];
+      liveCtx = { ...liveCtx, tools: freshSpecs };
+    }
+    turnMaxTokens = deps.maxTokens;
+    let currentTier: 1 | 2 | 3 = 2;
+    // Adaptive Runtime Kernel (on by default): allocate tools/roles/budget for this turn.
+    if (deps.kernel) {
+      const plan = await deps.kernel.planTurn({
+        objective: resolveKernelObjective(deps, messages),
+        allTools: kernelPool,
+        defaultMaxTokens: deps.maxTokens,
+        messages,
+        ...(deps.kernelSkills ? { skills: deps.kernelSkills } : {}),
+        turn: turns + 1,
+      });
+      currentTier = Math.min(3, Math.max(1, plan.allocation.tier)) as 1 | 2 | 3;
+      turnMaxTokens = plan.maxTokens;
+      if (plan.compactedMessages) {
+        messages = plan.compactedMessages;
+        deps.toolCtx.reads?.clear();
+        pendingFold = true;
+        deps.events.emit('kernel.gc', {
+          turn: turns,
+          messages: messages.length,
+        });
+      }
+      // Prompt cache: req.tools and req.system stay byte-identical within an epoch. Newly
+      // mounted capabilities go into the per-turn terminal directive (after the cached last
+      // message) and run by name or via call_capability; tools re-bake only at a fold.
+      const ep = toolEpoch.plan({
+        mounted: plan.tools,
+        fold: pendingFold,
+        suffixTokens: estimateJsonTokens(ctx.system) + estimateJsonTokens(messages),
+        foldBustTokens: estimateJsonTokens(ctx.system) + estimateJsonTokens(messages.slice(0, 1)),
+        expectedRemainingTurns: Math.max(1, deps.budget.max_turns_per_cycle - turns),
+      });
+      pendingFold = false;
+      byName = ep.byName;
+      liveCtx = { ...liveCtx, system: ctx.system, tools: ep.specs };
+      if (ep.rebaked && ep.epoch > 1)
+        deps.events.emit('kernel.epoch', { turn: turns, epoch: ep.epoch });
+      // Quiet by default: a kernel hint only when deliberative (tier>=2) or GC ran.
+      turnDirective = [
+        plan.allocation.tier >= 2 || plan.compactedMessages ? plan.systemHint.trim() : undefined,
+        capabilityDirective(ep.extra),
+        plan.phaseNudge,
+      ]
+        .filter((x): x is string => Boolean(x))
+        .join('\n\n');
+      deps.events.emit('kernel.allocate', {
+        turn: turns,
+        tier: plan.allocation.tier,
+        mode: plan.allocation.reasoningMode,
+        tools: plan.allocation.mountedTools,
+        friction: plan.telemetry.frictionScore,
+        pressure: plan.telemetry.contextPressure,
+        ...(plan.mctsSelectedId ? { mcts: plan.mctsSelectedId } : {}),
+        ...(plan.phase ? { phase: plan.phase, taskClass: plan.taskClass } : {}),
+        ...(plan.cadence
+          ? { cadence: plan.cadence.action, reason: plan.cadence.reason, epoch: ep.epoch }
+          : {}),
+        ...(plan.rankMode ? { rank: plan.rankMode } : {}),
+        ...(plan.whyMounted ? { why: plan.whyMounted } : {}),
+        ...(plan.mountSavings ? { mountSavings: plan.mountSavings } : {}),
+        priors: deps.kernel.optimizer.bandit.top(3),
+        ...(plan.droppedTools?.length ? { dropped: plan.droppedTools } : {}),
+        ...(plan.toolNameCollisions?.length ? { collisions: plan.toolNameCollisions } : {}),
+      });
+    }
+    let signal = await deps.control();
+    if (signal === 'pause') {
+      deps.events.emit('control.paused', { turn: turns });
+      deps.onPauseChange?.(true);
+      while (signal === 'pause') {
+        await deps.clock.sleep(deps.pausePollMs ?? 1_000);
+        signal = await deps.control();
+      }
+      deps.onPauseChange?.(false);
+      deps.events.emit('control.resumed', { turn: turns });
+    }
+    if (signal === 'stop' || signal === 'stop-now') return end(signal);
+    if (deps.signal?.aborted) return end('stop-now');
+
+    if (deps.rolling && turns > 0) {
+      // Rolling memory: every few turns rewrite working memory into the compact note and keep
+      // only the last turns raw. The folded transcript is already on disk (logs/transcript.md).
+      const rolling = deps.rolling;
+      if (shouldCondense(turns, lastCondenseTurn, rolling.every ?? DEFAULT_CONDENSE_EVERY)) {
+        const condensed = await condenseRolling(messages, ctx.anchor ?? ctx.first, {
+          turn: turns,
+          goal: rolling.goal ?? '',
+          keepTurns: rolling.keepTurns ?? DEFAULT_KEEP_TURNS,
+          ...(rolling.readFile ? { readFile: rolling.readFile } : {}),
+          persistTranscript:
+            rolling.persistTranscript ??
+            ((text) =>
+              appendTranscriptFile(deps.toolCtx.store.logsDir, deps.toolCtx.redactor.text(text))),
+        }).catch(() => undefined);
+        if (condensed) {
+          messages = condensed.messages;
+          lastCondenseTurn = turns;
+          pendingFold = true;
+          // Earlier read results are gone from the context now; let `read` return them again.
+          deps.toolCtx.reads?.clear();
+          rolling.onNote?.(condensed.note, turns);
+          deps.events.emit('context.condensed', {
+            turn: turns,
+            turnsSummarized: condensed.turnsSummarized,
+            noteChars: condensed.note.length,
+          });
+        }
+      }
+    }
+
+    if (deps.compaction && turns > 0) {
+      const settings = missAwareSettings(deps.compaction.settings, cacheMisses, turns - 1);
+      // When the user set a per-turn budget, enforce it as the history ceiling (target cap).
+      const effective = budgetPlan
+        ? { ...settings, budget: budgetPlan.compactionTarget }
+        : settings;
+      messages = await manageContext(
+        messages,
+        ctx.anchor ?? ctx.first,
+        ctx.pinned ? { ...effective, pinned: ctx.pinned } : effective,
+        deps.compaction.summarize,
+        ({ kind, ...rest }) => {
+          // Earlier read results are gone from the context now; let `read` return them again.
+          if (kind === 'cleared' || kind === 'compacted') deps.toolCtx.reads?.clear();
+          deps.events.emit(`context.${kind}`, { turn: turns, ...rest });
+        },
+      );
+    }
+
+    let chosen: ResolvedModel | undefined;
+    let res: CompletionResponse;
+    let learned: { model: string; raw: number } | undefined;
+    const callStart = deps.clock.now();
+    // One logical turn can make several provider attempts (failover, retry). The successful
+    // provider still bills once; failures are recorded as retry waste if the signature repeats.
+    let callAttempts = 1;
+    let lastEstimate = 0;
+    const lastPreviousPrompt = previousPromptTokens;
+    // Attempts in a row where some provider answered 5xx, and the last one that did.
+    let serverFailures = 0;
+    let badRequests = 0;
+    let lastServerFailure: ResolvedModel | undefined;
+    let attempted: { provider: string; id: string } | undefined;
+    try {
+      res = await withRetry(
+        async () => {
+          // After a few server errors, check whether the provider answers a trivial request.
+          // If it does and this request still fails, the request itself is the problem: an
+          // outage fails both, and one that just ended lets this attempt through.
+          if (serverFailures >= POISON_PROBE_AFTER && lastServerFailure) {
+            const m = lastServerFailure;
+            const probeReq: CompletionRequest = {
+              model: m.id,
+              route: m.provider,
+              system: [{ text: 'Reply with: ok' }],
+              tools: [],
+              messages: [{ role: 'user', content: [{ type: 'text', text: 'ok' }] }],
+              maxTokens: 16,
+              messageBreakpoints: [],
+            };
+            const probe = await deps.provider.complete(probeReq).catch(() => undefined);
+            if (probe) {
+              // The probe is a real billed call: attribute it too, or spend would have a hole.
+              await deps.onUsage(
+                probe.usage,
+                costUsd(probe.usage, m.price),
+                probe.model,
+                m.provider,
+                {
+                  purpose: 'verification',
+                  ...(deps.taskId?.() ? { taskId: deps.taskId() } : {}),
+                  ...(deps.cycle?.() !== undefined ? { cycle: deps.cycle() } : {}),
+                  turn: turns,
+                  step: `c${String(deps.cycle?.() ?? 0)}.probe`,
+                  attempt: callAttempts,
+                  promptTokens: 16,
+                  previousPromptTokens: 0,
+                },
+              );
+              // The provider is up: send the real request once more, cooling or not.
+              try {
+                const req = {
+                  ...turnRequest(
+                    liveCtx,
+                    messages,
+                    m.id,
+                    turnMaxTokens,
+                    deps.cacheKey,
+                    turnDirective ? { terminalDirective: turnDirective } : undefined,
+                  ),
+                  route: m.provider,
+                  ...(deps.signal ? { signal: deps.signal } : {}),
+                };
+                const quote = pricedPrompt(tokenRatios, m, req);
+                const r = await deps.provider.complete(req);
+                chosen = m;
+                learned = { model: quote.key, raw: quote.raw };
+                lastEstimate = quote.estimate;
+                return r;
+              } catch (err) {
+                if (err instanceof ProviderError && (err.status ?? 0) >= 500)
+                  throw new PoisonedRequest(
+                    `${m.provider}:${m.id} answers other requests but failed this one ${serverFailures + 1} times`,
+                  );
+                throw err;
+              }
+            }
+          }
+          let sawServerError = false;
+          let triedAny = false;
+          const skipped: string[] = [];
+          let onlyBudget = true;
+          const order = callOrder(deps.models, deps.strategy);
+          // Soft blocks (a model out of quota or rate-limited, a provider cooling down after a
+          // failure) are skipped while another model can take the call; when none can, they are
+          // tried anyway: one real retry beats sitting out the window with nothing to call (each
+          // cost minutes a run). Hard blocks (a spending cap) always hold.
+          const blockOf = (m: (typeof order)[number]): string | undefined =>
+            deps.providerBlocked?.(m.provider);
+          const cooling = (b: string | undefined): boolean =>
+            b?.startsWith('cooling down') === true;
+          const benched = (m: (typeof order)[number]): boolean =>
+            skipsOutModels(deps.strategy) &&
+            deps.modelExhausted?.(`${m.provider}:${m.id}`) === true;
+          const soft = (m: (typeof order)[number]): boolean => benched(m) || cooling(blockOf(m));
+          const hard = (m: (typeof order)[number]): boolean => {
+            const b = blockOf(m);
+            return b !== undefined && !cooling(b);
+          };
+          const anyFree = order.some((m) => !soft(m) && !hard(m));
+          for (const m of order) {
+            const blocked = blockOf(m);
+            if (hard(m)) {
+              if (!blocked?.includes('max_usd')) onlyBudget = false;
+              skipped.push(`${m.provider}: ${blocked ?? ''}`);
+              continue;
+            }
+            if (anyFree && soft(m)) {
+              onlyBudget = false;
+              skipped.push(
+                benched(m)
+                  ? `${m.provider}:${m.id}: out of quota`
+                  : `${m.provider}: ${blocked ?? ''}`,
+              );
+              continue;
+            }
+            // Use terminal prefix lock convention on the final turn to preserve KV cache warmth
+            const isTerminalTurn = turns >= deps.budget.max_turns_per_cycle - 1;
+            const req = turnRequest(
+              liveCtx,
+              messages,
+              m.id,
+              turnMaxTokens,
+              deps.cacheKey,
+              isTerminalTurn
+                ? {
+                    toolChoice: 'none',
+                    terminalDirective: [turnDirective, '[harness:terminal_step]']
+                      .filter(Boolean)
+                      .join('\n\n'),
+                  }
+                : turnDirective
+                  ? { terminalDirective: turnDirective }
+                  : undefined,
+            );
+            const quote = pricedPrompt(tokenRatios, m, req);
+            const estimate = quote.estimate;
+            lastEstimate = estimate;
+            const pf = preflight(deps.budget, {
+              spentUsd: deps.spentUsd(),
+              ...(deps.spentTodayUsd ? { spentTodayUsd: deps.spentTodayUsd() } : {}),
+              cycle: { turns, tokens: cycleTokens },
+              estimatedInputTokens: estimate,
+              maxOutputTokens: turnMaxTokens,
+              price: m.price,
+            });
+            if (!pf.ok) throw new BudgetStopSignal(pf.stop, pf.detail);
+            const taskId = deps.taskId?.();
+            // Planning/between-task calls belong to the run, not to the previous task.
+            const tb =
+              taskId && deps.purpose !== 'planning'
+                ? deps.taskBudget?.check({
+                    taskId,
+                    promptTokens: estimate,
+                    maxOutputTokens: turnMaxTokens,
+                    price: m.price,
+                  })
+                : undefined;
+            if (tb && !tb.allowed)
+              throw new BudgetStopSignal(tb.kind ?? 'task_max_tokens', tb.detail ?? 'task cap');
+            if (tb?.warning)
+              deps.events.emit('budget.task_warn', {
+                task: taskId,
+                cap: tb.warning.cap,
+                fraction: tb.warning.fraction,
+                cycle: deps.cycle?.(),
+              });
+            triedAny = true;
+            attempted = { provider: m.provider, id: m.id };
+            const ref = `${m.provider}:${m.id}`;
+            const sentAt = deps.clock.now();
+            deps.onRequest?.({ model: ref, inputTokens: estimate });
+            try {
+              const r = await deps.provider.complete({
+                ...req,
+                route: m.provider,
+                ...(deps.onDelta ? { onDelta: deps.onDelta } : {}),
+                ...(deps.signal ? { signal: deps.signal } : {}),
+              });
+              chosen = m;
+              learned = { model: quote.key, raw: quote.raw };
+              deps.onResponse?.({
+                model: ref,
+                inputTokens: estimate,
+                ms: deps.clock.now() - sentAt,
+              });
+              return r;
+            } catch (err) {
+              // A 400 is usually our own mistake, but behind a model pool the next try can land on
+              // a different model: give it two more chances before failing the call.
+              if (
+                err instanceof ProviderError &&
+                err.status === 400 &&
+                !err.contentFilter &&
+                !isQuotaError(err) &&
+                badRequests++ < BAD_REQUEST_RETRIES
+              ) {
+                deps.events.emit('provider.retry_400', {
+                  provider: m.provider,
+                  error: err.message,
+                });
+                throw new ProviderError(err.message, { retryable: true, status: 400 });
+              }
+              if (!shouldFailover(err)) throw err;
+              onlyBudget = false;
+              if ((err.status ?? 0) >= 500) {
+                sawServerError = true;
+                lastServerFailure = m;
+              }
+              // Out of quota: only this model is done, the provider's other models may still have some.
+              if (deps.markExhausted && isQuotaError(err))
+                deps.markExhausted(`${m.provider}:${m.id}`);
+              // A content filter refused this request only: the provider stays usable.
+              // Transient trouble: retry this provider soon. Key or model problems: much later.
+              else if (!err.contentFilter)
+                deps.coolProvider?.(m.provider, err.retryable ? 60_000 : 30 * 60_000);
+              // Fallback lists stay off a rate-limited model until it recovers, across sessions.
+              if (err.status === 429 && !isQuotaError(err) && sticksOnRateLimit(deps.strategy))
+                deps.markRateLimited?.(`${m.provider}:${m.id}`, RATE_LIMITED_FOR_MS);
+              deps.events.emit('provider.failover', {
+                provider: m.provider,
+                model: m.id,
+                error: err.message,
+                status: err.status,
+                purpose: deps.purpose ?? 'main',
+                estimatedInputTokens: lastEstimate,
+              });
+              skipped.push(`${m.provider}: ${err.message}`);
+            }
+          }
+          // Attempts where every provider was cooling down tried nothing: they don't reset it.
+          if (sawServerError) serverFailures++;
+          else if (triedAny) serverFailures = 0;
+          if (skipped.length && onlyBudget)
+            throw new BudgetStopSignal(
+              'max_usd',
+              `every provider in the chain is over its own cap (${skipped.join('; ')})`,
+            );
+          throw new ProviderError(
+            `no provider in the chain could take the call: ${skipped.join('; ')}`,
+            { retryable: true },
+          );
+        },
+        {
+          clock: deps.clock,
+          shouldStop: async () => {
+            const c = await deps.control();
+            return c === 'stop' || c === 'stop-now';
+          },
+          onRetry: (i) => {
+            callAttempts = Math.max(callAttempts, i.attempt + 1);
+            deps.events.emit('provider.retry', {
+              attempt: i.attempt,
+              delayMs: i.delayMs,
+              error: i.error,
+              outageMs: i.outageMs,
+              purpose: deps.purpose ?? 'main',
+              estimatedInputTokens: lastEstimate,
+              provider: attempted?.provider ?? 'unknown',
+              model: attempted?.id ?? 'unknown',
+            });
+          },
+          onOutage: (ms) => {
+            deps.events.emit('provider.outage', { outageMs: ms });
+            deps.retry?.onOutage?.(ms);
+          },
+          onRecovered: (ms, attempts) =>
+            deps.events.emit('provider.recovered', { outageMs: ms, attempts }),
+          ...(deps.retry?.baseDelayMs !== undefined ? { baseDelayMs: deps.retry.baseDelayMs } : {}),
+          ...(deps.retry?.maxDelayMs !== undefined ? { maxDelayMs: deps.retry.maxDelayMs } : {}),
+          ...(deps.retry?.giveUpAfterMs !== undefined
+            ? { giveUpAfterMs: deps.retry.giveUpAfterMs }
+            : {}),
+          ...(deps.signal ? { signal: deps.signal } : {}),
+        },
+      );
+    } catch (err) {
+      if (err instanceof StopRequested) return end('stop');
+      if (err instanceof ProvidersUnavailable) {
+        deps.events.emit('provider.give_up', { waitedMs: err.waitedMs, error: err.lastError });
+        return { ...end('providers_unavailable'), detail: err.lastError };
+      }
+      // Esc in chat: end the turn cleanly, keeping every completed step.
+      if (deps.signal?.aborted) return end('stop-now');
+      if (err instanceof PoisonedRequest) {
+        const finding: StuckFinding = { signal: 'poisoned_request', detail: err.message };
+        deps.events.emit('stuck.in_cycle', {
+          signal: finding.signal,
+          detail: finding.detail,
+          turn: turns,
+        });
+        return { ...end('stuck'), stuck: finding };
+      }
+      if (err instanceof BudgetStopSignal) {
+        deps.events.emit('budget.preflight_stop', {
+          stop: err.stop,
+          detail: err.detail,
+          turn: turns,
+        });
+        return end(err.stop);
+      }
+      throw err;
+    }
+    if (learned && deps.calibrationFile) {
+      const next = observeTokenRatio(
+        tokenRatios,
+        learned.model,
+        learned.raw,
+        totalInput(res.usage),
+      );
+      const ratio = next?.[learned.model];
+      if (next && ratio !== undefined) {
+        tokenRatios = next;
+        await saveTokenRatio(deps.calibrationFile, learned.model, ratio).catch(() => undefined);
+      }
+    }
+    const model = chosen ?? deps.models[0];
+    if (!model) throw new ProviderError('empty model chain', { retryable: false });
+    turns++;
+    deps.toolCtx.turn = turns;
+    const cost = costUsd(res.usage, model.price);
+    usd += cost;
+    for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] += res.usage[k];
+    cycleTokens += budgetTokens(res.usage);
+    const attributedTask = deps.taskId?.();
+    const attributedCycle = deps.cycle?.();
+    await deps.onUsage(res.usage, cost, res.model, model.provider, {
+      purpose: deps.purpose ?? 'main',
+      ...(attributedTask ? { taskId: attributedTask } : {}),
+      ...(attributedCycle !== undefined ? { cycle: attributedCycle } : {}),
+      turn: turns,
+      step: `c${String(attributedCycle ?? 0)}.t${String(turns)}`,
+      attempt: callAttempts,
+      promptTokens: lastEstimate,
+      previousPromptTokens: lastPreviousPrompt,
+    });
+    const input = totalInput(res.usage);
+    deps.events.emit('turn', {
+      turn: turns,
+      model: res.model,
+      provider: model.provider,
+      ms: deps.clock.now() - callStart,
+      stopReason: res.stopReason,
+      tokens: {
+        uncached: res.usage.uncached,
+        cacheWrite: res.usage.cacheWrite5m + res.usage.cacheWrite1h,
+        cacheRead: res.usage.cacheRead,
+        output: res.usage.output,
+      },
+      cacheReadShare: input ? res.usage.cacheRead / input : 0,
+      // Estimated input by segment, to see where the tokens go (W8 "measure first").
+      segments: { ...prefixTokens, ...messageSegments(messages) },
+      usd: cost,
+    });
+    const miss = cacheShortfall(turns, previousPromptTokens, res.usage.cacheRead);
+    if (miss) {
+      cacheMisses++;
+      deps.events.emit('cache.miss', miss);
+    }
+    previousPromptTokens = input;
+
+    messages.push({ role: 'assistant', content: res.content });
+    const text = res.content
+      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n')
+      .trim();
+    if (text) finalText = text;
+    else if (!finalText && res.reasoning) finalText = res.reasoning.trim();
+    const calls = res.content.filter(
+      (b): b is Extract<ContentBlock, { type: 'tool_use' }> => b.type === 'tool_use',
+    );
+    // What the model said or reasoned on its way to a tool call: shown as "thinking".
+    // A final answer (no tool call) is shown as the reply itself, so its reasoning isn't
+    // repeated after it.
+    const thought = calls.length ? text || res.reasoning?.trim() : undefined;
+    if (thought) deps.events.emit('agent.thinking', { text: thought.slice(0, 600) });
+    if (res.stopReason === 'refusal') return end('refusal');
+    for (const c of calls) if (c.name === todoTool.name) todos = todoItemsOf(c.input) ?? todos;
+    if (calls.length === 0) {
+      const late = deps.pendingInput?.() ?? [];
+      const open = todos.filter((i) => i.status !== 'done');
+      if (!forcedSummaryTurn && !late.length && open.length && !todoNudged) {
+        // Models often stop with the checklist half ticked; one reminder, then trust the answer.
+        todoNudged = true;
+        deps.events.emit('todo.nudge', { open: open.length });
+        messages.push({ role: 'user', content: [{ type: 'text', text: todoNudge(open) }] });
+        continue;
+      }
+      if (!late.length) return end('done');
+      // The person wrote while the model was finishing: answer that before ending the turn.
+      messages.push({ role: 'user', content: [{ type: 'text', text: steeringText(late) }] });
+      deps.events.emit('steer.applied', { count: late.length, turn: turns });
+      continue;
+    }
+
+    const finished = { now: false };
+    const branchState = { riskyToolFailed: false };
+    const runCallInner = async (call: (typeof calls)[number]): Promise<ContentBlock> => {
+      // Lazy mode: auto-load tool group if tool exists but isn't loaded
+      if (deps.loadedToolsState && !deps.loadedToolsState.toolToGroup.has(call.name)) {
+        // Tool not in any group (e.g., MCP tools) - allow it
+      } else if (deps.loadedToolsState) {
+        const loadedGroup = autoLoadToolGroup(deps.loadedToolsState, call.name);
+        if (loadedGroup) {
+          deps.events.emit('tool.autoload', { tool: call.name, group: loadedGroup });
+          // Return an error asking the model to retry
+          return {
+            type: 'tool_result',
+            toolUseId: call.id,
+            content: `Tool "${call.name}" was not loaded; loaded group "${loadedGroup}". Retry the call.`,
+            isError: true,
+          };
+        }
+      }
+
+      const tool = resolveTool(byName, call.name);
+      let content: string;
+      let isError: boolean;
+      let miss = false;
+      let savedTokens = 0;
+      toolSeq += 1;
+      const mutationTool = tool?.readOnly !== true;
+      if (mutationTool) {
+        // Any mutating tool invalidates the verification cache.
+        verificationCoalescer.invalidate();
+        lastMutationSeq = toolSeq;
+      }
+      const toolStart = deps.clock.now();
+      deps.events.emit('tool.start', {
+        tool: call.name,
+        // An invented name (print_tree) is narrated as the tool that actually runs (outline).
+        doing: narrateTool(
+          tool?.name ?? call.name,
+          typeof call.input === 'object' && call.input !== null
+            ? (call.input as Record<string, unknown>)
+            : {},
+        ),
+      });
+      if (!tool) {
+        content = `unknown tool ${call.name}; the tools are: ${[...byName.keys()].join(', ')}${byName.has('bash') ? ' (list files with bash, e.g. `ls -R src`)' : ' (you cannot run commands here; list files with search)'}`;
+        isError = true;
+      } else {
+        const prepare = (v: unknown) => (tool.normalize ? tool.normalize(v) : v);
+        let parsed = tool.schema.safeParse(prepare(call.input));
+        // Models often send a nested array or object as a JSON string ("milestones": "[{…}]").
+        // Decode before normalizing: a normalizer may reshape the string beyond recovery.
+        if (!parsed.success) {
+          const decoded = decodeJsonStrings(call.input);
+          if (decoded !== call.input) {
+            const again = tool.schema.safeParse(prepare(decoded));
+            if (again.success) parsed = again;
+          }
+        }
+        // Models name arguments their own way (line_start, file_path) and add extras (max_results).
+        if (!parsed.success) {
+          const lenient = lenientInput(tool.schema, call.input);
+          if (lenient !== undefined) {
+            const again = tool.schema.safeParse(prepare(lenient));
+            if (again.success) parsed = again;
+          }
+        }
+        if (!parsed.success) {
+          content = `invalid input for ${call.name}: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`;
+          isError = true;
+        } else {
+          // Phase 2 enforcement: never let a tool ask for more time than the run has left.
+          const timeoutKeys = [
+            'timeout',
+            'timeoutMs',
+            'timeout_ms',
+            'waitMs',
+            'wait_ms',
+            'duration',
+            'durationMs',
+            'maxMs',
+          ];
+          let refused = false;
+          let hint = '';
+          if (deps.deadlineMs) {
+            const remainingMs = Math.max(0, deps.deadlineMs - deps.clock.now());
+            for (const k of timeoutKeys) {
+              const v = (parsed.data as Record<string, unknown>)[k];
+              if (typeof v === 'number' && v > remainingMs) {
+                refused = true;
+                hint = `${Math.round(remainingMs / 1000)}s left, but ${k}=${v}ms; use a smaller timeout or split the work`;
+                break;
+              }
+            }
+            if (!refused && remainingMs < 60_000) {
+              refused = true;
+              hint = `only ${Math.round(remainingMs / 1000)}s left; finish, verify and report instead of starting more work`;
+            }
+          }
+          const systemOneBlock =
+            !refused && deps.systemOne
+              ? await deps.systemOne.beforeTool(tool.name, parsed.data, deps.toolCtx)
+              : undefined;
+          if (refused) {
+            content = `refused: ${hint}`;
+            isError = true;
+          } else if (systemOneBlock) {
+            content = systemOneBlock;
+            isError = true;
+          } else {
+            // --- Turn-efficiency short-circuits (neither runs the underlying tool) ---
+            let shortCircuit: string | undefined;
+            // Unchanged re-reads are handled by the read tool's own guard, which reports the
+            // tokens saved so the usage ledger records them as repeat_read savings.
+            // Redundant verification: the exact same read-only checker ran back-to-back with zero
+            // mutating tools since, so the tree is unchanged — short-circuit to "already green".
+            {
+              const cmd = (parsed.data as { command?: unknown }).command;
+              const isShell = tool.name === 'bash' || tool.name === 'shell' || tool.name === 'run';
+              if (
+                isShell &&
+                typeof cmd === 'string' &&
+                isRealVerification('bash', { command: cmd })
+              ) {
+                if (verificationCoalescer.decide(cmd, toolSeq, lastMutationSeq) === 'skip') {
+                  shortCircuit =
+                    '[harness:verification] this exact verification ran green on the current tree already (no changes since); proceeding without re-running.';
+                }
+              }
+            }
+            if (shortCircuit) {
+              content = shortCircuit;
+              isError = false;
+              miss = false;
+            } else {
+              const deadlineMs = deps.deadlineMs;
+              const reminder = deadlineMs
+                ? setInterval(() => {
+                    deps.events.emit('time.reminder', {
+                      tool: call.name,
+                      elapsed_s: Math.round((deps.clock.now() - toolStart) / 1000),
+                      remaining_s: Math.max(0, Math.round((deadlineMs - deps.clock.now()) / 1000)),
+                    });
+                  }, 60_000)
+                : undefined;
+              if (reminder) reminder.unref();
+              if (deps.kernel) {
+                await deps.kernel.beforeMutatingTool(call.name, parsed.data, messages.length);
+              }
+              // Step 3.7: arm a speculative checkpoint before a risky mutating tool runs,
+              // so a failed verification or stuck turn can roll the workspace back.
+              if (deps.rollback && RISKY_CHECKPOINT_TOOLS.has(tool.name)) {
+                await deps.rollback.armCheckpoint(turns, messages);
+              }
+              const out = await tool.run(parsed.data, deps.toolCtx);
+              if (reminder) clearInterval(reminder);
+              content = out.content;
+              isError = out.isError === true;
+              miss = out.miss === true;
+              savedTokens = out.savedTokens ?? 0;
+              if (out.final && !isError) finished.now = true;
+              if (isError && RISKY_CHECKPOINT_TOOLS.has(tool.name)) {
+                branchState.riskyToolFailed = true;
+              } else if (!isError && RISKY_CHECKPOINT_TOOLS.has(tool.name)) {
+                // Success: checkpoint served its purpose; don't let stale checkpoints accumulate.
+                deps.rollback?.disarmLatest();
+              }
+            }
+          }
+        }
+      }
+      const rawToolOutput = content;
+      if (deps.systemOne) content = await deps.systemOne.afterTool(call.name, content);
+      content = deps.toolCtx.redactor.text(content);
+      if (deps.deadlineMs && !isError) {
+        const toolMs = deps.clock.now() - toolStart;
+        const remainingMs = Math.max(0, deps.deadlineMs - deps.clock.now());
+        const fmt = (ms: number): string =>
+          ms >= 60_000 ? `${(ms / 60_000).toFixed(1)}m` : `${Math.round(ms / 1000)}s`;
+        content += `\n\n(${fmt(toolMs)}; ${fmt(remainingMs)} left)`;
+      }
+      deps.events.emit('tool.call', {
+        tool: call.name,
+        input: summarizeInput(call.input),
+        isError,
+        ...(miss ? { miss: true } : {}),
+        ...(savedTokens ? { savedTokens } : {}),
+        // Already redacted above. Enough to see why it failed without opening the transcript.
+        ...(isError ? { error: content.slice(0, 500) } : {}),
+        bytes: content.length,
+        ms: deps.clock.now() - toolStart,
+      });
+      if (deps.doomLoopRatchet) {
+        if (
+          [
+            'write_file',
+            'str_replace',
+            'multi_edit',
+            'replace_lines',
+            'apply_patch',
+            'patch',
+          ].includes(call.name) &&
+          !isError
+        ) {
+          const path = (call.input as { path?: unknown }).path;
+          if (typeof path === 'string') deps.doomLoopRatchet.recordFileModified(path);
+        }
+        if (isError) {
+          const path = (call.input as { path?: unknown }).path;
+          const contextKey = `${call.name}${typeof path === 'string' && path ? `::${path}` : ''}`;
+          const intervention = await deps.doomLoopRatchet.recordToolFailure(
+            call.name,
+            contextKey,
+            content,
+          );
+          if (intervention.action !== 'none' && intervention.message) {
+            ratchetInterventions.push(intervention.message);
+          }
+        } else {
+          deps.doomLoopRatchet.recordToolSuccess();
+          if (call.name === 'bash') {
+            const cmd = (call.input as { command?: unknown }).command;
+            if (typeof cmd === 'string') {
+              const intervention = await deps.doomLoopRatchet.recordVerificationResult(
+                cmd,
+                false,
+                content,
+              );
+              if (intervention.action !== 'none' && intervention.message) {
+                ratchetInterventions.push(intervention.message);
+              }
+            }
+          }
+        }
+        if (call.name === 'bash' && isError) {
+          const cmd = (call.input as { command?: unknown }).command;
+          if (typeof cmd === 'string') {
+            const intervention = await deps.doomLoopRatchet.recordVerificationResult(
+              cmd,
+              true,
+              content,
+            );
+            if (intervention.action !== 'none' && intervention.message) {
+              ratchetInterventions.push(intervention.message);
+            }
+          }
+        }
+      }
+      if (deps.kernel) {
+        const progress = toolStateProgress({
+          name: call.name,
+          readOnly: byName.get(call.name)?.readOnly,
+          isError,
+        });
+        const rolled = await deps.kernel.afterTool(
+          {
+            tool: call.name,
+            input: call.input,
+            isError,
+            content: rawToolOutput,
+            ...(progress ? { stateProgress: progress } : {}),
+          },
+          messages,
+        );
+        if (rolled?.constraint) {
+          messages = rolled.messages;
+          kernelConstraints.push(rolled.constraint);
+        }
+      }
+      return {
+        type: 'tool_result',
+        toolUseId: call.id,
+        content,
+        ...(isError ? { isError: true } : {}),
+      };
+    };
+    /**
+     * Every tool_use block must produce a tool_result at the same position in the
+     * next message, or the provider rejects the next call (400). A throw anywhere
+     * inside runCallInner (tool.run, a systemOne/kernel hook, the ratchet) used to
+     * escape through Promise.all and abort the turn with the assistant tool_use
+     * already pushed and no tool_result appended. Convert any failure into an error
+     * envelope instead; only StopRequested (a control-flow abort) propagates.
+     */
+    const runCall = async (call: (typeof calls)[number]): Promise<ContentBlock> => {
+      try {
+        return await runCallInner(call);
+      } catch (err) {
+        if (err instanceof StopRequested) throw err;
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          type: 'tool_result',
+          toolUseId: call.id,
+          content: `Error executing tool ${call.name}: ${message}`,
+          isError: true,
+        };
+      }
+    };
+    const results: ContentBlock[] = [];
+    const ratchetInterventions: string[] = [];
+    const kernelConstraints: string[] = [];
+    // A turn of only `task` calls fans out: read-only helpers can't conflict with each other.
+    // Otherwise runs of consecutive concurrency-safe calls (reads, searches) go out together;
+    // every other call runs alone, in order, so writes and commands never interleave.
+    const batches = calls.every((c) => c.name === 'task')
+      ? chunk(calls, deps.parallelTasks ?? 1)
+      : concurrentRuns(calls, (name) => resolveTool(byName, name)?.concurrent === true);
+    for (const batch of batches) results.push(...(await Promise.all(batch.map(runCall))));
+    if (calls.some((c) => resolveTool(byName, c.name)?.readOnly !== true)) changedSomething = true;
+    const lone = calls.length === 1 ? calls[0] : undefined;
+    if (!batchHinted && !changedSomething && lone && EXPLORE_TOOLS.has(lone.name)) {
+      batchHinted = true;
+      results.push({ type: 'text', text: BATCH_HINT });
+      deps.events.emit('loop.batch_hint', { turn: turns, tool: lone.name });
+    }
+    if (!bookkeepingHinted && !finished.now && calls.every((c) => BOOKKEEPING_TOOLS.has(c.name))) {
+      bookkeepingHinted = true;
+      results.push({ type: 'text', text: BOOKKEEPING_HINT });
+      deps.events.emit('loop.bookkeeping_hint', { turn: turns });
+    }
+    const steer = deps.pendingInput?.() ?? [];
+    if (steer.length) {
+      results.push({ type: 'text', text: steeringText(steer) });
+      deps.events.emit('steer.applied', { count: steer.length, turn: turns });
+    }
+    if (ratchetInterventions.length) {
+      for (const msg of ratchetInterventions) {
+        results.push({ type: 'text', text: msg });
+      }
+    }
+    if (kernelConstraints.length) {
+      for (const msg of kernelConstraints) {
+        results.push({ type: 'text', text: msg });
+      }
+    }
+    messages.push({ role: 'user', content: results });
+    // Weaker models keep calling tools after the job is done; don't pay for that.
+    if (finished.now) return end('done');
+
+    // Step 3.7: if a risky (checkpointed) tool errored this turn, roll the workspace back to the
+    // snapshot ref and inject a `<system_intervention type="branch_rollback">` so the model pivots.
+    if (deps.rollback && deps.rollback.hasActiveCheckpoint && branchState.riskyToolFailed) {
+      const rolled = await deps.rollback.executeRollback(messages, 'Risky tool failed');
+      if (rolled.rolledBack) continue;
+    }
+
+    // Step 4.4 & 4.5: Cascade Circuit Breaker tracking & escalation handoff
+    if (deps.circuitBreaker) {
+      const taskId = deps.kernelObjective ?? 'default-task';
+      const anyToolError = results.some((b) => b.type === 'tool_result' && b.isError === true);
+      if (anyToolError) {
+        const errorContent = results
+          .filter(
+            (b): b is Extract<ContentBlock, { type: 'tool_result' }> =>
+              b.type === 'tool_result' && b.isError === true,
+          )
+          .map((b) => b.content)
+          .join('\n');
+        deps.circuitBreaker.recordFailure(taskId, currentTier, errorContent);
+        const decision = deps.circuitBreaker.shouldEscalate(taskId, currentTier);
+        if (decision.escalate && decision.targetTier === 3) {
+          messages = buildEscalationHandoff(messages, decision);
+          deps.events.emit('router.escalation', {
+            turn: turns,
+            fromTier: currentTier,
+            toTier: 3,
+            reason: decision.reason ?? 'Escalated to Tier 3',
+          });
+        }
+      } else {
+        deps.circuitBreaker.recordSuccess(taskId, currentTier);
+      }
+    }
+
+    // Pair each call with its result, so the watch compares outcomes, not just call
+    // identity: re-reading a file that changed between reads is checking, not looping,
+    // and retrying an errored call is recovery, not looping.
+    const resultsById = new Map(
+      results
+        .filter(
+          (b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result',
+        )
+        .map((b) => [b.toolUseId, b]),
+    );
+    const callsWithResults = calls.map((c) => {
+      const r = resultsById.get(c.id);
+      return r
+        ? { name: c.name, input: c.input, result: r.content, isError: r.isError === true }
+        : { name: c.name, input: c.input };
+    });
+    if (deps.systemOne) {
+      const closing = await deps.systemOne.afterTurn(
+        calls.map((c) => ({
+          name: c.name,
+          input: c.input,
+          isError: resultsById.get(c.id)?.isError === true,
+          readOnly: resolveTool(byName, c.name)?.readOnly === true,
+        })),
+        finalText,
+        turns,
+      );
+      if (closing) {
+        finalText = closing;
+        messages.push({ role: 'assistant', content: [{ type: 'text', text: closing }] });
+        return end('done');
+      }
+    }
+    const finding = deps.watch?.afterTurn(turns, cycleTokens, callsWithResults);
+    if (finding) {
+      deps.events.emit('stuck.in_cycle', {
+        signal: finding.signal,
+        detail: finding.detail,
+        turn: turns,
+      });
+      if (deps.watchMode === 'nudge' && !nudged.has(finding.signal)) {
+        nudged.add(finding.signal);
+        messages.push({
+          role: 'user',
+          content: [{ type: 'text', text: stuckNudge(finding.detail) }],
+        });
+        continue;
+      }
+      if (deps.watchMode === 'nudge' && !forcedSummaryTurn) {
+        forcedSummaryTurn = true;
+        liveCtx = { ...liveCtx, tools: [] };
+        byName = new Map();
+        messages.push({
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `[harness] Action limit reached (${finding.detail}). You must stop calling tools now. Provide your complete findings, proposed plan, or direct response to the user based on what you have discovered so far.`,
+            },
+          ],
+        });
+        continue;
+      }
+      return { ...end('stuck'), stuck: finding };
+    }
+  }
+}
+
+/**
+ * @deprecated The kernel hint now rides in the turn's terminal directive (after the cached
+ * last message) so req.system stays byte-stable. Kept for callers outside the loop.
+ */
+export function withKernelHint(
+  base: readonly SystemBlock[],
+  hint: string | undefined,
+): SystemBlock[] {
+  return hint?.trim() ? [...base, { text: hint, volatile: true }] : [...base];
+}

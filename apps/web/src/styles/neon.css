@@ -1,0 +1,366 @@
+/* Neon Tree Visualization Styles */
+
+:root {
+  --neon-cyan: #00ffff;
+  --neon-blue: #0080ff;
+  --neon-yellow: #ffff00;
+  --neon-green: #00ff00;
+  --neon-red: #ff0040;
+  --neon-purple: #ff00ff;
+  --neon-orange: #ff8000;
+  --bg-dark: #0a0a0f;
+  --bg-darker: #050508;
+}
+
+/* Base neon glow effect */
+@keyframes neon-glow {
+  0%, 100% {
+    filter: drop-shadow(0 0 2px currentColor) 
+            drop-shadow(0 0 5px currentColor) 
+            drop-shadow(0 0 10px currentColor);
+  }
+  50% {
+    filter: drop-shadow(0 0 5px currentColor) 
+            drop-shadow(0 0 10px currentColor) 
+            drop-shadow(0 0 20px currentColor);
+  }
+}
+
+@keyframes neon-pulse {
+  0%, 100% {
+    opacity: 1;
+    filter: drop-shadow(0 0 3px currentColor) 
+            drop-shadow(0 0 6px currentColor);
+  }
+  50% {
+    opacity: 0.7;
+    filter: drop-shadow(0 0 6px currentColor) 
+            drop-shadow(0 0 12px currentColor);
+  }
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes flow {
+  0% {
+    stroke-dashoffset: 20;
+  }
+  100% {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* Node states */
+.neon-node {
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.neon-node-processing {
+  color: var(--neon-cyan);
+  animation: spin 2s linear infinite, neon-glow 1.5s ease-in-out infinite;
+}
+
+.neon-node-ready {
+  color: var(--neon-blue);
+  animation: neon-glow 2s ease-in-out infinite;
+}
+
+.neon-node-in-progress {
+  color: var(--neon-yellow);
+  animation: neon-pulse 1s ease-in-out infinite;
+}
+
+.neon-node-completed {
+  color: var(--neon-green);
+  filter: drop-shadow(0 0 3px var(--neon-green)) 
+          drop-shadow(0 0 6px var(--neon-green));
+}
+
+.neon-node-failed {
+  color: var(--neon-red);
+  filter: drop-shadow(0 0 3px var(--neon-red)) 
+          drop-shadow(0 0 6px var(--neon-red));
+}
+
+.neon-node-deliverable {
+  color: var(--neon-purple);
+  animation: neon-glow 2s ease-in-out infinite;
+}
+
+.neon-node:hover {
+  transform: scale(1.1);
+  filter: drop-shadow(0 0 5px currentColor) 
+          drop-shadow(0 0 15px currentColor) 
+          drop-shadow(0 0 25px currentColor) !important;
+}
+
+/* Connection lines */
+.neon-line {
+  stroke-width: 2;
+  fill: none;
+  stroke-dasharray: 5, 5;
+  transition: all 0.3s ease;
+}
+
+.neon-line-completed {
+  stroke: var(--neon-green);
+  filter: drop-shadow(0 0 2px var(--neon-green));
+}
+
+.neon-line-in-progress {
+  stroke: var(--neon-yellow);
+  filter: drop-shadow(0 0 2px var(--neon-yellow));
+  animation: flow 1s linear infinite;
+}
+
+.neon-line-blocked {
+  stroke: var(--neon-red);
+  filter: drop-shadow(0 0 2px var(--neon-red));
+}
+
+.neon-line-pending {
+  stroke: var(--neon-blue);
+  opacity: 0.5;
+}
+
+/* Input bar */
+.neon-input-bar {
+  background: rgba(10, 10, 15, 0.95);
+  border: 1px solid var(--neon-cyan);
+  box-shadow: 0 -4px 20px rgba(0, 255, 255, 0.2),
+              inset 0 0 20px rgba(0, 255, 255, 0.05);
+  backdrop-filter: blur(10px);
+}
+
+.neon-input {
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid var(--neon-blue);
+  color: var(--neon-cyan);
+  transition: all 0.3s ease;
+}
+
+.neon-input:focus {
+  outline: none;
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 10px rgba(0, 255, 255, 0.3),
+              inset 0 0 10px rgba(0, 255, 255, 0.1);
+}
+
+.neon-input::placeholder {
+  color: rgba(0, 255, 255, 0.4);
+}
+
+.neon-button {
+  background: linear-gradient(135deg, var(--neon-cyan), var(--neon-blue));
+  border: none;
+  color: var(--bg-dark);
+  font-weight: 600;
+  transition: all 0.3s ease;
+  box-shadow: 0 0 10px rgba(0, 255, 255, 0.5);
+}
+
+.neon-button:hover {
+  box-shadow: 0 0 20px rgba(0, 255, 255, 0.8);
+  transform: translateY(-2px);
+}
+
+.neon-button:active {
+  transform: translateY(0);
+}
+
+.neon-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* Slider */
+.neon-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(0, 128, 255, 0.2);
+  height: 6px;
+  border-radius: 3px;
+  outline: none;
+}
+
+.neon-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--neon-cyan);
+  cursor: pointer;
+  box-shadow: 0 0 10px var(--neon-cyan);
+}
+
+.neon-slider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--neon-cyan);
+  cursor: pointer;
+  border: none;
+  box-shadow: 0 0 10px var(--neon-cyan);
+}
+
+/* Tree container */
+.neon-tree-container {
+  background: radial-gradient(ellipse at center, #0f0f1a 0%, var(--bg-dark) 100%);
+  position: relative;
+  overflow: hidden;
+}
+
+.neon-tree-container::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: 
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 255, 255, 0.03) 2px,
+      rgba(0, 255, 255, 0.03) 4px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 255, 255, 0.03) 2px,
+      rgba(0, 255, 255, 0.03) 4px
+    );
+  pointer-events: none;
+}
+
+/* Node labels */
+.neon-label {
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  font-weight: 600;
+  text-shadow: 0 0 5px currentColor;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Zoom controls */
+.neon-zoom-controls {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 10;
+}
+
+.neon-zoom-button {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgba(0, 255, 255, 0.1);
+  border: 1px solid var(--neon-cyan);
+  color: var(--neon-cyan);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  backdrop-filter: blur(10px);
+}
+
+.neon-zoom-button:hover {
+  background: rgba(0, 255, 255, 0.2);
+  box-shadow: 0 0 15px rgba(0, 255, 255, 0.5);
+}
+
+/* Status indicator */
+.neon-status {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  padding: 10px 20px;
+  background: rgba(0, 0, 0, 0.7);
+  border: 1px solid var(--neon-cyan);
+  border-radius: 20px;
+  color: var(--neon-cyan);
+  font-family: 'Courier New', monospace;
+  font-size: 14px;
+  backdrop-filter: blur(10px);
+  box-shadow: 0 0 10px rgba(0, 255, 255, 0.3);
+}
+
+/* Tooltip */
+.neon-tooltip {
+  position: absolute;
+  background: rgba(0, 0, 0, 0.95);
+  border: 1px solid var(--neon-cyan);
+  border-radius: 8px;
+  padding: 12px;
+  color: var(--neon-cyan);
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  pointer-events: none;
+  z-index: 1000;
+  box-shadow: 0 0 20px rgba(0, 255, 255, 0.5);
+  max-width: 300px;
+}
+
+/* Deliverable icon */
+.neon-deliverable-icon {
+  animation: neon-pulse 2s ease-in-out infinite;
+}
+
+/* Loading spinner */
+.neon-spinner {
+  border: 3px solid rgba(0, 255, 255, 0.1);
+  border-top: 3px solid var(--neon-cyan);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+/* Progress bar */
+.neon-progress-bar {
+  background: rgba(0, 128, 255, 0.2);
+  border-radius: 10px;
+  overflow: hidden;
+  position: relative;
+}
+
+.neon-progress-fill {
+  background: linear-gradient(90deg, var(--neon-cyan), var(--neon-blue));
+  height: 100%;
+  transition: width 0.5s ease;
+  box-shadow: 0 0 10px var(--neon-cyan);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .neon-label {
+    font-size: 10px;
+  }
+  
+  .neon-zoom-button {
+    width: 35px;
+    height: 35px;
+  }
+  
+  .neon-status {
+    font-size: 12px;
+    padding: 8px 16px;
+  }
+}
+
+/* Made with Bob */

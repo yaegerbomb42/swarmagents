@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none" role="img" aria-label="SwarmAgents">
+  <defs>
+    <linearGradient id="bg" x1="20" y1="8" x2="110" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#141416"/>
+      <stop offset="1" stop-color="#09090b"/>
+    </linearGradient>
+    <linearGradient id="sStroke" x1="36" y1="28" x2="92" y2="100" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#e0f2fe"/>
+      <stop offset="0.55" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="42%" r="55%">
+      <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#60a5fa" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <rect width="128" height="128" rx="28" fill="url(#glow)"/>
+  <rect x="1" y="1" width="126" height="126" rx="27" stroke="#ffffff" stroke-opacity="0.1"/>
+  <!-- Soft swarm nodes -->
+  <circle cx="44" cy="38" r="3.2" fill="#93c5fd" fill-opacity="0.9"/>
+  <circle cx="58" cy="32" r="2.2" fill="#7dd3fc" fill-opacity="0.7"/>
+  <circle cx="72" cy="40" r="2.6" fill="#e0f2fe" fill-opacity="0.85"/>
+  <circle cx="84" cy="54" r="2.4" fill="#93c5fd" fill-opacity="0.75"/>
+  <circle cx="46" cy="72" r="2.3" fill="#38bdf8" fill-opacity="0.8"/>
+  <circle cx="62" cy="88" r="3" fill="#e0f2fe" fill-opacity="0.9"/>
+  <circle cx="78" cy="82" r="2.2" fill="#60a5fa" fill-opacity="0.85"/>
+  <circle cx="54" cy="58" r="2" fill="#d4d4d8" fill-opacity="0.6"/>
+  <!-- S path -->
+  <path
+    d="M82 42c0-9.5-8.2-16-19.5-16-12.8 0-21 6.8-21 15.2 0 7.6 5.6 12.2 18.8 15.2l6.2 1.4c9.6 2.2 14 5.6 14 12.2 0 8.4-8.4 14.8-21.6 14.8-13.6 0-22.4-6.6-23.2-16.4"
+    stroke="url(#sStroke)"
+    stroke-width="7.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

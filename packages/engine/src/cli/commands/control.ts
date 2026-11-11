@@ -1,0 +1,184 @@
+import pc from 'picocolors';
+import type { ConfigInput, OmnexxConfig } from '../../config/schema.js';
+import { loadConfig } from '../../config/load.js';
+import { readTextOr } from '../../core/atomic.js';
+import { pidAlive, readLock } from '../../core/lock.js';
+import { listRunIds, RunStore, TERMINAL } from '../../core/run-store.js';
+import { resolvePaths, worktreesDir, type OmnexxPaths } from '../../core/paths.js';
+import { killPid, killRunChildren } from '../../core/process-registry.js';
+import { listWorktrees, removeWorktreeByPath } from '../../git/worktree.js';
+import { supervise, type SuperviseOptions } from '../../core/supervisor.js';
+import { selfEntry, spawnDetached } from '../../daemon/detach.js';
+import { resumeAll } from '../../daemon/resume-all.js';
+import { UsageError } from '../../errors.js';
+import { EXIT } from '../exit-codes.js';
+import { confirm, println, type CliIO } from '../io.js';
+import { resolveRunDeps } from '../run-deps.js';
+
+/** Explicit run id, or the most recent run. */
+export async function pickRun(paths: OmnexxPaths, runId: string | undefined): Promise<RunStore> {
+  const ids = await listRunIds(paths);
+  const id = runId ?? ids.at(-1);
+  if (!id) throw new UsageError('no runs yet', 'start one with `omnexx run "<goal>"`');
+  if (!ids.includes(id)) throw new UsageError(`no run ${id}`, '`omnexx runs` lists them');
+  return new RunStore(paths, id);
+}
+
+export async function supervisorAlive(store: RunStore): Promise<boolean> {
+  const lock = await readLock(store.dir);
+  return lock !== undefined && pidAlive(lock.pid);
+}
+
+/** Foreground supervisor with signal handling: SIGTERM = graceful stop; SIGINT = pause, twice = stop. */
+/** The run's command-line overrides, kept so every supervisor start (detach, resume) applies them. */
+export const RUN_FLAGS_FILE = 'flags.json';
+
+export async function superviseForeground(
+  io: CliIO,
+  runId: string,
+  opts: SuperviseOptions = io.supervise ?? {},
+  /** Runs before the outcome is printed (the live feed flushes and clears its footer). */
+  beforeReport?: () => Promise<void>,
+): Promise<number> {
+  const paths = resolvePaths(io.env);
+  const store = new RunStore(paths, runId);
+  const state = await store.readState();
+  // Flags given to `omnexx run` (budget, gates, models…) outrank omnexx.toml for the whole run.
+  const flags = JSON.parse(await readTextOr(store.file(RUN_FLAGS_FILE), '{}')) as ConfigInput;
+  const { deps } = await resolveRunDeps(io, state.repoRoot, flags, io.hooks);
+  // Hot-reload at every cycle boundary: the mode (and any config edit) applies without a restart.
+  const reloadConfig = async (): Promise<OmnexxConfig> =>
+    (await loadConfig({ cwd: state.repoRoot, env: io.env, flags })).config;
+  const superviseOpts: SuperviseOptions = { ...opts, reloadConfig };
+  let interrupts = 0;
+  const onTerm = (): void => {
+    void store.writeControl({ request: 'stop', at: Date.now() });
+  };
+  const onInt = (): void => {
+    interrupts++;
+    void store.writeControl({ request: interrupts === 1 ? 'pause' : 'stop', at: Date.now() });
+    println(
+      io.stderr,
+      interrupts === 1
+        ? 'pausing at the next turn; Ctrl-C again to stop, `omnexx resume` to continue'
+        : 'stopping at the next turn',
+    );
+  };
+  process.on('SIGTERM', onTerm);
+  process.on('SIGINT', onInt);
+  try {
+    const out = await supervise(deps, runId, superviseOpts);
+    await beforeReport?.();
+    println(io.stdout, `${pc.bold(out.status)}: ${out.reason}`);
+    println(io.stdout, `Report: ${store.file('REPORT.md')}`);
+    return out.exitCode;
+  } finally {
+    process.off('SIGTERM', onTerm);
+    process.off('SIGINT', onInt);
+  }
+}
+
+export async function requestControl(
+  io: CliIO,
+  runId: string | undefined,
+  request: 'pause' | 'stop' | 'stop-now',
+): Promise<number> {
+  const store = await pickRun(resolvePaths(io.env), runId);
+  await store.writeControl({ request, at: Date.now() });
+  const alive = await supervisorAlive(store);
+  println(
+    io.stdout,
+    `${request} requested for ${store.runId}${alive ? '' : ' (no supervisor is running; it takes effect when the run resumes)'}`,
+  );
+  // A stop with nobody to hear it still has to clean up: kill what the dead supervisor left.
+  if (!alive && (request === 'stop' || request === 'stop-now')) {
+    const killed = await killRunChildren(resolvePaths(io.env), store.runId);
+    if (killed.killed > 0)
+      println(io.stdout, `killed ${killed.killed} child process(es) the run had left behind`);
+  }
+  return EXIT.ok;
+}
+
+/** `stop --all`: terminate every live supervisor and every registered child/server. */
+export async function stopAllCommand(io: CliIO, opts: { yes?: boolean } = {}): Promise<number> {
+  const paths = resolvePaths(io.env);
+  const ids = await listRunIds(paths);
+  let stopped = 0;
+  let killedChildren = 0;
+  for (const id of ids) {
+    const store = new RunStore(paths, id);
+    const lock = await readLock(store.dir);
+    if (lock && lock.pid !== process.pid && pidAlive(lock.pid)) {
+      // SIGTERM first (a supervisor stops gracefully at the next turn), SIGKILL after 5s.
+      await killPid(lock.pid, { graceMs: 5_000 });
+      println(io.stdout, `stopped supervisor for ${id} (pid ${lock.pid})`);
+      stopped++;
+    }
+    const killed = await killRunChildren(paths, id);
+    killedChildren += killed.killed;
+  }
+  if (killedChildren > 0)
+    println(io.stdout, `killed ${killedChildren} registered child process(es)`);
+
+  // Stale worktrees (>24h) are offered, never taken silently.
+  const stale = (await listWorktrees(worktreesDir(paths))).filter(
+    (w) => Date.now() - w.mtimeMs > 24 * 3_600_000,
+  );
+  if (stale.length > 0) {
+    let remove = opts.yes === true;
+    if (!remove && !io.isTTY) {
+      println(
+        io.stdout,
+        `${stale.length} worktree(s) older than 24h left in place (not a terminal; re-run with --yes to remove them)`,
+      );
+    } else if (!remove) {
+      for (const w of stale) println(io.stdout, `  stale worktree: ${w.path}`);
+      remove = await confirm(io, `Remove these ${stale.length} stale worktree(s)?`);
+    }
+    if (remove) {
+      let removed = 0;
+      for (const w of stale) {
+        if (await removeWorktreeByPath(w.path)) removed++;
+        else println(io.stdout, `could not remove ${w.path}`);
+      }
+      println(io.stdout, `removed ${removed} of ${stale.length} stale worktree(s)`);
+    } else if (io.isTTY) {
+      println(io.stdout, 'stale worktrees left in place');
+    }
+  }
+  println(io.stdout, `stop --all: ${stopped} supervisor(s) stopped`);
+  return EXIT.ok;
+}
+
+/** Clear a pause; if no supervisor is alive, start one detached (crash, budget raised, user resumed). */
+export async function resumeRun(io: CliIO, runId: string | undefined): Promise<number> {
+  const store = await pickRun(resolvePaths(io.env), runId);
+  const state = await store.readState();
+  await store.writeControl({ request: 'resume', at: Date.now() });
+  if (await supervisorAlive(store)) {
+    println(io.stdout, `resumed ${store.runId}`);
+    return EXIT.ok;
+  }
+  if (state.status === 'finished')
+    throw new UsageError(`${store.runId} already finished`, 'start a new run with `omnexx run`');
+  const pid = spawnDetached(
+    io.entry ?? selfEntry(),
+    ['supervise', store.runId],
+    store.file('supervisor.log'),
+    io.env,
+  );
+  println(
+    io.stdout,
+    `started a supervisor for ${store.runId} (pid ${pid}); follow it with \`omnexx logs -f ${store.runId}\``,
+  );
+  return EXIT.ok;
+}
+
+export async function resumeAllCommand(io: CliIO): Promise<number> {
+  return resumeAll(resolvePaths(io.env), io.entry ?? selfEntry(), io.env, (l) => {
+    println(io.stdout, l);
+  });
+}
+
+export const isTerminal = (status: string): boolean =>
+  (TERMINAL as readonly string[]).includes(status);

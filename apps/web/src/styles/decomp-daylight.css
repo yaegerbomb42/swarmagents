@@ -1,0 +1,3 @@
+/* Deprecated: the console is dark-only (design audit P0-2).
+   The daylight `!important` remap theme was removed. This stub remains only
+   because some pages still import it; delete once those imports are gone. */

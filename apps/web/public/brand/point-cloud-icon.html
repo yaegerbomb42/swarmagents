@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#02020a">
+<title>swarmagents.codes — 3D Particle Swarm</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root{ --cyan:#00ffff; --mag:#ff00ff; --bg:#02020a; --hud-text:#c9f6ff; }
+*{ margin:0; padding:0; box-sizing:border-box; }
+html,body{ width:100%; height:100%; overflow:hidden; background:var(--bg); }
+body{ font-family:'Rajdhani','Segoe UI',system-ui,sans-serif; color:var(--hud-text); -webkit-user-select:none; user-select:none; }
+#scene{ position:fixed; inset:0; touch-action:none; }
+#scene canvas{ display:block; }
+body::after{ content:''; position:fixed; inset:0; pointer-events:none; z-index:5;
+  background:radial-gradient(ellipse at center, transparent 52%, rgba(0,0,12,.62) 100%); }
+.scanlines{ position:fixed; inset:0; pointer-events:none; z-index:6; opacity:.5;
+  background:repeating-linear-gradient(0deg, rgba(140,255,255,.022) 0 1px, transparent 1px 3px); }
+.hud{
+  position:fixed; top:20px; left:20px; z-index:10; min-width:258px; max-width:300px; padding:18px 20px 14px;
+  background:linear-gradient(160deg, rgba(4,14,28,.85), rgba(12,4,26,.78));
+  border:1px solid rgba(0,255,255,.35);
+  box-shadow:0 0 26px rgba(0,255,255,.10), inset 0 0 22px rgba(0,255,255,.05);
+  backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+  clip-path:polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 18px 100%, 0 calc(100% - 18px));
+}
+.hud::before{ content:''; position:absolute; top:0; left:0; width:46%; height:2px;
+  background:linear-gradient(90deg, var(--cyan), transparent); }
+.hud::after{ content:''; position:absolute; bottom:0; right:0; width:26%; height:2px;
+  background:linear-gradient(270deg, var(--mag), transparent); }
+.hud__title{ font-family:'Orbitron',monospace; font-weight:900; font-size:17px; letter-spacing:.14em;
+  color:#eaffff; text-shadow:0 0 14px rgba(0,255,255,.85); }
+.hud__title em{ font-style:normal; color:var(--mag); text-shadow:0 0 14px rgba(255,0,255,.85); }
+.hud__sub{ font-size:10px; font-weight:600; letter-spacing:.32em; margin:3px 0 14px; color:rgba(160,240,255,.55); }
+.ctrl{ margin:13px 0; }
+.ctrl-row{ display:flex; justify-content:space-between; align-items:baseline;
+  font-size:11px; font-weight:600; letter-spacing:.18em; color:#9fefff; margin-bottom:7px; }
+#intensity-val{ color:var(--mag); font-weight:700; font-family:'Orbitron',monospace; font-size:12px; }
+.chk{ display:flex; align-items:center; gap:11px; cursor:pointer; font-size:11px; font-weight:600; letter-spacing:.18em; color:#9fefff; }
+.chk input{ position:absolute; opacity:0; width:1px; height:1px; }
+.chk .box{ width:15px; height:15px; flex:0 0 auto; position:relative; border:1px solid rgba(0,255,255,.7); background:rgba(0,255,255,.05); }
+.chk input:checked + .box{ background:rgba(0,255,255,.9); box-shadow:0 0 12px rgba(0,255,255,.9); }
+.chk input:checked + .box::after{ content:''; position:absolute; inset:3px; background:#02121a; }
+input[type=range]{ -webkit-appearance:none; appearance:none; width:100%; height:3px; cursor:pointer;
+  background:linear-gradient(90deg, var(--cyan), var(--mag)); outline:none; }
+input[type=range]::-webkit-slider-thumb{ -webkit-appearance:none; width:14px; height:14px; border-radius:0;
+  background:#04121c; border:2px solid var(--cyan); transform:rotate(45deg); box-shadow:0 0 12px rgba(0,255,255,.9); }
+.btn{ display:block; width:100%; margin-top:6px; padding:10px; background:transparent; border:1px solid rgba(255,0,255,.55);
+  color:#ffb3ff; font-family:'Orbitron',monospace; font-size:11px; font-weight:700; letter-spacing:.22em; cursor:pointer;
+  clip-path:polygon(9px 0, 100% 0, 100% calc(100% - 9px), calc(100% - 9px) 100%, 0 100%, 0 9px); }
+.btn:hover{ background:rgba(255,0,255,.15); box-shadow:0 0 18px rgba(255,0,255,.35); color:#fff; }
+.hud__stats{ display:flex; align-items:baseline; gap:7px; margin-top:14px; padding-top:11px;
+  border-top:1px solid rgba(0,255,255,.18); font-size:10px; font-weight:600; letter-spacing:.2em; color:rgba(160,240,255,.6); }
+.hud__stats b{ color:#5fffff; font-family:'Orbitron',monospace; font-weight:700; font-size:12px; }
+.hud__stats .sep{ color:rgba(255,0,255,.7); }
+.hud__hint{ margin-top:7px; font-size:9px; font-weight:600; letter-spacing:.22em; color:rgba(140,220,255,.38); }
+#error-overlay{ position:fixed; inset:0; z-index:100; display:flex; align-items:center; justify-content:center;
+  background:rgba(2,2,10,.95); padding:24px; }
+#error-overlay[hidden]{ display:none; }
+#error-overlay .panel{ max-width:660px; width:100%; padding:26px 28px; border:1px solid rgba(255,60,120,.55);
+  background:#0c020a; box-shadow:0 0 30px rgba(255,0,90,.25); color:#ff9db8; }
+#error-overlay h2{ font-family:'Orbitron',monospace; letter-spacing:.2em; font-size:16px; color:#ff5588; }
+#error-overlay pre{ margin-top:12px; max-height:40vh; overflow:auto; white-space:pre-wrap; font-size:12px; color:#ffc2d0; opacity:.85; }
+body.embed-mode .hud, body.embed-mode .scanlines, body.embed-mode #error-overlay { display:none !important; }
+body.embed-mode::after { display:none !important; }
+@media (max-width:560px){ .hud{ transform:scale(.85); transform-origin:top left; top:12px; left:12px; } }
+</style>
+</head>
+<body>
+<div id="scene"></div>
+<div class="scanlines"></div>
+<header class="hud" id="hud">
+  <h1 class="hud__title">SWARMAGENTS<em>.CODES</em></h1>
+  <p class="hud__sub">REAL-TIME PARTICLE TYPOGRAPHY</p>
+  <label class="chk ctrl" for="chk-rotate">
+    <input type="checkbox" id="chk-rotate" checked>
+    <span class="box" aria-hidden="true"></span>
+    AUTO-ORBIT (TEXT FACES YOU)
+  </label>
+  <div class="ctrl">
+    <div class="ctrl-row"><label for="rng-intensity">SWARM INTENSITY</label><span id="intensity-val">1.00</span></div>
+    <input type="range" id="rng-intensity" min="0" max="2" step="0.01" value="1">
+  </div>
+  <button class="btn" id="btn-reset" type="button">↻&nbsp; RESET CAMERA</button>
+  <p class="hud__stats"><b id="stat-points">–</b> PTS <span class="sep">//</span> <b id="stat-fps">–</b> FPS</p>
+  <p class="hud__hint">DRAG ORBIT · SCROLL ZOOM · R RESET</p>
+</header>
+<div id="error-overlay" hidden>
+  <div class="panel"><h2>// RENDER FAULT</h2><p>The particle engine could not start.</p><pre id="error-detail"></pre></div>
+</div>
+
+<script src="https://unpkg.com/three@0.147.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.147.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+'use strict';
+if (new URLSearchParams(location.search).get('hud') === '0') {
+  document.body.classList.add('embed-mode');
+}
+
+const CONFIG = {
+  TEXT: 'swarmagents.codes',
+  NUM_TEXT_POINTS: 11000,
+  NUM_SWARM: 2200,
+  TEXT_WORLD_WIDTH: 96,
+  TEXT_DEPTH: 1.15,
+  FONT_PX: 300,
+  SAMPLE_STRIDES: [3, 2, 1],
+  BG_COLOR: 0x02020a,
+  FOG_DENSITY: 0.0038,
+  CAM_FOV: 60,
+  CAM_NEAR: 0.1,
+  CAM_FAR: 800,
+  MAX_PIXEL_RATIO: 2,
+  ROT_SPEED: 0.22,
+  FLOAT_AMP: 0.55,
+  FLOAT_SPEED: 0.35,
+  DEFAULT_INTENSITY: 1.0,
+  SWARM: {
+    SPRING: 0.9, DAMP: 1.7, WANDER: 3.1, SPAWN_JITTER: 4,
+    BOUNDS: { x: 68, y: 17, z: 15 }
+  }
+};
+
+function pickTextColor(out, i3) {
+  const r = Math.random();
+  if (r < 0.06)      { out[i3]=0.85; out[i3+1]=1.0;  out[i3+2]=1.0; }
+  else if (r < 0.55) { out[i3]=0.0;  out[i3+1]=1.0;  out[i3+2]=1.0; }
+  else if (r < 0.80) { out[i3]=0.2;  out[i3+1]=1.0;  out[i3+2]=0.95; }
+  else               { out[i3]=0.0;  out[i3+1]=0.75; out[i3+2]=1.0; }
+}
+function pickSwarmColor(out, i3) {
+  const r = Math.random();
+  if (r < 0.32)      { out[i3]=1.0;  out[i3+1]=0.0;  out[i3+2]=1.0; }
+  else if (r < 0.60) { out[i3]=0.8;  out[i3+1]=0.0;  out[i3+2]=1.0; }
+  else if (r < 0.78) { out[i3]=0.62; out[i3+1]=0.22; out[i3+2]=1.0; }
+  else if (r < 0.90) { out[i3]=1.0;  out[i3+1]=0.24; out[i3+2]=0.75; }
+  else               { out[i3]=0.0;  out[i3+1]=1.0;  out[i3+2]=1.0; }
+}
+
+function createGlowTexture() {
+  const S = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = S;
+  const g = canvas.getContext('2d');
+  const grad = g.createRadialGradient(S/2, S/2, 0, S/2, S/2, S/2);
+  grad.addColorStop(0.00, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.22, 'rgba(255,255,255,0.9)');
+  grad.addColorStop(0.50, 'rgba(255,255,255,0.30)');
+  grad.addColorStop(1.00, 'rgba(255,255,255,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, S, S);
+  return new THREE.CanvasTexture(canvas);
+}
+
+function sampleTextPoints(text) {
+  const target = CONFIG.NUM_TEXT_POINTS;
+  const fontOf = px => `900 ${px}px "Arial Black","Helvetica Neue",Helvetica,Arial,sans-serif`;
+  const canvas = document.createElement('canvas');
+  let ctx = canvas.getContext('2d', { willReadFrequently: true });
+  let px = CONFIG.FONT_PX, w = 0, h = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    ctx.font = fontOf(px);
+    const m = ctx.measureText(text);
+    w = Math.ceil(m.width + px * 0.7);
+    h = Math.ceil(px * 1.32);
+    if (w <= 3800 || attempt === 2) break;
+    px = Math.floor(px * (3800 / w));
+  }
+  canvas.width = w; canvas.height = h;
+  ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.font = fontOf(px);
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, w / 2, h / 2 + px * 0.03);
+  const data = ctx.getImageData(0, 0, w, h).data;
+  let cand = null, count = 0;
+  for (const stride of CONFIG.SAMPLE_STRIDES) {
+    const cap = Math.ceil(w / stride) * Math.ceil(h / stride);
+    if (!cand || cand.length < cap) cand = new Int32Array(cap * 2);
+    count = 0;
+    for (let y = 0; y < h; y += stride) {
+      const row = y * w;
+      for (let x = 0; x < w; x += stride) {
+        if (data[(row + x) * 4 + 3] > 127) {
+          cand[count * 2] = x; cand[count * 2 + 1] = y; count++;
+        }
+      }
+    }
+    if (count >= target) break;
+  }
+  if (count < 64) throw new Error('Text sampling failed — only ' + count + ' glyph pixels.');
+  const positions = new Float32Array(target * 3);
+  const scale = CONFIG.TEXT_WORLD_WIDTH / w;
+  const jitter = scale * 0.45;
+  const pickCount = Math.min(target, count);
+  for (let i = 0; i < pickCount; i++) {
+    const p = Math.min(count - 1, ((i + Math.random()) / pickCount * count) | 0);
+    const gx = cand[p * 2], gy = cand[p * 2 + 1];
+    positions[i * 3]     = (gx - w / 2) * scale + (Math.random() - 0.5) * jitter;
+    positions[i * 3 + 1] = (h / 2 - gy) * scale + (Math.random() - 0.5) * jitter;
+    positions[i * 3 + 2] = (Math.random() - 0.5) * 2 * CONFIG.TEXT_DEPTH;
+  }
+  for (let i = pickCount; i < target; i++) {
+    const src = (Math.random() * pickCount) | 0;
+    positions[i * 3]     = positions[src * 3]     + (Math.random() - 0.5) * scale;
+    positions[i * 3 + 1] = positions[src * 3 + 1] + (Math.random() - 0.5) * scale;
+    positions[i * 3 + 2] = positions[src * 3 + 2];
+  }
+  return { positions, worldHeight: h * scale, candidates: count };
+}
+
+class SwarmParticle {
+  constructor(offset, hx, hy, hz) {
+    this.o = offset; this.hx = hx; this.hy = hy; this.hz = hz;
+    this.vx = (Math.random() - 0.5) * 2;
+    this.vy = (Math.random() - 0.5) * 2;
+    this.vz = (Math.random() - 0.5) * 2;
+    this.phase = Math.random() * Math.PI * 2;
+    this.freq = 0.5 + Math.random() * 1.2;
+    this.wob = 0.6 + Math.random() * 0.9;
+  }
+  update(pos, t, dt, intensity, S) {
+    const o = this.o;
+    const x = pos[o], y = pos[o + 1], z = pos[o + 2];
+    const wa = S.WANDER * intensity * this.wob;
+    const ax = (this.hx - x) * S.SPRING + Math.sin(t * this.freq + this.phase) * wa;
+    const ay = (this.hy - y) * S.SPRING + Math.cos(t * this.freq * 0.9 + this.phase * 1.7) * wa * 0.8;
+    const az = (this.hz - z) * S.SPRING + Math.sin(t * this.freq * 1.27 + this.phase * 2.3) * wa * 0.9;
+    const damp = Math.exp(-S.DAMP * dt);
+    let vx = (this.vx + ax * dt) * damp;
+    let vy = (this.vy + ay * dt) * damp;
+    let vz = (this.vz + az * dt) * damp;
+    const vmax = 6 + 16 * intensity;
+    const v2 = vx * vx + vy * vy + vz * vz;
+    if (v2 > vmax * vmax) {
+      const f = vmax / Math.sqrt(v2); vx *= f; vy *= f; vz *= f;
+    }
+    this.vx = vx; this.vy = vy; this.vz = vz;
+    pos[o] = x + vx * dt; pos[o + 1] = y + vy * dt; pos[o + 2] = z + vz * dt;
+  }
+}
+
+function buildPointCloud(text) {
+  const total = CONFIG.NUM_TEXT_POINTS + CONFIG.NUM_SWARM;
+  const positions = new Float32Array(total * 3);
+  const colors = new Float32Array(total * 3);
+  const sizes = new Float32Array(total);
+  const sample = sampleTextPoints(text);
+  positions.set(sample.positions, 0);
+  for (let i = 0; i < CONFIG.NUM_TEXT_POINTS; i++) {
+    pickTextColor(colors, i * 3);
+    sizes[i] = 0.26 + Math.pow(Math.random(), 1.8) * 0.34;
+  }
+  const B = CONFIG.SWARM.BOUNDS;
+  const particles = new Array(CONFIG.NUM_SWARM);
+  for (let i = 0; i < CONFIG.NUM_SWARM; i++) {
+    const idx = CONFIG.NUM_TEXT_POINTS + i;
+    const i3 = idx * 3;
+    const hx = (Math.random() * 2 - 1) * B.x;
+    const hy = (Math.random() * 2 - 1) * B.y;
+    const hz = (Math.random() * 2 - 1) * B.z;
+    positions[i3] = hx + (Math.random() - 0.5) * CONFIG.SWARM.SPAWN_JITTER;
+    positions[i3 + 1] = hy + (Math.random() - 0.5) * CONFIG.SWARM.SPAWN_JITTER;
+    positions[i3 + 2] = hz + (Math.random() - 0.5) * CONFIG.SWARM.SPAWN_JITTER;
+    pickSwarmColor(colors, i3);
+    sizes[idx] = 0.45 + Math.random() * 0.75;
+    particles[i] = new SwarmParticle(i3, hx, hy, hz);
+  }
+  const geometry = new THREE.BufferGeometry();
+  const posAttr = new THREE.BufferAttribute(positions, 3);
+  posAttr.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute('position', posAttr);
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+  const material = new THREE.PointsMaterial({
+    size: 1, map: createGlowTexture(), vertexColors: true,
+    blending: THREE.AdditiveBlending, transparent: true,
+    depthWrite: false, sizeAttenuation: true, opacity: 0.95
+  });
+  material.onBeforeCompile = (shader) => {
+    let vs = shader.vertexShader;
+    if (vs.includes('uniform float size;')) vs = vs.replace('uniform float size;', 'attribute float aSize;');
+    if (vs.includes('gl_PointSize = size;')) vs = vs.replace('gl_PointSize = size;', 'gl_PointSize = aSize;');
+    shader.vertexShader = vs;
+  };
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  return { points, posAttr, particles, material, worldHeight: sample.worldHeight };
+}
+
+function startApp() {
+  const params = new URLSearchParams(location.search);
+  const text = params.get('text') || CONFIG.TEXT;
+  if (params.get('n')) {
+    const n = Math.min(18000, Math.max(1000, parseInt(params.get('n'), 10) || CONFIG.NUM_TEXT_POINTS));
+    CONFIG.NUM_TEXT_POINTS = Math.floor(n * 0.83);
+    CONFIG.NUM_SWARM = n - CONFIG.NUM_TEXT_POINTS;
+  }
+
+  const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.MAX_PIXEL_RATIO));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(CONFIG.BG_COLOR, 1);
+  document.getElementById('scene').appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(CONFIG.BG_COLOR);
+  scene.fog = new THREE.FogExp2(CONFIG.BG_COLOR, CONFIG.FOG_DENSITY);
+
+  const camera = new THREE.PerspectiveCamera(CONFIG.CAM_FOV, window.innerWidth / window.innerHeight, CONFIG.CAM_NEAR, CONFIG.CAM_FAR);
+
+  const group = new THREE.Group();
+  const cloud = buildPointCloud(text);
+  group.add(cloud.points);
+  scene.add(group);
+
+  const posAttr = cloud.posAttr;
+  const particles = cloud.particles;
+  const material = cloud.material;
+  const posArray = posAttr.array;
+  const SWARM_BYTE_START = CONFIG.NUM_TEXT_POINTS * 3;
+  const supportsUpdateRange = !!posAttr.updateRange;
+
+  const camHomeTarget = new THREE.Vector3(0, 0, 0);
+  const camHomePos = new THREE.Vector3();
+  function computeCameraHome() {
+    const halfW = (CONFIG.TEXT_WORLD_WIDTH * 1.06) / 2;
+    const halfH = Math.max(cloud.worldHeight, 8) * 1.9 / 2;
+    const vFov = (CONFIG.CAM_FOV * Math.PI) / 180;
+    const distV = halfH / Math.tan(vFov / 2);
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
+    const distH = halfW / Math.tan(hFov / 2);
+    camHomePos.set(0, halfH * 0.25, Math.max(distV, distH, 42) * 1.02);
+  }
+  computeCameraHome();
+  camera.position.copy(camHomePos);
+
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.06;
+  controls.rotateSpeed = 0.6;
+  controls.minDistance = 15;
+  controls.maxDistance = 500;
+  controls.target.copy(camHomeTarget);
+  controls.update();
+
+  const $ = id => document.getElementById(id);
+  let autoOrbit = true;
+  let intensity = CONFIG.DEFAULT_INTENSITY;
+  const elRotate = $('chk-rotate');
+  const elIntensity = $('rng-intensity');
+  const elIntVal = $('intensity-val');
+  if (elRotate) elRotate.addEventListener('change', e => { autoOrbit = e.target.checked; });
+  if (elIntensity) elIntensity.addEventListener('input', e => {
+    intensity = parseFloat(e.target.value);
+    if (elIntVal) elIntVal.textContent = intensity.toFixed(2);
+  });
+  function resetCamera() {
+    camera.position.copy(camHomePos);
+    controls.target.copy(camHomeTarget);
+    controls.update();
+  }
+  const elReset = $('btn-reset');
+  if (elReset) elReset.addEventListener('click', resetCamera);
+  window.addEventListener('keydown', e => { if (e.key === 'r' || e.key === 'R') resetCamera(); });
+  const elPoints = $('stat-points');
+  if (elPoints) elPoints.textContent = (CONFIG.NUM_TEXT_POINTS + CONFIG.NUM_SWARM).toLocaleString('en-US');
+
+  const orbitAxis = new THREE.Vector3(0, 1, 0);
+  const camOffset = new THREE.Vector3();
+
+  function onResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    computeCameraHome();
+  }
+  window.addEventListener('resize', onResize, { passive: true });
+
+  const clock = new THREE.Clock();
+  let elapsed = 0;
+  let fpsFrames = 0, fpsLast = performance.now();
+  const elFps = $('stat-fps');
+  const S = CONFIG.SWARM;
+  const NUM_SWARM = CONFIG.NUM_SWARM;
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const dt = Math.min(clock.getDelta(), 0.05);
+    elapsed += dt;
+
+    // Auto-orbit the camera around the word so perspective moves...
+    if (autoOrbit) {
+      camOffset.copy(camera.position).sub(controls.target);
+      camOffset.applyAxisAngle(orbitAxis, CONFIG.ROT_SPEED * dt);
+      camera.position.copy(controls.target).add(camOffset);
+    }
+
+    // ...while the text always faces the viewer (billboard to camera).
+    group.quaternion.copy(camera.quaternion);
+    group.position.y = Math.sin(elapsed * CONFIG.FLOAT_SPEED) * CONFIG.FLOAT_AMP;
+    material.opacity = 0.9 + 0.08 * Math.sin(elapsed * 1.7);
+
+    for (let i = 0; i < NUM_SWARM; i++) particles[i].update(posArray, elapsed, dt, intensity, S);
+    if (supportsUpdateRange) {
+      posAttr.updateRange.offset = SWARM_BYTE_START;
+      posAttr.updateRange.count = NUM_SWARM * 3;
+    }
+    posAttr.needsUpdate = true;
+
+    controls.update();
+    renderer.render(scene, camera);
+
+    fpsFrames++;
+    const now = performance.now();
+    if (now - fpsLast >= 500) {
+      if (elFps) elFps.textContent = String(Math.round(fpsFrames * 1000 / (now - fpsLast)));
+      fpsFrames = 0; fpsLast = now;
+    }
+  }
+  animate();
+}
+
+(function () {
+  const overlay = document.getElementById('error-overlay');
+  const detail = document.getElementById('error-detail');
+  try {
+    if (typeof THREE === 'undefined') throw new Error('THREE failed to load');
+    startApp();
+  } catch (err) {
+    if (overlay) {
+      overlay.hidden = false;
+      if (detail) detail.textContent = (err && err.stack) ? String(err.stack) : String(err);
+    }
+    console.error(err);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GODMODE — Autonomous Builder</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+        :root {
+            --bg: #0a0d14;
+            --surface: rgba(255,255,255,0.04);
+            --surface-2: rgba(255,255,255,0.07);
+            --surface-3: rgba(255,255,255,0.10);
+            --border: rgba(255,255,255,0.08);
+            --border-2: rgba(255,255,255,0.14);
+            --text: rgba(255,255,255,0.92);
+            --text-2: rgba(255,255,255,0.60);
+            --text-3: rgba(255,255,255,0.35);
+            --green: #4ade80;
+            --green-dim: rgba(74,222,128,0.15);
+            --red: #f87171;
+            --red-dim: rgba(248,113,113,0.15);
+            --amber: #fbbf24;
+            --amber-dim: rgba(251,191,36,0.15);
+            --blue: #60a5fa;
+            --blue-dim: rgba(96,165,250,0.15);
+            --purple: #a78bfa;
+            --purple-dim: rgba(167,139,250,0.15);
+            --mono: 'IBM Plex Mono', monospace;
+            --sans: 'Inter', -apple-system, sans-serif;
+            --radius: 10px;
+            --radius-sm: 6px;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: var(--sans);
+            height: 100vh;
+            overflow: hidden;
+            font-size: 13px;
+        }
+
+        .app {
+            display: grid;
+            grid-template-rows: 48px 1fr 28px;
+            height: 100vh;
+        }
+
+        /* ===== TOP BAR ===== */
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 16px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(10,13,20,0.95);
+            backdrop-filter: blur(12px);
+            z-index: 100;
+        }
+
+        .topbar-left {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .logo {
+            font-weight: 800;
+            font-size: 14px;
+            letter-spacing: 0.08em;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .logo-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-3);
+            transition: all 0.3s;
+        }
+
+        .logo-dot.active { background: var(--green); box-shadow: 0 0 8px rgba(74,222,128,0.4); }
+        .logo-dot.paused { background: var(--amber); }
+        .logo-dot.error { background: var(--red); }
+
+        .status-chip {
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            padding: 3px 10px;
+            border-radius: 100px;
+            border: 1px solid var(--border);
+            background: var(--surface);
+            text-transform: uppercase;
+            font-family: var(--mono);
+        }
+
+        .status-chip.active { color: var(--green); border-color: rgba(74,222,128,0.3); background: var(--green-dim); }
+        .status-chip.idle { color: var(--text-3); }
+        .status-chip.paused { color: var(--amber); border-color: rgba(251,191,36,0.3); background: var(--amber-dim); }
+        .status-chip.error { color: var(--red); border-color: rgba(248,113,113,0.3); background: var(--red-dim); }
+
+        .topbar-metrics {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .metric-item {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+
+        .metric-label {
+            font-size: 9px;
+            color: var(--text-3);
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-family: var(--mono);
+        }
+
+        .metric-val {
+            font-size: 13px;
+            font-weight: 700;
+            font-family: var(--mono);
+            color: var(--text);
+        }
+
+        .topbar-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .clock {
+            font-family: var(--mono);
+            font-size: 12px;
+            color: var(--text-2);
+            font-weight: 500;
+        }
+
+        /* ===== MAIN GRID ===== */
+        .main {
+            display: grid;
+            grid-template-columns: 280px 1fr 320px;
+            overflow: hidden;
+        }
+
+        /* ===== PANELS ===== */
+        .panel {
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .panel:last-child { border-right: none; }
+
+        .panel-section {
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .panel-section.grow {
+            flex: 1;
+            overflow: hidden;
+        }
+
+        .section-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 14px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(255,255,255,0.015);
+            flex-shrink: 0;
+        }
+
+        .section-title {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--text-2);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .section-badge {
+            font-size: 9px;
+            padding: 1px 6px;
+            border-radius: 100px;
+            font-family: var(--mono);
+            font-weight: 600;
+        }
+
+        .scrollable {
+            overflow-y: auto;
+            flex: 1;
+        }
+
+        .scrollable::-webkit-scrollbar { width: 4px; }
+        .scrollable::-webkit-scrollbar-track { background: transparent; }
+        .scrollable::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 2px; }
+
+        /* ===== LEFT: CONTROL ===== */
+        .project-input {
+            padding: 12px;
+        }
+
+        .input-group {
+            margin-bottom: 10px;
+        }
+
+        .input-label {
+            font-size: 10px;
+            font-weight: 600;
+            color: var(--text-2);
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+            display: block;
+        }
+
+        textarea, input[type="text"], input[type="number"], select {
+            width: 100%;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 8px 10px;
+            color: var(--text);
+            font-family: var(--mono);
+            font-size: 12px;
+            outline: none;
+            transition: border-color 0.2s;
+            resize: vertical;
+        }
+
+        textarea:focus, input:focus, select:focus {
+            border-color: var(--border-2);
+        }
+
+        textarea { min-height: 80px; }
+
+        .btn-row {
+            display: flex;
+            gap: 4px;
+        }
+
+        .btn {
+            flex: 1;
+            padding: 7px 10px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--surface);
+            color: var(--text);
+            font-family: var(--mono);
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            cursor: pointer;
+            transition: all 0.15s;
+            text-align: center;
+        }
+
+        .btn:hover { background: var(--surface-2); border-color: var(--border-2); }
+        .btn.primary { background: rgba(74,222,128,0.12); border-color: rgba(74,222,128,0.3); color: var(--green); }
+        .btn.primary:hover { background: rgba(74,222,128,0.2); }
+        .btn.danger { background: rgba(248,113,113,0.1); border-color: rgba(248,113,113,0.25); color: var(--red); }
+        .btn.warn { background: rgba(251,191,36,0.1); border-color: rgba(251,191,36,0.25); color: var(--amber); }
+
+        /* Task Queue */
+        .task-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 8px;
+            align-items: flex-start;
+            transition: background 0.15s;
+        }
+
+        .task-item:hover { background: var(--surface); }
+
+        .task-status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            margin-top: 5px;
+            flex-shrink: 0;
+        }
+
+        .task-status-dot.queued { background: var(--text-3); }
+        .task-status-dot.running { background: var(--blue); box-shadow: 0 0 6px rgba(96,165,250,0.4); animation: pulse-dot 1.5s infinite; }
+        .task-status-dot.done { background: var(--green); }
+        .task-status-dot.error { background: var(--red); }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        .task-body { flex: 1; min-width: 0; }
+
+        .task-title {
+            font-size: 11px;
+            font-weight: 500;
+            line-height: 1.3;
+            word-break: break-word;
+        }
+
+        .task-meta {
+            font-size: 9px;
+            color: var(--text-3);
+            font-family: var(--mono);
+            margin-top: 2px;
+            display: flex;
+            gap: 8px;
+        }
+
+        .task-progress {
+            width: 100%;
+            height: 2px;
+            background: var(--border);
+            border-radius: 1px;
+            margin-top: 4px;
+            overflow: hidden;
+        }
+
+        .task-progress-fill {
+            height: 100%;
+            background: var(--blue);
+            transition: width 0.5s ease;
+            border-radius: 1px;
+        }
+
+        /* ===== CENTER ===== */
+        .center-panel {
+            display: grid;
+            grid-template-rows: 1fr 1fr;
+            overflow: hidden;
+            border-right: 1px solid var(--border);
+        }
+
+        /* Browser */
+        .browser-chrome {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            background: rgba(0,0,0,0.2);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .browser-dots {
+            display: flex;
+            gap: 4px;
+        }
+
+        .browser-dots span {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--surface-3);
+        }
+
+        .url-bar {
+            flex: 1;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 3px 8px;
+            font-family: var(--mono);
+            font-size: 11px;
+            color: var(--text-2);
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            overflow: hidden;
+        }
+
+        .url-lock { color: var(--green); font-size: 10px; }
+
+        .browser-viewport {
+            flex: 1;
+            overflow: auto;
+            padding: 0;
+            position: relative;
+            background: #0d1017;
+        }
+
+        .browser-viewport img {
+            width: 100%;
+            display: block;
+        }
+
+        .browser-empty {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-3);
+            font-size: 12px;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .browser-empty-icon {
+            font-size: 28px;
+            opacity: 0.3;
+        }
+
+        /* Terminal */
+        .terminal-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px 12px;
+            font-family: var(--mono);
+            font-size: 11px;
+            line-height: 1.6;
+            background: rgba(0,0,0,0.15);
+        }
+
+        .term-line {
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .term-prompt { color: var(--green); }
+        .term-cmd { color: var(--text); }
+        .term-stdout { color: var(--text-2); }
+        .term-stderr { color: var(--red); }
+        .term-info { color: var(--blue); }
+        .term-system { color: var(--purple); }
+        .term-dim { color: var(--text-3); }
+
+        .terminal-input-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            border-top: 1px solid var(--border);
+            background: rgba(0,0,0,0.1);
+        }
+
+        .terminal-input-row .prompt-text {
+            font-family: var(--mono);
+            font-size: 11px;
+            color: var(--green);
+            white-space: nowrap;
+        }
+
+        .terminal-input-row input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            font-family: var(--mono);
+            font-size: 11px;
+            color: var(--text);
+            outline: none;
+        }
+
+        .terminal-input-row .run-btn {
+            padding: 3px 10px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-2);
+            font-family: var(--mono);
+            font-size: 10px;
+            cursor: pointer;
+        }
+
+        .terminal-input-row .run-btn:hover {
+            background: var(--surface-2);
+            color: var(--text);
+        }
+
+        /* ===== RIGHT ===== */
+        /* File tree */
+        .file-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 12px;
+            font-family: var(--mono);
+            font-size: 11px;
+            cursor: pointer;
+            transition: background 0.1s;
+            position: relative;
+        }
+
+        .file-item:hover { background: var(--surface); }
+        .file-item.selected { background: var(--surface-2); }
+
+        .file-icon { font-size: 12px; width: 16px; text-align: center; flex-shrink: 0; }
+        .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+        .file-item:hover .file-name { color: var(--text); }
+        .file-size { font-size: 9px; color: var(--text-3); }
+
+        .file-modified-dot {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--amber);
+            flex-shrink: 0;
+        }
+
+        .file-indent { display: inline-block; }
+
+        /* File preview */
+        .file-preview {
+            flex: 1;
+            overflow: auto;
+            padding: 10px 12px;
+            font-family: var(--mono);
+            font-size: 11px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-all;
+            color: var(--text-2);
+            background: rgba(0,0,0,0.1);
+        }
+
+        .file-preview-header {
+            padding: 6px 12px;
+            font-family: var(--mono);
+            font-size: 10px;
+            color: var(--text-3);
+            border-bottom: 1px solid var(--border);
+            background: rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
+        }
+
+        /* Agent Log */
+        .log-entry {
+            display: flex;
+            gap: 6px;
+            padding: 2px 10px;
+            font-family: var(--mono);
+            font-size: 10px;
+            line-height: 1.5;
+            border-bottom: 1px solid rgba(255,255,255,0.02);
+        }
+
+        .log-ts { color: var(--text-3); white-space: nowrap; min-width: 70px; }
+        .log-level { font-weight: 600; min-width: 36px; }
+        .log-level.info { color: var(--blue); }
+        .log-level.ok { color: var(--green); }
+        .log-level.warn { color: var(--amber); }
+        .log-level.err { color: var(--red); }
+        .log-level.tool { color: var(--purple); }
+        .log-msg { color: var(--text-2); flex: 1; word-break: break-all; }
+
+        /* Provider status */
+        .provider-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 12px;
+            font-size: 11px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .provider-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+
+        .provider-dot.ok { background: var(--green); }
+        .provider-dot.down { background: var(--red); }
+        .provider-dot.unknown { background: var(--text-3); }
+
+        .provider-name {
+            flex: 1;
+            font-family: var(--mono);
+            font-weight: 500;
+        }
+
+        .provider-stat {
+            font-family: var(--mono);
+            font-size: 10px;
+            color: var(--text-3);
+        }
+
+        /* Deploy section */
+        .deploy-row {
+            display: flex;
+            gap: 4px;
+            padding: 8px 12px;
+        }
+
+        .deploy-row input { flex: 1; }
+        .deploy-row .btn { flex: 0 0 auto; padding: 7px 14px; }
+
+        /* ===== BOTTOM BAR ===== */
+        .bottombar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 14px;
+            border-top: 1px solid var(--border);
+            background: rgba(10,13,20,0.95);
+            font-family: var(--mono);
+            font-size: 10px;
+            color: var(--text-3);
+        }
+
+        .bottombar-left, .bottombar-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .progress-bar-bottom {
+            width: 120px;
+            height: 3px;
+            background: var(--border);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .progress-bar-bottom-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--blue), var(--purple));
+            transition: width 0.5s;
+        }
+
+        /* Inline row helpers */
+        .inline-row {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        /* Connection overlay */
+        .connecting-overlay {
+            position: fixed;
+            inset: 0;
+            background: var(--bg);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+            flex-direction: column;
+            gap: 16px;
+            transition: opacity 0.5s;
+        }
+
+        .connecting-overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .connecting-spinner {
+            width: 32px;
+            height: 32px;
+            border: 2px solid var(--border);
+            border-top-color: var(--text-2);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .connecting-text {
+            font-family: var(--mono);
+            font-size: 12px;
+            color: var(--text-2);
+            letter-spacing: 0.06em;
+        }
+
+        /* Budget display */
+        .budget-display {
+            padding: 6px 12px;
+            font-family: var(--mono);
+            font-size: 10px;
+            color: var(--text-3);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .budget-display span { color: var(--text-2); }
+    </style>
+</head>
+<body>
+    <div class="connecting-overlay" id="connectOverlay">
+        <div class="connecting-spinner"></div>
+        <div class="connecting-text">Connecting to backend...</div>
+    </div>
+
+    <div class="app">
+        <!-- TOP BAR -->
+        <div class="topbar">
+            <div class="topbar-left">
+                <div class="logo">
+                    <span class="logo-dot" id="statusDot"></span>
+                    <span>GODMODE</span>
+                </div>
+                <span class="status-chip idle" id="statusChip">IDLE</span>
+                <span class="status-chip" id="providerChip" style="color:var(--text-3)">no provider</span>
+                <span class="status-chip" id="stageChip" style="color:var(--text-3)">—</span>
+            </div>
+            <div class="topbar-metrics">
+                <div class="metric-item">
+                    <span class="metric-label">LLM calls</span>
+                    <span class="metric-val" id="metricLLM">0</span>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">Tool calls</span>
+                    <span class="metric-val" id="metricTool">0</span>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">Tasks</span>
+                    <span class="metric-val" id="metricTasks">0</span>
+                </div>
+                <div class="metric-item">
+                    <span class="metric-label">Progress</span>
+                    <span class="metric-val" id="metricProgress">0%</span>
+                </div>
+            </div>
+            <div class="topbar-right">
+                <span class="clock" id="clock">00:00:00</span>
+            </div>
+        </div>
+
+        <!-- MAIN -->
+        <div class="main">
+            <!-- LEFT PANEL -->
+            <div class="panel">
+                <div class="panel-section">
+                    <div class="section-header">
+                        <span class="section-title">Project</span>
+                    </div>
+                    <div class="project-input">
+                        <div class="input-group">
+                            <label class="input-label">Goal</label>
+                            <textarea id="goalInput" placeholder="Describe what to build. The agent will plan, code, test, and deploy."></textarea>
+                        </div>
+                        <div class="input-group inline-row">
+                            <div style="flex:1">
+                                <label class="input-label">Mode</label>
+                                <select id="modeSelect">
+                                    <option value="time">Time budget</option>
+                                    <option value="lines">Lines budget</option>
+                                </select>
+                            </div>
+                            <div style="flex:1">
+                                <label class="input-label" id="budgetLabel">Hours</label>
+                                <input type="number" id="budgetInput" value="5" min="0" step="0.5">
+                            </div>
+                        </div>
+                        <div class="btn-row" style="margin-top:8px">
+                            <button class="btn primary" id="btnStart">Start</button>
+                            <button class="btn warn" id="btnPause">Pause</button>
+                            <button class="btn danger" id="btnStop">Stop</button>
+                            <button class="btn" id="btnReset">Reset</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <div class="section-header">
+                        <span class="section-title">Instruction</span>
+                    </div>
+                    <div style="padding:8px 12px">
+                        <textarea id="instructionInput" placeholder="Add tasks, change direction, fix bugs..." style="min-height:50px"></textarea>
+                        <div class="btn-row" style="margin-top:6px">
+                            <button class="btn" id="btnQueuePlan">Queue Plan</button>
+                            <button class="btn" id="btnQueueExec">Queue Exec</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <div class="section-header">
+                        <span class="section-title">Deploy</span>
+                    </div>
+                    <div style="padding:8px 12px">
+                        <div class="input-group">
+                            <label class="input-label">Repo / Project name</label>
+                            <input type="text" id="repoNameInput" value="godmode-project">
+                        </div>
+                        <div class="btn-row">
+                            <button class="btn" id="btnGithub">Push GitHub</button>
+                            <button class="btn" id="btnVercel">Deploy Vercel</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <div class="section-header">
+                        <span class="section-title">Providers</span>
+                    </div>
+                    <div id="providerList" class="scrollable">
+                        <!-- filled by JS -->
+                    </div>
+                </div>
+
+                <div class="panel-section grow">
+                    <div class="section-header">
+                        <span class="section-title">Task Queue</span>
+                        <span class="section-badge" id="queueCount" style="color:var(--text-3)">0</span>
+                    </div>
+                    <div id="taskQueue" class="scrollable">
+                        <!-- filled by JS -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- CENTER PANEL -->
+            <div class="center-panel">
+                <!-- Browser -->
+                <div class="panel-section grow" style="border-right:none">
+                    <div class="section-header">
+                        <span class="section-title">Browser</span>
+                        <div class="inline-row">
+                            <input type="text" id="browseUrlInput" placeholder="https://..." style="width:200px;font-size:10px;padding:3px 8px">
+                            <button class="btn" id="btnBrowse" style="flex:0;padding:4px 10px;font-size:9px">Browse</button>
+                        </div>
+                    </div>
+                    <div class="browser-chrome">
+                        <div class="browser-dots"><span></span><span></span><span></span></div>
+                        <div class="url-bar">
+                            <span class="url-lock">⏐</span>
+                            <span id="browserUrl">No page loaded</span>
+                        </div>
+                    </div>
+                    <div class="browser-viewport" id="browserViewport">
+                        <div class="browser-empty">
+                            <div class="browser-empty-icon">◇</div>
+                            <div>No browser snapshot yet</div>
+                            <div style="font-size:10px">Agent will capture pages via Playwright</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Terminal -->
+                <div class="panel-section grow" style="border-right:none">
+                    <div class="section-header">
+                        <span class="section-title">Terminal</span>
+                        <span class="section-badge" style="color:var(--text-3)" id="terminalCwd">./workdir</span>
+                    </div>
+                    <div class="terminal-body" id="terminalBody">
+                        <div class="term-line term-system">godmode terminal — runs in ./workdir</div>
+                        <div class="term-line term-dim">type a command and press enter or click run</div>
+                    </div>
+                    <div class="terminal-input-row">
+                        <span class="prompt-text">$</span>
+                        <input type="text" id="terminalInput" placeholder="command..." autocomplete="off">
+                        <button class="run-btn" id="btnRunCmd">run</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- RIGHT PANEL -->
+            <div class="panel" style="border-right:none">
+                <!-- File Tree -->
+                <div class="panel-section" style="max-height:40%">
+                    <div class="section-header">
+                        <span class="section-title">Files</span>
+                        <button class="btn" id="btnRefreshFiles" style="padding:2px 8px;font-size:9px">Refresh</button>
+                    </div>
+                    <div id="fileTree" class="scrollable">
+                        <div style="padding:12px;color:var(--text-3);font-size:11px">No files yet — workdir is empty</div>
+                    </div>
+                </div>
+
+                <!-- File Preview -->
+                <div class="panel-section" style="flex:1;overflow:hidden">
+                    <div class="section-header">
+                        <span class="section-title">Preview</span>
+                    </div>
+                    <div class="file-preview-header" id="previewHeader">
+                        <span>No file selected</span>
+                        <span id="previewSize"></span>
+                    </div>
+                    <div class="file-preview" id="filePreview">
+                        Select a file from the tree to preview its contents.
+                    </div>
+                </div>
+
+                <!-- Agent Log -->
+                <div class="panel-section" style="max-height:30%">
+                    <div class="section-header">
+                        <span class="section-title">Agent Log</span>
+                        <button class="btn" id="btnClearLog" style="padding:2px 8px;font-size:9px">Clear</button>
+                    </div>
+                    <div id="agentLog" class="scrollable">
+                        <!-- filled by JS -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- BOTTOM BAR -->
+        <div class="bottombar">
+            <div class="bottombar-left">
+                <span id="bottomStatus">Disconnected</span>
+                <div class="progress-bar-bottom">
+                    <div class="progress-bar-bottom-fill" id="bottomProgress" style="width:0%"></div>
+                </div>
+                <span id="bottomBudget">—</span>
+            </div>
+            <div class="bottombar-right">
+                <span id="bottomUptime">uptime: —</span>
+                <span id="bottomPID">pid: —</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    /*
+     * GODMODE Frontend Controller
+     * 
+     * This connects to the Streamlit/FastAPI backend via the .godmode state files.
+     * Since we're a static HTML file, we poll the backend API.
+     * In production, the backend exposes a simple REST API.
+     * 
+     * For standalone demo: we run a self-contained state machine
+     * that mirrors what the Python backend does — reading/writing
+     * to the same JSON state files via a local API server.
+     * 
+     * If no backend is detected, the UI shows real state and waits.
+     */
+
+    const API_BASE = window.location.origin;
+    const POLL_MS = 800;
+    const STATE_DIR = '.godmode';
+
+    // ===== STATE =====
+    const state = {
+        runtime: {
+            agent_status: 'IDLE',
+            active_task_id: null,
+            time_budget_sec: 18000,
+            lines_budget: 20000,
+            project_goal: '',
+            project_mode: 'time',
+            heartbeat: 0
+        },
+        metrics: {
+            start_ts: 0,
+            llm_calls: 0,
+            tool_calls: 0,
+            progress: 0,
+            stage: 'idle',
+            active_provider: 'none',
+            file_mru: ''
+        },
+        queue: [],
+        logs: [],
+        files: [],
+        browser: { url: '', title: '', screenshot: null, ts: 0 },
+        providers: {},
+        connected: false,
+        selectedFile: null,
+        terminalHistory: [],
+        startTime: Date.now()
+    };
+
+    // ===== API LAYER =====
+    // Tries to reach the Python backend. If unavailable, uses localStorage fallback.
+
+    async function apiGet(path) {
+        try {
+            const r = await fetch(`${API_BASE}/api${path}`, { 
+                signal: AbortSignal.timeout(3000) 
+            });
+            if (r.ok) return await r.json();
+        } catch(e) {}
+        return null;
+    }
+
+    async function apiPost(path, body) {
+        try {
+            const r = await fetch(`${API_BASE}/api${path}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: AbortSignal.timeout(5000)
+            });
+            if (r.ok) return await r.json();
+        } catch(e) {}
+        return null;
+    }
+
+    // LocalStorage persistence (works when no backend)
+    function lsSave(key, val) {
+        try { localStorage.setItem('gm_' + key, JSON.stringify(val)); } catch(e) {}
+    }
+
+    function lsLoad(key, def) {
+        try {
+            const v = localStorage.getItem('gm_' + key);
+            return v ? JSON.parse(v) : def;
+        } catch(e) { return def; }
+    }
+
+    // ===== INITIALIZATION =====
+    function initState() {
+        const saved = lsLoad('state', null);
+        if (saved) {
+            Object.assign(state.runtime, saved.runtime || {});
+            Object.assign(state.metrics, saved.metrics || {});
+            state.queue = saved.queue || [];
+            state.logs = saved.logs || [];
+        }
+    }
+
+    function persistState() {
+        lsSave('state', {
+            runtime: state.runtime,
+            metrics: state.metrics,
+            queue: state.queue,
+            logs: state.logs
+        });
+    }
+
+    // ===== BACKEND POLLING =====
+    async function pollBackend() {
+        // Try fetching state from backend
+        const rt = await apiGet('/runtime');
+        const m = await apiGet('/metrics');
+        const q = await apiGet('/queue');
+        const b = await apiGet('/browser');
+        const f = await apiGet('/files');
+        const logs = await apiGet('/logs');
+        const prov = await apiGet('/providers');
+
+        if (rt) {
+            state.runtime = { ...state.runtime, ...rt };
+            state.connected = true;
+        }
+        if (m) state.metrics = { ...state.metrics, ...m };
+        if (q) state.queue = q;
+        if (b) state.browser = { ...state.browser, ...b };
+        if (f) state.files = f;
+        if (logs) state.logs = logs;
+        if (prov) state.providers = prov;
+
+        // If backend unreachable, use local state
+        if (!rt && !m) {
+            state.connected = false;
+        }
+
+        persistState();
+        render();
+    }
+
+    // ===== LOG =====
+    function addLog(level, msg) {
+        const ts = new Date().toTimeString().split(' ')[0];
+        state.logs.push({ ts, level, msg });
+        if (state.logs.length > 500) state.logs = state.logs.slice(-400);
+        persistState();
+    }
+
+    // ===== ACTIONS (send to backend or execute locally) =====
+    async function actionStart() {
+        const goal = document.getElementById('goalInput').value.trim();
+        if (!goal) { addLog('warn', 'No project goal set'); render(); return; }
+
+        state.runtime.project_goal = goal;
+        state.runtime.agent_status = 'ACTIVE';
+        state.runtime.project_mode = document.getElementById('modeSelect').value;
+
+        const budgetVal = parseFloat(document.getElementById('budgetInput').value) || 5;
+        if (state.runtime.project_mode === 'time') {
+            state.runtime.time_budget_sec = Math.round(budgetVal * 3600);
+        } else {
+            state.runtime.lines_budget = Math.round(budgetVal);
+        }
+
+        if (state.metrics.start_ts === 0) {
+            state.metrics.start_ts = Date.now() / 1000;
+            state.metrics.stage = 'boot';
+        }
+
+        const sent = await apiPost('/runtime', state.runtime);
+        if (sent) {
+            addLog('ok', 'Sent START to backend');
+            // Also bootstrap a plan if queue is empty
+            if (state.queue.length === 0 || !state.queue.some(t => t.status === 'queued')) {
+                await apiPost('/queue/add', {
+                    kind: 'plan',
+                    title: 'Bootstrap: plan + milestones + first implementation for: ' + goal.substring(0, 80),
+                    payload: {}
+                });
+                addLog('info', 'Queued bootstrap plan task');
+            }
+        } else {
+            addLog('warn', 'Backend unreachable — state saved locally');
+        }
+        persistState();
+        render();
+    }
+
+    async function actionPause() {
+        state.runtime.agent_status = 'PAUSED';
+        await apiPost('/runtime', state.runtime);
+        addLog('warn', 'Agent PAUSED');
+        persistState();
+        render();
+    }
+
+    async function actionStop() {
+        state.runtime.agent_status = 'STOPPED';
+        await apiPost('/runtime', state.runtime);
+        addLog('err', 'Agent STOPPED');
+        persistState();
+        render();
+    }
+
+    async function actionReset() {
+        state.runtime = {
+            agent_status: 'IDLE', active_task_id: null,
+            time_budget_sec: 18000, lines_budget: 20000,
+            project_goal: '', project_mode: 'time', heartbeat: 0
+        };
+        state.metrics = {
+            start_ts: 0, llm_calls: 0, tool_calls: 0,
+            progress: 0, stage: 'idle', active_provider: 'none', file_mru: ''
+        };
+        state.queue = [];
+        state.browser = { url: '', title: '', screenshot: null, ts: 0 };
+        await apiPost('/reset', {});
+        addLog('info', 'System reset');
+        persistState();
+        render();
+    }
+
+    async function actionQueuePlan() {
+        const text = document.getElementById('instructionInput').value.trim();
+        if (!text) return;
+        const task = {
+            kind: 'plan',
+            title: text.substring(0, 120),
+            payload: { instruction: text }
+        };
+        const sent = await apiPost('/queue/add', task);
+        state.queue.push({
+            id: 't' + Date.now(),
+            ...task,
+            status: 'queued',
+            result: '', error: '',
+            created_ts: Date.now() / 1000,
+            updated_ts: Date.now() / 1000
+        });
+        addLog('info', 'Queued plan: ' + text.substring(0, 60));
+        document.getElementById('instructionInput').value = '';
+        persistState();
+        render();
+    }
+
+    async function actionQueueExec() {
+        const text = document.getElementById('instructionInput').value.trim();
+        if (!text) return;
+        const task = {
+            kind: 'execute',
+            title: text.substring(0, 120),
+            payload: { instruction: text }
+        };
+        await apiPost('/queue/add', task);
+        state.queue.push({
+            id: 't' + Date.now(),
+            ...task,
+            status: 'queued',
+            result: '', error: '',
+            created_ts: Date.now() / 1000,
+            updated_ts: Date.now() / 1000
+        });
+        addLog('info', 'Queued exec: ' + text.substring(0, 60));
+        document.getElementById('instructionInput').value = '';
+        persistState();
+        render();
+    }
+
+    async function actionGithub() {
+        const repo = document.getElementById('repoNameInput').value.trim() || 'godmode-project';
+        const task = {
+            kind: 'tool',
+            title: 'GitHub push: ' + repo,
+            payload: { tool: 'github_push', args: { repo_name: repo, commit_msg: 'godmode push' } }
+        };
+        await apiPost('/queue/add', task);
+        state.queue.push({
+            id: 't' + Date.now(), ...task, status: 'queued',
+            result: '', error: '', created_ts: Date.now()/1000, updated_ts: Date.now()/1000
+        });
+        addLog('tool', 'Queued GitHub push → ' + repo);
+        persistState();
+        render();
+    }
+
+    async function actionVercel() {
+        const name = document.getElementById('repoNameInput').value.trim() || 'godmode-project';
+        const task = {
+            kind: 'tool',
+            title: 'Vercel deploy: ' + name,
+            payload: { tool: 'vercel_deploy', args: { project_name: name } }
+        };
+        await apiPost('/queue/add', task);
+        state.queue.push({
+            id: 't' + Date.now(), ...task, status: 'queued',
+            result: '', error: '', created_ts: Date.now()/1000, updated_ts: Date.now()/1000
+        });
+        addLog('tool', 'Queued Vercel deploy → ' + name);
+        persistState();
+        render();
+    }
+
+    async function actionBrowse() {
+        const url = document.getElementById('browseUrlInput').value.trim();
+        if (!url) return;
+        const task = {
+            kind: 'tool',
+            title: 'Browse: ' + url,
+            payload: { tool: 'browser_vision', args: { url } }
+        };
+        await apiPost('/queue/add', task);
+        state.queue.push({
+            id: 't' + Date.now(), ...task, status: 'queued',
+            result: '', error: '', created_ts: Date.now()/1000, updated_ts: Date.now()/1000
+        });
+        addLog('tool', 'Queued browse → ' + url);
+        persistState();
+        render();
+    }
+
+    async function actionRunCmd() {
+        const input = document.getElementById('terminalInput');
+        const cmd = input.value.trim();
+        if (!cmd) return;
+        input.value = '';
+
+        addTermLine('prompt', '$ ' + cmd);
+        addLog('tool', 'Terminal: ' + cmd);
+
+        const result = await apiPost('/terminal', { cmd, cwd: './workdir' });
+        if (result && result.out !== undefined) {
+            const lines = result.out.split('\n');
+            lines.forEach(l => addTermLine(result.rc === 0 ? 'stdout' : 'stderr', l));
+            addTermLine('dim', `exit code: ${result.rc}`);
+        } else {
+            addTermLine('info', 'Command queued — backend will execute');
+            // Also queue it
+            const task = {
+                kind: 'tool',
+                title: 'terminal: ' + cmd,
+                payload: { tool: 'run_terminal', args: { cmd, cwd: './workdir' } }
+            };
+            await apiPost('/queue/add', task);
+            state.queue.push({
+                id: 't' + Date.now(), ...task, status: 'queued',
+                result: '', error: '', created_ts: Date.now()/1000, updated_ts: Date.now()/1000
+            });
+        }
+        persistState();
+        render();
+    }
+
+    function addTermLine(type, text) {
+        state.terminalHistory.push({ type, text });
+        if (state.terminalHistory.length > 1000) {
+            state.terminalHistory = state.terminalHistory.slice(-800);
+        }
+    }
+
+    async function actionRefreshFiles() {
+        const files = await apiGet('/files');
+        if (files) {
+            state.files = files;
+            addLog('info', 'File tree refreshed: ' + files.length + ' entries');
+        } else {
+            addLog('warn', 'Could not refresh files — backend unreachable');
+        }
+        render();
+    }
+
+    async function actionSelectFile(path) {
+        state.selectedFile = path;
+        const content = await apiPost('/file/read', { path });
+        if (content && content.content !== undefined) {
+            document.getElementById('previewHeader').querySelector('span').textContent = path;
+            document.getElementById('previewSize').textContent = content.size || '';
+            document.getElementById('filePreview').textContent = content.content;
+        } else {
+            document.getElementById('previewHeader').querySelector('span').textContent = path;
+            document.getElementById('filePreview').textContent = '(could not read — backend unreachable)';
+        }
+    }
+
+    // ===== RENDERING =====
+    function render() {
+        const rt = state.runtime;
+        const m = state.metrics;
+
+        // Connection overlay
+        const overlay = document.getElementById('connectOverlay');
+        overlay.classList.toggle('hidden', true); // Always show UI
+
+        // Status indicators
+        const dot = document.getElementById('statusDot');
+        const chip = document.getElementById('statusChip');
+        dot.className = 'logo-dot';
+        chip.className = 'status-chip';
+
+        if (rt.agent_status === 'ACTIVE') {
+            dot.classList.add('active');
+            chip.classList.add('active');
+        } else if (rt.agent_status === 'PAUSED') {
+            dot.classList.add('paused');
+            chip.classList.add('paused');
+        } else if (rt.agent_status === 'STOPPED') {
+            dot.classList.add('error');
+            chip.classList.add('error');
+        } else {
+            chip.classList.add('idle');
+        }
+        chip.textContent = rt.agent_status;
+
+        // Provider chip
+        document.getElementById('providerChip').textContent = m.active_provider || 'none';
+        document.getElementById('stageChip').textContent = m.stage || '—';
+
+        // Metrics
+        document.getElementById('metricLLM').textContent = m.llm_calls;
+        document.getElementById('metricTool').textContent = m.tool_calls;
+        document.getElementById('metricTasks').textContent = state.queue.filter(t => t.status === 'done').length;
+        document.getElementById('metricProgress').textContent = Math.round((m.progress || 0) * 100) + '%';
+
+        // Progress bar
+        document.getElementById('bottomProgress').style.width = Math.round((m.progress || 0) * 100) + '%';
+
+        // Goal input (only if empty)
+        const goalInput = document.getElementById('goalInput');
+        if (!goalInput.value && rt.project_goal) {
+            goalInput.value = rt.project_goal;
+        }
+
+        // Queue
+        renderQueue();
+        renderProviders();
+        renderTerminal();
+        renderBrowser();
+        renderFiles();
+        renderLogs();
+
+        // Bottom bar
+        document.getElementById('bottomStatus').textContent = state.connected ? 'Connected' : 'Local mode';
+
+        if (m.start_ts && m.start_ts > 0) {
+            const elapsed = (Date.now() / 1000) - m.start_ts;
+            const h = Math.floor(elapsed / 3600);
+            const min = Math.floor((elapsed % 3600) / 60);
+            const sec = Math.floor(elapsed % 60);
+            document.getElementById('bottomUptime').textContent = 
+                `uptime: ${h}h ${String(min).padStart(2,'0')}m ${String(sec).padStart(2,'0')}s`;
+        }
+
+        if (rt.project_mode === 'time' && rt.time_budget_sec > 0 && m.start_ts > 0) {
+            const elapsed = (Date.now() / 1000) - m.start_ts;
+            const left = Math.max(0, rt.time_budget_sec - elapsed);
+            const lh = Math.floor(left / 3600);
+            const lm = Math.floor((left % 3600) / 60);
+            document.getElementById('bottomBudget').textContent = `budget: ${lh}h ${lm}m left`;
+        } else if (rt.project_mode === 'lines') {
+            document.getElementById('bottomBudget').textContent = `budget: ${rt.lines_budget} lines`;
+        }
+
+        // Clock
+        document.getElementById('clock').textContent = new Date().toTimeString().split(' ')[0];
+    }
+
+    function renderQueue() {
+        const container = document.getElementById('taskQueue');
+        const q = state.queue;
+        document.getElementById('queueCount').textContent = q.filter(t => t.status === 'queued').length;
+
+        if (q.length === 0) {
+            container.innerHTML = '<div style="padding:12px;color:var(--text-3);font-size:11px">No tasks queued</div>';
+            return;
+        }
+
+        // Show most recent first, limit to 20
+        const visible = q.slice(-20).reverse();
+        container.innerHTML = visible.map(t => `
+            <div class="task-item">
+                <div class="task-status-dot ${t.status}"></div>
+                <div class="task-body">
+                    <div class="task-title">${escHtml(t.title || '(untitled)')}</div>
+                    <div class="task-meta">
+                        <span>${t.kind}</span>
+                        <span>${t.status}</span>
+                        ${t.updated_ts ? `<span>${timeSince(t.updated_ts)}</span>` : ''}
+                    </div>
+                    ${t.status === 'running' ? '<div class="task-progress"><div class="task-progress-fill" style="width:50%"></div></div>' : ''}
+                    ${t.error ? `<div style="color:var(--red);font-size:10px;margin-top:3px;font-family:var(--mono)">${escHtml(t.error.substring(0,120))}</div>` : ''}
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function renderProviders() {
+        const container = document.getElementById('providerList');
+        const providers = state.providers;
+        const names = Object.keys(providers);
+
+        if (names.length === 0) {
+            // Show expected providers based on .env knowledge
+            const expected = [
+                { name: 'ollama_local', label: 'Ollama Local (deepseek-r1:8b)' },
+                { name: 'ollama_cloud', label: 'Ollama Cloud (deepseek-r1:671b)' },
+                { name: 'groq', label: 'Groq (llama3-70b-8192)' },
+                { name: 'gemini', label: 'Gemini (gemini-3-flash-preview)' },
+            ];
+            container.innerHTML = expected.map(p => `
+                <div class="provider-row">
+                    <div class="provider-dot unknown"></div>
+                    <span class="provider-name" style="color:var(--text-3)">${p.label}</span>
+                    <span class="provider-stat">—</span>
+                </div>
+            `).join('');
+            return;
+        }
+
+        container.innerHTML = names.map(name => {
+            const p = providers[name];
+            const isActive = state.metrics.active_provider === name;
+            const dotClass = p.fail > p.ok * 0.5 ? 'down' : p.ok > 0 ? 'ok' : 'unknown';
+            return `
+                <div class="provider-row" style="${isActive ? 'background:var(--surface)' : ''}">
+                    <div class="provider-dot ${dotClass}"></div>
+                    <span class="provider-name">${name}</span>
+                    <span class="provider-stat">${p.ok || 0}ok ${p.fail || 0}err</span>
+                </div>
+            `;
+        }).join('');
+    }
+
+    function renderTerminal() {
+        const body = document.getElementById('terminalBody');
+        const lines = state.terminalHistory;
+
+        if (lines.length === 0) return;
+
+        body.innerHTML = lines.map(l => {
+            const cls = {
+                prompt: 'term-prompt',
+                stdout: 'term-stdout',
+                stderr: 'term-stderr',
+                info: 'term-info',
+                system: 'term-system',
+                dim: 'term-dim'
+            }[l.type] || 'term-stdout';
+            return `<div class="term-line ${cls}">${escHtml(l.text)}</div>`;
+        }).join('');
+
+        body.scrollTop = body.scrollHeight;
+    }
+
+    function renderBrowser() {
+        const viewport = document.getElementById('browserViewport');
+        const urlBar = document.getElementById('browserUrl');
+
+        if (state.browser.url) {
+            urlBar.textContent = state.browser.url;
+            if (state.browser.screenshot) {
+                viewport.innerHTML = `<img src="${state.browser.screenshot}" alt="Browser snapshot">`;
+            } else {
+                viewport.innerHTML = `
+                    <div class="browser-empty">
+                        <div style="font-size:11px;color:var(--text-2)">Navigated to: ${escHtml(state.browser.url)}</div>
+                        <div style="font-size:10px;color:var(--text-3)">Title: ${escHtml(state.browser.title || '—')}</div>
+                    </div>`;
+            }
+        }
+    }
+
+    function renderFiles() {
+        const container = document.getElementById('fileTree');
+        const files = state.files;
+
+        if (!files || files.length === 0) {
+            container.innerHTML = '<div style="padding:12px;color:var(--text-3);font-size:11px">No files — workdir empty</div>';
+            return;
+        }
+
+        container.innerHTML = files.map(f => {
+            const icon = getFileIcon(f.name, f.is_dir);
+            const indent = (f.depth || 0) * 16;
+            const isSelected = state.selectedFile === f.path;
+            const isMru = state.metrics.file_mru && f.path && state.metrics.file_mru.endsWith(f.path);
+
+            return `
+                <div class="file-item ${isSelected ? 'selected' : ''}" 
+                     onclick="actionSelectFile('${escAttr(f.path)}')"
+                     style="padding-left:${12 + indent}px">
+                    <span class="file-icon">${icon}</span>
+                    <span class="file-name">${escHtml(f.name)}</span>
+                    ${f.size ? `<span class="file-size">${formatBytes(f.size)}</span>` : ''}
+                    ${isMru ? '<div class="file-modified-dot"></div>' : ''}
+                </div>
+            `;
+        }).join('');
+    }
+
+    function renderLogs() {
+        const container = document.getElementById('agentLog');
+        const logs = state.logs.slice(-80);
+
+        if (logs.length === 0) {
+            container.innerHTML = '<div style="padding:10px;color:var(--text-3);font-size:10px">No log entries yet</div>';
+            return;
+        }
+
+        container.innerHTML = logs.map(l => `
+            <div class="log-entry">
+                <span class="log-ts">${l.ts}</span>
+                <span class="log-level ${l.level}">${l.level}</span>
+                <span class="log-msg">${escHtml(l.msg)}</span>
+            </div>
+        `).join('');
+
+        container.scrollTop = container.scrollHeight;
+    }
+
+    // ===== HELPERS =====
+    function escHtml(s) {
+        if (!s) return '';
+        return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function escAttr(s) {
+        return String(s || '').replace(/'/g, "\\'").replace(/"/g, '\\"');
+    }
+
+    function timeSince(ts) {
+        const sec = Math.floor(Date.now()/1000 - ts);
+        if (sec < 5) return 'now';
+        if (sec < 60) return sec + 's ago';
+        if (sec < 3600) return Math.floor(sec/60) + 'm ago';
+        return Math.floor(sec/3600) + 'h ago';
+    }
+
+    function formatBytes(b) {
+        if (b < 1024) return b + 'B';
+        if (b < 1048576) return (b/1024).toFixed(1) + 'K';
+        return (b/1048576).toFixed(1) + 'M';
+    }
+
+    function getFileIcon(name, isDir) {
+        if (isDir) return '📁';
+        const ext = (name || '').split('.').pop().toLowerCase();
+        const map = {
+            py: '🐍', js: '📜', ts: '📘', tsx: '📘', jsx: '📜',
+            html: '🌐', css: '🎨', json: '⚙️', yml: '⚙️', yaml: '⚙️',
+            md: '📄', txt: '📄', log: '📋', db: '🗄️', sql: '🗄️',
+            png: '🖼️', jpg: '🖼️', svg: '🖼️', gif: '🖼️',
+            sh: '⚡', bash: '⚡', toml: '⚙️', cfg: '⚙️',
+            npy: '📊', csv: '📊', lock: '🔒', env: '🔐'
+        };
+        return map[ext] || '📄';
+    }
+
+    // ===== MODE SELECT =====
+    document.getElementById('modeSelect').addEventListener('change', function() {
+        const label = document.getElementById('budgetLabel');
+        const input = document.getElementById('budgetInput');
+        if (this.value === 'time') {
+            label.textContent = 'Hours';
+            input.value = '5';
+            input.step = '0.5';
+        } else {
+            label.textContent = 'Lines';
+            input.value = '20000';
+            input.step = '500';
+        }
+    });
+
+    // ===== EVENT BINDINGS =====
+    document.getElementById('btnStart').addEventListener('click', actionStart);
+    document.getElementById('btnPause').addEventListener('click', actionPause);
+    document.getElementById('btnStop').addEventListener('click', actionStop);
+    document.getElementById('btnReset').addEventListener('click', actionReset);
+    document.getElementById('btnQueuePlan').addEventListener('click', actionQueuePlan);
+    document.getElementById('btnQueueExec').addEventListener('click', actionQueueExec);
+    document.getElementById('btnGithub').addEventListener('click', actionGithub);
+    document.getElementById('btnVercel').addEventListener('click', actionVercel);
+    document.getElementById('btnBrowse').addEventListener('click', actionBrowse);
+    document.getElementById('btnRunCmd').addEventListener('click', actionRunCmd);
+    document.getElementById('btnRefreshFiles').addEventListener('click', actionRefreshFiles);
+    document.getElementById('btnClearLog').addEventListener('click', () => {
+        state.logs = [];
+        persistState();
+        render();
+    });
+
+    // Terminal enter key
+    document.getElementById('terminalInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') actionRunCmd();
+    });
+
+    // ===== BOOT =====
+    initState();
+
+    // Initial boot log
+    if (state.logs.length === 0) {
+        addLog('info', 'Godmode frontend initialized');
+        addLog('info', 'Providers: ollama_local, ollama_cloud, groq, gemini');
+        addLog('info', 'State dir: .godmode/ | Work dir: ./workdir');
+        addLog('info', 'Set project goal and press START to begin autonomous building');
+    }
+
+    addTermLine('system', 'godmode terminal ready');
+    addTermLine('dim', 'connected to backend: polling...');
+
+    render();
+
+    // Start polling
+    setInterval(() => {
+        pollBackend();
+    }, POLL_MS);
+
+    // Clock update
+    setInterval(() => {
+        document.getElementById('clock').textContent = new Date().toTimeString().split(' ')[0];
+    }, 1000);
+
+    // Hide overlay after brief check
+    setTimeout(() => {
+        document.getElementById('connectOverlay').classList.add('hidden');
+        if (!state.connected) {
+            addLog('warn', 'Backend not detected — running in local/UI-only mode');
+            addLog('info', 'Start the Python backend: bash run.sh');
+        }
+        render();
+    }, 1500);
+    </script>
+</body>
+</html>

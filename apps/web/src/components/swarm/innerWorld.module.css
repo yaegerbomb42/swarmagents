@@ -1,0 +1,271 @@
+/* Cinematic layer for InnerWorld grid.
+   All motion is transform/opacity/filter only — compositor-friendly, no layout thrash.
+   Every animation gated behind prefers-reduced-motion. */
+
+/* ---------- keyframes ---------- */
+
+@keyframes iw-spawn {
+  0% { opacity: 0; transform: scale(0.86) translateY(6px); filter: brightness(1.8); }
+  60% { opacity: 1; filter: brightness(1.15); }
+  100% { opacity: 1; transform: scale(1) translateY(0); filter: brightness(1); }
+}
+
+@keyframes iw-feed-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes iw-edge-flash {
+  0% { box-shadow: inset 3px 0 0 0 var(--iw-flash, rgba(167,139,250,0.9)); filter: brightness(1.35); }
+  100% { box-shadow: inset 3px 0 0 0 transparent; filter: brightness(1); }
+}
+
+@keyframes iw-breathe {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.35); opacity: 0.55; }
+}
+
+@keyframes iw-error-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.0); }
+  50% { box-shadow: 0 0 0 4px rgba(239,68,68,0.35); }
+}
+
+@keyframes iw-scanline {
+  from { transform: translateX(-120%) skewX(-12deg); }
+  to { transform: translateX(220%) skewX(-12deg); }
+}
+
+@keyframes iw-head-dot {
+  0%, 100% { opacity: 1; r: 2.2px; }
+  50% { opacity: 0.6; r: 1.6px; }
+}
+
+@keyframes iw-type-caret {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+@keyframes iw-settle {
+  0% { filter: brightness(1.4) saturate(1.3); transform: scale(1.02); }
+  100% { filter: brightness(0.75) saturate(0.6); transform: scale(1); }
+}
+
+@keyframes iw-milestone {
+  0% { filter: brightness(2.2); transform: scale(1.0); }
+  40% { filter: brightness(1.5); }
+  100% { filter: brightness(1); transform: scale(1); }
+}
+
+@keyframes iw-badge-glow {
+  0%, 100% { filter: drop-shadow(0 0 2px var(--iw-glow, rgba(167,139,250,0.5))); }
+  50% { filter: drop-shadow(0 0 6px var(--iw-glow, rgba(167,139,250,0.9))); }
+}
+
+/* ---------- card lifecycle ---------- */
+
+.card {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+  contain: layout paint style;
+  will-change: transform, opacity;
+}
+
+.cardSpawning {
+  animation: iw-spawn 520ms cubic-bezier(0.22, 1.4, 0.36, 1) backwards;
+  animation-delay: var(--iw-stagger, 0ms);
+}
+
+.cardSettled {
+  animation: iw-settle 900ms ease-out forwards;
+  opacity: 0.65;
+}
+
+.cardError {
+  border-color: rgba(239,68,68,0.45) !important;
+  animation: iw-error-pulse 1.4s ease-in-out infinite;
+}
+
+.cardFocused {
+  z-index: 30;
+}
+
+/* scanline sweep over active cards */
+.scanline {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+}
+.scanline::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 45%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.045) 45%,
+    rgba(255, 255, 255, 0.11) 55%,
+    transparent 100%
+  );
+  animation: iw-scanline 5.5s linear infinite;
+  animation-delay: var(--iw-stagger, 0ms);
+}
+
+.statusDot {
+  animation: iw-breathe 2.4s ease-in-out infinite;
+}
+.statusDotIdle {
+  animation: none;
+}
+
+/* ---------- activity feed ---------- */
+
+.feedItem {
+  animation: iw-feed-in 280ms cubic-bezier(0.2, 0.9, 0.3, 1) backwards,
+    iw-edge-flash 640ms ease-out backwards;
+  border-left: 2px solid transparent;
+}
+
+.feedItemErr {
+  --iw-flash: rgba(239, 68, 68, 0.95);
+}
+.feedItemState {
+  --iw-flash: rgba(236, 72, 153, 0.9);
+}
+.feedItemTool {
+  --iw-flash: rgba(34, 211, 238, 0.9);
+}
+.feedItemThought {
+  --iw-flash: rgba(167, 139, 250, 0.9);
+}
+.feedItemMemory {
+  --iw-flash: rgba(251, 191, 36, 0.9);
+}
+.feedItemResult {
+  --iw-flash: rgba(52, 211, 153, 0.9);
+}
+
+.typeCaret::after {
+  content: "▌";
+  font-size: 0.85em;
+  opacity: 0.7;
+  animation: iw-type-caret 900ms steps(1) infinite;
+}
+
+/* badge glow tiers: t1 subtle, t2 medium, t3 hot */
+.badgeGlowT1 { animation: iw-badge-glow 4.5s ease-in-out infinite; --iw-glow: rgba(148,163,184,0.5); }
+.badgeGlowT2 { animation: iw-badge-glow 2.8s ease-in-out infinite; --iw-glow: rgba(96,165,250,0.75); }
+.badgeGlowT3 { animation: iw-badge-glow 1.6s ease-in-out infinite; --iw-glow: rgba(251,146,60,0.95); }
+
+/* sparkline head dot */
+.headDot {
+  animation: iw-head-dot 1.1s ease-in-out infinite;
+  fill: rgba(196, 181, 253, 0.95);
+}
+
+/* ---------- milestone / mission strip ---------- */
+
+.milestoneFlash {
+  animation: iw-milestone 700ms ease-out;
+}
+
+.counterWrap {
+  font-variant-numeric: tabular-nums;
+  transition: color 240ms ease;
+}
+.counterSpring {
+  transition: transform 300ms cubic-bezier(0.22, 1.5, 0.36, 1);
+  display: inline-block;
+}
+.counterBump {
+  transform: translateY(-2px) scale(1.08);
+  color: rgba(255, 255, 255, 0.95);
+}
+
+/* ---------- focus mode ---------- */
+
+.focusOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgba(2, 6, 23, 0.72);
+  backdrop-filter: blur(3px);
+  opacity: 0;
+  transition: opacity 180ms ease-out;
+}
+.focusOverlayOpen {
+  opacity: 1;
+}
+
+.focusPanel {
+  position: fixed;
+  z-index: 50;
+  border-radius: 0.75rem;
+  background: rgba(10, 14, 26, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+  transition:
+    top 260ms cubic-bezier(0.3, 1.05, 0.4, 1),
+    left 260ms cubic-bezier(0.3, 1.05, 0.4, 1),
+    width 260ms cubic-bezier(0.3, 1.05, 0.4, 1),
+    height 260ms cubic-bezier(0.3, 1.05, 0.4, 1),
+    opacity 160ms ease-out;
+}
+
+.focusScroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.18) transparent;
+}
+
+.payloadExpander > summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.payloadExpander > summary::-webkit-details-marker { display: none; }
+.payloadExpander > summary::before {
+  content: "▸ ";
+  color: rgba(255,255,255,0.4);
+}
+.payloadExpander[open] > summary::before {
+  content: "▾ ";
+}
+
+/* ---------- dense mode ---------- */
+
+.denseCard {
+  contain: layout paint style;
+}
+.denseCardSpawning {
+  animation: iw-spawn 380ms ease-out backwards;
+  animation-delay: var(--iw-stagger, 0ms);
+}
+
+/* ---------- reduced motion ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .cardSpawning,
+  .feedItem,
+  .statusDot,
+  .cardError,
+  .headDot,
+  .badgeGlowT1,
+  .badgeGlowT2,
+  .badgeGlowT3,
+  .milestoneFlash {
+    animation: none !important;
+  }
+  .scanline::after { animation: none; opacity: 0; }
+  .typeCaret::after { animation: none; opacity: 0; }
+  .focusPanel,
+  .focusOverlay,
+  .counterSpring {
+    transition-duration: 1ms !important;
+  }
+  .cardSettled { animation: none; opacity: 0.65; }
+}

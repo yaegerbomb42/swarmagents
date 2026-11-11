@@ -1,0 +1,7 @@
+src/**
+**/*.map
+tsconfig.json
+# Visual testing harness: dev-only, never ships in the VSIX.
+preview/**
+scripts/**
+screenshots/**

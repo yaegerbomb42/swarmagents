@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "ranAt": 1784519964010,
+  "model": "lfm2.5:8b-a1b-q4_K_M",
+  "providerName": "Ollama LFM2.5 A1B",
+  "providerType": "ollama",
+  "tasks": [
+    {
+      "id": "small_web_ui",
+      "title": "Build a small counter web UI",
+      "qualityBar": "medium",
+      "baseline": {
+        "passed": false,
+        "ms": 5922,
+        "files": [
+          "package.json",
+          "test/ui.test.js"
+        ],
+        "validation_feedback": "Hard gate failures: npm_test",
+        "repairs": 1,
+        "error": "Hard gate failures: npm_test"
+      },
+      "swarm": {
+        "passed": true,
+        "ms": 323670,
+        "files": [
+          "CONTEXT.md",
+          "README.md",
+          "app.js",
+          "deliverables/eval-small_web_ui-css.md",
+          "deliverables/eval-small_web_ui-html-sp-mrsp2fdf-gv2e.md",
+          "deliverables/eval-small_web_ui-html-sp-mrsp2fdg-ey9u.md",
+          "deliverables/eval-small_web_ui-html-sp-mrsp2psc-m383.md",
+          "deliverables/eval-small_web_ui-html-sp-mrsp32rp-seda.md",
+          "deliverables/eval-small_web_ui-html-sp-mrsp3bk4-mxn2.md",
+          "deliverables/eval-small_web_ui-html.md",
+          "index.html",
+          "package.json",
+          "test/ui.test.js"
+        ],
+        "validation_feedback": "Gates passed (medium); Gates passed (medium); Gates passed (medium); Gates passed (medium); Gates passed (medium); Hard gate failures: npm_test; Hard gate failures: npm_test",
+        "repairs": 3
+      }
+    }
+  ],
+  "summary": {
+    "baselinePassRate": 0,
+    "swarmPassRate": 1,
+    "liftPercentagePoints": 100,
+    "liftRatio": null,
+    "baselinePassed": 0,
+    "swarmPassed": 1,
+    "total": 1,
+    "headline": "Same model (lfm2.5:8b-a1b-q4_K_M): SwarmAgents +100pp vs plain chat (1/1 vs 0/1)"
+  }
+}

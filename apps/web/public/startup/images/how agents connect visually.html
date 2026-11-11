@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>State Space Diagram - Auto Routed Curved Arrows</title>
+<style>
+body { font-family:sans-serif; margin:0; display:flex; flex-direction:column; align-items:center; }
+canvas { border:1px solid #ccc; background:#f9f9f9; cursor:pointer; margin-top:10px; }
+#instructions { margin:10px; }
+</style>
+</head>
+<body>
+<div id="instructions">
+Drag inside node → move. Drag on node edge → create arrow. Arrows curve to avoid nodes. Colors unique per node.
+</div>
+<canvas id="canvas" width="1200" height="700"></canvas>
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+const labels = ['A','B','C','D','E','F','G','J','H','I','K'];
+let nodes = [];
+let edges = [];
+let dragNode = null;
+let creatingEdge = null;
+
+// Generate distinct colors
+function randomColor(index,total){
+  return `hsl(${index/total*360},70%,50%)`;
+}
+
+class Node {
+  constructor(x,y,label,color){
+    this.x = x;
+    this.y = y;
+    this.label = label;
+    this.color = color;
+    this.radius = 25;
+  }
+}
+
+class Edge {
+  constructor(from,to,color){
+    this.from = from;
+    this.to = to;
+    this.color = color;
+  }
+}
+
+// Circle layout
+function layoutNodes(){
+  const centerX = canvas.width/2;
+  const centerY = canvas.height/2;
+  const radius = Math.min(canvas.width,canvas.height)/2.5;
+  const angleStep = (2*Math.PI)/labels.length;
+  nodes = labels.map((label,i)=>{
+    const angle = i*angleStep;
+    const x = centerX + radius*Math.cos(angle);
+    const y = centerY + radius*Math.sin(angle);
+    return new Node(x,y,label,randomColor(i,labels.length));
+  });
+}
+
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  edges.forEach(drawEdge);
+  if(creatingEdge) drawTempEdge(creatingEdge);
+  nodes.forEach(drawNode);
+}
+
+function drawNode(n){
+  ctx.fillStyle = n.color;
+  ctx.beginPath();
+  ctx.arc(n.x,n.y,n.radius,0,Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle="black";
+  ctx.stroke();
+  ctx.fillStyle="black";
+  ctx.font="16px sans-serif";
+  ctx.textAlign="center";
+  ctx.textBaseline="middle";
+  ctx.fillText(n.label,n.x,n.y);
+}
+
+// Curved edge
+function drawEdge(e){
+  const from = e.from;
+  const to = e.to;
+  ctx.strokeStyle = e.color;
+  ctx.fillStyle = e.color;
+  ctx.lineWidth = 2;
+  
+  if(from === to){
+    // self-loop: top-right curve
+    const loopRadius = 30;
+    ctx.beginPath();
+    ctx.arc(from.x, from.y - from.radius - loopRadius/2, loopRadius, 0, 2*Math.PI);
+    ctx.stroke();
+    drawArrowhead(from.x + loopRadius, from.y - from.radius - loopRadius/2, Math.PI/4, e.color);
+  } else {
+    // curved line using quadratic bezier
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const midX = (from.x + to.x)/2 - dy*0.2; // offset perpendicular
+    const midY = (from.y + to.y)/2 + dx*0.2;
+    
+    const angle = Math.atan2(to.y - from.y, to.x - from.x);
+    const startX = from.x + from.radius*Math.cos(angle);
+    const startY = from.y + from.radius*Math.sin(angle);
+    const endX = to.x - to.radius*Math.cos(angle);
+    const endY = to.y - to.radius*Math.sin(angle);
+    
+    ctx.beginPath();
+    ctx.moveTo(startX,startY);
+    ctx.quadraticCurveTo(midX,midY,endX,endY);
+    ctx.stroke();
+    
+    // arrowhead at end
+    const t = 0.95; // point along curve for arrow
+    const cx = (1-t)*(1-t)*startX + 2*(1-t)*t*midX + t*t*endX;
+    const cy = (1-t)*(1-t)*startY + 2*(1-t)*t*midY + t*t*endY;
+    const dxArrow = cx - ((1-t)*(1-t)*startX + 2*(1-t)*t*midX + (t-0.05)*(t-0.05)*endX);
+    const dyArrow = cy - ((1-t)*(1-t)*startY + 2*(1-t)*t*midY + (t-0.05)*(t-0.05)*endY);
+    drawArrowhead(cx,cy,Math.atan2(dyArrow,dxArrow),e.color);
+  }
+}
+
+function drawArrowhead(x,y,angle,color){
+  const size = 10;
+  ctx.beginPath();
+  ctx.moveTo(x,y);
+  ctx.lineTo(x - size*Math.cos(angle - Math.PI/6), y - size*Math.sin(angle - Math.PI/6));
+  ctx.lineTo(x - size*Math.cos(angle + Math.PI/6), y - size*Math.sin(angle + Math.PI/6));
+  ctx.lineTo(x,y);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+// Temporary edge while dragging
+function drawTempEdge(temp){
+  const from = temp.from;
+  const toX = temp.toX;
+  const toY = temp.toY;
+  ctx.strokeStyle = temp.color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  const dx = toX - from.x;
+  const dy = toY - from.y;
+  const midX = (from.x + toX)/2 - dy*0.2;
+  const midY = (from.y + toY)/2 + dx*0.2;
+  ctx.moveTo(from.x,from.y);
+  ctx.quadraticCurveTo(midX,midY,toX,toY);
+  ctx.stroke();
+}
+
+// Detect node under cursor
+function getNodeAt(x,y){
+  return nodes.find(n=>Math.hypot(x-n.x,y-n.y)<=n.radius);
+}
+
+// Check if point is near node edge for arrow creation
+function isOnEdge(n,x,y){
+  const dist = Math.hypot(x-n.x,y-n.y);
+  return dist > n.radius*0.6 && dist <= n.radius + 5; // outer ring
+}
+
+// Mouse events
+canvas.addEventListener('mousedown', e=>{
+  const n = getNodeAt(e.offsetX,e.offsetY);
+  if(n){
+    if(isOnEdge(n,e.offsetX,e.offsetY)){
+      creatingEdge = {from:n,toX:e.offsetX,toY:e.offsetY,color:n.color};
+    } else {
+      dragNode = n;
+    }
+  }
+});
+
+canvas.addEventListener('mousemove', e=>{
+  if(dragNode){
+    dragNode.x = e.offsetX;
+    dragNode.y = e.offsetY;
+    draw();
+  }
+  if(creatingEdge){
+    creatingEdge.toX = e.offsetX;
+    creatingEdge.toY = e.offsetY;
+    draw();
+  }
+});
+
+canvas.addEventListener('mouseup', e=>{
+  if(creatingEdge){
+    const target = getNodeAt(e.offsetX,e.offsetY) || creatingEdge.from;
+    edges.push(new Edge(creatingEdge.from,target,creatingEdge.color));
+    creatingEdge = null;
+    draw();
+  }
+  dragNode = null;
+});
+
+// Initialize nodes
+layoutNodes();
+draw();
+</script>
+</body>
+</html>
+

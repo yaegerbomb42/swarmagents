@@ -1,0 +1,27 @@
+:root {
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #e8f3ff;
+  background-color: #05070e;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(120% 90% at 50% 0%, rgba(50, 120, 210, 0.18), rgba(5, 7, 14, 1)),
+    #05070e;
+}
+
+#root {
+  min-height: 100vh;
+}

@@ -1,0 +1,11 @@
+.git
+.gitignore
+.next/cache
+*.md
+*.log
+e2e
+tests
+.DS_Store
+public/startup
+.gitnexus
+current

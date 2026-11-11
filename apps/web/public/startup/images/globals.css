@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .scrollbar-hide::-webkit-scrollbar {
+      display: none;
+  }
+  .scrollbar-hide {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+  }
+  .mask-image-b {
+    mask-image: linear-gradient(to bottom, transparent, black 10%, black 100%);
+    -webkit-mask-image: linear-gradient(to bottom, transparent, black 10%, black 100%);
+  }
+}

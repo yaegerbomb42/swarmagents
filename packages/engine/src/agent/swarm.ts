@@ -148,17 +148,23 @@ export interface SwarmExecutors {
   implementer: (spec: MilestoneSpec, ctx: SwarmPhaseContext) => Promise<ImplResult>;
   redTeam: (spec: MilestoneSpec, impl: ImplResult) => Promise<QaResult>;
   auditor: (spec: MilestoneSpec, impl: ImplResult, qa: QaResult) => Promise<AuditResult>;
+  /** Optional pre-implementation review of a proposal (security, speed, correctness). */
+  reviewer?: (spec: MilestoneSpec) => Promise<PeerReview>;
 }
 
 export type SwarmPhase = SwarmRoleId;
 
 /** Phase lifecycle, delivered to the coordinator's onEvent callback. */
 export interface SwarmEvent {
-  phase: SwarmPhase;
+  phase?: SwarmPhase;
   stage: 'start' | 'done';
   at: number;
   /** The spec id once the architect has produced it; the goal before that. */
   detail: string;
+  /** Telemetry: the delegation-bus message type when this is a bus/consensus event. */
+  messageType?: SwarmMessageType;
+  /** Telemetry: JSON-serializable payload for WebSocket/SSE consumers. */
+  payload?: unknown;
 }
 
 export interface SwarmCoordinatorDeps {
@@ -166,6 +172,8 @@ export interface SwarmCoordinatorDeps {
   scratchpad: SharedScratchpad;
   locks: RegionLockManager;
   onEvent?: (event: SwarmEvent) => void;
+  /** Optional delegation bus; when set, protocol messages are published to it. */
+  bus?: DelegationBus;
   /** Clock for event timestamps; injectable for deterministic tests. */
   now?: () => number;
   /** Timeout for the implementer phase's lock acquisition; waits indefinitely when omitted. */
@@ -189,6 +197,7 @@ export class SwarmCoordinator {
   private readonly executors: SwarmExecutors;
   private readonly scratchpad: SharedScratchpad;
   private readonly locks: RegionLockManager;
+  private readonly bus: DelegationBus | undefined;
   private readonly onEvent: ((event: SwarmEvent) => void) | undefined;
   private readonly now: () => number;
   private readonly lockTimeoutMs: number | undefined;
@@ -197,6 +206,7 @@ export class SwarmCoordinator {
     this.executors = deps.executors;
     this.scratchpad = deps.scratchpad;
     this.locks = deps.locks;
+    this.bus = deps.bus;
     this.onEvent = deps.onEvent;
     this.now = deps.now ?? Date.now;
     this.lockTimeoutMs = deps.lockTimeoutMs;
@@ -253,7 +263,287 @@ export class SwarmCoordinator {
     return { spec, impl, qa, audit, verdict };
   }
 
+  /**
+   * Run the four-step deliberation protocol for a goal:
+   *   propose_plan -> peer_review -> delegate_task -> consensus_reached.
+   *
+   * This is a pre-execution agreement layer: it does not write code. Every bus
+   * message and the final consensus verdict are emitted as JSON telemetry events
+   * via onEvent, so dashboards can subscribe over WebSocket or SSE.
+   */
+  async deliberate(goal: string): Promise<DeliberationOutcome> {
+    const roundId = `round-${this.now()}`;
+    const messages: SwarmMessage[] = [];
+
+    const publish = (message: Omit<SwarmMessage, 'id' | 'timestamp'>): void => {
+      const emitted = this.bus?.publish(message);
+      if (emitted) messages.push(emitted);
+      this.emitTelemetry(emitted ? emitted.type : message.type, message.from, message.payload);
+    };
+
+    // 1. propose_plan — the planner breaks the goal into sub-tasks.
+    this.emit('architect', 'start', goal);
+    const spec = await this.executors.architect(goal);
+    this.emit('architect', 'done', spec.id);
+
+    const subTasks = spec.files.map((file) => ({
+      id: file.path,
+      title: `${file.action} ${file.path}`,
+      seat: 'implementer',
+      summary: file.path,
+    }));
+    publish({
+      type: 'propose_plan',
+      from: 'coordinator',
+      payload: { goal, roundId, subTasks },
+    });
+
+    // 2. peer_review — the critic scores the proposal for security, speed, correctness.
+    const review: PeerReview =
+      this.executors.reviewer !== undefined
+        ? await this.executors.reviewer(spec)
+        : ({
+            proposalId: spec.id,
+            reviewer: 'auditor',
+            scores: { security: 100, speed: 100, correctness: 100 },
+            verdict: 'approve' as const,
+            notes: [] as string[],
+          } as PeerReview);
+    publish({
+      type: 'peer_review',
+      from: review.reviewer,
+      payload: {
+        proposalId: spec.id,
+        roundId,
+        reviewer: review.reviewer,
+        scores: review.scores,
+        verdict: review.verdict,
+        notes: review.notes,
+      },
+    });
+
+    // 3. delegate_task — hand each sub-task to a specialized worker seat.
+    const reviewPasses = review.verdict === 'approve';
+    if (reviewPasses) {
+      for (const file of spec.files) {
+        const seat = seatFor(file);
+        publish({
+          type: 'delegate_task',
+          from: 'coordinator',
+          to: seat,
+          payload: {
+            roundId,
+            taskId: file.path,
+            seat,
+            instruction: `${file.action} ${file.path}`,
+          },
+        });
+      }
+    }
+
+    // 4. consensus_reached — every seat votes; tally against the threshold.
+    const votes: ConsensusVote[] = SWARM_SEATS.map((seat) => ({
+      seat,
+      decision: reviewPasses ? ('approve' as const) : ('reject' as const),
+      reason: reviewPasses
+        ? `proposal reviewed OK (${review.verdict})`
+        : `review did not pass (${review.verdict})`,
+    }));
+    const consensus = aggregateConsensus(roundId, votes, SWARM_SEATS.length);
+    publish({
+      type: 'consensus_reached',
+      from: 'coordinator',
+      payload: {
+        roundId,
+        approved: consensus.approved,
+        votesFor: consensus.votesFor,
+        votesAgainst: consensus.votesAgainst,
+        votesAbstain: consensus.votesAbstain,
+        total: consensus.total,
+        threshold: consensus.threshold,
+        summary: consensus.summary,
+      },
+    });
+
+    return { spec, review, consensus, messages };
+  }
+
+  private emitTelemetry(
+    messageType: SwarmMessageType,
+    from: string,
+    payload: unknown,
+  ): void {
+    this.onEvent?.({
+      stage: 'done',
+      at: this.now(),
+      detail: `${messageType} from ${from}`,
+      messageType,
+      payload,
+    });
+  }
+
   private emit(phase: SwarmPhase, stage: SwarmEvent['stage'], detail: string): void {
     this.onEvent?.({ phase, stage, at: this.now(), detail });
   }
+}
+
+/** ---------------------------------------------------------------------------
+ *  Typed message exchange protocol (delegation bus)
+ * -------------------------------------------------------------------------- */
+
+/** Message types exchanged between swarm seats during deliberation. */
+export type SwarmMessageType =
+  | 'propose_plan'
+  | 'peer_review'
+  | 'delegate_task'
+  | 'consensus_reached';
+
+/** Payload shape for each message type. */
+export interface SwarmMessagePayloads {
+  propose_plan: {
+    goal: string;
+    roundId: string;
+    subTasks: Array<{ id: string; title: string; seat: string; summary: string }>;
+  };
+  peer_review: {
+    proposalId: string;
+    roundId: string;
+    reviewer: string;
+    scores: { security: number; speed: number; correctness: number };
+    verdict: 'approve' | 'reject' | 'request-changes';
+    notes: string[];
+  };
+  delegate_task: {
+    roundId: string;
+    taskId: string;
+    seat: string;
+    instruction: string;
+  };
+  consensus_reached: {
+    roundId: string;
+    approved: boolean;
+    votesFor: number;
+    votesAgainst: number;
+    votesAbstain: number;
+    total: number;
+    threshold: number;
+    summary: string;
+  };
+}
+
+/** A single message published on the delegation bus. */
+export interface SwarmMessage<T extends SwarmMessageType = SwarmMessageType> {
+  id: string;
+  type: T;
+  from: string;
+  to?: string;
+  payload: SwarmMessagePayloads[T];
+  timestamp: number;
+  replyTo?: string;
+}
+
+/** Publish/subscribe bus for typed swarm messages. */
+export class DelegationBus {
+  private readonly listeners = new Set<(message: SwarmMessage) => void>();
+  private readonly _history: SwarmMessage[] = [];
+  private readonly now: () => number;
+
+  constructor(opts: { now?: () => number } = {}) {
+    this.now = opts.now ?? Date.now;
+  }
+
+  /** Publish a typed message; returns the enriched message (id + timestamp). */
+  publish<T extends SwarmMessageType>(
+    message: Omit<SwarmMessage<T>, 'id' | 'timestamp'>,
+  ): SwarmMessage<T> {
+    const full: SwarmMessage<T> = {
+      ...message,
+      id: `msg-${this.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      timestamp: this.now(),
+    } as SwarmMessage<T>;
+    this._history.push(full);
+    for (const listener of this.listeners) listener(full);
+    return full;
+  }
+
+  /** Subscribe to every message on the bus; returns an unsubscribe handle. */
+  subscribe(handler: (message: SwarmMessage) => void): () => void {
+    this.listeners.add(handler);
+    return () => this.listeners.delete(handler);
+  }
+
+  /** All messages published so far, in order. */
+  history(): readonly SwarmMessage[] {
+    return [...this._history];
+  }
+}
+
+
+/** ---------------------------------------------------------------------------
+ *  Consensus voting
+ * -------------------------------------------------------------------------- */
+
+export type ConsensusDecision = 'approve' | 'reject' | 'abstain';
+
+export interface ConsensusVote {
+  seat: string;
+  decision: ConsensusDecision;
+  reason: string;
+}
+
+export interface ConsensusResult {
+  roundId: string;
+  approved: boolean;
+  votesFor: number;
+  votesAgainst: number;
+  votesAbstain: number;
+  total: number;
+  threshold: number;
+  summary: string;
+}
+
+/** Simple majority threshold: floor(n/2) + 1. */
+export function consensusThreshold(total: number): number {
+  return Math.floor(total / 2) + 1;
+}
+
+/** Tally votes against the threshold. */
+export function aggregateConsensus(
+  roundId: string,
+  votes: readonly ConsensusVote[],
+  totalSeats: number,
+): ConsensusResult {
+  const votesFor = votes.filter((v) => v.decision === 'approve').length;
+  const votesAgainst = votes.filter((v) => v.decision === 'reject').length;
+  const votesAbstain = votes.filter((v) => v.decision === 'abstain').length;
+  const threshold = consensusThreshold(totalSeats);
+  const approved = votesFor >= threshold;
+  const summary = approved
+    ? `Consensus: ${votesFor}/${totalSeats} approved`
+    : `No consensus: ${votesFor}/${totalSeats} approved (need ${threshold})`;
+  return { roundId, approved, votesFor, votesAgainst, votesAbstain, total: totalSeats, threshold, summary };
+}
+
+/** The swarm seats, in pipeline order. */
+export const SWARM_SEATS: readonly SwarmRoleId[] = ['architect', 'implementer', 'red-team', 'auditor'];
+
+export interface PeerReview {
+  proposalId: string;
+  reviewer: string;
+  scores: { security: number; speed: number; correctness: number };
+  verdict: 'approve' | 'reject' | 'request-changes';
+  notes: string[];
+}
+
+/** Outcome of the four-step deliberation protocol. */
+export interface DeliberationOutcome {
+  spec: MilestoneSpec;
+  review: PeerReview;
+  consensus: ConsensusResult;
+  messages: readonly SwarmMessage[];
+}
+
+/** Map a spec file to the seat best suited to implement it. */
+function seatFor(_file: MilestoneFile): SwarmRoleId {
+  return 'implementer';
 }

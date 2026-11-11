@@ -206,6 +206,26 @@ function throwIfAborted(signal: AbortSignal): void {
   }
 }
 
+/**
+ * Settle with `promise`, or reject as soon as `signal` aborts. The work itself is not cancelled
+ * here (tools get the same signal and kill their subprocesses), but a provider SDK or tool that
+ * ignores the signal can no longer wedge a daemon turn or block shutdown.
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return promise;
+  const abortError = (): Error =>
+    signal.reason instanceof Error ? signal.reason : new Error('executeTurn aborted');
+  if (signal.aborted) return Promise.reject(abortError());
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  return Promise.race([promise, aborted]).finally(() => {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+  });
+}
+
 /** Repo-relative posix path for a user-supplied path, or undefined when unusable. */
 function relPosix(worktree: string, p: string): string | undefined {
   if (typeof p !== 'string' || !p.trim()) return undefined;
@@ -871,18 +891,20 @@ export class AgentTaskExecutor implements TaskExecutor {
         throw new Error(`budget refused the turn: ${pf.detail}`);
       }
       try {
-        const res = await this.withTurnTimeout(() =>
-          this.provider.complete({
-            ...turnRequest(
-              { system: ctx.system, tools: ctx.specs },
-              snapshot,
-              model.id,
-              maxTokens,
-              `daemon-${taskId}`,
-            ),
-            route: model.provider,
-            signal,
-          }),
+        const res = await this.withTurnTimeout(
+          () =>
+            this.provider.complete({
+              ...turnRequest(
+                { system: ctx.system, tools: ctx.specs },
+                snapshot,
+                model.id,
+                maxTokens,
+                `daemon-${taskId}`,
+              ),
+              route: model.provider,
+              signal,
+            }),
+          signal,
         );
         ctx.spentUsd += costUsd(res.usage, model.price);
         // Report the priced call to the budget ledger (via the recorder the
@@ -911,13 +933,16 @@ export class AgentTaskExecutor implements TaskExecutor {
   }
 
   /**
-   * Race `fn` against an optional strict per-turn timeout. On timeout the call is
-   * rejected with a retryable {@link ProviderError}, so the daemon sees a turn
-   * error and can fail over / quarantine rather than hang. Best-effort: it does
-   * not cancel the underlying request, which is bounded by the provider SDK.
+   * Race `fn` against an optional strict per-turn timeout and the task's abort signal. On timeout
+   * the call is rejected with a retryable {@link ProviderError}, so the daemon sees a turn error
+   * and can fail over / quarantine rather than hang. On abort it rejects with the signal reason,
+   * so shutdown is immediate. Best-effort: it does not cancel the underlying request, which is
+   * bounded by the provider SDK and receives the same signal.
    */
-  private withTurnTimeout<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.turnTimeoutMs <= 0) return fn();
+  private withTurnTimeout<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (this.turnTimeoutMs <= 0 && signal === undefined) return fn();
+    const work = fn();
+    if (this.turnTimeoutMs <= 0) return raceAbort(work, signal);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
@@ -925,7 +950,7 @@ export class AgentTaskExecutor implements TaskExecutor {
       }, this.turnTimeoutMs);
       timer.unref();
     });
-    return Promise.race([fn(), timeout]).finally(() => {
+    return raceAbort(Promise.race([work, timeout]), signal).finally(() => {
       if (timer !== undefined) clearTimeout(timer);
     });
   }
@@ -1048,8 +1073,9 @@ export class AgentTaskExecutor implements TaskExecutor {
 
     let out: ToolOutput;
     try {
-      out = await tool.run(parsed.data, ctx.toolCtx);
+      out = await raceAbort(tool.run(parsed.data, ctx.toolCtx), ctx.toolCtx.signal);
     } catch (err) {
+      if (ctx.toolCtx.signal?.aborted) throwIfAborted(ctx.toolCtx.signal);
       return errorResult(`tool ${call.name} threw: ${(err as Error).message}`);
     }
     const content = ctx.toolCtx.redactor.text(out.content);

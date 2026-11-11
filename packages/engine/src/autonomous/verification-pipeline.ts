@@ -14,6 +14,7 @@ import {
   countAssertionsInFiles,
   defaultRunCommand,
   extractExpectations,
+  isTypeScriptSourcePath,
   maxComplexityInFiles,
   type ExpectedAssertion,
   type RunCommand,
@@ -288,6 +289,25 @@ export function checkDiffHygiene(input: DiffHygieneInput): DiffHygieneResult {
   const secrets = scanPatchForSecrets(input.diff);
   for (const f of secrets.findings) {
     violations.push(`secret in ${f.file}:${f.line} — ${f.reason}`);
+  }
+
+  // Corrupt or incomplete generations: the TypeScript parser is error-tolerant, so a broken file
+  // still produces partial assertion/complexity counts (and tsc is skipped in non-TS repos). Report
+  // the diagnostics here so the task is sent back to IMPLEMENT with real feedback, never shipped.
+  for (const file of input.changedFiles) {
+    if (!isTypeScriptSourcePath(file)) continue;
+    const content = input.readFile?.(file);
+    if (content === undefined) continue;
+    const { syntaxErrors } = analyzeSourceText(content, file);
+    for (const d of syntaxErrors.slice(0, 3)) {
+      const at = d.line > 0 ? `:${d.line}:${d.column}` : '';
+      violations.push(`syntax error in ${file}${at}: ${d.message}`);
+    }
+    if (syntaxErrors.length > 3) {
+      violations.push(
+        `…and ${syntaxErrors.length - 3} more syntax error(s) in ${file} (fix the file before rerunning)`,
+      );
+    }
   }
 
   if (input.recentBlobHistory?.length && input.blobShas) {

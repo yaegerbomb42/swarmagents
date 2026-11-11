@@ -17,7 +17,7 @@ export interface InterruptEvent {
 export class TurnInterruptBus {
   private abortController: AbortController = new AbortController();
   private currentInterrupt: InterruptEvent | null = null;
-  private listeners: ((event: InterruptEvent) => void)[] = [];
+  private readonly listeners = new Set<(event: InterruptEvent) => void>();
 
   get signal(): AbortSignal {
     return this.abortController.signal;
@@ -52,7 +52,9 @@ export class TurnInterruptBus {
       new Error(`Interrupted: ${reason}${payload ? ` - ${payload}` : ''}`),
     );
 
-    for (const listener of this.listeners) {
+    // Snapshot: a listener may unsubscribe (or register another listener) while we dispatch.
+    // Iterating the live Set used to skip listeners in that case.
+    for (const listener of [...this.listeners]) {
       try {
         listener(event);
       } catch {
@@ -62,20 +64,37 @@ export class TurnInterruptBus {
   }
 
   /**
-   * Listen for interrupt events.
+   * Listen for interrupt events. A listener registered after the turn was already interrupted
+   * is called immediately with the latched event, so a late subscriber cannot miss a stop.
    */
   onInterrupt(callback: (event: InterruptEvent) => void): () => void {
-    this.listeners.push(callback);
+    if (this.currentInterrupt) {
+      try {
+        callback(this.currentInterrupt);
+      } catch {
+        // Safe dispatch: a listener must not crash the bus.
+      }
+      return () => undefined;
+    }
+    this.listeners.add(callback);
     return () => {
-      this.listeners = this.listeners.filter((l) => l !== callback);
+      this.listeners.delete(callback);
     };
   }
 
   /**
    * Reset the interrupt bus for the subsequent turn (re-arming the abort signal).
+   * Listeners stay registered; they are bus-scoped, not turn-scoped.
    */
   reset(): void {
     this.abortController = new AbortController();
     this.currentInterrupt = null;
+  }
+
+  /** Drop every listener and release the signal (session shutdown). */
+  dispose(): void {
+    this.listeners.clear();
+    this.currentInterrupt = null;
+    this.abortController = new AbortController();
   }
 }

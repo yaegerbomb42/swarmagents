@@ -17,6 +17,11 @@ vi.mock("@/lib/auth", () => ({
   waitForFirebaseUser: () => mockWaitForFirebaseUser(),
 }));
 
+let firebaseConfigured = true;
+vi.mock("@/lib/firebase", () => ({
+  isFirebaseConfigured: () => firebaseConfigured,
+}));
+
 import { useRequireAuth } from "./useRequireAuth";
 
 function Probe({ redirectTo }: { redirectTo?: string }) {
@@ -27,6 +32,7 @@ function Probe({ redirectTo }: { redirectTo?: string }) {
 describe("useRequireAuth", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    firebaseConfigured = true;
     mockEnsureAuthListener.mockImplementation(() => undefined);
   });
   afterEach(cleanup);
@@ -39,6 +45,27 @@ describe("useRequireAuth", () => {
     );
     expect(mockReplace).toHaveBeenCalledWith(
       `/login?next=${encodeURIComponent("/dashboard/live")}`,
+    );
+  });
+
+  it("accepts the founder sandbox session when Firebase is not configured", async () => {
+    firebaseConfigured = false;
+    mockWaitForFirebaseUser.mockResolvedValue(null);
+    mockFetchMe.mockResolvedValue({ ok: true });
+    render(<Probe />);
+    await waitFor(() =>
+      expect(screen.getByTestId("state").textContent).toBe("authed"),
+    );
+    expect(mockReplace).not.toHaveBeenCalled();
+  });
+
+  it("redirects without Firebase when there is no sandbox session", async () => {
+    firebaseConfigured = false;
+    mockWaitForFirebaseUser.mockResolvedValue(null);
+    mockFetchMe.mockResolvedValue({ ok: false });
+    render(<Probe />);
+    await waitFor(() =>
+      expect(screen.getByTestId("state").textContent).toBe("redirecting"),
     );
   });
 

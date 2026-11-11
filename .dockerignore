@@ -1,0 +1,14 @@
+**/node_modules
+**/.next
+**/dist
+**/.git
+**/*.log
+**/.DS_Store
+apps/web/public/startup
+apps/web/e2e
+apps/web/tests
+apps/web/current
+apps/web/.gitnexus
+apps/extension
+apps/cli
+deploy/.env.production

@@ -469,7 +469,7 @@ class AbortedError extends Error {
  * can no longer wedge the turn forever: the race settles immediately and the caller synthesizes a
  * normal cancellation result, preserving the tool_use/tool_result pairing the providers require.
  */
-async function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+export async function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   if (signal === undefined) return promise;
   if (signal.aborted) throw new AbortedError(signal.reason);
   let onAbort: (() => void) | undefined;

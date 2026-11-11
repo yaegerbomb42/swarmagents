@@ -3,7 +3,7 @@ import {
   IDLE_GAP_MS,
   efficiency,
   type RunEvent,
-} from '../../bench/efficiency.ts';
+} from './efficiency.js';
 
 /** Look-around tools. One of these alone is a wasted round trip (see the agent loop). */
 const EXPLORE_TOOLS: ReadonlySet<string> = new Set([

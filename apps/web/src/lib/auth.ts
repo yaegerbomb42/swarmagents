@@ -651,7 +651,8 @@ export async function requestPasswordReset(
 export async function fetchMe(): Promise<
   { ok: true; data: AuthUser } | { ok: false; error: AuthError; status: number }
 > {
-  const current = getFirebaseAuth().currentUser;
+  // Without Firebase config the founder sandbox session in localStorage is the session.
+  const current = isFirebaseConfigured() ? getFirebaseAuth().currentUser : null;
   if (current) {
     const user = toAuthUser(current);
     localStorage.setItem(USER_KEY, JSON.stringify(user));

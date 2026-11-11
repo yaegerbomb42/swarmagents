@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { ensureAuthListener, fetchMe, waitForFirebaseUser } from '@/lib/auth';
+import { isFirebaseConfigured } from '@/lib/firebase';
 
 export type RequireAuthState = 'checking' | 'authed' | 'redirecting';
 
@@ -21,7 +22,8 @@ export function useRequireAuth(redirectTo = '/login'): RequireAuthState {
     (async () => {
       const firebaseUser = await waitForFirebaseUser();
       if (cancelled) return;
-      if (!firebaseUser) {
+      // Unconfigured Firebase: the sandbox session (set by login()) is checked by fetchMe below.
+      if (!firebaseUser && isFirebaseConfigured()) {
         setState('redirecting');
         router.replace(`${redirectTo}?next=${encodeURIComponent(pathname || '/')}`);
         return;

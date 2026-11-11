@@ -20,16 +20,18 @@ const RPM_AUTHED_FREE = Number(process.env.RATE_LIMIT_RPM_AUTHED_FREE || 60);
 const RPM_PAID = Number(process.env.RATE_LIMIT_RPM_PAID || 300);
 
 export const config = {
-  matcher: ['/api/llm/:path*', '/api/agent/:path*', '/api/tasks/:path*'],
+  matcher: ['/api/llm/:path*', '/api/agent/:path*', '/api/tasks/:path*', '/api/harness/:path*'],
 };
 
 function limitFor(req: NextRequest): { limit: number; key: string } {
   const auth = req.headers.get('authorization') || '';
   const authed = auth.toLowerCase().startsWith('bearer ') && auth.length > 12;
   const plan = req.headers.get('x-user-plan') === 'paid' ? 'paid' : 'free';
+  // x-real-ip is set by the reverse proxy (nginx proxy manager) and cannot be forged by the
+  // client; the first x-forwarded-for hop can, so it is only a fallback.
   const ip =
-    req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
     req.headers.get('x-real-ip') ||
+    req.headers.get('x-forwarded-for')?.split(',').pop()?.trim() ||
     'unknown';
   const key = authed ? `user:${auth.slice(7, 19)}` : `ip:${ip}`;
   if (!authed) return { limit: RPM_ANONYMOUS, key };

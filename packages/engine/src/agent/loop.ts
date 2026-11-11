@@ -71,6 +71,12 @@ import type { CascadeCircuitBreaker } from '../router/circuit-breaker.js';
 import { buildEscalationHandoff } from '../router/escalation-handoff.js';
 import { toolStateProgress } from '../runtime/kernel/telemetry.js';
 import { todoItemsOf, todoNudge, todoTool, type TodoItem } from '../tools/todo.js';
+import {
+  applyRoleToLoopContext,
+  applyRoleToLoopDeps,
+  toolDenialMessage,
+  type RoleDefinition,
+} from '../roles/index.js';
 
 /** Thrown inside the retry loop when a pre-flight check refuses the call; ends the cycle, never retried. */
 class BudgetStopSignal extends Error {
@@ -253,6 +259,8 @@ export interface LoopDeps {
   /** How the chain is used per call (routing.ts): random reshuffles, priority ignores quota marks. */
   strategy?: Strategy;
   tools: readonly Tool[];
+  /** Optional declarative role bound to this loop (whitelist, permissions, clamps). */
+  role?: RoleDefinition;
   toolCtx: ToolContext;
   /** Lazy tool discovery state (persists across context compaction). */
   loadedToolsState?: LoadedToolsState | null;
@@ -583,6 +591,8 @@ export async function runAgentLoop(
   },
   deps: LoopDeps,
 ): Promise<LoopResult> {
+  deps = applyRoleToLoopDeps(deps);
+  ctx = applyRoleToLoopContext(ctx, deps.role);
   let messages: Message[] = [...(ctx.history ?? []), ctx.first];
   if (deps.systemOne) {
     // The pre-fetch rides in the new user turn, after the cached history and system prefix.
@@ -1219,6 +1229,15 @@ export async function runAgentLoop(
     const finished = { now: false };
     const branchState = { riskyToolFailed: false };
     const runCallInner = async (call: (typeof calls)[number]): Promise<ContentBlock> => {
+      const denied = toolDenialMessage(deps.role, call.name);
+      if (denied) {
+        return {
+          type: 'tool_result',
+          toolUseId: call.id,
+          content: denied,
+          isError: true,
+        };
+      }
       // Lazy mode: auto-load tool group if tool exists but isn't loaded
       if (deps.loadedToolsState && !deps.loadedToolsState.toolToGroup.has(call.name)) {
         // Tool not in any group (e.g., MCP tools) - allow it

@@ -261,3 +261,41 @@ Strict Scope & Feature Deliverables:
    - Verify build integrity with `npm run build` in apps/web.
    - Commit your enhancements: `git commit -am "feat(swarm): multi-agent consensus bus and live debate feed"`.
 ```
+
+---
+
+## ⚡ Task 7: Autonomous Web Research & Intelligent Live Browser Agent (`packages/engine/src/tools/extra/browser/`)
+
+> **Assigned Agent**: Claude Code / Cline / Grok Bot (Specialist in Web Automation & Live Scraping)  
+> **Repository to Pull**: `https://github.com/yaegerbomb42/swarmagents.git`  
+> **Scope Boundaries**: Strictly confined to `packages/engine/src/tools/extra/browser/` and `apps/web/src/lib/tools/webBrowser.ts`. Zero edits to core UI layout, auth, or deploy files.
+
+### Prompt to Pass to Browser Specialist Agent:
+```markdown
+Target Repository: https://github.com/yaegerbomb42/swarmagents.git
+Working Directory: packages/engine/src/tools/extra/browser/ & apps/web/src/lib/tools/
+
+Context:
+The SwarmAgents dashboard requires active web browsing and autonomous research capabilities (@browse and research agents) so agents can search documentation, extract GitHub issues, verify APIs, and inspect web app states in real time. 
+
+Your Objective:
+Build and polish a robust, high-performance "Autonomous Web Research & Scraping Pipeline" that streams live browser telemetry (URLs, page titles, cleaned markdown content, and screenshot snapshots) directly to the SwarmAgents console.
+
+Strict Scope & Feature Deliverables:
+1. Intelligent Content Extractor (`packages/engine/src/tools/extra/web_extractor.ts` & `web_search.ts`):
+   - Implement clean HTML-to-Markdown distillation that strips ads, navbars, and cookie banners to preserve LLM token context.
+   - Support DuckDuckGo / SearXNG / Google search fallback queries with multi-engine query fallbacks.
+2. Virtual Headless Browser Session Manager (`packages/engine/src/tools/extra/browser/`):
+   - Provide safe page navigation (`navigate(url)`), element interaction (`click(selector)`), and text input (`type(selector, text)`).
+   - Implement a lightweight visual snapshot generator (returns either a rendered DOM wireframe or Base64 WebP screenshot).
+3. Telemetry Stream Event Hook (`apps/web/src/lib/tools/webBrowser.ts`):
+   - When an agent browses, emit real-time events:
+     * `browser:navigating`: { url, timestamp }
+     * `browser:loaded`: { url, title, statusCode, contentLength }
+     * `browser:snapshot`: { url, wireframeSnippet, screenshotUrl }
+   - These events feed directly into the right-hand browser preview screen on the new minimalist dashboards.
+4. Validation & Deliverable:
+   - Ensure the browser tool handles timeouts, redirects, and network failures gracefully without throwing unhandled exceptions.
+   - Run typechecks and unit tests in `packages/engine`.
+   - Commit cleanly: `git commit -am "feat(tools): autonomous web browsing and live telemetry extraction pipeline"`.
+```

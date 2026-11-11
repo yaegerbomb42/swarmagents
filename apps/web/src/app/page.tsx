@@ -50,7 +50,18 @@ export default function HomeConsole() {
       try {
         const res = await fetch('/api/harness/task', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            // Same token the /console page stores when the server requires one.
+            ...(() => {
+              try {
+                const t = localStorage.getItem('swarm.harnessToken');
+                return t ? { Authorization: `Bearer ${t}` } : {};
+              } catch {
+                return {};
+              }
+            })(),
+          },
           body: JSON.stringify({
             prompt: text,
             provider: provider?.type ?? undefined,

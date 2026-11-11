@@ -1,82 +1,105 @@
 # SwarmAgents — Autonomous Engineering Team Handoff Briefs
 
-This document contains dedicated, modular prompt briefs tailored for **Muse**, **Grok Bot**, and your coding assistants (**OpenCode**, **Cline**, **Claude Code**) to systematically test, debug, and polish the unified `swarmagents` repository.
+This document contains dedicated, production-grade instructions for **Muse**, **Grok Bot**, and your coding assistants (**OpenCode**, **Cline**, **Claude Code**).
+
+- **GitHub Repository**: `https://github.com/yaegerbomb42/swarmagents.git`
+- **Local Workspace**: `/Users/yaeger/Desktop/swarmagents`
+- **Production URL**: `https://swarmagents.codes` (Deployed on Oracle VPS, zero GitHub Pages)
 
 ---
 
-## 🎯 Task 1: Prompt Brief for Muse (Deep Codebase Audit, UI Polish & Linting)
+## 🎯 Task 1: Prompt Brief for Muse (UI Simplification: Minimal Input Bar + Live Telemetry)
 
-> **Role**: Principal Full-Stack Architect & Code Reviewer  
-> **Workspace**: `/Users/yaeger/Desktop/swarmagents`  
-> **Repository**: `https://github.com/yaegerbomb42/swarmagents`
+> **Role**: Principal Product Designer & Frontend Systems Engineer  
+> **Repository to Pull**: `https://github.com/yaegerbomb42/swarmagents.git`  
+> **Workspace**: `/Users/yaeger/Desktop/swarmagents`
+
+### What Happened & What Needs Rectification:
+SwarmAgents accumulated legacy marketing overhead, complex multi-screen dashboard flows, and authentication blockers from old iterations. It has now been decoupled from the monolith and unified with the Omnexx autonomous harness engine. 
+
+### The End Goal for Muse:
+Transform the UI into a **way easier, minimal, high-aesthetic command console**:
+1. **Primary Interface**: A central, clean tactile input bar (like Linear/Raycast/Claude) for commanding autonomous agents.
+2. **Real-Time Telemetry Feed**: A live telemetry HUD displaying execution steps, model tokens/latency, and task status streaming directly from the Omnexx engine.
+3. **Provider Quick-Switch**: Simple BYOK model selector (Gemini, OpenRouter, Nemotron, Groq) right below or beside the prompt bar.
+4. **Remove Clutter**: Streamline or archive legacy landing clutter so the user lands straight into the operational agent console.
 
 ### Prompt to Send to Muse:
 ```markdown
-You are acting as the Lead Architect & Code Auditor on the brand-new unified SwarmAgents repository located at:
-/Users/yaeger/Desktop/swarmagents
+Pull and work in the SwarmAgents repository:
+git clone https://github.com/yaegerbomb42/swarmagents.git
+cd swarmagents/apps/web
 
-Context:
-SwarmAgents has been completely reorganized into a clean sovereign platform:
-- apps/web: Next.js 15 full-stack frontend & API deployed to https://swarmagents.codes
-- apps/cli: Unified SwarmAgents & Omnexx CLI runner
-- apps/extension: VSCode Extension for the harness
-- packages/engine: Omnexx Autonomous Cognitive Core & Harness
-- packages/providers: Provider keys & concurrency racing layer
-- deploy/: Production Docker container and 1-command VPS deploy script
+Context & What Happened:
+SwarmAgents previously suffered from cluttered legacy marketing layouts, complicated nested dashboard tabs, and auth roadblocks. We have broken it out into this sovereign repo and merged it with the Omnexx execution harness.
 
-Your Objective:
-1. Audit apps/web:
-   - Check all page routes (/login, /signup, /decomp, /dashboard, /pricing, /live) for missing imports, syntax inconsistencies, or broken Tailwind styles.
-   - Ensure the instant sandbox authentication session in apps/web/src/lib/auth.ts operates flawlessly without throwing unhandled exceptions.
-   - Clean up any dead code, unused dependencies in package.json, or duplicate styles.
-2. Verify packages/engine (Omnexx):
-   - Inspect packages/engine/src/swarmagents-bridge.ts and ensure types line up with the task graph from apps/web/src/types/decomposition.ts.
-3. Test builds:
-   - Run typechecks and linting where applicable.
-   - Deliver a clear summary of all fixes made and commit cleanly to git with descriptive messages.
+Your Mission:
+Redesign and simplify apps/web to deliver an ultra-clean, minimal, high-focus agent workspace:
+1. Centered Prompt & Command Bar:
+   - Make the hero/home experience instantly actionable with a clean, floating prompt input bar where the user can dispatch missions directly to agents.
+2. Live Telemetry & Execution Stream:
+   - Below the input bar, render a high-density, real-time telemetry card/feed showing agent thought processes, tool actions, and latency/token counters (fed by /api/harness/task).
+3. Provider Selector:
+   - Provide a sleek selector pill for switching model backends (Nemotron, Mercury, Gemini, Groq, OpenRouter).
+4. Remove Bloat:
+   - Bypass confusing sub-pages and ensure anyone arriving at https://swarmagents.codes is immediately in the sleek command interface with zero friction.
+5. Verify build:
+   - Run `npm run build` inside apps/web to ensure clean compilation.
+   - Commit your work with `git commit -am "feat(ui): minimal prompt bar and live telemetry console"` and push to `origin main`.
 ```
 
 ---
 
-## ⚡ Task 2: Prompt Brief for Grok Bot (Nemotron & Mercury Runner / Harness Integration)
+## ⚡ Task 2: Prompt Brief for Grok Bot (Nemotron & Mercury Engine Runner / Verification)
 
-> **Role**: Systems & Runtime Verification Engineer  
+> **Role**: Principal Autonomous Systems & Infrastructure Engineer  
+> **Repository to Pull**: `https://github.com/yaegerbomb42/swarmagents.git`  
 > **Workspace**: `/Users/yaeger/Desktop/swarmagents`  
-> **Execution Substrate**: Omnexx Engine + Fast Provider Key Clusters (Nemotron & Mercury)
+> **Key Clusters**: Nemotron & Mercury
+
+### What Happened & What Needs Rectification:
+SwarmAgents is now powered by **Omnexx as its core runner harness** (`packages/engine`), while `apps/web` provides the UI and API. In the past, the engine and frontend suffered from disjointed schemas, unconfigured Firebase auth walls, and simulated responses. 
+
+### The End Goal for Grok Bot:
+1. Wire up the **Nemotron and Mercury API keys** in the engine's key pool and provider manager for high-speed agentic execution.
+2. Ensure every task submitted through the minimal input bar in `apps/web` executes through the Omnexx harness runtime (`packages/engine/src/agent/loop.ts` & `swarmagents-bridge.ts`).
+3. Deploy the rectified build to production on `https://swarmagents.codes` using `./deploy/deploy.sh`.
 
 ### Prompt to Send to Grok Bot:
 ```markdown
-You are acting as the Autonomous Systems & Runtime Engineer on SwarmAgents:
-/Users/yaeger/Desktop/swarmagents
+Pull and work in the SwarmAgents repository:
+git clone https://github.com/yaegerbomb42/swarmagents.git
+cd swarmagents
 
-Objective:
-Verify and harden the live execution loop connecting SwarmAgents (UI/API) with the Omnexx Harness Engine, utilizing your Nemotron and Mercury provider key clusters for blazing fast execution and automated testing.
+Context & What Happened:
+SwarmAgents has been separated into this clean repository. Omnexx is now the execution engine in packages/engine/, and apps/web is the control plane at https://swarmagents.codes. The previous issues stemmed from Firebase auth errors and disconnected execution backends.
 
-Key Directives:
-1. Harness Bridge Verification:
-   - Inspect apps/web/src/app/api/harness/task/route.ts.
-   - Connect it with packages/engine/src/swarmagents-bridge.ts to trigger real cognitive loops when tasks are dispatched.
-   - Ensure Nemotron and Mercury API providers are registered in packages/engine/src/llm/ or apps/web/src/lib/providerTemplates.ts so tasks can race across NVIDIA/Cerebras/Groq clusters.
-2. Live Endpoint Testing:
-   - Test https://swarmagents.codes/api/health and https://swarmagents.codes/api/harness/task.
-   - Verify that tasks created in the /decomp DAG canvas can post directly to the harness without 404s or 500s.
-3. VPS Deployment:
-   - If changes are made to apps/web or deploy/, run `./deploy/deploy.sh` to build and verify live container execution on the VPS (147.224.158.118).
-4. Provide direct proof of success:
-   - Return curl outputs, container logs, and test run results.
+Your Mission:
+1. Provider Integration (Nemotron & Mercury):
+   - In packages/engine/src/llm/ or apps/web/src/lib/providerTemplates.ts, configure the Nemotron and Mercury provider key clusters.
+   - Set up concurrency racing and automatic key rotation so completions run with ultra-low latency and 0 rate limits.
+2. Wire Web to Omnexx Engine:
+   - Connect apps/web/src/app/api/harness/task/route.ts to the real Omnexx runtime in packages/engine/src/swarmagents-bridge.ts.
+   - Ensure dispatched tasks stream live step telemetry back to the client interface.
+3. Bug Resolution & Verification:
+   - Hunt down and fix any lingering TypeScript errors or runtime gaps between apps/web and packages/engine.
+4. Deploy to Production:
+   - Run `./deploy/deploy.sh` to build the standalone Docker container and swap it live on the Oracle VPS (147.224.158.118).
+   - Test https://swarmagents.codes/api/health and the main console live to verify 100% functionality.
 ```
 
 ---
 
-## 🛠️ Task 3: Prompt Brief for Cline / OpenCode / Claude Code (CLI & VSCode Extension Integration)
+## 🛠️ Task 3: Prompt Brief for Cline / OpenCode / Claude Code (CLI & VSCode Extension)
+
+> **Role**: Tooling & Developer Experience Engineer  
+> **Repository to Pull**: `https://github.com/yaegerbomb42/swarmagents.git`
 
 ### Prompt:
 ```markdown
-You are assigned to align the SwarmAgents CLI and VSCode extension in /Users/yaeger/Desktop/swarmagents:
+Pull https://github.com/yaegerbomb42/swarmagents.git and link the developer tooling:
 1. apps/cli:
-   - Implement `swarm status` and `swarm run "<task>"` using the packages/engine Omnexx runtime.
-   - Add alias support for `omnexx` commands.
+   - Implement `swarm run "<task>"` and `omnexx run "<task>"` to trigger local agent executions via packages/engine.
 2. apps/extension:
-   - Verify out/extension.cjs loads cleanly in VSCode.
-   - Point extension telemetry and API calls to https://swarmagents.codes.
+   - Verify the Omnexx VSCode extension connects directly to https://swarmagents.codes for telemetry and cloud agent runs.
 ```

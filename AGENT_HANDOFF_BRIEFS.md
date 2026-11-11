@@ -190,3 +190,74 @@ Key Requirements:
 3. Styling:
    - Crisp `#08080a` base, `#121217` bento containers, cyan/emerald status highlights, subtle hover scale micro-interactions.
 ```
+
+---
+
+## 🔬 Task 5: Deep Quality & Hardening Audit (Autonomous Code Health & Anti-Regression)
+
+> **Assigned Agent**: OpenCode / Claude Code / Senior Quality Auditor  
+> **Repository to Pull**: `https://github.com/yaegerbomb42/swarmagents.git`  
+> **Scope Boundaries**: Strictly read-only analysis of `packages/engine/src/agent/` and `packages/engine/src/autonomous/`, followed by targeted, surgical hardening.
+
+### Prompt to Pass to Auditor Agent:
+```markdown
+Target Repository: https://github.com/yaegerbomb42/swarmagents.git
+Working Directory: packages/engine/
+
+Context:
+SwarmAgents has incorporated the entire Omnexx autonomous core into `packages/engine/`. This core contains multi-turn cognitive loops, GOAP planners, self-healing ratchets, AST analyzers, and file-staging primitives. Because this engine is the operational brain for all agent executions, it must possess deterministic stability, zero silent failures, and rock-solid error handling.
+
+Your Objective:
+Perform an exhaustive, strongly scoped quality and resilience audit across the autonomous execution core, and harden it against silent stalls or memory bloat.
+
+Strict Scope & Focus Areas:
+1. Cognitive Loop & Turn Budgeting (`packages/engine/src/agent/loop.ts` & `turn-budget.ts`):
+   - Inspect the termination conditions. Ensure that infinite loops, cascading 429 rate-limit retries, and stuck tool-call cycles are strictly bounded by timeout or turn limit.
+   - Verify that abort signals (`AbortController` / `interrupt-bus.ts`) immediately halt downstream worker subprocesses and flush telemetry cleanly.
+2. Safe Staging & AST Parsing (`packages/engine/src/autonomous/ast-analysis.ts` & `core/atomicWrite.ts`):
+   - Audit atomic writes to ensure corrupt syntax or incomplete code generations never overwrite target project files directly.
+   - Ensure the AST parser handles edge-case TypeScript/TSX syntax and returns clean error feedback to the agent instead of throwing unhandled exceptions.
+3. Memory & State Leaks (`packages/engine/src/autonomous/state-store.ts` & `agent/rolling-memory.ts`):
+   - Check episodic memory compaction. Ensure large session histories are automatically compressed so context token limits are never blown.
+4. Output Deliverable:
+   - Provide a clear audit report highlighting any identified vulnerabilities or race conditions.
+   - Implement surgical fixes with full test coverage where tests exist.
+   - Commit cleanly: `git commit -am "fix(engine): harden cognitive loop bounds and AST error handling"`.
+```
+
+---
+
+## 🚀 Task 6: Feature Enhancement — Multi-Agent Swarm Collaboration & Live Consensus Replay
+
+> **Assigned Agent**: Grok Bot / Cline / Advanced Multi-Agent Specialist  
+> **Repository to Pull**: `https://github.com/yaegerbomb42/swarmagents.git`  
+> **Scope Boundaries**: Strictly focused on `packages/engine/src/agent/swarm.ts` and `apps/web/src/components/swarm/` (zero changes to auth or deploy configs).
+
+### Prompt to Pass to Feature Agent:
+```markdown
+Target Repository: https://github.com/yaegerbomb42/swarmagents.git
+Working Directory: packages/engine/src/agent/ & apps/web/src/components/swarm/
+
+Context:
+SwarmAgents differentiates itself from single-agent coding tools by orchestrating a coordinated "company of agents" working in parallel—such as a Planner agent, an Author/Coder agent, a Critic/Auditor agent, and a Verifier/Tester agent.
+
+Your Objective:
+Enhance and elevate the Swarm collaboration protocol with a high-fidelity "Live Consensus & Delegation Engine" that allows users to see agents debate, vote, and divide tasks in real time.
+
+Strict Scope & Feature Deliverables:
+1. Multi-Agent Delegation Bus (`packages/engine/src/agent/swarm.ts` & `orchestration/`):
+   - Implement a typed message exchange protocol:
+     * `propose_plan`: Planner agent breaks a prompt into sub-tasks.
+     * `peer_review`: Critic agent scores the proposal for security, speed, and correctness.
+     * `delegate_task`: Coordinator hands sub-tasks to specialized worker seats.
+     * `consensus_reached`: Aggregates the collective output before final execution.
+2. Live Consensus Replay Feed (`apps/web/src/components/swarm/ConsensusReplay.tsx` or new component):
+   - Create a clean visual timeline / chat ribbon where users can inspect agent-to-agent deliberations.
+   - Show avatar badges for each agent persona (e.g. 🧠 Architect, ⚡ Rapid Coder, 🛡️ Security Sentinel).
+   - Include agreement indicators (e.g., "Consensus: 3/3 Approved" with green glowing badge).
+3. Telemetry Event Emitter:
+   - Ensure agent consensus events emit standard JSON events so the new minimalist dashboards can subscribe to them via WebSocket or Server-Sent Events (SSE).
+4. Validation & Commit:
+   - Verify build integrity with `npm run build` in apps/web.
+   - Commit your enhancements: `git commit -am "feat(swarm): multi-agent consensus bus and live debate feed"`.
+```

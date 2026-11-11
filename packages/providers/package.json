@@ -1,0 +1,15 @@
+{
+  "name": "@swarmagents/providers",
+  "version": "0.1.0",
+  "description": "Key pool + provider race engine for racing OpenAI-compatible LLM backends",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.11"
+  }
+}

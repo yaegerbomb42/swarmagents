@@ -14,7 +14,7 @@ FROM base AS deps
 RUN apk add --no-cache libc6-compat
 WORKDIR /app
 COPY apps/web/package.json apps/web/package-lock.json* apps/web/.npmrc ./
-RUN npm ci --no-audit --no-fund
+RUN npm ci --ignore-scripts --no-audit --no-fund
 
 FROM base AS builder
 WORKDIR /app

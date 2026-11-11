@@ -5,7 +5,14 @@ const EVENT_BUS_KEY = '__swarm_event_bus__';
 
 export interface SwarmEvent {
   id: string;
-  type: 'orchestrator' | 'task' | 'agent' | 'team' | 'profile' | 'system';
+  type:
+    | 'orchestrator'
+    | 'task'
+    | 'agent'
+    | 'team'
+    | 'profile'
+    | 'system'
+    | 'browser';
   action: string;
   payload: Record<string, unknown>;
   timestamp: number;

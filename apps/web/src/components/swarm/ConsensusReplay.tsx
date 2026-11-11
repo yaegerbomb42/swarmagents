@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Gavel, Play, Pause, RotateCcw, SkipBack, SkipForward } from 'lucide-react';
 import { unifiedApi } from '@/lib/api_client';
 
@@ -38,7 +38,6 @@ function roleBadgeClass(role: string): string {
   return 'border-white/10 bg-white/5 text-white/60';
 }
 
-
 const AGENT_PERSONAS: Record<string, { emoji: string; name: string }> = {
   proposer: { emoji: '🧠', name: 'Architect' },
   architect: { emoji: '🧠', name: 'Architect' },
@@ -55,6 +54,49 @@ function agentPersona(role: string): { emoji: string; name: string } {
   return AGENT_PERSONAS[role] ?? { emoji: '🤖', name: 'Agent' };
 }
 
+/** Segmented agreement meter: approve / reject / abstain share of the seats. */
+function ConsensusMeter({ consensus }: { consensus: ConsensusPayload }) {
+  const total = Math.max(1, consensus.totalSeats ?? 1);
+  const forV = Math.max(0, consensus.votesFor ?? (consensus.accepted ? total : 0));
+  const against = Math.max(0, consensus.votesAgainst ?? 0);
+  const abstain = Math.max(0, total - forV - against);
+  const pct = (n: number) => Math.round((n / total) * 100);
+  return (
+    <div className="w-full border border-white/10 rounded bg-white/[0.02] overflow-hidden">
+      <div className="flex h-2">
+        {forV > 0 && (
+          <div
+            className="bg-emerald-500/25 border-r border-emerald-500/40"
+            style={{ width: `${pct(forV)}%` }}
+            title={`${forV}/${total} approved`}
+          >
+            <span className="sr-only">{forV} approved ({pct(forV)}%)</span>
+          </div>
+        )}
+        {against > 0 && (
+          <div
+            className="bg-rose-500/25 border-r border-rose-500/40"
+            style={{ width: `${pct(against)}%` }}
+            title={`${against}/${total} rejected`}
+          >
+            <span className="sr-only">{against} rejected ({pct(against)}%)</span>
+          </div>
+        )}
+        {abstain > 0 && (
+          <div className="bg-zinc-700/30" style={{ width: `${pct(abstain)}%` }}>
+            <span className="sr-only">{abstain} abstained ({pct(abstain)}%)</span>
+          </div>
+        )}
+      </div>
+      <div className="flex justify-between text-[9px] font-mono text-zinc-400 px-1">
+        <span className="text-emerald-400">{forV} approve</span>
+        <span className="text-rose-400">{against} reject</span>
+        <span className="text-zinc-400">{abstain} abstain</span>
+      </div>
+    </div>
+  );
+}
+
 export default function ConsensusReplay({
   consensus: consensusProp,
   autoFetch = true,
@@ -65,6 +107,8 @@ export default function ConsensusReplay({
   const [error, setError] = useState<string | null>(null);
   const [step, setStep] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [live, setLive] = useState(false);
+  const esRef = useRef<EventSource | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -103,7 +147,14 @@ export default function ConsensusReplay({
     () => consensus?.votesFor ?? (consensus?.accepted ? totalSeats : 0),
     [consensus?.votesFor, consensus?.accepted, totalSeats],
   );
-
+  const votesAgainst = useMemo(
+    () => consensus?.votesAgainst ?? 0,
+    [consensus?.votesAgainst],
+  );
+  const votesAbstain = useMemo(
+    () => Math.max(0, totalSeats - votesFor - votesAgainst),
+    [totalSeats, votesFor, votesAgainst],
+  );
 
   useEffect(() => {
     if (!playing || visible.length >= transcript.length) {
@@ -113,6 +164,64 @@ export default function ConsensusReplay({
     const id = window.setTimeout(() => setStep((s) => Math.min(s + 1, maxStep)), 900);
     return () => window.clearTimeout(id);
   }, [playing, visible.length, transcript.length, maxStep]);
+
+  // Live SSE subscription to the consensus / delegation-bus event stream.
+  // Guarded so it is a no-op in environments without EventSource (e.g. tests).
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof EventSource === 'undefined') {
+      return undefined;
+    }
+    const es = new EventSource('/api/events');
+    esRef.current = es;
+    setLive(true);
+
+    es.onopen = () => setLive(true);
+    es.onmessage = (raw) => {
+      try {
+        const data = JSON.parse(raw.data);
+        if (data?.type === 'system' && data.action === 'heartbeat') return;
+        const tele = data?.payload ?? data;
+        const msgType =
+          tele?.messageType ??
+          (typeof tele?.action === 'string' && /^(propose_plan|peer_review|delegate_task|consensus_reached)$/.test(tele.action)
+            ? tele.action
+            : undefined);
+        if (!msgType) return;
+        setConsensus((prev) => {
+          const next: ConsensusPayload = { ...prev, transcript: [...(prev?.transcript ?? [])] };
+          const turn: ConsensusTurn = {
+            role: tele?.from ?? tele?.action ?? 'agent',
+            agent_id: tele?.from ?? 'live',
+            content: tele?.detail ?? msgType,
+          };
+          next.transcript.push(turn);
+          if (msgType === 'consensus_reached') {
+            const busPayload = tele?.payload ?? tele;
+            next.accepted = busPayload?.approved ?? next.accepted;
+            next.votesFor = busPayload?.votesFor ?? next.votesFor;
+            next.votesAgainst = busPayload?.votesAgainst ?? next.votesAgainst;
+            next.totalSeats = busPayload?.total ?? next.totalSeats;
+            next.rounds = (next.rounds ?? 0) + 1;
+          }
+          return next;
+        });
+        setLive(true);
+      } catch {
+        // ignore malformed stream frames
+      }
+    };
+    es.onerror = () => setLive(false);
+
+    return () => {
+      esRef.current = null;
+      try {
+        es.close();
+      } catch {
+        /* ignore */
+      }
+      setLive(false);
+    };
+  }, []);
 
   const reset = () => {
     setStep(0);
@@ -130,6 +239,12 @@ export default function ConsensusReplay({
           <Gavel className="h-4 w-4 text-purple-300 shrink-0" aria-hidden />
           <div className="min-w-0">
             <p className="text-xs font-medium text-white/90 truncate">Consensus Replay</p>
+            {live && (
+              <span className="flex items-center gap-1 ml-1">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" aria-hidden />
+                <span className="text-[9px] font-semibold text-emerald-300">Live</span>
+              </span>
+            )}
             <p className="text-[10px] text-zinc-500">
               {consensus
                 ? `${consensus.rounds} round(s) · ${consensus.accepted ? 'accepted' : 'rejected'}`
@@ -214,6 +329,12 @@ export default function ConsensusReplay({
               {step + 1}/{transcript.length || 1}
             </span>
           </div>
+          {consensus && (
+            <div className="w-full px-3 py-2">
+              <p className="text-[9px] font-mono text-zinc-500 mb-1">Seat agreement</p>
+              <ConsensusMeter consensus={consensus} />
+            </div>
+          )}
 
           <div className="flex-1 min-h-[10rem] max-h-72 overflow-y-auto p-3 space-y-2">
             {visible.map((turn, i) => (

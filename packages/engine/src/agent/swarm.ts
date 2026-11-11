@@ -180,6 +180,68 @@ export interface SwarmCoordinatorDeps {
   lockTimeoutMs?: number;
 }
 
+/** ---------------------------------------------------------------------------
+ *  Telemetry event emitter (delegation bus broadcast)
+ * -------------------------------------------------------------------------- */
+
+/** A swarm telemetry event serialized for transport over WebSocket / SSE. */
+export interface SwarmTelemetryEvent {
+  id: string;
+  /** 'swarm' for phase lifecycle, 'consensus' for bus/consensus events. */
+  type: 'swarm' | 'consensus';
+  /** Originating seat / coordinator. */
+  from?: string;
+  phase?: SwarmPhase;
+  /** The delegation-bus message type for consensus events. */
+  messageType?: SwarmMessageType;
+  stage: 'start' | 'done';
+  at: number;
+  detail: string;
+  /** JSON-serializable payload for WebSocket / SSE consumers. */
+  payload?: unknown;
+}
+/** Fields a caller supplies; the broadcaster supplies id, at, and type. */
+export type SwarmTelemetryInput = Omit<SwarmTelemetryEvent, 'id' | 'at' | 'type'>;
+
+/** In-process pub/sub registry for swarm telemetry events.
+ *
+ * Dashboards (and a server-side SSE route) subscribe here to receive the
+ * delegation-bus and consensus events emitted by `deliberate()` and `run()`
+ * as standard JSON events, without polling.
+ */
+export class SwarmTelemetryBroadcaster {
+  private readonly listeners = new Set<(evt: SwarmTelemetryEvent) => void>();
+
+  subscribe(handler: (evt: SwarmTelemetryEvent) => void): () => void {
+    this.listeners.add(handler);
+    return () => this.listeners.delete(handler);
+  }
+
+  private broadcast(evt: SwarmTelemetryEvent): void {
+    for (const handler of this.listeners) handler(evt);
+  }
+
+  /** Emit a phase-lifecycle telemetry event. */
+  emitPhase(evt: SwarmTelemetryInput): void {
+    this.broadcast({ ...evt, id: `evt-${Date.now()}`, at: Date.now(), type: 'swarm' });
+  }
+
+  /** Emit a bus / consensus telemetry event. */
+  emitConsensus(evt: SwarmTelemetryInput): void {
+    this.broadcast({ ...evt, id: `evt-${Date.now()}`, at: Date.now(), type: 'consensus' });
+  }
+}
+
+/** Module-level telemetry bus shared by every SwarmCoordinator instance. */
+export const swarmTelemetry = new SwarmTelemetryBroadcaster();
+
+/** Subscribe to all swarm telemetry events; returns an unsubscribe handle. */
+export function subscribeSwarmTelemetry(
+  handler: (evt: SwarmTelemetryEvent) => void,
+): () => void {
+  return swarmTelemetry.subscribe(handler);
+}
+
 /** Every region the spec puts in play: named regions, or the whole file when unnamed. */
 export function specRegions(spec: MilestoneSpec): FileRegion[] {
   const regions: FileRegion[] = [];
@@ -368,22 +430,25 @@ export class SwarmCoordinator {
     return { spec, review, consensus, messages };
   }
 
+  private emit(phase: SwarmPhase, stage: SwarmEvent['stage'], detail: string): void {
+    this.onEvent?.({ phase, stage, at: this.now(), detail });
+    swarmTelemetry.emitPhase({ phase, stage, detail });
+  }
+
   private emitTelemetry(
     messageType: SwarmMessageType,
     from: string,
     payload: unknown,
   ): void {
-    this.onEvent?.({
-      stage: 'done',
-      at: this.now(),
+    const base = {
+      stage: 'done' as const,
       detail: `${messageType} from ${from}`,
       messageType,
+      from,
       payload,
-    });
-  }
-
-  private emit(phase: SwarmPhase, stage: SwarmEvent['stage'], detail: string): void {
-    this.onEvent?.({ phase, stage, at: this.now(), detail });
+    };
+    this.onEvent?.({ ...base, at: this.now() });
+    swarmTelemetry.emitConsensus({ ...base });
   }
 }
 

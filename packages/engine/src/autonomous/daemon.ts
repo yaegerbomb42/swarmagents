@@ -500,8 +500,7 @@ export class AutonomousDaemon {
     for (const status of ACTIVE_STATUSES) {
       for (const task of this.store.listTasks(status)) {
         if (!task.worktreePath) continue;
-        const steps = this.store.getSteps(task.taskId);
-        const last = steps[steps.length - 1];
+        const last = this.store.getLatestStep(task.taskId);
         const treeHash = await this.worktreeTreeHash(task.worktreePath);
         if (treeHash === undefined) {
           // Worktree dir is gone: requeue from scratch.
@@ -544,6 +543,13 @@ export class AutonomousDaemon {
       }
     }
     this.logger.log(`[daemon] boot step 4: pruned ${pruned} stale done_set entries`);
+
+    // 5. Drop step-journal rows for tasks that are no longer queued (shipped, tombstoned or
+    //    dropped). They are never read again and used to accumulate for the life of the DB.
+    const prunedSteps = this.store.pruneOrphanedSteps();
+    if (prunedSteps > 0) {
+      this.logger.log(`[daemon] boot step 5: pruned ${prunedSteps} orphaned step journal rows`);
+    }
 
     this.lastHead = await this.currentHead();
     this.booted = true;

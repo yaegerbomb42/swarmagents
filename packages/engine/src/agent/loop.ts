@@ -793,7 +793,16 @@ export async function runAgentLoop(
             rolling.persistTranscript ??
             ((text) =>
               appendTranscriptFile(deps.toolCtx.store.logsDir, deps.toolCtx.redactor.text(text))),
-        }).catch(() => undefined);
+        }).catch((err: unknown) => {
+          // Condensation is the context-size safety net; a silent failure here means the
+          // prompt can grow to the provider's hard window with no trace of why. Surface it and
+          // let the token-threshold compaction (when configured) act as the backstop.
+          deps.events.emit('context.condense_failed', {
+            turn: turns,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return undefined;
+        });
         if (condensed) {
           messages = condensed.messages;
           lastCondenseTurn = turns;
@@ -1100,9 +1109,9 @@ export async function runAgentLoop(
             deps.events.emit('provider.recovered', { outageMs: ms, attempts }),
           ...(deps.retry?.baseDelayMs !== undefined ? { baseDelayMs: deps.retry.baseDelayMs } : {}),
           ...(deps.retry?.maxDelayMs !== undefined ? { maxDelayMs: deps.retry.maxDelayMs } : {}),
-          ...(deps.retry?.giveUpAfterMs !== undefined
-            ? { giveUpAfterMs: deps.retry.giveUpAfterMs }
-            : {}),
+          // Always pass a ceiling: an unset value used to mean "retry for ever", so a 429 storm
+          // in an interactive/helper loop could stall without ever reaching a turn boundary.
+          giveUpAfterMs: deps.retry?.giveUpAfterMs ?? DEFAULT_PROVIDER_GIVE_UP_MS,
           ...(deps.signal ? { signal: deps.signal } : {}),
         },
       );
@@ -1520,9 +1529,20 @@ export async function runAgentLoop(
      */
     const runCall = async (call: (typeof calls)[number]): Promise<ContentBlock> => {
       try {
-        return await runCallInner(call);
+        // Race the whole call (hooks + tool.run) against the abort signal. Tools receive the
+        // signal themselves and kill subprocesses; the race covers a tool/hook that ignores it.
+        return await abortable(runCallInner(call), deps.signal);
       } catch (err) {
         if (err instanceof StopRequested) throw err;
+        if (err instanceof AbortedError || deps.signal?.aborted) {
+          // Keep the tool_use/tool_result pairing; the loop returns stop-now at the next boundary.
+          return {
+            type: 'tool_result',
+            toolUseId: call.id,
+            content: `[harness:interrupted] ${call.name} was interrupted; its result is not available.`,
+            isError: true,
+          };
+        }
         const message = err instanceof Error ? err.message : String(err);
         return {
           type: 'tool_result',

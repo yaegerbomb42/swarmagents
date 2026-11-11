@@ -345,6 +345,14 @@ export function globMatches(glob: string, path: string): boolean {
 /** ~150-token cap for rule summaries: ~4 chars per token, truncate at 600. */
 const RULE_SUMMARY_MAX_CHARS = 600;
 
+/**
+ * Upper bound on rows scanned when matching learned patterns. Patterns accumulate one per
+ * completed task, so an unbounded `SELECT *` eventually loads the whole table on every call.
+ * Matching is in JS (scope globs), so this caps the highest-confidence window rather than
+ * pretending it can be filtered in SQL.
+ */
+export const LEARNED_PATTERN_SCAN_LIMIT = 5_000;
+
 export interface AutonomousStateStoreOptions {
   repoRoot: string;
   /** Defaults to `<repoRoot>/.omnexx/autonomous.db`. Use ':memory:' for tests. */
@@ -355,6 +363,8 @@ export class AutonomousStateStore {
   private readonly repoRoot: string;
   private readonly dbPath: string;
   private db: DatabaseSync | null = null;
+  /** Shared in-flight open, so two concurrent callers cannot open (and leak) two connections. */
+  private opening: Promise<void> | null = null;
 
   constructor(opts: AutonomousStateStoreOptions) {
     this.repoRoot = opts.repoRoot;
@@ -371,17 +381,36 @@ export class AutonomousStateStore {
 
   async open(): Promise<void> {
     if (this.db !== null) return;
+    this.opening ??= this.doOpen().finally(() => {
+      this.opening = null;
+    });
+    return this.opening;
+  }
+
+  private async doOpen(): Promise<void> {
+    if (this.db !== null) return;
     if (this.dbPath !== ':memory:') await mkdir(dirname(this.dbPath), { recursive: true });
     // Dynamic import so tsup does not rewrite the built-in module specifier.
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(this.dbPath, { open: true });
-    if (this.dbPath !== ':memory:') {
-      db.exec('PRAGMA journal_mode=WAL;');
+    try {
+      if (this.dbPath !== ':memory:') {
+        db.exec('PRAGMA journal_mode=WAL;');
+      }
+      db.exec('PRAGMA busy_timeout = 5000;');
+      db.exec('PRAGMA foreign_keys = ON;');
+      db.exec(SCHEMA);
+      this.db = db;
+    } catch (err) {
+      // A schema/pragma failure used to leave the open connection dangling (and this.db null,
+      // so the next open() leaked another one).
+      try {
+        db.close();
+      } catch {
+        // Surface the original error.
+      }
+      throw err;
     }
-    db.exec('PRAGMA busy_timeout = 5000;');
-    db.exec('PRAGMA foreign_keys = ON;');
-    db.exec(SCHEMA);
-    this.db = db;
   }
 
   close(): void {
@@ -623,6 +652,37 @@ export class AutonomousStateStore {
   }
 
   // -- done set / tombstones ------------------------------------------------
+
+  /** The newest journal entry for a task, without materializing the whole journal. */
+  getLatestStep(taskId: string): StepRecord | null {
+    const row = this.requireDb()
+      .prepare('SELECT * FROM step_journal WHERE task_id = ? ORDER BY step_index DESC LIMIT 1')
+      .get(taskId) as Row | undefined;
+    if (row === undefined) return null;
+    return {
+      taskId: str(row, 'task_id'),
+      stepIndex: num(row, 'step_index'),
+      phase: str(row, 'phase'),
+      toolName: nullableStr(row, 'tool_name'),
+      toolArgsHash: nullableStr(row, 'tool_args_hash'),
+      gitTreeHash: nullableStr(row, 'git_tree_hash'),
+      errorSignature: nullableStr(row, 'error_signature'),
+      tokensDelta: num(row, 'tokens_delta'),
+      createdAtMs: num(row, 'created_at_ms'),
+    };
+  }
+
+  /**
+   * Delete step-journal rows whose task is no longer in the work queue (completed, tombstoned
+   * or dropped). Boot reconciliation only reads journals for active tasks, so these rows were
+   * pure unbounded state growth. Returns the number of rows removed.
+   */
+  pruneOrphanedSteps(): number {
+    const info = this.requireDb()
+      .prepare('DELETE FROM step_journal WHERE task_id NOT IN (SELECT task_id FROM work_queue)')
+      .run();
+    return Number(info.changes);
+  }
 
   markDone(
     taskId: string,
@@ -893,8 +953,8 @@ export class AutonomousStateStore {
   /** Patterns whose scope glob applies to `scope` (usually a file path). */
   getLearnedPatterns(scope: string): LearnedPattern[] {
     const rows = this.requireDb()
-      .prepare('SELECT * FROM learned_patterns ORDER BY confidence DESC')
-      .all() as Row[];
+      .prepare('SELECT * FROM learned_patterns ORDER BY confidence DESC LIMIT ?')
+      .all(LEARNED_PATTERN_SCAN_LIMIT) as Row[];
     return rows
       .map((row) => ({
         patternId: str(row, 'pattern_id'),

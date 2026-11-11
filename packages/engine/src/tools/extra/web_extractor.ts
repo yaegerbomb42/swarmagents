@@ -102,7 +102,9 @@ export function htmlToMarkdown(html: string): string {
     ]
       .filter(Boolean)
       .join('\n\n');
-    return head ? `${head}\n\n${text}` : text;
+    const out = head ? `${head}\n\n${text}` : text;
+    // Fragments or docs with no readable article can yield an empty tree; fall back.
+    return out.trim() ? out : stripTags(html);
   } catch {
     return stripTags(html);
   }

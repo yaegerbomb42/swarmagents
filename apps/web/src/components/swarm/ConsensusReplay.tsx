@@ -17,6 +17,12 @@ export type ConsensusPayload = {
   transcript: ConsensusTurn[];
   rounds: number;
   test_output?: string;
+  /** Tally of seats that voted to approve (derived when omitted). */
+  votesFor?: number;
+  /** Tally of seats that voted to reject (derived when omitted). */
+  votesAgainst?: number;
+  /** Total number of seats in the consensus (derived from transcript when omitted). */
+  totalSeats?: number;
 };
 
 export type ConsensusReplayProps = {
@@ -30,6 +36,23 @@ function roleBadgeClass(role: string): string {
   if (role === 'critic') return 'border-amber-500/30 bg-amber-500/10 text-amber-200';
   if (role === 'judge') return 'border-purple-500/30 bg-purple-500/10 text-purple-200';
   return 'border-white/10 bg-white/5 text-white/60';
+}
+
+
+const AGENT_PERSONAS: Record<string, { emoji: string; name: string }> = {
+  proposer: { emoji: '🧠', name: 'Architect' },
+  architect: { emoji: '🧠', name: 'Architect' },
+  implementer: { emoji: '⚡', name: 'Rapid Coder' },
+  coder: { emoji: '⚡', name: 'Rapid Coder' },
+  critic: { emoji: '🛡️', name: 'Security Sentinel' },
+  auditor: { emoji: '🛡️', name: 'Security Sentinel' },
+  'red-team': { emoji: '🛡️', name: 'Security Sentinel' },
+  judge: { emoji: '🤝', name: 'Coordinator' },
+  coordinator: { emoji: '🤝', name: 'Coordinator' },
+};
+
+function agentPersona(role: string): { emoji: string; name: string } {
+  return AGENT_PERSONAS[role] ?? { emoji: '🤖', name: 'Agent' };
 }
 
 export default function ConsensusReplay({
@@ -72,6 +95,15 @@ export default function ConsensusReplay({
   const transcript = consensus?.transcript ?? [];
   const maxStep = Math.max(0, transcript.length - 1);
   const visible = useMemo(() => transcript.slice(0, step + 1), [transcript, step]);
+  const totalSeats = useMemo(
+    () => Math.max(1, consensus?.totalSeats ?? new Set(transcript.map((t) => t.agent_id)).size),
+    [consensus?.totalSeats, transcript],
+  );
+  const votesFor = useMemo(
+    () => consensus?.votesFor ?? (consensus?.accepted ? totalSeats : 0),
+    [consensus?.votesFor, consensus?.accepted, totalSeats],
+  );
+
 
   useEffect(() => {
     if (!playing || visible.length >= transcript.length) {
@@ -103,6 +135,17 @@ export default function ConsensusReplay({
                 ? `${consensus.rounds} round(s) · ${consensus.accepted ? 'accepted' : 'rejected'}`
                 : '3-tier proposer → critic → judge'}
             </p>
+            {consensus && (
+              <span
+                className={`mt-1 text-[9px] font-bold px-2 py-0.5 rounded-full border ${
+                  consensus.accepted
+                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400 shadow-[0_0_12px_rgba(34,197,94,0.4)]'
+                    : 'border-rose-500/30 bg-rose-500/10 text-rose-400'
+                }`}
+              >
+                {consensus.accepted ? '🟢' : '🔴'} Consensus: {votesFor}/{totalSeats} {consensus.accepted ? 'Approved' : 'Not Reached'}
+              </span>
+            )}
           </div>
         </div>
         {autoFetch && !consensusProp ? (
@@ -182,10 +225,14 @@ export default function ConsensusReplay({
                 }`}
               >
                 <div className="flex items-center gap-2 mb-1">
-                  <span className={`text-[9px] font-mono uppercase px-1.5 py-0.5 rounded border ${roleBadgeClass(turn.role)}`}>
-                    {turn.role}
-                  </span>
-                  <span className="text-[9px] font-mono text-white/30">{turn.agent_id}</span>
+                  <span className="text-xl shrink-0">{agentPersona(turn.role).emoji}</span>
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <span className={`text-[9px] font-mono uppercase px-1.5 py-0.5 rounded border ${roleBadgeClass(turn.role)}`}>
+                      {turn.role}
+                    </span>
+                    <span className="text-[10px] font-semibold text-white/80 truncate">{agentPersona(turn.role).name}</span>
+                  </div>
+                  <span className="text-[9px] font-mono text-white/30 shrink-0">{turn.agent_id}</span>
                 </div>
                 <p className="text-[11px] text-white/75 whitespace-pre-wrap">{turn.content}</p>
               </article>

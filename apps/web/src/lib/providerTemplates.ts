@@ -253,6 +253,15 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     category: 'cloud',
   },
   {
+    type: 'mercury',
+    name: 'Mercury (Inception Labs)',
+    defaultEndpoint: 'https://api.inceptionlabs.ai/v1',
+    models: ['mercury-3'],
+    needsKey: true,
+    apiStyle: 'openai',
+    category: 'cloud',
+  },
+  {
     type: 'moonshot',
     name: 'Moonshot (Kimi)',
     defaultEndpoint: 'https://api.moonshot.ai/v1',

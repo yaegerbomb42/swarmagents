@@ -293,7 +293,10 @@ export interface LoopDeps {
   retry?: {
     baseDelayMs?: number;
     maxDelayMs?: number;
-    /** Give up after this long with no provider able to take the call. */
+    /**
+     * Give up after this long with no provider able to take the call. Unset uses
+     * DEFAULT_PROVIDER_GIVE_UP_MS (30 min), so an unconfigured 429/5xx cascade is bounded.
+     */
     giveUpAfterMs?: number;
     onOutage?: (ms: number) => void;
   };
@@ -436,6 +439,43 @@ export const BOOKKEEPING_HINT =
 /** Extra tries for a 400 on one call (a pool may route the retry to another model). */
 const BAD_REQUEST_RETRIES = 2;
 
+/**
+ * Hard ceiling for one uninterrupted provider outage when the caller did not configure
+ * `retry.giveUpAfterMs`. `withRetry` otherwise waits for ever ("unset: wait for ever"), which
+ * turns a cascading 429/5xx chain into an unbounded stall: interactive sessions and helper loops
+ * never reach a cycle boundary that would enforce the run's own time limit. Callers that have a
+ * budget (`budget.max_provider_wait`, default 6h) still pass their value and override this.
+ */
+export const DEFAULT_PROVIDER_GIVE_UP_MS = 30 * 60_000;
+
+/** Marker for a tool/model promise that lost the race against the turn's abort signal. */
+class AbortedError extends Error {
+  constructor(readonly reason: unknown) {
+    super(reason instanceof Error ? reason.message : 'turn aborted');
+  }
+}
+
+/**
+ * Race a promise against an abort signal. The underlying work is not cancelled here (tools get
+ * the same signal and kill their own subprocesses), but a tool or hook that ignores the signal
+ * can no longer wedge the turn forever: the race settles immediately and the caller synthesizes a
+ * normal cancellation result, preserving the tool_use/tool_result pairing the providers require.
+ */
+async function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return promise;
+  if (signal.aborted) throw new AbortedError(signal.reason);
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new AbortedError(signal.reason));
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+  }
+}
+
 /** Failed attempts with a server error before checking whether the provider itself is up. */
 export const POISON_PROBE_AFTER = 3;
 
@@ -571,6 +611,14 @@ export async function runAgentLoop(
   const budgetAllocator = new TurnBudgetAllocator();
   const budgetPlan: TurnBudgetPlan | undefined =
     deps.tokensPerTurn !== undefined ? budgetAllocator.planFor(deps.tokensPerTurn) : undefined;
+  /**
+   * Belt-and-braces termination bound. `preflight` enforces `max_turns_per_cycle` before every
+   * provider call, but it only runs when a model is actually attempted: a chain whose providers are
+   * all cooling/blocked, an empty chain, or a path that `continue`s without a call could otherwise
+   * spin outside that check. The loop increments `turns` exactly once per iteration, so this guard
+   * is equivalent at normal budgets and still terminates in the degenerate paths.
+   */
+  const turnCeiling = Math.max(1, Math.floor(deps.budget.max_turns_per_cycle));
   // Turn-efficiency deduplication state (unchanged re-reads + redundant verification).
   const verificationCoalescer = new VerificationCoalescer();
   let toolSeq = 0;
@@ -604,6 +652,21 @@ export async function runAgentLoop(
   let forcedSummaryTurn = false;
   let turnDirective = '';
   for (;;) {
+    // Hard turn bound first: no provider call, kernel plan, compaction or tool wave may run past it.
+    if (turns >= turnCeiling) {
+      deps.events.emit('budget.preflight_stop', {
+        stop: 'max_turns_per_cycle',
+        detail: `${turns} turns used this cycle (hard loop ceiling)`,
+        turn: turns,
+      });
+      return end('max_turns_per_cycle');
+    }
+    // The run deadline is an absolute wall-clock bound too; without this check it only annotated
+    // tool results and a run could keep paying for turns until its token/dollar caps tripped.
+    if (deps.deadlineMs !== undefined && deps.clock.now() >= deps.deadlineMs) {
+      deps.events.emit('loop.deadline', { turn: turns, deadlineMs: deps.deadlineMs });
+      return { ...end('stop'), detail: 'run deadline reached' };
+    }
     // Refresh tools at the start of each turn if refreshTools is provided (lazy mode).
     if (deps.refreshTools) {
       const { tools: freshTools, specs: freshSpecs } = deps.refreshTools();
@@ -682,14 +745,29 @@ export async function runAgentLoop(
       deps.events.emit('control.paused', { turn: turns });
       deps.onPauseChange?.(true);
       while (signal === 'pause') {
-        await deps.clock.sleep(deps.pausePollMs ?? 1_000);
+        // A stop (Esc / daemon shutdown) must break the pause immediately, not wait for the
+        // control file to change: before this, an aborted turn stayed parked in the poll loop.
+        if (deps.signal?.aborted) break;
+        try {
+          await deps.clock.sleep(deps.pausePollMs ?? 1_000, deps.signal);
+        } catch (err) {
+          if (deps.signal?.aborted) break;
+          throw err;
+        }
         signal = await deps.control();
       }
       deps.onPauseChange?.(false);
+      if (deps.signal?.aborted) {
+        deps.events.emit('control.aborted', { turn: turns, during: 'pause' });
+        return end('stop-now');
+      }
       deps.events.emit('control.resumed', { turn: turns });
     }
     if (signal === 'stop' || signal === 'stop-now') return end(signal);
-    if (deps.signal?.aborted) return end('stop-now');
+    if (deps.signal?.aborted) {
+      deps.events.emit('control.aborted', { turn: turns, during: 'turn-start' });
+      return end('stop-now');
+    }
 
     if (deps.rolling && turns > 0) {
       // Rolling memory: every few turns rewrite working memory into the compact note and keep

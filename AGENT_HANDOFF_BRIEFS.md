@@ -299,3 +299,49 @@ Strict Scope & Feature Deliverables:
    - Run typechecks and unit tests in `packages/engine`.
    - Commit cleanly: `git commit -am "feat(tools): autonomous web browsing and live telemetry extraction pipeline"`.
 ```
+
+---
+
+## 🏗️ Task 8: The Dual Backend Engines — Virtual Sandbox VM + Provider Racing Layer
+
+> **Assigned Agent**: OpenCode / Claude Code / Grok Bot  
+> **Repository to Pull**: `https://github.com/yaegerbomb42/swarmagents.git`  
+> **Scope Boundaries**: Strictly confined to `packages/providers/` and `apps/web/src/lib/sandbox/`.
+
+### Prompt to Pass to Engineer / Model:
+```markdown
+Target Repository: https://github.com/yaegerbomb42/swarmagents.git
+Working Directory: packages/providers/ & apps/web/src/lib/sandbox/
+
+Context:
+The SwarmAgents minimalist dashboards require two critical background systems:
+1. Provider Key Racing Layer: Multi-key rotation and concurrent completion racing across Gemini, Groq, Cerebras, Nemotron, and Mercury with automatic cooldown for rate-limited (429) keys.
+2. Virtual Sandbox VM: A lightweight client-side virtual execution harness that simulates an xterm terminal with stdout/stderr event streaming and virtual filesystem tracking.
+
+Your Objective:
+Implement these two isolated engines so the dashboard UI components can immediately plug into them.
+
+Deliverables:
+
+Part 1: Multi-Key Racing Engine (`packages/providers/src/`):
+- Implement `KeyPool`: Tracks an array of API keys per provider with exponential backoff on 429/401 errors.
+- Implement `ProviderRaceEngine.complete({ prompt, provider, candidates: 3 })`:
+  * Concurrently dispatches completion requests across up to N available keys using `Promise.race` or `asyncio.wait(FIRST_COMPLETED)`.
+  * Cancels runner-up requests once the fastest valid response arrives.
+  * Records moving-average latency and tokens-per-second per key.
+- Provide clean TypeScript exports in `packages/providers/src/index.ts`.
+
+Part 2: Virtual Sandbox VM Hook (`apps/web/src/lib/sandbox/`):
+- Create `apps/web/src/lib/sandbox/virtualVm.ts`:
+  * A lightweight state machine simulating bash execution (`ls`, `cat`, `mkdir`, `npm install`, `node test.js`, `git status`).
+  * In-memory virtual filesystem (VFS) to track created and modified files.
+  * Event emitter for terminal output lines: `{ type: 'stdout' | 'stderr' | 'exit', text: string, timestamp: number }`.
+- Create React hook `useVirtualSandbox()`:
+  * Exposes `terminalLogs`, `activeCommand`, `vfsFiles`, `runCommand(cmd)`, and `clear()`.
+  * Allows any dashboard component to render a live streaming terminal with zero server execution risk.
+
+Validation & Deliverable:
+- Run `npm run build` in `apps/web` to confirm clean typing and compilation.
+- Commit cleanly: `git commit -am "feat(providers): multi-key racing engine and virtual sandbox VM hook"`.
+- Push to `origin main`.
+```

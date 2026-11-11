@@ -140,22 +140,38 @@ export function computeTurnBudgetPlan(rawB: number): TurnBudgetPlan {
         progress: 'optional',
       }
     : ALL_PINNED;
+  // Every ceiling is a share of B and is clamped to B itself. Before this clamp the 1k
+  // floor values (1_200) were larger than the whole budget at B = 1_000, so the plan
+  // promised a prefix and a compaction target that could never fit the window. The
+  // low floors are kept only up to B so a plan is always internally consistent.
+  const share = (fraction: number): number => Math.round(B * fraction);
+  const floorUpTo = (floor: number): number => Math.min(B, floor);
+  const prefixCeiling = Math.min(
+    B,
+    Math.max(
+      floorUpTo(1_200),
+      Math.min(PREFIX_TOKEN_CEILING, share(heavy ? 0.4 : 0.3)),
+    ),
+  );
+  const toolOutputCeiling = Math.min(
+    B,
+    MAX_TOOL_OUTPUT_CEILING,
+    Math.max(floorUpTo(MIN_TOOL_OUTPUT_CEILING), share(0.55)),
+  );
+  const compactionTarget = Math.min(
+    B,
+    Math.max(floorUpTo(1_200), share(heavy ? 0.8 : 0.9)),
+  );
   return {
     budget: B,
     heavy,
     sections,
     maxMounted: m,
     slotBudgets,
-    prefixCeiling: Math.max(
-      1_200,
-      Math.min(PREFIX_TOKEN_CEILING, Math.round(B * (heavy ? 0.4 : 0.3))),
-    ),
-    toolOutputCeiling: Math.min(
-      MAX_TOOL_OUTPUT_CEILING,
-      Math.max(MIN_TOOL_OUTPUT_CEILING, Math.round(B * 0.55)),
-    ),
-    compactionTarget: Math.max(1_200, Math.round(B * (heavy ? 0.8 : 0.9))),
-    minIrreducibleCore: 1_000,
+    prefixCeiling,
+    toolOutputCeiling,
+    compactionTarget,
+    minIrreducibleCore: floorUpTo(1_000),
   };
 }
 

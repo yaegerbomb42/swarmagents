@@ -22,6 +22,14 @@ export const ROLLING_NOTE_CHAR_CAP = 6_000;
 export const DEFAULT_CONDENSE_EVERY = 20;
 /** Raw turns kept verbatim after the note. */
 export const DEFAULT_KEEP_TURNS = 6;
+/**
+ * Hard cap on the in-memory thread list. The rendered note already collapses threads to fit
+ * ROLLING_NOTE_CHAR_CAP, but the note object kept between condensations used to accumulate every
+ * demoted work item for the whole session (one or more per turn, forever), so a long run grew
+ * without bound. Threads past the cap are rolled into `collapsed` — the note still says how many
+ * older threads exist and where to recall them, nothing is dropped silently.
+ */
+export const MAX_THREADS = 500;
 
 const GOAL = '## Current goal';
 const ACTIVE = '## Active work (newest first)';
@@ -421,7 +429,8 @@ export async function condense(
   const demoted: RollingThread[] = allItems
     .slice(ACTIVE_DETAILED)
     .map((w) => ({ line: w.title, turn: w.turn }));
-  const threads = dedupeThreads([...(prior?.threads ?? []), ...demoted]);
+  const mergedThreads = dedupeThreads([...(prior?.threads ?? []), ...demoted]);
+  const { threads, collapsed } = capThreads(mergedThreads, prior?.collapsed);
   const factsByPath = new Map<string, RollingFact>();
   for (const f of [...(prior?.facts ?? []), ...freshFacts]) factsByPath.set(f.path, f);
   return {
@@ -434,8 +443,30 @@ export async function condense(
     coversFrom: prior?.coversFrom ?? Math.max(1, firstTurn),
     coversTo: opts.headLastTurn,
     updatedTurn: opts.turn,
-    ...(prior?.collapsed ? { collapsed: prior.collapsed } : {}),
+    ...(collapsed ? { collapsed } : {}),
   };
+}
+
+/**
+ * Keep at most MAX_THREADS (newest first) and fold the rest into the collapsed counter. The
+ * dropped threads are the oldest ones, so `coversFrom`/`fromTurn` keeps moving backwards while
+ * `toTurn` only ever grows — the rendered line still accounts for every thread.
+ */
+function capThreads(
+  threads: readonly RollingThread[],
+  prior: RollingNote['collapsed'],
+): { threads: RollingThread[]; collapsed: RollingNote['collapsed'] } {
+  if (threads.length <= MAX_THREADS) return { threads: [...threads], collapsed: prior };
+  const kept = threads.slice(0, MAX_THREADS);
+  const dropped = threads.slice(MAX_THREADS);
+  const fromTurn = dropped.reduce((min, t) => Math.min(min, t.turn), dropped[0]?.turn ?? 0);
+  const toTurn = dropped.reduce((max, t) => Math.max(max, t.turn), dropped[0]?.turn ?? 0);
+  const collapsed = {
+    count: (prior?.count ?? 0) + dropped.length,
+    fromTurn: prior ? Math.min(prior.fromTurn, fromTurn) : fromTurn,
+    toTurn: prior ? Math.max(prior.toTurn, toTurn) : toTurn,
+  };
+  return { threads: kept, collapsed };
 }
 
 function dedupeThreads(items: readonly RollingThread[]): RollingThread[] {

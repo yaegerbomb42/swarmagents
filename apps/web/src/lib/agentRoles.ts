@@ -19,6 +19,8 @@ import {
   Users,
   Sliders,
   Minimize2,
+  ListChecks,
+  ShieldCheck,
 } from 'lucide-react';
 
 export interface AgentRole {
@@ -32,6 +34,11 @@ export interface AgentRole {
   color: string;
 }
 
+/**
+ * The 21 selectable agent archetypes. Team Mode adds two orchestration roles
+ * (planner, reviewer) in TEAM_ROLES below — they are not archetypes a user
+ * picks for a normal sub-agent, so they stay out of this inventory.
+ */
 export const AGENT_ROLES: AgentRole[] = [
   {
     id: 'architect',
@@ -247,8 +254,38 @@ export const AGENT_ROLES: AgentRole[] = [
   },
 ];
 
+/**
+ * Team Mode orchestration roles. They are roles in this registry (same shape,
+ * same helpers) but not selectable archetypes, so they live outside
+ * AGENT_ROLES and its inventory.
+ */
+export const TEAM_ROLES: AgentRole[] = [
+  {
+    id: 'planner',
+    name: 'Planner',
+    icon: ListChecks,
+    description: 'Turns one goal into a small ordered task list, then hands each task to a matching role.',
+    responsibility: 'Goal decomposition, task ordering, role assignment, acceptance criteria per task.',
+    tools: ['read', 'search', 'plan'],
+    model_tier: 'frontier',
+    color: 'from-cyan-400 to-sky-500',
+  },
+  {
+    id: 'reviewer',
+    name: 'Reviewer',
+    icon: ShieldCheck,
+    description: 'Checks each finished result against its task, then merges it or sends it back with notes.',
+    responsibility: 'Acceptance review, rework notes, merge gating, final integration.',
+    tools: ['read', 'test', 'search', 'merge'],
+    model_tier: 'strong',
+    color: 'from-violet-400 to-fuchsia-500',
+  },
+];
+
+export const ALL_AGENT_ROLES: AgentRole[] = [...AGENT_ROLES, ...TEAM_ROLES];
+
 export function getAgentRoleById(id: string): AgentRole | undefined {
-  return AGENT_ROLES.find((r) => r.id === id);
+  return ALL_AGENT_ROLES.find((r) => r.id === id);
 }
 
 export function formatRoleLabel(id: string): string {

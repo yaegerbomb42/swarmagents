@@ -7,6 +7,8 @@ import { LogIn, Plus, Settings } from 'lucide-react';
 import { PromptBar } from '@/components/console/PromptBar';
 import { ProviderPill, type PillBackend } from '@/components/console/ProviderPill';
 import { TelemetryFeed } from '@/components/console/TelemetryFeed';
+import { TeamPanel } from '@/components/team/TeamPanel';
+import { useTeamRun } from '@/hooks/useTeamRun';
 
 /**
  * The home console: one centered prompt bar, a provider pill, and a live
@@ -22,6 +24,12 @@ export default function HomeConsole() {
   const [provider, setProvider] = useState<PillBackend | null>(null);
   const [setupHint, setSetupHint] = useState<PillBackend | null>(null);
   const [dispatchError, setDispatchError] = useState<string | null>(null);
+  const [mode, setMode] = useState<'solo' | 'team'>('solo');
+  const [teamRunId, setTeamRunId] = useState<string | null>(null);
+  const [teamError, setTeamError] = useState<string | null>(null);
+  const { run: teamRun, connected: teamConnected } = useTeamRun(teamRunId);
+  const teamActive = Boolean(teamRun && ['planning', 'running', 'reviewing'].includes(teamRun.status));
+  const busy = running || teamActive;
 
   // Resume the last task if the server still has it (the feed drops back
   // to the hero on its own if the record is gone).
@@ -29,10 +37,19 @@ export default function HomeConsole() {
     try {
       const last = localStorage.getItem('swarm.active');
       if (last) setTaskId(last);
+      const team = localStorage.getItem('swarm.team');
+      if (team) {
+        setTeamRunId(team);
+        setMode('team');
+      }
     } catch {
       /* storage unavailable */
     }
   }, []);
+
+  useEffect(() => {
+    if (teamRun && ['completed', 'failed', 'cancelled'].includes(teamRun.status)) setRunning(false);
+  }, [teamRun]);
 
   const persistTask = useCallback((id: string | null) => {
     try {
@@ -43,10 +60,59 @@ export default function HomeConsole() {
     }
   }, []);
 
+  const persistTeam = useCallback((id: string | null) => {
+    try {
+      if (id) localStorage.setItem('swarm.team', id);
+      else localStorage.removeItem('swarm.team');
+    } catch {
+      /* storage unavailable */
+    }
+  }, []);
+
+  const dispatchTeam = useCallback(
+    async (text: string) => {
+      setTeamError(null);
+      setDispatchError(null);
+      try {
+        const res = await fetch('/api/team', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(() => {
+              try {
+                const t = localStorage.getItem('swarm.harnessToken');
+                return t ? { Authorization: `Bearer ${t}` } : {};
+              } catch {
+                return {};
+              }
+            })(),
+          },
+          body: JSON.stringify({ prompt: text, userId: 'local' }),
+        });
+        const data = (await res.json()) as { ok?: boolean; runId?: string; error?: string };
+        if (!res.ok || !data.ok || !data.runId) {
+          setTeamError(data.error || 'Team dispatch failed — no run was started.');
+          return;
+        }
+        setTeamRunId(data.runId);
+        setTaskTitle(text.slice(0, 80));
+        setRunning(true);
+        persistTeam(data.runId);
+      } catch (err) {
+        setTeamError(err instanceof Error ? err.message : 'Team dispatch failed.');
+      }
+    },
+    [persistTeam],
+  );
+
   const dispatch = useCallback(
     async (text: string) => {
       setDispatchError(null);
       setSetupHint(null);
+      if (mode === 'team') {
+        await dispatchTeam(text);
+        return;
+      }
       try {
         const res = await fetch('/api/harness/task', {
           method: 'POST',
@@ -81,7 +147,7 @@ export default function HomeConsole() {
         setDispatchError(err instanceof Error ? err.message : 'Dispatch failed.');
       }
     },
-    [provider, persistTask],
+    [provider, persistTask, mode, dispatchTeam],
   );
 
   const onTaskEnd = useCallback(() => setRunning(false), []);
@@ -94,11 +160,14 @@ export default function HomeConsole() {
 
   const newMission = useCallback(() => {
     setTaskId(null);
+    setTeamRunId(null);
     setTaskTitle(null);
     setRunning(false);
     setDispatchError(null);
+    setTeamError(null);
     persistTask(null);
-  }, [persistTask]);
+    persistTeam(null);
+  }, [persistTask, persistTeam]);
 
   return (
     <div className="min-h-[100svh] bg-bg-0 text-fg-1">
@@ -120,7 +189,7 @@ export default function HomeConsole() {
           <span className="hidden rounded-full border border-line-2 px-2.5 py-1 text-micro text-fg-2 sm:inline">
             Console
           </span>
-          {taskId ? (
+          {taskId || teamRunId ? (
             <button
               type="button"
               onClick={newMission}
@@ -155,7 +224,7 @@ export default function HomeConsole() {
       </header>
 
       <main className="mx-auto flex w-full max-w-3xl flex-col items-center px-5 pb-16">
-        {!taskId ? (
+        {!taskId && !teamRunId ? (
           <div className="pb-8 pt-14 text-center md:pt-20">
             <h1 className="text-[clamp(2rem,6vw,3.25rem)] font-semibold leading-[1.1] tracking-[-0.04em] text-fg-1">
               What should we get done?
@@ -174,7 +243,32 @@ export default function HomeConsole() {
           </div>
         )}
 
-        <PromptBar running={running} onSend={(text) => void dispatch(text)} />
+        <PromptBar running={busy} onSend={(text) => void dispatch(text)} />
+
+        <div
+          role="group"
+          aria-label="Run mode"
+          className="mt-3 inline-flex items-center gap-0.5 rounded-full border border-line-2 bg-bg-1 p-0.5"
+        >
+          {(['solo', 'team'] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              aria-pressed={mode === m}
+              data-testid={`mode-${m}`}
+              onClick={() => {
+                setMode(m);
+                setDispatchError(null);
+                setTeamError(null);
+              }}
+              className={`rounded-full px-3 py-1 font-mono text-micro transition-colors duration-fast ${
+                mode === m ? 'bg-accent/15 text-accent' : 'text-fg-3 hover:text-fg-1'
+              }`}
+            >
+              {m === 'solo' ? 'Solo' : 'Team'}
+            </button>
+          ))}
+        </div>
 
         <div className="mt-3 w-full">
           <ProviderPill
@@ -200,9 +294,32 @@ export default function HomeConsole() {
           </p>
         ) : null}
 
-        <div className="mt-5 w-full">
-          <TelemetryFeed taskId={taskId} running={running} onTaskEnd={onTaskEnd} onTaskGone={onTaskGone} />
-        </div>
+        {mode === 'team' ? (
+          <div className="mt-5 w-full">
+            {teamRun ? (
+              <TeamPanel run={teamRun} />
+            ) : (
+              <p className="rounded-r-md border border-line-2 bg-bg-1 p-3 text-center text-meta text-fg-3">
+                One prompt spawns a planner, 2–4 sub-agents in isolated folders, and a
+                reviewer that merges or sends work back.
+              </p>
+            )}
+            {teamError ? (
+              <p role="alert" className="mt-2 text-center text-meta text-st-failed">
+                {teamError}
+              </p>
+            ) : null}
+            {teamRun && !teamConnected ? (
+              <p className="mt-2 text-center font-mono text-micro text-fg-4">
+                reconnecting to the team stream…
+              </p>
+            ) : null}
+          </div>
+        ) : (
+          <div className="mt-5 w-full">
+            <TelemetryFeed taskId={taskId} running={running} onTaskEnd={onTaskEnd} onTaskGone={onTaskGone} />
+          </div>
+        )}
 
         <footer className="mt-10 flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-center font-mono text-micro text-fg-4">
           <span>home console · runs without sign-in</span>

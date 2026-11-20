@@ -39,7 +39,7 @@ import type { SettingsTab } from "./components/Settings";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { useToasts } from "./components/Toasts";
 import { ScreenFrame } from "./components/dashboard/ScreenFrame";
-import { Button, Loading, Notice, type SegmentOption } from "./components/ui";
+import { Button, Loading, Notice, SplitHandle, clampSplitRatio, splitChatWidthCss, type SegmentOption } from "./components/ui";
 import type { Attachment } from "./data";
 
 const NO_LOGS: LogEvent[] = [];
@@ -65,6 +65,10 @@ export default function App() {
   const [fullAuto, setFullAuto] = usePersisted<boolean>("ac.fullAuto", true);
   const [view, setView] = usePersisted<WorkspaceView>("sa.view", "chat");
   const [draft, setDraft] = useSessionPersisted<string>("sa.draft", "");
+  // The chat column's share of the split row, persisted across reloads.
+  const [splitRatio, setSplitRatio] = usePersisted<number>("sa.splitRatio", 0.38);
+  const mainRef = useRef<HTMLElement | null>(null);
+  const chatRef = useRef<HTMLDivElement | null>(null);
 
   const session = useAgentSession({ agentCard, fullAuto, computeTarget: compute.target || undefined });
   const board = useBoard(view === "board");
@@ -275,13 +279,15 @@ export default function App() {
         </Notice>
       )}
 
-      <main className="relative z-10 flex min-h-0 flex-1 flex-col lg:flex-row p-2 sm:p-3 gap-2 sm:gap-3">
+      <main ref={mainRef} className="relative z-10 flex min-h-0 flex-1 flex-col lg:flex-row p-2 sm:p-3 gap-2 sm:gap-3">
         {/* Chat & Narration Column */}
         <div
           hidden={!showChat}
+          ref={chatRef}
+          style={split ? { width: splitChatWidthCss(splitRatio) } : undefined}
           className={cn(
             "order-2 flex min-h-0 min-w-0 flex-1 flex-col lg:order-1 glass rounded-[26px] p-2.5 sm:p-4 shadow-2xl hair",
-            split && "lg:w-[clamp(420px,38vw,560px)] lg:flex-none",
+            split && "lg:flex-none",
             hero && "justify-center",
             !showChat && "hidden",
           )}
@@ -381,6 +387,16 @@ export default function App() {
             )}
           </div>
         </div>
+
+        {/* Drag handle between the chat column and the stage (split view only). */}
+        {split && (
+          <SplitHandle
+            containerRef={mainRef}
+            chatRef={chatRef}
+            ratio={clampSplitRatio(splitRatio)}
+            onRatioChange={(next) => setSplitRatio(clampSplitRatio(next))}
+          />
+        )}
 
         {/* Live VM Screen / Board Stage */}
         {showStage && (

@@ -72,3 +72,47 @@ test("nothing in the shell is a placeholder", async () => {
     assert.doesNotMatch(html, /coming soon|not implemented|todo/i, view);
   }
 });
+
+test("the split view has a drag handle between the chat and the stage", async () => {
+  const html = await renderApp({ local: { "sa.view": "screen" }, wide: true });
+  assert.equal(countOf(html, 'data-testid="split-handle"'), 1, "one handle in split view");
+  const handle = tagOf(html, "split-handle");
+  assert.match(handle, /role="separator"/);
+  assert.match(handle, /aria-orientation="vertical"/);
+  assert.match(handle, /aria-valuenow="38"/, "the default ratio");
+  assert.match(handle, /\bhidden\b/, "hidden below the wide breakpoint");
+  assert.match(handle, /\blg:flex\b/, "shown at the wide breakpoint");
+});
+
+test("the split view sizes the chat from the persisted ratio, with a 480px floor", async () => {
+  const html = await renderApp({ local: { "sa.view": "screen" }, wide: true });
+  assert.match(
+    tagOf(html, "chat-column"),
+    /width:clamp\(480px, 38\.0%, calc\(100% - 492px\)\)/,
+    "the default ratio drives the chat width",
+  );
+
+  const half = await renderApp({ local: { "sa.view": "board", "sa.splitRatio": 0.5 }, wide: true });
+  assert.equal(countOf(half, 'data-testid="split-handle"'), 1, "the handle is there for the board too");
+  assert.match(tagOf(half, "chat-column"), /width:clamp\(480px, 50\.0%, calc\(100% - 492px\)\)/);
+  assert.match(tagOf(half, "split-handle"), /aria-valuenow="50"/, "the persisted ratio survives a reload");
+});
+
+test("an out-of-range persisted ratio is clamped, never trusted", async () => {
+  const tooWide = await renderApp({ local: { "sa.view": "screen", "sa.splitRatio": 0.99 }, wide: true });
+  assert.match(tagOf(tooWide, "chat-column"), /width:clamp\(480px, 80\.0%, calc\(100% - 492px\)\)/);
+  assert.match(tagOf(tooWide, "split-handle"), /aria-valuenow="80"/);
+
+  const junk = await renderApp({ local: { "sa.view": "screen", "sa.splitRatio": "junk" }, wide: true });
+  assert.match(tagOf(junk, "chat-column"), /width:clamp\(480px, 38\.0%, calc\(100% - 492px\)\)/, "junk falls back to the default");
+});
+
+test("no split handle when the chat is alone, or on a narrow screen", async () => {
+  const chatOnly = await renderApp({ local: { "sa.view": "chat" }, wide: true });
+  assert.equal(countOf(chatOnly, 'data-testid="split-handle"'), 0, "no stage, no handle");
+  assert.doesNotMatch(tagOf(chatOnly, "chat-column"), /width:clamp/, "the chat takes the full row");
+
+  const phone = await renderApp({ local: { "sa.view": "screen" }, wide: false });
+  assert.equal(countOf(phone, 'data-testid="split-handle"'), 0, "a phone stays a single pane");
+  assert.doesNotMatch(tagOf(phone, "chat-column"), /width:clamp/, "no fixed width on a phone");
+});

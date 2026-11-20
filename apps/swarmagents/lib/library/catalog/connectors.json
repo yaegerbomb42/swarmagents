@@ -18,6 +18,27 @@
     "verifiedHow": "Endpoint or package documented by the linked vendor/reference source; tool names shown are documented examples, not an exhaustive inventory."
   },
   {
+    "id": "github-read-only",
+    "name": "GitHub · Read-only",
+    "category": "dev",
+    "description": "Look up repositories, commits, issues and pull requests without writing to GitHub.",
+    "transport": "http",
+    "install": "https://api.githubcopilot.com/mcp/readonly",
+    "requiredFields": [
+      {
+        "key": "Authorization",
+        "label": "GitHub access token",
+        "secret": true,
+        "helpUrl": "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens"
+      }
+    ],
+    "auth": "token",
+    "tools": [],
+    "sourceUrl": "https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md",
+    "verified": true,
+    "verifiedHow": "GitHub documents the hosted read-only endpoint and Authorization: Bearer header."
+  },
+  {
     "id": "gitlab",
     "name": "GitLab",
     "category": "dev",
@@ -299,6 +320,27 @@
     "verifiedHow": "MCP reference repository issue confirms npm package and deprecation; archived README documents query. Archived and unmaintained; use a read-only role. POSTGRES_URL is substituted into the positional URL argument."
   },
   {
+    "id": "postgres-dbhub",
+    "name": "PostgreSQL · DBHub",
+    "category": "data",
+    "description": "Inspect a PostgreSQL schema and run queries using your database account's permissions.",
+    "transport": "stdio",
+    "install": "npx -y @bytebase/dbhub@2.0.0 --transport stdio",
+    "requiredFields": [
+      {
+        "key": "DSN",
+        "label": "PostgreSQL connection string",
+        "secret": true,
+        "helpUrl": "https://dbhub.ai/config/command-line#dsn"
+      }
+    ],
+    "auth": "token",
+    "tools": ["search_objects", "execute_sql"],
+    "sourceUrl": "https://github.com/bytebase/dbhub/blob/v2.0.0/docs/config/command-line.mdx",
+    "verified": true,
+    "verifiedHow": "DBHub documents Node-compatible stdio and the DSN environment variable; use a read-only database role."
+  },
+  {
     "id": "sqlite",
     "name": "SQLite",
     "category": "data",
@@ -317,6 +359,20 @@
     "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.ofershap%2Fsqlite/versions/latest",
     "verified": true,
     "verifiedHow": "Official registry lists npm package v1.0.1; linked project README lists tool names. Database paths are supplied to tools."
+  },
+  {
+    "id": "sqlite-read-only",
+    "name": "SQLite · Read-only",
+    "category": "data",
+    "description": "Inspect and query SQLite files without writing to the database.",
+    "transport": "stdio",
+    "install": "npx -y node-sqlite-mcp@0.1.0",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": ["list_tables", "describe_table", "query"],
+    "sourceUrl": "https://github.com/djgadd/sqlite-mcp",
+    "verified": true,
+    "verifiedHow": "README and npm metadata confirm the stdio package uses built-in node:sqlite and opens databases read-only."
   },
   {
     "id": "supabase",
@@ -380,7 +436,7 @@
     "category": "search",
     "description": "Search the web, news, images and places.",
     "transport": "stdio",
-    "install": "npx -y @brave/brave-search-mcp-server --transport stdio",
+    "install": "npx -y @brave/brave-search-mcp-server@2.1.5 --transport stdio",
     "requiredFields": [
       {
         "key": "BRAVE_API_KEY",
@@ -418,6 +474,20 @@
     "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/ai.exa%2Fexa/versions/latest",
     "verified": true,
     "verifiedHow": "Official registry confirms hosted endpoint; vendor README lists default tools and anonymous rate-limited access. Optional OAuth or API key increases limits."
+  },
+  {
+    "id": "openai-docs",
+    "name": "OpenAI Developer Docs",
+    "category": "dev",
+    "description": "Search and read the official OpenAI API, Codex and ChatGPT documentation.",
+    "transport": "http",
+    "install": "https://developers.openai.com/mcp",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [],
+    "sourceUrl": "https://developers.openai.com/learn/docs-mcp",
+    "verified": true,
+    "verifiedHow": "OpenAI documents a public streamable HTTP server with read-only documentation access."
   },
   {
     "id": "fetch",

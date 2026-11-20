@@ -680,3 +680,54 @@ export function revokeComputer(userId: string, computerId: string, options: Data
 export function isComputerId(value: unknown): value is string {
   return typeof value === "string" && COMPUTER_ID_RE.test(value);
 }
+
+// ---------------------------------------------------------------------------
+// Async, serialized forms.
+//
+// The sync functions above are each a single uninterrupted read-modify-write,
+// so within one event-loop turn they cannot interleave. Callers that do async
+// work around them (route handlers awaiting a body, the node hub) use these
+// forms instead: every mutation for a data root runs one at a time behind an
+// in-process lock, so concurrent pairing, redemption and heartbeats can never
+// clobber each other's writes to a computers.json file.
+// ---------------------------------------------------------------------------
+
+const globalLocks = globalThis as typeof globalThis & { __swarmComputersLocks?: Map<string, Promise<unknown>> };
+const computerLocks = (globalLocks.__swarmComputersLocks ??= new Map<string, Promise<unknown>>());
+
+function withComputersLock<T>(options: DataDirOptions, fn: () => T): Promise<T> {
+  const key = path.resolve(dataDir(options));
+  const previous = computerLocks.get(key) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(fn);
+  computerLocks.set(key, run);
+  return run.finally(() => {
+    if (computerLocks.get(key) === run) computerLocks.delete(key);
+  });
+}
+
+/** Serialized {@link createPairingCode}. */
+export function createPairingCodeAsync(
+  userId: string,
+  options: DataDirOptions = {},
+): Promise<{ code: string; expiresAt: number }> {
+  return withComputersLock(options, () => createPairingCode(userId, options));
+}
+
+/** Serialized {@link redeemPairingCode}. */
+export function redeemPairingCodeAsync(
+  code: unknown,
+  machine?: ComputerMachine,
+  options: DataDirOptions = {},
+): Promise<PairingRedeemResult | null> {
+  return withComputersLock(options, () => redeemPairingCode(code, machine, options));
+}
+
+/** Serialized {@link recordHeartbeat}. */
+export function recordHeartbeatAsync(
+  computerId: unknown,
+  nodeToken: unknown,
+  machine?: ComputerMachine,
+  options: DataDirOptions = {},
+): Promise<{ userId: string; computer: Computer } | null> {
+  return withComputersLock(options, () => recordHeartbeat(computerId, nodeToken, machine, options));
+}

@@ -26,6 +26,7 @@ Or Actions > **Playtest login check**. Details: `docs/playtest/README.md`.
 
 ## Rules
 
+- **All PRs go to `github.com/yaegerbomb42/swarmagents`** (this repo, the single source of truth). The earlier private repo is a frozen archive: never open PRs or push there.
 - The only app is `apps/swarmagents/` and that path must not move (the VPS deploy script reads it).
   `apps/swarmagents/vendor/` is read-only reference material being extracted into the app and then deleted.
 - Branch from `main`, keep branches short-lived, open a PR, wait for CI, squash-merge, delete the branch.

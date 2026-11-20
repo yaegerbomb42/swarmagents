@@ -1,5 +1,7 @@
 # Contributing to SwarmAgents
 
+All changes go through pull requests to <https://github.com/yaegerbomb42/swarmagents>. The earlier private repo is a frozen archive.
+
 Humans and agents follow the same flow.
 
 1. **Branch** from `main`: `feat/...`, `fix/...`, `docs/...`, `chore/...`. Keep it small and short-lived.

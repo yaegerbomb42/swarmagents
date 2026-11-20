@@ -1,0 +1,132 @@
+{
+  "qwen3.8:27b": {
+    "T1_Reasoning": {
+      "ok": true,
+      "elapsed": 9.577997922897339,
+      "tokens": 157,
+      "tok_per_sec": 46.46580736245538,
+      "response": "Ball = x, Bat = x + $1.00\n\nx + (x + $1.00) = $1.10\n2x = $0.10\nx = **$0.05**",
+      "think_tokens": 0
+    },
+    "T2_Coding": {
+      "ok": true,
+      "elapsed": 9.183325052261353,
+      "tokens": 400,
+      "tok_per_sec": 47.089450142148486,
+      "response": "",
+      "think_tokens": 0
+    },
+    "T3_JSON_Schema": {
+      "ok": true,
+      "elapsed": 10.917998790740967,
+      "tokens": 400,
+      "tok_per_sec": 38.53089066735251,
+      "response": "{\"root_cause\":\"At UserList.tsx:14, .map() is called on a value that is undefined at render time. This typically",
+      "think_tokens": 0
+    }
+  },
+  "bonsai-2:27b": {
+    "T1_Reasoning": {
+      "ok": true,
+      "elapsed": 9.371718883514404,
+      "tokens": 139,
+      "tok_per_sec": 30.153878059886466,
+      "response": "Let ball = x, bat = x + 1.00\n\nx + (x + 1.00) = 1.10\n2x = 0.10\nx = $0.05",
+      "think_tokens": 0
+    },
+    "T2_Coding": {
+      "ok": true,
+      "elapsed": 14.1288321018219,
+      "tokens": 400,
+      "tok_per_sec": 29.26206771330255,
+      "response": "",
+      "think_tokens": 0
+    },
+    "T3_JSON_Schema": {
+      "ok": true,
+      "elapsed": 14.303977966308594,
+      "tokens": 400,
+      "tok_per_sec": 29.368963760167166,
+      "response": "",
+      "think_tokens": 0
+    }
+  },
+  "flint:latest": {
+    "T1_Reasoning": {
+      "ok": true,
+      "elapsed": 10.092689752578735,
+      "tokens": 206,
+      "tok_per_sec": 116.47260455501174,
+      "response": "Ball = $0.05  \nBat = $1.05  \nTotal = $1.10  \n\nFinal number: **$0.05**",
+      "think_tokens": 0
+    },
+    "T2_Coding": {
+      "ok": true,
+      "elapsed": 3.5497570037841797,
+      "tokens": 400,
+      "tok_per_sec": 115.98196850256284,
+      "response": "",
+      "think_tokens": 0
+    },
+    "T3_JSON_Schema": {
+      "ok": true,
+      "elapsed": 2.71602201461792,
+      "tokens": 303,
+      "tok_per_sec": 117.21534635152244,
+      "response": "{\n  \"root_cause\": \"The UserList component tried to call .map on a value that was undefined, likely because the users data was not loaded or was initially undefined.\",\n  \"fix_diff\": \"Add optional chaining or a default empty array before calling .map, such as (users ?? []).map(...).\",\n  \"risk_level\": \"low\"\n}",
+      "think_tokens": 0
+    }
+  },
+  "gemma:latest": {
+    "T1_Reasoning": {
+      "ok": true,
+      "elapsed": 8.238335847854614,
+      "tokens": 400,
+      "tok_per_sec": 120.69408908827437,
+      "response": "",
+      "think_tokens": 0
+    },
+    "T2_Coding": {
+      "ok": true,
+      "elapsed": 3.572664737701416,
+      "tokens": 400,
+      "tok_per_sec": 117.11789406773032,
+      "response": "",
+      "think_tokens": 0
+    },
+    "T3_JSON_Schema": {
+      "ok": true,
+      "elapsed": 4.433526039123535,
+      "tokens": 400,
+      "tok_per_sec": 96.81983160610788,
+      "response": "",
+      "think_tokens": 0
+    }
+  },
+  "Qwen3.8-Flash-Next-Coder": {
+    "T1_Reasoning": {
+      "ok": true,
+      "elapsed": 34.11787295341492,
+      "tokens": 246,
+      "tok_per_sec": 24.81262668998041,
+      "response": "Ball = x, bat = x + 1.00  \n2x + 1.00 = 1.10 \u2192 x = 0.05  \n\n$0.05",
+      "think_tokens": 108
+    },
+    "T2_Coding": {
+      "ok": true,
+      "elapsed": 18.50111198425293,
+      "tokens": 400,
+      "tok_per_sec": 26.10620291232686,
+      "response": "We need answer user's request: Write Python function rotate(matrix) rotates N x N 2D list 90 clockwise in-place O(1) aux. Provide only clean Python code and 1 assert statement. Need final only code and assert. Need ensure correct. Could do transpose then reverse rows. That's in-place O(1). Function:\ndef rotate(matrix):\n    n = len(matrix)\n    for i in range(n):\n        for j in range(i + 1, n):\n            matrix[i][j], matrix[j][i] = matrix[j][i], matrix[i][j]\n    for row in matrix:\n        row.reverse()\nAssert statement: assert rotate([[1,2],[3,4]]) == [[3,1],[4,2]]? But function returns None if in-place. Need one assert statement. Could do:\nmatrix = [[1,2],[3,4]]\nrotate(matrix)\nassert matrix == [[3,1],[4,2]]\nBut they ask Provide only the clean Python code and 1 assert statement. Could include function then assert. Ensure no extra text. Need maybe handle empty matrix? If matrix empty n=0 works. For one. Good.\n\nNeed final only code block? They said only clean Python code and 1 assert statement. Could output plain code no markdown? Probably code. Need not include explanation. Use no return.\n\nPotential issue: row.reverse() in-place O(1). Good.\n\nNeed only one assert statement. Could combine:\ndef rotate(matrix): ...\nassert (rotate([[1,2],[3,4]]) or [[3,1],[4,2]]?) No, rotate returns None, so assert rotate(...) == ... fails. Need use matrix variable. That's one assert statement. The assignment not assert. OK.\n\nCould do:\ndef rotate(matrix):\n    n = len(matrix)\n   ",
+      "think_tokens": 215
+    },
+    "T3_JSON_Schema": {
+      "ok": true,
+      "elapsed": 12.659257173538208,
+      "tokens": 253,
+      "tok_per_sec": 28.384176677533002,
+      "response": "{\n  \"root_cause\": \"The code at UserList.tsx:14 calls .map() on a value that is undefined, likely because the list prop/data is not initialized or may be missing.\",\n  \"fix_diff\": \"--- UserList.tsx\\n+++ UserList.tsx\\n@@\\n-  const users = props.users.map((user) => {\\n+  const users = (props.users ?? []).map((user) => {\\n@@\\n\",\n  \"risk_level\": \"low\"\n}",
+      "think_tokens": 92
+    }
+  }
+}

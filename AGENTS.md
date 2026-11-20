@@ -33,7 +33,7 @@ Or Actions > **Playtest login check**. Details: `docs/playtest/README.md`.
   Never force-push `main`; never rewrite history.
 - Claim work on the swarm board first (`apps/swarmagents/tools/swarm-board/README.md`); leave review notes as PR comments.
 - Never commit or print secrets (keys, passwords, tokens, cookies, server addresses). Use env vars and repo secrets.
-- Binary assets (png, gif, mp4, jpg, ...) are Git LFS: install `git-lfs` before committing binaries.
+- Binary assets (png, gif, mp4, jpg, ...) are Git LFS: install `git-lfs` before committing binaries. Exception: small web/brand assets under `apps/swarmagents/public/`, `app/` and `apps/swarmagents/branding/` are normal git files because the server never runs LFS (see docs/deploy/README.md).
 - Known test baseline: a handful of tests fail on `main` (ambient and computers store-mutex, client swarm-catalog, swarm-node
   host-mode). Do not add to the list. Some browser and budget-gate tests can show as cancelled on resource-limited machines.
 

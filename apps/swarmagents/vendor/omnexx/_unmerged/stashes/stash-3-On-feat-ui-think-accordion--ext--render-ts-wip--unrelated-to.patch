@@ -1,0 +1,192 @@
+diff --git a/vscode/src/webview/render.ts b/vscode/src/webview/render.ts
+index 9e52abd..438368c 100644
+--- a/vscode/src/webview/render.ts
++++ b/vscode/src/webview/render.ts
+@@ -535,6 +535,9 @@ export function toolBadgeLabel(kind: ToolKind): string {
+   return TOOL_BADGE_LABELS[kind];
+ }
+ 
++const ICON_COPY_SVG =
++  '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><rect x="5" y="5" width="8.5" height="8.5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M3 10.5V3.5A1 1 0 0 1 4 2.5h6.5" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>';
++
+ /** Lifecycle of one bash/shell tool call, as shown in its terminal pill. */
+ export type PillStatus = 'running' | 'success' | 'error';
+ 
+@@ -543,6 +546,7 @@ export interface TermPillView {
+   status: PillStatus;
+   startedAt?: number | undefined;
+   endedMs?: number | undefined;
++  exitCode?: number | null | undefined;
+ }
+ 
+ /**
+@@ -554,17 +558,26 @@ export interface TermPillView {
+ export function extractPillCmd(line: string): { cmd: string; isCommand: boolean } {
+   const backticked = /`([^`]+)`/.exec(line.trim());
+   if (backticked?.[1]) return { cmd: backticked[1].trim(), isCommand: true };
++  const running = /^running\s+(.+)$/i.exec(line.trim());
++  if (running?.[1]) return { cmd: running[1].trim(), isCommand: true };
+   return { cmd: line.trim(), isCommand: false };
+ }
+ 
++function pillStatusHtml(status: PillStatus, elapsedLabel: string, exitCode?: number | null): string {
++  if (status === 'running') {
++    return `<span class="term-pill-status is-running" title="Running"><span class="pill-spin" aria-hidden="true"></span>Running</span>`;
++  }
++  if (status === 'error') {
++    const code = typeof exitCode === 'number' ? ` <span class="pill-exit">exit ${String(exitCode)}</span>` : '';
++    return `<span class="term-pill-status is-error" title="Failed${typeof exitCode === 'number' ? ` (exit ${String(exitCode)})` : ''}"><span class="pill-badge-icon" aria-hidden="true">!</span><span>Failed</span>${code}</span>`;
++  }
++  return `<span class="term-pill-status is-success" title="Succeeded in ${escapeHtml(elapsedLabel || '—')}"><span class="pill-badge-icon" aria-hidden="true">✓</span>${elapsedLabel ? `<span class="pill-elapsed">${escapeHtml(elapsedLabel)}</span>` : '<span>Done</span>'}</span>`;
++}
++
+ /**
+  * One bash/shell tool line as a terminal pill: a collapsible header (chevron,
+- * `▶ bash: <cmd>`, status pill, live/final elapsed time) over an xterm
+- * container the webview fills on expansion. `view` is the pill's live state
+- * from terminalPill.ts when the host has posted for this call; without it the
+- * pill renders finished with no elapsed time. `open` is the disclosure state
+- * (open while running unless the person closed it; closed once done unless
+- * they opened it) — tracked by chat.ts like the other accordions.
++ * `$ <cmd>`, status indicator, live/final elapsed time) over an xterm container.
++ * Output body includes a copy button. `view` is the pill's live state.
+  */
+ export function termPillItemHtml(
+   pillId: number,
+@@ -574,34 +587,118 @@ export function termPillItemHtml(
+ ): string {
+   const { cmd, isCommand } = extractPillCmd(line);
+   const status: PillStatus = view?.status ?? 'success';
+-  const statusLabel = status === 'running' ? 'Running' : status === 'error' ? 'Error' : 'Success';
++  const exitCode = view?.exitCode;
+   const cmdHtml = isCommand ? `<code>${escapeHtml(cmd)}</code>` : escapeHtml(cmd);
+-  const elapsed =
++  const runningElapsed =
+     status === 'running' && view?.startedAt !== undefined
+       ? `<span class="tool-elapsed" data-started-at="${String(view.startedAt)}" title="Execution time">0ms</span>`
+-      : `<span class="tool-elapsed" title="Execution time">${view?.endedMs !== undefined ? escapeHtml(formatElapsedMs(view.endedMs)) : '—'}</span>`;
+-  return `<li class="tool k-run term-pill" data-pill-id="${String(pillId)}"><details class="term-pill-fold" data-disclosure-id="pill-${String(pillId)}"${open ? ' open' : ''}><summary class="term-pill-head"><span class="chev" aria-hidden="true"></span><span class="term-pill-cmd"><span class="term-pill-prompt" aria-hidden="true">$</span> ${cmdHtml}</span><span class="term-pill-status is-${status}">${statusLabel}</span>${elapsed}</summary><div class="term-pill-body"><div class="term-pill-term" data-pill-term="${String(pillId)}"></div></div></details></li>`;
++      : '';
++  const finalElapsed =
++    status !== 'running' && view?.endedMs !== undefined ? formatElapsedMs(view.endedMs) : '';
++  const statusHtml = pillStatusHtml(status, finalElapsed, exitCode);
++  const headerElapsed =
++    status === 'running'
++      ? runningElapsed
++      : status === 'error'
++        ? `<span class="tool-elapsed" title="Execution time">${view?.endedMs !== undefined ? escapeHtml(formatElapsedMs(view.endedMs)) : '—'}</span>`
++        : '';
++  return `<li class="tool k-run term-pill" data-pill-id="${String(pillId)}"><details class="term-pill-fold" data-disclosure-id="pill-${String(pillId)}"${open ? ' open' : ''}><summary class="term-pill-head"><span class="chev" aria-hidden="true"></span><span class="term-pill-cmd" title="${escapeHtml(cmd)}"><span class="term-pill-prompt" aria-hidden="true">$</span> ${cmdHtml}</span>${statusHtml}${headerElapsed}</summary><div class="term-pill-body"><div class="term-pill-body-bar"><button class="icon small term-copy-btn" type="button" data-copy-term="${String(pillId)}" title="Copy output" aria-label="Copy terminal output">${ICON_COPY_SVG}</button></div><div class="term-pill-term" data-pill-term="${String(pillId)}"></div></div></details></li>`;
++}
++
++function fileMicroIcon(path: string): string {
++  const ext = path.includes('.') ? (path.split('.').pop() ?? '').toLowerCase() : '';
++  const icons: Record<string, string> = {
++    ts: 'TS', tsx: 'TS', js: 'JS', jsx: 'JS', mjs: 'JS', cjs: 'JS',
++    json: '{}', css: '#', scss: '#', html: '<>', md: 'M↓', py: 'PY',
++    rs: 'RS', go: 'GO', yml: 'Y', yaml: 'Y', sh: '$_', bash: '$_',
++    svg: '◇', png: '◫', jpg: '◫', test: '✓', spec: '✓',
++  };
++  return icons[ext] ?? (ext ? ext.slice(0, 2).toUpperCase() : '•');
++}
++
++function fileChipHtml(path: string, extraClass = ''): string {
++  const clean = path.replace(/^['"`]+|['"`]+$/g, '');
++  const parts = clean.split('/');
++  const base = parts.pop() ?? clean;
++  const dir = parts.length ? `${parts.join('/')}/` : '';
++  const icon = escapeHtml(fileMicroIcon(base));
++  const escPath = escapeHtml(clean);
++  return `<span class="file-chip${extraClass ? ` ${extraClass}` : ''}" data-open="${escPath}" role="link" tabindex="0" title="${escPath}"><span class="file-chip-ico" aria-hidden="true">${icon}</span><span class="file-chip-path">${dir ? `<span class="file-chip-dir">${escapeHtml(dir)}</span>` : ''}<span class="file-chip-base">${escapeHtml(base)}</span></span></span>`;
++}
++
++function diffStatPillsHtml(adds: number, dels: number): string {
++  const parts: string[] = [];
++  if (adds > 0) parts.push(`<span class="diff-stat add" title="${String(adds)} additions">+${String(adds)}</span>`);
++  if (dels > 0) parts.push(`<span class="diff-stat del" title="${String(dels)} deletions">-${String(dels)}</span>`);
++  if (!parts.length) return '';
++  return `<span class="diff-stat-group">${parts.join('')}</span>`;
+ }
+ 
+ /**
+  * Formats a narrated tool line as rich HTML:
+- * - Clickable file paths (`data-open`)
++ * - Clickable file chips for path-like tokens (basename emphasized, micro-icon)
+  * - Inline shell commands wrapped in `.tool-cmd`
+- * - Diff stat counters (`+24` / `-9`) wrapped in `.diff-stat` pills
+- * - Test pass/fail badges (`PASS` / `FAIL`)
++ * - Diff stat counters (`+24` / `-9`, `(+66, -2)`) wrapped in `.diff-stat` pills
++ * - Test pass/fail badges
+  */
+ export function toolLineHtml(line: string): string {
+-  return line
+-    .trim()
+-    .split(/(\s+)/)
+-    .map((word) => {
+-      const path = word.replace(/^[`'"(]+|[`'",;:.)]+$/g, '');
+-      if (!path || !looksLikePath(path)) return escapeHtml(word);
+-      const at = word.indexOf(path);
+-      const esc = escapeHtml(path);
+-      return `${escapeHtml(word.slice(0, at))}<span class="path" data-open="${esc}" role="link" tabindex="0">${esc}</span>${escapeHtml(word.slice(at + path.length))}`;
+-    })
+-    .join('');
++  const trimmed = line.trim();
++  // Diff stats like "(+66, -2)" or "+66, -2"
++  let html = escapeHtml(trimmed)
++    .replace(/\(\+(\d+),\s*-(\d+)\)/g, (_m, a: string, d: string) =>
++      diffStatPillsHtml(Number(a), Number(d)),
++    )
++    .replace(/\b\+(\d+)\s+-(\d+)\b/g, (_m, a: string, d: string) =>
++      diffStatPillsHtml(Number(a), Number(d)),
++    );
++
++  // Test results: "4 passed", "2 failed", "(4 passed)"
++  html = html
++    .replace(/\b(\d+)\s+(passed|passing)\b/gi, '<span class="test-pill pass">$1 $2</span>')
++    .replace(/\b(\d+)\s+(failed|failing)\b/gi, '<span class="test-pill fail">$1 $2</span>')
++    .replace(/\b(PASS|PASSED)\b/g, '<span class="test-pill pass">$1</span>')
++    .replace(/\b(FAIL|FAILED)\b/g, '<span class="test-pill fail">$1</span>');
++
++  // Backticked commands
++  html = html.replace(/`([^`]+)`/g, (_m, cmd: string) => `<code class="tool-cmd">${cmd}</code>`);
++
++  // File/path chips - operate on remaining text segments carefully.
++  // Re-parse by tokenizing the escaped string is risky after replacements; use a targeted pass.
++  // Replace path-like escaped tokens that are not already inside tags.
++  html = html.replace(/(^|[\s>])(?!<)((?:[A-Za-z0-9_.@-]+\/)*[A-Za-z0-9_.@-]+\.[A-Za-z0-9]+)(?=[\s<,)']|$)/g, (m, pre: string, p: string) => {
++    const raw = p.replace(/&quot;|&#39;|&lt;|&gt;|&amp;/g, (e) => ({'&quot;':'"',"&#39;":"'",'&lt;':'<','&gt;':'>','&amp;':'&'}[e] ?? e));
++    if (!looksLikePath(raw)) return m;
++    return `${pre}${fileChipHtml(raw)}`;
++  });
++
++  return html;
++}
++
++/** Render a file action line as a compact chip for clustered strips (no redundant verb chrome). */
++export function fileActionChipHtml(line: string): string | null {
++  const t = line.trim();
++  const m = /^(reading|writing(?: code)?(?: to)?|editing|diffing|patching|deleting|creating)\s+(.+)$/i.exec(t);
++  if (!m) return null;
++  const verb = (m[1] ?? '').toLowerCase();
++  let rest = (m[2] ?? '').trim();
++  let statsHtml = '';
++  const statM = /\s*\(\+(\d+),\s*-(\d+)\)\s*$/.exec(rest);
++  if (statM) {
++    statsHtml = diffStatPillsHtml(Number(statM[1]), Number(statM[2]));
++    rest = rest.slice(0, statM.index).trim();
++  }
++  const path = rest.replace(/^['"`]+|['"`]+$/g, '');
++  if (!looksLikePath(path) && !path.includes('/')) {
++    // try to extract a path token
++    const pm = /([A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.[A-Za-z0-9]+|[A-Za-z0-9_.@-]+\.[A-Za-z0-9]+)/.exec(rest);
++    if (!pm) return null;
++    return `<span class="action-pill k-${toolKind(t)}"><span class="action-verb">${escapeHtml(verb.replace(/\s+to$/, ''))}</span>${fileChipHtml(pm[1] ?? path)}${statsHtml}</span>`;
++  }
++  return `<span class="action-pill k-${toolKind(t)}"><span class="action-verb">${escapeHtml(verb.replace(/\s+to$/, ''))}</span>${fileChipHtml(path)}${statsHtml}</span>`;
++}
++
++export function isFileActionLine(line: string): boolean {
++  return /^(reading|writing(?: code)?(?: to)?|editing|diffing|patching|skimming|listing|viewing)\b/i.test(line.trim());
+ }
+ 
+ export type LogRole = 'agent' | 'think' | 'system' | 'error';

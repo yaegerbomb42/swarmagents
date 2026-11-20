@@ -1,0 +1,949 @@
+diff --git a/src/autonomous/circuit-breaker.ts b/src/autonomous/circuit-breaker.ts
+index 222406d..a4fda6b 100644
+--- a/src/autonomous/circuit-breaker.ts
++++ b/src/autonomous/circuit-breaker.ts
+@@ -470,6 +470,14 @@ export class WatchdogMonitor {
+     if (taskId !== undefined) this.currentTaskId = taskId;
+   }
+ 
++  /** Kill the registered child process group, if any (daemon shutdown hygiene). */
++  killChildProcessGroup(): void {
++    if (this.currentPgid !== undefined) {
++      this.killProcessGroup(this.currentPgid);
++      this.currentPgid = undefined;
++    }
++  }
++
+   clearTask(): void {
+     this.currentTaskId = undefined;
+     this.currentPgid = undefined;
+diff --git a/src/autonomous/daemon.ts b/src/autonomous/daemon.ts
+index ef90b51..0d335c4 100644
+--- a/src/autonomous/daemon.ts
++++ b/src/autonomous/daemon.ts
+@@ -28,6 +28,7 @@ import { join } from 'node:path';
+ import { LockError } from '../errors.js';
+ import { readBootId } from '../daemon/boot-id.js';
+ import { git } from '../git/git.js';
++import { clearStaleGitLocks } from '../git/locks.js';
+ import { blobsChanged } from './fingerprint.js';
+ import { realClock, type Clock } from '../core/clock.js';
+ import { isStale, lockSchema, pidAlive } from '../core/lock.js';
+@@ -156,6 +157,17 @@ export interface TaskExecutor {
+   disposeTaskContext?: (taskId: string) => void | Promise<void>;
+ }
+ 
++/**
++ * Autonomous self-validation gate. Before a self-improvement change ships, the
++ * daemon runs the repo's full check (`npm run typecheck && npm test`) inside the
++ * transient worktree; on failure the gate clears stale git locks, rolls the
++ * worktree back, and records the failure in `autonomous_improvements.md`. See
++ * `src/autonomous/evolution-gate.ts`. Optional: when absent, no gate runs.
++ */
++export interface EvolutionGate {
++  check(worktree: string, baseSha: string): Promise<{ ok: boolean; diagnostics: string[] }>;
++}
++
+ /** Budget gate (no sibling budget module exists yet; injected when one lands). */
+ export interface BudgetGate {
+   check(nowMs: number): Promise<{ ok: boolean; reason?: string }>;
+@@ -203,6 +215,19 @@ export interface AutonomousDaemonOptions {
+    * Default 1_800_000 ms (30 min, the task wall-clock lease).
+    */
+   staleLeaseMs?: number | undefined;
++  /** Autonomous self-validation gate (optional; see {@link EvolutionGate}). */
++  evolutionGate?: EvolutionGate | undefined;
++  /** Consecutive task failures that trigger a backoff. Default 3. */
++  maxConsecutiveFailures?: number | undefined;
++  /** Base backoff sleep after the failure streak trips. Default 30_000 ms. */
++  failureBackoffBaseMs?: number | undefined;
++  /** Backoff ceiling. Default 3_600_000 ms (1h). */
++  failureBackoffMaxMs?: number | undefined;
++  /**
++   * Grace period `stop()` waits for the loop to settle before force-releasing
++   * the lock. Default 5_000 ms.
++   */
++  shutdownGraceMs?: number | undefined;
+ }
+ 
+ /** Fail-closed stub for LLM-backed pieces not yet injected. */
+@@ -358,6 +383,11 @@ export class AutonomousDaemon {
+   private readonly headPollMs: number;
+   private readonly watchdogStallMs: number;
+   private readonly staleLeaseMs: number;
++  private readonly evolutionGate?: EvolutionGate | undefined;
++  private readonly maxConsecutiveFailures: number;
++  private readonly failureBackoffBaseMs: number;
++  private readonly failureBackoffMaxMs: number;
++  private readonly shutdownGraceMs: number;
+ 
+   private state: DaemonState = 'idle';
+   private currentTask: QueuedTask | undefined;
+@@ -374,6 +404,9 @@ export class AutonomousDaemon {
+   private loopDone: Promise<void> | undefined;
+   private readonly watchdog: WatchdogMonitor;
+   private readonly onSignal: () => void;
++  /** Consecutive task failures (quarantines/task errors), reset on a successful ship. */
++  private consecutiveTaskFailures = 0;
++  private shutdownDone = false;
+ 
+   constructor(options: AutonomousDaemonOptions) {
+     this.repoRoot = options.repoRoot;
+@@ -398,6 +431,11 @@ export class AutonomousDaemon {
+     this.headPollMs = options.headPollMs ?? 10_000;
+     this.watchdogStallMs = options.watchdogStallMs ?? 900_000;
+     this.staleLeaseMs = options.staleLeaseMs ?? 1_800_000;
++    this.evolutionGate = options.evolutionGate;
++    this.maxConsecutiveFailures = options.maxConsecutiveFailures ?? 3;
++    this.failureBackoffBaseMs = options.failureBackoffBaseMs ?? 30_000;
++    this.failureBackoffMaxMs = options.failureBackoffMaxMs ?? 3_600_000;
++    this.shutdownGraceMs = options.shutdownGraceMs ?? 5_000;
+     this.watchdog = new WatchdogMonitor({
+       stallMs: this.watchdogStallMs,
+       onStall: async (info) => {
+@@ -599,7 +637,13 @@ export class AutonomousDaemon {
+ 
+   async stop(): Promise<void> {
+     if (!this.abortController.signal.aborted) this.abortController.abort(new Error('daemon stop'));
+-    await this.loopDone?.catch(() => undefined);
++    // Wait for the loop to settle, but never hang forever: a hung provider call,
++    // tool child, or deadlocked turn must not block a clean exit. Force-release
++    // after the shutdown grace period.
++    const done = this.loopDone;
++    if (done) {
++      await Promise.race([done.catch(() => undefined), delay(this.shutdownGraceMs)]);
++    }
+     // Release the lock even if start() was never called (boot() alone holds it).
+     if (this.running || this.releaseLock) await this.shutdown();
+   }
+@@ -626,9 +670,14 @@ export class AutonomousDaemon {
+   }
+ 
+   private async shutdown(): Promise<void> {
++    if (this.shutdownDone) return;
++    this.shutdownDone = true;
+     process.removeListener('SIGINT', this.onSignal);
+     process.removeListener('SIGTERM', this.onSignal);
+     this.watchdog.stop();
++    // Process-exit hygiene: kill any child process group the current task's work
++    // runs in (the watchdog tracks it), so a hung sub-task cannot outlive us.
++    this.watchdog.killChildProcessGroup();
+     if (this.currentTask) {
+       try {
+         this.store.recordStep(this.currentTask.taskId, {
+@@ -638,6 +687,11 @@ export class AutonomousDaemon {
+       } catch {
+         // Best effort checkpoint.
+       }
++      // Automated git lock clearance: a killed git process may have left a stale
++      // lock in the task worktree; clear it so the next boot / human isn't wedged.
++      if (this.currentTask.worktreePath) {
++        await clearStaleGitLocks(this.currentTask.worktreePath).catch(() => undefined);
++      }
+     }
+     await this.releaseLock?.().catch(() => undefined);
+     this.releaseLock = undefined;
+@@ -691,6 +745,24 @@ export class AutonomousDaemon {
+     }
+     this.emptyStreak = 0;
+     await this.processTask(task);
++    // Health heartbeat: once enough consecutive tasks have failed (or hit
++    // provider limits), back off gracefully rather than burning quota in a
++    // retry storm. The streak resets on the next successful ship.
++    if (this.consecutiveTaskFailures >= this.maxConsecutiveFailures) {
++      const sleepMs = failureBackoffMs(
++        this.consecutiveTaskFailures,
++        this.maxConsecutiveFailures,
++        this.failureBackoffBaseMs,
++        this.failureBackoffMaxMs,
++      );
++      if (sleepMs > 0) {
++        this.logger.warn(
++          `[daemon] ${this.consecutiveTaskFailures} consecutive task failures; ` +
++            `backing off ${Math.round(sleepMs / 1000)}s`,
++        );
++        await this.sleepWithHeadWatch(sleepMs);
++      }
++    }
+   }
+ 
+   /**
+@@ -771,6 +843,10 @@ export class AutonomousDaemon {
+           this.verifyTask(task, worktree, repairRound),
+         );
+         if (verification.outcome === 'PASS') {
++          // Self-validation gate: a self-improvement change must pass the repo's
++          // own full check before it ships. On gate failure the change is rolled
++          // back, the failure is recorded, and the task is quarantined.
++          if (!(await this.runEvolutionCheck(task, plan, worktree))) return;
+           revertProof = verification.revertProof;
+           break;
+         }
+@@ -1049,6 +1125,40 @@ export class AutonomousDaemon {
+     return { outcome: 'PASS', revertProof, diagnostics: result.diagnostics };
+   }
+ 
++  /**
++   * Autonomous self-validation (the evolution gate). When an evolution gate is
++   * configured and the change touches Omnexx's own source (`src/`), require the
++   * repo's full check to pass in the transient worktree before shipping. Returns
++   * true to proceed; false when the gate failed (the task was rolled back,
++   * recorded in `autonomous_improvements.md`, and quarantined).
++   */
++  private async runEvolutionCheck(
++    task: QueuedTask,
++    plan: TaskExecutionPlan,
++    worktree: string,
++  ): Promise<boolean> {
++    const gate = this.evolutionGate;
++    if (!gate) return true;
++    // The evolution gate guards self-improvement of Omnexx's own engine: only
++    // run it when the change touches this repo's source AND this repo is
++    // Omnexx itself. A generic repository a daemon improves is not self-evolution
++    // and must not be held to Omnexx's own full test suite.
++    const touchesSelf = plan.filesToTouch.some((f) => f.startsWith('src/'));
++    if (!touchesSelf) return true;
++    if (!(await isOmnexxRepo(this.repoRoot))) return true;
++    const baseSha = task.baseCommitSha ?? (await this.currentHead()) ?? 'HEAD';
++    const result = await this.withWatchdogHeartbeat(task.taskId, () =>
++      gate.check(worktree, baseSha),
++    );
++    if (result.ok) return true;
++    this.store.recordStep(task.taskId, {
++      phase: 'verify',
++      errorSignature: `evolution gate failed: ${result.diagnostics.join('; ')}`,
++    });
++    await this.quarantineTask(task, 'evolution_gate_failed');
++    return false;
++  }
++
+   /**
+    * SHIP: shipping controller (fail-closed when not configured). Commits the
+    * worktree first (the shipper pushes HEAD, so uncommitted edits would
+@@ -1197,6 +1307,8 @@ export class AutonomousDaemon {
+       deliveryMode: ship.deliveryMode,
+       targetBlobHashes,
+     });
++    // A successful ship clears the consecutive-failure streak.
++    this.consecutiveTaskFailures = 0;
+     await this.releaseWorktree(task);
+     this.store.recordStep(task.taskId, { phase: 'learn', errorSignature: 'learned + done' });
+     this.transition('idle', task.taskId);
+@@ -1222,6 +1334,7 @@ export class AutonomousDaemon {
+     // The watchdog and the IMPLEMENT loop can both observe the same trip.
+     if (this.quarantinedTaskIds.has(task.taskId)) return;
+     this.quarantinedTaskIds.add(task.taskId);
++    this.consecutiveTaskFailures++;
+     const treeHash = task.worktreePath ? await this.worktreeTreeHash(task.worktreePath) : undefined;
+     try {
+       const failure: {
+@@ -1363,3 +1476,43 @@ export class AutonomousDaemon {
+     this.logger.log(`[daemon] ${from} → ${to}${id ? ` (${id})` : ''}`);
+   }
+ }
++
++/** Resolve after `ms`; unref'd so it never keeps the process alive. */
++function delay(ms: number): Promise<void> {
++  return new Promise((resolve) => {
++    const t = setTimeout(resolve, ms);
++    t.unref();
++  });
++}
++
++/**
++ * Backoff sleep (ms) for a run of `streak` consecutive failures at or above the
++ * configured threshold. Escalates from `base` doubling per extra failure, capped
++ * at `max`. Pure — used by `runCycle` and unit-tested directly.
++ */
++export function failureBackoffMs(
++  streak: number,
++  threshold: number,
++  baseMs: number,
++  maxMs: number,
++): number {
++  if (streak <= threshold) return 0;
++  const extra = streak - threshold;
++  return Math.min(maxMs, baseMs * 2 ** (extra - 1));
++}
++
++/**
++ * True when `repoRoot` is the Omnexx repository itself (`package.json` name is
++ * `omnexx`), i.e. the daemon is improving its own engine. Best-effort: missing /
++ * unreadable package.json → false.
++ */
++export async function isOmnexxRepo(repoRoot: string): Promise<boolean> {
++  try {
++    const pkg = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8')) as {
++      name?: unknown;
++    };
++    return pkg.name === 'omnexx';
++  } catch {
++    return false;
++  }
++}
+diff --git a/src/autonomous/evolution-gate.ts b/src/autonomous/evolution-gate.ts
+new file mode 100644
+index 0000000..cdbd4fe
+--- /dev/null
++++ b/src/autonomous/evolution-gate.ts
+@@ -0,0 +1,154 @@
++/**
++ * EvolutionGate — autonomous self-validation for the 24/7 self-evolution engine.
++ *
++ * Before Omnexx ships a self-improvement change, the change must prove the repo
++ * still passes its own full check (default: `npm run typecheck && npm test`).
++ * The check runs inside the isolated (transient) task worktree. If it fails:
++ *
++ *  - stale git lock files are cleared (`clearStaleGitLocks`),
++ *  - the worktree is rolled back to the base commit (`rollbackTo`), and
++ *  - the failure is appended to the repo's `autonomous_improvements.md`.
++ *
++ * The command runner is injectable so tests can drive pass/fail without ever
++ * invoking npm. Defaults to a shell runner with a hard timeout.
++ */
++import { appendFile, mkdir } from 'node:fs/promises';
++import { dirname, join } from 'node:path';
++import { execa } from 'execa';
++import { clearStaleGitLocks } from '../git/locks.js';
++import { rollbackTo } from '../git/rollback.js';
++
++export interface EvolutionCommandResult {
++  exitCode: number;
++  stdout: string;
++  stderr: string;
++}
++
++export type EvolutionCommandRunner = (
++  cwd: string,
++  command: string,
++  opts?: { timeoutMs?: number },
++) => Promise<EvolutionCommandResult>;
++
++export const DEFAULT_EVOLUTION_COMMAND = 'npm run typecheck && npm test';
++
++/** Default runner: shell with a strict timeout; never throws on non-zero exit. */
++export const defaultEvolutionRunner: EvolutionCommandRunner = async (cwd, command, opts) => {
++  const r = await execa(command, {
++    cwd,
++    shell: true,
++    reject: false,
++    ...(opts?.timeoutMs !== undefined ? { timeout: opts.timeoutMs } : {}),
++  });
++  return { exitCode: r.exitCode ?? -1, stdout: r.stdout, stderr: r.stderr };
++};
++
++export interface EvolutionGateOptions {
++  /** Main checkout the improvement targets; default improvements path derives from it. */
++  repoRoot: string;
++  /** Commit to roll back to on failure (the task's base SHA). */
++  baseSha: string;
++  /** Where failures are recorded; defaults to `<repoRoot>/autonomous_improvements.md`. */
++  improvementsPath?: string;
++  /** The exact self-validation command. Defaults to `npm run typecheck && npm test`. */
++  command?: string;
++  /** Hard timeout (ms) for the whole gate. Default 600_000 (10 min). */
++  timeoutMs?: number;
++  /** Test seam: command runner. Defaults to `defaultEvolutionRunner`. */
++  run?: EvolutionCommandRunner;
++  logger?: Pick<Console, 'log' | 'warn' | 'error'>;
++}
++
++export interface EvolutionGateResult {
++  ok: boolean;
++  diagnostics: string[];
++  /** True when the gate failure triggered a rollback of the worktree. */
++  rolledBack: boolean;
++}
++
++export interface EvolutionFailureEntry {
++  /** ISO timestamp. */
++  at: string;
++  taskId?: string;
++  command: string;
++  exitCode?: number;
++  stderr: string;
++}
++
++export const DEFAULT_IMPROVEMENTS_FILE = 'autonomous_improvements.md';
++
++/** Append a markdown failure entry to the improvements log. */
++export async function recordEvolutionFailure(
++  path: string,
++  entry: EvolutionFailureEntry,
++): Promise<void> {
++  await mkdir(dirname(path), { recursive: true });
++  const lines = [
++    '',
++    `## 🔴 Evolution gate failed @ ${entry.at}`,
++    ...(entry.taskId ? [`- Task: \`${entry.taskId}\``] : []),
++    `- Command: \`${entry.command}\``,
++    ...(entry.exitCode !== undefined ? [`- Exit code: ${entry.exitCode}`] : []),
++    entry.stderr.trim()
++      ? ['- Output:', '', '```', entry.stderr.trim().slice(0, 4000), '```']
++      : ['- Output: *(none)*'],
++    '',
++  ].flat();
++  await appendFile(path, lines.join('\n'), 'utf8');
++}
++
++/**
++ * Run the evolution gate in the (transient) task worktree. Returns `{ok:true}`
++ * when the self-validation command passes. On failure, clears stale locks, rolls
++ * the worktree back to `baseSha`, and records the failure — then returns
++ * `{ok:false}` with diagnostics. Never throws.
++ */
++export async function runEvolutionGate(
++  worktree: string,
++  options: EvolutionGateOptions,
++): Promise<EvolutionGateResult> {
++  const command = options.command ?? DEFAULT_EVOLUTION_COMMAND;
++  const run = options.run ?? defaultEvolutionRunner;
++  const timeoutMs = options.timeoutMs ?? 600_000;
++  const improvementsPath =
++    options.improvementsPath ?? join(options.repoRoot, DEFAULT_IMPROVEMENTS_FILE);
++  const diagnostics: string[] = [];
++
++  let failed: { exitCode?: number; output: string } | undefined;
++  let crashed = false;
++  try {
++    const res = await run(worktree, command, { timeoutMs });
++    if (res.exitCode === 0) return { ok: true, diagnostics: [], rolledBack: false };
++    failed = { exitCode: res.exitCode, output: res.stderr };
++    diagnostics.push(`\`${command}\` exited ${res.exitCode}`);
++  } catch (err) {
++    crashed = true;
++    const message = err instanceof Error ? err.message : String(err);
++    diagnostics.push(`evolution command failed: ${message}`);
++    failed = { output: message };
++  }
++
++  // Rollback path: clear stale locks, restore the worktree to base, record.
++  await clearStaleGitLocks(worktree).catch(() => undefined);
++  let rolledBack = false;
++  try {
++    await rollbackTo(worktree, options.baseSha);
++    rolledBack = true;
++  } catch (err) {
++    diagnostics.push(`rollback failed: ${err instanceof Error ? err.message : String(err)}`);
++  }
++  const entry: EvolutionFailureEntry = {
++    at: new Date().toISOString(),
++    command,
++    stderr: failed.output.trim().slice(0, 4000) || (crashed ? 'command did not run' : ''),
++  };
++  if (!crashed && failed.exitCode !== undefined) entry.exitCode = failed.exitCode;
++  try {
++    await recordEvolutionFailure(improvementsPath, entry);
++  } catch (err) {
++    diagnostics.push(
++      `failed to record evolution failure: ${err instanceof Error ? err.message : String(err)}`,
++    );
++  }
++  return { ok: false, diagnostics, rolledBack };
++}
+diff --git a/src/autonomous/executor.ts b/src/autonomous/executor.ts
+index 1e2134b..626a23b 100644
+--- a/src/autonomous/executor.ts
++++ b/src/autonomous/executor.ts
+@@ -163,6 +163,13 @@ export interface AgentTaskExecutorOptions {
+    * unreported call is invisible to the caps).
+    */
+   onUsage?: DaemonUsageRecorder;
++  /**
++   * Hard per-turn timeout (ms) for a single provider call. When set, an
++   * unresponsive provider call is rejected (retryable) after this long, so a
++   * hung upstream never wedges the daemon's turn or blocks a clean shutdown.
++   * Defaults to unset (no timeout).
++   */
++  turnTimeoutMs?: number;
+ }
+ 
+ /** Everything one task's turns share: conversation, tools, and tool context. */
+@@ -505,6 +512,7 @@ export class AgentTaskExecutor implements TaskExecutor {
+   private readonly clock: Clock;
+   private readonly logger: DaemonLogger;
+   private readonly onUsage: DaemonUsageRecorder | undefined;
++  private readonly turnTimeoutMs: number;
+   private readonly contexts = new Map<string, TaskAgentContext>();
+ 
+   constructor(opts: AgentTaskExecutorOptions) {
+@@ -515,6 +523,7 @@ export class AgentTaskExecutor implements TaskExecutor {
+     this.clock = opts.clock ?? realClock;
+     this.logger = opts.logger ?? console;
+     this.onUsage = opts.onUsage;
++    this.turnTimeoutMs = opts.turnTimeoutMs ?? 0;
+   }
+ 
+   disposeTaskContext(taskId: string): void {
+@@ -862,17 +871,19 @@ export class AgentTaskExecutor implements TaskExecutor {
+         throw new Error(`budget refused the turn: ${pf.detail}`);
+       }
+       try {
+-        const res = await this.provider.complete({
+-          ...turnRequest(
+-            { system: ctx.system, tools: ctx.specs },
+-            snapshot,
+-            model.id,
+-            maxTokens,
+-            `daemon-${taskId}`,
+-          ),
+-          route: model.provider,
+-          signal,
+-        });
++        const res = await this.withTurnTimeout(() =>
++          this.provider.complete({
++            ...turnRequest(
++              { system: ctx.system, tools: ctx.specs },
++              snapshot,
++              model.id,
++              maxTokens,
++              `daemon-${taskId}`,
++            ),
++            route: model.provider,
++            signal,
++          }),
++        );
+         ctx.spentUsd += costUsd(res.usage, model.price);
+         // Report the priced call to the budget ledger (via the recorder the
+         // wiring layer injected); the per-task preflight above only tracks
+@@ -899,6 +910,26 @@ export class AgentTaskExecutor implements TaskExecutor {
+     });
+   }
+ 
++  /**
++   * Race `fn` against an optional strict per-turn timeout. On timeout the call is
++   * rejected with a retryable {@link ProviderError}, so the daemon sees a turn
++   * error and can fail over / quarantine rather than hang. Best-effort: it does
++   * not cancel the underlying request, which is bounded by the provider SDK.
++   */
++  private withTurnTimeout<T>(fn: () => Promise<T>): Promise<T> {
++    if (this.turnTimeoutMs <= 0) return fn();
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    const timeout = new Promise<never>((_, reject) => {
++      timer = setTimeout(() => {
++        reject(new ProviderError('daemon turn timed out', { retryable: true }));
++      }, this.turnTimeoutMs);
++      timer.unref();
++    });
++    return Promise.race([fn(), timeout]).finally(() => {
++      if (timer !== undefined) clearTimeout(timer);
++    });
++  }
++
+   // -------------------------------------------------------------------------
+   // One tool call: guard → validate → run (mirrors the agent loop's runCall)
+   // -------------------------------------------------------------------------
+diff --git a/src/cli/commands/daemon.ts b/src/cli/commands/daemon.ts
+index bf47705..a735cd2 100644
+--- a/src/cli/commands/daemon.ts
++++ b/src/cli/commands/daemon.ts
+@@ -21,9 +21,11 @@ import type {
+   ArchitectPlanner,
+   BudgetGate,
+   DaemonLogger,
++  EvolutionGate,
+   TaskExecutor,
+ } from '../../autonomous/daemon.js';
+ import { ALL_COLLECTORS, DiscoveryOrchestrator } from '../../autonomous/discovery/index.js';
++import { runEvolutionGate } from '../../autonomous/evolution-gate.js';
+ import { createTaskExecutor } from '../../autonomous/executor.js';
+ import { createArchitectPlanner } from '../../autonomous/planner.js';
+ import { QualityRatchet } from '../../autonomous/quality-ratchet.js';
+@@ -174,6 +176,8 @@ export interface DaemonCollaborators {
+   qualityRatchet: QualityRatchet;
+   budget: BudgetGate;
+   governor: DaemonBudgetGovernor;
++  /** Autonomous self-validation gate (typecheck + full test suite). */
++  evolutionGate: EvolutionGate;
+ }
+ 
+ export interface BuildDaemonCollaboratorsOptions {
+@@ -193,6 +197,20 @@ export interface BuildDaemonCollaboratorsOptions {
+   logger?: DaemonLogger;
+ }
+ 
++/**
++ * The evolution gate collaborator: runs the repo's full self-check
++ * (`npm run typecheck && npm test`) in the task worktree, rolling back and
++ * recording into `autonomous_improvements.md` on failure.
++ */
++function createEvolutionGate(repoRoot: string): EvolutionGate {
++  return {
++    async check(worktree, baseSha) {
++      const result = await runEvolutionGate(worktree, { repoRoot, baseSha });
++      return { ok: result.ok, diagnostics: result.diagnostics };
++    },
++  };
++}
++
+ /**
+  * Construct every collaborator `AutonomousDaemon` accepts, from config and an
+  * already-resolved provider.
+@@ -262,6 +280,7 @@ export async function buildDaemonCollaborators(
+     qualityRatchet,
+     budget,
+     governor,
++    evolutionGate: createEvolutionGate(repoRoot),
+   };
+ }
+ 
+@@ -362,6 +381,7 @@ export async function daemonStart(
+     worktrees: collaborators.worktrees,
+     qualityRatchet: collaborators.qualityRatchet,
+     budget: collaborators.budget,
++    evolutionGate: collaborators.evolutionGate,
+     maxTurnsPerTask: config.autonomous.circuit_breakers.max_turns_per_task,
+     idleSleepBaseMs: config.autonomous.discovery.interval_sec * 1000,
+     idleSleepMaxMs: config.autonomous.discovery.max_backoff_sec * 1000,
+diff --git a/test/unit/autonomous/daemon-hardening.test.ts b/test/unit/autonomous/daemon-hardening.test.ts
+new file mode 100644
+index 0000000..98fec2a
+--- /dev/null
++++ b/test/unit/autonomous/daemon-hardening.test.ts
+@@ -0,0 +1,218 @@
++/**
++ * Subsystem 8 — Spot24/7 Autonomous Self-Evolution Engine hardening.
++ *
++ * Covers the three goals:
++ *   1. Loop termination & early-stop clean exit: `AutonomousDaemon.start`/`stop`
++ *      resolve cleanly and release the daemon lock (no lingering state).
++ *   2. Autonomous self-validation (evolution gate): `runEvolutionGate` runs the
++ *      repo's full check in the transient/task worktree; on failure it clears
++ *      stale git locks, rolls the worktree back to base, and records the failure
++ *      in `autonomous_improvements.md`.
++ *   3. Health heartbeat & circuit-breaker backoff: `failureBackoffMs` escalates
++ *      sleep after consecutive failures and is capped.
++ */
++import { existsSync } from 'node:fs';
++import { readFile, utimes, writeFile } from 'node:fs/promises';
++import { join } from 'node:path';
++import { describe, expect, it } from 'vitest';
++import { AutonomousDaemon, isOmnexxRepo } from '../../../src/autonomous/daemon.js';
++import { failureBackoffMs } from '../../../src/autonomous/daemon.js';
++import {
++  DEFAULT_EVOLUTION_COMMAND,
++  recordEvolutionFailure,
++  runEvolutionGate,
++  type EvolutionCommandRunner,
++} from '../../../src/autonomous/evolution-gate.js';
++import { AutonomousStateStore } from '../../../src/autonomous/state-store.js';
++import { git } from '../../../src/git/git.js';
++import { gitDirFor } from '../../../src/git/locks.js';
++import { tempDir, tempRepo } from '../../support/tmp.js';
++import { FakeClock } from '../../support/clock.js';
++
++async function seededRepo(): Promise<{ repo: string; head: string }> {
++  const repo = await tempRepo();
++  await writeFile(join(repo, 'a.txt'), 'one\n');
++  await git(repo, ['add', '-A']);
++  await git(repo, ['commit', '-qm', 'init']);
++  const head = (await git(repo, ['rev-parse', 'HEAD'])).stdout.trim();
++  return { repo, head };
++}
++
++const failingRunner: EvolutionCommandRunner = async () => ({
++  exitCode: 1,
++  stdout: '',
++  stderr: 'typecheck failed: src/foo.ts(1,1): error TS2322',
++});
++
++const passingRunner: EvolutionCommandRunner = async () => ({ exitCode: 0, stdout: '', stderr: '' });
++
++describe('evolution gate (autonomous self-validation)', () => {
++  it('passes and records nothing when the full check succeeds', async () => {
++    const { repo, head } = await seededRepo();
++    const improvementsPath = join(await tempDir(), 'autonomous_improvements.md');
++
++    const result = await runEvolutionGate(repo, {
++      repoRoot: repo,
++      baseSha: head,
++      improvementsPath,
++      run: passingRunner,
++    });
++
++    expect(result.ok).toBe(true);
++    expect(result.rolledBack).toBe(false);
++    expect(existsSync(improvementsPath)).toBe(false);
++    expect(await readFile(join(repo, 'a.txt'), 'utf8')).toBe('one\n');
++  });
++
++  it('rolls back, clears stale locks, and records the failure when the check fails', async () => {
++    const { repo, head } = await seededRepo();
++    const improvementsPath = join(await tempDir(), 'autonomous_improvements.md');
++
++    // Simulate a speculative change that failed validation.
++    await writeFile(join(repo, 'a.txt'), 'broken\n');
++
++    // Plant a stale index.lock so we can prove lock clearance fires.
++    const lock = join(await gitDirFor(repo), 'index.lock');
++    await writeFile(lock, '');
++    const past = new Date(Date.now() - 60_000);
++    await utimes(lock, past, past);
++
++    const result = await runEvolutionGate(repo, {
++      repoRoot: repo,
++      baseSha: head,
++      improvementsPath,
++      run: failingRunner,
++    });
++
++    expect(result.ok).toBe(false);
++    expect(result.rolledBack).toBe(true);
++    expect(result.diagnostics.join(' ')).toMatch(/exited 1/);
++    // Rollback restored the worktree byte-identically.
++    expect(await readFile(join(repo, 'a.txt'), 'utf8')).toBe('one\n');
++    // Stale git lock was cleared.
++    expect(existsSync(lock)).toBe(false);
++    // Failure was recorded in autonomous_improvements.md.
++    const recorded = await readFile(improvementsPath, 'utf8');
++    expect(recorded).toContain('Evolution gate failed');
++    expect(recorded).toContain(DEFAULT_EVOLUTION_COMMAND);
++    expect(recorded).toMatch(/Exit code: 1/);
++  });
++
++  it('still records a hard runner crash and returns ok=false, trying rollback', async () => {
++    const { repo, head } = await seededRepo();
++    const improvementsPath = join(await tempDir(), 'autonomous_improvements.md');
++    await writeFile(join(repo, 'a.txt'), 'broken\n');
++    const crashRunner: EvolutionCommandRunner = async () => {
++      throw new Error('spawn npm ENOENT');
++    };
++
++    const result = await runEvolutionGate(repo, {
++      repoRoot: repo,
++      baseSha: head,
++      improvementsPath,
++      run: crashRunner,
++    });
++
++    expect(result.ok).toBe(false);
++    // A crashed runner means we do not know the exit code, but we still roll back
++    // and record the failure so the fact is not lost.
++    expect(await readFile(join(repo, 'a.txt'), 'utf8')).toBe('one\n');
++    expect(await readFile(improvementsPath, 'utf8')).toContain('Evolution gate failed');
++  });
++
++  it('recordEvolutionFailure appends idempotently with mkdir of the parent', async () => {
++    const dir = await tempDir();
++    const path = join(dir, 'nested', 'autonomous_improvements.md');
++    await recordEvolutionFailure(path, {
++      at: '2026-11-09T00:00:00.000Z',
++      taskId: 't_x',
++      command: 'npm run typecheck && npm test',
++      exitCode: 2,
++      stderr: 'boom',
++    });
++    await recordEvolutionFailure(path, {
++      at: '2026-11-09T00:00:01.000Z',
++      command: 'npm test',
++      stderr: '',
++    });
++    const text = await readFile(path, 'utf8');
++    expect(text).toContain('t_x');
++    expect(text).toContain('Exit code: 2');
++    expect((text.match(/Evolution gate failed/g) ?? []).length).toBe(2);
++  });
++});
++
++describe('health heartbeat / circuit-breaker backoff', () => {
++  it('returns 0 below or at the failure threshold', () => {
++    expect(failureBackoffMs(1, 3, 30_000, 3_600_000)).toBe(0);
++    expect(failureBackoffMs(3, 3, 30_000, 3_600_000)).toBe(0);
++  });
++
++  it('escalates from the base after the threshold', () => {
++    expect(failureBackoffMs(4, 3, 30_000, 3_600_000)).toBe(30_000);
++    expect(failureBackoffMs(5, 3, 30_000, 3_600_000)).toBe(60_000);
++    expect(failureBackoffMs(7, 3, 30_000, 3_600_000)).toBe(240_000);
++  });
++
++  it('caps at the maximum backoff', () => {
++    expect(failureBackoffMs(100, 3, 30_000, 3_600_000)).toBe(3_600_000);
++  });
++});
++
++describe('isOmnexxRepo (evolution gate scope)', () => {
++  it('detects the Omnexx repo by package.json name', async () => {
++    const repo = await tempRepo();
++    await writeFile(join(repo, 'package.json'), JSON.stringify({ name: 'omnexx' }));
++    expect(await isOmnexxRepo(repo)).toBe(true);
++  });
++
++  it('returns false for a generic repo or absent package.json', async () => {
++    const generic = await tempRepo();
++    await writeFile(join(generic, 'package.json'), JSON.stringify({ name: 'some-other-tool' }));
++    expect(await isOmnexxRepo(generic)).toBe(false);
++
++    const bare = await tempRepo();
++    expect(await isOmnexxRepo(bare)).toBe(false);
++  });
++});
++
++describe('daemon loop termination & clean exit', () => {
++  it('start(maxCycles) resolves, stops running, and releases the daemon lock', async () => {
++    const repo = await tempRepo();
++    const store = new AutonomousStateStore({ repoRoot: repo, dbPath: ':memory:' });
++    const daemon = new AutonomousDaemon({
++      repoRoot: repo,
++      store,
++      clock: new FakeClock(),
++      idleSleepBaseMs: 10,
++      headPollMs: 10,
++    });
++
++    await daemon.start({ maxCycles: 1 });
++
++    expect(daemon.isRunning).toBe(false);
++    expect(existsSync(join(repo, '.omnexx', 'daemon.lock'))).toBe(false);
++    // Stop is idempotent after a clean exit.
++    await daemon.stop();
++  });
++
++  it('stop() aborts an idle loop and releases the lock without hanging', async () => {
++    const repo = await tempRepo();
++    const store = new AutonomousStateStore({ repoRoot: repo, dbPath: ':memory:' });
++    const daemon = new AutonomousDaemon({
++      repoRoot: repo,
++      store,
++      clock: new FakeClock(),
++      idleSleepBaseMs: 10,
++      headPollMs: 10,
++      shutdownGraceMs: 500,
++    });
++
++    const running = daemon.start(); // no maxCycles → runs until stopped
++    await daemon.stop();
++    await running;
++
++    expect(daemon.isRunning).toBe(false);
++    expect(existsSync(join(repo, '.omnexx', 'daemon.lock'))).toBe(false);
++  });
++});
+diff --git a/vscode/src/webview/chat.ts b/vscode/src/webview/chat.ts
+index 116e1f2..af07588 100644
+--- a/vscode/src/webview/chat.ts
++++ b/vscode/src/webview/chat.ts
+@@ -16,10 +16,12 @@ import {
+   escapeHtml,
+   estimateHtml,
+   etaText,
++  fileActionChipHtml,
+   formatClock,
+   formatElapsedMs,
+   formatTokens,
+   formatUsd,
++  isFileActionLine,
+   logRole,
+   mountedRange,
+   renderMarkdown,
+@@ -423,26 +425,44 @@ function kindBreakdown(lines: readonly string[]): string {
+   return [...counts.entries()].map(([k, n]) => `${String(n)} ${toolBadgeLabel(k)}`).join(' · ');
+ }
+ 
++function kindNamesForSummary(lines: readonly string[]): string {
++  const seen = new Set<string>();
++  for (const line of lines) {
++    const k = toolKind(line);
++    const name = k === 'run' ? 'run' : k === 'read' ? 'read' : k === 'edit' ? 'edit' : k === 'diff' ? 'diff' : k === 'test' ? 'test' : k === 'search' ? 'search' : k === 'mcp' ? 'mcp' : 'tool';
++    seen.add(name);
++  }
++  return [...seen].join(', ');
++}
++
+ /**
+  * Renders a grouped tool execution cluster with semantic pills and collapsible overflow.
+- * The active (still running) cluster renders as one collapsible card whose header
+- * carries a live elapsed counter and a stdout preview pill showing the latest tool
+- * line — the last `act` entry, which is the most recent tool output the renderer
+- * sees. `startedAt` is when the block was first seen (blockSeenAt in drawConversation).
++ * Active cluster: one collapsible card with live elapsed + stdout preview.
++ * File read/edit actions are clustered into tactile strips to reduce vertical spam.
+  */
+ function renderToolCluster(b: Block, isActiveTail: boolean, startedAt?: number): string {
+   const validLines = b.lines.filter((l) => l.trim());
+   if (!validLines.length) return '';
+ 
++  const renderFileCluster = (lines: readonly string[], startIdx: number, isTailLive: boolean): string => {
++    const chips = lines
++      .map((line, i) => {
++        const chip = fileActionChipHtml(line);
++        const live = isTailLive && startIdx + i === validLines.length - 1 ? ' is-live' : '';
++        if (chip) return `<span class="file-cluster-chip${live}">${chip}</span>`;
++        const kind = toolKind(line);
++        return `<span class="file-cluster-chip${live}"><span class="action-pill k-${kind}"><span class="tool-text">${toolLineHtml(line)}</span></span></span>`;
++      })
++      .join('');
++    const livePulse = isTailLive && startIdx + lines.length - 1 === validLines.length - 1 ? '<span class="tool-pulse" aria-hidden="true"></span>' : '';
++    return `<li class="tool file-cluster-row"><span class="file-cluster-strip">${chips}</span>${livePulse}</li>`;
++  };
++
+   const renderItem = (line: string, idx: number): string => {
+     const kind = toolKind(line);
+     const isLiveItem = isActiveTail && idx === validLines.length - 1;
+     const liveClass = isLiveItem ? ' is-live' : '';
+     if (kind === 'run') {
+-      // One bash tool call per block (act entries never join), so the block id
+-      // is the pill id the host manager posts for this call. Open while the
+-      // tool runs unless the person closed it; closed once done unless they
+-      // opened it — the disclosure sets track deliberate toggles.
+       const pillId = b.id;
+       const view = terminalPill.getPillView(pillId);
+       const discId = `pill-${String(pillId)}`;
+@@ -455,20 +475,28 @@ function renderToolCluster(b: Block, isActiveTail: boolean, startedAt?: number):
+     return `<li class="tool k-${kind}${liveClass}"><span class="tool-ico">${iconForToolKind(kind)}</span><span class="tool-badge k-${kind}">${toolBadgeLabel(kind)}</span><span class="tool-text">${toolLineHtml(line)}</span>${isLiveItem ? '<span class="tool-pulse" aria-hidden="true"></span>' : ''}</li>`;
+   };
+ 
+-  // Group consecutive same-kind actions into runs first, so each run's header
+-  // can be emitted before its items ("read cluster", "edit cluster").
+   const renderRuns = (lines: readonly string[], offset: number): string => {
+-    const runs: { kind: ToolKind; at: number[] }[] = [];
++    type Run = { kind: ToolKind; fileCluster: boolean; at: number[] };
++    const runs: Run[] = [];
+     lines.forEach((line, i) => {
+       const kind = toolKind(line);
++      const fileCluster = kind !== 'run' && isFileActionLine(line);
+       const last = runs.at(-1);
+-      if (last?.kind === kind) last.at.push(i);
+-      else runs.push({ kind, at: [i] });
++      if (last && last.kind === kind && last.fileCluster === fileCluster) last.at.push(i);
++      else runs.push({ kind, fileCluster, at: [i] });
+     });
+     return runs
+       .map((run) => {
++        if (run.fileCluster && run.at.length >= 2) {
++          const head = `<li class="tool-run-head"><span class="tool-badge k-${run.kind}">${toolBadgeLabel(run.kind)}</span><span>${String(run.at.length)} files</span></li>`;
++          return head + renderFileCluster(run.at.map((i) => lines[i] ?? ''), offset + (run.at[0] ?? 0), isActiveTail);
++        }
++        if (run.fileCluster && run.at.length === 1) {
++          const i = run.at[0] ?? 0;
++          return renderItem(lines[i] ?? '', offset + i);
++        }
+         const head =
+-          run.at.length > 1
++          !run.fileCluster && run.at.length > 1
+             ? `<li class="tool-run-head"><span class="tool-badge k-${run.kind}">${toolBadgeLabel(run.kind)}</span><span>×${String(run.at.length)}</span></li>`
+             : '';
+         return head + run.at.map((i) => renderItem(lines[i] ?? '', offset + i)).join('');
+@@ -477,10 +505,6 @@ function renderToolCluster(b: Block, isActiveTail: boolean, startedAt?: number):
+   };
+ 
+   if (isActiveTail) {
+-    // One collapsible card while the cluster runs: header with the live
+-    // elapsed counter + stdout preview, body with every tool line. Open while
+-    // running so live output is visible; a deliberate close sticks, like the
+-    // think accordions (the toggle listener tracks data-disclosure-id).
+     const lastLine = validLines.at(-1) ?? '';
+     const kind = toolKind(lastLine);
+     const started = startedAt ?? Date.now();
+@@ -501,8 +525,10 @@ function renderToolCluster(b: Block, isActiveTail: boolean, startedAt?: number):
+     .slice(-3)
+     .map((l, i) => renderItem(l, validLines.length - 3 + i))
+     .join('');
++  const dur = startedAt ? ` · ${formatElapsedMs(Math.max(0, Date.now() - startedAt))}` : '';
++  const summaryLabel = `Executed ${String(validLines.length)} tools (${kindNamesForSummary(validLines)})${dur}`;
+ 
+-  return `<div class="msg tools-cluster"><details class="tools-fold" data-disclosure-id="${disclosureId}"${isOpen ? ' open' : ''}><summary class="tools-summary"><span class="tools-count-pill">${String(validLines.length)} tool actions · ${kindBreakdown(validLines)}</span><span class="tools-expand-hint">Show ${String(hiddenCount)} earlier · ${kindBreakdown(hiddenLines)}</span></summary><ul class="msg tools">${renderRuns(hiddenLines, 0)}</ul></details><ul class="msg tools tools-tail">${tailItems}</ul></div>`;
++  return `<div class="msg tools-cluster"><details class="tools-fold" data-disclosure-id="${disclosureId}"${isOpen ? ' open' : ''}><summary class="tools-summary"><span class="tools-summary-main">${escapeHtml(summaryLabel)}</span><span class="tools-expand-hint">Show ${String(hiddenCount)} earlier</span></summary><ul class="msg tools">${renderRuns(hiddenLines, 0)}</ul></details><ul class="msg tools tools-tail">${tailItems}</ul></div>`;
+ }
+ 
+ function messageHtml(b: Block, isActiveTail: boolean, seenAt?: number): string {

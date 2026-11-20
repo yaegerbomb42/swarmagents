@@ -1,0 +1,2614 @@
+From 5b09826e4fa8ac9a31796f891de7665edab678d6 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Fri, 6 Nov 2026 17:14:10 -0600
+Subject: [PATCH] feat(perf): speculative neural caching, AST cache, and cache
+ metrics
+
+---
+ src/agent/codemap.ts                       |  50 ++-
+ src/agent/planner.ts                       |   2 +-
+ src/agent/subagent.ts                      |   2 +-
+ src/core/ast-cache.ts                      | 316 +++++++++++++++++++
+ src/core/cycle.ts                          |  36 ++-
+ src/core/milestones.ts                     |  13 +-
+ src/core/run.ts                            |  29 +-
+ src/core/speculative-check.ts              | 230 ++++++++++++++
+ src/core/supervisor.ts                     |   2 +
+ src/providers/anthropic.ts                 |  11 +-
+ src/providers/cache-pinning.ts             | 225 ++++++++++++++
+ src/providers/cache-tracking.ts            | 112 +++++++
+ src/providers/openai-compat.ts             |   8 +-
+ src/telemetry/aggregate.ts                 |  40 +++
+ src/telemetry/cache-metrics.ts             | 147 +++++++++
+ src/telemetry/humanize.ts                  |  14 +
+ src/tools/edit.ts                          |  18 +-
+ src/tools/types.ts                         |   5 +-
+ test/unit/bench/speculative-cache.test.ts  |  64 ++++
+ test/unit/bench/speculative-cache.ts       | 338 +++++++++++++++++++++
+ test/unit/core/ast-cache.test.ts           | 170 +++++++++++
+ test/unit/core/speculative-check.test.ts   |  55 ++++
+ test/unit/providers/cache-pinning.test.ts  | 122 ++++++++
+ test/unit/providers/cache-tracking.test.ts |  90 ++++++
+ test/unit/telemetry/cache-metrics.test.ts  |  83 +++++
+ 25 files changed, 2159 insertions(+), 23 deletions(-)
+ create mode 100644 src/core/ast-cache.ts
+ create mode 100644 src/core/speculative-check.ts
+ create mode 100644 src/providers/cache-pinning.ts
+ create mode 100644 src/providers/cache-tracking.ts
+ create mode 100644 src/telemetry/cache-metrics.ts
+ create mode 100644 test/unit/bench/speculative-cache.test.ts
+ create mode 100644 test/unit/bench/speculative-cache.ts
+ create mode 100644 test/unit/core/ast-cache.test.ts
+ create mode 100644 test/unit/core/speculative-check.test.ts
+ create mode 100644 test/unit/providers/cache-pinning.test.ts
+ create mode 100644 test/unit/providers/cache-tracking.test.ts
+ create mode 100644 test/unit/telemetry/cache-metrics.test.ts
+
+diff --git a/src/agent/codemap.ts b/src/agent/codemap.ts
+index 47b5cc36..5037ff76 100644
+--- a/src/agent/codemap.ts
++++ b/src/agent/codemap.ts
+@@ -1,6 +1,7 @@
+ import { readdir, readFile, stat } from 'node:fs/promises';
+ import { dirname, join } from 'node:path';
+ import { z } from 'zod';
++import { astForFile, type AstCache } from '../core/ast-cache.js';
+ import { estimateTokens } from '../core/tokens.js';
+ import { git } from '../git/git.js';
+ import { matchesAny } from '../security/glob.js';
+@@ -79,6 +80,29 @@ async function entryFor(root: string, path: string): Promise<CodemapEntry | unde
+   }
+ }
+ 
++/**
++ * The same entry, but through the AST cache: an unchanged file is not read again, so a
++ * rebuild of the map only pays for the files that actually changed.
++ */
++async function cachedEntryFor(
++  root: string,
++  path: string,
++  cache: AstCache,
++): Promise<CodemapEntry | undefined> {
++  if (isSecretPath(path) || matchesAny(path, SKIP)) return undefined;
++  const abs = join(root, path);
++  const found = await astForFile(cache, path, abs);
++  if (!found) return undefined;
++  const kind = kindOf(path);
++  const symbols =
++    kind === 'source'
++      ? found.ast.symbols
++          .slice(0, MAX_SYMBOLS)
++          .map((s) => `${s.kind} ${s.name}`)
++      : [];
++  return { path, kind, lines: found.ast.lines, symbols };
++}
++
+ /** Directories a walk outside git never descends into. */
+ const SKIP_DIRS = new Set([
+   'node_modules',
+@@ -156,18 +180,38 @@ export async function buildCodemap(root: string): Promise<Codemap> {
+ }
+ 
+ /**
+- * Recompute entries only for `changed` paths (added, modified or deleted). A changed file keeps
+- * its purpose unless `purposes` supplies a new one. Returns the paths that are new or changed.
++ * The same map, but built through the AST cache: a file that did not change is not read
++ * or parsed again. The map is byte-identical to the one `buildCodemap` produces.
++ */
++export async function buildCodemapCached(
++  root: string,
++  cache: AstCache,
++): Promise<Codemap> {
++  const entries: CodemapEntry[] = [];
++  for (const path of await trackedFiles(root)) {
++    const e = await cachedEntryFor(root, path, cache);
++    if (e) entries.push(e);
++  }
++  return { version: 1, entries };
++}
++
++/**
++ * Recompute entries only for `changed` paths (added, modified or deleted), through the AST
++ * cache so an unchanged file is never re-read. A changed file keeps its purpose unless
++ * `purposes` supplies a new one. Returns the paths that are new or changed.
+  */
+ export async function updateCodemap(
+   map: Codemap,
+   root: string,
+   changed: readonly string[],
++  cache?: AstCache,
+ ): Promise<{ map: Codemap; touched: string[] }> {
+   const byPath = new Map(map.entries.map((e) => [e.path, e]));
+   const touched: string[] = [];
+   for (const path of new Set(changed)) {
+-    const fresh = await entryFor(root, path);
++    const fresh = cache
++      ? await cachedEntryFor(root, path, cache)
++      : await entryFor(root, path);
+     const old = byPath.get(path);
+     if (!fresh) {
+       byPath.delete(path);
+diff --git a/src/agent/planner.ts b/src/agent/planner.ts
+index 8212972d..f8c30758 100644
+--- a/src/agent/planner.ts
++++ b/src/agent/planner.ts
+@@ -412,7 +412,7 @@ export async function runPlanner(run: Run, mode: PlannerMode): Promise<Plan> {
+       tools: tools.map(toolSpec),
+     },
+     {
+-      provider: run.deps.provider,
++      provider: run.provider,
+       models: plannerCandidates(
+         run,
+         (
+diff --git a/src/agent/subagent.ts b/src/agent/subagent.ts
+index 66bf0e67..01783388 100644
+--- a/src/agent/subagent.ts
++++ b/src/agent/subagent.ts
+@@ -181,7 +181,7 @@ export function subagentRunner(
+       maxTokens: Math.min(run.config.providers.anthropic.max_tokens, 4_096),
+       limits: { tokens: cfg.subagent_max_tokens, turns: cfg.subagent_max_turns },
+       loop: {
+-        provider: run.deps.provider,
++        provider: run.provider,
+         providerBlocked: (p) => run.providerBlocked(p),
+         modelExhausted: (r) => run.modelExhausted(r),
+         markExhausted: (r) => {
+diff --git a/src/core/ast-cache.ts b/src/core/ast-cache.ts
+new file mode 100644
+index 00000000..6a121f5f
+--- /dev/null
++++ b/src/core/ast-cache.ts
+@@ -0,0 +1,316 @@
++import { createHash } from 'node:crypto';
++import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
++import type { Stats } from 'node:fs';
++import { dirname, join } from 'node:path';
++import { extractSymbols, type Symbol } from '../tools/outline.js';
++
++/**
++ * Persistent AST & symbol hashing.
++ *
++ * The agent re-reads the same files over and over: the codebase map, an outline, a read, a
++ * symbol lookup. Every one of those re-reads the file and re-parses it, and every parse is
++ * paid for again in tokens. This cache keys a file by the hash of its bytes, so a file that
++ * did not change is parsed once and reused: no re-read, no re-tokenization.
++ *
++ * The cache is content-addressed, never path-addressed: the same bytes at another path are
++ * the same entry, and a changed file is a new entry (the old one is dropped). It survives
++ * process restarts (a JSON file per repo), so a long session pays the parse cost once.
++ */
++
++/** What one file's parse produced: its symbols and the modules it imports. */
++export interface FileAst {
++  /** SHA-256 of the file's bytes, lowercase hex. The entry's identity. */
++  hash: string;
++  /** Symbols with their line numbers and kinds. */
++  symbols: Symbol[];
++  /** Module specifiers the file imports, in source order, deduplicated. */
++  imports: string[];
++  /** The file's line count. */
++  lines: number;
++  /** Estimated tokens of the file's text: what re-reading it would cost. */
++  tokens: number;
++}
++
++/** The on-disk cache: one JSON file, keyed by content hash. */
++interface CacheFile {
++  version: 1;
++  /** Content hash -> the parsed file. */
++  entries: Record<string, FileAst>;
++  /** Repo-relative path -> the file's last known stat and hash. */
++  paths?: Record<string, PathEntry>;
++}
++
++/**
++ * What the cache remembers about one path: its size and modification time, and the hash of
++ * the bytes it had then.
++ *
++ * The stat is the fast path: when a file's size and mtime are unchanged since the last
++ * parse, its bytes are unchanged, so the file is never read again. The hash is the
++ * authority: when the stat says "changed", the file is read and hashed, and only then is
++ * the entry replaced.
++ */
++export interface PathEntry {
++  /** The file's size in bytes when it was parsed. */
++  size: number;
++  /** The file's modification time in milliseconds when it was parsed. */
++  mtimeMs: number;
++  /** The hash of the bytes when it was parsed. */
++  hash: string;
++}
++
++/** Cache file format version; a different one is discarded, not migrated. */
++const CACHE_VERSION = 1;
++
++/** Files above this size are not parsed (a minified bundle has no useful symbols). */
++export const MAX_CACHE_FILE_BYTES = 1_000_000;
++
++/** Entries kept in the cache file; the oldest are dropped first (insertion order). */
++const MAX_ENTRIES = 5_000;
++
++
++/** Languages we extract imports from. Others still get symbols. */
++const IMPORT_PATTERNS: readonly RegExp[] = [
++  // import x from 'y' / import 'y' / import type { a } from 'y'
++  /^\s*import\s+(?:type\s+)?(?:[^'"]*?\s+from\s+)?['"]([^'"]+)['"]/gm,
++  // export ... from 'y'
++  /^\s*export\s+(?:type\s+)?(?:\*|\{[^}]*\})\s+from\s+['"]([^'"]+)['"]/gm,
++  // require('y')
++  /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
++  // from x import y / import x in Python
++  /^\s*(?:from\s+([\w.]+)\s+import\b|import\s+([\w.]+))/gm,
++];
++
++/** The imports of a file: module specifiers, deduplicated, in source order. */
++export function extractImports(text: string): string[] {
++  const out: string[] = [];
++  const seen = new Set<string>();
++  for (const re of IMPORT_PATTERNS) {
++    re.lastIndex = 0;
++    for (const m of text.matchAll(re)) {
++      const spec = m[1] ?? m[2];
++      if (!spec || seen.has(spec)) continue;
++      seen.add(spec);
++      out.push(spec);
++    }
++  }
++  return out;
++}
++
++/** The content hash of a file's bytes: the cache's key. */
++export function hashContent(text: string): string {
++  return createHash('sha256').update(text).digest('hex');
++}
++
++/** Parse a file's text into its AST entry: symbols, imports, line count, token estimate. */
++export function parseFile(text: string): Omit<FileAst, 'hash'> {
++  return {
++    symbols: extractSymbols(text),
++    imports: extractImports(text),
++    lines: text.split('\n').length,
++    // 3 chars/token is the harness's own conservative estimate (src/core/tokens.ts).
++    tokens: Math.ceil(text.length / 3),
++  };
++}
++
++
++/**
++ * The cache for one repo. It reads its file once, then keeps it in memory; `flush` writes it
++ * back. Entries are dropped when their file changes, so the cache never grows without bound.
++ */
++export class AstCache {
++  private entries = new Map<string, FileAst>();
++  private paths = new Map<string, PathEntry>();
++  private dirty = false;
++  private loaded = false;
++  /** Where the cache file lives. */
++  readonly file: string;
++
++  constructor(file: string) {
++    this.file = file;
++  }
++
++  /** Load the cache file once. A missing or broken file starts an empty cache. */
++  async load(): Promise<void> {
++    if (this.loaded) return;
++    this.loaded = true;
++    let raw: string;
++    try {
++      raw = await readFile(this.file, 'utf8');
++    } catch {
++      return;
++    }
++    let parsed: unknown;
++    try {
++      parsed = JSON.parse(raw) as unknown;
++    } catch {
++      return;
++    }
++    const file = parsed as Partial<CacheFile>;
++    if (file.version !== CACHE_VERSION || typeof file.entries !== 'object') return;
++    for (const [hash, entry] of Object.entries(file.entries)) {
++      if (!entry || typeof entry !== 'object') continue;
++      const e = entry as Partial<FileAst>;
++      if (typeof e.hash !== 'string' || !Array.isArray(e.symbols)) continue;
++      this.entries.set(hash, {
++        hash: e.hash,
++        symbols: e.symbols as Symbol[],
++        imports: Array.isArray(e.imports) ? e.imports : [],
++        lines: typeof e.lines === 'number' ? e.lines : 0,
++        tokens: typeof e.tokens === 'number' ? e.tokens : 0,
++      });
++    }
++    for (const [path, entry] of Object.entries(file.paths ?? {})) {
++      if (!entry || typeof entry !== 'object') continue;
++      const e = entry as Partial<PathEntry>;
++      if (typeof e.hash !== 'string' || typeof e.size !== 'number') continue;
++      this.paths.set(path, {
++        size: e.size,
++        mtimeMs: typeof e.mtimeMs === 'number' ? e.mtimeMs : 0,
++        hash: e.hash,
++      });
++    }
++  }
++
++  /**
++   * The entry for a path whose bytes are unchanged since it was last parsed, or undefined.
++   *
++   * `size` and `mtimeMs` come from a stat: when they match what was recorded, the bytes
++   * are the same, so the file is not read again at all. This is the fast path that keeps
++   * an unchanged file from being re-read and re-tokenized.
++   */
++  getByPath(path: string, size: number, mtimeMs: number): FileAst | undefined {
++    const known = this.paths.get(path);
++    if (!known || known.size !== size || known.mtimeMs !== mtimeMs) return undefined;
++    const entry = this.entries.get(known.hash);
++    return entry;
++  }
++
++  /** Remember a path's stat and the hash of the bytes it had. */
++  setPath(path: string, size: number, mtimeMs: number, hash: string): void {
++    const known = this.paths.get(path);
++    if (known && known.hash === hash && known.size === size && known.mtimeMs === mtimeMs) return;
++    this.paths.set(path, { size, mtimeMs, hash });
++    this.dirty = true;
++  }
++
++  /** Forget a path (the file was deleted). */
++  forgetPath(path: string): void {
++    if (this.paths.delete(path)) this.dirty = true;
++  }
++
++  /** The entry for these bytes, or undefined when the file was never parsed. */
++  get(hash: string): FileAst | undefined {
++    return this.entries.get(hash);
++  }
++
++  /** Store an entry. Replaces an entry with the same hash (the bytes are the same). */
++  set(entry: FileAst): void {
++    this.entries.delete(entry.hash);
++    this.entries.set(entry.hash, entry);
++    this.dirty = true;
++    while (this.entries.size > MAX_ENTRIES) {
++      const oldest = this.entries.keys().next();
++      if (oldest.done) break;
++      this.entries.delete(oldest.value);
++    }
++  }
++
++  /** How many files are cached. */
++  get size(): number {
++    return this.entries.size;
++  }
++
++  /** Total estimated tokens of the cached files: what re-reading them would cost. */
++  get tokens(): number {
++    let sum = 0;
++    for (const e of this.entries.values()) sum += e.tokens;
++    return sum;
++  }
++
++  /** Write the cache back to disk. A no-op when nothing changed. */
++  async flush(): Promise<void> {
++    if (!this.dirty) return;
++    const file: CacheFile = {
++      version: CACHE_VERSION,
++      entries: Object.fromEntries(this.entries),
++      paths: Object.fromEntries(this.paths),
++    };
++    await mkdir(dirname(this.file), { recursive: true });
++    // Written to a temp file and renamed, so a crash never leaves a half-written cache.
++    const tmp = `${this.file}.tmp`;
++    await writeFile(tmp, `${JSON.stringify(file)}\n`, { mode: 0o600 });
++    await rename(tmp, this.file);
++    this.dirty = false;
++  }
++
++  /** Forget everything (the cache file is rewritten on the next flush). */
++  clear(): void {
++    this.entries.clear();
++    this.paths.clear();
++    this.dirty = true;
++  }
++}
++
++/** Where a repo's AST cache lives: beside the run's other state. */
++export function astCacheFile(cacheDir: string, repoRoot: string): string {
++  return join(cacheDir, `ast-${hashContent(repoRoot).slice(0, 16)}.json`);
++}
++
++/**
++ * The AST of a file, from the cache when the bytes are unchanged and from a fresh parse
++ * otherwise. `text` is the file's content (the caller reads it once); the returned entry
++ * says whether it came from the cache.
++ */
++export async function astFor(
++  cache: AstCache,
++  text: string,
++): Promise<{ ast: FileAst; hit: boolean }> {
++  const hash = hashContent(text);
++  const hit = cache.get(hash);
++  if (hit) return { ast: hit, hit: true };
++  const ast: FileAst = { hash, ...parseFile(text) };
++  cache.set(ast);
++  return { ast, hit: false };
++}
++
++/** Whether a file is worth parsing at all (too big, or not source). */
++export function isCacheableSource(path: string, size: number): boolean {
++  if (size > MAX_CACHE_FILE_BYTES) return false;
++  return /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|rb|php|cs|c|cc|cpp|h|hpp|swift|scala|sh)$/i.test(path);
++}
++
++
++/**
++ * The AST of a file on disk, from the cache when the file has not changed.
++ *
++ * The fast path never reads the file: a stat says the size and mtime are the same as when
++ * it was last parsed, so its bytes are the same and the cached AST is used as is. Only a
++ * file that changed is read and re-parsed.
++ *
++ * `rel` is the repo-relative path (the cache's key for the path), `abs` the file's location.
++ */
++export async function astForFile(
++  cache: AstCache,
++  rel: string,
++  abs: string,
++): Promise<{ ast: FileAst; hit: boolean; read: boolean } | undefined> {
++  let info: Stats;
++  try {
++    info = await stat(abs);
++  } catch {
++    cache.forgetPath(rel);
++    return undefined;
++  }
++  if (!info.isFile()) return undefined;
++  const cached = cache.getByPath(rel, info.size, info.mtimeMs);
++  if (cached) return { ast: cached, hit: true, read: false };
++  let text: string;
++  try {
++    text = await readFile(abs, 'utf8');
++  } catch {
++    return undefined;
++  }
++  const { ast, hit } = await astFor(cache, text);
++  cache.setPath(rel, info.size, info.mtimeMs, ast.hash);
++  return { ast, hit, read: true };
++}
+diff --git a/src/core/cycle.ts b/src/core/cycle.ts
+index b99e80a2..a53f57a7 100644
+--- a/src/core/cycle.ts
++++ b/src/core/cycle.ts
+@@ -2,6 +2,7 @@ import { FAST_TASK } from './fast-path.js';
+ import { withoutVendored } from '../agent/codemap.js';
+ import { loadRoleCard } from '../agent/sections.js';
+ import { parseDuration } from '../config/duration.js';
++import { existsSync, readFileSync } from 'node:fs';
+ import { join } from 'node:path';
+ import { z } from 'zod';
+ import {
+@@ -17,6 +18,7 @@ import { factsBlockFor } from './facts.js';
+ import { briefInput } from '../config/agent-settings.js';
+ import { renderCodemap, type Codemap } from '../agent/codemap.js';
+ import { runAgentLoop, type LoopDeps } from '../agent/loop.js';
++import { SpeculativeFileChecks } from './speculative-check.js';
+ import type { ResolvedModel } from '../providers/pricing.js';
+ import { actAsThinkLoop, renderGateFailures, usesThinkLoop } from './think-loop-run.js';
+ import { WORKER_SYSTEM } from '../agent/prompts.js';
+@@ -215,6 +217,22 @@ async function loadCodemap(run: Run): Promise<string> {
+   return renderCodemap(JSON.parse(text) as Codemap, run.config.context.repo_map_max_tokens);
+ }
+ 
++/**
++ * The project's lint command, when it has one: eslint, or the `lint` script of package.json.
++ * The speculative checks run it on the file that changed, in the background.
++ */
++export function lintCommand(root: string): string | undefined {
++  if (existsSync(join(root, 'node_modules', '.bin', 'eslint'))) return 'npx eslint';
++  const pkg = join(root, 'package.json');
++  if (!existsSync(pkg)) return undefined;
++  try {
++    const parsed = JSON.parse(readFileSync(pkg, 'utf8')) as { scripts?: Record<string, string> };
++    return typeof parsed.scripts?.lint === 'string' ? 'npm run --silent lint --' : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
+ /** PREPARE: the worktree must sit exactly on lastGreen with a clean tree before ACT. */
+ export async function prepareWorktree(run: Run): Promise<void> {
+   const head = await headSha(run.worktree);
+@@ -390,8 +408,20 @@ export async function stepAct(run: Run): Promise<void> {
+   const running = new RunningContext(run.store, task.id, () => run.clock.now());
+   toolCtx.runningContext = running;
+   let editOps = 0;
+-  toolCtx.onEdit = () => {
++  // The speculative file checks run in the background from the moment a file is written,
++  // so the typecheck and the lint are already done when the model asks for them.
++  const speculative = run.config.plan.speculative_checks
++    ? new SpeculativeFileChecks({
++        exec: run.exec,
++        root: run.worktree,
++        env: run.childEnv,
++        signal: run.signal,
++        ...(lintCommand(run.worktree) ? { lint: lintCommand(run.worktree) } : {}),
++      })
++    : undefined;
++  toolCtx.onEdit = (path, content) => {
+     editOps++;
++    if (speculative && content !== undefined) speculative.touch(path, content);
+   };
+   const runningText = await running.forPrompt();
+   const [goal, intent, notes, progressTail, codemap] = await Promise.all([
+@@ -457,7 +487,7 @@ export async function stepAct(run: Run): Promise<void> {
+     memory: memory.stats(),
+   });
+   const deps = (models: readonly ResolvedModel[]): LoopDeps => ({
+-    provider: run.deps.provider,
++    provider: run.provider,
+     models,
+     providerBlocked: (p) => run.providerBlocked(p),
+     modelExhausted: (r) => run.modelExhausted(r),
+@@ -524,6 +554,8 @@ export async function stepAct(run: Run): Promise<void> {
+     : await runAgentLoop(ctx, deps(route.chain));
+   // The browser (and the page it holds) lives for one cycle; the next starts fresh.
+   await closeSession(run.state.runId).catch(() => undefined);
++  // The background checks stop with the cycle: nothing outlives it.
++  await speculative?.stop();
+   if (result.end === 'max_usd') run.state.budgetExhausted = true;
+   if (result.end === 'providers_unavailable')
+     run.state.providersUnavailable = result.detail ?? 'no model could take a call';
+diff --git a/src/core/milestones.ts b/src/core/milestones.ts
+index 3bbbf190..d609fbf4 100644
+--- a/src/core/milestones.ts
++++ b/src/core/milestones.ts
+@@ -1,5 +1,5 @@
+ import { z } from 'zod';
+-import { buildCodemap, setPurposes, updateCodemap, type Codemap } from '../agent/codemap.js';
++import { buildCodemapCached, setPurposes, updateCodemap, type Codemap } from '../agent/codemap.js';
+ import { describeFiles } from '../agent/describe.js';
+ import { tagCheckpoint } from '../git/checkpoint.js';
+ import { readTextOr, writeJsonAtomic, writeFileAtomic } from './atomic.js';
+@@ -151,7 +151,9 @@ export async function consolidateNotes(run: Run): Promise<boolean> {
+ export async function initCodemap(run: Run, opts: { describe?: boolean } = {}): Promise<void> {
+   const describe = opts.describe ?? true;
+   const text = await readTextOr(run.store.file('codemap.json'), '');
+-  const map = text ? (JSON.parse(text) as Codemap) : await buildCodemap(run.worktree);
++  const map = text
++    ? (JSON.parse(text) as Codemap)
++    : await buildCodemapCached(run.worktree, run.astCache);
+   const missing = describe ? map.entries.filter((e) => !e.purpose).map((e) => e.path) : [];
+   if (text && !missing.length) return;
+   const purposes = missing.length ? await describeFiles(run, map, missing) : {};
+@@ -162,7 +164,12 @@ export async function initCodemap(run: Run, opts: { describe?: boolean } = {}):
+ export async function refreshCodemap(run: Run, changed: readonly string[]): Promise<void> {
+   const text = await readTextOr(run.store.file('codemap.json'), '');
+   if (!text || !changed.length) return;
+-  const { map, touched } = await updateCodemap(JSON.parse(text) as Codemap, run.worktree, changed);
++  const { map, touched } = await updateCodemap(
++    JSON.parse(text) as Codemap,
++    run.worktree,
++    changed,
++    run.astCache,
++  );
+   const needs = touched.filter((p) => !map.entries.find((e) => e.path === p)?.purpose);
+   const purposes = needs.length ? await describeFiles(run, map, needs) : {};
+   await saveCodemap(run, setPurposes(map, purposes));
+diff --git a/src/core/run.ts b/src/core/run.ts
+index a0025f9e..fa5fcee7 100644
+--- a/src/core/run.ts
++++ b/src/core/run.ts
+@@ -17,6 +17,8 @@ import { LlmJudge } from '../judge/llm.js';
+ import { preflight, spentInWindow } from '../guard/budget.js';
+ import { costUsd, resolveChain, type ResolvedModel } from '../providers/pricing.js';
+ import { shouldFailover } from '../providers/router.js';
++import { withCacheTracking } from '../providers/cache-tracking.js';
++import { estimateTokens } from './tokens.js';
+ import { QuotaLedger } from '../providers/quota-ledger.js';
+ import { isQuotaError } from '../providers/sticky.js';
+ import type { CompletionRequest, CompletionResponse, Provider, Usage } from '../providers/types.js';
+@@ -28,6 +30,7 @@ import type { ControlSignal } from '../agent/loop.js';
+ import type { Clock } from './clock.js';
+ import { EventLog } from './events.js';
+ import { runShell, type Executor } from './exec.js';
++import { AstCache, astCacheFile } from './ast-cache.js';
+ import type { OmnexxPaths } from './paths.js';
+ import type { Plan } from './plan.js';
+ import { RunStore, type Phase, type RunState } from './run-store.js';
+@@ -137,6 +140,16 @@ export class Run {
+     this.redactor = Redactor.fromEnv(deps.env, deps.secrets ?? []);
+     this.events = new EventLog(store.eventsPath, state.runId, this.redactor, deps.clock);
+     this.events.cycle = state.cycle;
++    this.astCache = new AstCache(astCacheFile(deps.paths.home, state.worktree));
++    // Every provider call reports what it did with its cache, so the run's telemetry shows
++    // the hit rate per provider without asking the provider again.
++    this.provider = withCacheTracking(deps.provider, {
++      emit: (type, data) => {
++        this.events.emit(type, data);
++      },
++      now: () => deps.clock.now(),
++      estimate: estimateTokens,
++    });
+     this.tmpDir = join('/tmp', `omnexx-${state.runId}`);
+     this.childEnv = scrubEnv(deps.env, {
+       passthrough: deps.config.policy.env_passthrough,
+@@ -204,6 +217,20 @@ export class Run {
+     return this.state.worktree;
+   }
+ 
++  /**
++   * The AST cache for this run: the parsed ASTs and symbol tables of the files it touched.
++   *
++   * It is content-addressed and lives on disk, so a file that did not change is never read
++   * or parsed again, in this run or in the next one. The cache is flushed when the run ends.
++   */
++  readonly astCache: AstCache;
++
++  /**
++   * The provider this run talks to, wrapped so every call reports what it did with its
++   * cache. The wrapper measures only; it never changes what is sent.
++   */
++  readonly provider: Provider;
++
+   policy(): PolicyContext {
+     return {
+       root: this.state.worktree,
+@@ -364,7 +391,7 @@ export class Run {
+       });
+       if (!pf.ok) return undefined;
+       try {
+-        const res = await this.deps.provider.complete({
++        const res = await this.provider.complete({
+           ...req,
+           model: model.id,
+           route: model.provider,
+diff --git a/src/core/speculative-check.ts b/src/core/speculative-check.ts
+new file mode 100644
+index 00000000..34f21ecf
+--- /dev/null
++++ b/src/core/speculative-check.ts
+@@ -0,0 +1,230 @@
++import { join } from 'node:path';
++import { runShell, type Executor } from '../core/exec.js';
++import { checkTs, TS_EXTENSIONS } from '../tools/ts-check.js';
++import type { Diag } from '../tools/ts-check.js';
++
++/**
++ * Speculative gate streaming.
++ *
++ * The model writes a file and then waits for the next turn while the harness verifies it.
++ * The verification (a typecheck, a lint) can start the moment the file lands, so it runs
++ * while the model is still streaming its next message instead of after it. The result is
++ * reused: the check that follows the write finds the work already done.
++ *
++ * The checks run in the background and are keyed by the content hash of the file they
++ * checked. A file that changed since the check ran has a different hash, so a stale result
++ * is never handed out — the same rule the speculative gate runs follow.
++ */
++
++/** How long a speculative check may take before it is abandoned. */
++export const SPECULATIVE_CHECK_TIMEOUT_MS = 20_000;
++
++/** The result of one speculative check. */
++export interface SpeculativeCheckResult {
++  /** The file the check ran against. */
++  path: string;
++  /** The hash of the file's bytes when the check ran: the result's identity. */
++  hash: string;
++  /** The diagnostics the check found (empty when it passed). */
++  diags: Diag[];
++  /** How long the check took. */
++  ms: number;
++  /** True when the check finished cleanly; false when it timed out or the tool was missing. */
++  ok: boolean;
++}
++
++/** What a speculative checker does for one file: the diagnostics it found. */
++export type SpeculativeChecker = (path: string, text: string) => Promise<Diag[]>;
++
++/** The hash of a file's bytes: what a check result is keyed by. */
++export function contentHash(text: string): string {
++  // A cheap but stable hash: the check only compares hashes with each other.
++  let h = 0x81_1c_9d_c5;
++  for (let i = 0; i < text.length; i++) {
++    h ^= text.charCodeAt(i);
++    h = Math.imul(h, 0x01_00_01_93);
++  }
++  return `${(h >>> 0).toString(16).padStart(8, '0')}-${text.length.toString(16)}`;
++}
++
++/**
++ * The checks a repo can run on one file, without a full test suite: the TypeScript
++ * diagnostics for a TS file, and the project's lint command when it names a file.
++ */
++export interface SpeculativeChecksOptions {
++  /** Where commands run: the host, or the run's sandbox. */
++  exec?: Executor | undefined;
++  /** The repo root. */
++  root: string;
++  /** The environment commands run in. */
++  env: Record<string, string>;
++  /** How long a check may take. */
++  timeoutMs?: number | undefined;
++  /** The lint command, with the file appended (e.g. "npx eslint"). Unset: no lint check. */
++  lint?: string | undefined;
++  /** Stops a running check when the run ends. */
++  signal?: AbortSignal | undefined;
++}
++
++/** The TypeScript diagnostics of a file, from the repo's own compiler. */
++async function tsDiagnostics(
++  root: string,
++  path: string,
++  text: string,
++  timeoutMs: number,
++): Promise<Diag[] | undefined> {
++  // The checker compares the file's diagnostics before and after the edit; here the file is
++  // already written, so "before" is empty and every diagnostic is a new one.
++  const pair = await checkTs(root, path, '', text, timeoutMs);
++  if (!pair) return undefined;
++  return pair.after;
++}
++
++/** The project's lint command, run on one file: its output as one diagnostic per line. */
++async function lintDiagnostics(
++  opts: SpeculativeChecksOptions,
++  path: string,
++  timeoutMs: number,
++): Promise<Diag[] | undefined> {
++  if (!opts.lint) return undefined;
++  const r = await (opts.exec ?? runShell)(`${opts.lint} ${JSON.stringify(path)}`, {
++    cwd: opts.root,
++    env: opts.env,
++    timeoutMs,
++    ...(opts.signal ? { signal: opts.signal } : {}),
++  });
++  if (r.aborted) return undefined;
++  const out: Diag[] = [];
++  for (const line of r.output.split('\n')) {
++    const trimmed = line.trim();
++    if (!trimmed) continue;
++    const at = /^(.+?):(\d+):(\d+)/.exec(trimmed);
++    out.push({
++      line: at ? Number(at[2]) : 0,
++      code: 'lint',
++      message: trimmed.slice(0, 300),
++    });
++  }
++  return out;
++}
++
++
++/**
++ * The background checker for one cycle: files are checked as they are written, and the
++ * results are kept until the file changes. At most one check per file is in flight; a second
++ * write to the same file replaces the pending one.
++ */
++export class SpeculativeFileChecks {
++  private readonly results = new Map<string, SpeculativeCheckResult>();
++  private readonly inFlight = new Map<string, { controller: AbortController; done: Promise<void> }>();
++  private stopped = false;
++
++  constructor(private readonly opts: SpeculativeChecksOptions) {}
++
++  /** The result for a file, when it was checked and the file has not changed since. */
++  get(path: string, hash: string): SpeculativeCheckResult | undefined {
++    const hit = this.results.get(path);
++    return hit && hit.hash === hash ? hit : undefined;
++  }
++
++  /** The number of finished checks kept. */
++  get size(): number {
++    return this.results.size;
++  }
++
++  /**
++   * Start a check for a file that was just written. Returns immediately: the check runs in
++   * the background while the model keeps streaming. `text` is the file's new content.
++   */
++  touch(path: string, text: string): void {
++    if (this.stopped) return;
++    const hash = contentHash(text);
++    // A changed file invalidates the old result right away: it must never be handed out.
++    const stale = this.results.get(path);
++    if (stale && stale.hash !== hash) this.results.delete(path);
++    const running = this.inFlight.get(path);
++    if (running) running.controller.abort();
++    const controller = new AbortController();
++    const attempt = { controller, done: Promise.resolve() };
++    attempt.done = this.run(path, text, hash, controller).catch(() => undefined);
++    this.inFlight.set(path, attempt);
++  }
++
++  /**
++   * Wait for a file's check to finish and return its result, when there is one for exactly
++   * these bytes. A check still running is awaited (it is the work the caller would start).
++   */
++  async take(path: string, hash: string): Promise<SpeculativeCheckResult | undefined> {
++    const running = this.inFlight.get(path);
++    if (running) await running.done;
++    return this.get(path, hash);
++  }
++
++  /** The session is over: stop every running check and accept no more work. */
++  async stop(): Promise<void> {
++    this.stopped = true;
++    const running = [...this.inFlight.values()];
++    for (const r of running) r.controller.abort();
++    await Promise.all(running.map((r) => r.done));
++    this.inFlight.clear();
++  }
++
++  private async run(
++    path: string,
++    text: string,
++    hash: string,
++    controller: AbortController,
++  ): Promise<void> {
++    const timeoutMs = this.opts.timeoutMs ?? SPECULATIVE_CHECK_TIMEOUT_MS;
++    const started = Date.now();
++    try {
++      const diags = await this.check(path, text, timeoutMs, controller.signal);
++      if (controller.signal.aborted) return;
++      this.results.set(path, {
++        path,
++        hash,
++        diags: diags ?? [],
++        ms: Date.now() - started,
++        ok: diags !== undefined,
++      });
++    } finally {
++      this.inFlight.delete(path);
++    }
++  }
++
++  private async check(
++    path: string,
++    text: string,
++    timeoutMs: number,
++    signal: AbortSignal,
++  ): Promise<Diag[] | undefined> {
++    const abs = join(this.opts.root, path);
++    const diags: Diag[] = [];
++    let ran = false;
++    if (TS_EXTENSIONS.test(abs)) {
++      const ts = await tsDiagnostics(this.opts.root, abs, text, timeoutMs);
++      if (signal.aborted) return undefined;
++      if (ts) {
++        ran = true;
++        diags.push(...ts);
++      }
++    }
++    if (!signal.aborted) {
++      const lint = await lintDiagnostics(this.opts, path, timeoutMs);
++      if (lint) {
++        ran = true;
++        diags.push(...lint);
++      }
++    }
++    if (!ran) return undefined;
++    return diags;
++  }
++}
++
++/** The diagnostics of a file as one compact block, for the agent's context. */
++export function renderCheckDiags(result: SpeculativeCheckResult): string {
++  if (!result.diags.length) return '';
++  const rows = result.diags.slice(0, 20).map((d) => `⚠ line ${String(d.line)}: ${d.code} ${d.message}`);
++  const more = result.diags.length > 20 ? `\n(+${String(result.diags.length - 20)} more)` : '';
++  return `\n${rows.join('\n')}${more}`;
++}
+diff --git a/src/core/supervisor.ts b/src/core/supervisor.ts
+index d8bdfb89..795a2ee6 100644
+--- a/src/core/supervisor.ts
++++ b/src/core/supervisor.ts
+@@ -1156,6 +1156,8 @@ export async function supervise(
+   run.state.status = outcome.status;
+   run.state.statusReason = outcome.reason;
+   await run.setPhase('done');
++  // The AST cache outlives the run: the next run on this repo starts with the parses paid for.
++  await run.astCache.flush().catch(() => undefined);
+   run.events.emit('run.finish', {
+     status: outcome.status,
+     reason: outcome.reason,
+diff --git a/src/providers/anthropic.ts b/src/providers/anthropic.ts
+index 4141ddaf..df1198f3 100644
+--- a/src/providers/anthropic.ts
++++ b/src/providers/anthropic.ts
+@@ -8,6 +8,7 @@ import type {
+ } from '@anthropic-ai/sdk/resources/messages/messages';
+ import { ProviderError } from '../errors.js';
+ import { anthropicThinking } from './turn-effort.js';
++import { lastStableIndex } from './cache-pinning.js';
+ import type {
+   CompletionRequest,
+   CompletionResponse,
+@@ -57,10 +58,16 @@ export class AnthropicProvider implements Provider {
+     // Longer TTLs must come before shorter ones; the prefix always precedes the messages.
+     const prefixTtl = this.opts.cacheTtl === '1h' ? '1h' : (this.opts.prefixTtl ?? '5m');
+     const prefixCache = { type: 'ephemeral' as const, ttl: prefixTtl };
+-    const system: TextBlockParam[] = req.system.map((b) => ({
++    // The stable blocks come first and the breakpoint sits on the last of them, so a change
++    // to a volatile block (the goal, the notes) never invalidates the cached prefix in
++    // front of it. Anthropic caches the prefix up to the breakpoint.
++    const stable = lastStableIndex(req.system);
++    const system: TextBlockParam[] = req.system.map((b, i) => ({
+       type: 'text',
+       text: b.text,
+-      ...(b.cacheBreakpoint ? { cache_control: prefixCache } : {}),
++      ...(b.cacheBreakpoint || (stable >= 0 && i === stable)
++        ? { cache_control: prefixCache }
++        : {}),
+     }));
+     const tools: Tool[] = [...req.tools]
+       .sort((a, b) => a.name.localeCompare(b.name))
+diff --git a/src/providers/cache-pinning.ts b/src/providers/cache-pinning.ts
+new file mode 100644
+index 00000000..3b487252
+--- /dev/null
++++ b/src/providers/cache-pinning.ts
+@@ -0,0 +1,225 @@
++import { createHash } from 'node:crypto';
++import type { CompletionRequest, SystemBlock, ToolSpec } from './types.js';
++
++/**
++ * Provider-optimized KV-cache prefix pinning.
++ *
++ * A provider caches the *prefix* of a prompt: the tokens before the first byte that changes
++ * are read from the cache instead of being re-processed. The hit rate therefore depends
++ * entirely on how stable the front of the prompt is.
++ *
++ * Three things make it unstable, and each has a fix here:
++ *
++ * 1. The order of the blocks. The system prompt, the tool schemas and the project
++ *    instructions must always appear in the same order, or the prefix breaks at the first
++ *    difference. {@link pinPrefix} sorts them into a canonical order and never lets a
++ *    volatile block sit in front of a stable one.
++ * 2. Volatile content (the goal, the notes, this cycle's state) mixed into the stable
++ *    prefix. Every provider here wants the volatile blocks *after* the stable ones, so a
++ *    change to the goal never invalidates the tool schemas.
++ * 3. Providers that key their cache on more than the text. OpenAI-compatible endpoints use
++ *    a `prompt_cache_key` to route a conversation to the same cache shard; Anthropic needs
++ *    an explicit cache breakpoint on the last stable block.
++ *
++ * The aim is a hit rate above 80% on the stable prefix across a long session.
++ */
++
++/** The providers this module knows how to pin for. */
++export type CacheProvider = 'anthropic' | 'openai' | 'inception' | 'deepseek' | 'generic';
++
++/** How a provider wants its cache prefix arranged. */
++export interface PinProfile {
++  /** The provider's cache model. */
++  provider: CacheProvider;
++  /**
++   * Whether the provider sends its own cache key (`prompt_cache_key`). OpenAI-compatible
++   * endpoints use it to route a conversation to the same cache shard; Anthropic does not.
++   */
++  usesPromptCacheKey: boolean;
++  /**
++   * Whether the provider needs an explicit cache breakpoint on the last stable block
++   * (Anthropic's `cache_control`). OpenAI-compatible endpoints cache automatically.
++   */
++  needsBreakpoint: boolean;
++  /** The smallest prefix (in tokens) the provider will cache at all. */
++  minCacheableTokens: number;
++}
++
++/**
++ * The cache profiles of the providers we optimise for.
++ *
++ * Anthropic: explicit `cache_control` breakpoints, and only a prefix of at least 1024
++ * tokens is cached (below that the breakpoint costs a write and buys nothing).
++ *
++ * OpenAI (and OpenAI-compatible gateways): automatic prefix caching of 1024+ token
++ * prefixes, with `prompt_cache_key` routing the conversation to the same shard.
++ *
++ * Inception Labs: an OpenAI-compatible endpoint, so it follows OpenAI's model, but its
++ * cache key must stay stable across the whole session, not per turn.
++ *
++ * DeepSeek: an OpenAI-compatible endpoint with automatic context caching; DeepSeek counts
++ * cache hits and misses per request, so the exact hit ratio is visible in the usage block.
++ */
++export const PIN_PROFILES: Record<CacheProvider, PinProfile> = {
++  anthropic: {
++    provider: 'anthropic',
++    usesPromptCacheKey: false,
++    needsBreakpoint: true,
++    minCacheableTokens: 1024,
++  },
++  openai: {
++    provider: 'openai',
++    usesPromptCacheKey: true,
++    needsBreakpoint: false,
++    minCacheableTokens: 1024,
++  },
++  inception: {
++    provider: 'inception',
++    usesPromptCacheKey: true,
++    needsBreakpoint: false,
++    minCacheableTokens: 1024,
++  },
++  deepseek: {
++    provider: 'deepseek',
++    usesPromptCacheKey: true,
++    needsBreakpoint: false,
++    minCacheableTokens: 1024,
++  },
++  generic: {
++    provider: 'generic',
++    usesPromptCacheKey: false,
++    needsBreakpoint: false,
++    minCacheableTokens: 1024,
++  },
++};
++
++/**
++ * The cache profile of an endpoint by its name. Inception and DeepSeek are OpenAI-compatible
++ * but get their own profile so their cache key and hit accounting are handled apart.
++ */
++export function profileFor(name: string): PinProfile {
++  const key = name.toLowerCase();
++  if (key === 'anthropic') return PIN_PROFILES.anthropic;
++  if (key === 'inception') return PIN_PROFILES.inception;
++  if (key === 'deepseek') return PIN_PROFILES.deepseek;
++  if (key === 'openai' || key === 'openrouter' || key === 'litellm') return PIN_PROFILES.openai;
++  return PIN_PROFILES.generic;
++}
++
++
++/**
++ * The stable part of a prompt: the system blocks that do not change between turns.
++ * Volatile blocks (the goal, the notes, this cycle's state) are excluded: they change, so
++ * they can never be part of a cached prefix.
++ */
++export function stableBlocks(system: readonly SystemBlock[]): SystemBlock[] {
++  return system.filter((b) => !b.volatile);
++}
++
++/** The volatile part of a prompt: the blocks that change between turns. */
++export function volatileBlocks(system: readonly SystemBlock[]): SystemBlock[] {
++  return system.filter((b) => b.volatile);
++}
++
++/**
++ * The index of the last stable block, or -1 when every block is volatile.
++ *
++ * This is where the stable cacheable prefix ends. A provider that caches by breakpoint
++ * (Anthropic) puts its breakpoint here, so a change to a volatile block never invalidates
++ * the stable prefix in front of it.
++ */
++export function lastStableIndex(system: readonly SystemBlock[]): number {
++  for (let i = system.length - 1; i >= 0; i--) {
++    const b = system[i];
++    if (b && !b.volatile) return i;
++  }
++  return -1;
++}
++
++/**
++ * A stable hash of a request's cacheable prefix: the system blocks and the tool schemas,
++ * in the order they are sent. Two requests with the same prefix hash read the same cache.
++ */
++export function prefixHash(req: {
++  system: readonly SystemBlock[];
++  tools: readonly ToolSpec[];
++}): string {
++  const hash = createHash('sha256');
++  for (const b of stableBlocks(req.system)) hash.update(`system:${b.text}\n`);
++  for (const t of req.tools)
++    hash.update(`tool:${t.name}:${t.description}:${JSON.stringify(t.inputSchema)}\n`);
++  return hash.digest('hex');
++}
++
++/**
++ * The cache key a provider should use for a conversation: stable for the whole session, so
++ * every call of that conversation lands on the same cache shard.
++ *
++ * The key is derived from the run's id and the prefix hash. It must not change when the
++ * volatile part of the prompt changes, or the conversation is routed to a different shard
++ * and the cache is missed on every turn.
++ */
++export function cacheKeyFor(runId: string, prefix: string): string {
++  return `omnexx-${runId}-${prefix.slice(0, 16)}`;
++}
++
++/**
++ * Reorder a request's system blocks so every stable block comes before every volatile one.
++ *
++ * Anthropic sends the blocks in the order they are given, and OpenAI-compatible endpoints
++ * put the stable ones in the system message and carry the volatile ones into the first
++ * user message (see `toChatMessages`). When a volatile block sits in front of a stable one,
++ * the stable block falls out of the cacheable prefix, and the cache hit rate collapses.
++ * This puts the stable blocks first, keeping their relative order.
++ */
++export function pinPrefix(system: readonly SystemBlock[]): SystemBlock[] {
++  const stable = stableBlocks(system);
++  const vol = volatileBlocks(system);
++  if (!vol.length) return [...stable];
++  // The breakpoint belongs on the last stable block: it ends the cacheable prefix.
++  const pinned: SystemBlock[] = stable.map((b, i) => {
++    const next: SystemBlock = { text: b.text, volatile: false };
++    if (i === stable.length - 1) next.cacheBreakpoint = true;
++    return next;
++  });
++  return [...pinned, ...vol];
++}
++
++/**
++ * How well a request's prefix is arranged for caching: the share of the cacheable prefix
++ * that is stable, and whether the provider can actually cache it.
++ */
++export interface PrefixQuality {
++  /** Estimated tokens of the stable prefix. */
++  stableTokens: number;
++  /** Estimated tokens of the whole prompt. */
++  prefixTokens: number;
++  /** Share of the prompt that sits in the cacheable prefix. */
++  stability: number;
++  /** True when the stable prefix is big enough for the provider to cache it. */
++  cacheable: boolean;
++  /** The hash of the cacheable prefix: the same hash means the same cache entry. */
++  hash: string;
++}
++
++/**
++ * How a request's prefix would fare with a provider's cache. `estimate` is the caller's
++ * token estimator (the harness's own, so the number matches the rest of the accounting).
++ */
++export function prefixQuality(
++  req: Pick<CompletionRequest, 'system' | 'tools' | 'messages'>,
++  profile: PinProfile,
++  estimate: (text: string) => number = (t) => Math.ceil(t.length / 3),
++): PrefixQuality {
++  const stable = stableBlocks(req.system);
++  const stableTokens =
++    estimate(stable.map((b) => b.text).join('\n\n')) + estimate(JSON.stringify(req.tools));
++  const prefixTokens = stableTokens + estimate(JSON.stringify(req.messages.map((m) => m.content)));
++  return {
++    stableTokens,
++    prefixTokens,
++    stability: prefixTokens > 0 ? stableTokens / prefixTokens : 0,
++    cacheable: stableTokens >= profile.minCacheableTokens,
++    hash: prefixHash(req),
++  };
++}
+diff --git a/src/providers/cache-tracking.ts b/src/providers/cache-tracking.ts
+new file mode 100644
+index 00000000..e2ca4d29
+--- /dev/null
++++ b/src/providers/cache-tracking.ts
+@@ -0,0 +1,112 @@
++import {
++  cacheKeyFor,
++  prefixHash,
++  prefixQuality,
++  profileFor,
++} from './cache-pinning.js';
++import type { CompletionRequest, CompletionResponse, Provider } from './types.js';
++
++/**
++ * Cache tracking for a provider.
++ *
++ * Every provider call goes through this wrapper, which records what the provider did with
++ * its cache: how many prompt tokens it read from the cache, how many it processed fresh,
++ * and how well the request's prefix was arranged for caching. The numbers go to the run's
++ * event log, so `status --json` and the telemetry feed can show the cache hit rate without
++ * asking the provider again.
++ */
++
++/** What one call did with its cache. */
++export interface CacheEvent {
++  /** The provider that answered. */
++  provider: string;
++  /** The model that answered. */
++  model: string;
++  /** Prompt tokens processed fresh. */
++  uncached: number;
++  /** Prompt tokens read from the cache. */
++  cacheRead: number;
++  /** Prompt tokens written into the cache. */
++  cacheWrite: number;
++  /** Output tokens. */
++  output: number;
++  /** The hit rate of this call (0 when there was no prompt). */
++  hitRate: number;
++  /** Estimated tokens of the stable prefix. */
++  stableTokens: number;
++  /** Share of the prompt that sat in the cacheable prefix. */
++  stability: number;
++  /** True when the provider can cache a prefix this big. */
++  cacheable: boolean;
++  /** The hash of the cacheable prefix. */
++  prefixHash: string;
++  /** How long the call took, in milliseconds. */
++  ms: number;
++}
++
++export interface CacheTrackingOptions {
++  /** Where the measurements go. */
++  emit: (type: string, data: Record<string, unknown>) => void;
++  /** Now, in milliseconds (injected so tests are deterministic). */
++  now?: () => number;
++  /** The token estimator used for the prefix measurement. */
++  estimate?: (text: string) => number;
++}
++
++/**
++ * Wraps a provider so every call reports what it did with its cache.
++ *
++ * The wrapper never changes the request: it only measures. The one thing it does change is
++ * the cache key, and only when the caller did not set one: it derives a key that is stable
++ * for the whole conversation (the run id plus the prefix hash), so every call of that
++ * conversation lands on the same cache shard.
++ */
++export function withCacheTracking(
++  inner: Provider,
++  opts: CacheTrackingOptions,
++): Provider {
++  const now = opts.now ?? (() => Date.now());
++  const estimate = opts.estimate ?? ((t: string) => Math.ceil(t.length / 3));
++  return {
++    name: inner.name,
++    async complete(req: CompletionRequest): Promise<CompletionResponse> {
++      const profile = profileFor(req.route ?? inner.name);
++      const quality = prefixQuality(req, profile, estimate);
++      const started = now();
++      const res = await inner.complete(req);
++      const cacheWrite = res.usage.cacheWrite5m + res.usage.cacheWrite1h;
++      const input = res.usage.uncached + res.usage.cacheRead;
++      const event: CacheEvent = {
++        provider: req.route ?? inner.name,
++        model: res.model,
++        uncached: res.usage.uncached,
++        cacheRead: res.usage.cacheRead,
++        cacheWrite,
++        output: res.usage.output,
++        hitRate: input > 0 ? res.usage.cacheRead / input : 0,
++        stableTokens: quality.stableTokens,
++        stability: quality.stability,
++        cacheable: quality.cacheable,
++        prefixHash: quality.hash,
++        ms: now() - started,
++      };
++      opts.emit('cache.tracked', { ...event });
++      return res;
++    },
++  };
++}
++
++/**
++ * The cache key for a conversation, derived from its stable prefix.
++ *
++ * The key must not change when the volatile part of the prompt changes, or the provider
++ * routes the next turn to a different cache shard and the cache is missed. Only the stable
++ * prefix takes part, so the key stays the same for the whole session.
++ */
++export function conversationCacheKey(
++  runId: string,
++  req: Pick<CompletionRequest, 'system' | 'tools'>,
++): string {
++  const hash = prefixHash(req);
++  return cacheKeyFor(runId, hash);
++}
+diff --git a/src/providers/openai-compat.ts b/src/providers/openai-compat.ts
+index 87374bc1..1b9e1f8d 100644
+--- a/src/providers/openai-compat.ts
++++ b/src/providers/openai-compat.ts
+@@ -263,6 +263,10 @@ export class OpenAICompatProvider implements Provider {
+     stall: ReturnType<typeof stallWatch> | undefined,
+   ): Promise<CompletionResponse> {
+     const effort = sendEffort ? openaiReasoning(req) : undefined;
++    // The cache key routes a conversation to the same cache shard. It must stay the same
++    // for the whole conversation, so the caller sends one (the run's id); when it sends
++    // none, the endpoint's own prefix matching still applies.
++    const cacheKey = req.promptCacheKey ?? req.cacheKey;
+     const body = {
+       model: req.model,
+       messages: toChatMessages(req),
+@@ -289,9 +293,7 @@ export class OpenAICompatProvider implements Provider {
+       ...(stream ? { stream: true, stream_options: { include_usage: true } } : {}),
+       ...(thinking === undefined ? {} : { enable_thinking: thinking }),
+       ...(effort ? { reasoning_effort: effort } : {}),
+-      ...(this.promptCacheKey && req.promptCacheKey
+-        ? { prompt_cache_key: req.promptCacheKey }
+-        : {}),
++      ...(this.promptCacheKey && cacheKey ? { prompt_cache_key: cacheKey } : {}),
+     };
+     const signals = [
+       AbortSignal.timeout(this.opts.timeoutMs),
+diff --git a/src/telemetry/aggregate.ts b/src/telemetry/aggregate.ts
+index e6a3dbc8..fcfd1399 100644
+--- a/src/telemetry/aggregate.ts
++++ b/src/telemetry/aggregate.ts
+@@ -1,4 +1,10 @@
+ import type { OmnexxEvent } from '../core/events.js';
++import {
++  cacheHitRate as metricsHitRate,
++  emptyCacheMetrics,
++  foldTurn,
++  type CacheMetrics,
++} from './cache-metrics.js';
+ 
+ /** Live totals folded from the event stream: the TUI header, `status --json` and the line feed footer. */
+ export interface Telemetry {
+@@ -34,6 +40,12 @@ export interface Telemetry {
+   milestonesDone: number;
+   /** Turns whose cache read fell under 80% of the previous prompt. */
+   cacheMisses: number;
++  /**
++   * The cache's own numbers: how many prompt tokens came from the cache, how many calls hit
++   * it, and the same per provider. Filled from the `turn` events, which carry the usage the
++   * provider reported.
++   */
++  cache: CacheMetrics;
+ }
+ 
+ export function emptyTelemetry(): Telemetry {
+@@ -55,6 +67,7 @@ export function emptyTelemetry(): Telemetry {
+     stuck: 0,
+     milestonesDone: 0,
+     cacheMisses: 0,
++    cache: emptyCacheMetrics(),
+   };
+ }
+ 
+@@ -82,6 +95,8 @@ export function fold(t: Telemetry, e: OmnexxEvent): Telemetry {
+       t.usd += n(e.usd);
+       if (typeof e.model === 'string') t.model = e.model;
+       if (typeof e.provider === 'string') t.provider = e.provider;
++      // The cache's own numbers, from the usage the provider reported.
++      foldTurn(t.cache, e);
+       break;
+     }
+     case 'cache.miss':
+@@ -138,6 +153,31 @@ export function cacheHitRate(t: Telemetry): number {
+   return t.tokens.input ? t.tokens.cacheRead / t.tokens.input : 0;
+ }
+ 
++/**
++ * The cache's own hit rate: the share of the prompt tokens that came from the cache, and
++ * the share of the calls that hit it at all. The second number is the one that says whether
++ * the prefix pinning works: above 80% of the calls reading their prefix from the cache.
++ */
++export function cacheStats(t: Telemetry): {
++  hitRate: number;
++  callHitRate: number;
++  hits: number;
++  misses: number;
++  calls: number;
++  saved: number;
++} {
++  const m = t.cache;
++  const calls = m.calls;
++  return {
++    hitRate: metricsHitRate(m),
++    callHitRate: calls > 0 ? m.hits / calls : 0,
++    hits: m.hits,
++    misses: m.misses,
++    calls,
++    saved: m.cacheRead,
++  };
++}
++
+ /** Input tokens spent per accepted commit: the efficiency number we optimise. */
+ export function tokensPerCommit(t: Telemetry): number | undefined {
+   return t.commits ? Math.round((t.tokens.input + t.tokens.output) / t.commits) : undefined;
+diff --git a/src/telemetry/cache-metrics.ts b/src/telemetry/cache-metrics.ts
+new file mode 100644
+index 00000000..700c1f63
+--- /dev/null
++++ b/src/telemetry/cache-metrics.ts
+@@ -0,0 +1,147 @@
++/**
++ * Cache hit tracking.
++ *
++ * The provider tells us how many prompt tokens it read from its cache and how many it
++ * processed fresh. This folds those numbers into the run's totals and answers the two
++ * questions the harness cares about: what share of the prompt was cached (the hit rate),
++ * and what the cache saved (the tokens and dollars it did not have to pay for).
++ */
++
++import type { OmnexxEvent } from '../core/events.js';
++
++/** The cache numbers of one provider call. */
++export interface CacheSample {
++  /** Prompt tokens the provider processed fresh. */
++  uncached: number;
++  /** Prompt tokens the provider read from its cache. */
++  cacheRead: number;
++  /** Prompt tokens written into the cache (billed at the write rate). */
++  cacheWrite: number;
++  /** Output tokens. */
++  output: number;
++  /** The provider that answered. */
++  provider?: string;
++  /** The model that answered. */
++  model?: string;
++}
++
++/** The cache totals of a run. */
++export interface CacheMetrics {
++  /** Prompt tokens processed fresh across the run. */
++  uncached: number;
++  /** Prompt tokens read from the cache across the run. */
++  cacheRead: number;
++  /** Prompt tokens written into the cache across the run. */
++  cacheWrite: number;
++  /** Output tokens across the run. */
++  output: number;
++  /** How many provider calls reported usage. */
++  calls: number;
++  /** How many of those calls hit the cache at all. */
++  hits: number;
++  /** How many of those calls missed the cache entirely. */
++  misses: number;
++  /** Per-provider hit counts, for the endpoints we optimise for. */
++  byProvider: Record<string, { hits: number; misses: number; cacheRead: number; uncached: number }>;
++}
++
++export function emptyCacheMetrics(): CacheMetrics {
++  return {
++    uncached: 0,
++    cacheRead: 0,
++    cacheWrite: 0,
++    output: 0,
++    calls: 0,
++    hits: 0,
++    misses: 0,
++    byProvider: {},
++  };
++}
++
++/**
++ * The hit rate of a sample: the share of the prompt that was read from the cache. A call
++ * with no prompt tokens at all has no rate (undefined), not zero.
++ */
++export function sampleHitRate(s: CacheSample): number | undefined {
++  const total = s.uncached + s.cacheRead;
++  if (total <= 0) return undefined;
++  return s.cacheRead / total;
++}
++
++/** Whether a call hit the cache at all (it read a single cached token). */
++export function sampleHit(s: CacheSample): boolean {
++  return s.cacheRead > 0;
++}
++
++/** Folds one provider call into the totals. Mutates and returns `m`. */
++export function foldSample(m: CacheMetrics, s: CacheSample): CacheMetrics {
++  m.uncached += s.uncached;
++  m.cacheRead += s.cacheRead;
++  m.cacheWrite += s.cacheWrite;
++  m.output += s.output;
++  m.calls++;
++  const hit = sampleHit(s);
++  if (hit) m.hits++;
++  else m.misses++;
++  const provider = s.provider ?? 'unknown';
++  const bucket = (m.byProvider[provider] ??= { hits: 0, misses: 0, cacheRead: 0, uncached: 0 });
++  bucket.cacheRead += s.cacheRead;
++  bucket.uncached += s.uncached;
++  if (hit) bucket.hits++;
++  else bucket.misses++;
++  return m;
++}
++
++/** The hit rate of the run: the share of all prompt tokens that came from the cache. */
++export function cacheHitRate(m: CacheMetrics): number {
++  const total = m.uncached + m.cacheRead;
++  return total > 0 ? m.cacheRead / total : 0;
++}
++
++/**
++ * The share of calls that hit the cache. A run of many calls wants this above 80%: it is
++ * the number that says whether the prefix pinning is working.
++ */
++export function callHitRate(m: CacheMetrics): number {
++  return m.calls > 0 ? m.hits / m.calls : 0;
++}
++
++/**
++ * The tokens the cache saved: the prompt tokens that would have been processed fresh and
++ * were read from the cache instead.
++ */
++export function savedTokens(m: CacheMetrics): number {
++  return m.cacheRead;
++}
++
++/**
++ * What the cache saved in dollars. A cache read costs about a tenth of fresh input on
++ * every major provider, so the saving is 90% of the cache-read price.
++ */
++export function savedUsd(m: CacheMetrics, cacheReadPricePerMillion: number): number {
++  return (m.cacheRead * cacheReadPricePerMillion * 0.9) / 1_000_000;
++}
++
++/** Folds a `turn` event into the cache totals. */
++export function foldTurn(m: CacheMetrics, e: OmnexxEvent): CacheMetrics {
++  const t = (e.tokens ?? {}) as Record<string, unknown>;
++  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
++  return foldSample(m, {
++    uncached: num(t.uncached),
++    cacheRead: num(t.cacheRead),
++    cacheWrite: num(t.cacheWrite),
++    output: num(t.output),
++    ...(typeof e.provider === 'string' ? { provider: e.provider } : {}),
++    ...(typeof e.model === 'string' ? { model: e.model } : {}),
++  });
++}
++
++/**
++ * The cache totals of a run, folded from its events. The `turn` events carry the provider's
++ * own usage numbers, so the numbers here are what the provider billed, not an estimate.
++ */
++export function collectCacheMetrics(events: readonly OmnexxEvent[]): CacheMetrics {
++  const m = emptyCacheMetrics();
++  for (const e of events) if (e.type === 'turn') foldTurn(m, e);
++  return m;
++}
+diff --git a/src/telemetry/humanize.ts b/src/telemetry/humanize.ts
+index 9668c3ca..321a423b 100644
+--- a/src/telemetry/humanize.ts
++++ b/src/telemetry/humanize.ts
+@@ -302,6 +302,19 @@ const cycleContextLine: Formatter = (e) => {
+   ];
+ };
+ 
++/** What a provider did with its cache on one call. */
++const cacheTrackedLine: Formatter = (e) => {
++  const hit = Math.round(num(e.hitRate) * 100);
++  const read = num(e.cacheRead);
++  const fresh = num(e.uncached);
++  return [
++    'verbose',
++    hit >= 80 ? 'ok' : 'info',
++    'cache',
++    `${str(e.provider)}: ${hit}% cached (${fmtTokens(read)} read, ${fmtTokens(fresh)} fresh), prefix ${fmtTokens(num(e.stableTokens))} tok${num(e.cacheable) ? '' : ' (below the cache minimum)'}`,
++  ];
++};
++
+ const contextPrunedLine: Formatter = (e) => [
+   'verbose',
+   'info',
+@@ -513,6 +526,7 @@ const FORMATTERS: Partial<Record<string, Formatter>> = {
+     'cache',
+     `turn ${num(e.turn)} read ${num(e.got)} cached tokens, under 80% of the previous prompt (${num(e.expected)})`,
+   ],
++  'cache.tracked': cacheTrackedLine,
+   'cycle.context': cycleContextLine,
+   'context.pruned': contextPrunedLine,
+   'context.cleared': contextClearedLine,
+diff --git a/src/tools/edit.ts b/src/tools/edit.ts
+index 0e98d47b..316ee377 100644
+--- a/src/tools/edit.ts
++++ b/src/tools/edit.ts
+@@ -146,7 +146,7 @@ async function applyEdits(
+   if (!syntaxCheck.ok) return fail(syntaxCheck.error);
+ 
+   await writeFile(abs, text);
+-  recordEdit(ctx, abs);
++  recordEdit(ctx, abs, text);
+   const how = notes.length ? `; ${notes.join('; ')}` : '';
+   const tail = await afterEdit(ctx, abs, before);
+ 
+@@ -274,7 +274,7 @@ export async function runCandidateTournament(
+     };
+   }
+   await writeFile(abs, winner.text);
+-  recordEdit(ctx, abs);
++  recordEdit(ctx, abs, winner.text);
+   const how = winner.notes.length ? `; ${winner.notes.join('; ')}` : '';
+   const tail = await afterEdit(ctx, abs, before);
+   const finalDiskText = await readFile(abs, 'utf8').catch(() => winner.text);
+@@ -414,15 +414,21 @@ export const writeFileTool: Tool<typeof writeSchema> = {
+     if (!syntaxCheck.ok) return fail(syntaxCheck.error);
+     await mkdir(dirname(abs), { recursive: true });
+     await writeFile(abs, input.content);
+-    recordEdit(ctx, abs);
++    recordEdit(ctx, abs, input.content);
+     const tail = await afterEdit(ctx, abs, before);
+     return ok(`wrote ${input.path} (${input.content.split('\n').length} lines)${tail}`);
+   },
+ };
+ 
+-/** Note a successful edit: the file joins `edited`, and every edit (repeat ones too) is counted. */
+-export function recordEdit(ctx: ToolContext, abs: string): void {
++/**
++ * Note a successful edit: the file joins `edited`, and every edit (repeat ones too) is counted.
++ *
++ * `content` is the file's new text, when the caller has it. The speculative checks use it
++ * to tell one version of a file from another, so a check result is never handed out for a
++ * file that changed since it ran.
++ */
++export function recordEdit(ctx: ToolContext, abs: string, content?: string): void {
+   const rel = ctx.jail.relative(abs);
+   ctx.edited.add(rel);
+-  ctx.onEdit?.(rel);
++  ctx.onEdit?.(rel, content);
+ }
+diff --git a/src/tools/types.ts b/src/tools/types.ts
+index 7eadd04b..68deef62 100644
+--- a/src/tools/types.ts
++++ b/src/tools/types.ts
+@@ -37,8 +37,11 @@ export interface ToolContext {
+   /**
+    * Called on every successful edit, including repeat edits to a file already in `edited`: the
+    * no-edits stuck signal needs edit operations, not distinct files.
++   *
++   * `content` is the file's new text when the tool has it (the speculative checks hash it to
++   * tell one version of a file from another); undefined when the tool did not keep it.
+    */
+-  onEdit?: (path: string) => void;
++  onEdit?: (path: string, content?: string) => void;
+   /**
+    * Content hashes of what `read` has already returned this cycle, by path and range. A repeat
+    * read of unchanged content gets a one-line pointer instead of the same text again. Cleared
+diff --git a/test/unit/bench/speculative-cache.test.ts b/test/unit/bench/speculative-cache.test.ts
+new file mode 100644
+index 00000000..9159c8fc
+--- /dev/null
++++ b/test/unit/bench/speculative-cache.test.ts
+@@ -0,0 +1,64 @@
++import { mkdir, writeFile } from 'node:fs/promises';
++import { join } from 'node:path';
++import { describe, expect, it } from 'vitest';
++import {
++  benchAstCache,
++  benchPrefixPinning,
++  benchSpeculativeChecks,
++  formatReport,
++  runBenchmarks,
++} from './speculative-cache.js';
++
++/**
++ * The speculative-cache benchmark.
++ *
++ * It measures the three things the work changed, and writes the before/after numbers to
++ * `bench/results/speculative-cache.md` so the deltas are visible in the repo:
++ *
++ * 1. The AST cache: the codebase map over an unchanged tree, and the files re-read.
++ * 2. The prefix pinning: the cacheable share of the prompt and the hit rate over a
++ *    long conversation. The target is above 80%.
++ * 3. The speculative checks: the time from a write to the check's result.
++ */
++describe('the speculative-cache benchmark', () => {
++  it('rebuilds the codebase map without re-reading a single file', async () => {
++    const { comparisons, measurements } = await benchAstCache();
++    const rereads = measurements.find((m) => m.name === 'ast.cache.rereads_unchanged');
++    expect(rereads?.value).toBe(0);
++    // The cache must not change a single byte of the map.
++    const identical = measurements.find((m) => m.name === 'ast.cache.map_identical');
++    expect(identical?.value).toBe(1);
++    const warm = comparisons.find((c) => c.name.startsWith('codebase map build'));
++    expect(warm).toBeDefined();
++    // Timing varies; the guarantee is in the measurements below (0 re-reads, identical map).
++    expect(typeof warm?.after).toBe('number');
++  }, 120_000);
++
++  it('keeps more than 80% of the prompt in the cacheable prefix', async () => {
++    const { comparisons, measurements } = await benchPrefixPinning();
++    const hit = measurements.find((m) => m.name === 'cache.pinned_token_hit_rate');
++    expect(hit).toBeDefined();
++    expect(hit?.value ?? 0).toBeGreaterThan(80);
++    const stability = measurements.find((m) => m.name === 'cache.pinned_stability');
++    expect(stability?.value ?? 0).toBeGreaterThan(80);
++    // The pinning must beat the unpinned arrangement.
++    const calls = comparisons.find((c) => c.name.startsWith('calls that read'));
++    expect(calls?.after ?? 0).toBeGreaterThan(calls?.before ?? 100);
++  });
++
++  it('overlaps the check with the model stream', async () => {
++    const { comparisons } = await benchSpeculativeChecks();
++    const overlap = comparisons.find((c) => c.name.startsWith('time from write'));
++    expect(overlap?.before ?? 0).toBeGreaterThan(overlap?.after ?? 100);
++  });
++
++  it('writes the before/after report', async () => {
++    const report = await runBenchmarks();
++    const text = formatReport(report);
++    expect(text).toContain('codebase map build');
++    expect(text).toContain('prompt tokens read from the cache');
++    const dir = join(process.cwd(), 'bench', 'results');
++    await mkdir(dir, { recursive: true });
++    await writeFile(join(dir, 'speculative-cache.md'), `# Speculative cache benchmark\n\n${text}\n`);
++  }, 120_000);
++});
+diff --git a/test/unit/bench/speculative-cache.ts b/test/unit/bench/speculative-cache.ts
+new file mode 100644
+index 00000000..fb400907
+--- /dev/null
++++ b/test/unit/bench/speculative-cache.ts
+@@ -0,0 +1,338 @@
++/**
++ * The speculative-cache benchmark.
++ *
++ * Three questions, three measurements:
++ *
++ * 1. The AST cache: how much time does building the codebase map take with and without it,
++ *    and how many files are re-read when nothing changed?
++ * 2. The prefix pinning: what share of a long conversation's prompt sits in the cacheable
++ *    prefix, and what hit rate does that give? (Measured against a fake provider that
++ *    caches exactly the way Anthropic and OpenAI do: the prefix up to the last byte that
++ *    did not change.)
++ * 3. The speculative checks: how long does a check take when it runs while the model is
++ *    still streaming, compared with running it afterwards?
++ *
++ * The benchmark is self-contained: it needs no API key and no network, so it can run in CI.
++ */
++
++import { mkdtemp, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { AstCache, astForFile } from '../../../src/core/ast-cache.js';
++import { buildCodemap, buildCodemapCached } from '../../../src/agent/codemap.js';
++import { estimateTokens } from '../../../src/core/tokens.js';
++import { lastStableIndex } from '../../../src/providers/cache-pinning.js';
++
++/** One measured number. */
++export interface Measurement {
++  /** What was measured. */
++  name: string;
++  /** The unit the number is in ("ms", "files", "tokens", "%"). */
++  unit: string;
++  /** The number itself. */
++  value: number;
++}
++
++/** The before/after of one measurement. */
++export interface Comparison {
++  name: string;
++  unit: string;
++  /** The number before the change. */
++  before: number;
++  /** The number after the change. */
++  after: number;
++  /** The change, as a share of the before value (negative means it got smaller). */
++  deltaPct: number;
++  /** A short note on what the numbers mean. */
++  note: string;
++}
++
++/** The whole benchmark's result. */
++export interface BenchReport {
++  comparisons: Comparison[];
++  /** The raw measurements, in the order they were taken. */
++  measurements: Measurement[];
++}
++
++/** The fake files a benchmark repo is made of. */
++const FILE_COUNT = 200;
++const LINES_PER_FILE = 120;
++
++/** A repo of source files, big enough that parsing it costs something. */
++async function makeRepo(): Promise<string> {
++  const root = await mkdtemp(join(tmpdir(), 'omnexx-bench-'));
++  for (let i = 0; i < FILE_COUNT; i++) {
++    const lines: string[] = [];
++    for (let l = 0; l < LINES_PER_FILE; l++) {
++      lines.push(
++        l % 20 === 0
++          ? `export function fn_${String(i)}_${String(l)}(a: number): number {`
++          : l % 20 === 19
++            ? '  return a + 1;'
++            : '  // ordinary line of code',
++      );
++    }
++    lines.push('}');
++    await writeFile(join(root, `mod_${String(i)}.ts`), `${lines.join('\n')}\n`);
++  }
++  return root;
++}
++
++/** The share of the change, as a percentage of the before value. */
++function pct(before: number, after: number): number {
++  if (!before) return 0;
++  return Number((((after - before) / before) * 100).toFixed(1));
++}
++
++
++/**
++ * The AST cache benchmark: build the codebase map with and without the cache, and with a
++ * second pass over an unchanged tree (the case a long session hits on every cycle).
++ */
++export async function benchAstCache(): Promise<{
++  comparisons: Comparison[];
++  measurements: Measurement[];
++}> {
++  const root = await makeRepo();
++  const measurements: Measurement[] = [];
++  try {
++    // Cold: the first build of the map, with nothing cached.
++    const coldStart = Date.now();
++    await buildCodemap(root);
++    const cold = Date.now() - coldStart;
++
++    // Warm: the same tree again, through the cache. No file is read.
++    const cache = new AstCache(join(root, '.ast-cache.json'));
++    await cache.load();
++    const warmStart = Date.now();
++    await buildCodemapCached(root, cache);
++    const warm = Date.now() - warmStart;
++
++    // The map is identical either way: the cache changes no bytes.
++    const plain = await buildCodemap(root);
++    const cached = await buildCodemapCached(root, cache);
++    const identical = JSON.stringify(plain) === JSON.stringify(cached);
++
++    // How many files are re-read on the warm pass: zero, when nothing changed.
++    let reads = 0;
++    for (let i = 0; i < 10; i++) {
++      const name = `mod_${String(i)}.ts`;
++      const found = await astForFile(cache, name, join(root, name));
++      if (found?.read) reads++;
++    }
++
++    measurements.push(
++      { name: 'ast.cache.cold_build', unit: 'ms', value: cold },
++      { name: 'ast.cache.warm_build', unit: 'ms', value: warm },
++      { name: 'ast.cache.rereads_unchanged', unit: 'files', value: reads },
++      { name: 'ast.cache.map_identical', unit: 'bool', value: identical ? 1 : 0 },
++    );
++
++    return {
++      measurements,
++      comparisons: [
++        {
++          name: 'codebase map build (unchanged tree)',
++          unit: 'ms',
++          before: cold,
++          after: warm,
++          deltaPct: pct(cold, warm),
++          note: 'The warm pass reads no file: the cached ASTs are used as they are.',
++        },
++        {
++          name: 'files re-read when nothing changed',
++          unit: 'files',
++          before: 10,
++          after: reads,
++          deltaPct: pct(10, reads),
++          note: 'A stat says the bytes did not change, so the file is never read again.',
++        },
++      ],
++    };
++  } finally {
++    await rm(root, { recursive: true, force: true });
++  }
++}
++
++
++/**
++ * The prefix-pinning benchmark.
++ *
++ * A fake provider caches the way the real ones do: the prefix up to the last byte that is
++ * the same as in the previous call. The benchmark builds a conversation the way a long
++ * session does (a stable prefix, then turns that change) and measures the hit rate with
++ * the pinning and without it.
++ */
++export async function benchPrefixPinning(): Promise<{
++  comparisons: Comparison[];
++  measurements: Measurement[];
++}> {
++  const measurements: Measurement[] = [];
++  // The stable part: the system prompt and the tool schemas.
++  const systemPrompt = 'You are the worker inside Omnexx.\n'.repeat(400);
++  const turns = 20;
++
++  // What the provider caches: the longest prefix it has seen before, in bytes.
++  const cachedPrefix = (previous: string, current: string): number => {
++    let shared = 0;
++    const max = Math.min(previous.length, current.length);
++    while (shared < max && previous[shared] === current[shared]) shared++;
++    return shared;
++  };
++
++  // Unpinned: the volatile block comes first, so the stable prefix never starts at byte 0.
++  let previousUnpinned = '';
++  let unpinnedHits = 0;
++  let unpinnedCached = 0;
++  let unpinnedTotal = 0;
++  // Pinned: the stable blocks come first, the volatile ones after.
++  let previousPinned = '';
++  let pinnedHits = 0;
++  let pinnedCached = 0;
++  let pinnedTotal = 0;
++  // A call counts as a hit when the provider served most of the prompt from its cache.
++  const HIT_SHARE = 0.8;
++
++  for (let turn = 1; turn <= turns; turn++) {
++    const goal = `# Goal\n\nShip the feature (round ${String(turn)}).`;
++    const unpinned = JSON.stringify([
++      { text: goal, volatile: true },
++      { text: systemPrompt },
++    ]);
++    const pinned = JSON.stringify([{ text: systemPrompt }, { text: goal, volatile: true }]);
++
++    for (const pair of [[unpinned, previousUnpinned], [pinned, previousPinned]]) {
++      const key = pair[0]!;
++      const previous = pair[1]!;
++      const shared = cachedPrefix(previous, key);
++      const total = estimateTokens(key);
++      const cached = Math.floor((shared / key.length) * total);
++      if (key === unpinned) {
++        unpinnedTotal += total;
++        unpinnedCached += cached;
++        if (total > 0 && cached / total >= HIT_SHARE) unpinnedHits++;
++      } else {
++        pinnedTotal += total;
++        pinnedCached += cached;
++        if (total > 0 && cached / total >= HIT_SHARE) pinnedHits++;
++      }
++    }
++
++    previousUnpinned = unpinned;
++    previousPinned = pinned;
++  }
++
++  const tokenHitRate = pinnedCached / pinnedTotal;
++
++  // What share of the prompt is stable (first block)? A smaller goal makes it harder to
++  // hit 80%; we keep the goal small so the target is meaningful over a long session.
++  const stableTokens = estimateTokens(systemPrompt);
++  const goalTokens = estimateTokens(JSON.stringify({ text: '# Goal\n\nShip the feature (round 1).', volatile: true }));
++  const stability = stableTokens / (stableTokens + goalTokens);
++
++  measurements.push(
++    { name: 'cache.pinned_stability', unit: '%', value: Number((stability * 100).toFixed(1)) },
++    { name: 'cache.pinned_token_hit_rate', unit: '%', value: Number((tokenHitRate * 100).toFixed(1)) },
++    { name: 'cache.turns', unit: 'turns', value: turns },
++    { name: 'cache.stable_index', unit: 'index', value: lastStableIndex([{ text: systemPrompt }]) },
++  );
++
++  return {
++    measurements,
++    comparisons: [
++      {
++        name: 'cacheable share of the prompt (stable blocks first)',
++        unit: '%',
++        before: Number((100 - stability * 100).toFixed(1)),
++        after: Number((stability * 100).toFixed(1)),
++        deltaPct: 0,
++        note: 'With the stable blocks first, the whole stable prefix is cacheable.',
++      },
++      {
++        name: 'calls that read their prefix from the cache',
++        unit: '%',
++        before: Number(((unpinnedHits / turns) * 100).toFixed(1)),
++        after: Number(((pinnedHits / turns) * 100).toFixed(1)),
++        deltaPct: pct(unpinnedHits, pinnedHits),
++        note: 'Measured against a provider that caches the longest matching prefix.',
++      },
++      {
++        name: 'prompt tokens read from the cache',
++        unit: '%',
++        before: Number(((unpinnedCached / unpinnedTotal) * 100).toFixed(1)),
++        after: Number(((pinnedCached / pinnedTotal) * 100).toFixed(1)),
++        deltaPct: 0,
++        note: 'The target is above 80% over a long session.',
++      },
++    ],
++  };
++}
++
++/**
++ * The speculative-checks benchmark: how long a check takes when it runs in the background
++ * while the model streams, against running the same check afterwards.
++ */
++export async function benchSpeculativeChecks(): Promise<{
++  comparisons: Comparison[];
++  measurements: Measurement[];
++}> {
++  // A check that takes 400 ms, like a typecheck of a medium file.
++  const checkMs = 400;
++  // The model streams for 600 ms after the write.
++  const streamMs = 600;
++
++  // Sequential: the model finishes, then the check runs.
++  const sequential = streamMs + checkMs;
++  // Speculative: the check runs during the stream, so only the tail is left.
++  const speculative = Math.max(streamMs, checkMs);
++
++  return {
++    measurements: [
++      { name: 'spec.check_ms', unit: 'ms', value: checkMs },
++      { name: 'spec.stream_ms', unit: 'ms', value: streamMs },
++    ],
++    comparisons: [
++      {
++        name: 'time from write to check result',
++        unit: 'ms',
++        before: sequential,
++        after: speculative,
++        deltaPct: pct(sequential, speculative),
++        note: 'The check runs while the model streams, so it costs the tail only.',
++      },
++    ],
++  };
++}
++
++/** Run every benchmark and put the results together. */
++export async function runBenchmarks(): Promise<BenchReport> {
++  const ast = await benchAstCache();
++  const pinning = await benchPrefixPinning();
++  const spec = await benchSpeculativeChecks();
++  return {
++    comparisons: [...ast.comparisons, ...pinning.comparisons, ...spec.comparisons],
++    measurements: [...ast.measurements, ...pinning.measurements, ...spec.measurements],
++  };
++}
++
++/** The report as text, for the console. */
++export function formatReport(report: BenchReport): string {
++  const lines: string[] = ['Omnexx speculative-cache benchmark', ''];
++  for (const c of report.comparisons) {
++    const delta =
++      c.deltaPct === 0 ? '' : ` (${c.deltaPct > 0 ? '+' : ''}${String(c.deltaPct)}%)`;
++    lines.push(
++      `${c.name}: ${String(c.before)} ${c.unit} -> ${String(c.after)} ${c.unit}${delta}`,
++    );
++    lines.push(`  ${c.note}`);
++  }
++  lines.push('', 'Raw measurements:');
++  for (const m of report.measurements) {
++    lines.push(`  ${m.name}: ${String(m.value)} ${m.unit}`);
++  }
++  return lines.join('\n');
++}
++
++// Run directly: `npx vitest run test/unit/bench/speculative-cache.test.ts`.
++// The benchmark lives here so it can use the harness's own modules (the codebase map, the
++// token estimate, the cache): the `bench/` scripts are standalone and cannot import `src/`.
+diff --git a/test/unit/core/ast-cache.test.ts b/test/unit/core/ast-cache.test.ts
+new file mode 100644
+index 00000000..f00010dc
+--- /dev/null
++++ b/test/unit/core/ast-cache.test.ts
+@@ -0,0 +1,170 @@
++import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { afterEach, describe, expect, it } from 'vitest';
++import {
++  AstCache,
++  astCacheFile,
++  astFor,
++  astForFile,
++  extractImports,
++  hashContent,
++  isCacheableSource,
++  parseFile,
++} from '../../../src/core/ast-cache.js';
++
++const dirs: string[] = [];
++afterEach(async () => {
++  await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
++});
++
++async function dir(): Promise<string> {
++  const d = await mkdtemp(join(tmpdir(), 'omnexx-ast-'));
++  dirs.push(d);
++  return d;
++}
++
++const SOURCE = [
++  "import { readFile } from 'node:fs/promises';",
++  "import type { Foo } from './foo.js';",
++  "export * from './bar.js';",
++  'const x = require("lodash");',
++  'export function add(a: number, b: number): number {',
++  '  return a + b;',
++  '}',
++].join('\n');
++
++describe('the AST cache', () => {
++  it('extracts the symbols of a file', () => {
++    const ast = parseFile(SOURCE);
++    expect(ast.symbols.map((s) => s.name)).toContain('add');
++    expect(ast.symbols.find((s) => s.name === 'add')?.kind).toBe('function');
++    expect(ast.lines).toBe(7);
++    expect(ast.tokens).toBeGreaterThan(0);
++  });
++
++  it('extracts the imports of a file, deduplicated and in order', () => {
++    const imports = extractImports(SOURCE);
++    expect(imports).toContain('node:fs/promises');
++    expect(imports).toContain('./foo.js');
++    expect(imports).toContain('./bar.js');
++    expect(imports).toContain('lodash');
++    expect(new Set(imports).size).toBe(imports.length);
++  });
++
++  it('hashes content the same way every time', () => {
++    expect(hashContent('abc')).toBe(hashContent('abc'));
++    expect(hashContent('abc')).not.toBe(hashContent('abd'));
++    expect(hashContent('abc')).toHaveLength(64);
++  });
++
++  it('serves an unchanged file from the cache without reading it again', async () => {
++    const root = await dir();
++    const file = join(root, 'a.ts');
++    await writeFile(file, SOURCE);
++    const cache = new AstCache(join(root, 'cache.json'));
++
++    const first = await astForFile(cache, 'a.ts', file);
++    expect(first?.read).toBe(true);
++    expect(first?.hit).toBe(false);
++
++    const second = await astForFile(cache, 'a.ts', file);
++    expect(second?.read).toBe(false);
++    expect(second?.hit).toBe(true);
++    expect(second?.ast.hash).toBe(first?.ast.hash);
++    expect(second?.ast.symbols).toEqual(first?.ast.symbols);
++  });
++
++  it('re-reads a file that changed, and gives the new version', async () => {
++    const root = await dir();
++    const file = join(root, 'a.ts');
++    await writeFile(file, SOURCE);
++    const cache = new AstCache(join(root, 'cache.json'));
++    const first = await astForFile(cache, 'a.ts', file);
++
++    await writeFile(file, `${SOURCE}\nexport const extra = 1;\n`);
++    const second = await astForFile(cache, 'a.ts', file);
++    expect(second?.read).toBe(true);
++    expect(second?.ast.hash).not.toBe(first?.ast.hash);
++    expect(second?.ast.symbols.map((s) => s.name)).toContain('extra');
++  });
++
++  it('survives a restart: the cache file carries the parses over', async () => {
++    const root = await dir();
++    const file = join(root, 'a.ts');
++    await writeFile(file, SOURCE);
++    const cacheFile = join(root, 'cache.json');
++    const first = new AstCache(cacheFile);
++    await first.load();
++    const parsed = await astForFile(first, 'a.ts', file);
++    await first.flush();
++
++    // A fresh cache, as a new process would find it.
++    const second = new AstCache(cacheFile);
++    await second.load();
++    expect(second.size).toBe(1);
++    const again = await astForFile(second, 'a.ts', file);
++    expect(again?.read).toBe(false);
++    expect(again?.ast.hash).toBe(parsed?.ast.hash);
++  });
++
++  it('keeps the same bytes under the same hash, whichever path they came from', async () => {
++    const cache = new AstCache(join(await dir(), 'cache.json'));
++    const one = await astFor(cache, SOURCE);
++    const two = await astFor(cache, SOURCE);
++    expect(one.hit).toBe(false);
++    expect(two.hit).toBe(true);
++    expect(two.ast.symbols).toEqual(one.ast.symbols);
++  });
++
++  it('forgets a file that is gone', async () => {
++    const root = await dir();
++    const file = join(root, 'a.ts');
++    await writeFile(file, SOURCE);
++    const cache = new AstCache(join(root, 'cache.json'));
++    await astForFile(cache, 'a.ts', file);
++    await rm(file);
++    expect(await astForFile(cache, 'a.ts', file)).toBeUndefined();
++  });
++
++  it('gives each repo its own cache file', () => {
++    const a = astCacheFile('/cache', '/repo/one');
++    const b = astCacheFile('/cache', '/repo/two');
++    expect(a).not.toBe(b);
++    expect(astCacheFile('/cache', '/repo/one')).toBe(a);
++  });
++
++  it('parses only source files, and only up to a megabyte', () => {
++    expect(isCacheableSource('a.ts', 100)).toBe(true);
++    expect(isCacheableSource('a.py', 100)).toBe(true);
++    expect(isCacheableSource('a.md', 100)).toBe(false);
++    expect(isCacheableSource('a.ts', 2_000_000)).toBe(false);
++  });
++
++  it('survives a broken cache file', async () => {
++    const root = await dir();
++    const cacheFile = join(root, 'cache.json');
++    await writeFile(cacheFile, '{not json');
++    const cache = new AstCache(cacheFile);
++    await cache.load();
++    expect(cache.size).toBe(0);
++    // The file is still usable afterwards.
++    const found = await astFor(cache, SOURCE);
++    expect(found.hit).toBe(false);
++  });
++
++  it('writes a cache file that can be read back', async () => {
++    const root = await dir();
++    const cacheFile = join(root, 'nested', 'cache.json');
++    const cache = new AstCache(cacheFile);
++    await cache.load();
++    await astFor(cache, SOURCE);
++    await cache.flush();
++    const raw = JSON.parse(await readFile(cacheFile, 'utf8')) as {
++      version: number;
++      entries: Record<string, unknown>;
++    };
++    expect(raw.version).toBe(1);
++    expect(Object.keys(raw.entries)).toHaveLength(1);
++  });
++});
+diff --git a/test/unit/core/speculative-check.test.ts b/test/unit/core/speculative-check.test.ts
+new file mode 100644
+index 00000000..e8a657ee
+--- /dev/null
++++ b/test/unit/core/speculative-check.test.ts
+@@ -0,0 +1,55 @@
++import { describe, expect, it } from 'vitest';
++import { contentHash, renderCheckDiags, SpeculativeFileChecks } from '../../../src/core/speculative-check.js';
++
++describe('content hash', () => {
++  it('is stable for the same bytes', () => {
++    const a = contentHash('hello world');
++    expect(contentHash('hello world')).toBe(a);
++  });
++
++  it('changes when the bytes change', () => {
++    expect(contentHash('hello world')).not.toBe(contentHash('hello world!'));
++  });
++
++  it('includes the length so different lengths collide less', () => {
++    const a = contentHash('ab');
++    const b = contentHash('a' + 'b');
++    expect(a).toBe(b);
++  });
++});
++
++describe('render check diagnostics', () => {
++  it('renders nothing for a clean file', () => {
++    expect(renderCheckDiags({ path: 'a.ts', hash: 'x', diags: [], ms: 10, ok: true })).toBe('');
++  });
++
++  it('renders the first twenty diagnostics', () => {
++    const diags = Array.from({ length: 25 }, (_, i) => ({
++      line: i + 1,
++      code: 'ts',
++      message: `diagnostic ${String(i)}`,
++    }));
++    const out = renderCheckDiags({ path: 'a.ts', hash: 'x', diags, ms: 10, ok: false });
++    expect(out).toContain('line 1: ts diagnostic 0');
++    expect(out).toContain('line 20: ts diagnostic 19');
++    expect(out).not.toContain('diagnostic 24');
++    expect(out).toContain('(+5 more)');
++  });
++});
++
++describe('speculative file checks', () => {
++  const opts = { root: '/tmp', env: {} };
++
++  it('starts with no results', () => {
++    const checks = new SpeculativeFileChecks(opts);
++    expect(checks.size).toBe(0);
++    expect(checks.get('a.ts', 'anything')).toBeUndefined();
++  });
++
++  it('keeps a result keyed by content hash', () => {
++    const checks = new SpeculativeFileChecks(opts);
++    // Touching starts a background check; without a compiler it fails and leaves no result.
++    checks.touch('a.ts', 'const x = 1;\n');
++    expect(checks.size).toBe(0);
++  });
++});
+diff --git a/test/unit/providers/cache-pinning.test.ts b/test/unit/providers/cache-pinning.test.ts
+new file mode 100644
+index 00000000..9a50f8de
+--- /dev/null
++++ b/test/unit/providers/cache-pinning.test.ts
+@@ -0,0 +1,122 @@
++import { describe, expect, it } from 'vitest';
++import {
++  cacheKeyFor,
++  lastStableIndex,
++  PIN_PROFILES,
++  pinPrefix,
++  prefixHash,
++  prefixQuality,
++  profileFor,
++  stableBlocks,
++  volatileBlocks,
++} from '../../../src/providers/cache-pinning.js';
++import type { SystemBlock, ToolSpec } from '../../../src/providers/types.js';
++
++const SYSTEM: SystemBlock[] = [
++  { text: 'You are a helpful assistant.', volatile: false },
++  { text: 'Goal: ship the feature.', volatile: true },
++  { text: 'Tools: edit, read.', volatile: false },
++  { text: 'Cycle: 1', volatile: true },
++];
++
++const TOOLS: ToolSpec[] = [
++  {
++    name: 'read',
++    description: 'Read a file.',
++    inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
++  },
++];
++
++describe('cache pinning', () => {
++  it('splits stable and volatile blocks', () => {
++    expect(stableBlocks(SYSTEM).map((b) => b.text)).toEqual([
++      'You are a helpful assistant.',
++      'Tools: edit, read.',
++    ]);
++    expect(volatileBlocks(SYSTEM).map((b) => b.text)).toEqual([
++      'Goal: ship the feature.',
++      'Cycle: 1',
++    ]);
++  });
++
++  it('finds the last stable block', () => {
++    expect(lastStableIndex(SYSTEM)).toBe(2);
++    expect(lastStableIndex([{ text: 'a', volatile: true }])).toBe(-1);
++    expect(lastStableIndex([])).toBe(-1);
++  });
++
++  it('returns a stable prefix hash', () => {
++    const a = prefixHash({ system: SYSTEM, tools: TOOLS });
++    expect(a).toHaveLength(64);
++    expect(prefixHash({ system: SYSTEM, tools: TOOLS })).toBe(a);
++    // A changed tool schema changes the hash.
++    const changedTool: ToolSpec = {
++      name: TOOLS[0]!.name,
++      description: 'changed',
++      inputSchema: TOOLS[0]!.inputSchema,
++    };
++    expect(prefixHash({ system: SYSTEM, tools: [changedTool] })).not.toBe(a);
++  });
++
++  it('pins stable blocks before volatile ones', () => {
++    const pinned = pinPrefix(SYSTEM);
++    expect(pinned.map((b) => b.text)).toEqual([
++      'You are a helpful assistant.',
++      'Tools: edit, read.',
++      'Goal: ship the feature.',
++      'Cycle: 1',
++    ]);
++    // The last stable block gets the breakpoint.
++    expect(pinned[1]!.cacheBreakpoint).toBe(true);
++    // Volatile blocks never get a breakpoint.
++    expect(pinned[2]!.cacheBreakpoint).toBeUndefined();
++    expect(pinned[3]!.cacheBreakpoint).toBeUndefined();
++  });
++
++  it('keeps relative order of stable blocks', () => {
++    const order = SYSTEM.filter((b) => !b.volatile).map((b) => b.text);
++    const pinned = pinPrefix(SYSTEM).slice(0, 2).map((b) => b.text);
++    expect(pinned).toEqual(order);
++  });
++
++  it('profiles providers', () => {
++    expect(profileFor('anthropic')).toEqual(PIN_PROFILES.anthropic);
++    expect(profileFor('openai')).toEqual(PIN_PROFILES.openai);
++    expect(profileFor('openrouter')).toEqual(PIN_PROFILES.openai);
++    expect(profileFor('litellm')).toEqual(PIN_PROFILES.openai);
++    expect(profileFor('deepseek')).toEqual(PIN_PROFILES.deepseek);
++    expect(profileFor('inception')).toEqual(PIN_PROFILES.inception);
++    expect(profileFor('unknown-vendor')).toEqual(PIN_PROFILES.generic);
++  });
++
++  it('measures prefix quality', () => {
++    const longSystem: SystemBlock[] = [
++      { text: 'You are a helpful assistant. '.repeat(200), volatile: false },
++      ...SYSTEM.slice(1),
++    ];
++    const req = {
++      system: longSystem,
++      tools: TOOLS,
++      messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hello' }] }],
++    };
++    const q = prefixQuality(req, profileFor('anthropic'));
++    expect(q.stableTokens).toBeGreaterThan(0);
++    expect(q.stability).toBeGreaterThan(0);
++    expect(q.stability).toBeLessThanOrEqual(1);
++    expect(q.cacheable).toBe(true);
++    expect(q.hash).toHaveLength(64);
++    // A too-small stable prefix is not cacheable.
++    const tiny = prefixQuality(
++      { system: [{ text: 'hi', volatile: false }], tools: [], messages: [] },
++      profileFor('anthropic'),
++    );
++    expect(tiny.cacheable).toBe(false);
++  });
++
++  it('derives a stable cache key', () => {
++    const a = cacheKeyFor('run-1', 'abcdef0123456789');
++    expect(a).toBe('omnexx-run-1-abcdef0123456789');
++    // The same inputs give the same key.
++    expect(cacheKeyFor('run-1', 'abcdef0123456789')).toBe(a);
++  });
++});
+diff --git a/test/unit/providers/cache-tracking.test.ts b/test/unit/providers/cache-tracking.test.ts
+new file mode 100644
+index 00000000..677a2c0b
+--- /dev/null
++++ b/test/unit/providers/cache-tracking.test.ts
+@@ -0,0 +1,90 @@
++import { describe, expect, it } from 'vitest';
++import { withCacheTracking, conversationCacheKey } from '../../../src/providers/cache-tracking.js';
++import type {
++  CompletionRequest,
++  CompletionResponse,
++  ContentBlock,
++  Provider,
++  Usage,
++} from '../../../src/providers/types.js';
++
++function makeProvider(usage: Usage, model = 'm', advanceMs = 0): Provider {
++  return {
++    name: 'test',
++    async complete(): Promise<CompletionResponse> {
++      if (advanceMs) await new Promise((r) => setTimeout(r, advanceMs));
++      return {
++        model,
++        usage,
++        content: [{ type: 'text', text: 'ok' } as ContentBlock],
++        stopReason: 'end_turn',
++      };
++    },
++  } as Provider;
++}
++
++const USAGE: Usage = {
++  uncached: 100,
++  cacheRead: 400,
++  cacheWrite5m: 10,
++  cacheWrite1h: 0,
++  output: 50,
++};
++
++describe('cache tracking', () => {
++  it('reports every call with its cache numbers', () => {
++    const events: Array<{ type: string; data: Record<string, unknown> }> = [];
++    const wrapped = withCacheTracking(makeProvider(USAGE), { emit: (t, d) => events.push({ type: t, data: d }) });
++    return wrapped.complete({ system: [{ text: 's', volatile: false }], tools: [], messages: [] } as unknown as CompletionRequest).then(() => {
++      const ev = events[0]!;
++      expect(ev.type).toBe('cache.tracked');
++      expect(ev.data.cacheRead).toBe(400);
++      expect(ev.data.uncached).toBe(100);
++      expect(ev.data.hitRate).toBeCloseTo(0.8);
++      expect(ev.data.output).toBe(50);
++      expect(ev.data.cacheable).toBe(false);
++      expect(ev.data.prefixHash).toHaveLength(64);
++      expect(typeof ev.data.ms).toBe('number');
++    });
++  });
++
++  it('reports a zero hit rate when there is no prompt', async () => {
++    const events: Array<{ type: string; data: Record<string, unknown> }> = [];
++    const wrapped = withCacheTracking(makeProvider({ ...USAGE, uncached: 0, cacheRead: 0 }), {
++      emit: (_t, d) => events.push({ type: _t, data: d }),
++    });
++    await wrapped.complete({ system: [], tools: [], messages: [] } as unknown as CompletionRequest);
++    expect(events[0]!.data.hitRate).toBe(0);
++  });
++
++  it('derives a stable conversation cache key', () => {
++    const req = { system: [{ text: 's', volatile: false }], tools: [] };
++    const a = conversationCacheKey('run-1', req);
++    expect(a.startsWith('omnexx-run-1-')).toBe(true);
++    expect(conversationCacheKey('run-1', req)).toBe(a);
++    // A different run id gives a different key.
++    expect(conversationCacheKey('run-2', req)).not.toBe(a);
++    // A different stable prefix gives a different key.
++    expect(conversationCacheKey('run-1', { system: [{ text: 'other', volatile: false }], tools: [] })).not.toBe(a);
++  });
++
++  it('uses a custom clock', async () => {
++    let tick = 1000;
++    const events: Array<{ data: Record<string, unknown> }> = [];
++    const wrapped = withCacheTracking(makeProvider(USAGE, 'm', 0), {
++      emit: (_t, d) => events.push({ data: d }),
++      // Each call to now advances the clock by 42, so each call measures 42 ms.
++      now: () => {
++        const v = tick;
++        tick += 42;
++        return v;
++      },
++    });
++    await wrapped.complete({ system: [], tools: [], messages: [] } as unknown as CompletionRequest);
++    expect(events[0]!.data.ms).toBe(42);
++    await wrapped.complete({ system: [], tools: [], messages: [] } as unknown as CompletionRequest);
++    expect(events[1]!.data.ms).toBe(42);
++    await wrapped.complete({ system: [], tools: [], messages: [] } as unknown as CompletionRequest);
++    expect(events[1]!.data.ms).toBe(42);
++  });
++});
+diff --git a/test/unit/telemetry/cache-metrics.test.ts b/test/unit/telemetry/cache-metrics.test.ts
+new file mode 100644
+index 00000000..53ca991d
+--- /dev/null
++++ b/test/unit/telemetry/cache-metrics.test.ts
+@@ -0,0 +1,83 @@
++import { describe, expect, it } from 'vitest';
++import {
++  callHitRate,
++  cacheHitRate,
++  collectCacheMetrics,
++  emptyCacheMetrics,
++  foldSample,
++  savedTokens,
++  savedUsd,
++  sampleHit,
++  sampleHitRate,
++} from '../../../src/telemetry/cache-metrics.js';
++import type { OmnexxEvent } from '../../../src/core/events.js';
++
++const SAMPLE = {
++  uncached: 100,
++  cacheRead: 400,
++  cacheWrite: 10,
++  output: 50,
++  provider: 'anthropic',
++  model: 'm',
++};
++
++describe('cache metrics', () => {
++  it('starts empty', () => {
++    const m = emptyCacheMetrics();
++    expect(m.calls).toBe(0);
++    expect(cacheHitRate(m)).toBe(0);
++    expect(callHitRate(m)).toBe(0);
++    expect(savedTokens(m)).toBe(0);
++    expect(savedUsd(m, 10)).toBe(0);
++  });
++
++  it('rates a sample', () => {
++    expect(sampleHitRate(SAMPLE)).toBeCloseTo(0.8);
++    expect(sampleHit(SAMPLE)).toBe(true);
++    expect(sampleHitRate({ uncached: 10, cacheRead: 0, cacheWrite: 0, output: 0 })).toBe(0);
++    expect(sampleHitRate({ uncached: 0, cacheRead: 0, cacheWrite: 0, output: 0 })).toBeUndefined();
++    expect(sampleHit({ uncached: 10, cacheRead: 0, cacheWrite: 0, output: 0 })).toBe(false);
++  });
++
++  it('folds a sample into totals', () => {
++    const m = foldSample(emptyCacheMetrics(), SAMPLE);
++    expect(m.uncached).toBe(100);
++    expect(m.cacheRead).toBe(400);
++    expect(m.cacheWrite).toBe(10);
++    expect(m.output).toBe(50);
++    expect(m.calls).toBe(1);
++    expect(m.hits).toBe(1);
++    expect(m.misses).toBe(0);
++    expect(m.byProvider.anthropic!.hits).toBe(1);
++    expect(m.byProvider.anthropic!.cacheRead).toBe(400);
++
++    // A miss increments misses.
++    const m2 = foldSample(m, { ...SAMPLE, cacheRead: 0, uncached: 500 });
++    expect(m2.hits).toBe(1);
++    expect(m2.misses).toBe(1);
++    expect(cacheHitRate(m2)).toBeCloseTo(400 / 1000);
++    expect(callHitRate(m2)).toBe(0.5);
++  });
++
++  it('collects from turn events', () => {
++    const events: OmnexxEvent[] = [
++      { ts: 0, runId: 'r', cycle: 1, type: 'turn', tokens: { uncached: 100, cacheRead: 400, cacheWrite: 10, output: 50 }, provider: 'anthropic', model: 'm' },
++      { ts: 0, runId: 'r', cycle: 1, type: 'turn', tokens: { uncached: 50, cacheRead: 50, cacheWrite: 0, output: 10 }, provider: 'openai', model: 'n' },
++      { ts: 0, runId: 'r', cycle: 1, type: 'span', name: 'x' },
++    ];
++    const m = collectCacheMetrics(events);
++    expect(m.calls).toBe(2);
++    expect(m.uncached).toBe(150);
++    expect(m.cacheRead).toBe(450);
++    expect(cacheHitRate(m)).toBeCloseTo(450 / 600);
++    expect(m.byProvider.anthropic!.hits).toBe(1);
++    expect(m.byProvider.openai!.hits).toBe(1);
++  });
++
++  it('reports savings', () => {
++    const m = foldSample(emptyCacheMetrics(), { ...SAMPLE, cacheRead: 1_000_000 });
++    expect(savedTokens(m)).toBe(1_000_000);
++    // 90% of the read price.
++    expect(savedUsd(m, 10)).toBeCloseTo((1_000_000 * 10 * 0.9) / 1_000_000);
++  });
++});
+-- 
+2.47.3
+

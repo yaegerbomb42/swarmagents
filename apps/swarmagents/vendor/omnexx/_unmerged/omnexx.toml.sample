@@ -1,0 +1,50 @@
+[autonomous]
+enabled = true
+mode = "daemon"
+target_branch = "omnexx/auto-main"
+base_branch = "main"
+
+focus = [
+  "Surpass Cline, Claude Code, and OpenCode in agentic speed, token economics, and visual UX feel.",
+  "VS Code Extension: Fluid UI ergonomics, glassmorphic message styling, zero-latency streaming render, token cockpit, interactive scrubber, and tactile tool execution cards.",
+  "Core Engine: Speculative execution, tree-sitter AST repo mapping, prompt cache hit maximization (>80%), and ultra-low turn latency.",
+  "Decompose 1,000+ line monolithic files into clean single-responsibility modules (src/autonomous/daemon.ts, src/agent/loop.ts).",
+  "Write regression test armor on uncovered high-churn core modules (src/agent/budget-guard.ts, src/agent/call-stack.ts)."
+]
+
+[autonomous.discovery]
+interval_sec = 60
+min_priority_score = 15.0
+collectors_enabled = [
+  "test_runner",
+  "static_analysis",
+  "self_review",
+  "coverage_churn",
+  "perf_benchmark",
+  "complexity",
+  "todo_mining"
+]
+
+[autonomous.circuit_breakers]
+max_turns_per_task = 30
+max_wall_clock_per_task_sec = 1800
+max_identical_tool_errors = 3
+watchdog_stall_timeout_sec = 300
+
+[autonomous.budget]
+max_tokens_per_task_soft = 200000
+max_tokens_per_task_hard = 250000
+max_tokens_per_hour = 4000000
+max_tokens_per_day = 40000000
+max_cost_usd_per_task = 1.0
+
+[autonomous.verification]
+require_revert_test_proof = false
+require_adversarial_critic = false
+auto_merge_max_risk_score = 40
+flake_isolation_reruns = 2
+
+[autonomous.safety]
+max_files_per_task = 10
+max_net_loc_per_task = 350
+allow_network_in_bash = false

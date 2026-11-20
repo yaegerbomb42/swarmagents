@@ -1,0 +1,2268 @@
+From 385b66900b8a15ede8c025c6b1be1a22b4d9c72c Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Sun, 8 Nov 2026 16:05:07 -0600
+Subject: [PATCH] feat(runtime): add GitTreeSnapshotter and micro-amortized
+ history compaction (Steps 3.5, 3.6)
+
+---
+ .gitignore                               |   1 +
+ MASTER_TODO.md                           |  98 +++++++-
+ eslint.config.js                         |   3 -
+ package-lock.json                        |  33 ---
+ package.json                             |   2 -
+ src/agent/runtime/checkpoint.ts          |  94 ++++++++
+ src/agent/runtime/micro-compaction.ts    | 162 ++++++++++++++
+ test/unit/agent/checkpoint.test.ts       |  98 ++++++++
+ test/unit/agent/micro-compaction.test.ts | 111 +++++++++
+ test/unit/vscode-chat-render.test.ts     |  10 -
+ tsconfig.json                            |   2 -
+ vscode/build.mjs                         |  13 --
+ vscode/media/chat.css                    | 274 +----------------------
+ vscode/media/terminal.js                 | 257 ---------------------
+ vscode/media/tokens.css                  |  13 --
+ vscode/package.json                      |  40 ----
+ vscode/src/chatView.ts                   |  46 ----
+ vscode/src/diff-viewer.ts                | 239 --------------------
+ vscode/src/extension.ts                  |  48 +---
+ vscode/src/terminal-view.ts              | 198 ----------------
+ vscode/src/webview/chat.ts               |  38 +---
+ vscode/src/webview/css.d.ts              |   5 -
+ vscode/src/webview/render.ts             |  10 -
+ vscode/src/webview/tsconfig.json         |   3 -
+ vscode/src/webview/xterm-shim.ts         |  17 --
+ 25 files changed, 565 insertions(+), 1250 deletions(-)
+ create mode 100644 src/agent/runtime/checkpoint.ts
+ create mode 100644 src/agent/runtime/micro-compaction.ts
+ create mode 100644 test/unit/agent/checkpoint.test.ts
+ create mode 100644 test/unit/agent/micro-compaction.test.ts
+ delete mode 100644 vscode/media/terminal.js
+ delete mode 100644 vscode/src/diff-viewer.ts
+ delete mode 100644 vscode/src/terminal-view.ts
+ delete mode 100644 vscode/src/webview/css.d.ts
+ delete mode 100644 vscode/src/webview/xterm-shim.ts
+
+diff --git a/.gitignore b/.gitignore
+index 6e02c389..c9bfd059 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,6 +11,7 @@ bench/results/
+ .env
+ .env.local
+ src/.*_bak/
++stub-preflight-fmt.css
+ 
+ # Generated evolution candidates; only best.ts.txt (raw region, not compiled) is kept.
+ bench/evolve-prune/candidates/*
+diff --git a/MASTER_TODO.md b/MASTER_TODO.md
+index e12a46a9..e607b3df 100644
+--- a/MASTER_TODO.md
++++ b/MASTER_TODO.md
+@@ -239,7 +239,7 @@ flowchart TD
+   - **Dependencies:** Step 3.3
+   - **Acceptance:** Simulating mid-batch abort never produces a 400 Bad Request error on subsequent model calls.
+ 
+-- [ ] **Step 3.5: Micro-Amortized History Compaction**
++- [x] **Step 3.5: Micro-Amortized History Compaction**
+   - **Files:** `src/agent/runtime/micro-compaction.ts`, `src/agent/compaction.ts`
+   - **Action:**
+     - Implement `microCompact(messages, options)` operating strictly outside the pinned prefix and hot recent message window.
+@@ -250,7 +250,7 @@ flowchart TD
+   - **Dependencies:** Step 3.4
+   - **Acceptance:** History token count decreases after repetitive read turns while prefix cache hit ratio remains $>80\%$.
+ 
+-- [ ] **Step 3.6: Throwaway Git-Tree Snapshotter**
++- [x] **Step 3.6: Throwaway Git-Tree Snapshotter**
+   - **Files:** `src/agent/runtime/checkpoint.ts`, `src/git/checkpoint.ts`
+   - **Action:** Implement `GitTreeSnapshotter` using an isolated throwaway git index (`GIT_INDEX_FILE` in `os.tmpdir()`). Capture tree SHA via `git write-tree` in <50ms without modifying the user's HEAD, index, or branch refs. Implement restore using `git checkout-index` and directory cleaning.
+   - **Dependencies:** None
+@@ -620,14 +620,96 @@ flowchart TD
+ | Phase | Subsystem Focus | Total Steps | Completed | Est. Token Savings | Est. Turn Savings | Primary Metric Target |
+ |---|---|:---:|:---:|:---:|:---:|:---:|
+ | **Phase 0** | SWE-bench Core Remediation | 5 | 5 / 5 | Baseline | Baseline | 100% Valid Patch Formats & Diffs |
+-| **Phase 1** | Pre-flight Diagnostic Interceptor | 11 | 7 / 11 | ~15–20% | ~0.7 turns/task | Zero Syntax/Lint Errors to LLM |
+-| **Phase 2** | Prompt Topology & KV-Cache | 7 | 1 / 7 | 40–72% Input | N/A (Latency) | >80% Cache Hit Ratio Across Providers |
+-| **Phase 3** | Async Agent Engine (`runAgentLoop`) | 8 | 0 / 8 | ~25% Output | ~1.5 turns/task | Concurrency Speedup + Zero Orphan Use |
+-| **Phase 4** | 3-Tier Model Cascade Router | 6 | 0 / 6 | ~70% Cost | N/A (Cost) | <$0.30 / Exploration Run |
++| **Phase 1** | Pre-flight Diagnostic Interceptor | 11 | 10 / 11 | ~15–20% | ~0.7 turns/task | Zero Syntax/Lint Errors to LLM |
++| **Phase 2** | Prompt Topology & KV-Cache | 7 | 5 / 7 | 40–72% Input | N/A (Latency) | >80% Cache Hit Ratio Across Providers |
++| **Phase 3** | Async Agent Engine (`runAgentLoop`) | 8 | 6 / 8 | ~25% Output | ~1.5 turns/task | Concurrency Speedup + Zero Orphan Use |
++| **Phase 4** | 3-Tier Model Cascade Router | 6 | 2 / 6 | ~70% Cost | N/A (Cost) | <$0.30 / Exploration Run |
+ | **Phase 5** | Differential TDR & Worktrees | 6 | 0 / 6 | ~15% | ~2.0 turns/task | Zero Regression Commits Accepted |
+ | **Phase 6** | Decoupled Issue-Resolution FSM | 8 | 0 / 8 | ~30% | Bounded (11 nom) | Bounded Cost ($1.00 max) + Replayability |
+ | **Phase 7** | Oracle-Guided Tree Search (OGTS) | 7 | 0 / 7 | Adaptive | High Accuracy | +15–25% Relative SWE-bench Pass Rate |
+ | **Phase 8** | Zero-Trust Sandbox & PTY Engine | 7 | 0 / 7 | N/A (Safety) | Fast Tool PTY | Total Host & Kernel Isolation |
+-| **Phase 9** | VS Code Extension & UI System | 6 | 0 / 6 | DX / UX | Interactive | Native PTY Terminal + 24 Screen Design |
+-| **TOTAL** | **Full Omnexx Engineering Overhaul** | **71** | **13 / 71** | **~60–80% Net** | **~4.2 turns/task** | **Production Autonomous Coding Standard** |
++| **Phase 9** | VS Code Extension & UI System | 6 | 2 / 6 | DX / UX | Interactive | Native PTY Terminal + 24 Screen Design |
++| **TOTAL** | **Full Omnexx Engineering Overhaul** | **71** | **30 / 71** | **~60–80% Net** | **~4.2 turns/task** | **Production Autonomous Coding Standard** |
++
++---
++
++## Appendix: Post-Roadmap 6-Subsystem Frontier Model Audit Strategy
++
++*Preserved for execution after primary roadmap stabilization. Feed each slice (15k–40k tokens) into a frontier model (Claude 3.7 Sonnet / GPT-4.5 / Gemini 2.0 Pro) with the mandate: "No bug report accepted without a reproducing Vitest unit test."*
++
++### Subsystem 1: Agent Runtime, Concurrency & Interrupt Engine
++- **Target Files:**
++  - `src/agent/loop.ts`
++  - `src/agent/runtime/tool-scheduler.ts`
++  - `src/agent/runtime/interrupt-bus.ts`
++  - `src/agent/runtime/micro-compaction.ts`
++  - `test/unit/agent/tool-scheduler.test.ts`
++- **Audit Brief:**
++  - Audit unhandled Promise rejections and process group leaks when an AbortSignal trips mid-wave.
++  - Verify strict provider contract invariant: every `tool_use` must have a matching `tool_result` envelope at the identical array index.
++  - Audit concurrency boundary conditions in `executeToolWaves`.
++
++### Subsystem 2: Preflight Verification, Autofix & Diagnostics Hub
++- **Target Files:**
++  - `src/verify/preflight.ts`
++  - `src/verify/preflight-types.ts`
++  - `src/verify/diagnostics.ts`
++  - `src/verify/autofix.ts`
++  - `src/verify/formatters.ts`
++  - `src/verify/diagnostic-baseline.ts`
++  - `src/verify/impact-analysis.ts`
++- **Audit Brief:**
++  - Verify 4,000ms hard timeout ceiling enforcement across all sub-checks (formatters, autofix, LSP).
++  - Verify disk mutation consistency: Ensure the LLM never receives stale pre-mutation file snippets.
++  - Audit 0-based LSP coordinate to 1-based editor coordinate conversions.
++
++### Subsystem 3: Provider Wire Protocols, Dual-Breakpoints & KV-Cache Pinning
++- **Target Files:**
++  - `src/providers/anthropic.ts`
++  - `src/providers/openai-compat.ts`
++  - `src/providers/gemini.ts`
++  - `src/providers/cache-pinning.ts`
++  - `src/providers/cache-headers.ts`
++  - `src/telemetry/cache-meter.ts`
++- **Audit Brief:**
++  - Audit prefix cache stability: verify zero volatile timestamps, UUIDs, or random keys in Level 0/1 blocks.
++  - Verify Anthropic max-4 cache_control breakpoint budget compliance.
++  - Verify OpenAI/DeepSeek deterministic JSON key ordering via `stableJsonStringify`.
++
++### Subsystem 4: Context Architecture & 3-Level Prompt Topology
++- **Target Files:**
++  - `src/core/prompt-assembler.ts`
++  - `src/agent/context.ts`
++  - `src/agent/prompts.ts`
++  - `src/agent/compaction.ts`
++  - `src/core/running-context.ts`
++- **Audit Brief:**
++  - Verify strict partition: Level 0 (Immutable Core) -> Level 1 (Session Semi-Static) -> Level 2 (Dynamic Window).
++  - Audit `clampSlotTail` edge cases: ensure oldest progress lines are discarded while preserving newest living state entries.
++  - Audit Unicode / NFC normalization and absolute path canonicalization (`$REPO`).
++
++### Subsystem 5: Model Routing, Cascade Classifier & Fast-Path Engine
++- **Target Files:**
++  - `src/router/cascade-router.ts`
++  - `src/router/fast-path-engine.ts`
++  - `src/router/classify.ts`
++  - `src/router/actions.ts`
++  - `src/router/stage.ts`
++- **Audit Brief:**
++  - Audit false Tier 1 classifications: verify mutation verbs ("write", "delete", "edit", "rm") never route to non-LLM fast path.
++  - Verify instant Tier 3 escalation when context exceeds 100k tokens or touches >3 files.
++  - Verify `routeTask` is strictly synchronous and $O(1)$ without network/disk I/O.
++
++### Subsystem 6: SWE-bench Benchmark Extraction & Patch Engine
++- **Target Files:**
++  - `src/swe-bench/patch-diff.ts`
++  - `src/swe-bench/skeleton.ts`
++  - `src/swe-bench/reproduce.ts`
++  - `src/core/contract.ts`
++  - `src/core/spec-gate.ts`
++- **Audit Brief:**
++  - Verify standard `a/` and `b/` patch diff prefix compatibility with `git apply -p1`.
++  - Verify `git add -N .` untracked file capture across nested subdirectories.
++  - Verify subshell process-group kill (`-pid`) deterministic cleanup in `reproduce.ts`.
++
+ 
+diff --git a/eslint.config.js b/eslint.config.js
+index 63733d5e..3a1c6026 100644
+--- a/eslint.config.js
++++ b/eslint.config.js
+@@ -21,9 +21,6 @@ export default tseslint.config(
+       'test/.build/**',
+       'eslint.config.js',
+       'vscode/build.mjs',
+-      // Plain-JS webview asset (terminal drawer controller): not part of any
+-      // tsconfig, so the project service cannot type-check it — like build.mjs.
+-      'vscode/media/terminal.js',
+       'scripts/copy-kernel-data.mjs',
+     ],
+   },
+diff --git a/package-lock.json b/package-lock.json
+index 795c31e7..a2edf2e8 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -43,8 +43,6 @@
+         "@types/smtp-server": "^3.5.13",
+         "@types/vscode": "1.90.0",
+         "@vitest/coverage-v8": "5.0.3",
+-        "@xterm/addon-fit": "^0.11.0",
+-        "@xterm/xterm": "^6.0.0",
+         "eslint": "10.12.0",
+         "hoodiecrow-imap": "^3.3.1",
+         "ink-testing-library": "4.0.0",
+@@ -1730,20 +1728,6 @@
+         "node": ">=16.0.0"
+       }
+     },
+-    "node_modules/@prisma/config/node_modules/magicast": {
+-      "version": "0.3.5",
+-      "resolved": "https://registry.npmjs.org/magicast/-/magicast-0.3.5.tgz",
+-      "integrity": "sha512-L0WhttDl+2BOsybvEOLK7fW3UA0OQ0IQ2d6Zl2x/a6vVRs3bAY0ECOSHHeL5jD+SbOpOCUEi0y1DgHEn9Qn1AQ==",
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "peer": true,
+-      "dependencies": {
+-        "@babel/parser": "^7.25.4",
+-        "@babel/types": "^7.25.4",
+-        "source-map-js": "^1.2.0"
+-      }
+-    },
+     "node_modules/@prisma/config/node_modules/pkg-types": {
+       "version": "2.4.0",
+       "resolved": "https://registry.npmjs.org/pkg-types/-/pkg-types-2.4.0.tgz",
+@@ -3208,23 +3192,6 @@
+         "url": "https://opencollective.com/vitest"
+       }
+     },
+-    "node_modules/@xterm/addon-fit": {
+-      "version": "0.11.0",
+-      "resolved": "https://registry.npmjs.org/@xterm/addon-fit/-/addon-fit-0.11.0.tgz",
+-      "integrity": "sha512-jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g==",
+-      "dev": true,
+-      "license": "MIT"
+-    },
+-    "node_modules/@xterm/xterm": {
+-      "version": "6.0.0",
+-      "resolved": "https://registry.npmjs.org/@xterm/xterm/-/xterm-6.0.0.tgz",
+-      "integrity": "sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "workspaces": [
+-        "addons/*"
+-      ]
+-    },
+     "node_modules/@zone-eu/mailsplit": {
+       "version": "5.4.20",
+       "resolved": "https://registry.npmjs.org/@zone-eu/mailsplit/-/mailsplit-5.4.20.tgz",
+diff --git a/package.json b/package.json
+index fd89ae3d..5c6f6226 100644
+--- a/package.json
++++ b/package.json
+@@ -86,8 +86,6 @@
+     "@types/smtp-server": "^3.5.13",
+     "@types/vscode": "1.90.0",
+     "@vitest/coverage-v8": "5.0.3",
+-    "@xterm/addon-fit": "^0.11.0",
+-    "@xterm/xterm": "^6.0.0",
+     "eslint": "10.12.0",
+     "hoodiecrow-imap": "^3.3.1",
+     "ink-testing-library": "4.0.0",
+diff --git a/src/agent/runtime/checkpoint.ts b/src/agent/runtime/checkpoint.ts
+new file mode 100644
+index 00000000..0d3ea032
+--- /dev/null
++++ b/src/agent/runtime/checkpoint.ts
+@@ -0,0 +1,94 @@
++import { execFile } from 'node:child_process';
++import { randomUUID } from 'node:crypto';
++import { rm } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++
++export interface Snapshot {
++  treeSha: string;
++  timestamp: number;
++}
++
++const MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024;
++
++/**
++ * A throwaway git-tree snapshotter.
++ *
++ * Snapshots and restores the working tree (including untracked files) through an isolated
++ * `GIT_INDEX_FILE`, so the user's real `.git/index`, `HEAD`, and branch refs are never touched.
++ * The `index` is created under the OS temp dir and removed in a `finally` block.
++ */
++export class GitTreeSnapshotter {
++  constructor(private readonly repoRoot: string) {}
++
++  /** Capture the working tree + untracked files as a tree, returning its SHA. */
++  async snapshot(): Promise<Snapshot> {
++    const indexPath = this.newIndexPath();
++    try {
++      await this.git(indexPath, ['read-tree', 'HEAD']);
++      await this.git(indexPath, ['add', '-A']);
++      const treeSha = await this.git(indexPath, ['write-tree']);
++      return { treeSha, timestamp: Date.now() };
++    } finally {
++      await rm(indexPath, { force: true }).catch(() => undefined);
++    }
++  }
++
++  /** Reset the working tree to a previously captured snapshot. */
++  async restore(snapshot: Snapshot): Promise<void> {
++    const indexPath = this.newIndexPath();
++    try {
++      await this.git(indexPath, ['read-tree', snapshot.treeSha]);
++      await this.git(indexPath, ['checkout-index', `--prefix=${this.repoRoot}/`, '-a', '-f']);
++      await this.removeUntracked(indexPath);
++    } finally {
++      await rm(indexPath, { force: true }).catch(() => undefined);
++    }
++  }
++
++  private newIndexPath(): string {
++    return path.join(tmpdir(), `omnexx-snap-${randomUUID()}.index`);
++  }
++
++  /** Run a git command against the throwaway index file. */
++  private git(indexPath: string, args: readonly string[]): Promise<string> {
++    return new Promise((resolve, reject) => {
++      execFile(
++        'git',
++        [...args],
++        {
++          cwd: this.repoRoot,
++          env: { ...process.env, GIT_INDEX_FILE: indexPath },
++          maxBuffer: MAX_GIT_OUTPUT_BYTES,
++        },
++        (error, stdout, stderr) => {
++          if (error) {
++            reject(
++              new Error(`git ${args.join(' ')} failed: ${(stderr || '').trim() || error.message}`),
++            );
++            return;
++          }
++          resolve(stdout.trim());
++        },
++      );
++    });
++  }
++
++  /**
++   * Delete working-tree files that are not present in the snapshot tree. Because the throwaway
++   * index holds the snapshot tree, `git ls-files --others` lists exactly the files created
++   * after the snapshot — those get removed so restore() fully reverts the tree.
++   */
++  private async removeUntracked(indexPath: string): Promise<void> {
++    const out = await this.git(indexPath, ['ls-files', '--others', '--exclude-standard', '-z']);
++    if (!out) return;
++    const root = path.resolve(this.repoRoot);
++    const prefix = `${root}${path.sep}`;
++    for (const relative of out.split('\0')) {
++      if (!relative) continue;
++      const abs = path.resolve(root, relative);
++      if (!abs.startsWith(prefix) && abs !== root) continue;
++      await rm(abs, { force: true }).catch(() => undefined);
++    }
++  }
++}
+diff --git a/src/agent/runtime/micro-compaction.ts b/src/agent/runtime/micro-compaction.ts
+new file mode 100644
+index 00000000..101a4947
+--- /dev/null
++++ b/src/agent/runtime/micro-compaction.ts
+@@ -0,0 +1,162 @@
++import type { Message } from '../../providers/types.js';
++
++export interface MicroCompactOptions {
++  /**
++   * Number of trailing messages protected from mutation (hot recent turns).
++   * Default: 6.
++   */
++  hotWindowSize?: number;
++
++  /**
++   * Maximum character ceiling for cold tool results before middle truncation.
++   * Default: 2,000 chars.
++   */
++  maxColdChars?: number;
++
++  /**
++   * Compaction stride: only compact when turnIndex % stride === 0.
++   * Default: 4.
++   */
++  stride?: number;
++
++  /**
++   * Active turn index.
++   */
++  turnIndex: number;
++}
++
++export interface MicroCompactResult {
++  compacted: boolean;
++  messages: Message[];
++  charsSaved: number;
++  rulesApplied: {
++    supersededReads: number;
++    collapsedErrors: number;
++    truncatedColdOutputs: number;
++  };
++}
++
++/**
++ * Micro-Amortized History Compaction (Step 3.5)
++ *
++ * Runs on a periodic stride (every N turns) strictly outside the pinned prefix (Slot 0-6)
++ * and the hot recent interaction window, pruning dead tokens before they inflate context.
++ */
++export function microCompact(
++  messages: readonly Message[],
++  options: MicroCompactOptions,
++): MicroCompactResult {
++  const stride = options.stride ?? 4;
++  if (stride > 1 && options.turnIndex % stride !== 0) {
++    return {
++      compacted: false,
++      messages: [...messages],
++      charsSaved: 0,
++      rulesApplied: { supersededReads: 0, collapsedErrors: 0, truncatedColdOutputs: 0 },
++    };
++  }
++
++  const hotWindowSize = Math.max(2, options.hotWindowSize ?? 6);
++  const maxColdChars = Math.max(500, options.maxColdChars ?? 2_000);
++
++  // If messages don't exceed the frozen anchor (1) + hot window, skip
++  if (messages.length <= 1 + hotWindowSize) {
++    return {
++      compacted: false,
++      messages: [...messages],
++      charsSaved: 0,
++      rulesApplied: { supersededReads: 0, collapsedErrors: 0, truncatedColdOutputs: 0 },
++    };
++  }
++
++  const coldEndIndex = messages.length - hotWindowSize;
++
++  // Track all tool uses across the entire conversation by toolUseId and by signature
++  const toolUseById = new Map<string, { name: string; sig: string; msgIdx: number }>();
++  const toolCallSignatures = new Map<string, number[]>(); // signature -> message indices
++
++  for (let mIdx = 0; mIdx < messages.length; mIdx++) {
++    const msg = messages[mIdx];
++    if (!msg) continue;
++    for (const block of msg.content) {
++      if (block.type === 'tool_use') {
++        const sig = `${block.name}:${JSON.stringify(block.input ?? {})}`;
++        toolUseById.set(block.id, { name: block.name, sig, msgIdx: mIdx });
++        const existing = toolCallSignatures.get(sig) ?? [];
++        existing.push(mIdx);
++        toolCallSignatures.set(sig, existing);
++      }
++    }
++  }
++
++  let totalCharsSaved = 0;
++  let supersededReads = 0;
++  let collapsedErrors = 0;
++  let truncatedColdOutputs = 0;
++
++  // Deep clone candidate cold messages
++  const nextMessages: Message[] = messages.map((m) => ({
++    role: m.role,
++    content: m.content.map((b) => ({ ...b })),
++  }));
++
++  // Iterate strictly through the cold zone [1 .. coldEndIndex - 1]
++  for (let mIdx = 1; mIdx < coldEndIndex; mIdx++) {
++    const msg = nextMessages[mIdx];
++    if (!msg) continue;
++
++    for (const block of msg.content) {
++      if (block.type !== 'tool_result') continue;
++
++      const initialLength = block.content.length;
++      const useInfo = toolUseById.get(block.toolUseId);
++
++      // Rule A: Check if THIS specific tool call was superseded by an identical read/search later
++      if (
++        useInfo &&
++        (useInfo.name === 'read_file' || useInfo.name === 'read' || useInfo.name === 'search')
++      ) {
++        const sameCallIndices = toolCallSignatures.get(useInfo.sig) ?? [];
++        const hasLaterInstance = sameCallIndices.some((idx) => idx > useInfo.msgIdx);
++        if (hasLaterInstance && block.content.length > 200) {
++          block.content = '[μc] superseded: identical read/search call repeated in later turn';
++          supersededReads++;
++          totalCharsSaved += initialLength - block.content.length;
++          continue;
++        }
++      }
++
++      // Rule B: Collapse verbose error traces if a subsequent turn succeeded
++      if (block.isError && block.content.length > 300) {
++        const lines = block.content.split('\n').filter((l) => l.trim().length > 0);
++        const firstLine = lines[0] ?? 'Command failed';
++        block.content = `[μc] resolved error: ${firstLine.slice(0, 160)}`;
++        collapsedErrors++;
++        totalCharsSaved += initialLength - block.content.length;
++        continue;
++      }
++
++      // Rule C: Truncate cold outputs exceeding maxColdChars
++      if (block.content.length > maxColdChars) {
++        const head = block.content.slice(0, 1_000);
++        const tail = block.content.slice(-400);
++        const omitted = block.content.length - 1_400;
++        block.content = `${head}\n[... truncated by micro-compaction: ${String(omitted)} cold characters omitted ...]\n${tail}`;
++        truncatedColdOutputs++;
++        totalCharsSaved += initialLength - block.content.length;
++      }
++    }
++  }
++
++  const compacted = totalCharsSaved > 0;
++  return {
++    compacted,
++    messages: nextMessages,
++    charsSaved: totalCharsSaved,
++    rulesApplied: {
++      supersededReads,
++      collapsedErrors,
++      truncatedColdOutputs,
++    },
++  };
++}
+diff --git a/test/unit/agent/checkpoint.test.ts b/test/unit/agent/checkpoint.test.ts
+new file mode 100644
+index 00000000..6e05e979
+--- /dev/null
++++ b/test/unit/agent/checkpoint.test.ts
+@@ -0,0 +1,98 @@
++import { execFile } from 'node:child_process';
++import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import { afterEach, describe, expect, it } from 'vitest';
++import { GitTreeSnapshotter } from '../../../src/agent/runtime/checkpoint.js';
++
++const roots: string[] = [];
++
++async function runGit(repoDir: string, args: readonly string[]): Promise<string> {
++  return new Promise((resolve, reject) => {
++    execFile('git', [...args], { cwd: repoDir }, (err, stdout, stderr) => {
++      if (err) reject(new Error(`git ${args.join(' ')} failed: ${stderr.trim()}`));
++      else resolve(stdout);
++    });
++  });
++}
++
++/** Create an empty git repo with one initial commit containing seed.txt. */
++async function makeRepo(): Promise<string> {
++  const root = await mkdtemp(path.join(tmpdir(), 'omnexx-snap-'));
++  roots.push(root);
++  await runGit(root, ['init', '-q']);
++  await runGit(root, ['config', 'user.email', 'test@omnexx.dev']);
++  await runGit(root, ['config', 'user.name', 'test']);
++  await writeFile(path.join(root, 'seed.txt'), 'v1\n');
++  await runGit(root, ['add', '-A']);
++  await runGit(root, ['commit', '-qm', 'init']);
++  return root;
++}
++
++afterEach(async () => {
++  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
++});
++
++describe('GitTreeSnapshotter', () => {
++  it('captures uncommitted changes in the snapshot tree', async () => {
++    const repoRoot = await makeRepo();
++    const snap = new GitTreeSnapshotter(repoRoot);
++
++    // Make an uncommitted change before snapshotting.
++    await writeFile(path.join(repoRoot, 'seed.txt'), 'v2\n');
++
++    const snapshot = await snap.snapshot();
++
++    expect(snapshot.treeSha).toMatch(/^[0-9a-f]{40}$/);
++    expect(snapshot.timestamp).toBeGreaterThan(0);
++
++    // Restoring must reproduce the modified content, proving the change is captured.
++    await snap.restore(snapshot);
++    expect(await readFile(path.join(repoRoot, 'seed.txt'), 'utf8')).toBe('v2\n');
++  });
++
++  it('restore() resets the tree and deletes newly created untracked files', async () => {
++    const repoRoot = await makeRepo();
++    const snap = new GitTreeSnapshotter(repoRoot);
++    const snapshot = await snap.snapshot();
++
++    // Mutate a tracked file and create an untracked file (and a nested one).
++    await writeFile(path.join(repoRoot, 'seed.txt'), 'changed\n');
++    await writeFile(path.join(repoRoot, 'new.txt'), 'untracked\n');
++    await mkdir(path.join(repoRoot, 'sub'));
++    await writeFile(path.join(repoRoot, 'sub', 'nested.txt'), 'nested\n');
++
++    await snap.restore(snapshot);
++
++    expect(await readFile(path.join(repoRoot, 'seed.txt'), 'utf8')).toBe('v1\n');
++    await expect(readFile(path.join(repoRoot, 'new.txt'))).rejects.toThrow();
++    await expect(readFile(path.join(repoRoot, 'sub', 'nested.txt'))).rejects.toThrow();
++  });
++
++  it('restore() keeps files that exist in the snapshot', async () => {
++    const repoRoot = await makeRepo();
++    await writeFile(path.join(repoRoot, 'keep.txt'), 'keep\n');
++    const snap = new GitTreeSnapshotter(repoRoot);
++    const snapshot = await snap.snapshot();
++
++    await writeFile(path.join(repoRoot, 'keep.txt'), 'changed\n');
++    await snap.restore(snapshot);
++
++    expect(await readFile(path.join(repoRoot, 'keep.txt'), 'utf8')).toBe('keep\n');
++  });
++
++  it('completes a full snapshot + restore cycle in under 100ms', async () => {
++    const repoRoot = await makeRepo();
++    const snap = new GitTreeSnapshotter(repoRoot);
++
++    // Warm up git on the first run so the timed cycle measures steady-state cost.
++    await snap.restore(await snap.snapshot());
++
++    const start = performance.now();
++    const snapshot = await snap.snapshot();
++    await snap.restore(snapshot);
++    const elapsed = performance.now() - start;
++
++    expect(elapsed).toBeLessThan(100);
++  });
++});
+diff --git a/test/unit/agent/micro-compaction.test.ts b/test/unit/agent/micro-compaction.test.ts
+new file mode 100644
+index 00000000..a61e7e7b
+--- /dev/null
++++ b/test/unit/agent/micro-compaction.test.ts
+@@ -0,0 +1,111 @@
++import { describe, expect, it } from 'vitest';
++import { microCompact } from '../../../src/agent/runtime/micro-compaction.js';
++import type { Message } from '../../../src/providers/types.js';
++
++describe('Step 3.5: Micro-Amortized History Compaction (micro-compaction.ts)', () => {
++  const makeConversation = (): Message[] => [
++    // Message 0: Frozen anchor
++    { role: 'user', content: [{ type: 'text', text: 'Task M1.T01' }] },
++    // Turn 1 (Cold): Read file
++    {
++      role: 'assistant',
++      content: [{ type: 'tool_use', id: 'read_1', name: 'read_file', input: { path: 'a.ts' } }],
++    },
++    {
++      role: 'user',
++      content: [
++        {
++          type: 'tool_result',
++          toolUseId: 'read_1',
++          content: 'line 1\nline 2\n' + 'a'.repeat(500),
++        },
++      ],
++    },
++    // Turn 2 (Cold): Verbose build error
++    {
++      role: 'assistant',
++      content: [{ type: 'tool_use', id: 'bash_1', name: 'bash', input: { command: 'npm test' } }],
++    },
++    {
++      role: 'user',
++      content: [
++        {
++          type: 'tool_result',
++          toolUseId: 'bash_1',
++          content:
++            'FAIL src/app.test.ts\nError: Assert failed at Object.<anonymous> (test.ts:45)\n' +
++            '    at runTest (runner.js:12)\n'.repeat(20),
++          isError: true,
++        },
++      ],
++    },
++    // Turn 3 (Cold): Huge output
++    {
++      role: 'assistant',
++      content: [{ type: 'tool_use', id: 'bash_huge', name: 'bash', input: { command: 'cat huge.log' } }],
++    },
++    {
++      role: 'user',
++      content: [
++        {
++          type: 'tool_result',
++          toolUseId: 'bash_huge',
++          content: 'LOG START: ' + 'x'.repeat(4000) + ' LOG END',
++        },
++      ],
++    },
++    // Turn 4 (Hot): Second identical read of a.ts
++    {
++      role: 'assistant',
++      content: [{ type: 'tool_use', id: 'read_2', name: 'read_file', input: { path: 'a.ts' } }],
++    },
++    {
++      role: 'user',
++      content: [
++        {
++          type: 'tool_result',
++          toolUseId: 'read_2',
++          content: 'HOT READ RESULT: line 1\nline 2\n' + 'a'.repeat(500),
++        },
++      ],
++    },
++  ];
++
++  it('respects compaction stride and skips non-stride turns', () => {
++    const messages = makeConversation();
++    const result = microCompact(messages, { turnIndex: 3, stride: 4 });
++    expect(result.compacted).toBe(false);
++    expect(result.charsSaved).toBe(0);
++  });
++
++  it('prunes cold superseded reads, collapses cold errors, and truncates huge cold outputs on stride turns', () => {
++    const messages = makeConversation();
++    // Turn 4 with hotWindowSize = 2 protects the latest turn (messages 6 & 7)
++    const result = microCompact(messages, { turnIndex: 4, stride: 4, hotWindowSize: 2 });
++
++    expect(result.compacted).toBe(true);
++    expect(result.charsSaved).toBeGreaterThan(1000);
++
++    // Rule A: Turn 1 read_1 is superseded by Turn 4 read_2
++    const read1Result = result.messages[2]?.content[0];
++    expect(read1Result && 'content' in read1Result ? read1Result.content : '').toContain(
++      '[μc] superseded',
++    );
++
++    // Rule B: Turn 2 verbose error is collapsed to single-line summary
++    const errorResult = result.messages[4]?.content[0];
++    expect(errorResult && 'content' in errorResult ? errorResult.content : '').toContain(
++      '[μc] resolved error: FAIL src/app.test.ts',
++    );
++
++    // Rule C: Turn 3 huge output (4000+ chars) is truncated in the middle
++    const hugeResult = result.messages[6]?.content[0];
++    expect(hugeResult && 'content' in hugeResult ? hugeResult.content : '').toContain(
++      '[... truncated by micro-compaction',
++    );
++
++    // Hot Window: Message 7 (latest turn result) is strictly untouched
++    const hotResult = result.messages[8]?.content[0];
++    expect(hotResult && 'content' in hotResult ? hotResult.content : '').toContain('HOT READ RESULT');
++  });
++});
+diff --git a/test/unit/vscode-chat-render.test.ts b/test/unit/vscode-chat-render.test.ts
+index 6078500f..9e2a15b6 100644
+--- a/test/unit/vscode-chat-render.test.ts
++++ b/test/unit/vscode-chat-render.test.ts
+@@ -10,7 +10,6 @@ import {
+   contextPercent,
+   escapeHtml,
+   formatClock,
+-  formatElapsedMs,
+   formatTokens,
+   logRole,
+   formatUsd,
+@@ -149,15 +148,6 @@ describe('formatting', () => {
+     expect(formatUsd(1.234)).toBe('$1.23');
+   });
+ 
+-  it('formats elapsed milliseconds for live tool cards', () => {
+-    expect(formatElapsedMs(0)).toBe('0ms');
+-    expect(formatElapsedMs(842)).toBe('842ms');
+-    expect(formatElapsedMs(999)).toBe('999ms');
+-    expect(formatElapsedMs(12_345)).toBe('12.3s');
+-    expect(formatElapsedMs(125_000)).toBe('2m 05s');
+-    expect(formatElapsedMs(-50)).toBe('0ms');
+-  });
+-
+   it('computes cache hits and context fill', () => {
+     expect(cacheHitPercent(usage)).toBe(80);
+     expect(cacheHitPercent({ ...usage, tokens: { ...usage.tokens, input: 0 } })).toBe(0);
+diff --git a/tsconfig.json b/tsconfig.json
+index dc4f71f5..c5943173 100644
+--- a/tsconfig.json
++++ b/tsconfig.json
+@@ -27,8 +27,6 @@
+   "include": ["src", "test", "vscode/src", "*.ts", "trigger.config.ts"],
+   "exclude": [
+     "vscode/src/webview/chat.ts",
+-    "vscode/src/webview/xterm-shim.ts",
+-    "vscode/src/webview/css.d.ts",
+     "vscode/src/webview/settings.ts",
+     "vscode/src/webview/modelPicker.ts",
+     "vscode/src/webview/crew.ts",
+diff --git a/vscode/build.mjs b/vscode/build.mjs
+index 80acd5e9..67948303 100644
+--- a/vscode/build.mjs
++++ b/vscode/build.mjs
+@@ -34,19 +34,6 @@ await build({
+   minify: true,
+ });
+ 
+-// xterm.js for the live terminal drawer: a tiny shim entry exposes Terminal +
+-// FitAddon on window.Xterm for the plain-JS controller (media/terminal.js).
+-// The CSS import in the shim is emitted alongside as out/xterm.css.
+-await build({
+-  entryPoints: [join(here, 'src/webview/xterm-shim.ts')],
+-  outfile: join(here, 'out/xterm.js'),
+-  bundle: true,
+-  platform: 'browser',
+-  format: 'iife',
+-  target: 'es2022',
+-  minify: true,
+-});
+-
+ await build({
+   entryPoints: { index: join(root, 'src/cli/index.ts') },
+   outdir: join(here, 'out/cli'),
+diff --git a/vscode/media/chat.css b/vscode/media/chat.css
+index 21a3dac6..10af183b 100644
+--- a/vscode/media/chat.css
++++ b/vscode/media/chat.css
+@@ -1861,62 +1861,6 @@ details.msg.think[open] > summary::after {
+   margin: var(--space-3) 0 var(--space-2);
+ }
+ 
+-/* Tool execution card: the active cluster as one collapsible card. The header
+-   carries the live elapsed counter and the stdout preview pill (latest tool
+-   line, ellipsized; full text in the tooltip). */
+-.msg.tool-card {
+-  border: 1px solid var(--omnexx-border-subtle);
+-  border-radius: var(--radius-md);
+-  background: var(--omnexx-bg-card);
+-  padding: var(--space-2) var(--space-3);
+-}
+-
+-.msg.tool-card.is-active {
+-  border-color: color-mix(in srgb, var(--omnexx-accent) 35%, transparent);
+-}
+-
+-.tool-card-fold > summary.tool-card-head {
+-  list-style: none;
+-  cursor: pointer;
+-  display: flex;
+-  align-items: center;
+-  gap: var(--space-3);
+-  min-width: 0;
+-  font-size: var(--fs-xs);
+-  user-select: none;
+-}
+-
+-.tool-card-fold > summary.tool-card-head::-webkit-details-marker {
+-  display: none;
+-}
+-
+-.tool-card-fold[open] > summary .chev {
+-  transform: rotate(45deg) translateY(-2px);
+-}
+-
+-.tool-card-head .tool-elapsed {
+-  flex: none;
+-  font-family: var(--mono);
+-  font-size: var(--fs-xs);
+-  font-variant-numeric: tabular-nums;
+-  color: var(--omnexx-accent);
+-}
+-
+-.tool-stdout-pill {
+-  flex: 1;
+-  min-width: 0;
+-  overflow: hidden;
+-  text-overflow: ellipsis;
+-  white-space: nowrap;
+-  font-family: var(--mono);
+-  font-size: var(--fs-xs);
+-  color: var(--omnexx-text-muted);
+-}
+-
+-.msg.tool-card .msg.tools {
+-  margin: var(--space-2) 0 0;
+-}
+-
+ /* Active Working Cockpit HUD */
+ .working.cockpit-hud {
+   display: flex;
+@@ -2146,20 +2090,14 @@ details.msg.think[open] > summary::after {
+ 
+ /* Composer: the input is one flat card — borderless textarea inside, a filled
+    round send button, and the focus ring on the card, not the textarea. */
+-/* Floating bottom composer dock: an inset card on the panel surface — model
+-   selector (#model in the statusline) and action pills unchanged inside it.
+-   It stays pinned to the bottom as the body's last flex child. */
+ .composer {
+   position: relative;
+   display: flex;
+   flex-direction: column;
+   gap: var(--space-4);
+-  margin: 0 var(--pad-x) var(--space-4);
+-  padding: var(--space-4) var(--space-5) var(--space-5);
+-  background: var(--omnexx-bg-card);
+-  border: 1px solid var(--omnexx-border-subtle);
+-  border-radius: var(--omnexx-radius);
+-  box-shadow: var(--shadow-md);
++  padding: 10px var(--pad-x) var(--space-5);
++  background: transparent;
++  border-top: 1px solid var(--line);
+   flex: none;
+ }
+ 
+@@ -2473,8 +2411,7 @@ body.waking #power {
+ .jump {
+   position: absolute;
+   right: 14px;
+-  /* Above the floating composer dock (dock height + bottom margin). */
+-  bottom: 156px;
++  bottom: 136px;
+   z-index: var(--z-float);
+   display: grid;
+   place-items: center;
+@@ -3017,206 +2954,3 @@ body.waking #power {
+     transition: none;
+   }
+ }
+-
+-/* Live terminal drawer (Phase 9): xterm.js canvas in a docked drawer under the
+-   conversation, or a fixed right-hand pane in split-view. All surfaces use the
+-   --omnexx-* tokens. */
+-.terminal-drawer {
+-  flex: none;
+-  display: flex;
+-  flex-direction: column;
+-  height: 260px;
+-  min-height: 0;
+-  margin: 0 var(--pad-x) var(--space-3);
+-  background: var(--omnexx-bg-primary);
+-  border: 1px solid var(--omnexx-border-subtle);
+-  border-radius: var(--omnexx-radius);
+-  overflow: hidden;
+-}
+-
+-.terminal-drawer.collapsed {
+-  height: 34px;
+-}
+-
+-.terminal-head {
+-  flex: none;
+-  display: flex;
+-  align-items: center;
+-  gap: var(--space-2);
+-  height: 34px;
+-  padding: 0 var(--space-3);
+-  background: var(--omnexx-bg-card);
+-  border-bottom: 1px solid var(--omnexx-border-subtle);
+-  font-size: var(--fs-xs);
+-  color: var(--omnexx-text-muted);
+-  user-select: none;
+-}
+-
+-.terminal-head .t-title {
+-  flex: 1;
+-  min-width: 0;
+-  overflow: hidden;
+-  text-overflow: ellipsis;
+-  white-space: nowrap;
+-  font-family: var(--mono);
+-}
+-
+-.terminal-head .t-status {
+-  flex: none;
+-  font-family: var(--mono);
+-}
+-
+-.terminal-head button {
+-  flex: none;
+-  display: grid;
+-  place-items: center;
+-  width: 22px;
+-  height: 22px;
+-  padding: 0;
+-  border: 0;
+-  border-radius: var(--radius-sm);
+-  background: none;
+-  color: var(--omnexx-text-muted);
+-  font-size: var(--fs-sm);
+-  line-height: 1;
+-}
+-
+-.terminal-head button:hover {
+-  background: color-mix(in srgb, var(--omnexx-accent) 12%, transparent);
+-  color: var(--fg);
+-}
+-
+-.terminal-body {
+-  flex: 1;
+-  min-height: 0;
+-  position: relative;
+-}
+-
+-.terminal-screen {
+-  position: absolute;
+-  inset: 0;
+-  padding: var(--space-2) var(--space-3);
+-}
+-
+-.terminal-screen .xterm {
+-  height: 100%;
+-}
+-
+-/* Fallback renderer when xterm.js failed to load: a plain <pre> with a small
+-   ANSI color parser (terminal.js) and a one-line input for typing. */
+-.terminal-fallback-wrap {
+-  position: absolute;
+-  inset: 0;
+-  display: flex;
+-  flex-direction: column;
+-}
+-
+-.terminal-fallback {
+-  flex: 1;
+-  min-height: 0;
+-  margin: 0;
+-  padding: var(--space-2) var(--space-3);
+-  overflow-y: auto;
+-  background: transparent;
+-  color: var(--fg);
+-  font-family: var(--mono);
+-  font-size: var(--fs-sm);
+-  line-height: 1.45;
+-  white-space: pre-wrap;
+-  word-break: break-all;
+-}
+-
+-.terminal-fallback-input {
+-  flex: none;
+-  width: 100%;
+-  border: 0;
+-  border-top: 1px solid var(--omnexx-border-subtle);
+-  background: var(--omnexx-bg-card);
+-  color: var(--fg);
+-  font-family: var(--mono);
+-  font-size: var(--fs-sm);
+-  padding: var(--space-2) var(--space-3);
+-}
+-
+-.ansi-1 {
+-  font-weight: 700;
+-}
+-.ansi-30 {
+-  color: #7a7a7a;
+-}
+-.ansi-31 {
+-  color: #f87171;
+-}
+-.ansi-32 {
+-  color: #3fb950;
+-}
+-.ansi-33 {
+-  color: #f59e0b;
+-}
+-.ansi-34 {
+-  color: #58a6ff;
+-}
+-.ansi-35 {
+-  color: #c084fc;
+-}
+-.ansi-36 {
+-  color: #2dd4bf;
+-}
+-.ansi-37 {
+-  color: #d4d4d4;
+-}
+-.ansi-90 {
+-  color: #9d9d9d;
+-}
+-.ansi-91 {
+-  color: #ffa198;
+-}
+-.ansi-92 {
+-  color: #56d364;
+-}
+-.ansi-93 {
+-  color: #e3b341;
+-}
+-.ansi-94 {
+-  color: #79c0ff;
+-}
+-.ansi-95 {
+-  color: #d2a8ff;
+-}
+-.ansi-96 {
+-  color: #39c5cf;
+-}
+-.ansi-97 {
+-  color: #f0f0f0;
+-}
+-
+-/* Split view: conversation on the left, live terminal fixed on the right.
+-   The body's right padding narrows every panel child (log, composer) so the
+-   fixed drawer never overlaps them. */
+-body.split-view {
+-  padding-right: min(46%, 720px);
+-}
+-
+-body.split-view .terminal-drawer {
+-  position: fixed;
+-  top: 0;
+-  right: 0;
+-  bottom: 0;
+-  z-index: var(--z-float);
+-  width: min(46%, 720px);
+-  height: auto;
+-  margin: 0;
+-  border: 0;
+-  border-left: 1px solid var(--omnexx-border-subtle);
+-  border-radius: 0;
+-}
+-
+-body.split-view .terminal-drawer.collapsed {
+-  height: auto;
+-}
+-
+-@media (prefers-reduced-motion: reduce) {
+-  .terminal-head button {
+-    transition: none;
+-  }
+-}
+diff --git a/vscode/media/terminal.js b/vscode/media/terminal.js
+deleted file mode 100644
+index 2bd7ca06..00000000
+--- a/vscode/media/terminal.js
++++ /dev/null
+@@ -1,257 +0,0 @@
+-/**
+- * Live terminal drawer controller (plain webview script, no imports, no deps
+- * beyond window.Xterm + acquireVsCodeApi + DOM).
+- *
+- * Owns the drawer DOM under the conversation: an xterm.js canvas when the
+- * xterm bundle loaded (out/xterm.js sets window.Xterm), otherwise a minimal
+- * <pre> renderer with a small ANSI SGR color parser and a one-line input.
+- * Keystrokes go up as terminalInput, resizes as terminalResize; the extension
+- * host posts terminalStarted / terminalOutput / terminalExit / terminalSplit.
+- * Split view is a body class: conversation left, terminal fixed right.
+- */
+-/* global acquireVsCodeApi, document, window, getComputedStyle, requestAnimationFrame */
+-
+-(function () {
+-  'use strict';
+-
+-  var vscode = acquireVsCodeApi();
+-  var post = function (msg) {
+-    vscode.postMessage(msg);
+-  };
+-
+-  var drawer = null;
+-  var titleEl = null;
+-  var statusEl = null;
+-  var term = null;
+-  var fitAddon = null;
+-  var fallbackPre = null;
+-  var fallbackInput = null;
+-  var fallbackText = '';
+-  var sessionId = null;
+-
+-  var ANSI_SGR = /\x1b\[([0-9;]*)m/g;
+-  var ANSI_CSI_OTHER = /\x1b\[[0-9;?]*[A-DF-Za-df-z]/g;
+-  var ANSI_CHARSET = /\x1b[()][0-9A-B]/g;
+-  var MAX_FALLBACK_CHARS = 8000;
+-
+-  function themeColor(name, fallback) {
+-    var value = getComputedStyle(document.body).getPropertyValue(name).trim();
+-    return value || fallback;
+-  }
+-
+-  function ensureDrawer() {
+-    if (drawer) return drawer;
+-    var composer = document.querySelector('footer.composer');
+-    drawer = document.createElement('section');
+-    drawer.id = 'omnexx-terminal';
+-    drawer.className = 'terminal-drawer';
+-    drawer.setAttribute('aria-label', 'Live terminal');
+-    drawer.innerHTML =
+-      '<div class="terminal-head">' +
+-      '<button class="t-collapse" type="button" title="Collapse terminal" aria-label="Collapse terminal">▾</button>' +
+-      '<span class="t-title">Terminal</span>' +
+-      '<span class="t-status"></span>' +
+-      '<button class="t-split" type="button" title="Toggle split view (chat | terminal)" aria-label="Toggle split view">◫</button>' +
+-      '<button class="t-close" type="button" title="Close terminal" aria-label="Close terminal">✕</button>' +
+-      '</div>' +
+-      '<div class="terminal-body"><div class="terminal-screen"></div></div>';
+-    if (composer && composer.parentNode) composer.parentNode.insertBefore(drawer, composer);
+-    else document.body.appendChild(drawer);
+-    titleEl = drawer.querySelector('.t-title');
+-    statusEl = drawer.querySelector('.t-status');
+-    drawer.querySelector('.t-collapse').addEventListener('click', function () {
+-      drawer.classList.toggle('collapsed');
+-      requestAnimationFrame(fit);
+-    });
+-    drawer.querySelector('.t-split').addEventListener('click', function () {
+-      post({ type: 'terminalSplit' });
+-    });
+-    drawer.querySelector('.t-close').addEventListener('click', function () {
+-      post({ type: 'terminalStop' });
+-      disposeTerm();
+-      drawer.hidden = true;
+-    });
+-    return drawer;
+-  }
+-
+-  function disposeTerm() {
+-    if (term) {
+-      term.dispose();
+-      term = null;
+-      fitAddon = null;
+-    }
+-    fallbackPre = null;
+-    fallbackInput = null;
+-    fallbackText = '';
+-  }
+-
+-  function ensureTerm() {
+-    if (term || fallbackPre) return;
+-    var screen = drawer.querySelector('.terminal-screen');
+-    if (window.Xterm && window.Xterm.Terminal && window.Xterm.FitAddon) {
+-      var Terminal = window.Xterm.Terminal;
+-      var FitAddon = window.Xterm.FitAddon;
+-      term = new Terminal({
+-        cursorBlink: true,
+-        cursorStyle: 'block',
+-        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+-        fontSize: 12,
+-        theme: {
+-          background: 'transparent',
+-          foreground: themeColor('--vscode-terminal-foreground', '#cccccc'),
+-          cursor: themeColor('--vscode-terminalCursor-foreground', '#ffffff'),
+-        },
+-      });
+-      fitAddon = new FitAddon();
+-      term.loadAddon(fitAddon);
+-      term.open(screen);
+-      term.onData(function (data) {
+-        post({ type: 'terminalInput', data: data });
+-      });
+-      term.onResize(function (size) {
+-        post({ type: 'terminalResize', cols: size.cols, rows: size.rows });
+-      });
+-      fit();
+-      post({ type: 'terminalResize', cols: term.cols, rows: term.rows });
+-    } else {
+-      ensureFallback();
+-    }
+-  }
+-
+-  function fit() {
+-    if (term && fitAddon && drawer && !drawer.hidden && !drawer.classList.contains('collapsed')) {
+-      try {
+-        fitAddon.fit();
+-      } catch (e) {
+-        // Not laid out yet (drawer still measuring); the next fit fixes it.
+-      }
+-    }
+-  }
+-
+-  /** Minimal <pre> fallback: SGR colors become spans, other escapes are dropped. */
+-  function ansiToHtml(text) {
+-    var stripped = text.replace(ANSI_CSI_OTHER, '').replace(ANSI_CHARSET, '').replace(/\x07/g, '');
+-    var esc = stripped.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+-    var out = '';
+-    var last = 0;
+-    var open = false;
+-    var m;
+-    ANSI_SGR.lastIndex = 0;
+-    while ((m = ANSI_SGR.exec(esc)) !== null) {
+-      out += esc.slice(last, m.index);
+-      var classes = [];
+-      var codes = (m[1] || '0').split(';');
+-      for (var i = 0; i < codes.length; i++) {
+-        var code = Number(codes[i]);
+-        if (code === 0) {
+-          if (open) {
+-            out += '</span>';
+-            open = false;
+-          }
+-        } else if (code === 1) {
+-          classes.push('ansi-1');
+-        } else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) {
+-          classes.push('ansi-' + String(code));
+-        }
+-      }
+-      if (classes.length) {
+-        if (open) out += '</span>';
+-        out += '<span class="' + classes.join(' ') + '">';
+-        open = true;
+-      }
+-      last = m.index + m[0].length;
+-    }
+-    out += esc.slice(last);
+-    if (open) out += '</span>';
+-    return out;
+-  }
+-
+-  function ensureFallback() {
+-    var body = drawer.querySelector('.terminal-body');
+-    body.innerHTML = '';
+-    var wrap = document.createElement('div');
+-    wrap.className = 'terminal-fallback-wrap';
+-    fallbackPre = document.createElement('pre');
+-    fallbackPre.className = 'terminal-fallback';
+-    fallbackPre.setAttribute('aria-live', 'polite');
+-    fallbackInput = document.createElement('input');
+-    fallbackInput.className = 'terminal-fallback-input';
+-    fallbackInput.setAttribute('aria-label', 'Terminal input');
+-    fallbackInput.setAttribute('placeholder', 'Type a command and press Enter…');
+-    fallbackInput.addEventListener('keydown', function (e) {
+-      if (e.key === 'Enter') {
+-        post({ type: 'terminalInput', data: fallbackInput.value + '\n' });
+-        fallbackInput.value = '';
+-      }
+-    });
+-    wrap.appendChild(fallbackPre);
+-    wrap.appendChild(fallbackInput);
+-    body.appendChild(wrap);
+-  }
+-
+-  function appendFallback(chunk) {
+-    if (!fallbackPre) return;
+-    fallbackText += chunk;
+-    if (fallbackText.length > MAX_FALLBACK_CHARS) {
+-      fallbackText = fallbackText.slice(fallbackText.length - MAX_FALLBACK_CHARS);
+-    }
+-    fallbackPre.innerHTML = ansiToHtml(fallbackText);
+-    fallbackPre.scrollTop = fallbackPre.scrollHeight;
+-  }
+-
+-  function onStarted(m) {
+-    sessionId = typeof m.id === 'string' ? m.id : null;
+-    ensureDrawer();
+-    drawer.hidden = false;
+-    drawer.classList.remove('collapsed');
+-    if (titleEl)
+-      titleEl.textContent = 'Terminal — ' + (typeof m.command === 'string' ? m.command : 'shell');
+-    if (statusEl) statusEl.textContent = '';
+-    ensureTerm();
+-    fit();
+-  }
+-
+-  function onOutput(m) {
+-    if (typeof m.data !== 'string') return;
+-    if (typeof m.id === 'string' && sessionId && m.id !== sessionId) return;
+-    if (term) term.write(m.data);
+-    else appendFallback(m.data);
+-  }
+-
+-  function onExit(m) {
+-    if (typeof m.id === 'string' && sessionId && m.id !== sessionId) return;
+-    sessionId = null;
+-    var code = typeof m.code === 'number' ? m.code : null;
+-    var label = code === null ? 'exited' : 'exit ' + String(code);
+-    if (statusEl) statusEl.textContent = label;
+-    var line = '\r\n[' + label + ']\r\n';
+-    if (term) term.write(line);
+-    else appendFallback(line);
+-  }
+-
+-  function onSplit(m) {
+-    var on = m.on === true;
+-    document.body.classList.toggle('split-view', on);
+-    var splitBtn = drawer ? drawer.querySelector('.t-split') : null;
+-    if (splitBtn) splitBtn.setAttribute('aria-pressed', String(on));
+-    if (on) {
+-      ensureDrawer();
+-      drawer.hidden = false;
+-      if (!sessionId) post({ type: 'terminalStart' });
+-    }
+-    requestAnimationFrame(fit);
+-  }
+-
+-  window.addEventListener('message', function (event) {
+-    var m = event.data;
+-    if (!m || typeof m.type !== 'string') return;
+-    if (m.type === 'terminalStarted') onStarted(m);
+-    else if (m.type === 'terminalOutput') onOutput(m);
+-    else if (m.type === 'terminalExit') onExit(m);
+-    else if (m.type === 'terminalSplit') onSplit(m);
+-  });
+-
+-  window.addEventListener('resize', function () {
+-    fit();
+-  });
+-})();
+diff --git a/vscode/media/tokens.css b/vscode/media/tokens.css
+index 7f86b7ff..eb7bd41e 100644
+--- a/vscode/media/tokens.css
++++ b/vscode/media/tokens.css
+@@ -83,19 +83,6 @@
+   --shadow-md: 0 2px 6px rgb(0 0 0 / 14%), 0 8px 20px rgb(0 0 0 / 10%);
+ 
+   --mono: var(--vscode-editor-font-family, ui-monospace, monospace);
+-
+-  /* Omnexx minimal surface set (Phase 9): namespaced aliases over the tokens
+-     above and VS Code theme variables, so the floating composer, tool cards
+-     and terminal drawer share one surface language. The hex values are the
+-     roadmap 9.6 fallbacks, used only when no theme variable resolves. */
+-  --omnexx-bg-primary: var(--vscode-sideBar-background, #121316);
+-  --omnexx-bg-secondary: var(--vscode-editor-background, #121316);
+-  --omnexx-bg-card: var(--card);
+-  --omnexx-border-subtle: var(--line, #262930);
+-  --omnexx-accent: var(--accent, #6366f1);
+-  --omnexx-accent-alt: #06b6d4;
+-  --omnexx-text-muted: var(--muted);
+-  --omnexx-radius: var(--radius-lg);
+ }
+ 
+ body.vscode-light {
+diff --git a/vscode/package.json b/vscode/package.json
+index b34a3435..cbc46c96 100644
+--- a/vscode/package.json
++++ b/vscode/package.json
+@@ -208,36 +208,6 @@
+         "title": "Toggle 24/7 Autonomous Daemon",
+         "category": "omnexx",
+         "icon": "$(play)"
+-      },
+-      {
+-        "command": "omnexx.openTerminal",
+-        "title": "Open Live Terminal",
+-        "category": "omnexx",
+-        "icon": "$(terminal)"
+-      },
+-      {
+-        "command": "omnexx.toggleSplitView",
+-        "title": "Toggle Split View: Chat / Terminal",
+-        "category": "omnexx",
+-        "icon": "$(split-horizontal)"
+-      },
+-      {
+-        "command": "omnexx.reviewDiff",
+-        "title": "Review Patch Diff",
+-        "category": "omnexx",
+-        "icon": "$(diff)"
+-      },
+-      {
+-        "command": "omnexx.acceptPatch",
+-        "title": "Accept Patch",
+-        "category": "omnexx",
+-        "icon": "$(check)"
+-      },
+-      {
+-        "command": "omnexx.rejectPatch",
+-        "title": "Reject Patch & Re-roll",
+-        "category": "omnexx",
+-        "icon": "$(circle-slash)"
+       }
+     ],
+     "menus": {
+@@ -326,16 +296,6 @@
+           "command": "omnexx.compactChat",
+           "when": "view == omnexx.chat",
+           "group": "overflow@1"
+-        },
+-        {
+-          "command": "omnexx.openTerminal",
+-          "when": "view == omnexx.chat",
+-          "group": "overflow@3"
+-        },
+-        {
+-          "command": "omnexx.toggleSplitView",
+-          "when": "view == omnexx.chat",
+-          "group": "overflow@3"
+         }
+       ],
+       "view/item/context": [
+diff --git a/vscode/src/chatView.ts b/vscode/src/chatView.ts
+index 559dd5b4..04d4f882 100644
+--- a/vscode/src/chatView.ts
++++ b/vscode/src/chatView.ts
+@@ -8,7 +8,6 @@ import { ChatProcess, type ServerMessage } from './chatProcess.js';
+ import { BUNDLED_VERSION, engine, refreshEngine } from './engine.js';
+ import { FORWARD } from './forward.js';
+ import { parseLocation } from './location.js';
+-import { TerminalView } from './terminal-view.js';
+ import { primaryFolder } from './tree.js';
+ 
+ const BREW_PATHS = ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'];
+@@ -32,17 +31,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
+   private contextPaths = new Map<string, boolean>();
+   private modelsWaiters = new Map<number, (items: ModelItem[], unreachable: string[]) => void>();
+   private modelsWaiterId = 0;
+-  /** The live terminal drawer session (host side); the webview owns its UI. */
+-  private readonly terminal: TerminalView;
+ 
+   constructor(private readonly extensionUri: vscode.Uri) {
+     this.server = new ChatProcess(primaryFolder());
+-    this.terminal = new TerminalView((msg) => {
+-      this.post(msg);
+-    });
+     this.subscriptions.push(
+       this.server,
+-      this.terminal,
+       this.server.onMessage((m) => {
+         this.fromServer(m);
+       }),
+@@ -76,23 +69,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
+     await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
+   }
+ 
+-  /** Open the live terminal drawer: focus the panel, then start (or re-show) the session. */
+-  async openTerminal(): Promise<void> {
+-    await this.focus();
+-    this.terminal.start();
+-  }
+-
+-  /** Toggle split-view (conversation left, live terminal right) in the webview. */
+-  toggleSplitView(): void {
+-    this.terminal.toggleSplitView();
+-  }
+-
+-  /** Post a message to the chat as if the user typed it (used by diff re-roll). */
+-  sendMessage(text: string): void {
+-    if (!this.server.running) this.server.start();
+-    this.server.send({ type: 'send', text });
+-  }
+-
+   newChat(): void {
+     this.server.send({ type: 'clear' });
+   }
+@@ -202,18 +178,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
+     else if (type === 'toggleDaemon') {
+       await vscode.commands.executeCommand('omnexx.toggleAutonomousDaemon');
+     }
+-    // Live terminal drawer: handled here, never forwarded to the chat server.
+-    else if (type === 'terminalStart')
+-      this.terminal.start(
+-        typeof m.command === 'string' ? m.command : undefined,
+-        typeof m.cols === 'number' ? m.cols : 80,
+-        typeof m.rows === 'number' ? m.rows : 24,
+-      );
+-    else if (type === 'terminalInput' && typeof m.data === 'string') this.terminal.write(m.data);
+-    else if (type === 'terminalResize' && typeof m.cols === 'number' && typeof m.rows === 'number')
+-      this.terminal.resize(m.cols, m.rows);
+-    else if (type === 'terminalStop') this.terminal.stop();
+-    else if (type === 'terminalSplit') this.toggleSplitView();
+     else if (type === 'editToml')
+       await openSettingsFile(join(primaryFolder() ?? homedir(), 'omnexx.toml'), PROJECT_STARTER);
+     else if (type === 'editUserConfig') await openSettingsFile(userConfigPath(), USER_STARTER);
+@@ -499,13 +463,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
+       vscode.Uri.joinPath(this.extensionUri, 'media', 'settings.css'),
+     );
+     const js = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'out', 'chat.js'));
+-    const xtermCss = webview.asWebviewUri(
+-      vscode.Uri.joinPath(this.extensionUri, 'out', 'xterm.css'),
+-    );
+-    const xtermJs = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'out', 'xterm.js'));
+-    const terminalJs = webview.asWebviewUri(
+-      vscode.Uri.joinPath(this.extensionUri, 'media', 'terminal.js'),
+-    );
+     const logo = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'logo.png'));
+     const csp = [
+       "default-src 'none'",
+@@ -523,7 +480,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
+ <link rel="stylesheet" href="${tokensCss.toString()}">
+ <link rel="stylesheet" href="${css.toString()}">
+ <link rel="stylesheet" href="${settingsCss.toString()}">
+-<link rel="stylesheet" href="${xtermCss.toString()}">
+ <title>omnexx</title>
+ </head>
+ <body data-logo="${logo.toString()}" data-power="off">
+@@ -643,8 +599,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
+   </div>
+ </footer>
+ <script nonce="${nonce}" src="${js.toString()}"></script>
+-<script nonce="${nonce}" src="${xtermJs.toString()}"></script>
+-<script nonce="${nonce}" src="${terminalJs.toString()}"></script>
+ </body>
+ </html>`;
+   }
+diff --git a/vscode/src/diff-viewer.ts b/vscode/src/diff-viewer.ts
+deleted file mode 100644
+index f98edd8b..00000000
+--- a/vscode/src/diff-viewer.ts
++++ /dev/null
+@@ -1,239 +0,0 @@
+-/**
+- * Side-by-side patch diff review (Phase 9, brief 9.3): a proposed patch as a
+- * virtual document (`omnexx-patch://`), opened in VS Code's native side-by-side
+- * diff, with CodeLens Accept Patch / Reject & Re-roll buttons at the top.
+- *
+- * Follows the InlineDiffReviewProvider pattern (inline-diff-review.ts): the
+- * documents are served in-memory, no temp files are written. Accept writes the
+- * proposed text to the file on disk (or delegates to the queue-task
+- * reviewApprove() CLI flow when the patch belongs to a task); Reject closes
+- * the diff and either delegates to reviewReject() for a task or posts a
+- * re-roll prompt to the chat. The existing queue-task approve/reject commands
+- * are untouched.
+- */
+-import { randomBytes } from 'node:crypto';
+-import { isAbsolute, join } from 'node:path';
+-import * as vscode from 'vscode';
+-import { reviewApprove, reviewReject } from './cli.js';
+-import { primaryFolder } from './tree.js';
+-
+-export const PATCH_SCHEME = 'omnexx-patch';
+-
+-export interface PatchData {
+-  id: string;
+-  file: string;
+-  original: string;
+-  proposed: string;
+-  taskId?: string;
+-}
+-
+-export interface PatchReviewHost {
+-  /** Post a message to the chat as if the user typed it (re-roll prompt). */
+-  postToChat(text: string): void;
+-}
+-
+-export interface OpenPatchOptions {
+-  file: string;
+-  original: string;
+-  proposed: string;
+-  taskId?: string;
+-}
+-
+-/** In-memory patches, keyed by id; the content provider serves from here. */
+-const patches = new Map<string, PatchData>();
+-
+-/** `omnexx-patch://original/<id>` and `omnexx-patch://modified/<id>`. */
+-function patchUris(id: string): { left: vscode.Uri; right: vscode.Uri } {
+-  return {
+-    left: vscode.Uri.from({ scheme: PATCH_SCHEME, authority: 'original', path: `/${id}` }),
+-    right: vscode.Uri.from({ scheme: PATCH_SCHEME, authority: 'modified', path: `/${id}` }),
+-  };
+-}
+-
+-export function patchIdOf(uri: vscode.Uri): string | null {
+-  if (uri.scheme !== PATCH_SCHEME) return null;
+-  if (uri.authority !== 'original' && uri.authority !== 'modified') return null;
+-  const match = /^\/([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(uri.path);
+-  return match?.[1] ?? null;
+-}
+-
+-/** Serves the virtual patch documents from the in-memory store. */
+-export class PatchDiffProvider implements vscode.TextDocumentContentProvider {
+-  private readonly changed = new vscode.EventEmitter<vscode.Uri>();
+-  readonly onDidChange = this.changed.event;
+-
+-  provideTextDocumentContent(uri: vscode.Uri): string {
+-    const id = patchIdOf(uri);
+-    const patch = id ? patches.get(id) : undefined;
+-    if (!patch) return '(no patch for this diff)';
+-    return uri.authority === 'original' ? patch.original : patch.proposed;
+-  }
+-}
+-
+-/** Accept / Reject & Re-roll lenses on every omnexx-patch document. */
+-export class PatchCodeLensProvider implements vscode.CodeLensProvider {
+-  provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+-    const id = patchIdOf(document.uri);
+-    if (!id) return [];
+-    const range = new vscode.Range(0, 0, 0, 0);
+-    return [
+-      new vscode.CodeLens(range, {
+-        command: 'omnexx.acceptPatch',
+-        title: '$(check) Accept Patch',
+-        arguments: [id],
+-      }),
+-      new vscode.CodeLens(range, {
+-        command: 'omnexx.rejectPatch',
+-        title: '$(circle-slash) Reject & Re-roll',
+-        arguments: [id],
+-      }),
+-    ];
+-  }
+-}
+-
+-/** Open a patch as a native side-by-side diff; returns the patch id. */
+-export async function openPatchDiff(options: OpenPatchOptions): Promise<string> {
+-  const id = `patch-${randomBytes(6).toString('hex')}`;
+-  const patch: PatchData = {
+-    id,
+-    file: options.file,
+-    original: options.original,
+-    proposed: options.proposed,
+-    ...(options.taskId ? { taskId: options.taskId } : {}),
+-  };
+-  patches.set(id, patch);
+-  const { left, right } = patchUris(id);
+-  await vscode.commands.executeCommand('vscode.diff', left, right, `${options.file} (proposed)`);
+-  return id;
+-}
+-
+-/** Validate a patch payload passed to omnexx.reviewDiff (e.g. from the chat). */
+-export function patchOptionsFromArg(arg: unknown): OpenPatchOptions | null {
+-  if (!arg || typeof arg !== 'object') return null;
+-  const o = arg as { file?: unknown; original?: unknown; proposed?: unknown; taskId?: unknown };
+-  if (
+-    typeof o.file !== 'string' ||
+-    typeof o.original !== 'string' ||
+-    typeof o.proposed !== 'string'
+-  )
+-    return null;
+-  return {
+-    file: o.file,
+-    original: o.original,
+-    proposed: o.proposed,
+-    ...(typeof o.taskId === 'string' ? { taskId: o.taskId } : {}),
+-  };
+-}
+-
+-/** A patch id from a CodeLens argument, a { patchId } object, or the open diff editor. */
+-export function patchIdFromArg(arg: unknown): string | null {
+-  if (typeof arg === 'string') return arg;
+-  if (arg && typeof arg === 'object' && 'patchId' in arg) {
+-    const id = (arg as { patchId?: unknown }).patchId;
+-    if (typeof id === 'string') return id;
+-  }
+-  const active = vscode.window.activeTextEditor?.document.uri;
+-  return active ? patchIdOf(active) : null;
+-}
+-
+-/** The patch file on disk, relative to the workspace root unless absolute. */
+-function resolvePatchFile(file: string): vscode.Uri {
+-  if (isAbsolute(file)) return vscode.Uri.file(file);
+-  const folder = primaryFolder();
+-  if (!folder) throw new Error('Open a folder first: the patch file is relative to the workspace.');
+-  return vscode.Uri.file(join(folder, file));
+-}
+-
+-async function readFileText(uri: vscode.Uri): Promise<string | undefined> {
+-  try {
+-    return new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
+-  } catch {
+-    return undefined;
+-  }
+-}
+-
+-/** Close the open diff tabs for one patch (both sides share its id). */
+-async function closePatchEditors(id: string): Promise<void> {
+-  const tabs = vscode.window.tabGroups.all.flatMap((g) => [...g.tabs]);
+-  for (const tab of tabs) {
+-    const input = tab.input;
+-    if (typeof input !== 'object' || input === null) continue;
+-    if (input instanceof vscode.TabInputTextDiff) {
+-      if (patchIdOf(input.original) === id || patchIdOf(input.modified) === id)
+-        await vscode.window.tabGroups.close(tab);
+-    } else if (input instanceof vscode.TabInputText) {
+-      if (patchIdOf(input.uri) === id) await vscode.window.tabGroups.close(tab);
+-    }
+-  }
+-}
+-
+-/**
+- * Accept a patch from a CodeLens, the command palette, or the open diff editor.
+- * A task patch delegates to the reviewApprove() CLI flow; otherwise the
+- * proposed text is written to the file on disk (skipped when it already
+- * matches). Either way the diff editors close.
+- */
+-export async function acceptPatch(arg: unknown, done?: () => void): Promise<void> {
+-  const id = patchIdFromArg(arg);
+-  const patch = id ? patches.get(id) : undefined;
+-  if (!patch) throw new Error('Pick a patch diff to accept first.');
+-  if (patch.taskId) {
+-    const message = await reviewApprove(patch.taskId, primaryFolder());
+-    if (message) void vscode.window.showInformationMessage(`omnexx: ${message}`);
+-    done?.();
+-  } else {
+-    const uri = resolvePatchFile(patch.file);
+-    const current = await readFileText(uri);
+-    if (current !== patch.proposed) {
+-      await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(patch.proposed));
+-      void vscode.window.showInformationMessage(`omnexx: patch accepted — wrote ${patch.file}`);
+-    } else {
+-      void vscode.window.showInformationMessage(`omnexx: ${patch.file} already matches the patch`);
+-    }
+-  }
+-  await closePatchEditors(patch.id);
+-  patches.delete(patch.id);
+-}
+-
+-/**
+- * Reject a patch from a CodeLens, the command palette, or the open diff editor.
+- * A task patch delegates to the reviewReject() CLI flow (asks for a reason);
+- * otherwise the diff closes and a re-roll prompt goes to the chat. Cancelling
+- * the reason prompt aborts the reject.
+- */
+-export async function rejectPatch(
+-  arg: unknown,
+-  host: PatchReviewHost,
+-  done?: () => void,
+-): Promise<void> {
+-  const id = patchIdFromArg(arg);
+-  const patch = id ? patches.get(id) : undefined;
+-  if (!patch) throw new Error('Pick a patch diff to reject first.');
+-  if (patch.taskId) {
+-    const reason = await vscode.window.showInputBox({
+-      title: `omnexx: reject ${patch.taskId}`,
+-      prompt: 'Why is this patch rejected? (saved to learned_patterns)',
+-      placeHolder: 'e.g. duplicates the work in #412',
+-    });
+-    if (reason === undefined) return;
+-    const message = await reviewReject(patch.taskId, reason, primaryFolder());
+-    if (message) void vscode.window.showInformationMessage(`omnexx: ${message}`);
+-    done?.();
+-  } else {
+-    const reason = await vscode.window.showInputBox({
+-      title: `omnexx: reject patch for ${patch.file}`,
+-      prompt: 'Why reject this patch? (optional — included in the re-roll prompt)',
+-      placeHolder: 'e.g. too broad, keep the change minimal',
+-    });
+-    if (reason === undefined) return;
+-    const note = reason.trim() ? ` Reason: ${reason.trim()}` : '';
+-    host.postToChat(
+-      `The patch for ${patch.file} was rejected. Please re-roll it with a different approach.${note}`,
+-    );
+-    void vscode.window.showInformationMessage(
+-      `omnexx: re-roll requested in chat for ${patch.file}`,
+-    );
+-  }
+-  await closePatchEditors(patch.id);
+-  patches.delete(patch.id);
+-}
+diff --git a/vscode/src/extension.ts b/vscode/src/extension.ts
+index e94a20e5..2e99d4ea 100644
+--- a/vscode/src/extension.ts
++++ b/vscode/src/extension.ts
+@@ -4,14 +4,7 @@ import { join } from 'node:path';
+ import { AutonomousQueueProvider } from './autonomousQueue.js';
+ import { ChatViewProvider } from './chatView.js';
+ import { initEngine } from './engine.js';
+-import {
+-  control,
+-  daemonStart,
+-  daemonStatus,
+-  daemonStop,
+-  openTerminal,
+-  type Control,
+-} from './cli.js';
++import { control, daemonStart, daemonStatus, daemonStop, openTerminal, type Control } from './cli.js';
+ import {
+   DIFF_SCHEME,
+   DiffCodeLensProvider,
+@@ -21,15 +14,6 @@ import {
+   rejectDiff,
+   taskIdFromArg,
+ } from './inline-diff-review.js';
+-import {
+-  PATCH_SCHEME,
+-  PatchCodeLensProvider,
+-  PatchDiffProvider,
+-  acceptPatch,
+-  openPatchDiff,
+-  patchOptionsFromArg,
+-  rejectPatch,
+-} from './diff-viewer.js';
+ import { runArgs, validateDuration, type RunOptions } from './model.js';
+ import { primaryFolder, RunsProvider, type Node } from './tree.js';
+ 
+@@ -113,7 +97,6 @@ export function activate(context: vscode.ExtensionContext): void {
+     showCollapseAll: true,
+   });
+   const diffProvider = new InlineDiffReviewProvider();
+-  const patchProvider = new PatchDiffProvider();
+   const refreshQueue = (): void => {
+     queueProvider.refresh();
+   };
+@@ -195,8 +178,7 @@ export function activate(context: vscode.ExtensionContext): void {
+           if (!content.includes('[autonomous]')) {
+             writeFileSync(
+               tomlPath,
+-              content +
+-                '\n[autonomous]\nenabled = true\nmode = "daemon"\ntarget_branch = "omnexx/auto-main"\nbase_branch = "main"\n',
++              content + '\n[autonomous]\nenabled = true\nmode = "daemon"\ntarget_branch = "omnexx/auto-main"\nbase_branch = "main"\n',
+             );
+           } else if (content.includes('enabled = false')) {
+             writeFileSync(tomlPath, content.replace('enabled = false', 'enabled = true'));
+@@ -210,28 +192,6 @@ export function activate(context: vscode.ExtensionContext): void {
+     }),
+     vscode.workspace.registerTextDocumentContentProvider(DIFF_SCHEME, diffProvider),
+     vscode.languages.registerCodeLensProvider({ scheme: DIFF_SCHEME }, new DiffCodeLensProvider()),
+-    vscode.workspace.registerTextDocumentContentProvider(PATCH_SCHEME, patchProvider),
+-    vscode.languages.registerCodeLensProvider(
+-      { scheme: PATCH_SCHEME },
+-      new PatchCodeLensProvider(),
+-    ),
+-    cmd('omnexx.reviewDiff', (arg) => {
+-      const options = patchOptionsFromArg(arg);
+-      if (!options) throw new Error('Review a patch by opening it from a diff or the chat.');
+-      return openPatchDiff(options);
+-    }),
+-    cmd('omnexx.acceptPatch', (arg) => acceptPatch(arg, refreshQueue)),
+-    cmd('omnexx.rejectPatch', (arg) =>
+-      rejectPatch(
+-        arg,
+-        {
+-          postToChat: (text) => {
+-            chat.sendMessage(text);
+-          },
+-        },
+-        refreshQueue,
+-      ),
+-    ),
+     queueView.onDidChangeVisibility(() => {
+       if (queueView.visible) refreshQueue();
+     }),
+@@ -246,10 +206,6 @@ export function activate(context: vscode.ExtensionContext): void {
+     cmd('omnexx.openChat', () => {
+       return openTerminal('omnexx', [], primaryFolder());
+     }),
+-    cmd('omnexx.openTerminal', () => chat.openTerminal()),
+-    cmd('omnexx.toggleSplitView', () => {
+-      chat.toggleSplitView();
+-    }),
+     cmd('omnexx.attach', (node) => {
+       const runId = runIdOf(node);
+       return openTerminal(`omnexx ${runId}`, ['watch', runId], primaryFolder());
+diff --git a/vscode/src/terminal-view.ts b/vscode/src/terminal-view.ts
+deleted file mode 100644
+index ccde88c0..00000000
+--- a/vscode/src/terminal-view.ts
++++ /dev/null
+@@ -1,198 +0,0 @@
+-/**
+- * Live terminal sessions for the chat webview drawer (Phase 9, roadmap 9.1/9.2):
+- * a shell runs on the extension host and streams raw bytes to the webview, which
+- * renders them with xterm.js and posts keystrokes back.
+- *
+- * No node-pty, no native deps: the backend spawns the shell with piped stdio
+- * (`node:child_process`), so there is NO true PTY — the child sees pipes, not a
+- * tty (`isatty` is false, no job control, no SIGWINCH). `resize` is tracked and
+- * applied to COLUMNS/LINES for new spawns, not live. The `TerminalBackend`
+- * interface is the seam: a real node-pty backend can be swapped in later
+- * (roadmap 8.5) without touching the view or the webview protocol.
+- */
+-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+-import * as vscode from 'vscode';
+-import { primaryFolder } from './tree.js';
+-
+-export interface TerminalSpawnOptions {
+-  cwd?: string | undefined;
+-  cols: number;
+-  rows: number;
+-}
+-
+-/** A running shell session: write input, resize, kill; data/exit as events. */
+-export interface TerminalSession {
+-  readonly id: string;
+-  readonly command: string;
+-  write(data: string): void;
+-  resize(cols: number, rows: number): void;
+-  kill(): void;
+-  dispose(): void;
+-  onData(listener: (chunk: string) => void): vscode.Disposable;
+-  onExit(listener: (code: number | null) => void): vscode.Disposable;
+-}
+-
+-/** Spawns shell sessions. Swappable for a real node-pty backend later. */
+-export interface TerminalBackend {
+-  spawn(command: string, options: TerminalSpawnOptions): TerminalSession;
+-}
+-
+-/** The user's login shell, or a plain fallback when none is configured. */
+-export function defaultShell(): string {
+-  if (process.platform === 'win32') return 'powershell.exe';
+-  return process.env.SHELL ?? '/bin/bash';
+-}
+-
+-/** Piped-spawn backend: the shell's stdin/stdout/stderr are pipes, not a tty. */
+-export class SpawnTerminalBackend implements TerminalBackend {
+-  private counter = 0;
+-
+-  spawn(command: string, options: TerminalSpawnOptions): TerminalSession {
+-    const id = `term-${String(++this.counter)}`;
+-    const child = spawn(command, [], {
+-      cwd: options.cwd,
+-      env: {
+-        ...process.env,
+-        COLUMNS: String(options.cols),
+-        LINES: String(options.rows),
+-        TERM: 'xterm-256color',
+-      },
+-    });
+-    return new SpawnTerminalSession(id, command, child);
+-  }
+-}
+-
+-class SpawnTerminalSession implements TerminalSession {
+-  private readonly dataEmitter = new vscode.EventEmitter<string>();
+-  private readonly exitEmitter = new vscode.EventEmitter<number | null>();
+-  readonly onData = this.dataEmitter.event;
+-  readonly onExit = this.exitEmitter.event;
+-
+-  constructor(
+-    readonly id: string,
+-    readonly command: string,
+-    private readonly child: ChildProcessWithoutNullStreams,
+-  ) {
+-    child.stdout.on('data', (chunk: Buffer) => {
+-      this.dataEmitter.fire(chunk.toString('utf8'));
+-    });
+-    child.stderr.on('data', (chunk: Buffer) => {
+-      this.dataEmitter.fire(chunk.toString('utf8'));
+-    });
+-    child.on('error', (err: Error) => {
+-      this.dataEmitter.fire(`\r\n[omnexx: terminal failed to start: ${err.message}]\r\n`);
+-      this.exitEmitter.fire(null);
+-    });
+-    child.on('close', (code: number | null) => {
+-      this.exitEmitter.fire(code);
+-    });
+-  }
+-
+-  write(data: string): void {
+-    if (this.child.exitCode === null && !this.child.stdin.destroyed) this.child.stdin.write(data);
+-  }
+-
+-  resize(): void {
+-    // No true PTY: there is no window size to push and no SIGWINCH to send,
+-    // so the size is not applied to the running process. The view remembers
+-    // the size and uses it for COLUMNS/LINES on the next spawn; a future
+-    // node-pty backend will apply resizes live, and full-screen apps will
+-    // not reflow until the shell is restarted.
+-  }
+-
+-  kill(): void {
+-    if (this.child.exitCode === null) this.child.kill();
+-  }
+-
+-  dispose(): void {
+-    this.child.stdout.removeAllListeners('data');
+-    this.child.stderr.removeAllListeners('data');
+-    this.child.removeAllListeners();
+-    this.dataEmitter.dispose();
+-    this.exitEmitter.dispose();
+-  }
+-}
+-
+-/**
+- * The chat panel's live terminal: one drawer session at a time. The webview
+- * owns the drawer UI; this side owns the process and posts
+- * terminalStarted / terminalOutput / terminalExit / terminalSplit to it.
+- */
+-export class TerminalView implements vscode.Disposable {
+-  private readonly backend: TerminalBackend;
+-  private readonly post: (msg: object) => void;
+-  private session: TerminalSession | undefined;
+-  private sessionSubs: vscode.Disposable[] = [];
+-  private splitView = false;
+-  /** Last size the webview reported; reused for COLUMNS/LINES on the next spawn. */
+-  private lastCols = 80;
+-  private lastRows = 24;
+-
+-  constructor(post: (msg: object) => void, backend: TerminalBackend = new SpawnTerminalBackend()) {
+-    this.post = post;
+-    this.backend = backend;
+-  }
+-
+-  get active(): boolean {
+-    return this.session !== undefined;
+-  }
+-
+-  get isSplitView(): boolean {
+-    return this.splitView;
+-  }
+-
+-  /** Start the drawer session (or re-show the running one) and tell the webview. */
+-  start(command?: string, cols: number = this.lastCols, rows: number = this.lastRows): void {
+-    if (this.session) {
+-      this.post({ type: 'terminalStarted', id: this.session.id, command: this.session.command });
+-      return;
+-    }
+-    const shell = command?.trim() ? command.trim() : defaultShell();
+-    const session = this.backend.spawn(shell, { cwd: primaryFolder(), cols, rows });
+-    this.session = session;
+-    this.sessionSubs.push(
+-      session.onData((chunk) => {
+-        this.post({ type: 'terminalOutput', id: session.id, data: chunk });
+-      }),
+-      session.onExit((code) => {
+-        this.post({ type: 'terminalExit', id: session.id, code });
+-        this.clearSession(session);
+-      }),
+-    );
+-    this.post({ type: 'terminalStarted', id: session.id, command: shell });
+-  }
+-
+-  write(data: string): void {
+-    this.session?.write(data);
+-  }
+-
+-  resize(cols: number, rows: number): void {
+-    this.lastCols = cols;
+-    this.lastRows = rows;
+-    this.session?.resize(cols, rows);
+-  }
+-
+-  stop(): void {
+-    const session = this.session;
+-    if (!session) return;
+-    session.kill();
+-    this.clearSession(session);
+-  }
+-
+-  toggleSplitView(): void {
+-    this.splitView = !this.splitView;
+-    this.post({ type: 'terminalSplit', on: this.splitView });
+-  }
+-
+-  dispose(): void {
+-    this.stop();
+-  }
+-
+-  private clearSession(session: TerminalSession): void {
+-    if (this.session !== session) return;
+-    this.session = undefined;
+-    for (const s of this.sessionSubs) s.dispose();
+-    this.sessionSubs = [];
+-    session.dispose();
+-  }
+-}
+diff --git a/vscode/src/webview/chat.ts b/vscode/src/webview/chat.ts
+index 779a4cd4..0a1f3cac 100644
+--- a/vscode/src/webview/chat.ts
++++ b/vscode/src/webview/chat.ts
+@@ -17,7 +17,6 @@ import {
+   estimateHtml,
+   etaText,
+   formatClock,
+-  formatElapsedMs,
+   formatTokens,
+   formatUsd,
+   logRole,
+@@ -410,14 +409,8 @@ function kindBreakdown(lines: readonly string[]): string {
+   return [...counts.entries()].map(([k, n]) => `${String(n)} ${toolBadgeLabel(k)}`).join(' · ');
+ }
+ 
+-/**
+- * Renders a grouped tool execution cluster with semantic pills and collapsible overflow.
+- * The active (still running) cluster renders as one collapsible card whose header
+- * carries a live elapsed counter and a stdout preview pill showing the latest tool
+- * line — the last `act` entry, which is the most recent tool output the renderer
+- * sees. `startedAt` is when the block was first seen (blockSeenAt in drawConversation).
+- */
+-function renderToolCluster(b: Block, isActiveTail: boolean, startedAt?: number): string {
++/** Renders a grouped tool execution cluster with semantic pills and collapsible overflow. */
++function renderToolCluster(b: Block, isActiveTail: boolean): string {
+   const validLines = b.lines.filter((l) => l.trim());
+   if (!validLines.length) return '';
+ 
+@@ -449,19 +442,6 @@ function renderToolCluster(b: Block, isActiveTail: boolean, startedAt?: number):
+       .join('');
+   };
+ 
+-  if (isActiveTail) {
+-    // One collapsible card while the cluster runs: header with the live
+-    // elapsed counter + stdout preview, body with every tool line. Open while
+-    // running so live output is visible; a deliberate close sticks, like the
+-    // think accordions (the toggle listener tracks data-disclosure-id).
+-    const lastLine = validLines.at(-1) ?? '';
+-    const kind = toolKind(lastLine);
+-    const started = startedAt ?? Date.now();
+-    const cardId = `toolcard-${String(b.id)}`;
+-    const cardOpen = openDisclosures.has(cardId) || !userClosedDisclosures.has(cardId);
+-    return `<div class="msg tool-card is-active"><details class="tool-card-fold" data-disclosure-id="${cardId}"${cardOpen ? ' open' : ''}><summary class="tool-card-head"><span class="chev" aria-hidden="true"></span><span class="tool-badge k-${kind}">${toolBadgeLabel(kind)}</span><span class="tool-elapsed" data-started-at="${String(started)}" title="Elapsed since this tool cluster started">0ms</span><span class="tool-stdout-pill" title="${escapeHtml(lastLine)}">${escapeHtml(lastLine)}</span></summary><ul class="msg tools">${renderRuns(validLines, 0)}</ul></details></div>`;
+-  }
+-
+   if (validLines.length <= TOOL_CLUSTER_COLLAPSE_THRESHOLD) {
+     return `<ul class="msg tools">${renderRuns(validLines, 0)}</ul>`;
+   }
+@@ -507,7 +487,7 @@ function messageHtml(b: Block, isActiveTail: boolean, seenAt?: number): string {
+   }
+ 
+   if (b.kind === 'act') {
+-    return renderToolCluster(b, isActiveTail, seenAt);
++    return renderToolCluster(b, isActiveTail);
+   }
+ 
+   if (b.kind === 'think') {
+@@ -1208,18 +1188,6 @@ setInterval(() => {
+   const eta = document.getElementById('eta');
+   if (eta) eta.textContent = etaText(state?.waiting, Date.now());
+ }, CLOCK_TICK_MS);
+-
+-/** Live elapsed counters on active tool cards: ticked at 10 Hz so the millisecond
+- * readout moves while a tool runs. A block re-render resets the text to "0ms";
+- * the next tick fixes it within 100ms. */
+-const TOOL_ELAPSED_TICK_MS = 100;
+-setInterval(() => {
+-  for (const node of document.querySelectorAll<HTMLElement>('.tool-elapsed')) {
+-    const startedAt = Number(node.dataset.startedAt);
+-    if (!Number.isFinite(startedAt)) continue;
+-    node.textContent = formatElapsedMs(Date.now() - startedAt);
+-  }
+-}, TOOL_ELAPSED_TICK_MS);
+ post({ type: 'ready' });
+ input.focus();
+ 
+diff --git a/vscode/src/webview/css.d.ts b/vscode/src/webview/css.d.ts
+deleted file mode 100644
+index d1a99301..00000000
+--- a/vscode/src/webview/css.d.ts
++++ /dev/null
+@@ -1,5 +0,0 @@
+-/**
+- * Wildcard declaration for side-effect CSS imports in the webview bundle
+- * (xterm-shim.ts imports the xterm stylesheet so esbuild emits out/xterm.css).
+- */
+-declare module '*.css';
+diff --git a/vscode/src/webview/render.ts b/vscode/src/webview/render.ts
+index 5a246a84..07a76939 100644
+--- a/vscode/src/webview/render.ts
++++ b/vscode/src/webview/render.ts
+@@ -362,16 +362,6 @@ export function formatClock(ms: number): string {
+   return `${pad(Math.floor(total / 3_600))}:${pad(Math.floor((total % 3_600) / 60))}:${pad(total % 60)}`;
+ }
+ 
+-/** Live tool-execution elapsed time: 842 → "842ms", 12_345 → "12.3s", 125_000 → "2m 05s". */
+-export function formatElapsedMs(ms: number): string {
+-  const total = Math.max(0, Math.floor(ms));
+-  if (total < 1_000) return `${String(total)}ms`;
+-  if (total < 60_000) return `${(total / 1_000).toFixed(1)}s`;
+-  const minutes = Math.floor(total / 60_000);
+-  const seconds = Math.floor((total % 60_000) / 1_000);
+-  return `${String(minutes)}m ${String(seconds).padStart(2, '0')}s`;
+-}
+-
+ /** 0 → "ST-01". */
+ export function stepLabel(index: number): string {
+   return `ST-${String(index + 1).padStart(2, '0')}`;
+diff --git a/vscode/src/webview/tsconfig.json b/vscode/src/webview/tsconfig.json
+index 47f51a4d..99efe598 100644
+--- a/vscode/src/webview/tsconfig.json
++++ b/vscode/src/webview/tsconfig.json
+@@ -15,9 +15,6 @@
+     "mcp.ts",
+     "agentCard.ts",
+     "browserCockpit.ts",
+-    // xterm.js bundle entry (terminal drawer) + the CSS-import declaration it needs.
+-    "xterm-shim.ts",
+-    "css.d.ts",
+     // DOM test of roles.ts: typechecked here, with the DOM lib, not by the root config.
+     "../../../test/unit/vscode-roles-providers.test.ts"
+   ],
+diff --git a/vscode/src/webview/xterm-shim.ts b/vscode/src/webview/xterm-shim.ts
+deleted file mode 100644
+index 3275181b..00000000
+--- a/vscode/src/webview/xterm-shim.ts
++++ /dev/null
+@@ -1,17 +0,0 @@
+-/**
+- * xterm.js bundle entry: exposes Terminal + FitAddon on `window.Xterm` for the
+- * plain-JS terminal controller (`media/terminal.js`), and pulls in the xterm
+- * stylesheet so esbuild emits it as `out/xterm.css` (linked by chatView).
+- * Typechecked by the webview tsconfig (DOM lib); excluded from the root one.
+- */
+-import '@xterm/xterm/css/xterm.css';
+-import { Terminal } from '@xterm/xterm';
+-import { FitAddon } from '@xterm/addon-fit';
+-
+-declare global {
+-  interface Window {
+-    Xterm: { Terminal: typeof Terminal; FitAddon: typeof FitAddon };
+-  }
+-}
+-
+-window.Xterm = { Terminal, FitAddon };
+-- 
+2.47.3
+

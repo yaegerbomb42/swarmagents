@@ -1,0 +1,120 @@
+From 91295e2188c22cf38711b197e0bd93ca02238ce7 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Sun, 8 Nov 2026 16:00:15 -0600
+Subject: [PATCH] docs: preserve 6 subsystem audit packages and update master
+ ledger (28/71 complete)
+
+---
+ MASTER_TODO.md | 94 ++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 88 insertions(+), 6 deletions(-)
+
+diff --git a/MASTER_TODO.md b/MASTER_TODO.md
+index e12a46a9..42d1dccf 100644
+--- a/MASTER_TODO.md
++++ b/MASTER_TODO.md
+@@ -620,14 +620,96 @@ flowchart TD
+ | Phase | Subsystem Focus | Total Steps | Completed | Est. Token Savings | Est. Turn Savings | Primary Metric Target |
+ |---|---|:---:|:---:|:---:|:---:|:---:|
+ | **Phase 0** | SWE-bench Core Remediation | 5 | 5 / 5 | Baseline | Baseline | 100% Valid Patch Formats & Diffs |
+-| **Phase 1** | Pre-flight Diagnostic Interceptor | 11 | 7 / 11 | ~15–20% | ~0.7 turns/task | Zero Syntax/Lint Errors to LLM |
+-| **Phase 2** | Prompt Topology & KV-Cache | 7 | 1 / 7 | 40–72% Input | N/A (Latency) | >80% Cache Hit Ratio Across Providers |
+-| **Phase 3** | Async Agent Engine (`runAgentLoop`) | 8 | 0 / 8 | ~25% Output | ~1.5 turns/task | Concurrency Speedup + Zero Orphan Use |
+-| **Phase 4** | 3-Tier Model Cascade Router | 6 | 0 / 6 | ~70% Cost | N/A (Cost) | <$0.30 / Exploration Run |
++| **Phase 1** | Pre-flight Diagnostic Interceptor | 11 | 10 / 11 | ~15–20% | ~0.7 turns/task | Zero Syntax/Lint Errors to LLM |
++| **Phase 2** | Prompt Topology & KV-Cache | 7 | 5 / 7 | 40–72% Input | N/A (Latency) | >80% Cache Hit Ratio Across Providers |
++| **Phase 3** | Async Agent Engine (`runAgentLoop`) | 8 | 4 / 8 | ~25% Output | ~1.5 turns/task | Concurrency Speedup + Zero Orphan Use |
++| **Phase 4** | 3-Tier Model Cascade Router | 6 | 2 / 6 | ~70% Cost | N/A (Cost) | <$0.30 / Exploration Run |
+ | **Phase 5** | Differential TDR & Worktrees | 6 | 0 / 6 | ~15% | ~2.0 turns/task | Zero Regression Commits Accepted |
+ | **Phase 6** | Decoupled Issue-Resolution FSM | 8 | 0 / 8 | ~30% | Bounded (11 nom) | Bounded Cost ($1.00 max) + Replayability |
+ | **Phase 7** | Oracle-Guided Tree Search (OGTS) | 7 | 0 / 7 | Adaptive | High Accuracy | +15–25% Relative SWE-bench Pass Rate |
+ | **Phase 8** | Zero-Trust Sandbox & PTY Engine | 7 | 0 / 7 | N/A (Safety) | Fast Tool PTY | Total Host & Kernel Isolation |
+-| **Phase 9** | VS Code Extension & UI System | 6 | 0 / 6 | DX / UX | Interactive | Native PTY Terminal + 24 Screen Design |
+-| **TOTAL** | **Full Omnexx Engineering Overhaul** | **71** | **13 / 71** | **~60–80% Net** | **~4.2 turns/task** | **Production Autonomous Coding Standard** |
++| **Phase 9** | VS Code Extension & UI System | 6 | 2 / 6 | DX / UX | Interactive | Native PTY Terminal + 24 Screen Design |
++| **TOTAL** | **Full Omnexx Engineering Overhaul** | **71** | **28 / 71** | **~60–80% Net** | **~4.2 turns/task** | **Production Autonomous Coding Standard** |
++
++---
++
++## Appendix: Post-Roadmap 6-Subsystem Frontier Model Audit Strategy
++
++*Preserved for execution after primary roadmap stabilization. Feed each slice (15k–40k tokens) into a frontier model (Claude 3.7 Sonnet / GPT-4.5 / Gemini 2.0 Pro) with the mandate: "No bug report accepted without a reproducing Vitest unit test."*
++
++### Subsystem 1: Agent Runtime, Concurrency & Interrupt Engine
++- **Target Files:**
++  - `src/agent/loop.ts`
++  - `src/agent/runtime/tool-scheduler.ts`
++  - `src/agent/runtime/interrupt-bus.ts`
++  - `src/agent/runtime/micro-compaction.ts`
++  - `test/unit/agent/tool-scheduler.test.ts`
++- **Audit Brief:**
++  - Audit unhandled Promise rejections and process group leaks when an AbortSignal trips mid-wave.
++  - Verify strict provider contract invariant: every `tool_use` must have a matching `tool_result` envelope at the identical array index.
++  - Audit concurrency boundary conditions in `executeToolWaves`.
++
++### Subsystem 2: Preflight Verification, Autofix & Diagnostics Hub
++- **Target Files:**
++  - `src/verify/preflight.ts`
++  - `src/verify/preflight-types.ts`
++  - `src/verify/diagnostics.ts`
++  - `src/verify/autofix.ts`
++  - `src/verify/formatters.ts`
++  - `src/verify/diagnostic-baseline.ts`
++  - `src/verify/impact-analysis.ts`
++- **Audit Brief:**
++  - Verify 4,000ms hard timeout ceiling enforcement across all sub-checks (formatters, autofix, LSP).
++  - Verify disk mutation consistency: Ensure the LLM never receives stale pre-mutation file snippets.
++  - Audit 0-based LSP coordinate to 1-based editor coordinate conversions.
++
++### Subsystem 3: Provider Wire Protocols, Dual-Breakpoints & KV-Cache Pinning
++- **Target Files:**
++  - `src/providers/anthropic.ts`
++  - `src/providers/openai-compat.ts`
++  - `src/providers/gemini.ts`
++  - `src/providers/cache-pinning.ts`
++  - `src/providers/cache-headers.ts`
++  - `src/telemetry/cache-meter.ts`
++- **Audit Brief:**
++  - Audit prefix cache stability: verify zero volatile timestamps, UUIDs, or random keys in Level 0/1 blocks.
++  - Verify Anthropic max-4 cache_control breakpoint budget compliance.
++  - Verify OpenAI/DeepSeek deterministic JSON key ordering via `stableJsonStringify`.
++
++### Subsystem 4: Context Architecture & 3-Level Prompt Topology
++- **Target Files:**
++  - `src/core/prompt-assembler.ts`
++  - `src/agent/context.ts`
++  - `src/agent/prompts.ts`
++  - `src/agent/compaction.ts`
++  - `src/core/running-context.ts`
++- **Audit Brief:**
++  - Verify strict partition: Level 0 (Immutable Core) -> Level 1 (Session Semi-Static) -> Level 2 (Dynamic Window).
++  - Audit `clampSlotTail` edge cases: ensure oldest progress lines are discarded while preserving newest living state entries.
++  - Audit Unicode / NFC normalization and absolute path canonicalization (`$REPO`).
++
++### Subsystem 5: Model Routing, Cascade Classifier & Fast-Path Engine
++- **Target Files:**
++  - `src/router/cascade-router.ts`
++  - `src/router/fast-path-engine.ts`
++  - `src/router/classify.ts`
++  - `src/router/actions.ts`
++  - `src/router/stage.ts`
++- **Audit Brief:**
++  - Audit false Tier 1 classifications: verify mutation verbs ("write", "delete", "edit", "rm") never route to non-LLM fast path.
++  - Verify instant Tier 3 escalation when context exceeds 100k tokens or touches >3 files.
++  - Verify `routeTask` is strictly synchronous and $O(1)$ without network/disk I/O.
++
++### Subsystem 6: SWE-bench Benchmark Extraction & Patch Engine
++- **Target Files:**
++  - `src/swe-bench/patch-diff.ts`
++  - `src/swe-bench/skeleton.ts`
++  - `src/swe-bench/reproduce.ts`
++  - `src/core/contract.ts`
++  - `src/core/spec-gate.ts`
++- **Audit Brief:**
++  - Verify standard `a/` and `b/` patch diff prefix compatibility with `git apply -p1`.
++  - Verify `git add -N .` untracked file capture across nested subdirectories.
++  - Verify subshell process-group kill (`-pid`) deterministic cleanup in `reproduce.ts`.
++
+ 
+-- 
+2.47.3
+

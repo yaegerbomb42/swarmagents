@@ -35,3 +35,6 @@ Seven git stashes from `~/Projects/omnexx` (VS Code chat/render WIP, composer st
 
 ## `omnexx.toml.sample`
 Jimmy's local autonomous-daemon config (no secrets). `.omnexx/` runtime state (autonomous.db, budget ledger, logs) and `.env` were deliberately NOT archived.
+
+## `antigravity/`
+Comparison with the third Omnexx copy (`~/.gemini/antigravity/scratch/omnexx`, v0.24.0, 2026-11-05) and the 5-commit `feat/recursive-scope` branch it alone had. See `antigravity/README.md`. Conclusion: `vendor/omnexx` is the newer, fuller copy.

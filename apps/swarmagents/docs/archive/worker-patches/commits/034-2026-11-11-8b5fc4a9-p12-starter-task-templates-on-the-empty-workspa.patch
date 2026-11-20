@@ -1,0 +1,261 @@
+From 8b5fc4a927ca81719dcdedb86224431d063dc0e5 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 23:07:29 +0000
+Subject: [PATCH] [p12] Starter task templates on the empty workspace
+
+---
+ .../src/components/ComputerScreen.tsx         | 17 +++--
+ .../minimalist-ui/src/components/InputBar.tsx | 38 +++++++++-
+ .../src/components/StarterPrompts.tsx         | 54 ++++++++++++++
+ .../minimalist-ui/src/templates.ts            | 71 +++++++++++++++++++
+ 4 files changed, 175 insertions(+), 5 deletions(-)
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/StarterPrompts.tsx
+ create mode 100644 apps/swarmagents/minimalist-ui/src/templates.ts
+
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index 6196e4888..f7162ad6e 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -22,6 +22,7 @@ import {
+ import { ApprovalGate } from "./ApprovalGate";
+ import { FilesView } from "./FilesView";
+ import { BrowserView } from "./BrowserView";
++import { dispatchStarterPrompt, StarterPrompts } from "./StarterPrompts";
+ 
+ interface ComputerScreenProps {
+   logs: LogEvent[];
+@@ -573,10 +574,18 @@ export function ComputerScreen({
+                   <div className="text-white/60">Linux agent-vm-01 6.1.0-28-cloud-amd64 #1 SMP /bin/zsh</div>
+ 
+                   {logs.length === 0 ? (
+-                    <TerminalEmptyState
+-                      title="No activity yet"
+-                      hint="Run an agent or interact with the computer — terminal output will appear here."
+-                    />
++                    <>
++                      <TerminalEmptyState
++                        title="No activity yet"
++                        hint="Run an agent or interact with the computer — terminal output will appear here."
++                      />
++                      {/* Starter task chips (p12): only on the empty workspace,
++                          before any run exists. Tapping one fills the input
++                          bar below (via InputBar's listener) — never submits. */}
++                      <div className="mx-auto w-full max-w-md px-2 pb-2 pt-1">
++                        <StarterPrompts onSelect={dispatchStarterPrompt} />
++                      </div>
++                    </>
+                   ) : (
+                     logs.map((l, i) => (
+                       <div key={i} className="flex gap-2">
+diff --git a/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx b/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
+index 99c5fa2be..89a0c3dce 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
+@@ -1,6 +1,7 @@
+-import { useRef, useState, type RefObject } from 'react';
++import { useEffect, useRef, useState, type RefObject } from 'react';
+ import { ArrowUp, FileText, Film, Loader2, Music, Paperclip, Square, X, File as FileIcon } from 'lucide-react';
+ import { type Attachment, uid } from '../data';
++import { STARTER_PROMPT_EVENT, StarterPrompts } from './StarterPrompts';
+ 
+ const TEXT_EXT = /\.(txt|md|json|csv|ts|tsx|js|jsx|py|html|css|xml|yml|yaml|log|sql|sh|rs|go|java|c|cpp|rb)$/i;
+ 
+@@ -55,9 +56,35 @@ export function InputBar({
+   const [text, setText] = useState('');
+   const [atts, setAtts] = useState<Attachment[]>([]);
+   const [drag, setDrag] = useState(false);
++  // Once a run has been submitted the starter chips never come back in this
++  // session (p12: the chips hide once a run exists).
++  const [hasSubmitted, setHasSubmitted] = useState(false);
+   const fileRef = useRef<HTMLInputElement>(null);
+   const taRef = useRef<HTMLTextAreaElement>(null);
+ 
++  /** Fill the textarea with a starter template so the user can edit and press Send. Never submits. */
++  const fillFromTemplate = (prompt: string) => {
++    setText(prompt);
++    // Autosize + focus after the state update has rendered.
++    requestAnimationFrame(() => {
++      if (taRef.current) {
++        autosize(taRef.current);
++        taRef.current.focus();
++      }
++    });
++  };
++
++  // Starter chips mounted elsewhere (e.g. the ComputerScreen terminal empty
++  // state) dispatch this event; fill the input here instead of submitting.
++  useEffect(() => {
++    const onStarterPrompt = (e: Event) => {
++      const prompt = (e as CustomEvent<string>).detail;
++      if (typeof prompt === 'string' && prompt) fillFromTemplate(prompt);
++    };
++    window.addEventListener(STARTER_PROMPT_EVENT, onStarterPrompt);
++    return () => window.removeEventListener(STARTER_PROMPT_EVENT, onStarterPrompt);
++  }, []);
++
+   const add = async (files: FileList | File[]) => {
+     const list = await Promise.all(Array.from(files).map(toAttachment));
+     setAtts((p) => [...p, ...list]);
+@@ -66,6 +93,7 @@ export function InputBar({
+   const submit = () => {
+     if (busy) return onStop();
+     if (!text.trim() && !atts.length) return;
++    setHasSubmitted(true);
+     onSubmit(text.trim(), atts);
+     setText('');
+     setAtts([]);
+@@ -88,6 +116,14 @@ export function InputBar({
+       }}
+       className={`glass rounded-[28px] p-2 transition-all duration-300 focus-within:ring-2 focus-within:ring-cyan-400/70 ${drag ? 'ring-2 ring-white/40 scale-[1.01]' : ''}`}
+     >
++      {/* Starter task chips (p12): only before the first run, while the input
++          is empty and idle. Tapping one fills the textarea — never submits. */}
++      {!hasSubmitted && !busy && !starting && !text.trim() && (
++        <div className="px-2 pb-1 pt-2">
++          <StarterPrompts onSelect={fillFromTemplate} />
++        </div>
++      )}
++
+       {atts.length > 0 && (
+         <div className="flex gap-2 overflow-x-auto px-2 pt-2 pb-1 scrollbar-none">
+           {atts.map((a) => (
+diff --git a/apps/swarmagents/minimalist-ui/src/components/StarterPrompts.tsx b/apps/swarmagents/minimalist-ui/src/components/StarterPrompts.tsx
+new file mode 100644
+index 000000000..2200aec35
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/StarterPrompts.tsx
+@@ -0,0 +1,54 @@
++import { STARTER_TEMPLATES, type StarterTemplate } from '../templates';
++
++/**
++ * Window event fired when a starter chip is tapped somewhere that cannot
++ * call back into the input directly (e.g. the ComputerScreen terminal empty
++ * state). InputBar listens for it and fills the textarea.
++ */
++export const STARTER_PROMPT_EVENT = 'swarmagents:starter-prompt';
++
++export function dispatchStarterPrompt(prompt: string) {
++  if (typeof window === 'undefined') return;
++  window.dispatchEvent(
++    new CustomEvent<string>(STARTER_PROMPT_EVENT, { detail: prompt }),
++  );
++}
++
++/**
++ * Tappable starter-task chips for the empty workspace (p12). Clicking a chip
++ * calls `onSelect` with the template's full prompt — the caller fills the
++ * input so the user can edit it and press Send. Nothing auto-submits.
++ * Native buttons, so the chips are keyboard accessible (Tab + Enter/Space).
++ */
++export function StarterPrompts({
++  templates = STARTER_TEMPLATES,
++  onSelect,
++  className = '',
++}: {
++  templates?: StarterTemplate[];
++  /** Called with the template's full prompt. The caller fills the input; nothing auto-submits. */
++  onSelect: (prompt: string) => void;
++  className?: string;
++}) {
++  if (templates.length === 0) return null;
++  return (
++    <div className={className} role="group" aria-label="Starter tasks">
++      <div className="mb-2 text-[11px] font-medium tracking-wide text-white/40">
++        Try one of these to get started
++      </div>
++      <div className="flex flex-wrap gap-1.5">
++        {templates.map((t) => (
++          <button
++            key={t.id}
++            type="button"
++            onClick={() => onSelect(t.prompt)}
++            title={t.prompt}
++            className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-white/70 transition hover:border-cyan-400/40 hover:bg-cyan-400/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70"
++          >
++            {t.label}
++          </button>
++        ))}
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/templates.ts b/apps/swarmagents/minimalist-ui/src/templates.ts
+new file mode 100644
+index 000000000..8e13af005
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/templates.ts
+@@ -0,0 +1,71 @@
++/**
++ * Starter task templates (p12).
++ *
++ * Shown as tappable chips on the empty workspace so a brand-new signed-in
++ * user sees concrete things to try. Tapping a chip only FILLS the input —
++ * nothing here auto-submits.
++ */
++
++export interface StarterTemplate {
++  /** Stable id, used as the React key. */
++  id: string;
++  /** Short label shown on the chip. */
++  label: string;
++  /** Full prompt filled into the input when the chip is tapped. */
++  prompt: string;
++}
++
++export const STARTER_TEMPLATES: StarterTemplate[] = [
++  {
++    id: 'python-script-tests',
++    label: 'Python script + tests',
++    prompt:
++      'Write a small Python script that reads a CSV file and prints the top 5 rows by a numeric column, with tests.',
++  },
++  {
++    id: 'summarize-url',
++    label: 'Summarize a URL',
++    prompt:
++      'Summarize this article in 5 bullet points, then list the 3 most surprising claims. URL: ',
++  },
++  {
++    id: 'readme-cli',
++    label: 'README for a CLI',
++    prompt:
++      'Scaffold a README for a tiny CLI tool: installation, usage, and one worked example.',
++  },
++  {
++    id: 'audit-todos',
++    label: 'Find TODOs',
++    prompt:
++      'Audit this workspace for TODO, FIXME, and HACK comments and list them grouped by file.',
++  },
++  {
++    id: 'weekly-changelog',
++    label: 'Weekly changelog',
++    prompt:
++      "Turn the last week's git log into a short weekly changelog grouped by feature.",
++  },
++  {
++    id: 'tidy-csv',
++    label: 'Tidy a CSV',
++    prompt:
++      'Tidy up this CSV: remove duplicate rows, trim whitespace, and sort by the first column.',
++  },
++  {
++    id: 'explain-file',
++    label: 'Explain a file',
++    prompt: 'Explain what this file does in plain English, line by line: ',
++  },
++  {
++    id: 'fix-failing-test',
++    label: 'Fix a failing test',
++    prompt: 'Run the test suite, find the first failing test, and fix it.',
++  },
++  {
++    id: 'health-check',
++    label: 'Add a health check',
++    prompt:
++      'Add a /health endpoint that returns 200 with the app version and uptime.',
++  },
++];
+-- 
+2.55.0
+

@@ -1,0 +1,221 @@
+From 5e95007fce14a6457728d31d7d55c63ad59434c8 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 23:13:22 +0000
+Subject: [PATCH] [p23] Route tests for VM status and run-by-id
+
+---
+ .../app/api/runtime/runs/[id]/route.test.ts   | 102 ++++++++++++++++++
+ .../app/api/runtime/vm/status/route.test.ts   |  92 ++++++++++++++++
+ 2 files changed, 194 insertions(+)
+ create mode 100644 apps/swarmagents/app/api/runtime/runs/[id]/route.test.ts
+ create mode 100644 apps/swarmagents/app/api/runtime/vm/status/route.test.ts
+
+diff --git a/apps/swarmagents/app/api/runtime/runs/[id]/route.test.ts b/apps/swarmagents/app/api/runtime/runs/[id]/route.test.ts
+new file mode 100644
+index 000000000..7e899d971
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/runs/[id]/route.test.ts
+@@ -0,0 +1,102 @@
++/**
++ * Extra cases for GET /api/runtime/runs/<id>.
++ *
++ * The core happy-path and validation coverage for this route lives in the
++ * parent ../route.test.ts (replay, ?from=, 401, 400 bad id, 404 unknown id,
++ * cross-user 404). This file only adds the cases that file does not cover:
++ * the last-event-id header fallback, out-of-range/invalid `from`, and the
++ * caller-header length checks.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++import { GET } from "./route";
++import { TelemetryBus, type TelemetryEvent } from "../../../../../lib/telemetry/bus";
++import { configureRunsDir } from "../../../../../lib/telemetry/paths";
++
++function request(url: string, user: string | null = "alice", extra: Record<string, string> = {}): NextRequest {
++  const headers = new Headers();
++  if (user !== null) headers.set("x-swarm-user", user);
++  for (const [key, value] of Object.entries(extra)) headers.set(key, value);
++  return new NextRequest(`http://localhost${url}`, { headers });
++}
++
++function ctx(id: string): { params: Promise<{ id: string }> } {
++  return { params: Promise.resolve({ id }) };
++}
++
++function seed(dir: string): void {
++  const bus = new TelemetryBus({ persist: true, runsDir: () => dir });
++  bus.publish("run_1", { type: "run.created", data: { prompt: "first run", userId: "alice" } });
++  bus.publish("run_1", { type: "run.started", sessionId: "sess_1" } as TelemetryEvent);
++  bus.publish("run_1", { type: "run.finished", exitCode: 0, sessionId: "sess_1", costUsd: 0.03 } as TelemetryEvent);
++}
++
++type ReplayBody = {
++  runId: string;
++  summary: { status: string };
++  events: Array<{ type: string; seq: number }>;
++};
++
++test("GET /api/runtime/runs/<id> honours the last-event-id header", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-runs-id-header-"));
++  configureRunsDir(dir);
++  try {
++    seed(dir);
++
++    const res = await GET(request("/api/runtime/runs/run_1", "alice", { "last-event-id": "1" }), ctx("run_1"));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as ReplayBody;
++    assert.deepEqual(body.events.map((event) => event.seq), [2, 3]);
++
++    // The ?from= query param wins over the header when both are present.
++    const both = await GET(
++      request("/api/runtime/runs/run_1?from=2", "alice", { "last-event-id": "1" }),
++      ctx("run_1"),
++    );
++    assert.deepEqual(((await both.json()) as ReplayBody).events.map((event) => event.seq), [3]);
++  } finally {
++    configureRunsDir(null);
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("GET /api/runtime/runs/<id> treats invalid and out-of-range from as no filter", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-runs-id-from-"));
++  configureRunsDir(dir);
++  try {
++    seed(dir);
++
++    for (const from of ["abc", "-5", "0"]) {
++      const res = await GET(request(`/api/runtime/runs/run_1?from=${from}`), ctx("run_1"));
++      assert.equal(res.status, 200);
++      assert.deepEqual(((await res.json()) as ReplayBody).events.map((event) => event.seq), [1, 2, 3]);
++    }
++
++    const beyond = await GET(request("/api/runtime/runs/run_1?from=99"), ctx("run_1"));
++    assert.equal(beyond.status, 200);
++    assert.deepEqual(((await beyond.json()) as ReplayBody).events, []);
++  } finally {
++    configureRunsDir(null);
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("GET /api/runtime/runs/<id> rejects empty and over-long caller headers", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-runs-id-auth-"));
++  configureRunsDir(dir);
++  try {
++    seed(dir);
++    assert.equal((await GET(request("/api/runtime/runs/run_1", ""), ctx("run_1"))).status, 401);
++    assert.equal((await GET(request("/api/runtime/runs/run_1", "x".repeat(129)), ctx("run_1"))).status, 401);
++    // Exactly 128 chars is still a valid caller.
++    assert.equal((await GET(request("/api/runtime/runs/run_1", "x".repeat(128)), ctx("run_1"))).status, 404);
++  } finally {
++    configureRunsDir(null);
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/app/api/runtime/vm/status/route.test.ts b/apps/swarmagents/app/api/runtime/vm/status/route.test.ts
+new file mode 100644
+index 000000000..1e917aa36
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/vm/status/route.test.ts
+@@ -0,0 +1,92 @@
++/**
++ * Tests for GET /api/runtime/vm/status with the fake VM driver.
++ * Auth is the middleware-set x-swarm-user header.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { NextRequest } from "next/server";
++import { GET } from "./route";
++import { VmManager, setVmManagerForTesting } from "../../../../../lib/vm/manager";
++import { FakeVmDriver } from "../../../../../lib/vm/fake-driver";
++import type { VmHandle, VmState } from "../../../../../lib/vm/types";
++
++function install(quotas?: { diskQuotaMb: number }): VmManager {
++  const manager = new VmManager({ customDriver: new FakeVmDriver(), quotas });
++  setVmManagerForTesting(manager);
++  return manager;
++}
++
++function request(user: string | null = "alice"): NextRequest {
++  const headers = new Headers();
++  if (user !== null) headers.set("x-swarm-user", user);
++  return new NextRequest("http://localhost/api/runtime/vm/status", { headers });
++}
++
++/** 1 MiB string. */
++function mib(n: number): string {
++  return "x".repeat(1024 * 1024 * n);
++}
++
++test.afterEach(() => {
++  setVmManagerForTesting(null);
++});
++
++test("GET /api/runtime/vm/status rejects unauthenticated requests", async () => {
++  install();
++  assert.equal((await GET(request(null))).status, 401);
++  assert.equal((await GET(request(""))).status, 401);
++  assert.equal((await GET(request("x".repeat(129)))).status, 401);
++});
++
++test("GET /api/runtime/vm/status returns status and disk for the caller", async () => {
++  install();
++
++  const res = await GET(request("alice"));
++  assert.equal(res.status, 200);
++  const body = (await res.json()) as {
++    status: VmState;
++    disk: { usedMb: number; quotaMb: number; overQuota: boolean };
++  };
++  assert.equal(body.status.status, "running");
++  assert.equal(body.disk.usedMb, 0);
++  assert.equal(body.disk.quotaMb, 0);
++  assert.equal(body.disk.overQuota, false);
++});
++
++test("GET /api/runtime/vm/status reports per-user disk usage against the quota", async () => {
++  const manager = install({ diskQuotaMb: 1 });
++
++  await manager.writeFile("alice", "/workspace/big.bin", mib(2));
++
++  const alice = (await (await GET(request("alice"))).json()) as {
++    disk: { usedMb: number; quotaMb: number; overQuota: boolean };
++  };
++  assert.equal(alice.disk.usedMb, 2);
++  assert.equal(alice.disk.quotaMb, 1);
++  assert.equal(alice.disk.overQuota, true);
++
++  const bob = (await (await GET(request("bob"))).json()) as {
++    status: VmState;
++    disk: { usedMb: number; overQuota: boolean };
++  };
++  assert.equal(bob.status.status, "running");
++  assert.equal(bob.disk.usedMb, 0);
++  assert.equal(bob.disk.overQuota, false);
++});
++
++class FailingStatusDriver extends FakeVmDriver {
++  override async status(_handle: VmHandle): Promise<VmState> {
++    throw new Error("driver exploded");
++  }
++}
++
++test("GET /api/runtime/vm/status returns 500 when the driver fails", async () => {
++  const manager = new VmManager({ customDriver: new FailingStatusDriver() });
++  setVmManagerForTesting(manager);
++
++  const res = await GET(request("alice"));
++  assert.equal(res.status, 500);
++  const body = (await res.json()) as { error: string };
++  assert.equal(body.error, "driver exploded");
++});
+-- 
+2.55.0
+

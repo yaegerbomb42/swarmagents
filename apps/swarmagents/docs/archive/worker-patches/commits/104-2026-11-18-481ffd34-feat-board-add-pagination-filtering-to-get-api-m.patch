@@ -1,0 +1,226 @@
+From 481ffd346d2f2c68a09fda2729c0c2d64a2eaf05 Mon Sep 17 00:00:00 2001
+From: mercury-3 <noreply@anthropic.com>
+Date: Wed, 18 Nov 2026 11:20:22 -0600
+Subject: [PATCH] feat(board): add pagination + filtering to GET
+ /api/mcp/swarm-board
+
+GET now supports limit/offset pagination (defaults 50/0, limit capped at
+500) applied to tasks, proposals, and artifacts, alongside the existing
+status filter on tasks. Returns a pagination metadata block {limit, offset,
+total} (total = filtered task count). count unchanged as overall totals.
+Malformed limit/offset values fall back to defaults; a GET with no params
+still works (first page).
+
+Tests: paginated page requested, status-filtered page, no-param default page,
+and malformed-param fallback.
+
+Gates: typecheck 0 errors; unit 2565 pass / 0 fail / 1 skipped; build exit 0.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../app/api/mcp/swarm-board/route.test.ts     | 105 ++++++++++++++++++
+ .../app/api/mcp/swarm-board/route.ts          |  48 ++++++--
+ 2 files changed, 146 insertions(+), 7 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts b/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+index 967985dd4..22f303351 100644
+--- a/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
++++ b/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+@@ -176,3 +176,108 @@ test("GET sets Cache-Control: no-store so task counts are not cached by proxies"
+     fs.rmSync(dir, { recursive: true, force: true });
+   }
+ });
++
++test("GET supports pagination via limit/offset", async () => {
++  const dir = tmpDir();
++  const dataFile = path.join(dir, "swarm_board.json");
++  const tasks = Array.from({ length: 5 }, (_, i) => ({
++    id: `task_${i + 1}`,
++    title: `T${i + 1}`,
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status: "open",
++    createdAt: i + 1,
++    updatedAt: i + 1,
++  }));
++  fs.writeFileSync(dataFile, JSON.stringify({ tasks, proposals: [], messages: [] }), "utf-8");
++  configureStorePaths(dir, dataFile);
++  try {
++    const res = await GET(request("/api/mcp/swarm-board?limit=2&offset=1"));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as {
++      tasks?: Array<{ id: string }>;
++      pagination?: { limit?: number; offset?: number; total?: number };
++    };
++    assert.equal(body.pagination?.limit, 2);
++    assert.equal(body.pagination?.offset, 1);
++    assert.equal(body.pagination?.total, 5);
++    assert.deepEqual(body.tasks?.map((t) => t.id), ["task_2", "task_3"]);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("GET filters tasks by status", async () => {
++  const dir = tmpDir();
++  const dataFile = path.join(dir, "swarm_board.json");
++  const base = (id: string, status: string) => ({
++    id,
++    title: id,
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status,
++    createdAt: 1,
++    updatedAt: 1,
++  });
++  const tasks = [base("task_open1", "open"), base("task_done1", "completed"), base("task_open2", "open")];
++  fs.writeFileSync(dataFile, JSON.stringify({ tasks, proposals: [], messages: [] }), "utf-8");
++  configureStorePaths(dir, dataFile);
++  try {
++    const res = await GET(request("/api/mcp/swarm-board?status=open"));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as {
++      tasks?: Array<{ id: string }>;
++      pagination?: { total?: number };
++    };
++    assert.equal(body.pagination?.total, 2);
++    assert.deepEqual(body.tasks?.map((t) => t.id), ["task_open1", "task_open2"]);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("GET without pagination params still works and uses default page size", async () => {
++  const dir = tmpDir();
++  const dataFile = path.join(dir, "swarm_board.json");
++  seed(dataFile);
++  configureStorePaths(dir, dataFile);
++  try {
++    const res = await GET(request("/api/mcp/swarm-board"));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as {
++      tasks?: unknown[];
++      pagination?: { limit?: number; offset?: number; total?: number };
++    };
++    assert.equal(body.pagination?.limit, 50);
++    assert.equal(body.pagination?.offset, 0);
++    assert.equal(body.pagination?.total, 1);
++    assert.equal(body.tasks?.length, 1);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("GET ignores malformed pagination params (falls back to defaults)", async () => {
++  const dir = tmpDir();
++  const dataFile = path.join(dir, "swarm_board.json");
++  seed(dataFile);
++  configureStorePaths(dir, dataFile);
++  try {
++    const res = await GET(request("/api/mcp/swarm-board?limit=abc&offset=-5&status=open"));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as {
++      tasks?: unknown[];
++      pagination?: { limit?: number; offset?: number; total?: number };
++    };
++    assert.equal(body.pagination?.limit, 50);
++    assert.equal(body.pagination?.offset, 0);
++    assert.equal(body.pagination?.total, 1);
++    assert.equal(body.tasks?.length, 1);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/app/api/mcp/swarm-board/route.ts b/apps/swarmagents/app/api/mcp/swarm-board/route.ts
+index a1aafbc1e..3bc9c94a8 100644
+--- a/apps/swarmagents/app/api/mcp/swarm-board/route.ts
++++ b/apps/swarmagents/app/api/mcp/swarm-board/route.ts
+@@ -25,6 +25,8 @@ import {
+ 
+ export const dynamic = "force-dynamic";
+ const MAX_BODY_SIZE = 256 * 1024;
++const DEFAULT_PAGE_SIZE = 50;
++const MAX_PAGE_SIZE = 500;
+ 
+ /** JSON-RPC server error reserved for a board that is readable again after retry. */
+ const BOARD_UNAVAILABLE_CODE = -32001;
+@@ -110,13 +112,37 @@ function runReadTool(
+   return jsonRpcResponse({ result: res.result }, id);
+ }
+ 
+-// GET: Returns current board status, active tasks, proposals, and messages
++// GET: Returns current board status, active tasks, proposals, and messages.
++// Pagination is via `limit`/`offset` (defaults: 50/0); tasks may be filtered
++// by `status`. Invalid limit/offset values fall back to the defaults.
++function parsePageParams(url: URL): { limit: number; offset: number } {
++  const rawLimit = url.searchParams.get("limit");
++  const rawOffset = url.searchParams.get("offset");
++
++  let limit = DEFAULT_PAGE_SIZE;
++  let offset = 0;
++
++  if (rawLimit !== null) {
++    const n = Number(rawLimit);
++    if (Number.isInteger(n) && n > 0) limit = Math.min(n, MAX_PAGE_SIZE);
++  }
++
++  if (rawOffset !== null) {
++    const n = Number(rawOffset);
++    if (Number.isInteger(n) && n >= 0) offset = n;
++  }
++
++  return { limit, offset };
++}
++
+ export async function GET(req: NextRequest) {
+   const loaded = loadOrUnavailable();
+   if ("response" in loaded) return loaded.response;
+   const store = loaded.store;
++
+   const url = new URL(req.url);
+   const status = url.searchParams.get("status");
++  const { limit, offset } = parsePageParams(url);
+ 
+   let tasks = store.tasks;
+   if (status) {
+@@ -126,6 +152,12 @@ export async function GET(req: NextRequest) {
+   // transition history existed.
+   tasks = tasks.map((t) => ({ ...t, history: Array.isArray(t.history) ? t.history : [] }));
+ 
++  const proposals = store.proposals.map((p) => ({
++    ...p,
++    decisions: Array.isArray(p.decisions) ? p.decisions : [],
++  }));
++  const artifacts = store.artifacts ?? [];
++
+   return NextResponse.json({
+     name: "swarm-board",
+     version: "2.0.0",
+@@ -140,12 +172,14 @@ export async function GET(req: NextRequest) {
+       pending_proposals: store.proposals.filter((p) => p.status === "pending").length,
+       artifacts: store.artifacts?.length ?? 0,
+     },
+-    artifacts: store.artifacts ?? [],
+-    tasks,
+-    proposals: store.proposals.map((p) => ({
+-      ...p,
+-      decisions: Array.isArray(p.decisions) ? p.decisions : [],
+-    })),
++    pagination: {
++      limit,
++      offset,
++      total: tasks.length,
++    },
++    artifacts: artifacts.slice(offset, offset + limit),
++    tasks: tasks.slice(offset, offset + limit),
++    proposals: proposals.slice(offset, offset + limit),
+     messages: store.messages.slice(-20),
+   }, { headers: { "Cache-Control": "no-store" } });
+ }
+-- 
+2.55.0
+

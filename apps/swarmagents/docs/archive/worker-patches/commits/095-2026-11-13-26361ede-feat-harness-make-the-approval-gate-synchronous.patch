@@ -1,0 +1,2623 @@
+From 26361edef698ad567eb66a53a43ffa6d3b49f155 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <2.03348624e+08+yaegerbomb42@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:59:57 +0000
+Subject: [PATCH] feat(harness): make the approval gate synchronous with
+ execution (b5)
+
+The gate was advisory: the VM's managed settings blanket-allowed Bash, Read,
+Edit, Write and friends, and `claude -p` ran with no PreToolUse hook and no
+permission-prompt tool, so the CLI executed every tool itself. The harness
+only classified the tool_use block from stdout afterwards, opened the
+approval card on a side promise chain, and checked the denial after the
+child exited. `rm -rf /`, `sudo`, a force push or a read of `~/.ssh`
+completed before the card rendered; a deny just relabelled the finished run.
+
+The verdict is now synchronous:
+
+- lib/harness/tool-gate.ts: per-run gate session. The hook's request is
+  classified (allow/ask/deny), an ask waits for the user, and the answer is
+  the tool's permission decision. Fail closed everywhere: no approval
+  channel, unknown token, run over, timeout -> deny. Duplicate hook calls
+  (image hook + --settings hook) are deduped by tool-call id, and a deny
+  blocks the call rather than the run, so the model sees the reason and can
+  adapt. Emits approval.required -> approval.resolved -> tool.started so the
+  ordering is observable, plus tool.blocked for policy denies.
+- app/api/runtime/hooks/pretooluse/route.ts: the endpoint the hook calls,
+  authenticated by the per-run bearer token (it can only ask, never
+  approve). Returns the Claude Code hookSpecificOutput decision.
+- middleware.ts: that path authenticates itself, like the LLM proxy; without
+  the bypass every hook call would 401 and deny every tool.
+- lib/harness/runner.ts: opens the gate, hands the hook its URL and token
+  through the exec env (never argv, and the token is redacted from
+  telemetry), and keeps the stdout gate only as the fallback for a VM whose
+  hook never calls home.
+- lib/runtime/hook-settings.ts: a VM built from an older image gets the hook
+  through a per-run --settings file, probed once per user.
+- lib/harness/risk.ts: isIrreversibleExternal() so g9 full-auto can
+  auto-allow in-VM asks while force pushes, publishes and deploys still ask.
+- runtime + team lanes wire the gate; the hook client is seeded per run.
+
+Tests: unit coverage for every gate path (allow, deny, ask+approve,
+ask+deny, timeout, no channel, full-auto, dedupe, close, token lookup), the
+route, and the real hook client spawned as a child process against a real
+endpoint. The e2e test drives the real hook + route + gate + runner with a
+faithful fake CLI that honours the hook and executes a tool only after it
+was allowed: the target directory survives an unapproved, denied or timed
+out call and disappears only after an approval.
+---
+ .../runtime/hooks/pretooluse/route.test.ts    | 146 ++++++
+ .../app/api/runtime/hooks/pretooluse/route.ts | 100 +++++
+ apps/swarmagents/lib/audit.ts                 |   3 +
+ .../lib/harness/approval-gate.e2e.test.ts     | 343 +++++++++++++++
+ .../harness/fixtures/fake-claude-gated.mjs    | 180 ++++++++
+ .../lib/harness/hook-script.test.ts           | 224 ++++++++++
+ apps/swarmagents/lib/harness/hook-script.ts   |  17 +
+ apps/swarmagents/lib/harness/risk.ts          |  32 ++
+ .../lib/harness/runner.approvals.test.ts      |  98 +++++
+ apps/swarmagents/lib/harness/runner.ts        |  92 +++-
+ .../swarmagents/lib/harness/tool-gate.test.ts | 281 ++++++++++++
+ apps/swarmagents/lib/harness/tool-gate.ts     | 414 ++++++++++++++++++
+ apps/swarmagents/lib/harness/types.ts         |  20 +
+ apps/swarmagents/lib/middleware.test.ts       |  20 +
+ .../lib/runtime/hook-settings.test.ts         | 123 ++++++
+ apps/swarmagents/lib/runtime/hook-settings.ts |  68 +++
+ apps/swarmagents/lib/runtime/manager.ts       |  52 ++-
+ apps/swarmagents/lib/team/harness.ts          |  26 +-
+ apps/swarmagents/middleware.ts                |  17 +-
+ 19 files changed, 2230 insertions(+), 26 deletions(-)
+ create mode 100644 apps/swarmagents/app/api/runtime/hooks/pretooluse/route.test.ts
+ create mode 100644 apps/swarmagents/app/api/runtime/hooks/pretooluse/route.ts
+ create mode 100644 apps/swarmagents/lib/harness/approval-gate.e2e.test.ts
+ create mode 100644 apps/swarmagents/lib/harness/fixtures/fake-claude-gated.mjs
+ create mode 100644 apps/swarmagents/lib/harness/hook-script.test.ts
+ create mode 100644 apps/swarmagents/lib/harness/hook-script.ts
+ create mode 100644 apps/swarmagents/lib/harness/tool-gate.test.ts
+ create mode 100644 apps/swarmagents/lib/harness/tool-gate.ts
+ create mode 100644 apps/swarmagents/lib/runtime/hook-settings.test.ts
+ create mode 100644 apps/swarmagents/lib/runtime/hook-settings.ts
+
+diff --git a/apps/swarmagents/app/api/runtime/hooks/pretooluse/route.test.ts b/apps/swarmagents/app/api/runtime/hooks/pretooluse/route.test.ts
+new file mode 100644
+index 000000000..f48906f74
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/hooks/pretooluse/route.test.ts
+@@ -0,0 +1,146 @@
++/**
++ * Tests for the PreToolUse hook endpoint.
++ *
++ * The endpoint is what the VM's hook client calls before every tool: its answer
++ * is the Claude Code permission decision, so "deny" here means the tool never
++ * executes. Auth is the per-run bearer token; anything unrecognised must fail
++ * closed (the client turns a non-200 into a denial).
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { NextRequest } from "next/server";
++import { POST } from "./route";
++import { closeAllToolGates, openToolGate, type ToolGateSession } from "../../../../../lib/harness/tool-gate";
++import type { ApprovalGateway, TelemetryEvent } from "../../../../../lib/harness/types";
++
++const HOOK_URL = "http://app.test/api/runtime/hooks/pretooluse";
++
++function deferredVerdict() {
++  let resolve!: (v: "approved" | "denied" | "expired") => void;
++  const promise = new Promise<"approved" | "denied" | "expired">((r) => {
++    resolve = r;
++  });
++  return { promise, resolve };
++}
++
++function makeSession(gateway?: ApprovalGateway) {
++  const events: TelemetryEvent[] = [];
++  const session = openToolGate(
++    { runId: "run_route", userId: "alice", hookUrl: HOOK_URL, ...(gateway ? { approvalGateway: gateway } : {}) },
++    (event) => events.push(event),
++  ) as ToolGateSession;
++  return { session, events };
++}
++
++function hookRequest(token: string | null, body: unknown, raw?: string): NextRequest {
++  const headers = new Headers({ "content-type": "application/json" });
++  if (token) headers.set("authorization", `Bearer ${token}`);
++  return new NextRequest(HOOK_URL, {
++    method: "POST",
++    headers,
++    body: raw ?? JSON.stringify(body),
++  });
++}
++
++test.afterEach(() => closeAllToolGates());
++
++test("an unknown token is refused, so the hook fails closed", async () => {
++  makeSession();
++  const res = await POST(hookRequest("hk1_unknownunknownunknownunknown12", { tool_name: "Bash", tool_input: { command: "ls" } }));
++  assert.equal(res.status, 404);
++});
++
++test("a missing token is refused", async () => {
++  const res = await POST(hookRequest(null, { tool_name: "Bash", tool_input: { command: "ls" } }));
++  assert.equal(res.status, 404);
++});
++
++test("a benign call comes back as a Claude Code allow decision", async () => {
++  const { session } = makeSession();
++  const res = await POST(
++    hookRequest(session.token, { tool_name: "Bash", tool_input: { command: "ls -la" }, tool_use_id: "toolu_ok" }),
++  );
++  assert.equal(res.status, 200);
++  const body = (await res.json()) as { hookSpecificOutput: Record<string, unknown> };
++  assert.equal(body.hookSpecificOutput.hookEventName, "PreToolUse");
++  assert.equal(body.hookSpecificOutput.permissionDecision, "allow");
++  assert.equal(typeof body.hookSpecificOutput.permissionDecisionReason, "string");
++});
++
++test("an ask-classified call returns allow only after the user approves", async () => {
++  const { promise, resolve } = deferredVerdict();
++  const { session } = makeSession(async () => ({ id: "appr_route_1", verdict: promise }));
++
++  const pending = POST(
++    hookRequest(session.token, {
++      tool_name: "Bash",
++      tool_input: { command: "rm -rf /tmp/route-test" },
++      tool_use_id: "toolu_ask",
++    }),
++  );
++
++  await new Promise((r) => setTimeout(r, 20));
++  resolve("approved");
++  const res = await pending;
++  const body = (await res.json()) as { hookSpecificOutput: { permissionDecision: string } };
++  assert.equal(body.hookSpecificOutput.permissionDecision, "allow");
++});
++
++test("a denied approval returns a deny decision with the reason the model sees", async () => {
++  const { promise, resolve } = deferredVerdict();
++  const { session } = makeSession(async () => ({ id: "appr_route_2", verdict: promise }));
++
++  const pending = POST(
++    hookRequest(session.token, {
++      tool_name: "Bash",
++      tool_input: { command: "rm -rf /tmp/route-test" },
++      tool_use_id: "toolu_deny",
++    }),
++  );
++  await new Promise((r) => setTimeout(r, 20));
++  resolve("denied");
++
++  const res = await pending;
++  const body = (await res.json()) as { hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string } };
++  assert.equal(body.hookSpecificOutput.permissionDecision, "deny");
++  assert.match(body.hookSpecificOutput.permissionDecisionReason, /denied/i);
++});
++
++test("a deny-classified call is denied without opening a card", async () => {
++  let asked = 0;
++  const { session } = makeSession(async () => {
++    asked += 1;
++    return { id: "appr_unused", verdict: deferredVerdict().promise };
++  });
++  const res = await POST(
++    hookRequest(session.token, { tool_name: "Bash", tool_input: { command: "cat /etc/shadow" } }),
++  );
++  const body = (await res.json()) as { hookSpecificOutput: { permissionDecision: string } };
++  assert.equal(body.hookSpecificOutput.permissionDecision, "deny");
++  assert.equal(asked, 0);
++});
++
++test("malformed bodies are denied rather than allowed", async () => {
++  const { session } = makeSession();
++  const cases: Array<{ body: unknown; raw?: string }> = [
++    { body: null, raw: "{not json" },
++    { body: [] },
++    { body: { tool_input: { command: "ls" } } },
++    { body: { tool_name: "" } },
++  ];
++  for (const item of cases) {
++    const res = await POST(hookRequest(session.token, item.body, item.raw));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as { hookSpecificOutput: { permissionDecision: string } };
++    assert.equal(body.hookSpecificOutput.permissionDecision, "deny");
++  }
++});
++
++test("an oversized body is denied", async () => {
++  const { session } = makeSession();
++  const huge = JSON.stringify({ tool_name: "Bash", tool_input: { command: "x".repeat(200 * 1024) } });
++  const res = await POST(hookRequest(session.token, null, huge));
++  const body = (await res.json()) as { hookSpecificOutput: { permissionDecision: string } };
++  assert.equal(body.hookSpecificOutput.permissionDecision, "deny");
++});
+diff --git a/apps/swarmagents/app/api/runtime/hooks/pretooluse/route.ts b/apps/swarmagents/app/api/runtime/hooks/pretooluse/route.ts
+new file mode 100644
+index 000000000..28586097a
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/hooks/pretooluse/route.ts
+@@ -0,0 +1,100 @@
++/**
++ * PreToolUse hook endpoint: the app side of the VM's synchronous risk gate.
++ *
++ * The VM's managed settings register a PreToolUse hook
++ * (vm-image/managed-settings.json -> vm-image/pretooluse-hook.mjs). Before the
++ * CLI executes any tool it spawns that hook, which POSTs the tool call here and
++ * blocks until this route answers. The response is a Claude Code hook decision:
++ * "allow" lets the CLI run the tool, "deny" blocks it and hands the reason to
++ * the model, so a denied or timed-out approval never executes anything.
++ *
++ * Auth: `Authorization: Bearer <per-run token>`. The token is minted per run by
++ * the harness (lib/harness/tool-gate.ts), lives only in memory, is revoked when
++ * the run ends, and can only *ask* — it cannot approve anything, so a leaked
++ * token cannot lift the gate.
++ *
++ * This route is called from inside the user's VM, not from a browser: it does
++ * not use the x-swarm-user header (the hook has no session), and it never reads
++ * another user's data — the token resolves to exactly one run's gate session.
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { getToolGateSession } from "../../../../../lib/harness/tool-gate";
++import { recordAudit } from "../../../../../lib/audit";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++/** Tool inputs are small (a command, a path, a URL); cap the body hard. */
++const MAX_BODY_SIZE = 128 * 1024;
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++/** Extract the bearer token from the Authorization header. */
++function bearerToken(req: NextRequest): string | null {
++  const header = req.headers.get("authorization");
++  if (!header) return null;
++  const match = /^Bearer\s+(\S+)$/i.exec(header.trim());
++  return match ? match[1] : null;
++}
++
++/** The Claude Code PreToolUse decision envelope. */
++function hookDecision(decision: "allow" | "deny", reason: string) {
++  return {
++    hookSpecificOutput: {
++      hookEventName: "PreToolUse" as const,
++      permissionDecision: decision,
++      permissionDecisionReason: reason.slice(0, 500),
++    },
++  };
++}
++
++export async function POST(req: NextRequest) {
++  const session = getToolGateSession(bearerToken(req));
++  if (!session) {
++    // Unknown/expired token: the hook turns this into a denial (fail closed).
++    return NextResponse.json({ error: "Unknown or expired approval session." }, { status: 404 });
++  }
++
++  let text: string;
++  try {
++    text = await req.text();
++  } catch {
++    return NextResponse.json(hookDecision("deny", "could not read the hook payload"), { status: 200 });
++  }
++  if (text.length > MAX_BODY_SIZE) {
++    return NextResponse.json(hookDecision("deny", "hook payload too large"), { status: 200 });
++  }
++
++  let body: unknown;
++  try {
++    body = JSON.parse(text);
++  } catch {
++    return NextResponse.json(hookDecision("deny", "hook payload was not valid JSON"), { status: 200 });
++  }
++  if (!isRecord(body)) {
++    return NextResponse.json(hookDecision("deny", "hook payload must be a JSON object"), { status: 200 });
++  }
++  if (typeof body.tool_name !== "string" || body.tool_name === "") {
++    return NextResponse.json(hookDecision("deny", "hook payload did not name a tool"), { status: 200 });
++  }
++
++  const verdict = await session.decide({
++    hook_event_name: body.hook_event_name,
++    session_id: body.session_id,
++    tool_name: body.tool_name,
++    tool_input: body.tool_input,
++    tool_use_id: body.tool_use_id,
++  });
++
++  recordAudit({
++    user: session.userId || session.runId,
++    action: verdict.decision === "allow" ? "tool.allow" : "tool.deny",
++    target: body.tool_name,
++    result: "success",
++  });
++
++  return NextResponse.json(hookDecision(verdict.decision, verdict.reason), { status: 200 });
++}
+diff --git a/apps/swarmagents/lib/audit.ts b/apps/swarmagents/lib/audit.ts
+index 5db8ded35..9a3312d1d 100644
+--- a/apps/swarmagents/lib/audit.ts
++++ b/apps/swarmagents/lib/audit.ts
+@@ -30,6 +30,9 @@ export type AuditAction =
+   | "approval.approve"
+   | "approval.deny"
+   | "approval.expire"
++  /** A PreToolUse hook call was allowed / blocked by the synchronous risk gate. */
++  | "tool.allow"
++  | "tool.deny"
+   | "snapshot.create"
+   | "snapshot.restore"
+   | "login.success"
+diff --git a/apps/swarmagents/lib/harness/approval-gate.e2e.test.ts b/apps/swarmagents/lib/harness/approval-gate.e2e.test.ts
+new file mode 100644
+index 000000000..6e050bccf
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/approval-gate.e2e.test.ts
+@@ -0,0 +1,343 @@
++/**
++ * End-to-end test for the synchronous approval gate (bug b5).
++ *
++ * Before the fix the gate was advisory: `claude` ran the tool itself and the
++ * harness only classified the call from stdout afterwards, so `rm -rf` of a
++ * directory (or a `sudo` command) completed before the approval card rendered
++ * and a denial merely relabelled the finished run.
++ *
++ * This test wires the real pieces together:
++ *   - the real PreToolUse hook client (vm-image/pretooluse-hook.mjs),
++ *   - the real hook endpoint (app/api/runtime/hooks/pretooluse/route.ts),
++ *   - the real gate + runner (lib/harness/tool-gate.ts, runner.ts),
++ *   - and a faithful fake CLI (fixtures/fake-claude-gated.mjs) that executes a
++ *     tool only after the hook allowed it, exactly like the real CLI.
++ *
++ * The assertion is on the filesystem: the directory a risky command targets is
++ * still there while the card is pending, after a denial, and after a timeout —
++ * and gone only once the user approved.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { createServer, type Server } from "node:http";
++import { spawn } from "node:child_process";
++import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { NextRequest } from "next/server";
++import { POST as hookRoute } from "../../app/api/runtime/hooks/pretooluse/route";
++import { ClaudeCodeRunner } from "./runner";
++import { closeAllToolGates, TOOL_HOOK_COMMAND } from "./tool-gate";
++import type { ApprovalGateway, TelemetryEvent, VmExec, VmExecOpts } from "./types";
++
++const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
++const HOOK_SCRIPT = path.join(APP_ROOT, "vm-image/pretooluse-hook.mjs");
++const FAKE_CLI = path.join(APP_ROOT, "lib/harness/fixtures/fake-claude-gated.mjs");
++
++const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
++
++async function until(cond: () => boolean, timeoutMs = 5000): Promise<void> {
++  const start = Date.now();
++  while (!cond()) {
++    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
++    await sleep(10);
++  }
++}
++
++/** The hook endpoint, served over real HTTP so the real hook client can call it. */
++async function startBridge(): Promise<{ server: Server; url: string }> {
++  const server = createServer((req, res) => {
++    const chunks: Buffer[] = [];
++    req.on("data", (chunk: Buffer) => chunks.push(chunk));
++    req.on("end", () => {
++      const body = Buffer.concat(chunks).toString("utf8");
++      const headers = new Headers();
++      for (const [key, value] of Object.entries(req.headers)) {
++        if (typeof value === "string") headers.set(key, value);
++      }
++      const nextReq = new NextRequest("http://app.test/api/runtime/hooks/pretooluse", {
++        method: "POST",
++        headers,
++        body,
++      });
++      hookRoute(nextReq)
++        .then(async (out) => {
++          const text = await out.text();
++          res.writeHead(out.status, { "content-type": "application/json" });
++          res.end(text);
++        })
++        .catch((error: unknown) => {
++          res.writeHead(500, { "content-type": "application/json" });
++          res.end(JSON.stringify({ error: String(error) }));
++        });
++    });
++  });
++  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
++  const address = server.address();
++  assert.ok(address && typeof address === "object");
++  return { server, url: `http://127.0.0.1:${address.port}/api/runtime/hooks/pretooluse` };
++}
++
++/** VmExec that spawns the fake CLI in a real temp workspace. */
++class SpawnVm implements VmExec {
++  readonly calls: string[][] = [];
++  constructor(private readonly cwd: string) {}
++  exec(cmd: string[], opts?: VmExecOpts): Promise<{ exitCode: number }> {
++    this.calls.push(cmd);
++    const argv = cmd[0] === "claude" ? [process.execPath, FAKE_CLI, ...cmd.slice(1)] : cmd;
++    return new Promise((resolve, reject) => {
++      const child = spawn(argv[0], argv.slice(1), {
++        cwd: opts?.cwd ?? this.cwd,
++        env: { ...process.env, ...(opts?.env ?? {}) },
++        stdio: ["ignore", "pipe", "pipe"],
++      });
++      child.stdout.on("data", (chunk) => opts?.onStdout?.(String(chunk)));
++      child.stderr.on("data", (chunk) => opts?.onStderr?.(String(chunk)));
++      opts?.signal?.addEventListener("abort", () => child.kill("SIGKILL"));
++      child.on("error", reject);
++      child.on("close", (code) => resolve({ exitCode: code ?? 0 }));
++    });
++  }
++}
++
++function deferredVerdict() {
++  let resolve!: (v: "approved" | "denied" | "expired") => void;
++  const promise = new Promise<"approved" | "denied" | "expired">((r) => {
++    resolve = r;
++  });
++  return { promise, resolve };
++}
++
++function makeGateway() {
++  const requests: Array<{ toolName: string; action: string; reason: string }> = [];
++  const resolvers: Array<(v: "approved" | "denied" | "expired") => void> = [];
++  const gateway: ApprovalGateway = async (req) => {
++    requests.push({ toolName: req.toolName, action: req.action, reason: req.reason });
++    const { promise, resolve } = deferredVerdict();
++    resolvers.push(resolve);
++    return { id: `appr_e2e_${requests.length}`, verdict: promise };
++  };
++  return { gateway, requests, resolvers };
++}
++
++interface Scenario {
++  /** Absolute path the risky command deletes. */
++  target: string;
++  /** Absolute path of the file inside it (the "marker"). */
++  marker: string;
++}
++
++function workspace(): { dir: string; scenario: Scenario; plan: (steps: Array<{ name: string; input: unknown }>) => string } {
++  const dir = mkdtempSync(path.join(tmpdir(), "gate-e2e-"));
++  const target = path.join(dir, "doomed");
++  mkdirSync(target, { recursive: true });
++  const marker = path.join(target, "keep.txt");
++  writeFileSync(marker, "still here\n");
++  const plan = (steps: Array<{ name: string; input: unknown }>) => {
++    const file = path.join(dir, `plan-${Math.random().toString(16).slice(2)}.json`);
++    writeFileSync(file, JSON.stringify({ text: "Working on it.", steps }));
++    return file;
++  };
++  return { dir, scenario: { target, marker }, plan };
++}
++
++async function runScenario(opts: {
++  bridgeUrl: string;
++  planFile: string;
++  cwd: string;
++  gateway: ApprovalGateway;
++  env?: Record<string, string>;
++  doubleHook?: boolean;
++}): Promise<{ events: TelemetryEvent[]; outcome: { exitCode: number } }> {
++  const events: TelemetryEvent[] = [];
++  const runner = new ClaudeCodeRunner({ bin: "claude" });
++  const vm = new SpawnVm(opts.cwd);
++  const outcome = await runner.run(
++    {
++      prompt: "do the thing",
++      env: {
++        FAKE_CLAUDE_PLAN: opts.planFile,
++        FAKE_CLAUDE_HOOK_COMMAND: TOOL_HOOK_COMMAND,
++        SWARM_HOOK_SCRIPT: HOOK_SCRIPT,
++        ...(opts.doubleHook ? { FAKE_CLAUDE_DOUBLE_HOOK: "1" } : {}),
++        ...(opts.env ?? {}),
++      },
++      vm,
++      cwd: opts.cwd,
++      toolGate: { runId: "run_e2e", userId: "alice", hookUrl: opts.bridgeUrl, approvalGateway: opts.gateway },
++    },
++    (event) => events.push(event),
++  );
++  return { events, outcome };
++}
++
++test.afterEach(() => closeAllToolGates());
++
++test("an ask command does not run until approved, then it runs", async () => {
++  const { server, url } = await startBridge();
++  const { dir, scenario, plan } = workspace();
++  try {
++    const { gateway, requests, resolvers } = makeGateway();
++    const planFile = plan([{ name: "Bash", input: { command: `rm -rf ${scenario.target}` } }]);
++
++    const runPromise = runScenario({ bridgeUrl: url, planFile, cwd: dir, gateway });
++
++    await until(() => requests.length === 1);
++    // The card is pending: the tool has NOT executed.
++    assert.equal(existsSync(scenario.marker), true, "the risky command ran before the approval card was answered");
++    assert.equal(requests[0].toolName, "Bash");
++    assert.match(requests[0].action, /rm -rf/);
++
++    resolvers[0]("approved");
++    const { events, outcome } = await runPromise;
++
++    assert.equal(outcome.exitCode, 0);
++    assert.equal(existsSync(scenario.marker), false, "the approved command should have run");
++
++    const types = events.map((e) => e.type);
++    const required = types.indexOf("approval.required");
++    const started = types.indexOf("tool.started");
++    assert.ok(required >= 0, "approval.required must be emitted");
++    assert.ok(started > required, "tool.started must come after approval.required");
++    assert.equal(types.filter((t) => t === "run.error").length, 0, "an approved call must not fail the run");
++  } finally {
++    server.close();
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("a denied command never executes", async () => {
++  const { server, url } = await startBridge();
++  const { dir, scenario, plan } = workspace();
++  try {
++    const { gateway, requests, resolvers } = makeGateway();
++    const planFile = plan([{ name: "Bash", input: { command: `rm -rf ${scenario.target}` } }]);
++
++    const runPromise = runScenario({ bridgeUrl: url, planFile, cwd: dir, gateway });
++    await until(() => requests.length === 1);
++    resolvers[0]("denied");
++    const { events, outcome } = await runPromise;
++
++    assert.equal(outcome.exitCode, 0);
++    assert.equal(existsSync(scenario.marker), true, "a denied command must never execute");
++    assert.equal(events.some((e) => e.type === "tool.started"), false);
++    const resolved = events.find((e) => e.type === "approval.resolved") as Extract<TelemetryEvent, { type: "approval.resolved" }>;
++    assert.equal(resolved.verdict, "denied");
++    // The model was told why: the tool result is an error carrying the reason.
++    const result = events.find((e) => e.type === "tool.result") as Extract<TelemetryEvent, { type: "tool.result" }>;
++    assert.equal(result.ok, false);
++    assert.match(result.output, /denied/i);
++  } finally {
++    server.close();
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("a timed-out approval never executes the command", async () => {
++  const { server, url } = await startBridge();
++  const { dir, scenario, plan } = workspace();
++  try {
++    const { gateway, requests, resolvers } = makeGateway();
++    const planFile = plan([{ name: "Bash", input: { command: `rm -rf ${scenario.target}` } }]);
++
++    const runPromise = runScenario({ bridgeUrl: url, planFile, cwd: dir, gateway });
++    await until(() => requests.length === 1);
++    resolvers[0]("expired");
++    const { events } = await runPromise;
++
++    assert.equal(existsSync(scenario.marker), true, "a timed-out approval must never execute");
++    assert.equal(events.some((e) => e.type === "tool.started"), false);
++  } finally {
++    server.close();
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("a deny-classified call is blocked before it runs and the run continues", async () => {
++  const { server, url } = await startBridge();
++  const { dir, plan } = workspace();
++  try {
++    const { gateway, requests } = makeGateway();
++    const planFile = plan([
++      { name: "Bash", input: { command: "cat /etc/passwd" } },
++      { name: "Bash", input: { command: "echo done" } },
++    ]);
++
++    const { events, outcome } = await runScenario({ bridgeUrl: url, planFile, cwd: dir, gateway });
++    assert.equal(outcome.exitCode, 0);
++    assert.equal(requests.length, 0, "a policy deny must not open a card");
++
++    const blocked = events.find((e) => e.type === "tool.blocked") as Extract<TelemetryEvent, { type: "tool.blocked" }>;
++    assert.ok(blocked, "the blocked call must be reported");
++    assert.equal(blocked.name, "Bash");
++
++    // The secret file's contents never reached the transcript.
++    const results = events.filter((e) => e.type === "tool.result") as Array<Extract<TelemetryEvent, { type: "tool.result" }>>;
++    assert.equal(results.some((r) => /root:x?:0:0/.test(r.output)), false, "a denied read must not leak the file");
++    // The next, benign call still ran: a denial blocks the call, not the run.
++    assert.ok(results.some((r) => r.ok && r.output.includes("done")));
++  } finally {
++    server.close();
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("a benign call runs immediately with no approval card", async () => {
++  const { server, url } = await startBridge();
++  const { dir, plan } = workspace();
++  try {
++    const { gateway, requests } = makeGateway();
++    const planFile = plan([{ name: "Bash", input: { command: "echo hello-gate" } }]);
++
++    const { events } = await runScenario({ bridgeUrl: url, planFile, cwd: dir, gateway });
++    assert.equal(requests.length, 0);
++    assert.equal(events.some((e) => e.type === "approval.required"), false);
++    const result = events.find((e) => e.type === "tool.result") as Extract<TelemetryEvent, { type: "tool.result" }>;
++    assert.match(result.output, /hello-gate/);
++    assert.equal(events.filter((e) => e.type === "tool.started").length, 1);
++  } finally {
++    server.close();
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("two hooks for the same call (image + --settings) open only one card", async () => {
++  const { server, url } = await startBridge();
++  const { dir, scenario, plan } = workspace();
++  try {
++    const { gateway, requests, resolvers } = makeGateway();
++    const planFile = plan([{ name: "Bash", input: { command: `rm -rf ${scenario.target}` } }]);
++
++    const runPromise = runScenario({ bridgeUrl: url, planFile, cwd: dir, gateway, doubleHook: true });
++    await until(() => requests.length >= 1);
++    await sleep(100);
++    assert.equal(requests.length, 1, "a duplicate hook call must reuse the first decision");
++    resolvers[0]("approved");
++    const { events } = await runPromise;
++    assert.equal(existsSync(scenario.marker), false);
++    assert.equal(events.filter((e) => e.type === "approval.required").length, 1);
++  } finally {
++    server.close();
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("the gate token never appears in telemetry", async () => {
++  const { server, url } = await startBridge();
++  const { dir, plan } = workspace();
++  try {
++    // Auto-approve everything, so the command really runs and its output —
++    // which contains the hook token — flows back through the runner.
++    const gateway: ApprovalGateway = async () => ({ id: "appr_auto", verdict: Promise.resolve("approved") });
++    const planFile = plan([{ name: "Bash", input: { command: "env | grep SWARM_HOOK" } }]);
++    const { events } = await runScenario({ bridgeUrl: url, planFile, cwd: dir, gateway });
++    const text = JSON.stringify(events);
++    assert.match(text, /SWARM_HOOK_TOKEN/, "the tool output should have carried the variable name");
++    assert.equal(/hk1_[A-Za-z0-9_-]{16,}/.test(text), false, "the hook token leaked into telemetry");
++  } finally {
++    server.close();
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/lib/harness/fixtures/fake-claude-gated.mjs b/apps/swarmagents/lib/harness/fixtures/fake-claude-gated.mjs
+new file mode 100644
+index 000000000..a45c10641
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/fixtures/fake-claude-gated.mjs
+@@ -0,0 +1,180 @@
++#!/usr/bin/env node
++/**
++ * A faithful fake for `claude -p --output-format stream-json`, used by the
++ * approval-gate integration test.
++ *
++ * What makes it faithful is the part that matters for this bug: before it
++ * executes any tool it runs the PreToolUse hook exactly like the real CLI does
++ * — the command from the managed/run settings, the payload on stdin, the JSON
++ * decision on stdout — and it executes the tool *only* when the hook answers
++ * "allow". A denial is reported back to the model as a tool_result error and
++ * the run continues, which is the CLI's behaviour too.
++ *
++ * Configuration (env):
++ *   FAKE_CLAUDE_PLAN         path to a JSON plan: {steps:[{name,input}], text?}
++ *   FAKE_CLAUDE_HOOK_COMMAND shell command that runs the hook
++ *   FAKE_CLAUDE_DOUBLE_HOOK  "1" runs the hook twice per call (image hook +
++ *                            --settings hook) to prove the gate dedupes it
++ *
++ * Everything else is stream-json on stdout, one JSON object per line.
++ */
++
++import { spawn } from "node:child_process";
++import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
++import path from "node:path";
++
++const SESSION_ID = "sess_fake_gated";
++const MODEL = "claude-sonnet-5-5";
++const MAX_TOOL_OUTPUT = 4000;
++
++function emit(event) {
++  process.stdout.write(`${JSON.stringify(event)}\n`);
++}
++
++function assistantText(text, id) {
++  emit({
++    type: "assistant",
++    message: { id, role: "assistant", model: MODEL, content: [{ type: "text", text }] },
++  });
++}
++
++function assistantToolUse(id, name, input) {
++  emit({
++    type: "assistant",
++    message: { id: `${id}_msg`, role: "assistant", model: MODEL, content: [{ type: "tool_use", id, name, input }] },
++  });
++}
++
++function toolResult(id, output, isError) {
++  emit({
++    type: "user",
++    message: {
++      role: "user",
++      content: [{ type: "tool_result", tool_use_id: id, content: output, is_error: isError }],
++    },
++  });
++}
++
++/** Run the hook command the way the CLI does; resolves to the parsed decision. */
++function runHook(payload) {
++  return new Promise((resolve) => {
++    const command = process.env.FAKE_CLAUDE_HOOK_COMMAND;
++    if (!command) {
++      resolve({ decision: "deny", reason: "no hook command configured" });
++      return;
++    }
++    const child = spawn("sh", ["-c", command], { env: process.env, stdio: ["pipe", "pipe", "pipe"] });
++    let stdout = "";
++    child.stdout.on("data", (chunk) => (stdout += String(chunk)));
++    child.stderr.on("data", () => {});
++    child.on("close", () => {
++      try {
++        const parsed = JSON.parse(stdout);
++        const out = parsed && parsed.hookSpecificOutput;
++        const decision = out && out.permissionDecision;
++        resolve({
++          decision: decision === "allow" ? "allow" : "deny",
++          reason: (out && out.permissionDecisionReason) || "no reason",
++        });
++      } catch {
++        // A hook that prints nothing usable blocks the tool, like the real CLI
++        // treats a failed hook: fail closed.
++        resolve({ decision: "deny", reason: "hook produced no decision" });
++      }
++    });
++    child.stdin.end(JSON.stringify(payload));
++  });
++}
++
++/** Execute one tool for real, returning { output, isError }. */
++function executeTool(name, input) {
++  return new Promise((resolve) => {
++    if (name === "Bash") {
++      const command = typeof input?.command === "string" ? input.command : "";
++      const child = spawn("bash", ["-lc", command], { cwd: process.cwd(), env: process.env });
++      let output = "";
++      child.stdout.on("data", (chunk) => (output += String(chunk)));
++      child.stderr.on("data", (chunk) => (output += String(chunk)));
++      child.on("close", (code) => {
++        resolve({ output: output.slice(0, MAX_TOOL_OUTPUT), isError: code !== 0 });
++      });
++      return;
++    }
++    if (name === "Write") {
++      try {
++        const target = path.resolve(process.cwd(), String(input?.file_path ?? ""));
++        mkdirSync(path.dirname(target), { recursive: true });
++        writeFileSync(target, String(input?.content ?? ""));
++        resolve({ output: `wrote ${target}`, isError: false });
++      } catch (error) {
++        resolve({ output: String(error?.message ?? error), isError: true });
++      }
++      return;
++    }
++    if (name === "Read") {
++      try {
++        const target = path.resolve(process.cwd(), String(input?.file_path ?? ""));
++        resolve({ output: readFileSync(target, "utf8").slice(0, MAX_TOOL_OUTPUT), isError: false });
++      } catch (error) {
++        resolve({ output: String(error?.message ?? error), isError: true });
++      }
++      return;
++    }
++    resolve({ output: `${name} is not implemented by the fake CLI`, isError: true });
++  });
++}
++
++async function main() {
++  const planPath = process.env.FAKE_CLAUDE_PLAN;
++  const plan = planPath ? JSON.parse(readFileSync(planPath, "utf8")) : { steps: [] };
++
++  emit({ type: "system", subtype: "init", cwd: process.cwd(), session_id: SESSION_ID, model: MODEL });
++  if (plan.text) assistantText(plan.text, "msg_intro");
++
++  let index = 0;
++  for (const step of plan.steps ?? []) {
++    index += 1;
++    const toolId = `toolu_fake_${index}`;
++    assistantToolUse(toolId, step.name, step.input ?? {});
++
++    const payload = {
++      hook_event_name: "PreToolUse",
++      session_id: SESSION_ID,
++      tool_use_id: toolId,
++      tool_name: step.name,
++      tool_input: step.input ?? {},
++    };
++    const verdict = await runHook(payload);
++    if (process.env.FAKE_CLAUDE_DOUBLE_HOOK === "1") {
++      // The image's managed hook and the run's --settings hook both fire; the
++      // second must agree and must not open a second card.
++      const again = await runHook(payload);
++      if (again.decision !== verdict.decision) {
++        toolResult(toolId, `hook disagreement: ${verdict.decision} vs ${again.decision}`, true);
++        continue;
++      }
++    }
++
++    if (verdict.decision !== "allow") {
++      toolResult(toolId, `blocked by the approval gate: ${verdict.reason}`, true);
++      continue;
++    }
++    const result = await executeTool(step.name, step.input ?? {});
++    toolResult(toolId, result.output, result.isError);
++  }
++
++  emit({
++    type: "result",
++    subtype: "success",
++    is_error: false,
++    session_id: SESSION_ID,
++    total_cost_usd: 0.001,
++    duration_ms: 10,
++    num_turns: (plan.steps ?? []).length + 1,
++  });
++}
++
++main().catch((error) => {
++  process.stderr.write(`${error?.stack ?? error}\n`);
++  process.exit(1);
++});
+diff --git a/apps/swarmagents/lib/harness/hook-script.test.ts b/apps/swarmagents/lib/harness/hook-script.test.ts
+new file mode 100644
+index 000000000..c5eda9df5
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/hook-script.test.ts
+@@ -0,0 +1,224 @@
++/**
++ * Tests for the in-VM hook client (vm-image/pretooluse-hook.mjs).
++ *
++ * These run the real script as a child process, exactly like Claude Code does,
++ * against a real HTTP endpoint. The contract that matters: the script prints a
++ * Claude Code PreToolUse decision and exits 0, and *every* failure path denies.
++ * A hook that failed open (or exited non-zero, which the CLI treats as "carry
++ * on") would silently restore the advisory-gate bug.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { spawn } from "node:child_process";
++import { createServer, type Server } from "node:http";
++import { readFileSync } from "node:fs";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { PRETOOLUSE_HOOK_SCRIPT } from "./hook-script";
++import { TOOL_HOOK_COMMAND } from "./tool-gate";
++
++const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
++const HOOK_PATH = path.join(APP_ROOT, "vm-image/pretooluse-hook.mjs");
++const SETTINGS_PATH = path.join(APP_ROOT, "vm-image/managed-settings.json");
++
++interface RunResult {
++  code: number | null;
++  stdout: string;
++  stderr: string;
++}
++
++/** Run the hook the way the CLI does: payload on stdin, decision on stdout. */
++function runHook(
++  env: Record<string, string | undefined>,
++  payload: unknown,
++  scriptPath = HOOK_PATH,
++): Promise<RunResult> {
++  return new Promise((resolve, reject) => {
++    const childEnv: NodeJS.ProcessEnv = { ...process.env };
++    for (const [name, value] of Object.entries(env)) {
++      if (value === undefined) delete childEnv[name];
++      else childEnv[name] = value;
++    }
++    const child = spawn(process.execPath, [scriptPath], {
++      env: childEnv,
++    });
++    let stdout = "";
++    let stderr = "";
++    child.stdout.on("data", (chunk: Buffer) => (stdout += String(chunk)));
++    child.stderr.on("data", (chunk: Buffer) => (stderr += String(chunk)));
++    child.on("error", reject);
++    child.on("close", (code) => resolve({ code, stdout, stderr }));
++    child.stdin.end(typeof payload === "string" ? payload : JSON.stringify(payload));
++  });
++}
++
++/** Parse the decision envelope the script prints. */
++function decision(stdout: string): { decision: string; reason: string } {
++  const parsed = JSON.parse(stdout) as {
++    hookSpecificOutput: { hookEventName: string; permissionDecision: string; permissionDecisionReason: string };
++  };
++  assert.equal(parsed.hookSpecificOutput.hookEventName, "PreToolUse");
++  return {
++    decision: parsed.hookSpecificOutput.permissionDecision,
++    reason: parsed.hookSpecificOutput.permissionDecisionReason,
++  };
++}
++
++/** A bridge that answers each request according to the mode it was built with. */
++async function startBridge(mode: "allow" | "deny" | "garbage" | "500" | "slow"): Promise<{ server: Server; url: string }> {
++  const server = createServer((req, res) => {
++    if (mode === "500") {
++      res.writeHead(500, { "content-type": "application/json" });
++      res.end(JSON.stringify({ error: "boom" }));
++      return;
++    }
++    if (mode === "garbage") {
++      res.writeHead(200, { "content-type": "text/plain" });
++      res.end("not json");
++      return;
++    }
++    if (mode === "slow") {
++      // Never answer: the client's own timeout must deny.
++      setTimeout(() => {
++        res.writeHead(200, { "content-type": "application/json" });
++        res.end(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" } }));
++      }, 5_000).unref();
++      return;
++    }
++    res.writeHead(200, { "content-type": "application/json" });
++    res.end(
++      JSON.stringify({
++        hookSpecificOutput: {
++          hookEventName: "PreToolUse",
++          permissionDecision: mode,
++          permissionDecisionReason: mode === "allow" ? "approved by the user" : "the user denied this call",
++        },
++      }),
++    );
++  });
++  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
++  const address = server.address();
++  assert.ok(address && typeof address === "object");
++  return { server, url: `http://127.0.0.1:${address.port}/api/runtime/hooks/pretooluse` };
++}
++
++const PAYLOAD = { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "rm -rf /tmp/x" }, tool_use_id: "toolu_1" };
++
++test("an allow verdict is passed through to the CLI", async () => {
++  const { server, url } = await startBridge("allow");
++  try {
++    const result = await runHook({ SWARM_HOOK_URL: url, SWARM_HOOK_TOKEN: "hk1_test" }, PAYLOAD);
++    assert.equal(result.code, 0);
++    const verdict = decision(result.stdout);
++    assert.equal(verdict.decision, "allow");
++    assert.equal(verdict.reason, "approved by the user");
++  } finally {
++    server.close();
++  }
++});
++
++test("a deny verdict is passed through with its reason", async () => {
++  const { server, url } = await startBridge("deny");
++  try {
++    const result = await runHook({ SWARM_HOOK_URL: url, SWARM_HOOK_TOKEN: "hk1_test" }, PAYLOAD);
++    assert.equal(result.code, 0);
++    const verdict = decision(result.stdout);
++    assert.equal(verdict.decision, "deny");
++    assert.match(verdict.reason, /denied/);
++  } finally {
++    server.close();
++  }
++});
++
++test("an unreachable bridge denies (the gate fails closed)", async () => {
++  // Port 9 (discard) is closed here: connection refused, not a hang.
++  const result = await runHook({ SWARM_HOOK_URL: "http://127.0.0.1:9/hook", SWARM_HOOK_TOKEN: "hk1_test" }, PAYLOAD);
++  assert.equal(result.code, 0);
++  const verdict = decision(result.stdout);
++  assert.equal(verdict.decision, "deny");
++  assert.match(verdict.reason, /unreachable/i);
++});
++
++test("a bridge that never answers times out into a denial", async () => {
++  const { server, url } = await startBridge("slow");
++  try {
++    const result = await runHook({ SWARM_HOOK_URL: url, SWARM_HOOK_TOKEN: "hk1_test", SWARM_HOOK_TIMEOUT_MS: "100" }, PAYLOAD);
++    assert.equal(result.code, 0);
++    const verdict = decision(result.stdout);
++    assert.equal(verdict.decision, "deny");
++    assert.match(verdict.reason, /timed out|unreachable/i);
++  } finally {
++    server.close();
++  }
++});
++
++test("a broken bridge response denies", async () => {
++  for (const mode of ["garbage", "500"] as const) {
++    const { server, url } = await startBridge(mode);
++    try {
++      const result = await runHook({ SWARM_HOOK_URL: url, SWARM_HOOK_TOKEN: "hk1_test" }, PAYLOAD);
++      assert.equal(result.code, 0);
++      assert.equal(decision(result.stdout).decision, "deny", `mode ${mode} must deny`);
++    } finally {
++      server.close();
++    }
++  }
++});
++
++test("a run without hook configuration denies instead of running the tool", async () => {
++  const result = await runHook({}, PAYLOAD);
++  assert.equal(result.code, 0);
++  const verdict = decision(result.stdout);
++  assert.equal(verdict.decision, "deny");
++  assert.match(verdict.reason, /not configured/i);
++});
++
++test("a malformed payload denies", async () => {
++  const { server, url } = await startBridge("allow");
++  try {
++    for (const payload of ["{not json", JSON.stringify({ tool_input: {} })]) {
++      const result = await runHook({ SWARM_HOOK_URL: url, SWARM_HOOK_TOKEN: "hk1_test" }, payload);
++      assert.equal(result.code, 0);
++      assert.equal(decision(result.stdout).decision, "deny");
++    }
++  } finally {
++    server.close();
++  }
++});
++
++test("the seeded copy is byte-identical to the image's hook script", () => {
++  const onDisk = readFileSync(HOOK_PATH, "utf8");
++  assert.equal(
++    PRETOOLUSE_HOOK_SCRIPT,
++    onDisk,
++    "lib/harness/hook-script.ts drifted from vm-image/pretooluse-hook.mjs — regenerate it",
++  );
++});
++
++test("the image's managed settings install the hook and stop blanket-allowing risky tools", () => {
++  const settings = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
++    permissions: { allow: string[] };
++    hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ type: string; command: string; timeout: number }> }> };
++  };
++  const entry = settings.hooks.PreToolUse[0];
++  assert.ok(entry, "managed settings must register a PreToolUse hook");
++  assert.equal(entry.matcher, "*");
++  assert.equal(entry.hooks[0].type, "command");
++  assert.equal(entry.hooks[0].command, TOOL_HOOK_COMMAND);
++  assert.equal(entry.hooks[0].timeout, 330);
++
++  // Risky tools must go through the hook, not a blanket allow.
++  for (const risky of ["Bash", "Edit", "Write", "NotebookEdit"]) {
++    assert.equal(settings.permissions.allow.includes(risky), false, `${risky} must not be blanket-allowed`);
++  }
++  // Read-only tools stay allowed so the agent is not blocked on the hook for
++  // every file read (the hook still runs and can deny them).
++  assert.ok(settings.permissions.allow.includes("Read"));
++});
++
++test("the hook command resolves the script path without interpolating run data", () => {
++  assert.match(TOOL_HOOK_COMMAND, /\/opt\/swarm\/hooks\/pretooluse-hook\.mjs/);
++  assert.match(TOOL_HOOK_COMMAND, /\/workspace\/\.swarm\/pretooluse-hook\.mjs/);
++  assert.equal(/[$`]\(/.test(TOOL_HOOK_COMMAND), false, "no command substitution in the hook command");
++});
+diff --git a/apps/swarmagents/lib/harness/hook-script.ts b/apps/swarmagents/lib/harness/hook-script.ts
+new file mode 100644
+index 000000000..cf2dfbbe4
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/hook-script.ts
+@@ -0,0 +1,17 @@
++/**
++ * The PreToolUse hook client, as a string, so the runtime can seed it into a
++ * user's VM (lib/runtime/manager.ts -> seedRoleFiles).
++ *
++ * The canonical file is vm-image/pretooluse-hook.mjs: the VM image bakes it at
++ * /opt/swarm/hooks/pretooluse-hook.mjs, root-owned and read-only. Seeding the
++ * same bytes at /workspace/.swarm/pretooluse-hook.mjs is what makes a VM built
++ * from an older image (no /opt copy) still gate synchronously — the managed
++ * settings command falls back to that path. hook-script.test.ts fails if the
++ * two ever drift apart.
++ */
++
++/** Where the runtime seeds the hook inside the VM. */
++export const PRETOOLUSE_HOOK_SEED_PATH = "/workspace/.swarm/pretooluse-hook.mjs";
++
++/** Exact contents of vm-image/pretooluse-hook.mjs. */
++export const PRETOOLUSE_HOOK_SCRIPT = "#!/usr/bin/env node\n/**\n * PreToolUse hook client for the SwarmAgents harness risk gate.\n *\n * Claude Code spawns this script *before* it executes a tool and blocks until\n * the script exits. The script forwards the tool call to the app, waits for the\n * verdict (allow/deny), and prints it as a Claude Code hook decision. The tool\n * therefore only runs after a human — or the classifier — allowed it.\n *\n * Contract (Claude Code hooks):\n *   - stdin: the hook payload JSON ({hook_event_name, tool_name, tool_input, ...})\n *   - stdout: {\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\",\n *              \"permissionDecision\": \"allow\" | \"deny\",\n *              \"permissionDecisionReason\": \"...\"}}\n *   - exit 0 always. A non-zero exit that is not 2 makes the CLI treat the hook\n *     as failed and *continue*, so every failure path here prints an explicit\n *     \"deny\" instead: the gate fails closed.\n *\n * Configuration comes from the exec environment the harness sets for the run\n * (never argv, which anything on the box can read from the process table):\n *   SWARM_HOOK_URL         absolute URL of /api/runtime/hooks/pretooluse\n *   SWARM_HOOK_TOKEN       per-run bearer token for that endpoint\n *   SWARM_HOOK_TIMEOUT_MS  how long to wait for a verdict (default 330000)\n *\n * No dependencies: the image ships node, and this file must keep working in an\n * air-gapped VM.\n */\n\nconst MAX_INPUT_BYTES = 1024 * 1024;\nconst MAX_REASON = 500;\nconst DEFAULT_TIMEOUT_MS = 330000;\n\n/** Print a Claude Code PreToolUse decision. Never throws. */\nfunction answer(decision, reason) {\n  const text = String(reason ?? \"\").slice(0, MAX_REASON) || (decision === \"allow\" ? \"allowed\" : \"blocked\");\n  const payload = {\n    hookSpecificOutput: {\n      hookEventName: \"PreToolUse\",\n      permissionDecision: decision,\n      permissionDecisionReason: text,\n    },\n  };\n  try {\n    process.stdout.write(JSON.stringify(payload));\n  } catch {\n    // A closed stdout means the CLI is gone; there is nobody to answer.\n  }\n}\n\n/** Read the whole hook payload from stdin, bounded. */\nasync function readStdin() {\n  const chunks = [];\n  let total = 0;\n  for await (const chunk of process.stdin) {\n    total += chunk.length;\n    if (total > MAX_INPUT_BYTES) break;\n    chunks.push(chunk);\n  }\n  return Buffer.concat(chunks).toString(\"utf8\");\n}\n\nfunction timeoutMs() {\n  const raw = Number(process.env.SWARM_HOOK_TIMEOUT_MS);\n  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;\n}\n\nasync function main() {\n  const url = process.env.SWARM_HOOK_URL;\n  const token = process.env.SWARM_HOOK_TOKEN;\n  if (!url || !token) {\n    // Fail closed: a run without a bridge must not execute risky tools. The\n    // harness always sets these; an empty value means the gate is broken.\n    answer(\"deny\", \"approval bridge is not configured for this run\");\n    return;\n  }\n\n  let payload;\n  try {\n    const raw = await readStdin();\n    payload = JSON.parse(raw);\n  } catch (error) {\n    answer(\"deny\", `could not read the hook payload: ${error && error.message ? error.message : \"invalid JSON\"}`);\n    return;\n  }\n  if (!payload || typeof payload !== \"object\" || typeof payload.tool_name !== \"string\" || payload.tool_name === \"\") {\n    answer(\"deny\", \"hook payload did not name a tool\");\n    return;\n  }\n\n  let response;\n  try {\n    response = await fetch(url, {\n      method: \"POST\",\n      headers: {\n        \"content-type\": \"application/json\",\n        authorization: `Bearer ${token}`,\n      },\n      body: JSON.stringify({\n        hook_event_name: payload.hook_event_name ?? \"PreToolUse\",\n        session_id: payload.session_id,\n        tool_name: payload.tool_name,\n        tool_input: payload.tool_input,\n        tool_use_id: payload.tool_use_id,\n      }),\n      signal: AbortSignal.timeout(timeoutMs()),\n    });\n  } catch (error) {\n    const detail = error && error.name === \"TimeoutError\" ? \"timed out\" : String((error && error.message) || error);\n    answer(\"deny\", `approval bridge unreachable (${detail})`);\n    return;\n  }\n\n  if (!response.ok) {\n    answer(\"deny\", `approval bridge returned HTTP ${response.status}`);\n    return;\n  }\n\n  let body;\n  try {\n    body = await response.json();\n  } catch {\n    answer(\"deny\", \"approval bridge returned an unreadable verdict\");\n    return;\n  }\n\n  const out = body && typeof body === \"object\" ? body.hookSpecificOutput : null;\n  const decision = out && out.permissionDecision;\n  if (decision !== \"allow\" && decision !== \"deny\") {\n    answer(\"deny\", \"approval bridge returned no usable verdict\");\n    return;\n  }\n  answer(decision, out.permissionDecisionReason);\n}\n\nmain().catch((error) => {\n  answer(\"deny\", `approval hook failed: ${error && error.message ? error.message : String(error)}`);\n});\n";
+diff --git a/apps/swarmagents/lib/harness/risk.ts b/apps/swarmagents/lib/harness/risk.ts
+index 4269d86ab..bf1b27097 100644
+--- a/apps/swarmagents/lib/harness/risk.ts
++++ b/apps/swarmagents/lib/harness/risk.ts
+@@ -193,6 +193,38 @@ export function classifyToolCall(name: string, input: unknown): RiskDecision {
+   return { level: "allow", reason: "benign tool call" };
+ }
+ 
++/** Commands whose effect leaves the VM and cannot be undone from inside it. */
++const IRREVERSIBLE_EXTERNAL_PATTERNS: readonly RegExp[] = [
++  // Force / mirror / delete pushes rewrite or destroy a remote branch.
++  /\bgit\b[^\n|&;]*\bpush\b[^\n|&;]*\s(--force(-with-lease)?|-f|--mirror|--delete)\b/,
++  // Publishing artifacts, releases, images or deployments to a remote service.
++  /\bnpm\b[^\n|&;]*\bpublish\b/,
++  /\b(pnpm|yarn)\b[^\n|&;]*\bpublish\b/,
++  /\b(twine|cargo)\b[^\n|&;]*\b(upload|publish)\b/,
++  /\bdocker\b[^\n|&;]*\bpush\b/,
++  /\bgh\b[^\n|&;]*\b(release|repo|workflow|secret)\b/,
++  /\b(vercel|netlify|fly|flyctl|heroku|railway|surge)\b[^\n|&;]*\b(deploy|release|publish|destroy)\b/,
++  /\b(kubectl|helm|terraform|pulumi)\b[^\n|&;]*\b(apply|delete|destroy|upgrade|install)\b/,
++  /\baws\b[^\n|&;]*\b(s3|ec2|iam|cloudformation|lambda)\b/,
++];
++
++/**
++ * True when a tool call mutates state outside the VM irreversibly (force push,
++ * publish, deploy, cloud API mutation). Full-auto runs (g9) may auto-allow the
++ * asks that stay inside the VM, but these still need a human: the agent cannot
++ * roll them back and the blast radius is not the user's own sandbox.
++ */
++export function isIrreversibleExternal(name: string, input: unknown): boolean {
++  if (name !== "Bash" && name !== "Terminal" && name !== "Shell" && name !== "cmd") return false;
++  const command =
++    input && typeof input === "object" && typeof (input as { command?: unknown }).command === "string"
++      ? (input as { command: string }).command
++      : "";
++  if (!command) return false;
++  const bare = command.replace(/\s+/g, " ");
++  return IRREVERSIBLE_EXTERNAL_PATTERNS.some((pattern) => pattern.test(bare));
++}
++
+ /**
+  * Classify a shell command string (the input of the Bash tool).
+  *
+diff --git a/apps/swarmagents/lib/harness/runner.approvals.test.ts b/apps/swarmagents/lib/harness/runner.approvals.test.ts
+index b054a61f2..6daf13390 100644
+--- a/apps/swarmagents/lib/harness/runner.approvals.test.ts
++++ b/apps/swarmagents/lib/harness/runner.approvals.test.ts
+@@ -11,6 +11,7 @@ import test from "node:test";
+ import assert from "node:assert/strict";
+ import { ClaudeCodeRunner } from "./runner";
+ import type { ApprovalGateway, ApprovalRequest, TelemetryEvent, VmExec, VmExecOpts } from "./types";
++import { closeAllToolGates, getToolGateSession } from "./tool-gate";
+ 
+ const INIT = JSON.stringify({ type: "system", subtype: "init", session_id: "sess_gate", model: "claude-sonnet-5-5" });
+ const ASK_TEXT = JSON.stringify({
+@@ -169,3 +170,100 @@ test("no gateway configured: ask-classified calls pass through without pausing",
+   assert.equal(events.some((e) => e.type === "approval.required"), false);
+   assert.equal(events.filter((e) => e.type === "run.finished").length, 1);
+ });
++
++const HOOK_URL = "http://app.test/api/runtime/hooks/pretooluse";
++
++test("gate wired but no hook traffic: the stdout gate still asks (old image)", async () => {
++  // A VM whose image predates the PreToolUse hook never calls home. The run
++  // must not become silently ungated: the legacy stdout gate still applies.
++  const { gateway, requests, resolvers } = makeGateway();
++  const runner = new ClaudeCodeRunner({ bin: "claude" });
++  const events: TelemetryEvent[] = [];
++  const outcomePromise = runner.run(
++    {
++      prompt: "clean up",
++      env: {},
++      vm: new ScriptedVm(FIXTURE),
++      approvalGateway: gateway,
++      toolGate: { runId: "run_legacy", hookUrl: HOOK_URL, approvalGateway: gateway },
++    },
++    (e) => events.push(e),
++  );
++
++  await until(() => events.some((e) => e.type === "approval.required"), 3000);
++  assert.equal(requests.length, 1);
++  resolvers[0]("approved");
++  await outcomePromise;
++  assert.equal(events.filter((e) => e.type === "approval.required").length, 1);
++});
++
++test("gate live: the hook decides and stdout does not open a second card", async () => {
++  const { gateway, requests, resolvers } = makeGateway();
++  const runner = new ClaudeCodeRunner({ bin: "claude" });
++  const events: TelemetryEvent[] = [];
++
++  // The VM acts like the CLI with its hook: it asks the gate (over the same
++  // session the runner opened) *before* the tool_use line reaches stdout.
++  class HookedVm extends ScriptedVm {
++    override async exec(cmd: string[], opts?: VmExecOpts): Promise<{ exitCode: number }> {
++      const session = getToolGateSession(opts?.env?.SWARM_HOOK_TOKEN);
++      assert.ok(session, "the runner must hand the hook a session token");
++      void session.decide({
++        tool_use_id: "toolu_1",
++        tool_name: "Bash",
++        tool_input: { command: "rm -rf /" },
++      });
++      return super.exec(cmd, opts);
++    }
++  }
++
++  const outcomePromise = runner.run(
++    {
++      prompt: "clean up",
++      env: {},
++      vm: new HookedVm(FIXTURE),
++      approvalGateway: gateway,
++      toolGate: { runId: "run_hooked", hookUrl: HOOK_URL, approvalGateway: gateway },
++    },
++    (e) => events.push(e),
++  );
++
++  await until(() => events.some((e) => e.type === "approval.required"));
++  assert.equal(requests.length, 1, "the hook is authoritative: no second card from stdout");
++  resolvers[0]("approved");
++  const outcome = await outcomePromise;
++
++  assert.equal(outcome.exitCode, 0);
++  assert.equal(events.filter((e) => e.type === "approval.required").length, 1);
++  assert.equal(events.some((e) => e.type === "run.error"), false);
++});
++
++test("the gate session is closed when the run ends", async () => {
++  const { gateway } = makeGateway();
++  const runner = new ClaudeCodeRunner({ bin: "claude" });
++  let token: string | undefined;
++  class CapturingVm extends ScriptedVm {
++    override async exec(cmd: string[], opts?: VmExecOpts): Promise<{ exitCode: number }> {
++      token = opts?.env?.SWARM_HOOK_TOKEN;
++      return super.exec(cmd, opts);
++    }
++  }
++  const benign = [
++    INIT,
++    JSON.stringify({ type: "assistant", message: { id: "m1", content: [{ type: "text", text: "ok" }] } }),
++    RESULT,
++  ].join("\n") + "\n";
++  await runner.run(
++    {
++      prompt: "x",
++      env: {},
++      vm: new CapturingVm(benign),
++      approvalGateway: gateway,
++      toolGate: { runId: "run_close", hookUrl: HOOK_URL, approvalGateway: gateway },
++    },
++    () => {},
++  );
++  assert.ok(token);
++  assert.equal(getToolGateSession(token), null, "a finished run's hook token must stop working");
++  closeAllToolGates();
++});
+diff --git a/apps/swarmagents/lib/harness/runner.ts b/apps/swarmagents/lib/harness/runner.ts
+index 50a3a0f7c..618590e25 100644
+--- a/apps/swarmagents/lib/harness/runner.ts
++++ b/apps/swarmagents/lib/harness/runner.ts
+@@ -7,11 +7,15 @@
+  * TelemetryEvent union from ./types.ts.
+  *
+  * Risk gating: every tool.call is classified by ./risk.ts (allow/ask/deny).
++ * The verdict is synchronous with execution (see ./tool-gate.ts): the VM's
++ * PreToolUse hook calls back into the app and blocks the CLI until this process
++ * answers, so a tool only runs after it was allowed. The stdout classification
++ * below is the fallback for a VM whose image predates the hook (or whose hook
++ * never called home): there the legacy advisory behaviour still applies.
+  *   - allow: passes through unchanged.
+- *   - ask: when an approvalGateway is wired, the harness emits approval.required
+- *     and pauses further processing until the gateway's ticket resolves.
+- *     Approved runs resume; denied/expired runs halt with a run.error.
+- *   - deny: the call is blocked immediately (tool.blocked + run.error).
++ *   - ask: an approval.required card is opened and the run waits; the tool
++ *     executes only on "approved", and a deny/timeout never executes it.
++ *   - deny: the call is blocked immediately (tool.blocked).
+  *
+  * Provider keys never appear in argv — they are passed via the exec env map
+  * and scrubbed from every emitted event (see ./redact.ts).
+@@ -33,6 +37,7 @@ import { makeRedactor, redactValue } from "./redact";
+ import { classifyToolCall } from "./risk";
+ import { isRoleListTool, isRoleSwitchTool, ROLE_MCP_CONFIG_PATH } from "./role-mcp";
+ import { computerActionEvent, isDesktopMcpCall } from "./computer-mcp";
++import { openToolGate, toolCallKey, type ToolGateSession } from "./tool-gate";
+ 
+ export interface ClaudeCodeRunnerOptions {
+   /** Path to the claude binary. Defaults to "claude" (or $CLAUDE_BIN). */
+@@ -156,7 +161,24 @@ export class ClaudeCodeRunner {
+    * exec callbacks, so it must be cheap and must not await.
+    */
+   async run(request: RunRequest, onEvent: (event: TelemetryEvent) => void): Promise<RunOutcome> {
+-    const redact = makeRedactor(request.env, request.redactSecrets);
++    const gate = request.toolGate ? openToolGate(request.toolGate, onEvent) : null;
++    if (!gate) return this.runInner(request, onEvent, null);
++    try {
++      return await this.runInner(request, onEvent, gate);
++    } finally {
++      gate.close();
++    }
++  }
++
++  private async runInner(
++    request: RunRequest,
++    onEvent: (event: TelemetryEvent) => void,
++    gate: ToolGateSession | null,
++  ): Promise<RunOutcome> {
++    // The gate token must never reach telemetry, even if a tool echoes its env.
++    const extraSecrets: string[] = [...(request.redactSecrets ?? [])];
++    if (gate) extraSecrets.push(gate.token);
++    const redact = makeRedactor(request.env, extraSecrets);
+     const argv = this.buildArgv(request);
+ 
+     let started = false;
+@@ -259,6 +281,31 @@ export class ClaudeCodeRunner {
+      */
+     let gateChain = Promise.resolve();
+ 
++    /**
++     * The legacy, advisory risk policy: classify the tool_use block from stdout
++     * and open an approval card after the fact. Only used when the run has no
++     * synchronous gate, or when the VM's hook never called home (an image that
++     * predates vm-image/managed-settings.json's PreToolUse hook).
++     */
++    const applyStdoutRiskPolicy = (name: string, input: unknown): void => {
++      const decision = classifyToolCall(name, input);
++      if (decision.level === "ask" && request.approvalGateway) {
++        gateChain = gateChain.then(async () => {
++          const verdict = await this.gateApproval(request, {
++            toolName: name,
++            action: describeAction(name, input),
++            reason: decision.reason,
++          }, emit, redact);
++          if (verdict !== "approved" && haltedReason === null) {
++            haltedReason = verdict === "expired" ? "approval timed out" : "approval denied by user";
++          }
++        });
++      } else if (decision.level === "deny" && haltedReason === null) {
++        haltedReason = decision.reason;
++        emit({ type: "tool.blocked", name, reason: decision.reason });
++      }
++    };
++
+     const handleLine = (raw: unknown): void => {
+       if (!isObject(raw)) return;
+       if (haltedReason !== null) return;
+@@ -310,21 +357,22 @@ export class ClaudeCodeRunner {
+                 emit(computerActionEvent(name, redactValue(input, redact)));
+               }
+ 
+-              const decision = classifyToolCall(name, input);
+-              if (decision.level === "ask" && request.approvalGateway) {
++              // The synchronous gate (the VM's PreToolUse hook) already decided
++              // this call before the CLI ran it, and emitted its own approval
++              // and tool.started events. Only when the hook is absent does the
++              // stdout classifier get to gate the call.
++              const callKey = toolCallKey(toolId, name, input);
++              if (gate) {
+                 gateChain = gateChain.then(async () => {
+-                  const verdict = await this.gateApproval(request, {
+-                    toolName: name,
+-                    action: describeAction(name, input),
+-                    reason: decision.reason,
+-                  }, emit, redact);
+-                  if (verdict !== "approved" && haltedReason === null) {
+-                    haltedReason = verdict === "expired" ? "approval timed out" : "approval denied by user";
+-                  }
++                  if (haltedReason !== null) return;
++                  if (gate.hasSeen(callKey)) return;
++                  // The hook and this parser see the same call concurrently;
++                  // give the hook a moment to prove it is wired.
++                  if (await gate.waitForLive()) return;
++                  applyStdoutRiskPolicy(name, input);
+                 });
+-              } else if (decision.level === "deny" && haltedReason === null) {
+-                haltedReason = decision.reason;
+-                emit({ type: "tool.blocked", name, reason: decision.reason });
++              } else {
++                applyStdoutRiskPolicy(name, input);
+               }
+ 
+               // Agent-initiated role switch (set_role from the roles MCP server).
+@@ -457,7 +505,9 @@ export class ClaudeCodeRunner {
+ 
+     const execOpts: VmExecOpts = {
+       cwd: request.cwd,
+-      env: request.env,
++      // The hook client reads its endpoint + per-run token from the exec env —
++      // never argv, which anything on the box can read out of the process table.
++      env: gate ? { ...request.env, ...gate.env() } : request.env,
+       signal: request.signal ? AbortSignal.any([request.signal, switchAbort.signal]) : switchAbort.signal,
+       onStdout: (chunk) => parser.push(chunk),
+       onStderr: (chunk) => {
+@@ -633,6 +683,10 @@ export class ClaudeCodeRunner {
+     const argv: string[] = [this.bin, "-p", "--output-format", "stream-json", "--verbose"];
+     if (request.sessionId) argv.push("--resume", request.sessionId);
+     if (request.model) argv.push("--model", request.model);
++    // A VM image that predates the managed PreToolUse hook still gets the
++    // synchronous gate: the runtime writes a per-run settings file with the
++    // hook and passes it here.
++    if (request.settingsPath) argv.push("--settings", request.settingsPath);
+     // The agent card and the active role's prompt ride as one appended system
+     // prompt, one argv element per value — never interpolated into a shell string.
+     const role = request.rolePhase;
+diff --git a/apps/swarmagents/lib/harness/tool-gate.test.ts b/apps/swarmagents/lib/harness/tool-gate.test.ts
+new file mode 100644
+index 000000000..fd30f03e3
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/tool-gate.test.ts
+@@ -0,0 +1,281 @@
++/**
++ * Unit tests for the synchronous tool gate (lib/harness/tool-gate.ts).
++ *
++ * The gate is the app side of the VM's PreToolUse hook: it classifies a tool
++ * call, asks the user when needed, and answers allow/deny. The hook blocks the
++ * CLI on that answer, so "the verdict arrives before the tool runs" is a
++ * property of this module: nothing is allowed until decide() resolves.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  closeAllToolGates,
++  getToolGateSession,
++  openToolGate,
++  toolCallKey,
++  toolGateCount,
++  ToolGateSession,
++  TOOL_HOOK_COMMAND,
++  toolHookSettings,
++} from "./tool-gate";
++import { classifyToolCall, isIrreversibleExternal } from "./risk";
++import type { ApprovalGateway, ApprovalRequest, TelemetryEvent } from "./types";
++
++
++const HOOK_URL = "http://app.test/api/runtime/hooks/pretooluse";
++
++function deferredVerdict() {
++  let resolve!: (v: "approved" | "denied" | "expired") => void;
++  const promise = new Promise<"approved" | "denied" | "expired">((r) => {
++    resolve = r;
++  });
++  return { promise, resolve };
++}
++
++function makeGateway() {
++  const requests: ApprovalRequest[] = [];
++  const resolvers: Array<(v: "approved" | "denied" | "expired") => void> = [];
++  const gateway: ApprovalGateway = async (req) => {
++    requests.push(req);
++    const { promise, resolve } = deferredVerdict();
++    resolvers.push(resolve);
++    return { id: `appr_test_${requests.length}`, verdict: promise };
++  };
++  return { gateway, requests, resolvers };
++}
++
++function makeSession(config: Partial<Parameters<typeof openToolGate>[0]> = {}) {
++  const events: TelemetryEvent[] = [];
++  const session = openToolGate(
++    { runId: "run_1", userId: "alice", hookUrl: HOOK_URL, ...config },
++    (event) => events.push(event),
++  );
++  assert.ok(session, "gate session should open when a hook URL is configured");
++  return { session: session as ToolGateSession, events };
++}
++
++test.afterEach(() => closeAllToolGates());
++
++test("no hook URL means no session: the legacy gate stays in charge", () => {
++  assert.equal(openToolGate({ runId: "run_1", hookUrl: "" }, () => {}), null);
++  assert.equal(toolGateCount(), 0);
++});
++
++test("a benign call is allowed with no approval card", async () => {
++  const { gateway, requests } = makeGateway();
++  const { session, events } = makeSession({ approvalGateway: gateway });
++
++  const verdict = await session.decide({ tool_name: "Bash", tool_input: { command: "ls -la" }, tool_use_id: "toolu_1" });
++
++  assert.equal(verdict.decision, "allow");
++  assert.equal(requests.length, 0);
++  assert.deepEqual(events.map((e) => e.type), ["tool.started"]);
++  assert.equal(session.hasSeen(toolCallKey("toolu_1", "Bash", { command: "ls -la" })), true);
++});
++
++test("a deny-classified call is blocked with no card and never marked started", async () => {
++  const { gateway, requests } = makeGateway();
++  const { session, events } = makeSession({ approvalGateway: gateway });
++
++  const verdict = await session.decide({
++    tool_name: "Bash",
++    tool_input: { command: "cat /etc/passwd" },
++    tool_use_id: "toolu_deny",
++  });
++
++  assert.equal(verdict.decision, "deny");
++  assert.match(verdict.reason, /credential/i);
++  assert.equal(requests.length, 0, "a policy deny must not open an approval card");
++  assert.deepEqual(events.map((e) => e.type), ["tool.blocked"]);
++});
++
++test("an ask-classified call blocks on the card and allows only after approval", async () => {
++  const { gateway, requests, resolvers } = makeGateway();
++  const { session, events } = makeSession({ approvalGateway: gateway });
++
++  const pending = session.decide({
++    tool_name: "Bash",
++    tool_input: { command: "rm -rf /tmp/scratch" },
++    tool_use_id: "toolu_ask",
++  });
++
++  // Nothing is allowed yet: decide() is still waiting on the human.
++  await new Promise((r) => setTimeout(r, 20));
++  assert.equal(requests.length, 1);
++  assert.equal(events.some((e) => e.type === "tool.started"), false);
++
++  resolvers[0]("approved");
++  const verdict = await pending;
++
++  assert.equal(verdict.decision, "allow");
++  const order = events.map((e) => e.type);
++  assert.deepEqual(order, ["approval.required", "approval.resolved", "tool.started"]);
++  const required = events[0] as Extract<TelemetryEvent, { type: "approval.required" }>;
++  assert.equal(required.approval.tool, "Bash");
++  assert.equal(required.approval.action, "rm -rf /tmp/scratch");
++  assert.ok(required.approval.id.startsWith("appr_"));
++});
++
++test("a denied card blocks the call: deny verdict, no tool.started", async () => {
++  const { gateway, resolvers } = makeGateway();
++  const { session, events } = makeSession({ approvalGateway: gateway });
++
++  const pending = session.decide({
++    tool_name: "Bash",
++    tool_input: { command: "sudo apt-get install -y curl" },
++    tool_use_id: "toolu_deny_ask",
++  });
++  await new Promise((r) => setTimeout(r, 20));
++  resolvers[0]("denied");
++
++  const verdict = await pending;
++  assert.equal(verdict.decision, "deny");
++  assert.match(verdict.reason, /denied/);
++  assert.equal(events.some((e) => e.type === "tool.started"), false);
++  assert.equal(events.filter((e) => e.type === "approval.resolved").length, 1);
++});
++
++test("a timed-out card denies the call and reports the timeout", async () => {
++  // The real store's TTL timer is unref'd (it must never hold the process
++  // open), so the test drives the same shape with a live timer: verdict
++  // resolves "expired" and timedOut() reports true.
++  const { session, events } = makeSession({
++    approvalGateway: async () => ({
++      id: "appr_timeout",
++      expiresAt: Date.now() + 30,
++      timedOut: () => true,
++      verdict: new Promise<"expired">((resolve) => setTimeout(() => resolve("expired"), 30)),
++    }),
++  });
++
++  const verdict = await session.decide({
++    tool_name: "Bash",
++    tool_input: { command: "rm -rf /var/tmp/scratch" },
++    tool_use_id: "toolu_timeout",
++  });
++
++  assert.equal(verdict.decision, "deny");
++  const types = events.map((e) => e.type);
++  assert.deepEqual(types, ["approval.required", "approval.timeout", "approval.resolved"]);
++  const resolved = events[2] as Extract<TelemetryEvent, { type: "approval.resolved" }>;
++  assert.equal(resolved.verdict, "expired");
++});
++
++test("without an approval channel an ask fails closed", async () => {
++  const { session, events } = makeSession();
++  const verdict = await session.decide({
++    tool_name: "Bash",
++    tool_input: { command: "rm -rf /tmp/scratch" },
++    tool_use_id: "toolu_no_channel",
++  });
++  assert.equal(verdict.decision, "deny");
++  assert.match(verdict.reason, /no approval channel/i);
++  assert.equal(events.length, 0);
++});
++
++test("full-auto auto-allows in-VM asks but still asks for irreversible external actions", async () => {
++  const { gateway, requests, resolvers } = makeGateway();
++  const { session } = makeSession({ approvalGateway: gateway, autoApprove: true });
++
++  const inVm = await session.decide({
++    tool_name: "Bash",
++    tool_input: { command: "rm -rf /tmp/scratch" },
++    tool_use_id: "toolu_auto",
++  });
++  assert.equal(inVm.decision, "allow");
++  assert.equal(requests.length, 0, "full-auto must not open a card for an in-VM ask");
++
++  const pending = session.decide({
++    tool_name: "Bash",
++    tool_input: { command: "git push --force origin main" },
++    tool_use_id: "toolu_force",
++  });
++  await new Promise((r) => setTimeout(r, 20));
++  assert.equal(requests.length, 1, "a force push still needs a human in full-auto");
++  resolvers[0]("denied");
++  assert.equal((await pending).decision, "deny");
++});
++
++test("the same tool call is decided once, even when the hook fires twice", async () => {
++  const { gateway, requests, resolvers } = makeGateway();
++  const { session } = makeSession({ approvalGateway: gateway });
++
++  const payload = { tool_name: "Bash", tool_input: { command: "sudo id" }, tool_use_id: "toolu_dup" };
++  const first = session.decide(payload);
++  const second = session.decide(payload);
++  await new Promise((r) => setTimeout(r, 20));
++  assert.equal(requests.length, 1, "a duplicate hook call must not open a second card");
++  resolvers[0]("approved");
++  assert.equal((await first).decision, "allow");
++  assert.equal((await second).decision, "allow");
++});
++
++test("closing a run denies the call it is waiting on", async () => {
++  const { gateway } = makeGateway();
++  const { session } = makeSession({ approvalGateway: gateway });
++
++  const pending = session.decide({
++    tool_name: "Bash",
++    tool_input: { command: "sudo reboot" },
++    tool_use_id: "toolu_close",
++  });
++  await new Promise((r) => setTimeout(r, 20));
++  session.close();
++  const verdict = await pending;
++  assert.equal(verdict.decision, "deny");
++  assert.match(verdict.reason, /run ended/i);
++});
++
++test("session lookup is by bearer token only", () => {
++  const { session } = makeSession();
++  assert.equal(getToolGateSession(session.token), session);
++  assert.equal(getToolGateSession(`hk1_${"A".repeat(32)}`), null);
++  assert.equal(getToolGateSession("not-a-token"), null);
++  assert.equal(getToolGateSession(null), null);
++  session.close();
++  assert.equal(getToolGateSession(session.token), null, "a closed session is gone");
++});
++
++test("the hook env carries the endpoint, token and timeout, never argv", () => {
++  const { session } = makeSession({ ttlMs: 1234 });
++  const env = session.env();
++  assert.equal(env.SWARM_HOOK_URL, HOOK_URL);
++  assert.equal(env.SWARM_HOOK_TOKEN, session.token);
++  assert.equal(env.SWARM_HOOK_TIMEOUT_MS, "1234");
++});
++
++test("toolCallKey is stable across key order and distinct per call", () => {
++  const a = toolCallKey(undefined, "Bash", { command: "ls", timeout: 1 });
++  const b = toolCallKey(undefined, "Bash", { timeout: 1, command: "ls" });
++  assert.equal(a, b);
++  assert.notEqual(a, toolCallKey(undefined, "Bash", { command: "ls", timeout: 2 }));
++  assert.equal(toolCallKey("toolu_x", "Bash", {}), "id:toolu_x");
++});
++
++test("the hook settings match what the image ships", () => {
++  const settings = toolHookSettings() as {
++    hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string; timeout: number }> }> };
++  };
++  const entry = settings.hooks.PreToolUse[0];
++  assert.equal(entry.matcher, "*");
++  assert.equal(entry.hooks[0].command, TOOL_HOOK_COMMAND);
++  assert.equal(entry.hooks[0].timeout, 330);
++});
++
++test("irreversible external actions are recognised", () => {
++  assert.equal(isIrreversibleExternal("Bash", { command: "git push --force origin main" }), true);
++  assert.equal(isIrreversibleExternal("Bash", { command: "npm publish" }), true);
++  assert.equal(isIrreversibleExternal("Bash", { command: "gh release create v1" }), true);
++  assert.equal(isIrreversibleExternal("Bash", { command: "rm -rf /tmp/x" }), false);
++  assert.equal(isIrreversibleExternal("Read", { file_path: "/workspace/x" }), false);
++});
++
++test("the classifier agrees that these fixtures are ask-level", () => {
++  // Guards the tests above against a classifier change silently turning an
++  // "ask" fixture into an allow (which would make the assertions vacuous).
++  assert.equal(classifyToolCall("Bash", { command: "rm -rf /tmp/scratch" }).level, "ask");
++  assert.equal(classifyToolCall("Bash", { command: "sudo id" }).level, "ask");
++  assert.equal(classifyToolCall("Bash", { command: "cat /etc/passwd" }).level, "deny");
++  assert.equal(classifyToolCall("Bash", { command: "ls -la" }).level, "allow");
++});
+diff --git a/apps/swarmagents/lib/harness/tool-gate.ts b/apps/swarmagents/lib/harness/tool-gate.ts
+new file mode 100644
+index 000000000..a1862c640
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/tool-gate.ts
+@@ -0,0 +1,414 @@
++/**
++ * Synchronous tool gate: the harness side of the VM's PreToolUse hook.
++ *
++ * Before this module existed the risk gate was advisory. `claude -p` was
++ * launched with a blanket `permissions.allow` in the VM's managed settings and
++ * no PreToolUse hook, so the CLI executed every tool itself; the harness
++ * classified the tool_use block from stdout *after* the fact and, on an "ask",
++ * opened an approval card while the command was already running. A denial only
++ * relabelled a finished run.
++ *
++ * Now the VM's managed settings register a PreToolUse hook
++ * (vm-image/managed-settings.json -> vm-image/pretooluse-hook.mjs). The CLI
++ * spawns that hook *before* executing any tool and blocks until it exits; the
++ * hook forwards the tool call to the app and prints whatever verdict comes
++ * back. This module is the app side of that conversation:
++ *
++ *   hook POST /api/runtime/hooks/pretooluse (Bearer <per-run token>)
++ *     -> classifyToolCall(name, input)
++ *        allow  -> { decision: "allow" }            (no human needed)
++ *        ask    -> approval.required, wait for the user, then allow/deny
++ *        deny   -> { decision: "deny", reason }     (never executed)
++ *     <- { hookSpecificOutput: { permissionDecision, permissionDecisionReason } }
++ *
++ * The verdict is therefore synchronous with execution: the tool only runs after
++ * the hook returned "allow". A denied or timed-out approval (300 s default)
++ * returns "deny", so the command never executes and the model sees the reason.
++ *
++ * Sessions are per run and per process. The token is random, scoped to one run,
++ * revoked when the run ends, and only ever able to *ask* — holding it does not
++ * let the holder approve anything, so a leaked token cannot bypass the gate.
++ */
++
++import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
++import type { ApprovalGateway, TelemetryEvent } from "./types";
++import { classifyToolCall, isIrreversibleExternal, type RiskDecision } from "./risk";
++
++/** Path inside the VM of the seeded hook client (see lib/harness/hook-script.ts). */
++export const TOOL_HOOK_PATH = "/workspace/.swarm/pretooluse-hook.mjs";
++
++/** Path of the hook client baked into the VM image (root-owned, read-only). */
++export const TOOL_HOOK_IMAGE_PATH = "/opt/swarm/hooks/pretooluse-hook.mjs";
++
++/**
++ * The PreToolUse hook command, shared by the image's managed settings and the
++ * per-run settings file the runtime writes for VMs built from an older image.
++ * `$SWARM_HOOK_SCRIPT` lets a test point at the repo copy; otherwise the
++ * image's read-only copy wins, with the seeded /workspace copy as a fallback.
++ * A constant shell line: nothing from the run is interpolated into it.
++ */
++export const TOOL_HOOK_COMMAND =
++  "sh -c 'f=${SWARM_HOOK_SCRIPT:-/opt/swarm/hooks/pretooluse-hook.mjs}; " +
++  "[ -f \"$f\" ] || f=/workspace/.swarm/pretooluse-hook.mjs; exec node \"$f\"'";
++
++/** The `hooks` object both settings files carry. */
++export function toolHookSettings(): Record<string, unknown> {
++  return {
++    hooks: {
++      PreToolUse: [
++        {
++          matcher: "*",
++          hooks: [{ type: "command", timeout: 330, command: TOOL_HOOK_COMMAND }],
++        },
++      ],
++    },
++  };
++}
++
++/** Env names the hook client reads (set on the claude exec env, never in argv). */
++export const HOOK_URL_ENV = "SWARM_HOOK_URL";
++export const HOOK_TOKEN_ENV = "SWARM_HOOK_TOKEN";
++export const HOOK_TIMEOUT_ENV = "SWARM_HOOK_TIMEOUT_MS";
++
++/** Default approval TTL: 300 s, matching the approval store's default. */
++export const DEFAULT_GATE_TTL_MS = 300_000;
++
++/** The hook client gives up a little after the app's own TTL so the app wins. */
++export const DEFAULT_HOOK_TIMEOUT_MS = DEFAULT_GATE_TTL_MS + 30_000;
++
++/** Cap on distinct tool calls a single run may gate (guards a runaway loop). */
++const MAX_GATED_CALLS = 500;
++
++export interface ToolGateConfig {
++  /** Run this gate belongs to (approval records and telemetry are scoped to it). */
++  runId: string;
++  /** Account that owns the run (audit attribution only). */
++  userId?: string;
++  /** Absolute URL of the app's hook endpoint, reachable from inside the VM. */
++  hookUrl: string;
++  /** Creates the user-facing approval ticket for an ask-classified call. */
++  approvalGateway?: ApprovalGateway;
++  /**
++   * Full-auto (g9): auto-allow asks that stay inside the VM. Hard denies and
++   * irreversible-external actions (force push, publish, deploy) still ask.
++   */
++  autoApprove?: boolean;
++  /** Approval TTL override in ms. Defaults to DEFAULT_GATE_TTL_MS. */
++  ttlMs?: number;
++  /** Injectable clock for tests. */
++  now?: () => number;
++}
++
++/** The subset of the Claude Code hook payload this gate needs. */
++export interface HookPayload {
++  hook_event_name?: unknown;
++  session_id?: unknown;
++  tool_name?: unknown;
++  tool_input?: unknown;
++  tool_use_id?: unknown;
++}
++
++export interface GateVerdict {
++  decision: "allow" | "deny";
++  /** Shown to the model (and the user) when the call is blocked. */
++  reason: string;
++  /** Approval id when the verdict came from an approval card. */
++  approvalId?: string;
++  /** Risk level the classifier assigned. */
++  level: RiskDecision["level"];
++}
++
++/** Stable key for one tool call: the CLI's id, else a hash of name+input. */
++export function toolCallKey(toolUseId: unknown, name: string, input: unknown): string {
++  if (typeof toolUseId === "string" && toolUseId.trim() !== "") return `id:${toolUseId}`;
++  const hash = createHash("sha256")
++    .update(name)
++    .update("\u0000")
++    .update(stableStringify(input))
++    .digest("hex")
++    .slice(0, 32);
++  return `h:${hash}`;
++}
++
++/** Deterministic JSON for hashing (object keys sorted, bounded depth). */
++function stableStringify(value: unknown, depth = 0): string {
++  if (depth > 6) return '"…"';
++  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
++  if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v, depth + 1)).join(",")}]`;
++  const obj = value as Record<string, unknown>;
++  const keys = Object.keys(obj).sort();
++  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k], depth + 1)}`).join(",")}}`;
++}
++
++/** Human-readable summary of the flagged action (a command, path, or URL). */
++export function describeToolAction(name: string, input: unknown): string {
++  if (input && typeof input === "object") {
++    const obj = input as Record<string, unknown>;
++    if (typeof obj.command === "string") return obj.command;
++    if (typeof obj.file_path === "string") return obj.file_path;
++    if (typeof obj.path === "string") return obj.path;
++    if (typeof obj.url === "string") return obj.url;
++    if (typeof obj.notebook_path === "string") return obj.notebook_path;
++    if (typeof obj.query === "string") return obj.query;
++  }
++  return name;
++}
++
++/** How long a legacy (hook-less) VM may take to prove the hook is wired. */
++const LIVE_WAIT_MS = 500;
++
++export class ToolGateSession {
++  readonly token: string;
++  readonly runId: string;
++  readonly userId: string;
++  readonly config: ToolGateConfig;
++  private readonly emit: (event: TelemetryEvent) => void;
++  private readonly now: () => number;
++  private readonly seen = new Set<string>();
++  /** Verdict cache: a repeated hook call for the same tool call reuses it. */
++  private readonly verdicts = new Map<string, Promise<GateVerdict>>();
++  private readonly liveWaiters = new Set<() => void>();
++  /** Resolves when the run ends, so a waiting hook never outlives its run. */
++  private readonly closedSignal: Promise<void>;
++  private markClosed!: () => void;
++  private requests = 0;
++  private closed = false;
++
++  constructor(token: string, config: ToolGateConfig, emit: (event: TelemetryEvent) => void) {
++    this.token = token;
++    this.runId = config.runId;
++    this.userId = config.userId ?? "";
++    this.config = config;
++    this.emit = emit;
++    this.now = config.now ?? Date.now;
++    this.closedSignal = new Promise<void>((resolve) => {
++      this.markClosed = resolve;
++    });
++  }
++
++  /** Env the claude process (and therefore the hook) needs to reach the app. */
++  env(): Record<string, string> {
++    return {
++      [HOOK_URL_ENV]: this.config.hookUrl,
++      [HOOK_TOKEN_ENV]: this.token,
++      [HOOK_TIMEOUT_ENV]: String(this.config.ttlMs ?? DEFAULT_GATE_TTL_MS),
++    };
++  }
++
++  /** True once the hook has called home at least once for this run. */
++  isLive(): boolean {
++    return this.requests > 0;
++  }
++
++  /**
++   * Wait (bounded) for the hook to prove it is wired. The stdout parser and the
++   * hook run concurrently for the first tool call, so a VM without the hook
++   * needs a moment before the harness falls back to the legacy path.
++   */
++  async waitForLive(timeoutMs = LIVE_WAIT_MS): Promise<boolean> {
++    if (this.isLive() || this.closed) return this.isLive();
++    await new Promise<void>((resolve) => {
++      const done = () => {
++        clearTimeout(timer);
++        this.liveWaiters.delete(done);
++        resolve();
++      };
++      const timer = setTimeout(done, timeoutMs);
++      timer.unref?.();
++      this.liveWaiters.add(done);
++    });
++    return this.isLive();
++  }
++
++  /** Has the hook already decided this exact tool call? */
++  hasSeen(key: string): boolean {
++    return this.seen.has(key);
++  }
++
++  /**
++   * Decide one tool call. Resolves only once the call may (or may not) run, so
++   * the caller — the PreToolUse hook — can block the CLI on the answer.
++   */
++  async decide(payload: HookPayload): Promise<GateVerdict> {
++    const name = typeof payload.tool_name === "string" ? payload.tool_name : "";
++    const input = payload.tool_input;
++    if (!name) return { decision: "deny", reason: "hook payload carried no tool name", level: "deny" };
++    const key = toolCallKey(payload.tool_use_id, name, input);
++
++    const cached = this.verdicts.get(key);
++    if (cached) return cached;
++
++    if (this.closed) {
++      return { decision: "deny", reason: "run is no longer active", level: "deny" };
++    }
++    this.requests += 1;
++    for (const waiter of [...this.liveWaiters]) waiter();
++
++    if (this.requests > MAX_GATED_CALLS) {
++      return { decision: "deny", reason: "too many tool calls in one run", level: "deny" };
++    }
++
++    const toolUseId = typeof payload.tool_use_id === "string" ? payload.tool_use_id : undefined;
++    const pending = this.evaluate(name, input, toolUseId).catch((error: unknown) => {
++      const message = error instanceof Error ? error.message : String(error);
++      return { decision: "deny", reason: `approval failed: ${message}`, level: "ask" } as GateVerdict;
++    });
++    this.verdicts.set(key, pending);
++    this.seen.add(key);
++    this.trimCache();
++    return pending;
++  }
++
++  private trimCache(): void {
++    // Bounded memory: drop the oldest verdicts once the cache grows past the
++    // cap. Only recent calls matter for hook retries and duplicate hooks.
++    if (this.verdicts.size <= MAX_GATED_CALLS) return;
++    const drop = this.verdicts.size - MAX_GATED_CALLS;
++    let dropped = 0;
++    for (const key of this.verdicts.keys()) {
++      this.verdicts.delete(key);
++      if (++dropped >= drop) break;
++    }
++  }
++
++  private async evaluate(name: string, input: unknown, toolUseId?: string): Promise<GateVerdict> {
++    const decision = classifyToolCall(name, input);
++
++    if (decision.level === "deny") {
++      // Policy denial: no card, the model is told why and can adapt.
++      this.emit({ type: "tool.blocked", name, reason: decision.reason });
++      return { decision: "deny", reason: decision.reason, level: "deny" };
++    }
++
++    if (decision.level === "allow") {
++      this.emit({ type: "tool.started", name, id: toolUseId });
++      return { decision: "allow", reason: decision.reason, level: "allow" };
++    }
++
++    // ask
++    const external = isIrreversibleExternal(name, input);
++    if (this.config.autoApprove && !external) {
++      this.emit({ type: "tool.started", name, id: toolUseId });
++      return {
++        decision: "allow",
++        reason: `full-auto: ${decision.reason}`,
++        level: "ask",
++      };
++    }
++
++    const gateway = this.config.approvalGateway;
++    if (!gateway) {
++      // Fail closed: without a way to ask a human, a risky call does not run.
++      return { decision: "deny", reason: "no approval channel is configured for this run", level: "ask" };
++    }
++
++    const action = describeToolAction(name, input);
++    const reason = external
++      ? `${decision.reason} (irreversible outside the VM)`
++      : decision.reason;
++
++    let ticket;
++    try {
++      ticket = await gateway({ runId: this.runId, toolName: name, action, reason });
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      return { decision: "deny", reason: `approval could not be requested: ${message}`, level: "ask" };
++    }
++
++    this.emit({
++      type: "approval.required",
++      approval: {
++        id: ticket.id,
++        tool: name,
++        action,
++        reason,
++        riskLevel: "ask",
++        expiresAt: ticket.expiresAt,
++      },
++    });
++
++    // A run that ends (cancel, finish, crash) must not leave the CLI blocked on
++    // an approval nobody will answer: close() resolves this as a denial.
++    const verdict = await Promise.race([
++      ticket.verdict,
++      this.closedSignal.then(() => "expired" as const),
++    ]);
++    if (this.closed) {
++      return { decision: "deny", reason: "the run ended before the approval was decided", approvalId: ticket.id, level: "ask" };
++    }
++    if (
++      verdict === "expired" &&
++      (ticket.timedOut === undefined || ticket.timedOut())
++    ) {
++      this.emit({ type: "approval.timeout", id: ticket.id, tool: name, action, reason, expiresAt: ticket.expiresAt });
++    }
++    this.emit({ type: "approval.resolved", id: ticket.id, verdict });
++
++    if (verdict === "approved") {
++      this.emit({ type: "tool.started", name, id: toolUseId });
++      return { decision: "allow", reason: "approved by the user", approvalId: ticket.id, level: "ask" };
++    }
++    return {
++      decision: "deny",
++      reason:
++        verdict === "expired"
++          ? "approval timed out — the call was not executed"
++          : "the user denied this call",
++      approvalId: ticket.id,
++      level: "ask",
++    };
++  }
++
++  /** Close the session: later hook calls are refused, pending waits resolve. */
++  close(): void {
++    this.closed = true;
++    this.markClosed();
++    for (const waiter of [...this.liveWaiters]) waiter();
++    this.liveWaiters.clear();
++    for (const [token, session] of registry) {
++      if (session === this) registry.delete(token);
++    }
++  }
++}
++
++const registry = new Map<string, ToolGateSession>();
++
++/** Open a gate session for one run; returns null when no hook URL is known. */
++export function openToolGate(
++  config: ToolGateConfig,
++  emit: (event: TelemetryEvent) => void,
++): ToolGateSession | null {
++  if (!config.hookUrl) return null;
++  const token = `hk1_${randomBytes(24).toString("base64url")}`;
++  const session = new ToolGateSession(token, config, emit);
++  registry.set(token, session);
++  return session;
++}
++
++/** Look a session up by its bearer token (constant-time comparison). */
++export function getToolGateSession(token: string | null | undefined): ToolGateSession | null {
++  if (!token) return null;
++  const candidate = token.trim();
++  if (!/^hk1_[A-Za-z0-9_-]{16,64}$/.test(candidate)) return null;
++  // Compare against every live token in constant time so a wrong token never
++  // short-circuits on a length or prefix difference.
++  let match: ToolGateSession | null = null;
++  const given = Buffer.from(candidate);
++  for (const [key, session] of registry) {
++    const expected = Buffer.from(key);
++    if (expected.length !== given.length) continue;
++    if (timingSafeEqual(expected, given)) match = session;
++  }
++  return match;
++}
++
++/** Close every session (test hook / shutdown). */
++export function closeAllToolGates(): void {
++  for (const session of [...registry.values()]) session.close();
++  registry.clear();
++}
++
++/** Number of live sessions (test hook). */
++export function toolGateCount(): number {
++  return registry.size;
++}
+diff --git a/apps/swarmagents/lib/harness/types.ts b/apps/swarmagents/lib/harness/types.ts
+index 3725cbcd2..6544d3943 100644
+--- a/apps/swarmagents/lib/harness/types.ts
++++ b/apps/swarmagents/lib/harness/types.ts
+@@ -8,6 +8,7 @@
+  */
+ 
+ import type { RiskLevel } from "./risk";
++import type { ToolGateConfig } from "./tool-gate";
+ 
+ /** Minimal exec interface, modeled on VmDriver. Implementations manage the actual process tree. */
+ export interface VmExecOpts {
+@@ -40,6 +41,13 @@ export type TelemetryEvent =
+   | { type: "run.started"; sessionId?: string; model?: string; provider?: string; startedAt: number }
+   | { type: "assistant.text"; text: string }
+   | { type: "tool.call"; name: string; input: unknown; id?: string }
++  /**
++   * Emitted by the synchronous gate (./tool-gate.ts) when a tool call is
++   * cleared to run — after any approval, immediately before execution. The
++   * ordering `approval.required` -> `approval.resolved` -> `tool.started`
++   * proves the verdict arrived before the tool ran.
++   */
++  | { type: "tool.started"; name: string; id?: string }
+   | { type: "tool.result"; id?: string; ok: boolean; truncated: boolean; output: string }
+   | { type: "usage"; inputTokens: number; outputTokens: number; cachedTokens?: number; model?: string }
+   | { type: "run.finished"; exitCode: number; sessionId: string; costUsd?: number; durationMs?: number; numTurns?: number }
+@@ -197,6 +205,18 @@ export interface RunRequest {
+   cwd?: string;
+   /** When set, ask-classified tool calls pause for a human decision. */
+   approvalGateway?: ApprovalGateway;
++  /**
++   * Synchronous PreToolUse gate. When set, the runner registers a per-run gate
++   * session, hands the hook client its URL + token via the exec env, and lets
++   * the hook — not the stdout parser — decide before a tool runs. Absent: the
++   * legacy advisory gate above applies.
++   */
++  toolGate?: ToolGateConfig;
++  /**
++   * Extra `--settings <path>` file for the CLI, used to install the PreToolUse
++   * hook on VMs whose image predates the managed-settings hook.
++   */
++  settingsPath?: string;
+   /**
+    * The role configuration for this invocation (--allowedTools / --mcp-config
+    * / --append-system-prompt). When absent the run uses the default toolset.
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index 5e4d3318a..0560ff715 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -99,6 +99,26 @@ test("allows bearer-authenticated requests without an Origin header", async () =
+   assert.equal(res.status, 200);
+ });
+ 
++test("the PreToolUse approval hook is reachable without a session", () => {
++  // The VM holds no cookie: the hook authenticates with its own per-run token,
++  // which the route checks. Blocking it here would deny every tool call.
++  const res = middleware(
++    req(
++      "http://swarm.example.com/api/runtime/hooks/pretooluse",
++      { host: "swarm.example.com", authorization: "Bearer hk1_abc" },
++      "POST",
++    ),
++  );
++  assert.equal(res.status, 200);
++});
++
++test("a sibling path under the hook prefix still needs a session", () => {
++  const res = middleware(
++    req("http://swarm.example.com/api/runtime/hooks/other", { host: "swarm.example.com" }, "POST"),
++  );
++  assert.equal(res.status, 401);
++});
++
+ test("does not gate cross-site GET requests", () => {
+   const res = middleware(
+     req("http://swarm.example.com/api/providers/health", {
+diff --git a/apps/swarmagents/lib/runtime/hook-settings.test.ts b/apps/swarmagents/lib/runtime/hook-settings.test.ts
+new file mode 100644
+index 000000000..3c561d99e
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/hook-settings.test.ts
+@@ -0,0 +1,123 @@
++/**
++ * Tests for the hook-settings wiring (lib/runtime/hook-settings.ts).
++ *
++ * A VM image that already carries the PreToolUse hook in its managed settings
++ * needs nothing; an older image gets a per-run `--settings` file with the same
++ * hook. Either way the run ends up with exactly one hook, never zero.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { VmManager } from "../vm/manager";
++import { FakeVmDriver } from "../vm/fake-driver";
++import {
++  MANAGED_SETTINGS_PATH,
++  RUN_SETTINGS_PATH,
++  ensureHookSettings,
++  resetHookSettingsCache,
++  vmHasManagedHook,
++} from "./hook-settings";
++import { TOOL_HOOK_COMMAND } from "../harness/tool-gate";
++import { fullAutoEnabled, resolveHookUrl } from "./manager";
++
++function vm() {
++  const driver = new FakeVmDriver();
++  return { driver, manager: new VmManager({ customDriver: driver }) };
++}
++
++const USER = "alice";
++
++function managedSettings(withHook: boolean): string {
++  return JSON.stringify({
++    permissions: { allow: ["Read"] },
++    ...(withHook
++      ? { hooks: { PreToolUse: [{ matcher: "*", hooks: [{ type: "command", command: TOOL_HOOK_COMMAND }] }] } }
++      : {}),
++  });
++}
++
++test.afterEach(() => resetHookSettingsCache());
++
++test("an image that already ships the hook needs no --settings file", async () => {
++  const { manager } = vm();
++  await manager.writeFile(USER, MANAGED_SETTINGS_PATH, managedSettings(true));
++
++  assert.equal(await vmHasManagedHook(manager, USER), true);
++  assert.equal(await ensureHookSettings(manager, USER), undefined);
++  await assert.rejects(() => manager.readFile(USER, RUN_SETTINGS_PATH));
++});
++
++test("an older image gets a per-run settings file with the hook", async () => {
++  const { manager } = vm();
++  await manager.writeFile(USER, MANAGED_SETTINGS_PATH, managedSettings(false));
++
++  assert.equal(await vmHasManagedHook(manager, USER), false);
++  const path = await ensureHookSettings(manager, USER);
++  assert.equal(path, RUN_SETTINGS_PATH);
++
++  const written = JSON.parse(await manager.readFile(USER, RUN_SETTINGS_PATH)) as {
++    hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string; timeout: number }> }> };
++  };
++  assert.equal(written.hooks.PreToolUse[0].matcher, "*");
++  assert.equal(written.hooks.PreToolUse[0].hooks[0].command, TOOL_HOOK_COMMAND);
++  assert.equal(written.hooks.PreToolUse[0].hooks[0].timeout, 330);
++});
++
++test("an unreadable settings file also falls back to --settings", async () => {
++  const { manager } = vm();
++  // No managed settings at all (a VM that never had them installed).
++  assert.equal(await vmHasManagedHook(manager, USER), false);
++  assert.equal(await ensureHookSettings(manager, USER), RUN_SETTINGS_PATH);
++});
++
++test("the managed-hook probe is cached per user", async () => {
++  const { manager } = vm();
++  await manager.writeFile(USER, MANAGED_SETTINGS_PATH, managedSettings(false));
++  assert.equal(await vmHasManagedHook(manager, USER), false);
++  // Installing the hook afterwards is not seen until the cache expires — the
++  // per-run settings file already covers the run either way.
++  await manager.writeFile(USER, MANAGED_SETTINGS_PATH, managedSettings(true));
++  assert.equal(await vmHasManagedHook(manager, USER), false);
++  resetHookSettingsCache();
++  assert.equal(await vmHasManagedHook(manager, USER), true);
++});
++
++test("the hook URL prefers its own setting and otherwise follows the LLM origin", () => {
++  const saved = {
++    hook: process.env.SWARM_VM_HOOK_BASE_URL,
++    llm: process.env.SWARM_VM_LLM_BASE_URL,
++    origin: process.env.SWARM_PUBLIC_ORIGIN,
++    mode: process.env.SWARM_SERVER_MODE,
++  };
++  try {
++    delete process.env.SWARM_VM_HOOK_BASE_URL;
++    delete process.env.SWARM_VM_LLM_BASE_URL;
++    delete process.env.SWARM_PUBLIC_ORIGIN;
++    delete process.env.SWARM_SERVER_MODE;
++    assert.equal(resolveHookUrl(), null, "no reachable origin means no synchronous gate");
++
++    process.env.SWARM_SERVER_MODE = "1";
++    process.env.SWARM_PUBLIC_ORIGIN = "https://swarm.example/";
++    assert.equal(resolveHookUrl(), "https://swarm.example/api/runtime/hooks/pretooluse");
++
++    process.env.SWARM_VM_HOOK_BASE_URL = "http://172.17.0.1:3777";
++    assert.equal(resolveHookUrl(), "http://172.17.0.1:3777/api/runtime/hooks/pretooluse");
++  } finally {
++    for (const [key, value] of [
++      ["SWARM_VM_HOOK_BASE_URL", saved.hook],
++      ["SWARM_VM_LLM_BASE_URL", saved.llm],
++      ["SWARM_PUBLIC_ORIGIN", saved.origin],
++      ["SWARM_SERVER_MODE", saved.mode],
++    ] as const) {
++      if (value === undefined) delete process.env[key];
++      else process.env[key] = value;
++    }
++  }
++});
++
++test("full-auto is opt-in", () => {
++  assert.equal(fullAutoEnabled({}), false);
++  assert.equal(fullAutoEnabled({ SWARM_FULL_AUTO: "0" }), false);
++  assert.equal(fullAutoEnabled({ SWARM_FULL_AUTO: "1" }), true);
++  assert.equal(fullAutoEnabled({ SWARM_FULL_AUTO: "true" }), true);
++});
+diff --git a/apps/swarmagents/lib/runtime/hook-settings.ts b/apps/swarmagents/lib/runtime/hook-settings.ts
+new file mode 100644
+index 000000000..5573f77ea
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/hook-settings.ts
+@@ -0,0 +1,68 @@
++/**
++ * Hook wiring for the VM's Claude Code settings.
++ *
++ * The synchronous risk gate needs a PreToolUse hook registered in the VM. New
++ * images carry it in `/etc/claude-code/managed-settings.json` (read-only, see
++ * vm-image/). A VM built from an older image does not, so the runtime writes a
++ * per-run settings file and passes it with `--settings` — the CLI merges it on
++ * top of the managed settings, which installs the same hook.
++ *
++ * Both lanes (runtime runs and team lanes) go through here so the decision is
++ * made once, cached per user, and never duplicated: passing the hook twice
++ * would spawn two hook processes per tool call (the gate dedupes that anyway,
++ * but one hook is what we want).
++ */
++
++import type { VmManager } from "../vm/manager";
++import { toolHookSettings } from "../harness/tool-gate";
++
++/** The image's managed Claude Code settings — where the PreToolUse hook lives. */
++export const MANAGED_SETTINGS_PATH = "/etc/claude-code/managed-settings.json";
++/** Per-run settings file used when the VM's image predates the managed hook. */
++export const RUN_SETTINGS_PATH = "/workspace/.swarm/run-settings.json";
++
++/** How long a probe result is trusted before re-reading the VM (ms). */
++const PROBE_TTL_MS = 10 * 60_000;
++
++const probeCache = new Map<string, { at: number; hasHook: boolean }>();
++
++/** True when the VM's managed settings already register a PreToolUse hook. */
++export async function vmHasManagedHook(vm: VmManager, userId: string): Promise<boolean> {
++  const cached = probeCache.get(userId);
++  if (cached && Date.now() - cached.at < PROBE_TTL_MS) return cached.hasHook;
++  let hasHook = false;
++  try {
++    const text = await vm.readFile(userId, MANAGED_SETTINGS_PATH);
++    const parsed: unknown = JSON.parse(text);
++    const hooks = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>).hooks : undefined;
++    const pre = hooks && typeof hooks === "object" ? (hooks as Record<string, unknown>).PreToolUse : undefined;
++    hasHook = Array.isArray(pre) && pre.length > 0;
++  } catch {
++    // Unreadable settings (old image, or a driver without readFile): fall back
++    // to the per-run settings file, which the runner passes with --settings.
++    hasHook = false;
++  }
++  probeCache.set(userId, { at: Date.now(), hasHook });
++  return hasHook;
++}
++
++/**
++ * Ensure this run's claude process gets the PreToolUse hook. Returns the
++ * `--settings` path to pass, or undefined when the image already has it.
++ */
++export async function ensureHookSettings(vm: VmManager, userId: string): Promise<string | undefined> {
++  if (await vmHasManagedHook(vm, userId)) return undefined;
++  try {
++    await vm.writeFile(userId, RUN_SETTINGS_PATH, `${JSON.stringify(toolHookSettings(), null, 2)}\n`);
++    return RUN_SETTINGS_PATH;
++  } catch {
++    // A write failure must not break the run; the runner's stdout gate still
++    // applies (advisory) until the image is rebuilt.
++    return undefined;
++  }
++}
++
++/** Test hook: drop cached probe results. */
++export function resetHookSettingsCache(): void {
++  probeCache.clear();
++}
+diff --git a/apps/swarmagents/lib/runtime/manager.ts b/apps/swarmagents/lib/runtime/manager.ts
+index f86028b9b..2af941e9a 100644
+--- a/apps/swarmagents/lib/runtime/manager.ts
++++ b/apps/swarmagents/lib/runtime/manager.ts
+@@ -69,6 +69,8 @@ import {
+   rolePhase,
+   roleSeedFiles,
+ } from "../harness/role-mcp";
++import { PRETOOLUSE_HOOK_SEED_PATH, PRETOOLUSE_HOOK_SCRIPT } from "../harness/hook-script";
++import { ensureHookSettings } from "./hook-settings";
+ 
+ /**
+  * Only the variables Claude Code needs are forwarded into a user's VM. The server env also holds
+@@ -262,6 +264,32 @@ export function resolveLlmBaseUrl(): string | null {
+   return null;
+ }
+ 
++/**
++ * URL of the PreToolUse hook endpoint as seen from inside a user's VM.
++ *
++ * The VM has to call back into the app for every tool call, so the app must be
++ * reachable from the container: SWARM_VM_HOOK_BASE_URL when the app lives
++ * somewhere specific, otherwise the same origin the LLM proxy uses (the public
++ * site origin in server mode). When neither is set (local dev with no route
++ * from the container to the host) the synchronous gate is not wired and the
++ * harness keeps its legacy advisory gate.
++ */
++export function resolveHookUrl(): string | null {
++  const explicit = process.env.SWARM_VM_HOOK_BASE_URL?.trim();
++  const base = explicit ? explicit.replace(/\/+$/, "") : resolveLlmBaseUrl();
++  return base ? `${base}/api/runtime/hooks/pretooluse` : null;
++}
++
++/**
++ * g9 full-auto: in-VM asks are auto-allowed without a card. Hard denies and
++ * irreversible-external actions (force push, publish, deploy) still ask — the
++ * gate enforces that itself (see lib/harness/tool-gate.ts).
++ */
++export function fullAutoEnabled(env: Record<string, string | undefined> = process.env): boolean {
++  const raw = env.SWARM_FULL_AUTO?.trim().toLowerCase();
++  return raw === "1" || raw === "true" || raw === "yes";
++}
++
+ /**
+  * Drop host credentials from a child environment, keeping the ones the
+  * provider selection supplied. The server env holds session secrets, deploy
+@@ -365,7 +393,6 @@ export class RuntimeManager {
+    * keys on this; execute()'s finally removes entries. Never holds a slot.
+    */
+   private readonly cancelling = new Map<string, { userId: string }>();
+-
+   constructor(opts: {
+     vm?: VmManager;
+     bus?: TelemetryBus;
+@@ -587,6 +614,10 @@ export class RuntimeManager {
+     for (const file of roleSeedFiles(catalog, allowedRoleIds, initialPhase, { desktopMode: desktopModeEnabled() })) {
+       await this.vm.writeFile(userId, file.path, file.content);
+     }
++    // The PreToolUse hook client, seeded so a VM built from an image that
++    // predates /opt/swarm/hooks/pretooluse-hook.mjs still gates synchronously
++    // (the managed/run settings command falls back to this path).
++    await this.vm.writeFile(userId, PRETOOLUSE_HOOK_SEED_PATH, PRETOOLUSE_HOOK_SCRIPT);
+   }
+ 
+   /** Rewrite the VM's --mcp-config for the given role phase. */
+@@ -1439,6 +1470,13 @@ export class RuntimeManager {
+       };
+     };
+ 
++    // The synchronous gate: the VM's PreToolUse hook asks this process before
++    // the CLI runs anything, and that answer is the run's verdict. Without a
++    // reachable app URL the hook cannot call home, so the runner's legacy
++    // stdout gate stays in charge.
++    const hookUrl = resolveHookUrl();
++    const settingsPath = hookUrl ? await ensureHookSettings(this.vm, userId) : undefined;
++
+     try {
+       const outcome = await this.runner.run(
+         {
+@@ -1455,6 +1493,18 @@ export class RuntimeManager {
+           cwd: "/workspace",
+           redactSecrets: selection?.secrets,
+           approvalGateway,
++          ...(hookUrl
++            ? {
++                toolGate: {
++                  runId,
++                  userId,
++                  hookUrl,
++                  approvalGateway,
++                  autoApprove: fullAutoEnabled(),
++                },
++              }
++            : {}),
++          ...(settingsPath ? { settingsPath } : {}),
+           rolePhase: phase ?? this.defaultRolePhase(),
+           onRoleSwitch: async (request) => {
+             const catalog = userRoleCatalog(userId);
+diff --git a/apps/swarmagents/lib/team/harness.ts b/apps/swarmagents/lib/team/harness.ts
+index c32f66478..bbad47a11 100644
+--- a/apps/swarmagents/lib/team/harness.ts
++++ b/apps/swarmagents/lib/team/harness.ts
+@@ -17,9 +17,13 @@ import {
+   applyLlmProxyEnv,
+   buildRunnerEnv,
+   envFallback,
++  fullAutoEnabled,
++  resolveHookUrl,
+   resolveLlmBaseUrl,
+   scrubHostCredentials,
+ } from "../runtime/manager";
++import { ensureHookSettings } from "../runtime/hook-settings";
++import { PRETOOLUSE_HOOK_SEED_PATH, PRETOOLUSE_HOOK_SCRIPT } from "../harness/hook-script";
+ import { signRunToken } from "../runtime/run-token";
+ import {
+   aggregateFailureSummary,
+@@ -244,6 +248,20 @@ export class VmTeamHarness implements TeamHarness {
+ 
+     const exhausted = new Set<string>();
+     const failures: AttemptInfo[] = [];
++    // Same synchronous gate as a normal run: the VM's PreToolUse hook blocks
++    // each lane tool call until the harness answers. The hook client is seeded
++    // here too, so a lane on a fresh VM works before any runtime run seeded it.
++    const hookUrl = resolveHookUrl();
++    let settingsPath: string | undefined;
++    if (hookUrl) {
++      settingsPath = await ensureHookSettings(this.vm, userId);
++      try {
++        await this.vm.writeFile(userId, PRETOOLUSE_HOOK_SEED_PATH, PRETOOLUSE_HOOK_SCRIPT);
++      } catch {
++        // Best effort: the image's own copy is the normal path.
++      }
++    }
++    const approvalGateway = this.approvalGateway(runId, userId);
+     let lastText = "";
+     const lastError: { value: { message: string; exitCode?: number } | null } = { value: null };
+     let sessionId: string | undefined;
+@@ -328,7 +346,11 @@ export class VmTeamHarness implements TeamHarness {
+             // Every lane tool call goes through the same approval path as a
+             // normal run: an "ask" pauses the lane until the user approves or
+             // denies it, a "deny" is blocked outright.
+-            approvalGateway: this.approvalGateway(runId, userId),
++            approvalGateway,
++            ...(hookUrl
++              ? { toolGate: { runId, userId, hookUrl, approvalGateway, autoApprove: fullAutoEnabled() } }
++              : {}),
++            ...(settingsPath ? { settingsPath } : {}),
+           },
+           onEvent,
+         );
+@@ -538,4 +560,4 @@ export class VmTeamHarness implements TeamHarness {
+   }
+ }
+ 
+-export { LANE_PROMPT };
+\ No newline at end of file
++export { LANE_PROMPT };
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index d3323a2ad..37bd51f87 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -39,6 +39,12 @@ const PUBLIC_PREFIXES = ["/share/"];
+ 
+ /** The public board MCP endpoint is exempt from the cross-site gate (external MCP clients call it). */
+ const BOARD_PATH = "/api/mcp/swarm-board";
++/**
++ * The PreToolUse approval hook the agent's VM calls before every tool. It has
++ * no session (the VM holds no cookie) and authenticates with its own per-run
++ * bearer token, exactly like the LLM translation proxy.
++ */
++const TOOL_HOOK_PATH = "/api/runtime/hooks/pretooluse";
+ 
+ /** Liveness path the container healthcheck probes over loopback (Host: 127.0.0.1:<port>). */
+ const HEALTH_PATH = "/api/health";
+@@ -123,10 +129,13 @@ export function middleware(req: NextRequest) {
+     }
+   }
+ 
+-  // The LLM translation proxy (/api/runtime/llm/...) authenticates itself with
+-  // a per-run HMAC token, not a session/bearer credential, so it bypasses the
+-  // user gate below. It still passes the host check and rate limiting above.
+-  if (pathname.startsWith("/api/runtime/llm/")) {
++  // The LLM translation proxy (/api/runtime/llm/...) and the PreToolUse
++  // approval hook authenticate themselves with a per-run token, not a
++  // session/bearer credential, so they bypass the user gate below. Both still
++  // pass the host check and rate limiting above; a request without a valid
++  // token is refused by the route itself (404), which the hook turns into a
++  // denial.
++  if (pathname.startsWith("/api/runtime/llm/") || pathname === TOOL_HOOK_PATH) {
+     return withSecurityHeaders(NextResponse.next({ request: { headers: req.headers } }), nonce, { dev }, rate);
+   }
+ 
+-- 
+2.55.0
+

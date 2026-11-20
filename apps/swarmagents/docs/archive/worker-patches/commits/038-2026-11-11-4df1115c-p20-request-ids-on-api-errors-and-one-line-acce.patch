@@ -1,0 +1,662 @@
+From 4df1115c9ff85a2751509a27d708a3258aaf7b75 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 22:58:20 +0000
+Subject: [PATCH] [p20] Request ids on API errors and one-line access log
+
+---
+ apps/swarmagents/app/api/login/route.test.ts  | 20 +++-
+ apps/swarmagents/app/api/login/route.ts       |  7 +-
+ apps/swarmagents/app/api/providers/route.ts   | 61 +++++++-----
+ .../app/api/runtime/tasks/route.test.ts       | 17 ++++
+ .../app/api/runtime/tasks/route.ts            | 33 +++----
+ apps/swarmagents/lib/middleware.test.ts       | 28 ++++++
+ apps/swarmagents/lib/request-id.test.ts       | 97 +++++++++++++++++++
+ apps/swarmagents/lib/request-id.ts            | 81 ++++++++++++++++
+ apps/swarmagents/middleware.ts                | 35 ++++++-
+ 9 files changed, 328 insertions(+), 51 deletions(-)
+ create mode 100644 apps/swarmagents/lib/request-id.test.ts
+ create mode 100644 apps/swarmagents/lib/request-id.ts
+
+diff --git a/apps/swarmagents/app/api/login/route.test.ts b/apps/swarmagents/app/api/login/route.test.ts
+index c91cc4b1d..4edec7850 100644
+--- a/apps/swarmagents/app/api/login/route.test.ts
++++ b/apps/swarmagents/app/api/login/route.test.ts
+@@ -65,11 +65,27 @@ test("POST /api/login signs a session cookie with hardened attributes", async ()
+ test("POST /api/login refuses wrong password and unknown email the same way", async () => {
+   const wrongPw = await POST(request({ email: "alice@example.com", password: "nope" }));
+   assert.equal(wrongPw.status, 401);
+-  assert.deepEqual(await wrongPw.json(), { error: "Invalid credentials." });
++  const wrongBody = (await wrongPw.json()) as { error: string; requestId: string };
++  assert.equal(wrongBody.error, "Invalid credentials.");
++  assert.equal(typeof wrongBody.requestId, "string");
++  assert.ok(wrongBody.requestId.length > 0);
+ 
+   const unknown = await POST(request({ email: "nobody@example.com", password: "whatever" }));
+   assert.equal(unknown.status, 401);
+-  assert.deepEqual(await unknown.json(), { error: "Invalid credentials." });
++  const unknownBody = (await unknown.json()) as { error: string; requestId: string };
++  assert.equal(unknownBody.error, "Invalid credentials.");
++  assert.equal(typeof unknownBody.requestId, "string");
++  assert.ok(unknownBody.requestId.length > 0);
++});
++
++test("POST /api/login echoes a provided x-request-id in the error body", async () => {
++  const res = await POST(
++    request({ email: "alice@example.com", password: "nope" }, { "x-request-id": "req_login_123" }),
++  );
++  assert.equal(res.status, 401);
++  const body = (await res.json()) as { error: string; requestId: string };
++  assert.equal(body.error, "Invalid credentials.");
++  assert.equal(body.requestId, "req_login_123");
+ });
+ 
+ test("POST /api/login validates the next param and never reflects an open redirect", async () => {
+diff --git a/apps/swarmagents/app/api/login/route.ts b/apps/swarmagents/app/api/login/route.ts
+index 11880c2c9..d063887ac 100644
+--- a/apps/swarmagents/app/api/login/route.ts
++++ b/apps/swarmagents/app/api/login/route.ts
+@@ -12,6 +12,7 @@
+ 
+ import { NextResponse, type NextRequest } from "next/server";
+ import { safeNextPath, sessionCookieOptions, signSession, SESSION_COOKIE } from "../../../lib/auth";
++import { errorResponse } from "../../../lib/request-id";
+ import { verifyLocalUser } from "../../../lib/users";
+ import { recordAudit } from "../../../lib/audit";
+ 
+@@ -42,12 +43,12 @@ async function readBody(req: NextRequest): Promise<Record<string, unknown> | nul
+ 
+ export async function POST(req: NextRequest): Promise<Response> {
+   if (!process.env.SWARM_SESSION_SECRET) {
+-    return NextResponse.json({ error: "Server is not configured for sessions." }, { status: 500 });
++    return errorResponse(req, "Server is not configured for sessions.", 500);
+   }
+ 
+   const body = await readBody(req);
+   if (!body) {
+-    return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
++    return errorResponse(req, "Invalid request body.", 400);
+   }
+ 
+   const user = verifyLocalUser(body.email, body.password);
+@@ -56,7 +57,7 @@ export async function POST(req: NextRequest): Promise<Response> {
+     // never logged.
+     const attempted = typeof body.email === "string" && body.email ? body.email : "unknown";
+     recordAudit({ user: "anonymous", action: "login.failure", target: attempted, result: "failure" });
+-    return NextResponse.json({ error: "Invalid credentials." }, { status: 401 });
++    return errorResponse(req, "Invalid credentials.", 401);
+   }
+ 
+   recordAudit({ user: user.uid, action: "login.success", target: user.uid, result: "success" });
+diff --git a/apps/swarmagents/app/api/providers/route.ts b/apps/swarmagents/app/api/providers/route.ts
+index 26fe309f9..499ceb624 100644
+--- a/apps/swarmagents/app/api/providers/route.ts
++++ b/apps/swarmagents/app/api/providers/route.ts
+@@ -6,13 +6,17 @@ import { providerRow } from "@/lib/providers/rows";
+ import { routerProviders, savedProviderIds, saveProvider } from "@/lib/providers/store";
+ import { providerOwner } from "@/lib/providers/owner";
+ import { recordAudit } from "@/lib/audit";
++import { errorBody, errorResponse, requestIdFromHeaders } from "@/lib/request-id";
+ 
+ export const dynamic = "force-dynamic";
+ 
+ const NO_STORE = { "cache-control": "no-store" } as const;
+ 
+-function unauthorized() {
+-  return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++function unauthorized(request: Request) {
++  return NextResponse.json(
++    errorBody(requestIdFromHeaders(request.headers), "Sign in required."),
++    { status: 401, headers: NO_STORE },
++  );
+ }
+ 
+ /**
+@@ -25,7 +29,7 @@ function unauthorized() {
+  */
+ export function GET(request: Request) {
+   const owner = providerOwner(request);
+-  if (!owner) return unauthorized();
++  if (!owner) return unauthorized(request);
+   const configured = routerProviders(owner);
+   const saved = new Set(savedProviderIds(owner));
+   const configuredById = new Map(configured.map((p) => [p.id, p]));
+@@ -96,24 +100,24 @@ function isValidKey(key: string): boolean {
+ /** Save a provider keyed by id into the caller's account. Returns only a masked summary. */
+ export async function POST(request: Request) {
+   const owner = providerOwner(request);
+-  if (!owner) return unauthorized();
++  if (!owner) return unauthorized(request);
+   let body: unknown;
+   try {
+     body = await request.json();
+   } catch {
+-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
++    return errorResponse(request, "Invalid JSON body.", 400);
+   }
+   if (!body || typeof body !== "object") {
+-    return NextResponse.json({ error: "Body must be an object." }, { status: 400 });
++    return errorResponse(request, "Body must be an object.", 400);
+   }
+   const input = body as Record<string, unknown>;
+ 
+   if (typeof input.id !== "string") {
+-    return NextResponse.json({ error: "id is required." }, { status: 400 });
++    return errorResponse(request, "id is required.", 400);
+   }
+   const id = input.id.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+   if (!id || id.length > 64) {
+-    return NextResponse.json({ error: "id must be a slug (a-z, 0-9, dashes)." }, { status: 400 });
++    return errorResponse(request, "id must be a slug (a-z, 0-9, dashes).", 400);
+   }
+ 
+   const entry = catalogEntry(id);
+@@ -128,33 +132,32 @@ export async function POST(request: Request) {
+       ? apiStyleRaw
+       : undefined;
+   if (input.apiStyle !== undefined && apiStyle === undefined) {
+-    return NextResponse.json(
+-      { error: "apiStyle must be one of openai-compatible, anthropic, gemini, custom." },
+-      { status: 400 }
++    return errorResponse(
++      request,
++      "apiStyle must be one of openai-compatible, anthropic, gemini, custom.",
++      400,
+     );
+   }
+   const baseUrl = input.baseUrl === undefined ? undefined : String(input.baseUrl).trim();
+   if (baseUrl !== undefined && baseUrl !== "" && !isValidBaseUrl(baseUrl)) {
+-    return NextResponse.json(
+-      { error: "baseUrl must be an https URL (http is allowed only for local/private hosts)." },
+-      { status: 400 }
++    return errorResponse(
++      request,
++      "baseUrl must be an https URL (http is allowed only for local/private hosts).",
++      400,
+     );
+   }
+ 
+   const models = input.models === undefined ? undefined : input.models;
+   if (models !== undefined && !isValidModelList(models)) {
+-    return NextResponse.json(
+-      { error: "models must be an array of 1-8 non-empty model id strings." },
+-      { status: 400 }
+-    );
++    return errorResponse(request, "models must be an array of 1-8 non-empty model id strings.", 400);
+   }
+ 
+   const apiKey = input.apiKey === undefined ? undefined : String(input.apiKey);
+   if (!isLocal && apiKey !== undefined && !isValidKey(apiKey)) {
+-    return NextResponse.json({ error: "API key must be 1-512 printable characters." }, { status: 400 });
++    return errorResponse(request, "API key must be 1-512 printable characters.", 400);
+   }
+   if (!isLocal && (apiKey === undefined || apiKey === "")) {
+-    return NextResponse.json({ error: "An API key is required for this provider." }, { status: 400 });
++    return errorResponse(request, "An API key is required for this provider.", 400);
+   }
+ 
+   try {
+@@ -172,7 +175,7 @@ export async function POST(request: Request) {
+     const message = err instanceof Error ? err.message : String(err);
+     console.error(`[providers] failed to save provider "${id}": ${message}`);
+     recordAudit({ user: owner, action: "provider.add", target: id, result: "failure" });
+-    return NextResponse.json({ error: "Could not save provider configuration." }, { status: 500 });
++    return errorResponse(request, "Could not save provider configuration.", 500);
+   }
+ }
+ 
+@@ -186,20 +189,28 @@ export async function POST(request: Request) {
+  */
+ export async function PATCH(request: Request) {
+   const owner = providerOwner(request);
+-  if (!owner) return unauthorized();
++  if (!owner) return unauthorized(request);
+   let body: unknown;
+   try {
+     body = await request.json();
+   } catch {
+-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
++    return errorResponse(request, "Invalid JSON body.", 400);
+   }
+   if (!body || typeof body !== "object" || Array.isArray(body)) {
+-    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400 });
++    return errorResponse(request, "Body must be a JSON object.", 400);
+   }
+   const id = (body as Record<string, unknown>).id;
+   if (typeof id !== "string" || id.trim() === "") {
+-    return NextResponse.json({ error: "id is required." }, { status: 400 });
++    return errorResponse(request, "id is required.", 400);
+   }
+   const { status, body: payload } = runKeyMutation(owner, id, body);
++  // runKeyMutation lives in lib/providers and shapes its own failure bodies;
++  // attach the request id here so PATCH errors correlate too.
++  if (status >= 400) {
++    return NextResponse.json(
++      { ...payload, requestId: requestIdFromHeaders(request.headers) },
++      { status, headers: NO_STORE },
++    );
++  }
+   return NextResponse.json(payload, { status, headers: NO_STORE });
+ }
+diff --git a/apps/swarmagents/app/api/runtime/tasks/route.test.ts b/apps/swarmagents/app/api/runtime/tasks/route.test.ts
+index 0f4e68861..ee8af43f0 100644
+--- a/apps/swarmagents/app/api/runtime/tasks/route.test.ts
++++ b/apps/swarmagents/app/api/runtime/tasks/route.test.ts
+@@ -202,6 +202,23 @@ test("rejects unauthenticated requests", async () => {
+   assert.equal((await DELETE(request("/api/runtime/tasks?runId=run_x", {}, null))).status, 401);
+ });
+ 
++test("failing POST includes requestId in the JSON and echoes a provided x-request-id", async () => {
++  install(new ScriptedFakeVm());
++  const res = await POST(
++    request("/api/runtime/tasks", { method: "POST", headers: { "x-request-id": "req_tasks_123" }, body: "{}" }),
++  );
++  assert.equal(res.status, 400);
++  const body = await json(res);
++  assert.equal(body.error, "prompt is required.");
++  assert.equal(body.requestId, "req_tasks_123");
++
++  const minted = await postTask({});
++  assert.equal(minted.status, 400);
++  const mintedBody = await json(minted);
++  assert.equal(mintedBody.error, "prompt is required.");
++  assert.match(mintedBody.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
++});
++
+ test("rejects invalid bodies", async () => {
+   install(new ScriptedFakeVm());
+   assert.equal((await postTask("not json")).status, 400);
+diff --git a/apps/swarmagents/app/api/runtime/tasks/route.ts b/apps/swarmagents/app/api/runtime/tasks/route.ts
+index 1cf152813..91923af38 100644
+--- a/apps/swarmagents/app/api/runtime/tasks/route.ts
++++ b/apps/swarmagents/app/api/runtime/tasks/route.ts
+@@ -15,6 +15,7 @@
+ 
+ import { NextResponse, type NextRequest } from "next/server";
+ import { USER_HEADER } from "../../../../lib/auth";
++import { errorResponse } from "../../../../lib/request-id";
+ import { getRuntimeManager } from "../../../../lib/runtime/manager";
+ 
+ export const runtime = "nodejs";
+@@ -32,38 +33,38 @@ function isRecord(value: unknown): value is Record<string, unknown> {
+   return typeof value === "object" && value !== null && !Array.isArray(value);
+ }
+ 
+-function unauthorized() {
+-  return NextResponse.json({ error: "Sign in required." }, { status: 401 });
++function unauthorized(req: NextRequest) {
++  return errorResponse(req, "Sign in required.", 401);
+ }
+ 
+ export async function GET(req: NextRequest) {
+   const user = caller(req);
+-  if (!user) return unauthorized();
++  if (!user) return unauthorized(req);
+   return NextResponse.json({ runs: getRuntimeManager().list(user) });
+ }
+ 
+ export async function POST(req: NextRequest) {
+   const user = caller(req);
+-  if (!user) return unauthorized();
++  if (!user) return unauthorized(req);
+ 
+   let text: string;
+   try {
+     text = await req.text();
+   } catch {
+-    return NextResponse.json({ error: "Could not read request body." }, { status: 400 });
++    return errorResponse(req, "Could not read request body.", 400);
+   }
+   if (text.length > MAX_BODY_SIZE) {
+-    return NextResponse.json({ error: "Request body too large." }, { status: 413 });
++    return errorResponse(req, "Request body too large.", 413);
+   }
+ 
+   let body: unknown;
+   try {
+     body = JSON.parse(text);
+   } catch {
+-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
++    return errorResponse(req, "Invalid JSON body.", 400);
+   }
+   if (!isRecord(body)) {
+-    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400 });
++    return errorResponse(req, "Body must be a JSON object.", 400);
+   }
+ 
+   // Factory reset of the user's VM (the UI sends {action:"wipe_vm"}).
+@@ -79,19 +80,16 @@ export async function POST(req: NextRequest) {
+ 
+   const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
+   if (!prompt) {
+-    return NextResponse.json({ error: "prompt is required." }, { status: 400 });
++    return errorResponse(req, "prompt is required.", 400);
+   }
+   if (prompt.length > MAX_PROMPT_LEN) {
+-    return NextResponse.json({ error: "prompt too long." }, { status: 400 });
++    return errorResponse(req, "prompt too long.", 400);
+   }
+   const sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId.trim() : undefined;
+ 
+   const result = getRuntimeManager().start(user, { prompt, sessionId });
+   if (!result.accepted) {
+-    return NextResponse.json(
+-      { error: `Run queue is full (max ${result.limit ?? 3}). Wait for a run to finish.` },
+-      { status: 429 },
+-    );
++    return errorResponse(req, `Run queue is full (max ${result.limit ?? 3}). Wait for a run to finish.`, 429);
+   }
+   if (result.queued) {
+     return NextResponse.json(
+@@ -104,15 +102,12 @@ export async function POST(req: NextRequest) {
+ 
+ export async function DELETE(req: NextRequest) {
+   const user = caller(req);
+-  if (!user) return unauthorized();
++  if (!user) return unauthorized(req);
+ 
+   const runId = new URL(req.url).searchParams.get("runId") ?? undefined;
+   const result = getRuntimeManager().cancel(user, runId);
+   if (!result.ok) {
+-    return NextResponse.json(
+-      { error: runId ? "Run not found or not active." : "No active run to cancel." },
+-      { status: 404 },
+-    );
++    return errorResponse(req, runId ? "Run not found or not active." : "No active run to cancel.", 404);
+   }
+   return NextResponse.json({ ok: true, runId: result.runId });
+ }
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index c971b9f25..6b4f688e7 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -187,3 +187,31 @@ test("429 responses carry Retry-After and rate-limit headers (login bucket)", ()
+   assert.equal(res.headers.get("X-RateLimit-Remaining"), "0");
+   assert.ok(Number(res.headers.get("X-RateLimit-Reset")) >= 0);
+ });
++
++test("sets x-request-id on every response and reuses a provided safe token", () => {
++  const minted = middleware(req("http://swarm.example.com/api/providers/health", { host: "swarm.example.com" }));
++  assert.match(
++    minted.headers.get("x-request-id") ?? "",
++    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
++    "no inbound id -> mint a UUID",
++  );
++
++  const reused = middleware(
++    req("http://swarm.example.com/api/providers/health", { host: "swarm.example.com", "x-request-id": "req_test_123" }),
++  );
++  assert.equal(reused.headers.get("x-request-id"), "req_test_123", "a safe inbound id is reused");
++
++  // An unsafe inbound id is a valid header value but not a safe token, so it
++  // must be replaced, never echoed back.
++  const replaced = middleware(
++    req("http://swarm.example.com/api/providers/health", { host: "swarm.example.com", "x-request-id": "bad id" }),
++  );
++  assert.notEqual(replaced.headers.get("x-request-id"), "bad id");
++  assert.match(replaced.headers.get("x-request-id") ?? "", /^[0-9a-f-]{36}$/);
++});
++
++test("x-request-id is set on non-API responses too", () => {
++  const res = middleware(req("http://swarm.example.com/app", { host: "swarm.example.com", cookie: cookie() }));
++  assert.equal(res.status, 200);
++  assert.ok((res.headers.get("x-request-id") ?? "").length > 0);
++});
+diff --git a/apps/swarmagents/lib/request-id.test.ts b/apps/swarmagents/lib/request-id.test.ts
+new file mode 100644
+index 000000000..6f21a89cd
+--- /dev/null
++++ b/apps/swarmagents/lib/request-id.test.ts
+@@ -0,0 +1,97 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  REQUEST_ID_HEADER,
++  errorBody,
++  errorResponse,
++  formatAccessLog,
++  hashUserId,
++  isSafeRequestId,
++  newRequestId,
++  requestIdFromHeaders,
++  resolveRequestId,
++} from "./request-id";
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
++
++test("isSafeRequestId accepts plain tokens and rejects anything injectable", () => {
++  assert.equal(isSafeRequestId("abc-123_XYZ"), true);
++  assert.equal(isSafeRequestId("a"), true);
++  assert.equal(isSafeRequestId("x".repeat(128)), true);
++  assert.equal(isSafeRequestId(""), false);
++  assert.equal(isSafeRequestId("has space"), false);
++  assert.equal(isSafeRequestId("bad\nid"), false);
++  assert.equal(isSafeRequestId("bad\rid"), false);
++  assert.equal(isSafeRequestId("bad:id"), false);
++  assert.equal(isSafeRequestId("x".repeat(129)), false);
++  assert.equal(isSafeRequestId(null), false);
++  assert.equal(isSafeRequestId(undefined), false);
++});
++
++test("resolveRequestId reuses a provided safe token and mints a UUID otherwise", () => {
++  assert.equal(resolveRequestId("req_test_123"), "req_test_123");
++  const minted = resolveRequestId("has space");
++  assert.match(minted, UUID);
++  assert.match(resolveRequestId(null), UUID);
++  assert.match(resolveRequestId(undefined), UUID);
++  // Two minted ids differ.
++  assert.notEqual(newRequestId(), newRequestId());
++});
++
++test("requestIdFromHeaders reads the forwarded header and mints one when absent", () => {
++  const withHeader = new Headers({ [REQUEST_ID_HEADER]: "req_from_middleware" });
++  assert.equal(requestIdFromHeaders(withHeader), "req_from_middleware");
++  assert.match(requestIdFromHeaders(new Headers()), UUID);
++  // An unsafe forwarded value is replaced, never echoed. (CR/LF values
++  // cannot even reach this code: the Headers implementation rejects them.)
++  const unsafe = new Headers({ [REQUEST_ID_HEADER]: "bad id" });
++  const replaced = requestIdFromHeaders(unsafe);
++  assert.match(replaced, UUID);
++  assert.ok(!replaced.includes(" "));
++});
++
++test("errorResponse carries the request id and echoes a provided safe token", async () => {
++  const withId = new Request("http://localhost/api/x", { headers: { [REQUEST_ID_HEADER]: "req_echo_me" } });
++  const res = errorResponse(withId, "prompt is required.", 400);
++  assert.equal(res.status, 400);
++  assert.deepEqual(await res.json(), { error: "prompt is required.", requestId: "req_echo_me" });
++
++  const withoutId = new Request("http://localhost/api/x");
++  const minted = errorResponse(withoutId, "boom", 500);
++  assert.equal(minted.status, 500);
++  const body = (await minted.json()) as { error: string; requestId: string };
++  assert.equal(body.error, "boom");
++  assert.match(body.requestId, UUID);
++});
++
++test("errorBody shapes the JSON error payload", () => {
++  assert.deepEqual(errorBody("req_1", "nope"), { error: "nope", requestId: "req_1" });
++});
++
++test("hashUserId is a stable short hash and never returns the raw id", () => {
++  assert.equal(hashUserId(null), "anonymous");
++  assert.equal(hashUserId(undefined), "anonymous");
++  assert.equal(hashUserId(""), "anonymous");
++  const a = hashUserId("alice");
++  const b = hashUserId("alice");
++  assert.equal(a, b);
++  assert.match(a, /^[0-9a-f]{12}$/);
++  assert.ok(!a.includes("alice"));
++  assert.notEqual(hashUserId("alice"), hashUserId("bob"));
++});
++
++test("formatAccessLog is one line with method, path, status, duration, requestId and user hash", () => {
++  const line = formatAccessLog({
++    method: "POST",
++    path: "/api/runtime/tasks",
++    status: 400,
++    durationMs: 12,
++    requestId: "req_abc",
++    userHash: "deadbeefcafe",
++  });
++  assert.ok(!line.includes("\n"), "access log must stay on one line");
++  assert.equal(
++    line,
++    "[access] method=POST path=/api/runtime/tasks status=400 durationMs=12 requestId=req_abc userHash=deadbeefcafe",
++  );
++});
+diff --git a/apps/swarmagents/lib/request-id.ts b/apps/swarmagents/lib/request-id.ts
+new file mode 100644
+index 000000000..416ef9b34
+--- /dev/null
++++ b/apps/swarmagents/lib/request-id.ts
+@@ -0,0 +1,81 @@
++/**
++ * Request ids: correlate API errors with the access log.
++ *
++ * The middleware honors an inbound `x-request-id` when it is a safe token
++ * (bounded, no whitespace or control characters — it is echoed back in a
++ * response header and into JSON error bodies, so it must not carry CR/LF or
++ * other header-injection characters) and mints a UUID otherwise. Route
++ * handlers read the id the middleware forwarded and include it in JSON
++ * error bodies; the access log records the same id, so support can trace a
++ * failure from the JSON a user pastes to the server log line.
++ *
++ * Never log tokens or bodies here: the access log carries only method,
++ * path, status, duration, the request id, and a hash of the user id.
++ */
++
++import crypto from "node:crypto";
++import { NextResponse } from "next/server";
++
++/** The request-id header, read inbound and set on every response. */
++export const REQUEST_ID_HEADER = "x-request-id";
++
++/** Safe request-id tokens: 1-128 chars of [A-Za-z0-9_-]. Anything else is replaced with a minted id. */
++const SAFE_TOKEN = /^[A-Za-z0-9_-]{1,128}$/;
++
++/** True when the value may be echoed back as a request id. */
++export function isSafeRequestId(value: string | null | undefined): value is string {
++  return typeof value === "string" && SAFE_TOKEN.test(value);
++}
++
++/** Mint a fresh request id. */
++export function newRequestId(): string {
++  return crypto.randomUUID();
++}
++
++/** Honor an inbound request id when it is a safe token; otherwise mint one. */
++export function resolveRequestId(inbound: string | null | undefined): string {
++  return isSafeRequestId(inbound) ? inbound : newRequestId();
++}
++
++/** The request id for a handler: the middleware-forwarded header, or a minted one when called directly. */
++export function requestIdFromHeaders(headers: Headers): string {
++  return resolveRequestId(headers.get(REQUEST_ID_HEADER));
++}
++
++/** One-way hash of a user id for the access log (never log the raw id). */
++export function hashUserId(userId: string | null | undefined): string {
++  if (!userId) return "anonymous";
++  return crypto.createHash("sha256").update(userId).digest("hex").slice(0, 12);
++}
++
++/** JSON error body carrying the request id, so a client can quote it to support. */
++export function errorBody(requestId: string, error: string): { error: string; requestId: string } {
++  return { error, requestId };
++}
++
++/** JSON error response carrying the request id (tiny helper for route handlers). */
++export function errorResponse(request: Request, message: string, status: number): NextResponse {
++  return NextResponse.json(errorBody(requestIdFromHeaders(request.headers), message), { status });
++}
++
++export interface AccessLogEntry {
++  method: string;
++  path: string;
++  status: number;
++  durationMs: number;
++  requestId: string;
++  userHash: string;
++}
++
++/** One single-line access-log entry. Key=value, no tokens, no bodies, no query strings. */
++export function formatAccessLog(entry: AccessLogEntry): string {
++  return [
++    "[access]",
++    `method=${entry.method}`,
++    `path=${entry.path}`,
++    `status=${entry.status}`,
++    `durationMs=${entry.durationMs}`,
++    `requestId=${entry.requestId}`,
++    `userHash=${entry.userHash}`,
++  ].join(" ");
++}
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index b5268f03e..ee2d725e7 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -1,6 +1,7 @@
+ import crypto from "node:crypto";
+ import { NextResponse, type NextRequest } from "next/server";
+-import { hostAllowed, isHarnessBearer, requestUser, serverMode, USER_HEADER } from "./lib/auth";
++import { hostAllowed, isHarnessBearer, requestUser, serverMode, USER_HEADER, type AuthUser } from "./lib/auth";
++import { formatAccessLog, hashUserId, REQUEST_ID_HEADER, resolveRequestId } from "./lib/request-id";
+ import { rateLimitCheck, rateLimitKey, rateLimitResponse, type RateInfo } from "./lib/rate-limit";
+ import { cspValue, securityHeaders, NONCE_HEADER, type SecurityHeadersOptions } from "./lib/security-headers";
+ 
+@@ -85,6 +86,35 @@ function redirectOrigin(req: NextRequest): string {
+ }
+ 
+ export function middleware(req: NextRequest) {
++  const startedAt = Date.now();
++  // Honor an inbound x-request-id when it is a safe token; otherwise mint one.
++  const requestId = resolveRequestId(req.headers.get(REQUEST_ID_HEADER));
++  const user = requestUser(req);
++  const res = handleRequest(req, requestId, user);
++  // The request id rides on every response so a client can quote it back to support.
++  res.headers.set(REQUEST_ID_HEADER, requestId);
++  // One access-log line per /api/* request: method, path, status, duration,
++  // request id, and a hash of the user id — never tokens or bodies, and never
++  // the query string (it can carry tokens). The status is the middleware's
++  // own response status: for requests passed to a route handler this is 200
++  // (forwarded) — the handler's final status is not visible to middleware.
++  const { pathname } = req.nextUrl;
++  if (pathname.startsWith("/api/")) {
++    console.log(
++      formatAccessLog({
++        method: req.method,
++        path: pathname,
++        status: res.status,
++        durationMs: Date.now() - startedAt,
++        requestId,
++        userHash: hashUserId(user?.id ?? null),
++      }),
++    );
++  }
++  return res;
++}
++
++function handleRequest(req: NextRequest, requestId: string, user: AuthUser | null) {
+   const { pathname, search } = req.nextUrl;
+   const dev = process.env.NODE_ENV === "development";
+   // X-RateLimit-* headers for /api/* requests in server mode; null elsewhere.
+@@ -96,7 +126,6 @@ export function middleware(req: NextRequest) {
+   // One nonce per request, shared by the response CSP and the scripts Next
+   // renders (it picks the nonce up from the forwarded CSP request header).
+   const nonce = crypto.randomBytes(NONCE_BYTES).toString("base64");
+-  const user = requestUser(req);
+ 
+   // Rate limit /api/* in server mode (local mode is a single trusted user on loopback).
+   if (serverMode() && pathname.startsWith("/api/")) {
+@@ -112,6 +141,8 @@ export function middleware(req: NextRequest) {
+   const headers = new Headers(req.headers);
+   headers.delete(USER_HEADER);
+   if (user) headers.set(USER_HEADER, user.id);
++  // Forward the request id so route handlers can include it in JSON errors.
++  headers.set(REQUEST_ID_HEADER, requestId);
+   // Forward the policy (and nonce) so Next.js stamps the nonce onto its own
+   // inline bootstrap scripts; the response below carries the enforcement copy.
+   headers.set("Content-Security-Policy", cspValue(nonce, { dev }));
+-- 
+2.55.0
+

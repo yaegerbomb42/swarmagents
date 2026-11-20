@@ -1,0 +1,955 @@
+From d1abd3aff1f478f17af4a2915c42f470a26d2cba Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:44:00 -0600
+Subject: [PATCH] feat(vm): desktop mode in the docker driver (agent user +
+ display endpoint)
+
+---
+ apps/swarmagents/README.md                    |  24 +
+ apps/swarmagents/lib/vm/docker-driver.test.ts | 440 ++++++++++++++++++
+ apps/swarmagents/lib/vm/docker-driver.ts      | 221 ++++++++-
+ apps/swarmagents/lib/vm/fake-driver.ts        |   6 +
+ apps/swarmagents/lib/vm/index.ts              |  13 +
+ apps/swarmagents/lib/vm/types.ts              |  18 +
+ 6 files changed, 713 insertions(+), 9 deletions(-)
+ create mode 100644 apps/swarmagents/lib/vm/docker-driver.test.ts
+
+diff --git a/apps/swarmagents/README.md b/apps/swarmagents/README.md
+index fb493fbdd..8766496d6 100644
+--- a/apps/swarmagents/README.md
++++ b/apps/swarmagents/README.md
+@@ -212,6 +212,28 @@ user keeps their files. The policy lives in `lib/vm/idle.ts`
+ (`resolveIdlePolicy`) and the timer in `lib/vm/idle-sweeper.ts` (wired by the
+ VM manager).
+ 
++### Desktop VMs (agent user + reachable display)
++
++The docker driver can run a *desktop* image (`vm-desktop`) instead of the
++headless stub container:
++
++- The container keeps the image's own entrypoint (no `tail -f /dev/null`
++  stub), runs as the non-root `agent` user (`--user 1000:1000`), gets
++  `DISPLAY=:1` and a bigger `/dev/shm` (`--shm-size 512m`) so Chromium can
++  run.
++- Instead of publishing host ports, the VM is attached to a user-defined
++  bridge network (`SWARM_VM_NETWORK`, default `swarm-vms`, created on demand),
++  so the app reaches it by container IP. `driver.display(userId)` returns
++  `{host, port}` — the container IP on that network plus the in-VM display
++  port (6080) — or `null` when there is no display (e.g. the fake driver).
++- Execs run as the same user with `HOME=/home/agent`.
++- Desktop mode is on when `SWARM_VM_DESKTOP=1`, off when `SWARM_VM_DESKTOP=0`,
++  and otherwise inferred from the image name (an image containing
++  `vm-desktop` is treated as a desktop image).
++- Containers created before desktop mode existed are detected (they lack the
++  `swarm.vm.desktop=1` label) and recreated on the next `ensure()` — the
++  `/workspace` volume is kept, so the user's files survive the upgrade.
++
+ ### Provider catalog and key storage
+ 
+ `lib/providers/catalog.ts` holds `PROVIDER_CATALOG`: one typed entry per
+@@ -307,6 +329,8 @@ Never commit real keys. All provider keys live in env only.
+ | `SWARM_VM_IDLE_MIN` | `30` | Minutes of inactivity before a persistent VM is stopped (0 = never stop). |
+ | `SWARM_VM_SWEEP_INTERVAL_SEC` | `60` | How often the idle sweeper checks for idle VMs. |
+ | `SWARM_VM_ENV_ALLOW` | unset | Comma-separated extra env var names forwarded into VMs. |
++| `SWARM_VM_DESKTOP` | inferred from the image name | `1` forces desktop mode (agent user + display endpoint), `0` disables it; unset infers it from an image containing `vm-desktop`. |
++| `SWARM_VM_NETWORK` | `swarm-vms` | User-defined bridge network desktop VMs attach to (created on demand); the VM is reached by container IP, not published host ports. |
+ | `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI binary inside the VM. |
+ | `SWARM_APPROVAL_TIMEOUT_SEC` | `300` | Seconds before an unanswered ask-level approval auto-denies and halts the run. |
+ | `ANTHROPIC_API_KEY` | unset | Provider key forwarded to the VM for Claude Code. |
+diff --git a/apps/swarmagents/lib/vm/docker-driver.test.ts b/apps/swarmagents/lib/vm/docker-driver.test.ts
+new file mode 100644
+index 000000000..7331fc0d6
+--- /dev/null
++++ b/apps/swarmagents/lib/vm/docker-driver.test.ts
+@@ -0,0 +1,440 @@
++/**
++ * Docker driver tests — desktop mode (l2).
++ *
++ * Desktop mode runs the `vm-desktop` image as the non-root `agent` user with
++ * a reachable display endpoint: no `tail -f /dev/null` stub, DISPLAY=:1,
++ * a bigger /dev/shm for Chromium, the shared bridge network instead of
++ * published host ports, and a label so legacy containers can be detected and
++ * recreated (without touching the /workspace volume).
++ */
++import test from "node:test";
++import assert from "node:assert/strict";
++import { EventEmitter } from "node:events";
++import type { ChildProcess, SpawnOptions } from "node:child_process";
++import {
++  DockerVmDriver,
++  buildExecArgs,
++  buildRunArgs,
++  resolveDesktopMode,
++  resolveVmNetwork,
++  DEFAULT_VM_NETWORK,
++  VM_DESKTOP_LABEL,
++  VM_DESKTOP_USER,
++  VM_DISPLAY_PORT,
++} from "./docker-driver.js";
++import { FakeVmDriver } from "./fake-driver.js";
++import type { VmHandle } from "./types.js";
++
++// ---------------------------------------------------------------------------
++// Fake spawn — captures argv/env and drives child-process events.
++// ---------------------------------------------------------------------------
++
++interface FakeSpawnCall {
++  cmd: string;
++  args: readonly string[];
++  opts: SpawnOptions;
++  cp: {
++    emitClose: (code: number | null) => void;
++    emitError: (err: Error) => void;
++    kill: (sig?: string) => boolean;
++    killed: boolean;
++    stdout: EventEmitter;
++    stderr: EventEmitter;
++  };
++}
++
++function makeFakeSpawn() {
++  const calls: FakeSpawnCall[] = [];
++  const spawnFn = (cmd: string, args: readonly string[], opts?: SpawnOptions): ChildProcess => {
++    const stdout = new EventEmitter();
++    const stderr = new EventEmitter();
++    const emitter = new EventEmitter();
++    const call: FakeSpawnCall = {
++      cmd,
++      args,
++      opts: opts ?? {},
++      cp: {
++        emitClose: (code) => emitter.emit("close", code),
++        emitError: (err) => emitter.emit("error", err),
++        kill: (sig) => {
++          call.cp.killed = true;
++          emitter.emit("close", 143);
++          return true;
++        },
++        killed: false,
++        stdout,
++        stderr,
++      },
++    };
++    calls.push(call);
++    const cp: Record<string, unknown> = {
++      stdout,
++      stderr,
++      on: (ev: string, fn: (...a: unknown[]) => void) => {
++        emitter.on(ev, fn);
++        return cp;
++      },
++      kill: call.cp.kill,
++    };
++    return cp as unknown as ChildProcess;
++  };
++  return { spawnFn, calls };
++}
++
++const flush = () => new Promise((r) => setImmediate(r));
++
++const handle = (userId = "alice"): VmHandle => ({
++  userId,
++  containerName: `swarm-vm-${userId}`,
++  createdAt: Date.now(),
++});
++
++const LEGACY_BASE = {
++  containerName: "swarm-vm-a",
++  volume: "swarm-vm-a-workspace",
++  image: "node:22-bookworm-slim",
++  memory: "2g",
++  cpus: "2",
++  pidsLimit: "512",
++};
++
++// ---------------------------------------------------------------------------
++// Mode / network resolution
++// ---------------------------------------------------------------------------
++
++test("resolveDesktopMode: the explicit override wins over env and image", () => {
++  assert.equal(resolveDesktopMode({ SWARM_VM_DESKTOP: "1" }, "node:22-bookworm-slim", false), false);
++  assert.equal(resolveDesktopMode({ SWARM_VM_DESKTOP: "0" }, "swarm-vm-desktop:latest", true), true);
++  assert.equal(resolveDesktopMode({}, "node:22-bookworm-slim", true), true);
++});
++
++test("resolveDesktopMode: SWARM_VM_DESKTOP forces desktop mode on and off", () => {
++  assert.equal(resolveDesktopMode({ SWARM_VM_DESKTOP: "1" }, "node:22-bookworm-slim"), true);
++  assert.equal(resolveDesktopMode({ SWARM_VM_DESKTOP: "true" }, "node:22-bookworm-slim"), true);
++  assert.equal(resolveDesktopMode({ SWARM_VM_DESKTOP: "yes" }, "node:22-bookworm-slim"), true);
++  assert.equal(resolveDesktopMode({ SWARM_VM_DESKTOP: "0" }, "swarm-vm-desktop:latest"), false);
++  assert.equal(resolveDesktopMode({ SWARM_VM_DESKTOP: "false" }, "swarm-vm-desktop:latest"), false);
++});
++
++test("resolveDesktopMode: unset falls back to the image name", () => {
++  assert.equal(resolveDesktopMode({}, "swarmagents-vm-desktop:latest"), true);
++  assert.equal(resolveDesktopMode({}, "node:22-bookworm-slim"), false);
++  // A blank value is "unset", so the image name still decides.
++  assert.equal(resolveDesktopMode({ SWARM_VM_DESKTOP: "   " }, "swarmagents-vm-desktop:latest"), true);
++});
++
++test("resolveVmNetwork: default, env and explicit override", () => {
++  assert.equal(resolveVmNetwork({}), DEFAULT_VM_NETWORK);
++  assert.equal(resolveVmNetwork({}), "swarm-vms");
++  assert.equal(resolveVmNetwork({ SWARM_VM_NETWORK: "vms" }), "vms");
++  assert.equal(resolveVmNetwork({ SWARM_VM_NETWORK: "  " }), DEFAULT_VM_NETWORK);
++  assert.equal(resolveVmNetwork({ SWARM_VM_NETWORK: "vms" }, "other"), "other");
++});
++
++// ---------------------------------------------------------------------------
++// argv
++// ---------------------------------------------------------------------------
++
++test("buildRunArgs keeps the legacy stub and adds no display args in legacy mode", () => {
++  const argv = buildRunArgs({ ...LEGACY_BASE });
++
++  assert.deepEqual(argv.slice(-4), ["node:22-bookworm-slim", "tail", "-f", "/dev/null"]);
++  assert.equal(argv.includes("--user"), false);
++  assert.equal(argv.includes("--shm-size"), false);
++  assert.equal(argv.includes("--network"), false);
++  assert.equal(argv.some((a) => a.startsWith("DISPLAY=")), false);
++  assert.equal(argv.some((a) => a.startsWith(`${VM_DESKTOP_LABEL}=`)), false);
++  // The hardened profile is unchanged.
++  assert.ok(argv.includes("--security-opt"));
++  assert.ok(argv.includes("--cap-drop"));
++  assert.ok(argv.includes("--init"));
++});
++
++test("buildRunArgs in desktop mode runs as agent with a display and the shared network", () => {
++  const argv = buildRunArgs({ ...LEGACY_BASE, image: "swarmagents-vm-desktop:latest", desktop: true });
++
++  assert.equal(argv[argv.indexOf("--user") + 1], VM_DESKTOP_USER);
++  assert.equal(argv[argv.indexOf("--user") + 1], "1000:1000");
++  assert.equal(argv[argv.indexOf("--shm-size") + 1], "512m");
++  assert.equal(argv[argv.indexOf("-e") + 1], "DISPLAY=:1");
++  assert.equal(argv[argv.indexOf("--network") + 1], "swarm-vms");
++  assert.equal(argv[argv.indexOf("--label") + 1], `${VM_DESKTOP_LABEL}=1`);
++
++  // The image's own CMD runs: no `tail -f /dev/null` stub, image is last.
++  assert.equal(argv.includes("tail"), false);
++  assert.equal(argv.includes("/dev/null"), false);
++  assert.equal(argv[argv.length - 1], "swarmagents-vm-desktop:latest");
++
++  // No host ports are published: the VM is reached over the bridge network.
++  assert.equal(argv.some((a) => a.startsWith("-p") || a.startsWith("--publish")), false);
++
++  // The hardened profile and the workspace volume are untouched.
++  assert.ok(argv.includes("--security-opt"));
++  assert.ok(argv.includes("--cap-drop"));
++  assert.equal(argv[argv.indexOf("--memory") + 1], "2g");
++  assert.equal(argv[argv.indexOf("--cpus") + 1], "2");
++  assert.equal(argv[argv.indexOf("--pids-limit") + 1], "512");
++  assert.equal(argv[argv.indexOf("-v") + 1], "swarm-vm-a-workspace:/workspace");
++});
++
++test("buildRunArgs in desktop mode uses the configured network and keeps the limits", () => {
++  const argv = buildRunArgs({
++    ...LEGACY_BASE,
++    desktop: true,
++    network: "other-vms",
++    memory: "4g",
++    pidsLimit: "1024",
++  });
++  assert.equal(argv[argv.indexOf("--network") + 1], "other-vms");
++  assert.equal(argv[argv.indexOf("--memory") + 1], "4g");
++  assert.equal(argv[argv.indexOf("--pids-limit") + 1], "1024");
++});
++
++test("buildExecArgs only passes --user when one is requested", () => {
++  assert.deepEqual(buildExecArgs("c", ["ls"], {}), ["exec", "--", "c", "ls"]);
++  assert.deepEqual(
++    buildExecArgs("c", ["ls"], { user: VM_DESKTOP_USER }),
++    ["exec", "--user", "1000:1000", "--", "c", "ls"],
++  );
++  assert.deepEqual(
++    buildExecArgs("c", ["ls"], { env: { HOME: "/home/agent" }, user: VM_DESKTOP_USER }),
++    ["exec", "--user", "1000:1000", "-e", "HOME", "--", "c", "ls"],
++  );
++});
++
++// ---------------------------------------------------------------------------
++// ensure() — desktop containers
++// ---------------------------------------------------------------------------
++
++test("DockerVmDriver.ensure in desktop mode creates the network and runs the desktop container", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn, image: "swarmagents-vm-desktop:latest", desktop: true });
++
++  const p = driver.ensure("alice");
++  calls[0].cp.emitClose(0); // volume ls -> missing
++  await flush();
++  calls[1].cp.emitClose(0); // volume create
++  await flush();
++  calls[2].cp.emitClose(1); // network inspect -> missing
++  await flush();
++  calls[3].cp.emitClose(0); // network create
++  await flush();
++  calls[4].cp.emitClose(1); // container inspect -> missing
++  await flush();
++  calls[5].cp.emitClose(0); // image inspect -> found
++  await flush();
++
++  const netCreate = calls.find((c) => c.args[0] === "network" && c.args[1] === "create");
++  assert.ok(netCreate, "expected the shared network to be created");
++  assert.deepEqual(netCreate!.args, ["network", "create", "swarm-vms"]);
++
++  const runCall = calls.find((c) => c.args[0] === "run");
++  assert.ok(runCall, "expected a docker run call");
++  const argv = runCall!.args;
++  assert.equal(argv[argv.indexOf("--user") + 1], "1000:1000");
++  assert.equal(argv[argv.indexOf("-e") + 1], "DISPLAY=:1");
++  assert.equal(argv[argv.indexOf("--network") + 1], "swarm-vms");
++  assert.equal(argv.includes("tail"), false);
++
++  runCall!.cp.emitClose(0);
++  const h = await p;
++  assert.equal(h.containerName, "swarm-vm-alice");
++});
++
++test("DockerVmDriver.ensure recreates a legacy container for desktop mode without deleting the workspace volume", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn, image: "swarmagents-vm-desktop:latest", desktop: true });
++
++  const p = driver.ensure("alice");
++  calls[0].cp.stdout.emit("data", Buffer.from("swarm-vm-alice-workspace\n"));
++  calls[0].cp.emitClose(0); // volume ls -> volume exists
++  await flush();
++  calls[1].cp.emitClose(0); // network inspect -> exists
++  await flush();
++  calls[2].cp.stdout.emit("data", Buffer.from("running\n"));
++  calls[2].cp.emitClose(0); // container inspect -> exists
++  await flush();
++  calls[3].cp.stdout.emit("data", Buffer.from("{}\n"));
++  calls[3].cp.emitClose(0); // labels -> no desktop label
++  await flush();
++
++  const rm = calls.find((c) => c.args[0] === "rm");
++  assert.ok(rm, "expected the legacy container to be removed");
++  assert.deepEqual(rm!.args, ["rm", "-f", "swarm-vm-alice"]);
++  rm!.cp.emitClose(0);
++  await flush();
++
++  // The workspace volume must survive the recreation.
++  assert.ok(
++    !calls.some((c) => c.args[0] === "volume" && c.args[1] === "rm"),
++    "the /workspace volume must not be deleted",
++  );
++
++  calls[5].cp.emitClose(0); // image inspect -> found
++  await flush();
++  const runCall = calls.find((c) => c.args[0] === "run");
++  assert.ok(runCall, "expected a fresh desktop container");
++  assert.equal(runCall!.args[runCall!.args.indexOf("--label") + 1], `${VM_DESKTOP_LABEL}=1`);
++  runCall!.cp.emitClose(0);
++
++  const h = await p;
++  assert.equal(h.containerName, "swarm-vm-alice");
++});
++
++test("DockerVmDriver.ensure keeps a desktop container that already carries the label", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn, image: "swarmagents-vm-desktop:latest", desktop: true });
++
++  const p = driver.ensure("alice");
++  calls[0].cp.stdout.emit("data", Buffer.from("swarm-vm-alice-workspace\n"));
++  calls[0].cp.emitClose(0); // volume ls -> volume exists
++  await flush();
++  calls[1].cp.emitClose(0); // network inspect -> exists
++  await flush();
++  calls[2].cp.stdout.emit("data", Buffer.from("running\n"));
++  calls[2].cp.emitClose(0); // container inspect -> running
++  await flush();
++  calls[3].cp.stdout.emit("data", Buffer.from(JSON.stringify({ [VM_DESKTOP_LABEL]: "1" })));
++  calls[3].cp.emitClose(0); // labels -> desktop container
++  await flush();
++
++  const update = calls.find((c) => c.args[0] === "update");
++  assert.ok(update, "expected the limits to be re-applied");
++  update!.cp.emitClose(0);
++
++  assert.ok(!calls.some((c) => c.args[0] === "rm"), "must not recreate a desktop container");
++  assert.ok(!calls.some((c) => c.args[0] === "run"), "must not recreate a desktop container");
++
++  const h = await p;
++  assert.equal(h.containerName, "swarm-vm-alice");
++});
++
++// ---------------------------------------------------------------------------
++// display()
++// ---------------------------------------------------------------------------
++
++const NETWORK_JSON = JSON.stringify({
++  "swarm-vms": {
++    IPAddress: "172.18.0.5",
++    Gateway: "172.18.0.1",
++  },
++  bridge: { IPAddress: "172.17.0.2" },
++});
++
++test("DockerVmDriver.display parses the container IP on the shared network", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn, image: "swarmagents-vm-desktop:latest", desktop: true });
++
++  const p = driver.display("alice");
++  assert.deepEqual(calls[0].args, [
++    "container", "inspect", "-f", "{{json .NetworkSettings.Networks}}", "swarm-vm-alice",
++  ]);
++  calls[0].cp.stdout.emit("data", Buffer.from(NETWORK_JSON));
++  calls[0].cp.emitClose(0);
++
++  const endpoint = await p;
++  assert.deepEqual(endpoint, { host: "172.18.0.5", port: VM_DISPLAY_PORT });
++  assert.equal(endpoint!.port, 6080);
++});
++
++test("DockerVmDriver.display accepts a handle as well as a user id", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn, image: "swarmagents-vm-desktop:latest", desktop: true });
++
++  const p = driver.display(handle("alice"));
++  calls[0].cp.stdout.emit("data", Buffer.from(NETWORK_JSON));
++  calls[0].cp.emitClose(0);
++  assert.deepEqual(await p, { host: "172.18.0.5", port: VM_DISPLAY_PORT });
++});
++
++test("DockerVmDriver.display returns null without a desktop, an IP or a usable inspect", async () => {
++  // Legacy driver: no display at all, and no docker call is made.
++  const legacy = makeFakeSpawn();
++  const legacyDriver = new DockerVmDriver({
++    spawnFn: legacy.spawnFn,
++    image: "node:22-bookworm-slim",
++    desktop: false,
++  });
++  assert.equal(await legacyDriver.display("alice"), null);
++  assert.equal(legacy.calls.length, 0);
++
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn, image: "swarmagents-vm-desktop:latest", desktop: true });
++
++  // No IP on the shared network yet.
++  const noIp = driver.display("alice");
++  calls[0].cp.stdout.emit("data", Buffer.from(JSON.stringify({ "swarm-vms": { IPAddress: "" } })));
++  calls[0].cp.emitClose(0);
++  assert.equal(await noIp, null);
++
++  // The VM is attached to a different network.
++  const otherNet = driver.display("alice");
++  calls[1].cp.stdout.emit("data", Buffer.from(JSON.stringify({ bridge: { IPAddress: "172.17.0.2" } })));
++  calls[1].cp.emitClose(0);
++  assert.equal(await otherNet, null);
++
++  // inspect failed.
++  const failed = driver.display("alice");
++  calls[2].cp.emitClose(1);
++  assert.equal(await failed, null);
++
++  // Unparseable output.
++  const garbage = driver.display("alice");
++  calls[3].cp.stdout.emit("data", Buffer.from("not json"));
++  calls[3].cp.emitClose(0);
++  assert.equal(await garbage, null);
++});
++
++test("DockerVmDriver.display honours the configured network and port", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({
++    spawnFn,
++    image: "swarmagents-vm-desktop:latest",
++    desktop: true,
++    network: "other-vms",
++    displayPort: 6081,
++  });
++
++  const p = driver.display("alice");
++  calls[0].cp.stdout.emit(
++    "data",
++    Buffer.from(JSON.stringify({ "other-vms": { IPAddress: "10.0.0.7" }, "swarm-vms": { IPAddress: "172.18.0.5" } })),
++  );
++  calls[0].cp.emitClose(0);
++
++  assert.deepEqual(await p, { host: "10.0.0.7", port: 6081 });
++});
++
++// ---------------------------------------------------------------------------
++// exec() — desktop user + HOME
++// ---------------------------------------------------------------------------
++
++test("DockerVmDriver.exec in desktop mode runs as agent with HOME=/home/agent", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn, image: "swarmagents-vm-desktop:latest", desktop: true });
++
++  const p = driver.exec(handle(), ["ls", "-la"]);
++  const call = calls[0];
++  assert.equal(call.args[0], "exec");
++  assert.equal(call.args[call.args.indexOf("--user") + 1], "1000:1000");
++  assert.equal(call.args[call.args.indexOf("-e") + 1], "HOME");
++  assert.equal(call.opts.env!.HOME, "/home/agent");
++  call.cp.emitClose(0);
++  assert.equal((await p).exitCode, 0);
++});
++
++test("DockerVmDriver.exec in legacy mode keeps the container user and argv", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn, image: "node:22-bookworm-slim", desktop: false });
++
++  const p = driver.exec(handle(), ["ls"]);
++  assert.deepEqual(calls[0].args, ["exec", "--", "swarm-vm-alice", "ls"]);
++  calls[0].cp.emitClose(0);
++  assert.equal((await p).exitCode, 0);
++});
++
++test("FakeVmDriver.display returns null (no display outside the docker driver)", async () => {
++  const driver = new FakeVmDriver();
++  const h = await driver.ensure("alice");
++  assert.equal(await driver.display(h), null);
++});
+diff --git a/apps/swarmagents/lib/vm/docker-driver.ts b/apps/swarmagents/lib/vm/docker-driver.ts
+index 6eb6f379f..767fd8a9d 100644
+--- a/apps/swarmagents/lib/vm/docker-driver.ts
++++ b/apps/swarmagents/lib/vm/docker-driver.ts
+@@ -13,6 +13,7 @@ import type {
+   VmFileBytes,
+   VmFileStat,
+   VmSnapshot,
++  VmDisplayEndpoint,
+ } from "./types";
+ import { VmFileError } from "./files";
+ import {
+@@ -119,6 +120,72 @@ export const VM_CAPABILITIES = [
+ /** Pull timeout for SWARM_VM_PULL=1, ms. Default 2 min. */
+ export const SWARM_VM_PULL_TIMEOUT_MS = Number(process.env.SWARM_VM_PULL_TIMEOUT_MS ?? "120000");
+ 
++// ---------------------------------------------------------------------------
++// Desktop mode (vm-desktop image): run as the non-root `agent` user with a
++// reachable display endpoint instead of the legacy `tail -f /dev/null` stub.
++// ---------------------------------------------------------------------------
++
++/** Env var forcing desktop mode on/off (unset: infer from the image name). */
++export const SWARM_VM_DESKTOP_ENV = "SWARM_VM_DESKTOP";
++
++/** Env var selecting the user-defined bridge network desktop VMs attach to. */
++export const SWARM_VM_NETWORK_ENV = "SWARM_VM_NETWORK";
++
++/** Default bridge network for desktop VMs (created on demand by ensure()). */
++export const DEFAULT_VM_NETWORK = "swarm-vms";
++
++/** Container label marking a container created with desktop-mode argv. */
++export const VM_DESKTOP_LABEL = "swarm.vm.desktop";
++
++/** Label value written for desktop containers. */
++export const VM_DESKTOP_LABEL_VALUE = "1";
++
++/** Non-root user the desktop image provides (uid 1000, home /home/agent). */
++export const VM_DESKTOP_USER = "1000:1000";
++
++/** Home directory for execs in desktop mode. */
++export const VM_DESKTOP_HOME = "/home/agent";
++
++/** Shared-memory size for desktop mode (Chromium needs more than the 64m default). */
++export const VM_DESKTOP_SHM = "512m";
++
++/** DISPLAY value inside desktop containers. */
++export const VM_DESKTOP_DISPLAY = ":1";
++
++/** in-VM noVNC/websockify port returned by display(). */
++export const VM_DISPLAY_PORT = 6080;
++
++/**
++ * Resolve desktop mode: an explicit override wins; otherwise SWARM_VM_DESKTOP
++ * (1/true/yes) forces it on or off; otherwise it is inferred from the image
++ * name (an image containing "vm-desktop" is a desktop image).
++ */
++export function resolveDesktopMode(
++  env: Record<string, string | undefined> = process.env,
++  image: string = SWARM_VM_IMAGE,
++  override?: boolean,
++): boolean {
++  if (override !== undefined) return override;
++  const raw = env[SWARM_VM_DESKTOP_ENV];
++  if (raw !== undefined && raw !== null && String(raw).trim() !== "") {
++    const v = String(raw).trim().toLowerCase();
++    return v === "1" || v === "true" || v === "yes";
++  }
++  return image.includes("vm-desktop");
++}
++
++/**
++ * Resolve the bridge network for desktop VMs: an explicit override wins, then
++ * SWARM_VM_NETWORK, then the default (`swarm-vms`). Blank values fall back.
++ */
++export function resolveVmNetwork(
++  env: Record<string, string | undefined> = process.env,
++  override?: string,
++): string {
++  const raw = (override ?? env[SWARM_VM_NETWORK_ENV] ?? "").trim();
++  return raw || DEFAULT_VM_NETWORK;
++}
++
+ /** Typed error thrown when the Docker VM cannot be made available. */
+ export class VmUnavailableError extends Error {
+   readonly cause?: Error;
+@@ -168,6 +235,8 @@ export function validateEnvName(name: string): void {
+ /**
+  * Build the argv for `docker exec`.
+  *
++ * - `--user <user>` runs the exec as a given user (desktop mode drops to the
++ *   non-root agent user; legacy containers omit the flag).
+  * - `-w <cwd>` replaces any `cd ... &&` prefixing.
+  * - `-e NAME` forwards only the name; docker copies the value from the client
+  *   env we pass to spawn, so values never appear in argv.
+@@ -179,9 +248,10 @@ export function validateEnvName(name: string): void {
+ export function buildExecArgs(
+   containerName: string,
+   cmd: string[],
+-  opts?: Pick<ExecOptions, "cwd" | "env" | "stdin">,
++  opts?: Pick<ExecOptions, "cwd" | "env" | "stdin"> & { user?: string },
+ ): string[] {
+   const args = ["exec"];
++  if (opts?.user) args.push("--user", opts.user);
+   if (opts?.stdin !== undefined) args.push("-i");
+   if (opts?.cwd) args.push("-w", opts.cwd);
+   if (opts?.env) {
+@@ -203,6 +273,12 @@ export function buildExecArgs(
+  *
+  * The limits are validated first: a malformed value must never reach the
+  * docker CLI (where it would either be ignored or fail the whole run).
++ *
++ * Desktop mode (`desktop: true`) keeps the image's own CMD/entrypoint (no
++ * `tail -f /dev/null` stub), runs as the non-root agent user, gives Chromium
++ * enough shared memory, sets DISPLAY, tags the container with the desktop
++ * label (used to detect legacy containers on upgrade), and attaches it to the
++ * shared bridge network instead of publishing host ports.
+  */
+ export function buildRunArgs(opts: {
+   containerName: string;
+@@ -213,6 +289,10 @@ export function buildRunArgs(opts: {
+   pidsLimit: string;
+   /** OCI runtime; validated against the allowlist (unset/blank -> no flag). */
+   runtime?: string;
++  /** Desktop mode: keep the image CMD, run as agent, attach to the network. */
++  desktop?: boolean;
++  /** Bridge network for desktop mode (default `swarm-vms`). */
++  network?: string;
+ }): string[] {
+   const memory = validateMemoryLimit(opts.memory, "memory");
+   const cpus = validateCpuLimit(opts.cpus, "cpus");
+@@ -230,6 +310,14 @@ export function buildRunArgs(opts: {
+     "--pids-limit", pids,
+   ];
+   if (runtime) args.push("--runtime", runtime);
++  if (opts.desktop) {
++    args.push(
++      "--user", VM_DESKTOP_USER,
++      "--shm-size", VM_DESKTOP_SHM,
++      "-e", `DISPLAY=${VM_DESKTOP_DISPLAY}`,
++      "--label", `${VM_DESKTOP_LABEL}=${VM_DESKTOP_LABEL_VALUE}`,
++    );
++  }
+   args.push(
+     "--restart", "unless-stopped",
+     "--security-opt", "no-new-privileges",
+@@ -238,9 +326,16 @@ export function buildRunArgs(opts: {
+     "--init",
+     "-v", `${opts.volume}:/workspace`,
+     "-w", "/workspace",
+-    opts.image,
+-    "tail", "-f", "/dev/null",
+   );
++  if (opts.desktop) {
++    args.push("--network", opts.network ?? DEFAULT_VM_NETWORK);
++  }
++  args.push(opts.image);
++  if (!opts.desktop) {
++    // Legacy mode: keep the container alive with a no-op stub so execs have a
++    // long-lived target. Desktop images run their own desktop entrypoint.
++    args.push("tail", "-f", "/dev/null");
++  }
+   return args;
+ }
+ 
+@@ -324,6 +419,15 @@ export interface DockerVmDriverOptions {
+   pidsLimit?: string;
+   /** OCI runtime for the container (e.g. "runsc"); allowlist-validated. */
+   runtime?: string;
++  /**
++   * Desktop mode. Default: inferred from SWARM_VM_DESKTOP, then the image name
++   * (an image containing "vm-desktop" is treated as a desktop image).
++   */
++  desktop?: boolean;
++  /** Bridge network for desktop mode (default SWARM_VM_NETWORK or swarm-vms). */
++  network?: string;
++  /** in-VM display port returned by display() (default 6080). */
++  displayPort?: number;
+   /** How long to wait after the JS timeout deadline before killing the docker CLI. */
+   killGraceMs?: number;
+   /** Injectable spawn for tests (defaults to node:child_process spawn). */
+@@ -338,6 +442,12 @@ export class DockerVmDriver implements VmDriver {
+   readonly pidsLimit: string;
+   /** Effective OCI runtime; undefined means Docker's default (no flag). */
+   readonly runtime: string | undefined;
++  /** Desktop mode: agent user, display, shared bridge network. */
++  readonly desktop: boolean;
++  /** Bridge network desktop containers attach to. */
++  readonly network: string;
++  /** in-VM display port reported by display(). */
++  readonly displayPort: number;
+   private readonly killGraceMs: number;
+   private readonly spawnFn: DockerSpawnFn;
+ 
+@@ -354,6 +464,9 @@ export class DockerVmDriver implements VmDriver {
+     this.cpus = limits.cpus;
+     this.pidsLimit = limits.pids;
+     this.runtime = resolveVmRuntime(process.env, opts.runtime);
++    this.desktop = resolveDesktopMode(process.env, this.image, opts.desktop);
++    this.network = resolveVmNetwork(process.env, opts.network);
++    this.displayPort = opts.displayPort ?? VM_DISPLAY_PORT;
+     this.killGraceMs = opts.killGraceMs ?? 3000;
+     // Node's spawn is overloaded; pin it to our single signature.
+     this.spawnFn = opts.spawnFn ?? (spawn as unknown as DockerSpawnFn);
+@@ -428,6 +541,37 @@ export class DockerVmDriver implements VmDriver {
+     }
+   }
+ 
++  /**
++   * Create the shared bridge network desktop VMs attach to if it doesn't
++   * exist. A user-defined network (not the default bridge) is what lets the
++   * app container reach VM containers by their network IPs.
++   */
++  private async ensureNetwork(name: string): Promise<void> {
++    const inspect = await this.run(["network", "inspect", name]);
++    if (inspect.code !== 0) {
++      const create = await this.run(["network", "create", name]);
++      if (create.code !== 0) {
++        throw new Error(`Failed to create network ${name}: ${create.stderr}`);
++      }
++    }
++  }
++
++  /**
++   * Whether a container was created with desktop-mode argv, via the
++   * `swarm.vm.desktop=1` label. Containers from before desktop mode existed
++   * (or created with legacy argv) have no label and must be recreated.
++   */
++  private async hasDesktopLabel(containerName: string): Promise<boolean> {
++    const res = await this.run(["container", "inspect", "-f", "{{json .Config.Labels}}", containerName]);
++    if (res.code !== 0) return false;
++    try {
++      const labels = JSON.parse(res.stdout.trim()) as Record<string, unknown> | null;
++      return labels?.[VM_DESKTOP_LABEL] === VM_DESKTOP_LABEL_VALUE;
++    } catch {
++      return false;
++    }
++  }
++
+   /**
+    * (Re-)apply the resource limits to an existing container. Containers
+    * created before the limits were configured keep running unbounded, so
+@@ -458,12 +602,30 @@ export class DockerVmDriver implements VmDriver {
+     const vol = volumeNameFor(userId);
+ 
+     await this.ensureVolume(vol);
++    // Desktop VMs live on a shared bridge network so the app (and the display
++    // proxy) can reach them by container IP instead of published host ports.
++    if (this.desktop) await this.ensureNetwork(this.network);
+ 
+     // Check if container already exists.
+     const inspect = await this.run(["container", "inspect", "-f", "{{.State.Status}}", name]);
+     const stateStatus = inspect.stdout.trim();
++    let exists = inspect.code === 0;
++
++    // Upgrade path: a container created before desktop mode (or with legacy
++    // argv) lacks the desktop label. Recreate it so the agent user / display /
++    // network args apply — the named /workspace volume is left untouched.
++    if (exists && this.desktop && !(await this.hasDesktopLabel(name))) {
++      const rm = await this.run(["rm", "-f", name]);
++      if (rm.code !== 0) {
++        throw new VmUnavailableError(
++          `Failed to recreate container ${name} for desktop mode: ` +
++            `${rm.stderr.trim() || `exit code ${rm.code}`}`,
++        );
++      }
++      exists = false;
++    }
+ 
+-    if (inspect.code !== 0) {
++    if (!exists) {
+       // Container does not exist — ensure the image is available first.
+       const imageInspect = await this.run(["image", "inspect", "-f", "{{.Id}}", this.image]);
+       if (imageInspect.code !== 0) {
+@@ -528,6 +690,8 @@ export class DockerVmDriver implements VmDriver {
+         cpus: this.cpus,
+         pidsLimit: this.pidsLimit,
+         runtime: this.runtime,
++        desktop: this.desktop,
++        network: this.network,
+       }));
+       if (start.code !== 0) {
+         // A requested runtime the daemon does not know is a configuration
+@@ -562,6 +726,35 @@ export class DockerVmDriver implements VmDriver {
+     return { userId: sanitized, containerName: name, createdAt: Date.now() };
+   }
+ 
++  /**
++   * Reachable display endpoint for a desktop VM: the container's IP on the
++   * shared bridge network plus the in-VM display port (noVNC/websockify).
++   * Returns null when the driver is not in desktop mode, the container has no
++   * IP on that network yet, or the inspect output is unusable.
++   *
++   * Accepts either a handle (preferred) or a raw user id.
++   */
++  async display(handleOrUserId: VmHandle | string): Promise<VmDisplayEndpoint | null> {
++    if (!this.desktop) return null;
++    const name =
++      typeof handleOrUserId === "string"
++        ? containerNameFor(handleOrUserId)
++        : handleOrUserId.containerName;
++    const res = await this.run([
++      "container", "inspect", "-f", "{{json .NetworkSettings.Networks}}", name,
++    ]);
++    if (res.code !== 0) return null;
++    let networks: Record<string, { IPAddress?: string }> | null = null;
++    try {
++      networks = JSON.parse(res.stdout.trim()) as Record<string, { IPAddress?: string }> | null;
++    } catch {
++      return null;
++    }
++    const host = networks?.[this.network]?.IPAddress?.trim();
++    if (!host) return null;
++    return { host, port: this.displayPort };
++  }
++
+   async exec(handle: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
+     if (opts?.signal?.aborted) {
+       return { exitCode: 130 };
+@@ -570,10 +763,13 @@ export class DockerVmDriver implements VmDriver {
+     // Forward env values to the docker CLI process only; argv carries just the
+     // validated names, so secrets never show up in the process table.
+     const env: NodeJS.ProcessEnv = { ...process.env };
+-    if (opts?.env) {
+-      for (const [key, value] of Object.entries(opts.env)) {
+-        if (value !== undefined) env[key] = value;
+-      }
++    const execEnv: Record<string, string> = { ...(opts?.env ?? {}) };
++    // Desktop mode: execs drop to the non-root agent user and get its home.
++    if (this.desktop && execEnv.HOME === undefined) {
++      execEnv.HOME = VM_DESKTOP_HOME;
++    }
++    for (const [key, value] of Object.entries(execEnv)) {
++      if (value !== undefined) env[key] = value;
+     }
+ 
+     // When a deadline is set, run the command under GNU timeout *inside* the
+@@ -582,7 +778,12 @@ export class DockerVmDriver implements VmDriver {
+     // exit code without any translation on our side.
+     const timeoutMs = opts?.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : 0;
+     const innerCmd = timeoutMs ? buildTimeoutWrap(cmd, timeoutMs) : cmd;
+-    const argv = buildExecArgs(handle.containerName, innerCmd, opts);
++    const argv = buildExecArgs(handle.containerName, innerCmd, {
++      cwd: opts?.cwd,
++      env: execEnv,
++      stdin: opts?.stdin,
++      user: this.desktop ? VM_DESKTOP_USER : undefined,
++    });
+ 
+     return new Promise((resolve, reject) => {
+       let settled = false;
+@@ -848,6 +1049,8 @@ export class DockerVmDriver implements VmDriver {
+       cpus: this.cpus,
+       pidsLimit: this.pidsLimit,
+       runtime: this.runtime,
++      desktop: this.desktop,
++      network: this.network,
+     }));
+     if (start.code !== 0) {
+       throw new Error(`restore failed: ${start.stderr.trim() || `exit code ${start.code}`}`);
+diff --git a/apps/swarmagents/lib/vm/fake-driver.ts b/apps/swarmagents/lib/vm/fake-driver.ts
+index 8bca86955..776d55177 100644
+--- a/apps/swarmagents/lib/vm/fake-driver.ts
++++ b/apps/swarmagents/lib/vm/fake-driver.ts
+@@ -15,6 +15,7 @@ import type {
+   VmFileBytes,
+   VmFileStat,
+   VmSnapshot,
++  VmDisplayEndpoint,
+ } from "./types";
+ import { VmFileError, WORKSPACE_ROOT } from "./files";
+ import { validateSnapshotLabel } from "./docker-driver";
+@@ -338,6 +339,11 @@ export class FakeVmDriver implements VmDriver {
+     vm.running = snapshot.running;
+   }
+ 
++  /** The fake driver has no display; desktop streaming is docker-only. */
++  async display(_handle?: VmHandle): Promise<VmDisplayEndpoint | null> {
++    return null;
++  }
++
+   /** Test helper: directly inspect a file without going through readFile. */
+   peekFile(userId: string, path: string): string | undefined {
+     return this.vms.get(userId)?.files.get(path);
+diff --git a/apps/swarmagents/lib/vm/index.ts b/apps/swarmagents/lib/vm/index.ts
+index 3e55cbfa5..3c72f315e 100644
+--- a/apps/swarmagents/lib/vm/index.ts
++++ b/apps/swarmagents/lib/vm/index.ts
+@@ -18,6 +18,7 @@ export type {
+   VmFileStat,
+   VmDirEntry,
+   VmFileBytes,
++  VmDisplayEndpoint,
+ } from "./types";
+ 
+ export {
+@@ -45,6 +46,18 @@ export {
+   validateSnapshotName,
+   validateSnapshotLabel,
+   snapshotRepoFor,
++  SWARM_VM_DESKTOP_ENV,
++  SWARM_VM_NETWORK_ENV,
++  DEFAULT_VM_NETWORK,
++  VM_DESKTOP_LABEL,
++  VM_DESKTOP_LABEL_VALUE,
++  VM_DESKTOP_USER,
++  VM_DESKTOP_HOME,
++  VM_DESKTOP_SHM,
++  VM_DESKTOP_DISPLAY,
++  VM_DISPLAY_PORT,
++  resolveDesktopMode,
++  resolveVmNetwork,
+   type DockerVmDriverOptions,
+ } from "./docker-driver";
+ export {
+diff --git a/apps/swarmagents/lib/vm/types.ts b/apps/swarmagents/lib/vm/types.ts
+index 03eaeb05b..77c5c3d68 100644
+--- a/apps/swarmagents/lib/vm/types.ts
++++ b/apps/swarmagents/lib/vm/types.ts
+@@ -81,6 +81,17 @@ export interface VmSnapshot {
+   image?: string;
+ }
+ 
++/**
++ * Reachable display endpoint for a desktop VM.
++ *
++ * `host` is the container's IP on the shared bridge network (not a published
++ * host port), `port` is the in-VM display port (noVNC/websockify, 6080).
++ */
++export interface VmDisplayEndpoint {
++  host: string;
++  port: number;
++}
++
+ /** Every driver must satisfy this interface. */
+ export interface VmDriver {
+   /** Make sure a VM exists for the user (idempotent). */
+@@ -121,4 +132,11 @@ export interface VmDriver {
+ 
+   /** Optional: roll the VM back to a previously created checkpoint. */
+   restore?(handle: VmHandle, label: string): Promise<void>;
++
++  /**
++   * Optional: reachable display endpoint for this user's VM.
++   * Desktop VMs return the container IP on the shared bridge network plus the
++   * in-VM display port; drivers without a display return null.
++   */
++  display?(handle: VmHandle): Promise<VmDisplayEndpoint | null>;
+ }
+-- 
+2.55.0
+

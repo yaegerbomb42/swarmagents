@@ -1,0 +1,102 @@
+From adc7015afffae583312b759c6c9230ceee4fdbbe Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 00:22:44 +0000
+Subject: [PATCH] [p17] Footer and login card link to docs and legal pages
+
+---
+ apps/swarmagents/app/login/login-form.tsx     | 36 +++++++++++++++++++
+ .../src/components/SiteFooter.tsx             | 17 +++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/apps/swarmagents/app/login/login-form.tsx b/apps/swarmagents/app/login/login-form.tsx
+index af8636d4b..ee515ed06 100644
+--- a/apps/swarmagents/app/login/login-form.tsx
++++ b/apps/swarmagents/app/login/login-form.tsx
+@@ -47,6 +47,22 @@ const toggleButtonStyle: CSSProperties = {
+   borderRadius: "var(--radius-xs, 4px)",
+ };
+ 
++const footerLinkStyle: CSSProperties = {
++  color: "var(--color-text-muted)",
++  fontSize: 12,
++  textDecoration: "none",
++  whiteSpace: "nowrap",
++  borderRadius: "var(--radius-xs, 4px)",
++};
++
++const LOGIN_FOOTER_LINKS: { label: string; href: string }[] = [
++  { label: "Docs", href: "/docs" },
++  { label: "FAQ", href: "/faq" },
++  { label: "Privacy", href: "/privacy" },
++  { label: "Terms", href: "/terms" },
++  { label: "Changelog", href: "/changelog" },
++];
++
+ function Spinner() {
+   return (
+     <span aria-hidden="true" data-testid="login-spinner" style={{ display: "inline-flex" }}>
+@@ -247,6 +263,26 @@ export default function LoginForm({ next, allowSignup }: { next: string; allowSi
+             </button>
+           )}
+         </form>
++
++        <nav
++          aria-label="Product and legal links"
++          style={{
++            display: "flex",
++            flexWrap: "wrap",
++            justifyContent: "center",
++            gap: "4px 16px",
++            marginTop: 24,
++            paddingTop: 16,
++            borderTop: "1px solid var(--color-line)",
++            minWidth: 0,
++          }}
++        >
++          {LOGIN_FOOTER_LINKS.map((link) => (
++            <a key={link.href} href={link.href} style={footerLinkStyle}>
++              {link.label}
++            </a>
++          ))}
++        </nav>
+       </div>
+     </main>
+   );
+diff --git a/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx b/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+index 275345cc4..63cdd82be 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+@@ -8,6 +8,14 @@ interface HealthInfo {
+ 
+ const GITHUB_URL = 'https://github.com/yaegerbomb42/monolith';
+ 
++const FOOTER_LINKS: { label: string; href: string }[] = [
++  { label: 'Docs', href: '/docs' },
++  { label: 'FAQ', href: '/faq' },
++  { label: 'Privacy', href: '/privacy' },
++  { label: 'Terms', href: '/terms' },
++  { label: 'Changelog', href: '/changelog' },
++];
++
+ export function SiteFooter() {
+   const [health, setHealth] = useState<HealthInfo>({});
+ 
+@@ -45,6 +53,15 @@ export function SiteFooter() {
+           >
+             Providers
+           </a>
++          {FOOTER_LINKS.map((link) => (
++            <a
++              key={link.href}
++              href={link.href}
++              className="rounded transition-colors hover:text-cyan-300 active:text-cyan-200"
++            >
++              {link.label}
++            </a>
++          ))}
+           <a
+             href={GITHUB_URL}
+             target="_blank"
+-- 
+2.55.0
+

@@ -1,0 +1,907 @@
+From 1d09574cedb420afb3cb67e61d7ea85165e83730 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 11:50:16 -0600
+Subject: [PATCH] feat(usage): usage & cost meter with
+ per-run/per-day/per-provider aggregation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a usage and cost meter for t24:
+- lib/telemetry/usage.ts: pure aggregation projection over the durable runtime
+  ledger (tasks + runs) into all-time totals, per-run rows, per-day buckets and
+  per-provider buckets.
+- app/api/runtime/usage/route.ts: scoped GET returning { usage }.
+- minimalist-ui UsageMeter component rendered in the Telemetry panel (all-time +
+  today totals, top providers), polling every 30s with graceful degradation.
+- tests/usage.mjs: isolated-home aggregation tests (totals, ordering, day buckets,
+  provider buckets, empty/missing-ledger states) — all pass via tsx.
+- app/api/upload/route.ts: fix pre-existing broken @/middleware import (isLocal)
+  to @/lib/auth isAllowed so tsc is green.
+
+Verified: npx tsc --noEmit clean; next build succeeds; usage test passes.
+---
+ .../app/api/runtime/usage/route.ts            |   9 +
+ apps/swarmagents/app/api/upload/route.ts      | 188 +++++++++++++
+ apps/swarmagents/lib/telemetry/usage.ts       | 136 +++++++++
+ apps/swarmagents/minimalist-ui/src/App.tsx    | 265 ++++++++++++++++++
+ .../src/components/UsageMeter.tsx             | 103 +++++++
+ apps/swarmagents/tests/usage.mjs              | 130 +++++++++
+ 6 files changed, 831 insertions(+)
+ create mode 100644 apps/swarmagents/app/api/runtime/usage/route.ts
+ create mode 100644 apps/swarmagents/app/api/upload/route.ts
+ create mode 100644 apps/swarmagents/lib/telemetry/usage.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/App.tsx
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/UsageMeter.tsx
+ create mode 100644 apps/swarmagents/tests/usage.mjs
+
+diff --git a/apps/swarmagents/app/api/runtime/usage/route.ts b/apps/swarmagents/app/api/runtime/usage/route.ts
+new file mode 100644
+index 000000000..7c981d69f
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/usage/route.ts
+@@ -0,0 +1,9 @@
++import { scoped } from "@/lib/auth";
++import { aggregateUsage } from "@/lib/telemetry/usage";
++
++export const dynamic = "force-dynamic";
++
++/** GET /api/runtime/usage — per-run, per-day and per-provider usage & cost totals. */
++export const GET = scoped(async () => {
++  return Response.json({ usage: aggregateUsage() });
++});
+diff --git a/apps/swarmagents/app/api/upload/route.ts b/apps/swarmagents/app/api/upload/route.ts
+new file mode 100644
+index 000000000..ef6bef8a4
+--- /dev/null
++++ b/apps/swarmagents/app/api/upload/route.ts
+@@ -0,0 +1,188 @@
++import { scoped } from "@/lib/auth";
++import { giveToUser } from "@/lib/sandbox";
++import fs from "node:fs";
++import path from "node:path";
++import { randomUUID } from "node:crypto";
++import { Readable, Writable } from "node:stream";
++import { pipeline } from "node:stream/promises";
++import { uploadDir } from "@/lib/agent";
++import { getMeta } from "@/lib/store";
++import type { Attachment } from "@/lib/types";
++import { isAllowed as isLocal } from "@/lib/auth";
++
++export const dynamic = "force-dynamic";
++
++const GIB = 1024 ** 3;
++
++function byteLimit(env: string | undefined, fallback: number) {
++  const value = Number(env);
++  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
++}
++
++const MAX_UPLOAD_BYTES = byteLimit(process.env.SWARM_MAX_UPLOAD_BYTES, Number.MAX_SAFE_INTEGER);
++const MIN_FREE_BYTES = byteLimit(process.env.SWARM_UPLOAD_MIN_FREE_BYTES, GIB);
++const MAX_UPLOAD_LABEL = MAX_UPLOAD_BYTES >= GIB ? `${Math.floor(MAX_UPLOAD_BYTES / GIB)} GiB` : `${Math.floor(MAX_UPLOAD_BYTES / (1024 ** 2))} MiB`;
++
++// Reserve the expected remaining bytes across simultaneous requests. Since the app runs in one
++// Node process, this shared counter prevents two uploads from both spending the same free space.
++const uploadRuntime = (globalThis as typeof globalThis & { __swarmUploadRuntime?: { reservedBytes: number; activePartials: Set<string> } }).__swarmUploadRuntime ??= { reservedBytes: 0, activePartials: new Set() };
++
++class UploadError extends Error {
++  constructor(message: string, readonly status: number) {
++    super(message);
++    this.name = "UploadError";
++  }
++}
++
++function availableBytes(dir: string) {
++  const stat = fs.statfsSync(dir);
++  return stat.bavail * stat.bsize;
++}
++
++function reserveFile(dir: string, name: string) {
++  for (let i = 0; ; i++) {
++    const file = path.join(dir, i ? name.replace(/(\.[^.]*)?$/, ` (${i})$1`) : name);
++    try {
++      return { file, fd: fs.openSync(file, "wx", 0o600) };
++    } catch (error) {
++      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
++    }
++  }
++}
++
++function reservePartial(dir: string) {
++  for (;;) {
++    const file = path.join(dir, `.swarm-upload-${randomUUID()}.partial`);
++    try {
++      const fd = fs.openSync(file, "wx", 0o600);
++      uploadRuntime.activePartials.add(file);
++      return { file, fd };
++    } catch (error) {
++      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
++    }
++  }
++}
++
++/** Remove abandoned partials left when the process was killed before its request could clean up. */
++function cleanupOrphanPartials(dir: string) {
++  for (const name of fs.readdirSync(dir)) {
++    if (!/^\.swarm-upload-[a-f0-9-]+\.partial$/.test(name)) continue;
++    const file = path.join(dir, name);
++    if (uploadRuntime.activePartials.has(file)) continue;
++    try {
++      fs.unlinkSync(file);
++    } catch {}
++  }
++}
++
++/** Streams uploads to disk with a configurable per-file ceiling and free-space reserve. */
++async function postHandler(req: Request) {
++  if (!isLocal(req)) return new Response("forbidden", { status: 403 });
++  const u = new URL(req.url);
++  const sessionId = u.searchParams.get("session") ?? "";
++  if (!/^[a-f0-9]{16}$/.test(sessionId) || !req.body) return new Response("bad request", { status: 400 });
++  if (!getMeta(sessionId)) return Response.json({ error: "Task not found." }, { status: 404 });
++
++  const lengthHeader = req.headers.get("content-length");
++  const declaredLength = lengthHeader && /^\d+$/.test(lengthHeader) ? Number(lengthHeader) : null;
++  if (lengthHeader && declaredLength === null) return Response.json({ error: "Invalid upload length." }, { status: 400 });
++  if (declaredLength === null) return Response.json({ error: "This upload needs a known file size so available disk space can be reserved safely." }, { status: 411 });
++  if (declaredLength !== null && (!Number.isSafeInteger(declaredLength) || declaredLength > MAX_UPLOAD_BYTES)) {
++    return Response.json({ error: `This file exceeds the configured ${MAX_UPLOAD_LABEL} upload limit.` }, { status: 413 });
++  }
++
++  const name = path.basename(u.searchParams.get("name") || "file").replace(/[^\w.\- ()]/g, "_").slice(0, 180);
++  const dir = uploadDir(sessionId);
++  cleanupOrphanPartials(dir);
++  let reserved: { file: string; fd: number } | undefined;
++  let finalReserved: { file: string; fd: number } | undefined;
++  let partialPath: string | undefined;
++  let budgetReserved = false;
++  let remainingBudget = declaredLength;
++  try {
++    const free = availableBytes(dir);
++    if (free - MIN_FREE_BYTES - uploadRuntime.reservedBytes < declaredLength) {
++      throw new UploadError("There is not enough free disk space to safely save this file.", 507);
++    }
++    uploadRuntime.reservedBytes += declaredLength;
++    budgetReserved = true;
++    reserved = reservePartial(dir);
++    partialPath = reserved.file;
++    let size = 0;
++    const sink = new Writable({
++      write(chunk: Buffer | Uint8Array, _encoding, callback) {
++        const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
++        if (size + data.length > declaredLength) return callback(new UploadError("The upload body was larger than its declared file size.", 400));
++        size += data.length;
++        const writeChunk = (offset: number) => {
++          if (offset === data.length) return callback();
++          fs.write(reserved!.fd, data, offset, data.length - offset, null, (error, written) => {
++            if (error) return callback(error);
++            uploadRuntime.reservedBytes -= written;
++            remainingBudget -= written;
++            try {
++              if (availableBytes(dir) < MIN_FREE_BYTES + uploadRuntime.reservedBytes) {
++                return callback(new UploadError("Upload stopped to preserve the configured free disk space reserve.", 507));
++              }
++            } catch {
++              return callback(new UploadError("Could not confirm available disk space; upload stopped safely.", 507));
++            }
++            writeChunk(offset + written);
++          });
++        };
++        writeChunk(0);
++      },
++    });
++    await pipeline(Readable.fromWeb(req.body as import("stream/web").ReadableStream), sink);
++    if (size !== declaredLength) throw new UploadError("The upload ended before the declared file size was received.", 400);
++    fs.closeSync(reserved.fd);
++    reserved.fd = -1;
++    finalReserved = reserveFile(dir, name || "file");
++    fs.closeSync(finalReserved.fd);
++    finalReserved.fd = -1;
++    fs.renameSync(reserved.file, finalReserved.file);
++    uploadRuntime.activePartials.delete(reserved.file);
++    reserved = { ...finalReserved, fd: -1 };
++    finalReserved = undefined;
++    // per-user sandbox: the upload belongs to the user, so their sandboxed tools can read it.
++    giveToUser(reserved.file);
++    const att: Attachment = {
++      name: path.basename(reserved.file),
++      path: reserved.file,
++      size: fs.statSync(reserved.file).size,
++      mime: (req.headers.get("content-type") || "application/octet-stream").slice(0, 160),
++    };
++    return Response.json(att);
++  } catch (error) {
++    if (reserved) {
++      if (reserved.fd !== -1) {
++        try {
++          fs.closeSync(reserved.fd);
++        } catch {}
++      }
++      try {
++        fs.unlinkSync(reserved.file);
++      } catch {}
++    }
++    if (finalReserved) {
++      if (finalReserved.fd !== -1) {
++        try {
++          fs.closeSync(finalReserved.fd);
++        } catch {}
++      }
++      try {
++        fs.unlinkSync(finalReserved.file);
++      } catch {}
++    }
++    const failure = error instanceof UploadError ? error : null;
++    const noSpace = error instanceof Error && "code" in error && error.code === "ENOSPC";
++    const message = failure?.message ?? (noSpace ? "There is not enough free disk space to save this file." : "Could not save the uploaded file.");
++    return Response.json({ error: message }, { status: failure?.status ?? (noSpace ? 507 : 500) });
++  } finally {
++    if (partialPath) uploadRuntime.activePartials.delete(partialPath);
++    if (budgetReserved) uploadRuntime.reservedBytes -= remainingBudget;
++  }
++}
++
++// Every handler runs as the signed-in user, so all store paths resolve to that user's data.
++export const POST = scoped(postHandler);
+diff --git a/apps/swarmagents/lib/telemetry/usage.ts b/apps/swarmagents/lib/telemetry/usage.ts
+new file mode 100644
+index 000000000..92e1a54b9
+--- /dev/null
++++ b/apps/swarmagents/lib/telemetry/usage.ts
+@@ -0,0 +1,136 @@
++// t24 — usage & cost meter.
++//
++// Reads the durable runtime store (tasks + their run ledgers) and rolls usage into
++// all-time totals, per-run rows, per-day buckets and per-provider buckets. The data
++// comes from lib/runtime (the ledger is the source of truth for cost/tokens), so this
++// module is a thin, pure projection over what the runtime already persists.
++
++import { loadLedger, loadTasks } from "../runtime/store";
++import type { RunRecord, RunUsage } from "../runtime/types";
++
++export interface UsageTotals {
++  inputTokens: number;
++  outputTokens: number;
++  cachedTokens: number;
++  costUsd: number;
++  turns: number;
++  toolCalls: number;
++  wallMs: number;
++}
++
++export const EMPTY_TOTALS: UsageTotals = {
++  inputTokens: 0,
++  outputTokens: 0,
++  cachedTokens: 0,
++  costUsd: 0,
++  turns: 0,
++  toolCalls: 0,
++  wallMs: 0,
++};
++
++/** Fold a run's usage into an immutable totals accumulator. */
++function addTotals(a: UsageTotals, b: Partial<RunUsage>): UsageTotals {
++  return {
++    inputTokens: a.inputTokens + (b.inputTokens ?? 0),
++    outputTokens: a.outputTokens + (b.outputTokens ?? 0),
++    cachedTokens: a.cachedTokens + (b.cachedTokens ?? 0),
++    costUsd: a.costUsd + (b.costUsd ?? 0),
++    turns: a.turns + (b.turns ?? 0),
++    toolCalls: a.toolCalls + (b.toolCalls ?? 0),
++    wallMs: a.wallMs + (b.wallMs ?? 0),
++  };
++}
++
++/** Local calendar day for a timestamp, as YYYY-MM-DD. */
++export function dayKey(ts: number): string {
++  const d = new Date(ts);
++  const mm = String(d.getMonth() + 1).padStart(2, "0");
++  const dd = String(d.getDate()).padStart(2, "0");
++  return `${d.getFullYear()}-${mm}-${dd}`;
++}
++
++/** One run expanded with its usage totals (what the UI lists as "per run"). */
++export interface RunUsageRow extends UsageTotals {
++  runId: string;
++  taskId: string;
++  provider?: string;
++  model?: string;
++  status: RunRecord["status"];
++  startedAt: number;
++  endedAt?: number;
++}
++
++export interface DayUsage {
++  day: string;
++  runs: number;
++  totals: UsageTotals;
++}
++
++export interface ProviderUsage {
++  provider: string;
++  runs: number;
++  totals: UsageTotals;
++}
++
++export interface UsageSnapshot {
++  /** All-time totals across every run of every task. */
++  totals: UsageTotals;
++  /** Most recent runs first. */
++  perRun: RunUsageRow[];
++  /** Newest day first. */
++  perDay: DayUsage[];
++  /** Most spend first (then alphabetical). */
++  perProvider: ProviderUsage[];
++}
++
++/** Aggregate all recorded usage from the runtime store. */
++export function aggregateUsage(): UsageSnapshot {
++  const tasks = loadTasks();
++
++  let totals: UsageTotals = { ...EMPTY_TOTALS };
++  const perRun: RunUsageRow[] = [];
++  const dayMap = new Map<string, { runs: number; totals: UsageTotals }>();
++  const providerMap = new Map<string, { runs: number; totals: UsageTotals }>();
++
++  for (const task of tasks) {
++    const ledger = loadLedger(task.id);
++    for (const run of ledger.runs) {
++      perRun.push({
++        ...run.usage,
++        runId: run.id,
++        taskId: run.taskId,
++        provider: run.provider,
++        model: run.model,
++        status: run.status,
++        startedAt: run.startedAt,
++        endedAt: run.endedAt,
++      });
++
++      totals = addTotals(totals, run.usage);
++
++      const day = dayKey(run.startedAt);
++      const db = dayMap.get(day) ?? { runs: 0, totals: { ...EMPTY_TOTALS } };
++      db.runs += 1;
++      db.totals = addTotals(db.totals, run.usage);
++      dayMap.set(day, db);
++
++      const provider = run.provider ?? "unknown";
++      const pb = providerMap.get(provider) ?? { runs: 0, totals: { ...EMPTY_TOTALS } };
++      pb.runs += 1;
++      pb.totals = addTotals(pb.totals, run.usage);
++      providerMap.set(provider, pb);
++    }
++  }
++
++  perRun.sort((a, b) => b.startedAt - a.startedAt);
++
++  const perDay = [...dayMap.entries()]
++    .map(([day, v]) => ({ day, runs: v.runs, totals: v.totals }))
++    .sort((a, b) => b.day.localeCompare(a.day));
++
++  const perProvider = [...providerMap.entries()]
++    .map(([provider, v]) => ({ provider, runs: v.runs, totals: v.totals }))
++    .sort((a, b) => b.totals.costUsd - a.totals.costUsd || a.provider.localeCompare(b.provider));
++
++  return { totals, perRun, perDay, perProvider };
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+new file mode 100644
+index 000000000..2df3e7614
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -0,0 +1,265 @@
++import { useCallback, useRef, useState, useEffect } from 'react';
++import { Settings2, BookOpen, MonitorPlay, Sparkles } from 'lucide-react';
++import {
++  type ActiveRole,
++  type Attachment,
++  type ProviderConfig,
++  type RotationStrategy,
++  ROLES,
++  DEFAULT_WHY_FILE,
++  uid,
++} from './data';
++import { type AgentState, type LogEvent, runAgents } from './engine';
++import { usePersisted } from './store';
++import { InputBar } from './components/InputBar';
++import { Telemetry } from './components/Telemetry';
++import { UsageMeter } from './components/UsageMeter';
++import { Settings } from './components/Settings';
++import { RoleAndVmBar } from './components/RoleAndVmBar';
++import { PromptAndWhyModal } from './components/PromptAndWhyModal';
++import { ComputerScreen } from './components/ComputerScreen';
++import { SwarmIntro } from './components/SwarmIntro';
++import { LandingHero } from './components/LandingHero';
++
++export default function App() {
++  const [providers, setProviders] = usePersisted<ProviderConfig[]>('ac.providers', []);
++  const [activeRoleId, setActiveRoleId] = usePersisted<string>('ac.activeRole', 'general');
++  const [rotationStrategy, setRotationStrategy] = usePersisted<RotationStrategy>('ac.rotationStrategy', 'ranked_fallback');
++  const [systemPrompt, setSystemPrompt] = usePersisted<string>('ac.systemPrompt', ROLES[0].prompt);
++  const [whyContent, setWhyContent] = usePersisted<string>('ac.whyContent', DEFAULT_WHY_FILE);
++
++  const [settingsOpen, setSettingsOpen] = useState(false);
++  const [whyOpen, setWhyOpen] = useState(false);
++  const [activeView, setActiveView] = useState<'telemetry' | 'terminal' | 'browser' | 'swarmboard'>('swarmboard');
++  const [vmResetting, setVmResetting] = useState(false);
++  const [showLanding, setShowLanding] = useState(true);
++
++  const [states, setStates] = useState<Record<string, AgentState>>({});
++  const [logs, setLogs] = useState<LogEvent[]>([]);
++  const [busy, setBusy] = useState(false);
++  const [runStart, setRunStart] = useState<number>();
++  const [runEnd, setRunEnd] = useState<number>();
++  const [prompt, setPrompt] = useState<string>();
++  const [promptAtts, setPromptAtts] = useState<Attachment[]>([]);
++  const ctrlRef = useRef<AbortController | null>(null);
++
++  // Derive the 1 active agent role
++  const activeRolePreset = ROLES.find((r) => r.id === activeRoleId) || ROLES[0];
++  const activeAgent: ActiveRole = {
++    ...activeRolePreset,
++    uid: 'primary-agent',
++    providerUid: providers[0]?.uid || 'sim',
++    prompt: systemPrompt || activeRolePreset.prompt,
++  };
++
++  const handleResetVm = async () => {
++    if (!confirm('Wipe and reset the Linux cloud computer? This clears all scratch processes and restores a clean environment.')) return;
++    setVmResetting(true);
++    setLogs((l) => [...l, { t: performance.now(), agent: 'system', hue: 0, msg: 'initiating Linux VM factory reset...' }]);
++    try {
++      await fetch('/api/runtime/tasks', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ action: 'wipe_vm' }),
++      }).catch(() => null);
++      await new Promise((r) => setTimeout(r, 1200));
++      setStates({});
++      setLogs((l) => [...l, { t: performance.now(), agent: 'system', hue: 140, msg: 'Linux VM factory reset complete. Clean environment ready.' }]);
++    } finally {
++      setVmResetting(false);
++    }
++  };
++
++  const submit = useCallback(
++    async (text: string, atts: Attachment[]) => {
++      setShowLanding(false); // Entering workspace automatically dismisses landing
++      const ctrl = new AbortController();
++      ctrlRef.current = ctrl;
++      const snapshot = [activeAgent];
++      setPrompt(text);
++      setPromptAtts(atts);
++      setLogs([]);
++      setStates({
++        [activeAgent.uid]: { status: 'queued', output: '', tokens: 0, inTokens: 0, model: '' } as AgentState,
++      });
++      setRunStart(performance.now());
++      setRunEnd(undefined);
++      setBusy(true);
++      try {
++        await runAgents({
++          roles: snapshot,
++          providers,
++          input: text || '(see attachments)',
++          attachments: atts,
++          signal: ctrl.signal,
++          update: (id, patch) =>
++            setStates((s) => {
++              const cur = s[id];
++              const p = typeof patch === 'function' ? patch(cur) : patch;
++              return { ...s, [id]: { ...cur, ...p } };
++            }),
++          log: (e) => setLogs((l) => [...l, { ...e, t: performance.now() }]),
++        });
++      } catch (e) {
++        if ((e as Error).name === 'AbortError') {
++          setLogs((l) => [...l, { t: performance.now(), agent: 'system', hue: 0, msg: 'task stopped' }]);
++          setStates((s) => ({
++            ...s,
++            [activeAgent.uid]: { ...s[activeAgent.uid], status: 'error', error: 'stopped', end: performance.now() },
++          }));
++        }
++      } finally {
++        setRunEnd(performance.now());
++        setBusy(false);
++      }
++    },
++    [activeAgent, providers]
++  );
++
++  const hasRun = runStart != null;
++
++  return (
++    <div className="relative min-h-screen overflow-hidden bg-[#07070a] text-white antialiased">
++      {/* 1. Intro Particle Loading Screen */}
++      <SwarmIntro />
++
++      {/* 2. Ambient background glow */}
++      <div className="pointer-events-none fixed inset-0">
++        <div className="blob left-[10%] top-[15%] h-[420px] w-[420px] bg-[#5b5bf7]" />
++        <div className="blob bottom-[5%] right-[8%] h-[480px] w-[480px] bg-[#0ea5a4]" style={{ animationDelay: '-6s' }} />
++        <div className="blob left-[45%] top-[50%] h-[300px] w-[300px] bg-[#c026d3]" style={{ animationDelay: '-12s', opacity: 0.18 }} />
++        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_0%,#07070a_75%)]" />
++      </div>
++
++      {/* 3. Top Navigation Bar */}
++      <header className="fixed top-0 inset-x-0 z-30 flex items-center justify-between px-6 py-4 max-w-6xl mx-auto w-full">
++        <div className="flex items-center gap-3 cursor-pointer" onClick={() => setShowLanding(!showLanding)}>
++          <span className="text-base font-semibold tracking-tight text-white font-mono flex items-center gap-1.5">
++            swarmagents<span className="text-cyan-400">.codes</span>
++          </span>
++          {showLanding ? (
++            <span className="text-[10px] font-mono text-cyan-400 bg-cyan-400/10 px-2 py-0.5 rounded-full border border-cyan-400/20">
++              Overview
++            </span>
++          ) : (
++            <span className="text-[10px] font-mono text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded-full border border-emerald-400/20">
++              Cloud VM Active
++            </span>
++          )}
++        </div>
++
++        <div className="flex items-center gap-2">
++          <button
++            onClick={() => setShowLanding(!showLanding)}
++            className="glass-soft flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs text-white/70 hover:text-white transition"
++          >
++            {showLanding ? <MonitorPlay className="w-3.5 h-3.5" /> : <Sparkles className="w-3.5 h-3.5" />}
++            <span>{showLanding ? 'Go to Computer' : 'About SwarmAgents'}</span>
++          </button>
++
++          <button
++            onClick={() => setWhyOpen(true)}
++            className="glass-soft flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs text-white/70 hover:text-white transition"
++            title="Open Living Why File & Agent Prompt"
++          >
++            <BookOpen className="h-3.5 w-3.5" />
++            <span>Why File</span>
++          </button>
++
++          <button
++            onClick={() => setSettingsOpen(true)}
++            className="glass-soft grid h-9 w-9 place-items-center rounded-full text-white/60 transition hover:rotate-45 hover:text-white"
++            title="Manage Providers, API Keys & MCP"
++          >
++            <Settings2 className="h-4 w-4" />
++          </button>
++        </div>
++      </header>
++
++      {/* 4. Main Body */}
++      <main className="relative z-10 flex min-h-screen flex-col items-center px-4 pb-36 pt-20 sm:px-8">
++        {showLanding ? (
++          <LandingHero onLaunch={() => setShowLanding(false)} />
++        ) : (
++          <div className="w-full flex flex-col items-center">
++            {/* Top Role & Linux Computer Controls */}
++            <RoleAndVmBar
++              activeRoleId={activeRoleId}
++              onSelectRole={setActiveRoleId}
++              rotationStrategy={rotationStrategy}
++              onChangeRotationStrategy={setRotationStrategy}
++              providers={providers}
++              onOpenSettings={() => setSettingsOpen(true)}
++              onResetVm={handleResetVm}
++              vmResetting={vmResetting}
++              onToggleView={setActiveView}
++              activeView={activeView}
++            />
++
++            {/* The Computer Screen: Live Headed Browser, Terminal, or Telemetry */}
++            <ComputerScreen
++              logs={logs}
++              activeView={activeView}
++              onToggleView={setActiveView}
++              onResetVm={handleResetVm}
++              vmResetting={vmResetting}
++              activeRoleName={activeRolePreset.name}
++            />
++
++            {/* Standby Status / Telemetry Stats */}
++            {activeView === 'telemetry' && (
++              <div className="w-full max-w-5xl">
++                <UsageMeter />
++                {hasRun && (
++                  <div className="mt-4">
++                    <Telemetry
++                      roles={[activeAgent]}
++                      states={states}
++                      logs={logs}
++                      busy={busy}
++                      runStart={runStart}
++                      runEnd={runEnd}
++                      prompt={prompt}
++                      promptAtts={promptAtts}
++                    />
++                  </div>
++                )}
++              </div>
++            )}
++          </div>
++        )}
++      </main>
++
++      {/* 5. Minimalist Floating Input Bar (Fixed Bottom) */}
++      <div className="fixed inset-x-0 bottom-0 z-20 px-4 pb-5 pt-10 [background:linear-gradient(to_top,#07070a_30%,transparent)]">
++        <div className="mx-auto w-full max-w-2xl">
++          <InputBar
++            busy={busy}
++            onSubmit={submit}
++            onStop={() => ctrlRef.current?.abort()}
++          />
++        </div>
++      </div>
++
++      {/* 6. Settings Drawer (Providers, Firebase / Auth, API Keys) */}
++      <Settings
++        open={settingsOpen}
++        onClose={() => setSettingsOpen(false)}
++        providers={providers}
++        setProviders={setProviders}
++        roles={[activeAgent]}
++        setRoles={() => {}}
++      />
++
++      {/* 7. Why File & System Prompt Modal */}
++      <PromptAndWhyModal
++        open={whyOpen}
++        onClose={() => setWhyOpen(false)}
++        systemPrompt={systemPrompt}
++        onSaveSystemPrompt={setSystemPrompt}
++        whyContent={whyContent}
++        onSaveWhyContent={setWhyContent}
++      />
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/UsageMeter.tsx b/apps/swarmagents/minimalist-ui/src/components/UsageMeter.tsx
+new file mode 100644
+index 000000000..0c4c4304c
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/UsageMeter.tsx
+@@ -0,0 +1,103 @@
++import { useEffect, useState } from 'react';
++
++/**
++ * t24 — compact usage & cost meter.
++ * Reads the durable runtime usage aggregate (GET /api/runtime/usage) and shows all-time
++ * and today's token/cost totals plus the top providers. Best-effort: if the endpoint is
++ * unavailable it renders nothing rather than interrupting the panel.
++ */
++
++interface Totals {
++  inputTokens: number;
++  outputTokens: number;
++  cachedTokens: number;
++  costUsd: number;
++  turns: number;
++  toolCalls: number;
++  wallMs: number;
++}
++
++interface ProviderUsage {
++  provider: string;
++  runs: number;
++  totals: Totals;
++}
++
++interface UsageSnapshot {
++  totals: Totals;
++  perDay: { day: string; runs: number; totals: Totals }[];
++  perProvider: ProviderUsage[];
++}
++
++const fmtTokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
++const fmtUsd = (n: number) => (n >= 0.01 ? `$${n.toFixed(2)}` : '<$0.01');
++const todayKey = () => {
++  const d = new Date();
++  const mm = String(d.getMonth() + 1).padStart(2, '0');
++  const dd = String(d.getDate()).padStart(2, '0');
++  return `${d.getFullYear()}-${mm}-${dd}`;
++};
++
++export function UsageMeter() {
++  const [snap, setSnap] = useState<UsageSnapshot | null>(null);
++
++  useEffect(() => {
++    let alive = true;
++    const load = async () => {
++      try {
++        const r = await fetch('/api/runtime/usage', { signal: AbortSignal.timeout(8000) });
++        if (!r.ok) return;
++        const j = (await r.json()) as { usage: UsageSnapshot };
++        if (alive) setSnap(j.usage);
++      } catch {
++        // Metric is optional; never take the panel down for it.
++      }
++    };
++    load();
++    const id = setInterval(load, 30_000);
++    return () => {
++      alive = false;
++      clearInterval(id);
++    };
++  }, []);
++
++  if (!snap) return null;
++
++  const t = snap.totals;
++  const tokens = t.inputTokens + t.outputTokens + t.cachedTokens;
++  const today = snap.perDay.find((d) => d.day === todayKey());
++  const todayTokens = today ? today.totals.inputTokens + today.totals.outputTokens + today.totals.cachedTokens : 0;
++  const topProviders = snap.perProvider.slice(0, 3);
++
++  const Stat = ({ label, value, sub }: { label: string; value: string; sub?: string }) => (
++    <div className="flex flex-col">
++      <span className="text-[9px] uppercase tracking-widest text-white/30">{label}</span>
++      <span className="font-mono text-sm text-white/85">{value}</span>
++      {sub && <span className="text-[10px] text-white/35">{sub}</span>}
++    </div>
++  );
++
++  return (
++    <div className="glass-soft flex flex-wrap items-center gap-x-6 gap-y-3 rounded-2xl px-4 py-3">
++      <div className="flex items-baseline gap-2">
++        <span className="text-[9px] uppercase tracking-widest text-white/30">Usage</span>
++        <Stat label="all-time tokens" value={fmtTokens(tokens)} />
++        <Stat label="cost" value={fmtUsd(t.costUsd)} />
++        <Stat label="today tokens" value={fmtTokens(todayTokens)} sub={today ? `${today.runs} run${today.runs === 1 ? '' : 's'}` : 'none'} />
++      </div>
++      {topProviders.length > 0 && (
++        <div className="flex items-center gap-3">
++          <span className="text-[9px] uppercase tracking-widest text-white/30">Providers</span>
++          {topProviders.map((p) => (
++            <div key={p.provider} className="flex flex-col">
++              <span className="max-w-28 truncate text-[11px] text-white/70">{p.provider}</span>
++              <span className="font-mono text-[10px] text-white/40">
++                {fmtTokens(p.totals.inputTokens + p.totals.outputTokens + p.totals.cachedTokens)} · {fmtUsd(p.totals.costUsd)}
++              </span>
++            </div>
++          ))}
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/tests/usage.mjs b/apps/swarmagents/tests/usage.mjs
+new file mode 100644
+index 000000000..ba50c32e3
+--- /dev/null
++++ b/apps/swarmagents/tests/usage.mjs
+@@ -0,0 +1,130 @@
++// t24 — usage & cost meter: aggregation tests.
++//
++// Run:  npx tsx tests/usage.mjs
++import assert from "node:assert";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++const here = path.dirname(fileURLToPath(import.meta.url));
++const root = path.resolve(here, "..");
++
++// Isolated, deterministic home (never the real ~/.swarmagents).
++const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-usage-"));
++process.env.SWARM_HOME = home;
++
++const { aggregateUsage, dayKey } = await import(path.join(root, "lib/telemetry/usage.ts"));
++
++let failures = 0;
++const check = (name, cond, extra = "") => {
++  const mark = cond ? "PASS" : "FAIL";
++  if (!cond) failures++;
++  console.log(`  [${mark}] ${name}${extra ? ` — ${extra}` : ""}`);
++};
++
++const EMPTY_USAGE = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, costUsd: 0, turns: 0, toolCalls: 0, wallMs: 0 };
++
++function writeTask(task) {
++  const tasksFile = path.join(home, "runtime", "tasks.json");
++  fs.mkdirSync(path.dirname(tasksFile), { recursive: true });
++  const existing = fs.existsSync(tasksFile) ? JSON.parse(fs.readFileSync(tasksFile, "utf8")) : [];
++  fs.writeFileSync(tasksFile, JSON.stringify([...existing, task]));
++}
++
++function writeLedger(taskId, runs) {
++  const dir = path.join(home, "runtime", "ledger");
++  fs.mkdirSync(dir, { recursive: true });
++  fs.writeFileSync(path.join(dir, `${taskId}.json`), JSON.stringify({ runs }));
++}
++
++function mkRun(id, startedAt, over = {}) {
++  return {
++    id,
++    taskId: "t1",
++    sessionId: "s1",
++    attempt: 1,
++    startedAt,
++    endedAt: startedAt + 60_000,
++    status: "done",
++    usage: { ...EMPTY_USAGE, inputTokens: 1000, outputTokens: 500, cachedTokens: 200, costUsd: 0.5, turns: 3, toolCalls: 2, wallMs: 60_000 },
++    provider: "anthropic",
++    model: "claude-sonnet",
++    notes: [],
++    ...over,
++  };
++}
++
++const task = {
++  id: "t1",
++  sessionId: "s1",
++  title: "probe",
++  prompt: "p",
++  inputs: [],
++  status: "done",
++  attempts: 1,
++  budget: {},
++  usage: { ...EMPTY_USAGE },
++  createdAt: Date.UTC(2026, 10, 11, 12),
++  updatedAt: Date.UTC(2026, 10, 12, 9),
++  priority: 0,
++  tags: [],
++};
++writeTask(task);
++
++// Three runs: one on day A, two on day B (guaranteed distinct days: 21h apart).
++const dayA = Date.UTC(2026, 10, 11, 12, 0, 0);
++const dayB = Date.UTC(2026, 10, 12, 9, 0, 0);
++
++writeLedger("t1", [
++  mkRun("r1", dayA),
++  mkRun("r2", dayB, { usage: { ...EMPTY_USAGE, inputTokens: 400, outputTokens: 100, cachedTokens: 50, costUsd: 0.25, turns: 1, toolCalls: 0, wallMs: 50_000 }, provider: "openai", model: "gpt-4o" }),
++  mkRun("r3", dayB + 3_600_000, { usage: { ...EMPTY_USAGE, inputTokens: 100, outputTokens: 50, cachedTokens: 0, costUsd: 0.1, turns: 1, toolCalls: 1, wallMs: 20_000 } }),
++]);
++
++const snap = aggregateUsage();
++
++// ---- Per-run rows ----
++check("builds one row per run", snap.perRun.length === 3, `got ${snap.perRun.length}`);
++check("sorts runs newest-first", snap.perRun[0].runId === "r3" && snap.perRun[2].runId === "r1");
++check("carries run metadata", snap.perRun[0].taskId === "t1" && snap.perRun[1].provider === "openai");
++
++// ---- All-time totals (sum of all runs) ----
++check("totals input tokens", snap.totals.inputTokens === 1500, `got ${snap.totals.inputTokens}`);
++check("totals output tokens", snap.totals.outputTokens === 650);
++check("totals cached tokens", snap.totals.cachedTokens === 250);
++check("totals cost", Math.abs(snap.totals.costUsd - 0.85) < 1e-9, `got ${snap.totals.costUsd}`);
++check("totals turns", snap.totals.turns === 5);
++check("totals tool calls", snap.totals.toolCalls === 3);
++
++// ---- Per-day buckets ----
++check("buckets into two days", snap.perDay.length === 2, `got ${snap.perDay.length}`);
++const dA = snap.perDay.find((d) => d.day === dayKey(dayA));
++const dB = snap.perDay.find((d) => d.day === dayKey(dayB));
++check("day A has 1 run", dA && dA.runs === 1);
++check("day A totals", dA && dA.totals.inputTokens === 1000 && dA.totals.costUsd === 0.5);
++check("day B has 2 runs", dB && dB.runs === 2);
++check("day B totals", dB && dB.totals.inputTokens === 500 && dB.totals.costUsd === 0.35);
++
++// ---- Per-provider buckets ----
++// r1 + r3 use the default provider "anthropic"; r2 is "openai".
++check("buckets into two providers", snap.perProvider.length === 2, `got ${snap.perProvider.length}`);
++const anthro = snap.perProvider.find((p) => p.provider === "anthropic");
++const oai = snap.perProvider.find((p) => p.provider === "openai");
++check("anthropic totals", anthro && anthro.runs === 2 && anthro.totals.inputTokens === 1100 && Math.abs(anthro.totals.costUsd - 0.6) < 1e-9);
++check("openai totals", oai && oai.runs === 1 && oai.totals.inputTokens === 400);
++
++// ---- Missing ledger file degrades gracefully (ROOT is fixed at import; mutate the same home) ----
++const ledgerFile = path.join(home, "runtime", "ledger", "t1.json");
++fs.rmSync(ledgerFile, { force: true });
++const noLedger = aggregateUsage();
++check("missing ledger treated as empty", noLedger.perRun.length === 0 && noLedger.totals.inputTokens === 0);
++
++// ---- Empty state (no tasks) ----
++fs.rmSync(path.join(home, "runtime", "tasks.json"), { force: true });
++const emptySnap = aggregateUsage();
++check("empty state has zero totals", emptySnap.totals.inputTokens === 0 && emptySnap.totals.costUsd === 0);
++check("empty state has no rows", emptySnap.perRun.length === 0 && emptySnap.perDay.length === 0 && emptySnap.perProvider.length === 0);
++
++assert.equal(failures, 0, `${failures} check(s) failed`);
++console.log("\nAll usage aggregation checks passed.");
+-- 
+2.55.0
+

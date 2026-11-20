@@ -1,0 +1,218 @@
+From 7f75674e8ff1e34fb49e8e74b9c46e98332359ca Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 20:49:34 +0000
+Subject: [PATCH] [t53] e2e: accessibility smoke
+
+---
+ apps/swarmagents/e2e/accessibility.spec.ts    | 159 ++++++++++++++++++
+ .../minimalist-ui/src/components/InputBar.tsx |   3 +-
+ .../minimalist-ui/src/components/Settings.tsx |   6 +-
+ 3 files changed, 166 insertions(+), 2 deletions(-)
+ create mode 100644 apps/swarmagents/e2e/accessibility.spec.ts
+
+diff --git a/apps/swarmagents/e2e/accessibility.spec.ts b/apps/swarmagents/e2e/accessibility.spec.ts
+new file mode 100644
+index 000000000..49defa6bc
+--- /dev/null
++++ b/apps/swarmagents/e2e/accessibility.spec.ts
+@@ -0,0 +1,159 @@
++import assert from "node:assert/strict";
++import { after, test } from "node:test";
++import type { Page } from "playwright-core";
++import { assertUIAccessible, closeBrowser, openWorkspace, runPageTest } from "./lib";
++
++after(async () => {
++  await closeBrowser();
++});
++
++/**
++ * Accessible name of an element, following the browser's naming sources in
++ * priority order: aria-labelledby, aria-label, visible text content, then
++ * title. Placeholder text is deliberately NOT a name source: it is a hint,
++ * not a label, so an input named only by its placeholder fails here.
++ */
++function nameScript(node: Element): string {
++  const labelledby = node.getAttribute("aria-labelledby");
++  if (labelledby) {
++    const text = labelledby
++      .split(/\s+/)
++      .map((id) => document.getElementById(id)?.textContent?.trim() ?? "")
++      .join(" ")
++      .trim();
++    if (text) return text;
++  }
++  const label = node.getAttribute("aria-label")?.trim();
++  if (label) return label;
++  const text = ((node as HTMLElement).innerText ?? node.textContent ?? "").trim();
++  if (text) return text;
++  return node.getAttribute("title")?.trim() ?? "";
++}
++
++async function checkInteractiveNames(page: Page, where: string): Promise<void> {
++  const locator = page.locator("button:visible, a[href]:visible");
++  const count = await locator.count();
++  assert.ok(count > 0, `expected at least one visible button/link on ${where}, found none`);
++
++  const unnamed: string[] = [];
++  for (let i = 0; i < count; i++) {
++    const el = locator.nth(i);
++    const name = await el.evaluate(nameScript);
++    if (!name) {
++      const html = await el.evaluate((node) => node.outerHTML);
++      unnamed.push(html.slice(0, 200));
++    }
++  }
++  assert.deepEqual(
++    unnamed,
++    [],
++    `${unnamed.length} of ${count} visible buttons/links on ${where} have no accessible name:\n${unnamed.join("\n")}`,
++  );
++}
++
++async function checkImages(page: Page, where: string): Promise<number> {
++  const locator = page.locator("img:visible");
++  const count = await locator.count();
++
++  const missing: string[] = [];
++  for (let i = 0; i < count; i++) {
++    const el = locator.nth(i);
++    const alt = await el.getAttribute("alt");
++    if (alt === null || alt.trim() === "") {
++      const html = await el.evaluate((node) => node.outerHTML);
++      missing.push(html.slice(0, 200));
++    }
++  }
++  assert.deepEqual(
++    missing,
++    [],
++    `${missing.length} of ${count} visible images on ${where} have no alt text:\n${missing.join("\n")}`,
++  );
++  return count;
++}
++
++async function checkInputBarLabel(page: Page): Promise<void> {
++  const input = page.locator("textarea").first();
++  await input.waitFor({ state: "visible", timeout: 15_000 });
++  const labelled = await input.evaluate((node) => {
++    if (node.getAttribute("aria-label")?.trim()) return true;
++    const labelledby = node.getAttribute("aria-labelledby");
++    if (
++      labelledby &&
++      labelledby.split(/\s+/).some((id) => document.getElementById(id)?.textContent?.trim())
++    ) {
++      return true;
++    }
++    const labels = (node as HTMLTextAreaElement).labels;
++    return Boolean(labels && labels.length > 0);
++  });
++  assert.ok(
++    labelled,
++    "expected the prompt input bar to have a label (aria-label, aria-labelledby, or an associated <label> element); placeholder text alone is not a label",
++  );
++  // Belt and braces: the label must surface as the textbox's accessible name.
++  await page
++    .getByRole("textbox", { name: /ask the agents/i })
++    .first()
++    .waitFor({ state: "visible", timeout: 15_000 });
++}
++
++test("a11y: workspace buttons, links, images, and input bar", async (t) => {
++  const testName = "a11y: workspace buttons, links, images, and input bar";
++  const result = await runPageTest(testName, async ({ page, context }) => {
++    await openWorkspace(page, context);
++
++    await checkInteractiveNames(page, "the workspace");
++    await checkImages(page, "the workspace");
++    await checkInputBarLabel(page);
++
++    // No image renders on the home page until one is attached (or a browser
++    // frame exists), so attach a 1x1 PNG to make the attachment-preview <img>
++    // render and assert it carries alt text too. Attaching is local UI
++    // state only — no request is sent, so this is safe in prod mode.
++    const fileInput = page.locator('input[type="file"]').first();
++    await fileInput.setInputFiles({
++      name: "a11y-check.png",
++      mimeType: "image/png",
++      buffer: Buffer.from(
++        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
++        "base64",
++      ),
++    });
++    await page.locator("img:visible").first().waitFor({ state: "visible", timeout: 5_000 });
++    await checkImages(page, "the workspace with an image attachment");
++    await page
++      .getByRole("button", { name: "Remove a11y-check.png" })
++      .first()
++      .click();
++  });
++  if (result.skipped) t.skip(result.skipped);
++});
++
++test("a11y: landing buttons, links, and images", async (t) => {
++  const testName = "a11y: landing buttons, links, and images";
++  const result = await runPageTest(testName, async ({ page, context }) => {
++    const response = await page.goto("/", { waitUntil: "domcontentloaded" });
++    if (!response) throw new Error("Home page returned no response");
++    if (response.status() >= 400) throw new Error(`Home page returned HTTP ${response.status()}`);
++
++    await assertUIAccessible(page, context);
++
++    await page
++      .getByRole("button", { name: "Launch Agent Workspace" })
++      .first()
++      .waitFor({ state: "visible", timeout: 15_000 });
++
++    // First-run onboarding (SwarmIntro) overlays the page; dismiss it so the
++    // checks see the landing page itself. Real users see it once.
++    const skipIntro = page.getByRole("button", { name: /^skip$/i }).first();
++    if (await skipIntro.isVisible({ timeout: 2_000 }).catch(() => false)) {
++      await skipIntro.click();
++      await skipIntro.waitFor({ state: "detached", timeout: 5_000 }).catch(() => undefined);
++    }
++
++    await checkInteractiveNames(page, "the landing page");
++    await checkImages(page, "the landing page");
++  });
++  if (result.skipped) t.skip(result.skipped);
++});
+diff --git a/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx b/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
+index 99c5fa2be..0883f2577 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
+@@ -93,7 +93,7 @@ export function InputBar({
+           {atts.map((a) => (
+             <div key={a.id} className="group relative shrink-0">
+               {a.kind === 'image' ? (
+-                <img src={a.url} className="h-14 w-14 rounded-xl object-cover ring-1 ring-white/15" />
++                <img src={a.url} alt={a.name} className="h-14 w-14 rounded-xl object-cover ring-1 ring-white/15" />
+               ) : a.kind === 'video' ? (
+                 <div className="relative h-14 w-14 overflow-hidden rounded-xl ring-1 ring-white/15">
+                   <video src={a.url} className="h-full w-full object-cover" muted />
+@@ -150,6 +150,7 @@ export function InputBar({
+           rows={1}
+           value={text}
+           disabled={starting}
++          aria-label="Ask the agents anything"
+           placeholder={starting ? 'Starting run…' : 'Ask the agents anything…'}
+           onChange={(e) => {
+             setText(e.target.value);
+diff --git a/apps/swarmagents/minimalist-ui/src/components/Settings.tsx b/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
+index c5b0b0dd8..446f66850 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
+@@ -208,7 +208,11 @@ function General({
+                   </option>
+                 ))}
+               </select>
+-              <button onClick={() => remove(r.uid)} className="rounded-md p-1 text-white/30 hover:bg-white/10 hover:text-white">
++              <button
++                onClick={() => remove(r.uid)}
++                aria-label={`Remove ${r.name} from pipeline`}
++                className="rounded-md p-1 text-white/30 hover:bg-white/10 hover:text-white"
++              >
+                 <X className="h-3.5 w-3.5" />
+               </button>
+             </div>
+-- 
+2.55.0
+

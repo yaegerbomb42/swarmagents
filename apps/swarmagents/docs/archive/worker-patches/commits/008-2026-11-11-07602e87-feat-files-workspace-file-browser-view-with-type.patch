@@ -1,0 +1,912 @@
+From 07602e870b9360f1ba6b53b06619927869742561 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 12:52:04 -0600
+Subject: [PATCH] feat(files): workspace file browser view with typed client
+ helpers
+
+---
+ apps/swarmagents/lib/client/files.test.ts     | 191 +++++++++++
+ apps/swarmagents/lib/client/files.ts          | 296 ++++++++++++++++++
+ apps/swarmagents/minimalist-ui/src/App.tsx    |   2 +-
+ .../src/components/ComputerScreen.tsx         |  24 +-
+ .../src/components/FilesView.tsx              | 268 ++++++++++++++++
+ .../src/components/RoleAndVmBar.tsx           |  14 +-
+ 6 files changed, 788 insertions(+), 7 deletions(-)
+ create mode 100644 apps/swarmagents/lib/client/files.test.ts
+ create mode 100644 apps/swarmagents/lib/client/files.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/FilesView.tsx
+
+diff --git a/apps/swarmagents/lib/client/files.test.ts b/apps/swarmagents/lib/client/files.test.ts
+new file mode 100644
+index 000000000..022ff43b8
+--- /dev/null
++++ b/apps/swarmagents/lib/client/files.test.ts
+@@ -0,0 +1,191 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import {
++  FileBrowserError,
++  WORKSPACE_ROOT,
++  describeFilesError,
++  fetchWorkspaceFile,
++  fetchWorkspaceListing,
++  formatBytes,
++  joinWorkspacePath,
++  normalizeWorkspacePath,
++  parentWorkspacePath,
++  type FetchLike,
++} from "./files";
++
++function fakeFetch(body: unknown, init?: ResponseInit & { raw?: string }): FetchLike {
++  return async () =>
++    new Response(init?.raw ?? JSON.stringify(body), {
++      status: init?.status ?? 200,
++      headers: { "content-type": "application/json" },
++    });
++}
++
++test("joins a directory and an entry into an absolute workspace path", () => {
++  assert.equal(joinWorkspacePath("/workspace", "src"), "/workspace/src");
++  assert.equal(joinWorkspacePath("/workspace/src", "app.ts"), "/workspace/src/app.ts");
++  assert.equal(joinWorkspacePath("/workspace/", "notes.md"), "/workspace/notes.md");
++  assert.equal(joinWorkspacePath("", "notes.md"), "/workspace/notes.md");
++});
++
++test("normalizes relative, duplicate-slash, and dot paths", () => {
++  assert.equal(normalizeWorkspacePath("notes.md"), "/workspace/notes.md");
++  assert.equal(normalizeWorkspacePath("/workspace//src/./app.ts"), "/workspace/src/app.ts");
++  assert.equal(normalizeWorkspacePath(""), WORKSPACE_ROOT);
++  assert.equal(normalizeWorkspacePath(null), WORKSPACE_ROOT);
++});
++
++test("path joining rejects traversal instead of clamping it", () => {
++  for (const name of ["..", "../etc", "a/../../b"]) {
++    assert.throws(
++      () => joinWorkspacePath("/workspace/src", name),
++      (err: unknown) => err instanceof FileBrowserError && err.kind === "forbidden",
++      `expected ${name} to be rejected`,
++    );
++  }
++});
++
++test("paths outside the workspace and invalid names are refused", () => {
++  assert.throws(
++    () => normalizeWorkspacePath("/etc/passwd"),
++    (err: unknown) => err instanceof FileBrowserError && err.kind === "forbidden",
++  );
++  assert.throws(
++    () => normalizeWorkspacePath("/workspace/a\u0000b"),
++    (err: unknown) => err instanceof FileBrowserError && err.kind === "invalid_path",
++  );
++  assert.throws(
++    () => normalizeWorkspacePath("/workspace\\a"),
++    (err: unknown) => err instanceof FileBrowserError && err.kind === "invalid_path",
++  );
++  assert.throws(
++    () => joinWorkspacePath("/workspace", "  "),
++    (err: unknown) => err instanceof FileBrowserError && err.kind === "invalid_path",
++  );
++});
++
++test("parentWorkspacePath walks up and stops at the root", () => {
++  assert.equal(parentWorkspacePath("/workspace/src/app.ts"), "/workspace/src");
++  assert.equal(parentWorkspacePath("/workspace/src"), "/workspace");
++  assert.equal(parentWorkspacePath("/workspace"), null);
++});
++
++test("fetchWorkspaceListing parses entries and builds the request URL", async () => {
++  let seen = "";
++  const fetchImpl: FetchLike = async (input) => {
++    seen = String(input);
++    return new Response(
++      JSON.stringify({
++        path: "/workspace",
++        kind: "directory",
++        root: "/workspace",
++        parent: null,
++        entries: [{ name: "src", path: "/workspace/src", type: "directory", size: 0 }],
++      }),
++      { status: 200 },
++    );
++  };
++
++  const listing = await fetchWorkspaceListing("/workspace", { fetchImpl });
++  assert.equal(listing.path, "/workspace");
++  assert.equal(listing.parent, null);
++  assert.equal(listing.entries[0].name, "src");
++  assert.equal(listing.entries[0].type, "directory");
++  assert.match(seen, /^\/api\/runtime\/vm\/files\?path=%2Fworkspace$/);
++});
++
++test("fetchWorkspaceFile requests read=1 and keeps the binary/truncated flags", async () => {
++  let seen = "";
++  const fetchImpl: FetchLike = async (input) => {
++    seen = String(input);
++    return new Response(
++      JSON.stringify({
++        path: "/workspace/big.txt",
++        kind: "file",
++        size: 2_000_000,
++        truncated: true,
++        binary: false,
++        limit: 1_048_576,
++        content: "x",
++      }),
++      { status: 200 },
++    );
++  };
++
++  const file = await fetchWorkspaceFile("/workspace/big.txt", { fetchImpl });
++  assert.match(seen, /read=1/);
++  assert.equal(file.truncated, true);
++  assert.equal(file.limit, 1_048_576);
++  assert.equal(file.content, "x");
++});
++
++test("maps API error codes to typed error states", async () => {
++  const cases: Array<{ status: number; code: string; kind: FileBrowserError["kind"] }> = [
++    { status: 401, code: "unauthorized", kind: "unauthorized" },
++    { status: 403, code: "outside_workspace", kind: "forbidden" },
++    { status: 404, code: "not_found", kind: "not_found" },
++    { status: 400, code: "is_a_directory", kind: "bad_request" },
++    { status: 501, code: "unsupported", kind: "unsupported" },
++    { status: 500, code: "vm_error", kind: "server" },
++  ];
++
++  for (const c of cases) {
++    await assert.rejects(
++      fetchWorkspaceListing("/workspace", {
++        fetchImpl: fakeFetch({ error: "nope", code: c.code }, { status: c.status }),
++      }),
++      (err: unknown) => {
++        assert.ok(err instanceof FileBrowserError);
++        assert.equal(err.kind, c.kind);
++        assert.equal(err.status, c.status);
++        assert.equal(err.code, c.code);
++        assert.equal(err.message, "nope");
++        return true;
++      },
++      `expected ${c.status}/${c.code}`,
++    );
++  }
++});
++
++test("a network failure becomes a network error", async () => {
++  const fetchImpl: FetchLike = async () => {
++    throw new TypeError("fetch failed");
++  };
++  await assert.rejects(
++    fetchWorkspaceListing("/workspace", { fetchImpl }),
++    (err: unknown) => err instanceof FileBrowserError && err.kind === "network",
++  );
++});
++
++test("a success response with the wrong shape is a malformed error", async () => {
++  await assert.rejects(
++    fetchWorkspaceListing("/workspace", { fetchImpl: fakeFetch({ nope: true }) }),
++    (err: unknown) => err instanceof FileBrowserError && err.kind === "malformed",
++  );
++  await assert.rejects(
++    fetchWorkspaceListing("/workspace", { fetchImpl: fakeFetch(null, { raw: "not json" }) }),
++    (err: unknown) => err instanceof FileBrowserError && err.kind === "malformed",
++  );
++});
++
++test("abort errors are rethrown untouched so effects can ignore them", async () => {
++  const fetchImpl: FetchLike = async () => {
++    const err = new Error("aborted");
++    err.name = "AbortError";
++    throw err;
++  };
++  await assert.rejects(
++    fetchWorkspaceListing("/workspace", { fetchImpl }),
++    (err: unknown) => err instanceof Error && err.name === "AbortError",
++  );
++});
++
++test("formatBytes and describeFilesError produce friendly text", () => {
++  assert.equal(formatBytes(0), "0 B");
++  assert.equal(formatBytes(512), "512 B");
++  assert.equal(formatBytes(1536), "1.5 KB");
++  assert.equal(formatBytes(1024 * 1024), "1.0 MB");
++  assert.equal(describeFilesError(new FileBrowserError("not_found", "Missing.")), "Missing.");
++  assert.equal(describeFilesError(new Error("boom")), "boom");
++  assert.equal(describeFilesError("weird"), "Could not load the VM filesystem.");
++});
+diff --git a/apps/swarmagents/lib/client/files.ts b/apps/swarmagents/lib/client/files.ts
+new file mode 100644
+index 000000000..7825b6efe
+--- /dev/null
++++ b/apps/swarmagents/lib/client/files.ts
+@@ -0,0 +1,296 @@
++/**
++ * Client helpers for the workspace file browser.
++ *
++ * The UI never talks to the VM directly; it goes through
++ * GET /api/runtime/vm/files. These helpers build the request URLs, keep paths
++ * scoped to /workspace, and turn the API's error payloads into a typed
++ * FileBrowserError the views can render.
++ */
++
++/** Root of the per-user persistent volume, mirrored from lib/vm/files. */
++export const WORKSPACE_ROOT = "/workspace";
++
++export type WorkspaceEntryType = "file" | "directory" | "other";
++
++export interface WorkspaceEntry {
++  name: string;
++  path: string;
++  type: WorkspaceEntryType;
++  size: number;
++  modifiedAt?: number;
++}
++
++export interface WorkspaceListing {
++  path: string;
++  kind: "directory";
++  root: string;
++  parent: string | null;
++  entries: WorkspaceEntry[];
++}
++
++export interface WorkspaceFile {
++  path: string;
++  kind: "file";
++  size: number;
++  truncated: boolean;
++  binary: boolean;
++  /** Byte cap the API enforced for this read (1 MB). */
++  limit: number;
++  /** Present only for non-binary files. */
++  content?: string;
++}
++
++/** Categories the UI can render for a failed file request. */
++export type FileBrowserErrorKind =
++  | "invalid_path"
++  | "forbidden"
++  | "unauthorized"
++  | "not_found"
++  | "bad_request"
++  | "unsupported"
++  | "network"
++  | "server"
++  | "malformed";
++
++export class FileBrowserError extends Error {
++  readonly kind: FileBrowserErrorKind;
++  readonly status?: number;
++  readonly code?: string;
++
++  constructor(
++    kind: FileBrowserErrorKind,
++    message: string,
++    extra?: { status?: number; code?: string },
++  ) {
++    super(message);
++    this.name = "FileBrowserError";
++    this.kind = kind;
++    this.status = extra?.status;
++    this.code = extra?.code;
++  }
++}
++
++const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
++
++function pathError(kind: FileBrowserErrorKind, message: string): FileBrowserError {
++  return new FileBrowserError(kind, message);
++}
++
++/**
++ * Normalize a path to an absolute path inside /workspace.
++ *
++ * Relative paths are taken relative to /workspace, "." segments are dropped,
++ * and ".." (or anything that escapes the workspace) is refused rather than
++ * silently clamped.
++ */
++export function normalizeWorkspacePath(raw: string | null | undefined): string {
++  const input = (raw ?? "").trim();
++  if (!input) return WORKSPACE_ROOT;
++  if (CONTROL_CHARS.test(input)) {
++    throw pathError("invalid_path", "Path contains control characters.");
++  }
++  if (input.includes("\\")) {
++    throw pathError("invalid_path", "Path contains a backslash.");
++  }
++
++  const absolute = input.startsWith("/") ? input : `${WORKSPACE_ROOT}/${input}`;
++  const segments: string[] = [];
++  for (const segment of absolute.split("/")) {
++    if (!segment || segment === ".") continue;
++    if (segment === "..") {
++      throw pathError("forbidden", "Path traversal is not allowed.");
++    }
++    segments.push(segment);
++  }
++
++  const resolved = `/${segments.join("/")}`;
++  if (resolved !== WORKSPACE_ROOT && !resolved.startsWith(`${WORKSPACE_ROOT}/`)) {
++    throw pathError("forbidden", `Path must stay inside ${WORKSPACE_ROOT}.`);
++  }
++  return resolved;
++}
++
++/** Join a directory path and a child name into a normalized workspace path. */
++export function joinWorkspacePath(dir: string, name: string): string {
++  const base = normalizeWorkspacePath(dir);
++  const child = (name ?? "").trim();
++  if (!child) {
++    throw pathError("invalid_path", "Entry name is empty.");
++  }
++  if (child.startsWith("/")) {
++    return normalizeWorkspacePath(child);
++  }
++  return normalizeWorkspacePath(`${base}/${child}`);
++}
++
++/** Parent of a workspace path, or null when already at the workspace root. */
++export function parentWorkspacePath(path: string): string | null {
++  const normalized = normalizeWorkspacePath(path);
++  if (normalized === WORKSPACE_ROOT) return null;
++  const idx = normalized.lastIndexOf("/");
++  if (idx <= 0) return null;
++  return normalized.slice(0, idx);
++}
++
++export type FetchLike = typeof fetch;
++
++export interface FilesRequestOptions {
++  signal?: AbortSignal;
++  /** Injectable fetch for tests and SSR-safe callers. */
++  fetchImpl?: FetchLike;
++}
++
++function isAbortError(err: unknown): boolean {
++  return err instanceof Error && err.name === "AbortError";
++}
++
++function requestUrl(path: string, read: boolean): string {
++  const params = new URLSearchParams({ path });
++  if (read) params.set("read", "1");
++  return `/api/runtime/vm/files?${params.toString()}`;
++}
++
++const STATUS_ERROR_KIND: Record<number, FileBrowserErrorKind> = {
++  400: "bad_request",
++  401: "unauthorized",
++  403: "forbidden",
++  404: "not_found",
++  501: "unsupported",
++};
++
++function asObject(value: unknown): Record<string, unknown> | null {
++  return value && typeof value === "object" && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : null;
++}
++
++function asString(value: unknown): string | undefined {
++  return typeof value === "string" ? value : undefined;
++}
++
++function asNumber(value: unknown): number | undefined {
++  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
++}
++
++function parseListing(body: unknown): WorkspaceListing {
++  const obj = asObject(body);
++  if (!obj || obj.kind !== "directory" || !Array.isArray(obj.entries)) {
++    throw new FileBrowserError("malformed", "The VM file API returned an unexpected directory listing.");
++  }
++  const entries: WorkspaceEntry[] = [];
++  for (const raw of obj.entries) {
++    const entry = asObject(raw);
++    const name = asString(entry?.name);
++    const path = asString(entry?.path);
++    const type = asString(entry?.type);
++    if (!entry || !name || !path || !type) {
++      throw new FileBrowserError("malformed", "The VM file API returned an invalid entry.");
++    }
++    const size = asNumber(entry.size) ?? 0;
++    const modifiedAt = asNumber(entry.modifiedAt);
++    entries.push({
++      name,
++      path,
++      type: type === "directory" ? "directory" : type === "file" ? "file" : "other",
++      size,
++      ...(modifiedAt !== undefined ? { modifiedAt } : {}),
++    });
++  }
++  return {
++    path: asString(obj.path) ?? WORKSPACE_ROOT,
++    kind: "directory",
++    root: asString(obj.root) ?? WORKSPACE_ROOT,
++    parent: obj.parent === null ? null : (asString(obj.parent) ?? null),
++    entries,
++  };
++}
++
++function parseFile(body: unknown): WorkspaceFile {
++  const obj = asObject(body);
++  if (!obj || obj.kind !== "file" || typeof obj.binary !== "boolean") {
++    throw new FileBrowserError("malformed", "The VM file API returned an unexpected file payload.");
++  }
++  return {
++    path: asString(obj.path) ?? "",
++    kind: "file",
++    size: asNumber(obj.size) ?? 0,
++    truncated: obj.truncated === true,
++    binary: obj.binary,
++    limit: asNumber(obj.limit) ?? 0,
++    ...(typeof obj.content === "string" ? { content: obj.content } : {}),
++  };
++}
++
++async function requestJson(
++  path: string,
++  read: boolean,
++  parse: (body: unknown) => WorkspaceListing | WorkspaceFile,
++  options: FilesRequestOptions,
++): Promise<WorkspaceListing | WorkspaceFile> {
++  const fetchImpl = options.fetchImpl ?? fetch;
++
++  let res: Response;
++  try {
++    res = await fetchImpl(requestUrl(path, read), { signal: options.signal });
++  } catch (err) {
++    if (isAbortError(err)) throw err;
++    throw new FileBrowserError("network", "Could not reach the VM file API.");
++  }
++
++  let body: unknown = null;
++  try {
++    body = await res.json();
++  } catch {
++    body = null;
++  }
++
++  if (!res.ok) {
++    const obj = asObject(body);
++    const code = asString(obj?.code);
++    const message =
++      asString(obj?.error) ?? `The VM file API returned ${res.status}.`;
++    const kind = STATUS_ERROR_KIND[res.status] ?? "server";
++    throw new FileBrowserError(kind, message, { status: res.status, code });
++  }
++
++  return parse(body);
++}
++
++/** Fetch a directory listing from the VM file API. */
++export async function fetchWorkspaceListing(
++  path: string,
++  options: FilesRequestOptions = {},
++): Promise<WorkspaceListing> {
++  return (await requestJson(path, false, parseListing, options)) as WorkspaceListing;
++}
++
++/** Fetch a capped text preview from the VM file API. */
++export async function fetchWorkspaceFile(
++  path: string,
++  options: FilesRequestOptions = {},
++): Promise<WorkspaceFile> {
++  return (await requestJson(path, true, parseFile, options)) as WorkspaceFile;
++}
++
++/** Human-readable byte size (e.g. "1.5 MB"). */
++export function formatBytes(bytes: number): string {
++  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
++  const units = ["B", "KB", "MB", "GB", "TB"];
++  let value = bytes;
++  let unit = 0;
++  while (value >= 1024 && unit < units.length - 1) {
++    value /= 1024;
++    unit += 1;
++  }
++  const rounded = unit === 0 ? String(Math.round(value)) : value.toFixed(value >= 10 ? 0 : 1);
++  return `${rounded} ${units[unit]}`;
++}
++
++/** Message suitable for an inline error state; unknown errors fall back safely. */
++export function describeFilesError(err: unknown): string {
++  if (err instanceof FileBrowserError) return err.message;
++  if (err instanceof Error && err.message) return err.message;
++  return "Could not load the VM filesystem.";
++}
++
++export { isAbortError };
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index e72f36238..e6a3ee121 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -32,7 +32,7 @@ export default function App() {
+ 
+   const [settingsOpen, setSettingsOpen] = useState(false);
+   const [whyOpen, setWhyOpen] = useState(false);
+-  const [activeView, setActiveView] = useState<'telemetry' | 'terminal' | 'browser'>('terminal');
++  const [activeView, setActiveView] = useState<'telemetry' | 'terminal' | 'browser' | 'files'>('terminal');
+   const [vmResetting, setVmResetting] = useState(false);
+   const [showLanding, setShowLanding] = useState(true);
+ 
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index 9d5369de9..2251a65d3 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -1,10 +1,11 @@
+ "use client";
+ 
+ import React, { useState } from "react";
+-import { Terminal, Globe, Maximize2, RotateCcw, ShieldCheck, Cpu } from "lucide-react";
++import { Terminal, Globe, Maximize2, RotateCcw, ShieldCheck, Cpu, FileText } from "lucide-react";
+ import type { LogEvent } from "../engine";
+ import { AnsiRenderer } from "../../../components/AnsiRenderer";
+ import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
++import { FilesView } from "./FilesView";
+ 
+ interface ComputerScreenProps {
+   logs: LogEvent[];
+@@ -14,8 +15,8 @@ interface ComputerScreenProps {
+    * current simulated terminal output.
+    */
+   runId?: string;
+-  activeView: "telemetry" | "terminal" | "browser";
+-  onToggleView: (view: "telemetry" | "terminal" | "browser") => void;
++  activeView: "telemetry" | "terminal" | "browser" | "files";
++  onToggleView: (view: "telemetry" | "terminal" | "browser" | "files") => void;
+   onResetVm: () => void;
+   vmResetting: boolean;
+   activeRoleName: string;
+@@ -185,6 +186,13 @@ export function ComputerScreen({
+   const stream = useRunStream(runId);
+   const liveRun = Boolean(runId);
+ 
++  // Each run.finished bumps this token; the Files view watches it and re-reads
++  // the workspace so files written during the run show up without a manual refresh.
++  const filesRefreshToken = stream.items.reduce(
++    (token, item) => (item.kind === "run.finished" ? item.seq : token),
++    0,
++  );
++
+   return (
+     <div className="w-full max-w-5xl mx-auto rounded-3xl bg-[#0d0d12] border border-white/15 shadow-[0_25px_70px_rgba(0,0,0,0.8)] overflow-hidden flex flex-col mb-6 backdrop-blur-2xl">
+       {/* 1. OS Window Titlebar */}
+@@ -222,6 +230,14 @@ export function ComputerScreen({
+           >
+             <Globe className="w-3 h-3" /> Browser
+           </button>
++          <button
++            onClick={() => onToggleView("files")}
++            className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-[11px] font-mono transition-colors ${
++              activeView === "files" ? "bg-white/20 text-white font-medium" : "text-white/40 hover:text-white"
++            }`}
++          >
++            <FileText className="w-3 h-3" /> Files
++          </button>
+           <button
+             onClick={() => onToggleView("telemetry")}
+             className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-[11px] font-mono transition-colors ${
+@@ -323,6 +339,8 @@ export function ComputerScreen({
+           </div>
+         )}
+ 
++        {activeView === "files" && <FilesView refreshToken={filesRefreshToken} />}
++
+         {activeView === "telemetry" && (
+           <div className="flex-1 p-6 grid place-items-center text-center">
+             <div className="max-w-md">
+diff --git a/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx b/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx
+new file mode 100644
+index 000000000..a5022201b
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx
+@@ -0,0 +1,268 @@
++"use client";
++
++import React, { useCallback, useEffect, useState } from "react";
++import {
++  AlertTriangle,
++  ChevronLeft,
++  File as FileIcon,
++  FileText,
++  Folder,
++  Loader2,
++  RefreshCw,
++  X,
++} from "lucide-react";
++import {
++  WORKSPACE_ROOT,
++  describeFilesError,
++  fetchWorkspaceFile,
++  fetchWorkspaceListing,
++  formatBytes,
++  joinWorkspacePath,
++  parentWorkspacePath,
++  type WorkspaceEntry,
++  type WorkspaceFile,
++  type WorkspaceListing,
++} from "../../../lib/client/files";
++
++interface FilesViewProps {
++  /**
++   * Monotonic token that changes when the current run emits run.finished, so
++   * the listing and open preview re-read the workspace after the agent writes.
++   */
++  refreshToken?: number;
++}
++
++function isAbort(err: unknown): boolean {
++  return err instanceof Error && err.name === "AbortError";
++}
++
++function entryIcon(entry: WorkspaceEntry) {
++  if (entry.type === "directory") return <Folder className="h-3.5 w-3.5 text-cyan-400/80" />;
++  if (entry.type === "file") return <FileText className="h-3.5 w-3.5 text-white/50" />;
++  return <FileIcon className="h-3.5 w-3.5 text-white/30" />;
++}
++
++export function FilesView({ refreshToken = 0 }: FilesViewProps) {
++  const [path, setPath] = useState(WORKSPACE_ROOT);
++  const [listing, setListing] = useState<WorkspaceListing>();
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState<string>();
++  const [reload, setReload] = useState(0);
++
++  const [selected, setSelected] = useState<string>();
++  const [file, setFile] = useState<WorkspaceFile>();
++  const [fileLoading, setFileLoading] = useState(false);
++  const [fileError, setFileError] = useState<string>();
++
++  // Directory listing (also reloads when a run finishes or the user refreshes).
++  useEffect(() => {
++    const ctrl = new AbortController();
++    setLoading(true);
++    setError(undefined);
++    fetchWorkspaceListing(path, { signal: ctrl.signal })
++      .then((data) => {
++        if (ctrl.signal.aborted) return;
++        setListing(data);
++      })
++      .catch((err) => {
++        if (isAbort(err) || ctrl.signal.aborted) return;
++        setError(describeFilesError(err));
++      })
++      .finally(() => {
++        if (!ctrl.signal.aborted) setLoading(false);
++      });
++    return () => ctrl.abort();
++  }, [path, refreshToken, reload]);
++
++  // Open file preview (re-read on refresh so the agent's latest writes show).
++  useEffect(() => {
++    if (!selected) {
++      setFile(undefined);
++      setFileError(undefined);
++      setFileLoading(false);
++      return;
++    }
++    const ctrl = new AbortController();
++    setFileLoading(true);
++    setFileError(undefined);
++    fetchWorkspaceFile(selected, { signal: ctrl.signal })
++      .then((data) => {
++        if (ctrl.signal.aborted) return;
++        setFile(data);
++      })
++      .catch((err) => {
++        if (isAbort(err) || ctrl.signal.aborted) return;
++        setFile(undefined);
++        setFileError(describeFilesError(err));
++      })
++      .finally(() => {
++        if (!ctrl.signal.aborted) setFileLoading(false);
++      });
++    return () => ctrl.abort();
++  }, [selected, refreshToken, reload]);
++
++  const navigate = useCallback((next: string) => {
++    setPath(next);
++    setSelected(undefined);
++    setFile(undefined);
++    setFileError(undefined);
++  }, []);
++
++  const openEntry = useCallback(
++    (entry: WorkspaceEntry) => {
++      if (entry.type === "directory") {
++        navigate(joinWorkspacePath(path, entry.name));
++        return;
++      }
++      setSelected(entry.path);
++    },
++    [navigate, path],
++  );
++
++  const parent = parentWorkspacePath(path);
++  const selectedName = selected ? selected.slice(selected.lastIndexOf("/") + 1) : undefined;
++
++  return (
++    <div className="flex flex-1 min-h-0 flex-col">
++      {/* Toolbar: path + refresh */}
++      <div className="flex items-center gap-2 border-b border-white/10 bg-[#0f0f15] px-3 py-2">
++        <button
++          onClick={() => parent && navigate(parent)}
++          disabled={!parent}
++          title="Up one folder"
++          className="grid h-6 w-6 place-items-center rounded-lg text-white/50 transition hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-25"
++        >
++          <ChevronLeft className="h-3.5 w-3.5" />
++        </button>
++        <div className="min-w-0 flex-1 truncate font-mono text-[11px] text-white/60">
++          {path}
++        </div>
++        {refreshToken > 0 && (
++          <span className="rounded-full border border-emerald-400/20 bg-emerald-400/10 px-2 py-0.5 text-[10px] font-mono text-emerald-300/80">
++            synced
++          </span>
++        )}
++        <button
++          onClick={() => setReload((n) => n + 1)}
++          title="Refresh"
++          className="flex items-center gap-1.5 rounded-lg px-2 py-1 text-[11px] font-mono text-white/50 transition hover:bg-white/10 hover:text-white"
++        >
++          <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
++          <span>Refresh</span>
++        </button>
++      </div>
++
++      <div className="flex min-h-0 flex-1">
++        {/* Directory listing */}
++        <div className="flex min-w-0 flex-1 flex-col overflow-y-auto border-r border-white/10 scrollbar-thin">
++          {error ? (
++            <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
++              <AlertTriangle className="h-5 w-5 text-rose-400/70" />
++              <div className="text-xs text-rose-300/90">{error}</div>
++              <button
++                onClick={() => setReload((n) => n + 1)}
++                className="rounded-lg border border-white/10 px-2.5 py-1 text-[11px] text-white/60 hover:bg-white/10 hover:text-white"
++              >
++                Try again
++              </button>
++            </div>
++          ) : loading && !listing ? (
++            <div className="flex flex-1 items-center justify-center gap-2 p-6 text-xs text-white/40">
++              <Loader2 className="h-4 w-4 animate-spin" /> Loading workspace…
++            </div>
++          ) : listing && listing.entries.length === 0 ? (
++            <div className="flex flex-1 flex-col items-center justify-center gap-1 p-6 text-center">
++              <Folder className="h-5 w-5 text-white/25" />
++              <div className="text-xs text-white/40">This folder is empty.</div>
++            </div>
++          ) : (
++            <div className="p-1.5">
++              {listing?.entries.map((entry) => {
++                const active = selected === entry.path;
++                return (
++                  <button
++                    key={entry.path}
++                    onClick={() => openEntry(entry)}
++                    className={`flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left font-mono text-[11px] transition-colors ${
++                      active ? "bg-white/15 text-white" : "text-white/70 hover:bg-white/[0.07]"
++                    }`}
++                  >
++                    {entryIcon(entry)}
++                    <span className="min-w-0 flex-1 truncate">{entry.name}</span>
++                    {entry.type === "file" && (
++                      <span className="shrink-0 text-[10px] text-white/30">{formatBytes(entry.size)}</span>
++                    )}
++                  </button>
++                );
++              })}
++            </div>
++          )}
++        </div>
++
++        {/* Preview pane */}
++        <div className="flex min-w-0 flex-1 flex-col">
++          {!selected ? (
++            <div className="flex flex-1 flex-col items-center justify-center gap-1 p-6 text-center">
++              <FileText className="h-5 w-5 text-white/20" />
++              <div className="text-xs text-white/40">Select a file to preview it.</div>
++              <div className="max-w-[220px] text-[10px] leading-relaxed text-white/25">
++                Text previews are capped by the API; binary files show a notice instead of content.
++              </div>
++            </div>
++          ) : (
++            <>
++              <div className="flex items-center gap-2 border-b border-white/10 bg-[#0f0f15] px-3 py-1.5">
++                <FileText className="h-3.5 w-3.5 shrink-0 text-white/40" />
++                <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-white/70">
++                  {selectedName}
++                </span>
++                {file && <span className="shrink-0 text-[10px] text-white/30">{formatBytes(file.size)}</span>}
++                <button
++                  onClick={() => setSelected(undefined)}
++                  title="Close preview"
++                  className="grid h-5 w-5 place-items-center rounded text-white/40 hover:bg-white/10 hover:text-white"
++                >
++                  <X className="h-3 w-3" />
++                </button>
++              </div>
++
++              {fileLoading ? (
++                <div className="flex flex-1 items-center justify-center gap-2 p-6 text-xs text-white/40">
++                  <Loader2 className="h-4 w-4 animate-spin" /> Reading file…
++                </div>
++              ) : fileError ? (
++                <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
++                  <AlertTriangle className="h-5 w-5 text-rose-400/70" />
++                  <div className="text-xs text-rose-300/90">{fileError}</div>
++                </div>
++              ) : file?.binary ? (
++                <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
++                  <AlertTriangle className="h-5 w-5 text-amber-400/70" />
++                  <div className="text-xs text-white/60">Binary file — preview unavailable.</div>
++                  <div className="text-[10px] text-white/30">
++                    {formatBytes(file.size)} · detected as binary by the file API.
++                  </div>
++                </div>
++              ) : (
++                <div className="flex min-h-0 flex-1 flex-col">
++                  <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-relaxed text-white/75 scrollbar-thin">
++                    {file?.content ?? ""}
++                  </pre>
++                  {file?.truncated && (
++                    <div className="flex items-center gap-1.5 border-t border-amber-400/20 bg-amber-400/10 px-3 py-1.5 text-[10px] text-amber-200/80">
++                      <AlertTriangle className="h-3 w-3 shrink-0" />
++                      <span>
++                        Preview truncated at the {formatBytes(file.limit)} limit — showing the first{" "}
++                        {formatBytes(file.limit)} of {formatBytes(file.size)}.
++                      </span>
++                    </div>
++                  )}
++                </div>
++              )}
++            </>
++          )}
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx b/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
+index 5cdde80db..309a53869 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import React, { useState } from "react";
+-import { RefreshCw, Monitor, Terminal, Globe, Cpu, Sliders, ChevronDown } from "lucide-react";
++import { RefreshCw, Monitor, Terminal, Globe, Cpu, Sliders, ChevronDown, FileText } from "lucide-react";
+ import { ROLES, DEFAULT_MCP_SKILLS, type RolePreset, type RotationStrategy, type ProviderConfig } from "../data";
+ import { RoleIcon } from "./RoleIcon";
+ 
+@@ -14,8 +14,8 @@ interface RoleAndVmBarProps {
+   onOpenSettings: () => void;
+   onResetVm: () => void;
+   vmResetting: boolean;
+-  onToggleView: (view: "telemetry" | "terminal" | "browser") => void;
+-  activeView: "telemetry" | "terminal" | "browser";
++  onToggleView: (view: "telemetry" | "terminal" | "browser" | "files") => void;
++  activeView: "telemetry" | "terminal" | "browser" | "files";
+ }
+ 
+ export function RoleAndVmBar({
+@@ -126,6 +126,14 @@ export function RoleAndVmBar({
+           >
+             <Globe className="w-3.5 h-3.5" /> Browser
+           </button>
++          <button
++            onClick={() => onToggleView("files")}
++            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg transition-colors text-[11px] font-mono ${
++              activeView === "files" ? "bg-white/20 text-white font-semibold" : "text-white/50 hover:text-white"
++            }`}
++          >
++            <FileText className="w-3.5 h-3.5" /> Files
++          </button>
+         </div>
+ 
+         {/* Right: Providers Strategy & Reset Linux VM */}
+-- 
+2.55.0
+

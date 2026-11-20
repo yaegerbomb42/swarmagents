@@ -1,0 +1,99 @@
+From 332e2606bb50a55a744e8c40e0d13dcc8535609c Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 23:14:16 +0000
+Subject: [PATCH] [p1] Pin /api/health public in middleware tests; add health
+ route tests
+
+---
+ apps/swarmagents/app/api/health/route.test.ts | 44 +++++++++++++++++++
+ apps/swarmagents/lib/middleware.test.ts       | 23 ++++++++++
+ 2 files changed, 67 insertions(+)
+ create mode 100644 apps/swarmagents/app/api/health/route.test.ts
+
+diff --git a/apps/swarmagents/app/api/health/route.test.ts b/apps/swarmagents/app/api/health/route.test.ts
+new file mode 100644
+index 000000000..5c83bec09
+--- /dev/null
++++ b/apps/swarmagents/app/api/health/route.test.ts
+@@ -0,0 +1,44 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { NextRequest } from "next/server";
++import { GET } from "./route";
++import { USER_HEADER } from "../../../lib/auth";
++
++function request(url: string, headers: Record<string, string> = {}): NextRequest {
++  return new NextRequest(url, { headers });
++}
++
++test("GET /api/health returns public liveness JSON when signed out", async () => {
++  const res = await GET(request("http://localhost/api/health"));
++  assert.notEqual(res.status, 401, "the liveness probe must never require sign-in");
++  assert.equal(res.status, 200);
++  const body = await res.json();
++  assert.equal(typeof body.ok, "boolean");
++  assert.equal(typeof body.version, "string");
++  assert.equal(typeof body.commit, "string");
++  assert.equal(typeof body.board.writable, "boolean");
++  assert.equal(typeof body.providersConfigured, "number");
++  // Signed out, the count covers host provider env keys, not a user.
++  assert.equal(body.providersScope, "host-env");
++});
++
++test("GET /api/health?ready=1 returns readiness JSON (200 or 503), never 401", async () => {
++  const res = await GET(request("http://localhost/api/health?ready=1"));
++  assert.notEqual(res.status, 401, "the readiness probe must never require sign-in");
++  assert.ok(res.status === 200 || res.status === 503, `unexpected readiness status ${res.status}`);
++  const body = await res.json();
++  assert.equal(typeof body.ready, "boolean");
++  assert.equal(body.ready, res.status === 200, "ready must agree with the status code");
++  assert.equal(typeof body.vmDriver.kind, "string");
++  assert.equal(typeof body.vmDriver.ok, "boolean");
++  assert.equal(typeof body.home.writable, "boolean");
++  assert.equal(typeof body.disk.freeMb, "number");
++});
++
++test("GET /api/health counts the signed-in caller's own providers", async () => {
++  const res = await GET(request("http://localhost/api/health", { [USER_HEADER]: "alice" }));
++  assert.equal(res.status, 200);
++  const body = await res.json();
++  assert.equal(body.providersScope, "user");
++  assert.equal(body.providersConfigured, 0);
++});
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index c971b9f25..1778095ec 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -47,6 +47,29 @@ test("returns 401 JSON for unauthenticated API calls instead of redirecting", as
+   assert.deepEqual(await res.json(), { error: "Sign in required." });
+ });
+ 
++test("lets unauthenticated GET /api/health through (public liveness probe)", () => {
++  // Regression pin for the live 401 on GET /api/health (observed 2026-11-11):
++  // /api/health is in PUBLIC, so the probe must pass middleware, never 401.
++  const res = middleware(req("http://swarm.example.com/api/health", { host: "swarm.example.com" }));
++  assert.equal(res.status, 200);
++  assert.equal(res.headers.get("location"), null, "the health probe must not redirect to /login");
++});
++
++test("lets unauthenticated GET /api/health?ready=1 through (public readiness probe)", () => {
++  // PUBLIC matches on pathname, so the ?ready=1 readiness probe is public too.
++  const res = middleware(req("http://swarm.example.com/api/health?ready=1", { host: "swarm.example.com" }));
++  assert.equal(res.status, 200);
++  assert.equal(res.headers.get("location"), null, "the readiness probe must not redirect to /login");
++});
++
++test("does NOT treat /api/health/ready as public (readiness is ?ready=1 on /api/health)", async () => {
++  // There is no /api/health/ready route; it must stay behind sign-in, not be
++  // added to PUBLIC.
++  const res = middleware(req("http://swarm.example.com/api/health/ready", { host: "swarm.example.com" }));
++  assert.equal(res.status, 401);
++  assert.deepEqual(await res.json(), { error: "Sign in required." });
++});
++
+ test("passes authenticated requests through with a valid session cookie", () => {
+   const res = middleware(req("http://swarm.example.com/app", { host: "swarm.example.com", cookie: cookie() }));
+   assert.equal(res.status, 200);
+-- 
+2.55.0
+

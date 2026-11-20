@@ -1,0 +1,1089 @@
+From b8dfb6b958cae9f561778349040da83b41a0ec84 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 03:08:48 +0000
+Subject: [PATCH] [t92] providers: model list fetch, rebased onto per-user
+ providers
+
+---
+ .gitignore                                    |   3 +
+ .../api/providers/[id]/models/route.test.ts   | 268 ++++++++++++++++
+ .../app/api/providers/[id]/models/route.ts    | 100 ++++++
+ apps/swarmagents/components/ProvidersPage.tsx |  82 ++++-
+ apps/swarmagents/lib/providers/index.ts       |  11 +
+ apps/swarmagents/lib/providers/models.test.ts | 232 ++++++++++++++
+ apps/swarmagents/lib/providers/models.ts      | 292 ++++++++++++++++++
+ 7 files changed, 987 insertions(+), 1 deletion(-)
+ mode change 100755 => 100644 .gitignore
+ create mode 100644 apps/swarmagents/app/api/providers/[id]/models/route.test.ts
+ create mode 100644 apps/swarmagents/app/api/providers/[id]/models/route.ts
+ create mode 100644 apps/swarmagents/lib/providers/models.test.ts
+ create mode 100644 apps/swarmagents/lib/providers/models.ts
+
+diff --git a/.gitignore b/.gitignore
+old mode 100755
+new mode 100644
+index 33a7f028a..99af1b559
+--- a/.gitignore
++++ b/.gitignore
+@@ -80,6 +80,9 @@ _dist_old_bak/
+ *.gguf
+ *.pack
+ models/
++# Exception: the models-list API route lives in a directory named `models`
++# (source files, not binaries) — keep it tracked.
++!apps/swarmagents/app/api/providers/\[id\]/models/
+ 
+ # Build output / deps / runtime junk (anywhere)
+ node_modules/
+diff --git a/apps/swarmagents/app/api/providers/[id]/models/route.test.ts b/apps/swarmagents/app/api/providers/[id]/models/route.test.ts
+new file mode 100644
+index 000000000..10f23da3b
+--- /dev/null
++++ b/apps/swarmagents/app/api/providers/[id]/models/route.test.ts
+@@ -0,0 +1,268 @@
++/**
++ * Tests for POST /api/providers/[id]/models.
++ *
++ * The endpoint fetches the provider's own /models list server-side with the
++ * signed-in user's stored key, caches it for 10 minutes under the owner's
++ * cache key, and returns ids only. No response may ever carry key material.
++ * All upstream calls are stubbed — no live provider is ever contacted.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { POST } from "./route";
++import { clearModelListCache } from "../../../../../lib/providers/models";
++import {
++  configureProviderStorePaths,
++  saveProvider,
++} from "../../../../../lib/providers/store";
++
++const KEY = "sk-secret-test-aaaa";
++
++let tempDir: string;
++let providersFile: string;
++
++/** Requests without the user header act as the local-mode owner. */
++const OWNER = "local";
++
++/** Calls the stubbed upstream fetch records, in order. */
++let calls: { url: string; init: Record<string, unknown> }[];
++
++test.beforeEach(() => {
++  tempDir = mkdtempSync(join(tmpdir(), "swarm-provider-models-route-"));
++  providersFile = join(tempDir, "providers.json");
++  configureProviderStorePaths(providersFile);
++  clearModelListCache();
++  calls = [];
++  delete process.env.SWARM_KEYS_OPENAI;
++  delete process.env.SWARM_KEYS_ANTHROPIC;
++  delete process.env.SWARM_KEYS_GEMINI;
++  delete process.env.SWARM_KEYS_OLLAMA;
++});
++
++test.afterEach(() => {
++  rmSync(tempDir, { recursive: true, force: true });
++});
++
++function ctx(id: string): { params: Promise<{ id: string }> } {
++  return { params: Promise.resolve({ id }) };
++}
++
++function post(id: string, body?: unknown): Promise<Response> {
++  const init: RequestInit =
++    body === undefined
++      ? { method: "POST" }
++      : {
++          method: "POST",
++          headers: { "content-type": "application/json" },
++          body: JSON.stringify(body),
++        };
++  return POST(new Request(`http://localhost/api/providers/${id}/models`, init), ctx(id));
++}
++
++function stubFetch(makeResponse: () => Response): typeof fetch {
++  return (async (url: string, init?: Record<string, unknown>) => {
++    calls.push({ url, init: init ?? {} });
++    return makeResponse();
++  }) as unknown as typeof fetch;
++}
++
++function withFetch<T>(makeResponse: () => Response, run: () => Promise<T>): Promise<T> {
++  const originalFetch = globalThis.fetch;
++  globalThis.fetch = stubFetch(makeResponse);
++  return run().finally(() => {
++    globalThis.fetch = originalFetch;
++  });
++}
++
++function modelsResponse(ids: string[]): Response {
++  return new Response(JSON.stringify({ data: ids.map((id) => ({ id })) }), {
++    status: 200,
++    headers: { "content-type": "application/json" },
++  });
++}
++
++test("POST returns the provider's model ids only, from its /models endpoint", async () => {
++  saveProvider(OWNER, { id: "openai", apiKey: KEY });
++
++  await withFetch(() => modelsResponse(["gpt-4.1", "gpt-4o-mini"]), async () => {
++    const res = await post("openai");
++    assert.equal(res.status, 200);
++    const text = await res.text();
++    assert.equal(text.includes(KEY), false, "response leaked the key");
++    const body = JSON.parse(text) as {
++      models: string[];
++      cached: boolean;
++      fetchedAt: number;
++    };
++    assert.deepEqual(body.models, ["gpt-4.1", "gpt-4o-mini"]);
++    assert.equal(body.cached, false);
++    assert.equal(typeof body.fetchedAt, "number");
++
++    assert.equal(calls.length, 1);
++    assert.equal(calls[0].url, "https://api.openai.com/v1/models");
++    const headers = calls[0].init.headers as Record<string, string>;
++    assert.equal(headers.authorization, `Bearer ${KEY}`);
++  });
++});
++
++test("POST serves the second call from the 10-minute cache without refetching", async () => {
++  saveProvider(OWNER, { id: "openai", apiKey: KEY });
++
++  await withFetch(() => modelsResponse(["gpt-4.1"]), async () => {
++    const first = await post("openai");
++    assert.equal(first.status, 200);
++    assert.equal(calls.length, 1);
++
++    const second = await post("openai");
++    assert.equal(second.status, 200);
++    assert.equal(calls.length, 1, "second call refetched instead of using the cache");
++    const body = JSON.parse(await second.text()) as { cached: boolean; models: string[] };
++    assert.equal(body.cached, true);
++    assert.deepEqual(body.models, ["gpt-4.1"]);
++  });
++});
++
++test("POST uses the Anthropic /v1/models endpoint with the x-api-key header", async () => {
++  saveProvider(OWNER, { id: "anthropic", apiKey: KEY });
++
++  await withFetch(() => modelsResponse(["claude-sonnet-4-5", "claude-haiku-4-5"]), async () => {
++    const res = await post("anthropic");
++    assert.equal(res.status, 200);
++    const body = JSON.parse(await res.text()) as { models: string[] };
++    assert.deepEqual(body.models, ["claude-haiku-4-5", "claude-sonnet-4-5"]);
++
++    assert.equal(calls.length, 1);
++    assert.equal(calls[0].url, "https://api.anthropic.com/v1/models");
++    const headers = calls[0].init.headers as Record<string, string>;
++    assert.equal(headers["x-api-key"], KEY);
++    assert.equal(headers["anthropic-version"], "2023-06-01");
++  });
++});
++
++test("POST parses Gemini's models list, strips the models/ prefix, and drops non-generative models", async () => {
++  saveProvider(OWNER, { id: "gemini", apiKey: KEY });
++
++  const makeResponse = () =>
++    new Response(
++      JSON.stringify({
++        models: [
++          { name: "models/gemini-2.5-pro", supportedGenerationMethods: ["generateContent"] },
++          { name: "models/gemini-embedding-001", supportedGenerationMethods: ["embedContent"] },
++          { name: "models/gemini-2.5-flash", supportedGenerationMethods: ["generateContent"] },
++        ],
++      }),
++      { status: 200, headers: { "content-type": "application/json" } }
++    );
++
++  await withFetch(makeResponse, async () => {
++    const res = await post("gemini");
++    assert.equal(res.status, 200);
++    const text = await res.text();
++    assert.equal(text.includes(KEY), false, "response leaked the key");
++    const body = JSON.parse(text) as { models: string[] };
++    assert.deepEqual(body.models, ["gemini-2.5-flash", "gemini-2.5-pro"]);
++
++    assert.equal(calls.length, 1);
++    assert.equal(calls[0].url, "https://generativelanguage.googleapis.com/v1beta/models");
++    const headers = calls[0].init.headers as Record<string, string>;
++    assert.equal(headers["x-goog-api-key"], KEY);
++  });
++});
++
++test("POST accepts a body-supplied key for a provider that is not saved yet", async () => {
++  const bodyKey = "sk-body-key-bbbb";
++  await withFetch(() => modelsResponse(["llama-3.3-70b-versatile"]), async () => {
++    // Groq is a catalog provider with no saved entry: the typed key is used
++    // for this one fetch and must never come back in the response.
++    const res = await post("groq", { apiKey: bodyKey });
++    assert.equal(res.status, 200);
++    const text = await res.text();
++    assert.equal(text.includes(bodyKey), false, "response leaked the body-supplied key");
++    const body = JSON.parse(text) as { models: string[] };
++    assert.deepEqual(body.models, ["llama-3.3-70b-versatile"]);
++
++    assert.equal(calls.length, 1);
++    assert.equal(calls[0].url, "https://api.groq.com/openai/v1/models");
++    const headers = calls[0].init.headers as Record<string, string>;
++    assert.equal(headers.authorization, `Bearer ${bodyKey}`);
++  });
++});
++
++test("POST fetches a local provider without a key", async () => {
++  await withFetch(() => modelsResponse(["llama3.3"]), async () => {
++    const res = await post("ollama");
++    assert.equal(res.status, 200);
++    const body = JSON.parse(await res.text()) as { models: string[] };
++    assert.deepEqual(body.models, ["llama3.3"]);
++
++    assert.equal(calls.length, 1);
++    assert.equal(calls[0].url, "http://localhost:11434/v1/models");
++    const headers = calls[0].init.headers as Record<string, string>;
++    assert.equal(headers.authorization, undefined);
++  });
++});
++
++test("POST returns 401 in server mode without a signed-in user", async () => {
++  const prev = process.env.SWARM_SERVER_MODE;
++  process.env.SWARM_SERVER_MODE = "1";
++  try {
++    await withFetch(() => modelsResponse(["gpt-4.1"]), async () => {
++      const res = await post("openai");
++      assert.equal(res.status, 401);
++      assert.equal(calls.length, 0, "unsigned server-mode request still called upstream");
++    });
++  } finally {
++    if (prev === undefined) delete process.env.SWARM_SERVER_MODE;
++    else process.env.SWARM_SERVER_MODE = prev;
++  }
++});
++
++test("POST returns 404 for an unknown provider", async () => {
++  await withFetch(() => modelsResponse(["gpt-4.1"]), async () => {
++    const res = await post("nope");
++    assert.equal(res.status, 404);
++    const body = JSON.parse(await res.text()) as { error?: string };
++    assert.equal(typeof body.error, "string");
++    assert.equal(calls.length, 0, "unknown provider still called upstream");
++  });
++});
++
++test("POST returns 400 when no key is stored for a non-local provider", async () => {
++  // OpenAI is a built-in router default with no saved entry and no env key.
++  await withFetch(() => modelsResponse(["gpt-4.1"]), async () => {
++    const res = await post("openai");
++    assert.equal(res.status, 400);
++    const body = JSON.parse(await res.text()) as { error?: string };
++    assert.match(body.error ?? "", /key/i);
++    assert.equal(calls.length, 0, "keyless provider still called upstream");
++  });
++});
++
++test("POST surfaces an upstream failure as 502 without key material", async () => {
++  saveProvider(OWNER, { id: "openai", apiKey: KEY });
++
++  // The upstream error body echoes the key — the response must not.
++  const upstream = () => new Response(`unauthorized for ${KEY}`, { status: 401 });
++  await withFetch(upstream, async () => {
++    const res = await post("openai");
++    assert.equal(res.status, 502);
++    const text = await res.text();
++    assert.equal(text.includes(KEY), false, "error response leaked the key");
++    const body = JSON.parse(text) as { error?: string };
++    assert.match(body.error ?? "", /401/);
++  });
++});
++
++test("POST surfaces a non-JSON upstream body as 502", async () => {
++  saveProvider(OWNER, { id: "openai", apiKey: KEY });
++
++  await withFetch(() => new Response("not json", { status: 200 }), async () => {
++    const res = await post("openai");
++    assert.equal(res.status, 502);
++    const body = JSON.parse(await res.text()) as { error?: string };
++    assert.equal(typeof body.error, "string");
++  });
++});
+diff --git a/apps/swarmagents/app/api/providers/[id]/models/route.ts b/apps/swarmagents/app/api/providers/[id]/models/route.ts
+new file mode 100644
+index 000000000..254d50db9
+--- /dev/null
++++ b/apps/swarmagents/app/api/providers/[id]/models/route.ts
+@@ -0,0 +1,100 @@
++/**
++ * Live model list for a single provider: fetches the ids the provider
++ * reports right now from its own /models endpoint (OpenAI-compatible,
++ * Anthropic, or Gemini), caches them server-side for 10 minutes, and
++ * returns ids only.
++ *
++ * The response never carries key material. The fetch uses the provider's
++ * stored key; an optional `apiKey` in the POST body (typed into the Add
++ * form before the provider is saved) is used for that one fetch only — it
++ * is never stored, cached, logged, or echoed back.
++ *
++ * Auth comes from the middleware (every non-public /api/* route is gated),
++ * and the owner comes from the verified session header: the fetch uses the
++ * signed-in user's own stored key (decrypted server-side only), the cache
++ * is keyed by owner, and in server mode host keys are never consulted.
++ */
++
++import { NextResponse } from "next/server";
++import { catalogEntry, providerKindForCatalog } from "@/lib/providers/catalog";
++import { fetchProviderModels, ModelListError } from "@/lib/providers/models";
++import { providerOwner } from "@/lib/providers/owner";
++import { routerProviders } from "@/lib/providers/store";
++import type { ProviderConfig } from "@/lib/providers/types";
++
++export const dynamic = "force-dynamic";
++
++interface RouteContext {
++  params: Promise<{ id: string }>;
++}
++
++const NO_STORE = { "cache-control": "no-store" } as const;
++
++function asRecord(value: unknown): Record<string, unknown> | undefined {
++  return typeof value === "object" && value !== null
++    ? (value as Record<string, unknown>)
++    : undefined;
++}
++
++/**
++ * A provider config for a catalog entry that is not saved (and is not a
++ * built-in router default): the Add form fetches models for it before the
++ * provider exists, so the catalog's kind/baseUrl stand in for the config.
++ */
++function catalogConfig(id: string): ProviderConfig | undefined {
++  const entry = catalogEntry(id);
++  if (!entry) return undefined;
++  return {
++    id: entry.id,
++    kind: providerKindForCatalog(entry),
++    ...(entry.baseUrl ? { baseUrl: entry.baseUrl } : {}),
++  };
++}
++
++/**
++ * Fetch the provider's current model ids.
++ *
++ * Body (optional): { apiKey } — a key typed into the Add form for a provider
++ * that is not saved yet. When omitted, the stored key is used.
++ */
++export async function POST(request: Request, ctx: RouteContext) {
++  const owner = providerOwner(request);
++  if (!owner) {
++    return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++  }
++  const params = await Promise.resolve(ctx.params);
++  const id = typeof params?.id === "string" ? params.id : "";
++  const config =
++    routerProviders(owner).find((p) => p.id === id) ?? catalogConfig(id);
++  if (!config) {
++    return NextResponse.json({ error: "Provider not found." }, { status: 404 });
++  }
++
++  let body: unknown = null;
++  try {
++    body = await request.json();
++  } catch {
++    body = null;
++  }
++  const apiKey = asRecord(body)?.apiKey;
++  const suppliedKey = typeof apiKey === "string" ? apiKey : undefined;
++
++  try {
++    const list = await fetchProviderModels(config, {
++      owner,
++      ...(suppliedKey ? { apiKey: suppliedKey } : {}),
++    });
++    return NextResponse.json(
++      { models: list.models, cached: list.cached, fetchedAt: list.fetchedAt },
++      { headers: NO_STORE }
++    );
++  } catch (err) {
++    if (err instanceof ModelListError) {
++      return NextResponse.json({ error: err.message }, { status: err.status, headers: NO_STORE });
++    }
++    return NextResponse.json(
++      { error: "Could not fetch the model list." },
++      { status: 502, headers: NO_STORE }
++    );
++  }
++}
+diff --git a/apps/swarmagents/components/ProvidersPage.tsx b/apps/swarmagents/components/ProvidersPage.tsx
+index 111cfa654..b83787158 100644
+--- a/apps/swarmagents/components/ProvidersPage.tsx
++++ b/apps/swarmagents/components/ProvidersPage.tsx
+@@ -43,6 +43,10 @@ interface AddDraft {
+   apiKey: string;
+   saving: boolean;
+   error: string;
++  /** Model ids fetched live from the provider (POST /api/providers/[id]/models). */
++  fetchedModels: string[];
++  modelsLoading: boolean;
++  modelsError: string;
+ }
+ 
+ interface KeyDraft {
+@@ -152,7 +156,58 @@ export function ProvidersPage() {
+       apiKey: "",
+       saving: false,
+       error: "",
++      fetchedModels: [],
++      modelsLoading: false,
++      modelsError: "",
+     });
++    // A saved/connected provider has a stored key, so its live model list
++    // can be fetched right away. A brand-new provider fetches on demand
++    // (the "Fetch models" button) once its key is typed in.
++    if (savedById.has(entry.id) || connectedById.has(entry.id)) {
++      void fetchModels(entry);
++    }
++  };
++
++  /**
++   * Fetch the provider's live model ids for the Add form. With no key typed
++   * yet the stored key is used; with one typed in, that key is sent for this
++   * one fetch only (it is never stored by the endpoint). Results land in the
++   * model field's suggestion list.
++   */
++  const fetchModels = async (entry: ProviderCatalogEntry, apiKey = "") => {
++    setDraft((prev) =>
++      prev && prev.entry.id === entry.id
++        ? { ...prev, modelsLoading: true, modelsError: "" }
++        : prev
++    );
++    try {
++      const res = await fetch(`/api/providers/${entry.id}/models`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify(apiKey.trim() !== "" ? { apiKey: apiKey.trim() } : {}),
++      });
++      const body = (await res.json().catch(() => null)) as {
++        models?: string[];
++        error?: string;
++      } | null;
++      if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
++      const models = (body?.models ?? []).filter((m) => typeof m === "string");
++      setDraft((prev) =>
++        prev && prev.entry.id === entry.id
++          ? { ...prev, modelsLoading: false, fetchedModels: models }
++          : prev
++      );
++    } catch (err) {
++      setDraft((prev) =>
++        prev && prev.entry.id === entry.id
++          ? {
++              ...prev,
++              modelsLoading: false,
++              modelsError: err instanceof Error ? err.message : String(err),
++            }
++          : prev
++      );
++    }
+   };
+ 
+   const closeAdd = () => setDraft(null);
+@@ -668,10 +723,35 @@ export function ProvidersPage() {
+                 className="w-full rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 placeholder:text-white/25 focus:outline-none focus:ring-white/30"
+               />
+               <datalist id="provider-models">
+-                {(draft.entry.models?.popular ?? []).map((model) => (
++                {Array.from(
++                  new Set([...draft.fetchedModels, ...(draft.entry.models?.popular ?? [])])
++                ).map((model) => (
+                   <option key={model} value={model} />
+                 ))}
+               </datalist>
++              <span className="mt-1.5 flex items-center gap-2 text-[11px] text-white/40">
++                <button
++                  type="button"
++                  disabled={draft.modelsLoading}
++                  onClick={() => void fetchModels(draft.entry, draft.apiKey)}
++                  className="flex items-center gap-1 rounded-full bg-white/10 px-2.5 py-1 text-[11px] text-white/75 transition hover:bg-white/15 hover:text-white disabled:opacity-50"
++                >
++                  {draft.modelsLoading ? (
++                    <Loader2 className="h-3 w-3 animate-spin" />
++                  ) : (
++                    <RotateCw className="h-3 w-3" />
++                  )}
++                  {draft.modelsLoading ? "Fetching…" : "Fetch live models"}
++                </button>
++                {draft.fetchedModels.length > 0 && !draft.modelsLoading && (
++                  <span className="text-emerald-300/80">
++                    {draft.fetchedModels.length} from provider
++                  </span>
++                )}
++                {draft.modelsError && !draft.modelsLoading && (
++                  <span className="text-red-300/80">{draft.modelsError}</span>
++                )}
++              </span>
+             </label>
+ 
+             <label className="mb-4 block">
+diff --git a/apps/swarmagents/lib/providers/index.ts b/apps/swarmagents/lib/providers/index.ts
+index 2460ddda7..391926183 100644
+--- a/apps/swarmagents/lib/providers/index.ts
++++ b/apps/swarmagents/lib/providers/index.ts
+@@ -102,6 +102,17 @@ export { maskProviderKey, providerKeySlots } from "./keys";
+ export { migrateLegacyProviders } from "./migrate";
+ export type { MigrationResult } from "./migrate";
+ export { providerOwner } from "./owner";
++export {
++  fetchProviderModels,
++  parseModelIds,
++  modelsListUrl,
++  loadProviderKeys,
++  clearModelListCache,
++  ModelListError,
++  MODEL_LIST_TTL_MS,
++  MODEL_LIST_TIMEOUT_MS,
++} from "./models";
++export type { ProviderModelList, FetchProviderModelsOptions } from "./models";
+ export type { ProviderKeySlot } from "./keys";
+ export { providerRow, configModels, countProviderKeys } from "./rows";
+ export type { ProviderRow } from "./rows";
+diff --git a/apps/swarmagents/lib/providers/models.test.ts b/apps/swarmagents/lib/providers/models.test.ts
+new file mode 100644
+index 000000000..ba860f47a
+--- /dev/null
++++ b/apps/swarmagents/lib/providers/models.test.ts
+@@ -0,0 +1,232 @@
++/**
++ * Tests for the live provider model-list fetch (lib/providers/models).
++ *
++ * Covers response parsing per provider kind, the 10-minute cache, and key
++ * resolution. All upstream calls are stubbed — no live provider is ever
++ * contacted.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  fetchProviderModels,
++  parseModelIds,
++  modelsListUrl,
++  clearModelListCache,
++  ModelListError,
++  MODEL_LIST_TTL_MS,
++} from "./models";
++import type { FetchLike, ProviderConfig } from "./types";
++
++const KEY = "sk-secret-test-cccc";
++
++test.beforeEach(() => {
++  clearModelListCache();
++});
++
++function config(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
++  return { id: "openai", kind: "openai", baseUrl: "https://api.openai.com/v1", ...overrides };
++}
++
++function stubFetch(
++  makeResponse: () => Response,
++  calls: { url: string; init: Record<string, unknown> }[]
++): FetchLike {
++  return (async (url: string, init) => {
++    calls.push({ url, init: init as Record<string, unknown> });
++    return makeResponse();
++  }) as FetchLike;
++}
++
++function modelsResponse(ids: string[]): Response {
++  return new Response(JSON.stringify({ data: ids.map((id) => ({ id })) }), {
++    status: 200,
++    headers: { "content-type": "application/json" },
++  });
++}
++
++test("modelsListUrl appends /models to a versioned base and /v1/models otherwise", () => {
++  assert.equal(modelsListUrl("https://api.openai.com/v1", "openai"), "https://api.openai.com/v1/models");
++  assert.equal(modelsListUrl("https://api.perplexity.ai", "openai"), "https://api.perplexity.ai/v1/models");
++  assert.equal(modelsListUrl("https://api.perplexity.ai/", "openai"), "https://api.perplexity.ai/v1/models");
++  assert.equal(
++    modelsListUrl("https://generativelanguage.googleapis.com/v1beta", "gemini"),
++    "https://generativelanguage.googleapis.com/v1beta/models"
++  );
++  assert.equal(
++    modelsListUrl("https://generativelanguage.googleapis.com", "gemini"),
++    "https://generativelanguage.googleapis.com/v1beta/models"
++  );
++  assert.equal(modelsListUrl("https://api.anthropic.com", "anthropic"), "https://api.anthropic.com/v1/models");
++});
++
++test("parseModelIds dedupes and sorts OpenAI-style data entries", () => {
++  assert.deepEqual(
++    parseModelIds({ data: [{ id: "b" }, { id: "a" }, { id: "b" }, {}] }, "openai"),
++    ["a", "b"]
++  );
++  assert.deepEqual(parseModelIds({ data: "nope" }, "openai"), []);
++  assert.deepEqual(parseModelIds("nope", "openai"), []);
++});
++
++test("parseModelIds strips the models/ prefix and drops non-generative Gemini entries", () => {
++  assert.deepEqual(
++    parseModelIds(
++      {
++        models: [
++          { name: "models/gemini-2.5-pro", supportedGenerationMethods: ["generateContent"] },
++          { name: "models/text-embedding-004", supportedGenerationMethods: ["embedContent"] },
++          { name: "models/gemini-2.5-flash" },
++        ],
++      },
++      "gemini"
++    ),
++    ["gemini-2.5-flash", "gemini-2.5-pro"]
++  );
++});
++
++test("fetchProviderModels caches stored-key results and refetches after the TTL", async () => {
++  const calls: { url: string; init: Record<string, unknown> }[] = [];
++  let now = 1_000_000;
++  const options = {
++    fetch: stubFetch(() => modelsResponse(["gpt-4.1"]), calls),
++    env: {},
++    now: () => now,
++    owner: "test-user",
++  };
++
++  const first = await fetchProviderModels(config({ keys: [KEY] }), options);
++  assert.equal(first.cached, false);
++  assert.equal(calls.length, 1);
++
++  const second = await fetchProviderModels(config({ keys: [KEY] }), options);
++  assert.equal(second.cached, true);
++  assert.equal(calls.length, 1);
++
++  now += MODEL_LIST_TTL_MS;
++  const third = await fetchProviderModels(config({ keys: [KEY] }), options);
++  assert.equal(third.cached, false);
++  assert.equal(calls.length, 2, "expired cache entry was not refetched");
++});
++
++test("fetchProviderModels caches per owner and never serves one user's list to another", async () => {
++  const calls: { url: string; init: Record<string, unknown> }[] = [];
++  let now = 1_000_000;
++  const options = {
++    fetch: stubFetch(() => modelsResponse(["gpt-4.1"]), calls),
++    env: {},
++    now: () => now,
++  };
++
++  const aliceFirst = await fetchProviderModels(config({ keys: [KEY] }), { ...options, owner: "alice" });
++  assert.equal(aliceFirst.cached, false);
++  assert.equal(calls.length, 1);
++
++  const aliceSecond = await fetchProviderModels(config({ keys: [KEY] }), { ...options, owner: "alice" });
++  assert.equal(aliceSecond.cached, true);
++  assert.equal(calls.length, 1);
++
++  const bobFirst = await fetchProviderModels(config({ keys: [KEY] }), { ...options, owner: "bob" });
++  assert.equal(bobFirst.cached, false, "bob was served alice's cached list");
++  assert.equal(calls.length, 2);
++
++  const aliceThird = await fetchProviderModels(config({ keys: [KEY] }), { ...options, owner: "alice" });
++  assert.equal(aliceThird.cached, true);
++  assert.equal(calls.length, 2);
++});
++
++test("fetchProviderModels never caches a caller-supplied key fetch", async () => {
++  const calls: { url: string; init: Record<string, unknown> }[] = [];
++  const options = {
++    fetch: stubFetch(() => modelsResponse(["gpt-4.1"]), calls),
++    env: {},
++    owner: "test-user",
++  };
++
++  await fetchProviderModels(config(), { ...options, apiKey: "sk-typed-dddd" });
++  await fetchProviderModels(config(), { ...options, apiKey: "sk-typed-dddd" });
++  assert.equal(calls.length, 2, "caller-supplied key fetch was cached");
++});
++
++test("fetchProviderModels resolves keys from the environment when the config has none", async () => {
++  const calls: { url: string; init: Record<string, unknown> }[] = [];
++  const env = { SWARM_KEYS_OPENAI: ` ${KEY} ` };
++  await fetchProviderModels(config({ keys: undefined }), {
++    fetch: stubFetch(() => modelsResponse(["gpt-4.1"]), calls),
++    env,
++    owner: "test-user",
++  });
++  const headers = calls[0].init.headers as Record<string, string>;
++  assert.equal(headers.authorization, `Bearer ${KEY}`);
++});
++
++test("fetchProviderModels never reads host env keys when hostEnvKeys is false", async () => {
++  const calls: { url: string; init: Record<string, unknown> }[] = [];
++  const env = { SWARM_KEYS_OPENAI: ` ${KEY} ` };
++  await assert.rejects(
++    fetchProviderModels(config({ keys: undefined }), {
++      fetch: stubFetch(() => modelsResponse(["gpt-4.1"]), calls),
++      env,
++      owner: "test-user",
++      hostEnvKeys: false,
++    }),
++    (err: unknown) => {
++      assert.ok(err instanceof ModelListError);
++      assert.equal(err.status, 400);
++      return true;
++    }
++  );
++  assert.equal(calls.length, 0, "server mode must not consult host env keys");
++});
++
++test("fetchProviderModels throws 400 when no key is available", async () => {
++  const calls: { url: string; init: Record<string, unknown> }[] = [];
++  await assert.rejects(
++    fetchProviderModels(config({ keys: [] }), {
++      fetch: stubFetch(() => modelsResponse(["gpt-4.1"]), calls),
++      env: {},
++      owner: "test-user",
++    }),
++    (err: unknown) => {
++      assert.ok(err instanceof ModelListError);
++      assert.equal(err.status, 400);
++      return true;
++    }
++  );
++  assert.equal(calls.length, 0);
++});
++
++test("fetchProviderModels throws 400 when the provider has no model list endpoint", async () => {
++  const calls: { url: string; init: Record<string, unknown> }[] = [];
++  await assert.rejects(
++    fetchProviderModels(
++      { id: "azure-openai", kind: "openai", keys: [KEY] },
++      { fetch: stubFetch(() => modelsResponse(["gpt-4o"]), calls), env: {}, owner: "test-user" }
++    ),
++    (err: unknown) => {
++      assert.ok(err instanceof ModelListError);
++      assert.equal(err.status, 400);
++      return true;
++    }
++  );
++  assert.equal(calls.length, 0);
++});
++
++test("fetchProviderModels throws 502 and redacts the key from upstream errors", async () => {
++  const calls: { url: string; init: Record<string, unknown> }[] = [];
++  const upstream = new Response(`bad key ${KEY}`, { status: 403 });
++  await assert.rejects(
++    fetchProviderModels(config({ keys: [KEY] }), {
++      fetch: stubFetch(() => upstream, calls),
++      env: {},
++      owner: "test-user",
++    }),
++    (err: unknown) => {
++      assert.ok(err instanceof ModelListError);
++      assert.equal(err.status, 502);
++      assert.equal(err.message.includes(KEY), false, "error leaked the key");
++      assert.match(err.message, /403/);
++      return true;
++    }
++  );
++});
+diff --git a/apps/swarmagents/lib/providers/models.ts b/apps/swarmagents/lib/providers/models.ts
+new file mode 100644
+index 000000000..86de0a43b
+--- /dev/null
++++ b/apps/swarmagents/lib/providers/models.ts
+@@ -0,0 +1,292 @@
++/**
++ * Live model lists, fetched from the provider itself.
++ *
++ * The catalog's model ids go stale, so the Add/Edit provider form offers the
++ * ids the provider reports right now: this module calls the provider's
++ * OpenAI-compatible GET /models endpoint (or the catalog-specific equivalent
++ * for Anthropic and Gemini) server-side with the stored key, caches the
++ * result for 10 minutes, and returns ids only.
++ *
++ * Key material never leaves this module: responses carry ids only, upstream
++ * error bodies are redacted with the key before they reach an error message,
++ * and a caller-supplied key (typed into the Add form before the provider is
++ * saved) is used for one fetch only — it is never stored, cached, logged, or
++ * echoed back.
++ *
++ * Per-user isolation: the caller passes the owner, the stored key comes from
++ * that owner's own providers (via routerProviders(owner)), the cache is
++ * keyed by owner + provider id, and host env keys (SWARM_KEYS_*) are only
++ * consulted in local mode — server mode never shares host keys across
++ * accounts.
++ */
++
++import { catalogEntry } from "./catalog";
++import { errorMessage, redact } from "./errors";
++import { serverMode } from "../auth";
++import type { FetchLike, ProviderConfig, ProviderKind } from "./types";
++
++/** How long a fetched model list stays fresh. */
++export const MODEL_LIST_TTL_MS = 10 * 60 * 1000;
++
++/** Per-request timeout for the upstream /models call. */
++export const MODEL_LIST_TIMEOUT_MS = 10_000;
++
++/** A rejected model-list fetch (no key, no endpoint, upstream failure). */
++export class ModelListError extends Error {
++  /** HTTP status the API should answer with. */
++  readonly status: number;
++
++  constructor(message: string, status = 502) {
++    super(message);
++    this.name = "ModelListError";
++    this.status = status;
++  }
++}
++
++export interface ProviderModelList {
++  id: string;
++  models: string[];
++  /** True when this came from the 10-minute cache instead of the provider. */
++  cached: boolean;
++  fetchedAt: number;
++}
++
++export interface FetchProviderModelsOptions {
++  fetch?: FetchLike;
++  /** Environment source for SWARM_KEYS_<PROVIDER>. Defaults to process.env. */
++  env?: Record<string, string | undefined>;
++  /** Injectable clock, primarily for deterministic tests. */
++  now?: () => number;
++  /**
++   * The owner whose stored key (and cache entry) this fetch belongs to.
++   * Required: the model-list cache is keyed by owner, so one user's fetched
++   * list is never served to another user.
++   */
++  owner: string;
++  /**
++   * Let a keyless provider read host env keys (SWARM_KEYS_*). Defaults to
++   * true only in local (single-user) mode; server mode never shares host
++   * keys across accounts (mirrors routerProviders' hostEnvKeys).
++   */
++  hostEnvKeys?: boolean;
++  /**
++   * A key supplied by the caller (e.g. typed into the Add form before the
++   * provider is saved). Takes precedence over the stored key, bypasses the
++   * cache, and is never stored or returned.
++   */
++  apiKey?: string;
++  /** Timeout for the upstream call in ms. Default MODEL_LIST_TIMEOUT_MS. */
++  timeoutMs?: number;
++}
++
++interface CacheEntry {
++  models: string[];
++  fetchedAt: number;
++}
++
++/** In-memory cache, keyed by owner + provider id. Stored-key fetches only. */
++const modelListCache = new Map<string, CacheEntry>();
++
++/** Clear the model-list cache (primarily for tests). */
++export function clearModelListCache(): void {
++  modelListCache.clear();
++}
++
++function dedupe(keys: string[]): string[] {
++  return Array.from(new Set(keys.map((k) => k.trim()).filter(Boolean)));
++}
++
++function envKeysName(config: ProviderConfig): string {
++  if (config.envKeys) return config.envKeys;
++  const suffix = config.id.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
++  return `SWARM_KEYS_${suffix}`;
++}
++
++/**
++ * Keys for a provider: explicit config keys first, then the environment
++ * (mirrors the health checker's resolution). The environment fallback only
++ * applies when `hostEnvKeys` is true — in server mode host keys are never
++ * shared across accounts, so a keyless config resolves to no keys at all.
++ */
++export function loadProviderKeys(
++  config: ProviderConfig,
++  env: Record<string, string | undefined>,
++  hostEnvKeys = !serverMode()
++): string[] {
++  if (config.keys) return dedupe(config.keys);
++  if (!hostEnvKeys) return [];
++  let raw = env[envKeysName(config)];
++  if (raw === undefined && config.id !== config.kind) {
++    raw = env[`SWARM_KEYS_${config.kind.toUpperCase()}`];
++  }
++  return dedupe((raw ?? "").split(","));
++}
++
++function asRecord(value: unknown): Record<string, unknown> | undefined {
++  return typeof value === "object" && value !== null
++    ? (value as Record<string, unknown>)
++    : undefined;
++}
++
++function asString(value: unknown): string | undefined {
++  return typeof value === "string" ? value : undefined;
++}
++
++/**
++ * The provider's model-list URL for its kind.
++ *
++ * OpenAI-compatible and Anthropic providers expose GET /v1/models; Gemini
++ * exposes GET /v1beta/models. A baseUrl that already ends in the version
++ * segment takes just `/models`, otherwise the version segment is appended —
++ * the same join the request adapters use for chat endpoints.
++ */
++export function modelsListUrl(baseUrl: string, kind: ProviderKind): string {
++  const base = baseUrl.replace(/\/+$/, "");
++  if (kind === "gemini") {
++    return base.endsWith("/v1beta") ? `${base}/models` : `${base}/v1beta/models`;
++  }
++  return base.endsWith("/v1") ? `${base}/models` : `${base}/v1/models`;
++}
++
++/** Auth headers for a model-list call, mirroring the request adapters. */
++function headersFor(
++  config: ProviderConfig,
++  apiKey: string | undefined
++): Record<string, string> {
++  const headers: Record<string, string> = { ...config.headers };
++  if (!apiKey) return headers;
++  if (config.kind === "anthropic") {
++    headers["x-api-key"] = apiKey;
++    headers["anthropic-version"] = "2023-06-01";
++  } else if (config.kind === "openai") {
++    headers.authorization = `Bearer ${apiKey}`;
++  } else {
++    headers["x-goog-api-key"] = apiKey;
++  }
++  return headers;
++}
++
++/**
++ * Pull model ids out of a provider's list response.
++ *
++ * OpenAI-compatible and Anthropic answer `{ data: [{ id }] }`; Gemini
++ * answers `{ models: [{ name: "models/<id>", supportedGenerationMethods }] }`
++ * — the `models/` prefix is stripped, and entries that cannot generate
++ * content (embeddings, ...) are dropped when the capability list is present.
++ */
++export function parseModelIds(body: unknown, kind: ProviderKind): string[] {
++  const root = asRecord(body);
++  if (!root) return [];
++  const list = Array.isArray(root.data)
++    ? root.data
++    : Array.isArray(root.models)
++      ? root.models
++      : [];
++  const ids: string[] = [];
++  for (const item of list) {
++    const entry = asRecord(item);
++    if (!entry) continue;
++    if (kind === "gemini") {
++      const methods = entry.supportedGenerationMethods;
++      if (
++        Array.isArray(methods) &&
++        !methods.some((m) => m === "generateContent")
++      ) {
++        continue;
++      }
++    }
++    const raw = asString(entry.id) ?? asString(entry.name);
++    if (!raw) continue;
++    ids.push(raw.startsWith("models/") ? raw.slice("models/".length) : raw);
++  }
++  return [...new Set(ids)].sort();
++}
++
++/**
++ * Fetch a provider's current model ids from the provider itself.
++ *
++ * Uses the owner's stored key (config keys, then the environment in local
++ * mode only); a caller-supplied `apiKey` takes precedence and bypasses the
++ * cache. Stored-key results are cached for MODEL_LIST_TTL_MS under the
++ * owner's cache key. The returned list is ids only — never key material —
++ * and upstream error bodies are redacted before surfacing.
++ */
++export async function fetchProviderModels(
++  config: ProviderConfig,
++  options: FetchProviderModelsOptions
++): Promise<ProviderModelList> {
++  const fetchImpl =
++    options.fetch ?? (globalThis.fetch as FetchLike | undefined);
++  if (!fetchImpl) {
++    throw new ModelListError("No fetch implementation is available.", 502);
++  }
++  const env = options.env ?? process.env;
++  const now = options.now ?? Date.now;
++  const timeoutMs = options.timeoutMs ?? MODEL_LIST_TIMEOUT_MS;
++  const hostEnvKeys = options.hostEnvKeys ?? !serverMode();
++  const fetchedAt = now();
++  // The cache is keyed by owner + provider id: one user's fetched list is
++  // never served to another user.
++  const cacheKey = `${options.owner}:${config.id}`;
++
++  const suppliedKey = options.apiKey?.trim() || undefined;
++  const usingStoredKey = suppliedKey === undefined;
++  if (usingStoredKey) {
++    const cached = modelListCache.get(cacheKey);
++    if (cached && fetchedAt - cached.fetchedAt < MODEL_LIST_TTL_MS) {
++      return { id: config.id, models: cached.models, cached: true, fetchedAt: cached.fetchedAt };
++    }
++  }
++
++  const key = suppliedKey ?? loadProviderKeys(config, env, hostEnvKeys)[0];
++  const isLocal = catalogEntry(config.id)?.isLocal === true;
++  if (!key && !isLocal) {
++    throw new ModelListError("No API key stored for this provider.", 400);
++  }
++
++  // No kind-level default: a provider whose endpoint depends on the account
++  // or resource (Azure, Bedrock, a bare custom id) must have a baseUrl in
++  // its config or catalog entry, otherwise the list call would hit the wrong
++  // host with the user's key.
++  const baseUrl = config.baseUrl ?? catalogEntry(config.id)?.baseUrl;
++  if (!baseUrl) {
++    throw new ModelListError("This provider has no model list endpoint configured.", 400);
++  }
++  const url = modelsListUrl(baseUrl, config.kind);
++
++  const controller = new AbortController();
++  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
++  let response: Awaited<ReturnType<FetchLike>>;
++  try {
++    response = await fetchImpl(url, {
++      method: "GET",
++      headers: headersFor(config, key),
++      signal: controller.signal,
++    });
++  } catch (err) {
++    clearTimeout(timeoutId);
++    throw new ModelListError(`Could not reach ${config.id}: ${errorMessage(err)}`, 502);
++  }
++  clearTimeout(timeoutId);
++
++  if (!response.ok) {
++    const body = await response.text().catch(() => "");
++    const detail = body
++      ? `: ${redact(body.slice(0, 200), key ? [key] : [])}`
++      : "";
++    throw new ModelListError(`Provider returned HTTP ${response.status}${detail}`, 502);
++  }
++
++  const text = await response.text();
++  let json: unknown;
++  try {
++    json = JSON.parse(text);
++  } catch {
++    throw new ModelListError("Provider returned a non-JSON model list.", 502);
++  }
++  const models = parseModelIds(json, config.kind);
++  if (usingStoredKey) {
++    modelListCache.set(cacheKey, { models, fetchedAt });
++  }
++  return { id: config.id, models, cached: false, fetchedAt };
++}
+-- 
+2.55.0
+

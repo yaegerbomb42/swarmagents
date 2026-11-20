@@ -1,0 +1,181 @@
+From f3b09b49dec16f1c30a5605215f2482ccf754b33 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 22:29:18 +0000
+Subject: [PATCH] [t75] e2e: browser view and file browser specs
+
+---
+ apps/swarmagents/e2e/README.md             |   7 +
+ apps/swarmagents/e2e/browser-files.spec.ts | 143 +++++++++++++++++++++
+ 2 files changed, 150 insertions(+)
+ create mode 100644 apps/swarmagents/e2e/browser-files.spec.ts
+
+diff --git a/apps/swarmagents/e2e/README.md b/apps/swarmagents/e2e/README.md
+index ff444699c..c19b71c08 100644
+--- a/apps/swarmagents/e2e/README.md
++++ b/apps/swarmagents/e2e/README.md
+@@ -66,6 +66,13 @@ requests and the dispatch spec is skipped.
+   which makes the fake claude emit a risky Bash tool call. Asserts the approval
+   card appears, Deny resolves it to `denied` with a run error, and Allow resumes
+   the run to `run finished`.
++- `browser-files.spec.ts` - local mode only. After a fake dispatch, opens the
++  Browser view (asserts the "No frame yet" state for a run with no frames, the
++  address bar enabled, and no unexpected console errors — the frame-poll 404
++  is the hook's documented empty state, so it is allowed only when every failed
++  response is that poll) and the Files view (asserts the workspace breadcrumb,
++  a settled listing, the preview empty state, and no console errors), with a
++  screenshot per view.
+ 
+ Every test writes a full-page screenshot (pass or fail) plus an entry in
+ `SCREENSHOT_DIR/summary.json` with `test`, `status`, `error`, and `screenshot`.
+diff --git a/apps/swarmagents/e2e/browser-files.spec.ts b/apps/swarmagents/e2e/browser-files.spec.ts
+new file mode 100644
+index 000000000..a793dd7e2
+--- /dev/null
++++ b/apps/swarmagents/e2e/browser-files.spec.ts
+@@ -0,0 +1,143 @@
++import assert from "node:assert/strict";
++import { after, test } from "node:test";
++import type { Page } from "playwright-core";
++import { captureView, closeBrowser, mode, openWorkspace, runPageTest } from "./lib";
++import { FAKE_CLAUDE_ASSISTANT_TEXT } from "../lib/vm/fake-claude";
++
++after(async () => {
++  await closeBrowser();
++});
++
++const readOnly = mode() === "prod";
++
++// Chrome logs every failed fetch as a console error. The Browser view polls
++// `/api/runtime/browser/[runId]/frame` once a second, and useBrowserFrame
++// documents a 404 there as "no frame captured yet — an empty state, not an
++// error": the fake VM never captures a frame, so the poll 404s for the whole
++// test. That one message is benign; anything else is a real page error.
++const FRAME_POLL_404 =
++  "Failed to load resource: the server responded with a status of 404 (Not Found)";
++const FRAME_POLL_URL = /\/api\/runtime\/browser\/[^/]+\/frame$/;
++
++// Dispatch a prompt through the fake VM and wait for the recorded transcript
++// to finish, so the Browser and Files views have a completed run behind them.
++async function dispatchFakePrompt(page: Page): Promise<void> {
++  await page.getByRole("button", { name: /^Terminal$/ }).first().click();
++  await page.getByText(/Isolated User Sandbox/).first().waitFor({ state: "visible", timeout: 15_000 });
++
++  const input = page.locator("textarea").first();
++  await input.fill("Run a quick end-to-end smoke check.");
++  await input.press("Enter");
++
++  await page.getByText(/run started ·/).first().waitFor({ state: "visible", timeout: 30_000 });
++  await page.getByText(FAKE_CLAUDE_ASSISTANT_TEXT).first().waitFor({ state: "visible", timeout: 30_000 });
++  await page.getByText(/run finished · exit 0/).first().waitFor({ state: "visible", timeout: 45_000 });
++}
++
++test(
++  "browser-files: Browser view renders after a fake dispatch",
++  { skip: readOnly ? "prod mode is read-only" : false },
++  async (t) => {
++    const testName = "browser-files: Browser view renders after a fake dispatch";
++    const result = await runPageTest(testName, async ({ page, context, consoleErrors }) => {
++      await openWorkspace(page, context);
++      await dispatchFakePrompt(page);
++
++      // Record every failed response so the frame-poll 404 can be told apart
++      // from a real failed resource by URL, not just by message text.
++      const failedResponses: string[] = [];
++      page.on("response", (res) => {
++        if (res.status() >= 400) failedResponses.push(`${res.status()} ${res.url()}`);
++      });
++
++      await page.getByRole("button", { name: /^Browser$/ }).first().click();
++
++      // The fake VM never navigates, so the view shows its "no frame yet"
++      // state for a completed run — not the idle "Waiting for a run" state.
++      await page.getByText("No frame yet").first().waitFor({ state: "visible", timeout: 15_000 });
++      await page
++        .getByText("When the agent visits URLs, clicks, or takes screenshots, the live page renders here.")
++        .first()
++        .waitFor({ state: "visible", timeout: 15_000 });
++
++      // The browser chrome is present and usable for a live run.
++      const addressBar = page.getByLabel("Address bar");
++      assert.equal(await addressBar.isVisible(), true, "expected the address bar to be visible");
++      assert.equal(await addressBar.isEnabled(), true, "expected the address bar to be enabled for a live run");
++
++      await captureView(page, testName, "browser");
++
++      // Wait for the first frame-poll tick to land before judging it: "No
++      // frame yet" can render before the first fetch returns.
++      const pollDeadline = Date.now() + 15_000;
++      while (failedResponses.length === 0 && Date.now() < pollDeadline) {
++        await page.waitForTimeout(200);
++      }
++
++      // The view must actually be polling for frames (at least one 404 for a
++      // run with no frames yet), every failed response must be that poll, and
++      // every console error must be that poll's Chrome 404 message — nothing
++      // else may fail.
++      assert.ok(
++        failedResponses.length >= 1,
++        "expected the Browser view to poll for a frame (404 = no frame yet)",
++      );
++      assert.ok(
++        failedResponses.every((entry) => entry.startsWith("404 ") && FRAME_POLL_URL.test(entry)),
++        `unexpected failed responses: ${failedResponses.join(" | ")}`,
++      );
++      const unexpectedErrors = consoleErrors.filter((err) => err !== FRAME_POLL_404);
++      assert.deepEqual(unexpectedErrors, [], `unexpected page errors: ${unexpectedErrors.join(" | ")}`);
++    });
++    if (result.skipped) t.skip(result.skipped);
++  },
++);
++
++test(
++  "browser-files: Files view lists the workspace after a fake dispatch",
++  { skip: readOnly ? "prod mode is read-only" : false },
++  async (t) => {
++    const testName = "browser-files: Files view lists the workspace after a fake dispatch";
++    const result = await runPageTest(testName, async ({ page, context, consoleErrors }) => {
++      await openWorkspace(page, context);
++      await dispatchFakePrompt(page);
++
++      await page.getByRole("button", { name: /^Files$/ }).first().click();
++
++      // The breadcrumb shows the workspace root once the view mounts.
++      const breadcrumb = page.locator('nav[aria-label="Breadcrumb"]');
++      await breadcrumb.getByRole("button", { name: "workspace" }).waitFor({ state: "visible", timeout: 15_000 });
++
++      // Wait for the listing fetch to settle: the loading indicator must go
++      // away (it resolves immediately when the element was never rendered).
++      await page.getByText("Loading workspace…").waitFor({ state: "detached", timeout: 15_000 });
++
++      // The listing loaded: either the fake VM's workspace is empty, or it
++      // holds entries from the run. A failed listing shows a "Try again"
++      // error state instead.
++      const emptyState = page.getByText("This folder is empty");
++      const listingHeader = page.getByText("Name", { exact: true });
++      const hasEmptyState = await emptyState.isVisible().catch(() => false);
++      const hasListing = await listingHeader.isVisible().catch(() => false);
++      assert.ok(
++        hasEmptyState || hasListing,
++        "expected the Files view to show either an empty folder or a file listing",
++      );
++      assert.equal(
++        await page.getByRole("button", { name: "Try again" }).count(),
++        0,
++        "expected no Files view load error",
++      );
++
++      // The preview pane renders its empty state with nothing selected.
++      await page
++        .getByText("Select a file to preview it.")
++        .first()
++        .waitFor({ state: "visible", timeout: 15_000 });
++
++      await captureView(page, testName, "files");
++      assert.deepEqual(consoleErrors, [], `unexpected page errors: ${consoleErrors.join(" | ")}`);
++    });
++    if (result.skipped) t.skip(result.skipped);
++  },
++);
+-- 
+2.55.0
+

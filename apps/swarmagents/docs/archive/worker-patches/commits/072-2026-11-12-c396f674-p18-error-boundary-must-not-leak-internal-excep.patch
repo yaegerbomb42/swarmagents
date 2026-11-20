@@ -1,0 +1,181 @@
+From c396f6745249151cce7dc9b3b7a63097347811ca Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 00:44:00 +0000
+Subject: [PATCH] [p18] Error boundary must not leak internal exception strings
+
+---
+ .../src/components/ErrorBoundary.test.tsx     | 94 +++++++++++++++++++
+ .../src/components/ErrorBoundary.tsx          | 33 ++++++-
+ 2 files changed, 123 insertions(+), 4 deletions(-)
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.test.tsx
+
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.test.tsx b/apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.test.tsx
+new file mode 100644
+index 000000000..278aa60f7
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.test.tsx
+@@ -0,0 +1,94 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import type { ReactElement } from "react";
++import React from "react";
++import { ErrorBoundary } from "./ErrorBoundary";
++
++// tsx compiles this repo's JSX (tsconfig jsx: preserve) with the classic
++// runtime, so the component's JSX resolves `React` from the global scope
++// when render() runs. Next.js / Vite use the automatic runtime and never
++// need this; it exists only so the tests can exercise render() under tsx.
++(globalThis as unknown as { React: typeof React }).React = React;
++
++// A message that looks like a real leak: a filesystem path plus provider text.
++const SECRET = "boom: /home/secret/path and provider error sk-abc123";
++
++function collectText(node: unknown, out: string[] = []): string[] {
++  if (typeof node === "string" || typeof node === "number") {
++    out.push(String(node));
++    return out;
++  }
++  if (node && typeof node === "object") {
++    const el = node as ReactElement;
++    const children = (el.props as { children?: unknown } | null)?.children;
++    if (Array.isArray(children)) children.forEach((child) => collectText(child, out));
++    else collectText(children, out);
++  }
++  return out;
++}
++
++function hasElementType(node: unknown, type: string): boolean {
++  if (node && typeof node === "object") {
++    const el = node as ReactElement;
++    if (el.type === type) return true;
++    const children = (el.props as { children?: unknown } | null)?.children;
++    if (Array.isArray(children)) return children.some((child) => hasElementType(child, type));
++    return hasElementType(children, type);
++  }
++  return false;
++}
++
++function renderWithError(env: string | undefined): ReactElement {
++  // process.env.NODE_ENV is typed read-only; cast to mutate it for the test.
++  const envMap = process.env as Record<string, string | undefined>;
++  const prev = envMap.NODE_ENV;
++  if (env === undefined) delete envMap.NODE_ENV;
++  else envMap.NODE_ENV = env;
++  try {
++    const boundary = new ErrorBoundary({ children: null });
++    boundary.state = ErrorBoundary.getDerivedStateFromError(new Error(SECRET));
++    return boundary.render() as ReactElement;
++  } finally {
++    if (prev === undefined) delete envMap.NODE_ENV;
++    else envMap.NODE_ENV = prev;
++  }
++}
++
++test("production fallback never renders the raw error message", () => {
++  const tree = renderWithError("production");
++  const text = collectText(tree).join("\n");
++  assert.ok(text.includes("Something went wrong"), "friendly message is shown");
++  assert.ok(text.includes("Reload"), "Reload action is shown");
++  assert.ok(text.includes("Try again"), "Try again action is shown");
++  assert.ok(!text.includes(SECRET), "raw error message must not appear in production");
++  assert.ok(!hasElementType(tree, "details"), "no <details> in production");
++});
++
++test("development fallback shows the raw message inside a collapsed <details>", () => {
++  const tree = renderWithError("development");
++  const text = collectText(tree).join("\n");
++  assert.ok(text.includes("Something went wrong"), "friendly message is shown");
++  assert.ok(text.includes(SECRET), "raw message is available in development");
++  assert.ok(hasElementType(tree, "details"), "raw message is inside a <details>");
++});
++
++test("componentDidCatch logs the error to console.error", () => {
++  const calls: unknown[][] = [];
++  const prev = console.error;
++  console.error = (...args: unknown[]) => {
++    calls.push(args);
++  };
++  try {
++    const boundary = new ErrorBoundary({ children: null });
++    const error = new Error(SECRET);
++    boundary.componentDidCatch(error, { componentStack: "\n    at Broken" });
++    assert.equal(calls.length, 1, "logs exactly once");
++    assert.ok(calls[0].includes(error), "logs the error object");
++    assert.ok(
++      calls[0].some((arg) => typeof arg === "string" && arg.includes("at Broken")),
++      "logs the component stack",
++    );
++  } finally {
++    console.error = prev;
++  }
++});
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.tsx b/apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.tsx
+index 494f9cddd..c383d1031 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.tsx
+@@ -1,4 +1,4 @@
+-import { Component, type ReactNode } from "react";
++import { Component, type ErrorInfo, type ReactNode } from "react";
+ 
+ interface Props {
+   children: ReactNode;
+@@ -8,11 +8,25 @@ interface State {
+   error: Error | null;
+ }
+ 
++/**
++ * True outside production. The raw error is only rendered in development;
++ * in a Vite-style bundle `process` may not exist at all, in which case we
++ * fail closed and never show internals.
++ */
++function showErrorDetails(): boolean {
++  return typeof process !== "undefined" && process.env?.NODE_ENV !== "production";
++}
++
+ /**
+  * t14r — recoverable error boundary around the workspace.
+  *
+  * Catches render errors anywhere below it and shows a friendly fallback with a one-click
+  * reset and a reload action instead of a blank white screen.
++ *
++ * The raw exception message is never rendered in production: it can contain
++ * filesystem paths, provider errors, or other internals. It is only shown
++ * inside a collapsed <details> in development. The error is logged via
++ * componentDidCatch so it is still diagnosable from the console.
+  */
+ export class ErrorBoundary extends Component<Props, State> {
+   state: State = { error: null };
+@@ -21,6 +35,12 @@ export class ErrorBoundary extends Component<Props, State> {
+     return { error };
+   }
+ 
++  componentDidCatch(error: Error, info: ErrorInfo): void {
++    // Console-only diagnostics: the raw error and component stack never
++    // reach the rendered UI in production (see render).
++    console.error("ErrorBoundary caught an error:", error, info.componentStack);
++  }
++
+   private handleReset = () => this.setState({ error: null });
+ 
+   render() {
+@@ -33,9 +53,14 @@ export class ErrorBoundary extends Component<Props, State> {
+             </div>
+             <div className="text-base font-medium text-white/90">Something went wrong</div>
+             <p className="mt-2 text-sm text-white/45">The workspace hit an unexpected error. You can reload, or try again.</p>
+-            <p className="mt-3 break-words rounded-xl bg-white/5 p-3 font-mono text-[10px] leading-relaxed text-red-300/70">
+-              {this.state.error.message || String(this.state.error)}
+-            </p>
++            {showErrorDetails() && (
++              <details className="mt-3 break-words rounded-xl bg-white/5 p-3 text-left font-mono text-[10px] leading-relaxed text-red-300/70">
++                <summary className="cursor-pointer text-white/60">Error details (development only)</summary>
++                <p className="mt-2 whitespace-pre-wrap">
++                  {this.state.error.message || String(this.state.error)}
++                </p>
++              </details>
++            )}
+             <div className="mt-6 flex justify-center gap-3">
+               <button
+                 onClick={() => window.location.reload()}
+-- 
+2.55.0
+

@@ -1,0 +1,91 @@
+From 03b03a3256f8e6e7377947bc63daf4773ec85396 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 12:10:02 -0600
+Subject: [PATCH] fix(harness): pass prompt after -- to prevent flag parsing
+
+---
+ apps/swarmagents/lib/harness/runner.test.ts | 21 ++++++++++++++++++---
+ apps/swarmagents/lib/harness/runner.ts      | 11 ++++++++++-
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/apps/swarmagents/lib/harness/runner.test.ts b/apps/swarmagents/lib/harness/runner.test.ts
+index 9ab661aeb..3bde609b2 100644
+--- a/apps/swarmagents/lib/harness/runner.test.ts
++++ b/apps/swarmagents/lib/harness/runner.test.ts
+@@ -221,8 +221,6 @@ test("builds argv correctly and passes provider keys via env only, never argv",
+   const { cmd, opts } = vm.calls[0];
+   assert.deepEqual(cmd, [
+     "claude",
+-    "-p",
+-    "Inspect repo",
+     "--output-format",
+     "stream-json",
+     "--verbose",
+@@ -230,6 +228,8 @@ test("builds argv correctly and passes provider keys via env only, never argv",
+     "sess_resume_x",
+     "--model",
+     "claude-sonnet-5-5",
++    "--",
++    "Inspect repo",
+   ]);
+   assert.deepEqual(opts.env, envWithSecrets);
+   for (const secret of [SECRET_TOKEN, PLAIN_SECRET]) {
+@@ -399,8 +399,23 @@ test("defaults: no --resume/--model when not requested; run without sessionId",
+   const outcome = await runner.run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+ 
+   assert.equal(outcome.exitCode, 0);
+-  assert.deepEqual(vm.calls[0].cmd, ["claude", "-p", "x", "--output-format", "stream-json", "--verbose"]);
++  assert.deepEqual(vm.calls[0].cmd, ["claude", "--output-format", "stream-json", "--verbose", "--", "x"]);
+   // No sessionId anywhere -> finished falls back to the result event's session.
+   const finished = events.find((e) => e.type === "run.finished");
+   assert.equal(finished!.sessionId, "sess_demo_1");
+ });
++
++test("passes prompts starting with '-' after -- so they are never treated as flags", async () => {
++  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
++  const runner = new ClaudeCodeRunner();
++  const prompt = "--dangerously-skip-permissions";
++
++  await runner.run({ prompt, env: {}, vm }, () => {});
++
++  const cmd = vm.calls[0].cmd;
++  assert.equal(cmd[cmd.length - 2], "--");
++  assert.equal(cmd[cmd.length - 1], prompt);
++  assert.ok(!cmd.includes("-p"), "must not use -p which can misparse dash-leading prompt values");
++  const beforeTerminator = cmd.slice(0, -2);
++  assert.ok(!beforeTerminator.includes(prompt), "dash-leading prompt must appear only after -- terminator");
++});
+diff --git a/apps/swarmagents/lib/harness/runner.ts b/apps/swarmagents/lib/harness/runner.ts
+index 125bf00f1..cabb0bc87 100644
+--- a/apps/swarmagents/lib/harness/runner.ts
++++ b/apps/swarmagents/lib/harness/runner.ts
+@@ -42,6 +42,12 @@ export class ClaudeCodeRunner {
+    * Resolves when the process exits; emits run.finished / run.error as the
+    * final event. The caller's onEvent may be called synchronously from within
+    * exec callbacks, so it must be cheap and must not await.
++   *
++   * Prompt safety: the prompt is passed as a positional argument after `--` so
++   * values starting with `-` (e.g. "--dangerously-skip-permissions") are never
++   * parsed as CLI flags. We avoid `-p <prompt>` because some CLI parsers treat
++   * a dash-leading value as an option; the `--` end-of-options terminator makes
++   * the prompt an opaque positional argument.
+    */
+   async run(request: RunRequest, onEvent: (event: TelemetryEvent) => void): Promise<RunOutcome> {
+     const redact = makeRedactor(request.env, request.redactSecrets);
+@@ -211,9 +217,12 @@ export class ClaudeCodeRunner {
+   }
+ 
+   private buildArgv(request: RunRequest): string[] {
+-    const argv: string[] = [this.bin, "-p", request.prompt, "--output-format", "stream-json", "--verbose"];
++    const argv: string[] = [this.bin, "--output-format", "stream-json", "--verbose"];
+     if (request.sessionId) argv.push("--resume", request.sessionId);
+     if (request.model) argv.push("--model", request.model);
++    // `--` terminates option parsing so a prompt beginning with '-' is never
++    // interpreted as a flag (e.g. "--dangerously-skip-permissions").
++    argv.push("--", request.prompt);
+     return argv;
+   }
+ }
+-- 
+2.55.0
+

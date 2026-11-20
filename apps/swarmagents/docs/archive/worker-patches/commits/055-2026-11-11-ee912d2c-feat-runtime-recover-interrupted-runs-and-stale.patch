@@ -1,0 +1,535 @@
+From ee912d2cd74cf147832b6f7d32db9b7e39675b23 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:32:58 -0600
+Subject: [PATCH] feat(runtime): recover interrupted runs and stale agent
+ processes on restart
+
+---
+ apps/swarmagents/instrumentation.ts           |  14 +-
+ apps/swarmagents/lib/runtime/manager.ts       |  10 +
+ apps/swarmagents/lib/runtime/recovery.test.ts | 219 ++++++++++++++++++
+ apps/swarmagents/lib/runtime/recovery.ts      | 100 ++++++++
+ apps/swarmagents/lib/runtime/run-store.ts     |  95 ++++++--
+ 5 files changed, 416 insertions(+), 22 deletions(-)
+ create mode 100644 apps/swarmagents/lib/runtime/recovery.test.ts
+ create mode 100644 apps/swarmagents/lib/runtime/recovery.ts
+
+diff --git a/apps/swarmagents/instrumentation.ts b/apps/swarmagents/instrumentation.ts
+index 2dba404df..d8d0eec35 100644
+--- a/apps/swarmagents/instrumentation.ts
++++ b/apps/swarmagents/instrumentation.ts
+@@ -2,11 +2,23 @@
+  * Server startup hook (Next.js instrumentation). Registers the graceful
+  * shutdown handler once per process so a SIGTERM/SIGINT during a deploy
+  * cancels in-flight runs with reason "shutdown" and flushes run logs
+- * before the process exits.
++ * before the process exits. Then reconciles runs left queued/running by the
++ * previous process so history never shows them spinning forever.
+  */
+ export async function register(): Promise<void> {
+   if (process.env.NEXT_RUNTIME === "nodejs") {
+     const { registerShutdownHandler } = await import("./lib/runtime/shutdown");
+     registerShutdownHandler();
++
++    // Recovery must never break startup: a bad log file is logged and skipped.
++    try {
++      const { reconcileInterruptedRuns } = await import("./lib/runtime/recovery");
++      const report = reconcileInterruptedRuns();
++      if (report.count > 0) {
++        console.info(`[recovery] marked ${report.count} interrupted run(s) after restart`);
++      }
++    } catch (error) {
++      console.error("[recovery] startup reconciliation failed:", error);
++    }
+   }
+ }
+diff --git a/apps/swarmagents/lib/runtime/manager.ts b/apps/swarmagents/lib/runtime/manager.ts
+index 251c09e74..cda4534ba 100644
+--- a/apps/swarmagents/lib/runtime/manager.ts
++++ b/apps/swarmagents/lib/runtime/manager.ts
+@@ -39,6 +39,7 @@ import { telemetryBus, type TelemetryBus } from "../telemetry/index";
+ import { getBrowserManager } from "../browser/manager";
+ import { bindExec, VmManager, vmManager } from "../vm/manager";
+ import { startVmIdleSweeper } from "../vm/idle-sweeper";
++import { isFakeVmDriver, prepareUserVmForRun } from "./recovery";
+ import { getRun, recoverOrphanedRuns } from "./run-store";
+ import { getLastSession, setLastSession, clearLastSession } from "./session-store";
+ 
+@@ -698,6 +699,15 @@ export class RuntimeManager {
+     }
+ 
+     if (active.controller.signal.aborted) return;
++
++    // The previous server may have died leaving its `claude` process alive in
++    // this VM. Kill it once per user per boot before the first agent run so
++    // the fresh run cannot collide with it. Skipped entirely under the fake
++    // driver (and avoids an extra await so fake-driver runs stay prompt).
++    if (!isFakeVmDriver(this.vm.driver)) {
++      await prepareUserVmForRun(this.vm, userId);
++    }
++
+     const ensureMs = Date.now() - ensureStartedAt;
+     this.bus.publish(runId, { type: "vm.ready", data: { ms: ensureMs, durationMs: ensureMs } });
+ 
+diff --git a/apps/swarmagents/lib/runtime/recovery.test.ts b/apps/swarmagents/lib/runtime/recovery.test.ts
+new file mode 100644
+index 000000000..885594dd5
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/recovery.test.ts
+@@ -0,0 +1,219 @@
++/**
++ * Restart recovery: persisted runs left queued/running by a dead server are
++ * finalized as interrupted, and leftover `claude` processes are killed once
++ * per user before the first agent run after boot.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { TelemetryBus, type TelemetryEvent } from "../telemetry/bus";
++import { VmManager } from "../vm/manager";
++import { FakeVmDriver } from "../vm/fake-driver";
++import type { ExecOptions, ExecResult, VmHandle } from "../vm/types";
++import { getRun, INTERRUPTED_RUN_REASON, listByStatus, markInterrupted } from "./run-store";
++import {
++  KILL_AGENT_PROCESSES_CMD,
++  prepareUserVmForRun,
++  reconcileInterruptedRuns,
++  resetRecoveryStateForTesting,
++  type RecoveryVm,
++} from "./recovery";
++
++function tmpDir(): string {
++  return fs.mkdtempSync(path.join(os.tmpdir(), "swarm-recovery-"));
++}
++
++function persistBus(dir: string): TelemetryBus {
++  return new TelemetryBus({ persist: true, runsDir: () => dir });
++}
++
++/** Persist a run that was mid-flight when the process died. */
++function writeInFlightRun(bus: TelemetryBus, runId: string, userId = "alice"): void {
++  bus.publish(runId, { type: "run.created", data: { prompt: `p:${runId}`, userId } });
++  bus.publish(runId, {
++    type: "run.started",
++    sessionId: `sess_${runId}`,
++    model: "claude-test",
++  } as TelemetryEvent);
++}
++
++test("reconcileInterruptedRuns finalizes running and queued runs as interrupted", () => {
++  const dir = tmpDir();
++  try {
++    const bus = persistBus(dir);
++    writeInFlightRun(bus, "run_running");
++    bus.publish("run_running", { type: "assistant.text", text: "half done" } as TelemetryEvent);
++
++    bus.publish("run_queued", { type: "run.created", data: { prompt: "queued", userId: "alice" } });
++    bus.publish("run_queued", {
++      type: "run.queued",
++      data: { position: 1, prompt: "queued", userId: "alice" },
++    });
++    assert.equal(getRun("run_queued", dir)?.summary.status, "queued");
++
++    bus.publish("run_done", { type: "run.created", data: { prompt: "done", userId: "alice" } });
++    bus.publish("run_done", { type: "run.finished", exitCode: 0 } as TelemetryEvent);
++
++    const report = reconcileInterruptedRuns(dir);
++    assert.equal(report.count, 2);
++    assert.deepEqual(
++      report.interrupted.map((run) => run.runId).sort(),
++      ["run_queued", "run_running"],
++    );
++
++    for (const runId of ["run_queued", "run_running"]) {
++      const run = getRun(runId, dir);
++      assert.ok(run);
++      assert.equal(run.summary.status, "error");
++      assert.equal(run.summary.error, INTERRUPTED_RUN_REASON);
++      assert.ok(typeof run.summary.finishedAt === "number");
++      const last = run.events[run.events.length - 1];
++      assert.equal(last?.type, "run.error");
++      assert.equal((last as { message?: string }).message, INTERRUPTED_RUN_REASON);
++      // The appended error continues the persisted sequence (no gap/collision).
++      assert.equal(last?.seq, run.summary.lastSeq);
++      assert.equal(
++        new Set(run.events.map((event) => event.seq)).size,
++        run.events.length,
++      );
++    }
++
++    // A finished run is untouched.
++    const done = getRun("run_done", dir);
++    assert.equal(done?.summary.status, "finished");
++    assert.equal(done?.events.length, 2);
++
++    // Idempotent: a second startup pass finds nothing in flight.
++    const before = getRun("run_running", dir)?.events.length;
++    const second = reconcileInterruptedRuns(dir);
++    assert.equal(second.count, 0);
++    assert.equal(getRun("run_running", dir)?.events.length, before);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("markInterrupted only marks queued/running runs and ignores unknown ids", () => {
++  const dir = tmpDir();
++  try {
++    const bus = persistBus(dir);
++    writeInFlightRun(bus, "run_live");
++    bus.publish("run_finished", { type: "run.created", data: { prompt: "done" } });
++    bus.publish("run_finished", { type: "run.finished", exitCode: 0 } as TelemetryEvent);
++
++    assert.equal(markInterrupted("run_live", dir), true);
++    assert.equal(markInterrupted("run_live", dir), false);
++    assert.equal(markInterrupted("run_finished", dir), false);
++    assert.equal(markInterrupted("run_missing", dir), false);
++    assert.equal(markInterrupted("run_live", null), false);
++
++    assert.equal(getRun("run_live", dir)?.summary.status, "error");
++    assert.equal(getRun("run_finished", dir)?.summary.status, "finished");
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("listByStatus filters persisted runs without a pagination cap", () => {
++  const dir = tmpDir();
++  try {
++    const bus = persistBus(dir);
++    for (let i = 0; i < 120; i++) {
++      writeInFlightRun(bus, `run_bulk_${String(i).padStart(3, "0")}`, i % 2 === 0 ? "alice" : "bob");
++    }
++    assert.equal(listByStatus("running", { runsDir: dir }).length, 120);
++    assert.equal(listByStatus("running", { runsDir: dir, userId: "alice" }).length, 60);
++    assert.equal(listByStatus(["queued", "running"], { runsDir: dir }).length, 120);
++    assert.equal(listByStatus(["finished", "error"], { runsDir: dir }).length, 0);
++    assert.equal(listByStatus("running", { runsDir: null }).length, 0);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++/** Records pkill execs while otherwise behaving like the fake driver. */
++class RecordingFakeVm extends FakeVmDriver {
++  calls: Array<{ userId: string; cmd: string[] }> = [];
++
++  override async exec(
++    handle: VmHandle,
++    cmd: string[],
++    opts?: ExecOptions,
++  ): Promise<ExecResult> {
++    this.calls.push({ userId: handle.userId, cmd });
++    return { exitCode: 1 };
++  }
++}
++
++interface StubVm extends RecoveryVm {
++  calls: Array<{ userId: string; cmd: string[] }>;
++}
++
++/** A non-fake VM stub so the kill path runs, recording every exec. */
++function stubVm(exitCode = 1): StubVm {
++  const calls: Array<{ userId: string; cmd: string[] }> = [];
++  return {
++    // Not a FakeVmDriver instance or by-name match, so this is a "real" VM.
++    driver: { kind: "docker" },
++    calls,
++    async exec(userId: string, cmd: string[]): Promise<ExecResult> {
++      calls.push({ userId, cmd });
++      return { exitCode };
++    },
++  };
++}
++
++test("prepareUserVmForRun kills leftover agents once per user", async () => {
++  resetRecoveryStateForTesting();
++  const vm = stubVm(1); // pkill exit 1: nothing matched, must be ignored
++
++  assert.equal(await prepareUserVmForRun(vm, "alice"), false);
++  assert.equal(await prepareUserVmForRun(vm, "alice"), false);
++  assert.equal(vm.calls.length, 1, "the second run for a user must not exec again");
++  assert.equal(vm.calls[0]?.userId, "alice");
++  assert.deepEqual(vm.calls[0]?.cmd, KILL_AGENT_PROCESSES_CMD);
++
++  // Another user gets their own one-time cleanup.
++  assert.equal(await prepareUserVmForRun(vm, "bob"), false);
++  assert.equal(vm.calls.length, 2);
++  assert.equal(vm.calls[1]?.userId, "bob");
++
++  // A fresh boot starts the cycle over.
++  resetRecoveryStateForTesting();
++  assert.equal(await prepareUserVmForRun(vm, "alice"), false);
++  assert.equal(vm.calls.length, 3);
++});
++
++test("prepareUserVmForRun reports a successful kill and swallows driver errors", async () => {
++  resetRecoveryStateForTesting();
++  const vm = stubVm(0);
++  assert.equal(await prepareUserVmForRun(vm, "alice"), true);
++
++  resetRecoveryStateForTesting();
++  const failing: RecoveryVm = {
++    driver: { kind: "docker" },
++    async exec(): Promise<ExecResult> {
++      throw new Error("vm exploded");
++    },
++  };
++  const originalError = console.error;
++  console.error = () => {};
++  try {
++    assert.equal(await prepareUserVmForRun(failing, "bob"), false);
++  } finally {
++    console.error = originalError;
++  }
++});
++
++test("prepareUserVmForRun is a no-op under the fake driver", async () => {
++  resetRecoveryStateForTesting();
++  const driver = new RecordingFakeVm();
++  const vm = new VmManager({ customDriver: driver });
++
++  assert.equal(await prepareUserVmForRun(vm, "alice"), false);
++  assert.equal(await prepareUserVmForRun(vm, "alice"), false);
++  assert.equal(driver.calls.length, 0);
++});
+diff --git a/apps/swarmagents/lib/runtime/recovery.ts b/apps/swarmagents/lib/runtime/recovery.ts
+new file mode 100644
+index 000000000..46d295c48
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/recovery.ts
+@@ -0,0 +1,100 @@
++/**
++ * Crash recovery for the runtime.
++ *
++ * RuntimeManager state is in memory, so a deploy or crash leaves two kinds of
++ * debris behind:
++ *   1. Persisted runs still marked queued/running that no process will ever
++ *      finish. They are finalized as errors at boot so history never shows a
++ *      run spinning forever.
++ *   2. The `claude` process from the dead run may still be alive inside the
++ *      user's container. It is killed once per user before that user's first
++ *      agent run after boot, so a fresh run cannot collide with it.
++ *
++ * Reconciliation writes directly to the run log (no bus publish): after a
++ * restart there are no subscribers, and the bus's per-process sequence would
++ * restart at 1 and corrupt the persisted log ordering.
++ */
++
++import type { ExecOptions, ExecResult } from "../vm/types";
++import { FakeVmDriver } from "../vm/fake-driver";
++import { getRunsDir } from "../telemetry/paths";
++import { listByStatus, markInterrupted, type StoredRunSummary } from "./run-store";
++
++/** The command that kills the agent CLI left behind by a dead server. */
++export const KILL_AGENT_PROCESSES_CMD = ["pkill", "-u", "agent", "-f", "claude -p"];
++
++/** Minimum VM surface recovery needs; the real VmManager satisfies it. */
++export interface RecoveryVm {
++  readonly driver?: unknown;
++  exec(userId: string, cmd: string[], opts?: ExecOptions): Promise<ExecResult>;
++}
++
++export interface RecoveryReport {
++  /** Persisted runs finalized as interrupted, newest first. */
++  interrupted: StoredRunSummary[];
++  count: number;
++}
++
++/**
++ * Finalize every persisted run left queued/running by a previous process.
++ * Runs are marked with error "interrupted by server restart"; nothing is
++ * published. Safe to call more than once (the second call is a no-op).
++ */
++export function reconcileInterruptedRuns(
++  runsDir: string | null = getRunsDir(),
++): RecoveryReport {
++  if (!runsDir) return { interrupted: [], count: 0 };
++
++  const interrupted: StoredRunSummary[] = [];
++  for (const run of listByStatus(["queued", "running"], { runsDir })) {
++    if (markInterrupted(run.runId, runsDir)) interrupted.push(run);
++  }
++  return { interrupted, count: interrupted.length };
++}
++
++/** Users whose leftover processes have already been cleaned up this boot. */
++const preparedUsers = new Set<string>();
++
++/** Test hook: forget which users were prepared (simulates a fresh boot). */
++export function resetRecoveryStateForTesting(): void {
++  preparedUsers.clear();
++}
++
++/** True for the in-memory fake driver (or a test subclass of it). */
++export function isFakeVmDriver(driver: unknown): boolean {
++  if (driver instanceof FakeVmDriver) return true;
++  // Next.js can load this module in several bundles; compare by name too so a
++  // duplicated FakeVmDriver class still counts as the fake driver.
++  return (
++    (driver as { constructor?: { name?: string } } | undefined)?.constructor?.name ===
++    "FakeVmDriver"
++  );
++}
++
++/**
++ * Kill leftover agent processes in a user's VM, at most once per user per
++ * boot. Called just before that user's first agent run. `pkill` exits 1 when
++ * nothing matched, which is the normal case and is ignored; any driver error
++ * is swallowed so recovery can never block a run. A no-op under the fake VM
++ * driver (local playtests and unit tests have no real agent processes).
++ *
++ * Returns true when `pkill` found and signalled a process, false otherwise.
++ */
++export async function prepareUserVmForRun(
++  vm: RecoveryVm,
++  userId: string,
++): Promise<boolean> {
++  if (preparedUsers.has(userId)) return false;
++  preparedUsers.add(userId);
++
++  if (isFakeVmDriver(vm.driver)) return false;
++
++  try {
++    const result = await vm.exec(userId, KILL_AGENT_PROCESSES_CMD);
++    if (result.exitCode === 1) return false; // no matching process
++    return result.exitCode === 0;
++  } catch (error) {
++    console.error(`[recovery] could not kill leftover agent processes for ${userId}:`, error);
++    return false;
++  }
++}
+diff --git a/apps/swarmagents/lib/runtime/run-store.ts b/apps/swarmagents/lib/runtime/run-store.ts
+index baf361f6c..60b841c5e 100644
+--- a/apps/swarmagents/lib/runtime/run-store.ts
++++ b/apps/swarmagents/lib/runtime/run-store.ts
+@@ -8,7 +8,7 @@ import type { SequencedEvent } from "../telemetry/bus";
+ import { getRunsDir } from "../telemetry/paths";
+ import { appendRunEvent, listRunLogs, readRunEvents } from "../telemetry/run-log";
+ 
+-export type StoredRunStatus = "running" | "finished" | "error" | "cancelled";
++export type StoredRunStatus = "queued" | "running" | "finished" | "error" | "cancelled";
+ 
+ export interface StoredRunSummary {
+   runId: string;
+@@ -97,7 +97,11 @@ export function summarizeRun(runId: string, events: SequencedEvent[]): StoredRun
+       case "assistant.text":
+         summary.finalText = str(field("text")) ?? summary.finalText;
+         break;
++      case "run.queued":
++        summary.status = "queued";
++        break;
+       case "run.started":
++        summary.status = "running";
+         summary.sessionId = str(field("sessionId")) ?? summary.sessionId;
+         summary.model = str(field("model")) ?? summary.model;
+         break;
+@@ -199,33 +203,82 @@ export function listRuns(options: ListRunsOptions = {}): StoredRunSummary[] {
+   return summaries.slice(0, limit);
+ }
+ 
+-/** Reason recorded on runs orphaned by a server restart. */
++/**
++ * Every persisted run with one of the given statuses, newest first. Unlike
++ * listRuns this has no pagination limit: startup recovery must see every
++ * orphaned run, however many accumulated.
++ */
++export function listByStatus(
++  status: StoredRunStatus | readonly StoredRunStatus[],
++  options: { runsDir?: string | null; userId?: string } = {},
++): StoredRunSummary[] {
++  const runsDir = options.runsDir === undefined ? getRunsDir() : options.runsDir;
++  if (!runsDir) return [];
++  const wanted = new Set<StoredRunStatus>(
++    typeof status === "string" ? [status] : [...status],
++  );
++
++  const summaries: StoredRunSummary[] = [];
++  for (const info of listRunLogs(runsDir)) {
++    const run = getRun(info.runId, runsDir);
++    if (!run || !wanted.has(run.summary.status)) continue;
++    if (options.userId && run.summary.userId !== options.userId) continue;
++    summaries.push(run.summary);
++  }
++  summaries.sort(
++    (a, b) => b.createdAt - a.createdAt || (a.runId < b.runId ? 1 : a.runId > b.runId ? -1 : 0),
++  );
++  return summaries;
++}
++
++/** Reason recorded on runs interrupted by a server restart. */
++export const INTERRUPTED_RUN_REASON = "interrupted by server restart";
++
++/** Reason recorded on runs orphaned by a server restart (legacy spelling). */
+ export const ORPHANED_RUN_REASON = "server restarted";
+ 
+ /**
+- * Finalize every persisted run still marked running. The server restarted
+- * mid-run, so no live process will ever finish it; leaving it "running"
+- * would strand it forever. Appends a run.error event (seq = last persisted
+- * seq + 1, so the log stays gapless and ordered) to each orphaned run's log,
+- * which flips its durable summary to "error" with the restart reason.
+- * Finished, errored and cancelled runs are left untouched. Returns the
+- * recovered runIds. Idempotent: a second call finds nothing still running.
++ * Finalize one persisted run that was still queued or running when the
++ * process died. Appends a run.error event (seq = last persisted seq + 1, so
++ * the log stays gapless and ordered) with `reason`, which flips its durable
++ * summary to "error". Writes straight to the run log rather than the bus:
++ * there are no subscribers after a restart, and the bus's per-process seq
++ * would start at 1 and corrupt the persisted ordering. Returns true when the
++ * run was marked; finished/errored/cancelled/unknown runs are left untouched,
++ * so it is idempotent.
++ */
++export function markInterrupted(
++  runId: string,
++  runsDir: string | null = getRunsDir(),
++  reason: string = INTERRUPTED_RUN_REASON,
++): boolean {
++  if (!runsDir) return false;
++  const run = getRun(runId, runsDir);
++  if (!run) return false;
++  if (run.summary.status !== "queued" && run.summary.status !== "running") return false;
++
++  const errorEvent: SequencedEvent & { message: string } = {
++    type: "run.error",
++    message: reason,
++    seq: run.summary.lastSeq + 1,
++    runId: run.runId,
++    ts: Date.now(),
++  };
++  appendRunEvent(errorEvent, runsDir);
++  return true;
++}
++
++/**
++ * Finalize every persisted run still marked running or queued. The server
++ * restarted mid-run, so no live process will ever finish it; leaving it
++ * "running" would strand it forever. Returns the recovered runIds.
++ * Idempotent: a second call finds nothing still in flight.
+  */
+ export function recoverOrphanedRuns(runsDir: string | null = getRunsDir()): string[] {
+   if (!runsDir) return [];
+   const recovered: string[] = [];
+-  for (const info of listRunLogs(runsDir)) {
+-    const run = getRun(info.runId, runsDir);
+-    if (!run || run.summary.status !== "running") continue;
+-    const errorEvent: SequencedEvent & { message: string } = {
+-      type: "run.error",
+-      message: ORPHANED_RUN_REASON,
+-      seq: run.summary.lastSeq + 1,
+-      runId: run.runId,
+-      ts: Date.now(),
+-    };
+-    appendRunEvent(errorEvent, runsDir);
+-    recovered.push(run.runId);
++  for (const run of listByStatus(["queued", "running"], { runsDir })) {
++    if (markInterrupted(run.runId, runsDir, ORPHANED_RUN_REASON)) recovered.push(run.runId);
+   }
+   return recovered;
+ }
+-- 
+2.55.0
+

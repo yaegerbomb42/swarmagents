@@ -1,0 +1,1346 @@
+From 4e1b3b786c13089cef6e17d195d5aca7265d373a Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 13:54:41 -0600
+Subject: [PATCH] feat(httpguard): http-guard + MCP transport
+
+Adds lib/http-guard.ts (auth, per-user TokenBucket rate limit before body
+parse, bounded JSON 64 KB, validate callback, no-store) and lib/mcp/transport.ts
+(JSON-RPC 2.0 / MCP 2024-11-05, single+batch <=20, notifications -> 202,
+error codes, 413 over 256 KB), wired into both swarm-board and memory MCP
+routes via McpServerAdapter.
+
+Reconciled the swarm-board POST hunk against the live base (which had added
+a JSON-RPC params/id validation block); the new transport validates id
+globally, so the invalid-id case now returns -32600 (stricter behavior).
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/app/api/mcp/memory/route.ts  |  82 +----
+ .../app/api/mcp/swarm-board/route.test.ts     |   4 +-
+ .../app/api/mcp/swarm-board/route.ts          | 220 +++++-------
+ apps/swarmagents/lib/http-guard.test.ts       | 230 +++++++++++++
+ apps/swarmagents/lib/http-guard.ts            | 135 ++++++++
+ apps/swarmagents/lib/mcp/transport.test.ts    | 319 ++++++++++++++++++
+ apps/swarmagents/lib/mcp/transport.ts         | 211 ++++++++++++
+ 7 files changed, 988 insertions(+), 213 deletions(-)
+ create mode 100644 apps/swarmagents/lib/http-guard.test.ts
+ create mode 100644 apps/swarmagents/lib/http-guard.ts
+ create mode 100644 apps/swarmagents/lib/mcp/transport.test.ts
+ create mode 100644 apps/swarmagents/lib/mcp/transport.ts
+
+diff --git a/apps/swarmagents/app/api/mcp/memory/route.ts b/apps/swarmagents/app/api/mcp/memory/route.ts
+index 79bbf046f..59ab69601 100644
+--- a/apps/swarmagents/app/api/mcp/memory/route.ts
++++ b/apps/swarmagents/app/api/mcp/memory/route.ts
+@@ -16,20 +16,12 @@
+ import { NextResponse, type NextRequest } from "next/server";
+ import { providerOwner } from "@/lib/providers/owner";
+ import { MEMORY_TOOL_SCHEMAS, runMemoryTool } from "@/lib/memory/tools";
++import { handleMcpPost, type McpServerAdapter } from "@/lib/mcp/transport";
+ 
+ export const dynamic = "force-dynamic";
+ 
+-const MAX_BODY_SIZE = 256 * 1024;
+ const NO_STORE = { "cache-control": "no-store" } as const;
+ 
+-function jsonRpcError(code: number, message: string, id: unknown, status = 200) {
+-  return NextResponse.json({ jsonrpc: "2.0", error: { code, message }, id: id ?? null }, { status });
+-}
+-
+-function jsonRpcResponse(payload: { result?: unknown }, id: unknown) {
+-  return NextResponse.json({ jsonrpc: "2.0", ...payload, id }, { status: 200, headers: NO_STORE });
+-}
+-
+ /** GET: describe the server (handy for a quick health check). */
+ export function GET(request: NextRequest) {
+   const owner = providerOwner(request);
+@@ -53,69 +45,19 @@ export async function POST(request: NextRequest) {
+     return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
+   }
+ 
+-  let text: string;
+-  try {
+-    text = await request.text();
+-  } catch {
+-    return jsonRpcError(-32700, "Parse error", null, 400);
+-  }
+-  if (text.length > MAX_BODY_SIZE) {
+-    return jsonRpcError(-32602, "Request body too large", null);
+-  }
+-
+-  let body: unknown;
+-  try {
+-    body = JSON.parse(text);
+-  } catch {
+-    return jsonRpcError(-32700, "Parse error", null, 400);
+-  }
+-  if (!body || typeof body !== "object" || Array.isArray(body)) {
+-    return jsonRpcError(-32600, "Invalid Request", null);
+-  }
+-
+-  const payload = body as { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown };
+-  if (payload.jsonrpc !== "2.0") {
+-    return jsonRpcError(-32600, "Invalid Request", payload.id ?? null);
+-  }
+-
+-  const id = payload.id ?? null;
+-  const method = typeof payload.method === "string" ? payload.method : "";
+-
+-  if (method === "initialize") {
+-    return jsonRpcResponse(
+-      {
+-        result: {
+-          protocolVersion: "2024-11-05",
+-          capabilities: { tools: {} },
+-          serverInfo: { name: "swarm-memory", version: "1.0.0" },
+-        },
+-      },
+-      id,
+-    );
+-  }
+-
+-  if (method === "ping") {
+-    return jsonRpcResponse({ result: {} }, id);
+-  }
+-
+-  if (method === "tools/list") {
+-    return jsonRpcResponse({ result: { tools: MEMORY_TOOL_SCHEMAS } }, id);
+-  }
+-
+-  if (method === "tools/call") {
+-    const params = (payload.params ?? {}) as { name?: unknown; arguments?: unknown };
+-    const name = typeof params.name === "string" ? params.name : "";
+-    const answer = await runMemoryTool(owner, name, params.arguments ?? {});
+-    return jsonRpcResponse(
+-      {
++  const adapter: McpServerAdapter = {
++    name: "swarm-memory",
++    version: "1.0.0",
++    tools: MEMORY_TOOL_SCHEMAS,
++    async callTool(name, args) {
++      const answer = await runMemoryTool(owner, name, args);
++      return {
+         result: {
+           content: [{ type: "text", text: JSON.stringify(answer) }],
+           isError: answer.ok !== true,
+         },
+-      },
+-      id,
+-    );
+-  }
+-
+-  return jsonRpcError(-32601, "Method not found", id);
++      };
++    },
++  };
++  return handleMcpPost(request, adapter);
+ }
+diff --git a/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts b/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+index 7656656cc..f0eaa8a49 100644
+--- a/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
++++ b/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+@@ -193,7 +193,7 @@ test("POST tools/call with primitive params returns -32602 Invalid params", asyn
+   assert.equal(body.result, undefined);
+ });
+ 
+-test("POST tools/call with an invalid id type returns -32602 Invalid params", async () => {
++test("POST with an invalid id type returns -32600 Invalid Request", async () => {
+   const res = await POST(
+     new NextRequest("http://localhost/api/mcp/swarm-board", {
+       method: "POST",
+@@ -208,6 +208,6 @@ test("POST tools/call with an invalid id type returns -32602 Invalid params", as
+   );
+   assert.equal(res.status, 200);
+   const body = (await res.json()) as { error?: { code?: number }; result?: unknown };
+-  assert.equal(body.error?.code, -32602);
++  assert.equal(body.error?.code, -32600);
+   assert.equal(body.result, undefined);
+ });
+diff --git a/apps/swarmagents/app/api/mcp/swarm-board/route.ts b/apps/swarmagents/app/api/mcp/swarm-board/route.ts
+index 4a55c5da4..a50e5ff3d 100644
+--- a/apps/swarmagents/app/api/mcp/swarm-board/route.ts
++++ b/apps/swarmagents/app/api/mcp/swarm-board/route.ts
+@@ -7,8 +7,6 @@ import {
+ } from "@/lib/board/store";
+ import type { BoardStore } from "@/lib/board/types";
+ import {
+-  handleInitialize,
+-  handlePing,
+   handleToolsList,
+   handleCreateTask,
+   handlePollTasks,
+@@ -22,9 +20,10 @@ import {
+   handleSyncArtifact,
+   handleListArtifacts,
+ } from "@/lib/board/handlers";
++import type { JsonRpcError, JsonRpcResult } from "@/lib/board/handlers";
++import { handleMcpPost, type McpServerAdapter } from "@/lib/mcp/transport";
+ 
+ export const dynamic = "force-dynamic";
+-const MAX_BODY_SIZE = 256 * 1024;
+ 
+ /** JSON-RPC server error reserved for a board that is readable again after retry. */
+ const BOARD_UNAVAILABLE_CODE = -32001;
+@@ -37,14 +36,6 @@ function isBoardUnavailable(err: unknown): err is BoardUnavailableError {
+   );
+ }
+ 
+-function jsonRpcError(code: number, message: string, id: unknown, status = 200) {
+-  return NextResponse.json({ jsonrpc: "2.0", error: { code, message }, id: id ?? null }, { status });
+-}
+-
+-function jsonRpcResponse(payload: { result?: unknown }, id: unknown) {
+-  return NextResponse.json({ jsonrpc: "2.0", ...payload, id }, { status: 200 });
+-}
+-
+ /**
+  * A 503-style, explicitly retryable response. Returning an empty task list
+  * (the old behavior) would tell workers the board is genuinely empty and let
+@@ -77,38 +68,89 @@ function loadOrUnavailable(id?: unknown): { store: BoardStore } | { response: Ne
+   }
+ }
+ 
+-type HandlerResult =
+-  | { result: { content: Array<{ type: "text"; text: string }> } }
+-  | { error: { code: number; message: string } };
++type ToolOutcome =
++  | { result: { content: Array<{ type: "text"; text: string }>; isError?: boolean } }
++  | { error: { code: number; message: string; data?: unknown }; httpStatus?: number };
+ 
+-/**
+- * Run a board tool under the write lock and turn any storage-unavailable
+- * failure into a retryable JSON-RPC/HTTP error instead of a generic 500.
+- */
+-async function runLockedTool(
+-  id: unknown,
+-  work: () => Promise<HandlerResult>,
+-): Promise<NextResponse> {
++/** The same retryable 503 the old route returned, expressed as a tool outcome. */
++function boardUnavailableOutcome(): ToolOutcome {
++  return {
++    error: {
++      code: BOARD_UNAVAILABLE_CODE,
++      message: "Board storage is temporarily unavailable. Retry shortly.",
++      data: { retryable: true },
++    },
++    httpStatus: 503,
++  };
++}
++
++function toOutcome(res: { result: JsonRpcResult } | { error: JsonRpcError }): ToolOutcome {
++  if ("error" in res) return { error: res.error };
++  return { result: res.result };
++}
++
++/** Run a read tool against the loaded store (no lock, no persistence). */
++function runReadBoardTool(
++  work: (store: BoardStore) => { result: JsonRpcResult } | { error: JsonRpcError },
++): ToolOutcome {
++  const loaded = loadOrUnavailable();
++  if ("response" in loaded) return boardUnavailableOutcome();
++  return toOutcome(work(loaded.store));
++}
++
++/** Run a write tool under the write lock. */
++async function runLockedBoardTool(
++  work: () => Promise<{ result: JsonRpcResult } | { error: JsonRpcError }>,
++): Promise<ToolOutcome> {
+   try {
+-    const res = await work();
+-    if ("error" in res) return jsonRpcError(res.error.code, res.error.message, id);
+-    return jsonRpcResponse({ result: res.result }, id);
++    return toOutcome(await work());
+   } catch (err) {
+-    if (isBoardUnavailable(err)) return boardUnavailableResponse(id);
++    if (isBoardUnavailable(err)) return boardUnavailableOutcome();
+     throw err;
+   }
+ }
+ 
+-function runReadTool(
+-  id: unknown,
+-  work: (store: BoardStore) => HandlerResult,
+-): NextResponse {
+-  const loaded = loadOrUnavailable(id);
+-  if ("response" in loaded) return loaded.response;
+-  const res = work(loaded.store);
+-  if ("error" in res) return jsonRpcError(res.error.code, res.error.message, id);
+-  return jsonRpcResponse({ result: res.result }, id);
+-}
++const boardAdapter: McpServerAdapter = {
++  name: "swarmagents-cloud-mcp",
++  version: "2.0.0",
++  tools: handleToolsList(null).result.tools,
++  async callTool(name, args) {
++    if (name === "poll_tasks") {
++      return runReadBoardTool((store) => handlePollTasks(store, args));
++    }
++    if (name === "list_proposals") {
++      return runReadBoardTool((store) => handleListProposals(store, args));
++    }
++    if (name === "list_artifacts") {
++      return runReadBoardTool((store) => handleListArtifacts(store, args));
++    }
++    if (name === "create_task") {
++      return runLockedBoardTool(() => withLockedStore((store) => handleCreateTask(store, args)));
++    }
++    if (name === "claim_task") {
++      return runLockedBoardTool(() => withLockedStore((store) => handleClaimTask(store, args)));
++    }
++    if (name === "submit_task_work") {
++      return runLockedBoardTool(() => withLockedStore((store) => handleSubmitTaskWork(store, args)));
++    }
++    if (name === "submit_proposal") {
++      return runLockedBoardTool(() => withLockedStore((store) => handleSubmitProposal(store, args)));
++    }
++    if (name === "judge_proposal") {
++      return runLockedBoardTool(() => withLockedStore((store) => handleJudgeProposal(store, args)));
++    }
++    if (name === "review_and_merge_task") {
++      return runLockedBoardTool(() => withLockedStore((store) => handleReviewAndMergeTask(store, args)));
++    }
++    if (name === "record_match") {
++      return runLockedBoardTool(() => withLockedStore((store) => handleRecordMatch(store, args)));
++    }
++    if (name === "sync_artifact") {
++      return runLockedBoardTool(() => withLockedStore((store) => handleSyncArtifact(store, args)));
++    }
++    return { error: { code: -32601, message: `Unknown tool: ${name}` } };
++  },
++};
+ 
+ // GET: Returns current board status, active tasks, proposals, and messages
+ export async function GET(req: NextRequest) {
+@@ -152,109 +194,5 @@ export async function GET(req: NextRequest) {
+ 
+ // POST: Standard JSON-RPC 2.0 endpoint for Remote MCP clients (SSE / HTTP transport)
+ export async function POST(req: NextRequest) {
+-  let text: string;
+-  try {
+-    text = await req.text();
+-  } catch {
+-    return jsonRpcError(-32700, "Parse error", null, 400);
+-  }
+-
+-  if (text.length > MAX_BODY_SIZE) {
+-    return jsonRpcError(-32602, "Request body too large", null);
+-  }
+-
+-  let body: any;
+-  try {
+-    body = JSON.parse(text);
+-  } catch {
+-    return jsonRpcError(-32700, "Parse error", null, 400);
+-  }
+-
+-  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+-    return jsonRpcError(-32600, "Invalid Request", null);
+-  }
+-
+-  if (body.jsonrpc !== "2.0") {
+-    return jsonRpcError(-32600, "Invalid Request", body.id ?? null);
+-  }
+-
+-  const { id, method, params } = body;
+-
+-  if (method === "initialize") {
+-    return jsonRpcResponse(handleInitialize(id), id);
+-  }
+-
+-  if (method === "ping") {
+-    return jsonRpcResponse(handlePing(id), id);
+-  }
+-
+-  if (method === "tools/list") {
+-    return jsonRpcResponse(handleToolsList(id), id);
+-  }
+-
+-  if (method === "tools/call") {
+-    // JSON-RPC 2.0 compliance: when present, params MUST be a structured
+-    // object (not an array or primitive), and id MUST be a String, Number,
+-    // or null. Anything else is Invalid params (-32602).
+-    if (
+-      params !== undefined &&
+-      (typeof params !== "object" || params === null || Array.isArray(params))
+-    ) {
+-      return jsonRpcError(-32602, "Invalid params", id ?? null);
+-    }
+-    if (id !== undefined && id !== null && typeof id !== "string" && typeof id !== "number") {
+-      return jsonRpcError(-32602, "Invalid params", null);
+-    }
+-
+-    const name = params?.name;
+-    const args = params?.arguments || {};
+-
+-    if (name === "create_task") {
+-      return runLockedTool(id, () => withLockedStore((store) => handleCreateTask(store, args)));
+-    }
+-
+-    if (name === "poll_tasks") {
+-      return runReadTool(id, (store) => handlePollTasks(store, args));
+-    }
+-
+-    if (name === "claim_task") {
+-      return runLockedTool(id, () => withLockedStore((store) => handleClaimTask(store, args)));
+-    }
+-
+-    if (name === "submit_task_work") {
+-      return runLockedTool(id, () => withLockedStore((store) => handleSubmitTaskWork(store, args)));
+-    }
+-
+-    if (name === "submit_proposal") {
+-      return runLockedTool(id, () => withLockedStore((store) => handleSubmitProposal(store, args)));
+-    }
+-
+-    if (name === "list_proposals") {
+-      return runReadTool(id, (store) => handleListProposals(store, args));
+-    }
+-
+-    if (name === "judge_proposal") {
+-      return runLockedTool(id, () => withLockedStore((store) => handleJudgeProposal(store, args)));
+-    }
+-
+-    if (name === "review_and_merge_task") {
+-      return runLockedTool(id, () => withLockedStore((store) => handleReviewAndMergeTask(store, args)));
+-    }
+-
+-    if (name === "record_match") {
+-      return runLockedTool(id, () => withLockedStore((store) => handleRecordMatch(store, args)));
+-    }
+-
+-    if (name === "sync_artifact") {
+-      return runLockedTool(id, () => withLockedStore((store) => handleSyncArtifact(store, args)));
+-    }
+-
+-    if (name === "list_artifacts") {
+-      return runReadTool(id, (store) => handleListArtifacts(store, args));
+-    }
+-
+-    return jsonRpcError(-32601, `Unknown tool: ${name}`, id);
+-  }
+-
+-  return jsonRpcError(-32601, "Method not found", id);
++  return handleMcpPost(req, boardAdapter);
+ }
+diff --git a/apps/swarmagents/lib/http-guard.test.ts b/apps/swarmagents/lib/http-guard.test.ts
+new file mode 100644
+index 000000000..24bf022d8
+--- /dev/null
++++ b/apps/swarmagents/lib/http-guard.test.ts
+@@ -0,0 +1,230 @@
++/**
++ * Tests for the composable route guard (lib/http-guard): caller extraction,
++ * auth, per-user rate limiting before body parsing, bounded JSON bodies,
++ * and automatic Cache-Control: no-store.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { NextRequest, NextResponse } from "next/server";
++import { USER_HEADER } from "./auth";
++import { TokenBucket } from "./rate-limit";
++import {
++  extractCaller,
++  jsonNoStore,
++  RouteValidationError,
++  withRouteGuard,
++} from "./http-guard";
++
++function request(
++  body?: string,
++  headers: Record<string, string> = {},
++): NextRequest {
++  return new NextRequest("http://localhost/api/test", {
++    method: "POST",
++    headers: { "content-type": "application/json", ...headers },
++    body,
++  });
++}
++
++function authed(body?: string): NextRequest {
++  return request(body, { [USER_HEADER]: "local_alice@example.com" });
++}
++
++test("extractCaller returns the x-swarm-user header value", () => {
++  assert.equal(extractCaller(authed()), "local_alice@example.com");
++  assert.equal(extractCaller(request()), null);
++  assert.equal(extractCaller(request(undefined, { [USER_HEADER]: "" })), null);
++  assert.equal(extractCaller(request(undefined, { [USER_HEADER]: "x".repeat(129) })), null);
++  assert.equal(extractCaller(request(undefined, { [USER_HEADER]: "x".repeat(128) })), "x".repeat(128));
++});
++
++test("jsonNoStore sets Cache-Control: no-store and the given status", async () => {
++  const res = jsonNoStore({ ok: true }, 201);
++  assert.equal(res.status, 201);
++  assert.equal(res.headers.get("cache-control"), "no-store");
++  assert.deepEqual(await res.json(), { ok: true });
++});
++
++test("guard rejects an unauthenticated caller with 401 + no-store", async () => {
++  const handler = withRouteGuard({}, async () => NextResponse.json({ ok: true }));
++  const res = await handler(request(JSON.stringify({})), {});
++  assert.equal(res.status, 401);
++  assert.equal(res.headers.get("cache-control"), "no-store");
++  assert.deepEqual(await res.json(), { error: "Sign in required." });
++});
++
++test("guard passes an authenticated caller through with user + parsed body", async () => {
++  const seen: Array<{ user: string; body: unknown }> = [];
++  const handler = withRouteGuard<{ n: number }>(
++    { json: {} },
++    async ({ user, body }) => {
++      seen.push({ user, body });
++      return NextResponse.json({ ok: true });
++    },
++  );
++  const res = await handler(authed(JSON.stringify({ n: 3 })), {});
++  assert.equal(res.status, 200);
++  assert.equal(res.headers.get("cache-control"), "no-store");
++  assert.deepEqual(seen, [{ user: "local_alice@example.com", body: { n: 3 } }]);
++});
++
++test("guard with auth: false does not require a caller", async () => {
++  const handler = withRouteGuard({ auth: false }, async ({ user }) => NextResponse.json({ user }));
++  const res = await handler(request(JSON.stringify({})), {});
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { user: "" });
++});
++
++test("guard rate-limits before body parsing (second request is 429 even with a bad body)", async () => {
++  const bucket = new TokenBucket(1, 60_000);
++  const handler = withRouteGuard(
++    { rateLimit: { bucket, keyPrefix: "test" }, json: {} },
++    async () => NextResponse.json({ ok: true }),
++  );
++  const first = await handler(authed(JSON.stringify({})), {});
++  assert.equal(first.status, 200);
++
++  // The bucket is exhausted; even a malformed body must hit the rate limit
++  // first (429), not the body parser (400).
++  const second = await handler(authed("{not json"), {});
++  assert.equal(second.status, 429);
++  assert.equal(second.headers.get("retry-after"), "60");
++  assert.equal(second.headers.get("cache-control"), "no-store");
++  assert.deepEqual(await second.json(), { error: "Too many requests - try again shortly." });
++});
++
++test("guard rate-limits per user (different users get separate budgets)", async () => {
++  const bucket = new TokenBucket(1, 60_000);
++  const handler = withRouteGuard(
++    { rateLimit: { bucket, keyPrefix: "test" } },
++    async () => NextResponse.json({ ok: true }),
++  );
++  assert.equal((await handler(authed(), {})).status, 200);
++  const other = request(undefined, { [USER_HEADER]: "local_bob@example.com" });
++  assert.equal((await handler(other, {})).status, 200);
++});
++
++test("guard rejects an oversized body with 413", async () => {
++  const handler = withRouteGuard(
++    { json: { maxBytes: 10 } },
++    async () => NextResponse.json({ ok: true }),
++  );
++  const res = await handler(authed(JSON.stringify({ pad: "x".repeat(100) })), {});
++  assert.equal(res.status, 413);
++  assert.deepEqual(await res.json(), { error: "Request body too large." });
++});
++
++test("guard rejects invalid JSON with 400", async () => {
++  const handler = withRouteGuard({ json: {} }, async () => NextResponse.json({ ok: true }));
++  const res = await handler(authed("{not json"), {});
++  assert.equal(res.status, 400);
++  assert.deepEqual(await res.json(), { error: "Invalid JSON body." });
++});
++
++test("guard rejects an empty body when json is not optional", async () => {
++  const handler = withRouteGuard({ json: {} }, async () => NextResponse.json({ ok: true }));
++  const res = await handler(authed(""), {});
++  assert.equal(res.status, 400);
++  assert.deepEqual(await res.json(), { error: "Request body is required." });
++});
++
++test("guard accepts an empty body when json is optional (body becomes {})", async () => {
++  const seen: unknown[] = [];
++  const handler = withRouteGuard(
++    { json: { optional: true } },
++    async ({ body }) => {
++      seen.push(body);
++      return NextResponse.json({ ok: true });
++    },
++  );
++  const res = await handler(authed(""), {});
++  assert.equal(res.status, 200);
++  assert.deepEqual(seen, [{}]);
++});
++
++test("guard validate callback transforms the body and rejects bad payloads", async () => {
++  const handler = withRouteGuard<{ id: string }>(
++    {
++      json: {
++        validate: (raw) => {
++          if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
++            throw new RouteValidationError("Body must be a JSON object.");
++          }
++          const id = (raw as { id?: unknown }).id;
++          if (typeof id !== "string" || !id) {
++            throw new RouteValidationError("id is required.", 422);
++          }
++          return { id };
++        },
++      },
++    },
++    async ({ body }) => NextResponse.json({ id: body.id }),
++  );
++
++  const ok = await handler(authed(JSON.stringify({ id: "abc", extra: 1 })), {});
++  assert.equal(ok.status, 200);
++  assert.deepEqual(await ok.json(), { id: "abc" });
++
++  const bad = await handler(authed(JSON.stringify({})), {});
++  assert.equal(bad.status, 422);
++  assert.deepEqual(await bad.json(), { error: "id is required." });
++
++  const notObject = await handler(authed(JSON.stringify([1, 2])), {});
++  assert.equal(notObject.status, 400);
++  assert.deepEqual(await notObject.json(), { error: "Body must be a JSON object." });
++});
++
++test("guard maps a non-RouteValidationError from validate to 400", async () => {
++  const handler = withRouteGuard(
++    {
++      json: {
++        validate: () => {
++          throw new Error("boom");
++        },
++      },
++    },
++    async () => NextResponse.json({ ok: true }),
++  );
++  const res = await handler(authed(JSON.stringify({})), {});
++  assert.equal(res.status, 400);
++  assert.deepEqual(await res.json(), { error: "Invalid request payload." });
++});
++
++test("guard adds no-store to a handler response that lacks cache-control", async () => {
++  const handler = withRouteGuard({}, async () => new Response("hello", { status: 200 }));
++  const res = await handler(authed(), {});
++  assert.equal(res.headers.get("cache-control"), "no-store");
++  assert.equal(await res.text(), "hello");
++});
++
++test("guard keeps a handler response's own cache-control header", async () => {
++  const handler = withRouteGuard(
++    {},
++    async () => new Response("hello", { headers: { "cache-control": "public, max-age=60" } }),
++  );
++  const res = await handler(authed(), {});
++  assert.equal(res.headers.get("cache-control"), "public, max-age=60");
++});
++
++test("guard maps a RouteValidationError thrown by the handler to its status", async () => {
++  const handler = withRouteGuard({}, async () => {
++    throw new RouteValidationError("Nope.", 403);
++  });
++  const res = await handler(authed(), {});
++  assert.equal(res.status, 403);
++  assert.deepEqual(await res.json(), { error: "Nope." });
++});
++
++test("guard rethrows a non-validation error from the handler", async () => {
++  const handler = withRouteGuard({}, async () => {
++    throw new Error("boom");
++  });
++  await assert.rejects(handler(authed(), {}), /boom/);
++});
++
++test("RouteValidationError defaults to status 400", () => {
++  const err = new RouteValidationError("bad");
++  assert.equal(err.status, 400);
++  assert.equal(err.name, "RouteValidationError");
++});
+diff --git a/apps/swarmagents/lib/http-guard.ts b/apps/swarmagents/lib/http-guard.ts
+new file mode 100644
+index 000000000..9d9219b01
+--- /dev/null
++++ b/apps/swarmagents/lib/http-guard.ts
+@@ -0,0 +1,135 @@
++/**
++ * Composable Next.js App Router guard enforcing:
++ *   1. Verified caller extraction (`x-swarm-user`)
++ *   2. Per-user TokenBucket rate limiting (before any I/O or VM calls)
++ *   3. Bounded JSON body parsing with structured 400/413 responses
++ *   4. Automatic `Cache-Control: no-store` on all responses
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { USER_HEADER } from "./auth";
++import { TokenBucket } from "./rate-limit";
++
++export const NO_STORE_HEADERS = { "cache-control": "no-store" } as const;
++
++export interface GuardContext<TBody = unknown> {
++  req: NextRequest;
++  user: string;
++  body: TBody;
++}
++
++export interface RouteGuardOptions<TBody = unknown> {
++  /** Require a verified `x-swarm-user` header (default: true). */
++  auth?: boolean;
++  /** Optional dedicated per-user TokenBucket checked prior to body parsing or I/O. */
++  rateLimit?: {
++    bucket: TokenBucket;
++    keyPrefix: string;
++    message?: string;
++  };
++  /** Parse and bound JSON request body when present. */
++  json?: {
++    maxBytes?: number;
++    optional?: boolean;
++    validate?: (raw: unknown) => TBody;
++  };
++}
++
++export class RouteValidationError extends Error {
++  readonly status: number;
++  constructor(message: string, status = 400) {
++    super(message);
++    this.name = "RouteValidationError";
++    this.status = status;
++  }
++}
++
++export function extractCaller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++export function jsonNoStore(payload: unknown, status = 200, extraHeaders?: Record<string, string>): NextResponse {
++  return NextResponse.json(payload, {
++    status,
++    headers: { ...NO_STORE_HEADERS, ...extraHeaders },
++  });
++}
++
++export function withRouteGuard<TBody = unknown, TRouteCtx = unknown>(
++  options: RouteGuardOptions<TBody>,
++  handler: (ctx: GuardContext<TBody>, routeCtx: TRouteCtx) => Promise<Response> | Response,
++) {
++  const requireAuth = options.auth !== false;
++  const maxBytes = options.json?.maxBytes ?? 64 * 1024;
++
++  return async (req: NextRequest, routeCtx: TRouteCtx): Promise<Response> => {
++    const user = extractCaller(req);
++    if (requireAuth && !user) {
++      return jsonNoStore({ error: "Sign in required." }, 401);
++    }
++
++    if (options.rateLimit) {
++      const identity = user ?? req.headers.get("x-real-ip") ?? "anonymous";
++      const result = options.rateLimit.bucket.consume(`${options.rateLimit.keyPrefix}:${identity}`);
++      if (!result.allowed) {
++        return jsonNoStore(
++          { error: options.rateLimit.message ?? "Too many requests - try again shortly." },
++          429,
++          { "Retry-After": String(result.retryAfter) },
++        );
++      }
++    }
++
++    let parsedBody = undefined as TBody;
++    if (options.json) {
++      let text: string;
++      try {
++        text = await req.text();
++      } catch {
++        return jsonNoStore({ error: "Could not read request body." }, 400);
++      }
++      if (text.length > maxBytes) {
++        return jsonNoStore({ error: "Request body too large." }, 413);
++      }
++      if (!text.trim()) {
++        if (!options.json.optional) {
++          return jsonNoStore({ error: "Request body is required." }, 400);
++        }
++        parsedBody = {} as TBody;
++      } else {
++        let raw: unknown;
++        try {
++          raw = JSON.parse(text);
++        } catch {
++          return jsonNoStore({ error: "Invalid JSON body." }, 400);
++        }
++        if (options.json.validate) {
++          try {
++            parsedBody = options.json.validate(raw);
++          } catch (err) {
++            if (err instanceof RouteValidationError) {
++              return jsonNoStore({ error: err.message }, err.status);
++            }
++            return jsonNoStore({ error: "Invalid request payload." }, 400);
++          }
++        } else {
++          parsedBody = raw as TBody;
++        }
++      }
++    }
++
++    try {
++      const res = await handler({ req, user: user ?? "", body: parsedBody }, routeCtx);
++      if (!res.headers.has("cache-control")) {
++        res.headers.set("cache-control", "no-store");
++      }
++      return res;
++    } catch (err) {
++      if (err instanceof RouteValidationError) {
++        return jsonNoStore({ error: err.message }, err.status);
++      }
++      throw err;
++    }
++  };
++}
+diff --git a/apps/swarmagents/lib/mcp/transport.test.ts b/apps/swarmagents/lib/mcp/transport.test.ts
+new file mode 100644
+index 000000000..83804e12e
+--- /dev/null
++++ b/apps/swarmagents/lib/mcp/transport.test.ts
+@@ -0,0 +1,319 @@
++/**
++ * Tests for the shared JSON-RPC 2.0 / MCP (2024-11-05) transport
++ * (lib/mcp/transport): single requests, batch arrays, notifications,
++ * initialize/ping/tools/resources, error codes, and HTTP mapping.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { NextRequest } from "next/server";
++import { handleMcpPost, type McpServerAdapter } from "./transport";
++
++function post(body: unknown, rawBody?: string): NextRequest {
++  return new NextRequest("http://localhost/api/mcp/test", {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: rawBody ?? JSON.stringify(body),
++  });
++}
++
++const echoAdapter: McpServerAdapter = {
++  name: "test-server",
++  version: "1.0.0",
++  tools: [{ name: "echo", description: "Echo the arguments.", inputSchema: { type: "object" } }],
++  async callTool(name, args) {
++    if (name === "echo") {
++      return { result: { content: [{ type: "text", text: JSON.stringify(args) }] } };
++    }
++    if (name === "boom") {
++      return { error: { code: -32000, message: "boom" } };
++    }
++    if (name === "unavailable") {
++      return {
++        error: { code: -32001, message: "Board storage is temporarily unavailable. Retry shortly.", data: { retryable: true } },
++        httpStatus: 503,
++      };
++    }
++    return { error: { code: -32601, message: `Unknown tool: ${name}` } };
++  },
++};
++
++const resourceAdapter: McpServerAdapter = {
++  ...echoAdapter,
++  async listResources() {
++    return [{ uri: "test://hello", name: "hello", mimeType: "text/plain" }];
++  },
++  async readResource(uri) {
++    if (uri === "test://hello") {
++      return { uri, mimeType: "text/plain", text: "hello" };
++    }
++    return null;
++  },
++};
++
++test("initialize answers with protocol 2024-11-05 and serverInfo", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 1, method: "initialize" }),
++    echoAdapter,
++  );
++  assert.equal(res.status, 200);
++  assert.equal(res.headers.get("cache-control"), "no-store");
++  const body = (await res.json()) as {
++    result: { protocolVersion: string; capabilities: { tools: unknown }; serverInfo: { name: string; version: string } };
++  };
++  assert.equal(body.result.protocolVersion, "2024-11-05");
++  assert.equal(body.result.serverInfo.name, "test-server");
++  assert.equal(body.result.serverInfo.version, "1.0.0");
++  assert.deepEqual(body.result.capabilities.tools, {});
++});
++
++test("initialize advertises resources capability only when the adapter has them", async () => {
++  const without = await handleMcpPost(post({ jsonrpc: "2.0", id: 1, method: "initialize" }), echoAdapter);
++  const withoutBody = (await without.json()) as { result: { capabilities: Record<string, unknown> } };
++  assert.equal("resources" in withoutBody.result.capabilities, false);
++
++  const withRes = await handleMcpPost(post({ jsonrpc: "2.0", id: 1, method: "initialize" }), resourceAdapter);
++  const withBody = (await withRes.json()) as { result: { capabilities: Record<string, unknown> } };
++  assert.deepEqual(withBody.result.capabilities.resources, {});
++});
++
++test("ping answers with an empty result", async () => {
++  const res = await handleMcpPost(post({ jsonrpc: "2.0", id: 2, method: "ping" }), echoAdapter);
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { jsonrpc: "2.0", id: 2, result: {} });
++});
++
++test("tools/list returns the adapter tools", async () => {
++  const res = await handleMcpPost(post({ jsonrpc: "2.0", id: 3, method: "tools/list" }), echoAdapter);
++  const body = (await res.json()) as { result: { tools: Array<{ name: string }> } };
++  assert.deepEqual(body.result.tools.map((t) => t.name), ["echo"]);
++});
++
++test("tools/call dispatches and returns the tool result", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "echo", arguments: { a: 1 } } }),
++    echoAdapter,
++  );
++  assert.equal(res.status, 200);
++  const body = (await res.json()) as { result: { content: Array<{ text: string }> } };
++  assert.deepEqual(JSON.parse(body.result.content[0].text), { a: 1 });
++});
++
++test("tools/call surfaces a tool error with its code", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "boom", arguments: {} } }),
++    echoAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number; message: string } };
++  assert.equal(body.error.code, -32000);
++  assert.equal(body.error.message, "boom");
++});
++
++test("tools/call with an unknown tool returns -32601", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "nope", arguments: {} } }),
++    echoAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32601);
++});
++
++test("tools/call with a missing name returns -32602", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { arguments: {} } }),
++    echoAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32602);
++});
++
++test("tools/call with non-object arguments returns -32602", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "echo", arguments: [1, 2] } }),
++    echoAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number; message: string } };
++  assert.equal(body.error.code, -32602);
++  assert.match(body.error.message, /arguments must be an object/);
++});
++
++test("non-object params returns -32602", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 9, method: "tools/call", params: [1, 2] }),
++    echoAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32602);
++});
++
++test("notifications/initialized without id returns 202 with no body", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", method: "notifications/initialized" }),
++    echoAdapter,
++  );
++  assert.equal(res.status, 202);
++  assert.equal(await res.text(), "");
++});
++
++test("notifications/cancelled without id returns 202 with no body", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", method: "notifications/cancelled" }),
++    echoAdapter,
++  );
++  assert.equal(res.status, 202);
++});
++
++test("an unknown method without id is also a notification (202, no body)", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", method: "notifications/unknown" }),
++    echoAdapter,
++  );
++  assert.equal(res.status, 202);
++});
++
++test("an unknown method with id returns -32601", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 10, method: "resources/subscribe" }),
++    echoAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number; message: string } };
++  assert.equal(body.error.code, -32601);
++  assert.match(body.error.message, /Method not found/);
++});
++
++test("a wrong jsonrpc version returns -32600", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "1.0", id: 11, method: "tools/list" }),
++    echoAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32600);
++});
++
++test("a JSON null body returns -32600", async () => {
++  const res = await handleMcpPost(post(null, "null"), echoAdapter);
++  assert.equal(res.status, 200);
++  const body = (await res.json()) as { error: { code: number; message: string } };
++  assert.equal(body.error.code, -32600);
++  assert.match(body.error.message, /Invalid Request/);
++});
++
++test("an invalid id type returns -32600", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: { bad: true }, method: "ping" }),
++    echoAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32600);
++});
++
++test("unparseable JSON returns -32700 with HTTP 400", async () => {
++  const res = await handleMcpPost(post(null, "{not json"), echoAdapter);
++  assert.equal(res.status, 400);
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32700);
++});
++
++test("an oversized body returns -32602 with HTTP 413", async () => {
++  const big = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping", pad: "x".repeat(300 * 1024) });
++  const res = await handleMcpPost(post(null, big), echoAdapter);
++  assert.equal(res.status, 413);
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32602);
++});
++
++test("a batch of two calls returns an array of two packets", async () => {
++  const res = await handleMcpPost(
++    post([
++      { jsonrpc: "2.0", id: 1, method: "ping" },
++      { jsonrpc: "2.0", id: 2, method: "tools/list" },
++    ]),
++    echoAdapter,
++  );
++  assert.equal(res.status, 200);
++  const body = (await res.json()) as Array<{ id: number; result?: unknown; error?: unknown }>;
++  assert.equal(body.length, 2);
++  assert.deepEqual(body.map((p) => p.id), [1, 2]);
++});
++
++test("a batch of only notifications returns 202 with no body", async () => {
++  const res = await handleMcpPost(
++    post([{ jsonrpc: "2.0", method: "notifications/initialized" }]),
++    echoAdapter,
++  );
++  assert.equal(res.status, 202);
++  assert.equal(await res.text(), "");
++});
++
++test("an empty batch returns -32600 with HTTP 400", async () => {
++  const res = await handleMcpPost(post([]), echoAdapter);
++  assert.equal(res.status, 400);
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32600);
++});
++
++test("a batch larger than 20 returns -32600 with HTTP 400", async () => {
++  const batch = Array.from({ length: 21 }, (_, i) => ({ jsonrpc: "2.0", id: i, method: "ping" }));
++  const res = await handleMcpPost(post(batch), echoAdapter);
++  assert.equal(res.status, 400);
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32600);
++});
++
++test("resources/list returns the adapter resources", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 20, method: "resources/list" }),
++    resourceAdapter,
++  );
++  const body = (await res.json()) as { result: { resources: Array<{ uri: string }> } };
++  assert.deepEqual(body.result.resources.map((r) => r.uri), ["test://hello"]);
++});
++
++test("resources/list without a resources adapter returns -32601", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 21, method: "resources/list" }),
++    echoAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32601);
++});
++
++test("resources/read returns the resource contents", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 22, method: "resources/read", params: { uri: "test://hello" } }),
++    resourceAdapter,
++  );
++  const body = (await res.json()) as { result: { contents: Array<{ text: string }> } };
++  assert.equal(body.result.contents[0].text, "hello");
++});
++
++test("resources/read of an unknown uri returns -32002", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 23, method: "resources/read", params: { uri: "test://missing" } }),
++    resourceAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32002);
++});
++
++test("resources/read without a uri returns -32602", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 24, method: "resources/read", params: {} }),
++    resourceAdapter,
++  );
++  const body = (await res.json()) as { error: { code: number } };
++  assert.equal(body.error.code, -32602);
++});
++
++test("a tool error with httpStatus 503 maps to HTTP 503 + Retry-After", async () => {
++  const res = await handleMcpPost(
++    post({ jsonrpc: "2.0", id: 25, method: "tools/call", params: { name: "unavailable", arguments: {} } }),
++    echoAdapter,
++  );
++  assert.equal(res.status, 503);
++  assert.equal(res.headers.get("retry-after"), "2");
++  const body = (await res.json()) as { error: { code: number; data?: { retryable?: boolean } }; id: number };
++  assert.equal(body.error.code, -32001);
++  assert.equal(body.error.data?.retryable, true);
++  assert.equal(body.id, 25);
++});
+diff --git a/apps/swarmagents/lib/mcp/transport.ts b/apps/swarmagents/lib/mcp/transport.ts
+new file mode 100644
+index 000000000..0bee9b6fb
+--- /dev/null
++++ b/apps/swarmagents/lib/mcp/transport.ts
+@@ -0,0 +1,211 @@
++/**
++ * Shared JSON-RPC 2.0 / MCP (2024-11-05) transport layer.
++ *
++ * Supports:
++ *   - Single requests and JSON-RPC batch arrays (bounded to 20 calls)
++ *   - JSON-RPC notifications (requests without `id`, e.g. `notifications/initialized`) -> 202 Accepted
++ *   - `initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/read`
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++
++const MAX_BODY_BYTES = 256 * 1024;
++const MAX_BATCH_SIZE = 20;
++const NO_STORE = { "cache-control": "no-store" } as const;
++
++export interface McpResourceDescriptor {
++  uri: string;
++  name: string;
++  description?: string;
++  mimeType?: string;
++}
++
++export interface McpResourceContent {
++  uri: string;
++  mimeType?: string;
++  text: string;
++}
++
++export interface McpServerAdapter {
++  name: string;
++  version: string;
++  tools: readonly unknown[];
++  callTool(name: string, args: Record<string, unknown>): Promise<
++    | { result: { content: Array<{ type: "text"; text: string }>; isError?: boolean } }
++    | { error: { code: number; message: string; data?: unknown }; httpStatus?: number }
++  >;
++  listResources?(): Promise<McpResourceDescriptor[]>;
++  readResource?(uri: string): Promise<McpResourceContent | null>;
++}
++
++interface JsonRpcPacket {
++  jsonrpc: "2.0";
++  id?: string | number | null;
++  result?: unknown;
++  error?: { code: number; message: string; data?: unknown };
++}
++
++function isPlainObject(v: unknown): v is Record<string, unknown> {
++  return typeof v === "object" && v !== null && !Array.isArray(v);
++}
++
++function isValidId(id: unknown): id is string | number | null {
++  return id === null || typeof id === "string" || (typeof id === "number" && Number.isFinite(id));
++}
++
++async function dispatchSingle(
++  raw: unknown,
++  adapter: McpServerAdapter,
++): Promise<{ packet: JsonRpcPacket | null; httpStatus?: number }> {
++  if (!isPlainObject(raw)) {
++    return { packet: { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } } };
++  }
++
++  const hasId = "id" in raw && raw.id !== undefined;
++  let id: string | number | null = null;
++  if (hasId) {
++    if (!isValidId(raw.id)) {
++      return { packet: { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request id" } } };
++    }
++    id = raw.id;
++  }
++
++  if (raw.jsonrpc !== "2.0" || typeof raw.method !== "string" || !raw.method) {
++    return { packet: { jsonrpc: "2.0", id: isValidId(id) ? id : null, error: { code: -32600, message: "Invalid Request" } } };
++  }
++
++  const method = raw.method;
++  const params = raw.params;
++  if (params !== undefined && !isPlainObject(params)) {
++    return { packet: { jsonrpc: "2.0", id, error: { code: -32602, message: "Invalid params: must be an object" } } };
++  }
++
++  // JSON-RPC notifications carry no `id` and expect no JSON-RPC response body.
++  if (!hasId) {
++    if (method === "notifications/initialized" || method === "notifications/cancelled") {
++      return { packet: null };
++    }
++    return { packet: null };
++  }
++
++  if (method === "initialize") {
++    return {
++      packet: {
++        jsonrpc: "2.0",
++        id,
++        result: {
++          protocolVersion: "2024-11-05",
++          capabilities: {
++            tools: {},
++            ...(adapter.listResources ? { resources: {} } : {}),
++          },
++          serverInfo: { name: adapter.name, version: adapter.version },
++        },
++      },
++    };
++  }
++
++  if (method === "ping") {
++    return { packet: { jsonrpc: "2.0", id, result: {} } };
++  }
++
++  if (method === "tools/list") {
++    return { packet: { jsonrpc: "2.0", id, result: { tools: adapter.tools } } };
++  }
++
++  if (method === "tools/call") {
++    const name = typeof params?.name === "string" ? params.name : "";
++    if (!name) {
++      return { packet: { jsonrpc: "2.0", id, error: { code: -32602, message: "Tool name is required" } } };
++    }
++    const args = params?.arguments;
++    if (args !== undefined && !isPlainObject(args)) {
++      return { packet: { jsonrpc: "2.0", id, error: { code: -32602, message: "Tool arguments must be an object" } } };
++    }
++    const outcome = await adapter.callTool(name, args ?? {});
++    if ("error" in outcome) {
++      return {
++        packet: { jsonrpc: "2.0", id, error: outcome.error },
++        ...(outcome.httpStatus ? { httpStatus: outcome.httpStatus } : {}),
++      };
++    }
++    return { packet: { jsonrpc: "2.0", id, result: outcome.result } };
++  }
++
++  if (method === "resources/list" && adapter.listResources) {
++    const resources = await adapter.listResources();
++    return { packet: { jsonrpc: "2.0", id, result: { resources } } };
++  }
++
++  if (method === "resources/read" && adapter.readResource) {
++    const uri = typeof params?.uri === "string" ? params.uri : "";
++    if (!uri) {
++      return { packet: { jsonrpc: "2.0", id, error: { code: -32602, message: "Resource uri is required" } } };
++    }
++    const content = await adapter.readResource(uri);
++    if (!content) {
++      return { packet: { jsonrpc: "2.0", id, error: { code: -32002, message: `Resource not found: ${uri}` } } };
++    }
++    return { packet: { jsonrpc: "2.0", id, result: { contents: [content] } } };
++  }
++
++  return { packet: { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } } };
++}
++
++export async function handleMcpPost(req: NextRequest, adapter: McpServerAdapter): Promise<NextResponse> {
++  let text: string;
++  try {
++    text = await req.text();
++  } catch {
++    return NextResponse.json(
++      { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
++      { status: 400, headers: NO_STORE },
++    );
++  }
++  if (text.length > MAX_BODY_BYTES) {
++    return NextResponse.json(
++      { jsonrpc: "2.0", id: null, error: { code: -32602, message: "Request body too large" } },
++      { status: 413, headers: NO_STORE },
++    );
++  }
++
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(text);
++  } catch {
++    return NextResponse.json(
++      { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
++      { status: 400, headers: NO_STORE },
++    );
++  }
++
++  if (Array.isArray(parsed)) {
++    if (parsed.length === 0 || parsed.length > MAX_BATCH_SIZE) {
++      return NextResponse.json(
++        { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid batch size" } },
++        { status: 400, headers: NO_STORE },
++      );
++    }
++    const responses: JsonRpcPacket[] = [];
++    for (const item of parsed) {
++      const { packet } = await dispatchSingle(item, adapter);
++      if (packet) responses.push(packet);
++    }
++    if (responses.length === 0) {
++      return new NextResponse(null, { status: 202, headers: NO_STORE });
++    }
++    return NextResponse.json(responses, { status: 200, headers: NO_STORE });
++  }
++
++  const { packet, httpStatus } = await dispatchSingle(parsed, adapter);
++  if (!packet) {
++    return new NextResponse(null, { status: 202, headers: NO_STORE });
++  }
++  return NextResponse.json(packet, {
++    status: httpStatus ?? 200,
++    headers: {
++      ...NO_STORE,
++      ...(httpStatus === 503 ? { "Retry-After": "2" } : {}),
++    },
++  });
++}
+-- 
+2.55.0
+

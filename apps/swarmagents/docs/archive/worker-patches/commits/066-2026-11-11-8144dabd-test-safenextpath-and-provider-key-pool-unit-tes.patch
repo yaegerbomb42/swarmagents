@@ -1,0 +1,187 @@
+From 8144dabd0f5878465ced713a14cccf9870d52986 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:42:26 -0600
+Subject: [PATCH] test: safeNextPath and provider key pool unit tests
+
+safeNextPath: same-origin absolute paths pass; protocol-relative, absolute
+URLs, backslash-smuggled paths, embedded control characters, empty and
+over-length values, and non-string inputs fall back to '/'; surrounding
+whitespace is trimmed. KeyPool: picks the next usable key (skipping empty,
+duplicate, and cooldowned slots), cooldown/recovery flow, non-cooldown
+failures stay in rotation, restore matched by key hash, and exposed state /
+lease labels never contain raw key material.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../lib/providers/key-pool.test.ts            | 94 +++++++++++++++++++
+ apps/swarmagents/lib/safe-next.test.ts        | 57 +++++++++++
+ 2 files changed, 151 insertions(+)
+ create mode 100644 apps/swarmagents/lib/providers/key-pool.test.ts
+ create mode 100644 apps/swarmagents/lib/safe-next.test.ts
+
+diff --git a/apps/swarmagents/lib/providers/key-pool.test.ts b/apps/swarmagents/lib/providers/key-pool.test.ts
+new file mode 100644
+index 000000000..650e89e52
+--- /dev/null
++++ b/apps/swarmagents/lib/providers/key-pool.test.ts
+@@ -0,0 +1,94 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { KeyPool } from "./key-pool";
++import { hashProviderKey } from "./cooldown-store";
++
++test("acquire returns null when every key is cooling down", () => {
++  let now = 0;
++  const pool = new KeyPool("p", ["k1"], { now: () => now });
++  const lease = pool.acquire();
++  assert.ok(lease);
++  lease!.failure({ kind: "rate_limit" });
++  assert.equal(pool.hasAvailable(), false);
++  assert.equal(pool.acquire(), null);
++});
++
++test("acquire skips empty/duplicate slots and picks the next usable key", () => {
++  let now = 0;
++  // Empty strings and duplicates are deduped; only "k1" survives.
++  const deduped = new KeyPool("p", ["", "  ", "k1", "k1"]);
++  assert.equal(deduped.size, 1);
++  assert.equal(deduped.acquire()!.id, "p:key-1");
++
++  const pool = new KeyPool("p", ["k1", "k2"], { now: () => now });
++  const first = pool.acquire();
++  assert.equal(first!.id, "p:key-1");
++  first!.failure({ kind: "auth" }); // puts key-1 on cooldown
++
++  // key-1 is cooling; acquire must return key-2 rather than null.
++  const second = pool.acquire();
++  assert.ok(second, "expected a usable key to be available");
++  assert.equal(second!.id, "p:key-2");
++  second!.cancel();
++});
++
++test("a failed key cools down, then recovers after its cooldown elapses", () => {
++  let now = 0;
++  const pool = new KeyPool("p", ["k1"], { now: () => now });
++  const a = pool.acquire();
++  a!.failure({ kind: "rate_limit" });
++  assert.equal(pool.acquire(), null);
++
++  now += 2000; // past the base 1000ms cooldown
++  const b = pool.acquire();
++  assert.ok(b);
++  assert.equal(b!.id, "p:key-1");
++  b!.success(150);
++
++  const [stat] = pool.stats();
++  assert.equal(stat.available, true);
++  assert.equal(stat.successes, 1);
++  assert.equal(stat.consecutiveFailures, 0);
++});
++
++test("non-cooldown failures do not take a key out of rotation", () => {
++  let now = 0;
++  const pool = new KeyPool("p", ["k1"], { now: () => now });
++  const a = pool.acquire();
++  a!.failure({ kind: "invalid_response" });
++  const b = pool.acquire();
++  assert.ok(b);
++  assert.equal(b!.id, "p:key-1");
++  b!.cancel();
++});
++
++test("restore applies persisted cooldown matched by key hash", () => {
++  let now = 0;
++  const pool = new KeyPool("p", ["super-secret-key-value"], { now: () => now });
++  pool.restore([
++    {
++      provider: "p",
++      keyHash: hashProviderKey("super-secret-key-value"),
++      cooldownUntil: now + 5000,
++      consecutiveFailures: 3,
++      failures: 3,
++      updatedAt: now,
++    },
++  ]);
++  assert.equal(pool.acquire(), null);
++  assert.equal(pool.cooldownStates().length, 1);
++});
++
++test("exposed state and lease labels never contain raw key material", () => {
++  const secret = "super-secret-key-value";
++  const pool = new KeyPool("p", [secret]);
++  const lease = pool.acquire();
++  assert.ok(lease);
++
++  assert.equal(lease!.id.includes(secret), false);
++  assert.equal(JSON.stringify(pool.stats()).includes(secret), false);
++  assert.equal(JSON.stringify(pool.cooldownStates()).includes(secret), false);
++
++  // The secret is only reachable via the explicit secretValues() escape hatch.
++  assert.deepEqual(pool.secretValues(), [secret]);
++});
+diff --git a/apps/swarmagents/lib/safe-next.test.ts b/apps/swarmagents/lib/safe-next.test.ts
+new file mode 100644
+index 000000000..bebab66e2
+--- /dev/null
++++ b/apps/swarmagents/lib/safe-next.test.ts
+@@ -0,0 +1,57 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { safeNextPath } from "./safe-next";
++
++test("accepts safe same-origin absolute paths", () => {
++  assert.equal(safeNextPath("/ok"), "/ok");
++  assert.equal(safeNextPath("/ok?x=1&y=2"), "/ok?x=1&y=2");
++  assert.equal(safeNextPath("/login/next"), "/login/next");
++});
++
++test("accepts a path with surrounding whitespace (trimmed)", () => {
++  assert.equal(safeNextPath("  /ok  "), "/ok");
++});
++
++test("rejects protocol-relative URLs", () => {
++  assert.equal(safeNextPath("//evil.com/steal"), "/");
++  assert.equal(safeNextPath("//"), "/");
++});
++
++test("rejects absolute / protocol URLs", () => {
++  assert.equal(safeNextPath("https://evil.com"), "/");
++  assert.equal(safeNextPath("http://evil.com/x"), "/");
++});
++
++test("rejects backslash-smuggled paths", () => {
++  assert.equal(safeNextPath("/\\evil"), "/");
++  assert.equal(safeNextPath("\\/evil"), "/");
++});
++
++test("rejects embedded control characters", () => {
++  assert.equal(safeNextPath("/ok\nsteal"), "/");
++  assert.equal(safeNextPath("/ok\u0000"), "/");
++  assert.equal(safeNextPath("/ok\u001f"), "/");
++});
++
++test("trims surrounding whitespace, so trailing CR/LF is not a control char", () => {
++  assert.equal(safeNextPath("/ok\r\n"), "/ok");
++});
++
++test("rejects empty and whitespace-only values", () => {
++  assert.equal(safeNextPath(""), "/");
++  assert.equal(safeNextPath("   "), "/");
++});
++
++test("rejects over-length paths", () => {
++  assert.equal(safeNextPath("/" + "a".repeat(3000)), "/");
++  assert.equal(safeNextPath("/ok?" + "x=1&".repeat(1000)), "/");
++});
++
++test("rejects non-string inputs", () => {
++  assert.equal(safeNextPath(42), "/");
++  assert.equal(safeNextPath(null), "/");
++  assert.equal(safeNextPath(undefined), "/");
++  assert.equal(safeNextPath(true), "/");
++  assert.equal(safeNextPath({}), "/");
++  assert.equal(safeNextPath([" /ok" as unknown]), "/");
++});
+-- 
+2.55.0
+

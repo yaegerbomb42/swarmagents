@@ -1,0 +1,1047 @@
+From dd3d4cae6e5d084aecfc03fb3be15376ddd12292 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 15:55:04 -0600
+Subject: [PATCH] feat(h1): real permission gate via a PreToolUse hook
+
+The approval gate previously only observed tool_use after claude had already run
+the tool, and headless claude could not act at all without blanket pre-allow.
+This adds a real gate: a PreToolUse hook in the VM (vm-image/swarm-pretooluse.sh)
+classifies every call with the same rules as risk.ts via a classifier bundle that
+lib/harness/permission-hook.ts generates (esbuild) and the runtime writes into the
+VM. 'allow' proceeds; 'deny' blocks with exit 2; 'ask' writes <id>.req and
+blocks until <id>.ok/<id>.no appears. runner.ts passes --settings + --permission-mode
+acceptEdits; the runtime mirrors approval verdicts into the VM via writeFile so
+the hook unblocks, using a deterministic id (hookApprovalId) shared with the hook.
+esbuild is a prod dependency; next.config externalizes it; the Dockerfiles install
+the hook and copy esbuild into the standalone output.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/Dockerfile                   |   2 +
+ apps/swarmagents/lib/harness/approvals.ts     |   8 +-
+ .../lib/harness/permission-hook.test.ts       | 109 +++++++++++
+ .../lib/harness/permission-hook.ts            | 178 ++++++++++++++++++
+ apps/swarmagents/lib/harness/runner.test.ts   | 108 ++++++++++-
+ apps/swarmagents/lib/harness/runner.ts        |   9 +
+ apps/swarmagents/lib/harness/types.ts         |  11 ++
+ apps/swarmagents/lib/runtime/manager.ts       |  52 +++++
+ apps/swarmagents/next.config.ts               |   9 +
+ apps/swarmagents/package-lock.json            |  28 +--
+ apps/swarmagents/package.json                 |   1 +
+ apps/swarmagents/vm-image/Dockerfile          |   6 +
+ apps/swarmagents/vm-image/swarm-pretooluse.sh | 100 ++++++++++
+ 13 files changed, 592 insertions(+), 29 deletions(-)
+ create mode 100644 apps/swarmagents/lib/harness/permission-hook.test.ts
+ create mode 100644 apps/swarmagents/lib/harness/permission-hook.ts
+ create mode 100644 apps/swarmagents/vm-image/swarm-pretooluse.sh
+
+diff --git a/apps/swarmagents/Dockerfile b/apps/swarmagents/Dockerfile
+index db29f3262..d799561e1 100644
+--- a/apps/swarmagents/Dockerfile
++++ b/apps/swarmagents/Dockerfile
+@@ -29,6 +29,8 @@ RUN groupadd --system --gid 1001 nodejs \
+     && chown nextjs:nodejs /data
+ 
+ COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
++COPY --from=builder --chown=nextjs:nodejs /app/node_modules/esbuild ./node_modules/esbuild
++COPY --from=builder --chown=nextjs:nodejs /app/node_modules/@esbuild ./node_modules/@esbuild
+ COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+ COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+ 
+diff --git a/apps/swarmagents/lib/harness/approvals.ts b/apps/swarmagents/lib/harness/approvals.ts
+index 45562510c..8a3ba8051 100644
+--- a/apps/swarmagents/lib/harness/approvals.ts
++++ b/apps/swarmagents/lib/harness/approvals.ts
+@@ -49,6 +49,12 @@ export interface CreateApprovalInput {
+   toolName: string;
+   action: string;
+   reason: string;
++  /**
++   * Optional caller-supplied id. The permission-gate hook (h1) uses a
++   * deterministic id shared with the VM-side hook; when provided it must be
++   * unique among pending approvals.
++   */
++  id?: string;
+   /** Called exactly once if this approval times out (never on a manual denial). */
+   onTimeout?: ApprovalTimeoutHandler;
+ }
+@@ -88,7 +94,7 @@ export class ApprovalStore {
+ 
+   /** Create a pending approval for a flagged tool call. */
+   create(input: CreateApprovalInput): PendingApproval {
+-    const id = `appr_${randomUUID()}`;
++    const id = input.id ?? `appr_${randomUUID()}`;
+     const now = this.now();
+     const ttlMs = this.ttlMs ?? defaultTtlMs();
+     const approval: PendingApproval = {
+diff --git a/apps/swarmagents/lib/harness/permission-hook.test.ts b/apps/swarmagents/lib/harness/permission-hook.test.ts
+new file mode 100644
+index 000000000..71ff64f93
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/permission-hook.test.ts
+@@ -0,0 +1,109 @@
++/**
++ * Tests for the permission-gate hook (h1): settings generation, the generated
++ * classifier bundle (which must agree with risk.ts), the deterministic approval
++ * id shared with the VM-side shell hook, and the decision-file poll protocol.
++ */
++import test from "node:test";
++import assert from "node:assert/strict";
++import { execFileSync } from "node:child_process";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import {
++  APPROVAL_DIR,
++  CLASSIFIER_PATH,
++  decisionFileName,
++  hookApprovalId,
++  HOOK_SCRIPT,
++  HOOK_SETTINGS_PATH,
++  permissionHookSettingsJson,
++  pollApprovalDecision,
++} from "./permission-hook.js";
++import { classifyToolCall } from "./risk.js";
++import { generateClassifier } from "./permission-hook.js";
++
++test("permissionHookSettingsJson registers the PreToolUse hook", () => {
++  const settings = JSON.parse(permissionHookSettingsJson());
++  const hooks = settings.hooks?.PreToolUse;
++  assert.ok(Array.isArray(hooks) && hooks.length === 1, "expected one PreToolUse hook");
++  assert.equal(hooks[0].matcher, "*");
++  assert.ok(hooks[0].hook.includes(HOOK_SCRIPT), "hook command must reference the script");
++  assert.deepEqual(settings.permissions, { allow: [], deny: [], ask: [] });
++});
++
++test("generated classifier agrees with risk.ts for representative calls", () => {
++  const classifierPath = path.join(os.tmpdir(), `swarm-classify-${process.pid}.cjs`);
++  fs.writeFileSync(classifierPath, generateClassifier());
++  try {
++    const cases: Array<[string, unknown]> = [
++      ["Bash", { command: "ls -la" }],
++      ["Bash", { command: "rm -rf /" }],
++      ["Bash", { command: "echo $OPENAI_API_KEY" }],
++      ["Edit", { file_path: "/etc/shadow" }],
++      ["Read", { file_path: "package.json" }],
++      ["WebFetch", { url: "http://10.0.0.5/steal" }],
++    ];
++    for (const [tool, input] of cases) {
++      const raw = execFileSync("node", [classifierPath, tool, JSON.stringify(input)], { encoding: "utf8" }).trim();
++      const decision = JSON.parse(raw);
++      const expected = classifyToolCall(tool, input);
++      assert.equal(decision.level, expected.level, `${tool} level mismatch for ${JSON.stringify(input)}`);
++      assert.equal(decision.reason, expected.reason, `${tool} reason mismatch`);
++    }
++  } finally {
++    fs.rmSync(classifierPath, { force: true });
++  }
++});
++
++test("hookApprovalId is deterministic, canonical, and matches the shared format", () => {
++  const inputA = { command: "rm -rf /", cwd: "/workspace" };
++  const inputB = { cwd: "/workspace", command: "rm -rf /" }; // different key order
++  const a = hookApprovalId("Bash", inputA);
++  const b = hookApprovalId("Bash", inputB);
++  assert.equal(a, b, "id must not depend on key order");
++  assert.ok(a.startsWith("appr_"), "id must be prefixed appr_");
++  assert.match(a.slice("appr_".length), /^[0-9a-f]{24}$/, "id must be 24 hex chars");
++  assert.notEqual(hookApprovalId("Bash", inputA), hookApprovalId("Edit", inputA));
++});
++
++test("decisionFileName encodes approve/deny", () => {
++  assert.equal(decisionFileName("appr_x", true), "appr_x.ok");
++  assert.equal(decisionFileName("appr_x", false), "appr_x.no");
++});
++
++test("pollApprovalDecision resolves on .ok, .no, and expiry", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-approvals-"));
++  const id = "appr_test123";
++  try {
++    // Approved.
++    fs.writeFileSync(path.join(dir, decisionFileName(id, true)), "approved");
++    assert.equal(await pollApprovalDecision(id, dir, 2000), "approved");
++    fs.rmSync(path.join(dir, decisionFileName(id, true)));
++
++    // Denied.
++    fs.writeFileSync(path.join(dir, decisionFileName(id, false)), "denied");
++    assert.equal(await pollApprovalDecision(id, dir, 2000), "denied");
++    fs.rmSync(path.join(dir, decisionFileName(id, false)));
++
++    // File written after a short delay is still observed.
++    setTimeout(() => fs.writeFileSync(path.join(dir, decisionFileName(id, true)), "approved"), 40);
++    assert.equal(await pollApprovalDecision(id, dir, 2000), "approved");
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("pollApprovalDecision expires when nothing is written", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-approvals-exp-"));
++  try {
++    assert.equal(await pollApprovalDecision("appr_expired", dir, 60), "expired");
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("exposes the VM paths the hook and runtime share", () => {
++  assert.equal(APPROVAL_DIR, "/tmp/swarm-approvals");
++  assert.equal(HOOK_SETTINGS_PATH, "/tmp/swarm-hook-settings.json");
++  assert.equal(CLASSIFIER_PATH, "/tmp/swarm-classify.cjs");
++});
+diff --git a/apps/swarmagents/lib/harness/permission-hook.ts b/apps/swarmagents/lib/harness/permission-hook.ts
+new file mode 100644
+index 000000000..4e6961634
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/permission-hook.ts
+@@ -0,0 +1,178 @@
++/**
++ * Permission-gate hook support (h1).
++ *
++ * The harness's post-hoc approval observer (runner.ts) cannot stop a risky
++ * tool from executing: by the time stream-json reports a `tool_use` block,
++ * Claude has already run the tool. This module supplies a real
++ * PreToolUse hook that runs inside claude in the user's VM and blocks "ask"
++ * and "deny" calls BEFORE they execute.
++ *
++ * The hook is a shell script (`vm-image/swarm-pretooluse.sh`) installed in
++ * the VM image at `HOOK_SCRIPT`. It classifies every call with the exact
++ * same rules as risk.ts by invoking a standalone classifier bundle this
++ * module generates with esbuild and writes into the VM before a run:
++ *
++ *   - "allow" continues (exit 0, decision allow);
++ *   - "deny" blocks the call (exit code 2, decision block, reason);
++ *   - "ask" writes `<id>.req` into `APPROVAL_DIR` and blocks until
++ *     `<id>.ok` / `<id>.no` appears. The runtime writes the decision file
++ *     (via the VM file API) when the user decides on
++ *     `POST /api/runtime/approvals/{id}`; expiry counts as a denial.
++ *
++ * `hookApprovalId` derives a deterministic id from the tool name + canonical
++ * input so the harness and the shell hook agree on the file name without any
++ * out-of-band handshake.
++ */
++
++import { createHash } from "node:crypto";
++import fs from "node:fs/promises";
++import path from "node:path";
++import * as esbuild from "esbuild";
++import { classifyToolCall, type RiskDecision } from "./risk";
++
++/** Directory (inside the VM) where approval request/decision files live. */
++export const APPROVAL_DIR = "/tmp/swarm-approvals";
++/** Path (inside the VM) of the --settings file that registers the hook. */
++export const HOOK_SETTINGS_PATH = "/tmp/swarm-hook-settings.json";
++/** Path (inside the VM image) of the hook shell script. */
++export const HOOK_SCRIPT = "/opt/swarm-hooks/swarm-pretooluse.sh";
++/** Path (inside the VM) where the generated classifier bundle is written. */
++export const CLASSIFIER_PATH = "/tmp/swarm-classify.cjs";
++/** claude permission mode: edits run headless; everything else goes through the hook. */
++export const PERMISSION_MODE = "acceptEdits";
++
++export const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1000;
++
++/** Approval TTL in ms (env-overridable, matching the approvals store). */
++export function approvalTtlMs(): number {
++  const sec = Number(process.env.SWARM_APPROVAL_TIMEOUT_SEC);
++  if (Number.isFinite(sec) && sec > 0) return sec * 1000;
++  const ms = Number(process.env.SWARM_APPROVAL_TIMEOUT_MS);
++  if (Number.isFinite(ms) && ms > 0) return ms;
++  return DEFAULT_APPROVAL_TTL_MS;
++}
++
++/** The `--settings` JSON that registers the PreToolUse hook for every tool. */
++export function permissionHookSettingsJson(): string {
++  return JSON.stringify(
++    {
++      hooks: {
++        PreToolUse: [{ matcher: "*", hook: `bash ${HOOK_SCRIPT}` }],
++      },
++      permissions: { allow: [], deny: [], ask: [] },
++    },
++    null,
++    2,
++  );
++}
++
++/** Recursively sort object keys so JSON.stringify yields a canonical form. */
++function canonicalize(value: unknown): unknown {
++  if (Array.isArray(value)) return value.map(canonicalize);
++  if (value !== null && typeof value === "object") {
++    const out: Record<string, unknown> = {};
++    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
++      out[key] = canonicalize((value as Record<string, unknown>)[key]);
++    }
++    return out;
++  }
++  return value;
++}
++
++/**
++ * Deterministic approval id shared with the VM-side shell hook. The hook
++ * canonicalizes `.tool_input` with `jq -S -c` and hashes `tool::canonical`
++ * with sha1 (first 24 hex chars) — this must produce the identical string.
++ */
++export function hookApprovalId(toolName: string, input: unknown): string {
++  const canon = JSON.stringify(canonicalize(input ?? {}));
++  const digest = createHash("sha1").update(`${toolName}::${canon}`).digest("hex");
++  return `appr_${digest.slice(0, 24)}`;
++}
++
++/** File name for a decision: `<id>.ok` or `<id>.no`. */
++export function decisionFileName(id: string, approve: boolean): string {
++  return `${id}${approve ? ".ok" : ".no"}`;
++}
++
++/**
++ * Wait (bounded by the approval TTL) for a decision file to appear in `dir`.
++ * Used by tests and by callers that need to block until the runtime writes the
++ * decision; returns the verdict.
++ */
++export async function pollApprovalDecision(
++  id: string,
++  dir = APPROVAL_DIR,
++  timeoutMs = approvalTtlMs(),
++): Promise<"approved" | "denied" | "expired"> {
++  const okPath = path.join(dir, decisionFileName(id, true));
++  const noPath = path.join(dir, decisionFileName(id, false));
++  const deadline = Date.now() + timeoutMs;
++  for (;;) {
++    try {
++      await fs.access(okPath);
++      return "approved";
++    } catch {
++      /* not yet */
++    }
++    try {
++      await fs.access(noPath);
++      return "denied";
++    } catch {
++      /* not yet */
++    }
++    if (Date.now() >= deadline) return "expired";
++    await new Promise((resolve) => setTimeout(resolve, 25));
++  }
++}
++
++/**
++ * A self-contained classifier whose decision logic comes straight from risk.ts.
++ * Bundled once (cached) so the VM-side hook and the harness can never drift.
++ */
++let classifierCache: string | undefined;
++export function generateClassifier(): string {
++  if (classifierCache !== undefined) return classifierCache;
++  const source = `
++import { classifyToolCall } from "./risk";
++const tool = process.argv[2] ?? "";
++const raw = process.argv[3] ?? "{}";
++let input: unknown;
++try { input = JSON.parse(raw); } catch { input = raw; }
++const d = classifyToolCall(tool, input);
++process.stdout.write(JSON.stringify(d));
++`;
++  const result = esbuild.buildSync({
++    stdin: {
++      contents: source,
++      resolveDir: __dirname,
++      sourcefile: "swarm-classify.ts",
++      loader: "ts",
++    },
++    bundle: true,
++    platform: "node",
++    format: "cjs",
++    write: false,
++    logLevel: "silent",
++  });
++  classifierCache = result.outputFiles[0]?.text ?? "";
++  return classifierCache;
++}
++
++export interface HookFile {
++  path: string;
++  content: string;
++}
++
++/** Files the runtime writes into the VM (settings + classifier) before a run. */
++export function permissionHookFiles(): HookFile[] {
++  return [
++    { path: HOOK_SETTINGS_PATH, content: permissionHookSettingsJson() },
++    { path: CLASSIFIER_PATH, content: generateClassifier() },
++  ];
++}
++
++/** Convenience classification that mirrors what the hook evaluates. */
++export function classifyHookCall(name: string, input: unknown): RiskDecision {
++  return classifyToolCall(name, input);
++}
+diff --git a/apps/swarmagents/lib/harness/runner.test.ts b/apps/swarmagents/lib/harness/runner.test.ts
+index 594a2dc2d..41233ef78 100644
+--- a/apps/swarmagents/lib/harness/runner.test.ts
++++ b/apps/swarmagents/lib/harness/runner.test.ts
+@@ -7,8 +7,13 @@
+  */
+ import test from "node:test";
+ import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
+ import { ClaudeCodeRunner, isBackgroundedCommand } from "./runner.js";
+-import type { TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
++import type { ApprovalGateway, TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
++import { ApprovalStore } from "./approvals.js";
++import { decisionFileName, pollApprovalDecision } from "./permission-hook.js";
+ 
+ const SECRET_TOKEN = "sk-ant-api03-BENCH-FAKE-TOKEN-0000";
+ const PLAIN_SECRET = "my-super-secret-key-42";
+@@ -771,3 +776,104 @@ test("does not emit tool.backgrounded for a foreground Bash loop", async () => {
+   assert.equal(outcome.exitCode, 0);
+   assert.equal(events.filter((e) => e.type === "tool.backgrounded").length, 0);
+ });
++
++test("appends --settings and --permission-mode acceptEdits when a hook settings path is set", async () => {
++  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
++  const runner = new ClaudeCodeRunner({ bin: "claude" });
++  const events: TelemetryEvent[] = [];
++
++  const outcome = await runner.run(
++    { prompt: "Hi", env: envWithSecrets, vm, hookSettingsPath: "/tmp/swarm-hook-settings.json" },
++    (e) => events.push(e),
++  );
++
++  assert.equal(outcome.exitCode, 0);
++  const cmd = vm.calls[0].cmd;
++  const settingsIdx = cmd.indexOf("--settings");
++  assert.ok(settingsIdx !== -1, "argv should include --settings");
++  assert.equal(cmd[settingsIdx + 1], "/tmp/swarm-hook-settings.json");
++  const modeIdx = cmd.indexOf("--permission-mode");
++  assert.ok(modeIdx !== -1, "argv should include --permission-mode");
++  assert.equal(cmd[modeIdx + 1], "acceptEdits");
++});
++
++test("ask-classified Bash does not execute before approval; executes after approve", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-approvals-run-"));
++  const id = "appr_gatetest";
++  const M_ASK = {
++    type: "assistant",
++    message: {
++      id: "m_ask",
++      content: [{ type: "tool_use", id: "toolu_ask", name: "Bash", input: { command: "rm -rf /" } }],
++    },
++  };
++  const T_ASK = {
++    type: "user",
++    message: {
++      role: "user",
++      content: [{ type: "tool_result", tool_use_id: "toolu_ask", content: "removed", is_error: false }],
++    },
++  };
++  const lines = [INIT, M_ASK, T_ASK, RESULT];
++
++  // Emulate claude honoring the PreToolUse hook: the tool's result is not
++  // streamed until the approval decision file appears.
++  class HookBlockingVm implements VmExec {
++    calls: Array<{ cmd: string[] }> = [];
++    async exec(cmd: string[], opts?: VmExecOpts): Promise<{ exitCode: number }> {
++      this.calls.push({ cmd });
++      for (const line of lines) {
++        if (line === T_ASK) {
++          const verdict = await pollApprovalDecision(id, dir, 3000);
++          assert.notEqual(verdict, "expired", "expected an approval decision before execution");
++        }
++        opts?.onStdout?.(JSON.stringify(line) + "\n");
++      }
++      return { exitCode: 0 };
++    }
++  }
++
++  const store = new ApprovalStore();
++  const gateway: ApprovalGateway = async (ask) => {
++    const approval = store.create({
++      runId: "r1",
++      userId: "u1",
++      toolName: ask.toolName,
++      action: ask.action,
++      reason: ask.reason,
++      id,
++    });
++    // Simulate the user approving shortly after the request appears.
++    setTimeout(() => {
++      store.resolve(id, "approved");
++      fs.writeFileSync(path.join(dir, decisionFileName(id, true)), "approved");
++    }, 60);
++    return {
++      id: approval.id,
++      expiresAt: approval.expiresAt,
++      timedOut: () => store.get(id)?.timedOut === true,
++      verdict: store.waitFor(id),
++    };
++  };
++
++  const vm = new HookBlockingVm();
++  const runner = new ClaudeCodeRunner({ bin: "claude" });
++  const events: TelemetryEvent[] = [];
++  try {
++    const outcome = await runner.run(
++      { prompt: "Do the risky thing", env: envWithSecrets, vm, approvalGateway: gateway },
++      (e) => events.push(e),
++    );
++
++    assert.equal(outcome.exitCode, 0);
++    const kinds = events.map((e) => e.type);
++    assert.ok(kinds.includes("approval.required"), "expected approval.required");
++    assert.ok(kinds.includes("approval.resolved"), "expected approval.resolved");
++    assert.ok(kinds.includes("tool.result"), "expected tool.result");
++    const resolvedIdx = kinds.indexOf("approval.resolved");
++    const resultIdx = kinds.indexOf("tool.result");
++    assert.ok(resolvedIdx !== -1 && resultIdx !== -1 && resolvedIdx < resultIdx, "tool.result must come after approval resolves");
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/lib/harness/runner.ts b/apps/swarmagents/lib/harness/runner.ts
+index 6643a3e7f..d58738de6 100644
+--- a/apps/swarmagents/lib/harness/runner.ts
++++ b/apps/swarmagents/lib/harness/runner.ts
+@@ -31,6 +31,7 @@ import type {
+ import { createStreamJsonParser } from "./stream-json";
+ import { makeRedactor, redactValue } from "./redact";
+ import { classifyToolCall } from "./risk";
++import { PERMISSION_MODE } from "./permission-hook";
+ import { isRoleListTool, isRoleSwitchTool, ROLE_MCP_CONFIG_PATH } from "./role-mcp";
+ import { computerActionEvent, isDesktopMcpCall } from "./computer-mcp";
+ 
+@@ -209,6 +210,7 @@ export class ClaudeCodeRunner {
+                     toolName: name,
+                     action: describeAction(name, input),
+                     reason: decision.reason,
++                    input,
+                   }, emit, redact);
+                   if (verdict !== "approved" && haltedReason === null) {
+                     haltedReason = verdict === "expired" ? "approval timed out" : "approval denied by user";
+@@ -511,6 +513,13 @@ export class ClaudeCodeRunner {
+     }
+     const appended = [request.agentCard, role?.appendSystemPrompt].filter(Boolean).join("\n\n");
+     if (appended) argv.push("--append-system-prompt", appended);
++    // The permission-gate hook (h1): register the PreToolUse hook via --settings
++    // and let allow-classified tools (notably Edit) run headless. This is what
++    // actually prevents an ask/deny tool from executing before approval.
++    if (request.hookSettingsPath) {
++      argv.push("--settings", request.hookSettingsPath);
++      argv.push("--permission-mode", PERMISSION_MODE);
++    }
+     argv.push("--", request.prompt);
+     return argv;
+   }
+diff --git a/apps/swarmagents/lib/harness/types.ts b/apps/swarmagents/lib/harness/types.ts
+index 3725cbcd2..3384c2eb6 100644
+--- a/apps/swarmagents/lib/harness/types.ts
++++ b/apps/swarmagents/lib/harness/types.ts
+@@ -122,6 +122,11 @@ export interface ApprovalRequest {
+   /** Human-readable summary of the flagged action (e.g. the shell command). */
+   action: string;
+   reason: string;
++  /**
++   * The raw tool input, when available. The permission-gate hook (h1) needs it
++   * to derive the deterministic approval id it shares with the VM-side hook.
++   */
++  input?: unknown;
+ }
+ 
+ export interface ApprovalTicket {
+@@ -197,6 +202,12 @@ export interface RunRequest {
+   cwd?: string;
+   /** When set, ask-classified tool calls pause for a human decision. */
+   approvalGateway?: ApprovalGateway;
++  /**
++   * Path (inside the VM) of a claude --settings file that registers a
++   * PreToolUse permission-gate hook. When set the runner also passes
++   * --permission-mode acceptEdits so allow-classified tools run headless.
++   */
++  hookSettingsPath?: string;
+   /**
+    * The role configuration for this invocation (--allowedTools / --mcp-config
+    * / --append-system-prompt). When absent the run uses the default toolset.
+diff --git a/apps/swarmagents/lib/runtime/manager.ts b/apps/swarmagents/lib/runtime/manager.ts
+index d2f02d1db..9d16149c4 100644
+--- a/apps/swarmagents/lib/runtime/manager.ts
++++ b/apps/swarmagents/lib/runtime/manager.ts
+@@ -37,6 +37,13 @@ import type {
+   Router,
+ } from "../providers";
+ import { getApprovalStore } from "../harness/approvals";
++import {
++  APPROVAL_DIR,
++  decisionFileName,
++  hookApprovalId,
++  HOOK_SETTINGS_PATH,
++  permissionHookFiles,
++} from "../harness/permission-hook";
+ import { telemetryBus, type TelemetryBus } from "../telemetry/index";
+ import { getBrowserManager } from "../browser/manager";
+ import { bindExec, VmManager, vmManager } from "../vm/manager";
+@@ -542,6 +549,33 @@ export class RuntimeManager {
+     }
+   }
+ 
++  /**
++   * Whether the real permission-gate hook (h1) is active. Enabled by default;
++   * set SWARM_DISABLE_PERMISSION_HOOK=1 to fall back to the harness's post-hoc
++   * observer.
++   */
++  private permissionHookEnabled(): boolean {
++    return process.env.SWARM_DISABLE_PERMISSION_HOOK !== "1";
++  }
++
++  /**
++   * Seed the permission-gate hook settings + classifier bundle into the VM.
++   * Returns the --settings path to pass to claude when the hook is active and
++   * was written successfully; otherwise undefined (the run degrades to the
++   * post-hoc observer rather than failing).
++   */
++  private async seedPermissionHookFiles(userId: string): Promise<string | undefined> {
++    if (!this.permissionHookEnabled()) return undefined;
++    try {
++      for (const file of permissionHookFiles()) {
++        await this.vm.writeFile(userId, file.path, file.content);
++      }
++      return HOOK_SETTINGS_PATH;
++    } catch {
++      return undefined;
++    }
++  }
++
+   /** Rewrite the VM's --mcp-config for the given role phase. */
+   private async writeRoleConfig(
+     userId: string,
+@@ -1319,14 +1353,29 @@ export class RuntimeManager {
+     };
+ 
+     // Ask-classified tool calls pause the run until POST /api/runtime/approvals/{id}.
++    // The approval id is the deterministic hook id so the VM-side PreToolUse
++    // hook and the store agree on the decision file (see permission-hook.ts).
+     const approvalGateway: ApprovalGateway = async (ask) => {
++      const id = hookApprovalId(ask.toolName, ask.input);
+       const approval = getApprovalStore().create({
+         runId,
+         userId,
+         toolName: ask.toolName,
+         action: ask.action,
+         reason: ask.reason,
++        id,
+       });
++      // Mirror the verdict into the VM so the blocked hook unblocks (the hook
++      // also unblocks on its own TTL when no decision file ever appears).
++      void (async () => {
++        try {
++          const verdict = await getApprovalStore().waitFor(id);
++          const target = `${APPROVAL_DIR}/${decisionFileName(id, verdict === "approved")}`;
++          await this.vm.writeFile(userId, target, verdict);
++        } catch {
++          // Best-effort mirror; never let a write failure break the run.
++        }
++      })();
+       return {
+         id: approval.id,
+         expiresAt: approval.expiresAt,
+@@ -1335,6 +1384,8 @@ export class RuntimeManager {
+       };
+     };
+ 
++    const hookSettingsPath = await this.seedPermissionHookFiles(userId);
++
+     try {
+       const outcome = await this.runner.run(
+         {
+@@ -1349,6 +1400,7 @@ export class RuntimeManager {
+           cwd: "/workspace",
+           redactSecrets: selection?.secrets,
+           approvalGateway,
++          hookSettingsPath,
+           rolePhase: phase ?? this.defaultRolePhase(),
+           onRoleSwitch: async (request) => {
+             const catalog = userRoleCatalog(userId);
+diff --git a/apps/swarmagents/next.config.ts b/apps/swarmagents/next.config.ts
+index b47146110..30ec0fc82 100644
+--- a/apps/swarmagents/next.config.ts
++++ b/apps/swarmagents/next.config.ts
+@@ -11,6 +11,15 @@ const nextConfig: NextConfig = {
+     // fallback when the runtime env var is absent.
+     SWARM_BUILD_TIME: process.env.SWARM_BUILD_TIME ?? new Date().toISOString(),
+   },
++  webpack: (config, { isServer }) => {
++    // esbuild is a native, runtime-only tool used to generate the permission
++    // hook classifier (lib/harness/permission-hook.ts). It must never be
++    // bundled/parsed by webpack; it is required from node_modules at runtime.
++    if (isServer && Array.isArray(config.externals)) {
++      config.externals.push("esbuild");
++    }
++    return config;
++  },
+ };
+ 
+ export default nextConfig;
+diff --git a/apps/swarmagents/package-lock.json b/apps/swarmagents/package-lock.json
+index 9709713ed..1c325eea2 100644
+--- a/apps/swarmagents/package-lock.json
++++ b/apps/swarmagents/package-lock.json
+@@ -12,6 +12,7 @@
+         "@modelcontextprotocol/sdk": "^1.31.0",
+         "@shikijs/rehype": "^4.5.0",
+         "clsx": "^2.1.1",
++        "esbuild": "^0.28.2",
+         "lucide-react": "^1.72.0",
+         "next": "^15.5.27",
+         "openai": "^7.25.0",
+@@ -94,7 +95,6 @@
+       "cpu": [
+         "ppc64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -111,7 +111,6 @@
+       "cpu": [
+         "arm"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -128,7 +127,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -145,7 +143,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -162,7 +159,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -179,7 +175,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -196,7 +191,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -213,7 +207,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -230,7 +223,6 @@
+       "cpu": [
+         "arm"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -247,7 +239,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -264,7 +255,6 @@
+       "cpu": [
+         "ia32"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -281,7 +271,6 @@
+       "cpu": [
+         "loong64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -298,7 +287,6 @@
+       "cpu": [
+         "mips64el"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -315,7 +303,6 @@
+       "cpu": [
+         "ppc64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -332,7 +319,6 @@
+       "cpu": [
+         "riscv64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -349,7 +335,6 @@
+       "cpu": [
+         "s390x"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -366,7 +351,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -383,7 +367,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -400,7 +383,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -417,7 +399,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -434,7 +415,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -451,7 +431,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -468,7 +447,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -485,7 +463,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -502,7 +479,6 @@
+       "cpu": [
+         "ia32"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -519,7 +495,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2287,7 +2262,6 @@
+       "version": "0.28.2",
+       "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz",
+       "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA==",
+-      "dev": true,
+       "hasInstallScript": true,
+       "license": "MIT",
+       "bin": {
+diff --git a/apps/swarmagents/package.json b/apps/swarmagents/package.json
+index 49c03dea8..9d7c94ba9 100644
+--- a/apps/swarmagents/package.json
++++ b/apps/swarmagents/package.json
+@@ -31,6 +31,7 @@
+     "@modelcontextprotocol/sdk": "^1.31.0",
+     "@shikijs/rehype": "^4.5.0",
+     "clsx": "^2.1.1",
++    "esbuild": "^0.28.2",
+     "lucide-react": "^1.72.0",
+     "next": "^15.5.27",
+     "openai": "^7.25.0",
+diff --git a/apps/swarmagents/vm-image/Dockerfile b/apps/swarmagents/vm-image/Dockerfile
+index 9ba830bcb..239c345b7 100644
+--- a/apps/swarmagents/vm-image/Dockerfile
++++ b/apps/swarmagents/vm-image/Dockerfile
+@@ -57,6 +57,12 @@ COPY managed-settings.json /etc/claude-code/managed-settings.json
+ RUN chmod 0444 /etc/claude-code/managed-settings.json \
+     && chown root:root /etc/claude-code/managed-settings.json
+ 
++# Permission-gate PreToolUse hook (h1). The runtime supplies the classifier
++# bundle + --settings at run time; this only installs the hook script itself.
++COPY swarm-pretooluse.sh /opt/swarm-hooks/swarm-pretooluse.sh
++RUN chmod 0755 /opt/swarm-hooks/swarm-pretooluse.sh \
++    && chown node:node /opt/swarm-hooks/swarm-pretooluse.sh
++
+ # The driver mounts a per-user named volume at /workspace; docker seeds a
+ # fresh named volume from the image's directory, so /workspace must be owned
+ # by the unprivileged `node` user (uid 1000) that ships with the base image.
+diff --git a/apps/swarmagents/vm-image/swarm-pretooluse.sh b/apps/swarmagents/vm-image/swarm-pretooluse.sh
+new file mode 100644
+index 000000000..eb1644e7e
+--- /dev/null
++++ b/apps/swarmagents/vm-image/swarm-pretooluse.sh
+@@ -0,0 +1,100 @@
++#!/usr/bin/env bash
++#
++# swarm-pretooluse.sh — Claude Code PreToolUse hook (h1 permission gate).
++#
++# Installed in the swarm-vm image at /opt/swarm-hooks/. On every tool call
++# claude runs this script with the hook JSON payload on stdin. The script
++# classifies the call with the same rules as the app's lib/harness/risk.ts by
++# delegating to a standalone classifier bundle the runtime writes into the VM
++# at $SWARM_HOOK_CLASSIFIER. Decisions:
++#
++#   allow -> {"decision":"allow"} exit 0 (tool proceeds)
++#   deny  -> {"decision":"block","reason":...,"exitCode":2} exit 2 (tool blocked)
++#   ask   -> writes <id>.req, blocks until <id>.ok / <id>.no appears, then
++#            allow or block accordingly; expiry (TTL) counts as a denial.
++#
++# The approval id is deterministic: sha1(tool::canonical_input)[0:24]
++# prefixed with "appr_", where canonical_input is `jq -S -c` of .tool_input.
++# The runtime computes the identical id (lib/harness/permission-hook.ts) and
++# writes the decision file when the user approves/denies on
++# POST /api/runtime/approvals/{id}.
++
++set -u
++
++HOOK_LOG="${SWARM_HOOK_LOG:-/tmp/swarm-hook.log}"
++log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$HOOK_LOG" 2>/dev/null || true; }
++
++PAYLOAD="$(cat)"
++TOOL="$(printf '%s' "$PAYLOAD" | jq -r '.tool_name // empty')"
++INPUT_CANON="$(printf '%s' "$PAYLOAD" | jq -S -c '.tool_input // {}')"
++LEVEL=""
++REASON=""
++
++CLASSIFIER="${SWARM_HOOK_CLASSIFIER:-/tmp/swarm-classify.cjs}"
++APPROVAL_DIR="${SWARM_APPROVAL_DIR:-/tmp/swarm-approvals}"
++TTL_MS="${SWARM_APPROVAL_TIMEOUT_MS:-300000}"
++
++if [ -z "$TOOL" ]; then
++  # No tool name: safety-default to allow (hook miswiring must not deadlock).
++  printf '{"decision":"allow","reason":"no tool name"}\n'
++  exit 0
++fi
++
++if [ ! -s "$CLASSIFIER" ]; then
++  log "classifier missing at $CLASSIFIER; blocking $TOOL"
++  printf '{"decision":"block","reason":"permission classifier unavailable","exitCode":2}\n'
++  exit 2
++fi
++
++DECISION="$(printf '%s' "$INPUT_CANON" | node "$CLASSIFIER" "$TOOL" 2>>"$HOOK_LOG")"
++if [ -z "$DECISION" ]; then
++  log "classifier produced no output for $TOOL; blocking"
++  printf '{"decision":"block","reason":"permission classifier error","exitCode":2}\n'
++  exit 2
++fi
++
++LEVEL="$(printf '%s' "$DECISION" | jq -r '.level // empty')"
++REASON="$(printf '%s' "$DECISION" | jq -r '.reason // ""')"
++
++case "$LEVEL" in
++  deny)
++    printf '{"decision":"block","reason":"%s","exitCode":2}\n' "$REASON"
++    exit 2
++    ;;
++  ask)
++    if [ -z "$REASON" ]; then REASON="action requires approval"; fi
++    mkdir -p "$APPROVAL_DIR"
++    ID="appr_$(printf '%s' "$TOOL::$INPUT_CANON" | sha1sum | awk '{print $1}' | head -c 24)"
++    printf '{"id":"%s","tool":"%s","at":"%s"}\n' "$ID" "$TOOL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$APPROVAL_DIR/$ID.req"
++    log "ask blocked $TOOL id=$ID reason=$REASON"
++    # Poll until a decision file appears, or the TTL elapses (counts as denial).
++    # GNU date supports %3N; the VM image ships coreutils.
++    DEADLINE=$(( $(date +%s%3N) + TTL_MS ))
++    while :; do
++      if [ -f "$APPROVAL_DIR/$ID.ok" ]; then
++        rm -f "$APPROVAL_DIR/$ID.req"
++        log "allowed $TOOL id=$ID"
++        printf '{"decision":"allow","reason":"approved by user"}\n'
++        exit 0
++      fi
++      if [ -f "$APPROVAL_DIR/$ID.no" ]; then
++        rm -f "$APPROVAL_DIR/$ID.req"
++        log "denied $TOOL id=$ID"
++        printf '{"decision":"block","reason":"denied by user","exitCode":2}\n'
++        exit 2
++      fi
++      if [ "$(date +%s%3N)" -ge "$DEADLINE" ]; then
++        rm -f "$APPROVAL_DIR/$ID.req"
++        log "timed out $TOOL id=$ID"
++        printf '{"decision":"block","reason":"approval timed out","exitCode":2}\n'
++        exit 2
++      fi
++      sleep 0.2
++    done
++    ;;
++  *)
++    # allow (and any unrecognized level default to allow — never block benign work).
++    printf '{"decision":"allow","reason":"%s"}\n' "$REASON"
++    exit 0
++    ;;
++esac
+-- 
+2.55.0
+

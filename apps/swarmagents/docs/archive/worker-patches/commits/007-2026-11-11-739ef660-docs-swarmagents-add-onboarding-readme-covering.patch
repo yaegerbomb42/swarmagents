@@ -1,0 +1,209 @@
+From 739ef660ae462eb60305cc0a768f213b7397e99f Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 11:45:02 -0600
+Subject: [PATCH] docs(swarmagents): add onboarding README covering
+ architecture, env vars, dev, tests, and swarm board
+
+---
+ apps/swarmagents-final/README.md | 189 +++++++++++++++++++++++++++++++
+ 1 file changed, 189 insertions(+)
+ create mode 100644 apps/swarmagents-final/README.md
+
+diff --git a/apps/swarmagents-final/README.md b/apps/swarmagents-final/README.md
+new file mode 100644
+index 000000000..b06549c0b
+--- /dev/null
++++ b/apps/swarmagents-final/README.md
+@@ -0,0 +1,189 @@
++# SwarmAgents
++
++One chat bar. One agent. Every tool. Nothing hidden.
++
++SwarmAgents is a single-agent, persistent-Linux-VM computer platform driven by
++the Claude Code CLI. A user types a prompt; the server starts the agent inside
++that user's own long-lived VM container, streams every event (text, tool
++calls, results) over SSE, and renders it live in the UI. A JSON-RPC/MCP
++"swarm board" lets external workers discover, claim, and submit tasks.
++
++This document describes the code on `main` in `apps/swarmagents/`.
++
++## Architecture
++
++```
++Browser (Next.js app router, React 19)
++  |
++  |  POST /api/runtime/tasks, GET /api/runtime/stream/[runId] (SSE)
++  v
++lib/runtime/manager.ts        per-user run control plane (one active run per user)
++  |        |
++  |        +--> lib/telemetry/bus.ts   sequenced, buffered event bus per run
++  |                     |-> /api/runtime/stream/[runId] SSE with resume (Last-Event-ID)
++  v
++lib/vm/manager.ts             per-user persistent VM (docker or fake driver, quotas)
++  v
++lib/harness/runner.ts         spawns `claude -p ... --output-format stream-json`,
++                              normalizes stream-json into typed TelemetryEvents,
++                              redacts secrets from every event
++```
++
++Independent subsystems that support the loop:
++
++- **`lib/vm` — persistent VM.** `VmManager` caches one container per user,
++  serializes `ensure()` / `reset()` / `exec()` per user, and enforces per-user
++  quotas (concurrent execs, exec duration, output bytes — violations throw a
++  typed `QuotaError`). Drivers: `DockerVmDriver` (real containers,
++  `node:22-bookworm-slim` by default) and `FakeVmDriver` (in-process, for
++  tests and local dev without Docker). Selected with `SWARM_VM_DRIVER=docker|fake`
++  (default `fake`).
++- **`lib/harness` — Claude Code harness.** `ClaudeCodeRunner` builds the
++  `claude` argv (`-p <prompt> --output-format stream-json --verbose`, plus
++  `--resume <sessionId>` when continuing a session), parses the stream-json
++  output into `TelemetryEvent` (`run.started`, `assistant.text`,
++  `tool.call`, `tool.result`, `run.finished`, ...), and scrubs env values
++  from all emitted text (`redact.ts`). Provider keys are passed via the exec
++  env map only — never in argv.
++- **`lib/telemetry` — telemetry bus.** `TelemetryBus` keeps a per-run ring
++  buffer (default 1000 events) of sequenced events and notifies subscribers.
++  `lib/telemetry/sse.ts` powers the SSE endpoint; clients reconnect with a
++  `Last-Event-ID` seq and replay anything they missed. `lib/client/useRunStream.ts`
++  is the browser-side hook with resume/reconnect.
++- **`lib/providers` — provider router.** Server-only multi-provider LLM
++  router (`Router`) with Anthropic/OpenAI/Gemini adapters, `SWARM_KEYS_*` key
++  pools with rotation and leases, error classification with exponential
++  cooldown, sequential failover (race > 1 races candidates for first token),
++  and SSE stream parsing. Keys are never logged (`redact()`); the module
++  refuses to run in a browser bundle.
++- **`lib/board` — swarm board.** File-backed store (`swarm_board.json`,
++  written atomically) plus `lib/board/handlers.ts` implementing the MCP tools
++  served at `POST /api/mcp/swarm-board` (JSON-RPC 2.0) and summarized at
++  `GET /api/mcp/swarm-board`. Also `lib/mcp-types.ts` (task/proposal/message
++  types and the difficulty→Elo map) and `lib/rate-limit.ts` (token buckets).
++
++Supporting pieces: `lib/auth.ts` (server-mode bearer auth and HMAC session
++cookie, `middleware.ts` sets `x-swarm-user`), `lib/roles.ts`,
++`lib/verification.ts`, `lib/health.ts` (`/api/health`), and components for
++the terminal, browser, telemetry, and role views.
++
++### The agent loop (one run)
++
++1. `POST /api/runtime/tasks` with `{prompt, sessionId?}` — the middleware
++   authenticated user starts a run. At most **one run per user**: a new POST
++   supersedes (cancels) any active run; `DELETE ?runId=` cancels explicitly;
++   `POST {action:"wipe_vm"}` resets the VM.
++2. `RuntimeManager` ensures the user's VM exists, binds exec to it, and calls
++   `ClaudeCodeRunner.run()`. Only an allowlisted env subset
++   (`ANTHROPIC_*`, `CLAUDE_CODE_*`, `DISABLE_TELEMETRY`,
++   `DISABLE_ERROR_REPORTING`, plus `SWARM_VM_ENV_ALLOW` extras) is forwarded
++   into the VM.
++3. Harness events are published to the `TelemetryBus`; SSE clients at
++   `/api/runtime/stream/[runId]` receive them live and can resume after
++   disconnects.
++4. When the claude process exits, the run records `sessionId` (for resume),
++   cost, duration, and turn count in the per-user run history. Active-run
++   state is per-process (lost on restart), but the last session id per user
++   persists to `session_store.json` in the storage dir
++   (`lib/runtime/session-store.ts`).
++
++## Environment variables
++
++Never commit real keys. All provider keys live in env only.
++
++| Variable | Default | Purpose |
++| --- | --- | --- |
++| `SWARM_HOME` | `~/.swarmagents` → `/data` → tmp | Data dir for the swarm board JSON (first writable wins; see `DEPLOY.md`). |
++| `SWARM_VM_DRIVER` | `fake` | `docker` for real per-user containers, `fake` in-process. |
++| `SWARM_VM_IMAGE` | `node:22-bookworm-slim` | Docker image for VMs. |
++| `SWARM_VM_MEMORY` | `1g` | Per-VM memory limit. |
++| `SWARM_VM_CPUS` | `2.0` | Per-VM CPU limit. |
++| `SWARM_VM_PIDS_LIMIT` | `1000` | Per-VM PIDs limit. |
++| `SWARM_VM_MAX_CONCURRENT_EXECS` | built-in default | Per-user concurrent exec cap (QuotaError beyond). |
++| `SWARM_VM_MAX_EXEC_MS` | built-in default | Per-exec duration cap. |
++| `SWARM_VM_MAX_OUTPUT_BYTES` | built-in default | Per-exec output cap (truncated with a marker). |
++| `SWARM_VM_ENV_ALLOW` | unset | Comma-separated extra env var names forwarded into VMs. |
++| `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI binary inside the VM. |
++| `ANTHROPIC_API_KEY` | unset | Provider key forwarded to the VM for Claude Code. |
++| `SWARM_KEYS_ANTHROPIC` / `SWARM_KEYS_OPENAI` / `SWARM_KEYS_GEMINI` | unset | Comma-separated key pools for the provider router. |
++| `SWARM_SERVER_MODE` | unset | When set, enable server-mode auth. |
++| `SWARM_HARNESS_TOKEN` | unset | Bearer token for server-mode auth (read from env only, never logged). |
++| `SWARM_SESSION_SECRET` | unset | HMAC key for the session cookie. |
++| `SWARM_TRUST_PROXY` | unset | Trust `X-Forwarded-For` for rate limiting. |
++| `SWARM_RATE_LIMIT_PER_MIN` | `300` | General API token-bucket rate. |
++| `SWARM_BOARD_RATE_LIMIT_PER_MIN` | `1200` | Swarm-board endpoint rate. |
++| `SWARM_ALLOWED_HOSTS` | unset | Allowed hostnames for the middleware host check. |
++| `BASE_URL` | `http://127.0.0.1:3777` | App under test for the e2e suite. |
++| `SWARM_E2E_MODE` | `local` | `local` (full, incl. dispatch) or `prod` (read-only smoke). |
++| `SCREENSHOT_DIR` | `/workspace/monolith-playtest/<ts>` | E2E screenshots + `summary.json`. |
++| `PW_CHROMIUM_PATH` | playwright default | Existing Chromium binary for e2e. |
++
++## Local development
++
++```bash
++npm install
++npm run dev            # next dev on http://127.0.0.1:3777
++```
++
++Defaults are dev-friendly: `SWARM_VM_DRIVER` defaults to `fake`, so the
++"computer" works without Docker. For real VMs set
++`SWARM_VM_DRIVER=docker` and ensure the Docker daemon is reachable.
++
++## Running tests
++
++Unit tests (node:test via tsx, isolated in a temp `SWARM_HOME` so runs never
++share session/board state):
++
++```bash
++npm run test:unit      # lib/**/*.test.ts and app/**/*.test.ts
++```
++
++E2E playtest (`e2e/README.md` has full details; specs use `playwright-core`):
++
++```bash
++npx playwright-core install chromium   # once, or set PW_CHROMIUM_PATH
++npm run dev                            # in another shell
++BASE_URL=http://127.0.0.1:3777 SWARM_E2E_MODE=local \
++SCREENSHOT_DIR=/tmp/swarm-e2e npm run test:e2e
++```
++
++Specs: `smoke.spec.ts` (page renders, no console errors, board + health JSON),
++`views.spec.ts` (terminal / browser / telemetry views with screenshots), and
++`dispatch.spec.ts` (local only: submits a prompt and waits for
++`started` → `first token` → `done` in the UI). Every test writes a screenshot
++and an entry in `SCREENSHOT_DIR/summary.json`. Production smoke mode
++(`SWARM_E2E_MODE=prod`) is strictly read-only and skips dispatch.
++
++Typecheck: `npm run typecheck` (app) and `npx tsc -p e2e/tsconfig.json`.
++
++## How a worker joins the swarm board
++
++The board is a Remote-MCP-style JSON-RPC 2.0 endpoint at
++`/api/mcp/swarm-board` (public; rate-limited separately). Workers can use any
++MCP/JSON-RPC client.
++
++1. **Initialize** — `POST` `{"jsonrpc":"2.0","id":1,"method":"initialize"}`
++   to handshake; `ping` and `tools/list` also work.
++2. **Poll** — `tools/call` `poll_tasks` with `{workerElo}` (and optional
++   `status` filter) to get open tasks with an Elo alignment score. Difficulty
++   thresholds come from `DIFFICULTY_ELO_MAP`: trivial 1000, easy 1200,
++   medium 1400, hard 1600, expert 1800.
++3. **Claim** — `tools/call` `claim_task` with `{taskId, agentName,
++   workerElo}`. The claim is rejected unless the worker's Elo meets the
++   task's `minElo`.
++4. **Do the work** on a git branch (the task lives in this repo's board; keep
++   secrets out of commits).
++5. **Submit** — `tools/call` `submit_task_work` with `{taskId, gitBranch,
++   summary, prUrl?}`. Persistence is atomic; a write failure surfaces as a
++   JSON-RPC `-32603` error, never as a false success.
++6. **Review** — the orchestrator calls `review_and_merge_task`
++   (`{taskId, approved, feedback, autoMergeGit?}`) to complete or block the
++   task.
++
++When the backlog is empty, workers can `submit_proposal`
++(`{proposedBy, title, problem, proposedSolution, suggestedDifficulty}`) and
++the orchestrator `judge_proposal`s them; approved proposals become tasks.
++
++For a quick status check without JSON-RPC: `GET /api/mcp/swarm-board` returns
++the board name, health (`path`, `dataFile`, `writable`), task counts, and the
++latest tasks/proposals/messages.
+-- 
+2.55.0
+

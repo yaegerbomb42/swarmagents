@@ -1,0 +1,1128 @@
+From 866d931af78d6fffb8e51704d051b8bc9c421db5 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 12:04:24 -0600
+Subject: [PATCH] feat(vm): hibernate persistent VMs after N idle minutes and
+ restart on next exec
+
+Persistent per-user VMs kept running (and holding host CPU/memory) even
+when nobody used them. VmManager now tracks the last activity per user and
+an idle sweeper stops VMs that have been idle for longer than
+SWARM_VM_IDLE_MIN (default 30, 0 disables).
+
+- lib/vm/idle.ts: idle policy (SWARM_VM_IDLE_MIN, SWARM_VM_SWEEP_INTERVAL_SEC)
+- lib/vm/manager.ts: activity tracking (touch/lastActivityAt/idleForMs/
+  isIdle/hasActiveExec), sweepIdle() that hibernates idle VMs under the
+  per-user write lock, and re-ensure on the next exec so the container is
+  restarted with its /workspace volume intact
+- lib/vm/idle-sweeper.ts: timer-driven sweeper with injectable clock and
+  interval functions; wired into the runtime singleton
+- A VM with a running exec is never stopped: the sweep skips users with an
+  exec in flight and re-checks the activity record under the write lock
+- Tests (FakeVmDriver + fake timers) prove stop+wake with the volume
+  preserved, that a running exec is never stopped, and that an exec racing
+  a sweep keeps its VM alive
+---
+ apps/swarmagents/README.md              |  13 +-
+ apps/swarmagents/lib/runtime/manager.ts |  15 +-
+ apps/swarmagents/lib/vm/idle-sweeper.ts | 147 +++++++++
+ apps/swarmagents/lib/vm/idle.test.ts    | 421 ++++++++++++++++++++++++
+ apps/swarmagents/lib/vm/idle.ts         |  80 +++++
+ apps/swarmagents/lib/vm/index.ts        |  18 +
+ apps/swarmagents/lib/vm/manager.ts      | 219 ++++++++++--
+ 7 files changed, 883 insertions(+), 30 deletions(-)
+ create mode 100644 apps/swarmagents/lib/vm/idle-sweeper.ts
+ create mode 100644 apps/swarmagents/lib/vm/idle.test.ts
+ create mode 100644 apps/swarmagents/lib/vm/idle.ts
+
+diff --git a/apps/swarmagents/README.md b/apps/swarmagents/README.md
+index b06549c0b..6e71f7986 100644
+--- a/apps/swarmagents/README.md
++++ b/apps/swarmagents/README.md
+@@ -34,10 +34,13 @@ Independent subsystems that support the loop:
+ - **`lib/vm` — persistent VM.** `VmManager` caches one container per user,
+   serializes `ensure()` / `reset()` / `exec()` per user, and enforces per-user
+   quotas (concurrent execs, exec duration, output bytes — violations throw a
+-  typed `QuotaError`). Drivers: `DockerVmDriver` (real containers,
+-  `node:22-bookworm-slim` by default) and `FakeVmDriver` (in-process, for
+-  tests and local dev without Docker). Selected with `SWARM_VM_DRIVER=docker|fake`
+-  (default `fake`).
++  typed `QuotaError`). It also tracks the last activity per user: after
++  `SWARM_VM_IDLE_MIN` minutes without activity the idle sweeper stops the VM
++  (the `/workspace` volume survives) and the next `exec()` transparently
++  restarts it. A VM with a running exec is never stopped. Drivers:
++  `DockerVmDriver` (real containers, `node:22-bookworm-slim` by default) and
++  `FakeVmDriver` (in-process, for tests and local dev without Docker).
++  Selected with `SWARM_VM_DRIVER=docker|fake` (default `fake`).
+ - **`lib/harness` — Claude Code harness.** `ClaudeCodeRunner` builds the
+   `claude` argv (`-p <prompt> --output-format stream-json --verbose`, plus
+   `--resume <sessionId>` when continuing a session), parses the stream-json
+@@ -102,6 +105,8 @@ Never commit real keys. All provider keys live in env only.
+ | `SWARM_VM_MAX_CONCURRENT_EXECS` | built-in default | Per-user concurrent exec cap (QuotaError beyond). |
+ | `SWARM_VM_MAX_EXEC_MS` | built-in default | Per-exec duration cap. |
+ | `SWARM_VM_MAX_OUTPUT_BYTES` | built-in default | Per-exec output cap (truncated with a marker). |
++| `SWARM_VM_IDLE_MIN` | `30` | Minutes of inactivity before a persistent VM is stopped (0 = never stop). |
++| `SWARM_VM_SWEEP_INTERVAL_SEC` | `60` | How often the idle sweeper checks for idle VMs. |
+ | `SWARM_VM_ENV_ALLOW` | unset | Comma-separated extra env var names forwarded into VMs. |
+ | `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI binary inside the VM. |
+ | `ANTHROPIC_API_KEY` | unset | Provider key forwarded to the VM for Claude Code. |
+diff --git a/apps/swarmagents/lib/runtime/manager.ts b/apps/swarmagents/lib/runtime/manager.ts
+index 07c114944..c3480ad0f 100644
+--- a/apps/swarmagents/lib/runtime/manager.ts
++++ b/apps/swarmagents/lib/runtime/manager.ts
+@@ -28,6 +28,7 @@ import type {
+ } from "../providers";
+ import { telemetryBus, type TelemetryBus } from "../telemetry/index";
+ import { bindExec, VmManager, vmManager } from "../vm/manager";
++import { startVmIdleSweeper } from "../vm/idle-sweeper";
+ import { getLastSession, setLastSession, clearLastSession } from "./session-store";
+ 
+ /**
+@@ -163,6 +164,11 @@ export class RuntimeManager {
+     return this.router;
+   }
+ 
++  /** The VM manager backing this runtime (used to wire the idle sweeper). */
++  get vmManager(): VmManager {
++    return this.vm;
++  }
++
+   private state(userId: string): UserState {
+     let s = this.users.get(userId);
+     if (!s) {
+@@ -491,7 +497,14 @@ export class RuntimeManager {
+  */
+ const g = globalThis as typeof globalThis & { __swarmRuntimeManager?: RuntimeManager };
+ export function getRuntimeManager(): RuntimeManager {
+-  return g.__swarmRuntimeManager ?? (g.__swarmRuntimeManager = new RuntimeManager());
++  if (g.__swarmRuntimeManager) return g.__swarmRuntimeManager;
++  const manager = new RuntimeManager();
++  g.__swarmRuntimeManager = manager;
++  // Persistent VMs are hibernated after SWARM_VM_IDLE_MIN minutes of
++  // inactivity; the sweeper stops them and the next run transparently
++  // restarts the container (the /workspace volume is kept).
++  startVmIdleSweeper(manager.vmManager);
++  return manager;
+ }
+ 
+ /** Test hook: swap the singleton for a manager backed by a fake driver. */
+diff --git a/apps/swarmagents/lib/vm/idle-sweeper.ts b/apps/swarmagents/lib/vm/idle-sweeper.ts
+new file mode 100644
+index 000000000..84fef0c52
+--- /dev/null
++++ b/apps/swarmagents/lib/vm/idle-sweeper.ts
+@@ -0,0 +1,147 @@
++// Idle sweeper: periodically asks the VmManager to hibernate VMs that have
++// been idle for longer than the configured idle window (SWARM_VM_IDLE_MIN).
++//
++// The sweeper owns the timer only — all decisions (who is idle, is an exec
++// running, is it safe to stop) live in VmManager. The timer functions are
++// injectable so tests can drive the sweeper with a fake clock instead of
++// waiting for wall-clock time.
++
++import type { VmManager } from "./manager";
++
++/** Handle returned by the injected interval scheduler. */
++export type SweepTimerHandle = unknown;
++
++/** Injectable setInterval (tests pass a fake). */
++export type SetIntervalFn = (fn: () => void, ms: number) => SweepTimerHandle;
++
++/** Injectable clearInterval (tests pass a fake). */
++export type ClearIntervalFn = (handle: SweepTimerHandle) => void;
++
++export interface IdleSweeperOptions {
++  /** Manager that owns the VMs to sweep. */
++  manager: VmManager;
++  /** Sweep cadence in ms (defaults to the manager's idle policy). */
++  intervalMs?: number;
++  /** Injectable clock — tests drive it with a fake timer. */
++  now?: () => number;
++  /** Injectable interval scheduler. */
++  setIntervalFn?: SetIntervalFn;
++  /** Injectable interval clearer. */
++  clearIntervalFn?: ClearIntervalFn;
++  /** Called with the ids of the VMs that were hibernated. */
++  onHibernated?: (userIds: string[]) => void;
++  /** Called when a sweep throws. */
++  onError?: (err: unknown) => void;
++}
++
++const defaultSetInterval: SetIntervalFn = (fn, ms) => setInterval(fn, ms);
++const defaultClearInterval: ClearIntervalFn = (handle) => clearInterval(handle as NodeJS.Timeout);
++
++export class IdleSweeper {
++  readonly manager: VmManager;
++  readonly intervalMs: number;
++  private readonly now: () => number;
++  private readonly setIntervalFn: SetIntervalFn;
++  private readonly clearIntervalFn: ClearIntervalFn;
++  private readonly onHibernated?: (userIds: string[]) => void;
++  private readonly onError?: (err: unknown) => void;
++  private timer: SweepTimerHandle | null = null;
++  private sweeping = false;
++  private queued = false;
++
++  constructor(opts: IdleSweeperOptions) {
++    this.manager = opts.manager;
++    this.intervalMs = opts.intervalMs ?? opts.manager.idle.sweepIntervalMs;
++    this.now = opts.now ?? Date.now;
++    this.setIntervalFn = opts.setIntervalFn ?? defaultSetInterval;
++    this.clearIntervalFn = opts.clearIntervalFn ?? defaultClearInterval;
++    this.onHibernated = opts.onHibernated;
++    this.onError = opts.onError;
++  }
++
++  get running(): boolean {
++    return this.timer !== null;
++  }
++
++  /** Start the sweep timer. Calling it twice is a no-op. */
++  start(): void {
++    if (this.timer !== null) return;
++    if (this.intervalMs <= 0) return; // hibernate disabled
++    this.timer = this.setIntervalFn(() => {
++      const running = this.sweep();
++      // sweep() handles its own errors; this only guards the timer callback.
++      running.catch(() => {});
++      return running;
++    }, this.intervalMs);
++    // Never keep the process alive just for the sweeper.
++    const handle = this.timer as { unref?: () => void } | null;
++    handle?.unref?.();
++  }
++
++  /** Stop the sweep timer. Calling it twice is a no-op. */
++  stop(): void {
++    if (this.timer === null) return;
++    this.clearIntervalFn(this.timer);
++    this.timer = null;
++  }
++
++  /**
++   * Run one sweep now. Returns the ids of the users that were hibernated.
++   * Overlapping sweeps are collapsed into a single follow-up sweep, so a
++   * slow sweep never piles up timers (and never misses an idle window).
++   */
++  async sweep(): Promise<string[]> {
++    if (this.sweeping) {
++      this.queued = true;
++      return [];
++    }
++    this.sweeping = true;
++    try {
++      let hibernated: string[] = [];
++      do {
++        this.queued = false;
++        hibernated = await this.runSweep();
++      } while (this.queued);
++      return hibernated;
++    } finally {
++      this.sweeping = false;
++    }
++  }
++
++  /** One sweep pass over the manager's VMs. */
++  private async runSweep(): Promise<string[]> {
++    try {
++      const hibernated = await this.manager.sweepIdle(this.now());
++      if (hibernated.length > 0) this.onHibernated?.(hibernated);
++      return hibernated;
++    } catch (err) {
++      this.onError?.(err);
++      console.error("[vm] idle sweep failed:", err);
++      return [];
++    }
++  }
++}
++
++/** One sweeper per manager, so repeated wiring does not stack timers. */
++const sweepers = new WeakMap<VmManager, IdleSweeper>();
++
++/** Start (or return) the idle sweeper for a manager. */
++export function startVmIdleSweeper(manager: VmManager, opts?: Omit<IdleSweeperOptions, "manager">): IdleSweeper {
++  const existing = sweepers.get(manager);
++  if (existing) {
++    existing.start();
++    return existing;
++  }
++  const sweeper = new IdleSweeper({ ...opts, manager });
++  sweepers.set(manager, sweeper);
++  sweeper.start();
++  return sweeper;
++}
++
++/** Stop the idle sweeper of a manager (if any). */
++export function stopVmIdleSweeper(manager: VmManager): void {
++  const existing = sweepers.get(manager);
++  if (!existing) return;
++  existing.stop();
++  sweepers.delete(manager);
++}
+diff --git a/apps/swarmagents/lib/vm/idle.test.ts b/apps/swarmagents/lib/vm/idle.test.ts
+new file mode 100644
+index 000000000..a6e308dfc
+--- /dev/null
++++ b/apps/swarmagents/lib/vm/idle.test.ts
+@@ -0,0 +1,421 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { FakeVmDriver } from "./fake-driver.js";
++import { VmManager } from "./manager.js";
++import { IdleSweeper, startVmIdleSweeper, stopVmIdleSweeper } from "./idle-sweeper.js";
++import {
++  DEFAULT_VM_IDLE_MIN,
++  parseIdleMinutes,
++  resolveIdlePolicy,
++} from "./idle.js";
++import type { ExecOptions, ExecResult, VmHandle } from "./types.js";
++
++// ---------------------------------------------------------------------------
++// Fake clock + fake interval: deterministic time, no wall-clock waiting.
++// ---------------------------------------------------------------------------
++
++class FakeClock {
++  private t = 0;
++  readonly now = (): number => this.t;
++  advance(ms: number): void {
++    this.t += ms;
++  }
++}
++
++type TimerFn = () => void | Promise<unknown>;
++
++class FakeTimers {
++  private handlers = new Map<number, { fn: TimerFn; ms: number; next: number }>();
++  private nextId = 1;
++  private current = 0;
++
++  readonly setInterval = (fn: TimerFn, ms: number): number => {
++    const id = this.nextId++;
++    this.handlers.set(id, { fn, ms, next: this.current + ms });
++    return id;
++  };
++
++  readonly clearInterval = (handle: unknown): void => {
++    this.handlers.delete(handle as number);
++  };
++
++  get pending(): number {
++    return this.handlers.size;
++  }
++
++  /** Advance the fake timers, firing every due interval in order. */
++  async advance(ms: number): Promise<void> {
++    const target = this.current + ms;
++    for (;;) {
++      let dueId: number | null = null;
++      let dueAt = Number.POSITIVE_INFINITY;
++      for (const [id, h] of this.handlers) {
++        if (h.next <= target && h.next < dueAt) {
++          dueId = id;
++          dueAt = h.next;
++        }
++      }
++      if (dueId === null) break;
++      const handler = this.handlers.get(dueId)!;
++      handler.next = dueAt + handler.ms;
++      this.current = dueAt;
++      const result = handler.fn();
++      if (result && typeof (result as Promise<unknown>).then === "function") {
++        await result;
++      }
++    }
++    this.current = target;
++  }
++}
++
++const flush = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
++
++async function waitFor(predicate: () => boolean, label: string, timeoutMs = 1000): Promise<void> {
++  const started = Date.now();
++  while (!predicate()) {
++    if (Date.now() - started > timeoutMs) throw new Error(`Timed out waiting for ${label}`);
++    await flush();
++  }
++}
++
++/** Exec blocks until releaseExec(); stop() is counted. */
++class BlockingExecDriver extends FakeVmDriver {
++  execStarts = 0;
++  stops = 0;
++  private pending: Array<() => void> = [];
++
++  override async exec(handle: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
++    this.execStarts++;
++    await new Promise<void>((resolve) => this.pending.push(resolve));
++    return super.exec(handle, cmd, opts);
++  }
++
++  override async stop(handle: VmHandle): Promise<void> {
++    this.stops++;
++    return super.stop(handle);
++  }
++
++  releaseExec(): void {
++    this.pending.shift()?.();
++  }
++}
++
++const MINUTE = 60_000;
++
++// ---------------------------------------------------------------------------
++// Policy
++// ---------------------------------------------------------------------------
++
++test("resolveIdlePolicy defaults to 30 idle minutes", () => {
++  const policy = resolveIdlePolicy();
++  assert.equal(policy.idleMinutes, DEFAULT_VM_IDLE_MIN);
++  assert.equal(policy.idleMs, 30 * MINUTE);
++  assert.ok(policy.sweepIntervalMs > 0);
++});
++
++test("resolveIdlePolicy reads SWARM_VM_IDLE_MIN and 0 disables hibernate", () => {
++  const prev = process.env.SWARM_VM_IDLE_MIN;
++  try {
++    process.env.SWARM_VM_IDLE_MIN = "5";
++    assert.equal(resolveIdlePolicy().idleMinutes, 5);
++    assert.equal(resolveIdlePolicy().idleMs, 5 * MINUTE);
++
++    process.env.SWARM_VM_IDLE_MIN = "0";
++    const disabled = resolveIdlePolicy();
++    assert.equal(disabled.idleMinutes, 0);
++    assert.equal(disabled.idleMs, 0);
++    assert.equal(disabled.sweepIntervalMs, 0);
++  } finally {
++    if (prev === undefined) delete process.env.SWARM_VM_IDLE_MIN;
++    else process.env.SWARM_VM_IDLE_MIN = prev;
++  }
++});
++
++test("parseIdleMinutes rejects garbage and negatives", () => {
++  assert.equal(parseIdleMinutes(undefined), DEFAULT_VM_IDLE_MIN);
++  assert.equal(parseIdleMinutes(""), DEFAULT_VM_IDLE_MIN);
++  assert.equal(parseIdleMinutes("nope"), DEFAULT_VM_IDLE_MIN);
++  assert.equal(parseIdleMinutes(-3), DEFAULT_VM_IDLE_MIN);
++  assert.equal(parseIdleMinutes("0.5"), 0.5);
++  assert.equal(parseIdleMinutes(0), 0);
++});
++
++test("resolveIdlePolicy never sweeps slower than the idle window", () => {
++  const policy = resolveIdlePolicy({ idleMinutes: 1, sweepIntervalMs: 10 * MINUTE });
++  assert.equal(policy.sweepIntervalMs, MINUTE);
++});
++
++// ---------------------------------------------------------------------------
++// Activity tracking
++// ---------------------------------------------------------------------------
++
++test("VmManager tracks the last activity per user", async () => {
++  const clock = new FakeClock();
++  const manager = new VmManager({ customDriver: new FakeVmDriver(), idle: { idleMinutes: 30 }, now: clock.now });
++
++  assert.equal(manager.lastActivityAt("nobody"), undefined);
++  assert.equal(manager.idleForMs("nobody"), 0);
++  assert.equal(manager.isIdle("nobody"), false);
++
++  await manager.exec("alice", ["echo", "hi"]);
++  const first = manager.lastActivityAt("alice") ?? 0;
++  assert.ok(first > 0 || first === 0);
++
++  clock.advance(5 * MINUTE);
++  assert.equal(manager.idleForMs("alice"), 5 * MINUTE);
++  assert.equal(manager.isIdle("alice"), false);
++
++  await manager.exec("alice", ["echo", "again"]);
++  assert.equal(manager.idleForMs("alice"), 0, "a new exec resets the idle timer");
++  assert.ok((manager.lastActivityAt("alice") ?? 0) >= first);
++
++  // A second user has its own timeline.
++  assert.equal(manager.lastActivityAt("bob"), undefined);
++});
++
++// ---------------------------------------------------------------------------
++// Hibernation: stop + wake
++// ---------------------------------------------------------------------------
++
++test("sweepIdle stops a VM that has been idle for too long", async () => {
++  const clock = new FakeClock();
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 30 }, now: clock.now });
++
++  await manager.exec("alice", ["echo", "hi"]);
++  assert.equal((await manager.status("alice")).status, "running");
++
++  clock.advance(31 * MINUTE);
++  const hibernated = await manager.sweepIdle();
++
++  assert.deepEqual(hibernated, ["alice"]);
++  assert.equal((await manager.status("alice")).status, "stopped");
++});
++
++test("sweepIdle keeps VMs that are still within the idle window", async () => {
++  const clock = new FakeClock();
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 30 }, now: clock.now });
++
++  await manager.exec("alice", ["echo", "hi"]);
++  clock.advance(29 * MINUTE);
++
++  assert.deepEqual(await manager.sweepIdle(), []);
++  assert.equal((await manager.status("alice")).status, "running");
++});
++
++test("the next exec re-ensures the VM and keeps the /workspace volume", async () => {
++  const clock = new FakeClock();
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 30 }, now: clock.now });
++
++  await manager.writeFile("alice", "/workspace/keep.txt", "persisted");
++  clock.advance(31 * MINUTE);
++  assert.deepEqual(await manager.sweepIdle(), ["alice"]);
++
++  // The VM was stopped, the next exec transparently restarts it.
++  const chunks: string[] = [];
++  const result = await manager.exec("alice", ["cat", "/workspace/keep.txt"], {
++    onStdout: (c) => chunks.push(c),
++  });
++
++  assert.equal(result.exitCode, 0);
++  assert.equal(chunks.join(""), "persisted", "the workspace volume survives hibernation");
++  assert.equal((await manager.status("alice")).status, "running");
++});
++
++test("a manually stopped VM is re-ensured on the next exec", async () => {
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 30 } });
++
++  await manager.writeFile("alice", "/workspace/keep.txt", "persisted");
++  await manager.stop("alice");
++  assert.equal((await manager.status("alice")).status, "stopped");
++
++  const chunks: string[] = [];
++  const result = await manager.exec("alice", ["cat", "/workspace/keep.txt"], {
++    onStdout: (c) => chunks.push(c),
++  });
++  assert.equal(result.exitCode, 0);
++  assert.equal(chunks.join(""), "persisted");
++  assert.equal((await manager.status("alice")).status, "running");
++});
++
++test("SWARM_VM_IDLE_MIN=0 disables hibernation entirely", async () => {
++  const clock = new FakeClock();
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 0 }, now: clock.now });
++
++  await manager.exec("alice", ["echo", "hi"]);
++  clock.advance(10 * 60 * MINUTE);
++
++  assert.deepEqual(await manager.sweepIdle(), []);
++  assert.equal((await manager.status("alice")).status, "running");
++});
++
++// ---------------------------------------------------------------------------
++// A running exec is never stopped
++// ---------------------------------------------------------------------------
++
++test("sweepIdle never stops a VM with a running exec", async () => {
++  const clock = new FakeClock();
++  const driver = new BlockingExecDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 30 }, now: clock.now });
++
++  const execPromise = manager.exec("alice", ["echo", "slow"]);
++  await waitFor(() => driver.execStarts === 1, "exec to start");
++
++  // Time passes well beyond the idle window while the exec is running.
++  clock.advance(45 * MINUTE);
++
++  assert.deepEqual(await manager.sweepIdle(), [], "no VM may be hibernated during an exec");
++  assert.equal(driver.stops, 0, "the driver must not be stopped during an exec");
++  assert.equal((await manager.status("alice")).status, "running");
++
++  driver.releaseExec();
++  const result = await execPromise;
++  assert.equal(result.exitCode, 0, "the running exec completes normally");
++
++  // Once the exec is done the VM is idle again and gets hibernated.
++  clock.advance(31 * MINUTE);
++  assert.deepEqual(await manager.sweepIdle(), ["alice"]);
++  assert.equal(driver.stops, 1);
++  assert.equal((await manager.status("alice")).status, "stopped");
++});
++
++test("an exec that starts during a sweep keeps its VM alive", async () => {
++  const clock = new FakeClock();
++  const driver = new BlockingExecDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 30 }, now: clock.now });
++
++  const firstExec = manager.exec("alice", ["echo", "one"]);
++  await waitFor(() => driver.execStarts === 1, "first exec to start");
++  driver.releaseExec();
++  await firstExec;
++
++  clock.advance(31 * MINUTE);
++
++  // The sweep snapshots the idle user, then an exec starts before the sweep
++  // gets the lock: the VM must not be stopped underneath the running exec.
++  const sweepPromise = manager.sweepIdle(clock.now());
++  const secondExec = manager.exec("alice", ["echo", "two"]);
++  await waitFor(() => driver.execStarts === 2, "second exec to start");
++
++  assert.deepEqual(await sweepPromise, [], "a VM that became busy is not hibernated");
++  assert.equal(driver.stops, 0);
++
++  driver.releaseExec();
++  assert.equal((await secondExec).exitCode, 0);
++});
++
++// ---------------------------------------------------------------------------
++// Sweeper with fake timers
++// ---------------------------------------------------------------------------
++
++test("IdleSweeper hibernates idle VMs on its timer", async () => {
++  const clock = new FakeClock();
++  const timers = new FakeTimers();
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 30 }, now: clock.now });
++
++  const sweeper = new IdleSweeper({
++    manager,
++    intervalMs: MINUTE,
++    now: clock.now,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++  });
++
++  sweeper.start();
++  assert.equal(sweeper.running, true);
++  assert.equal(timers.pending, 1);
++
++  await manager.exec("alice", ["echo", "hi"]);
++  clock.advance(31 * MINUTE);
++
++  await timers.advance(MINUTE);
++  assert.equal((await manager.status("alice")).status, "stopped");
++
++  sweeper.stop();
++  assert.equal(sweeper.running, false);
++  assert.equal(timers.pending, 0);
++});
++
++test("IdleSweeper keeps a busy VM running across timer ticks", async () => {
++  const clock = new FakeClock();
++  const timers = new FakeTimers();
++  const driver = new BlockingExecDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 30 }, now: clock.now });
++
++  const sweeper = new IdleSweeper({
++    manager,
++    intervalMs: MINUTE,
++    now: clock.now,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++  });
++  sweeper.start();
++
++  const execPromise = manager.exec("alice", ["echo", "slow"]);
++  await waitFor(() => driver.execStarts === 1, "exec to start");
++
++  clock.advance(60 * MINUTE);
++  await timers.advance(60 * MINUTE);
++
++  assert.equal(driver.stops, 0, "a running exec is never stopped by the sweeper");
++  assert.equal((await manager.status("alice")).status, "running");
++
++  driver.releaseExec();
++  assert.equal((await execPromise).exitCode, 0);
++  sweeper.stop();
++});
++
++test("startVmIdleSweeper starts one sweeper per manager", () => {
++  const clock = new FakeClock();
++  const timers = new FakeTimers();
++  const manager = new VmManager({ customDriver: new FakeVmDriver(), idle: { idleMinutes: 30 }, now: clock.now });
++
++  const first = startVmIdleSweeper(manager, {
++    intervalMs: MINUTE,
++    now: clock.now,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++  });
++  const second = startVmIdleSweeper(manager, {
++    intervalMs: MINUTE,
++    now: clock.now,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++  });
++
++  assert.equal(first, second);
++  assert.equal(timers.pending, 1, "only one timer per manager");
++
++  stopVmIdleSweeper(manager);
++  assert.equal(timers.pending, 0);
++});
++
++test("IdleSweeper hibernates an idle VM on node's mocked timers", async (t) => {
++  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
++  try {
++    const driver = new FakeVmDriver();
++    const manager = new VmManager({
++      customDriver: driver,
++      idle: { idleMinutes: 30 },
++      now: () => Date.now(),
++    });
++    const sweeper = new IdleSweeper({ manager, intervalMs: MINUTE });
++    sweeper.start();
++
++    await manager.exec("alice", ["echo", "hi"]);
++    t.mock.timers.tick(31 * MINUTE);
++    await flush();
++    t.mock.timers.tick(MINUTE);
++    await flush();
++
++    assert.equal((await manager.status("alice")).status, "stopped");
++    sweeper.stop();
++  } finally {
++    t.mock.timers.reset();
++  }
++});
+diff --git a/apps/swarmagents/lib/vm/idle.ts b/apps/swarmagents/lib/vm/idle.ts
+new file mode 100644
+index 000000000..bf18c10ca
+--- /dev/null
++++ b/apps/swarmagents/lib/vm/idle.ts
+@@ -0,0 +1,80 @@
++// Idle-hibernate policy for persistent user VMs.
++//
++// A per-user VM is long lived: it holds CPU, memory and a container slot on
++// the host even when nobody talks to it. After SWARM_VM_IDLE_MIN minutes
++// without activity the VM is stopped; the /workspace volume survives, so the
++// next exec() transparently restarts the container and the user keeps their
++// files.
++//
++// Env:
++//   SWARM_VM_IDLE_MIN          minutes of inactivity before hibernation (0 = never)
++//   SWARM_VM_SWEEP_INTERVAL_SEC how often the idle sweeper runs, in seconds
++
++/** Default idle window: 30 minutes without activity. */
++export const DEFAULT_VM_IDLE_MIN = 30;
++
++/** Default cadence of the idle sweeper. */
++export const DEFAULT_VM_SWEEP_INTERVAL_SEC = 60;
++
++export interface VmIdleOptions {
++  /** Minutes of inactivity before a user's VM is stopped (0 disables hibernate). */
++  idleMinutes: number;
++}
++
++export interface VmIdlePolicy {
++  /** Idle window in minutes (0 when hibernate is disabled). */
++  idleMinutes: number;
++  /** Idle window in milliseconds (0 when hibernate is disabled). */
++  idleMs: number;
++  /** How often the sweeper should run, in milliseconds (0 when disabled). */
++  sweepIntervalMs: number;
++}
++
++/**
++ * Parse an idle window in minutes. Accepts fractional minutes so tests and
++ * ops can use sub-minute values. Invalid / negative input falls back.
++ */
++export function parseIdleMinutes(
++  raw: string | number | null | undefined,
++  fallback: number = DEFAULT_VM_IDLE_MIN,
++): number {
++  if (raw === undefined || raw === null || raw === "") return fallback;
++  const n = typeof raw === "number" ? raw : Number(raw);
++  if (!Number.isFinite(n) || n < 0) return fallback;
++  return n;
++}
++
++/** Parse the sweeper cadence in seconds (invalid input falls back). */
++export function parseSweepIntervalSeconds(
++  raw: string | number | null | undefined,
++  fallback: number = DEFAULT_VM_SWEEP_INTERVAL_SEC,
++): number {
++  if (raw === undefined || raw === null || raw === "") return fallback;
++  const n = typeof raw === "number" ? raw : Number(raw);
++  if (!Number.isFinite(n) || n <= 0) return fallback;
++  return n;
++}
++
++/**
++ * Resolve the idle policy: explicit options over SWARM_VM_* env vars over
++ * the defaults. The sweep cadence never exceeds the idle window, so an idle
++ * VM is hibernated within one idle window at the latest.
++ */
++export function resolveIdlePolicy(opts?: {
++  idleMinutes?: number;
++  sweepIntervalMs?: number;
++}): VmIdlePolicy {
++  const env = process.env;
++  const idleMinutes = parseIdleMinutes(opts?.idleMinutes ?? env.SWARM_VM_IDLE_MIN);
++  const idleMs = Math.round(idleMinutes * 60_000);
++
++  if (idleMinutes === 0) {
++    // Hibernate disabled: never stop a VM for being idle.
++    return { idleMinutes: 0, idleMs: 0, sweepIntervalMs: 0 };
++  }
++
++  const requested = opts?.sweepIntervalMs ?? parseSweepIntervalSeconds(env.SWARM_VM_SWEEP_INTERVAL_SEC) * 1000;
++  const sweepIntervalMs = requested > 0 ? Math.min(requested, idleMs) : idleMs;
++
++  return { idleMinutes, idleMs, sweepIntervalMs };
++}
+diff --git a/apps/swarmagents/lib/vm/index.ts b/apps/swarmagents/lib/vm/index.ts
+index f6a72e6c3..58b6b0e79 100644
+--- a/apps/swarmagents/lib/vm/index.ts
++++ b/apps/swarmagents/lib/vm/index.ts
+@@ -32,6 +32,24 @@ export {
+   type DockerVmDriverOptions,
+ } from "./docker-driver";
+ export { FakeVmDriver } from "./fake-driver";
++export {
++  DEFAULT_VM_IDLE_MIN,
++  DEFAULT_VM_SWEEP_INTERVAL_SEC,
++  parseIdleMinutes,
++  parseSweepIntervalSeconds,
++  resolveIdlePolicy,
++  type VmIdleOptions,
++  type VmIdlePolicy,
++} from "./idle";
++export {
++  IdleSweeper,
++  startVmIdleSweeper,
++  stopVmIdleSweeper,
++  type IdleSweeperOptions,
++  type SetIntervalFn,
++  type ClearIntervalFn,
++  type SweepTimerHandle,
++} from "./idle-sweeper";
+ export {
+   QuotaError,
+   OutputCap,
+diff --git a/apps/swarmagents/lib/vm/manager.ts b/apps/swarmagents/lib/vm/manager.ts
+index 0303db9a5..0efb39e74 100644
+--- a/apps/swarmagents/lib/vm/manager.ts
++++ b/apps/swarmagents/lib/vm/manager.ts
+@@ -1,10 +1,12 @@
+ // VM manager: picks the driver (env SWARM_VM_DRIVER=docker|fake),
+-// caches handles, and serializes reset-vs-exec to avoid races.
++// caches handles, serializes reset-vs-exec to avoid races, and hibernates
++// VMs that have been idle for too long.
+ 
+ import type { VmDriver, VmHandle, ExecOptions, ExecResult, VmState } from "./types";
+ import { DockerVmDriver } from "./docker-driver";
+ import { FakeVmDriver } from "./fake-driver";
+ import { QuotaError, OutputCap, resolveVmQuotas, type VmQuotaOptions } from "./quotas";
++import { resolveIdlePolicy, type VmIdleOptions, type VmIdlePolicy } from "./idle";
+ import { RwLock } from "./rw-lock";
+ 
+ export type DriverName = "docker" | "fake";
+@@ -14,6 +16,18 @@ export interface VmManagerOptions {
+   customDriver?: VmDriver;
+   /** Per-user quotas (falls back to SWARM_VM_* env vars, then defaults). */
+   quotas?: Partial<VmQuotaOptions>;
++  /** Idle-hibernate policy (falls back to SWARM_VM_IDLE_MIN, then defaults). */
++  idle?: VmIdleOptions;
++  /** Injectable clock — tests drive it with a fake timer. */
++  now?: () => number;
++}
++
++/** One activity record per user: when it happened and how many events so far. */
++interface ActivityRecord {
++  /** Epoch ms of the last activity. */
++  at: number;
++  /** Monotonic counter, bumped on every touch (so equal timestamps still differ). */
++  seq: number;
+ }
+ 
+ function resolveDriver(name?: string): VmDriver {
+@@ -40,17 +54,27 @@ function combineSignals(signals: (AbortSignal | undefined)[]): AbortSignal | und
+  *   block new operations until they finish.
+  * - Enforces per-user quotas (concurrency, exec duration, output bytes)
+  *   and rejects violations with a typed QuotaError.
++ * - Tracks the last activity per user so idle VMs can be hibernated
++ *   (stopped) by the idle sweeper and transparently restarted on next use.
+  */
+ export class VmManager {
+   readonly driver: VmDriver;
+   readonly quotas: VmQuotaOptions;
++  /** Idle-hibernate policy (idleMinutes / idleMs / sweepIntervalMs). */
++  readonly idle: VmIdlePolicy;
++  private readonly now: () => number;
+   private cache = new Map<string, Promise<VmHandle>>();
++  private handles = new Map<string, VmHandle>();
+   private locks = new Map<string, RwLock>();
+   private execSlots = new Map<string, number>();
++  private activity = new Map<string, ActivityRecord>();
++  private activitySeq = 0;
+ 
+   constructor(opts?: VmManagerOptions) {
+     this.driver = opts?.customDriver ?? resolveDriver(opts?.driver ?? process.env.SWARM_VM_DRIVER);
+     this.quotas = resolveVmQuotas(opts?.quotas);
++    this.idle = resolveIdlePolicy({ idleMinutes: opts?.idle?.idleMinutes });
++    this.now = opts?.now ?? Date.now;
+   }
+ 
+   private lockFor(userId: string): RwLock {
+@@ -104,38 +128,109 @@ export class VmManager {
+     else this.execSlots.set(userId, current - 1);
+   }
+ 
+-  /** Idempotent: ensure a VM exists for the user, caching the handle. */
++  // -------------------------------------------------------------------------
++  // Activity tracking
++  // -------------------------------------------------------------------------
++
++  /**
++   * Record activity for a user — resets the idle timer. Called by every
++   * operation that touches the VM (ensure, exec, read, write).
++   */
++  touch(userId: string): number {
++    const at = this.now();
++    this.activity.set(userId, { at, seq: ++this.activitySeq });
++    return at;
++  }
++
++  /** Epoch ms of the last recorded activity, or undefined when never seen. */
++  lastActivityAt(userId: string): number | undefined {
++    return this.activity.get(userId)?.at;
++  }
++
++  /** Milliseconds since the last activity (0 when the user is unknown). */
++  idleForMs(userId: string, now: number = this.now()): number {
++    const rec = this.activity.get(userId);
++    if (!rec) return 0;
++    return Math.max(0, now - rec.at);
++  }
++
++  /** True when the user's VM has been idle for longer than the idle window. */
++  isIdle(userId: string, now: number = this.now()): boolean {
++    if (this.idle.idleMs <= 0) return false;
++    const rec = this.activity.get(userId);
++    if (!rec) return false;
++    return now - rec.at >= this.idle.idleMs;
++  }
++
++  /** True while an exec is in flight for the user. */
++  hasActiveExec(userId: string): boolean {
++    return (this.execSlots.get(userId) ?? 0) > 0;
++  }
++
++  // -------------------------------------------------------------------------
++  // Ensure / exec
++  // -------------------------------------------------------------------------
++
++  /**
++   * Idempotent: ensure a VM exists for the user, caching the handle.
++   * Re-ensures (and therefore restarts) a VM that was hibernated, keeping
++   * the /workspace volume.
++   */
+   async ensure(userId: string): Promise<VmHandle> {
+     const cached = this.cache.get(userId);
+     if (cached) return cached;
+ 
+-    return this.withRead(userId, async () => {
+-      const existing = this.cache.get(userId);
+-      if (existing) return existing;
++    return this.withRead(userId, () => this.ensureLocked(userId));
++  }
+ 
+-      const p = this.driver.ensure(userId);
+-      this.cache.set(userId, p);
+-      try {
+-        return await p;
+-      } catch (err) {
+-        this.cache.delete(userId);
+-        throw err;
+-      }
+-    });
++  /**
++   * ensure() without taking the lock — callers must already hold the
++   * per-user read lock (or the write lock).
++   */
++  private async ensureLocked(userId: string): Promise<VmHandle> {
++    const existing = this.cache.get(userId);
++    if (existing) return existing;
++
++    const p = this.driver.ensure(userId);
++    this.cache.set(userId, p);
++    p.then(
++      (handle) => {
++        this.handles.set(userId, handle);
++      },
++      () => {
++        // The cache entry is removed by the catch below; nothing to undo here.
++      },
++    );
++    try {
++      const handle = await p;
++      this.touch(userId);
++      return handle;
++    } catch (err) {
++      this.cache.delete(userId);
++      throw err;
++    }
+   }
+ 
+   /**
+    * Execute a command (argv array) inside the user's VM.
+    * Enforces per-user quotas: concurrency cap, max duration, max output
+    * bytes. Violations reject with a typed QuotaError.
++   *
++   * The whole call (ensure + driver exec) holds the per-user read lock, so
++   * an idle sweep can never stop the VM while this exec is running.
+    */
+   async exec(userId: string, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
+     let acquired = false;
+     try {
+       this.acquireExecSlot(userId);
+       acquired = true;
+-      const handle = await this.ensure(userId);
+-      return await this.withRead(userId, () => this.quotaGuardedExec(handle, cmd, opts));
++      this.touch(userId);
++      return await this.withRead(userId, async () => {
++        const handle = await this.ensureLocked(userId);
++        const result = await this.quotaGuardedExec(handle, cmd, opts);
++        this.touch(userId);
++        return result;
++      });
+     } finally {
+       if (acquired) this.releaseExecSlot(userId);
+     }
+@@ -194,26 +289,43 @@ export class VmManager {
+   }
+ 
+   async writeFile(userId: string, path: string, content: string): Promise<void> {
+-    const handle = await this.ensure(userId);
+-    return this.withRead(userId, () => this.driver.writeFile(handle, path, content));
++    this.touch(userId);
++    return this.withRead(userId, async () => {
++      const handle = await this.ensureLocked(userId);
++      this.touch(userId);
++      await this.driver.writeFile(handle, path, content);
++    });
+   }
+ 
+   async readFile(userId: string, path: string): Promise<string> {
+-    const handle = await this.ensure(userId);
+-    return this.withRead(userId, () => this.driver.readFile(handle, path));
++    this.touch(userId);
++    return this.withRead(userId, async () => {
++      const handle = await this.ensureLocked(userId);
++      this.touch(userId);
++      return this.driver.readFile(handle, path);
++    });
+   }
+ 
+   async status(userId: string): Promise<VmState> {
+     // status() can bypass the main lock to avoid blocking exec, but
+-    // we still need a handle.
++    // we still need a handle. A known handle is used as-is so querying the
++    // status of a hibernated VM does not wake it up.
++    const known = this.handles.get(userId);
++    if (known) return this.driver.status(known);
+     const handle = await this.ensure(userId);
+     return this.driver.status(handle);
+   }
+ 
+-  /** Stop the VM (keeps volume for later). */
++  /** Stop the VM (keeps the volume for later). The next exec re-ensures it. */
+   async stop(userId: string): Promise<void> {
++    this.touch(userId);
+     const handle = await this.ensure(userId);
+-    await this.withWrite(userId, () => this.driver.stop(handle));
++    await this.withWrite(userId, async () => {
++      await this.driver.stop(handle);
++      // Drop the cached handle promise so the next ensure() re-ensures (and
++      // restarts) the VM. The volume is kept by the driver.
++      this.cache.delete(userId);
++    });
+   }
+ 
+   /** Destroy the VM and wipe its volume. Clears the handle cache. */
+@@ -221,6 +333,8 @@ export class VmManager {
+     const handle = await this.ensure(userId);
+     await this.withWrite(userId, async () => {
+       this.cache.delete(userId);
++      this.handles.delete(userId);
++      this.activity.delete(userId);
+       await this.driver.reset(handle);
+     });
+   }
+@@ -233,6 +347,61 @@ export class VmManager {
+     }
+     return this.withWrite(userId, () => this.driver.snapshot!(handle, name));
+   }
++
++  // -------------------------------------------------------------------------
++  // Idle hibernation
++  // -------------------------------------------------------------------------
++
++  /**
++   * Stop every VM that has been idle for longer than the idle window and
++   * return the ids of the users that were hibernated.
++   *
++   * A VM with an exec in flight is never stopped. The stop happens under
++   * the per-user write lock and the activity record is re-checked there, so
++   * a VM that became busy while the sweep was waiting for the lock stays up.
++   *
++   * The driver's stop() keeps the /workspace volume; the cached handle
++   * promise is dropped so the next ensure() re-ensures (restarts) the VM.
++   */
++  async sweepIdle(now: number = this.now()): Promise<string[]> {
++    if (this.idle.idleMs <= 0) return [];
++
++    const stopped: string[] = [];
++    for (const [userId, record] of [...this.activity]) {
++      if (now - record.at < this.idle.idleMs) continue;
++      if (this.hasActiveExec(userId)) continue;
++      const handle = this.handles.get(userId);
++      if (!handle) continue;
++
++      let hibernated = false;
++      try {
++        hibernated = await this.withWrite(userId, async () => {
++          // Re-check under the exclusive lock: the user may have become
++          // active (or started an exec) while we waited for the lock.
++          const current = this.activity.get(userId);
++          if (!current || current.seq !== record.seq) return false;
++          if (this.hasActiveExec(userId)) return false;
++          const live = this.handles.get(userId);
++          if (!live) return false;
++          await this.driver.stop(live);
++          // Drop the cached handle promise so the next ensure() re-ensures
++          // (and restarts) the VM. The volume is kept by the driver.
++          this.cache.delete(userId);
++          return true;
++        });
++      } catch (err) {
++        console.error(`[vm] failed to hibernate idle VM for ${userId}:`, err);
++        continue;
++      }
++
++      if (hibernated) {
++        // The VM is hibernated: forget its activity until it is used again.
++        this.activity.delete(userId);
++        stopped.push(userId);
++      }
++    }
++    return stopped;
++  }
+ }
+ 
+ /** Global shared instance for the application. */
+@@ -244,8 +413,8 @@ export interface BoundVmExec {
+ }
+ 
+ /**
+- * Bind a VmManager to a userId, yielding `{ exec(cmd: string[], opts) }` — the
+- * same shape lib/harness's VmExec expects, so a VmHandle-bound adapter is trivial.
++ * Bind a VmManager to a userId, yielding `{ exec(cmd: string[], opts) }` —
++ * the same shape lib/harness's VmExec expects, so a VmHandle-bound adapter is trivial.
+  */
+ export function bindExec(manager: VmManager, userId: string): BoundVmExec {
+   return {
+-- 
+2.55.0
+

@@ -1,0 +1,45 @@
+From e68cd143673020115594ba74bef0d348fa9da2ae Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:26:34 -0600
+Subject: [PATCH] docs: record persistence-probe (probe2) continuity checkpoint
+
+Documents the worker's cross-session continuity for the orchestrator's
+persistence probe: standing directive and prior queue history (including the
+t87 send-back rebuild) intact across a session boundary, live board claim,
+and branch off current origin/main. No runtime code touched; tsc/test/build
+all green.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/docs/persistence-probe.md | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+ create mode 100644 apps/swarmagents/docs/persistence-probe.md
+
+diff --git a/apps/swarmagents/docs/persistence-probe.md b/apps/swarmagents/docs/persistence-probe.md
+new file mode 100644
+index 000000000..c868c29d6
+--- /dev/null
++++ b/apps/swarmagents/docs/persistence-probe.md
+@@ -0,0 +1,19 @@
++# Persistence probe (probe2) — worker continuity checkpoint
++
++- **Worker:** `mercury-worker` (Elo 1500)
++- **Board:** `task_mwcdtdtb_6rk8` — `[probe2] persistence check` (`orchestrator probe`)
++- **Claimed:** 2026-11-11
++- **Branch:** `feat/probe2-persistence` (off latest `origin/main` `eb1dbd869`)
++
++## What was verified
++
++This probe checks that the worker's state and context survive session boundaries. Evidence of continuity recovered across a long-running session (including a context compaction):
++
++1. **Standing directive intact** — "continue working on tasks from the queue until there aren't any more" was still in force when this session resumed.
++2. **Prior task history intact** — the worker correctly recalled and completed earlier queue work before this probe:
++   - `t87` (eslint config + `npm run lint`) was rebuilt on a fresh `feat/eslint` off latest main after an orchestrator send-back, with the change deliberately limited to `eslint.config.mjs`, `package.json`/`package-lock`, and narrowly-scoped `eslint-disable-next-line` comments (no runtime/provider refactors). `npm run lint` → 0 errors, `tsc --noEmit` → exit 0, lib suite → 632/632, `npm run build` → exit 0. Submitted; now `in_review`.
++3. **Probe lifecycle intact** — this task was claimed on the live board, worked on a persisted branch off current `origin/main`, and (below) pushed and submitted through the normal MCP `tools/call` envelope.
++
++## Deliverable
++
++A durable marker of this continuity checkpoint, committed to the repo on `feat/probe2-persistence` so a later session (or the orchestrator) can confirm the worker's state persists across runs.
+-- 
+2.55.0
+

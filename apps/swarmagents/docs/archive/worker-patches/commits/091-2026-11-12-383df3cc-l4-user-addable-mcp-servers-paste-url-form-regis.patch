@@ -1,0 +1,3800 @@
+From 383df3cccc70a3ef8add4783e7ae33ce8ae05e43 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 22:26:20 +0000
+Subject: [PATCH] l4: user-addable MCP servers (paste/URL/form, registry
+ browse, test connection)
+
+---
+ .../app/api/mcp-servers/[id]/route.ts         |  61 ++
+ .../app/api/mcp-servers/[id]/test/route.ts    |  76 ++
+ .../app/api/mcp-servers/registry/route.ts     |  31 +
+ apps/swarmagents/app/api/mcp-servers/route.ts | 214 ++++++
+ apps/swarmagents/lib/audit.ts                 |   3 +
+ apps/swarmagents/lib/harness/role-mcp.test.ts |  37 +
+ apps/swarmagents/lib/harness/role-mcp.ts      |  41 +-
+ apps/swarmagents/lib/mcp-probe.test.ts        | 189 +++++
+ apps/swarmagents/lib/mcp-probe.ts             | 446 +++++++++++
+ apps/swarmagents/lib/mcp-registry.test.ts     |  95 +++
+ apps/swarmagents/lib/mcp-registry.ts          | 241 ++++++
+ .../swarmagents/lib/mcp-servers-store.test.ts | 127 ++++
+ apps/swarmagents/lib/mcp-servers-store.ts     | 306 ++++++++
+ apps/swarmagents/lib/mcp-servers.test.ts      | 243 ++++++
+ apps/swarmagents/lib/mcp-servers.ts           | 600 +++++++++++++++
+ apps/swarmagents/lib/providers/secret-box.ts  |   2 +-
+ apps/swarmagents/lib/runtime/manager.ts       |  46 +-
+ .../src/components/McpServers.tsx             | 706 ++++++++++++++++++
+ .../minimalist-ui/src/components/Settings.tsx |  12 +-
+ 19 files changed, 3457 insertions(+), 19 deletions(-)
+ create mode 100644 apps/swarmagents/app/api/mcp-servers/[id]/route.ts
+ create mode 100644 apps/swarmagents/app/api/mcp-servers/[id]/test/route.ts
+ create mode 100644 apps/swarmagents/app/api/mcp-servers/registry/route.ts
+ create mode 100644 apps/swarmagents/app/api/mcp-servers/route.ts
+ create mode 100644 apps/swarmagents/lib/mcp-probe.test.ts
+ create mode 100644 apps/swarmagents/lib/mcp-probe.ts
+ create mode 100644 apps/swarmagents/lib/mcp-registry.test.ts
+ create mode 100644 apps/swarmagents/lib/mcp-registry.ts
+ create mode 100644 apps/swarmagents/lib/mcp-servers-store.test.ts
+ create mode 100644 apps/swarmagents/lib/mcp-servers-store.ts
+ create mode 100644 apps/swarmagents/lib/mcp-servers.test.ts
+ create mode 100644 apps/swarmagents/lib/mcp-servers.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/McpServers.tsx
+
+diff --git a/apps/swarmagents/app/api/mcp-servers/[id]/route.ts b/apps/swarmagents/app/api/mcp-servers/[id]/route.ts
+new file mode 100644
+index 000000000..f4ccf8ed8
+--- /dev/null
++++ b/apps/swarmagents/app/api/mcp-servers/[id]/route.ts
+@@ -0,0 +1,61 @@
++import { NextResponse } from "next/server";
++import { recordAudit } from "@/lib/audit";
++import { deleteUserMcpServer, updateUserMcpServer } from "@/lib/mcp-servers-store";
++import { providerOwner } from "@/lib/providers/owner";
++
++export const dynamic = "force-dynamic";
++
++const NO_STORE = { "cache-control": "no-store" } as const;
++
++function unauthorized() {
++  return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++/**
++ * PATCH /api/mcp-servers/[id] {enabled?, name?} — toggle a server or rename
++ * it. Env values are never edited through this route (secrets are write-only:
++ * delete the server and re-add it to change them).
++ */
++export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
++  const owner = providerOwner(request);
++  if (!owner) return unauthorized();
++  const { id } = await params;
++
++  let body: unknown;
++  try {
++    body = await request.json();
++  } catch {
++    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400, headers: NO_STORE });
++  }
++  if (!isRecord(body)) {
++    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400, headers: NO_STORE });
++  }
++  const patch: { enabled?: boolean; name?: string } = {};
++  if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
++  if (typeof body.name === "string") patch.name = body.name;
++  if (Object.keys(patch).length === 0) {
++    return NextResponse.json({ error: "Nothing to update (send enabled or name)." }, { status: 400, headers: NO_STORE });
++  }
++  const row = updateUserMcpServer(owner, id, patch);
++  if (!row) {
++    return NextResponse.json({ error: "No MCP server with that id." }, { status: 404, headers: NO_STORE });
++  }
++  return NextResponse.json({ server: row }, { headers: NO_STORE });
++}
++
++/** DELETE /api/mcp-servers/[id] — remove a server (and its sealed secrets). */
++export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
++  const owner = providerOwner(request);
++  if (!owner) return unauthorized();
++  const { id } = await params;
++  const removed = deleteUserMcpServer(owner, id);
++  if (!removed) {
++    return NextResponse.json({ error: "No MCP server with that id." }, { status: 404, headers: NO_STORE });
++  }
++  recordAudit({ user: owner, action: "mcp-server.delete", target: id, result: "success" });
++  return NextResponse.json({ deleted: id }, { headers: NO_STORE });
++}
+diff --git a/apps/swarmagents/app/api/mcp-servers/[id]/test/route.ts b/apps/swarmagents/app/api/mcp-servers/[id]/test/route.ts
+new file mode 100644
+index 000000000..f20475596
+--- /dev/null
++++ b/apps/swarmagents/app/api/mcp-servers/[id]/test/route.ts
+@@ -0,0 +1,76 @@
++import { lookup } from "node:dns/promises";
++import { NextResponse } from "next/server";
++import { recordAudit } from "@/lib/audit";
++import { MCP_PROBE_TIMEOUT_MS, probeMcpServerInVm } from "@/lib/mcp-probe";
++import { assertPublicResolvedIps, assertSafeRemoteUrl } from "@/lib/mcp-servers";
++import { readUserMcpServersDecrypted } from "@/lib/mcp-servers-store";
++import { providerOwner } from "@/lib/providers/owner";
++import { getVmManager } from "@/lib/vm/manager";
++
++export const dynamic = "force-dynamic";
++
++const NO_STORE = { "cache-control": "no-store" } as const;
++
++/**
++ * POST /api/mcp-servers/[id]/test — test the connection to one stored server.
++ *
++ * The probe runs INSIDE the user's VM (seeded script + vm.exec): a stdio
++ * server spawns only in the VM, and a remote server is reached only from the
++ * VM's network. Remote URLs are SSRF-checked here first (literal private /
++ * link-local / metadata hosts, then the DNS-resolved addresses) before the
++ * config is handed to the VM.
++ *
++ * Returns {ok, tools, resources, prompts, ms} or {ok: false, error,
++ * stderrTail?, ms}. A VM that cannot be started is a 503, not a silent
++ * host-side fallback.
++ */
++export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
++  const owner = providerOwner(request);
++  if (!owner) {
++    return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++  }
++  const { id } = await params;
++  const server = readUserMcpServersDecrypted(owner).find((candidate) => candidate.id === id);
++  if (!server) {
++    return NextResponse.json({ error: "No MCP server with that id." }, { status: 404, headers: NO_STORE });
++  }
++
++  if (server.transport !== "stdio" && server.url) {
++    try {
++      const url = assertSafeRemoteUrl(server.url);
++      let addresses: string[] = [];
++      try {
++        const resolved = await lookup(url.hostname, { all: true });
++        addresses = resolved.map((entry) => entry.address);
++      } catch {
++        // Unresolvable host: the probe will report the DNS failure; do not
++        // block on it here.
++      }
++      assertPublicResolvedIps(url.hostname, addresses);
++    } catch (err) {
++      const message = err instanceof Error ? err.message : String(err);
++      return NextResponse.json({ ok: false, tools: [], resources: [], prompts: [], ms: 0, error: message }, { headers: NO_STORE });
++    }
++  }
++
++  try {
++    const result = await probeMcpServerInVm(getVmManager(), owner, server, {
++      timeoutMs: MCP_PROBE_TIMEOUT_MS,
++    });
++    recordAudit({ user: owner, action: "mcp-server.test", target: id, result: result.ok ? "success" : "failure" });
++    return NextResponse.json(result, { headers: NO_STORE });
++  } catch (err) {
++    const message = err instanceof Error ? err.message : String(err);
++    return NextResponse.json(
++      {
++        ok: false,
++        tools: [],
++        resources: [],
++        prompts: [],
++        ms: 0,
++        error: `The test needs your VM, which could not be started: ${message}`,
++      },
++      { status: 503, headers: NO_STORE },
++    );
++  }
++}
+diff --git a/apps/swarmagents/app/api/mcp-servers/registry/route.ts b/apps/swarmagents/app/api/mcp-servers/registry/route.ts
+new file mode 100644
+index 000000000..3ddc24ed7
+--- /dev/null
++++ b/apps/swarmagents/app/api/mcp-servers/registry/route.ts
+@@ -0,0 +1,31 @@
++import { NextResponse } from "next/server";
++import { searchRegistry, RegistryError } from "@/lib/mcp-registry";
++import { providerOwner } from "@/lib/providers/owner";
++
++export const dynamic = "force-dynamic";
++
++const NO_STORE = { "cache-control": "no-store" } as const;
++
++/**
++ * GET /api/mcp-servers/registry?q=<query>&limit=<n> — search the official MCP
++ * registry (registry.modelcontextprotocol.io). Results are real registry
++ * entries, normalized; a registry outage returns 502, never fake results.
++ */
++export async function GET(request: Request) {
++  const owner = providerOwner(request);
++  if (!owner) {
++    return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++  }
++  const url = new URL(request.url);
++  const q = url.searchParams.get("q") ?? "";
++  const limit = Number(url.searchParams.get("limit") ?? "20");
++  try {
++    const servers = await searchRegistry(q, { limit: Number.isFinite(limit) ? limit : 20 });
++    return NextResponse.json({ servers }, { headers: NO_STORE });
++  } catch (err) {
++    if (err instanceof RegistryError) {
++      return NextResponse.json({ error: err.message }, { status: 502, headers: NO_STORE });
++    }
++    throw err;
++  }
++}
+diff --git a/apps/swarmagents/app/api/mcp-servers/route.ts b/apps/swarmagents/app/api/mcp-servers/route.ts
+new file mode 100644
+index 000000000..48cd374ab
+--- /dev/null
++++ b/apps/swarmagents/app/api/mcp-servers/route.ts
+@@ -0,0 +1,214 @@
++import { NextResponse } from "next/server";
++import { recordAudit } from "@/lib/audit";
++import {
++  classifyEnv,
++  draftFromForm,
++  draftFromRemoteUrl,
++  McpServerError,
++  parseMcpConfigJson,
++  validateServerDraft,
++  type McpServerDraft,
++} from "@/lib/mcp-servers";
++import {
++  addUserMcpServers,
++  readUserMcpServers,
++} from "@/lib/mcp-servers-store";
++import { providerOwner } from "@/lib/providers/owner";
++
++export const dynamic = "force-dynamic";
++
++const NO_STORE = { "cache-control": "no-store" } as const;
++const MAX_BODY_SIZE = 64 * 1024;
++
++function unauthorized() {
++  return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++}
++
++/**
++ * GET /api/mcp-servers — the signed-in user's MCP servers (client-safe rows;
++ * secret env values are masked, never returned).
++ */
++export function GET(request: Request) {
++  const owner = providerOwner(request);
++  if (!owner) return unauthorized();
++  return NextResponse.json({ servers: readUserMcpServers(owner) }, { headers: NO_STORE });
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function parseHeaders(raw: unknown): Record<string, string> {
++  if (!isRecord(raw)) return {};
++  const out: Record<string, string> = {};
++  for (const [key, value] of Object.entries(raw)) {
++    if (typeof value === "string" && key.trim()) out[key.trim()] = value;
++  }
++  return out;
++}
++
++function parseEnv(raw: unknown): Record<string, string> {
++  return parseHeaders(raw);
++}
++
++/**
++ * POST /api/mcp-servers — add one or more servers. Body variants:
++ *
++ *   {paste: "..."}            claude_desktop_config / .mcp.json block (one or many servers)
++ *   {url, name?, headers?}    remote server URL (streamable HTTP / SSE)
++ *   {form: {name, command, args?, env?, description?}}
++ *   {registry: {...}, env?}   a normalized registry entry + user-typed env values
++ *
++ * With {preview: true} nothing is saved: the parsed drafts (with secret
++ * flags) are returned so the UI can show them before the user confirms.
++ */
++export async function POST(request: Request) {
++  const owner = providerOwner(request);
++  if (!owner) return unauthorized();
++
++  let text: string;
++  try {
++    text = await request.text();
++  } catch {
++    return NextResponse.json({ error: "Could not read request body." }, { status: 400, headers: NO_STORE });
++  }
++  if (text.length > MAX_BODY_SIZE) {
++    return NextResponse.json({ error: "Request body too large." }, { status: 413, headers: NO_STORE });
++  }
++  let body: unknown;
++  try {
++    body = JSON.parse(text);
++  } catch {
++    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400, headers: NO_STORE });
++  }
++  if (!isRecord(body)) {
++    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400, headers: NO_STORE });
++  }
++  const preview = body.preview === true;
++
++  let drafts: McpServerDraft[] = [];
++  const errors: string[] = [];
++  try {
++    if (typeof body.paste === "string") {
++      const parsed = parseMcpConfigJson(body.paste);
++      drafts = parsed.servers;
++      errors.push(...parsed.errors);
++      if (drafts.length === 0 && errors.length === 0) errors.push("No servers found in that config.");
++    } else if (typeof body.url === "string") {
++      drafts = [draftFromRemoteUrl(body.url, typeof body.name === "string" ? body.name : undefined, parseHeaders(body.headers))];
++    } else if (isRecord(body.form)) {
++      const form = body.form;
++      if (typeof form.name !== "string" || typeof form.command !== "string") {
++        return NextResponse.json({ error: "The form needs a name and a command." }, { status: 400, headers: NO_STORE });
++      }
++      const args = Array.isArray(form.args)
++        ? (form.args as unknown[]).filter((a): a is string => typeof a === "string")
++        : [];
++      drafts = [
++        draftFromForm({
++          name: form.name,
++          command: form.command,
++          args,
++          env: parseEnv(form.env),
++          description: typeof form.description === "string" ? form.description : undefined,
++        }),
++      ];
++    } else if (isRecord(body.registry)) {
++      const entry = body.registry;
++      const name = typeof entry.name === "string" ? entry.name : typeof entry.id === "string" ? entry.id : "";
++      const env = parseEnv(body.env);
++      if (entry.transport === "stdio" && typeof entry.command === "string") {
++        drafts = [
++          {
++            name,
++            description: typeof entry.description === "string" ? entry.description : "",
++            transport: "stdio",
++            command: entry.command,
++            args: Array.isArray(entry.args)
++              ? (entry.args as unknown[]).filter((a): a is string => typeof a === "string")
++              : [],
++            env: classifyEnv(env),
++            source: "registry",
++            registryId: typeof entry.id === "string" ? entry.id : undefined,
++          },
++        ];
++      } else if ((entry.transport === "streamable-http" || entry.transport === "sse") && typeof entry.url === "string") {
++        drafts = [
++          {
++            name,
++            description: typeof entry.description === "string" ? entry.description : "",
++            transport: entry.transport,
++            url: entry.url,
++            headers: classifyEnv(env),
++            source: "registry",
++            registryId: typeof entry.id === "string" ? entry.id : undefined,
++          },
++        ];
++      } else {
++        return NextResponse.json(
++          { error: "That registry entry has no usable transport (no command or url)." },
++          { status: 400, headers: NO_STORE },
++        );
++      }
++    } else {
++      return NextResponse.json(
++        { error: "Send a paste, a url, a form, or a registry entry." },
++        { status: 400, headers: NO_STORE },
++      );
++    }
++  } catch (err) {
++    if (err instanceof McpServerError) {
++      return NextResponse.json({ error: err.message }, { status: 400, headers: NO_STORE });
++    }
++    throw err;
++  }
++
++  for (const draft of drafts) errors.push(...validateServerDraft(draft));
++  if (drafts.length === 0) {
++    return NextResponse.json({ error: errors[0] ?? "No servers found.", errors }, { status: 400, headers: NO_STORE });
++  }
++
++  if (preview) {
++    // Preview shape mirrors the client row but is explicitly unsaved: the UI
++    // shows transport, command/url and which env values will be encrypted.
++    return NextResponse.json(
++      {
++        preview: drafts.map((draft) => ({
++          name: draft.name,
++          description: draft.description,
++          transport: draft.transport,
++          ...(draft.command ? { command: draft.command } : {}),
++          ...(draft.args?.length ? { args: draft.args } : {}),
++          ...(draft.url ? { url: draft.url } : {}),
++          env: Object.fromEntries(
++            Object.entries(draft.env ?? {}).map(([k, v]) => [k, v.secret ? "••••••••" : v.value]),
++          ),
++          headers: Object.fromEntries(
++            Object.entries(draft.headers ?? {}).map(([k, v]) => [k, v.secret ? "••••••••" : v.value]),
++          ),
++          secretKeys: [
++            ...Object.entries(draft.env ?? {}).filter(([, v]) => v.secret).map(([k]) => `env:${k}`),
++            ...Object.entries(draft.headers ?? {}).filter(([, v]) => v.secret).map(([k]) => `header:${k}`),
++          ],
++          source: draft.source,
++          ...(draft.registryId ? { registryId: draft.registryId } : {}),
++        })),
++        errors,
++      },
++      { headers: NO_STORE },
++    );
++  }
++
++  try {
++    const created = addUserMcpServers(owner, drafts);
++    for (const row of created) {
++      recordAudit({ user: owner, action: "mcp-server.add", target: row.id, result: "success" });
++    }
++    return NextResponse.json({ created, errors }, { status: 201, headers: NO_STORE });
++  } catch (err) {
++    return NextResponse.json(
++      { error: err instanceof Error ? err.message : "Could not save the server." },
++      { status: 400, headers: NO_STORE },
++    );
++  }
++}
+diff --git a/apps/swarmagents/lib/audit.ts b/apps/swarmagents/lib/audit.ts
+index 5db8ded35..6f99e88e6 100644
+--- a/apps/swarmagents/lib/audit.ts
++++ b/apps/swarmagents/lib/audit.ts
+@@ -27,6 +27,9 @@ export type AuditAction =
+   | "provider.key.add"
+   | "provider.key.remove"
+   | "provider.key.rotate"
++  | "mcp-server.add"
++  | "mcp-server.delete"
++  | "mcp-server.test"
+   | "approval.approve"
+   | "approval.deny"
+   | "approval.expire"
+diff --git a/apps/swarmagents/lib/harness/role-mcp.test.ts b/apps/swarmagents/lib/harness/role-mcp.test.ts
+index 022608b39..834a129d9 100644
+--- a/apps/swarmagents/lib/harness/role-mcp.test.ts
++++ b/apps/swarmagents/lib/harness/role-mcp.test.ts
+@@ -306,3 +306,40 @@ test("rolePhase appends the tail even to a role without instructions", () => {
+   const phase = rolePhase(bare);
+   assert.ok(phase.appendSystemPrompt?.includes("Long-running work stays visible"));
+ });
++
++test("roleAllowedTools grants a user MCP server only when it exists in the user's store", () => {
++  const role: RoleDefinition = { ...mainRole(), mcpServers: ["github-mcp", "my-filesystem"] };
++  const without = roleAllowedTools(role);
++  assert.ok(without.includes("mcp__github-mcp__*"));
++  assert.ok(!without.includes("mcp__my-filesystem__*"), "unknown user server grants nothing");
++  const withStore = roleAllowedTools(role, { userMcpServerIds: new Set(["my-filesystem"]) });
++  assert.ok(withStore.includes("mcp__my-filesystem__*"));
++});
++
++test("roleMcpConfigJson wires a user MCP server only when the role lists it", () => {
++  const role: RoleDefinition = { ...mainRole(), mcpServers: ["github-mcp", "my-filesystem"] };
++  const phase = rolePhase(role, { userMcpServerIds: new Set(["my-filesystem", "other-server"]) });
++  const config = JSON.parse(
++    roleMcpConfigJson(phase, {
++      allowedRoleIds: new Set([role.id]),
++      roleDef: role,
++      userMcpServers: [
++        { id: "my-filesystem", entry: { type: "stdio", command: "npx", args: ["-y", "fs"] } },
++        { id: "other-server", entry: { type: "http", url: "https://mcp.example.com/mcp" } },
++      ],
++    }),
++  ) as { mcpServers: Record<string, unknown> };
++  assert.deepEqual(config.mcpServers["my-filesystem"], { type: "stdio", command: "npx", args: ["-y", "fs"] });
++  assert.equal(config.mcpServers["other-server"], undefined, "a server the role does not list is never wired");
++  assert.ok(config.mcpServers[ROLE_MCP_SERVER_NAME], "role-switch server stays wired");
++});
++
++test("roleSeedFiles carries user MCP servers into the run config", () => {
++  const role: RoleDefinition = { ...mainRole(), mcpServers: ["my-filesystem"] };
++  const files = roleSeedFiles([role], new Set([role.id]), rolePhase(role, { userMcpServerIds: new Set(["my-filesystem"]) }), {
++    userMcpServers: [{ id: "my-filesystem", entry: { type: "stdio", command: "npx" } }],
++  });
++  const configFile = files.find((file) => file.path === ROLE_MCP_CONFIG_PATH)!;
++  const config = JSON.parse(configFile.content) as { mcpServers: Record<string, unknown> };
++  assert.deepEqual(config.mcpServers["my-filesystem"], { type: "stdio", command: "npx" });
++});
+diff --git a/apps/swarmagents/lib/harness/role-mcp.ts b/apps/swarmagents/lib/harness/role-mcp.ts
+index c23f55ad5..433bc0bbf 100644
+--- a/apps/swarmagents/lib/harness/role-mcp.ts
++++ b/apps/swarmagents/lib/harness/role-mcp.ts
+@@ -100,10 +100,15 @@ export function isRoleListTool(name: string): boolean {
+  * and the role's MCP servers are always granted. The desktop MCP servers are
+  * additionally granted when the role has desktop access AND desktop mode is
+  * on — never otherwise, so a non-desktop run gets exactly today's toolset.
++ *
++ * User-added MCP servers (board task l4) are granted only when the caller
++ * passes their ids in `userMcpServerIds` — i.e. only servers that actually
++ * exist in the user's own store. A role can never get more than the user's
++ * settings allow: listing an unknown id grants nothing.
+  */
+ export function roleAllowedTools(
+   role: RoleDefinition,
+-  opts: { desktopMode?: boolean } = {},
++  opts: { desktopMode?: boolean; userMcpServerIds?: ReadonlySet<string> } = {},
+ ): string[] {
+   const out = new Set<string>();
+   for (const tool of role.tools) {
+@@ -112,6 +117,7 @@ export function roleAllowedTools(
+   out.add(`mcp__${ROLE_MCP_SERVER_NAME}__*`);
+   for (const server of role.mcpServers) {
+     if (server in ROLE_MCP_SERVER_REGISTRY) out.add(`mcp__${server}__*`);
++    if (opts.userMcpServerIds?.has(server)) out.add(`mcp__${server}__*`);
+   }
+   if (opts.desktopMode && roleHasDesktopAccess(role)) {
+     for (const server of DESKTOP_ROLE_MCP_SERVERS) out.add(`mcp__${server}__*`);
+@@ -161,11 +167,24 @@ export function roleCatalogJson(catalog: readonly RoleDefinition[]): string {
+   });
+ }
+ 
++/**
++ * One user-added MCP server, resolved to its --mcp-config entry (decrypted
++ * env, server-side only). Produced by lib/mcp-servers-store.ts
++ * userMcpRunEntries() for the user's ENABLED servers.
++ */
++export interface UserMcpServerEntry {
++  id: string;
++  entry: Record<string, unknown>;
++}
++
+ /**
+  * The --mcp-config file for a run under `role`. Always includes the `roles`
+  * server (the switch mechanism); role-listed MCP servers that have a concrete
+  * registry entry are included too. The desktop MCP servers are wired only
+- * when desktop mode is on and the role has desktop access.
++ * when desktop mode is on and the role has desktop access. User-added MCP
++ * servers (board task l4) are wired when passed in `userMcpServers` AND the
++ * role lists their id in `mcpServers` — a role can never wire a server the
++ * user did not allow it to use.
+  */
+ export function roleMcpConfigJson(
+   role: RolePhase,
+@@ -176,6 +195,8 @@ export function roleMcpConfigJson(
+     desktopMode?: boolean;
+     /** The catalog role definition backing this phase (custom roles need it). */
+     roleDef?: RoleDefinition;
++    /** The user's enabled MCP servers, resolved to --mcp-config entries. */
++    userMcpServers?: readonly UserMcpServerEntry[];
+   },
+ ): string {
+   const servers: Record<string, unknown> = {
+@@ -198,6 +219,15 @@ export function roleMcpConfigJson(
+       }
+     }
+   }
++  if (opts.userMcpServers?.length) {
++    const roleDef = opts.roleDef ?? roleDefinitionForId(role.roleId);
++    const allowed = new Set(roleDef?.mcpServers ?? []);
++    for (const userServer of opts.userMcpServers) {
++      if (allowed.has(userServer.id) && !(userServer.id in servers)) {
++        servers[userServer.id] = userServer.entry;
++      }
++    }
++  }
+   return JSON.stringify({ mcpServers: servers }, null, 2);
+ }
+ 
+@@ -227,7 +257,7 @@ export function roleSeedFiles(
+   catalog: readonly RoleDefinition[],
+   allowedRoleIds: ReadonlySet<string>,
+   initialPhase?: RolePhase,
+-  opts: { desktopMode?: boolean } = {},
++  opts: { desktopMode?: boolean; userMcpServers?: readonly UserMcpServerEntry[] } = {},
+ ): Array<{ path: string; content: string }> {
+   const phase = initialPhase ?? rolePhase(catalog[0] ?? BUILTIN_ROLES[0], opts);
+   const initialDef = phase.roleId ? catalog.find((role) => role.id === phase.roleId) : undefined;
+@@ -239,7 +269,10 @@ export function roleSeedFiles(
+ }
+ 
+ /** Build the harness phase (argv config) for a role. */
+-export function rolePhase(role: RoleDefinition, opts: { desktopMode?: boolean } = {}): RolePhase {
++export function rolePhase(
++  role: RoleDefinition,
++  opts: { desktopMode?: boolean; userMcpServerIds?: ReadonlySet<string> } = {},
++): RolePhase {
+   // The long-running-work tail rides with every role's instructions (built-in
+   // and custom alike) so the agent always runs user-visible work in the
+   // foreground; a role without instructions still gets the tail on its own.
+diff --git a/apps/swarmagents/lib/mcp-probe.test.ts b/apps/swarmagents/lib/mcp-probe.test.ts
+new file mode 100644
+index 000000000..ca5dc2852
+--- /dev/null
++++ b/apps/swarmagents/lib/mcp-probe.test.ts
+@@ -0,0 +1,189 @@
++/**
++ * Test-connection probe: fake stdio + fake streamable-HTTP MCP servers.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { createServer, type Server } from "node:http";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import {
++  MCP_PROBE_TIMEOUT_MS,
++  parseProbeResult,
++  probeConfigForServer,
++  runMcpProbeLocally,
++} from "./mcp-probe";
++import type { UserMcpServer } from "./mcp-servers";
++
++const FAKE_STDIO_SERVER = [
++  "import readline from 'node:readline';",
++  "const rl = readline.createInterface({ input: process.stdin });",
++  "for await (const line of rl) {",
++  "  let msg;",
++  "  try { msg = JSON.parse(line); } catch { continue; }",
++  "  if (!msg || (typeof msg.method === 'string' && msg.method.startsWith('notifications/'))) continue;",
++  "  let result = null;",
++  "  if (msg.method === 'initialize') result = { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'fake-mcp', version: '0.0.1' } };",
++  "  else if (msg.method === 'tools/list') result = { tools: [{ name: 'echo', description: 'Echoes input' }, { name: 'read_file', description: 'Reads a file' }] };",
++  "  else if (msg.method === 'resources/list') result = { resources: [{ name: 'config', uri: 'file:///config' }] };",
++  "  else if (msg.method === 'prompts/list') result = { prompts: [{ name: 'greet', description: 'Say hello' }] };",
++  "  if (result) process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\\n');",
++  "  else process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'Method not found' } }) + '\\n');",
++  "}",
++  "",
++].join("\n");
++
++const FAILING_SERVER = "console.error('boom: missing dependency');\nprocess.exit(1);\n";
++
++let tempDir: string;
++
++test.beforeEach(() => {
++  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-mcp-probe-"));
++});
++
++test.afterEach(() => {
++  fs.rmSync(tempDir, { recursive: true, force: true });
++});
++
++function writeFake(name: string, source: string): string {
++  const file = path.join(tempDir, name);
++  fs.writeFileSync(file, source, "utf-8");
++  return file;
++}
++
++test("probe: fake stdio server lists tools, resources and prompts", async () => {
++  const serverPath = writeFake("fake-server.mjs", FAKE_STDIO_SERVER);
++  const result = await runMcpProbeLocally({
++    transport: "stdio",
++    command: process.execPath,
++    args: [serverPath],
++    timeoutMs: 10000,
++  });
++  assert.equal(result.ok, true);
++  assert.deepEqual(
++    result.tools.map((t) => t.name),
++    ["echo", "read_file"],
++  );
++  assert.deepEqual(
++    result.resources.map((t) => t.name),
++    ["config"],
++  );
++  assert.deepEqual(
++    result.prompts.map((t) => t.name),
++    ["greet"],
++  );
++  assert.ok(result.ms >= 0 && result.ms < 10000);
++});
++
++test("probe: failing stdio server reports ok:false with the stderr tail", async () => {
++  const serverPath = writeFake("failing-server.mjs", FAILING_SERVER);
++  const result = await runMcpProbeLocally({
++    transport: "stdio",
++    command: process.execPath,
++    args: [serverPath],
++    timeoutMs: 10000,
++  });
++  assert.equal(result.ok, false);
++  assert.ok(result.error);
++  assert.ok(result.stderrTail?.includes("boom: missing dependency"));
++});
++
++test("probe: a command that does not exist reports ok:false", async () => {
++  const result = await runMcpProbeLocally({
++    transport: "stdio",
++    command: "definitely-not-a-real-command-xyz",
++    args: [],
++    timeoutMs: 5000,
++  });
++  assert.equal(result.ok, false);
++  assert.ok(result.error);
++});
++
++test("probe: fake streamable-HTTP server (JSON + SSE responses)", async () => {
++  const handle = async (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => {
++    const chunks: Buffer[] = [];
++    for await (const chunk of req) chunks.push(chunk as Buffer);
++    let msg: { id?: number; method?: string } = {};
++    try {
++      msg = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
++    } catch {
++      res.writeHead(400).end();
++      return;
++    }
++    if (typeof msg.method === "string" && msg.method.startsWith("notifications/")) {
++      res.writeHead(202).end();
++      return;
++    }
++    let result: unknown = null;
++    if (msg.method === "initialize") result = { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fake-http", version: "0.0.1" } };
++    else if (msg.method === "tools/list") result = { tools: [{ name: "search", description: "Searches" }] };
++    else if (msg.method === "resources/list") result = { resources: [] };
++    else if (msg.method === "prompts/list") result = { prompts: [] };
++    const payload = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result });
++    if (req.url === "/mcp-sse") {
++      res.writeHead(200, { "content-type": "text/event-stream", "mcp-session-id": "sess-1" });
++      res.end(`event: message\ndata: ${payload}\n\n`);
++      return;
++    }
++    res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
++    res.end(payload);
++  };
++  const server: Server = createServer((req, res) => void handle(req, res));
++  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
++  const address = server.address();
++  const port = typeof address === "object" && address ? address.port : 0;
++  try {
++    const json = await runMcpProbeLocally({
++      transport: "streamable-http",
++      url: `http://127.0.0.1:${port}/mcp`,
++      timeoutMs: 10000,
++    });
++    assert.equal(json.ok, true);
++    assert.deepEqual(
++      json.tools.map((t) => t.name),
++      ["search"],
++    );
++    const sse = await runMcpProbeLocally({
++      transport: "streamable-http",
++      url: `http://127.0.0.1:${port}/mcp-sse`,
++      timeoutMs: 10000,
++    });
++    assert.equal(sse.ok, true);
++    assert.deepEqual(
++      sse.tools.map((t) => t.name),
++      ["search"],
++    );
++  } finally {
++    server.close();
++  }
++});
++
++test("probeConfigForServer builds stdio and remote configs; parseProbeResult rejects garbage", () => {
++  const base: UserMcpServer = {
++    id: "x",
++    name: "X",
++    description: "",
++    transport: "stdio",
++    command: "npx",
++    args: ["-y", "x"],
++    env: { KEY: { value: "v", secret: false } },
++    enabled: true,
++    source: "form",
++    createdAt: new Date().toISOString(),
++    updatedAt: new Date().toISOString(),
++  };
++  const stdio = probeConfigForServer(base, { timeoutMs: 1234 });
++  assert.equal(stdio.command, "npx");
++  assert.deepEqual(stdio.env, { KEY: "v" });
++  assert.equal(stdio.timeoutMs, 1234);
++
++  const remote = probeConfigForServer({ ...base, transport: "sse", url: "https://mcp.example.com/sse" });
++  assert.equal(remote.transport, "sse");
++  assert.equal(remote.timeoutMs, MCP_PROBE_TIMEOUT_MS);
++
++  const parsed = parseProbeResult('noise\n{"ok":true,"tools":[{"name":"a","description":""}],"resources":[],"prompts":[],"ms":5}\n');
++  assert.equal(parsed.ok, true);
++  assert.equal(parsed.tools[0].name, "a");
++  assert.throws(() => parseProbeResult("no json here"), /no result/);
++});
+diff --git a/apps/swarmagents/lib/mcp-probe.ts b/apps/swarmagents/lib/mcp-probe.ts
+new file mode 100644
+index 000000000..4715ea15e
+--- /dev/null
++++ b/apps/swarmagents/lib/mcp-probe.ts
+@@ -0,0 +1,446 @@
++/**
++ * Test-connection probe for a user MCP server (board task l4).
++ *
++ * The probe is a dependency-free Node script (MCP_PROBE_SOURCE) that speaks
++ * the MCP handshake itself — stdio via a spawned process, remote via fetch
++ * (streamable HTTP or SSE) — and prints one JSON result line to stdout:
++ *
++ *   {ok, tools: [{name, description}], resources: [{name}], prompts: [{name}], ms}
++ *   {ok: false, error, stderrTail?, ms}
++ *
++ * It runs INSIDE the user's VM (seeded with vm.writeFile, executed with
++ * vm.exec), never in the Next.js process: a stdio server the user added must
++ * only ever spawn in their VM, and a remote server must only be reached from
++ * the VM's network. `runMcpProbeLocally` is the same script spawned on the
++ * host — a test/dev helper only; no route uses it.
++ *
++ * The script is written to mirror the SDK's handshake (initialize with
++ * protocolVersion 2024-11-05, notifications/initialized, tools/list,
++ * resources/list, prompts/list) without needing the SDK installed in the VM.
++ */
++
++import { spawn } from "node:child_process";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import type { McpTransport, UserMcpServer } from "./mcp-servers";
++import { plainEnv } from "./mcp-servers";
++
++/** Path inside the user's VM where the probe script is seeded. */
++export const MCP_PROBE_PATH = "/workspace/.swarm/mcp-probe.mjs";
++
++/** Default probe timeout (the whole handshake must finish inside this). */
++export const MCP_PROBE_TIMEOUT_MS = 15000;
++
++export interface McpProbeConfig {
++  transport: McpTransport;
++  command?: string;
++  args?: string[];
++  env?: Record<string, string>;
++  url?: string;
++  headers?: Record<string, string>;
++  timeoutMs?: number;
++}
++
++export interface McpProbeTool {
++  name: string;
++  description: string;
++}
++
++export interface McpProbeResult {
++  ok: boolean;
++  tools: McpProbeTool[];
++  resources: McpProbeTool[];
++  prompts: McpProbeTool[];
++  /** Milliseconds the handshake took. */
++  ms: number;
++  error?: string;
++  /** Last ~2KB of the stdio server's stderr (failure diagnosis only). */
++  stderrTail?: string;
++}
++
++/** Minimal VM surface the probe needs (VmManager satisfies it structurally). */
++export interface VmProbeRunner {
++  writeFile(userId: string, path: string, content: string): Promise<void>;
++  exec(
++    userId: string,
++    cmd: string[],
++    opts?: {
++      stdin?: string;
++      timeoutMs?: number;
++      onStdout?: (chunk: string) => void;
++      onStderr?: (chunk: string) => void;
++    },
++  ): Promise<{ exitCode: number; truncated?: boolean }>;
++}
++
++// ---------------------------------------------------------------------------
++// The probe script (dependency-free Node; runs inside the user's VM)
++// ---------------------------------------------------------------------------
++
++export const MCP_PROBE_SOURCE = [
++  "// SwarmAgents MCP test-connection probe (auto-generated, dependency-free).",
++  "// Reads one JSON config from stdin, runs the MCP handshake, prints one",
++  "// JSON result line to stdout. Diagnostics go to stderr, never stdout.",
++  "import { spawn } from 'node:child_process';",
++  "",
++  "const started = Date.now();",
++  "const out = (result) => { process.stdout.write(JSON.stringify({ ...result, ms: Date.now() - started }) + '\\n'); };",
++  "const fail = (error, extra) => { out({ ok: false, tools: [], resources: [], prompts: [], error, ...(extra || {}) }); };",
++  "",
++  "let config;",
++  "try {",
++  "  const text = await new Promise((resolve, reject) => {",
++  "    let buf = '';",
++  "    process.stdin.setEncoding('utf-8');",
++  "    process.stdin.on('data', (c) => { buf += c; });",
++  "    process.stdin.on('end', () => resolve(buf));",
++  "    process.stdin.on('error', reject);",
++  "  });",
++  "  config = JSON.parse(text);",
++  "} catch (e) { fail('Probe config was not valid JSON: ' + (e && e.message ? e.message : String(e))); process.exit(0); }",
++  "",
++  "const timeoutMs = typeof config.timeoutMs === 'number' && config.timeoutMs > 0 ? config.timeoutMs : 15000;",
++  "const deadline = setTimeout(() => { fail('Timed out after ' + timeoutMs + 'ms waiting for the server to answer.'); process.exit(0); }, timeoutMs);",
++  "const clear = () => clearTimeout(deadline);",
++  "",
++  "const CLIENT = { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'swarmagents-probe', version: '1.0.0' } };",
++  "const names = (list) => (Array.isArray(list) ? list : []).filter((t) => t && typeof t.name === 'string').map((t) => ({ name: t.name, description: typeof t.description === 'string' ? t.description : '' }));",
++  "",
++  "// ---- stdio ------------------------------------------------------------",
++  "async function probeStdio() {",
++  "  const child = spawn(config.command, Array.isArray(config.args) ? config.args : [], {",
++  "    env: { ...process.env, ...(config.env || {}) },",
++  "    stdio: ['pipe', 'pipe', 'pipe'],",
++  "  });",
++  "  let stderr = '';",
++  "  child.stderr.setEncoding('utf-8');",
++  "  child.stderr.on('data', (c) => { stderr += c; if (stderr.length > 8192) stderr = stderr.slice(-8192); });",
++  "  const send = (msg) => new Promise((resolve, reject) => {",
++  "    child.stdin.write(JSON.stringify(msg) + '\\n', (err) => (err ? reject(err) : resolve()));",
++  "  });",
++  "  let nextId = 1;",
++  "  const pending = new Map();",
++  "  let buf = '';",
++  "  child.stdout.setEncoding('utf-8');",
++  "  child.stdout.on('data', (chunk) => {",
++  "    buf += chunk;",
++  "    let idx;",
++  "    while ((idx = buf.indexOf('\\n')) >= 0) {",
++  "      const line = buf.slice(0, idx).trim();",
++  "      buf = buf.slice(idx + 1);",
++  "      if (!line) continue;",
++  "      let msg;",
++  "      try { msg = JSON.parse(line); } catch { continue; }",
++  "      if (msg && typeof msg.id !== 'undefined' && pending.has(msg.id)) {",
++  "        const { resolve, reject } = pending.get(msg.id);",
++  "        pending.delete(msg.id);",
++  "        if (msg.error) reject(new Error(msg.error.message || 'JSON-RPC error ' + msg.error.code));",
++  "        else resolve(msg.result);",
++  "      }",
++  "    }",
++  "  });",
++  "  const request = (method, params) => new Promise((resolve, reject) => {",
++  "    const id = nextId++;",
++  "    pending.set(id, { resolve, reject });",
++  "    send({ jsonrpc: '2.0', id, method, params }).catch(reject);",
++  "  });",
++  "  const notify = (method) => send({ jsonrpc: '2.0', method }).catch(() => {});",
++  "  const list = async (method, key) => {",
++  "    try { const r = await request(method, {}); return names(r ? r[key] : []); }",
++  "    catch { return []; }",
++  "  };",
++  "  try {",
++  "    const earlyFailure = new Promise((_, reject) => {",
++  "      child.once('error', (e) => reject(e));",
++  "      child.once('exit', (code, signal) => reject(new Error('Server exited before answering (code ' + code + ', signal ' + signal + ')')));",
++  "    });",
++  "    const init = await Promise.race([request('initialize', CLIENT), earlyFailure]);",
++  "    if (!init || typeof init !== 'object') throw new Error('Server answered initialize with no result.');",
++  "    await notify('notifications/initialized');",
++  "    const [tools, resources, prompts] = await Promise.all([",
++  "      list('tools/list', 'tools'), list('resources/list', 'resources'), list('prompts/list', 'prompts'),",
++  "    ]);",
++  "    clear();",
++  "    child.kill();",
++  "    out({ ok: true, tools, resources, prompts });",
++  "  } catch (e) {",
++  "    clear();",
++  "    try { child.kill(); } catch {}",
++  "    const tail = stderr.trim().slice(-2000);",
++  "    fail('stdio probe failed: ' + (e && e.message ? e.message : String(e)), tail ? { stderrTail: tail } : undefined);",
++  "  }",
++  "  process.exit(0);",
++  "}",
++  "",
++  "// ---- remote (streamable HTTP / SSE) ------------------------------------",
++  "function parseSse(text) {",
++  "  const frames = [];",
++  "  for (const block of text.split(/\\r?\\n\\r?\\n/)) {",
++  "    if (!block.trim()) continue;",
++  "    let event = 'message';",
++  "    const data = [];",
++  "    for (const line of block.split(/\\r?\\n/)) {",
++  "      if (line.startsWith('event:')) event = line.slice(6).trim();",
++  "      else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));",
++  "    }",
++  "    if (data.length) frames.push({ event, data: data.join('\\n') });",
++  "  }",
++  "  return frames;",
++  "}",
++  "",
++  "async function postRpc(url, body, sessionId) {",
++  "  const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(config.headers || {}) };",
++  "  if (sessionId) headers['mcp-session-id'] = sessionId;",
++  "  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });",
++  "  const nextSession = res.headers.get('mcp-session-id') || sessionId;",
++  "  if (res.status === 202 || res.status === 204) return { sessionId: nextSession };",
++  "  const text = await res.text();",
++  "  if (!res.ok) throw new Error('Server answered HTTP ' + res.status + (text ? ': ' + text.slice(0, 300) : ''));",
++  "  const ctype = (res.headers.get('content-type') || '').toLowerCase();",
++  "  if (ctype.includes('text/event-stream')) {",
++  "    for (const frame of parseSse(text)) {",
++  "      try {",
++  "        const msg = JSON.parse(frame.data);",
++  "        if (msg && typeof msg.id !== 'undefined') {",
++  "          if (msg.error) throw new Error(msg.error.message || 'JSON-RPC error ' + msg.error.code);",
++  "          return { result: msg.result, sessionId: nextSession };",
++  "        }",
++  "      } catch (e) { if (e && e.message && e.message.startsWith('JSON-RPC')) throw e; }",
++  "    }",
++  "    return { sessionId: nextSession };",
++  "  }",
++  "  let msg;",
++  "  try { msg = JSON.parse(text); } catch { throw new Error('Server answered with non-JSON: ' + text.slice(0, 200)); }",
++  "  if (msg && msg.error) throw new Error(msg.error.message || 'JSON-RPC error ' + msg.error.code);",
++  "  return { result: msg ? msg.result : undefined, sessionId: nextSession };",
++  "}",
++  "",
++  "async function probeStreamableHttp() {",
++  "  try {",
++  "    let nextId = 1;",
++  "    let sessionId;",
++  "    const call = async (method, params) => {",
++  "      const r = await postRpc(config.url, { jsonrpc: '2.0', id: nextId++, method, params }, sessionId);",
++  "      sessionId = r.sessionId;",
++  "      return r.result;",
++  "    };",
++  "    const init = await call('initialize', CLIENT);",
++  "    if (!init || typeof init !== 'object') throw new Error('Server answered initialize with no result.');",
++  "    await postRpc(config.url, { jsonrpc: '2.0', method: 'notifications/initialized' }, sessionId).catch(() => {});",
++  "    const list = async (method, key) => { try { const r = await call(method, {}); return names(r ? r[key] : []); } catch { return []; } };",
++  "    const [tools, resources, prompts] = await Promise.all([",
++  "      list('tools/list', 'tools'), list('resources/list', 'resources'), list('prompts/list', 'prompts'),",
++  "    ]);",
++  "    clear();",
++  "    out({ ok: true, tools, resources, prompts });",
++  "  } catch (e) {",
++  "    clear();",
++  "    fail('Remote probe failed: ' + (e && e.message ? e.message : String(e)));",
++  "  }",
++  "  process.exit(0);",
++  "}",
++  "",
++  "async function probeSse() {",
++  "  try {",
++  "    const ctrl = new AbortController();",
++  "    const res = await fetch(config.url, { headers: { accept: 'text/event-stream', ...(config.headers || {}) }, signal: ctrl.signal });",
++  "    if (!res.ok || !res.body) throw new Error('Server answered HTTP ' + res.status + ' opening the SSE stream.');",
++  "    const reader = res.body.getReader();",
++  "    const decoder = new TextDecoder();",
++  "    let buffer = '';",
++  "    let endpoint = null;",
++  "    const inbox = [];",
++  "    const waiters = new Map();",
++  "    const deliver = (msg) => {",
++  "      if (msg && typeof msg.id !== 'undefined' && waiters.has(msg.id)) {",
++  "        const { resolve, reject } = waiters.get(msg.id);",
++  "        waiters.delete(msg.id);",
++  "        if (msg.error) reject(new Error(msg.error.message || 'JSON-RPC error ' + msg.error.code));",
++  "        else resolve(msg.result);",
++  "      } else if (msg) inbox.push(msg);",
++  "    };",
++  "    const pump = (async () => {",
++  "      try {",
++  "        for (;;) {",
++  "          const { done, value } = await reader.read();",
++  "          if (done) break;",
++  "          buffer += decoder.decode(value, { stream: true });",
++  "          let idx;",
++  "          while ((idx = buffer.indexOf('\\n\\n')) >= 0) {",
++  "            const block = buffer.slice(0, idx);",
++  "            buffer = buffer.slice(idx + 2);",
++  "            for (const frame of parseSse(block + '\\n\\n')) {",
++  "              if (frame.event === 'endpoint') { endpoint = new URL(frame.data.trim(), config.url).toString(); continue; }",
++  "              try { deliver(JSON.parse(frame.data)); } catch {}",
++  "            }",
++  "          }",
++  "        }",
++  "      } catch {}",
++  "    })();",
++  "    const waitEndpoint = new Promise((resolve, reject) => {",
++  "      const t0 = Date.now();",
++  "      const tick = () => {",
++  "        if (endpoint) return resolve(endpoint);",
++  "        if (Date.now() - t0 > 8000) return reject(new Error('Server never sent an SSE endpoint.'));",
++  "        setTimeout(tick, 50);",
++  "      };",
++  "      tick();",
++  "    });",
++  "    const endpointUrl = await waitEndpoint;",
++  "    let nextId = 1;",
++  "    const call = (method, params) => new Promise((resolve, reject) => {",
++  "      const id = nextId++;",
++  "      waiters.set(id, { resolve, reject });",
++  "      fetch(endpointUrl, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(config.headers || {}) }, body: JSON.stringify({ jsonrpc: '2.0', id, method, params }), signal: AbortSignal.timeout(timeoutMs) }).then(async (r) => {",
++  "        const text = await r.text().catch(() => '');",
++  "        if (!r.ok) { waiters.delete(id); return reject(new Error('Server answered HTTP ' + r.status)); }",
++  "        try { const msg = JSON.parse(text); if (msg && typeof msg.id !== 'undefined') deliver(msg); }",
++  "        catch { for (const frame of parseSse(text)) { try { deliver(JSON.parse(frame.data)); } catch {} } }",
++  "      }).catch((e) => { waiters.delete(id); reject(e); });",
++  "      setTimeout(() => { if (waiters.has(id)) { waiters.delete(id); reject(new Error('No answer to ' + method + ' within ' + timeoutMs + 'ms.')); } }, timeoutMs);",
++  "    });",
++  "    const list = async (method, key) => { try { const r = await call(method, {}); return names(r ? r[key] : []); } catch { return []; } };",
++  "    const init = await call('initialize', CLIENT);",
++  "    if (!init || typeof init !== 'object') throw new Error('Server answered initialize with no result.');",
++  "    await fetch(endpointUrl, { method: 'POST', headers: { 'content-type': 'application/json', ...(config.headers || {}) }, body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }), signal: AbortSignal.timeout(timeoutMs) }).catch(() => {});",
++  "    const [tools, resources, prompts] = await Promise.all([",
++  "      list('tools/list', 'tools'), list('resources/list', 'resources'), list('prompts/list', 'prompts'),",
++  "    ]);",
++  "    ctrl.abort();",
++  "    await pump.catch(() => {});",
++  "    clear();",
++  "    out({ ok: true, tools, resources, prompts });",
++  "  } catch (e) {",
++  "    clear();",
++  "    fail('Remote probe failed: ' + (e && e.message ? e.message : String(e)));",
++  "  }",
++  "  process.exit(0);",
++  "}",
++  "",
++  "if (config.transport === 'stdio') await probeStdio();",
++  "else if (config.transport === 'sse') await probeSse();",
++  "else if (config.transport === 'streamable-http') await probeStreamableHttp();",
++  "else { clear(); fail('Unknown transport: ' + String(config.transport)); process.exit(0); }",
++].join("\n");
++
++/** Probe config for a stored server (decrypted env — server-side only). */
++export function probeConfigForServer(server: UserMcpServer, opts: { timeoutMs?: number } = {}): McpProbeConfig {
++  const base = { timeoutMs: opts.timeoutMs ?? MCP_PROBE_TIMEOUT_MS };
++  if (server.transport === "stdio") {
++    return { ...base, transport: "stdio", command: server.command ?? "", args: server.args ?? [], env: plainEnv(server.env) };
++  }
++  return {
++    ...base,
++    transport: server.transport,
++    url: server.url ?? "",
++    headers: plainEnv(server.headers),
++  };
++}
++
++/** Parse the probe's stdout: one JSON result line. Throws on garbage. */
++export function parseProbeResult(stdout: string): McpProbeResult {
++  const line = stdout
++    .split("\n")
++    .map((l) => l.trim())
++    .find((l) => l.startsWith("{"));
++  if (!line) throw new Error("The probe printed no result.");
++  let data: unknown;
++  try {
++    data = JSON.parse(line);
++  } catch {
++    throw new Error("The probe printed an unreadable result.");
++  }
++  if (!data || typeof data !== "object") throw new Error("The probe printed an unreadable result.");
++  const r = data as Record<string, unknown>;
++  const names = (value: unknown): McpProbeTool[] =>
++    Array.isArray(value)
++      ? value
++          .filter((t): t is Record<string, unknown> => !!t && typeof t === "object" && typeof (t as Record<string, unknown>).name === "string")
++          .map((t) => ({
++            name: (t as Record<string, unknown>).name as string,
++            description: typeof (t as Record<string, unknown>).description === "string" ? ((t as Record<string, unknown>).description as string) : "",
++          }))
++      : [];
++  return {
++    ok: r.ok === true,
++    tools: names(r.tools),
++    resources: names(r.resources),
++    prompts: names(r.prompts),
++    ms: typeof r.ms === "number" ? r.ms : 0,
++    ...(typeof r.error === "string" ? { error: r.error } : {}),
++    ...(typeof r.stderrTail === "string" ? { stderrTail: r.stderrTail } : {}),
++  };
++}
++
++/**
++ * Run the probe script on this host. Test/dev helper ONLY — routes must use
++ * probeMcpServerInVm so user servers never execute in the Next.js process.
++ */
++export async function runMcpProbeLocally(config: McpProbeConfig): Promise<McpProbeResult> {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-mcp-probe-"));
++  const scriptPath = path.join(dir, "probe.mjs");
++  try {
++    fs.writeFileSync(scriptPath, MCP_PROBE_SOURCE, "utf-8");
++    const child = spawn(process.execPath, [scriptPath], { stdio: ["pipe", "pipe", "pipe"] });
++    let stdout = "";
++    let stderr = "";
++    child.stdout.setEncoding("utf-8");
++    child.stderr.setEncoding("utf-8");
++    child.stdout.on("data", (c: string) => {
++      stdout += c;
++    });
++    child.stderr.on("data", (c: string) => {
++      stderr += c;
++    });
++    child.stdin.end(JSON.stringify(config));
++    const code = await new Promise<number | null>((resolve) => {
++      child.once("exit", (c) => resolve(c));
++      child.once("error", () => resolve(null));
++    });
++    if (code === null) throw new Error("Could not start the probe (node unavailable).");
++    try {
++      return parseProbeResult(stdout);
++    } catch {
++      throw new Error(`The probe exited (${code}) without a result.${stderr ? ` stderr: ${stderr.slice(-500)}` : ""}`);
++    }
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++}
++
++/**
++ * Test a stored server inside the user's VM: seed the probe script, run it
++ * with the server's config on stdin, parse the one-line JSON result.
++ */
++export async function probeMcpServerInVm(
++  vm: VmProbeRunner,
++  userId: string,
++  server: UserMcpServer,
++  opts: { timeoutMs?: number } = {},
++): Promise<McpProbeResult> {
++  const config = probeConfigForServer(server, opts);
++  await vm.writeFile(userId, MCP_PROBE_PATH, MCP_PROBE_SOURCE);
++  let stdout = "";
++  let stderr = "";
++  const result = await vm.exec(userId, ["node", MCP_PROBE_PATH], {
++    stdin: JSON.stringify(config),
++    timeoutMs: (opts.timeoutMs ?? MCP_PROBE_TIMEOUT_MS) + 5000,
++    onStdout: (chunk) => {
++      stdout += chunk;
++    },
++    onStderr: (chunk) => {
++      stderr += chunk;
++    },
++  });
++  if (result.exitCode !== 0) {
++    try {
++      return parseProbeResult(stdout);
++    } catch {
++      throw new Error(
++        `The probe failed inside the VM (exit ${result.exitCode}).${stderr ? ` ${stderr.slice(-500)}` : ""}`,
++      );
++    }
++  }
++  return parseProbeResult(stdout);
++}
+diff --git a/apps/swarmagents/lib/mcp-registry.test.ts b/apps/swarmagents/lib/mcp-registry.test.ts
+new file mode 100644
+index 000000000..3c8f729a3
+--- /dev/null
++++ b/apps/swarmagents/lib/mcp-registry.test.ts
+@@ -0,0 +1,95 @@
++/**
++ * Official MCP registry search + entry normalization.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { normalizeRegistryServer, RegistryError, searchRegistry } from "./mcp-registry";
++
++const REMOTE_ENTRY = {
++  server: {
++    name: "ac.inference.sh/mcp",
++    title: "inference.sh",
++    description: "Run 150+ AI apps.",
++    version: "1.0.0",
++    repository: { url: "https://github.com/example/inference" },
++    remotes: [{ type: "streamable-http", url: "https://api.inference.sh/mcp" }],
++  },
++};
++
++const STDIO_ENTRY = {
++  server: {
++    name: "io.github.modelcontextprotocol/filesystem",
++    description: "Filesystem access.",
++    version: "2025.1.1",
++    repository: { url: "https://github.com/modelcontextprotocol/servers" },
++    packages: [
++      {
++        registryType: "npm",
++        identifier: "@modelcontextprotocol/server-filesystem",
++        version: "2025.1.1",
++        runtimeHint: "npx",
++        transport: { type: "stdio" },
++        runtimeArguments: [{ type: "positional", value: "/workspace" }],
++        environmentVariables: [
++          { name: "ALLOWED_DIR", description: "Directory to allow.", isRequired: false, isSecret: false },
++          { name: "FS_API_KEY", description: "API key.", isRequired: true, isSecret: true },
++        ],
++      },
++    ],
++  },
++};
++
++test("normalizeRegistryServer: remote entry keeps its URL and transport", () => {
++  const out = normalizeRegistryServer(REMOTE_ENTRY);
++  assert.ok(out);
++  assert.equal(out.id, "ac.inference.sh/mcp");
++  assert.equal(out.transport, "streamable-http");
++  assert.equal(out.url, "https://api.inference.sh/mcp");
++  assert.equal(out.homepage, "https://github.com/example/inference");
++  assert.deepEqual(out.envVars, []);
++});
++
++test("normalizeRegistryServer: stdio npm entry becomes an npx command", () => {
++  const out = normalizeRegistryServer(STDIO_ENTRY);
++  assert.ok(out);
++  assert.equal(out.transport, "stdio");
++  assert.equal(out.command, "npx");
++  assert.deepEqual(out.args, ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]);
++  assert.equal(out.envVars.length, 2);
++  assert.equal(out.envVars[1].name, "FS_API_KEY");
++  assert.equal(out.envVars[1].required, true);
++  assert.equal(out.envVars[1].secret, true);
++});
++
++test("normalizeRegistryServer: entries with no usable transport are skipped", () => {
++  assert.equal(normalizeRegistryServer({ server: { name: "x", packages: [{ identifier: "y", runtimeHint: "weird" }] } }), null);
++  assert.equal(normalizeRegistryServer({ server: { name: "x" } }), null);
++  assert.equal(normalizeRegistryServer({ nope: true }), null);
++  assert.equal(normalizeRegistryServer(null), null);
++});
++
++test("searchRegistry: stubbed fetch returns real-shaped results", async () => {
++  const fetchImpl = async (url: string) => {
++    assert.ok(url.startsWith("https://registry.modelcontextprotocol.io/v0/servers?"));
++    assert.ok(url.includes("search=filesystem"));
++    return {
++      ok: true,
++      status: 200,
++      json: async () => ({ servers: [STDIO_ENTRY, REMOTE_ENTRY, { server: { name: "broken" } }] }),
++    };
++  };
++  const results = await searchRegistry("filesystem", { fetchImpl });
++  assert.equal(results.length, 2);
++  assert.equal(results[0].transport, "stdio");
++  assert.equal(results[1].transport, "streamable-http");
++});
++
++test("searchRegistry: registry errors surface, never fake results", async () => {
++  const failing = async () => ({ ok: false, status: 500, json: async () => ({}) });
++  await assert.rejects(() => searchRegistry("x", { fetchImpl: failing }), RegistryError);
++  const down = async () => {
++    throw new Error("ECONNREFUSED");
++  };
++  await assert.rejects(() => searchRegistry("x", { fetchImpl: down }), /could not be reached/);
++});
+diff --git a/apps/swarmagents/lib/mcp-registry.ts b/apps/swarmagents/lib/mcp-registry.ts
+new file mode 100644
+index 000000000..fb86c0512
+--- /dev/null
++++ b/apps/swarmagents/lib/mcp-registry.ts
+@@ -0,0 +1,241 @@
++/**
++ * Search the official MCP registry (registry.modelcontextprotocol.io).
++ *
++ * The registry API is real and reachable: GET
++ * https://registry.modelcontextprotocol.io/v0/servers?search=<q>&limit=<n>
++ * returns `{servers: [{server: {...}, _meta: {...}}]}` (verified 2026-11-12).
++ * Entries are normalized into the small RegistryServer shape the UI installs
++ * from; nothing is invented — an entry the registry does not return never
++ * appears, and a registry outage surfaces as an error, never fake results.
++ *
++ * A registry entry is untrusted catalog content: it is shown to the user
++ * (name, description, required env vars, transport) before install, and
++ * install only stores what the user explicitly confirmed, with env values
++ * they typed themselves.
++ */
++
++import type { McpTransport } from "./mcp-servers";
++
++export const REGISTRY_API_BASE = "https://registry.modelcontextprotocol.io";
++
++/** A registry entry reduced to what the UI needs to show + install. */
++export interface RegistryServer {
++  /** Registry name, e.g. "io.github.modelcontextprotocol/filesystem". */
++  id: string;
++  name: string;
++  title: string;
++  description: string;
++  version: string;
++  homepage: string;
++  transport: McpTransport;
++  /** stdio installs. */
++  command?: string;
++  args?: string[];
++  /** Remote installs. */
++  url?: string;
++  envVars: RegistryEnvVar[];
++}
++
++export interface RegistryEnvVar {
++  name: string;
++  description: string;
++  required: boolean;
++  secret: boolean;
++  defaultValue: string;
++}
++
++/** The registry (or the network) could not be reached. */
++export class RegistryError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = "RegistryError";
++  }
++}
++
++type FetchFn = (url: string, init?: { signal?: AbortSignal }) => Promise<{
++  ok: boolean;
++  status: number;
++  json(): Promise<unknown>;
++}>;
++
++const asRecord = (value: unknown): Record<string, unknown> | null =>
++  value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
++
++const asText = (value: unknown, max = 280): string =>
++  typeof value === "string" ? value.trim().slice(0, max) : "";
++
++/**
++ * Normalize one registry API entry (`{server: {...}}`) into a RegistryServer.
++ * Returns null when the entry has no usable transport (no remotes, no
++ * runnable package) — it is skipped, never invented.
++ */
++export function normalizeRegistryServer(entry: unknown): RegistryServer | null {
++  const root = asRecord(entry);
++  const server = root ? asRecord(root.server) : null;
++  if (!server) return null;
++  const name = asText(server.name, 200);
++  if (!name) return null;
++  const description = asText(server.description);
++  const repository = asRecord(server.repository);
++  const homepage = asText(repository?.url, 500);
++
++  const envVars: RegistryEnvVar[] = [];
++  const readEnvVars = (list: unknown): void => {
++    if (!Array.isArray(list)) return;
++    for (const item of list) {
++      const v = asRecord(item);
++      if (!v || typeof v.name !== "string" || !v.name.trim()) continue;
++      envVars.push({
++        name: v.name.trim().slice(0, 128),
++        description: asText(v.description, 280),
++        required: v.isRequired === true,
++        secret: v.isSecret === true,
++        defaultValue: typeof v.default === "string" ? v.default.slice(0, 512) : "",
++      });
++    }
++  };
++
++  // Remote first: a streamable-HTTP or SSE endpoint needs no install.
++  const remotes = Array.isArray(server.remotes) ? server.remotes : [];
++  for (const remote of remotes) {
++    const r = asRecord(remote);
++    if (!r || typeof r.url !== "string" || !r.url.trim()) continue;
++    const type = typeof r.type === "string" ? r.type.trim().toLowerCase() : "";
++    if (type !== "streamable-http" && type !== "sse") continue;
++    return {
++      id: name,
++      name,
++      title: asText(server.title, 120),
++      description,
++      version: asText(server.version, 40),
++      homepage,
++      transport: type,
++      url: r.url.trim(),
++      envVars,
++    };
++  }
++
++  // stdio: pick the first runnable package (npm via npx, python via uvx,
++  // docker image, or a plain node entry).
++  const packages = Array.isArray(server.packages) ? server.packages : [];
++  for (const pkg of packages) {
++    const p = asRecord(pkg);
++    if (!p || typeof p.identifier !== "string" || !p.identifier.trim()) continue;
++    const identifier = p.identifier.trim().slice(0, 256);
++    const runtimeHint = typeof p.runtimeHint === "string" ? p.runtimeHint.trim().toLowerCase() : "";
++    const transport = asRecord(p.transport);
++    if (transport && typeof transport.type === "string" && transport.type !== "stdio") continue;
++    readEnvVars(p.environmentVariables);
++    const runtimeArgs: string[] = [];
++    if (Array.isArray(p.runtimeArguments)) {
++      for (const arg of p.runtimeArguments) {
++        const a = asRecord(arg);
++        if (!a || typeof a.value !== "string") continue;
++        if (a.type === "named" && typeof a.name === "string" && a.name.trim()) {
++          runtimeArgs.push(`--${a.name.trim()}`, a.value);
++        } else {
++          runtimeArgs.push(a.value);
++        }
++      }
++    }
++    if (runtimeHint === "npx") {
++      return {
++        id: name,
++        name,
++        title: asText(server.title, 120),
++        description,
++        version: asText(server.version, 40),
++        homepage,
++        transport: "stdio",
++        command: "npx",
++        args: ["-y", identifier, ...runtimeArgs],
++        envVars,
++      };
++    }
++    if (runtimeHint === "uvx") {
++      return {
++        id: name,
++        name,
++        title: asText(server.title, 120),
++        description,
++        version: asText(server.version, 40),
++        homepage,
++        transport: "stdio",
++        command: "uvx",
++        args: [identifier, ...runtimeArgs],
++        envVars,
++      };
++    }
++    if (runtimeHint === "docker") {
++      return {
++        id: name,
++        name,
++        title: asText(server.title, 120),
++        description,
++        version: asText(server.version, 40),
++        homepage,
++        transport: "stdio",
++        command: "docker",
++        args: ["run", "-i", "--rm", identifier, ...runtimeArgs],
++        envVars,
++      };
++    }
++    if (runtimeHint === "node") {
++      return {
++        id: name,
++        name,
++        title: asText(server.title, 120),
++        description,
++        version: asText(server.version, 40),
++        homepage,
++        transport: "stdio",
++        command: "node",
++        args: [identifier, ...runtimeArgs],
++        envVars,
++      };
++    }
++    // Unknown runtime hint: skip this package, try the next one.
++  }
++  return null;
++}
++
++/**
++ * Search the official registry. `query` empty lists the latest servers.
++ * `fetchImpl` is injectable for tests; defaults to the global fetch.
++ */
++export async function searchRegistry(
++  query: string,
++  opts: { limit?: number; fetchImpl?: FetchFn; timeoutMs?: number } = {},
++): Promise<RegistryServer[]> {
++  const limit = Math.min(Math.max(opts.limit ?? 20, 1), 50);
++  const params = new URLSearchParams({ limit: String(limit) });
++  const q = query.trim();
++  if (q) params.set("search", q);
++  const url = `${REGISTRY_API_BASE}/v0/servers?${params.toString()}`;
++  const fetchImpl: FetchFn = opts.fetchImpl ?? ((u: string, init?: { signal?: AbortSignal }) => fetch(u, init));
++  let res;
++  try {
++    res = await fetchImpl(url, { signal: AbortSignal.timeout(opts.timeoutMs ?? 10000) });
++  } catch (err) {
++    throw new RegistryError(
++      `The MCP registry could not be reached (${err instanceof Error ? err.message : String(err)}).`,
++    );
++  }
++  if (!res.ok) {
++    throw new RegistryError(`The MCP registry answered ${res.status}. Try again in a moment.`);
++  }
++  let data: unknown;
++  try {
++    data = await res.json();
++  } catch {
++    throw new RegistryError("The MCP registry answered with invalid JSON.");
++  }
++  const root = asRecord(data);
++  const servers = root && Array.isArray(root.servers) ? root.servers : [];
++  const out: RegistryServer[] = [];
++  for (const entry of servers) {
++    const normalized = normalizeRegistryServer(entry);
++    if (normalized) out.push(normalized);
++  }
++  return out;
++}
+diff --git a/apps/swarmagents/lib/mcp-servers-store.test.ts b/apps/swarmagents/lib/mcp-servers-store.test.ts
+new file mode 100644
+index 000000000..9458925aa
+--- /dev/null
++++ b/apps/swarmagents/lib/mcp-servers-store.test.ts
+@@ -0,0 +1,127 @@
++/**
++ * Per-user MCP server store: per-account files, secrets sealed at rest.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { parseMcpConfigJson } from "./mcp-servers";
++import {
++  addUserMcpServers,
++  deleteUserMcpServer,
++  readUserMcpServers,
++  readUserMcpServersDecrypted,
++  updateUserMcpServer,
++  userMcpRunEntries,
++  userMcpServersFilePath,
++} from "./mcp-servers-store";
++import { isSealed } from "./providers/secret-box";
++
++const ALICE = "local_alice@example.com";
++const BOB = "local_bob@example.com";
++
++let tempDir: string;
++const opts = () => ({ env: { SWARM_HOME: tempDir } });
++
++test.beforeEach(() => {
++  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-mcp-store-"));
++});
++
++test.afterEach(() => {
++  fs.rmSync(tempDir, { recursive: true, force: true });
++});
++
++test("add + read: a multi-server paste stores multiple servers, masked on read", () => {
++  const { servers } = parseMcpConfigJson(
++    JSON.stringify({
++      mcpServers: {
++        filesystem: { command: "npx", args: ["-y", "fs"], env: { DIR: "/tmp" } },
++        remote: { url: "https://mcp.example.com/mcp", headers: { Authorization: "Bearer sk-abcdefghijklmnopqrst" } },
++      },
++    }),
++  );
++  const created = addUserMcpServers(ALICE, servers, opts());
++  assert.equal(created.length, 2);
++  assert.deepEqual(
++    created.map((c) => c.id).sort(),
++    ["filesystem", "remote"],
++  );
++
++  const rows = readUserMcpServers(ALICE, opts());
++  assert.equal(rows.length, 2);
++  const remote = rows.find((r) => r.id === "remote")!;
++  assert.equal(remote.headers.Authorization, "••••••••");
++  assert.deepEqual(remote.secretKeys, ["header:Authorization"]);
++  assert.ok(!JSON.stringify(rows).includes("sk-abcdefghijklmnopqrst"));
++
++  // The other user's store is empty and separate.
++  assert.deepEqual(readUserMcpServers(BOB, opts()), []);
++});
++
++test("secrets are sealed on disk, never plaintext", () => {
++  const { servers } = parseMcpConfigJson(
++    JSON.stringify({
++      mcpServers: {
++        fs: { command: "npx", env: { API_KEY: "sk-abcdefghijklmnopqrstuvwx" } },
++      },
++    }),
++  );
++  addUserMcpServers(ALICE, servers, opts());
++  const raw = fs.readFileSync(userMcpServersFilePath(ALICE, opts()), "utf-8");
++  assert.ok(!raw.includes("sk-abcdefghijklmnopqrstuvwx"), "no plaintext secret on disk");
++  const parsed = JSON.parse(raw) as { servers: Array<{ env: Record<string, { value: string }> }> };
++  assert.ok(isSealed(parsed.servers[0].env.API_KEY.value), "secret is sealed");
++
++  // Server-side decrypted read recovers the value (probe / run wiring).
++  const decrypted = readUserMcpServersDecrypted(ALICE, opts());
++  assert.equal(decrypted[0].env?.API_KEY.value, "sk-abcdefghijklmnopqrstuvwx");
++
++  // File modes: user dir 700, file 600.
++  assert.equal(fs.statSync(path.dirname(userMcpServersFilePath(ALICE, opts()))).mode & 0o777, 0o700);
++  assert.equal(fs.statSync(userMcpServersFilePath(ALICE, opts())).mode & 0o777, 0o600);
++});
++
++test("update + delete + run entries (enabled only, claude config form)", () => {
++  const { servers } = parseMcpConfigJson(
++    JSON.stringify({
++      mcpServers: {
++        a: { command: "npx", args: ["-y", "a"] },
++        b: { url: "https://mcp.example.com/mcp" },
++      },
++    }),
++  );
++  addUserMcpServers(ALICE, servers, opts());
++
++  const disabled = updateUserMcpServer(ALICE, "b", { enabled: false }, opts());
++  assert.equal(disabled?.enabled, false);
++  assert.equal(updateUserMcpServer(ALICE, "missing", { enabled: true }, opts()), null);
++
++  const entries = userMcpRunEntries(ALICE, opts());
++  assert.equal(entries.length, 1);
++  assert.equal(entries[0].id, "a");
++  assert.deepEqual(entries[0].entry, { type: "stdio", command: "npx", args: ["-y", "a"] });
++
++  assert.equal(deleteUserMcpServer(ALICE, "a", opts()), true);
++  assert.equal(deleteUserMcpServer(ALICE, "a", opts()), false);
++  assert.equal(readUserMcpServers(ALICE, opts()).length, 1);
++});
++
++test("a file owned by another user is ignored", () => {
++  addUserMcpServers(ALICE, parseMcpConfigJson(JSON.stringify({ mcpServers: { a: { command: "npx" } } })).servers, opts());
++  const file = userMcpServersFilePath(ALICE, opts());
++  const body = JSON.parse(fs.readFileSync(file, "utf-8")) as Record<string, unknown>;
++  fs.writeFileSync(file, JSON.stringify({ ...body, userId: BOB }));
++  assert.deepEqual(readUserMcpServers(ALICE, opts()), []);
++});
++
++test("duplicate names get unique ids", () => {
++  const { servers } = parseMcpConfigJson(
++    JSON.stringify({ mcpServers: { fs: { command: "npx" } } }),
++  );
++  const first = addUserMcpServers(ALICE, servers, opts());
++  const second = addUserMcpServers(ALICE, servers, opts());
++  assert.equal(first[0].id, "fs");
++  assert.equal(second[0].id, "fs-2");
++});
+diff --git a/apps/swarmagents/lib/mcp-servers-store.ts b/apps/swarmagents/lib/mcp-servers-store.ts
+new file mode 100644
+index 000000000..8540bd3b6
+--- /dev/null
++++ b/apps/swarmagents/lib/mcp-servers-store.ts
+@@ -0,0 +1,306 @@
++/**
++ * Per-user MCP server store.
++ *
++ * A user's servers live on the server in
++ * `<data dir>/users/<hash(userId)>/mcp-servers.json` (dir mode 700, file mode
++ * 600) — the same layout the per-user provider and role stores use, so one
++ * data dir serves all three. There is intentionally no server-wide file: an
++ * account's servers are its own.
++ *
++ * Env/header values flagged secret (see lib/mcp-servers.ts looksLikeSecret)
++ * are sealed with AES-256-GCM (lib/providers/secret-box.ts), bound to the
++ * owner and the server id, exactly like provider keys. Non-secret values are
++ * stored in plain text. Read paths return masked rows for the client; the
++ * decrypted read is server-side only (test-connection probe, run wiring).
++ *
++ * l1 note: the Library foundation (per-user extension store) is not on main
++ * yet. This is the minimal per-user store l4 needs, following the existing
++ * provider-key patterns; it can move under l1's store later without changing
++ * callers (same read/add/update/delete surface).
++ */
++
++import fs from "node:fs";
++import path from "node:path";
++import {
++  MCP_SERVERS_SCHEMA,
++  MCP_SERVERS_VERSION,
++  maskServerForClient,
++  normalizeUserMcpServer,
++  toClaudeMcpConfigEntry,
++  uniqueMcpServerId,
++  type McpEnvEntry,
++  type McpServerDraft,
++  type McpServerRow,
++  type UserMcpServer,
++} from "./mcp-servers";
++import { isSealed, open, seal, type SecretBoxOptions } from "./providers/secret-box";
++import { providerDataDir, resolveDataDir, userDirName, type DataDirOptions } from "./providers/store";
++
++/** Per-user MCP servers file name inside the user's directory. */
++export const USER_MCP_SERVERS_FILE = "mcp-servers.json";
++const MAX_USER_ID_LEN = 256;
++const MAX_SERVERS_PER_USER = 100;
++
++/** The --mcp-config entry for one enabled user server, for run wiring. */
++export interface UserMcpRunEntry {
++  id: string;
++  entry: Record<string, unknown>;
++}
++
++function requireUserId(userId: string): string {
++  if (typeof userId !== "string" || userId.length === 0 || userId.length > MAX_USER_ID_LEN) {
++    throw new Error("A signed-in user is required.");
++  }
++  return userId;
++}
++
++/** One user's MCP servers file. */
++export function userMcpServersFilePath(userId: string, options: DataDirOptions = {}): string {
++  return path.join(resolveDataDir(options), "users", userDirName(userId), USER_MCP_SERVERS_FILE);
++}
++
++function secretOptions(options: DataDirOptions): SecretBoxOptions {
++  return { env: options.env ?? process.env, dataDir: providerDataDir(options) };
++}
++
++interface StoredFile {
++  schema: string;
++  version: number;
++  userId: string;
++  servers: unknown[];
++}
++
++function readStored(userId: string, options: DataDirOptions): UserMcpServer[] {
++  const file = userMcpServersFilePath(userId, options);
++  if (!fs.existsSync(file)) return [];
++  let raw: string;
++  try {
++    raw = fs.readFileSync(file, "utf-8");
++  } catch (err) {
++    console.error(`[swarm-mcp] ignoring unreadable MCP servers file ${file}: ${String(err)}`);
++    return [];
++  }
++  let data: unknown;
++  try {
++    data = JSON.parse(raw);
++  } catch (err) {
++    console.error(`[swarm-mcp] ignoring malformed MCP servers file ${file}: ${String(err)}`);
++    return [];
++  }
++  if (data && typeof data === "object" && !Array.isArray(data)) {
++    const record = data as Record<string, unknown>;
++    if (typeof record.userId === "string" && record.userId !== userId) {
++      console.error(`[swarm-mcp] ignoring MCP servers file ${file}: owner mismatch.`);
++      return [];
++    }
++    if (!Array.isArray(record.servers)) return [];
++    data = record.servers;
++  }
++  if (!Array.isArray(data)) return [];
++  const out: UserMcpServer[] = [];
++  for (const item of data) {
++    const server = normalizeUserMcpServer(item);
++    if (server) out.push(server);
++  }
++  return out;
++}
++
++function sealEnv(
++  env: Record<string, McpEnvEntry> | undefined,
++  userId: string,
++  serverId: string,
++  options: DataDirOptions,
++): Record<string, McpEnvEntry> | undefined {
++  if (!env) return undefined;
++  const out: Record<string, McpEnvEntry> = {};
++  for (const [key, entry] of Object.entries(env)) {
++    if (entry.secret && !isSealed(entry.value)) {
++      try {
++        out[key] = { value: seal(entry.value, userId, `mcp-server:${serverId}`, secretOptions(options)), secret: true };
++      } catch (err) {
++        // Sealing must never lose the user's server: keep the value sealed
++        // under a marker the read path reports as undecryptable.
++        console.error(`[swarm-mcp] could not seal env "${key}" for server ${serverId}: ${String(err)}`);
++        out[key] = { value: entry.value, secret: true };
++      }
++    } else {
++      out[key] = { ...entry };
++    }
++  }
++  return out;
++}
++
++function openEnv(
++  env: Record<string, McpEnvEntry> | undefined,
++  userId: string,
++  serverId: string,
++  options: DataDirOptions,
++): Record<string, McpEnvEntry> | undefined {
++  if (!env) return undefined;
++  const out: Record<string, McpEnvEntry> = {};
++  for (const [key, entry] of Object.entries(env)) {
++    if (entry.secret && isSealed(entry.value)) {
++      try {
++        out[key] = { value: open(entry.value, userId, `mcp-server:${serverId}`, secretOptions(options)), secret: true };
++      } catch (err) {
++        // A secret sealed under a rotated/removed key is dropped, not fatal:
++        // the server stays usable, minus that one value.
++        console.error(`[swarm-mcp] could not open sealed env "${key}" for server ${serverId}: ${String(err)}`);
++      }
++    } else {
++      out[key] = { ...entry };
++    }
++  }
++  return out;
++}
++
++/**
++ * Atomically replace a user's MCP servers file. Secrets are sealed on write;
++ * already-sealed values pass through untouched. Returns the written path.
++ */
++export function writeUserMcpServers(
++  userId: string,
++  servers: readonly UserMcpServer[],
++  options: DataDirOptions = {},
++): string {
++  requireUserId(userId);
++  const file = userMcpServersFilePath(userId, options);
++  const dir = path.dirname(file);
++  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
++  try {
++    fs.chmodSync(dir, 0o700);
++  } catch {
++    // Best effort: a read-only or foreign-owned mount keeps its mode.
++  }
++  const cleaned: UserMcpServer[] = [];
++  const seen = new Set<string>();
++  for (const raw of servers.slice(0, MAX_SERVERS_PER_USER)) {
++    const server = normalizeUserMcpServer(raw);
++    if (!server || seen.has(server.id)) continue;
++    seen.add(server.id);
++    cleaned.push({
++      ...server,
++      env: sealEnv(server.env, userId, server.id, options),
++      headers: sealEnv(server.headers, userId, server.id, options),
++    });
++  }
++  const body: StoredFile = {
++    schema: MCP_SERVERS_SCHEMA,
++    version: MCP_SERVERS_VERSION,
++    userId,
++    servers: cleaned,
++  };
++  const tmp = `${file}.tmp.${process.pid}.${Date.now()}`;
++  fs.writeFileSync(tmp, JSON.stringify(body, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
++  fs.renameSync(tmp, file);
++  try {
++    fs.chmodSync(file, 0o600);
++  } catch {
++    // Best effort.
++  }
++  return file;
++}
++
++/**
++ * The user's servers as client-safe rows (secret values masked, never
++ * returned). A missing file returns [].
++ */
++export function readUserMcpServers(userId: string, options: DataDirOptions = {}): McpServerRow[] {
++  return readStored(userId, options).map((server) => maskServerForClient(server));
++}
++
++/**
++ * The user's servers with plaintext env (server-side only: test-connection
++ * probe and run wiring). Callers must never echo env values to a client.
++ */
++export function readUserMcpServersDecrypted(userId: string, options: DataDirOptions = {}): UserMcpServer[] {
++  return readStored(userId, options).map((server) => ({
++    ...server,
++    env: openEnv(server.env, userId, server.id, options),
++    headers: openEnv(server.headers, userId, server.id, options),
++  }));
++}
++
++/**
++ * Append drafts as new servers with unique ids. Returns the created rows.
++ * Throws when the user already has MAX_SERVERS_PER_USER servers.
++ */
++export function addUserMcpServers(
++  userId: string,
++  drafts: readonly McpServerDraft[],
++  options: DataDirOptions = {},
++): McpServerRow[] {
++  const existing = readStored(userId, options);
++  if (existing.length + drafts.length > MAX_SERVERS_PER_USER) {
++    throw new Error(`You can add up to ${MAX_SERVERS_PER_USER} MCP servers.`);
++  }
++  const taken = new Set(existing.map((server) => server.id));
++  const now = new Date().toISOString();
++  const created: UserMcpServer[] = [];
++  for (const draft of drafts) {
++    const id = uniqueMcpServerId(draft.name, taken);
++    taken.add(id);
++    created.push({
++      id,
++      name: draft.name,
++      description: draft.description,
++      transport: draft.transport,
++      ...(draft.command ? { command: draft.command } : {}),
++      ...(draft.args?.length ? { args: [...draft.args] } : {}),
++      ...(draft.env && Object.keys(draft.env).length > 0 ? { env: { ...draft.env } } : {}),
++      ...(draft.url ? { url: draft.url } : {}),
++      ...(draft.headers && Object.keys(draft.headers).length > 0 ? { headers: { ...draft.headers } } : {}),
++      enabled: true,
++      source: draft.source,
++      ...(draft.registryId ? { registryId: draft.registryId } : {}),
++      createdAt: now,
++      updatedAt: now,
++    });
++  }
++  writeUserMcpServers(userId, [...existing, ...created], options);
++  return created.map((server) => maskServerForClient(server));
++}
++
++/** Patch one server (enabled flag / display name). Returns the row or null. */
++export function updateUserMcpServer(
++  userId: string,
++  serverId: string,
++  patch: { enabled?: boolean; name?: string },
++  options: DataDirOptions = {},
++): McpServerRow | null {
++  const servers = readStored(userId, options);
++  const index = servers.findIndex((server) => server.id === serverId);
++  if (index < 0) return null;
++  const updated: UserMcpServer = {
++    ...servers[index],
++    ...(typeof patch.enabled === "boolean" ? { enabled: patch.enabled } : {}),
++    ...(typeof patch.name === "string" && patch.name.trim()
++      ? { name: patch.name.trim().slice(0, 80) }
++      : {}),
++    updatedAt: new Date().toISOString(),
++  };
++  servers[index] = updated;
++  writeUserMcpServers(userId, servers, options);
++  return maskServerForClient(updated);
++}
++
++/** Delete one server. Returns true when a server was removed. */
++export function deleteUserMcpServer(userId: string, serverId: string, options: DataDirOptions = {}): boolean {
++  const servers = readStored(userId, options);
++  const kept = servers.filter((server) => server.id !== serverId);
++  if (kept.length === servers.length) return false;
++  writeUserMcpServers(userId, kept, options);
++  return true;
++}
++
++/**
++ * --mcp-config entries for the user's ENABLED servers, with decrypted env.
++ * Used to wire the user's servers into a run (lib/harness/role-mcp). A
++ * corrupt store or undecryptable secret degrades to fewer entries, never a
++ * failed run — the caller wraps this in try/catch as well.
++ */
++export function userMcpRunEntries(userId: string, options: DataDirOptions = {}): UserMcpRunEntry[] {
++  return readUserMcpServersDecrypted(userId, options)
++    .filter((server) => server.enabled)
++    .map((server) => ({ id: server.id, entry: toClaudeMcpConfigEntry(server) }));
++}
+diff --git a/apps/swarmagents/lib/mcp-servers.test.ts b/apps/swarmagents/lib/mcp-servers.test.ts
+new file mode 100644
+index 000000000..55466fbf9
+--- /dev/null
++++ b/apps/swarmagents/lib/mcp-servers.test.ts
+@@ -0,0 +1,243 @@
++/**
++ * Parsing, validation, secret detection and SSRF guards for user MCP servers.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  assertPublicResolvedIps,
++  assertSafeRemoteUrl,
++  draftFromForm,
++  draftFromRemoteUrl,
++  isBlockedRemoteHost,
++  isPrivateIp,
++  looksLikeSecret,
++  maskServerForClient,
++  McpServerError,
++  normalizeUserMcpServer,
++  parseMcpConfigJson,
++  slugifyMcpServerId,
++  toClaudeMcpConfigEntry,
++  validateServerDraft,
++  type UserMcpServer,
++} from "./mcp-servers";
++
++const MULTI_SERVER_PASTE = JSON.stringify({
++  mcpServers: {
++    filesystem: {
++      command: "npx",
++      args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
++      env: { ALLOWED_DIR: "/workspace" },
++    },
++    "my-remote": {
++      url: "https://mcp.example.com/sse",
++      type: "sse",
++      headers: { Authorization: "Bearer sk-test-1234567890abcdefghij" },
++    },
++    sqlite: {
++      command: "uvx",
++      args: ["mcp-server-sqlite", "--db-path", "/tmp/test.db"],
++      env: { SQLITE_KEY: "sk-abcdefghijklmnopqrstuvwx" },
++    },
++  },
++});
++
++test("parseMcpConfigJson: a multi-server paste creates multiple entries", () => {
++  const { servers, errors } = parseMcpConfigJson(MULTI_SERVER_PASTE);
++  assert.equal(errors.length, 0);
++  assert.equal(servers.length, 3);
++  const fs = servers.find((s) => s.name === "filesystem")!;
++  assert.equal(fs.transport, "stdio");
++  assert.equal(fs.command, "npx");
++  assert.deepEqual(fs.args, ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]);
++  assert.equal(fs.env?.ALLOWED_DIR.secret, false);
++  const remote = servers.find((s) => s.name === "my-remote")!;
++  assert.equal(remote.transport, "sse");
++  assert.equal(remote.url, "https://mcp.example.com/sse");
++  assert.equal(remote.headers?.Authorization.secret, true);
++  const sqlite = servers.find((s) => s.name === "sqlite")!;
++  assert.equal(sqlite.transport, "stdio");
++  assert.equal(sqlite.env?.SQLITE_KEY.secret, true);
++});
++
++test("parseMcpConfigJson: bare map, single server object, and bad input", () => {
++  const bare = parseMcpConfigJson(JSON.stringify({ solo: { command: "npx", args: ["-y", "x"] } }));
++  assert.equal(bare.servers.length, 1);
++  assert.equal(bare.servers[0].name, "solo");
++
++  const single = parseMcpConfigJson(JSON.stringify({ name: "solo", command: "node", args: ["server.js"] }));
++  assert.equal(single.servers.length, 1);
++  assert.equal(single.servers[0].transport, "stdio");
++
++  const invalid = parseMcpConfigJson("{not json");
++  assert.equal(invalid.servers.length, 0);
++  assert.ok(invalid.errors.length > 0);
++
++  const missing = parseMcpConfigJson(JSON.stringify({ mcpServers: { bad: { foo: 1 } } }));
++  assert.equal(missing.servers.length, 0);
++  assert.ok(missing.errors[0].includes("needs a"));
++
++  const empty = parseMcpConfigJson(JSON.stringify({ mcpServers: {} }));
++  assert.equal(empty.servers.length, 0);
++  assert.ok(empty.errors.length > 0);
++});
++
++test("parseMcpConfigJson: entries without command or url are skipped, not fatal", () => {
++  const { servers, errors } = parseMcpConfigJson(
++    JSON.stringify({ mcpServers: { good: { command: "npx" }, bad: { nope: true } } }),
++  );
++  assert.equal(servers.length, 1);
++  assert.equal(servers[0].name, "good");
++  assert.equal(errors.length, 1);
++});
++
++test("looksLikeSecret flags key names, known prefixes and high-entropy values", () => {
++  assert.equal(looksLikeSecret("API_KEY", "anything"), true);
++  assert.equal(looksLikeSecret("GITHUB_TOKEN", "x"), true);
++  assert.equal(looksLikeSecret("MY_SECRET", "x"), true);
++  assert.equal(looksLikeSecret("PASSWORD", "x"), true);
++  assert.equal(looksLikeSecret("ENDPOINT", "sk-abcdefghijklmnopqrstuvwx"), true);
++  assert.equal(looksLikeSecret("ENDPOINT", "ghp_abcdefghijklmnopqrstuv"), true);
++  assert.equal(looksLikeSecret("ENDPOINT", "AKIAIOSFODNN7EXAMPLE"), true);
++  assert.equal(looksLikeSecret("ALLOWED_DIR", "/workspace"), false);
++  assert.equal(looksLikeSecret("MODEL", "gpt-4o"), false);
++  assert.equal(looksLikeSecret("PORT", "8080"), false);
++});
++
++test("draftFromRemoteUrl and draftFromForm validate their input", () => {
++  const remote = draftFromRemoteUrl("https://mcp.example.com/mcp", "Example", { Authorization: "Bearer abc" });
++  assert.equal(remote.transport, "streamable-http");
++  assert.equal(remote.name, "Example");
++  assert.equal(remote.headers?.Authorization.secret, true);
++
++  assert.throws(() => draftFromRemoteUrl("http://mcp.example.com/mcp", undefined, undefined), McpServerError);
++  assert.throws(() => draftFromRemoteUrl("https://169.254.169.254/latest", undefined, undefined), McpServerError);
++
++  const form = draftFromForm({ name: "FS", command: "npx", args: ["-y", "x"], env: { KEY: "v" } });
++  assert.equal(form.transport, "stdio");
++  assert.throws(() => draftFromForm({ name: "", command: "npx" }), McpServerError);
++  assert.throws(() => draftFromForm({ name: "x", command: "" }), McpServerError);
++});
++
++test("SSRF: private, loopback, link-local and metadata hosts are blocked", () => {
++  for (const host of [
++    "localhost",
++    "127.0.0.1",
++    "127.0.0.2",
++    "10.0.0.5",
++    "172.16.0.1",
++    "172.31.255.255",
++    "192.168.1.1",
++    "169.254.169.254",
++    "0.0.0.0",
++    "::1",
++    "fe80::1",
++    "fc00::1",
++    "metadata.google.internal",
++    "foo.local",
++    "foo.internal",
++  ]) {
++    assert.equal(isBlockedRemoteHost(host), true, host);
++    assert.throws(() => assertSafeRemoteUrl(`https://${host}/mcp`), McpServerError, host);
++  }
++  for (const host of ["mcp.example.com", "8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"]) {
++    assert.equal(isBlockedRemoteHost(host), false, host);
++    assert.equal(isPrivateIp(host), false, host);
++  }
++  // Public IPs stay reachable.
++  assert.equal(assertSafeRemoteUrl("https://mcp.example.com/mcp").hostname, "mcp.example.com");
++  // http is refused (headers would travel in the clear).
++  assert.throws(() => assertSafeRemoteUrl("http://mcp.example.com/mcp"), /https/);
++  // Embedded credentials are refused.
++  assert.throws(() => assertSafeRemoteUrl("https://user:pass@mcp.example.com/mcp"), /credentials/);
++});
++
++test("SSRF: DNS-resolved private addresses are blocked", () => {
++  assert.throws(() => assertPublicResolvedIps("mcp.example.com", ["93.184.216.34", "10.0.0.1"]), /private address 10\.0\.0\.1/);
++  assert.throws(() => assertPublicResolvedIps("mcp.example.com", ["::1"]), /private address ::1/);
++  assertPublicResolvedIps("mcp.example.com", ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]);
++});
++
++test("validateServerDraft catches transport mismatches", () => {
++  assert.deepEqual(validateServerDraft({ name: "x", description: "", transport: "stdio", source: "form" }), [
++    "A stdio server needs a command.",
++  ]);
++  assert.deepEqual(
++    validateServerDraft({ name: "x", description: "", transport: "streamable-http", url: "http://localhost/mcp", source: "url" }),
++    ["Remote MCP servers must use https (plain http would send headers in the clear)."],
++  );
++  assert.deepEqual(
++    validateServerDraft({ name: "x", description: "", transport: "stdio", command: "npx", source: "form" }),
++    [],
++  );
++});
++
++test("toClaudeMcpConfigEntry maps stdio and remote servers", () => {
++  const stdio: UserMcpServer = {
++    id: "fs",
++    name: "FS",
++    description: "",
++    transport: "stdio",
++    command: "npx",
++    args: ["-y", "x"],
++    env: { KEY: { value: "v", secret: true } },
++    enabled: true,
++    source: "form",
++    createdAt: new Date().toISOString(),
++    updatedAt: new Date().toISOString(),
++  };
++  assert.deepEqual(toClaudeMcpConfigEntry(stdio), {
++    type: "stdio",
++    command: "npx",
++    args: ["-y", "x"],
++    env: { KEY: "v" },
++  });
++  const remote: UserMcpServer = {
++    ...stdio,
++    id: "remote",
++    transport: "streamable-http",
++    command: undefined,
++    args: undefined,
++    env: undefined,
++    url: "https://mcp.example.com/mcp",
++    headers: { Authorization: { value: "Bearer t", secret: true } },
++  };
++  assert.deepEqual(toClaudeMcpConfigEntry(remote), {
++    type: "http",
++    url: "https://mcp.example.com/mcp",
++    headers: { Authorization: "Bearer t" },
++  });
++  const sse: UserMcpServer = { ...remote, transport: "sse", url: "https://mcp.example.com/sse" };
++  assert.equal((toClaudeMcpConfigEntry(sse) as { type: string }).type, "sse");
++});
++
++test("maskServerForClient never returns a secret value", () => {
++  const server: UserMcpServer = {
++    id: "fs",
++    name: "FS",
++    description: "",
++    transport: "stdio",
++    command: "npx",
++    env: {
++      API_KEY: { value: "sk-secret-value", secret: true },
++      ALLOWED_DIR: { value: "/workspace", secret: false },
++    },
++    enabled: true,
++    source: "paste",
++    createdAt: new Date().toISOString(),
++    updatedAt: new Date().toISOString(),
++  };
++  const row = maskServerForClient(server);
++  assert.equal(row.env.API_KEY, "••••••••");
++  assert.equal(row.env.ALLOWED_DIR, "/workspace");
++  assert.deepEqual(row.secretKeys, ["env:API_KEY"]);
++  assert.ok(!JSON.stringify(row).includes("sk-secret-value"));
++});
++
++test("normalizeUserMcpServer rejects junk, slugifyMcpServerId is stable", () => {
++  assert.equal(normalizeUserMcpServer(null), null);
++  assert.equal(normalizeUserMcpServer({ id: "x" }), null);
++  assert.equal(normalizeUserMcpServer({ id: "x", name: "X", transport: "weird" }), null);
++  assert.equal(slugifyMcpServerId("My Cool Server!"), "my-cool-server");
++  assert.equal(slugifyMcpServerId(""), "mcp-server");
++});
+diff --git a/apps/swarmagents/lib/mcp-servers.ts b/apps/swarmagents/lib/mcp-servers.ts
+new file mode 100644
+index 000000000..9f5a340c4
+--- /dev/null
++++ b/apps/swarmagents/lib/mcp-servers.ts
+@@ -0,0 +1,600 @@
++/**
++ * User-addable MCP servers (board task l4).
++ *
++ * Everything here is pure (no node:*, no fs): parse/validate the three ways a
++ * user adds a server (pasted claude_desktop_config / .mcp.json block, remote
++ * URL, form), detect env values that look like secrets, convert a stored
++ * server into a Claude Code --mcp-config entry, and guard remote URLs
++ * against SSRF (private / link-local / metadata addresses).
++ *
++ * Per-account storage lives in lib/mcp-servers-store.ts (same layout as the
++ * per-user provider and role stores); the secrets detected here are sealed
++ * there with the provider-key encryption (lib/providers/secret-box.ts).
++ *
++ * l1 note: the Library foundation (per-user extension store) is not on main
++ * yet, so this feature ships its own minimal per-user MCP server store
++ * following the existing provider-key patterns, instead of inventing an l1
++ * API. When l1 lands, the store can move under it without changing the
++ * parse/validate/probe code here.
++ */
++
++export const MCP_SERVERS_SCHEMA = "swarmagents.mcp-servers";
++export const MCP_SERVERS_VERSION = 1;
++
++export type McpTransport = "stdio" | "streamable-http" | "sse";
++
++/** One env/header value as stored: secrets are sealed, others are plain. */
++export interface McpEnvEntry {
++  value: string;
++  secret: boolean;
++}
++
++/** A user's MCP server as stored on the server (never sent to the client). */
++export interface UserMcpServer {
++  id: string;
++  name: string;
++  description: string;
++  transport: McpTransport;
++  /** stdio only. */
++  command?: string;
++  args?: string[];
++  /** stdio env. Values flagged secret are sealed in the store. */
++  env?: Record<string, McpEnvEntry>;
++  /** Remote only. */
++  url?: string;
++  /** Remote headers. Values flagged secret are sealed in the store. */
++  headers?: Record<string, McpEnvEntry>;
++  enabled: boolean;
++  source: "paste" | "url" | "form" | "registry";
++  /** Registry name (e.g. "io.github.foo/bar") for registry installs. */
++  registryId?: string;
++  createdAt: string;
++  updatedAt: string;
++}
++
++/** Client-safe row: secret values are never returned, only a mask. */
++export interface McpServerRow {
++  id: string;
++  name: string;
++  description: string;
++  transport: McpTransport;
++  command?: string;
++  args?: string[];
++  /** Non-secret values in full; secret values as "••••••••". */
++  env: Record<string, string>;
++  url?: string;
++  headers: Record<string, string>;
++  /** Names of the env/header keys that hold secrets. */
++  secretKeys: string[];
++  enabled: boolean;
++  source: UserMcpServer["source"];
++  registryId?: string;
++  createdAt: string;
++  updatedAt: string;
++}
++
++/** A parsed-but-unsaved server (paste / URL / form / registry install). */
++export interface McpServerDraft {
++  name: string;
++  description: string;
++  transport: McpTransport;
++  command?: string;
++  args?: string[];
++  env?: Record<string, McpEnvEntry>;
++  url?: string;
++  headers?: Record<string, McpEnvEntry>;
++  source: UserMcpServer["source"];
++  registryId?: string;
++}
++
++const MAX_SERVERS_PER_PASTE = 50;
++const MAX_NAME_LEN = 80;
++const MAX_DESCRIPTION_LEN = 280;
++const MAX_COMMAND_LEN = 256;
++const MAX_ARGS = 32;
++const MAX_ARG_LEN = 512;
++const MAX_ENV_KEYS = 32;
++const MAX_ENV_VALUE_LEN = 4096;
++const MAX_URL_LEN = 2048;
++
++const asRecord = (value: unknown): Record<string, unknown> | null =>
++  value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
++
++const asText = (value: unknown, max: number): string =>
++  typeof value === "string" ? value.trim().slice(0, max) : "";
++
++const asStringArray = (value: unknown): string[] | null => {
++  if (!Array.isArray(value)) return null;
++  if (value.some((item) => typeof item !== "string")) return null;
++  return value as string[];
++};
++
++/** A rejected server/URL (bad input, SSRF block, ...). */
++export class McpServerError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = "McpServerError";
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Ids
++// ---------------------------------------------------------------------------
++
++/** Turn a display name into a stable, URL-safe id. */
++export function slugifyMcpServerId(value: string): string {
++  const slug = value
++    .toLowerCase()
++    .normalize("NFKD")
++    .replace(/[\u0300-\u036f]/g, "")
++    .replace(/[^a-z0-9]+/g, "-")
++    .slice(0, 48)
++    .replace(/^-+|-+$/g, "");
++  return slug || "mcp-server";
++}
++
++/** A non-built-in id unique among `taken`, suffixed with -2, -3, … when needed. */
++export function uniqueMcpServerId(preferred: string, taken: Iterable<string>): string {
++  const used = new Set<string>(taken);
++  const base = slugifyMcpServerId(preferred);
++  if (!used.has(base)) return base;
++  for (let n = 2; ; n++) {
++    const candidate = `${base}-${n}`;
++    if (!used.has(candidate)) return candidate;
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Secret detection
++// ---------------------------------------------------------------------------
++
++const SECRET_NAME_RE =
++  /(api[_-]?key|apikey|token|secret|passwd|password|auth|bearer|private[_-]?key|client[_-]?secret|access[_-]?key|session[_-]?key)/i;
++
++const SECRET_VALUE_RES = [
++  /^sk-[A-Za-z0-9]{8,}/,
++  /^gh[opuasr]_[A-Za-z0-9]{8,}/,
++  /^github_pat_[A-Za-z0-9_]{8,}/,
++  /^AKIA[0-9A-Z]{16}$/,
++  /^xox[baprs]-[A-Za-z0-9-]{8,}/,
++  /^hf_[A-Za-z0-9]{8,}/,
++];
++
++/**
++ * Does this env/header value look like a secret? Name-based first (API_KEY,
++ * TOKEN, ...), then known token prefixes, then a long mixed-case+digit
++ * string with no spaces (high-entropy token). Over-flagging is safe: a
++ * flagged value is only encrypted at rest and masked in the UI.
++ */
++export function looksLikeSecret(name: string, value: string): boolean {
++  if (SECRET_NAME_RE.test(name)) return true;
++  if (SECRET_VALUE_RES.some((re) => re.test(value))) return true;
++  if (
++    value.length >= 24 &&
++    !/\s/.test(value) &&
++    /[a-z]/.test(value) &&
++    /[A-Z]/.test(value) &&
++    /[0-9]/.test(value)
++  ) {
++    return true;
++  }
++  return false;
++}
++
++/** Classify a plain env/header map, flagging secret-looking values. */
++export function classifyEnv(env: Record<string, string>): Record<string, McpEnvEntry> {
++  const out: Record<string, McpEnvEntry> = {};
++  for (const [key, value] of Object.entries(env)) {
++    if (!key) continue;
++    out[key] = { value, secret: looksLikeSecret(key, value) };
++  }
++  return out;
++}
++
++// ---------------------------------------------------------------------------
++// SSRF guard (literal checks; DNS resolution is checked by the caller)
++// ---------------------------------------------------------------------------
++
++function isPrivateIpv4(host: string): boolean {
++  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
++  if (!m) return false;
++  const [a, b] = m.slice(1).map(Number);
++  if (m.slice(1).some((part) => Number(part) > 255)) return false;
++  if (a === 10) return true; // RFC1918
++  if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
++  if (a === 192 && b === 168) return true; // RFC1918
++  if (a === 127) return true; // loopback
++  if (a === 169 && b === 254) return true; // link-local (incl. 169.254.169.254 metadata)
++  if (a === 0) return true; // "this network"
++  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
++  if (a === 192 && b === 0) return true; // 192.0.0.0/24 (IETF assignments) + TEST-NET-1 192.0.2.0/24
++  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
++  if (a === 198 && b === 51 && m[3] === "100") return true; // TEST-NET-2
++  if (a === 203 && b === 0 && m[3] === "113") return true; // TEST-NET-3
++  if (a >= 224) return true; // multicast + reserved
++  return false;
++}
++
++function isPrivateIpv6(host: string): boolean {
++  if (!host.includes(":")) return false;
++  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
++  if (h === "::1" || h === "::") return true; // loopback / unspecified
++  if (h.startsWith("fe8") || h.startsWith("fe9") || h.startsWith("fea") || h.startsWith("feb")) return true; // fe80::/10 link-local
++  if (h.startsWith("fc") || h.startsWith("fd")) return true; // fc00::/7 unique-local
++  if (h.startsWith("ff")) return true; // multicast
++  if (h.startsWith("2001:db8")) return true; // documentation
++  if (h.startsWith("::ffff:")) return isPrivateIpv4(h.slice("::ffff:".length)); // v4-mapped
++  return false;
++}
++
++/** True when `host` is an IP literal in a private/reserved range. */
++export function isPrivateIp(host: string): boolean {
++  return isPrivateIpv4(host) || isPrivateIpv6(host);
++}
++
++/** True when a hostname is blocked outright (loopback names, mDNS, internal). */
++export function isBlockedRemoteHost(host: string): boolean {
++  const h = host.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
++  if (h === "localhost" || h.endsWith(".localhost")) return true;
++  if (h.endsWith(".local") || h.endsWith(".internal") || h.endsWith(".lan") || h.endsWith(".home.arpa")) return true;
++  if (h === "metadata.google.internal" || h === "metadata") return true;
++  if (isPrivateIp(h)) return true;
++  return false;
++}
++
++/**
++ * Validate a remote MCP server URL. Only https, no embedded credentials, no
++ * blocked host. Throws McpServerError. DNS-resolved addresses must be
++ * checked separately with assertPublicResolvedIps (the route does that
++ * before handing the URL to the VM probe).
++ */
++export function assertSafeRemoteUrl(rawUrl: string): URL {
++  const trimmed = rawUrl.trim();
++  if (!trimmed || trimmed.length > MAX_URL_LEN) throw new McpServerError("Enter a remote MCP server URL.");
++  let url: URL;
++  try {
++    url = new URL(trimmed);
++  } catch {
++    throw new McpServerError("That is not a valid URL.");
++  }
++  if (url.protocol !== "https:") {
++    throw new McpServerError("Remote MCP servers must use https (plain http would send headers in the clear).");
++  }
++  if (url.username || url.password) throw new McpServerError("URLs with embedded credentials are not allowed.");
++  if (isBlockedRemoteHost(url.hostname)) {
++    throw new McpServerError(`Remote MCP servers cannot point at ${url.hostname} (private or internal address).`);
++  }
++  return url;
++}
++
++/** Throw when any DNS-resolved address for a remote URL is private. */
++export function assertPublicResolvedIps(host: string, ips: readonly string[]): void {
++  for (const ip of ips) {
++    if (isPrivateIp(ip)) {
++      throw new McpServerError(
++        `Remote MCP servers cannot point at ${host} (it resolves to private address ${ip}).`,
++      );
++    }
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Parsing pasted config / form / URL
++// ---------------------------------------------------------------------------
++
++function parseEnvMap(raw: unknown, errors: string[], label: string): Record<string, McpEnvEntry> {
++  const record = asRecord(raw);
++  if (!record) {
++    if (raw !== undefined) errors.push(`${label}: env must be an object of string values.`);
++    return {};
++  }
++  const entries = Object.entries(record).slice(0, MAX_ENV_KEYS);
++  if (Object.keys(record).length > MAX_ENV_KEYS) {
++    errors.push(`${label}: only the first ${MAX_ENV_KEYS} env entries were kept.`);
++  }
++  const out: Record<string, McpEnvEntry> = {};
++  for (const [key, value] of entries) {
++    if (typeof value !== "string") {
++      errors.push(`${label}: env "${key}" must be a string.`);
++      continue;
++    }
++    out[key] = { value: value.slice(0, MAX_ENV_VALUE_LEN), secret: looksLikeSecret(key, value) };
++  }
++  return out;
++}
++
++function parseOneServerEntry(
++  key: string,
++  raw: unknown,
++  errors: string[],
++): McpServerDraft | null {
++  const entry = asRecord(raw);
++  if (!entry) {
++    errors.push(`"${key}": expected an object with a command or a url.`);
++    return null;
++  }
++  const name = asText(entry.name, MAX_NAME_LEN) || key;
++  const description = asText(entry.description, MAX_DESCRIPTION_LEN);
++  const type = typeof entry.type === "string" ? entry.type.trim().toLowerCase() : "";
++
++  // Remote: {url, headers} (+ optional type "sse" / "streamable-http" / "http").
++  if (typeof entry.url === "string") {
++    let transport: McpTransport = "streamable-http";
++    if (type === "sse") transport = "sse";
++    else if (type === "streamable-http" || type === "http" || type === "") transport = "streamable-http";
++    else {
++      errors.push(`"${key}": unknown transport type "${type}".`);
++      return null;
++    }
++    try {
++      assertSafeRemoteUrl(entry.url);
++    } catch (err) {
++      errors.push(`"${key}": ${err instanceof Error ? err.message : String(err)}`);
++      return null;
++    }
++    return {
++      name,
++      description,
++      transport,
++      url: entry.url.trim(),
++      headers: parseEnvMap(entry.headers, errors, `"${key}"`),
++      source: "paste",
++    };
++  }
++
++  // stdio: {command, args, env}.
++  if (typeof entry.command === "string") {
++    const command = entry.command.trim().slice(0, MAX_COMMAND_LEN);
++    if (!command || command.includes("\0")) {
++      errors.push(`"${key}": command must be a non-empty program name or path.`);
++      return null;
++    }
++    const args = asStringArray(entry.args) ?? [];
++    if (entry.args !== undefined && asStringArray(entry.args) === null) {
++      errors.push(`"${key}": args must be an array of strings.`);
++      return null;
++    }
++    if (args.length > MAX_ARGS) errors.push(`"${key}": only the first ${MAX_ARGS} args were kept.`);
++    return {
++      name,
++      description,
++      transport: "stdio",
++      command,
++      args: args.slice(0, MAX_ARGS).map((arg) => arg.slice(0, MAX_ARG_LEN)),
++      env: parseEnvMap(entry.env, errors, `"${key}"`),
++      source: "paste",
++    };
++  }
++
++  errors.push(`"${key}": needs a "command" (stdio) or a "url" (remote) — neither was found.`);
++  return null;
++}
++
++export interface ParseMcpConfigResult {
++  servers: McpServerDraft[];
++  errors: string[];
++}
++
++/**
++ * Parse a pasted claude_desktop_config / .mcp.json style block.
++ *
++ * Accepts `{mcpServers: {...}}`, a bare `{name: {...}}` map, or a single
++ * server object. Each entry becomes one draft (a multi-server paste creates
++ * multiple entries). Returns the drafts plus per-entry errors; unusable
++ * entries are skipped, not fatal.
++ */
++export function parseMcpConfigJson(text: string): ParseMcpConfigResult {
++  const errors: string[] = [];
++  let data: unknown;
++  try {
++    data = JSON.parse(text);
++  } catch {
++    return { servers: [], errors: ["That is not valid JSON."] };
++  }
++  const root = asRecord(data);
++  if (!root) return { servers: [], errors: ["Expected a JSON object (a config block or a map of servers)."] };
++
++  let entries: Record<string, unknown>;
++  if (asRecord(root.mcpServers)) {
++    entries = root.mcpServers as Record<string, unknown>;
++  } else if (asRecord(root.servers)) {
++    entries = root.servers as Record<string, unknown>;
++  } else if (typeof root.command === "string" || typeof root.url === "string") {
++    // A single server object pasted on its own.
++    entries = { [asText(root.name, MAX_NAME_LEN) || "server"]: root };
++  } else {
++    // A bare map of servers: every value must look like a server entry.
++    const values = Object.values(root);
++    if (values.length > 0 && values.every((v) => asRecord(v) !== null)) {
++      entries = root as Record<string, unknown>;
++    } else {
++      return { servers: [], errors: ["Expected a \"mcpServers\" object (or a map of server entries)."] };
++    }
++  }
++
++  const keys = Object.keys(entries);
++  if (keys.length === 0) return { servers: [], errors: ["No servers found in that config."] };
++  if (keys.length > MAX_SERVERS_PER_PASTE) {
++    errors.push(`Only the first ${MAX_SERVERS_PER_PASTE} servers were read.`);
++  }
++  const servers: McpServerDraft[] = [];
++  for (const key of keys.slice(0, MAX_SERVERS_PER_PASTE)) {
++    const draft = parseOneServerEntry(key, entries[key], errors);
++    if (draft) servers.push(draft);
++  }
++  return { servers, errors };
++}
++
++/** Draft for a remote URL entered directly (plus optional headers). */
++export function draftFromRemoteUrl(
++  rawUrl: string,
++  name: string | undefined,
++  headers: Record<string, string> | undefined,
++): McpServerDraft {
++  const url = assertSafeRemoteUrl(rawUrl);
++  return {
++    name: asText(name, MAX_NAME_LEN) || url.hostname,
++    description: "",
++    transport: "streamable-http",
++    url: url.toString(),
++    headers: classifyEnv(headers ?? {}),
++    source: "url",
++  };
++}
++
++/** Draft for the manual form (command / args / env). */
++export function draftFromForm(input: {
++  name: string;
++  command: string;
++  args?: string[];
++  env?: Record<string, string>;
++  description?: string;
++}): McpServerDraft {
++  const name = asText(input.name, MAX_NAME_LEN);
++  if (!name) throw new McpServerError("Give the server a name.");
++  const command = (input.command ?? "").trim().slice(0, MAX_COMMAND_LEN);
++  if (!command || command.includes("\0")) throw new McpServerError("Enter the command that starts the server (e.g. npx).");
++  const args = (input.args ?? []).filter((arg) => arg.trim() !== "").slice(0, MAX_ARGS);
++  return {
++    name,
++    description: asText(input.description, MAX_DESCRIPTION_LEN),
++    transport: "stdio",
++    command,
++    args,
++    env: classifyEnv(input.env ?? {}),
++    source: "form",
++  };
++}
++
++/** Validate a draft before it is stored. Returns error strings (empty = ok). */
++export function validateServerDraft(draft: McpServerDraft): string[] {
++  const errors: string[] = [];
++  if (!draft.name.trim()) errors.push("A server needs a name.");
++  if (draft.transport === "stdio") {
++    if (!draft.command?.trim()) errors.push("A stdio server needs a command.");
++    if (draft.url) errors.push("A stdio server must not have a url.");
++  } else {
++    if (!draft.url) errors.push("A remote server needs a url.");
++    else {
++      try {
++        assertSafeRemoteUrl(draft.url);
++      } catch (err) {
++        errors.push(err instanceof Error ? err.message : String(err));
++      }
++    }
++    if (draft.command) errors.push("A remote server must not have a command.");
++  }
++  return errors;
++}
++
++// ---------------------------------------------------------------------------
++// Normalisation / client shape / run wiring
++// ---------------------------------------------------------------------------
++
++/** Defensive parse of a stored server record (malformed -> null). */
++export function normalizeUserMcpServer(raw: unknown): UserMcpServer | null {
++  const r = asRecord(raw);
++  if (!r) return null;
++  const id = asText(r.id, 64);
++  const name = asText(r.name, MAX_NAME_LEN);
++  if (!id || !name) return null;
++  const transport = r.transport;
++  if (transport !== "stdio" && transport !== "streamable-http" && transport !== "sse") return null;
++  const env = asRecord(r.env);
++  const headers = asRecord(r.headers);
++  const parseEnv = (rec: Record<string, unknown> | null): Record<string, McpEnvEntry> | undefined => {
++    if (!rec) return undefined;
++    const out: Record<string, McpEnvEntry> = {};
++    for (const [key, value] of Object.entries(rec)) {
++      const v = asRecord(value);
++      if (v && typeof v.value === "string") out[key] = { value: v.value, secret: v.secret === true };
++    }
++    return out;
++  };
++  const source = r.source;
++  return {
++    id,
++    name,
++    description: asText(r.description, MAX_DESCRIPTION_LEN),
++    transport,
++    ...(typeof r.command === "string" ? { command: r.command.slice(0, MAX_COMMAND_LEN) } : {}),
++    ...(Array.isArray(r.args) ? { args: (r.args as unknown[]).filter((a) => typeof a === "string") as string[] } : {}),
++    ...(parseEnv(env) ? { env: parseEnv(env) } : {}),
++    ...(typeof r.url === "string" ? { url: r.url.slice(0, MAX_URL_LEN) } : {}),
++    ...(parseEnv(headers) ? { headers: parseEnv(headers) } : {}),
++    enabled: r.enabled !== false,
++    source: source === "paste" || source === "url" || source === "form" || source === "registry" ? source : "paste",
++    ...(typeof r.registryId === "string" ? { registryId: r.registryId.slice(0, 200) } : {}),
++    createdAt: typeof r.createdAt === "string" ? r.createdAt : new Date(0).toISOString(),
++    updatedAt: typeof r.updatedAt === "string" ? r.updatedAt : new Date(0).toISOString(),
++  };
++}
++
++const MASK = "••••••••";
++
++/** Client-safe row: secret env/header values are masked, never returned. */
++export function maskServerForClient(server: UserMcpServer): McpServerRow {
++  const env: Record<string, string> = {};
++  const headers: Record<string, string> = {};
++  const secretKeys: string[] = [];
++  for (const [key, entry] of Object.entries(server.env ?? {})) {
++    if (entry.secret) {
++      env[key] = MASK;
++      secretKeys.push(`env:${key}`);
++    } else {
++      env[key] = entry.value;
++    }
++  }
++  for (const [key, entry] of Object.entries(server.headers ?? {})) {
++    if (entry.secret) {
++      headers[key] = MASK;
++      secretKeys.push(`header:${key}`);
++    } else {
++      headers[key] = entry.value;
++    }
++  }
++  return {
++    id: server.id,
++    name: server.name,
++    description: server.description,
++    transport: server.transport,
++    ...(server.command ? { command: server.command } : {}),
++    ...(server.args ? { args: [...server.args] } : {}),
++    env,
++    ...(server.url ? { url: server.url } : {}),
++    headers,
++    secretKeys,
++    enabled: server.enabled,
++    source: server.source,
++    ...(server.registryId ? { registryId: server.registryId } : {}),
++    createdAt: server.createdAt,
++    updatedAt: server.updatedAt,
++  };
++}
++
++/** Plain env map for server-side use (probe / run wiring). */
++export function plainEnv(env: Record<string, McpEnvEntry> | undefined): Record<string, string> {
++  const out: Record<string, string> = {};
++  for (const [key, entry] of Object.entries(env ?? {})) out[key] = entry.value;
++  return out;
++}
++
++/**
++ * The Claude Code --mcp-config entry for a stored server (decrypted env).
++ * stdio -> {type: "stdio", command, args, env}; remote -> {type: "http"|"sse", url, headers}.
++ */
++export function toClaudeMcpConfigEntry(server: UserMcpServer): Record<string, unknown> {
++  if (server.transport === "stdio") {
++    return {
++      type: "stdio",
++      command: server.command ?? "",
++      ...(server.args?.length ? { args: server.args } : {}),
++      ...(server.env && Object.keys(server.env).length > 0 ? { env: plainEnv(server.env) } : {}),
++    };
++  }
++  return {
++    type: server.transport === "sse" ? "sse" : "http",
++    url: server.url ?? "",
++    ...(server.headers && Object.keys(server.headers).length > 0 ? { headers: plainEnv(server.headers) } : {}),
++  };
++}
+diff --git a/apps/swarmagents/lib/providers/secret-box.ts b/apps/swarmagents/lib/providers/secret-box.ts
+index bf9307005..72b57fac4 100644
+--- a/apps/swarmagents/lib/providers/secret-box.ts
++++ b/apps/swarmagents/lib/providers/secret-box.ts
+@@ -38,7 +38,7 @@ export class SecretBoxError extends Error {
+   }
+ }
+ 
+-interface SecretBoxOptions {
++export interface SecretBoxOptions {
+   env?: Record<string, string | undefined>;
+   /** Directory for the last-resort key file (key id "f"). */
+   dataDir?: string;
+diff --git a/apps/swarmagents/lib/runtime/manager.ts b/apps/swarmagents/lib/runtime/manager.ts
+index 587c98b5a..ceb192d14 100644
+--- a/apps/swarmagents/lib/runtime/manager.ts
++++ b/apps/swarmagents/lib/runtime/manager.ts
+@@ -56,6 +56,7 @@ import {
+   type RoleDefinition,
+ } from "../roles";
+ import { userRoleCatalog } from "../roles-store";
++import { readUserMcpServers, userMcpRunEntries } from "../mcp-servers-store";
+ import {
+   MAX_ROLE_PHASES,
+   ROLE_MCP_CONFIG_PATH,
+@@ -64,6 +65,7 @@ import {
+   roleMcpConfigJson,
+   rolePhase,
+   roleSeedFiles,
++  type UserMcpServerEntry,
+ } from "../harness/role-mcp";
+ 
+ /**
+@@ -524,15 +526,35 @@ export class RuntimeManager {
+     return normalizeRoleDefinition(role) ?? role;
+   }
+ 
++  /**
++   * The user's enabled MCP servers, resolved to --mcp-config entries. A
++   * corrupt store or undecryptable secret degrades to fewer entries, never a
++   * failed run — the run simply wires what could be read.
++   */
++  private userMcpEntries(userId: string): UserMcpServerEntry[] {
++    try {
++      return userMcpRunEntries(userId);
++    } catch (error) {
++      console.error(`[swarm-runtime] ignoring unreadable MCP servers for ${userId}: ${String(error)}`);
++      return [];
++    }
++  }
++
+   /** The harness phase (argv config) for a role. */
+-  private rolePhaseFor(role: RoleDefinition): RolePhase {
+-    return rolePhase(role, { desktopMode: desktopModeEnabled() });
++  private rolePhaseFor(userId: string, role: RoleDefinition): RolePhase {
++    let userMcpServerIds: ReadonlySet<string> | undefined;
++    try {
++      userMcpServerIds = new Set(readUserMcpServers(userId).map((server) => server.id));
++    } catch {
++      userMcpServerIds = undefined;
++    }
++    return rolePhase(role, { desktopMode: desktopModeEnabled(), userMcpServerIds });
+   }
+ 
+   /** The harness phase for the default Main Agent role (used when no role is set). */
+-  private defaultRolePhase(): RolePhase {
++  private defaultRolePhase(userId?: string): RolePhase {
+     const main = BUILTIN_ROLES.find((role) => role.id === DEFAULT_ROLE_ID) ?? BUILTIN_ROLES[0];
+-    return this.rolePhaseFor(main);
++    return userId ? this.rolePhaseFor(userId, main) : rolePhase(main, { desktopMode: desktopModeEnabled() });
+   }
+ 
+   /**
+@@ -546,7 +568,10 @@ export class RuntimeManager {
+     allowedRoleIds: ReadonlySet<string>,
+     initialPhase: RolePhase,
+   ): Promise<void> {
+-    for (const file of roleSeedFiles(catalog, allowedRoleIds, initialPhase, { desktopMode: desktopModeEnabled() })) {
++    for (const file of roleSeedFiles(catalog, allowedRoleIds, initialPhase, {
++      desktopMode: desktopModeEnabled(),
++      userMcpServers: this.userMcpEntries(userId),
++    })) {
+       await this.vm.writeFile(userId, file.path, file.content);
+     }
+   }
+@@ -560,10 +585,11 @@ export class RuntimeManager {
+     await this.vm.writeFile(
+       userId,
+       ROLE_MCP_CONFIG_PATH,
+-      roleMcpConfigJson(this.rolePhaseFor(role), {
++      roleMcpConfigJson(this.rolePhaseFor(userId, role), {
+         allowedRoleIds,
+         roleDef: role,
+         desktopMode: desktopModeEnabled(),
++        userMcpServers: this.userMcpEntries(userId),
+       }),
+     );
+   }
+@@ -1113,7 +1139,7 @@ export class RuntimeManager {
+     const catalog = userRoleCatalog(userId);
+     const allowedRoleIds = defaultAllowedRoleIds(catalog);
+     const initialRole = active.role;
+-    const initialPhase = initialRole ? this.rolePhaseFor(initialRole) : this.defaultRolePhase();
++    const initialPhase = initialRole ? this.rolePhaseFor(userId, initialRole) : this.defaultRolePhase(userId);
+     try {
+       await this.seedRoleFiles(userId, catalog, allowedRoleIds, initialPhase);
+     } catch (error) {
+@@ -1179,7 +1205,7 @@ export class RuntimeManager {
+     // VM ever holds. It expires when the run finalizes (revoked in finalize).
+     const runToken = llmBaseUrl ? signRunToken(userId, runId) : null;
+ 
+-    const phase = role ? this.rolePhaseFor(role) : null;
++    const phase = role ? this.rolePhaseFor(active.userId, role) : null;
+ 
+     while (true) {
+       const selection = router
+@@ -1381,12 +1407,12 @@ export class RuntimeManager {
+           cwd: "/workspace",
+           redactSecrets: selection?.secrets,
+           approvalGateway,
+-          rolePhase: phase ?? this.defaultRolePhase(),
++          rolePhase: phase ?? this.defaultRolePhase(active.userId),
+           onRoleSwitch: async (request) => {
+             const catalog = userRoleCatalog(userId);
+             const decision = resolveRoleSwitch(catalog, defaultAllowedRoleIds(catalog), request.toRoleId);
+             if (!decision.ok) return null;
+-            return this.rolePhaseFor(decision.role);
++            return this.rolePhaseFor(userId, decision.role);
+           },
+         },
+         onAttemptEvent,
+diff --git a/apps/swarmagents/minimalist-ui/src/components/McpServers.tsx b/apps/swarmagents/minimalist-ui/src/components/McpServers.tsx
+new file mode 100644
+index 000000000..2c0f08fd0
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/McpServers.tsx
+@@ -0,0 +1,706 @@
++import { useEffect, useState } from 'react';
++import {
++  Check, ChevronDown, Eye, Globe, Loader2, PlugZap, Plus, Search, Server, Terminal, Trash2, Zap,
++} from 'lucide-react';
++
++/**
++ * MCP tab (Settings → MCP): the user's own MCP servers.
++ *
++ * Servers run inside the user's VM, never on the host, and secrets are
++ * encrypted at rest and never returned to the client — the API only ever
++ * sends masked values ("••••••••"). Add via pasted config / remote URL /
++ * form, browse the official registry, and test the connection (the probe
++ * runs in the VM and reports the tools/resources/prompts it finds).
++ */
++
++interface McpServerRow {
++  id: string;
++  name: string;
++  description: string;
++  transport: 'stdio' | 'streamable-http' | 'sse';
++  command?: string;
++  args?: string[];
++  env: Record<string, string>;
++  url?: string;
++  headers: Record<string, string>;
++  secretKeys: string[];
++  enabled: boolean;
++  source: string;
++  registryId?: string;
++}
++
++interface McpPreview {
++  name: string;
++  description: string;
++  transport: 'stdio' | 'streamable-http' | 'sse';
++  command?: string;
++  args?: string[];
++  url?: string;
++  env: Record<string, string>;
++  headers: Record<string, string>;
++  secretKeys: string[];
++  source: string;
++  registryId?: string;
++}
++
++interface RegistryEnvVar {
++  name: string;
++  description: string;
++  required: boolean;
++  secret: boolean;
++  defaultValue: string;
++}
++
++interface RegistryEntry {
++  id: string;
++  name: string;
++  title: string;
++  description: string;
++  version: string;
++  homepage: string;
++  transport: 'stdio' | 'streamable-http' | 'sse';
++  command?: string;
++  args?: string[];
++  url?: string;
++  envVars: RegistryEnvVar[];
++}
++
++interface ProbeResult {
++  ok: boolean;
++  tools: { name: string; description: string }[];
++  resources: { name: string; description: string }[];
++  prompts: { name: string; description: string }[];
++  ms: number;
++  error?: string;
++  stderrTail?: string;
++}
++
++type AddMode = 'paste' | 'url' | 'form';
++
++async function api(path: string, init?: RequestInit): Promise<{ ok: boolean; body: Record<string, unknown> }> {
++  const res = await fetch(path, { headers: { Accept: 'application/json', ...(init?.headers ?? {}) }, ...init });
++  let body: Record<string, unknown> = {};
++  try {
++    body = (await res.json()) as Record<string, unknown>;
++  } catch {
++    // Non-JSON error page: keep the status text.
++  }
++  return { ok: res.ok, body };
++}
++
++/** Parse "KEY=value" lines into a map (blank lines and #-comments skipped). */
++function parseKeyValueLines(text: string): Record<string, string> {
++  const out: Record<string, string> = {};
++  for (const line of text.split('\n')) {
++    const trimmed = line.trim();
++    if (!trimmed || trimmed.startsWith('#')) continue;
++    const eq = trimmed.indexOf('=');
++    if (eq <= 0) continue;
++    out[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
++  }
++  return out;
++}
++
++export function McpServers() {
++  const [servers, setServers] = useState<McpServerRow[] | null>(null);
++  const [loadError, setLoadError] = useState<string | null>(null);
++  const [mode, setMode] = useState<AddMode>('paste');
++  const [paste, setPaste] = useState('');
++  const [url, setUrl] = useState('');
++  const [urlName, setUrlName] = useState('');
++  const [urlHeaders, setUrlHeaders] = useState('');
++  const [formName, setFormName] = useState('');
++  const [formCommand, setFormCommand] = useState('');
++  const [formArgs, setFormArgs] = useState('');
++  const [formEnv, setFormEnv] = useState('');
++  const [preview, setPreview] = useState<McpPreview[] | null>(null);
++  const [previewErrors, setPreviewErrors] = useState<string[]>([]);
++  const [previewPayload, setPreviewPayload] = useState<Record<string, unknown> | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [notice, setNotice] = useState<string | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [expanded, setExpanded] = useState<string | null>(null);
++  const [tests, setTests] = useState<Record<string, ProbeResult | { busy: true }>>({});
++  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
++
++  // Registry browse.
++  const [query, setQuery] = useState('');
++  const [registry, setRegistry] = useState<RegistryEntry[] | null>(null);
++  const [registryBusy, setRegistryBusy] = useState(false);
++  const [registryError, setRegistryError] = useState<string | null>(null);
++  const [installing, setInstalling] = useState<RegistryEntry | null>(null);
++  const [installEnv, setInstallEnv] = useState<Record<string, string>>({});
++
++  const load = async () => {
++    const { ok, body } = await api('/api/mcp-servers');
++    if (ok && Array.isArray(body.servers)) {
++      setServers(body.servers as McpServerRow[]);
++      setLoadError(null);
++    } else {
++      setLoadError(typeof body.error === 'string' ? body.error : 'Could not load your MCP servers.');
++    }
++  };
++
++  useEffect(() => {
++    void load();
++  }, []);
++
++  const resetAdd = () => {
++    setPreview(null);
++    setPreviewErrors([]);
++    setPreviewPayload(null);
++  };
++
++  const runPreview = async () => {
++    setError(null);
++    setNotice(null);
++    let payload: Record<string, unknown>;
++    if (mode === 'paste') {
++      if (!paste.trim()) return setError('Paste a config block first.');
++      payload = { paste, preview: true };
++    } else if (mode === 'url') {
++      if (!url.trim()) return setError('Enter a remote server URL first.');
++      payload = { url: url.trim(), name: urlName.trim() || undefined, headers: parseKeyValueLines(urlHeaders), preview: true };
++    } else {
++      if (!formName.trim() || !formCommand.trim()) return setError('The form needs a name and a command.');
++      payload = {
++        form: {
++          name: formName.trim(),
++          command: formCommand.trim(),
++          args: formArgs.split(/\s+/).filter(Boolean),
++          env: parseKeyValueLines(formEnv),
++        },
++        preview: true,
++      };
++    }
++    setBusy(true);
++    const { ok, body } = await api('/api/mcp-servers', {
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify(payload),
++    });
++    setBusy(false);
++    if (!ok) {
++      setError(typeof body.error === 'string' ? body.error : 'Could not parse that config.');
++      setPreview(null);
++      setPreviewPayload(null);
++      return;
++    }
++    setPreview(Array.isArray(body.preview) ? (body.preview as McpPreview[]) : []);
++    setPreviewErrors(Array.isArray(body.errors) ? (body.errors as string[]) : []);
++    setPreviewPayload(payload);
++  };
++
++  const confirmAdd = async () => {
++    if (!previewPayload) return;
++    setBusy(true);
++    const { ok, body } = await api('/api/mcp-servers', {
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify({ ...previewPayload, preview: false }),
++    });
++    setBusy(false);
++    if (!ok) {
++      setError(typeof body.error === 'string' ? body.error : 'Could not save the server.');
++      return;
++    }
++    const created = Array.isArray(body.created) ? body.created.length : 0;
++    setNotice(created === 1 ? 'Server added.' : `${created} servers added.`);
++    resetAdd();
++    setPaste('');
++    setUrl('');
++    setUrlName('');
++    setUrlHeaders('');
++    setFormName('');
++    setFormCommand('');
++    setFormArgs('');
++    setFormEnv('');
++    void load();
++  };
++
++  const toggleEnabled = async (server: McpServerRow) => {
++    const { ok, body } = await api(`/api/mcp-servers/${encodeURIComponent(server.id)}`, {
++      method: 'PATCH',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify({ enabled: !server.enabled }),
++    });
++    if (!ok) {
++      setError(typeof body.error === 'string' ? body.error : 'Could not update the server.');
++      return;
++    }
++    setServers((list) => (list ?? []).map((s) => (s.id === server.id ? { ...s, enabled: !server.enabled } : s)));
++  };
++
++  const removeServer = async (server: McpServerRow) => {
++    const { ok, body } = await api(`/api/mcp-servers/${encodeURIComponent(server.id)}`, { method: 'DELETE' });
++    if (!ok) {
++      setError(typeof body.error === 'string' ? body.error : 'Could not delete the server.');
++      return;
++    }
++    setConfirmDelete(null);
++    setServers((list) => (list ?? []).filter((s) => s.id !== server.id));
++  };
++
++  const testServer = async (server: McpServerRow) => {
++    setTests((t) => ({ ...t, [server.id]: { busy: true } }));
++    const { ok, body } = await api(`/api/mcp-servers/${encodeURIComponent(server.id)}/test`, { method: 'POST' });
++    if (!ok && typeof body.error === 'string' && !('tools' in body)) {
++      setTests((t) => ({
++        ...t,
++        [server.id]: { ok: false, tools: [], resources: [], prompts: [], ms: 0, error: body.error as string },
++      }));
++      return;
++    }
++    setTests((t) => ({ ...t, [server.id]: body as unknown as ProbeResult }));
++  };
++
++  const searchRegistry = async () => {
++    setRegistryBusy(true);
++    setRegistryError(null);
++    const { ok, body } = await api(`/api/mcp-servers/registry?q=${encodeURIComponent(query.trim())}&limit=20`);
++    setRegistryBusy(false);
++    if (!ok) {
++      setRegistryError(typeof body.error === 'string' ? body.error : 'Registry search failed.');
++      setRegistry(null);
++      return;
++    }
++    setRegistry(Array.isArray(body.servers) ? (body.servers as RegistryEntry[]) : []);
++  };
++
++  const startInstall = (entry: RegistryEntry) => {
++    setInstalling(entry);
++    setInstallEnv(Object.fromEntries(entry.envVars.map((v) => [v.name, v.defaultValue])));
++  };
++
++  const confirmInstall = async () => {
++    if (!installing) return;
++    const missing = installing.envVars.filter((v) => v.required && !(installEnv[v.name] ?? '').trim());
++    if (missing.length > 0) {
++      setError(`Fill in the required value${missing.length === 1 ? '' : 's'}: ${missing.map((v) => v.name).join(', ')}.`);
++      return;
++    }
++    setBusy(true);
++    const { ok, body } = await api('/api/mcp-servers', {
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify({ registry: installing, env: installEnv }),
++    });
++    setBusy(false);
++    if (!ok) {
++      setError(typeof body.error === 'string' ? body.error : 'Could not install that server.');
++      return;
++    }
++    setInstalling(null);
++    setNotice(`Installed ${installing.name}.`);
++    void load();
++  };
++
++  const transportLabel = (t: McpServerRow['transport']) =>
++    t === 'stdio' ? 'stdio' : t === 'sse' ? 'SSE' : 'streamable HTTP';
++
++  return (
++    <div className="space-y-6">
++      <p className="text-[11px] leading-relaxed text-white/40">
++        MCP servers run inside your VM, never on the host. Secrets in env or headers are encrypted at rest and never
++        shown back — values that look like keys are stored encrypted automatically. Roles can only use servers you
++        allow them to: add a server id to a role&apos;s MCP list to wire it into runs.
++      </p>
++
++      {notice && <div className="rounded-xl bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300 ring-1 ring-emerald-500/30">{notice}</div>}
++      {error && <div className="rounded-xl bg-red-500/10 px-3 py-2 text-xs text-red-300 ring-1 ring-red-500/30">{error}</div>}
++
++      {/* Your servers */}
++      <section>
++        <Label>Your MCP servers</Label>
++        {loadError && <div className="rounded-2xl border border-dashed border-white/10 p-4 text-xs text-white/40">{loadError}</div>}
++        {servers !== null && servers.length === 0 && (
++          <div className="rounded-2xl border border-dashed border-white/10 p-6 text-center text-xs text-white/40">
++            No MCP servers yet — paste a config below or browse the registry.
++          </div>
++        )}
++        <div className="space-y-2">
++          {(servers ?? []).map((server) => {
++            const test = tests[server.id];
++            const open = expanded === server.id;
++            return (
++              <div key={server.id} className="overflow-hidden rounded-2xl bg-white/[0.04] ring-1 ring-white/10">
++                <div className="flex items-center gap-3 px-4 py-3">
++                  <span className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-white/[0.06] text-white/60">
++                    {server.transport === 'stdio' ? <Terminal className="h-3.5 w-3.5" /> : <Globe className="h-3.5 w-3.5" />}
++                  </span>
++                  <button onClick={() => setExpanded(open ? null : server.id)} className="min-w-0 flex-1 text-left">
++                    <div className="truncate text-sm text-white/90">{server.name}</div>
++                    <div className="truncate font-mono text-[10px] text-white/35">
++                      {transportLabel(server.transport)}
++                      {server.transport === 'stdio' ? ` · ${server.command ?? ''} ${(server.args ?? []).join(' ')}`.trimEnd() : ` · ${server.url ?? ''}`}
++                      {server.secretKeys.length > 0 && ` · ${server.secretKeys.length} secret${server.secretKeys.length === 1 ? '' : 's'} encrypted`}
++                    </div>
++                  </button>
++                  <Toggle on={server.enabled} onChange={() => void toggleEnabled(server)} />
++                  <button onClick={() => setExpanded(open ? null : server.id)} className="p-1 text-white/40 hover:text-white">
++                    <ChevronDown className={`h-4 w-4 transition ${open ? 'rotate-180' : ''}`} />
++                  </button>
++                </div>
++                {open && (
++                  <div className="space-y-3 border-t border-white/5 px-4 py-4">
++                    {server.description && <p className="text-[11px] leading-relaxed text-white/50">{server.description}</p>}
++                    <div className="font-mono text-[10px] leading-relaxed text-white/35">
++                      {server.transport === 'stdio' ? (
++                        <>
++                          <div>command: {server.command}</div>
++                          {(server.args ?? []).length > 0 && <div>args: {server.args!.join(' ')}</div>}
++                        </>
++                      ) : (
++                        <div>url: {server.url}</div>
++                      )}
++                      {Object.entries(server.env).map(([k, v]) => (
++                        <div key={`env-${k}`}>{k}={v}</div>
++                      ))}
++                      {Object.entries(server.headers).map(([k, v]) => (
++                        <div key={`hdr-${k}`}>header {k}={v}</div>
++                      ))}
++                      <div className="mt-1 text-white/25">id: {server.id} · source: {server.source}{server.registryId ? ` · ${server.registryId}` : ''}</div>
++                    </div>
++                    <div className="flex flex-wrap items-center gap-2">
++                      <button
++                        onClick={() => void testServer(server)}
++                        disabled={test !== undefined && 'busy' in test}
++                        className="flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs text-white/80 hover:bg-white/15 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++                      >
++                        {test !== undefined && 'busy' in test ? <Loader2 className="h-3 w-3 animate-spin" /> : <Zap className="h-3 w-3" />}
++                        Test connection
++                      </button>
++                      {confirmDelete === server.id ? (
++                        <>
++                          <button
++                            onClick={() => void removeServer(server)}
++                            className="flex items-center gap-1 rounded-full bg-red-500/15 px-3 py-1.5 text-xs text-red-300 ring-1 ring-red-500/30"
++                          >
++                            <Trash2 className="h-3 w-3" /> Confirm delete
++                          </button>
++                          <button onClick={() => setConfirmDelete(null)} className="rounded-full px-3 py-1.5 text-xs text-white/50 hover:text-white">
++                            Cancel
++                          </button>
++                        </>
++                      ) : (
++                        <button
++                          onClick={() => setConfirmDelete(server.id)}
++                          className="ml-auto flex items-center gap-1 rounded-full px-3 py-1.5 text-xs text-white/40 hover:bg-red-500/10 hover:text-red-300"
++                        >
++                          <Trash2 className="h-3 w-3" /> Remove
++                        </button>
++                      )}
++                    </div>
++                    {test !== undefined && !('busy' in test) && (
++                      <div className="rounded-xl bg-black/20 p-3 ring-1 ring-white/10">
++                        {test.ok ? (
++                          <div className="space-y-1.5 text-[11px]">
++                            <div className="flex items-center gap-1.5 text-emerald-300/90">
++                              <Check className="h-3.5 w-3.5" /> Connected in {test.ms}ms
++                            </div>
++                            <div className="text-white/60">
++                              Tools ({test.tools.length}): {test.tools.length > 0 ? test.tools.map((t) => t.name).join(', ') : 'none'}
++                            </div>
++                            <div className="text-white/60">
++                              Resources ({test.resources.length}): {test.resources.length > 0 ? test.resources.map((t) => t.name).join(', ') : 'none'}
++                            </div>
++                            <div className="text-white/60">
++                              Prompts ({test.prompts.length}): {test.prompts.length > 0 ? test.prompts.map((t) => t.name).join(', ') : 'none'}
++                            </div>
++                          </div>
++                        ) : (
++                          <div className="space-y-1.5 text-[11px]">
++                            <div className="text-red-300/90">Connection failed</div>
++                            <div className="break-words text-white/60">{test.error ?? 'Unknown error.'}</div>
++                            {test.stderrTail && (
++                              <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] text-white/40">{test.stderrTail}</pre>
++                            )}
++                          </div>
++                        )}
++                      </div>
++                    )}
++                  </div>
++                )}
++              </div>
++            );
++          })}
++        </div>
++      </section>
++
++      {/* Add a server */}
++      <section>
++        <Label>Add a server</Label>
++        <div role="tablist" aria-label="Add server method" className="mb-3 flex gap-1 rounded-full bg-white/5 p-1 ring-1 ring-white/10">
++          {(['paste', 'url', 'form'] as AddMode[]).map((m) => (
++            <button
++              key={m}
++              role="tab"
++              aria-selected={mode === m}
++              onClick={() => {
++                setMode(m);
++                resetAdd();
++              }}
++              className={`flex-1 rounded-full py-1.5 text-xs capitalize transition ${
++                mode === m ? 'bg-cyan-400 text-black' : 'text-white/60 hover:text-white'
++              }`}
++            >
++              {m === 'paste' ? 'Paste config' : m === 'url' ? 'Remote URL' : 'Form'}
++            </button>
++          ))}
++        </div>
++
++        {mode === 'paste' && (
++          <label className="block">
++            <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">Config JSON</span>
++            <textarea
++              value={paste}
++              onChange={(e) => setPaste(e.target.value)}
++              rows={7}
++              spellCheck={false}
++              placeholder={'{\n  "mcpServers": {\n    "filesystem": {\n      "command": "npx",\n      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],\n      "env": { "API_KEY": "…" }\n    }\n  }\n}'}
++              className="w-full resize-y rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 placeholder:text-white/25 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++            />
++            <span className="mt-1 block text-[10px] text-white/30">claude_desktop_config / .mcp.json style — one server or many. Env values that look like secrets are stored encrypted.</span>
++          </label>
++        )}
++        {mode === 'url' && (
++          <div className="space-y-3">
++            <Field label="Server URL (https)" value={url} onChange={setUrl} mono placeholder="https://example.com/mcp" />
++            <Field label="Name (optional)" value={urlName} onChange={setUrlName} placeholder="Defaults to the host name" />
++            <label className="block">
++              <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">Headers (optional, KEY=value per line)</span>
++              <textarea
++                value={urlHeaders}
++                onChange={(e) => setUrlHeaders(e.target.value)}
++                rows={2}
++                spellCheck={false}
++                placeholder={'Authorization=Bearer …'}
++                className="w-full resize-y rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 placeholder:text-white/25 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++              />
++              <span className="mt-1 block text-[10px] text-white/30">Private, loopback and metadata addresses are blocked.</span>
++            </label>
++          </div>
++        )}
++        {mode === 'form' && (
++          <div className="space-y-3">
++            <Field label="Name" value={formName} onChange={setFormName} placeholder="e.g. Filesystem" />
++            <Field label="Command" value={formCommand} onChange={setFormCommand} mono placeholder="npx" />
++            <Field label="Args (space-separated)" value={formArgs} onChange={setFormArgs} mono placeholder="-y @modelcontextprotocol/server-filesystem /workspace" />
++            <label className="block">
++              <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">Env (optional, KEY=value per line)</span>
++              <textarea
++                value={formEnv}
++                onChange={(e) => setFormEnv(e.target.value)}
++                rows={3}
++                spellCheck={false}
++                placeholder={'API_KEY=…'}
++                className="w-full resize-y rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 placeholder:text-white/25 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++              />
++            </label>
++          </div>
++        )}
++
++        <div className="mt-3 flex items-center gap-2">
++          <button
++            onClick={() => void runPreview()}
++            disabled={busy}
++            className="flex items-center gap-1.5 rounded-full bg-white/10 px-3.5 py-1.5 text-xs text-white/85 hover:bg-white/15 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++          >
++            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Eye className="h-3 w-3" />}
++            Preview
++          </button>
++          <span className="text-[11px] text-white/30">Preview first — nothing is saved until you confirm.</span>
++        </div>
++
++        {previewErrors.length > 0 && (
++          <div className="mt-3 space-y-1 rounded-xl bg-amber-500/10 px-3 py-2 ring-1 ring-amber-500/30">
++            {previewErrors.map((e, i) => (
++              <div key={i} className="text-[11px] text-amber-200/90">{e}</div>
++            ))}
++          </div>
++        )}
++
++        {preview !== null && (
++          <div className="mt-3 space-y-2">
++            {preview.length === 0 && <div className="rounded-xl bg-white/[0.04] p-3 text-xs text-white/40">Nothing usable in that config — see the notes above.</div>}
++            {preview.map((draft, i) => (
++              <div key={i} className="rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
++                <div className="flex items-center gap-2 text-xs text-white/85">
++                  <Server className="h-3.5 w-3.5 text-white/50" />
++                  <span className="font-medium">{draft.name}</span>
++                  <span className="font-mono text-[10px] text-white/35">{draft.transport}</span>
++                </div>
++                {draft.description && <p className="mt-1 text-[11px] text-white/50">{draft.description}</p>}
++                <div className="mt-1.5 font-mono text-[10px] leading-relaxed text-white/40">
++                  {draft.transport === 'stdio' ? (
++                    <div>{draft.command} {(draft.args ?? []).join(' ')}</div>
++                  ) : (
++                    <div>{draft.url}</div>
++                  )}
++                  {Object.entries(draft.env).map(([k, v]) => (
++                    <div key={`env-${k}`}>{k}={v}{draft.secretKeys.includes(`env:${k}`) ? '  · will be stored encrypted' : ''}</div>
++                  ))}
++                  {Object.entries(draft.headers).map(([k, v]) => (
++                    <div key={`hdr-${k}`}>header {k}={v}{draft.secretKeys.includes(`header:${k}`) ? '  · will be stored encrypted' : ''}</div>
++                  ))}
++                </div>
++              </div>
++            ))}
++            {preview.length > 0 && (
++              <div className="flex gap-2">
++                <button
++                  onClick={() => void confirmAdd()}
++                  disabled={busy}
++                  className="flex items-center gap-1.5 rounded-full bg-cyan-400 px-3.5 py-1.5 text-xs font-medium text-black hover:bg-cyan-300 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++                >
++                  {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Plus className="h-3 w-3" />}
++                  {preview.length === 1 ? 'Add server' : `Add ${preview.length} servers`}
++                </button>
++                <button onClick={resetAdd} className="rounded-full px-3 py-1.5 text-xs text-white/50 hover:text-white">
++                  Cancel
++                </button>
++              </div>
++            )}
++          </div>
++        )}
++      </section>
++
++      {/* Browse the registry */}
++      <section>
++        <Label>Browse the registry</Label>
++        <p className="mb-2 text-[11px] leading-relaxed text-white/40">
++          The official MCP registry (registry.modelcontextprotocol.io). Entries are untrusted catalog content —
++          review the command, URL and required values before installing.
++        </p>
++        <div className="flex gap-2">
++          <div className="flex min-w-0 flex-1 items-center rounded-xl bg-black/20 ring-1 ring-white/10 focus-within:ring-2 focus-within:ring-cyan-400/60">
++            <Search className="ml-3 h-3.5 w-3.5 shrink-0 text-white/35" />
++            <input
++              value={query}
++              onChange={(e) => setQuery(e.target.value)}
++              onKeyDown={(e) => {
++                if (e.key === 'Enter') void searchRegistry();
++              }}
++              placeholder="Search servers — e.g. filesystem, github, sqlite"
++              className="min-w-0 flex-1 bg-transparent px-2 py-2 text-xs text-white/85 placeholder:text-white/25 focus:outline-none"
++            />
++          </div>
++          <button
++            onClick={() => void searchRegistry()}
++            disabled={registryBusy}
++            className="shrink-0 rounded-full bg-white/10 px-3.5 py-2 text-xs text-white/85 hover:bg-white/15 disabled:opacity-50"
++          >
++            {registryBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : 'Search'}
++          </button>
++        </div>
++        {registryError && <div className="mt-2 text-[11px] text-red-300/80">{registryError}</div>}
++        {registry !== null && registry.length === 0 && (
++          <div className="mt-2 rounded-2xl border border-dashed border-white/10 p-4 text-center text-xs text-white/40">
++            No registry servers matched that search.
++          </div>
++        )}
++        <div className="mt-2 space-y-2">
++          {(registry ?? []).map((entry) => (
++            <div key={entry.id} className="rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
++              <div className="flex items-start justify-between gap-2">
++                <div className="min-w-0">
++                  <div className="truncate text-xs font-medium text-white/90">
++                    {entry.title || entry.name}
++                    {entry.version && <span className="ml-2 font-mono text-[10px] text-white/35">v{entry.version}</span>}
++                  </div>
++                  <div className="mt-0.5 line-clamp-2 text-[11px] leading-relaxed text-white/50">{entry.description}</div>
++                  <div className="mt-1 font-mono text-[10px] text-white/35">
++                    {entry.transport === 'stdio' ? `${entry.command ?? ''} ${(entry.args ?? []).join(' ')}`.trim() : entry.url}
++                    {entry.envVars.length > 0 && ` · needs ${entry.envVars.filter((v) => v.required).length} required value${entry.envVars.filter((v) => v.required).length === 1 ? '' : 's'}`}
++                  </div>
++                </div>
++                <button
++                  onClick={() => startInstall(entry)}
++                  className="flex shrink-0 items-center gap-1 rounded-full bg-white/10 px-3 py-1.5 text-xs text-white/85 hover:bg-white/15"
++                >
++                  <Plus className="h-3 w-3" /> Install
++                </button>
++              </div>
++              {installing?.id === entry.id && (
++                <div className="mt-3 space-y-2 border-t border-white/5 pt-3">
++                  <div className="text-[11px] text-amber-200/80">
++                    Review before installing — this entry comes from the public registry, not from SwarmAgents.
++                  </div>
++                  {entry.homepage && (
++                    <a href={entry.homepage} target="_blank" rel="noreferrer" className="block truncate font-mono text-[10px] text-cyan-300/70 hover:text-cyan-300">
++                      {entry.homepage}
++                    </a>
++                  )}
++                  {entry.envVars.length === 0 && <div className="text-[11px] text-white/40">No values needed.</div>}
++                  {entry.envVars.map((v) => (
++                    <label key={v.name} className="block">
++                      <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">
++                        {v.name}
++                        {v.required ? ' · required' : ' · optional'}
++                        {v.secret ? ' · secret — stored encrypted' : ''}
++                      </span>
++                      <input
++                        type={v.secret ? 'password' : 'text'}
++                        value={installEnv[v.name] ?? ''}
++                        onChange={(e) => setInstallEnv((prev) => ({ ...prev, [v.name]: e.target.value }))}
++                        placeholder={v.description || v.name}
++                        className="w-full rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 placeholder:text-white/25 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                      />
++                      {v.description && <span className="mt-1 block text-[10px] text-white/30">{v.description}</span>}
++                    </label>
++                  ))}
++                  <div className="flex gap-2 pt-1">
++                    <button
++                      onClick={() => void confirmInstall()}
++                      disabled={busy}
++                      className="flex items-center gap-1.5 rounded-full bg-cyan-400 px-3.5 py-1.5 text-xs font-medium text-black hover:bg-cyan-300 disabled:opacity-50"
++                    >
++                      {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <PlugZap className="h-3 w-3" />}
++                      Install server
++                    </button>
++                    <button onClick={() => setInstalling(null)} className="rounded-full px-3 py-1.5 text-xs text-white/50 hover:text-white">
++                      Cancel
++                    </button>
++                  </div>
++                </div>
++              )}
++            </div>
++          ))}
++        </div>
++      </section>
++    </div>
++  );
++}
++
++/* ---------------- primitives (same language as Settings) ---------------- */
++
++function Label({ children, className = '' }: { children: React.ReactNode; className?: string }) {
++  return <div className={`mb-2 text-[10px] uppercase tracking-[0.2em] text-white/40 ${className}`}>{children}</div>;
++}
++
++function Field({ label, value, onChange, mono, placeholder }: { label: string; value: string; onChange: (v: string) => void; mono?: boolean; placeholder?: string }) {
++  return (
++    <label className="block">
++      <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">{label}</span>
++      <input
++        value={value}
++        onChange={(e) => onChange(e.target.value)}
++        placeholder={placeholder}
++        className={`w-full rounded-xl bg-black/20 px-3 py-2 text-xs text-white/85 ring-1 ring-white/10 placeholder:text-white/25 transition focus:outline-none focus:ring-2 focus:ring-cyan-400/60 ${mono ? 'font-mono' : ''}`}
++      />
++    </label>
++  );
++}
++
++function Toggle({ on, onChange }: { on: boolean; onChange?: (v: boolean) => void }) {
++  return (
++    <button
++      onClick={onChange ? () => onChange(!on) : undefined}
++      aria-checked={on}
++      role="switch"
++      className={`relative h-5 w-9 shrink-0 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 ${on ? 'bg-cyan-400' : 'bg-white/15'}`}
++    >
++      <span className={`absolute top-0.5 h-4 w-4 rounded-full transition-all ${on ? 'left-[18px] bg-black' : 'left-0.5 bg-white/70'}`} />
++    </button>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/Settings.tsx b/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
+index feb9cdee7..43c9f4f1e 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
+@@ -6,10 +6,11 @@ import {
+   type ActiveRole, type ApiFormat, MAX_ROLES, MIN_ROLES, PROVIDERS, type ProviderConfig, ROLES, uid,
+ } from '../data';
+ import { callProvider } from '../engine';
++import { McpServers } from './McpServers';
+ import { RoleIcon } from './RoleIcon';
+ import { removeRole, moveRole } from '../utils/pipeline';
+ 
+-type Tab = 'general' | 'providers' | 'appearance';
++type Tab = 'general' | 'providers' | 'mcp' | 'appearance';
+ type Accent = 'cyan' | 'emerald' | 'violet';
+ 
+ /** Total providers configured for this user: BYO providers saved in this
+@@ -92,7 +93,7 @@ export function Settings({
+             </button>
+           </div>
+           <div role="tablist" aria-label="Settings sections" className="mx-5 mt-4 flex gap-1 rounded-full bg-white/5 p-1 ring-1 ring-white/10">
+-            {(['general', 'providers', 'appearance'] as Tab[]).map((t) => (
++            {(['general', 'providers', 'mcp', 'appearance'] as Tab[]).map((t) => (
+               <button
+                 key={t}
+                 role="tab"
+@@ -101,13 +102,15 @@ export function Settings({
+                 title={
+                   t === 'providers'
+                     ? 'Your configured providers — saved in this browser plus your account on the server'
+-                    : undefined
++                    : t === 'mcp'
++                      ? 'Your MCP servers — add any server, browse the registry, test connections'
++                      : undefined
+                 }
+                 className={`flex-1 truncate rounded-full py-1.5 text-xs capitalize transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 ${
+                   tab === t ? a.tab : 'text-white/60 hover:text-white'
+                 }`}
+               >
+-                {t === 'providers' ? `Providers · ${countConfiguredProviders(providers.length, serverProviderCount)}` : t}
++                {t === 'providers' ? `Providers · ${countConfiguredProviders(providers.length, serverProviderCount)}` : t === 'mcp' ? 'MCP' : t}
+               </button>
+             ))}
+           </div>
+@@ -116,6 +119,7 @@ export function Settings({
+         <div className="flex-1 overflow-y-auto px-5 pb-6 pt-5 scrollbar-thin">
+           {tab === 'general' && <General roles={roles} setRoles={setRoles} providers={providers} setProviders={setProviders} showHelpers={showHelpers} />}
+           {tab === 'providers' && <Providers providers={providers} setProviders={setProviders} accent={a} showHelpers={showHelpers} serverProviderCount={serverProviderCount} />}
++          {tab === 'mcp' && <McpServers />}
+           {tab === 'appearance' && <Appearance accent={accent} setAccent={setAccent} showHelpers={showHelpers} setShowHelpers={setShowHelpers} />}
+         </div>
+       </aside>
+-- 
+2.55.0
+

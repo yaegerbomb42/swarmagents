@@ -1,0 +1,243 @@
+From 1ee7326cd19121f0583da439a8fa984f36fcbf74 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 00:41:20 +0000
+Subject: [PATCH] [HARDEN] Body-size caps on providers POST and PATCH (p19)
+
+---
+ .../app/api/providers/[id]/route.test.ts      | 31 +++++++++++++
+ .../app/api/providers/[id]/route.ts           | 35 ++++++++++++---
+ .../app/api/providers/route.test.ts           | 45 +++++++++++++++++++
+ apps/swarmagents/app/api/providers/route.ts   | 44 +++++++++++++-----
+ 4 files changed, 137 insertions(+), 18 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/providers/[id]/route.test.ts b/apps/swarmagents/app/api/providers/[id]/route.test.ts
+index af13f05b5..d5ab51b1f 100644
+--- a/apps/swarmagents/app/api/providers/[id]/route.test.ts
++++ b/apps/swarmagents/app/api/providers/[id]/route.test.ts
+@@ -179,6 +179,37 @@ test("PATCH rejects unknown providers, bad indexes and bad payloads", async () =
+   assert.deepEqual(onDisk().providers[0].keys, [KEY_ONE]);
+ });
+ 
++test("PATCH rejects bodies over the 16kb cap with 413", async () => {
++  saveProvider(OWNER, { id: "openai", apiKey: KEY_ONE });
++
++  const res = await PATCH(
++    new Request("http://localhost/api/providers/openai", {
++      method: "PATCH",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ action: "add-key", apiKey: "x".repeat(17 * 1024) }),
++    }),
++    ctx("openai")
++  );
++  assert.equal(res.status, 413);
++  const body = (await res.json()) as { error?: string };
++  assert.match(body.error ?? "", /too large/i);
++
++  // The oversized mutation never landed.
++  assert.deepEqual(onDisk().providers[0].keys, [KEY_ONE]);
++});
++
++test("PATCH accepts a valid add-key just under the 16kb cap", async () => {
++  saveProvider(OWNER, { id: "openai", apiKey: KEY_ONE });
++
++  const res = await patch("openai", {
++    action: "add-key",
++    apiKey: KEY_TWO,
++    note: "x".repeat(16_000),
++  });
++  assert.equal(res.status, 200);
++  assert.deepEqual(onDisk().providers[0].keys, [KEY_ONE, KEY_TWO]);
++});
++
+ test("DELETE removes the provider and its keys", async () => {
+   saveProvider(OWNER, { id: "openai", apiKey: KEY_ONE });
+   saveProvider(OWNER, { id: "groq", apiKey: KEY_THREE });
+diff --git a/apps/swarmagents/app/api/providers/[id]/route.ts b/apps/swarmagents/app/api/providers/[id]/route.ts
+index 2f76219c1..ec2b4548c 100644
+--- a/apps/swarmagents/app/api/providers/[id]/route.ts
++++ b/apps/swarmagents/app/api/providers/[id]/route.ts
+@@ -23,10 +23,36 @@ interface RouteContext {
+ 
+ const NO_STORE = { "cache-control": "no-store" } as const;
+ 
++/** Bodies over this size are rejected with 413 (same cap as /api/login). */
++const MAX_BODY_SIZE = 16 * 1024;
++
+ function unauthorized() {
+   return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
+ }
+ 
++/**
++ * Read a JSON body, rejecting anything over MAX_BODY_SIZE with 413 before
++ * parsing so a huge body cannot stall the process.
++ */
++async function readJsonBody(
++  request: Request
++): Promise<{ body: unknown } | { response: Response }> {
++  let text: string;
++  try {
++    text = await request.text();
++  } catch {
++    return { response: NextResponse.json({ error: "Could not read request body." }, { status: 400 }) };
++  }
++  if (text.length > MAX_BODY_SIZE) {
++    return { response: NextResponse.json({ error: "Request body too large." }, { status: 413 }) };
++  }
++  try {
++    return { body: JSON.parse(text) as unknown };
++  } catch {
++    return { response: NextResponse.json({ error: "Invalid JSON body." }, { status: 400 }) };
++  }
++}
++
+ async function routeId(ctx: RouteContext): Promise<string> {
+   const params = await Promise.resolve(ctx.params);
+   return typeof params?.id === "string" ? params.id : "";
+@@ -55,12 +81,9 @@ export async function PATCH(request: Request, ctx: RouteContext) {
+   const owner = providerOwner(request);
+   if (!owner) return unauthorized();
+   const id = await routeId(ctx);
+-  let body: unknown;
+-  try {
+-    body = await request.json();
+-  } catch {
+-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+-  }
++  const parsed = await readJsonBody(request);
++  if ("response" in parsed) return parsed.response;
++  const body = parsed.body;
+   const { status, body: payload } = runKeyMutation(owner, id, body);
+   return NextResponse.json(payload, { status, headers: NO_STORE });
+ }
+diff --git a/apps/swarmagents/app/api/providers/route.test.ts b/apps/swarmagents/app/api/providers/route.test.ts
+index d02f4f7c0..473837ab2 100644
+--- a/apps/swarmagents/app/api/providers/route.test.ts
++++ b/apps/swarmagents/app/api/providers/route.test.ts
+@@ -230,6 +230,51 @@ test("POST rejects malformed JSON", async () => {
+   assert.equal(res.status, 400);
+ });
+ 
++test("POST rejects bodies over the 16kb cap with 413", async () => {
++  const res = await POST(
++    new Request("http://localhost/api/providers", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ id: "openai", apiKey: "x".repeat(17 * 1024) }),
++    })
++  );
++  assert.equal(res.status, 413);
++  const body = (await res.json()) as { error?: string };
++  assert.match(body.error ?? "", /too large/i);
++  // The oversized save never landed.
++  assert.deepEqual(onDisk().providers, []);
++});
++
++test("PATCH rejects bodies over the 16kb cap with 413", async () => {
++  await post({ id: "openai", apiKey: "sk-secret-cap-test" });
++  const res = await PATCH(
++    new Request("http://localhost/api/providers", {
++      method: "PATCH",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ id: "openai", action: "add-key", apiKey: "x".repeat(17 * 1024) }),
++    })
++  );
++  assert.equal(res.status, 413);
++  const body = (await res.json()) as { error?: string };
++  assert.match(body.error ?? "", /too large/i);
++  // The oversized mutation never landed.
++  assert.deepEqual(onDisk().providers[0].keys, ["sk-secret-cap-test"]);
++});
++
++test("PATCH accepts a valid add-key just under the 16kb cap", async () => {
++  await post({ id: "openai", apiKey: "sk-secret-cap-test" });
++  const res = await patch({
++    id: "openai",
++    action: "add-key",
++    apiKey: "sk-secret-near-cap",
++    note: "x".repeat(16_000),
++  });
++  assert.equal(res.status, 200);
++  const body = (await res.json()) as { keyCount?: number };
++  assert.equal(body.keyCount, 2);
++  assert.deepEqual(onDisk().providers[0].keys, ["sk-secret-cap-test", "sk-secret-near-cap"]);
++});
++
+ test("POST accepts custom OpenAI-compatible providers with a base URL", async () => {
+   const res = await post({
+     id: "custom",
+diff --git a/apps/swarmagents/app/api/providers/route.ts b/apps/swarmagents/app/api/providers/route.ts
+index 26fe309f9..0a0743a39 100644
+--- a/apps/swarmagents/app/api/providers/route.ts
++++ b/apps/swarmagents/app/api/providers/route.ts
+@@ -11,10 +11,36 @@ export const dynamic = "force-dynamic";
+ 
+ const NO_STORE = { "cache-control": "no-store" } as const;
+ 
++/** Bodies over this size are rejected with 413 (same cap as /api/login). */
++const MAX_BODY_SIZE = 16 * 1024;
++
+ function unauthorized() {
+   return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
+ }
+ 
++/**
++ * Read a JSON body, rejecting anything over MAX_BODY_SIZE with 413 before
++ * parsing so a huge body cannot stall the process.
++ */
++async function readJsonBody(
++  request: Request
++): Promise<{ body: unknown } | { response: Response }> {
++  let text: string;
++  try {
++    text = await request.text();
++  } catch {
++    return { response: NextResponse.json({ error: "Could not read request body." }, { status: 400 }) };
++  }
++  if (text.length > MAX_BODY_SIZE) {
++    return { response: NextResponse.json({ error: "Request body too large." }, { status: 413 }) };
++  }
++  try {
++    return { body: JSON.parse(text) as unknown };
++  } catch {
++    return { response: NextResponse.json({ error: "Invalid JSON body." }, { status: 400 }) };
++  }
++}
++
+ /**
+  * Providers catalog + the signed-in user's configured providers.
+  *
+@@ -97,12 +123,9 @@ function isValidKey(key: string): boolean {
+ export async function POST(request: Request) {
+   const owner = providerOwner(request);
+   if (!owner) return unauthorized();
+-  let body: unknown;
+-  try {
+-    body = await request.json();
+-  } catch {
+-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+-  }
++  const parsed = await readJsonBody(request);
++  if ("response" in parsed) return parsed.response;
++  const body = parsed.body;
+   if (!body || typeof body !== "object") {
+     return NextResponse.json({ error: "Body must be an object." }, { status: 400 });
+   }
+@@ -187,12 +210,9 @@ export async function POST(request: Request) {
+ export async function PATCH(request: Request) {
+   const owner = providerOwner(request);
+   if (!owner) return unauthorized();
+-  let body: unknown;
+-  try {
+-    body = await request.json();
+-  } catch {
+-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+-  }
++  const parsed = await readJsonBody(request);
++  if ("response" in parsed) return parsed.response;
++  const body = parsed.body;
+   if (!body || typeof body !== "object" || Array.isArray(body)) {
+     return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400 });
+   }
+-- 
+2.55.0
+

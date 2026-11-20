@@ -1,0 +1,124 @@
+From dfbc918cac7c540997ec04aaa0f52fb62b299e79 Mon Sep 17 00:00:00 2001
+From: DeepSeek-3 <deepseek-3@swarm.local>
+Date: Thu, 12 Nov 2026 19:57:47 -0600
+Subject: [PATCH] test(health): isolate provider env vars from the host
+
+The health tests assumed no provider keys were exported by the machine
+running the suite, so a host OPENAI_API_KEY made providersConfigured
+legitimately 2 and failed the snapshot assertion. Snapshot, clear and
+restore every provider key lib/health.ts reads around each affected
+case, and add a regression test that a host-exported key is both
+ignored by a case and restored afterwards.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/lib/health.test.ts | 78 +++++++++++++++++++++++------
+ 1 file changed, 63 insertions(+), 15 deletions(-)
+
+diff --git a/apps/swarmagents/lib/health.test.ts b/apps/swarmagents/lib/health.test.ts
+index 95b3018ef..ad1eb06d3 100644
+--- a/apps/swarmagents/lib/health.test.ts
++++ b/apps/swarmagents/lib/health.test.ts
+@@ -10,17 +10,48 @@ function tmpDir(): string {
+   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "swarm-health-")));
+ }
+ 
++// Every provider-key env var lib/health.ts reads (its PROVIDER_KEYS). Keep this
++// list in sync when a provider is added there.
++const PROVIDER_KEYS = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] as const;
++
++/**
++ * Host machines often export real provider keys (e.g. `OPENAI_API_KEY=x npm
++ * test`), which legitimately changes providersConfigured and makes assertions
++ * about a controlled count flaky. Snapshot and clear every provider key for the
++ * duration of a test, and return a restore function that puts back exactly what
++ * was there — including variables that were previously unset.
++ */
++function isolateProviderEnv(): () => void {
++  const saved = new Map<string, string | undefined>();
++  for (const key of PROVIDER_KEYS) {
++    saved.set(key, process.env[key]);
++    delete process.env[key];
++  }
++  return () => {
++    for (const key of PROVIDER_KEYS) {
++      const value = saved.get(key);
++      if (value === undefined) delete process.env[key];
++      else process.env[key] = value;
++    }
++  };
++}
++
+ test("health snapshot exposes only the agreed fields, never secrets", () => {
+-  process.env.ANTHROPIC_API_KEY = "sk-test-anthropic";
+-  const snap = healthSnapshot();
+-  assert.deepEqual(Object.keys(snap).sort(), ["board", "builtAt", "commit", "ok", "providersConfigured", "providersScope", "uptimeSec", "version", "vmDriver"]);
+-  assert.equal(typeof snap.ok, "boolean");
+-  assert.equal(snap.version, "2.0.0");
+-  assert.ok(snap.uptimeSec >= 0);
+-  assert.equal(snap.providersConfigured, 1);
+-  assert.equal(snap.providersScope, "host-env");
+-  // The raw key value must never leak into the report.
+-  assert.equal(JSON.stringify(snap).includes("sk-test-anthropic"), false);
++  const restoreEnv = isolateProviderEnv();
++  try {
++    process.env.ANTHROPIC_API_KEY = "sk-test-anthropic";
++    const snap = healthSnapshot();
++    assert.deepEqual(Object.keys(snap).sort(), ["board", "builtAt", "commit", "ok", "providersConfigured", "providersScope", "uptimeSec", "version", "vmDriver"]);
++    assert.equal(typeof snap.ok, "boolean");
++    assert.equal(snap.version, "2.0.0");
++    assert.ok(snap.uptimeSec >= 0);
++    assert.equal(snap.providersConfigured, 1);
++    assert.equal(snap.providersScope, "host-env");
++    // The raw key value must never leak into the report.
++    assert.equal(JSON.stringify(snap).includes("sk-test-anthropic"), false);
++  } finally {
++    restoreEnv();
++  }
+ });
+ 
+ test("commit and builtAt come from env or fall back to defaults", () => {
+@@ -78,8 +109,7 @@ test("builtAt is an ISO string when SWARM_BUILD_TIME is set", () => {
+ });
+ 
+ test("providersConfigured counts only non-empty provider keys", () => {
+-  const prevA = process.env.ANTHROPIC_API_KEY;
+-  const prevO = process.env.OPENAI_API_KEY;
++  const restoreEnv = isolateProviderEnv();
+   try {
+     process.env.ANTHROPIC_API_KEY = "";
+     process.env.OPENAI_API_KEY = "sk-test-openai";
+@@ -90,9 +120,27 @@ test("providersConfigured counts only non-empty provider keys", () => {
+     delete process.env.ANTHROPIC_API_KEY;
+     assert.equal(healthSnapshot().providersConfigured, 0);
+   } finally {
+-    if (prevA !== undefined) process.env.ANTHROPIC_API_KEY = prevA;
+-    else delete process.env.ANTHROPIC_API_KEY;
+-    if (prevO !== undefined) process.env.OPENAI_API_KEY = prevO;
++    restoreEnv();
++  }
++});
++
++test("host-exported provider keys are isolated from a case and restored afterwards", () => {
++  const prevOpenai = process.env.OPENAI_API_KEY;
++  process.env.OPENAI_API_KEY = "sk-host-openai";
++  try {
++    const restoreEnv = isolateProviderEnv();
++    try {
++      // The host key is cleared, so the case sees only what it sets itself.
++      assert.equal(healthSnapshot().providersConfigured, 0);
++      process.env.ANTHROPIC_API_KEY = "sk-a";
++      assert.equal(healthSnapshot().providersConfigured, 1);
++    } finally {
++      restoreEnv();
++    }
++    // ...and the host's value is put back rather than being left deleted.
++    assert.equal(process.env.OPENAI_API_KEY, "sk-host-openai");
++  } finally {
++    if (prevOpenai !== undefined) process.env.OPENAI_API_KEY = prevOpenai;
+     else delete process.env.OPENAI_API_KEY;
+   }
+ });
+-- 
+2.55.0
+

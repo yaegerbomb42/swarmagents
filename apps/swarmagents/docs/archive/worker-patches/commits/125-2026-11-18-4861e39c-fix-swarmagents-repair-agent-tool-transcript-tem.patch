@@ -1,0 +1,27 @@
+From 4861e39c5a2e3623339c126477c6e70f52e042a0 Mon Sep 17 00:00:00 2001
+From: yaeger42 <jyaeger@hawk.iit.edu>
+Date: Wed, 18 Nov 2026 11:53:07 -0600
+Subject: [PATCH] fix(swarmagents): repair agent tool transcript template
+
+---
+ apps/swarmagents/lib/board-agent/agent.ts | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/apps/swarmagents/lib/board-agent/agent.ts b/apps/swarmagents/lib/board-agent/agent.ts
+index c8bd53df3..3aa41699c 100644
+--- a/apps/swarmagents/lib/board-agent/agent.ts
++++ b/apps/swarmagents/lib/board-agent/agent.ts
+@@ -170,9 +170,7 @@ export async function runBoardAgent(
+     const executed = await executeTool(userId, call, userMessage);
+     conversation.messages.push({
+       role: "agent",
+-      content: ```json
+-${JSON.stringify({ tool: call.tool, args: call.args })}
+-```,
++      content: `\`\`\`json\n${JSON.stringify({ tool: call.tool, args: call.args })}\n\`\`\``,
+       createdAt: Date.now(),
+     });
+     if (executed.taskId) taskIds.push(executed.taskId);
+-- 
+2.55.0
+

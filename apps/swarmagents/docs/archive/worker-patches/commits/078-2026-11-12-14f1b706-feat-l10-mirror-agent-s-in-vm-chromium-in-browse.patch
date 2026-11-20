@@ -1,0 +1,1516 @@
+From 14f1b706ba23cdca2121bec93ec89ffc2612ae0c Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 21:35:55 +0000
+Subject: [PATCH] feat(l10): mirror agent's in-VM Chromium in Browser tab via
+ CDP
+
+---
+ .../runtime/browser/[runId]/frame/route.ts    |  21 +-
+ .../app/api/runtime/browser/[runId]/route.ts  |  35 +-
+ .../lib/browser/cdp-endpoint.test.ts          | 115 +++++
+ apps/swarmagents/lib/browser/cdp-endpoint.ts  | 154 ++++++
+ apps/swarmagents/lib/browser/manager.test.ts  | 280 +++++++++-
+ apps/swarmagents/lib/browser/manager.ts       | 488 ++++++++++++++++--
+ .../src/components/BrowserView.tsx            |  67 ++-
+ 7 files changed, 1102 insertions(+), 58 deletions(-)
+ create mode 100644 apps/swarmagents/lib/browser/cdp-endpoint.test.ts
+ create mode 100644 apps/swarmagents/lib/browser/cdp-endpoint.ts
+
+diff --git a/apps/swarmagents/app/api/runtime/browser/[runId]/frame/route.ts b/apps/swarmagents/app/api/runtime/browser/[runId]/frame/route.ts
+index 8af4ca7e5..f58d5ab6f 100644
+--- a/apps/swarmagents/app/api/runtime/browser/[runId]/frame/route.ts
++++ b/apps/swarmagents/app/api/runtime/browser/[runId]/frame/route.ts
+@@ -15,18 +15,13 @@ import { USER_HEADER } from "../../../../../../lib/auth";
+ import { RUN_ID_RE } from "../../../../../../lib/telemetry/paths";
+ import { getRuntimeManager } from "../../../../../../lib/runtime/manager";
+ import { getBrowserManager } from "../../../../../../lib/browser/manager";
++import { IN_VM_BROWSER_MESSAGE } from "../../../../../../lib/browser/cdp-endpoint";
+ import { isDesktopModeEnabled } from "../../../../../../lib/vm/desktop";
+ 
+ export const runtime = "nodejs";
+ export const dynamic = "force-dynamic";
+ 
+ export async function GET(req: NextRequest, ctx: { params: Promise<{ runId: string }> }) {
+-  if (isDesktopModeEnabled()) {
+-    return NextResponse.json(
+-      { error: "Desktop mode: the agent drives the on-screen browser; headless frame serving is disabled." },
+-      { status: 409 },
+-    );
+-  }
+   const user = req.headers.get(USER_HEADER);
+   if (!user || user.length > 128) {
+     return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+@@ -38,7 +33,19 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ runId: stri
+     return NextResponse.json({ error: "Run not found." }, { status: 404 });
+   }
+ 
+-  const frame = await getBrowserManager().getFrame(runId);
++  // In desktop mode the frame path serves the CDP mirror of the agent's
++  // Chromium (task l10); when there is no mirror, report the in-VM state
++  // to the run's stream (once, via getFrame) so the Browser tab can render
++  // it, and answer 409.
++  if (isDesktopModeEnabled()) {
++    const mode = await getBrowserManager().browserModeForUser?.(user);
++    if (mode !== "cdp") {
++      await getBrowserManager().getFrame(runId, { userId: user });
++      return NextResponse.json({ error: IN_VM_BROWSER_MESSAGE }, { status: 409 });
++    }
++  }
++
++  const frame = await getBrowserManager().getFrame(runId, { userId: user });
+   if (!frame) {
+     return NextResponse.json({ error: "No frame captured yet." }, { status: 404 });
+   }
+diff --git a/apps/swarmagents/app/api/runtime/browser/[runId]/route.ts b/apps/swarmagents/app/api/runtime/browser/[runId]/route.ts
+index 2c2a798d5..dca90efee 100644
+--- a/apps/swarmagents/app/api/runtime/browser/[runId]/route.ts
++++ b/apps/swarmagents/app/api/runtime/browser/[runId]/route.ts
+@@ -16,6 +16,7 @@ import { USER_HEADER } from "../../../../../lib/auth";
+ import { RUN_ID_RE } from "../../../../../lib/telemetry/paths";
+ import { getRuntimeManager } from "../../../../../lib/runtime/manager";
+ import { getBrowserManager } from "../../../../../lib/browser/manager";
++import { IN_VM_BROWSER_MESSAGE } from "../../../../../lib/browser/cdp-endpoint";
+ import { isDesktopModeEnabled } from "../../../../../lib/vm/desktop";
+ 
+ export const runtime = "nodejs";
+@@ -24,13 +25,25 @@ export const dynamic = "force-dynamic";
+ const MAX_BODY_SIZE = 64 * 1024;
+ const MAX_URL_LEN = 8192;
+ 
+-/** In desktop mode the agent drives the on-screen browser; the headless frame
+- * path is retired (the UI watches the VNC view instead). */
++/**
++ * In desktop mode the agent drives the on-screen browser, so the headless
++ * frame path is retired — unless the Browser tab can mirror the agent's
++ * Chromium over CDP (task l10). When it cannot, the tab shows the in-VM
++ * message and the user watches the Screen tab instead.
++ */
+ function desktopModeResponse(): Response {
+-  return NextResponse.json(
+-    { error: "Desktop mode: the agent drives the on-screen browser; headless browser control is disabled." },
+-    { status: 409 },
+-  );
++  return NextResponse.json({ error: IN_VM_BROWSER_MESSAGE }, { status: 409 });
++}
++
++/**
++ * True when desktop mode is on and this user's browser cannot be served
++ * (no CDP mirror). A manager without browserModeForUser (older stubs)
++ * keeps the gate closed, preserving the previous blanket refusal.
++ */
++async function desktopModeBlocked(user: string): Promise<boolean> {
++  if (!isDesktopModeEnabled()) return false;
++  const mode = await getBrowserManager().browserModeForUser?.(user);
++  return mode !== "cdp";
+ }
+ 
+ function caller(req: NextRequest): string | null {
+@@ -53,12 +66,12 @@ async function activeRun(req: NextRequest, runId: string): Promise<{ user: strin
+ }
+ 
+ export async function GET(req: NextRequest, ctx: { params: Promise<{ runId: string }> }) {
+-  if (isDesktopModeEnabled()) return desktopModeResponse();
+   const { runId } = await ctx.params;
+   const gate = await activeRun(req, runId);
+   if (gate instanceof Response) return gate;
++  if (await desktopModeBlocked(gate.user)) return desktopModeResponse();
+ 
+-  const frame = await getBrowserManager().getFrame(runId);
++  const frame = await getBrowserManager().getFrame(runId, { userId: gate.user });
+   if (!frame) {
+     return NextResponse.json({ error: "No frame captured yet." }, { status: 404 });
+   }
+@@ -73,10 +86,10 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ runId: stri
+ }
+ 
+ export async function POST(req: NextRequest, ctx: { params: Promise<{ runId: string }> }) {
+-  if (isDesktopModeEnabled()) return desktopModeResponse();
+   const { runId } = await ctx.params;
+   const gate = await activeRun(req, runId);
+   if (gate instanceof Response) return gate;
++  if (await desktopModeBlocked(gate.user)) return desktopModeResponse();
+ 
+   let text: string;
+   try {
+@@ -99,7 +112,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ runId: str
+   }
+ 
+   if (body.action === "screenshot") {
+-    const result = await getBrowserManager().screenshot(runId);
++    const result = await getBrowserManager().screenshot(runId, { userId: gate.user });
+     if (!result.ok) {
+       return NextResponse.json({ error: result.reason }, { status: 400 });
+     }
+@@ -111,7 +124,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ runId: str
+     return NextResponse.json({ error: "url is required." }, { status: 400 });
+   }
+ 
+-  const result = await getBrowserManager().navigate(runId, url);
++  const result = await getBrowserManager().navigate(runId, url, { userId: gate.user });
+   if (!result.ok) {
+     return NextResponse.json({ error: result.reason }, { status: 400 });
+   }
+diff --git a/apps/swarmagents/lib/browser/cdp-endpoint.test.ts b/apps/swarmagents/lib/browser/cdp-endpoint.test.ts
+new file mode 100644
+index 000000000..68c7f5f98
+--- /dev/null
++++ b/apps/swarmagents/lib/browser/cdp-endpoint.test.ts
+@@ -0,0 +1,115 @@
++/**
++ * Unit tests for CDP endpoint resolution (lib/browser/cdp-endpoint.ts).
++ *
++ * The resolver is pure given its injected VM callbacks: no Docker, no
++ * Chromium, no network. Covers the resolution matrix (host forced /
++ * desktop off / no display / forwarder failure / success) and the
++ * socat forwarder argv (idempotent, detached, binds the VM IP, rejects
++ * a hostile host).
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  CDP_FORWARD_PORT,
++  CDP_PORT_IN_VM,
++  IN_VM_BROWSER_MESSAGE,
++  buildForwarderArgv,
++  isHostBrowserForced,
++  resolveCdpEndpoint,
++  type CdpEndpointDeps,
++} from "./cdp-endpoint";
++
++function deps(overrides: Partial<CdpEndpointDeps> = {}): CdpEndpointDeps & {
++  execCalls: Array<{ userId: string; argv: string[] }>;
++} {
++  const execCalls: Array<{ userId: string; argv: string[] }> = [];
++  return {
++    desktopMode: true,
++    hostBrowserForced: false,
++    getDesktopEndpoint: async () => ({ host: "172.18.0.4", port: 6080, password: "secret" }),
++    execInVm: async (userId, argv) => {
++      execCalls.push({ userId, argv });
++      return { exitCode: 0 };
++    },
++    execCalls,
++    ...overrides,
++  };
++}
++
++test("resolves http://<vm-ip>:9223 and starts the socat forwarder on demand", async () => {
++  const d = deps();
++  const res = await resolveCdpEndpoint("alice", d);
++  assert.equal(res.ok, true);
++  if (res.ok) {
++    assert.equal(res.endpoint.url, "http://172.18.0.4:9223");
++    assert.equal(res.endpoint.vmHost, "172.18.0.4");
++    assert.equal(res.endpoint.port, CDP_FORWARD_PORT);
++  }
++  assert.equal(d.execCalls.length, 1);
++  assert.equal(d.execCalls[0]?.userId, "alice");
++  const script = d.execCalls[0]?.argv.join(" ") ?? "";
++  assert.match(script, /socat TCP-LISTEN:9223,bind=172\.18\.0\.4,fork,reuseaddr TCP:127\.0\.0\.1:9222/);
++  // Idempotent: an already-running forwarder is left alone (pgrep guard).
++  assert.match(script, /pgrep -f 'socat TCP-LISTEN:922\[3\]'/);
++});
++
++test("host browser forced (SWARM_BROWSER_HOST=1) resolves to no endpoint without touching the VM", async () => {
++  const d = deps({ hostBrowserForced: true });
++  const res = await resolveCdpEndpoint("alice", d);
++  assert.equal(res.ok, false);
++  if (!res.ok) assert.match(res.reason, /host browser forced/);
++  assert.equal(d.execCalls.length, 0);
++});
++
++test("desktop mode off resolves to no endpoint without touching the VM", async () => {
++  const d = deps({ desktopMode: false });
++  const res = await resolveCdpEndpoint("alice", d);
++  assert.equal(res.ok, false);
++  if (!res.ok) assert.match(res.reason, /desktop mode is off/);
++  assert.equal(d.execCalls.length, 0);
++});
++
++test("fake driver fallback: no display endpoint resolves to no endpoint", async () => {
++  const d = deps({ getDesktopEndpoint: async () => null });
++  const res = await resolveCdpEndpoint("alice", d);
++  assert.equal(res.ok, false);
++  if (!res.ok) assert.match(res.reason, /no display/);
++  assert.equal(d.execCalls.length, 0);
++});
++
++test("forwarder start failure (e.g. socat missing from the image) resolves to no endpoint", async () => {
++  const d = deps({ execInVm: async () => ({ exitCode: 3 }) });
++  const res = await resolveCdpEndpoint("alice", d);
++  assert.equal(res.ok, false);
++  if (!res.ok) assert.match(res.reason, /could not start CDP forwarder \(exit 3\)/);
++});
++
++test("a throwing desktop-endpoint lookup resolves to no endpoint", async () => {
++  const d = deps({
++    getDesktopEndpoint: async () => {
++      throw new Error("container gone");
++    },
++  });
++  const res = await resolveCdpEndpoint("alice", d);
++  assert.equal(res.ok, false);
++  if (!res.ok) assert.match(res.reason, /could not read desktop endpoint: container gone/);
++});
++
++test("forwarder argv rejects a hostile VM host (no shell injection)", () => {
++  assert.throws(() => buildForwarderArgv("1.2.3.4; rm -rf /"), /Invalid VM host/);
++  assert.throws(() => buildForwarderArgv("$(id)"), /Invalid VM host/);
++  assert.throws(() => buildForwarderArgv(""), /Invalid VM host/);
++  // IPv6 loopback-adjacent literals are fine.
++  const argv = buildForwarderArgv("fd00::4");
++  assert.match(argv.join(" "), /bind=fd00::4/);
++});
++
++test("constants: in-VM CDP port, forwarder port, and the user-facing message", () => {
++  assert.equal(CDP_PORT_IN_VM, 9222);
++  assert.equal(CDP_FORWARD_PORT, 9223);
++  assert.equal(IN_VM_BROWSER_MESSAGE, "Browser runs inside your computer — open the Screen tab");
++  assert.equal(isHostBrowserForced({ SWARM_BROWSER_HOST: "1" }), true);
++  assert.equal(isHostBrowserForced({ SWARM_BROWSER_HOST: "0" }), false);
++  assert.equal(isHostBrowserForced({}), false);
++});
+diff --git a/apps/swarmagents/lib/browser/cdp-endpoint.ts b/apps/swarmagents/lib/browser/cdp-endpoint.ts
+new file mode 100644
+index 000000000..3120c1442
+--- /dev/null
++++ b/apps/swarmagents/lib/browser/cdp-endpoint.ts
+@@ -0,0 +1,154 @@
++/**
++ * CDP endpoint resolution for the Browser tab mirror (task l10).
++ *
++ * When the agent runs in desktop mode it drives the VM's own Chromium (on
++ * the desktop display, via the computer-use / Playwright MCP servers), so
++ * the Browser tab must show *that* page instead of a separate host-side
++ * headless Chromium. The VM's Chromium listens for DevTools connections on
++ * 127.0.0.1:9222 *inside* the VM; the host reaches it through a socat
++ * forwarder started on demand inside the VM (vm.exec) that binds the VM's
++ * own network IP at port 9223 and forwards to 127.0.0.1:9222. Playwright
++ * then attaches with `chromium.connectOverCDP("http://<vm-ip>:9223")`.
++ *
++ * Ownership: the forwarder binds the per-user VM network IP (never
++ * 0.0.0.0), and resolution is always for one authenticated user — the
++ * run's owner — via that user's own desktop endpoint, so one user can only
++ * ever resolve (and attach to) their own VM's Chromium. This is the same
++ * per-user-endpoint shape the display proxy uses; there is no shared
++ * forwarder and no cross-user endpoint.
++ *
++ * What is NOT here yet (dependency gaps, stated in the task): l3's display
++ * proxy does not exist in this tree, the desktop image does not install
++ * socat, and `chromium-launch.sh` does not pass `--remote-debugging-port`.
++ * Until those land, `resolveCdpEndpoint` degrades to "VM has no display" /
++ * "could not start CDP forwarder" and the manager reports the browser as
++ * running inside the user's computer (see IN_VM_BROWSER_MESSAGE) instead
++ * of launching a host Chromium that is not the agent's browser.
++ *
++ * This module is dependency-free (only type imports and lib/vm/desktop, so
++ * the BrowserView client can import IN_VM_BROWSER_MESSAGE from here) and
++ * takes its VM access as injected callbacks so the resolution logic is
++ * unit-testable without Docker.
++ */
++
++import { isDesktopModeEnabled } from "../vm/desktop";
++import type { VmDesktopEndpoint } from "../vm/types";
++
++/** DevTools port the VM's Chromium listens on (inside the VM). */
++export const CDP_PORT_IN_VM = 9222;
++/** Port the on-demand socat forwarder exposes on the VM network IP. */
++export const CDP_FORWARD_PORT = 9223;
++/** Env var forcing the legacy host-launch browser (dev escape hatch). */
++export const SWARM_BROWSER_HOST_ENV = "SWARM_BROWSER_HOST";
++
++/**
++ * Shown in the Browser tab when the browser runs inside the user's computer
++ * and cannot be mirrored (no display / no CDP endpoint): the user watches
++ * it on the Screen tab instead.
++ */
++export const IN_VM_BROWSER_MESSAGE = "Browser runs inside your computer — open the Screen tab";
++
++/** A resolved CDP endpoint for one user's VM. */
++export interface CdpEndpoint {
++  /** `http://<vm-ip>:9223` — the URL `chromium.connectOverCDP` attaches to. */
++  url: string;
++  /** The VM's network IP the forwarder is bound to. */
++  vmHost: string;
++  /** The forwarder port (CDP_FORWARD_PORT). */
++  port: number;
++}
++
++export type CdpResolution =
++  | { ok: true; endpoint: CdpEndpoint }
++  | { ok: false; reason: string };
++
++/** The VM access the resolver needs; injected so tests can stub Docker. */
++export interface CdpEndpointDeps {
++  /** Desktop mode on (SWARM_VM_DESKTOP=1). Read per call so env changes apply. */
++  desktopMode: boolean;
++  /** SWARM_BROWSER_HOST=1 forces the legacy host-launch browser. */
++  hostBrowserForced: boolean;
++  /** The user's desktop (display) endpoint, or null when the VM has no display. */
++  getDesktopEndpoint: (userId: string) => Promise<VmDesktopEndpoint | null>;
++  /** Run an argv command inside the user's VM (vm.exec). */
++  execInVm: (userId: string, argv: string[]) => Promise<{ exitCode: number }>;
++}
++
++/** True when SWARM_BROWSER_HOST=1 (legacy host-launch escape hatch). */
++export function isHostBrowserForced(env: Record<string, string | undefined> = process.env): boolean {
++  return env[SWARM_BROWSER_HOST_ENV] === "1";
++}
++
++/** Resolve the CDP endpoint for a user from the live environment. */
++export function liveCdpEndpointDeps(deps: {
++  getDesktopEndpoint: (userId: string) => Promise<VmDesktopEndpoint | null>;
++  execInVm: (userId: string, argv: string[]) => Promise<{ exitCode: number }>;
++}): CdpEndpointDeps {
++  return {
++    desktopMode: isDesktopModeEnabled(),
++    hostBrowserForced: isHostBrowserForced(),
++    getDesktopEndpoint: deps.getDesktopEndpoint,
++    execInVm: deps.execInVm,
++  };
++}
++
++/** The socat argv that forwards <vmHost>:9223 to 127.0.0.1:9222 in the VM. */
++export function buildForwarderArgv(vmHost: string): string[] {
++  if (!/^[0-9a-fA-F.:]+$/.test(vmHost) || vmHost.length === 0 || vmHost.length > 45) {
++    throw new Error(`Invalid VM host for CDP forwarder: ${JSON.stringify(vmHost)}`);
++  }
++  // Idempotent and detached: if a forwarder is already listening, do
++  // nothing; otherwise start one in the background and return at once.
++  // `command -v socat` fails the exec when socat is not installed in the
++  // image (exit 3) instead of silently launching a dead background job.
++  // The pgrep pattern spells the port as 922[3] so it cannot match this
++  // very `sh -c` command line (which contains the bracketed form, not
++  // the literal port).
++  const script =
++    `pgrep -f 'socat TCP-LISTEN:922[3]' >/dev/null 2>&1 || { ` +
++    `command -v socat >/dev/null 2>&1 || exit 3; ` +
++    `nohup socat TCP-LISTEN:${CDP_FORWARD_PORT},bind=${vmHost},fork,reuseaddr TCP:127.0.0.1:${CDP_PORT_IN_VM} >/dev/null 2>&1 & }`;
++  return ["sh", "-c", script];
++}
++
++/**
++ * Resolve the CDP endpoint for one user's VM, starting the socat forwarder
++ * on demand. Returns `{ok:false}` (with a reason) when there is nothing to
++ * mirror: host browser forced, desktop mode off, no display, or the
++ * forwarder could not be started. Never throws for an expected miss — only
++ * for a bad caller argument.
++ */
++export async function resolveCdpEndpoint(userId: string, deps: CdpEndpointDeps): Promise<CdpResolution> {
++  if (deps.hostBrowserForced) return { ok: false, reason: "host browser forced (SWARM_BROWSER_HOST=1)" };
++  if (!deps.desktopMode) return { ok: false, reason: "desktop mode is off" };
++
++  let desktop: VmDesktopEndpoint | null;
++  try {
++    desktop = await deps.getDesktopEndpoint(userId);
++  } catch (error) {
++    return { ok: false, reason: `could not read desktop endpoint: ${error instanceof Error ? error.message : String(error)}` };
++  }
++  if (!desktop) return { ok: false, reason: "VM has no display" };
++
++  let argv: string[];
++  try {
++    argv = buildForwarderArgv(desktop.host);
++  } catch (error) {
++    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
++  }
++
++  let started: { exitCode: number };
++  try {
++    started = await deps.execInVm(userId, argv);
++  } catch (error) {
++    return { ok: false, reason: `could not start CDP forwarder: ${error instanceof Error ? error.message : String(error)}` };
++  }
++  if (started.exitCode !== 0) {
++    return { ok: false, reason: `could not start CDP forwarder (exit ${started.exitCode})` };
++  }
++
++  return {
++    ok: true,
++    endpoint: { url: `http://${desktop.host}:${CDP_FORWARD_PORT}`, vmHost: desktop.host, port: CDP_FORWARD_PORT },
++  };
++}
+diff --git a/apps/swarmagents/lib/browser/manager.test.ts b/apps/swarmagents/lib/browser/manager.test.ts
+index 427a9f640..1636113de 100644
+--- a/apps/swarmagents/lib/browser/manager.test.ts
++++ b/apps/swarmagents/lib/browser/manager.test.ts
+@@ -9,8 +9,9 @@
+ 
+ import test from "node:test";
+ import assert from "node:assert/strict";
+-import type { BrowserContext, Page } from "playwright-core";
+-import { BrowserManager, MAX_FPS } from "./manager";
++import type { Browser, BrowserContext, Page } from "playwright-core";
++import { BrowserManager, MAX_FPS, type CdpConnector } from "./manager";
++import { IN_VM_BROWSER_MESSAGE, type CdpResolution } from "./cdp-endpoint";
+ import { telemetryBus } from "../telemetry/index";
+ 
+ const JPEG = Buffer.from("fake-jpeg-bytes");
+@@ -320,3 +321,278 @@ test("close tears the session down and drops the cache", async () => {
+   await manager.close(RUN);
+   assert.equal(closed, 1);
+ });
++
++// --- CDP mirror mode (task l10) ---------------------------------------------
++
++interface FakeCdpPageState {
++  url: string;
++  title: string;
++  gotoCalls: string[];
++  screenshotCalls: number;
++}
++
++function fakeCdpPage(initial: Partial<FakeCdpPageState> = {}) {
++  const state: FakeCdpPageState = {
++    url: initial.url ?? "about:blank",
++    title: initial.title ?? "Agent Page",
++    gotoCalls: [],
++    screenshotCalls: 0,
++  };
++  const listeners = new Map<string, Array<(arg?: unknown) => void>>();
++  const mainFrame = { __mainFrame: true };
++  const page = {
++    url: () => state.url,
++    title: async () => state.title,
++    goto: async (target: string) => {
++      state.gotoCalls.push(target);
++      state.url = target;
++      return null;
++    },
++    screenshot: async () => {
++      state.screenshotCalls += 1;
++      return JPEG;
++    },
++    viewportSize: () => ({ width: 1280, height: 800 }),
++    mainFrame: () => mainFrame,
++    on: (event: string, fn: (arg?: unknown) => void) => {
++      const list = listeners.get(event) ?? [];
++      list.push(fn);
++      listeners.set(event, list);
++    },
++    off: (event: string, fn: (arg?: unknown) => void) => {
++      listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn));
++    },
++    route: () => {},
++  } as unknown as Page;
++  const emit = (event: string, arg?: unknown) => {
++    for (const fn of [...(listeners.get(event) ?? [])]) fn(arg);
++  };
++  return { page, state, mainFrame, emit };
++}
++
++function fakeCdpContext(page: Page) {
++  const state = { closeCalls: 0, newPageCalls: 0 };
++  const listeners = new Map<string, Array<(arg?: unknown) => void>>();
++  const context = {
++    close: async () => {
++      state.closeCalls += 1;
++    },
++    newPage: async () => {
++      state.newPageCalls += 1;
++      return page;
++    },
++    pages: () => [page],
++    on: (event: string, fn: (arg?: unknown) => void) => {
++      const list = listeners.get(event) ?? [];
++      list.push(fn);
++      listeners.set(event, list);
++    },
++    off: (event: string, fn: (arg?: unknown) => void) => {
++      listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn));
++    },
++  } as unknown as BrowserContext;
++  const emit = (event: string, arg?: unknown) => {
++    for (const fn of [...(listeners.get(event) ?? [])]) fn(arg);
++  };
++  return { context, state, emit };
++}
++
++function fakeCdpBrowser(context: BrowserContext) {
++  const state = { closeCalls: 0 };
++  const browser = {
++    contexts: () => [context],
++    close: async () => {
++      state.closeCalls += 1;
++    },
++  } as unknown as Browser;
++  return { browser, state };
++}
++
++function fakeCdpConnector(
++  browser: Browser,
++  resolve: CdpResolution = {
++    ok: true,
++    endpoint: { url: "http://172.18.0.4:9223", vmHost: "172.18.0.4", port: 9223 },
++  },
++) {
++  const state = { resolveCalls: [] as string[], connectCalls: [] as string[] };
++  const connector: CdpConnector = {
++    resolveEndpoint: async (userId: string) => {
++      state.resolveCalls.push(userId);
++      return resolve;
++    },
++    connect: async (url: string) => {
++      state.connectCalls.push(url);
++      return browser;
++    },
++  };
++  return { connector, state };
++}
++
++/** Run a block with desktop mode on (and no host-browser escape hatch). */
++async function withDesktopMode<T>(fn: () => Promise<T>): Promise<T> {
++  const prevDesktop = process.env.SWARM_VM_DESKTOP;
++  const prevHost = process.env.SWARM_BROWSER_HOST;
++  process.env.SWARM_VM_DESKTOP = "1";
++  delete process.env.SWARM_BROWSER_HOST;
++  try {
++    return await fn();
++  } finally {
++    if (prevDesktop === undefined) delete process.env.SWARM_VM_DESKTOP;
++    else process.env.SWARM_VM_DESKTOP = prevDesktop;
++    if (prevHost === undefined) delete process.env.SWARM_BROWSER_HOST;
++    else process.env.SWARM_BROWSER_HOST = prevHost;
++  }
++}
++
++/** Public DNS answers for the CDP tests (no network dependence). */
++const publicLookup = async (): Promise<string[]> => ["93.184.216.34"];
++
++test("CDP mode: navigate drives the agent's in-VM tab, not a host browser", async () => {
++  await withDesktopMode(async () => {
++    const cdpPage = fakeCdpPage({ url: "https://example.com/", title: "Agent Page" });
++    const cdpContext = fakeCdpContext(cdpPage.page);
++    const cdpBrowser = fakeCdpBrowser(cdpContext.context);
++    const { connector, state } = fakeCdpConnector(cdpBrowser.browser);
++    const manager = new BrowserManager({ bus: telemetryBus, lookup: publicLookup, cdp: connector });
++    const events = eventsOf(RUN);
++
++    assert.equal(await manager.browserModeForUser("alice"), "cdp");
++    assert.deepEqual(state.resolveCalls, ["alice"]);
++    assert.deepEqual(state.connectCalls, [], "mode resolution alone does not attach");
++
++    const result = await manager.navigate(RUN, PUBLIC_URL, { userId: "alice" });
++    assert.equal(result.ok, true);
++    assert.deepEqual(state.connectCalls, ["http://172.18.0.4:9223"]);
++    if (result.ok) {
++      assert.equal(result.url, PUBLIC_URL);
++      assert.equal(result.title, "Agent Page");
++    }
++    // The goto went to the agent's tab; no host session was created.
++    assert.deepEqual(cdpPage.state.gotoCalls, [PUBLIC_URL]);
++    const frame = await manager.getFrame(RUN, { userId: "alice" });
++    assert.ok(frame);
++    assert.equal(frame?.jpeg, JPEG);
++    assert.ok(events.some((e) => e.type === "browser.navigated"));
++    assert.ok(events.some((e) => e.type === "browser.frame"));
++    await manager.close(RUN);
++  });
++});
++
++test("CDP mode: an agent navigation (framenavigated) updates url/title and frame", async () => {
++  await withDesktopMode(async () => {
++    const cdpPage = fakeCdpPage({ url: "https://example.com/", title: "Agent Page" });
++    const cdpContext = fakeCdpContext(cdpPage.page);
++    const cdpBrowser = fakeCdpBrowser(cdpContext.context);
++    const { connector } = fakeCdpConnector(cdpBrowser.browser);
++    const manager = new BrowserManager({ bus: telemetryBus, lookup: publicLookup, cdp: connector });
++    const events = eventsOf(RUN);
++
++    // Opening the tab attaches to the agent's Chromium (no user navigate needed).
++    const initial = await manager.getFrame(RUN, { userId: "alice" });
++    assert.ok(initial, "attaching must capture the live tab's frame at once");
++    assert.equal(cdpPage.state.screenshotCalls, 1);
++
++    // The agent navigates via MCP: the tab commits a new document.
++    cdpPage.state.url = "https://example.org/next";
++    cdpPage.state.title = "Next Page";
++    cdpPage.emit("framenavigated", cdpPage.mainFrame);
++    // The navigation handler runs async; let it settle.
++    await new Promise((resolve) => setTimeout(resolve, 10));
++
++    const nav = events.filter((e) => e.type === "browser.navigated").pop();
++    assert.ok(nav);
++    assert.deepEqual(nav?.data, { url: "https://example.org/next", title: "Next Page" });
++    assert.ok(cdpPage.state.screenshotCalls >= 2, "agent navigation captures a fresh frame");
++    const frame = await manager.getFrame(RUN, { userId: "alice" });
++    assert.ok(frame);
++    await manager.close(RUN);
++  });
++});
++
++test("CDP mode: close detaches but never closes the agent's context or browser", async () => {
++  await withDesktopMode(async () => {
++    const cdpPage = fakeCdpPage({ url: "https://example.com/" });
++    const cdpContext = fakeCdpContext(cdpPage.page);
++    const cdpBrowser = fakeCdpBrowser(cdpContext.context);
++    const { connector } = fakeCdpConnector(cdpBrowser.browser);
++    const manager = new BrowserManager({ bus: telemetryBus, lookup: publicLookup, cdp: connector });
++
++    await manager.navigate(RUN, PUBLIC_URL, { userId: "alice" });
++    await manager.close(RUN);
++    // The CDP disconnect is async; let it settle.
++    await new Promise((resolve) => setImmediate(resolve));
++
++    assert.equal(cdpContext.state.closeCalls, 0, "the agent's context must stay open");
++    assert.equal(cdpBrowser.state.closeCalls, 1, "the CDP connection disconnects");
++    await manager.close(RUN);
++    assert.equal(cdpBrowser.state.closeCalls, 1, "closing twice disconnects once");
++  });
++});
++
++test("fake-driver fallback: no CDP endpoint reports the browser runs in the VM", async () => {
++  await withDesktopMode(async () => {
++    const cdpPage = fakeCdpPage();
++    const cdpContext = fakeCdpContext(cdpPage.page);
++    const cdpBrowser = fakeCdpBrowser(cdpContext.context);
++    const { connector, state } = fakeCdpConnector(cdpBrowser.browser, {
++      ok: false,
++      reason: "VM has no display",
++    });
++    const manager = new BrowserManager({ bus: telemetryBus, lookup: publicLookup, cdp: connector });
++    const events = eventsOf(RUN);
++
++    assert.equal(await manager.browserModeForUser("alice"), "in-vm");
++
++    const nav = await manager.navigate(RUN, PUBLIC_URL, { userId: "alice" });
++    assert.equal(nav.ok, false);
++    if (!nav.ok) assert.equal(nav.reason, IN_VM_BROWSER_MESSAGE);
++    // No attach attempted, no host browser touched.
++    assert.equal(state.connectCalls.length, 0);
++    assert.equal(cdpPage.state.gotoCalls.length, 0);
++
++    const shot = await manager.screenshot(RUN, { userId: "alice" });
++    assert.equal(shot.ok, false);
++    if (!shot.ok) assert.equal(shot.reason, IN_VM_BROWSER_MESSAGE);
++
++    // The tab learns the state from the stream, exactly once per run.
++    assert.equal(await manager.getFrame(RUN, { userId: "alice" }), null);
++    assert.equal(await manager.getFrame(RUN, { userId: "alice" }), null);
++    assert.equal(events.filter((e) => e.type === "browser.unavailable").length, 1);
++    assert.deepEqual(events.find((e) => e.type === "browser.unavailable")?.data, {
++      reason: IN_VM_BROWSER_MESSAGE,
++    });
++    await manager.close(RUN);
++  });
++});
++
++test("SWARM_BROWSER_HOST=1 keeps the host launch in desktop mode", async () => {
++  const prevDesktop = process.env.SWARM_VM_DESKTOP;
++  const prevHost = process.env.SWARM_BROWSER_HOST;
++  process.env.SWARM_VM_DESKTOP = "1";
++  process.env.SWARM_BROWSER_HOST = "1";
++  try {
++    const { page, state } = fakePage();
++    const cdpPage = fakeCdpPage();
++    const cdpContext = fakeCdpContext(cdpPage.page);
++    const cdpBrowser = fakeCdpBrowser(cdpContext.context);
++    const { connector, state: cdpState } = fakeCdpConnector(cdpBrowser.browser);
++    const manager = new FakeBrowserManager(makeSession(page), publicLookup);
++    // Swap in the CDP connector the same way the real manager wires it.
++    (manager as unknown as { cdp: CdpConnector }).cdp = connector;
++
++    assert.equal(await manager.browserModeForUser("alice"), "host");
++    assert.equal(cdpState.resolveCalls.length, 0, "host mode never resolves a CDP endpoint");
++
++    const result = await manager.navigate(RUN, PUBLIC_URL, { userId: "alice" });
++    assert.equal(result.ok, true);
++    assert.deepEqual(state.gotoCalls, [PUBLIC_URL]);
++    assert.equal(cdpPage.state.gotoCalls.length, 0, "the agent's tab was not driven");
++    await manager.close(RUN);
++  } finally {
++    if (prevDesktop === undefined) delete process.env.SWARM_VM_DESKTOP;
++    else process.env.SWARM_VM_DESKTOP = prevDesktop;
++    if (prevHost === undefined) delete process.env.SWARM_BROWSER_HOST;
++    else process.env.SWARM_BROWSER_HOST = prevHost;
++  }
++});
+diff --git a/apps/swarmagents/lib/browser/manager.ts b/apps/swarmagents/lib/browser/manager.ts
+index ef14b2140..745e61c13 100644
+--- a/apps/swarmagents/lib/browser/manager.ts
++++ b/apps/swarmagents/lib/browser/manager.ts
+@@ -23,11 +23,33 @@
+  * The browser process is launched lazily on first use and shared across runs;
+  * sessions idle for SESSION_IDLE_MS are closed by the sweeper, and a run's
+  * session is closed automatically when the run reaches a terminal state.
++ *
++ * In desktop mode (task l10) there is no host-launched browser: the agent
++ * drives the VM's own Chromium, so the manager attaches to it over CDP
++ * (`chromium.connectOverCDP`, see ./cdp-endpoint.ts) and mirrors its active
++ * tab — the user's navigate drives that same page, and agent-driven
++ * navigations update the URL bar and frame via `framenavigated`. When no
++ * CDP endpoint resolves (fake driver, no display, forwarder unavailable)
++ * the run's browser is reported as running inside the user's computer
++ * instead of launching a host Chromium that is not the agent's browser;
++ * SWARM_BROWSER_HOST=1 keeps the legacy host launch as an escape hatch.
++ * CDP sessions never close the agent's context, page, or browser — closing
++ * a session only detaches listeners and drops the CDP connection.
+  */
+ 
+ import { promises as dns } from "node:dns";
+-import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
++import { chromium, type Browser, type BrowserContext, type Frame, type Page } from "playwright-core";
+ import { telemetryBus, type TelemetryBus } from "../telemetry/index";
++import { getRun } from "../runtime/run-store";
++import { isDesktopModeEnabled } from "../vm/desktop";
++import { vmManager } from "../vm/manager";
++import {
++  IN_VM_BROWSER_MESSAGE,
++  isHostBrowserForced,
++  resolveCdpEndpoint,
++  type CdpEndpoint,
++  type CdpResolution,
++} from "./cdp-endpoint";
+ import {
+   checkNavigation,
+   isAddressLiteral,
+@@ -53,12 +75,36 @@ export type ScreenshotResult =
+   | { ok: true; frameId: number; width: number; height: number }
+   | { ok: false; reason: string };
+ 
++/** How a run's browser is served: host-launched, CDP-mirrored, or in-VM-only. */
++export type BrowserMode = "host" | "cdp" | "in-vm";
++
++/** Extra context a caller may pass; the run's owner when the route knows it. */
++export interface BrowserCallOptions {
++  userId?: string;
++}
++
++/**
++ * The CDP attach surface (injected in tests; the default resolves the
++ * endpoint for the run's owner via the VM manager and connects with
++ * `chromium.connectOverCDP`).
++ */
++export interface CdpConnector {
++  resolveEndpoint(userId: string): Promise<CdpResolution>;
++  connect(endpointUrl: string): Promise<Browser>;
++}
++
+ /** The control surface the routes (and tests) depend on. */
+ export interface BrowserControl {
+-  navigate(runId: string, url: string): Promise<NavigateResult>;
+-  screenshot(runId: string): Promise<ScreenshotResult>;
+-  getFrame(runId: string): Promise<BrowserFrame | null>;
++  navigate(runId: string, url: string, opts?: BrowserCallOptions): Promise<NavigateResult>;
++  screenshot(runId: string, opts?: BrowserCallOptions): Promise<ScreenshotResult>;
++  getFrame(runId: string, opts?: BrowserCallOptions): Promise<BrowserFrame | null>;
+   close(runId: string): Promise<void>;
++  /**
++   * The browser mode for a user ("host" | "cdp" | "in-vm"). Optional so
++   * stubs pre-dating the CDP mirror keep working; routes treat a missing
++   * method as "not CDP" and keep the desktop-mode gate closed.
++   */
++  browserModeForUser?(userId: string): Promise<BrowserMode>;
+ }
+ 
+ /** Cap on published frame rate (frames per second). */
+@@ -83,6 +129,18 @@ interface RunSession {
+   lastCaptureAt: number;
+   heartbeat: ReturnType<typeof setInterval>;
+   unsubscribe: () => void;
++  /** "host" = this process launched Chromium; "cdp" = attached to the agent's VM Chromium. */
++  mode?: BrowserMode;
++  /** CDP connection (cdp mode only); disconnect on close, never close the agent's browser. */
++  cdpBrowser?: Browser;
++  cdpEndpointUrl?: string;
++  /** Set on close so late page/context events are ignored. */
++  closed?: boolean;
++  /** Detachable page/context listeners (stored so a page switch can unhook the old page). */
++  onLoad?: () => void;
++  onRequestFinished?: () => void;
++  onFrameNavigated?: (frame: Frame) => void;
++  onNewPage?: (page: Page) => void;
+ }
+ 
+ function busPublish(bus: TelemetryBus, runId: string, type: string, data: unknown): void {
+@@ -94,6 +152,28 @@ function busPublish(bus: TelemetryBus, runId: string, type: string, data: unknow
+   }
+ }
+ 
++/**
++ * The agent's active tab: the most recently opened non-blank page, else
++ * the most recently opened page. Closed pages report nothing and are
++ * skipped. Returns undefined when the context has no pages at all.
++ */
++function pickActivePage(context: BrowserContext): Page | undefined {
++  let pages: Page[];
++  try {
++    pages = context.pages();
++  } catch {
++    return undefined;
++  }
++  const live = pages.filter((page) => {
++    try {
++      return page.url() !== "about:blank";
++    } catch {
++      return false;
++    }
++  });
++  return live[live.length - 1] ?? pages[pages.length - 1];
++}
++
+ /** Resolve a hostname to all of its A/AAAA records (`[]` when unresolvable). */
+ async function lookupAddresses(host: string): Promise<string[]> {
+   try {
+@@ -142,16 +222,97 @@ function executablePath(): string | undefined {
+   return process.env.PW_CHROMIUM_PATH?.trim() || process.env.SWARM_BROWSER_EXECUTABLE?.trim() || undefined;
+ }
+ 
++/** Endpoint resolutions are cached briefly per user (a VM IP / display can appear). */
++const MODE_CACHE_TTL_MS = 60_000;
++
+ export class BrowserManager implements BrowserControl {
+   private readonly bus: TelemetryBus;
+   /** DNS resolver used by the navigation preflight (injectable in tests). */
+   private readonly lookup: (host: string) => Promise<string[]>;
++  /** CDP attach surface (injectable in tests; defaults to the live VM manager). */
++  private readonly cdp: CdpConnector;
+   private readonly sessions = new Map<string, Promise<RunSession>>();
+   private browserPromise: Promise<Browser> | null = null;
+-
+-  constructor(options: { bus?: TelemetryBus; lookup?: (host: string) => Promise<string[]> } = {}) {
++  /** CDP connections shared per endpoint URL, with a session refcount. */
++  private cdpBrowsers = new Map<string, { browser: Promise<Browser>; refs: number }>();
++  private modeCache = new Map<string, { mode: BrowserMode; endpoint?: CdpEndpoint; at: number }>();
++  /** Runs already told (once) that their browser lives in the VM. */
++  private announcedUnavailable = new Set<string>();
++
++  constructor(
++    options: { bus?: TelemetryBus; lookup?: (host: string) => Promise<string[]>; cdp?: CdpConnector } = {},
++  ) {
+     this.bus = options.bus ?? telemetryBus;
+     this.lookup = options.lookup ?? lookupAddresses;
++    this.cdp = options.cdp ?? defaultCdpConnector();
++  }
++
++  // --- browser mode ---------------------------------------------------------
++
++  /**
++   * The browser mode for a user: "host" when the host launch applies
++   * (desktop mode off, or SWARM_BROWSER_HOST=1), "cdp" when the VM's
++   * Chromium is reachable, "in-vm" when the browser runs inside the user's
++   * computer but cannot be mirrored (fake driver / no display / forwarder
++   * unavailable). Cached briefly per user.
++   */
++  async browserModeForUser(userId: string): Promise<BrowserMode> {
++    return (await this.modeForUser(userId)).mode;
++  }
++
++  private async modeForUser(userId: string): Promise<{ mode: BrowserMode; endpoint?: CdpEndpoint }> {
++    const cached = this.modeCache.get(userId);
++    if (cached && Date.now() - cached.at < MODE_CACHE_TTL_MS) return cached;
++    let resolved: { mode: BrowserMode; endpoint?: CdpEndpoint };
++    if (isHostBrowserForced() || !isDesktopModeEnabled()) {
++      resolved = { mode: "host" };
++    } else {
++      const res = await this.cdp.resolveEndpoint(userId).catch((error) => ({
++        ok: false as const,
++        reason: `CDP resolution failed: ${error instanceof Error ? error.message : String(error)}`,
++      }));
++      if (res.ok) {
++        resolved = { mode: "cdp", endpoint: res.endpoint };
++      } else {
++        // The user-facing state is "in the VM" either way; the reason is
++        // server-side context for why the mirror is down.
++        console.error(`[browser] CDP endpoint unavailable for ${userId}: ${res.reason}`);
++        resolved = { mode: "in-vm" };
++      }
++    }
++    this.modeCache.set(userId, { ...resolved, at: Date.now() });
++    return resolved;
++  }
++
++  /** The run's owner: the caller's userId when known, else the run log. */
++  private userIdForRun(runId: string, userId?: string): string | null {
++    if (userId) return userId;
++    try {
++      return getRun(runId)?.summary.userId ?? null;
++    } catch {
++      return null;
++    }
++  }
++
++  /** The browser mode for a run; runs with no known owner stay on "host". */
++  private async modeForRun(
++    runId: string,
++    userId?: string,
++  ): Promise<{ mode: BrowserMode; endpoint?: CdpEndpoint }> {
++    const owner = this.userIdForRun(runId, userId);
++    if (!owner) {
++      // Without an owner there is no VM to mirror; in desktop mode that is
++      // the in-VM state, not a reason to launch a host browser.
++      return isDesktopModeEnabled() && !isHostBrowserForced() ? { mode: "in-vm" } : { mode: "host" };
++    }
++    return this.modeForUser(owner);
++  }
++
++  /** Tell the run's stream (once) that its browser lives in the VM. */
++  private announceUnavailable(runId: string): void {
++    if (this.announcedUnavailable.has(runId)) return;
++    this.announcedUnavailable.add(runId);
++    busPublish(this.bus, runId, "browser.unavailable", { reason: IN_VM_BROWSER_MESSAGE });
+   }
+ 
+   // --- lifecycle -----------------------------------------------------------
+@@ -183,17 +344,10 @@ export class BrowserManager implements BrowserControl {
+       pendingChange: true,
+       lastActivityAt: Date.now(),
+       lastCaptureAt: 0,
++      mode: "host",
+     } as RunSession;
+ 
+-    // Any browser activity marks the run as needing a fresh frame.
+-    page.on("load", () => {
+-      session.pendingChange = true;
+-      session.lastActivityAt = Date.now();
+-    });
+-    page.on("requestfinished", () => {
+-      session.pendingChange = true;
+-      session.lastActivityAt = Date.now();
+-    });
++    this.attachPageListeners(session, page, runId);
+ 
+     this.attachRequestGuards(page);
+ 
+@@ -212,6 +366,186 @@ export class BrowserManager implements BrowserControl {
+     return session;
+   }
+ 
++  /**
++   * Attach to the agent's in-VM Chromium over CDP and mirror its active
++   * tab. The context and page belong to the agent: no request guards are
++   * installed (the agent's traffic must not be intercepted), no new
++   * context is created, and closing the session never closes them.
++   */
++  protected async createCdpSession(runId: string, endpoint: CdpEndpoint): Promise<RunSession> {
++    const browser = await this.cdpBrowser(endpoint.url);
++    try {
++      const contexts = browser.contexts();
++      const context = contexts[0];
++      if (!context) throw new Error("The agent's Chromium has no open context yet");
++      let page = pickActivePage(context);
++      if (!page) page = await context.newPage();
++      const session = {
++        context,
++        page,
++        frame: null,
++        frameSeq: 0,
++        pendingChange: true,
++        lastActivityAt: Date.now(),
++        lastCaptureAt: 0,
++        mode: "cdp",
++        cdpBrowser: browser,
++        cdpEndpointUrl: endpoint.url,
++      } as RunSession;
++
++      // Seed url/title from the live tab so the URL bar is right at once.
++      try {
++        session.url = page.url();
++      } catch {
++        // A closed tab reports nothing; the first navigation fills it in.
++      }
++      session.title = (await page.title().catch(() => "")).slice(0, MAX_TITLE_LEN);
++
++      this.attachPageListeners(session, page, runId);
++
++      // The agent may open a new tab: follow it so the mirror tracks the
++      // active tab rather than a stale one.
++      session.onNewPage = (newPage: Page) => {
++        void this.switchCdpPage(runId, session, newPage);
++      };
++      context.on("page", session.onNewPage);
++
++      // Auto-close when the run ends: detach only — the agent's browser
++      // keeps running for its own sake.
++      session.unsubscribe = this.bus.subscribe(runId, 0, (event) => {
++        if (event.type === "run.finished" || event.type === "run.error" || event.type === "run.cancelled") {
++          void this.close(runId);
++        }
++      });
++
++      session.heartbeat = setInterval(() => {
++        void this.captureFrame(runId, session, false);
++      }, FRAME_HEARTBEAT_MS);
++      session.heartbeat.unref?.();
++
++      // The agent may already be on a page: capture a frame at once so the
++      // tab is not blank until the next heartbeat.
++      await this.captureFrame(runId, session, true);
++      return session;
++    } catch (error) {
++      this.releaseCdpBrowser(endpoint.url);
++      throw error;
++    }
++  }
++
++  /** Hook the page events a session needs; stored for later detach. */
++  private attachPageListeners(session: RunSession, page: Page, runId: string): void {
++    // Any browser activity marks the run as needing a fresh frame.
++    const onLoad = () => {
++      session.pendingChange = true;
++      session.lastActivityAt = Date.now();
++    };
++    const onRequestFinished = () => {
++      session.pendingChange = true;
++      session.lastActivityAt = Date.now();
++    };
++    page.on("load", onLoad);
++    page.on("requestfinished", onRequestFinished);
++    session.onLoad = onLoad;
++    session.onRequestFinished = onRequestFinished;
++    if (session.mode === "cdp") {
++      // The agent navigating (e.g. via MCP) commits here first: update the
++      // URL bar and frame at once instead of waiting for the heartbeat.
++      const onFrameNavigated = (frame: Frame) => {
++        if (session.closed) return;
++        try {
++          if (frame !== page.mainFrame()) return;
++        } catch {
++          return;
++        }
++        void this.onAgentNavigation(runId, session);
++      };
++      page.on("framenavigated", onFrameNavigated);
++      session.onFrameNavigated = onFrameNavigated;
++    }
++  }
++
++  /** Unhook the listeners attachPageListeners registered on a page. */
++  private detachPageListeners(session: RunSession, page: Page): void {
++    try {
++      if (session.onLoad) page.off("load", session.onLoad);
++      if (session.onRequestFinished) page.off("requestfinished", session.onRequestFinished);
++      if (session.onFrameNavigated) page.off("framenavigated", session.onFrameNavigated);
++    } catch {
++      // The page is already closed; nothing left to unhook.
++    }
++    session.onLoad = undefined;
++    session.onRequestFinished = undefined;
++    session.onFrameNavigated = undefined;
++  }
++
++  /** Follow a newly opened tab in the agent's Chromium. */
++  private async switchCdpPage(runId: string, session: RunSession, newPage: Page): Promise<void> {
++    if (session.closed || session.mode !== "cdp") return;
++    const pending = this.sessions.get(runId);
++    if (!pending) return;
++    let current: RunSession | undefined;
++    try {
++      current = await pending;
++    } catch {
++      return;
++    }
++    if (current !== session || session.closed) return;
++    this.detachPageListeners(session, session.page);
++    session.page = newPage;
++    session.pendingChange = true;
++    this.attachPageListeners(session, newPage, runId);
++    await this.onAgentNavigation(runId, session);
++  }
++
++  /** The agent navigated the mirrored tab: publish url/title + a fresh frame. */
++  private async onAgentNavigation(runId: string, session: RunSession): Promise<void> {
++    if (session.closed) return;
++    let url: string;
++    try {
++      url = session.page.url();
++    } catch {
++      return;
++    }
++    const title = (await session.page.title().catch(() => "")).slice(0, MAX_TITLE_LEN);
++    session.url = url;
++    session.title = title;
++    session.pendingChange = true;
++    session.lastActivityAt = Date.now();
++    busPublish(this.bus, runId, "browser.navigated", { url, title });
++    await this.captureFrame(runId, session, true);
++  }
++
++  /**
++   * A CDP connection shared per endpoint URL (one VM Chromium serves every
++   * run of its user). Refcounted so the connection drops when its last
++   * session closes; `browser.close()` on a connectOverCDP browser only
++   * disconnects — the agent's Chromium keeps running.
++   */
++  private cdpBrowser(endpointUrl: string): Promise<Browser> {
++    let entry = this.cdpBrowsers.get(endpointUrl);
++    if (!entry) {
++      entry = { browser: this.cdp.connect(endpointUrl), refs: 0 };
++      this.cdpBrowsers.set(endpointUrl, entry);
++      entry.browser.catch(() => {
++        if (this.cdpBrowsers.get(endpointUrl) === entry) this.cdpBrowsers.delete(endpointUrl);
++      });
++    }
++    entry.refs += 1;
++    return entry.browser;
++  }
++
++  private releaseCdpBrowser(endpointUrl?: string): void {
++    if (!endpointUrl) return;
++    const entry = this.cdpBrowsers.get(endpointUrl);
++    if (!entry) return;
++    entry.refs = Math.max(0, entry.refs - 1);
++    if (entry.refs === 0) {
++      this.cdpBrowsers.delete(endpointUrl);
++      void entry.browser.then((browser) => browser.close()).catch(() => {});
++    }
++  }
++
+   /**
+    * Intercept every request the page makes and refuse ones that violate the
+    * DNS-aware policy (see ./policy.ts). This closes the side channels a
+@@ -238,10 +572,10 @@ export class BrowserManager implements BrowserControl {
+     });
+   }
+ 
+-  private ensureSession(runId: string): Promise<RunSession> {
++  private ensureSession(runId: string, userId?: string): Promise<RunSession> {
+     let pending = this.sessions.get(runId);
+     if (!pending) {
+-      pending = this.createSession(runId);
++      pending = this.createSessionForRun(runId, userId);
+       this.sessions.set(runId, pending);
+       // A failed launch must not poison the run forever; drop the entry so the
+       // next call retries Chromium fresh.
+@@ -252,19 +586,47 @@ export class BrowserManager implements BrowserControl {
+     return pending;
+   }
+ 
++  /** Create the session the run's mode calls for (CDP mirror or host launch). */
++  private async createSessionForRun(runId: string, userId?: string): Promise<RunSession> {
++    const { mode, endpoint } = await this.modeForRun(runId, userId);
++    if (mode === "in-vm") {
++      // The browser runs inside the user's computer and cannot be mirrored;
++      // callers report IN_VM_BROWSER_MESSAGE instead of launching a host
++      // Chromium that is not the agent's browser.
++      throw new Error(IN_VM_BROWSER_MESSAGE);
++    }
++    if (mode === "cdp" && endpoint) return this.createCdpSession(runId, endpoint);
++    return this.createSession(runId);
++  }
++
+   /**
+    * Close a run's browser session. Swallows errors (the browser may already be
+-   * closed) and always clears the session map entry.
++   * closed) and always clears the session map entry. In CDP mode the page,
++   * context, and browser belong to the agent's VM Chromium and are never
++   * closed — only our listeners detach and the CDP connection drops.
+    */
+   async close(runId: string): Promise<void> {
+     const pending = this.sessions.get(runId);
+     if (!pending) return;
+     this.sessions.delete(runId);
++    this.announcedUnavailable.delete(runId);
+     try {
+       const session = await pending;
+       clearInterval(session.heartbeat);
+       session.unsubscribe();
+-      await session.context.close().catch(() => {});
++      session.closed = true;
++      if (session.mode === "cdp") {
++        this.detachPageListeners(session, session.page);
++        try {
++          if (session.onNewPage) session.context.off("page", session.onNewPage);
++        } catch {
++          // The context is already gone; nothing left to unhook.
++        }
++        session.onNewPage = undefined;
++        this.releaseCdpBrowser(session.cdpEndpointUrl);
++      } else {
++        await session.context.close().catch(() => {});
++      }
+     } catch {
+       // Session creation itself failed; nothing to tear down.
+     }
+@@ -300,9 +662,10 @@ export class BrowserManager implements BrowserControl {
+    * Navigate the run's browser to `url`. Policy violations (bad scheme,
+    * private address, unresolvable or private-resolving hostname) are refused
+    * before Chromium loads anything, and the destination is double-checked
+-   * after load (redirect handling).
++   * after load (redirect handling). In CDP mode this drives the agent's
++   * in-VM tab — the same page the Screen tab shows.
+    */
+-  async navigate(runId: string, raw: string): Promise<NavigateResult> {
++  async navigate(runId: string, raw: string, opts?: BrowserCallOptions): Promise<NavigateResult> {
+     const fail = (reason: string): NavigateResult => {
+       busPublish(this.bus, runId, "browser.error", { action: "navigate", url: raw, reason });
+       return { ok: false, reason };
+@@ -315,11 +678,19 @@ export class BrowserManager implements BrowserControl {
+     const blockedAddr = await dnsBlockedAddress(url.hostname, this.lookup);
+     if (blockedAddr) return fail(`Destination resolves to private address ${blockedAddr}`);
+ 
++    const mode = await this.modeForRun(runId, opts?.userId);
++    if (mode.mode === "in-vm") return fail(IN_VM_BROWSER_MESSAGE);
++
+     let session: RunSession;
+     try {
+-      session = await this.ensureSession(runId);
++      session = await this.ensureSession(runId, opts?.userId);
+     } catch (error) {
+-      return fail(`Could not start headless Chromium: ${error instanceof Error ? error.message : String(error)}`);
++      if (error instanceof Error && error.message === IN_VM_BROWSER_MESSAGE) return fail(IN_VM_BROWSER_MESSAGE);
++      const launch =
++        mode.mode === "cdp"
++          ? "Could not attach to the agent's Chromium (CDP)"
++          : "Could not start headless Chromium";
++      return fail(`${launch}: ${error instanceof Error ? error.message : String(error)}`);
+     }
+ 
+     try {
+@@ -353,12 +724,27 @@ export class BrowserManager implements BrowserControl {
+   }
+ 
+   /** Capture the current page immediately (the agent's "take a screenshot"). */
+-  async screenshot(runId: string): Promise<ScreenshotResult> {
++  async screenshot(runId: string, opts?: BrowserCallOptions): Promise<ScreenshotResult> {
++    const mode = await this.modeForRun(runId, opts?.userId);
++    if (mode.mode === "in-vm") {
++      const reason = IN_VM_BROWSER_MESSAGE;
++      busPublish(this.bus, runId, "browser.error", { action: "screenshot", reason });
++      return { ok: false, reason };
++    }
+     let session: RunSession;
+     try {
+-      session = await this.ensureSession(runId);
++      session = await this.ensureSession(runId, opts?.userId);
+     } catch (error) {
+-      const reason = `Could not start headless Chromium: ${error instanceof Error ? error.message : String(error)}`;
++      if (error instanceof Error && error.message === IN_VM_BROWSER_MESSAGE) {
++        const reason = IN_VM_BROWSER_MESSAGE;
++        busPublish(this.bus, runId, "browser.error", { action: "screenshot", reason });
++        return { ok: false, reason };
++      }
++      const launch =
++        mode.mode === "cdp"
++          ? "Could not attach to the agent's Chromium (CDP)"
++          : "Could not start headless Chromium";
++      const reason = `${launch}: ${error instanceof Error ? error.message : String(error)}`;
+       busPublish(this.bus, runId, "browser.error", { action: "screenshot", reason });
+       return { ok: false, reason };
+     }
+@@ -371,16 +757,38 @@ export class BrowserManager implements BrowserControl {
+     return { ok: true, frameId: frame.frameId, width: frame.width, height: frame.height };
+   }
+ 
+-  /** Latest frame for a run (null until the first capture). */
+-  async getFrame(runId: string): Promise<BrowserFrame | null> {
++  /**
++   * Latest frame for a run (null until the first capture). In CDP mode this
++   * attaches to the agent's Chromium on first call, so agent-driven
++   * navigation mirrors without the user having to navigate first; in
++   * in-vm mode it reports the unavailable state to the run's stream
++   * (once) instead. In host mode it stays a pure read — polling must not
++   * launch a Chromium.
++   */
++  async getFrame(runId: string, opts?: BrowserCallOptions): Promise<BrowserFrame | null> {
+     const pending = this.sessions.get(runId);
+-    if (!pending) return null;
+-    try {
+-      const session = await pending;
+-      return session.frame;
+-    } catch {
++    if (pending) {
++      try {
++        const session = await pending;
++        return session.frame;
++      } catch {
++        return null;
++      }
++    }
++    const mode = await this.modeForRun(runId, opts?.userId);
++    if (mode.mode === "in-vm") {
++      this.announceUnavailable(runId);
+       return null;
+     }
++    if (mode.mode === "cdp") {
++      try {
++        const session = await this.ensureSession(runId, opts?.userId);
++        return session.frame;
++      } catch {
++        return null;
++      }
++    }
++    return null;
+   }
+ 
+   // --- frame capture -------------------------------------------------------
+@@ -428,6 +836,20 @@ export class BrowserManager implements BrowserControl {
+   }
+ }
+ 
++/** The live CDP connector: resolve the endpoint for the run's owner via the VM manager. */
++function defaultCdpConnector(): CdpConnector {
++  return {
++    resolveEndpoint: (userId: string) =>
++      resolveCdpEndpoint(userId, {
++        desktopMode: isDesktopModeEnabled(),
++        hostBrowserForced: isHostBrowserForced(),
++        getDesktopEndpoint: (u: string) => vmManager.desktopEndpoint(u),
++        execInVm: (u: string, argv: string[]) => vmManager.exec(u, argv),
++      }),
++    connect: (endpointUrl: string) => chromium.connectOverCDP(endpointUrl),
++  };
++}
++
+ /**
+  * Process-wide singleton (same pattern as the telemetry bus / runtime
+  * manager) so route handlers share one Chromium process.
+diff --git a/apps/swarmagents/minimalist-ui/src/components/BrowserView.tsx b/apps/swarmagents/minimalist-ui/src/components/BrowserView.tsx
+index ab688daf5..42126c49e 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/BrowserView.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/BrowserView.tsx
+@@ -13,12 +13,18 @@
+  * the image bytes come from the polled frame route. Every frame-bearing event
+  * bumps the polling hook's refreshKey so a new screenshot appears immediately
+  * rather than waiting for the next poll tick.
++ *
++ * When the agent's browser runs inside the VM and cannot be mirrored over
++ * CDP (`browser.unavailable`, task l10), the viewport shows the in-VM state
++ * ("Browser runs inside your computer — open the Screen tab") and the
++ * address bar is disabled until a live frame arrives.
+  */
+ 
+ import React, { useCallback, useEffect, useRef, useState } from "react";
+-import { ArrowRight, Globe, Lock, RotateCcw, ShieldAlert } from "lucide-react";
++import { ArrowRight, Globe, Lock, Monitor, RotateCcw, ShieldAlert } from "lucide-react";
+ import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
+ import { useBrowserFrame } from "../../../lib/client/useBrowserFrame";
++import { IN_VM_BROWSER_MESSAGE } from "../../../lib/browser/cdp-endpoint";
+ 
+ interface BrowserViewProps {
+   /** Active runtime run id; when absent the view shows its idle state. */
+@@ -58,6 +64,32 @@ function timeAgo(fetchedAt: number, now: number): string {
+   return `${Math.floor(minutes / 60)}h ago`;
+ }
+ 
++function InVmState() {
++  return (
++    <div className="flex flex-col items-center justify-center gap-4 text-center max-w-md">
++      <div className="relative" aria-hidden="true">
++        <div className="absolute inset-0 rounded-full bg-cyan-500/10 blur-2xl" />
++        <div className="relative w-28 h-24 rounded-2xl border border-white/10 bg-gradient-to-b from-white/[0.08] to-white/[0.02] p-2 shadow-2xl">
++          <div className="flex items-center gap-1 pb-1.5 border-b border-white/10">
++            <span className="w-1.5 h-1.5 rounded-full bg-rose-400/60" />
++            <span className="w-1.5 h-1.5 rounded-full bg-amber-400/60" />
++            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400/60" />
++            <span className="ml-auto h-1.5 w-10 rounded-full bg-white/10" />
++          </div>
++          <div className="h-[calc(100%-0.75rem)] grid place-items-center text-cyan-400/80">
++            <Monitor className="w-7 h-7" />
++          </div>
++        </div>
++      </div>
++      <div className="text-sm font-medium text-white/90">{IN_VM_BROWSER_MESSAGE}</div>
++      <p className="text-xs text-white/40 leading-relaxed">
++        The agent is browsing on your computer&apos;s screen, and this tab
++        cannot mirror it yet. Switch to the Screen tab to watch it live.
++      </p>
++    </div>
++  );
++}
++
+ function EmptyState({ hasRun, error }: { hasRun: boolean; error?: string }) {
+   return (
+     <div className="flex flex-col items-center justify-center gap-4 text-center max-w-md">
+@@ -120,6 +152,8 @@ export function BrowserView({ runId }: BrowserViewProps) {
+   const [blocked, setBlocked] = useState<BlockedNotice>();
+   const [draft, setDraft] = useState("");
+   const [navBusy, setNavBusy] = useState(false);
++  /** The run's browser lives in the VM and cannot be mirrored (see InVmState). */
++  const [inVm, setInVm] = useState(false);
+   const [now, setNow] = useState(() => Date.now());
+   const blockedTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+ 
+@@ -142,23 +176,36 @@ export function BrowserView({ runId }: BrowserViewProps) {
+       setMeta({});
+       setBlocked(undefined);
+       setDraft("");
++      setInVm(false);
+       return;
+     }
+     let latestMeta: BrowserMeta = {};
+     let latestBlocked: BlockedNotice | undefined;
++    // The last of browser.unavailable / a live frame event wins: the mirror
++    // can light up after being unavailable, and vice versa.
++    let latestMode: "in-vm" | "live" | undefined;
+     for (const item of stream.items) {
+       if (item.kind === "browser.navigated" || item.kind === "browser.frame") {
+         const m = frameMeta(item);
+         if (m) latestMeta = { ...latestMeta, ...m };
++        latestMode = "live";
+         // A successful navigation clears any outstanding blocked notice.
+         if (item.kind === "browser.navigated") latestBlocked = undefined;
++      } else if (item.kind === "browser.unavailable") {
++        latestMode = "in-vm";
+       } else if (item.kind === "browser.error") {
+         const payload = item.data as { data?: { action?: string; reason?: string; url?: string } } | null;
+         if (payload?.data?.action === "navigate" && payload.data.reason) {
+-          latestBlocked = { reason: payload.data.reason, at: Date.now() };
++          if (payload.data.reason === IN_VM_BROWSER_MESSAGE) {
++            latestMode = "in-vm";
++          } else {
++            latestBlocked = { reason: payload.data.reason, at: Date.now() };
++          }
+         }
+       }
+     }
++    if (latestMode === "in-vm") setInVm(true);
++    else if (latestMode === "live") setInVm(false);
+     if (latestMeta.url !== undefined) {
+       setMeta(latestMeta);
+       setDraft((cur) => (cur === "" ? latestMeta.url! : cur));
+@@ -193,6 +240,9 @@ export function BrowserView({ runId }: BrowserViewProps) {
+           const finalUrl = data?.url ?? url;
+           setDraft(finalUrl);
+           setBlocked(undefined);
++        } else if (data?.error === IN_VM_BROWSER_MESSAGE) {
++          // The browser runs inside the computer and cannot be mirrored.
++          setInVm(true);
+         } else {
+           // The server refuses policy violations (and load failures) with a
+           // 400; surface the reason as a "blocked by policy" notice.
+@@ -207,6 +257,11 @@ export function BrowserView({ runId }: BrowserViewProps) {
+     [runId, navBusy],
+   );
+ 
++  // A live frame means the mirror is up; clear any in-VM state.
++  useEffect(() => {
++    if (frame.frameUrl) setInVm(false);
++  }, [frame.frameUrl]);
++
+   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+     if (e.key === "Enter") void navigate(draft);
+   };
+@@ -238,7 +293,7 @@ export function BrowserView({ runId }: BrowserViewProps) {
+             onChange={(e) => setDraft(e.target.value)}
+             onKeyDown={onKeyDown}
+             placeholder={runId ? "https://…" : "no active run — start an agent"}
+-            disabled={!runId || navBusy}
++            disabled={!runId || navBusy || inVm}
+             spellCheck={false}
+             autoCapitalize="off"
+             autoComplete="off"
+@@ -249,7 +304,7 @@ export function BrowserView({ runId }: BrowserViewProps) {
+ 
+         <button
+           onClick={() => void navigate(draft)}
+-          disabled={!runId || navBusy || !draft.trim()}
++          disabled={!runId || navBusy || !draft.trim() || inVm}
+           title="Navigate"
+           className="text-white/50 hover:text-cyan-300 disabled:opacity-30 transition"
+         >
+@@ -306,7 +361,9 @@ export function BrowserView({ runId }: BrowserViewProps) {
+ 
+       {/* Browser viewport */}
+       <div className="flex-1 min-h-0 grid place-items-center bg-[#07070a] p-6 overflow-hidden">
+-        {frame.frameUrl ? (
++        {inVm ? (
++          <InVmState />
++        ) : frame.frameUrl ? (
+           <img
+             src={frame.frameUrl}
+             alt="Agent browser"
+-- 
+2.55.0
+

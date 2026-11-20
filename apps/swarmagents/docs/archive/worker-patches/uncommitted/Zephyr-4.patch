@@ -1,0 +1,154 @@
+diff --git a/apps/swarmagents/lib/harness/role-mcp.ts b/apps/swarmagents/lib/harness/role-mcp.ts
+index 78b0753af..56e228273 100644
+--- a/apps/swarmagents/lib/harness/role-mcp.ts
++++ b/apps/swarmagents/lib/harness/role-mcp.ts
+@@ -93,6 +93,84 @@ export function isRoleListTool(name: string): boolean {
+   return name === ROLE_LIST_ROLES_TOOL || name.endsWith(`__${ROLE_LIST_ROLES_TOOL}`);
+ }
+ 
++/**
++ * The tool ids a role may actually call.
++ *
++ * A role's tool list is the ceiling, but the role's permission flags are the
++ * harder ceiling: a role can never grant more than its own permissions allow.
++ * A read-only role that still lists `write_file` does not get Write, a role
++ * without `allowBash` never gets Bash, and so on. Unknown (imported/MCP) tool
++ * ids pass through untouched — the harness cannot classify them.
++ */
++export function roleEffectiveTools(role: RoleDefinition): string[] {
++  const p = role.permissions;
++  return role.tools.filter((tool) => {
++    switch (tool) {
++      case "write_file":
++      case "edit_file":
++      case "restore_checkpoint":
++        return p.allowWrite && !p.readOnly;
++      case "bash":
++        return p.allowBash;
++      case "web_search":
++      case "web_fetch":
++      case "api_request":
++        return p.allowNetwork;
++      case "browser":
++        return p.allowBrowser;
++      case "subagent":
++        return p.allowSubagents;
++      default:
++        return true;
++    }
++  });
++}
++
++/**
++ * Claude Code permission strings that a role must NOT get.
++ *
++ * --allowedTools alone only pre-approves the listed tools; it does not stop
++ * the model from asking for others. The disallowed list is what actually
++ * enforces the role server-side: a researcher role cannot Write, Edit or run
++ * Bash even if it decides to try.
++ *
++ * The list is derived from the role's own tool vocabulary: every built-in tool
++ * the role does not grant is denied. Only real Claude Code tool names appear
++ * here (the role's own ids map onto them below); a role-only capability such
++ * as the API request tool has no Claude Code counterpart to deny.
++ */
++export function roleDisallowedTools(
++  role: RoleDefinition,
++  opts: { desktopMode?: boolean } = {},
++): string[] {
++  const granted = new Set(roleAllowedTools(role, opts));
++  const effective = new Set(roleEffectiveTools(role));
++  const out: string[] = [];
++  for (const [toolId, permission] of Object.entries(ROLE_TOOL_DENY_NAME)) {
++    if (effective.has(toolId)) continue;
++    if (granted.has(permission)) continue;
++    out.push(permission);
++  }
++  // The multi-edit spellings of Write/Edit follow Write/Edit.
++  if (!effective.has("write_file") && !effective.has("edit_file")) {
++    out.push("MultiEdit", "NotebookEdit");
++  }
++  return [...new Set(out)];
++}
++
++/**
++ * Role tool id -> the real Claude Code tool name that grants the same
++ * capability. Used to build the --disallowedTools list.
++ */
++const ROLE_TOOL_DENY_NAME: Record<string, string> = {
++  bash: "Bash",
++  write_file: "Write",
++  edit_file: "Edit",
++  web_search: "WebSearch",
++  web_fetch: "WebFetch",
++  subagent: "Task",
++};
++
+ /**
+  * Map a role's tool ids to Claude Code permission strings for --allowedTools.
+  * Unknown (imported/MCP) tool ids pass through as-is. The role-switch server
+@@ -105,7 +183,7 @@ export function roleAllowedTools(
+   opts: { desktopMode?: boolean } = {},
+ ): string[] {
+   const out = new Set<string>();
+-  for (const tool of role.tools) {
++  for (const tool of roleEffectiveTools(role)) {
+     out.add(ROLE_TOOL_PERMISSION[tool] ?? tool);
+   }
+   out.add(`mcp__${ROLE_MCP_SERVER_NAME}__*`);
+@@ -216,6 +294,9 @@ function roleDefinitionForId(roleId: string): RoleDefinition | null {
+ export function roleArgvFlags(phase: RolePhase): string[] {
+   const flags: string[] = [];
+   flags.push("--allowedTools", ...phase.allowedTools);
++  if (phase.disallowedTools?.length) {
++    flags.push("--disallowedTools", ...phase.disallowedTools);
++  }
+   flags.push("--mcp-config", phase.mcpConfigPath);
+   if (phase.appendSystemPrompt) flags.push("--append-system-prompt", phase.appendSystemPrompt);
+   return flags;
+@@ -239,10 +320,12 @@ export function roleSeedFiles(
+ 
+ /** Build the harness phase (argv config) for a role. */
+ export function rolePhase(role: RoleDefinition, opts: { desktopMode?: boolean } = {}): RolePhase {
++  const disallowedTools = roleDisallowedTools(role, opts);
+   return {
+     roleId: role.id,
+     roleName: role.name,
+     allowedTools: roleAllowedTools(role, opts),
++    ...(disallowedTools.length ? { disallowedTools } : {}),
+     mcpConfigPath: ROLE_MCP_CONFIG_PATH,
+     ...(role.instructions ? { appendSystemPrompt: role.instructions } : {}),
+   };
+diff --git a/apps/swarmagents/lib/harness/runner.ts b/apps/swarmagents/lib/harness/runner.ts
+index 58b9ce6d8..8b9af47d8 100644
+--- a/apps/swarmagents/lib/harness/runner.ts
++++ b/apps/swarmagents/lib/harness/runner.ts
+@@ -490,6 +490,11 @@ export class ClaudeCodeRunner {
+     const role = request.rolePhase;
+     if (role) {
+       argv.push("--allowedTools", ...role.allowedTools);
++      // The role's ceiling: the privileged tools this role may not use.
++      // --allowedTools only pre-approves; --disallowedTools actually blocks.
++      if (role.disallowedTools?.length) {
++        argv.push("--disallowedTools", ...role.disallowedTools);
++      }
+       argv.push("--mcp-config", role.mcpConfigPath);
+     }
+     const appended = [request.agentCard, role?.appendSystemPrompt].filter(Boolean).join("\n\n");
+diff --git a/apps/swarmagents/lib/harness/types.ts b/apps/swarmagents/lib/harness/types.ts
+index 510e393f0..2e9721d3f 100644
+--- a/apps/swarmagents/lib/harness/types.ts
++++ b/apps/swarmagents/lib/harness/types.ts
+@@ -147,6 +147,12 @@ export interface RolePhase {
+   roleName?: string;
+   /** Claude Code permission strings for --allowedTools (role tool whitelist). */
+   allowedTools: string[];
++  /**
++   * Claude Code permission strings for --disallowedTools: the privileged tools
++   * this role may not use. This is what actually enforces the role server-side
++   * (--allowedTools only pre-approves the listed tools).
++   */
++  disallowedTools?: string[];
+   /** Absolute path (inside the VM) of the --mcp-config JSON for this role. */
+   mcpConfigPath: string;
+   /** Role instructions appended after the run prompt (--append-system-prompt). */

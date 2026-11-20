@@ -1,0 +1,302 @@
+From 9acede2aaa3d91540e199f44ced963663532cabe Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 13:03:45 -0600
+Subject: [PATCH] feat(ratelimit): add rate limit headers on limited routes
+
+---
+ apps/swarmagents/lib/middleware.test.ts | 44 +++++++++++++++++++++
+ apps/swarmagents/lib/rate-limit.test.ts | 50 +++++++++++++++++++++++-
+ apps/swarmagents/lib/rate-limit.ts      | 52 +++++++++++++++++++++----
+ apps/swarmagents/middleware.ts          | 24 +++++++++---
+ 4 files changed, 155 insertions(+), 15 deletions(-)
+
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index 4700a77ff..3b3c2284d 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -84,3 +84,47 @@ test("the next param derived from a hostile URL stays a same-origin path", () =>
+   // only ever interpreted by the login page/API through safeNextPath.
+   assert.equal(res.status, 200);
+ });
++
++test("server-mode limited API responses include rate limit headers (api bucket)", async () => {
++  resetBuckets();
++  const cookie = `${SESSION_COOKIE}=${signSession("alice")}`;
++  const res = middleware(req("http://swarm.example.com/api/runtime/tasks", { host: "swarm.example.com", cookie }));
++  assert.equal(res.status, 200);
++  assert.equal(res.headers.get("X-RateLimit-Limit"), "300");
++  assert.ok(res.headers.get("X-RateLimit-Remaining") !== null);
++  assert.ok(res.headers.get("X-RateLimit-Reset") !== null);
++
++  resetBuckets();
++  const keyHeaders = { host: "swarm.example.com", cookie };
++  let limited: any;
++  for (let i = 0; i < 301; i++) {
++    limited = middleware(req("http://swarm.example.com/api/runtime/tasks", keyHeaders));
++  }
++  assert.equal(limited.status, 429);
++  assert.equal(limited.headers.get("Retry-After") !== null, true);
++  assert.equal(limited.headers.get("X-RateLimit-Limit"), "300");
++  assert.equal(limited.headers.get("X-RateLimit-Remaining"), "0");
++  assert.ok(limited.headers.get("X-RateLimit-Reset") !== null);
++});
++
++test("server-mode limited routes cover login bucket headers", async () => {
++  resetBuckets();
++  const headers = { host: "swarm.example.com" };
++  const res = middleware(req("http://swarm.example.com/api/login", headers));
++  // /api/login is public and unauthenticated here; middleware should still apply login-bucket headers on allowed response.
++  assert.equal(res.status, 200);
++  assert.equal(res.headers.get("X-RateLimit-Limit"), "5");
++  assert.ok(res.headers.get("X-RateLimit-Remaining") !== null);
++  assert.ok(res.headers.get("X-RateLimit-Reset") !== null);
++
++  resetBuckets();
++  let limited: any;
++  for (let i = 0; i < 6; i++) {
++    limited = middleware(req("http://swarm.example.com/api/login", headers));
++  }
++  assert.equal(limited.status, 429);
++  assert.equal(limited.headers.get("Retry-After") !== null, true);
++  assert.equal(limited.headers.get("X-RateLimit-Limit"), "5");
++  assert.equal(limited.headers.get("X-RateLimit-Remaining"), "0");
++  assert.ok(limited.headers.get("X-RateLimit-Reset") !== null);
++});
+diff --git a/apps/swarmagents/lib/rate-limit.test.ts b/apps/swarmagents/lib/rate-limit.test.ts
+index 24765a074..1c9f55d87 100644
+--- a/apps/swarmagents/lib/rate-limit.test.ts
++++ b/apps/swarmagents/lib/rate-limit.test.ts
+@@ -6,6 +6,7 @@ import {
+   clientIp,
+   rateLimitKey,
+   rateLimitCheck,
++  rateLimitHeaders,
+   rateLimitResponse,
+   resetBuckets,
+ } from "./rate-limit.js";
+@@ -154,10 +155,14 @@ test("rateLimitCheck applies api bucket for /api/signup", () => {
+   assert.equal(r!.allowed, false);
+ });
+ 
+-test("rateLimitResponse returns 429 with Retry-After", () => {
+-  const res = rateLimitResponse(42);
++test("rateLimitResponse returns 429 with Retry-After and rate limit headers", () => {
++  const result = { allowed: false, retryAfter: 42, limit: 5, remaining: 0, reset: 1234567890 };
++  const res = rateLimitResponse(result);
+   assert.equal(res.status, 429);
+   assert.equal(res.headers.get("Retry-After"), "42");
++  assert.equal(res.headers.get("X-RateLimit-Limit"), "5");
++  assert.equal(res.headers.get("X-RateLimit-Remaining"), "0");
++  assert.equal(res.headers.get("X-RateLimit-Reset"), "1234567890");
+ });
+ 
+ test("rateLimitCheck gives the swarm board its own larger bucket and exempts /api/health", () => {
+@@ -167,3 +172,44 @@ test("rateLimitCheck gives the swarm board its own larger bucket and exempts /ap
+   assert.equal(rateLimitCheck("/api/mcp/swarm-board", key)!.allowed, false);
+   assert.equal(rateLimitCheck("/api/health", key), null);
+ });
++
++test("limited routes expose rate limit headers and 429 includes Retry-After", () => {
++  resetBuckets();
++  const key = "test-headers-" + Date.now();
++  const ok = rateLimitCheck("/api/runtime/tasks", key);
++  assert.ok(ok);
++  assert.equal(ok!.allowed, true);
++  assert.equal(ok!.limit, 300);
++  assert.ok(ok!.remaining >= 0);
++  assert.ok(ok!.reset > 0);
++  const headers = rateLimitHeaders(ok!);
++  assert.equal(headers["X-RateLimit-Limit"], "300");
++  assert.equal(headers["X-RateLimit-Remaining"], String(ok!.remaining));
++  assert.equal(headers["X-RateLimit-Reset"], String(ok!.reset));
++
++  resetBuckets();
++  const loginKey = "test-login-headers-" + Date.now();
++  let blocked: any;
++  for (let i = 0; i < 6; i++) blocked = rateLimitCheck("/api/login", loginKey);
++  assert.ok(blocked);
++  assert.equal(blocked.allowed, false);
++  assert.equal(blocked.limit, 5);
++  assert.equal(blocked.remaining, 0);
++  assert.ok(blocked.retryAfter > 0);
++  const blockedRes = rateLimitResponse(blocked);
++  assert.equal(blockedRes.status, 429);
++  assert.equal(blockedRes.headers.get("Retry-After"), String(blocked.retryAfter));
++  assert.equal(blockedRes.headers.get("X-RateLimit-Limit"), "5");
++  assert.equal(blockedRes.headers.get("X-RateLimit-Remaining"), "0");
++  assert.equal(blockedRes.headers.get("X-RateLimit-Reset"), String(blocked.reset));
++});
++
++test("board bucket reports its own limit in headers", () => {
++  resetBuckets();
++  const key = "test-board-headers-" + Date.now();
++  const ok = rateLimitCheck("/api/mcp/swarm-board", key);
++  assert.ok(ok);
++  assert.equal(ok!.allowed, true);
++  assert.equal(ok!.limit, 1200);
++  assert.equal(rateLimitHeaders(ok!)["X-RateLimit-Limit"], "1200");
++});
+diff --git a/apps/swarmagents/lib/rate-limit.ts b/apps/swarmagents/lib/rate-limit.ts
+index fcd9136b2..674e12727 100644
+--- a/apps/swarmagents/lib/rate-limit.ts
++++ b/apps/swarmagents/lib/rate-limit.ts
+@@ -13,6 +13,14 @@ interface Bucket {
+   lastRefill: number;
+ }
+ 
++export interface RateLimitResult {
++  allowed: boolean;
++  retryAfter: number;
++  limit: number;
++  remaining: number;
++  reset: number;
++}
++
+ export class TokenBucket {
+   private buckets = new Map<string, Bucket>();
+ 
+@@ -21,7 +29,7 @@ export class TokenBucket {
+     private windowMs: number,
+   ) {}
+ 
+-  consume(key: string, tokens = 1): { allowed: boolean; retryAfter: number } {
++  consume(key: string, tokens = 1): RateLimitResult {
+     const now = Date.now();
+     let bucket = this.buckets.get(key);
+     if (!bucket) {
+@@ -40,16 +48,35 @@ export class TokenBucket {
+       const oldest = this.buckets.keys().next().value;
+       if (oldest !== undefined) this.buckets.delete(oldest);
+     }
++
++    const msPerToken = this.windowMs / this.capacity;
++    const resetMs = bucket.tokens >= this.capacity ? 0 : Math.ceil((this.capacity - bucket.tokens) * msPerToken);
++    const reset = Math.ceil((now + resetMs) / 1000);
++
+     if (bucket.tokens >= tokens) {
+       bucket.tokens -= tokens;
+       this.buckets.set(key, bucket);
+-      return { allowed: true, retryAfter: 0 };
++      const remaining = Math.max(0, Math.floor(bucket.tokens));
++      const afterResetMs = bucket.tokens >= this.capacity ? 0 : Math.ceil((this.capacity - bucket.tokens) * msPerToken);
++      return {
++        allowed: true,
++        retryAfter: 0,
++        limit: this.capacity,
++        remaining,
++        reset: Math.ceil((now + afterResetMs) / 1000),
++      };
+     }
+ 
+     const needed = tokens - bucket.tokens;
+-    const retryAfterMs = Math.ceil((needed / this.capacity) * this.windowMs);
++    const retryAfterMs = Math.ceil(needed * msPerToken);
+     this.buckets.set(key, bucket);
+-    return { allowed: false, retryAfter: Math.ceil(retryAfterMs / 1000) };
++    return {
++      allowed: false,
++      retryAfter: Math.ceil(retryAfterMs / 1000),
++      limit: this.capacity,
++      remaining: 0,
++      reset,
++    };
+   }
+ 
+   /** Internal: clear all buckets. */
+@@ -96,7 +123,7 @@ export function rateLimitKey(req: NextRequest, user: AuthUser | null): string {
+ export function rateLimitCheck(
+   pathname: string,
+   key: string,
+-): { allowed: boolean; retryAfter: number } | null {
++): RateLimitResult | null {
+   if (!pathname.startsWith("/api/") || EXEMPT.has(pathname)) return null;
+   if (pathname === "/api/mcp/swarm-board") return boardBucket.consume(key);
+ 
+@@ -107,10 +134,21 @@ export function rateLimitCheck(
+   return apiBucket.consume(key);
+ }
+ 
+-export function rateLimitResponse(retryAfter: number): NextResponse {
++export function rateLimitHeaders(result: RateLimitResult): Record<string, string> {
++  return {
++    "X-RateLimit-Limit": String(result.limit),
++    "X-RateLimit-Remaining": String(result.remaining),
++    "X-RateLimit-Reset": String(result.reset),
++  };
++}
++
++export function rateLimitResponse(result: RateLimitResult): NextResponse {
+   return new NextResponse("Too Many Requests", {
+     status: 429,
+-    headers: { "Retry-After": String(retryAfter) },
++    headers: {
++      "Retry-After": String(result.retryAfter),
++      ...rateLimitHeaders(result),
++    },
+   });
+ }
+ 
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index 04412058b..76c7beeb9 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -1,7 +1,7 @@
+ import crypto from "node:crypto";
+ import { NextResponse, type NextRequest } from "next/server";
+ import { hostAllowed, requestUser, serverMode, USER_HEADER } from "./lib/auth";
+-import { rateLimitCheck, rateLimitKey, rateLimitResponse } from "./lib/rate-limit";
++import { rateLimitCheck, rateLimitHeaders, rateLimitKey, rateLimitResponse } from "./lib/rate-limit";
+ import { cspValue, securityHeaders, NONCE_HEADER, type SecurityHeadersOptions } from "./lib/security-headers";
+ 
+ const NONCE_BYTES = 16;
+@@ -56,10 +56,13 @@ export function middleware(req: NextRequest) {
+   const user = requestUser(req);
+ 
+   // Rate limit /api/* in server mode (local mode is a single trusted user on loopback).
++  let rateLimitResult: ReturnType<typeof rateLimitCheck> | null = null;
+   if (serverMode() && pathname.startsWith("/api/")) {
+     const key = rateLimitKey(req, user);
+-    const result = rateLimitCheck(pathname, key);
+-    if (result && !result.allowed) return withSecurityHeaders(rateLimitResponse(result.retryAfter), nonce, { dev });
++    rateLimitResult = rateLimitCheck(pathname, key);
++    if (rateLimitResult && !rateLimitResult.allowed) {
++      return withSecurityHeaders(rateLimitResponse(rateLimitResult), nonce, { dev });
++    }
+   }
+ 
+   // Route handlers learn who is calling from this header. Always overwrite it so a client can't supply its own.
+@@ -71,11 +74,20 @@ export function middleware(req: NextRequest) {
+   headers.set("Content-Security-Policy", cspValue(nonce, { dev }));
+   headers.set(NONCE_HEADER, nonce);
+ 
+-  if (PUBLIC.has(pathname)) return withSecurityHeaders(NextResponse.next({ request: { headers } }), nonce, { dev });
++  const applyRateLimitHeaders = (res: NextResponse) => {
++    if (rateLimitResult) {
++      for (const [name, value] of Object.entries(rateLimitHeaders(rateLimitResult))) {
++        res.headers.set(name, value);
++      }
++    }
++    return res;
++  };
++
++  if (PUBLIC.has(pathname)) return withSecurityHeaders(applyRateLimitHeaders(NextResponse.next({ request: { headers } })), nonce, { dev });
+   if (!user) {
+     if (!serverMode()) return withSecurityHeaders(new NextResponse("forbidden", { status: 403 }), nonce, { dev });
+     if (pathname.startsWith("/api/")) {
+-      return withSecurityHeaders(NextResponse.json({ error: "Sign in required." }, { status: 401 }), nonce, { dev });
++      return withSecurityHeaders(applyRateLimitHeaders(NextResponse.json({ error: "Sign in required." }, { status: 401 })), nonce, { dev });
+     }
+     // Build the target from the public Host header (already allowlisted): behind the proxy req.url carries the
+     // internal host and port, and middleware rejects relative Locations.
+@@ -89,7 +101,7 @@ export function middleware(req: NextRequest) {
+     u.hostname = "127.0.0.1";
+     return withSecurityHeaders(NextResponse.redirect(u, 308), nonce, { dev });
+   }
+-  return withSecurityHeaders(NextResponse.next({ request: { headers } }), nonce, { dev });
++  return withSecurityHeaders(applyRateLimitHeaders(NextResponse.next({ request: { headers } })), nonce, { dev });
+ }
+ 
+ // Everything except static assets. Uploads bypass middleware (it buffers bodies with a size cap) and call
+-- 
+2.55.0
+

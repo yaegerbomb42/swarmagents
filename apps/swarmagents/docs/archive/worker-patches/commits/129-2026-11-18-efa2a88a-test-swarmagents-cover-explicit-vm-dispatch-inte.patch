@@ -1,0 +1,39 @@
+From efa2a88ae916e2276bb6f7f7e65ea4eabfb339b5 Mon Sep 17 00:00:00 2001
+From: yaeger42 <jyaeger@hawk.iit.edu>
+Date: Wed, 18 Nov 2026 11:53:19 -0600
+Subject: [PATCH] test(swarmagents): cover explicit VM dispatch intent
+
+---
+ apps/swarmagents/lib/board-agent/agent.test.ts | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/apps/swarmagents/lib/board-agent/agent.test.ts b/apps/swarmagents/lib/board-agent/agent.test.ts
+index 6627caa5c..e4bbdc5eb 100644
+--- a/apps/swarmagents/lib/board-agent/agent.test.ts
++++ b/apps/swarmagents/lib/board-agent/agent.test.ts
+@@ -9,6 +9,7 @@ import {
+   __setBoardAgentDispatchForTests,
+   parseToolCall,
+   runBoardAgent,
++  wantsVmRun,
+ } from "./agent";
+ import type { BoardAgentConversation } from "./types";
+ 
+@@ -70,3 +71,14 @@ test("dispatch error is returned as tool text", async () => {
+   __setBoardAgentCompleterForTests(null);
+   __setBoardAgentDispatchForTests(null);
+ });
++
++test("VM dispatch requires explicit implementation or execution intent", () => {
++  assert.equal(wantsVmRun("fix the login bug"), true);
++  assert.equal(wantsVmRun("please build a dashboard"), true);
++  assert.equal(wantsVmRun("run the unit tests"), true);
++  assert.equal(wantsVmRun("work on the settings page"), true);
++  assert.equal(wantsVmRun("what should I do next?"), false);
++  assert.equal(wantsVmRun("can you run me through the design?"), false);
++  assert.equal(wantsVmRun("make sense of this stack trace"), false);
++  assert.equal(wantsVmRun("create a task to review the docs"), false);
++});
+-- 
+2.55.0
+

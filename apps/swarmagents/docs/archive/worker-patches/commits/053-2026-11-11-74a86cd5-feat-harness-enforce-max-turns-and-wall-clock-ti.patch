@@ -1,0 +1,154 @@
+From 74a86cd54054cd61f126cec42aec908ef315fa78 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:45:14 -0600
+Subject: [PATCH] feat(harness): enforce max turns and wall-clock timeout per
+ agent run
+
+---
+ apps/swarmagents/lib/harness/runner.ts  | 23 ++++++++++++++++++++++-
+ apps/swarmagents/lib/harness/types.ts   |  2 ++
+ apps/swarmagents/lib/runtime/manager.ts | 15 +++++++++++++++
+ 3 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/apps/swarmagents/lib/harness/runner.ts b/apps/swarmagents/lib/harness/runner.ts
+index 423bb3718..86f14049d 100644
+--- a/apps/swarmagents/lib/harness/runner.ts
++++ b/apps/swarmagents/lib/harness/runner.ts
+@@ -32,9 +32,13 @@ function isObject(value: unknown): value is Record<string, unknown> {
+ 
+ export class ClaudeCodeRunner {
+   private readonly bin: string;
++  private readonly maxTurns: number | undefined;
++  private readonly maxDurationMs: number | undefined;
+ 
+   constructor(options: ClaudeCodeRunnerOptions = {}) {
+     this.bin = options.bin ?? process.env.CLAUDE_BIN ?? "claude";
++    this.maxTurns = typeof process.env.SWARM_MAX_TURNS === "string" ? Number(process.env.SWARM_MAX_TURNS) : undefined;
++    this.maxDurationMs = typeof process.env.SWARM_RUN_TIMEOUT_MS === "string" ? Number(process.env.SWARM_RUN_TIMEOUT_MS) : undefined;
+   }
+ 
+   /**
+@@ -53,17 +57,20 @@ export class ClaudeCodeRunner {
+     let finalMeta: FinalResultMeta | undefined;
+     let malformedLines = 0;
+     let stderrTail = "";
++    let startedAt: number | undefined;
++    let turnCount = 0;
+ 
+     const emit = (event: TelemetryEvent) => onEvent(event);
+ 
+     const startRun = (init?: Record<string, unknown>) => {
+       if (started) return;
+       started = true;
++      startedAt = Date.now();
+       emit({
+         type: "run.started",
+         sessionId: typeof init?.session_id === "string" ? init.session_id : request.sessionId,
+         model: typeof init?.model === "string" ? init.model : request.model,
+-        startedAt: Date.now(),
++        startedAt,
+       });
+     };
+ 
+@@ -76,6 +83,20 @@ export class ClaudeCodeRunner {
+         if (!started) startRun(raw);
+         if (typeof raw.session_id === "string") lastSessionId = raw.session_id;
+ 
++        // Check for limit violations after we have tracking data
++        if (this.maxDurationMs !== undefined && startedAt !== undefined) {
++          const elapsed = Date.now() - startedAt;
++          if (elapsed > this.maxDurationMs) {
++            request.signalController?.abort();
++          }
++        }
++        if (this.maxTurns !== undefined && raw.type === "assistant") {
++          turnCount++;
++          if (turnCount > this.maxTurns) {
++            request.signalController?.abort();
++          }
++        }
++
+         switch (raw.type) {
+           case "assistant": {
+             const message = isObject(raw.message) ? raw.message : null;
+diff --git a/apps/swarmagents/lib/harness/types.ts b/apps/swarmagents/lib/harness/types.ts
+index 882fd2416..56dbb57d0 100644
+--- a/apps/swarmagents/lib/harness/types.ts
++++ b/apps/swarmagents/lib/harness/types.ts
+@@ -51,6 +51,8 @@ export interface RunRequest {
+   env: Record<string, string>;
+   vm: VmExec;
+   signal?: AbortSignal;
++  /** Optional AbortController - runner can call .abort() on this to terminate the run. */
++  signalController?: AbortController;
+   cwd?: string;
+ }
+ 
+diff --git a/apps/swarmagents/lib/runtime/manager.ts b/apps/swarmagents/lib/runtime/manager.ts
+index d063fb55d..072bcc4a8 100644
+--- a/apps/swarmagents/lib/runtime/manager.ts
++++ b/apps/swarmagents/lib/runtime/manager.ts
+@@ -48,6 +48,10 @@ export interface RunSummary {
+   /** Present when a run was cancelled rather than finishing naturally. */
+   cancelledReason?: "user" | "superseded";
+   lastSeq: number;
++  /** Configured maximum turns for the run (from SWARM_MAX_TURNS env var). */
++  maxTurns?: number;
++  /** Configured maximum runtime in milliseconds (from SWARM_RUN_TIMEOUT_MS env var). */
++  maxDurationMs?: number;
+ }
+ 
+ interface ActiveRun {
+@@ -59,6 +63,8 @@ interface ActiveRun {
+   model?: string;
+   createdAt: number;
+   startedAt?: number;
++  maxTurns?: number;
++  maxDurationMs?: number;
+ }
+ 
+ interface UserState {
+@@ -103,10 +109,14 @@ export class RuntimeManager {
+   private readonly bus: TelemetryBus;
+   private readonly runner = new ClaudeCodeRunner();
+   private readonly users = new Map<string, UserState>();
++  private readonly maxTurns: number | undefined;
++  private readonly maxDurationMs: number | undefined;
+ 
+   constructor(opts: { vm?: VmManager; bus?: TelemetryBus } = {}) {
+     this.vm = opts.vm ?? vmManager;
+     this.bus = opts.bus ?? telemetryBus;
++    this.maxTurns = typeof process.env.SWARM_MAX_TURNS === "string" ? Number(process.env.SWARM_MAX_TURNS) : undefined;
++    this.maxDurationMs = typeof process.env.SWARM_RUN_TIMEOUT_MS === "string" ? Number(process.env.SWARM_RUN_TIMEOUT_MS) : undefined;
+   }
+ 
+   private state(userId: string): UserState {
+@@ -141,6 +151,8 @@ export class RuntimeManager {
+       sessionId: input.sessionId ?? persistedSession,
+       model: input.model,
+       createdAt: Date.now(),
++      maxTurns: this.maxTurns,
++      maxDurationMs: this.maxDurationMs,
+     };
+     st.active = active;
+ 
+@@ -235,6 +247,7 @@ export class RuntimeManager {
+           env: buildRunnerEnv(),
+           vm: bindExec(this.vm, userId),
+           signal: active.controller.signal,
++          signalController: active.controller,
+           cwd: "/workspace",
+         },
+         onEvent,
+@@ -282,6 +295,8 @@ export class RuntimeManager {
+         durationMs: patch.durationMs,
+         numTurns: patch.numTurns,
+         cancelledReason: patch.cancelledReason,
++        maxTurns: active.maxTurns,
++        maxDurationMs: active.maxDurationMs,
+       };
+       st.active = null;
+       st.history.unshift(summary);
+-- 
+2.55.0
+

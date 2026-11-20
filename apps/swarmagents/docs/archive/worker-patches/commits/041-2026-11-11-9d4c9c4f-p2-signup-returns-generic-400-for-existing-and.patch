@@ -1,0 +1,112 @@
+From 9d4c9c4fed9d24c9a8d2a5673e9b96da86683e4b Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 23:19:42 +0000
+Subject: [PATCH] [p2] signup returns generic 400 for existing and invalid
+ signups
+
+---
+ apps/swarmagents/app/api/signup/route.test.ts | 24 ++++++++++++++++-
+ apps/swarmagents/app/api/signup/route.ts      | 26 ++++++++++++++++---
+ 2 files changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/signup/route.test.ts b/apps/swarmagents/app/api/signup/route.test.ts
+index 4801fb039..7fe9ffded 100644
+--- a/apps/swarmagents/app/api/signup/route.test.ts
++++ b/apps/swarmagents/app/api/signup/route.test.ts
+@@ -52,7 +52,7 @@ test("POST /api/signup creates a user and signs a hardened session cookie", asyn
+ 
+ test("POST /api/signup rejects duplicates, invalid input, and non-JSON", async () => {
+   assert.equal((await POST(request({ email: "a@example.com", password: "long enough password" }))).status, 201);
+-  assert.equal((await POST(request({ email: "A@EXAMPLE.COM", password: "another long password" }))).status, 409);
++  assert.equal((await POST(request({ email: "A@EXAMPLE.COM", password: "another long password" }))).status, 400);
+   assert.equal((await POST(request({ email: "not-an-email", password: "long enough password" }))).status, 400);
+   assert.equal((await POST(request({ email: "a@example.com", password: "short" }))).status, 400);
+   assert.equal((await POST(request({ email: "a@example.com" }))).status, 400);
+@@ -61,6 +61,28 @@ test("POST /api/signup rejects duplicates, invalid input, and non-JSON", async (
+   assert.equal((await POST(request([]))).status, 400);
+ });
+ 
++test("POST /api/signup does not disclose whether an email is registered", async () => {
++  assert.equal((await POST(request({ email: "a@example.com", password: "long enough password" }))).status, 201);
++
++  const duplicate = await POST(request({ email: "A@EXAMPLE.COM", password: "another long password" }));
++  assert.equal(duplicate.status, 400);
++  const duplicateJson = (await duplicate.json()) as { error: string };
++
++  const invalid = await POST(request({ email: "not-an-email", password: "long enough password" }));
++  assert.equal(invalid.status, 400);
++  const invalidJson = (await invalid.json()) as { error: string };
++
++  // Same status, same message: an existing email is indistinguishable from
++  // invalid input, so the endpoint cannot be used to enumerate accounts.
++  assert.equal(duplicateJson.error, invalidJson.error);
++  assert.ok(!/already exists/i.test(duplicateJson.error), `must not disclose: ${duplicateJson.error}`);
++  assert.ok(!/registered/i.test(duplicateJson.error), `must not disclose: ${duplicateJson.error}`);
++
++  // A fresh email still signs up, so the generic error is not a blanket reject.
++  const fresh = await POST(request({ email: "b@example.com", password: "long enough password" }));
++  assert.equal(fresh.status, 201);
++});
++
+ test("POST /api/signup refuses to run without SWARM_SESSION_SECRET", async () => {
+   delete process.env.SWARM_SESSION_SECRET;
+   const res = await POST(request({ email: "a@example.com", password: "long enough password" }));
+diff --git a/apps/swarmagents/app/api/signup/route.ts b/apps/swarmagents/app/api/signup/route.ts
+index e7a801908..7cbd2525d 100644
+--- a/apps/swarmagents/app/api/signup/route.ts
++++ b/apps/swarmagents/app/api/signup/route.ts
+@@ -4,10 +4,12 @@
+  * Create a local password user and mint a session cookie for them.
+  *
+  * Accepts {email, password}; the email is normalized (trimmed, lowercase),
+- * passwords are hashed with scrypt in lib/users, and duplicates return a
+- * 409 without disclosing whether the account exists for other purposes.
++ * passwords are hashed with scrypt in lib/users, and a duplicate email is
++ * indistinguishable from invalid input: both return the same generic 400,
++ * so the endpoint never discloses whether an account exists.
+  */
+ 
++import { randomBytes, scryptSync } from "node:crypto";
+ import { NextResponse, type NextRequest } from "next/server";
+ import { sessionCookieOptions, signSession, SESSION_COOKIE } from "../../../lib/auth";
+ import { signupLocalUser } from "../../../lib/users";
+@@ -17,6 +19,19 @@ export const dynamic = "force-dynamic";
+ 
+ const MAX_BODY_SIZE = 16 * 1024;
+ 
++/** The single generic message every failed signup returns, whatever the cause. */
++const GENERIC_SIGNUP_ERROR = "Enter a valid email and a password of at least 8 characters.";
++
++/**
++ * Burn the same scrypt cost a real signup pays, so an existing-email
++ * response takes no less time than a successful one and timing cannot leak
++ * whether the account exists. Same parameters as lib/users hashPassword.
++ */
++function dummyHash(password: unknown): void {
++  if (typeof password !== "string" || !password) return;
++  scryptSync(password, randomBytes(16), 32);
++}
++
+ function isRecord(value: unknown): value is Record<string, unknown> {
+   return typeof value === "object" && value !== null && !Array.isArray(value);
+ }
+@@ -57,11 +72,14 @@ export async function POST(req: NextRequest): Promise<Response> {
+   if (!result.ok) {
+     switch (result.error) {
+       case "exists":
+-        return NextResponse.json({ error: "An account with this email already exists." }, { status: 409 });
++        // Deliberately indistinguishable from invalid input: same status,
++        // same message, same hashing cost — no account enumeration.
++        dummyHash(body.password);
++        return NextResponse.json({ error: GENERIC_SIGNUP_ERROR }, { status: 400 });
+       case "fatal":
+         return NextResponse.json({ error: "Could not persist the account." }, { status: 500 });
+       default:
+-        return NextResponse.json({ error: "Enter a valid email and a password of at least 8 characters." }, { status: 400 });
++        return NextResponse.json({ error: GENERIC_SIGNUP_ERROR }, { status: 400 });
+     }
+   }
+ 
+-- 
+2.55.0
+

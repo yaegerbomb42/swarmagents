@@ -1,0 +1,389 @@
+From bd17cb57ed4bb104cb296ff29e7c9d0772a85a3d Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <2.03348624e+08+yaegerbomb42@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:00:01 +0000
+Subject: [PATCH] feat(vm-image): install the PreToolUse hook and stop
+ blanket-allowing risky tools
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The image pre-allowed Bash, Edit, Write and NotebookEdit in
+/etc/claude-code/managed-settings.json and registered no hook, so a headless
+`claude -p` run executed every tool unguarded. Now:
+
+- pretooluse-hook.mjs (new): dependency-free hook client baked at
+  /opt/swarm/hooks/pretooluse-hook.mjs (root-owned, 0555). It forwards the
+  tool call to the app with the run's bearer token, blocks until the verdict
+  arrives, and prints the Claude Code decision. Every failure path answers
+  deny — an unreachable app, a bad token, unreadable JSON or a timeout — and
+  it always exits 0, because a non-zero exit makes the CLI continue.
+- managed-settings.json: registers the hook for every tool ("*", 330 s) and
+  keeps only the read-only tools pre-allowed (Read, Glob, Grep, WebSearch,
+  WebFetch, TodoWrite). Mutating tools now run only on the hook's allow.
+- Dockerfile: bakes the hook read-only.
+- READMEs: the vm-image README described the old (advisory) behaviour and
+  claimed the risk gate could still deny a call after the fact; it now
+  documents the synchronous contract, the hook env, the fail-closed rule,
+  the older-image --settings fallback and the rebuild step. The app README
+  documents the endpoint, the token semantics and the two new env vars
+  (SWARM_VM_HOOK_BASE_URL, SWARM_FULL_AUTO).
+---
+ apps/swarmagents/README.md                    |  43 +++++-
+ apps/swarmagents/vm-image/Dockerfile          |  18 ++-
+ apps/swarmagents/vm-image/README.md           |  62 +++++++-
+ .../vm-image/managed-settings.json            |  22 ++-
+ apps/swarmagents/vm-image/pretooluse-hook.mjs | 137 ++++++++++++++++++
+ 5 files changed, 257 insertions(+), 25 deletions(-)
+ create mode 100644 apps/swarmagents/vm-image/pretooluse-hook.mjs
+
+diff --git a/apps/swarmagents/README.md b/apps/swarmagents/README.md
+index 3bcff7077..1a658a9fe 100644
+--- a/apps/swarmagents/README.md
++++ b/apps/swarmagents/README.md
+@@ -187,14 +187,39 @@ Every tool call the agent makes passes through the pure risk classifier in
+ | `ask` | Risky but legitimate; pauses for a human decision. | `rm -rf /` or other destructive root deletions, `curl \| sh` / piping a remote download into a shell, downloads from untrusted hosts, `docker`/`podman` and other container commands, force/destructive git operations, reading or writing credential files (`~/.ssh`, `.env`, `.aws`, ...), privilege elevation (`sudo`), disk/partition tools, broad `chmod`/`chown`, system package-manager mutations, service control, firewall changes, `ssh`/`scp`/`rsync` |
+ | `deny` | Never allowed; no approval can lift it. | printing secret environment variables, system credential files (`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`, ...), referencing secret env vars with a disclosure verb, cloud instance metadata endpoints (`169.254.169.254` and equivalents) |
+ 
+-An `ask`-level decision pauses the run: the runner creates a pending approval
+-in the in-memory `ApprovalStore` (`lib/harness/approvals.ts`) and the user
+-decides with `POST /api/runtime/approvals/{id}` (approve or deny) from the
+-terminal's approval card. If nobody decides before the TTL expires the
+-approval auto-expires and is treated exactly like a denial — the run halts
+-with a `run.error` under the harness risk policy. The pending store is
+-per-process: a server restart drops pending approvals (their runs end with a
+-policy error rather than hanging forever).
++The verdict is **synchronous with execution**: the VM's Claude Code settings
++register a `PreToolUse` hook (`vm-image/pretooluse-hook.mjs`), so the CLI runs
++that hook before every tool and blocks until it answers. The hook calls
++`POST /api/runtime/hooks/pretooluse` with the per-run bearer token; the app
++classifies the call and replies with the Claude Code permission decision
++(`lib/harness/tool-gate.ts`). A tool therefore executes only after it was
++allowed — a denial, or a timeout, means the command never ran at all.
++
++An `ask`-level decision creates a pending approval in the in-memory
++`ApprovalStore` (`lib/harness/approvals.ts`) while the CLI is blocked on the
++hook; the user decides with `POST /api/runtime/approvals/{id}` (approve or
++deny) from the terminal's approval card. If nobody decides before the TTL
++expires the approval auto-expires and the hook answers `deny` — the model sees
++the reason and can adapt, and nothing ran. The pending store is per-process: a
++server restart drops pending approvals (their runs end with a policy error
++rather than hanging forever).
++
++- The hook fails closed: an unreachable app, a bad token, a malformed payload
++  or an unreadable verdict all answer `deny`.
++- The gate token is minted per run, lives in memory, is revoked when the run
++  ends, and can only *ask* — holding it cannot approve anything.
++- A duplicate hook (the image's managed settings plus a run `--settings`
++  file) is deduped by tool-call id: one card, one decision.
++- VMs built from an image that predates the hook get it through a per-run
++  `--settings` file (`lib/runtime/hook-settings.ts`); if the hook never calls
++  home at all, the runner keeps the older stdout-based gate as a fallback.
++- `SWARM_VM_HOOK_BASE_URL` sets the app origin the VM calls back on; it
++  defaults to the LLM proxy origin (`SWARM_VM_LLM_BASE_URL`, else
++  `SWARM_PUBLIC_ORIGIN` in server mode). Without a reachable origin the
++  synchronous gate is not wired and the fallback gate applies.
++- `SWARM_FULL_AUTO=1` (g9 full-auto) auto-allows the asks that stay inside the
++  VM. Hard denies and irreversible-external actions (force push, publish,
++  deploy, cloud API mutations) still open a card.
+ 
+ - TTL: `SWARM_APPROVAL_TIMEOUT_SEC` (seconds, default `300`).
+   `SWARM_APPROVAL_TIMEOUT_MS` remains supported as a fallback for
+@@ -334,6 +359,8 @@ Never commit real keys. All provider keys live in env only.
+ | `SWARM_VM_ENV_ALLOW` | unset | Comma-separated extra env var names forwarded into VMs. |
+ | `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI binary inside the VM. |
+ | `SWARM_APPROVAL_TIMEOUT_SEC` | `300` | Seconds before an unanswered ask-level approval auto-denies and halts the run. |
++| `SWARM_VM_HOOK_BASE_URL` | unset | App origin a VM calls back on for the `PreToolUse` approval hook (defaults to the LLM proxy origin / `SWARM_PUBLIC_ORIGIN`). Without it the synchronous gate is not wired. |
++| `SWARM_FULL_AUTO` | unset | `1` = g9 full-auto: auto-allow in-VM asks; hard denies and irreversible-external actions still ask. |
+ | `ANTHROPIC_API_KEY` | unset | Provider key forwarded to the VM for Claude Code. |
+ | `SWARM_KEYS_ANTHROPIC` / `SWARM_KEYS_OPENAI` / `SWARM_KEYS_GEMINI` | unset | Comma-separated key pools for the provider router. |
+ | `SWARM_HEDGE_DELAY_MS` | `1500` | Hedge delay in ms before a second healthy provider starts when hedged racing is enabled and no first token has arrived. |
+diff --git a/apps/swarmagents/vm-image/Dockerfile b/apps/swarmagents/vm-image/Dockerfile
+index 9ba830bcb..36cfdc223 100644
+--- a/apps/swarmagents/vm-image/Dockerfile
++++ b/apps/swarmagents/vm-image/Dockerfile
+@@ -49,10 +49,20 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+     && npm ls -g --depth=0 @anthropic-ai/claude-code \
+     && (claude --version || echo "warning: 'claude --version' failed in the build" >&2)
+ 
+-# Managed (admin-owned) Claude Code settings: pre-allow the standard tools so
+-# a headless `claude -p` can actually act. The app's own risk gate
+-# (lib/harness/risk.ts) still classifies every tool call the agent makes and
+-# can still ask or deny — this only removes the CLI's own interactive prompt.
++# PreToolUse hook client: Claude Code runs it before every tool call and blocks
++# on its answer, which is what makes the harness risk gate synchronous (a tool
++# cannot execute before the user/harness allows it). Root-owned and read-only
++# so the agent cannot rewrite the gate it is running under.
++COPY pretooluse-hook.mjs /opt/swarm/hooks/pretooluse-hook.mjs
++RUN chmod 0555 /opt/swarm/hooks/pretooluse-hook.mjs \
++    && chown root:root /opt/swarm/hooks/pretooluse-hook.mjs
++
++# Managed (admin-owned) Claude Code settings: register the PreToolUse hook and
++# pre-allow only the read-only tools, so a headless `claude -p` can act without
++# the CLI's own interactive prompt while every mutating call (Bash, Edit, Write,
++# NotebookEdit) goes through the hook. Without the hook these tools would either
++# stop at the CLI prompt or — worse, as they used to — run unguarded because the
++# settings blanket-allowed them.
+ COPY managed-settings.json /etc/claude-code/managed-settings.json
+ RUN chmod 0444 /etc/claude-code/managed-settings.json \
+     && chown root:root /etc/claude-code/managed-settings.json
+diff --git a/apps/swarmagents/vm-image/README.md b/apps/swarmagents/vm-image/README.md
+index 9a89c9563..ff0e3e729 100644
+--- a/apps/swarmagents/vm-image/README.md
++++ b/apps/swarmagents/vm-image/README.md
+@@ -66,16 +66,64 @@ workspace survives restarts.
+ ## Managed settings
+ 
+ `managed-settings.json` is copied to `/etc/claude-code/managed-settings.json`
+-(read-only, root-owned) and pre-allows the standard tools:
++(read-only, root-owned). It does two things:
++
++1. **Registers a `PreToolUse` hook** that runs
++   `/opt/swarm/hooks/pretooluse-hook.mjs` (also root-owned, `0555`) for every
++   tool call. The CLI spawns the hook *before* executing the tool and blocks
++   until it exits; the hook asks the app
++   (`POST /api/runtime/hooks/pretooluse`, bearer token from the run's exec
++   env) and prints the verdict. The app's risk classifier
++   (`lib/harness/risk.ts`) plus the user's decision therefore decide whether a
++   tool runs **before it runs** — an `rm -rf`, a `sudo` command, or a read of
++   `~/.ssh` never starts until it was allowed, and a denial means it never
++   starts at all.
++2. **Pre-allows only the read-only tools** (`Read`, `Glob`, `Grep`,
++   `WebSearch`, `WebFetch`, `TodoWrite`). Mutating tools (`Bash`, `Edit`,
++   `Write`, `NotebookEdit`) are deliberately *not* blanket-allowed: the hook's
++   `allow` decision is what lets them run. Pre-allowing them would execute the
++   tool without the hook ever being consulted on older CLI builds.
++
++Without the hook a headless `claude -p` run would either stop at the CLI's own
++permission prompt or — as it used to, when the settings blanket-allowed
++`Bash` — run every tool unguarded while the app only classified it from
++stdout after the fact. The hook is what makes the verdict synchronous.
++
++### Hook configuration
++
++The hook reads its endpoint from the run's exec environment (set by the
++harness, never argv):
++
++| Variable | Meaning |
++|----------|---------|
++| `SWARM_HOOK_URL` | Absolute URL of the app's `/api/runtime/hooks/pretooluse`. |
++| `SWARM_HOOK_TOKEN` | Per-run bearer token. It can only *ask*; it cannot approve. |
++| `SWARM_HOOK_TIMEOUT_MS` | How long the hook waits for a verdict (default `330000`, just above the app's 300 s approval TTL). |
++
++The command in `managed-settings.json` resolves the script as
++`${SWARM_HOOK_SCRIPT:-/opt/swarm/hooks/pretooluse-hook.mjs}`, falling back to
++`/workspace/.swarm/pretooluse-hook.mjs` — the copy the runtime seeds for VMs
++built from an older image (the same file, kept in sync by
++`lib/harness/hook-script.test.ts`).
++
++Every failure path answers `deny`: no URL/token, an unreachable app, a non-200
++response, unreadable JSON, or a timeout. A hook that exited non-zero without a
++decision would make the CLI *continue*, which is exactly the failure mode this
++design exists to prevent — so the script always exits 0 with an explicit
++decision on stdout.
++
++### Rebuilding
++
++The image must be rebuilt for the hook to take effect:
+ 
+-```
+-Bash, Read, Edit, Write, Glob, Grep, WebFetch, WebSearch, TodoWrite, NotebookEdit
++```bash
++npm run vm-image:build   # docker build -t swarm-vm:claude vm-image
+ ```
+ 
+-Without it a headless `claude -p` run stops at the CLI's own permission
+-prompt and cannot do anything. These are the *CLI's* permissions only: the
+-app's risk gate (`lib/harness/risk.ts`) still classifies every tool call the
+-agent makes and can still ask the user or deny the call outright.
++An existing VM keeps the image it was created from. The runtime covers that:
++when a VM's managed settings have no `PreToolUse` hook it writes
++`/workspace/.swarm/run-settings.json` with the same hook and passes
++`--settings` to `claude` (`lib/runtime/hook-settings.ts`).
+ 
+ ## Network
+ 
+diff --git a/apps/swarmagents/vm-image/managed-settings.json b/apps/swarmagents/vm-image/managed-settings.json
+index 7e2a50fde..204a6b638 100644
+--- a/apps/swarmagents/vm-image/managed-settings.json
++++ b/apps/swarmagents/vm-image/managed-settings.json
+@@ -1,18 +1,28 @@
+ {
+   "permissions": {
+     "allow": [
+-      "Bash",
+       "Read",
+-      "Edit",
+-      "Write",
+       "Glob",
+       "Grep",
+-      "WebFetch",
+       "WebSearch",
+-      "TodoWrite",
+-      "NotebookEdit"
++      "WebFetch",
++      "TodoWrite"
+     ],
+     "deny": [],
+     "ask": []
++  },
++  "hooks": {
++    "PreToolUse": [
++      {
++        "matcher": "*",
++        "hooks": [
++          {
++            "type": "command",
++            "timeout": 330,
++            "command": "sh -c 'f=${SWARM_HOOK_SCRIPT:-/opt/swarm/hooks/pretooluse-hook.mjs}; [ -f \"$f\" ] || f=/workspace/.swarm/pretooluse-hook.mjs; exec node \"$f\"'"
++          }
++        ]
++      }
++    ]
+   }
+ }
+diff --git a/apps/swarmagents/vm-image/pretooluse-hook.mjs b/apps/swarmagents/vm-image/pretooluse-hook.mjs
+new file mode 100644
+index 000000000..65e3d8bb9
+--- /dev/null
++++ b/apps/swarmagents/vm-image/pretooluse-hook.mjs
+@@ -0,0 +1,137 @@
++#!/usr/bin/env node
++/**
++ * PreToolUse hook client for the SwarmAgents harness risk gate.
++ *
++ * Claude Code spawns this script *before* it executes a tool and blocks until
++ * the script exits. The script forwards the tool call to the app, waits for the
++ * verdict (allow/deny), and prints it as a Claude Code hook decision. The tool
++ * therefore only runs after a human — or the classifier — allowed it.
++ *
++ * Contract (Claude Code hooks):
++ *   - stdin: the hook payload JSON ({hook_event_name, tool_name, tool_input, ...})
++ *   - stdout: {"hookSpecificOutput": {"hookEventName": "PreToolUse",
++ *              "permissionDecision": "allow" | "deny",
++ *              "permissionDecisionReason": "..."}}
++ *   - exit 0 always. A non-zero exit that is not 2 makes the CLI treat the hook
++ *     as failed and *continue*, so every failure path here prints an explicit
++ *     "deny" instead: the gate fails closed.
++ *
++ * Configuration comes from the exec environment the harness sets for the run
++ * (never argv, which anything on the box can read from the process table):
++ *   SWARM_HOOK_URL         absolute URL of /api/runtime/hooks/pretooluse
++ *   SWARM_HOOK_TOKEN       per-run bearer token for that endpoint
++ *   SWARM_HOOK_TIMEOUT_MS  how long to wait for a verdict (default 330000)
++ *
++ * No dependencies: the image ships node, and this file must keep working in an
++ * air-gapped VM.
++ */
++
++const MAX_INPUT_BYTES = 1024 * 1024;
++const MAX_REASON = 500;
++const DEFAULT_TIMEOUT_MS = 330000;
++
++/** Print a Claude Code PreToolUse decision. Never throws. */
++function answer(decision, reason) {
++  const text = String(reason ?? "").slice(0, MAX_REASON) || (decision === "allow" ? "allowed" : "blocked");
++  const payload = {
++    hookSpecificOutput: {
++      hookEventName: "PreToolUse",
++      permissionDecision: decision,
++      permissionDecisionReason: text,
++    },
++  };
++  try {
++    process.stdout.write(JSON.stringify(payload));
++  } catch {
++    // A closed stdout means the CLI is gone; there is nobody to answer.
++  }
++}
++
++/** Read the whole hook payload from stdin, bounded. */
++async function readStdin() {
++  const chunks = [];
++  let total = 0;
++  for await (const chunk of process.stdin) {
++    total += chunk.length;
++    if (total > MAX_INPUT_BYTES) break;
++    chunks.push(chunk);
++  }
++  return Buffer.concat(chunks).toString("utf8");
++}
++
++function timeoutMs() {
++  const raw = Number(process.env.SWARM_HOOK_TIMEOUT_MS);
++  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
++}
++
++async function main() {
++  const url = process.env.SWARM_HOOK_URL;
++  const token = process.env.SWARM_HOOK_TOKEN;
++  if (!url || !token) {
++    // Fail closed: a run without a bridge must not execute risky tools. The
++    // harness always sets these; an empty value means the gate is broken.
++    answer("deny", "approval bridge is not configured for this run");
++    return;
++  }
++
++  let payload;
++  try {
++    const raw = await readStdin();
++    payload = JSON.parse(raw);
++  } catch (error) {
++    answer("deny", `could not read the hook payload: ${error && error.message ? error.message : "invalid JSON"}`);
++    return;
++  }
++  if (!payload || typeof payload !== "object" || typeof payload.tool_name !== "string" || payload.tool_name === "") {
++    answer("deny", "hook payload did not name a tool");
++    return;
++  }
++
++  let response;
++  try {
++    response = await fetch(url, {
++      method: "POST",
++      headers: {
++        "content-type": "application/json",
++        authorization: `Bearer ${token}`,
++      },
++      body: JSON.stringify({
++        hook_event_name: payload.hook_event_name ?? "PreToolUse",
++        session_id: payload.session_id,
++        tool_name: payload.tool_name,
++        tool_input: payload.tool_input,
++        tool_use_id: payload.tool_use_id,
++      }),
++      signal: AbortSignal.timeout(timeoutMs()),
++    });
++  } catch (error) {
++    const detail = error && error.name === "TimeoutError" ? "timed out" : String((error && error.message) || error);
++    answer("deny", `approval bridge unreachable (${detail})`);
++    return;
++  }
++
++  if (!response.ok) {
++    answer("deny", `approval bridge returned HTTP ${response.status}`);
++    return;
++  }
++
++  let body;
++  try {
++    body = await response.json();
++  } catch {
++    answer("deny", "approval bridge returned an unreadable verdict");
++    return;
++  }
++
++  const out = body && typeof body === "object" ? body.hookSpecificOutput : null;
++  const decision = out && out.permissionDecision;
++  if (decision !== "allow" && decision !== "deny") {
++    answer("deny", "approval bridge returned no usable verdict");
++    return;
++  }
++  answer(decision, out.permissionDecisionReason);
++}
++
++main().catch((error) => {
++  answer("deny", `approval hook failed: ${error && error.message ? error.message : String(error)}`);
++});
+-- 
+2.55.0
+

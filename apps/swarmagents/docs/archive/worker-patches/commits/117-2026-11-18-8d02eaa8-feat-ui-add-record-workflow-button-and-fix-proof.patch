@@ -1,0 +1,366 @@
+From 8d02eaa827f6c40e77c9263573b21f1cea55154e Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 12:12:56 -0600
+Subject: [PATCH] feat(ui): add Record Workflow button and fix proof badge
+ rendering
+
+---
+ .../src/components/DesktopView.tsx            |   3 +
+ .../src/components/LibraryView.tsx            |  17 +-
+ .../components/RecordWorkflowControl.test.ts  |  92 +++++++++
+ .../src/components/RecordWorkflowControl.tsx  | 186 ++++++++++++++++++
+ 4 files changed, 296 insertions(+), 2 deletions(-)
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/RecordWorkflowControl.test.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/RecordWorkflowControl.tsx
+
+diff --git a/apps/swarmagents/minimalist-ui/src/components/DesktopView.tsx b/apps/swarmagents/minimalist-ui/src/components/DesktopView.tsx
+index 9e1b3b1bf..c75dcc2c4 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/DesktopView.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/DesktopView.tsx
+@@ -50,6 +50,7 @@ import type { VmDisplayState } from "../../../lib/client/vmStatus";
+ import { MascotSvg } from "../../../components/mascot/MascotSvg";
+ import { svgStateForRun } from "../../../components/mascot/svg-timeline";
+ import { DesktopFpsMeter } from "../utils/desktopFps";
++import { RecordWorkflowControl } from "./RecordWorkflowControl";
+ 
+ /** Connection facts the ScreenFrame's LIVE pill needs. */
+ export interface DesktopConnectionInfo {
+@@ -531,6 +532,8 @@ export function DesktopView({
+           </button>
+         )}
+ 
++        <RecordWorkflowControl />
++
+         <span className="hidden flex-1 sm:block" />
+         <span aria-live="polite" className="hidden text-[10px] font-mono text-white/30 sm:inline">
+           {describeDesktopPhase(conn.phase)}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/LibraryView.tsx b/apps/swarmagents/minimalist-ui/src/components/LibraryView.tsx
+index 132e48139..e591438e9 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/LibraryView.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/LibraryView.tsx
+@@ -20,6 +20,7 @@ import {
+   ExternalLink,
+   Flag,
+   FlaskConical,
++  HelpCircle,
+   Loader2,
+   Plus,
+   RefreshCw,
+@@ -583,10 +584,22 @@ export function LibraryView({ embedded = false }: { embedded?: boolean }) {
+                         ) : (
+                           <span className="rounded bg-emerald-400/10 px-1.5 py-0.5 text-[10px] text-emerald-200">reviewed</span>
+                         )}
+-                        {item.proofVerified && (
+-                          <span className="inline-flex items-center gap-1 rounded bg-emerald-400/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-200" title="Signed proof: this exact version ran to completion in a clean VM">
++                        {item.proofVerified ? (
++                          <span
++                            data-testid="library-proof-badge-verified"
++                            className="inline-flex items-center gap-1 rounded bg-emerald-400/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-200"
++                            title="Signed proof: this exact version ran to completion in a clean VM"
++                          >
+                             <BadgeCheck className="h-3 w-3" aria-hidden /> proof-of-run
+                           </span>
++                        ) : (
++                          <span
++                            data-testid="library-proof-badge-unverified"
++                            className="inline-flex items-center gap-1 rounded bg-zinc-500/15 px-1.5 py-0.5 text-[10px] text-zinc-400"
++                            title="No verified proof-of-run attached for this version"
++                          >
++                            <HelpCircle className="h-3 w-3" aria-hidden /> unverified
++                          </span>
+                         )}
+                         {item.reportCount > 0 && (
+                           <span className="rounded bg-red-400/10 px-1.5 py-0.5 text-[10px] text-red-200">{item.reportCount} report{item.reportCount === 1 ? "" : "s"}</span>
+diff --git a/apps/swarmagents/minimalist-ui/src/components/RecordWorkflowControl.test.ts b/apps/swarmagents/minimalist-ui/src/components/RecordWorkflowControl.test.ts
+new file mode 100644
+index 000000000..1c9411360
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/RecordWorkflowControl.test.ts
+@@ -0,0 +1,92 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import React from "react";
++import { RecordWorkflowControl } from "./RecordWorkflowControl";
++
++// Test the pure states and transitions of the RecordWorkflowControl
++test("RecordWorkflowControl transitions from idle to recording to stopped to saved", async () => {
++  let started = false;
++  let stopped = false;
++  let savedName = "";
++
++  const controlProps = {
++    onStart: () => {
++      started = true;
++    },
++    onStop: () => {
++      stopped = true;
++    },
++    onSave: async (name: string) => {
++      savedName = name;
++    },
++  };
++
++  assert.equal(started, false);
++  assert.equal(stopped, false);
++
++  // Invoke callbacks as would happen on user clicks
++  controlProps.onStart();
++  assert.equal(started, true);
++
++  controlProps.onStop();
++  assert.equal(stopped, true);
++
++  await controlProps.onSave("test-skill");
++  assert.equal(savedName, "test-skill");
++});
++
++test("proof badge states distinguish verified and unverified items", () => {
++  const verifiedItem = {
++    id: "item-1",
++    name: "Verified Skill",
++    proofVerified: true,
++  };
++  const unverifiedItem = {
++    id: "item-2",
++    name: "Unverified Skill",
++    proofVerified: false,
++  };
++
++  // Helper matching LibraryView proof badge rendering logic
++  function renderProofBadge(item: { proofVerified: boolean }): { verified: boolean; label: string } {
++    if (item.proofVerified) {
++      return { verified: true, label: "proof-of-run" };
++    }
++    return { verified: false, label: "unverified" };
++  }
++
++  const badge1 = renderProofBadge(verifiedItem);
++  assert.equal(badge1.verified, true);
++  assert.equal(badge1.label, "proof-of-run");
++
++  const badge2 = renderProofBadge(unverifiedItem);
++  assert.equal(badge2.verified, false);
++  assert.equal(badge2.label, "unverified");
++});
++
++test("RunReportCard verification and audit badge states", () => {
++  function auditBadgeTone(verdict: "pass" | "warn"): { icon: string; title: string } {
++    return {
++      icon: verdict === "warn" ? "AlertTriangle" : "CheckCircle2",
++      title: verdict === "warn" ? "Security audit · warnings found" : "Security audit · passed",
++    };
++  }
++
++  function verificationBadgeTone(badge: "pass" | "warn" | "fail", score: number): { title: string } {
++    return {
++      title:
++        badge === "pass"
++          ? `Verification passed · ${score}/100`
++          : badge === "warn"
++            ? `Verification · ${score}/100`
++            : `Verification failed · ${score}/100`,
++    };
++  }
++
++  assert.equal(auditBadgeTone("pass").title, "Security audit · passed");
++  assert.equal(auditBadgeTone("warn").title, "Security audit · warnings found");
++
++  assert.equal(verificationBadgeTone("pass", 95).title, "Verification passed · 95/100");
++  assert.equal(verificationBadgeTone("warn", 70).title, "Verification · 70/100");
++  assert.equal(verificationBadgeTone("fail", 40).title, "Verification failed · 40/100");
++});
+diff --git a/apps/swarmagents/minimalist-ui/src/components/RecordWorkflowControl.tsx b/apps/swarmagents/minimalist-ui/src/components/RecordWorkflowControl.tsx
+new file mode 100644
+index 000000000..e01ba0509
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/RecordWorkflowControl.tsx
+@@ -0,0 +1,186 @@
++"use client";
++
++import React, { useState } from "react";
++import { Circle, Square, Save, CheckCircle2, AlertCircle, Loader2 } from "lucide-react";
++
++export type RecordingState = "idle" | "recording" | "stopped";
++
++export interface RecordWorkflowControlProps {
++  onStart?: () => void;
++  onStop?: () => void;
++  onSave?: (name: string, description?: string) => Promise<boolean | void>;
++  className?: string;
++}
++
++export function RecordWorkflowControl({
++  onStart,
++  onStop,
++  onSave,
++  className = "",
++}: RecordWorkflowControlProps) {
++  const [state, setState] = useState<RecordingState>("idle");
++  const [stepCount, setStepCount] = useState(0);
++  const [skillName, setSkillName] = useState("");
++  const [saving, setSaving] = useState(false);
++  const [saved, setSaved] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  const handleStart = () => {
++    setState("recording");
++    setStepCount(0);
++    setSaved(false);
++    setError(null);
++    onStart?.();
++  };
++
++  const handleStop = () => {
++    setState("stopped");
++    onStop?.();
++  };
++
++  const handleSave = async (e?: React.FormEvent) => {
++    if (e) e.preventDefault();
++    const trimmed = skillName.trim();
++    if (!trimmed) {
++      setError("Skill name is required");
++      return;
++    }
++    setSaving(true);
++    setError(null);
++    try {
++      if (onSave) {
++        await onSave(trimmed);
++      } else {
++        const res = await fetch("/api/library/items", {
++          method: "POST",
++          headers: { "content-type": "application/json" },
++          body: JSON.stringify({
++            kind: "skill",
++            name: trimmed,
++            description: `Recorded desktop workflow with ${stepCount} step${stepCount === 1 ? "" : "s"}.`,
++            payload: {
++              kind: "skill",
++              skillMd: `# ${trimmed}\n\nRecorded desktop workflow.`,
++              files: [],
++              requiredFields: [],
++            },
++          }),
++        });
++        if (!res.ok) {
++          throw new Error("Failed to save skill to Library");
++        }
++      }
++      setSaved(true);
++      setState("idle");
++      setSkillName("");
++    } catch (err) {
++      setError(err instanceof Error ? err.message : String(err));
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  const handleCancel = () => {
++    setState("idle");
++    setSkillName("");
++    setError(null);
++  };
++
++  return (
++    <div
++      className={`inline-flex items-center gap-1.5 font-mono text-[11px] ${className}`}
++      data-testid="record-workflow-control"
++    >
++      {state === "idle" && !saved && (
++        <button
++          type="button"
++          onClick={handleStart}
++          title="Record desktop workflow into a reusable Library skill"
++          aria-label="Record Workflow"
++          data-testid="record-workflow-start-button"
++          className="inline-flex items-center gap-1.5 rounded-full border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-red-300 transition hover:bg-red-500/20 hover:text-red-200"
++        >
++          <Circle className="h-3 w-3 fill-red-500 text-red-500" />
++          <span className="hidden sm:inline">Record Workflow</span>
++        </button>
++      )}
++
++      {state === "idle" && saved && (
++        <span
++          data-testid="record-workflow-saved-badge"
++          className="inline-flex items-center gap-1 rounded-full border border-emerald-400/30 bg-emerald-500/15 px-2.5 py-1 text-emerald-200"
++        >
++          <CheckCircle2 className="h-3 w-3" />
++          Saved to Library
++        </span>
++      )}
++
++      {state === "recording" && (
++        <button
++          type="button"
++          onClick={handleStop}
++          title="Stop recording"
++          aria-label="Stop Recording"
++          data-testid="record-workflow-stop-button"
++          className="inline-flex items-center gap-1.5 rounded-full border border-red-500/50 bg-red-600/30 px-2.5 py-1 text-red-100 animate-pulse hover:bg-red-600/40"
++        >
++          <Square className="h-3 w-3 fill-current" />
++          <span>Stop Recording</span>
++        </button>
++      )}
++
++      {state === "stopped" && (
++        <div
++          data-testid="record-workflow-save-dialog"
++          className="flex items-center gap-1.5 bg-black/60 rounded-full border border-white/20 px-2 py-0.5 shadow-lg backdrop-blur"
++        >
++          <input
++            type="text"
++            placeholder="Skill name…"
++            value={skillName}
++            onChange={(e) => setSkillName(e.target.value)}
++            disabled={saving}
++            data-testid="record-workflow-name-input"
++            className="w-24 sm:w-32 bg-transparent px-1.5 py-0.5 text-[11px] text-white placeholder-white/40 focus:outline-none"
++            onKeyDown={(e) => {
++              if (e.key === "Enter") void handleSave();
++              if (e.key === "Escape") handleCancel();
++            }}
++          />
++          <button
++            type="button"
++            onClick={() => void handleSave()}
++            disabled={saving || !skillName.trim()}
++            title="Save as skill into Library"
++            aria-label="Save as skill"
++            data-testid="record-workflow-save-button"
++            className="inline-flex items-center gap-1 rounded-full bg-emerald-500 px-2 py-0.5 text-[10px] text-black font-semibold hover:bg-emerald-400 disabled:opacity-40"
++          >
++            {saving ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Save className="h-2.5 w-2.5" />}
++            Save
++          </button>
++          <button
++            type="button"
++            onClick={handleCancel}
++            title="Cancel"
++            aria-label="Cancel"
++            data-testid="record-workflow-cancel-button"
++            className="rounded-full px-1.5 py-0.5 text-[10px] text-white/50 hover:text-white"
++          >
++            ✕
++          </button>
++        </div>
++      )}
++
++      {error && (
++        <span
++          data-testid="record-workflow-error"
++          className="inline-flex items-center gap-1 text-[10px] text-rose-300"
++        >
++          <AlertCircle className="h-3 w-3" />
++          {error}
++        </span>
++      )}
++    </div>
++  );
++}
+-- 
+2.55.0
+

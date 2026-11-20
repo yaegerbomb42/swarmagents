@@ -1,0 +1,225 @@
+From 6708b9c40291f8bef9c426304d983280f4d07b4b Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 12:57:16 -0600
+Subject: [PATCH] feat(runs): add pagination to runs API
+
+---
+ .../app/api/runtime/runs/route.test.ts        | 31 ++++++++++---
+ .../swarmagents/app/api/runtime/runs/route.ts | 45 +++++++++++++++----
+ .../swarmagents/lib/runtime/run-store.test.ts | 22 ++++++---
+ apps/swarmagents/lib/runtime/run-store.ts     | 36 ++++++++++++---
+ 4 files changed, 106 insertions(+), 28 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/runtime/runs/route.test.ts b/apps/swarmagents/app/api/runtime/runs/route.test.ts
+index 68e6e0029..e129518db 100644
+--- a/apps/swarmagents/app/api/runtime/runs/route.test.ts
++++ b/apps/swarmagents/app/api/runtime/runs/route.test.ts
+@@ -43,12 +43,23 @@ test("GET /api/runtime/runs lists durable runs with status and cost", async () =
+     assert.equal(first?.costUsd, 0.03);
+     assert.equal(first?.prompt, "first run");
+ 
+-    assert.equal((await listGET(request("/api/runtime/runs?limit=1"))).status, 200);
+-    assert.equal(((await (await listGET(request("/api/runtime/runs?limit=1"))).json()) as { runs: unknown[] }).runs.length, 1);
+-    const sinceBody = (await (await listGET(request(`/api/runtime/runs?since=${Date.now() + 60_000}`))).json()) as {
+-      runs: unknown[];
+-    };
+-    assert.equal(sinceBody.runs.length, 0);
++    const page1Res = await listGET(request("/api/runtime/runs?limit=1"));
++    assert.equal(page1Res.status, 200);
++    const page1 = (await page1Res.json()) as { runs: Array<{ runId: string }>; nextCursor: string | null };
++    assert.equal(page1.runs.length, 1);
++    assert.ok(page1.nextCursor);
++
++    const page2Res = await listGET(request(`/api/runtime/runs?limit=1&before=${encodeURIComponent(page1.nextCursor!)}`));
++    assert.equal(page2Res.status, 200);
++    const page2 = (await page2Res.json()) as { runs: Array<{ runId: string }>; nextCursor: string | null };
++    assert.equal(page2.runs.length, 1);
++    assert.equal(page2.nextCursor, null);
++    assert.notEqual(page2.runs[0].runId, page1.runs[0].runId);
++
++    const beforeTsRes = await listGET(request(`/api/runtime/runs?before=${page1.runs[0].runId}`));
++    assert.equal(beforeTsRes.status, 200);
++    const beforeTs = (await beforeTsRes.json()) as { runs: Array<{ runId: string }>; nextCursor: string | null };
++    assert.ok(beforeTs.runs.every((r) => r.runId !== page1.runs[0].runId));
+   } finally {
+     configureRunsDir(null);
+     fs.rmSync(dir, { recursive: true, force: true });
+@@ -93,6 +104,14 @@ test("GET /api/runtime/runs rejects bad input and unknown runs", async () => {
+     assert.equal((await replayGET(request("/api/runtime/runs/run_missing"), ctx("run_missing"))).status, 404);
+     // Runs owned by another user are not readable.
+     assert.equal((await replayGET(request("/api/runtime/runs/run_3"), ctx("run_3"))).status, 404);
++
++    // Pagination invalid params (400).
++    assert.equal((await listGET(request("/api/runtime/runs?limit=0"))).status, 400);
++    assert.equal((await listGET(request("/api/runtime/runs?limit=101"))).status, 400);
++    assert.equal((await listGET(request("/api/runtime/runs?limit=-1"))).status, 400);
++    assert.equal((await listGET(request("/api/runtime/runs?limit=abc"))).status, 400);
++    assert.equal((await listGET(request("/api/runtime/runs?before="))).status, 400);
++    assert.equal((await listGET(request("/api/runtime/runs?before=bad$id"))).status, 400);
+   } finally {
+     configureRunsDir(null);
+     fs.rmSync(dir, { recursive: true, force: true });
+diff --git a/apps/swarmagents/app/api/runtime/runs/route.ts b/apps/swarmagents/app/api/runtime/runs/route.ts
+index 72cdb5715..c4c527959 100644
+--- a/apps/swarmagents/app/api/runtime/runs/route.ts
++++ b/apps/swarmagents/app/api/runtime/runs/route.ts
+@@ -2,8 +2,8 @@
+  * Durable run history. Reads the per-run JSONL telemetry logs so runs remain
+  * listable after a server restart, unlike the in-memory RuntimeManager view.
+  *
+- * GET /api/runtime/runs?limit=20&since=<epochMs> -> {runs: StoredRunSummary[]}
+- * for the caller, optionally limited to the current thread's boundary.
++ * GET /api/runtime/runs?limit=20&before=<runId|epochMs> -> {runs, nextCursor}
++ * Paginated, scoped to the caller.
+  */
+ 
+ import { NextResponse, type NextRequest } from "next/server";
+@@ -22,10 +22,39 @@ export async function GET(req: NextRequest) {
+   const user = caller(req);
+   if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+ 
+-  const rawLimit = Number(req.nextUrl.searchParams.get("limit") ?? "");
+-  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 20;
+-  const rawSince = Number(req.nextUrl.searchParams.get("since") ?? "");
+-  const since = Number.isFinite(rawSince) && rawSince > 0 ? Math.floor(rawSince) : undefined;
+-  const runs = listRuns({ userId: user, limit, since });
+-  return NextResponse.json({ runs });
++  const limitParam = req.nextUrl.searchParams.get("limit");
++  let limit = 20;
++  if (limitParam !== null) {
++    if (!/^\d+$/.test(limitParam)) {
++      return NextResponse.json({ error: "Invalid limit." }, { status: 400 });
++    }
++    limit = Number(limitParam);
++    if (!Number.isFinite(limit) || limit < 1 || limit > 100) {
++      return NextResponse.json({ error: "Invalid limit." }, { status: 400 });
++    }
++  }
++
++  const beforeParam = req.nextUrl.searchParams.get("before");
++  let before: string | number | undefined;
++  if (beforeParam !== null) {
++    if (beforeParam.length === 0 || beforeParam.length > 128) {
++      return NextResponse.json({ error: "Invalid before cursor." }, { status: 400 });
++    }
++    if (/^\d+$/.test(beforeParam)) {
++      const ts = Number(beforeParam);
++      if (!Number.isFinite(ts) || ts < 0) {
++        return NextResponse.json({ error: "Invalid before cursor." }, { status: 400 });
++      }
++      before = ts;
++    } else {
++      // runId cursor
++      if (!/^[A-Za-z0-9_-]{1,128}$/.test(beforeParam)) {
++        return NextResponse.json({ error: "Invalid before cursor." }, { status: 400 });
++      }
++      before = beforeParam;
++    }
++  }
++
++  const result = listRuns({ userId: user, limit, before });
++  return NextResponse.json(result);
+ }
+diff --git a/apps/swarmagents/lib/runtime/run-store.test.ts b/apps/swarmagents/lib/runtime/run-store.test.ts
+index 69fcd51ac..1492eff8a 100644
+--- a/apps/swarmagents/lib/runtime/run-store.test.ts
++++ b/apps/swarmagents/lib/runtime/run-store.test.ts
+@@ -69,19 +69,27 @@ test("lists recent runs with status and cost, newest first, filtered by user", (
+     bus.publish("run_bob", { type: "run.created", data: { prompt: "bob", userId: "bob" } });
+ 
+     const all = listRuns({ runsDir: dir });
+-    assert.equal(all.length, 3);
++    assert.equal(all.runs.length, 3);
++    assert.equal(all.nextCursor, null);
+     const alice = listRuns({ runsDir: dir, userId: "alice" });
+-    assert.deepEqual(alice.map((r) => r.runId).sort(), ["run_new", "run_old"]);
+-    const old = alice.find((r) => r.runId === "run_old");
+-    const next = alice.find((r) => r.runId === "run_new");
++    assert.deepEqual(alice.runs.map((r) => r.runId).sort(), ["run_new", "run_old"]);
++    const old = alice.runs.find((r) => r.runId === "run_old");
++    const next = alice.runs.find((r) => r.runId === "run_new");
+     assert.equal(old?.status, "finished");
+     assert.equal(old?.costUsd, 0.5);
+     assert.equal(next?.status, "error");
+     assert.equal(next?.error, "boom");
+ 
+-    assert.equal(listRuns({ runsDir: dir, limit: 1 }).length, 1);
+-    assert.equal(listRuns({ runsDir: dir, since: Date.now() + 60_000 }).length, 0);
+-    assert.equal(listRuns({ runsDir: null }).length, 0);
++    const page1 = listRuns({ runsDir: dir, userId: "alice", limit: 1 });
++    assert.equal(page1.runs.length, 1);
++    assert.ok(page1.nextCursor);
++    const page2 = listRuns({ runsDir: dir, userId: "alice", limit: 1, before: page1.nextCursor! });
++    assert.equal(page2.runs.length, 1);
++    assert.equal(page2.nextCursor, null);
++
++    const future = listRuns({ runsDir: dir, before: Date.now() + 60_000 });
++    assert.equal(future.runs.length, all.runs.length);
++    assert.equal(listRuns({ runsDir: null }).runs.length, 0);
+   } finally {
+     fs.rmSync(dir, { recursive: true, force: true });
+   }
+diff --git a/apps/swarmagents/lib/runtime/run-store.ts b/apps/swarmagents/lib/runtime/run-store.ts
+index 421f50b7f..d11732ec2 100644
+--- a/apps/swarmagents/lib/runtime/run-store.ts
++++ b/apps/swarmagents/lib/runtime/run-store.ts
+@@ -33,7 +33,12 @@ export interface ListRunsOptions {
+   runsDir?: string | null;
+   limit?: number;
+   userId?: string;
+-  since?: number;
++  before?: string | number;
++}
++
++export interface ListRunsResult {
++  runs: StoredRunSummary[];
++  nextCursor: string | null;
+ }
+ 
+ export interface ReplayedRun {
+@@ -122,19 +127,36 @@ export function getRun(runId: string, runsDir: string | null = getRunsDir()): Re
+   return { runId, events, summary: summarizeRun(runId, events) };
+ }
+ 
+-export function listRuns(options: ListRunsOptions = {}): StoredRunSummary[] {
++export function listRuns(options: ListRunsOptions = {}): ListRunsResult {
+   const runsDir = options.runsDir === undefined ? getRunsDir() : options.runsDir;
+-  if (!runsDir) return [];
+-  const limit = Math.max(1, Math.min(options.limit ?? 20, 200));
++  if (!runsDir) return { runs: [], nextCursor: null };
++  const limit = Math.max(1, Math.min(options.limit ?? 20, 100));
+ 
+   const summaries: StoredRunSummary[] = [];
+   for (const info of listRunLogs(runsDir)) {
+     const run = getRun(info.runId, runsDir);
+     if (!run) continue;
+     if (options.userId && run.summary.userId !== options.userId) continue;
+-    if (options.since !== undefined && run.summary.createdAt < options.since) continue;
+     summaries.push(run.summary);
+   }
+-  summaries.sort((a, b) => b.createdAt - a.createdAt);
+-  return summaries.slice(0, limit);
++  summaries.sort((a, b) => b.createdAt - a.createdAt || b.runId.localeCompare(a.runId));
++
++  let start = 0;
++  if (options.before !== undefined && options.before !== "") {
++    const before = options.before;
++    if (typeof before === "number" || /^\d+$/.test(String(before))) {
++      const ts = typeof before === "number" ? before : Number(before);
++      if (Number.isFinite(ts)) {
++        start = summaries.findIndex((r) => r.createdAt < ts);
++        if (start === -1) start = summaries.length;
++      }
++    } else {
++      const idx = summaries.findIndex((r) => r.runId === before);
++      start = idx === -1 ? summaries.length : idx + 1;
++    }
++  }
++
++  const page = summaries.slice(start, start + limit);
++  const nextCursor = start + limit < summaries.length ? (page[page.length - 1]?.runId ?? null) : null;
++  return { runs: page, nextCursor };
+ }
+-- 
+2.55.0
+

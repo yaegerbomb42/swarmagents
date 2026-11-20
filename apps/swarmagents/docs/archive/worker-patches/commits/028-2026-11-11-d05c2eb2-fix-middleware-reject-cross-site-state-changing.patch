@@ -1,0 +1,225 @@
+From d05c2eb24ea7b882539a18305c350202c4c35bcb Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 13:11:39 -0600
+Subject: [PATCH] fix(middleware): reject cross-site state-changing /api
+ requests
+
+Add a CSRF gate for POST/PUT/PATCH/DELETE under /api in server mode:
+reject with a 403 JSON error when Origin shows a mismatched host (which
+catches same-site subdomain requests that SameSite=Lax still passes) or
+when Sec-Fetch-Site is cross-site. The public board MCP endpoint and
+harness bearer-authenticated calls are exempt. Tests cover same-origin,
+cross-site, the subdomain loophole, missing Origin with bearer, and the
+board exemption.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/lib/auth.ts            |  7 ++
+ apps/swarmagents/lib/middleware.test.ts | 85 +++++++++++++++++++++++--
+ apps/swarmagents/middleware.ts          | 50 ++++++++++++++-
+ 3 files changed, 137 insertions(+), 5 deletions(-)
+
+diff --git a/apps/swarmagents/lib/auth.ts b/apps/swarmagents/lib/auth.ts
+index d4587bd6d..04c14b83d 100644
+--- a/apps/swarmagents/lib/auth.ts
++++ b/apps/swarmagents/lib/auth.ts
+@@ -177,6 +177,13 @@ function harnessTokenValid(token: string): boolean {
+   return a.length === b.length && timingSafeEqual(a, b);
+ }
+ 
++/** True when the request carries a valid harness bearer token (server-to-server, never a browser). */
++export function isHarnessBearer(req: AuthRequestLike): boolean {
++  const auth = req.headers.get("authorization") ?? "";
++  if (!auth.toLowerCase().startsWith("bearer ")) return false;
++  return harnessTokenValid(auth.slice(7).trim());
++}
++
+ /**
+  * Resolve the caller. Local mode: the machine's own agent is always trusted.
+  * Server mode: valid harness bearer token, or a signed session cookie.
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index 533022d47..c971b9f25 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -5,10 +5,18 @@ import { middleware } from "../middleware";
+ import { SESSION_COOKIE, signSession } from "./auth";
+ import { resetBuckets } from "./rate-limit";
+ 
+-function req(url: string, headers: Record<string, string> = {}): NextRequest {
+-  return new NextRequest(url, { headers });
++function req(url: string, headers: Record<string, string> = {}, method = "GET"): NextRequest {
++  return new NextRequest(url, { headers, method });
+ }
+ 
++/** Signed session cookie for "alice"; must be minted after beforeEach sets SWARM_SESSION_SECRET. */
++function cookie(): string {
++  return `${SESSION_COOKIE}=${signSession("alice")}`;
++}
++
++const HARNESS = "Bearer harness-token";
++const STATE_CHANGING = ["POST", "PUT", "PATCH", "DELETE"];
++
+ test.beforeEach(() => {
+   process.env.SWARM_SERVER_MODE = "1";
+   process.env.SWARM_ALLOWED_HOSTS = "swarm.example.com";
+@@ -40,12 +48,81 @@ test("returns 401 JSON for unauthenticated API calls instead of redirecting", as
+ });
+ 
+ test("passes authenticated requests through with a valid session cookie", () => {
+-  const cookie = `${SESSION_COOKIE}=${signSession("alice")}`;
+-  const res = middleware(req("http://swarm.example.com/app", { host: "swarm.example.com", cookie }));
++  const res = middleware(req("http://swarm.example.com/app", { host: "swarm.example.com", cookie: cookie() }));
+   assert.equal(res.status, 200);
+   assert.equal(res.headers.get("location"), null, "authenticated requests must not redirect");
+ });
+ 
++test("rejects cross-site state-changing API requests with 403 JSON", async () => {
++  for (const method of STATE_CHANGING) {
++    const res = middleware(
++      req(
++        "http://swarm.example.com/api/providers/health",
++        { host: "swarm.example.com", origin: "http://evil.example.com", cookie: cookie() },
++        method,
++      ),
++    );
++    assert.equal(res.status, 403, `${method} cross-site must be rejected`);
++    assert.deepEqual(await res.json(), { error: "Cross-site request blocked." }, `${method} must return the 403 JSON error`);
++  }
++});
++
++test("rejects cross-site requests from a same-site subdomain (SameSite=Lax loophole)", async () => {
++  // A sibling subdomain is same-site, so SameSite=Lax sends the cookie; only the
++  // Origin/Host comparison can tell this request is cross-origin.
++  const res = middleware(
++    req(
++      "http://swarm.example.com/api/providers/health",
++      { host: "swarm.example.com", origin: "http://sub.swarm.example.com", cookie: cookie() },
++      "POST",
++    ),
++  );
++  assert.equal(res.status, 403);
++});
++
++test("allows same-origin state-changing API requests", async () => {
++  for (const method of STATE_CHANGING) {
++    const res = middleware(
++      req(
++        "http://swarm.example.com/api/providers/health",
++        { host: "swarm.example.com", origin: "http://swarm.example.com", cookie: cookie() },
++        method,
++      ),
++    );
++    assert.equal(res.status, 200, `${method} same-origin must pass`);
++  }
++});
++
++test("allows bearer-authenticated requests without an Origin header", async () => {
++  // Server-to-server harness calls carry no Origin; they are exempt from the gate.
++  const res = middleware(req("http://swarm.example.com/api/runtime/tasks", { host: "swarm.example.com", authorization: HARNESS }, "POST"));
++  assert.equal(res.status, 200);
++});
++
++test("does not gate cross-site GET requests", () => {
++  const res = middleware(
++    req("http://swarm.example.com/api/providers/health", {
++      host: "swarm.example.com",
++      origin: "http://evil.example.com",
++      cookie: cookie(),
++    }),
++  );
++  assert.equal(res.status, 200);
++});
++
++test("exempts the public board endpoint from the cross-site gate", async () => {
++  for (const method of STATE_CHANGING) {
++    const res = middleware(
++      req(
++        "http://swarm.example.com/api/mcp/swarm-board",
++        { host: "swarm.example.com", origin: "http://evil.example.com" },
++        method,
++      ),
++    );
++    assert.equal(res.status, 200, `${method} to the board must be exempt`);
++  }
++});
++
+ test("rejects non-allowlisted hosts before any auth or redirect logic", () => {
+   const res = middleware(req("http://evil.example.com/app", { host: "evil.example.com" }));
+   assert.equal(res.status, 403);
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index 2105f4776..604ac99c8 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -1,6 +1,6 @@
+ import crypto from "node:crypto";
+ import { NextResponse, type NextRequest } from "next/server";
+-import { hostAllowed, requestUser, serverMode, USER_HEADER } from "./lib/auth";
++import { hostAllowed, isHarnessBearer, requestUser, serverMode, USER_HEADER } from "./lib/auth";
+ import { rateLimitCheck, rateLimitKey, rateLimitResponse, type RateInfo } from "./lib/rate-limit";
+ import { cspValue, securityHeaders, NONCE_HEADER, type SecurityHeadersOptions } from "./lib/security-headers";
+ 
+@@ -31,6 +31,36 @@ export { isAllowed as isLocal } from "./lib/auth";
+ /** Reachable signed out: the sign-in page and the endpoints it uses. */
+ const PUBLIC = new Set(["/login", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
+ 
++/** The public board MCP endpoint is exempt from the cross-site gate (external MCP clients call it). */
++const BOARD_PATH = "/api/mcp/swarm-board";
++
++/** State-changing methods: a cross-site request can make the browser act as the logged-in user. */
++const STATE_CHANGING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
++
++/**
++ * True when Origin / Sec-Fetch-Site prove the request is cross-site. Browsers
++ * send Origin on every state-changing request (fetch, XHR, forms), so a
++ * mismatched Origin host is unambiguous; Sec-Fetch-Site catches the rest.
++ * Absent headers mean a non-browser client (which carries no cookies to abuse),
++ * not a cross-site browser request, and are allowed. SameSite=Lax already
++ * stops cross-site fetch/XHR POSTs from other domains, but requests from a
++ * same-site subdomain (e.g. a compromised subdomain) still carry Lax cookies,
++ * so a mismatched Origin host is the signal that matters.
++ */
++function isCrossSite(req: NextRequest): boolean {
++  const origin = req.headers.get("origin");
++  if (origin) {
++    try {
++      const host = (req.headers.get("host") ?? "").split(":")[0].toLowerCase();
++      const originHost = new URL(origin).hostname.toLowerCase();
++      if (originHost !== host) return true;
++    } catch {
++      return true; // Malformed Origin: cannot prove same-origin, reject.
++    }
++  }
++  return req.headers.get("sec-fetch-site") === "cross-site";
++}
++
+ /** Never let an untrusted X-Forwarded-Host turn the sign-in redirect into an open redirect. */
+ function redirectOrigin(req: NextRequest): string {
+   const allowed = (process.env.SWARM_ALLOWED_HOSTS ?? "")
+@@ -86,6 +116,24 @@ export function middleware(req: NextRequest) {
+   headers.set("Content-Security-Policy", cspValue(nonce, { dev }));
+   headers.set(NONCE_HEADER, nonce);
+ 
++  // Cross-site gate for state-changing /api/* calls. Cookie-authenticated
++  // requests from another origin (including a same-site subdomain, which
++  // SameSite=Lax lets through) could mutate state as the signed-in user, so
++  // they get a 403 JSON. Runs before the public allow-list so the public
++  // login/signup POSTs are gated too. The public board endpoint and harness
++  // bearer calls (server-to-server; browsers cannot attach the Authorization
++  // header) are exempt.
++  if (
++    serverMode() &&
++    pathname.startsWith("/api/") &&
++    pathname !== BOARD_PATH &&
++    STATE_CHANGING.has(req.method.toUpperCase()) &&
++    !isHarnessBearer(req) &&
++    isCrossSite(req)
++  ) {
++    return withSecurityHeaders(NextResponse.json({ error: "Cross-site request blocked." }, { status: 403 }), nonce, { dev }, rate);
++  }
++
+   if (PUBLIC.has(pathname)) return withSecurityHeaders(NextResponse.next({ request: { headers } }), nonce, { dev }, rate);
+   if (!user) {
+     if (!serverMode()) return withSecurityHeaders(new NextResponse("forbidden", { status: 403 }), nonce, { dev }, rate);
+-- 
+2.55.0
+

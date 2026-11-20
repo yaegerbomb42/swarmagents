@@ -1,0 +1,332 @@
+From 0c1a2c8922ccddfd036414b36984e81326dc2d57 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:57:20 -0600
+Subject: [PATCH] feat(p8): add public pricing and FAQ pages
+
+---
+ apps/swarmagents/app/faq/page.tsx       | 138 ++++++++++++++++++++++++
+ apps/swarmagents/app/pricing/page.tsx   | 124 +++++++++++++++++++++
+ apps/swarmagents/lib/middleware.test.ts |  18 ++++
+ apps/swarmagents/middleware.ts          |   2 +-
+ 4 files changed, 281 insertions(+), 1 deletion(-)
+ create mode 100644 apps/swarmagents/app/faq/page.tsx
+ create mode 100644 apps/swarmagents/app/pricing/page.tsx
+
+diff --git a/apps/swarmagents/app/faq/page.tsx b/apps/swarmagents/app/faq/page.tsx
+new file mode 100644
+index 000000000..f5e975479
+--- /dev/null
++++ b/apps/swarmagents/app/faq/page.tsx
+@@ -0,0 +1,138 @@
++export const metadata = {
++  title: "FAQ — SwarmAgents",
++  description: "Frequently asked questions about SwarmAgents: what a run is, approvals, hibernate, reset, what is stored, providers, signup, and more.",
++};
++
++export const dynamic = "force-dynamic";
++
++const FAQS: { q: string; a: string }[] = [
++  {
++    q: "What is a run?",
++    a: "A run is one execution of your agent inside your persistent VM. You start a run with a prompt, and your agent works inside the VM using the tools you&rsquo;ve given it — shell, file edits, browser, and more — while you watch live.",
++  },
++  {
++    q: "What is the persistent VM?",
++    a: "Each account gets one persistent Linux VM. Your agent&rsquo;s workspace, installed tools, and state live there between runs. It hibernates when idle and wakes when you start a new run.",
++  },
++  {
++    q: "What are approvals?",
++    a: "Some actions (like destructive commands or external network calls) require your explicit approval before the agent can proceed. You review and approve or reject each one in the UI.",
++  },
++  {
++    q: "What does hibernate do?",
++    a: "Hibernate suspends your VM when it&rsquo;s been idle, freeing resources while keeping your workspace intact. Your agent resumes exactly where it left off on the next run.",
++  },
++  {
++    q: "What does reset do?",
++    a: "Reset wipes the VM workspace back to a clean state, as if it were freshly provisioned. Use this if something goes wrong or you want to start over.",
++  },
++  {
++    q: "What is stored?",
++    a: "Prompts, run logs, workspace files, VM snapshots, and your account email are stored. Provider keys you add stay on the server and are never sent to agent-controlled code.",
++  },
++  {
++    q: "Which providers are supported?",
++    a: "You can bring your own provider keys (Anthropic Claude, OpenAI, etc.) or use the platform pool if available. Provider health is checked automatically so failed keys are rotated out.",
++  },
++  {
++    q: "Is self-signup open?",
++    a: "No — self-signup is closed in production unless SWARM_ALLOW_SIGNUP=1 is set. To request an account, contact the operator (mailto link on the pricing page).",
++  },
++  {
++    q: "Can I take over my agent?",
++    a: "Yes — you can watch your agent&rsquo;s screen, terminal, and browser live, and you can take control at any time.",
++  },
++  {
++    q: "How long do runs keep history?",
++    a: "Run history is kept per-user up to a configurable limit. Older runs are pruned to keep the history manageable.",
++  },
++  {
++    q: "Is this a paid product?",
++    a: "SwarmAgents is in preview. There is no published price and no charges during the preview period. Contact the operator for access and pricing details when they&rsquo;re available.",
++  },
++];
++
++export default function FAQPage() {
++  return (
++    <main
++      style={{
++        minHeight: "100vh",
++        background: "#000",
++        color: "#fff",
++        fontFamily: '"Geist", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif',
++        padding: "40px 20px 80px",
++      }}
++    >
++      <div style={{ maxWidth: 720, margin: "0 auto" }}>
++        <h1
++          style={{
++            fontSize: "clamp(1.75rem, 1.64rem + 0.55vw, 2rem)",
++            fontWeight: 600,
++            letterSpacing: "-0.02em",
++            marginBottom: 8,
++            color: "#fff",
++          }}
++        >
++          FAQ
++        </h1>
++        <p
++          style={{
++            fontSize: "clamp(1rem, 0.96rem + 0.2vw, 1.0625rem)",
++            color: "#888",
++            marginBottom: 40,
++            lineHeight: 1.6,
++          }}
++        >
++          Honest answers about SwarmAgents. Still have questions? Contact the
++          operator.
++        </p>
++
++        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
++          {FAQS.map((faq, i) => (
++            <details
++              key={i}
++              style={{
++                background: "#0a0a0a",
++                border: "1px solid #1a1a1a",
++                borderRadius: 8,
++                overflow: "hidden",
++              }}
++            >
++              <summary
++                style={{
++                  padding: "12px 16px",
++                  fontWeight: 600,
++                  color: "#fff",
++                  cursor: "pointer",
++                  listStyle: "none",
++                }}
++              >
++                {faq.q}
++              </summary>
++              <p style={{ padding: "0 16px 16px", color: "#ccc", lineHeight: 1.7 }}>
++                {faq.a}
++              </p>
++            </details>
++          ))}
++        </div>
++
++        <p style={{ color: "#555", fontSize: "clamp(0.875rem, 0.84rem + 0.18vw, 0.9375rem)", marginTop: 40 }}>
++          {"Want pricing? "}
++          <a
++            href="/pricing"
++            style={{ color: "#22d3ee", textDecoration: "none", borderBottom: "1px solid #22d3ee" }}
++          >
++            See pricing
++          </a>
++          {" • "}
++          <a
++            href="/login"
++            style={{ color: "#22d3ee", textDecoration: "none", borderBottom: "1px solid #22d3ee" }}
++          >
++            Sign in
++          </a>
++        </p>
++      </div>
++    </main>
++  );
++}
+\ No newline at end of file
+diff --git a/apps/swarmagents/app/pricing/page.tsx b/apps/swarmagents/app/pricing/page.tsx
+new file mode 100644
+index 000000000..76423b989
+--- /dev/null
++++ b/apps/swarmagents/app/pricing/page.tsx
+@@ -0,0 +1,124 @@
++import Link from "next/link";
++
++export const metadata = {
++  title: "Pricing — SwarmAgents",
++  description: "One persistent VM per account. Bring your own provider keys, or use the platform pool. Preview access — contact the operator to get started.",
++};
++
++export const dynamic = "force-dynamic";
++
++export default function PricingPage() {
++  return (
++    <main
++      style={{
++        minHeight: "100vh",
++        background: "#000",
++        color: "#fff",
++        fontFamily: '"Geist", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif',
++        padding: "40px 20px 80px",
++      }}
++    >
++      <div style={{ maxWidth: 720, margin: "0 auto" }}>
++        <h1
++          style={{
++            fontSize: "clamp(1.75rem, 1.64rem + 0.55vw, 2rem)",
++            fontWeight: 600,
++            letterSpacing: "-0.02em",
++            marginBottom: 8,
++            color: "#fff",
++          }}
++        >
++          Pricing
++        </h1>
++        <p
++          style={{
++            fontSize: "clamp(1rem, 0.96rem + 0.2vw, 1.0625rem)",
++            color: "#888",
++            marginBottom: 40,
++            lineHeight: 1.6,
++          }}
++        >
++          SwarmAgents is in preview. One persistent Linux VM per account — your
++          agent lives there, you can watch it work live, and you keep full
++          control.
++        </p>
++
++        <section style={{ marginBottom: 40 }}>
++          <h2
++            style={{
++              fontSize: "clamp(1.375rem, 1.3rem + 0.38vw, 1.5625rem)",
++              fontWeight: 600,
++              marginBottom: 20,
++              color: "#fff",
++            }}
++          >
++            What&rsquo;s included
++          </h2>
++          <ul style={{ color: "#fff", lineHeight: 1.8, paddingLeft: 20 }}>
++            <li>One persistent VM per account — your agent runs there 24/7</li>
++            <li>Live screen, terminal, and browser view of your agent at work</li>
++            <li>Bring your own provider keys (Anthropic, OpenAI, etc.)</li>
++            <li>Optional platform provider pool if you don&rsquo;t have keys</li>
++            <li>Full command history and run logs</li>
++            <li>File snapshots, VM suspend/resume, and idle cleanup</li>
++          </ul>
++        </section>
++
++        <section style={{ marginBottom: 40 }}>
++          <h2
++            style={{
++              fontSize: "clamp(1.375rem, 1.3rem + 0.38vw, 1.5625rem)",
++              fontWeight: 600,
++              marginBottom: 20,
++              color: "#fff",
++            }}
++          >
++            Cost
++          </h2>
++          <p style={{ color: "#fff", marginBottom: 16 }}>
++            SwarmAgents is in preview — there is no published price yet. We do
++            not invent prices or charge during the preview period. To request
++            access, email us at the operator address listed below.
++          </p>
++        </section>
++
++        <section style={{ marginBottom: 40, padding: 24, background: "#0a0a0a", border: "1px solid #1a1a1a", borderRadius: 12 }}>
++          <h2
++            style={{
++              fontSize: "clamp(1.125rem, 1.07rem + 0.28vw, 1.25rem)",
++              fontWeight: 600,
++              marginBottom: 12,
++              color: "#fff",
++            }}
++          >
++            How to get access
++          </h2>
++          <p style={{ color: "#888", lineHeight: 1.6, marginBottom: 12 }}>
++            Self-signup is closed in production. To request an account, contact
++            the operator:
++          </p>
++          <a
++            href="mailto:operator@swarmagents.local"
++            style={{
++              color: "#22d3ee",
++              textDecoration: "none",
++              borderBottom: "1px solid #22d3ee",
++            }}
++          >
++            mailto:operator@swarmagents.local
++          </a>
++        </section>
++
++        <p style={{ color: "#555", fontSize: "clamp(0.875rem, 0.84rem + 0.18vw, 0.9375rem)", marginTop: 40 }}>
++          {"Already have an account? "}
++          <Link
++            href="/login"
++            style={{ color: "#22d3ee", textDecoration: "none", borderBottom: "1px solid #22d3ee" }}
++          >
++            Sign in
++          </Link>
++        </p>
++      </div>
++    </main>
++  );
++}
+\ No newline at end of file
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index c971b9f25..c54914d0e 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -187,3 +187,21 @@ test("429 responses carry Retry-After and rate-limit headers (login bucket)", ()
+   assert.equal(res.headers.get("X-RateLimit-Remaining"), "0");
+   assert.ok(Number(res.headers.get("X-RateLimit-Reset")) >= 0);
+ });
++
++test("/pricing is publicly accessible without authentication", () => {
++  const res = middleware(req("http://swarm.example.com/pricing", { host: "swarm.example.com" }));
++  assert.equal(res.status, 200);
++});
++
++test("/faq is publicly accessible without authentication", () => {
++  const res = middleware(req("http://swarm.example.com/faq", { host: "swarm.example.com" }));
++  assert.equal(res.status, 200);
++});
++
++test("/pricing and /faq do not redirect unauthenticated users to /login", () => {
++  for (const path of ["/pricing", "/faq"]) {
++    const res = middleware(req(`http://swarm.example.com${path}`, { host: "swarm.example.com" }));
++    assert.equal(res.status, 200, `${path} must not redirect`);
++    assert.equal(res.headers.get("location"), null, `${path} must not set a Location header`);
++  }
++});
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index b5268f03e..e92211a69 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -29,7 +29,7 @@ function withSecurityHeaders(
+ export { isAllowed as isLocal } from "./lib/auth";
+ 
+ /** Reachable signed out: the sign-in page and the endpoints it uses. */
+-const PUBLIC = new Set(["/login", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
++const PUBLIC = new Set(["/login", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health", "/pricing", "/faq"]);
+ 
+ /** The public board MCP endpoint is exempt from the cross-site gate (external MCP clients call it). */
+ const BOARD_PATH = "/api/mcp/swarm-board";
+-- 
+2.55.0
+

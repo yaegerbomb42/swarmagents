@@ -1,0 +1,1527 @@
+From fa0604e1849fd3abd9f993dfab463b13a23c51f3 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Tue, 17 Nov 2026 08:26:47 -0600
+Subject: [PATCH] =?UTF-8?q?feat(swarmagents):=20gaps=20live=20features=20?=
+ =?UTF-8?q?=E2=80=94=20preview=20WS=20wiring,=20test-drive=20sweeper,=20la?=
+ =?UTF-8?q?ne=20checkpoints?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/DEPLOY.md                    |  30 ++
+ .../library/public/[id]/test-drive/route.ts   |  10 +-
+ .../app/preview/[port]/[[...path]]/route.ts   |   6 +-
+ .../share/[token]/[port]/[[...path]]/route.ts |   5 +-
+ apps/swarmagents/deploy/nginx.conf            |  37 +++
+ .../lib/desktop-proxy/proxy.test.ts           | 233 +++++++++++++-
+ apps/swarmagents/lib/desktop-proxy/proxy.ts   | 137 ++++++++
+ .../lib/library/test-drive-sweeper.test.ts    | 301 ++++++++++++++++++
+ .../lib/library/test-drive-sweeper.ts         | 221 +++++++++++++
+ apps/swarmagents/lib/preview/proxy.ts         |  12 +-
+ apps/swarmagents/lib/runtime/manager.ts       |  16 +
+ .../lib/team/harness.checkpoints.test.ts      | 252 +++++++++++++++
+ 12 files changed, 1246 insertions(+), 14 deletions(-)
+ create mode 100644 apps/swarmagents/lib/library/test-drive-sweeper.test.ts
+ create mode 100644 apps/swarmagents/lib/library/test-drive-sweeper.ts
+ create mode 100644 apps/swarmagents/lib/team/harness.checkpoints.test.ts
+
+diff --git a/apps/swarmagents/DEPLOY.md b/apps/swarmagents/DEPLOY.md
+index c80ab93ba..299c1a880 100644
+--- a/apps/swarmagents/DEPLOY.md
++++ b/apps/swarmagents/DEPLOY.md
+@@ -389,6 +389,36 @@ should not expose 3778 anywhere but the loopback; the published port binding
+ above enforces that. SSL termination happens at nginx, as for the rest of the
+ app.
+ 
++## Preview WebSocket upgrades
++
++The preview routes (`/preview/<port>/...`, `/preview/share/<token>/<port>/...`)
++are Next.js route handlers, so they can forward HTTP but cannot accept a
++WebSocket upgrade — a Vite HMR or live-reload socket inside a previewed app
++would never connect through them. The upgrade half lives on the same
++in-process proxy server as the desktop stream (`lib/desktop-proxy/proxy.ts`,
++which already owns an `upgrade` event and the session-cookie gate):
++
++- nginx routes preview traffic by the `Upgrade` header: `deploy/nginx.conf`
++  maps `$http_upgrade` to a backend (`websocket` → 127.0.0.1:3778, anything
++  else → 127.0.0.1:3777) and the `location /preview/` block proxies to it.
++  Plain HTTP keeps going to Next.js; only an actual upgrade handshake
++  reaches the proxy. The same `location /preview/` block is in the 443
++  template.
++- The proxy accepts upgrades under the same mounts the HTTP routes serve
++  and applies the same gates: the session mount requires a valid session
++  cookie for the VM owner (plus the host/origin checks); the share mount
++  requires a live token whose bound port equals the port in the path. The
++  dial target comes only from `resolvePreviewTarget` — the port must be in
++  that owner's detected listening set right now — so an unlisted port is a
++  404, never a dial, and the session cookie is never forwarded upstream.
++  The tunnel itself is `handlePreviewUpgrade` (`lib/preview/proxy.ts`).
++- The socket client must connect under the preview mount
++  (`wss://<host>/preview/<port>/...`); a client that connects at the site
++  root still hits Next.js and cannot upgrade. Apps that need a sub-path
++  base for their assets (Vite `base: './'`) already connect their HMR
++  socket under the mount; apps that open an absolute root-path socket do
++  not.
++
+ ## Per-IP rate limiting behind the proxy
+ 
+ Anonymous API calls (sign-in, sign-up, public reads) are rate-limited per
+diff --git a/apps/swarmagents/app/api/library/public/[id]/test-drive/route.ts b/apps/swarmagents/app/api/library/public/[id]/test-drive/route.ts
+index c38b2f04c..c0630092e 100644
+--- a/apps/swarmagents/app/api/library/public/[id]/test-drive/route.ts
++++ b/apps/swarmagents/app/api/library/public/[id]/test-drive/route.ts
+@@ -16,11 +16,11 @@
+  *
+  * Both GET paths also run the abandonment sweep for the caller, so a drive
+  * the user never revisits is rolled back the next time any drive list is
+- * read — the sweep is the background cleanup, and the explicit sweep
+- * action is the manual trigger. (There is no app-level periodic hook for
+- * library records to piggyback on: the RuntimeManager watchdog and the
+- * VM idle sweeper are run/VM-scoped, so the route reads + the sweep
+- * action are the mechanism, not a new timer.)
++ * read. A background timer does the same for every account once an hour
++ * (see startTestDriveSweeper in lib/library/test-drive-sweeper.ts, wired
++ * in getRuntimeManager next to the VM idle sweeper), so a drive abandoned
++ * by a user who never returns is still rolled back — the route reads +
++ * the sweep action are the manual/on-demand path, not the only one.
+  *
+  * The start sequence is the whole point of the feature:
+  *   1. Refuse while the user has an active or queued run — snapshotting
+diff --git a/apps/swarmagents/app/preview/[port]/[[...path]]/route.ts b/apps/swarmagents/app/preview/[port]/[[...path]]/route.ts
+index 84a110a52..312194293 100644
+--- a/apps/swarmagents/app/preview/[port]/[[...path]]/route.ts
++++ b/apps/swarmagents/app/preview/[port]/[[...path]]/route.ts
+@@ -4,8 +4,10 @@
+  * /preview/<port>/[...path] — the owner's live app, framed in the in-app
+  * Preview tab. Every HTTP method is forwarded; see lib/preview/serve.ts
+  * for the auth, port-allowlist, and forwarding rules. WebSocket upgrades
+- * are not supported by Next.js route handlers, so Vite HMR and other live
+- * sockets will not connect — the app itself loads and works.
++ * are not supported by Next.js route handlers, so a Vite HMR socket that
++ * connects under this mount is accepted by the desktop proxy instead
++ * (lib/desktop-proxy/proxy.ts; nginx routes preview upgrades there) —
++ * the app itself loads and works either way.
+  */
+ 
+ import type { NextRequest } from "next/server";
+diff --git a/apps/swarmagents/app/preview/share/[token]/[port]/[[...path]]/route.ts b/apps/swarmagents/app/preview/share/[token]/[port]/[[...path]]/route.ts
+index 1d943db79..6000bcd1c 100644
+--- a/apps/swarmagents/app/preview/share/[token]/[port]/[[...path]]/route.ts
++++ b/apps/swarmagents/app/preview/share/[token]/[port]/[[...path]]/route.ts
+@@ -6,7 +6,10 @@
+  * with no port-forwarding and no deploy. The token is the only credential
+  * (same model as /share/<token>); the port must match the token and still
+  * be listening in the owner's VM. See lib/preview/serve.ts for the full
+- * rules. WebSocket upgrades are not supported by Next.js route handlers.
++ * rules. WebSocket upgrades are not supported by Next.js route handlers,
++ * so a socket that connects under this mount is accepted by the desktop
++ * proxy instead (lib/desktop-proxy/proxy.ts; nginx routes preview
++ * upgrades there).
+  */
+ 
+ import type { NextRequest } from "next/server";
+diff --git a/apps/swarmagents/deploy/nginx.conf b/apps/swarmagents/deploy/nginx.conf
+index 176660bc0..caeabd8e8 100644
+--- a/apps/swarmagents/deploy/nginx.conf
++++ b/apps/swarmagents/deploy/nginx.conf
+@@ -1,3 +1,14 @@
++# Preview WebSocket upgrades go to the in-process proxy (3778), everything
++# else under /preview/ to Next.js (3777). Next.js route handlers cannot
++# receive upgrades, so a Vite HMR socket under /preview/<port>/... would
++# otherwise never connect; the proxy (lib/desktop-proxy) owns the upgrade
++# and resolves the target through the same choke point as the HTTP routes
++# (see "Desktop stream proxy" / "Preview WebSocket upgrades" in DEPLOY.md).
++map $http_upgrade $preview_backend {
++    default      127.0.0.1:3777;
++    ~*websocket 127.0.0.1:3778;
++}
++
+ server {
+     listen 80;
+     server_name swarmagents.codes;
+@@ -31,6 +42,19 @@ server {
+         proxy_read_timeout 86400s;
+         proxy_send_timeout 86400s;
+     }
++
++    location /preview/ {
++        proxy_pass http://$preview_backend;
++        proxy_http_version 1.1;
++        proxy_set_header Upgrade $http_upgrade;
++        proxy_set_header Connection "upgrade";
++        proxy_set_header Host $host;
++        proxy_set_header X-Forwarded-For $remote_addr;
++        proxy_set_header X-Real-IP $remote_addr;
++        proxy_set_header X-Forwarded-Proto $scheme;
++        proxy_read_timeout 86400s;
++        proxy_send_timeout 86400s;
++    }
+ }
+ 
+ # ---------------------------------------------------------------------------
+@@ -84,4 +108,17 @@ server {
+ #        proxy_read_timeout 86400s;
+ #        proxy_send_timeout 86400s;
+ #    }
++#
++#    location /preview/ {
++#        proxy_pass http://$preview_backend;
++#        proxy_http_version 1.1;
++#        proxy_set_header Upgrade $http_upgrade;
++#        proxy_set_header Connection "upgrade";
++#        proxy_set_header Host $host;
++#        proxy_set_header X-Forwarded-For $remote_addr;
++#        proxy_set_header X-Real-IP $remote_addr;
++#        proxy_set_header X-Forwarded-Proto $scheme;
++#        proxy_read_timeout 86400s;
++#        proxy_send_timeout 86400s;
++#    }
+ #}
+diff --git a/apps/swarmagents/lib/desktop-proxy/proxy.test.ts b/apps/swarmagents/lib/desktop-proxy/proxy.test.ts
+index 6f3a7a310..bf9ac46ce 100644
+--- a/apps/swarmagents/lib/desktop-proxy/proxy.test.ts
++++ b/apps/swarmagents/lib/desktop-proxy/proxy.test.ts
+@@ -29,11 +29,14 @@ import {
+   encodeClientFrame,
+   decodeFrames,
+   OP_BINARY,
++  OP_TEXT,
+   OP_PING,
+   OP_PONG,
+   OP_CLOSE,
+   type WsMessage,
+ } from "./ws";
++import type { PreviewTarget } from "../preview/proxy";
++import type { PreviewShareOwner } from "../preview/tokens";
+ import { vncDesResponse, RFB_VERSION, SECURITY_NONE } from "./rfb";
+ import type { VmDesktopEndpoint } from "../vm/types";
+ import { createProject, createShareLink, configureProjectStoreDir } from "../projects/store";
+@@ -181,9 +184,11 @@ async function completeRfbClientHandshake(client: TestWsClient): Promise<void> {
+ // --- fake upstream VNC server ------------------------------------------------
+ 
+ const allFakeServers: FakeVncServer[] = [];
++const allFakeWsApps: FakeWsApp[] = [];
+ 
+ test.after(() => {
+   for (const s of allFakeServers) s.close();
++  for (const s of allFakeWsApps) s.close();
+ });
+ 
+ class FakeVncServer {
+@@ -331,6 +336,72 @@ class FakeVncServer {
+   }
+ }
+ 
++/** A mock "VM app" with a WebSocket endpoint that echoes frames back. */
++class FakeWsApp {
++  readonly server: http.Server;
++  port = 0;
++  urls: string[] = [];
++  seenUpgrades: Array<{ url: string; cookie: string | undefined; authorization: string | undefined }> = [];
++  private sockets = new Set<net.Socket>();
++
++  constructor() {
++    this.server = http.createServer((_req, res) => {
++      res.writeHead(404);
++      res.end();
++    });
++    this.server.on("upgrade", (req, socket) => this.handleUpgrade(req, socket as net.Socket));
++    allFakeWsApps.push(this);
++  }
++
++  listen(): Promise<void> {
++    return new Promise((resolve) => {
++      this.server.listen(0, "127.0.0.1", () => {
++        this.port = (this.server.address() as net.AddressInfo).port;
++        resolve();
++      });
++    });
++  }
++
++  close(): void {
++    for (const s of this.sockets) s.destroy();
++    this.server.close();
++  }
++
++  private handleUpgrade(req: http.IncomingMessage, socket: net.Socket): void {
++    this.urls.push(`WS ${req.url}`);
++    this.seenUpgrades.push({
++      url: req.url ?? "/",
++      cookie: req.headers.cookie,
++      authorization: req.headers.authorization,
++    });
++    this.sockets.add(socket);
++    socket.on("error", () => {});
++    const key = String(req.headers["sec-websocket-key"] ?? "");
++    const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
++    socket.write(
++      "HTTP/1.1 101 Switching Protocols\r\n" +
++        "Upgrade: websocket\r\n" +
++        "Connection: Upgrade\r\n" +
++        `Sec-WebSocket-Accept: ${accept}\r\n` +
++        "\r\n",
++    );
++    // Echo data frames back as binary; answer pings; close on close.
++    let buf: Buffer = Buffer.alloc(0);
++    socket.on("data", (chunk: Buffer) => {
++      buf = Buffer.concat([buf, chunk]);
++      const { messages, rest } = decodeFrames(buf);
++      buf = rest;
++      for (const m of messages) {
++        if (m.opcode === OP_PING) socket.write(encodeFrame(OP_PONG, m.payload));
++        else if (m.opcode === OP_BINARY || m.opcode === OP_TEXT) {
++          socket.write(encodeFrame(OP_BINARY, m.payload));
++        } else if (m.opcode === OP_CLOSE) socket.end();
++      }
++    });
++    socket.on("end", () => socket.destroy());
++  }
++}
++
+ // --- fake driver + proxy harness ---------------------------------------------
+ 
+ interface HarnessEndpoints {
+@@ -340,17 +411,32 @@ interface HarnessEndpoints {
+ }
+ 
+ const GUEST_TOKEN = "guest-token";
++/** Preview share token the harness resolves to alice's port 3000. */
++const PREVIEW_SHARE_TOKEN = "a".repeat(48);
+ 
+ async function makeProxy(opts: {
+   idleMs?: number;
+   maxViewers?: number;
+   endpoints?: HarnessEndpoints;
+   resolveGuest?: (token: string) => Promise<string | null>;
+-} = {}): Promise<{ proxy: DesktopProxy; port: number; aliceVm: FakeVncServer; bobVm: FakeVncServer }> {
++  resolvePreviewTarget?: (userId: string, port: number) => Promise<PreviewTarget | null>;
++  resolvePreviewShare?: (token: string) => PreviewShareOwner | null;
++} = {}): Promise<{
++  proxy: DesktopProxy;
++  port: number;
++  aliceVm: FakeVncServer;
++  bobVm: FakeVncServer;
++  aliceApp: FakeWsApp;
++  bobApp: FakeWsApp;
++}> {
+   const aliceVm = new FakeVncServer("alice-vnc-password");
+   const bobVm = new FakeVncServer("bob-vnc-password");
+   await aliceVm.listen();
+   await bobVm.listen();
++  const aliceApp = new FakeWsApp();
++  const bobApp = new FakeWsApp();
++  await aliceApp.listen();
++  await bobApp.listen();
+   const endpoints: HarnessEndpoints = opts.endpoints ?? {
+     alice: { host: "127.0.0.1", port: aliceVm.port, password: "alice-vnc-password" },
+     bob: { host: "127.0.0.1", port: bobVm.port, password: "bob-vnc-password" },
+@@ -365,6 +451,21 @@ async function makeProxy(opts: {
+       opts.resolveGuest ??
+       (async (token: string): Promise<string | null> =>
+         token === GUEST_TOKEN ? "alice" : null),
++    // Preview targets: only port 3000 is "listening" in each user's VM;
++    // anything else resolves to null, exactly as the real choke point
++    // refuses an unlisted port.
++    resolvePreviewTarget:
++      opts.resolvePreviewTarget ??
++      (async (userId: string, port: number): Promise<PreviewTarget | null> => {
++        if (port !== 3000) return null;
++        if (userId === "alice") return { host: "127.0.0.1", port: aliceApp.port };
++        if (userId === "bob") return { host: "127.0.0.1", port: bobApp.port };
++        return null;
++      }),
++    resolvePreviewShare:
++      opts.resolvePreviewShare ??
++      ((token: string): PreviewShareOwner | null =>
++        token === PREVIEW_SHARE_TOKEN ? { ownerId: "alice", port: 3000, createdAt: 0 } : null),
+     // Ephemeral port: tests must not collide with a dev proxy or another
+     // test process on the default 3778.
+     port: 0,
+@@ -372,7 +473,7 @@ async function makeProxy(opts: {
+     maxViewersPerUser: opts.maxViewers,
+   });
+   await proxy.listen();
+-  return { proxy, port: proxy.port, aliceVm, bobVm };
++  return { proxy, port: proxy.port, aliceVm, bobVm, aliceApp, bobApp };
+ }
+ 
+ function wsUrl(port: number, mode?: "view" | "control"): string {
+@@ -750,3 +851,131 @@ test("desktop proxy: default resolveGuest honors the share token index", async (
+     fs.rmSync(tmp, { recursive: true, force: true });
+   }
+ });
++
++// --- preview WebSocket wiring ------------------------------------------------
++//
++// These exercise the real wiring path — a WebSocket upgrade arriving at the
++// proxy server under the preview mounts — not handlePreviewUpgrade in
++// isolation (lib/preview/proxy.test.ts covers the handler itself).
++
++test("preview WS: session-gated upgrade round-trips frames through the owner's VM app", async () => {
++  const { proxy, port, aliceApp, bobApp } = await makeProxy();
++  try {
++    const client = await TestWsClient.connect(`ws://127.0.0.1:${port}/preview/3000/`, {
++      cookie: sessionFor("alice"),
++    });
++    client.sendBinary(Buffer.from("hello hmr"));
++    assert.equal((await client.next()).toString("utf8"), "hello hmr");
++    assert.equal(aliceApp.seenUpgrades.length, 1);
++    assert.equal(aliceApp.seenUpgrades[0]?.url, "/");
++    // The session cookie never reaches the previewed app.
++    assert.equal(aliceApp.seenUpgrades[0]?.cookie, undefined);
++    assert.equal(aliceApp.seenUpgrades[0]?.authorization, undefined);
++    assert.equal(bobApp.seenUpgrades.length, 0, "bob's app was never contacted");
++    client.close();
++  } finally {
++    await proxy.close();
++  }
++});
++
++test("preview WS: sub-path and query reach the upstream app", async () => {
++  const { proxy, port, aliceApp } = await makeProxy();
++  try {
++    const client = await TestWsClient.connect(`ws://127.0.0.1:${port}/preview/3000/vite-hmr?x=1`, {
++      cookie: sessionFor("alice"),
++    });
++    client.sendBinary(Buffer.from("ping"));
++    assert.equal((await client.next()).toString("utf8"), "ping");
++    assert.equal(aliceApp.seenUpgrades[0]?.url, "/vite-hmr?x=1");
++    client.close();
++  } finally {
++    await proxy.close();
++  }
++});
++
++test("preview WS: unauthenticated upgrade is refused with 401", async () => {
++  const { proxy, port, aliceApp } = await makeProxy();
++  try {
++    const err = await TestWsClient.connect(`ws://127.0.0.1:${port}/preview/3000/`).catch(
++      (e: Error) => e,
++    );
++    assert.ok(err instanceof Error, "upgrade without cookie is refused");
++    assert.match(err.message, /HTTP 401/);
++    assert.equal(aliceApp.seenUpgrades.length, 0, "upstream never dialed");
++  } finally {
++    await proxy.close();
++  }
++});
++
++test("preview WS: unlisted port is a 404 and the upstream is never dialed", async () => {
++  const { proxy, port, aliceApp } = await makeProxy();
++  try {
++    const err = await TestWsClient.connect(`ws://127.0.0.1:${port}/preview/4000/`, {
++      cookie: sessionFor("alice"),
++    }).catch((e: Error) => e);
++    assert.ok(err instanceof Error, "unlisted port is refused");
++    assert.match(err.message, /HTTP 404/);
++    assert.equal(aliceApp.seenUpgrades.length, 0, "upstream never dialed");
++  } finally {
++    await proxy.close();
++  }
++});
++
++test("preview WS: traversal path never reaches the upstream", async () => {
++  const { proxy, port, aliceApp } = await makeProxy();
++  try {
++    const err = await TestWsClient.connect(`ws://127.0.0.1:${port}/preview/3000/%2e%2e/secret`, {
++      cookie: sessionFor("alice"),
++    }).catch((e: Error) => e);
++    assert.ok(err instanceof Error, "traversal is refused");
++    assert.match(err.message, /HTTP 404/);
++    assert.equal(aliceApp.seenUpgrades.length, 0, "upstream never dialed");
++  } finally {
++    await proxy.close();
++  }
++});
++
++test("preview WS: only the authenticated user's app is ever contacted", async () => {
++  const { proxy, port, aliceApp, bobApp } = await makeProxy();
++  try {
++    const client = await TestWsClient.connect(`ws://127.0.0.1:${port}/preview/3000/`, {
++      cookie: sessionFor("bob"),
++    });
++    client.sendBinary(Buffer.from("bob hmr"));
++    assert.equal((await client.next()).toString("utf8"), "bob hmr");
++    assert.equal(bobApp.seenUpgrades.length, 1);
++    assert.equal(aliceApp.seenUpgrades.length, 0, "alice's app was never contacted");
++    client.close();
++  } finally {
++    await proxy.close();
++  }
++});
++
++test("preview WS: share token upgrade works without a session; wrong-port and bogus tokens are refused", async () => {
++  const { proxy, port, aliceApp } = await makeProxy();
++  try {
++    const client = await TestWsClient.connect(
++      `ws://127.0.0.1:${port}/preview/share/${PREVIEW_SHARE_TOKEN}/3000/`,
++    );
++    client.sendBinary(Buffer.from("shared hmr"));
++    assert.equal((await client.next()).toString("utf8"), "shared hmr");
++    assert.equal(aliceApp.seenUpgrades.length, 1);
++    assert.equal(aliceApp.seenUpgrades[0]?.url, "/");
++    client.close();
++
++    const wrongPort = await TestWsClient.connect(
++      `ws://127.0.0.1:${port}/preview/share/${PREVIEW_SHARE_TOKEN}/4000/`,
++    ).catch((e: Error) => e);
++    assert.ok(wrongPort instanceof Error, "token bound to another port is refused");
++    assert.match(wrongPort.message, /HTTP 404/);
++
++    const bogus = await TestWsClient.connect(
++      `ws://127.0.0.1:${port}/preview/share/${"b".repeat(48)}/3000/`,
++    ).catch((e: Error) => e);
++    assert.ok(bogus instanceof Error, "bogus token is refused");
++    assert.match(bogus.message, /HTTP 404/);
++    assert.equal(aliceApp.seenUpgrades.length, 1, "refused tokens never dialed the upstream");
++  } finally {
++    await proxy.close();
++  }
++});
+diff --git a/apps/swarmagents/lib/desktop-proxy/proxy.ts b/apps/swarmagents/lib/desktop-proxy/proxy.ts
+index 0fb77731b..da3772ea6 100644
+--- a/apps/swarmagents/lib/desktop-proxy/proxy.ts
++++ b/apps/swarmagents/lib/desktop-proxy/proxy.ts
+@@ -7,6 +7,16 @@
+  * (default 127.0.0.1:3778); in production a reverse proxy routes the public
+  * `/desktop/` path to it. See DEPLOY.md for the nginx/compose wiring.
+  *
++ * The same server also owns preview WebSocket upgrades
++ * (`/preview/<port>/...` session-gated, `/preview/share/<token>/<port>/...`
++ * token-gated): the Next.js preview routes can only forward HTTP, so nginx
++ * routes preview requests carrying an `Upgrade: websocket` header here
++ * (see deploy/nginx.conf) and this server resolves the target through the
++ * same choke point as the HTTP routes (`lib/preview/target.ts`) and hands
++ * the tunnel to `handlePreviewUpgrade` (`lib/preview/proxy.ts`). That is
++ * what makes a Vite HMR / live-reload socket inside a previewed app
++ * connect; the app page itself is still served by the Next.js routes.
++ *
+  * Security properties:
+  *   - Every request (HTTP assets and WebSocket upgrades) must carry a valid
+  *     session cookie (lib/auth). Nothing is ever served without it.
+@@ -40,12 +50,21 @@ import {
+ import { recordAudit } from "../audit";
+ import { getVmManager } from "../vm/manager";
+ import type { VmDesktopEndpoint } from "../vm/types";
++import { handlePreviewUpgrade, type PreviewTarget } from "../preview/proxy";
++import { parsePreviewPort, resolvePreviewTarget } from "../preview/target";
++import { resolvePreviewShare, type PreviewShareOwner } from "../preview/tokens";
+ import { resolveShareOwner } from "../projects/store";
+ import { DesktopBridge } from "./bridge";
+ import type { RfbFilterMode } from "./rfb-filter";
+ 
+ export const DESKTOP_WS_PATH = "/desktop/ws";
+ export const DESKTOP_HTTP_PREFIX = "/desktop/";
++/** Upgrade requests under this prefix are preview WebSockets, not desktop. */
++export const PREVIEW_WS_PREFIX = "/preview/";
++/** `/preview/share/<token>/<port>/...` — the token-gated preview mount. */
++const PREVIEW_SHARE_RE = /^\/preview\/share\/([^/]+)\/([^/]+)(\/.*)?$/;
++/** `/preview/<port>/...` — the session-gated preview mount. */
++const PREVIEW_SESSION_RE = /^\/preview\/([^/]+)(\/.*)?$/;
+ 
+ export const DEFAULT_PROXY_PORT = 3778;
+ export const DEFAULT_PROXY_HOST = "127.0.0.1";
+@@ -86,6 +105,19 @@ export interface DesktopProxyOptions {
+    * handshake the proxy performs toward the container.
+    */
+   upstreamViewonlyParam?: string;
++  /**
++   * Resolve a preview dial target for (userId, port). Defaults to the
++   * app's preview choke point (`resolvePreviewTarget` in
++   * lib/preview/target.ts — the port must be in the user's detected
++   * listening set). Tests inject a resolver backed by fake upstreams.
++   */
++  resolvePreviewTarget?: (userId: string, port: number) => Promise<PreviewTarget | null>;
++  /**
++   * Resolve a preview share token to its owner and port. Defaults to the
++   * preview token index (`resolvePreviewShare` in lib/preview/tokens.ts).
++   * Tests inject a resolver backed by fake shares.
++   */
++  resolvePreviewShare?: (token: string) => PreviewShareOwner | null;
+   now?: () => number;
+ }
+ 
+@@ -200,6 +232,11 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
+       const owner = resolveShareOwner(token);
+       return owner ? owner.ownerId : null;
+     });
++  const resolvePreviewTargetFor =
++    opts.resolvePreviewTarget ??
++    ((userId: string, port: number) => resolvePreviewTarget(getVmManager(), userId, port));
++  const resolvePreviewShareFor =
++    opts.resolvePreviewShare ?? ((token: string) => resolvePreviewShare(token));
+ 
+   const sessionsByUser = new Map<string, Set<ProxySession>>();
+   let nextSessionId = 1;
+@@ -344,6 +381,103 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
+     req.pipe(upReq);
+   }
+ 
++  // --- Preview WebSocket upgrades (/preview/<port>/... and /preview/share/<token>/<port>/...) ---
++
++  /**
++   * Decode and validate the path inside the previewed app, mirroring
++   * lib/preview/serve.ts: percent-decoded segments, re-encoded on the way
++   * out; traversal (".", "..", backslash, control chars) is a 404 and the
++   * upstream is never dialed. `rest` is the mount remainder including its
++   * leading "/" (or undefined when the URL ends at the port); the query
++   * string is preserved for the upstream app.
++   */
++  function previewUpstreamPath(rest: string | undefined, search: string): string | null {
++    const segments = (rest ?? "/").split("/").filter((s) => s.length > 0);
++    const decoded: string[] = [];
++    for (const segment of segments) {
++      let part: string;
++      try {
++        part = decodeURIComponent(segment);
++      } catch {
++        return null;
++      }
++      if (part === "." || part === "..") return null;
++      if (part.includes("\\") || /[\u0000-\u001f\u007f]/.test(part)) return null;
++      decoded.push(part);
++    }
++    return `/${decoded.map((s) => encodeURIComponent(s)).join("/")}${search}`;
++  }
++
++  /**
++   * Own the preview half of the `upgrade` event. The shape mirrors the
++   * Next.js HTTP routes in app/preview/ (same mounts, same gates, same
++   * target choke point) — the only difference is that this runs on a raw
++   * server, so the upgrade can actually be accepted:
++   *
++   *   - Session mount: the caller must hold a valid session cookie for
++   *     the VM owner (same gate as the desktop stream); host and origin
++   *     are checked first, exactly as for /desktop/ws.
++   *   - Share mount: the token is the only credential; it must resolve
++   *     and its bound port must equal the port in the path, as in
++   *     serveSharedPreview. No session is required or consulted.
++   *   - Either way the dial target comes only from
++   *     `resolvePreviewTarget` (the port must be in that owner's
++   *     detected listening set right now) — a client-supplied port that
++   *     is not listening is a 404, never a dial, so there is no SSRF
++   *     surface through the path. The session cookie / Authorization
++   *     header are never forwarded upstream (handlePreviewUpgrade
++   *     strips them, as the HTTP forward does).
++   *
++   * The tunnel itself (handshake, piping, teardown) is
++   * `handlePreviewUpgrade` in lib/preview/proxy.ts; this function only
++   * decides who may open it and where it goes.
++   */
++  async function handlePreviewUpgradeRequest(
++    req: IncomingMessage,
++    socket: net.Socket,
++    head: Buffer,
++    url: URL,
++  ): Promise<void> {
++    if (!hostAllowed(requestLike(req))) {
++      return writeUpgradeRefusal(socket, 403, "Forbidden.");
++    }
++    if (!originAllowed(req)) {
++      return writeUpgradeRefusal(socket, 403, "Cross-site request blocked.");
++    }
++
++    let ownerId: string;
++    let port: number;
++    let upstreamPath: string | null;
++
++    const shareMatch = PREVIEW_SHARE_RE.exec(url.pathname);
++    if (shareMatch) {
++      const [, token, portSegment, rest] = shareMatch;
++      const parsed = parsePreviewPort(portSegment);
++      if (parsed === null) return writeUpgradeRefusal(socket, 404, "Not found.");
++      const share = resolvePreviewShareFor(token);
++      if (!share || share.port !== parsed) return writeUpgradeRefusal(socket, 404, "Not found.");
++      ownerId = share.ownerId;
++      port = parsed;
++      upstreamPath = previewUpstreamPath(rest, url.search);
++    } else {
++      const sessionMatch = PREVIEW_SESSION_RE.exec(url.pathname);
++      if (!sessionMatch) return writeUpgradeRefusal(socket, 404, "Not found.");
++      const user = requestUser(requestLike(req));
++      if (!user) return writeUpgradeRefusal(socket, 401, "Sign in required.");
++      const [, portSegment, rest] = sessionMatch;
++      const parsed = parsePreviewPort(portSegment);
++      if (parsed === null) return writeUpgradeRefusal(socket, 404, "Not found.");
++      ownerId = user.id;
++      port = parsed;
++      upstreamPath = previewUpstreamPath(rest, url.search);
++    }
++    if (upstreamPath === null) return writeUpgradeRefusal(socket, 404, "Not found.");
++
++    const target = await resolvePreviewTargetFor(ownerId, port);
++    if (!target) return writeUpgradeRefusal(socket, 404, "Preview unavailable.");
++    await handlePreviewUpgrade(req, socket, head, target, upstreamPath);
++  }
++
+   // --- WebSocket proxying (/desktop/ws) --------------------------------------
+ 
+   function writeUpgradeRefusal(socket: net.Socket, status: number, message: string): void {
+@@ -362,6 +496,9 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
+ 
+   async function handleUpgrade(req: IncomingMessage, socket: net.Socket, head: Buffer): Promise<void> {
+     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
++    if (url.pathname.startsWith(PREVIEW_WS_PREFIX)) {
++      return handlePreviewUpgradeRequest(req, socket, head, url);
++    }
+     if (url.pathname !== DESKTOP_WS_PATH) {
+       return writeUpgradeRefusal(socket, 404, "Not found.");
+     }
+diff --git a/apps/swarmagents/lib/library/test-drive-sweeper.test.ts b/apps/swarmagents/lib/library/test-drive-sweeper.test.ts
+new file mode 100644
+index 000000000..de529f67a
+--- /dev/null
++++ b/apps/swarmagents/lib/library/test-drive-sweeper.test.ts
+@@ -0,0 +1,301 @@
++/**
++ * F4 — test-drive background sweeper: an abandoned drive is rolled back
++ * by the timer alone, with no manual trigger (no route read, no POST
++ * sweep, no next drive start).
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { configureLibraryStoreDir } from "./user-store";
++import { createTestDrive, getTestDrive, updateTestDrive } from "./test-drive";
++import type { TestDriveRecord } from "./test-drive";
++import {
++  DEFAULT_TEST_DRIVE_SWEEP_INTERVAL_MS,
++  TestDriveSweeper,
++  resolveTestDriveSweepIntervalMs,
++  startTestDriveSweeper,
++  stopTestDriveSweeper,
++} from "./test-drive-sweeper";
++
++let dir: string;
++
++test.beforeEach(() => {
++  dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-test-drive-sweeper-"));
++  configureLibraryStoreDir(dir);
++});
++
++test.afterEach(() => {
++  stopTestDriveSweeper();
++  configureLibraryStoreDir(undefined);
++  fs.rmSync(dir, { recursive: true, force: true });
++});
++
++const DAY_MS = 24 * 60 * 60 * 1000;
++const NOW = Date.now();
++
++function seedDrive(
++  runId: string,
++  input: {
++    userId?: string;
++    status: "running" | "awaiting-decision" | "kept" | "rolled-back";
++    ageDays: number;
++  },
++): string {
++  const drive = createTestDrive({
++    userId: input.userId ?? "local_alice@example.com",
++    publicId: "pub_abc",
++    publicName: "Try me",
++    version: 1,
++    snapshotLabel: `test-drive-${runId}`,
++    runId,
++  });
++  updateTestDrive(drive.id, {
++    status: input.status,
++    startedAt: NOW - input.ageDays * DAY_MS,
++    finishedAt: input.status === "running" ? undefined : NOW - input.ageDays * DAY_MS,
++  });
++  return drive.id;
++}
++
++// Fake interval scheduler: deterministic time, no wall-clock waiting
++// (same shape as the one in lib/vm/idle.test.ts).
++type TimerFn = () => void | Promise<unknown>;
++
++class FakeTimers {
++  private handlers = new Map<number, { fn: TimerFn; ms: number; next: number }>();
++  private nextId = 1;
++  private current = 0;
++
++  readonly setInterval = (fn: TimerFn, ms: number): number => {
++    const id = this.nextId++;
++    this.handlers.set(id, { fn, ms, next: this.current + ms });
++    return id;
++  };
++
++  readonly clearInterval = (handle: unknown): void => {
++    this.handlers.delete(handle as number);
++  };
++
++  get pending(): number {
++    return this.handlers.size;
++  }
++
++  /** Advance the fake timers, firing every due interval in order. */
++  async advance(ms: number): Promise<void> {
++    const target = this.current + ms;
++    for (;;) {
++      let dueId: number | null = null;
++      let dueAt = Number.POSITIVE_INFINITY;
++      for (const [id, h] of this.handlers) {
++        if (h.next <= target && h.next < dueAt) {
++          dueId = id;
++          dueAt = h.next;
++        }
++      }
++      if (dueId === null) break;
++      const handler = this.handlers.get(dueId)!;
++      handler.next = dueAt + handler.ms;
++      this.current = dueAt;
++      const result = handler.fn();
++      if (result && typeof (result as Promise<unknown>).then === "function") {
++        await result;
++      }
++    }
++    this.current = target;
++  }
++}
++
++function makeSweeper(
++  timers: FakeTimers,
++  opts: {
++    restore: (drive: TestDriveRecord) => Promise<void>;
++    isUserBusy?: (userId: string) => boolean;
++    intervalMs?: number;
++    maxAgeMs?: number;
++  },
++): TestDriveSweeper {
++  return new TestDriveSweeper({
++    restore: opts.restore,
++    intervalMs: opts.intervalMs ?? 1000,
++    now: NOW,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++    ...(opts.isUserBusy ? { isUserBusy: opts.isUserBusy } : {}),
++    ...(opts.maxAgeMs !== undefined ? { maxAgeMs: opts.maxAgeMs } : {}),
++  });
++}
++
++test("resolveTestDriveSweepIntervalMs defaults to hourly and honors the env var", () => {
++  assert.equal(resolveTestDriveSweepIntervalMs(), DEFAULT_TEST_DRIVE_SWEEP_INTERVAL_MS);
++  assert.equal(DEFAULT_TEST_DRIVE_SWEEP_INTERVAL_MS, 60 * 60 * 1000);
++  const prev = process.env.SWARM_TEST_DRIVE_SWEEP_INTERVAL_SEC;
++  try {
++    process.env.SWARM_TEST_DRIVE_SWEEP_INTERVAL_SEC = "120";
++    assert.equal(resolveTestDriveSweepIntervalMs(), 120_000);
++    process.env.SWARM_TEST_DRIVE_SWEEP_INTERVAL_SEC = "bogus";
++    assert.equal(resolveTestDriveSweepIntervalMs(), DEFAULT_TEST_DRIVE_SWEEP_INTERVAL_MS);
++  } finally {
++    if (prev === undefined) delete process.env.SWARM_TEST_DRIVE_SWEEP_INTERVAL_SEC;
++    else process.env.SWARM_TEST_DRIVE_SWEEP_INTERVAL_SEC = prev;
++  }
++});
++
++test("the timer alone sweeps a stale awaiting-decision drive — no manual trigger", async () => {
++  const stale = seedDrive("run_stale", { status: "awaiting-decision", ageDays: 8 });
++  const fresh = seedDrive("run_fresh", { status: "awaiting-decision", ageDays: 1 });
++  const restored: string[] = [];
++  const timers = new FakeTimers();
++  const sweeper = makeSweeper(timers, {
++    restore: async (drive) => {
++      restored.push(drive.id);
++    },
++  });
++  sweeper.start();
++  assert.equal(sweeper.running, true);
++
++  // Nothing has fired yet: no restore, no status change.
++  assert.deepEqual(restored, []);
++  assert.equal(getTestDrive(stale)?.status, "awaiting-decision");
++
++  await timers.advance(1000);
++
++  assert.deepEqual(restored, [stale]);
++  assert.equal(getTestDrive(stale)?.status, "rolled-back");
++  assert.equal(getTestDrive(stale)?.rollbackReason, "abandoned");
++  // The fresh drive (1 day old) is left alone.
++  assert.equal(getTestDrive(fresh)?.status, "awaiting-decision");
++  sweeper.stop();
++});
++
++test("start() twice schedules only one timer; stop() cancels it", async () => {
++  const stale = seedDrive("run_stale", { status: "awaiting-decision", ageDays: 8 });
++  const restored: string[] = [];
++  const timers = new FakeTimers();
++  const sweeper = makeSweeper(timers, {
++    restore: async (drive) => {
++      restored.push(drive.id);
++    },
++  });
++  sweeper.start();
++  sweeper.start();
++  assert.equal(timers.pending, 1);
++
++  sweeper.stop();
++  assert.equal(sweeper.running, false);
++  assert.equal(timers.pending, 0);
++  await timers.advance(5000);
++  assert.deepEqual(restored, []);
++  assert.equal(getTestDrive(stale)?.status, "awaiting-decision");
++});
++
++test("startTestDriveSweeper returns one process-wide sweeper", () => {
++  const timers = new FakeTimers();
++  const first = startTestDriveSweeper(async () => {}, {
++    intervalMs: 1000,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++  });
++  const second = startTestDriveSweeper(async () => {}, {
++    intervalMs: 1000,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++  });
++  assert.equal(second, first);
++  assert.equal(timers.pending, 1);
++  stopTestDriveSweeper();
++  assert.equal(timers.pending, 0);
++  assert.equal(first.running, false);
++});
++
++test("a busy user's drives wait for the next tick", async () => {
++  const stale = seedDrive("run_stale", { status: "awaiting-decision", ageDays: 8 });
++  const restored: string[] = [];
++  const timers = new FakeTimers();
++  let busy = true;
++  const sweeper = makeSweeper(timers, {
++    restore: async (drive) => {
++      restored.push(drive.id);
++    },
++    isUserBusy: () => busy,
++  });
++  sweeper.start();
++
++  // Tick while the user has a run in flight: nothing is restored — a
++  // restore mid-run would clobber the run's VM state.
++  await timers.advance(1000);
++  assert.deepEqual(restored, []);
++  assert.equal(getTestDrive(stale)?.status, "awaiting-decision");
++
++  busy = false;
++  await timers.advance(1000);
++  assert.deepEqual(restored, [stale]);
++  assert.equal(getTestDrive(stale)?.status, "rolled-back");
++  sweeper.stop();
++});
++
++test("the timer sweeps every account, and a restore failure blocks nothing", async () => {
++  const aliceStale = seedDrive("run_alice", {
++    userId: "local_alice@example.com",
++    status: "awaiting-decision",
++    ageDays: 8,
++  });
++  const bobStale = seedDrive("run_bob", {
++    userId: "local_bob@example.com",
++    status: "awaiting-decision",
++    ageDays: 9,
++  });
++  const restored: string[] = [];
++  const timers = new FakeTimers();
++  const sweeper = makeSweeper(timers, {
++    restore: async (drive) => {
++      if (drive.id === aliceStale) throw new Error("snapshot gone");
++      restored.push(drive.id);
++    },
++  });
++  sweeper.start();
++  await timers.advance(1000);
++
++  // Bob's drive was swept even though Alice's restore failed.
++  assert.deepEqual(restored, [bobStale]);
++  assert.equal(getTestDrive(bobStale)?.status, "rolled-back");
++  // Alice's drive stays awaiting-decision with the failure recorded.
++  assert.equal(getTestDrive(aliceStale)?.status, "awaiting-decision");
++  assert.match(getTestDrive(aliceStale)?.lastError ?? "", /snapshot gone/);
++  sweeper.stop();
++});
++
++test("overlapping sweeps collapse into one follow-up pass", async () => {
++  const stale = seedDrive("run_stale", { status: "awaiting-decision", ageDays: 8 });
++  let release!: () => void;
++  const gate = new Promise<void>((resolve) => {
++    release = resolve;
++  });
++  let restoreCalls = 0;
++  const sweeper = new TestDriveSweeper({
++    restore: async () => {
++      restoreCalls += 1;
++      await gate;
++    },
++    intervalMs: 1000,
++    now: NOW,
++  });
++
++  const first = sweeper.sweep();
++  const second = sweeper.sweep();
++  // The second call collapses: it returns immediately with no results
++  // and queues exactly one follow-up pass.
++  assert.deepEqual(await second, []);
++  release();
++  const results = await first;
++  // Pass 1 swept the drive; the queued follow-up pass found nothing left
++  // (sweep() returns the last pass's results), and the restore ran once.
++  assert.equal(restoreCalls, 1);
++  assert.deepEqual(
++    results.map((r) => r.swept),
++    [[]],
++  );
++  assert.equal(getTestDrive(stale)?.status, "rolled-back");
++});
+diff --git a/apps/swarmagents/lib/library/test-drive-sweeper.ts b/apps/swarmagents/lib/library/test-drive-sweeper.ts
+new file mode 100644
+index 000000000..d35a9b642
+--- /dev/null
++++ b/apps/swarmagents/lib/library/test-drive-sweeper.ts
+@@ -0,0 +1,221 @@
++// Test-drive sweeper: periodically rolls back "awaiting-decision" drives
++// whose owners never came back to choose keep or roll back.
++//
++// The on-demand sweep in the test-drive route (GET reads + POST sweep +
++// next drive start) only runs while the user is looking at the library.
++// A drive abandoned by a user who never returns would pin the VM's
++// post-drive state forever, so this sweeper runs on a background timer and
++// sweeps every account's stale drives without a manual trigger.
++//
++// It mirrors lib/vm/idle-sweeper.ts: the sweeper owns the timer only —
++// staleness and roll-back live in sweepAbandonedDrives
++// (lib/library/test-drive.ts) and the caller owns the VM restore. The
++// timer functions are injectable so tests can drive the sweeper with a
++// fake clock instead of waiting for wall-clock time.
++//
++// Wiring: getRuntimeManager() (lib/runtime/manager.ts) starts one next to
++// the VM idle sweeper, so the timer lives as long as the server process
++// and is started exactly once per process. The restore goes through the
++// runtime's VmManager and users with a running or queued run are skipped:
++// restoring a snapshot mid-run would clobber the run's VM state, so a
++// busy user's drives wait for the next tick.
++
++import {
++  DEFAULT_TEST_DRIVE_ABANDONED_MAX_AGE_MS,
++  readTestDrives,
++  sweepAbandonedDrives,
++  type SweepAbandonedDrivesResult,
++  type TestDriveRecord,
++} from "./test-drive";
++import type { LibraryStoreOptions } from "./user-store";
++import { parseSweepIntervalSeconds } from "../vm/idle";
++
++/** Handle returned by the injected interval scheduler. */
++export type TestDriveSweepTimerHandle = unknown;
++
++/** Injectable setInterval (tests pass a fake). */
++export type TestDriveSetIntervalFn = (fn: () => void, ms: number) => TestDriveSweepTimerHandle;
++
++/** Injectable clearInterval (tests pass a fake). */
++export type TestDriveClearIntervalFn = (handle: TestDriveSweepTimerHandle) => void;
++
++/** Env: how often the test-drive sweeper runs, in seconds. */
++export const TEST_DRIVE_SWEEP_INTERVAL_ENV = "SWARM_TEST_DRIVE_SWEEP_INTERVAL_SEC";
++
++/** Default cadence of the test-drive sweeper: once an hour. */
++export const DEFAULT_TEST_DRIVE_SWEEP_INTERVAL_SEC = 60 * 60;
++
++/** Default cadence of the test-drive sweeper, in ms. */
++export const DEFAULT_TEST_DRIVE_SWEEP_INTERVAL_MS =
++  DEFAULT_TEST_DRIVE_SWEEP_INTERVAL_SEC * 1000;
++
++/**
++ * Resolve the sweep cadence: explicit options over the
++ * SWARM_TEST_DRIVE_SWEEP_INTERVAL_SEC env var over the hourly default.
++ */
++export function resolveTestDriveSweepIntervalMs(opts?: { intervalMs?: number }): number {
++  if (opts?.intervalMs !== undefined) return opts.intervalMs;
++  return parseSweepIntervalSeconds(
++    process.env[TEST_DRIVE_SWEEP_INTERVAL_ENV],
++    DEFAULT_TEST_DRIVE_SWEEP_INTERVAL_SEC,
++  ) * 1000;
++}
++
++export interface TestDriveSweeperOptions extends LibraryStoreOptions {
++  /** Performs the VM roll-back for one drive (the caller owns the manager). */
++  restore: (drive: TestDriveRecord) => Promise<void>;
++  /** Sweep cadence in ms (defaults to the env var / hourly default). */
++  intervalMs?: number;
++  /** Staleness threshold in ms (default DEFAULT_TEST_DRIVE_ABANDONED_MAX_AGE_MS). */
++  maxAgeMs?: number;
++  /** Clock override for tests. */
++  now?: number;
++  /** Injectable interval scheduler. */
++  setIntervalFn?: TestDriveSetIntervalFn;
++  /** Injectable interval clearer. */
++  clearIntervalFn?: TestDriveClearIntervalFn;
++  /**
++   * True while a user has a run in flight. A busy user's drives are left
++   * for the next tick — restoring a snapshot mid-run would clobber it.
++   */
++  isUserBusy?: (userId: string) => boolean;
++  /** Called with the per-user sweep results of each pass. */
++  onSwept?: (results: Array<{ userId: string } & SweepAbandonedDrivesResult>) => void;
++  /** Called when a sweep throws. */
++  onError?: (err: unknown) => void;
++}
++
++const defaultSetInterval: TestDriveSetIntervalFn = (fn, ms) => setInterval(fn, ms);
++const defaultClearInterval: TestDriveClearIntervalFn = (handle) =>
++  clearInterval(handle as NodeJS.Timeout);
++
++export class TestDriveSweeper {
++  readonly intervalMs: number;
++  private readonly restore: (drive: TestDriveRecord) => Promise<void>;
++  private readonly maxAgeMs: number;
++  private readonly now: () => number;
++  private readonly setIntervalFn: TestDriveSetIntervalFn;
++  private readonly clearIntervalFn: TestDriveClearIntervalFn;
++  private readonly isUserBusy?: (userId: string) => boolean;
++  private readonly onSwept?: TestDriveSweeperOptions["onSwept"];
++  private readonly onError?: (err: unknown) => void;
++  private readonly storeOptions: LibraryStoreOptions;
++  private timer: TestDriveSweepTimerHandle | null = null;
++  private sweeping = false;
++  private queued = false;
++
++  constructor(opts: TestDriveSweeperOptions) {
++    this.restore = opts.restore;
++    this.intervalMs = resolveTestDriveSweepIntervalMs(opts);
++    this.maxAgeMs = opts.maxAgeMs ?? DEFAULT_TEST_DRIVE_ABANDONED_MAX_AGE_MS;
++    this.now = opts.now !== undefined ? () => opts.now as number : Date.now;
++    this.setIntervalFn = opts.setIntervalFn ?? defaultSetInterval;
++    this.clearIntervalFn = opts.clearIntervalFn ?? defaultClearInterval;
++    this.isUserBusy = opts.isUserBusy;
++    this.onSwept = opts.onSwept;
++    this.onError = opts.onError;
++    // LibraryStoreOptions is the data-dir override (dataDir); keep only
++    // that — the rest of the options are sweeper config, not store config.
++    this.storeOptions = opts.dataDir !== undefined ? { dataDir: opts.dataDir } : {};
++  }
++
++  get running(): boolean {
++    return this.timer !== null;
++  }
++
++  /** Start the sweep timer. Calling it twice is a no-op. */
++  start(): void {
++    if (this.timer !== null) return;
++    if (this.intervalMs <= 0) return; // sweeper disabled
++    this.timer = this.setIntervalFn(() => {
++      const running = this.sweep();
++      // sweep() handles its own errors; this only guards the timer callback.
++      running.catch(() => {});
++      return running;
++    }, this.intervalMs);
++    // Never keep the process alive just for the sweeper.
++    const handle = this.timer as { unref?: () => void } | null;
++    handle?.unref?.();
++  }
++
++  /** Stop the sweep timer. Calling it twice is a no-op. */
++  stop(): void {
++    if (this.timer === null) return;
++    this.clearIntervalFn(this.timer);
++    this.timer = null;
++  }
++
++  /**
++   * Run one sweep now. Returns the per-user results. Overlapping sweeps
++   * are collapsed into a single follow-up sweep, so a slow sweep never
++   * piles up timers (and never misses an abandonment window).
++   */
++  async sweep(): Promise<Array<{ userId: string } & SweepAbandonedDrivesResult>> {
++    if (this.sweeping) {
++      this.queued = true;
++      return [];
++    }
++    this.sweeping = true;
++    try {
++      let results: Array<{ userId: string } & SweepAbandonedDrivesResult> = [];
++      do {
++        this.queued = false;
++        results = await this.runSweep();
++      } while (this.queued);
++      return results;
++    } finally {
++      this.sweeping = false;
++    }
++  }
++
++  /** One sweep pass over every account with test-drive records. */
++  private async runSweep(): Promise<Array<{ userId: string } & SweepAbandonedDrivesResult>> {
++    try {
++      const now = this.now();
++      const userIds = [...new Set(readTestDrives(this.storeOptions).map((d) => d.userId))];
++      const results: Array<{ userId: string } & SweepAbandonedDrivesResult> = [];
++      for (const userId of userIds) {
++        if (this.isUserBusy?.(userId)) continue;
++        const result = await sweepAbandonedDrives(userId, this.restore, {
++          ...this.storeOptions,
++          maxAgeMs: this.maxAgeMs,
++          now,
++        });
++        results.push({ userId, ...result });
++      }
++      if (results.some((r) => r.swept.length > 0 || r.failed.length > 0)) {
++        this.onSwept?.(results);
++      }
++      return results;
++    } catch (err) {
++      this.onError?.(err);
++      console.error("[test-drive] background sweep failed:", err);
++      return [];
++    }
++  }
++}
++
++/** One sweeper per process, so repeated wiring does not stack timers. */
++let singleton: TestDriveSweeper | null = null;
++
++/** Start (or return) the process-wide test-drive sweeper. */
++export function startTestDriveSweeper(
++  restore: (drive: TestDriveRecord) => Promise<void>,
++  opts?: Omit<TestDriveSweeperOptions, "restore">,
++): TestDriveSweeper {
++  if (singleton) {
++    singleton.start();
++    return singleton;
++  }
++  const sweeper = new TestDriveSweeper({ ...opts, restore });
++  singleton = sweeper;
++  sweeper.start();
++  return sweeper;
++}
++
++/** Stop the process-wide test-drive sweeper (if any). */
++export function stopTestDriveSweeper(): void {
++  if (!singleton) return;
++  singleton.stop();
++  singleton = null;
++}
+diff --git a/apps/swarmagents/lib/preview/proxy.ts b/apps/swarmagents/lib/preview/proxy.ts
+index 700349f21..d9fdbbbae 100644
+--- a/apps/swarmagents/lib/preview/proxy.ts
++++ b/apps/swarmagents/lib/preview/proxy.ts
+@@ -30,14 +30,18 @@
+  * Known limits (by design — Next.js route handlers cannot upgrade
+  * WebSockets, which is exactly why the desktop proxy is a separate Node
+  * server): the route handlers in app/preview/ cannot receive an upgrade,
+- * so Vite HMR / live-reload sockets will not connect through them; the app
++ * so Vite HMR / live-reload sockets do not connect through them; the app
+  * itself still loads and works. `handlePreviewUpgrade` in this module is
+  * the missing half for a raw Node server that owns the `upgrade` event:
+  * it performs the upstream handshake and pipes the two sockets, with the
+  * same target validation and credential stripping as the HTTP forward.
+- * Until a raw server (custom Next server or the desktop proxy) wires it
+- * to the preview mount, upgrades through the Next.js routes stay
+- * unavailable — the handler is tested and ready, the wiring is not done.
++ * It is wired into the desktop proxy (lib/desktop-proxy/proxy.ts), which
++ * accepts upgrades under the same preview mounts
++ * (`/preview/<port>/...`, `/preview/share/<token>/<port>/...`) — nginx
++ * routes preview requests carrying an `Upgrade: websocket` header there
++ * (see deploy/nginx.conf), so a socket that connects under the preview
++ * mount upgrades through the proxy while plain HTTP keeps going to the
++ * Next.js routes.
+  * Apps that emit absolute asset URLs (e.g. Vite with the default base)
+  * will 404 their assets under the sub-path mount; apps with relative URLs
+  * or `base: './'` work as-is. The response is streamed; there is no HTML
+diff --git a/apps/swarmagents/lib/runtime/manager.ts b/apps/swarmagents/lib/runtime/manager.ts
+index 873767a43..7241bf295 100644
+--- a/apps/swarmagents/lib/runtime/manager.ts
++++ b/apps/swarmagents/lib/runtime/manager.ts
+@@ -92,6 +92,7 @@ import {
+   type PersistedRuntimeState,
+   type PersistedUserState,
+ } from "./durable-queue";
++import { startTestDriveSweeper } from "../library/test-drive-sweeper";
+ import type { RunCompute } from "../computers/compute";
+ import { readReportMeta } from "./run-report";
+ import type { ReportCardMeta, RunVerificationMeta } from "./run-report-types";
+@@ -3141,6 +3142,21 @@ export function getRuntimeManager(): RuntimeManager {
+       void import("../gardener/tick").then((mod) => mod.runAutopilotForUsers(userIds, manager.vmManager));
+     },
+   });
++  // Abandoned test-drives are rolled back on a background timer too
++  // (hourly by default, SWARM_TEST_DRIVE_SWEEP_INTERVAL_SEC to tune):
++  // the route's on-demand sweep only runs while the user is looking at
++  // the library, so a drive abandoned by a user who never returns would
++  // otherwise pin the VM's post-drive state forever. Users with a run
++  // in flight are skipped — restoring a snapshot mid-run would clobber it.
++  startTestDriveSweeper(
++    (drive) => manager.vmManager.restore(drive.userId, drive.snapshotLabel),
++    {
++      isUserBusy: (userId) =>
++        manager
++          .list(userId)
++          .some((run) => run.status === "running" || run.status === "queued"),
++    },
++  );
+   return manager;
+ }
+ 
+diff --git a/apps/swarmagents/lib/team/harness.checkpoints.test.ts b/apps/swarmagents/lib/team/harness.checkpoints.test.ts
+new file mode 100644
+index 000000000..ee1b7287e
+--- /dev/null
++++ b/apps/swarmagents/lib/team/harness.checkpoints.test.ts
+@@ -0,0 +1,252 @@
++// Team Mode — lane-level checkpoint coverage (F1 time travel).
++//
++// The auto-checkpoint taker is wired into VmTeamHarness.runLane (see
++// lib/team/harness.ts): created once per lane invocation, handed to
++// evaluateToolApproval through the lane's synchronous approval handler.
++// The taker itself is unit tested in lib/runtime/checkpoints.test.ts, but
++// nothing exercised the real lane path end to end — team tests use
++// FakeHarness, not VmTeamHarness.runLane. These tests drive the real
++// VmTeamHarness over the fake VM and simulate the in-VM PreToolUse hook
++// POSTing a tool call, the way vm-image/hooks/pre-tool-use.mjs does in
++// production.
++//
++// The fake VM cannot run the hook script, so the tests invoke the same
++// lookup the hook endpoint uses (RuntimeManager.requestToolApproval ->
++// requestRegisteredApproval) while the lane is live. The hook calls are
++// fired from the lane's first event: that proves runLane has registered
++// its handler for the running lane, and the fake transcript replays in
++// milliseconds, so there is no later moment to fire them from.
++
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { after, before, test } from "node:test";
++
++import { ApprovalStore, getApprovalStore, setApprovalStoreForTesting } from "../harness/approvals";
++import type { ToolApprovalDecision } from "../harness/tool-approval";
++import type { TelemetryEvent as HarnessEvent } from "../harness/types";
++import { parseCheckpointVmLabel } from "../runtime/checkpoints";
++import { requestRegisteredApproval } from "../runtime/tool-approval-bridge";
++import { FAKE_CLAUDE_APPROVAL_TRIGGER } from "../vm/fake-claude";
++import { FakeVmDriver } from "../vm/fake-driver";
++import { VmManager } from "../vm/manager";
++import { VmTeamHarness, workerRole } from "./harness";
++import { LaneSpendLedger, setLaneSpendLedgerForTesting } from "./lane-policy";
++
++const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
++
++async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
++  const deadline = Date.now() + timeoutMs;
++  while (!predicate()) {
++    if (Date.now() > deadline) throw new Error("timed out waiting for the condition");
++    await delay(5);
++  }
++}
++
++/** Fail fast instead of hanging the suite when a promise never settles. */
++async function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
++  let timer: NodeJS.Timeout | undefined;
++  try {
++    return await Promise.race([
++      promise,
++      new Promise<T>((_resolve, reject) => {
++        timer = setTimeout(() => reject(new Error(`timed out waiting for ${what}`)), ms);
++      }),
++    ]);
++  } finally {
++    if (timer !== undefined) clearTimeout(timer);
++  }
++}
++
++const RUN_A = "run_11111111-2222-3333-4444-555555555555";
++const RUN_B = "run_22222222-3333-4444-5555-666666666666";
++const USER_ID = "lane-checkpoint-user";
++
++/** A simulated hook POST: one ask-classified tool call the lane is about to run. */
++interface HookCall {
++  toolName: string;
++  input: unknown;
++}
++
++const RISKY_BASH: HookCall = { toolName: "Bash", input: { command: FAKE_CLAUDE_APPROVAL_TRIGGER } };
++// Routine ask-classified call (package-manager mutation): a second lane step.
++const INSTALL_FLASK: HookCall = { toolName: "Bash", input: { command: "pip install flask" } };
++
++let dataDir = "";
++let previousApprovalBaseUrl: string | undefined;
++let previousSessionSecret: string | undefined;
++
++before(() => {
++  // The provider store keeps the user's settings and providers here.
++  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-team-lane-checkpoints-"));
++  process.env.SWARM_HOME = dataDir;
++  setLaneSpendLedgerForTesting(new LaneSpendLedger());
++  // The lane only registers its synchronous approval handler (and therefore
++  // its checkpoint taker) when the VM can reach an approval endpoint and a
++  // per-run token can be signed. Neither URL is ever fetched here — the fake
++  // VM has no hook script — but runLane needs both configured to take the
++  // hook path at all.
++  previousApprovalBaseUrl = process.env.SWARM_VM_APPROVAL_BASE_URL;
++  previousSessionSecret = process.env.SWARM_SESSION_SECRET;
++  process.env.SWARM_VM_APPROVAL_BASE_URL = "http://127.0.0.1:1";
++  process.env.SWARM_SESSION_SECRET = "test-secret-for-checkpoint-tests";
++});
++
++after(() => {
++  setApprovalStoreForTesting(null);
++  setLaneSpendLedgerForTesting(null);
++  if (previousApprovalBaseUrl === undefined) delete process.env.SWARM_VM_APPROVAL_BASE_URL;
++  else process.env.SWARM_VM_APPROVAL_BASE_URL = previousApprovalBaseUrl;
++  if (previousSessionSecret === undefined) delete process.env.SWARM_SESSION_SECRET;
++  else process.env.SWARM_SESSION_SECRET = previousSessionSecret;
++  if (dataDir) fs.rmSync(dataDir, { recursive: true, force: true });
++});
++
++interface LaneCheckpointRun {
++  result: { ok: boolean; error?: string };
++  events: HarnessEvent[];
++  decisions: ToolApprovalDecision[];
++  snapshotLabels: string[];
++}
++
++/**
++ * Run one real lane over the fake VM, firing the given simulated hook calls
++ * the moment the lane starts streaming, and resolving every approval card
++ * they open with `verdict`. Returns once the lane and every hook call have
++ * settled, so checkpoint events and snapshots are final when it returns.
++ */
++async function runLaneWithHookCalls(
++  runId: string,
++  hookCalls: HookCall[],
++  verdict: "approved" | "denied",
++): Promise<LaneCheckpointRun> {
++  setApprovalStoreForTesting(new ApprovalStore({ ttlMs: 60_000 }));
++  const vm = new VmManager({ customDriver: new FakeVmDriver() });
++  const harness = new VmTeamHarness({ vm, routerForUser: () => null });
++  const events: HarnessEvent[] = [];
++  const decisions: ToolApprovalDecision[] = [];
++  let hookFired = false;
++  let hookMissed = false;
++
++  const lanePromise = harness.lane({
++    runId,
++    userId: USER_ID,
++    agentId: "a1",
++    role: workerRole(0),
++    // The prompt makes the fake claude replay the risky-call transcript, so
++    // the lane really is the one whose tool call the hook is gating.
++    prompt: `Clean up the sandbox root by running ${FAKE_CLAUDE_APPROVAL_TRIGGER} on it.`,
++    cwd: `/workspace/team/${runId}/a1`,
++    onEvent: (event) => {
++      events.push(event);
++      if (!hookFired) {
++        hookFired = true;
++        for (const call of hookCalls) {
++          const decision = requestRegisteredApproval(USER_ID, runId, call.toolName, call.input);
++          if (!decision) {
++            // The lane's handler was not registered: the hook has nothing to
++            // call, so the lane path under test did not take the hook branch.
++            hookMissed = true;
++            continue;
++          }
++          void decision.then((resolved) => decisions.push(resolved));
++        }
++      }
++      if (event.type === "approval.required") {
++        getApprovalStore().resolve(event.approval.id, verdict);
++      }
++    },
++  });
++
++  // The hook calls settle on their own: the lane never awaits them, so
++  // waiting for the lane alone would race the checkpoint telemetry.
++  await waitFor(() => hookMissed || decisions.length === hookCalls.length);
++  assert.equal(hookMissed, false, "the lane must register its synchronous approval handler");
++  const result = await withTimeout(lanePromise, 10_000, "the lane to finish");
++  const snapshotLabels = (await vm.listSnapshots(USER_ID)).map((snapshot) => snapshot.label);
++  return { result, events, decisions, snapshotLabels };
++}
++
++function checkpointEvents(events: HarnessEvent[]) {
++  return events.filter((event) => event.type === "checkpoint.created");
++}
++
++test("an approved ask in a lane creates a checkpoint before the tool runs", async () => {
++  const { result, events, decisions, snapshotLabels } = await runLaneWithHookCalls(RUN_A, [RISKY_BASH], "approved");
++
++  assert.equal(result.ok, true, "an approved lane finishes normally");
++  assert.equal(decisions.length, 1);
++  assert.equal(decisions[0]?.decision, "allow");
++
++  // The approval card is for the same ask-classified call the hook gated.
++  const request = events.find((event) => event.type === "approval.required");
++  assert.ok(request && request.type === "approval.required", "the lane must ask for approval");
++  assert.equal(request.approval.tool, "Bash");
++  assert.match(request.approval.action, /rm -rf \//);
++
++  const checkpoints = checkpointEvents(events);
++  assert.equal(checkpoints.length, 1, "exactly one checkpoint for one approved ask");
++  const checkpoint = checkpoints[0];
++  assert.ok(checkpoint && checkpoint.type === "checkpoint.created");
++  assert.equal(checkpoint.label, "auto-pre-step-1");
++  assert.equal(checkpoint.vmLabel, `${RUN_A}-auto-pre-step-1`);
++  assert.equal(checkpoint.stepSeq, 1);
++  assert.equal(checkpoint.tool, "Bash");
++  assert.deepEqual(parseCheckpointVmLabel(checkpoint.vmLabel), { runId: RUN_A, stepSeq: 1 });
++
++  // The snapshot itself landed in the VM, under the checkpoint's VM label.
++  assert.ok(
++    snapshotLabels.includes(`${RUN_A}-auto-pre-step-1`),
++    `expected a snapshot labelled ${RUN_A}-auto-pre-step-1, got ${JSON.stringify(snapshotLabels)}`,
++  );
++});
++
++test("each lane step gets its own checkpoint, counted per lane", async () => {
++  const { result, events, decisions, snapshotLabels } = await runLaneWithHookCalls(
++    RUN_A,
++    [RISKY_BASH, INSTALL_FLASK],
++    "approved",
++  );
++
++  assert.equal(result.ok, true);
++  assert.equal(decisions.length, 2);
++  assert.ok(decisions.every((decision) => decision.decision === "allow"));
++
++  const checkpoints = checkpointEvents(events);
++  assert.equal(checkpoints.length, 2, "one checkpoint per approved ask");
++  const seqs = checkpoints
++    .map((event) => (event.type === "checkpoint.created" ? event.stepSeq : -1))
++    .sort((a, b) => a - b);
++  assert.deepEqual(seqs, [1, 2], "the lane's per-lane counter counts its own steps");
++  const labels = checkpoints
++    .map((event) => (event.type === "checkpoint.created" ? event.label : ""))
++    .sort();
++  assert.deepEqual(labels, ["auto-pre-step-1", "auto-pre-step-2"]);
++  assert.ok(snapshotLabels.includes(`${RUN_A}-auto-pre-step-1`));
++  assert.ok(snapshotLabels.includes(`${RUN_A}-auto-pre-step-2`));
++});
++
++test("a denied ask in a lane creates no checkpoint", async () => {
++  const { result, events, decisions, snapshotLabels } = await runLaneWithHookCalls(RUN_B, [RISKY_BASH], "denied");
++
++  assert.equal(decisions.length, 1);
++  assert.equal(decisions[0]?.decision, "deny");
++
++  const blocked = events.find((event) => event.type === "tool.blocked");
++  assert.ok(blocked, "the denied call must surface as tool.blocked");
++
++  assert.equal(
++    checkpointEvents(events).length,
++    0,
++    "a call that never executes must not snapshot the VM",
++  );
++  assert.deepEqual(
++    snapshotLabels.filter((label) => label.startsWith(`${RUN_B}-`)),
++    [],
++    "no snapshot may land for the denied run",
++  );
++  // The lane itself still finishes: the denial applies to the simulated hook
++  // call, while the fake transcript replays its fixed outcome regardless.
++  assert.equal(result.ok, true);
++});
+-- 
+2.55.0
+

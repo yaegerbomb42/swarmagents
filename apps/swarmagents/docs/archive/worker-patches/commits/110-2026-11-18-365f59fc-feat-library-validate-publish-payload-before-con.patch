@@ -1,0 +1,204 @@
+From 365f59fce452e243a58465e28e23eaf833268cd6 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 12:03:37 -0600
+Subject: [PATCH] feat(library): validate publish payload before consuming
+ rate-limit quota
+
+---
+ .../api/library/public/[id]/versions/route.ts |   4 +-
+ .../app/api/library/public/route.test.ts      | 139 ++++++++++++++++++
+ .../app/api/library/public/route.ts           |   3 +-
+ 3 files changed, 143 insertions(+), 3 deletions(-)
+ create mode 100644 apps/swarmagents/app/api/library/public/route.test.ts
+
+diff --git a/apps/swarmagents/app/api/library/public/[id]/versions/route.ts b/apps/swarmagents/app/api/library/public/[id]/versions/route.ts
+index eb7a8e304..78f31eecc 100644
+--- a/apps/swarmagents/app/api/library/public/[id]/versions/route.ts
++++ b/apps/swarmagents/app/api/library/public/[id]/versions/route.ts
+@@ -34,6 +34,8 @@ export async function POST(request: Request, context: RouteContext) {
+         { status: 403, headers: NO_STORE },
+       );
+     }
++    const body = await readJson(request);
++    const input = resolvePublishInput(owner, body, record.kind);
+     const rate = consumePublishRate(owner);
+     if (!rate.allowed) {
+       return NextResponse.json(
+@@ -41,8 +43,6 @@ export async function POST(request: Request, context: RouteContext) {
+         { status: 429, headers: { ...NO_STORE, "retry-after": String(rate.retryAfter) } },
+       );
+     }
+-    const body = await readJson(request);
+-    const input = resolvePublishInput(owner, body, record.kind);
+     const updated = publishVersion(id, owner, input);
+     // F4: an optional `proofRunId` attaches a signed proof-of-run bundle to
+     // the new version (see the publish route for the failure contract).
+diff --git a/apps/swarmagents/app/api/library/public/route.test.ts b/apps/swarmagents/app/api/library/public/route.test.ts
+new file mode 100644
+index 000000000..9eeb09df3
+--- /dev/null
++++ b/apps/swarmagents/app/api/library/public/route.test.ts
+@@ -0,0 +1,139 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { POST as publicPost } from "./route";
++import { POST as versionsPost } from "./[id]/versions/route";
++import { resetPublishRateLimit, consumePublishRate } from "../../../../lib/library/rate";
++
++let tmpDir = "";
++
++test.beforeEach(() => {
++  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-publish-order-test-"));
++  process.env.SWARM_DATA_DIR = tmpDir;
++  process.env.SWARM_LIBRARY_PUBLISH_PER_HOUR = "1";
++  resetPublishRateLimit();
++});
++
++test.afterEach(() => {
++  delete process.env.SWARM_DATA_DIR;
++  delete process.env.SWARM_LIBRARY_PUBLISH_PER_HOUR;
++  resetPublishRateLimit();
++  fs.rmSync(tmpDir, { recursive: true, force: true });
++});
++
++test("POST /api/library/public: malformed JSON (400) does NOT decrement publish allowance", async () => {
++  const req = new Request("http://localhost/api/library/public", {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      "x-swarm-user": "alice",
++    },
++    body: "invalid-json{{{",
++  });
++
++  const res = await publicPost(req);
++  assert.equal(res.status, 400);
++
++  // Rate limit should NOT have been consumed
++  const check = consumePublishRate("alice", Date.now(), { SWARM_LIBRARY_PUBLISH_PER_HOUR: "1" });
++  assert.equal(check.allowed, true);
++  assert.equal(check.remaining, 0);
++});
++
++test("POST /api/library/public: invalid payload schema (400) does NOT decrement publish allowance", async () => {
++  const req = new Request("http://localhost/api/library/public", {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      "x-swarm-user": "alice",
++    },
++    body: JSON.stringify({ kind: "invalid-kind", name: "bad" }),
++  });
++
++  const res = await publicPost(req);
++  assert.equal(res.status, 400);
++
++  // Rate limit should NOT have been consumed
++  const check = consumePublishRate("alice", Date.now(), { SWARM_LIBRARY_PUBLISH_PER_HOUR: "1" });
++  assert.equal(check.allowed, true);
++  assert.equal(check.remaining, 0);
++});
++
++test("POST /api/library/public: valid publish consumes exactly one unit", async () => {
++  const validBody = {
++    kind: "skill",
++    name: "My Skill",
++    description: "A valid skill",
++    payload: {
++      skillMd: "# Test Skill",
++    },
++  };
++
++  const req = new Request("http://localhost/api/library/public", {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      "x-swarm-user": "alice",
++    },
++    body: JSON.stringify(validBody),
++  });
++
++  const res = await publicPost(req);
++  assert.equal(res.status, 201);
++  const data = (await res.json()) as { item: { id: string }; remaining: number };
++  assert.equal(data.remaining, 0);
++
++  // Next publish attempt should be rate limited (429)
++  const req2 = new Request("http://localhost/api/library/public", {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      "x-swarm-user": "alice",
++    },
++    body: JSON.stringify(validBody),
++  });
++
++  const res2 = await publicPost(req2);
++  assert.equal(res2.status, 429);
++});
++
++test("POST /api/library/public/[id]/versions: malformed payload does not consume rate limit", async () => {
++  // First publish an item with rate limit set to 2 so we have budget
++  process.env.SWARM_LIBRARY_PUBLISH_PER_HOUR = "2";
++  resetPublishRateLimit();
++
++  const createReq = new Request("http://localhost/api/library/public", {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      "x-swarm-user": "alice",
++    },
++    body: JSON.stringify({
++      kind: "skill",
++      name: "Skill 1",
++      payload: { skillMd: "# V1" },
++    }),
++  });
++  const createRes = await publicPost(createReq);
++  assert.equal(createRes.status, 201);
++  const { item } = (await createRes.json()) as { item: { id: string } };
++
++  // Remaining budget is 1. Attempt invalid version update
++  const invalidVersionReq = new Request(`http://localhost/api/library/public/${item.id}/versions`, {
++    method: "POST",
++    headers: {
++      "content-type": "application/json",
++      "x-swarm-user": "alice",
++    },
++    body: "malformed-json{{",
++  });
++  const badRes = await versionsPost(invalidVersionReq, { params: Promise.resolve({ id: item.id }) });
++  assert.equal(badRes.status, 400);
++
++  // Still has 1 budget remaining
++  const check = consumePublishRate("alice", Date.now(), { SWARM_LIBRARY_PUBLISH_PER_HOUR: "2" });
++  assert.equal(check.allowed, true);
++  assert.equal(check.remaining, 0);
++});
+diff --git a/apps/swarmagents/app/api/library/public/route.ts b/apps/swarmagents/app/api/library/public/route.ts
+index 360d2f3d1..4abc93513 100644
+--- a/apps/swarmagents/app/api/library/public/route.ts
++++ b/apps/swarmagents/app/api/library/public/route.ts
+@@ -56,6 +56,7 @@ export async function POST(request: Request) {
+   if (!owner) return unauthorized();
+   try {
+     const body = await readJson(request);
++    const publishInput = resolvePublishInput(owner, body);
+     const rate = consumePublishRate(owner);
+     if (!rate.allowed) {
+       return NextResponse.json(
+@@ -66,7 +67,7 @@ export async function POST(request: Request) {
+         { status: 429, headers: { ...NO_STORE, "retry-after": String(rate.retryAfter) } },
+       );
+     }
+-    const record = publishItem(owner, resolvePublishInput(owner, body));
++    const record = publishItem(owner, publishInput);
+     // F4: an optional `proofRunId` attaches a signed proof-of-run bundle to
+     // version 1. A proof failure never fails the publish — it is reported
+     // as `proofError` so the publisher can retry with a finished run.
+-- 
+2.55.0
+

@@ -1,0 +1,316 @@
+From eb76cc567099b780ac02d42d631754e06e030f65 Mon Sep 17 00:00:00 2001
+From: minimax-1 <minimax-1@swarmagents.local>
+Date: Wed, 11 Nov 2026 15:46:03 -0600
+Subject: [PATCH] feat(app): public landing page for signed-out visitors
+
+GET / no longer redirects to /login: an unauthenticated visitor gets a
+server-rendered landing page explaining the persistent Linux VM, with
+Sign in (-> /login) and Create account CTAs plus FAQ/Docs/Privacy links.
+Signed-in users still land in the workspace; every other path (including
+/providers and all of /api/*) stays behind the auth gate.
+---
+ apps/swarmagents/app/page.tsx           |  13 +-
+ apps/swarmagents/app/public-landing.tsx | 159 ++++++++++++++++++++++++
+ apps/swarmagents/e2e/lib.ts             |   4 +
+ apps/swarmagents/lib/middleware.test.ts |  42 +++++++
+ apps/swarmagents/middleware.ts          |  16 +++
+ 5 files changed, 232 insertions(+), 2 deletions(-)
+ create mode 100644 apps/swarmagents/app/public-landing.tsx
+
+diff --git a/apps/swarmagents/app/page.tsx b/apps/swarmagents/app/page.tsx
+index d28d07226..6bfa69a3d 100644
+--- a/apps/swarmagents/app/page.tsx
++++ b/apps/swarmagents/app/page.tsx
+@@ -1,10 +1,19 @@
++import { cookies, headers } from "next/headers";
++import { requestUser } from "../lib/auth";
+ import HomeClient from "./home-client";
++import PublicLanding from "./public-landing";
+ 
+-export default function Home() {
++export default async function Home() {
++  // The middleware lets an unauthenticated GET / through so a first-time
++  // visitor sees the public landing page. A visitor who holds a session still
++  // lands straight in the workspace, exactly as before.
++  const [hdrs, cs] = await Promise.all([headers(), cookies()]);
++  const user = requestUser({ headers: hdrs, cookies: { get: (name) => cs.get(name) } });
++  if (!user) return <PublicLanding />;
+   return <HomeClient />;
+ }
+ 
+ // Serve the shell per-request instead of from the static prerender cache:
+ // the CSP nonce is minted per request in middleware, so Next can only stamp it
+ // onto its inline bootstrap scripts when the page is rendered dynamically.
+-export const dynamic = "force-dynamic";
+\ No newline at end of file
++export const dynamic = "force-dynamic";
+diff --git a/apps/swarmagents/app/public-landing.tsx b/apps/swarmagents/app/public-landing.tsx
+new file mode 100644
+index 000000000..ed871529b
+--- /dev/null
++++ b/apps/swarmagents/app/public-landing.tsx
+@@ -0,0 +1,159 @@
++/**
++ * Signed-out landing page.
++ *
++ * Rendered at / when the visitor has no session, so a first-time visitor gets
++ * the product story instead of a locked sign-in form. It is deliberately inert:
++ * it never mounts the workspace (no VM, no providers, no runs) and only links
++ * to /login. The signed-in workspace keeps its own hero (LandingHero in
++ * minimalist-ui) — this is the "before you sign in" variant of it.
++ */
++
++/**
++ * Whether POST /api/signup accepts new accounts. Mirrors the check in
++ * app/api/signup/route.ts and app/login/page.tsx: open in development, closed
++ * in production unless SWARM_ALLOW_SIGNUP is explicitly enabled.
++ */
++function signupSupported(): boolean {
++  if (process.env.NODE_ENV !== "production") return true;
++  const allow = (process.env.SWARM_ALLOW_SIGNUP ?? "").toLowerCase();
++  return allow === "1" || allow === "true";
++}
++
++const PILLARS = [
++  {
++    icon: (
++      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5" aria-hidden="true">
++        <rect x="2.5" y="4" width="19" height="16" rx="2.5" />
++        <path d="M7 9.5l2.5 2.5L7 14.5M12.5 15h4.5" />
++      </svg>
++    ),
++    tone: "text-cyan-300 border-cyan-400/25 bg-cyan-400/10",
++    title: "Your own Linux machine",
++    body: "A persistent Debian box with bash, node, python and git. It survives between runs, so the work is still there tomorrow.",
++  },
++  {
++    icon: (
++      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5" aria-hidden="true">
++        <circle cx="12" cy="12" r="9" />
++        <path d="M3 12h18M12 3c2.5 2.6 2.5 15.4 0 18M12 3c-2.5 2.6-2.5 15.4 0 18" />
++      </svg>
++    ),
++    tone: "text-emerald-300 border-emerald-400/25 bg-emerald-400/10",
++    title: "Watch the agent work",
++    body: "Every command runs in a live terminal and a headed browser. See what the agent types, what it clicks and what it fetches.",
++  },
++  {
++    icon: (
++      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5" aria-hidden="true">
++        <rect x="2.5" y="5.5" width="19" height="13" rx="2.5" />
++        <path d="M7 10h.01M10.5 10h.01M14 10h.01M17.5 10h.01M8 14h8" />
++      </svg>
++    ),
++    tone: "text-violet-300 border-violet-400/25 bg-violet-400/10",
++    title: "Take over any time",
++    body: "Grab the keyboard and drive the machine yourself. The agent picks up where you left off instead of starting over.",
++  },
++];
++
++export default function PublicLanding() {
++  const allowSignup = signupSupported();
++
++  return (
++    <main
++      data-testid="public-landing"
++      className="relative min-h-screen overflow-hidden bg-[#07070a] text-white antialiased"
++    >
++      {/* Ambient glow — decorative only, matches the app shell. */}
++      <div aria-hidden="true" className="pointer-events-none fixed inset-0">
++        <div className="blob left-[6%] top-[8%] h-[420px] w-[420px] bg-[#0ea5a4]" />
++        <div className="blob bottom-[2%] right-[4%] h-[460px] w-[460px] bg-[#5b5bf7]" style={{ animationDelay: "-7s" }} />
++        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_0%,#07070a_78%)]" />
++      </div>
++
++      <div className="relative z-10 mx-auto flex min-h-screen w-full max-w-5xl flex-col px-5 py-7 sm:px-8">
++        <header className="flex items-center justify-between gap-4">
++          <div className="flex items-center gap-2.5">
++            <span aria-hidden="true" className="h-2.5 w-2.5 rounded-full bg-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.9)]" />
++            <span className="text-base font-semibold tracking-tight">SwarmAgents</span>
++          </div>
++          <a
++            href="/login"
++            className="rounded-full border border-white/15 px-4 py-2 text-sm text-white/80 transition-colors hover:bg-white/10 hover:text-white"
++          >
++            Sign in
++          </a>
++        </header>
++
++        <section className="flex flex-1 flex-col items-center justify-center py-14 text-center">
++          <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3.5 py-1 font-mono text-xs text-white/70 backdrop-blur-xl">
++            <span aria-hidden="true" className="h-2 w-2 rounded-full bg-cyan-400" />
++            Persistent Linux VM · Autonomous agent
++          </span>
++
++          <h1 className="mt-6 max-w-3xl text-4xl font-light leading-tight tracking-tight text-white sm:text-5xl">
++            Your own persistent Linux computer.
++            <span className="block bg-gradient-to-r from-cyan-400 to-emerald-400 bg-clip-text text-transparent">
++              Watch the agent work. Take over any time.
++            </span>
++          </h1>
++
++          <p className="mt-5 max-w-2xl text-base font-light leading-relaxed text-white/55 sm:text-lg">
++            SwarmAgents hands you a dedicated Debian machine that stays alive between runs. The agent
++            pilots it — terminal, browser, git — and you are always one keystroke away from taking the
++            controls yourself.
++          </p>
++
++          <div className="mt-9 flex flex-wrap items-center justify-center gap-3">
++            <a
++              href="/login"
++              className="rounded-2xl bg-white px-6 py-3 text-sm font-medium text-black shadow-xl transition-all hover:scale-[1.02] hover:bg-white/90 active:scale-95"
++            >
++              Sign in
++            </a>
++            {allowSignup && (
++              <a
++                href="/login"
++                className="rounded-2xl border border-white/10 bg-white/[0.05] px-6 py-3 text-sm font-medium text-white/80 backdrop-blur-xl transition-colors hover:bg-white/10 hover:text-white"
++              >
++                Create account
++              </a>
++            )}
++          </div>
++          <p className="mt-4 text-xs text-white/40">
++            Signing in opens your workspace. Nothing runs until you ask it to.
++          </p>
++        </section>
++
++        <section aria-label="What you get" className="grid gap-4 sm:grid-cols-3">
++          {PILLARS.map((pillar) => (
++            <div
++              key={pillar.title}
++              className="glass rounded-2xl border border-white/10 p-5 text-left"
++            >
++              <div className={`mb-3 grid h-9 w-9 place-items-center rounded-xl border ${pillar.tone}`}>
++                {pillar.icon}
++              </div>
++              <h2 className="mb-1 text-sm font-semibold text-white">{pillar.title}</h2>
++              <p className="text-xs leading-relaxed text-white/50">{pillar.body}</p>
++            </div>
++          ))}
++        </section>
++
++        <footer className="mt-10 flex flex-col items-center gap-3 border-t border-white/10 py-6 text-xs text-white/45 sm:flex-row sm:justify-between">
++          <span>© {new Date().getFullYear()} SwarmAgents</span>
++          <nav aria-label="Footer" className="flex items-center gap-5">
++            <a href="/faq" className="transition-colors hover:text-white/80">
++              FAQ
++            </a>
++            <a href="/docs" className="transition-colors hover:text-white/80">
++              Docs
++            </a>
++            <a href="/privacy" className="transition-colors hover:text-white/80">
++              Privacy
++            </a>
++          </nav>
++        </footer>
++      </div>
++    </main>
++  );
++}
+diff --git a/apps/swarmagents/e2e/lib.ts b/apps/swarmagents/e2e/lib.ts
+index bfd03eafe..7350717b3 100644
+--- a/apps/swarmagents/e2e/lib.ts
++++ b/apps/swarmagents/e2e/lib.ts
+@@ -227,6 +227,10 @@ export async function isLoginWall(page: Page): Promise<boolean> {
+     const url = new URL(page.url());
+     if (url.pathname === "/login" || url.pathname.startsWith("/login/")) return true;
+   } catch {}
++  // Signed out, "/" serves the public landing page: still no workspace, so it
++  // counts as a wall for the prod-mode UI specs.
++  const landing = page.locator("[data-testid='public-landing']").first();
++  if (await landing.isVisible().catch(() => false)) return true;
+   const loginForm = page.locator("form.login-form, .login-page, input[type='password']").first();
+   return loginForm.isVisible().catch(() => false);
+ }
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index c971b9f25..76c11313e 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -41,6 +41,48 @@ test("redirects unauthenticated document navigations to /login with the target a
+   assert.equal(new URL(loc).searchParams.get("next"), "/runs?tab=log");
+ });
+ 
++test("serves the landing page to unauthenticated visitors (GET / is public)", () => {
++  const res = middleware(req("http://swarm.example.com/", { host: "swarm.example.com" }));
++  assert.equal(res.status, 200, "the landing page must not redirect to /login");
++  assert.equal(res.headers.get("location"), null, "the landing page must not redirect");
++});
++
++test("the public landing keeps the query string and answers HEAD", () => {
++  const res = middleware(req("http://swarm.example.com/?utm=launch", { host: "swarm.example.com" }));
++  assert.equal(res.status, 200);
++  const head = middleware(req("http://swarm.example.com/", { host: "swarm.example.com" }, "HEAD"));
++  assert.equal(head.status, 200, "HEAD / must stay public");
++});
++
++test("the public landing is read-only: other methods still need a session", () => {
++  for (const method of STATE_CHANGING) {
++    const res = middleware(req("http://swarm.example.com/", { host: "swarm.example.com" }, method));
++    assert.equal(res.status, 303, `${method} / must still be gated`);
++    const loc = res.headers.get("location") ?? "";
++    assert.ok(loc.startsWith("http://swarm.example.com/login?next="), `unexpected location: ${loc}`);
++  }
++});
++
++test("the public landing does not open any other path (/providers stays gated)", () => {
++  for (const path of ["/providers", "/runs", "/settings", "/api/providers/health"]) {
++    const res = middleware(req(`http://swarm.example.com${path}`, { host: "swarm.example.com" }));
++    if (path.startsWith("/api/")) {
++      assert.equal(res.status, 401, `${path} must require a session`);
++    } else {
++      assert.equal(res.status, 303, `${path} must redirect to the sign-in page`);
++      const loc = res.headers.get("location") ?? "";
++      assert.ok(loc.startsWith("http://swarm.example.com/login?next="), `unexpected location: ${loc}`);
++      assert.equal(new URL(loc).searchParams.get("next"), path);
++    }
++  }
++});
++
++test("signed-in visitors still get the workspace at / without a redirect", () => {
++  const res = middleware(req("http://swarm.example.com/", { host: "swarm.example.com", cookie: cookie() }));
++  assert.equal(res.status, 200);
++  assert.equal(res.headers.get("location"), null, "authenticated requests must not redirect");
++});
++
+ test("returns 401 JSON for unauthenticated API calls instead of redirecting", async () => {
+   const res = middleware(req("http://swarm.example.com/api/providers/health", { host: "swarm.example.com" }));
+   assert.equal(res.status, 401);
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index b5268f03e..b45ac1d36 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -31,6 +31,20 @@ export { isAllowed as isLocal } from "./lib/auth";
+ /** Reachable signed out: the sign-in page and the endpoints it uses. */
+ const PUBLIC = new Set(["/login", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
+ 
++/** Read-only methods a signed-out visitor may use on the public landing page. */
++const READ_ONLY = new Set(["GET", "HEAD"]);
++
++/**
++ * The public landing page: "/" is reachable without a session so a first-time
++ * visitor sees what the product is instead of a locked sign-in form. Only the
++ * exact path and only read-only methods qualify — every other route (including
++ * /providers and all of /api/*) stays behind the auth gate. The page itself
++ * renders the workspace for a visitor who does hold a session.
++ */
++function isPublicLanding(pathname: string, method: string): boolean {
++  return pathname === "/" && READ_ONLY.has(method.toUpperCase());
++}
++
+ /** The public board MCP endpoint is exempt from the cross-site gate (external MCP clients call it). */
+ const BOARD_PATH = "/api/mcp/swarm-board";
+ 
+@@ -136,6 +150,8 @@ export function middleware(req: NextRequest) {
+   }
+ 
+   if (PUBLIC.has(pathname)) return withSecurityHeaders(NextResponse.next({ request: { headers } }), nonce, { dev }, rate);
++  // The landing page at / is public for read-only navigations (see isPublicLanding).
++  if (isPublicLanding(pathname, req.method)) return withSecurityHeaders(NextResponse.next({ request: { headers } }), nonce, { dev }, rate);
+   if (!user) {
+     if (!serverMode()) return withSecurityHeaders(new NextResponse("forbidden", { status: 403 }), nonce, { dev }, rate);
+     if (pathname.startsWith("/api/")) {
+-- 
+2.55.0
+

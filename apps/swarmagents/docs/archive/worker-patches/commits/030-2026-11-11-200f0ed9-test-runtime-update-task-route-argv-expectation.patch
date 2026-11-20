@@ -1,0 +1,36 @@
+From 200f0ed9aeebc52450e7fd066c4e5ecfe446c96f Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 12:12:37 -0600
+Subject: [PATCH] test(runtime): update task route argv expectation for safe
+ prompt handling
+
+---
+ apps/swarmagents/app/api/runtime/tasks/route.test.ts | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/runtime/tasks/route.test.ts b/apps/swarmagents/app/api/runtime/tasks/route.test.ts
+index e7bd960ae..15a63706e 100644
+--- a/apps/swarmagents/app/api/runtime/tasks/route.test.ts
++++ b/apps/swarmagents/app/api/runtime/tasks/route.test.ts
+@@ -173,8 +173,16 @@ test("POST starts a run, publishes telemetry, and GET lists it as finished", asy
+   // provider token is chosen by lib/providers and rides in env, never argv.
+   assert.equal(driver.calls.length, 1);
+   const { cmd, opts } = driver.calls[0];
+-  assert.deepEqual(cmd.slice(0, 7), ["claude", "-p", "Build a thing", "--output-format", "stream-json", "--verbose", "--resume"]);
+-  assert.equal(cmd[7], "sess_resume_9");
++  assert.deepEqual(cmd, [
++    "claude",
++    "--output-format",
++    "stream-json",
++    "--verbose",
++    "--resume",
++    "sess_resume_9",
++    "--",
++    "Build a thing",
++  ]);
+   assert.equal(opts.env?.ANTHROPIC_AUTH_TOKEN, "sk-test-gw-key-0000");
+   assert.equal(opts.env?.ANTHROPIC_BASE_URL, "http://gw");
+   assert.equal(opts.env?.ANTHROPIC_MODEL, "claude-sonnet-4-5");
+-- 
+2.55.0
+

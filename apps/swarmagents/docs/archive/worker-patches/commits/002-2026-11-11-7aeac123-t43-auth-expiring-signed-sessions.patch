@@ -1,0 +1,241 @@
+From 7aeac123114d119940a8acd598df24d688cc83ae Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 18:25:28 +0000
+Subject: [PATCH] [t43] auth: expiring signed sessions
+
+- signSession now mints v2.<userId>.<issuedAtSec>.<mac> with issued-at embedded; MAC covers v2:<userId>:<issuedAtSec> (domain-separated from legacy format).
+- verifySession rejects v2 sessions older than SWARM_SESSION_MAX_AGE_SEC (default 7 days) and sessions issued in the future; timing-safe comparison retained.
+- Legacy <userId>.<mac> cookies keep working (no issued-at to expire); replaced by v2 cookies at next sign-in.
+- Tests: 5 new cases (valid, expired incl. just-inside-limit, tampered issued-at, future issued-at, legacy valid/tampered incl. dotted and v2-looking user ids, sessionMaxAgeSec default/env/invalid); 13/13 auth tests pass.
+- Gates: npx tsc --noEmit 0 errors; npm run build passes; full npm test cannot complete due to pre-existing hang in app/api/runtime/dispatch.e2e.test.ts (byte-identical to pristine) plus pre-existing route.test.ts:272 auto-resume failure (byte-identical to pristine).
+- No browser visual check (server-side auth lib, no UI); no live provider run (not applicable).
+---
+ apps/swarmagents/lib/auth.test.ts | 82 +++++++++++++++++++++++++++++
+ apps/swarmagents/lib/auth.ts      | 87 ++++++++++++++++++++++++++++---
+ 2 files changed, 162 insertions(+), 7 deletions(-)
+
+diff --git a/apps/swarmagents/lib/auth.test.ts b/apps/swarmagents/lib/auth.test.ts
+index 2b871a5c4..d91b550fe 100644
+--- a/apps/swarmagents/lib/auth.test.ts
++++ b/apps/swarmagents/lib/auth.test.ts
+@@ -1,14 +1,35 @@
+ import test from "node:test";
+ import assert from "node:assert/strict";
++import { createHmac } from "node:crypto";
+ import {
+   hostAllowed,
+   isAllowed,
+   requestUser,
+   serverMode,
++  sessionMaxAgeSec,
+   signSession,
+   USER_HEADER,
+ } from "./auth.js";
+ 
++/** Mint a legacy-format cookie (`<userId>.<hmac(userId)>`, no issued-at). */
++function legacySignSession(userId: string): string {
++  const secret = process.env.SWARM_SESSION_SECRET ?? "";
++  return `${userId}.${createHmac("sha256", secret).update(userId).digest("hex")}`;
++}
++
++/** Return `token` with its issued-at segment replaced (v2 format only). */
++function withIssuedAt(token: string, issuedAtSec: number): string {
++  const parts = token.split(".");
++  parts[parts.length - 2] = String(issuedAtSec);
++  return parts.join(".");
++}
++
++function serverEnv() {
++  process.env.SWARM_SERVER_MODE = "1";
++  process.env.SWARM_HARNESS_TOKEN = "harness-token";
++  process.env.SWARM_SESSION_SECRET = "test-secret";
++}
++
+ function req(headers: Record<string, string>, cookie?: string) {
+   return {
+     headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
+@@ -60,6 +81,67 @@ test("requestUser: server mode accepts signed session cookie, rejects tampered",
+   assert.equal(requestUser(req({}, good + "x")), null);
+ });
+ 
++test("sessionMaxAgeSec: defaults to 7 days, honors SWARM_SESSION_MAX_AGE_SEC", () => {
++  delete process.env.SWARM_SESSION_MAX_AGE_SEC;
++  assert.equal(sessionMaxAgeSec(), 7 * 24 * 60 * 60);
++  process.env.SWARM_SESSION_MAX_AGE_SEC = "3600";
++  assert.equal(sessionMaxAgeSec(), 3600);
++  process.env.SWARM_SESSION_MAX_AGE_SEC = "bogus";
++  assert.equal(sessionMaxAgeSec(), 7 * 24 * 60 * 60);
++  process.env.SWARM_SESSION_MAX_AGE_SEC = "0";
++  assert.equal(sessionMaxAgeSec(), 7 * 24 * 60 * 60);
++  process.env.SWARM_SESSION_MAX_AGE_SEC = "-5";
++  assert.equal(sessionMaxAgeSec(), 7 * 24 * 60 * 60);
++});
++
++test("requestUser: v2 sessions expire after SWARM_SESSION_MAX_AGE_SEC", () => {
++  serverEnv();
++  process.env.SWARM_SESSION_MAX_AGE_SEC = "60";
++  const now = Math.floor(Date.now() / 1000);
++  assert.equal(requestUser(req({}, signSession("alice", now - 30)))?.id, "alice");
++  // Just inside the limit is still valid (59s, not 60, so a clock tick cannot flake it).
++  assert.equal(requestUser(req({}, signSession("alice", now - 59)))?.id, "alice");
++  // One second past the limit is expired.
++  assert.equal(requestUser(req({}, signSession("alice", now - 61))), null);
++  // Well past the limit is expired.
++  assert.equal(requestUser(req({}, signSession("alice", now - 8 * 24 * 60 * 60))), null);
++});
++
++test("requestUser: v2 sessions reject tampered issued-at and future issued-at", () => {
++  serverEnv();
++  process.env.SWARM_SESSION_MAX_AGE_SEC = "60";
++  const now = Math.floor(Date.now() / 1000);
++  const good = signSession("alice", now - 30);
++  assert.equal(requestUser(req({}, good))?.id, "alice");
++  // Rewriting issued-at without re-signing breaks the MAC.
++  assert.equal(requestUser(req({}, withIssuedAt(good, now - 10))), null);
++  // A session issued in the future is not trustworthy, even if re-signed.
++  assert.equal(requestUser(req({}, signSession("alice", now + 3600))), null);
++});
++
++test("requestUser: legacy-format cookies without issued-at keep working", () => {
++  serverEnv();
++  delete process.env.SWARM_SESSION_MAX_AGE_SEC;
++  // Documented choice: legacy cookies carry no issued-at, so no expiry can
++  // be enforced for them; they stay valid rather than breaking existing
++  // sessions silently. They are replaced by v2 cookies at next sign-in.
++  const legacy = legacySignSession("alice");
++  assert.equal(requestUser(req({}, legacy))?.id, "alice");
++  assert.equal(requestUser(req({}, legacy + "x")), null);
++  // A legacy user id that looks like a v2 token must still verify as legacy.
++  assert.equal(requestUser(req({}, legacySignSession("v2.x.123")))?.id, "v2.x.123");
++  // A dotted legacy user id still works.
++  assert.equal(requestUser(req({}, legacySignSession("alice.smith")))?.id, "alice.smith");
++});
++
++test("requestUser: v2 sessions work for dotted user ids", () => {
++  serverEnv();
++  delete process.env.SWARM_SESSION_MAX_AGE_SEC;
++  const now = Math.floor(Date.now() / 1000);
++  assert.equal(requestUser(req({}, signSession("alice.smith", now)))?.id, "alice.smith");
++  assert.equal(requestUser(req({}, signSession("alice.smith", now - 8 * 24 * 60 * 60))), null);
++});
++
+ test("isAllowed: keeps local mode open, gates server mode", () => {
+   process.env.SWARM_SERVER_MODE = "0";
+   assert.equal(isAllowed(req({})), true);
+diff --git a/apps/swarmagents/lib/auth.ts b/apps/swarmagents/lib/auth.ts
+index 3f7c79123..fa12d6919 100644
+--- a/apps/swarmagents/lib/auth.ts
++++ b/apps/swarmagents/lib/auth.ts
+@@ -22,6 +22,23 @@ export const USER_HEADER = "x-swarm-user";
+ /** Signed session cookie name. */
+ const SESSION_COOKIE = "swarm_session";
+ 
++/** Default session lifetime: 7 days, in seconds. */
++export const DEFAULT_SESSION_MAX_AGE_SEC = 7 * 24 * 60 * 60;
++
++/**
++ * Max session age in seconds, from SWARM_SESSION_MAX_AGE_SEC (default 7 days).
++ * A missing, non-numeric, or non-positive value falls back to the default
++ * rather than silently disabling expiry or locking everyone out.
++ */
++export function sessionMaxAgeSec(): number {
++  const raw = process.env.SWARM_SESSION_MAX_AGE_SEC;
++  if (raw !== undefined) {
++    const n = Number(raw);
++    if (Number.isFinite(n) && n > 0) return Math.floor(n);
++  }
++  return DEFAULT_SESSION_MAX_AGE_SEC;
++}
++
+ const LOCAL_USER: AuthUser = { id: "local", email: "local@swarmagents.local" };
+ const HARNESS_USER: AuthUser = { id: "harness", email: "harness@swarmagents.local" };
+ 
+@@ -49,15 +66,62 @@ function sessionSecret(): string {
+   return process.env.SWARM_SESSION_SECRET ?? "";
+ }
+ 
+-/** Sign a session cookie value for `userId`. Used by the login route and tests. */
+-export function signSession(userId: string): string {
+-  return `${userId}.${createHmac("sha256", sessionSecret()).update(userId).digest("hex")}`;
++/**
++ * Sign a session cookie value for `userId`. Used by the login route and tests.
++ *
++ * Format: `v2.<userId>.<issuedAtSec>.<mac>` where issuedAtSec is the Unix
++ * time (seconds) the session was issued and the MAC covers
++ * `v2:<userId>:<issuedAtSec>` (domain-separated from the legacy format so a
++ * legacy token can never be mistaken for a v2 token). `issuedAtSec` defaults
++ * to now; callers (tests) may pass an explicit value to mint an old session.
++ */
++export function signSession(userId: string, issuedAtSec: number = Math.floor(Date.now() / 1000)): string {
++  const issuedAt = Math.floor(issuedAtSec);
++  const signingInput = `v2:${userId}:${issuedAt}`;
++  const mac = createHmac("sha256", sessionSecret()).update(signingInput).digest("hex");
++  return `v2.${userId}.${issuedAt}.${mac}`;
+ }
+ 
+-/** Returns the verified user id from a signed session cookie, or null. */
+-function verifySession(token: string): string | null {
+-  const secret = sessionSecret();
+-  if (!secret) return null;
++/**
++ * Verify a v2 session token (`v2.<userId>.<issuedAtSec>.<mac>`).
++ * Returns the user id if valid, null if it is a genuine v2 token that fails
++ * verification or has expired, and undefined if the token is not a v2 token
++ * at all (the caller then falls back to the legacy format).
++ */
++function verifyV2Session(token: string, secret: string): string | null | undefined {
++  if (!token.startsWith("v2.")) return undefined;
++  const macSep = token.lastIndexOf(".");
++  if (macSep <= 3) return undefined;
++  const payload = token.slice(0, macSep); // "v2.<userId>.<issuedAtSec>"
++  const mac = token.slice(macSep + 1);
++  const iatSep = payload.lastIndexOf(".");
++  if (iatSep <= 3) return undefined;
++  const issuedAtRaw = payload.slice(iatSep + 1);
++  if (!/^\d+$/.test(issuedAtRaw)) return undefined;
++  const userId = payload.slice(3, iatSep);
++  if (!userId) return undefined;
++  const issuedAt = Number(issuedAtRaw);
++  const expected = createHmac("sha256", secret).update(`v2:${userId}:${issuedAt}`).digest("hex");
++  const a = Buffer.from(mac);
++  const b = Buffer.from(expected);
++  // MAC mismatch means this is not a v2 token (e.g. a legacy token whose
++  // user id happens to start with "v2."); let the legacy check decide.
++  if (a.length !== b.length || !timingSafeEqual(a, b)) return undefined;
++  const now = Math.floor(Date.now() / 1000);
++  if (issuedAt > now) return null; // issued in the future: not trustworthy
++  if (now - issuedAt > sessionMaxAgeSec()) return null; // expired
++  return userId;
++}
++
++/**
++ * Verify a legacy session token (`<userId>.<mac>`, MAC over the user id).
++ * Legacy cookies carry no issued-at, so no expiry can be enforced for them.
++ * They are deliberately kept working rather than breaking existing sessions
++ * silently: every legacy session will be replaced by a v2 session the next
++ * time its user signs in, and the legacy format can be dropped once that
++ * migration has had time to complete.
++ */
++function verifyLegacySession(token: string, secret: string): string | null {
+   const i = token.lastIndexOf(".");
+   if (i <= 0) return null;
+   const userId = token.slice(0, i);
+@@ -69,6 +133,15 @@ function verifySession(token: string): string | null {
+   return timingSafeEqual(a, b) ? userId : null;
+ }
+ 
++/** Returns the verified user id from a signed session cookie, or null. */
++function verifySession(token: string): string | null {
++  const secret = sessionSecret();
++  if (!secret) return null;
++  const v2 = verifyV2Session(token, secret);
++  if (v2 !== undefined) return v2;
++  return verifyLegacySession(token, secret);
++}
++
+ function harnessTokenValid(token: string): boolean {
+   const expected = process.env.SWARM_HARNESS_TOKEN;
+   if (!expected) return false;
+-- 
+2.55.0
+

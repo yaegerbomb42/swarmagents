@@ -1,0 +1,103 @@
+From bc198cc086d3a74e841860e79739a55426977890 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 11:33:05 -0600
+Subject: [PATCH] fix(providers): normalize PATCH id to the same slug POST uses
+
+PATCH /api/providers resolved the raw body id, relying on store-level
+normalization to match a saved provider. Mirror POST's slug handling at the
+route boundary so a mixed-case id ("OpenAI") resolves to the same provider
+("openai") and the audit target / error messages carry the canonical slug.
+An explicit baseUrl: "" continues to clear the stored base URL.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../app/api/providers/route.test.ts           | 38 +++++++++++++++++++
+ apps/swarmagents/app/api/providers/route.ts   | 14 ++++++-
+ 2 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/providers/route.test.ts b/apps/swarmagents/app/api/providers/route.test.ts
+index 97838a3dc..235d44132 100644
+--- a/apps/swarmagents/app/api/providers/route.test.ts
++++ b/apps/swarmagents/app/api/providers/route.test.ts
+@@ -317,6 +317,44 @@ test("POST and PATCH normalize legacy apiStyle aliases to openai-chat", async ()
+   assert.equal(updated?.baseUrl, "https://gw.example.com/v1");
+ });
+ 
++test("PATCH resolves a mixed-case id to the same provider POST saved", async () => {
++  await post({ id: "openai", apiKey: "sk-openai-mixed" });
++
++  // set-endpoint with a differently-cased id must hit the saved "openai".
++  const endpoint = await patch({
++    id: "OpenAI",
++    action: "set-endpoint",
++    baseUrl: "https://gw.example.com/v1",
++  });
++  assert.equal(endpoint.status, 200);
++
++  // Key mutations must hit the same provider too.
++  const key = await patch({ id: "OpenAI", action: "add-key", apiKey: "sk-mixed-second" });
++  assert.equal(key.status, 200);
++  const body = (await key.json()) as { keyCount?: number };
++  assert.equal(body.keyCount, 2);
++
++  const providers = routerProviders(OWNER).filter((p) => p.id.toLowerCase() === "openai");
++  assert.equal(providers.length, 1, "mixed-case PATCH must not mint a second provider");
++  assert.equal(providers[0].baseUrl, "https://gw.example.com/v1");
++  assert.deepEqual(providers[0].keys, ["sk-openai-mixed", "sk-mixed-second"]);
++});
++
++test("PATCH baseUrl:'' clears the provider base URL", async () => {
++  await post({
++    id: "openai",
++    apiKey: "sk-openai-clear",
++    baseUrl: "https://api.openai.com/v1",
++  });
++
++  const res = await patch({ id: "openai", action: "set-endpoint", baseUrl: "" });
++  assert.equal(res.status, 200);
++
++  const openai = routerProviders(OWNER).find((p) => p.id === "openai");
++  assert.ok(openai);
++  assert.equal(openai.baseUrl, undefined, "base URL must be cleared by an empty string");
++});
++
+ test("POST refuses an oversized JSON body with a 413", async () => {
+   const res = await POST(
+     new Request("http://localhost/api/providers", {
+diff --git a/apps/swarmagents/app/api/providers/route.ts b/apps/swarmagents/app/api/providers/route.ts
+index 915ba2bdc..01f7c00ba 100644
+--- a/apps/swarmagents/app/api/providers/route.ts
++++ b/apps/swarmagents/app/api/providers/route.ts
+@@ -309,10 +309,18 @@ export async function PATCH(request: Request) {
+   if (!body || typeof body !== "object" || Array.isArray(body)) {
+     return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400 });
+   }
+-  const id = (body as Record<string, unknown>).id;
+-  if (typeof id !== "string" || id.trim() === "") {
++  const rawId = (body as Record<string, unknown>).id;
++  if (typeof rawId !== "string") {
+     return NextResponse.json({ error: "id is required." }, { status: 400 });
+   }
++  // Normalize the id the same way POST does, so PATCH resolves a mixed-case
++  // id ("OpenAI") to the same saved provider ("openai") and never mints a
++  // second one. The store re-normalizes, so this is idempotent; it also keeps
++  // the audit target and error messages on the canonical slug.
++  const id = rawId.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
++  if (!id || id.length > 64) {
++    return NextResponse.json({ error: "id must be a slug (a-z, 0-9, dashes)." }, { status: 400 });
++  }
+   const input = body as Record<string, unknown>;
+ 
+   // Endpoint/model/capability edits share this route with key mutations so the
+@@ -341,6 +349,8 @@ export async function PATCH(request: Request) {
+     if (modelCapabilities === null) {
+       return NextResponse.json({ error: "Invalid capability overrides." }, { status: 400 });
+     }
++    // An explicit baseUrl: "" clears the stored base URL (the store treats an
++    // empty value as a clear and falls back to the provider's default).
+     const baseUrl = input.baseUrl === undefined ? undefined : String(input.baseUrl).trim();
+     if (baseUrl !== undefined && baseUrl !== "") {
+       const safe = await assertResolvableProviderBaseUrl(baseUrl);
+-- 
+2.55.0
+

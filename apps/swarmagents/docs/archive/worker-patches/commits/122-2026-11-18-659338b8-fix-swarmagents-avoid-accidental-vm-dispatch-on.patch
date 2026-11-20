@@ -1,0 +1,49 @@
+From 659338b84e1ed962c2b4f3ee66ce53a0e31bd0ba Mon Sep 17 00:00:00 2001
+From: yaeger42 <jyaeger@hawk.iit.edu>
+Date: Wed, 18 Nov 2026 11:52:42 -0600
+Subject: [PATCH] fix(swarmagents): avoid accidental VM dispatch on vague
+ requests
+
+---
+ apps/swarmagents/lib/board-agent/agent.ts | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/apps/swarmagents/lib/board-agent/agent.ts b/apps/swarmagents/lib/board-agent/agent.ts
+index 6d8b53d54..c8bd53df3 100644
+--- a/apps/swarmagents/lib/board-agent/agent.ts
++++ b/apps/swarmagents/lib/board-agent/agent.ts
+@@ -14,7 +14,10 @@ const TOOLS: ReadonlySet<string> = new Set([
+   "get_run_status",
+ ]);
+ 
+-const WORK_INTENT = /\b(fix|build|implement|run|dispatch|work on|make|do)\b/i;
++// Only dispatch on explicit implementation verbs or concrete execution requests.
++// Generic conversational uses of "do", "make", or "run me through" must not start a VM.
++const WORK_INTENT = /\b(?:fix|build|implement|change|modify|update|add|remove|refactor|improve|ship|deploy)\b/i;
++const EXECUTION_INTENT = /\b(?:run|execute)\s+(?:the\s+)?(?:tests?|build|app|server|command|script|suite|migration)\b/i;
+ 
+ export class BoardAgentProviderError extends Error {
+   readonly status: 502 | 503;
+@@ -40,7 +43,7 @@ export function __setBoardAgentDispatchForTests(fn: Dispatcher | null): void {
+ }
+ 
+ export function wantsVmRun(userMessage: string): boolean {
+-  return WORK_INTENT.test(userMessage);
++  return WORK_INTENT.test(userMessage) || EXECUTION_INTENT.test(userMessage) || /\bwork on\b/i.test(userMessage);
+ }
+ 
+ function transcript(conversation: BoardAgentConversation): string {
+@@ -167,7 +170,9 @@ export async function runBoardAgent(
+     const executed = await executeTool(userId, call, userMessage);
+     conversation.messages.push({
+       role: "agent",
+-      content: `\`\`\`json\n${JSON.stringify({ tool: call.tool, args: call.args })}\n\`\`\``,
++      content: ```json
++${JSON.stringify({ tool: call.tool, args: call.args })}
++```,
+       createdAt: Date.now(),
+     });
+     if (executed.taskId) taskIds.push(executed.taskId);
+-- 
+2.55.0
+

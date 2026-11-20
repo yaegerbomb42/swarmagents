@@ -1,0 +1,1305 @@
+From d31b3c772f66bba308c63e02ef1292320ee13fcc Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 21:07:57 +0000
+Subject: [PATCH] feat(l4): live noVNC Screen tab with Watch / Take control
+
+---
+ apps/swarmagents/lib/client/novnc.d.ts        |  27 +
+ .../lib/client/useVmDisplay.test.ts           | 172 +++++++
+ apps/swarmagents/lib/client/useVmDisplay.ts   | 475 ++++++++++++++++++
+ apps/swarmagents/minimalist-ui/src/App.tsx    |  44 +-
+ .../src/components/ComputerScreen.tsx         |  10 +-
+ .../src/components/MobileTabBar.tsx           |   7 +-
+ .../src/components/RoleAndVmBar.tsx           |   4 +-
+ .../src/components/ScreenView.tsx             | 264 ++++++++++
+ apps/swarmagents/package-lock.json            |  31 +-
+ apps/swarmagents/package.json                 |   1 +
+ 10 files changed, 996 insertions(+), 39 deletions(-)
+ create mode 100644 apps/swarmagents/lib/client/novnc.d.ts
+ create mode 100644 apps/swarmagents/lib/client/useVmDisplay.test.ts
+ create mode 100644 apps/swarmagents/lib/client/useVmDisplay.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/ScreenView.tsx
+
+diff --git a/apps/swarmagents/lib/client/novnc.d.ts b/apps/swarmagents/lib/client/novnc.d.ts
+new file mode 100644
+index 000000000..2dc110dbe
+--- /dev/null
++++ b/apps/swarmagents/lib/client/novnc.d.ts
+@@ -0,0 +1,27 @@
++/**
++ * Minimal types for @novnc/novnc (1.7.0), which ships no TypeScript
++ * declarations. Only the RFB surface used by lib/client/useVmDisplay
++ * is typed here, verified against node_modules/@novnc/novnc/core/rfb.js.
++ *
++ * The package's exports field maps the package root to ./core/rfb.js,
++ * so the import specifier is "@novnc/novnc", not "@novnc/novnc/core/rfb".
++ */
++declare module "@novnc/novnc" {
++  export interface RfbOptions {
++    credentials?: Record<string, string>;
++    shared?: boolean;
++    repeaterID?: string;
++    wsProtocols?: string[];
++  }
++
++  export default class RFB extends EventTarget {
++    constructor(target: HTMLElement, url: string, options?: RfbOptions);
++    viewOnly: boolean;
++    scaleViewport: boolean;
++    showDotCursor: boolean;
++    focus(options?: FocusOptions): void;
++    disconnect(): void;
++    sendCtrlAltDel(): void;
++    clipboardPasteFrom(text: string): void;
++  }
++}
+diff --git a/apps/swarmagents/lib/client/useVmDisplay.test.ts b/apps/swarmagents/lib/client/useVmDisplay.test.ts
+new file mode 100644
+index 000000000..5d5425340
+--- /dev/null
++++ b/apps/swarmagents/lib/client/useVmDisplay.test.ts
+@@ -0,0 +1,172 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  VM_DISPLAY_INITIAL_STATE,
++  parseVmDisplayAvailable,
++  vmDisplayCloseMessage,
++  vmDisplayReducer,
++  type VmDisplayState,
++} from "./useVmDisplay";
++
++function reduce(
++  state: VmDisplayState,
++  ...actions: Parameters<typeof vmDisplayReducer>[1][]
++): VmDisplayState {
++  return actions.reduce(vmDisplayReducer, state);
++}
++
++test("starts out checking for a display", () => {
++  assert.equal(VM_DISPLAY_INITIAL_STATE.status, "checking");
++  assert.equal(VM_DISPLAY_INITIAL_STATE.attempt, 0);
++});
++
++test("available moves checking to connecting, attempt reset", () => {
++  const next = vmDisplayReducer(VM_DISPLAY_INITIAL_STATE, { type: "available" });
++  assert.equal(next.status, "connecting");
++  assert.equal(next.attempt, 0);
++});
++
++test("unavailable shows the empty state and re-checks can connect", () => {
++  const unavailable = reduce(VM_DISPLAY_INITIAL_STATE, { type: "unavailable" });
++  assert.equal(unavailable.status, "unavailable");
++  const connected = vmDisplayReducer(unavailable, { type: "available" });
++  assert.equal(connected.status, "connecting");
++});
++
++test("connected carries the desktop name", () => {
++  const next = reduce(
++    VM_DISPLAY_INITIAL_STATE,
++    { type: "available" },
++    { type: "connected", desktopName: "agent-vm-01" },
++  );
++  assert.equal(next.status, "connected");
++  assert.equal(next.desktopName, "agent-vm-01");
++});
++
++test("a dropped connection reconnects with backoff, doubling each time", () => {
++  const connected = reduce(
++    VM_DISPLAY_INITIAL_STATE,
++    { type: "available" },
++    { type: "connected" },
++  );
++  const first = vmDisplayReducer(connected, { type: "disconnected", clean: false });
++  assert.equal(first.status, "reconnecting");
++  assert.equal(first.attempt, 1);
++  assert.equal(first.retryInMs, 500);
++
++  const retrying = vmDisplayReducer(first, { type: "retry" });
++  assert.equal(retrying.status, "connecting");
++  const second = vmDisplayReducer(retrying, { type: "disconnected", clean: false });
++  assert.equal(second.status, "reconnecting");
++  assert.equal(second.attempt, 2);
++  assert.equal(second.retryInMs, 1000);
++
++  // A clean server-side close with no code still reconnects.
++  const clean = vmDisplayReducer(retrying, { type: "disconnected", clean: true });
++  assert.equal(clean.status, "reconnecting");
++});
++
++test("backoff caps at 30s after many drops", () => {
++  let state = reduce(
++    VM_DISPLAY_INITIAL_STATE,
++    { type: "available" },
++    { type: "connected" },
++  );
++  for (let i = 0; i < 10; i++) {
++    state = vmDisplayReducer(state, { type: "disconnected", clean: false });
++    state = vmDisplayReducer(state, { type: "retry" });
++  }
++  state = vmDisplayReducer(state, { type: "disconnected", clean: false });
++  assert.equal(state.status, "reconnecting");
++  assert.equal(state.retryInMs, 30_000);
++});
++
++test("close codes 4401/4404/4503 are terminal errors with friendly messages", () => {
++  const connected = reduce(
++    VM_DISPLAY_INITIAL_STATE,
++    { type: "available" },
++    { type: "connected" },
++  );
++  for (const code of [4401, 4404, 4503] as const) {
++    const next = vmDisplayReducer(connected, { type: "disconnected", clean: false, code });
++    assert.equal(next.status, "error");
++    assert.equal(next.error, vmDisplayCloseMessage(code));
++    assert.ok(next.error && next.error.length > 0);
++  }
++  assert.match(vmDisplayCloseMessage(4401) ?? "", /denied|sign in/i);
++  assert.match(vmDisplayCloseMessage(4404) ?? "", /no live desktop|not.*found/i);
++  assert.match(vmDisplayCloseMessage(4503) ?? "", /busy/i);
++});
++
++test("unknown close codes reconnect instead of failing", () => {
++  const connected = reduce(
++    VM_DISPLAY_INITIAL_STATE,
++    { type: "available" },
++    { type: "connected" },
++  );
++  const next = vmDisplayReducer(connected, {
++    type: "disconnected",
++    clean: false,
++    code: 1006,
++  });
++  assert.equal(next.status, "reconnecting");
++  assert.equal(vmDisplayCloseMessage(1006), undefined);
++  assert.equal(vmDisplayCloseMessage(1000), undefined);
++});
++
++test("retry from an error re-checks availability first", () => {
++  const errored = reduce(
++    VM_DISPLAY_INITIAL_STATE,
++    { type: "available" },
++    { type: "connected" },
++    { type: "disconnected", clean: false, code: 4401 },
++  );
++  assert.equal(errored.status, "error");
++  const checking = vmDisplayReducer(errored, { type: "check" });
++  assert.equal(checking.status, "checking");
++  assert.equal(checking.error, undefined);
++  const connecting = vmDisplayReducer(checking, { type: "available" });
++  assert.equal(connecting.status, "connecting");
++});
++
++test("availability polls never disturb a live session", () => {
++  const connected = reduce(
++    VM_DISPLAY_INITIAL_STATE,
++    { type: "available" },
++    { type: "connected", desktopName: "agent-vm-01" },
++  );
++  // A stray "available" poll while connected is a no-op.
++  assert.equal(vmDisplayReducer(connected, { type: "available" }), connected);
++  // A stray "unavailable" poll while connected is a no-op.
++  assert.equal(vmDisplayReducer(connected, { type: "unavailable" }), connected);
++  // A desktop name arriving before connect is ignored.
++  const early = vmDisplayReducer(VM_DISPLAY_INITIAL_STATE, {
++    type: "desktopName",
++    name: "agent-vm-01",
++  });
++  assert.equal(early.desktopName, undefined);
++});
++
++test("disconnects while already reconnecting or unavailable are ignored", () => {
++  const unavailable = reduce(VM_DISPLAY_INITIAL_STATE, { type: "unavailable" });
++  assert.equal(
++    vmDisplayReducer(unavailable, { type: "disconnected", clean: false }),
++    unavailable,
++  );
++});
++
++test("parseVmDisplayAvailable reads the flag in its known shapes", () => {
++  assert.equal(parseVmDisplayAvailable({ available: true }), true);
++  assert.equal(parseVmDisplayAvailable({ available: false }), false);
++  assert.equal(parseVmDisplayAvailable({ display: true }), true);
++  assert.equal(parseVmDisplayAvailable({ status: "available" }), true);
++  assert.equal(parseVmDisplayAvailable({ status: "ready" }), true);
++  assert.equal(parseVmDisplayAvailable({ status: "running" }), true);
++  assert.equal(parseVmDisplayAvailable({ status: "unavailable" }), false);
++  assert.equal(parseVmDisplayAvailable({ status: "missing" }), false);
++  assert.equal(parseVmDisplayAvailable({ ok: true }), true);
++  assert.equal(parseVmDisplayAvailable({ ok: false }), false);
++  assert.equal(parseVmDisplayAvailable(null), undefined);
++  assert.equal(parseVmDisplayAvailable("yes"), undefined);
++  assert.equal(parseVmDisplayAvailable({ status: "weird" }), undefined);
++});
+diff --git a/apps/swarmagents/lib/client/useVmDisplay.ts b/apps/swarmagents/lib/client/useVmDisplay.ts
+new file mode 100644
+index 000000000..98d8fb38d
+--- /dev/null
++++ b/apps/swarmagents/lib/client/useVmDisplay.ts
+@@ -0,0 +1,475 @@
++"use client";
++
++/**
++ * Live VM desktop display — state machine + noVNC (RFB) hook for the
++ * Screen tab (l4).
++ *
++ * The display proxy (l3) is not on main yet, so this is written against
++ * the specified contract and degrades cleanly until it lands:
++ *
++ *   - GET /api/runtime/vm/display says whether a display exists. A
++ *     non-OK response (404 while l3 is absent) or an explicit
++ *     `available: false` means "Desktop not available on this server"
++ *     and nothing throws.
++ *   - wss://<host>/api/runtime/vm/display/ws carries the RFB session.
++ *     noVNC 1.7's RFB only reports `{ clean }` on its `disconnect`
++ *     event — the WebSocket close code never reaches it — so the hook
++ *     also listens for `close` on the underlying socket (RFB's Websock
++ *     assigns `onclose`, which coexists with `addEventListener`) and
++ *     reads the code on a microtask after the RFB event fires. Close
++ *     codes 4401 / 4404 / 4503 map to friendly terminal errors; anything
++ *     else reconnects with the shared exponential backoff.
++ *
++ * The pure reducer (`vmDisplayReducer`) is the unit-tested state
++ * machine; the hook only wires timers, fetches, and RFB events to it.
++ *
++ * @novnc/novnc ships no TypeScript types (1.7.0). The ambient module
++ * declaration in ./novnc.d.ts types the small RFB surface this hook
++ * uses, verified against node_modules/@novnc/novnc/core/rfb.js. RFB is
++ * loaded with a dynamic `import()` inside the hook so the module (and
++ * the node-based unit tests) never evaluate noVNC on the server.
++ */
++
++import { useEffect, useReducer, useRef, useState, type RefObject } from "react";
++import { backoffDelayMs } from "./backoff";
++
++// @novnc/novnc ships no types; the ambient declaration lives in
++// ./novnc.d.ts. RFB is loaded with a dynamic `import()` inside the
++// hook so the module (and the node-based unit tests) never evaluate
++// noVNC on the server.
++
++/** Minimal structural view of RFB for the hook (and its tests). */
++export interface RfbConnection extends EventTarget {
++  viewOnly: boolean;
++  scaleViewport: boolean;
++  showDotCursor: boolean;
++  focus(options?: FocusOptions): void;
++  disconnect(): void;
++  clipboardPasteFrom(text: string): void;
++}
++
++export const VM_DISPLAY_HTTP_PATH = "/api/runtime/vm/display";
++export const VM_DISPLAY_WS_PATH = "/api/runtime/vm/display/ws";
++
++/** How often an unavailable display re-checks for a live desktop. */
++export const VM_DISPLAY_RECHECK_MS = 30_000;
++
++export type VmDisplayStatus =
++  | "checking"
++  | "unavailable"
++  | "connecting"
++  | "connected"
++  | "reconnecting"
++  | "error";
++
++export interface VmDisplayState {
++  status: VmDisplayStatus;
++  /** Desktop name reported by the VNC server, once connected. */
++  desktopName?: string;
++  /** Friendly error message when status is "error". */
++  error?: string;
++  /** Reconnect attempt count (0 = first connect). */
++  attempt: number;
++  /** ms until the next reconnect attempt, while reconnecting. */
++  retryInMs?: number;
++}
++
++export const VM_DISPLAY_INITIAL_STATE: VmDisplayState = {
++  status: "checking",
++  attempt: 0,
++};
++
++export type VmDisplayAction =
++  | { type: "check" }
++  | { type: "available" }
++  | { type: "unavailable" }
++  | { type: "connected"; desktopName?: string }
++  | { type: "desktopName"; name: string }
++  | { type: "disconnected"; clean: boolean; code?: number }
++  | { type: "retry" }
++  | { type: "failed"; message: string };
++
++/**
++ * Map a display-proxy WebSocket close code to a friendly terminal error.
++ * Returns undefined for codes that should reconnect instead of failing.
++ */
++export function vmDisplayCloseMessage(code: number): string | undefined {
++  switch (code) {
++    case 4401:
++      return "Access denied — this screen needs a signed-in session. Reload the page to sign in again.";
++    case 4404:
++      return "No live desktop was found on this server — the VM may not have started yet.";
++    case 4503:
++      return "The desktop service is busy right now. Try again in a moment.";
++    default:
++      return undefined;
++  }
++}
++
++/**
++ * Pure state machine for the display connection.
++ *
++ *  checking -> available -> connecting -> connected
++ *  checking -> unavailable (polls until a display appears)
++ *  connecting/connected -> disconnected -> reconnecting -> retry -> connecting
++ *  disconnected with a 4401/4404/4503 close code -> error (terminal)
++ *  error/unavailable -> check -> checking (manual retry)
++ *
++ * Availability polls never disturb a live session: `available` and
++ * `unavailable` are no-ops unless the machine is checking, unavailable,
++ * or in a terminal error.
++ */
++export function vmDisplayReducer(
++  state: VmDisplayState,
++  action: VmDisplayAction,
++): VmDisplayState {
++  switch (action.type) {
++    case "check":
++      return { ...state, status: "checking", error: undefined, retryInMs: undefined };
++    case "available":
++      if (
++        state.status === "checking" ||
++        state.status === "unavailable" ||
++        state.status === "error"
++      ) {
++        return {
++          ...state,
++          status: "connecting",
++          attempt: 0,
++          error: undefined,
++          retryInMs: undefined,
++        };
++      }
++      return state;
++    case "unavailable":
++      if (state.status === "checking") {
++        return { ...state, status: "unavailable", error: undefined, retryInMs: undefined };
++      }
++      return state;
++    case "connected":
++      return {
++        ...state,
++        status: "connected",
++        desktopName: action.desktopName ?? state.desktopName,
++        error: undefined,
++        retryInMs: undefined,
++      };
++    case "desktopName":
++      return state.status === "connected" ? { ...state, desktopName: action.name } : state;
++    case "disconnected": {
++      // Terminal close codes (auth / not-found / overloaded) fail
++      // outright instead of reconnecting forever.
++      const message =
++        action.code !== undefined ? vmDisplayCloseMessage(action.code) : undefined;
++      if (message !== undefined) {
++        return { ...state, status: "error", error: message, retryInMs: undefined };
++      }
++      if (state.status === "connected" || state.status === "connecting") {
++        const attempt = state.attempt + 1;
++        return {
++          ...state,
++          status: "reconnecting",
++          attempt,
++          retryInMs: backoffDelayMs(attempt - 1),
++        };
++      }
++      return state;
++    }
++    case "retry":
++      return { ...state, status: "connecting", error: undefined, retryInMs: undefined };
++    case "failed":
++      return { ...state, status: "error", error: action.message, retryInMs: undefined };
++  }
++}
++
++/** Read the availability flag out of a GET /api/runtime/vm/display body. */
++export function parseVmDisplayAvailable(data: unknown): boolean | undefined {
++  if (typeof data !== "object" || data === null) return undefined;
++  const d = data as Record<string, unknown>;
++  if (typeof d.available === "boolean") return d.available;
++  if (typeof d.display === "boolean") return d.display;
++  if (typeof d.status === "string") {
++    if (d.status === "available" || d.status === "ready" || d.status === "running") return true;
++    if (
++      d.status === "unavailable" ||
++      d.status === "missing" ||
++      d.status === "stopped" ||
++      d.status === "disabled"
++    ) {
++      return false;
++    }
++    return undefined;
++  }
++  if (typeof d.ok === "boolean") return d.ok;
++  return undefined;
++}
++
++/**
++ * Ask the server whether a live desktop exists. Any failure — non-OK
++ * status (the 404 while l3 is absent), unparseable body, network error —
++ * means "no display", never a throw.
++ */
++export async function checkVmDisplayAvailable(signal?: AbortSignal): Promise<boolean> {
++  try {
++    const res = await fetch(VM_DISPLAY_HTTP_PATH, { signal });
++    if (!res.ok) return false;
++    const data = await res.json().catch(() => null);
++    // A 200 with an unrecognised shape: try the WS and let it decide.
++    return parseVmDisplayAvailable(data) ?? true;
++  } catch {
++    return false;
++  }
++}
++
++/** wss://<host>/api/runtime/vm/display/ws (ws: on plain http). */
++export function vmDisplayWsUrl(): string {
++  const { protocol, host } = window.location;
++  return `${protocol === "https:" ? "wss:" : "ws:"}//${host}${VM_DISPLAY_WS_PATH}`;
++}
++
++/**
++ * Lightweight availability probe for callers that only need to know
++ * whether a display exists (e.g. App picking the default tab). Re-checks
++ * every VM_DISPLAY_RECHECK_MS so a display that appears later is seen.
++ */
++export function useVmDisplayAvailable(enabled = true): boolean {
++  const [available, setAvailable] = useState(false);
++
++  useEffect(() => {
++    if (!enabled) return;
++    let cancelled = false;
++    const load = async () => {
++      const ok = await checkVmDisplayAvailable();
++      if (!cancelled) setAvailable(ok);
++    };
++    void load();
++    const id = setInterval(() => void load(), VM_DISPLAY_RECHECK_MS);
++    return () => {
++      cancelled = true;
++      clearInterval(id);
++    };
++  }, [enabled]);
++
++  return available;
++}
++
++/**
++ * Reach the native WebSocket behind an RFB instance. noVNC's Websock
++ * keeps it at `_sock._websocket`; this is a private field, so anything
++ * missing just means no close-code capture (the hook still reconnects
++ * on RFB's own `disconnect` event).
++ */
++function nativeSocketOf(rfb: RfbConnection): WebSocket | undefined {
++  const sock = (rfb as unknown as { _sock?: { _websocket?: unknown } })._sock;
++  const ws = sock?._websocket;
++  return ws instanceof WebSocket ? ws : undefined;
++}
++
++export interface UseVmDisplayOptions {
++  /** Set false to keep the hook idle (e.g. the tab is not mounted). */
++  enabled?: boolean;
++}
++
++export interface UseVmDisplay {
++  state: VmDisplayState;
++  /** True once GET /api/runtime/vm/display has said a display exists. */
++  available: boolean;
++  /** True while the user holds mouse+keyboard control of the VM. */
++  hasControl: boolean;
++  /** Attach the noVNC canvas here. */
++  targetRef: RefObject<HTMLDivElement | null>;
++  /** Switch the session from view-only to interactive. */
++  takeControl(): void;
++  /** Give the desktop back to view-only mode. */
++  giveBack(): void;
++  /** Paste text into the VM's clipboard (needs control). */
++  pasteClipboard(text: string): void;
++  /** Re-check availability and reconnect (from error / unavailable). */
++  retry(): void;
++}
++
++export function useVmDisplay(options: UseVmDisplayOptions = {}): UseVmDisplay {
++  const { enabled = true } = options;
++  const [state, dispatch] = useReducer(vmDisplayReducer, VM_DISPLAY_INITIAL_STATE);
++  const [hasControl, setHasControl] = useState(false);
++  const targetRef = useRef<HTMLDivElement | null>(null);
++  const rfbRef = useRef<RfbConnection | null>(null);
++  const closeCodeRef = useRef<number | undefined>(undefined);
++
++  // Availability: poll while checking/unavailable only — never while a
++  // live session is up, so a flaky poll can't tear the desktop down.
++  useEffect(() => {
++    if (!enabled) return;
++    if (state.status !== "checking" && state.status !== "unavailable") return;
++    let cancelled = false;
++    const load = async () => {
++      const ok = await checkVmDisplayAvailable();
++      if (cancelled) return;
++      dispatch(ok ? { type: "available" } : { type: "unavailable" });
++    };
++    void load();
++    const id = setInterval(() => void load(), VM_DISPLAY_RECHECK_MS);
++    return () => {
++      cancelled = true;
++      clearInterval(id);
++    };
++  }, [enabled, state.status]);
++
++  // A new RFB session starts each time the machine enters "connecting".
++  // `session` is the stable key: status flips to "connected" must NOT
++  // tear the session down, so the effect keys on this, not the status.
++  const [session, setSession] = useState(0);
++  const prevStatusRef = useRef(state.status);
++  useEffect(() => {
++    if (state.status === "connecting" && prevStatusRef.current !== "connecting") {
++      setSession((s) => s + 1);
++    }
++    prevStatusRef.current = state.status;
++  }, [state.status]);
++
++  // Losing control follows the session, not the button: any disconnect
++  // drops back to view-only.
++  useEffect(() => {
++    if (state.status !== "connected") setHasControl(false);
++  }, [state.status]);
++
++  useEffect(() => {
++    if (!enabled || session === 0) return;
++    const target = targetRef.current;
++    if (!target) {
++      dispatch({ type: "failed", message: "The screen area isn't mounted yet." });
++      return;
++    }
++
++    let disposed = false;
++    let rfb: RfbConnection | null = null;
++    let socket: WebSocket | undefined;
++    let onNativeClose: ((e: CloseEvent) => void) | undefined;
++
++    const onConnect = () => {
++      if (!disposed) dispatch({ type: "connected" });
++    };
++    const onDesktopName = (e: Event) => {
++      const name = (e as CustomEvent<{ name?: unknown }>).detail?.name;
++      if (!disposed && typeof name === "string") dispatch({ type: "desktopName", name });
++    };
++    const onDisconnect = (e: Event) => {
++      const clean = (e as CustomEvent<{ clean?: unknown }>).detail?.clean === true;
++      // The native socket's `close` listener runs after RFB's own
++      // `onclose` handler in the same dispatch, so read the recorded
++      // code on a microtask — after the whole close event has fired.
++      queueMicrotask(() => {
++        if (disposed) return;
++        dispatch({ type: "disconnected", clean, code: closeCodeRef.current });
++        closeCodeRef.current = undefined;
++      });
++    };
++    const onSecurityFailure = (e: Event) => {
++      const detail = (e as CustomEvent<{ status?: unknown; reason?: unknown }>).detail;
++      const reason =
++        typeof detail?.reason === "string" ? detail.reason : "The desktop refused the connection.";
++      if (!disposed) dispatch({ type: "failed", message: reason });
++    };
++
++    const boot = async () => {
++      let RFB: new (
++        target: HTMLElement,
++        url: string,
++        options?: { shared?: boolean },
++      ) => RfbConnection;
++      try {
++        ({ default: RFB } = await import("@novnc/novnc"));
++      } catch {
++        if (!disposed) {
++          dispatch({ type: "failed", message: "Could not load the screen viewer." });
++        }
++        return;
++      }
++      if (disposed) return;
++      const instance = new RFB(target, vmDisplayWsUrl(), { shared: true });
++      instance.viewOnly = true;
++      instance.scaleViewport = true;
++      instance.showDotCursor = true;
++      rfb = instance;
++      rfbRef.current = instance;
++
++      // Capture the proxy's close code (4401/4404/4503) before RFB
++      // swallows it: Websock assigns `onclose`, so an added listener
++      // coexists with it.
++      socket = nativeSocketOf(instance);
++      if (socket) {
++        onNativeClose = (e: CloseEvent) => {
++          closeCodeRef.current = e.code;
++        };
++        socket.addEventListener("close", onNativeClose, { once: true });
++      }
++
++      instance.addEventListener("connect", onConnect);
++      instance.addEventListener("desktopname", onDesktopName);
++      instance.addEventListener("disconnect", onDisconnect);
++      instance.addEventListener("securityfailure", onSecurityFailure);
++    };
++    void boot();
++
++    return () => {
++      disposed = true;
++      if (socket && onNativeClose) socket.removeEventListener("close", onNativeClose);
++      if (rfb) {
++        rfb.removeEventListener("connect", onConnect);
++        rfb.removeEventListener("desktopname", onDesktopName);
++        rfb.removeEventListener("disconnect", onDisconnect);
++        rfb.removeEventListener("securityfailure", onSecurityFailure);
++        try {
++          rfb.disconnect();
++        } catch {
++          /* already disconnected */
++        }
++      }
++      if (rfbRef.current === rfb) rfbRef.current = null;
++    };
++  }, [enabled, session]);
++
++  // Reconnect timer: each drop waits backoffDelayMs(attempt) before the
++  // machine goes back to "connecting" and a fresh session starts.
++  useEffect(() => {
++    if (state.status !== "reconnecting" || state.retryInMs === undefined) return;
++    const id = setTimeout(() => dispatch({ type: "retry" }), state.retryInMs);
++    return () => clearTimeout(id);
++  }, [state.status, state.retryInMs]);
++
++  const takeControl = () => {
++    const rfb = rfbRef.current;
++    if (!rfb || state.status !== "connected") return;
++    rfb.viewOnly = false;
++    rfb.focus({ preventScroll: true });
++    setHasControl(true);
++  };
++
++  const giveBack = () => {
++    const rfb = rfbRef.current;
++    if (rfb) rfb.viewOnly = true;
++    setHasControl(false);
++  };
++
++  const pasteClipboard = (text: string) => {
++    if (!text) return;
++    rfbRef.current?.clipboardPasteFrom(text);
++  };
++
++  const retry = () => {
++    dispatch({ type: "check" });
++  };
++
++  return {
++    state,
++    // Past the availability check (connecting onward, including a
++    // terminal error) means a display exists; checking/unavailable does not.
++    available: state.status !== "checking" && state.status !== "unavailable",
++    hasControl,
++    targetRef,
++    takeControl,
++    giveBack,
++    pasteClipboard,
++    retry,
++  };
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index ac0d97a91..4cad71190 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -27,6 +27,7 @@ import { ThreadPanel } from './components/ThreadPanel';
+ import { useToasts } from './components/Toasts';
+ import { describeFailure } from '../../lib/ui/toasts';
+ import { uploadAttachments } from '../../lib/client/upload';
++import { useVmDisplayAvailable } from '../../lib/client/useVmDisplay';
+ import { mapKeyToAction } from './utils/keymap';
+ 
+ export default function App() {
+@@ -62,7 +63,7 @@ export default function App() {
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [cardMigrated]);
+   const navRef = useRef<HTMLDivElement>(null);
+-  const [activeView, setActiveView] = useState<'terminal' | 'browser' | 'files'>('terminal');
++  const [activeView, setActiveView] = useState<'terminal' | 'browser' | 'files' | 'screen'>('terminal');
+   const [telemetryOpen, setTelemetryOpen] = useState(false);
+   const [vmResetting, setVmResetting] = useState(false);
+   const [showLanding, setShowLanding] = useState(true);
+@@ -152,18 +153,33 @@ export default function App() {
+ 
+   /** Route view switches: the legacy 'telemetry' view is now the activity
+    *  strip's expandable Telemetry drawer, so it opens the drawer instead of
+-   *  changing the computer screen's inner view. */
++   *  changing the computer screen's inner view. Any explicit view switch
++   *  marks the view as user-chosen, which stops the display-available
++   *  auto-default below from overriding it. */
++  const viewChosenRef = useRef(false);
+   const handleToggleView = useCallback(
+-    (view: 'telemetry' | 'terminal' | 'browser' | 'files') => {
++    (view: 'telemetry' | 'terminal' | 'browser' | 'files' | 'screen') => {
+       if (view === 'telemetry') {
+         setTelemetryOpen(true);
+         return;
+       }
++      viewChosenRef.current = true;
+       setActiveView(view);
+     },
+     [],
+   );
+ 
++  // Screen is the default tab once a live desktop exists (l4): the
++  // display probe runs independently of the Screen tab, so this flips
++  // over as soon as the server reports a display — but only if the user
++  // hasn't picked a view themselves.
++  const displayAvailable = useVmDisplayAvailable();
++  useEffect(() => {
++    if (displayAvailable && !viewChosenRef.current) {
++      setActiveView('screen');
++    }
++  }, [displayAvailable]);
++
+   const handleResetVm = async () => {
+     if (!confirm('Wipe and reset the Linux cloud computer? This clears all scratch processes and restores a clean environment.')) return;
+     setVmResetting(true);
+@@ -386,11 +402,19 @@ export default function App() {
+     ctrlRef.current?.abort();
+   }, [runId, activeAgent.uid]);
+ 
+-  // Workspace keyboard shortcuts: Cmd/Ctrl+K focuses the input, Cmd/Ctrl+1..4
+-  // switch views, ? opens the help overlay, Esc closes it. Bare keys are
++  // Workspace keyboard shortcuts: Cmd/Ctrl+K focuses the input, Cmd/Ctrl+1..3
++  // switch views, Cmd/Ctrl+4 opens telemetry, Cmd/Ctrl+5 switches to the
++  // live Screen tab, ? opens the help overlay, Esc closes it. Bare keys are
+   // ignored while typing so they never hijack text entry (see utils/keymap).
++  // Cmd/Ctrl+5 lives here, not in the keymap: the keymap's view digits are
++  // 1..3 with 4 reserved for telemetry, and the Screen tab is the fifth view.
+   useEffect(() => {
+     const onKeyDown = (e: KeyboardEvent) => {
++      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key === '5') {
++        e.preventDefault();
++        handleToggleView('screen');
++        return;
++      }
+       const el = e.target as HTMLElement | null;
+       const isTyping =
+         !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+@@ -637,7 +661,7 @@ export default function App() {
+               logs={logs}
+               runId={runId}
+               activeView={activeView}
+-              onToggleView={setActiveView}
++              onToggleView={handleToggleView}
+               onResetVm={handleResetVm}
+               vmResetting={vmResetting}
+               activeRoleName={activeRolePreset.name}
+@@ -769,6 +793,12 @@ export default function App() {
+                   ⌘4
+                 </kbd>
+               </li>
++              <li className="flex items-center justify-between gap-4">
++                <span className="text-white/70">Screen view</span>
++                <kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[11px] text-white/80">
++                  ⌘5
++                </kbd>
++              </li>
+             </ul>
+             <p className="mt-4 border-t border-white/10 pt-3 text-xs text-white/45">
+               Press <kbd className="rounded bg-white/10 px-1 py-0.5 font-mono text-[11px] text-white/70">?</kbd>{' '}
+@@ -778,7 +808,7 @@ export default function App() {
+           </div>
+         </div>
+       )}
+-      <MobileTabBar activeView={activeView} onToggleView={setActiveView} />
++      <MobileTabBar activeView={activeView} onToggleView={handleToggleView} />
+     </div>
+   );
+ }
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index 226065229..75b042da5 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import React, { useCallback, useEffect, useRef, useState } from "react";
+-import { Terminal, Globe, ShieldCheck, FileText } from "lucide-react";
++import { Terminal, Globe, ShieldCheck, FileText, Monitor } from "lucide-react";
+ import type { LogEvent } from "../engine";
+ import { AnsiRenderer } from "../../../components/AnsiRenderer";
+ import { getRunStreamBadge, useRunStream, type RunStreamBadgeTone, type RunStreamItem } from "../../../lib/client/useRunStream";
+@@ -22,6 +22,7 @@ import {
+ import { ApprovalGate } from "./ApprovalGate";
+ import { FilesView } from "./FilesView";
+ import { BrowserView } from "./BrowserView";
++import { ScreenView } from "./ScreenView";
+ 
+ interface ComputerScreenProps {
+   logs: LogEvent[];
+@@ -31,8 +32,8 @@ interface ComputerScreenProps {
+    * current simulated terminal output.
+    */
+   runId?: string;
+-  activeView: "terminal" | "browser" | "files";
+-  onToggleView: (view: "terminal" | "browser" | "files") => void;
++  activeView: "terminal" | "browser" | "files" | "screen";
++  onToggleView: (view: "terminal" | "browser" | "files" | "screen") => void;
+   onResetVm: () => void;
+   vmResetting: boolean;
+   activeRoleName: string;
+@@ -46,6 +47,7 @@ const VIEW_TABS = [
+   { view: "terminal", label: "Terminal", Icon: Terminal },
+   { view: "browser", label: "Browser", Icon: Globe },
+   { view: "files", label: "Files", Icon: FileText },
++  { view: "screen", label: "Screen", Icon: Monitor },
+ ] as const;
+ 
+ const VM_STATUS_STYLES: Record<
+@@ -657,6 +659,8 @@ export function ComputerScreen({
+         )}
+ 
+         {activeView === "files" && <FilesView refreshToken={filesRefreshToken} />}
++
++        {activeView === "screen" && <ScreenView />}
+       </div>
+     </div>
+   );
+diff --git a/apps/swarmagents/minimalist-ui/src/components/MobileTabBar.tsx b/apps/swarmagents/minimalist-ui/src/components/MobileTabBar.tsx
+index 5018e4857..9482225e0 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/MobileTabBar.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/MobileTabBar.tsx
+@@ -1,18 +1,19 @@
+ "use client";
+ 
+-import { Terminal, Globe, FileText, type LucideIcon } from "lucide-react";
++import { Terminal, Globe, FileText, Monitor, type LucideIcon } from "lucide-react";
+ 
+-export type ViewId = "terminal" | "browser" | "files";
++export type ViewId = "terminal" | "browser" | "files" | "screen";
+ 
+ const TABS: { id: ViewId; label: string; icon: LucideIcon }[] = [
+   { id: "terminal", label: "Terminal", icon: Terminal },
+   { id: "browser", label: "Browser", icon: Globe },
+   { id: "files", label: "Files", icon: FileText },
++  { id: "screen", label: "Screen", icon: Monitor },
+ ];
+ 
+ /**
+  * Mobile-only bottom tab bar for switching the computer screen's inner view
+- * (terminal / browser / files). Telemetry no longer lives here: it is reached
++ * (terminal / browser / files / screen). Telemetry no longer lives here: it is reached
+  * from the activity strip above the input bar. Hidden at the `sm` breakpoint
+  * (>= 640px) where the in-window tabs are used instead.
+  */
+diff --git a/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx b/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
+index 9172de41b..be5b815d5 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
+@@ -14,8 +14,8 @@ interface RoleAndVmBarProps {
+   onOpenSettings: () => void;
+   onResetVm: () => void;
+   vmResetting: boolean;
+-  onToggleView: (view: "telemetry" | "terminal" | "browser" | "files") => void;
+-  activeView: "telemetry" | "terminal" | "browser" | "files";
++  onToggleView: (view: "telemetry" | "terminal" | "browser" | "files" | "screen") => void;
++  activeView: "telemetry" | "terminal" | "browser" | "files" | "screen";
+   /** The user's agent card text (used for the compact "Agent" strip preview). */
+   agentCard: string;
+   /** Open the full Agent Card dialog. */
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ScreenView.tsx b/apps/swarmagents/minimalist-ui/src/components/ScreenView.tsx
+new file mode 100644
+index 000000000..200cdd88f
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/ScreenView.tsx
+@@ -0,0 +1,264 @@
++"use client";
++
++/**
++ * ScreenView — the live noVNC view of the VM desktop (l4).
++ *
++ * Connects RFB to wss://<host>/api/runtime/vm/display/ws through
++ * `useVmDisplay` and renders the remote framebuffer scaled to fit
++ * while keeping its aspect ratio (`scaleViewport`).
++ *
++ * View-only by default ("Watching" pill). "Take control" hands the
++ * mouse+keyboard to the user with an amber "You have control" bar and
++ * a "Give back" button that returns to view-only. A clipboard paste
++ * button sends the system clipboard into the VM (control only), and a
++ * fullscreen button expands the viewport.
++ *
++ * States: connecting shows a skeleton + "Waking your computer…";
++ * reconnecting shows the retry countdown; an unavailable display
++ * (fake driver / l3 not on main yet) shows the empty state and nothing
++ * throws; terminal close codes surface their friendly message with a
++ * "Try again" button.
++ */
++
++import { useEffect, useRef, useState } from "react";
++import {
++  ClipboardPaste,
++  Eye,
++  Maximize,
++  Minimize,
++  Monitor,
++  MousePointer2,
++  RotateCcw,
++  TriangleAlert,
++} from "lucide-react";
++import { useVmDisplay } from "../../../lib/client/useVmDisplay";
++
++export function ScreenView() {
++  const display = useVmDisplay();
++  const { state } = display;
++  const wrapRef = useRef<HTMLDivElement | null>(null);
++  const [isFullscreen, setIsFullscreen] = useState(false);
++  const [pasteError, setPasteError] = useState<string | undefined>(undefined);
++  const [pasteBusy, setPasteBusy] = useState(false);
++
++  useEffect(() => {
++    const onChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
++    document.addEventListener("fullscreenchange", onChange);
++    return () => document.removeEventListener("fullscreenchange", onChange);
++  }, []);
++
++  const toggleFullscreen = async () => {
++    const el = wrapRef.current;
++    if (!el) return;
++    try {
++      if (document.fullscreenElement) {
++        await document.exitFullscreen();
++      } else {
++        await el.requestFullscreen();
++      }
++    } catch {
++      // Fullscreen can be refused (iframe permissions, headless test
++      // envs) — the inline view keeps working, so stay silent.
++    }
++  };
++
++  const pasteFromClipboard = async () => {
++    if (!display.hasControl || pasteBusy) return;
++    setPasteBusy(true);
++    setPasteError(undefined);
++    try {
++      const text = await navigator.clipboard.readText();
++      if (!text) {
++        setPasteError("Clipboard is empty.");
++        return;
++      }
++      display.pasteClipboard(text);
++    } catch {
++      setPasteError("Couldn't read the clipboard — allow clipboard access and try again.");
++    } finally {
++      setPasteBusy(false);
++    }
++  };
++
++  const connected = state.status === "connected";
++  const retryInSeconds =
++    state.status === "reconnecting" && state.retryInMs !== undefined
++      ? Math.max(1, Math.ceil(state.retryInMs / 1000))
++      : undefined;
++
++  return (
++    <div ref={wrapRef} className="flex min-h-0 flex-1 flex-col bg-[#08080c]">
++      {/* Status bar: mode pill on the left, controls on the right. */}
++      <div className="flex items-center justify-between gap-2 border-b border-white/10 bg-[#0a0a10] px-3 py-2">
++        <div className="flex min-w-0 items-center gap-2">
++          {connected && !display.hasControl && (
++            <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wide text-emerald-300">
++              <Eye className="h-3 w-3" /> Watching
++              {state.desktopName ? (
++                <span className="normal-case tracking-normal text-emerald-300/70">
++                  · {state.desktopName}
++                </span>
++              ) : null}
++            </span>
++          )}
++          {connected && display.hasControl && (
++            <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-400/40 bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wide text-amber-300">
++              <MousePointer2 className="h-3 w-3" /> You have control
++            </span>
++          )}
++          {state.status === "connecting" && (
++            <span className="inline-flex items-center gap-1.5 rounded-full border border-sky-400/30 bg-sky-500/15 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wide text-sky-300">
++              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
++              Connecting
++            </span>
++          )}
++          {state.status === "reconnecting" && (
++            <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-400/30 bg-amber-500/15 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wide text-amber-300">
++              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
++              Reconnecting{retryInSeconds ? ` in ${retryInSeconds}s` : "…"}
++            </span>
++          )}
++          {state.status === "checking" && (
++            <span className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wide text-white/50">
++              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white/50" />
++              Checking display
++            </span>
++          )}
++          {state.status === "unavailable" && (
++            <span className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wide text-white/50">
++              <Monitor className="h-3 w-3" /> No desktop
++            </span>
++          )}
++          {state.status === "error" && (
++            <span className="inline-flex items-center gap-1.5 rounded-full border border-rose-400/30 bg-rose-500/15 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wide text-rose-300">
++              <TriangleAlert className="h-3 w-3" /> Screen error
++            </span>
++          )}
++        </div>
++
++        <div className="flex shrink-0 items-center gap-1.5">
++          {connected && !display.hasControl && (
++            <button
++              type="button"
++              onClick={display.takeControl}
++              className="inline-flex items-center gap-1.5 rounded-full border border-amber-400/40 bg-amber-500/15 px-2.5 py-1 text-[11px] font-mono text-amber-300 transition-colors hover:bg-amber-500/25"
++            >
++              <MousePointer2 className="h-3 w-3" /> Take control
++            </button>
++          )}
++          {connected && display.hasControl && (
++            <button
++              type="button"
++              onClick={display.giveBack}
++              className="inline-flex items-center gap-1.5 rounded-full border border-white/20 bg-white/10 px-2.5 py-1 text-[11px] font-mono text-white/80 transition-colors hover:bg-white/15"
++            >
++              Give back
++            </button>
++          )}
++          <button
++            type="button"
++            onClick={() => void pasteFromClipboard()}
++            disabled={!connected || !display.hasControl || pasteBusy}
++            title={display.hasControl ? "Paste clipboard into the VM" : "Take control to paste"}
++            aria-label="Paste clipboard into the VM"
++            className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] font-mono text-white/70 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
++          >
++            <ClipboardPaste className="h-3 w-3" /> Paste
++          </button>
++          <button
++            type="button"
++            onClick={() => void toggleFullscreen()}
++            aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen screen"}
++            title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
++            className="inline-flex items-center rounded-full border border-white/15 bg-white/5 p-1.5 text-white/70 transition-colors hover:bg-white/10"
++          >
++            {isFullscreen ? <Minimize className="h-3.5 w-3.5" /> : <Maximize className="h-3.5 w-3.5" />}
++          </button>
++        </div>
++      </div>
++
++      {/* Control banner: what "You have control" means, and how to end it. */}
++      {connected && display.hasControl && (
++        <div className="flex items-center justify-between gap-2 border-b border-amber-400/25 bg-amber-500/10 px-3 py-1.5 text-[11px] font-mono text-amber-200/90">
++          <span>Your mouse and keyboard are driving the VM — clicks and keys go to the desktop.</span>
++          <button
++            type="button"
++            onClick={display.giveBack}
++            className="shrink-0 rounded-full border border-amber-400/40 px-2 py-0.5 text-[10px] uppercase tracking-wide text-amber-300 hover:bg-amber-500/20"
++          >
++            Give back
++          </button>
++        </div>
++      )}
++
++      {/* Viewport: noVNC mounts its canvas here and scales it to fit. */}
++      <div className="relative min-h-0 flex-1 bg-black">
++        <div ref={display.targetRef} className="absolute inset-0 overflow-hidden [&_canvas]:block" />
++
++        {/* Connecting / checking skeleton over the (empty) viewport. */}
++        {(state.status === "connecting" || state.status === "checking") && (
++          <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-3 bg-[#08080c]">
++            <div className="h-24 w-3/4 animate-pulse rounded-xl bg-white/5" />
++            <div className="h-3 w-1/2 animate-pulse rounded bg-white/5" />
++            <div className="mt-1 flex items-center gap-2 text-xs font-mono text-white/50">
++              <span className="h-2 w-2 animate-pulse rounded-full bg-sky-400" />
++              {state.status === "connecting" ? "Waking your computer…" : "Checking for a live desktop…"}
++            </div>
++          </div>
++        )}
++
++        {/* Reconnecting: keep the last frame visible underneath, if any. */}
++        {state.status === "reconnecting" && (
++          <div className="absolute inset-x-0 bottom-0 flex items-center justify-center gap-2 bg-black/70 px-3 py-2 text-[11px] font-mono text-amber-200/90">
++            <RotateCcw className="h-3 w-3 animate-spin" />
++            Connection lost — retrying{retryInSeconds ? ` in ${retryInSeconds}s` : ""}…
++            <button
++              type="button"
++              onClick={display.retry}
++              className="rounded-full border border-amber-400/40 px-2 py-0.5 text-[10px] uppercase tracking-wide text-amber-300 hover:bg-amber-500/20"
++            >
++              Retry now
++            </button>
++          </div>
++        )}
++
++        {/* Unavailable: the fake-driver / no-l3-yet empty state. */}
++        {state.status === "unavailable" && (
++          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 py-10 text-center">
++            <Monitor className="h-5 w-5 text-white/25" />
++            <div className="text-xs font-medium text-white/50">Desktop not available on this server</div>
++            <div className="max-w-xs text-[11px] leading-relaxed text-white/30">
++              This server doesn&apos;t expose a live desktop — for example, the
++              simulated driver has no real VM to show. The Terminal tab still
++              works.
++            </div>
++          </div>
++        )}
++
++        {/* Terminal error (4401 / 4404 / 4503 / load failure). */}
++        {state.status === "error" && (
++          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 py-10 text-center">
++            <TriangleAlert className="h-5 w-5 text-rose-400/70" />
++            <div className="text-xs font-medium text-white/70">Couldn&apos;t show the desktop</div>
++            <div className="max-w-xs text-[11px] leading-relaxed text-white/40">
++              {state.error ?? "The screen connection failed."}
++            </div>
++            <button
++              type="button"
++              onClick={display.retry}
++              className="mt-1 inline-flex items-center gap-1.5 rounded-full border border-white/20 bg-white/10 px-3 py-1 text-[11px] font-mono text-white/80 transition-colors hover:bg-white/15"
++            >
++              <RotateCcw className="h-3 w-3" /> Try again
++            </button>
++          </div>
++        )}
++      </div>
++
++      {pasteError && (
++        <div className="border-t border-amber-500/20 bg-amber-500/10 px-3 py-1.5 font-mono text-[11px] text-amber-200/90">
++          {pasteError}
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/package-lock.json b/apps/swarmagents/package-lock.json
+index 9709713ed..ef19f808b 100644
+--- a/apps/swarmagents/package-lock.json
++++ b/apps/swarmagents/package-lock.json
+@@ -10,6 +10,7 @@
+       "dependencies": {
+         "@anthropic-ai/sdk": "^0.130.0",
+         "@modelcontextprotocol/sdk": "^1.31.0",
++        "@novnc/novnc": "^1.7.0",
+         "@shikijs/rehype": "^4.5.0",
+         "clsx": "^2.1.1",
+         "lucide-react": "^1.72.0",
+@@ -1266,6 +1267,12 @@
+         "node": ">= 10"
+       }
+     },
++    "node_modules/@novnc/novnc": {
++      "version": "1.7.0",
++      "resolved": "https://registry.npmjs.org/@novnc/novnc/-/novnc-1.7.0.tgz",
++      "integrity": "sha512-ucEJOx4T2avIRCleodk7YobZj5O2Ga2AeLfQ69A/yjG9HHba2+PDgwSkN3FttrmG+70ZGx21sElNFouK13RzyA==",
++      "license": "MPL-2.0"
++    },
+     "node_modules/@shikijs/core": {
+       "version": "4.5.0",
+       "resolved": "https://registry.npmjs.org/@shikijs/core/-/core-4.5.0.tgz",
+@@ -1531,9 +1538,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1551,9 +1555,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1571,9 +1572,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1591,9 +1589,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -3048,9 +3043,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -3072,9 +3064,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -3096,9 +3085,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -3120,9 +3106,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+diff --git a/apps/swarmagents/package.json b/apps/swarmagents/package.json
+index 9d9101219..f280e2623 100644
+--- a/apps/swarmagents/package.json
++++ b/apps/swarmagents/package.json
+@@ -28,6 +28,7 @@
+   "dependencies": {
+     "@anthropic-ai/sdk": "^0.130.0",
+     "@modelcontextprotocol/sdk": "^1.31.0",
++    "@novnc/novnc": "^1.7.0",
+     "@shikijs/rehype": "^4.5.0",
+     "clsx": "^2.1.1",
+     "lucide-react": "^1.72.0",
+-- 
+2.55.0
+

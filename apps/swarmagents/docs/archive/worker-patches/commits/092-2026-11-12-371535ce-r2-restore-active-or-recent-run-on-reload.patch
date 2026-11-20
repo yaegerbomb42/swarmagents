@@ -1,0 +1,209 @@
+From 371535ceac4d28808782494723a54dea4197854f Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 15:46:31 -0600
+Subject: [PATCH] r2: restore active or recent run on reload
+
+On load, reattach to the current thread's active run or most recent run so terminal/activity/thread rebuild to true state instead of staying stuck after reload.
+
+Co-authored-by: Nova-7 <nova-7@swarmagents.codes>
+---
+ .../swarmagents/lib/client/restoreRun.test.ts | 48 +++++++++++++++++
+ apps/swarmagents/lib/client/restoreRun.ts     | 51 ++++++++++++++++++
+ apps/swarmagents/minimalist-ui/src/App.tsx    | 54 +++++++++++++++++++
+ 3 files changed, 153 insertions(+)
+ create mode 100644 apps/swarmagents/lib/client/restoreRun.test.ts
+ create mode 100644 apps/swarmagents/lib/client/restoreRun.ts
+
+diff --git a/apps/swarmagents/lib/client/restoreRun.test.ts b/apps/swarmagents/lib/client/restoreRun.test.ts
+new file mode 100644
+index 000000000..372b82dcd
+--- /dev/null
++++ b/apps/swarmagents/lib/client/restoreRun.test.ts
+@@ -0,0 +1,48 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { pickRunToRestore } from "./restoreRun";
++
++test("reconnect-while-running: prefers an active running run over newer finished runs", () => {
++  const selected = pickRunToRestore([
++    { runId: "run_done", status: "finished", prompt: "done", createdAt: 3000 },
++    { runId: "run_live", status: "running", prompt: "still going", createdAt: 2000 },
++    { runId: "run_old", status: "finished", prompt: "old", createdAt: 1000 },
++  ]);
++
++  assert.deepEqual(selected, {
++    runId: "run_live",
++    prompt: "still going",
++    createdAt: 2000,
++    active: true,
++  });
++});
++
++test("reconnect-while-running: treats queued as active", () => {
++  const selected = pickRunToRestore([
++    { runId: "run_q", status: "queued", prompt: "waiting", createdAt: 5000 },
++    { runId: "run_done", status: "finished", prompt: "done", createdAt: 4000 },
++  ]);
++
++  assert.equal(selected?.runId, "run_q");
++  assert.equal(selected?.active, true);
++});
++
++test("reconnect-after-finish: selects the most recent run when none are active", () => {
++  const selected = pickRunToRestore([
++    { runId: "run_new", status: "finished", prompt: "latest", createdAt: 3000 },
++    { runId: "run_err", status: "error", prompt: "err", createdAt: 2000 },
++    { runId: "run_old", status: "cancelled", prompt: "old", createdAt: 1000 },
++  ]);
++
++  assert.deepEqual(selected, {
++    runId: "run_new",
++    prompt: "latest",
++    createdAt: 3000,
++    active: false,
++  });
++});
++
++test("returns null when there are no runs to restore", () => {
++  assert.equal(pickRunToRestore([]), null);
++  assert.equal(pickRunToRestore([{ runId: "", status: "running" }]), null);
++});
+diff --git a/apps/swarmagents/lib/client/restoreRun.ts b/apps/swarmagents/lib/client/restoreRun.ts
+new file mode 100644
+index 000000000..2ff1f859b
+--- /dev/null
++++ b/apps/swarmagents/lib/client/restoreRun.ts
+@@ -0,0 +1,51 @@
++export interface RestorableRun {
++  runId: string;
++  status?: string;
++  prompt?: string;
++  createdAt?: number;
++}
++
++export interface RestoreSelection {
++  runId: string;
++  prompt?: string;
++  createdAt?: number;
++  active: boolean;
++}
++
++function isLiveStatus(status?: string): boolean {
++  return status === "queued" || status === "running";
++}
++
++/**
++ * Pick the run to reattach to after a full page (re)load for the current
++ * thread. Prefers an active (queued/running) run so a live view resumes;
++ * otherwise returns the most recent run so a run that finished while
++ * disconnected can show its final result instead of "Working…".
++ *
++ * `runs` is expected newest-first (as returned by /api/runtime/runs), but the
++ * active pick is resilient to ordering.
++ */
++export function pickRunToRestore(runs: readonly RestorableRun[]): RestoreSelection | null {
++  let newestActive: RestorableRun | undefined;
++  for (const run of runs) {
++    if (!run?.runId || !isLiveStatus(run.status)) continue;
++    if (
++      !newestActive ||
++      (run.createdAt ?? 0) > (newestActive.createdAt ?? 0) ||
++      ((run.createdAt ?? 0) === (newestActive.createdAt ?? 0) && run.runId > newestActive.runId)
++    ) {
++      newestActive = run;
++    }
++  }
++  const target = newestActive ?? runs.find((r) => r?.runId);
++  if (!target?.runId) return null;
++  return {
++    runId: target.runId,
++    prompt: typeof target.prompt === "string" && target.prompt.length > 0 ? target.prompt : undefined,
++    createdAt:
++      typeof target.createdAt === "number" && Number.isFinite(target.createdAt)
++        ? target.createdAt
++        : undefined,
++    active: isLiveStatus(target.status),
++  };
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index cb2976e10..6e6b0e733 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -28,6 +28,7 @@ import { useToasts } from './components/Toasts';
+ import { describeFailure } from '../../lib/ui/toasts';
+ import { uploadAttachments } from '../../lib/client/upload';
+ import { mapKeyToAction } from './utils/keymap';
++import { pickRunToRestore } from '../../lib/client/restoreRun';
+ 
+ export default function App() {
+   const [providers, setProviders] = usePersisted<ProviderConfig[]>('ac.providers', []);
+@@ -77,6 +78,7 @@ export default function App() {
+   const [runId, setRunId] = useState<string>();
+   const ctrlRef = useRef<AbortController | null>(null);
+   const inputRef = useRef<HTMLTextAreaElement>(null);
++  const restoredRunRef = useRef(false);
+   const { push: pushToast } = useToasts();
+ 
+   // Server-configured providers (server-held keys). Fetched from /api/providers;
+@@ -458,6 +460,58 @@ export default function App() {
+     };
+   }, [runId, busy]);
+ 
++  // On a full page (re)load the in-memory runId is lost. Reattach to the
++  // current thread's active run, or — if nothing is active — the most recent
++  // run so a run that finished while disconnected shows its final result
++  // instead of an empty "Working…" view (r2).
++  useEffect(() => {
++    if (restoredRunRef.current) return;
++    restoredRunRef.current = true;
++    const ctrl = new AbortController();
++    void (async () => {
++      try {
++        let since: string | null = null;
++        try {
++          since = localStorage.getItem('ac.threadSince');
++        } catch {
++          since = null;
++        }
++        const params = new URLSearchParams({ limit: '50' });
++        const sinceNum = since ? Number(since) : NaN;
++        if (Number.isFinite(sinceNum) && sinceNum > 0) params.set('since', String(sinceNum));
++        const res = await fetch(`/api/runtime/runs?${params.toString()}`, {
++          signal: ctrl.signal,
++          cache: 'no-store',
++        });
++        if (!res.ok) return;
++        const body = (await res.json().catch(() => null)) as {
++          runs?: Array<{
++            runId: string;
++            status?: string;
++            prompt?: string;
++            createdAt?: number;
++          }>;
++        } | null;
++        const runs = Array.isArray(body?.runs) ? body.runs : [];
++        const target = pickRunToRestore(runs);
++        if (!target) return;
++        setRunId(target.runId);
++        if (target.prompt) setPrompt(target.prompt);
++        if (target.createdAt !== undefined) setRunStart(target.createdAt);
++        if (target.active) {
++          setBusy(true);
++          setRunEnd(undefined);
++        } else {
++          setBusy(false);
++          setRunEnd(performance.now());
++        }
++      } catch {
++        /* best-effort restore; ignore transient failures */
++      }
++    })();
++    return () => ctrl.abort();
++  }, []);
++
+   // Workspace keyboard shortcuts: Cmd/Ctrl+K focuses the input, Cmd/Ctrl+1..4
+   // switch views, ? opens the help overlay, Esc closes it. Bare keys are
+   // ignored while typing so they never hijack text entry (see utils/keymap).
+-- 
+2.55.0
+

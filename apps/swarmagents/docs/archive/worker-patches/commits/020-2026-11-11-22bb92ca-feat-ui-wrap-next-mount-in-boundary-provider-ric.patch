@@ -1,0 +1,155 @@
+From 22bb92ca18155379e630636508c579cfbd87f568 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 12:08:31 -0600
+Subject: [PATCH] feat(ui): wrap Next mount in boundary/provider; richer
+ provider-error copy
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- app/page.tsx (the real Next entry) now wraps the app in ErrorBoundary and
+  ToastsProvider, matching main.tsx — useToasts() requires the provider at the
+  actual mount point, not only the standalone createRoot entry
+- describeFailure now classifies common provider errors (401/403/429/402/404/5xx,
+  network, abort) into friendly, actionable toasts
+- Tests extended to 17 checks covering the new classification
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/app/page.tsx          | 10 +++++-
+ apps/swarmagents/lib/ui/toasts.test.ts | 43 ++++++++++++++++++++++----
+ apps/swarmagents/lib/ui/toasts.ts      | 30 +++++++++++++++---
+ 3 files changed, 72 insertions(+), 11 deletions(-)
+
+diff --git a/apps/swarmagents/app/page.tsx b/apps/swarmagents/app/page.tsx
+index 918d0eea0..6b76bca9b 100644
+--- a/apps/swarmagents/app/page.tsx
++++ b/apps/swarmagents/app/page.tsx
+@@ -1,11 +1,19 @@
+ "use client";
+ 
+ import dynamic from "next/dynamic";
++import { ErrorBoundary } from "../minimalist-ui/src/components/ErrorBoundary";
++import { ToastsProvider } from "../minimalist-ui/src/components/Toasts";
+ 
+ const MinimalistApp = dynamic(() => import("../minimalist-ui/src/App"), {
+   ssr: false,
+ });
+ 
+ export default function Home() {
+-  return <MinimalistApp />;
++  return (
++    <ErrorBoundary>
++      <ToastsProvider>
++        <MinimalistApp />
++      </ToastsProvider>
++    </ErrorBoundary>
++  );
+ }
+diff --git a/apps/swarmagents/lib/ui/toasts.test.ts b/apps/swarmagents/lib/ui/toasts.test.ts
+index 04577604a..33718e00f 100644
+--- a/apps/swarmagents/lib/ui/toasts.test.ts
++++ b/apps/swarmagents/lib/ui/toasts.test.ts
+@@ -59,16 +59,41 @@ test("dismiss removes every toast with the matching id", () => {
+   assert.equal(next.length, 0);
+ });
+ 
+-test("describeFailure maps a fetch network error to a friendly label", () => {
++test("describeFailure maps a fetch network error", () => {
+   const f = describeFailure(new Error("Failed to fetch"));
+   assert.equal(f.message, "Network error");
+-  assert.equal(f.detail, "Could not reach the provider. Check your connection or API key.");
++  assert.match(f.detail!, /reach the provider/);
+ });
+ 
+-test("describeFailure maps a provider error to its message", () => {
++test("describeFailure maps a 401 to an invalid-key hint", () => {
+   const f = describeFailure(new Error("401 Unauthorized"));
+-  assert.equal(f.message, "Provider error");
+-  assert.equal(f.detail, "401 Unauthorized");
++  assert.equal(f.message, "Invalid API key");
++  assert.match(f.detail!, /API key/);
++});
++
++test("describeFailure maps a 403 to an access-denied hint", () => {
++  const f = describeFailure(new Error("403 Forbidden"));
++  assert.equal(f.message, "Access denied");
++});
++
++test("describeFailure maps a 429 to a rate-limit hint", () => {
++  const f = describeFailure(new Error("429 Too Many Requests"));
++  assert.equal(f.message, "Rate limited");
++});
++
++test("describeFailure maps a 402 to a quota hint", () => {
++  const f = describeFailure(new Error("402 Payment Required"));
++  assert.equal(f.message, "No credit");
++});
++
++test("describeFailure maps a 404 model error", () => {
++  const f = describeFailure(new Error("Model claude-sonnet not found"));
++  assert.equal(f.message, "Model not found");
++});
++
++test("describeFailure maps a 5xx server error", () => {
++  const f = describeFailure(new Error("500 Internal Server Error"));
++  assert.equal(f.message, "Server error");
+ });
+ 
+ test("describeFailure maps an abort to 'Run stopped'", () => {
+@@ -79,5 +104,11 @@ test("describeFailure maps an abort to 'Run stopped'", () => {
+ test("describeFailure falls back for unknown thrown values", () => {
+   const f = describeFailure(undefined);
+   assert.equal(f.message, "Provider error");
+-  assert.equal(f.detail, "unknown error");
++  assert.equal(f.detail, "request failed");
++});
++
++test("describeFailure truncates very long provider messages", () => {
++  const long = "x".repeat(500);
++  const f = describeFailure(new Error(long));
++  assert.ok((f.detail ?? "").length <= 221);
+ });
+diff --git a/apps/swarmagents/lib/ui/toasts.ts b/apps/swarmagents/lib/ui/toasts.ts
+index 1a65128ab..42b93a6f1 100644
+--- a/apps/swarmagents/lib/ui/toasts.ts
++++ b/apps/swarmagents/lib/ui/toasts.ts
+@@ -35,9 +35,31 @@ export function describeFailure(err: unknown): { message: string; detail?: strin
+   if (err instanceof Error && err.name === "AbortError") {
+     return { message: "Run stopped", detail: "The request was cancelled." };
+   }
+-  const msg = err instanceof Error ? err.message : String(err ?? "unknown error");
+-  if (!msg || msg === "Failed to fetch") {
+-    return { message: "Network error", detail: "Could not reach the provider. Check your connection or API key." };
++  const raw = err instanceof Error ? err.message : typeof err === "string" ? err : String(err ?? "");
++  const msg = (raw || "request failed").trim();
++  const lower = msg.toLowerCase();
++
++  if (/failed to fetch|networkerror|network request failed|load failed|econnrefused|enotfound|socket hang up|network error/.test(lower)) {
++    return { message: "Network error", detail: "Couldn't reach the provider. Check your connection and try again." };
++  }
++  if (/\b401\b|unauthorized|invalid api key|incorrect api key|authentication/.test(lower)) {
++    return { message: "Invalid API key", detail: "The provider rejected the API key. Check the key in Settings and try again." };
++  }
++  if (/\b403\b|forbidden|permission/.test(lower)) {
++    return { message: "Access denied", detail: "The provider refused this request. Check the key permissions and try again." };
++  }
++  if (/\b429\b|rate limit|too many requests/.test(lower)) {
++    return { message: "Rate limited", detail: "The provider is rate-limiting requests. Wait a moment and try again." };
+   }
+-  return { message: "Provider error", detail: msg };
++  if (/\b402\b|insufficient|quota|billing|payment required/.test(lower)) {
++    return { message: "No credit", detail: "The provider ran out of credit or quota. Check billing for that provider." };
++  }
++  if (/\b404\b|not found|no such model|model .* not found/.test(lower)) {
++    return { message: "Model not found", detail: "The selected model was not found on this provider. Pick another model in Settings." };
++  }
++  if (/\b5\d\d\b|server error|internal error|overloaded|unavailable/.test(lower)) {
++    return { message: "Server error", detail: "The provider had a server error. Try again in a moment." };
++  }
++
++  return { message: "Provider error", detail: msg.length > 220 ? `${msg.slice(0, 220)}…` : msg };
+ }
+-- 
+2.55.0
+

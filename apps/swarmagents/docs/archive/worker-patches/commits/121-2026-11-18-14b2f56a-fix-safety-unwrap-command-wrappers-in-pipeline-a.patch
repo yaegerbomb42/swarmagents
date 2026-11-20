@@ -1,0 +1,206 @@
+From 14b2f56a06a00539b7a7f99357229c77a2920dd1 Mon Sep 17 00:00:00 2001
+From: yaeger42 <jyaeger@hawk.iit.edu>
+Date: Wed, 18 Nov 2026 12:08:23 -0600
+Subject: [PATCH] fix(safety): unwrap command wrappers in pipeline analysis
+
+---
+ .../lib/safety/shell-classifier/classifier.ts | 120 +++++++++++-------
+ 1 file changed, 73 insertions(+), 47 deletions(-)
+
+diff --git a/apps/swarmagents/lib/safety/shell-classifier/classifier.ts b/apps/swarmagents/lib/safety/shell-classifier/classifier.ts
+index fe788dc55..0f3de206e 100644
+--- a/apps/swarmagents/lib/safety/shell-classifier/classifier.ts
++++ b/apps/swarmagents/lib/safety/shell-classifier/classifier.ts
+@@ -66,41 +66,18 @@ function makeWord(val: string): WordToken {
+ }
+ 
+ /**
+- * Strips transparent execution prefixes (`command`, `nohup`, `nice`, `timeout 10`, `env VAR=1`)
+- * and returns the effective command argv plus extracted inner commands from `sh -c`, `eval`, `xargs`, `find -exec`.
++ * Removes execution wrappers using the same rules wherever a command's identity
++ * matters. Pipeline analysis must see through the same wrappers as command analysis.
+  */
+-function unwrapCommandAndExtractNested(
+-  cmd: SimpleCommandNode,
+-  ctx: AnalysisContext,
+-): {
+-  effectiveArgv: WordToken[];
+-  nestedScripts: string[];
+-  nestedArgvs: WordToken[][];
+-} {
+-  const nestedScripts: string[] = [];
+-  const nestedArgvs: WordToken[][] = [];
+-
+-  // 1. Collect all command substitutions $(...), `...`, <(...), >(...) inside env assignments, argv, and redirects
+-  for (const env of cmd.envAssignments) {
+-    nestedScripts.push(...env.value.subcommands);
+-  }
+-  for (const arg of cmd.argv) {
+-    nestedScripts.push(...arg.subcommands);
+-  }
+-  for (const redir of cmd.redirects) {
+-    nestedScripts.push(...redir.target.subcommands);
+-  }
+-
++function unwrapTransparentWrappers(argv: WordToken[]): WordToken[] {
+   let idx = 0;
+-  const argv = cmd.argv;
+ 
+-  // Unwrap transparent wrappers (command, nohup, nice, timeout, env)
+   while (idx < argv.length) {
+     const headBase = basenameCmd(argv[idx]!.value);
+ 
+     if (TRANSPARENT_WRAPPERS.has(headBase)) {
+       idx++;
+-      // Skip wrapper flags (e.g., `nice -n 10`, `command -p`, `stdbuf -o0`)
++      // Skip wrapper flags (e.g., `nice -n 10`, `command -p`, `stdbuf -o0`).
+       while (idx < argv.length && argv[idx]!.value.startsWith("-")) {
+         const flag = argv[idx]!.value;
+         idx++;
+@@ -126,7 +103,7 @@ function unwrapCommandAndExtractNested(
+           idx++;
+         }
+       }
+-      // Duration argument (e.g., `10`, `5s`)
++      // Duration argument (e.g., `10`, `5s`).
+       if (idx < argv.length && /^\d+[smhd]?$/.test(argv[idx]!.value)) {
+         idx++;
+       }
+@@ -134,15 +111,25 @@ function unwrapCommandAndExtractNested(
+     }
+ 
+     if (headBase === "env") {
+-      // Only unwrap `env` if followed by a command (not bare `env` dump)
++      // Only unwrap `env` if followed by a command (not a bare environment dump).
+       let look = idx + 1;
+       while (look < argv.length) {
+-        const v = argv[look]!.value;
+-        if (v === "-i" || v === "--ignore-environment" || v === "-0" || v === "--null") {
++        const value = argv[look]!.value;
++        if (
++          value === "-i" ||
++          value === "--ignore-environment" ||
++          value === "-0" ||
++          value === "--null"
++        ) {
+           look++;
+-        } else if (v === "-u" || v === "--unset" || v === "-C" || v === "--chdir") {
++        } else if (
++          value === "-u" ||
++          value === "--unset" ||
++          value === "-C" ||
++          value === "--chdir"
++        ) {
+           look += 2;
+-        } else if (/^[a-zA-Z_][a-zA-Z0-9_]*=/.test(v)) {
++        } else if (/^[a-zA-Z_][a-zA-Z0-9_]*=/.test(value)) {
+           look++;
+         } else {
+           break;
+@@ -157,7 +144,46 @@ function unwrapCommandAndExtractNested(
+     break;
+   }
+ 
+-  const effectiveArgv = argv.slice(idx);
++  return argv.slice(idx);
++}
++
++function effectiveCommandArgv(command: CommandNode): WordToken[] {
++  return command.kind === "simple"
++    ? unwrapTransparentWrappers(command.argv)
++    : [];
++}
++
++function effectiveCommandHead(command: CommandNode): string {
++  return basenameCmd(effectiveCommandArgv(command)[0]?.value ?? "");
++}
++
++/**
++ * Strips transparent execution prefixes (`command`, `nohup`, `nice`, `timeout 10`, `env VAR=1`)
++ * and returns the effective command argv plus extracted inner commands from `sh -c`, `eval`, `xargs`, `find -exec`.
++ */
++function unwrapCommandAndExtractNested(
++  cmd: SimpleCommandNode,
++  ctx: AnalysisContext,
++): {
++  effectiveArgv: WordToken[];
++  nestedScripts: string[];
++  nestedArgvs: WordToken[][];
++} {
++  const nestedScripts: string[] = [];
++  const nestedArgvs: WordToken[][] = [];
++
++  // 1. Collect all command substitutions $(...), `...`, <(...), >(...) inside env assignments, argv, and redirects
++  for (const env of cmd.envAssignments) {
++    nestedScripts.push(...env.value.subcommands);
++  }
++  for (const arg of cmd.argv) {
++    nestedScripts.push(...arg.subcommands);
++  }
++  for (const redir of cmd.redirects) {
++    nestedScripts.push(...redir.target.subcommands);
++  }
++
++  const effectiveArgv = unwrapTransparentWrappers(cmd.argv);
+   if (effectiveArgv.length === 0) {
+     return { effectiveArgv, nestedScripts, nestedArgvs };
+   }
+@@ -357,14 +383,12 @@ function analyzePipelines(
+       const nextSeg = segs[i + 1];
+       const prevSeg = i > 0 ? segs[i - 1] : undefined;
+ 
+-      const nextHead =
+-        nextSeg?.command.kind === "simple"
+-          ? basenameCmd(nextSeg.command.argv[0]?.value ?? "")
+-          : "";
+-      const prevHead =
+-        prevSeg?.command.kind === "simple"
+-          ? basenameCmd(prevSeg.command.argv[0]?.value ?? "")
+-          : "";
++      const nextHead = nextSeg
++        ? effectiveCommandHead(nextSeg.command)
++        : "";
++      const prevHead = prevSeg
++        ? effectiveCommandHead(prevSeg.command)
++        : "";
+ 
+       const pipedToShell =
+         SHELL_BINARIES.has(nextHead) ||
+@@ -403,27 +427,29 @@ function extractPipedPayload(
+   ctx: AnalysisContext,
+ ): void {
+   if (downstream.length === 0) return;
+-  const producerBase = basenameCmd(producer.argv[0]?.value ?? "");
++  const producerArgv = unwrapTransparentWrappers(producer.argv);
++  const producerBase = basenameCmd(producerArgv[0]?.value ?? "");
+   if (producerBase !== "echo" && producerBase !== "printf") return;
+ 
+-  const literalArgs = producer.argv
++  const literalArgs = producerArgv
+     .slice(1)
+     .filter((a) => !a.value.startsWith("-"))
+     .map((a) => a.value);
+   if (literalArgs.length === 0) return;
+ 
+   let payload = literalArgs.join(" ");
+-  if (producerBase === "printf" || producer.argv.some((a) => a.value === "-e")) {
++  if (producerBase === "printf" || producerArgv.some((a) => a.value === "-e")) {
+     payload = decodeEscapedString(payload);
+   }
+ 
+   for (const step of downstream) {
+     if (step.command.kind !== "simple") break;
+-    const stepBase = basenameCmd(step.command.argv[0]?.value ?? "");
++    const stepArgv = effectiveCommandArgv(step.command);
++    const stepBase = basenameCmd(stepArgv[0]?.value ?? "");
+ 
+     if (
+       stepBase === "base64" &&
+-      step.command.argv.some((a) => a.value === "-d" || a.value === "--decode")
++      stepArgv.some((a) => a.value === "-d" || a.value === "--decode")
+     ) {
+       const decoded = tryDecodeStaticBase64(payload);
+       if (!decoded) return;
+-- 
+2.55.0
+

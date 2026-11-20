@@ -1,0 +1,446 @@
+From 1331278634fdc3e7df0e3cc17364923b4d9f8892 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 22:17:54 +0000
+Subject: [PATCH] [p9] Privacy Policy and Terms of Use pages
+
+---
+ apps/swarmagents/app/privacy/page.tsx | 189 +++++++++++++++++++++++
+ apps/swarmagents/app/terms/page.tsx   | 214 ++++++++++++++++++++++++++
+ apps/swarmagents/middleware.ts        |   4 +-
+ 3 files changed, 405 insertions(+), 2 deletions(-)
+ create mode 100644 apps/swarmagents/app/privacy/page.tsx
+ create mode 100644 apps/swarmagents/app/terms/page.tsx
+
+diff --git a/apps/swarmagents/app/privacy/page.tsx b/apps/swarmagents/app/privacy/page.tsx
+new file mode 100644
+index 000000000..88376b3c4
+--- /dev/null
++++ b/apps/swarmagents/app/privacy/page.tsx
+@@ -0,0 +1,189 @@
++import type { Metadata } from "next";
++import type { CSSProperties } from "react";
++
++export const metadata: Metadata = {
++  title: "Privacy Policy — SwarmAgents",
++  description:
++    "How SwarmAgents collects, stores, and protects your account, prompts, run logs, and workspace data.",
++};
++
++/**
++ * Privacy Policy. Plain, dated copy — no lorem ipsum. SwarmAgents runs a
++ * user-owned VM and stores prompts, run logs, and an account email, so this
++ * page says exactly what is kept, where it lives, and how to get it deleted.
++ * Public: middleware lists /privacy as a PUBLIC route so signed-out visitors
++ * can read it.
++ */
++
++const mainStyle: CSSProperties = {
++  minHeight: "100vh",
++  background: "var(--color-bg)",
++  color: "var(--color-text)",
++  fontFamily: "var(--font-sans)",
++  padding: "var(--space-8) var(--space-4) var(--space-16)",
++  boxSizing: "border-box",
++};
++
++const articleStyle: CSSProperties = {
++  maxWidth: 680,
++  margin: "0 auto",
++  lineHeight: "var(--line-height-normal)",
++};
++
++const h1Style: CSSProperties = {
++  fontSize: "var(--type-size-4)",
++  lineHeight: "var(--line-height-tight)",
++  margin: "0 0 var(--space-2)",
++  fontWeight: "var(--type-weight-semibold)",
++};
++
++const metaStyle: CSSProperties = {
++  color: "var(--color-text-muted)",
++  fontSize: "var(--type-size-0)",
++  margin: "0 0 var(--space-8)",
++};
++
++const h2Style: CSSProperties = {
++  fontSize: "var(--type-size-2)",
++  margin: "var(--space-8) 0 var(--space-3)",
++  fontWeight: "var(--type-weight-semibold)",
++};
++
++const pStyle: CSSProperties = {
++  margin: "0 0 var(--space-4)",
++  fontSize: "var(--type-size-1)",
++  color: "var(--color-text)",
++};
++
++const listStyle: CSSProperties = {
++  margin: "0 0 var(--space-4)",
++  paddingLeft: "var(--space-5)",
++  fontSize: "var(--type-size-1)",
++};
++
++const linkStyle: CSSProperties = {
++  color: "var(--color-focus)",
++  textDecoration: "underline",
++  textUnderlineOffset: 3,
++};
++
++const navStyle: CSSProperties = {
++  display: "flex",
++  flexWrap: "wrap",
++  gap: "var(--space-4)",
++  marginTop: "var(--space-12)",
++  paddingTop: "var(--space-6)",
++  borderTop: "1px solid var(--color-line)",
++  fontSize: "var(--type-size-0)",
++  color: "var(--color-text-muted)",
++};
++
++export default function PrivacyPage() {
++  return (
++    <main style={mainStyle}>
++      <article style={articleStyle}>
++        <h1 style={h1Style}>Privacy Policy</h1>
++        <p style={metaStyle}>
++          Last updated: November 2026 · SwarmAgents is operated from Illinois,
++          United States.
++        </p>
++
++        <p style={pStyle}>
++          SwarmAgents is a preview product. It gives you a personal agent that
++          runs on a virtual machine you own, with access to your files, tools,
++          and the providers you connect. This policy explains what we store,
++          why we store it, and how to get it deleted. If anything here changes,
++          the date above changes with it.
++        </p>
++
++        <h2 style={h2Style}>What we store</h2>
++        <ul style={listStyle}>
++          <li>
++            <strong>Account email.</strong> The email address you sign up with,
++            used to identify your account and keep your sessions separate from
++            other users.
++          </li>
++          <li>
++            <strong>Prompts.</strong> The messages you send to the agent, kept
++            so your conversation history and runs can be shown back to you.
++          </li>
++          <li>
++            <strong>Run logs.</strong> Records of what the agent did — tool
++            calls, file changes, and run status — kept so you can review, resume,
++            and audit past runs.
++          </li>
++          <li>
++            <strong>Workspace volumes.</strong> The files in your agent&apos;s
++            workspace, including anything the agent creates or edits on your
++            behalf. This is your data, stored on the VM that runs your agent.
++          </li>
++          <li>
++            <strong>Session cookies.</strong> A signed session cookie in your
++            browser keeps you signed in. It identifies your session only; it
++            carries no tracking identifiers and is not shared with advertisers.
++          </li>
++        </ul>
++
++        <h2 style={h2Style}>Provider keys</h2>
++        <p style={pStyle}>
++          API keys for model and tool providers (for example, your provider
++          keys) are stored on the server and used only to call those providers
++          on your behalf. They are never sent to your browser, never shown in
++          the interface, and never shared with any other party.
++        </p>
++
++        <h2 style={h2Style}>What we do not do</h2>
++        <p style={pStyle}>
++          We do not sell your data. We do not share your prompts, run logs,
++          workspace files, or account email with advertisers or data brokers.
++          Your data is sent to the model and tool providers you have connected
++          only as needed to carry out your requests, and to no one else.
++        </p>
++
++        <h2 style={h2Style}>How long we keep it</h2>
++        <p style={pStyle}>
++          Your account data, prompts, run logs, and workspace volumes are kept
++          while your account is active, so your history and work remain
++          available to you. Session cookies expire as described in the sign-in
++          flow; signing out ends the session.
++        </p>
++
++        <h2 style={h2Style}>Deletion</h2>
++        <p style={pStyle}>
++          You can request deletion of your account and all data associated
++          with it at any time, from the account settings in the app or by
++          contacting the operator directly. Deleting your account removes your
++          prompts, run logs, workspace volumes, and account email from our
++          servers. Backups, if any, are purged on their normal rotation cycle.
++        </p>
++
++        <h2 style={h2Style}>Preview status</h2>
++        <p style={pStyle}>
++          SwarmAgents is in preview. Features, storage, and this policy may
++          change as the product develops. We will update the date at the top of
++          this page when they do, and we will not quietly expand what we
++          collect.
++        </p>
++
++        <h2 style={h2Style}>Contact</h2>
++        <p style={pStyle}>
++          SwarmAgents is operated from Illinois, United States. Questions about
++          this policy can be sent to the operator through the support channel
++          listed in the app.
++        </p>
++
++        <nav style={navStyle} aria-label="Legal">
++          <a href="/terms" style={linkStyle}>
++            Terms of Use
++          </a>
++          <a href="/login" style={linkStyle}>
++            Sign in
++          </a>
++          <a href="/" style={linkStyle}>
++            Home
++          </a>
++        </nav>
++      </article>
++    </main>
++  );
++}
+diff --git a/apps/swarmagents/app/terms/page.tsx b/apps/swarmagents/app/terms/page.tsx
+new file mode 100644
+index 000000000..481faa801
+--- /dev/null
++++ b/apps/swarmagents/app/terms/page.tsx
+@@ -0,0 +1,214 @@
++import type { Metadata } from "next";
++import type { CSSProperties } from "react";
++
++export const metadata: Metadata = {
++  title: "Terms of Use — SwarmAgents",
++  description:
++    "The terms for using SwarmAgents: what the service is, what you are responsible for, and the limits of a preview product.",
++};
++
++/**
++ * Terms of Use. Plain, dated copy — no lorem ipsum. Covers the preview nature
++ * of the product, the user-owned VM, acceptable use, and the limits of
++ * liability for an agent that can run code and change files on your behalf.
++ * Public: middleware lists /terms as a PUBLIC route so signed-out visitors
++ * can read it.
++ */
++
++const mainStyle: CSSProperties = {
++  minHeight: "100vh",
++  background: "var(--color-bg)",
++  color: "var(--color-text)",
++  fontFamily: "var(--font-sans)",
++  padding: "var(--space-8) var(--space-4) var(--space-16)",
++  boxSizing: "border-box",
++};
++
++const articleStyle: CSSProperties = {
++  maxWidth: 680,
++  margin: "0 auto",
++  lineHeight: "var(--line-height-normal)",
++};
++
++const h1Style: CSSProperties = {
++  fontSize: "var(--type-size-4)",
++  lineHeight: "var(--line-height-tight)",
++  margin: "0 0 var(--space-2)",
++  fontWeight: "var(--type-weight-semibold)",
++};
++
++const metaStyle: CSSProperties = {
++  color: "var(--color-text-muted)",
++  fontSize: "var(--type-size-0)",
++  margin: "0 0 var(--space-8)",
++};
++
++const h2Style: CSSProperties = {
++  fontSize: "var(--type-size-2)",
++  margin: "var(--space-8) 0 var(--space-3)",
++  fontWeight: "var(--type-weight-semibold)",
++};
++
++const pStyle: CSSProperties = {
++  margin: "0 0 var(--space-4)",
++  fontSize: "var(--type-size-1)",
++  color: "var(--color-text)",
++};
++
++const listStyle: CSSProperties = {
++  margin: "0 0 var(--space-4)",
++  paddingLeft: "var(--space-5)",
++  fontSize: "var(--type-size-1)",
++};
++
++const linkStyle: CSSProperties = {
++  color: "var(--color-focus)",
++  textDecoration: "underline",
++  textUnderlineOffset: 3,
++};
++
++const navStyle: CSSProperties = {
++  display: "flex",
++  flexWrap: "wrap",
++  gap: "var(--space-4)",
++  marginTop: "var(--space-12)",
++  paddingTop: "var(--space-6)",
++  borderTop: "1px solid var(--color-line)",
++  fontSize: "var(--type-size-0)",
++  color: "var(--color-text-muted)",
++};
++
++export default function TermsPage() {
++  return (
++    <main style={mainStyle}>
++      <article style={articleStyle}>
++        <h1 style={h1Style}>Terms of Use</h1>
++        <p style={metaStyle}>
++          Last updated: November 2026 · SwarmAgents is operated from Illinois,
++          United States.
++        </p>
++
++        <p style={pStyle}>
++          These terms govern your use of SwarmAgents. By creating an account or
++          using the service, you agree to them. If you do not agree, do not use
++          the service.
++        </p>
++
++        <h2 style={h2Style}>What SwarmAgents is</h2>
++        <p style={pStyle}>
++          SwarmAgents gives you a personal coding agent that runs on a virtual
++          machine you own. The agent can read and write files in your
++          workspace, run commands, call the model and tool providers you
++          connect, and browse the web on your behalf. You stay in control:
++          you choose what the agent can access, and you can review its runs and
++          stop it at any time.
++        </p>
++
++        <h2 style={h2Style}>Preview status</h2>
++        <p style={pStyle}>
++          SwarmAgents is in preview. The service may change, break, or become
++          temporarily unavailable without notice, and features may be added,
++          changed, or removed. Do not rely on it as your only copy of anything
++          important — keep your own backups of work that matters.
++        </p>
++
++        <h2 style={h2Style}>Your account</h2>
++        <p style={pStyle}>
++          You are responsible for keeping your account credentials safe and for
++          everything done under your account. Your provider API keys stay on
++          the server and are used only to call those providers on your behalf;
++          you are responsible for the usage and charges those keys incur with
++          the providers themselves. Tell the operator promptly if you believe
++          your account has been compromised.
++        </p>
++
++        <h2 style={h2Style}>Your responsibilities</h2>
++        <ul style={listStyle}>
++          <li>
++            Use the service only for lawful purposes, and only in ways that
++            respect the rights of others.
++          </li>
++          <li>
++            Do not use the agent to harm, harass, or deceive anyone; to break
++            into systems you do not own; or to produce or distribute illegal
++            content.
++          </li>
++          <li>
++            Do not try to circumvent the service&apos;s security, rate limits,
++            or access controls, and do not resell or share your access in a way
++            that lets others use the service through your account.
++          </li>
++          <li>
++            Review what the agent does. The agent acts on your instructions,
++            and you are responsible for the changes it makes to your workspace
++            and the requests it sends to your connected providers.
++          </li>
++        </ul>
++
++        <h2 style={h2Style}>Your content</h2>
++        <p style={pStyle}>
++          You own your prompts, your workspace files, and everything the agent
++          creates for you. We store that content only to operate the service
++          for you, as described in the{" "}
++          <a href="/privacy" style={linkStyle}>
++            Privacy Policy
++          </a>
++          . We do not claim ownership of it, and we do not sell it.
++        </p>
++
++        <h2 style={h2Style}>What the agent may do — and what it may get wrong</h2>
++        <p style={pStyle}>
++          An agent that can run code and edit files can make mistakes: it can
++          delete or overwrite files, run commands with unintended effects, or
++          produce incorrect output. That is the nature of the tool. You accept
++          that risk when you give the agent access to a workspace or provider,
++          and you should keep backups and review run logs before relying on
++          its output.
++        </p>
++
++        <h2 style={h2Style}>Availability and liability</h2>
++        <p style={pStyle}>
++          The service is provided &ldquo;as is&rdquo;, without warranties of any
++          kind, express or implied, including merchantability, fitness for a
++          particular purpose, and non-infringement. To the fullest extent
++          permitted by law, the operator is not liable for any indirect,
++          incidental, or consequential damages, or for loss of data, arising
++          from your use of the service.
++        </p>
++
++        <h2 style={h2Style}>Ending your use</h2>
++        <p style={pStyle}>
++          You may stop using the service and request deletion of your account
++          at any time, as described in the Privacy Policy. The operator may
++          suspend or terminate accounts that violate these terms, abuse the
++          service, or create a security risk, with or without notice.
++        </p>
++
++        <h2 style={h2Style}>Changes to these terms</h2>
++        <p style={pStyle}>
++          These terms may change as the product develops. The date at the top
++          of this page will change when they do, and continued use of the
++          service after a change means you accept the updated terms.
++        </p>
++
++        <h2 style={h2Style}>Governing law</h2>
++        <p style={pStyle}>
++          These terms are governed by the laws of the State of Illinois, United
++          States, without regard to conflict-of-law rules.
++        </p>
++
++        <nav style={navStyle} aria-label="Legal">
++          <a href="/privacy" style={linkStyle}>
++            Privacy Policy
++          </a>
++          <a href="/login" style={linkStyle}>
++            Sign in
++          </a>
++          <a href="/" style={linkStyle}>
++            Home
++          </a>
++        </nav>
++      </article>
++    </main>
++  );
++}
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index b5268f03e..f6cc38466 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -28,8 +28,8 @@ function withSecurityHeaders(
+ // Kept under this name because route handlers that bypass middleware (uploads) import it as their gate.
+ export { isAllowed as isLocal } from "./lib/auth";
+ 
+-/** Reachable signed out: the sign-in page and the endpoints it uses. */
+-const PUBLIC = new Set(["/login", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
++/** Reachable signed out: the sign-in page, the public legal pages, and the endpoints they use. */
++const PUBLIC = new Set(["/login", "/privacy", "/terms", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
+ 
+ /** The public board MCP endpoint is exempt from the cross-site gate (external MCP clients call it). */
+ const BOARD_PATH = "/api/mcp/swarm-board";
+-- 
+2.55.0
+

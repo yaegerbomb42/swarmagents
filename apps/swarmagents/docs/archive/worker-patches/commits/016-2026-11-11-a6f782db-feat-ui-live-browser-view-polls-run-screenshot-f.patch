@@ -1,0 +1,756 @@
+From a6f782db9c26f476abb018126495fa2061e5c7b5 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 12:57:35 -0600
+Subject: [PATCH] feat(ui): live browser view polls run screenshot frames
+
+Replaces the static browser placeholder with a real view of the run's
+headless Chromium session: the frame route
+(/api/runtime/browser/[runId]/frame) is polled at a modest 1s cadence
+while the tab is visible (pausing when hidden, with exponential backoff
+on errors), and frame-bearing SSE events (browser.frame /
+browser.navigated) trigger an immediate refetch. The address bar tracks
+the run's current URL, refused navigations surface a "blocked by policy"
+notice, and a waiting state is shown before the first frame exists.
+
+The polling schedule is extracted into pure helpers
+(browserPollSchedule / nextBrowserPollDelayMs / recordBrowserPollOutcome)
+and unit-tested for interval, backoff, cap, and reset behavior.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/e2e/views.spec.ts            |   3 +-
+ .../lib/client/useBrowserFrame.test.ts        | 105 +++++++
+ .../swarmagents/lib/client/useBrowserFrame.ts | 263 ++++++++++++++++++
+ .../src/components/BrowserView.tsx            | 254 +++++++++++++++++
+ .../src/components/ComputerScreen.tsx         |  40 +--
+ 5 files changed, 627 insertions(+), 38 deletions(-)
+ create mode 100644 apps/swarmagents/lib/client/useBrowserFrame.test.ts
+ create mode 100644 apps/swarmagents/lib/client/useBrowserFrame.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/BrowserView.tsx
+
+diff --git a/apps/swarmagents/e2e/views.spec.ts b/apps/swarmagents/e2e/views.spec.ts
+index fc1dd26fe..57e475605 100644
+--- a/apps/swarmagents/e2e/views.spec.ts
++++ b/apps/swarmagents/e2e/views.spec.ts
+@@ -15,7 +15,8 @@ test("views: terminal, browser, and telemetry toggle", async (t) => {
+     await captureView(page, testName, "terminal");
+ 
+     await page.getByRole("button", { name: /^Browser$/ }).first().click();
+-    await page.getByText("Live Headed Chromium Viewport").first().waitFor({ state: "visible", timeout: 15_000 });
++    // No active run in the e2e workspace: the browser shows its idle state.
++    await page.getByText("Waiting for a run").first().waitFor({ state: "visible", timeout: 15_000 });
+     await captureView(page, testName, "browser");
+ 
+     await page.getByRole("button", { name: /^Telemetry$/ }).first().click();
+diff --git a/apps/swarmagents/lib/client/useBrowserFrame.test.ts b/apps/swarmagents/lib/client/useBrowserFrame.test.ts
+new file mode 100644
+index 000000000..4c07b0363
+--- /dev/null
++++ b/apps/swarmagents/lib/client/useBrowserFrame.test.ts
+@@ -0,0 +1,105 @@
++/**
++ * Unit tests for useBrowserFrame's polling timing logic. The hook's scheduler
++ * is extracted into pure helpers (browserPollSchedule, nextBrowserPollDelayMs,
++ * recordBrowserPollOutcome) so the schedule can be tested without timers,
++ * fetch mocks, or a DOM.
++ */
++
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import {
++  BROWSER_POLL_INTERVAL_MS,
++  BROWSER_POLL_MAX_BACKOFF_MS,
++  browserFrameUrl,
++  browserPollSchedule,
++  initialBrowserPollState,
++  nextBrowserPollDelayMs,
++  recordBrowserPollOutcome,
++} from "./useBrowserFrame";
++
++test("polls at the base interval while ticks succeed", () => {
++  // A steady stream of good ticks (including the 404 "no frame yet" case
++  // counting as a clean tick) stays at the modest 1s cadence.
++  assert.deepEqual(browserPollSchedule(["ok", "ok", "ok", "ok"]), [
++    BROWSER_POLL_INTERVAL_MS,
++    BROWSER_POLL_INTERVAL_MS,
++    BROWSER_POLL_INTERVAL_MS,
++    BROWSER_POLL_INTERVAL_MS,
++  ]);
++});
++
++test("a 404 (no frame yet) does not count as a failure", () => {
++  // The frame route 404s until the first capture; the view must keep polling
++  // at the base interval rather than backing off.
++  const schedule = browserPollSchedule(["ok", "ok", "fail"]);
++  assert.equal(schedule[0], BROWSER_POLL_INTERVAL_MS);
++  assert.equal(schedule[1], BROWSER_POLL_INTERVAL_MS);
++  // A failure right after resets the streak: the next delay is back to base.
++  assert.equal(schedule[2], backoffDelay(0));
++});
++
++test("backs off exponentially after consecutive failures", () => {
++  // The first failure's next tick is one base interval (backoff attempt 0);
++  // each further failure doubles until the cap.
++  const schedule = browserPollSchedule(["fail", "fail", "fail", "fail"]);
++  assert.deepEqual(schedule, [
++    backoffDelay(0),
++    backoffDelay(0),
++    backoffDelay(1),
++    backoffDelay(2),
++  ]);
++});
++
++test("caps the failure backoff", () => {
++  const capped = ["fail", "fail", "fail", "fail", "fail", "fail", "fail"] as const;
++  const schedule = browserPollSchedule(capped);
++  assert.equal(schedule[schedule.length - 1], BROWSER_POLL_MAX_BACKOFF_MS);
++  // A long failure run never exceeds the cap.
++  assert.ok(schedule.every((d) => d <= BROWSER_POLL_MAX_BACKOFF_MS));
++});
++
++test("a success resets the failure streak", () => {
++  // fail, fail (backoff growing), then ok: the delay scheduled *after* the ok
++  // returns to base (the streak reset), even when one more failure follows.
++  const schedule = browserPollSchedule(["fail", "fail", "ok", "fail"]);
++  assert.equal(schedule[0], backoffDelay(0));
++  assert.equal(schedule[1], backoffDelay(0));
++  assert.equal(schedule[2], backoffDelay(1)); // streak 2 by the time the ok runs
++  assert.equal(schedule[3], BROWSER_POLL_INTERVAL_MS); // reset → base again
++});
++
++test("recordBrowserPollOutcome folds outcomes deterministically", () => {
++  const start = initialBrowserPollState();
++  const afterFail = recordBrowserPollOutcome(start, false);
++  assert.deepEqual(afterFail, { failStreak: 1 });
++  const afterSecondFail = recordBrowserPollOutcome(afterFail, false);
++  assert.deepEqual(afterSecondFail, { failStreak: 2 });
++  assert.deepEqual(recordBrowserPollOutcome(afterSecondFail, true), start);
++});
++
++test("custom interval and backoff cap are honoured", () => {
++  const opts = { intervalMs: 250, maxBackoffMs: 2000 };
++  assert.equal(nextBrowserPollDelayMs(initialBrowserPollState(), opts), 250);
++  // fail, fail, fail: 250 -> 250 -> 500.
++  assert.deepEqual(browserPollSchedule(["fail", "fail", "fail"], opts), [250, 250, 500]);
++  // A long run caps at 2000.
++  const long = browserPollSchedule(
++    ["fail", "fail", "fail", "fail", "fail", "fail", "fail"],
++    opts,
++  );
++  assert.equal(long[long.length - 1], 2000);
++});
++
++test("browserFrameUrl encodes the run id", () => {
++  assert.equal(browserFrameUrl("run_abc123"), "/api/runtime/browser/run_abc123/frame");
++  assert.equal(
++    browserFrameUrl("run with spaces"),
++    "/api/runtime/browser/run%20with%20spaces/frame",
++  );
++});
++
++/** First backoff delay from the base interval (one failure in the streak). */
++function backoffDelay(n: number): number {
++  // Mirrors backoffDelayMs: base = interval, doubled per extra failure, capped.
++  return Math.min(BROWSER_POLL_INTERVAL_MS * 2 ** n, BROWSER_POLL_MAX_BACKOFF_MS);
++}
+diff --git a/apps/swarmagents/lib/client/useBrowserFrame.ts b/apps/swarmagents/lib/client/useBrowserFrame.ts
+new file mode 100644
+index 000000000..de1727b46
+--- /dev/null
++++ b/apps/swarmagents/lib/client/useBrowserFrame.ts
+@@ -0,0 +1,263 @@
++"use client";
++
++/**
++ * useBrowserFrame(runId) — poll the latest screenshot frame for a run.
++ *
++ * The runtime serves frames as JPEG bytes at
++ * `/api/runtime/browser/[runId]/frame`. This hook fetches that route at a
++ * modest, steady rate while the tab is visible:
++ *
++ *   - 200 (image/jpeg): the frame is replaced when its byte size changed
++ *     since the last fetch, or when `refreshKey` advanced (the caller bumps it
++ *     when a `browser.frame` / `browser.navigated` SSE event says a new frame
++ *     exists). Same-size frames keep the previous object URL so the <img>
++ *     does not flicker on every tick.
++ *   - 404: no frame captured yet — an empty state, not an error. Polling
++ *     continues at the base interval.
++ *   - any other failure: keep the last good frame and back off exponentially
++ *     (base = interval, doubling, capped), so a flapping backend is not
++ *     hammered. The backoff resets on the next successful fetch.
++ *
++ * Polling pauses while the document is hidden (`visibilitychange`) and resumes
++ * immediately the next time the tab becomes visible. When `runId` is absent
++ * the hook stays idle.
++ *
++ * The scheduling policy is extracted into the pure helpers at the bottom of
++ * this module so the timing logic can be unit-tested without timers or a DOM.
++ */
++
++import { useCallback, useEffect, useRef, useState } from "react";
++import { backoffDelayMs } from "./backoff";
++
++export const BROWSER_POLL_INTERVAL_MS = 1000;
++export const BROWSER_POLL_MAX_BACKOFF_MS = 15_000;
++
++/** A run's latest frame is served at /api/runtime/browser/[runId]/frame. */
++export function browserFrameUrl(runId: string): string {
++  return `/api/runtime/browser/${encodeURIComponent(runId)}/frame`;
++}
++
++export interface BrowserPollOptions {
++  /** Delay between successful polls (default 1000ms). */
++  intervalMs?: number;
++  /** Ceiling for the failure backoff (default 15s). */
++  maxBackoffMs?: number;
++}
++
++/** Mutable state of one poll loop, folded by the pure helpers below. */
++export interface BrowserPollState {
++  /** Consecutive failed ticks (fetch error / non-404 HTTP error). */
++  failStreak: number;
++}
++
++export function initialBrowserPollState(): BrowserPollState {
++  return { failStreak: 0 };
++}
++
++/**
++ * Fold the outcome of one tick into the poll state. Success — and the 404
++ * "no frame yet" case — reset the failure streak; anything else increments it.
++ */
++export function recordBrowserPollOutcome(state: BrowserPollState, ok: boolean): BrowserPollState {
++  return ok ? initialBrowserPollState() : { failStreak: state.failStreak + 1 };
++}
++
++/**
++ * Delay until the next poll tick after a tick that finished with `ok`.
++ * Success polls at the base interval; a failure backs off exponentially from
++ * the interval, capped at `maxBackoffMs`, so a down server is probed at most
++ * every ~15s instead of every second.
++ */
++export function nextBrowserPollDelayMs(state: BrowserPollState, options: BrowserPollOptions = {}): number {
++  const intervalMs = options.intervalMs ?? BROWSER_POLL_INTERVAL_MS;
++  const maxBackoffMs = Math.max(intervalMs, options.maxBackoffMs ?? BROWSER_POLL_MAX_BACKOFF_MS);
++  if (state.failStreak <= 0) return intervalMs;
++  return backoffDelayMs(state.failStreak - 1, { baseMs: intervalMs, maxMs: maxBackoffMs });
++}
++
++/**
++ * The delay schedule a poll loop would produce for a given script of outcomes
++ * ("ok" = successful fetch or clean 404; "fail" = network/HTTP error). Pure,
++ * deterministic, and the unit-tested core of the hook's timing.
++ */
++export function browserPollSchedule(outcomes: readonly ("ok" | "fail")[], options: BrowserPollOptions = {}): number[] {
++  let state = initialBrowserPollState();
++  return outcomes.map((outcome) => {
++    const delay = nextBrowserPollDelayMs(state, options);
++    state = recordBrowserPollOutcome(state, outcome === "ok");
++    return delay;
++  });
++}
++
++export type BrowserFrameStatus = "idle" | "polling" | "empty" | "error";
++
++export interface BrowserFrameState {
++  /** "idle" (no run), "polling" (run active), "empty" (no frame yet), "error". */
++  status: BrowserFrameStatus;
++  /** Object URL of the latest frame; replaced on update, revoked on unmount. */
++  frameUrl?: string;
++  /** Epoch ms the frame bytes were last fetched. */
++  fetchedAt?: number;
++  /** Last fetch error message, when status === "error". */
++  error?: string;
++}
++
++interface InternalState extends BrowserFrameState {
++  frameSize?: number;
++}
++
++export interface BrowserFrameHookOptions extends BrowserPollOptions {
++  /** Bump when a frame-bearing stream event arrives to force a refresh. */
++  refreshKey?: number;
++  /** Injectable visibility check (tests); defaults to document.visibilityState. */
++  isVisible?: () => boolean;
++}
++
++export function useBrowserFrame(runId?: string | null, options: BrowserFrameHookOptions = {}): BrowserFrameState & { refresh: () => void } {
++  const { intervalMs, maxBackoffMs, refreshKey = 0, isVisible } = options;
++
++  const [state, setState] = useState<InternalState>({ status: "idle" });
++  const stateRef = useRef(state);
++  stateRef.current = state;
++  const urlRef = useRef<string | undefined>(undefined);
++  const prevRunIdRef = useRef<string | null | undefined>(null);
++  /** Bumped to restart the loop immediately (manual refresh or refreshKey). */
++  const [signal, setSignal] = useState(0);
++
++  const visible = useCallback(() => {
++    if (isVisible) return isVisible();
++    return typeof document === "undefined" ? true : document.visibilityState === "visible";
++  }, [isVisible]);
++
++  // A frame-bearing SSE event (or a manual refresh) restarts the loop, which
++  // fetches immediately instead of waiting for the next scheduled tick. The
++  // ref skips the initial mount so mounting does not double-start the loop.
++  const prevRefreshKeyRef = useRef(refreshKey);
++  useEffect(() => {
++    if (prevRefreshKeyRef.current !== refreshKey) {
++      prevRefreshKeyRef.current = refreshKey;
++      setSignal((s) => s + 1);
++    }
++  }, [refreshKey]);
++
++  const refresh = useCallback(() => setSignal((s) => s + 1), []);
++
++  useEffect(() => {
++    // When the run changes (or clears), drop the previous run's frame before
++    // fetching anything, so a stale image never flashes for the new run. On a
++    // pure refresh signal (same runId) the current frame stays until the new
++    // bytes arrive.
++    const id = runId ?? null;
++    if (id !== prevRunIdRef.current) {
++      prevRunIdRef.current = id;
++      if (urlRef.current) {
++        URL.revokeObjectURL(urlRef.current);
++        urlRef.current = undefined;
++      }
++      setState({ status: id ? "polling" : "idle" });
++      if (!id) return;
++    }
++    // The run stayed cleared (e.g. refresh clicked while idle): stay idle.
++    if (!id) return;
++
++    const aborter = new AbortController();
++    let alive = true;
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    let pollState = initialBrowserPollState();
++
++    const clearTimer = () => {
++      if (timer) clearTimeout(timer);
++      timer = undefined;
++    };
++
++    const replaceFrame = (blob: Blob) => {
++      if (urlRef.current) URL.revokeObjectURL(urlRef.current);
++      const url = URL.createObjectURL(blob);
++      urlRef.current = url;
++      setState({ status: "polling", frameUrl: url, frameSize: blob.size, fetchedAt: Date.now() });
++    };
++
++    const schedule = (delayMs: number) => {
++      if (!alive) return;
++      clearTimer();
++      timer = setTimeout(() => void tick(false), delayMs);
++    };
++
++    // `force` replaces the frame even when its size is unchanged (initial
++    // fetch, manual refresh, or a stream event announcing a new frame).
++    const tick = async (force: boolean) => {
++      if (!alive) return;
++      // Pause while hidden: no fetch, no timer. The visibilitychange listener
++      // below resumes the loop the moment the tab becomes visible again.
++      if (!visible()) return;
++      try {
++        const res = await fetch(browserFrameUrl(id), {
++          cache: "no-store",
++          signal: aborter.signal,
++        });
++        if (!alive) return;
++        if (res.status === 200) {
++          const blob = await res.blob();
++          if (!alive) return;
++          pollState = recordBrowserPollOutcome(pollState, true);
++          const prev = stateRef.current;
++          if (prev.frameSize === blob.size && !force) {
++            // Same bytes as the last fetch (a quiet page): keep the current
++            // object URL so the <img> does not remount, just re-arm the timer.
++            schedule(nextBrowserPollDelayMs(pollState, { intervalMs, maxBackoffMs }));
++            return;
++          }
++          replaceFrame(blob);
++          schedule(nextBrowserPollDelayMs(pollState, { intervalMs, maxBackoffMs }));
++        } else if (res.status === 404) {
++          // No frame captured yet — a legitimate empty state, not an error.
++          pollState = recordBrowserPollOutcome(pollState, true);
++          if (urlRef.current) {
++            URL.revokeObjectURL(urlRef.current);
++            urlRef.current = undefined;
++          }
++          setState({ status: "empty" });
++          schedule(nextBrowserPollDelayMs(pollState, { intervalMs, maxBackoffMs }));
++        } else {
++          throw new Error(`browser frame responded ${res.status}`);
++        }
++      } catch (err) {
++        if (!alive || aborter.signal.aborted) return;
++        pollState = recordBrowserPollOutcome(pollState, false);
++        const message = err instanceof Error ? err.message : String(err);
++        setState((prev) => ({ ...prev, status: "error", error: message }));
++        schedule(nextBrowserPollDelayMs(pollState, { intervalMs, maxBackoffMs }));
++      }
++    };
++
++    const onVisibility = () => {
++      // Resume immediately on becoming visible; a hidden tab stays paused.
++      if (visible()) void tick(true);
++    };
++
++    void tick(true);
++    document.addEventListener("visibilitychange", onVisibility);
++
++    return () => {
++      alive = false;
++      clearTimer();
++      aborter.abort();
++      document.removeEventListener("visibilitychange", onVisibility);
++    };
++    // `signal` restarts the loop (refreshKey events and manual refreshes);
++    // runId changes restart it for a new run.
++  }, [runId, signal, visible, intervalMs, maxBackoffMs]);
++
++  // Revoke the latest object URL on unmount (guard against stale URLs from a
++  // previous runId).
++  useEffect(() => {
++    return () => {
++      if (urlRef.current) {
++        URL.revokeObjectURL(urlRef.current);
++        urlRef.current = undefined;
++      }
++    };
++  }, []);
++
++  return { ...state, refresh };
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/BrowserView.tsx b/apps/swarmagents/minimalist-ui/src/components/BrowserView.tsx
+new file mode 100644
+index 000000000..c065178e5
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/BrowserView.tsx
+@@ -0,0 +1,254 @@
++"use client";
++
++/**
++ * BrowserView — the live agent-browser screen for a run.
++ *
++ * Shows the latest screenshot frame for the active run (polled from
++ * `/api/runtime/browser/[runId]/frame` by useBrowserFrame) inside a minimal
++ * browser chrome: address bar with the run's current URL, a refresh control,
++ * and a "blocked by policy" notice when a navigation was refused.
++ *
++ * The URL/title/dimensions and refused-navigation reasons arrive on the run's
++ * SSE stream (`browser.navigated`, `browser.frame`, `browser.error` events);
++ * the image bytes come from the polled frame route. Every frame-bearing event
++ * bumps the polling hook's refreshKey so a new screenshot appears immediately
++ * rather than waiting for the next poll tick.
++ */
++
++import React, { useCallback, useEffect, useRef, useState } from "react";
++import { ArrowRight, Globe, RotateCcw, ShieldAlert } from "lucide-react";
++import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
++import { useBrowserFrame } from "../../../lib/client/useBrowserFrame";
++
++interface BrowserViewProps {
++  /** Active runtime run id; when absent the view shows its idle state. */
++  runId?: string;
++}
++
++interface BrowserMeta {
++  url?: string;
++  title?: string;
++  width?: number;
++  height?: number;
++}
++
++interface BlockedNotice {
++  reason: string;
++  at: number;
++}
++
++/** How long a refused-navigation notice stays visible before auto-dismissing. */
++const BLOCKED_NOTICE_MS = 10_000;
++
++/** A run's frame-bearing SSE events carry their metadata under `data`. */
++function frameMeta(item: RunStreamItem): BrowserMeta | null {
++  const payload = item.data as { data?: Partial<BrowserMeta> } | null;
++  const meta = payload?.data;
++  if (!meta || typeof meta !== "object") return null;
++  return meta;
++}
++
++function EmptyState({ hasRun, error }: { hasRun: boolean; error?: string }) {
++  return (
++    <div className="flex flex-col items-center justify-center gap-3 text-center max-w-md">
++      <div className="w-12 h-12 rounded-2xl bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 grid place-items-center">
++        <Globe className="w-6 h-6" />
++      </div>
++      {error ? (
++        <>
++          <div className="text-sm font-medium text-amber-300/90">Frame unavailable</div>
++          <p className="text-xs text-white/40 leading-relaxed">
++            The browser frame could not be fetched ({error}). Retrying with backoff…
++          </p>
++        </>
++      ) : hasRun ? (
++        <>
++          <div className="text-sm font-medium text-white/90">No frame yet</div>
++          <p className="text-xs text-white/40 leading-relaxed">
++            When the agent visits URLs, clicks, or takes screenshots, the live
++            page renders here.
++          </p>
++        </>
++      ) : (
++        <>
++          <div className="text-sm font-medium text-white/90">Waiting for a run</div>
++          <p className="text-xs text-white/40 leading-relaxed">
++            Start an agent to see its live browser session in this viewport.
++          </p>
++        </>
++      )}
++    </div>
++  );
++}
++
++export function BrowserView({ runId }: BrowserViewProps) {
++  const stream = useRunStream(runId);
++
++  // Frame-bearing events force an immediate refetch (refreshKey bump). The
++  // count is monotonic even when the SSE list prunes old items (MAX_LINES),
++  // so a new frame event always differs from the previous refreshKey.
++  const frameEventsRef = useRef(0);
++  const frameEvents = stream.items.filter(
++    (item) => item.kind === "browser.frame" || item.kind === "browser.navigated",
++  ).length;
++  if (frameEvents > frameEventsRef.current) frameEventsRef.current = frameEvents;
++  const refreshKey = frameEventsRef.current;
++  const frame = useBrowserFrame(runId, { refreshKey });
++
++  const [meta, setMeta] = useState<BrowserMeta>({});
++  const [blocked, setBlocked] = useState<BlockedNotice>();
++  const [draft, setDraft] = useState("");
++  const [navBusy, setNavBusy] = useState(false);
++  const blockedTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
++
++  // Follow the run stream: current URL/title/dimensions, and refused
++  // navigations (browser.error with action "navigate").
++  useEffect(() => {
++    if (!runId) {
++      setMeta({});
++      setBlocked(undefined);
++      setDraft("");
++      return;
++    }
++    let latestMeta: BrowserMeta = {};
++    let latestBlocked: BlockedNotice | undefined;
++    for (const item of stream.items) {
++      if (item.kind === "browser.navigated" || item.kind === "browser.frame") {
++        const m = frameMeta(item);
++        if (m) latestMeta = { ...latestMeta, ...m };
++        // A successful navigation clears any outstanding blocked notice.
++        if (item.kind === "browser.navigated") latestBlocked = undefined;
++      } else if (item.kind === "browser.error") {
++        const payload = item.data as { data?: { action?: string; reason?: string; url?: string } } | null;
++        if (payload?.data?.action === "navigate" && payload.data.reason) {
++          latestBlocked = { reason: payload.data.reason, at: Date.now() };
++        }
++      }
++    }
++    if (latestMeta.url !== undefined) {
++      setMeta(latestMeta);
++      setDraft((cur) => (cur === "" ? latestMeta.url! : cur));
++    }
++    if (latestBlocked !== undefined) {
++      setBlocked(latestBlocked);
++    }
++  }, [runId, stream.items]);
++
++  // Auto-dismiss the blocked notice after a while.
++  useEffect(() => {
++    if (!blocked) return;
++    blockedTimerRef.current = setTimeout(() => setBlocked(undefined), BLOCKED_NOTICE_MS);
++    return () => {
++      if (blockedTimerRef.current) clearTimeout(blockedTimerRef.current);
++    };
++  }, [blocked]);
++
++  const navigate = useCallback(
++    async (raw: string) => {
++      const url = raw.trim();
++      if (!url || !runId || navBusy) return;
++      setNavBusy(true);
++      try {
++        const res = await fetch(`/api/runtime/browser/${encodeURIComponent(runId)}`, {
++          method: "POST",
++          headers: { "Content-Type": "application/json" },
++          body: JSON.stringify({ url }),
++        });
++        const data = (await res.json().catch(() => null)) as { url?: string; error?: string } | null;
++        if (res.ok) {
++          const finalUrl = data?.url ?? url;
++          setDraft(finalUrl);
++          setBlocked(undefined);
++        } else {
++          // The server refuses policy violations (and load failures) with a
++          // 400; surface the reason as a "blocked by policy" notice.
++          setBlocked({ reason: data?.error ?? `navigation failed (${res.status})`, at: Date.now() });
++        }
++      } catch {
++        setBlocked({ reason: "Could not reach the runtime.", at: Date.now() });
++      } finally {
++        setNavBusy(false);
++      }
++    },
++    [runId, navBusy],
++  );
++
++  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
++    if (e.key === "Enter") void navigate(draft);
++  };
++
++  return (
++    <div className="flex-1 flex flex-col min-h-0">
++      {/* Browser chrome */}
++      <div className="bg-[#121218] border-b border-white/10 px-4 py-2 flex items-center gap-3">
++        <button
++          onClick={frame.refresh}
++          disabled={!runId}
++          title="Refresh frame"
++          className="text-white/40 hover:text-white disabled:opacity-30 transition"
++        >
++          <RotateCcw className="w-3.5 h-3.5" />
++        </button>
++
++        <div className="flex-1 bg-black/60 border border-white/10 rounded-xl px-3 py-1 text-[11px] font-mono text-white/70 flex items-center gap-2 min-w-0">
++          <span className="text-emerald-400 text-xs shrink-0">🔒</span>
++          <input
++            type="text"
++            value={draft}
++            onChange={(e) => setDraft(e.target.value)}
++            onKeyDown={onKeyDown}
++            placeholder={runId ? "https://…" : "no active run — start an agent"}
++            disabled={!runId || navBusy}
++            spellCheck={false}
++            autoCapitalize="off"
++            autoComplete="off"
++            className="bg-transparent border-none focus:outline-none w-full text-white/90 placeholder:text-white/25"
++          />
++        </div>
++
++        <button
++          onClick={() => void navigate(draft)}
++          disabled={!runId || navBusy || !draft.trim()}
++          title="Navigate"
++          className="text-white/50 hover:text-cyan-300 disabled:opacity-30 transition"
++        >
++          <ArrowRight className="w-4 h-4" />
++        </button>
++
++        {meta.width && meta.height ? (
++          <span className="text-[10px] font-mono text-white/40 bg-white/5 px-2 py-0.5 rounded-full shrink-0">
++            {meta.width}×{meta.height}
++          </span>
++        ) : null}
++      </div>
++
++      {/* Refused navigation notice */}
++      {blocked ? (
++        <div className="flex items-center gap-2 px-4 py-2 border-b border-rose-500/20 bg-rose-500/10 text-rose-300/90 font-mono text-[11px]">
++          <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
++          <span className="flex-1 min-w-0 truncate">Blocked by policy — {blocked.reason}</span>
++          <button
++            onClick={() => setBlocked(undefined)}
++            className="text-rose-300/60 hover:text-rose-200 text-[10px] shrink-0"
++          >
++            dismiss
++          </button>
++        </div>
++      ) : null}
++
++      {/* Browser viewport */}
++      <div className="flex-1 min-h-0 grid place-items-center bg-[#07070a] p-6 overflow-hidden">
++        {frame.frameUrl ? (
++          <img
++            src={frame.frameUrl}
++            alt="Agent browser"
++            draggable={false}
++            className="max-w-full max-h-full rounded-lg shadow-2xl border border-white/10 select-none"
++          />
++        ) : (
++          <EmptyState hasRun={Boolean(runId)} error={frame.status === "error" ? frame.error : undefined} />
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index 4d5587dc0..e9b5f705e 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -1,11 +1,12 @@
+ "use client";
+ 
+ import React, { useCallback, useState } from "react";
+-import { Terminal, Globe, Maximize2, RotateCcw, ShieldCheck, Cpu } from "lucide-react";
++import { Terminal, Globe, ShieldCheck, Cpu } from "lucide-react";
+ import type { LogEvent } from "../engine";
+ import { AnsiRenderer } from "../../../components/AnsiRenderer";
+ import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
+ import { usePersisted } from "../store";
++import { BrowserView } from "./BrowserView";
+ 
+ interface ComputerScreenProps {
+   logs: LogEvent[];
+@@ -217,7 +218,6 @@ export function ComputerScreen({
+   activeRoleName,
+   onShellRunStarted = () => {},
+ }: ComputerScreenProps) {
+-  const [browserUrl, setBrowserUrl] = useState("http://localhost:3000");
+   const stream = useRunStream(runId);
+   const liveRun = Boolean(runId);
+ 
+@@ -445,41 +445,7 @@ export function ComputerScreen({
+         )}
+ 
+         {activeView === "browser" && (
+-          <div className="flex-1 flex flex-col">
+-            {/* Browser URL Bar */}
+-            <div className="bg-[#121218] border-b border-white/10 px-4 py-2 flex items-center gap-3">
+-              <div className="flex items-center gap-1.5 text-white/40">
+-                <RotateCcw className="w-3.5 h-3.5 hover:text-white cursor-pointer" />
+-              </div>
+-              <div className="flex-1 bg-black/60 border border-white/10 rounded-xl px-3 py-1 text-[11px] font-mono text-white/70 flex items-center gap-2">
+-                <span className="text-emerald-400 text-xs">🔒</span>
+-                <input
+-                  type="text"
+-                  value={browserUrl}
+-                  onChange={(e) => setBrowserUrl(e.target.value)}
+-                  className="bg-transparent border-none focus:outline-none w-full text-white/90"
+-                />
+-              </div>
+-              <span className="text-[10px] font-mono text-white/40 bg-white/5 px-2 py-0.5 rounded-full">
+-                X11 Display :99
+-              </span>
+-            </div>
+-
+-            {/* Browser Viewport */}
+-            <div className="flex-1 grid place-items-center bg-[#07070a] p-8 text-center">
+-              <div className="max-w-md">
+-                <div className="w-12 h-12 rounded-2xl bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 grid place-items-center mx-auto mb-3">
+-                  <Globe className="w-6 h-6" />
+-                </div>
+-                <div className="text-sm font-medium text-white/90 mb-1">
+-                  Live Headed Chromium Viewport
+-                </div>
+-                <p className="text-xs text-white/40 leading-relaxed">
+-                  When the agent visits URLs, clicks buttons, takes screenshots, or audits web applications, the live browser renders directly inside this screen.
+-                </p>
+-              </div>
+-            </div>
+-          </div>
++          <BrowserView runId={liveRun ? runId : undefined} />
+         )}
+ 
+         {activeView === "telemetry" && (
+-- 
+2.55.0
+

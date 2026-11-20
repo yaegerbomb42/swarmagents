@@ -1,0 +1,37 @@
+From 2f5836bc39f3348ff22d4a282cc89f41e9372d3e Mon Sep 17 00:00:00 2001
+From: yaeger42 <jyaeger@hawk.iit.edu>
+Date: Wed, 18 Nov 2026 11:41:50 -0600
+Subject: [PATCH] fix(swarmagents): preserve board agent tool call context
+
+---
+ apps/swarmagents/lib/board-agent/agent.ts | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/apps/swarmagents/lib/board-agent/agent.ts b/apps/swarmagents/lib/board-agent/agent.ts
+index 6c1d3cc68..6d8b53d54 100644
+--- a/apps/swarmagents/lib/board-agent/agent.ts
++++ b/apps/swarmagents/lib/board-agent/agent.ts
+@@ -5,7 +5,7 @@ import { createBoardTask, getBoardTask, getRunStatus, listBoardTasks } from "./t
+ import type { BoardAgentConversation, BoardAgentMessage, BoardAgentToolCall, BoardAgentToolName, BoardAgentToolResult } from "./types";
+ import type { SwarmTask } from "../mcp-types";
+ 
+-const SYSTEM = "You are the SwarmBoard agent. You help the user by creating and tracking tasks on the SwarmBoard and running them in the SwarmAgents VM. You can call tools by emitting a single ```json block with { tool, args }. If no tool is needed, reply in plain text. Keep replies short. Never invent a task id, run id, or PR url — only report ids returned by tools.";
++const SYSTEM = "You are the SwarmBoard agent. You help the user by creating and tracking tasks on the SwarmBoard and running them in the SwarmAgents VM. You can call tools by emitting a single ```json block with { tool, args }. For a new request that requires work, create a board task. If the user asks to actually build, implement, fix, or change something, create the task and dispatch it to the VM. For listing or checking status, use read-only tools and never dispatch. If no tool is needed, reply in plain text. Keep replies short. Never invent a task id, run id, or PR url — only report ids returned by tools.";
+ 
+ const TOOLS: ReadonlySet<string> = new Set([
+   "create_board_task",
+@@ -165,6 +165,11 @@ export async function runBoardAgent(
+     const call = turn < 3 ? parseToolCall(reply) : null;
+     if (!call) break;
+     const executed = await executeTool(userId, call, userMessage);
++    conversation.messages.push({
++      role: "agent",
++      content: `\`\`\`json\n${JSON.stringify({ tool: call.tool, args: call.args })}\n\`\`\``,
++      createdAt: Date.now(),
++    });
+     if (executed.taskId) taskIds.push(executed.taskId);
+     if (executed.runId) runIds.push(executed.runId);
+     const toolMessage: BoardAgentMessage = {
+-- 
+2.55.0
+

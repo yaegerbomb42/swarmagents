@@ -1,0 +1,971 @@
+From c76fb34021375ecf3d70afb289acad7988577f34 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <2.03348624e+08+yaegerbomb42@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:49:10 +0000
+Subject: [PATCH] fix(vm): stop EPIPE on exec stdin from killing the server
+ (VM-02)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A docker exec whose stdin pipe is closed early (destination is a directory,
+workspace full, container gone) emitted EPIPE on the socket with no 'error'
+listener, and with no process-level handler the whole Next.js server died —
+a remote DoS for any signed-in user via the upload route.
+
+- docker-driver: attach error listeners to every child stdin/stdout/stderr;
+  feed exec payloads through stream.pipeline from a chunked Readable so
+  large writes honour backpressure, and reject with a typed VmStdinError
+  (code EPIPE) instead of leaking an unhandled 'error' event. Reap the CLI
+  on failure so a wedged docker process cannot outlive the request.
+- lib/runtime/process-guard: last-resort uncaughtException and
+  unhandledRejection listeners. Known stream errors are logged and the
+  server keeps serving; anything else keeps Node's fatal behaviour.
+  Registered once from instrumentation.
+- upload route: refuse a destination that already exists as a directory or
+  special file with 409 destination_not_a_file, and map an EPIPE-class
+  write failure to 409 destination_rejected instead of a 500.
+---
+ .../api/runtime/vm/files/upload/route.test.ts |  61 ++++++
+ .../app/api/runtime/vm/files/upload/route.ts  |  32 +++
+ apps/swarmagents/instrumentation.ts           |   6 +
+ .../lib/runtime/process-guard.test.ts         | 139 +++++++++++++
+ apps/swarmagents/lib/runtime/process-guard.ts | 153 ++++++++++++++
+ apps/swarmagents/lib/vm/docker-driver.ts      | 189 ++++++++++++++++--
+ apps/swarmagents/lib/vm/index.test.ts         | 136 ++++++++++++-
+ 7 files changed, 703 insertions(+), 13 deletions(-)
+ create mode 100644 apps/swarmagents/lib/runtime/process-guard.test.ts
+ create mode 100644 apps/swarmagents/lib/runtime/process-guard.ts
+
+diff --git a/apps/swarmagents/app/api/runtime/vm/files/upload/route.test.ts b/apps/swarmagents/app/api/runtime/vm/files/upload/route.test.ts
+index 464c65e38..ad7ec87ce 100644
+--- a/apps/swarmagents/app/api/runtime/vm/files/upload/route.test.ts
++++ b/apps/swarmagents/app/api/runtime/vm/files/upload/route.test.ts
+@@ -26,6 +26,7 @@ import {
+ } from "../../../../../../lib/vm/files";
+ import { VmManager, setVmManagerForTesting } from "../../../../../../lib/vm/manager";
+ import { FakeVmDriver } from "../../../../../../lib/vm/fake-driver";
++import { VmStdinError } from "../../../../../../lib/vm/docker-driver";
+ import type { ExecOptions, ExecResult, VmHandle } from "../../../../../../lib/vm/types";
+ import { configureAuditPath, getAuditFile } from "../../../../../../lib/audit";
+ import { resetBuckets } from "../../../../../../lib/rate-limit";
+@@ -390,3 +391,63 @@ test("rate limit applies to uploads in server mode (429 once exhausted)", async
+   }
+   assert.equal(lastStatus, 429);
+ });
++
++// ---------------------------------------------------------------------------
++// VM-02: a destination that cannot take the bytes must be a 4xx and must never
++// take the server down (EPIPE on stdin used to crash the process).
++// ---------------------------------------------------------------------------
++
++test("upload onto an existing directory path is refused with 409, not 500", async () => {
++  const vm = install();
++  const driver = vm.driver as FakeVmDriver;
++  // A directory at the destination: the fake driver reports a directory when
++  // files exist underneath the path.
++  const handle = await driver.ensure("local");
++  await driver.writeFile(handle, `${UPLOAD_DIR}/taken/inner.txt`, "x");
++
++  const res = await POST(request([file("taken", "payload")]));
++  assert.equal(res.status, 409);
++  const body = await json(res);
++  assert.equal(body.code, "destination_not_a_file");
++  assert.match(body.error, /already exists as a directory/);
++  assert.equal(uploadAudits("local").at(-1)?.result, "failure");
++});
++
++test("a binary upload whose stdin closes (EPIPE) returns 409 and the server keeps serving", async () => {
++  class EpipedDriver extends FakeVmDriver {
++    override async exec(h: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
++      if (cmd[0] === "sh" && cmd[2]?.includes("base64 -d")) {
++        throw new VmStdinError(
++          "The command stopped reading stdin before the payload was written (EPIPE).",
++          "EPIPE",
++        );
++      }
++      return super.exec(h, cmd, opts);
++    }
++  }
++  install(new EpipedDriver());
++
++  const res = await POST(request([file("img.png", PNG_BYTES, "image/png")]));
++  assert.equal(res.status, 409);
++  const body = await json(res);
++  assert.equal(body.code, "destination_rejected");
++  assert.equal(uploadAudits("local").at(-1)?.result, "failure");
++
++  // The process (and the route) is still healthy: the next upload succeeds.
++  const ok = await POST(request([file("after.txt", "still here")]));
++  assert.equal(ok.status, 200);
++});
++
++test("a text upload whose writeFile hits EPIPE returns 409", async () => {
++  class EpipedWriteDriver extends FakeVmDriver {
++    override async writeFile(): Promise<void> {
++      throw new VmStdinError("The command stopped reading stdin (EPIPE).", "EPIPE");
++    }
++  }
++  install(new EpipedWriteDriver());
++
++  const res = await POST(request([file("notes.txt", "hello")]));
++  assert.equal(res.status, 409);
++  const body = await json(res);
++  assert.equal(body.code, "destination_rejected");
++});
+diff --git a/apps/swarmagents/app/api/runtime/vm/files/upload/route.ts b/apps/swarmagents/app/api/runtime/vm/files/upload/route.ts
+index a0834ae90..e2cdfd764 100644
+--- a/apps/swarmagents/app/api/runtime/vm/files/upload/route.ts
++++ b/apps/swarmagents/app/api/runtime/vm/files/upload/route.ts
+@@ -33,6 +33,7 @@ import {
+   resolveWorkspacePath,
+   VmPathError,
+ } from "../../../../../../lib/vm/files";
++import { isStdinClosedError } from "../../../../../../lib/vm/docker-driver";
+ import { recordAudit } from "../../../../../../lib/audit";
+ 
+ export const runtime = "nodejs";
+@@ -219,6 +220,21 @@ export async function POST(req: NextRequest) {
+       return reject(user, 500, "Could not create the uploads directory.", "vm_write_error", UPLOAD_DIR);
+     }
+     for (const entry of entries) {
++      // A destination that already exists as a directory (or a device) can
++      // never take file bytes: the shell redirection fails and the base64
++      // pipe is closed under us (EPIPE). Refuse it as a client error before
++      // any byte is written, so the user gets a 4xx instead of a 500 (b11).
++      const existing = await vm.stat(user, entry.target).catch(() => null);
++      if (existing && existing.type !== "file") {
++        const kind = existing.type === "directory" ? "directory" : "special file";
++        return reject(
++          user,
++          409,
++          `"${entry.name}" already exists as a ${kind} in the workspace.`,
++          "destination_not_a_file",
++          entry.name,
++        );
++      }
+       // Read and write one file at a time: a 10-file batch is then bounded by
+       // MAX_UPLOAD_FILE_BYTES of live memory instead of the whole batch.
+       const bytes = Buffer.from(await entry.file.arrayBuffer());
+@@ -238,6 +254,22 @@ export async function POST(req: NextRequest) {
+       }
+     }
+   } catch (err) {
++    // The VM closed the pipe mid-write (EPIPE): the destination is unusable —
++    // a directory, a full workspace, or a container that vanished. That is a
++    // client-visible write failure and the server keeps serving; the driver
++    // turned it into a VmStdinError instead of crashing the process (b11).
++    if (isStdinClosedError(err)) {
++      console.error(
++        `[upload] VM closed stdin for ${user}: ${err instanceof Error ? err.message : String(err)}`,
++      );
++      return reject(
++        user,
++        409,
++        "The VM could not accept the uploaded data. The destination may be a directory or the workspace may be full.",
++        "destination_rejected",
++        entries.map((e) => e.name).join(", "),
++      );
++    }
+     console.error(`[upload] write failed for ${user}:`, err);
+     return reject(user, 500, "Could not write the uploaded files.", "vm_write_error", entries.map((e) => e.name).join(", "));
+   }
+diff --git a/apps/swarmagents/instrumentation.ts b/apps/swarmagents/instrumentation.ts
+index e7de96938..f3ecda921 100644
+--- a/apps/swarmagents/instrumentation.ts
++++ b/apps/swarmagents/instrumentation.ts
+@@ -5,9 +5,15 @@
+  * before the process exits. Also moves the legacy server-wide providers.json
+  * into the owner's account (SWARM_OWNER_EMAIL) once, so no provider is ever
+  * shared across accounts.
++ *
++ * It also installs the last-resort process guards: a stream error raised by a
++ * dead VM pipe (EPIPE) is logged and the server keeps serving, while any other
++ * uncaught exception keeps Node's default fatal behaviour.
+  */
+ export async function register(): Promise<void> {
+   if (process.env.NEXT_RUNTIME === "nodejs") {
++    const { registerProcessGuards } = await import("./lib/runtime/process-guard");
++    registerProcessGuards();
+     const { registerShutdownHandler } = await import("./lib/runtime/shutdown");
+     registerShutdownHandler();
+     const { migrateLegacyProvidersAtStartup } = await import("./lib/providers/migrate");
+diff --git a/apps/swarmagents/lib/runtime/process-guard.test.ts b/apps/swarmagents/lib/runtime/process-guard.test.ts
+new file mode 100644
+index 000000000..664aa352b
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/process-guard.test.ts
+@@ -0,0 +1,139 @@
++/**
++ * Unit tests for the last-resort process guards (VM-02).
++ *
++ * The real `process` is never touched: each test drives a fake target that
++ * records listeners and emits the events Node would emit, so an EPIPE can be
++ * proven non-fatal without risking the test runner.
++ */
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  KNOWN_STREAM_CODES,
++  describeError,
++  isKnownStreamError,
++  processGuardsRegistered,
++  registerProcessGuards,
++  type ProcessGuardTarget,
++} from "./process-guard.js";
++
++type Listener = (arg: unknown) => void;
++
++class FakeProcess implements ProcessGuardTarget {
++  readonly handlers = new Map<string, Listener[]>();
++
++  on(event: string, listener: Listener): this {
++    const list = this.handlers.get(event) ?? [];
++    list.push(listener);
++    this.handlers.set(event, list);
++    return this;
++  }
++
++  removeListener(event: string, listener: Listener): this {
++    const list = this.handlers.get(event) ?? [];
++    this.handlers.set(
++      event,
++      list.filter((fn) => fn !== listener),
++    );
++    return this;
++  }
++
++  listenerCount(event: string): number {
++    return (this.handlers.get(event) ?? []).length;
++  }
++
++  emit(event: string, arg: unknown): void {
++    for (const fn of [...(this.handlers.get(event) ?? [])]) fn(arg);
++  }
++}
++
++function streamError(code: string, message = `socket hang up (${code})`): Error {
++  return Object.assign(new Error(message), { code });
++}
++
++function harness() {
++  const proc = new FakeProcess();
++  const logs: string[] = [];
++  const exits: number[] = [];
++  const dispose = registerProcessGuards({
++    target: proc,
++    exit: (code) => exits.push(code),
++    log: (message) => logs.push(message),
++  });
++  return { proc, logs, exits, dispose };
++}
++
++test("isKnownStreamError recognises the EPIPE family and nothing else", () => {
++  for (const code of KNOWN_STREAM_CODES) {
++    assert.equal(isKnownStreamError(streamError(code)), true, code);
++  }
++  assert.equal(isKnownStreamError(new Error("plain")), false);
++  assert.equal(isKnownStreamError(Object.assign(new Error("x"), { code: "ENOENT" })), false);
++  assert.equal(isKnownStreamError("EPIPE"), false);
++  assert.equal(isKnownStreamError(null), false);
++  assert.equal(isKnownStreamError(undefined), false);
++});
++
++test("describeError renders a code and never throws on odd values", () => {
++  assert.match(describeError(streamError("EPIPE")), /Error \[EPIPE\]: socket hang up/);
++  assert.equal(describeError("boom"), "boom");
++  assert.equal(describeError(42), "42");
++  const circular: Record<string, unknown> = {};
++  circular.self = circular;
++  assert.doesNotThrow(() => describeError(circular));
++});
++
++test("an EPIPE uncaughtException is logged and the process keeps serving", () => {
++  const { proc, logs, exits, dispose } = harness();
++  proc.emit("uncaughtException", streamError("EPIPE"));
++  assert.deepEqual(exits, []);
++  assert.equal(logs.length, 1);
++  assert.match(logs[0], /ignored stream error/);
++  assert.match(logs[0], /EPIPE/);
++  dispose();
++});
++
++test("an unknown uncaughtException keeps Node's fatal behaviour", () => {
++  const { proc, logs, exits, dispose } = harness();
++  proc.emit("uncaughtException", new TypeError("cannot read properties of undefined"));
++  assert.deepEqual(exits, [1]);
++  assert.match(logs[0], /fatal uncaught exception/);
++  dispose();
++});
++
++test("an EPIPE unhandledRejection is logged and does not exit", () => {
++  const { proc, logs, exits, dispose } = harness();
++  proc.emit("unhandledRejection", streamError("ERR_STREAM_DESTROYED"));
++  assert.deepEqual(exits, []);
++  assert.match(logs[0], /ignored stream rejection/);
++  dispose();
++});
++
++test("an unknown unhandledRejection exits non-zero", () => {
++  const { proc, exits, dispose } = harness();
++  proc.emit("unhandledRejection", new Error("database is on fire"));
++  assert.deepEqual(exits, [1]);
++  dispose();
++});
++
++test("registering twice for the same target installs one listener pair", () => {
++  const proc = new FakeProcess();
++  const first = registerProcessGuards({ target: proc, exit: () => {}, log: () => {} });
++  const second = registerProcessGuards({ target: proc, exit: () => {}, log: () => {} });
++  assert.equal(proc.listenerCount("uncaughtException"), 1);
++  assert.equal(proc.listenerCount("unhandledRejection"), 1);
++  assert.equal(first, second, "the existing disposer is reused");
++  assert.equal(processGuardsRegistered(), true);
++  first();
++  assert.equal(proc.listenerCount("uncaughtException"), 0);
++  assert.equal(proc.listenerCount("unhandledRejection"), 0);
++  assert.equal(processGuardsRegistered(), false);
++  first(); // disposing twice is safe
++});
++
++test("dispose stops the guards from reacting", () => {
++  const { proc, logs, exits, dispose } = harness();
++  dispose();
++  proc.emit("uncaughtException", new Error("after dispose"));
++  assert.deepEqual(exits, []);
++  assert.deepEqual(logs, []);
++});
+diff --git a/apps/swarmagents/lib/runtime/process-guard.ts b/apps/swarmagents/lib/runtime/process-guard.ts
+new file mode 100644
+index 000000000..dcdb9784e
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/process-guard.ts
+@@ -0,0 +1,153 @@
++/**
++ * Last-resort process guards (VM-02).
++ *
++ * Stream errors are the one failure mode that cannot always be caught where it
++ * happens: a `socket.write()` whose reader is gone reports EPIPE asynchronously
++ * on the socket, and an 'error' event with no listener terminates the process.
++ * A single broken VM pipe must therefore never take the whole Next.js server
++ * down — every signed-in user would lose their session.
++ *
++ * `registerProcessGuards()` installs one `uncaughtException` and one
++ * `unhandledRejection` listener that:
++ *
++ * - log the error with its code and message, and keep serving, when the error
++ *   is a known stream error (EPIPE, ECONNRESET, destroyed / premature-close
++ *   streams). The failing request has already been rejected by the caller; the
++ *   process itself is healthy.
++ * - log the error and exit(1) for anything else, which preserves Node's
++ *   default behaviour: an unknown uncaught exception is a programming error and
++ *   must not be swallowed.
++ *
++ * Registration is idempotent (a module-level flag plus the globalThis guard,
++ * because Next.js can load this file into several bundles) and the returned
++ * disposer removes both listeners so tests can run cleanly.
++ */
++
++/** Error codes that mean "a stream peer went away", not "the server is broken". */
++export const KNOWN_STREAM_CODES = [
++  "EPIPE",
++  "ECONNRESET",
++  "EPROTO",
++  "ERR_STREAM_DESTROYED",
++  "ERR_STREAM_PREMATURE_CLOSE",
++  "ERR_STREAM_WRITE_AFTER_END",
++  "ERR_STREAM_ALREADY_FINISHED",
++  "ECANCELED",
++] as const;
++
++const KNOWN_STREAM_SET: ReadonlySet<string> = new Set(KNOWN_STREAM_CODES);
++
++/** True when `err` is a known stream error that must not crash the server. */
++export function isKnownStreamError(err: unknown): boolean {
++  if (!err || typeof err !== "object") return false;
++  const code = (err as NodeJS.ErrnoException).code;
++  return typeof code === "string" && KNOWN_STREAM_SET.has(code);
++}
++
++/** One line describing an unknown thrown value, safe for logs. */
++export function describeError(err: unknown): string {
++  if (err instanceof Error) {
++    const code = (err as NodeJS.ErrnoException).code;
++    return code ? `${err.name} [${code}]: ${err.message}` : `${err.name}: ${err.message}`;
++  }
++  if (typeof err === "string") return err;
++  try {
++    return JSON.stringify(err) ?? String(err);
++  } catch {
++    return String(err);
++  }
++}
++
++/** Injectable surface so tests never touch the real process. */
++export interface ProcessGuardTarget {
++  on(event: "uncaughtException" | "unhandledRejection", listener: (arg: unknown) => void): unknown;
++  removeListener(
++    event: "uncaughtException" | "unhandledRejection",
++    listener: (arg: unknown) => void,
++  ): unknown;
++}
++
++export interface ProcessGuardOptions {
++  /** Process to guard; defaults to the real one. */
++  target?: ProcessGuardTarget;
++  /** Exit function; defaults to `process.exit`. */
++  exit?: (code: number) => void;
++  /** Logger; defaults to console.error. */
++  log?: (message: string) => void;
++}
++
++const GLOBAL_FLAG = "__swarmProcessGuards";
++
++interface GuardFlag {
++  registered: boolean;
++  dispose: (() => void) | null;
++  target: ProcessGuardTarget | null;
++}
++
++function flag(): GuardFlag {
++  const holder = globalThis as unknown as Record<string, GuardFlag | undefined>;
++  if (!holder[GLOBAL_FLAG]) {
++    holder[GLOBAL_FLAG] = { registered: false, dispose: null, target: null };
++  }
++  return holder[GLOBAL_FLAG] as GuardFlag;
++}
++
++/**
++ * Install the guards once per process. Returns a disposer (also stored on the
++ * global flag) that removes them; calling it twice is safe.
++ */
++export function registerProcessGuards(options: ProcessGuardOptions = {}): () => void {
++  const target = options.target ?? (process as unknown as ProcessGuardTarget);
++  const exit = options.exit ?? ((code: number) => process.exit(code));
++  const log = options.log ?? ((message: string) => console.error(message));
++
++  // Next.js loads instrumentation once, but several bundles can import this
++  // module: the same target is only ever guarded once.
++  const existing = flag();
++  if (existing.registered && existing.dispose && existing.target === target) {
++    return existing.dispose;
++  }
++
++  const onUncaught = (err: unknown): void => {
++    if (isKnownStreamError(err)) {
++      log(`[process] ignored stream error (server keeps serving): ${describeError(err)}`);
++      return;
++    }
++    log(`[process] fatal uncaught exception: ${describeError(err)}`);
++    exit(1);
++  };
++
++  const onRejection = (reason: unknown): void => {
++    if (isKnownStreamError(reason)) {
++      log(`[process] ignored stream rejection (server keeps serving): ${describeError(reason)}`);
++      return;
++    }
++    log(`[process] fatal unhandled rejection: ${describeError(reason)}`);
++    exit(1);
++  };
++
++  target.on("uncaughtException", onUncaught);
++  target.on("unhandledRejection", onRejection);
++
++  const dispose = (): void => {
++    target.removeListener("uncaughtException", onUncaught);
++    target.removeListener("unhandledRejection", onRejection);
++    const state = flag();
++    if (state.dispose === dispose) {
++      state.registered = false;
++      state.dispose = null;
++      state.target = null;
++    }
++  };
++
++  const state = flag();
++  state.registered = true;
++  state.dispose = dispose;
++  state.target = target;
++  return dispose;
++}
++
++/** True when the guards are installed in this process. */
++export function processGuardsRegistered(): boolean {
++  return flag().registered;
++}
+diff --git a/apps/swarmagents/lib/vm/docker-driver.ts b/apps/swarmagents/lib/vm/docker-driver.ts
+index 50786226d..2a260fb78 100644
+--- a/apps/swarmagents/lib/vm/docker-driver.ts
++++ b/apps/swarmagents/lib/vm/docker-driver.ts
+@@ -4,6 +4,7 @@
+ 
+ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+ import { randomBytes } from "node:crypto";
++import { Readable, pipeline } from "node:stream";
+ import type {
+   VmDriver,
+   VmHandle,
+@@ -221,6 +222,98 @@ export class VmUnavailableError extends Error {
+   }
+ }
+ 
++/**
++ * Error codes meaning "the child process stopped reading our stdin". They are
++ * the async failure mode of a pipe whose reader is gone: the write lands on a
++ * closed socket and Node emits EPIPE (or destroys the stream) on the handle
++ * instead of returning an error from write().
++ */
++export const STDIN_CLOSED_CODES = [
++  "EPIPE",
++  "ECONNRESET",
++  "EPROTO",
++  "ERR_STREAM_DESTROYED",
++  "ERR_STREAM_PREMATURE_CLOSE",
++  "ERR_STREAM_WRITE_AFTER_END",
++] as const;
++
++const STDIN_CLOSED_SET: ReadonlySet<string> = new Set(STDIN_CLOSED_CODES);
++
++/** True when `err` is a "stdin closed early" stream error (EPIPE class). */
++export function isStdinClosedError(err: unknown): boolean {
++  if (!err || typeof err !== "object") return false;
++  const code = (err as NodeJS.ErrnoException).code;
++  return typeof code === "string" && STDIN_CLOSED_SET.has(code);
++}
++
++/**
++ * Raised when writing the exec() payload to the child's stdin fails because
++ * the child closed the pipe (EPIPE and friends). Without this, the failure
++ * arrives as an unhandled 'error' event on the stdin socket and takes the
++ * whole Next.js process down (VM-02).
++ *
++ * `code` is always "EPIPE" so callers can treat it as an EPIPE-class failure
++ * regardless of which underlying code fired; `streamCode` keeps the original.
++ */
++export class VmStdinError extends Error {
++  readonly code = "EPIPE";
++  readonly streamCode: string;
++  readonly cause?: Error;
++  constructor(message: string, streamCode: string, cause?: Error) {
++    super(message);
++    this.name = "VmStdinError";
++    this.streamCode = streamCode;
++    this.cause = cause;
++  }
++}
++
++/** Wrap any stdin failure in a {@link VmStdinError} with a readable message. */
++export function toStdinError(err: unknown): VmStdinError {
++  const raw =
++    err && typeof err === "object" ? (err as NodeJS.ErrnoException).code : undefined;
++  const code = typeof raw === "string" && raw.length > 0 ? raw : "EPIPE";
++  const cause = err instanceof Error ? err : undefined;
++  return new VmStdinError(
++    `The command stopped reading stdin before the payload was written (${code}). ` +
++      `The destination may be a directory, the workspace may be full, or the VM may have stopped.`,
++    code,
++    cause,
++  );
++}
++
++/**
++ * Attach a no-op 'error' listener so a stream error can never surface as an
++ * unhandled 'error' event (which crashes the process). An optional callback
++ * lets the caller record the failure.
++ */
++function guardStream(
++  stream: NodeJS.ReadableStream | NodeJS.WritableStream | null | undefined,
++  onError?: (err: Error) => void,
++): void {
++  if (!stream || typeof stream.on !== "function") return;
++  stream.on("error", (err: Error) => {
++    onError?.(err);
++  });
++}
++
++/**
++ * Size of one stdin chunk. Large payloads are fed to the pipe in pieces so the
++ * write path honours the socket's backpressure instead of handing a 13 MB
++ * buffer to one `write()` whose `false` return value nobody looks at.
++ */
++export const STDIN_CHUNK_BYTES = 64 * 1024;
++
++/** Split a payload into chunks for {@link Readable.from}. */
++function* chunked(payload: Buffer, size: number): Generator<Buffer> {
++  if (payload.length === 0) {
++    yield Buffer.alloc(0);
++    return;
++  }
++  for (let offset = 0; offset < payload.length; offset += size) {
++    yield payload.subarray(offset, Math.min(offset + size, payload.length));
++  }
++}
++
+ /** Sanitize a user id into a safe container / volume name segment. */
+ export function sanitizeId(raw: string): string {
+   return raw
+@@ -538,9 +631,23 @@ export class DockerVmDriver implements VmDriver {
+ 
+       const chunks: Buffer[] = [];
+       let stderr = "";
++      let done = false;
++      let t: NodeJS.Timeout | null = null;
+       cp.stdout?.on("data", (buf) => { chunks.push(Buffer.from(buf as Buffer)); });
+       cp.stderr?.on("data", (buf) => { stderr += String(buf); });
+ 
++      // A read error on either pipe (EPIPE when the CLI exits early, a reset
++      // socket) must settle the promise, never crash the process: an 'error'
++      // event with no listener is fatal in Node.
++      const fail = (err: Error) => {
++        if (done) return;
++        done = true;
++        if (t) clearTimeout(t);
++        reject(err);
++      };
++      guardStream(cp.stdout, fail);
++      guardStream(cp.stderr, fail);
++
+       if (opts?.signal) {
+         const onAbort = () => {
+           try { cp.kill("SIGTERM"); } catch { /* ignore */ }
+@@ -552,26 +659,28 @@ export class DockerVmDriver implements VmDriver {
+         }
+       }
+ 
+-      const t = opts?.timeoutMs && opts.timeoutMs > 0
++      t = opts?.timeoutMs && opts.timeoutMs > 0
+         ? setTimeout(() => { try { cp.kill("SIGTERM"); } catch { /* ignore */ } }, opts.timeoutMs)
+         : null;
+ 
+       cp.on("error", (err) => {
+-        if (t) clearTimeout(t);
++        if (done) return;
+         const errno = err as NodeJS.ErrnoException;
+         if (errno.code === "ENOENT") {
+-          reject(
++          fail(
+             new VmUnavailableError(
+               "Docker CLI was not found (ENOENT). Ensure Docker is installed and available on your PATH.",
+               err,
+             ),
+           );
+         } else {
+-          reject(err);
++          fail(err);
+         }
+       });
+ 
+       cp.on("close", (code) => {
++        if (done) return;
++        done = true;
+         if (t) clearTimeout(t);
+         resolve({ code: code ?? 0, stdout: Buffer.concat(chunks), stderr });
+       });
+@@ -845,6 +954,7 @@ export class DockerVmDriver implements VmDriver {
+       let aborted = false;
+       let timedOut = false;
+       let removeAbort: (() => void) | null = null;
++      let t: NodeJS.Timeout | null = null;
+ 
+       const cp = this.spawnFn("docker", argv, { env, shell: false });
+ 
+@@ -856,6 +966,22 @@ export class DockerVmDriver implements VmDriver {
+         resolve({ exitCode: code });
+       };
+ 
++      /**
++       * Reject exactly once and release the timers/abort listener. Used by the
++       * spawn 'error' path and by the stdin pipeline, so an EPIPE while writing
++       * the payload can never leave the promise pending or the child running.
++       */
++      const fail = (err: Error) => {
++        if (settled) return;
++        settled = true;
++        if (t) clearTimeout(t);
++        if (removeAbort) removeAbort();
++        // The CLI is unusable once its stdin pipe is gone: reap it so a wedged
++        // docker process cannot outlive the request.
++        try { cp.kill("SIGTERM"); } catch { /* ignore */ }
++        reject(err);
++      };
++
+       if (opts?.signal) {
+         const onAbort = () => {
+           if (settled) return;
+@@ -876,7 +1002,7 @@ export class DockerVmDriver implements VmDriver {
+       // Backstop only: the in-container `timeout` wrapper normally kills the
+       // command first and exits 124. This timer only guards against a wedged
+       // docker CLI that never closes after the deadline.
+-      const t = timeoutMs
++      t = timeoutMs
+         ? setTimeout(() => {
+             if (settled) return;
+             timedOut = true;
+@@ -885,11 +1011,7 @@ export class DockerVmDriver implements VmDriver {
+         : null;
+ 
+       cp.on("error", (err) => {
+-        if (settled) return;
+-        settled = true;
+-        if (t) clearTimeout(t);
+-        if (removeAbort) removeAbort();
+-        reject(err);
++        fail(err);
+       });
+ 
+       cp.on("close", (code) => {
+@@ -905,13 +1027,56 @@ export class DockerVmDriver implements VmDriver {
+         cp.stderr?.on("data", (buf) => opts?.onStderr?.(String(buf)));
+       }
+ 
++      // Output pipes get a listener even when nobody is reading them: a read
++      // error (the CLI died mid-stream) is fatal without one.
++      guardStream(cp.stdout, () => { /* output errors are not fatal */ });
++      guardStream(cp.stderr, () => { /* output errors are not fatal */ });
++
+       if (opts?.stdin !== undefined) {
+-        cp.stdin?.write(opts.stdin);
+-        cp.stdin?.end();
++        this.pipeStdin(cp, opts.stdin, fail);
+       }
+     });
+   }
+ 
++  /**
++   * Write an exec payload to the child's stdin with backpressure.
++   *
++   * The payload is fed from a Readable through `stream.pipeline`, so a large
++   * upload (13 MB and up) is chunked by the stream machinery instead of being
++   * buffered in one `write()` that returns false and is then ignored. Every
++   * failure — most importantly EPIPE when the child closed stdin early (the
++   * destination is a directory, the workspace is full, the container vanished)
++   * — reaches the pipeline callback and is turned into a {@link VmStdinError}
++   * that rejects the exec promise. The listener is attached *before* the first
++   * byte is written, so the error can never surface as an unhandled 'error'
++   * event (which would kill the process: VM-02).
++   */
++  private pipeStdin(cp: ChildProcess, input: string | Buffer, onError: (err: Error) => void): void {
++    const sink = cp.stdin;
++    if (!sink) {
++      onError(
++        new VmStdinError(
++          "The command has no stdin pipe; the payload could not be delivered.",
++          "ENOSTDIN",
++        ),
++      );
++      return;
++    }
++
++    // pipeline attaches its own error handling to both ends; the extra guard
++    // covers the window before pipeline has wired the sink.
++    guardStream(sink, () => { /* pipeline reports this via its callback */ });
++
++    const payload = Buffer.isBuffer(input) ? input : Buffer.from(input, "utf8");
++    const source = Readable.from(chunked(payload, STDIN_CHUNK_BYTES));
++    source.on("error", () => { /* surfaced through the pipeline callback */ });
++
++    pipeline(source, sink, (err) => {
++      if (!err) return;
++      onError(isStdinClosedError(err) ? toStdinError(err) : err);
++    });
++  }
++
+   async writeFile(handle: VmHandle, path: string, content: string): Promise<void> {
+     if (!path.startsWith("/")) {
+       throw new Error(`writeFile requires an absolute path, got ${JSON.stringify(path)}`);
+diff --git a/apps/swarmagents/lib/vm/index.test.ts b/apps/swarmagents/lib/vm/index.test.ts
+index e4e7467e8..8ffff5197 100644
+--- a/apps/swarmagents/lib/vm/index.test.ts
++++ b/apps/swarmagents/lib/vm/index.test.ts
+@@ -1,13 +1,16 @@
+ import test from "node:test";
+ import assert from "node:assert/strict";
+ import { EventEmitter } from "node:events";
++import { Writable } from "node:stream";
+ import type { ChildProcess, SpawnOptions } from "node:child_process";
+ import { FakeVmDriver } from "./fake-driver.js";
+ import {
+   DockerVmDriver,
+   VmUnavailableError,
++  VmStdinError,
+   VmRuntimeError,
+   VmNetworkError,
++  isStdinClosedError,
+   sanitizeId,
+   containerNameFor,
+   volumeNameFor,
+@@ -41,15 +44,37 @@ interface FakeSpawnCall {
+     killed: boolean;
+     stdout: EventEmitter;
+     stderr: EventEmitter;
++    /** Bytes the driver actually delivered on stdin, in order. */
++    stdinChunks: Buffer[];
++    /** Destroy stdin with an EPIPE-class error (child stopped reading). */
++    closeStdin: (code?: string) => void;
+   };
+ }
+ 
+-function makeFakeSpawn() {
++/**
++ * A Writable that records everything written to it, like a child's stdin pipe.
++ * With `stalled`, the write callback is never invoked, so the pipe stays
++ * backpressured and a later destroy() always lands while a write is pending
++ * (a deterministic EPIPE instead of a race with a fast sink).
++ */
++function makeFakeStdin(stalled = false): { sink: Writable; chunks: Buffer[] } {
++  const chunks: Buffer[] = [];
++  const sink = new Writable({
++    write(chunk: Buffer, _enc, cb) {
++      chunks.push(Buffer.from(chunk));
++      if (!stalled) cb();
++    },
++  });
++  return { sink, chunks };
++}
++
++function makeFakeSpawn(options: { stallStdin?: boolean } = {}) {
+   const calls: FakeSpawnCall[] = [];
+   const spawnFn = (cmd: string, args: readonly string[], opts?: SpawnOptions): ChildProcess => {
+     const stdout = new EventEmitter();
+     const stderr = new EventEmitter();
+     const emitter = new EventEmitter();
++    const { sink: stdin, chunks: stdinChunks } = makeFakeStdin(options.stallStdin ?? false);
+     const call: FakeSpawnCall = {
+       cmd,
+       args,
+@@ -65,12 +90,18 @@ function makeFakeSpawn() {
+         killed: false,
+         stdout,
+         stderr,
++        stdinChunks,
++        closeStdin: (code = "EPIPE") => {
++          const err = Object.assign(new Error(`write ${code}`), { code });
++          stdin.destroy(err);
++        },
+       },
+     };
+     calls.push(call);
+     const cp: Record<string, unknown> = {
+       stdout,
+       stderr,
++      stdin,
+       on: (ev: string, fn: (...a: unknown[]) => void) => {
+         emitter.on(ev, fn);
+         return cp;
+@@ -619,6 +650,8 @@ test("DockerVmDriver.writeFile creates parent dir and pipes content via stdin",
+     "exec", "-i", "--", "swarm-vm-alice", "sh", "-c", "cat > \"$1\"", "sh", "/workspace/sub/a.txt",
+   ]);
+   assert.ok(!calls[1].args.some((a) => a.includes("big-content")), "content must not appear in argv");
++  await waitFor(() => stdinBytes(calls[1]) === "big-content".length);
++  assert.equal(Buffer.concat(calls[1].cp.stdinChunks).toString("utf8"), "big-content");
+   calls[1].cp.emitClose(0);
+ 
+   await p;
+@@ -1043,3 +1076,104 @@ test("bindExec adapts a VmManager to the harness exec shape", async () => {
+   assert.equal(res.exitCode, 0);
+   assert.equal(chunks.join(""), "hi\n");
+ });
++
++// ---------------------------------------------------------------------------
++// VM-02: stdin must never crash the process (EPIPE) and must honour
++// backpressure for large payloads.
++// ---------------------------------------------------------------------------
++
++/** Poll until `predicate` holds or the timeout expires (no fixed sleeps). */
++async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
++  const deadline = Date.now() + timeoutMs;
++  while (!predicate()) {
++    if (Date.now() > deadline) throw new Error("waitFor timed out");
++    await new Promise((r) => setTimeout(r, 5));
++  }
++}
++
++const stdinBytes = (call: FakeSpawnCall) =>
++  call.cp.stdinChunks.reduce((total, chunk) => total + chunk.length, 0);
++
++test("DockerVmDriver.exec feeds a 13 MB stdin payload in chunks", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn });
++  const payload = "x".repeat(13 * 1024 * 1024);
++
++  const p = driver.exec(handle(), ["sh", "-c", "cat > /dev/null"], { stdin: payload });
++  const call = calls[0];
++  assert.ok(call.args.includes("-i"), "stdin requires docker exec -i");
++
++  await waitFor(() => stdinBytes(call) === Buffer.byteLength(payload));
++  assert.ok(
++    call.cp.stdinChunks.length > 1,
++    `expected the payload to be written in several chunks, got ${call.cp.stdinChunks.length}`,
++  );
++  assert.equal(call.cp.stdinChunks.map((c) => c.toString("utf8")).join(""), payload);
++
++  call.cp.emitClose(0);
++  assert.equal((await p).exitCode, 0);
++});
++
++test("DockerVmDriver.exec rejects with an EPIPE-class error when stdin closes early", async () => {
++  // A stalled sink keeps a write pending, so the destroy() below always lands
++  // mid-write instead of racing a fast pipe.
++  const { spawnFn, calls } = makeFakeSpawn({ stallStdin: true });
++  const driver = new DockerVmDriver({ spawnFn });
++
++  const p = driver.exec(handle(), ["sh", "-c", "cat > \"$1\"", "sh", "/workspace"], {
++    stdin: "y".repeat(1024 * 1024),
++  });
++  const call = calls[0];
++  call.cp.closeStdin("EPIPE");
++
++  await assert.rejects(p, (err: unknown) => {
++    assert.ok(err instanceof VmStdinError, `expected VmStdinError, got ${String(err)}`);
++    assert.equal(err.code, "EPIPE");
++    assert.ok(isStdinClosedError(err));
++    return true;
++  });
++  // The CLI is reaped so a wedged docker process cannot outlive the request.
++  assert.ok(call.cp.killed);
++});
++
++test("DockerVmDriver.exec survives a premature close of stdin (ERR_STREAM_PREMATURE_CLOSE)", async () => {
++  const { spawnFn, calls } = makeFakeSpawn({ stallStdin: true });
++  const driver = new DockerVmDriver({ spawnFn });
++
++  const p = driver.exec(handle(), ["sh", "-c", "cat"], { stdin: "z".repeat(256 * 1024) });
++  calls[0].cp.closeStdin("ERR_STREAM_PREMATURE_CLOSE");
++
++  await assert.rejects(p, (err: unknown) => {
++    assert.ok(err instanceof VmStdinError);
++    assert.equal(err.code, "EPIPE");
++    return true;
++  });
++  // Reaching this line proves the process was not taken down by the error.
++  assert.equal(typeof process.pid, "number");
++});
++
++test("DockerVmDriver.exec ignores output-pipe errors instead of crashing", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn });
++
++  const p = driver.exec(handle(), ["true"]);
++  calls[0].cp.stdout.emit("error", Object.assign(new Error("read EPIPE"), { code: "EPIPE" }));
++  calls[0].cp.emitClose(0);
++  assert.equal((await p).exitCode, 0);
++});
++
++test("DockerVmDriver.writeFile rejects when the destination closes stdin", async () => {
++  const { spawnFn, calls } = makeFakeSpawn({ stallStdin: true });
++  const driver = new DockerVmDriver({ spawnFn });
++
++  const p = driver.writeFile(handle(), "/workspace/a.txt", "content");
++  calls[0].cp.emitClose(0); // mkdir
++  await flush();
++  calls[1].cp.closeStdin("EPIPE");
++
++  await assert.rejects(p, (err: unknown) => {
++    assert.ok(err instanceof VmStdinError);
++    assert.match((err as Error).message, /stopped reading stdin/);
++    return true;
++  });
++});
+-- 
+2.55.0
+

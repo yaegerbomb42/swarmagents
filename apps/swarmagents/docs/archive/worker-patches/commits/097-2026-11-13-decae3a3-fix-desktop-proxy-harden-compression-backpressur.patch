@@ -1,0 +1,601 @@
+From decae3a3359940c04626e8a8ae52786af8875eb4 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <203348624+yaegerbomb42@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:20:30 +0000
+Subject: [PATCH] fix(desktop-proxy): harden compression, backpressure and
+ frame masking
+
+- Never negotiate permessage-deflate: stop forwarding the browser's
+  sec-websocket-extensions upstream and stop echoing the upstream's
+  extension header in the 101 reply, since the bridge re-frames every
+  message.
+- Apply slow-viewer backpressure: pause the upstream socket above 8 MB
+  of unacked browser data, resume on drain, and close with 1001 if still
+  above 32 MB after 10 s.
+- Enforce RFC 6455 mask direction per hop: an unmasked browser frame or a
+  masked container frame is a protocol error, answered with close 1002
+  before teardown.
+---
+ .../lib/desktop-proxy/bridge.test.ts          |  66 +++++++++
+ apps/swarmagents/lib/desktop-proxy/bridge.ts  | 125 ++++++++++++++++--
+ .../lib/desktop-proxy/proxy.test.ts           |  32 ++++-
+ apps/swarmagents/lib/desktop-proxy/proxy.ts   |   9 +-
+ apps/swarmagents/lib/desktop-proxy/ws.ts      |  45 +++++--
+ 5 files changed, 250 insertions(+), 27 deletions(-)
+
+diff --git a/apps/swarmagents/lib/desktop-proxy/bridge.test.ts b/apps/swarmagents/lib/desktop-proxy/bridge.test.ts
+index 1d9860256..1096f9a99 100644
+--- a/apps/swarmagents/lib/desktop-proxy/bridge.test.ts
++++ b/apps/swarmagents/lib/desktop-proxy/bridge.test.ts
+@@ -21,6 +21,7 @@ import {
+   OP_CONTINUATION,
+   OP_PING,
+   OP_PONG,
++  OP_CLOSE,
+   type WsMessage,
+ } from "./ws";
+ import { vncDesResponse, RFB_VERSION } from "./rfb";
+@@ -31,6 +32,8 @@ class FakeSocket extends EventEmitter {
+   writes: Buffer[] = [];
+   destroyed = false;
+   ended = false;
++  writableLength = 0;
++  paused = false;
+   write(data: Buffer | string): boolean {
+     this.writes.push(Buffer.from(data));
+     return true;
+@@ -44,6 +47,20 @@ class FakeSocket extends EventEmitter {
+     this.destroyed = true;
+     return this;
+   }
++  pause(): this {
++    this.paused = true;
++    return this;
++  }
++  resume(): this {
++    this.paused = false;
++    return this;
++  }
++  isPaused(): boolean {
++    return this.paused;
++  }
++  drain(): void {
++    this.emit("drain");
++  }
+   feed(chunk: Buffer): void {
+     this.emit("data", chunk);
+   }
+@@ -392,3 +409,52 @@ test("bridge: bytes arriving with the upgrade (head) go through the decoders", (
+   const toBrowser = h.toClient.binary();
+   assert.equal(toBrowser.subarray(0, 12).toString(), RFB_VERSION, "client head answered");
+ });
++
++test("bridge: an unmasked browser frame is a protocol error closed with 1002", () => {
++  const h = makeBridge("control");
++  handshake(h);
++  h.client.feed(frame(OP_BINARY, Buffer.from("hello"), { masked: false }));
++  assert.deepEqual(h.closes, ["client-unmasked-frame"]);
++  assert.ok(h.client.destroyed && h.upstream.destroyed, "both sockets torn down");
++  const close = h.toClient.read().find((m) => m.opcode === OP_CLOSE);
++  assert.ok(close, "close frame sent to the browser");
++  assert.equal(close!.payload.readUInt16BE(0), 1002);
++});
++
++test("bridge: a masked container frame is a protocol error closed with 1002", () => {
++  const h = makeBridge("view");
++  handshake(h);
++  h.upstream.feed(frame(OP_BINARY, Buffer.from("hello"), { masked: true }));
++  assert.deepEqual(h.closes, ["upstream-masked-frame"]);
++  assert.ok(h.client.destroyed && h.upstream.destroyed, "both sockets torn down");
++  const close = h.toUpstream.read().find((m) => m.opcode === OP_CLOSE);
++  assert.ok(close, "close frame sent to the container");
++  assert.equal(close!.payload.readUInt16BE(0), 1002);
++});
++
++test("bridge: a slow browser pauses the upstream socket until it drains", () => {
++  const h = makeBridge("control", { clientHighWaterBytes: 1024 });
++  handshake(h);
++  h.client.writableLength = 2048;
++  h.upstream.feed(encodeFrame(OP_BINARY, Buffer.from("x")));
++  assert.equal(h.upstream.isPaused(), true, "upstream paused above the high-water mark");
++  h.client.writableLength = 0;
++  h.client.drain();
++  assert.equal(h.upstream.isPaused(), false, "upstream resumed once the browser drained");
++  assert.deepEqual(h.closes, []);
++});
++
++test("bridge: a browser stuck above the hard cap is closed after the grace period", async () => {
++  const h = makeBridge("control", {
++    clientHighWaterBytes: 1024,
++    clientMaxBufferBytes: 2048,
++    slowDrainMs: 20,
++  });
++  handshake(h);
++  h.client.writableLength = 4096;
++  h.upstream.feed(encodeFrame(OP_BINARY, Buffer.from("x")));
++  assert.deepEqual(h.closes, [], "not closed immediately");
++  await new Promise((r) => setTimeout(r, 80));
++  assert.deepEqual(h.closes, ["client-slow-drain"]);
++  assert.ok(h.client.destroyed && h.upstream.destroyed, "both sockets torn down");
++});
+diff --git a/apps/swarmagents/lib/desktop-proxy/bridge.ts b/apps/swarmagents/lib/desktop-proxy/bridge.ts
+index 49a446de2..39d35a8b0 100644
+--- a/apps/swarmagents/lib/desktop-proxy/bridge.ts
++++ b/apps/swarmagents/lib/desktop-proxy/bridge.ts
+@@ -31,6 +31,7 @@ import {
+ import {
+   WsFrameDecoder,
+   WsBufferOverflowError,
++  WsMaskError,
+   MAX_WS_BUFFER_BYTES,
+   encodeFrame,
+   encodeClientFrame,
+@@ -45,6 +46,13 @@ import {
+ 
+ export const HANDSHAKE_TIMEOUT_MS = 15_000;
+ 
++/** Unacked browser bytes that pause the upstream socket. */
++export const DEFAULT_CLIENT_HIGH_WATER_BYTES = 8 * 1024 * 1024;
++/** Unacked browser bytes tolerated before a slow-drain timer starts. */
++export const DEFAULT_CLIENT_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
++/** How long the browser may stay above the max buffer before closing. */
++export const DEFAULT_SLOW_DRAIN_MS = 10_000;
++
+ export interface DesktopBridgeOptions {
+   mode: RfbFilterMode;
+   password: string;
+@@ -60,6 +68,18 @@ export interface DesktopBridgeOptions {
+   clientHead?: Buffer;
+   /** Bytes the container sent right after its 101 response (upgrade `head`). */
+   upstreamHead?: Buffer;
++  /**
++   * Unacked bytes toward the browser at which the upstream socket is paused.
++   * Default 8 MB. Keeps a slow viewer from making the container buffer.
++   */
++  clientHighWaterBytes?: number;
++  /**
++   * Hard cap on unacked bytes toward the browser. If the socket is still over
++   * this after `slowDrainMs`, the bridge closes. Default 32 MB.
++   */
++  clientMaxBufferBytes?: number;
++  /** Grace period above `clientMaxBufferBytes` before closing. Default 10 s. */
++  slowDrainMs?: number;
+ }
+ 
+ export class DesktopBridge {
+@@ -80,6 +100,10 @@ export class DesktopBridge {
+   private timeout: NodeJS.Timeout | null = null;
+   private readonly onActivity: () => void;
+   private readonly onCloseCb: (reason: string) => void;
++  private readonly clientHighWaterBytes: number;
++  private readonly clientMaxBufferBytes: number;
++  private readonly slowDrainMs: number;
++  private slowDrainTimer: NodeJS.Timeout | null = null;
+ 
+   constructor(
+     private readonly client: net.Socket,
+@@ -91,8 +115,13 @@ export class DesktopBridge {
+     this.onActivity = options.onActivity;
+     this.onCloseCb = options.onClose;
+     this.maxBufferBytes = options.maxBufferBytes ?? MAX_WS_BUFFER_BYTES;
+-    this.clientDecoder = new WsFrameDecoder(this.maxBufferBytes);
+-    this.upstreamDecoder = new WsFrameDecoder(this.maxBufferBytes);
++    this.clientHighWaterBytes = options.clientHighWaterBytes ?? DEFAULT_CLIENT_HIGH_WATER_BYTES;
++    this.clientMaxBufferBytes = options.clientMaxBufferBytes ?? DEFAULT_CLIENT_MAX_BUFFER_BYTES;
++    this.slowDrainMs = options.slowDrainMs ?? DEFAULT_SLOW_DRAIN_MS;
++    // The browser must mask every frame; the container (our WebSocket server)
++    // must not. A violation is a protocol error, not data.
++    this.clientDecoder = new WsFrameDecoder(this.maxBufferBytes, true);
++    this.upstreamDecoder = new WsFrameDecoder(this.maxBufferBytes, false);
+ 
+     // The proxy is the RFB client toward the container: it speaks first.
+     const startBytes = this.clientHs.start();
+@@ -102,6 +131,7 @@ export class DesktopBridge {
+     upstream.on("data", (chunk: Buffer) => this.onUpstreamChunk(chunk));
+     client.on("error", () => this.fail("client-error"));
+     upstream.on("error", () => this.fail("upstream-error"));
++    client.on("drain", () => this.onClientDrain());
+ 
+     this.timeout = setTimeout(() => this.fail("handshake-timeout"), HANDSHAKE_TIMEOUT_MS);
+     this.timeout.unref?.();
+@@ -115,27 +145,46 @@ export class DesktopBridge {
+     if (this.closed) return;
+     this.closed = true;
+     if (this.timeout) clearTimeout(this.timeout);
++    this.clearSlowDrainTimer();
+     this.client.destroy();
+     this.upstream.destroy();
+     this.onCloseCb(reason);
+   }
+ 
++  /**
++   * A mask bit pointing the wrong way is a fatal protocol error: tell the
++   * offending peer with close code 1002, then tear the bridge down.
++   */
++  private protocolError(fromClient: boolean, reason: string): void {
++    if (this.closed) return;
++    const target = fromClient ? this.client : this.upstream;
++    if (!target.destroyed) {
++      target.write(fromClient ? closeFrame(1002, reason) : clientCloseFrame(1002, reason));
++      target.end();
++    }
++    this.fail(reason);
++  }
++
+   private handleMessage(message: WsMessage, fromClient: boolean): void {
+     if (message.opcode === OP_PING) {
+       // Answer on the side that pinged; toward upstream we are the client, so
+       // the pong is masked.
+       if (fromClient) {
+-        if (!this.client.destroyed) this.client.write(encodeFrame(OP_PONG, message.payload));
++        this.writeToClient(encodeFrame(OP_PONG, message.payload));
+       } else if (!this.upstream.destroyed) {
+         this.upstream.write(encodeClientFrame(OP_PONG, message.payload));
+       }
+       return;
+     }
+     if (message.opcode === OP_CLOSE) {
+-      const target = fromClient ? this.upstream : this.client;
+-      if (!target.destroyed) {
+-        target.write(fromClient ? clientCloseFrame(1000, "") : closeFrame(1000, ""));
+-        target.end();
++      if (fromClient) {
++        if (!this.upstream.destroyed) {
++          this.upstream.write(clientCloseFrame(1000, ""));
++          this.upstream.end();
++        }
++      } else {
++        this.writeToClient(closeFrame(1000, ""));
++        this.client.end();
+       }
+       this.fail("close-frame");
+       return;
+@@ -162,6 +211,10 @@ export class DesktopBridge {
+     try {
+       messages = decoder.push(chunk);
+     } catch (err) {
++      if (err instanceof WsMaskError) {
++        this.protocolError(fromClient, fromClient ? "client-unmasked-frame" : "upstream-masked-frame");
++        return;
++      }
+       const side = fromClient ? "client" : "upstream";
+       this.fail(err instanceof WsBufferOverflowError ? `${side}-buffer-overflow` : fromClient ? "protocol-error" : "upstream-protocol-error");
+       return;
+@@ -186,7 +239,7 @@ export class DesktopBridge {
+     if (!this.serverHs.done) {
+       try {
+         const { out, surplus } = this.serverHs.feed(payload);
+-        if (out.length > 0) this.client.write(encodeFrame(OP_BINARY, out));
++        if (out.length > 0) this.writeToClient(encodeFrame(OP_BINARY, out));
+         if (surplus.length > 0) this.defer(true, surplus);
+       } catch {
+         this.fail("client-handshake-error");
+@@ -220,7 +273,7 @@ export class DesktopBridge {
+       this.defer(false, payload);
+       return;
+     }
+-    if (!this.client.destroyed) this.client.write(encodeFrame(OP_BINARY, payload));
++    this.writeToClient(encodeFrame(OP_BINARY, payload));
+   }
+ 
+   private maybeSplice(): void {
+@@ -230,7 +283,7 @@ export class DesktopBridge {
+     // The browser waits for ServerInit; send it with the upstream framebuffer
+     // dimensions before any message bytes flow.
+     const serverInit = this.serverHs.serverInit(this.clientHs.width, this.clientHs.height);
+-    this.client.write(encodeFrame(OP_BINARY, serverInit));
++    this.writeToClient(encodeFrame(OP_BINARY, serverInit));
+     if (this.clientDeferred.length > 0) {
+       const deferred = this.clientDeferred;
+       this.clientDeferred = Buffer.alloc(0);
+@@ -239,7 +292,7 @@ export class DesktopBridge {
+     if (this.upstreamDeferred.length > 0) {
+       const deferred = this.upstreamDeferred;
+       this.upstreamDeferred = Buffer.alloc(0);
+-      if (!this.client.destroyed) this.client.write(encodeFrame(OP_BINARY, deferred));
++      this.writeToClient(encodeFrame(OP_BINARY, deferred));
+     }
+   }
+ 
+@@ -253,6 +306,56 @@ export class DesktopBridge {
+     if (!this.upstream.destroyed) this.upstream.write(encodeClientFrame(OP_BINARY, payload));
+   }
+ 
++  /** Write a frame toward the browser and apply slow-viewer backpressure. */
++  private writeToClient(payload: Buffer): void {
++    if (this.client.destroyed) return;
++    this.client.write(payload);
++    this.enforceClientBackpressure();
++  }
++
++  /**
++   * Pause the upstream socket while the browser falls behind, and close the
++   * bridge if it stays far enough behind for `slowDrainMs`.
++   */
++  private enforceClientBackpressure(): void {
++    const pending = this.client.writableLength ?? 0;
++    if (!this.upstream.destroyed && typeof this.upstream.pause === "function") {
++      if (pending > this.clientHighWaterBytes) this.upstream.pause();
++      else if (typeof this.upstream.resume === "function") this.upstream.resume();
++    }
++    if (pending > this.clientMaxBufferBytes) {
++      if (!this.slowDrainTimer) {
++        this.slowDrainTimer = setTimeout(() => {
++          this.slowDrainTimer = null;
++          const stillOver = !this.closed && !this.client.destroyed &&
++            (this.client.writableLength ?? 0) > this.clientMaxBufferBytes;
++          if (!stillOver) return;
++          // Tell the browser we are going away before tearing the bridge down.
++          if (!this.client.destroyed) {
++            this.client.write(closeFrame(1001, "slow drain"));
++            this.client.end();
++          }
++          this.fail("client-slow-drain");
++        }, this.slowDrainMs);
++        this.slowDrainTimer.unref?.();
++      }
++    } else {
++      this.clearSlowDrainTimer();
++    }
++  }
++
++  private onClientDrain(): void {
++    if (!this.upstream.destroyed && typeof this.upstream.resume === "function") this.upstream.resume();
++    this.enforceClientBackpressure();
++  }
++
++  private clearSlowDrainTimer(): void {
++    if (this.slowDrainTimer) {
++      clearTimeout(this.slowDrainTimer);
++      this.slowDrainTimer = null;
++    }
++  }
++
+   private touch(): void {
+     this.onActivity();
+   }
+diff --git a/apps/swarmagents/lib/desktop-proxy/proxy.test.ts b/apps/swarmagents/lib/desktop-proxy/proxy.test.ts
+index f8d8e0f4e..1f809f216 100644
+--- a/apps/swarmagents/lib/desktop-proxy/proxy.test.ts
++++ b/apps/swarmagents/lib/desktop-proxy/proxy.test.ts
+@@ -61,7 +61,10 @@ class TestWsClient {
+   rawStream: Buffer[] = [];
+   receivedAll: Buffer[] = [];
+ 
+-  private constructor(private readonly sock: net.Socket) {
++  private constructor(
++    private readonly sock: net.Socket,
++    readonly responseHeaders: http.IncomingHttpHeaders = {},
++  ) {
+     sock.on("data", (chunk: Buffer) => {
+       this.rawStream.push(chunk);
+       const { messages, rest } = decodeFrames(Buffer.concat([this.rest, chunk]));
+@@ -103,7 +106,7 @@ class TestWsClient {
+           ...headers,
+         },
+       });
+-      req.on("upgrade", (_res, sock) => resolve(new TestWsClient(sock as net.Socket)));
++      req.on("upgrade", (res, sock) => resolve(new TestWsClient(sock as net.Socket, res.headers)));
+       req.on("response", (res) => {
+         res.resume();
+         reject(new Error(`expected upgrade, got HTTP ${res.statusCode}`));
+@@ -187,6 +190,7 @@ class FakeVncServer {
+   port = 0;
+   received: Buffer[] = [];
+   urls: string[] = [];
++  upgradeRequests: http.IncomingHttpHeaders[] = [];
+   readonly challenge = crypto.randomBytes(16);
+   assets = new Map<string, string>();
+   private sockets = new Set<net.Socket>();
+@@ -214,6 +218,7 @@ class FakeVncServer {
+ 
+   private handleUpgrade(req: http.IncomingMessage, socket: net.Socket): void {
+     this.urls.push(`WS ${req.url}`);
++    this.upgradeRequests.push(req.headers);
+     this.sockets.add(socket);
+     const key = String(req.headers["sec-websocket-key"] ?? "");
+     const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
+@@ -222,6 +227,7 @@ class FakeVncServer {
+         "Upgrade: websocket\r\n" +
+         "Connection: Upgrade\r\n" +
+         `Sec-WebSocket-Accept: ${accept}\r\n` +
++        "Sec-WebSocket-Extensions: permessage-deflate\r\n" +
+         "\r\n",
+     );
+     this.runRfbServer(socket);
+@@ -630,3 +636,25 @@ test("desktop proxy: audit log records desktop.view and desktop.takeover", async
+     await proxy.close();
+   }
+ });
++
++test("desktop proxy: permessage-deflate is never negotiated", async () => {
++  const { proxy, port, aliceVm } = await makeProxy();
++  try {
++    const client = await TestWsClient.connect(wsUrl(port), {
++      cookie: sessionFor("alice"),
++      "sec-websocket-extensions": "permessage-deflate; client_max_window_bits",
++    });
++    await completeRfbClientHandshake(client);
++    assert.equal(
++      client.responseHeaders["sec-websocket-extensions"],
++      undefined,
++      "101 reply never negotiates an extension",
++    );
++    const last = aliceVm.upgradeRequests.at(-1);
++    assert.ok(last, "upstream saw the upgrade request");
++    assert.equal(last!["sec-websocket-extensions"], undefined, "extension header not forwarded upstream");
++    client.close();
++  } finally {
++    await proxy.close();
++  }
++});
+diff --git a/apps/swarmagents/lib/desktop-proxy/proxy.ts b/apps/swarmagents/lib/desktop-proxy/proxy.ts
+index dac5bb75b..792b234f7 100644
+--- a/apps/swarmagents/lib/desktop-proxy/proxy.ts
++++ b/apps/swarmagents/lib/desktop-proxy/proxy.ts
+@@ -395,9 +395,8 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
+       "sec-websocket-version": "13",
+       "sec-websocket-key": req.headers["sec-websocket-key"] ?? "",
+     };
+-    if (req.headers["sec-websocket-extensions"]) {
+-      upHeaders["sec-websocket-extensions"] = req.headers["sec-websocket-extensions"] as string;
+-    }
++    // Never negotiate permessage-deflate: the bridge re-frames every message,
++    // so a compressed stream would be forwarded as opaque bytes and break RFB.
+     if (req.headers.origin) upHeaders.origin = req.headers.origin as string;
+ 
+     const upReq = http.request({
+@@ -430,13 +429,13 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
+       // Echo a minimal 101 to the client, reusing the upstream's accept key
+       // (computed from the client's key, so the browser accepts it).
+       const accept = (upRes.headers["sec-websocket-accept"] as string | undefined) ?? "";
+-      const extensions = upRes.headers["sec-websocket-extensions"] as string | undefined;
++      // Do not echo the upstream's extension negotiation: compression is never
++      // enabled on this hop.
+       socket.write(
+         "HTTP/1.1 101 Switching Protocols\r\n" +
+           "Upgrade: websocket\r\n" +
+           "Connection: Upgrade\r\n" +
+           (accept ? `Sec-WebSocket-Accept: ${accept}\r\n` : "") +
+-          (extensions ? `Sec-WebSocket-Extensions: ${extensions}\r\n` : "") +
+           "\r\n",
+       );
+ 
+diff --git a/apps/swarmagents/lib/desktop-proxy/ws.ts b/apps/swarmagents/lib/desktop-proxy/ws.ts
+index 5541091c2..9baeaa186 100644
+--- a/apps/swarmagents/lib/desktop-proxy/ws.ts
++++ b/apps/swarmagents/lib/desktop-proxy/ws.ts
+@@ -21,6 +21,8 @@ export interface WsMessage {
+   opcode: number;
+   payload: Buffer;
+   fin: boolean;
++  /** Whether the frame that carried this message had the mask bit set. */
++  masked: boolean;
+ }
+ 
+ /**
+@@ -39,10 +41,23 @@ export class WsBufferOverflowError extends Error {
+   }
+ }
+ 
++/**
++ * Thrown when a frame's mask bit is the wrong direction for this decoder.
++ * RFC 6455 requires every client->server frame to be masked and every
++ * server->client frame to be unmasked; a violation is a protocol error.
++ */
++export class WsMaskError extends Error {
++  constructor(message = "WebSocket frame mask bit is invalid for this direction") {
++    super(message);
++    this.name = "WsMaskError";
++  }
++}
++
+ interface FrameHeader {
+   fin: boolean;
+   opcode: number;
+   maskKey: Buffer | null;
++  masked: boolean;
+   len: number;
+   headerLen: number;
+ }
+@@ -81,7 +96,7 @@ function parseFrameHeader(input: Buffer, offset: number): FrameHeader | null {
+   if (opcode >= 0x8 && (len > 125 || !fin)) {
+     throw new Error("Invalid control frame");
+   }
+-  return { fin, opcode, maskKey, len, headerLen };
++  return { fin, opcode, maskKey, masked, len, headerLen };
+ }
+ 
+ /**
+@@ -100,7 +115,7 @@ export function decodeFrames(input: Buffer): { messages: WsMessage[]; rest: Buff
+   for (;;) {
+     const h = parseFrameHeader(input, offset);
+     if (!h) break;
+-    const { fin, opcode, maskKey, len, headerLen } = h;
++    const { fin, opcode, maskKey, masked, len, headerLen } = h;
+     if (offset + headerLen + len > input.length) break;
+ 
+     const encoded = input.subarray(offset + headerLen, offset + headerLen + len);
+@@ -109,14 +124,14 @@ export function decodeFrames(input: Buffer): { messages: WsMessage[]; rest: Buff
+ 
+     if (opcode === OP_CLOSE || opcode === OP_PING || opcode === OP_PONG) {
+       // Control frames never fragment.
+-      messages.push({ opcode, payload, fin: true });
++      messages.push({ opcode, payload, fin: true, masked });
+       continue;
+     }
+     if (opcode === OP_CONTINUATION) {
+       if (continuation === null) throw new Error("Unexpected continuation frame");
+       continuation = Buffer.concat([continuation, payload]);
+       if (fin) {
+-        messages.push({ opcode: continuationOpcode, payload: continuation, fin: true });
++        messages.push({ opcode: continuationOpcode, payload: continuation, fin: true, masked });
+         continuation = null;
+       }
+       continue;
+@@ -124,7 +139,7 @@ export function decodeFrames(input: Buffer): { messages: WsMessage[]; rest: Buff
+     // Data frame.
+     if (continuation !== null) throw new Error("Interleaved data frame during fragmentation");
+     if (fin) {
+-      messages.push({ opcode, payload, fin: true });
++      messages.push({ opcode, payload, fin: true, masked });
+     } else {
+       continuation = payload;
+       continuationOpcode = opcode;
+@@ -153,7 +168,15 @@ export class WsFrameDecoder {
+   private fragmentBytes = 0;
+   private fragmentOpcode: number | null = null;
+ 
+-  constructor(private readonly maxBytes: number = MAX_WS_BUFFER_BYTES) {}
++  constructor(
++    private readonly maxBytes: number = MAX_WS_BUFFER_BYTES,
++    /**
++     * Expected mask bit for this direction: true for browser->proxy frames
++     * (must be masked), false for container->proxy frames (must be unmasked),
++     * null to accept either.
++     */
++    private readonly requireMasked: boolean | null = null,
++  ) {}
+ 
+   /** Bytes currently held (raw remainder + pending fragments). */
+   get bufferedBytes(): number {
+@@ -169,7 +192,10 @@ export class WsFrameDecoder {
+     for (;;) {
+       const h = parseFrameHeader(input, offset);
+       if (!h) break;
+-      const { fin, opcode, maskKey, len, headerLen } = h;
++      const { fin, opcode, maskKey, masked, len, headerLen } = h;
++      if (this.requireMasked !== null && masked !== this.requireMasked) {
++        throw new WsMaskError();
++      }
+       const isControl = opcode >= 0x8;
+       // Fail fast on a declared length that can never fit, rather than
+       // buffering up to the cap first.
+@@ -183,7 +209,7 @@ export class WsFrameDecoder {
+       offset += headerLen + len;
+ 
+       if (isControl) {
+-        messages.push({ opcode, payload, fin: true });
++        messages.push({ opcode, payload, fin: true, masked });
+         continue;
+       }
+       if (opcode === OP_CONTINUATION) {
+@@ -195,6 +221,7 @@ export class WsFrameDecoder {
+             opcode: this.fragmentOpcode,
+             payload: Buffer.concat(this.fragments, this.fragmentBytes),
+             fin: true,
++            masked,
+           });
+           this.fragments = [];
+           this.fragmentBytes = 0;
+@@ -204,7 +231,7 @@ export class WsFrameDecoder {
+       }
+       if (this.fragmentOpcode !== null) throw new Error("Interleaved data frame during fragmentation");
+       if (fin) {
+-        messages.push({ opcode, payload, fin: true });
++        messages.push({ opcode, payload, fin: true, masked });
+       } else {
+         this.fragments = [payload];
+         this.fragmentBytes = payload.length;
+-- 
+2.55.0
+

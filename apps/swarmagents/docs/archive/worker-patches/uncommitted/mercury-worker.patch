@@ -1,0 +1,965 @@
+diff --git a/apps/swarmagents/app/api/providers/settings/route.ts b/apps/swarmagents/app/api/providers/settings/route.ts
+index a09e79120..f8a12effd 100644
+--- a/apps/swarmagents/app/api/providers/settings/route.ts
++++ b/apps/swarmagents/app/api/providers/settings/route.ts
+@@ -9,7 +9,7 @@
+ 
+ import { NextResponse, type NextRequest } from "next/server";
+ import { providerOwner } from "@/lib/providers/owner";
+-import { readUserSettings, updateUserSettings } from "@/lib/providers/settings";
++import { readUserSettings, updateUserSettings, TIER_KEYS, parseTierModels } from "@/lib/providers/settings";
+ import type { UserSettings } from "@/lib/providers/settings";
+ 
+ export const dynamic = "force-dynamic";
+@@ -60,8 +60,18 @@ export async function PUT(request: NextRequest) {
+     }
+     patch[field] = value as number | null;
+   }
++  if ("tierModels" in input) {
++    const parsed = parseTierModels(input.tierModels);
++    if (input.tierModels !== null && input.tierModels !== undefined && parsed === undefined) {
++      return NextResponse.json(
++        { error: `tierModels must be an object with optional keys ${TIER_KEYS.join(", ")} mapping to a model id.` },
++        { status: 400 },
++      );
++    }
++    patch.tierModels = parsed ?? undefined;
++  }
+   if (Object.keys(patch).length === 0) {
+-    return NextResponse.json({ error: "preferFreeProviders must be a boolean." }, { status: 400 });
++    return NextResponse.json({ error: "No supported settings were provided in the body." }, { status: 400 });
+   }
+   const next = updateUserSettings(owner, patch);
+   return NextResponse.json(next, { status: 200, headers: NO_STORE });
+diff --git a/apps/swarmagents/lib/providers/settings.ts b/apps/swarmagents/lib/providers/settings.ts
+index 75fa37b5d..6cf5a83f9 100644
+--- a/apps/swarmagents/lib/providers/settings.ts
++++ b/apps/swarmagents/lib/providers/settings.ts
+@@ -30,6 +30,12 @@ export interface UserSettings {
+   perRunBudgetUsd?: number | null;
+   /** USD cap per UTC day on paid providers. Absent/null = uncapped. */
+   perDayBudgetUsd?: number | null;
++  /**
++   * g4: preferred model ("providerId:modelId") per classifier tier. When set,
++   * the router prioritises that model for steps classified into the tier.
++   * Absent = default free-first behaviour. See lib/router/classifier.ts.
++   */
++  tierModels?: Partial<Record<"fast" | "balanced" | "deep", string>>;
+ }
+ 
+ function parseBudget(value: unknown): number | null | undefined {
+@@ -49,6 +55,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
+   return typeof value === "object" && value !== null && !Array.isArray(value);
+ }
+ 
++/** Valid tier keys for the g4 tier → model mapping. */
++export const TIER_KEYS = ["fast", "balanced", "deep"] as const;
++export type TierKey = (typeof TIER_KEYS)[number];
++
++export function parseTierModels(raw: unknown): Partial<Record<TierKey, string>> | undefined {
++  if (!isRecord(raw)) return undefined;
++  const out: Partial<Record<TierKey, string>> = {};
++  let found = false;
++  for (const key of TIER_KEYS) {
++    const value = raw[key];
++    if (typeof value !== "string") continue;
++    const trimmed = value.trim();
++    if (trimmed === "" || trimmed.length > 120 || /[\s\n]/.test(trimmed)) continue;
++    out[key] = trimmed;
++    found = true;
++  }
++  return found ? out : undefined;
++}
++
+ /** Parse a settings file body; invalid shapes fall back to defaults. */
+ export function parseUserSettings(raw: unknown): UserSettings {
+   if (!isRecord(raw)) return { ...DEFAULT_USER_SETTINGS };
+@@ -63,6 +88,8 @@ export function parseUserSettings(raw: unknown): UserSettings {
+   if (perRun !== undefined) out.perRunBudgetUsd = perRun;
+   const perDay = parseBudget(raw.perDayBudgetUsd);
+   if (perDay !== undefined) out.perDayBudgetUsd = perDay;
++  const tierModels = parseTierModels(raw.tierModels);
++  if (tierModels !== undefined) out.tierModels = tierModels;
+   return out;
+ }
+ 
+diff --git a/apps/swarmagents/lib/router/router.ts b/apps/swarmagents/lib/router/router.ts
+index 939007b0e..db3fdff54 100644
+--- a/apps/swarmagents/lib/router/router.ts
++++ b/apps/swarmagents/lib/router/router.ts
+@@ -36,6 +36,7 @@ import {
+   type RouterSnapshot,
+   type RouterStore,
+   type RoutingDecision,
++  type RoutingMode,
+   type UserRoutingPolicy,
+   type UserRoutingPolicyInput,
+   type UserUsageState,
+@@ -521,6 +522,8 @@ export class SwarmRouter {
+       reasonsRejected,
+       estimatedCost: chosenEval ? chosenEval.estimatedCostUsd : 0,
+       failoverReason,
++      ...(request.mode ? { mode: request.mode } : {}),
++      ...(request.classification ? { tier: request.classification.tier, reason: request.classification.reason } : {}),
+     };
+ 
+     if (request.stickyTarget && failoverReason && chosen) {
+@@ -1007,6 +1010,10 @@ export class SwarmRouter {
+         ? Number(Math.min(15, (estimatedCostUsd / runBudget) * 15).toFixed(3))
+         : 0;
+ 
++    // g4 composer mode: bias the composite score toward cost (cheapest) or
++    // quality (best). Balanced adds no bias.
++    const modeBias = this.modeBias(request.mode, isPaid, estimatedCostUsd, health, isLongPrompt);
++
+     const score = Number(
+       (
+         priorityScore +
+@@ -1014,7 +1021,8 @@ export class SwarmRouter {
+         quotaHeadroomBonus +
+         healthAdjustment -
+         longPromptGarblePenalty -
+-        paidCostPenalty
++        paidCostPenalty +
++        modeBias
+       ).toFixed(4),
+     );
+ 
+@@ -1035,10 +1043,41 @@ export class SwarmRouter {
+         longPromptGarblePenalty,
+         paidCostPenalty,
+         stickyApplied: false,
++        modeBias,
+       },
+     };
+   }
+ 
++  /**
++   * g4 mode bias added to an eligible candidate's composite score.
++   * - cheapest: heavily penalise paid candidates, then penalise by raw cost so
++   *   the cheapest eligible model (free first) wins.
++   * - best: boost proportionally to the relevant prompt-class quality score so
++   *   the strongest healthy model wins even at higher cost.
++   * - balanced: 0 (the default composite already balances cost + quality).
++   */
++  private modeBias(
++    mode: RoutingMode | undefined,
++    isPaid: boolean,
++    estimatedCostUsd: number,
++    health: ModelHealthState,
++    isLongPrompt: boolean,
++  ): number {
++    if (mode === "cheapest") {
++      // Cheapest dominates cost: a large flat paid penalty plus a cost-proportional
++      // penalty so the cheapest eligible (free-first) model wins even when it lags
++      // on priority or agent-loop bonuses.
++      const paidPenalty = isPaid ? 50 : 0;
++      const costPenalty = Math.min(40, estimatedCostUsd * 100);
++      return Number((-(paidPenalty + costPenalty)).toFixed(3));
++    }
++    if (mode === "best") {
++      const quality = isLongPrompt ? health.longPromptQualityScore : health.shortPromptQualityScore;
++      return Number((8 * quality - 4).toFixed(3));
++    }
++    return 0;
++  }
++
+   private computePriorityScore(priorityOrder: string[], providerId: string, modelId: string): number {
+     const exactKey = `${providerId}:${modelId}`;
+     let idx = priorityOrder.indexOf(exactKey);
+diff --git a/apps/swarmagents/lib/router/types.ts b/apps/swarmagents/lib/router/types.ts
+index 5a2261836..dee122bdf 100644
+--- a/apps/swarmagents/lib/router/types.ts
++++ b/apps/swarmagents/lib/router/types.ts
+@@ -93,6 +93,27 @@ export interface StickyTarget {
+   keyId?: string;
+ }
+ 
++/**
++ * Composer routing mode (g4): how aggressive the router is about cost vs.
++ * quality when picking among eligible candidates in a tier.
++ * - "cheapest": pay the biggest cost penalty (free first, cheapest eligible).
++ * - "balanced": the default composite score.
++ * - "best": boost the quality/health term so the strongest model wins even if
++ *   it costs more.
++ */
++export type RoutingMode = "cheapest" | "balanced" | "best";
++
++export function isRoutingMode(value: string): value is RoutingMode {
++  return value === "cheapest" || value === "balanced" || value === "best";
++}
++
++/** A step classification attached to a request (see lib/router/classifier.ts). */
++export interface RouteClassification {
++  category: "trivial" | "normal" | "complex" | "deep";
++  tier: "fast" | "balanced" | "deep";
++  reason: string;
++}
++
+ export interface RouteRequest {
+   requestId: string;
+   userId: string;
+@@ -114,6 +135,15 @@ export interface RouteRequest {
+   allowedModels?: string[];
+   /** Per-request priority list; overrides the user policy's priorityOrder. */
+   priorityOrder?: string[];
++  /**
++   * g4 routing mode from the composer chip. Defaults to "balanced" when absent.
++   */
++  mode?: RoutingMode;
++  /**
++   * g4 step classification (tier + reason). Recorded on the decision so
++   * telemetry can report what the router routed for and why.
++   */
++  classification?: RouteClassification;
+ }
+ 
+ export interface ToolCallPayload {
+@@ -155,6 +185,8 @@ export interface CandidateEvaluation {
+     longPromptGarblePenalty: number;
+     paidCostPenalty: number;
+     stickyApplied: boolean;
++    /** g4 mode-induced bias (negative favours cheaper, positive favours quality). */
++    modeBias?: number;
+   };
+ }
+ 
+@@ -176,6 +208,12 @@ export interface RoutingDecision {
+   reasonsRejected: Record<string, string[]>;
+   estimatedCost: number;
+   failoverReason?: string;
++  /** g4 routing mode that produced this decision. */
++  mode?: RoutingMode;
++  /** g4 step classification tier, when the request carried one. */
++  tier?: "fast" | "balanced" | "deep";
++  /** g4 step classification reason, when the request carried one. */
++  reason?: string;
+ }
+ 
+ export type RouterEvent =
+diff --git a/apps/swarmagents/lib/runtime/llm-gateway.ts b/apps/swarmagents/lib/runtime/llm-gateway.ts
+index 7e4d11566..db029ca04 100644
+--- a/apps/swarmagents/lib/runtime/llm-gateway.ts
++++ b/apps/swarmagents/lib/runtime/llm-gateway.ts
+@@ -53,6 +53,8 @@ import {
+   type AnthropicSseEvent,
+ } from "../providers/anthropic-bridge";
+ import type { ExecutionOutcome, StickyTarget, ToolCallPayload } from "../router";
++import { isRoutingMode, type RoutingMode } from "../router/types";
++import { classifyStep } from "../router/classifier";
+ import {
+   candidateId,
+   decisionEventData,
+@@ -617,6 +619,7 @@ function routeFeatures(body: unknown): {
+   maxOutputTokens: number;
+   requiresTools: boolean;
+   promptSample?: string;
++  mode?: RoutingMode;
+ } {
+   const root = isRecordValue(body) ? body : {};
+   const maxTokens = typeof root.max_tokens === "number" && root.max_tokens > 0 ? Math.floor(root.max_tokens) : 4_096;
+@@ -635,11 +638,15 @@ function routeFeatures(body: unknown): {
+       if (text) promptSample = text;
+     }
+   }
++  // g4 composer mode, when the client sent one.
++  let mode: RoutingMode | undefined;
++  if (typeof root.mode === "string" && isRoutingMode(root.mode)) mode = root.mode;
+   return {
+     estimatedPromptTokens: estimateInputTokens(body),
+     maxOutputTokens: maxTokens,
+     requiresTools,
+     ...(promptSample !== undefined ? { promptSample: promptSample.slice(0, 2_000) } : {}),
++    ...(mode !== undefined ? { mode } : {}),
+   };
+ }
+ 
+@@ -656,6 +663,19 @@ async function routerSource(req: LlmRequest): Promise<AttemptSource> {
+   );
+   const requestId = randomUUID();
+   const stickyKey = req.runId ? `${req.runId}|${req.requestedModel ?? ""}` : undefined;
++  const features = routeFeatures(req.body);
++  const classification = classifyStep({
++    prompt: features.promptSample,
++    estimatedTokens: features.estimatedPromptTokens,
++    filesTouched: features.requiresTools ? 1 : 0,
++  });
++  // g4 tier → model preference from Settings: prepend the mapped model for the
++  // classified tier so it wins the priority component of scoring.
++  const tierPriorityOrder = req.settings?.tierModels?.[classification.tier];
++  const priorityOrder = tierPriorityOrder
++    ? [tierPriorityOrder, ...routing.priorityOrder.filter((x) => x !== tierPriorityOrder)]
++    : routing.priorityOrder;
++
+   const base = {
+     requestId,
+     userId: req.owner,
+@@ -663,8 +683,9 @@ async function routerSource(req: LlmRequest): Promise<AttemptSource> {
+     turnIndex: 0,
+     isAgentLoop: false,
+     allowedModels: routing.allowedModels,
+-    priorityOrder: routing.priorityOrder,
+-    ...routeFeatures(req.body),
++    priorityOrder,
++    ...features,
++    classification,
+   };
+   base.isAgentLoop = base.requiresTools;
+   const tried: string[] = [];
+diff --git a/apps/swarmagents/lib/runtime/llm-routing.ts b/apps/swarmagents/lib/runtime/llm-routing.ts
+index 997e030fd..2cff341de 100644
+--- a/apps/swarmagents/lib/runtime/llm-routing.ts
++++ b/apps/swarmagents/lib/runtime/llm-routing.ts
+@@ -322,6 +322,12 @@ export interface RouteDecisionEventData {
+   chosen: { provider: string; model: string; key: string; isPaid: boolean; sticky: boolean } | null;
+   estimatedCostUsd: number;
+   failoverReason?: string;
++  /** g4 composer mode that produced this decision. */
++  mode?: string;
++  /** g4 step classification tier, when the request carried one. */
++  tier?: string;
++  /** g4 step classification reason, when the request carried one. */
++  reason?: string;
+   candidates: Array<{
+     provider: string;
+     model: string;
+@@ -363,6 +369,9 @@ export function decisionEventData(decision: RoutingDecision, attempt: number): R
+       : null,
+     estimatedCostUsd: decision.estimatedCost,
+     ...(decision.failoverReason ? { failoverReason: decision.failoverReason } : {}),
++    ...(decision.mode ? { mode: decision.mode } : {}),
++    ...(decision.tier ? { tier: decision.tier } : {}),
++    ...(decision.reason ? { reason: decision.reason } : {}),
+     candidates,
+   };
+ }
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index d1497054f..8e23a7959 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -14,6 +14,7 @@ import {
+ import { type AgentState, type LogEvent, runAgents } from './engine';
+ import { usePersisted } from './store';
+ import { InputBar } from './components/InputBar';
++import type { RoutingMode } from '../../lib/router/types';
+ import { ActivityStrip } from './components/ActivityStrip';
+ import { Telemetry } from './components/Telemetry';
+ import { Settings } from './components/Settings';
+@@ -263,7 +264,7 @@ export default function App() {
+   }
+ 
+   const submit = useCallback(
+-    async (text: string, atts: Attachment[]) => {
++    async (text: string, atts: Attachment[], mode: RoutingMode) => {
+       setShowLanding(false); // Entering workspace automatically dismisses landing
+       // Upload attachments into the user's VM workspace first so the task
+       // prompt can list where the files landed. A failed upload aborts the
+@@ -303,6 +304,7 @@ export default function App() {
+             headers: { 'Content-Type': 'application/json' },
+             body: JSON.stringify({
+               prompt: withUploads || '(see attachments)',
++              mode,
+               ...(agentCard ? { agentCard } : {}),
+             }),
+             signal: teamCtrl.signal,
+@@ -346,7 +348,7 @@ export default function App() {
+         const res = await fetch('/api/runtime/tasks', {
+           method: 'POST',
+           headers: { 'Content-Type': 'application/json' },
+-          body: JSON.stringify({ prompt: withUploads || '(see attachments)', agentCard }),
++          body: JSON.stringify({ prompt: withUploads || '(see attachments)', mode, agentCard }),
+         }).catch(() => null);
+         const dispatched = res && res.ok && (await res.json().catch(() => null))?.runId;
+         if (dispatched) {
+diff --git a/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx b/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
+index bc2c49b75..16bacf055 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
+@@ -2,11 +2,19 @@ import { useRef, useState, type RefObject } from 'react';
+ import { ArrowUp, FileText, Film, Loader2, Music, Paperclip, Square, X, File as FileIcon, Users } from 'lucide-react';
+ import { type Attachment, uid } from '../data';
+ import { validateAttachment } from '../../../lib/client/upload';
++import type { RoutingMode } from '../../../lib/router/types';
+ 
+ const TEXT_EXT = /\.(txt|md|json|csv|ts|tsx|js|jsx|py|html|css|xml|yml|yaml|log|sql|sh|rs|go|java|c|cpp|rb)$/i;
+ 
+ const MAX_LINES = 6;
+ 
++/** g4 composer routing modes: Cheapest / Balanced / Best. */
++const ROUTING_MODES: { value: RoutingMode; label: string; title: string }[] = [
++  { value: 'cheapest', label: 'Cheapest', title: 'Route steps to the cheapest eligible model' },
++  { value: 'balanced', label: 'Balanced', title: 'Default balance of cost and quality' },
++  { value: 'best', label: 'Best', title: 'Route steps to the highest-quality model' },
++];
++
+ /** Autosize the textarea up to MAX_LINES rows, measured from its real metrics. */
+ function autosize(ta: HTMLTextAreaElement) {
+   ta.style.height = 'auto';
+@@ -50,7 +58,7 @@ export function InputBar({
+   busy: boolean;
+   /** True while a run is in its brief pre-stream phase — inputs are disabled and a spinner shows. */
+   starting: boolean;
+-  onSubmit: (text: string, atts: Attachment[]) => void;
++  onSubmit: (text: string, atts: Attachment[], mode: RoutingMode) => void;
+   onStop: () => void;
+   /** External ref (e.g. for the Cmd/Ctrl+K shortcut) to focus the textarea. */
+   inputRef?: RefObject<HTMLTextAreaElement | null>;
+@@ -61,6 +69,8 @@ export function InputBar({
+   const [text, setText] = useState('');
+   const [atts, setAtts] = useState<Attachment[]>([]);
+   const [drag, setDrag] = useState(false);
++  /** g4 composer routing mode; defaults to balanced (no bias). */
++  const [mode, setMode] = useState<RoutingMode>('balanced');
+   /** Inline rejection message for files that exceed the chat limits. */
+   const [attachError, setAttachError] = useState<string | null>(null);
+   const fileRef = useRef<HTMLInputElement>(null);
+@@ -92,7 +102,7 @@ export function InputBar({
+   const submit = () => {
+     if (busy) return onStop();
+     if (!text.trim() && !atts.length) return;
+-    onSubmit(text.trim(), atts);
++    onSubmit(text.trim(), atts, mode);
+     setText('');
+     setAtts([]);
+     setAttachError(null);
+@@ -247,7 +257,25 @@ export function InputBar({
+         </button>
+       </div>
+ 
+-      <div className="flex select-none items-center px-3 pb-0.5 pt-1">
++      <div className="flex select-none items-center justify-between gap-2 px-3 pb-0.5 pt-1">
++        <div className="flex items-center gap-0.5 rounded-full bg-white/5 p-0.5" role="group" aria-label="Routing mode">
++          {ROUTING_MODES.map((m) => (
++            <button
++              key={m.value}
++              type="button"
++              onClick={() => setMode(m.value)}
++              disabled={starting}
++              data-testid={`routing-mode-${m.value}`}
++              aria-pressed={mode === m.value}
++              title={m.title}
++              className={`rounded-full px-2.5 py-0.5 text-[10px] font-medium transition duration-150 disabled:cursor-not-allowed disabled:opacity-40 ${
++                mode === m.value ? 'bg-white/15 text-white ring-1 ring-white/25' : 'text-white/30 hover:text-white/60'
++              }`}
++            >
++              {m.label}
++            </button>
++          ))}
++        </div>
+         <span className="text-[10px] font-normal tracking-wide text-white/25">Enter to send · Shift+Enter newline · Ctrl/Cmd+K focus</span>
+       </div>
+     </div>
+diff --git a/apps/swarmagents/minimalist-ui/src/components/Settings.tsx b/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
+index feb9cdee7..61297b209 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
+@@ -488,6 +488,7 @@ function Providers({
+ }) {
+   const [expanded, setExpanded] = useState<string | null>(null);
+   const [preferFree, setPreferFree] = useState<boolean | null>(null);
++  const [tierModels, setTierModels] = useState<Partial<Record<'fast' | 'balanced' | 'deep', string>>>({});
+   const [serverRows, setServerRows] = useState<ServerProviderRow[] | null>(null);
+   const [settingsError, setSettingsError] = useState<string | null>(null);
+ 
+@@ -500,8 +501,16 @@ function Providers({
+       try {
+         const settingsRes = await fetch('/api/providers/settings', { headers: { Accept: 'application/json' } });
+         if (settingsRes.ok && !cancelled) {
+-          const body = (await settingsRes.json()) as { preferFreeProviders?: unknown };
++          const body = (await settingsRes.json()) as { preferFreeProviders?: unknown; tierModels?: unknown };
+           if (typeof body.preferFreeProviders === 'boolean') setPreferFree(body.preferFreeProviders);
++          if (body.tierModels && typeof body.tierModels === 'object' && !Array.isArray(body.tierModels)) {
++            const tm = body.tierModels as Record<string, unknown>;
++            const next: Partial<Record<'fast' | 'balanced' | 'deep', string>> = {};
++            for (const key of ['fast', 'balanced', 'deep'] as const) {
++              if (typeof tm[key] === 'string') next[key] = tm[key] as string;
++            }
++            setTierModels(next);
++          }
+         }
+       } catch {
+         // offline / unsigned — leave the toggle hidden
+@@ -521,6 +530,36 @@ function Providers({
+     };
+   }, []);
+ 
++  const saveTierModels = async () => {
++    setSettingsError(null);
++    const cleaned: Partial<Record<'fast' | 'balanced' | 'deep', string>> = {};
++    for (const key of ['fast', 'balanced', 'deep'] as const) {
++      const v = (tierModels[key] ?? '').trim();
++      if (v && v.length <= 120 && !/[\s\n]/.test(v)) cleaned[key] = v;
++    }
++    try {
++      const res = await fetch('/api/providers/settings', {
++        method: 'PUT',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({ tierModels: cleaned }),
++      });
++      if (!res.ok) {
++        setSettingsError('Could not save per-tier model mapping.');
++        return;
++      }
++      setTierModels((prev) => {
++        const next: Partial<Record<'fast' | 'balanced' | 'deep', string>> = {};
++        for (const key of ['fast', 'balanced', 'deep'] as const) {
++          const fromPrev = (prev[key] ?? '').trim();
++          next[key] = cleaned[key] ?? fromPrev;
++        }
++        return next;
++      });
++    } catch {
++      setSettingsError('Could not save per-tier model mapping.');
++    }
++  };
++
+   const setPreferFreeRemote = async (v: boolean) => {
+     setSettingsError(null);
+     try {
+@@ -610,6 +649,39 @@ function Providers({
+         </section>
+       )}
+ 
++      <section>
++        <Label>Model per step type · g4</Label>
++        <div className="rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
++          <div className="space-y-3">
++            {(['fast', 'balanced', 'deep'] as const).map((tier) => (
++              <label key={tier} className="block">
++                <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">
++                  {tier === 'fast' ? 'Fast · trivial' : tier === 'balanced' ? 'Balanced · normal' : 'Deep · complex/deep'}
++                </span>
++                <input
++                  value={tierModels[tier] ?? ''}
++                  placeholder="providerId:modelId"
++                  onChange={(e) => setTierModels((prev) => ({ ...prev, [tier]: e.target.value }))}
++                  className="w-full rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 transition focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                />
++              </label>
++            ))}
++            <div className="flex items-center gap-2">
++              <button
++                onClick={() => void saveTierModels()}
++                className="flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs text-white/80 hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++              >
++                Save models
++              </button>
++              <span className="text-[10px] leading-snug text-white/30">
++                Optional per-tier model override — e.g. <span className="font-mono">anthropic:claude-sonnet</span>. Leave blank to use free-first defaults.
++              </span>
++            </div>
++          </div>
++          {settingsError && <div className="mt-2 text-[10px] text-red-300/80">{settingsError}</div>}
++        </div>
++      </section>
++
+       {serverRows && serverRows.length > 0 && (
+         <section>
+           <Label>Server providers · free &amp; quota</Label>
+diff --git a/apps/swarmagents/e2e/router-mode.spec.ts b/apps/swarmagents/e2e/router-mode.spec.ts
+new file mode 100644
+index 000000000..b971c6339
+--- /dev/null
++++ b/apps/swarmagents/e2e/router-mode.spec.ts
+@@ -0,0 +1,41 @@
++import assert from "node:assert/strict";
++import { after, test } from "node:test";
++import { closeBrowser, openWorkspace, runPageTest } from "./lib";
++
++after(async () => {
++  await closeBrowser();
++});
++
++test("g4: composer routing-mode chip renders and cycles the three modes", async (t) => {
++  const result = await runPageTest("g4: composer routing-mode chip", async ({ page, context, consoleErrors }) => {
++    await openWorkspace(page, context);
++
++    const cheapest = page.getByTestId("routing-mode-cheapest");
++    const balanced = page.getByTestId("routing-mode-balanced");
++    const best = page.getByTestId("routing-mode-best");
++
++    await balanced.waitFor({ state: "visible", timeout: 15_000 });
++    assert.equal(await cheapest.isVisible(), true, "expected Cheapest chip to be visible");
++    assert.equal(await best.isVisible(), true, "expected Best chip to be visible");
++
++    // Default is Balanced (aria-pressed).
++    assert.equal(await balanced.getAttribute("aria-pressed"), "true", "expected Balanced to be the default mode");
++    assert.equal(await cheapest.getAttribute("aria-pressed"), "false", "expected Cheapest off by default");
++    assert.equal(await best.getAttribute("aria-pressed"), "false", "expected Best off by default");
++
++    // Cycle: Cheapest → Best → balanced.
++    await cheapest.click();
++    assert.equal(await cheapest.getAttribute("aria-pressed"), "true", "expected Cheapest selected after click");
++    assert.equal(await balanced.getAttribute("aria-pressed"), "false", "expected Balanced deselected");
++
++    await best.click();
++    assert.equal(await best.getAttribute("aria-pressed"), "true", "expected Best selected after click");
++    assert.equal(await cheapest.getAttribute("aria-pressed"), "false", "expected Cheapest deselected");
++
++    await balanced.click();
++    assert.equal(await balanced.getAttribute("aria-pressed"), "true", "expected Balanced re-selected");
++
++    assert.deepEqual(consoleErrors, [], `unexpected page errors: ${consoleErrors.join(" | ")}`);
++  });
++  if (result.skipped) t.skip(result.skipped);
++});
+diff --git a/apps/swarmagents/lib/router/classifier.test.ts b/apps/swarmagents/lib/router/classifier.test.ts
+new file mode 100644
+index 000000000..6c00bd9e1
+--- /dev/null
++++ b/apps/swarmagents/lib/router/classifier.test.ts
+@@ -0,0 +1,61 @@
++import { describe, it } from "node:test";
++import { expect } from "./expect-shim.test-helper";
++import { classifyStep, type ClassificationInput } from "./classifier";
++
++function step(overrides: ClassificationInput = {}): ClassificationInput {
++  return { prompt: "fix the typo in the heading", ...overrides };
++}
++
++describe("classifyStep", () => {
++  it("classifies a short simple request as trivial/fast", () => {
++    const c = classifyStep(step());
++    expect(c.category).toBe("trivial");
++    expect(c.tier).toBe("fast");
++    expect(c.reason).toContain("short simple request");
++  });
++
++  it("classifies an ordinary coding request as normal/balanced", () => {
++    const c = classifyStep(step({ prompt: "Refactor the pricing module so it uses the new currency table and updates the summary endpoint accordingly." }));
++    expect(c.category).toBe("normal");
++    expect(c.tier).toBe("balanced");
++  });
++
++  it("classifies many files as complex/deep", () => {
++    const c = classifyStep(step({ prompt: "Implement the feature across the whole service.", filesTouched: 6 }));
++    expect(c.category).toBe("complex");
++    expect(c.tier).toBe("deep");
++  });
++
++  it("classifies a planner 'architecture' tag as deep", () => {
++    const c = classifyStep(step({ prompt: "Lay out the system", plannerTag: "architecture" }));
++    expect(c.category).toBe("deep");
++    expect(c.tier).toBe("deep");
++    expect(c.reason).toContain("architecture");
++  });
++
++  it("classifies a planner 'refactor' tag as complex", () => {
++    const c = classifyStep(step({ prompt: "Change the schema", plannerTag: "refactor" }));
++    expect(c.category).toBe("complex");
++    expect(c.tier).toBe("deep");
++    expect(c.reason).toContain("refactor");
++  });
++
++  it("large token volume is deep", () => {
++    const c = classifyStep(step({ prompt: "R", estimatedTokens: 8000 }));
++    expect(c.category).toBe("deep");
++    expect(c.tier).toBe("deep");
++    expect(c.reason).toContain("large step");
++  });
++
++  it("deep keywords push to deep", () => {
++    const c = classifyStep(step({ prompt: "Think about the architecture and the tradeoffs.", keywords: ["architecture", "tradeoff"] }));
++    expect(c.category).toBe("deep");
++    expect(c.tier).toBe("deep");
++  });
++
++  it("empty prompt never crashes and stays balanced", () => {
++    const c = classifyStep({});
++    expect(c.category).toBe("normal");
++    expect(c.tier).toBe("balanced");
++  });
++});
+diff --git a/apps/swarmagents/lib/router/classifier.ts b/apps/swarmagents/lib/router/classifier.ts
+new file mode 100644
+index 000000000..bb398cdf9
+--- /dev/null
++++ b/apps/swarmagents/lib/router/classifier.ts
+@@ -0,0 +1,167 @@
++/**
++ * Step classifier (lib/router/classifier.ts).
++ *
++ * g4 "Automatic per-step model routing": turns cheap signals about one step of
++ * a task (prompt length, estimated tokens, number of files/tools touched,
++ * narrator keywords, planner-provided tags) into a classification the routing
++ * layer can act on:
++ *
++ *   category  tier     meaning
++ *   trivial -> fast     one-line edits, summaries, simple lookups
++ *   normal  -> balanced ordinary coding / authoring steps
++ *   complex -> deep     refactors, debugging, multi-file changes
++ *   deep    -> deep     planning, architecture, research, very large steps
++ *
++ * The classification is pure and synchronous so it is trivially unit-testable
++ * and safe to call in request handlers and the LLM gateway.
++ */
++
++export type StepTier = "fast" | "balanced" | "deep";
++
++export type StepCategory = "trivial" | "normal" | "complex" | "deep";
++
++export interface ClassificationInput {
++  /** Trimmed prompt text for this step. */
++  prompt?: string;
++  /** Estimated prompt tokens when known; falls back to len/4. */
++  estimatedTokens?: number;
++  /** How many files/tools the step touches (0 defaults to 0). */
++  filesTouched?: number;
++  /** Offer keywords extracted from the prompt. */
++  keywords?: readonly string[];
++  /** Planner-provided tag, e.g. "plan", "implement", "refactor". */
++  plannerTag?: string;
++}
++
++export interface StepClassification {
++  category: StepCategory;
++  tier: StepTier;
++  /** Human-readable signal that produced this classification. */
++  reason: string;
++}
++
++/** Planner tags that signal deep reasoning regardless of raw size. */
++const DEEP_TAGS = new Set([
++  "architecture",
++  "design",
++  "plan",
++  "research",
++  "strategy",
++  "synthesize",
++]);
++
++/** Planner tags that signal a complex, logic-heavy step. */
++const COMPLEX_TAGS = new Set([
++  "build",
++  "debug",
++  "fix",
++  "integrate",
++  "implement",
++  "migrate",
++  "optimize",
++  "performance",
++  "refactor",
++  "scale",
++  "security",
++  "test",
++]);
++
++const DEEP_KEYWORDS = new Set([
++  "architecture",
++  "design",
++  "hard",
++  "research",
++  "tradeoff",
++  "trade-off",
++]);
++
++const COMPLEX_KEYWORDS = new Set([
++  "async",
++  "bug",
++  "complex",
++  "concurrency",
++  "debug",
++  "migrate",
++  "multi",
++  "pipeline",
++  "refactor",
++  "schema",
++  "thread",
++]);
++
++/** Size thresholds (tokens) beyond which a step is complex / deep. */
++const COMPLEX_TOKEN_THRESHOLD = 1_500;
++const DEEP_TOKEN_THRESHOLD = 6_000;
++const TRIVIAL_CHARS = 200;
++const COMPLEX_FILES = 3;
++const DEEP_FILES = 8;
++
++/** Common words that carry no routing signal. */
++const STOPWORDS = new Set(
++  "the and for with this that from into your you are all its them they then was were has have been will would could should about which their there when where what because after before just only also than very not but use using make made take get set put can may might each every some any new old two one our out over under within without until while during".split(" "),
++);
++
++function derivedKeywords(prompt: string): string[] {
++  const words = prompt.toLowerCase().match(/[a-z][a-z0-9-]{2,}/g) ?? [];
++  return [...new Set(words.filter((w) => !STOPWORDS.has(w)))].slice(0, 12);
++}
++
++export function classifyStep(input: ClassificationInput): StepClassification {
++  const prompt = (input.prompt ?? "").trim();
++  const len = prompt.length;
++  const tokens = input.estimatedTokens ?? Math.max(1, Math.round(len / 4));
++  const files = input.filesTouched ?? 0;
++  const tag = (input.plannerTag ?? "").trim().toLowerCase();
++
++  // Explicit keywords come from the caller (planner/tool hints) and are strong
++  // signals. Keywords we derive from the prompt text are weak: they keep a step
++  // from being "trivial" but only escalate to complex/deep when reinforced by
++  // size evidence, so a short request that merely mentions "refactor" stays an
++  // ordinary coding step instead of being over-classified.
++  const explicitKw = new Set((input.keywords ?? []).map((k) => k.toLowerCase()));
++  const derivedKw = new Set(derivedKeywords(prompt));
++
++  const reasons: string[] = [];
++
++  const isDeepTag = DEEP_TAGS.has(tag);
++  const isComplexTag = COMPLEX_TAGS.has(tag);
++  const hasDeepKeywordExplicit = [...explicitKw].some((w) => DEEP_KEYWORDS.has(w));
++  const hasComplexKeywordExplicit = [...explicitKw].some((w) => COMPLEX_KEYWORDS.has(w));
++  const hasDeepKeywordDerived = [...derivedKw].some((w) => DEEP_KEYWORDS.has(w));
++  const hasComplexKeywordDerived = [...derivedKw].some((w) => COMPLEX_KEYWORDS.has(w));
++
++  const heavyDeep = files >= DEEP_FILES || tokens >= DEEP_TOKEN_THRESHOLD || len >= DEEP_TOKEN_THRESHOLD * 4;
++  const heavyComplex = files >= COMPLEX_FILES || tokens >= COMPLEX_TOKEN_THRESHOLD || len >= COMPLEX_TOKEN_THRESHOLD * 4;
++
++  // Weak derived keywords only escalate when the step is large enough to back them.
++  const deepDerived = hasDeepKeywordDerived && (len >= 600 || files >= 4 || tokens >= 3_000);
++  const complexDerived = hasComplexKeywordDerived && (len >= 300 || files >= 2 || tokens >= 1_200);
++
++  const anyHeavyWord = hasDeepKeywordExplicit || hasComplexKeywordExplicit || hasDeepKeywordDerived || hasComplexKeywordDerived;
++
++  let category: StepCategory;
++
++  if (heavyDeep || isDeepTag || hasDeepKeywordExplicit || deepDerived) {
++    category = "deep";
++    if (isDeepTag) reasons.push(`planner tag "${tag}"`);
++    if (hasDeepKeywordExplicit) reasons.push("deep-reasoning keywords");
++    if (deepDerived) reasons.push("deep-reasoning keywords + size");
++    if (heavyDeep) reasons.push(`large step (${tokens} tok, ${files} files)`);
++  } else if (heavyComplex || isComplexTag || hasComplexKeywordExplicit || complexDerived) {
++    category = "complex";
++    if (isComplexTag) reasons.push(`planner tag "${tag}"`);
++    if (hasComplexKeywordExplicit) reasons.push("logic-heavy keywords");
++    if (complexDerived) reasons.push("logic-heavy keywords + size");
++    if (heavyComplex) reasons.push(`nontrivial size (${tokens} tok, ${files} files)`);
++  } else if (len > 0 && len < TRIVIAL_CHARS && files <= 1 && tokens < 800 && !tag && !anyHeavyWord) {
++    category = "trivial";
++    reasons.push(`short simple request (${tokens} tok)`);
++  } else {
++    category = "normal";
++    reasons.push(`ordinary step (${tokens} tok${files > 0 ? `, ${files} files` : ""})`);
++  }
++
++  const tier: StepTier = category === "trivial" ? "fast" : category === "normal" ? "balanced" : "deep";
++
++  return { category, tier, reason: reasons.join(", ") };
++}
+diff --git a/apps/swarmagents/lib/router/router.mode.test.ts b/apps/swarmagents/lib/router/router.mode.test.ts
+new file mode 100644
+index 000000000..923a672d9
+--- /dev/null
++++ b/apps/swarmagents/lib/router/router.mode.test.ts
+@@ -0,0 +1,114 @@
++import { describe, it } from "node:test";
++import { expect } from "./expect-shim.test-helper";
++import { InMemoryRouterStore, SwarmRouter, type Clock, type RouteRequest } from "./index";
++
++class FakeClock implements Clock {
++  private currentMs = Date.parse("2026-11-12T10:00:00.000Z");
++  now(): number {
++    return this.currentMs;
++  }
++  random(): number {
++    return 0.42;
++  }
++}
++
++/** Two paid providers: "cheap" is far cheaper, "pricey" is higher priority. */
++function makeRouter() {
++  const router = new SwarmRouter({ clock: new FakeClock(), store: new InMemoryRouterStore() });
++  router.registerProvider({
++    id: "pricey",
++    name: "Pricey Paid",
++    resetsDailyUtc: false,
++    models: [
++      {
++        id: "pricey-model",
++        providerId: "pricey",
++        displayName: "Pricey",
++        contextWindow: 200_000,
++        maxOutputTokens: 16_384,
++        supportsTools: true,
++        goodAtLongAgentLoops: true,
++        inputCostPer1kUsd: 0.004,
++        outputCostPer1kUsd: 0.02,
++      },
++    ],
++  });
++  router.registerProvider({
++    id: "cheap",
++    name: "Cheap Paid",
++    resetsDailyUtc: false,
++    models: [
++      {
++        id: "cheap-model",
++        providerId: "cheap",
++        displayName: "Cheap",
++        contextWindow: 200_000,
++        maxOutputTokens: 16_384,
++        supportsTools: true,
++        goodAtLongAgentLoops: false,
++        inputCostPer1kUsd: 0.0001,
++        outputCostPer1kUsd: 0.0003,
++      },
++    ],
++  });
++  router.registerUserKey({ keyId: "pk-1", userId: "u-1", providerId: "pricey", label: "pricey", maxConcurrent: 2 });
++  router.registerUserKey({ keyId: "ck-1", userId: "u-1", providerId: "cheap", label: "cheap", maxConcurrent: 2 });
++  router.setUserPolicy({
++    userId: "u-1",
++    priorityOrder: ["pricey", "cheap"],
++    allowPaidFallback: true,
++    perRunBudgetUsd: null,
++    perDayBudgetUsd: null,
++    freeFirst: false,
++    maxConcurrentRequests: 4,
++  });
++  return router;
++}
++
++function makeReq(overrides: Partial<RouteRequest> = {}): RouteRequest {
++  return {
++    requestId: "req-1",
++    userId: "u-1",
++    runId: "run-1",
++    turnIndex: 0,
++    estimatedPromptTokens: 24_000,
++    maxOutputTokens: 4_096,
++    requiresTools: true,
++    isAgentLoop: true,
++    promptSample: "Refactor the auth middleware and run the full test suite.",
++    ...overrides,
++  };
++}
++
++describe("g4 routing mode", () => {
++  it("balanced (default) follows priority order → pricey", () => {
++    const router = makeRouter();
++    const decision = router.selectRoute(makeReq());
++    expect(decision.chosen?.modelId).toBe("pricey-model");
++    expect(decision.chosen?.isPaid).toBe(true);
++  });
++
++  it("cheapest flips to the cheaper paid model despite lower priority", () => {
++    const router = makeRouter();
++    const decision = router.selectRoute(makeReq({ mode: "cheapest" }));
++    expect(decision.chosen?.modelId).toBe("cheap-model");
++    const cheap = decision.candidatesConsidered.find((c) => c.modelId === "cheap-model");
++    expect(cheap?.breakdown?.modeBias).toBeLessThan(0);
++  });
++
++  it("best keeps the high-priority model and records a non-negative quality bias", () => {
++    const router = makeRouter();
++    const decision = router.selectRoute(makeReq({ mode: "best" }));
++    expect(decision.chosen?.modelId).toBe("pricey-model");
++  });
++
++  it("records mode + classification (tier/reason) on the decision", () => {
++    const router = makeRouter();
++    const decision = router.selectRoute(
++      makeReq({ mode: "cheapest", classification: { category: "complex", tier: "deep", reason: "nontrivial size (24000 tok, 1 files)" } }),
++    );
++    expect(decision.mode).toBe("cheapest");
++    expect(decision.tier).toBe("deep");
++    expect(decision.reason).toContain("size");
++  });
++});

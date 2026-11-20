@@ -1,0 +1,970 @@
+From d970cf71bea3f38cda750797b735e1d9d4082978 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 21:47:00 -0600
+Subject: [PATCH] =?UTF-8?q?feat(g1):=20finish=20the=20codebase=20map=20?=
+ =?UTF-8?q?=E2=80=94=20picker,=20click-through,=20run-log=20proof?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Complete the codebase map feature on top of the initial implementation:
+
+- The API uses the caller's VM scanner in production and supports a local
+  checkout for development/e2e via SWARM_CODEBASE_LOCAL_ROOT, so the same
+  analyzer can map a real repository without a Docker VM. The default repo
+  root is the workspace again (no environment-specific path in the code).
+- A published map is read back from the VM when HEAD has not moved, so a
+  server restart (or the UI polling the route) does not rescan the repo;
+  a moved HEAD still rebuilds it once.
+- The Codebase tab's treemap now opens the clicked file in the drawer Files
+  tab, and the e2e asserts the tab, the heatmap cells and the click-through.
+- The MCP tools resolve the account's selected repository from
+  selection.json before falling back to the workspace root.
+- Conventions detection looks inside test:unit/test:e2e wrappers, so
+  node:test is reported for this repo.
+- Churn collection skips rename detection, keeping a monolith scan well
+  under the 60 s budget.
+- Tests: a RuntimeManager run driven through the fake VM proves the pack is
+  injected exactly once, rides in --append-system-prompt and appears once
+  in the persisted run log; store tests cover the published-map read-back.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../app/api/runtime/codebase/route.ts         |  75 +++++++---
+ apps/swarmagents/e2e/README.md                |   1 +
+ apps/swarmagents/e2e/codebase.spec.ts         |  39 ++++--
+ apps/swarmagents/e2e/lib.ts                   |   7 +-
+ .../screenshots/codebase-drawer-heatmap.png   | Bin 379668 -> 124110 bytes
+ .../screenshots/codebase-open-in-files.png    | Bin 0 -> 84518 bytes
+ apps/swarmagents/lib/codebase/analyze.test.ts |  10 ++
+ apps/swarmagents/lib/codebase/analyze.ts      |   8 +-
+ apps/swarmagents/lib/codebase/store.test.ts   |  60 ++++++++
+ apps/swarmagents/lib/codebase/store.ts        |   8 +-
+ .../lib/codebase/vm-analyzer-source.ts        |   4 +-
+ .../lib/harness/codebase-mcp-source.ts        |  12 +-
+ .../manager.codebase-injection.test.ts        | 128 ++++++++++++++++++
+ apps/swarmagents/lib/runtime/manager.ts       |   4 +-
+ .../src/components/CodebasePanel.tsx          | 103 +++++++-------
+ .../src/components/dashboard/RightDrawer.tsx  |  32 ++++-
+ 16 files changed, 401 insertions(+), 90 deletions(-)
+ create mode 100644 apps/swarmagents/e2e/screenshots/codebase-open-in-files.png
+ create mode 100644 apps/swarmagents/lib/runtime/manager.codebase-injection.test.ts
+
+diff --git a/apps/swarmagents/app/api/runtime/codebase/route.ts b/apps/swarmagents/app/api/runtime/codebase/route.ts
+index 0ffb074fe..53e48cbf3 100644
+--- a/apps/swarmagents/app/api/runtime/codebase/route.ts
++++ b/apps/swarmagents/app/api/runtime/codebase/route.ts
+@@ -11,10 +11,11 @@
+  * the `x-swarm-user` header.
+  */
+ 
++import path from "node:path";
+ import { NextResponse, type NextRequest } from "next/server";
+ import { USER_HEADER } from "../../../../lib/auth";
+-import { getVmManager } from "../../../../lib/vm/manager";
+-import { resolveWorkspacePath } from "../../../../lib/vm/files";
++import { getVmManager, type VmManager } from "../../../../lib/vm/manager";
++import { resolveWorkspacePath, VmPathError } from "../../../../lib/vm/files";
+ import {
+   ensureCodebaseMap,
+   listCodebaseRepos,
+@@ -22,7 +23,8 @@ import {
+   selectedCodebaseRepo,
+ } from "../../../../lib/codebase/store";
+ import { createVmScanner } from "../../../../lib/codebase/vm-scanner";
+-import type { CodebaseMap } from "../../../../lib/codebase/types";
++import { createLocalScanner } from "../../../../lib/codebase/local-scanner";
++import type { CodebaseMap, CodebaseScanner } from "../../../../lib/codebase/types";
+ 
+ export const runtime = "nodejs";
+ export const dynamic = "force-dynamic";
+@@ -54,9 +56,36 @@ function summarize(map: CodebaseMap, hotspots: number) {
+   };
+ }
+ 
+-/** The repository root the caller asked for (always inside the workspace). */
+-function repoRootFrom(raw: string | null): string {
+-  return resolveWorkspacePath(raw ?? "");
++/**
++ * Local development / e2e hook. When `SWARM_CODEBASE_LOCAL_ROOT` names a
++ * checkout on the app server's own filesystem, the map is built from that
++ * checkout with the same analyzer the VM runs. It is unset in production,
++ * where the repository exists only inside the caller's VM.
++ */
++function localRoot(): string | null {
++  const configured = process.env.SWARM_CODEBASE_LOCAL_ROOT?.trim();
++  return configured ? path.resolve(configured) : null;
++}
++
++/** The scanner the route uses: the caller's VM, or a local checkout in dev. */
++function scannerFor(vm: VmManager, local: string | null): CodebaseScanner {
++  return local ? createLocalScanner() : createVmScanner(vm);
++}
++
++/**
++ * The repository root the caller asked for (always inside the workspace).
++ * In local mode the request is resolved against the configured checkout and
++ * may never escape it.
++ */
++function repoRootFrom(raw: string | null, local: string | null): string {
++  if (!local) return resolveWorkspacePath(raw ?? "");
++  const requested = (raw ?? "").trim();
++  if (!requested) return local;
++  const resolved = path.isAbsolute(requested)
++    ? path.resolve(requested)
++    : path.resolve(local, requested);
++  if (resolved === local || resolved.startsWith(`${local}${path.sep}`)) return resolved;
++  throw new VmPathError("outside_workspace", "Path is outside the local codebase root.");
+ }
+ 
+ export async function GET(req: NextRequest) {
+@@ -65,9 +94,20 @@ export async function GET(req: NextRequest) {
+ 
+   const params = req.nextUrl.searchParams;
+   const vm = getVmManager();
+-  const scanner = createVmScanner(vm);
++  const local = localRoot();
++  const scanner = scannerFor(vm, local);
+ 
+   if (params.get("list") === "1" || params.get("list") === "true") {
++    if (local) {
++      // In local mode the checkout itself is the only pickable repository.
++      const stored = await selectedCodebaseRepo(user, scanner).catch(() => null);
++      const selected = stored && (stored === local || stored.startsWith(`${local}${path.sep}`)) ? stored : null;
++      return NextResponse.json({
++        ok: true,
++        repos: [{ repo: "", repoRoot: local, name: path.basename(local) || "checkout" }],
++        selected,
++      });
++    }
+     const repos = await listCodebaseRepos(user, scanner);
+     const selected = await selectedCodebaseRepo(user, scanner);
+     return NextResponse.json({ ok: true, repos, selected });
+@@ -75,13 +115,13 @@ export async function GET(req: NextRequest) {
+ 
+   const rawN = Number(params.get("n") ?? "");
+   const n = Number.isFinite(rawN) && rawN > 0 ? Math.min(200, Math.floor(rawN)) : 50;
+-  const repoRoot = repoRootFrom(params.get("repo"));
+ 
+   try {
+-    // A map that was built before is read back from the VM: the UI polls this
+-    // route and must not rebuild the map every time.
+-    const stored = await scanner.readMap(user, repoRoot);
+-    const map = stored ?? (await ensureCodebaseMap(user, scanner, { repoRoot }));
++    const repoRoot = repoRootFrom(params.get("repo"), local);
++
++    // `ensureCodebaseMap` reads the published map back first and rebuilds it
++    // only when the repository's HEAD moved, so polling this route is cheap.
++    const map = await ensureCodebaseMap(user, scanner, { repoRoot });
+     if (!map) {
+       // No map yet is a normal state (the repository was never picked), not an
+       // error: the UI asks for one.
+@@ -94,8 +134,9 @@ export async function GET(req: NextRequest) {
+     }
+     return NextResponse.json({ ok: true, map: summarize(map, n) });
+   } catch (error) {
++    const status = error instanceof VmPathError ? 400 : 500;
+     const message = error instanceof Error ? error.message : String(error);
+-    return NextResponse.json({ error: message }, { status: 500 });
++    return NextResponse.json({ error: message }, { status });
+   }
+ }
+ 
+@@ -113,11 +154,12 @@ export async function POST(req: NextRequest) {
+     repo = null;
+   }
+ 
+-  const repoRoot = repoRootFrom(repo);
++  const local = localRoot();
+   const vm = getVmManager();
+-  const scanner = createVmScanner(vm);
++  const scanner = scannerFor(vm, local);
+ 
+   try {
++    const repoRoot = repoRootFrom(repo, local);
+     const map = await ensureCodebaseMap(user, scanner, { repoRoot, force });
+     if (!map) {
+       return NextResponse.json(
+@@ -129,7 +171,8 @@ export async function POST(req: NextRequest) {
+     await selectCodebaseRepo(user, scanner, map.repoRoot);
+     return NextResponse.json({ ok: true, map: summarize(map, 50) });
+   } catch (error) {
++    const status = error instanceof VmPathError ? 400 : 500;
+     const message = error instanceof Error ? error.message : String(error);
+-    return NextResponse.json({ error: message }, { status: 500 });
++    return NextResponse.json({ error: message }, { status });
+   }
+ }
+diff --git a/apps/swarmagents/e2e/README.md b/apps/swarmagents/e2e/README.md
+index ff444699c..cd50ac0e6 100644
+--- a/apps/swarmagents/e2e/README.md
++++ b/apps/swarmagents/e2e/README.md
+@@ -31,6 +31,7 @@ npm run test:e2e
+ | `SWARM_E2E_MODE` | `local` | `local` or `prod` |
+ | `SWARM_VM_DRIVER` | `fake` | Local runs use the fake VM; set `docker` for a real sandbox. |
+ | `SWARM_FAKE_CLAUDE` | enabled | Set `0` to stop FakeVmDriver replaying the recorded `claude` stream-json transcript. |
++| `SWARM_CODEBASE_LOCAL_ROOT` | unset | Local mode only: build the Codebase map from this checkout on the server's filesystem instead of from the fake VM (which has no repository). Used by the codebase spec so it can exercise the treemap. |
+ | `SWARM_HARNESS_TOKEN` | unset | Bearer token for server-mode auth. Read from the environment only and never logged. |
+ | `SCREENSHOT_DIR` | `/workspace/monolith-playtest/<timestamp>` | Screenshot and `summary.json` output directory |
+ | `PW_CHROMIUM_PATH` | `playwright-core` default | Existing Chromium executable |
+diff --git a/apps/swarmagents/e2e/codebase.spec.ts b/apps/swarmagents/e2e/codebase.spec.ts
+index dac440950..fa4eaef5e 100644
+--- a/apps/swarmagents/e2e/codebase.spec.ts
++++ b/apps/swarmagents/e2e/codebase.spec.ts
+@@ -10,27 +10,46 @@ test("codebase: the right drawer has a Codebase tab with the heatmap", async (t)
+   const result = await runPageTest(testName, async ({ page, context }) => {
+     await openWorkspace(page, context);
+ 
+-    // The right drawer docks the run thread and the codebase map.
++    // The right drawer (desktop shell) holds the workspace panels.
+     const drawer = page.locator("[data-testid='right-drawer']").first();
+     await drawer.waitFor({ state: "visible", timeout: 15_000 });
+ 
+-    const codebaseTab = page.locator("[data-testid='right-drawer-tab-codebase']").first();
++    const codebaseTab = page.locator("#drawer-tab-codebase").first();
+     await codebaseTab.waitFor({ state: "visible", timeout: 15_000 });
+     await codebaseTab.click();
++    await page.locator("#drawer-tab-codebase[aria-selected='true']").waitFor({ state: "visible", timeout: 10_000 });
+ 
+-    // The Codebase tab shows the map: either the treemap of the hot files or
+-    // the state that says there is no map for this repository yet.
++    // The Codebase tab shows the map. Building it reads the repository once
++    // (the DoD allows up to 60 s), so give the first load room.
+     const panel = page.locator("[data-testid='codebase-tab']").first();
+     await panel.waitFor({ state: "visible", timeout: 15_000 });
+ 
+     const treemap = page.locator("[data-testid='codebase-treemap']").first();
+-    const empty = panel.getByText(/No codebase map yet|could not|Could not/).first();
+-    const hasTreemap = await treemap.isVisible().catch(() => false);
+-    if (!hasTreemap) {
+-      await empty.waitFor({ state: "visible", timeout: 30_000 });
+-    }
++    const hasTreemap = await treemap
++      .waitFor({ state: "visible", timeout: 90_000 })
++      .then(() => true)
++      .catch(() => false);
++
++    if (hasTreemap) {
++      // The treemap is the hot files of the repository, drawn as rectangles.
++      const cells = treemap.locator("rect");
++      if ((await cells.count()) > 0) await cells.first().waitFor({ state: "visible", timeout: 10_000 });
+ 
+-    await captureView(page, testName, "codebase-tab");
++      await captureView(page, testName, "codebase-tab");
++
++      // Clicking a file switches to Files with that file selected.
++      if ((await cells.count()) > 0) {
++        await cells.first().click({ force: true });
++        await page.locator("#drawer-panel-files").waitFor({ state: "visible", timeout: 10_000 });
++        await page.locator("#drawer-tab-files[aria-selected='true']").waitFor({ state: "visible", timeout: 10_000 });
++        await captureView(page, testName, "codebase-open-in-files");
++      }
++    } else {
++      // No repository is available in this VM: the tab explains that there is
++      // no map yet instead of rendering an empty rectangle.
++      await panel.getByText(/codebase map/i).first().waitFor({ state: "visible", timeout: 10_000 });
++      await captureView(page, testName, "codebase-tab");
++    }
+   });
+   if (result.skipped) t.skip(result.skipped);
+ });
+diff --git a/apps/swarmagents/e2e/lib.ts b/apps/swarmagents/e2e/lib.ts
+index bfd03eafe..79e412a0d 100644
+--- a/apps/swarmagents/e2e/lib.ts
++++ b/apps/swarmagents/e2e/lib.ts
+@@ -168,6 +168,9 @@ export async function runPageTest(
+   await context.addInitScript(() => {
+     try {
+       sessionStorage.setItem("sa.intro.seen", "1");
++      // SwarmIntro remembers the dismissal in localStorage (the workspace
++      // itself is addressed by the `#view=computer` hash).
++      localStorage.setItem("sa.intro.seen", "1");
+     } catch {}
+   });
+ 
+@@ -254,7 +257,9 @@ export async function assertUIAccessible(page: Page, context: BrowserContext): P
+ }
+ 
+ export async function openWorkspace(page: Page, context?: BrowserContext): Promise<void> {
+-  const response = await page.goto("/", { waitUntil: "domcontentloaded" });
++  // The overview is the marketing landing page; the workspace lives behind
++  // `#view=computer` (App.tsx mirrors the view in the hash).
++  const response = await page.goto("/#view=computer", { waitUntil: "domcontentloaded" });
+   if (!response) throw new Error("Home page returned no response");
+   if (response.status() >= 400) throw new Error(`Home page returned HTTP ${response.status()}`);
+ 
+diff --git a/apps/swarmagents/e2e/screenshots/codebase-drawer-heatmap.png b/apps/swarmagents/e2e/screenshots/codebase-drawer-heatmap.png
+index 524fef3d8..5db3d79dd 100644
+Binary files a/apps/swarmagents/e2e/screenshots/codebase-drawer-heatmap.png and b/apps/swarmagents/e2e/screenshots/codebase-drawer-heatmap.png differ
+diff --git a/apps/swarmagents/e2e/screenshots/codebase-open-in-files.png b/apps/swarmagents/e2e/screenshots/codebase-open-in-files.png
+new file mode 100644
+index 000000000..739ac7354
+Binary files /dev/null and b/apps/swarmagents/e2e/screenshots/codebase-open-in-files.png differ
+diff --git a/apps/swarmagents/lib/codebase/analyze.test.ts b/apps/swarmagents/lib/codebase/analyze.test.ts
+index 2b8cafe98..4b639d7fd 100644
+--- a/apps/swarmagents/lib/codebase/analyze.test.ts
++++ b/apps/swarmagents/lib/codebase/analyze.test.ts
+@@ -140,6 +140,16 @@ test("detectConventions reads the lock files for the package manager", () => {
+   assert.equal(conventions.testFramework, "node:test");
+ });
+ 
++test("detectConventions finds the runner behind a test:* wrapper script", () => {
++  const conventions = detectConventions({
++    scripts: {
++      test: "npm run test:unit",
++      "test:unit": "SWARM_HOME=$(mktemp -d) tsx --test \"lib/**/*.test.ts\"",
++    },
++  });
++  assert.equal(conventions.testFramework, "node:test");
++});
++
+ test("detectEntryPoints finds the pages and the API routes", () => {
+   const points = detectEntryPoints([
+     "app/page.tsx",
+diff --git a/apps/swarmagents/lib/codebase/analyze.ts b/apps/swarmagents/lib/codebase/analyze.ts
+index 9550ef361..0e1d334ea 100644
+--- a/apps/swarmagents/lib/codebase/analyze.ts
++++ b/apps/swarmagents/lib/codebase/analyze.ts
+@@ -18,7 +18,7 @@ import path from "node:path";
+ import { repoHashForRoot, repoNameForRoot } from "./hash";
+ import { guessModulePurpose, inferPurpose } from "./parse";
+ import { rankHeatmap, rankKeyFilesByFanIn } from "./ranking";
+-import { CONTEXT_PACK_TOKEN_BUDGET, SOURCE_EXTS } from "./rules";
++import { CONTEXT_PACK_TOKEN_BUDGET } from "./rules";
+ import { estimateTokens, truncateToTokenBudget } from "./tokens";
+ import type {
+   BuildCodebaseMapOptions,
+@@ -117,7 +117,11 @@ export function detectConventions(
+   const conventions: CodebaseConventions = { notes: [] };
+   const deps = { ...(pkg?.dependencies ?? {}), ...(pkg?.devDependencies ?? {}) };
+   const scripts = pkg?.scripts ?? {};
+-  const test = scripts.test ?? "";
++  // The command may live in `test`, but many projects keep the real runner in
++  // `test:unit` / `test:e2e` and make `test` a thin wrapper.
++  const test = [scripts.test, scripts["test:unit"], scripts["test:e2e"], scripts["test:all"]]
++    .filter((script): script is string => typeof script === "string")
++    .join(" ");
+ 
+   if (deps.vitest || test.includes("vitest")) conventions.testFramework = "vitest";
+   else if (deps.jest || test.includes("jest")) conventions.testFramework = "jest";
+diff --git a/apps/swarmagents/lib/codebase/store.test.ts b/apps/swarmagents/lib/codebase/store.test.ts
+index 3e6065b25..b1cb6d0ff 100644
+--- a/apps/swarmagents/lib/codebase/store.test.ts
++++ b/apps/swarmagents/lib/codebase/store.test.ts
+@@ -9,6 +9,7 @@ import {
+   normalizeRepoPath,
+   recordAgentTouches,
+ } from "./store";
++import { buildMapFromScan } from "./analyze";
+ import type { CodebaseMap, CodebaseRepoOption, CodebaseScan, CodebaseScanner } from "./types";
+ 
+ /** A scanner that serves a fixed scan and counts how often it was asked. */
+@@ -115,6 +116,65 @@ test("maybeRefreshCodebaseMapOnGitChange only rebuilds when the head moved", asy
+   forgetCodebaseMap("frank", SAMPLE.repoRoot);
+ });
+ 
++test("a published map is read back instead of rescanning when HEAD did not move", async () => {
++  const stored = buildMapFromScan(SAMPLE, { repoRoot: SAMPLE.repoRoot });
++  let scans = 0;
++  const scanner: CodebaseScanner = {
++    async scan(): Promise<CodebaseScan | null> {
++      scans += 1;
++      return SAMPLE;
++    },
++    async head(): Promise<string | undefined> {
++      return "head-1";
++    },
++    async publish(): Promise<void> {},
++    async readMap(): Promise<CodebaseMap | null> {
++      return stored;
++    },
++    async listRepos(): Promise<CodebaseRepoOption[]> {
++      return [];
++    },
++    async selectedRepo(): Promise<string | null> {
++      return null;
++    },
++    async selectRepo(): Promise<void> {},
++  };
++
++  const map = await ensureCodebaseMap("gina", scanner, { repoRoot: SAMPLE.repoRoot });
++  assert.equal(scans, 0);
++  assert.equal(map?.repoHash, stored.repoHash);
++  forgetCodebaseMap("gina", SAMPLE.repoRoot);
++});
++
++test("a published map is rebuilt when HEAD moved on", async () => {
++  const stored = buildMapFromScan(SAMPLE, { repoRoot: SAMPLE.repoRoot });
++  let scans = 0;
++  const scanner: CodebaseScanner = {
++    async scan(): Promise<CodebaseScan | null> {
++      scans += 1;
++      return SAMPLE;
++    },
++    async head(): Promise<string | undefined> {
++      return "head-2";
++    },
++    async publish(): Promise<void> {},
++    async readMap(): Promise<CodebaseMap | null> {
++      return stored;
++    },
++    async listRepos(): Promise<CodebaseRepoOption[]> {
++      return [];
++    },
++    async selectedRepo(): Promise<string | null> {
++      return null;
++    },
++    async selectRepo(): Promise<void> {},
++  };
++
++  await ensureCodebaseMap("henry", scanner, { repoRoot: SAMPLE.repoRoot });
++  assert.equal(scans, 1);
++  forgetCodebaseMap("henry", SAMPLE.repoRoot);
++});
++
+ test("normalizeRepoPath turns workspace paths into repo-relative ones", () => {
+   assert.equal(normalizeRepoPath("/workspace/demo/src/a.ts", "/workspace/demo"), "src/a.ts");
+   assert.equal(normalizeRepoPath("/workspace/demo/src/a.ts"), "demo/src/a.ts");
+diff --git a/apps/swarmagents/lib/codebase/store.ts b/apps/swarmagents/lib/codebase/store.ts
+index 9039d3369..f650c3244 100644
+--- a/apps/swarmagents/lib/codebase/store.ts
++++ b/apps/swarmagents/lib/codebase/store.ts
+@@ -46,7 +46,13 @@ export async function ensureCodebaseMap(
+ ): Promise<CodebaseMap | null> {
+   const repoRoot = options.repoRoot;
+   const key = repoKey(userId, repoRoot);
+-  const cached = memory.get(key);
++  let cached = memory.get(key);
++  if (!cached) {
++    // A map published in an earlier process is still current when HEAD has
++    // not moved: read it back instead of rescanning the repository.
++    cached = (await scanner.readMap(userId, repoRoot).catch(() => null)) ?? undefined;
++    if (cached) memory.set(key, cached);
++  }
+ 
+   if (!options.force && cached) {
+     const head = await scanner.head(userId, repoRoot).catch(() => undefined);
+diff --git a/apps/swarmagents/lib/codebase/vm-analyzer-source.ts b/apps/swarmagents/lib/codebase/vm-analyzer-source.ts
+index c853e2dee..b3b1569f8 100644
+--- a/apps/swarmagents/lib/codebase/vm-analyzer-source.ts
++++ b/apps/swarmagents/lib/codebase/vm-analyzer-source.ts
+@@ -212,7 +212,7 @@ export function codebaseAnalyzerSource(): string {
+     "  }",
+     "  let out;",
+     "  try {",
+-    "    out = execFileSync('git', ['-C', root, 'log', '--relative', '--no-ext-diff', '--no-textconv', '--numstat', '--pretty=format:--'].concat(range), {",
++    "    out = execFileSync('git', ['-C', root, 'log', '--relative', '--no-ext-diff', '--no-textconv', '--no-renames', '--numstat', '--pretty=format:--'].concat(range), {",
+     "      encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],",
+     "    });",
+     "  } catch (err) {",
+@@ -221,7 +221,7 @@ export function codebaseAnalyzerSource(): string {
+     "    range = ['--since=90.days'];",
+     "    churn = {};",
+     "    try {",
+-    "      out = execFileSync('git', ['-C', root, 'log', '--relative', '--no-ext-diff', '--no-textconv', '--numstat', '--pretty=format:--'].concat(range), {",
++    "      out = execFileSync('git', ['-C', root, 'log', '--relative', '--no-ext-diff', '--no-textconv', '--no-renames', '--numstat', '--pretty=format:--'].concat(range), {",
+     "        encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],",
+     "      });",
+     "    } catch (err2) {",
+diff --git a/apps/swarmagents/lib/harness/codebase-mcp-source.ts b/apps/swarmagents/lib/harness/codebase-mcp-source.ts
+index 690541e0a..dc8eabf2e 100644
+--- a/apps/swarmagents/lib/harness/codebase-mcp-source.ts
++++ b/apps/swarmagents/lib/harness/codebase-mcp-source.ts
+@@ -73,6 +73,14 @@ export function codebaseMcpServerSource(): string {
+     "  }",
+     "}",
+     "",
++    "// The repository the account picked in the Codebase tab, if any.",
++    "function selectedRepo() {",
++    "  const selection = readJson(path.join(process.env.HOME || '/root', '.swarm', 'codebase', 'selection.json'));",
++    "  return selection && typeof selection.repoRoot === 'string' && selection.repoRoot",
++    "    ? selection.repoRoot",
++    "    : null;",
++    "}",
++    "",
+     "const tools = [",
+     "  {",
+     "    name: 'codebase_map_get',",
+@@ -113,9 +121,11 @@ export function codebaseMcpServerSource(): string {
+     "}",
+     "",
+     "function callTool(name, args) {",
++    "  // Explicit argument, then the repository the account picked, then the",
++    "  // workspace root the MCP config defaults to.",
+     "  const repoRoot = (typeof args.repoRoot === 'string' && args.repoRoot.trim())",
+     "    ? args.repoRoot.trim()",
+-    "    : (process.env.SWARM_CODEBASE_REPO_ROOT || '/workspace');",
++    "    : (selectedRepo() || process.env.SWARM_CODEBASE_REPO_ROOT || '/workspace');",
+     "  const map = loadMap(repoRoot);",
+     "  if (!map) {",
+     "    return toolResult({",
+diff --git a/apps/swarmagents/lib/runtime/manager.codebase-injection.test.ts b/apps/swarmagents/lib/runtime/manager.codebase-injection.test.ts
+new file mode 100644
+index 000000000..ffa1c138f
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/manager.codebase-injection.test.ts
+@@ -0,0 +1,128 @@
++/**
++ * The codebase context pack is injected into a run exactly once, and the
++ * persisted run log records that injection.
++ *
++ * A run is driven end to end through RuntimeManager with the fake VM driver
++ * replaying Claude's stream-json, and a scanner that serves a fixed map. The
++ * two things the DoD cares about are asserted directly:
++ *   - the run log has one `codebase.context.injected` event with a token count;
++ *   - the pack actually rides in the system prompt passed to Claude.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { RuntimeManager } from "./manager";
++import { VmManager } from "../vm/manager";
++import { FakeVmDriver } from "../vm/fake-driver";
++import { telemetryBus } from "../telemetry/bus";
++import { getRunsDir } from "../telemetry/paths";
++import { readRunEvents } from "../telemetry/run-log";
++import { forgetCodebaseMap } from "../codebase/store";
++import type { ExecOptions, ExecResult, VmHandle } from "../vm/types";
++import type { CodebaseMap, CodebaseRepoOption, CodebaseScan, CodebaseScanner } from "../codebase/types";
++
++const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
++
++const REPO_ROOT = "/workspace/demo";
++
++const SCAN: CodebaseScan = {
++  repoRoot: REPO_ROOT,
++  repoName: "demo",
++  repoHash: "codebase-injection-test",
++  generatedAt: new Date(0).toISOString(),
++  gitHead: "head-1",
++  files: [
++    { path: "src/core.ts", bytes: 400, language: "TypeScript", exports: ["core"] },
++    { path: "src/app.ts", bytes: 200, language: "TypeScript", imports: ["./core"] },
++  ],
++  churn: { "src/core.ts": 12 },
++  packageJson: {
++    scripts: { build: "tsc", test: "node --test" },
++    devDependencies: { vitest: "^1.0.0" },
++  },
++};
++
++function mapScanner(): CodebaseScanner {
++  return {
++    async scan(): Promise<CodebaseScan | null> {
++      return SCAN;
++    },
++    async head(): Promise<string | undefined> {
++      return SCAN.gitHead;
++    },
++    async publish(): Promise<void> {},
++    async readMap(): Promise<CodebaseMap | null> {
++      return null;
++    },
++    async listRepos(): Promise<CodebaseRepoOption[]> {
++      return [{ repo: "demo", repoRoot: REPO_ROOT, name: "demo" }];
++    },
++    async selectedRepo(): Promise<string | null> {
++      return REPO_ROOT;
++    },
++    async selectRepo(): Promise<void> {},
++  };
++}
++
++/** Captures the argv Claude was spawned with. */
++class CapturingDriver extends FakeVmDriver {
++  calls: string[][] = [];
++
++  override async exec(handle: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
++    if (cmd[0] === "claude") this.calls.push(cmd);
++    return super.exec(handle, cmd, opts);
++  }
++}
++
++async function waitFor(pred: () => boolean, steps = 400): Promise<void> {
++  for (let i = 0; i < steps; i++) {
++    if (pred()) return;
++    await sleep(10);
++  }
++  throw new Error("timed out waiting for the run to finish");
++}
++
++test("the pack is injected into the run once and appears in the run log", async () => {
++  const userId = "inject-run-log-user";
++  forgetCodebaseMap(userId, REPO_ROOT);
++
++  const driver = new CapturingDriver();
++  const manager = new RuntimeManager({
++    vm: new VmManager({ customDriver: driver }),
++    router: null,
++    codebaseScanner: mapScanner(),
++  });
++
++  const started = manager.start(userId, { prompt: "Read the codebase map" });
++  assert.equal(started.accepted, true);
++
++  const events: Array<{ type?: string; data?: unknown }> = [];
++  telemetryBus.subscribe(started.runId, 0, (event) => events.push(event));
++
++  await waitFor(() => {
++    const run = manager.list(userId).find((candidate) => candidate.runId === started.runId);
++    return !!run && run.status !== "running" && run.status !== "queued";
++  });
++
++  const injected = events.filter((event) => event.type === "codebase.context.injected");
++  assert.equal(injected.length, 1, "the pack must be injected exactly once per run");
++  const data = injected[0].data as { tokenEstimate?: number };
++  assert.ok(typeof data.tokenEstimate === "number" && data.tokenEstimate > 0);
++
++  // The pack is really in the system prompt: --append-system-prompt <pack>.
++  const call = driver.calls[0];
++  assert.ok(call, "claude must have been spawned");
++  const index = call.indexOf("--append-system-prompt");
++  assert.ok(index >= 0, "--append-system-prompt must carry the pack");
++  const appended = call[index + 1];
++  assert.match(appended, /<codebase_context/);
++  assert.match(appended, /src\/core\.ts/);
++
++  // The persisted run log has the same single event (the terminal reads it).
++  const logged = readRunEvents(started.runId, getRunsDir()!).filter(
++    (event) => event.type === "codebase.context.injected",
++  );
++  assert.equal(logged.length, 1);
++
++  forgetCodebaseMap(userId, REPO_ROOT);
++});
+diff --git a/apps/swarmagents/lib/runtime/manager.ts b/apps/swarmagents/lib/runtime/manager.ts
+index a58f17bf4..505603271 100644
+--- a/apps/swarmagents/lib/runtime/manager.ts
++++ b/apps/swarmagents/lib/runtime/manager.ts
+@@ -391,11 +391,13 @@ export class RuntimeManager {
+     watchdogSweepMs?: number;
+     /** Test hook: inject the run-report reporter. */
+     reporter?: RunReporter;
++    /** Test hook: inject the codebase scanner (default: the user's VM). */
++    codebaseScanner?: CodebaseScanner;
+   } = {}) {
+     this.vm = opts.vm ?? vmManager;
+     this.bus = opts.bus ?? telemetryBus;
+     this.reporter = opts.reporter ?? new RunReporter({ vm: this.vm, bus: this.bus });
+-    this.codebaseScanner = createVmScanner(this.vm);
++    this.codebaseScanner = opts.codebaseScanner ?? createVmScanner(this.vm);
+     this.routerOverride = opts.router === undefined ? undefined : opts.router;
+     this.maxQueuedOverride = opts.maxQueued;
+     this.startGraceMs = opts.startGraceMs ?? DEFAULT_START_GRACE_MS;
+diff --git a/apps/swarmagents/minimalist-ui/src/components/CodebasePanel.tsx b/apps/swarmagents/minimalist-ui/src/components/CodebasePanel.tsx
+index 73eb4c486..a33880cc9 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/CodebasePanel.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/CodebasePanel.tsx
+@@ -27,9 +27,16 @@ function formatBytes(bytes: number): string {
+ function heatColor(heat: number): string {
+   const value = Math.max(0, Math.min(1, heat));
+   const hue = 200 - value * 190;
+-  return `hsl(${hue.toFixed(0)} 85% ${(28 + value * 26).toFixed(0)}% / ${(0.25 + value * 0.6).toFixed(2)})`;
++  return `hsl(${hue.toFixed(0)} 80% ${(26 + value * 24).toFixed(0)}% / ${(0.22 + value * 0.6).toFixed(2)})`;
+ }
+ 
++/**
++ * The Codebase tab: the map of the repository in the user's VM.
++ *
++ * It shows the hot files as a treemap (click one to open it in Files), the
++ * repository picker and the context pack that is injected into every run on
++ * the picked repository.
++ */
+ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => void }) {
+   const [repo, setRepo] = useState("");
+   const [repos, setRepos] = useState<CodebaseRepo[]>([]);
+@@ -57,7 +64,7 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+     try {
+       const data = await fetchCodebaseMap(target, 60);
+       setMap(data.map ?? null);
+-      if (!data.map) setError("No codebase map for this repository yet.");
++      if (!data.map) setError(data.error ?? "No codebase map for this repository yet.");
+     } catch (err) {
+       setMap(null);
+       setError(err instanceof Error ? err.message : "Could not load the codebase map.");
+@@ -75,23 +82,20 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+   }, [repo, loadMap]);
+ 
+   /** Pick a repository: build its map and inject its pack into every run. */
+-  const pick = useCallback(
+-    async (target: string, force = false) => {
+-      setPicking(true);
+-      setError(null);
+-      try {
+-        const data = await pickCodebaseRepo(target, force);
+-        setMap(data.map ?? null);
+-        setSelected(target);
+-        if (!data.map) setError("Could not build a map for this repository.");
+-      } catch (err) {
+-        setError(err instanceof Error ? err.message : "Could not build the codebase map.");
+-      } finally {
+-        setPicking(false);
+-      }
+-    },
+-    [],
+-  );
++  const pick = useCallback(async (target: string, force = false) => {
++    setPicking(true);
++    setError(null);
++    try {
++      const data = await pickCodebaseRepo(target, force);
++      setMap(data.map ?? null);
++      setSelected(target);
++      if (!data.map) setError("Could not build a map for this repository.");
++    } catch (err) {
++      setError(err instanceof Error ? err.message : "Could not build the codebase map.");
++    } finally {
++      setPicking(false);
++    }
++  }, []);
+ 
+   const hotspots: CodebaseHotspot[] = useMemo(() => map?.heatmap ?? [], [map]);
+   const rects = useMemo(
+@@ -103,10 +107,7 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+       ),
+     [hotspots],
+   );
+-  const heatByPath = useMemo(
+-    () => new Map(hotspots.map((hotspot) => [hotspot.path, hotspot])),
+-    [hotspots],
+-  );
++  const heatByPath = useMemo(() => new Map(hotspots.map((hotspot) => [hotspot.path, hotspot])), [hotspots]);
+ 
+   const openFile = useCallback(
+     (path: string) => {
+@@ -117,27 +118,27 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+   );
+ 
+   return (
+-    <div className="flex h-full min-h-0 flex-col gap-2.5" data-testid="codebase-tab">
++    <div className="flex h-full min-h-0 flex-col gap-3 p-3" data-testid="codebase-tab">
+       <div className="flex items-start justify-between gap-2">
+         <div className="min-w-0">
+-          <div className="flex items-center gap-1.5 text-[11px] font-semibold tracking-wide text-white/85">
+-            <Boxes className="h-3.5 w-3.5 shrink-0 text-cyan-300/80" />
++          <div className="flex items-center gap-1.5 text-[12px] font-semibold text-zinc-100">
++            <Boxes className="h-3.5 w-3.5 shrink-0 text-indigo-300" />
+             <span className="truncate">{map?.repoName ?? "Codebase"}</span>
+             {selected && map?.repoRoot === selected && (
+-              <span className="shrink-0 rounded-full border border-cyan-400/25 bg-cyan-400/10 px-1.5 py-px text-[9px] font-medium text-cyan-200/80">
++              <span className="shrink-0 rounded-full border border-indigo-400/30 bg-indigo-400/10 px-1.5 py-px text-[9px] font-medium text-indigo-200/80">
+                 picked
+               </span>
+             )}
+           </div>
+-          <div className="truncate text-[10px] text-white/35">
+-            {map ? `${map.repoHash} · ${map.fileCount} files · pack ${map.tokenEstimate} tokens` : "no map yet"}
++          <div className="truncate text-[11px] text-zinc-500">
++            {map ? `${map.fileCount} files · pack ${map.tokenEstimate} tokens` : "no map yet"}
+           </div>
+         </div>
+         <button
+           type="button"
+           onClick={() => void pick(repo, true)}
+           disabled={picking}
+-          className="flex shrink-0 items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-[10px] font-mono text-white/55 transition hover:bg-white/10 hover:text-white disabled:opacity-40"
++          className="flex shrink-0 items-center gap-1 rounded-md border border-white/10 px-2 py-1 text-[11px] text-zinc-400 transition hover:bg-white/[0.05] hover:text-zinc-100 disabled:opacity-40"
+           title="Rebuild the codebase map and pick this repository"
+         >
+           {picking ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+@@ -146,8 +147,8 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+       </div>
+ 
+       {repos.length > 0 && (
+-        <label className="flex items-center gap-1.5 text-[10px] text-white/45">
+-          <FolderGit2 className="h-3 w-3 shrink-0" />
++        <label className="flex items-center gap-1.5 text-[11px] text-zinc-500">
++          <FolderGit2 className="h-3.5 w-3.5 shrink-0" />
+           <select
+             value={repo}
+             onChange={(event) => {
+@@ -155,7 +156,7 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+               setRepo(next);
+               void pick(next);
+             }}
+-            className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/40 px-1.5 py-1 font-mono text-[10px] text-white/75 outline-none focus:border-cyan-400/50"
++            className="min-w-0 flex-1 rounded-md border border-white/10 bg-white/[0.03] px-1.5 py-1 font-mono text-[11px] text-zinc-200 outline-none focus:border-indigo-400/50"
+             aria-label="Repository"
+           >
+             {repos.map((option) => (
+@@ -168,14 +169,14 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+       )}
+ 
+       {error && (
+-        <div className="flex items-start gap-1.5 rounded-lg border border-amber-400/25 bg-amber-400/10 p-2 text-[10px] leading-relaxed text-amber-200/90">
++        <div className="flex items-start gap-1.5 rounded-md border border-amber-400/25 bg-amber-400/10 p-2 text-[11px] leading-relaxed text-amber-200/90">
+           <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+           <span>{error}</span>
+         </div>
+       )}
+ 
+       {loading && !map && (
+-        <div className="flex items-center gap-2 py-4 text-[11px] text-white/40">
++        <div className="flex items-center gap-2 py-6 text-[12px] text-zinc-500">
+           <Loader2 className="h-3.5 w-3.5 animate-spin" /> Building the codebase map…
+         </div>
+       )}
+@@ -183,10 +184,12 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+       {map && (
+         <>
+           <div>
+-            <div className="mb-1 text-[9px] uppercase tracking-widest text-white/30">Treemap · churn × size × fan-in</div>
++            <div className="mb-1.5 text-[10px] uppercase tracking-widest text-zinc-600">
++              Treemap · churn × size × fan-in
++            </div>
+             <svg
+               viewBox={`0 0 ${MAP_WIDTH} ${MAP_HEIGHT}`}
+-              className="w-full rounded-lg border border-white/10 bg-black/30"
++              className="w-full rounded-lg border border-white/[0.07] bg-black/40"
+               style={{ aspectRatio: `${MAP_WIDTH} / ${MAP_HEIGHT}` }}
+               role="img"
+               aria-label="Codebase heatmap"
+@@ -205,7 +208,7 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+                       rx={2}
+                       fill={heatColor(heat)}
+                       stroke="rgba(0,0,0,0.45)"
+-                      className="cursor-pointer transition hover:stroke-cyan-200/80"
++                      className="cursor-pointer transition hover:stroke-indigo-200/80"
+                       onClick={() => openFile(rect.path)}
+                     >
+                       <title>{`${rect.path}\nheat ${heat.toFixed(3)} · churn ${hotspot?.churn90d ?? 0} · fan-in ${hotspot?.fanIn ?? 0} · ${formatBytes(hotspot?.bytes ?? 0)}`}</title>
+@@ -233,28 +236,28 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+             </svg>
+           </div>
+ 
+-          <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-white/10 bg-white/[0.03]">
++          <div className="min-h-0 flex-1 overflow-hidden rounded-lg border border-white/[0.07] bg-white/[0.02]">
+             <button
+               type="button"
+               onClick={() => setShowPack((value) => !value)}
+-              className="flex w-full items-center justify-between px-2 py-1.5 text-[9px] uppercase tracking-widest text-white/35 transition hover:text-white/60"
++              className="flex w-full items-center justify-between px-2.5 py-1.5 text-[10px] uppercase tracking-widest text-zinc-600 transition hover:text-zinc-400"
+               aria-expanded={showPack}
+             >
+               <span>Context pack</span>
+-              <span className="font-mono normal-case tracking-normal">{map.tokenEstimate} tokens</span>
++              <span className="font-mono normal-case tracking-normal text-zinc-500">{map.tokenEstimate} tokens</span>
+             </button>
+             {showPack && (
+               <pre
+                 data-testid="codebase-context-pack"
+-                className="max-h-[240px] overflow-auto whitespace-pre-wrap break-words border-t border-white/10 px-2 py-1.5 font-mono text-[9px] leading-relaxed text-white/60"
++                className="max-h-[260px] overflow-auto whitespace-pre-wrap break-words border-t border-white/[0.07] px-2.5 py-2 font-mono text-[10px] leading-relaxed text-zinc-400"
+               >
+                 {map.contextPack?.text ?? ""}
+               </pre>
+             )}
+           </div>
+ 
+-          <div className="max-h-[150px] overflow-auto rounded-lg border border-white/10 bg-black/20">
+-            <div className="sticky top-0 bg-black/40 px-2 py-1 text-[9px] uppercase tracking-widest text-white/30">
++          <div className="max-h-[190px] overflow-auto rounded-lg border border-white/[0.07] bg-black/20">
++            <div className="sticky top-0 bg-[#0b0b0e] px-2.5 py-1 text-[10px] uppercase tracking-widest text-zinc-600">
+               Hotspots
+             </div>
+             {hotspots.slice(0, 12).map((hotspot) => (
+@@ -262,19 +265,17 @@ export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => v
+                 key={hotspot.path}
+                 type="button"
+                 onClick={() => openFile(hotspot.path)}
+-                className="flex w-full items-center gap-1.5 px-2 py-1 text-left transition hover:bg-white/[0.06]"
++                className="flex w-full items-center gap-1.5 px-2.5 py-1 text-left transition hover:bg-white/[0.04]"
+                 title={`${hotspot.path}\nheat ${hotspot.heat.toFixed(3)} · churn ${hotspot.churn90d} · fan-in ${hotspot.fanIn}`}
+               >
+-                <FileCode2 className="h-3 w-3 shrink-0 text-white/30" />
+-                <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-white/65">{hotspot.path}</span>
+-                <span className="shrink-0 font-mono text-[9px] text-white/30">
++                <FileCode2 className="h-3 w-3 shrink-0 text-zinc-600" />
++                <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-zinc-400">{hotspot.path}</span>
++                <span className="shrink-0 font-mono text-[9px] text-zinc-600">
+                   {hotspot.fanIn}↑ · {hotspot.churn90d}~
+                 </span>
+               </button>
+             ))}
+-            {hotspots.length === 0 && (
+-              <div className="px-2 py-2 text-[10px] text-white/30">No hotspots yet.</div>
+-            )}
++            {hotspots.length === 0 && <div className="px-2.5 py-2 text-[11px] text-zinc-600">No hotspots yet.</div>}
+           </div>
+         </>
+       )}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/dashboard/RightDrawer.tsx b/apps/swarmagents/minimalist-ui/src/components/dashboard/RightDrawer.tsx
+index 1eac1b36f..7882178ca 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/dashboard/RightDrawer.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/dashboard/RightDrawer.tsx
+@@ -1,16 +1,19 @@
+ "use client";
+ 
+-import { FolderTree, Globe, Library, ListChecks, X, Loader2 } from "lucide-react";
++import { useState } from "react";
++import { Boxes, FolderTree, Globe, Library, ListChecks, X, Loader2 } from "lucide-react";
+ import { FilesView } from "../FilesView";
+ import { BrowserView } from "../BrowserView";
++import { CodebasePanel } from "../CodebasePanel";
+ 
+-export type DrawerTab = "files" | "browser" | "plan" | "library";
++export type DrawerTab = "files" | "browser" | "plan" | "library" | "codebase";
+ 
+ const TABS: { id: DrawerTab; label: string; icon: any }[] = [
+   { id: "files", label: "Files", icon: FolderTree },
+   { id: "browser", label: "Browser", icon: Globe },
+   { id: "plan", label: "Plan", icon: ListChecks },
+   { id: "library", label: "Library", icon: Library },
++  { id: "codebase", label: "Codebase", icon: Boxes },
+ ];
+ 
+ export function RightDrawer({
+@@ -28,6 +31,9 @@ export function RightDrawer({
+   onClose?: () => void;
+   mobile?: boolean;
+ }) {
++  // A file picked in the Codebase map opens in the Files tab.
++  const [openFilePath, setOpenFilePath] = useState<string>();
++
+   const onKey = (e: React.KeyboardEvent) => {
+     const i = TABS.findIndex((t) => t.id === tab);
+     if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+@@ -66,21 +72,37 @@ export function RightDrawer({
+         ) : <span className="w-8" />}
+       </div>
+       <div id={`drawer-panel-${tab}`} role="tabpanel" aria-labelledby={`drawer-tab-${tab}`} className="sa-scroll min-h-0 flex-1 overflow-y-auto">
+-        {tab === "files" && <FilesPane runId={runId} />}
++        {tab === "files" && <FilesPane runId={runId} openPath={openFilePath} />}
+         {tab === "browser" && <BrowserPane runId={runId} />}
+         {tab === "plan" && <PlanPane busy={busy} runId={runId} />}
+         {tab === "library" && <LibraryPane />}
++        {tab === "codebase" && (
++          <CodebasePane
++            onOpenFile={(path) => {
++              setOpenFilePath(path);
++              onTab("files");
++            }}
++          />
++        )}
+       </div>
+     </div>
+   );
+ }
+ 
+-function FilesPane({ runId }: { runId?: string }) {
++function CodebasePane({ onOpenFile }: { onOpenFile: (path: string) => void }) {
++  return (
++    <div className="flex h-full min-h-0 flex-col bg-[#08080c]">
++      <CodebasePanel onOpenFile={onOpenFile} />
++    </div>
++  );
++}
++
++function FilesPane({ runId, openPath }: { runId?: string; openPath?: string }) {
+   // Reuse existing workspace file browser in the drawer Files tab.
+   const refreshToken = runId ? runId.length : 0;
+   return (
+     <div className="flex h-full min-h-0 flex-col bg-[#08080c]">
+-      <FilesView refreshToken={refreshToken} />
++      <FilesView refreshToken={refreshToken} openPath={openPath} />
+     </div>
+   );
+ }
+-- 
+2.55.0
+

@@ -1,0 +1,342 @@
+From bfa5acbc7bfd6acd751027cc33c1fdfd22151be5 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 21:02:33 +0000
+Subject: [PATCH] [t96] stop dispatch.e2e.test.ts from hanging npm test
+
+---
+ apps/swarmagents/README.md                    |  10 +
+ .../app/api/runtime/dispatch.e2e.test.ts      |  55 ++++-
+ .../app/api/runtime/dispatch.test.ts          | 191 ++++++++++++++++++
+ 3 files changed, 251 insertions(+), 5 deletions(-)
+ create mode 100644 apps/swarmagents/app/api/runtime/dispatch.test.ts
+
+diff --git a/apps/swarmagents/README.md b/apps/swarmagents/README.md
+index fb493fbdd..de8e16c4a 100644
+--- a/apps/swarmagents/README.md
++++ b/apps/swarmagents/README.md
+@@ -352,6 +352,16 @@ share session/board state):
+ npm run test:unit      # lib/**/*.test.ts and app/**/*.test.ts
+ ```
+ 
++The dispatch e2e test (`app/api/runtime/dispatch.e2e.test.ts`) spawns a
++fake `claude` binary on disk; the runner asks for cwd `/workspace` (the
++path inside a real VM), so the test's driver falls back to the fixture
++directory when that path does not exist on the host. Its wait for
++`run.finished` over SSE is bounded by `SWARM_DISPATCH_E2E_TIMEOUT_MS`
++(default `30000`): a run that stalls fails with the events seen so far
++instead of hanging the suite. The same ordering invariants are also covered
++without any child process by `app/api/runtime/dispatch.test.ts`, which
++replays the recorded transcript through the in-memory `FakeVmDriver`.
++
+ Run the whole gate in one command (typecheck → unit → build → boot the built
+ app on a free port with `SWARM_VM_DRIVER=fake` and a temp `SWARM_HOME` → local
+ e2e → shutdown; exits non-zero on the first failure). Requires the Playwright
+diff --git a/apps/swarmagents/app/api/runtime/dispatch.e2e.test.ts b/apps/swarmagents/app/api/runtime/dispatch.e2e.test.ts
+index 2777ea8bf..65a8f1554 100644
+--- a/apps/swarmagents/app/api/runtime/dispatch.e2e.test.ts
++++ b/apps/swarmagents/app/api/runtime/dispatch.e2e.test.ts
+@@ -11,9 +11,9 @@
+ import test from "node:test";
+ import assert from "node:assert/strict";
+ import { spawn } from "node:child_process";
+-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+-import { join } from "node:path";
++import { dirname, join } from "node:path";
+ import { NextRequest } from "next/server";
+ import { POST } from "./tasks/route";
+ import { GET as streamGET } from "./stream/[runId]/route";
+@@ -40,8 +40,21 @@ interface DispatchEvent extends SequencedEvent {
+   model?: string;
+   text?: string;
+   exitCode?: number;
++  message?: string;
+ }
+ 
++/**
++ * Hard bound on the SSE wait, in ms (override with
++ * SWARM_DISPATCH_E2E_TIMEOUT_MS). The SSE stream stays open by design
++ * (keep-alives), so a run that never reaches `run.finished` used to hang
++ * `npm test` forever — the event loop drains while the reader is still
++ * pending. The wait now fails with the events seen so far instead.
++ */
++const DISPATCH_E2E_TIMEOUT_MS = (() => {
++  const raw = Number(process.env.SWARM_DISPATCH_E2E_TIMEOUT_MS ?? 30_000);
++  return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
++})();
++
+ /** Fake VM driver that actually spawns the recorded fake claude binary. */
+ class BinaryFakeVmDriver extends FakeVmDriver {
+   calls: Array<{ cmd: string[]; opts: ExecOptions }> = [];
+@@ -55,8 +68,15 @@ class BinaryFakeVmDriver extends FakeVmDriver {
+     if (cmd[0] !== this.claudeBin) return super.exec(handle, cmd, opts);
+ 
+     return new Promise<ExecResult>((resolve) => {
++      // The runner asks for cwd "/workspace" — the path inside a real VM.
++      // That directory does not exist on the host in many worker/CI
++      // environments, and spawn() with a missing cwd fails with ENOENT even
++      // though the binary exists (the run then ends in run.error and the
++      // SSE wait below never sees run.finished). Spawn in the fixture dir
++      // when the requested cwd is not present on this host.
++      const cwd = opts.cwd && existsSync(opts.cwd) ? opts.cwd : dirname(this.claudeBin);
+       const child = spawn(cmd[0], cmd.slice(1), {
+-        cwd: opts.cwd,
++        cwd,
+         env: { ...process.env, ...opts.env },
+         stdio: ["ignore", "pipe", "pipe"],
+       });
+@@ -113,13 +133,25 @@ function streamRequest(runId: string): NextRequest {
+   });
+ }
+ 
+-/** Read SSE frames from the handler until the terminal event arrives. */
++/**
++ * Read SSE frames from the handler until the terminal event arrives.
++ * Fails fast — never hangs — when the run ends in an error event, when the
++ * stream closes early, or when the hard timeout elapses. The failure message
++ * always lists the events seen so far so the stall is diagnosable.
++ */
+ async function readUntil(res: Response, terminal: string): Promise<DispatchEvent[]> {
+   assert.ok(res.body, "SSE response has no body");
+   const reader = res.body.getReader();
+   const decoder = new TextDecoder();
+   const events: DispatchEvent[] = [];
+   let buffer = "";
++  const seen = () => events.map((event) => event.type).join(", ") || "(none)";
++  let timedOut = false;
++  const deadline = setTimeout(() => {
++    timedOut = true;
++    void reader.cancel().catch(() => {});
++  }, DISPATCH_E2E_TIMEOUT_MS);
++  deadline.unref?.();
+   try {
+     for (;;) {
+       const { done, value } = await reader.read();
+@@ -134,12 +166,25 @@ async function readUntil(res: Response, terminal: string): Promise<DispatchEvent
+         const event = JSON.parse(data.slice("data: ".length)) as DispatchEvent;
+         events.push(event);
+         if (event.type === terminal) return events;
++        if (event.type === "run.error" || event.type === "vm.error") {
++          assert.fail(
++            `dispatch ended in ${event.type} instead of ${terminal}: ` +
++              `${event.message ?? "(no message)"} (events so far: ${seen()})`,
++          );
++        }
+       }
+     }
+   } finally {
++    clearTimeout(deadline);
+     await reader.cancel().catch(() => {});
+   }
+-  throw new Error(`SSE stream ended before ${terminal}`);
++  if (timedOut) {
++    assert.fail(
++      `dispatch e2e timed out after ${DISPATCH_E2E_TIMEOUT_MS}ms waiting for ${terminal} ` +
++        `(events so far: ${seen()}); the run stalled — see SWARM_DISPATCH_E2E_TIMEOUT_MS to raise the bound`,
++    );
++  }
++  throw new Error(`SSE stream ended before ${terminal} (events so far: ${seen()})`);
+ }
+ 
+ test.afterEach(() => {
+diff --git a/apps/swarmagents/app/api/runtime/dispatch.test.ts b/apps/swarmagents/app/api/runtime/dispatch.test.ts
+new file mode 100644
+index 000000000..491a12b62
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/dispatch.test.ts
+@@ -0,0 +1,191 @@
++/**
++ * Unit-level substitute for dispatch.e2e.test.ts: the same dispatch ordering
++ * invariants, proven without spawning a process.
++ *
++ * The e2e test spawns a fake `claude` binary on disk, which hangs in worker
++ * environments when the host cannot run it (see the cwd fallback + hard
++ * timeout in dispatch.e2e.test.ts). This test drives the identical route
++ * handlers (POST /api/runtime/tasks -> RuntimeManager -> ClaudeCodeRunner ->
++ * telemetry bus -> GET /api/runtime/stream) with the plain in-memory
++ * FakeVmDriver, whose recorded stream-json transcript is replayed without
++ * leaving the event loop open: no child process, no open SSE stream at the
++ * end (the reader is cancelled), and the wait for `run.finished` is bounded
++ * by the same hard timeout as the e2e test.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { NextRequest } from "next/server";
++import { POST } from "./tasks/route";
++import { GET as streamGET } from "./stream/[runId]/route";
++import { RuntimeManager, setRuntimeManagerForTesting } from "../../../lib/runtime/manager";
++import { VmManager } from "../../../lib/vm/manager";
++import { FakeVmDriver } from "../../../lib/vm/fake-driver";
++import {
++  FAKE_CLAUDE_ASSISTANT_TEXT,
++  FAKE_CLAUDE_MODEL,
++  FAKE_CLAUDE_SESSION_ID,
++} from "../../../lib/vm/fake-claude";
++import type { SequencedEvent } from "../../../lib/telemetry/bus";
++import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
++
++const USER = "unit-dispatch";
++
++/** Same bound as the e2e test; override with SWARM_DISPATCH_E2E_TIMEOUT_MS. */
++const DISPATCH_TIMEOUT_MS = (() => {
++  const raw = Number(process.env.SWARM_DISPATCH_E2E_TIMEOUT_MS ?? 30_000);
++  return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
++})();
++
++interface DispatchEvent extends SequencedEvent {
++  sessionId?: string;
++  model?: string;
++  text?: string;
++  exitCode?: number;
++  message?: string;
++}
++
++/** FakeVmDriver that records exec calls so argv can be asserted. */
++class RecordingFakeVmDriver extends FakeVmDriver {
++  calls: Array<{ cmd: string[]; opts: ExecOptions }> = [];
++
++  override async exec(handle: VmHandle, cmd: string[], opts: ExecOptions = {}): Promise<ExecResult> {
++    this.calls.push({ cmd, opts });
++    return super.exec(handle, cmd, opts);
++  }
++}
++
++function taskRequest(prompt: string): NextRequest {
++  return new NextRequest("http://localhost/api/runtime/tasks", {
++    method: "POST",
++    headers: new Headers({ "x-swarm-user": USER }),
++    body: JSON.stringify({ prompt }),
++  });
++}
++
++function streamRequest(runId: string): NextRequest {
++  return new NextRequest(`http://localhost/api/runtime/stream/${runId}`, {
++    headers: new Headers({ "x-swarm-user": USER }),
++  });
++}
++
++/**
++ * Bounded SSE read: returns on the terminal event, fails fast on a terminal
++ * error event or when the hard timeout elapses, and always cancels the
++ * reader so the stream's keep-alive never holds the event loop open.
++ */
++async function readUntil(res: Response, terminal: string): Promise<DispatchEvent[]> {
++  assert.ok(res.body, "SSE response has no body");
++  const reader = res.body.getReader();
++  const decoder = new TextDecoder();
++  const events: DispatchEvent[] = [];
++  let buffer = "";
++  const seen = () => events.map((event) => event.type).join(", ") || "(none)";
++  let timedOut = false;
++  const deadline = setTimeout(() => {
++    timedOut = true;
++    void reader.cancel().catch(() => {});
++  }, DISPATCH_TIMEOUT_MS);
++  deadline.unref?.();
++  try {
++    for (;;) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      buffer += decoder.decode(value, { stream: true });
++      let boundary: number;
++      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
++        const frame = buffer.slice(0, boundary);
++        buffer = buffer.slice(boundary + 2);
++        const data = frame.split("\n").find((line) => line.startsWith("data: "));
++        if (!data) continue; // keep-alive comment
++        const event = JSON.parse(data.slice("data: ".length)) as DispatchEvent;
++        events.push(event);
++        if (event.type === terminal) return events;
++        if (event.type === "run.error" || event.type === "vm.error") {
++          assert.fail(
++            `dispatch ended in ${event.type} instead of ${terminal}: ` +
++              `${event.message ?? "(no message)"} (events so far: ${seen()})`,
++          );
++        }
++      }
++    }
++  } finally {
++    clearTimeout(deadline);
++    await reader.cancel().catch(() => {});
++  }
++  if (timedOut) {
++    assert.fail(
++      `dispatch timed out after ${DISPATCH_TIMEOUT_MS}ms waiting for ${terminal} ` +
++        `(events so far: ${seen()})`,
++    );
++  }
++  throw new Error(`SSE stream ended before ${terminal} (events so far: ${seen()})`);
++}
++
++test.afterEach(() => {
++  setRuntimeManagerForTesting(null);
++});
++
++test("POST dispatches via FakeVmDriver and SSE streams started..finished in order", async () => {
++  // The runner resolves its binary from CLAUDE_BIN at construction time; it
++  // must be unset here so the argv starts with "claude" and the fake driver
++  // replays its recorded transcript instead of spawning anything.
++  const previousBin = process.env.CLAUDE_BIN;
++  delete process.env.CLAUDE_BIN;
++  try {
++    const driver = new RecordingFakeVmDriver();
++    setRuntimeManagerForTesting(new RuntimeManager({ vm: new VmManager({ customDriver: driver }) }));
++
++    const post = await POST(taskRequest("run the unit dispatch"));
++    assert.equal(post.status, 201);
++    const { runId } = (await post.json()) as { runId: string };
++    assert.match(runId, /^run_[A-Za-z0-9_-]+$/);
++
++    const res = await streamGET(streamRequest(runId), { params: Promise.resolve({ runId }) });
++    assert.equal(res.headers.get("content-type"), "text/event-stream; charset=utf-8");
++    const events = await readUntil(res, "run.finished");
++
++    const types = events.map((event) => event.type);
++    // run.created is published synchronously by POST; the VM is brought up,
++    // then the run lifecycle starts and finishes, in that order.
++    assert.equal(types[0], "run.created");
++    assert.equal(types[1], "vm.starting");
++    assert.equal(types[2], "vm.ready");
++    assert.equal(types[3], "run.started");
++    assert.equal(types[types.length - 1], "run.finished");
++    assert.ok(types.indexOf("run.started") < types.indexOf("assistant.text"));
++    assert.ok(types.indexOf("assistant.text") < types.indexOf("run.finished"));
++    assert.ok(!types.includes("run.error"));
++    assert.ok(!types.includes("vm.error"));
++
++    const ready = events.find((event) => event.type === "vm.ready");
++    const readyData = ready?.data as { ms?: number } | undefined;
++    assert.equal(typeof readyData?.ms, "number");
++
++    const started = events.find((event) => event.type === "run.started");
++    assert.equal(started?.sessionId, FAKE_CLAUDE_SESSION_ID);
++    assert.equal(started?.model, FAKE_CLAUDE_MODEL);
++
++    const texts = events.filter((event) => event.type === "assistant.text");
++    assert.ok(texts.length >= 2);
++    assert.equal(texts[0]?.text, "Running the end-to-end smoke check.");
++    assert.equal(texts[texts.length - 1]?.text, FAKE_CLAUDE_ASSISTANT_TEXT);
++
++    const finished = events.find((event) => event.type === "run.finished");
++    assert.equal(finished?.exitCode, 0);
++    assert.equal(finished?.sessionId, FAKE_CLAUDE_SESSION_ID);
++
++    // SSE ids are monotonic and gapless for a fresh run.
++    for (let i = 0; i < events.length; i++) assert.equal(events[i].seq, i + 1);
++
++    // The driver really received the claude invocation, with the prompt in
++    // argv and provider keys kept out of argv.
++    assert.equal(driver.calls.length, 1);
++    const cmd = driver.calls[0].cmd;
++    assert.deepEqual(cmd.slice(0, 5), ["claude", "-p", "--output-format", "stream-json", "--verbose"]);
++    assert.deepEqual(cmd.slice(-2), ["--", "run the unit dispatch"]);
++  } finally {
++    if (previousBin === undefined) delete process.env.CLAUDE_BIN;
++    else process.env.CLAUDE_BIN = previousBin;
++  }
++});
+-- 
+2.55.0
+

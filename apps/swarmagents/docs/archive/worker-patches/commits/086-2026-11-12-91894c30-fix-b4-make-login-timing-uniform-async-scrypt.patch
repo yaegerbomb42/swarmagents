@@ -1,0 +1,377 @@
+From 91894c300b79b208d9235bacb13c3deec60e25db Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 20:05:40 -0600
+Subject: [PATCH] fix(b4): make login timing uniform; async scrypt
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+verifyLocalUser returned early for an unknown email while running scryptSync
+(~25ms) only for a known one (~0.01ms) — a ~2000x timing leak that let
+accounts be enumerated. scryptSync also blocked the event loop ~25ms per
+attempt.
+
+Switch password hashing/verification to async crypto.scrypt (promisified),
+which never blocks the event loop. For an unknown email, verify against a
+fixed dummy scrypt hash with identical parameters before returning null, so
+an unknown account costs the same as a wrong password (constant-time compare
+via timingSafeEqual). Routes await the now-async functions.
+
+Tests: a new timing test asserts unknown vs known-wrong ratio < 3x over 10
+iterations; a new non-blocking test proves verification yields to the event
+loop (a short timer fires while verification is pending). Existing
+login/signup/audit/migrate suites updated to await the async API. tsc 0
+errors, npm test passes (only pre-existing environmental desktop-proxy
+ECONNRESET flakes fail), build OK.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/app/api/audit/route.test.ts  |  2 +-
+ apps/swarmagents/app/api/login/route.test.ts  |  4 +-
+ apps/swarmagents/app/api/login/route.ts       |  2 +-
+ apps/swarmagents/app/api/signup/route.ts      |  2 +-
+ .../swarmagents/lib/providers/migrate.test.ts | 16 ++--
+ apps/swarmagents/lib/users.test.ts            | 92 +++++++++++++++----
+ apps/swarmagents/lib/users.ts                 | 49 +++++++---
+ 7 files changed, 125 insertions(+), 42 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/audit/route.test.ts b/apps/swarmagents/app/api/audit/route.test.ts
+index 6fb2d5f7c..a62e53b1a 100644
+--- a/apps/swarmagents/app/api/audit/route.test.ts
++++ b/apps/swarmagents/app/api/audit/route.test.ts
+@@ -204,7 +204,7 @@ test("snapshot create/restore are audit-logged", async () => {
+ });
+ 
+ test("login success and failure are audit-logged without the password", async () => {
+-  signupLocalUser("alice@example.com", "correct horse battery staple");
++  await signupLocalUser("alice@example.com", "correct horse battery staple");
+   const loginReq = (body: unknown) =>
+     new NextRequest("http://localhost/api/login", {
+       method: "POST",
+diff --git a/apps/swarmagents/app/api/login/route.test.ts b/apps/swarmagents/app/api/login/route.test.ts
+index c6f836ea8..4c93b158c 100644
+--- a/apps/swarmagents/app/api/login/route.test.ts
++++ b/apps/swarmagents/app/api/login/route.test.ts
+@@ -28,11 +28,11 @@ function setCookieValue(res: Response): string {
+ 
+ let dir = "";
+ 
+-test.beforeEach(() => {
++test.beforeEach(async () => {
+   dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-login-test-"));
+   configureUserPaths(path.join(dir, "users.json"));
+   process.env.SWARM_SESSION_SECRET = "test-session-secret";
+-  signupLocalUser("alice@example.com", "correct horse battery staple");
++  await signupLocalUser("alice@example.com", "correct horse battery staple");
+ });
+ 
+ test.afterEach(() => {
+diff --git a/apps/swarmagents/app/api/login/route.ts b/apps/swarmagents/app/api/login/route.ts
+index 11880c2c9..d03fc39bb 100644
+--- a/apps/swarmagents/app/api/login/route.ts
++++ b/apps/swarmagents/app/api/login/route.ts
+@@ -50,7 +50,7 @@ export async function POST(req: NextRequest): Promise<Response> {
+     return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
+   }
+ 
+-  const user = verifyLocalUser(body.email, body.password);
++  const user = await verifyLocalUser(body.email, body.password);
+   if (!user) {
+     // The attempted email is an identifier, not a secret; the password is
+     // never logged.
+diff --git a/apps/swarmagents/app/api/signup/route.ts b/apps/swarmagents/app/api/signup/route.ts
+index e7a801908..d6805e04d 100644
+--- a/apps/swarmagents/app/api/signup/route.ts
++++ b/apps/swarmagents/app/api/signup/route.ts
+@@ -53,7 +53,7 @@ export async function POST(req: NextRequest): Promise<Response> {
+     return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
+   }
+ 
+-  const result = signupLocalUser(body.email, body.password);
++  const result = await signupLocalUser(body.email, body.password);
+   if (!result.ok) {
+     switch (result.error) {
+       case "exists":
+diff --git a/apps/swarmagents/lib/providers/migrate.test.ts b/apps/swarmagents/lib/providers/migrate.test.ts
+index 578f30f28..2afab5f52 100644
+--- a/apps/swarmagents/lib/providers/migrate.test.ts
++++ b/apps/swarmagents/lib/providers/migrate.test.ts
+@@ -38,8 +38,8 @@ test.afterEach(() => {
+   fs.rmSync(tempDir, { recursive: true, force: true });
+ });
+ 
+-test("moves the legacy file into the owner's account, encrypted, and renames it", () => {
+-  signupLocalUser(OWNER, "a-long-password-1");
++test("moves the legacy file into the owner's account, encrypted, and renames it", async () => {
++  await signupLocalUser(OWNER, "a-long-password-1");
+   writeLegacy();
+   const result = migrateLegacyProviders({ env: {} });
+   assert.equal(result.status, "migrated");
+@@ -61,8 +61,8 @@ test("moves the legacy file into the owner's account, encrypted, and renames it"
+   assert.equal(migrateLegacyProviders({ env: {} }).status, "no-legacy-file", "idempotent");
+ });
+ 
+-test("SWARM_OWNER_EMAIL picks the owner", () => {
+-  signupLocalUser("boss@example.com", "a-long-password-1");
++test("SWARM_OWNER_EMAIL picks the owner", async () => {
++  await signupLocalUser("boss@example.com", "a-long-password-1");
+   writeLegacy();
+   const result = migrateLegacyProviders({ env: { SWARM_OWNER_EMAIL: "Boss@Example.com" } });
+   assert.equal(result.status, "migrated");
+@@ -78,8 +78,8 @@ test("does nothing until the owner account exists (keys are never parked under a
+   assert.equal(fs.existsSync(userProvidersFilePath(OWNER_ID)), false);
+ });
+ 
+-test("merges into an owner who already saved providers, keeping their own entries", () => {
+-  signupLocalUser(OWNER, "a-long-password-1");
++test("merges into an owner who already saved providers, keeping their own entries", async () => {
++  await signupLocalUser(OWNER, "a-long-password-1");
+   saveProvider(OWNER_ID, { id: "mercury", apiKey: "sk-mercury-own-9999" });
+   writeLegacy();
+   const result = migrateLegacyProviders({ env: {} });
+@@ -91,8 +91,8 @@ test("merges into an owner who already saved providers, keeping their own entrie
+   assert.deepEqual(owner.find((p) => p.id === "exaone")?.keys, ["sk-exaone-legacy-2222"]);
+ });
+ 
+-test("an invalid legacy file is reported and left alone", () => {
+-  signupLocalUser(OWNER, "a-long-password-1");
++test("an invalid legacy file is reported and left alone", async () => {
++  await signupLocalUser(OWNER, "a-long-password-1");
+   fs.writeFileSync(legacyFile, "{ nope");
+   assert.equal(migrateLegacyProviders({ env: {} }).status, "invalid-file");
+   assert.equal(fs.existsSync(legacyFile), true);
+diff --git a/apps/swarmagents/lib/users.test.ts b/apps/swarmagents/lib/users.test.ts
+index bdb7ad388..47265f8c6 100644
+--- a/apps/swarmagents/lib/users.test.ts
++++ b/apps/swarmagents/lib/users.test.ts
+@@ -25,37 +25,37 @@ test.afterEach(() => {
+   fs.rmSync(dir, { recursive: true, force: true });
+ });
+ 
+-test("signupLocalUser persists and verifyLocalUser authenticates", () => {
+-  const created = signupLocalUser(" Alice@Example.COM ", "correct horse battery");
++test("signupLocalUser persists and verifyLocalUser authenticates", async () => {
++  const created = await signupLocalUser(" Alice@Example.COM ", "correct horse battery");
+   assert.equal(created.ok, true);
+   if (!created.ok) return;
+   assert.equal(created.user.email, "alice@example.com");
+   assert.equal(created.user.uid, "local_alice@example.com");
+ 
+   // Case-insensitive, whitespace-tolerant login.
+-  assert.deepEqual(verifyLocalUser("ALICE@example.com", "correct horse battery"), created.user);
+-  assert.equal(verifyLocalUser("alice@example.com", "wrong password"), null);
+-  assert.equal(verifyLocalUser("nobody@example.com", "correct horse battery"), null);
++  assert.deepEqual(await verifyLocalUser("ALICE@example.com", "correct horse battery"), created.user);
++  assert.equal(await verifyLocalUser("alice@example.com", "wrong password"), null);
++  assert.equal(await verifyLocalUser("nobody@example.com", "correct horse battery"), null);
+ 
+   // The file is written to disk, so a fresh read finds the user.
+-  const again = verifyLocalUser("alice@example.com", "correct horse battery");
++  const again = await verifyLocalUser("alice@example.com", "correct horse battery");
+   assert.ok(again);
+ });
+ 
+-test("passwords are stored as salted scrypt hashes, never plaintext", () => {
+-  signupLocalUser("alice@example.com", "hunter2secret");
++test("passwords are stored as salted scrypt hashes, never plaintext", async () => {
++  await signupLocalUser("alice@example.com", "hunter2secret");
+   const raw = fs.readFileSync(path.join(dir, "users.json"), "utf-8");
+   assert.ok(!raw.includes("hunter2secret"), "password must not appear in the store");
+   assert.match(raw, /scrypt\$/);
+ });
+ 
+-test("signupLocalUser rejects invalid email, weak password, duplicates", () => {
+-  assert.deepEqual(signupLocalUser("not-an-email", "longenough123"), { ok: false, error: "invalid" });
+-  assert.deepEqual(signupLocalUser("a@b.co", "short"), { ok: false, error: "invalid" });
+-  assert.deepEqual(signupLocalUser(null, "longenough123"), { ok: false, error: "invalid" });
+-  assert.equal(signupLocalUser("dup@example.com", "validpassword123").ok, true);
+-  assert.deepEqual(signupLocalUser("dup@example.com", "anotherpassword123"), { ok: false, error: "exists" });
+-  assert.deepEqual(signupLocalUser("DUP@example.com", "anotherpassword123"), { ok: false, error: "exists" });
++test("signupLocalUser rejects invalid email, weak password, duplicates", async () => {
++  assert.deepEqual(await signupLocalUser("not-an-email", "longenough123"), { ok: false, error: "invalid" });
++  assert.deepEqual(await signupLocalUser("a@b.co", "short"), { ok: false, error: "invalid" });
++  assert.deepEqual(await signupLocalUser(null, "longenough123"), { ok: false, error: "invalid" });
++  assert.equal((await signupLocalUser("dup@example.com", "validpassword123")).ok, true);
++  assert.deepEqual(await signupLocalUser("dup@example.com", "anotherpassword123"), { ok: false, error: "exists" });
++  assert.deepEqual(await signupLocalUser("DUP@example.com", "anotherpassword123"), { ok: false, error: "exists" });
+ });
+ 
+ test("emailForUserId shows the real address for local accounts", () => {
+@@ -76,9 +76,9 @@ test("normalizeEmail canonicalizes and rejects garbage", () => {
+   assert.equal(normalizeEmail("a".repeat(300) + "@x.com"), "");
+ });
+ 
+-test("getSessionEpoch/bumpSessionEpoch revoke sessions for one user only", () => {
+-  signupLocalUser("alice@example.com", "correct horse battery");
+-  signupLocalUser("bob@example.com", "another strong secret");
++test("getSessionEpoch/bumpSessionEpoch revoke sessions for one user only", async () => {
++  await signupLocalUser("alice@example.com", "correct horse battery");
++  await signupLocalUser("bob@example.com", "another strong secret");
+ 
+   // Fresh accounts have never revoked: epoch 0.
+   assert.equal(getSessionEpoch("alice@example.com"), 0);
+@@ -96,3 +96,59 @@ test("getSessionEpoch/bumpSessionEpoch revoke sessions for one user only", () =>
+   assert.equal(bumpSessionEpoch("nobody@example.com"), false);
+   assert.equal(bumpSessionEpoch("not-an-email"), false);
+ });
++
++test("verifyLocalUser timing is uniform between unknown email and wrong password", async () => {
++  await signupLocalUser("alice@example.com", "correct horse battery");
++  const wrongPassword = "definitely-wrong-password";
++
++  const knownWrong = () => verifyLocalUser("alice@example.com", wrongPassword);
++  const unknown = () => verifyLocalUser("nobody@example.com", wrongPassword);
++
++  // Warm up the scrypt pool / caches so the first call does not skew ratios.
++  for (let i = 0; i < 3; i++) {
++    await knownWrong();
++    await unknown();
++  }
++
++  const N = 10;
++  let knownTotal = 0;
++  let unknownTotal = 0;
++  for (let i = 0; i < N; i++) {
++    const t0 = performance.now();
++    await knownWrong();
++    knownTotal += performance.now() - t0;
++
++    const t1 = performance.now();
++    await unknown();
++    unknownTotal += performance.now() - t1;
++  }
++  const knownAvg = knownTotal / N;
++  const unknownAvg = unknownTotal / N;
++  assert.ok(unknownAvg > 0, `unknown-email verification should cost something, got ${unknownAvg}ms`);
++  // An unknown email must not be meaningfully faster than a known wrong
++  // password, otherwise accounts could be enumerated by response timing.
++  // Allow generous slack for scheduling noise (DoD: ratio < 3x).
++  assert.ok(knownAvg < unknownAvg * 3, `known=${knownAvg.toFixed(2)}ms unknown=${unknownAvg.toFixed(2)}ms`);
++});
++
++test("password verification yields to the event loop (async, non-blocking)", async () => {
++  await signupLocalUser("alice@example.com", "correct horse battery");
++
++  const order: string[] = [];
++  const timerPromise = new Promise<void>((resolve) => {
++    // Fire ~5ms after the timer is set. scrypt takes ~25ms, so if
++    // verification is async the timer wins; if it blocked synchronously the
++    // verification would resolve first.
++    setTimeout(() => {
++      order.push("timer");
++      resolve();
++    }, 5);
++  });
++
++  const verifyPromise = verifyLocalUser("alice@example.com", "wrong-password").then(() => {
++    order.push("verify");
++  });
++  await Promise.all([timerPromise, verifyPromise]);
++
++  assert.deepEqual(order, ["timer", "verify"], "a short timer must fire while verification is still pending");
++});
+diff --git a/apps/swarmagents/lib/users.ts b/apps/swarmagents/lib/users.ts
+index e6b58fbc7..8b12fc887 100644
+--- a/apps/swarmagents/lib/users.ts
++++ b/apps/swarmagents/lib/users.ts
+@@ -9,12 +9,30 @@
+ 
+ import fs from "node:fs";
+ import path from "node:path";
+-import { randomBytes, scryptSync } from "node:crypto";
++import { randomBytes, scrypt } from "node:crypto";
++import { promisify } from "node:util";
+ import { resolveStorageDir, isDirWritable } from "./board/store";
+ 
+ const SCHEME = "scrypt";
+ const KEY_LEN = 32;
+ const SALT_BYTES = 16;
++
++/** Async scrypt (promisified); never blocks the event loop while hashing. */
++const scryptAsync = promisify(scrypt) as (
++  password: string | Buffer,
++  salt: Buffer | string,
++  keylen: number,
++) => Promise<Buffer>;
++
++/**
++ * A fixed scrypt hash used to equalize the cost of a login attempt for an
++ * unknown email. The stored value is never used for authentication — only its
++ * parameters (identical to real hashes) matter, so known and unknown accounts
++ * burn the same CPU before responding and account existence cannot be probed
++ * by response timing.
++ */
++const DUMMY_SCRYPT_HASH =
++  "scrypt$33247306aac749054795c00127be0ecf$945ffa6bb3d59a4b3d46e77f8a6f5c1cb0bc5d549c017b4b5d9e90dd74a00ba9";
+ const MAX_EMAIL_LEN = 254;
+ const MIN_PASSWORD_LEN = 8;
+ const MAX_PASSWORD_LEN = 1024;
+@@ -42,18 +60,19 @@ interface UserFile {
+   users: StoredUser[];
+ }
+ 
+-/** Password hashing: scrypt with a random salt (node:crypto, no deps). */
+-function hashPassword(password: string): string {
++/** Password hashing: scrypt with a random salt, async (node:crypto, no deps). */
++async function hashPassword(password: string): Promise<string> {
+   const salt = randomBytes(SALT_BYTES);
+-  const hash = scryptSync(password, salt, KEY_LEN);
++  const hash = await scryptAsync(password, salt, KEY_LEN);
+   return `${SCHEME}$${salt.toString("hex")}$${hash.toString("hex")}`;
+ }
+ 
+-function verifyPassword(password: string, stored: string): boolean {
++/** Verify a password against a stored scrypt hash; async and constant-time. */
++async function verifyPassword(password: string, stored: string): Promise<boolean> {
+   const parts = stored.split("$");
+   if (parts.length !== 3 || parts[0] !== SCHEME) return false;
+   const expected = Buffer.from(parts[2], "hex");
+-  const actual = scryptSync(password, Buffer.from(parts[1], "hex"), expected.length);
++  const actual = await scryptAsync(password, Buffer.from(parts[1], "hex"), expected.length);
+   return actual.length === expected.length && timingSafeEqualBuf(actual, expected);
+ }
+ 
+@@ -112,7 +131,7 @@ export type SignupResult =
+   | { ok: false; error: SignupError };
+ 
+ /** Create a local password user; fires no network calls. */
+-export function signupLocalUser(email: unknown, password: unknown): SignupResult {
++export async function signupLocalUser(email: unknown, password: unknown): Promise<SignupResult> {
+   const normalized = normalizeEmail(email);
+   if (
+     !normalized ||
+@@ -126,7 +145,7 @@ export function signupLocalUser(email: unknown, password: unknown): SignupResult
+   if (users.some((u) => u.email === normalized)) {
+     return { ok: false, error: "exists" };
+   }
+-  users.push({ email: normalized, password: hashPassword(password), createdAt: Date.now() });
++  users.push({ email: normalized, password: await hashPassword(password), createdAt: Date.now() });
+   try {
+     saveUsers(users);
+   } catch {
+@@ -153,11 +172,19 @@ export function localUserExists(email: unknown): boolean {
+ }
+ 
+ /** Verify a local password; returns the user on success, null otherwise. */
+-export function verifyLocalUser(email: unknown, password: unknown): LocalUser | null {
++export async function verifyLocalUser(email: unknown, password: unknown): Promise<LocalUser | null> {
+   const normalized = normalizeEmail(email);
+   if (!normalized || typeof password !== "string" || !password) return null;
+-  const user = loadUsers().find((u) => u.email === normalized);
+-  if (!user || !verifyPassword(password, user.password)) return null;
++  const users = loadUsers();
++  const user = users.find((u) => u.email === normalized);
++  if (!user) {
++    // Burn the same scrypt cost as a real verification against a fixed dummy
++    // hash, so an unknown email is indistinguishable from a wrong password by
++    // response timing (no account enumeration).
++    await verifyPassword(password, DUMMY_SCRYPT_HASH);
++    return null;
++  }
++  if (!(await verifyPassword(password, user.password))) return null;
+   return { uid: localUserIdForEmail(normalized), email: normalized };
+ }
+ 
+-- 
+2.55.0
+

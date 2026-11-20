@@ -1,0 +1,551 @@
+From 6a8c222af477034b8434f8e2351d29ad6ab40a77 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 14:07:53 -0600
+Subject: [PATCH] feat(byoc): batch events + Python worker
+
+Send claude stream-json events to the server in batches (action: "events")
+instead of one synchronous POST per line. The POSIX worker buffers up to 50
+events and flushes every ~150ms or on queue pressure, dropping the oldest
+event under severe congestion so claude's stdout never stalls. Falls back to
+single-event POSTs against an older server. The worker now also exits
+promptly when the node token is revoked (HTTP 401) and terminates the active
+claude child on SIGTERM/SIGINT instead of orphaning it.
+
+Server route adds a bounded batch endpoint (non-empty, <=100 events per call)
+that publishes each event and reports the accepted count; it rejects with 409
+and the accepted-so-far count when a run is not running or an event is invalid.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../app/api/computers/node/install/route.ts   | 134 ++++++++--
+ .../app/api/computers/node/route.test.ts      | 240 ++++++++++++++++++
+ .../app/api/computers/node/route.ts           |  25 ++
+ 3 files changed, 379 insertions(+), 20 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/computers/node/install/route.ts b/apps/swarmagents/app/api/computers/node/install/route.ts
+index adca0676a..8c3663490 100644
+--- a/apps/swarmagents/app/api/computers/node/install/route.ts
++++ b/apps/swarmagents/app/api/computers/node/install/route.ts
+@@ -11,9 +11,12 @@
+  * command line and the token is written only to the node's own config file.
+  *
+  * The POSIX worker heartbeats from a background thread while `claude` runs,
+- * streams `--output-format stream-json` events back as `action: "event"`, and
+- * resumes the previous session with `--resume` so multi-turn runs keep their
+- * context.
++ * streams `--output-format stream-json` events back in batches via
++ * `action: "events"` (falling back to single `action: "event"` calls against
++ * an older server), and resumes the previous session with `--resume` so
++ * multi-turn runs keep their context. The worker exits promptly when its
++ * token is revoked (HTTP 401) and terminates the active `claude` child on
++ * SIGTERM/SIGINT instead of orphaning it.
+  *
+  * This path is in the middleware public allow-list (the pairing code is the
+  * credential at this stage).
+@@ -114,7 +117,7 @@ printf '{"computerId":"%s","nodeToken":"%s","server":"%s"}\n' "$CID" "$TOKEN" "$
+ chmod 600 "$CONFIG"
+ echo "Paired as $CID. Keeping this computer online (Ctrl-C to stop)."
+ exec python3 - "$SERVER" "$CID" "$TOKEN" "$OS" "$ARCH" "$MODE" <<'PY'
+-import json, subprocess, sys, threading, time, urllib.request
++import json, os, queue, signal, subprocess, sys, threading, time, urllib.error, urllib.request
+ 
+ server, cid, token, os_name, arch, mode = sys.argv[1:7]
+ endpoint = server + "/api/computers/node"
+@@ -124,33 +127,112 @@ headers = {
+     "x-computer-id": cid,
+ }
+ machine = {"os": os_name, "arch": arch, "mode": mode}
++shutdown_event = threading.Event()
++active_proc_lock = threading.Lock()
++active_proc = None
+ 
+-def post(payload, timeout=60):
++def handle_signal(signum, _frame):
++    shutdown_event.set()
++    with active_proc_lock:
++        if active_proc is not None and active_proc.poll() is None:
++            try:
++                active_proc.terminate()
++            except Exception:
++                pass
++
++signal.signal(signal.SIGTERM, handle_signal)
++signal.signal(signal.SIGINT, handle_signal)
++
++class RevokedError(Exception):
++    pass
++
++def post(payload, timeout=30):
+     req = urllib.request.Request(
+         endpoint, data=json.dumps(payload).encode(), headers=headers, method="POST"
+     )
+-    with urllib.request.urlopen(req, timeout=timeout) as res:
+-        raw = res.read()
+-    return json.loads(raw.decode() or "{}")
++    try:
++        with urllib.request.urlopen(req, timeout=timeout) as res:
++            raw = res.read()
++        return json.loads(raw.decode() or "{}")
++    except urllib.error.HTTPError as exc:
++        if exc.code == 401:
++            raise RevokedError("Computer token revoked or unknown.") from exc
++        raise
+ 
+ def heartbeat_loop():
+     # The claim/execute loop blocks while claude runs. Without this thread the
+     # node stops heartbeating and the server pauses the run after its 60s
+     # offline window.
+-    while True:
++    while not shutdown_event.is_set():
+         try:
+-            post({"action": "heartbeat", "machine": machine})
++            post({"action": "heartbeat", "machine": machine}, timeout=15)
++        except RevokedError:
++            print("Computer revoked by server; shutting down.", file=sys.stderr)
++            os._exit(0)
+         except Exception:
+             pass
+-        time.sleep(20)
++        shutdown_event.wait(20)
+ 
+ threading.Thread(target=heartbeat_loop, daemon=True).start()
+ 
+-def emit(run_id, event):
+-    try:
+-        post({"action": "event", "runId": run_id, "event": event})
+-    except Exception:
+-        pass
++class EventBatcher:
++    """Batch claude stream-json events off the stdout thread.
++
++    A synchronous HTTP POST per stream-json line stalls stdout draining on
++    slow networks and can fill the pipe buffer, blocking claude
++    mid-execution. Events are queued (bounded) and flushed by a background
++    thread every ~150ms or up to 50 events per batch. If the queue is
++    severely congested the oldest event is dropped so stdout never stalls.
++    """
++
++    def __init__(self, run_id):
++        self.run_id = run_id
++        self.q = queue.Queue(maxsize=2000)
++        self.closed = threading.Event()
++        self.thread = threading.Thread(target=self._flush_loop, daemon=True)
++        self.thread.start()
++
++    def push(self, event):
++        try:
++            self.q.put_nowait(event)
++        except queue.Full:
++            # Drop oldest if severely congested so claude stdout never stalls
++            try:
++                self.q.get_nowait()
++                self.q.put_nowait(event)
++            except Exception:
++                pass
++
++    def _drain_batch(self):
++        batch = []
++        while len(batch) < 50:
++            try:
++                batch.append(self.q.get_nowait())
++            except queue.Empty:
++                break
++        if not batch:
++            return
++        try:
++            post({"action": "events", "runId": self.run_id, "events": batch}, timeout=15)
++        except RevokedError:
++            os._exit(0)
++        except Exception:
++            # Fallback to single-event endpoint if talking to an older server
++            for ev in batch:
++                try:
++                    post({"action": "event", "runId": self.run_id, "event": ev}, timeout=10)
++                except Exception:
++                    pass
++
++    def _flush_loop(self):
++        while not self.closed.is_set() or not self.q.empty():
++            self._drain_batch()
++            if self.q.empty() and not self.closed.is_set():
++                self.closed.wait(0.15)
++
++    def close(self):
++        self.closed.set()
++        self.thread.join(timeout=10)
+ 
+ def usage_event(message):
+     usage = message.get("usage")
+@@ -259,6 +341,7 @@ def complete(run_id, status, code, text="", error="", meta=None):
+         pass
+ 
+ def run_job(job):
++    global active_proc
+     run_id = job.get("runId")
+     if not isinstance(run_id, str) or not run_id:
+         return
+@@ -313,6 +396,10 @@ def run_job(job):
+     watchdog.daemon = True
+     watchdog.start()
+ 
++    batcher = EventBatcher(run_id)
++    with active_proc_lock:
++        active_proc = proc
++
+     try:
+         for line in proc.stdout:
+             if time.time() - started > 3600:
+@@ -334,7 +421,7 @@ def run_job(job):
+                 if event.get("type") == "assistant.text":
+                     text_parts.append(event.get("text", ""))
+                     saw_text_event = True
+-                emit(run_id, event)
++                batcher.push(event)
+             if raw.get("type") == "result":
+                 cost = raw.get("total_cost_usd")
+                 if not isinstance(cost, (int, float)):
+@@ -349,6 +436,10 @@ def run_job(job):
+                     meta["numTurns"] = int(turns)
+     finally:
+         watchdog.cancel()
++        batcher.close()
++        with active_proc_lock:
++            if active_proc is proc:
++                active_proc = None
+         try:
+             proc.wait(timeout=30)
+         except Exception:
+@@ -372,17 +463,20 @@ def run_job(job):
+             error = "claude exited with code " + str(code) + "."
+         complete(run_id, "error", code, reported, error, meta)
+ 
+-while True:
++while not shutdown_event.is_set():
+     job = None
+     try:
+         reply = post({"action": "claim"}, timeout=30)
+         job = reply.get("job") if isinstance(reply, dict) else None
++    except RevokedError:
++        print("Computer revoked by server; shutting down.", file=sys.stderr)
++        os._exit(0)
+     except Exception:
+         job = None
+     if job:
+         run_job(job)
+-    else:
+-        time.sleep(3)
++    elif not shutdown_event.is_set():
++        shutdown_event.wait(3)
+ PY
+ `;
+ 
+diff --git a/apps/swarmagents/app/api/computers/node/route.test.ts b/apps/swarmagents/app/api/computers/node/route.test.ts
+index 615c1b502..dd1274cfb 100644
+--- a/apps/swarmagents/app/api/computers/node/route.test.ts
++++ b/apps/swarmagents/app/api/computers/node/route.test.ts
+@@ -1,8 +1,32 @@
+ import test, { mock } from "node:test";
+ import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
+ import { NextRequest } from "next/server";
+ import { POST } from "./route";
++import { POST as pairingRoute } from "../route";
++import { POST as redeemRoute } from "../pair/route";
++import { POST as startTaskRoute } from "../../runtime/tasks/route";
+ import { computerAuth } from "../../../../lib/computers/node-token";
++import {
++  configureComputersClock,
++  configureComputersStoreDir,
++} from "../../../../lib/computers/store";
++import {
++  resetRemoteRunManagerForTesting,
++} from "../../../../lib/computers/remote";
++
++function request(url: string, init: { method?: string; body?: string; headers?: HeadersInit } = {}, user: string | null = "byoc-node-test"): NextRequest {
++  const headers = new Headers(init.headers);
++  if (user !== null) headers.set("x-swarm-user", user);
++  if (init.body) headers.set("content-type", "application/json");
++  return new NextRequest(`http://localhost${url}`, {
++    ...(init.method ? { method: init.method } : {}),
++    ...(init.body ? { body: init.body } : {}),
++    headers,
++  });
++}
+ 
+ function post(headers: Record<string, string>): NextRequest {
+   return new NextRequest("http://localhost/api/computers/node", {
+@@ -12,6 +36,71 @@ function post(headers: Record<string, string>): NextRequest {
+   });
+ }
+ 
++function nodeRequest(computerId: string, token: string, body: unknown) {
++  return POST(
++    request(
++      "/api/computers/node",
++      {
++        method: "POST",
++        body: JSON.stringify(body),
++        headers: { authorization: `Bearer ${token}`, "x-computer-id": computerId },
++      },
++      null,
++    ),
++  );
++}
++
++async function pair(): Promise<{ id: string; token: string }> {
++  const created = await pairingRoute(request("/api/computers", { method: "POST", body: "{}" }));
++  assert.equal(created.status, 200);
++  const pairing = (await created.json()) as { code: string };
++  const redeemed = await redeemRoute(
++    request(
++      "/api/computers/pair",
++      {
++        method: "POST",
++        body: JSON.stringify({
++          code: pairing.code,
++          machine: { name: "Test PC", os: "linux", arch: "x86_64", cpuCores: 4, memoryMb: 8192, mode: "host" },
++        }),
++      },
++      null,
++    ),
++  );
++  assert.equal(redeemed.status, 200);
++  const body = (await redeemed.json()) as { computer: { id: string }; nodeToken: string };
++  return { id: body.computer.id, token: body.nodeToken };
++}
++
++/** Best-effort: mark the run finished so no active run lingers in the
++ * shared SWARM_HOME state for later test files. A 409 (already finished)
++ * is fine. Must run BEFORE resetRemoteRunManagerForTesting(). */
++async function finishRun(id: string, token: string, runId: string): Promise<void> {
++  try {
++    await nodeRequest(id, token, { action: "complete", runId, result: { status: "finished", text: "done" } });
++  } catch {
++    // Run already gone — nothing to clean up.
++  }
++}
++
++/** Pair a computer, queue a BYOC run for it, and claim it so the job is running. */
++async function runningJob(): Promise<{ id: string; token: string; runId: string }> {
++  const paired = await pair();
++  const started = await startTaskRoute(
++    request("/api/runtime/tasks", {
++      method: "POST",
++      body: JSON.stringify({ prompt: "Run the suite", computeTarget: `computer:${paired.id}` }),
++    }),
++  );
++  assert.equal(started.status, 202);
++  const { runId } = (await started.json()) as { runId: string };
++  const claim = await nodeRequest(paired.id, paired.token, { action: "claim" });
++  assert.equal(claim.status, 200);
++  const claimed = (await claim.json()) as { job: { runId: string } | null };
++  assert.equal(claimed.job?.runId, runId);
++  return { ...paired, runId };
++}
++
+ test("a non-hex x-computer-token is rejected like a bad bearer and never hits the store", async () => {
+   let storeCalls = 0;
+   mock.method(computerAuth, "authenticate", () => {
+@@ -48,3 +137,154 @@ test("a 64-hex x-computer-token is passed to the store", async () => {
+     mock.restoreAll();
+   }
+ });
++
++test("node events: accepts a valid batch and reports the accepted count", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-node-events-"));
++  configureComputersStoreDir(dir);
++  configureComputersClock(() => 1_000_000);
++  resetRemoteRunManagerForTesting();
++  let id = "";
++  let token = "";
++  let runId = "";
++  try {
++    ({ id, token, runId } = await runningJob());
++    const res = await nodeRequest(id, token, {
++      action: "events",
++      runId,
++      events: [
++        { type: "assistant.text", text: "hello" },
++        { type: "tool.call", name: "bash", input: { cmd: "ls" } },
++      ],
++    });
++    assert.equal(res.status, 200);
++    assert.deepEqual(await res.json(), { ok: true, accepted: 2 });
++  } finally {
++    await finishRun(id, token, runId);
++    resetRemoteRunManagerForTesting();
++    configureComputersStoreDir("");
++    configureComputersClock(undefined);
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("node events: rejects a missing runId and empty or oversized batches", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-node-events-"));
++  configureComputersStoreDir(dir);
++  configureComputersClock(() => 1_000_000);
++  resetRemoteRunManagerForTesting();
++  let id = "";
++  let token = "";
++  let runId = "";
++  try {
++    ({ id, token, runId } = await runningJob());
++    const valid = { type: "assistant.text", text: "hi" };
++
++    const noRunId = await nodeRequest(id, token, { action: "events", events: [valid] });
++    assert.equal(noRunId.status, 400);
++
++    const empty = await nodeRequest(id, token, { action: "events", runId, events: [] });
++    assert.equal(empty.status, 400);
++
++    const notArray = await nodeRequest(id, token, { action: "events", runId, events: { type: "assistant.text" } });
++    assert.equal(notArray.status, 400);
++
++    const oversized = await nodeRequest(id, token, {
++      action: "events",
++      runId,
++      events: Array.from({ length: 101 }, () => valid),
++    });
++    assert.equal(oversized.status, 400);
++
++    const boundary = await nodeRequest(id, token, {
++      action: "events",
++      runId,
++      events: Array.from({ length: 100 }, () => valid),
++    });
++    assert.equal(boundary.status, 200);
++    assert.deepEqual(await boundary.json(), { ok: true, accepted: 100 });
++  } finally {
++    await finishRun(id, token, runId);
++    resetRemoteRunManagerForTesting();
++    configureComputersStoreDir("");
++    configureComputersClock(undefined);
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("node events: stops at the first failing event and reports accepted so far", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-node-events-"));
++  configureComputersStoreDir(dir);
++  configureComputersClock(() => 1_000_000);
++  resetRemoteRunManagerForTesting();
++  let id = "";
++  let token = "";
++  let runId = "";
++  try {
++    ({ id, token, runId } = await runningJob());
++    // "run.finished" is a reserved event type, so safeEvent rejects it and
++    // publishEvent returns false mid-batch.
++    const res = await nodeRequest(id, token, {
++      action: "events",
++      runId,
++      events: [
++        { type: "assistant.text", text: "first" },
++        { type: "run.finished" },
++        { type: "assistant.text", text: "never reached" },
++      ],
++    });
++    assert.equal(res.status, 409);
++    const body = (await res.json()) as { error: string; accepted: number };
++    assert.equal(body.accepted, 1);
++    assert.match(body.error, /invalid event/);
++  } finally {
++    await finishRun(id, token, runId);
++    resetRemoteRunManagerForTesting();
++    configureComputersStoreDir("");
++    configureComputersClock(undefined);
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("node events: rejects a batch for an unknown or finished run", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-node-events-"));
++  configureComputersStoreDir(dir);
++  configureComputersClock(() => 1_000_000);
++  resetRemoteRunManagerForTesting();
++  let id = "";
++  let token = "";
++  let runId = "";
++  try {
++    ({ id, token, runId } = await runningJob());
++    const unknown = await nodeRequest(id, token, {
++      action: "events",
++      runId: "run_does_not_exist",
++      events: [{ type: "assistant.text", text: "hi" }],
++    });
++    assert.equal(unknown.status, 409);
++    assert.deepEqual(await unknown.json(), {
++      error: "Run is not running, not yours, or contains an invalid event.",
++      accepted: 0,
++    });
++
++    // After the run completes, further batches are rejected the same way.
++    const done = await nodeRequest(id, token, {
++      action: "complete",
++      runId,
++      result: { status: "finished", text: "done" },
++    });
++    assert.equal(done.status, 200);
++    const after = await nodeRequest(id, token, {
++      action: "events",
++      runId,
++      events: [{ type: "assistant.text", text: "late" }],
++    });
++    assert.equal(after.status, 409);
++    assert.equal(((await after.json()) as { accepted: number }).accepted, 0);
++  } finally {
++    await finishRun(id, token, runId);
++    resetRemoteRunManagerForTesting();
++    configureComputersStoreDir("");
++    configureComputersClock(undefined);
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/app/api/computers/node/route.ts b/apps/swarmagents/app/api/computers/node/route.ts
+index f6831ce90..39d683db9 100644
+--- a/apps/swarmagents/app/api/computers/node/route.ts
++++ b/apps/swarmagents/app/api/computers/node/route.ts
+@@ -8,6 +8,7 @@
+  * POST { action: "heartbeat", machine? }        -> { ok, computer }
+  * POST { action: "claim" }                     -> { job } | { job: null }
+  * POST { action: "event", runId, event }       -> { ok } (409 when rejected)
++ * POST { action: "events", runId, events }     -> { ok, accepted } (409 when rejected)
+  * POST { action: "complete", runId, result }   -> { ok } (409 when rejected)
+  *
+  * This path is public in the middleware allow-list (the bearer token is the
+@@ -94,6 +95,30 @@ export async function POST(req: NextRequest) {
+     return NextResponse.json({ ok: true }, { headers: NO_STORE });
+   }
+ 
++  if (action === "events") {
++    const runId = typeof body.runId === "string" ? body.runId : "";
++    if (!runId) {
++      return NextResponse.json({ error: "runId is required." }, { status: 400, headers: NO_STORE });
++    }
++    if (!Array.isArray(body.events) || body.events.length === 0 || body.events.length > 100) {
++      return NextResponse.json(
++        { error: "events must be a non-empty array of at most 100 events." },
++        { status: 400, headers: NO_STORE },
++      );
++    }
++    let accepted = 0;
++    for (const event of body.events) {
++      if (!manager.publishEvent(auth.userId, auth.computer.id, runId, event)) {
++        return NextResponse.json(
++          { error: "Run is not running, not yours, or contains an invalid event.", accepted },
++          { status: 409, headers: NO_STORE },
++        );
++      }
++      accepted += 1;
++    }
++    return NextResponse.json({ ok: true, accepted }, { headers: NO_STORE });
++  }
++
+   if (action === "complete") {
+     const runId = typeof body.runId === "string" ? body.runId : "";
+     if (!runId) {
+-- 
+2.55.0
+

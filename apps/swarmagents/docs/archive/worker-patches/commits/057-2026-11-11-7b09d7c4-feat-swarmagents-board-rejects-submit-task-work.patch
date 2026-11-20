@@ -1,0 +1,291 @@
+From 7b09d7c44b91177f82b038a354a14c55dd122606 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:18:19 -0600
+Subject: [PATCH] feat(swarmagents): board rejects submit_task_work for
+ unpushed branches (t97)
+
+submit_task_work now validates gitBranch (non-empty, not main/master, must
+start with feat/|fix/|docs/) and optionally verifies the ref exists on origin
+via git ls-remote, gated by SWARM_GIT_REMOTE_CHECK=0 (disabled in tests).
+Invalid branches return a clear JSON-RPC -32602 error. Adds branch-check.ts
+with an injectable git runner, unit tests for branch-check and the handler,
+and documents the push-before-submit rule in the README worker section.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/README.md                    |  6 +-
+ apps/swarmagents/lib/board/board.test.ts      | 55 ++++++++++++++++++
+ .../lib/board/branch-check.test.ts            | 43 ++++++++++++++
+ apps/swarmagents/lib/board/branch-check.ts    | 57 +++++++++++++++++++
+ apps/swarmagents/lib/board/handlers.ts        |  9 +++
+ apps/swarmagents/lib/board/validation.ts      | 26 ++++++++-
+ 6 files changed, 194 insertions(+), 2 deletions(-)
+ create mode 100644 apps/swarmagents/lib/board/branch-check.test.ts
+ create mode 100644 apps/swarmagents/lib/board/branch-check.ts
+
+diff --git a/apps/swarmagents/README.md b/apps/swarmagents/README.md
+index e77bce374..e6bcda3fc 100644
+--- a/apps/swarmagents/README.md
++++ b/apps/swarmagents/README.md
+@@ -262,7 +262,11 @@ MCP/JSON-RPC client.
+    secrets out of commits).
+ 5. **Submit** — `tools/call` `submit_task_work` with `{taskId, gitBranch,
+    summary, prUrl?}`. Persistence is atomic; a write failure surfaces as a
+-   JSON-RPC `-32603` error, never as a false success.
++   JSON-RPC `-32603` error, never as a false success. The board requires
++   `gitBranch` to be a pushed branch named `feat/<slug>`, `fix/<slug>` or
++   `docs/<slug>` (never `main`/`master`). Workers must `git push -u origin <branch>`
++   **before** submitting; the board verifies the ref exists on `origin` unless
++   `SWARM_GIT_REMOTE_CHECK=0` disables the check.
+ 6. **Review** — the orchestrator calls `review_and_merge_task`
+    (`{taskId, approved, feedback, autoMergeGit?}`) to complete or block the
+    task.
+diff --git a/apps/swarmagents/lib/board/board.test.ts b/apps/swarmagents/lib/board/board.test.ts
+index 1467424b6..9cc3492bb 100644
+--- a/apps/swarmagents/lib/board/board.test.ts
++++ b/apps/swarmagents/lib/board/board.test.ts
+@@ -122,6 +122,61 @@ test("handleSubmitTaskWork requires summary", async () => {
+   assert.equal(result.error.code, -32602);
+ });
+ 
++test("handleSubmitTaskWork rejects a gitBranch that is main", async () => {
++  const store = emptyStore();
++  const result = await handleSubmitTaskWork(store, {
++    taskId: "x",
++    gitBranch: "main",
++    summary: "s",
++  });
++  assert.ok("error" in result);
++  assert.equal(result.error.code, -32602);
++  assert.match(result.error.message, /gitBranch/);
++});
++
++test("handleSubmitTaskWork rejects a gitBranch without an allowed prefix", async () => {
++  const store = emptyStore();
++  const result = await handleSubmitTaskWork(store, {
++    taskId: "x",
++    gitBranch: "feature/foo",
++    summary: "s",
++  });
++  assert.ok("error" in result);
++  assert.equal(result.error.code, -32602);
++  assert.match(result.error.message, /must start with/);
++});
++
++test("handleSubmitTaskWork accepts a valid feat branch when remote check is disabled", async () => {
++  const prev = process.env.SWARM_GIT_REMOTE_CHECK;
++  process.env.SWARM_GIT_REMOTE_CHECK = "0";
++  try {
++    const store = emptyStore();
++    store.tasks.push({
++      id: "t1",
++      title: "T",
++      description: "D",
++      difficulty: "easy",
++      minElo: 1200,
++      constraints: [],
++      status: "claimed",
++      createdAt: 0,
++      updatedAt: 0,
++    });
++    const result = await handleSubmitTaskWork(store, {
++      taskId: "t1",
++      gitBranch: "feat/foo",
++      summary: "s",
++    });
++    assert.ok("result" in result);
++    const parsed = JSON.parse(result.result.content[0].text);
++    assert.equal(parsed.task.status, "in_review");
++    assert.equal(parsed.task.gitBranch, "feat/foo");
++  } finally {
++    if (prev === undefined) delete process.env.SWARM_GIT_REMOTE_CHECK;
++    else process.env.SWARM_GIT_REMOTE_CHECK = prev;
++  }
++});
++
+ test("handleReviewAndMergeTask rejects missing feedback", async () => {
+   const store = emptyStore();
+   const result = await handleReviewAndMergeTask(store, { taskId: "x", approved: true });
+diff --git a/apps/swarmagents/lib/board/branch-check.test.ts b/apps/swarmagents/lib/board/branch-check.test.ts
+new file mode 100644
+index 000000000..3f08d30fa
+--- /dev/null
++++ b/apps/swarmagents/lib/board/branch-check.test.ts
+@@ -0,0 +1,43 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { verifyBranchPushed, type GitRunner } from "./branch-check";
++
++const foundRunner: GitRunner = async (args) => {
++  const branch = args[args.length - 1];
++  return { stdout: `abc123\trefs/heads/${branch}\n` };
++};
++
++const missingRunner: GitRunner = async () => ({ stdout: "" });
++
++test("verifyBranchPushed: passes when check is disabled", async () => {
++  const prev = process.env.SWARM_GIT_REMOTE_CHECK;
++  process.env.SWARM_GIT_REMOTE_CHECK = "0";
++  try {
++    const res = await verifyBranchPushed("feat/x", { runGit: missingRunner });
++    assert.deepEqual(res, { ok: true });
++  } finally {
++    if (prev === undefined) delete process.env.SWARM_GIT_REMOTE_CHECK;
++    else process.env.SWARM_GIT_REMOTE_CHECK = prev;
++  }
++});
++
++test("verifyBranchPushed: accepts a branch found on the remote", async () => {
++  const res = await verifyBranchPushed("feat/x", { runGit: foundRunner, enforce: true });
++  assert.equal(res.ok, true);
++});
++
++test("verifyBranchPushed: rejects a branch missing on the remote", async () => {
++  const res = await verifyBranchPushed("feat/x", { runGit: missingRunner, enforce: true });
++  assert.equal(res.ok, false);
++  assert.match(res.error ?? "", /not found on remote/);
++  assert.match(res.error ?? "", /git push/);
++});
++
++test("verifyBranchPushed: surfaces git command failures", async () => {
++  const failingRunner: GitRunner = async () => {
++    throw new Error("git: not a git repository");
++  };
++  const res = await verifyBranchPushed("feat/x", { runGit: failingRunner, enforce: true });
++  assert.equal(res.ok, false);
++  assert.match(res.error ?? "", /Failed to verify/);
++});
+diff --git a/apps/swarmagents/lib/board/branch-check.ts b/apps/swarmagents/lib/board/branch-check.ts
+new file mode 100644
+index 000000000..8a14e3512
+--- /dev/null
++++ b/apps/swarmagents/lib/board/branch-check.ts
+@@ -0,0 +1,57 @@
++/**
++ * Optional verification that a git branch exists on the origin remote before
++ * the board accepts a `submit_task_work` submission. The check is on by
++ * default and can be disabled with `SWARM_GIT_REMOTE_CHECK=0` (e.g. in unit
++ * tests, or when the host has no git access to the repository).
++ */
++
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
++
++const execFileAsync = promisify(execFile);
++
++export type GitRunner = (args: string[]) => Promise<{ stdout: string }>;
++
++const defaultGitRunner: GitRunner = (args) => execFileAsync("git", args, { encoding: "utf8" });
++
++export interface BranchCheckOptions {
++  remote?: string;
++  timeoutMs?: number;
++  enforce?: boolean;
++  runGit?: GitRunner;
++}
++
++export interface BranchCheckResult {
++  ok: boolean;
++  error?: string;
++}
++
++/**
++ * Return whether `branch` exists on the configured remote. When the check is
++ * disabled (or no runner is provided), it always passes.
++ */
++export async function verifyBranchPushed(
++  branch: string,
++  opts: BranchCheckOptions = {}
++): Promise<BranchCheckResult> {
++  const enforce = opts.enforce ?? process.env.SWARM_GIT_REMOTE_CHECK !== "0";
++  if (!enforce) return { ok: true };
++
++  const remote = opts.remote ?? "origin";
++  const runGit = opts.runGit ?? defaultGitRunner;
++
++  try {
++    const { stdout } = await runGit(["ls-remote", "--heads", remote, branch]);
++    const found = stdout.split("\n").some((line) => line.includes(`refs/heads/${branch}`));
++    if (found) return { ok: true };
++    return {
++      ok: false,
++      error: `Branch "${branch}" was not found on remote "${remote}". Push it first with: git push -u origin ${branch}`,
++    };
++  } catch (err) {
++    return {
++      ok: false,
++      error: `Failed to verify branch "${branch}" on remote "${remote}": ${err instanceof Error ? err.message : String(err)}`,
++    };
++  }
++}
+diff --git a/apps/swarmagents/lib/board/handlers.ts b/apps/swarmagents/lib/board/handlers.ts
+index 5b7b12bb9..f76f4f268 100644
+--- a/apps/swarmagents/lib/board/handlers.ts
++++ b/apps/swarmagents/lib/board/handlers.ts
+@@ -2,6 +2,7 @@ import type { BoardStore } from "./types";
+ import type { SwarmTask, TaskProposal, TaskDifficulty } from "@/lib/mcp-types";
+ import { DIFFICULTY_ELO_MAP } from "@/lib/mcp-types";
+ import { saveStoreAtomic } from "./store";
++import { verifyBranchPushed } from "./branch-check";
+ import {
+   validateCreateTask,
+   validatePollTasks,
+@@ -261,6 +262,14 @@ export async function handleSubmitTaskWork(
+   if (ve.length) {
+     return { error: invalidParams(ve.map((v) => `${v.field}: ${v.message}`).join("; ")) };
+   }
++  // The worker must have pushed the branch to origin before submitting (the
++  // submission only records a branch name). Verify the ref exists remotely
++  // unless the check is disabled via SWARM_GIT_REMOTE_CHECK=0.
++  const branchCheck = await verifyBranchPushed(args.gitBranch as string);
++  if (!branchCheck.ok) {
++    return { error: invalidParams(branchCheck.error ?? "gitBranch could not be verified on origin") };
++  }
++
+   const task = store.tasks.find((t) => t.id === args.taskId);
+   if (!task) return { error: notFound("Task not found") };
+   task.status = "in_review";
+diff --git a/apps/swarmagents/lib/board/validation.ts b/apps/swarmagents/lib/board/validation.ts
+index 601fd07db..0fcde2e1c 100644
+--- a/apps/swarmagents/lib/board/validation.ts
++++ b/apps/swarmagents/lib/board/validation.ts
+@@ -124,11 +124,35 @@ export function validateClaimTask(args: Record<string, unknown>): ValidationErro
+   return errs;
+ }
+ 
++/** Prefixes a worker branch must carry. */
++const ALLOWED_BRANCH_PREFIXES = ["feat/", "fix/", "docs/"] as const;
++
++/**
++ * Validate a gitBranch value for a submission. It must be a non-empty string,
++ * must not be a trunk branch (main/master), and must carry an allowed prefix
++ * (feat/, fix/, docs/). Returns a validation error or null.
++ */
++export function validateGitBranch(branch: unknown): ValidationError | null {
++  const e = requiredString(branch, "gitBranch", 200);
++  if (e) return e;
++  const value = (branch as string).trim();
++  if (value === "main" || value === "master") {
++    return { field: "gitBranch", message: "gitBranch must not be the main or master branch" };
++  }
++  if (!ALLOWED_BRANCH_PREFIXES.some((prefix) => value.startsWith(prefix))) {
++    return {
++      field: "gitBranch",
++      message: `gitBranch must start with one of: ${ALLOWED_BRANCH_PREFIXES.join(", ")}`,
++    };
++  }
++  return null;
++}
++
+ export function validateSubmitTaskWork(args: Record<string, unknown>): ValidationError[] {
+   const errs: ValidationError[] = [];
+   const e1 = requiredString(args.taskId, "taskId");
+   if (e1) errs.push(e1);
+-  const e2 = requiredString(args.gitBranch, "gitBranch", 200);
++  const e2 = validateGitBranch(args.gitBranch);
+   if (e2) errs.push(e2);
+   const e3 = requiredString(args.summary, "summary", 8000);
+   if (e3) errs.push(e3);
+-- 
+2.55.0
+

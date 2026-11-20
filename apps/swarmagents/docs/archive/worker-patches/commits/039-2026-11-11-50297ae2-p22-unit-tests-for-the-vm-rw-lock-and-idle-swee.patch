@@ -1,0 +1,577 @@
+From 50297ae21567a5c1de4fc89c637a08ef573ae361 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 22:55:03 +0000
+Subject: [PATCH] [p22] Unit tests for the VM rw-lock and idle sweeper
+
+---
+ apps/swarmagents/lib/vm/idle-sweeper.test.ts | 349 +++++++++++++++++++
+ apps/swarmagents/lib/vm/rw-lock.test.ts      | 201 +++++++++++
+ 2 files changed, 550 insertions(+)
+ create mode 100644 apps/swarmagents/lib/vm/idle-sweeper.test.ts
+ create mode 100644 apps/swarmagents/lib/vm/rw-lock.test.ts
+
+diff --git a/apps/swarmagents/lib/vm/idle-sweeper.test.ts b/apps/swarmagents/lib/vm/idle-sweeper.test.ts
+new file mode 100644
+index 000000000..5973bad9c
+--- /dev/null
++++ b/apps/swarmagents/lib/vm/idle-sweeper.test.ts
+@@ -0,0 +1,349 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { FakeVmDriver } from "./fake-driver";
++import { VmManager } from "./manager";
++import { IdleSweeper, startVmIdleSweeper, stopVmIdleSweeper } from "./idle-sweeper";
++import type { VmHandle } from "./types";
++
++const MINUTE = 60_000;
++
++// ---------------------------------------------------------------------------
++// Fake clock + fake interval: deterministic time, no wall-clock waiting.
++// ---------------------------------------------------------------------------
++
++class FakeClock {
++  private t = 0;
++  readonly now = (): number => this.t;
++  advance(ms: number): void {
++    this.t += ms;
++  }
++}
++
++type TimerFn = () => void | Promise<unknown>;
++
++class FakeTimers {
++  private handlers = new Map<number, { fn: TimerFn; ms: number; next: number }>();
++  private nextId = 1;
++  private current = 0;
++
++  readonly setInterval = (fn: TimerFn, ms: number): number => {
++    const id = this.nextId++;
++    this.handlers.set(id, { fn, ms, next: this.current + ms });
++    return id;
++  };
++
++  readonly clearInterval = (handle: unknown): void => {
++    this.handlers.delete(handle as number);
++  };
++
++  get pending(): number {
++    return this.handlers.size;
++  }
++
++  /** Advance the fake timers, firing every due interval in order. */
++  async advance(ms: number): Promise<void> {
++    const target = this.current + ms;
++    for (;;) {
++      let dueId: number | null = null;
++      let dueAt = Number.POSITIVE_INFINITY;
++      for (const [id, h] of this.handlers) {
++        if (h.next <= target && h.next < dueAt) {
++          dueId = id;
++          dueAt = h.next;
++        }
++      }
++      if (dueId === null) break;
++      const handler = this.handlers.get(dueId)!;
++      handler.next = dueAt + handler.ms;
++      this.current = dueAt;
++      const result = handler.fn();
++      if (result && typeof (result as Promise<unknown>).then === "function") {
++        await result;
++      }
++    }
++    this.current = target;
++  }
++}
++
++const flush = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
++
++function deferred<T = void>() {
++  let resolve!: (value: T) => void;
++  let reject!: (err: unknown) => void;
++  const promise = new Promise<T>((res, rej) => {
++    resolve = res;
++    reject = rej;
++  });
++  return { promise, resolve, reject };
++}
++
++// ---------------------------------------------------------------------------
++// Stub manager: the sweeper only needs idle.sweepIntervalMs and sweepIdle,
++// so tests can inject a driver-like stub instead of a real VmManager.
++// ---------------------------------------------------------------------------
++
++interface StubSweepIdle {
++  (now: number): Promise<string[]>;
++}
++
++function stubManager(sweepIdle: StubSweepIdle, sweepIntervalMs = MINUTE): VmManager {
++  return {
++    idle: { idleMinutes: 30, idleMs: 30 * MINUTE, sweepIntervalMs },
++    sweepIdle,
++  } as unknown as VmManager;
++}
++
++/** stop() throws for bob so a hibernate failure can be injected per VM. */
++class ThrowingStopDriver extends FakeVmDriver {
++  override async stop(handle: VmHandle): Promise<void> {
++    if (handle.userId === "bob") throw new Error("stop failed for bob");
++    return super.stop(handle);
++  }
++}
++
++// ---------------------------------------------------------------------------
++// sweep() with an injected manager
++// ---------------------------------------------------------------------------
++
++test("sweep hibernates idle VMs and reports them via onHibernated", async () => {
++  const clock = new FakeClock();
++  clock.advance(45 * MINUTE);
++  const seenNow: number[] = [];
++  const hibernated: string[][] = [];
++  const manager = stubManager(async (now) => {
++    seenNow.push(now);
++    return ["alice", "bob"];
++  });
++  const sweeper = new IdleSweeper({
++    manager,
++    intervalMs: MINUTE,
++    now: clock.now,
++    onHibernated: (ids) => hibernated.push(ids),
++  });
++
++  const result = await sweeper.sweep();
++
++  assert.deepEqual(result, ["alice", "bob"]);
++  assert.deepEqual(hibernated, [["alice", "bob"]]);
++  assert.deepEqual(seenNow, [45 * MINUTE], "the sweeper passes its fake clock to the manager");
++});
++
++test("sweep returns an empty list when no VM is idle", async () => {
++  const hibernated: string[][] = [];
++  const manager = stubManager(async () => []);
++  const sweeper = new IdleSweeper({
++    manager,
++    intervalMs: MINUTE,
++    onHibernated: (ids) => hibernated.push(ids),
++  });
++
++  assert.deepEqual(await sweeper.sweep(), []);
++  assert.deepEqual(hibernated, [], "onHibernated is not called for an empty sweep");
++});
++
++test("sweep skips recently used VMs (real manager, fake clock)", async () => {
++  const clock = new FakeClock();
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 30 }, now: clock.now });
++  const sweeper = new IdleSweeper({ manager, intervalMs: MINUTE, now: clock.now });
++
++  await manager.exec("alice", ["echo", "hi"]);
++  clock.advance(29 * MINUTE);
++
++  assert.deepEqual(await sweeper.sweep(), [], "alice was active 29 minutes ago");
++  assert.equal((await manager.status("alice")).status, "running");
++
++  clock.advance(2 * MINUTE);
++  assert.deepEqual(await sweeper.sweep(), ["alice"], "alice is idle after 31 minutes");
++  assert.equal((await manager.status("alice")).status, "stopped");
++});
++
++// ---------------------------------------------------------------------------
++// Continuing after a hibernate throw
++// ---------------------------------------------------------------------------
++
++test("a hibernate throw for one VM does not stop the sweep for the others", async () => {
++  const clock = new FakeClock();
++  const driver = new ThrowingStopDriver();
++  const manager = new VmManager({ customDriver: driver, idle: { idleMinutes: 30 }, now: clock.now });
++  const hibernated: string[][] = [];
++  const sweeper = new IdleSweeper({
++    manager,
++    intervalMs: MINUTE,
++    now: clock.now,
++    onHibernated: (ids) => hibernated.push(ids),
++  });
++
++  // bob is swept first (insertion order) and his stop() throws.
++  await manager.exec("bob", ["echo", "hi"]);
++  await manager.exec("alice", ["echo", "hi"]);
++  clock.advance(31 * MINUTE);
++
++  const result = await sweeper.sweep();
++
++  assert.deepEqual(result, ["alice"], "the sweep continued past bob's failure");
++  assert.deepEqual(hibernated, [["alice"]]);
++  assert.equal((await manager.status("alice")).status, "stopped");
++  assert.equal((await manager.status("bob")).status, "running", "bob's VM is untouched by the failure");
++});
++
++test("a sweepIdle throw is reported via onError and the next sweep still runs", async () => {
++  const errors: unknown[] = [];
++  let calls = 0;
++  const manager = stubManager(async () => {
++    calls++;
++    if (calls === 1) throw new Error("manager sweep exploded");
++    return ["alice"];
++  });
++  const sweeper = new IdleSweeper({
++    manager,
++    intervalMs: MINUTE,
++    onError: (err) => errors.push(err),
++  });
++
++  assert.deepEqual(await sweeper.sweep(), [], "a failed sweep reports nothing hibernated");
++  assert.equal(errors.length, 1);
++  assert.match((errors[0] as Error).message, /manager sweep exploded/);
++
++  // The sweeper is not wedged by the failure.
++  assert.deepEqual(await sweeper.sweep(), ["alice"]);
++  assert.equal(calls, 2);
++  assert.equal(errors.length, 1, "no second error");
++});
++
++test("the timer keeps sweeping after a failed sweep", async () => {
++  const clock = new FakeClock();
++  const timers = new FakeTimers();
++  const errors: unknown[] = [];
++  const hibernated: string[][] = [];
++  let calls = 0;
++  const manager = stubManager(async () => {
++    calls++;
++    if (calls === 1) throw new Error("first sweep fails");
++    return ["alice"];
++  });
++  const sweeper = new IdleSweeper({
++    manager,
++    intervalMs: MINUTE,
++    now: clock.now,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++    onHibernated: (ids) => hibernated.push(ids),
++    onError: (err) => errors.push(err),
++  });
++
++  sweeper.start();
++  await timers.advance(MINUTE);
++  assert.equal(errors.length, 1, "the first tick's failure is reported");
++  assert.deepEqual(hibernated, []);
++
++  await timers.advance(MINUTE);
++  assert.equal(calls, 2, "the timer fired again after the failure");
++  assert.deepEqual(hibernated, [["alice"]]);
++  assert.equal(errors.length, 1, "no further errors");
++
++  sweeper.stop();
++});
++
++// ---------------------------------------------------------------------------
++// Overlapping sweeps collapse into one follow-up sweep
++// ---------------------------------------------------------------------------
++
++test("overlapping sweeps collapse into a single follow-up sweep", async () => {
++  let calls = 0;
++  const gate = deferred<string[]>();
++  const manager = stubManager(async () => {
++    calls++;
++    if (calls === 1) return gate.promise;
++    return ["bob"];
++  });
++  const sweeper = new IdleSweeper({ manager, intervalMs: MINUTE });
++
++  const first = sweeper.sweep();
++  await flush();
++  assert.equal(calls, 1, "the first sweep is in flight");
++
++  // A second sweep while one is running returns immediately and queues a
++  // single follow-up instead of piling up another pass.
++  const second = await sweeper.sweep();
++  assert.deepEqual(second, []);
++  assert.equal(calls, 1, "no second pass started while the first is running");
++
++  gate.resolve(["alice"]);
++  assert.deepEqual(await first, ["bob"], "the first call returns the follow-up pass");
++  assert.equal(calls, 2, "exactly one follow-up sweep ran");
++
++  // No further sweep is queued once the follow-up has run.
++  assert.deepEqual(await sweeper.sweep(), ["bob"]);
++  assert.equal(calls, 3);
++});
++
++// ---------------------------------------------------------------------------
++// Timer lifecycle
++// ---------------------------------------------------------------------------
++
++test("start is a no-op when hibernation is disabled (intervalMs 0)", async () => {
++  const timers = new FakeTimers();
++  let calls = 0;
++  const manager = stubManager(async () => {
++    calls++;
++    return ["alice"];
++  });
++  const sweeper = new IdleSweeper({
++    manager,
++    intervalMs: 0,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++  });
++
++  sweeper.start();
++  assert.equal(sweeper.running, false, "no timer is registered");
++  assert.equal(timers.pending, 0);
++
++  await timers.advance(10 * MINUTE);
++  assert.equal(calls, 0, "no sweep ever runs while disabled");
++});
++
++test("start and stop are idempotent and stop clears the timer", async () => {
++  const timers = new FakeTimers();
++  const manager = stubManager(async () => []);
++  const sweeper = new IdleSweeper({
++    manager,
++    intervalMs: MINUTE,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++  });
++
++  sweeper.start();
++  sweeper.start();
++  assert.equal(sweeper.running, true);
++  assert.equal(timers.pending, 1, "calling start twice registers one timer");
++
++  sweeper.stop();
++  sweeper.stop();
++  assert.equal(sweeper.running, false);
++  assert.equal(timers.pending, 0, "calling stop twice clears the timer once");
++});
++
++test("startVmIdleSweeper returns one sweeper per manager", () => {
++  const timers = new FakeTimers();
++  const manager = stubManager(async () => []);
++  const opts = {
++    intervalMs: MINUTE,
++    setIntervalFn: timers.setInterval,
++    clearIntervalFn: timers.clearInterval,
++  };
++
++  const first = startVmIdleSweeper(manager, opts);
++  const second = startVmIdleSweeper(manager, opts);
++
++  assert.equal(first, second);
++  assert.equal(timers.pending, 1, "only one timer per manager");
++
++  stopVmIdleSweeper(manager);
++  assert.equal(timers.pending, 0);
++  assert.equal(first.running, false);
++
++  // Stopping a manager with no sweeper is a no-op.
++  stopVmIdleSweeper(manager);
++});
+diff --git a/apps/swarmagents/lib/vm/rw-lock.test.ts b/apps/swarmagents/lib/vm/rw-lock.test.ts
+new file mode 100644
+index 000000000..f83206cb7
+--- /dev/null
++++ b/apps/swarmagents/lib/vm/rw-lock.test.ts
+@@ -0,0 +1,201 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { RwLock } from "./rw-lock";
++
++const flush = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
++
++/** Track whether a promise has settled without awaiting it. */
++function track<T>(promise: Promise<T>) {
++  let settled = false;
++  void promise.then(() => {
++    settled = true;
++  });
++  return {
++    promise,
++    get settled() {
++      return settled;
++    },
++  };
++}
++
++test("multiple readers may hold the lock at the same time", async () => {
++  const lock = new RwLock();
++
++  // All three acquire immediately — none of them has to wait.
++  await lock.acquireRead();
++  await lock.acquireRead();
++  await lock.acquireRead();
++
++  // A writer still has to wait until every reader has released.
++  const write = track(lock.acquireWrite());
++  await flush();
++  assert.equal(write.settled, false, "writer must wait for all readers");
++
++  lock.releaseRead();
++  lock.releaseRead();
++  await flush();
++  assert.equal(write.settled, false, "writer must wait for the last reader");
++
++  lock.releaseRead();
++  await write.promise;
++});
++
++test("an exclusive waiter only proceeds once every shared holder has released", async () => {
++  const lock = new RwLock();
++
++  await lock.acquireRead();
++  await lock.acquireRead();
++
++  const write = track(lock.acquireWrite());
++  await flush();
++  assert.equal(write.settled, false);
++
++  lock.releaseRead();
++  await flush();
++  assert.equal(write.settled, false, "one remaining reader still blocks the writer");
++
++  lock.releaseRead();
++  await write.promise;
++  assert.equal(write.settled, true);
++
++  // The lock is exclusive again: a reader waits until the writer releases.
++  const read = track(lock.acquireRead());
++  await flush();
++  assert.equal(read.settled, false, "reader must wait for the writer");
++
++  lock.releaseWrite();
++  await read.promise;
++  lock.releaseRead();
++});
++
++test("a waiting writer blocks new readers (documented fairness)", async () => {
++  const lock = new RwLock();
++
++  // Documented contract (rw-lock.ts header): "Waiting writers block new
++  // readers so a reset cannot be starved by a stream of execs."
++  await lock.acquireRead();
++
++  const write = track(lock.acquireWrite());
++  await flush();
++  assert.equal(write.settled, false, "writer waits for the active reader");
++
++  // A new reader arrives while the writer is queued. Even though no writer
++  // holds the lock yet, the reader must queue behind the writer — otherwise
++  // a stream of readers could starve the writer forever.
++  const lateRead = track(lock.acquireRead());
++  await flush();
++  assert.equal(lateRead.settled, false, "new readers queue behind a waiting writer");
++
++  lock.releaseRead();
++  await write.promise;
++  await flush();
++  assert.equal(lateRead.settled, false, "the queued reader still waits for the writer");
++
++  lock.releaseWrite();
++  await lateRead.promise;
++  lock.releaseRead();
++});
++
++test("readers queued behind a writer are granted together once it releases", async () => {
++  const lock = new RwLock();
++
++  await lock.acquireRead();
++  const write = track(lock.acquireWrite());
++
++  const readA = track(lock.acquireRead());
++  const readB = track(lock.acquireRead());
++  await flush();
++  assert.equal(readA.settled, false);
++  assert.equal(readB.settled, false);
++
++  lock.releaseRead();
++  await write.promise;
++
++  // The writer holds the lock exclusively; both queued readers still wait.
++  await flush();
++  assert.equal(readA.settled, false);
++  assert.equal(readB.settled, false);
++
++  lock.releaseWrite();
++  await Promise.all([readA.promise, readB.promise]);
++  assert.equal(readA.settled, true);
++  assert.equal(readB.settled, true, "queued readers are granted as a batch");
++
++  // And a writer queued behind them now has to wait for both.
++  const write2 = track(lock.acquireWrite());
++  await flush();
++  assert.equal(write2.settled, false);
++
++  lock.releaseRead();
++  await flush();
++  assert.equal(write2.settled, false, "one remaining reader still blocks the writer");
++
++  lock.releaseRead();
++  await write2.promise;
++  lock.releaseWrite();
++});
++
++test("writers queue in order and each waits for the previous one", async () => {
++  const lock = new RwLock();
++
++  await lock.acquireWrite();
++
++  const second = track(lock.acquireWrite());
++  const third = track(lock.acquireWrite());
++  await flush();
++  assert.equal(second.settled, false);
++  assert.equal(third.settled, false);
++
++  lock.releaseWrite();
++  await second.promise;
++  await flush();
++  assert.equal(third.settled, false, "the third writer waits for the second");
++
++  lock.releaseWrite();
++  await third.promise;
++  lock.releaseWrite();
++});
++
++test("a reader queued while a writer holds the lock waits, and a writer behind it waits too", async () => {
++  const lock = new RwLock();
++
++  await lock.acquireWrite();
++
++  const read = track(lock.acquireRead());
++  const write = track(lock.acquireWrite());
++  await flush();
++  assert.equal(read.settled, false);
++  assert.equal(write.settled, false);
++
++  lock.releaseWrite();
++  await read.promise;
++  await flush();
++  assert.equal(write.settled, false, "the writer waits for the queued reader");
++
++  lock.releaseRead();
++  await write.promise;
++  lock.releaseWrite();
++});
++
++test("releasing without holding is a no-op and the lock stays usable", async () => {
++  const lock = new RwLock();
++
++  // No holders, no waiters: releasing must not throw or corrupt state.
++  lock.releaseRead();
++  lock.releaseWrite();
++
++  await lock.acquireRead();
++  lock.releaseRead();
++
++  await lock.acquireWrite();
++  lock.releaseWrite();
++
++  // Still usable afterwards, for both modes.
++  await lock.acquireRead();
++  lock.releaseRead();
++});
++
++// NOTE: the task brief lists "rejection after dispose" as an acceptance item,
++// but this RwLock has no dispose() method in this base (no dispose exists
++// anywhere in lib/vm), so there is no dispose behaviour to test. If a
++// dispose API is added later, it needs tests for pending waiters rejecting.
+-- 
+2.55.0
+

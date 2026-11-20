@@ -1,0 +1,1563 @@
+From 9a24cc871dccb1869714b1e26bdbb968b055caef Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <2.03348624e+08+yaegerbomb42@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:55:48 +0000
+Subject: [PATCH] fix(vm): resolve workspace symlinks in the container and keep
+ the VNC password out of PID 1 (VM-10)
+
+The /workspace confinement was lexical: resolveWorkspacePath() rejected ".."
+but the driver then ran cat/stat/head on the raw path, so a workspace symlink
+to /proc/1/environ (SWARM_VNC_PASSWORD) or /etc/passwd was followed and served
+through the files, report-artifact and lenses routes.
+
+- docker-driver: every file op resolves the path inside the container with
+  realpath -e (readlink -f fallback) and refuses anything outside /workspace
+  with VmPathError("outside_workspace"); reads open the resolved path, writes
+  resolve the parent and refuse a symlink at the destination (test -L).
+- files/artifacts routes answer 403 for a refused path; the lenses route drops
+  a refused artifact from the model context.
+- Desktop VNC password: containers are now created with `docker create`, the
+  password is copied in as a 0600 node-owned file, then `docker start` runs
+  init.sh, which reads and deletes it. The password is no longer passed in the
+  container environment (/proc/1/environ), and the image/docs are updated.
+- FakeVmDriver models symlinks (link()/seedFile()) so route tests can assert
+  refusals; driver and route tests cover escape and in-workspace cases.
+
+Refs b13 (VM-10)
+---
+ apps/swarmagents/app/api/lenses/route.test.ts |  75 ++++-
+ apps/swarmagents/app/api/lenses/route.ts      |   8 +-
+ .../runs/[id]/report/artifacts/route.ts       |  12 +-
+ .../runtime/runs/[id]/report/route.test.ts    |  53 ++++
+ .../app/api/runtime/vm/files/route.test.ts    |  38 +++
+ .../app/api/runtime/vm/files/route.ts         |   7 +
+ apps/swarmagents/lib/vm/desktop.test.ts       |  97 +++++--
+ apps/swarmagents/lib/vm/docker-driver.ts      | 274 ++++++++++++++----
+ apps/swarmagents/lib/vm/fake-driver.ts        |  97 ++++++-
+ apps/swarmagents/lib/vm/files.ts              |  31 +-
+ apps/swarmagents/lib/vm/index.test.ts         | 142 ++++++++-
+ apps/swarmagents/vm-image-desktop/Dockerfile  |  10 +-
+ apps/swarmagents/vm-image-desktop/README.md   |  27 +-
+ .../vm-image-desktop/files/init.sh            |  38 ++-
+ 14 files changed, 766 insertions(+), 143 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/lenses/route.test.ts b/apps/swarmagents/app/api/lenses/route.test.ts
+index 20839039b..46cf2d00c 100644
+--- a/apps/swarmagents/app/api/lenses/route.test.ts
++++ b/apps/swarmagents/app/api/lenses/route.test.ts
+@@ -6,7 +6,11 @@ import { join } from "node:path";
+ import { NextRequest } from "next/server";
+ import { POST } from "./route";
+ import { configureProviderStorePaths } from "../../../lib/providers/store";
+-import { getRunsDir } from "../../../lib/telemetry/paths";
++import { configureRunsDir, getRunsDir } from "../../../lib/telemetry/paths";
++import { assembleReport, writeRunReport } from "../../../lib/runtime/run-report";
++import { VmManager, setVmManagerForTesting } from "../../../lib/vm/manager";
++import { FakeVmDriver } from "../../../lib/vm/fake-driver";
++import type { SequencedEvent } from "../../../lib/telemetry/bus";
+ 
+ const USER = "lens-user@example.com";
+ const apiKey = "sk-test-openai-lens-route";
+@@ -23,6 +27,7 @@ test.beforeEach(() => {
+ 
+ test.afterEach(() => {
+   rmSync(tempDir, { recursive: true, force: true });
++  setVmManagerForTesting(null);
+ });
+ 
+ function openaiOk(text: string) {
+@@ -150,3 +155,71 @@ test("lens calls are rate limited per user, cached answers are not", async () =>
+   assert.equal(cached.status, 200);
+   assert.equal((await cached.json()).cached, true);
+ });
++
++test("a run artifact that is a symlink out of /workspace never reaches the model", async () => {
++  // A fresh user keeps this test out of the rate-limit bucket the previous
++  // test deliberately exhausts.
++  const runUser = "lens-symlink-user@example.com";
++  const runsDir = join(tempDir, "runs");
++  mkdirSync(runsDir, { recursive: true });
++  const prevRunsDir = getRunsDir();
++  configureRunsDir(runsDir);
++
++  const driver = new FakeVmDriver();
++  const vmHandle = { userId: runUser, containerName: "c", createdAt: 0 };
++  await driver.writeFile(vmHandle, "/workspace/notes.txt", "VISIBLE-NOTES");
++  // A container file outside the workspace, reachable only through a symlink.
++  driver.seedFile(runUser, "/proc/1/environ", "SWARM_VNC_PASSWORD=supersecret");
++  driver.link(runUser, "/workspace/leak.txt", "/proc/1/environ");
++  setVmManagerForTesting(new VmManager({ customDriver: driver }));
++
++  try {
++    const runId = "lens_symlink_run";
++    writeFileSync(
++      join(runsDir, `${runId}.jsonl`),
++      `${JSON.stringify({
++        seq: 1,
++        runId,
++        ts: 1,
++        type: "run.created",
++        data: { userId: runUser, prompt: "hi" },
++      })}\n`,
++      "utf-8",
++    );
++    const events = [
++      { type: "run.created", data: { prompt: "hi", userId: runUser }, seq: 1, runId, ts: 1_000 },
++    ] as unknown as SequencedEvent[];
++    writeRunReport(
++      runId,
++      assembleReport({
++        runId,
++        userId: runUser,
++        events,
++        createdAt: 1_000,
++        finishedAt: 2_000,
++        artifacts: [
++          { path: "/workspace/leak.txt", rel: "leak.txt", size: 32, mtimeMs: 2_000, change: "created" },
++          { path: "/workspace/notes.txt", rel: "notes.txt", size: 13, mtimeMs: 2_000, change: "created" },
++        ],
++        shots: [],
++      }),
++      runsDir,
++    );
++
++    const bodies: string[] = [];
++    globalThis.fetch = (async (_input: unknown, init?: { body?: string }) => {
++      bodies.push(String(init?.body ?? ""));
++      return jsonResponse(openaiOk("explained"));
++    }) as unknown as typeof globalThis.fetch;
++
++    const res = await post({ lens: "security", message: "review the run", runId }, runUser);
++    assert.equal(res.status, 200);
++    assert.equal(bodies.length, 1);
++    // The workspace file is context; the symlinked /proc/1/environ is not.
++    assert.ok(bodies[0].includes("VISIBLE-NOTES"), "expected the workspace file in the prompt");
++    assert.equal(bodies[0].includes("supersecret"), false, "the symlink target must never reach the model");
++    assert.equal(bodies[0].includes("SWARM_VNC_PASSWORD"), false);
++  } finally {
++    configureRunsDir(prevRunsDir ?? null);
++  }
++});
+diff --git a/apps/swarmagents/app/api/lenses/route.ts b/apps/swarmagents/app/api/lenses/route.ts
+index 730b19875..e870e89f6 100644
+--- a/apps/swarmagents/app/api/lenses/route.ts
++++ b/apps/swarmagents/app/api/lenses/route.ts
+@@ -25,7 +25,7 @@ import { getRun } from "../../../lib/runtime/run-store";
+ import { readRunReport } from "../../../lib/runtime/run-report";
+ import { RUN_ID_RE } from "../../../lib/telemetry/paths";
+ import { getVmManager } from "../../../lib/vm/manager";
+-import { looksBinary, resolveWorkspacePath } from "../../../lib/vm/files";
++import { looksBinary, resolveWorkspacePath, VmPathError } from "../../../lib/vm/files";
+ 
+ export const runtime = "nodejs";
+ export const dynamic = "force-dynamic";
+@@ -89,7 +89,11 @@ async function filesFromRun(userId: string, runId: string): Promise<ReferencedFi
+       const content = Buffer.from(bytes.content).toString("utf-8");
+       if (!content.trim()) continue;
+       files.push({ path: artifact.rel, content: content.slice(0, MAX_FILE_CHARS) });
+-    } catch {
++    } catch (err) {
++      // An artifact that is a symlink out of /workspace is refused by the
++      // driver: its content (e.g. /proc/1/environ, /etc/passwd) must never
++      // reach a model, so the file is simply left out of the lens context.
++      if (err instanceof VmPathError) continue;
+       /* the file is gone or the VM is asleep — continue without it */
+     }
+   }
+diff --git a/apps/swarmagents/app/api/runtime/runs/[id]/report/artifacts/route.ts b/apps/swarmagents/app/api/runtime/runs/[id]/report/artifacts/route.ts
+index 19aa9fa82..bdf011dac 100644
+--- a/apps/swarmagents/app/api/runtime/runs/[id]/report/artifacts/route.ts
++++ b/apps/swarmagents/app/api/runtime/runs/[id]/report/artifacts/route.ts
+@@ -14,7 +14,7 @@ import { RUN_ID_RE } from "../../../../../../../lib/telemetry/paths";
+ import { getRun } from "../../../../../../../lib/runtime/run-store";
+ import { readRunReport, MAX_ARTIFACT_DOWNLOAD_BYTES } from "../../../../../../../lib/runtime/run-report";
+ import { getVmManager } from "../../../../../../../lib/vm/manager";
+-import { resolveWorkspacePath } from "../../../../../../../lib/vm/files";
++import { resolveWorkspacePath, VmPathError } from "../../../../../../../lib/vm/files";
+ 
+ export const runtime = "nodejs";
+ export const dynamic = "force-dynamic";
+@@ -59,7 +59,15 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string
+   let file;
+   try {
+     file = await vm.readFileBytes(user, absPath, MAX_ARTIFACT_DOWNLOAD_BYTES);
+-  } catch {
++  } catch (err) {
++    // An artifact that is a symlink out of the workspace (-> /etc/passwd,
++    // -> /proc/1/environ) resolves outside /workspace and is refused here.
++    if (err instanceof VmPathError) {
++      return NextResponse.json(
++        { error: "Artifact resolves outside the workspace.", code: err.code },
++        { status: 403 },
++      );
++    }
+     return NextResponse.json({ error: "Could not read file from the VM." }, { status: 404 });
+   }
+ 
+diff --git a/apps/swarmagents/app/api/runtime/runs/[id]/report/route.test.ts b/apps/swarmagents/app/api/runtime/runs/[id]/report/route.test.ts
+index cfee5e500..0341b271f 100644
+--- a/apps/swarmagents/app/api/runtime/runs/[id]/report/route.test.ts
++++ b/apps/swarmagents/app/api/runtime/runs/[id]/report/route.test.ts
+@@ -186,6 +186,59 @@ test("owner downloads artifacts from the VM; others get 404", async () => {
+   }
+ });
+ 
++test("an artifact that is a symlink out of the workspace is refused", async () => {
++  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-report-route-"));
++  configureRunsDir(runsDir);
++  const driver = new FakeVmDriver();
++  const vmHandle = { userId: "alice", containerName: "c", createdAt: 0 };
++  await driver.writeFile(vmHandle, "/workspace/real.txt", "inside the workspace");
++  driver.link("alice", "/workspace/leak.txt", "/proc/1/environ");
++  driver.link("alice", "/workspace/passwd.txt", "/etc/passwd");
++  driver.link("alice", "/workspace/alias.txt", "/workspace/real.txt");
++  setVmManagerForTesting(new VmManager({ customDriver: driver }));
++  try {
++    const artifacts = ["leak.txt", "passwd.txt", "alias.txt"].map((rel) => ({
++      path: `/workspace/${rel}`,
++      rel,
++      size: 16,
++      mtimeMs: 6_000,
++      change: "created" as const,
++    }));
++    const report = assembleReport({
++      runId: "run_1",
++      userId: "alice",
++      events: seedEvents("alice"),
++      createdAt: 1_000,
++      finishedAt: 6_000,
++      artifacts,
++      shots: [],
++    });
++    writeRunReport("run_1", report, runsDir);
++
++    for (const rel of ["leak.txt", "passwd.txt"]) {
++      const res = await GET_ARTIFACT(
++        request(`/api/runtime/runs/run_1/report/artifacts?path=${rel}`),
++        ctx("run_1"),
++      );
++      assert.equal(res.status, 403, `expected ${rel} to be refused`);
++      const body = await res.json();
++      assert.equal(body.code, "outside_workspace");
++      // No byte of the target file is ever returned.
++      assert.equal(JSON.stringify(body).includes("PATH="), false);
++    }
++
++    // A symlink that stays inside the workspace is still downloadable.
++    const ok = await GET_ARTIFACT(
++      request("/api/runtime/runs/run_1/report/artifacts?path=alias.txt"),
++      ctx("run_1"),
++    );
++    assert.equal(ok.status, 200);
++    assert.equal(await ok.text(), "inside the workspace");
++  } finally {
++    fs.rmSync(runsDir, { recursive: true, force: true });
++  }
++});
++
+ test("a report with no recorded owner is not public", async () => {
+   const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-report-route-"));
+   configureRunsDir(runsDir);
+diff --git a/apps/swarmagents/app/api/runtime/vm/files/route.test.ts b/apps/swarmagents/app/api/runtime/vm/files/route.test.ts
+index 457659a59..0d2ca806c 100644
+--- a/apps/swarmagents/app/api/runtime/vm/files/route.test.ts
++++ b/apps/swarmagents/app/api/runtime/vm/files/route.test.ts
+@@ -276,3 +276,41 @@ test("download of an oversized file is refused with 413, never truncated", async
+   assert.equal(body.size, big.length);
+   assert.equal(body.limit, MAX_FILE_DOWNLOAD_BYTES);
+ });
++
++// ---------------------------------------------------------------------------
++// VM-10 — workspace confinement follows symlinks
++// ---------------------------------------------------------------------------
++
++test("a workspace symlink that points outside /workspace is refused", async () => {
++  const vm = install();
++  const driver = vm.driver as FakeVmDriver;
++  driver.link("alice", "/workspace/passwd", "/etc/passwd");
++  driver.link("alice", "/workspace/environ", "/proc/1/environ");
++  driver.link("alice", "/workspace/secret-dir", "/root");
++
++  for (const name of ["passwd", "environ"]) {
++    const read = await GET(request(`/api/runtime/vm/files?path=/workspace/${name}&read=1`));
++    assert.equal(read.status, 403, `expected a read of ${name} to be refused`);
++    assert.equal((await json(read)).code, "outside_workspace");
++
++    const download = await GET(request(`/api/runtime/vm/files?path=/workspace/${name}&download=1`));
++    assert.equal(download.status, 403, `expected a download of ${name} to be refused`);
++    assert.equal((await json(download)).code, "outside_workspace");
++  }
++
++  // Listing through a symlinked directory is refused too.
++  const listing = await GET(request("/api/runtime/vm/files?path=/workspace/secret-dir"));
++  assert.equal(listing.status, 403);
++  assert.equal((await json(listing)).code, "outside_workspace");
++});
++
++test("a symlink that stays inside the workspace still works", async () => {
++  const vm = install();
++  await vm.writeFile("alice", "/workspace/real.txt", "real content");
++  (vm.driver as FakeVmDriver).link("alice", "/workspace/alias.txt", "/workspace/real.txt");
++
++  const res = await GET(request("/api/runtime/vm/files?path=/workspace/alias.txt&read=1"));
++  assert.equal(res.status, 200);
++  const body = await json(res);
++  assert.equal(body.content, "real content");
++});
+diff --git a/apps/swarmagents/app/api/runtime/vm/files/route.ts b/apps/swarmagents/app/api/runtime/vm/files/route.ts
+index 0ea328260..d943cdf3c 100644
+--- a/apps/swarmagents/app/api/runtime/vm/files/route.ts
++++ b/apps/swarmagents/app/api/runtime/vm/files/route.ts
+@@ -141,6 +141,13 @@ export async function GET(req: NextRequest) {
+       entries,
+     });
+   } catch (err) {
++    // The driver resolves the path inside the container; a workspace symlink
++    // that points outside /workspace (e.g. -> /proc/1/environ) is refused
++    // here rather than followed.
++    if (err instanceof VmPathError) {
++      const status = err.code === "outside_workspace" ? 403 : 400;
++      return errorResponse(status, err.message, err.code);
++    }
+     if (err instanceof VmFileError) {
+       switch (err.code) {
+         case "not_found":
+diff --git a/apps/swarmagents/lib/vm/desktop.test.ts b/apps/swarmagents/lib/vm/desktop.test.ts
+index 397401234..8d62b9e80 100644
+--- a/apps/swarmagents/lib/vm/desktop.test.ts
++++ b/apps/swarmagents/lib/vm/desktop.test.ts
+@@ -14,6 +14,7 @@ import type { ChildProcess, SpawnOptions } from "node:child_process";
+ import {
+   DockerVmDriver,
+   buildRunArgs,
++  buildCreateArgs,
+   generateVncPassword,
+   SWARM_VM_DESKTOP_IMAGE,
+   DEFAULT_DESKTOP_IMAGE,
+@@ -22,6 +23,7 @@ import {
+   DESKTOP_SHM_SIZE,
+   DESKTOP_VNC_PASSWORD_ENV,
+   DESKTOP_VNC_PASSWORD_FILE,
++  DESKTOP_VNC_SECRET_FILE,
+ } from "./docker-driver.js";
+ import { DEFAULT_VM_DESKTOP_MEMORY } from "./limits.js";
+ import type { VmHandle } from "./types.js";
+@@ -99,12 +101,12 @@ const baseRunOpts = {
+ // testRunArgs — desktop vs non-desktop
+ // ---------------------------------------------------------------------------
+ 
+-test("buildRunArgs desktop mode sizes shm, forwards env by name, never publishes ports", () => {
++test("buildRunArgs desktop mode sizes shm, forwards DISPLAY only, never publishes ports", () => {
+   const argv = buildRunArgs({
+     ...baseRunOpts,
+     desktop: true,
+     shmSize: DESKTOP_SHM_SIZE,
+-    env: { DISPLAY: DESKTOP_DISPLAY, [DESKTOP_VNC_PASSWORD_ENV]: "s3cr3t-vnc" },
++    env: { DISPLAY: DESKTOP_DISPLAY },
+   });
+ 
+   // shm-size present, value correct.
+@@ -120,7 +122,9 @@ test("buildRunArgs desktop mode sizes shm, forwards env by name, never publishes
+   // Env forwarded by NAME only; values must never appear in argv.
+   assert.ok(argv.includes("-e"));
+   assert.ok(argv.includes("DISPLAY"));
+-  assert.ok(argv.includes(DESKTOP_VNC_PASSWORD_ENV));
++  // The VNC password is never an environment variable: /proc/1/environ is
++  // readable inside the container, so it is copied in as a 0600 file instead.
++  assert.ok(!argv.includes(DESKTOP_VNC_PASSWORD_ENV));
+   const joined = argv.join(" ");
+   assert.ok(!joined.includes("s3cr3t-vnc"), "VNC password must not appear in argv");
+   assert.ok(!argv.some((a) => a === DESKTOP_DISPLAY), "DISPLAY value must not appear in argv");
+@@ -130,6 +134,23 @@ test("buildRunArgs desktop mode sizes shm, forwards env by name, never publishes
+   assert.ok(!argv.includes("/dev/null"));
+ });
+ 
++test("buildCreateArgs creates instead of running, with the same hardening", () => {
++  const create = buildCreateArgs({
++    ...baseRunOpts,
++    desktop: true,
++    shmSize: DESKTOP_SHM_SIZE,
++    env: { DISPLAY: DESKTOP_DISPLAY },
++  });
++  assert.equal(create[0], "create");
++  assert.ok(!create.includes("-d"), "docker create takes no -d");
++  assert.ok(create.includes("--shm-size"));
++  assert.ok(create.includes("--cap-drop"));
++  assert.ok(create.includes("--security-opt"));
++  assert.ok(!create.includes(DESKTOP_VNC_PASSWORD_ENV));
++  assert.ok(!create.includes("-p"));
++  assert.ok(!create.includes("tail"), "desktop image CMD must run, not tail");
++});
++
+ test("buildRunArgs without desktop stays headless (tail CMD, no shm, no env)", () => {
+   const argv = buildRunArgs({
+     ...baseRunOpts,
+@@ -187,7 +208,7 @@ test("generateVncPassword honors an explicit env override (test hook)", () => {
+ // ensure() — desktop create / reuse
+ // ---------------------------------------------------------------------------
+ 
+-test("DockerVmDriver.ensure desktop mode creates with shm, env and no ports", async () => {
++test("DockerVmDriver.ensure desktop mode creates, copies the VNC secret, then starts", async () => {
+   const { spawnFn, calls } = makeFakeSpawn();
+   const driver = new DockerVmDriver({ spawnFn, desktop: true });
+ 
+@@ -201,23 +222,36 @@ test("DockerVmDriver.ensure desktop mode creates with shm, env and no ports", as
+   calls[3].cp.emitClose(0); // image inspect -> found
+   await flush();
+ 
+-  const runCall = calls.find((c) => c.args[0] === "run");
+-  assert.ok(runCall, "expected a docker run argv");
+-  const argv = runCall!.args;
++  const createCall = calls.find((c) => c.args[0] === "create");
++  assert.ok(createCall, "expected a docker create argv");
++  const argv = createCall!.args;
+   assert.ok(argv.includes("--shm-size"));
+   assert.equal(argv[argv.indexOf("--shm-size") + 1], "1g");
+   assert.ok(argv.includes("-e"));
+   assert.ok(argv.includes("DISPLAY"));
+-  assert.ok(argv.includes(DESKTOP_VNC_PASSWORD_ENV));
++  // The password is never an env var: /proc/1/environ would expose it.
++  assert.ok(!argv.includes(DESKTOP_VNC_PASSWORD_ENV));
++  assert.equal(createCall!.opts.env?.[DESKTOP_VNC_PASSWORD_ENV], undefined);
+   assert.ok(!argv.includes("-p"));
+   assert.ok(!argv.includes("tail"), "desktop image CMD must run, not tail");
++  assert.ok(!calls.some((c) => c.args[0] === "run"), "desktop VMs are created, not run");
+ 
+-  // The password value travels in the spawn env only.
+-  const password = runCall!.opts.env?.[DESKTOP_VNC_PASSWORD_ENV] as string | undefined;
+-  assert.ok(password && password.length >= 12, "expected a generated VNC password in spawn env");
+-  assert.ok(!argv.join(" ").includes(password), "password must never appear in argv");
++  createCall!.cp.emitClose(0);
++  await flush();
+ 
+-  runCall!.cp.emitClose(0);
++  // Next: docker cp the 0600 secret into the created (not yet started) container.
++  const cpCall = calls.find((c) => c.args[0] === "cp");
++  assert.ok(cpCall, "expected a docker cp for the VNC secret");
++  assert.ok(cpCall!.args.includes("--chown=1000:1000"), "secret must be node-owned");
++  assert.equal(cpCall!.args[cpCall!.args.length - 1], `swarm-vm-alice:${DESKTOP_VNC_SECRET_FILE}`);
++  cpCall!.cp.emitClose(0);
++  await flush();
++
++  // Finally: start the container, whose init script reads and deletes the file.
++  const startCall = calls.find((c) => c.args[0] === "start");
++  assert.ok(startCall, "expected a docker start after the secret is copied");
++  assert.deepEqual(startCall!.args, ["start", "swarm-vm-alice"]);
++  startCall!.cp.emitClose(0);
+   const h = await p;
+   assert.equal(h.containerName, "swarm-vm-alice");
+ 
+@@ -227,7 +261,10 @@ test("DockerVmDriver.ensure desktop mode creates with shm, env and no ports", as
+   inspect.cp.stdout.emit("data", Buffer.from("running\t172.30.0.5\n"));
+   inspect.cp.emitClose(0);
+   const endpoint = await endpointP;
+-  assert.deepEqual(endpoint, { host: "172.30.0.5", port: DESKTOP_VNC_PORT, password });
++  assert.equal(endpoint?.host, "172.30.0.5");
++  assert.equal(endpoint?.port, DESKTOP_VNC_PORT);
++  assert.ok((endpoint?.password.length ?? 0) >= 12, "expected a generated VNC password");
++  assert.ok(!argv.join(" ").includes(endpoint!.password), "password must never appear in argv");
+ });
+ 
+ test("DockerVmDriver.ensure reattaches an existing desktop container (one container per user)", async () => {
+@@ -244,12 +281,20 @@ test("DockerVmDriver.ensure reattaches an existing desktop container (one contai
+   await flush();
+   calls[3].cp.emitClose(0);
+   await flush();
+-  const run1 = calls.find((c) => c.args[0] === "run");
+-  assert.ok(run1);
+-  run1!.cp.emitClose(0);
++  const create1 = calls.find((c) => c.args[0] === "create");
++  assert.ok(create1);
++  create1!.cp.emitClose(0);
++  await flush();
++  const cp1 = calls.find((c) => c.args[0] === "cp");
++  assert.ok(cp1);
++  cp1!.cp.emitClose(0);
++  await flush();
++  const start1 = calls.find((c) => c.args[0] === "start");
++  assert.ok(start1);
++  start1!.cp.emitClose(0);
+   await p1;
+ 
+-  const runCountBefore = calls.filter((c) => c.args[0] === "run").length;
++  const createCountBefore = calls.filter((c) => c.args[0] === "create").length;
+ 
+   // Second ensure: same image, no recreate — just re-applies limits.
+   const p2 = driver.ensure("alice");
+@@ -270,8 +315,8 @@ test("DockerVmDriver.ensure reattaches an existing desktop container (one contai
+   updateCall!.cp.emitClose(0);
+   await p2;
+ 
+-  const runCountAfter = calls.filter((c) => c.args[0] === "run").length;
+-  assert.equal(runCountAfter, runCountBefore, "re-ensure must not recreate the container");
++  const createCountAfter = calls.filter((c) => c.args[0] === "create").length;
++  assert.equal(createCountAfter, createCountBefore, "re-ensure must not recreate the container");
+ });
+ 
+ test("DockerVmDriver.ensure recreates a headless container when desktop mode is on", async () => {
+@@ -298,10 +343,14 @@ test("DockerVmDriver.ensure recreates a headless container when desktop mode is
+   await flush();
+   calls[6].cp.emitClose(0); // image inspect (create branch)
+   await flush();
+-  const runCall = calls.find((c) => c.args[0] === "run");
+-  assert.ok(runCall, "expected a recreation from the desktop image");
+-  assert.equal(runCall!.args[runCall!.args.indexOf("--name") + 1], "swarm-vm-alice");
+-  runCall!.cp.emitClose(0);
++  const createCall = calls.find((c) => c.args[0] === "create");
++  assert.ok(createCall, "expected a recreation from the desktop image");
++  assert.equal(createCall!.args[createCall!.args.indexOf("--name") + 1], "swarm-vm-alice");
++  createCall!.cp.emitClose(0);
++  await flush();
++  calls.find((c) => c.args[0] === "cp")!.cp.emitClose(0);
++  await flush();
++  calls.find((c) => c.args[0] === "start")!.cp.emitClose(0);
+   await p;
+ });
+ 
+diff --git a/apps/swarmagents/lib/vm/docker-driver.ts b/apps/swarmagents/lib/vm/docker-driver.ts
+index 50786226d..e6ff10304 100644
+--- a/apps/swarmagents/lib/vm/docker-driver.ts
++++ b/apps/swarmagents/lib/vm/docker-driver.ts
+@@ -4,6 +4,9 @@
+ 
+ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
+ import { randomBytes } from "node:crypto";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
+ import type {
+   VmDriver,
+   VmHandle,
+@@ -16,7 +19,7 @@ import type {
+   VmSnapshot,
+   VmDesktopEndpoint,
+ } from "./types";
+-import { VmFileError } from "./files";
++import { VmFileError, VmPathError, isWorkspacePath } from "./files";
+ import {
+   DEFAULT_VM_CPUS,
+   DEFAULT_VM_DESKTOP_MEMORY,
+@@ -52,7 +55,23 @@ export const DESKTOP_VNC_PORT = 6080;
+ /** /dev/shm size for the container (Chromium needs > 64MB). */
+ export const DESKTOP_SHM_SIZE = "1g";
+ /** Env var carrying the generated VNC password into the container. */
++/**
++ * Host-side override for the generated VNC password (and a test hook). Read by
++ * {@link generateVncPassword} on the server only; it is never passed into a
++ * container — see {@link DESKTOP_VNC_SECRET_FILE}.
++ */
+ export const DESKTOP_VNC_PASSWORD_ENV = "SWARM_VNC_PASSWORD";
++/**
++ * Where the driver drops the generated password *before* the container starts:
++ * a 0600 file copied in with `docker cp`, never an environment variable. A
++ * container's environment is visible to every process that can read
++ * /proc/1/environ, so the password must not travel that way; init.sh reads
++ * this file, rewrites the VNC password files and deletes it.
++ */
++export const DESKTOP_VNC_SECRET_FILE = "/home/node/.vnc/.swarm-vnc-incoming";
++/** uid/gid of the image's `node` user (docker cp --chown owner of the secret). */
++export const DESKTOP_VNC_SECRET_UID = 1000;
++export const DESKTOP_VNC_SECRET_GID = 1000;
+ /** Where the container stores the plaintext copy the driver can re-read. */
+ export const DESKTOP_VNC_PASSWORD_FILE = "/home/node/.vnc/.swarm-vnc-password";
+ 
+@@ -235,8 +254,8 @@ export function sanitizeId(raw: string): string {
+ /**
+  * Generate a random VNC password for a desktop container. The driver keeps it
+  * server-side only: it is never sent to the browser in clear and never
+- * logged, and it is passed into the container via the spawn env (by name in
+- * the docker argv, value only in the env), never as an argv token.
++ * logged. It reaches the container as a 0600 file copied in before the
++ * container starts (never as an argv token, never as an environment variable).
+  */
+ export function generateVncPassword(env: Record<string, string | undefined> = process.env): string {
+   const fromEnv = env[DESKTOP_VNC_PASSWORD_ENV];
+@@ -300,7 +319,8 @@ export function buildExecArgs(
+ }
+ 
+ /**
+- * Build the args for `docker run -d` with a hardened security profile:
++ * Build the args for `docker run -d` (or `docker create`) with a hardened
++ * security profile:
+  * a hard memory / CPU / PID ceiling, no new privileges, all capabilities
+  * dropped except a minimal dev-box set, and a bundled init so zombie
+  * processes get reaped.
+@@ -308,7 +328,7 @@ export function buildExecArgs(
+  * The limits are validated first: a malformed value must never reach the
+  * docker CLI (where it would either be ignored or fail the whole run).
+  */
+-export function buildRunArgs(opts: {
++export interface BuildContainerArgsOptions {
+   containerName: string;
+   volume: string;
+   image: string;
+@@ -328,7 +348,14 @@ export function buildRunArgs(opts: {
+   desktop?: boolean;
+   shmSize?: string;
+   env?: Record<string, string>;
+-}): string[] {
++}
++
++/**
++ * Shared argv builder for `docker run -d` and `docker create`. `create` is
++ * used for desktop VMs so the VNC password can be copied in as a 0600 file
++ * before the container's init script runs (see DESKTOP_VNC_SECRET_FILE).
++ */
++function buildContainerArgs(mode: "run" | "create", opts: BuildContainerArgsOptions): string[] {
+   const memory = validateMemoryLimit(opts.memory, "memory");
+   const cpus = validateCpuLimit(opts.cpus, "cpus");
+   const pids = validatePidsLimit(opts.pidsLimit, "pids");
+@@ -341,8 +368,8 @@ export function buildRunArgs(opts: {
+       ? validateVmNetwork(opts.network, "network")
+       : undefined;
+   const args = [
+-    "run",
+-    "-d",
++    mode,
++    ...(mode === "run" ? ["-d"] : []),
+     "--name", opts.containerName,
+     "--memory", memory,
+     "--cpus", cpus,
+@@ -376,6 +403,16 @@ export function buildRunArgs(opts: {
+   return args;
+ }
+ 
++/** Build the args for `docker run -d` (headless and desktop containers). */
++export function buildRunArgs(opts: BuildContainerArgsOptions): string[] {
++  return buildContainerArgs("run", opts);
++}
++
++/** Build the args for `docker create` (desktop containers, secret copied in first). */
++export function buildCreateArgs(opts: BuildContainerArgsOptions): string[] {
++  return buildContainerArgs("create", opts);
++}
++
+ /**
+  * Build the args for `docker update`, used to (re-)apply the resource
+  * limits to a container that already exists — a VM created before the
+@@ -678,6 +715,55 @@ export class DockerVmDriver implements VmDriver {
+     return { host: ip, port: DESKTOP_VNC_PORT, password };
+   }
+ 
++  /**
++   * Start a desktop container with the VNC password handed over as a 0600
++   * file: `docker create` (not `run`) so the container exists but its init
++   * script has not run yet, `docker cp` the secret in, then `docker start`.
++   * The password never enters the container's environment, so it cannot be
++   * read back from /proc/1/environ.
++   */
++  private async createDesktopContainer(
++    name: string,
++    opts: BuildContainerArgsOptions,
++    password: string,
++  ): Promise<{ code: number; stderr: string }> {
++    const created = await this.run(
++      buildCreateArgs(opts),
++      opts.env ? { env: opts.env as NodeJS.ProcessEnv } : undefined,
++    );
++    if (created.code !== 0) return { code: created.code, stderr: created.stderr };
++    await this.copyDesktopSecret(name, password);
++    return this.run(["start", name]);
++  }
++
++  /**
++   * Copy the VNC password into a created container as a 0600, node-owned file.
++   * `docker cp --chown` needs API 1.42+; on an older CLI the plain copy leaves
++   * a root-owned file the unprivileged init script cannot read, so init.sh
++   * falls back to generating its own password (which desktopEndpoint() reads
++   * back from the container). Either way the password is never in the env.
++   */
++  private async copyDesktopSecret(name: string, password: string): Promise<void> {
++    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-vnc-"));
++    const file = path.join(dir, "secret");
++    try {
++      // 0600 inside a 0700 temp dir: unreadable by other host users.
++      fs.writeFileSync(file, `${password}\n`, { mode: 0o600 });
++      const owner = `${DESKTOP_VNC_SECRET_UID}:${DESKTOP_VNC_SECRET_GID}`;
++      const copied = await this.run([
++        "cp",
++        `--chown=${owner}`,
++        file,
++        `${name}:${DESKTOP_VNC_SECRET_FILE}`,
++      ]);
++      if (copied.code !== 0) {
++        await this.run(["cp", file, `${name}:${DESKTOP_VNC_SECRET_FILE}`]);
++      }
++    } finally {
++      fs.rmSync(dir, { recursive: true, force: true });
++    }
++  }
++
+   async ensure(userId: string): Promise<VmHandle> {
+     const sanitized = sanitizeId(userId);
+     const name = containerNameFor(userId);
+@@ -752,33 +838,36 @@ export class DockerVmDriver implements VmDriver {
+       }
+ 
+       // Create container. In desktop mode a fresh VNC password is generated
+-      // and forwarded by name (value in the spawn env, never in argv); the
+-      // image's init script writes it into the VNC password files at boot.
++      // and handed over as a 0600 file (never an environment variable, which
++      // every process able to read /proc/1/environ could pick up); the image's
++      // init script writes it into the VNC password files at boot and deletes
++      // the handoff file.
+       let runEnv: Record<string, string> | undefined;
++      let vncPassword: string | undefined;
+       if (this.desktop) {
+-        const password = generateVncPassword();
+-        this.desktopPasswords.set(sanitized, password);
+-        runEnv = {
+-          DISPLAY: DESKTOP_DISPLAY,
+-          [DESKTOP_VNC_PASSWORD_ENV]: password,
+-        };
++        vncPassword = generateVncPassword();
++        this.desktopPasswords.set(sanitized, vncPassword);
++        runEnv = { DISPLAY: DESKTOP_DISPLAY };
+       }
+-      const start = await this.run(
+-        buildRunArgs({
+-          containerName: name,
+-          volume: vol,
+-          image: this.image,
+-          memory: this.memory,
+-          cpus: this.cpus,
+-          pidsLimit: this.pidsLimit,
+-          runtime: this.runtime,
+-          network: this.network,
+-          desktop: this.desktop,
+-          shmSize: this.desktop ? DESKTOP_SHM_SIZE : undefined,
+-          env: runEnv,
+-        }),
+-        runEnv ? { env: runEnv as NodeJS.ProcessEnv } : undefined,
+-      );
++      const containerOpts: BuildContainerArgsOptions = {
++        containerName: name,
++        volume: vol,
++        image: this.image,
++        memory: this.memory,
++        cpus: this.cpus,
++        pidsLimit: this.pidsLimit,
++        runtime: this.runtime,
++        network: this.network,
++        desktop: this.desktop,
++        shmSize: this.desktop ? DESKTOP_SHM_SIZE : undefined,
++        env: runEnv,
++      };
++      const start = vncPassword
++        ? await this.createDesktopContainer(name, containerOpts, vncPassword)
++        : await this.run(
++            buildRunArgs(containerOpts),
++            runEnv ? { env: runEnv as NodeJS.ProcessEnv } : undefined,
++          );
+       if (start.code !== 0) {
+         // A requested runtime the daemon does not know is a configuration
+         // error with a clear message — not a silent fallback.
+@@ -928,9 +1017,21 @@ export class DockerVmDriver implements VmDriver {
+       throw new Error(`writeFile failed to create directory ${dir}`);
+     }
+ 
++    // Resolve the parent inside the container and require it to stay under
++    // /workspace: a workspace symlink pointing at /etc would otherwise let a
++    // write escape the volume.
++    const realDir = await this.confineToWorkspace(handle, dir);
++    const target = realDir === "/" ? `/${path.slice(idx + 1)}` : `${realDir}/${path.slice(idx + 1)}`;
++    // Never write through a symlink that already exists at the destination
++    // (O_NOFOLLOW semantics for the final component).
++    const link = await this.run(["exec", handle.containerName, "test", "-L", target]);
++    if (link.code === 0) {
++      throw new VmPathError("outside_workspace", `Refusing to write through a symbolic link: ${path}`);
++    }
++
+     // Pipe content through stdin (never argv) to `sh -c 'cat > "$1"' sh <path>`.
+     let stderr = "";
+-    const res = await this.exec(handle, ["sh", "-c", "cat > \"$1\"", "sh", path], {
++    const res = await this.exec(handle, ["sh", "-c", "cat > \"$1\"", "sh", target], {
+       stdin: content,
+       onStderr: (c) => { stderr += c; },
+     });
+@@ -940,8 +1041,9 @@ export class DockerVmDriver implements VmDriver {
+   }
+ 
+   async readFile(handle: VmHandle, path: string): Promise<string> {
++    const target = await this.confineToWorkspace(handle, path);
+     // `cat --` so paths starting with `-` are not parsed as flags.
+-    const res = await this.run(["exec", handle.containerName, "cat", "--", path]);
++    const res = await this.run(["exec", handle.containerName, "cat", "--", target]);
+     if (res.code !== 0) {
+       throw new Error(`readFile failed: ${res.stderr}`);
+     }
+@@ -950,8 +1052,14 @@ export class DockerVmDriver implements VmDriver {
+ 
+   /** Metadata for one path, via coreutils stat. */
+   async stat(handle: VmHandle, path: string): Promise<VmFileStat> {
++    const target = await this.confineToWorkspace(handle, path);
++    return this.statResolved(handle, path, target);
++  }
++
++  /** stat for a path that has already been resolved and confined. */
++  private async statResolved(handle: VmHandle, path: string, target: string): Promise<VmFileStat> {
+     // -c does not interpret escapes, so the separator is a real tab.
+-    const res = await this.run(["exec", handle.containerName, "stat", "-c", "%F\t%s\t%Y", "--", path]);
++    const res = await this.run(["exec", handle.containerName, "stat", "-c", "%F\t%s\t%Y", "--", target]);
+     if (res.code !== 0) {
+       throw new VmFileError("not_found", `No such file or directory: ${path}`);
+     }
+@@ -967,11 +1075,12 @@ export class DockerVmDriver implements VmDriver {
+ 
+   /** One level of a directory, via GNU find's -printf (NUL separated). */
+   async listDir(handle: VmHandle, path: string): Promise<VmDirEntry[]> {
++    const target = await this.confineToWorkspace(handle, path);
+     // The format string is interpreted by find, so "\0" is a NUL separator and
+     // names containing spaces or newlines survive the round trip.
+     const res = await this.run([
+       "exec", handle.containerName,
+-      "find", path, "-mindepth", "1", "-maxdepth", "1", "-printf", "%y\\0%s\\0%T@\\0%f\\0",
++      "find", target, "-mindepth", "1", "-maxdepth", "1", "-printf", "%y\\0%s\\0%T@\\0%f\\0",
+     ]);
+     if (res.code !== 0) {
+       if (res.code === 127) {
+@@ -1000,13 +1109,14 @@ export class DockerVmDriver implements VmDriver {
+ 
+   /** Raw bytes of a file, never more than maxBytes. */
+   async readFileBytes(handle: VmHandle, path: string, maxBytes: number): Promise<VmFileBytes> {
+-    const stat = await this.stat(handle, path);
++    const target = await this.confineToWorkspace(handle, path);
++    const stat = await this.statResolved(handle, path, target);
+     if (stat.type === "directory") {
+       throw new VmFileError("not_a_file", `Not a file: ${path}`);
+     }
+     // head -c caps the read even if the file grows between stat and read.
+     const res = await this.runRaw([
+-      "exec", handle.containerName, "head", "-c", String(Math.max(0, maxBytes)), "--", path,
++      "exec", handle.containerName, "head", "-c", String(Math.max(0, maxBytes)), "--", target,
+     ]);
+     if (res.code !== 0) {
+       if (res.code === 127) {
+@@ -1021,6 +1131,48 @@ export class DockerVmDriver implements VmDriver {
+     };
+   }
+ 
++  /**
++   * Resolve a path *inside the container* and require the result to stay under
++   * /workspace.
++   *
++   * The API-level check (lib/vm/files resolveWorkspacePath) is lexical: it
++   * rejects ".." but knows nothing about symlinks, so a workspace symlink to
++   * /proc/1/environ or /etc/passwd used to be followed by cat/stat/head. This
++   * resolves every component with `realpath -e` (falling back to
++   * `readlink -f` on images without it) and refuses anything that lands
++   * outside the volume. Reads then open the *resolved* path, so no component
++   * of the path they open is a symlink.
++   *
++   * @throws VmPathError("outside_workspace") when the target leaves /workspace.
++   * @throws VmFileError("not_found") when the path cannot be resolved at all.
++   */
++  private async confineToWorkspace(handle: VmHandle, path: string): Promise<string> {
++    if (!path.startsWith("/")) {
++      throw new VmPathError("invalid_path", `Expected an absolute path, got ${JSON.stringify(path)}`);
++    }
++    let resolved = "";
++    const real = await this.run(["exec", handle.containerName, "realpath", "-e", "--", path]);
++    if (real.code === 0 && real.stdout.trim()) {
++      resolved = real.stdout.trim();
++    } else {
++      // Older coreutils / busybox may lack `realpath`; readlink -f resolves
++      // the same way (and still succeeds for a missing final component, which
++      // lets stat/head report the proper not-found error).
++      const link = await this.run(["exec", handle.containerName, "readlink", "-f", "--", path]);
++      if (link.code !== 0 || !link.stdout.trim()) {
++        throw new VmFileError("not_found", `No such file or directory: ${path}`);
++      }
++      resolved = link.stdout.trim();
++    }
++    if (!isWorkspacePath(resolved)) {
++      throw new VmPathError(
++        "outside_workspace",
++        `Path resolves outside /workspace and is not readable: ${path}`,
++      );
++    }
++    return resolved;
++  }
++
+   async status(handle: VmHandle): Promise<VmState> {
+     const res = await this.run(["container", "inspect", "-f", "{{.State.Status}}", handle.containerName]);
+     const s = res.stdout.trim();
+@@ -1104,30 +1256,32 @@ export class DockerVmDriver implements VmDriver {
+     // while the volume survives.
+     await this.run(["rm", "-f", handle.containerName]);
+     let runEnv: Record<string, string> | undefined;
++    let vncPassword: string | undefined;
+     if (this.desktop) {
+-      const password = generateVncPassword();
+-      this.desktopPasswords.set(sanitizeId(handle.userId), password);
+-      runEnv = {
+-        DISPLAY: DESKTOP_DISPLAY,
+-        [DESKTOP_VNC_PASSWORD_ENV]: password,
+-      };
++      vncPassword = generateVncPassword();
++      this.desktopPasswords.set(sanitizeId(handle.userId), vncPassword);
++      runEnv = { DISPLAY: DESKTOP_DISPLAY };
+     }
+-    const start = await this.run(
+-      buildRunArgs({
+-        containerName: handle.containerName,
+-        volume: volumeNameFor(handle.userId),
+-        image,
+-        memory: this.memory,
+-        cpus: this.cpus,
+-        pidsLimit: this.pidsLimit,
+-        runtime: this.runtime,
+-        network: this.network,
+-        desktop: this.desktop,
+-        shmSize: this.desktop ? DESKTOP_SHM_SIZE : undefined,
+-        env: runEnv,
+-      }),
+-      runEnv ? { env: runEnv as NodeJS.ProcessEnv } : undefined,
+-    );
++    const containerOpts: BuildContainerArgsOptions = {
++      containerName: handle.containerName,
++      volume: volumeNameFor(handle.userId),
++      image,
++      memory: this.memory,
++      cpus: this.cpus,
++      pidsLimit: this.pidsLimit,
++      runtime: this.runtime,
++      network: this.network,
++      desktop: this.desktop,
++      shmSize: this.desktop ? DESKTOP_SHM_SIZE : undefined,
++      env: runEnv,
++    };
++    // Desktop containers get the password as a 0600 file, never in the env.
++    const start = vncPassword
++      ? await this.createDesktopContainer(handle.containerName, containerOpts, vncPassword)
++      : await this.run(
++          buildRunArgs(containerOpts),
++          runEnv ? { env: runEnv as NodeJS.ProcessEnv } : undefined,
++        );
+     if (start.code !== 0) {
+       throw new Error(`restore failed: ${start.stderr.trim() || `exit code ${start.code}`}`);
+     }
+diff --git a/apps/swarmagents/lib/vm/fake-driver.ts b/apps/swarmagents/lib/vm/fake-driver.ts
+index 9b0d23c8d..0b738ea9c 100644
+--- a/apps/swarmagents/lib/vm/fake-driver.ts
++++ b/apps/swarmagents/lib/vm/fake-driver.ts
+@@ -18,12 +18,14 @@ import type {
+   VmSnapshot,
+ } from "./types";
+ import { VmFileError, WORKSPACE_ROOT } from "./files";
++import { VmPathError, isWorkspacePath } from "./files";
+ import { validateSnapshotLabel } from "./docker-driver";
+ 
+ interface FakeSnapshot {
+   info: VmSnapshot;
+   files: Map<string, string>;
+   mtimes: Map<string, number>;
++  links: Map<string, string>;
+   running: boolean;
+ }
+ 
+@@ -31,6 +33,8 @@ interface FakeVm {
+   handle: VmHandle;
+   files: Map<string, string>;
+   mtimes: Map<string, number>;
++  /** path -> target, mirroring symlinks that exist inside the container. */
++  links: Map<string, string>;
+   running: boolean;
+   snapshots: Map<string, FakeSnapshot>;
+ }
+@@ -84,6 +88,7 @@ export class FakeVmDriver implements VmDriver {
+         handle: { userId, containerName: `fake-${userId}`, createdAt: Date.now() },
+         files: new Map(),
+         mtimes: new Map(),
++        links: new Map(),
+         running: true,
+         snapshots: new Map(),
+       };
+@@ -184,14 +189,15 @@ export class FakeVmDriver implements VmDriver {
+ 
+   async writeFile(handle: VmHandle, path: string, content: string): Promise<void> {
+     const vm = this.getOrCreateVm(handle.userId);
+-    vm.files.set(path, content);
+-    vm.mtimes.set(path, Date.now());
++    const target = this.resolveInsideWorkspace(vm, path, { writing: true });
++    vm.files.set(target, content);
++    vm.mtimes.set(target, Date.now());
+   }
+ 
+   async readFile(handle: VmHandle, path: string): Promise<string> {
+     const vm = this.vms.get(handle.userId);
+     if (!vm) throw new Error(`VM missing for user ${handle.userId}`);
+-    const content = vm.files.get(path);
++    const content = vm.files.get(this.resolveInsideWorkspace(vm, path));
+     if (content === undefined) {
+       throw new Error(`File not found: ${path}`);
+     }
+@@ -202,16 +208,17 @@ export class FakeVmDriver implements VmDriver {
+   async stat(handle: VmHandle, path: string): Promise<VmFileStat> {
+     const vm = this.vms.get(handle.userId);
+     if (!vm) throw new VmFileError("not_found", `VM missing for user ${handle.userId}`);
+-    const content = vm.files.get(path);
++    const target = this.resolveInsideWorkspace(vm, path);
++    const content = vm.files.get(target);
+     if (content !== undefined) {
+       return {
+         path,
+         type: "file",
+         size: Buffer.byteLength(content, "utf8"),
+-        modifiedAt: vm.mtimes.get(path),
++        modifiedAt: vm.mtimes.get(target),
+       };
+     }
+-    if (path === WORKSPACE_ROOT || this.childEntries(vm, path).length > 0) {
++    if (target === WORKSPACE_ROOT || this.childEntries(vm, target).length > 0) {
+       return { path, type: "directory", size: 0 };
+     }
+     throw new VmFileError("not_found", `No such file or directory: ${path}`);
+@@ -221,11 +228,15 @@ export class FakeVmDriver implements VmDriver {
+   async listDir(handle: VmHandle, path: string): Promise<VmDirEntry[]> {
+     const vm = this.vms.get(handle.userId);
+     if (!vm) throw new VmFileError("not_found", `VM missing for user ${handle.userId}`);
+-    if (vm.files.get(path) !== undefined) {
++    const target = this.resolveInsideWorkspace(vm, path);
++    if (vm.files.get(target) !== undefined) {
+       throw new VmFileError("not_a_directory", `Not a directory: ${path}`);
+     }
+-    const entries = this.childEntries(vm, path);
+-    if (path !== WORKSPACE_ROOT && entries.length === 0 && !this.hasDescendant(vm, path)) {
++    const entries = this.childEntries(vm, target).map((entry) => ({
++      ...entry,
++      path: `${path === "/" ? "" : path}${entry.path.slice(target.length)}`,
++    }));
++    if (target !== WORKSPACE_ROOT && entries.length === 0 && !this.hasDescendant(vm, target)) {
+       throw new VmFileError("not_found", `No such file or directory: ${path}`);
+     }
+     return entries;
+@@ -235,7 +246,7 @@ export class FakeVmDriver implements VmDriver {
+   async readFileBytes(handle: VmHandle, path: string, maxBytes: number): Promise<VmFileBytes> {
+     const vm = this.vms.get(handle.userId);
+     if (!vm) throw new VmFileError("not_found", `VM missing for user ${handle.userId}`);
+-    const content = vm.files.get(path);
++    const content = vm.files.get(this.resolveInsideWorkspace(vm, path));
+     if (content === undefined) {
+       throw new VmFileError("not_found", `No such file or directory: ${path}`);
+     }
+@@ -273,6 +284,15 @@ export class FakeVmDriver implements VmDriver {
+         dirs.set(name, { name, path: `${prefix}${name}`, type: "directory", size: 0 });
+       }
+     }
++    // Symlinks show up as entries too (a link to a directory is listed as a
++    // file here; the fake does not model directory listings through links).
++    for (const linkPath of vm.links.keys()) {
++      if (!linkPath.startsWith(prefix)) continue;
++      const relative = linkPath.slice(prefix.length);
++      if (!relative || relative.includes("/")) continue;
++      if (files.some((entry) => entry.name === relative)) continue;
++      files.push({ name: relative, path: linkPath, type: "file", size: 0 });
++    }
+     return [...dirs.values(), ...files].sort((a, b) =>
+       a.type === b.type ? a.name.localeCompare(b.name) : a.type === "directory" ? -1 : 1,
+     );
+@@ -284,9 +304,42 @@ export class FakeVmDriver implements VmDriver {
+     for (const filePath of vm.files.keys()) {
+       if (filePath.startsWith(prefix)) return true;
+     }
++    for (const linkPath of vm.links.keys()) {
++      if (linkPath.startsWith(prefix)) return true;
++    }
+     return false;
+   }
+ 
++  /**
++   * Resolve `path` through the fake symlink table, mirroring the docker
++   * driver's realpath confinement: the resolved path must stay under
++   * /workspace, otherwise VmPathError("outside_workspace") is raised.
++   *
++   * `writing` also refuses a destination that is itself a symlink, matching
++   * the driver's O_NOFOLLOW-style refusal to write through a link.
++   */
++  private resolveInsideWorkspace(vm: FakeVm, path: string, opts: { writing?: boolean } = {}): string {
++    if (opts.writing && vm.links.has(path)) {
++      throw new VmPathError("outside_workspace", `Refusing to write through a symbolic link: ${path}`);
++    }
++    let current = path;
++    for (let hop = 0; hop < 8; hop++) {
++      const match = [...vm.links.entries()]
++        .filter(([link]) => current === link || current.startsWith(`${link}/`))
++        .sort((a, b) => b[0].length - a[0].length)[0];
++      if (!match) break;
++      const [link, target] = match;
++      current = `${target}${current.slice(link.length)}`;
++    }
++    if (!isWorkspacePath(current)) {
++      throw new VmPathError(
++        "outside_workspace",
++        `Path resolves outside /workspace and is not readable: ${path}`,
++      );
++    }
++    return current;
++  }
++
+   async status(handle: VmHandle): Promise<VmState> {
+     const vm = this.vms.get(handle.userId);
+     if (!vm) return { status: "missing" };
+@@ -302,6 +355,7 @@ export class FakeVmDriver implements VmDriver {
+     const vm = this.vms.get(handle.userId);
+     if (vm) {
+       vm.files.clear();
++      vm.links.clear();
+       vm.running = false;
+     }
+   }
+@@ -314,6 +368,7 @@ export class FakeVmDriver implements VmDriver {
+       info,
+       files: new Map(vm.files),
+       mtimes: new Map(vm.mtimes),
++      links: new Map(vm.links),
+       running: vm.running,
+     });
+     return info;
+@@ -336,6 +391,7 @@ export class FakeVmDriver implements VmDriver {
+     }
+     vm.files = new Map(snapshot.files);
+     vm.mtimes = new Map(snapshot.mtimes);
++    vm.links = new Map(snapshot.links);
+     vm.running = snapshot.running;
+   }
+ 
+@@ -348,4 +404,25 @@ export class FakeVmDriver implements VmDriver {
+   peekFile(userId: string, path: string): string | undefined {
+     return this.vms.get(userId)?.files.get(path);
+   }
++
++  /**
++   * Test helper: create a symlink inside the fake VM, so tests can model the
++   * classic escape (/workspace/link -> /etc/passwd or /proc/1/environ).
++   */
++  link(userId: string, linkPath: string, target: string): void {
++    const vm = this.getOrCreateVm(userId);
++    vm.links.set(linkPath, target);
++  }
++
++  /**
++   * Test helper: place a file at an arbitrary path, bypassing the workspace
++   * confinement. Models a host/container file that exists outside /workspace
++   * (e.g. /proc/1/environ) so a test can prove its content is never served
++   * through a symlink.
++   */
++  seedFile(userId: string, path: string, content: string): void {
++    const vm = this.getOrCreateVm(userId);
++    vm.files.set(path, content);
++    vm.mtimes.set(path, Date.now());
++  }
+ }
+diff --git a/apps/swarmagents/lib/vm/files.ts b/apps/swarmagents/lib/vm/files.ts
+index 2656ceb68..4528e9855 100644
+--- a/apps/swarmagents/lib/vm/files.ts
++++ b/apps/swarmagents/lib/vm/files.ts
+@@ -17,6 +17,25 @@ export const MAX_UPLOAD_FILES = 10;
+ /** Hard cap on one file's size (10 MB). */
+ export const MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024;
+ 
++/**
++ * Hard cap on a whole upload request body: the per-file caps plus 1 MiB of
++ * multipart framing. Enforced as a streaming cap (see lib/body-limit), so a
++ * chunked body with no Content-Length is still bounded.
++ */
++export const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_FILES * MAX_UPLOAD_FILE_BYTES + 1024 * 1024;
++
++/**
++ * The effective upload body cap. SWARM_UPLOAD_MAX_BODY_BYTES may only *lower*
++ * it (an operator knob for smaller deployments); values at or above the
++ * built-in cap, and non-numeric values, are ignored. Tests use it to exercise
++ * the streaming abort without pushing 101 MiB through a parser.
++ */
++export function uploadRequestBodyCap(env: Record<string, string | undefined> = process.env): number {
++  const raw = Number(env.SWARM_UPLOAD_MAX_BODY_BYTES ?? "");
++  if (Number.isFinite(raw) && raw > 0 && raw < MAX_UPLOAD_REQUEST_BYTES) return Math.floor(raw);
++  return MAX_UPLOAD_REQUEST_BYTES;
++}
++
+ /** Hard cap on the bytes returned for a single file read (1 MB). */
+ export const MAX_FILE_READ_BYTES = 1024 * 1024;
+ 
+@@ -119,6 +138,16 @@ export class VmPathError extends Error {
+ /** Control characters (NUL included) are never valid in a VM path. */
+ const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+ 
++/**
++ * True when an absolute path stays inside the workspace volume. This is a
++ * *lexical* test: callers that follow symlinks (the docker driver) must
++ * resolve the path inside the container first and then apply this predicate
++ * to the resolved result.
++ */
++export function isWorkspacePath(path: string): boolean {
++  return path === WORKSPACE_ROOT || path.startsWith(`${WORKSPACE_ROOT}/`);
++}
++
+ /**
+  * Resolve a caller-supplied path to an absolute path inside /workspace.
+  *
+@@ -155,7 +184,7 @@ export function resolveWorkspacePath(raw: string | null | undefined): string {
+   }
+ 
+   const resolved = `/${out.join("/")}`;
+-  if (resolved !== WORKSPACE_ROOT && !resolved.startsWith(`${WORKSPACE_ROOT}/`)) {
++  if (!isWorkspacePath(resolved)) {
+     throw new VmPathError("outside_workspace", `Path must stay inside ${WORKSPACE_ROOT}.`);
+   }
+   return resolved;
+diff --git a/apps/swarmagents/lib/vm/index.test.ts b/apps/swarmagents/lib/vm/index.test.ts
+index e4e7467e8..dd888a9c8 100644
+--- a/apps/swarmagents/lib/vm/index.test.ts
++++ b/apps/swarmagents/lib/vm/index.test.ts
+@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
+ import { EventEmitter } from "node:events";
+ import type { ChildProcess, SpawnOptions } from "node:child_process";
+ import { FakeVmDriver } from "./fake-driver.js";
++import { VmPathError } from "./files.js";
+ import {
+   DockerVmDriver,
+   VmUnavailableError,
+@@ -232,11 +233,19 @@ test("DockerVmDriver.stat parses type, size and mtime", async () => {
+   const driver = new DockerVmDriver({ spawnFn });
+ 
+   const p = driver.stat(handle(), "/workspace/notes.txt");
++  // The driver resolves the path inside the container first (symlink safety).
+   assert.deepEqual(calls[0].args, [
+-    "exec", "swarm-vm-alice", "stat", "-c", "%F\t%s\t%Y", "--", "/workspace/notes.txt",
++    "exec", "swarm-vm-alice", "realpath", "-e", "--", "/workspace/notes.txt",
+   ]);
+-  calls[0].cp.stdout.emit("data", Buffer.from("regular file\t12\t1700000000\n"));
++  calls[0].cp.stdout.emit("data", Buffer.from("/workspace/notes.txt\n"));
+   calls[0].cp.emitClose(0);
++  await flush();
++
++  assert.deepEqual(calls[1].args, [
++    "exec", "swarm-vm-alice", "stat", "-c", "%F\t%s\t%Y", "--", "/workspace/notes.txt",
++  ]);
++  calls[1].cp.stdout.emit("data", Buffer.from("regular file\t12\t1700000000\n"));
++  calls[1].cp.emitClose(0);
+ 
+   const stat = await p;
+   assert.equal(stat.type, "file");
+@@ -250,8 +259,14 @@ test("DockerVmDriver.stat reports a missing path", async () => {
+ 
+   const p = driver.stat(handle(), "/workspace/ghost");
+   p.catch(() => {}); // suppress unhandled-rejection noise
+-  calls[0].cp.stderr.emit("data", Buffer.from("stat: cannot statx: No such file or directory\n"));
+-  calls[0].cp.emitClose(1);
++  calls[0].cp.emitClose(1); // realpath -e: does not exist
++  await flush();
++  // readlink -f resolves the missing leaf lexically, so the stat below reports it.
++  calls[1].cp.stdout.emit("data", Buffer.from("/workspace/ghost\n"));
++  calls[1].cp.emitClose(0);
++  await flush();
++  calls[2].cp.stderr.emit("data", Buffer.from("stat: cannot statx: No such file or directory\n"));
++  calls[2].cp.emitClose(1);
+ 
+   await assert.rejects(p, /No such file or directory/);
+ });
+@@ -261,7 +276,10 @@ test("DockerVmDriver.listDir parses NUL separated find output", async () => {
+   const driver = new DockerVmDriver({ spawnFn });
+ 
+   const p = driver.listDir(handle(), "/workspace");
+-  assert.deepEqual(calls[0].args, [
++  calls[0].cp.stdout.emit("data", Buffer.from("/workspace\n"));
++  calls[0].cp.emitClose(0);
++  await flush();
++  assert.deepEqual(calls[1].args, [
+     "exec", "swarm-vm-alice",
+     "find", "/workspace", "-mindepth", "1", "-maxdepth", "1", "-printf", "%y\\0%s\\0%T@\\0%f\\0",
+   ]);
+@@ -269,8 +287,8 @@ test("DockerVmDriver.listDir parses NUL separated find output", async () => {
+     "d", "4096", "1700000000.5000000000", "src",
+     "f", "12", "1700000001.0000000000", "hello.txt",
+   ].join("\0") + "\0";
+-  calls[0].cp.stdout.emit("data", Buffer.from(payload, "utf8"));
+-  calls[0].cp.emitClose(0);
++  calls[1].cp.stdout.emit("data", Buffer.from(payload, "utf8"));
++  calls[1].cp.emitClose(0);
+ 
+   const entries = await p;
+   assert.deepEqual(entries.map((e) => e.name), ["src", "hello.txt"]);
+@@ -286,11 +304,15 @@ test("DockerVmDriver.readFileBytes caps the read with head -c", async () => {
+   const driver = new DockerVmDriver({ spawnFn });
+ 
+   const p = driver.readFileBytes(handle(), "/workspace/a.bin", 4);
+-  calls[0].cp.stdout.emit("data", Buffer.from("regular file\t10\t1700000000\n"));
++  calls[0].cp.stdout.emit("data", Buffer.from("/workspace/a.bin\n"));
+   calls[0].cp.emitClose(0);
+   await flush();
+ 
+-  const head = calls[1];
++  calls[1].cp.stdout.emit("data", Buffer.from("regular file\t10\t1700000000\n"));
++  calls[1].cp.emitClose(0);
++  await flush();
++
++  const head = calls[2];
+   assert.deepEqual(head.args, ["exec", "swarm-vm-alice", "head", "-c", "4", "--", "/workspace/a.bin"]);
+   head.cp.stdout.emit("data", Buffer.from([0, 1, 2, 3]));
+   head.cp.emitClose(0);
+@@ -599,8 +621,11 @@ test("DockerVmDriver.inFile uses cat -- so leading dashes are safe", async () =>
+   const driver = new DockerVmDriver({ spawnFn });
+ 
+   const p = driver.readFile(handle(), "/workspace/-weird");
+-  assert.deepEqual(calls[0].args, ["exec", "swarm-vm-alice", "cat", "--", "/workspace/-weird"]);
++  calls[0].cp.stdout.emit("data", Buffer.from("/workspace/-weird\n"));
+   calls[0].cp.emitClose(0);
++  await flush();
++  assert.deepEqual(calls[1].args, ["exec", "swarm-vm-alice", "cat", "--", "/workspace/-weird"]);
++  calls[1].cp.emitClose(0);
+   assert.equal(await p, "");
+ });
+ 
+@@ -614,12 +639,24 @@ test("DockerVmDriver.writeFile creates parent dir and pipes content via stdin",
+   calls[0].cp.emitClose(0);
+ 
+   await flush();
+-  assert.equal(calls.length, 2);
++  // Parent is resolved inside the container before the write.
+   assert.deepEqual(calls[1].args, [
+-    "exec", "-i", "--", "swarm-vm-alice", "sh", "-c", "cat > \"$1\"", "sh", "/workspace/sub/a.txt",
++    "exec", "swarm-vm-alice", "realpath", "-e", "--", "/workspace/sub",
+   ]);
+-  assert.ok(!calls[1].args.some((a) => a.includes("big-content")), "content must not appear in argv");
++  calls[1].cp.stdout.emit("data", Buffer.from("/workspace/sub\n"));
+   calls[1].cp.emitClose(0);
++  await flush();
++
++  // O_NOFOLLOW-style refusal to write through an existing symlink.
++  assert.deepEqual(calls[2].args, ["exec", "swarm-vm-alice", "test", "-L", "/workspace/sub/a.txt"]);
++  calls[2].cp.emitClose(1); // not a symlink
++  await flush();
++
++  assert.deepEqual(calls[3].args, [
++    "exec", "-i", "--", "swarm-vm-alice", "sh", "-c", "cat > \"$1\"", "sh", "/workspace/sub/a.txt",
++  ]);
++  assert.ok(!calls[3].args.some((a) => a.includes("big-content")), "content must not appear in argv");
++  calls[3].cp.emitClose(0);
+ 
+   await p;
+ });
+@@ -631,6 +668,85 @@ test("DockerVmDriver.writeFile rejects relative and weird paths", async () => {
+   await assert.rejects(driver.writeFile(handle(), "/a\"b", "x"), /forbidden characters/);
+ });
+ 
++// ---------------------------------------------------------------------------
++// Symlink confinement (VM-10)
++// ---------------------------------------------------------------------------
++
++test("DockerVmDriver.readFileBytes refuses a workspace symlink that leaves /workspace", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn });
++
++  const p = driver.readFileBytes(handle(), "/workspace/passwd", 1024);
++  p.catch(() => {}); // suppress unhandled-rejection noise
++  // realpath -e resolves the symlink inside the container: /etc/passwd.
++  assert.deepEqual(calls[0].args, [
++    "exec", "swarm-vm-alice", "realpath", "-e", "--", "/workspace/passwd",
++  ]);
++  calls[0].cp.stdout.emit("data", Buffer.from("/etc/passwd\n"));
++  calls[0].cp.emitClose(0);
++
++  await assert.rejects(p, (err: unknown) => {
++    assert.ok(err instanceof VmPathError);
++    assert.equal(err.code, "outside_workspace");
++    return true;
++  });
++  // Nothing was opened: no stat, no head.
++  assert.equal(calls.length, 1, "a refused path must never be read");
++  assert.ok(!calls.some((c) => c.args.includes("head")), "head must not run for a refused path");
++});
++
++test("DockerVmDriver.stat and listDir refuse a symlink out of /workspace", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn });
++
++  const statP = driver.stat(handle(), "/workspace/environ");
++  statP.catch(() => {});
++  calls[0].cp.stdout.emit("data", Buffer.from("/proc/1/environ\n"));
++  calls[0].cp.emitClose(0);
++  await assert.rejects(statP, VmPathError);
++
++  const listP = driver.listDir(handle(), "/workspace/etcdir");
++  listP.catch(() => {});
++  calls[1].cp.stdout.emit("data", Buffer.from("/etc\n"));
++  calls[1].cp.emitClose(0);
++  await assert.rejects(listP, VmPathError);
++});
++
++test("DockerVmDriver.writeFile refuses a parent directory that resolves outside /workspace", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn });
++
++  const p = driver.writeFile(handle(), "/workspace/escape/evil.sh", "x");
++  p.catch(() => {});
++  calls[0].cp.emitClose(0); // mkdir -p /workspace/escape
++  await flush();
++  calls[1].cp.stdout.emit("data", Buffer.from("/etc\n")); // symlink -> /etc
++  calls[1].cp.emitClose(0);
++
++  await assert.rejects(p, (err: unknown) => {
++    assert.ok(err instanceof VmPathError);
++    assert.equal(err.code, "outside_workspace");
++    return true;
++  });
++  assert.ok(!calls.some((c) => c.args[0] === "exec" && c.args.includes("cat > \"$1\"")), "no write after refusal");
++});
++
++test("DockerVmDriver.writeFile refuses to write through a symlink at the destination", async () => {
++  const { spawnFn, calls } = makeFakeSpawn();
++  const driver = new DockerVmDriver({ spawnFn });
++
++  const p = driver.writeFile(handle(), "/workspace/notes.txt", "x");
++  p.catch(() => {});
++  calls[0].cp.emitClose(0); // mkdir
++  await flush();
++  calls[1].cp.stdout.emit("data", Buffer.from("/workspace\n"));
++  calls[1].cp.emitClose(0);
++  await flush();
++  calls[2].cp.emitClose(0); // test -L -> it IS a symlink
++
++  await assert.rejects(p, /symbolic link/);
++});
++
+ test("DockerVmDriver.ensure builds hardened run args with resource limits", async () => {
+   const { spawnFn, calls } = makeFakeSpawn();
+   const driver = new DockerVmDriver({ spawnFn });
+diff --git a/apps/swarmagents/vm-image-desktop/Dockerfile b/apps/swarmagents/vm-image-desktop/Dockerfile
+index d2341e4aa..5d8c4ffa1 100644
+--- a/apps/swarmagents/vm-image-desktop/Dockerfile
++++ b/apps/swarmagents/vm-image-desktop/Dockerfile
+@@ -82,11 +82,11 @@ RUN apt-get update \
+         xauth \
+     && rm -rf /var/lib/apt/lists/*
+ 
+-# Desktop init: generates/reads the VNC password from $SWARM_VNC_PASSWORD
+-# (passed by the driver via the container env — never argv, never logged),
+-# writes it into the VNC password file (and a 0600 copy the driver can
+-# re-read), then hands off to supervisord, which supervises Xvnc + XFCE +
+-# the noVNC web client.
++# Desktop init: reads the VNC password from the 0600 handoff file the driver
++# copies in before the container starts (never an env var — /proc/1/environ is
++# readable inside the container), writes it into the VNC password file (and a
++# 0600 copy the driver can re-read), deletes the handoff file, then hands off
++# to supervisord, which supervises Xvnc + XFCE + the noVNC web client.
+ COPY files/init.sh /usr/local/bin/swarm-desktop-init.sh
+ COPY files/supervisord.conf /etc/supervisor/conf.d/swarm-desktop.conf
+ COPY files/healthcheck.sh /usr/local/bin/swarm-desktop-healthcheck.sh
+diff --git a/apps/swarmagents/vm-image-desktop/README.md b/apps/swarmagents/vm-image-desktop/README.md
+index 81ec3b168..8b78d54d4 100644
+--- a/apps/swarmagents/vm-image-desktop/README.md
++++ b/apps/swarmagents/vm-image-desktop/README.md
+@@ -61,13 +61,17 @@ is owned by that user, as in the headless image.
+ 
+ ### The VNC password
+ 
+-The driver generates a random per-container password and passes it into the
+-container via the environment (`SWARM_VNC_PASSWORD`) — **by name only** in
+-the `docker run` argv, value only in the spawn env, and never logged. The
+-image's `init.sh` writes it into the VNC password file and a `0600` plaintext
+-copy at `/home/node/.vnc/.swarm-vnc-password` (which `desktopEndpoint()` can
+-re-read after a server restart). The password is never sent to the browser in
+-clear; the web client asks for it over the TLS-less VNC handshake.
++The driver generates a random per-container password and hands it over as a
++file, never an environment variable: it creates the container with
++`docker create`, copies the password to `/home/node/.vnc/.swarm-vnc-incoming`
++as a `0600` file owned by `node` (`docker cp --chown`), and only then starts
++it. A container's environment is readable through `/proc/1/environ`, so
++putting the password there would hand it to anything that can read that file.
++The image's `init.sh` reads the handoff file, writes the VNC password file and
++a `0600` plaintext copy at `/home/node/.vnc/.swarm-vnc-password` (which
++`desktopEndpoint()` can re-read after a server restart), and deletes the
++handoff file. The password is never sent to the browser in clear; the web
++client asks for it over the TLS-less VNC handshake.
+ 
+ No port is ever published to a host port. The web client (6080) is bound to
+ the container's network interface and is only reachable from inside the
+@@ -150,9 +154,12 @@ Accepted hadolint-style findings (deliberate):
+ ```bash
+ # The desktop stack boots and the web client listens (run inside the docker
+ # network, e.g. from another container on the same bridge):
+-docker run --rm -d --name smoke-desktop \
+-  -e SWARM_VNC_PASSWORD=testpass -p 127.0.0.1:6080:6080 \
+-  swarm-vm:desktop
++docker create --name smoke-desktop -p 127.0.0.1:6080:6080 swarm-vm:desktop
++printf 'testpass\n' > /tmp/vnc-secret
++docker cp --chown=1000:1000 /tmp/vnc-secret \
++  smoke-desktop:/home/node/.vnc/.swarm-vnc-incoming
++rm -f /tmp/vnc-secret
++docker start smoke-desktop
+ sleep 15
+ curl -fsS -o /dev/null http://127.0.0.1:6080/   # noVNC client page
+ docker exec smoke-desktop sh -lc \
+diff --git a/apps/swarmagents/vm-image-desktop/files/init.sh b/apps/swarmagents/vm-image-desktop/files/init.sh
+index 7200d3d78..aa25a336b 100755
+--- a/apps/swarmagents/vm-image-desktop/files/init.sh
++++ b/apps/swarmagents/vm-image-desktop/files/init.sh
+@@ -1,10 +1,13 @@
+ #!/bin/sh
+ # swarm-desktop-init.sh — boot the desktop stack for a swarm-vm:desktop VM.
+ #
+-# Runs as the unprivileged `node` user (the image's USER). The driver passes
+-# SWARM_VNC_PASSWORD via the container environment (never argv, never logged).
+-# This script writes it into the VNC password file, then hands off to
+-# supervisord, which keeps Xvnc + XFCE + the noVNC web client alive.
++# Runs as the unprivileged `node` user (the image's USER). The driver creates
++# the container with `docker create`, copies the generated VNC password in as
++# a 0600 file owned by this user (never an environment variable: a container's
++# environment is readable through /proc/1/environ by anything inside it), and
++# only then starts it. This script reads that file, writes the VNC password
++# files, deletes the handoff file, and hands off to supervisord, which keeps
++# Xvnc + XFCE + the noVNC web client alive.
+ #
+ # Also writes a plaintext copy of the password to a file the driver can re-read
+ # (e.g. after a server restart, when the in-memory copy is gone). The file is
+@@ -12,18 +15,26 @@
+ 
+ set -eu
+ 
+-# Resolve the VNC password: the driver's generated password (the normal case),
+-# else an operator-set SWARM_VNC_PASSWORD, else a random one generated here.
++SECRET_FILE=/home/node/.vnc/.swarm-vnc-incoming
++PASSWORD_FILE=/home/node/.vnc/.swarm-vnc-password
++
++# Resolve the VNC password: the driver's 0600 handoff file (the normal case),
++# else the copy from a previous boot, else a random one generated here.
+ # A random one that the driver never saw means the web endpoint will refuse to
+ # connect until the container is recreated — see the README.
+-if [ -n "${SWARM_VNC_PASSWORD:-}" ]; then
+-  VNC_PASSWORD="$SWARM_VNC_PASSWORD"
+-elif [ -f /home/node/.vnc/.swarm-vnc-password ]; then
+-  VNC_PASSWORD="$(cat /home/node/.vnc/.swarm-vnc-password)"
++if [ -f "$SECRET_FILE" ] && [ -r "$SECRET_FILE" ]; then
++  VNC_PASSWORD="$(cat "$SECRET_FILE")"
++  rm -f "$SECRET_FILE"
++elif [ -f "$PASSWORD_FILE" ] && [ -r "$PASSWORD_FILE" ]; then
++  VNC_PASSWORD="$(cat "$PASSWORD_FILE")"
+ else
+   VNC_PASSWORD="$(head -c 12 /dev/urandom | base64 | tr -d '=/+' | head -c 12)"
+ fi
+ 
++# A stale SWARM_VNC_PASSWORD in the environment is never used (the driver does
++# not set one); clear it so it cannot reach the supervised children.
++unset SWARM_VNC_PASSWORD
++
+ mkdir -p /home/node/.vnc
+ umask 077
+ 
+@@ -33,10 +44,7 @@ chmod 0600 /home/node/.vnc/passwd
+ 
+ # The driver's plaintext copy — 0600, node-owned, for desktopEndpoint() to
+ # re-read after a server restart.
+-printf '%s\n' "$VNC_PASSWORD" > /home/node/.vnc/.swarm-vnc-password
+-chmod 0600 /home/node/.vnc/.swarm-vnc-password
+-
+-# Unset so it cannot leak into the supervised children's environments or logs.
+-unset SWARM_VNC_PASSWORD
++printf '%s\n' "$VNC_PASSWORD" > "$PASSWORD_FILE"
++chmod 0600 "$PASSWORD_FILE"
+ 
+ exec supervisord -c /etc/supervisor/conf.d/swarm-desktop.conf
+-- 
+2.55.0
+

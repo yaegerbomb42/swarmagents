@@ -1,0 +1,952 @@
+From 31ecedca986c6fd49a1d87b1239fcfe5f116e02a Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 15:44:26 -0600
+Subject: [PATCH] feat(l3): authenticated VM display proxy tunnel
+
+Add a custom Node server (server.ts) wrapping the Next standalone handler and
+intercepting the WebSocket upgrade on /api/runtime/vm/display/ws. A new
+display proxy (lib/vm/display-proxy.ts) authenticates via session cookie,
+checks Origin, resolves the upstream websockify endpoint only through the VM
+manager's desktopEndpoint(userId) (ensure() first), and pipes frames both ways.
+GET /api/runtime/vm/display reports availability. Custom close codes: 4401
+not signed in, 4404 no display (fake driver), 4503 VM failed to start. Max 3
+viewers per user, 30 min idle reap, connect/disconnect audit entries.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/Dockerfile                   |   1 +
+ .../app/api/runtime/vm/display/route.ts       |  43 +++
+ apps/swarmagents/lib/audit.ts                 |   3 +-
+ apps/swarmagents/lib/vm/display-proxy.test.ts | 332 +++++++++++++++++
+ apps/swarmagents/lib/vm/display-proxy.ts      | 341 ++++++++++++++++++
+ apps/swarmagents/package-lock.json            |  36 +-
+ apps/swarmagents/package.json                 |   7 +-
+ apps/swarmagents/server.ts                    |  54 +++
+ 8 files changed, 813 insertions(+), 4 deletions(-)
+ create mode 100644 apps/swarmagents/app/api/runtime/vm/display/route.ts
+ create mode 100644 apps/swarmagents/lib/vm/display-proxy.test.ts
+ create mode 100644 apps/swarmagents/lib/vm/display-proxy.ts
+ create mode 100644 apps/swarmagents/server.ts
+
+diff --git a/apps/swarmagents/Dockerfile b/apps/swarmagents/Dockerfile
+index fdb7241a0..bb3049ee2 100644
+--- a/apps/swarmagents/Dockerfile
++++ b/apps/swarmagents/Dockerfile
+@@ -25,6 +25,7 @@ RUN groupadd --system --gid 1001 nodejs \
+     && chown nextjs:nodejs /data
+ 
+ COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
++COPY --from=builder --chown=nextjs:nodejs /app/server.js ./server.js
+ COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+ COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+ 
+diff --git a/apps/swarmagents/app/api/runtime/vm/display/route.ts b/apps/swarmagents/app/api/runtime/vm/display/route.ts
+new file mode 100644
+index 000000000..520390511
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/vm/display/route.ts
+@@ -0,0 +1,43 @@
++/**
++ * Display availability for the caller's VM.
++ *
++ * GET /api/runtime/vm/display -> {available: boolean, reason?: string}
++ *
++ * When a desktop VM is reachable this returns `available: true`; the browser
++ * then opens the WebSocket tunnel at /api/runtime/vm/display/ws (served by
++ * the custom Node server, see server.ts). Under the headless fake driver —
++ * or any driver without a desktop — there is no endpoint and it returns
++ * `available: false` with a reason. Auth comes from the middleware-set
++ * x-swarm-user header (see lib/auth).
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { USER_HEADER } from "../../../../../lib/auth";
++import { getVmManager } from "../../../../../lib/vm/manager";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++function caller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++export async function GET(req: NextRequest) {
++  const user = caller(req);
++  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
++
++  const vm = getVmManager();
++  try {
++    const endpoint = await vm.desktopEndpoint(user);
++    if (endpoint) {
++      return NextResponse.json({ available: true });
++    }
++    const driver = (process.env.SWARM_VM_DRIVER ?? "").trim().toLowerCase();
++    const reason = driver === "docker" ? "no desktop VM" : "fake driver";
++    return NextResponse.json({ available: false, reason });
++  } catch (err) {
++    const message = err instanceof Error ? err.message : "Could not query display availability.";
++    return NextResponse.json({ available: false, reason: message }, { status: 500 });
++  }
++}
+diff --git a/apps/swarmagents/lib/audit.ts b/apps/swarmagents/lib/audit.ts
+index 5db8ded35..14a546ed2 100644
+--- a/apps/swarmagents/lib/audit.ts
++++ b/apps/swarmagents/lib/audit.ts
+@@ -36,7 +36,8 @@ export type AuditAction =
+   | "login.failure"
+   | "vm.file.upload"
+   | "desktop.view"
+-  | "desktop.takeover";
++  | "desktop.takeover"
++  | "desktop.disconnect";
+ 
+ export type AuditResult = "success" | "failure";
+ 
+diff --git a/apps/swarmagents/lib/vm/display-proxy.test.ts b/apps/swarmagents/lib/vm/display-proxy.test.ts
+new file mode 100644
+index 000000000..2a94aeb51
+--- /dev/null
++++ b/apps/swarmagents/lib/vm/display-proxy.test.ts
+@@ -0,0 +1,332 @@
++/**
++ * Tests for the authenticated display proxy (lib/vm/display-proxy.ts).
++ *
++ * The proxy is exercised through a real WebSocket client (`ws`) against a real
++ * HTTP server, with fake upstream websockify servers standing in for VMs.
++ * Coverage: auth rejection (close 4401), Origin rejection (HTTP 403), no
++ * display / fake driver (close 4404), VM failed to start (close 4503), viewer
++ * cap (HTTP 429), per-user endpoint isolation, both-direction frame piping, and
++ * audit entries (desktop.view / desktop.disconnect).
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import http from "node:http";
++import crypto from "node:crypto";
++import os from "node:os";
++import path from "node:path";
++import fs from "node:fs";
++import { URL } from "node:url";
++import { WebSocket, WebSocketServer } from "ws";
++import { signSession, SESSION_COOKIE } from "../auth";
++import { readAuditEntries, configureAuditPath } from "../audit";
++import { createDisplayProxy, DISPLAY_WS_PATH, type DisplayProxy } from "./display-proxy";
++import { GET as displayRouteGet } from "../../app/api/runtime/vm/display/route";
++import type { VmDesktopEndpoint } from "./types";
++
++const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "display-proxy-test-"));
++process.env.SWARM_HOME = TMP;
++process.env.SWARM_SERVER_MODE = "1";
++process.env.SWARM_SESSION_SECRET = "test-secret";
++configureAuditPath(path.join(TMP, "audit.jsonl"));
++
++function sessionFor(userId: string): string {
++  return `${SESSION_COOKIE}=${signSession(userId)}`;
++}
++
++const WS_BASE = "ws://127.0.0.1";
++
++interface Harness {
++  proxy: DisplayProxy;
++  server: http.Server;
++  url: string;
++  close(): Promise<void>;
++}
++
++async function startHarness(opts: {
++  resolveEndpoint?: (userId: string) => Promise<VmDesktopEndpoint | null>;
++  maxViewersPerUser?: number;
++  idleMs?: number;
++} = {}): Promise<Harness> {
++  const proxy = createDisplayProxy(opts);
++  const server = http.createServer();
++  proxy.install(server);
++  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
++  const address = server.address();
++  const port = typeof address === "object" && address ? address.port : 0;
++  return {
++    proxy,
++    server,
++    url: `${WS_BASE}:${port}${DISPLAY_WS_PATH}`,
++    async close() {
++      await proxy.close();
++      await new Promise<void>((resolve) => server.close(() => resolve()));
++    },
++  };
++}
++
++interface Upstream {
++  port: number;
++  wss: WebSocketServer;
++  serverSockets: WebSocket[];
++  received: Buffer[];
++  close(): Promise<void>;
++}
++
++function startUpstream(): Promise<Upstream> {
++  return new Promise((resolve) => {
++    const received: Buffer[] = [];
++    const serverSockets: WebSocket[] = [];
++    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
++    wss.on("connection", (ws) => {
++      serverSockets.push(ws);
++      ws.on("message", (data) => received.push(data as Buffer));
++    });
++    wss.on("listening", () => {
++      resolve({
++        port: (wss.address() as { port: number }).port,
++        wss,
++        serverSockets,
++        received,
++        close: () => new Promise<void>((r) => wss.close(() => r())),
++      });
++    });
++  });
++}
++
++function clientConnect(url: string, headers: Record<string, string>): Promise<WebSocket> {
++  return new Promise((resolve, reject) => {
++    const ws = new WebSocket(url, { headers });
++    ws.on("open", () => resolve(ws));
++    ws.on("error", reject);
++  });
++}
++
++/** Perform an upgrade attempt and return the HTTP status when the server refuses. */
++function expectRefusal(url: string, headers: Record<string, string>): Promise<number> {
++  return new Promise((resolve, reject) => {
++    const u = new URL(url);
++    const req = http.request({
++      host: u.hostname,
++      port: Number(u.port || 80),
++      path: u.pathname + u.search,
++      headers: {
++        connection: "Upgrade",
++        upgrade: "websocket",
++        "sec-websocket-version": "13",
++        "sec-websocket-key": crypto.randomBytes(16).toString("base64"),
++        ...headers,
++      },
++    });
++    req.on("upgrade", () => reject(new Error("expected refusal, got upgrade")));
++    req.on("response", (res) => {
++      res.resume();
++      resolve(res.statusCode ?? 0);
++    });
++    req.on("error", reject);
++    req.end();
++  });
++}
++
++test("auth rejection closes with 4401 when not signed in", async () => {
++  const h = await startHarness();
++  try {
++    const ws = await clientConnect(h.url, {});
++    const closed = await new Promise<{ code: number }>((resolve) => {
++      ws.on("close", (code) => resolve({ code }));
++    });
++    assert.equal(closed.code, 4401);
++  } finally {
++    await h.close();
++  }
++});
++
++test("Origin mismatch is refused with HTTP 403", async () => {
++  const h = await startHarness();
++  try {
++    const status = await expectRefusal(h.url, {
++      Cookie: sessionFor("u1"),
++      Origin: "https://evil.example.com",
++    });
++    assert.equal(status, 403);
++  } finally {
++    await h.close();
++  }
++});
++
++test("wrong path is refused with HTTP 404", async () => {
++  const h = await startHarness();
++  try {
++    const status = await expectRefusal(`${WS_BASE}:${new URL(h.url).port}/api/other`, {
++      Cookie: sessionFor("u1"),
++    });
++    assert.equal(status, 404);
++  } finally {
++    await h.close();
++  }
++});
++
++test("no display (fake driver) closes with 4404", async () => {
++  const h = await startHarness({ resolveEndpoint: async () => null });
++  try {
++    const ws = await clientConnect(h.url, { Cookie: sessionFor("u1") });
++    const closed = await new Promise<{ code: number }>((resolve) => {
++      ws.on("close", (code) => resolve({ code }));
++    });
++    assert.equal(closed.code, 4404);
++  } finally {
++    await h.close();
++  }
++});
++
++test("VM failed to start closes with 4503", async () => {
++  const h = await startHarness({
++    resolveEndpoint: async () => {
++      throw new Error("container create failed");
++    },
++  });
++  try {
++    const ws = await clientConnect(h.url, { Cookie: sessionFor("u1") });
++    const closed = await new Promise<{ code: number }>((resolve) => {
++      ws.on("close", (code) => resolve({ code }));
++    });
++    assert.equal(closed.code, 4503);
++  } finally {
++    await h.close();
++  }
++});
++
++test("viewer cap refuses a second concurrent session with HTTP 429", async () => {
++  const upstream = await startUpstream();
++  const h = await startHarness({
++    resolveEndpoint: async () => ({ host: "127.0.0.1", port: upstream.port, password: "pw" }),
++    maxViewersPerUser: 1,
++  });
++  let first: WebSocket | undefined;
++  try {
++    first = await clientConnect(h.url, { Cookie: sessionFor("u1") });
++    const status = await expectRefusal(h.url, { Cookie: sessionFor("u1") });
++    assert.equal(status, 429);
++  } finally {
++    first?.close();
++    await h.close();
++    await upstream.close();
++  }
++});
++
++test("each user is only routed to their own VM endpoint", async () => {
++  const upstreamA = await startUpstream();
++  const upstreamB = await startUpstream();
++  const h = await startHarness({
++    resolveEndpoint: async (userId: string) =>
++      userId === "userA"
++        ? { host: "127.0.0.1", port: upstreamA.port, password: "pw" }
++        : { host: "127.0.0.1", port: upstreamB.port, password: "pw" },
++  });
++  const wsA = await clientConnect(h.url, { Cookie: sessionFor("userA") });
++  const wsB = await clientConnect(h.url, { Cookie: sessionFor("userB") });
++  try {
++    wsA.send(Buffer.from([1, 2, 3]));
++    wsB.send(Buffer.from([4, 5, 6]));
++    await waitFor(() => upstreamA.received.length === 1 && upstreamB.received.length === 1);
++    assert.deepEqual(upstreamA.received[0], Buffer.from([1, 2, 3]));
++    assert.deepEqual(upstreamB.received[0], Buffer.from([4, 5, 6]));
++  } finally {
++    wsA.close();
++    wsB.close();
++    await h.close();
++    await upstreamA.close();
++    await upstreamB.close();
++  }
++});
++
++test("frames are piped both ways and audit records view + disconnect", async () => {
++  const upstream = await startUpstream();
++  const h = await startHarness({
++    resolveEndpoint: async () => ({ host: "127.0.0.1", port: upstream.port, password: "pw" }),
++  });
++  const ws = await clientConnect(h.url, { Cookie: sessionFor("u1") });
++  try {
++    // client -> upstream
++    ws.send(Buffer.from([10, 20]));
++    await waitFor(() => upstream.received.length === 1);
++    assert.deepEqual(upstream.received[0], Buffer.from([10, 20]));
++
++    // upstream -> client
++    const received = waitForMessage(ws);
++    upstream.serverSockets[0].send(Buffer.from([7, 8, 9]));
++    const payload = await received;
++    assert.deepEqual(payload, Buffer.from([7, 8, 9]));
++
++    // audit: the connect (desktop.view) should be present
++    const entries = readAuditEntries("u1");
++    assert.ok(entries.some((e) => e.action === "desktop.view"));
++  } finally {
++    ws.close();
++    await h.close();
++    await upstream.close();
++    // after close, a disconnect entry records
++    const entries = readAuditEntries("u1");
++    assert.ok(entries.some((e) => e.action === "desktop.disconnect"));
++  }
++});
++
++test("idle sessions are reaped", async () => {
++  const upstream = await startUpstream();
++  const h = await startHarness({
++    resolveEndpoint: async () => ({ host: "127.0.0.1", port: upstream.port, password: "pw" }),
++    idleMs: 250,
++  });
++  const ws = await clientConnect(h.url, { Cookie: sessionFor("u1") });
++  try {
++    const closed = await new Promise<{ code: number }>((resolve) => {
++      ws.on("close", (code) => resolve({ code }));
++    });
++    assert.equal(closed.code, 1000);
++    assert.equal(h.proxy.activeViewers("u1"), 0);
++  } finally {
++    await h.close();
++    await upstream.close();
++  }
++});
++
++test("GET /api/runtime/vm/display reports the fake driver", async () => {
++  const req = {
++    headers: new Headers([["x-swarm-user", "u1"]]),
++  } as unknown as Parameters<typeof displayRouteGet>[0];
++  const res = await displayRouteGet(req);
++  const body = await res.json();
++  assert.equal(res.status, 200);
++  assert.equal(body.available, false);
++  assert.equal(body.reason, "fake driver");
++});
++
++function waitFor(fn: () => boolean, timeoutMs = 3000): Promise<void> {
++  const start = Date.now();
++  return new Promise((resolve, reject) => {
++    const tick = () => {
++      try {
++        if (fn()) return resolve();
++      } catch (err) {
++        return reject(err);
++      }
++      if (Date.now() - start > timeoutMs) return reject(new Error("timed out waiting for condition"));
++      setTimeout(tick, 10);
++    };
++    tick();
++  });
++}
++
++function waitForMessage(ws: WebSocket, timeoutMs = 3000): Promise<Buffer> {
++  return new Promise((resolve, reject) => {
++    const timer = setTimeout(() => reject(new Error("timed out waiting for message")), timeoutMs);
++    ws.on("message", (data) => {
++      clearTimeout(timer);
++      resolve(data as Buffer);
++    });
++    ws.on("error", (err) => {
++      clearTimeout(timer);
++      reject(err);
++    });
++  });
++}
+diff --git a/apps/swarmagents/lib/vm/display-proxy.ts b/apps/swarmagents/lib/vm/display-proxy.ts
+new file mode 100644
+index 000000000..92406deb0
+--- /dev/null
++++ b/apps/swarmagents/lib/vm/display-proxy.ts
+@@ -0,0 +1,341 @@
++/**
++ * Authenticated display proxy: browser -> user's own VM noVNC.
++ *
++ * Next.js route handlers cannot upgrade WebSockets, so the app's HTTP server
++ * must terminate the tunnel itself. This module attaches to an existing
++ * `http.Server` and intercepts the `upgrade` handshake on
++ * `/api/runtime/vm/display/ws` — the one path the Next runtime cannot serve.
++ *
++ * A user is only ever routed to THEIR OWN VM: the upstream endpoint is resolved
++ * exclusively through the VM manager's `desktopEndpoint(userId)` (which calls
++ * `ensure()` first so a hibernated VM wakes), never from anything the client
++ * sends. The upstream leg is the VM's websockify (`ws://<container-ip>:6080/websockify`)
++ * and frames are piped verbatim in both directions.
++ *
++ * Policy failures reject the handshake with an HTTP response, or — once the
++ * WebSocket is established — close it with a custom code (4000-4999 private
++ * use): 4401 not signed in, 4404 no display (fake driver), 4503 VM failed to
++ * start. Sessions are capped at 3 concurrent viewers per user and reaped after
++ * 30 idle minutes. Connects and disconnects are recorded in the audit log
++ * (never any payload, host, or secret).
++ */
++
++import http from "node:http";
++import net from "node:net";
++import { URL } from "node:url";
++import { WebSocket, WebSocketServer } from "ws";
++import { hostAllowed, requestUser, type AuthRequestLike } from "../auth";
++import { recordAudit } from "../audit";
++import { getVmManager } from "./manager";
++import type { VmDesktopEndpoint } from "./types";
++
++/** WebSocket upgrade path this proxy owns. */
++export const DISPLAY_WS_PATH = "/api/runtime/vm/display/ws";
++
++export const DEFAULT_MAX_VIEWERS = 3;
++export const DEFAULT_IDLE_MS = 30 * 60 * 1000;
++
++// WebSocket close codes (4000-4999 are private use).
++export const CLOSE_NOT_SIGNED_IN = 4401;
++export const CLOSE_NO_DISPLAY = 4404;
++export const CLOSE_VM_FAILED_TO_START = 4503;
++export const CLOSE_TOO_MANY_VIEWERS = 4501;
++export const CLOSE_UPSTREAM_UNAVAILABLE = 1011;
++
++/** Options for createDisplayProxy. */
++export interface DisplayProxyOptions {
++  /**
++   * Resolve the display endpoint for an authenticated user. Defaults to the
++   * app's VM manager (`getVmManager().desktopEndpoint(userId)`), which is the
++   * only allowed target for that user. Tests inject a resolver backed by fake
++   * upstreams.
++   */
++  resolveEndpoint?: (userId: string) => Promise<VmDesktopEndpoint | null>;
++  /** Max concurrent display sessions per user. Default 3. */
++  maxViewersPerUser?: number;
++  /** Idle timeout before a session is closed, ms. Default 30 minutes. */
++  idleMs?: number;
++  /** Upstream WebSocket path inside the container (default /websockify). */
++  upstreamWsPath?: string;
++  now?: () => number;
++}
++
++interface DisplaySession {
++  userId: string;
++  client: WebSocket;
++  upstream: WebSocket;
++  /** Client frames buffered while the upstream is still connecting. */
++  pending: Buffer[];
++  lastActivity: number;
++  idleTimer: NodeJS.Timeout | null;
++}
++
++export interface DisplayProxy {
++  /** Attach the `upgrade` listener to an existing HTTP server. */
++  install(server: http.Server): void;
++  /** Close every session and stop accepting upgrades. */
++  close(): Promise<void>;
++  /** Active display sessions for a user (tests/metrics). */
++  activeViewers(userId: string): number;
++}
++
++function parseCookieHeader(value: string | undefined): Map<string, string> {
++  const out = new Map<string, string>();
++  if (!value) return out;
++  for (const part of value.split(";")) {
++    const idx = part.indexOf("=");
++    if (idx > 0) {
++      out.set(part.slice(0, idx).trim(), part.slice(idx + 1).trim());
++    }
++  }
++  return out;
++}
++
++/** Adapt an IncomingMessage to lib/auth's AuthRequestLike. */
++function requestLike(req: http.IncomingMessage): AuthRequestLike {
++  const cookies = parseCookieHeader(req.headers.cookie);
++  return {
++    headers: {
++      get(name: string) {
++        const lower = name.toLowerCase();
++        const value = lower === "cookie" ? req.headers.cookie : req.headers[lower];
++        if (value === undefined) return null;
++        return Array.isArray(value) ? value[0] : value;
++      },
++    },
++    cookies: {
++      get(name: string) {
++        const value = cookies.get(name);
++        return value !== undefined ? { value } : undefined;
++      },
++    },
++  };
++}
++
++/** Reject an upgrade with a plain HTTP response (no WebSocket handshake). */
++function writeUpgradeRefusal(socket: net.Socket, status: number, message: string): void {
++  const body = Buffer.from(message);
++  socket.write(
++    `HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? "Error"}\r\n` +
++      "Connection: close\r\n" +
++      "Content-Type: text/plain; charset=utf-8\r\n" +
++      "Content-Length: " + body.length + "\r\n" +
++      "X-Content-Type-Options: nosniff\r\n" +
++      "Cache-Control: no-store\r\n" +
++      "\r\n",
++  );
++  socket.end(body);
++}
++
++/** Same Origin gate as middleware + the desktop proxy. */
++function originAllowed(req: http.IncomingMessage): boolean {
++  const origin = req.headers.origin;
++  if (!origin) return true; // non-browser client; cookie auth still required
++  try {
++    const originHost = new URL(origin).hostname.toLowerCase();
++    const host = (req.headers.host ?? "").split(":")[0].toLowerCase();
++    if (originHost === host) return true;
++    const allowed = (process.env.SWARM_ALLOWED_HOSTS ?? "")
++      .split(",")
++      .map((h) => h.trim().toLowerCase())
++      .filter(Boolean);
++    return allowed.includes(originHost);
++  } catch {
++    return false; // malformed Origin cannot be trusted
++  }
++}
++
++/** Validate a driver-supplied host: plain IP or DNS name, never a URL. */
++function isSafeUpstreamHost(host: string): boolean {
++  if (!host || host.length > 253) return false;
++  if (/[/\\@?#\s]/.test(host)) return false;
++  if (host.startsWith("[") && host.endsWith("]")) {
++    return net.isIP(host.slice(1, -1)) === 6;
++  }
++  const ip = net.isIP(host);
++  if (ip === 4 || ip === 6) return true;
++  return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/i.test(host);
++}
++
++export function createDisplayProxy(opts: DisplayProxyOptions = {}): DisplayProxy {
++  const maxViewers = Math.max(1, opts.maxViewersPerUser ?? DEFAULT_MAX_VIEWERS);
++  const idleMs = Math.max(1000, opts.idleMs ?? DEFAULT_IDLE_MS);
++  const rawUpstreamPath = opts.upstreamWsPath ?? "/websockify";
++  const upstreamWsPath = rawUpstreamPath.startsWith("/") ? rawUpstreamPath : `/${rawUpstreamPath}`;
++  const now = opts.now ?? Date.now;
++  const resolveEndpoint = opts.resolveEndpoint ?? ((userId: string) => getVmManager().desktopEndpoint(userId));
++
++  const wss = new WebSocketServer({ noServer: true });
++  const sessionsByUser = new Map<string, Set<DisplaySession>>();
++  let closing = false;
++
++  function sessionsFor(userId: string): Set<DisplaySession> {
++    let set = sessionsByUser.get(userId);
++    if (!set) {
++      set = new Set();
++      sessionsByUser.set(userId, set);
++    }
++    return set;
++  }
++
++  function closeSession(session: DisplaySession, code: number, reason: string): void {
++    if (session.idleTimer) clearTimeout(session.idleTimer);
++    session.idleTimer = null;
++    const set = sessionsByUser.get(session.userId);
++    set?.delete(session);
++    if (set && set.size === 0) sessionsByUser.delete(session.userId);
++    if (session.client.readyState === WebSocket.OPEN) session.client.close(code, reason);
++    if (session.upstream.readyState === WebSocket.OPEN) session.upstream.close(1000, "proxy closed");
++  }
++
++  function touch(session: DisplaySession): void {
++    session.lastActivity = now();
++    if (session.idleTimer) clearTimeout(session.idleTimer);
++    session.idleTimer = setTimeout(() => {
++      if (now() - session.lastActivity >= idleMs) closeSession(session, 1000, "idle timeout");
++    }, idleMs);
++    session.idleTimer.unref?.();
++  }
++
++  /** Complete the WebSocket handshake with the browser. */
++  function upgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer): Promise<WebSocket> {
++    return new Promise((resolve, reject) => {
++      try {
++        wss.handleUpgrade(req, socket, head, (ws) => resolve(ws));
++      } catch (err) {
++        reject(err);
++      }
++    });
++  }
++
++  /** Handshake, then close immediately with a custom code (policy failure). */
++  async function closeAfterUpgrade(
++    req: http.IncomingMessage,
++    socket: net.Socket,
++    head: Buffer,
++    code: number,
++    reason: string,
++  ): Promise<void> {
++    try {
++      const ws = await upgrade(req, socket, head);
++      ws.close(code, reason);
++    } catch {
++      writeUpgradeRefusal(socket, 400, "Bad WebSocket handshake.");
++    }
++  }
++
++  async function handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer): Promise<void> {
++    let url: URL;
++    try {
++      url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
++    } catch {
++      return writeUpgradeRefusal(socket, 400, "Bad request.");
++    }
++
++    if (url.pathname !== DISPLAY_WS_PATH) return writeUpgradeRefusal(socket, 404, "Not found.");
++    if (!hostAllowed(requestLike(req))) return writeUpgradeRefusal(socket, 403, "Forbidden.");
++
++    const user = requestUser(requestLike(req));
++    if (!user) {
++      await closeAfterUpgrade(req, socket, head, CLOSE_NOT_SIGNED_IN, "not signed in");
++      return;
++    }
++    if (!originAllowed(req)) return writeUpgradeRefusal(socket, 403, "Cross-site request blocked.");
++
++    let endpoint: VmDesktopEndpoint | null;
++    try {
++      endpoint = await resolveEndpoint(user.id);
++    } catch {
++      await closeAfterUpgrade(req, socket, head, CLOSE_VM_FAILED_TO_START, "VM failed to start");
++      return;
++    }
++    if (!endpoint) {
++      await closeAfterUpgrade(req, socket, head, CLOSE_NO_DISPLAY, "no display for this VM");
++      return;
++    }
++    if (!isSafeUpstreamHost(endpoint.host) || !Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535) {
++      await closeAfterUpgrade(req, socket, head, CLOSE_VM_FAILED_TO_START, "invalid display endpoint");
++      return;
++    }
++
++    const active = sessionsFor(user.id);
++    if (active.size >= maxViewers) {
++      return writeUpgradeRefusal(socket, 429, "Too many display viewers for this user.");
++    }
++    if (closing) return writeUpgradeRefusal(socket, 503, "Shutting down.");
++
++    const upstream = new WebSocket(`ws://${endpoint.host}:${endpoint.port}${upstreamWsPath}`);
++    const client = await upgrade(req, socket, head);
++    const session: DisplaySession = {
++      userId: user.id,
++      client,
++      upstream,
++      pending: [],
++      lastActivity: now(),
++      idleTimer: null,
++    };
++    active.add(session);
++    touch(session);
++
++    upstream.on("error", () => {
++      closeSession(session, CLOSE_UPSTREAM_UNAVAILABLE, "upstream unavailable");
++    });
++    upstream.on("open", () => {
++      recordAudit({ user: session.userId, action: "desktop.view", target: session.userId, result: "success" });
++      if (session.pending.length > 0) {
++        const buffered = session.pending;
++        session.pending = [];
++        for (const frame of buffered) upstream.send(frame);
++      }
++    });
++    upstream.on("message", (data) => {
++      touch(session);
++      if (client.readyState === WebSocket.OPEN) client.send(data);
++    });
++    upstream.on("close", () => {
++      closeSession(session, 1000, "upstream closed");
++    });
++
++    client.on("message", (data) => {
++      touch(session);
++      const frame = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
++      if (upstream.readyState === WebSocket.OPEN) {
++        upstream.send(frame);
++      } else {
++        session.pending.push(frame);
++      }
++    });
++    client.on("close", () => {
++      recordAudit({ user: session.userId, action: "desktop.disconnect", target: session.userId, result: "success" });
++      closeSession(session, 1000, "client closed");
++    });
++    client.on("error", () => {
++      closeSession(session, CLOSE_UPSTREAM_UNAVAILABLE, "client error");
++    });
++  }
++
++  return {
++    install(server: http.Server): void {
++      server.on("upgrade", (req, socket, head) => {
++        void handleUpgrade(req, socket as net.Socket, head).catch((err) => {
++          console.error("[display-proxy] upgrade failed:", err);
++          try {
++            writeUpgradeRefusal(socket as net.Socket, 500, "Proxy error.");
++          } catch {
++            // socket already gone
++          }
++        });
++      });
++    },
++    close(): Promise<void> {
++      closing = true;
++      for (const set of sessionsByUser.values()) {
++        for (const session of [...set]) closeSession(session, 1001, "proxy closing");
++      }
++      return new Promise((resolve) => wss.close(() => resolve()));
++    },
++    activeViewers(userId: string): number {
++      return sessionsByUser.get(userId)?.size ?? 0;
++    },
++  };
++}
+diff --git a/apps/swarmagents/package-lock.json b/apps/swarmagents/package-lock.json
+index 9709713ed..4b820b745 100644
+--- a/apps/swarmagents/package-lock.json
++++ b/apps/swarmagents/package-lock.json
+@@ -21,13 +21,16 @@
+         "react-markdown": "^10.1.0",
+         "remark-gfm": "^4.0.1",
+         "shiki": "^4.5.0",
+-        "tailwind-merge": "^3.7.0"
++        "tailwind-merge": "^3.7.0",
++        "ws": "^8.22.2"
+       },
+       "devDependencies": {
+         "@tailwindcss/postcss": "^4.3.5",
+         "@types/node": "^26.6.3",
+         "@types/react": "^19.3.0",
+         "@types/react-dom": "^19.3.0",
++        "@types/ws": "^8.18.2",
++        "esbuild": "^0.28.2",
+         "postcss": "^8.5.32",
+         "tailwindcss": "^4.3.5",
+         "tsx": "^4.23.15",
+@@ -1830,6 +1833,16 @@
+       "integrity": "sha512-ko/gIFJRv177XgZsZcBwnqJN5x/Gien8qNOn0D5bQU/zAzVf9Zt3BlcUiLqhV9y4ARk0GbT3tnUiPNgnTXzc/Q==",
+       "license": "MIT"
+     },
++    "node_modules/@types/ws": {
++      "version": "8.18.2",
++      "resolved": "https://registry.npmjs.org/@types/ws/-/ws-8.18.2.tgz",
++      "integrity": "sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/node": "*"
++      }
++    },
+     "node_modules/@ungap/structured-clone": {
+       "version": "1.4.0",
+       "resolved": "https://registry.npmjs.org/@ungap/structured-clone/-/structured-clone-1.4.0.tgz",
+@@ -5338,6 +5351,27 @@
+       "integrity": "sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==",
+       "license": "ISC"
+     },
++    "node_modules/ws": {
++      "version": "8.22.2",
++      "resolved": "https://registry.npmjs.org/ws/-/ws-8.22.2.tgz",
++      "integrity": "sha512-/rEZ2ejown2N5gxVTHUu9bVVC7ttu0/Tgzf5hbTOixR3Fs7mbbXgn2DbdbcKgJOmpQMtrIUWivtYuVMnp/W/yA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=10.0.0"
++      },
++      "peerDependencies": {
++        "bufferutil": "^4.0.1",
++        "utf-8-validate": ">=5.0.2"
++      },
++      "peerDependenciesMeta": {
++        "bufferutil": {
++          "optional": true
++        },
++        "utf-8-validate": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/zod": {
+       "version": "4.6.5",
+       "resolved": "https://registry.npmjs.org/zod/-/zod-4.6.5.tgz",
+diff --git a/apps/swarmagents/package.json b/apps/swarmagents/package.json
+index 49c03dea8..7214579b9 100644
+--- a/apps/swarmagents/package.json
++++ b/apps/swarmagents/package.json
+@@ -6,8 +6,8 @@
+   "scripts": {
+     "dev": "next dev -H 127.0.0.1 -p 3777",
+     "desktop-proxy:dev": "tsx lib/desktop-proxy/server.ts",
+-    "build": "next build && tsc -p tsconfig.desktop-proxy.json",
+-    "start": "next start -H 127.0.0.1 -p 3777",
++    "build": "next build && tsc -p tsconfig.desktop-proxy.json && esbuild server.ts --bundle --platform=node --format=cjs --outfile=server.js --external:next",
++    "start": "node server.js",
+     "typecheck": "tsc --noEmit",
+     "vm-image:build": "docker build -t swarm-vm:claude vm-image",
+     "vm-image-desktop:build": "docker build -t swarm-vm:desktop vm-image-desktop",
+@@ -21,6 +21,8 @@
+     "@types/node": "^26.6.3",
+     "@types/react": "^19.3.0",
+     "@types/react-dom": "^19.3.0",
++    "@types/ws": "^8.18.2",
++    "esbuild": "^0.28.2",
+     "postcss": "^8.5.32",
+     "tailwindcss": "^4.3.5",
+     "tsx": "^4.23.15",
+@@ -35,6 +37,7 @@
+     "next": "^15.5.27",
+     "openai": "^7.25.0",
+     "playwright-core": "^1.63.0",
++    "ws": "^8.22.2",
+     "react": "^19.3.0",
+     "react-dom": "^19.3.0",
+     "react-markdown": "^10.1.0",
+diff --git a/apps/swarmagents/server.ts b/apps/swarmagents/server.ts
+new file mode 100644
+index 000000000..da83d156b
+--- /dev/null
++++ b/apps/swarmagents/server.ts
+@@ -0,0 +1,54 @@
++/**
++ * Production entry: a small custom Node server that wraps the Next.js
++ * standalone handler and adds the authenticated display WebSocket tunnel.
++ *
++ * Next.js route handlers cannot upgrade WebSockets, so we run our own HTTP
++ * server: every normal request is handed to the Next request handler, and the
++ * display proxy's `upgrade` handler owns `/api/runtime/vm/display/ws` (see
++ * lib/vm/display-proxy.ts). Built to `server.js` by `npm run build` and run by
++ * the container (`CMD ["node", "server.js"]`).
++ */
++
++import http from "node:http";
++import next from "next";
++import { createDisplayProxy } from "./lib/vm/display-proxy";
++
++// The `next` types expose NODE_ENV as read-only; the runtime value is what
++// matters (the standalone server does the same).
++(process.env as { NODE_ENV?: string }).NODE_ENV = "production";
++
++const dir = __dirname;
++const app = next({ dev: false, dir });
++const handle = app.getRequestHandler();
++
++const port = Number(process.env.PORT ?? 3777);
++const hostname = process.env.HOSTNAME || "0.0.0.0";
++
++const displayProxy = createDisplayProxy();
++
++app.prepare().then(() => {
++  const server = http.createServer((req, res) => {
++    handle(req, res).catch(() => {
++      if (!res.headersSent) res.writeHead(500);
++      res.end();
++    });
++  });
++  displayProxy.install(server);
++
++  server.listen(port, hostname, () => {
++    // eslint-disable-next-line no-console
++    console.log(`[swarmagents] listening on ${hostname}:${port}`);
++  });
++
++  let shuttingDown = false;
++  const shutdown = () => {
++    if (shuttingDown) return;
++    shuttingDown = true;
++    displayProxy.close().finally(() => server.close(() => process.exit(0)));
++  };
++  process.on("SIGTERM", shutdown);
++  process.on("SIGINT", shutdown);
++}).catch((err) => {
++  console.error("[swarmagents] failed to start:", err);
++  process.exit(1);
++});
+-- 
+2.55.0
+

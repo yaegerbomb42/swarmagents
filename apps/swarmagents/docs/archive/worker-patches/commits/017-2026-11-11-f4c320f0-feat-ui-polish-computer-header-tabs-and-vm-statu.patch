@@ -1,0 +1,211 @@
+From f4c320f02cc4ba0092ee3c9cc0be1098191c23e7 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 13:27:29 -0600
+Subject: [PATCH] feat(ui): polish computer header tabs and VM status pill
+
+---
+ .../src/components/ComputerScreen.tsx         | 170 ++++++++++++------
+ 1 file changed, 119 insertions(+), 51 deletions(-)
+
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index 9f480305d..67421d33b 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -36,6 +36,28 @@ interface ComputerScreenProps {
+ 
+ const CHAR_LIMIT = 4000;
+ 
++const VIEW_TABS = [
++  { view: "terminal", label: "Terminal", Icon: Terminal },
++  { view: "browser", label: "Browser", Icon: Globe },
++  { view: "files", label: "Files", Icon: FileText },
++  { view: "telemetry", label: "Telemetry", Icon: Cpu },
++] as const;
++
++const VM_STATUS_STYLES = {
++  booting: {
++    pill: "border-amber-400/30 bg-amber-500/15 text-amber-300",
++    dot: "bg-amber-400 animate-pulse",
++  },
++  ready: {
++    pill: "border-emerald-400/30 bg-emerald-500/15 text-emerald-300",
++    dot: "bg-emerald-400",
++  },
++  error: {
++    pill: "border-rose-400/30 bg-rose-500/15 text-rose-300",
++    dot: "bg-rose-400",
++  },
++} as const;
++
+ function summarizeInput(input: unknown): string {
+   if (input == null) return "";
+   const text = typeof input === "string" ? input : JSON.stringify(input);
+@@ -256,6 +278,42 @@ export function ComputerScreen({
+     0,
+   );
+ 
++  // Derive the VM status from the run stream's lifecycle events (plus any
++  // in-flight reset) so the header pill reflects the sandbox without new props.
++  let vmStatus: keyof typeof VM_STATUS_STYLES = "ready";
++  for (const item of stream.items) {
++    if (item.kind === "vm.starting") vmStatus = "booting";
++    else if (item.kind === "vm.ready") vmStatus = "ready";
++    else if (item.kind === "vm.error") vmStatus = "error";
++  }
++  if (vmResetting) vmStatus = "booting";
++  const vmStatusStyle = VM_STATUS_STYLES[vmStatus];
++
++  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
++  const onTabKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
++    const current = VIEW_TABS.findIndex((tab) => tab.view === activeView);
++    let next: number;
++    switch (e.key) {
++      case "ArrowRight":
++        next = (current + 1) % VIEW_TABS.length;
++        break;
++      case "ArrowLeft":
++        next = (current - 1 + VIEW_TABS.length) % VIEW_TABS.length;
++        break;
++      case "Home":
++        next = 0;
++        break;
++      case "End":
++        next = VIEW_TABS.length - 1;
++        break;
++      default:
++        return;
++    }
++    e.preventDefault();
++    onToggleView(VIEW_TABS[next].view);
++    tabRefs.current[next]?.focus();
++  };
++
+   // --- terminal input: shell runs + history ---
+   const [shellRunId, setShellRunId] = useState<string>();
+   const [runningShellRunId, setRunningShellRunId] = useState<string>();
+@@ -376,61 +434,71 @@ export function ComputerScreen({
+   return (
+     <div className="w-full max-w-5xl mx-auto rounded-3xl bg-[#0d0d12] border border-white/15 shadow-[0_25px_70px_rgba(0,0,0,0.8)] overflow-hidden flex flex-col mb-6 backdrop-blur-2xl">
+       {/* 1. OS Window Titlebar */}
+-      <div className="bg-[#14141c] border-b border-white/10 px-4 py-2.5 flex items-center justify-between select-none">
+-        {/* Mac OS Style Window Dots */}
+-        <div className="flex items-center gap-2">
+-          <button
+-            onClick={onResetVm}
+-            title="Reset / Wipe Linux Computer"
+-            className="w-3 h-3 rounded-full bg-rose-500 hover:bg-rose-600 transition-colors"
+-          />
+-          <div className="w-3 h-3 rounded-full bg-amber-500/80" />
+-          <div className="w-3 h-3 rounded-full bg-emerald-500/80" />
+-          <span className="ml-3 text-[11px] font-mono text-white/50 flex items-center gap-1.5">
+-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+-            agent-vm-01 (Debian 12 Bookworm) · {activeRoleName}
+-          </span>
++      <div className="bg-[#14141c] border-b border-white/10 px-4 py-2.5 flex items-center justify-between gap-3 select-none">
++        {/* Mac OS Style Window Dots + VM identity */}
++        <div className="flex min-w-0 items-center gap-2">
++          <div className="flex shrink-0 items-center gap-2">
++            <button
++              onClick={onResetVm}
++              title="Reset / Wipe Linux Computer"
++              className="w-3 h-3 rounded-full bg-rose-500 hover:bg-rose-600 transition-colors"
++            />
++            <div className="w-3 h-3 rounded-full bg-amber-500/80" />
++            <div className="w-3 h-3 rounded-full bg-emerald-500/80" />
++          </div>
++          <div className="ml-2 flex min-w-0 items-center gap-2">
++            <span
++              className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-mono ${vmStatusStyle.pill}`}
++              title={`VM status: ${vmStatus}`}
++            >
++              <span className={`h-1.5 w-1.5 rounded-full ${vmStatusStyle.dot}`} />
++              agent-vm-01
++              <span className="uppercase tracking-[0.08em] opacity-80">{vmStatus}</span>
++            </span>
++            <span className="hidden truncate text-[11px] font-mono text-white/40 md:inline">
++              (Debian 12 Bookworm) · {activeRoleName}
++            </span>
++          </div>
+         </div>
+ 
+-        {/* View Switcher Tabs */}
+-        <div className="flex items-center gap-1 bg-black/50 p-0.5 rounded-xl border border-white/10 text-xs">
+-          <button
+-            onClick={() => onToggleView("terminal")}
+-            className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-[11px] font-mono transition-colors ${
+-              activeView === "terminal" ? "bg-white/20 text-white font-medium" : "text-white/40 hover:text-white"
+-            }`}
+-          >
+-            <Terminal className="w-3 h-3" /> Terminal
+-          </button>
+-          <button
+-            onClick={() => onToggleView("browser")}
+-            className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-[11px] font-mono transition-colors ${
+-              activeView === "browser" ? "bg-white/20 text-white font-medium" : "text-white/40 hover:text-white"
+-            }`}
+-          >
+-            <Globe className="w-3 h-3" /> Browser
+-          </button>
+-          <button
+-            onClick={() => onToggleView("files")}
+-            className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-[11px] font-mono transition-colors ${
+-              activeView === "files" ? "bg-white/20 text-white font-medium" : "text-white/40 hover:text-white"
+-            }`}
+-          >
+-            <FileText className="w-3 h-3" /> Files
+-          </button>
+-          <button
+-            onClick={() => onToggleView("telemetry")}
+-            className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-[11px] font-mono transition-colors ${
+-              activeView === "telemetry" ? "bg-white/20 text-white font-medium" : "text-white/40 hover:text-white"
+-            }`}
+-          >
+-            <Cpu className="w-3 h-3" /> Telemetry
+-          </button>
++        {/* View Switcher Tabs — single pill group with roving arrow-key focus */}
++        <div
++          role="group"
++          aria-label="Computer views"
++          onKeyDown={onTabKeyDown}
++          className="flex shrink-0 items-center gap-0.5 rounded-full border border-white/10 bg-black/60 p-0.5 text-xs shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
++        >
++          {VIEW_TABS.map(({ view, label, Icon }, index) => {
++            const active = activeView === view;
++            return (
++              <button
++                key={view}
++                ref={(el) => {
++                  tabRefs.current[index] = el;
++                }}
++                onClick={() => onToggleView(view)}
++                aria-pressed={active}
++                tabIndex={active ? 0 : -1}
++                className={`relative flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-mono transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 ${
++                  active
++                    ? "bg-cyan-500/20 text-white font-medium shadow-[0_0_14px_rgba(34,211,238,0.12)]"
++                    : "text-white/45 hover:bg-white/5 hover:text-white/85"
++                }`}
++              >
++                <Icon className="w-3 h-3" /> {label}
++                {active && (
++                  <span className="absolute inset-x-2 bottom-0.5 h-0.5 rounded-full bg-cyan-400" />
++                )}
++              </button>
++            );
++          })}
+         </div>
+ 
+-        {/* Right Status */}
+-        <div className="flex items-center gap-2 text-[11px] font-mono text-white/40">
+-          <span>/data/workspace</span>
++        {/* Right-aligned cwd — truncates with the full path in a tooltip */}
++        <div className="flex min-w-0 max-w-[150px] items-center justify-end text-[11px] font-mono text-white/40">
++          <span className="truncate text-right" title="/data/workspace">
++            /data/workspace
++          </span>
+         </div>
+       </div>
+ 
+-- 
+2.55.0
+

@@ -34,6 +34,15 @@ One-time key setup, the server-side contract (what the VPS script reads from thi
 - Deploy workflows run only on manual dispatch from `main`, never for pull requests or forks.
 - The `apps/swarmagents/` path is read by the VPS script; do not move it.
 
+## Assets and Git LFS
+
+The VPS builds from a plain git mirror and **never runs git-lfs**, so an LFS-tracked file the build needs would be served as pointer text.
+
+- Small web and brand assets (anything under `apps/swarmagents/public/`, `app/` icons, `apps/swarmagents/branding/`, fonts, favicons, under ~5 MB) are **normal git files**. `.gitattributes` exempts those paths from the LFS patterns.
+- Big or non-runtime media (promo video, screenshots, large logs, bench artifacts, datasets) go in Git LFS or external storage.
+- Never let the server build or runtime depend on an LFS file. To add a runtime asset outside the exempted paths, add its path to the exemptions in `.gitattributes` first, then `git add` it.
+- Check with `git cat-file -p :<path> | head -c 40`: it must not start with `version https://git-lfs`.
+
 ## One-time server cutover (owner, on the VPS)
 
 The installed server script `deploy/deploy.sh` builds from a bare git mirror and a worktree that still point at the earlier private repo.

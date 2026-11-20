@@ -19,3 +19,8 @@ dataset.jsonl filter=lfs diff=lfs merge=lfs -text
 # Next.js app icons are committed as normal binaries, not LFS pointers.
 apps/swarmagents/app/icon.png -filter -diff -merge -text
 apps/swarmagents/app/apple-icon.png -filter -diff -merge -text
+
+# Small web/brand assets are normal git blobs, NOT LFS: the VPS deploy rsyncs from a
+# plain git mirror that never runs git-lfs. See docs/deploy/README.md.
+apps/swarmagents/public/** -filter -diff -merge -text
+apps/swarmagents/branding/** -filter -diff -merge -text

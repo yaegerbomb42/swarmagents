@@ -1,0 +1,1 @@
+{"tag":"task-01-fix-typescript-errors/omnexx/r1","task":"task-01-fix-typescript-errors","agent":"omnexx","rep":1,"state":"error","startedAt":"2026-11-12T22:32:00.308Z","finishedAt":"2026-11-12T22:32:11.860Z","tokens":{"fresh":0,"cached":0,"output":0,"requests":0},"error":"Error: omnexx left no run state in /var/folders/tk/8pxhdgm91j3cn59vq8p80_lh0000gn/T/omnexx-bench-C0ct1n"}

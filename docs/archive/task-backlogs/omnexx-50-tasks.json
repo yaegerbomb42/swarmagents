@@ -1,0 +1,1003 @@
+[
+  {
+    "id": "bug-plan-cycle",
+    "title": "Reject cyclic dependsOn in applyPlanUpdate so a run can't stall as 'nothing runnable'",
+    "area": "core",
+    "why": "A planner can write M1.T01 dependsOn [M1.T02] and M1.T02 dependsOn [M1.T01]; validation only rejects unknown ids and self-deps, so the cycle is accepted, both tasks are unrunnable forever, and select() falls through to needs-human. Found in bug hunt 2 (#1, HIGH).",
+    "files": ["src/core/plan.ts", "test/unit/core/plan.test.ts"],
+    "steps": [
+      "In applyPlanUpdate, after the unknown-id/self-dep check, run a DFS/topological check over dependsOn edges.",
+      "Reject with a StateError naming the cycle, e.g. '<id> depends on <id> in a cycle', so the planner's write_plan retry path surfaces it.",
+      "Cover 2-cycles, 3-cycles, self-deps (already rejected), and diamond DAGs (still accepted)."
+    ],
+    "acceptance": [
+      "A 2-cycle and a 3-cycle are rejected with an error naming a node in the cycle.",
+      "A diamond DAG (A -> B,C -> D) is accepted and runnableTasks returns the roots.",
+      "Full unit suite passes; no other plan validation behavior changes."
+    ],
+    "tests": ["test/unit/core/plan.test.ts: cycle rejection, diamond acceptance, runnableTasks after cycle attempt"],
+    "est_lines": 60,
+    "risk": "low"
+  },
+  {
+    "id": "bug-quota-429",
+    "title": "Stop classifying transient 429 rate limits as quota exhaustion in isQuotaError",
+    "area": "core",
+    "why": "The quota regex includes 'limit (exceeded|reached)', which matches standard transient rate-limit wording ('Rate limit exceeded. Try again in 20s'). One per-minute blip then marks the model exhausted for 24h in the shared ledger instead of the 5-minute rate-limit mark. Found in bug hunt 2 (#2, HIGH).",
+    "files": ["src/providers/sticky.ts", "test/unit/providers/sticky.test.ts"],
+    "steps": [
+      "Remove 'limit (exceeded|reached)' from the quota regex, or require a quota/billing/credit word alongside it.",
+      "Keep the 400-quota carve-out and all genuinely quota wordings (quota, exhaust, insufficient, billing, balance, out of credit/token).",
+      "Add cases: 429 'Rate limit exceeded. Try again in 20s.' is NOT quota; 429 'quota exceeded for model' IS quota."
+    ],
+    "acceptance": [
+      "Transient 429 messages return isQuotaError false; true quota messages still return true.",
+      "The 5-minute markRateLimited path in loop.ts is reachable for bare 429s.",
+      "Full unit suite passes."
+    ],
+    "tests": ["test/unit/providers/sticky.test.ts: isQuotaError transient-429 vs quota-429 cases"],
+    "est_lines": 40,
+    "risk": "low"
+  },
+  {
+    "id": "bug-filelock-ttl",
+    "title": "Arm a timer so file-lock TTL expiry actually wakes waiters",
+    "area": "core",
+    "why": "pruneExpired() only runs from acquire()/activeLocks(), so a waiter behind a dead owner's TTL'd lock waits out its full timeoutMs and fails even though the lock expired long ago. The TTL 'backstop against a dead owner' only works by accident. Found in bug hunt 2 (#3, HIGH).",
+    "files": ["src/workers/file-locks.ts", "test/unit/workers/file-locks.test.ts"],
+    "steps": [
+      "On grant (and when a waiter queues), arm a setTimeout for the earliest expiresAt that calls pruneExpired() then wakeWaiters().",
+      "Re-arm after each prune if a later expiry remains; clear the timer when the lock set empties.",
+      "Keep the timer unref'd so it never keeps the process alive, and handle the case where the process exits with a pending acquire."
+    ],
+    "acceptance": [
+      "A holds a region with ttlMs 50; B waits with timeoutMs 2000 and is granted at ~50ms.",
+      "No timer is left armed once all locks are released.",
+      "Existing file-lock tests pass."
+    ],
+    "tests": ["test/unit/workers/file-locks.test.ts: waiter granted on TTL expiry, no timer leak after release"],
+    "est_lines": 80,
+    "risk": "medium"
+  },
+  {
+    "id": "bug-mcp-restart",
+    "title": "Only restart-and-retry MCP calls on transport errors; never re-execute a tool that already ran",
+    "area": "core",
+    "why": "callTool's catch covers both connectServer and execute(), so a tool-level error (e.g. -32602 invalid params) triggers a restart and a second execution of a possibly non-idempotent tool. Separately, transport.onerror and the callTool catch can fire concurrent restartServer calls, orphaning a server child process. Also crashedOnce is never reset, so auto-restart works once per process lifetime. Found in bug hunt 2 (#7, #8, MEDIUM).",
+    "files": ["src/mcp/client-manager.ts", "test/unit/mcp/client-manager.test.ts"],
+    "steps": [
+      "Split the try/catch: connection errors retry after restart; errors thrown by execute() (tool-level/JSON-RPC) propagate immediately without restart or re-execution.",
+      "Serialize restarts with one in-flight restart promise per server so onerror and callTool can't double-restart.",
+      "Reset crashedOnce to false on successful connectServer (or replace with a timestamped restart + cooldown)."
+    ],
+    "acceptance": [
+      "A tool that throws -32602 is executed exactly once and no restart happens.",
+      "A transport drop mid-call restarts once and re-executes once.",
+      "Two crashes a minute apart both auto-restart.",
+      "No orphaned child process after a double-crash sequence."
+    ],
+    "tests": ["test/unit/mcp/client-manager.test.ts: tool-error no-retry, transport-drop single restart, crashedOnce reset on reconnect"],
+    "est_lines": 120,
+    "risk": "medium"
+  },
+  {
+    "id": "bug-shell-quote",
+    "title": "Quote goal text interpolated into inferred acceptance-check shell commands",
+    "area": "core",
+    "why": "inferCheckCommand interpolates goal text into double-quoted shell with no escaping, so a pasted criterion containing a quote, $(), or ; can break the check (task parked as 'check may be wrong') or execute arbitrary shell in the worktree unattended. Found in bug hunt 2 (#6, MEDIUM).",
+    "files": ["src/verify/acceptance-checks.ts", "test/unit/verify/acceptance-checks.test.ts"],
+    "steps": [
+      "Add a small shell single-quote helper in acceptance-checks.ts (wrap in '...', escape embedded ' as '\\'').",
+      "Use it for word/excluded in the grep patterns and for cmd in the 'passes with tests' pattern; do not pass raw goal text to the shell.",
+      "Reject (return undefined) criteria whose command part contains a newline instead of emitting a check."
+    ],
+    "acceptance": [
+      "Goal 'No file mentions `foo\" ; rm -rf src ; echo `' produces a grep command that matches the literal text and executes nothing.",
+      "'x$(whoami)' is treated as literal text, not command substitution.",
+      "Normal criteria produce byte-identical commands to before."
+    ],
+    "tests": ["test/unit/verify/acceptance-checks.test.ts: quote-breakout, command-substitution, normal-criteria unchanged"],
+    "est_lines": 70,
+    "risk": "medium"
+  },
+  {
+    "id": "bug-secrets-atomic",
+    "title": "Atomic writes and corrupt-file refusal for mcp-secrets.json and mcp-oauth.json",
+    "area": "core",
+    "why": "readSecrets/readAll swallow all errors so a truncated file reads as empty, and writeServerSecrets/update write with plain writeFile, so the next store after a crash mid-write silently destroys every other server's secrets and OAuth tokens. Found in bug hunt 2 (#9, MEDIUM).",
+    "files": ["src/integrations/secrets.ts", "src/mcp/oauth.ts", "test/unit/integrations/secrets.test.ts"],
+    "steps": [
+      "Write both files via tmp file + rename (same pattern as QuotaLedger.write), keeping the 0600 mode.",
+      "On JSON parse failure, rename the corrupt file to <name>.corrupt-<timestamp> and throw instead of returning {}.",
+      "Cover both modules in the one new test file; keep the read API shape (missing file still reads as {})."
+    ],
+    "acceptance": [
+      "A truncated mcp-secrets.json is preserved as a .corrupt backup and readSecrets throws instead of returning {}.",
+      "A kill mid-write can no longer truncate either file (write is atomic).",
+      "Normal store/read round-trips unchanged; missing file still returns {}."
+    ],
+    "tests": ["test/unit/integrations/secrets.test.ts: corrupt-file backup + throw, atomic write, round-trip, missing file"],
+    "est_lines": 110,
+    "risk": "medium"
+  },
+  {
+    "id": "bug-testcounts",
+    "title": "Anchor testCounts to vitest's 'Tests' line instead of reading 'Test Files' counts",
+    "area": "core",
+    "why": "The unanchored vitest pattern matches the 'Test Files' line first, so a suite that is 12/13 failing is counted as 2 passed / 1 failed, suiteImplausible returns false, and a broken spec suite is kept (fix rounds burned) while failedBefore undercounts and skews the spec-gate revert decision. Found in bug hunt 2 (#4, MEDIUM).",
+    "files": ["src/verify/spec-tests.ts", "test/unit/verify/spec-tests.test.ts"],
+    "steps": [
+      "Anchor the vitest/jest count patterns to the 'Tests' line (e.g. /^Tests\\s+(\\d+) failed/m), keeping the node --test patterns first.",
+      "Fall back to the loose pattern only when no 'Tests' line exists in the output.",
+      "Add the exact trigger output from the bug report as a regression case."
+    ],
+    "acceptance": [
+      "Output 'Test Files 1 failed | 2 passed' + 'Tests 12 failed | 1 passed' returns {pass: 1, fail: 12}.",
+      "suiteImplausible returns true for that output (0.92 > 0.5).",
+      "Outputs with no 'Tests' line still parse via the fallback."
+    ],
+    "tests": ["test/unit/verify/spec-tests.test.ts: vitest Test-Files-vs-Tests, fallback, node --test unchanged"],
+    "est_lines": 50,
+    "risk": "low"
+  },
+  {
+    "id": "bug-toml-dotted",
+    "title": "Teach removeTable/setTable to handle dotted-key TOML tables",
+    "area": "core",
+    "why": "removeTable only sees [table] headers, so an entry written as dotted keys under a parent header ([mcp.servers] + github.command) is invisible: setTable appends a duplicate table and parse() throws, and disconnect() deletes the secrets while leaving the server entry (half-disconnect). Found in bug hunt 2 (#10, MEDIUM).",
+    "files": ["src/integrations/toml-edit.ts", "test/unit/integrations/toml-edit.test.ts"],
+    "steps": [
+      "In removeTable, also strip dotted keys belonging to the target table: lines starting with the leaf key + '.' under any ancestor header, and 'servers.github.…' dotted keys under [mcp].",
+      "Keep header-form removal byte-identical; return removed: true when dotted keys were stripped.",
+      "Add cases: setTable over a dotted entry succeeds without a redefine error; removeTable on a dotted entry removes it."
+    ],
+    "acceptance": [
+      "A config with [mcp.servers] + github.command can be edited by setTable without a parse error.",
+      "removeTable on a dotted entry returns removed: true and the entry is gone.",
+      "Header-form tables behave exactly as before."
+    ],
+    "tests": ["test/unit/integrations/toml-edit.test.ts: dotted setTable, dotted removeTable, header-form unchanged"],
+    "est_lines": 90,
+    "risk": "medium"
+  },
+  {
+    "id": "bug-anchor-hash",
+    "title": "Reject 2-char expected_hash on multi-line replace_lines ranges",
+    "area": "core",
+    "why": "locateRange doubles a 2-char hash, which is only correct when start == end. On a multi-line range it demands startTag == endTag == expected, so the hash check, whole-file rescan, and both fuzzy recoveries all fail even when the lines are unchanged. Found in bug hunt 2 (#13, MEDIUM).",
+    "files": ["src/tools/anchors.ts", "test/unit/tools/anchors.test.ts"],
+    "steps": [
+      "In locateRange, when expected is 2 chars and start !== end, return {ok: false} with a clear reason telling the caller to use the 4-char hash.",
+      "Keep the 2-char path for single-line ranges and the 4-char path unchanged.",
+      "Add the exact trigger from the bug report as a regression case."
+    ],
+    "acceptance": [
+      "replace_lines lines 10-20 with a 2-char hash fails fast with a message naming the 4-char hash.",
+      "The same range with the 4-char hash succeeds; single-line 2-char hashes still succeed.",
+      "No other anchor behavior changes."
+    ],
+    "tests": ["test/unit/tools/anchors.test.ts: 2-char multi-line rejection, 4-char multi-line ok, 1-line 2-char ok"],
+    "est_lines": 40,
+    "risk": "low"
+  },
+  {
+    "id": "bug-workers-quota",
+    "title": "Guard QuotaStore.read() against corrupt workers/state.json instead of throwing SyntaxError",
+    "area": "core",
+    "why": "QuotaStore.read() does fileSchema.safeParse(JSON.parse(text)), so a truncated state.json throws before safeParse runs; blocked() is called before the try in runWorkerCycle, so one corrupt file aborts the whole worker cycle. Found in bug hunt 2 (#9, MEDIUM).",
+    "files": ["src/workers/quota.ts", "test/unit/workers/quota.test.ts"],
+    "steps": [
+      "Wrap JSON.parse in try/catch in read(); on failure return {} and rename the corrupt file to state.json.corrupt-<timestamp> so the corruption isn't silently lost.",
+      "Keep the safeParse shape fallback ({}) for well-formed but wrong-shaped files.",
+      "Add cases: corrupt JSON, wrong shape, valid file."
+    ],
+    "acceptance": [
+      "state.json containing 'this is not json{{{' makes blocked() return undefined and record() succeed.",
+      "The corrupt file is preserved with a .corrupt suffix.",
+      "Valid and wrong-shaped files behave as before."
+    ],
+    "tests": ["test/unit/workers/quota.test.ts: corrupt JSON, wrong shape, valid round-trip"],
+    "est_lines": 45,
+    "risk": "low"
+  },
+  {
+    "id": "cli-runs-filters",
+    "title": "omnexx runs gains --status, --since, and --limit filters",
+    "area": "cli",
+    "why": "runs lists every run with no way to narrow it; on a busy repo the operator scrolls past dozens of finished runs to find the one still working or the one from today. Filtering is the cheapest way to make runs usable as a daily tool.",
+    "files": ["src/cli/commands/control.ts", "test/unit/cli/control.test.ts"],
+    "steps": [
+      "Add --status <working|done|failed|paused>, --since <duration like 24h/7d>, and --limit <n> options to the runs command in control.ts.",
+      "Filter in runsCommand before printing; --since parses with the existing duration helper in src/config/duration.ts.",
+      "Keep --json output shape identical, filtered the same way; --limit defaults to 20."
+    ],
+    "acceptance": [
+      "`omnexx runs --status working` lists only non-terminal runs.",
+      "`omnexx runs --since 24h --limit 5` lists at most 5 runs started in the last day.",
+      "`omnexx runs --json --status failed` returns valid JSON with only failed runs."
+    ],
+    "tests": ["test/unit/cli/control.test.ts: status filter, since filter, limit, json + filter combined"],
+    "est_lines": 110,
+    "risk": "low"
+  },
+  {
+    "id": "cli-shell-completions",
+    "title": "Shell completions for bash, zsh, and fish",
+    "area": "cli",
+    "why": "Every command, subcommand, and flag has to be typed from memory; a single `omnexx completion <shell>` that prints a script makes the CLI discoverable and cuts typos on long option names like --i-know-there-are-no-checks. No completion support exists today.",
+    "files": ["src/cli/completions.ts", "src/cli/program.ts", "test/unit/cli/completions.test.ts"],
+    "steps": [
+      "Add src/cli/completions.ts that walks the commander program tree and emits a completion script for bash, zsh, and fish (commands, subcommands, flags, and static value lists like --sandbox host|docker and --mode swe|general).",
+      "Register `omnexx completion <shell>` in program.ts with exactly one line of wiring; reject unknown shells with a usage error listing the three.",
+      "Generate the script for each shell in tests and assert every top-level command name appears."
+    ],
+    "acceptance": [
+      "`omnexx completion bash|zsh|fish` prints a non-empty script containing all top-level commands.",
+      "`omnexx completion powershell` fails with a usage error naming the three supported shells.",
+      "The bash script completes `omnexx run --s` to the --sandbox/--status family (spot-check by sourcing in bash)."
+    ],
+    "tests": ["test/unit/cli/completions.test.ts: all three shells contain every command, unknown shell errors"],
+    "est_lines": 200,
+    "risk": "medium"
+  },
+  {
+    "id": "core-run-history-summary",
+    "title": "RunHistory gains a summary() API: success rate, median cost/duration, per-model breakdown",
+    "area": "core",
+    "why": "Run history is only a list of samples; nothing answers 'how often do runs succeed, what do they cost, which model is cheapest per success'. A summary API turns the history file into the input for estimates, reports, and the status view instead of each caller re-aggregating.",
+    "files": ["src/core/run-history.ts", "test/unit/core/run-history.test.ts"],
+    "steps": [
+      "Add summary(history) returning totals, success rate, median duration and cost, and a per-model breakdown (runs, success rate, median cost).",
+      "Handle empty history (all zeros, no division by zero) and samples missing cost/duration.",
+      "Cap the scan at MAX_RUN_SAMPLES (200) as loadRunHistory already does."
+    ],
+    "acceptance": [
+      "summary() over a mixed sample set returns the correct medians and per-model rates.",
+      "Empty history returns zeros without throwing.",
+      "No changes to the on-disk format or to recordRun/appendRunSample."
+    ],
+    "tests": ["test/unit/core/run-history.test.ts: summary medians, per-model breakdown, empty history"],
+    "est_lines": 90,
+    "risk": "low"
+  },
+  {
+    "id": "vscode-engine-cache",
+    "title": "Cache the resolved VS Code engine so every call doesn't re-probe for the omnexx binary",
+    "area": "vscode",
+    "why": "engine() is called on nearly every extension action (chat, runs, history) and each call re-probes for the bundled/global omnexx binary. Caching the resolved engine per session removes repeated spawn/stat work from the hot path and makes the UI snappier.",
+    "files": ["vscode/src/engine.ts", "test/unit/vscode-engine.test.ts"],
+    "steps": [
+      "Cache the resolved Engine after the first successful engine() call; return the cached value on later calls.",
+      "Invalidate the cache in refreshEngine() (already the intended refresh point) and when the resolved binary disappears (spawn ENOENT).",
+      "Add tests: second call returns the identical object without re-probing; refreshEngine() forces a fresh probe."
+    ],
+    "acceptance": [
+      "Two engine() calls in one session resolve the binary once (probe count 1).",
+      "refreshEngine() makes the next engine() call probe again.",
+      "A cached engine whose binary was deleted falls back to a fresh probe instead of failing."
+    ],
+    "tests": ["test/unit/vscode-engine.test.ts: cache hit, refresh invalidates, missing binary re-probes"],
+    "est_lines": 70,
+    "risk": "low"
+  },
+  {
+    "id": "cli-print-save",
+    "title": "omnexx -p gains --save <file> to write the reply to a file",
+    "area": "cli",
+    "why": "A one-shot -p reply today only goes to stdout, so scripting around it means shell redirection with no record of the prompt that produced it. --save writes the reply plus a header (prompt, model, timestamp) to a file, making -p usable as a cheap notes/answer generator.",
+    "files": ["src/cli/print.ts", "test/unit/cli/print.test.ts"],
+    "steps": [
+      "Add a --save <path> option to the root program's -p flow; after a successful turn, write the reply with a '# prompt / model / time' header to the path (create parent dirs).",
+      "Fail with a clean error (no partial file) when the path is not writable; --save works in both text and --json modes (JSON mode still prints the PrintResult to stdout).",
+      "Refuse to overwrite an existing file unless --force is also given."
+    ],
+    "acceptance": [
+      "`omnexx -p 'hi' --save out.md` writes out.md with the reply and a header naming the prompt and model.",
+      "`--save` to an unwritable path exits non-zero with a clean error and no file created.",
+      "`--save` over an existing file fails unless --force is passed."
+    ],
+    "tests": ["test/unit/cli/print.test.ts: save writes header + reply, unwritable path errors, existing file refused without --force"],
+    "est_lines": 100,
+    "risk": "low"
+  },
+  {
+    "id": "core-atomic-fsync",
+    "title": "fsync the directory after atomic writes so renames survive a crash",
+    "area": "core",
+    "why": "writeFileAtomic/writeJsonAtomic use tmp+rename, which is atomic within the OS but not durable: on a power loss or OS crash the rename itself can vanish, so a 'saved' config or ledger can silently revert. fsyncing the directory entry after rename closes that hole for the files that matter most (secrets, ledger, run state).",
+    "files": ["src/core/atomic.ts", "test/unit/core/atomic.test.ts"],
+    "steps": [
+      "After the rename in writeFileAtomic, open the parent directory and fsync it (best-effort on platforms where directory fsync is unavailable, e.g. Windows).",
+      "Keep writeJsonAtomic delegating to writeFileAtomic so both paths gain durability.",
+      "Add a test that writes, kills nothing, and reads back; plus a test that a failed fsync does not fail the write."
+    ],
+    "acceptance": [
+      "writeFileAtomic still writes the exact bytes and renames atomically.",
+      "Directory fsync is attempted on POSIX and skipped cleanly on Windows.",
+      "A simulated fsync failure does not fail the write."
+    ],
+    "tests": ["test/unit/core/atomic.test.ts: round-trip, fsync attempted, fsync failure tolerated"],
+    "est_lines": 60,
+    "risk": "low"
+  },
+  {
+    "id": "prov-key-rotation",
+    "title": "Rotate to the next provider key on 401 and mark the bad one",
+    "area": "core",
+    "why": "key-rotation.ts exists but a revoked key fails every call until the operator notices and edits config by hand. Rotating automatically on 401 (and remembering which key failed, with a cooldown) turns a dead key from a run-killing outage into one retried request.",
+    "files": ["src/providers/key-rotation.ts", "test/unit/providers/key-rotation.test.ts"],
+    "steps": [
+      "On a 401/403 from a provider call, mark the current key bad (with a timestamped cooldown) and retry once with the next key in rotation.",
+      "Persist the bad-key marks alongside the rotation state so a restart doesn't retry a known-dead key immediately.",
+      "When all keys are marked bad, fail with an error listing the keys tried (redacted) instead of looping."
+    ],
+    "acceptance": [
+      "First key 401s, second key succeeds: the call succeeds and the first key is marked bad.",
+      "All keys bad: the error names the provider and the number of keys tried, with no key material.",
+      "A bad key is retried after its cooldown expires."
+    ],
+    "tests": ["test/unit/providers/key-rotation.test.ts: rotate on 401, all-keys-bad error, cooldown expiry"],
+    "est_lines": 130,
+    "risk": "medium"
+  },
+  {
+    "id": "agent-compaction",
+    "title": "Compaction preserves the plan and lastGreen so a compacted run doesn't lose its place",
+    "area": "core",
+    "why": "Compaction squeezes the agent's context, but if the plan and the last-green commit fall out of the summary, the resumed agent re-plans from scratch or re-does finished milestones. Preserving those two anchors makes compaction safe to run mid-run.",
+    "files": ["src/agent/compaction.ts", "test/unit/agent/compaction.test.ts"],
+    "steps": [
+      "Define the compaction summary contract: it must always include the current plan (milestones + task statuses), lastGreen, and the active task id.",
+      "Add a check that rejects a summary missing any anchor (fall back to the pre-compaction context instead of proceeding with a lossy summary).",
+      "Add tests: compact a run mid-milestone and verify the plan, lastGreen, and active task survive."
+    ],
+    "acceptance": [
+      "A compacted summary always contains plan milestones with statuses, lastGreen, and the active task.",
+      "A summary missing an anchor is rejected and the old context is kept.",
+      "Existing compaction tests pass."
+    ],
+    "tests": ["test/unit/agent/compaction.test.ts: anchors preserved, missing anchor rejected"],
+    "est_lines": 100,
+    "risk": "medium"
+  },
+  {
+    "id": "verify-flaky-quarantine",
+    "title": "Quarantine a flaky test after N flakes instead of failing the run",
+    "area": "core",
+    "why": "A test that passes on retry still fails the gate on its first failure, so one flaky test can stall a run that is otherwise green. Quarantining it after a threshold (recorded, visible, re-checked later) keeps the run moving while the flake stays tracked instead of silently ignored.",
+    "files": ["src/verify/flaky.ts", "test/unit/verify/flaky.test.ts"],
+    "steps": [
+      "Track per-test flake counts in flaky.ts; when a test flakes (fails then passes on retry) N times (default 3), mark it quarantined.",
+      "Quarantined tests are skipped in the gate but listed in the run report and re-checked on the next run (one re-check per run).",
+      "Persist quarantine state in the run dir so it survives restarts; never quarantine a test that fails consistently."
+    ],
+    "acceptance": [
+      "A test flaking 3 times is quarantined, the gate passes, and the report names it.",
+      "A consistently failing test is never quarantined.",
+      "A quarantined test is re-checked on the next run and unquarantined if it passes cleanly twice."
+    ],
+    "tests": ["test/unit/verify/flaky.test.ts: quarantine threshold, consistent failure never quarantined, re-check unquarantines"],
+    "est_lines": 140,
+    "risk": "medium"
+  },
+  {
+    "id": "git-pr-body",
+    "title": "Fill new PR bodies from the run's REPORT.md",
+    "area": "core",
+    "why": "PRs opened from omnexx runs get an empty or generic body, so reviewers open a diff with no context about what the run did, which gates passed, or what it cost. The run already writes REPORT.md with all of that — using it as the PR body is free context.",
+    "files": ["src/git/pr.ts", "test/unit/git/pr.test.ts"],
+    "steps": [
+      "Add a function that renders a PR body from a run's report: goal, milestones done, gates (tests/lint/typecheck), cost, and the run id.",
+      "Cap the body at a sane length (truncate the report's verbose sections, keep the summary + gate table).",
+      "Wire it into the existing PR creation path as the default body, with a flag to pass a custom body instead."
+    ],
+    "acceptance": [
+      "A PR created from a run has a body naming the goal, gates, and cost.",
+      "Bodies over the cap are truncated with a note, never cut mid-table.",
+      "A custom --body still overrides the generated one."
+    ],
+    "tests": ["test/unit/git/pr.test.ts: body from report, truncation, custom body override"],
+    "est_lines": 110,
+    "risk": "low"
+  },
+  {
+    "id": "vscode-provider-form",
+    "title": "Live inline validation on the provider form (validate as you type, not only on save)",
+    "area": "vscode",
+    "why": "providerForm.ts only reports malformed extras when the user saves or tests, so a bad API key format or missing required field is discovered after a round trip. Validating each field on input, with the save button disabled until the form is valid, catches mistakes at the keystroke.",
+    "files": ["vscode/src/webview/providerForm.ts", "test/unit/vscode-provider-form.test.ts"],
+    "steps": [
+      "Add per-field validators (required fields present, URL-shaped endpoints parse, key fields non-empty) that run on input.",
+      "Show an inline error under the offending field and disable Save/Test while any error is present.",
+      "Keep the existing save-time error path as the backstop; reuse the same messages so the two paths agree."
+    ],
+    "acceptance": [
+      "Typing an invalid URL shows an inline error immediately; fixing it clears the error and enables Save.",
+      "Save stays disabled while any field is invalid.",
+      "Save-time validation messages are unchanged."
+    ],
+    "tests": ["test/unit/vscode-provider-form.test.ts: invalid URL inline error, save disabled until valid, messages match save-time"],
+    "est_lines": 120,
+    "risk": "low"
+  },
+  {
+    "id": "core-token-calibration",
+    "title": "Learn the token ratio per model from real usage and persist it",
+    "area": "core",
+    "why": "tokens.ts estimates with a fixed chars-per-token ratio, but the true ratio varies a lot by model and content. Learning it from actual usage (estimated vs billed tokens) and storing it per model makes every later estimate — run budgets, plan costs, TUI counters — materially more accurate.",
+    "files": ["src/core/token-calibration.ts", "test/unit/core/token-calibration.test.ts"],
+    "steps": [
+      "Record (model, estimated, actual) observations and update a per-model ratio with an exponential moving average.",
+      "Persist learned ratios in the run history dir; load them on start; fall back to the default ratio for unseen models.",
+      "Clamp learned ratios to TOKEN_RATIO_MIN..MAX so one bad observation can't wreck estimates."
+    ],
+    "acceptance": [
+      "After observations, calibratedTokens for that model uses the learned ratio, not the default.",
+      "Ratios survive a restart (persisted and reloaded).",
+      "A single extreme observation moves the ratio by at most the EMA step; clamps hold."
+    ],
+    "tests": ["test/unit/core/token-calibration.test.ts: EMA learning, persistence round-trip, clamp bounds"],
+    "est_lines": 110,
+    "risk": "low"
+  },
+  {
+    "id": "prov-discovery-cache",
+    "title": "Cache the provider model catalog for an hour instead of re-discovering every call",
+    "area": "core",
+    "why": "discovery.ts re-fetches the model catalog on every call, so model listing and provider probing pay a network round trip each time. A one-hour cache with an explicit refresh makes listing instant in the common case while staying fresh enough for a catalog that changes rarely.",
+    "files": ["src/providers/discovery.ts", "test/unit/providers/discovery.test.ts"],
+    "steps": [
+      "Cache discoverModels results keyed by provider + base URL with a 1h TTL, stored in memory and in the OMNEXX_HOME cache dir.",
+      "Add a refresh option/flag that bypasses the cache; a failed refresh returns the stale cache with a warning instead of erroring.",
+      "Invalidate the cache entry when the provider config changes."
+    ],
+    "acceptance": [
+      "Two discoverModels calls a minute apart hit the network once.",
+      "A forced refresh hits the network again.",
+      "A failed refresh returns stale data with a warning, not an error."
+    ],
+    "tests": ["test/unit/providers/discovery.test.ts: cache hit, forced refresh, failed refresh falls back to stale"],
+    "est_lines": 90,
+    "risk": "low"
+  },
+  {
+    "id": "agent-recall",
+    "title": "Rank recalled memories by relevance as well as recency",
+    "area": "core",
+    "why": "recall.ts returns memories newest-first, so a recent trivial note outranks an older memory that exactly matches the current task. Scoring by both relevance (keyword/semantic overlap with the task) and recency surfaces the memory the agent actually needs.",
+    "files": ["src/agent/recall.ts", "test/unit/agent/recall.test.ts"],
+    "steps": [
+      "Score each candidate memory as relevance * recency-decay; relevance is token overlap between the memory text and the task/goal text.",
+      "Keep the existing recall API; add an optional limit and a minimum score cutoff.",
+      "Add tests: an old highly-relevant memory outranks a new irrelevant one; identical scores fall back to recency."
+    ],
+    "acceptance": [
+      "An older memory matching the task terms ranks above a newer unrelated memory.",
+      "A minimum-score cutoff drops irrelevant memories entirely.",
+      "The default recall order for unrelated memories is unchanged (recency)."
+    ],
+    "tests": ["test/unit/agent/recall.test.ts: relevance beats recency, cutoff drops junk, tie falls back to recency"],
+    "est_lines": 100,
+    "risk": "low"
+  },
+  {
+    "id": "verify-ratchet-branch",
+    "title": "Track the spec-gate ratchet baseline per branch, not just per repo",
+    "area": "core",
+    "why": "The ratchet records one baseline per repo, so work on a long-lived branch is judged against main's baseline (or vice versa) and a branch that legitimately lowers the count gets flagged as a regression. A per-branch baseline keeps the ratchet honest when several lines of work are in flight.",
+    "files": ["src/verify/ratchet.ts", "test/unit/verify/ratchet.test.ts"],
+    "steps": [
+      "Key the stored baseline by branch name (fall back to the repo baseline for detached HEAD / unknown branch).",
+      "On branch creation, seed the new branch's baseline from the current branch's baseline.",
+      "Migrating: an existing repo-level baseline is adopted as the current branch's baseline on first use."
+    ],
+    "acceptance": [
+      "Two branches keep independent baselines; improving one never flags the other.",
+      "A new branch seeds from its parent branch's baseline.",
+      "Repos with only the old repo-level baseline keep working (adopted as the current branch's)."
+    ],
+    "tests": ["test/unit/verify/ratchet.test.ts: independent branch baselines, seeding, legacy migration"],
+    "est_lines": 90,
+    "risk": "medium"
+  },
+  {
+    "id": "workers-scratchpad-ttl",
+    "title": "Scratchpad entries gain TTLs so stale claims expire instead of blocking forever",
+    "area": "core",
+    "why": "SharedScratchpad entries are versioned but never expire, so a claim left by a crashed worker can block a region indefinitely until someone manually clears it. A TTL on claims (with renewal by the owner) makes the scratchpad self-healing.",
+    "files": ["src/workers/scratchpad.ts", "test/unit/workers/scratchpad.test.ts"],
+    "steps": [
+      "Add an optional ttlMs to put(); expired entries are treated as absent on get/list and pruned on the next write.",
+      "Add a renew() that extends a live claim's TTL; renewing an expired or foreign claim fails.",
+      "Default TTL for claims is 10 minutes; reads never return expired entries."
+    ],
+    "acceptance": [
+      "An entry with ttlMs 50 is gone after 60ms (get returns undefined).",
+      "renew() extends a live claim; renewing an expired claim fails.",
+      "Entries without a TTL behave exactly as before."
+    ],
+    "tests": ["test/unit/workers/scratchpad.test.ts: expiry, renew extends, renew expired fails, no-TTL unchanged"],
+    "est_lines": 100,
+    "risk": "low"
+  },
+  {
+    "id": "config-routing-overrides",
+    "title": "Per-task-kind model overrides in [routing]",
+    "area": "core",
+    "why": "Routing picks one model for everything, but planning, implementation, and review have very different cost/quality trade-offs — a cheap fast model plans fine, a strong model should review. Per-kind overrides in [routing] let the operator tune that without touching code.",
+    "files": ["src/config/routing.ts", "test/unit/config/routing.test.ts"],
+    "steps": [
+      "Add optional [routing.overrides] mapping task kinds (plan, implement, review, test) to model aliases.",
+      "Resolve overrides after the default routing decision; an override naming an unknown alias is a config error at load time.",
+      "Document the keys in the config docs comment above the section."
+    ],
+    "acceptance": [
+      "A review override routes review tasks to the named model; other kinds use the default.",
+      "An override naming an unknown alias fails config load with a message naming the key.",
+      "No overrides present: routing behaves exactly as before."
+    ],
+    "tests": ["test/unit/config/routing.test.ts: override applies, unknown alias errors, no overrides unchanged"],
+    "est_lines": 90,
+    "risk": "low"
+  },
+  {
+    "id": "judge-llm-retry",
+    "title": "LLM judge retries once on malformed JSON instead of failing open",
+    "area": "core",
+    "why": "The LLM judge parses the model's verdict as JSON; one malformed reply currently fails the judgement open (or fails the run), wasting the whole round. A single retry with a 'reply with JSON only' reminder fixes the common case where the model added prose around the JSON.",
+    "files": ["src/judge/llm.ts", "test/unit/judge/llm.test.ts"],
+    "steps": [
+      "On a JSON parse failure, retry once with the previous reply plus a short 'return JSON only' instruction.",
+      "If the retry also fails to parse, fall back to the existing fail-open path and record the parse failure in the judgement.",
+      "Count the retry against the judge's token budget so it can't loop."
+    ],
+    "acceptance": [
+      "A first reply of prose + JSON is salvaged by the retry and the verdict is used.",
+      "Two unparseable replies fall back to fail-open with the parse failure recorded.",
+      "Valid JSON on the first try costs exactly one call (no retry)."
+    ],
+    "tests": ["test/unit/judge/llm.test.ts: retry salvages prose-wrapped JSON, double failure fails open, valid JSON single call"],
+    "est_lines": 80,
+    "risk": "low"
+  },
+  {
+    "id": "cli-update-cache",
+    "title": "Cache the update check for a day so it doesn't hit the network on every invocation",
+    "area": "cli",
+    "why": "checkForUpdate hits the network on every CLI start, adding latency to even `omnexx --help`. A daily cache (stored in OMNEXX_HOME, keyed by current version) makes the check effectively free after the first call of the day.",
+    "files": ["src/cli/update-check.ts", "test/unit/cli/update-check.test.ts"],
+    "steps": [
+      "Cache checkForUpdate results in OMNEXX_HOME/update-check.json with a timestamp; return the cached result when it is under 24h old and the version matches.",
+      "Add a --refresh/force option to bypass the cache; a failed network check returns the stale cache with no error.",
+      "Write the cache atomically via the existing writeJsonAtomic helper."
+    ],
+    "acceptance": [
+      "Two checks an hour apart hit the network once.",
+      "A forced refresh hits the network again.",
+      "A network failure with a fresh cache returns the cached result silently."
+    ],
+    "tests": ["test/unit/cli/update-check.test.ts: cache hit, forced refresh, network failure falls back to cache"],
+    "est_lines": 80,
+    "risk": "low"
+  },
+  {
+    "id": "vscode-contextpage-remove",
+    "title": "Context page rows gain a remove-from-context button",
+    "area": "vscode",
+    "why": "The context page lists every file in context but offers no way to drop one — the operator has to close the page and edit config by hand. A per-row remove button (with the total updating live) makes context curation a one-click job.",
+    "files": ["vscode/src/webview/contextPage.ts", "test/unit/vscode-context-page.test.ts"],
+    "steps": [
+      "Add a remove button to each row in rowHtml; on click, post a remove message and redraw without that file.",
+      "Update the page totals live after removal; removing the last file shows the empty state instead of a blank list.",
+      "Confirm the host handles the remove message (add the case if it doesn't exist yet)."
+    ],
+    "acceptance": [
+      "Clicking remove drops the file from the list and updates the totals immediately.",
+      "Removing the last file shows the empty state.",
+      "The host actually drops the file from context (not just from the page)."
+    ],
+    "tests": ["test/unit/vscode-context-page.test.ts: remove drops row, totals update, empty state on last removal"],
+    "est_lines": 90,
+    "risk": "low"
+  },
+  {
+    "id": "core-repo-probe-cache",
+    "title": "Cache repo-probe results per commit so repeated runs skip re-probing",
+    "area": "core",
+    "why": "repo-probe re-detects the build/test/lint setup on every run, shelling out to check package managers and scripts even when the repo hasn't changed. Caching the result keyed by HEAD commit makes the second run on the same commit free.",
+    "files": ["src/core/repo-probe.ts", "test/unit/core/repo-probe.test.ts"],
+    "steps": [
+      "Store probe results in OMNEXX_HOME keyed by repo path + HEAD sha; return the cached result when the sha matches.",
+      "Invalidate when the probe inputs change (package.json, lockfile, or config mtime newer than the cache entry).",
+      "Add a --no-probe-cache escape hatch via env var for debugging."
+    ],
+    "acceptance": [
+      "Two probes on the same HEAD shell out once.",
+      "Touching package.json invalidates the cache and re-probes.",
+      "The env escape hatch forces a fresh probe."
+    ],
+    "tests": ["test/unit/core/repo-probe.test.ts: cache hit on same HEAD, invalidation on package.json change, escape hatch"],
+    "est_lines": 100,
+    "risk": "low"
+  },
+  {
+    "id": "mcp-status-latency",
+    "title": "mcp status shows per-server latency and last error",
+    "area": "core",
+    "why": "mcp status today says whether a server is up, but not whether it is slow or what its last failure was — so a server timing out on every call looks identical to a healthy one. Latency (last call + p50) and the last error turn status into a real diagnostic.",
+    "files": ["src/mcp/status.ts", "test/unit/mcp/status.test.ts"],
+    "steps": [
+      "Record last-call latency and last error per server in the client manager (or read them from existing telemetry if present).",
+      "Render them in mcp status output: latency ms, p50 over recent calls, and the last error message (truncated).",
+      "Keep the output shape backward compatible for the healthy case (new columns only, no reordering)."
+    ],
+    "acceptance": [
+      "A server with slow calls shows its p50 latency in status output.",
+      "A server whose last call failed shows the error message.",
+      "A healthy server's status output is unchanged apart from the new columns."
+    ],
+    "tests": ["test/unit/mcp/status.test.ts: latency shown, last error shown, healthy output stable"],
+    "est_lines": 110,
+    "risk": "low"
+  },
+  {
+    "id": "tools-fuzzy-rank",
+    "title": "Rank exact-substring hits first in fuzzy file matching",
+    "area": "core",
+    "why": "fuzzy-match scores all candidates on edit distance, so a file literally containing the query string can lose to a shorter unrelated name. Exact-substring containment is a much stronger signal than edit distance and should always win ties — it matches what the operator meant.",
+    "files": ["src/tools/fuzzy-match.ts", "test/unit/tools/fuzzy-match.test.ts"],
+    "steps": [
+      "Boost candidates whose path contains the query as a substring (case-insensitive) above all non-containing candidates, keeping edit-distance order within each group.",
+      "Keep the existing score function for the within-group order; only the grouping changes.",
+      "Add cases: substring hit vs shorter non-hit, multiple substring hits ordered by distance."
+    ],
+    "acceptance": [
+      "Query 'auth' ranks 'src/auth/keys.ts' above 'src/a.ts' even though the latter is shorter.",
+      "Multiple substring hits stay ordered by edit distance.",
+      "Queries with no substring hit behave exactly as before."
+    ],
+    "tests": ["test/unit/tools/fuzzy-match.test.ts: substring beats shorter non-hit, substring group ordered, no-hit unchanged"],
+    "est_lines": 60,
+    "risk": "low"
+  },
+  {
+    "id": "tui-model-picker-cost",
+    "title": "TUI model picker shows per-model cost and context window",
+    "area": "cli",
+    "why": "The TUI model picker lists model names only, so picking between two models is a guess about price and capacity. Showing $/1M tokens and context window next to each name (from the existing pricing + context-windows data) makes the choice informed.",
+    "files": ["src/tui/model-picker.tsx", "test/unit/tui/model-picker.test.ts"],
+    "steps": [
+      "Join the model list with the pricing table and context-window table; render '$x.xx/1M · NNNk ctx' beside each model.",
+      "Models missing pricing data show 'price unknown' instead of a number; never block the picker on missing data.",
+      "Sort still follows the existing order (cost is display-only, not a reorder)."
+    ],
+    "acceptance": [
+      "Each model row shows its price and context window.",
+      "A model with no pricing data shows 'price unknown' and the picker still works.",
+      "Row order is unchanged."
+    ],
+    "tests": ["test/unit/tui/model-picker.test.ts: price + window shown, unknown price placeholder, order unchanged"],
+    "est_lines": 80,
+    "risk": "low"
+  },
+  {
+    "id": "agent-cost-sim",
+    "title": "Cost simulation uses the real model price table instead of a flat rate",
+    "area": "core",
+    "why": "cost-sim estimates run cost with a flat per-token rate, so a plan that uses an expensive model looks as cheap as one on a budget model and the operator can't compare plans on cost. Plugging in the real pricing table makes the simulation match the eventual bill.",
+    "files": ["src/agent/cost-sim.ts", "test/unit/agent/cost-sim.test.ts"],
+    "steps": [
+      "Replace the flat rate with a lookup into the pricing table by provider:model; unknown models fall back to the flat rate with a note.",
+      "Include input vs output token prices separately (output is usually pricier) using the plan's estimated split.",
+      "Report the per-model breakdown in the simulation result."
+    ],
+    "acceptance": [
+      "A plan on an expensive model simulates higher than the same plan on a cheap model.",
+      "An unknown model falls back to the flat rate and the result says so.",
+      "The result includes a per-model cost breakdown."
+    ],
+    "tests": ["test/unit/agent/cost-sim.test.ts: expensive vs cheap model, unknown model fallback, per-model breakdown"],
+    "est_lines": 100,
+    "risk": "low"
+  },
+  {
+    "id": "verify-triage-grouping",
+    "title": "Group run failures by root cause instead of listing every failure separately",
+    "area": "core",
+    "why": "A run with 40 failing tests lists 40 failures even when 35 share one root cause (same file, same error), burying the signal. Grouping by file + error signature turns a wall of failures into a short list of causes to fix.",
+    "files": ["src/verify/triage.ts", "test/unit/verify/triage.test.ts"],
+    "steps": [
+      "Cluster failures by (file, normalized error signature) where the signature strips line numbers, paths, and timestamps.",
+      "Render each group once with its count and one representative failure, plus the list of affected tests.",
+      "Keep the existing triage output for singletons; groups only collapse duplicates."
+    ],
+    "acceptance": [
+      "35 failures sharing one file + signature collapse into one group with count 35.",
+      "Failures with different signatures stay separate.",
+      "Singleton failures render exactly as before."
+    ],
+    "tests": ["test/unit/verify/triage.test.ts: grouping collapses duplicates, distinct signatures separate, singletons unchanged"],
+    "est_lines": 110,
+    "risk": "low"
+  },
+  {
+    "id": "workers-ipc-deadline",
+    "title": "IPC envelopes gain a request deadline; late replies are dropped with a clear error",
+    "area": "core",
+    "why": "IPC request/reply has correlation and timeout/closed errors, but a reply that arrives after the caller gave up can still resolve a later request with a stale payload. A per-request deadline that drops late replies makes worker communication predictable.",
+    "files": ["src/workers/ipc.ts", "test/unit/workers/ipc.test.ts"],
+    "steps": [
+      "Add an optional deadlineMs to requests; the pending-request table drops entries past their deadline.",
+      "A reply arriving for a dropped request is ignored and logged at debug level, never delivered.",
+      "The caller gets a DeadlineError naming the request id and the deadline, distinct from a transport-closed error."
+    ],
+    "acceptance": [
+      "A reply arriving after the deadline is ignored and the caller already got a DeadlineError.",
+      "Replies inside the deadline deliver normally.",
+      "DeadlineError names the request and deadline; it is distinct from a closed-transport error."
+    ],
+    "tests": ["test/unit/workers/ipc.test.ts: late reply dropped, on-time reply delivered, DeadlineError shape"],
+    "est_lines": 90,
+    "risk": "low"
+  },
+  {
+    "id": "git-trailers-coauthor",
+    "title": "Add a Co-Authored-By trailer naming the worker model on run commits",
+    "area": "core",
+    "why": "Run commits carry no record of which model did the work, so later archaeology (which model wrote this, which model should fix it) has to guess from the run dir. A Co-Authored-By trailer with the model id makes authorship visible in git log itself.",
+    "files": ["src/git/trailers.ts", "test/unit/git/trailers.test.ts"],
+    "steps": [
+      "Add a helper that appends 'Co-Authored-By: <model> <model@omnexx>' to a commit message when a worker model is set.",
+      "Skip the trailer when no model is set or when the message already carries one for that model.",
+      "Wire it into the run commit path."
+    ],
+    "acceptance": [
+      "A commit from a run carries the Co-Authored-By trailer with the worker model.",
+      "No trailer is added when no model is set.",
+      "An existing trailer for the same model is not duplicated."
+    ],
+    "tests": ["test/unit/git/trailers.test.ts: trailer added, skipped without model, no duplication"],
+    "est_lines": 60,
+    "risk": "low"
+  },
+  {
+    "id": "config-duration-parse",
+    "title": "Accept plain durations ('90m', '2h', '1d') everywhere a timeout is configured",
+    "area": "core",
+    "why": "Timeouts are configured in different units in different places (ms in one section, seconds in another), so operators guess and get it wrong. One duration parser accepting '90m', '2h', '1d', and plain seconds, used by every timeout-bearing section, removes the guesswork.",
+    "files": ["src/config/duration.ts", "test/unit/config/duration.test.ts"],
+    "steps": [
+      "Extend the duration parser to accept s/m/h/d suffixes and bare numbers (seconds), rejecting unknown suffixes with a message naming the value.",
+      "Route the timeout-bearing config sections through the one parser (keep their existing defaults).",
+      "Add cases: '90m' = 5400s, '2h' = 7200s, '1d' = 86400s, '30' = 30s, '5x' errors."
+    ],
+    "acceptance": [
+      "'90m', '2h', '1d' parse to the right second counts; bare numbers mean seconds.",
+      "An unknown suffix fails config load with a message naming the bad value.",
+      "Existing configs with numeric timeouts behave identically."
+    ],
+    "tests": ["test/unit/config/duration.test.ts: suffix parsing, bare numbers, unknown suffix errors"],
+    "est_lines": 70,
+    "risk": "low"
+  },
+  {
+    "id": "judge-state-summary",
+    "title": "Truncate long diffs in the judge state summary before sending",
+    "area": "core",
+    "why": "The state summary hands the judge the full diff, so a big run burns most of the judge's context on diff text and the actual verdict gets squeezed. Truncating to the most relevant hunks (with a note about what was cut) keeps the judgement quality up and the cost down.",
+    "files": ["src/judge/state-summary.ts", "test/unit/judge/state-summary.test.ts"],
+    "steps": [
+      "Cap the diff portion of the summary at a token budget (default 4000 tokens, estimated with the existing estimator).",
+      "Keep hunks touching files the run changed most recently first; drop the rest with a 'truncated N lines' note.",
+      "Never truncate the verdict-relevant metadata (pass/fail counts, gate results) — only diff text."
+    ],
+    "acceptance": [
+      "A summary with a huge diff stays under the token budget and names what was cut.",
+      "Gate results and counts are never truncated.",
+      "Small diffs pass through byte-identical."
+    ],
+    "tests": ["test/unit/judge/state-summary.test.ts: large diff truncated with note, metadata kept, small diff unchanged"],
+    "est_lines": 90,
+    "risk": "low"
+  },
+  {
+    "id": "security-paths-jail",
+    "title": "Jail path checks resolve symlinks so a linked escape can't leave the repo",
+    "area": "core",
+    "why": "Path checks compare the lexical path, so a symlink inside the repo pointing outside it passes the 'inside the repo' check and a tool can write outside the worktree. Resolving symlinks before the check closes a real sandbox escape.",
+    "files": ["src/security/paths.ts", "test/unit/security/paths.test.ts"],
+    "steps": [
+      "Resolve symlinks (realpath) on both the candidate path and the repo root before the containment check.",
+      "Treat a dangling symlink as outside the repo (fail closed) and report the resolved path in the error.",
+      "Add cases: direct escape, symlink escape, dangling symlink, normal inside-repo path."
+    ],
+    "acceptance": [
+      "A symlink inside the repo pointing outside is rejected as outside.",
+      "A dangling symlink is rejected.",
+      "Normal inside-repo paths (including symlinks staying inside) still pass."
+    ],
+    "tests": ["test/unit/security/paths.test.ts: symlink escape rejected, dangling rejected, inside paths pass"],
+    "est_lines": 80,
+    "risk": "medium"
+  },
+  {
+    "id": "core-fold-prompt-budget",
+    "title": "Fold long prompts against a token budget instead of a fixed depth",
+    "area": "core",
+    "why": "fold-prompt folds at a fixed depth, so a short prompt gets folded unnecessarily and a huge prompt still blows the budget after folding. Folding until the prompt fits a token budget adapts to the actual size and keeps the model inside its window.",
+    "files": ["src/core/fold-prompt.ts", "test/unit/core/fold-prompt.test.ts"],
+    "steps": [
+      "Add a token budget parameter; fold the least-important sections first until the prompt fits, using the existing token estimator.",
+      "Never fold the goal, the plan anchors, or the active task — only supporting context.",
+      "Report how much was folded (sections + tokens saved) in the result."
+    ],
+    "acceptance": [
+      "A prompt over budget folds down to under the budget; goal/plan/active task survive.",
+      "A prompt already under budget is returned unchanged.",
+      "The result reports sections folded and tokens saved."
+    ],
+    "tests": ["test/unit/core/fold-prompt.test.ts: over-budget folds to fit, anchors survive, under-budget unchanged"],
+    "est_lines": 100,
+    "risk": "low"
+  },
+  {
+    "id": "vscode-agentcard-sliders",
+    "title": "Agent card sliders show their numeric value and a reset-to-default per slider",
+    "area": "vscode",
+    "why": "The agent card sliders (taskEffort, turnEffort, contextLevel, time, maxTokens) show position only — the operator can't see the value they're setting or get back to the default without guessing. A live value label and a small reset button per slider fix both.",
+    "files": ["vscode/src/webview/agentCardModel.ts", "test/unit/vscode-agent-card-model.test.ts"],
+    "steps": [
+      "Add a value formatter per SliderId (using the existing position()/steps() helpers) and render the current value next to each slider.",
+      "Add a reset control per slider that restores the meta default; reset updates the value label immediately.",
+      "Keep the existing position/steps math untouched."
+    ],
+    "acceptance": [
+      "Each slider shows its current numeric value.",
+      "Reset restores the default value and the label updates.",
+      "Slider positions for a given value are unchanged."
+    ],
+    "tests": ["test/unit/vscode-agent-card-model.test.ts: value formatting per slider, reset restores default"],
+    "est_lines": 90,
+    "risk": "low"
+  },
+  {
+    "id": "prov-probe-latency",
+    "title": "Provider probe reports latency percentiles, not just success",
+    "area": "core",
+    "why": "probe.ts answers 'does this provider respond' but not 'how slow is it', so a provider that answers in 30s looks as healthy as one that answers in 200ms. Reporting p50/p95 from a few probes turns probe into a usable health signal for routing.",
+    "files": ["src/providers/probe.ts", "test/unit/providers/probe.test.ts"],
+    "steps": [
+      "Run 3 probes per provider check (or reuse recent timings) and report p50/p95 latency alongside success.",
+      "Surface the percentiles in the probe result and in `omnexx providers` output.",
+      "A provider that times out reports latency as null, not zero."
+    ],
+    "acceptance": [
+      "A healthy provider's probe result includes p50 and p95 latencies.",
+      "A timing-out provider reports latency null.",
+      "A single-probe result still works (percentiles equal the one sample)."
+    ],
+    "tests": ["test/unit/providers/probe.test.ts: percentiles reported, timeout null, single sample"],
+    "est_lines": 90,
+    "risk": "low"
+  },
+  {
+    "id": "vscode-roles-filter",
+    "title": "Roles list gains a filter box and a visible role count",
+    "area": "vscode",
+    "why": "The roles list shows every role with no way to narrow it; on a configured workspace the operator scrolls to find one role. A filter box (matching id and label) plus a 'N roles' count makes the list scannable.",
+    "files": ["vscode/src/webview/roles.ts", "test/unit/vscode-roles.test.ts"],
+    "steps": [
+      "Add a filter input above the role list; filter matches against role id and label, case-insensitive substring.",
+      "Show 'N of M roles' while filtering; an empty result shows a 'no roles match' empty state.",
+      "Keep the existing list rendering and selection behavior for unfiltered views."
+    ],
+    "acceptance": [
+      "Typing 'plan' shows only roles whose id or label contains it, with the count updated.",
+      "Clearing the filter restores the full list.",
+      "No match shows the empty state instead of a blank list."
+    ],
+    "tests": ["test/unit/vscode-roles.test.ts: filter narrows, count updates, empty state on no match"],
+    "est_lines": 80,
+    "risk": "low"
+  },
+  {
+    "id": "core-speculative-cache",
+    "title": "Cache speculative check results per tree hash so unchanged trees skip re-checking",
+    "area": "core",
+    "why": "Speculative checks re-run on every cycle even when the tree hasn't changed since the last check, burning model calls and time on identical input. Keying results by tree hash makes the repeat check a cache hit.",
+    "files": ["src/core/speculative-check.ts", "test/unit/core/speculative-check.test.ts"],
+    "steps": [
+      "Hash the working tree (reuse the existing workingTreeHash) and cache check results keyed by that hash + the check definition.",
+      "Invalidate on any tree change (hash mismatch) and cap the cache at the last 8 entries.",
+      "A cache hit returns the stored result without invoking the checker."
+    ],
+    "acceptance": [
+      "Two checks on an unchanged tree invoke the checker once.",
+      "Changing any file invalidates the cache and re-runs the check.",
+      "The cache never holds more than 8 entries."
+    ],
+    "tests": ["test/unit/core/speculative-check.test.ts: cache hit on unchanged tree, invalidation on change, cap enforced"],
+    "est_lines": 100,
+    "risk": "medium"
+  },
+  {
+    "id": "vscode-cli-errors",
+    "title": "Distinguish timeout, non-zero exit, and oversize output in VS Code CLI calls",
+    "area": "vscode",
+    "why": "cli.ts call() rejects with omnexx's own message for every failure, so a 15s timeout, a real error, and an 8MB oversize output all look the same to the extension — and the user gets no hint about which happened. Typed errors let the UI say 'timed out, try again' vs 'omnexx failed' vs 'output too large'.",
+    "files": ["vscode/src/cli.ts", "test/unit/vscode-cli.test.ts"],
+    "steps": [
+      "Add typed error kinds (timeout, exit, oversize) to call(); the timeout error names the command and the 15s limit, oversize names the 8MB cap.",
+      "Keep the existing rejection shape for non-zero exits (omnexx's own message) so callers don't change.",
+      "Add tests with a stubbed engine that sleeps, exits non-zero, and overflows."
+    ],
+    "acceptance": [
+      "A call past 15s rejects with a timeout error naming the command.",
+      "An 8MB+ output rejects with an oversize error naming the cap.",
+      "A non-zero exit still rejects with omnexx's own message, unchanged."
+    ],
+    "tests": ["test/unit/vscode-cli.test.ts: timeout typed, oversize typed, non-zero exit message unchanged"],
+    "est_lines": 90,
+    "risk": "low"
+  },
+  {
+    "id": "tools-post-edit-restart",
+    "title": "Restart the post-edit daemon transparently when it crashes",
+    "area": "core",
+    "why": "post-edit runs a Python daemon for edit post-processing; if the daemon dies, every later edit fails or silently skips post-processing until the process restarts. Supervising it (restart on crash, with a backoff and a visible warning after repeated crashes) keeps edits working.",
+    "files": ["src/tools/post-edit.ts", "test/unit/tools/post-edit.test.ts"],
+    "steps": [
+      "Track the daemon child process; on unexpected exit, restart it with exponential backoff (max 3 tries, then report degraded mode).",
+      "Queue one in-flight edit across the restart instead of dropping it.",
+      "Log a warning on each restart and an error when entering degraded mode."
+    ],
+    "acceptance": [
+      "Killing the daemon mid-run restarts it and the next edit still gets post-processed.",
+      "Three rapid crashes put the tool in degraded mode with a clear error instead of hanging.",
+      "An in-flight edit across a restart is not lost."
+    ],
+    "tests": ["test/unit/tools/post-edit.test.ts: restart on crash, degraded after 3 crashes, in-flight edit survives"],
+    "est_lines": 130,
+    "risk": "medium"
+  },
+  {
+    "id": "bench-meter-cost",
+    "title": "Benchmark meter gains a cost column in the results table",
+    "area": "core",
+    "why": "bench/meter.ts reports time and tokens but not dollars, so comparing two models on the benchmark ignores the thing that decides most purchases. A cost column (tokens x pricing table) makes the benchmark table answer 'which model is cheapest per passing task'.",
+    "files": ["bench/meter.ts", "test/unit/bench-meter.test.ts"],
+    "steps": [
+      "Join meter readings with the pricing table to compute USD per run; show it as a column in the results table.",
+      "Models missing pricing show 'n/a' instead of a number; totals include a cost row.",
+      "Keep the existing columns and ordering; cost is display-only."
+    ],
+    "acceptance": [
+      "The results table has a cost column with USD per run.",
+      "A model without pricing shows 'n/a' and the table still renders.",
+      "Existing columns are unchanged."
+    ],
+    "tests": ["test/unit/bench-meter.test.ts: cost column present, missing pricing n/a, columns unchanged"],
+    "est_lines": 80,
+    "risk": "low"
+  },
+  {
+    "id": "swe-bench-reproduce-cache",
+    "title": "Cache the built reproduction image per base commit",
+    "area": "core",
+    "why": "reproduce.ts rebuilds the task environment from scratch for every run, even when the base commit hasn't changed — the slowest step in the SWE-bench loop. Caching the built image keyed by base commit + Dockerfile hash makes repeat reproductions start in seconds.",
+    "files": ["src/swe-bench/reproduce.ts", "test/unit/swe-bench/reproduce.test.ts"],
+    "steps": [
+      "Key the built image by base commit + hash of the reproduction inputs; reuse the cached image on a match.",
+      "Invalidate when the inputs hash changes; prune cached images older than 7 days.",
+      "Log cache hit/miss so the operator can see the saving."
+    ],
+    "acceptance": [
+      "Two reproductions on the same base commit build once.",
+      "Changing the inputs rebuilds.",
+      "Images older than 7 days are pruned."
+    ],
+    "tests": ["test/unit/swe-bench/reproduce.test.ts: cache hit, invalidation on input change, 7-day prune"],
+    "est_lines": 120,
+    "risk": "medium"
+  }
+]

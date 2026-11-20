@@ -1,0 +1,39 @@
+diff --git a/vscode/src/webview/terminalPill.ts b/vscode/src/webview/terminalPill.ts
+index 395912c..4ff784a 100644
+--- a/vscode/src/webview/terminalPill.ts
++++ b/vscode/src/webview/terminalPill.ts
+@@ -43,6 +43,7 @@ interface PillRuntime {
+   status: PillStatus;
+   startedAt: number;
+   endedMs?: number | undefined;
++  exitCode?: number | null | undefined;
+   buffer: string;
+   term?: Terminal | undefined;
+   fit?: FitAddon | undefined;
+@@ -77,6 +78,7 @@ export function getPillView(id: number): TermPillView | undefined {
+     status: p.status,
+     startedAt: p.startedAt,
+     ...(p.endedMs !== undefined ? { endedMs: p.endedMs } : {}),
++    ...(p.exitCode !== undefined ? { exitCode: p.exitCode } : {}),
+   };
+ }
+ 
+@@ -109,11 +111,17 @@ export function handlePillOutput(id: number, chunk: string): void {
+   else if (p.fallbackPre) refreshFallback(p);
+ }
+ 
+-export function handlePillEnd(id: number, status: PillStatus, elapsedMs: number): void {
++export function handlePillEnd(
++  id: number,
++  status: PillStatus,
++  elapsedMs: number,
++  exitCode?: number | null,
++): void {
+   const p = pills.get(id);
+   if (!p) return;
+   p.status = status;
+   p.endedMs = Math.max(0, Math.floor(elapsedMs));
++  if (exitCode !== undefined) p.exitCode = exitCode;
+   updateHeader(p);
+ }
+ 

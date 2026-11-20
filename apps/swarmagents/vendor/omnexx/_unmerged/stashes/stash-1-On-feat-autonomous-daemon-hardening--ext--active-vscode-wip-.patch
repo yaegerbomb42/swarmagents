@@ -1,0 +1,32 @@
+diff --git a/vscode/src/webview/chat.ts b/vscode/src/webview/chat.ts
+index 116e1f2..dc05d16 100644
+--- a/vscode/src/webview/chat.ts
++++ b/vscode/src/webview/chat.ts
+@@ -1232,6 +1232,11 @@ document.addEventListener('click', (e) => {
+     const text = clone.textContent;
+     if (text) copyText(text, copyCode);
+   }
++  const copyTerm = target.closest<HTMLElement>('[data-copy-term]');
++  if (copyTerm?.dataset.copyTerm) {
++    const text = terminalPill.getPillBuffer(Number(copyTerm.dataset.copyTerm));
++    if (text) copyText(text, copyTerm);
++  }
+   const copyBlock = target.closest<HTMLElement>('[data-copy-block]');
+   const reply = blocks.find((b) => String(b.id) === copyBlock?.dataset.copyBlock);
+   if (copyBlock && reply) copyText(reply.lines.join('\n'), copyBlock);
+diff --git a/vscode/src/webview/terminalPill.ts b/vscode/src/webview/terminalPill.ts
+index 395912c..70d7c16 100644
+--- a/vscode/src/webview/terminalPill.ts
++++ b/vscode/src/webview/terminalPill.ts
+@@ -80,6 +80,11 @@ export function getPillView(id: number): TermPillView | undefined {
+   };
+ }
+ 
++/** Output buffer for copy actions (bounded tail). */
++export function getPillBuffer(id: number): string {
++  return pills.get(id)?.buffer ?? '';
++}
++
+ export function handlePillStart(id: number, cmd: string): void {
+   const existing = pills.get(id);
+   if (existing) {

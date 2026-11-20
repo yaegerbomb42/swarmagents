@@ -1,0 +1,710 @@
+diff --git a/src/autonomous/worktree-manager.ts b/src/autonomous/worktree-manager.ts
+index 764fcb3..bd42dc5 100644
+--- a/src/autonomous/worktree-manager.ts
++++ b/src/autonomous/worktree-manager.ts
+@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
+ import { basename, join, resolve } from 'node:path';
+ import { GitError } from '../errors.js';
+ import { git } from '../git/git.js';
++import { clearStaleGitLocks } from '../git/locks.js';
+ import { resolveRef } from '../git/repo.js';
+ 
+ /**
+@@ -270,6 +271,9 @@ export class WorktreeManager {
+   /** Remove the worktree and its wip ref. */
+   async destroy(taskId: string): Promise<void> {
+     const path = this.pathFor(taskId);
++    // Clear stale git locks so a worktree left by a killed process cannot wedge
++    // the removal (a stale index.lock would otherwise abort `worktree remove`).
++    await clearStaleGitLocks(path).catch(() => undefined);
+     await git(this.repoRoot, ['worktree', 'remove', '--force', path], { allowFailure: true });
+     await git(this.repoRoot, ['update-ref', '-d', this.wipRef(taskId)], { allowFailure: true });
+     await rm(path, { recursive: true, force: true });
+diff --git a/src/git/locks.ts b/src/git/locks.ts
+new file mode 100644
+index 0000000..800479c
+--- /dev/null
++++ b/src/git/locks.ts
+@@ -0,0 +1,62 @@
++import { readdir, rm, stat } from 'node:fs/promises';
++import { join } from 'node:path';
++import { git } from './git.js';
++
++export interface ClearStaleLocksOptions {
++  /** Override the clock for deterministic tests; defaults to Date.now(). */
++  now?: number;
++  /** Minimum age in ms before a lock file is considered stale; defaults to 5000. */
++  minAgeMs?: number;
++}
++
++/**
++ * Resolve a working-tree path to its git directory. For the main checkout this
++ * is `<repo>/.git`; for a linked worktree it is its own git dir
++ * (`<repo>/.git/worktrees/<name>`), which is where `index.lock` lives.
++ */
++export async function gitDirFor(cwd: string): Promise<string> {
++  const rel = (await git(cwd, ['rev-parse', '--git-dir'])).stdout.trim();
++  return rel.startsWith('/') ? rel : join(cwd, rel);
++}
++
++/**
++ * Defensively remove stale git lock files left behind by a killed git process.
++ *
++ * A git process that dies mid-operation (crash, SIGKILL, abrupt host shutdown)
++ * can leave `index.lock` / `HEAD.lock` / `*.lock` in the git dir. Those wedge
++ * every later index/HEAD write (`reset`, `add`, `commit`, `checkout`), so a
++ * speculative rollback or worktree teardown would otherwise hang forever.
++ *
++ * Best-effort: only removes lock files older than `minAgeMs` so an in-flight
++ * git process is never disturbed, and swallows per-file errors. Returns the
++ * absolute paths it removed.
++ */
++export async function clearStaleGitLocks(
++  cwd: string,
++  options: ClearStaleLocksOptions = {},
++): Promise<string[]> {
++  const now = options.now ?? Date.now();
++  const minAgeMs = options.minAgeMs ?? 5_000;
++  const gitDir = await gitDirFor(cwd);
++  const removed: string[] = [];
++  let names: string[];
++  try {
++    names = await readdir(gitDir);
++  } catch {
++    return removed;
++  }
++  for (const name of names) {
++    if (!name.endsWith('.lock')) continue;
++    const p = join(gitDir, name);
++    const mtimeMs = await stat(p).then(
++      (s) => s.mtimeMs,
++      () => Number.NaN,
++    );
++    if (!Number.isFinite(mtimeMs)) continue;
++    if (now - mtimeMs >= minAgeMs) {
++      await rm(p, { force: true }).catch(() => undefined);
++      removed.push(p);
++    }
++  }
++  return removed;
++}
+diff --git a/src/git/rollback.ts b/src/git/rollback.ts
+index e7b4748..ae1124f 100644
+--- a/src/git/rollback.ts
++++ b/src/git/rollback.ts
+@@ -1,6 +1,7 @@
+ import { writeFile } from 'node:fs/promises';
+ import { isSecretPath } from '../security/paths.js';
+ import { git } from './git.js';
++import { clearStaleGitLocks } from './locks.js';
+ import { workingTreeDiff } from './repo.js';
+ 
+ /** Drop per-file sections for credential-looking paths, then redact what's left. */
+@@ -34,6 +35,12 @@ export async function rollbackTo(
+       exact = patch === raw;
+     }
+   }
++  // A git process that died mid-run may have left an `index.lock` in the
++  // worktree's git dir, which would wedge the hard reset below and leave the
++  // speculative changes in place. Clear lock files first (best-effort).
++  // Rollback is a recovery path on an Omnexx-owned worktree — no git process
++  // should be writing to it concurrently — so clear regardless of age.
++  await clearStaleGitLocks(cwd, { minAgeMs: 0 }).catch(() => undefined);
+   await git(cwd, ['reset', '-q', '--hard', lastGreen]);
+   await git(cwd, [
+     'clean',
+diff --git a/src/git/worktree.ts b/src/git/worktree.ts
+index ed5d2d3..3325004 100644
+--- a/src/git/worktree.ts
++++ b/src/git/worktree.ts
+@@ -3,6 +3,7 @@ import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+ import { basename, isAbsolute, join, relative, resolve } from 'node:path';
+ import { GitError } from '../errors.js';
+ import { git } from './git.js';
++import { clearStaleGitLocks } from './locks.js';
+ import { resolveRef } from './repo.js';
+ 
+ export interface Worktree {
+@@ -81,6 +82,9 @@ export async function removeWorktreeByPath(path: string): Promise<boolean> {
+     const dotGit = await readFile(join(path, '.git'), 'utf8');
+     const gitDir = /^gitdir: (.+)$/m.exec(dotGit.trim())?.[1];
+     if (gitDir) {
++      // Remove any stale lock (e.g. index.lock) left by a killed git process so
++      // `git worktree remove` cannot wedge on it.
++      await clearStaleGitLocks(path).catch(() => undefined);
+       // <repo>/.git/worktrees/<name> -> <repo>
+       await removeWorktree(resolve(gitDir, '..', '..', '..'), path);
+       return true;
+@@ -161,6 +165,9 @@ export async function createVerificationWorktree(
+   const cleanup = async (): Promise<void> => {
+     if (cleaned) return;
+     cleaned = true;
++    // Clear stale git locks so the removal cannot wedge on a lock left by a
++    // killed process (e.g. SIGKILL mid-verification).
++    await clearStaleGitLocks(worktreePath).catch(() => undefined);
+     await git(repoRoot, ['worktree', 'remove', '--force', worktreePath], {
+       allowFailure: true,
+     });
+diff --git a/test/unit/autonomous/worktree-rollback-audit.test.ts b/test/unit/autonomous/worktree-rollback-audit.test.ts
+new file mode 100644
+index 0000000..b16b2db
+--- /dev/null
++++ b/test/unit/autonomous/worktree-rollback-audit.test.ts
+@@ -0,0 +1,270 @@
++/**
++ * Subsystem 7 — Speculative Rollback & Transient Worktree Isolation.
++ *
++ * Audit + hardening coverage for the speculative-rollback and transient-worktree
++ * primitives: `src/git/worktree.ts`, `src/git/rollback.ts`, `src/git/locks.ts`,
++ * and `src/autonomous/worktree-manager.ts`. Verifies:
++ *
++ *   1. Atomic speculative rollbacks restore a worktree on simulated failure and
++ *      never leave stale git index locks, unmerged heads, or orphaned branches.
++ *   2. Path containment: speculative mutation primitives cannot escape the
++ *      sandbox boundary via path traversal (`../`) or symlinks.
++ *   3. Deterministic lifecycle cleanup: transient worktrees are pruned/deleted
++ *      on completion/abort, and parallel agents get non-colliding names.
++ */
++import { existsSync } from 'node:fs';
++import { readFile, rm, utimes, writeFile } from 'node:fs/promises';
++import { join, relative, resolve } from 'node:path';
++import { describe, expect, it } from 'vitest';
++import { WorktreeManager } from '../../../src/autonomous/worktree-manager.js';
++import { git } from '../../../src/git/git.js';
++import { clearStaleGitLocks, gitDirFor } from '../../../src/git/locks.js';
++import { rollbackTo } from '../../../src/git/rollback.js';
++import {
++  createVerificationWorktree,
++  createWorktree,
++  removeWorktreeByPath,
++} from '../../../src/git/worktree.js';
++import { tempDir, tempRepo } from '../../support/tmp.js';
++
++async function seededRepo(): Promise<{ repo: string; head: string }> {
++  const repo = await tempRepo();
++  await writeFile(join(repo, 'a.txt'), 'one\n');
++  await git(repo, ['add', '-A']);
++  await git(repo, ['commit', '-qm', 'init']);
++  const head = (await git(repo, ['rev-parse', 'HEAD'])).stdout.trim();
++  return { repo, head };
++}
++
++const patchTouching = (): string =>
++  [
++    'diff --git a/a.txt b/a.txt',
++    '--- a/a.txt',
++    '+++ b/a.txt',
++    '@@ -1 +1,2 @@',
++    ' one',
++    '+two',
++    '',
++  ].join('\n');
++
++const escapePatch = (target: string): string =>
++  [
++    `diff --git a/${target} b/${target}`,
++    'new file mode 100644',
++    '--- /dev/null',
++    `+++ b/${target}`,
++    '@@ -0,0 +1 @@',
++    '+pwned',
++    '',
++  ].join('\n');
++
++function isInside(candidate: string, parent: string): boolean {
++  const rel = relative(resolve(parent), resolve(candidate));
++  return rel === '' || (!rel.startsWith('..') && !rel.startsWith('/'));
++}
++
++describe('atomic speculative rollback', () => {
++  it('rolls back a failed run byte-identically and leaves no stray files or unmerged state', async () => {
++    const { repo, head } = await seededRepo();
++    const wt = await createWorktree(repo, await tempDir(), 'r_audit1');
++    // Simulate a failed agent run: an edit, a brand-new file, an artifact dir.
++    await writeFile(join(wt.path, 'a.txt'), 'broken\n');
++    await writeFile(join(wt.path, 'junk.txt'), 'junk\n');
++    const patchPath = join(await tempDir(), 'rejected.patch');
++    const { savedPatch, exact } = await rollbackTo(wt.path, head, {
++      path: patchPath,
++      redact: (x) => x,
++    });
++
++    expect(savedPatch).toBe(true);
++    expect(exact).toBe(true);
++    // The failed attempt is persisted for review before the reset.
++    expect(await readFile(patchPath, 'utf8')).toContain('+broken');
++
++    // Byte-identical restore, no leftovers, no unmerged/conflicted entries.
++    expect(await readFile(join(wt.path, 'a.txt'), 'utf8')).toBe('one\n');
++    expect(existsSync(join(wt.path, 'junk.txt'))).toBe(false);
++    const status = (await git(wt.path, ['status', '--porcelain'])).stdout.trim();
++    expect(status).toBe('');
++    await rm(wt.path, { recursive: true, force: true });
++  });
++
++  it('recovers even when a stale index.lock would wedge a plain reset', async () => {
++    const { repo, head } = await seededRepo();
++    const wt = await createWorktree(repo, await tempDir(), 'r_audit2');
++    await writeFile(join(wt.path, 'a.txt'), 'broken\n');
++
++    // Plant a lock file exactly where git would put it during an interrupted run.
++    const gitDir = await gitDirFor(wt.path);
++    const lock = join(gitDir, 'index.lock');
++    await writeFile(lock, '');
++
++    const { savedPatch } = await rollbackTo(wt.path, head, {
++      path: join(await tempDir(), 'p.patch'),
++      redact: (x) => x,
++    });
++    expect(savedPatch).toBe(true);
++    // The hardened rollback cleared the lock, so the reset went through.
++    expect(existsSync(lock)).toBe(false);
++    expect(await readFile(join(wt.path, 'a.txt'), 'utf8')).toBe('one\n');
++    expect((await git(wt.path, ['status', '--porcelain'])).stdout.trim()).toBe('');
++    await rm(wt.path, { recursive: true, force: true });
++  });
++});
++
++describe('transient worktree path containment & airgap', () => {
++  it('confines verification worktrees under their configured root', async () => {
++    const { repo } = await seededRepo();
++    const root = await tempDir();
++    const wt = await createVerificationWorktree(repo, { root });
++    try {
++      expect(isInside(wt.worktreePath, root)).toBe(true);
++      expect(existsSync(wt.worktreePath)).toBe(true);
++    } finally {
++      await wt.cleanup();
++    }
++  });
++
++  it('rejects a patch that escapes the worktree via ../ traversal', async () => {
++    const { repo } = await seededRepo();
++    const root = await tempDir();
++    const outside = await tempDir();
++    const secret = join(outside, 'secret.txt');
++    await writeFile(secret, 'classified\n');
++
++    const wt = await createVerificationWorktree(repo, { root });
++    try {
++      const r = await wt.applyPatch(escapePatch('../../escape.txt'));
++      // Either git refuses the traversal outright, or it never reaches outside.
++      expect(r).toBe(false);
++      expect(await readFile(secret, 'utf8')).toBe('classified\n');
++      // Nothing may leak above the configured root either.
++      for (const name of await (await import('node:fs/promises')).readdir(root)) {
++        if (name.startsWith('verify-')) {
++          expect(isInside(join(root, name), root)).toBe(true);
++        }
++      }
++    } finally {
++      await wt.cleanup();
++    }
++  });
++
++  it('cannot traverse through a symlink planted in the worktree', async () => {
++    const { repo } = await seededRepo();
++    const outside = await tempDir();
++    const victim = join(outside, 'victim.txt');
++    await writeFile(victim, 'untouched\n');
++
++    const wt = await createVerificationWorktree(repo, { root: await tempDir() });
++    try {
++      const { symlink } = await import('node:fs/promises');
++      await symlink(outside, join(wt.worktreePath, 'evil'), 'dir');
++      const r = await wt.applyPatch(escapePatch('evil/victim.txt'));
++      // The symlink must not let a speculative patch mutate a host path.
++      expect(await readFile(victim, 'utf8')).toBe('untouched\n');
++      expect(r).toBe(false);
++    } finally {
++      await wt.cleanup();
++    }
++  });
++
++  it('applies a well-formed patch inside the worktree only', async () => {
++    const { repo } = await seededRepo();
++    const wt = await createVerificationWorktree(repo);
++    try {
++      expect(await wt.applyPatch(patchTouching())).toBe(true);
++      expect(await readFile(join(wt.worktreePath, 'a.txt'), 'utf8')).toBe('one\ntwo\n');
++      // Primary checkout untouched.
++      expect(await readFile(join(repo, 'a.txt'), 'utf8')).toBe('one\n');
++    } finally {
++      await wt.cleanup();
++    }
++  });
++});
++
++describe('parallel transient worktree allocation', () => {
++  it('allocates non-colliding worktrees and leaves no orphaned branches', async () => {
++    const { repo } = await seededRepo();
++    const root = await tempDir();
++    const beforeRefs = (await git(repo, ['for-each-ref', 'refs/heads'])).stdout;
++
++    const wts = await Promise.all(
++      Array.from({ length: 6 }, () => createVerificationWorktree(repo, { root })),
++    );
++    const paths = wts.map((w) => w.worktreePath);
++    expect(new Set(paths).size).toBe(paths.length); // no collisions
++    for (const p of paths) {
++      expect(existsSync(p)).toBe(true);
++      expect(isInside(p, root)).toBe(true);
++    }
++
++    await Promise.all(wts.map((w) => w.cleanup()));
++    for (const p of paths) expect(existsSync(p)).toBe(false);
++
++    // Detached throwaway worktrees must never create branches.
++    const afterRefs = (await git(repo, ['for-each-ref', 'refs/heads'])).stdout;
++    expect(afterRefs).toBe(beforeRefs);
++  });
++});
++
++describe('worktree lifecycle + git lock hygiene', () => {
++  it('clearStaleGitLocks removes only old locks and keeps fresh in-flight ones', async () => {
++    const { repo } = await seededRepo();
++    const gitDir = await gitDirFor(repo);
++
++    const stale = join(gitDir, 'stale.lock');
++    const fresh = join(gitDir, 'fresh.lock');
++    await writeFile(stale, '');
++    await writeFile(fresh, '');
++    const past = new Date(Date.now() - 60_000);
++    await utimes(stale, past, past);
++
++    const removed = await clearStaleGitLocks(repo);
++    expect(removed).toContain(stale);
++    expect(removed).not.toContain(fresh);
++    expect(existsSync(stale)).toBe(false);
++    expect(existsSync(fresh)).toBe(true); // young lock preserved (in-flight guard)
++
++    // An explicit zero-age sweep clears the remaining lock.
++    const swept = await clearStaleGitLocks(repo, { minAgeMs: 0 });
++    expect(swept).toContain(fresh);
++    expect(existsSync(fresh)).toBe(false);
++  });
++
++  it('removeWorktreeByPath clears a stale lock during teardown', async () => {
++    const { repo } = await seededRepo();
++    const wt = await createWorktree(repo, await tempDir(), 'r_audit_rm');
++    const lock = join(await gitDirFor(wt.path), 'index.lock');
++    await writeFile(lock, '');
++    const past = new Date(Date.now() - 60_000);
++    await utimes(lock, past, past);
++
++    expect(await removeWorktreeByPath(wt.path)).toBe(true);
++    expect(existsSync(wt.path)).toBe(false);
++    const list = await git(repo, ['worktree', 'list']);
++    expect(list.stdout).not.toContain(wt.path);
++  });
++
++  it('WorktreeManager.destroy clears a stale lock and prunes the worktree + wip ref', async () => {
++    const { repo, head } = await seededRepo();
++    const manager = new WorktreeManager({ repoRoot: repo, worktreesRoot: await tempDir() });
++    await manager.create('t_audit', head);
++
++    const taskPath = manager.pathFor('t_audit');
++    expect(existsSync(taskPath)).toBe(true);
++    const lock = join(await gitDirFor(taskPath), 'index.lock');
++    await writeFile(lock, '');
++    const past = new Date(Date.now() - 60_000);
++    await utimes(lock, past, past);
++
++    await manager.destroy('t_audit');
++    expect(existsSync(taskPath)).toBe(false);
++    expect(await manager.list()).toEqual([]);
++    const wip = (
++      await git(repo, ['show-ref', '--verify', '--quiet', manager.wipRef('t_audit')], {
++        allowFailure: true,
++      })
++    ).exitCode;
++    expect(wip).not.toBe(0);
++  });
++});
+diff --git a/vscode/media/chat.css b/vscode/media/chat.css
+index 45917e5..4adf84d 100644
+--- a/vscode/media/chat.css
++++ b/vscode/media/chat.css
+@@ -2082,6 +2082,8 @@ details.msg.think[open] .think-body {
+ 
+   to {
+     opacity: 1;
++  }
++}
+ 
+ details.msg.think[open] .think-body {
+   animation: think-reveal var(--dur-base) var(--ease);
+@@ -2870,6 +2872,30 @@ details.msg.think[open] > summary::after {
+     0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+ }
+ 
++/* Ghost keyboard hint, tucked into the deck's right side (left of Send). It
++   only shows while the composer is empty; typing fades it out (.has-text). */
++.key-hint {
++  position: absolute;
++  top: 50%;
++  right: 44px;
++  transform: translateY(-50%);
++  display: inline-flex;
++  align-items: center;
++  pointer-events: none;
++  color: var(--muted);
++  font-size: var(--fs-xs);
++  font-family: var(--mono);
++  white-space: nowrap;
++  letter-spacing: 0.01em;
++  opacity: 0.9;
++  transition: opacity var(--dur-fast) var(--ease);
++  user-select: none;
++}
++
++.input-deck.has-text .key-hint {
++  opacity: 0;
++}
++
+ textarea {
+   width: 100%;
+   resize: none;
+@@ -3173,6 +3199,63 @@ textarea::placeholder {
+   color: var(--accent);
+ }
+ 
++/* Token meter: a tiny context-window gauge inside the ctx button — a hairline
++   track with a proportional fill that shifts green → amber → red as the
++   window fills. The meter track is fixed-width so digits don't jiggle it. */
++.token-meter-track {
++  position: relative;
++  flex: none;
++  width: 34px;
++  height: 4px;
++  overflow: hidden;
++  border-radius: 2px;
++  background: color-mix(in srgb, var(--muted) 25%, transparent);
++}
++
++.token-meter-fill {
++  position: absolute;
++  inset: 0 auto 0 0;
++  width: 0%;
++  border-radius: inherit;
++  background: var(--ok);
++  transition:
++    width var(--dur-base) var(--ease),
++    background var(--dur-base) var(--ease);
++}
++
++.token-meter[data-level='mid'] .token-meter-fill {
++  background: var(--warn);
++}
++
++.token-meter[data-level='high'] .token-meter-fill {
++  background: var(--bad);
++}
++
++.token-meter-val {
++  color: inherit;
++}
++
++/* Compact sidebars (340px): the icon-backed items collapse to icon-only and
++   the model's share shrinks, so the line never wraps to two rows. */
++@media (max-width: 360px) {
++  #status-daemon-label,
++  #model-label,
++  #status-tokens-label,
++  .settings-label,
++  .sb-label {
++    display: none;
++  }
++
++  .status-model {
++    min-width: 72px;
++    max-width: 42%;
++  }
++
++  .token-meter-track {
++    width: 24px;
++  }
++}
++
+ /* Power: the control board. Dormant by default (body[data-power='off']):
+    the whole panel is desaturated and dimmed; only the logo power button
+    stays lit, pulsing gently until it is woken. Waking replays a ~600ms
+@@ -4096,6 +4179,7 @@ body.split-view .terminal-drawer.collapsed {
+ .empty-hint code:hover {
+   background: color-mix(in srgb, var(--accent) 10%, var(--card));
+   border-color: color-mix(in srgb, var(--accent) 30%, var(--line));
++}
+ 
+ /* ==========================================================================
+    #inspector — Context Cockpit: segmented token progress bar with glowing
+diff --git a/vscode/preview/webview.html b/vscode/preview/webview.html
+index c727484..44cf00f 100644
+--- a/vscode/preview/webview.html
++++ b/vscode/preview/webview.html
+@@ -193,64 +193,30 @@
+ <footer class="composer">
+   <div id="suggest" class="suggest" hidden role="listbox" aria-label="Suggestions"></div>
+   <div id="statusline" class="statusline" role="status" aria-label="Session status">
+-    <button id="power" class="power" title="Power on: wake omnexx" aria-label="Power omnexx on or off" aria-pressed="true"><img src="../media/logo.png" alt=""></button>
++    <button id="power" class="power" title="Power on: wake omnexx" aria-label="Power omnexx on or off" aria-pressed="false"><img src="../media/logo.png" alt=""></button>
+     <span class="sep" aria-hidden="true">·</span>
+-    <button id="model" class="status-model" data-action="settingsModels" title="Chat model: click to see your models in Settings"><svg class="status-ico" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.2" y="3.2" width="9.6" height="9.6" rx="2"/><path d="M6 1.6v1.6M10 1.6v1.6M6 12.8v1.6M10 12.8v1.6M1.6 6h1.6M1.6 10h1.6M12.8 6h1.6M12.8 10h1.6"/></svg><span id="model-label">Pick a model</span></button>
++    <button id="model" class="status-model" data-action="settingsModels" title="Chat model: click to see your models in Settings">Pick a model</button>
+     <span class="sep" aria-hidden="true">·</span>
+-    <span id="status-tokens" class="status-item" title="Tokens used this session"><svg class="status-ico" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8" cy="4.2" rx="4.6" ry="1.8"/><path d="M3.4 4.2v3.2c0 1 2.06 1.8 4.6 1.8s4.6-.8 4.6-1.8V4.2M3.4 7.4v3.2c0 1 2.06 1.8 4.6 1.8s4.6-.8 4.6-1.8V7.4"/></svg><span id="status-tokens-label">0 tok</span></span>
++    <span id="status-tokens" class="status-item" title="Tokens used this session">0 tok</span>
+     <span class="sep" aria-hidden="true">·</span>
+     <span id="status-step" class="status-item">idle</span>
+     <span class="grow"></span>
+-    <button
+-      id="status-daemon"
+-      class="status-item as-button"
+-      data-action="toggleDaemon"
+-      title="Click to start/stop 24/7 Autonomous Daemon"
+-    >
+-      <svg
+-        class="status-ico"
+-        viewBox="0 0 16 16"
+-        width="12"
+-        height="12"
+-        fill="currentColor"
+-        aria-hidden="true"
+-      >
+-        <path d="M9 1 3 9h3.5L6 15l6-8H8.5z" /></svg
+-      ><span id="status-daemon-label">24/7 Off</span>
+-    </button>
++    <button id="status-daemon" class="status-item as-button" data-action="toggleDaemon" title="Click to start/stop 24/7 Autonomous Daemon"><svg class="status-ico" viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M9 1 3 9h3.5L6 15l6-8H8.5z"/></svg><span id="status-daemon-label">24/7 Off</span></button>
+     <span class="sep" aria-hidden="true">·</span>
+-    <button id="status-ctx" class="status-item as-button" data-action="inspect" title="Context in use; click to see, edit or delete what the model gets">ctx —</button>
++    <button id="status-ctx" class="status-item as-button token-meter" data-action="inspect" data-level="low" title="Context in use; click to see, edit or delete what the model gets">
++      <span class="token-meter-track"><span id="ctx-fill" class="token-meter-fill" style="width:0%"></span></span>
++      <span id="ctx-val" class="token-meter-val">ctx 0%</span>
++    </button>
+     <span class="sep" aria-hidden="true">·</span>
+     <button id="sb-open-settings" class="status-item as-button" data-action="open-sandbox-settings" title="Sandbox: mounts, env masks, airgap, and checkpoint timeline"><svg class="status-ico sandbox-ico" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 11 8 15l6-4V5L8 1 2 5zM2 5l6 4 6-4M8 9v6"/></svg><span class="sb-label">Sandbox</span></button>
+     <span class="sep" aria-hidden="true">·</span>
+-    <button
+-      id="status-settings"
+-      class="status-item as-button"
+-      data-action="settings"
+-      title="Settings (Click to configure models, providers & autonomous)"
+-    >
+-      <svg
+-        class="status-ico"
+-        viewBox="0 0 16 16"
+-        width="12"
+-        height="12"
+-        fill="none"
+-        stroke="currentColor"
+-        stroke-width="1.4"
+-        stroke-linecap="round"
+-        aria-hidden="true"
+-      >
+-        <circle cx="8" cy="8" r="2.2" />
+-        <path
+-          d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6 11 5M5 11l-1.4 1.4"
+-        /></svg
+-      >Settings
+-    </button>
++    <button id="status-settings" class="status-item as-button" data-action="settings" title="Settings (Click to configure models, providers & autonomous)"><svg class="status-ico" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6 11 5M5 11l-1.4 1.4"/></svg><span class="settings-label">Settings</span></button>
+   </div>
+-  <div class="input-wrap">
++  <form id="composer-form" class="input-deck" autocomplete="off">
+     <textarea id="input" rows="1" aria-label="Message omnexx"></textarea>
+-    <button id="send" class="send" title="Send (Enter)" aria-label="Send"><svg class="stop-ico" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor"/></svg><svg class="send-ico" viewBox="0 0 16 16"><path d="M2 8l11-5-3.5 11-2.2-4.3z M7.3 9.7 13 3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
+-  </div>
++    <span class="key-hint" aria-hidden="true">Enter ↵ · ⇧↵ newline</span>
++    <button id="send-btn" class="send" type="button" title="Send (Enter)" aria-label="Send"><svg class="stop-ico" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor"/></svg><svg class="send-ico" viewBox="0 0 16 16"><path d="M2 8l11-5-3.5 11-2.2-4.3z M7.3 9.7 13 3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>
++  </form>
+   <div class="row">
+     <div class="modes" role="group" aria-label="Mode">
+       <button data-mode="chat" aria-pressed="true" title="Work turn by turn with you">Chat</button>
+diff --git a/vscode/screenshots/01_welcome.png b/vscode/screenshots/01_welcome.png
+index e4237c2..ae6e3fc 100644
+Binary files a/vscode/screenshots/01_welcome.png and b/vscode/screenshots/01_welcome.png differ
+diff --git a/vscode/screenshots/02_streaming_think.png b/vscode/screenshots/02_streaming_think.png
+index e4237c2..33d142a 100644
+Binary files a/vscode/screenshots/02_streaming_think.png and b/vscode/screenshots/02_streaming_think.png differ
+diff --git a/vscode/screenshots/03_tools_diffs.png b/vscode/screenshots/03_tools_diffs.png
+index e4237c2..c0f69b1 100644
+Binary files a/vscode/screenshots/03_tools_diffs.png and b/vscode/screenshots/03_tools_diffs.png differ
+diff --git a/vscode/screenshots/04_approval_gate.png b/vscode/screenshots/04_approval_gate.png
+index e4237c2..a216c53 100644
+Binary files a/vscode/screenshots/04_approval_gate.png and b/vscode/screenshots/04_approval_gate.png differ
+diff --git a/vscode/screenshots/05_context_cockpit.png b/vscode/screenshots/05_context_cockpit.png
+index e4237c2..25495e9 100644
+Binary files a/vscode/screenshots/05_context_cockpit.png and b/vscode/screenshots/05_context_cockpit.png differ
+diff --git a/vscode/screenshots/06_settings.png b/vscode/screenshots/06_settings.png
+index e4237c2..e87d6b5 100644
+Binary files a/vscode/screenshots/06_settings.png and b/vscode/screenshots/06_settings.png differ
+diff --git a/vscode/screenshots/07_sandbox_scrubber.png b/vscode/screenshots/07_sandbox_scrubber.png
+index b0dc818..5adb35e 100644
+Binary files a/vscode/screenshots/07_sandbox_scrubber.png and b/vscode/screenshots/07_sandbox_scrubber.png differ
+diff --git a/vscode/screenshots/INDEX.md b/vscode/screenshots/INDEX.md
+index 8311bfc..207d4b6 100644
+--- a/vscode/screenshots/INDEX.md
++++ b/vscode/screenshots/INDEX.md
+@@ -1,55 +1,55 @@
+ # Omnexx VS Code UI Gallery
+ 
+-Captured at: `2026-11-09T19:10:15.554Z`
++Captured at: `2026-11-09T19:17:19.826Z`
+ Viewport: **400 × 820 px** (Standard VS Code sidebar panel)
+ Theme: **VS Code Dark Modern**
+ 
+ ---
+ 
+ ### 01. Welcome & Empty State
+-File: `01_welcome.png` (81.4 KB)
++File: `01_welcome.png` (54.0 KB)
+ 
+ ![01. Welcome & Empty State](./01_welcome.png)
+ 
+ ---
+ 
+ ### 02. Active Streaming & Chain-of-Thought
+-File: `02_streaming_think.png` (81.4 KB)
++File: `02_streaming_think.png` (63.1 KB)
+ 
+ ![02. Active Streaming & Chain-of-Thought](./02_streaming_think.png)
+ 
+ ---
+ 
+ ### 03. Tool Execution & Diffs
+-File: `03_tools_diffs.png` (81.4 KB)
++File: `03_tools_diffs.png` (55.6 KB)
+ 
+ ![03. Tool Execution & Diffs](./03_tools_diffs.png)
+ 
+ ---
+ 
+ ### 04. Approval Gate (Command Review)
+-File: `04_approval_gate.png` (81.4 KB)
++File: `04_approval_gate.png` (49.9 KB)
+ 
+ ![04. Approval Gate (Command Review)](./04_approval_gate.png)
+ 
+ ---
+ 
+ ### 05. Context Inspector & Token Cockpit
+-File: `05_context_cockpit.png` (81.4 KB)
++File: `05_context_cockpit.png` (69.9 KB)
+ 
+ ![05. Context Inspector & Token Cockpit](./05_context_cockpit.png)
+ 
+ ---
+ 
+ ### 06. Settings & Model Matrix
+-File: `06_settings.png` (81.4 KB)
++File: `06_settings.png` (36.7 KB)
+ 
+ ![06. Settings & Model Matrix](./06_settings.png)
+ 
+ ---
+ 
+ ### 07. Sandbox Scrubber Timeline
+-File: `07_sandbox_scrubber.png` (87.0 KB)
++File: `07_sandbox_scrubber.png` (45.8 KB)
+ 
+ ![07. Sandbox Scrubber Timeline](./07_sandbox_scrubber.png)
+ 

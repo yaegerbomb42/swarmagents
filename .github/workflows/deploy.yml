@@ -1,0 +1,75 @@
+name: Deploy
+
+# Manual by default. To deploy on every merge to main, uncomment the push
+# trigger below (and keep the `production` environment's protection rules).
+#
+# The VPS pulls origin/main from GitHub itself and builds there, so this job
+# only runs the whitelisted forced command (`deploy`, `status`, ...) over SSH.
+# Required repo secrets are documented in docs/deploy/README.md.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Forced-command action to run on the VPS
+        type: choice
+        default: deploy
+        options: [deploy, status, rollback, logs, cleanup, build-desktop, desktop-on, desktop-off]
+      skip_gates:
+        description: Skip the typecheck/unit-test gate before deploying (not recommended)
+        type: boolean
+        default: false
+  # push:
+  #   branches: [main]
+  #   paths: ["apps/swarmagents/**"]
+
+concurrency:
+  group: swarmagents-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: Gates (typecheck + unit tests)
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.action == 'deploy' && !inputs.skip_gates) }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/swarmagents
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/swarmagents/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:unit
+
+  ship:
+    name: Run ${{ inputs.action || 'deploy' }} on the VPS
+    needs: [gates]
+    # `gates` is skipped for non-deploy actions and when skip_gates is set.
+    if: ${{ !cancelled() && github.repository == 'yaegerbomb42/swarmagents' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (needs.gates.result == 'success' || needs.gates.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare SSH key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/swarm_deploy
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/swarm_known_hosts
+      - name: Run ${{ inputs.action || 'deploy' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: /home/runner/.ssh/swarm_deploy
+          DEPLOY_KNOWN_HOSTS: /home/runner/.ssh/swarm_known_hosts
+        run: ./deploy.sh "${{ inputs.action || 'deploy' }}"

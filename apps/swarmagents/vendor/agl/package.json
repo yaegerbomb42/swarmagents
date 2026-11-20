@@ -1,0 +1,32 @@
+{
+  "name": "agl-lang",
+  "version": "1.0.0",
+  "description": "Agentic Grammar Language (AGL) runtime, parser, and multi-agent synthesis swarm",
+  "type": "module",
+  "main": "dist/bundle.mjs",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "agl-run": "./dist/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "agl_ledger.json",
+    "README.md",
+    "MINECRAFT_SPEC.md",
+    "examples"
+  ],
+  "scripts": {
+    "test": "node dist/cli.mjs examples/hypercube_3d.agl"
+  },
+  "keywords": [
+    "agl",
+    "agentic-grammar",
+    "dsl",
+    "runtime",
+    "multi-agent",
+    "lisp",
+    "ast"
+  ],
+  "author": "yaeger",
+  "license": "MIT"
+}

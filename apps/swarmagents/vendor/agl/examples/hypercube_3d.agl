@@ -1,0 +1,71 @@
+(lvl:0:block
+  ;; =========================================================================
+  ;; 💠 AGL 3D MATRIX PROJECTION & VECTOR TRANSFORMATION PIPELINE
+  ;; Computes 3D vertices, rotates along X/Y/Z with trigonometry, and projects to 2D
+  ;; =========================================================================
+
+  ;; 1. Define 8 Vertices of a Unit Cube [-1, 1] in 3D Space
+  (lvl:0:set "cube_vertices"
+    (lvl:0:list
+      (lvl:0:dict "x" -1 "y" -1 "z" -1)
+      (lvl:0:dict "x"  1 "y" -1 "z" -1)
+      (lvl:0:dict "x"  1 "y"  1 "z" -1)
+      (lvl:0:dict "x" -1 "y"  1 "z" -1)
+      (lvl:0:dict "x" -1 "y" -1 "z"  1)
+      (lvl:0:dict "x"  1 "y" -1 "z"  1)
+      (lvl:0:dict "x"  1 "y"  1 "z"  1)
+      (lvl:0:dict "x" -1 "y"  1 "z"  1)
+    )
+  )
+
+  ;; 2. Rotation and Perspective Projection Function
+  (lvl:0:def "project_vertex" (v rad_x rad_y fov)
+    (lvl:0:block
+      ;; Rotate around Y axis
+      (lvl:0:set "x1" (lvl:0:sub (lvl:0:mul (lvl:0:at v "x") 0.866) (lvl:0:mul (lvl:0:at v "z") 0.5)))
+      (lvl:0:set "z1" (lvl:0:add (lvl:0:mul (lvl:0:at v "x") 0.5) (lvl:0:mul (lvl:0:at v "z") 0.866)))
+      
+      ;; Rotate around X axis
+      (lvl:0:set "y2" (lvl:0:sub (lvl:0:mul (lvl:0:at v "y") 0.866) (lvl:0:mul (lvl:0:get "z1") 0.5)))
+      (lvl:0:set "z2" (lvl:0:add (lvl:0:mul (lvl:0:at v "y") 0.5) (lvl:0:mul (lvl:0:get "z1") 0.866)))
+
+      ;; Perspective Divide
+      (lvl:0:set "camera_dist" (lvl:0:add (lvl:0:get "z2") 3.5))
+      (lvl:0:set "scale" (lvl:0:div fov (lvl:0:get "camera_dist")))
+
+      ;; 2D Screen Projection
+      (lvl:0:dict
+        "screen_x" (lvl:0:mul (lvl:0:get "x1") (lvl:0:get "scale"))
+        "screen_y" (lvl:0:mul (lvl:0:get "y2") (lvl:0:get "scale"))
+        "depth" (lvl:0:get "z2")
+      )
+    )
+  )
+
+  ;; 3. Level 2 Concurrently Fan-Out Transformation across all 8 vertices
+  (lvl:0:set "projected_points"
+    (lvl:2:fan_out (lvl:0:get "cube_vertices")
+      (lvl:0:call "project_vertex" $item 0.5 0.5 250)
+    )
+  )
+
+  ;; 4. Level 3 Render Generative UI Interactive 3D Canvas
+  (lvl:0:set "cube_ui"
+    (lvl:3:render_ui "hypercube_3d_canvas"
+      (lvl:0:dict
+        "total_vertices" 8
+        "total_edges" 12
+        "sample_projected" (lvl:0:at (lvl:0:get "projected_points") 0)
+      )
+    )
+  )
+
+  ;; 5. Output Frame Telemetry
+  (lvl:0:dict
+    "status" "3D_PIPELINE_SYNTHESIZED"
+    "vertices_count" (lvl:0:len (lvl:0:get "projected_points"))
+    "first_point_2d" (lvl:0:at (lvl:0:get "projected_points") 0)
+    "last_point_2d" (lvl:0:at (lvl:0:get "projected_points") 7)
+    "ui_widget" (lvl:0:at (lvl:0:get "cube_ui") "ui_type")
+  )
+)

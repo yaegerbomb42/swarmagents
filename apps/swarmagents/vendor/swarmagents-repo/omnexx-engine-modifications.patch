@@ -1,0 +1,2004 @@
+--- a/vendor/omnexx/src/agent/loop.ts
++++ b/swarmagents-repo/packages/engine/src/agent/loop.ts
+@@ -71,6 +71,12 @@
+ import { buildEscalationHandoff } from '../router/escalation-handoff.js';
+ import { toolStateProgress } from '../runtime/kernel/telemetry.js';
+ import { todoItemsOf, todoNudge, todoTool, type TodoItem } from '../tools/todo.js';
++import {
++  applyRoleToLoopContext,
++  applyRoleToLoopDeps,
++  toolDenialMessage,
++  type RoleDefinition,
++} from '../roles/index.js';
+ 
+ /** Thrown inside the retry loop when a pre-flight check refuses the call; ends the cycle, never retried. */
+ class BudgetStopSignal extends Error {
+@@ -253,6 +259,8 @@
+   /** How the chain is used per call (routing.ts): random reshuffles, priority ignores quota marks. */
+   strategy?: Strategy;
+   tools: readonly Tool[];
++  /** Optional declarative role bound to this loop (whitelist, permissions, clamps). */
++  role?: RoleDefinition;
+   toolCtx: ToolContext;
+   /** Lazy tool discovery state (persists across context compaction). */
+   loadedToolsState?: LoadedToolsState | null;
+@@ -293,7 +301,10 @@
+   retry?: {
+     baseDelayMs?: number;
+     maxDelayMs?: number;
+-    /** Give up after this long with no provider able to take the call. */
++    /**
++     * Give up after this long with no provider able to take the call. Unset uses
++     * DEFAULT_PROVIDER_GIVE_UP_MS (30 min), so an unconfigured 429/5xx cascade is bounded.
++     */
+     giveUpAfterMs?: number;
+     onOutage?: (ms: number) => void;
+   };
+@@ -436,6 +447,43 @@
+ /** Extra tries for a 400 on one call (a pool may route the retry to another model). */
+ const BAD_REQUEST_RETRIES = 2;
+ 
++/**
++ * Hard ceiling for one uninterrupted provider outage when the caller did not configure
++ * `retry.giveUpAfterMs`. `withRetry` otherwise waits for ever ("unset: wait for ever"), which
++ * turns a cascading 429/5xx chain into an unbounded stall: interactive sessions and helper loops
++ * never reach a cycle boundary that would enforce the run's own time limit. Callers that have a
++ * budget (`budget.max_provider_wait`, default 6h) still pass their value and override this.
++ */
++export const DEFAULT_PROVIDER_GIVE_UP_MS = 30 * 60_000;
++
++/** Marker for a tool/model promise that lost the race against the turn's abort signal. */
++class AbortedError extends Error {
++  constructor(readonly reason: unknown) {
++    super(reason instanceof Error ? reason.message : 'turn aborted');
++  }
++}
++
++/**
++ * Race a promise against an abort signal. The underlying work is not cancelled here (tools get
++ * the same signal and kill their own subprocesses), but a tool or hook that ignores the signal
++ * can no longer wedge the turn forever: the race settles immediately and the caller synthesizes a
++ * normal cancellation result, preserving the tool_use/tool_result pairing the providers require.
++ */
++export async function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
++  if (signal === undefined) return promise;
++  if (signal.aborted) throw new AbortedError(signal.reason);
++  let onAbort: (() => void) | undefined;
++  const aborted = new Promise<never>((_, reject) => {
++    onAbort = () => reject(new AbortedError(signal.reason));
++    signal.addEventListener('abort', onAbort, { once: true });
++  });
++  try {
++    return await Promise.race([promise, aborted]);
++  } finally {
++    if (onAbort) signal.removeEventListener('abort', onAbort);
++  }
++}
++
+ /** Failed attempts with a server error before checking whether the provider itself is up. */
+ export const POISON_PROBE_AFTER = 3;
+ 
+@@ -543,6 +591,8 @@
+   },
+   deps: LoopDeps,
+ ): Promise<LoopResult> {
++  deps = applyRoleToLoopDeps(deps);
++  ctx = applyRoleToLoopContext(ctx, deps.role);
+   let messages: Message[] = [...(ctx.history ?? []), ctx.first];
+   if (deps.systemOne) {
+     // The pre-fetch rides in the new user turn, after the cached history and system prefix.
+@@ -571,6 +621,14 @@
+   const budgetAllocator = new TurnBudgetAllocator();
+   const budgetPlan: TurnBudgetPlan | undefined =
+     deps.tokensPerTurn !== undefined ? budgetAllocator.planFor(deps.tokensPerTurn) : undefined;
++  /**
++   * Belt-and-braces termination bound. `preflight` enforces `max_turns_per_cycle` before every
++   * provider call, but it only runs when a model is actually attempted: a chain whose providers are
++   * all cooling/blocked, an empty chain, or a path that `continue`s without a call could otherwise
++   * spin outside that check. The loop increments `turns` exactly once per iteration, so this guard
++   * is equivalent at normal budgets and still terminates in the degenerate paths.
++   */
++  const turnCeiling = Math.max(1, Math.floor(deps.budget.max_turns_per_cycle));
+   // Turn-efficiency deduplication state (unchanged re-reads + redundant verification).
+   const verificationCoalescer = new VerificationCoalescer();
+   let toolSeq = 0;
+@@ -604,6 +662,21 @@
+   let forcedSummaryTurn = false;
+   let turnDirective = '';
+   for (;;) {
++    // Hard turn bound first: no provider call, kernel plan, compaction or tool wave may run past it.
++    if (turns >= turnCeiling) {
++      deps.events.emit('budget.preflight_stop', {
++        stop: 'max_turns_per_cycle',
++        detail: `${turns} turns used this cycle (hard loop ceiling)`,
++        turn: turns,
++      });
++      return end('max_turns_per_cycle');
++    }
++    // The run deadline is an absolute wall-clock bound too; without this check it only annotated
++    // tool results and a run could keep paying for turns until its token/dollar caps tripped.
++    if (deps.deadlineMs !== undefined && deps.clock.now() >= deps.deadlineMs) {
++      deps.events.emit('loop.deadline', { turn: turns, deadlineMs: deps.deadlineMs });
++      return { ...end('stop'), detail: 'run deadline reached' };
++    }
+     // Refresh tools at the start of each turn if refreshTools is provided (lazy mode).
+     if (deps.refreshTools) {
+       const { tools: freshTools, specs: freshSpecs } = deps.refreshTools();
+@@ -682,14 +755,29 @@
+       deps.events.emit('control.paused', { turn: turns });
+       deps.onPauseChange?.(true);
+       while (signal === 'pause') {
+-        await deps.clock.sleep(deps.pausePollMs ?? 1_000);
++        // A stop (Esc / daemon shutdown) must break the pause immediately, not wait for the
++        // control file to change: before this, an aborted turn stayed parked in the poll loop.
++        if (deps.signal?.aborted) break;
++        try {
++          await deps.clock.sleep(deps.pausePollMs ?? 1_000, deps.signal);
++        } catch (err) {
++          if (deps.signal?.aborted) break;
++          throw err;
++        }
+         signal = await deps.control();
+       }
+       deps.onPauseChange?.(false);
++      if (deps.signal?.aborted) {
++        deps.events.emit('control.aborted', { turn: turns, during: 'pause' });
++        return end('stop-now');
++      }
+       deps.events.emit('control.resumed', { turn: turns });
+     }
+     if (signal === 'stop' || signal === 'stop-now') return end(signal);
+-    if (deps.signal?.aborted) return end('stop-now');
++    if (deps.signal?.aborted) {
++      deps.events.emit('control.aborted', { turn: turns, during: 'turn-start' });
++      return end('stop-now');
++    }
+ 
+     if (deps.rolling && turns > 0) {
+       // Rolling memory: every few turns rewrite working memory into the compact note and keep
+@@ -705,7 +793,16 @@
+             rolling.persistTranscript ??
+             ((text) =>
+               appendTranscriptFile(deps.toolCtx.store.logsDir, deps.toolCtx.redactor.text(text))),
+-        }).catch(() => undefined);
++        }).catch((err: unknown) => {
++          // Condensation is the context-size safety net; a silent failure here means the
++          // prompt can grow to the provider's hard window with no trace of why. Surface it and
++          // let the token-threshold compaction (when configured) act as the backstop.
++          deps.events.emit('context.condense_failed', {
++            turn: turns,
++            error: err instanceof Error ? err.message : String(err),
++          });
++          return undefined;
++        });
+         if (condensed) {
+           messages = condensed.messages;
+           lastCondenseTurn = turns;
+@@ -1012,9 +1109,9 @@
+             deps.events.emit('provider.recovered', { outageMs: ms, attempts }),
+           ...(deps.retry?.baseDelayMs !== undefined ? { baseDelayMs: deps.retry.baseDelayMs } : {}),
+           ...(deps.retry?.maxDelayMs !== undefined ? { maxDelayMs: deps.retry.maxDelayMs } : {}),
+-          ...(deps.retry?.giveUpAfterMs !== undefined
+-            ? { giveUpAfterMs: deps.retry.giveUpAfterMs }
+-            : {}),
++          // Always pass a ceiling: an unset value used to mean "retry for ever", so a 429 storm
++          // in an interactive/helper loop could stall without ever reaching a turn boundary.
++          giveUpAfterMs: deps.retry?.giveUpAfterMs ?? DEFAULT_PROVIDER_GIVE_UP_MS,
+           ...(deps.signal ? { signal: deps.signal } : {}),
+         },
+       );
+@@ -1141,6 +1238,15 @@
+     const finished = { now: false };
+     const branchState = { riskyToolFailed: false };
+     const runCallInner = async (call: (typeof calls)[number]): Promise<ContentBlock> => {
++      const denied = toolDenialMessage(deps.role, call.name);
++      if (denied) {
++        return {
++          type: 'tool_result',
++          toolUseId: call.id,
++          content: denied,
++          isError: true,
++        };
++      }
+       // Lazy mode: auto-load tool group if tool exists but isn't loaded
+       if (deps.loadedToolsState && !deps.loadedToolsState.toolToGroup.has(call.name)) {
+         // Tool not in any group (e.g., MCP tools) - allow it
+@@ -1423,9 +1529,20 @@
+      */
+     const runCall = async (call: (typeof calls)[number]): Promise<ContentBlock> => {
+       try {
+-        return await runCallInner(call);
++        // Race the whole call (hooks + tool.run) against the abort signal. Tools receive the
++        // signal themselves and kill subprocesses; the race covers a tool/hook that ignores it.
++        return await abortable(runCallInner(call), deps.signal);
+       } catch (err) {
+         if (err instanceof StopRequested) throw err;
++        if (err instanceof AbortedError || deps.signal?.aborted) {
++          // Keep the tool_use/tool_result pairing; the loop returns stop-now at the next boundary.
++          return {
++            type: 'tool_result',
++            toolUseId: call.id,
++            content: `[harness:interrupted] ${call.name} was interrupted; its result is not available.`,
++            isError: true,
++          };
++        }
+         const message = err instanceof Error ? err.message : String(err);
+         return {
+           type: 'tool_result',
+--- a/vendor/omnexx/src/agent/swarm.ts
++++ b/swarmagents-repo/packages/engine/src/agent/swarm.ts
+@@ -148,17 +148,23 @@
+   implementer: (spec: MilestoneSpec, ctx: SwarmPhaseContext) => Promise<ImplResult>;
+   redTeam: (spec: MilestoneSpec, impl: ImplResult) => Promise<QaResult>;
+   auditor: (spec: MilestoneSpec, impl: ImplResult, qa: QaResult) => Promise<AuditResult>;
++  /** Optional pre-implementation review of a proposal (security, speed, correctness). */
++  reviewer?: (spec: MilestoneSpec) => Promise<PeerReview>;
+ }
+ 
+ export type SwarmPhase = SwarmRoleId;
+ 
+ /** Phase lifecycle, delivered to the coordinator's onEvent callback. */
+ export interface SwarmEvent {
+-  phase: SwarmPhase;
++  phase?: SwarmPhase;
+   stage: 'start' | 'done';
+   at: number;
+   /** The spec id once the architect has produced it; the goal before that. */
+   detail: string;
++  /** Telemetry: the delegation-bus message type when this is a bus/consensus event. */
++  messageType?: SwarmMessageType;
++  /** Telemetry: JSON-serializable payload for WebSocket/SSE consumers. */
++  payload?: unknown;
+ }
+ 
+ export interface SwarmCoordinatorDeps {
+@@ -166,6 +172,8 @@
+   scratchpad: SharedScratchpad;
+   locks: RegionLockManager;
+   onEvent?: (event: SwarmEvent) => void;
++  /** Optional delegation bus; when set, protocol messages are published to it. */
++  bus?: DelegationBus;
+   /** Clock for event timestamps; injectable for deterministic tests. */
+   now?: () => number;
+   /** Timeout for the implementer phase's lock acquisition; waits indefinitely when omitted. */
+@@ -189,6 +197,7 @@
+   private readonly executors: SwarmExecutors;
+   private readonly scratchpad: SharedScratchpad;
+   private readonly locks: RegionLockManager;
++  private readonly bus: DelegationBus | undefined;
+   private readonly onEvent: ((event: SwarmEvent) => void) | undefined;
+   private readonly now: () => number;
+   private readonly lockTimeoutMs: number | undefined;
+@@ -197,6 +206,7 @@
+     this.executors = deps.executors;
+     this.scratchpad = deps.scratchpad;
+     this.locks = deps.locks;
++    this.bus = deps.bus;
+     this.onEvent = deps.onEvent;
+     this.now = deps.now ?? Date.now;
+     this.lockTimeoutMs = deps.lockTimeoutMs;
+@@ -253,7 +263,287 @@
+     return { spec, impl, qa, audit, verdict };
+   }
+ 
++  /**
++   * Run the four-step deliberation protocol for a goal:
++   *   propose_plan -> peer_review -> delegate_task -> consensus_reached.
++   *
++   * This is a pre-execution agreement layer: it does not write code. Every bus
++   * message and the final consensus verdict are emitted as JSON telemetry events
++   * via onEvent, so dashboards can subscribe over WebSocket or SSE.
++   */
++  async deliberate(goal: string): Promise<DeliberationOutcome> {
++    const roundId = `round-${this.now()}`;
++    const messages: SwarmMessage[] = [];
++
++    const publish = (message: Omit<SwarmMessage, 'id' | 'timestamp'>): void => {
++      const emitted = this.bus?.publish(message);
++      if (emitted) messages.push(emitted);
++      this.emitTelemetry(emitted ? emitted.type : message.type, message.from, message.payload);
++    };
++
++    // 1. propose_plan — the planner breaks the goal into sub-tasks.
++    this.emit('architect', 'start', goal);
++    const spec = await this.executors.architect(goal);
++    this.emit('architect', 'done', spec.id);
++
++    const subTasks = spec.files.map((file) => ({
++      id: file.path,
++      title: `${file.action} ${file.path}`,
++      seat: 'implementer',
++      summary: file.path,
++    }));
++    publish({
++      type: 'propose_plan',
++      from: 'coordinator',
++      payload: { goal, roundId, subTasks },
++    });
++
++    // 2. peer_review — the critic scores the proposal for security, speed, correctness.
++    const review: PeerReview =
++      this.executors.reviewer !== undefined
++        ? await this.executors.reviewer(spec)
++        : ({
++            proposalId: spec.id,
++            reviewer: 'auditor',
++            scores: { security: 100, speed: 100, correctness: 100 },
++            verdict: 'approve' as const,
++            notes: [] as string[],
++          } as PeerReview);
++    publish({
++      type: 'peer_review',
++      from: review.reviewer,
++      payload: {
++        proposalId: spec.id,
++        roundId,
++        reviewer: review.reviewer,
++        scores: review.scores,
++        verdict: review.verdict,
++        notes: review.notes,
++      },
++    });
++
++    // 3. delegate_task — hand each sub-task to a specialized worker seat.
++    const reviewPasses = review.verdict === 'approve';
++    if (reviewPasses) {
++      for (const file of spec.files) {
++        const seat = seatFor(file);
++        publish({
++          type: 'delegate_task',
++          from: 'coordinator',
++          to: seat,
++          payload: {
++            roundId,
++            taskId: file.path,
++            seat,
++            instruction: `${file.action} ${file.path}`,
++          },
++        });
++      }
++    }
++
++    // 4. consensus_reached — every seat votes; tally against the threshold.
++    const votes: ConsensusVote[] = SWARM_SEATS.map((seat) => ({
++      seat,
++      decision: reviewPasses ? ('approve' as const) : ('reject' as const),
++      reason: reviewPasses
++        ? `proposal reviewed OK (${review.verdict})`
++        : `review did not pass (${review.verdict})`,
++    }));
++    const consensus = aggregateConsensus(roundId, votes, SWARM_SEATS.length);
++    publish({
++      type: 'consensus_reached',
++      from: 'coordinator',
++      payload: {
++        roundId,
++        approved: consensus.approved,
++        votesFor: consensus.votesFor,
++        votesAgainst: consensus.votesAgainst,
++        votesAbstain: consensus.votesAbstain,
++        total: consensus.total,
++        threshold: consensus.threshold,
++        summary: consensus.summary,
++      },
++    });
++
++    return { spec, review, consensus, messages };
++  }
++
++  private emitTelemetry(
++    messageType: SwarmMessageType,
++    from: string,
++    payload: unknown,
++  ): void {
++    this.onEvent?.({
++      stage: 'done',
++      at: this.now(),
++      detail: `${messageType} from ${from}`,
++      messageType,
++      payload,
++    });
++  }
++
+   private emit(phase: SwarmPhase, stage: SwarmEvent['stage'], detail: string): void {
+     this.onEvent?.({ phase, stage, at: this.now(), detail });
+   }
+ }
++
++/** ---------------------------------------------------------------------------
++ *  Typed message exchange protocol (delegation bus)
++ * -------------------------------------------------------------------------- */
++
++/** Message types exchanged between swarm seats during deliberation. */
++export type SwarmMessageType =
++  | 'propose_plan'
++  | 'peer_review'
++  | 'delegate_task'
++  | 'consensus_reached';
++
++/** Payload shape for each message type. */
++export interface SwarmMessagePayloads {
++  propose_plan: {
++    goal: string;
++    roundId: string;
++    subTasks: Array<{ id: string; title: string; seat: string; summary: string }>;
++  };
++  peer_review: {
++    proposalId: string;
++    roundId: string;
++    reviewer: string;
++    scores: { security: number; speed: number; correctness: number };
++    verdict: 'approve' | 'reject' | 'request-changes';
++    notes: string[];
++  };
++  delegate_task: {
++    roundId: string;
++    taskId: string;
++    seat: string;
++    instruction: string;
++  };
++  consensus_reached: {
++    roundId: string;
++    approved: boolean;
++    votesFor: number;
++    votesAgainst: number;
++    votesAbstain: number;
++    total: number;
++    threshold: number;
++    summary: string;
++  };
++}
++
++/** A single message published on the delegation bus. */
++export interface SwarmMessage<T extends SwarmMessageType = SwarmMessageType> {
++  id: string;
++  type: T;
++  from: string;
++  to?: string;
++  payload: SwarmMessagePayloads[T];
++  timestamp: number;
++  replyTo?: string;
++}
++
++/** Publish/subscribe bus for typed swarm messages. */
++export class DelegationBus {
++  private readonly listeners = new Set<(message: SwarmMessage) => void>();
++  private readonly _history: SwarmMessage[] = [];
++  private readonly now: () => number;
++
++  constructor(opts: { now?: () => number } = {}) {
++    this.now = opts.now ?? Date.now;
++  }
++
++  /** Publish a typed message; returns the enriched message (id + timestamp). */
++  publish<T extends SwarmMessageType>(
++    message: Omit<SwarmMessage<T>, 'id' | 'timestamp'>,
++  ): SwarmMessage<T> {
++    const full: SwarmMessage<T> = {
++      ...message,
++      id: `msg-${this.now()}-${Math.random().toString(36).slice(2, 6)}`,
++      timestamp: this.now(),
++    } as SwarmMessage<T>;
++    this._history.push(full);
++    for (const listener of this.listeners) listener(full);
++    return full;
++  }
++
++  /** Subscribe to every message on the bus; returns an unsubscribe handle. */
++  subscribe(handler: (message: SwarmMessage) => void): () => void {
++    this.listeners.add(handler);
++    return () => this.listeners.delete(handler);
++  }
++
++  /** All messages published so far, in order. */
++  history(): readonly SwarmMessage[] {
++    return [...this._history];
++  }
++}
++
++
++/** ---------------------------------------------------------------------------
++ *  Consensus voting
++ * -------------------------------------------------------------------------- */
++
++export type ConsensusDecision = 'approve' | 'reject' | 'abstain';
++
++export interface ConsensusVote {
++  seat: string;
++  decision: ConsensusDecision;
++  reason: string;
++}
++
++export interface ConsensusResult {
++  roundId: string;
++  approved: boolean;
++  votesFor: number;
++  votesAgainst: number;
++  votesAbstain: number;
++  total: number;
++  threshold: number;
++  summary: string;
++}
++
++/** Simple majority threshold: floor(n/2) + 1. */
++export function consensusThreshold(total: number): number {
++  return Math.floor(total / 2) + 1;
++}
++
++/** Tally votes against the threshold. */
++export function aggregateConsensus(
++  roundId: string,
++  votes: readonly ConsensusVote[],
++  totalSeats: number,
++): ConsensusResult {
++  const votesFor = votes.filter((v) => v.decision === 'approve').length;
++  const votesAgainst = votes.filter((v) => v.decision === 'reject').length;
++  const votesAbstain = votes.filter((v) => v.decision === 'abstain').length;
++  const threshold = consensusThreshold(totalSeats);
++  const approved = votesFor >= threshold;
++  const summary = approved
++    ? `Consensus: ${votesFor}/${totalSeats} approved`
++    : `No consensus: ${votesFor}/${totalSeats} approved (need ${threshold})`;
++  return { roundId, approved, votesFor, votesAgainst, votesAbstain, total: totalSeats, threshold, summary };
++}
++
++/** The swarm seats, in pipeline order. */
++export const SWARM_SEATS: readonly SwarmRoleId[] = ['architect', 'implementer', 'red-team', 'auditor'];
++
++export interface PeerReview {
++  proposalId: string;
++  reviewer: string;
++  scores: { security: number; speed: number; correctness: number };
++  verdict: 'approve' | 'reject' | 'request-changes';
++  notes: string[];
++}
++
++/** Outcome of the four-step deliberation protocol. */
++export interface DeliberationOutcome {
++  spec: MilestoneSpec;
++  review: PeerReview;
++  consensus: ConsensusResult;
++  messages: readonly SwarmMessage[];
++}
++
++/** Map a spec file to the seat best suited to implement it. */
++function seatFor(_file: MilestoneFile): SwarmRoleId {
++  return 'implementer';
++}
+\ No newline at end of file
+--- a/vendor/omnexx/src/agent/rolling-memory.ts
++++ b/swarmagents-repo/packages/engine/src/agent/rolling-memory.ts
+@@ -22,6 +22,14 @@
+ export const DEFAULT_CONDENSE_EVERY = 20;
+ /** Raw turns kept verbatim after the note. */
+ export const DEFAULT_KEEP_TURNS = 6;
++/**
++ * Hard cap on the in-memory thread list. The rendered note already collapses threads to fit
++ * ROLLING_NOTE_CHAR_CAP, but the note object kept between condensations used to accumulate every
++ * demoted work item for the whole session (one or more per turn, forever), so a long run grew
++ * without bound. Threads past the cap are rolled into `collapsed` — the note still says how many
++ * older threads exist and where to recall them, nothing is dropped silently.
++ */
++export const MAX_THREADS = 500;
+ 
+ const GOAL = '## Current goal';
+ const ACTIVE = '## Active work (newest first)';
+@@ -421,7 +429,8 @@
+   const demoted: RollingThread[] = allItems
+     .slice(ACTIVE_DETAILED)
+     .map((w) => ({ line: w.title, turn: w.turn }));
+-  const threads = dedupeThreads([...(prior?.threads ?? []), ...demoted]);
++  const mergedThreads = dedupeThreads([...(prior?.threads ?? []), ...demoted]);
++  const { threads, collapsed } = capThreads(mergedThreads, prior?.collapsed);
+   const factsByPath = new Map<string, RollingFact>();
+   for (const f of [...(prior?.facts ?? []), ...freshFacts]) factsByPath.set(f.path, f);
+   return {
+@@ -434,8 +443,30 @@
+     coversFrom: prior?.coversFrom ?? Math.max(1, firstTurn),
+     coversTo: opts.headLastTurn,
+     updatedTurn: opts.turn,
+-    ...(prior?.collapsed ? { collapsed: prior.collapsed } : {}),
++    ...(collapsed ? { collapsed } : {}),
++  };
++}
++
++/**
++ * Keep at most MAX_THREADS (newest first) and fold the rest into the collapsed counter. The
++ * dropped threads are the oldest ones, so `coversFrom`/`fromTurn` keeps moving backwards while
++ * `toTurn` only ever grows — the rendered line still accounts for every thread.
++ */
++function capThreads(
++  threads: readonly RollingThread[],
++  prior: RollingNote['collapsed'],
++): { threads: RollingThread[]; collapsed: RollingNote['collapsed'] } {
++  if (threads.length <= MAX_THREADS) return { threads: [...threads], collapsed: prior };
++  const kept = threads.slice(0, MAX_THREADS);
++  const dropped = threads.slice(MAX_THREADS);
++  const fromTurn = dropped.reduce((min, t) => Math.min(min, t.turn), dropped[0]?.turn ?? 0);
++  const toTurn = dropped.reduce((max, t) => Math.max(max, t.turn), dropped[0]?.turn ?? 0);
++  const collapsed = {
++    count: (prior?.count ?? 0) + dropped.length,
++    fromTurn: prior ? Math.min(prior.fromTurn, fromTurn) : fromTurn,
++    toTurn: prior ? Math.max(prior.toTurn, toTurn) : toTurn,
+   };
++  return { threads: kept, collapsed };
+ }
+ 
+ function dedupeThreads(items: readonly RollingThread[]): RollingThread[] {
+--- a/vendor/omnexx/src/agent/turn-budget.ts
++++ b/swarmagents-repo/packages/engine/src/agent/turn-budget.ts
+@@ -140,22 +140,38 @@
+         progress: 'optional',
+       }
+     : ALL_PINNED;
++  // Every ceiling is a share of B and is clamped to B itself. Before this clamp the 1k
++  // floor values (1_200) were larger than the whole budget at B = 1_000, so the plan
++  // promised a prefix and a compaction target that could never fit the window. The
++  // low floors are kept only up to B so a plan is always internally consistent.
++  const share = (fraction: number): number => Math.round(B * fraction);
++  const floorUpTo = (floor: number): number => Math.min(B, floor);
++  const prefixCeiling = Math.min(
++    B,
++    Math.max(
++      floorUpTo(1_200),
++      Math.min(PREFIX_TOKEN_CEILING, share(heavy ? 0.4 : 0.3)),
++    ),
++  );
++  const toolOutputCeiling = Math.min(
++    B,
++    MAX_TOOL_OUTPUT_CEILING,
++    Math.max(floorUpTo(MIN_TOOL_OUTPUT_CEILING), share(0.55)),
++  );
++  const compactionTarget = Math.min(
++    B,
++    Math.max(floorUpTo(1_200), share(heavy ? 0.8 : 0.9)),
++  );
+   return {
+     budget: B,
+     heavy,
+     sections,
+     maxMounted: m,
+     slotBudgets,
+-    prefixCeiling: Math.max(
+-      1_200,
+-      Math.min(PREFIX_TOKEN_CEILING, Math.round(B * (heavy ? 0.4 : 0.3))),
+-    ),
+-    toolOutputCeiling: Math.min(
+-      MAX_TOOL_OUTPUT_CEILING,
+-      Math.max(MIN_TOOL_OUTPUT_CEILING, Math.round(B * 0.55)),
+-    ),
+-    compactionTarget: Math.max(1_200, Math.round(B * (heavy ? 0.8 : 0.9))),
+-    minIrreducibleCore: 1_000,
++    prefixCeiling,
++    toolOutputCeiling,
++    compactionTarget,
++    minIrreducibleCore: floorUpTo(1_000),
+   };
+ }
+ 
+--- a/vendor/omnexx/src/agent/runtime/interrupt-bus.ts
++++ b/swarmagents-repo/packages/engine/src/agent/runtime/interrupt-bus.ts
+@@ -17,7 +17,7 @@
+ export class TurnInterruptBus {
+   private abortController: AbortController = new AbortController();
+   private currentInterrupt: InterruptEvent | null = null;
+-  private listeners: ((event: InterruptEvent) => void)[] = [];
++  private readonly listeners = new Set<(event: InterruptEvent) => void>();
+ 
+   get signal(): AbortSignal {
+     return this.abortController.signal;
+@@ -52,7 +52,9 @@
+       new Error(`Interrupted: ${reason}${payload ? ` - ${payload}` : ''}`),
+     );
+ 
+-    for (const listener of this.listeners) {
++    // Snapshot: a listener may unsubscribe (or register another listener) while we dispatch.
++    // Iterating the live Set used to skip listeners in that case.
++    for (const listener of [...this.listeners]) {
+       try {
+         listener(event);
+       } catch {
+@@ -62,20 +64,37 @@
+   }
+ 
+   /**
+-   * Listen for interrupt events.
++   * Listen for interrupt events. A listener registered after the turn was already interrupted
++   * is called immediately with the latched event, so a late subscriber cannot miss a stop.
+    */
+   onInterrupt(callback: (event: InterruptEvent) => void): () => void {
+-    this.listeners.push(callback);
++    if (this.currentInterrupt) {
++      try {
++        callback(this.currentInterrupt);
++      } catch {
++        // Safe dispatch: a listener must not crash the bus.
++      }
++      return () => undefined;
++    }
++    this.listeners.add(callback);
+     return () => {
+-      this.listeners = this.listeners.filter((l) => l !== callback);
++      this.listeners.delete(callback);
+     };
+   }
+ 
+   /**
+    * Reset the interrupt bus for the subsequent turn (re-arming the abort signal).
++   * Listeners stay registered; they are bus-scoped, not turn-scoped.
+    */
+   reset(): void {
+     this.abortController = new AbortController();
+     this.currentInterrupt = null;
+   }
++
++  /** Drop every listener and release the signal (session shutdown). */
++  dispose(): void {
++    this.listeners.clear();
++    this.currentInterrupt = null;
++    this.abortController = new AbortController();
++  }
+ }
+--- a/vendor/omnexx/src/autonomous/ast-analysis.ts
++++ b/swarmagents-repo/packages/engine/src/autonomous/ast-analysis.ts
+@@ -31,21 +31,49 @@
+ /** Default runner: execa, never throws on non-zero exit, never hangs forever. */
+ export const defaultRunCommand: RunCommand = async (command, args, opts) => {
+   const started = Date.now();
+-  const result = await execa(command, [...args], {
+-    cwd: opts.cwd,
+-    reject: false,
+-    timeout: opts.timeoutMs ?? 120_000,
+-    maxBuffer: 64 * 1024 * 1024,
+-    stripFinalNewline: true,
+-    ...(opts.env !== undefined ? { env: opts.env } : {}),
+-  });
+-  return {
+-    stdout: result.stdout,
+-    stderr: result.stderr,
+-    exitCode: result.exitCode ?? -1,
+-    timedOut: result.timedOut,
+-    durationMs: Date.now() - started,
+-  };
++  const timeoutMs = Math.max(1_000, opts.timeoutMs ?? 120_000);
++  try {
++    const result = await execa(command, [...args], {
++      cwd: opts.cwd,
++      reject: false,
++      // 0 disables the timeout in execa; a verifier must always have one.
++      timeout: timeoutMs,
++      // A process that traps SIGTERM is force-killed after this grace period.
++      forceKillAfterDelay: 5_000,
++      maxBuffer: 64 * 1024 * 1024,
++      stripFinalNewline: true,
++      ...(opts.env !== undefined ? { env: opts.env } : {}),
++    });
++    // With `reject: false`, execa reports spawn failures (ENOENT, EACCES, broken cwd) as a
++    // resolved result with `failed: true`, no stderr, and the explanation only in `message`.
++    // Surface that explanation so callers do not see a silent zero-byte failure.
++    const stderr =
++      result.stderr.length > 0 || !result.failed
++        ? result.stderr
++        : (result.originalMessage ?? result.message ?? 'command failed to spawn');
++    return {
++      stdout: result.stdout,
++      stderr,
++      exitCode: result.exitCode ?? -1,
++      timedOut: result.timedOut,
++      durationMs: Date.now() - started,
++    };
++  } catch (err) {
++    // Spawn failures (ENOENT, EACCES, a broken cwd) reject even with reject:false. Report them as
++    // a normal failed command instead of letting an unhandled throw escape into the pipeline.
++    const e = err as {
++      message?: unknown;
++      timedOut?: unknown;
++      exitCode?: unknown;
++    };
++    return {
++      stdout: '',
++      stderr: typeof e.message === 'string' ? e.message : String(err),
++      exitCode: typeof e.exitCode === 'number' ? e.exitCode : -1,
++      timedOut: e.timedOut === true,
++      durationMs: Date.now() - started,
++    };
++  }
+ };
+ 
+ // ---------------------------------------------------------------------------
+@@ -61,6 +89,19 @@
+   maxCyclomaticComplexity: number;
+   /** Raw relative import specifiers (`./…` / `../…`). */
+   relativeImports: string[];
++  /**
++   * TypeScript syntax errors found while parsing. Empty for valid code. The compiler API is
++   * error-tolerant, so analysis of a corrupt file used to succeed with partial counts — a
++   * silently wrong gate. Callers that can fail a task should report these to the agent.
++   */
++  syntaxErrors: SyntaxDiagnostic[];
++}
++
++/** One parser diagnostic, with 1-based coordinates (line/column 0 = file-level failure). */
++export interface SyntaxDiagnostic {
++  message: string;
++  line: number;
++  column: number;
+ }
+ 
+ const TEST_FNS = new Set([
+@@ -81,6 +122,70 @@
+   return TEST_FILE_RE.test(filePath);
+ }
+ 
++/** A TypeScript source file (the only kind the compiler API diagnostics below apply to). */
++const TS_SOURCE_RE = /\.(ts|tsx|mts|cts)$/i;
++export function isTypeScriptSourcePath(filePath: string): boolean {
++  return TS_SOURCE_RE.test(filePath);
++}
++
++function scriptKindOf(fileName: string): ts.ScriptKind {
++  const lower = fileName.toLowerCase();
++  if (lower.endsWith('.tsx')) return ts.ScriptKind.TSX;
++  if (lower.endsWith('.jsx')) return ts.ScriptKind.JSX;
++  if (lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) {
++    return ts.ScriptKind.JS;
++  }
++  return ts.ScriptKind.TS;
++}
++
++interface ParsedSource {
++  sourceFile: ts.SourceFile;
++  diagnostics: SyntaxDiagnostic[];
++}
++
++/** A cheap JSX/TSX signal used only to decide whether a TSX re-parse is worth trying. */
++const LOOKS_LIKE_JSX = /<[A-Za-z][\w.:-]*[\s/>]/;
++
++function parseDiagnosticsOf(sourceFile: ts.SourceFile): SyntaxDiagnostic[] {
++  // `parseDiagnostics` is on SourceFile at runtime but not part of the public type surface.
++  const raw = (
++    sourceFile as ts.SourceFile & {
++      parseDiagnostics?: readonly ts.Diagnostic[];
++    }
++  ).parseDiagnostics;
++  if (!raw?.length) return [];
++  return raw.map((d) => {
++    const message = ts.flattenDiagnosticMessageText(d.messageText, '\n');
++    if (d.file !== undefined && d.start !== undefined) {
++      const pos = d.file.getLineAndCharacterOfPosition(d.start);
++      return { message, line: pos.line + 1, column: pos.character + 1 };
++    }
++    return { message, line: 0, column: 0 };
++  });
++}
++
++/**
++ * Parse TypeScript (or TSX/JSX) without ever throwing. `.ts` files whose contents are actually
++ * JSX are retried as TSX when that produces fewer diagnostics — editors and generators routinely
++ * save TSX into the wrong extension, and the compiler API otherwise reports a wall of syntax
++ * errors for otherwise-valid JSX.
++ */
++export function parseTypeScript(sourceText: string, fileName = 'file.ts'): ParsedSource {
++  const create = (name: string, kind: ts.ScriptKind): ts.SourceFile =>
++    ts.createSourceFile(name, sourceText, ts.ScriptTarget.Latest, true, kind);
++  let sourceFile = create(fileName, scriptKindOf(fileName));
++  let diagnostics = parseDiagnosticsOf(sourceFile);
++  if (diagnostics.length > 0 && !/\.[jt]sx$/i.test(fileName) && LOOKS_LIKE_JSX.test(sourceText)) {
++    const tsxFile = create(`${fileName}.tsx`, ts.ScriptKind.TSX);
++    const tsxDiagnostics = parseDiagnosticsOf(tsxFile);
++    if (tsxDiagnostics.length < diagnostics.length) {
++      sourceFile = tsxFile;
++      diagnostics = tsxDiagnostics;
++    }
++  }
++  return { sourceFile, diagnostics };
++}
++
+ // ---------------------------------------------------------------------------
+ // Expected values (`expect(...).toBe/toEqual/toStrictEqual(<literal>)`)
+ // ---------------------------------------------------------------------------
+@@ -140,75 +245,84 @@
+  * enclosing describe scope, or '' at top level).
+  */
+ export function extractExpectations(sourceText: string, fileName = 'file.ts'): ExpectedAssertion[] {
+-  const sf = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.Latest, true);
+-  const out: ExpectedAssertion[] = [];
++  try {
++    const { sourceFile: sf } = parseTypeScript(sourceText, fileName);
++    const out: ExpectedAssertion[] = [];
+ 
+-  const titleOf = (call: ts.CallExpression): string | undefined => {
+-    const first = call.arguments[0];
+-    return first && ts.isStringLiteral(first) ? first.text : undefined;
+-  };
++    const titleOf = (call: ts.CallExpression): string | undefined => {
++      const first = call.arguments[0];
++      return first && ts.isStringLiteral(first) ? first.text : undefined;
++    };
+ 
+-  const visit = (node: ts.Node, scope: string, testTitle: string): void => {
+-    if (ts.isCallExpression(node)) {
+-      const callee = node.expression;
+-      // describe('...', fn): extend the scope for the children.
+-      if (ts.isIdentifier(callee) && (callee.text === 'describe' || callee.text === 'xdescribe')) {
+-        const title = titleOf(node);
+-        const nextScope = title === undefined ? scope : scope ? `${scope} › ${title}` : title;
+-        node.forEachChild((child) => {
+-          visit(child, nextScope, testTitle);
+-        });
+-        return;
+-      }
+-      if (
+-        ts.isPropertyAccessExpression(callee) &&
+-        ts.isIdentifier(callee.expression) &&
+-        callee.expression.text === 'describe' &&
+-        (callee.name.text === 'skip' || callee.name.text === 'only')
+-      ) {
+-        const title = titleOf(node);
+-        const nextScope = title === undefined ? scope : scope ? `${scope} › ${title}` : title;
+-        node.forEachChild((child) => {
+-          visit(child, nextScope, testTitle);
+-        });
+-        return;
+-      }
+-      // it('...', fn) / test('...', fn): the callback's assertions belong to this title.
+-      if (
+-        ts.isIdentifier(callee) &&
+-        (callee.text === 'it' ||
+-          callee.text === 'test' ||
+-          callee.text === 'xit' ||
+-          callee.text === 'fit' ||
+-          callee.text === 'xtest')
+-      ) {
+-        const title = titleOf(node);
+-        const full = title === undefined ? testTitle : scope ? `${scope} › ${title}` : title;
+-        node.forEachChild((child) => {
+-          visit(child, scope, full);
+-        });
+-        return;
+-      }
+-      // expect(<actual>).toBe/toEqual/toStrictEqual(<literal>)
+-      if (ts.isPropertyAccessExpression(callee) && EXPECT_MATCHERS.has(callee.name.text)) {
+-        const root = expectRoot(callee.expression);
+-        const expectedArg = node.arguments[0];
+-        if (root && root.arguments.length > 0 && expectedArg && isLiteralExpected(expectedArg)) {
+-          out.push({
+-            testTitle,
+-            matcher: callee.name.text as ExpectedAssertion['matcher'],
+-            expected: expectedArg.getText(sf),
+-            actual: (root.arguments[0] as ts.Node).getText(sf),
++    const visit = (node: ts.Node, scope: string, testTitle: string): void => {
++      if (ts.isCallExpression(node)) {
++        const callee = node.expression;
++        // describe('...', fn): extend the scope for the children.
++        if (
++          ts.isIdentifier(callee) &&
++          (callee.text === 'describe' || callee.text === 'xdescribe')
++        ) {
++          const title = titleOf(node);
++          const nextScope = title === undefined ? scope : scope ? `${scope} › ${title}` : title;
++          node.forEachChild((child) => {
++            visit(child, nextScope, testTitle);
++          });
++          return;
++        }
++        if (
++          ts.isPropertyAccessExpression(callee) &&
++          ts.isIdentifier(callee.expression) &&
++          callee.expression.text === 'describe' &&
++          (callee.name.text === 'skip' || callee.name.text === 'only')
++        ) {
++          const title = titleOf(node);
++          const nextScope = title === undefined ? scope : scope ? `${scope} › ${title}` : title;
++          node.forEachChild((child) => {
++            visit(child, nextScope, testTitle);
++          });
++          return;
++        }
++        // it('...', fn) / test('...', fn): the callback's assertions belong to this title.
++        if (
++          ts.isIdentifier(callee) &&
++          (callee.text === 'it' ||
++            callee.text === 'test' ||
++            callee.text === 'xit' ||
++            callee.text === 'fit' ||
++            callee.text === 'xtest')
++        ) {
++          const title = titleOf(node);
++          const full = title === undefined ? testTitle : scope ? `${scope} › ${title}` : title;
++          node.forEachChild((child) => {
++            visit(child, scope, full);
+           });
++          return;
++        }
++        // expect(<actual>).toBe/toEqual/toStrictEqual(<literal>)
++        if (ts.isPropertyAccessExpression(callee) && EXPECT_MATCHERS.has(callee.name.text)) {
++          const root = expectRoot(callee.expression);
++          const expectedArg = node.arguments[0];
++          if (root && root.arguments.length > 0 && expectedArg && isLiteralExpected(expectedArg)) {
++            out.push({
++              testTitle,
++              matcher: callee.name.text as ExpectedAssertion['matcher'],
++              expected: expectedArg.getText(sf),
++              actual: (root.arguments[0] as ts.Node).getText(sf),
++            });
++          }
+         }
+       }
+-    }
+-    node.forEachChild((child) => {
+-      visit(child, scope, testTitle);
+-    });
+-  };
+-  visit(sf, '', '');
+-  return out;
++      node.forEachChild((child) => {
++        visit(child, scope, testTitle);
++      });
++    };
++    visit(sf, '', '');
++    return out;
++  } catch {
++    // A parser/runtime failure must not escape into the verification pipeline; a missing
++    // assertion list is reported by the (separate) syntax/parse diagnostics check instead.
++    return [];
++  }
+ }
+ 
+ function isDecision(node: ts.Node): boolean {
+@@ -236,96 +350,125 @@
+   return false;
+ }
+ 
+-/** Analyse one source text. Pure — no filesystem access. */
++/** Analyse one source text. Pure — no filesystem access, and never throws. */
+ export function analyzeSourceText(sourceText: string, fileName = 'file.ts'): SourceAnalysis {
+-  const sf = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.Latest, true);
+-  let assertionCount = 0;
+-  let hasSkipOrOnly = false;
+-  let maxComplexity = 0;
+-  const relativeImports: string[] = [];
++  try {
++    const { sourceFile: sf, diagnostics } = parseTypeScript(sourceText, fileName);
++    let assertionCount = 0;
++    let hasSkipOrOnly = false;
++    let maxComplexity = 0;
++    const relativeImports: string[] = [];
+ 
+-  const isTestCall = (node: ts.CallExpression): boolean => {
+-    const callee = node.expression;
+-    if (ts.isIdentifier(callee)) return callee.text === 'expect' || callee.text === 'assert';
+-    if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)) {
+-      return callee.expression.text === 'expect' || callee.expression.text === 'assert';
+-    }
+-    return false;
+-  };
++    const isTestCall = (node: ts.CallExpression): boolean => {
++      const callee = node.expression;
++      if (ts.isIdentifier(callee)) return callee.text === 'expect' || callee.text === 'assert';
++      if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)) {
++        return callee.expression.text === 'expect' || callee.expression.text === 'assert';
++      }
++      return false;
++    };
+ 
+-  const isFunctionLike = (node: ts.Node): boolean =>
+-    ts.isFunctionDeclaration(node) ||
+-    ts.isFunctionExpression(node) ||
+-    ts.isArrowFunction(node) ||
+-    ts.isMethodDeclaration(node);
+-
+-  // Cyclomatic complexity, scored per function (nested functions get their own
+-  // budget) plus one unit for top-level code.
+-  const scoreFunction = (fn: ts.Node): void => {
+-    let decisions = 0;
+-    const walk = (node: ts.Node): void => {
++    const isFunctionLike = (node: ts.Node): boolean =>
++      ts.isFunctionDeclaration(node) ||
++      ts.isFunctionExpression(node) ||
++      ts.isArrowFunction(node) ||
++      ts.isMethodDeclaration(node);
++
++    // Cyclomatic complexity, scored per function (nested functions get their own
++    // budget) plus one unit for top-level code.
++    const scoreFunction = (fn: ts.Node): void => {
++      let decisions = 0;
++      const walk = (node: ts.Node): void => {
++        if (isFunctionLike(node)) {
++          scoreFunction(node);
++          return;
++        }
++        if (isDecision(node)) decisions++;
++        ts.forEachChild(node, walk);
++      };
++      ts.forEachChild(fn, walk);
++      maxComplexity = Math.max(maxComplexity, 1 + decisions);
++    };
++    let topLevelDecisions = 0;
++    const walkTopLevel = (node: ts.Node): void => {
+       if (isFunctionLike(node)) {
+         scoreFunction(node);
+         return;
+       }
+-      if (isDecision(node)) decisions++;
+-      ts.forEachChild(node, walk);
++      if (isDecision(node)) topLevelDecisions++;
++      ts.forEachChild(node, walkTopLevel);
+     };
+-    ts.forEachChild(fn, walk);
+-    maxComplexity = Math.max(maxComplexity, 1 + decisions);
+-  };
+-  let topLevelDecisions = 0;
+-  const walkTopLevel = (node: ts.Node): void => {
+-    if (isFunctionLike(node)) {
+-      scoreFunction(node);
+-      return;
+-    }
+-    if (isDecision(node)) topLevelDecisions++;
+-    ts.forEachChild(node, walkTopLevel);
+-  };
+-  ts.forEachChild(sf, walkTopLevel);
+-  maxComplexity = Math.max(maxComplexity, 1 + topLevelDecisions);
+-
+-  const visit = (node: ts.Node): void => {
+-    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+-      const spec = node.moduleSpecifier.text;
+-      if (spec.startsWith('.')) relativeImports.push(spec);
+-    }
+-    if (ts.isCallExpression(node)) {
+-      if (isTestCall(node)) assertionCount++;
+-      const callee = node.expression;
+-      if (ts.isPropertyAccessExpression(callee) && SKIP_ONLY.has(callee.name.text)) {
+-        const obj = callee.expression;
+-        if (ts.isIdentifier(obj) && TEST_FNS.has(obj.text)) hasSkipOrOnly = true;
++    ts.forEachChild(sf, walkTopLevel);
++    maxComplexity = Math.max(maxComplexity, 1 + topLevelDecisions);
++
++    const visit = (node: ts.Node): void => {
++      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
++        const spec = node.moduleSpecifier.text;
++        if (spec.startsWith('.')) relativeImports.push(spec);
+       }
+-      if (
+-        ts.isIdentifier(callee) &&
+-        (callee.text === 'xit' ||
+-          callee.text === 'xdescribe' ||
+-          callee.text === 'xtest' ||
+-          callee.text === 'fit' ||
+-          callee.text === 'fdescribe')
+-      ) {
+-        hasSkipOrOnly = true;
++      if (ts.isCallExpression(node)) {
++        if (isTestCall(node)) assertionCount++;
++        const callee = node.expression;
++        if (ts.isPropertyAccessExpression(callee) && SKIP_ONLY.has(callee.name.text)) {
++          const obj = callee.expression;
++          if (ts.isIdentifier(obj) && TEST_FNS.has(obj.text)) hasSkipOrOnly = true;
++        }
++        if (
++          ts.isIdentifier(callee) &&
++          (callee.text === 'xit' ||
++            callee.text === 'xdescribe' ||
++            callee.text === 'xtest' ||
++            callee.text === 'fit' ||
++            callee.text === 'fdescribe')
++        ) {
++          hasSkipOrOnly = true;
++        }
+       }
+-    }
+-    ts.forEachChild(node, visit);
+-  };
+-  visit(sf);
++      ts.forEachChild(node, visit);
++    };
++    visit(sf);
+ 
+-  return { assertionCount, hasSkipOrOnly, maxCyclomaticComplexity: maxComplexity, relativeImports };
++    return {
++      assertionCount,
++      hasSkipOrOnly,
++      maxCyclomaticComplexity: maxComplexity,
++      relativeImports,
++      syntaxErrors: diagnostics,
++    };
++  } catch (err) {
++    return {
++      assertionCount: 0,
++      hasSkipOrOnly: false,
++      maxCyclomaticComplexity: 0,
++      relativeImports: [],
++      syntaxErrors: [
++        {
++          message: `TypeScript analysis failed: ${err instanceof Error ? err.message : String(err)}`,
++          line: 0,
++          column: 0,
++        },
++      ],
++    };
++  }
+ }
+ 
+-/** Analyse one file from disk. Returns zeros when the file cannot be read. */
++/** Analyse one file from disk. Returns zeros (and a diagnostic) when the file cannot be read. */
+ export function analyzeFile(filePath: string): SourceAnalysis {
+   try {
+     return analyzeSourceText(readFileSync(filePath, 'utf8'), filePath);
+-  } catch {
++  } catch (err) {
+     return {
+       assertionCount: 0,
+       hasSkipOrOnly: false,
+       maxCyclomaticComplexity: 0,
+       relativeImports: [],
++      syntaxErrors: [
++        {
++          message: `cannot read ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
++          line: 0,
++          column: 0,
++        },
++      ],
+     };
+   }
+ }
+--- a/vendor/omnexx/src/autonomous/daemon.ts
++++ b/swarmagents-repo/packages/engine/src/autonomous/daemon.ts
+@@ -500,8 +500,7 @@
+     for (const status of ACTIVE_STATUSES) {
+       for (const task of this.store.listTasks(status)) {
+         if (!task.worktreePath) continue;
+-        const steps = this.store.getSteps(task.taskId);
+-        const last = steps[steps.length - 1];
++        const last = this.store.getLatestStep(task.taskId);
+         const treeHash = await this.worktreeTreeHash(task.worktreePath);
+         if (treeHash === undefined) {
+           // Worktree dir is gone: requeue from scratch.
+@@ -545,6 +544,13 @@
+     }
+     this.logger.log(`[daemon] boot step 4: pruned ${pruned} stale done_set entries`);
+ 
++    // 5. Drop step-journal rows for tasks that are no longer queued (shipped, tombstoned or
++    //    dropped). They are never read again and used to accumulate for the life of the DB.
++    const prunedSteps = this.store.pruneOrphanedSteps();
++    if (prunedSteps > 0) {
++      this.logger.log(`[daemon] boot step 5: pruned ${prunedSteps} orphaned step journal rows`);
++    }
++
+     this.lastHead = await this.currentHead();
+     this.booted = true;
+     this.logger.log('[daemon] boot reconciliation complete');
+@@ -880,7 +886,7 @@
+         await this.releaseWorktree(task).catch(() => undefined);
+         this.transition('idle', task.taskId);
+       } else {
+-        // Genuine task failure (guardrail throw, environment error, ...): tombstone
++        // Genuine task failure (guardrail throw, environment error, ...): tombstone
+         // it instead of leaving it stuck in PLANNING/IMPLEMENTING forever.
+         await this.quarantineTask(task, 'task_error');
+       }
+--- a/vendor/omnexx/src/autonomous/executor.ts
++++ b/swarmagents-repo/packages/engine/src/autonomous/executor.ts
+@@ -206,6 +206,26 @@
+   }
+ }
+ 
++/**
++ * Settle with `promise`, or reject as soon as `signal` aborts. The work itself is not cancelled
++ * here (tools get the same signal and kill their subprocesses), but a provider SDK or tool that
++ * ignores the signal can no longer wedge a daemon turn or block shutdown.
++ */
++function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
++  if (signal === undefined) return promise;
++  const abortError = (): Error =>
++    signal.reason instanceof Error ? signal.reason : new Error('executeTurn aborted');
++  if (signal.aborted) return Promise.reject(abortError());
++  let onAbort: (() => void) | undefined;
++  const aborted = new Promise<never>((_, reject) => {
++    onAbort = () => reject(abortError());
++    signal.addEventListener('abort', onAbort, { once: true });
++  });
++  return Promise.race([promise, aborted]).finally(() => {
++    if (onAbort) signal.removeEventListener('abort', onAbort);
++  });
++}
++
+ /** Repo-relative posix path for a user-supplied path, or undefined when unusable. */
+ function relPosix(worktree: string, p: string): string | undefined {
+   if (typeof p !== 'string' || !p.trim()) return undefined;
+@@ -871,18 +891,20 @@
+         throw new Error(`budget refused the turn: ${pf.detail}`);
+       }
+       try {
+-        const res = await this.withTurnTimeout(() =>
+-          this.provider.complete({
+-            ...turnRequest(
+-              { system: ctx.system, tools: ctx.specs },
+-              snapshot,
+-              model.id,
+-              maxTokens,
+-              `daemon-${taskId}`,
+-            ),
+-            route: model.provider,
+-            signal,
+-          }),
++        const res = await this.withTurnTimeout(
++          () =>
++            this.provider.complete({
++              ...turnRequest(
++                { system: ctx.system, tools: ctx.specs },
++                snapshot,
++                model.id,
++                maxTokens,
++                `daemon-${taskId}`,
++              ),
++              route: model.provider,
++              signal,
++            }),
++          signal,
+         );
+         ctx.spentUsd += costUsd(res.usage, model.price);
+         // Report the priced call to the budget ledger (via the recorder the
+@@ -911,13 +933,16 @@
+   }
+ 
+   /**
+-   * Race `fn` against an optional strict per-turn timeout. On timeout the call is
+-   * rejected with a retryable {@link ProviderError}, so the daemon sees a turn
+-   * error and can fail over / quarantine rather than hang. Best-effort: it does
+-   * not cancel the underlying request, which is bounded by the provider SDK.
++   * Race `fn` against an optional strict per-turn timeout and the task's abort signal. On timeout
++   * the call is rejected with a retryable {@link ProviderError}, so the daemon sees a turn error
++   * and can fail over / quarantine rather than hang. On abort it rejects with the signal reason,
++   * so shutdown is immediate. Best-effort: it does not cancel the underlying request, which is
++   * bounded by the provider SDK and receives the same signal.
+    */
+-  private withTurnTimeout<T>(fn: () => Promise<T>): Promise<T> {
+-    if (this.turnTimeoutMs <= 0) return fn();
++  private withTurnTimeout<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
++    if (this.turnTimeoutMs <= 0 && signal === undefined) return fn();
++    const work = fn();
++    if (this.turnTimeoutMs <= 0) return raceAbort(work, signal);
+     let timer: ReturnType<typeof setTimeout> | undefined;
+     const timeout = new Promise<never>((_, reject) => {
+       timer = setTimeout(() => {
+@@ -925,7 +950,7 @@
+       }, this.turnTimeoutMs);
+       timer.unref();
+     });
+-    return Promise.race([fn(), timeout]).finally(() => {
++    return raceAbort(Promise.race([work, timeout]), signal).finally(() => {
+       if (timer !== undefined) clearTimeout(timer);
+     });
+   }
+@@ -1048,8 +1073,9 @@
+ 
+     let out: ToolOutput;
+     try {
+-      out = await tool.run(parsed.data, ctx.toolCtx);
++      out = await raceAbort(tool.run(parsed.data, ctx.toolCtx), ctx.toolCtx.signal);
+     } catch (err) {
++      if (ctx.toolCtx.signal?.aborted) throwIfAborted(ctx.toolCtx.signal);
+       return errorResult(`tool ${call.name} threw: ${(err as Error).message}`);
+     }
+     const content = ctx.toolCtx.redactor.text(out.content);
+--- a/vendor/omnexx/src/autonomous/state-store.ts
++++ b/swarmagents-repo/packages/engine/src/autonomous/state-store.ts
+@@ -345,6 +345,14 @@
+ /** ~150-token cap for rule summaries: ~4 chars per token, truncate at 600. */
+ const RULE_SUMMARY_MAX_CHARS = 600;
+ 
++/**
++ * Upper bound on rows scanned when matching learned patterns. Patterns accumulate one per
++ * completed task, so an unbounded `SELECT *` eventually loads the whole table on every call.
++ * Matching is in JS (scope globs), so this caps the highest-confidence window rather than
++ * pretending it can be filtered in SQL.
++ */
++export const LEARNED_PATTERN_SCAN_LIMIT = 5_000;
++
+ export interface AutonomousStateStoreOptions {
+   repoRoot: string;
+   /** Defaults to `<repoRoot>/.omnexx/autonomous.db`. Use ':memory:' for tests. */
+@@ -355,6 +363,8 @@
+   private readonly repoRoot: string;
+   private readonly dbPath: string;
+   private db: DatabaseSync | null = null;
++  /** Shared in-flight open, so two concurrent callers cannot open (and leak) two connections. */
++  private opening: Promise<void> | null = null;
+ 
+   constructor(opts: AutonomousStateStoreOptions) {
+     this.repoRoot = opts.repoRoot;
+@@ -371,17 +381,36 @@
+ 
+   async open(): Promise<void> {
+     if (this.db !== null) return;
++    this.opening ??= this.doOpen().finally(() => {
++      this.opening = null;
++    });
++    return this.opening;
++  }
++
++  private async doOpen(): Promise<void> {
++    if (this.db !== null) return;
+     if (this.dbPath !== ':memory:') await mkdir(dirname(this.dbPath), { recursive: true });
+     // Dynamic import so tsup does not rewrite the built-in module specifier.
+     const { DatabaseSync } = await import('node:sqlite');
+     const db = new DatabaseSync(this.dbPath, { open: true });
+-    if (this.dbPath !== ':memory:') {
+-      db.exec('PRAGMA journal_mode=WAL;');
++    try {
++      if (this.dbPath !== ':memory:') {
++        db.exec('PRAGMA journal_mode=WAL;');
++      }
++      db.exec('PRAGMA busy_timeout = 5000;');
++      db.exec('PRAGMA foreign_keys = ON;');
++      db.exec(SCHEMA);
++      this.db = db;
++    } catch (err) {
++      // A schema/pragma failure used to leave the open connection dangling (and this.db null,
++      // so the next open() leaked another one).
++      try {
++        db.close();
++      } catch {
++        // Surface the original error.
++      }
++      throw err;
+     }
+-    db.exec('PRAGMA busy_timeout = 5000;');
+-    db.exec('PRAGMA foreign_keys = ON;');
+-    db.exec(SCHEMA);
+-    this.db = db;
+   }
+ 
+   close(): void {
+@@ -624,6 +653,37 @@
+ 
+   // -- done set / tombstones ------------------------------------------------
+ 
++  /** The newest journal entry for a task, without materializing the whole journal. */
++  getLatestStep(taskId: string): StepRecord | null {
++    const row = this.requireDb()
++      .prepare('SELECT * FROM step_journal WHERE task_id = ? ORDER BY step_index DESC LIMIT 1')
++      .get(taskId) as Row | undefined;
++    if (row === undefined) return null;
++    return {
++      taskId: str(row, 'task_id'),
++      stepIndex: num(row, 'step_index'),
++      phase: str(row, 'phase'),
++      toolName: nullableStr(row, 'tool_name'),
++      toolArgsHash: nullableStr(row, 'tool_args_hash'),
++      gitTreeHash: nullableStr(row, 'git_tree_hash'),
++      errorSignature: nullableStr(row, 'error_signature'),
++      tokensDelta: num(row, 'tokens_delta'),
++      createdAtMs: num(row, 'created_at_ms'),
++    };
++  }
++
++  /**
++   * Delete step-journal rows whose task is no longer in the work queue (completed, tombstoned
++   * or dropped). Boot reconciliation only reads journals for active tasks, so these rows were
++   * pure unbounded state growth. Returns the number of rows removed.
++   */
++  pruneOrphanedSteps(): number {
++    const info = this.requireDb()
++      .prepare('DELETE FROM step_journal WHERE task_id NOT IN (SELECT task_id FROM work_queue)')
++      .run();
++    return Number(info.changes);
++  }
++
+   markDone(
+     taskId: string,
+     opts: {
+@@ -893,8 +953,8 @@
+   /** Patterns whose scope glob applies to `scope` (usually a file path). */
+   getLearnedPatterns(scope: string): LearnedPattern[] {
+     const rows = this.requireDb()
+-      .prepare('SELECT * FROM learned_patterns ORDER BY confidence DESC')
+-      .all() as Row[];
++      .prepare('SELECT * FROM learned_patterns ORDER BY confidence DESC LIMIT ?')
++      .all(LEARNED_PATTERN_SCAN_LIMIT) as Row[];
+     return rows
+       .map((row) => ({
+         patternId: str(row, 'pattern_id'),
+--- a/vendor/omnexx/src/autonomous/verification-pipeline.ts
++++ b/swarmagents-repo/packages/engine/src/autonomous/verification-pipeline.ts
+@@ -14,6 +14,7 @@
+   countAssertionsInFiles,
+   defaultRunCommand,
+   extractExpectations,
++  isTypeScriptSourcePath,
+   maxComplexityInFiles,
+   type ExpectedAssertion,
+   type RunCommand,
+@@ -290,6 +291,25 @@
+     violations.push(`secret in ${f.file}:${f.line} — ${f.reason}`);
+   }
+ 
++  // Corrupt or incomplete generations: the TypeScript parser is error-tolerant, so a broken file
++  // still produces partial assertion/complexity counts (and tsc is skipped in non-TS repos). Report
++  // the diagnostics here so the task is sent back to IMPLEMENT with real feedback, never shipped.
++  for (const file of input.changedFiles) {
++    if (!isTypeScriptSourcePath(file)) continue;
++    const content = input.readFile?.(file);
++    if (content === undefined) continue;
++    const { syntaxErrors } = analyzeSourceText(content, file);
++    for (const d of syntaxErrors.slice(0, 3)) {
++      const at = d.line > 0 ? `:${d.line}:${d.column}` : '';
++      violations.push(`syntax error in ${file}${at}: ${d.message}`);
++    }
++    if (syntaxErrors.length > 3) {
++      violations.push(
++        `…and ${syntaxErrors.length - 3} more syntax error(s) in ${file} (fix the file before rerunning)`,
++      );
++    }
++  }
++
+   if (input.recentBlobHistory?.length && input.blobShas) {
+     const history = new Set(input.recentBlobHistory);
+     for (const [file, sha] of input.blobShas) {
+--- a/vendor/omnexx/src/core/atomicWrite.ts
++++ b/swarmagents-repo/packages/engine/src/core/atomicWrite.ts
+@@ -6,50 +6,78 @@
+   return createHash('sha256').update(data, 'utf8').digest('hex');
+ }
+ 
++export interface StageFileOptions {
++  /**
++   * Runs against the fully written, checksum-verified staged content before the rename. Throw
++   * to abort: the target file is left byte-for-byte untouched and the temp file is removed.
++   *
++   * Use this to keep a corrupt or incomplete generation from replacing a known-good file
++   * (e.g. parse the staged TypeScript and throw on diagnostics).
++   */
++  validate?: (staged: string) => void | Promise<void>;
++}
++
+ /**
+  * Write `data` to `path` with verify-after-write atomic semantics: stage the
+  * intended content to a sibling temp file, fsync it, verify its checksum
+- * matches the intended content, then atomically rename it over the target. On
+- * POSIX the parent directory is fsynced after the rename to persist the
+- * directory entry. Resolves with the SHA-256 checksum of the written content.
++ * matches the intended content, optionally validate it, then atomically rename
++ * it over the target. On POSIX the parent directory is fsynced after the
++ * rename to persist the directory entry. Resolves with the SHA-256 checksum of
++ * the written content.
++ *
++ * Every failure path removes the temp file and leaves the target untouched;
++ * the only window in which the target changes is the atomic rename itself.
+  */
+-export async function writeFileAtomic(path: string, data: string): Promise<string> {
++export async function stageFileAtomic(
++  path: string,
++  data: string,
++  opts: StageFileOptions = {},
++): Promise<string> {
+   const intended = sha256Hex(data);
+   const dir = dirname(path);
+   await mkdir(dir, { recursive: true });
+   const tmp = join(dir, `.${randomBytes(6).toString('hex')}.tmp`);
+-  const fh = await open(tmp, 'w', 0o600);
+-  let staged = false;
++  let committed = false;
+   try {
+-    await fh.writeFile(data, 'utf8');
+-    await fh.sync();
+-    staged = true;
+-  } finally {
+-    await fh.close();
+-    // A failed write/sync must not leave the temp file behind.
+-    if (!staged) await rm(tmp, { force: true });
+-  }
++    const fh = await open(tmp, 'w', 0o600);
++    try {
++      await fh.writeFile(data, 'utf8');
++      await fh.sync();
++    } finally {
++      // A close failure must not leave the temp file behind either. If writing already failed,
++      // the finally above still runs; this close error is secondary to the write error.
++      await fh.close().catch(() => undefined);
++    }
+ 
+-  if (sha256Hex(await readFile(tmp, 'utf8')) !== intended) {
+-    await rm(tmp, { force: true });
+-    throw new Error('writeFileAtomic: checksum mismatch, temp file removed');
+-  }
++    const staged = await readFile(tmp, 'utf8');
++    if (sha256Hex(staged) !== intended) {
++      throw new Error('atomicWrite: checksum mismatch after staging, target left untouched');
++    }
++    await opts.validate?.(staged);
+ 
+-  try {
+     await rename(tmp, path);
+-  } catch (err) {
+-    await rm(tmp, { force: true });
+-    throw err;
++    committed = true;
++  } finally {
++    if (!committed) await rm(tmp, { force: true }).catch(() => undefined);
+   }
+ 
+   if (process.platform !== 'win32') {
+-    const dh = await open(dir, 'r');
+     try {
+-      await dh.sync();
+-    } finally {
+-      await dh.close();
++      const dh = await open(dir, 'r');
++      try {
++        await dh.sync();
++      } finally {
++        await dh.close();
++      }
++    } catch {
++      // Some platforms/filesystems refuse fsync on a directory handle; the rename is still atomic.
+     }
+   }
+ 
+   return intended;
+ }
++
++/** Backward-compatible name for {@link stageFileAtomic} without a validator. */
++export async function writeFileAtomic(path: string, data: string): Promise<string> {
++  return stageFileAtomic(path, data);
++}
+--- a/vendor/omnexx/src/telemetry/run-diagnosis.ts
++++ b/swarmagents-repo/packages/engine/src/telemetry/run-diagnosis.ts
+@@ -3,7 +3,7 @@
+   IDLE_GAP_MS,
+   efficiency,
+   type RunEvent,
+-} from '../../bench/efficiency.ts';
++} from './efficiency.js';
+ 
+ /** Look-around tools. One of these alone is a wasted round trip (see the agent loop). */
+ const EXPLORE_TOOLS: ReadonlySet<string> = new Set([
+--- a/vendor/omnexx/src/tools/extra/web_extractor.ts
++++ b/swarmagents-repo/packages/engine/src/tools/extra/web_extractor.ts
+@@ -102,7 +102,9 @@
+     ]
+       .filter(Boolean)
+       .join('\n\n');
+-    return head ? `${head}\n\n${text}` : text;
++    const out = head ? `${head}\n\n${text}` : text;
++    // Fragments or docs with no readable article can yield an empty tree; fall back.
++    return out.trim() ? out : stripTags(html);
+   } catch {
+     return stripTags(html);
+   }
+--- a/vendor/omnexx/src/tools/extra/web_search.ts
++++ b/swarmagents-repo/packages/engine/src/tools/extra/web_search.ts
+@@ -14,7 +14,7 @@
+ const MAX_SNIPPET_CHARS = 300;
+ 
+ let activeWebConfig: WebConfig | undefined;
+-/** Formatted results per run, backend, query and count. One run never serves another. */
++/** Formatted results per run, count and query. One run never serves another. */
+ const searchCache = new Map<string, string>();
+ 
+ export function setWebSearchConfig(config?: Partial<WebConfig>): void {
+@@ -53,12 +53,99 @@
+     .describe('Maximum number of results to return (default: 5)'),
+ });
+ 
+-interface SearchResultItem {
++export interface SearchResultItem {
+   title: string;
+   url: string;
+   snippet: string;
+ }
+ 
++/** The free, no-key engines used as fallbacks when a configured backend fails or returns nothing. */
++export type SearchEngineId =
++  | 'brave'
++  | 'tavily'
++  | 'exa'
++  | 'searxng'
++  | 'duckduckgo'
++  | 'google';
++
++/** A browser-grade User-Agent so public HTML endpoints don't refuse the request. */
++const WEB_USER_AGENT =
++  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
++
++function safeDecode(s: string): string {
++  try {
++    return decodeURIComponent(s);
++  } catch {
++    return s;
++  }
++}
++
++function stripTagsInline(raw: string): string {
++  return raw
++    .replace(/<[^>]+>/g, ' ')
++    .replace(/&nbsp;/g, ' ')
++    .replace(/&amp;/g, '&')
++    .replace(/&lt;/g, '<')
++    .replace(/&gt;/g, '>')
++    .replace(/&quot;/g, '"')
++    .replace(/&#0?39;/g, "'")
++    .replace(/\s+/g, ' ')
++    .trim();
++}
++
++/**
++ * Parses DuckDuckGo's HTML endpoint (<html.duckduckgo.com>) result page. Exported so unit
++ * tests can feed canned markup without a network round trip.
++ */
++export function parseDuckDuckGoHtml(html: string): SearchResultItem[] {
++  const anchors = Array.from(
++    html.matchAll(/<a[^>]*class="[^"]*result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi),
++  );
++  const snippets = Array.from(
++    html.matchAll(/<a[^>]*class="[^"]*result__snippet"[^>]*>([\s\S]*?)<\/a>/gi),
++  );
++  const results: SearchResultItem[] = [];
++  for (let i = 0; i < anchors.length; i++) {
++    const a = anchors[i];
++    if (!a) continue;
++    let url = (a[1] ?? '').trim();
++    const uddg = /uddg=([^&]+)/.exec(url);
++    if (uddg) url = safeDecode(uddg[1] ?? '');
++    const title = stripTagsInline(a[2] ?? '');
++    if (!url || !title) continue;
++    const snippet = stripTagsInline(snippets[i]?.[1] ?? '');
++    results.push({ title, url, snippet });
++  }
++  return results;
++}
++
++/**
++ * Parses a Google HTML results page (best effort; structure shifts over time). Exported for
++ * tests. Never throws: malformed blocks are skipped.
++ */
++export function parseGoogleHtml(html: string): SearchResultItem[] {
++  const results: SearchResultItem[] = [];
++  const blocks = html.split(/<div[^>]*class="[^"]*\bg\b[^"]*"/gi);
++  for (const block of blocks.slice(1)) {
++    const hrefMatch =
++      /<a[^>]*href="\/url\?q=([^"&]+)/i.exec(block) ??
++      /<a[^>]*href="(https?:\/\/[^"]+)/i.exec(block);
++    const titleMatch = /<h3[^>]*>([\s\S]*?)<\/h3>/i.exec(block);
++    if (!hrefMatch || !titleMatch) continue;
++    const rawUrl = hrefMatch[1] ?? hrefMatch[0];
++    const url = /^https?:\/\//i.test(rawUrl)
++      ? rawUrl.replace(/&amp;/g, '&')
++      : safeDecode(rawUrl);
++    const title = stripTagsInline(titleMatch[1] ?? '');
++    if (!url || !title) continue;
++    const snippetMatch =
++      /<div[^>]*class="[^"]*(?:VwiC3b|IsZvec)[^"]*"[^>]*>([\s\S]*?)<\/div>/i.exec(block);
++    const snippet = stripTagsInline(snippetMatch?.[1] ?? '');
++    results.push({ title, url, snippet });
++  }
++  return results;
++}
++
+ async function searchBrave(
+   query: string,
+   count: number,
+@@ -202,6 +289,101 @@
+   return results;
+ }
+ 
++async function searchDuckDuckGo(query: string, count: number): Promise<SearchResultItem[]> {
++  const url = new URL('https://html.duckduckgo.com/html/');
++  url.searchParams.set('q', query);
++  const res = await searchFetch(url.toString(), {
++    headers: { 'User-Agent': WEB_USER_AGENT },
++  });
++  if (!res.ok) throw new Error(`DuckDuckGo returned ${res.status}`);
++  const html = await res.text();
++  return parseDuckDuckGoHtml(html).slice(0, count);
++}
++
++async function searchGoogle(query: string, count: number): Promise<SearchResultItem[]> {
++  const url = new URL('https://www.google.com/search');
++  url.searchParams.set('q', query);
++  url.searchParams.set('num', String(count));
++  const res = await searchFetch(url.toString(), {
++    headers: { 'User-Agent': WEB_USER_AGENT, Accept: 'text/html' },
++  });
++  if (!res.ok) throw new Error(`Google returned ${res.status}`);
++  const html = await res.text();
++  return parseGoogleHtml(html).slice(0, count);
++}
++
++/** Rejects when the configured SearXNG instance is a private/implicit URL. */
++async function assertSafeSearx(baseUrl: string): Promise<void> {
++  const parsed = new URL(baseUrl);
++  const allowList = activeWebConfig?.allow ?? ['*'];
++  const named = allowList.filter((a) => a !== '*');
++  const allowed =
++    named.length > 0 &&
++    named.some((a) => parsed.hostname === a || parsed.hostname.endsWith(`.${a}`));
++  if (allowed) return;
++  try {
++    const why = await privateTarget(parsed.hostname);
++    if (why) throw new Error(`SearXNG URL refused: ${why}`);
++  } catch (err) {
++    if (err instanceof Error && err.message.startsWith('SearXNG URL refused')) throw err;
++    throw new Error('Invalid SearXNG URL');
++  }
++}
++
++/**
++ * Ordered list of engines to try for one query: the configured primary first, then the free
++ * fallbacks (searxng when configured, DuckDuckGo, then Google). Exported for tests.
++ */
++export function buildFallbackChain(): Array<{ id: SearchEngineId; label: string }> {
++  const chain: Array<{ id: SearchEngineId; label: string }> = [];
++  const backend = activeWebConfig?.search;
++  if (backend === 'brave') chain.push({ id: 'brave', label: 'Brave' });
++  else if (backend === 'tavily') chain.push({ id: 'tavily', label: 'Tavily' });
++  else if (backend === 'exa') chain.push({ id: 'exa', label: 'Exa' });
++  else if (backend === 'searxng') chain.push({ id: 'searxng', label: 'SearXNG' });
++
++  if (backend !== 'searxng' && (activeWebConfig?.search_url || process.env.SEARXNG_URL)) {
++    chain.push({ id: 'searxng', label: 'SearXNG' });
++  }
++  chain.push({ id: 'duckduckgo', label: 'DuckDuckGo' });
++  chain.push({ id: 'google', label: 'Google' });
++  return chain;
++}
++
++async function searchWith(
++  id: SearchEngineId,
++  query: string,
++  count: number,
++): Promise<SearchResultItem[]> {
++  switch (id) {
++    case 'brave': {
++      const key = resolveSearchKey('brave', activeWebConfig?.search_key_env);
++      if (!key) throw new Error('missing BRAVE_API_KEY (set BRAVE_API_KEY or [web] search_key_env)');
++      return searchBrave(query, count, key);
++    }
++    case 'tavily': {
++      const key = resolveSearchKey('tavily', activeWebConfig?.search_key_env);
++      if (!key) throw new Error('missing TAVILY_API_KEY (set TAVILY_API_KEY or [web] search_key_env)');
++      return searchTavily(query, count, key);
++    }
++    case 'exa': {
++      const key = resolveSearchKey('exa', activeWebConfig?.search_key_env);
++      if (!key) throw new Error('missing EXA_API_KEY (set EXA_API_KEY or [web] search_key_env)');
++      return searchExa(query, count, key);
++    }
++    case 'searxng': {
++      const base = activeWebConfig?.search_url ?? process.env.SEARXNG_URL;
++      if (!base) throw new Error('missing SearXNG instance URL (set SEARXNG_URL or [web] search_url)');
++      await assertSafeSearx(base);
++      return searchSearxng(query, count, base);
++    }
++    case 'duckduckgo':
++      return searchDuckDuckGo(query, count);
++    case 'google':
++      return searchGoogle(query, count);
++  }
++}
++
+ export function resolveSearchKey(backend: SearchBackend, keyEnv?: string): string | undefined {
+   if (keyEnv) {
+     return process.env[keyEnv];
+@@ -221,7 +403,7 @@
+ export const webSearchTool: Tool<typeof schema> = {
+   name: 'web_search',
+   description:
+-    'Search the web (configured backend). Returns titles, URLs and short snippets; read a result with web_fetch. Cached per run.',
++    'Search the web (configured backend with free multi-engine fallbacks). Returns titles, URLs and short snippets; read a result with web_fetch. Cached per run.',
+   schema,
+   readOnly: true,
+   async run(input, ctx: ToolContext): Promise<ToolOutput> {
+@@ -231,78 +413,49 @@
+     }
+ 
+     const count = input.n ?? 5;
+-    const key = resolveSearchKey(backend, activeWebConfig?.search_key_env);
+-
+-    const cacheKey = `${ctx.store.runId}\n${backend}\n${count}\n${input.query}`;
++    const cacheKey = `${ctx.store.runId}\n${count}\n${input.query}`;
+     const cached = searchCache.get(cacheKey);
+     if (cached !== undefined) return ok(cached);
+ 
+-    try {
+-      let items: SearchResultItem[] = [];
+-      switch (backend) {
+-        case 'brave':
+-          if (!key)
+-            return fail(
+-              'Missing API key for Brave search (set BRAVE_API_KEY or [web] search_key_env)',
+-            );
+-          items = await searchBrave(input.query, count, key);
+-          break;
+-        case 'tavily':
+-          if (!key)
+-            return fail(
+-              'Missing API key for Tavily search (set TAVILY_API_KEY or [web] search_key_env)',
+-            );
+-          items = await searchTavily(input.query, count, key);
+-          break;
+-        case 'exa':
+-          if (!key)
+-            return fail('Missing API key for Exa search (set EXA_API_KEY or [web] search_key_env)');
+-          items = await searchExa(input.query, count, key);
+-          break;
+-        case 'searxng': {
+-          const searxUrl = activeWebConfig?.search_url ?? process.env.SEARXNG_URL;
+-          if (!searxUrl)
+-            return fail('Missing SearXNG instance URL (set SEARXNG_URL or [web] search_url)');
+-          const parsed = new URL(searxUrl);
+-          const allowList = activeWebConfig?.allow ?? ['*'];
+-          const named = allowList.filter((a) => a !== '*');
+-          if (!(
+-            named.length &&
+-            named.some((a) => parsed.hostname === a || parsed.hostname.endsWith('.' + a))
+-          )) {
+-            try {
+-              const why = await privateTarget(parsed.hostname);
+-              if (why) return fail(`SearXNG URL refused: ${why}`);
+-            } catch {
+-              return fail('Invalid SearXNG URL');
+-            }
+-          }
+-          items = await searchSearxng(input.query, count, searxUrl);
++    const errors: string[] = [];
++    let anySuccess = false;
++    let items: SearchResultItem[] = [];
++
++    for (const { id, label } of buildFallbackChain()) {
++      try {
++        const found = await searchWith(id, input.query, count);
++        anySuccess = true;
++        if (found.length > 0) {
++          items = found;
+           break;
+         }
++        errors.push(`${label}: no results`);
++      } catch (err) {
++        const msg = err instanceof Error ? err.message : String(err);
++        errors.push(`${label}: ${msg}`);
+       }
++    }
+ 
+-      if (items.length === 0) {
+-        return ok(`No search results found for: ${input.query}`);
++    if (items.length === 0) {
++      if (!anySuccess && errors.length > 0) {
++        return fail(`Search failed: ${ctx.redactor.text(errors.join('; '))}`);
+       }
+-
+-      const formatted = ctx.redactor.text(
+-        items
+-          .slice(0, count)
+-          .map(
+-            (item, idx) =>
+-              `${idx + 1}. [${item.title}](${item.url})\n   ${clipSnippet(item.snippet)}`,
+-          )
+-          .join('\n\n'),
+-      );
+-      searchCache.set(cacheKey, formatted);
+-      const oldest = searchCache.keys().next().value;
+-      if (searchCache.size > MAX_CACHED_QUERIES && oldest !== undefined) searchCache.delete(oldest);
+-      return ok(formatted);
+-    } catch (err) {
+-      const msg = err instanceof Error ? err.message : String(err);
+-      return fail(`Search failed: ${ctx.redactor.text(msg)}`);
++      return ok(`No search results found for: ${input.query}`);
+     }
++
++    const formatted = ctx.redactor.text(
++      items
++        .slice(0, count)
++        .map(
++          (item, idx) =>
++            `${idx + 1}. [${item.title}](${item.url})\n   ${clipSnippet(item.snippet)}`,
++        )
++        .join('\n\n'),
++    );
++    searchCache.set(cacheKey, formatted);
++    const oldest = searchCache.keys().next().value;
++    if (searchCache.size > MAX_CACHED_QUERIES && oldest !== undefined) searchCache.delete(oldest);
++    return ok(formatted);
+   },
+ };
+ 

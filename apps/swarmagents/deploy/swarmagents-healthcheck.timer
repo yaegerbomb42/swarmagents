@@ -1,0 +1,18 @@
+# swarmagents-healthcheck.timer — example 5-minute schedule for the
+# SwarmAgents health check (see swarmagents-healthcheck.service).
+#
+# Install alongside the .service file, then:
+#   systemctl daemon-reload
+#   systemctl enable --now swarmagents-healthcheck.timer
+#   systemctl list-timers swarmagents-healthcheck.timer
+[Unit]
+Description=Run the SwarmAgents health check every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=swarmagents-healthcheck.service
+
+[Install]
+WantedBy=timers.target

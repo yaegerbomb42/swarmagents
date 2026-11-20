@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SwarmAgents // Minimal 3-Part UI (AGL Architecture Proof)</title>
+  <style>
+    :root {
+      --bg: #090a0f;
+      --surface: #12151c;
+      --surface-elevated: #1a1e28;
+      --border: #232836;
+      --text-main: #f0f3f6;
+      --text-muted: #7d8799;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --green: #10b981;
+      --yellow: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* TOP BAR / BRAND & SETTINGS TRIGGER */
+    header {
+      height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--border);
+      z-index: 10;
+    }
+    .brand {
+      font-weight: 600;
+      font-size: 15px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      letter-spacing: -0.3px;
+    }
+    .pulse-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+    }
+    .gear-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: 6px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .gear-btn:hover {
+      color: var(--text-main);
+      border-color: #3b4356;
+      background: var(--surface);
+    }
+
+    /* PART 2: MAIN AREA — VM COMPUTER VISUAL (THE STAR) */
+    main {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      position: relative;
+      background: radial-gradient(circle at center, #111520 0%, #090a0f 100%);
+    }
+
+    .vm-screen-wrapper {
+      width: 100%;
+      max-width: 960px;
+      height: 100%;
+      max-height: 580px;
+      background: #080a0e;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+      position: relative;
+    }
+
+    .vm-titlebar {
+      height: 32px;
+      background: #0d1017;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: monospace;
+    }
+    .vm-dots {
+      display: flex;
+      gap: 6px;
+    }
+    .vm-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #232836;
+    }
+
+    .vm-viewport {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      padding: 24px;
+    }
+
+    /* Empty state */
+    .vm-empty-state {
+      text-align: center;
+      max-width: 380px;
+    }
+    .vm-empty-icon {
+      font-size: 40px;
+      margin-bottom: 12px;
+      opacity: 0.3;
+    }
+    .vm-empty-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-main);
+      margin-bottom: 6px;
+    }
+    .vm-empty-desc {
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.4;
+      margin-bottom: 16px;
+    }
+    .chips {
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+    }
+    .chip {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 11px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .chip:hover {
+      color: var(--text-main);
+      border-color: #3b4356;
+    }
+
+    /* Elegant Activity Feed Overlay */
+    .activity-overlay {
+      position: absolute;
+      bottom: 16px;
+      left: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-width: 450px;
+    }
+    .activity-row {
+      background: rgba(18, 21, 28, 0.9);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      animation: fadeIn 0.2s ease-out;
+    }
+    .activity-time { color: var(--text-muted); font-family: monospace; }
+    .activity-text { color: #d1d5db; }
+
+    /* PART 1: PINNED INPUT BAR (BOTTOM) */
+    footer {
+      padding: 12px 16px 20px 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .input-bar-container {
+      width: 100%;
+      max-width: 720px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+      transition: border-color 0.15s;
+    }
+    .input-bar-container:focus-within {
+      border-color: #3b82f6;
+    }
+    .input-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    textarea {
+      flex: 1;
+      background: none;
+      border: none;
+      color: var(--text-main);
+      font-size: 14px;
+      resize: none;
+      height: 24px;
+      line-height: 24px;
+      outline: none;
+      font-family: inherit;
+    }
+    textarea::placeholder { color: var(--text-muted); }
+    .send-btn {
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-weight: 500;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .send-btn:hover { background: var(--accent-hover); }
+
+    .input-subrow {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .model-picker {
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: #191e2b;
+      color: #93c5fd;
+    }
+
+    /* PART 3: SLIDE-OVER SETTINGS PANEL (TOP RIGHT) */
+    .slide-panel {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 440px;
+      height: 100vh;
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      box-shadow: -10px 0 40px rgba(0,0,0,0.6);
+      transform: translateX(100%);
+      transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      z-index: 100;
+      display: flex;
+      flex-direction: column;
+    }
+    .slide-panel.open {
+      transform: translateX(0);
+    }
+    .panel-header {
+      height: 52px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+    }
+    .panel-title { font-weight: 600; font-size: 14px; }
+    .close-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 18px;
+      cursor: pointer;
+    }
+    .close-btn:hover { color: var(--text-main); }
+
+    /* 5 Tabs */
+    .tabs-bar {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+      background: #0f1218;
+    }
+    .tab-btn {
+      flex: 1;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      padding: 10px 0;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: center;
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s;
+    }
+    .tab-btn.active {
+      color: var(--text-main);
+      border-bottom-color: var(--accent);
+      background: var(--surface);
+    }
+
+    .panel-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+    }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* Items rows */
+    .item-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      background: var(--surface-elevated);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 8px;
+      font-size: 12px;
+    }
+    .item-info { display: flex; flex-direction: column; gap: 2px; }
+    .item-name { font-weight: 600; color: var(--text-main); }
+    .item-desc { color: var(--text-muted); font-size: 11px; }
+
+    /* Effective provider callout */
+    .effective-callout {
+      background: #172554;
+      border: 1px solid #1e40af;
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-size: 11px;
+      color: #93c5fd;
+      margin-bottom: 14px;
+      line-height: 1.4;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- TOP HEADER -->
+  <header>
+    <div class="brand">
+      <div class="pulse-dot"></div>
+      <span>SwarmAgents</span>
+      <span style="font-size:10px; background:#232836; padding:2px 6px; border-radius:4px; color:var(--text-muted);">AGL-ARCH-v1</span>
+    </div>
+    <button class="gear-btn" onclick="toggleSettings()">
+      <span>⚙ Settings</span>
+    </button>
+  </header>
+
+  <!-- PART 2: MAIN SECTION (VM COMPUTER SCREEN) -->
+  <main>
+    <div class="vm-screen-wrapper">
+      <div class="vm-titlebar">
+        <div class="vm-dots">
+          <div class="vm-dot"></div>
+          <div class="vm-dot"></div>
+          <div class="vm-dot"></div>
+        </div>
+        <div>vmDriver: docker // screen: lib/desktop-proxy</div>
+        <div>1080p ● 60fps</div>
+      </div>
+
+      <div class="vm-viewport">
+        <!-- Calm Empty State (when no run is active) -->
+        <div class="vm-empty-state">
+          <div class="vm-empty-icon">🖥</div>
+          <div class="vm-empty-title">Start a run to watch the agent work</div>
+          <div class="vm-empty-desc">The VM screen streams live execution from Docker with sub-millisecond telemetry.</div>
+          <div class="chips">
+            <div class="chip" onclick="simulateRun('Build Landing Page')">Build Landing Page</div>
+            <div class="chip" onclick="simulateRun('Run Test Suite')">Run Test Suite</div>
+          </div>
+        </div>
+
+        <!-- Elegant Live Activity Feed Overlay -->
+        <div class="activity-overlay" id="activity-overlay">
+          <div class="activity-row">
+            <span class="activity-time">19:14:02</span>
+            <span class="activity-text">⚡ [AGL] Initialized AST state machine in 0.38ms</span>
+          </div>
+          <div class="activity-row">
+            <span class="activity-time">19:14:15</span>
+            <span class="activity-text">🔍 [Harness] Connecting desktop proxy stream...</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- PART 1: PINNED BOTTOM INPUT BAR -->
+  <footer>
+    <div class="input-bar-container">
+      <div class="input-row">
+        <button style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:16px;">📎</button>
+        <textarea placeholder="Ask the agent to build, test, or inspect anything..." rows="1" id="prompt-input"></textarea>
+        <button class="send-btn" onclick="sendPrompt()">Run Agent</button>
+      </div>
+      <div class="input-subrow">
+        <div class="model-picker" onclick="toggleSettings(); switchTab('providers')">
+          <span>⚡ Inception / mercury-3 (Free)</span>
+          <span style="font-size:9px;">▼</span>
+        </div>
+        <div id="status-line">Ready for instruction</div>
+      </div>
+    </div>
+  </footer>
+
+  <!-- PART 3: TOP RIGHT SLIDE-OVER SETTINGS PANEL -->
+  <div class="slide-panel" id="settings-panel">
+    <div class="panel-header">
+      <div class="panel-title">Swarm Control Center</div>
+      <button class="close-btn" onclick="toggleSettings()">✕</button>
+    </div>
+
+    <!-- 5 Fleshed Out Tabs -->
+    <div class="tabs-bar">
+      <button class="tab-btn active" onclick="switchTab('providers')">Providers</button>
+      <button class="tab-btn" onclick="switchTab('mcp')">MCP</button>
+      <button class="tab-btn" onclick="switchTab('tools')">Tools</button>
+      <button class="tab-btn" onclick="switchTab('skills')">Skills</button>
+      <button class="tab-btn" onclick="switchTab('connectors')">Connectors</button>
+    </div>
+
+    <div class="panel-body">
+      <!-- TAB 1: PROVIDERS (BYOK) -->
+      <div class="tab-content active" id="tab-providers">
+        <div class="effective-callout">
+          <strong>Next run effective provider:</strong><br>
+          Inception / mercury-3 — free, first in fallback order.
+        </div>
+        <div style="font-size:11px; font-weight:600; color:var(--text-muted); margin-bottom:8px; text-transform:uppercase;">Configured Providers (Drag to reorder fallback)</div>
+        
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">1. Inception</span>
+            <span class="item-desc">mercury-3 ● BYOK Key Set</span>
+          </div>
+          <span style="color:var(--green); font-size:11px;">Active</span>
+        </div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">2. NVIDIA</span>
+            <span class="item-desc">nemotron-3.5-lightning ● Ready</span>
+          </div>
+          <span style="color:var(--green); font-size:11px;">Fallback 1</span>
+        </div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">3. Groq Pool (14 Keys)</span>
+            <span class="item-desc">qwen/qwen3.8-27b ● High-speed</span>
+          </div>
+          <span style="color:var(--green); font-size:11px;">Fallback 2</span>
+        </div>
+      </div>
+
+      <!-- TAB 2: MCP SERVERS -->
+      <div class="tab-content" id="tab-mcp">
+        <div style="font-size:11px; font-weight:600; color:var(--text-muted); margin-bottom:8px; text-transform:uppercase;">Shipped MCP Server Registry</div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">blender</span>
+            <span class="item-desc">3D Scene Generation & Inspection</span>
+          </div>
+          <button style="background:#064e3b; color:#6ee7b7; border:none; padding:4px 8px; border-radius:4px; font-size:11px;">Connected</button>
+        </div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">chrome-devtools</span>
+            <span class="item-desc">Live DOM Tree & Trace</span>
+          </div>
+          <button style="background:#064e3b; color:#6ee7b7; border:none; padding:4px 8px; border-radius:4px; font-size:11px;">Connected</button>
+        </div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">sequential-thinking</span>
+            <span class="item-desc">Multi-step Dynamic Deductive Logic</span>
+          </div>
+          <button style="background:#1e293b; color:#94a3b8; border:none; padding:4px 8px; border-radius:4px; font-size:11px;">Connect</button>
+        </div>
+      </div>
+
+      <!-- TAB 3: TOOLS -->
+      <div class="tab-content" id="tab-tools">
+        <div style="font-size:11px; font-weight:600; color:var(--text-muted); margin-bottom:8px; text-transform:uppercase;">Agent Roles & Capabilities (lib/roles.ts)</div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">computer</span>
+            <span class="item-desc">Screenshot & Describe VM Screen</span>
+          </div>
+          <span style="color:var(--green); font-size:11px;">Enabled</span>
+        </div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">bash</span>
+            <span class="item-desc">Execute shell in isolated Docker</span>
+          </div>
+          <span style="color:var(--green); font-size:11px;">Enabled</span>
+        </div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">edit_file</span>
+            <span class="item-desc">Precise unified diff patching</span>
+          </div>
+          <span style="color:var(--green); font-size:11px;">Enabled</span>
+        </div>
+      </div>
+
+      <!-- TAB 4: SKILLS -->
+      <div class="tab-content" id="tab-skills">
+        <div style="font-size:11px; font-weight:600; color:var(--text-muted); margin-bottom:8px; text-transform:uppercase;">Loaded Skills (2 / 10 Max Runtime Cap)</div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">modern-web-guidance</span>
+            <span class="item-desc">Standard HTML5, CSS Grid, A11y</span>
+          </div>
+          <span style="color:var(--green); font-size:11px;">Loaded</span>
+        </div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">a11y-debugging</span>
+            <span class="item-desc">WCAG conformance checks</span>
+          </div>
+          <span style="color:var(--green); font-size:11px;">Loaded</span>
+        </div>
+      </div>
+
+      <!-- TAB 5: CONNECTORS -->
+      <div class="tab-content" id="tab-connectors">
+        <div style="font-size:11px; font-weight:600; color:var(--text-muted); margin-bottom:8px; text-transform:uppercase;">Capability Catalog Connectors</div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">GitHub</span>
+            <span class="item-desc">PR branches & commit hooks</span>
+          </div>
+          <span style="color:var(--green); font-size:11px;">Added</span>
+        </div>
+        <div class="item-row">
+          <div class="item-info">
+            <span class="item-name">Linear</span>
+            <span class="item-desc">Issue tracking & roadmap sync</span>
+          </div>
+          <span style="color:var(--yellow); font-size:11px;">OAuth Setup Required</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function toggleSettings() {
+      document.getElementById('settings-panel').classList.toggle('open');
+    }
+    window.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        document.getElementById('settings-panel').classList.remove('open');
+      }
+    });
+
+    function switchTab(tabId) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+      event.target.classList.add('active');
+      document.getElementById('tab-' + tabId).classList.add('active');
+    }
+
+    function sendPrompt() {
+      const inp = document.getElementById('prompt-input');
+      const val = inp.value.trim();
+      if (!val) return;
+      simulateRun(val);
+      inp.value = '';
+    }
+
+    function simulateRun(task) {
+      document.getElementById('status-line').innerText = `Agent is running: ${task}...`;
+      const overlay = document.getElementById('activity-overlay');
+      const time = new Date().toTimeString().split(' ')[0];
+      const newRow = document.createElement('div');
+      newRow.className = 'activity-row';
+      newRow.innerHTML = `<span class="activity-time">${time}</span><span class="activity-text">⚡ [AGL Intent] (lvl:3:agent_dispatch "Builder" "${task}")</span>`;
+      overlay.appendChild(newRow);
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+# Real per-user VMs. Use together with docker-compose.yml; the base file keeps
+# its no-socket fake-driver development default.
+services:
+  swarmagents:
+    environment:
+      SWARM_SERVER_MODE: "1"
+      SWARM_VM_DRIVER: ${SWARM_VM_DRIVER:-docker}
+      SWARM_VM_IMAGE: ${SWARM_VM_IMAGE:-swarm-vm:claude}
+      SWARM_VM_NETWORK: ${SWARM_VM_NETWORK:-swarm-vms}
+      # The per-user VMs resolve this service name on the shared network.
+      SWARM_VM_APPROVAL_BASE_URL: ${SWARM_VM_APPROVAL_BASE_URL:-http://swarmagents:3777}
+      SWARM_SESSION_SECRET: ${SWARM_SESSION_SECRET:?Set SWARM_SESSION_SECRET to a long random value}
+      SWARM_VM_DESKTOP: ${SWARM_VM_DESKTOP:-0}
+      SWARM_VM_DESKTOP_IMAGE: ${SWARM_VM_DESKTOP_IMAGE:-swarm-vm:desktop}
+    # Root:root sockets need group 0. Otherwise set DOCKER_GID to the socket's
+    # actual group (Linux `stat -c '%g'`, macOS `stat -f '%g'`).
+    group_add:
+      - "${DOCKER_GID:-0}"
+    volumes:
+      - swarm_data:/data
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    networks:
+      - default
+      - swarm-vms
+
+networks:
+  # The app and every per-user VM must share this network for approval calls
+  # and the desktop proxy. Compose creates it; no manual network step is needed.
+  swarm-vms:
+    name: ${SWARM_VM_NETWORK:-swarm-vms}
+    driver: bridge
+
+volumes:
+  swarm_data:

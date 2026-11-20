@@ -1,0 +1,159 @@
+{
+  "date": "2026-11-08",
+  "corpus": {
+    "subdir": "src/core",
+    "files": 69,
+    "loc": 14347,
+    "defCount": 1012,
+    "refCount": 4645,
+    "engine": "tree-sitter"
+  },
+  "rawDumpTokens": 175843,
+  "codemapTokens": 699,
+  "slice": {
+    "bothDirections": {
+      "tokens": 4095,
+      "spans": 105,
+      "truncated": true,
+      "hasGold": true
+    },
+    "callersOnly": {
+      "tokens": 3374,
+      "spans": 5,
+      "truncated": true,
+      "hasGold": true
+    }
+  },
+  "failure": {
+    "gold": "src/core/token-count.ts",
+    "rankPos": 1,
+    "mapUnseededPinsHit": true,
+    "mapPinnedHit": true
+  },
+  "tasks": [
+    {
+      "id": "t1",
+      "identifier": "TokenCounter",
+      "gold": "src/core/token-count.ts",
+      "posUnseeded": 14,
+      "posSeeded": 0,
+      "inMapUnseeded": false,
+      "inMapSeededPinned": true,
+      "inMapSeededNoPin": true,
+      "grepTokens": 40,
+      "goldFileTokens": 2165
+    },
+    {
+      "id": "t2",
+      "identifier": "estimateTokens",
+      "gold": "src/core/tokens.ts",
+      "posUnseeded": 12,
+      "posSeeded": 0,
+      "inMapUnseeded": false,
+      "inMapSeededPinned": true,
+      "inMapSeededNoPin": true,
+      "grepTokens": 957,
+      "goldFileTokens": 824
+    },
+    {
+      "id": "t3",
+      "identifier": "nextTokenRatio",
+      "gold": "src/core/tokens.ts",
+      "posUnseeded": 12,
+      "posSeeded": 0,
+      "inMapUnseeded": false,
+      "inMapSeededPinned": true,
+      "inMapSeededNoPin": true,
+      "grepTokens": 99,
+      "goldFileTokens": 824
+    },
+    {
+      "id": "t4",
+      "identifier": "AstCache",
+      "gold": "src/core/ast-cache.ts",
+      "posUnseeded": 0,
+      "posSeeded": 0,
+      "inMapUnseeded": true,
+      "inMapSeededPinned": true,
+      "inMapSeededNoPin": true,
+      "grepTokens": 70,
+      "goldFileTokens": 3825
+    },
+    {
+      "id": "t5",
+      "identifier": "parseFile",
+      "gold": "src/core/ast-cache.ts",
+      "posUnseeded": 0,
+      "posSeeded": 0,
+      "inMapUnseeded": true,
+      "inMapSeededPinned": true,
+      "inMapSeededNoPin": true,
+      "grepTokens": 57,
+      "goldFileTokens": 3825
+    },
+    {
+      "id": "t6",
+      "identifier": "compactPlanView",
+      "gold": "src/core/plan.ts",
+      "posUnseeded": 24,
+      "posSeeded": 0,
+      "inMapUnseeded": false,
+      "inMapSeededPinned": true,
+      "inMapSeededNoPin": true,
+      "grepTokens": 37,
+      "goldFileTokens": 5833
+    },
+    {
+      "id": "t7",
+      "identifier": "writeFileAtomic",
+      "gold": "src/core/atomicWrite.ts",
+      "posUnseeded": 25,
+      "posSeeded": 0,
+      "inMapUnseeded": false,
+      "inMapSeededPinned": true,
+      "inMapSeededNoPin": true,
+      "grepTokens": 517,
+      "goldFileTokens": 569
+    },
+    {
+      "id": "t8",
+      "identifier": "EventLog",
+      "gold": "src/core/events.ts",
+      "posUnseeded": 18,
+      "posSeeded": 0,
+      "inMapUnseeded": false,
+      "inMapSeededPinned": true,
+      "inMapSeededNoPin": true,
+      "grepTokens": 163,
+      "goldFileTokens": 1477
+    }
+  ],
+  "aggregates": {
+    "recallUnseeded": {
+      "r1": 0.25,
+      "r3": 0.25,
+      "r5": 0.25,
+      "mrr": 0.29395074224021595
+    },
+    "recallSeeded": {
+      "r1": 1,
+      "r3": 1,
+      "r5": 1,
+      "mrr": 1
+    },
+    "inMapUnseeded1024": 0.25,
+    "inMapSeeded1024": 1,
+    "builtinSeeded": {
+      "recall1": 0.5,
+      "mrr": 0.6666666666666666
+    }
+  },
+  "timing": {
+    "extractMs": 598.6438390000001,
+    "graphMs": 3.6717579999999543,
+    "codemapMs": 20.08033999999998,
+    "regexMs": 30.11213100000009,
+    "builtinMs": 135.167418,
+    "totalMs": 1102.534491
+  }
+}

@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Robot Sprite: Wave, Curious, Thinking</title>
+<style>
+:root{--stage:#c5c5c5;--ui-bg:rgba(255,255,255,.55);--ui-fg:#2a2d36;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--ui-bg:rgba(20,22,28,.62);--ui-fg:#e8e6e1}}
+:root[data-theme="dark"]{--ui-bg:rgba(20,22,28,.62);--ui-fg:#e8e6e1}
+html{height:100%;scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;height:100%;background:var(--stage);display:flex;flex-direction:column;font:13px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ui-fg)}
+svg{flex:1;min-height:0;width:100%;display:block}
+#ui{display:flex;align-items:center;gap:12px;margin:0 auto 14px;padding:8px 14px;border-radius:999px;background:var(--ui-bg);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);max-width:calc(100% - 24px)}
+#pp{font:inherit;padding:6px 14px;border-radius:999px;border:1.5px solid var(--ui-fg);background:transparent;color:var(--ui-fg);cursor:pointer;min-width:64px}
+#pp:focus-visible,#scrub:focus-visible{outline:2px solid var(--ui-fg);outline-offset:2px}
+#scrub{width:min(44vw,300px);accent-color:var(--ui-fg)}
+#lbl{min-width:150px;font-variant-numeric:tabular-nums}
+@media (max-width:520px){#lbl{min-width:0}#scrub{width:34vw}}
+</style>
+</head>
+<body>
+<svg viewBox="130 70 540 640" role="img" aria-label="Animated cute robot: waves, tilts its head curiously, then ponders">
+<defs>
+  <radialGradient id="shell" cx=".35" cy=".25" r=".95"><stop offset="0" stop-color="#4d5366"/><stop offset=".55" stop-color="#2b2f3b"/><stop offset="1" stop-color="#171922"/></radialGradient>
+  <linearGradient id="limb" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#4a5062"/><stop offset=".5" stop-color="#2b2f3b"/><stop offset=".88" stop-color="#1d2029"/><stop offset="1" stop-color="#3a4d6e"/></linearGradient>
+  <linearGradient id="limbR" x1="1" y1="0" x2="0" y2="0"><stop offset="0" stop-color="#4a5062"/><stop offset=".5" stop-color="#2b2f3b"/><stop offset=".88" stop-color="#1d2029"/><stop offset="1" stop-color="#3a4d6e"/></linearGradient>
+  <linearGradient id="rim" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a9c0e0" stop-opacity=".5"/><stop offset=".4" stop-color="#a9c0e0" stop-opacity="0"/><stop offset=".72" stop-color="#7fa2d4" stop-opacity="0"/><stop offset="1" stop-color="#8fb4ec" stop-opacity=".95"/></linearGradient>
+  <linearGradient id="creamV" gradientUnits="userSpaceOnUse" x1="0" y1="120" x2="0" y2="610"><stop offset="0" stop-color="#f4e7cf"/><stop offset=".5" stop-color="#e9d5b1"/><stop offset="1" stop-color="#d2b993"/></linearGradient>
+  <linearGradient id="glass" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#6b6b70"/><stop offset=".5" stop-color="#a7a39d"/><stop offset="1" stop-color="#5b5c61"/></linearGradient>
+  <radialGradient id="shadowG"><stop offset="0" stop-color="#000" stop-opacity=".5"/><stop offset=".6" stop-color="#000" stop-opacity=".22"/><stop offset="1" stop-color="#000" stop-opacity="0"/></radialGradient>
+  <filter id="b6" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="6"/></filter>
+  <filter id="b3" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="3"/></filter>
+  <clipPath id="faceClip"><ellipse cx="400" cy="262" rx="80" ry="135"/></clipPath>
+  <clipPath id="headClip"><ellipse cx="400" cy="246" rx="116" ry="142"/></clipPath>
+  <clipPath id="rimClip"><rect x="250" y="80" width="300" height="250"/></clipPath>
+  <path id="leg" d="M350 575 L396 575 L394 640 C394 660 385 668 372 668 C358 668 347 660 348 640 Z" fill="url(#limb)"/>
+</defs>
+
+<g id="shadow">
+  <ellipse cx="400" cy="670" rx="122" ry="19" fill="url(#shadowG)"/>
+  <ellipse cx="400" cy="668" rx="70" ry="7" fill="#000" opacity=".35" filter="url(#b3)"/>
+</g>
+
+<g id="root">
+  <use href="#leg"/><use href="#leg" x="56"/>
+
+  <g id="torso">
+    <ellipse cx="400" cy="450" rx="124" ry="175" fill="url(#shell)"/>
+    <ellipse cx="318" cy="430" rx="20" ry="88" fill="#fff" opacity=".07" filter="url(#b6)"/>
+    <ellipse cx="400" cy="450" rx="124" ry="175" fill="none" stroke="url(#rim)" stroke-width="3"/>
+  </g>
+
+  <g id="head">
+    <ellipse cx="400" cy="246" rx="116" ry="142" fill="url(#shell)"/>
+    <g clip-path="url(#headClip)"><ellipse cx="352" cy="160" rx="34" ry="20" fill="#fff" opacity=".14" filter="url(#b6)" transform="rotate(-28 352 160)"/></g>
+    <ellipse cx="400" cy="246" rx="116" ry="142" fill="none" stroke="url(#rim)" stroke-width="3" clip-path="url(#rimClip)"/>
+    <ellipse cx="400" cy="262" rx="80" ry="135" fill="url(#creamV)"/>
+    <g clip-path="url(#faceClip)">
+      <g id="p1"><path d="M322 170 L392 132 L380 300 L330 330 Z" fill="#fff" opacity=".13"/></g>
+      <g id="p2"><path d="M470 190 L490 300 L430 390 L440 260 Z" fill="#7b5c33" opacity=".1"/></g>
+      <g id="p3"><path d="M340 300 L460 270 L450 345 L350 360 Z" fill="#fff" opacity=".09"/></g>
+      <ellipse cx="362" cy="200" rx="24" ry="62" fill="#fff" opacity=".22" filter="url(#b6)"/>
+    </g>
+    <g id="slit">
+      <rect id="glow" x="376" y="154" width="48" height="88" rx="24" fill="#ffd9a0" filter="url(#b6)" opacity=".5"/>
+      <rect x="383" y="162" width="34" height="68" rx="17" fill="#23252d"/>
+      <rect x="387" y="167" width="26" height="58" rx="13" fill="url(#glass)"/>
+      <rect id="lit" x="387" y="167" width="26" height="58" rx="13" fill="#fff0cf" opacity=".4"/>
+      <ellipse cx="394" cy="181" rx="3" ry="7" fill="#fff" opacity=".6"/>
+      <rect x="383" y="162" width="34" height="68" rx="17" fill="none" stroke="#fff" stroke-opacity=".14" stroke-width="1.5"/>
+    </g>
+  </g>
+
+  <g id="belly">
+    <ellipse cx="400" cy="466" rx="94" ry="140" fill="url(#creamV)"/>
+    <ellipse cx="364" cy="440" rx="26" ry="72" fill="#fff" opacity=".18" filter="url(#b6)"/>
+    <path d="M350 376 Q400 396 450 376" fill="none" stroke="#9c7f55" stroke-opacity=".32" stroke-width="3" stroke-linecap="round"/>
+    <path d="M352 382 Q400 402 448 382" fill="none" stroke="#fff" stroke-opacity=".5" stroke-width="2" stroke-linecap="round"/>
+  </g>
+
+  <g id="armL"></g>
+  <g id="armR"></g>
+</g>
+</svg>
+
+<div id="ui">
+  <button id="pp" type="button" aria-label="Play or pause">Pause</button>
+  <input id="scrub" type="range" min="0" max="10" step="0.001" value="0" aria-label="Timeline">
+  <span id="lbl"></span>
+</div>
+
+<script>
+(()=>{
+const $=id=>document.getElementById(id), TAU=Math.PI*2, LOOP=10;
+
+/* easing: spring has anticipation-free settle with gentle overshoot */
+const E={
+  io:u=>u<.5?4*u*u*u:1-Math.pow(-2*u+2,3)/2,
+  sine:u=>-(Math.cos(Math.PI*u)-1)/2,
+  sp:u=>u>=1?1:1-Math.exp(-7.5*u)*(Math.cos(10*u)+.75*Math.sin(10*u))
+};
+/* keyframe track: [time, value, easingOfIncomingSegment] */
+const tr=(k,t)=>{
+  if(t<=k[0][0])return k[0][1];
+  for(let i=1;i<k.length;i++){
+    if(t<=k[i][0]){const a=k[i-1],b=k[i];return a[1]+(b[1]-a[1])*E[b[2]||'io']((t-a[0])/(b[0]-a[0]));}
+  }
+  return k[k.length-1][1];
+};
+
+/* two-bone IK (used once, to find the pondering pose that puts the hand at the chin plate) */
+function ik(sx,sy,s,tx,ty,l1,l2){
+  const x=(tx-sx)*s,y=ty-sy;
+  const d=Math.min(Math.max(Math.hypot(x,y),Math.abs(l1-l2)+1),l1+l2-1);
+  const phi=Math.atan2(x,y),A=Math.acos((l1*l1+d*d-l2*l2)/(2*l1*d));
+  let b=null;
+  for(const g of[-1,1]){const r=phi+g*A,ey=l1*Math.cos(r);if(!b||ey>b.ey)b={r,ex:l1*Math.sin(r),ey};}
+  let e=Math.atan2(x-b.ex,y-b.ey)-b.r;e=Math.atan2(Math.sin(e),Math.cos(e));
+  return[b.r*180/Math.PI,e*180/Math.PI];
+}
+
+/* arm rig: shoulder angle r (0 = hanging, 90 = out to the side), elbow angle e (curls the forearm upward) */
+function mkArm(id,sx,s,fill){
+  const g=$(id);
+  g.setAttribute('transform',`translate(${sx} 398) scale(${s} 1)`);
+  g.innerHTML=`<g><g transform="translate(0 78)"><rect x="-19" y="-19" width="38" height="120" rx="19" fill="url(#${fill})"/><ellipse cx="0" cy="82" rx="22" ry="24" fill="url(#${fill})"/></g><rect x="-21" y="-21" width="42" height="120" rx="21" fill="url(#${fill})"/></g>`;
+  const u=g.firstChild,f=u.firstChild;
+  return(r,e)=>{u.setAttribute('transform',`rotate(${-r})`);f.setAttribute('transform',`translate(0 78) rotate(${-e})`);};
+}
+const setR=mkArm('armR',512,1,'limb'), setL=mkArm('armL',288,-1,'limbR');
+const [rP,eP]=ik(288,398,-1,356,374,78,82);
+
+const K={
+  tilt:[[0,0],[.4,-1.8],[1.3,3.2,'sp'],[2.9,3.2],[3.9,0]],
+  sc:[[0,1],[3.2,1],[4.4,1.04,'sp'],[5.9,1.04],[6.9,1]],
+  hT:[[0,0],[1.3,-2.5,'sp'],[3,-2.5],[3.4,-4],[4.5,15,'sp'],[5.2,13,'sine'],[5.7,16,'sine'],[6,15,'sine'],[7,-2,'sp'],[7.7,0],[8.5,-1.5,'sine'],[9.3,.5,'sine'],[10,0]],
+  hS:[[0,1],[3.4,1],[4.5,1.05,'sp'],[6,1.05],[7,1]],
+  hD:[[0,0],[6,0],[7,4],[9.2,4],[10,0]],
+  gx:[[0,0],[3.4,0],[4.2,6],[4.9,-6,'sine'],[5.6,5,'sine'],[6.3,0],[7.6,-4],[9.4,-4],[10,0]],
+  gy:[[0,0],[7,0],[7.9,-6],[9.2,-6],[10,0]],
+  think:[[0,0],[6,0],[7,1],[9,1],[10,0]],
+  cur:[[0,0],[3.2,0],[3.8,1],[5.8,1],[6.4,0]],
+  rR:[[0,8],[.35,-6],[1.25,105,'sp'],[2.95,105],[3.9,8]],
+  eR:[[0,6],[.35,0],[1.25,62,'sp'],[1.55,100,'sine'],[1.9,40,'sine'],[2.25,100,'sine'],[2.6,40,'sine'],[2.95,62,'sine'],[3.9,6]],
+  rL:[[0,8],[6,8],[7.2,rP,'sp'],[9.2,rP],[10,8]],
+  eL:[[0,6],[6,6],[7.2,eP,'sp'],[8.1,eP+5,'sine'],[8.8,eP-2,'sine'],[9.2,eP,'sine'],[10,6]]
+};
+
+const root=$('root'),head=$('head'),shadow=$('shadow'),slit=$('slit'),glow=$('glow'),lit=$('lit'),pl=[$('p1'),$('p2'),$('p3')];
+
+function frame(t){
+  const w=tr(K.think,t), sc=tr(K.sc,t), tilt=tr(K.tilt,t);
+  const breath=Math.sin(TAU*.3*t)*(.008+.006*w);
+  const bob=-4*w*(.5+.5*Math.sin(TAU*.2*t-1.2)), up=-bob;
+  root.setAttribute('transform',`translate(0 ${bob.toFixed(2)}) translate(400 666) rotate(${tilt.toFixed(3)}) scale(${(sc*(1-breath*.4)).toFixed(4)} ${(sc*(1+breath)).toFixed(4)}) translate(-400 -666)`);
+  head.setAttribute('transform',`translate(0 ${tr(K.hD,t).toFixed(2)}) translate(400 352) rotate(${tr(K.hT,t).toFixed(3)}) scale(${tr(K.hS,t).toFixed(4)}) translate(-400 -352)`);
+  const idle=1.4*Math.sin(TAU*.3*t);
+  setR(tr(K.rR,t)+idle,tr(K.eR,t));
+  setL(tr(K.rL,t)-idle*.7,tr(K.eL,t));
+  shadow.setAttribute('transform',`translate(${(tilt*2.2).toFixed(2)} 0) translate(400 670) scale(${((1-up*.02)*(1+(sc-1)*1.6)).toFixed(3)} ${(1-up*.02).toFixed(3)}) translate(-400 -670)`);
+  shadow.setAttribute('opacity',(1-up*.05).toFixed(3));
+  /* optical slit: calm glow, flickering curiosity, slow dim pulse while thinking */
+  const cw=tr(K.cur,t);
+  const fl=.14*Math.sin(TAU*3.2*t)+.07*Math.sin(TAU*8.7*t+1)+.04*Math.sin(TAU*17*t);
+  const I=Math.min(1,Math.max(0,(1-w)*(.8+.04*Math.sin(TAU*.4*t))+w*(.58+.1*Math.sin(TAU*.6*t))+cw*fl));
+  slit.setAttribute('transform',`translate(${tr(K.gx,t).toFixed(2)} ${tr(K.gy,t).toFixed(2)})`);
+  glow.setAttribute('opacity',(.1+.65*I).toFixed(3));
+  lit.setAttribute('opacity',(.5*I).toFixed(3));
+  /* micro plane shifts on the face plate, strongest while thinking */
+  const pw=.25+.75*w;
+  pl.forEach((p,i)=>{const ph=i*2.1;
+    p.setAttribute('transform',`translate(${(3*pw*Math.sin(TAU*.3*t+ph)).toFixed(2)} ${(2.5*pw*Math.cos(TAU*.4*t+ph)).toFixed(2)})`);
+    p.setAttribute('opacity',(.7+.3*Math.sin(TAU*.3*t+ph*1.7)).toFixed(3));});
+}
+
+const pp=$('pp'),scrub=$('scrub'),lbl=$('lbl'),names=['Wave','Curious','Thinking'];
+let t=0,last=null,playing=!matchMedia('(prefers-reduced-motion: reduce)').matches;
+const sync=()=>{
+  const n=t<3?0:t<6?1:2;
+  lbl.textContent=`State ${n+1} · ${names[n]} · ${t.toFixed(1)}s`;
+  pp.textContent=playing?'Pause':'Play';
+};
+pp.onclick=()=>{playing=!playing;sync();};
+scrub.oninput=()=>{playing=false;t=+scrub.value;frame(t);sync();};
+function tick(now){
+  if(last!==null&&playing)t=(t+Math.min((now-last)/1000,.1))%LOOP;
+  last=now;frame(t);
+  if(playing)scrub.value=t;
+  sync();requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,832 @@
+[
+  {
+    "id": "github",
+    "name": "GitHub",
+    "category": "dev",
+    "description": "Search and manage repositories, issues and pull requests.",
+    "transport": "http",
+    "install": "https://api.githubcopilot.com/mcp/",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [
+      "search_repositories",
+      "search_code",
+      "search_issues"
+    ],
+    "sourceUrl": "https://github.com/github/github-mcp-server",
+    "verified": true,
+    "verifiedHow": "Endpoint or package documented by the linked vendor/reference source; tool names shown are documented examples, not an exhaustive inventory."
+  },
+  {
+    "id": "gitlab",
+    "name": "GitLab",
+    "category": "dev",
+    "description": "Work with GitLab projects and development workflows.",
+    "transport": "http",
+    "install": "https://gitlab.com/api/v4/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/com.gitlab%2Fmcp/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms the remote streamable HTTP URL; tool names were not confirmed. Enable MCP on the GitLab instance; tools vary by deployment."
+  },
+  {
+    "id": "slack",
+    "name": "Slack",
+    "category": "communication",
+    "description": "Search conversations and send messages in Slack.",
+    "transport": "http",
+    "install": "https://mcp.slack.com/mcp",
+    "requiredFields": [
+      {
+        "key": "CLIENT_ID",
+        "label": "Slack app client ID",
+        "secret": false,
+        "helpUrl": "https://api.slack.com/apps"
+      },
+      {
+        "key": "CLIENT_SECRET",
+        "label": "Slack app client secret",
+        "secret": true,
+        "helpUrl": "https://api.slack.com/apps"
+      }
+    ],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://docs.slack.dev/ai/slack-mcp-server/",
+    "verified": true,
+    "verifiedHow": "Slack documents the endpoint and confidential OAuth; app registration and workspace approval can be required. Exact tool names not confirmed."
+  },
+  {
+    "id": "notion",
+    "name": "Notion",
+    "category": "productivity",
+    "description": "Search and edit Notion workspace content.",
+    "transport": "http",
+    "install": "https://mcp.notion.com/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/com.notion%2Fmcp/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms hosted endpoint; exact tool names not verified."
+  },
+  {
+    "id": "linear",
+    "name": "Linear",
+    "category": "productivity",
+    "description": "Manage issues, projects and team workflows.",
+    "transport": "http",
+    "install": "https://mcp.linear.app/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/app.linear%2Flinear/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms hosted endpoint; exact tool names not verified."
+  },
+  {
+    "id": "atlassian",
+    "name": "Atlassian Rovo (Jira and Confluence)",
+    "category": "productivity",
+    "description": "Work with Jira issues and Confluence content.",
+    "transport": "http",
+    "install": "https://mcp.atlassian.com/v2/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/com.atlassian%2Fatlassian-mcp-server/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms v2 streamable HTTP endpoint; exact tool names not verified."
+  },
+  {
+    "id": "google-drive",
+    "name": "Google Drive",
+    "category": "files",
+    "description": "Search, read and create Google Drive files.",
+    "transport": "http",
+    "install": "https://drivemcp.googleapis.com/mcp/v1",
+    "requiredFields": [
+      {
+        "key": "OAUTH_CLIENT_ID",
+        "label": "Google OAuth client ID",
+        "secret": false,
+        "helpUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers"
+      },
+      {
+        "key": "OAUTH_CLIENT_SECRET",
+        "label": "Google OAuth client secret",
+        "secret": true,
+        "helpUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers"
+      }
+    ],
+    "auth": "oauth",
+    "tools": [
+      "copy_file",
+      "create_file",
+      "download_file_content",
+      "get_file_metadata",
+      "get_file_permissions",
+      "list_recent_files",
+      "read_file_content",
+      "search_files"
+    ],
+    "sourceUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers",
+    "verified": true,
+    "verifiedHow": "Google setup guide lists endpoint, OAuth client credentials and tools; Google Cloud API enablement and developer-preview access may be required."
+  },
+  {
+    "id": "gmail",
+    "name": "Gmail",
+    "category": "communication",
+    "description": "Search mail, create drafts and manage labels.",
+    "transport": "http",
+    "install": "https://gmailmcp.googleapis.com/mcp/v1",
+    "requiredFields": [
+      {
+        "key": "OAUTH_CLIENT_ID",
+        "label": "Google OAuth client ID",
+        "secret": false,
+        "helpUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers"
+      },
+      {
+        "key": "OAUTH_CLIENT_SECRET",
+        "label": "Google OAuth client secret",
+        "secret": true,
+        "helpUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers"
+      }
+    ],
+    "auth": "oauth",
+    "tools": [
+      "create_draft",
+      "get_message",
+      "get_thread",
+      "label_message",
+      "label_thread",
+      "list_drafts",
+      "list_labels",
+      "search_threads",
+      "unlabel_message",
+      "unlabel_thread"
+    ],
+    "sourceUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers",
+    "verified": true,
+    "verifiedHow": "Google setup guide lists endpoint, OAuth client credentials and tools; Google Cloud API enablement and developer-preview access may be required."
+  },
+  {
+    "id": "google-calendar",
+    "name": "Google Calendar",
+    "category": "productivity",
+    "description": "Read calendars and manage events.",
+    "transport": "http",
+    "install": "https://calendarmcp.googleapis.com/mcp/v1",
+    "requiredFields": [
+      {
+        "key": "OAUTH_CLIENT_ID",
+        "label": "Google OAuth client ID",
+        "secret": false,
+        "helpUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers"
+      },
+      {
+        "key": "OAUTH_CLIENT_SECRET",
+        "label": "Google OAuth client secret",
+        "secret": true,
+        "helpUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers"
+      }
+    ],
+    "auth": "oauth",
+    "tools": [
+      "create_event",
+      "delete_event",
+      "get_event",
+      "list_calendars",
+      "list_events",
+      "respond_to_event",
+      "search_events",
+      "suggest_time",
+      "update_event"
+    ],
+    "sourceUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers",
+    "verified": true,
+    "verifiedHow": "Google setup guide lists endpoint, OAuth client credentials and tools; Google Cloud API enablement and developer-preview access may be required."
+  },
+  {
+    "id": "google-docs",
+    "name": "Google Docs",
+    "category": "productivity",
+    "description": "Read and update documents.",
+    "transport": "http",
+    "install": "https://docsmcp.googleapis.com/mcp/v1",
+    "requiredFields": [
+      {
+        "key": "OAUTH_CLIENT_ID",
+        "label": "Google OAuth client ID",
+        "secret": false,
+        "helpUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers"
+      },
+      {
+        "key": "OAUTH_CLIENT_SECRET",
+        "label": "Google OAuth client secret",
+        "secret": true,
+        "helpUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers"
+      }
+    ],
+    "auth": "oauth",
+    "tools": [
+      "read_doc",
+      "update_doc"
+    ],
+    "sourceUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers",
+    "verified": true,
+    "verifiedHow": "Google setup guide lists endpoint, OAuth client credentials and tools; Google Cloud API enablement and developer-preview access may be required."
+  },
+  {
+    "id": "google-sheets",
+    "name": "Google Sheets",
+    "category": "data",
+    "description": "Read and update spreadsheets.",
+    "transport": "http",
+    "install": "https://sheetsmcp.googleapis.com/mcp/v1",
+    "requiredFields": [
+      {
+        "key": "OAUTH_CLIENT_ID",
+        "label": "Google OAuth client ID",
+        "secret": false,
+        "helpUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers"
+      },
+      {
+        "key": "OAUTH_CLIENT_SECRET",
+        "label": "Google OAuth client secret",
+        "secret": true,
+        "helpUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers"
+      }
+    ],
+    "auth": "oauth",
+    "tools": [
+      "get_values",
+      "get_spreadsheet",
+      "update_spreadsheet",
+      "update_values",
+      "update_formulas",
+      "insert_dimension"
+    ],
+    "sourceUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers",
+    "verified": true,
+    "verifiedHow": "Google setup guide lists endpoint, OAuth client credentials and tools; Google Cloud API enablement and developer-preview access may be required."
+  },
+  {
+    "id": "postgres",
+    "name": "PostgreSQL",
+    "category": "data",
+    "description": "Query PostgreSQL with a read-only reference server.",
+    "transport": "stdio",
+    "install": "npx -y @modelcontextprotocol/server-postgres \"$POSTGRES_URL\"",
+    "requiredFields": [
+      {
+        "key": "POSTGRES_URL",
+        "label": "PostgreSQL connection URL",
+        "secret": true,
+        "helpUrl": "https://www.postgresql.org/docs/current/libpq-connect.html"
+      }
+    ],
+    "auth": "token",
+    "tools": [
+      "query"
+    ],
+    "sourceUrl": "https://github.com/modelcontextprotocol/servers/issues/4785",
+    "verified": true,
+    "verifiedHow": "MCP reference repository issue confirms npm package and deprecation; archived README documents query. Archived and unmaintained; use a read-only role. POSTGRES_URL is substituted into the positional URL argument."
+  },
+  {
+    "id": "sqlite",
+    "name": "SQLite",
+    "category": "data",
+    "description": "Inspect and query SQLite databases.",
+    "transport": "stdio",
+    "install": "npx -y mcp-sqlite-server",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "query",
+      "schema",
+      "table_info",
+      "explain",
+      "list_databases"
+    ],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.ofershap%2Fsqlite/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry lists npm package v1.0.1; linked project README lists tool names. Database paths are supplied to tools."
+  },
+  {
+    "id": "supabase",
+    "name": "Supabase",
+    "category": "data",
+    "description": "Manage Supabase projects and database workflows.",
+    "transport": "http",
+    "install": "https://mcp.supabase.com/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/com.supabase%2Fmcp/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms hosted endpoint; exact tool names not verified. Project scoping and read-only mode are available."
+  },
+  {
+    "id": "stripe",
+    "name": "Stripe",
+    "category": "finance",
+    "description": "Access Stripe payment and billing operations.",
+    "transport": "http",
+    "install": "https://mcp.stripe.com",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/com.stripe%2Fmcp/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms hosted endpoint; exact tool names not verified and can change."
+  },
+  {
+    "id": "sentry",
+    "name": "Sentry",
+    "category": "dev",
+    "description": "Investigate errors and production issues.",
+    "transport": "http",
+    "install": "https://mcp.sentry.dev/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.getsentry%2Fsentry-mcp/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms hosted endpoint; exact tool names not verified."
+  },
+  {
+    "id": "figma",
+    "name": "Figma",
+    "category": "design",
+    "description": "Retrieve design context for development.",
+    "transport": "http",
+    "install": "https://mcp.figma.com/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/com.figma.mcp%2Fmcp/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms hosted endpoint; exact tool names not verified."
+  },
+  {
+    "id": "brave-search",
+    "name": "Brave Search",
+    "category": "search",
+    "description": "Search the web, news, images and places.",
+    "transport": "stdio",
+    "install": "npx -y @brave/brave-search-mcp-server --transport stdio",
+    "requiredFields": [
+      {
+        "key": "BRAVE_API_KEY",
+        "label": "Brave Search API key",
+        "secret": true,
+        "helpUrl": "https://api.search.brave.com/app/keys"
+      }
+    ],
+    "auth": "token",
+    "tools": [
+      "brave_web_search",
+      "brave_news_search",
+      "brave_image_search",
+      "brave_video_search",
+      "brave_local_search",
+      "brave_llm_context"
+    ],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.brave%2Fbrave-search-mcp-server/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms package; Brave README documents stdio and tools. Listed tools are a subset."
+  },
+  {
+    "id": "exa",
+    "name": "Exa",
+    "category": "search",
+    "description": "Search the web and retrieve page content.",
+    "transport": "http",
+    "install": "https://mcp.exa.ai/mcp",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "web_search_exa",
+      "web_fetch_exa"
+    ],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/ai.exa%2Fexa/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms hosted endpoint; vendor README lists default tools and anonymous rate-limited access. Optional OAuth or API key increases limits."
+  },
+  {
+    "id": "fetch",
+    "name": "Fetch",
+    "category": "search",
+    "description": "Fetch web pages as model-friendly text.",
+    "transport": "stdio",
+    "install": "uvx mcp-server-fetch",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "fetch"
+    ],
+    "sourceUrl": "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
+    "verified": true,
+    "verifiedHow": "Endpoint or package documented by the linked vendor/reference source; tool names shown are documented examples, not an exhaustive inventory."
+  },
+  {
+    "id": "filesystem",
+    "name": "Filesystem",
+    "category": "files",
+    "description": "Read and modify files within allowed directories.",
+    "transport": "stdio",
+    "install": "npx -y @modelcontextprotocol/server-filesystem \"$ALLOWED_DIRECTORY\"",
+    "requiredFields": [
+      {
+        "key": "ALLOWED_DIRECTORY",
+        "label": "Allowed directory path",
+        "secret": false,
+        "helpUrl": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem"
+      }
+    ],
+    "auth": "none",
+    "tools": [
+      "read_file",
+      "read_text_file",
+      "write_file",
+      "list_directory",
+      "search_files"
+    ],
+    "sourceUrl": "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
+    "verified": true,
+    "verifiedHow": "Reference README documents package and tools. Substitute ALLOWED_DIRECTORY as a required positional path; restrict it to a safe directory. Listed tools are a subset."
+  },
+  {
+    "id": "memory",
+    "name": "Memory",
+    "category": "data",
+    "description": "Persist knowledge graphs across sessions.",
+    "transport": "stdio",
+    "install": "npx -y @modelcontextprotocol/server-memory",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "create_entities",
+      "create_relations",
+      "add_observations",
+      "search_nodes",
+      "open_nodes",
+      "read_graph"
+    ],
+    "sourceUrl": "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
+    "verified": true,
+    "verifiedHow": "Endpoint or package documented by the linked vendor/reference source; tool names shown are documented examples, not an exhaustive inventory."
+  },
+  {
+    "id": "playwright",
+    "name": "Playwright",
+    "category": "browser",
+    "description": "Automate and inspect browser interactions.",
+    "transport": "stdio",
+    "install": "npx -y @playwright/mcp@latest",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "browser_navigate",
+      "browser_click",
+      "browser_snapshot",
+      "browser_take_screenshot"
+    ],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.microsoft%2Fplaywright-mcp/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry lists the package; Microsoft README lists browser tools. Listed tools are a subset."
+  },
+  {
+    "id": "puppeteer",
+    "name": "Puppeteer",
+    "category": "browser",
+    "description": "Automate browser navigation and screenshots with Puppeteer.",
+    "transport": "stdio",
+    "install": "npx -y @modelcontextprotocol/server-puppeteer",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "puppeteer_navigate",
+      "puppeteer_screenshot",
+      "puppeteer_click",
+      "puppeteer_hover",
+      "puppeteer_fill",
+      "puppeteer_select",
+      "puppeteer_evaluate"
+    ],
+    "sourceUrl": "https://github.com/modelcontextprotocol/servers/issues/4785",
+    "verified": true,
+    "verifiedHow": "MCP reference repository issue confirms npm package and notes deprecation; archived reference README lists tools. Archived and unmaintained; prefer Playwright."
+  },
+  {
+    "id": "docker",
+    "name": "Docker",
+    "category": "dev",
+    "description": "Inspect and manage Docker containers and images.",
+    "transport": "stdio",
+    "install": "uvx docker-mcp-server",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "container_stop",
+      "container_restart",
+      "container_remove"
+    ],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.L337-org%2Fdocker-mcp-server/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry lists PyPI package v2.3.0; linked README lists tools. Uses existing Docker daemon access, which may be root-equivalent."
+  },
+  {
+    "id": "kubernetes",
+    "name": "Kubernetes",
+    "category": "cloud",
+    "description": "Inspect and manage Kubernetes and OpenShift resources.",
+    "transport": "stdio",
+    "install": "npx -y kubernetes-mcp-server@latest",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.containers%2Fkubernetes-mcp-server/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms npm stdio package. Existing kubeconfig and cluster permissions are required; exact tool names not verified."
+  },
+  {
+    "id": "cloudflare",
+    "name": "Cloudflare",
+    "category": "cloud",
+    "description": "Access Cloudflare services and API operations.",
+    "transport": "http",
+    "install": "https://mcp.cloudflare.com/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/",
+    "verified": true,
+    "verifiedHow": "Cloudflare documentation describes the hosted endpoint; exact tool names not verified."
+  },
+  {
+    "id": "vercel",
+    "name": "Vercel",
+    "category": "cloud",
+    "description": "Inspect deployments, projects and runtime logs.",
+    "transport": "http",
+    "install": "https://mcp.vercel.com",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://vercel.com/docs/mcp/vercel-mcp",
+    "verified": true,
+    "verifiedHow": "Vercel documentation describes hosted endpoint and OAuth; exact tool names not verified."
+  },
+  {
+    "id": "aws",
+    "name": "AWS MCP Server",
+    "category": "cloud",
+    "description": "Search AWS documentation and perform AWS API tasks.",
+    "transport": "http",
+    "install": "https://aws-mcp.us-east-1.api.aws/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [
+      "aws___search_documentation",
+      "aws___read_documentation",
+      "aws___run_script"
+    ],
+    "sourceUrl": "https://docs.aws.amazon.com/agent-toolkit/latest/userguide/what-is-agent-toolkit.html",
+    "verified": true,
+    "verifiedHow": "AWS documentation lists tool names, OAuth and managed service; AWS guide documents endpoint. IAM authorization is required for API actions."
+  },
+  {
+    "id": "airtable",
+    "name": "Airtable",
+    "category": "data",
+    "description": "Access and update Airtable records and bases.",
+    "transport": "http",
+    "install": "https://mcp.airtable.com/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://support.airtable.com/articles/9897799762-using-the-airtable-mcp-server",
+    "verified": true,
+    "verifiedHow": "Airtable documentation confirms hosted URL and OAuth; exact tool names not verified."
+  },
+  {
+    "id": "hubspot",
+    "name": "HubSpot",
+    "category": "productivity",
+    "description": "Read and update CRM records.",
+    "transport": "http",
+    "install": "https://mcp.hubspot.com",
+    "requiredFields": [
+      {
+        "key": "CLIENT_ID",
+        "label": "HubSpot MCP connector client ID",
+        "secret": false,
+        "helpUrl": "https://developers.hubspot.com/docs/apps/developer-platform/build-apps/integrate-with-the-remote-hubspot-mcp-server"
+      },
+      {
+        "key": "CLIENT_SECRET",
+        "label": "HubSpot MCP connector client secret",
+        "secret": true,
+        "helpUrl": "https://developers.hubspot.com/docs/apps/developer-platform/build-apps/integrate-with-the-remote-hubspot-mcp-server"
+      }
+    ],
+    "auth": "oauth",
+    "tools": [],
+    "sourceUrl": "https://developers.hubspot.com/docs/apps/developer-platform/build-apps/integrate-with-the-remote-hubspot-mcp-server",
+    "verified": true,
+    "verifiedHow": "HubSpot documents endpoint, PKCE OAuth, and connector client credentials; exact tool names not verified."
+  },
+  {
+    "id": "discord",
+    "name": "Discord",
+    "category": "communication",
+    "description": "Access Discord via a least-privilege bot.",
+    "transport": "stdio",
+    "install": "npx -y @j-256/discord-mcp serve --config \"$DISCORD_MCP_CONFIG\"",
+    "requiredFields": [
+      {
+        "key": "DISCORD_BOT_TOKEN",
+        "label": "Discord bot token",
+        "secret": true,
+        "helpUrl": "https://discord.com/developers/applications"
+      },
+      {
+        "key": "DISCORD_MCP_CONFIG",
+        "label": "Discord MCP config file path",
+        "secret": false,
+        "helpUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.j-256%2Fdiscord-mcp/versions/latest"
+      }
+    ],
+    "auth": "token",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.j-256%2Fdiscord-mcp/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry specifies npm package, serve --config and bot token. Config is a required positional substitution; tool names not independently verified."
+  },
+  {
+    "id": "obsidian",
+    "name": "Obsidian",
+    "category": "productivity",
+    "description": "Search and edit notes in an Obsidian vault.",
+    "transport": "stdio",
+    "install": "npx -y obsidian-mcp-server",
+    "requiredFields": [
+      {
+        "key": "OBSIDIAN_API_KEY",
+        "label": "Obsidian Local REST API key",
+        "secret": true,
+        "helpUrl": "https://github.com/cyanheads/obsidian-mcp-server"
+      }
+    ],
+    "auth": "token",
+    "tools": [
+      "obsidian_get_note",
+      "obsidian_list_notes",
+      "obsidian_search_notes",
+      "obsidian_write_note",
+      "obsidian_append_to_note"
+    ],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.cyanheads%2Fobsidian-mcp-server/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry lists npm package and required key; linked README lists tools. Obsidian Local REST API plugin must be running."
+  },
+  {
+    "id": "todoist",
+    "name": "Todoist",
+    "category": "productivity",
+    "description": "Work with tasks and projects.",
+    "transport": "http",
+    "install": "https://ai.todoist.net/mcp",
+    "requiredFields": [],
+    "auth": "oauth",
+    "tools": [
+      "search",
+      "fetch"
+    ],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/net.todoist%2Fmcp/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms endpoint; vendor README documents OAuth and search/fetch tools. List is not exhaustive."
+  },
+  {
+    "id": "youtube-transcripts",
+    "name": "YouTube Transcripts",
+    "category": "search",
+    "description": "Retrieve transcripts from YouTube videos and channels.",
+    "transport": "stdio",
+    "install": "npx -y fetchworks-mcp",
+    "requiredFields": [
+      {
+        "key": "APIFY_TOKEN",
+        "label": "Apify API token",
+        "secret": true,
+        "helpUrl": "https://console.apify.com/account/integrations"
+      }
+    ],
+    "auth": "token",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.fetchworks-dev%2Fyoutube-transcripts/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry lists npm package v0.1.1, transcript capabilities and required token; exact tool names not verified. Apify usage is billed."
+  },
+  {
+    "id": "arxiv",
+    "name": "arXiv",
+    "category": "search",
+    "description": "Search research papers and download readable content.",
+    "transport": "stdio",
+    "install": "uvx arxiv-mcp-server",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "search_papers",
+      "get_abstract",
+      "download_paper",
+      "list_papers",
+      "read_paper"
+    ],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.blazickjp%2Farxiv-mcp-server/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry lists PyPI package; linked project README documents uvx and tool names. Listed tools are a subset."
+  },
+  {
+    "id": "git",
+    "name": "Git",
+    "category": "dev",
+    "description": "Inspect and manipulate local Git repositories.",
+    "transport": "stdio",
+    "install": "uvx mcp-server-git",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "git_status",
+      "git_diff_unstaged",
+      "git_diff_staged",
+      "git_log",
+      "git_show"
+    ],
+    "sourceUrl": "https://github.com/modelcontextprotocol/servers/tree/main/src/git",
+    "verified": true,
+    "verifiedHow": "Endpoint or package documented by the linked vendor/reference source; tool names shown are documented examples, not an exhaustive inventory."
+  },
+  {
+    "id": "time",
+    "name": "Time",
+    "category": "productivity",
+    "description": "Get the current time and convert time zones.",
+    "transport": "stdio",
+    "install": "uvx mcp-server-time",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "get_current_time",
+      "convert_time"
+    ],
+    "sourceUrl": "https://github.com/modelcontextprotocol/servers/tree/main/src/time",
+    "verified": true,
+    "verifiedHow": "Endpoint or package documented by the linked vendor/reference source; tool names shown are documented examples, not an exhaustive inventory."
+  },
+  {
+    "id": "sequential-thinking",
+    "name": "Sequential Thinking",
+    "category": "productivity",
+    "description": "Structure multistep reasoning.",
+    "transport": "stdio",
+    "install": "npx -y @modelcontextprotocol/server-sequential-thinking",
+    "requiredFields": [],
+    "auth": "none",
+    "tools": [
+      "sequentialthinking"
+    ],
+    "sourceUrl": "https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking",
+    "verified": true,
+    "verifiedHow": "Endpoint or package documented by the linked vendor/reference source; tool names shown are documented examples, not an exhaustive inventory."
+  },
+  {
+    "id": "mongodb",
+    "name": "MongoDB",
+    "category": "data",
+    "description": "Query and inspect MongoDB collections.",
+    "transport": "stdio",
+    "install": "npx -y mongodb-mcp-server",
+    "requiredFields": [
+      {
+        "key": "MDB_MCP_CONNECTION_STRING",
+        "label": "MongoDB connection string",
+        "secret": true,
+        "helpUrl": "https://www.mongodb.com/docs/manual/reference/connection-string/"
+      }
+    ],
+    "auth": "token",
+    "tools": [],
+    "sourceUrl": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.mongodb-js%2Fmongodb-mcp-server/versions/latest",
+    "verified": true,
+    "verifiedHow": "Official registry confirms npm stdio package; vendor README documents connection string environment variable. Tool names not verified. A connect tool or Atlas credentials are alternatives."
+  }
+]

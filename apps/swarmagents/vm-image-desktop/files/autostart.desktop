@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Swarm Desktop Autostart
+Comment=Open a Chromium window on the desktop
+Exec=/usr/local/bin/swarm-chromium-launch.sh about:blank
+X-XFCE-Autostart-Phase=2
+Hidden=false
+NoDisplay=true

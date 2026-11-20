@@ -1,0 +1,14 @@
+dist
+coverage
+node_modules
+package-lock.json
+docs/PLAN.md
+test/fixtures
+.changeset/*.md
+test/.build
+.claude/
+vscode/out
+vscode/preview
+bench/suites/*/*/solution/
+bench/suites/*/*/repo/
+bench/suites/*/*/hidden/

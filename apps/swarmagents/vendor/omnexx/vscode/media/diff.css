@@ -1,0 +1,149 @@
+/*
+ * Split-diff viewer styles (Phase 9, roadmap 9.3). tokens.css loads first,
+ * so every spacing, radius and surface value resolves through --space-* and
+ * the --omnexx-* surface tokens. Changed-line tints are the exact
+ * green/red hex-with-alpha values from the brief.
+ */
+body {
+  margin: 0;
+  background: var(--omnexx-bg-primary);
+  color: var(--fg);
+  font-family: var(--vscode-font-family);
+  font-size: var(--fs-md);
+}
+
+.diff-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: var(--border);
+  background: var(--omnexx-bg-primary);
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+}
+
+.diff-file {
+  font-family: var(--mono);
+  font-size: var(--fs-md);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-toggle {
+  display: flex;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+.diff-toggle button,
+.diff-actions button {
+  font-family: var(--vscode-font-family);
+  font-size: var(--fs-sm);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  border: var(--border);
+  background: var(--omnexx-bg-card);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.diff-toggle button:hover,
+.diff-actions button:hover {
+  background: var(--card);
+}
+
+.diff-toggle button[aria-pressed='true'] {
+  background: var(--omnexx-accent);
+  border-color: transparent;
+  color: var(--vscode-button-foreground, #fff);
+}
+
+.diff-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.diff-accept {
+  background: var(--ok);
+  border-color: transparent;
+  color: var(--vscode-button-foreground, #fff);
+}
+
+.diff-reject {
+  background: var(--bad);
+  border-color: transparent;
+  color: var(--vscode-button-foreground, #fff);
+}
+
+.diff-body {
+  padding: var(--space-4) var(--space-5);
+  overflow: auto;
+}
+
+.diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+
+.diff-gutter {
+  width: 1%;
+  min-width: var(--space-8);
+  text-align: right;
+  padding: var(--space-1) var(--space-3);
+  color: var(--muted);
+  user-select: none;
+  vertical-align: top;
+}
+
+.diff-marker {
+  width: 1%;
+  text-align: center;
+  padding: var(--space-1) var(--space-2);
+  color: var(--muted);
+  user-select: none;
+  vertical-align: top;
+}
+
+.diff-code {
+  padding: var(--space-1) var(--space-3);
+  white-space: pre;
+  vertical-align: top;
+}
+
+/* Changed-line gutter tints: exact brief values, on gutter and code cells. */
+.diff-line.diff-added .diff-gutter,
+.diff-line.diff-added .diff-code,
+.diff-line.diff-added .diff-marker {
+  background: #22c55e20;
+}
+
+.diff-line.diff-removed .diff-gutter,
+.diff-line.diff-removed .diff-code,
+.diff-line.diff-removed .diff-marker {
+  background: #ef444420;
+}
+
+.diff-fold-banner {
+  display: block;
+  width: 100%;
+  text-align: center;
+  padding: var(--space-2);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+}
+
+.diff-fold-banner:hover {
+  color: var(--fg);
+  background: var(--card);
+}

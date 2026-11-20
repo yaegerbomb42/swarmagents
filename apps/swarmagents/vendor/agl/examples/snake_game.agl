@@ -1,0 +1,70 @@
+(lvl:0:block
+  ;; =========================================================================
+  ;; 🐍 FULL SNAKE GAME STATE MACHINE & GENERATIVE UI ENGINE IN AGL
+  ;; =========================================================================
+
+  ;; 1. Initialize Grid Constants & Initial Snake State
+  (lvl:0:set "grid_size" 20)
+  (lvl:0:set "initial_snake" 
+    (lvl:0:list 
+      (lvl:0:dict "x" 10 "y" 10)
+      (lvl:0:dict "x" 9 "y" 10)
+      (lvl:0:dict "x" 8 "y" 10)
+    )
+  )
+  (lvl:0:set "initial_food" (lvl:0:dict "x" 15 "y" 10))
+  (lvl:0:set "initial_direction" "RIGHT")
+
+  ;; 2. Define Pure Vector Step Calculator: (dir, head) -> new_head
+  (lvl:0:def "compute_next_head" (dir head)
+    (lvl:0:if (lvl:0:eq dir "RIGHT")
+      (lvl:0:dict "x" (lvl:0:mod (lvl:0:add (lvl:0:at head "x") 1) 20) "y" (lvl:0:at head "y"))
+      (lvl:0:if (lvl:0:eq dir "LEFT")
+        (lvl:0:dict "x" (lvl:0:mod (lvl:0:add (lvl:0:at head "x") 19) 20) "y" (lvl:0:at head "y"))
+        (lvl:0:if (lvl:0:eq dir "DOWN")
+          (lvl:0:dict "x" (lvl:0:at head "x") "y" (lvl:0:mod (lvl:0:add (lvl:0:at head "y") 1) 20))
+          (lvl:0:dict "x" (lvl:0:at head "x") "y" (lvl:0:mod (lvl:0:add (lvl:0:at head "y") 19) 20))
+        )
+      )
+    )
+  )
+
+  ;; 3. Define Collision Detector: check if head matches food
+  (lvl:0:def "check_food_collision" (head food)
+    (lvl:0:if (lvl:0:eq (lvl:0:at head "x") (lvl:0:at food "x"))
+      (lvl:0:eq (lvl:0:at head "y") (lvl:0:at food "y"))
+      false
+    )
+  )
+
+  ;; 4. Simulate Next Tick in Pure AGL
+  (lvl:0:set "current_head" (lvl:0:at (lvl:0:get "initial_snake") 0))
+  (lvl:0:set "next_head" (lvl:0:call "compute_next_head" (lvl:0:get "initial_direction") (lvl:0:get "current_head")))
+  (lvl:0:set "food_eaten" (lvl:0:call "check_food_collision" (lvl:0:get "next_head") (lvl:0:get "initial_food")))
+
+  ;; 5. Level 3 Actuation: Render Interactive Generative Canvas UI for the Snake Game
+  (lvl:0:set "game_ui"
+    (lvl:3:render_ui "snake_game_canvas"
+      (lvl:0:dict
+        "grid" 20
+        "snake" (lvl:0:get "initial_snake")
+        "next_head" (lvl:0:get "next_head")
+        "food" (lvl:0:get "initial_food")
+        "direction" (lvl:0:get "initial_direction")
+        "score" 0
+      )
+    )
+  )
+
+  ;; 6. Return Verified Telemetry & Game State
+  (lvl:0:dict
+    "status" "SNAKE_ENGINE_INITIALIZED"
+    "grid_dimensions" "20x20"
+    "initial_length" (lvl:0:len (lvl:0:get "initial_snake"))
+    "current_head" (lvl:0:get "current_head")
+    "next_tick_head" (lvl:0:get "next_head")
+    "food_coord" (lvl:0:get "initial_food")
+    "food_eaten_on_tick" (lvl:0:get "food_eaten")
+    "ui_widget" (lvl:0:at (lvl:0:get "game_ui") "ui_type")
+  )
+)

@@ -1,0 +1,603 @@
+import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { writeJsonAtomic } from '../../../src/core/atomic.js';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { readEvents } from '../../../src/core/events.js';
+import {
+  bashTool,
+  DEFAULT_BASH_TIMEOUT_MS,
+  readLogTool,
+  trimOutput,
+  splitHeredoc,
+} from '../../../src/tools/bash.js';
+import { multiEditTool, strReplaceTool, writeFileTool } from '../../../src/tools/edit.js';
+import { extractSymbols, MAX_DIR_FILES, outlineTool } from '../../../src/tools/outline.js';
+import { readTool } from '../../../src/tools/read.js';
+import { replaceLinesTool } from '../../../src/tools/replace-lines.js';
+import { READ_ONLY_TOOLS, sortKeys, toolSpec, WORKER_TOOLS } from '../../../src/tools/registry.js';
+import { rememberTool } from '../../../src/tools/remember.js';
+import { _internal, searchTool } from '../../../src/tools/search.js';
+import { secretCorpus } from '../../support/secrets.js';
+import { tempDir } from '../../support/tmp.js';
+import { toolContext } from '../../support/tool-context.js';
+
+async function repo(): Promise<string> {
+  const root = await tempDir();
+  await mkdir(join(root, 'src'));
+  await writeFile(
+    join(root, 'src/a.ts'),
+    'export function add(a: number, b: number) {\n  return a + b;\n}\nexport const PI = 3;\n',
+  );
+  await writeFile(
+    join(root, 'src/big.ts'),
+    Array.from({ length: 500 }, (_, i) => `export const v${i} = ${i};`).join('\n'),
+  );
+  await writeFile(join(root, '.env'), `KEY=${secretCorpus().anthropic}\n`);
+  return root;
+}
+
+describe('read / outline', () => {
+  it('reads with line numbers and ranges; large files need a range', async () => {
+    const root = await repo();
+    const ctx = await toolContext(root);
+    expect((await readTool.run({ path: 'src/a.ts' }, ctx)).content).toContain(
+      '    2    return a + b;',
+    );
+    const big = await readTool.run({ path: 'src/big.ts' }, ctx);
+    expect(big.content).toMatch(/has 500 lines; read it by range/);
+    const range = await readTool.run({ path: 'src/big.ts', start: 10, end: 2000 }, ctx);
+    expect(range.content.split('\n')[0]).toContain('v9');
+    expect(range.content).toContain('(lines 410-500 not shown)');
+    expect((await readTool.run({ path: 'src/a.ts', start: 99 }, ctx)).isError).toBe(true);
+    const inverted = await readTool.run({ path: 'src/a.ts', start: 5, end: 2 }, ctx);
+    expect(inverted.isError).toBe(true);
+    expect(inverted.content).toContain('start line (5) cannot be greater than end line (2)');
+    expect((await readTool.run({ path: '.env' }, ctx)).content).toMatch(/denied/);
+    expect((await readTool.run({ path: 'nope.ts' }, ctx)).content).toMatch(/ENOENT/);
+    await writeFile(join(root, 'bin.dat'), 'a\0b');
+    expect((await readTool.run({ path: 'bin.dat' }, ctx)).content).toMatch(/binary/);
+  });
+
+  it('reads several files and ranges in one call, reporting a bad one in its own section', async () => {
+    const root = await repo();
+    const ctx = await toolContext(root);
+    const out = await readTool.run(
+      {
+        files: [
+          { path: 'src/a.ts' },
+          { path: 'src/big.ts', start: 3, end: 4 },
+          { path: 'nope.ts' },
+        ],
+      },
+      ctx,
+    );
+    expect(out.isError).toBeUndefined();
+    const sections = out.content.split('\n\n');
+    expect(sections[0]).toMatch(/^== src\/a\.ts ==\n {4}1 {2}export function add/);
+    expect(sections[1]).toMatch(/^== src\/big\.ts \(lines 3-4\) ==\n {4}3 {2}export const v2 = 2;/);
+    expect(sections[1]).not.toContain('v4 =');
+    expect(sections[2]).toMatch(/^== nope\.ts ==\n.*ENOENT/s);
+    const allBad = await readTool.run({ files: [{ path: 'nope.ts' }, { path: '.env' }] }, ctx);
+    expect(allBad.isError).toBe(true);
+  });
+
+  it('shares one size limit across the files of a call', async () => {
+    const root = await repo();
+    const row = 'x'.repeat(390);
+    for (const f of ['w1', 'w2', 'w3'])
+      await writeFile(join(root, `${f}.txt`), Array.from({ length: 100 }, () => row).join('\n'));
+    const out = await readTool.run(
+      { files: ['w1', 'w2', 'w3'].map((f) => ({ path: `${f}.txt` })) },
+      await toolContext(root),
+    );
+    expect(out.content.length).toBeLessThan(62_000);
+    expect(out.content).toMatch(/== w2\.txt ==\n[\s\S]*not shown/);
+    expect(out.content).toContain('== w3.txt ==\n(not read: this call reached its size limit');
+  });
+
+  it('read and outline take a single target or a list, not both or neither', async () => {
+    const ctx = await toolContext(await repo());
+    const both = await readTool.run({ path: 'src/a.ts', files: [{ path: 'src/a.ts' }] }, ctx);
+    expect(both.content).toMatch(/not both/);
+    expect((await readTool.run({}, ctx)).content).toMatch(/needs path/);
+    expect((await outlineTool.run({}, ctx)).isError).toBe(true);
+    const many = await outlineTool.run({ paths: ['src/a.ts', 'nope.ts'] }, ctx);
+    expect(many.isError).toBeUndefined();
+    expect(many.content).toMatch(/^== src\/a\.ts ==\n\d+ lines[\s\S]*function add/);
+    expect(many.content).toMatch(/== nope\.ts ==\n.*ENOENT/);
+  });
+
+  it('extracts symbols across languages', () => {
+    const syms = extractSymbols(
+      [
+        'export async function go() {}',
+        'class Foo {',
+        '  bar(x: number): void {',
+        '  if (x) {',
+        'export interface I {}',
+        'export type T = 1;',
+        'def py_fn(x):',
+        'func (s *S) GoFn() {',
+        'pub fn rusty() {}',
+        'export enum E {}',
+      ].join('\n'),
+    );
+    expect(syms.map((s) => `${s.kind}:${s.name}`)).toEqual([
+      'function:go',
+      'class:Foo',
+      'method:bar',
+      'interface:I',
+      'type:T',
+      'def:py_fn',
+      'func:GoFn',
+      'item:rusty',
+      'enum:E',
+    ]);
+  });
+
+  it('outline tool', async () => {
+    const ctx = await toolContext(await repo());
+    expect((await outlineTool.run({ path: 'src/a.ts' }, ctx)).content).toContain('function add');
+    expect((await outlineTool.run({ path: '../x' }, ctx)).isError).toBe(true);
+  });
+
+  it('outlines a directory as a codebase-map slice and leaves file outlines unchanged', async () => {
+    const root = await repo();
+    const ctx = await toolContext(root);
+    const fromDisk = await outlineTool.run({ path: 'src' }, ctx);
+    expect(fromDisk.isError).toBeUndefined();
+    expect(fromDisk.content).toContain('src/a.ts');
+    expect(fromDisk.content).toContain('function add');
+
+    await writeJsonAtomic(ctx.store.file('codemap.json'), {
+      version: 1,
+      entries: [
+        { path: 'src/a.ts', kind: 'source', lines: 4, symbols: ['function onlyInMap'] },
+        { path: 'src/big.ts', kind: 'source', lines: 500, symbols: ['const v0'] },
+        { path: 'other.ts', kind: 'source', lines: 1, symbols: ['function outside'] },
+        ...Array.from({ length: MAX_DIR_FILES + 5 }, (_, i) => ({
+          path: `src/extra/f${String(i).padStart(3, '0')}.ts`,
+          kind: 'source' as const,
+          lines: 1,
+          symbols: ['function f'],
+        })),
+      ],
+    });
+    const dir = await outlineTool.run({ path: 'src' }, ctx);
+    expect(dir.isError).toBeUndefined();
+    expect(dir.content).toContain('src/a.ts');
+    expect(dir.content).toContain('function onlyInMap');
+    expect(dir.content).not.toContain('function outside');
+    expect(dir.content).not.toContain('const PI');
+    expect(dir.content).toContain('outline a subdirectory');
+    expect(dir.content).not.toContain(`f${String(MAX_DIR_FILES + 4).padStart(3, '0')}.ts`);
+
+    const file = await outlineTool.run({ path: 'src/a.ts' }, ctx);
+    expect(file.isError).toBeUndefined();
+    expect(file.content).toMatch(/^\d+ lines\n\s+1 {2}function add/);
+    expect(file.content).toContain('const PI');
+
+    const missing = await outlineTool.run({ path: 'missing-dir' }, ctx);
+    expect(missing.isError).toBe(true);
+    expect(missing.content).toMatch(/ENOENT/);
+    expect(missing.content).not.toBe('(no files under missing-dir)');
+  });
+});
+
+describe('search', () => {
+  it('finds matches with context, never in secret files; JS fallback agrees', async () => {
+    const root = await repo();
+    const ctx = await toolContext(root);
+    const r = await searchTool.run({ pattern: 'return a' }, ctx);
+    expect(r.content).toMatch(/^src\/a\.ts\n(.*\n)*\s+2:\s+return a/m);
+    expect((await searchTool.run({ pattern: 'sk-ant' }, ctx)).content).toBe('no matches');
+    expect((await searchTool.run({ pattern: 'v\\d\\d', glob: 'src/*.ts' }, ctx)).content).toMatch(
+      /src\/big\.ts has more than 20 matches/,
+    );
+    const literal = await searchTool.run({ pattern: 'return a + (' }, ctx);
+    expect(literal.content).toMatch(/not a valid regex, so searched for the literal text/);
+    expect((await searchTool.run({ pattern: 'x', path: '..' }, ctx)).isError).toBe(true);
+    const js = await _internal.viaJs('return a', root, undefined);
+    expect(js).toEqual(['src/a.ts\u00002:  return a + b;']);
+    expect(await _internal.viaJs('KEY', root, '**/*.ts')).toEqual([]);
+  });
+
+  it('accepts a file as path and searches just that file', async () => {
+    const root = await repo();
+    const ctx = await toolContext(root);
+    const r = await searchTool.run({ pattern: 'return a', path: 'src/a.ts' }, ctx);
+    expect(r.isError).toBeUndefined();
+    expect(r.content).toMatch(/^a\.ts\n(.*\n)*\s+2:\s+return a/m);
+    expect(await _internal.viaJs('return a', join(root, 'src'), undefined, 'a.ts')).toEqual([
+      'a.ts\u00002:  return a + b;',
+    ]);
+  });
+});
+
+describe('edit tools', () => {
+  it('str_replace requires a unique match and writes nothing otherwise', async () => {
+    const root = await repo();
+    const ctx = await toolContext(root);
+    expect(
+      (await strReplaceTool.run({ path: 'src/a.ts', old_str: 'a + b', new_str: 'a - b' }, ctx))
+        .isError,
+    ).toBeUndefined();
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toContain('a - b');
+    expect([...ctx.edited]).toEqual(['src/a.ts']);
+    expect(
+      (await strReplaceTool.run({ path: 'src/a.ts', old_str: 'a', new_str: 'z' }, ctx)).content,
+    ).toMatch(/found \d+ times/);
+    expect(
+      (await strReplaceTool.run({ path: 'src/none.ts', old_str: 'a', new_str: 'z' }, ctx)).content,
+    ).toMatch(/write_file/);
+    expect(
+      (await strReplaceTool.run({ path: '../a.ts', old_str: 'a', new_str: 'z' }, ctx)).content,
+    ).toMatch(/outside/);
+  });
+
+  it('multi_edit is all-or-nothing; $ patterns in new_str are literal', async () => {
+    const root = await repo();
+    const ctx = await toolContext(root);
+    const before = await readFile(join(root, 'src/a.ts'), 'utf8');
+    const bad = await multiEditTool.run(
+      {
+        path: 'src/a.ts',
+        edits: [
+          { old_str: 'PI = 3', new_str: 'PI = 4' },
+          { old_str: 'missing', new_str: 'x' },
+        ],
+      },
+      ctx,
+    );
+    expect(bad.content).toMatch(/edit 2/);
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toBe(before);
+    await multiEditTool.run(
+      { path: 'src/a.ts', edits: [{ old_str: 'PI = 3', new_str: "PI = '$&$1'" }] },
+      ctx,
+    );
+    expect(await readFile(join(root, 'src/a.ts'), 'utf8')).toContain("PI = '$&$1'");
+  });
+
+  it('write_file creates files and directories, refuses to overwrite big files', async () => {
+    const root = await repo();
+    const ctx = await toolContext(root);
+    expect(
+      (await writeFileTool.run({ path: 'new/dir/x.ts', content: 'x\n' }, ctx)).content,
+    ).toMatch(/wrote/);
+    expect((await writeFileTool.run({ path: 'src/big.ts', content: '' }, ctx)).content).toMatch(
+      /more than \d+ lines/,
+    );
+    expect((await writeFileTool.run({ path: '.env.local', content: '' }, ctx)).isError).toBe(true);
+  });
+});
+
+describe('bash + read_log', () => {
+  it('runs allowed commands in the root with a scrubbed env and redacted, trimmed output', async () => {
+    const root = await repo();
+    const secret = secretCorpus().github;
+    const ctx = await toolContext(root);
+    const r = await bashTool.run({ command: `echo hi; echo ${secret}; ls src` }, ctx);
+    expect(r.isError).toBeUndefined();
+    expect(r.content).toMatch(/^\[exit 0, \d+ms, log cmd-1-1\]/);
+    expect(r.content).toContain('a.ts');
+    expect(r.content).not.toContain(secret);
+    expect(await readFile(join(ctx.store.logsDir, 'cmd-1-1.log'), 'utf8')).not.toContain(secret);
+    expect((await bashTool.run({ command: 'exit 2' }, ctx)).isError).toBe(true);
+    expect((await bashTool.run({ command: 'sleep 5', timeout: '200ms' }, ctx)).content).toMatch(
+      /timed out/,
+    );
+    expect((await bashTool.run({ command: 'true', timeout: 'soon' }, ctx)).content).toMatch(
+      /invalid timeout/,
+    );
+    // Models often send milliseconds as a bare number (or a numeric string).
+    expect((await bashTool.run({ command: 'sleep 5', timeout: '200' }, ctx)).content).toMatch(
+      /timed out/,
+    );
+    const parsed = bashTool.schema.parse(
+      bashTool.normalize?.({ command: 'true', timeout: 120000 }),
+    );
+    expect(parsed.timeout).toBe('120000');
+  });
+
+  it('caps a command without a timeout at the default, not the whole run budget', async () => {
+    // Bench task-10: `find /` and `grep -r /private/var/folders` each held a cycle for 5-7 min.
+    const root = await repo();
+    const seen: number[] = [];
+    const base = await toolContext(root);
+    const ctx = {
+      ...base,
+      maxCmdTimeoutMs: 30 * 60_000,
+      exec: (_c: string, o: { timeoutMs: number }) => {
+        seen.push(o.timeoutMs);
+        return Promise.resolve({
+          exitCode: 0,
+          timedOut: true,
+          aborted: false,
+          output: '',
+          durationMs: 1,
+        });
+      },
+    } as typeof base;
+    const r = await bashTool.run({ command: 'find / -name x' }, ctx);
+    expect(seen[0]).toBe(DEFAULT_BASH_TIMEOUT_MS);
+    expect(r.content).toMatch(/timed out after 120s.*timeout/s);
+    await bashTool.run({ command: 'npm test', timeout: '10m' }, ctx);
+    expect(seen[1]).toBe(10 * 60_000);
+    // Bench hard10 task-04: a script given "30m" hung for 26 minutes. Ten minutes is the most.
+    await bashTool.run({ command: 'python3 verify.py', timeout: '30m' }, ctx);
+    expect(seen[2]).toBe(10 * 60_000);
+  });
+
+  it('refuses policy violations, logs tool.denied, and calls the safety hook only for allowed commands', async () => {
+    const root = await repo();
+    const seen: string[] = [];
+    const ctx = await toolContext(root, { onBash: (c) => seen.push(c) });
+    for (const cmd of [
+      'cat ~/.ssh/id_ed25519',
+      'rm -rf ../',
+      'git push --force',
+      'echo $ANTHROPIC_API_KEY',
+      'echo x > /tmp/elsewhere.txt',
+    ]) {
+      const r = await bashTool.run({ command: cmd }, ctx);
+      expect(r.isError, cmd).toBe(true);
+      expect(r.content).toMatch(/refused by policy/);
+    }
+    await bashTool.run({ command: 'true' }, ctx);
+    expect(seen).toEqual(['true']);
+    const events = await readEvents(ctx.store.eventsPath);
+    expect(events.filter((e) => e.type === 'tool.denied')).toHaveLength(5);
+  });
+
+  it('trims long output and read_log pages through the full log', async () => {
+    const root = await repo();
+    const ctx = await toolContext(root);
+    const r = await bashTool.run(
+      { command: 'for i in $(seq 1 1000); do echo line$i; done; echo "Error: boom"' },
+      ctx,
+    );
+    expect(r.content).toBe(r.content);
+    const sub = await bashTool.run({ command: 'seq 1 1000' }, ctx);
+    expect(sub.content).toMatch(/lines omitted \(read_log id="cmd-1-\d"/);
+    const id = /log (cmd-1-\d)/.exec(sub.content)?.[1] ?? '';
+    const page = await readLogTool.run({ id, start: 500, end: 501 }, ctx);
+    expect(page.content).toContain('   500  500');
+    expect((await readLogTool.run({ id: 'cmd-9-9' }, ctx)).isError).toBe(true);
+    // A reversed or past-the-end page is an error, not a silently empty log.
+    const backwards = await readLogTool.run({ id, start: 500, end: 499 }, ctx);
+    expect(backwards.isError).toBe(true);
+    expect(backwards.content).toMatch(/cannot be greater than end/);
+    const pastEnd = await readLogTool.run({ id, start: 99_999 }, ctx);
+    expect(pastEnd.isError).toBe(true);
+    expect(pastEnd.content).toMatch(/has only \d+ lines/);
+    expect(trimOutput('a\nb', 'x')).toBe('a\nb');
+    const t = trimOutput(
+      [
+        ...Array.from({ length: 200 }, (_, i) => `l${i}`),
+        'Error: mid',
+        ...Array.from({ length: 200 }, (_, i) => `m${i}`),
+      ].join('\n'),
+      'cmd-x',
+    );
+    expect(t).toContain('Error: mid');
+    expect(t.split('\n').length).toBeLessThan(160);
+    const long = trimOutput(`ok\n${'z'.repeat(5_000)}`, 'cmd-y');
+    expect(long.length).toBeLessThan(600);
+    expect(long).toContain('[5000 chars]');
+  });
+});
+
+describe('remember', () => {
+  it('writes notes for the next cycle and logs the update', async () => {
+    const ctx = await toolContext(await repo());
+    expect(
+      (await rememberTool.run({ action: 'add', type: 'command', text: 'use pnpm' }, ctx)).content,
+    ).toMatch(/next cycle/);
+    expect((await ctx.store.readNotes())[0]).toMatchObject({
+      id: 'N1',
+      text: 'use pnpm',
+      date: '2026-10-03',
+    });
+    expect((await rememberTool.run({ action: 'remove', id: 'N7' }, ctx)).isError).toBe(true);
+  });
+});
+
+describe('registry', () => {
+  it('specs are deterministic with sorted keys; read-only subset excludes writers', () => {
+    const a = JSON.stringify(WORKER_TOOLS.map(toolSpec));
+    const b = JSON.stringify(WORKER_TOOLS.map(toolSpec));
+    expect(a).toBe(b);
+    expect(a).not.toContain('$schema');
+    expect(READ_ONLY_TOOLS.map((t) => t.name).sort()).toEqual([
+      'context',
+      'outline',
+      'query_artifact',
+      'read',
+      'read_log',
+      'read_symbol',
+      'recall',
+      'remember',
+      'repl_projection',
+      'running_context',
+      'search',
+      'task',
+      'todo',
+    ]);
+    expect(JSON.stringify(sortKeys({ b: 1, a: [{ d: 1, c: 2 }] }))).toBe(
+      '{"a":[{"c":2,"d":1}],"b":1}',
+    );
+  });
+});
+
+describe('tool schemas the API accepts', () => {
+  it('every tool spec is a plain object schema at the top level (no top-level union)', () => {
+    for (const spec of WORKER_TOOLS.map(toolSpec)) {
+      expect(spec.inputSchema.type, spec.name).toBe('object');
+      for (const k of ['oneOf', 'anyOf', 'allOf'])
+        expect(spec.inputSchema, `${spec.name}.${k}`).not.toHaveProperty(k);
+    }
+  });
+
+  it('remember enforces per-action fields and normalizes defaults', async () => {
+    const ctx = await toolContext(await repo());
+    expect((await rememberTool.run({ action: 'add', text: '' }, ctx)).content).toMatch(
+      /add needs type and text/,
+    );
+    expect((await rememberTool.run({ action: 'remove' }, ctx)).isError).toBe(true);
+    // When text is provided without explicit type or action, defaults to add + inferred type
+    expect((await rememberTool.run({ text: 'use pnpm' }, ctx)).content).toMatch(/next cycle/);
+  });
+});
+
+describe('read size caps', () => {
+  it('clips huge lines and stops a range at the char budget', async () => {
+    const root = await repo();
+    await writeFile(join(root, 'src/min.js'), `${'a'.repeat(10_000)}\n${'b;'.repeat(1_000)}\n`);
+    await writeFile(
+      join(root, 'src/wide.js'),
+      Array.from({ length: 300 }, () => 'c'.repeat(1_500)).join('\n'),
+    );
+    const ctx = await toolContext(root);
+    const min = await readTool.run({ path: 'src/min.js' }, ctx);
+    expect(min.content).toContain('[line is 10000 chars');
+    expect(min.content.length).toBeLessThan(5_000);
+    const wide = await readTool.run({ path: 'src/wide.js' }, ctx);
+    expect(wide.content.length).toBeLessThan(62_000);
+    expect(wide.content).toMatch(/\(lines \d+-300 not shown\)/);
+  });
+});
+
+describe('search scoping', () => {
+  it('skips unreadable files and dependency folders, and gives an overview of a broad search', async () => {
+    const root = await repo();
+    const ctx = await toolContext(root);
+    await writeFile(join(root, 'src/locked.ts'), 'export const turbotoolbox = 1;\n');
+    await chmod(join(root, 'src/locked.ts'), 0o000);
+    await writeFile(join(root, 'src/open.ts'), 'export const turbotoolbox = 2;\n');
+    await mkdir(join(root, 'node_modules/pkg'), { recursive: true });
+    await writeFile(join(root, 'node_modules/pkg/i.js'), 'turbotoolbox\n');
+    const r = await searchTool.run({ pattern: 'turbotoolbox' }, ctx);
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toMatch(/^src\/open\.ts\n\s+1:/m);
+    expect(r.content).not.toContain('node_modules');
+    await chmod(join(root, 'src/locked.ts'), 0o644);
+
+    for (let d = 0; d < 8; d++) {
+      await mkdir(join(root, `apps/a${String(d)}`), { recursive: true });
+      for (let f = 0; f < 3; f++)
+        await writeFile(
+          join(root, `apps/a${String(d)}/f${String(f)}.ts`),
+          Array.from({ length: 10 }, (_, i) => `const hit${String(i)} = 1;`).join('\n'),
+        );
+    }
+    const broad = await searchTool.run({ pattern: 'hit\\d', path: 'apps' }, ctx);
+    expect(broad.content).toMatch(/^240 matches in 24 files/);
+    expect(broad.content).toMatch(/^a\d\/f\d\.ts \(10\)/m);
+    expect(broad.content).toMatch(/narrow with path or glob/);
+  });
+});
+
+describe('bash heredoc', () => {
+  it('runs `cmd <<EOF … EOF` with the body as stdin, checking only the command', async () => {
+    expect(splitHeredoc("python3 - <<'EOF'\nprint(6 * 7)\nEOF")).toEqual({
+      command: 'python3 -',
+      stdin: 'print(6 * 7)\n',
+    });
+    expect(splitHeredoc('cat <<-END\n\tline\nEND\n')).toEqual({
+      command: 'cat',
+      stdin: 'line\n',
+    });
+    expect(splitHeredoc('echo hi')).toBeUndefined();
+    const ctx = await toolContext(await repo());
+    const r = await bashTool.run({ command: "python3 - <<'EOF'\nprint(6 * 7)\nEOF" }, ctx);
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('42');
+  });
+});
+
+describe('tool argument normalization', () => {
+  it('str_replace normalizes parameter aliases and hoisted edits', () => {
+    const n1 = strReplaceTool.normalize?.({
+      path: 'foo.ts',
+      old_string: 'a',
+      new_string: 'b',
+    }) as Record<string, unknown>;
+    expect(n1).toEqual({ path: 'foo.ts', old_str: 'a', new_str: 'b' });
+
+    const n2 = strReplaceTool.normalize?.({
+      path: 'foo.ts',
+      search: 'a',
+      replace: 'b',
+    }) as Record<string, unknown>;
+    expect(n2).toEqual({ path: 'foo.ts', old_str: 'a', new_str: 'b' });
+
+    const n3 = strReplaceTool.normalize?.({
+      path: 'foo.ts',
+      edits: [{ old_str: 'a', new_str: 'b' }],
+    }) as Record<string, unknown>;
+    expect(n3).toEqual({ path: 'foo.ts', old_str: 'a', new_str: 'b' });
+  });
+
+  it('write_file normalizes content aliases', () => {
+    expect(writeFileTool.normalize?.({ path: 'f.ts', contents: 'x' })).toEqual({
+      path: 'f.ts',
+      content: 'x',
+    });
+    expect(writeFileTool.normalize?.({ path: 'f.ts', text: 'x' })).toEqual({
+      path: 'f.ts',
+      content: 'x',
+    });
+    expect(writeFileTool.normalize?.({ path: 'f.ts', code: 'x' })).toEqual({
+      path: 'f.ts',
+      content: 'x',
+    });
+  });
+
+  it('replace_lines normalizes line and text aliases', () => {
+    expect(
+      replaceLinesTool.normalize?.({
+        path: 'f.ts',
+        start_line: 1,
+        end_line: 5,
+        replacement: 'new',
+      }),
+    ).toMatchObject({
+      path: 'f.ts',
+      start: 1,
+      end: 5,
+      new_text: 'new',
+    });
+  });
+
+  it('search normalizes query/regex and directory aliases', () => {
+    expect(searchTool.normalize?.({ query: 'hello', directory: 'src' })).toMatchObject({
+      pattern: 'hello',
+      path: 'src',
+    });
+    expect(searchTool.normalize?.({ regex: 'hi', dir: 'test' })).toMatchObject({
+      pattern: 'hi',
+      path: 'test',
+    });
+  });
+
+  it('read normalizes paths and start_line/end_line aliases', () => {
+    expect(
+      readTool.normalize?.({
+        paths: [{ path: 'a.ts' }],
+      }),
+    ).toMatchObject({
+      files: [{ path: 'a.ts' }],
+    });
+    expect(
+      readTool.normalize?.({
+        path: 'a.ts',
+        start_line: 10,
+        end_line: 20,
+      }),
+    ).toMatchObject({
+      path: 'a.ts',
+      start: 10,
+      end: 20,
+    });
+  });
+});

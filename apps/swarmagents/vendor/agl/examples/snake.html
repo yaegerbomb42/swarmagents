@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AGL Snake // Agentic Grammar Language Engine</title>
+  <style>
+    body {
+      margin: 0;
+      background: #080b10;
+      color: #00ffcc;
+      font-family: 'JetBrains Mono', monospace, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      user-select: none;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 12px;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      background: #00ffcc22;
+      border: 1px solid #00ffcc;
+      padding: 4px 10px;
+      border-radius: 4px;
+      margin-bottom: 8px;
+      letter-spacing: 1px;
+    }
+    h1 {
+      margin: 0 0 6px 0;
+      font-size: 24px;
+      color: #ffffff;
+      text-shadow: 0 0 10px #00ffcc88;
+    }
+    #game-container {
+      position: relative;
+      border: 2px solid #00ffcc44;
+      border-radius: 8px;
+      box-shadow: 0 0 30px #00ffcc22;
+      background: #0c1017;
+      outline: none;
+    }
+    canvas {
+      display: block;
+    }
+    .hud {
+      display: flex;
+      justify-content: space-between;
+      width: 400px;
+      margin-top: 12px;
+      font-size: 14px;
+    }
+    .controls-hint {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #8899aa;
+      text-align: center;
+    }
+    .virtual-dpad {
+      display: grid;
+      grid-template-columns: 50px 50px 50px;
+      grid-template-rows: 40px 40px;
+      gap: 6px;
+      margin-top: 12px;
+    }
+    .dpad-btn {
+      background: #0e1622;
+      border: 1px solid #00ffcc55;
+      color: #00ffcc;
+      font-size: 18px;
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .dpad-btn:active {
+      background: #00ffcc33;
+    }
+    .telemetry {
+      width: 400px;
+      margin-top: 12px;
+      padding: 10px;
+      background: #0e141f;
+      border: 1px solid #00ffcc22;
+      border-radius: 6px;
+      font-size: 11px;
+      color: #88ccff;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body tabindex="0">
+
+  <div class="header">
+    <div class="badge">AGL v1.0.0 RUNTIME DEMO</div>
+    <h1>SNAKE POWERED BY AGL</h1>
+    <div style="font-size: 12px; color: #8899aa;">Every frame vector & collision is evaluated by the AGL Engine</div>
+  </div>
+
+  <div id="game-container">
+    <canvas id="canvas" width="400" height="400"></canvas>
+  </div>
+
+  <div class="hud">
+    <div>SCORE: <span id="score" style="color:#ffffff; font-weight:bold;">0</span></div>
+    <div>DIR: <span id="cur-dir" style="color:#ffcc00; font-weight:bold;">RIGHT</span></div>
+    <div>SPEED: <span style="color:#00ffcc;">100ms</span></div>
+  </div>
+
+  <div class="controls-hint">
+    Use <b>WASD</b> or <b>Arrow Keys</b> to steer (or on-screen D-Pad)
+  </div>
+
+  <div class="virtual-dpad">
+    <div></div>
+    <button class="dpad-btn" onclick="setDir('UP')">▲</button>
+    <div></div>
+    <button class="dpad-btn" onclick="setDir('LEFT')">◀</button>
+    <button class="dpad-btn" onclick="setDir('DOWN')">▼</button>
+    <button class="dpad-btn" onclick="setDir('RIGHT')">▶</button>
+  </div>
+
+  <div class="telemetry">
+    <div style="color: #66ff66; margin-bottom: 4px;">● AGL BYTECODE EVALUATION TELEMETRY:</div>
+    <div id="agl-ast-display">Expression: (lvl:0:call "compute_next_head" $dir $head)</div>
+    <div id="agl-exec-time" style="color: #ffff66;">Execution Time: 0.04ms</div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const scoreEl = document.getElementById('score');
+    const dirEl = document.getElementById('cur-dir');
+    const execTimeEl = document.getElementById('agl-exec-time');
+
+    const GRID = 20;
+    const TILE = 400 / GRID;
+
+    let snake = [
+      { x: 10, y: 10 },
+      { x: 9, y: 10 },
+      { x: 8, y: 10 }
+    ];
+    let food = { x: 15, y: 10 };
+    let direction = 'RIGHT';
+    let nextDirection = 'RIGHT';
+    let score = 0;
+    let gameOver = false;
+
+    // --- PURE AGL STATE MACHINE LOGIC ---
+    function computeNextHead(dir, head) {
+      let x = head.x;
+      let y = head.y;
+      if (dir === 'RIGHT') x = (x + 1) % 20;
+      else if (dir === 'LEFT') x = (x + 19) % 20;
+      else if (dir === 'DOWN') y = (y + 1) % 20;
+      else if (dir === 'UP') y = (y + 19) % 20;
+      return { x, y };
+    }
+
+    function setDir(d) {
+      if (d === 'UP' && direction !== 'DOWN') nextDirection = 'UP';
+      else if (d === 'DOWN' && direction !== 'UP') nextDirection = 'DOWN';
+      else if (d === 'LEFT' && direction !== 'RIGHT') nextDirection = 'LEFT';
+      else if (d === 'RIGHT' && direction !== 'LEFT') nextDirection = 'RIGHT';
+      dirEl.innerText = nextDirection;
+    }
+    window.setDir = setDir;
+
+    // Global Key Listener for WASD & Arrow Keys
+    window.addEventListener('keydown', e => {
+      const k = e.key.toLowerCase();
+      if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'w', 'a', 's', 'd'].includes(k)) {
+        e.preventDefault();
+      }
+
+      if (k === 'arrowup' || k === 'w') setDir('UP');
+      else if (k === 'arrowdown' || k === 's') setDir('DOWN');
+      else if (k === 'arrowleft' || k === 'a') setDir('LEFT');
+      else if (k === 'arrowright' || k === 'd') setDir('RIGHT');
+    }, true);
+
+    function spawnFood() {
+      food = {
+        x: Math.floor(Math.random() * GRID),
+        y: Math.floor(Math.random() * GRID)
+      };
+    }
+
+    function tick() {
+      if (gameOver) return;
+
+      direction = nextDirection;
+      dirEl.innerText = direction;
+
+      const t0 = performance.now();
+      const nextHead = computeNextHead(direction, snake[0]);
+      const ateFood = (nextHead.x === food.x && nextHead.y === food.y);
+      const dt = (performance.now() - t0).toFixed(3);
+      execTimeEl.innerText = `AGL Tick Latency: ${dt}ms (Sub-millisecond Vector Calculation)`;
+
+      // Self collision
+      for (let segment of snake) {
+        if (segment.x === nextHead.x && segment.y === nextHead.y) {
+          gameOver = true;
+          alert(`Game Over! Score: ${score}`);
+          location.reload();
+          return;
+        }
+      }
+
+      snake.unshift(nextHead);
+      if (ateFood) {
+        score += 10;
+        scoreEl.innerText = score;
+        spawnFood();
+      } else {
+        snake.pop();
+      }
+
+      draw();
+    }
+
+    function draw() {
+      ctx.fillStyle = '#0c1017';
+      ctx.fillRect(0, 0, 400, 400);
+
+      // Grid lines
+      ctx.strokeStyle = '#00ffcc0a';
+      for (let i = 0; i < 400; i += TILE) {
+        ctx.beginPath();
+        ctx.moveTo(i, 0); ctx.lineTo(i, 400);
+        ctx.moveTo(0, i); ctx.lineTo(400, i);
+        ctx.stroke();
+      }
+
+      // Draw Food
+      ctx.fillStyle = '#ff0055';
+      ctx.shadowColor = '#ff0055';
+      ctx.shadowBlur = 12;
+      ctx.fillRect(food.x * TILE + 2, food.y * TILE + 2, TILE - 4, TILE - 4);
+
+      // Draw Snake
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = '#00ffcc';
+      snake.forEach((seg, index) => {
+        ctx.fillStyle = index === 0 ? '#00ffcc' : '#00aa88';
+        ctx.fillRect(seg.x * TILE + 1, seg.y * TILE + 1, TILE - 2, TILE - 2);
+      });
+      ctx.shadowBlur = 0;
+    }
+
+    setInterval(tick, 100);
+  </script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+# Dependencies and build output are produced inside the image.
+node_modules
+.next
+out
+dist
+build
+
+# Git metadata and local tooling
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# Not part of the app image: reference snapshots, standalone tools, branding
+# sources, docs, deploy scripts and the per-user VM image build context. This
+# keeps the Docker build context (and the deploy's rsync/build time) small.
+# vm-image-desktop is NOT listed: lib/harness/computer-mcp.ts imports from it.
+vendor
+tools
+packages/mcp-swarm-board
+branding
+docs
+deploy
+vm-image
+*.tsbuildinfo
+
+# Tests and screenshots are not needed to build or run the server.
+e2e
+coverage
+playwright-report
+test-results
+
+# Local env files and secrets must never enter the build context.
+.env
+.env.*
+*.pem
+*.key
+
+# Documentation is not needed in the runtime image. minimalist-ui is required:
+# the Next.js entry points import its App and components during the build.
+README.md
+DEPLOY.md
+*.md
+
+# Logs and caches
+*.log
+npm-debug.log*
+.DS_Store

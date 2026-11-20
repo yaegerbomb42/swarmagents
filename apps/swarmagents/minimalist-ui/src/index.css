@@ -1,0 +1,156 @@
+@import "tailwindcss";
+
+/* ── Dark theme tokens ── */
+:root {
+  --surface-base: #07070a;
+  --surface-elevated: #101015;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text-primary: #ffffff;
+  --text-secondary: rgba(255, 255, 255, 0.6);
+  --text-faint: rgba(255, 255, 255, 0.35);
+  --accent: #6366f1;               /* indigo-500 — acting / you-can-act only */
+  --accent-emerald: #34d399;       /* emerald-400 */
+  --focus-ring: #818cf8;
+  --selection-bg: rgba(99, 102, 241, 0.30);
+  --scrollbar-thumb: rgba(255, 255, 255, 0.15);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.28);
+}
+
+html, body, #root { height: 100%; }
+body {
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+  background: var(--surface-base);
+  color: var(--text-primary);
+  overflow-x: hidden;
+}
+
+/* Selection color */
+::selection {
+  background: var(--selection-bg);
+}
+
+/* Thin dark scrollbars (Firefox + Chromium) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+/* Consistent keyboard focus ring (2px cyan, offset) */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.glass {
+  background: linear-gradient(135deg, rgba(255,255,255,.09), rgba(255,255,255,.03));
+  backdrop-filter: blur(28px) saturate(160%);
+  -webkit-backdrop-filter: blur(28px) saturate(160%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.14),
+    inset 0 0 0 1px rgba(255,255,255,.08),
+    0 20px 60px -20px rgba(0,0,0,.7);
+}
+.glass-soft {
+  background: rgba(255,255,255,.04);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.08), inset 0 0 0 1px rgba(255,255,255,.06);
+}
+
+/* Chat input bar: subtle accent focus glow, 120–180ms, layout-stable */
+.input-bar {
+  transition:
+    background-color 150ms ease-out,
+    box-shadow 150ms ease-out,
+    transform 150ms ease-out;
+}
+.input-bar:hover {
+  background-color: rgba(255, 255, 255, 0.035);
+}
+.input-bar:focus-within {
+  background-color: rgba(255, 255, 255, 0.06);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 0 0 1px rgba(34, 211, 238, 0.32),
+    0 0 0 2px rgba(34, 211, 238, 0.5),
+    0 0 28px -8px rgba(34, 211, 238, 0.5),
+    0 20px 60px -20px rgba(0, 0, 0, 0.7);
+}
+/* Keep an explicit keyboard indicator even though the textarea outline is suppressed */
+.input-bar:has(textarea:focus-visible) {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+.input-bar.input-bar--drag {
+  background-color: rgba(255, 255, 255, 0.06);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.35),
+    0 0 0 2px rgba(255, 255, 255, 0.35),
+    0 20px 60px -20px rgba(0, 0, 0, 0.7);
+  transform: scale(1.01);
+}
+
+.blob {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(110px);
+  opacity: .28;
+  animation: drift 22s ease-in-out infinite;
+}
+
+@keyframes drift {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(60px, -40px) scale(1.1); }
+  66% { transform: translate(-40px, 50px) scale(.95); }
+}
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+@keyframes scan {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+/* Newest activity line fades/slides in (disabled by prefers-reduced-motion below). */
+@keyframes activity-enter {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.activity-line-enter {
+  animation: activity-enter 160ms ease-out both;
+}
+
+.scrollbar-none::-webkit-scrollbar { display: none; }
+.scrollbar-none { scrollbar-width: none; }
+.scrollbar-thin { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) transparent; }
+
+select option { background: var(--surface-elevated); color: var(--text-primary); }
+
+/* Reduced motion: disable non-essential animations/transitions */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

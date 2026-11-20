@@ -1,0 +1,612 @@
+import { Box, Static, Text, useApp, useInput, useWindowSize } from 'ink';
+import { useEffect, useRef, useState } from 'react';
+import { TAGLINE, WORDMARK } from '../cli/brand.js';
+import { cacheHitRate } from '../telemetry/aggregate.js';
+import { fmtMs, fmtTokens } from '../telemetry/humanize.js';
+import type { Entry, Session } from './session.js';
+
+import { BAD, INFO, MUTED, OK, VIOLET } from './colors.js';
+import { BORDER, SPACE } from './tokens.js';
+import { ActivityIndicator, progressBar } from './activity.js';
+import { DiffView } from './diff.js';
+import { RunCard } from './run-card.js';
+import { AgentsView } from './agents.js';
+import { ModelPicker, RankEditor } from './model-picker.js';
+import { AutoTimePicker, timeLabel } from './auto-setup.js';
+import { AgentPanel } from './agent-panel-view.js';
+import { agentPanelKeyOf } from './agent-panel.js';
+import type { TodoItem } from '../tools/todo.js';
+import { MarkdownLine } from './markdown.js';
+import {
+  Mascot,
+  mascotFrame,
+  NEX_WIDTH,
+  REACTION_TICKS,
+  SLEEP_TICKS,
+  SpeechBubble,
+  type Look,
+  type Mood,
+} from './mascot.js';
+
+export { progressBar } from './activity.js';
+
+/** Re-render whenever the session changes. */
+function useSession(session: Session): void {
+  const [, setVersion] = useState(0);
+  useEffect(
+    () =>
+      session.onChange(() => {
+        setVersion((v) => v + 1);
+      }),
+    [session],
+  );
+}
+
+/**
+ * Each kind of line has its own look, so a glance tells them apart: your messages carry a green
+ * badge, tool use a cyan arrow, the model's thinking sits dimmed behind a violet bar, errors red.
+ */
+function EntryLine({ e }: { e: Entry }) {
+  switch (e.kind) {
+    case 'user':
+      return (
+        <Box marginTop={1}>
+          <Text backgroundColor={OK} color="black" bold>
+            {' you '}
+          </Text>
+          <Text bold color="whiteBright">{` ${e.text}`}</Text>
+        </Box>
+      );
+    case 'act':
+      return (
+        <Text>
+          <Text color={INFO} bold>
+            {'▸ '}
+          </Text>
+          <Text color="white">{e.text}</Text>
+        </Text>
+      );
+    case 'think':
+      return (
+        <Text>
+          <Text color={VIOLET}>{'┃ '}</Text>
+          <Text color={VIOLET} dimColor>
+            {'thinking '}
+          </Text>
+          <Text color={MUTED} italic>
+            {e.text}
+          </Text>
+        </Text>
+      );
+    case 'system':
+      return <Text color={MUTED}>{e.text}</Text>;
+    case 'err':
+      // Error lines always start with the badge, whether or not the source already prefixed it.
+      return <Text color={BAD}>{`✗ ${e.text.trimStart().replace(/^✗\s*/, '')}`}</Text>;
+    case 'out':
+      return e.md ? <MarkdownLine text={e.text} md={e.md} /> : <Text>{e.text}</Text>;
+    default:
+      return <Text>{e.text}</Text>;
+  }
+}
+
+export function Header({ version, cwd, width }: { version: string; cwd: string; width: number }) {
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      {width >= 60 ? (
+        <Box flexDirection="column" marginBottom={1}>
+          {WORDMARK.map((l) => (
+            <Text key={l} color={OK}>
+              {l}
+            </Text>
+          ))}
+        </Box>
+      ) : (
+        <Text color={OK} bold>
+          omnexx
+        </Text>
+      )}
+      <Text>
+        <Text color={INFO}>$ omnexx</Text>
+        <Text color={MUTED}>{` v${version} · ${cwd}`}</Text>
+      </Text>
+      <Text>{`> ${TAGLINE}`}</Text>
+      <Text color={MUTED}>
+        {
+          '> type what you want: it works on it right here, showing every step. /run <goal> starts a long unattended run.'
+        }
+      </Text>
+      <Text color={MUTED}>
+        {
+          '> /help · shift+tab chat/run mode · esc stop · ctrl+p plan · ctrl+c leave (runs keep going)'
+        }
+      </Text>
+    </Box>
+  );
+}
+
+export function WhyCard() {
+  const rows: [string, string][] = [
+    ['you drive, turn by turn', 'one prompt, then it drives for hours or days'],
+    ['stops when the context fills', 'fresh context every cycle; never runs out'],
+    ['"done" = the model says so', 'done = your tests, types and lint pass, no regressions'],
+    ['stops at the literal ask', 'infers the intended build, ships it, then hardens it'],
+    ['one model per session', 'Nimble routes each action to the right model'],
+  ];
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle={BORDER.card}
+      borderColor={MUTED}
+      paddingX={SPACE.sm}
+      marginBottom={1}
+    >
+      <Text color={OK} bold>
+        why omnexx over claude code?
+      </Text>
+      {rows.map(([them, us]) => (
+        <Text key={us}>
+          <Text color={MUTED}>{them.padEnd(30)}</Text>
+          <Text color={OK}>{'→ '}</Text>
+          <Text>{us}</Text>
+        </Text>
+      ))}
+    </Box>
+  );
+}
+
+function StatusBar({ session, width }: { session: Session; width: number }) {
+  const t = session.telemetry;
+  const info = session.info;
+  const left = session.runId ? (
+    <Text wrap="truncate-end">
+      <Text color={session.runAlive ? OK : MUTED}>{session.runAlive ? '● ' : '○ '}</Text>
+      <Text color={INFO}>{session.runId}</Text>
+      {info && <Text color={MUTED}>{` · ${info.phase}`}</Text>}
+      {info && info.tasks > 0 && (
+        <Text>
+          {' '}
+          <Text color={OK}>{progressBar(info.done, info.tasks)}</Text>
+          <Text color={MUTED}>{` ${info.done}/${info.tasks}`}</Text>
+        </Text>
+      )}
+      <Text color={MUTED}>
+        {` · ${t.startedAt && t.lastAt ? fmtMs(t.lastAt - t.startedAt) : '0s'}${t.task ? ` · ${t.task}` : ''}${session.estimate ? ` · ${session.estimate}` : ''}`}
+      </Text>
+    </Text>
+  ) : (
+    <Text color={MUTED}>{session.estimate ?? 'no run attached'}</Text>
+  );
+  const agent = session.agentSettings.summary;
+  const right = agent ? `${agent} · ${statusRight(session)}` : statusRight(session);
+  return (
+    <Box width={width} justifyContent="space-between">
+      {left}
+      <Text color={MUTED} wrap="truncate-start">
+        {right}
+      </Text>
+    </Box>
+  );
+}
+
+/** What the empty input box suggests, by what the session is waiting for. */
+function placeholderFor(session: Session): string {
+  if (session.chat) return `message ${session.chat.ref} (/setup off to leave)`;
+  if (session.autoSetup?.step === 'custom') return 'how long? e.g. 90m, 3h, 1d (esc to cancel)';
+  if (session.autoSetup?.step === 'goal')
+    return `what should it work on for ${timeLabel(session.autoSetup.time)}? enter on empty: keep improving the repo`;
+  if (session.awaiting === 'key') return 'paste the API key, then enter';
+  if (session.awaiting === 'url') return '<url> [key] [--name alias]';
+  if (session.pending?.labels)
+    return `y: ${session.pending.labels.yes.toLowerCase()}, n: ${session.pending.labels.no.toLowerCase()}`;
+  if (session.pending) return 'y to allow, anything else to refuse';
+  if (session.mode === 'plan')
+    return session.busy
+      ? 'type to steer the plan while it investigates'
+      : 'what should we plan? (nothing changes until you /go)';
+  if (session.mode === 'chat')
+    return session.busy
+      ? 'type to steer the agent while it works'
+      : 'what should we build or change? (shift+tab: plan, then long run)';
+  return session.runAlive ? 'steer the run, or /command' : 'what should omnexx build? (or /help)';
+}
+
+/** The status bar's right side: run telemetry, or the chat model and context use. */
+function statusRight(session: Session): string {
+  const t = session.telemetry;
+  if (session.runId)
+    return `${t.model ?? '–'} · ${fmtTokens(t.tokens.input + t.tokens.output)} tok · cache ${Math.round(cacheHitRate(t) * 100)}% · $${t.usd.toFixed(2)} · ✓${t.commits} ✗${t.rejects}`;
+  if (session.mode === 'run') return `run mode · feed ${session.verbosity}`;
+  const ctx = session.context;
+  const used = ctx ? ` · ctx ${fmtTokens(ctx.used)}/${fmtTokens(ctx.limit)}` : '';
+  const routing = session.chatRouting ? ` (${session.chatRouting.toLowerCase()})` : '';
+  return `${session.chatModelName ?? 'chat'}${routing}${used} · ${session.mode} mode`;
+}
+
+/** Width of the "omnexx" title column; Nex's eye sits right after it. */
+const TITLE_WIDTH = 9;
+
+/** The agent's checklist for the current request, OpenHands-style. */
+export function TodoPanel({ items }: { items: readonly TodoItem[] }) {
+  const done = items.filter((i) => i.status === 'done').length;
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle={BORDER.card}
+      borderColor={MUTED}
+      paddingX={SPACE.sm}
+      flexGrow={1}
+    >
+      <Text color={OK}>{`todo ${done}/${items.length}`}</Text>
+      {items.map((it, i) => (
+        <Text
+          key={i}
+          wrap="truncate-end"
+          {...(it.status === 'done' ? { color: MUTED, strikethrough: true } : {})}
+          {...(it.status === 'in_progress' ? { color: INFO, bold: true } : {})}
+        >
+          {`${it.status === 'done' ? '☑' : it.status === 'in_progress' ? '▶' : '☐'} ${it.text}`}
+        </Text>
+      ))}
+    </Box>
+  );
+}
+
+function PlanBox({ plan, rows }: { plan: string; rows: number }) {
+  const lines = plan.split('\n').slice(0, Math.max(3, rows));
+  return (
+    <Box flexDirection="column" borderStyle={BORDER.card} borderColor={MUTED} paddingX={SPACE.sm}>
+      <Text color={OK}>plan</Text>
+      {lines.map((l, i) => (
+        <Text key={i} wrap="truncate-end">
+          {l}
+        </Text>
+      ))}
+    </Box>
+  );
+}
+
+export interface AppProps {
+  session: Session;
+  version: string;
+  cwd: string;
+  showWhy: boolean;
+  pollMs?: number;
+}
+
+export function App({ session, version, cwd, showWhy, pollMs = 300 }: AppProps) {
+  useSession(session);
+  const { exit } = useApp();
+  const { columns } = useWindowSize();
+  const width = columns || 80;
+  const [input, setInput] = useState('');
+  const [hist, setHist] = useState<number | undefined>(undefined);
+  const [showPlan, setShowPlan] = useState(false);
+  const [tick, setTick] = useState(0);
+  const frame = tick;
+  // The tick a commit or rejection was last seen, so the mascot reacts for a moment.
+  const seen = useRef<{ commits: number; rejects: number; at: number; mood: Mood }>({
+    commits: 0,
+    rejects: 0,
+    at: -REACTION_TICKS,
+    mood: 'happy',
+  });
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      void session.poll();
+      void session.refreshAgents();
+      setTick((f) => f + 1);
+    }, pollMs);
+    return () => {
+      clearInterval(t);
+    };
+  }, [session, pollMs]);
+
+  useEffect(() => {
+    if (session.quit) exit();
+  });
+
+  const wide = width >= 110;
+  const suggestions = session.complete(input);
+  const files = session.completeFile(input);
+
+  useInput((ch, key) => {
+    if (key.ctrl && ch === 'c') {
+      exit();
+      return;
+    }
+    // An offer (pull a model) answers on one key; guard questions still need enter.
+    if (session.pending?.labels && !input && (ch === 'y' || ch === 'n')) {
+      void session.submit(ch);
+      return;
+    }
+    if (session.agentSettings.panel) {
+      void session.agentKey(agentPanelKeyOf(ch, key));
+      return;
+    }
+    if (session.autoSetup?.step === 'time') {
+      if (key.upArrow) session.autoKey({ up: true });
+      else if (key.downArrow) session.autoKey({ down: true });
+      else if (key.return) session.autoKey({ enter: true });
+      else if (key.escape || ch === 'q') session.autoKey({ close: true });
+      else if (/^[1-8]$/.test(ch)) session.autoKey({ pick: Number(ch) - 1 });
+      return;
+    }
+    if (session.rankView) {
+      if (key.upArrow) void session.rankKey({ key: key.shift ? 'move-up' : 'up' });
+      else if (key.downArrow) void session.rankKey({ key: key.shift ? 'move-down' : 'down' });
+      else if (ch === ' ') void session.rankKey({ key: 'grab' });
+      else if (ch === 'a') void session.rankKey({ add: true });
+      else if (ch === 'm') void session.rankKey({ key: 'mode' });
+      else if (ch === 'x' || key.backspace || key.delete) void session.rankKey({ key: 'remove' });
+      else if (key.escape || key.return || ch === 'q') void session.rankKey({ close: true });
+      return;
+    }
+    if (session.modelPicker) {
+      if (key.upArrow) session.pickerKey({ up: true });
+      else if (key.downArrow) session.pickerKey({ down: true });
+      else if (key.return) session.pickerKey({ enter: true });
+      else if (key.tab) session.pickerKey({ toggle: true });
+      else if (key.escape) session.pickerKey({ close: true });
+      else if (key.backspace || key.delete) session.pickerKey({ back: true });
+      else if (ch && !key.ctrl && !key.meta) session.pickerKey({ char: ch });
+      return;
+    }
+    if (session.agentsView) {
+      if (key.upArrow) void session.agentsKey('up');
+      else if (key.downArrow) void session.agentsKey('down');
+      else if (key.return) void session.agentsKey('attach');
+      else if (ch === 'p') void session.agentsKey('pause');
+      else if (ch === 's') void session.agentsKey('stop');
+      else if (key.escape || ch === 'q') void session.agentsKey('close');
+      return;
+    }
+    if (session.diffView) {
+      if (key.upArrow) session.diffKey('up');
+      else if (key.downArrow) session.diffKey('down');
+      else if (key.return || ch === ' ') session.diffKey('enter');
+      else if (key.escape || ch === 'q') session.diffKey('close');
+      return;
+    }
+    if (key.shift && key.tab) {
+      session.nextMode();
+      return;
+    }
+    if (key.ctrl && ch === 'd') {
+      session.detach();
+      return;
+    }
+    if (key.ctrl && ch === 'p') {
+      setShowPlan((v) => !v);
+      return;
+    }
+    if (key.return && (key.meta || input.endsWith('\\'))) {
+      // alt+enter, or a trailing backslash, continues on a new line.
+      setInput((s) => `${s.endsWith('\\') ? s.slice(0, -1) : s}\n`);
+      return;
+    }
+    if (key.return) {
+      const text = input;
+      setInput('');
+      setHist(undefined);
+      void session.submit(text);
+      return;
+    }
+    if (key.escape) {
+      // Esc stops the agent mid-turn; with nothing running it clears the input.
+      if (!session.interrupt()) setInput('');
+      return;
+    }
+    if (key.tab) {
+      const file = files[0];
+      if (file) {
+        setInput((s) => s.replace(/@[^\s@]*$/, `@${file} `));
+        return;
+      }
+      const first = suggestions[0];
+      if (first) setInput(`/${first.name} `);
+      return;
+    }
+    if (key.upArrow || key.downArrow) {
+      const h = session.history;
+      if (!h.length) return;
+      const cur = hist ?? h.length;
+      const next = key.upArrow ? Math.max(0, cur - 1) : Math.min(h.length, cur + 1);
+      setHist(next);
+      setInput(h[next] ?? '');
+      return;
+    }
+    if (key.backspace || key.delete) {
+      setInput((s) => s.slice(0, -1));
+      return;
+    }
+    if (key.ctrl && ch === 'u') {
+      setInput('');
+      return;
+    }
+    if (!ch || key.ctrl || key.meta) return;
+    // A multi-line paste stays in the box to be edited and sent with Enter.
+    const body = ch.replace(/\r\n?/g, '\n');
+    if (body.slice(0, -1).includes('\n')) {
+      setInput((s) => s + body.replace(/\n$/, ''));
+      return;
+    }
+    // Fast typing can arrive as one chunk that ends in Enter: submit it.
+    const nl = ch.search(/[\r\n]/);
+    session.touch();
+    if (nl === -1) {
+      setInput((s) => s + ch);
+      return;
+    }
+    const text = (input + ch.slice(0, nl)).trim();
+    setInput('');
+    setHist(undefined);
+    void session.submit(text);
+  });
+
+  // Run commits and rejections make Nex cheer or droop, like chat checks do.
+  const { commits, rejects } = session.telemetry;
+  const s0 = seen.current;
+  if (commits > s0.commits) session.react('happy', 'committed!');
+  else if (rejects > s0.rejects) session.react('sad', 'rejected, retrying');
+  s0.commits = commits;
+  s0.rejects = rejects;
+  const nex = session.nex;
+  const sinceReaction = (Date.now() - nex.at) / pollMs;
+  const sinceActivity = (Date.now() - session.lastActivity) / pollMs;
+  // Typing beats the hello wave: the eye turns to the input as soon as you start.
+  const reacting =
+    ['hello', 'happy', 'sad', 'startled'].includes(nex.mood) &&
+    sinceReaction < REACTION_TICKS &&
+    !(nex.mood === 'hello' && input);
+  const mood: Mood = reacting
+    ? nex.mood
+    : session.busy
+      ? nex.mood === 'working'
+        ? 'working'
+        : 'thinking'
+      : session.runAlive
+        ? 'working'
+        : input
+          ? 'listening'
+          : sinceActivity > SLEEP_TICKS
+            ? 'sleepy'
+            : 'idle';
+  const say = reacting || (session.busy && nex.mood === 'working') ? nex.say : '';
+  // The eye looks down at the input box, following the cursor as the text grows.
+  const lastLine = input.split('\n').at(-1) ?? '';
+  const cursorCol = 4 + lastLine.length;
+  const eyeCol = TITLE_WIDTH + Math.floor(NEX_WIDTH / 2);
+  const look: Look = {
+    x: cursorCol < eyeCol - 4 ? -1 : cursorCol > eyeCol + 4 ? 1 : 0,
+    y: input ? 1 : 0,
+  };
+  const showMascot = width >= 60 && session.mascot;
+
+  const placeholder = placeholderFor(session);
+
+  return (
+    <>
+      <Static items={[{ id: -1 } as const, ...session.entries]}>
+        {(e) =>
+          e.id === -1 ? (
+            <Box key="head" flexDirection="column">
+              <Header version={version} cwd={cwd} width={width} />
+              {showWhy && <WhyCard />}
+            </Box>
+          ) : (
+            <EntryLine key={e.id} e={e as Entry} />
+          )
+        }
+      </Static>
+      <Box flexDirection="column" marginTop={1}>
+        {showPlan && session.plan && <PlanBox plan={session.plan} rows={12} />}
+        {session.runId && session.showRunCard && !session.modelPicker && !session.rankView && (
+          <RunCard
+            width={width}
+            info={{
+              runId: session.runId,
+              alive: session.runAlive,
+              phase: session.info?.phase,
+              done: session.info?.done ?? 0,
+              tasks: session.info?.tasks ?? 0,
+              t: session.telemetry,
+              now: Date.now(),
+            }}
+          />
+        )}
+        {session.diffView && <DiffView view={session.diffView} width={width} />}
+        {session.agentsView && <AgentsView state={session.agentsView} width={width} />}
+        {session.modelPicker && <ModelPicker state={session.modelPicker} width={width} />}
+        {session.rankView && <RankEditor state={session.rankView} width={width} />}
+        {session.autoSetup && <AutoTimePicker state={session.autoSetup} width={width} />}
+        {session.agentSettings.panel && (
+          <AgentPanel state={session.agentSettings.panel} width={width} />
+        )}
+        <Box width={width}>
+          <Box flexDirection="column" flexGrow={1}>
+            {session.live && (
+              <Text wrap="wrap">{session.live.split('\n').slice(-6).join('\n')}</Text>
+            )}
+            {session.busy && (
+              <Text color={INFO}>
+                <ActivityIndicator frame={frame} /> {session.busy}
+                <Text color={MUTED}>
+                  {session.mode === 'run' ? '' : '  (esc to stop, type to steer)'}
+                </Text>
+              </Text>
+            )}
+            {!wide && session.todos.length > 0 && <TodoPanel items={session.todos} />}
+          </Box>
+          {wide && session.todos.length > 0 && (
+            <Box width={42} marginLeft={1}>
+              <TodoPanel items={session.todos} />
+            </Box>
+          )}
+        </Box>
+        {session.pending && (
+          <Text color={INFO} bold>
+            {`? ${session.pending.question} [y/N]`}
+          </Text>
+        )}
+        {showMascot && (
+          <Box width={width} alignItems="center">
+            <Box flexDirection="column" width={TITLE_WIDTH}>
+              <Text color={OK} bold>
+                omnexx
+              </Text>
+              <Text color={MUTED}>{session.mode === 'run' ? 'long run' : session.mode}</Text>
+            </Box>
+            <Mascot mood={mood} tick={tick} say={say} look={look} />
+            <SpeechBubble
+              text={mascotFrame(mood, tick, say, look).caption}
+              width={Math.max(20, width - TITLE_WIDTH - NEX_WIDTH - 2)}
+            />
+          </Box>
+        )}
+        {!showMascot && (
+          <Text>
+            <Text color={OK} bold>
+              omnexx
+            </Text>
+            <Text color={MUTED}>{` · ${session.mode === 'run' ? 'long run' : session.mode}`}</Text>
+          </Text>
+        )}
+        <Box width={width}>
+          <Box borderStyle={BORDER.card} borderColor={OK} paddingX={SPACE.sm} flexGrow={1}>
+            <Text color={OK}>{'› '}</Text>
+            {input ? (
+              <Text>
+                {input}
+                <Text color={OK}>█</Text>
+              </Text>
+            ) : (
+              <Text color={MUTED}>
+                <Text color={OK}>█</Text> {placeholder}
+              </Text>
+            )}
+          </Box>
+        </Box>
+        {files.length > 0 && (
+          <Box flexDirection="column" paddingX={2}>
+            {files.slice(0, 6).map((f) => (
+              <Text key={f} color={INFO}>{`@${f}`}</Text>
+            ))}
+          </Box>
+        )}
+        {suggestions.length > 0 && (
+          <Box flexDirection="column" paddingX={2}>
+            {suggestions.slice(0, 6).map((c) => (
+              <Text key={c.name}>
+                <Text color={INFO}>{`/${c.name}`.padEnd(10)}</Text>
+                <Text color={MUTED}>{c.help}</Text>
+              </Text>
+            ))}
+          </Box>
+        )}
+        <StatusBar session={session} width={width} />
+      </Box>
+    </>
+  );
+}

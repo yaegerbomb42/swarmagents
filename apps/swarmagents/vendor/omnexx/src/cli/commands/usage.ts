@@ -1,0 +1,213 @@
+import { cacheSummary } from '../../providers/cache-stats.js';
+import pc from 'picocolors';
+import { readdir, stat } from 'node:fs/promises';
+import { join } from 'node:path';
+import { resolvePaths, runDir, runsDir, usageFile } from '../../core/paths.js';
+import { readEvents } from '../../core/events.js';
+import { UsageError } from '../../errors.js';
+import { readUsageLedger, summarizeUsage, type UsageReport } from '../../providers/usage-ledger.js';
+import { EXIT } from '../exit-codes.js';
+import { println, type CliIO } from '../io.js';
+import type { CommandRegistrar } from './extra/types.js';
+
+const fmt = (n: number): string => {
+  if (!Number.isFinite(n) || n <= 0) return '0';
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+  return String(Math.round(n));
+};
+
+const pct = (n: number): string => `${(n * 100).toFixed(1)}%`;
+
+function table(io: CliIO, report: UsageReport): void {
+  const rows = Object.entries(report.byPurpose).sort((a, b) => b[1].usd - a[1].usd);
+  const head = `${'purpose'.padEnd(14)} ${'calls'.padStart(6)} ${'input'.padStart(9)} ${'output'.padStart(8)} ${'usd'.padStart(10)} ${'share'.padStart(7)}`;
+  println(io.stdout, pc.bold(head));
+  for (const [purpose, p] of rows)
+    println(
+      io.stdout,
+      `${purpose.padEnd(14)} ${String(p.calls).padStart(6)} ${fmt(p.inputTokens).padStart(9)} ${fmt(p.outputTokens).padStart(8)} ${`$${p.usd.toFixed(4)}`.padStart(10)} ${pct(p.share).padStart(7)}`,
+    );
+  if (!rows.length) println(io.stdout, '  (no model calls recorded yet)');
+}
+
+function wasteSection(io: CliIO, report: UsageReport): void {
+  const w = report.waste;
+  println(io.stdout, '');
+  println(io.stdout, pc.bold('Waste'));
+  println(
+    io.stdout,
+    `  repeat reads of unchanged files: ${String(w.repeatRead.events)} events, ${fmt(w.repeatRead.tokensSaved)} tokens saved${w.repeatRead.files ? ` (${String(w.repeatRead.files)} files)` : ''}`,
+  );
+  println(
+    io.stdout,
+    `  retries with the same error:    ${String(w.retries.events)} events, ${fmt(w.retries.tokens)} input tokens re-sent${w.retries.signatures ? ` (${String(w.retries.signatures)} signatures)` : ''}`,
+  );
+  println(
+    io.stdout,
+    `  compactions that did not shrink: ${String(w.compactions.events)} events, ${fmt(w.compactions.tokens)} tokens left behind`,
+  );
+  println(
+    io.stdout,
+    `  context re-sent across turns:   ${fmt(w.contextResend.tokens)} tokens (${fmt(w.contextResend.cached)} were cache reads, ${String(w.contextResend.turns)} turns)`,
+  );
+  println(
+    io.stdout,
+    `  ${pc.dim('net explainable waste:')} ${pc.bold(fmt(Math.max(0, w.totalTokens - w.repeatRead.tokensSaved)))} tokens; ${pc.green(`${fmt(w.repeatRead.tokensSaved)} avoided`)} by the re-read guard`,
+  );
+}
+
+function stepsSection(io: CliIO, report: UsageReport): void {
+  if (!report.byStep.length) return;
+  println(io.stdout, '');
+  println(io.stdout, pc.bold('Top steps'));
+  for (const s of report.byStep.slice(0, 8))
+    println(
+      io.stdout,
+      `  ${s.step.padEnd(18)} ${String(s.calls).padStart(4)} calls  ${fmt(s.tokens).padStart(8)} tokens  $${s.usd.toFixed(4)}`,
+    );
+}
+
+export async function latestRunDir(
+  p: ReturnType<typeof resolvePaths>,
+): Promise<string | undefined> {
+  const base = runsDir(p);
+  let entries: string[];
+  try {
+    entries = await readdir(base);
+  } catch {
+    return undefined;
+  }
+  let best: { name: string; mtime: number } | undefined;
+  for (const name of entries) {
+    try {
+      const s = await stat(join(base, name));
+      if (!s.isDirectory()) continue;
+      if (!best || s.mtimeMs > best.mtime) best = { name, mtime: s.mtimeMs };
+    } catch {
+      // skip
+    }
+  }
+  return best ? join(base, best.name) : undefined;
+}
+
+async function timeSection(
+  io: CliIO,
+  p: ReturnType<typeof resolvePaths>,
+  runId: string | undefined,
+): Promise<void> {
+  const dir = runId ? runDir(p, runId) : await latestRunDir(p);
+  if (!dir) return;
+  const events = await readEvents(join(dir, 'events.jsonl'));
+  const reports = events.filter((e) => e.type === 'time.report');
+  if (!reports.length) return;
+  const last = reports.at(-1);
+  if (!last) return;
+  const d = (last.data ?? {}) as Record<string, unknown>;
+  const fmt = (v: unknown, dflt: string): string =>
+    typeof v === 'number' || typeof v === 'string' ? String(v) : dflt;
+  println(io.stdout, '');
+  println(io.stdout, pc.bold('Time'));
+  println(
+    io.stdout,
+    `  elapsed ${fmt(d.elapsed_s, '?')}s · remaining ${fmt(d.remaining_s, '?')}s · overrun ${fmt(d.overrun_s, '0')}s`,
+  );
+  println(
+    io.stdout,
+    `  model ${fmt(d.model_s, '?')}s · tools ${fmt(d.tool_s, '?')}s · useful ops ${fmt(d.useful_ops, '?')}`,
+  );
+  println(io.stdout, pc.dim(`  ${String(reports.length)} time.report events in ${dir}`));
+}
+
+async function render(
+  io: CliIO,
+  report: UsageReport,
+  p: ReturnType<typeof resolvePaths>,
+  runId: string | undefined,
+): Promise<void> {
+  const title = report.labels.length ? report.labels.join(', ') : report.query || 'all tasks';
+  println(io.stdout, pc.bold(`Usage: ${title}`));
+  const when =
+    report.firstAt !== undefined && report.lastAt !== undefined
+      ? ` · ${new Date(report.firstAt).toISOString().slice(0, 16)} → ${new Date(report.lastAt).toISOString().slice(0, 16)}`
+      : '';
+  println(
+    io.stdout,
+    `  ${String(report.calls)} calls · $${report.usd.toFixed(4)} · input ${fmt(report.inputTokens)} (${fmt(report.cacheRead)} cached) · output ${fmt(report.outputTokens)}${when}`,
+  );
+  const cache = cacheSummary({
+    input: report.inputTokens,
+    cacheRead: report.cacheRead,
+    output: report.outputTokens,
+    usd: report.usd,
+  });
+  println(
+    io.stdout,
+    `  cache hit ${String(cache.hitPercent)}% · saved ~${fmt(Math.max(0, cache.savedTokens))} tokens (~$${Math.max(0, cache.savedUsd).toFixed(4)})`,
+  );
+  if (report.runs.length && report.runs.length <= 3)
+    println(io.stdout, pc.dim(`  runs: ${report.runs.join(', ')}`));
+  println(io.stdout, '');
+  table(io, report);
+  if (Object.keys(report.byTask).length > 1) {
+    println(io.stdout, '');
+    println(io.stdout, pc.bold('By task'));
+    for (const [task, t] of Object.entries(report.byTask).sort((a, b) => b[1].usd - a[1].usd))
+      println(
+        io.stdout,
+        `  ${task.padEnd(22)} ${String(t.calls).padStart(4)} calls  ${fmt(t.tokens).padStart(8)} tokens  $${t.usd.toFixed(4)}`,
+      );
+  }
+  stepsSection(io, report);
+  wasteSection(io, report);
+  await timeSection(io, p, runId);
+  println(io.stdout, '');
+  println(
+    io.stdout,
+    report.attribution.untagged
+      ? pc.red(
+          `Attribution: ${pct(report.attribution.share)} (${String(report.attribution.untagged)} of ${String(report.calls)} calls untagged)`,
+        )
+      : pc.green(
+          `Attribution: ${pct(report.attribution.share)} (${String(report.attribution.tagged)}/${String(report.calls)} calls tagged)`,
+        ),
+  );
+}
+
+export const register: CommandRegistrar = (program, io, setExit) => {
+  program
+    .command('usage')
+    .argument('[task]', 'task id, bench label, or run id (defaults to the whole ledger)')
+    .option('--json', 'machine-readable output')
+    .option('--list', 'list tasks in the ledger')
+    .description('where every token went, by purpose, task and step, plus wasted spend')
+    .action(async (task: string | undefined, opts: { json?: boolean; list?: boolean }) => {
+      const p = resolvePaths(io.env);
+      const file = usageFile(p);
+      const records = readUsageLedger(file);
+      if (!records.length) {
+        println(io.stdout, `No usage recorded yet (${file}).`);
+        setExit(EXIT.ok);
+        return;
+      }
+      if (opts.list) {
+        const labels = new Map<string, number>();
+        for (const r of records)
+          if (r.kind === 'call') labels.set(r.label, (labels.get(r.label) ?? 0) + 1);
+        for (const [label, calls] of [...labels.entries()].sort())
+          println(io.stdout, `${label}  ${String(calls)} calls`);
+        setExit(EXIT.ok);
+        return;
+      }
+      const report = summarizeUsage(records, task ?? '');
+      if (task && !report.calls && !report.waste.repeatRead.events) {
+        throw new UsageError(
+          `no usage for "${task}"`,
+          `run \`omnexx usage --list\` to see the labels in ${file}`,
+        );
+      }
+      if (opts.json) println(io.stdout, JSON.stringify(report, null, 2));
+      else await render(io, report, p, task);
+      setExit(EXIT.ok);
+    });
+};

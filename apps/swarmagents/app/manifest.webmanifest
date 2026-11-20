@@ -1,0 +1,21 @@
+{
+  "name": "SwarmAgents",
+  "short_name": "SwarmAgents",
+  "description": "One chat bar. One agent. Every tool. Nothing hidden.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07070a",
+  "theme_color": "#07070a",
+  "icons": [
+    {
+      "src": "/icon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/apple-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    }
+  ]
+}

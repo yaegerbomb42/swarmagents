@@ -1,0 +1,206 @@
+/* Role catalog / custom-role configurator styles. Complements the shared
+   modules (.overlay/.modal/.btn/.input/.icon-btn) defined in app/globals.css. */
+
+.st-modal {
+  display: flex;
+  flex-direction: column;
+  max-height: min(84vh, 760px);
+}
+
+.st-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.st-head h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.st-back {
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-text);
+  width: 26px;
+  height: 26px;
+  line-height: 1;
+  cursor: pointer;
+  font-size: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.st-back:hover {
+  border-color: var(--color-line-strong);
+  background: var(--color-line);
+}
+
+.st-section {
+  margin-bottom: 18px;
+}
+
+.st-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.st-section-head h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.st-badge {
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 99px;
+  border: 1px solid var(--color-line-strong);
+  color: var(--color-text-muted);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.st-hint,
+.st-help {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  line-height: 1.5;
+}
+
+.st-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  margin-bottom: 14px;
+  border: 1px solid;
+}
+
+.st-banner.ok {
+  color: #89b482;
+  border-color: rgba(137, 180, 130, 0.35);
+  background: rgba(137, 180, 130, 0.08);
+}
+
+.st-banner.err {
+  color: #d16969;
+  border-color: rgba(209, 105, 105, 0.35);
+  background: rgba(209, 105, 105, 0.08);
+}
+
+.st-banner button {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  padding: 2px;
+}
+
+.st-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field label {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.st-area {
+  min-height: 120px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.st-mini {
+  font-size: 11px;
+  color: var(--color-text-muted);
+}
+
+.st-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+.st-opt input {
+  accent-color: var(--color-text);
+}
+
+.st-empty {
+  font-size: 12.5px;
+  color: var(--color-text-faint);
+  text-align: center;
+  padding: 18px 0;
+}
+
+.st-toollist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* Role card grid item. */
+.st-card {
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.02);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.st-card:hover {
+  border-color: var(--color-line-strong);
+}
+
+.st-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.st-card-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.st-card-blurb {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--color-text-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}

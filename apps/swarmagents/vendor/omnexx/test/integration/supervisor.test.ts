@@ -1,0 +1,803 @@
+import { readFile, writeFile } from 'node:fs/promises';
+import { describe, expect, it } from 'vitest';
+import { readEvents, type OmnexxEvent } from '../../src/core/events.js';
+import { getNode } from '../../src/core/plan.js';
+import { REPORT_SECTIONS } from '../../src/core/report.js';
+import { supervise } from '../../src/core/supervisor.js';
+import { git } from '../../src/git/git.js';
+import { isClean } from '../../src/git/repo.js';
+import type { NotifyPayload } from '../../src/notify/ntfy.js';
+import { fileTask, fileWorker, planner, scenario } from '../support/scenarios.js';
+import { call, outage, say, ScriptedProvider, type Script } from '../support/scripted-provider.js';
+import { makeRepo, startTestRun, type TestRun } from '../support/harness.js';
+import { json, mockServer } from '../support/mock-http.js';
+
+const GATE = {
+  name: 'test',
+  run: 'node --test --test-reporter=tap',
+  parser: 'node-test' as const,
+  timeout: '2m',
+};
+const fastOpts = (pushes: NotifyPayload[] = []) => ({
+  bootId: 'boot-a',
+  heartbeatMs: 50,
+  controlPollMs: 20,
+  pausePollMs: 10,
+  notifier: {
+    notify: (p: NotifyPayload) => {
+      pushes.push(p);
+      return Promise.resolve();
+    },
+  },
+});
+const types = (events: OmnexxEvent[], t: string) => events.filter((e) => e.type === t);
+
+async function superviseTest(t: TestRun, pushes: NotifyPayload[] = []) {
+  return supervise(t.run.deps, t.run.state.runId, fastOpts(pushes));
+}
+
+/** The impossible-task fixture: one task no change can pass, so it always ends up parked. */
+const impossiblePlan = () =>
+  planner([
+    {
+      id: 'M1',
+      title: 'Math',
+      tasks: [{ id: 'M1.T01', title: 'Make 2+2 both 4 and 5', checks: ['node --test'] }],
+    },
+  ]);
+const impossibleWorker: Script = (m) =>
+  m.turn === 0
+    ? call('str_replace', {
+        path: 'src/math.js',
+        old_str: 'return a + b;',
+        new_str: `return a + b + ${m.attempt};`,
+      })
+    : say(`Tried +${m.attempt}`);
+
+describe('milestones the planner cannot expand', () => {
+  const run = async (check: string) => {
+    const plan = planner([
+      { id: 'M0', title: 'Install and confirm the baseline', checks: [check] },
+      { id: 'M1', title: 'Real work', dependsOn: ['M0'], tasks: [fileTask('M1.T01')] },
+    ]);
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(scenario(plan, fileWorker)),
+      config: { gates: [GATE] },
+    });
+    await superviseTest(t);
+    return { t, events: await readEvents(t.run.store.eventsPath) };
+  };
+
+  it('counts one with passing checks as done, so the work after it runs', async () => {
+    const { t, events } = await run('true');
+    expect(types(events, 'milestone.no_work').map((e) => e.milestone)).toEqual(['M0']);
+    const saved = await t.run.store.readPlan();
+    expect(saved && getNode(saved, 'M1.T01').status).toBe('done');
+  });
+
+  it('parks one with failing checks but releases what depended on it', async () => {
+    const { t, events } = await run('false');
+    expect(types(events, 'milestone.released')[0]).toMatchObject({
+      parked: 'M0',
+      released: ['M1'],
+    });
+    const saved = await t.run.store.readPlan();
+    expect(saved && getNode(saved, 'M1.T01').status).toBe('done');
+  });
+});
+
+describe('M2: hierarchical plan, milestones, checkpoints and the report', () => {
+  it('runs a 3-milestone plan milestone by milestone with rolling-wave expansion and a failing-milestone re-plan', async () => {
+    const plan = planner(
+      [
+        {
+          id: 'M1',
+          title: 'First',
+          checks: ['test -f out/M1.T01.txt'],
+          tasks: [fileTask('M1.T01'), fileTask('M1.T02', { dependsOn: ['M1.T01'] })],
+        },
+        { id: 'M2', title: 'Second', checks: ['test -f out/M2.extra.txt'], dependsOn: ['M1'] },
+        { id: 'M3', title: 'Third', checks: ['test -f out/M3.T01.txt'], dependsOn: ['M2'] },
+      ],
+      { M2: [fileTask('M2.T01')], M3: [fileTask('M3.T01')] },
+      {
+        M2: [
+          { id: 'M2.T02', title: 'Create out/M2.extra.txt', checks: ['test -f out/M2.extra.txt'] },
+        ],
+      },
+    );
+    const worker: Script = (m) =>
+      m.taskId === 'M2.T02'
+        ? m.turn === 0
+          ? call('write_file', { path: 'out/M2.extra.txt', content: 'x\n' })
+          : say('ok')
+        : fileWorker(m);
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(scenario(plan, worker)),
+      config: { gates: [GATE] },
+    });
+    const pushes: NotifyPayload[] = [];
+    const out = await superviseTest(t, pushes);
+
+    expect(out).toMatchObject({ status: 'finished', exitCode: 0 });
+    const events = await readEvents(t.run.store.eventsPath);
+    const done = types(events, 'milestone.done').map((e) => e.milestone);
+    expect(done).toEqual(['M1', 'M2', 'M3']);
+    // M2's tasks were done before its own check passed: it was not marked done then.
+    const failed = types(events, 'milestone.checks_failed');
+    expect(failed.map((e) => e.milestone)).toEqual(['M2']);
+    expect(events.indexOf(failed[0] as OmnexxEvent)).toBeLessThan(
+      events.findIndex((e) => e.type === 'milestone.done' && e.milestone === 'M2'),
+    );
+    expect(types(events, 'planner.start').map((e) => e.mode)).toEqual([
+      'initial',
+      'expand',
+      'replan',
+      'expand',
+    ]);
+
+    const tags = (
+      await git(t.run.worktree, ['tag', '--list', `omnexx/${t.run.state.runId}/*`])
+    ).stdout
+      .split('\n')
+      .filter(Boolean);
+    expect(tags).toEqual(['M1', 'M2', 'M3'].map((m) => `omnexx/${t.run.state.runId}/${m}`));
+    expect(t.run.state.checkpoints).toHaveLength(0); // the in-memory Run in the test is stale; read from disk:
+    const state = await t.run.store.readState();
+    expect(state.checkpoints.map((c) => c.milestoneId)).toEqual(['M1', 'M2', 'M3']);
+    expect(state.acceptedCommits).toBe(5);
+
+    const report = await readFile(t.run.store.file('REPORT.md'), 'utf8');
+    for (const s of REPORT_SECTIONS) expect(report).toContain(`## ${s}`);
+    expect(report).toContain('**finished**');
+    expect(report).toContain('Tasks: 5 done, 0 parked, 0 open of 5. Milestones: 3/3.');
+    expect(report).toContain(`5 commits on top of`);
+    expect(report).toMatch(/\| out\/ \| 5 \| 5 \| 0 \|/);
+    expect(pushes.map((p) => p.kind)).toEqual(['started', 'finished']);
+    expect(await isClean(t.repo)).toBe(true);
+  });
+
+  it('a re-plan that leaves nodes out keeps them unchanged instead of deleting them', async () => {
+    let attempt = 0;
+    const plan = (m: Parameters<Script>[0]) => {
+      if (m.turn > 0) return say('ok');
+      const text = m.request.messages[0]?.content[0];
+      if (text?.type === 'text' && text.text.startsWith('There is no plan yet')) {
+        return call('write_plan', {
+          milestones: [
+            { id: 'M1', title: 'One', tasks: [fileTask('M1.T01')] },
+            { id: 'M2', title: 'Two', dependsOn: ['M1'] },
+          ],
+        });
+      }
+      attempt++;
+      // First expansion sends only M2; M1 is kept as it was (nodes are never deleted).
+      return attempt === 1
+        ? call('write_plan', {
+            milestones: [{ id: 'M2', title: 'Two', tasks: [fileTask('M2.T01')] }],
+          })
+        : call('write_plan', {
+            milestones: [
+              { id: 'M1', title: 'One', tasks: [fileTask('M1.T01')] },
+              { id: 'M2', title: 'Two', dependsOn: ['M1'], tasks: [fileTask('M2.T01')] },
+            ],
+          });
+    };
+    const provider = new ScriptedProvider(
+      scenario(
+        (m) =>
+          m.turn === 1 && attempt === 1
+            ? (attempt++,
+              call('write_plan', {
+                milestones: [
+                  { id: 'M1', title: 'One', tasks: [fileTask('M1.T01')] },
+                  { id: 'M2', title: 'Two', dependsOn: ['M1'], tasks: [fileTask('M2.T01')] },
+                ],
+              }))
+            : plan(m),
+        fileWorker,
+      ),
+    );
+    const t = await startTestRun({ repo: await makeRepo(), provider, config: { gates: [GATE] } });
+    expect((await superviseTest(t)).status).toBe('finished');
+    expect(JSON.stringify(provider.requests.map((r) => r.messages))).not.toMatch(/plan rejected/);
+    const final = await t.run.store.readPlan();
+    expect(final?.nodes.map((n) => n.id)).toEqual(['M1', 'M1.T01', 'M2', 'M2.T01']);
+  });
+});
+
+describe('M2: stuck handling, budget and judge', () => {
+  it('a planner model that keeps failing hands planning to the next model instead of stopping', async () => {
+    // Arrange: opus answers in prose (no tool calls); sonnet plans properly.
+    const good = planner([{ id: 'M1', title: 'Ship', tasks: [fileTask('M1.T01')] }]);
+    const script: Script = (m) => {
+      if (m.planner && m.request.model.includes('opus')) return say('Here is my plan in words.');
+      return scenario(good, fileWorker)(m);
+    };
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(script),
+      config: {
+        gates: [GATE],
+        models: { planner: ['anthropic:opus', 'anthropic:sonnet'], worker: 'anthropic:sonnet' },
+      },
+    });
+
+    // Act
+    const out = await superviseTest(t);
+
+    // Assert
+    expect(out.status).toBe('finished');
+    const events = await readEvents(t.run.store.eventsPath);
+    expect(types(events, 'planner.fallback')).toMatchObject([
+      {
+        from: expect.stringContaining('anthropic:') as string,
+        to: expect.stringContaining('anthropic:') as string,
+      },
+    ]);
+    expect((await t.run.store.readState()).acceptedCommits).toBe(1);
+  });
+
+  it('a verify-only task with nothing to change is done in one cycle, not retried until parked', async () => {
+    // Arrange: M1.T01 builds something; M1.T02 only "runs the full test suite" (no checks).
+    const plan = planner([
+      {
+        id: 'M1',
+        title: 'Ship',
+        tasks: [
+          fileTask('M1.T01'),
+          {
+            id: 'M1.T02',
+            title: 'Run the full test suite to confirm everything passes',
+            checks: [],
+          },
+        ],
+      },
+    ]);
+    const worker: Script = (m) =>
+      m.taskId === 'M1.T02'
+        ? say('Ran the suite; everything passes. Nothing to change.')
+        : fileWorker(m);
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(scenario(plan, worker)),
+      config: { gates: [GATE] },
+    });
+
+    // Act
+    const out = await superviseTest(t);
+
+    // Assert
+    expect(out.status).toBe('finished');
+    const nodes = (await t.run.store.readPlan())?.nodes ?? [];
+    expect(nodes.find((n) => n.id === 'M1.T02')).toMatchObject({ status: 'done', attempts: 1 });
+    const events = await readEvents(t.run.store.eventsPath);
+    expect(types(events, 'task.nothing_to_change')).toHaveLength(1);
+    expect((await t.run.store.readState()).rejectedCycles).toBe(0);
+  });
+
+  it('a hung model call: the watchdog aborts the cycle, rolls back, and the next attempt lands', async () => {
+    // Arrange: the first worker call never returns on its own; later calls work.
+    const plan = planner([{ id: 'M1', title: 'First', tasks: [fileTask('M1.T01')] }]);
+    const inner = new ScriptedProvider(scenario(plan, fileWorker));
+    let hungOnce = false;
+    const box: { clock?: { advance: (ms: number) => void } } = {};
+    const provider = {
+      name: 'hangs-once',
+      complete: (req: Parameters<typeof inner.complete>[0]) => {
+        const isWorker = !req.system.some((b) => b.text.includes('planner'));
+        if (isWorker && !hungOnce) {
+          hungOnce = true;
+          // Only an abort ends it. Time passes while it hangs.
+          setTimeout(() => box.clock?.advance(60 * 60_000), 30);
+          return new Promise<never>((_resolve, reject) => {
+            req.signal?.addEventListener('abort', () => {
+              reject(new Error('aborted'));
+            });
+          });
+        }
+        return inner.complete(req);
+      },
+    };
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider,
+      config: { gates: [GATE], stuck: { max_silence: '45m' } },
+    });
+    box.clock = t.clock;
+
+    // Act
+    const out = await superviseTest(t);
+
+    // Assert
+    expect(out.status).toBe('finished');
+    const events = await readEvents(t.run.store.eventsPath);
+    const hung = events.filter((e) => e.type === 'stuck.signal' && e.signal === 'hung');
+    expect(hung).toHaveLength(1);
+    expect(String(hung[0]?.detail)).toMatch(/no activity for 1h/);
+    expect((await t.run.store.readState()).acceptedCommits).toBe(1);
+  });
+
+  it('max_hours passing inside a cycle ends the cycle and stops the run, without calling it hung', async () => {
+    // Arrange: the first worker call hangs while 61 minutes pass on a one-hour run.
+    const plan = planner([{ id: 'M1', title: 'First', tasks: [fileTask('M1.T01')] }]);
+    const inner = new ScriptedProvider(scenario(plan, fileWorker));
+    const box: { clock?: { advance: (ms: number) => void } } = {};
+    let hung = false;
+    const provider = {
+      name: 'hangs-past-deadline',
+      complete: (req: Parameters<typeof inner.complete>[0]) => {
+        const isWorker = !req.system.some((b) => b.text.includes('planner'));
+        if (isWorker && !hung) {
+          hung = true;
+          setTimeout(() => box.clock?.advance(61 * 60_000), 30);
+          return new Promise<never>((_resolve, reject) => {
+            req.signal?.addEventListener('abort', () => {
+              reject(new Error('aborted'));
+            });
+          });
+        }
+        return inner.complete(req);
+      },
+    };
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider,
+      config: { gates: [GATE], budget: { max_hours: 1 }, stuck: { max_silence: '10h' } },
+    });
+    box.clock = t.clock;
+
+    // Act
+    const out = await superviseTest(t);
+
+    // Assert
+    expect(out.status).toBe('expired');
+    expect(out.reason).toMatch(/max_hours/);
+    const events = await readEvents(t.run.store.eventsPath);
+    expect(types(events, 'budget.deadline')).toHaveLength(1);
+    expect(events.filter((e) => e.type === 'stuck.signal' && e.signal === 'hung')).toEqual([]);
+  });
+
+  it('a run-level turn cap ends the run as expired with a summary, not an error', async () => {
+    // Arrange: one task, one turn of budget. The first cycle spends the turn;
+    // the next boundary stops the run instead of starting another cycle.
+    const plan = planner([{ id: 'M1', title: 'First', tasks: [fileTask('M1.T01')] }]);
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(scenario(plan, fileWorker)),
+      config: { gates: [GATE], budget: { max_turns: 1 } },
+    });
+
+    // Act
+    const out = await superviseTest(t);
+
+    // Assert
+    expect(out).toMatchObject({ status: 'expired', exitCode: 3 });
+    expect(out.reason).toMatch(/max_turns/);
+    expect((await t.run.store.readState()).spend.turns).toBeGreaterThanOrEqual(1);
+    const report = await readFile(t.run.store.file('REPORT.md'), 'utf8');
+    expect(report).toMatch(/expired/);
+    expect(report).toMatch(/Budget:.*turns of 1/);
+  });
+
+  it('every model out of quota: stops with expired after max_provider_wait instead of waiting for ever', async () => {
+    // Arrange: the planner works; then every worker call fails as if quotas were gone.
+    const plan = planner([{ id: 'M1', title: 'First', tasks: [fileTask('M1.T01')] }]);
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(scenario(plan, () => outage())),
+      config: { gates: [GATE], budget: { max_provider_wait: '2h' } },
+    });
+
+    // Act
+    const out = await superviseTest(t);
+
+    // Assert
+    expect(out.status).toBe('expired');
+    expect(out.reason).toMatch(/no model could take a call for 2h.*omnexx resume/);
+    const events = await readEvents(t.run.store.eventsPath);
+    expect(types(events, 'provider.give_up')).toHaveLength(1);
+    expect((await t.run.store.readState()).providersUnavailable).toMatch(/529/);
+  });
+
+  it('a planner model that never calls a tool stops with a tool-calling hint, after retries', async () => {
+    // Arrange
+    const textOnly: Script = () => say('Here is my plan: first I will look at the code.');
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(scenario(textOnly, textOnly)),
+      config: { gates: [GATE] },
+    });
+
+    // Act
+    const out = await superviseTest(t, []);
+
+    // Assert
+    expect(out).toMatchObject({ status: 'blocked' });
+    expect(out.reason).toMatch(/never called a tool.*may not support tool calling/);
+    const events = await readEvents(t.run.store.eventsPath);
+    expect(types(events, 'planner.retry').length).toBeGreaterThan(0);
+  });
+
+  it('autonomous: a parked task skips its blocked milestone instead of stopping to ask', async () => {
+    // Arrange
+    const plan = impossiblePlan();
+    const worker = impossibleWorker;
+    const t = await startTestRun({
+      fixture: 'impossible-task',
+      provider: new ScriptedProvider(scenario(plan, worker)),
+      config: { gates: [GATE], autonomous: { enabled: true, max_idle_rounds: 1 } },
+    });
+
+    // Act
+    const out = await superviseTest(t, []);
+
+    // Assert
+    expect(out).toMatchObject({ status: 'finished' });
+    const events = await readEvents(t.run.store.eventsPath);
+    expect(types(events, 'autonomous.skipped').flatMap((e) => e.nodes)).toEqual(['M1']);
+    expect(types(events, 'ladder.rung').map((e) => e.rung)).not.toContain('stop_and_ask');
+  });
+
+  it('impossible-task: 3 rejections ask for a different approach, 3 more escalate to the strong model, 3 more ask the planner to split it (it cannot), then it parks; nothing runnable → blocked (exit 2) and a push', async () => {
+    const plan = impossiblePlan();
+    const worker = impossibleWorker;
+    const t = await startTestRun({
+      fixture: 'impossible-task',
+      provider: new ScriptedProvider(scenario(plan, worker)),
+      config: { gates: [GATE] },
+    });
+    const pushes: NotifyPayload[] = [];
+    const out = await superviseTest(t, pushes);
+    expect(out).toMatchObject({ status: 'blocked', exitCode: 2 });
+    const events = await readEvents(t.run.store.eventsPath);
+    expect(types(events, 'rollback')).toHaveLength(9);
+    expect(types(events, 'ladder.rung').map((e) => e.rung)).toEqual([
+      'different_approach',
+      'escalate_model',
+      'replan_task',
+      'park',
+      'stop_and_ask',
+    ]);
+    // Cycles 1-6 use the worker model (a different approach first); after escalation, 7-9 use the planner model.
+    const models = (t.run.deps.provider as ScriptedProvider).requests
+      .filter((q) => JSON.stringify(q.messages[0]).includes('Work on M1.T01'))
+      .map((q) => q.model);
+    expect(new Set(models.slice(0, 12))).toEqual(new Set(['claude-sonnet-5-5']));
+    expect(new Set(models.slice(12))).toEqual(new Set(['claude-opus-5-5']));
+    expect(
+      types(events, 'stuck.signal')
+        .map((e) => e.signal)
+        .sort(),
+    ).toEqual([
+      'consecutive_rejections',
+      'consecutive_rejections',
+      'consecutive_rejections',
+      'repeated_signature',
+      'repeated_signature',
+      'repeated_signature',
+    ]);
+    const plan2 = await t.run.store.readPlan();
+    expect(plan2 && getNode(plan2, 'M1.T01')).toMatchObject({
+      status: 'parked',
+      escalated: true,
+      // The list keeps the latest 8 approaches.
+      approachesTried: Array.from({ length: 8 }, (_, i) => `Tried +${String(i + 2)}`),
+    });
+    expect(pushes.at(-1)).toMatchObject({ kind: 'needs-human', parked: 1 });
+    expect(await readFile(t.run.store.file('REPORT.md'), 'utf8')).toMatch(
+      /## 7\. Needs your decision\n\n- M1\.T01 Make 2\+2 both 4 and 5: consecutive_rejections/,
+    );
+  });
+
+  it('a task that stays stuck on the strong model is split by the planner; the run finishes when the pieces are done', async () => {
+    const plan = planner(
+      [
+        {
+          id: 'M1',
+          title: 'Work',
+          tasks: [
+            { id: 'M1.T01', title: 'Hard task', checks: ['test -f out/hard.txt'] },
+            fileTask('M1.T02', { dependsOn: ['M1.T01'] }),
+          ],
+        },
+      ],
+      {},
+      {},
+      { 'M1.T01': [fileTask('M1.T03'), fileTask('M1.T04', { dependsOn: ['M1.T03'] })] },
+    );
+    // The hard task never succeeds directly; the pieces it is split into do.
+    const worker: Script = (m) =>
+      m.taskId === 'M1.T01'
+        ? m.turn === 0
+          ? call('write_file', { path: 'out/wrong.txt', content: String(m.attempt) })
+          : say(`attempt ${m.attempt}`)
+        : fileWorker(m);
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(scenario(plan, worker)),
+      config: { gates: [GATE] },
+    });
+    const out = await superviseTest(t);
+    expect(out.status).toBe('finished');
+    const events = await readEvents(t.run.store.eventsPath);
+    expect(types(events, 'task.split')).toMatchObject([
+      { task: 'M1.T01', into: ['M1.T03', 'M1.T04'] },
+    ]);
+    expect(types(events, 'ladder.rung').map((e) => e.rung)).toEqual([
+      'different_approach',
+      'escalate_model',
+      'replan_task',
+    ]);
+    const final = await t.run.store.readPlan();
+    expect(final && getNode(final, 'M1.T01')).toMatchObject({
+      status: 'done',
+      splitInto: ['M1.T03', 'M1.T04'],
+    });
+    // M1.T02 depended on the hard task; it now waits for the pieces instead.
+    expect(final && getNode(final, 'M1.T02').dependsOn).toEqual(['M1.T03', 'M1.T04']);
+    // The hard task's partial commits come first; after the split, the pieces then its dependent.
+    expect(
+      types(events, 'commit')
+        .map((e) => e.task)
+        .filter((x) => x !== 'M1.T01'),
+    ).toEqual(['M1.T03', 'M1.T04', 'M1.T02']);
+    expect(types(events, 'stuck.signal').map((e) => e.signal)).toEqual([
+      'task_cycles',
+      'task_cycles',
+      'task_cycles',
+    ]);
+  });
+
+  it('oscillation (A→B→A) is detected within one cycle and the rejection names the signal', async () => {
+    const plan = planner([
+      {
+        id: 'M1',
+        title: 'Flip',
+        tasks: [
+          { id: 'M1.T01', title: 'Set value to B', checks: ['grep -q B value.txt'] },
+          {
+            id: 'M1.T02',
+            title: 'Add notes file',
+            checks: ['test -f notes.txt'],
+            dependsOn: ['M1.T01'],
+          },
+        ],
+      },
+    ]);
+    const worker: Script = (m) => {
+      if (m.taskId === 'M1.T01')
+        return m.turn === 0
+          ? call('write_file', { path: 'value.txt', content: 'B\n' })
+          : say('set B');
+      return m.turn === 0
+        ? call('write_file', { path: 'value.txt', content: 'A\n' })
+        : say('reverted value');
+    };
+    const t = await startTestRun({
+      repo: await makeRepo({ 'value.txt': 'A\n' }),
+      provider: new ScriptedProvider(scenario(plan, worker)),
+      config: { gates: [GATE] },
+    });
+    await superviseTest(t);
+    const events = await readEvents(t.run.store.eventsPath);
+    const osc = types(events, 'stuck.signal').filter((e) => e.signal === 'oscillation');
+    expect(osc.length).toBeGreaterThanOrEqual(1);
+    expect(osc[0]?.cycle).toBe(2);
+    const v = types(events, 'verify.result').find((e) => e.cycle === 2);
+    expect(JSON.stringify(v?.reasons)).toContain('stuck oscillation');
+  });
+
+  it('a tiny max_usd stops the run (exit 3) with lastGreen intact; raising the cap and resuming continues', async () => {
+    const plan = planner([
+      {
+        id: 'M1',
+        title: 'Files',
+        tasks: [fileTask('M1.T01'), fileTask('M1.T02'), fileTask('M1.T03')],
+      },
+    ]);
+    const provider = new ScriptedProvider(scenario(plan, fileWorker));
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider,
+      config: {
+        gates: [GATE],
+        budget: { max_usd: 0.04, wrapup_reserve: 0 },
+        providers: { anthropic: { max_tokens: 500 } },
+      },
+    });
+    const first = await superviseTest(t);
+    expect(first).toMatchObject({ status: 'expired', exitCode: 3 });
+    const s1 = await t.run.store.readState();
+    expect(s1.spend.usd).toBeLessThanOrEqual(0.04);
+    expect((await git(t.run.worktree, ['rev-parse', 'HEAD'])).stdout).toBe(s1.lastGreen);
+    expect(await isClean(t.run.worktree)).toBe(true);
+
+    const raised = {
+      ...t.run.deps,
+      config: { ...t.run.deps.config, budget: { ...t.run.deps.config.budget, max_usd: 50 } },
+    };
+    const second = await supervise(raised, t.run.state.runId, fastOpts());
+    expect(second.status).toBe('finished');
+    const s2 = await t.run.store.readState();
+    expect(s2.acceptedCommits).toBe(3);
+    expect(types(await readEvents(t.run.store.eventsPath), 'run.resume')).toHaveLength(1);
+  });
+
+  it('daily cap: the run pauses when the rolling 24 h spend nears the cap, then resumes and finishes', async () => {
+    const plan = planner([
+      {
+        id: 'M1',
+        title: 'Files',
+        tasks: [fileTask('M1.T01'), fileTask('M1.T02'), fileTask('M1.T03'), fileTask('M1.T04')],
+      },
+    ]);
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(scenario(plan, fileWorker)),
+      config: {
+        gates: [GATE],
+        // Just above one worst-case call (tools + prompt), so it must pause between cycles.
+        budget: { max_usd_per_day: 0.06, max_hours: 2 },
+        providers: { anthropic: { max_tokens: 500 } },
+      },
+    });
+    const pushes: NotifyPayload[] = [];
+    const out = await superviseTest(t, pushes);
+    expect(out.status).toBe('finished');
+    const events = await readEvents(t.run.store.eventsPath);
+    const pauses = types(events, 'budget.daily_pause');
+    expect(pauses.length).toBeGreaterThanOrEqual(1);
+    expect(types(events, 'budget.daily_resume')).toHaveLength(pauses.length);
+    expect(pushes.some((x) => x.kind === 'budget' && (x.hint ?? '').includes('daily cap'))).toBe(
+      true,
+    );
+    // The pauses lasted a simulated day or more, yet max_hours = 2 didn't stop the run.
+    expect(t.clock.now() - 1_700_000_000_000).toBeGreaterThan(20 * 3_600_000);
+    const state = await t.run.store.readState();
+    expect(state.acceptedCommits).toBe(4);
+    // A cycle cut by the cap before any change is not an attempt.
+    const final = await t.run.store.readPlan();
+    for (const id of ['M1.T01', 'M1.T02', 'M1.T03', 'M1.T04'])
+      expect(final && getNode(final, id).consecutiveRejections).toBe(0);
+  });
+
+  it('wrap-up reserve: the run lands (no hard stop at the reserve); report written, lastGreen clean', async () => {
+    const plan = planner([
+      {
+        id: 'M1',
+        title: 'Files',
+        tasks: [fileTask('M1.T01'), fileTask('M1.T02'), fileTask('M1.T03')],
+      },
+    ]);
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(scenario(plan, fileWorker)),
+      config: { gates: [GATE], budget: { max_hours: 1, wrapup_reserve: 0.4 } },
+    });
+    // Each scripted turn advances the fake clock by 5 minutes: after ~11 turns we're in the reserve.
+    const inner = t.run.deps.provider;
+    t.run.deps.provider = {
+      name: 'slow',
+      complete: (r) => {
+        t.clock.advance(10 * 60_000);
+        return inner.complete(r);
+      },
+    };
+    const out = await superviseTest(t);
+    expect(out.status).toBe('expired');
+    const events = await readEvents(t.run.store.eventsPath);
+    // Phase 3: entering the reserve switches to landing instead of stopping.
+    expect(types(events, 'landing.start').length).toBeGreaterThan(0);
+    const landing = events.findIndex((e) => e.type === 'phase' && e.phase === 'landing');
+    expect(landing).toBeGreaterThan(-1);
+    expect(await readFile(t.run.store.file('REPORT.md'), 'utf8')).toBeTruthy();
+    expect(await isClean(t.run.worktree)).toBe(true);
+  });
+
+  it('editing goal.md mid-run is picked up next cycle and logged by hash', async () => {
+    const plan = planner([
+      { id: 'M1', title: 'Files', tasks: [fileTask('M1.T01'), fileTask('M1.T02')] },
+    ]);
+    let edited = false;
+    const t = await startTestRun({
+      repo: await makeRepo(),
+      provider: new ScriptedProvider(scenario(plan, fileWorker)),
+      config: { gates: [GATE] },
+    });
+    t.run.deps.hooks = {
+      onPhase: async (phase, cycle) => {
+        if (phase === 'record' && cycle === 1 && !edited) {
+          edited = true;
+          await writeFile(t.run.store.file('goal.md'), 'A different goal\n');
+        }
+      },
+    };
+    const provider = t.run.deps.provider as ScriptedProvider;
+    await superviseTest(t);
+    const events = await readEvents(t.run.store.eventsPath);
+    const changed = types(events, 'goal.changed');
+    expect(changed).toHaveLength(1);
+    expect(changed[0]?.to).toMatch(/^[0-9a-f]{64}$/);
+    const cycle2 = provider.requests.find((r) =>
+      JSON.stringify(r.messages[0]).includes('Work on M1.T02'),
+    );
+    expect(JSON.stringify(cycle2?.system)).toContain('A different goal');
+  });
+
+  it('judge invariant: advise mode with arbitrary answers produces identical commits and rollbacks to judge off', async () => {
+    const answers = [
+      'continue',
+      'ask_human',
+      'park_and_move_on',
+      'split_task',
+      'switch_to_strong_model',
+    ];
+    let n = 0;
+    const srv = await mockServer((req, res) => {
+      if (req.url === '/api/version') {
+        json(res, 200, { version: '0.35.1' });
+        return;
+      }
+      const q = (
+        JSON.parse(req.body) as {
+          questions: Record<string, { type: string; criteria?: Record<string, null> | string[] }>;
+        }
+      ).questions;
+      const out: Record<string, unknown> = {};
+      for (const [name, x] of Object.entries(q)) {
+        const options =
+          x.type === 'choice' && x.criteria && !Array.isArray(x.criteria)
+            ? Object.keys(x.criteria)
+            : undefined;
+        const pick = options
+          ? options.includes(answers[n % answers.length] ?? '')
+            ? answers[n % answers.length]
+            : options[0]
+          : undefined;
+        n++;
+        out[name] =
+          x.type === 'choice'
+            ? { choice: pick, probabilities: { [pick ?? '']: 0.99 }, confidence: 0.99 }
+            : { probability: n % 2 ? 0.05 : 0.95 };
+      }
+      json(res, 200, { answers: out });
+    });
+    const runOnce = async (judge: object) => {
+      const plan = planner([
+        {
+          id: 'M1',
+          title: 'Mixed',
+          tasks: [
+            fileTask('M1.T01'),
+            { id: 'M1.T02', title: 'Impossible', checks: ['false'] },
+            fileTask('M1.T03'),
+          ],
+        },
+      ]);
+      const t = await startTestRun({
+        repo: await makeRepo(),
+        provider: new ScriptedProvider(scenario(plan, fileWorker)),
+        config: { gates: [GATE], judge },
+        fetch: globalThis.fetch,
+      });
+      await superviseTest(t);
+      const log = (
+        await git(t.run.worktree, ['log', '--format=%s %T', `${t.run.state.startRef}..HEAD`])
+      ).stdout;
+      const events = await readEvents(t.run.store.eventsPath);
+      return {
+        log,
+        rollbacks: types(events, 'rollback').map((e) => e.task),
+        status: (await t.run.store.readState()).status,
+        judged: types(events, 'judge.decision').length,
+      };
+    };
+    const off = await runOnce({ kind: 'none' });
+    const advise = await runOnce({ kind: 'nimble', mode: 'advise', nimble: { url: srv.url } });
+    expect(advise.judged).toBeGreaterThan(0);
+    expect({ ...advise, judged: 0 }).toEqual({ ...off, judged: 0 });
+  });
+});

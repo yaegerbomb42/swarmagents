@@ -1,0 +1,19 @@
+node_modules/
+dist/
+coverage/
+*.tgz
+.DS_Store
+.omnexx-test-*
+test/.build/
+.claude/
+bench/results/
+.trigger/
+.env
+.env.local
+src/.*_bak/
+stub-preflight-fmt.css
+
+# Generated evolution candidates; only best.ts.txt (raw region, not compiled) is kept.
+bench/evolve-prune/candidates/*
+!bench/evolve-prune/candidates/best.ts.txt
+/data/

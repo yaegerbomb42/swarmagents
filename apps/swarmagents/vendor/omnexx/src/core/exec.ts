@@ -1,0 +1,565 @@
+import { spawn, execFile, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { execa } from 'execa';
+import { registerChild, unregisterChild } from './process-registry.js';
+
+export type SessionName = 'main' | 'test' | 'repl' | (string & {});
+
+export interface ExecOptions {
+  cwd: string;
+  env?: Record<string, string>;
+  timeoutMs?: number;
+  /** Full untrimmed output is written here (after redaction by the caller's `redact`). */
+  logPath?: string;
+  redact?: (s: string) => string;
+  signal?: AbortSignal;
+  /** Grace period between SIGTERM and SIGKILL of the process group. */
+  killGraceMs?: number;
+  stdin?: string;
+  /** Extra cleanup when the command is timed out or aborted (e.g. kill it inside a container). */
+  onKill?: () => Promise<void>;
+  /** Named persistent shell session ('main' | 'test' | 'repl'). Omit or set oneShot for disposable run. */
+  session?: SessionName;
+  /** Force-reset the named session before running the command. */
+  resetSession?: boolean;
+  /** Force a disposable one-shot subshell instead of a persistent session. */
+  oneShot?: boolean;
+}
+
+export interface ExecResult {
+  output: string;
+  exitCode: number;
+  timedOut: boolean;
+  aborted?: boolean;
+  durationMs: number;
+  cwd?: string;
+  session?: string;
+}
+
+/** Runs one shell command and waits for it: on the host, or inside the run's sandbox. */
+export type Executor = (command: string, opts: ExecOptions) => Promise<ExecResult>;
+
+/** Kill an entire process group. Ignores "no such process". */
+export function killGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ESRCH' && code !== 'EPERM') throw err;
+  }
+}
+
+export interface ArgvResult {
+  exitCode: number;
+  timedOut: boolean;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+}
+
+/**
+ * Run a program (no shell) in its own process group with a wall-clock limit; on timeout the
+ * whole tree gets SIGTERM, then SIGKILL after a grace period. Used for worker backends.
+ */
+export async function runArgv(
+  argv: readonly string[],
+  opts: {
+    cwd: string;
+    env: Record<string, string>;
+    timeoutMs: number;
+    killGraceMs?: number;
+    stdin?: string;
+    redact: (s: string) => string;
+    stdoutPath: string;
+    stderrPath: string;
+  },
+): Promise<ArgvResult> {
+  const [file, ...args] = argv;
+  const started = Date.now();
+  const child = execa(file ?? 'false', args, {
+    cwd: opts.cwd,
+    env: opts.env,
+    extendEnv: false,
+    detached: true,
+    reject: false,
+    stripFinalNewline: false,
+    maxBuffer: 64 * 1024 * 1024,
+    ...(opts.stdin !== undefined ? { input: opts.stdin } : { stdin: 'ignore' }),
+  });
+  let timedOut = false;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    if (child.pid === undefined) return;
+    const pid = child.pid;
+    graceTimer = setTimeout(() => {
+      killGroup(pid, 'SIGKILL');
+    }, opts.killGraceMs ?? 5_000);
+    graceTimer.unref();
+    killGroup(pid, 'SIGTERM');
+  }, opts.timeoutMs);
+  const r = await child;
+  clearTimeout(timer);
+  if (graceTimer) clearTimeout(graceTimer);
+  if (child.pid !== undefined) killGroup(child.pid, 'SIGKILL');
+  const stdout = opts.redact(typeof r.stdout === 'string' ? r.stdout : '');
+  const stderr = opts.redact(typeof r.stderr === 'string' ? r.stderr : '');
+  await writeFile(opts.stdoutPath, stdout, { mode: 0o600 });
+  await writeFile(opts.stderrPath, stderr, { mode: 0o600 });
+  return {
+    exitCode: r.exitCode ?? 124,
+    timedOut,
+    stdout,
+    stderr,
+    durationMs: Date.now() - started,
+  };
+}
+
+const DEFAULT_TIMEOUT_MS = 120_000;
+const KILL_GRACE_MS = 180;
+const STATE_DIR = join(tmpdir(), 'omnexx-sessions');
+
+/** Fast pre-flight syntax check using `bash -n` so unmatched quotes never wedge a persistent session in PS2. */
+function checkBashSyntax(command: string, stdin?: string): Promise<string | null> {
+  if (stdin !== undefined) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const child = execFile('/bin/bash', ['-n'], { timeout: 250 }, (err, _stdout, stderr) => {
+      if (err && stderr.trim()) {
+        resolve(stderr.trim());
+      } else {
+        resolve(null);
+      }
+    });
+    child.on('error', () => {
+      resolve(null);
+    });
+    child.stdin?.end(command);
+  });
+}
+
+/** Kill all direct and indirect child processes of `parentPid` without killing `parentPid` itself. */
+function killChildTree(parentPid: number, sig: 'TERM' | 'KILL'): Promise<void> {
+  return new Promise((resolve) => {
+    execFile('pkill', [`-${sig}`, '-P', String(parentPid)], { timeout: 300 }, () => {
+      resolve();
+    });
+  });
+}
+
+/**
+ * A single persistent, stateful bash process (SWE-ReX style) that preserves `cwd`,
+ * virtualenvs (`source .venv/bin/activate`), shell functions, and exported env vars across turns.
+ */
+export class ShellSession {
+  readonly name: string;
+  readonly rootCwd: string;
+  private baseEnv: Record<string, string>;
+  private proc: ChildProcessWithoutNullStreams | null = null;
+  private lastCwd: string;
+  private readonly cwdStatePath: string;
+  private readonly envStatePath: string;
+  private queue: Promise<unknown> = Promise.resolve();
+
+  constructor(name: string, rootCwd: string, baseEnv: Record<string, string>) {
+    this.name = name;
+    this.rootCwd = rootCwd;
+    this.lastCwd = rootCwd;
+    this.baseEnv = { ...baseEnv };
+    mkdirSync(STATE_DIR, { recursive: true });
+    const cwdHash = createHash('sha256').update(rootCwd).digest('hex').slice(0, 16);
+    const safeId = `${cwdHash}-${name.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    this.cwdStatePath = join(STATE_DIR, `${safeId}.cwd`);
+    this.envStatePath = join(STATE_DIR, `${safeId}.env`);
+  }
+
+  get cwd(): string {
+    return this.lastCwd;
+  }
+
+  /** Serialize command execution within the same named session so sentinel markers never interleave. */
+  exec(command: string, opts: ExecOptions): Promise<ExecResult> {
+    const next = this.queue.then(
+      () => this.runSerialized(command, opts),
+      () => this.runSerialized(command, opts),
+    );
+    this.queue = next.catch(() => undefined);
+    return next;
+  }
+
+  /** Hard-reset the persistent process and wipe saved state back to `rootCwd`. */
+  reset(newEnv?: Record<string, string>): void {
+    this.killProcessGroup();
+    this.lastCwd = this.rootCwd;
+    if (newEnv) this.baseEnv = { ...newEnv };
+    try {
+      rmSync(this.cwdStatePath, { force: true });
+      rmSync(this.envStatePath, { force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+
+  dispose(): void {
+    this.reset();
+  }
+
+  private killProcessGroup(): void {
+    const p = this.proc;
+    this.proc = null;
+    if (!p?.pid) return;
+    unregisterChild(p.pid);
+    try {
+      process.kill(-p.pid, 'SIGKILL');
+    } catch {
+      try {
+        p.kill('SIGKILL');
+      } catch {
+        // already exited
+      }
+    }
+  }
+
+  private ensureProcess(envOverride?: Record<string, string>): ChildProcessWithoutNullStreams {
+    if (this.proc?.exitCode === null && !this.proc.killed) {
+      return this.proc;
+    }
+    const mergedEnv: Record<string, string> = {
+      ...process.env,
+      ...this.baseEnv,
+      ...(envOverride ?? {}),
+      PS1: '',
+      PS2: '',
+      PROMPT_COMMAND: '',
+      TERM: 'dumb',
+    };
+    const shellBin = existsSync('/bin/bash') ? '/bin/bash' : '/bin/sh';
+    const args = shellBin.endsWith('bash') ? ['--norc', '--noprofile'] : [];
+    const spawnCwd = existsSync(this.lastCwd) ? this.lastCwd : this.rootCwd;
+
+    const proc = spawn(shellBin, args, {
+      cwd: spawnCwd,
+      env: mergedEnv,
+      detached: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    // Redirect session-level stderr to stdout so all subsequent output shares a single FIFO buffer.
+    const bootstrapLines: string[] = ['exec 2>&1'];
+    if (existsSync(this.envStatePath)) {
+      bootstrapLines.push(`. "${this.envStatePath}" >/dev/null 2>&1 || true`);
+    }
+    if (existsSync(this.cwdStatePath)) {
+      try {
+        const savedCwd = readFileSync(this.cwdStatePath, 'utf8').trim();
+        if (savedCwd && existsSync(savedCwd)) {
+          this.lastCwd = savedCwd;
+          const escaped = savedCwd.replace(/'/g, "'\\''");
+          bootstrapLines.push(`cd '${escaped}' >/dev/null 2>&1 || true`);
+        }
+      } catch {
+        // fallback to spawnCwd
+      }
+    }
+    proc.stdin.write(`${bootstrapLines.join('\n')}\n`);
+    proc.on('exit', () => {
+      if (this.proc === proc) this.proc = null;
+      if (proc.pid !== undefined) unregisterChild(proc.pid);
+    });
+    proc.on('error', () => {
+      if (this.proc === proc) this.proc = null;
+    });
+
+    this.proc = proc;
+    // A persistent shell outlives every turn: register it so run end (or a reaper after a
+    // crash) kills the whole group, including servers backgrounded inside it.
+    if (proc.pid !== undefined)
+      registerChild({
+        pid: proc.pid,
+        pgid: proc.pid,
+        kind: 'shell',
+        command: `bash (${this.name} session)`,
+        startedAt: Date.now(),
+      });
+    return proc;
+  }
+
+  private async runSerialized(command: string, opts: ExecOptions): Promise<ExecResult> {
+    const startMs = performance.now();
+    if (opts.resetSession) {
+      this.reset(opts.env);
+    }
+
+    // Guard against unmatched quotes / syntax errors that would leave the persistent shell in PS2.
+    const syntaxErr = await checkBashSyntax(command, opts.stdin);
+    if (syntaxErr) {
+      const output = opts.redact ? opts.redact(syntaxErr) : syntaxErr;
+      if (opts.logPath) {
+        await writeLogSafe(opts.logPath, output);
+      }
+      return {
+        output,
+        exitCode: 2,
+        timedOut: false,
+        durationMs: performance.now() - startMs,
+        cwd: this.lastCwd,
+        session: this.name,
+      };
+    }
+
+    const proc = this.ensureProcess(opts.env);
+    const nonce = randomUUID().replace(/-/g, '');
+    const sentinelPrefix = `__OMNEXX_DONE_${nonce}__`;
+    const eofToken = `__OMNEXX_EOF_${nonce}__`;
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+    // Frame the command with an internal heredoc if `opts.stdin` was extracted by `splitHeredoc`.
+    const framedCommand =
+      opts.stdin !== undefined
+        ? `{\n${command}\n} <<'${eofToken}' 2>&1\n${opts.stdin.endsWith('\n') ? opts.stdin : `${opts.stdin}\n`}${eofToken}`
+        : `{\n${command}\n} 2>&1`;
+
+    const payload = [
+      framedCommand,
+      '__omnexx_ec=$?',
+      `pwd -P > "${this.cwdStatePath}" 2>/dev/null || true`,
+      `export -p > "${this.envStatePath}" 2>/dev/null || true`,
+      `printf '\\n${sentinelPrefix}:%d:%s\\n' "$__omnexx_ec" "$PWD"`,
+      '',
+    ].join('\n');
+
+    return new Promise<ExecResult>((resolve) => {
+      let rawBuffer = '';
+      let timedOut = false;
+      let settled = false;
+      let killEscalationTimer: ReturnType<typeof setTimeout> | undefined;
+      let reapTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const sentinelRegex = new RegExp(`(?:^|\\n)${sentinelPrefix}:(\\d+):([^\\r\\n]*)\\r?\\n?`);
+
+      const cleanup = () => {
+        clearTimeout(timeoutTimer);
+        if (killEscalationTimer) clearTimeout(killEscalationTimer);
+        if (reapTimer) clearTimeout(reapTimer);
+        proc.stdout.off('data', onData);
+        proc.stderr.off('data', onData);
+        proc.off('exit', onExit);
+        proc.stdin.off('error', onStdinError);
+        if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
+      };
+
+      const finalize = async (exitCode: number, finalOutput: string, newCwd?: string) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (newCwd?.startsWith('/')) {
+          this.lastCwd = newCwd;
+          try {
+            writeFileSync(this.cwdStatePath, `${newCwd}\n`, 'utf8');
+          } catch {
+            // ignore
+          }
+        }
+        const cleaned = opts.redact ? opts.redact(finalOutput) : finalOutput;
+        if (opts.logPath) {
+          await writeLogSafe(opts.logPath, cleaned);
+        }
+        resolve({
+          output: cleaned,
+          exitCode,
+          timedOut,
+          durationMs: performance.now() - startMs,
+          cwd: this.lastCwd,
+          session: this.name,
+        });
+      };
+
+      const onData = (chunk: Buffer) => {
+        rawBuffer += chunk.toString('utf8');
+        const match = sentinelRegex.exec(rawBuffer);
+        if (match) {
+          const exitCode = Number(match[1] ?? 1);
+          const pwd = match[2]?.trim();
+          const beforeSentinel = rawBuffer.slice(0, match.index);
+          void finalize(exitCode, beforeSentinel, pwd);
+        }
+      };
+
+      const onExit = (code: number | null) => {
+        this.proc = null;
+        const stripped = rawBuffer.replace(sentinelRegex, '');
+        void finalize(code ?? (timedOut ? 124 : 1), stripped);
+      };
+
+      const interruptCommand = () => {
+        timedOut = true;
+        if (!proc.pid) {
+          void finalize(124, rawBuffer);
+          return;
+        }
+        // Stage 1: Reap child processes of the shell so the shell itself survives and emits its sentinel.
+        void killChildTree(proc.pid, 'TERM');
+        reapTimer = setTimeout(() => {
+          if (!settled && proc.pid) void killChildTree(proc.pid, 'KILL');
+        }, 80);
+
+        // Stage 2: If the shell itself is wedged after KILL_GRACE_MS, kill the process group and respawn next turn.
+        killEscalationTimer = setTimeout(() => {
+          if (!settled) {
+            this.killProcessGroup();
+            void finalize(124, rawBuffer);
+          }
+        }, KILL_GRACE_MS);
+      };
+
+      const onAbort = () => {
+        interruptCommand();
+      };
+
+      const onStdinError = () => {
+        void finalize(1, rawBuffer);
+      };
+
+      const timeoutTimer = setTimeout(interruptCommand, timeoutMs);
+      proc.stdout.on('data', onData);
+      proc.stderr.on('data', onData);
+      proc.once('exit', onExit);
+      proc.stdin.once('error', onStdinError);
+      if (opts.signal) {
+        if (opts.signal.aborted) interruptCommand();
+        else opts.signal.addEventListener('abort', onAbort, { once: true });
+      }
+      try {
+        proc.stdin.write(payload);
+      } catch {
+        void finalize(1, rawBuffer);
+      }
+    });
+  }
+}
+
+/** Per-workspace pool of named persistent sessions ('main', 'test', 'repl'). */
+export class SessionPool {
+  private readonly sessions = new Map<string, ShellSession>();
+
+  private key(rootCwd: string, sessionName: string): string {
+    return `${rootCwd}::${sessionName}`;
+  }
+
+  getOrCreate(
+    rootCwd: string,
+    sessionName: SessionName,
+    baseEnv: Record<string, string>,
+  ): ShellSession {
+    const k = this.key(rootCwd, sessionName);
+    let session = this.sessions.get(k);
+    if (!session) {
+      session = new ShellSession(sessionName, rootCwd, baseEnv);
+      this.sessions.set(k, session);
+    }
+    return session;
+  }
+
+  reset(rootCwd: string, sessionName?: SessionName): void {
+    if (sessionName) {
+      const s = this.sessions.get(this.key(rootCwd, sessionName));
+      s?.reset();
+      return;
+    }
+    for (const [k, s] of this.sessions.entries()) {
+      if (k.startsWith(`${rootCwd}::`)) s.reset();
+    }
+  }
+
+  disposeAll(): void {
+    for (const s of this.sessions.values()) s.dispose();
+    this.sessions.clear();
+  }
+}
+
+export const defaultSessionPool = new SessionPool();
+
+async function writeLogSafe(logPath: string, content: string): Promise<void> {
+  try {
+    mkdirSync(dirname(logPath), { recursive: true });
+    await writeFile(logPath, content, 'utf8');
+  } catch {
+    // non-fatal log write failure
+  }
+}
+
+/** Disposable one-shot execution for isolated commands or when `opts.oneShot` is set. */
+export async function runDisposableShell(command: string, opts: ExecOptions): Promise<ExecResult> {
+  const started = Date.now();
+  const child = execa(command, {
+    shell: '/bin/sh',
+    cwd: opts.cwd,
+    env: opts.env ?? {},
+    extendEnv: false,
+    detached: true,
+    all: true,
+    reject: false,
+    stripFinalNewline: false,
+    maxBuffer: 64 * 1024 * 1024,
+    ...(opts.stdin !== undefined ? { input: opts.stdin } : { stdin: 'ignore' }),
+  });
+  let timedOut = false;
+  let aborted = false;
+  const grace = opts.killGraceMs ?? 5_000;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  const stop = (): void => {
+    if (child.pid === undefined) return;
+    const pid = child.pid;
+    void opts.onKill?.().catch(() => undefined);
+    graceTimer = setTimeout(() => {
+      killGroup(pid, 'SIGKILL');
+    }, grace);
+    graceTimer.unref();
+    killGroup(pid, 'SIGTERM');
+  };
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    stop();
+  }, timeoutMs);
+  const onAbort = (): void => {
+    aborted = true;
+    stop();
+  };
+  // A signal that is already aborted never fires 'abort': without this check the command would
+  // run to completion even though the run it belongs to has been stopped.
+  if (opts.signal?.aborted) onAbort();
+  else opts.signal?.addEventListener('abort', onAbort, { once: true });
+  const result = await child;
+  clearTimeout(timer);
+  if (graceTimer) clearTimeout(graceTimer);
+  opts.signal?.removeEventListener('abort', onAbort);
+  if (child.pid !== undefined) killGroup(child.pid, 'SIGKILL');
+  const raw = typeof result.all === 'string' ? result.all : '';
+  const output = opts.redact ? opts.redact(raw) : raw;
+  if (opts.logPath) await writeFile(opts.logPath, output, { mode: 0o600 });
+  return {
+    exitCode: result.exitCode ?? 124,
+    timedOut,
+    aborted,
+    output,
+    durationMs: Date.now() - started,
+    cwd: opts.cwd,
+  };
+}
+
+/**
+ * Primary shell execution entrypoint.
+ * If `opts.session` is specified, routes to a stateful persistent named session ('main' | 'test' | 'repl').
+ * Otherwise, runs in an isolated process group via `runDisposableShell`.
+ */
+export async function runShell(command: string, opts: ExecOptions): Promise<ExecResult> {
+  if (opts.session && !opts.oneShot) {
+    const session = defaultSessionPool.getOrCreate(opts.cwd, opts.session, opts.env ?? {});
+    return session.exec(command, opts);
+  }
+  return runDisposableShell(command, opts);
+}

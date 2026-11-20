@@ -1,0 +1,24 @@
+# swarmagents-healthcheck.service — example oneshot unit for the 5-minute
+# external health check (run by swarmagents-healthcheck.timer).
+#
+# Install (example — adjust paths to where healthcheck.sh lives on the host):
+#   install -m 755 deploy/healthcheck.sh /usr/local/sbin/healthcheck.sh
+#   install -m 644 deploy/swarmagents-healthcheck.service /etc/systemd/system/
+#   install -m 644 deploy/swarmagents-healthcheck.timer /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now swarmagents-healthcheck.timer
+#
+# A failed check is recorded in the journal (systemctl status / journalctl -u
+# swarmagents-healthcheck.service) but pages nobody by itself. For alerting,
+# add an OnFailure= notifier unit here, or point an external uptime monitor
+# at https://swarmagents.codes/api/health?ready=1. See "Monitoring" in DEPLOY.md.
+[Unit]
+Description=SwarmAgents external health check (polls /api/health?ready=1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/healthcheck.sh
+# The script only makes a loopback HTTP request; tighten with a dedicated
+# user if your host policy wants one (e.g. User=nobody).

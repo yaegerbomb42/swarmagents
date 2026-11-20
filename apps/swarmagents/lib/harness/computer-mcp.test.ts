@@ -1,0 +1,274 @@
+/**
+ * Tests for the desktop computer-use surface: the shared MCP validator
+ * (vm-image-desktop/computer-mcp/validate.mjs — the exact module the server
+ * executes), the harness risk classification for desktop tool calls, and the
+ * human-readable summaries carried by computer.action telemetry.
+ *
+ * The central security invariant: every validated tool call yields *argv
+ * arrays* (never a shell string), so no argument — text, keys, coordinates,
+ * app names — can ever be interpreted as a command. The injection cases
+ * below exercise exactly that.
+ */
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import { parseToolArgs, summarizeTool } from "../../vm-image-desktop/computer-mcp/validate.mjs";
+import {
+  classifyDesktopToolCall,
+  classifyDesktopToolCallAsync,
+  describeDesktopAction,
+  desktopMcpTool,
+  isDesktopMcpCall,
+  parseMcpToolName,
+} from "./computer-mcp";
+import type { RiskDecision } from "./risk";
+
+// ---- Tool-name parsing -----------------------------------------------------
+
+test("parseMcpToolName recognizes mcp__server__tool names", () => {
+  assert.deepEqual(parseMcpToolName("mcp__computer-mcp__click"), { server: "computer-mcp", tool: "click" });
+  assert.deepEqual(parseMcpToolName("mcp__playwright-mcp__browser_navigate"), {
+    server: "playwright-mcp",
+    tool: "browser_navigate",
+  });
+  // Non-desktop MCP servers parse the same way; the desktop check is separate.
+  assert.deepEqual(parseMcpToolName("mcp__roles__set_role"), { server: "roles", tool: "set_role" });
+  assert.equal(parseMcpToolName("Bash"), null);
+  assert.equal(parseMcpToolName(""), null);
+});
+
+test("isDesktopMcpCall / desktopMcpTool only match the desktop servers", () => {
+  assert.equal(isDesktopMcpCall("mcp__computer-mcp__screenshot"), true);
+  assert.equal(isDesktopMcpCall("mcp__playwright-mcp__browser_navigate"), true);
+  assert.equal(isDesktopMcpCall("mcp__browser-mcp__browser_navigate"), true);
+  assert.equal(isDesktopMcpCall("mcp__roles__set_role"), false);
+  assert.equal(isDesktopMcpCall("Bash"), false);
+  assert.equal(desktopMcpTool("mcp__computer-mcp__type"), "type");
+  assert.equal(desktopMcpTool("mcp__roles__set_role"), null);
+});
+
+// ---- Validator: argv arrays, never shell strings ---------------------------
+
+test("click / double_click / move produce plain xdotool argv", () => {
+  // Moves and clicks chain into one xdotool argv (valid command syntax), never
+  // a shell string.
+  assert.deepEqual(parseToolArgs("click", { x: 100, y: 200 }), {
+    ok: true,
+    cmds: [["mousemove", "100", "200", "click", "1"]],
+  });
+  assert.deepEqual(parseToolArgs("click", { x: 100, y: 200, button: 3 }), {
+    ok: true,
+    cmds: [["mousemove", "100", "200", "click", "3"]],
+  });
+  assert.deepEqual(parseToolArgs("double_click", { x: "10", y: "20" }), {
+    ok: true,
+    cmds: [["mousemove", "10", "20", "click", "--repeat", "2", "--delay", "60", "1"]],
+  });
+  assert.deepEqual(parseToolArgs("move", { x: 7, y: 8 }), {
+    ok: true,
+    cmds: [["mousemove", "7", "8"]],
+  });
+});
+
+test("drag produces press-move-release argv", () => {
+  const parsed = parseToolArgs("drag", { x1: 0, y1: 0, x2: 500, y2: 500 });
+  assert.equal(parsed.ok, true);
+  assert.deepEqual(parsed.cmds, [
+    ["mousemove", "0", "0"],
+    ["mousedown", "1"],
+    ["mousemove", "500", "500"],
+    ["mouseup", "1"],
+  ]);
+});
+
+test("type produces argv with the text as a single element (newlines -> Return)", () => {
+  assert.deepEqual(parseToolArgs("type", { text: "hello" }), {
+    ok: true,
+    cmds: [["type", "--delay", "15", "hello"]],
+  });
+  const multiline = parseToolArgs("type", { text: "a\nb" });
+  assert.equal(multiline.ok, true);
+  assert.deepEqual(multiline.cmds, [
+    ["type", "--delay", "15", "a"],
+    ["key", "Return"],
+    ["type", "--delay", "15", "b"],
+  ]);
+});
+
+test("key produces argv; combos are charset-limited", () => {
+  assert.deepEqual(parseToolArgs("key", { combo: "ctrl+l" }), { ok: true, cmds: [["key", "ctrl+l"]] });
+  assert.deepEqual(parseToolArgs("key", { combo: "Return" }), { ok: true, cmds: [["key", "Return"]] });
+  // Shell metacharacters / spaces are not valid keysym combos.
+  assert.equal(parseToolArgs("key", { combo: "rm -rf /" }).ok, false);
+  assert.equal(parseToolArgs("key", { combo: "$(id)" }).ok, false);
+  assert.equal(parseToolArgs("key", { combo: "a;b" }).ok, false);
+  assert.equal(parseToolArgs("key", {}).ok, false);
+});
+
+test("scroll maps deltas to wheel-button repeats, capped", () => {
+  assert.deepEqual(parseToolArgs("scroll", { dx: 0, dy: 5 }), {
+    ok: true,
+    cmds: [["click", "--repeat", "5", "--delay", "30", "5"]],
+  });
+  const up = parseToolArgs("scroll", { dx: 0, dy: -3 });
+  assert.deepEqual(up.cmds, [["click", "--repeat", "3", "--delay", "30", "4"]]);
+  const both = parseToolArgs("scroll", { dx: -2, dy: 1 });
+  assert.deepEqual(both.cmds, [
+    ["click", "--repeat", "1", "--delay", "30", "5"],
+    ["click", "--repeat", "2", "--delay", "30", "6"],
+  ]);
+  assert.equal(parseToolArgs("scroll", { dx: 0, dy: 0 }).ok, false);
+  assert.equal(parseToolArgs("scroll", { dx: 1 }).ok, false); // dy missing
+});
+
+test("open_app only launches allowlisted apps", () => {
+  assert.deepEqual(parseToolArgs("open_app", { name: "browser" }), {
+    ok: true,
+    cmds: [["chromium", "--new-window"]],
+  });
+  assert.deepEqual(parseToolArgs("open_app", { name: "terminal" }), {
+    ok: true,
+    cmds: [["xfce4-terminal"]],
+  });
+  assert.deepEqual(parseToolArgs("open_app", { name: "files" }), {
+    ok: true,
+    cmds: [["thunar"]],
+  });
+  assert.equal(parseToolArgs("open_app", { name: "bash" }).ok, false);
+  assert.equal(parseToolArgs("open_app", { name: "../../bin/sh" }).ok, false);
+  assert.equal(parseToolArgs("open_app", {}).ok, false);
+});
+
+test("screenshot / wait have no commands", () => {
+  assert.deepEqual(parseToolArgs("screenshot", {}), { ok: true, cmds: [] });
+  assert.deepEqual(parseToolArgs("wait", { ms: 100 }), { ok: true, cmds: [] });
+  assert.equal(parseToolArgs("wait", { ms: -1 }).ok, false);
+  assert.equal(parseToolArgs("wait", { ms: 999999999 }).ok, false);
+});
+
+test("injection-shaped arguments are rejected or stay inert argv", () => {
+  // Shell metacharacters in coordinates are not integers -> rejected.
+  assert.equal(parseToolArgs("click", { x: "1; echo pwned", y: 5 }).ok, false);
+  assert.equal(parseToolArgs("click", { x: 1, y: "yes" }).ok, false);
+  // Out-of-range / negative coordinates are rejected.
+  assert.equal(parseToolArgs("click", { x: -5, y: 0 }).ok, false);
+  assert.equal(parseToolArgs("click", { x: 99999, y: 0 }).ok, false);
+  // Buttons outside 1..7 are rejected.
+  assert.equal(parseToolArgs("click", { x: 1, y: 1, button: 9 }).ok, false);
+  // Text is allowed to contain shell punctuation, but it arrives as one argv
+  // element — xdotool types the literal characters, nothing is executed.
+  const text = parseToolArgs("type", { text: "x; rm -rf / && echo pwned" });
+  assert.equal(text.ok, true);
+  assert.ok(text.cmds.every((argv) => argv.every((arg) => typeof arg === "string")));
+  assert.deepEqual(text.cmds, [["type", "--delay", "15", "x; rm -rf / && echo pwned"]]);
+  // Control characters cannot be typed.
+  assert.equal(parseToolArgs("type", { text: "a\u0000b" }).ok, false);
+  assert.equal(parseToolArgs("type", { text: "a\u001bb" }).ok, false);
+  // Unknown tools never produce commands.
+  assert.equal(parseToolArgs("delete_everything", {}).ok, false);
+});
+
+// ---- Risk classification ---------------------------------------------------
+
+test("classifyDesktopToolCall: computer-mcp tools pass the shared validator gates", () => {
+  const call = (name: string, input: unknown): RiskDecision => classifyDesktopToolCall(name, input)!;
+  assert.equal(call("mcp__computer-mcp__click", { x: 1, y: 2 }).level, "allow");
+  assert.equal(call("mcp__computer-mcp__screenshot", {}).level, "allow");
+  assert.equal(call("mcp__computer-mcp__type", { text: "hello" }).level, "allow");
+  // Malformed arguments are denied — the server would reject them anyway.
+  const bad = call("mcp__computer-mcp__click", { x: -1, y: 2 });
+  assert.equal(bad.level, "deny");
+  assert.match(bad.reason, /invalid desktop action/);
+  assert.equal(call("mcp__computer-mcp__open_app", { name: "sh" }).level, "deny");
+});
+
+test("classifyDesktopToolCall: browser navigation allows only explicit loopback for local previews", () => {
+  const nav = (url: string): RiskDecision => classifyDesktopToolCall("mcp__playwright-mcp__browser_navigate", { url })!;
+  assert.equal(nav("https://github.com/owner/repo").level, "allow");
+  assert.equal(nav("https://example.com").level, "allow");
+  assert.equal(nav("http://localhost:8080/app").level, "allow");
+  assert.equal(nav("http://127.0.0.1/x").level, "allow");
+  assert.equal(nav("https://[::1]/").level, "allow");
+  assert.equal(nav("http://10.0.0.5/").level, "deny");
+  assert.equal(nav("http://192.168.1.10/").level, "deny");
+  assert.equal(nav("file:///etc/passwd").level, "deny");
+  assert.equal(nav("ftp://localhost/file").level, "deny");
+  assert.equal(classifyDesktopToolCall("mcp__browser-mcp__browser_navigate", { url: "http://127.0.0.1:5173" })!.level, "allow");
+});
+
+test("classifyDesktopToolCall: other playwright actions and non-desktop calls fall through", () => {
+  assert.equal(classifyDesktopToolCall("mcp__playwright-mcp__browser_click", { ref: "x" })!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__playwright-mcp__browser_snapshot", {})!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__playwright-mcp__browser_navigate", {})!.level, "allow");
+  assert.equal(classifyDesktopToolCall("Bash", { command: "ls" }), null);
+  assert.equal(classifyDesktopToolCall("Read", { file_path: "x" }), null);
+  assert.equal(classifyDesktopToolCall("mcp__roles__set_role", { role_id: "x" }), null);
+});
+
+test("classifyDesktopToolCall normalizes loopback but still blocks reserved hostnames (b9)", () => {
+  const nav = (url: string): RiskDecision => classifyDesktopToolCall("mcp__playwright-mcp__browser_navigate", { url })!;
+  assert.equal(nav("http://localhost./").level, "allow");
+  assert.equal(nav("http://LOCALHOST./").level, "allow");
+  assert.equal(nav("http://localhost.localdomain/").level, "deny");
+  assert.equal(nav("http://metadata.google.internal/").level, "deny");
+  assert.equal(nav("https://example.com").level, "allow");
+});
+
+test("classifyDesktopToolCallAsync runs DNS preflight (b9)", async () => {
+  const lookup = async (host: string): Promise<string[]> => {
+    const map: Record<string, string[]> = {
+      "localtest.me": ["127.0.0.1"],
+      "127.0.0.1.nip.io": ["127.0.0.1"],
+      "example.com": ["93.184.216.34"],
+    };
+    return map[host] ?? [];
+  };
+  const nav = (url: string) =>
+    classifyDesktopToolCallAsync("mcp__playwright-mcp__browser_navigate", { url }, lookup);
+
+  assert.equal((await nav("http://localhost./"))!.level, "allow");
+  assert.equal((await nav("http://localtest.me/"))!.level, "deny");
+  assert.equal((await nav("http://127.0.0.1.nip.io/"))!.level, "deny");
+  assert.equal((await nav("https://example.com"))!.level, "allow");
+  assert.equal((await nav("http://127.0.0.1/"))!.level, "allow");
+});
+
+// ---- Human-readable summaries (computer.action telemetry) -------------------
+
+test("describeDesktopAction summarizes computer-mcp calls readably", () => {
+  assert.equal(describeDesktopAction("mcp__computer-mcp__click", { x: 10, y: 20 }), "Clicking at (10, 20)");
+  assert.equal(describeDesktopAction("mcp__computer-mcp__click", { x: 1, y: 1, button: 3 }), "Right-clicking at (1, 1)");
+  assert.equal(describeDesktopAction("mcp__computer-mcp__double_click", { x: 1, y: 1 }), "Double-clicking at (1, 1)");
+  assert.equal(describeDesktopAction("mcp__computer-mcp__move", { x: 1, y: 1 }), "Moving pointer to (1, 1)");
+  assert.equal(describeDesktopAction("mcp__computer-mcp__type", { text: "hello" }), 'Typing "hello"');
+  assert.equal(describeDesktopAction("mcp__computer-mcp__key", { combo: "ctrl+l" }), "Pressing ctrl+l");
+  assert.equal(describeDesktopAction("mcp__computer-mcp__open_app", { name: "browser" }), "Opening browser");
+  assert.equal(describeDesktopAction("mcp__computer-mcp__screenshot", {}), "Taking a screenshot");
+  assert.equal(describeDesktopAction("mcp__computer-mcp__scroll", { dx: 0, dy: 2 }), "Scrolling down");
+  assert.equal(describeDesktopAction("mcp__computer-mcp__wait", { ms: 500 }), "Waiting 500ms");
+});
+
+test("describeDesktopAction summarizes playwright calls readably", () => {
+  assert.equal(
+    describeDesktopAction("mcp__playwright-mcp__browser_navigate", { url: "https://github.com/foo" }),
+    "Opening github.com",
+  );
+  assert.equal(describeDesktopAction("mcp__playwright-mcp__browser_navigate", {}), "Opening a new tab");
+  assert.equal(describeDesktopAction("mcp__playwright-mcp__browser_snapshot", {}), "Reading the page");
+  assert.equal(
+    describeDesktopAction("mcp__playwright-mcp__browser_type", { text: "search term" }),
+    'Typing "search term"',
+  );
+  assert.equal(describeDesktopAction("mcp__playwright-mcp__browser_press_key", { key: "Enter" }), "Pressing Enter");
+  assert.equal(describeDesktopAction("mcp__playwright-mcp__browser_mouse_wheel", { deltaY: 100 }), "Scrolling the page");
+  // Non-desktop call: falls back to a readable label rather than crashing.
+  assert.equal(describeDesktopAction("mcp__roles__set_role", { role_id: "x" }), "Set role");
+});
+
+test("summarizeTool (server side) stays consistent with the harness summaries", () => {
+  assert.equal(summarizeTool("click", { x: 10, y: 20 }), "Clicking at (10, 20)");
+  assert.equal(summarizeTool("type", { text: "hi" }), 'Typing "hi"');
+  assert.equal(summarizeTool("key", { combo: "Return" }), "Pressing Return");
+  assert.equal(summarizeTool("open_app", { name: "browser" }), "Opening browser");
+  assert.equal(summarizeTool("scroll", { dx: 0, dy: -4 }), "Scrolling up");
+});

@@ -1,0 +1,98 @@
+# docker-compose.server.yml.example — TEMPLATE for the production deploy.
+#
+# This is NOT a working compose file: every value that depends on the real
+# host is a placeholder. Copy it to docker-compose.server.yml and fill in
+# every <FILL IN> before use. The full checklist of what must be provided
+# is in the "Rebuilding the production deploy from this repo" section of
+# DEPLOY.md. The live production file (with real hosts, secrets, and the
+# deploy key) lives only on the VPS and is deliberately not in this repo.
+#
+# Shape notes (from the in-repo base files and deploy/deploy.sh):
+# - The app listens inside the container on 3777; the deploy health check
+#   polls http://172.17.0.1:3400/api/health?ready=1, i.e. the host port below
+#   as reached through the Docker bridge gateway. Keep the host port and the
+#   HEALTH_URL in deploy/deploy.sh in agreement.
+# - The desktop proxy (lib/desktop-proxy) binds inside the container on 3778
+#   and is published on the host loopback ONLY — never expose 3778 publicly.
+# - The base docker-compose.yml + docker-compose.docker.yml in this directory
+#   are the development equivalents of this template; this file is the
+#   production merge of the two, with server-mode auth on.
+services:
+  swarmagents:
+    image: swarmagents-v2:latest
+    container_name: swarmagents
+    restart: unless-stopped
+    ports:
+      # <FILL IN> host port for the app. Production uses 3400; change it only
+      # together with HEALTH_URL in deploy/deploy.sh.
+      - "<FILL IN: HOST_APP_PORT, e.g. 3400>:3777"
+      # Desktop proxy, host loopback only — do not change the 127.0.0.1 bind.
+      - "127.0.0.1:3778:3778"
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: "3777"
+      # <FILL IN> server mode MUST be on in production (unauthenticated
+      # local mode is the default if this is unset — see DEPLOY.md).
+      SWARM_SERVER_MODE: "1"
+      # <FILL IN> 32+ random bytes. Generate with: openssl rand -hex 32.
+      # Never commit the real value; it lives in .env.v2 on the VPS only.
+      SWARM_SESSION_SECRET: "<FILL IN: openssl rand -hex 32>"
+      # <FILL IN> public hostname(s), comma-separated, e.g. swarmagents.codes.
+      # Must also include the internal service name for VM approval callbacks.
+      SWARM_ALLOWED_HOSTS: "<FILL IN: e.g. swarmagents.codes,swarmagents>"
+      # <FILL IN> owner account for the admin bootstrap / operator identity.
+      SWARM_OWNER_EMAIL: "<FILL IN: owner email>"
+      SWARM_HOME: /data
+      # Real per-user VMs (fake driver is the dev default — never production).
+      SWARM_VM_DRIVER: docker
+      SWARM_VM_IMAGE: swarm-vm:claude
+      # <FILL IN> dedicated VM network (see DEPLOY.md "VM network"). The
+      # egress rules in swarmagents-egress.sh target this network's subnet.
+      SWARM_VM_NETWORK: swarm-vms
+      SWARM_VM_APPROVAL_BASE_URL: http://swarmagents:3777
+      SWARM_VM_DESKTOP: "0"
+      SWARM_VM_DESKTOP_IMAGE: swarm-vm:desktop
+      SWARM_DESKTOP_PROXY_HOST: 0.0.0.0
+      SWARM_DESKTOP_PROXY_PORT: "3778"
+      # Reverse proxy in front (nginx): rate limits key off the real client.
+      SWARM_TRUST_PROXY: "1"
+      SWARM_TRUSTED_PROXY_HOPS: "1"
+      # <FILL IN> host's docker socket group id (Linux: stat -c '%g'
+      # /var/run/docker.sock; macOS: stat -f '%g' /var/run/docker.sock).
+      DOCKER_GID: "<FILL IN: docker socket group id>"
+    # The docker socket is owned by root:docker (0660); the app user must be
+    # in the host's docker group (group_add below) or the mount is unusable.
+    group_add:
+      - "${DOCKER_GID}"
+    volumes:
+      # <FILL IN> persistent volume for /data (board, users, telemetry,
+      # per-user provider keys). Use a named volume; back it up (see
+      # deploy/backup.sh) — rollback never restores /data.
+      - swarm_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - default
+      - swarm-vms
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:' + (process.env.PORT || 3777) + '/api/health?ready=1').then(async (r) => { const body = await r.json().catch(() => null); process.exit(r.ok && body?.ready === true ? 0 : 1); }).catch(() => process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+networks:
+  swarm-vms:
+    name: ${SWARM_VM_NETWORK:-swarm-vms}
+    driver: bridge
+
+volumes:
+  swarm_data:

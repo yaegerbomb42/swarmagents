@@ -1,0 +1,593 @@
+/**
+ * DesktopBridge framing tests: WebSocket frames split across TCP chunks,
+ * fragmented messages, buffer caps, masking toward the container, and the
+ * view-only input filter when RFB messages arrive split.
+ *
+ * The bridge is driven with in-memory sockets so every TCP slicing pattern is
+ * deterministic: whatever is "written" by the bridge is captured and decoded.
+ */
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import crypto from "node:crypto";
+import type net from "node:net";
+import { DesktopBridge, type DesktopBridgeOptions } from "./bridge";
+import {
+  WsFrameDecoder,
+  encodeFrame,
+  encodeClientFrame,
+  OP_BINARY,
+  OP_CONTINUATION,
+  OP_PING,
+  OP_PONG,
+  type WsMessage,
+} from "./ws";
+import { vncDesResponse, RFB_VERSION } from "./rfb";
+
+const PASSWORD = "s3cret-pw";
+
+class FakeSocket extends EventEmitter {
+  writes: Buffer[] = [];
+  destroyed = false;
+  ended = false;
+  write(data: Buffer | string): boolean {
+    this.writes.push(Buffer.from(data));
+    return true;
+  }
+  end(data?: Buffer | string): this {
+    if (data) this.write(data);
+    this.ended = true;
+    return this;
+  }
+  destroy(): this {
+    this.destroyed = true;
+    return this;
+  }
+  feed(chunk: Buffer): void {
+    this.emit("data", chunk);
+  }
+  feedSliced(data: Buffer, size: number): void {
+    for (let i = 0; i < data.length; i += size) this.feed(data.subarray(i, i + size));
+  }
+}
+
+/** Decodes everything the bridge wrote to one socket, incrementally. */
+class Reader {
+  private seen = 0;
+  private decoder = new WsFrameDecoder(Number.MAX_SAFE_INTEGER);
+  constructor(private readonly sock: FakeSocket) {}
+  read(): WsMessage[] {
+    const fresh = this.sock.writes.slice(this.seen);
+    this.seen = this.sock.writes.length;
+    return fresh.flatMap((w) => this.decoder.push(w));
+  }
+  binary(): Buffer {
+    return Buffer.concat(this.read().filter((m) => m.opcode === OP_BINARY).map((m) => m.payload));
+  }
+}
+
+/** Raw frame builder for fragmentation tests (fin/opcode/mask chosen freely). */
+function frame(opcode: number, payload: Buffer, opts: { fin?: boolean; masked?: boolean } = {}): Buffer {
+  const fin = opts.fin ?? true;
+  const key = opts.masked ? crypto.randomBytes(4) : null;
+  const len = payload.length;
+  let header: Buffer;
+  const maskBit = key ? 0x80 : 0;
+  const b0 = (fin ? 0x80 : 0) | opcode;
+  if (len < 126) header = Buffer.from([b0, maskBit | len]);
+  else if (len <= 0xffff) {
+    header = Buffer.alloc(4);
+    header[0] = b0;
+    header[1] = maskBit | 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = b0;
+    header[1] = maskBit | 127;
+    header.writeUInt32BE(len, 6);
+  }
+  if (!key) return Buffer.concat([header, payload]);
+  const masked = Buffer.from(payload.map((b, i) => b ^ key[i & 3]));
+  return Buffer.concat([header, key, masked]);
+}
+
+function serverInit(width = 1600, height = 900, name = "fake-vnc"): Buffer {
+  const n = Buffer.from(name);
+  // 20-byte fixed part + U32 name length + name (RFC 6143 ServerInit).
+  const init = Buffer.alloc(24 + n.length);
+  init.writeUInt16BE(width, 0);
+  init.writeUInt16BE(height, 2);
+  init[4] = 32;
+  init[5] = 24;
+  init[7] = 1;
+  init.writeUInt32BE(n.length, 20);
+  n.copy(init, 24);
+  return init;
+}
+
+interface Harness {
+  client: FakeSocket;
+  upstream: FakeSocket;
+  toClient: Reader;
+  toUpstream: Reader;
+  closes: string[];
+  bridge: DesktopBridge;
+}
+
+function makeBridge(mode: "view" | "control", extra: Partial<DesktopBridgeOptions> = {}): Harness {
+  const client = new FakeSocket();
+  const upstream = new FakeSocket();
+  const closes: string[] = [];
+  const bridge = new DesktopBridge(client as unknown as net.Socket, upstream as unknown as net.Socket, {
+    mode,
+    password: PASSWORD,
+    onActivity: () => {},
+    onClose: (r) => closes.push(r),
+    ...extra,
+  });
+  return { client, upstream, toClient: new Reader(client), toUpstream: new Reader(upstream), closes, bridge };
+}
+
+/** Run both RFB handshakes to the spliced state. */
+function handshake(h: Harness): void {
+  const challenge = crypto.randomBytes(16);
+  assert.equal(h.toUpstream.binary().toString(), RFB_VERSION, "proxy sends its version first");
+  h.upstream.feed(encodeFrame(OP_BINARY, Buffer.concat([Buffer.from(RFB_VERSION), Buffer.from([1, 2])])));
+  assert.deepEqual([...h.toUpstream.binary()], [2], "VNCAuth selected");
+  h.upstream.feed(encodeFrame(OP_BINARY, challenge));
+  assert.ok(h.toUpstream.binary().equals(vncDesResponse(PASSWORD, challenge)), "password injected");
+  h.upstream.feed(encodeFrame(OP_BINARY, Buffer.from([0, 0, 0, 0])));
+  assert.deepEqual([...h.toUpstream.binary()], [1], "ClientInit");
+  h.upstream.feed(encodeFrame(OP_BINARY, serverInit()));
+
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from(RFB_VERSION)));
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
+  const toBrowser = h.toClient.binary();
+  // version(12) + types(2) + result(4) + ServerInit(24 + name)
+  assert.equal(toBrowser.subarray(0, 12).toString(), RFB_VERSION);
+  assert.equal(toBrowser.readUInt16BE(18), 1600, "ServerInit carries upstream width");
+  assert.equal(toBrowser.readUInt16BE(20), 900, "ServerInit carries upstream height");
+  assert.deepEqual(h.closes, []);
+}
+
+function bigPayload(size: number): Buffer {
+  const b = crypto.randomBytes(size);
+  return b;
+}
+
+test("bridge: 200 KB upstream frame in 4 KB TCP slices reaches the browser intact", () => {
+  const h = makeBridge("view");
+  handshake(h);
+  const payload = bigPayload(200 * 1024);
+  h.upstream.feedSliced(encodeFrame(OP_BINARY, payload), 4096);
+  const msgs = h.toClient.read();
+  assert.equal(msgs.length, 1, "exactly one message forwarded");
+  assert.ok(msgs[0].payload.equals(payload), "payload byte-identical");
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: 200 KB masked browser frame in 4 KB TCP slices reaches the container intact", () => {
+  const h = makeBridge("control");
+  handshake(h);
+  const payload = bigPayload(200 * 1024);
+  h.client.feedSliced(encodeClientFrame(OP_BINARY, payload), 4096);
+  const msgs = h.toUpstream.read();
+  assert.equal(msgs.length, 1);
+  assert.ok(msgs[0].payload.equals(payload));
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: 1-byte TCP slices in both directions", () => {
+  const h = makeBridge("control");
+  handshake(h);
+  const down = bigPayload(20_000);
+  const up = bigPayload(20_000);
+  h.upstream.feedSliced(encodeFrame(OP_BINARY, down), 1);
+  h.client.feedSliced(encodeClientFrame(OP_BINARY, up), 1);
+  assert.ok(h.toClient.binary().equals(down));
+  assert.ok(h.toUpstream.binary().equals(up));
+});
+
+test("bridge: the whole handshake also survives 1-byte slices", () => {
+  const h = makeBridge("view");
+  const challenge = crypto.randomBytes(16);
+  h.toUpstream.read();
+  const feed = (b: Buffer) => h.upstream.feedSliced(encodeFrame(OP_BINARY, b), 1);
+  feed(Buffer.concat([Buffer.from(RFB_VERSION), Buffer.from([1, 2])]));
+  feed(challenge);
+  assert.ok(Buffer.concat([Buffer.from([2]), vncDesResponse(PASSWORD, challenge)]).equals(h.toUpstream.binary()));
+  feed(Buffer.from([0, 0, 0, 0]));
+  feed(serverInit());
+  for (const b of [Buffer.from(RFB_VERSION), Buffer.from([1]), Buffer.from([1])]) {
+    h.client.feedSliced(encodeClientFrame(OP_BINARY, b), 1);
+  }
+  const toBrowser = h.toClient.binary();
+  assert.equal(toBrowser.readUInt16BE(18), 1600);
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: ServerInit split across two WebSocket messages still completes the handshake", () => {
+  const h = makeBridge("view");
+  h.toUpstream.read();
+  h.upstream.feed(encodeFrame(OP_BINARY, Buffer.concat([Buffer.from(RFB_VERSION), Buffer.from([1, 1])]))); // None
+  h.upstream.feed(encodeFrame(OP_BINARY, Buffer.from([0, 0, 0, 0])));
+  const init = serverInit(1280, 720, "split-name");
+  h.upstream.feed(encodeFrame(OP_BINARY, init.subarray(0, 26))); // mid name-length
+  h.upstream.feed(encodeFrame(OP_BINARY, init.subarray(26, 30))); // mid name
+  h.upstream.feed(encodeFrame(OP_BINARY, init.subarray(30)));
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from(RFB_VERSION)));
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
+  const toBrowser = h.toClient.binary();
+  assert.equal(toBrowser.readUInt16BE(18), 1280);
+  assert.equal(toBrowser.readUInt16BE(20), 720);
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: two frames in one TCP chunk are both forwarded, in order", () => {
+  const h = makeBridge("control");
+  handshake(h);
+  const a = bigPayload(300);
+  const b = bigPayload(70_000);
+  h.upstream.feed(Buffer.concat([encodeFrame(OP_BINARY, a), encodeFrame(OP_BINARY, b)]));
+  const down = h.toClient.read();
+  assert.equal(down.length, 2);
+  assert.ok(down[0].payload.equals(a) && down[1].payload.equals(b));
+  h.client.feed(Buffer.concat([encodeClientFrame(OP_BINARY, a), encodeClientFrame(OP_BINARY, b)]));
+  const up = h.toUpstream.read();
+  assert.equal(up.length, 2);
+  assert.ok(up[0].payload.equals(a) && up[1].payload.equals(b));
+});
+
+test("bridge: frame boundary in the middle of a header (length and mask key)", () => {
+  const h = makeBridge("control");
+  handshake(h);
+  const payload = bigPayload(100_000); // 64-bit length header
+  const down = encodeFrame(OP_BINARY, payload);
+  for (const cut of [1, 3, 9]) {
+    h.upstream.feed(down.subarray(0, cut));
+    h.upstream.feed(down.subarray(cut));
+    assert.ok(h.toClient.binary().equals(payload), `upstream header split at ${cut}`);
+  }
+  const up = encodeClientFrame(OP_BINARY, payload);
+  for (const cut of [1, 2, 5, 11, 13]) {
+    // 13 = inside the 4-byte mask key after a 10-byte header
+    const again = encodeClientFrame(OP_BINARY, payload);
+    h.client.feed(again.subarray(0, cut));
+    h.client.feed(again.subarray(cut));
+    assert.ok(h.toUpstream.binary().equals(payload), `client header split at ${cut}`);
+  }
+  // A trailing frame starting in the same chunk as the end of the previous one.
+  const small = bigPayload(10);
+  const joined = Buffer.concat([up, encodeClientFrame(OP_BINARY, small)]);
+  h.client.feed(joined.subarray(0, up.length + 1));
+  h.client.feed(joined.subarray(up.length + 1));
+  assert.ok(h.toUpstream.binary().equals(Buffer.concat([payload, small])));
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: fragmented message (FIN=0 + continuations) split across chunks, with a ping in between", () => {
+  const h = makeBridge("control");
+  handshake(h);
+  const parts = [bigPayload(5000), bigPayload(7000), bigPayload(3000)];
+  const stream = Buffer.concat([
+    frame(OP_BINARY, parts[0], { fin: false }),
+    frame(OP_CONTINUATION, parts[1], { fin: false }),
+    frame(OP_PING, Buffer.from("hb")),
+    frame(OP_CONTINUATION, parts[2], { fin: true }),
+  ]);
+  h.upstream.feedSliced(stream, 1000);
+  const down = h.toClient.read();
+  assert.equal(down.length, 1, "one reassembled message");
+  assert.ok(down[0].payload.equals(Buffer.concat(parts)));
+  // The upstream ping is answered upstream with a masked pong.
+  const pongWrite = h.upstream.writes.at(-1)!;
+  assert.ok((pongWrite[1] & 0x80) !== 0, "pong toward the container is masked");
+  const pong = h.toUpstream.read();
+  assert.equal(pong.length, 1);
+  assert.equal(pong[0].opcode, OP_PONG);
+  assert.equal(pong[0].payload.toString(), "hb");
+
+  const clientStream = Buffer.concat([
+    frame(OP_BINARY, parts[0], { fin: false, masked: true }),
+    frame(OP_CONTINUATION, parts[1], { fin: false, masked: true }),
+    frame(OP_CONTINUATION, parts[2], { fin: true, masked: true }),
+  ]);
+  h.client.feedSliced(clientStream, 777);
+  assert.ok(h.toUpstream.binary().equals(Buffer.concat(parts)));
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: every frame toward the container is masked (websockify rejects unmasked)", () => {
+  const h = makeBridge("control");
+  handshake(h);
+  h.client.feed(encodeClientFrame(OP_BINARY, bigPayload(70_000)));
+  assert.ok(h.upstream.writes.length > 0);
+  for (const w of h.upstream.writes) assert.ok((w[1] & 0x80) !== 0, "mask bit set");
+  for (const w of h.client.writes) assert.equal(w[1] & 0x80, 0, "browser frames unmasked");
+});
+
+test("bridge: frame declaring more than the cap closes the bridge cleanly, without buffering it", () => {
+  const h = makeBridge("view");
+  handshake(h);
+  const header = Buffer.alloc(10);
+  header[0] = 0x80 | OP_BINARY;
+  header[1] = 127;
+  header.writeUInt32BE(33 * 1024 * 1024, 6); // > default 32 MB
+  h.upstream.feed(header);
+  assert.deepEqual(h.closes, ["upstream-buffer-overflow"]);
+  assert.ok(h.client.destroyed && h.upstream.destroyed, "both sockets torn down");
+  // Further data is ignored, onClose fires once.
+  h.upstream.feed(Buffer.alloc(100));
+  assert.equal(h.closes.length, 1);
+});
+
+test("bridge: fragments accumulating past the cap close the bridge (client side)", () => {
+  const h = makeBridge("control", { maxBufferBytes: 64 * 1024 });
+  handshake(h);
+  const chunk = bigPayload(20 * 1024);
+  h.client.feed(frame(OP_BINARY, chunk, { fin: false, masked: true }));
+  h.client.feed(frame(OP_CONTINUATION, chunk, { fin: false, masked: true }));
+  h.client.feed(frame(OP_CONTINUATION, chunk, { fin: false, masked: true }));
+  assert.deepEqual(h.closes, []);
+  h.client.feed(frame(OP_CONTINUATION, chunk, { fin: false, masked: true }));
+  assert.deepEqual(h.closes, ["client-buffer-overflow"]);
+  assert.ok(h.client.destroyed && h.upstream.destroyed);
+});
+
+test("bridge: pre-splice deferred payload is capped too", () => {
+  const h = makeBridge("view", { maxBufferBytes: 64 * 1024 });
+  // Browser finishes its handshake, upstream never does: further browser data
+  // is deferred, and must not grow without bound.
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from(RFB_VERSION)));
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
+  for (let i = 0; i < 4 && h.closes.length === 0; i++) {
+    h.client.feed(encodeClientFrame(OP_BINARY, bigPayload(30 * 1024)));
+  }
+  assert.deepEqual(h.closes, ["client-buffer-overflow"]);
+});
+
+test("bridge: view-only still drops input when RFB messages are split across frames and chunks", () => {
+  const h = makeBridge("view");
+  handshake(h);
+  const fbur = Buffer.from([3, 1, 0, 0, 0, 0, 6, 64, 3, 132]);
+  const key = Buffer.from([4, 1, 0, 0, 0, 0x41, 0, 0].slice(0, 6)); // KeyEvent
+  const pointer = Buffer.from([5, 1, 0, 10, 0, 20]);
+  const cut = Buffer.concat([Buffer.from([6, 0, 0, 0, 0, 0, 0, 5]), Buffer.from("hello")]);
+  const fence = Buffer.from([248, 0, 0, 0, 0, 0, 0, 1, 2, 0xaa, 0xbb]); // ClientFence, 2-byte payload
+  const ecu = Buffer.from([150, 1, 0, 0, 0, 0, 6, 64, 3, 132]); // EnableContinuousUpdates
+  const qemuKey = Buffer.from([255, 0, 0, 1, 0, 0, 0, 0x41, 0, 0, 0, 30]);
+  const resize = Buffer.concat([Buffer.from([251, 0, 7, 128, 4, 56, 1, 0]), Buffer.alloc(16)]);
+
+  // One WS message with everything, delivered in 1-byte TCP slices.
+  const all = Buffer.concat([fbur, key, fence, pointer, ecu, cut, qemuKey, resize, fbur]);
+  h.client.feedSliced(encodeClientFrame(OP_BINARY, all), 1);
+  // RFB messages split across WS message boundaries.
+  const tail = Buffer.concat([key, pointer, fbur]);
+  for (let i = 0; i < tail.length; i += 4) {
+    h.client.feed(encodeClientFrame(OP_BINARY, tail.subarray(i, i + 4)));
+  }
+  const forwarded = h.toUpstream.binary();
+  assert.ok(
+    forwarded.equals(Buffer.concat([fbur, fence, ecu, fbur, fbur])),
+    "only FBUR / fence / continuous-updates relayed; key, pointer, cut text, QEMU key, resize dropped",
+  );
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: bytes arriving with the upgrade (head) go through the decoders", () => {
+  const challenge = crypto.randomBytes(16);
+  const upHead = Buffer.concat([
+    encodeFrame(OP_BINARY, Buffer.concat([Buffer.from(RFB_VERSION), Buffer.from([1, 2])])),
+    encodeFrame(OP_BINARY, challenge).subarray(0, 5), // partial frame
+  ]);
+  const clientHead = encodeClientFrame(OP_BINARY, Buffer.from(RFB_VERSION));
+  const h = makeBridge("view", { upstreamHead: upHead, clientHead });
+  const up = h.toUpstream.binary();
+  assert.equal(up.subarray(0, 12).toString(), RFB_VERSION);
+  assert.deepEqual([...up.subarray(12)], [2], "head's security types were processed");
+  h.upstream.feed(encodeFrame(OP_BINARY, challenge).subarray(5));
+  assert.ok(h.toUpstream.binary().equals(vncDesResponse(PASSWORD, challenge)), "partial head frame completed");
+  const toBrowser = h.toClient.binary();
+  assert.equal(toBrowser.subarray(0, 12).toString(), RFB_VERSION, "client head answered");
+});
+
+test("bridge: browser frame with MASK=0 closes with protocol error 1002", () => {
+  const h = makeBridge("view");
+  handshake(h);
+  // Client->server frames must be masked; an unmasked frame is a protocol error.
+  h.client.feed(encodeFrame(OP_BINARY, Buffer.from("hello")));
+  assert.deepEqual(h.closes, ["client-mask-violation"]);
+  assert.ok(h.client.destroyed && h.upstream.destroyed);
+  const closeOut = h.client.writes.at(-1);
+  assert.ok(closeOut, "close frame written to browser");
+  // 1002 = Protocol Error
+  assert.equal(closeOut!.readUInt16BE(2), 1002);
+});
+
+test("bridge: upstream frame with MASK=1 closes with protocol error 1002", () => {
+  const h = makeBridge("view");
+  handshake(h);
+  // Server->client frames must not be masked; a masked upstream frame is a protocol error.
+  h.upstream.feed(encodeClientFrame(OP_BINARY, Buffer.from("hello")));
+  assert.deepEqual(h.closes, ["upstream-mask-violation"]);
+  assert.ok(h.client.destroyed && h.upstream.destroyed);
+  const closeOut = h.client.writes.at(-1);
+  assert.ok(closeOut, "close frame written to browser");
+  assert.equal(closeOut!.readUInt16BE(2), 1002);
+});
+
+test("bridge: browser backpressure pauses upstream at 8 MB and closes if still over 32 MB after 10 s", async () => {
+  const h = makeBridge("control");
+  handshake(h);
+
+  let paused = 0;
+  let writableLength = 0;
+  (h.client as any).write = (data: Buffer | string) => {
+    h.client.writes.push(Buffer.from(data));
+    writableLength += Buffer.byteLength(data as any);
+    return true;
+  };
+  Object.defineProperty(h.client, "writableLength", { get: () => writableLength, configurable: true });
+  (h.upstream as any).pause = () => { paused++; };
+  (h.upstream as any).resume = () => {};
+
+  const originalSetTimeout = global.setTimeout;
+  let closeTimerFn: (() => void) | null = null;
+  (global as any).setTimeout = (fn: any, ms?: number, ...args: any[]) => {
+    if (ms === 10_000) {
+      closeTimerFn = () => fn(...args);
+      return { unref() {} } as any;
+    }
+    return originalSetTimeout(fn, ms as any, ...args);
+  };
+
+  try {
+    // Push a large upstream message so the bridge writes to the browser and hits backpressure.
+    h.upstream.feed(encodeFrame(OP_BINARY, bigPayload(9 * 1024 * 1024)));
+    assert.ok(paused >= 1, "upstream paused when browser queue exceeded 8 MB");
+    assert.equal(closeTimerFn, null, "no close timer yet (queue below 32 MB)");
+
+    // Simulate queue growing over 32 MB.
+    writableLength = 33 * 1024 * 1024;
+    h.upstream.feed(encodeFrame(OP_BINARY, bigPayload(1024)));
+    assert.ok(closeTimerFn, "close timer scheduled when browser queue exceeded 32 MB");
+
+    // Still over 32 MB after timeout: bridge closes cleanly.
+    (closeTimerFn as () => void)();
+    assert.deepEqual(h.closes, ["client-backpressure-timeout"]);
+    assert.ok(h.client.destroyed && h.upstream.destroyed);
+  } finally {
+    (global as any).setTimeout = originalSetTimeout;
+  }
+});
+
+test("bridge: setMode demotes a live control session to view and restores control", () => {
+  const h = makeBridge("control");
+  handshake(h);
+  const key = Buffer.from([4, 1, 0, 0, 0, 0x41]);
+  const fbur = Buffer.from([3, 1, 0, 0, 0, 0, 6, 64, 3, 132]);
+
+  // Control: input forwarded.
+  h.client.feed(encodeClientFrame(OP_BINARY, key));
+  assert.ok(h.toUpstream.binary().equals(key), "key forwarded in control mode");
+
+  // Demote to view: input dropped, framebuffer requests still relayed.
+  h.bridge.setMode("view");
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.concat([key, fbur])));
+  assert.ok(h.toUpstream.binary().equals(fbur), "key dropped after demote, FBUR relayed");
+
+  // Restore control: input forwarded again.
+  h.bridge.setMode("control");
+  h.client.feed(encodeClientFrame(OP_BINARY, key));
+  assert.ok(h.toUpstream.binary().equals(key), "key forwarded again after restore");
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: setMode view->view is a no-op and view->control unblocks input", () => {
+  const h = makeBridge("view");
+  handshake(h);
+  const key = Buffer.from([4, 1, 0, 0, 0, 0x41]);
+  const fbur = Buffer.from([3, 1, 0, 0, 0, 0, 6, 64, 3, 132]);
+
+  h.client.feed(encodeClientFrame(OP_BINARY, key));
+  assert.equal(h.toUpstream.binary().length, 0, "key dropped in view mode");
+
+  h.bridge.setMode("view"); // no-op: filter already installed
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.concat([key, fbur])));
+  assert.ok(h.toUpstream.binary().equals(fbur), "still view-only after redundant setMode(view)");
+
+  h.bridge.setMode("control");
+  h.client.feed(encodeClientFrame(OP_BINARY, key));
+  assert.ok(h.toUpstream.binary().equals(key), "key forwarded after promote to control");
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: a view client sending an unknown RFB type terminates the bridge with 1002", () => {
+  const h = makeBridge("view");
+  handshake(h);
+  const key = Buffer.from([4, 1, 0, 0, 0, 0x41]);
+  // [99] (unknown) followed by a KeyEvent must not smuggle input through.
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.concat([Buffer.from([99, 0, 0, 0]), key])));
+  assert.deepEqual(h.closes, ["rfb-view-violation"]);
+  assert.ok(h.client.destroyed && h.upstream.destroyed, "both sockets torn down");
+  assert.equal(h.toUpstream.binary().length, 0, "no input reached the container");
+  const closeOut = h.client.writes.at(-1);
+  assert.ok(closeOut, "close frame written to browser");
+  assert.equal(closeOut!.readUInt16BE(2), 1002);
+});
+
+test("bridge: missed keepalive pong fails the bridge (ping-timeout)", async () => {
+  const h = makeBridge("view", { pingIntervalMs: 20 });
+  handshake(h);
+  await new Promise((r) => setTimeout(r, 90));
+  assert.ok(h.closes.includes("ping-timeout"), `expected ping-timeout, got ${JSON.stringify(h.closes)}`);
+  assert.ok(h.client.destroyed && h.upstream.destroyed);
+});
+
+test("bridge: a pong resets the keepalive watchdog", async () => {
+  const h = makeBridge("view", { pingIntervalMs: 50 });
+  handshake(h);
+  // First tick (50ms) sent pings and is awaiting a pong; answer from the browser.
+  await new Promise((r) => setTimeout(r, 70));
+  h.client.feed(encodeClientFrame(OP_PONG, Buffer.alloc(0)));
+  // Second tick (100ms) must not fail: the pong reset the flag.
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(h.closes.length, 0, "pong reset the watchdog, no failure at the second tick");
+  // Third tick (150ms) with no further pong: the watchdog fires.
+  await new Promise((r) => setTimeout(r, 60));
+  assert.ok(h.closes.includes("ping-timeout"), "watchdog still fires once pongs stop");
+});
+
+test("bridge: browser backpressure resumes upstream on drain below 8 MB", () => {
+  const h = makeBridge("control");
+  handshake(h);
+
+  let paused = 0;
+  let resumed = 0;
+  let writableLength = 0;
+  (h.client as any).write = (data: Buffer | string) => {
+    h.client.writes.push(Buffer.from(data));
+    writableLength += Buffer.byteLength(data as any);
+    return true;
+  };
+  Object.defineProperty(h.client, "writableLength", { get: () => writableLength, configurable: true });
+  (h.upstream as any).pause = () => { paused++; };
+  (h.upstream as any).resume = () => { resumed++; };
+
+  h.upstream.feed(encodeFrame(OP_BINARY, bigPayload(9 * 1024 * 1024)));
+  assert.ok(paused >= 1, "upstream paused");
+  writableLength = 1024;
+  h.client.emit("drain");
+  assert.ok(resumed >= 1, "upstream resumed after drain");
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: getStatus reports live mode, connected, and spliced state", () => {
+  const h = makeBridge("view");
+  assert.deepEqual(
+    h.bridge.getStatus(),
+    { mode: "view", connected: true, spliced: false },
+    "before the handshake: view, connected, not spliced",
+  );
+  handshake(h);
+  assert.deepEqual(
+    h.bridge.getStatus(),
+    { mode: "view", connected: true, spliced: true },
+    "after the handshake: spliced",
+  );
+  // setMode is reflected live: the status reads the installed filter.
+  h.bridge.setMode("control");
+  assert.equal(h.bridge.getStatus().mode, "control");
+  h.bridge.setMode("view");
+  assert.equal(h.bridge.getStatus().mode, "view");
+  // A view violation tears the bridge down: connected flips to false.
+  h.client.feed(
+    encodeClientFrame(OP_BINARY, Buffer.concat([Buffer.from([99, 0, 0, 0]), Buffer.from([4, 0, 0, 0, 85, 0])])),
+  );
+  assert.deepEqual(h.closes, ["rfb-view-violation"]);
+  assert.equal(h.bridge.getStatus().connected, false);
+});

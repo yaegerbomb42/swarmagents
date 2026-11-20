@@ -1,0 +1,768 @@
+import { z } from 'zod';
+import { CHARS_PER_TOKEN, estimateTokens } from '../core/tokens.js';
+import type { ContentBlock, Message } from '../providers/types.js';
+import { enforceBudget } from './budget-guard.js';
+import { pruneRules } from './prune-rules.js';
+import {
+  WORKING_STATE_HEADER,
+  analysisIn,
+  mergeWorkingState,
+  parseWorkingState,
+  renderWorkingState,
+  tombstonesIn,
+} from './working-state.js';
+
+/**
+ * Mathematical ceiling for the Living State Frame + Active Suffix (Slots 6–11).
+ * Combined with the Frozen System Prefix, the total prompt is strictly bounded <= 10,240 tokens.
+ */
+export const LSF_TOKEN_CEILING = 10_240;
+
+/**
+ * In-cycle context control (plan §3.6), upgraded to an Epoch-Locked Living State Frame (LSF):
+ * 1. Mid-epoch pruning/clearing ONLY executes when the characters removed exceed the KV-cache
+ *    miss amortization threshold (`minClearChars`), preventing single-block cache thrashing.
+ * 2. At `compactAt` (or LSF ceiling), full zero-threshold pruning + LSF folding execute together
+ *    in a single epoch transition, replacing Slot 7 (`messages[0].content[1]`) while keeping
+ *    Slot 6 (`messages[0].content[0]`) 100% byte-identical.
+ */
+export interface CompactionSettings {
+  clearAt: number;
+  keepToolResults: number;
+  compactAt: number;
+  keepTurns: number;
+  /** Clear only when at least this many tokens would go (default: MIN_CLEAR_TOKENS or clearAt/10). */
+  minClearTokens?: number;
+  /**
+   * The user's context budget (clamped to LSF_TOKEN_CEILING). The history never leaves
+   * manageContext above it.
+   */
+  budget?: number;
+  /** Text the fold keeps word for word (the think phase's analysis). */
+  pinned?: string;
+  /**
+   * Fraction of the effective budget at which to trigger a fold pre-emptively (default 0.75).
+   * Prevents the summary call from seeing a near-full context and deadlocking.
+   * Only applies when `budget` is set; otherwise `compactAt` is used directly.
+   */
+  compactAtFraction?: number;
+}
+
+/** A cache read's price as a share of an uncached input token (Anthropic and DeepSeek: 0.1). */
+const CACHED_PRICE = 0.1;
+/** The miss rate the configured thresholds are tuned for. */
+const BASELINE_MISS_RATE = 0.02;
+/** Turns of prior weight on the baseline, so a single early miss doesn't halve the thresholds. */
+const MISS_PRIOR_TURNS = 30;
+const MIN_THRESHOLD_SCALE = 0.5;
+
+/**
+ * Every provider cache miss re-sends the whole prompt, so a resident token costs
+ * `CACHED_PRICE + (1 - CACHED_PRICE) * missRate` per turn. When misses run above the baseline,
+ * scale the clear and fold thresholds down to keep that expected cost where it was tuned.
+ */
+export function missAwareSettings(
+  settings: CompactionSettings,
+  misses: number,
+  turns: number,
+): CompactionSettings {
+  const rate =
+    (misses + BASELINE_MISS_RATE * MISS_PRIOR_TURNS) / (Math.max(0, turns) + MISS_PRIOR_TURNS);
+  const perToken = (m: number) => CACHED_PRICE + (1 - CACHED_PRICE) * m;
+  const scale = Math.min(
+    1,
+    Math.max(MIN_THRESHOLD_SCALE, perToken(BASELINE_MISS_RATE) / perToken(rate)),
+  );
+  if (scale === 1) return settings;
+  return {
+    ...settings,
+    clearAt: Math.floor(settings.clearAt * scale),
+    compactAt: Math.floor(settings.compactAt * scale),
+  };
+}
+
+/** Below this a clear saves less than the cache miss it causes on the next turn. */
+export const MIN_CLEAR_TOKENS = 4_000;
+
+/** Tool results shorter than this are never worth clearing. */
+const MIN_CLEAR_CHARS = 1_000;
+const CLEARED_PREFIX = '[cleared by omnexx:';
+const MIN_TURNS_TO_COMPACT = 2;
+
+export const cycleSummarySchema = z.object({
+  done: z.array(z.string().max(300)).max(30),
+  inProgress: z.string().max(600),
+  filesTouched: z.array(z.string().max(200)).max(60),
+  lastError: z.string().max(1_000).optional(),
+  nextStep: z.string().max(600),
+  /** Unfinished items of the agent's `todo` checklist, as "[status] text". */
+  openTodos: z.array(z.string().max(220)).max(30).optional(),
+  /** Choices made and why, one line each. */
+  decisions: z.array(z.string().max(300)).max(20).optional(),
+  /** Approaches that failed and must not be repeated, one line each. */
+  failed: z.array(z.string().max(400)).max(20).optional(),
+  /** "path — what matters about it now" (not its contents). */
+  keyFiles: z.array(z.string().max(300)).max(60).optional(),
+});
+export type CycleSummary = z.infer<typeof cycleSummarySchema>;
+
+/**
+ * Staged fallback: when the whole-head summarize overflows, split the head into halves,
+ * summarize oldest-first, and merge. If a half also fails, fall back to factSummary for it.
+ * Guarantees at most 3 total summarize invocations (1 failed whole-head + 2 chunk calls).
+ */
+export async function stagedSummary(
+  head: readonly Message[],
+  prior: CycleSummary | undefined,
+  summarize: Summarize,
+): Promise<CycleSummary | undefined> {
+  const mid = Math.floor(head.length / 2);
+  if (mid === 0) return undefined;
+  const chunks = [head.slice(0, mid), head.slice(mid)];
+  let merged: CycleSummary | undefined = prior;
+  for (const chunk of chunks) {
+    let s: CycleSummary | undefined;
+    try {
+      s = await summarize(chunk, merged);
+    } catch {
+      s = factSummary(chunk);
+    }
+    if (s) merged = mergeWorkingState(merged, s);
+  }
+  return merged;
+}
+
+/** Roughly what a vision model charges for one image, whatever its base64 length. */
+const IMAGE_TOKENS = 1_500;
+
+export function contextTokens(messages: readonly Message[]): number {
+  let images = 0;
+  const text = JSON.stringify(messages, (_k, v: unknown) => {
+    if (v && typeof v === 'object' && (v as { type?: unknown }).type === 'image') {
+      images++;
+      return undefined;
+    }
+    return v;
+  });
+  return estimateTokens(text) + images * IMAGE_TOKENS;
+}
+
+/** `[exit 1, 812ms, log cmd-3-2]` at the top of a bash result names the log that keeps it whole. */
+const LOG_ID = /^\[[^\]\n]*\blog ([\w.-]+)\]/;
+
+/** How to get a cleared result back: the bash log when there is one, else the same call again. */
+export function clearedStub(
+  content: string,
+  call: { name: string; input: unknown } | undefined,
+): string {
+  const log = LOG_ID.exec(content)?.[1];
+  const what = call ? `${call.name} ${clip(JSON.stringify(call.input), 160)}` : 'a tool call';
+  const back = log ? `read_log id="${log}" has it all` : 'repeat the call if you still need it';
+  return `${CLEARED_PREFIX} ${content.length} chars of old output from ${what}; ${back}]`;
+}
+
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+/**
+ * Provider errors that mean the summarize input itself did not fit the model's context window
+ * (Anthropic: "prompt is too long"; OpenAI: "maximum context length"; Claude Code:
+ * "conversation too long"). Only these trigger the staged chunk-and-merge fallback; an
+ * unrelated failure (network, auth) must still surface as `compact_failed`.
+ */
+const OVERFLOW_ERROR = /too long|context length|context window|max(imum)? tokens|overflow|exceed/i;
+
+export function isOverflowError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  return OVERFLOW_ERROR.test(msg);
+}
+
+/**
+ * Replace the content of all but the newest `keep` tool results that are large, with a note that
+ * names the call and how to get the data back. Every clear rewrites earlier messages and so
+ * costs a prompt-cache miss: unless at least `minChars` would go, nothing is cleared.
+ * Returns new messages; the input is not mutated.
+ */
+export function clearOldToolResults(
+  messages: readonly Message[],
+  keep: number,
+  minChars = 0,
+): { messages: Message[]; cleared: number; chars: number } {
+  const positions: [number, number][] = [];
+  const calls = new Map<string, { name: string; input: unknown }>();
+  messages.forEach((m, i) => {
+    m.content.forEach((b, j) => {
+      if (b.type === 'tool_result') positions.push([i, j]);
+      else if (b.type === 'tool_use') calls.set(b.id, { name: b.name, input: b.input });
+    });
+  });
+  const clearable = (b: ContentBlock) =>
+    b.type === 'tool_result' &&
+    b.content.length >= MIN_CLEAR_CHARS &&
+    !b.content.startsWith(CLEARED_PREFIX);
+  const old = new Set<string>();
+  let total = 0;
+  for (const [i, j] of positions.slice(0, Math.max(0, positions.length - keep))) {
+    const b = messages[i]?.content[j];
+    if (b?.type !== 'tool_result' || !clearable(b)) continue;
+    old.add(String([i, j]));
+    total += b.content.length;
+  }
+  if (!old.size || total < minChars) return { messages: [...messages], cleared: 0, chars: 0 };
+  const out = messages.map((m, i) => {
+    if (!m.content.some((_, j) => old.has(String([i, j])))) return m;
+    const content = m.content.map((b, j): ContentBlock => {
+      if (b.type !== 'tool_result' || !old.has(String([i, j]))) return b;
+      return { ...b, content: clearedStub(b.content, calls.get(b.toolUseId)) };
+    });
+    return { ...m, content };
+  });
+  return { messages: out, cleared: old.size, chars: total };
+}
+
+const SUPERSEDED_PREFIX = '[superseded by omnexx:';
+/** Results shorter than this aren't worth a cache miss to stub. */
+const MIN_SUPERSEDE_CHARS = 400;
+
+interface CallInfo {
+  name: string;
+  input: Record<string, unknown>;
+}
+
+const field = (input: Record<string, unknown>, k: string): unknown => input[k];
+const lineOf = (input: Record<string, unknown>, k: string): number | undefined => {
+  const v = field(input, k);
+  return typeof v === 'number' ? v : undefined;
+};
+
+/** Does a later read cover an earlier one: same file, and the whole file or a wider range. */
+function covers(later: Record<string, unknown>, earlier: Record<string, unknown>): boolean {
+  if (field(later, 'path') !== field(earlier, 'path')) return false;
+  const ls = lineOf(later, 'start');
+  const le = lineOf(later, 'end');
+  if (ls === undefined && le === undefined) return true;
+  const es = lineOf(earlier, 'start');
+  const ee = lineOf(earlier, 'end');
+  if (es === undefined || ee === undefined) return false;
+  return (ls ?? 1) <= es && le !== undefined && le >= ee;
+}
+
+/** Are two grep/glob inputs identical (every field, key order ignored)? */
+function sameSearchInput(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  const norm = (x: Record<string, unknown>) =>
+    JSON.stringify(
+      Object.keys(x)
+        .sort((p, q) => p.localeCompare(q))
+        .map((k) => [k, x[k]]),
+    );
+  return norm(a) === norm(b);
+}
+
+/**
+ * Does a later edit/write_file invalidate an earlier read, and is there a later read that
+ * restores the file's contents? A read becomes stale when a later edit/write_file of the same
+ * path is followed by a later read of that path (any range), but keep it if no later read exists.
+ */
+function readSupersededByEditThenRead(
+  path: unknown,
+  later: readonly { call: CallInfo }[],
+): boolean {
+  if (path === undefined) return false;
+  let sawEdit = false;
+  for (const { call: c } of later) {
+    if ((c.name === 'edit' || c.name === 'write_file') && field(c.input, 'path') === path)
+      sawEdit = true;
+    else if (sawEdit && c.name === 'read' && field(c.input, 'path') === path) return true;
+  }
+  return false;
+}
+
+/** Normalize a bash command for comparison: trim and collapse internal whitespace. */
+function normCmdEq(a: unknown, b: unknown): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  return a.trim().replace(/\s+/g, ' ') === b.trim().replace(/\s+/g, ' ');
+}
+
+interface OrderEntry {
+  at: [number, number];
+  call: CallInfo;
+  isError: boolean;
+  size: number;
+  done: boolean;
+}
+
+/**
+ * Stub tool results that later steps made dead weight: a file read again later (same lines or
+ * the whole file), a read invalidated by an edit then re-read, and a command that failed and then
+ * passed. Deterministic and free; the call and its result stay paired, so every provider accepts
+ * the history. Returns new messages.
+ */
+function collectCalls(messages: readonly Message[]): Map<string, CallInfo> {
+  const calls = new Map<string, CallInfo>();
+  for (const m of messages)
+    for (const b of m.content)
+      if (b.type === 'tool_use')
+        calls.set(b.id, {
+          name: b.name,
+          input:
+            typeof b.input === 'object' && b.input !== null
+              ? (b.input as Record<string, unknown>)
+              : {},
+        });
+  return calls;
+}
+
+function collectOrder(messages: readonly Message[], calls: Map<string, CallInfo>): OrderEntry[] {
+  const order: OrderEntry[] = [];
+  messages.forEach((m, i) => {
+    m.content.forEach((b, j) => {
+      if (b.type !== 'tool_result') return;
+      const call = calls.get(b.toolUseId);
+      if (!call) return;
+      order.push({
+        at: [i, j],
+        call,
+        isError: b.isError === true,
+        size: b.content.length,
+        done: b.content.startsWith(SUPERSEDED_PREFIX) || b.content.startsWith(CLEARED_PREFIX),
+      });
+    });
+  });
+  return order;
+}
+
+function readReason(r: OrderEntry, later: readonly OrderEntry[]): string | undefined {
+  if (later.some((l) => l.call.name === 'read' && covers(l.call.input, r.call.input)))
+    return `${String(field(r.call.input, 'path'))} was read again later`;
+  if (readSupersededByEditThenRead(field(r.call.input, 'path'), later))
+    return `${String(field(r.call.input, 'path'))} was edited and read again later`;
+  return undefined;
+}
+
+function bashReason(r: OrderEntry, later: readonly OrderEntry[]): string | undefined {
+  const command = field(r.call.input, 'command');
+  if (typeof command !== 'string') return undefined;
+  const reruns = later.filter(
+    (l) => l.call.name === 'bash' && normCmdEq(field(l.call.input, 'command'), command),
+  );
+  if (!reruns.length) return undefined;
+  const shown = clip(command, 60);
+  if (r.isError && reruns.some((l) => !l.isError))
+    return `\`${shown}\` failed here and passed later`;
+  return `\`${shown}\` ${r.isError ? 'failed' : 'passed'} here and ran again later`;
+}
+
+function searchReason(r: OrderEntry, later: readonly OrderEntry[]): string | undefined {
+  return later.some(
+    (l) => l.call.name === r.call.name && sameSearchInput(l.call.input, r.call.input),
+  )
+    ? `later identical ${r.call.name}`
+    : undefined;
+}
+
+function supersededReason(r: OrderEntry, later: readonly OrderEntry[]): string | undefined {
+  if (r.call.name === 'read') return readReason(r, later);
+  if (r.call.name === 'bash') return bashReason(r, later);
+  if (r.call.name === 'grep' || r.call.name === 'glob') return searchReason(r, later);
+  return undefined;
+}
+
+function applyStubs(messages: readonly Message[], stubs: Map<string, string>): Message[] {
+  return messages.map((m, i) => {
+    if (!m.content.some((_, j) => stubs.has(`${i}|${j}`))) return m;
+    return {
+      ...m,
+      content: m.content.map((b, j): ContentBlock => {
+        const stub = stubs.get(`${i}|${j}`);
+        return stub && b.type === 'tool_result' ? { ...b, content: stub } : b;
+      }),
+    };
+  });
+}
+
+export function pruneSuperseded(messages: readonly Message[]): {
+  messages: Message[];
+  pruned: number;
+  chars: number;
+} {
+  const order = collectOrder(messages, collectCalls(messages));
+  const stubs = new Map<string, string>();
+  let chars = 0;
+
+  order.forEach((r, k) => {
+    if (r.done || r.size < MIN_SUPERSEDE_CHARS) return;
+    const why = supersededReason(r, order.slice(k + 1));
+    if (!why) return;
+    stubs.set(`${r.at[0]}|${r.at[1]}`, `${SUPERSEDED_PREFIX} ${why}]`);
+    chars += r.size;
+  });
+
+  if (!stubs.size) return { messages: [...messages], pruned: 0, chars: 0 };
+  return { messages: applyStubs(messages, stubs), pruned: stubs.size, chars };
+}
+/**
+ * Split after the first message into the part to summarize and the recent tail to keep. The tail
+ * starts at an assistant message so every tool_use keeps its tool_result. Undefined when fewer
+ * than two turns are old enough to summarize.
+ */
+export function splitForCompaction(
+  messages: readonly Message[],
+  keepTurns: number,
+): { head: Message[]; tail: Message[] } | undefined {
+  const assistants = messages.flatMap((m, i) => (m.role === 'assistant' && i > 0 ? [i] : []));
+  const cut = assistants[assistants.length - keepTurns];
+  // At least two old turns, so a compaction is never redone on the very next turn.
+  if (cut === undefined || assistants.indexOf(cut) < MIN_TURNS_TO_COMPACT) return undefined;
+  return { head: messages.slice(1, cut), tail: messages.slice(cut) };
+}
+
+/** Plain-text transcript of the turns being summarized, each block capped so the input stays bounded. */
+export function transcriptFor(messages: readonly Message[], maxBlockChars = 2_000): string {
+  const cap = (s: string) =>
+    s.length > maxBlockChars ? `${s.slice(0, maxBlockChars)}… [${s.length} chars]` : s;
+  const lines: string[] = [];
+  for (const m of messages) {
+    for (const b of m.content) {
+      if (b.type === 'text') lines.push(`${m.role}: ${cap(b.text)}`);
+      else if (b.type === 'tool_use')
+        lines.push(`tool call ${b.name}: ${cap(JSON.stringify(b.input))}`);
+      else if (b.type === 'tool_result')
+        lines.push(`tool result${b.isError ? ' (error)' : ''}: ${cap(b.content)}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+const clipTo = (v: unknown, n: number): string | undefined =>
+  typeof v === 'string' ? v.slice(0, n) : undefined;
+const listOf = (v: unknown, items: number, chars: number): string[] =>
+  (Array.isArray(v) ? v : typeof v === 'string' ? [v] : [])
+    .flatMap((x: unknown) => (typeof x === 'string' ? [x.slice(0, chars)] : []))
+    .slice(0, items);
+
+/**
+ * Weak models overshoot the limits (31 items, a long line) or send a list as one string. Clip
+ * to the schema instead of throwing the whole compaction away; undefined only when it is unusable.
+ */
+export function coerceSummary(input: unknown): CycleSummary | undefined {
+  if (typeof input !== 'object' || input === null) return undefined;
+  const o = input as Record<string, unknown>;
+  const inProgress = clipTo(o.inProgress, 600);
+  const nextStep = clipTo(o.nextStep, 600);
+  if (inProgress === undefined && nextStep === undefined) return undefined;
+  const lastError = clipTo(o.lastError, 1_000);
+  const todos = listOf(o.openTodos, 30, 220);
+  const decisions = listOf(o.decisions, 20, 300);
+  const failed = listOf(o.failed, 20, 400);
+  const keyFiles = listOf(o.keyFiles, 60, 300);
+  const r = cycleSummarySchema.safeParse({
+    done: listOf(o.done, 30, 300),
+    inProgress: inProgress ?? '',
+    filesTouched: listOf(o.filesTouched, 60, 200),
+    nextStep: nextStep ?? '',
+    ...(lastError ? { lastError } : {}),
+    ...(todos.length ? { openTodos: todos } : {}),
+    ...(decisions.length ? { decisions } : {}),
+    ...(failed.length ? { failed } : {}),
+    ...(keyFiles.length ? { keyFiles } : {}),
+  });
+  return r.success ? r.data : undefined;
+}
+
+/**
+ * A summary from the transcript alone, for when the cheap model is unavailable or its answer is
+ * unusable: compacting with less is better than letting the context grow to the cycle cap.
+ * `ensureFacts` adds files, the last error and open todos on top.
+ */
+export function factSummary(head: readonly Message[]): CycleSummary {
+  const calls: string[] = [];
+  let lastText = '';
+  for (const m of head)
+    for (const b of m.content) {
+      if (b.type === 'tool_use') calls.push(`${b.name} ${clip(JSON.stringify(b.input), 200)}`);
+      else if (b.type === 'text' && m.role === 'assistant' && b.text.trim()) lastText = b.text;
+    }
+  return {
+    done: calls.slice(-30).map((c) => `called ${c}`.slice(0, 300)),
+    inProgress: (lastText.trim() || 'see the calls above').slice(0, 600),
+    filesTouched: [],
+    nextStep: 'Continue the task from where these calls left off.',
+  };
+}
+
+export function renderSummary(s: CycleSummary, pinned?: string, tombstones?: string[]): string {
+  return renderWorkingState(s, {
+    ...(pinned ? { analysis: pinned } : {}),
+    ...(tombstones?.length ? { tombstones } : {}),
+  });
+}
+
+const OPEN_TODOS_HEADER = 'Open todos (your todo list; send the whole list again to update it):';
+
+/**
+ * The unfinished items of the newest todo list in `head`: from the last `todo` call, else from
+ * an earlier compaction's summary (which holds them as text). Undefined when there is neither.
+ */
+export function openTodos(head: readonly Message[]): string[] | undefined {
+  for (let i = head.length - 1; i >= 0; i--) {
+    const blocks = head[i]?.content ?? [];
+    for (let j = blocks.length - 1; j >= 0; j--) {
+      const b = blocks[j];
+      if (b?.type === 'tool_use' && b.name === 'todo') {
+        const items = (b.input as { items?: unknown }).items;
+        if (!Array.isArray(items)) continue;
+        return items.flatMap((it: unknown) => {
+          const { text, status } = (it ?? {}) as { text?: unknown; status?: unknown };
+          return typeof text === 'string' && status !== 'done'
+            ? [`[${typeof status === 'string' ? status : 'pending'}] ${text}`.slice(0, 220)]
+            : [];
+        });
+      }
+      if (b?.type === 'text' && b.text.includes(OPEN_TODOS_HEADER)) {
+        const block = b.text.split(OPEN_TODOS_HEADER)[1]?.split('\n\n')[0] ?? '';
+        return block
+          .split('\n')
+          .filter((l) => l.startsWith('- '))
+          .map((l) => l.slice(2));
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The cheap model's summary must not lose what the next turn depends on: every file edited
+ * this cycle, the most recent error and the open todo items. Fill them in from the facts.
+ */
+export function ensureFacts(
+  s: CycleSummary,
+  head: readonly Message[],
+  edited: Iterable<string>,
+): CycleSummary {
+  const files = [...new Set([...s.filesTouched, ...edited])].slice(0, 60);
+  let lastError = s.lastError;
+  if (!lastError?.trim()) {
+    const errors = head.flatMap((m) =>
+      m.content.flatMap((b) => (b.type === 'tool_result' && b.isError ? [b.content] : [])),
+    );
+    const last = errors.at(-1);
+    if (last) lastError = last.slice(0, 1_000);
+  }
+  const todos = openTodos(head) ?? s.openTodos;
+  return {
+    ...s,
+    filesTouched: files,
+    ...(lastError ? { lastError } : {}),
+    ...(todos?.length ? { openTodos: todos.slice(0, 30) } : {}),
+  };
+}
+
+/**
+ * Slot 6 (`first.content[0]`) is the frozen cycle anchor. Slot 7 (`first.content[1]`) is the
+ * Living State Frame (LSF). `applySummary` replaces Slot 7 cleanly so Slot 6 never mutates.
+ */
+export function applySummary(first: Message, summary: string, tail: readonly Message[]): Message[] {
+  const slot6Block = first.content[0];
+  const content: ContentBlock[] = slot6Block
+    ? [slot6Block, { type: 'text', text: summary }]
+    : [{ type: 'text', text: summary }];
+  return [{ role: 'user', content }, ...tail];
+}
+
+/** Fold `head` (the turns since the last fold); `prior` is the working state they continue. */
+export type Summarize = (
+  head: readonly Message[],
+  prior?: CycleSummary,
+) => Promise<CycleSummary | undefined>;
+
+export type CompactionEvent =
+  | { kind: 'pruned'; pruned: number; chars: number; tokensBefore: number; tokensAfter: number }
+  | { kind: 'cleared'; cleared: number; chars: number; tokensBefore: number; tokensAfter: number }
+  | { kind: 'compacted'; turnsSummarized: number; tokensBefore: number; tokensAfter: number }
+  | { kind: 'compact_failed'; reason: string; tokens: number }
+  | { kind: 'digested'; digested: number; tokensBefore: number; tokensAfter: number };
+
+type Emit = (e: CompactionEvent) => void;
+
+/** After a fold, the kept tail is digested down to this share of the budget (newest turn spared). */
+export const SETTLE_FRACTION = 0.4;
+
+/** Default pre-limit trigger: fold when context reaches 75% of the effective budget. */
+const DEFAULT_COMPACT_FRACTION = 0.75;
+
+const minClearChars = (settings: CompactionSettings): number =>
+  (settings.minClearTokens ?? Math.min(MIN_CLEAR_TOKENS, settings.clearAt / 10)) * CHARS_PER_TOKEN;
+
+interface Step {
+  messages: Message[];
+  tokens: number;
+}
+
+/**
+ * Epoch-Aware Prune:
+ * Outside of a fold (`force = false`), NEVER mutate mid-history unless `chars >= minClearChars(settings)`.
+ * In the original code, `tokens > settings.clearAt` bypassed `minClearChars`, causing every single
+ * 400-char superseded read to rewrite mid-history and destroy the KV-cache on every turn.
+ */
+function prune(messages: Message[], settings: CompactionSettings, emit: Emit, force = false): Step {
+  const tokens = contextTokens(messages);
+  const s = pruneSuperseded(messages);
+  const r = pruneRules(s.messages, settings.keepTurns);
+  const chars = s.chars + r.chars;
+  const count = s.pruned + r.pruned;
+  if (!count || (!force && chars < minClearChars(settings))) {
+    return { messages, tokens };
+  }
+  const after = contextTokens(r.messages);
+  emit({ kind: 'pruned', pruned: count, chars, tokensBefore: tokens, tokensAfter: after });
+  return { messages: r.messages, tokens: after };
+}
+
+function clear(step: Step, settings: CompactionSettings, emit: Emit, force = false): Step {
+  if (!force && step.tokens <= settings.clearAt) return step;
+  const threshold = force ? MIN_CLEAR_CHARS : minClearChars(settings);
+  const r = clearOldToolResults(step.messages, settings.keepToolResults, threshold);
+  if (!r.cleared) return step;
+  const after = contextTokens(r.messages);
+  emit({
+    kind: 'cleared',
+    cleared: r.cleared,
+    chars: r.chars,
+    tokensBefore: step.tokens,
+    tokensAfter: after,
+  });
+  return { messages: r.messages, tokens: after };
+}
+
+/** Extract any existing Slot 7 Living State Frame text from `messages[0]`. */
+function extractPriorLsfText(currentFirst: Message | undefined, originalFirst: Message): string {
+  if (!currentFirst) return '';
+  // Look for any block containing WORKING_STATE_HEADER or blocks after Slot 6 (index 0).
+  const lsfBlocks = currentFirst.content.filter(
+    (b, idx) => b.type === 'text' && (idx > 0 || b.text.includes(WORKING_STATE_HEADER)),
+  );
+  if (lsfBlocks.length > 0) {
+    return lsfBlocks.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('\n\n');
+  }
+  const trailing = currentFirst.content.slice(originalFirst.content.length);
+  return trailing.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('\n\n');
+}
+
+/**
+ * Fold everything older than the last `keepTurns` turns into the Living State Frame (Slot 7),
+ * merged with `prior`. Executes zero-threshold pruning/clearing first since the fold rewrites
+ * the suffix anyway, costing zero extra KV-cache misses.
+ */
+async function fold(
+  step: Step,
+  first: Message,
+  settings: CompactionSettings,
+  summarize: Summarize,
+  emit: Emit,
+  effectiveBudget: number,
+): Promise<Message[]> {
+  // Piggyback free un-throttled prune + clear onto the fold epoch transition.
+  const preCleaned = clear(prune(step.messages, settings, emit, true), settings, emit, true);
+  const { messages: current, tokens } = preCleaned;
+
+  const split = splitForCompaction(current, settings.keepTurns);
+  if (!split) {
+    emit({ kind: 'compact_failed', reason: 'too few turns to compact', tokens });
+    return current;
+  }
+
+  const earlier = extractPriorLsfText(current[0], first);
+  const prior = parseWorkingState(earlier);
+  let summary: CycleSummary | undefined;
+  try {
+    summary = await summarize(split.head, prior);
+  } catch (err) {
+    // The summary call itself overflowed the summarizer's window (Claude Code #26317/#28728:
+    // /compact fails with "conversation too long" at the limit). Fall back to staged compaction:
+    // summarize oldest chunks first, then merge, so every call fits. Unrelated failures
+    // (network, auth) still surface as compact_failed.
+    const staged = isOverflowError(err)
+      ? await stagedSummary(split.head, prior, summarize)
+      : undefined;
+    if (!staged) {
+      emit({ kind: 'compact_failed', reason: (err as Error).message, tokens });
+      return current;
+    }
+    summary = staged;
+  }
+  if (!summary) {
+    emit({ kind: 'compact_failed', reason: 'no summary (budget or malformed answer)', tokens });
+    return current;
+  }
+
+  const pinned = settings.pinned?.trim() ? settings.pinned : analysisIn(earlier);
+  const merged = mergeWorkingState(prior, summary);
+  const state = renderSummary(merged, pinned, tombstonesIn(split.head));
+
+  const folded = applySummary(first, state, split.tail);
+  const settleTarget = Math.floor(effectiveBudget * SETTLE_FRACTION);
+  const next = enforceBudget(folded, settleTarget, true).messages;
+
+  emit({
+    kind: 'compacted',
+    turnsSummarized: split.head.filter((m) => m.role === 'assistant').length,
+    tokensBefore: tokens,
+    tokensAfter: contextTokens(next),
+  });
+  return next;
+}
+
+/**
+ * Before a turn:
+ * 1. Clamp the active budget to `LSF_TOKEN_CEILING` (10,240 tokens).
+ * 2. Run amortized `prune` and `clear` (only mutating mid-history if savings pay for the miss).
+ * 3. Trigger an LSF `fold` pre-emptively at `compactAtFraction` (default 0.75) of the budget,
+ *    or past `compactAt`, whichever comes first — so the summary call never sees a full window.
+ * 4. Enforce hard budget ceiling on the exit path.
+ */
+export async function manageContext(
+  messages: Message[],
+  first: Message,
+  settings: CompactionSettings,
+  summarize: Summarize | undefined,
+  emit: Emit,
+): Promise<Message[]> {
+  const budget = settings.budget ?? LSF_TOKEN_CEILING;
+  // Pre-limit trigger: with an explicit budget, fold at a fraction of it (default 0.75) so the
+  // summarizer is never handed a transcript at the window limit (the /compact deadlock).
+  const effectiveCompactAt =
+    settings.budget === undefined
+      ? settings.compactAt
+      : Math.min(
+          settings.compactAt,
+          Math.floor(budget * (settings.compactAtFraction ?? DEFAULT_COMPACT_FRACTION)),
+        );
+
+  const cleared = clear(prune(messages, settings, emit, false), settings, emit, false);
+  const current =
+    cleared.tokens > effectiveCompactAt && summarize
+      ? await fold(cleared, first, settings, summarize, emit, budget)
+      : cleared.messages;
+
+  if (settings.budget === undefined) {
+    return current;
+  }
+  const g = enforceBudget(current, settings.budget);
+  if (g.digested) {
+    emit({
+      kind: 'digested',
+      digested: g.digested,
+      tokensBefore: contextTokens(current),
+      tokensAfter: g.tokens,
+    });
+  }
+  return g.messages;
+}
+
+export {
+  formatMilestoneRecap,
+  foldMilestoneCheckpoint,
+  extractFilesTouched,
+  extractVerificationCommand,
+  type CheckpointMetadata,
+  type FoldResult,
+} from './milestone-compactor.js';

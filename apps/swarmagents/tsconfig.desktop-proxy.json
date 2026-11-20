@@ -1,0 +1,42 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "dom"],
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./*"]
+    },
+    "ignoreDeprecations": "6.0",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "noEmit": false,
+    "declaration": false,
+    "sourceMap": false,
+    "outDir": "dist/desktop-proxy",
+    "rootDir": "lib",
+    "types": ["node"]
+  },
+  "include": [
+    "lib/desktop-proxy/**/*.ts",
+    "lib/auth.ts",
+    "lib/safe-next.ts",
+    "lib/audit.ts",
+    "lib/vm/types.ts",
+    "lib/vm/docker-driver.ts",
+    "lib/vm/limits.ts",
+    "lib/vm/files.ts",
+    "lib/vm/manager.ts",
+    "lib/vm/desktop.ts",
+    "lib/vm/idle.ts",
+    "lib/vm/idle-sweeper.ts",
+    "lib/vm/quotas.ts",
+    "lib/vm/rw-lock.ts",
+    "lib/vm/fake-driver.ts",
+    "lib/vm/fake-claude.ts"
+  ],
+  "exclude": ["**/*.test.ts"]
+}

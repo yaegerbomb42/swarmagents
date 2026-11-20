@@ -1,0 +1,397 @@
+# Changelog
+
+## 1.0.0
+
+- **Omnexx Version 1.0.0 Launch**: Complete 71-step core engineering overhaul (Phases 0–9) and 6-subsystem frontier model audit.
+- **24/7 Autonomous Daemon**: Unattended daemon loop with discovery, triage, planner, executor, verifier, and shipper; live daemon control bar and queue view in VS Code extension.
+- **Enterprise Design System**: Single token layer (`tokens.css`), minimal charcoal surface palette, Context Inspector HUD, Terminal Pill with live pseudoterminal streaming, virtualized diff viewer, and sandbox scrubber.
+- **Resilient Multi-Model Runtime**: Wave-pipelined concurrency scheduler, provider KV-cache pinning (Anthropic 4-breakpoint budget, deterministic JSON serialization), MicroVM & path-jail sandboxing, and anti-doom-loop 2-strike rollbacks.
+- **SWE-bench Patch & Verification Engine**: Hardened patch diff generation (`git apply -p1` compatibility), nested file tracking, and bounded preflight diagnostics.
+
+## 0.22.0
+
+Extension 0.22.0 (extension now versioned with the CLI).
+
+- **Lazy tool discovery on by default** (#378, #358): a compact tool index is sent and full
+  definitions load on demand via `request_tools`. Opt out with `[tools] discovery = "full"`,
+  `--tool-discovery full`, or the VS Code "Lazy tool discovery" switch.
+- **Time-aware runs** (#359, #361, #362, #363, #365, #366, #372): `time.report` telemetry, a
+  volatile `# Clock` prompt block, time-budget enforcement at the action boundary, landing instead
+  of stopping, per-task estimates with overrun/replan signals, `max_cycles` scaling with
+  `max_hours`, and beyond rounds that use the remaining budget.
+- **Context:** evolved `pruneSuperseded` (−14% train / −23% held-out tokens, #374), milestone
+  compactor (#376), stable-prefix cache refinement (#380), cache prefix pinning (#357).
+- **Reliability:** anti-doom-loop ratchet (#375), acceptance contract gate (#373), dynamic
+  phase-based router (#377), run budget terminal states (#370), beyond rounds opt-in (#369),
+  read-only subagent sandbox (#368), quieter command output (#367), outline end-lines (#360).
+- **VS Code:** tabbed settings page (#364), UI polish (#381), grouped color-coded model picker
+  (#354), model chip opens Settings (#353).
+- Static review fixes (#352).
+
+## 0.21.1
+
+Extension 0.17.1.
+
+- **VS Code Extension & Marketplace Overhaul**:
+  - Refreshed marketplace descriptor: concise, high-impact overview of autonomous coding capabilities.
+  - Replaced screenshot with high-fidelity UI panel assets displaying live trajectory, real-time token/cost meters, model picker, and animated demo.
+  - Streamlined extension documentation with an immediate 3-step quickstart and mode comparison matrix (Plan, Act, Autonomous).
+- **Core Engine Fixes**:
+  - Fixed duplicate `program` assignment in CLI runner.
+  - Fixed duplicate `defaultSessionPool` import in supervisor.
+
+## 0.21.0
+
+Includes everything from the unpublished 0.20.0 tag. Extension 0.17.0.
+
+- **Long unattended runs:** provider failover and quota-aware routing (#330), bounded memory
+  growth for multi-day runs (#334), pre-limit staged compaction that cannot deadlock (#318),
+  pre-flight budget governor (#307), doom-loop breaker for repeated failing actions (#329).
+- **Context efficiency:** subagent context isolation with compact returns (#331), tool-output
+  compression with on-demand expansion (#319), stale file-read eviction (#316), speculative cache
+  (AST cache, prefix pinning, cache metrics).
+- **Verification:** autonomous self-verification loop with acceptance contract (#328),
+  verify-after-write atomic file semantics (#306), formal planner/executor contract (#304),
+  opt-in full-suite regression sentinel with bisect and auto-revert (#287), multi-phase session
+  rewind with file checkpoints (#305).
+- **Execution modes:** dual work domains (swe and general), hot-switchable execution modes and a
+  SWE-bench preset; hierarchical multi-agent swarm core (#285).
+- **CLI and VS Code:** screen-reader accessibility mode (#311), config migration wizard for other
+  agents (#310), keyboard shortcuts (#340), message navigation (#309), empty states (#308),
+  chat UI polish, browser diagnostics and visual diff (#286), status badge, `print --json`.
+- **Fixes:** 40+ reliability fixes, including chat process tree kill and queued sends on POSIX
+  (#342), `replace_lines` hash on multi-line ranges (#341), abort-signal loss in `realClock.sleep`
+  (#345), heartbeat clock (#344), shell-quoted check commands (#322), corrupt secrets backed up
+  instead of wiped (#323), file-lock waiter wakeups (#321), cyclic `dependsOn` rejected (#317),
+  Windows skill paths (#299), and the race conditions in ranking, freePort and workingTreeDiff.
+- **CI:** fast lanes, with affected tests on PRs and the sharded full suite on main and nightly (#347).
+
+## 0.19.0
+
+- **Token efficiency:** multi-file reads, bookkeeping outside the main loop, related tests before
+  the full suite, hung-call cutoffs, cache-miss detection and `prompt_cache_key`, first-call
+  budget, directory `outline`, test-output digests, right-sized think phase, conditional native
+  tools (`lazy_tools`, off by default), repo probe, `str_replace` recovery, token calibration,
+  superseding reruns, miss-aware fold thresholds, and review calls that reuse the worker cache.
+- **Beyond mode:** evidence-ranked improvement backlog (`core/evidence.ts`).
+- **Security:** `web_fetch` blocks private and metadata addresses on every redirect; redactor
+  covers Stripe and Hugging Face keys.
+- **`omnexx doctor`:** run health and configuration report.
+- **Bench:** efficiency columns and cache-miss breakdown in results.
+
+## 0.18.2
+
+- **Stop, pause and new messages act at once**: stop kills a running command too; pause cuts
+  the current step short and /resume carries on; a message sent while the agent works is
+  answered right away.
+- **Fix**: falling back to Ollama mid-chat failed with `invalid message content type: <nil>`.
+
+## 0.18.1
+
+- **No idling after a rate limit**: a provider cooling down after a 429 is still tried when it is
+  the only one (it could idle a run 4-5 minutes).
+- **Stops when done**: once the tests pass and the goal holds, the agent stops instead of
+  re-running tests, writing demos or scratch scripts, or updating notes.
+- **Commands never outlive the run**: the per-command cap follows the time left in the run.
+
+## 0.18.0
+
+- **Working state, never over budget**: stale reads, failed attempts and chatter are pruned as
+  they're superseded; near your Memory budget older turns fold into a concise working state
+  (goal, analysis verbatim, done steps, what didn't work, open items, key files). Memory goes
+  up to **1M** on models that support it.
+- **Fix: saved Agent settings no longer force the slow planner.** Every effort level used to
+  turn off the think-first loop; effort now caps milestones only when a plan is made.
+- **Fix: one rate limit no longer locks omnexx out** of its only model for minutes; benched
+  models are tried when nothing else can take the call.
+- **Fix: the cycle token cap counts cache reads at their real cost** (a tenth), so mostly-cached
+  sessions aren't cut off mid-fix; an unfinished fix for a review finding isn't accepted.
+- `cmd <<'EOF' … EOF` heredocs run (the body is passed as input).
+- Bench: `--quick` (5–10 minutes) and `npm run bench:watch` to watch runs live.
+
+## 0.17.0
+
+- **Chat keeps working when it runs out of room**: it summarizes the work so far and continues
+  (up to 3 times per message) instead of stopping at `max_tokens_per_cycle`.
+- **Several tool calls per turn** in chat, no re-reading lines it already saw, and search falls
+  back to the literal text for patterns like `test(`; clearer `replace_lines` errors and
+  `multi_edit` accepts common field names.
+- **Compact** (button and `/compact`) always compacts and says what it did.
+- **New chat** keeps the previous conversation in History.
+- **77 providers** (34 more: AI21, Baseten, Featherless, Chutes, Upstage, Reka, StepFun,
+  Volcengine Ark, Baidu Qianfan, iFlytek Spark, SenseNova, Ollama Cloud, Snowflake Cortex,
+  Databricks, Helicone, Martian, KoboldCpp, text-generation-webui, Llamafile, MLX-LM, SGLang,
+  Docker Model Runner, Lemonade, GPT4All and more).
+- **Settings**: a color per section, section chips to jump around, icons and one-line subtitles,
+  folding sections, every skill can be switched off, hidden or deleted, MCP servers show icons
+  and short descriptions, quiet "Saved ✓" instead of chat messages, and "Max reply length".
+
+## 0.16.0
+
+- **`read_symbol`**: one call returns a definition, the types in its signature (from any file)
+  and its callers and callees, instead of several searches and reads. Uses the TypeScript
+  language service when the repo has it, a fast fallback for TS/JS, Python, Go and Rust.
+- **Verified repo facts**: build, test, lint and typecheck commands that actually passed are
+  remembered per repo, tied to hashes of package.json, lockfiles and similar, marked unverified
+  when those change, and given to the agent in a short block. `omnexx facts`, `/facts`.
+- **Checks start early**: after the last edit, the checks run in the background while the model
+  is still writing; the verify step reuses the result when the code is unchanged.
+
+## 0.15.0
+
+- **Leaner search**: results grouped by file (path once), context only for a few matches, and
+  an overview of files and counts for wide searches; 30–90% fewer tokens per search.
+- **Cleaner command output**: no ANSI codes or spinner frames; passing tests, repeated lines
+  and dependency stack frames collapsed before trimming.
+- **Lazy MCP**: one small `mcp` tool lists your servers and loads a server's tools when needed,
+  so MCP tool definitions cost ~450 tokens per request instead of thousands, without breaking
+  the prompt cache.
+- **Smarter edits**: `read` can tag lines with 2-character hashes and `replace_lines` edits by
+  them; `str_replace` tolerates whitespace drift; the project's formatter runs after an edit;
+  new type and syntax errors come back in the edit result; "did you mean …?" for wrong paths.
+- **Recovery**: a doom-loop breaker rewinds to the best state when fixes oscillate or keep
+  making things worse, with a short note on what not to repeat; failures are sorted into
+  pre-existing, flaky, environment and real, and real ones come back as a compact packet; fixes
+  are remembered per repo.
+- **Fix**: New chat no longer overwrites the previous conversation in History.
+
+## 0.14.0
+
+- **Think-first loop**: small and medium goals run as one conversation that first analyses the
+  problem (framing, root causes, steps, how to verify), then works and fixes forward with the
+  checks after each pass, re-thinks when stuck, and gets one review at the end. Helper subagents
+  are off by default: one agent with the whole context.
+- **Agent settings** (`/settings`, the VS Code **Agent** card): effort per task 1–10 (quick MVP to
+  hours of work), effort per turn 1–10 (reasoning depth), context 5k–500k tokens, time wanted and
+  max tokens per turn; offered at launch until you choose "keep, don't ask again".
+- **Ranked models**: one list, click or drag to add and reorder, with Random, Rank priority or
+  Fallback on quota; per-role lists under Advanced. `/models` in the terminal.
+- **43 providers** in one catalog, and custom endpoints from just a URL and key (the API style,
+  `/v1` and models are detected, with clear errors). `/provider`, `omnexx providers catalog`.
+- **MCP made easy**: add from a gallery, the registry, a command, a URL (browser sign-in), pasted
+  JSON or an import from Claude/Cursor/VS Code/Windsurf; status, tools and token cost per server,
+  on/off and per-tool allow-lists. `/mcp`, `omnexx mcp gallery|enable|disable|allow|logs`.
+- **Context and skills**: see and edit everything sent (notes, pins, hide), with a budget bar;
+  every skill in one list with on/off, plus marketplaces (Anthropic's skills, any GitHub repo or
+  Claude plugin marketplace) to preview and install. `/context`, `/skills`.
+- Chat answers greetings briefly and asks for approval for actions outside the repo instead of
+  refusing them.
+
+## 0.13.0
+
+- **Zero-config Ollama**: on first run omnexx finds your local Ollama, picks the best installed
+  model that can call tools, gives it a 32k context and says what it chose; with no usable model
+  it offers to `ollama pull` one (a key in the terminal, a button in VS Code).
+- **Faster turns**: independent reads and searches run in parallel, and the model is asked to
+  batch its calls.
+- **Web and browser**: pages come back as clean markdown (often under a tenth of the raw HTML),
+  paged for long pages and cached per run; elements by visible text, label or role; a new
+  `check_page` reports a screenshot, console errors, overflow, overlaps and broken images.
+- **Spec-first tests** (opt-in, `review.spec_tests = auto|on`): acceptance tests written from the
+  goal alone run before a run may finish.
+- **Run estimates**: before a run (and when chat starts work on an approved plan), "est. ~3 min,
+  ~40k tokens, ~$0.02" from the most similar past runs, a range when unsure, "no history yet"
+  without any; then "~2 min left" as tasks finish. In `omnexx run`, the terminal chat's status
+  bar and the VS Code panel.
+
+## 0.12.0
+
+- **Chat proposes a plan** for vague or larger requests ("I looked at X. Plan: 1) … Go ahead?")
+  instead of asking a menu of questions; small clear requests are just done.
+- **Run from anywhere**: started in `/` or your home folder, a run gets its own new folder under
+  `~/omnexx-projects`.
+- **Fewer tokens and less time**: tools stay in the cached prompt prefix on Chat Completions
+  endpoints; no false rejections from coverage output or tests-only diffs; audit follow-up is
+  capped; coverage reports stay out of commits; ported tests aren't treated as deleted; every
+  edit counts as progress for the stuck signal; agent commands stop after 2 minutes by default.
+- Context inspector, chat history and response-time estimates for the VS Code panel.
+- Terminal chat: a calm one-line header (the animated character only with `OMNEXX_MASCOT=1`).
+
+## 0.11.3
+
+- Notes from a command ("started a git repository", "no tests configured") no longer show as red
+  errors in the chat view; only real failures do.
+- Tools take the argument names models use (`line_start`, `file_path`, `query`, …) and ignore
+  extras like `max_results` instead of failing the call.
+- An edit whose text appears more than once says on which lines, so the model can pick the one
+  it means instead of re-reading the file.
+
+## 0.11.2
+
+- **Search scopes itself**: files it can't read are skipped instead of failing the whole search;
+  dependency, build and cache folders are left out (and `Library`, `.config` and the like when
+  working in a home folder); at most 20 matches per file; a search that hits too much says
+  which folders the matches are in, so the next one can narrow.
+
+## 0.11.1
+
+- **Quieter chat**: thinking lines show the decision ("Let's list that path") instead of the
+  request the model restates every turn, and a repeated thought isn't printed again.
+- Tool lines say what they act on: "listing tools/apps" instead of "using list", an invented
+  tool name shows as the tool that ran, and an empty search reads "listing the files".
+
+## 0.11.0
+
+- **Guided autonomous runs**: `/autonomous` (or `/auto`) with nothing after it asks how long
+  (30 minutes to 24 hours, or type a time like `90m`), then what to work on; enter on an empty
+  line keeps improving the repo.
+- **Runs work without tests or git**: with no test command, each task's checks and the reviewer
+  decide what is kept (no more one-cycle limit); a folder that isn't a git repository is tracked
+  first (git init, a `.gitignore`, a first commit) so every change can be undone.
+
+## 0.10.0
+
+- **Fast path**: small goals get one pass on the whole goal, gated and reviewed like any cycle;
+  the planner takes over only if it doesn't get there (`[plan] mode = auto|fast|full`).
+- **Planning effort for long runs**: `--plan-helpers N` (planner helpers at once) and
+  `--plan-milestones N` (a cap the first plan is held to).
+- **Writing runs**: books, reports and research documents, no tests needed ("write me a book
+  about…" or `--kind writing`). An outline and a bible first, a task per chapter with word-count
+  and placeholder checks, an editor-style reviewer, and chapter summaries in the context map.
+- **Far fewer tokens** (head-to-head bench, same model as Cline and OpenHands): an early audit
+  skips padded milestones, the end audit judges only what was asked, the reviewer blocks only on
+  evidence, review findings are amended instead of redone, and committed `node_modules` is no
+  longer described file by file. Most bench tasks now take 8–19k fresh tokens, down from
+  63k–2.4M.
+- **Fewer tool slips**: a `list` tool; invented tool names (`print_tree`, `ls`, `cat`, `grep`…)
+  run the real tool; an empty search lists files; chat turns that circle are told once, then
+  stopped; dev servers run 20 s and are stopped for you; "Missing script" names the scripts that
+  exist.
+- **Clearer terminal**: your messages, tool use, thinking and errors each have their own look.
+- **Nimble judge** speaks Ollama's current systemone format. The planner falls back to the next
+  model when one keeps failing, and a stuck task asks for a different approach before switching
+  models.
+- **Bench**: Cline and OpenHands runners behind a metering proxy (`--endpoint PREFIX`).
+
+## 0.9.0
+
+- **Routing strategies per role**: priority, random, least busy (parallel helpers spread over
+  providers) or smart (most capable first), in `models.routing` or the editor.
+- **Leaner requests**: tool definitions are 22% smaller on every call (short skill and agent
+  lists; `skill` with name "list" shows them in full).
+- **Browser profiles and Camoufox**: `browser.profile` reuses a profile's logins (opt-in),
+  `browser.session_name` keeps the agent's own cookies between runs, and
+  `browser.engine = "camoufox"` drives the anti-detection Firefox through Playwright.
+- **Fewer wasted cycles** (found by the new benchmark): verify-only tasks with nothing to change
+  are done instead of retried until parked; re-reading a file after editing it no longer counts
+  as a loop; one cut-short attempt retries before the ladder climbs.
+- **Benchmark** (`npm run bench`): the jimmy10 suite with hidden checks; `--model` pins one free
+  model, `--context lean|full` compares context modes.
+
+## 0.8.0
+
+- **Leaner context.** Command output leads with the test outcome and is capped at ~3k tokens
+  (full log via `read_log`); results that later steps superseded (a file read again, a failure
+  that later passed) are pruned without a model call.
+- **Optional context sections** (`context.sections`): role, codemap, intent, lessons and progress
+  are each pinned, optional (listed with sizes, opened on demand) or hidden. The codemap is now
+  optional by default.
+- **Role card** per task, generated from the task and editable; `.omnexx/role.md` adds repo-wide
+  guidance.
+- **Model roles**: pick models per role (chat, planner, worker, quick jobs, helpers); parallel
+  helpers spread across providers (`models.helpers`, `models.spread_helpers`).
+- **Stalls handled.** A hung step is aborted after `stuck.max_silence` (45m) and retried; a run
+  where no model can take a call stops after `budget.max_provider_wait` (6h). `runs` and
+  `status` report health: working, quiet, waiting, stalled, dead.
+
+## 0.7.0
+
+- **Live browser view.** `browser.live_view` (on by default): after each page-changing browser
+  action omnexx saves a screenshot under the run's logs (never the repo) and emits
+  `browser.frame`, so the VS Code panel can show what the agent sees.
+- **Helpers in the panel.** `chat-server` reports each helper (subagent) starting and
+  finishing, with turns and cost, for the panel's Crew view.
+- `chat-server`: `testProvider`, and clearing a chat now waits for its notes to be archived.
+
+## 0.6.0
+
+- **Autonomous runs keep going.** With `run --for`, a stretch with no accepted commit no longer
+  stops the run to ask: the stalled task is parked (listed in the report) and the run moves on.
+  It still stops after `autonomous.max_idle_rounds` such recoveries in a row.
+- `omnexx chat-server`: the interactive session as JSON lines on stdin/stdout, for editor
+  panels. It powers the VS Code extension's new chat panel (extension 0.2.0), including adding
+  and removing providers and keys.
+- Chat sessions count their own tokens, turns and tool calls.
+
+## 0.5.0
+
+- `omnexx runs --json` and `omnexx plan --json` for editors and scripts.
+- **VS Code extension** (`vscode/`, not yet published): a runs sidebar with each run's live
+  milestones and tasks, Start Run, Autonomous for N Hours, Open Chat in Terminal, and Watch /
+  Pause / Resume / Stop per run.
+- **Autonomous mode.** `omnexx run --for 8h "<goal>"` (or `/autonomous 8h`) keeps improving the
+  repo until the time is up: improvement rounds with no round cap, each on the next focus area,
+  work blocked by a parked task skipped instead of stopping to ask.
+- **Context scopes.** A `context` tool the agent reads only when it helps: `general` (goal,
+  intent, lessons), `repo` (codebase map), `heat` (files changing most) and `recent`, each
+  capped, with notes the agent rewrites itself; repo notes carry over to later runs.
+- **Live todos.** Workers keep a checklist you can watch tick off in an attached run, and get one
+  reminder if they stop with items open.
+- **Connectors.** `omnexx connect` (or `/apps`): 26 free apps. Notion, Linear, Jira and
+  Confluence, GitLab, Sentry, Supabase, Stripe, Todoist and more sign in through the browser
+  (MCP OAuth); GitHub and Slack take a token; Google Workspace runs with your own Google client.
+- **Email over IMAP.** `omnexx connect email`: an address and an app password for Gmail,
+  Outlook, iCloud, Yahoo or Fastmail. Search, read and draft; sending only if you allow it.
+- **Ollama in one command.** `omnexx --ollama` connects a local Ollama and picks a coding
+  model; a first run with no provider connects a running Ollama by itself.
+- A planner model that never calls a tool now says so (it may not support tool calling)
+  instead of "could not produce a valid plan".
+- Installer: `curl -fsSL https://omnexx.org/install.sh | sh`.
+
+## 0.4.0
+
+- **Any provider, set up in one step.** 24 hosted providers by name (OpenAI, Gemini, xAI,
+  Mistral, DeepSeek, Groq, Cerebras, OpenRouter, Together, Fireworks, NVIDIA, Moonshot, Z.ai,
+  Qwen/DashScope, SiliconFlow, DeepInfra, Hugging Face, Perplexity, Cohere, Vercel AI Gateway,
+  GitHub Models, Novita, Hyperbolic, SambaNova), plus Anthropic and 6 local servers (Ollama,
+  LM Studio, vLLM, llama.cpp, LiteLLM, Jan). Paste a key, even inside a sentence ("my mistral
+  key is …"), and omnexx adds the provider; keys never reach a model. `/connect env` adopts the
+  keys already in your environment without copying them.
+- **First-run welcome**: connect a model, ask, review, in three steps.
+- **Model pool** (`/models`): tick any number of models; pick top-first, random (a daily
+  shuffle) or smart (a local Nimble model picks per action). Each model is used until it runs
+  out of quota, then the next; the quota ledger is per model and shared by every session.
+- **Earned done.** Every change gets an independent review before commit, and a run may only
+  finish after an audit against your "done when" list. Review runs on your worker models by
+  default (no paid model unless you configured one).
+- **runningContext**: a living note per task that every cycle starts from, archived when the
+  task is done.
+- **Chat**: plan mode, `/undo`, `--continue`, `omnexx -p` for scripts, custom slash commands
+  (`.omnexx/commands`, `.claude/commands`), image attachments, `/agents` to watch every run on
+  this machine, and Nex, the eye that follows your cursor.
+- **Memory and search**: lessons persist per repo across runs and chats; `semantic_search`
+  finds code by meaning.
+- **Runs**: a walkthrough per milestone, an optional PR at the end, Slack/Discord webhooks, a
+  hardened browser tool for multi-step web tasks.
+
+## 0.3.0
+
+- **Works like Claude Code.** Bare `omnexx` opens a chat that codes in your checkout: every
+  action shows as it happens (`▸ running test suite`, `▸ writing code to test.py`,
+  `▸ browsing alexa.com`, `thinking: …`), replies stream in, Esc stops a turn, and anything you
+  type while it works reaches it at its next step. A todo panel shows its checklist. `/model`,
+  `/compact`, `/diff` (an in-place diff viewer), `@file` completion, multi-line input, and
+  context use in the status bar. Long chats are trimmed and summarized automatically.
+- **Long unattended runs** with `/run <goal>` (or shift+tab): plan, then cycle on a branch until
+  your checks pass. Start from an empty folder and it sets up git, checks and `AGENTS.md`.
+- **Any model.** Paste an API key, `/connect <name|url> [key] [--name x]`, or `/setup` to have a
+  model add providers for you. `[models] chat` sets chat's model; OpenAI-compatible endpoints
+  stream, including reasoning.
+- **Browser checks.** `kind = "browser"` gates start your app on `$PORT` and fail blank pages
+  and uncaught JavaScript errors.
+- **Sturdier with weaker models** (found in unattended runs on free models): forgiving plan and
+  tool input, run-wide anti-cheat lessons, no split cascades, a request the provider always
+  rejects no longer wedges a run, and failed tool calls log why.
+- **Helpers and memory.** `task` runs read-only helper agents in parallel; `recall` searches the
+  whole run's history.
+- **Fix:** `omnexx run --budget/--hours/--gate/--model-worker/--sandbox/--push` were ignored by
+  the supervisor; they now apply for the whole run, including after `resume`.
+- Update notice in the TUI, at most one npm check a day (`OMNEXX_NO_UPDATE_CHECK=1` to turn off).
+
+## 0.2.0
+
+Docker sandbox, model escalation.
+
+## 0.1.0
+
+First release.

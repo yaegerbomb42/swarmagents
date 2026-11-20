@@ -1,0 +1,1253 @@
+import { FAST_TASK } from './fast-path.js';
+import { withoutVendored } from '../agent/codemap.js';
+import { loadRoleCard } from '../agent/sections.js';
+import { parseDuration } from '../config/duration.js';
+import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { z } from 'zod';
+import {
+  cycleSummarySchema,
+  coerceSummary,
+  ensureFacts,
+  factSummary,
+  transcriptFor,
+  type CycleSummary,
+} from '../agent/compaction.js';
+import { buildCycleContext } from '../agent/context.js';
+import { TurnBudgetAllocator } from '../agent/turn-budget.js';
+import { factsBlockFor } from './facts.js';
+import { briefInput, tokensPerTurnOf } from '../config/agent-settings.js';
+import { renderCodemap, type Codemap } from '../agent/codemap.js';
+import {
+  failureZoomEvidence,
+  readRunRepoMap,
+  repoMapEnabled,
+  refreshRunRepoMap,
+} from './repomap-slot.js';
+import { runAgentLoop, type LoopDeps } from '../agent/loop.js';
+import type { ResolvedModel } from '../providers/pricing.js';
+import { actAsThinkLoop, renderGateFailures, usesThinkLoop } from './think-loop-run.js';
+import { getWorkerPrompt } from '../agent/prompts.js';
+import { workModeOf } from '../config/work-mode.js';
+import { StateError } from '../errors.js';
+import { commitCheckpoint } from '../git/checkpoint.js';
+import { git } from '../git/git.js';
+import { commitMessage, headSha, isClean, workingTreeDiff } from '../git/repo.js';
+import { rollbackTo } from '../git/rollback.js';
+import { runCheck, runSentinel } from '../verify/sentinel.js';
+import { parseTrailers } from '../git/trailers.js';
+import { PathJail } from '../security/paths.js';
+import { burnThreshold, detectOscillation, InCycleWatch, isIdleCycle } from '../guard/stuck.js';
+import {
+  CONFIDENT_FALSE,
+  CONFIDENT_TRUE,
+  driftQuestion,
+  sameFailureQuestion,
+  toolSafetyQuestion,
+} from '../judge/uses.js';
+import {
+  buildToolIndexForPrompt,
+  buildToolListSync,
+  toolSpec,
+  workerTools,
+} from '../tools/registry.js';
+import { cycleRoute } from '../router/classify.js';
+import { readIntent } from '../agent/intent.js';
+import { ContractGate } from './contract.js';
+import type { ToolContext } from '../tools/types.js';
+import { antiCheat, type Violation as AntiCheatViolation } from '../verify/anticheat.js';
+import { blocking, renderFindings, reviewChange } from '../verify/review.js';
+import { runGatesWithFlakyCheck, type FlakyFinding } from '../verify/flaky.js';
+import { runGates, toBaseline } from '../verify/gates.js';
+import { failureSignature, judgeGate } from '../verify/ratchet.js';
+import { DoomLoopRatchet } from './doom-loop-ratchet.js';
+import { createKernelIfEnabled, mcpCapabilityRuntime } from '../runtime/kernel/index.js';
+import { createSystemOneIfEnabled } from '../runtime/system-one/index.js';
+import { getActiveMcpManager } from '../tools/extra/mcp.js';
+import { knownWindow } from '../providers/context-windows.js';
+import { readTextOr, writeFileAtomic } from './atomic.js';
+import { applyRemember, keepNewestNotes, renderNotes } from './notes.js';
+import { refreshCodemap } from './milestones.js';
+import { getNode, planCounts, type PlanNode } from './plan.js';
+import { foldPrompt } from './fold-prompt.js';
+import { MemoryHarness } from './memory/index.js';
+import { RunningContext } from './running-context.js';
+import { closeSession } from '../tools/extra/browser.js';
+import { subagentRunner } from '../agent/subagent.js';
+import type { PendingVerdict } from './run-store.js';
+import type { Run } from './run.js';
+import { tokenCalibrationFile } from './token-calibration.js';
+import { estimateTokens } from './tokens.js';
+import type { Message } from '../providers/types.js';
+
+const CHECK_TIMEOUT_MS = 10 * 60_000;
+/** Fast-path cycles show at most this many tokens of lessons, the newest first. */
+const FAST_NOTES_TOKENS = 1_000;
+
+/** Rejection reason for a cycle a budget cap cut short before it changed anything: not an attempt. */
+export const INTERRUPTED_BY_BUDGET = 'interrupted by a budget cap before the task finished';
+
+/**
+ * An in-cycle signal (cut short, hung) climbs the ladder only when it also cut the previous
+ * attempt short: once is a retry with the evidence, twice in a row is a pattern. Remembers it.
+ */
+function climbsNow(task: PlanNode, signal: string): boolean {
+  const again = task.lastCutShort === signal;
+  task.lastCutShort = signal;
+  return again;
+}
+
+const VERIFY_ONLY = /^(run|re-run|verify|confirm|check|ensure|validate|make sure|double-check)\b/i;
+
+/** A task that only asks to verify or run something, with nothing of its own to build. */
+export function verifyOnly(task: { title: string; kind: string }): boolean {
+  return task.kind === 'investigate' || VERIFY_ONLY.test(task.title.trim());
+}
+
+export interface CheckResult {
+  command: string;
+  pass: boolean;
+  output: string;
+}
+
+/** Run a task's acceptance checks (shell commands) in the worktree. All must exit 0. */
+export async function runChecks(run: Run, task: PlanNode, label: string): Promise<CheckResult[]> {
+  const out: CheckResult[] = [];
+  for (const [i, command] of task.checks.entries()) {
+    const r = await run.exec(command, {
+      cwd: run.worktree,
+      env: run.childEnv,
+      timeoutMs: Math.min(CHECK_TIMEOUT_MS, run.maxCmdTimeoutMs),
+      logPath: join(run.store.logsDir, `check-${label}-${i}.log`),
+      redact: (s) => run.redactor.text(s),
+      signal: run.signal,
+    });
+    out.push({
+      command,
+      pass: r.exitCode === 0 && !r.timedOut,
+      output: r.output.split('\n').slice(-20).join('\n'),
+    });
+  }
+  return out;
+}
+
+function gateRunCtx(run: Run, label: string) {
+  return {
+    exec: run.exec,
+    cwd: run.worktree,
+    env: run.childEnv,
+    logsDir: run.store.logsDir,
+    label,
+    maxCmdTimeoutMs: run.maxCmdTimeoutMs,
+    redact: (s: string) => run.redactor.text(s),
+    signal: run.signal,
+    runId: run.state.runId,
+  };
+}
+
+/**
+ * Tests that failed and then passed on a re-run: an event, plus a `flaky` lesson per new id so
+ * later cycles know not to chase them. A full lessons file just skips the note.
+ */
+async function recordFlaky(
+  run: Run,
+  task: PlanNode,
+  flaky: readonly FlakyFinding[],
+): Promise<void> {
+  let notes = await run.store.readNotes();
+  const today = new Date(run.clock.now()).toISOString().slice(0, 10);
+  for (const f of flaky) {
+    run.events.emit('verify.flaky', { task: task.id, gate: f.gate, ids: f.ids });
+    for (const id of f.ids) {
+      if (notes.some((n) => n.type === 'flaky' && n.text.includes(id))) continue;
+      const r = applyRemember(
+        notes,
+        {
+          action: 'add',
+          type: 'flaky',
+          text: `Flaky in gate ${f.gate} (failed, then passed on re-run): ${id}`.slice(0, 400),
+        },
+        run.config.context.notes_max_tokens,
+        today,
+      );
+      if (r.ok) notes = r.notes;
+    }
+  }
+  await run.store.writeNotes(notes);
+}
+
+/** Anti-cheat lessons, one per rule, phrased so they hold for every later task. */
+const ANTI_CHEAT_LESSON: Record<AntiCheatViolation['rule'], string> = {
+  'skip-marker':
+    'Never add @ts-ignore, eslint-disable, .skip or .only, not even in tests: the cycle is rejected even when every test passes. Fix the cause.',
+  'deleted-test': 'Never delete or rename away a test file: the cycle is rejected.',
+  'test-count-drop': 'The test count may never go down: the cycle is rejected.',
+  'snapshot-rewrite': 'Never rewrite snapshot files to make tests pass: the cycle is rejected.',
+  'protected-path':
+    'Never edit protected files (CI config, lockfiles, omnexx.toml, .env): the cycle is rejected.',
+};
+
+/**
+ * Task evidence keeps only the last few rejections, so an early anti-cheat rejection can scroll
+ * out and the agent repeats it. Each rule that fired becomes a run-wide lesson instead.
+ */
+async function recordAntiCheatLessons(
+  run: Run,
+  violations: readonly AntiCheatViolation[],
+): Promise<void> {
+  let notes = await run.store.readNotes();
+  const today = new Date(run.clock.now()).toISOString().slice(0, 10);
+  let changed = false;
+  for (const rule of new Set(violations.map((v) => v.rule))) {
+    const text = ANTI_CHEAT_LESSON[rule];
+    if (notes.some((n) => n.text === text)) continue;
+    const r = applyRemember(
+      notes,
+      { action: 'add', type: 'pitfall', text },
+      run.config.context.notes_max_tokens,
+      today,
+    );
+    if (r.ok) {
+      notes = r.notes;
+      changed = true;
+    }
+  }
+  if (changed) await run.store.writeNotes(notes);
+}
+
+/** Record which tests and errors already fail at the starting commit (plan §3.8). */
+export async function runBaseline(run: Run): Promise<void> {
+  const results = await runGates(run.config.gates, gateRunCtx(run, 'baseline'));
+  run.state.baseline = toBaseline(results);
+  run.state.initialBaseline ??= run.state.baseline;
+  await run.save();
+  run.events.emit('baseline', {
+    gates: results.map((r) => ({
+      gate: r.name,
+      exitCode: r.exitCode,
+      failures: r.failures.length,
+      tests: r.tests,
+    })),
+  });
+}
+
+async function loadCodemap(run: Run): Promise<string> {
+  // Flag-gated ranked repository map (REPOMAP_ENABLE=1); falls back to the codemap view.
+  if (repoMapEnabled()) {
+    const cached = await readRunRepoMap(run);
+    if (cached) return cached;
+    await refreshRunRepoMap(run);
+    const built = await readRunRepoMap(run);
+    if (built) return built;
+  }
+  const text = await readTextOr(run.store.file('codemap.json'), '');
+  if (!text) return '# Codebase map\n(not built yet; explore with search and outline)';
+  return renderCodemap(JSON.parse(text) as Codemap, run.config.context.repo_map_max_tokens);
+}
+
+/** PREPARE: the worktree must sit exactly on lastGreen with a clean tree before ACT. */
+export async function prepareWorktree(run: Run): Promise<void> {
+  const head = await headSha(run.worktree);
+  const clean = await isClean(run.worktree);
+  if (head === run.state.lastGreen && clean) return;
+  const patch = join(run.store.dir, 'salvage', `${run.state.cycle}.patch`);
+  await rollbackTo(
+    run.worktree,
+    run.state.lastGreen,
+    clean ? undefined : { path: patch, redact: (x) => run.redactor.text(x) },
+  );
+  run.events.emit('reconcile.salvage', {
+    head,
+    lastGreen: run.state.lastGreen,
+    dirty: !clean,
+    patch: clean ? undefined : patch,
+  });
+}
+
+/** Estimated tokens per segment of the cycle's starting context, in prefix order. */
+export function contextBreakdown(ctx: {
+  system: { text: string }[];
+  first: Message;
+  tools: unknown[];
+  labels?: string[];
+}): Record<string, number> {
+  const labels = ctx.labels ?? ['system', 'codemap', 'goal', 'notes'];
+  const out: Record<string, number> = { tools: estimateTokens(JSON.stringify(ctx.tools)) };
+  ctx.system.forEach((b, i) => {
+    out[labels[i] ?? `block${i}`] = estimateTokens(b.text);
+  });
+  out.state = estimateTokens(JSON.stringify(ctx.first));
+  return out;
+}
+
+export function toolContext(run: Run, edited: Set<string>): ToolContext {
+  let n = 0;
+  const { judge } = run;
+  const ctx: ToolContext = {
+    jail: run.sandbox ? run.sandbox.jail : new PathJail(run.worktree),
+    exec: run.exec,
+    ...(run.sandbox ? { sandbox: run.sandbox } : {}),
+    env: run.childEnv,
+    store: run.store,
+    events: run.events,
+    redactor: run.redactor,
+    policy: run.policy(),
+    cycle: run.state.cycle,
+    // Read live: the time left in the run shrinks while the cycle works, and one long command
+    // must never carry the run far past --hours (a stress script once added 20 minutes).
+    get maxCmdTimeoutMs(): number {
+      return run.maxCmdTimeoutMs;
+    },
+    notesMaxTokens: run.config.context.notes_max_tokens,
+    today: new Date(run.clock.now()).toISOString().slice(0, 10),
+    signal: run.signal,
+    nextCommandId: () => `cmd-${run.state.cycle}-${++n}`,
+    edited,
+    reads: new Map(),
+    contractGate: new ContractGate(run.worktree),
+    // Advisory, log-only, never awaited by the tool, skipped while the breaker is open.
+    ...(judge.enabled('tool_safety') && judge.breakerState !== 'open'
+      ? {
+          onBash: (command: string) => {
+            void judge
+              .ask('tool_safety', { command, task: run.state.taskId }, [toolSafetyQuestion])
+              .then((r) => {
+                const p =
+                  r.status === 'answered' && r.answers[0]?.type === 'noul'
+                    ? r.answers[0].probability
+                    : undefined;
+                if (p !== undefined && p >= CONFIDENT_TRUE)
+                  run.events.emit('judge.tool_flag', { command, probability: p });
+              });
+          },
+        }
+      : {}),
+  };
+  ctx.subagent = subagentRunner(run, ctx);
+  return ctx;
+}
+
+const SUMMARY_MAX_TOKENS = 2_000;
+/** One progress entry or evidence item is cut to this many chars before entering memory. */
+const MEMORY_ITEM_CHARS = 12_000;
+
+/** Cycles of token totals kept for the burn-rate median. */
+const CYCLE_TOKEN_HISTORY = 20;
+
+/** Cheap-model CycleSummary of the turns a compaction drops (plan §3.6). */
+async function summarizeCycle(
+  run: Run,
+  task: PlanNode,
+  head: readonly Message[],
+  prior?: CycleSummary,
+): Promise<CycleSummary | undefined> {
+  const prompt = foldPrompt(task, run.redactor.text(transcriptFor(head)), prior);
+  const done = await run.cheapComplete(
+    {
+      system: [{ text: 'You compress a coding agent transcript into a structured summary.' }],
+      tools: [
+        {
+          name: 'answer',
+          description: 'Submit the summary',
+          inputSchema: z.toJSONSchema(cycleSummarySchema),
+        },
+      ],
+      toolChoice: { type: 'tool', name: 'answer' },
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+      maxTokens: SUMMARY_MAX_TOKENS,
+      messageBreakpoints: [],
+    },
+    {
+      estimatedInputTokens: estimateTokens(prompt) + 400,
+      maxOutputTokens: SUMMARY_MAX_TOKENS,
+      role: 'cheap',
+      purpose: 'compaction',
+    },
+  );
+  const call = done?.res.content.find((b) => b.type === 'tool_use');
+  return coerceSummary(call?.type === 'tool_use' ? call.input : undefined);
+}
+
+/** ACT: zero-cost preflight on the task's checks, then the agent loop with a fresh context. */
+/** The reviewed attempt goes back on the tree so this one only fixes the findings. */
+async function applyAmend(run: Run, task: PlanNode): Promise<void> {
+  const patch = task.amendPatch;
+  if (!patch) return;
+  delete task.amendPatch;
+  const res = await git(run.worktree, ['apply', '--whitespace=nowarn', patch], {
+    allowFailure: true,
+  });
+  run.events.emit('amend.applied', { task: task.id, ok: res.exitCode === 0 });
+  if (res.exitCode !== 0) return;
+  const reviewOnly = task.lastRejection?.startsWith('review:') ?? false;
+  task.evidence = [
+    ...task.evidence,
+    reviewOnly
+      ? 'Your previous attempt is already applied to the working tree (uncommitted): its tests passed. Keep it, and change only what the review findings above ask for.'
+      : 'Your previous attempt is already applied to the working tree (uncommitted). Keep what works and fix what the evidence above says failed.',
+  ];
+}
+
+export async function stepAct(run: Run): Promise<void> {
+  run.newCycle();
+  const plan = run.requirePlan();
+  const task = getNode(plan, run.state.taskId ?? '');
+  await prepareWorktree(run);
+
+  // Checks that pass before the run has changed anything passed on the code the user wants
+  // changed, so they prove nothing: until the first accepted commit the agent looks for itself.
+  // A check every other task also uses (the whole test file) says nothing about this task, so
+  // the free skip needs at least one check of the task's own.
+  const shared = new Set(
+    plan.nodes.filter((n) => n.id !== task.id).flatMap((n) => n.checks.map((c) => c.trim())),
+  );
+  const ownCheck = task.checks.some((c) => !shared.has(c.trim()));
+  if (task.checks.length && task.attempts === 0 && run.state.acceptedCommits > 0 && ownCheck) {
+    const pre = await runChecks(run, task, `${run.state.cycle}-pre`);
+    if (pre.every((c) => c.pass)) {
+      run.events.emit('task.already_done', { task: task.id });
+      run.state.act = {
+        summary: 'acceptance checks already pass; no changes needed',
+        end: 'already-done',
+        turns: 0,
+        usd: 0,
+      };
+      await run.setPhase('verify');
+      return;
+    }
+  }
+
+  await applyAmend(run, task);
+  const edited = new Set<string>();
+  const toolCtx = toolContext(run, edited);
+  const running = new RunningContext(run.store, task.id, () => run.clock.now());
+  toolCtx.runningContext = running;
+  let editOps = 0;
+  toolCtx.onEdit = () => {
+    editOps++;
+  };
+  const runningText = await running.forPrompt();
+  const [goal, intent, notes, progressTail, codemap] = await Promise.all([
+    run.store.readGoal(),
+    readIntent(run.store),
+    run.store.readNotes(),
+    run.store.progressTail(run.config.context.progress_tail),
+    loadCodemap(run),
+  ]);
+
+  // Rank progress and evidence by salience within a token budget. Goal, plan and notes are
+  // already in the context, so the harness only reorders and trims what changes per cycle.
+  const memory = new MemoryHarness();
+  for (const entry of progressTail.split(/^(?=## Cycle \d+\n)/m).filter((e) => e.trim()))
+    memory.conversation.insert(entry.trim().slice(0, MEMORY_ITEM_CHARS));
+  for (const e of task.evidence.slice(-3)) memory.working.insert(e.slice(0, MEMORY_ITEM_CHARS));
+  memory.rescore();
+  const assembled = memory.assemble();
+
+  // One agent with the whole context: helper agents (`task`) only when `[context] subagents` is on.
+  // `recall` only once an earlier cycle left history to search.
+  const hasRecallableHistory =
+    notes.length > 0 || task.evidence.length > 0 || progressTail.trim().length > 0;
+  const exposureOpts = {
+    subagents: run.config.context.subagents,
+    hasHistory: hasRecallableHistory,
+    autoApprove: run.config.policy.auto_approve,
+    // The legacy `more_tools` deferral only applies in full mode; lazy discovery replaces it.
+    lazyTools: run.config.tools.discovery !== 'lazy' && run.config.context.lazy_tools,
+  };
+  const isLazyMode = run.config.tools.discovery === 'lazy';
+
+  // Compute the full tool list ONCE and reuse it.
+  const allTools = await workerTools(run.config, { repoRoot: run.worktree, env: run.deps.env });
+  const tools = buildToolListSync(allTools, run.config, exposureOpts, run.loadedToolsState);
+  const route = await run.router.pick(cycleRoute(task, run.budgetLeftFraction()));
+  const shownNotes = task.id === FAST_TASK ? keepNewestNotes(notes, FAST_NOTES_TOKENS) : notes;
+
+  // Build tool index for lazy mode with available tool names
+  const availableToolNames = isLazyMode ? new Set(allTools.map((t) => t.name)) : undefined;
+  const toolIndex =
+    isLazyMode && run.loadedToolsState
+      ? buildToolIndexForPrompt(run.loadedToolsState, availableToolNames)
+      : undefined;
+
+  // Failure-path zoom (REPOMAP_ENABLE=1): dependent call-path around the latest stack trace,
+  // as one extra volatile evidence item. Never persisted to the plan.
+  const zoom = await failureZoomEvidence(run, task.evidence);
+  const cycleEvidence = [...task.evidence.slice(-3), ...(zoom ? [zoom] : [])];
+
+  // Per-turn input budget: one deterministic plan per epoch (stable tools/system → no cache bust).
+  const tokensPerTurn = tokensPerTurnOf(run.config);
+  const budgetPlan =
+    tokensPerTurn !== undefined ? new TurnBudgetAllocator().planFor(tokensPerTurn) : undefined;
+
+  const ctx = buildCycleContext({
+    systemPrompt: getWorkerPrompt(workModeOf(run.config)),
+    codemap,
+    goal: goal.text,
+    intent,
+    notes: renderNotes(shownNotes),
+    plan,
+    task,
+    progressTail,
+    evidence: cycleEvidence,
+    ...(assembled.text ? { memory: assembled.text } : {}),
+    ...(runningText ? { runningContext: runningText } : {}),
+    role: await loadRoleCard(run.store, task, run.state.repoRoot),
+    sections: budgetPlan ? budgetPlan.sections : run.config.context.sections,
+    ...briefInput(run.config),
+    clock: (() => {
+      const elapsedMs = run.elapsedMs();
+      const remainingMs = Math.max(0, run.deadlineMs - elapsedMs);
+      const fmt = (ms: number): string =>
+        ms >= 60_000 ? `${(ms / 60_000).toFixed(1)}m` : `${Math.round(ms / 1000)}s`;
+      const counts = run.plan ? planCounts(run.plan) : undefined;
+      const left = run.budgetLeftFraction();
+      const pace = left >= 0.5 ? 'on pace' : left >= 0.2 ? 'tight' : 'behind';
+      const parts = [
+        `Elapsed ${fmt(elapsedMs)} of ${run.config.budget.max_hours}h`,
+        `${fmt(remainingMs)} left`,
+        counts ? `${counts.done} of ${counts.tasks} tasks done` : '',
+        run.lastCycleModelMs
+          ? `last cycle: ${fmt(run.lastCycleModelMs)} model, ${fmt(run.lastCycleToolMs)} tools`
+          : '',
+        `pace: ${pace}`,
+      ].filter(Boolean);
+      return `# Clock\n\n${parts.join(' · ')}`;
+    })(),
+    facts: await factsBlockFor(
+      run.deps.paths,
+      run.state.repoRoot,
+      run.worktree,
+      shownNotes.map((n) => n.text),
+    ),
+    tools: tools.map(toolSpec),
+    ...(toolIndex ? { toolIndex } : {}),
+  });
+
+  // Telemetry: tool discovery token savings (lazy mode only; full mode does no extra work).
+  const fullToolsTokens = isLazyMode ? estimateTokens(JSON.stringify(allTools.map(toolSpec))) : 0;
+  const lazyToolsTokens = isLazyMode ? estimateTokens(JSON.stringify(tools.map(toolSpec))) : 0;
+  const toolIndexTokens = toolIndex ? estimateTokens(toolIndex) : 0;
+  const omittedTokens = isLazyMode ? fullToolsTokens - lazyToolsTokens - toolIndexTokens : 0;
+
+  run.events.emit('cycle.context', {
+    task: task.id,
+    prefixBytes: ctx.system.reduce((n, b) => n + b.text.length, 0),
+    stateBytes: JSON.stringify(ctx.first).length,
+    tokens: contextBreakdown(ctx),
+    memory: memory.stats(),
+    toolDiscovery: isLazyMode
+      ? {
+          mode: 'lazy',
+          loadedGroups: run.loadedToolsState ? [...run.loadedToolsState.loadedGroups] : [],
+          fullToolsTokens,
+          lazyToolsTokens,
+          toolIndexTokens,
+          omittedTokens: Math.max(0, omittedTokens),
+        }
+      : { mode: 'full' },
+  });
+
+  // Emit tool.discovery event in lazy mode with detailed token savings
+  if (isLazyMode) {
+    run.events.emit('tool.discovery', {
+      fullToolsTokens,
+      lazyToolsTokens,
+      toolIndexTokens,
+      savedTokens: Math.max(0, omittedTokens),
+    });
+  }
+  const primaryModel = route.chain[0];
+  const modelRef = primaryModel ? `${primaryModel.provider}:${primaryModel.id}` : '';
+  const profileRef = primaryModel ? `${primaryModel.provider}:${primaryModel.alias}` : '';
+  const maxWindow =
+    (modelRef ? knownWindow(modelRef) : undefined) ??
+    run.config.models.profiles[profileRef]?.context ??
+    200_000;
+  const kernel = createKernelIfEnabled(
+    run.config,
+    run.worktree,
+    maxWindow,
+    undefined,
+    tokensPerTurn,
+  );
+  if (kernel) {
+    const mgr = getActiveMcpManager();
+    if (mgr) {
+      kernel.attachMcpRuntime(
+        mcpCapabilityRuntime(mgr, { repoRoot: run.worktree, env: process.env }),
+      );
+    }
+    void kernel.warm(tools.map((t) => ({ name: t.name, description: t.description })));
+  }
+
+  const kernelGoalText = kernel ? (await run.store.readGoal()).text : '';
+  const systemOne = createSystemOneIfEnabled(run.config, run.worktree, run.events, process.env);
+  const deps = (models: readonly ResolvedModel[]): LoopDeps => {
+    const base: LoopDeps = {
+      provider: run.deps.provider,
+      models,
+      providerBlocked: (p) => run.providerBlocked(p),
+      modelExhausted: (r) => run.modelExhausted(r),
+      markExhausted: (r) => {
+        run.markExhausted(r);
+      },
+      markRateLimited: (r, ms) => {
+        run.markRateLimited(r, ms);
+      },
+      strategy: run.strategy('worker'),
+      coolProvider: (p, ms) => {
+        run.coolProvider(p, ms);
+      },
+      tools,
+      toolCtx,
+      loadedToolsState: run.loadedToolsState,
+      budget: run.config.budget,
+      maxTokens: run.config.providers.anthropic.max_tokens,
+      ...(tokensPerTurn !== undefined ? { tokensPerTurn } : {}),
+      clock: run.clock,
+      events: run.events,
+      cacheKey: run.state.runId,
+      purpose: 'main',
+      taskId: () => run.state.taskId,
+      cycle: () => run.state.cycle,
+      taskBudget: run.taskBudget,
+      // Quotas gone or every provider down: stop after a while instead of waiting for ever.
+      retry: { giveUpAfterMs: parseDuration(run.config.budget.max_provider_wait) },
+      spentUsd: () => run.state.spend.usd,
+      spentTodayUsd: () => run.spentToday(),
+      onUsage: (u, usd, model, provider, meta) =>
+        run.addSpend(u, usd, model, 'worker', provider, meta),
+      onResponse: ({ ms }) => {
+        run.cycleModelMs += ms;
+      },
+      control: () => run.control(),
+      onPauseChange: (p) => {
+        run.paused = p;
+      },
+      signal: run.signal,
+      // Absolute deadline on run.clock: the loop compares it against clock.now().
+      deadlineMs: run.clock.now() + Math.max(0, run.deadlineMs - run.elapsedMs()),
+      calibrationFile: tokenCalibrationFile(run.deps.paths),
+      parallelTasks: run.config.context.subagent_parallel,
+      watch: new InCycleWatch(
+        {
+          repeatedToolCall: run.config.stuck.repeated_tool_call,
+          noEditTurns: run.config.stuck.no_edit_turns,
+          burnTokens: burnThreshold(run.state.cycleTokens, run.config.stuck.burn_factor),
+        },
+        () => editOps,
+      ),
+      doomLoopRatchet: new DoomLoopRatchet({
+        worktree: run.worktree,
+        cleanSha: run.state.lastGreen,
+        events: run.events,
+      }),
+      ...(kernel
+        ? {
+            kernel,
+            kernelObjective: kernelObjectiveFor(task.title, kernelGoalText),
+          }
+        : {}),
+      ...(systemOne ? { systemOne } : {}),
+      compaction: {
+        settings: {
+          clearAt: run.config.context.clear_tool_results_at,
+          keepToolResults: run.config.context.keep_tool_results,
+          compactAt: run.config.context.compact_at,
+          keepTurns: run.config.context.compact_keep_turns,
+          ...(run.config.context.budget_tokens ? { budget: run.config.context.budget_tokens } : {}),
+        },
+        summarize: async (head, prior) => {
+          const s = await summarizeCycle(run, task, head, prior).catch(() => undefined);
+          if (!s) run.events.emit('context.fact_summary', { turns: head.length });
+          return ensureFacts(s ?? factSummary(head), head, edited);
+        },
+      },
+      ...(run.config.context.memory === 'rolling'
+        ? {
+            rolling: {
+              every: run.config.context.memory_condense_every,
+              keepTurns: run.config.context.memory_keep_turns,
+              goal: `${task.id}: ${task.title}`,
+              readFile: (p: string) =>
+                readFile(join(run.worktree, p), 'utf8').catch(() => undefined),
+              onNote: (note: string) => {
+                // The current note on disk, next to progress.md, for `recall` and inspection.
+                void writeFileAtomic(run.store.file('memory.md'), note).catch(() => undefined);
+              },
+            },
+          }
+        : {}),
+    };
+    // In lazy mode, provide refreshTools so the loop can update the tool list each turn.
+    if (isLazyMode && run.loadedToolsState) {
+      return {
+        ...base,
+        refreshTools: () => {
+          const freshTools = buildToolListSync(
+            allTools,
+            run.config,
+            exposureOpts,
+            run.loadedToolsState,
+          );
+          return { tools: freshTools, specs: freshTools.map(toolSpec) };
+        },
+      };
+    }
+    return base;
+  };
+  const loop = usesThinkLoop(run, task);
+  const result = loop
+    ? await actAsThinkLoop(run, task, {
+        ctx,
+        deps,
+        workChain: route.chain,
+        runChecks: () => runChecks(run, task, `${run.state.cycle}-loop`),
+      })
+    : await runAgentLoop(ctx, deps(route.chain));
+  // The browser (and the page it holds) lives for one cycle; the next starts fresh.
+  await closeSession(run.state.runId).catch(() => undefined);
+  if (result.end === 'max_usd') run.state.budgetExhausted = true;
+  if (result.end === 'providers_unavailable')
+    run.state.providersUnavailable = result.detail ?? 'no model could take a call';
+  if (result.end === 'max_usd_per_day') run.state.dailyCapHit = true;
+  const taskCap =
+    result.end === 'task_max_usd' || result.end === 'task_max_tokens' ? result.end : undefined;
+  run.events.emit('act.end', {
+    end: result.end,
+    turns: result.turns,
+    usd: result.usd,
+    edited: [...edited],
+  });
+  const tokens =
+    result.usage.uncached +
+    result.usage.cacheWrite5m +
+    result.usage.cacheWrite1h +
+    result.usage.cacheRead +
+    result.usage.output;
+  if (tokens)
+    run.state.cycleTokens = [...run.state.cycleTokens, tokens].slice(-CYCLE_TOKEN_HISTORY);
+  run.state.act = {
+    summary: run.redactor.text(result.finalText).slice(0, 2_000),
+    end: result.end,
+    turns: result.turns,
+    usd: result.usd,
+    ...(result.stuck ? { stuck: result.stuck } : {}),
+    ...('reviewed' in result && result.reviewed ? { reviewed: true } : {}),
+  };
+  if ('reviewed' in result && result.reviewed && task.id === FAST_TASK)
+    run.state.loopReviewed = true;
+  run.workerPrefix = { system: ctx.system, tools: ctx.tools, messages: result.messages };
+  if (taskCap) await run.parkAtTaskCap(taskCap);
+  await run.setPhase('verify');
+}
+
+/** VERIFY + JUDGE: gates against the baseline, anti-cheat, oscillation, task checks. Harness decides. */
+export async function stepVerify(run: Run): Promise<void> {
+  const plan = run.requirePlan();
+  const task = getNode(plan, run.state.taskId ?? '');
+  const act = run.state.act ?? { summary: '', end: 'crashed', turns: 0, usd: 0 };
+  const { changes, patch, treeHash } = await workingTreeDiff(run.worktree, run.state.lastGreen);
+  const diffStats = {
+    files: changes.length,
+    added: changes.reduce((n, c) => n + c.added, 0),
+    removed: changes.reduce((n, c) => n + c.removed, 0),
+  };
+  const reasons: string[] = [];
+  const evidence: string[] = [];
+  const stuck: string[] = [];
+  let baseline = run.state.baseline;
+  let testsPassed: number | undefined;
+  const label = `c${run.state.cycle}`;
+
+  if (act.end === 'stop-now' && run.hang) {
+    // The stall watchdog cut a hung cycle: a stuck attempt, so the ladder takes it from here.
+    reasons.push(`hung: ${run.hang}`);
+    if (climbsNow(task, 'hung')) stuck.push('hung');
+    evidence.push(
+      `The last attempt hung (${run.hang}) and was aborted. Avoid whatever blocked: a command that waits for input or never exits, a server started in the foreground, or a request that never returns.`,
+    );
+    run.events.emit('stuck.signal', { signal: 'hung', task: task.id, detail: run.hang });
+  } else if (act.end === 'stop-now' && run.deadlineHit)
+    run.events.emit('budget.deadline', { task: task.id, files: changes.length });
+  else if (act.end === 'stop-now') reasons.push('stopped by user (--now)');
+  // An attempt that wasn't cut short breaks any pattern of cut-short attempts.
+  if (!act.stuck && !(act.end === 'stop-now' && run.hang)) task.lastCutShort = undefined;
+  if (act.stuck) {
+    // Ended early by an in-cycle signal: partial work is still verified. The first time is a
+    // retry with this evidence; the same signal again climbs the ladder.
+    if (climbsNow(task, act.stuck.signal)) stuck.push(act.stuck.signal);
+    evidence.push(
+      `The last attempt was cut short: ${act.stuck.detail}. Change approach instead of repeating it.`,
+    );
+    run.events.emit('stuck.signal', {
+      signal: act.stuck.signal,
+      task: task.id,
+      detail: act.stuck.detail,
+    });
+  }
+
+  const checks = task.checks.length ? await runChecks(run, task, label) : [];
+  const checksPass = checks.every((c) => c.pass);
+  for (const c of checks.filter((x) => !x.pass))
+    evidence.push(`Check failed: \`${c.command}\`\n${c.output}`);
+
+  const taskCapCut = act.end === 'task_max_usd' || act.end === 'task_max_tokens';
+  const budgetCut = act.end === 'max_usd' || act.end === 'max_usd_per_day' || taskCapCut;
+  // A task cap can stop mid-edit: never commit a partial task. Run-level caps keep the old
+  // behavior and may still commit work that passes every gate.
+  if (taskCapCut) reasons.push(INTERRUPTED_BY_BUDGET);
+  // A task with no checks of its own that only verifies ("Run the full test suite…"), or that came
+  // back with nothing to change twice in a row, is done: the tree is lastGreen, which passed every
+  // gate. Rejecting it again only burns cycles; the final audit still checks the goal.
+  const nothingToChange =
+    !changes.length &&
+    !budgetCut &&
+    !task.checks.length &&
+    (verifyOnly(task) || task.lastRejection === 'no changes');
+  if (nothingToChange) run.events.emit('task.nothing_to_change', { task: task.id });
+  // The fast path's checks are the gates, which usually pass before any work: it must change code.
+  const mustChange = task.id === FAST_TASK && run.state.fastPath === 'tried';
+  if (!changes.length) {
+    if (budgetCut && !taskCapCut) reasons.push(INTERRUPTED_BY_BUDGET);
+    else if (!budgetCut && (mustChange || !(task.checks.length && checksPass)) && !nothingToChange)
+      reasons.push('no changes');
+  } else if (!reasons.length) {
+    const { results, flaky } = await runGatesWithFlakyCheck(
+      run.config.gates,
+      gateRunCtx(run, label),
+      run.state.baseline,
+    );
+    if (flaky.length) await recordFlaky(run, task, flaky);
+    const verdicts = results.map((r) => judgeGate(r, run.state.baseline));
+    for (const v of verdicts) if (!v.pass) reasons.push(`gate ${v.gate}: ${v.reason ?? 'failed'}`);
+    const failText = renderGateFailures(results, verdicts);
+    if (failText) evidence.push(failText);
+    testsPassed = results.reduce((n, r) => n + (r.tests?.passed ?? 0), 0) || undefined;
+    const cheats = antiCheat({
+      changes,
+      patch,
+      protectedPatterns: run.config.protected,
+      allow: task.allow,
+      baseline: run.state.baseline,
+      results,
+      domain: workModeOf(run.config),
+    });
+    for (const v of cheats) {
+      reasons.push(`anti-cheat ${v.rule}: ${v.detail}`);
+      evidence.push(`Rejected by anti-cheat (${v.rule}): ${v.detail}. Do not do this.`);
+    }
+    if (cheats.length) await recordAntiCheatLessons(run, cheats);
+    const osc = await detectOscillation(
+      run.worktree,
+      run.state.lastGreen,
+      run.state.greenHistory
+        .slice(-run.config.stuck.oscillation_window - 1, -1)
+        .map((g) => g.sha)
+        .reverse(),
+      changes,
+    );
+    if (osc) {
+      reasons.push(`stuck ${osc.signal}: ${osc.detail}`);
+      stuck.push(osc.signal);
+      evidence.push(
+        `Rejected: ${osc.detail}. Find an approach that keeps the earlier accepted work.`,
+      );
+      run.events.emit('stuck.signal', { signal: osc.signal, task: task.id, detail: osc.detail });
+    }
+    // Gates passed: a separate model reviews the diff for what tests miss (stubs, hardcoded
+    // outputs, unmet requirements). It fails open, so a reviewer outage never blocks work.
+    // A loop session already had its one review, of the whole diff; findings were fixed in it.
+    if (!reasons.length && run.config.review.enabled && !act.reviewed) {
+      const goal = (await run.store.readGoal()).text;
+      const r = await reviewChange(run, task, goal, withoutVendored(patch), run.workerPrefix);
+      if (r) {
+        const block = blocking(r.findings, run.config.review.block_on);
+        run.events.emit('review.result', {
+          task: task.id,
+          findings: r.findings.length,
+          blocking: block.length,
+          summary: r.summary.slice(0, 200),
+        });
+        if (block.length) {
+          reasons.push(
+            `review: ${block
+              .map((f) => f.problem)
+              .join('; ')
+              .slice(0, 300)}`,
+          );
+          evidence.push(
+            `Rejected in review (tests passed, but):\n${renderFindings(block)}\nFix these.`,
+          );
+        }
+      }
+    }
+    baseline = toBaseline(results);
+    run.events.emit('verify.gates', {
+      gates: results.map((r, i) => ({
+        gate: r.name,
+        exitCode: r.exitCode,
+        timedOut: r.timedOut,
+        failures: r.failures.length,
+        newFailures: verdicts[i]?.newFailures.length ?? 0,
+        fixed: verdicts[i]?.fixed.length ?? 0,
+        tests: r.tests,
+        durationMs: r.durationMs,
+      })),
+    });
+  }
+
+  // Advisory drift check: may add evidence, never changes the verdict.
+  if (changes.length && run.judge.enabled('drift')) {
+    const r = await run.judge.ask(
+      'drift',
+      {
+        goal: (await run.store.readGoal()).text.slice(0, 1_500),
+        task: { id: task.id, title: task.title },
+        files: changes.map((c) => `${c.status} ${c.path} +${c.added}/-${c.removed}`).slice(0, 60),
+        summary: act.summary.slice(0, 600),
+      },
+      [driftQuestion],
+    );
+    const p =
+      r.status === 'answered' && r.answers[0]?.type === 'noul'
+        ? r.answers[0].probability
+        : undefined;
+    if (p !== undefined && p <= CONFIDENT_FALSE) {
+      evidence.push(
+        'An advisory check suggests the last diff drifted away from the current task. Stay on the task.',
+      );
+      stuck.push('judge_drift');
+      run.events.emit('judge.drift_flag', { task: task.id, probability: p });
+    }
+  }
+
+  const verdict: PendingVerdict['verdict'] = reasons.length ? 'reject' : 'accept';
+  const done = verdict === 'accept' && checksPass;
+  const signature = verdict === 'reject' ? failureSignature(reasons) : '';
+  // Doom-loop detector, run level: a rejected cycle with no diff, no budget cut, and
+  // no failing check produced nothing to act on. Consecutive idle cycles end the run
+  // as `stuck` (see guardPre); any cycle with a diff resets the streak.
+  const idleCycle = isIdleCycle({
+    verdict,
+    diffFiles: changes.length,
+    budgetCut,
+    checksFailed: checks.length > 0 && !checksPass,
+  });
+  run.state.idleCycles = idleCycle ? run.state.idleCycles + 1 : 0;
+  if (idleCycle)
+    run.events.emit('doom.idle_cycle', {
+      task: task.id,
+      cycle: run.state.cycle,
+      idleCycles: run.state.idleCycles,
+      reasons,
+    });
+  run.events.emit('verify.result', {
+    task: task.id,
+    verdict,
+    done,
+    reasons,
+    checks: checks.map((c) => ({ command: c.command, pass: c.pass })),
+    diff: diffStats,
+  });
+  run.state.pending = {
+    verdict,
+    taskId: task.id,
+    done,
+    reasons,
+    signature,
+    diffHash: changes.length ? treeHash : '',
+    ...(verdict === 'accept' && baseline ? { baseline } : {}),
+    summary: act.summary,
+    evidence: evidence.join('\n\n').slice(0, 8_000),
+    changedFiles: changes.map((c) => c.path),
+    diffStats,
+    stuck,
+    ...(testsPassed !== undefined ? { testsPassed } : {}),
+    ...(act.worker ? { worker: act.worker } : {}),
+  };
+  await run.setPhase(verdict === 'accept' ? 'commit' : 'rollback');
+}
+
+function commitSubject(task: PlanNode): string {
+  const title = task.title.replace(/\s+/g, ' ').trim();
+  return `omnexx(${task.id}): ${title.length > 60 ? `${title.slice(0, 57)}...` : title}`;
+}
+
+/** COMMIT: idempotent. A commit for this cycle that already exists (crash after commit) is adopted. */
+export async function stepCommit(run: Run): Promise<void> {
+  const p = run.state.pending;
+  if (!p) throw new StateError('commit phase without a pending verdict');
+  const task = getNode(run.requirePlan(), p.taskId);
+  const head = await headSha(run.worktree);
+  let sha: string | undefined;
+  if (head !== run.state.lastGreen) {
+    const t = parseTrailers(await commitMessage(run.worktree, head));
+    if (t?.run === run.state.runId && t.cycle === run.state.cycle) {
+      sha = head;
+      run.events.emit('reconcile.adopt', { sha: head });
+    }
+  }
+  if (!sha && p.changedFiles.length && !(await isClean(run.worktree))) {
+    const body = [
+      p.summary.trim().slice(0, 1_500),
+      `Gates passed${p.done ? '; task checks passed' : '; task not finished yet'}.`,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+    sha = await commitCheckpoint(run.worktree, commitSubject(task), body, {
+      run: run.state.runId,
+      task: task.id,
+      cycle: run.state.cycle,
+      ...(p.worker ? { worker: p.worker } : {}),
+    });
+  }
+  if (sha) {
+    run.state.lastGreen = sha;
+    run.state.greenHistory.push({ sha, cycle: run.state.cycle });
+    run.state.acceptedCommits++;
+    if (p.baseline) run.state.baseline = p.baseline;
+    run.events.emit('commit', {
+      sha,
+      task: task.id,
+      done: p.done,
+      diff: p.diffStats,
+      worker: p.worker,
+    });
+    await maybeRunSentinel(run);
+    if (run.config.git.push === 'branch') {
+      const r = await git(
+        run.worktree,
+        ['push', run.config.git.remote, `${run.state.branch}:${run.state.branch}`],
+        { allowFailure: true },
+      );
+      run.events.emit(r.exitCode === 0 ? 'git.pushed' : 'git.push_failed', {
+        branch: run.state.branch,
+        error: r.exitCode ? r.stderr.split('\n')[0] : undefined,
+      });
+    }
+  }
+  run.state.lastProgressAt = run.clock.now();
+  run.state.lastProgressCycle = run.state.cycle;
+  run.state.recoveries = 0;
+  await run.setPhase('record');
+}
+
+/**
+ * SENTINEL (opt-in, [sentinel]): every N accepted commits run the full check on lastGreen. On a
+ * regression, bisect this run's checkpoints and revert the first bad one with a new commit.
+ */
+async function maybeRunSentinel(run: Run): Promise<void> {
+  const cfg = run.config.sentinel;
+  if (!cfg.enabled || run.state.acceptedCommits % cfg.every_commits !== 0) return;
+  run.events.emit('sentinel.start', { head: run.state.lastGreen });
+  try {
+    const r = await runSentinel({
+      cwd: run.worktree,
+      history: run.state.greenHistory.map((g) => g.sha),
+      check: (cwd) => runCheck(cwd, cfg.command, cfg.timeout_seconds * 1_000),
+      autoRevert: cfg.auto_revert,
+    });
+    if (r.revertSha) {
+      run.state.lastGreen = r.revertSha;
+      run.state.greenHistory.push({ sha: r.revertSha, cycle: run.state.cycle });
+    }
+    run.events.emit(r.healthy ? 'sentinel.healthy' : 'sentinel.regression', { ...r });
+  } catch (err) {
+    run.events.emit('sentinel.error', { error: String(err) });
+  }
+}
+
+/** ROLLBACK: save the failed diff, reset to lastGreen. Idempotent. */
+export async function stepRollback(run: Run): Promise<void> {
+  const p = run.state.pending;
+  const patch = join(
+    run.store.dir,
+    'rejected',
+    `${run.state.cycle}${p?.worker ? `-${p.worker}` : ''}.patch`,
+  );
+  const { savedPatch, exact } = await rollbackTo(run.worktree, run.state.lastGreen, {
+    path: patch,
+    redact: (x) => run.redactor.text(x),
+  });
+  // Tests passed and only the reviewer objected: keep the work for the next attempt to amend
+  // instead of redoing it (on the bench, redoing cost a full cycle per review finding).
+  const reviewOnly = Boolean(p?.reasons.length) && p?.reasons.every((r) => r.startsWith('review:'));
+  if (p && run.plan) {
+    const task = run.plan.nodes.find((n) => n.id === p.taskId);
+    if (task) {
+      // A loop session that ended red keeps its work too: the next session fixes it forward.
+      const keep =
+        reviewOnly === true || (usesThinkLoop(run, task) && !p.reasons.includes('no changes'));
+      if (savedPatch && exact && keep) task.amendPatch = patch;
+      else delete task.amendPatch;
+    }
+  }
+  run.state.rejectedCycles++;
+  run.events.emit('rollback', {
+    to: run.state.lastGreen,
+    task: p?.taskId,
+    reasons: p?.reasons ?? [],
+    patch: savedPatch ? patch : undefined,
+  });
+  await run.setPhase('record');
+}
+
+/** RECORD: plan, progress journal and per-task memory. Skipped when this cycle was already recorded. */
+export async function stepRecord(run: Run): Promise<void> {
+  const p = run.state.pending;
+  if (!p) throw new StateError('record phase without a pending verdict');
+  const plan = run.requirePlan();
+  const task = getNode(plan, p.taskId);
+  const interrupted = p.reasons.length === 1 && p.reasons[0] === INTERRUPTED_BY_BUDGET;
+  if (run.state.recordedCycle !== run.state.cycle && interrupted) {
+    run.events.emit('cycle.recorded', {
+      task: task.id,
+      verdict: 'interrupted',
+      attempts: task.attempts,
+    });
+    // Waiting on a budget cap isn't a lack of progress.
+    run.state.lastProgressCycle = run.state.cycle;
+    run.state.recordedCycle = run.state.cycle;
+  } else if (run.state.recordedCycle !== run.state.cycle) {
+    task.attempts++;
+    // The harness keeps the running context current even when the model forgets to.
+    const running = new RunningContext(run.store, task.id, () => run.clock.now());
+    const said =
+      p.summary
+        .split('\n')
+        .find((l) => l.trim())
+        ?.trim()
+        .slice(0, 300) ?? '';
+    await running.add(
+      'checkpoint',
+      p.verdict === 'accept'
+        ? `Accepted${p.done ? ': the task is done' : ' (not done yet)'}. ${said}`
+        : `Rejected: ${p.reasons.join('; ').slice(0, 600)}. Tried: ${said}`,
+      `cycle ${run.state.cycle}`,
+    );
+    if (p.verdict === 'accept') {
+      task.consecutiveRejections = 0;
+      if (p.done) {
+        task.status = 'done';
+        task.doneAtCycle = run.state.cycle;
+        task.evidence = [];
+        await running.archive();
+      } else task.status = 'doing';
+    } else {
+      const repeatsNoChange =
+        p.reasons.length === 1 &&
+        p.reasons[0] === 'no changes' &&
+        task.lastRejection === 'no changes' &&
+        !!p.evidence &&
+        task.evidence.at(-1)?.split('\n').slice(1).join('\n') === p.evidence;
+      task.status = 'doing';
+      task.consecutiveRejections++;
+      task.failureSignatures = [...task.failureSignatures, p.signature].slice(-10);
+      task.lastRejection = p.reasons.join('; ').slice(0, 500);
+      const approach = p.summary
+        .split('\n')
+        .find((l) => l.trim())
+        ?.trim()
+        .slice(0, 200);
+      if (approach && !task.approachesTried.includes(approach))
+        task.approachesTried = [...task.approachesTried, approach].slice(-8);
+      if (p.evidence)
+        task.evidence = [
+          ...task.evidence,
+          `Cycle ${run.state.cycle} was rejected: ${p.reasons.join('; ')}\n${p.evidence}`,
+        ].slice(-3);
+      // Twice nothing to change while the same checks fail the same way: another try can't
+      // help. Usually the check itself is wrong (a quoting slip that can never match).
+      if (repeatsNoChange) {
+        task.status = 'parked';
+        task.parkedReason =
+          'its checks fail the same way while the agent finds nothing to change; a check may be wrong';
+        run.events.emit('check.suspect', {
+          task: task.id,
+          checks: task.checks.slice(0, 5),
+        });
+      }
+      // Advisory similarity check: logged only.
+      const prev = task.failureSignatures.at(-2);
+      if (prev && run.judge.enabled('failure_similarity')) {
+        const r = await run.judge.ask(
+          'failure_similarity',
+          { previous: prev.slice(0, 1_500), latest: p.signature.slice(0, 1_500) },
+          [sameFailureQuestion],
+        );
+        if (r.status === 'answered' && r.answers[0]?.type === 'noul') {
+          run.events.emit('judge.similarity', {
+            task: task.id,
+            sameRootCause: r.answers[0].probability,
+            deterministicSame: prev === p.signature,
+          });
+        }
+      }
+    }
+    await run.savePlan();
+    const outcome =
+      p.verdict === 'accept'
+        ? p.done
+          ? `accepted, ${task.id} done`
+          : 'accepted (partial)'
+        : `rejected: ${p.reasons.join('; ')}`;
+    await run.store.appendProgress(
+      run.state.cycle,
+      [
+        `Task ${task.id} (${task.title}), attempt ${task.attempts}: ${outcome}.`,
+        p.verdict === 'accept'
+          ? `Commit ${run.state.lastGreen.slice(0, 10)}. Files: ${p.changedFiles.slice(0, 12).join(', ') || 'none'}.`
+          : '',
+        p.summary
+          ? `Agent summary: ${p.summary.split('\n').slice(0, 4).join(' ').slice(0, 400)}`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+    if (p.verdict === 'accept' && p.changedFiles.length) await refreshCodemap(run, p.changedFiles);
+    run.events.emit(p.done ? 'task.done' : 'cycle.recorded', {
+      task: task.id,
+      verdict: p.verdict,
+      attempts: task.attempts,
+    });
+    run.state.recordedCycle = run.state.cycle;
+  }
+  run.state.act = undefined;
+  await run.setPhase('guard');
+}
+
+/** One complete cycle on one task: ACT → VERIFY → COMMIT|ROLLBACK → RECORD (M1's unit of work). */
+export async function runOneCycle(run: Run, taskId: string): Promise<PendingVerdict> {
+  run.state.cycle++;
+  await run.setPhase('act', { taskId, pending: undefined });
+  run.events.emit('cycle.start', { task: taskId });
+  await stepAct(run);
+  await stepVerify(run);
+  if (run.state.phase === 'commit') await stepCommit(run);
+  else await stepRollback(run);
+  const pending = run.state.pending;
+  if (!pending) throw new StateError('cycle ended without a verdict');
+  await stepRecord(run);
+  run.events.emit('cycle.end', {
+    task: taskId,
+    verdict: pending.verdict,
+    done: pending.done,
+    usd: run.state.spend.usd,
+  });
+  return pending;
+}
+
+/**
+ * Capability-selection query for a cycle. The task id ("M1.T01") is left out because it
+ * matched unrelated registry tools (such as "DOL Form M-1") in BM25. Generic fast-path
+ * titles also get the goal text added, so selection runs on what the user actually asked.
+ */
+export function kernelObjectiveFor(title: string, goal: string): string {
+  const g = goal.trim().slice(0, 600);
+  const t = title.trim();
+  if (!g) return t;
+  return /^do the whole goal/i.test(t) || t.length < 12 ? g : `${t}\n${g}`;
+}

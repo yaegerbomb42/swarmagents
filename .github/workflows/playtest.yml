@@ -1,0 +1,49 @@
+name: Playtest login check
+
+# Manual: signs in to a SwarmAgents server as the shared test account, loads the
+# provider keys from repo secrets into that account (idempotent), and reports
+# which providers are connected. Keys and passwords are never printed.
+# Setup is documented in docs/playtest/README.md.
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Load the provider keys (TEST_<PROVIDER>_API_KEY secrets, listed in the TEST_PROVIDERS_MANIFEST variable) into the test account before checking
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  playtest:
+    # Never runs for pull requests or forks: manual dispatch on main only.
+    if: ${{ github.repository == 'yaegerbomb42/swarmagents' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Seed provider keys
+        if: ${{ inputs.seed }}
+        working-directory: apps/swarmagents
+        env:
+          SWARM_BASE_URL: ${{ vars.SWARM_BASE_URL || 'https://swarmagents.codes' }}
+          SWARM_TEST_EMAIL: ${{ secrets.SWARM_TEST_EMAIL }}
+          SWARM_TEST_PASSWORD: ${{ secrets.SWARM_TEST_PASSWORD }}
+          TEST_PROVIDERS_MANIFEST: ${{ vars.TEST_PROVIDERS_MANIFEST }}
+          # Secrets cannot be enumerated by name at run time, so the job passes
+          # them to the script as one blob; the script only reads the names the
+          # manifest lists and never prints values (GitHub also masks them).
+          ALL_SECRETS_JSON: ${{ toJSON(secrets) }}
+          ALL_VARS_JSON: ${{ toJSON(vars) }}
+        run: node scripts/playtest.mjs seed
+      - name: Check
+        working-directory: apps/swarmagents
+        env:
+          SWARM_BASE_URL: ${{ vars.SWARM_BASE_URL || 'https://swarmagents.codes' }}
+          SWARM_TEST_EMAIL: ${{ secrets.SWARM_TEST_EMAIL }}
+          SWARM_TEST_PASSWORD: ${{ secrets.SWARM_TEST_PASSWORD }}
+        run: node scripts/playtest.mjs check

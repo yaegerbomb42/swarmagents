@@ -1,0 +1,92 @@
+(lvl:0:block
+  ;; =========================================================================
+  ;; 🚀 SWARMAGENTS MINIMAL 3-PART UI COMPONENT SPECIFICATION IN AGL
+  ;; Architecture: Pinned Input Bar, Live VM Computer Screen, 5-Tab Settings
+  ;; Target Aesthetic: Google + Apple calm, precise, minimal
+  ;; =========================================================================
+
+  ;; --- PART 1: STATE VECTOR INITIALIZATION ---
+  (lvl:0:set "active_run" false)
+  (lvl:0:set "effective_provider" "Inception / mercury-3 (Free)")
+
+  ;; Real Providers Data Structure
+  (lvl:0:set "user_providers" 
+    (lvl:0:list
+      (lvl:0:dict "id" "inception" "name" "Inception" "model" "mercury-3" "status" "configured" "rank" 1)
+      (lvl:0:dict "id" "nvidia" "name" "NVIDIA" "model" "nemotron-3.5" "status" "configured" "rank" 2)
+      (lvl:0:dict "id" "groq" "name" "Groq" "model" "qwen-3.8-27b" "status" "configured" "rank" 3)
+    )
+  )
+
+  ;; Real Shipped MCP Servers Registry
+  (lvl:0:set "mcp_servers"
+    (lvl:0:list
+      (lvl:0:dict "name" "blender" "desc" "3D Scene Generation & Inspection" "connected" true)
+      (lvl:0:dict "name" "chrome-devtools" "desc" "DOM Inspection & Network Trace" "connected" true)
+      (lvl:0:dict "name" "sequential-thinking" "desc" "Dynamic Reasoning & Verification" "connected" false)
+    )
+  )
+
+  ;; Real Tools Allowlist (from lib/roles.ts)
+  (lvl:0:set "tools_list"
+    (lvl:0:list
+      (lvl:0:dict "name" "bash" "desc" "Run shell commands in Docker VM" "enabled" true)
+      (lvl:0:dict "name" "computer" "desc" "Take screenshot & inspect screen" "enabled" true)
+      (lvl:0:dict "name" "edit_file" "desc" "Make precise unified patch edits" "enabled" true)
+      (lvl:0:dict "name" "fetch" "desc" "Safe sandbox network requests" "enabled" true)
+    )
+  )
+
+  ;; Real Library Skills (Max 10)
+  (lvl:0:set "skills_list"
+    (lvl:0:list
+      (lvl:0:dict "name" "modern-web-guidance" "desc" "Web standards & CSS best practices" "loaded" true)
+      (lvl:0:dict "name" "a11y-debugging" "desc" "Semantic ARIA auditing" "loaded" true)
+      (lvl:0:dict "name" "memory-leak-debugging" "desc" "Heap snapshot inspection" "loaded" false)
+    )
+  )
+
+  ;; Real Capability Connectors
+  (lvl:0:set "connectors_list"
+    (lvl:0:list
+      (lvl:0:dict "name" "GitHub" "desc" "Repository PR & Issue Automation" "status" "connected")
+      (lvl:0:dict "name" "Linear" "desc" "Issue tracking & project sync" "status" "setup_required")
+    )
+  )
+
+  ;; Simulated Live Telemetry Action Feed (when active)
+  (lvl:0:set "live_actions"
+    (lvl:0:list
+      (lvl:0:dict "time" "19:14:02" "icon" "terminal" "action" "Ran npm run test:unit")
+      (lvl:0:dict "time" "19:14:15" "icon" "screen" "action" "Captured viewport frame")
+      (lvl:0:dict "time" "19:14:28" "icon" "edit" "action" "Patched SettingsPanel.tsx")
+    )
+  )
+
+  ;; --- PART 2: COMPILATION VIA LEVEL 3 RENDER_UI ---
+  (lvl:0:set "swarmagents_app"
+    (lvl:3:render_ui "swarmagents_minimal_3part"
+      (lvl:0:dict
+        "brand" "SwarmAgents"
+        "theme" "dark_minimal"
+        "active_run" (lvl:0:get "active_run")
+        "effective_provider" (lvl:0:get "effective_provider")
+        "providers" (lvl:0:get "user_providers")
+        "mcp_servers" (lvl:0:get "mcp_servers")
+        "tools" (lvl:0:get "tools_list")
+        "skills" (lvl:0:get "skills_list")
+        "connectors" (lvl:0:get "connectors_list")
+        "live_telemetry" (lvl:0:get "live_actions")
+      )
+    )
+  )
+
+  ;; --- PART 3: RETURN GENERATED STATE PACKET ---
+  (lvl:0:dict
+    "status" "SWARMAGENTS_UI_SYNTHESIZED"
+    "architecture_parts" (lvl:0:list "InputBar_Bottom" "VMScreen_Main" "SettingsPanel_SlideOver")
+    "settings_tabs" (lvl:0:list "Providers" "MCPServers" "Tools" "Skills" "Connectors")
+    "effective_provider" (lvl:0:get "effective_provider")
+    "rendered_widget_type" (lvl:0:at (lvl:0:get "swarmagents_app") "ui_type")
+  )
+)

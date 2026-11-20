@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Chromium
+Comment=Web browser
+Exec=/usr/local/bin/swarm-chromium-launch.sh %U
+Icon=chromium
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;

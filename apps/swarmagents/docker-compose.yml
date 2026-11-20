@@ -1,0 +1,87 @@
+services:
+  swarmagents:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: swarmagents-v2:latest
+    container_name: swarmagents
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-3777}:3777"
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: "3777"
+      # Server mode is the default for a deployed container: sign-in is
+      # required and there is no unauthenticated access to runs, VMs,
+      # provider keys, or the board. The app also refuses to boot in server
+      # mode without SWARM_SESSION_SECRET, and compose fails fast here when
+      # it is unset — a plain `docker compose up` must never serve an
+      # unauthenticated app. See DEPLOY.md "Server-mode authentication".
+      SWARM_SERVER_MODE: "1"
+      SWARM_SESSION_SECRET: ${SWARM_SESSION_SECRET:?Set SWARM_SESSION_SECRET to 32+ random bytes, e.g. export SWARM_SESSION_SECRET="$(openssl rand -hex 32)"}
+      # Public hostname(s) for the middleware host allowlist
+      # (comma-separated). Set this to the public hostname in production;
+      # unset means any Host header is accepted (see DEPLOY.md).
+      SWARM_ALLOWED_HOSTS: ${SWARM_ALLOWED_HOSTS:-}
+      # Persistent board/users/telemetry storage. Must point at the mounted volume.
+      SWARM_HOME: /data
+      # "fake" runs VMs in-process. Set to "docker" and enable the socket mount
+      # below to run real per-user VM containers on the host daemon.
+      SWARM_VM_DRIVER: ${SWARM_VM_DRIVER:-fake}
+      # Image the per-user VM containers are created from. Build the repo image
+      # with `npm run vm-image:build` (see vm-image/README.md).
+      # SWARM_VM_IMAGE: ${SWARM_VM_IMAGE:-swarm-vm:claude}
+      # Docker network VM containers join (`docker run --network`). Leave unset
+      # to keep Docker's default bridge; a dedicated network (e.g. swarm-vms on
+      # 172.30.0.0/16) keeps egress rules scoped to the VMs. See DEPLOY.md.
+      # SWARM_VM_NETWORK: ${SWARM_VM_NETWORK:-swarm-vms}
+      # Per-VM container ceilings (docker --memory / --cpus / --pids-limit).
+      # Uncomment to override the defaults (2g / 2 / 512).
+      # SWARM_VM_MEMORY: ${SWARM_VM_MEMORY:-2g}
+      # SWARM_VM_CPUS: ${SWARM_VM_CPUS:-2}
+      # SWARM_VM_PIDS: ${SWARM_VM_PIDS:-512}
+      # Desktop mode: SWARM_VM_DESKTOP=1 creates per-user containers from
+      # swarm-vm:desktop (build with `npm run vm-image:desktop:build`, see
+      # vm-image-desktop/) instead of swarm-vm:claude. The live desktop stream
+      # is served by the in-process desktop proxy (lib/desktop-proxy) on the
+      # container loopback:127.0.0.1:3778 behind the session cookie gate — see
+      # the "Desktop stream proxy" section of DEPLOY.md for the nginx routing
+      # of the public /desktop/ path and the optional host-loopback publish of
+      # 3778. The proxy itself never binds outward; only nginx (or a published
+      # loopback port) may reach it.
+      # SWARM_VM_DESKTOP: ${SWARM_VM_DESKTOP:-0}
+      # SWARM_VM_DESKTOP_IMAGE: ${SWARM_VM_DESKTOP_IMAGE:-swarm-vm:desktop}
+      # SWARM_DESKTOP_PROXY_HOST: 0.0.0.0   # only if nginx proxies from outside this container
+      # SWARM_DESKTOP_PROXY_PORT: "3778"
+      # SWARM_DESKTOP_MAX_VIEWERS: "3"
+      # SWARM_DESKTOP_IDLE_MS: "600000"
+    # The docker socket is owned by root:docker (0660), so the app user must be
+    # in the host's docker group: getent group docker | cut -d: -f3
+    # group_add:
+    #   - "${DOCKER_GID}"
+    volumes:
+      - swarm_data:/data
+      # Optional: required ONLY when SWARM_VM_DRIVER=docker. The app talks to
+      # the host Docker daemon to create per-user VM containers. Never expose
+      # this socket when running with the default "fake" driver.
+      # - /var/run/docker.sock:/var/run/docker.sock
+    security_opt:
+      - no-new-privileges:true
+    # Same readiness probe as the Dockerfile: board, disk and Docker daemon.
+    # Middleware exempts this loopback request from the server-mode allowlist.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:' + (process.env.PORT || 3777) + '/api/health?ready=1').then(async (r) => { const body = await r.json().catch(() => null); process.exit(r.ok && body?.ready === true ? 0 : 1); }).catch(() => process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  swarm_data:

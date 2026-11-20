@@ -1,0 +1,28 @@
+# swarmagents-egress.service — re-apply the SwarmAgents VM egress firewall at boot.
+#
+# The per-user VM iptables rules do not survive a reboot (and netfilter-persistent
+# is deliberately not used: its rules.v4 snapshot would also capture Docker's own
+# rules). This oneshot unit re-runs swarmagents-egress.sh on every boot.
+#
+# It runs Before docker.service, when Docker is not up yet, so the script reuses
+# the subnet saved at deploy time in /etc/swarmagents-egress.subnet (see the
+# script header). First boot after install — before any deploy has saved a
+# subnet — the unit fails loudly instead of installing rules for the wrong
+# network; the deploy path runs the script with Docker up and fixes that.
+#
+# Installed once by the operator (see DEPLOY.md, "Installing the egress unit"):
+#   install -m 644 swarmagents-egress.service /etc/systemd/system/
+#   systemctl enable swarmagents-egress.service
+[Unit]
+Description=SwarmAgents per-user VM egress firewall
+After=network-online.target
+Before=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/swarmagents-egress.sh
+
+[Install]
+WantedBy=multi-user.target

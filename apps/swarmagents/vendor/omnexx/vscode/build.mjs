@@ -1,0 +1,77 @@
+// Builds the extension: the extension host code, the chat webview, and a bundled copy of the
+// omnexx CLI (out/cli) that runs on the editor's own Node, so the extension works right after
+// install. Run from vscode/: `node build.mjs`.
+import { readFileSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const root = join(here, '..');
+const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
+
+rmSync(join(here, 'out'), { recursive: true, force: true });
+
+await build({
+  entryPoints: [join(here, 'src/extension.ts')],
+  outfile: join(here, 'out/extension.cjs'),
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  target: 'node20',
+  external: ['vscode'],
+  define: { __OMNEXX_VERSION__: JSON.stringify(version) },
+  minify: true,
+});
+
+await build({
+  entryPoints: [join(here, 'src/webview/chat.ts')],
+  outfile: join(here, 'out/chat.js'),
+  bundle: true,
+  platform: 'browser',
+  format: 'iife',
+  target: 'es2022',
+  minify: true,
+});
+
+// xterm.js for the live terminal drawer: a tiny shim entry exposes Terminal +
+// FitAddon on window.Xterm for the plain-JS controller (media/terminal.js).
+// The CSS import in the shim is emitted alongside as out/xterm.css.
+await build({
+  entryPoints: [join(here, 'src/webview/xterm-shim.ts')],
+  outfile: join(here, 'out/xterm.js'),
+  bundle: true,
+  platform: 'browser',
+  format: 'iife',
+  target: 'es2022',
+  minify: true,
+});
+
+// Split-diff viewer: its own bundle (out/diff.js) for the webview panel.
+await build({
+  entryPoints: [join(here, 'src/webview/diffView.ts')],
+  outfile: join(here, 'out/diff.js'),
+  bundle: true,
+  platform: 'browser',
+  format: 'iife',
+  target: 'es2022',
+  minify: true,
+});
+
+await build({
+  entryPoints: { index: join(root, 'src/cli/index.ts') },
+  outdir: join(here, 'out/cli'),
+  bundle: true,
+  splitting: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node22',
+  minify: true,
+  // Optional browser engines stay out; the browser tool explains how to add them.
+  external: ['playwright-core', 'camoufox-js', 'react-devtools-core'],
+  banner: {
+    js: "import{createRequire as __cr}from'module';import{fileURLToPath as __futp}from'url';import{dirname as __dn}from'path';const require=__cr(import.meta.url);const __filename=__futp(import.meta.url);const __dirname=__dn(__filename);",
+  },
+});
+
+console.log(`built extension + bundled omnexx ${version}`);

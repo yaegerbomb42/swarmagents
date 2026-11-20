@@ -1,0 +1,36 @@
+{
+  "name": "swarm-node",
+  "version": "0.1.0",
+  "description": "Run a SwarmAgents agent sandbox on your own machine and connect it to the server over an outbound websocket",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "dist/node.js",
+  "types": "dist/node.d.ts",
+  "bin": {
+    "swarm-node": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "test": "tsx --test \"src/**/*.test.ts\""
+  },
+  "keywords": [
+    "swarmagents",
+    "byoc",
+    "vnc",
+    "websocket"
+  ],
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3"
+  }
+}

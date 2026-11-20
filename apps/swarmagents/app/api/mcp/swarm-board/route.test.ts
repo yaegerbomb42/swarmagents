@@ -1,0 +1,310 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { NextRequest } from "next/server";
+import { GET, POST } from "./route";
+import { configureStorePaths, getStoragePaths, loadStore } from "@/lib/board/store";
+
+function tmpDir(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "swarm-board-route-"));
+}
+
+function seed(dataFile: string): void {
+  fs.writeFileSync(
+    dataFile,
+    JSON.stringify({
+      tasks: [
+        {
+          id: "task_1",
+          title: "Survive an I/O blip",
+          description: "D",
+          difficulty: "easy",
+          minElo: 1200,
+          constraints: [],
+          status: "open",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      proposals: [],
+      messages: [],
+    }),
+    "utf-8",
+  );
+}
+
+function request(url: string): NextRequest {
+  return new NextRequest(`http://localhost${url}`);
+}
+
+function rpc(method: string, params?: unknown): NextRequest {
+  return new NextRequest("http://localhost/api/mcp/swarm-board", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 7, method, ...(params ? { params } : {}) }),
+  });
+}
+
+test("GET returns the board when storage is healthy", async () => {
+  const dir = tmpDir();
+  const dataFile = path.join(dir, "swarm_board.json");
+  seed(dataFile);
+  configureStorePaths(dir, dataFile);
+  try {
+    const res = await GET(request("/api/mcp/swarm-board"));
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { counts?: { tasks?: number }; tasks?: unknown[] };
+    assert.equal(body.counts?.tasks, 1);
+    assert.equal(body.tasks?.length, 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("GET returns a retryable 503 instead of an empty board when the file cannot be read", async () => {
+  const dir = tmpDir();
+  const dataFile = path.join(dir, "swarm_board.json");
+  // A directory at the data-file path makes readFileSync fail with EISDIR,
+  // which works under root too (no permission-bit skip needed).
+  fs.mkdirSync(dataFile);
+  configureStorePaths(dir, dataFile);
+  try {
+    const res = await GET(request("/api/mcp/swarm-board"));
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get("retry-after"), "2");
+    const body = (await res.json()) as {
+      code?: string;
+      retryable?: boolean;
+      counts?: unknown;
+      tasks?: unknown;
+    };
+    assert.equal(body.code, "BOARD_UNAVAILABLE");
+    assert.equal(body.retryable, true);
+    // Crucially: no empty task list that a worker could read as "no work".
+    assert.equal(body.tasks, undefined);
+    assert.equal(body.counts, undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST poll_tasks returns a retryable error when the board is unavailable", async () => {
+  const dir = tmpDir();
+  const dataFile = path.join(dir, "swarm_board.json");
+  fs.mkdirSync(dataFile);
+  configureStorePaths(dir, dataFile);
+  try {
+    const res = await POST(rpc("tools/call", { name: "poll_tasks", arguments: { status: "open" } }));
+    assert.equal(res.status, 503);
+    const body = (await res.json()) as {
+      error?: { code?: number; data?: { retryable?: boolean } };
+      result?: unknown;
+      id?: unknown;
+    };
+    assert.equal(body.error?.code, -32001);
+    assert.equal(body.error?.data?.retryable, true);
+    assert.equal(body.result, undefined);
+    assert.equal(body.id, 7);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST create_task does not fake success when the board is unavailable", async () => {
+  const dir = tmpDir();
+  const dataFile = path.join(dir, "swarm_board.json");
+  fs.mkdirSync(dataFile);
+  configureStorePaths(dir, dataFile);
+  try {
+    const res = await POST(
+      rpc("tools/call", {
+        name: "create_task",
+        arguments: { title: "T", description: "D", difficulty: "easy" },
+      }),
+    );
+    assert.equal(res.status, 503);
+    const body = (await res.json()) as { error?: { code?: number }; result?: unknown };
+    assert.equal(body.error?.code, -32001);
+    assert.equal(body.result, undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST poll_tasks still works when storage is healthy", async () => {
+  const dir = tmpDir();
+  const dataFile = path.join(dir, "swarm_board.json");
+  seed(dataFile);
+  configureStorePaths(dir, dataFile);
+  try {
+    const res = await POST(rpc("tools/call", { name: "poll_tasks", arguments: { status: "open" } }));
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { result?: { content?: Array<{ text?: string }> } };
+    const payload = JSON.parse(body.result?.content?.[0]?.text ?? "{}") as { count?: number };
+    assert.equal(payload.count, 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST with a JSON null body is an Invalid Request (-32600), not a 500", async () => {
+  const res = await POST(
+    new NextRequest("http://localhost/api/mcp/swarm-board", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "null",
+    }),
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { error?: { code?: number; message?: string } };
+  assert.equal(body.error?.code, -32600);
+  assert.match(body.error?.message ?? "", /Invalid Request/);
+});
+
+test("GET sets Cache-Control: no-store so task counts are not cached by proxies", async () => {
+  const dir = tmpDir();
+  const dataFile = path.join(dir, "swarm_board.json");
+  seed(dataFile);
+  configureStorePaths(dir, dataFile);
+  try {
+    const res = await GET(request("/api/mcp/swarm-board"));
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("POST tools/call with array params returns -32602 Invalid params", async () => {
+  const res = await POST(rpc("tools/call", [{ name: "poll_tasks", arguments: { status: "open" } }]));
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { error?: { code?: number }; result?: unknown };
+  assert.equal(body.error?.code, -32602);
+  assert.equal(body.result, undefined);
+});
+
+test("POST tools/call with primitive params returns -32602 Invalid params", async () => {
+  const res = await POST(rpc("tools/call", "not-an-object"));
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { error?: { code?: number }; result?: unknown };
+  assert.equal(body.error?.code, -32602);
+  assert.equal(body.result, undefined);
+});
+
+test("POST tools/call with an invalid id type returns -32602 Invalid params", async () => {
+  const res = await POST(
+    new NextRequest("http://localhost/api/mcp/swarm-board", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: { bad: true },
+        method: "tools/call",
+        params: { name: "poll_tasks", arguments: { status: "open" } },
+      }),
+    }),
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { error?: { code?: number }; result?: unknown };
+  assert.equal(body.error?.code, -32602);
+  assert.equal(body.result, undefined);
+});
+
+
+function rawRpc(body: unknown): NextRequest {
+  return new NextRequest("http://localhost/api/mcp/swarm-board", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+test("RPC distinguishes invalid envelopes, invalid tool params, and unknown methods", async () => {
+  const cases: Array<[body: unknown, code: number, id: unknown]> = [
+    [{ jsonrpc: "2.0", id: 0 }, -32600, 0],
+    [{ jsonrpc: "2.0", id: "client", method: 1 }, -32600, "client"],
+    [{ jsonrpc: "2.0", id: { bad: true }, method: "ping" }, -32600, null],
+    [{ jsonrpc: "1.0", id: [7], method: "ping" }, -32600, null],
+    [{ jsonrpc: "2.0", id: "bad-params", method: "ping", params: null }, -32602, "bad-params"],
+    [{ jsonrpc: "2.0", id: 4, method: "tools/call", params: {} }, -32602, 4],
+    [{ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "poll_tasks", arguments: [] } }, -32602, 5],
+    [{ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "poll_tasks", arguments: false } }, -32602, 6],
+    [{ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "poll_tasks", arguments: null } }, -32602, 7],
+    [{ jsonrpc: "2.0", id: 8, method: "missing" }, -32601, 8],
+  ];
+  for (const [input, code, id] of cases) {
+    const res = await POST(rawRpc(input));
+    const body = await res.json();
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    assert.equal(body.jsonrpc, "2.0");
+    assert.equal(body.error.code, code, JSON.stringify(input));
+    assert.equal(body.id, id);
+    assert.equal("result" in body, false);
+  }
+});
+
+test("RPC notifications return no body and explicit null remains a request id", async () => {
+  const notification = await POST(rawRpc({ jsonrpc: "2.0", method: "notifications/initialized" }));
+  assert.equal(notification.status, 202);
+  assert.equal(await notification.text(), "");
+  assert.equal(notification.headers.get("cache-control"), "no-store");
+  const reply = await POST(rawRpc({ jsonrpc: "2.0", method: "ping", id: null }));
+  assert.deepEqual(await reply.json(), { jsonrpc: "2.0", id: null, result: {} });
+});
+
+test("RPC body limit measures bytes, not character count", async () => {
+  const res = await POST(rawRpc({ jsonrpc: "2.0", method: "ping", id: 7, params: { text: "é".repeat(140_000) } }));
+  const body = await res.json();
+  assert.equal(body.error.code, -32602);
+  assert.match(body.error.message, /body too large/);
+});
+
+test("workers see the same lease deadline in GET/poll and can reclaim it exactly once", async (t) => {
+  const { STORAGE_DIR, DATA_FILE } = getStoragePaths();
+  const ttl = process.env.SWARM_BOARD_CLAIM_TTL_MS;
+  process.env.SWARM_BOARD_CLAIM_TTL_MS = "1000";
+  const dir = tmpDir();
+  const dataFile = path.join(dir, "swarm_board.json");
+  t.after(() => {
+    if (ttl === undefined) delete process.env.SWARM_BOARD_CLAIM_TTL_MS;
+    else process.env.SWARM_BOARD_CLAIM_TTL_MS = ttl;
+    configureStorePaths(STORAGE_DIR, DATA_FILE);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  seed(dataFile);
+  configureStorePaths(dir, dataFile);
+  let now = 1000;
+  t.mock.method(Date, "now", () => now);
+  const tool = (name: string, args: Record<string, unknown>) => POST(rpc("tools/call", { name, arguments: args }));
+  const claim = (agentName: string) => tool("claim_task", { taskId: "task_1", agentName, workerElo: 1300 });
+  const expiredSubmit = () => tool("submit_task_work", {
+    taskId: "task_1", agentName: "old-worker", gitBranch: "feat/late", summary: "Late work",
+  });
+  assert.ok((await (await claim("old-worker")).json()).result);
+  now = 1999;
+  assert.equal((await (await claim("other-worker")).json()).error.code, -32602);
+  now = 2000;
+  const open = await (await GET(request("/api/mcp/swarm-board?status=open"))).json();
+  assert.equal(open.counts.open, 1);
+  assert.equal(open.counts.claimed, 0);
+  const reopened = open.tasks[0];
+  assert.equal(reopened.status, "open");
+  assert.equal(reopened.claimedBy, undefined);
+  const expiryEvent = { from: "claimed", to: "open", actor: "swarm-board", at: 2000 };
+  assert.deepEqual(reopened.history.at(-1), expiryEvent);
+  const polled = await (await tool("poll_tasks", {})).json();
+  assert.deepEqual(JSON.parse(polled.result.content[0].text).tasks[0].history, reopened.history);
+  assert.equal(loadStore().tasks[0].status, "claimed", "a read-only poll does not write storage");
+  assert.match((await (await expiredSubmit()).json()).error.message, /claim expired/i);
+
+  now = 2500;
+  const competing = await Promise.all([claim("worker-a"), claim("worker-b")]);
+  const results = await Promise.all(competing.map((response) => response.json()));
+  assert.equal(results.filter((body) => body.result).length, 1);
+  assert.equal(results.filter((body) => body.error?.code === -32602).length, 1);
+  const [saved] = loadStore().tasks;
+  assert.deepEqual(saved.history?.slice(1), [expiryEvent, { from: "open", to: "claimed", actor: saved.claimedBy, at: 2500 }]);
+  assert.match((await (await expiredSubmit()).json()).error.message, /only the claiming agent/);
+});

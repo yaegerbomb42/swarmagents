@@ -1,0 +1,209 @@
+/**
+ * Model capability presets and run-mode gating.
+ *
+ * Pure data + pure functions: safe to import from the settings UI as well as
+ * the server. Capabilities come from three places, in increasing priority:
+ *
+ *   1. the preset table below (known hosted models),
+ *   2. discovery (e.g. Ollama /api/show "capabilities"),
+ *   3. a per-model manual override saved on the provider config.
+ *
+ * A provider with no capability information is treated conservatively: it can
+ * call tools (most OpenAI-compatible servers can), but it has no vision, so a
+ * run starts in text mode and never wires the desktop/computer-use tools.
+ */
+
+import type { ModelCapabilities, ProviderConfig, RunMode } from "./types";
+
+/** Safe default for a model we know nothing about. */
+export const CONSERVATIVE_CAPABILITIES: ModelCapabilities = {
+  vision: false,
+  tools: true,
+  computerUse: false,
+  source: "preset",
+};
+
+const VISION_NAME = /(?:^|[-_/.:])(vision|vl|llava|pixtral|internvl|minicpm-v|gemma3)(?:[-_/.:]|$)|(?:qwen2(?:\.5)?-vl)|(?:llama-?3\.2.*vision)|(?:llama-?4.*(?:scout|maverick))/i;
+const NO_TOOLS_NAME = /(?:^|[-_/])(?:embed|embedding|rerank|whisper|tts)(?:[-_/]|$)/i;
+
+const ANTHROPIC_VISION = /claude-(?:3|3\.5|3\.7|4|sonnet-4|opus-4|haiku-4)/i;
+const ANTHROPIC_COMPUTER = /claude-(?:3\.5|3\.7|4|sonnet-4|opus-4|haiku-4)/i;
+const OPENAI_VISION = /(?:gpt-4o|gpt-4\.1|gpt-5|o3|o4|chatgpt-4o)/i;
+const OPENAI_COMPUTER = /(?:gpt-4o|gpt-4\.1|gpt-5|computer-use)/i;
+const GEMINI_VISION = /gemini-(?:1\.5|2|2\.5|3)/i;
+
+/** Capability preset for a provider id + model id. */
+export function presetModelCapabilities(providerId: string, model: string): ModelCapabilities {
+  const id = providerId.toLowerCase();
+  const m = model.toLowerCase();
+
+  if (NO_TOOLS_NAME.test(m)) {
+    return { vision: false, tools: false, computerUse: false, source: "preset" };
+  }
+
+  const namedVision = VISION_NAME.test(m);
+
+  if (id === "anthropic" || id === "radium") {
+    const vision = ANTHROPIC_VISION.test(m);
+    return {
+      vision,
+      tools: true,
+      computerUse: vision && ANTHROPIC_COMPUTER.test(m),
+      contextWindow: 200_000,
+      source: "preset",
+    };
+  }
+
+  if (id === "openai" || id === "azure-openai") {
+    const vision = OPENAI_VISION.test(m);
+    return {
+      vision,
+      tools: true,
+      computerUse: vision && OPENAI_COMPUTER.test(m),
+      contextWindow: 200_000,
+      source: "preset",
+    };
+  }
+
+  if (id === "gemini") {
+    const vision = GEMINI_VISION.test(m);
+    return {
+      vision,
+      tools: true,
+      computerUse: vision,
+      contextWindow: 1_000_000,
+      source: "preset",
+    };
+  }
+
+  if (id === "xai") {
+    const vision = /grok-(?:2|3|4)/i.test(m);
+    return {
+      vision,
+      tools: true,
+      computerUse: vision,
+      contextWindow: 256_000,
+      source: "preset",
+    };
+  }
+
+  if (id === "mistral") {
+    return {
+      vision: /pixtral|mistral-small-3|magistral.*vision/i.test(m),
+      tools: true,
+      computerUse: false,
+      contextWindow: 128_000,
+      source: "preset",
+    };
+  }
+
+  if (id === "cohere") {
+    return { vision: false, tools: true, computerUse: false, contextWindow: 128_000, source: "preset" };
+  }
+
+  if (id === "deepseek") {
+    return { vision: false, tools: true, computerUse: false, contextWindow: 128_000, source: "preset" };
+  }
+
+  // Local runtimes (Ollama, LM Studio) and open-weights routers: only trust the
+  // model name, and only for vision. Tool support is common but not universal;
+  // Ollama discovery refines it from /api/show.
+  return {
+    vision: namedVision,
+    tools: true,
+    computerUse: false,
+    source: "preset",
+  };
+}
+
+/** Capabilities for a model on a provider: preset, overlaid by saved overrides. */
+export function mergedModelCapabilities(
+  config: Pick<ProviderConfig, "id" | "modelCapabilities">,
+  model: string,
+): ModelCapabilities {
+  const override = config.modelCapabilities?.[model];
+  if (override) {
+    return { ...presetModelCapabilities(config.id, model), ...override, source: "override" };
+  }
+  return presetModelCapabilities(config.id, model);
+}
+
+/** True when a saved capability map overrides any field for this model. */
+export function hasCapabilityOverride(
+  config: Pick<ProviderConfig, "modelCapabilities">,
+  model: string,
+): boolean {
+  return config.modelCapabilities?.[model] !== undefined;
+}
+
+export interface RunModeInfo {
+  mode: RunMode;
+  /** Short badge text, e.g. "Text mode". */
+  label: string;
+  /** Full sentence explaining why, shown as a title/tooltip and in telemetry. */
+  reason: string;
+  provider?: string;
+  model?: string;
+  capabilities: ModelCapabilities;
+}
+
+/**
+ * Decide how a run should behave for the selected model.
+ *
+ * `desktopEnabled` is the deployment's desktop switch (SWARM_VM_DESKTOP=1).
+ * Even with it on, a model without vision or computer-use support must not
+ * get the desktop — it runs headless with shell/files/web/MCP tools.
+ */
+export function runModeForCapabilities(
+  capabilities: ModelCapabilities,
+  options: {
+    desktopEnabled: boolean;
+    provider?: string;
+    model?: string;
+  },
+): RunModeInfo {
+  const base = {
+    capabilities,
+    ...(options.provider ? { provider: options.provider } : {}),
+    ...(options.model ? { model: options.model } : {}),
+  };
+
+  if (!capabilities.tools) {
+    return {
+      ...base,
+      mode: "chat",
+      label: "Plain chat",
+      reason: "Plain chat: this model cannot call tools.",
+    };
+  }
+  if (!options.desktopEnabled) {
+    return {
+      ...base,
+      mode: "text",
+      label: "Text mode",
+      reason: "Text mode: the desktop is off for this deployment.",
+    };
+  }
+  if (!capabilities.vision) {
+    return {
+      ...base,
+      mode: "text",
+      label: "Text mode",
+      reason: "Text mode: this model has no vision.",
+    };
+  }
+  if (!capabilities.computerUse) {
+    return {
+      ...base,
+      mode: "text",
+      label: "Text mode",
+      reason: "Text mode: this model cannot use computer tools.",
+    };
+  }
+  return {
+    ...base,
+    mode: "gui",
+    label: "Desktop mode",
+    reason: "Desktop mode: vision and computer-use tools are enabled.",
+  };
+}

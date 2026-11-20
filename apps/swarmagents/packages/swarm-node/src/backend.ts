@@ -505,13 +505,27 @@ export class ContainerBackend implements NodeBackend {
   }
 
   async status(userId: string): Promise<{ status: string; error?: string }> {
-    const result = await this.docker([
-      "container",
-      "inspect",
-      "-f",
-      "{{.State.Status}}",
-      this.containerName(userId),
-    ]);
+    let result: NodeRunResult;
+    try {
+      result = await this.docker([
+        "container",
+        "inspect",
+        "-f",
+        "{{.State.Status}}",
+        this.containerName(userId),
+      ]);
+    } catch (err) {
+      // A status probe must answer, not throw: a machine without Docker on
+      // PATH (spawn ENOENT) reports that plainly so the user can install it
+      // or restart the node with --host-mode.
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return {
+          status: "error",
+          error: "Docker is not installed or not on PATH on this computer. Install Docker, or restart the node with --host-mode.",
+        };
+      }
+      throw err;
+    }
     if (result.exitCode !== 0) return { status: "missing" };
     const status = result.stdout.trim();
     if (status === "running") return { status: "running" };

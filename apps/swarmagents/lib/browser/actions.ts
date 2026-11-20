@@ -118,8 +118,11 @@ export async function evaluatePageExpression(
         return raw === undefined ? null : JSON.parse(JSON.stringify(raw));
       }, trimmed),
       new Promise<never>((_, reject) => {
+        // Deliberately not unref'd: the timer is the only thing guaranteed to
+        // settle this race, so it must keep the event loop alive until it
+        // fires or is cleared below. An unref'd timer let the process (or the
+        // test runner) exit with the evaluation still pending.
         timer = setTimeout(() => reject(new Error("Page evaluation timed out")), timeoutMs);
-        timer.unref?.();
       }),
     ]);
   } finally {

@@ -258,8 +258,15 @@ export class ByocVmDriver implements VmDriver {
       );
       const raw = (result as { status?: unknown } | null)?.status;
       const status = typeof raw === "string" ? raw : "";
-      if (status === "running" || status === "stopped" || status === "creating") {
+      if (status === "running" || status === "stopped" || status === "creating" || status === "missing") {
         return { status };
+      }
+      if (status === "error") {
+        const message = (result as { error?: unknown }).error;
+        return {
+          status: "error",
+          error: typeof message === "string" && message ? message.slice(0, 300) : "The node reported an error.",
+        };
       }
       return { status: "error", error: "The node reported an unknown status." };
     } catch (err) {

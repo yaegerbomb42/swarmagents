@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { atomicWriteFile } from "../atomic-write";
 import type { AmbientRule, PostedRunReport } from "./types";
 
 function homeDir(): string {
@@ -41,12 +42,53 @@ export function loadRules(): AmbientRule[] {
   }
 }
 
+/**
+ * Rules can carry webhook secrets, so the file is owner-only (0o600) in an
+ * owner-only directory, and is replaced atomically (temp + fsync + rename).
+ */
 export function saveRules(rules: AmbientRule[]): void {
   const file = rulesPath();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(rules, null, 2));
-  fs.renameSync(tmp, file);
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  atomicWriteFile(file, JSON.stringify(rules, null, 2), { encoding: "utf-8", mode: 0o600 });
+  try {
+    // The temp file is created with 0o600, but a umask or a pre-existing
+    // file on an odd mount could still leave it wider; tighten best effort.
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // Best effort on read-only or foreign-owned mounts.
+  }
+}
+
+class AsyncLock {
+  private tail: Promise<void> = Promise.resolve();
+  async acquire<T>(fn: () => T | Promise<T>): Promise<T> {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+}
+
+// Next can bundle the watchers route and the ambient engine separately; share
+// one load/modify/save lock per process across those module instances.
+const globals = globalThis as typeof globalThis & { __swarmAmbientRulesLock?: AsyncLock };
+const rulesLock = (globals.__swarmAmbientRulesLock ??= new AsyncLock());
+
+/**
+ * Run an async read-modify-write against the rules file while holding the
+ * in-process rules lock, so concurrent writers that await between load and
+ * save cannot lose each other's updates. `fn` receives a fresh load.
+ */
+export function withLockedRules<T>(fn: (rules: AmbientRule[]) => T | Promise<T>): Promise<T> {
+  return rulesLock.acquire(() => fn(loadRules()));
 }
 
 export function upsertRule(rule: AmbientRule): void {

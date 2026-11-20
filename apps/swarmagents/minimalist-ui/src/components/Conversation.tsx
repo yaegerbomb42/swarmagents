@@ -32,7 +32,7 @@ import {
 import type { AgentSession, PromptDisplay } from "../hooks/useAgentSession";
 import type { ThreadEntry } from "../../../lib/client/thread";
 import { describeRunFailure } from "../../../lib/client/thread";
-import { buildConversation, shortToolName } from "../../../lib/client/conversation";
+import { buildConversation } from "../../../lib/client/conversation";
 import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
 import { useStickToBottom } from "../../../lib/client/useStickToBottom";
 import {
@@ -174,7 +174,8 @@ function ToolDetail({ entry }: { entry: ToolEntry }) {
   );
 }
 
-function StepRow({ step }: { step: StepEntry }) {
+/** One tool call in an expanded steps block. Exported for the static-render tests. */
+export function StepRow({ step }: { step: StepEntry }) {
   const [open, setOpen] = useState(false);
   if (step.kind === "status") {
     return (
@@ -207,9 +208,14 @@ function StepRow({ step }: { step: StepEntry }) {
             <X className="h-3.5 w-3.5 text-sa-err" aria-label="Failed" />
           )}
         </span>
-        <span className="shrink-0 text-sa-fg3">{shortToolName(step.name)}</span>
+        {/* The label already names the action ("Writing /workspace/hello.txt"),
+            so a separate tool-name column would double the verb ("Write
+            Writing ..."). */}
         <span className="sa-mono min-w-0 flex-1 truncate text-[12.5px] text-sa-fg2">{step.label}</span>
-        {step.durationMs !== undefined && step.status !== "running" && (
+        {/* A 0 ms duration means the call and its result were stamped in the
+            same millisecond — no real elapsed time was recorded, so showing
+            "0 ms" reads as a bug. */}
+        {step.durationMs !== undefined && step.durationMs > 0 && step.status !== "running" && (
           <span className="sa-tabular shrink-0 text-[12px] text-sa-fg3">{formatStepDuration(step.durationMs)}</span>
         )}
         <ChevronRight

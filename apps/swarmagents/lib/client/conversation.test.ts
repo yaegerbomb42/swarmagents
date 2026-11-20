@@ -101,6 +101,34 @@ test("conversation: an unpaired tool call stays running", () => {
   assert.equal(entries[0].status, "running");
 });
 
+test("conversation: a tool call whose result never arrives settles when the run ends", () => {
+  // The live bug: a Bash step kept showing "Running" after the run finished
+  // because its tool.result never paired by id. A finished run has no tool
+  // still running.
+  const finished = buildConversation([
+    item("tool.call", { id: "t1", name: "Bash", input: { command: "python3 /workspace/fib.py" } }),
+    item("run.finished", { exitCode: 0, costUsd: 0.01, durationMs: 3800 }),
+  ]);
+  assert.equal(finished.length, 2);
+  assert.ok(finished[0].kind === "tool");
+  assert.equal(finished[0].label, "Running: python3 /workspace/fib.py");
+  assert.equal(finished[0].status, "done", "a finished run settles the step to done");
+
+  const errored = buildConversation([
+    item("tool.call", { id: "t1", name: "Bash", input: { command: "python3 /workspace/fib.py" } }),
+    item("run.error", { message: "claude exited with code 1" }),
+  ]);
+  assert.ok(errored[0].kind === "tool");
+  assert.equal(errored[0].status, "error", "an errored run settles the step to error");
+
+  const cancelled = buildConversation([
+    item("tool.call", { id: "t1", name: "Bash", input: { command: "python3 /workspace/fib.py" } }),
+    item("run.cancelled", {}),
+  ]);
+  assert.ok(cancelled[0].kind === "tool");
+  assert.equal(cancelled[0].status, "error", "a cancelled run settles the step to error");
+});
+
 test("conversation: ask_user renders as a question card, not a raw tool row", () => {
   const entries = buildConversation([
     item("tool.call", { id: "t_ask", name: "mcp__ask__ask_user", input: { question: "Which engine?" } }),

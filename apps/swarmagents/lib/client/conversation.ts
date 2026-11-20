@@ -176,6 +176,22 @@ export function splitUploadedFiles(prompt: string): UploadedPrompt {
   return { text, attachments };
 }
 
+/**
+ * A run that reached a terminal state has no tool still running: settle any
+ * tool entry whose result never arrived (or never paired by id), so the steps
+ * block stops showing "Running" after the run finished. A finished run
+ * implies its tools completed; an errored or cancelled run implies the
+ * in-flight tool did not.
+ */
+function settleRunningTools(
+  toolByKey: ReadonlyMap<string, Extract<ConversationEntry, { kind: "tool" }>>,
+  status: "done" | "error",
+): void {
+  for (const entry of toolByKey.values()) {
+    if (entry.status === "running") entry.status = status;
+  }
+}
+
 function questionResolvedStatus(status: string): "answered" | "cancelled" | "expired" {
   return status === "answered" ? "answered" : status === "expired" ? "expired" : "cancelled";
 }
@@ -381,6 +397,7 @@ export function buildConversation(items: readonly RunStreamItem[]): Conversation
         break;
       }
       case "run.finished": {
+        settleRunningTools(toolByKey, "done");
         const cost = asNumber(data.costUsd);
         const duration = asNumber(data.durationMs);
         const parts = ["Done"];
@@ -396,6 +413,7 @@ export function buildConversation(items: readonly RunStreamItem[]): Conversation
         break;
       }
       case "run.error": {
+        settleRunningTools(toolByKey, "error");
         entries.push({
           kind: "status",
           key: `error:${item.seq}`,
@@ -406,6 +424,7 @@ export function buildConversation(items: readonly RunStreamItem[]): Conversation
         break;
       }
       case "run.cancelled": {
+        settleRunningTools(toolByKey, "error");
         entries.push({ kind: "status", key: `cancelled:${item.seq}`, ts: item.ts, text: "Run stopped", tone: "info" });
         break;
       }

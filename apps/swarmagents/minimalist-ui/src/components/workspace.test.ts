@@ -10,6 +10,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { RUN_PHASE_META, type RunPhase } from "../../../lib/client/runPhase";
 import type { ConversationEntry } from "../../../lib/client/conversation";
+import type { ToolEntry } from "../../../lib/client/turns";
 import { countOf, installBrowserStubs, makeBoard, makeEntry, makeSession, makeTask, tagOf } from "../testing/harness";
 
 const h = React.createElement;
@@ -373,6 +374,33 @@ test("the live turn shows what the agent is doing, with a way to its screen", as
   assert.match(html, />Running</);
   assert.equal(countOf(html, 'data-testid="watch-screen"'), 1, "jump to this run's screen");
   assert.equal(countOf(html, 'data-testid="run-report"'), 0, "no report until the run ends");
+});
+
+test("a step row shows its label once, with no doubled verb and no 0 ms duration", async () => {
+  const { StepRow } = await load();
+  const write: ToolEntry = {
+    kind: "tool",
+    key: "tool:t1",
+    ts: 1_000,
+    name: "Write",
+    label: "Writing /workspace/hello.txt",
+    status: "done",
+    input: { file_path: "/workspace/hello.txt" },
+    durationMs: 0,
+  };
+  const html = renderToStaticMarkup(h(StepRow, { step: write }));
+  assert.match(html, /Writing \/workspace\/hello\.txt/);
+  assert.equal(countOf(html, "Write Writing"), 0, "the verb is not doubled");
+  assert.equal(countOf(html, "0 ms"), 0, "a 0 ms duration is not shown");
+
+  // A real duration is still shown.
+  const slow = renderToStaticMarkup(h(StepRow, { step: { ...write, durationMs: 500 } }));
+  assert.match(slow, /500 ms/);
+
+  // A running step shows the spinner and no duration.
+  const running = renderToStaticMarkup(h(StepRow, { step: { ...write, status: "running", durationMs: 500 } }));
+  assert.match(running, /aria-label="Running"/);
+  assert.equal(countOf(running, "500 ms"), 0);
 });
 
 test("the way to the screen is left out while the screen is already on show", async () => {

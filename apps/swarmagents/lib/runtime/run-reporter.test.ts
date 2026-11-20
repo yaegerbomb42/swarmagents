@@ -228,6 +228,38 @@ test("reporter creates a report with artifacts diffed from the workspace listing
   }
 });
 
+test("reporter counts a file the Write telemetry proves it wrote, even when the start listing already has it", async () => {
+  const runsDir = tmpDir();
+  try {
+    const driver = new FakeFindDriver();
+    // The file is already in the workspace before vm.ready: the start listing
+    // (captured asynchronously after vm.ready) already contains it, so the
+    // listing diff alone would report 0 files changed — the live bug. The
+    // run's own Write call is the proof the run wrote it.
+    driver.entries.set("/workspace/hello.txt", { size: 23, mtimeMs: 2_000 });
+    const { bus, reporter } = setup(driver, runsDir);
+    const runId = "run_write_proof";
+    reporter.attach(runId, "alice");
+    bus.publish(runId, { type: "run.created", data: { prompt: "create hello.txt", userId: "alice" } });
+    bus.publish(runId, { type: "vm.ready", data: { ms: 1 } });
+    bus.publish(runId, { type: "tool.call", name: "Write", id: "t1", input: { file_path: "/workspace/hello.txt" } } as never);
+    bus.publish(runId, { type: "tool.result", id: "t1", ok: true } as never);
+    bus.publish(runId, { type: "run.finished", exitCode: 0, sessionId: "s1" } as never);
+
+    const report = await waitFor(() => readRunReport(runId, runsDir));
+    assert.equal(report.meta.artifacts, 1);
+    // The file is in the (raced) start baseline, so the telemetry-derived
+    // entry is labelled "modified" — the point is the count: the diff alone
+    // reported 0, the Write telemetry proves the run wrote the file.
+    assert.deepEqual(
+      report.artifacts.map((artifact) => [artifact.rel, artifact.change]),
+      [["hello.txt", "modified"]],
+    );
+  } finally {
+    fs.rmSync(runsDir, { recursive: true, force: true });
+  }
+});
+
 test("reporter samples action screenshots to the cap but keeps start and end", async () => {
   const runsDir = tmpDir();
   try {

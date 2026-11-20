@@ -1,0 +1,223 @@
+From 06cb760bfc2e3aee29d78f5f0d7a8f35cc24846d Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 13:30:31 -0600
+Subject: [PATCH] feat(ui): add stream status badge to terminal header
+
+---
+ .../lib/client/useRunStream.test.ts           | 50 +++++++++++++++++++
+ apps/swarmagents/lib/client/useRunStream.ts   | 46 ++++++++++++++++-
+ .../src/components/ComputerScreen.tsx         | 20 +++++++-
+ 3 files changed, 113 insertions(+), 3 deletions(-)
+ create mode 100644 apps/swarmagents/lib/client/useRunStream.test.ts
+
+diff --git a/apps/swarmagents/lib/client/useRunStream.test.ts b/apps/swarmagents/lib/client/useRunStream.test.ts
+new file mode 100644
+index 000000000..13bb2cdee
+--- /dev/null
++++ b/apps/swarmagents/lib/client/useRunStream.test.ts
+@@ -0,0 +1,50 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { getRunStreamBadge, type RunStreamItem } from "./useRunStream.js";
++
++function item(kind: string): RunStreamItem {
++  return { seq: 1, kind, data: {}, parsed: { data: "{}" }, ts: Date.now() };
++}
++
++test("maps connecting state", () => {
++  assert.deepEqual(
++    getRunStreamBadge({ status: "connecting", items: [], reconnectAttempt: 0 }),
++    { label: "connecting", tone: "connecting" },
++  );
++});
++
++test("maps connected state to live", () => {
++  assert.deepEqual(
++    getRunStreamBadge({ status: "connected", items: [item("assistant.text")], reconnectAttempt: 0 }),
++    { label: "live", tone: "live" },
++  );
++});
++
++test("maps reconnecting state with attempt number", () => {
++  assert.deepEqual(
++    getRunStreamBadge({ status: "reconnecting", items: [], reconnectAttempt: 3 }),
++    { label: "reconnecting (attempt 3)", tone: "reconnecting" },
++  );
++  assert.deepEqual(
++    getRunStreamBadge({ status: "reconnecting", items: [], reconnectAttempt: 0 }),
++    { label: "reconnecting (attempt 1)", tone: "reconnecting" },
++  );
++});
++
++test("maps terminal run events to ended", () => {
++  assert.deepEqual(
++    getRunStreamBadge({ status: "connected", items: [item("run.finished")], reconnectAttempt: 0 }),
++    { label: "ended", tone: "ended" },
++  );
++  assert.deepEqual(
++    getRunStreamBadge({ status: "reconnecting", items: [item("run.cancelled")], reconnectAttempt: 2 }),
++    { label: "ended", tone: "ended" },
++  );
++});
++
++test("maps run.error to error", () => {
++  assert.deepEqual(
++    getRunStreamBadge({ status: "connected", items: [item("run.error")], reconnectAttempt: 0, error: "boom" }),
++    { label: "error", tone: "error" },
++  );
++});
+diff --git a/apps/swarmagents/lib/client/useRunStream.ts b/apps/swarmagents/lib/client/useRunStream.ts
+index 8f69c6ab4..e77093f7a 100644
+--- a/apps/swarmagents/lib/client/useRunStream.ts
++++ b/apps/swarmagents/lib/client/useRunStream.ts
+@@ -40,6 +40,41 @@ export interface RunStreamState {
+   status: RunStreamStatus;
+   items: RunStreamItem[];
+   error?: string;
++  /** 1-based reconnect attempt while status is reconnecting; 0 otherwise. */
++  reconnectAttempt: number;
++}
++
++export type RunStreamBadgeTone = "connecting" | "live" | "reconnecting" | "ended" | "error";
++
++export interface RunStreamBadge {
++  label: string;
++  tone: RunStreamBadgeTone;
++}
++
++function isTerminalEnd(item: RunStreamItem | undefined): boolean {
++  if (!item) return false;
++  return item.kind === "run.finished" || item.kind === "run.cancelled";
++}
++
++export function getRunStreamBadge(state: Pick<RunStreamState, "status" | "items" | "error" | "reconnectAttempt">): RunStreamBadge {
++  const last = state.items[state.items.length - 1];
++  if (last?.kind === "run.error") return { label: "error", tone: "error" };
++  if (isTerminalEnd(last)) return { label: "ended", tone: "ended" };
++
++  switch (state.status) {
++    case "idle":
++      return { label: "idle", tone: "ended" };
++    case "connecting":
++      return { label: "connecting", tone: "connecting" };
++    case "connected":
++      return { label: "live", tone: "live" };
++    case "reconnecting": {
++      const n = Math.max(1, state.reconnectAttempt || 1);
++      return { label: `reconnecting (attempt ${n})`, tone: "reconnecting" };
++    }
++    default:
++      return state.error ? { label: "error", tone: "error" } : { label: "connecting", tone: "connecting" };
++  }
+ }
+ 
+ const MAX_LINES = 2000;
+@@ -49,6 +84,7 @@ export function useRunStream(runId?: string | null): RunStreamState {
+   const [status, setStatus] = useState<RunStreamStatus>("idle");
+   const [error, setError] = useState<string>();
+   const [items, setItems] = useState<RunStreamItem[]>([]);
++  const [reconnectAttempt, setReconnectAttempt] = useState(0);
+ 
+   // Refs survive React StrictMode effect remounts, so a remount reconnects
+   // with Last-Event-ID instead of replaying every buffered event.
+@@ -64,6 +100,7 @@ export function useRunStream(runId?: string | null): RunStreamState {
+       setItems([]);
+       setStatus("idle");
+       setError(undefined);
++      setReconnectAttempt(0);
+       return;
+     }
+ 
+@@ -93,7 +130,9 @@ export function useRunStream(runId?: string | null): RunStreamState {
+       if (!alive) return;
+       const headers: Record<string, string> = {};
+       if (lastIdRef.current) headers["Last-Event-ID"] = lastIdRef.current;
+-      setStatus(attempt === 0 ? "connecting" : "reconnecting");
++      const reconnecting = attempt > 0;
++      setStatus(reconnecting ? "reconnecting" : "connecting");
++      setReconnectAttempt(reconnecting ? attempt : 0);
+       try {
+         const res = await fetch(`/api/runtime/stream/${encodeURIComponent(runId)}`, {
+           headers,
+@@ -102,6 +141,7 @@ export function useRunStream(runId?: string | null): RunStreamState {
+         if (!res.ok || !res.body) throw new Error(`stream responded ${res.status}`);
+         setStatus("connected");
+         setError(undefined);
++        setReconnectAttempt(0);
+         const reader = res.body.getReader();
+         const decoder = new TextDecoder();
+         for (;;) {
+@@ -130,6 +170,7 @@ export function useRunStream(runId?: string | null): RunStreamState {
+         setError(message);
+         const delayMs = backoffDelayMs(attempt);
+         attempt += 1;
++        setReconnectAttempt(attempt);
+         timer = setTimeout(() => void connect(), delayMs);
+       }
+     };
+@@ -141,8 +182,9 @@ export function useRunStream(runId?: string | null): RunStreamState {
+       outer.abort();
+       if (timer) clearTimeout(timer);
+       setStatus("idle");
++      setReconnectAttempt(0);
+     };
+   }, [runId]);
+ 
+-  return { status, items, error };
++  return { status, items, error, reconnectAttempt };
+ }
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index 9f480305d..76bf18bc0 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
+ import { Terminal, Globe, ShieldCheck, Cpu, FileText } from "lucide-react";
+ import type { LogEvent } from "../engine";
+ import { AnsiRenderer } from "../../../components/AnsiRenderer";
+-import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
++import { getRunStreamBadge, useRunStream, type RunStreamBadgeTone, type RunStreamItem } from "../../../lib/client/useRunStream";
+ import {
+   EMPTY_TERMINAL_HISTORY,
+   sanitizeTerminalHistory,
+@@ -236,6 +236,14 @@ function TerminalEmptyState({ title, hint }: { title: string; hint: string }) {
+   );
+ }
+ 
++const STREAM_BADGE_CLASS: Record<RunStreamBadgeTone, string> = {
++  connecting: "border-sky-400/40 bg-sky-500/15 text-sky-300",
++  live: "border-emerald-400/40 bg-emerald-500/15 text-emerald-300",
++  reconnecting: "border-amber-400/40 bg-amber-500/15 text-amber-300",
++  ended: "border-white/20 bg-white/10 text-white/60",
++  error: "border-rose-400/40 bg-rose-500/15 text-rose-300",
++};
++
+ export function ComputerScreen({
+   logs,
+   runId,
+@@ -248,6 +256,7 @@ export function ComputerScreen({
+ }: ComputerScreenProps) {
+   const stream = useRunStream(runId);
+   const liveRun = Boolean(runId);
++  const streamBadge = liveRun ? getRunStreamBadge(stream) : null;
+ 
+   // Each run.finished bumps this token; the Files view watches it and re-reads
+   // the workspace so files written during the run show up without a manual refresh.
+@@ -390,6 +399,15 @@ export function ComputerScreen({
+             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+             agent-vm-01 (Debian 12 Bookworm) · {activeRoleName}
+           </span>
++          {streamBadge && (
++            <span
++              data-testid="stream-status-badge"
++              className={`ml-2 inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-mono uppercase tracking-wide ${STREAM_BADGE_CLASS[streamBadge.tone]}`}
++              title={stream.error ? `Stream: ${streamBadge.label} (${stream.error})` : `Stream: ${streamBadge.label}`}
++            >
++              {streamBadge.label}
++            </span>
++          )}
+         </div>
+ 
+         {/* View Switcher Tabs */}
+-- 
+2.55.0
+

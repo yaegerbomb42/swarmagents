@@ -1,0 +1,484 @@
+From 3017d686581dbbcd353a48f34329b403267521c7 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 11:32:55 -0600
+Subject: [PATCH] fix(installer): harden node installer and achieve powershell
+ parity
+
+---
+ .../api/computers/node/install/route.test.ts  | 112 ++++++-
+ .../app/api/computers/node/install/route.ts   | 293 ++++++++++++++++--
+ 2 files changed, 373 insertions(+), 32 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/computers/node/install/route.test.ts b/apps/swarmagents/app/api/computers/node/install/route.test.ts
+index 7d24493fb..040a24e8c 100644
+--- a/apps/swarmagents/app/api/computers/node/install/route.test.ts
++++ b/apps/swarmagents/app/api/computers/node/install/route.test.ts
+@@ -9,8 +9,8 @@ import { GET } from "./route";
+ 
+ const CODE = "ABCDE-FGHIJ";
+ 
+-async function installScript(): Promise<string> {
+-  const res = await GET(new NextRequest("http://localhost/api/computers/node/install?os=linux"));
++async function installScript(osType = "linux"): Promise<string> {
++  const res = await GET(new NextRequest(`http://localhost/api/computers/node/install?os=${osType}`));
+   return res.text();
+ }
+ 
+@@ -163,3 +163,111 @@ test("installer rejects a truncated or non-hex node token", async () => {
+     assert.equal(fs.existsSync(path.join(dir, ".swarmagents", "computer.json")), false);
+   }
+ });
++
++test("installer rejects trailing flags with a clean usage message without crashing", async () => {
++  const dir = tmp();
++  const bin = fakeBin(dir, realPython());
++  const script = await installScript();
++
++  for (const flag of ["--code", "--server", "--mode"]) {
++    const res = runInstaller(script, dir, bin, {}, ["--code", CODE, flag]);
++    assert.equal(res.status, 1, `trailing flag ${flag} must exit 1: ${res.stderr}`);
++    assert.match(String(res.stderr), /Usage:/, `trailing flag ${flag} must print usage message`);
++    assert.doesNotMatch(String(res.stderr), /unbound variable|shift/, `trailing flag ${flag} must not crash`);
++  }
++
++  // Also verify passing a trailing flag when it is the only argument
++  for (const flag of ["--code", "--server", "--mode"]) {
++    const res = runInstaller(script, dir, bin, {}, [flag]);
++    assert.equal(res.status, 1, `lone trailing flag ${flag} must exit 1`);
++    assert.match(String(res.stderr), /Usage:/);
++    assert.doesNotMatch(String(res.stderr), /unbound variable|shift/);
++  }
++});
++
++test("installer rejects invalid or non-HTTPS --server URLs unless loopback", async () => {
++  const dir = tmp();
++  const marker = path.join(dir, "curl-data");
++  const bin = fakeBin(dir, realPython());
++  const script = await installScript();
++  const body = JSON.stringify({ computer: { id: "cmp_test" }, nodeToken: "A".repeat(64) });
++
++  const invalidServers = [
++    'https://example.com"bad',
++    "https://example.com/api",
++    "http://insecure.com",
++    "ftp://example.com",
++    "javascript:alert(1)",
++    "https://example.com; rm -rf /",
++    "https://example.com\\path",
++  ];
++
++  for (const server of invalidServers) {
++    const res = runInstaller(script, dir, bin, { CURL_DATA: marker, CURL_BODY: body }, [
++      "--code",
++      CODE,
++      "--server",
++      server,
++    ]);
++    assert.equal(res.status, 1, `server ${JSON.stringify(server)} must be rejected: ${res.stderr}`);
++    assert.match(String(res.stderr), /Invalid --server URL/);
++  }
++  assert.equal(fs.existsSync(marker), false, "invalid server must not contact endpoint");
++});
++
++test("installer accepts valid HTTPS --server URLs and HTTP loopback", async () => {
++  const python = realPython();
++  if (!python) return;
++  const script = await installScript();
++  const body = JSON.stringify({ computer: { id: "cmp_test" }, nodeToken: "A".repeat(64) });
++
++  const validServers = [
++    "https://swarmagents.codes",
++    "https://swarmagents.codes:443",
++    "https://sub.domain-test.co:8443",
++    "http://localhost:3777",
++    "http://127.0.0.1:8080",
++  ];
++
++  for (const server of validServers) {
++    const dir = tmp();
++    const marker = path.join(dir, "curl-data");
++    const bin = fakeBin(dir, python);
++    const res = runInstaller(script, dir, bin, {
++      REAL_PYTHON: python,
++      CURL_DATA: marker,
++      CURL_BODY: body,
++    }, ["--code", CODE, "--server", server]);
++    assert.equal(res.status, 0, `server ${server} must be accepted: ${res.stderr}`);
++    const config = JSON.parse(
++      fs.readFileSync(path.join(dir, ".swarmagents", "computer.json"), "utf8"),
++    ) as Record<string, unknown>;
++    assert.equal(config.server, server);
++  }
++});
++
++test("PowerShell installer script validates Mode, server, and uses --resume, stream-json, and file ACLs", async () => {
++  const psScript = await installScript("windows");
++
++  // Mode validation
++  assert.match(psScript, /\$Mode\s+-notmatch\s+'\^\(host\|docker\|sandbox\)\$'/);
++
++  // Server validation
++  assert.match(psScript, /\$Server\s+-notmatch\s+'\^https\?:\/\/\[A-Za-z0-9\._:-\]\+\$'/);
++  assert.match(psScript, /localhost|127/);
++
++  // Prompt separation with --
++  assert.match(psScript, /claudeArgs.*--.*prompt|claudeArgs\s*\+=\s*@\("--",\s*\$prompt\)/);
++
++  // --resume session continuity
++  assert.match(psScript, /--resume/);
++
++  // --output-format stream-json telemetry forwarding
++  assert.match(psScript, /--output-format.*stream-json/);
++
++  // Background heartbeat job
++  assert.match(psScript, /Start-Job.*heartbeat|heartbeatJob/);
++
++  // Restrictive file ACLs on computer.json
++  assert.match(psScript, /SetAccessRuleProtection|FileSystemAccessRule|Set-Acl|icacls/);
++});
+diff --git a/apps/swarmagents/app/api/computers/node/install/route.ts b/apps/swarmagents/app/api/computers/node/install/route.ts
+index adca0676a..151c70f0e 100644
+--- a/apps/swarmagents/app/api/computers/node/install/route.ts
++++ b/apps/swarmagents/app/api/computers/node/install/route.ts
+@@ -29,24 +29,68 @@ const NO_STORE = { "cache-control": "no-store", "content-type": "text/plain; cha
+ const SHELL_SCRIPT = String.raw`#!/bin/sh
+ # SwarmAgents computer installer: pair, save the node token, then serve runs.
+ set -eu
++usage() {
++  echo "Usage: $0 --code <pairing-code> [--server <url>] [--mode host|docker|sandbox]" >&2
++  exit 1
++}
+ CODE=""
+ SERVER="https://swarmagents.codes"
+ MODE="host"
+ while [ $# -gt 0 ]; do
+   case "$1" in
+-    --code) CODE="$2"; shift 2 ;;
+-    --server) SERVER="$2"; shift 2 ;;
+-    --mode) MODE="$2"; shift 2 ;;
++    --code)
++      [ $# -ge 2 ] || usage
++      CODE="$2"; shift 2 ;;
++    --server)
++      [ $# -ge 2 ] || usage
++      SERVER="$2"; shift 2 ;;
++    --mode)
++      [ $# -ge 2 ] || usage
++      MODE="$2"; shift 2 ;;
+     *) shift ;;
+   esac
+ done
+ if [ -z "$CODE" ]; then
+-  echo "Missing --code. Create a pairing code in Settings > Computers." >&2
+-  exit 1
++  usage
+ fi
+ case "$CODE" in
+   *[!A-Za-z0-9-]*) echo "Invalid pairing code." >&2; exit 1 ;;
+ esac
++# Validate SERVER: must match ^https?://[A-Za-z0-9._:-]+$ and require https://
++# unless targeting loopback (localhost or 127.0.0.1).
++case "$SERVER" in
++  http://localhost|http://localhost:*|http://127.0.0.1|http://127.0.0.1:*) ;;
++  https://*)
++    # Check that the rest contains only valid host/port characters
++    REST=$(printf '%s' "$SERVER" | sed 's|^https://||')
++    case "$REST" in
++      ""|*[!A-Za-z0-9._:-]*)
++        echo "Invalid --server URL. Must match ^https?://[A-Za-z0-9._:-]+$ (HTTPS required unless loopback)." >&2
++        exit 1
++        ;;
++    esac
++    ;;
++  http://*)
++    echo "Invalid --server URL. HTTPS is required unless targeting loopback (localhost or 127.0.0.1)." >&2
++    exit 1
++    ;;
++  *)
++    echo "Invalid --server URL. Must match ^https?://[A-Za-z0-9._:-]+$ (HTTPS required unless loopback)." >&2
++    exit 1
++    ;;
++esac
++# Further verify loopback REST has no invalid characters
++case "$SERVER" in
++  http://*)
++    REST=$(printf '%s' "$SERVER" | sed 's|^http://||')
++    case "$REST" in
++      ""|*[!A-Za-z0-9._:-]*)
++        echo "Invalid --server URL. Must match ^https?://[A-Za-z0-9._:-]+$." >&2
++        exit 1
++        ;;
++    esac
++    ;;
++esac
+ # --mode is interpolated into the pairing JSON, so accept only the known
+ # values. Anything else (quotes, braces, arbitrary text) fails closed before
+ # the request is made.
+@@ -386,9 +430,39 @@ while True:
+ PY
+ `;
+ 
+-const POWERSHELL_SCRIPT = `param([string]$Code, [string]$Server = "https://swarmagents.codes", [string]$Mode = "host")
++const POWERSHELL_SCRIPT = String.raw`param([string]$Code, [string]$Server = "https://swarmagents.codes", [string]$Mode = "host")
+ $ErrorActionPreference = "Stop"
+-if (-not $Code) { Write-Error "Missing -Code. Create a pairing code in Settings > Computers."; exit 1 }
++
++function Show-Usage {
++  Write-Host "Usage: install.ps1 -Code <pairing-code> [-Server <url>] [-Mode host|docker|sandbox]"
++  exit 1
++}
++
++if (-not $Code) {
++  Show-Usage
++}
++
++if ($Code -notmatch '^[A-Za-z0-9-]+$') {
++  Write-Error "Invalid pairing code."
++  exit 1
++}
++
++# Validate $Mode: must be host, docker, or sandbox
++if ($Mode -notmatch '^(host|docker|sandbox)$') {
++  Write-Error "Invalid -Mode. Use host, docker or sandbox."
++  exit 2
++}
++
++# Validate $Server: match ^https?://[A-Za-z0-9._:-]+$ and require https:// unless loopback
++if ($Server -notmatch '^https?://[A-Za-z0-9._:-]+$') {
++  Write-Error "Invalid -Server URL. Must match ^https?://[A-Za-z0-9._:-]+$."
++  exit 1
++}
++if ($Server -match '^http://' -and $Server -notmatch '^http://(localhost|127\.0\.0\.1)(:\d+)?$') {
++  Write-Error "Invalid -Server URL. HTTPS is required unless targeting loopback (localhost or 127.0.0.1)."
++  exit 1
++}
++
+ $machine = @{ os = "windows"; arch = $env:PROCESSOR_ARCHITECTURE; mode = $Mode }
+ $pairBody = @{ code = $Code; machine = $machine } | ConvertTo-Json -Depth 4
+ try {
+@@ -397,40 +471,199 @@ try {
+   Write-Error "Pairing failed. The code may be expired or already used."
+   exit 1
+ }
++
+ $dir = Join-Path $HOME ".swarmagents"
+ New-Item -ItemType Directory -Force -Path $dir | Out-Null
++$configPath = Join-Path $dir "computer.json"
+ $config = @{ computerId = $pair.computer.id; nodeToken = $pair.nodeToken; server = $Server } | ConvertTo-Json
+-Set-Content -Path (Join-Path $dir "computer.json") -Value $config -Encoding utf8
++Set-Content -Path $configPath -Value $config -Encoding utf8
++
++# Restrict file ACLs on computer.json so only current user and SYSTEM have access
++try {
++  $acl = Get-Acl -Path $configPath
++  $acl.SetAccessRuleProtection($true, $false)
++  $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
++  $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, "FullControl", "Allow")
++  $acl.SetAccessRule($accessRule)
++  Set-Acl -Path $configPath -AclObject $acl
++} catch {
++  # Fallback to icacls if PowerShell ACL manipulation encounters edge cases
++  try {
++    icacls $configPath /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
++  } catch {}
++}
++
+ Write-Host "Paired as $($pair.computer.id). Keeping this computer online (Ctrl-C to stop)."
+ $headers = @{ Authorization = "Bearer $($pair.nodeToken)"; "x-computer-id" = $pair.computer.id }
+ $node = "$Server/api/computers/node"
+-while ($true) {
+-  try {
+-    Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body (@{ action = "heartbeat"; machine = $machine } | ConvertTo-Json -Depth 4) | Out-Null
+-  } catch {}
+-  $claim = $null
+-  try { $claim = Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body (@{ action = "claim" } | ConvertTo-Json) } catch {}
+-  if ($claim -and $claim.job) {
+-    $job = $claim.job
+-    $status = "finished"
+-    $code = 0
+-    $text = ""
+-    $errorText = ""
++
++# Background heartbeat job to keep the node online during long-running tasks
++$heartbeatScript = {
++  param($endpoint, $hdrs, $mach)
++  while ($true) {
+     try {
+-      $text = (& claude -p $job.prompt 2>&1 | Out-String)
+-      $code = $LASTEXITCODE
+-      if ($code -ne 0) { $status = "error" }
+-    } catch {
+-      $code = 127
+-      $status = "error"
+-      $errorText = "claude is not installed on this computer."
++      Invoke-RestMethod -Method Post -Uri $endpoint -Headers $hdrs -ContentType "application/json" -Body (@{ action = "heartbeat"; machine = $mach } | ConvertTo-Json -Depth 4) | Out-Null
++    } catch {}
++    Start-Sleep -Seconds 20
++  }
++}
++$heartbeatJob = Start-Job -ScriptBlock $heartbeatScript -ArgumentList $node, $headers, $machine
++
++try {
++  while ($true) {
++    # Ensure heartbeat job remains running
++    if ($heartbeatJob.State -ne "Running") {
++      try { Remove-Job -Job $heartbeatJob -Force | Out-Null } catch {}
++      $heartbeatJob = Start-Job -ScriptBlock $heartbeatScript -ArgumentList $node, $headers, $machine
+     }
++
++    $claim = $null
+     try {
+-      $body = @{ action = "complete"; runId = $job.runId; result = @{ status = $status; exitCode = $code; text = $text; error = $errorText } } | ConvertTo-Json -Depth 5
+-      Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body $body | Out-Null
++      $claim = Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body (@{ action = "claim" } | ConvertTo-Json)
+     } catch {}
++
++    if ($claim -and $claim.job) {
++      $job = $claim.job
++      $runId = $job.runId
++      $sessionId = $job.sessionId
++      $prompt = if ($job.prompt) { $job.prompt } else { "" }
++
++      $claudeArgs = @("-p", "--output-format", "stream-json", "--verbose")
++      if ($sessionId) {
++        $claudeArgs += @("--resume", $sessionId)
++      }
++      $claudeArgs += @("--", $prompt)
++
++      $status = "finished"
++      $code = 0
++      $textParts = New-Object System.Collections.Generic.List[string]
++      $sawTextEvent = $false
++      $errorText = ""
++      $meta = @{}
++      if ($sessionId) {
++        $meta["sessionId"] = $sessionId
++      }
++
++      try {
++        $psi = New-Object System.Diagnostics.ProcessStartInfo
++        $psi.FileName = "claude"
++        $psi.UseShellExecute = $false
++        $psi.RedirectStandardOutput = $true
++        $psi.RedirectStandardError = $true
++        $psi.CreateNoWindow = $true
++
++        foreach ($arg in $claudeArgs) {
++          $psi.ArgumentList.Add($arg)
++        }
++
++        $proc = [System.Diagnostics.Process]::Start($psi)
++        $stderrBuilder = New-Object System.Text.StringBuilder
++
++        while (-not $proc.StandardOutput.EndOfStream) {
++          $line = $proc.StandardOutput.ReadLine()
++          if (-not $line) { continue }
++          try {
++            $raw = $line | ConvertFrom-Json
++          } catch {
++            continue
++          }
++          if ($raw.session_id) {
++            $meta["sessionId"] = $raw.session_id
++          }
++          if ($raw.type -eq "assistant" -and $raw.message -and $raw.message.content) {
++            foreach ($blk in $raw.message.content) {
++              if ($blk.type -eq "text" -and $blk.text) {
++                $textParts.Add($blk.text)
++                $sawTextEvent = $true
++                try {
++                  $eventPayload = @{ action = "event"; runId = $runId; event = @{ type = "assistant.text"; text = $blk.text } } | ConvertTo-Json -Depth 5
++                  Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body $eventPayload | Out-Null
++                } catch {}
++              } elseif ($blk.type -eq "tool_use") {
++                $toolCallEvent = @{ type = "tool.call"; name = if ($blk.name) { $blk.name } else { "" }; input = $blk.input }
++                if ($blk.id) { $toolCallEvent["id"] = $blk.id }
++                try {
++                  $eventPayload = @{ action = "event"; runId = $runId; event = $toolCallEvent } | ConvertTo-Json -Depth 5
++                  Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body $eventPayload | Out-Null
++                } catch {}
++              }
++            }
++            if ($raw.message.usage) {
++              $u = $raw.message.usage
++              if ($u.input_tokens -is [int] -and $u.output_tokens -is [int]) {
++                $usageEvent = @{ type = "usage"; inputTokens = $u.input_tokens; outputTokens = $u.output_tokens }
++                if ($u.cache_read_input_tokens -is [int]) { $usageEvent["cachedTokens"] = $u.cache_read_input_tokens }
++                if ($raw.message.model) { $usageEvent["model"] = $raw.message.model }
++                try {
++                  $eventPayload = @{ action = "event"; runId = $runId; event = $usageEvent } | ConvertTo-Json -Depth 5
++                  Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body $eventPayload | Out-Null
++                } catch {}
++              }
++            }
++          } elseif ($raw.type -eq "user" -and $raw.message -and $raw.message.content) {
++            foreach ($blk in $raw.message.content) {
++              if ($blk.type -eq "tool_result") {
++                $outStr = if ($blk.content -is [string]) { $blk.content } else { ($blk.content | ConvertTo-Json -Compress) }
++                $toolResEvent = @{ type = "tool.result"; ok = ($blk.is_error -ne $true); truncated = $false; output = $outStr }
++                if ($blk.tool_use_id) { $toolResEvent["id"] = $blk.tool_use_id }
++                try {
++                  $eventPayload = @{ action = "event"; runId = $runId; event = $toolResEvent } | ConvertTo-Json -Depth 5
++                  Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body $eventPayload | Out-Null
++                } catch {}
++              }
++            }
++          } elseif ($raw.type -eq "result") {
++            $cost = if ($null -ne $raw.total_cost_usd) { $raw.total_cost_usd } else { $raw.cost_usd }
++            if ($null -ne $cost) { $meta["costUsd"] = $cost }
++            if ($null -ne $raw.duration_ms) { $meta["durationMs"] = [int]$raw.duration_ms }
++            if ($null -ne $raw.num_turns) { $meta["numTurns"] = [int]$raw.num_turns }
++          }
++        }
++
++        $stderrContent = $proc.StandardError.ReadToEnd()
++        $proc.WaitForExit(30000) | Out-Null
++        $code = $proc.ExitCode
++        if ($code -ne 0) {
++          $status = "error"
++          $errorText = if ($stderrContent.Trim()) { $stderrContent.Trim() } else { "claude exited with code $code." }
++        }
++      } catch [System.ComponentModel.Win32Exception] {
++        $code = 127
++        $status = "error"
++        $errorText = "claude is not installed on this computer."
++      } catch {
++        $code = 1
++        $status = "error"
++        $errorText = $_.Exception.Message
++      }
++
++      $fullText = [string]::Join("", $textParts)
++      $reportedText = if ($sawTextEvent) { "" } else { $fullText }
++
++      $resultObj = @{
++        status = $status
++        exitCode = $code
++        text = if ($reportedText.Length -gt 200000) { $reportedText.Substring($reportedText.Length - 200000) } else { $reportedText }
++        error = if ($errorText.Length -gt 2000) { $errorText.Substring(0, 2000) } else { $errorText }
++      }
++      foreach ($key in @("sessionId", "costUsd", "durationMs", "numTurns")) {
++        if ($meta.ContainsKey($key)) {
++          $resultObj[$key] = $meta[$key]
++        }
++      }
++
++      try {
++        $body = @{ action = "complete"; runId = $runId; result = $resultObj } | ConvertTo-Json -Depth 5
++        Invoke-RestMethod -Method Post -Uri $node -Headers $headers -ContentType "application/json" -Body $body | Out-Null
++      } catch {}
++    }
++    Start-Sleep -Seconds 3
++  }
++} finally {
++  if ($heartbeatJob) {
++    try { Stop-Job -Job $heartbeatJob -Force | Out-Null } catch {}
++    try { Remove-Job -Job $heartbeatJob -Force | Out-Null } catch {}
+   }
+-  Start-Sleep -Seconds 3
+ }
+ `;
+ 
+-- 
+2.55.0
+

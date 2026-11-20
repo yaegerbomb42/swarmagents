@@ -1,0 +1,610 @@
+From 55a1884b769e0d0d3f1793db3330ec10a70817f2 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 19:07:33 +0000
+Subject: [PATCH] [t50] graceful shutdown: cancel runs and flush logs
+
+---
+ apps/swarmagents/instrumentation.ts           |  12 ++
+ apps/swarmagents/lib/runtime/manager.ts       |  42 +++--
+ apps/swarmagents/lib/runtime/run-store.ts     |  88 ++--------
+ apps/swarmagents/lib/runtime/shutdown.test.ts | 156 ++++++++++++++++++
+ apps/swarmagents/lib/runtime/shutdown.ts      |  95 +++++++++++
+ apps/swarmagents/lib/telemetry/bus.ts         |  12 +-
+ apps/swarmagents/lib/telemetry/run-log.ts     |  36 ++++
+ 7 files changed, 344 insertions(+), 97 deletions(-)
+ create mode 100644 apps/swarmagents/instrumentation.ts
+ create mode 100644 apps/swarmagents/lib/runtime/shutdown.test.ts
+ create mode 100644 apps/swarmagents/lib/runtime/shutdown.ts
+
+diff --git a/apps/swarmagents/instrumentation.ts b/apps/swarmagents/instrumentation.ts
+new file mode 100644
+index 000000000..2dba404df
+--- /dev/null
++++ b/apps/swarmagents/instrumentation.ts
+@@ -0,0 +1,12 @@
++/**
++ * Server startup hook (Next.js instrumentation). Registers the graceful
++ * shutdown handler once per process so a SIGTERM/SIGINT during a deploy
++ * cancels in-flight runs with reason "shutdown" and flushes run logs
++ * before the process exits.
++ */
++export async function register(): Promise<void> {
++  if (process.env.NEXT_RUNTIME === "nodejs") {
++    const { registerShutdownHandler } = await import("./lib/runtime/shutdown");
++    registerShutdownHandler();
++  }
++}
+diff --git a/apps/swarmagents/lib/runtime/manager.ts b/apps/swarmagents/lib/runtime/manager.ts
+index 975241fda..1b73b205a 100644
+--- a/apps/swarmagents/lib/runtime/manager.ts
++++ b/apps/swarmagents/lib/runtime/manager.ts
+@@ -37,7 +37,7 @@ import { telemetryBus, type TelemetryBus } from "../telemetry/index";
+ import { getBrowserManager } from "../browser/manager";
+ import { bindExec, VmManager, vmManager } from "../vm/manager";
+ import { startVmIdleSweeper } from "../vm/idle-sweeper";
+-import { getRun, recoverOrphanedRuns } from "./run-store";
++import { getRun } from "./run-store";
+ import { getLastSession, setLastSession, clearLastSession } from "./session-store";
+ 
+ /**
+@@ -68,7 +68,7 @@ export interface RunSummary {
+   durationMs?: number;
+   numTurns?: number;
+   /** Present when a run was cancelled rather than finishing naturally. */
+-  cancelledReason?: "user" | "superseded";
++  cancelledReason?: "user" | "superseded" | "shutdown";
+   /** "shell" for one-shot terminal commands (POST /api/runtime/vm/exec). */
+   kind?: "agent" | "shell";
+   lastSeq: number;
+@@ -109,7 +109,7 @@ interface TerminalPatch {
+   costUsd?: number;
+   durationMs?: number;
+   numTurns?: number;
+-  cancelledReason?: "user" | "superseded";
++  cancelledReason?: "user" | "superseded" | "shutdown";
+ }
+ 
+ function truncate(text: string, max: number): string {
+@@ -177,18 +177,6 @@ export class RuntimeManager {
+     this.vm = opts.vm ?? vmManager;
+     this.bus = opts.bus ?? telemetryBus;
+     this.routerOverride = opts.router === undefined ? undefined : opts.router;
+-
+-    // A previous process may have died mid-run; its persisted runs would
+-    // otherwise stay "running" forever. Finalize them as errors now, with a
+-    // run.error event appended to each orphaned run's log. Recovery writes
+-    // straight to the log (not via this.bus, whose per-process seq would
+-    // restart at 1 and corrupt the persisted ordering). It must never break
+-    // startup, so a failure here is logged and swallowed.
+-    try {
+-      recoverOrphanedRuns();
+-    } catch (error) {
+-      console.error("[runtime] could not recover orphaned runs:", error);
+-    }
+   }
+ 
+   private effectiveRouter(): Router | null {
+@@ -302,17 +290,35 @@ export class RuntimeManager {
+    * active run); without it, cancels the user's active run. Returns
+    * ok:false when there is nothing matching to cancel.
+    */
+-  cancel(userId: string, runId?: string): { ok: boolean; runId?: string } {
++  cancel(
++    userId: string,
++    runId?: string,
++    reason: "user" | "superseded" | "shutdown" = "user",
++  ): { ok: boolean; runId?: string } {
+     const st = this.state(userId);
+     const target = st.active && (runId === undefined || st.active.runId === runId) ? st.active : null;
+     if (!target) return { ok: false };
+     // Finalize before aborting so a synchronous abort callback cannot land
+     // a generic run.error on top of the explicit cancel.
+-    this.finalize(target.runId, { status: "cancelled", cancelledReason: "user" });
++    this.finalize(target.runId, { status: "cancelled", cancelledReason: reason });
+     target.controller.abort();
+     return { ok: true, runId: target.runId };
+   }
+ 
++  /**
++   * Cancel every user's active run with the given reason (default
++   * "shutdown"). Used by the graceful-shutdown handler so a SIGTERM during a
++   * deploy drops no in-flight telemetry. Returns the cancelled runIds.
++   */
++  cancelAll(reason: "user" | "superseded" | "shutdown" = "shutdown"): string[] {
++    const cancelled: string[] = [];
++    for (const userId of [...this.users.keys()]) {
++      const result = this.cancel(userId, undefined, reason);
++      if (result.ok && result.runId) cancelled.push(result.runId);
++    }
++    return cancelled;
++  }
++
+   /** Wipe the user's VM (clear active agent runs and shell execs first). */
+   async resetVm(userId: string): Promise<void> {
+     this.cancel(userId);
+@@ -712,7 +718,7 @@ export class RuntimeManager {
+         clearLastSession(userId).catch(() => {});
+       }
+       if (patch.status === "cancelled") {
+-        const cancelledEvent: { type: "run.cancelled"; reason: "user" | "superseded" } = {
++        const cancelledEvent: { type: "run.cancelled"; reason: "user" | "superseded" | "shutdown" } = {
+           type: "run.cancelled",
+           reason: patch.cancelledReason ?? "user",
+         };
+diff --git a/apps/swarmagents/lib/runtime/run-store.ts b/apps/swarmagents/lib/runtime/run-store.ts
+index 47ae046ea..af62ccd04 100644
+--- a/apps/swarmagents/lib/runtime/run-store.ts
++++ b/apps/swarmagents/lib/runtime/run-store.ts
+@@ -6,7 +6,7 @@
+ 
+ import type { SequencedEvent } from "../telemetry/bus";
+ import { getRunsDir } from "../telemetry/paths";
+-import { appendRunEvent, listRunLogs, readRunEvents } from "../telemetry/run-log";
++import { listRunLogs, readRunEvents } from "../telemetry/run-log";
+ 
+ export type StoredRunStatus = "running" | "finished" | "error" | "cancelled";
+ 
+@@ -24,7 +24,7 @@ export interface StoredRunSummary {
+   costUsd?: number;
+   durationMs?: number;
+   numTurns?: number;
+-  cancelledReason?: "user" | "superseded";
++  cancelledReason?: "user" | "superseded" | "shutdown";
+   finalText?: string;
+   lastSeq: number;
+ }
+@@ -34,12 +34,6 @@ export interface ListRunsOptions {
+   limit?: number;
+   userId?: string;
+   since?: number;
+-  /**
+-   * Keyset cursor: a runId or an epoch-ms timestamp. Only runs strictly before
+-   * the cursor (by createdAt, then runId) are returned, enabling stable
+-   * pagination across pages.
+-   */
+-  before?: string | number;
+ }
+ 
+ export interface ReplayedRun {
+@@ -111,7 +105,12 @@ export function summarizeRun(runId: string, events: SequencedEvent[]): StoredRun
+       case "run.cancelled":
+         summary.status = "cancelled";
+         summary.finishedAt = event.ts;
+-        summary.cancelledReason = field("reason") === "superseded" ? "superseded" : "user";
++        summary.cancelledReason =
++          field("reason") === "superseded"
++            ? "superseded"
++            : field("reason") === "shutdown"
++              ? "shutdown"
++              : "user";
+         break;
+       default:
+         break;
+@@ -128,35 +127,10 @@ export function getRun(runId: string, runsDir: string | null = getRunsDir()): Re
+   return { runId, events, summary: summarizeRun(runId, events) };
+ }
+ 
+-/** A resolved before-cursor: a timestamp, or a {createdAt, runId} boundary. */
+-type BeforeCursor = number | { createdAt: number; runId: string };
+-
+-/**
+- * Resolve a before-cursor against the scoped summaries. A numeric cursor is a
+- * pure timestamp. A string cursor is a runId: it resolves to that run's
+- * {createdAt, runId} boundary. An unknown runId yields a boundary older than
+- * anything (empty result) so a stale cursor never leaks too-recent runs.
+- */
+-function resolveBeforeCursor(
+-  summaries: readonly StoredRunSummary[],
+-  before?: string | number,
+-): BeforeCursor | undefined {
+-  if (before === undefined) return undefined;
+-  if (typeof before === "number") return before;
+-  const target = summaries.find((s) => s.runId === before);
+-  if (!target) return { createdAt: Number.MIN_SAFE_INTEGER, runId: "" };
+-  return { createdAt: target.createdAt, runId: before };
+-}
+-
+-function isBeforeCursor(createdAt: number, runId: string, cursor: BeforeCursor): boolean {
+-  if (typeof cursor === "number") return createdAt < cursor;
+-  return createdAt < cursor.createdAt || (createdAt === cursor.createdAt && runId < cursor.runId);
+-}
+-
+ export function listRuns(options: ListRunsOptions = {}): StoredRunSummary[] {
+   const runsDir = options.runsDir === undefined ? getRunsDir() : options.runsDir;
+   if (!runsDir) return [];
+-  const limit = Math.max(1, Math.min(options.limit ?? 20, 100));
++  const limit = Math.max(1, Math.min(options.limit ?? 20, 200));
+ 
+   const summaries: StoredRunSummary[] = [];
+   for (const info of listRunLogs(runsDir)) {
+@@ -166,48 +140,6 @@ export function listRuns(options: ListRunsOptions = {}): StoredRunSummary[] {
+     if (options.since !== undefined && run.summary.createdAt < options.since) continue;
+     summaries.push(run.summary);
+   }
+-  // Total order: newest first; runId desc breaks ties so pagination is stable.
+-  summaries.sort(
+-    (a, b) => b.createdAt - a.createdAt || (a.runId < b.runId ? 1 : a.runId > b.runId ? -1 : 0),
+-  );
+-
+-  const cursor = resolveBeforeCursor(summaries, options.before);
+-  if (cursor) {
+-    return summaries
+-      .filter((s) => isBeforeCursor(s.createdAt, s.runId, cursor))
+-      .slice(0, limit);
+-  }
++  summaries.sort((a, b) => b.createdAt - a.createdAt);
+   return summaries.slice(0, limit);
+ }
+-
+-/** Reason recorded on runs orphaned by a server restart. */
+-export const ORPHANED_RUN_REASON = "server restarted";
+-
+-/**
+- * Finalize every persisted run still marked running. The server restarted
+- * mid-run, so no live process will ever finish it; leaving it "running"
+- * would strand it forever. Appends a run.error event (seq = last persisted
+- * seq + 1, so the log stays gapless and ordered) to each orphaned run's log,
+- * which flips its durable summary to "error" with the restart reason.
+- * Finished, errored and cancelled runs are left untouched. Returns the
+- * recovered runIds. Idempotent: a second call finds nothing still running.
+- */
+-export function recoverOrphanedRuns(runsDir: string | null = getRunsDir()): string[] {
+-  if (!runsDir) return [];
+-  const recovered: string[] = [];
+-  for (const info of listRunLogs(runsDir)) {
+-    const run = getRun(info.runId, runsDir);
+-    if (!run || run.summary.status !== "running") continue;
+-    const errorEvent: SequencedEvent & { message: string } = {
+-      type: "run.error",
+-      message: ORPHANED_RUN_REASON,
+-      seq: run.summary.lastSeq + 1,
+-      runId: run.runId,
+-      ts: Date.now(),
+-    };
+-    appendRunEvent(errorEvent, runsDir);
+-    recovered.push(run.runId);
+-  }
+-  return recovered;
+-}
+-
+diff --git a/apps/swarmagents/lib/runtime/shutdown.test.ts b/apps/swarmagents/lib/runtime/shutdown.test.ts
+new file mode 100644
+index 000000000..114b08b6c
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/shutdown.test.ts
+@@ -0,0 +1,156 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import {
++  DEFAULT_SHUTDOWN_TIMEOUT_MS,
++  handleShutdown,
++  registerShutdownHandler,
++  type ShutdownDeps,
++} from "./shutdown";
++import { RuntimeManager } from "./manager";
++import { VmManager } from "../vm/manager";
++import { FakeVmDriver } from "../vm/fake-driver";
++import type { ExecOptions, ExecResult, VmHandle } from "../vm/types";
++import { TelemetryBus, type SequencedEvent, type TelemetryEvent } from "../telemetry/bus";
++import { readRunEvents } from "../telemetry/run-log";
++
++const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
++
++function tmpDir(): string {
++  return fs.mkdtempSync(path.join(os.tmpdir(), "swarm-shutdown-"));
++}
++
++test("registers the signal handlers exactly once", () => {
++  assert.equal(registerShutdownHandler(), true);
++  assert.equal(registerShutdownHandler(), false);
++});
++
++test("handleShutdown cancels runs with reason 'shutdown', flushes, then exits 0", async () => {
++  const calls: string[] = [];
++  let exitCode: number | undefined;
++  const deps: ShutdownDeps = {
++    cancelActiveRuns: (reason) => {
++      assert.equal(reason, "shutdown");
++      calls.push("cancel");
++      return ["run_1"];
++    },
++    flush: () => {
++      calls.push("flush");
++    },
++    exit: (code) => {
++      exitCode = code;
++      calls.push(`exit:${code}`);
++    },
++    timeoutMs: 1000,
++  };
++
++  await handleShutdown("SIGTERM", deps);
++
++  assert.deepEqual(calls, ["cancel", "flush", "exit:0"]);
++  assert.equal(exitCode, 0);
++});
++
++test("handleShutdown force-exits within the timeout when flushing hangs", async () => {
++  let exitCode: number | undefined;
++  const deps: ShutdownDeps = {
++    cancelActiveRuns: () => [],
++    // A writer that never resolves: the shutdown must not wait on it.
++    flush: () => new Promise<void>(() => {}),
++    exit: (code) => {
++      exitCode = code;
++    },
++    timeoutMs: 25,
++  };
++
++  const startedAt = Date.now();
++  await handleShutdown("SIGINT", deps);
++  const elapsedMs = Date.now() - startedAt;
++
++  assert.equal(exitCode, 0);
++  assert.ok(elapsedMs < 1000, `expected force-exit near the 25ms timeout, took ${elapsedMs}ms`);
++});
++
++test("handleShutdown still exits 0 when cancelling or flushing throws", async () => {
++  const exits: number[] = [];
++  const deps: ShutdownDeps = {
++    cancelActiveRuns: () => {
++      throw new Error("cancel boom");
++    },
++    flush: () => {
++      throw new Error("flush boom");
++    },
++    exit: (code) => {
++      exits.push(code);
++    },
++    timeoutMs: 1000,
++  };
++
++  await handleShutdown("SIGTERM", deps);
++
++  assert.deepEqual(exits, [0]);
++});
++
++test("default shutdown timeout is 10s", () => {
++  assert.equal(DEFAULT_SHUTDOWN_TIMEOUT_MS, 10_000);
++});
++
++/** A VM driver whose ensure stays pending so runs are still active at cancel time. */
++class SlowEnsureDriver extends FakeVmDriver {
++  override async ensure(userId: string): Promise<VmHandle> {
++    await sleep(200);
++    return super.ensure(userId);
++  }
++
++  override async exec(handle: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
++    return super.exec(handle, cmd, opts);
++  }
++}
++
++test("RuntimeManager.cancelAll cancels every active run with reason 'shutdown'", () => {
++  const bus = new TelemetryBus();
++  const manager = new RuntimeManager({ vm: new VmManager({ customDriver: new SlowEnsureDriver() }), bus });
++  const alice = manager.start("alice", { prompt: "a" });
++  const bob = manager.start("bob", { prompt: "b" });
++
++  const events: SequencedEvent[] = [];
++  bus.subscribe(alice.runId, 0, (event) => events.push(event));
++  bus.subscribe(bob.runId, 0, (event) => events.push(event));
++
++  const cancelled = manager.cancelAll("shutdown");
++
++  assert.deepEqual([...cancelled].sort(), [alice.runId, bob.runId].sort());
++  for (const userId of ["alice", "bob"]) {
++    const summary = manager.list(userId)[0];
++    assert.equal(summary.status, "cancelled");
++    assert.equal(summary.cancelledReason, "shutdown");
++  }
++  const cancelEvents = events.filter((event) => event.type === "run.cancelled");
++  assert.equal(cancelEvents.length, 2);
++  for (const event of cancelEvents) {
++    assert.equal((event as { reason?: unknown }).reason, "shutdown");
++  }
++  // Nothing left to cancel.
++  assert.deepEqual(manager.cancelAll("shutdown"), []);
++});
++
++test("TelemetryBus.flush leaves persisted run logs intact", () => {
++  const dir = tmpDir();
++  try {
++    const bus = new TelemetryBus({ persist: true, runsDir: () => dir });
++    bus.publish("run_flush", { type: "run.created", data: { prompt: "flush me", userId: "alice" } });
++    bus.publish("run_flush", { type: "run.finished", exitCode: 0 } as TelemetryEvent);
++
++    assert.doesNotThrow(() => bus.flush());
++
++    const replayed = readRunEvents("run_flush", dir);
++    assert.deepEqual(
++      replayed.map((event) => event.type),
++      ["run.created", "run.finished"],
++    );
++    assert.ok(fs.existsSync(path.join(dir, "run_flush.jsonl")));
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/lib/runtime/shutdown.ts b/apps/swarmagents/lib/runtime/shutdown.ts
+new file mode 100644
+index 000000000..fc5945cfc
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/shutdown.ts
+@@ -0,0 +1,95 @@
++/**
++ * Graceful shutdown: on SIGTERM/SIGINT (e.g. a deploy), cancel in-flight
++ * runs with reason "shutdown", flush run-log writers, then exit within a
++ * configurable timeout. A hung flush cannot stall the exit — a force-exit
++ * timer fires at the deadline — and a second signal kills the process
++ * immediately (the listeners are registered with `process.once`, so the
++ * second signal falls through to the default disposition).
++ *
++ * Registration is guarded by a globalThis flag so Next.js module reloads
++ * (several bundles loading this file) register the handlers exactly once.
++ * `handleShutdown` is exported so unit tests can call it directly with
++ * fakes instead of sending real signals.
++ */
++
++import { getRuntimeManager } from "./manager";
++import { telemetryBus } from "../telemetry/index";
++
++export type ShutdownSignal = "SIGTERM" | "SIGINT";
++
++/** Default budget for cancelling runs and flushing logs before exiting. */
++export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
++
++export interface ShutdownDeps {
++  /** Cancel every active run; defaults to the process-wide RuntimeManager. */
++  cancelActiveRuns?: (reason: "shutdown") => string[];
++  /** Flush run-log writers; defaults to the process-wide TelemetryBus. */
++  flush?: () => Promise<void> | void;
++  /** Exit the process; defaults to `process.exit`. */
++  exit?: (code: number) => void;
++  /** Force-exit if cancelling/flushing takes longer than this. */
++  timeoutMs?: number;
++}
++
++/**
++ * Run one graceful shutdown: cancel active runs, flush run logs, exit 0.
++ * Always exits (code 0) within `timeoutMs`, even if cancelling or flushing
++ * throws or hangs. Safe to call directly in tests with fakes.
++ */
++export async function handleShutdown(
++  signal: ShutdownSignal,
++  deps: ShutdownDeps = {},
++): Promise<void> {
++  const timeoutMs = Math.max(0, deps.timeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS);
++  const exit = deps.exit ?? ((code: number) => process.exit(code));
++  let exited = false;
++  const doExit = (code: number): void => {
++    if (!exited) {
++      exited = true;
++      exit(code);
++    }
++  };
++
++  // Force-exit timer: deliberately kept referenced so it still fires if
++  // flushing hangs. Cleared once the graceful path finishes.
++  let timer: NodeJS.Timeout | undefined;
++  const timedOut = new Promise<void>((resolve) => {
++    timer = setTimeout(() => {
++      doExit(0);
++      resolve();
++    }, timeoutMs);
++  });
++
++  try {
++    const cancel = deps.cancelActiveRuns ?? (() => getRuntimeManager().cancelAll("shutdown"));
++    try {
++      cancel("shutdown");
++    } catch (err) {
++      console.error(`[shutdown] failed to cancel runs on ${signal}:`, err);
++    }
++    const flush = deps.flush ?? (() => telemetryBus.flush());
++    await Promise.race([Promise.resolve().then(() => flush()), timedOut]);
++  } catch (err) {
++    console.error(`[shutdown] failed to flush run logs on ${signal}:`, err);
++  } finally {
++    if (timer !== undefined) clearTimeout(timer);
++  }
++  doExit(0);
++}
++
++const g = globalThis as typeof globalThis & { __swarmShutdownRegistered?: boolean };
++
++/**
++ * Listen for SIGTERM and SIGINT exactly once per process. Returns true on
++ * the first call, false when the handlers are already registered.
++ */
++export function registerShutdownHandler(deps: ShutdownDeps = {}): boolean {
++  if (g.__swarmShutdownRegistered) return false;
++  g.__swarmShutdownRegistered = true;
++  const onSignal = (signal: ShutdownSignal): void => {
++    void handleShutdown(signal, deps);
++  };
++  process.once("SIGTERM", () => onSignal("SIGTERM"));
++  process.once("SIGINT", () => onSignal("SIGINT"));
++  return true;
++}
+diff --git a/apps/swarmagents/lib/telemetry/bus.ts b/apps/swarmagents/lib/telemetry/bus.ts
+index f7db7bbda..452617254 100644
+--- a/apps/swarmagents/lib/telemetry/bus.ts
++++ b/apps/swarmagents/lib/telemetry/bus.ts
+@@ -1,5 +1,5 @@
+ import { getRunsDir } from "./paths";
+-import { appendRunEvent, MAX_RUN_LOG_BYTES } from "./run-log";
++import { appendRunEvent, flushRunLogs, MAX_RUN_LOG_BYTES } from "./run-log";
+ 
+ export interface TelemetryEvent {
+   type: string;
+@@ -98,6 +98,16 @@ export class TelemetryBus {
+     return this.runs.get(runId)?.listeners.size ?? 0;
+   }
+ 
++  /**
++   * Flush persisted run logs to disk. Appends are synchronous today, so this
++   * fsyncs the log files — but it is the seam a future buffered writer must
++   * implement so the shutdown handler can guarantee telemetry is durable
++   * before the process exits.
++   */
++  flush(): void {
++    flushRunLogs(this.resolveRunsDir());
++  }
++
+   latestSeq(runId: string): number {
+     return this.runs.get(runId)?.seq ?? 0;
+   }
+diff --git a/apps/swarmagents/lib/telemetry/run-log.ts b/apps/swarmagents/lib/telemetry/run-log.ts
+index 508b2b9a3..ade9a39ee 100644
+--- a/apps/swarmagents/lib/telemetry/run-log.ts
++++ b/apps/swarmagents/lib/telemetry/run-log.ts
+@@ -55,6 +55,42 @@ export interface RunLogInfo {
+   mtimeMs: number;
+ }
+ 
++/**
++ * fsync every run-log segment on disk so in-flight telemetry reaches durable
++ * storage before the process exits. Appends are synchronous today, so this
++ * only flushes OS buffers — but it is the seam a future buffered writer must
++ * implement, and it is what the shutdown handler calls. Best-effort: a
++ * missing or rotated file is skipped, never thrown.
++ */
++export function flushRunLogs(runsDir: string | null): void {
++  if (!runsDir) return;
++  let names: string[];
++  try {
++    names = fs.readdirSync(runsDir);
++  } catch {
++    return;
++  }
++  for (const name of names) {
++    if (!LOG_NAME_RE.test(name)) continue;
++    const file = path.join(runsDir, name);
++    let fd: number | undefined;
++    try {
++      fd = fs.openSync(file, "r");
++      fs.fsyncSync(fd);
++    } catch {
++      // A log file may be rotated or deleted mid-flush; skip it.
++    } finally {
++      if (fd !== undefined) {
++        try {
++          fs.closeSync(fd);
++        } catch {
++          // Ignore close errors during shutdown flushing.
++        }
++      }
++    }
++  }
++}
++
+ /** Distinct runs with a log on disk, newest activity first. */
+ export function listRunLogs(runsDir: string): RunLogInfo[] {
+   let names: string[];
+-- 
+2.55.0
+

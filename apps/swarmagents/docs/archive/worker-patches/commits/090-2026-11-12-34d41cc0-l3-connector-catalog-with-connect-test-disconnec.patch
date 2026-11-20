@@ -1,0 +1,2453 @@
+From 34d41cc0cb9aba529f3d39104cca883e1b992695 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 22:48:23 +0000
+Subject: [PATCH] l3: connector catalog with connect/test/disconnect
+ (task_mwe235eh_3esa)
+
+---
+ .../lib/library/catalog/catalog.test.ts       | 176 ++++
+ .../lib/library/catalog/connectors.ts         | 963 ++++++++++++++++++
+ .../lib/library/catalog/probe-source.ts       | 278 +++++
+ .../lib/library/catalog/probe.test.ts         | 216 ++++
+ .../lib/library/catalog/service.test.ts       | 296 ++++++
+ .../lib/library/catalog/service.ts            | 332 ++++++
+ apps/swarmagents/lib/library/seam.ts          | 124 +++
+ 7 files changed, 2385 insertions(+)
+ create mode 100644 apps/swarmagents/lib/library/catalog/catalog.test.ts
+ create mode 100644 apps/swarmagents/lib/library/catalog/connectors.ts
+ create mode 100644 apps/swarmagents/lib/library/catalog/probe-source.ts
+ create mode 100644 apps/swarmagents/lib/library/catalog/probe.test.ts
+ create mode 100644 apps/swarmagents/lib/library/catalog/service.test.ts
+ create mode 100644 apps/swarmagents/lib/library/catalog/service.ts
+ create mode 100644 apps/swarmagents/lib/library/seam.ts
+
+diff --git a/apps/swarmagents/lib/library/catalog/catalog.test.ts b/apps/swarmagents/lib/library/catalog/catalog.test.ts
+new file mode 100644
+index 000000000..a348f25a0
+--- /dev/null
++++ b/apps/swarmagents/lib/library/catalog/catalog.test.ts
+@@ -0,0 +1,176 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  CONNECTORS,
++  buildServerCommand,
++  getConnector,
++  maskSecret,
++  missingRequiredFields,
++} from "./connectors";
++
++const REQUIRED_IDS = [
++  "github",
++  "gitlab",
++  "slack",
++  "notion",
++  "linear",
++  "jira",
++  "google-drive",
++  "gmail",
++  "google-calendar",
++  "postgres",
++  "sqlite",
++  "supabase",
++  "stripe",
++  "sentry",
++  "figma",
++  "brave-search",
++  "exa-search",
++  "fetch",
++  "filesystem",
++  "memory",
++  "playwright",
++  "puppeteer",
++  "docker",
++  "cloudflare",
++  "vercel",
++  "airtable",
++];
++
++test("catalog covers every required connector with a unique id", () => {
++  const ids = CONNECTORS.map((c) => c.id);
++  assert.equal(new Set(ids).size, ids.length, "duplicate connector ids");
++  for (const id of REQUIRED_IDS) {
++    assert.ok(getConnector(id), `missing required connector ${id}`);
++  }
++  assert.ok(CONNECTORS.length >= 25, `expected ~25 connectors, got ${CONNECTORS.length}`);
++});
++
++test("every catalog entry is complete and honest about verification", () => {
++  for (const c of CONNECTORS) {
++    assert.ok(c.name.trim(), `${c.id}: empty name`);
++    assert.ok(c.description.trim(), `${c.id}: empty description`);
++    assert.ok(c.icon.trim(), `${c.id}: empty icon`);
++    assert.ok(c.tools.length > 0, `${c.id}: no advertised tools`);
++    for (const f of c.fields) {
++      assert.ok(f.help.trim(), `${c.id}/${f.key}: empty help text`);
++      assert.ok(f.link.startsWith("https://"), `${c.id}/${f.key}: help link is not https`);
++    }
++    // Unverified entries must be remote URLs curl could not check from the
++    // build VM — never an npx/uvx package we failed to verify.
++    if (!c.verified) {
++      assert.equal(c.run.kind, "remote", `${c.id}: unverified non-remote entry`);
++    }
++    if (c.run.kind !== "remote") {
++      assert.ok(c.run.package.trim(), `${c.id}: empty package name`);
++    }
++  }
++});
++
++test("OAuth-only connectors are flagged, not silently connectable", () => {
++  for (const id of ["google-drive", "gmail", "google-calendar", "figma", "vercel"]) {
++    const c = getConnector(id);
++    assert.ok(c?.needsOAuth?.includes("OAuth"), `${id} should be flagged needs OAuth`);
++  }
++});
++
++test("maskSecret never returns the full value", () => {
++  assert.equal(maskSecret(""), "••••••••");
++  assert.equal(maskSecret("short"), "••••••••");
++  const masked = maskSecret("ghp_abcdefghijklmnop1234");
++  assert.ok(!masked.includes("abcdefghijklmnop"), "masked value leaks the middle");
++  assert.ok(masked.startsWith("ghp_"), "masked value keeps a recognizable prefix");
++  assert.ok(masked.endsWith("1234"), "masked value keeps a recognizable suffix");
++});
++
++test("buildServerCommand: GitHub token goes to env, never argv", () => {
++  const cmd = buildServerCommand(getConnector("github")!, { token: "ghp_secret123" });
++  assert.equal(cmd.kind, "npx");
++  if (cmd.kind === "npx") {
++    assert.deepEqual(cmd.args, ["-y", "@modelcontextprotocol/server-github"]);
++    assert.equal(cmd.env.GITHUB_PERSONAL_ACCESS_TOKEN, "ghp_secret123");
++    assert.equal(cmd.args.join(" ").includes("ghp_secret123"), false);
++  }
++});
++
++test("buildServerCommand: a secret in argv is rejected unless explicitly allowed", () => {
++  // Synthetic connector: a secret placeholder in args with no opt-in.
++  const bad = {
++    id: "bad",
++    name: "Bad",
++    icon: "B",
++    description: "test-only",
++    category: "Test",
++    run: { kind: "npx", package: "some-pkg", args: ["{token}"] },
++    fields: [{ key: "token", label: "Token", help: "h", link: "https://example.com", secret: true, required: true }],
++    tools: [{ name: "t", description: "t" }],
++    verified: true,
++    source: "official",
++  } as const;
++  assert.throws(
++    () => buildServerCommand(bad as never, { token: "secret123" }),
++    /must not appear in argv/,
++  );
++});
++
++test("buildServerCommand: Postgres is the single documented argv exception", () => {
++  // server-postgres takes its connection string only as a positional argv
++  // argument (no env alternative); it runs inside the user's own VM.
++  const postgres = getConnector("postgres")!;
++  assert.deepEqual(postgres.run.kind === "npx" ? postgres.run.allowSecretInArgv : [], [
++    "connectionString",
++  ]);
++  const cmd = buildServerCommand(postgres, {
++    connectionString: "postgres://u:p@h:5432/db",
++  });
++  assert.equal(cmd.kind, "npx");
++  if (cmd.kind === "npx") {
++    assert.deepEqual(cmd.args, [
++      "-y",
++      "@modelcontextprotocol/server-postgres",
++      "postgres://u:p@h:5432/db",
++    ]);
++  }
++  // No other catalog entry allows a secret in argv.
++  for (const c of CONNECTORS) {
++    if (c.id === "postgres") continue;
++    if (c.run.kind === "remote") continue;
++    assert.equal(c.run.allowSecretInArgv?.length ?? 0, 0, `${c.id} allows a secret in argv`);
++  }
++});
++
++test("buildServerCommand: Fetch needs no fields and runs npx", () => {
++  const cmd = buildServerCommand(getConnector("fetch")!, {});
++  assert.equal(cmd.kind, "npx");
++  if (cmd.kind === "npx") {
++    assert.deepEqual(cmd.args, ["-y", "@kazuph/mcp-fetch"]);
++    assert.deepEqual(cmd.env, {});
++  }
++});
++
++test("buildServerCommand: remote Linear substitutes the API key into the header only", () => {
++  const cmd = buildServerCommand(getConnector("linear")!, { apiKey: "lin_api_secret" });
++  assert.equal(cmd.kind, "remote");
++  if (cmd.kind === "remote") {
++    assert.equal(cmd.url, "https://mcp.linear.app/sse");
++    assert.equal(cmd.transport, "sse");
++    assert.equal(cmd.headers.Authorization, "Bearer lin_api_secret");
++  }
++});
++
++test("buildServerCommand: missing required fields throw", () => {
++  assert.throws(() => buildServerCommand(getConnector("github")!, {}), /missing required field/);
++  assert.throws(
++    () => buildServerCommand(getConnector("github")!, { token: "   " }),
++    /missing required field/,
++  );
++  assert.deepEqual(missingRequiredFields(getConnector("slack")!, { botToken: "x" }), ["teamId"]);
++});
++
++test("buildServerCommand: Filesystem is VM-scoped to /workspace", () => {
++  const cmd = buildServerCommand(getConnector("filesystem")!, {});
++  assert.equal(cmd.kind, "npx");
++  if (cmd.kind === "npx") {
++    assert.deepEqual(cmd.args, ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]);
++  }
++});
+diff --git a/apps/swarmagents/lib/library/catalog/connectors.ts b/apps/swarmagents/lib/library/catalog/connectors.ts
+new file mode 100644
+index 000000000..8ef77b8dc
+--- /dev/null
++++ b/apps/swarmagents/lib/library/catalog/connectors.ts
+@@ -0,0 +1,963 @@
++/**
++ * l3 connector catalog: the curated list of common connectors a user can
++ * add from the Library (l2's Connectors tab renders this catalog).
++ *
++ * Every entry is per-account: a connection stores its field values sealed
++ * (see lib/library/seam.ts) and every server executes inside the owning
++ * user's VM, never on the host or in the Next.js process. Secrets are
++ * never returned to the client unmasked (see `maskSecret`) and never
++ * appear in argv (see `buildServerCommand` — secrets travel only in env,
++ * which the probe receives on stdin) — with one documented exception:
++ * Postgres, whose vendor server takes its connection string only as an
++ * argv argument (see `allowSecretInArgv`).
++ *
++ * Verification (2026-11-12, from this VM):
++ * - npx packages checked with `npm view <pkg> version`; uvx packages with
++ *   `pip index versions`. Entries marked `verified: true` passed that
++ *   check. `verified: false` means the endpoint is the vendor's documented
++ *   remote MCP URL but could NOT be curl-verified from this VM (outbound
++ *   curl is blocked by the egress proxy — `curl` returns 000 for every
++ *   host). Those entries are kept because the task requires them, but they
++ *   are flagged here and in the submission report.
++ * - Dropped: `@modelcontextprotocol/server-sqlite` and
++ *   `@modelcontextprotocol/server-fetch` both 404 on npm, so the catalog
++ *   uses the community packages `mcp-server-sqlite` and `@kazuph/mcp-fetch`
++ *   instead. `@modelcontextprotocol/server-docker` also 404s; the catalog
++ *   uses community `mcp-server-docker`.
++ * - OAuth-only services (Google Drive, Gmail, Google Calendar, Figma,
++ *   Vercel) are marked `needsOAuth: "needs OAuth (coming soon)"` and the
++ *   service layer refuses to connect them until l1 ships an OAuth flow.
++ * - One argv exception: Postgres. `@modelcontextprotocol/server-postgres`
++ *   accepts its connection string ONLY as a positional argv argument — no
++ *   env alternative exists. Its `allowSecretInArgv` opt-in is the single
++ *   exception to the secrets-never-in-argv rule, and it stays inside the
++ *   user's own VM (the user's own secret, the user's own process list);
++ *   the probe's own argv never carries secrets, and nothing is logged.
++ */
++
++export type ConnectorRun =
++  | {
++      kind: "npx" | "uvx";
++      /** Package name, verified to exist on npm / PyPI (see header). */
++      package: string;
++      /**
++       * Args passed after `-y <package>`. May contain `{fieldKey}`
++       * placeholders, replaced with the stored field value. Placeholders
++       * MUST only reference non-secret fields — a secret in argv would
++       * leak it into process listings and logs — unless the field key is
++       * listed in `allowSecretInArgv` (see below). `buildServerCommand`
++       * enforces this and throws otherwise.
++       */
++      args?: string[];
++      /** Env var name -> field key. Secrets travel here, never in argv. */
++      env?: Record<string, string>;
++      /**
++       * Escape hatch, used ONLY by Postgres: field keys whose values may
++       * appear in argv because the vendor's server accepts them no other
++       * way (server-postgres takes its connection string as a positional
++       * argument; there is no env alternative). The value still runs
++       * inside the user's own VM only, and is never logged. Keep this
++       * list empty for every other connector.
++       */
++      allowSecretInArgv?: string[];
++    }
++  | {
++      kind: "remote";
++      /** Vendor's MCP endpoint. */
++      url: string;
++      transport: "sse" | "streamable-http";
++      /**
++       * Header name -> value template. May contain `{fieldKey}`
++       * placeholders (e.g. `"Bearer {apiKey}"`).
++       */
++      headers?: Record<string, string>;
++    };
++
++export interface ConnectorField {
++  key: string;
++  label: string;
++  /** What the value is and where to get it. Shown in the connect form. */
++  help: string;
++  /** Link to the page where the user creates the key / token. */
++  link: string;
++  /** Secret values are sealed at rest and masked in every client view. */
++  secret: boolean;
++  required: boolean;
++  placeholder?: string;
++}
++
++export interface AdvertisedTool {
++  name: string;
++  description: string;
++}
++
++export interface CatalogConnector {
++  id: string;
++  name: string;
++  /** Short glyph shown on the connector card (l2 renders it). */
++  icon: string;
++  description: string;
++  category: string;
++  run: ConnectorRun;
++  fields: ConnectorField[];
++  /**
++   * Tools the server is expected to expose. Shown BEFORE install so the
++   * user sees what they are granting; the real list comes from
++   * "Test connection" (MCP tools/list) and replaces this on display.
++   */
++  tools: AdvertisedTool[];
++  /**
++   * Set when the connector cannot be connected with a pasted key/token
++   * today: "needs OAuth (coming soon)" (or a more specific note). The
++   * service layer refuses `connect` while this is set.
++   */
++  needsOAuth?: string;
++  /** True when the package name / URL was verified from this VM. */
++  verified: boolean;
++  /** "official" = published by the service vendor or the MCP project. */
++  source: "official" | "community";
++}
++
++const field = (
++  key: string,
++  label: string,
++  help: string,
++  link: string,
++  secret: boolean,
++  required = true,
++  placeholder?: string,
++): ConnectorField => ({ key, label, help, link, secret, required, placeholder });
++
++/** The curated catalog. Order is the display order in l2's Connectors tab. */
++export const CONNECTORS: readonly CatalogConnector[] = [
++  {
++    id: "github",
++    name: "GitHub",
++    icon: "GH",
++    description: "Repos, issues, pull requests, and commit checks.",
++    category: "Code",
++    run: {
++      kind: "npx",
++      package: "@modelcontextprotocol/server-github",
++      env: { GITHUB_PERSONAL_ACCESS_TOKEN: "token" },
++    },
++    fields: [
++      field(
++        "token",
++        "Personal access token",
++        "A classic PAT (or fine-grained token) with repo scope. The agent can only do what this token allows.",
++        "https://github.com/settings/tokens",
++        true,
++        true,
++        "ghp_…",
++      ),
++    ],
++    tools: [
++      { name: "search_repositories", description: "Search GitHub repositories." },
++      { name: "create_issue", description: "Create an issue in a repository." },
++      { name: "create_pull_request", description: "Open a pull request." },
++      { name: "get_file_contents", description: "Read a file from a repo." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "gitlab",
++    name: "GitLab",
++    icon: "GL",
++    description: "Projects, merge requests, issues, and pipelines.",
++    category: "Code",
++    run: {
++      kind: "npx",
++      package: "@modelcontextprotocol/server-gitlab",
++      env: { GITLAB_PERSONAL_ACCESS_TOKEN: "token", GITLAB_API_URL: "apiUrl" },
++    },
++    fields: [
++      field(
++        "token",
++        "Personal access token",
++        "A PAT with api scope. Leave the API URL empty for gitlab.com.",
++        "https://gitlab.com/-/user_settings/personal_access_tokens",
++        true,
++        true,
++        "glpat-…",
++      ),
++      field(
++        "apiUrl",
++        "GitLab API URL (optional)",
++        "Only for self-hosted GitLab, e.g. https://gitlab.example.com/api/v4. Empty means gitlab.com.",
++        "https://docs.gitlab.com/ee/api/",
++        false,
++        false,
++        "https://gitlab.com/api/v4",
++      ),
++    ],
++    tools: [
++      { name: "list_projects", description: "List accessible GitLab projects." },
++      { name: "create_issue", description: "Create an issue in a project." },
++      { name: "create_merge_request", description: "Open a merge request." },
++      { name: "list_pipelines", description: "List CI pipelines for a project." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "slack",
++    name: "Slack",
++    icon: "SL",
++    description: "Read channels, post messages, and manage threads.",
++    category: "Communication",
++    run: {
++      kind: "npx",
++      package: "@modelcontextprotocol/server-slack",
++      env: { SLACK_BOT_TOKEN: "botToken", SLACK_TEAM_ID: "teamId" },
++    },
++    fields: [
++      field(
++        "botToken",
++        "Bot token",
++        "Create a Slack app, add the bot token scopes it needs, install it to the workspace, and paste the xoxb- token.",
++        "https://api.slack.com/apps",
++        true,
++        true,
++        "xoxb-…",
++      ),
++      field(
++        "teamId",
++        "Team ID",
++        "Your workspace's team ID (starts with T). Find it in the workspace URL or under Settings.",
++        "https://api.slack.com/methods/team.info",
++        false,
++        true,
++        "T0123456789",
++      ),
++    ],
++    tools: [
++      { name: "slack_list_channels", description: "List channels in the workspace." },
++      { name: "slack_post_message", description: "Post a message to a channel." },
++      { name: "slack_reply_to_thread", description: "Reply inside a thread." },
++      { name: "slack_get_channel_history", description: "Read recent messages in a channel." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "notion",
++    name: "Notion",
++    icon: "NO",
++    description: "Search pages, read databases, and create docs.",
++    category: "Productivity",
++    run: {
++      kind: "npx",
++      package: "@notionhq/notion-mcp-server",
++      env: { NOTION_API_KEY: "apiKey" },
++    },
++    fields: [
++      field(
++        "apiKey",
++        "Internal integration token",
++        "Create an integration, share the pages/databases it may access with that integration, and paste the ntn_ token.",
++        "https://www.notion.so/my-account/integrations",
++        true,
++        true,
++        "ntn_…",
++      ),
++    ],
++    tools: [
++      { name: "API-post-search", description: "Search Notion pages and databases." },
++      { name: "API-retrieve-a-page", description: "Read a page's content." },
++      { name: "API-post-database-query", description: "Query a database." },
++      { name: "API-post-page", description: "Create a page." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "linear",
++    name: "Linear",
++    icon: "LN",
++    description: "Issues, projects, and cycles for product teams.",
++    category: "Productivity",
++    run: {
++      kind: "remote",
++      url: "https://mcp.linear.app/sse",
++      transport: "sse",
++      headers: { Authorization: "Bearer {apiKey}" },
++    },
++    fields: [
++      field(
++        "apiKey",
++        "Linear API key",
++        "A personal API key from Linear settings. It acts as you in Linear.",
++        "https://linear.app/settings/api",
++        true,
++        true,
++        "lin_api_…",
++      ),
++    ],
++    tools: [
++      { name: "list_issues", description: "List issues with filters." },
++      { name: "create_issue", description: "Create a Linear issue." },
++      { name: "update_issue", description: "Update an issue's status or fields." },
++      { name: "list_projects", description: "List Linear projects." },
++    ],
++    verified: false,
++    source: "official",
++  },
++  {
++    id: "jira",
++    name: "Jira / Atlassian",
++    icon: "JR",
++    description: "Jira issues and Confluence pages via Atlassian Cloud.",
++    category: "Productivity",
++    run: {
++      kind: "uvx",
++      package: "mcp-atlassian",
++      env: {
++        JIRA_URL: "jiraUrl",
++        JIRA_USERNAME: "username",
++        JIRA_API_TOKEN: "apiToken",
++        CONFLUENCE_URL: "confluenceUrl",
++      },
++    },
++    fields: [
++      field(
++        "jiraUrl",
++        "Jira site URL",
++        "Your Atlassian Cloud site, e.g. https://your-team.atlassian.net.",
++        "https://www.atlassian.com/software/jira",
++        false,
++        true,
++        "https://your-team.atlassian.net",
++      ),
++      field(
++        "username",
++        "Atlassian account email",
++        "The email of the Atlassian account the API token belongs to.",
++        "https://id.atlassian.com/manage-profile/email",
++        false,
++        true,
++        "you@example.com",
++      ),
++      field(
++        "apiToken",
++        "API token",
++        "Create an Atlassian API token for that account. It acts as you in Jira and Confluence.",
++        "https://id.atlassian.com/manage-profile/security/api-tokens",
++        true,
++        true,
++      ),
++      field(
++        "confluenceUrl",
++        "Confluence site URL (optional)",
++        "Same cloud site as Jira in most cases; leave empty to skip Confluence.",
++        "https://www.atlassian.com/software/confluence",
++        false,
++        false,
++        "https://your-team.atlassian.net/wiki",
++      ),
++    ],
++    tools: [
++      { name: "jira_search", description: "Search Jira issues with JQL." },
++      { name: "jira_create_issue", description: "Create a Jira issue." },
++      { name: "jira_get_issue", description: "Read a Jira issue." },
++      { name: "confluence_search", description: "Search Confluence pages." },
++    ],
++    verified: true,
++    source: "community",
++  },
++  {
++    id: "google-drive",
++    name: "Google Drive",
++    icon: "GD",
++    description: "Search and read files in Google Drive.",
++    category: "Productivity",
++    run: {
++      kind: "npx",
++      package: "@modelcontextprotocol/server-gdrive",
++    },
++    fields: [],
++    tools: [
++      { name: "gdrive_search", description: "Search files in Drive." },
++      { name: "gdrive_read_file", description: "Read a Drive file's contents." },
++    ],
++    needsOAuth: "needs OAuth (coming soon)",
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "gmail",
++    name: "Gmail",
++    icon: "GM",
++    description: "Search, read, and send email.",
++    category: "Communication",
++    run: {
++      kind: "npx",
++      package: "@gongrzhe/server-gmail-autoauth-mcp",
++    },
++    fields: [],
++    tools: [
++      { name: "search_emails", description: "Search the mailbox." },
++      { name: "read_email", description: "Read a message." },
++      { name: "send_email", description: "Send a message." },
++    ],
++    needsOAuth: "needs OAuth (coming soon)",
++    verified: true,
++    source: "community",
++  },
++  {
++    id: "google-calendar",
++    name: "Google Calendar",
++    icon: "GC",
++    description: "List and create calendar events.",
++    category: "Productivity",
++    run: {
++      kind: "npx",
++      package: "@cocal/google-calendar-mcp",
++    },
++    fields: [],
++    tools: [
++      { name: "list-events", description: "List events on a calendar." },
++      { name: "create-event", description: "Create a calendar event." },
++    ],
++    needsOAuth: "needs OAuth (coming soon)",
++    verified: true,
++    source: "community",
++  },
++  {
++    id: "postgres",
++    name: "Postgres",
++    icon: "PG",
++    description: "Query, inspect, and migrate a PostgreSQL database.",
++    category: "Data",
++    run: {
++      kind: "npx",
++      package: "@modelcontextprotocol/server-postgres",
++      args: ["{connectionString}"],
++      // Vendor limitation: server-postgres takes its connection string only
++      // as a positional argv argument (no env alternative). See the header
++      // comment — the single argv exception in this catalog.
++      allowSecretInArgv: ["connectionString"],
++    },
++    fields: [
++      field(
++        "connectionString",
++        "Connection string",
++        "A postgres:// URL for a database the agent may query. Use a least-privilege role — the agent runs SQL as this user.",
++        "https://www.postgresql.org/docs/current/libpq-connect.html",
++        true,
++        true,
++        "postgres://user:pass@host:5432/db",
++      ),
++    ],
++    tools: [
++      { name: "query", description: "Run a read-only SQL query." },
++      { name: "list_tables", description: "List tables in the schema." },
++      { name: "describe_table", description: "Show a table's columns." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "sqlite",
++    name: "SQLite",
++    icon: "SQ",
++    description: "Query a SQLite database file inside the VM.",
++    category: "Data",
++    run: {
++      kind: "npx",
++      package: "mcp-server-sqlite",
++      args: ["{dbPath}"],
++    },
++    fields: [
++      field(
++        "dbPath",
++        "Database file path (in the VM)",
++        "Path to a .db/.sqlite file inside the user's VM, e.g. /workspace/data/app.db. The server only sees VM files.",
++        "https://www.sqlite.org/",
++        false,
++        true,
++        "/workspace/data/app.db",
++      ),
++    ],
++    tools: [
++      { name: "read_query", description: "Run a read-only SQL query." },
++      { name: "list_tables", description: "List tables in the database." },
++      { name: "describe_table", description: "Show a table's columns." },
++    ],
++    verified: true,
++    source: "community",
++  },
++  {
++    id: "supabase",
++    name: "Supabase",
++    icon: "SB",
++    description: "Tables, auth, storage, and SQL on a Supabase project.",
++    category: "Data",
++    run: {
++      kind: "npx",
++      package: "@supabase/mcp-server-supabase",
++      args: ["--project-ref", "{projectRef}"],
++      env: { SUPABASE_ACCESS_TOKEN: "accessToken" },
++    },
++    fields: [
++      field(
++        "accessToken",
++        "Supabase access token",
++        "A personal access token (sbp_…) from your Supabase account settings.",
++        "https://supabase.com/dashboard/account/tokens",
++        true,
++        true,
++        "sbp_…",
++      ),
++      field(
++        "projectRef",
++        "Project ref",
++        "The project ref from your project URL, e.g. abcdefghijklm in https://abcdefghijklm.supabase.co.",
++        "https://supabase.com/dashboard",
++        false,
++        true,
++        "abcdefghijklm",
++      ),
++    ],
++    tools: [
++      { name: "list_tables", description: "List tables in the project." },
++      { name: "execute_sql", description: "Run SQL against the project." },
++      { name: "list_projects", description: "List Supabase projects." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "stripe",
++    name: "Stripe",
++    icon: "ST",
++    description: "Customers, payments, subscriptions, and disputes.",
++    category: "Payments",
++    run: {
++      kind: "npx",
++      package: "@stripe/mcp",
++      env: { STRIPE_SECRET_KEY: "secretKey" },
++    },
++    fields: [
++      field(
++        "secretKey",
++        "Secret key",
++        "A Stripe secret key (sk_live_… or sk_test_…). Use a restricted key with only the permissions the agent needs.",
++        "https://dashboard.stripe.com/apikeys",
++        true,
++        true,
++        "sk_test_…",
++      ),
++    ],
++    tools: [
++      { name: "list_customers", description: "List Stripe customers." },
++      { name: "create_payment_link", description: "Create a payment link." },
++      { name: "list_subscriptions", description: "List subscriptions." },
++      { name: "retrieve_balance", description: "Read the account balance." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "sentry",
++    name: "Sentry",
++    icon: "SE",
++    description: "Errors, issues, and releases for your apps.",
++    category: "Observability",
++    run: {
++      kind: "npx",
++      package: "@sentry/mcp-server",
++      env: { SENTRY_ACCESS_TOKEN: "accessToken" },
++    },
++    fields: [
++      field(
++        "accessToken",
++        "Auth token",
++        "A Sentry user auth token with the scopes the agent needs (e.g. project:read, event:read).",
++        "https://sentry.io/settings/account/api/auth-tokens/",
++        true,
++        true,
++      ),
++    ],
++    tools: [
++      { name: "list_issues", description: "List issues in a project." },
++      { name: "get_issue_details", description: "Read an issue's details." },
++      { name: "list_projects", description: "List Sentry projects." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "figma",
++    name: "Figma",
++    icon: "FG",
++    description: "Read designs, components, and variables.",
++    category: "Design",
++    run: {
++      kind: "remote",
++      url: "https://mcp.figma.com",
++      transport: "streamable-http",
++    },
++    fields: [],
++    tools: [
++      { name: "get_design_context", description: "Read a Figma file's design context." },
++      { name: "get_variable_defs", description: "Read design variables." },
++    ],
++    needsOAuth: "needs OAuth (coming soon)",
++    verified: false,
++    source: "official",
++  },
++  {
++    id: "brave-search",
++    name: "Brave Search",
++    icon: "BR",
++    description: "Web search results for the agent.",
++    category: "Web",
++    run: {
++      kind: "npx",
++      package: "@modelcontextprotocol/server-brave-search",
++      env: { BRAVE_API_KEY: "apiKey" },
++    },
++    fields: [
++      field(
++        "apiKey",
++        "Brave Search API key",
++        "A free API key from Brave Search (2,000 queries/month on the free plan).",
++        "https://api.search.brave.com/app/documentation/web-search/get-started",
++        true,
++        true,
++        "BSA…",
++      ),
++    ],
++    tools: [
++      { name: "brave_web_search", description: "Search the web." },
++      { name: "brave_local_search", description: "Search local businesses and places." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "exa-search",
++    name: "Exa Search",
++    icon: "EX",
++    description: "Neural web search and page contents.",
++    category: "Web",
++    run: {
++      kind: "npx",
++      package: "exa-mcp-server",
++      env: { EXA_API_KEY: "apiKey" },
++    },
++    fields: [
++      field(
++        "apiKey",
++        "Exa API key",
++        "An API key from Exa's dashboard.",
++        "https://dashboard.exa.ai/api-keys",
++        true,
++        true,
++        "…",
++      ),
++    ],
++    tools: [
++      { name: "web_search_exa", description: "Neural web search." },
++      { name: "get_contents_exa", description: "Fetch page contents." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "fetch",
++    name: "Fetch",
++    icon: "FE",
++    description: "Fetch a URL and read its contents as markdown.",
++    category: "Web",
++    run: {
++      kind: "npx",
++      package: "@kazuph/mcp-fetch",
++    },
++    fields: [],
++    tools: [
++      { name: "fetch", description: "Fetch a URL and return its contents." },
++    ],
++    verified: true,
++    source: "community",
++  },
++  {
++    id: "filesystem",
++    name: "Filesystem (VM)",
++    icon: "FS",
++    description: "Read and write files inside the user's VM only.",
++    category: "VM",
++    run: {
++      kind: "npx",
++      package: "@modelcontextprotocol/server-filesystem",
++      args: ["/workspace"],
++    },
++    fields: [],
++    tools: [
++      { name: "read_file", description: "Read a file in /workspace." },
++      { name: "list_directory", description: "List a directory in /workspace." },
++      { name: "write_file", description: "Write a file in /workspace." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "memory",
++    name: "Memory",
++    icon: "MM",
++    description: "A persistent knowledge graph the agent remembers across runs.",
++    category: "VM",
++    run: {
++      kind: "npx",
++      package: "@modelcontextprotocol/server-memory",
++    },
++    fields: [],
++    tools: [
++      { name: "create_entities", description: "Create entities in the knowledge graph." },
++      { name: "create_relations", description: "Link entities with relations." },
++      { name: "search_nodes", description: "Search the knowledge graph." },
++      { name: "read_graph", description: "Read the whole graph." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "playwright",
++    name: "Playwright",
++    icon: "PW",
++    description: "Drive a real browser inside the VM: navigate, click, type.",
++    category: "Browser",
++    run: {
++      kind: "npx",
++      package: "@playwright/mcp",
++      args: ["--browser", "chromium"],
++    },
++    fields: [],
++    tools: [
++      { name: "browser_navigate", description: "Navigate to a URL." },
++      { name: "browser_click", description: "Click an element." },
++      { name: "browser_snapshot", description: "Snapshot the page as accessibility tree." },
++      { name: "browser_take_screenshot", description: "Screenshot the page." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "puppeteer",
++    name: "Puppeteer",
++    icon: "PP",
++    description: "Drive a headless browser inside the VM.",
++    category: "Browser",
++    run: {
++      kind: "npx",
++      package: "@modelcontextprotocol/server-puppeteer",
++    },
++    fields: [],
++    tools: [
++      { name: "puppeteer_navigate", description: "Navigate to a URL." },
++      { name: "puppeteer_click", description: "Click an element." },
++      { name: "puppeteer_screenshot", description: "Screenshot the page." },
++      { name: "puppeteer_evaluate", description: "Run JavaScript in the page." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "docker",
++    name: "Docker",
++    icon: "DK",
++    description: "Run commands inside Docker containers in the VM.",
++    category: "VM",
++    run: {
++      kind: "npx",
++      package: "mcp-server-docker",
++    },
++    fields: [],
++    tools: [
++      { name: "run_docker_command", description: "Run a command in a container." },
++      { name: "list_containers", description: "List containers." },
++    ],
++    verified: true,
++    source: "community",
++  },
++  {
++    id: "cloudflare",
++    name: "Cloudflare",
++    icon: "CF",
++    description: "Workers, KV, R2, DNS, and account resources.",
++    category: "Cloud",
++    run: {
++      kind: "npx",
++      package: "@cloudflare/mcp-server-cloudflare",
++      env: { CLOUDFLARE_API_TOKEN: "apiToken", CLOUDFLARE_ACCOUNT_ID: "accountId" },
++    },
++    fields: [
++      field(
++        "apiToken",
++        "API token",
++        "A Cloudflare API token with the permissions the agent needs.",
++        "https://dash.cloudflare.com/profile/api-tokens",
++        true,
++        true,
++      ),
++      field(
++        "accountId",
++        "Account ID",
++        "Your Cloudflare account ID, shown on the dashboard overview.",
++        "https://dash.cloudflare.com/",
++        false,
++        true,
++      ),
++    ],
++    tools: [
++      { name: "workers_list", description: "List Workers scripts." },
++      { name: "kv_list", description: "List KV namespaces." },
++      { name: "dns_list_records", description: "List DNS records for a zone." },
++    ],
++    verified: true,
++    source: "official",
++  },
++  {
++    id: "vercel",
++    name: "Vercel",
++    icon: "VC",
++    description: "Projects, deployments, and domains.",
++    category: "Cloud",
++    run: {
++      kind: "remote",
++      url: "https://mcp.vercel.com",
++      transport: "streamable-http",
++    },
++    fields: [],
++    tools: [
++      { name: "list_projects", description: "List Vercel projects." },
++      { name: "list_deployments", description: "List deployments." },
++    ],
++    needsOAuth: "needs OAuth (coming soon)",
++    verified: false,
++    source: "official",
++  },
++  {
++    id: "airtable",
++    name: "Airtable",
++    icon: "AT",
++    description: "Bases, tables, and records.",
++    category: "Data",
++    run: {
++      kind: "npx",
++      package: "airtable-mcp-server",
++      env: { AIRTABLE_API_KEY: "apiKey" },
++    },
++    fields: [
++      field(
++        "apiKey",
++        "Personal access token",
++        "Create a personal access token with the scopes the agent needs and paste it here.",
++        "https://airtable.com/create/tokens",
++        true,
++        true,
++        "pat…",
++      ),
++    ],
++    tools: [
++      { name: "list_records", description: "List records in a table." },
++      { name: "create_record", description: "Create a record." },
++      { name: "update_records", description: "Update records." },
++      { name: "list_tables", description: "List tables in a base." },
++    ],
++    verified: true,
++    source: "official",
++  },
++];
++
++export function getConnector(id: string): CatalogConnector | undefined {
++  return CONNECTORS.find((c) => c.id === id);
++}
++
++/** Required field keys that have no value (empty string counts as missing). */
++export function missingRequiredFields(
++  connector: CatalogConnector,
++  values: Record<string, string>,
++): string[] {
++  return connector.fields
++    .filter((f) => f.required && !(values[f.key] ?? "").trim())
++    .map((f) => f.key);
++}
++
++/**
++ * Mask a secret for display: first 4 + last 4 chars with the middle hidden.
++ * Short values are fully hidden. Never returns the full value.
++ */
++export function maskSecret(value: string): string {
++  if (value.length <= 8) return "••••••••";
++  return `${value.slice(0, 4)}••••${value.slice(-4)}`;
++}
++
++export type ServerCommand =
++  | {
++      kind: "npx" | "uvx";
++      /** argv to run inside the VM (secrets NEVER appear here). */
++      command: string;
++      args: string[];
++      /** Env for the child process (secrets travel here). */
++      env: Record<string, string>;
++    }
++  | {
++      kind: "remote";
++      url: string;
++      transport: "sse" | "streamable-http";
++      headers: Record<string, string>;
++    };
++
++function substitute(template: string, values: Record<string, string>): string {
++  return template.replace(/\{([A-Za-z0-9_]+)\}/g, (_m, key: string) => values[key] ?? "");
++}
++
++/**
++ * Resolve a connector + stored field values into the command the VM runs.
++ * Throws when a required field is missing, when a `{placeholder}` has no
++ * value, or when a secret field would land in argv (secrets go in env
++ * only). The returned env values are the plaintext secrets — callers must
++ * keep them out of logs and pass them only to the VM runner's stdin.
++ */
++export function buildServerCommand(
++  connector: CatalogConnector,
++  values: Record<string, string>,
++): ServerCommand {
++  const missing = missingRequiredFields(connector, values);
++  if (missing.length > 0) {
++    throw new Error(`missing required field(s): ${missing.join(", ")}`);
++  }
++  const secretKeys = new Set(connector.fields.filter((f) => f.secret).map((f) => f.key));
++  const run = connector.run;
++  if (run.kind === "remote") {
++    const headers: Record<string, string> = {};
++    for (const [name, template] of Object.entries(run.headers ?? {})) {
++      headers[name] = substitute(template, values);
++    }
++    return { kind: "remote", url: run.url, transport: run.transport, headers };
++  }
++  const allowedInArgv = new Set(run.allowSecretInArgv ?? []);
++  const args: string[] = ["-y", run.package];
++  for (const raw of run.args ?? []) {
++    const placeholderKeys = [...raw.matchAll(/\{([A-Za-z0-9_]+)\}/g)].map((m) => m[1]);
++    for (const key of placeholderKeys) {
++      if (secretKeys.has(key) && !allowedInArgv.has(key)) {
++        throw new Error(`secret field "${key}" must not appear in argv; use env instead`);
++      }
++      if (!(values[key] ?? "").trim()) {
++        throw new Error(`missing value for arg placeholder "{${key}}"`);
++      }
++    }
++    args.push(substitute(raw, values));
++  }
++  const env: Record<string, string> = {};
++  for (const [name, key] of Object.entries(run.env ?? {})) {
++    const value = values[key];
++    if (value === undefined || value === "") continue;
++    env[name] = value;
++  }
++  return { kind: run.kind, command: run.kind, args, env };
++}
+diff --git a/apps/swarmagents/lib/library/catalog/probe-source.ts b/apps/swarmagents/lib/library/catalog/probe-source.ts
+new file mode 100644
+index 000000000..7a993f22a
+--- /dev/null
++++ b/apps/swarmagents/lib/library/catalog/probe-source.ts
+@@ -0,0 +1,278 @@
++/**
++ * The MCP probe: a dependency-free Node script that runs INSIDE the user's
++ * VM and discovers what tools one MCP server exposes.
++ *
++ * The service (service.ts) seeds this source into the VM at
++ * MCP_PROBE_PATH and runs `node <path>` with a JSON config on stdin:
++ *
++ *   { "kind": "stdio", "command": "npx", "args": ["-y", "pkg"], "env": {...} }
++ *   { "kind": "remote", "url": "https://…", "transport": "sse" | "streamable-http",
++ *     "headers": {...} }
++ *
++ * It prints exactly one JSON line on stdout:
++ *   { "ok": true, "tools": [{ "name", "description" }] }
++ *   { "ok": false, "error": "<readable message>" }
++ * and exits 0 either way (a failed probe is a result, not a crash).
++ *
++ * No MCP SDK dependency: the probe speaks raw JSON-RPC 2.0 (initialize →
++ * notifications/initialized → tools/list) over stdio, SSE, and
++ * streamable-HTTP, so it works in a bare VM with only node installed.
++ * Secrets arrive on stdin / in env, never in argv, and are never logged.
++ *
++ * This file holds the probe as a template string so the Next.js server can
++ * seed it into the VM without a filesystem read. Keep the string valid
++ * Node (no TS): probe.test.ts executes it for real against fake servers.
++ */
++
++export const MCP_PROBE_SOURCE = `// MCP probe — dependency-free, runs inside the user's VM.
++// Input: JSON config on stdin. Output: one JSON line on stdout.
++import { spawn } from "node:child_process";
++
++const TIMEOUT_MS = 120_000;
++
++function fail(message) {
++  process.stdout.write(JSON.stringify({ ok: false, error: message }) + "\\n");
++  process.exit(0);
++}
++
++async function readStdin() {
++  const chunks = [];
++  for await (const chunk of process.stdin) chunks.push(chunk);
++  return Buffer.concat(chunks).toString("utf8");
++}
++
++// --- stdio transport: spawn the server, speak JSON-RPC over its pipes. ---
++async function probeStdio(config) {
++  const child = spawn(config.command, config.args ?? [], {
++    env: { ...process.env, ...(config.env ?? {}) },
++    stdio: ["pipe", "pipe", "pipe"],
++  });
++  let stdout = "";
++  let stderr = "";
++  const pending = new Map();
++  let nextId = 1;
++  child.stdout.setEncoding("utf8");
++  child.stdout.on("data", (d) => {
++    stdout += d;
++    const lines = stdout.split("\\n");
++    stdout = lines.pop() ?? "";
++    for (const line of lines) {
++      const trimmed = line.trim();
++      if (!trimmed) continue;
++      let msg;
++      try { msg = JSON.parse(trimmed); } catch { continue; }
++      if (msg.id !== undefined && pending.has(msg.id)) {
++        pending.get(msg.id).resolve(msg);
++        pending.delete(msg.id);
++      }
++    }
++  });
++  child.stderr.setEncoding("utf8");
++  child.stderr.on("data", (d) => { stderr += d; });
++  const exited = new Promise((resolve) => child.on("exit", (code, signal) => resolve({ code, signal })));
++  // If the server dies, fail pending calls at once instead of waiting out
++  // the per-call timeout — a dead server is a fast, readable error.
++  child.on("exit", (code, signal) => {
++    for (const [id, entry] of pending) {
++      clearTimeout(entry.timer);
++      entry.reject(new Error("server exited" + (code !== null ? " with code " + code : " (" + signal + ")") + " before responding to " + entry.method));
++      pending.delete(id);
++    }
++  });
++  child.on("error", (err) => {
++    for (const [id, entry] of pending) {
++      clearTimeout(entry.timer);
++      entry.reject(new Error("failed to start server: " + err.message));
++      pending.delete(id);
++    }
++  });
++  const send = (method, params) => new Promise((resolve, reject) => {
++    if (child.exitCode !== null || child.signalCode !== null) {
++      reject(new Error("server already exited before " + method));
++      return;
++    }
++    const id = nextId++;
++    const timer = setTimeout(() => { pending.delete(id); reject(new Error("timed out waiting for " + method)); }, TIMEOUT_MS);
++    pending.set(id, { method, timer, resolve: (msg) => { clearTimeout(timer); resolve(msg); }, reject });
++    try {
++      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\\n");
++    } catch (err) {
++      clearTimeout(timer);
++      pending.delete(id);
++      reject(new Error("failed to write to server: " + err.message));
++    }
++  });
++  const notify = (method, params) => {
++    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\\n");
++  };
++  const kill = () => { try { child.kill("SIGKILL"); } catch {} };
++  const timeout = setTimeout(kill, TIMEOUT_MS);
++  try {
++    const init = await send("initialize", {
++      protocolVersion: "2024-11-05",
++      capabilities: {},
++      clientInfo: { name: "swarm-mcp-probe", version: "1.0.0" },
++    });
++    if (init.error) throw new Error("initialize failed: " + (init.error.message ?? JSON.stringify(init.error)));
++    notify("notifications/initialized");
++    const list = await send("tools/list", {});
++    if (list.error) throw new Error("tools/list failed: " + (list.error.message ?? JSON.stringify(list.error)));
++    const tools = (list.result?.tools ?? []).map((t) => ({ name: t.name, description: t.description ?? "" }));
++    clearTimeout(timeout);
++    kill();
++    await exited;
++    return tools;
++  } catch (err) {
++    clearTimeout(timeout);
++    kill();
++    await exited;
++    const tail = stderr.trim().split("\\n").slice(-3).join(" ");
++    throw new Error(err.message + (tail ? " (server stderr: " + tail + ")" : ""));
++  }
++}
++
++// --- HTTP transports: incremental SSE parsing (the stream stays open). ---
++function createSseParser(onMessage) {
++  let buf = "";
++  let event = "";
++  let data = "";
++  const flush = () => {
++    if (data !== "") onMessage(event || "message", data);
++    event = "";
++    data = "";
++  };
++  return {
++    feed(chunk) {
++      buf += chunk;
++      let idx;
++      while ((idx = buf.indexOf("\\n")) >= 0) {
++        const line = buf.slice(0, idx).replace(/\\r$/, "");
++        buf = buf.slice(idx + 1);
++        if (line === "") { flush(); continue; }
++        if (line.startsWith("event:")) event = line.slice(6).trim();
++        else if (line.startsWith("data:")) data += line.slice(5).trim();
++      }
++    },
++    finish() { flush(); },
++  };
++}
++
++async function pumpSse(res, onMessage) {
++  const reader = res.body.getReader();
++  const parser = createSseParser(onMessage);
++  const decoder = new TextDecoder();
++  try {
++    for (;;) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      parser.feed(decoder.decode(value, { stream: true }));
++    }
++    parser.feed(decoder.decode());
++    parser.finish();
++  } catch { /* stream closed early; callers use what arrived */ }
++}
++
++async function probeSse(config) {
++  const res = await fetch(config.url, { method: "GET", headers: { Accept: "text/event-stream", ...(config.headers ?? {}) } });
++  if (!res.ok) throw new Error("SSE GET " + config.url + " failed: HTTP " + res.status);
++  let endpoint = null;
++  const messages = [];
++  // Pump in the background; messages arrive while we wait below.
++  pumpSse(res, (event, data) => {
++    if (event === "endpoint") endpoint = data;
++    else {
++      try { messages.push(JSON.parse(data)); } catch {}
++    }
++  });
++  const waitFor = async (pred, what) => {
++    const deadline = Date.now() + TIMEOUT_MS;
++    while (Date.now() < deadline) {
++      const i = messages.findIndex(pred);
++      if (i >= 0) return messages.splice(i, 1)[0];
++      await new Promise((r) => setTimeout(r, 50));
++    }
++    throw new Error("timed out waiting for " + what);
++  };
++  const deadline = Date.now() + TIMEOUT_MS;
++  while (!endpoint && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
++  if (!endpoint) throw new Error("SSE stream gave no endpoint event");
++  const postUrl = new URL(endpoint, config.url).toString();
++  let nextId = 1;
++  const rpc = async (method, params) => {
++    const id = nextId++;
++    const r = await fetch(postUrl, {
++      method: "POST",
++      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...(config.headers ?? {}) },
++      body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
++    });
++    if (!r.ok) throw new Error("POST " + method + " failed: HTTP " + r.status);
++    return waitFor((m) => m.id === id, method);
++  };
++  const init = await rpc("initialize", {
++    protocolVersion: "2024-11-05",
++    capabilities: {},
++    clientInfo: { name: "swarm-mcp-probe", version: "1.0.0" },
++  });
++  if (init.error) throw new Error("initialize failed: " + (init.error.message ?? JSON.stringify(init.error)));
++  await fetch(postUrl, {
++    method: "POST",
++    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...(config.headers ?? {}) },
++    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
++  });
++  const list = await rpc("tools/list", {});
++  if (list.error) throw new Error("tools/list failed: " + (list.error.message ?? JSON.stringify(list.error)));
++  return (list.result?.tools ?? []).map((t) => ({ name: t.name, description: t.description ?? "" }));
++}
++
++async function probeStreamableHttp(config) {
++  let sessionId = null;
++  const post = async (body) => {
++    const headers = { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...(config.headers ?? {}) };
++    if (sessionId) headers["Mcp-Session-Id"] = sessionId;
++    const r = await fetch(config.url, { method: "POST", headers, body: JSON.stringify(body) });
++    if (!r.ok) throw new Error("POST " + config.url + " failed: HTTP " + r.status);
++    sessionId = r.headers.get("mcp-session-id") ?? sessionId;
++    const contentType = r.headers.get("content-type") ?? "";
++    if (contentType.includes("application/json")) return await r.json();
++    const messages = [];
++    await pumpSse(r, (event, data) => {
++      if (event === "message" || event === "") { try { messages.push(JSON.parse(data)); } catch {} }
++    });
++    return messages.find((m) => m.id !== undefined && m.method === undefined) ?? messages[0];
++  };
++  let nextId = 1;
++  const init = await post({ jsonrpc: "2.0", id: nextId++, method: "initialize", params: {
++    protocolVersion: "2024-11-05",
++    capabilities: {},
++    clientInfo: { name: "swarm-mcp-probe", version: "1.0.0" },
++  } });
++  if (!init || init.error) throw new Error("initialize failed: " + (init?.error?.message ?? "no response"));
++  await post({ jsonrpc: "2.0", method: "notifications/initialized" });
++  const list = await post({ jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} });
++  if (!list || list.error) throw new Error("tools/list failed: " + (list?.error?.message ?? "no response"));
++  return (list.result?.tools ?? []).map((t) => ({ name: t.name, description: t.description ?? "" }));
++}
++
++const main = async () => {
++  let config;
++  try {
++    config = JSON.parse(await readStdin());
++  } catch {
++    fail("probe input was not valid JSON");
++    return;
++  }
++  try {
++    let tools;
++    if (config.kind === "stdio") tools = await probeStdio(config);
++    else if (config.kind === "remote" && config.transport === "sse") tools = await probeSse(config);
++    else if (config.kind === "remote" && config.transport === "streamable-http") tools = await probeStreamableHttp(config);
++    else throw new Error("unknown probe config kind/transport");
++    process.stdout.write(JSON.stringify({ ok: true, tools }) + "\\n");
++    process.exit(0);
++  } catch (err) {
++    fail(err instanceof Error ? err.message : String(err));
++  }
++};
++
++main();
++`;
+diff --git a/apps/swarmagents/lib/library/catalog/probe.test.ts b/apps/swarmagents/lib/library/catalog/probe.test.ts
+new file mode 100644
+index 000000000..cc3565073
+--- /dev/null
++++ b/apps/swarmagents/lib/library/catalog/probe.test.ts
+@@ -0,0 +1,216 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { spawn } from "node:child_process";
++import fs from "node:fs";
++import http from "node:http";
++import os from "node:os";
++import path from "node:path";
++import { MCP_PROBE_SOURCE } from "./probe-source";
++
++/** Run the probe source as a real node process with a JSON config on stdin. */
++function runProbe(config: Record<string, unknown>): Promise<{ stdout: string; stderr: string; code: number | null }> {
++  return new Promise((resolve, reject) => {
++    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-probe-"));
++    const probePath = path.join(dir, "mcp-probe.mjs");
++    fs.writeFileSync(probePath, MCP_PROBE_SOURCE);
++    const child = spawn(process.execPath, [probePath], { stdio: ["pipe", "pipe", "pipe"] });
++    let stdout = "";
++    let stderr = "";
++    child.stdout.setEncoding("utf8");
++    child.stdout.on("data", (d: string) => {
++      stdout += d;
++    });
++    child.stderr.setEncoding("utf8");
++    child.stderr.on("data", (d: string) => {
++      stderr += d;
++    });
++    child.on("error", reject);
++    child.on("exit", (code) => resolve({ stdout, stderr, code }));
++    child.stdin.end(JSON.stringify(config));
++  });
++}
++
++/** A fake MCP server speaking JSON-RPC over stdio. */
++const FAKE_STDIO_SERVER = `
++import readline from "node:readline";
++const rl = readline.createInterface({ input: process.stdin });
++rl.on("line", (line) => {
++  let msg;
++  try { msg = JSON.parse(line); } catch { return; }
++  if (msg.method === "initialize") {
++    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {
++      protocolVersion: "2024-11-05", capabilities: {},
++      serverInfo: { name: "fake", version: "0" },
++    } }) + "\\n");
++  } else if (msg.method === "tools/list") {
++    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [
++      { name: "search_repositories", description: "Search repos." },
++      { name: "create_issue", description: "Create issue." },
++    ] } }) + "\\n");
++  }
++  // notifications/initialized gets no reply, by design.
++});
++`;
++
++function writeFakeServer(contents: string): string {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-fake-mcp-"));
++  const p = path.join(dir, "fake-server.mjs");
++  fs.writeFileSync(p, contents);
++  return p;
++}
++
++test("probe discovers tools from a stdio MCP server", async () => {
++  const server = writeFakeServer(FAKE_STDIO_SERVER);
++  const { stdout, stderr, code } = await runProbe({
++    kind: "stdio",
++    command: process.execPath,
++    args: [server],
++    env: {},
++  });
++  assert.equal(code, 0);
++  assert.equal(stderr, "");
++  const lines = stdout.trim().split("\n");
++  assert.equal(lines.length, 1, `probe must print exactly one JSON line, got: ${stdout}`);
++  const result = JSON.parse(lines[0]) as { ok: boolean; tools?: { name: string }[] };
++  assert.equal(result.ok, true);
++  assert.deepEqual(
++    (result.tools ?? []).map((t) => t.name),
++    ["search_repositories", "create_issue"],
++  );
++});
++
++test("probe reports a readable error when the server dies immediately", async () => {
++  const server = writeFakeServer(`process.stderr.write("boom: bad config\\n"); process.exit(1);\n`);
++  const { stdout, code } = await runProbe({
++    kind: "stdio",
++    command: process.execPath,
++    args: [server],
++    env: {},
++  });
++  assert.equal(code, 0, "a failed probe is a result, not a crash");
++  const result = JSON.parse(stdout.trim()) as { ok: boolean; error?: string };
++  assert.equal(result.ok, false);
++  assert.ok(result.error && result.error.length > 0, "error must be readable");
++});
++
++test("probe reports invalid input instead of crashing", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-probe-"));
++  const probePath = path.join(dir, "mcp-probe.mjs");
++  fs.writeFileSync(probePath, MCP_PROBE_SOURCE);
++  const child = spawn(process.execPath, [probePath], { stdio: ["pipe", "pipe", "pipe"] });
++  let stdout = "";
++  child.stdout.setEncoding("utf8");
++  child.stdout.on("data", (d: string) => {
++    stdout += d;
++  });
++  const code = await new Promise<number | null>((resolve) => {
++    child.on("exit", resolve);
++    child.stdin.end("not json");
++  });
++  assert.equal(code, 0);
++  const result = JSON.parse(stdout.trim()) as { ok: boolean; error?: string };
++  assert.equal(result.ok, false);
++  assert.match(result.error ?? "", /not valid JSON/);
++});
++
++test("probe discovers tools from an SSE MCP server", async () => {
++  // Minimal SSE MCP server: GET /sse opens the stream and announces the
++  // POST endpoint; POST /messages answers JSON-RPC via the stream.
++  // Holder object so TS does not narrow the closure-assigned response away.
++  const sseHolder: { res: http.ServerResponse | null } = { res: null };
++  const server = http.createServer((req, res) => {
++    if (req.url === "/sse" && req.method === "GET") {
++      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
++      res.write("event: endpoint\ndata: /messages\n\n");
++      sseHolder.res = res;
++      return;
++    }
++    if (req.url === "/messages" && req.method === "POST") {
++      let body = "";
++      req.on("data", (c: Buffer) => {
++        body += c.toString();
++      });
++      req.on("end", () => {
++        const msg = JSON.parse(body) as { id?: number; method?: string };
++        res.writeHead(202);
++        res.end();
++        if (msg.method === "initialize") {
++          sseHolder.res?.write(
++            `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fake-sse", version: "0" } } })}\n\n`,
++          );
++        } else if (msg.method === "tools/list") {
++          sseHolder.res?.write(
++            `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "list_issues", description: "List issues." }] } })}\n\n`,
++          );
++        }
++      });
++      return;
++    }
++    res.writeHead(404);
++    res.end();
++  });
++  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
++  const addr = server.address();
++  assert.ok(addr && typeof addr === "object");
++  try {
++    const { stdout, code } = await runProbe({
++      kind: "remote",
++      url: `http://127.0.0.1:${addr.port}/sse`,
++      transport: "sse",
++      headers: {},
++    });
++    assert.equal(code, 0);
++    const result = JSON.parse(stdout.trim()) as { ok: boolean; tools?: { name: string }[]; error?: string };
++    assert.equal(result.ok, true, `probe failed: ${result.error ?? ""}`);
++    assert.deepEqual((result.tools ?? []).map((t) => t.name), ["list_issues"]);
++  } finally {
++    sseHolder.res?.end();
++    server.close();
++  }
++});
++
++test("probe discovers tools over streamable HTTP", async () => {
++  const server = http.createServer((req, res) => {
++    if (req.method !== "POST") {
++      res.writeHead(404);
++      res.end();
++      return;
++    }
++    let body = "";
++    req.on("data", (c: Buffer) => {
++      body += c.toString();
++    });
++    req.on("end", () => {
++      const msg = JSON.parse(body) as { id?: number; method?: string };
++      res.writeHead(200, { "Content-Type": "application/json" });
++      if (msg.method === "initialize") {
++        res.end(
++          JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fake-http", version: "0" } } }),
++        );
++      } else if (msg.method === "tools/list") {
++        res.end(
++          JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "list_projects", description: "List projects." }] } }),
++        );
++      } else {
++        res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id ?? null, result: {} }));
++      }
++    });
++  });
++  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
++  const addr = server.address();
++  assert.ok(addr && typeof addr === "object");
++  try {
++    const { stdout, code } = await runProbe({
++      kind: "remote",
++      url: `http://127.0.0.1:${addr.port}/mcp`,
++      transport: "streamable-http",
++      headers: { Authorization: "Bearer test-key" },
++    });
++    assert.equal(code, 0);
++    const result = JSON.parse(stdout.trim()) as { ok: boolean; tools?: { name: string }[]; error?: string };
++    assert.equal(result.ok, true, `probe failed: ${result.error ?? ""}`);
++    assert.deepEqual((result.tools ?? []).map((t) => t.name), ["list_projects"]);
++  } finally {
++    server.close();
++  }
++});
+diff --git a/apps/swarmagents/lib/library/catalog/service.test.ts b/apps/swarmagents/lib/library/catalog/service.test.ts
+new file mode 100644
+index 000000000..1534f0cc2
+--- /dev/null
++++ b/apps/swarmagents/lib/library/catalog/service.test.ts
+@@ -0,0 +1,296 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  connect,
++  disconnect,
++  listConnections,
++  probeServer,
++  serversForRun,
++  testConnection,
++  toClientView,
++  ConnectorServiceError,
++} from "./service";
++import { getConnector } from "./connectors";
++import type {
++  ConnectorConnectionRecord,
++  ConnectorStore,
++  DiscoveredTool,
++  LibraryVmRunner,
++  SaveConnectionInput,
++  TestRecord,
++  VmRunResult,
++} from "../seam";
++
++/**
++ * In-memory fake of the l1 store. NOTE: this fake keeps values in
++ * plaintext only because it is test-only; the real l1 store seals them
++ * with secret-box before they touch disk (see seam.ts).
++ */
++class FakeStore implements ConnectorStore {
++  records = new Map<string, ConnectorConnectionRecord>();
++  values = new Map<string, Record<string, string>>();
++  counter = 0;
++
++  async list(ownerId: string): Promise<ConnectorConnectionRecord[]> {
++    return [...this.records.values()].filter((r) => r.ownerId === ownerId);
++  }
++  async get(ownerId: string, id: string): Promise<ConnectorConnectionRecord | null> {
++    const r = this.records.get(id);
++    return r && r.ownerId === ownerId ? r : null;
++  }
++  async save(ownerId: string, input: SaveConnectionInput): Promise<ConnectorConnectionRecord> {
++    const id = `conn-${++this.counter}`;
++    const now = Date.now();
++    const record: ConnectorConnectionRecord = {
++      id,
++      connectorId: input.connectorId,
++      ownerId,
++      label: input.label ?? input.connectorId,
++      sealedFields: {},
++      secretFields: input.secretFields,
++      createdAt: now,
++      updatedAt: now,
++    };
++    this.records.set(id, record);
++    this.values.set(id, { ...input.values });
++    return record;
++  }
++  async remove(ownerId: string, id: string): Promise<boolean> {
++    const r = this.records.get(id);
++    if (!r || r.ownerId !== ownerId) return false;
++    this.records.delete(id);
++    this.values.delete(id);
++    return true;
++  }
++  async updateTest(ownerId: string, id: string, result: TestRecord): Promise<void> {
++    const r = this.records.get(id);
++    if (!r || r.ownerId !== ownerId) return;
++    r.lastTestedAt = result.testedAt;
++    r.lastTestedOk = result.ok;
++    r.lastTools = result.tools;
++  }
++  async openValues(ownerId: string, id: string): Promise<Record<string, string> | null> {
++    const r = this.records.get(id);
++    if (!r || r.ownerId !== ownerId) return null;
++    return { ...this.values.get(id) };
++  }
++}
++
++class FakeRunner implements LibraryVmRunner {
++  execCalls: { argv: string[]; stdin?: string }[] = [];
++  written = new Map<string, string>();
++  /** Handler decides the probe result for each exec call. */
++  handler: (argv: string[], stdin?: string) => VmRunResult = () => ({
++    exitCode: 0,
++    stdout: JSON.stringify({ ok: true, tools: [{ name: "fake_tool", description: "fake" }] }) + "\n",
++    stderr: "",
++  });
++
++  async exec(ownerId: string, argv: string[], opts?: { stdin?: string; timeoutMs?: number }): Promise<VmRunResult> {
++    void ownerId;
++    void opts?.timeoutMs;
++    this.execCalls.push({ argv, stdin: opts?.stdin });
++    return this.handler(argv, opts?.stdin);
++  }
++  async writeFile(ownerId: string, path: string, contents: string): Promise<void> {
++    void ownerId;
++    this.written.set(path, contents);
++  }
++}
++
++const OWNER = "user-alice";
++
++test("connect saves a GitHub connection and returns a masked view", async () => {
++  const store = new FakeStore();
++  const view = await connect(store, null, OWNER, "github", { token: "ghp_secret1234567890" });
++  assert.equal(view.connectorId, "github");
++  assert.equal(view.connectorName, "GitHub");
++  assert.equal(view.fields.length, 1);
++  assert.equal(view.fields[0].secret, true);
++  assert.equal(view.fields[0].value.includes("secret1234567890"), false);
++  assert.ok(view.fields[0].value.startsWith("ghp_"));
++  assert.deepEqual(view.tools, getConnector("github")!.tools);
++  assert.equal((await store.list(OWNER)).length, 1);
++});
++
++test("connect refuses unknown connectors, disallowed connectors, and OAuth-only ones", async () => {
++  const store = new FakeStore();
++  await assert.rejects(connect(store, null, OWNER, "nope", {}), (e: unknown) => {
++    assert.ok(e instanceof ConnectorServiceError && e.code === "not-found");
++    return true;
++  });
++  await assert.rejects(
++    connect(store, { allowedConnectorIds: ["fetch"] }, OWNER, "github", { token: "x" }),
++    (e: unknown) => {
++      assert.ok(e instanceof ConnectorServiceError && e.code === "not-allowed");
++      return true;
++    },
++  );
++  await assert.rejects(connect(store, null, OWNER, "google-drive", {}), (e: unknown) => {
++    assert.ok(e instanceof ConnectorServiceError && e.code === "needs-oauth");
++    return true;
++  });
++});
++
++test("connect rejects missing required fields", async () => {
++  const store = new FakeStore();
++  await assert.rejects(connect(store, null, OWNER, "github", {}), (e: unknown) => {
++    assert.ok(e instanceof ConnectorServiceError && e.code === "missing-fields");
++    return true;
++  });
++  assert.equal((await store.list(OWNER)).length, 0);
++});
++
++test("testConnection runs the probe in the VM and records discovered tools", async () => {
++  const store = new FakeStore();
++  const runner = new FakeRunner();
++  const discovered: DiscoveredTool[] = [
++    { name: "search_repositories", description: "Search repos." },
++    { name: "create_issue", description: "Create issue." },
++  ];
++  runner.handler = () => ({
++    exitCode: 0,
++    stdout: JSON.stringify({ ok: true, tools: discovered }) + "\n",
++    stderr: "",
++  });
++  const view = await connect(store, null, OWNER, "github", { token: "ghp_secret1234567890" });
++  const result = await testConnection(store, runner, OWNER, view.id);
++  assert.equal(result.ok, true);
++  assert.deepEqual(result.tools, discovered);
++
++  // The probe script was seeded, and the probe was run with no secrets in argv.
++  assert.ok(runner.written.has("/workspace/.swarm/mcp-probe.mjs"));
++  assert.equal(runner.execCalls.length, 1);
++  const call = runner.execCalls[0];
++  assert.deepEqual(call.argv, ["node", "/workspace/.swarm/mcp-probe.mjs"]);
++  assert.equal(call.argv.join(" ").includes("ghp_secret"), false);
++  // Secrets travel on stdin (inside the probe config), never in argv.
++  assert.ok(call.stdin?.includes("ghp_secret1234567890"));
++
++  const stored = await store.get(OWNER, view.id);
++  assert.equal(stored?.lastTestedOk, true);
++  assert.deepEqual(stored?.lastTools, discovered);
++});
++
++test("testConnection surfaces a readable probe error and records the failure", async () => {
++  const store = new FakeStore();
++  const runner = new FakeRunner();
++  runner.handler = () => ({
++    exitCode: 0,
++    stdout: JSON.stringify({ ok: false, error: "initialize failed: bad token" }) + "\n",
++    stderr: "",
++  });
++  const view = await connect(store, null, OWNER, "fetch", {});
++  const result = await testConnection(store, runner, OWNER, view.id);
++  assert.equal(result.ok, false);
++  assert.match(result.error ?? "", /bad token/);
++  const stored = await store.get(OWNER, view.id);
++  assert.equal(stored?.lastTestedOk, false);
++});
++
++test("testConnection handles a probe that produced no output", async () => {
++  const store = new FakeStore();
++  const runner = new FakeRunner();
++  runner.handler = () => ({ exitCode: 1, stdout: "", stderr: "node: bad flag\n" });
++  const view = await connect(store, null, OWNER, "fetch", {});
++  const result = await testConnection(store, runner, OWNER, view.id);
++  assert.equal(result.ok, false);
++  assert.match(result.error ?? "", /no readable output/);
++});
++
++test("probeServer: GitHub/Fetch/Postgres flows use the right server command", async () => {
++  const runner = new FakeRunner();
++  const seen: string[] = [];
++  runner.handler = (_argv, stdin) => {
++    seen.push(stdin ?? "");
++    return { exitCode: 0, stdout: JSON.stringify({ ok: true, tools: [] }) + "\n", stderr: "" };
++  };
++  const store = new FakeStore();
++  const gh = await connect(store, null, OWNER, "github", { token: "ghp_abc" });
++  const fe = await connect(store, null, OWNER, "fetch", {});
++  const pg = await connect(store, null, OWNER, "postgres", {
++    connectionString: "postgres://u:p@h:5432/db",
++  });
++  for (const v of [gh, fe, pg]) {
++    const r = await testConnection(store, runner, OWNER, v.id);
++    assert.equal(r.ok, true);
++  }
++  const configs = seen.map((s) => JSON.parse(s) as Record<string, unknown>);
++  assert.deepEqual(configs[0].args, ["-y", "@modelcontextprotocol/server-github"]);
++  assert.deepEqual(configs[1].args, ["-y", "@kazuph/mcp-fetch"]);
++  assert.deepEqual(configs[2].args, [
++    "-y",
++    "@modelcontextprotocol/server-postgres",
++    "postgres://u:p@h:5432/db",
++  ]);
++  // The probe's own argv never carries a secret.
++  for (const call of runner.execCalls) {
++    assert.equal(call.argv.join(" ").includes("ghp_abc"), false);
++    assert.equal(call.argv.join(" ").includes("postgres://"), false);
++  }
++});
++
++test("disconnect removes the connection; listConnections masks secrets", async () => {
++  const store = new FakeStore();
++  const gh = await connect(store, null, OWNER, "github", { token: "ghp_secret1234567890" });
++  const pg = await connect(store, null, OWNER, "postgres", {
++    connectionString: "postgres://u:p@h:5432/db",
++  });
++  const listed = await listConnections(store, OWNER);
++  assert.equal(listed.length, 2);
++  const ghView = listed.find((v) => v.id === gh.id)!;
++  assert.equal(ghView.fields[0].value.includes("secret1234567890"), false);
++  assert.equal(await disconnect(store, OWNER, gh.id), true);
++  assert.equal(await disconnect(store, OWNER, gh.id), false);
++  assert.deepEqual(
++    (await listConnections(store, OWNER)).map((v) => v.id),
++    [pg.id],
++  );
++});
++
++test("toClientView never exposes a secret value, even for non-catalog connectors", () => {
++  const record: ConnectorConnectionRecord = {
++    id: "c1",
++    connectorId: "github",
++    ownerId: OWNER,
++    label: "GitHub",
++    sealedFields: {},
++    secretFields: ["token"],
++    createdAt: 1,
++    updatedAt: 1,
++  };
++  const view = toClientView(record, { token: "ghp_secret1234567890" });
++  assert.equal(view.fields[0].value.includes("secret1234567890"), false);
++  assert.equal(JSON.stringify(view).includes("ghp_secret1234567890"), false);
++});
++
++test("serversForRun intersects connections with the settings allowlist", async () => {
++  const store = new FakeStore();
++  await connect(store, null, OWNER, "github", { token: "ghp_abc" });
++  await connect(store, null, OWNER, "fetch", {});
++  const all = await serversForRun(store, null, OWNER);
++  assert.deepEqual(
++    all.map((s) => s.connectorId).sort(),
++    ["fetch", "github"],
++  );
++  const onlyFetch = await serversForRun(store, { allowedConnectorIds: ["fetch"] }, OWNER);
++  assert.deepEqual(
++    onlyFetch.map((s) => s.connectorId),
++    ["fetch"],
++  );
++  const none = await serversForRun(store, { allowedConnectorIds: [] }, OWNER);
++  assert.deepEqual(none, []);
++});
++
++test("probeServer returns the error when the VM run itself fails", async () => {
++  const runner = new FakeRunner();
++  runner.handler = () => ({ exitCode: 1, stdout: "", stderr: "boom\n" });
++  const result = await probeServer(runner, OWNER, {
++    kind: "npx",
++    command: "npx",
++    args: ["-y", "@kazuph/mcp-fetch"],
++    env: {},
++  });
++  assert.equal(result.ok, false);
++  assert.match(result.error ?? "", /exit 1/);
++});
+diff --git a/apps/swarmagents/lib/library/catalog/service.ts b/apps/swarmagents/lib/library/catalog/service.ts
+new file mode 100644
+index 000000000..83f9a468f
+--- /dev/null
++++ b/apps/swarmagents/lib/library/catalog/service.ts
+@@ -0,0 +1,332 @@
++/**
++ * l3 connect / test / disconnect service.
++ *
++ * Runs entirely against the l1 seam (lib/library/seam.ts): `ConnectorStore`
++ * for per-account persistence and `LibraryVmRunner` for execution inside
++ * the owning user's VM. l1 is not on main yet, so this file has no real
++ * store wired in — the tests use fakes, and l1 plugs in its implementation
++ * of the seam interfaces.
++ *
++ * Security rules enforced here:
++ * - A connection can only be opened/tested under its own ownerId; the
++ *   store's secret-box AAD binds sealed values to owner + connector +
++ *   field, so a copied ciphertext fails to open instead of working.
++ * - Plaintext field values are never logged and never appear in any
++ *   client-facing view (see `toClientView` — secrets are masked).
++ * - Secrets never appear in argv: the probe receives them via stdin/env
++ *   only (see buildServerCommand in connectors.ts).
++ * - A role (and the agent) can never get more than the user's settings
++ *   allow: `serversForRun` intersects connections with the policy
++ *   allowlist before handing anything to run wiring.
++ */
++
++import {
++  CONNECTORS,
++  buildServerCommand,
++  getConnector,
++  maskSecret,
++  missingRequiredFields,
++  type CatalogConnector,
++  type ServerCommand,
++} from "./connectors";
++import { MCP_PROBE_SOURCE } from "./probe-source";
++import {
++  MCP_PROBE_PATH,
++  isConnectorAllowed,
++  type ConnectorConnectionRecord,
++  type ConnectorPolicy,
++  type ConnectorStore,
++  type DiscoveredTool,
++  type LibraryVmRunner,
++} from "../seam";
++
++export interface ClientFieldView {
++  key: string;
++  label: string;
++  /** Masked value for secret fields, plaintext for non-secret fields. */
++  value: string;
++  secret: boolean;
++  required: boolean;
++}
++
++export interface ClientConnectionView {
++  id: string;
++  connectorId: string;
++  connectorName: string;
++  label: string;
++  fields: ClientFieldView[];
++  createdAt: number;
++  updatedAt: number;
++  lastTestedAt?: number;
++  lastTestedOk?: boolean;
++  /** Tools discovered by the last successful test (advertised list before then). */
++  tools: DiscoveredTool[];
++}
++
++export interface TestConnectionResult {
++  ok: boolean;
++  tools?: DiscoveredTool[];
++  error?: string;
++  testedAt: number;
++}
++
++export class ConnectorServiceError extends Error {
++  constructor(
++    message: string,
++    public readonly code:
++      | "not-found"
++      | "not-allowed"
++      | "needs-oauth"
++      | "missing-fields"
++      | "probe-failed",
++  ) {
++    super(message);
++    this.name = "ConnectorServiceError";
++  }
++}
++
++/** Connectors the user may add, honoring the settings allowlist. */
++export function allowedConnectors(policy: ConnectorPolicy | null | undefined): CatalogConnector[] {
++  return CONNECTORS.filter((c) => isConnectorAllowed(policy, c.id));
++}
++
++/**
++ * Client-safe view of a stored connection. Secret field values are masked;
++ * non-secret values (URLs, paths, usernames) are shown as stored. The
++ * sealed ciphertext is never exposed.
++ */
++export function toClientView(
++  record: ConnectorConnectionRecord,
++  values: Record<string, string>,
++  connector?: CatalogConnector,
++): ClientConnectionView {
++  const resolved: CatalogConnector = connector ?? getConnector(record.connectorId) ?? {
++    id: record.connectorId,
++    name: record.connectorId,
++    icon: "?",
++    description: "",
++    category: "",
++    run: { kind: "npx", package: "" },
++    fields: [],
++    tools: [],
++    verified: false,
++    source: "official",
++  };
++  const secretSet = new Set(record.secretFields);
++  return {
++    id: record.id,
++    connectorId: record.connectorId,
++    connectorName: resolved.name,
++    label: record.label,
++    fields: resolved.fields.map((f) => ({
++      key: f.key,
++      label: f.label,
++      value: secretSet.has(f.key) ? maskSecret(values[f.key] ?? "") : (values[f.key] ?? ""),
++      secret: f.secret,
++      required: f.required,
++    })),
++    createdAt: record.createdAt,
++    updatedAt: record.updatedAt,
++    lastTestedAt: record.lastTestedAt,
++    lastTestedOk: record.lastTestedOk,
++    tools: record.lastTools ?? resolved.tools,
++  };
++}
++
++function probeInput(command: ServerCommand): Record<string, unknown> {
++  if (command.kind === "remote") {
++    return {
++      kind: "remote",
++      url: command.url,
++      transport: command.transport,
++      headers: command.headers,
++    };
++  }
++  return {
++    kind: "stdio",
++    command: command.command,
++    args: command.args,
++    env: command.env,
++  };
++}
++
++/**
++ * Run the probe inside the user's VM and return the discovered tools.
++ * The probe script is seeded into the VM first; the server command, args
++ * and env travel on stdin — secrets never appear in argv.
++ */
++export async function probeServer(
++  runner: LibraryVmRunner,
++  ownerId: string,
++  command: ServerCommand,
++): Promise<TestConnectionResult> {
++  const testedAt = Date.now();
++  await runner.writeFile(ownerId, MCP_PROBE_PATH, MCP_PROBE_SOURCE);
++  const result = await runner.exec(ownerId, ["node", MCP_PROBE_PATH], {
++    stdin: JSON.stringify(probeInput(command)),
++    timeoutMs: 120_000,
++  });
++  const line = result.stdout
++    .split("\n")
++    .map((l) => l.trim())
++    .find((l) => l.startsWith("{"));
++  if (line) {
++    try {
++      const parsed = JSON.parse(line) as { ok: boolean; tools?: DiscoveredTool[]; error?: string };
++      if (parsed.ok) return { ok: true, tools: parsed.tools ?? [], testedAt };
++      return { ok: false, error: parsed.error ?? "probe failed", testedAt };
++    } catch {
++      // Fall through to the unreadable-output error below.
++    }
++  }
++  const stderrTail = result.stderr.trim().split("\n").slice(-3).join(" ");
++  return {
++    ok: false,
++    error: `probe produced no readable output (exit ${result.exitCode})${stderrTail ? `: ${stderrTail}` : ""}`,
++    testedAt,
++  };
++}
++
++/** Save a new connection (form values -> sealed store), then return its client view. */
++export async function connect(
++  store: ConnectorStore,
++  policy: ConnectorPolicy | null | undefined,
++  ownerId: string,
++  connectorId: string,
++  values: Record<string, string>,
++  label?: string,
++): Promise<ClientConnectionView> {
++  const connector = getConnector(connectorId);
++  if (!connector) {
++    throw new ConnectorServiceError(`unknown connector "${connectorId}"`, "not-found");
++  }
++  if (!isConnectorAllowed(policy, connectorId)) {
++    throw new ConnectorServiceError(
++      `"${connector.name}" is not allowed by the user's settings`,
++      "not-allowed",
++    );
++  }
++  if (connector.needsOAuth) {
++    throw new ConnectorServiceError(
++      `"${connector.name}" ${connector.needsOAuth} — connect will be available once OAuth lands`,
++      "needs-oauth",
++    );
++  }
++  const missing = missingRequiredFields(connector, values);
++  if (missing.length > 0) {
++    throw new ConnectorServiceError(
++      `missing required field(s): ${missing.join(", ")}`,
++      "missing-fields",
++    );
++  }
++  const record = await store.save(ownerId, {
++    connectorId,
++    label: label?.trim() || connector.name,
++    values,
++    secretFields: connector.fields.filter((f) => f.secret).map((f) => f.key),
++  });
++  return toClientView(record, values, connector);
++}
++
++/**
++ * Test a stored connection: unseal its values (server-only), run the
++ * probe in the owner's VM, record the outcome, and return the discovered
++ * tools or a readable error.
++ */
++export async function testConnection(
++  store: ConnectorStore,
++  runner: LibraryVmRunner,
++  ownerId: string,
++  connectionId: string,
++): Promise<TestConnectionResult> {
++  const record = await store.get(ownerId, connectionId);
++  if (!record) {
++    throw new ConnectorServiceError(`unknown connection "${connectionId}"`, "not-found");
++  }
++  const connector = getConnector(record.connectorId);
++  if (!connector) {
++    throw new ConnectorServiceError(
++      `connector "${record.connectorId}" is no longer in the catalog`,
++      "not-found",
++    );
++  }
++  const values = await store.openValues(ownerId, connectionId);
++  if (!values) {
++    throw new ConnectorServiceError(`could not open values for "${connectionId}"`, "not-found");
++  }
++  let command: ServerCommand;
++  try {
++    command = buildServerCommand(connector, values);
++  } catch (err) {
++    throw new ConnectorServiceError(
++      err instanceof Error ? err.message : String(err),
++      "missing-fields",
++    );
++  }
++  const result = await probeServer(runner, ownerId, command);
++  await store.updateTest(ownerId, connectionId, {
++    ok: result.ok,
++    tools: result.tools,
++    testedAt: result.testedAt,
++  });
++  return result;
++}
++
++/** Disconnect: remove the stored connection (and its sealed secrets). */
++export async function disconnect(
++  store: ConnectorStore,
++  ownerId: string,
++  connectionId: string,
++): Promise<boolean> {
++  return store.remove(ownerId, connectionId);
++}
++
++/** List the owner's connections as client-safe (masked) views. */
++export async function listConnections(
++  store: ConnectorStore,
++  ownerId: string,
++): Promise<ClientConnectionView[]> {
++  const records = await store.list(ownerId);
++  const views: ClientConnectionView[] = [];
++  for (const record of records) {
++    // Server-side only: unseal to build the view, but return masked
++    // secrets and non-secret values only — never the raw opened values.
++    const values = await store.openValues(ownerId, record.id);
++    if (!values) continue;
++    views.push(toClientView(record, values, getConnector(record.connectorId)));
++  }
++  return views;
++}
++
++export interface RunServer {
++  connectorId: string;
++  command: ServerCommand;
++}
++
++/**
++ * Resolve the servers a run may use: the owner's stored connections,
++ * intersected with the settings allowlist. l1's run wiring feeds this
++ * into the agent's --mcp-config. Connections whose connector is no longer
++ * in the catalog, or whose values fail to open, are skipped (never fatal).
++ */
++export async function serversForRun(
++  store: ConnectorStore,
++  policy: ConnectorPolicy | null | undefined,
++  ownerId: string,
++): Promise<RunServer[]> {
++  const records = await store.list(ownerId);
++  const servers: RunServer[] = [];
++  for (const record of records) {
++    if (!isConnectorAllowed(policy, record.connectorId)) continue;
++    const connector = getConnector(record.connectorId);
++    if (!connector) continue;
++    const values = await store.openValues(ownerId, record.id);
++    if (!values) continue;
++    try {
++      servers.push({ connectorId: record.connectorId, command: buildServerCommand(connector, values) });
++    } catch {
++      continue;
++    }
++  }
++  return servers;
++}
+diff --git a/apps/swarmagents/lib/library/seam.ts b/apps/swarmagents/lib/library/seam.ts
+new file mode 100644
+index 000000000..b64f9c680
+--- /dev/null
++++ b/apps/swarmagents/lib/library/seam.ts
+@@ -0,0 +1,124 @@
++/**
++ * The l1 seam: the minimal interfaces l3 (connector catalog) needs from l1
++ * (per-user extension store + run wiring) and from the runtime (VM exec).
++ *
++ * l1 and l2 are NOT on main yet, so nothing here is wired to a real store.
++ * This file only defines the contract and the rules l1 must follow when it
++ * implements it. The catalog service (service.ts) and the probe (probe.ts)
++ * run entirely against these interfaces, with fakes in the tests.
++ *
++ * What l1 must supply
++ * -------------------
++ * - `ConnectorStore`: per-account persistence for connector connections.
++ *   Field values are sealed with `lib/providers/secret-box` `seal(value,
++ *   ownerId, "library/connector:<connectorId>:<fieldKey>")` before they
++ *   touch disk, in a mode-600 file inside a mode-700 per-account directory,
++ *   exactly like the provider store. `openValues` is server-only: it unseals
++ *   values for VM execution and must never be called from a route handler
++ *   that returns its result to the client.
++ * - `ConnectorPolicy`: the user's settings allowlist. A role (and the agent)
++ *   can never get more than the user's settings allow: run wiring must
++ *   intersect the role's connector ids with this allowlist before building
++ *   `--mcp-config`. `allowedConnectorIds: null` means "every catalog entry".
++ *
++ * What the runtime must supply
++ * -----------------------------
++ * - `LibraryVmRunner`: run a command inside the owning user's VM and seed
++ *   files into it. The production implementation adapts
++ *   `lib/vm` `vmManager.exec` / `writeFile`. The probe only ever runs
++ *   `node /workspace/.swarm/mcp-probe.mjs` with the server command, args and
++ *   env as JSON on stdin — secrets never appear in argv.
++ *
++ * What l1 must NOT do
++ * --------------------
++ * - Never store a field value in plaintext, never log one, and never return
++ *   one to the client. Client views carry masked values only (see
++ *   `maskSecret` in catalog/connectors.ts).
++ * - Never let one account's connection be opened under another account:
++ *   the secret-box AAD binds each sealed value to its owner + connector +
++ *   field, so a copied ciphertext fails to open instead of working.
++ */
++
++export interface DiscoveredTool {
++  name: string;
++  description?: string;
++}
++
++/**
++ * One stored connector connection. `sealedFields` holds secret-box
++ * ciphertext, never plaintext. Non-secret field values (URLs, paths,
++ * usernames) are stored sealed too, so the store has one code path.
++ */
++export interface ConnectorConnectionRecord {
++  id: string;
++  connectorId: string;
++  ownerId: string;
++  label: string;
++  sealedFields: Record<string, string>;
++  /** Field keys whose values are secrets (masked in every client view). */
++  secretFields: string[];
++  createdAt: number;
++  updatedAt: number;
++  lastTestedAt?: number;
++  lastTestedOk?: boolean;
++  lastTools?: DiscoveredTool[];
++}
++
++export interface SaveConnectionInput {
++  connectorId: string;
++  /** Human label; defaults to the connector's name. */
++  label?: string;
++  /** Plaintext field values. The store seals them before persisting. */
++  values: Record<string, string>;
++  secretFields: string[];
++}
++
++export interface TestRecord {
++  ok: boolean;
++  tools?: DiscoveredTool[];
++  testedAt: number;
++}
++
++/** Per-account persistence for connector connections (implemented by l1). */
++export interface ConnectorStore {
++  list(ownerId: string): Promise<ConnectorConnectionRecord[]>;
++  get(ownerId: string, connectionId: string): Promise<ConnectorConnectionRecord | null>;
++  save(ownerId: string, input: SaveConnectionInput): Promise<ConnectorConnectionRecord>;
++  remove(ownerId: string, connectionId: string): Promise<boolean>;
++  updateTest(ownerId: string, connectionId: string, result: TestRecord): Promise<void>;
++  /**
++   * Server-only: unseal the field values for VM execution (probe / run
++   * wiring). MUST NOT be reachable from any client-facing route.
++   */
++  openValues(ownerId: string, connectionId: string): Promise<Record<string, string> | null>;
++}
++
++/** One command run inside the owning user's VM. */
++export interface VmRunResult {
++  exitCode: number;
++  stdout: string;
++  stderr: string;
++}
++
++/** Run commands and seed files inside the owning user's VM (runtime). */
++export interface LibraryVmRunner {
++  exec(
++    ownerId: string,
++    argv: string[],
++    opts?: { stdin?: string; timeoutMs?: number },
++  ): Promise<VmRunResult>;
++  writeFile(ownerId: string, path: string, contents: string): Promise<void>;
++}
++
++/** The user's settings allowlist for connectors. `null` allows the catalog. */
++export interface ConnectorPolicy {
++  allowedConnectorIds: string[] | null;
++}
++
++export function isConnectorAllowed(policy: ConnectorPolicy | null | undefined, connectorId: string): boolean {
++  if (!policy || policy.allowedConnectorIds === null) return true;
++  return policy.allowedConnectorIds.includes(connectorId);
++}
++
++/** Path inside the user's VM where the probe script is seeded. */
++export const MCP_PROBE_PATH = "/workspace/.swarm/mcp-probe.mjs";
+-- 
+2.55.0
+

@@ -1,0 +1,292 @@
+From e523bb0741c0e5ab7d5413e16f2e838a104528bd Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 11:50:54 -0600
+Subject: [PATCH] feat(swarmagents): list pending approvals + DELETE cancel
+ (task_mwmdm11r_gihy)
+
+GET /api/runtime/approvals returns the caller's pending approvals so a
+reconnecting tab can rehydrate approval cards whose SSE event it missed.
+DELETE /api/runtime/approvals/{id} cancels a pending approval, recorded as a
+denial so the paused run stops instead of waiting out the TTL.
+
+Adds ApprovalStore.listPending(userId?) and route tests for both verbs.
+---
+ .../app/api/runtime/approvals/[id]/route.ts   |  37 +++++
+ .../api/runtime/approvals/list-delete.test.ts | 135 ++++++++++++++++++
+ .../app/api/runtime/approvals/route.ts        |  38 +++++
+ apps/swarmagents/lib/harness/approvals.ts     |  13 ++
+ 4 files changed, 223 insertions(+)
+ create mode 100644 apps/swarmagents/app/api/runtime/approvals/list-delete.test.ts
+ create mode 100644 apps/swarmagents/app/api/runtime/approvals/route.ts
+
+diff --git a/apps/swarmagents/app/api/runtime/approvals/[id]/route.ts b/apps/swarmagents/app/api/runtime/approvals/[id]/route.ts
+index 119906815..6bfb02313 100644
+--- a/apps/swarmagents/app/api/runtime/approvals/[id]/route.ts
++++ b/apps/swarmagents/app/api/runtime/approvals/[id]/route.ts
+@@ -6,6 +6,10 @@
+  * that was paused on approval.required resumes on "approve" and halts on
+  * "deny"; an undecided approval auto-expires after its TTL.
+  *
++ * DELETE -> cancels the pending approval, recorded as a denial so the paused
++ * run stops instead of waiting out the TTL. Used when a client dismisses the
++ * card without choosing, or when a stale card must be cleared from the API.
++ *
+  * Auth comes from the middleware-set x-swarm-user header (see lib/auth), and
+  * the caller must own the approval (same user as the run that created it).
+  */
+@@ -20,6 +24,9 @@ export const dynamic = "force-dynamic";
+ 
+ const MAX_BODY_SIZE = 1024;
+ 
++/** Per-user state; never cache it anywhere in front of the origin. */
++const NO_STORE = { "cache-control": "no-store" } as const;
++
+ function caller(req: NextRequest): string | null {
+   const user = req.headers.get(USER_HEADER);
+   return user && user.length > 0 && user.length <= 128 ? user : null;
+@@ -84,3 +91,33 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
+   });
+   return NextResponse.json({ ok: true, status: resolved!.status });
+ }
++
++/**
++ * Cancel a pending approval. Recorded as a denial ("approval.deny") because the
++ * paused run must be released with a verdict it already understands; the
++ * alternative — leaving it pending — keeps the run parked until the TTL.
++ *
++ * Same ownership and auth rules as POST. A second cancel is a 409, mirroring
++ * the "decide twice" contract.
++ */
++export async function DELETE(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
++  const user = caller(req);
++  if (!user) return unauthorized();
++  const { id } = await ctx.params;
++
++  const store = getApprovalStore();
++  const approval = store.get(id);
++  if (!approval || approval.userId !== user) {
++    return NextResponse.json({ error: "Approval not found." }, { status: 404, headers: NO_STORE });
++  }
++  if (approval.status !== "pending") {
++    return NextResponse.json(
++      { error: `Approval already ${approval.status}.`, status: approval.status },
++      { status: 409, headers: NO_STORE },
++    );
++  }
++
++  const resolved = store.resolve(id, "denied");
++  recordAudit({ user, action: "approval.deny", target: id, result: "success" });
++  return NextResponse.json({ ok: true, status: resolved!.status }, { headers: NO_STORE });
++}
+diff --git a/apps/swarmagents/app/api/runtime/approvals/list-delete.test.ts b/apps/swarmagents/app/api/runtime/approvals/list-delete.test.ts
+new file mode 100644
+index 000000000..54aab86fb
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/approvals/list-delete.test.ts
+@@ -0,0 +1,135 @@
++/**
++ * Tests for the approvals rehydration list and the cancel verb:
++ *
++ *   GET    /api/runtime/approvals       -> the caller's pending approvals
++ *   DELETE /api/runtime/approvals/{id}  -> cancel (recorded as a denial)
++ *
++ * These are store-level route tests: no VM, no run, just the approval store the
++ * runtime would have written into.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { NextRequest } from "next/server";
++import { USER_HEADER } from "../../../../lib/auth";
++import { ApprovalStore, setApprovalStoreForTesting } from "../../../../lib/harness/approvals";
++import { GET } from "./route";
++import { DELETE } from "./[id]/route";
++
++const ALICE = "alice";
++
++function listRequest(user: string | null): NextRequest {
++  return new NextRequest("http://localhost/api/runtime/approvals", {
++    headers: user ? { [USER_HEADER]: user } : {},
++  });
++}
++
++function deleteApproval(id: string, user: string | null): Promise<Response> {
++  return DELETE(
++    new NextRequest(`http://localhost/api/runtime/approvals/${id}`, {
++      method: "DELETE",
++      headers: user ? { [USER_HEADER]: user } : {},
++    }),
++    { params: Promise.resolve({ id }) },
++  );
++}
++
++function install(): ApprovalStore {
++  const store = new ApprovalStore({ ttlMs: 60_000 });
++  setApprovalStoreForTesting(store);
++  return store;
++}
++
++function pending(store: ApprovalStore, overrides: { userId?: string; runId?: string } = {}) {
++  return store.create({
++    runId: overrides.runId ?? "run_alice",
++    userId: overrides.userId ?? ALICE,
++    toolName: "Bash",
++    action: "rm -rf /workspace/build",
++    reason: "destructive shell command",
++  });
++}
++
++test.after(() => {
++  setApprovalStoreForTesting(null);
++});
++
++test("GET requires a signed-in caller", async () => {
++  install();
++  const res = await GET(listRequest(null));
++  assert.equal(res.status, 401);
++});
++
++test("GET lists only the caller's pending approvals", async () => {
++  const store = install();
++  const mine = pending(store);
++  pending(store, { userId: "mallory", runId: "run_mallory" });
++
++  const res = await GET(listRequest(ALICE));
++  assert.equal(res.status, 200);
++  // Per-user state must never be cached in front of the origin.
++  assert.equal(res.headers.get("cache-control"), "no-store");
++
++  const body = (await res.json()) as { approvals: Array<{ id: string; userId: string; status: string }> };
++  assert.equal(body.approvals.length, 1);
++  assert.equal(body.approvals[0]!.id, mine.id);
++  assert.equal(body.approvals[0]!.status, "pending");
++
++  const theirs = await GET(listRequest("mallory"));
++  const theirsBody = (await theirs.json()) as { approvals: Array<{ userId: string }> };
++  assert.deepEqual(theirsBody.approvals.map((a) => a.userId), ["mallory"]);
++});
++
++test("GET is empty when nothing is pending", async () => {
++  install();
++  const res = await GET(listRequest(ALICE));
++  assert.equal(res.status, 200);
++  assert.deepEqual((await res.json()) as { approvals: unknown[] }, { approvals: [] });
++});
++
++test("GET drops decided and expired approvals", async () => {
++  const store = install();
++  const approved = pending(store, { runId: "run_a" });
++  const expired = pending(store, { runId: "run_b" });
++  const live = pending(store, { runId: "run_c" });
++  store.resolve(approved.id, "approved");
++  store.expirePendingForRun(expired.runId, "run_cancelled");
++
++  const res = await GET(listRequest(ALICE));
++  const body = (await res.json()) as { approvals: Array<{ id: string }> };
++  assert.deepEqual(body.approvals.map((a) => a.id), [live.id]);
++});
++
++test("DELETE requires auth, ownership, and a live approval", async () => {
++  const store = install();
++  const approval = pending(store);
++
++  assert.equal((await deleteApproval(approval.id, null)).status, 401);
++  assert.equal((await deleteApproval("appr_ghost", ALICE)).status, 404);
++  // Another user cannot cancel someone else's approval.
++  assert.equal((await deleteApproval(approval.id, "mallory")).status, 404);
++
++  const ok = await deleteApproval(approval.id, ALICE);
++  assert.equal(ok.status, 200);
++  assert.equal(ok.headers.get("cache-control"), "no-store");
++  assert.deepEqual((await ok.json()) as unknown, { ok: true, status: "denied" });
++
++  // Already decided -> 409, not a second resolution.
++  const again = await deleteApproval(approval.id, ALICE);
++  assert.equal(again.status, 409);
++  assert.equal(((await again.json()) as { status: string }).status, "denied");
++});
++
++test("DELETE releases the paused run with a denial and clears the list", async () => {
++  const store = install();
++  const approval = pending(store);
++  const verdict = store.waitFor(approval.id);
++
++  const res = await deleteApproval(approval.id, ALICE);
++  assert.equal(res.status, 200);
++  // The runner awaiting this approval must wake up, not sit out the TTL.
++  assert.equal(await verdict, "denied");
++
++  const listed = (await (await GET(listRequest(ALICE))).json()) as { approvals: unknown[] };
++  assert.deepEqual(listed.approvals, []);
++});
+diff --git a/apps/swarmagents/app/api/runtime/approvals/route.ts b/apps/swarmagents/app/api/runtime/approvals/route.ts
+new file mode 100644
+index 000000000..4b6b9249d
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/approvals/route.ts
+@@ -0,0 +1,38 @@
++/**
++ * Pending approvals for the signed-in user.
++ *
++ * A run that hits an "ask" tool call pauses on the risk gate and emits
++ * `approval.required` on the run's SSE stream. A browser tab that reconnects
++ * (reload, second tab, laptop wake) can miss that event, which used to leave
++ * the run paused with no card to click. This route rehydrates those cards from
++ * the durable approval store instead of relying on the event stream.
++ *
++ * GET -> { approvals: PendingApproval[] } for the caller only, oldest first.
++ *
++ * Decisions stay on POST /api/runtime/approvals/{id} (approve/deny) and
++ * DELETE /api/runtime/approvals/{id} (cancel).
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { USER_HEADER } from "../../../../lib/auth";
++import { getApprovalStore } from "../../../../lib/harness/approvals";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++/** Per-user state; never cache it anywhere in front of the origin. */
++const NO_STORE = { "cache-control": "no-store" } as const;
++
++function caller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++export async function GET(req: NextRequest) {
++  const user = caller(req);
++  if (!user) {
++    return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++  }
++  // Scoped to the caller: never expose another user's pending approvals.
++  return NextResponse.json({ approvals: getApprovalStore().listPending(user) }, { headers: NO_STORE });
++}
+diff --git a/apps/swarmagents/lib/harness/approvals.ts b/apps/swarmagents/lib/harness/approvals.ts
+index a1016e021..3bffa97bb 100644
+--- a/apps/swarmagents/lib/harness/approvals.ts
++++ b/apps/swarmagents/lib/harness/approvals.ts
+@@ -257,6 +257,19 @@ export class ApprovalStore {
+     return this.approvals.get(id);
+   }
+ 
++  /**
++   * Pending approvals, oldest first. Pass a userId to scope the list to one
++   * caller (every HTTP surface must); the runtime paths omit it to scan all.
++   */
++  listPending(userId?: string): PendingApproval[] {
++    return [...this.approvals.values()]
++      .filter(
++        (approval) =>
++          approval.status === "pending" && (userId === undefined || approval.userId === userId),
++      )
++      .sort((a, b) => a.createdAt - b.createdAt);
++  }
++
+   /** Promise that settles when the approval is decided (or expires). */
+   waitFor(id: string): Promise<ApprovalVerdict> {
+     return this.waiters.get(id)?.promise ?? Promise.resolve("expired");
+-- 
+2.55.0
+

@@ -1,0 +1,315 @@
+From e02fa8f98fe6f6b5c6fcb76ed64c52140814f37d Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 21:15:20 +0000
+Subject: [PATCH] [t65] e2e: local signup -> login -> /api/me flow
+
+---
+ apps/swarmagents/e2e/README.md       |  12 +++
+ apps/swarmagents/e2e/auth.spec.ts    | 132 +++++++++++++++++++++++++++
+ apps/swarmagents/scripts/test-all.sh |  78 ++++++++++++++--
+ 3 files changed, 213 insertions(+), 9 deletions(-)
+ create mode 100644 apps/swarmagents/e2e/auth.spec.ts
+ mode change 100755 => 100644 apps/swarmagents/scripts/test-all.sh
+
+diff --git a/apps/swarmagents/e2e/README.md b/apps/swarmagents/e2e/README.md
+index ff444699c..4b99f6fc7 100644
+--- a/apps/swarmagents/e2e/README.md
++++ b/apps/swarmagents/e2e/README.md
+@@ -32,6 +32,9 @@ npm run test:e2e
+ | `SWARM_VM_DRIVER` | `fake` | Local runs use the fake VM; set `docker` for a real sandbox. |
+ | `SWARM_FAKE_CLAUDE` | enabled | Set `0` to stop FakeVmDriver replaying the recorded `claude` stream-json transcript. |
+ | `SWARM_HARNESS_TOKEN` | unset | Bearer token for server-mode auth. Read from the environment only and never logged. |
++| `SWARM_ALLOW_SIGNUP` | unset | Set to `1` (with `SWARM_SESSION_SECRET`) to enable self-signup in a production-mode server; the auth e2e spec needs it. `scripts/test-all.sh` sets it for the local playtest run. |
++| `SWARM_SESSION_SECRET` | unset | HMAC key for the session cookie; the server refuses to mint sessions without it. `scripts/test-all.sh` generates an ephemeral one per run. |
++| `SWARM_SERVER_MODE` | unset | Set to `1` to make the server verify session cookies instead of trusting loopback as the "local" user; the auth e2e spec needs it. `scripts/test-all.sh` sets it for the auth phase only, together with `SWARM_COOKIE_SECURE=0` (Playwright's API client won't send a Secure cookie over plain HTTP). |
+ | `SCREENSHOT_DIR` | `/workspace/monolith-playtest/<timestamp>` | Screenshot and `summary.json` output directory |
+ | `PW_CHROMIUM_PATH` | `playwright-core` default | Existing Chromium executable |
+ 
+@@ -54,6 +57,15 @@ requests and the dispatch spec is skipped.
+ 
+ ## Specs
+ 
++- `auth.spec.ts` - local mode only, and only against a server-mode
++  instance (`SWARM_SERVER_MODE=1`; `scripts/test-all.sh` boots one for
++  this spec). Signs up a throwaway user (`SWARM_ALLOW_SIGNUP=1`), asserts
++  the session cookie is HttpOnly and `/api/me` returns the user, logs out
++  (drops the session cookie), asserts `/api/me` reports no user and a wrong
++  password is rejected, then logs in and asserts `/api/me` returns the
++  user again. Server mode is required because in local mode the middleware
++  trusts loopback as the "local" user, so `/api/me` can never reflect the
++  signed-up user — or null after logout.
+ - `smoke.spec.ts` - home page status, no uncaught page errors or `console.error`,
+   input bar and computer screen render, `/api/mcp/swarm-board` JSON, and
+   `/api/health` when it exists.
+diff --git a/apps/swarmagents/e2e/auth.spec.ts b/apps/swarmagents/e2e/auth.spec.ts
+new file mode 100644
+index 000000000..f369524dc
+--- /dev/null
++++ b/apps/swarmagents/e2e/auth.spec.ts
+@@ -0,0 +1,132 @@
++import assert from "node:assert/strict";
++import { after, test } from "node:test";
++import { SESSION_COOKIE } from "../lib/auth";
++import { closeBrowser, mode, runPageTest } from "./lib";
++
++after(async () => {
++  await closeBrowser();
++});
++
++const readOnly = mode() === "prod";
++
++/**
++ * Local-only coverage for the t12 password-auth flow: sign up, prove the
++ * session cookie is HttpOnly and /api/me reports the user, log out, prove
++ * /api/me reports no user, then log back in and prove the session is live
++ * again. Prod mode is read-only (the browser blocks non-GET requests and
++ * creating accounts against a live server is out of scope), so the spec is
++ * skipped there.
++ *
++ * The flow runs against the real running server through the browser
++ * context's API client, so the session cookie is stored in the context's
++ * cookie jar exactly as a browser would store it and /api/me sees it via
++ * the middleware-set x-swarm-user header.
++ *
++ * The server MUST be booted with SWARM_SERVER_MODE=1 for this spec
++ * (scripts/test-all.sh does that for the auth phase): in local mode
++ * requestUser() always returns the loopback "local" user, so /api/me can
++ * never reflect the signed-up user — or null after logout. In server mode
++ * the middleware verifies the session cookie, so the whole flow is real.
++ * Signup is closed in production unless SWARM_ALLOW_SIGNUP=1, and the
++ * server refuses to mint sessions without SWARM_SESSION_SECRET; both are
++ * set by scripts/test-all.sh. The server also needs SWARM_COOKIE_SECURE=0
++ * when reached over plain HTTP: Playwright's API request context will not
++ * send a Secure cookie over plain HTTP, so without it /api/me would never
++ * see the session even though the cookie lands in the jar.
++ *
++ * The app has no /api/logout route, so "log out" here is the client-side
++ * logout: dropping the session cookie from the context, after which
++ * /api/me must report no user.
++ */
++test(
++  "auth: local signup -> logout -> login -> /api/me flow",
++  { skip: readOnly ? "prod mode is read-only" : false },
++  async (t) => {
++    const testName = "auth: local signup -> logout -> login -> /api/me flow";
++    const result = await runPageTest(testName, async ({ context }) => {
++      const api = context.request;
++      // Unique per run so re-running the spec against the same server
++      // (same SWARM_HOME) does not hit the signup 409 for an existing user.
++      const email = `auth-e2e-${Date.now()}@example.com`;
++      const password = "e2e-auth-flow-password";
++      const expectedId = `local_${email}`;
++
++      const sessionCookieFromJar = async (): Promise<{ httpOnly: boolean } | undefined> =>
++        (await context.cookies()).find((cookie) => cookie.name === SESSION_COOKIE);
++
++      const setCookieHeader = (res: { headersArray: () => { name: string; value: string }[] }): string =>
++        res
++          .headersArray()
++          .filter((h) => h.name.toLowerCase() === "set-cookie")
++          .map((h) => h.value)
++          .join("; ");
++
++      // ── 1. Sign up ──────────────────────────────────────────────────
++      const signup = await api.post("/api/signup", { data: { email, password } });
++      assert.equal(
++        signup.status(),
++        201,
++        `signup returned HTTP ${signup.status()} (in a production run the server needs ` +
++          `SWARM_ALLOW_SIGNUP=1 and SWARM_SESSION_SECRET; test-all.sh sets both): ${await signup.text()}`,
++      );
++      const signupBody = (await signup.json()) as { ok?: boolean; user?: { uid?: string; email?: string } };
++      assert.equal(signupBody.ok, true, "expected signup to report ok");
++      assert.equal(signupBody.user?.email, email, "expected signup to echo the new user's email");
++      assert.equal(signupBody.user?.uid, expectedId, "expected signup to report the local uid");
++      assert.match(setCookieHeader(signup), /HttpOnly/i, "expected the signup Set-Cookie header to carry HttpOnly");
++      const cookieAfterSignup = await sessionCookieFromJar();
++      assert.ok(cookieAfterSignup, "expected a session cookie in the jar after signup");
++      assert.equal(cookieAfterSignup.httpOnly, true, "expected the session cookie to be HttpOnly");
++
++      // ── 2. /api/me returns the signed-up user ──────────────────────
++      const meAfterSignup = await api.get("/api/me");
++      assert.equal(meAfterSignup.status(), 200, `GET /api/me returned HTTP ${meAfterSignup.status()}`);
++      const meAfterSignupBody = (await meAfterSignup.json()) as {
++        user?: { id?: string; email?: string } | null;
++      };
++      assert.equal(meAfterSignupBody.user?.id, expectedId, "expected /api/me to return the signed-up user id");
++      assert.equal(
++        meAfterSignupBody.user?.email,
++        `${expectedId}@swarmagents.local`,
++        "expected /api/me to return the signed-up user email",
++      );
++
++      // ── 3. Log out (drop the session cookie) ───────────────────────
++      await context.clearCookies();
++      assert.equal(await sessionCookieFromJar(), undefined, "expected the session cookie to be gone after logout");
++      const meAfterLogout = await api.get("/api/me");
++      assert.equal(meAfterLogout.status(), 200, `GET /api/me returned HTTP ${meAfterLogout.status()} after logout`);
++      const meAfterLogoutBody = (await meAfterLogout.json()) as { user?: { id?: string } | null };
++      assert.equal(meAfterLogoutBody.user, null, "expected /api/me to report no user after logout");
++
++      // ── 4. Wrong password is still rejected while logged out ───────
++      const badLogin = await api.post("/api/login", { data: { email, password: "wrong-password-123" } });
++      assert.equal(badLogin.status(), 401, `wrong-password login returned HTTP ${badLogin.status()}`);
++      const meAfterBadLogin = (await (await api.get("/api/me")).json()) as { user?: unknown | null };
++      assert.equal(meAfterBadLogin.user, null, "expected /api/me to still report no user after a failed login");
++
++      // ── 5. Log in ──────────────────────────────────────────────────
++      const login = await api.post("/api/login", { data: { email, password } });
++      assert.equal(login.status(), 200, `login returned HTTP ${login.status()}: ${await login.text()}`);
++      const loginBody = (await login.json()) as { ok?: boolean; user?: { id?: string } };
++      assert.equal(loginBody.ok, true, "expected login to report ok");
++      assert.equal(loginBody.user?.id, expectedId, "expected login to report the user id");
++      assert.match(setCookieHeader(login), /HttpOnly/i, "expected the login Set-Cookie header to carry HttpOnly");
++      const cookieAfterLogin = await sessionCookieFromJar();
++      assert.ok(cookieAfterLogin, "expected a session cookie in the jar after login");
++      assert.equal(cookieAfterLogin.httpOnly, true, "expected the session cookie to be HttpOnly");
++
++      // ── 6. /api/me returns the user again ──────────────────────────
++      const meAfterLogin = await api.get("/api/me");
++      assert.equal(meAfterLogin.status(), 200, `GET /api/me returned HTTP ${meAfterLogin.status()} after login`);
++      const meAfterLoginBody = (await meAfterLogin.json()) as { user?: { id?: string; email?: string } | null };
++      assert.equal(meAfterLoginBody.user?.id, expectedId, "expected /api/me to return the user id after login");
++      assert.equal(
++        meAfterLoginBody.user?.email,
++        `${expectedId}@swarmagents.local`,
++        "expected /api/me to return the user email after login",
++      );
++    });
++    if (result.skipped) t.skip(result.skipped);
++  },
++);
+diff --git a/apps/swarmagents/scripts/test-all.sh b/apps/swarmagents/scripts/test-all.sh
+old mode 100755
+new mode 100644
+index 60890f73a..3b881f8f0
+--- a/apps/swarmagents/scripts/test-all.sh
++++ b/apps/swarmagents/scripts/test-all.sh
+@@ -2,7 +2,8 @@
+ #
+ # test-all.sh — run the full app quality gate in one shot:
+ #   typecheck → unit tests → production build → boot the built app against a
+-#   fake VM driver and a temp SWARM_HOME → local e2e → shutdown.
++#   fake VM driver and a temp SWARM_HOME → local e2e → auth e2e against a
++#   server-mode instance → shutdown.
+ #
+ # Exits non-zero on the first failing step (set -e). The app is served on a
+ # free port and torn down (server killed, temp SWARM_HOME removed) on exit.
+@@ -20,38 +21,48 @@ free_port() {
+ 
+ PORT="${TEST_ALL_PORT:-$(free_port)}"
+ 
+-echo "Running full app gate: typecheck → unit → build → e2e (local, fake VM, temp SWARM_HOME)"
++echo "Running full app gate: typecheck → unit → build → e2e (local, fake VM, temp SWARM_HOME) → auth e2e (server mode)"
+ echo "App will listen on http://127.0.0.1:${PORT}"
+ 
+ export SWARM_VM_DRIVER=fake
++# Local auth e2e (e2e/auth.spec.ts) signs up a throwaway user against the
++# production-mode server, so self-signup must be enabled and the server
++# needs a session secret to mint session cookies. The secret is ephemeral
++# to this run; an existing SWARM_SESSION_SECRET is respected.
++export SWARM_ALLOW_SIGNUP=1
++export SWARM_SESSION_SECRET="${SWARM_SESSION_SECRET:-$(node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('hex'))")}"
+ SWARM_HOME="$(mktemp -d)"
+ export SWARM_HOME
+ echo "SWARM_HOME=${SWARM_HOME}"
+ 
+ SERVER_PID=""
++AUTH_HOME=""
+ cleanup() {
+   if [ -n "$SERVER_PID" ]; then
+     kill "$SERVER_PID" 2>/dev/null || true
+     wait "$SERVER_PID" 2>/dev/null || true
+   fi
+   rm -rf "$SWARM_HOME"
++  if [ -n "$AUTH_HOME" ]; then
++    rm -rf "$AUTH_HOME"
++  fi
+ }
+ trap cleanup EXIT
+ 
+ # ── 1. typecheck ───────────────────────────────────────────────────────────
+-log "1/5 Typecheck (tsc --noEmit)"
++log "1/6 Typecheck (tsc --noEmit)"
+ npm run typecheck
+ 
+ # ── 2. unit tests ──────────────────────────────────────────────────────────
+-log "2/5 Unit tests"
++log "2/6 Unit tests"
+ npm run test:unit
+ 
+ # ── 3. production build ────────────────────────────────────────────────────
+-log "3/5 Build (next build)"
++log "3/6 Build (next build)"
+ npm run build
+ 
+ # ── 4. boot the built app ──────────────────────────────────────────────────
+-log "4/5 Boot server on ${PORT} (SWARM_VM_DRIVER=fake)"
++log "4/6 Boot server on ${PORT} (SWARM_VM_DRIVER=fake)"
+ "$PWD/node_modules/.bin/next" start -H 127.0.0.1 -p "$PORT" &
+ SERVER_PID=$!
+ 
+@@ -70,8 +81,57 @@ if [ "$ready" != true ]; then
+ fi
+ echo "Server is ready."
+ 
+-# ── 5. local e2e ───────────────────────────────────────────────────────────
+-log "5/5 E2E (local)"
+-BASE_URL="http://127.0.0.1:${PORT}" SWARM_E2E_MODE=local npm run test:e2e
++# ── 5. local e2e (all specs except auth: it needs a server-mode server) ──
++log "5/6 E2E (local)"
++LOCAL_SPECS=()
++for spec in e2e/*.spec.ts; do
++  [ "$spec" = "e2e/auth.spec.ts" ] || LOCAL_SPECS+=("$spec")
++done
++BASE_URL="http://127.0.0.1:${PORT}" SWARM_E2E_MODE=local npx tsx --test --test-concurrency=1 "${LOCAL_SPECS[@]}"
++
++# ── 6. auth e2e against a server-mode instance ──────────────────────────
++# The auth spec needs SWARM_SERVER_MODE=1: in local mode the middleware
++# trusts loopback as the "local" user, so /api/me can never reflect the
++# signed-up user (or null after logout). Server mode verifies the session
++# cookie, so the full signup -> logout -> login -> /api/me flow is real.
++# SWARM_ALLOW_SIGNUP=1 and SWARM_SESSION_SECRET are already exported above
++# and inherited by this instance. A fresh port and SWARM_HOME keep it
++# isolated from the local-mode run. SWARM_COOKIE_SECURE=0 is required too:
++# the server is reached over plain HTTP, and Playwright's API request
++# context will not send a Secure cookie over plain HTTP, so without it
++# /api/me would never see the session (the cookie would still land in the
++# jar). Real browsers on http://127.0.0.1 do send Secure cookies; this is
++# only about the API client used by the spec.
++log "6/6 Auth E2E (server mode)"
++kill "$SERVER_PID" 2>/dev/null || true
++wait "$SERVER_PID" 2>/dev/null || true
++SERVER_PID=""
++
++AUTH_PORT="$(free_port)"
++AUTH_HOME="$(mktemp -d)"
++echo "Server-mode instance will listen on http://127.0.0.1:${AUTH_PORT}"
++echo "AUTH_HOME=${AUTH_HOME}"
++SWARM_SERVER_MODE=1 SWARM_COOKIE_SECURE=0 SWARM_VM_DRIVER=fake SWARM_HOME="$AUTH_HOME" \
++  "$PWD/node_modules/.bin/next" start -H 127.0.0.1 -p "$AUTH_PORT" &
++SERVER_PID=$!
++
++ready=false
++for _ in $(seq 1 40); do
++  if curl -fsS "http://127.0.0.1:${AUTH_PORT}/api/health" >/dev/null 2>&1; then
++    ready=true
++    break
++  fi
++  sleep 0.5
++done
++
++if [ "$ready" != true ]; then
++  echo "Server-mode instance did not become ready on port ${AUTH_PORT}" >&2
++  exit 1
++fi
++echo "Server-mode instance is ready."
++
++BASE_URL="http://127.0.0.1:${AUTH_PORT}" SWARM_E2E_MODE=local npx tsx --test --test-concurrency=1 e2e/auth.spec.ts
++rm -rf "$AUTH_HOME"
++AUTH_HOME=""
+ 
+ log "All gates passed ✅"
+-- 
+2.55.0
+

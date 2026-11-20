@@ -1,0 +1,216 @@
+From 8e90a65620ad72fe502aaff7e59586cc0c372ce1 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 23:32:45 +0000
+Subject: [PATCH] [p11] Public changelog of what has shipped
+
+---
+ apps/swarmagents/app/changelog/page.tsx       | 61 +++++++++++++++
+ apps/swarmagents/content/changelog.ts         | 74 +++++++++++++++++++
+ apps/swarmagents/lib/middleware.test.ts       |  8 ++
+ apps/swarmagents/middleware.ts                |  4 +-
+ .../src/components/SiteFooter.tsx             |  6 ++
+ 5 files changed, 151 insertions(+), 2 deletions(-)
+ create mode 100644 apps/swarmagents/app/changelog/page.tsx
+ create mode 100644 apps/swarmagents/content/changelog.ts
+
+diff --git a/apps/swarmagents/app/changelog/page.tsx b/apps/swarmagents/app/changelog/page.tsx
+new file mode 100644
+index 000000000..212c178e3
+--- /dev/null
++++ b/apps/swarmagents/app/changelog/page.tsx
+@@ -0,0 +1,61 @@
++import type { Metadata } from "next";
++import { CHANGELOG } from "../../content/changelog";
++
++export const metadata: Metadata = {
++  title: "Changelog — SwarmAgents",
++  description: "What has shipped in SwarmAgents, newest first.",
++};
++
++// Rendered per request like the other public pages: the CSP nonce is minted
++// per request in middleware, so a statically prerendered copy could serve a
++// stale nonce.
++export const dynamic = "force-dynamic";
++
++/** Format an ISO date (YYYY-MM-DD) as e.g. "November 11, 2026". */
++function formatDate(iso: string): string {
++  const [year, month, day] = iso.split("-").map(Number);
++  return new Date(Date.UTC(year, month - 1, day)).toLocaleDateString("en-US", {
++    month: "long",
++    day: "numeric",
++    year: "numeric",
++    timeZone: "UTC",
++  });
++}
++
++/**
++ * Public changelog: what has shipped, grouped by ship date, newest first.
++ * Signed-out readable — /changelog is in the middleware PUBLIC set.
++ */
++export default function ChangelogPage() {
++  return (
++    <main className="min-h-dvh bg-black text-white">
++      <div className="mx-auto w-full max-w-2xl px-4 py-12 sm:px-6">
++        <a
++          href="/"
++          className="font-mono text-xs text-white/40 transition-colors hover:text-cyan-300"
++        >
++          ← SwarmAgents
++        </a>
++        <h1 className="mt-6 text-3xl font-semibold tracking-tight">Changelog</h1>
++        <p className="mt-2 text-sm leading-relaxed text-white/60">
++          What has shipped in SwarmAgents, newest first.
++        </p>
++        {CHANGELOG.map((release) => (
++          <section key={release.date} className="mt-10">
++            <h2 className="border-b border-white/10 pb-2 font-mono text-xs uppercase tracking-wider text-white/40">
++              <time dateTime={release.date}>{formatDate(release.date)}</time>
++            </h2>
++            <ul className="mt-4 space-y-6">
++              {release.entries.map((entry) => (
++                <li key={entry.title}>
++                  <h3 className="text-base font-medium">{entry.title}</h3>
++                  <p className="mt-1 text-sm leading-relaxed text-white/60">{entry.summary}</p>
++                </li>
++              ))}
++            </ul>
++          </section>
++        ))}
++      </div>
++    </main>
++  );
++}
+diff --git a/apps/swarmagents/content/changelog.ts b/apps/swarmagents/content/changelog.ts
+new file mode 100644
+index 000000000..c37a25932
+--- /dev/null
++++ b/apps/swarmagents/content/changelog.ts
+@@ -0,0 +1,74 @@
++/**
++ * Public changelog content: user-visible work that has shipped, grouped by
++ * ship date, newest first. New releases go at the front of the list.
++ *
++ * Dates are the day the work landed on main. Where an exact day cannot be
++ * determined, entries are grouped under the week they shipped rather than
++ * given an invented precise date.
++ */
++
++export interface ChangelogEntry {
++  /** Short user-facing title, e.g. "Usage meter". */
++  title: string;
++  /** One or two sentences on what changed for the user. No internal task ids. */
++  summary: string;
++}
++
++export interface ChangelogRelease {
++  /** ISO date (YYYY-MM-DD) the group shipped. */
++  date: string;
++  entries: ChangelogEntry[];
++}
++
++export const CHANGELOG: ChangelogRelease[] = [
++  {
++    date: "2026-11-11",
++    entries: [
++      {
++        title: "Signed-in sessions",
++        summary:
++          "Sign in once and stay signed in with an expiring session. Sessions end automatically after a period of inactivity, and signing out clears them immediately.",
++      },
++      {
++        title: "Provider catalog and test-connection",
++        summary:
++          "Browse the available providers and their models from the Providers page, and test a connection before sending work to it so a bad key or unreachable endpoint shows up early.",
++      },
++      {
++        title: "Approvals",
++        summary:
++          "Sensitive actions now ask for your approval before they run, so nothing consequential happens without you saying yes first.",
++      },
++      {
++        title: "File browser",
++        summary:
++          "Browse and inspect the files in your workspace from the Files view, including what the agent has changed.",
++      },
++      {
++        title: "Usage meter",
++        summary:
++          "See how much you have used, live in the composer, so there are no surprises about where a run stands.",
++      },
++      {
++        title: "Snapshots",
++        summary:
++          "Save a snapshot of your workspace and restore it later from the Snapshots panel.",
++      },
++      {
++        title: "Live runs resume after a dropped connection",
++        summary:
++          "If the live stream drops, the run reconnects and resumes where it left off instead of starting over.",
++      },
++      {
++        title: "VM status indicator",
++        summary:
++          "The status bar now shows whether your workspace VM is starting, ready, or hibernated.",
++      },
++      {
++        title: "Security hardening",
++        summary:
++          "Hardened security headers, cross-site request protection, and rate limits on API calls are now in place behind the scenes.",
++      },
++    ],
++  },
++];
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index c971b9f25..64a98b617 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -162,6 +162,14 @@ test("the next param derived from a hostile URL stays a same-origin path", () =>
+   assert.equal(res.status, 200);
+ });
+ 
++test("the public changelog passes through unauthenticated", () => {
++  // /changelog is public, so signed-out visitors read it instead of being
++  // bounced to /login.
++  const res = middleware(req("http://swarm.example.com/changelog", { host: "swarm.example.com" }));
++  assert.equal(res.status, 200);
++  assert.equal(res.headers.get("location"), null, "public pages must not redirect");
++});
++
+ test("allowed API responses carry X-RateLimit-* headers", () => {
+   const cookie = `${SESSION_COOKIE}=${signSession("alice")}`;
+   const res = middleware(
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index b5268f03e..a35662c03 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -28,8 +28,8 @@ function withSecurityHeaders(
+ // Kept under this name because route handlers that bypass middleware (uploads) import it as their gate.
+ export { isAllowed as isLocal } from "./lib/auth";
+ 
+-/** Reachable signed out: the sign-in page and the endpoints it uses. */
+-const PUBLIC = new Set(["/login", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
++/** Reachable signed out: the sign-in page, the public pages, and the endpoints they use. */
++const PUBLIC = new Set(["/login", "/changelog", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
+ 
+ /** The public board MCP endpoint is exempt from the cross-site gate (external MCP clients call it). */
+ const BOARD_PATH = "/api/mcp/swarm-board";
+diff --git a/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx b/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+index 275345cc4..d893ae863 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+@@ -39,6 +39,12 @@ export function SiteFooter() {
+       <div className="mx-auto flex w-full max-w-5xl flex-col items-center justify-between gap-2 px-1 py-3 font-mono text-[11px] text-white/40 sm:flex-row">
+         <span className="whitespace-nowrap">© SwarmAgents</span>
+         <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1">
++          <a
++            href="/changelog"
++            className="rounded transition-colors hover:text-cyan-300 active:text-cyan-200"
++          >
++            Changelog
++          </a>
+           <a
+             href="/providers"
+             className="rounded transition-colors hover:text-cyan-300 active:text-cyan-200"
+-- 
+2.55.0
+

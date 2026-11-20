@@ -1,0 +1,1423 @@
+From 80c8fac1b08c4d121c5eb27175d5086a21c86e8d Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 13:53:44 -0600
+Subject: [PATCH] feat(agents): deployment profiles, a second harness adapter,
+ community templates
+
+Phase 7 of the Agent Studio brief, stacked on feat/agent-studio.
+
+- lib/agents/profiles.ts   named per-account profiles: harness, model
+                           overrides, MCP endpoint bindings. resolveProfile()
+                           applies them and only rewrites the endpoint of an
+                           MCP server the manifest already declares; a binding
+                           for an undeclared server is a warning, never an
+                           invented server. Profiles never carry credentials.
+- adapters/local-claude.ts DELIBERATELY a stub: real PATH-based capability
+                           detection, grants zero tools (the CLI has no per-run
+                           allowlist in this build) and refuses deploy with
+                           'not implemented'. No fake second harness.
+- adapters/registry.ts     one place that lists adapters; routes and UI read it.
+- lib/agents/templates.ts  read-only gallery from templates/agents/*.json,
+                           validated on load; a broken template is reported in
+                           'issues' instead of being offered.
+- templates/agents/*.json  triage-bot, pr-reviewer, release-notes.
+- routes                   GET/POST /api/agents/profiles, DELETE
+                           /api/agents/profiles/{id}, GET /api/agents/templates,
+                           POST /api/agents/templates/{id}/import; deploy now
+                           accepts { profile } and reports what the profile
+                           changed.
+- UI                       the community section is a real gallery with Use;
+                           the builder has a Profile picker used by Deploy.
+
+Live check found two defects, both fixed here: the shipped templates listed
+'Glob', which this harness cannot grant (they would have failed at deploy),
+and a refused deploy reported the *swarm* compatibility report for a different
+adapter. A regression test now asserts every shipped template is deployable.
+---
+ .../api/agents/[id]/compatibility/route.ts    |   7 +-
+ .../app/api/agents/[id]/deploy/route.ts       |  52 ++++-
+ .../app/api/agents/agents-routes.test.ts      |   3 +-
+ .../app/api/agents/harnesses/route.ts         |   2 +-
+ .../app/api/agents/phase7-routes.test.ts      | 179 +++++++++++++++
+ .../app/api/agents/profiles/[id]/route.ts     |  16 ++
+ .../app/api/agents/profiles/route.ts          |  30 +++
+ .../api/agents/templates/[id]/import/route.ts |  26 +++
+ .../app/api/agents/templates/route.ts         |  27 +++
+ .../lib/agents/adapters/local-claude.ts       |  62 ++++++
+ .../lib/agents/adapters/registry.ts           |  19 ++
+ apps/swarmagents/lib/agents/phase7.test.ts    | 208 ++++++++++++++++++
+ apps/swarmagents/lib/agents/profiles.ts       | 195 ++++++++++++++++
+ apps/swarmagents/lib/agents/templates.ts      |  74 +++++++
+ apps/swarmagents/lib/client/agents.ts         |  44 +++-
+ .../src/components/AgentLibrary.tsx           |  58 ++++-
+ .../src/components/AgentStudio.tsx            |  31 ++-
+ .../templates/agents/pr-reviewer.json         |  27 +++
+ .../templates/agents/release-notes.json       |  21 ++
+ .../templates/agents/triage-bot.json          |  21 ++
+ 20 files changed, 1075 insertions(+), 27 deletions(-)
+ create mode 100644 apps/swarmagents/app/api/agents/phase7-routes.test.ts
+ create mode 100644 apps/swarmagents/app/api/agents/profiles/[id]/route.ts
+ create mode 100644 apps/swarmagents/app/api/agents/profiles/route.ts
+ create mode 100644 apps/swarmagents/app/api/agents/templates/[id]/import/route.ts
+ create mode 100644 apps/swarmagents/app/api/agents/templates/route.ts
+ create mode 100644 apps/swarmagents/lib/agents/adapters/local-claude.ts
+ create mode 100644 apps/swarmagents/lib/agents/adapters/registry.ts
+ create mode 100644 apps/swarmagents/lib/agents/phase7.test.ts
+ create mode 100644 apps/swarmagents/lib/agents/profiles.ts
+ create mode 100644 apps/swarmagents/lib/agents/templates.ts
+ create mode 100644 apps/swarmagents/templates/agents/pr-reviewer.json
+ create mode 100644 apps/swarmagents/templates/agents/release-notes.json
+ create mode 100644 apps/swarmagents/templates/agents/triage-bot.json
+
+diff --git a/apps/swarmagents/app/api/agents/[id]/compatibility/route.ts b/apps/swarmagents/app/api/agents/[id]/compatibility/route.ts
+index cf5f6b044..10c71573d 100644
+--- a/apps/swarmagents/app/api/agents/[id]/compatibility/route.ts
++++ b/apps/swarmagents/app/api/agents/[id]/compatibility/route.ts
+@@ -3,7 +3,7 @@
+ import type { NextRequest } from "next/server";
+ import { getAgent } from "@/lib/agents/store";
+ import { compatibilityReport } from "@/lib/agents/compatibility";
+-import { swarmAdapter } from "@/lib/agents/adapters/swarm";
++import { adapterById } from "@/lib/agents/adapters/registry";
+ import { agentCaller, notFound, ok, routeId, unauthorized } from "@/lib/agents/http";
+ 
+ export const runtime = "nodejs";
+@@ -15,9 +15,10 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string
+   const id = await routeId(ctx);
+   const manifest = getAgent(user, id);
+   if (!manifest) return notFound();
++  const adapter = adapterById("swarm");
+   return ok({
+-    harness: swarmAdapter.id,
+-    capabilities: swarmAdapter.capabilities(),
++    harness: "swarm",
++    capabilities: adapter?.capabilities() ?? null,
+     report: compatibilityReport(manifest, { userId: user }),
+   });
+ }
+diff --git a/apps/swarmagents/app/api/agents/[id]/deploy/route.ts b/apps/swarmagents/app/api/agents/[id]/deploy/route.ts
+index e329e0627..1c65dd585 100644
+--- a/apps/swarmagents/app/api/agents/[id]/deploy/route.ts
++++ b/apps/swarmagents/app/api/agents/[id]/deploy/route.ts
+@@ -1,16 +1,25 @@
+ /**
+- * POST /api/agents/{id}/deploy { harness?: "swarm" }
+- *   -> 200 { runId, queued, harness, report }
++ * POST /api/agents/{id}/deploy { harness?: string, profile?: string }
++ *   -> 200 { runId, queued, harness, profile, report, warnings }
+  *   -> 400 { error, missing } when the agent is not compatible with the harness
++ *
++ * A `profile` binds the manifest to an environment first: its model overrides
++ * and MCP endpoint bindings are applied, then the resolved manifest is checked
++ * and deployed. The profile never carries a credential.
+  */
+ 
+ import type { NextRequest } from "next/server";
+ import { getAgent } from "@/lib/agents/store";
+ import { compatibilityReport } from "@/lib/agents/compatibility";
+-import { harnessAdapters } from "@/lib/agents/adapters/swarm";
++import { harnessAdapters } from "@/lib/agents/adapters/registry";
++import { getProfile, readProfiles, resolveProfile } from "@/lib/agents/profiles";
+ import { agentCaller, badRequest, notFound, ok, readAgentBody, routeId, unauthorized } from "@/lib/agents/http";
+ 
+ export const runtime = "nodejs";
++
++function readProfileIds(userId: string): string[] {
++  return readProfiles(userId).map((profile) => profile.id);
++}
+ export const dynamic = "force-dynamic";
+ 
+ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+@@ -21,17 +30,40 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
+   if (!manifest) return notFound();
+   const body = await readAgentBody(req);
+   if (!body.ok) return body.response;
++  const input = body.value && typeof body.value === "object" ? (body.value as { harness?: unknown; profile?: unknown }) : {};
++  const profileId = typeof input.profile === "string" && input.profile.trim() ? input.profile.trim() : undefined;
++  let profile = null;
++  if (profileId) {
++    profile = getProfile(user, profileId);
++    if (!profile) return badRequest(`Unknown profile "${profileId}".`, { profiles: readProfileIds(user) });
++  }
+   const requested =
+-    body.value && typeof body.value === "object" && typeof (body.value as { harness?: unknown }).harness === "string"
+-      ? (body.value as { harness: string }).harness
+-      : "swarm";
++    typeof input.harness === "string" && input.harness.trim()
++      ? input.harness.trim()
++      : profile?.harness ?? "swarm";
+   const adapter = harnessAdapters().find((entry) => entry.id === requested);
+   if (!adapter) return badRequest(`Unknown harness "${requested}".`, { harnesses: harnessAdapters().map((entry) => entry.id) });
+ 
+-  const report = compatibilityReport(manifest, { userId: user });
+-  const result = await adapter.deploy(user, manifest);
++  const resolved = resolveProfile(manifest, profile);
++  const report = compatibilityReport(resolved.manifest, { userId: user });
++  const result = await adapter.deploy(user, resolved.manifest);
+   if (!result.ok) {
+-    return badRequest(result.error, { missing: result.missing ?? report.missing, report });
++    // `report` describes the SwarmAgents harness; shipping it for another
++    // adapter would explain the failure with the wrong reasons.
++    return badRequest(result.error, {
++      harness: adapter.id,
++      ...(adapter.id === "swarm" ? { report } : { report: null }),
++      missing: result.missing ?? report.missing,
++      warnings: resolved.warnings,
++    });
+   }
+-  return ok({ runId: result.runId, queued: result.queued, harness: adapter.id, report });
++  return ok({
++    runId: result.runId,
++    queued: result.queued,
++    harness: adapter.id,
++    ...(profile ? { profile: profile.id } : {}),
++    report,
++    warnings: resolved.warnings,
++    applied: resolved.changed,
++  });
+ }
+diff --git a/apps/swarmagents/app/api/agents/agents-routes.test.ts b/apps/swarmagents/app/api/agents/agents-routes.test.ts
+index b4b355dce..bfbc46316 100644
+--- a/apps/swarmagents/app/api/agents/agents-routes.test.ts
++++ b/apps/swarmagents/app/api/agents/agents-routes.test.ts
+@@ -171,7 +171,8 @@ test("harnesses and compatibility report what this harness can run", async () =>
+ 
+   const harnesses = await HARNESSES(req("GET", "/api/agents/harnesses"));
+   const harnessBody = (await harnesses.json()) as { harnesses: Array<{ id: string; capabilities: { tools: string[] } }> };
+-  assert.deepEqual(harnessBody.harnesses.map((row) => row.id), ["swarm"]);
++  // Phase 7 added the (stub) local CLI adapter; the swarm harness stays first.
++  assert.deepEqual(harnessBody.harnesses.map((row) => row.id), ["swarm", "local-claude-cli"]);
+   assert.ok(harnessBody.harnesses[0].capabilities.tools.includes("Bash"));
+ 
+   const compat = await COMPAT(req("GET", "/api/agents/route-bot/compatibility"), ctx("route-bot"));
+diff --git a/apps/swarmagents/app/api/agents/harnesses/route.ts b/apps/swarmagents/app/api/agents/harnesses/route.ts
+index d2e9c6a9f..da27388e9 100644
+--- a/apps/swarmagents/app/api/agents/harnesses/route.ts
++++ b/apps/swarmagents/app/api/agents/harnesses/route.ts
+@@ -1,7 +1,7 @@
+ /** GET /api/agents/harnesses -> available harness adapters and their capabilities. */
+ 
+ import type { NextRequest } from "next/server";
+-import { harnessAdapters } from "@/lib/agents/adapters/swarm";
++import { harnessAdapters } from "@/lib/agents/adapters/registry";
+ import { agentCaller, ok, unauthorized } from "@/lib/agents/http";
+ 
+ export const runtime = "nodejs";
+diff --git a/apps/swarmagents/app/api/agents/phase7-routes.test.ts b/apps/swarmagents/app/api/agents/phase7-routes.test.ts
+new file mode 100644
+index 000000000..ae3aeb9fe
+--- /dev/null
++++ b/apps/swarmagents/app/api/agents/phase7-routes.test.ts
+@@ -0,0 +1,179 @@
++/**
++ * Phase 7 routes: deployment profiles, the template gallery and deploy-with-profile.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++import { USER_HEADER } from "@/lib/auth";
++import { AGENT_MANIFEST_VERSION, catalogModelIds } from "@/lib/agents/manifest";
++import { configureAgentsDir } from "@/lib/agents/store";
++import { configureAgentProfilesDir } from "@/lib/agents/profiles";
++import { setRuntimeManagerForTesting, type RuntimeManager } from "@/lib/runtime/manager";
++import { GET as PROFILES, POST as SAVE_PROFILE } from "./profiles/route";
++import { DELETE as DELETE_PROFILE } from "./profiles/[id]/route";
++import { GET as TEMPLATES } from "./templates/route";
++import { POST as IMPORT_TEMPLATE } from "./templates/[id]/import/route";
++import { POST as CREATE } from "./route";
++import { GET as HARNESSES } from "./harnesses/route";
++import { POST as DEPLOY } from "./[id]/deploy/route";
++
++const MODELS = [...catalogModelIds()];
++const PREFERRED = MODELS[0];
++const OVERRIDE = MODELS[1];
++let dir = "";
++
++function req(method: string, url: string, body?: unknown, user: string | null = "alice"): NextRequest {
++  return new NextRequest(`http://localhost${url}`, {
++    method,
++    headers: { "content-type": "application/json", ...(user ? { [USER_HEADER]: user } : {}) },
++    ...(body === undefined ? {} : { body: typeof body === "string" ? body : JSON.stringify(body) }),
++  });
++}
++
++const ctx = (id: string) => ({ params: Promise.resolve({ id }) });
++
++function manifest() {
++  return {
++    version: AGENT_MANIFEST_VERSION,
++    id: "deployable",
++    name: "Deployable",
++    identity: { systemPrompt: "Do the work." },
++    models: { preferred: PREFERRED, fallbacks: [] },
++    tools: ["Read"],
++    mcp: [],
++    connectors: [],
++    context: [],
++    memory: { policy: "none" },
++    skills: [],
++    workflows: [],
++    policies: {},
++    permissions: { allowTools: [], denyTools: [], approvalRequired: false },
++    subagents: [],
++  };
++}
++
++test.beforeEach(() => {
++  dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-agent-p7-routes-"));
++  configureAgentsDir(dir);
++  configureAgentProfilesDir(dir);
++});
++
++test.afterEach(() => {
++  setRuntimeManagerForTesting(null);
++  configureAgentsDir(undefined);
++  configureAgentProfilesDir(undefined);
++  fs.rmSync(dir, { recursive: true, force: true });
++});
++
++test("profile and template routes refuse an unauthenticated caller", async () => {
++  const calls = [
++    PROFILES(req("GET", "/api/agents/profiles", undefined, null)),
++    SAVE_PROFILE(req("POST", "/api/agents/profiles", { id: "dev", name: "Dev", harness: "swarm" }, null)),
++    DELETE_PROFILE(req("DELETE", "/api/agents/profiles/dev", undefined, null), ctx("dev")),
++    TEMPLATES(req("GET", "/api/agents/templates", undefined, null)),
++    IMPORT_TEMPLATE(req("POST", "/api/agents/templates/triage-bot/import", {}, null), ctx("triage-bot")),
++  ];
++  for (const res of await Promise.all(calls)) {
++    assert.equal(res.status, 401);
++    assert.equal(res.headers.get("cache-control"), "no-store");
++  }
++});
++
++test("profiles: create, list, reject an invalid one, delete", async () => {
++  const created = await SAVE_PROFILE(req("POST", "/api/agents/profiles", { id: "dev", name: "Dev", harness: "swarm" }));
++  assert.equal(created.status, 201);
++
++  const listed = await PROFILES(req("GET", "/api/agents/profiles"));
++  const body = (await listed.json()) as { profiles: Array<{ id: string; harness: string }> };
++  assert.deepEqual(body.profiles.map((row) => row.id), ["dev"]);
++  assert.equal(body.profiles[0].harness, "swarm");
++
++  const invalid = await SAVE_PROFILE(req("POST", "/api/agents/profiles", { id: "No Spaces", name: "x", harness: "swarm" }));
++  assert.equal(invalid.status, 400);
++
++  assert.equal((await DELETE_PROFILE(req("DELETE", "/api/agents/profiles/dev"), ctx("dev"))).status, 200);
++  assert.equal((await DELETE_PROFILE(req("DELETE", "/api/agents/profiles/dev"), ctx("dev"))).status, 404);
++});
++
++test("templates list the shipped gallery and import into the account", async () => {
++  const listed = await TEMPLATES(req("GET", "/api/agents/templates"));
++  assert.equal(listed.status, 200);
++  const body = (await listed.json()) as {
++    templates: Array<{ id: string; name: string; description: string }>;
++    issues: unknown[];
++  };
++  assert.deepEqual(body.issues, []);
++  assert.ok(body.templates.length >= 3);
++  assert.ok(body.templates.every((row) => row.name && row.description));
++
++  const first = body.templates[0];
++  const imported = await IMPORT_TEMPLATE(req("POST", `/api/agents/templates/${first.id}/import`, {}), ctx(first.id));
++  assert.equal(imported.status, 201);
++  const importedBody = (await imported.json()) as { agent: { id: string; name: string } };
++  assert.equal(importedBody.agent.name, first.name);
++
++  // Importing the same template twice de-dupes the id instead of overwriting.
++  const again = await IMPORT_TEMPLATE(req("POST", `/api/agents/templates/${first.id}/import`, {}), ctx(first.id));
++  assert.equal(again.status, 201);
++  const againBody = (await again.json()) as { agent: { id: string } };
++  assert.notEqual(againBody.agent.id, importedBody.agent.id);
++
++  assert.equal(
++    (await IMPORT_TEMPLATE(req("POST", "/api/agents/templates/nope/import", {}), ctx("nope"))).status,
++    404,
++  );
++});
++
++test("harnesses now lists both adapters with their capabilities", async () => {
++  const res = await HARNESSES(req("GET", "/api/agents/harnesses"));
++  const body = (await res.json()) as { harnesses: Array<{ id: string; name: string; capabilities: { tools: string[] } }> };
++  assert.deepEqual(body.harnesses.map((row) => row.id), ["swarm", "local-claude-cli"]);
++  assert.ok(body.harnesses[0].capabilities.tools.includes("Bash"));
++  assert.deepEqual(body.harnesses[1].capabilities.tools, [], "the stub grants no tools");
++});
++
++test("deploy with a profile applies its model override before the run starts", async () => {
++  assert.equal((await CREATE(req("POST", "/api/agents", manifest()))).status, 201);
++  assert.equal(
++    (await SAVE_PROFILE(req("POST", "/api/agents/profiles", {
++      id: "dev",
++      name: "Dev",
++      harness: "swarm",
++      modelOverrides: { preferred: OVERRIDE },
++    }))).status,
++    201,
++  );
++
++  const calls: Array<Record<string, unknown>> = [];
++  const fake = {
++    start: (_userId: string, input: Record<string, unknown>) => {
++      calls.push(input);
++      return { accepted: true, runId: "run_profile", queued: false };
++    },
++  };
++  setRuntimeManagerForTesting(fake as unknown as RuntimeManager);
++
++  const deployed = await DEPLOY(req("POST", "/api/agents/deployable/deploy", { profile: "dev" }), ctx("deployable"));
++  assert.equal(deployed.status, 200);
++  const body = (await deployed.json()) as { runId: string; profile: string; applied: string[] };
++  assert.equal(body.runId, "run_profile");
++  assert.equal(body.profile, "dev");
++  assert.ok(body.applied.some((entry) => entry.includes(OVERRIDE)));
++  assert.equal(calls[0].model, OVERRIDE, "the profile's model must reach the runtime");
++
++  const unknown = await DEPLOY(req("POST", "/api/agents/deployable/deploy", { profile: "ghost" }), ctx("deployable"));
++  assert.equal(unknown.status, 400);
++});
++
++test("deploying to the stub harness is refused with 'not implemented'", async () => {
++  assert.equal((await CREATE(req("POST", "/api/agents", manifest()))).status, 201);
++  const res = await DEPLOY(req("POST", "/api/agents/deployable/deploy", { harness: "local-claude-cli" }), ctx("deployable"));
++  assert.equal(res.status, 400);
++  const body = (await res.json()) as { error: string; missing: string[] };
++  assert.match(body.error, /not implemented/i);
++  assert.ok(body.missing.length > 0);
++});
+diff --git a/apps/swarmagents/app/api/agents/profiles/[id]/route.ts b/apps/swarmagents/app/api/agents/profiles/[id]/route.ts
+new file mode 100644
+index 000000000..1fcfe104a
+--- /dev/null
++++ b/apps/swarmagents/app/api/agents/profiles/[id]/route.ts
+@@ -0,0 +1,16 @@
++/** DELETE /api/agents/profiles/{id} -> remove one profile. */
++
++import type { NextRequest } from "next/server";
++import { deleteProfile } from "@/lib/agents/profiles";
++import { agentCaller, notFound, ok, routeId, unauthorized } from "@/lib/agents/http";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++export async function DELETE(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
++  const user = agentCaller(req);
++  if (!user) return unauthorized();
++  const id = await routeId(ctx);
++  if (!deleteProfile(user, id)) return notFound("Profile not found.");
++  return ok({ ok: true, id });
++}
+diff --git a/apps/swarmagents/app/api/agents/profiles/route.ts b/apps/swarmagents/app/api/agents/profiles/route.ts
+new file mode 100644
+index 000000000..1ea40f183
+--- /dev/null
++++ b/apps/swarmagents/app/api/agents/profiles/route.ts
+@@ -0,0 +1,30 @@
++/**
++ * GET  /api/agents/profiles -> the caller's deployment profiles
++ * POST /api/agents/profiles -> create or replace one profile
++ *
++ * A profile binds an agent to an environment (harness, model overrides, MCP
++ * endpoint bindings). It never carries a credential.
++ */
++
++import type { NextRequest } from "next/server";
++import { readProfiles, saveProfile } from "@/lib/agents/profiles";
++import { agentCaller, badRequest, ok, readAgentBody, unauthorized } from "@/lib/agents/http";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++export async function GET(req: NextRequest) {
++  const user = agentCaller(req);
++  if (!user) return unauthorized();
++  return ok({ profiles: readProfiles(user) });
++}
++
++export async function POST(req: NextRequest) {
++  const user = agentCaller(req);
++  if (!user) return unauthorized();
++  const body = await readAgentBody(req);
++  if (!body.ok) return body.response;
++  const result = saveProfile(user, body.value);
++  if (!result.ok) return badRequest("Profile is invalid.", { errors: result.errors });
++  return ok({ profile: result.profile }, 201);
++}
+diff --git a/apps/swarmagents/app/api/agents/templates/[id]/import/route.ts b/apps/swarmagents/app/api/agents/templates/[id]/import/route.ts
+new file mode 100644
+index 000000000..9f039e65e
+--- /dev/null
++++ b/apps/swarmagents/app/api/agents/templates/[id]/import/route.ts
+@@ -0,0 +1,26 @@
++/**
++ * POST /api/agents/templates/{id}/import -> clone a template into this account.
++ *
++ * The template goes through the normal import path, so it gets a fresh id when
++ * the id is taken, secrets are stripped, and unknown skills come back as
++ * warnings.
++ */
++
++import type { NextRequest } from "next/server";
++import { getTemplate } from "@/lib/agents/templates";
++import { importAgent } from "@/lib/agents/store";
++import { agentCaller, notFound, ok, routeId, unauthorized } from "@/lib/agents/http";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
++  const user = agentCaller(req);
++  if (!user) return unauthorized();
++  const id = await routeId(ctx);
++  const template = getTemplate(id);
++  if (!template) return notFound("Template not found.");
++  const result = importAgent(user, template.manifest);
++  if (!result.ok) return notFound("Template could not be imported.");
++  return ok({ agent: result.manifest, warnings: result.warnings }, 201);
++}
+diff --git a/apps/swarmagents/app/api/agents/templates/route.ts b/apps/swarmagents/app/api/agents/templates/route.ts
+new file mode 100644
+index 000000000..995e4c9ea
+--- /dev/null
++++ b/apps/swarmagents/app/api/agents/templates/route.ts
+@@ -0,0 +1,27 @@
++/**
++ * GET /api/agents/templates -> the read-only community template list.
++ *
++ * Templates ship with the repo and are validated on load, so a broken template
++ * is reported in `issues` instead of being offered and failing at import.
++ */
++
++import type { NextRequest } from "next/server";
++import { loadTemplates } from "@/lib/agents/templates";
++import { agentCaller, ok, unauthorized } from "@/lib/agents/http";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++export async function GET(req: NextRequest) {
++  const user = agentCaller(req);
++  if (!user) return unauthorized();
++  const { templates, issues } = loadTemplates();
++  return ok({
++    templates: templates.map((template) => ({
++      id: template.id,
++      name: template.name,
++      description: template.description,
++    })),
++    issues,
++  });
++}
+diff --git a/apps/swarmagents/lib/agents/adapters/local-claude.ts b/apps/swarmagents/lib/agents/adapters/local-claude.ts
+new file mode 100644
+index 000000000..00453c04b
+--- /dev/null
++++ b/apps/swarmagents/lib/agents/adapters/local-claude.ts
+@@ -0,0 +1,62 @@
++/**
++ * Local Claude Code CLI adapter (Agent Studio, phase 7) — DELIBERATELY A STUB.
++ *
++ * The manifest claims to be harness-agnostic; this adapter exists to prove the
++ * interface can carry a second harness, and to report honestly what that
++ * harness is. It does NOT run anything: `deploy` refuses with "not
++ * implemented". Faking a deploy here would be worse than refusing — a user
++ * would believe an agent was running when nothing was.
++ *
++ * What is real: capability detection. `claude` is looked up on PATH (and
++ * `CLAUDE_CLI_PATH` overrides it), so the UI can say truthfully whether this
++ * machine has the CLI at all.
++ */
++
++import fs from "node:fs";
++import path from "node:path";
++import { catalogModelIds } from "../manifest";
++import type { AdapterCapabilities, DeployFailure, HarnessAdapter } from "./types";
++
++export const LOCAL_CLAUDE_ADAPTER_ID = "local-claude-cli";
++export const NOT_IMPLEMENTED =
++  "The local Claude Code CLI adapter is not implemented in this build: it reports its capabilities but cannot deploy an agent yet.";
++
++/** Where the CLI would be, without executing it. */
++export function detectLocalClaudeCli(env: NodeJS.ProcessEnv = process.env): string | null {
++  const explicit = env.CLAUDE_CLI_PATH?.trim();
++  if (explicit && fs.existsSync(explicit)) return explicit;
++  const dirs = (env.PATH ?? "").split(path.delimiter).filter(Boolean);
++  for (const dir of dirs) {
++    const candidate = path.join(dir, "claude");
++    try {
++      const stat = fs.statSync(candidate);
++      if (stat.isFile()) return candidate;
++    } catch {
++      // not in this directory
++    }
++  }
++  return null;
++}
++
++export const localClaudeAdapter: HarnessAdapter = {
++  id: LOCAL_CLAUDE_ADAPTER_ID,
++  name: "Local Claude Code CLI (not implemented)",
++  capabilities(): AdapterCapabilities {
++    const cli = detectLocalClaudeCli();
++    return {
++      // The CLI has no per-run tool allowlist API in this build, so it can grant
++      // nothing: claiming otherwise would let a manifest deploy that cannot be
++      // enforced.
++      tools: [],
++      models: [...catalogModelIds()],
++      supportsMcp: cli !== null,
++      mcpTransports: cli ? ["stdio"] : [],
++      memoryPolicies: ["none", "session"],
++      supportsSubagents: false,
++      connectors: [],
++    };
++  },
++  async deploy(): Promise<DeployFailure> {
++    return { ok: false, error: NOT_IMPLEMENTED, missing: [NOT_IMPLEMENTED] };
++  },
++};
+diff --git a/apps/swarmagents/lib/agents/adapters/registry.ts b/apps/swarmagents/lib/agents/adapters/registry.ts
+new file mode 100644
+index 000000000..6e975f725
+--- /dev/null
++++ b/apps/swarmagents/lib/agents/adapters/registry.ts
+@@ -0,0 +1,19 @@
++/**
++ * The harness adapters this build ships (Agent Studio, phase 7).
++ *
++ * Keeping the registry separate from any one adapter means adding a harness is
++ * a change here plus its adapter file — the routes and the UI never enumerate
++ * harnesses by hand.
++ */
++
++import { localClaudeAdapter } from "./local-claude";
++import { swarmAdapter } from "./swarm";
++import type { HarnessAdapter } from "./types";
++
++export function harnessAdapters(): HarnessAdapter[] {
++  return [swarmAdapter, localClaudeAdapter];
++}
++
++export function adapterById(id: string): HarnessAdapter | undefined {
++  return harnessAdapters().find((adapter) => adapter.id === id);
++}
+diff --git a/apps/swarmagents/lib/agents/phase7.test.ts b/apps/swarmagents/lib/agents/phase7.test.ts
+new file mode 100644
+index 000000000..922f56cd7
+--- /dev/null
++++ b/apps/swarmagents/lib/agents/phase7.test.ts
+@@ -0,0 +1,208 @@
++/**
++ * Phase 7: deployment profiles, the second harness adapter and community
++ * templates.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import {
++  configureAgentProfilesDir,
++  deleteProfile,
++  getProfile,
++  MAX_PROFILES,
++  parseProfile,
++  readProfiles,
++  resolveProfile,
++  saveProfile,
++} from "./profiles";
++import { loadTemplates, getTemplate, TEMPLATES_DIR } from "./templates";
++import { adapterById, harnessAdapters } from "./adapters/registry";
++import { detectLocalClaudeCli, localClaudeAdapter, NOT_IMPLEMENTED } from "./adapters/local-claude";
++import { catalogModelIds, validateManifest, type AgentManifest } from "./manifest";
++import { globalAgentCatalog } from "./catalog";
++import { configureAgentsDir, saveAgent } from "./store";
++
++const MODELS = [...catalogModelIds()];
++const A = MODELS[0];
++const B = MODELS[1];
++let dir = "";
++
++test.beforeEach(() => {
++  dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-agent-profiles-"));
++  configureAgentProfilesDir(dir);
++  configureAgentsDir(dir);
++});
++
++test.afterEach(() => {
++  configureAgentProfilesDir(undefined);
++  configureAgentsDir(undefined);
++  fs.rmSync(dir, { recursive: true, force: true });
++});
++
++function manifest(overrides: Record<string, unknown> = {}): AgentManifest {
++  const validated = validateManifest({
++    version: 1,
++    id: "profiled",
++    name: "Profiled agent",
++    identity: { systemPrompt: "Do the work." },
++    models: { preferred: A, fallbacks: [] },
++    tools: ["Read"],
++    mcp: [
++      { name: "library-tools", transport: "http", url: "https://placeholder.invalid/mcp" },
++      { name: "local-tools", transport: "stdio", command: "node tools.mjs" },
++    ],
++    connectors: [],
++    context: [],
++    memory: { policy: "none" },
++    skills: [],
++    workflows: [],
++    policies: {},
++    permissions: { allowTools: [], denyTools: [], approvalRequired: false },
++    subagents: [],
++    ...overrides,
++  }, globalAgentCatalog(), { requireCatalogIds: false });
++  assert.equal(validated.ok, true, JSON.stringify(validated));
++  return (validated as { ok: true; manifest: AgentManifest }).manifest;
++}
++
++test("a profile needs a slug id, a name and a harness", () => {
++  assert.equal(parseProfile({ id: "Bad Id", name: "x", harness: "swarm" }), null);
++  assert.equal(parseProfile({ id: "dev", name: "", harness: "swarm" }), null);
++  assert.equal(parseProfile({ id: "dev", name: "Dev", harness: "" }), null);
++  const ok = parseProfile({ id: "dev", name: " Dev ", harness: "swarm", modelOverrides: { preferred: B, fallbacks: ["", A] } });
++  assert.deepEqual(ok, { id: "dev", name: "Dev", harness: "swarm", modelOverrides: { preferred: B, fallbacks: [A] } });
++});
++
++test("profiles round-trip per account and delete", () => {
++  assert.equal(saveProfile("alice", { id: "dev", name: "Dev", harness: "swarm" }).ok, true);
++  assert.equal(saveProfile("alice", { id: "prod", name: "Prod", harness: "swarm" }).ok, true);
++  assert.deepEqual(readProfiles("alice").map((row) => row.id).sort(), ["dev", "prod"]);
++  assert.equal(getProfile("alice", "dev")?.name, "Dev");
++  assert.deepEqual(readProfiles("bob"), [], "profiles are per account");
++
++  assert.equal(deleteProfile("alice", "dev"), true);
++  assert.equal(deleteProfile("alice", "dev"), false);
++  assert.deepEqual(readProfiles("alice").map((row) => row.id), ["prod"]);
++});
++
++test("saving an existing profile replaces it, and the cap only blocks new ids", () => {
++  for (let i = 0; i < MAX_PROFILES; i += 1) {
++    assert.equal(saveProfile("alice", { id: `p-${i}`, name: `P ${i}`, harness: "swarm" }).ok, true);
++  }
++  const over = saveProfile("alice", { id: "one-too-many", name: "No", harness: "swarm" });
++  assert.equal(over.ok, false);
++  // Replacing an existing profile still works at the cap.
++  const replaced = saveProfile("alice", { id: "p-0", name: "Renamed", harness: "swarm" });
++  assert.equal(replaced.ok, true);
++  assert.equal(getProfile("alice", "p-0")?.name, "Renamed");
++});
++
++test("resolveProfile applies model overrides and MCP endpoint bindings", () => {
++  const base = manifest();
++  const profile = {
++    id: "dev",
++    name: "Dev",
++    harness: "swarm",
++    modelOverrides: { preferred: B, fallbacks: [A] },
++    bindings: { mcp: { "library-tools": "http://127.0.0.1:9000/mcp" } },
++  };
++  const resolved = resolveProfile(base, profile);
++  assert.equal(resolved.manifest.models.preferred, B);
++  assert.deepEqual(resolved.manifest.models.fallbacks, [A]);
++  assert.equal(resolved.manifest.mcp[0].url, "http://127.0.0.1:9000/mcp");
++  assert.equal(resolved.manifest.mcp[1].command, "node tools.mjs", "stdio servers are never rewritten");
++  assert.ok(resolved.changed.some((entry) => /model/.test(entry)));
++  assert.ok(resolved.changed.some((entry) => /mcp library-tools/.test(entry)));
++});
++
++test("resolveProfile warns instead of inventing bindings", () => {
++  const resolved = resolveProfile(manifest(), {
++    id: "prod",
++    name: "Prod",
++    harness: "swarm",
++    bindings: { mcp: { "not-declared": "https://x.invalid/mcp" } },
++  });
++  assert.ok(resolved.warnings.some((warning) => /not-declared.*ignored/.test(warning)));
++  // A declared http server with no binding is a warning, not a silent default.
++  assert.ok(resolved.warnings.some((warning) => /library-tools has no binding/.test(warning)));
++});
++
++test("resolveProfile with no profile is the identity", () => {
++  const base = manifest();
++  const resolved = resolveProfile(base, null);
++  assert.equal(resolved.manifest, base);
++  assert.deepEqual(resolved.warnings, []);
++  assert.deepEqual(resolved.changed, []);
++});
++
++test("every shipped template validates and loads without issues", () => {
++  const { templates, issues } = loadTemplates();
++  assert.deepEqual(issues, [], "a template that does not validate must be fixed, not shipped");
++  assert.ok(templates.length >= 3, `expected at least 3 templates, got ${templates.length}`);
++  for (const template of templates) {
++    assert.equal(template.manifest.version, 1);
++    assert.ok(template.manifest.identity.systemPrompt.length > 0);
++    assert.ok(template.description.length > 0, `${template.id} needs a description for the gallery`);
++  }
++  const files = fs.readdirSync(path.resolve(process.cwd(), TEMPLATES_DIR)).filter((name) => name.endsWith(".json"));
++  assert.equal(files.length, templates.length + issues.length);
++});
++
++test("getTemplate finds one template and misses cleanly", () => {
++  const first = loadTemplates().templates[0];
++  assert.equal(getTemplate(first.id)?.manifest.id, first.id);
++  assert.equal(getTemplate("does-not-exist"), null);
++});
++
++test("a template imports into an account through the normal path", async () => {
++  // Saving the template manifest under a different id is exactly what the
++  // import route does; assert the store accepts a shipped manifest as-is.
++  const template = loadTemplates().templates[0];
++  const saved = saveAgent("alice", { ...template.manifest, id: "from-template" }, globalAgentCatalog());
++  assert.equal(saved.ok, true);
++  assert.equal(fs.existsSync(path.join(dir, "agents")), true);
++});
++
++test("the adapter registry ships two harnesses and the stub refuses honestly", async () => {
++  const adapters = harnessAdapters();
++  assert.deepEqual(adapters.map((adapter) => adapter.id), ["swarm", "local-claude-cli"]);
++  assert.equal(adapterById("nope"), undefined);
++
++  const stub = adapterById("local-claude-cli");
++  assert.ok(stub);
++  const caps = stub!.capabilities();
++  // It grants no tools, because the CLI has no per-run allowlist in this build.
++  assert.deepEqual(caps.tools, []);
++  assert.equal(caps.supportsSubagents, false);
++
++  const result = await stub!.deploy("alice", manifest());
++  assert.equal(result.ok, false);
++  if (result.ok) return;
++  assert.equal(result.error, NOT_IMPLEMENTED);
++  assert.ok(result.missing?.includes(NOT_IMPLEMENTED));
++  assert.ok(!/swarm/i.test(localClaudeAdapter.name.replace("Claude", "")), "the stub must be labelled as not implemented");
++});
++
++test("local CLI detection looks on PATH without executing anything", () => {
++  const empty = detectLocalClaudeCli({ PATH: "/definitely/not/here" } as unknown as NodeJS.ProcessEnv);
++  assert.equal(empty, null);
++  // Whatever this machine has, the answer is either a real path or null — never a guess.
++  const detected = detectLocalClaudeCli();
++  if (detected !== null) assert.equal(fs.existsSync(detected), true);
++});
++
++test("every shipped template is deployable on the harness it ships for", async () => {
++  const { compatibilityReport } = await import("./compatibility");
++  const { templates } = loadTemplates();
++  for (const template of templates) {
++    const report = compatibilityReport(template.manifest);
++    assert.deepEqual(
++      report.missing,
++      [],
++      `template ${template.id} cannot deploy on the swarm harness: ${report.missing.join("; ")}`,
++    );
++  }
++});
+diff --git a/apps/swarmagents/lib/agents/profiles.ts b/apps/swarmagents/lib/agents/profiles.ts
+new file mode 100644
+index 000000000..7f0699250
+--- /dev/null
++++ b/apps/swarmagents/lib/agents/profiles.ts
+@@ -0,0 +1,195 @@
++/**
++ * Deployment profiles (Agent Studio, phase 7).
++ *
++ * A profile is a named, per-account binding of one agent to an environment:
++ * which harness to deploy to, optional model overrides, and the endpoint
++ * bindings for that environment (MCP urls, provider ids).
++ *
++ * Profiles are deliberately separate from the manifest: the manifest is the
++ * portable asset, a profile is what makes it run *here*. That is why a profile
++ * is never exported with an agent and never carries a credential — a binding is
++ * an endpoint or an id, and the destination still authenticates it itself.
++ */
++
++import fs from "node:fs";
++import path from "node:path";
++import { atomicWriteFile } from "../atomic-write";
++import { resolveDataDir, userDirName } from "../providers/store";
++import type { AgentManifest } from "./manifest";
++
++export const PROFILES_FILE = "profiles.json";
++export const MAX_PROFILES = 20;
++const PROFILE_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
++
++export interface AgentProfileBindings {
++  /** MCP server name -> endpoint for this environment. */
++  mcp?: Record<string, string>;
++  /** Logical provider slot -> provider id in this account. */
++  providers?: Record<string, string>;
++}
++
++export interface AgentDeploymentProfile {
++  id: string;
++  name: string;
++  harness: string;
++  modelOverrides?: {
++    preferred?: string;
++    fallbacks?: string[];
++  };
++  bindings?: AgentProfileBindings;
++}
++
++interface ProfilesFile {
++  version: 1;
++  profiles: AgentDeploymentProfile[];
++}
++
++let DATA_DIR_OVERRIDE: string | undefined;
++
++/** Point profile storage at a fixed directory (tests). */
++export function configureAgentProfilesDir(dir: string | undefined): void {
++  DATA_DIR_OVERRIDE = dir || undefined;
++}
++
++function profilesFile(userId: string): string {
++  const root = DATA_DIR_OVERRIDE ?? resolveDataDir();
++  return path.join(root, "agents", userDirName(userId), PROFILES_FILE);
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function stringMap(value: unknown): Record<string, string> | undefined {
++  if (!isRecord(value)) return undefined;
++  const out: Record<string, string> = {};
++  for (const [key, raw] of Object.entries(value)) {
++    if (typeof raw === "string" && raw.trim()) out[key] = raw.trim();
++  }
++  return Object.keys(out).length > 0 ? out : undefined;
++}
++
++/** Normalize one untrusted profile. Returns null when it cannot be used. */
++export function parseProfile(value: unknown): AgentDeploymentProfile | null {
++  if (!isRecord(value)) return null;
++  const id = typeof value.id === "string" ? value.id.trim() : "";
++  const name = typeof value.name === "string" ? value.name.trim() : "";
++  const harness = typeof value.harness === "string" ? value.harness.trim() : "";
++  if (!PROFILE_ID_RE.test(id) || !name || !harness) return null;
++
++  const overridesRaw = isRecord(value.modelOverrides) ? value.modelOverrides : {};
++  const preferred = typeof overridesRaw.preferred === "string" ? overridesRaw.preferred.trim() : "";
++  const fallbacks = Array.isArray(overridesRaw.fallbacks)
++    ? overridesRaw.fallbacks.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
++    : [];
++  const bindingsRaw = isRecord(value.bindings) ? value.bindings : {};
++  const mcp = stringMap(bindingsRaw.mcp);
++  const providers = stringMap(bindingsRaw.providers);
++
++  return {
++    id,
++    name: name.slice(0, 100),
++    harness,
++    ...(preferred || fallbacks.length > 0
++      ? { modelOverrides: { ...(preferred ? { preferred } : {}), ...(fallbacks.length > 0 ? { fallbacks } : {}) } }
++      : {}),
++    ...(mcp || providers ? { bindings: { ...(mcp ? { mcp } : {}), ...(providers ? { providers } : {}) } } : {}),
++  };
++}
++
++export function readProfiles(userId: string): AgentDeploymentProfile[] {
++  let raw: string;
++  try {
++    raw = fs.readFileSync(profilesFile(userId), "utf-8");
++  } catch {
++    return [];
++  }
++  try {
++    const parsed = JSON.parse(raw) as unknown;
++    if (!isRecord(parsed) || !Array.isArray(parsed.profiles)) return [];
++    return parsed.profiles.map((entry) => parseProfile(entry)).filter((entry): entry is AgentDeploymentProfile => entry !== null);
++  } catch {
++    return [];
++  }
++}
++
++export function getProfile(userId: string, id: string): AgentDeploymentProfile | null {
++  return readProfiles(userId).find((profile) => profile.id === id) ?? null;
++}
++
++export type SaveProfileResult =
++  | { ok: true; profile: AgentDeploymentProfile }
++  | { ok: false; errors: string[] };
++
++/** Create or replace one profile. Rejects an id above the per-account cap. */
++export function saveProfile(userId: string, input: unknown): SaveProfileResult {
++  const profile = parseProfile(input);
++  if (!profile) return { ok: false, errors: ["a profile needs a slug id, a name and a harness"] };
++  const existing = readProfiles(userId);
++  const without = existing.filter((row) => row.id !== profile.id);
++  if (!existing.some((row) => row.id === profile.id) && existing.length >= MAX_PROFILES) {
++    return { ok: false, errors: [`at most ${MAX_PROFILES} profiles per account`] };
++  }
++  const next: ProfilesFile = { version: 1, profiles: [...without, profile] };
++  const file = profilesFile(userId);
++  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
++  atomicWriteFile(file, JSON.stringify(next, null, 2), { mode: 0o600 });
++  return { ok: true, profile };
++}
++
++export function deleteProfile(userId: string, id: string): boolean {
++  const existing = readProfiles(userId);
++  const next = existing.filter((row) => row.id !== id);
++  if (next.length === existing.length) return false;
++  const file = profilesFile(userId);
++  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
++  atomicWriteFile(file, JSON.stringify({ version: 1, profiles: next } satisfies ProfilesFile, null, 2), { mode: 0o600 });
++  return true;
++}
++
++export interface ResolvedProfile {
++  manifest: AgentManifest;
++  warnings: string[];
++  changed: string[];
++}
++
++/**
++ * Apply one profile to a manifest: model overrides and environment bindings.
++ *
++ * Bindings only rewrite the *endpoint* of an MCP server the manifest already
++ * declares. A binding for a server that is not in the manifest is reported as a
++ * warning instead of silently adding a server the agent never asked for.
++ */
++export function resolveProfile(manifest: AgentManifest, profile: AgentDeploymentProfile | null): ResolvedProfile {
++  if (!profile) return { manifest, warnings: [], changed: [] };
++  const warnings: string[] = [];
++  const changed: string[] = [];
++
++  const preferred = profile.modelOverrides?.preferred;
++  const fallbacks = profile.modelOverrides?.fallbacks;
++  const models = {
++    preferred: preferred ?? manifest.models.preferred,
++    fallbacks: fallbacks ?? manifest.models.fallbacks,
++  };
++  if (preferred && preferred !== manifest.models.preferred) changed.push(`model ${manifest.models.preferred} -> ${preferred}`);
++  if (fallbacks) changed.push("fallbacks overridden by the profile");
++
++  const bindings = profile.bindings?.mcp ?? {};
++  const declared = new Set(manifest.mcp.map((server) => server.name));
++  for (const name of Object.keys(bindings)) {
++    if (!declared.has(name)) warnings.push(`binding for MCP server "${name}" was ignored: the agent does not declare it`);
++  }
++  const mcp = manifest.mcp.map((server) => {
++    const bound = bindings[server.name];
++    if (!bound || server.transport === "stdio") return server;
++    changed.push(`mcp ${server.name} -> ${bound}`);
++    return { ...server, url: bound };
++  });
++  for (const server of manifest.mcp) {
++    if (server.transport !== "stdio" && !bindings[server.name]) {
++      warnings.push(`MCP server ${server.name} has no binding in profile "${profile.id}"`);
++    }
++  }
++
++  return { manifest: { ...manifest, models, mcp }, warnings, changed };
++}
+diff --git a/apps/swarmagents/lib/agents/templates.ts b/apps/swarmagents/lib/agents/templates.ts
+new file mode 100644
+index 000000000..a2545b3e3
+--- /dev/null
++++ b/apps/swarmagents/lib/agents/templates.ts
+@@ -0,0 +1,74 @@
++/**
++ * Community agent templates (Agent Studio, phase 7).
++ *
++ * A read-only list seeded from `templates/agents/*.json` in the repo. Templates
++ * are ordinary manifests, so importing one is the normal import path (fresh id,
++ * secrets stripped, unknown skills reported) — there is no second format and no
++ * privileged path.
++ *
++ * Every shipped template is validated at load time against the global catalog;
++ * a template that does not validate is reported as unavailable rather than
++ * offered to a user and failing at import.
++ */
++
++import fs from "node:fs";
++import path from "node:path";
++import { globalAgentCatalog } from "./catalog";
++import { validateManifest, type AgentManifest } from "./manifest";
++
++export const TEMPLATES_DIR = path.join("templates", "agents");
++
++export interface AgentTemplate {
++  id: string;
++  name: string;
++  description: string;
++  manifest: AgentManifest;
++}
++
++export interface TemplateIssue {
++  id: string;
++  error: string;
++}
++
++function templatesDir(override?: string): string {
++  return override ?? path.resolve(process.cwd(), TEMPLATES_DIR);
++}
++
++/** Load and validate every template. Invalid ones are surfaced, never hidden. */
++export function loadTemplates(dir?: string): { templates: AgentTemplate[]; issues: TemplateIssue[] } {
++  let names: string[];
++  try {
++    names = fs.readdirSync(templatesDir(dir)).filter((name) => name.endsWith(".json")).sort();
++  } catch {
++    return { templates: [], issues: [] };
++  }
++  const templates: AgentTemplate[] = [];
++  const issues: TemplateIssue[] = [];
++  const catalog = globalAgentCatalog();
++  for (const name of names) {
++    const file = path.join(templatesDir(dir), name);
++    let raw: unknown;
++    try {
++      raw = JSON.parse(fs.readFileSync(file, "utf-8"));
++    } catch (err) {
++      issues.push({ id: name, error: `unreadable JSON: ${err instanceof Error ? err.message : "unknown error"}` });
++      continue;
++    }
++    const validated = validateManifest(raw, catalog, { requireCatalogIds: false });
++    if (!validated.ok) {
++      issues.push({ id: name, error: validated.errors.join("; ") });
++      continue;
++    }
++    templates.push({
++      id: validated.manifest.id,
++      name: validated.manifest.name,
++      description: validated.manifest.description ?? "",
++      manifest: validated.manifest,
++    });
++  }
++  return { templates, issues };
++}
++
++export function getTemplate(id: string, dir?: string): AgentTemplate | null {
++  return loadTemplates(dir).templates.find((template) => template.id === id) ?? null;
++}
+diff --git a/apps/swarmagents/lib/client/agents.ts b/apps/swarmagents/lib/client/agents.ts
+index d67395311..120f64904 100644
+--- a/apps/swarmagents/lib/client/agents.ts
++++ b/apps/swarmagents/lib/client/agents.ts
+@@ -46,6 +46,20 @@ export interface HarnessView {
+   };
+ }
+ 
++export interface AgentProfile {
++  id: string;
++  name: string;
++  harness: string;
++  modelOverrides?: { preferred?: string; fallbacks?: string[] };
++  bindings?: { mcp?: Record<string, string>; providers?: Record<string, string> };
++}
++
++export interface AgentTemplateSummary {
++  id: string;
++  name: string;
++  description: string;
++}
++
+ export interface AgentExportPackage {
+   format: "swarm-agent";
+   formatVersion: 1;
+@@ -132,10 +146,30 @@ export const agentsApi = {
+     request<{ harness: string; capabilities: HarnessView["capabilities"]; report: CompatibilityReportView }>(
+       `/api/agents/${encodeURIComponent(id)}/compatibility`,
+     ),
+-  deploy: (id: string, harness = "swarm") =>
+-    request<{ runId: string; queued: boolean; harness: string; report: CompatibilityReportView }>(
+-      `/api/agents/${encodeURIComponent(id)}/deploy`,
+-      { method: "POST", body: JSON.stringify({ harness }) },
+-    ),
++  deploy: (id: string, options: { harness?: string; profile?: string } = {}) =>
++    request<{
++      runId: string;
++      queued: boolean;
++      harness: string;
++      profile?: string;
++      report: CompatibilityReportView;
++      warnings: string[];
++      applied: string[];
++    }>(`/api/agents/${encodeURIComponent(id)}/deploy`, {
++      method: "POST",
++      body: JSON.stringify({ harness: options.harness ?? "swarm", ...(options.profile ? { profile: options.profile } : {}) }),
++    }),
+   harnesses: () => request<{ harnesses: HarnessView[] }>("/api/agents/harnesses"),
++  profiles: () => request<{ profiles: AgentProfile[] }>("/api/agents/profiles"),
++  saveProfile: (profile: AgentProfile) =>
++    request<{ profile: AgentProfile }>("/api/agents/profiles", { method: "POST", body: JSON.stringify(profile) }),
++  deleteProfile: (id: string) =>
++    request<{ ok: boolean }>(`/api/agents/profiles/${encodeURIComponent(id)}`, { method: "DELETE" }),
++  templates: () =>
++    request<{ templates: AgentTemplateSummary[]; issues: Array<{ id: string; error: string }> }>("/api/agents/templates"),
++  importTemplate: (id: string) =>
++    request<{ agent: AgentManifest; warnings: string[] }>(`/api/agents/templates/${encodeURIComponent(id)}/import`, {
++      method: "POST",
++      body: JSON.stringify({}),
++    }),
+ };
+diff --git a/apps/swarmagents/minimalist-ui/src/components/AgentLibrary.tsx b/apps/swarmagents/minimalist-ui/src/components/AgentLibrary.tsx
+index f57b08246..a13a4d33c 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/AgentLibrary.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/AgentLibrary.tsx
+@@ -32,6 +32,7 @@ import {
+   type AgentHistoryRow,
+   type AgentManifest,
+   type AgentSummary,
++  type AgentTemplateSummary,
+ } from "../../../lib/client/agents";
+ import { filterAgents } from "./agentForm";
+ import { AgentStudio } from "./AgentStudio";
+@@ -63,6 +64,8 @@ export function AgentLibrary() {
+   const [editing, setEditing] = useState<string | null>(null); // null = list, "" = new agent
+   const [historyFor, setHistoryFor] = useState<string | null>(null);
+   const [history, setHistory] = useState<AgentHistoryRow[]>([]);
++  const [templates, setTemplates] = useState<AgentTemplateSummary[]>([]);
++  const [templateIssues, setTemplateIssues] = useState<Array<{ id: string; error: string }>>([]);
+   const fileRef = useRef<HTMLInputElement | null>(null);
+ 
+   const refresh = useCallback(async () => {
+@@ -82,6 +85,29 @@ export function AgentLibrary() {
+     void refresh();
+   }, [refresh]);
+ 
++  useEffect(() => {
++    // The gallery ships with the repo; failures here must not block the list.
++    void agentsApi
++      .templates()
++      .then((result) => {
++        setTemplates(result.templates);
++        setTemplateIssues(result.issues);
++      })
++      .catch(() => undefined);
++  }, []);
++
++  async function useTemplate(id: string, name: string) {
++    await withBusy(async () => {
++      const result = await agentsApi.importTemplate(id);
++      setNotice(
++        result.warnings.length > 0
++          ? `Added ${name} with warnings: ${result.warnings.join("; ")}`
++          : `Added ${name} to your agents.`,
++      );
++      await refresh();
++    });
++  }
++
+   const visible = useMemo(() => filterAgents(agents, query), [agents, query]);
+ 
+   async function withBusy(fn: () => Promise<void>) {
+@@ -129,7 +155,7 @@ export function AgentLibrary() {
+ 
+   async function deployAgent(id: string) {
+     await withBusy(async () => {
+-      const result = await agentsApi.deploy(id, "swarm");
++      const result = await agentsApi.deploy(id, { harness: "swarm" });
+       setNotice(`Deployed ${id} as run ${result.runId}.`);
+     });
+   }
+@@ -363,9 +389,33 @@ export function AgentLibrary() {
+           <h3 className="flex items-center gap-1 text-[11px] font-medium uppercase tracking-wide text-zinc-500">
+             <Bot className="h-3 w-3" aria-hidden /> Community templates
+           </h3>
+-          <p className="mt-1 text-[11px] text-zinc-600">
+-            The template gallery ships with the community catalog, which is not part of this release.
+-          </p>
++          {templates.length === 0 ? (
++            <p className="mt-1 text-[11px] text-zinc-600">No templates shipped with this build.</p>
++          ) : (
++            <ul className="mt-1 space-y-1">
++              {templates.map((template) => (
++                <li key={template.id} className="flex items-start gap-2 rounded-md border border-white/[0.06] bg-black/20 p-2">
++                  <div className="min-w-0 flex-1">
++                    <p className="truncate text-[12px] text-zinc-200">{template.name}</p>
++                    <p className="text-[11px] text-zinc-500">{template.description}</p>
++                  </div>
++                  <button
++                    type="button"
++                    onClick={() => void useTemplate(template.id, template.name)}
++                    className="shrink-0 rounded-md border border-cyan-400/30 px-1.5 py-0.5 text-[10px] text-cyan-200 hover:bg-cyan-400/10"
++                  >
++                    Use
++                  </button>
++                </li>
++              ))}
++            </ul>
++          )}
++          {templateIssues.length > 0 ? (
++            <p className="mt-1 text-[11px] text-amber-300/80">
++              {templateIssues.length} template{templateIssues.length === 1 ? "" : "s"} failed to load:{" "}
++              {templateIssues.map((issue) => issue.id).join(", ")}
++            </p>
++          ) : null}
+         </section>
+       </div>
+     </div>
+diff --git a/apps/swarmagents/minimalist-ui/src/components/AgentStudio.tsx b/apps/swarmagents/minimalist-ui/src/components/AgentStudio.tsx
+index 0f5c9f7f1..d21648cfe 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/AgentStudio.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/AgentStudio.tsx
+@@ -14,7 +14,13 @@
+ 
+ import { useCallback, useEffect, useMemo, useState } from "react";
+ import { AlertTriangle, Check, Loader2, Rocket, Save, ShieldCheck, X } from "lucide-react";
+-import { agentsApi, AgentApiError, type AgentManifest, type HarnessView } from "../../../lib/client/agents";
++import {
++  agentsApi,
++  AgentApiError,
++  type AgentManifest,
++  type AgentProfile,
++  type HarnessView,
++} from "../../../lib/client/agents";
+ import type { CompatibilityReportView } from "../../../lib/client/agents";
+ import {
+   digestCompatibility,
+@@ -68,18 +74,23 @@ export function AgentStudio({
+   const [notice, setNotice] = useState<string | null>(null);
+   const [compat, setCompat] = useState<CompatibilityReportView | null>(null);
+   const [runId, setRunId] = useState<string | null>(null);
++  const [profiles, setProfiles] = useState<AgentProfile[]>([]);
++  const [profileId, setProfileId] = useState("");
+ 
+   const set = <K extends keyof AgentFormState>(key: K, value: AgentFormState[K]) =>
+     setForm((prev) => ({ ...prev, [key]: value }));
+ 
+   const load = useCallback(async () => {
+     try {
+-      const [harnesses, library, providers, connectorList] = await Promise.all([
++      const [harnesses, library, providers, connectorList, profileList] = await Promise.all([
+         agentsApi.harnesses(),
+         fetch("/api/library/items", { cache: "no-store" }).then((res) => (res.ok ? res.json() : { items: [] })),
+         fetch("/api/providers", { cache: "no-store" }).then((res) => (res.ok ? res.json() : { catalog: [] })),
+         fetch("/api/library/connectors", { cache: "no-store" }).then((res) => (res.ok ? res.json() : { connectors: [] })),
++        agentsApi.profiles().catch(() => ({ profiles: [] as AgentProfile[] })),
+       ]);
++      setProfiles(profileList.profiles);
++      if (profileList.profiles.length > 0) setProfileId((current) => current || profileList.profiles[0].id);
+       setHarness(harnesses.harnesses.find((entry) => entry.id === "swarm") ?? harnesses.harnesses[0] ?? null);
+       const items = (library as { items?: InstalledSkill[] }).items ?? [];
+       setSkills(items.filter((item) => item.kind === "skill"));
+@@ -149,7 +160,7 @@ export function AgentStudio({
+     setBusy(true);
+     setRunId(null);
+     try {
+-      const result = await agentsApi.deploy(manifest.id, "swarm");
++      const result = await agentsApi.deploy(manifest.id, { harness: "swarm", ...(profileId ? { profile: profileId } : {}) });
+       setRunId(result.runId);
+       setCompat(result.report);
+       setNotice(`Deployed as run ${result.runId}.`);
+@@ -176,6 +187,20 @@ export function AgentStudio({
+       <div className="flex items-center gap-2 border-b border-white/[0.07] px-3 py-2">
+         <h2 className="text-[13px] font-semibold">{agentId ? "Edit agent" : "New agent"}</h2>
+         <span className="flex-1" />
++        <label className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-zinc-500">
++          Profile
++          <select
++            className="rounded-md border border-white/10 bg-black/30 px-1.5 py-0.5 text-[11px] normal-case tracking-normal text-zinc-200"
++            value={profileId}
++            onChange={(e) => setProfileId(e.target.value)}
++            aria-label="Deployment profile"
++          >
++            <option value="">none</option>
++            {profiles.map((profile) => (
++              <option key={profile.id} value={profile.id}>{profile.name}</option>
++            ))}
++          </select>
++        </label>
+         {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin text-zinc-500" aria-hidden /> : null}
+         <button
+           type="button"
+diff --git a/apps/swarmagents/templates/agents/pr-reviewer.json b/apps/swarmagents/templates/agents/pr-reviewer.json
+new file mode 100644
+index 000000000..726ef6d90
+--- /dev/null
++++ b/apps/swarmagents/templates/agents/pr-reviewer.json
+@@ -0,0 +1,27 @@
++{
++  "version": 1,
++  "id": "pr-reviewer",
++  "name": "PR reviewer",
++  "description": "Reviews a diff for correctness, missing tests and risky changes, and writes review comments in priority order.",
++  "identity": {
++    "systemPrompt": "You are a code reviewer. Read the diff and the surrounding code before commenting. Report findings in priority order: correctness bugs first, then missing or wrong tests, then risk (data, permissions, concurrency, compatibility), then style. For every finding give the file and the line, what is wrong, and what you would change. Say explicitly when you found nothing in a category. Do not rewrite the code unless asked.",
++    "tone": "direct, specific, no praise padding"
++  },
++  "models": { "preferred": "claude-opus-4-1", "fallbacks": ["claude-sonnet-4-5"] },
++  "tools": ["Read", "Grep", "Bash"],
++  "mcp": [],
++  "connectors": [],
++  "context": [],
++  "memory": { "policy": "session", "maxEntries": 50 },
++  "skills": [],
++  "workflows": [],
++  "policies": { "maxTurns": 60, "maxCostUsd": 3 },
++  "permissions": { "allowTools": [], "denyTools": ["Write", "Edit"], "approvalRequired": true },
++  "subagents": [
++    {
++      "name": "test-gap-finder",
++      "instructions": "Find behaviour changed by the diff that no test exercises. Report the behaviour, the file, and the test that is missing.",
++      "tools": ["Read", "Grep"]
++    }
++  ]
++}
+diff --git a/apps/swarmagents/templates/agents/release-notes.json b/apps/swarmagents/templates/agents/release-notes.json
+new file mode 100644
+index 000000000..03c51f810
+--- /dev/null
++++ b/apps/swarmagents/templates/agents/release-notes.json
+@@ -0,0 +1,21 @@
++{
++  "version": 1,
++  "id": "release-notes",
++  "name": "Release notes writer",
++  "description": "Turns a commit range into user-facing release notes grouped by what changed for the user, not by file.",
++  "identity": {
++    "systemPrompt": "You write release notes. Read the commits and the touched code for the range you are given. Group the changes by what a user would notice: new capability, behaviour change, fix, internal. Write one sentence per item in the present tense, name the user-visible effect, and never invent a change that is not in the range. Leave out pure refactors unless they change behaviour.",
++    "tone": "plain, concrete, no marketing"
++  },
++  "models": { "preferred": "gpt-4.1", "fallbacks": ["claude-sonnet-4-5"] },
++  "tools": ["Read", "Grep", "Bash"],
++  "mcp": [],
++  "connectors": [],
++  "context": [],
++  "memory": { "policy": "none" },
++  "skills": [],
++  "workflows": [],
++  "policies": { "maxTurns": 25, "maxCostUsd": 1 },
++  "permissions": { "allowTools": [], "denyTools": ["Write", "Edit"], "approvalRequired": false },
++  "subagents": []
++}
+diff --git a/apps/swarmagents/templates/agents/triage-bot.json b/apps/swarmagents/templates/agents/triage-bot.json
+new file mode 100644
+index 000000000..234629a11
+--- /dev/null
++++ b/apps/swarmagents/templates/agents/triage-bot.json
+@@ -0,0 +1,21 @@
++{
++  "version": 1,
++  "id": "triage-bot",
++  "name": "Triage bot",
++  "description": "Reads incoming issues, groups them by area and owner, and writes a routing summary. Read-only by default; it never edits code.",
++  "identity": {
++    "systemPrompt": "You are a triage agent. Read the issues you are given, group them by repository area and likely owner, and produce a short routing summary: one line per issue with the area, the owner, and the reason. Never modify files. If an issue is missing information you need to route it, say exactly what is missing instead of guessing.",
++    "tone": "terse, factual, no filler"
++  },
++  "models": { "preferred": "claude-sonnet-4-5", "fallbacks": ["gpt-4.1", "gemini-2.5-pro"] },
++  "tools": ["Read", "Grep"],
++  "mcp": [],
++  "connectors": [],
++  "context": [],
++  "memory": { "policy": "none" },
++  "skills": [],
++  "workflows": [],
++  "policies": { "maxTurns": 30, "maxCostUsd": 1 },
++  "permissions": { "allowTools": [], "denyTools": ["Write", "Edit", "Bash"], "approvalRequired": false },
++  "subagents": []
++}
+-- 
+2.55.0
+

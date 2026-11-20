@@ -1,0 +1,64 @@
+From c06e9600c28618ae8a55a055e36056e7ca2bef13 Mon Sep 17 00:00:00 2001
+From: yaeger42 <jyaeger@hawk.iit.edu>
+Date: Wed, 18 Nov 2026 11:41:41 -0600
+Subject: [PATCH] fix(swarmagents): serialize conversation writes
+
+---
+ apps/swarmagents/lib/board-agent/store.ts | 33 ++++++++++++++++++-----
+ 1 file changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/apps/swarmagents/lib/board-agent/store.ts b/apps/swarmagents/lib/board-agent/store.ts
+index 37258eb80..b87a2d9d4 100644
+--- a/apps/swarmagents/lib/board-agent/store.ts
++++ b/apps/swarmagents/lib/board-agent/store.ts
+@@ -5,8 +5,7 @@ import { resolveStorageDir } from "../board/store";
+ import type { BoardAgentConversation } from "./types";
+ 
+ function safeUserId(userId: string): string {
+-  const cleaned = userId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 128);
+-  return cleaned.length > 0 ? cleaned : "user";
++  return Buffer.from(userId, "utf8").toString("base64url") || "user";
+ }
+ 
+ export function conversationFile(userId: string): string {
+@@ -40,12 +39,32 @@ export function loadConversations(userId: string): BoardAgentConversation[] {
+   }
+ }
+ 
++const userLocks = new Map<string, Promise<void>>();
++
++async function withUserLock<T>(userId: string, work: () => Promise<T>): Promise<T> {
++  const previous = userLocks.get(userId) ?? Promise.resolve();
++  let release!: () => void;
++  const current = new Promise<void>((resolve) => { release = resolve; });
++  userLocks.set(userId, current);
++  await previous;
++  try {
++    return await work();
++  } finally {
++    release();
++    if (userLocks.get(userId) === current) userLocks.delete(userId);
++  }
++}
++
+ export async function saveConversation(userId: string, conv: BoardAgentConversation): Promise<void> {
+-  const all = loadConversations(userId).filter((row) => row.id !== conv.id);
+-  all.push({ ...conv, userId });
+-  const file = conversationFile(userId);
+-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+-  await atomicWriteFileAsync(file, JSON.stringify(all), { mode: 0o600 });
++  if (conv.userId !== userId) throw new Error("Conversation owner mismatch.");
++  await withUserLock(userId, async () => {
++    const all = loadConversations(userId).filter((row) => row.id !== conv.id);
++    all.push(conv);
++    const file = conversationFile(userId);
++    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
++    fs.chmodSync(path.dirname(file), 0o700);
++    await atomicWriteFileAsync(file, JSON.stringify(all), { mode: 0o600 });
++  });
+ }
+ 
+ export function getConversation(userId: string, id: string): BoardAgentConversation | null {
+-- 
+2.55.0
+

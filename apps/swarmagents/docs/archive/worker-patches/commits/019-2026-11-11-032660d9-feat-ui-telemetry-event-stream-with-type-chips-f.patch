@@ -1,0 +1,182 @@
+From 032660d9ede0e75c2b119eac1f05ec624d84e88d Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 13:28:18 -0600
+Subject: [PATCH] feat(ui): telemetry event stream with type chips, filters and
+ expandable JSON
+
+---
+ .../src/components/Telemetry.tsx              | 139 +++++++++++++++++-
+ 1 file changed, 138 insertions(+), 1 deletion(-)
+
+diff --git a/apps/swarmagents/minimalist-ui/src/components/Telemetry.tsx b/apps/swarmagents/minimalist-ui/src/components/Telemetry.tsx
+index b7af3484e..ad0ccbb20 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/Telemetry.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/Telemetry.tsx
+@@ -1,5 +1,5 @@
+ import { useEffect, useState, type ReactNode } from 'react';
+-import { X } from 'lucide-react';
++import { ChevronDown, X } from 'lucide-react';
+ import type { ActiveRole, Attachment } from '../data';
+ import type { AgentState, LogEvent } from '../engine';
+ import { RoleIcon } from './RoleIcon';
+@@ -16,6 +16,56 @@ const summarize = (v: unknown) => {
+   return text.length > 280 ? `${text.slice(0, 280)}…` : text;
+ };
+ 
++const isRecord = (v: unknown): v is Record<string, unknown> =>
++  typeof v === 'object' && v !== null && !Array.isArray(v);
++
++/** Event-type chip groups shown as filters over the raw run stream. */
++type EventGroup = 'run' | 'vm' | 'tool' | 'assistant' | 'approval' | 'error';
++const EVENT_GROUPS: EventGroup[] = ['run', 'vm', 'tool', 'assistant', 'approval', 'error'];
++
++const GROUP_STYLE: Record<EventGroup, string> = {
++  run: 'bg-cyan-400/10 text-cyan-300 ring-cyan-400/25',
++  vm: 'bg-emerald-400/10 text-emerald-300 ring-emerald-400/25',
++  tool: 'bg-amber-400/10 text-amber-300 ring-amber-400/25',
++  assistant: 'bg-sky-400/10 text-sky-300 ring-sky-400/25',
++  approval: 'bg-violet-400/10 text-violet-300 ring-violet-400/25',
++  error: 'bg-rose-400/10 text-rose-300 ring-rose-400/25',
++};
++
++/** Map a stream event kind onto its filter chip (run/vm/tool/assistant/approval/error). */
++const classifyEvent = (kind: string): EventGroup => {
++  if (kind.startsWith('vm.')) return kind === 'vm.error' ? 'error' : 'vm';
++  if (kind.startsWith('run.')) return kind === 'run.error' ? 'error' : 'run';
++  if (kind.startsWith('tool.')) return 'tool';
++  if (kind.startsWith('assistant.')) return 'assistant';
++  if (kind.startsWith('approval.')) return 'approval';
++  return 'run';
++};
++
++/** One-line human summary for an event row, derived from its payload. */
++const eventSummary = (data: unknown): string => {
++  if (!isRecord(data)) return typeof data === 'string' ? summarize(data) : '';
++  const parts: string[] = [];
++  for (const key of ['name', 'model', 'message', 'text', 'action', 'tool', 'verdict', 'reason']) {
++    if (typeof data[key] === 'string') parts.push(data[key] as string);
++  }
++  if (typeof data.inputTokens === 'number' || typeof data.outputTokens === 'number') {
++    parts.push(`${String(data.inputTokens ?? 0)} in / ${String(data.outputTokens ?? 0)} out`);
++  }
++  if (typeof data.exitCode === 'number') parts.push(`exit ${data.exitCode}`);
++  if (typeof data.durationMs === 'number') parts.push(fmt(data.durationMs));
++  return summarize(parts.join(' · '));
++};
++
++/** Relative wall-clock offset, e.g. "+0.4s" / "+2m05s". */
++const relTime = (ts: number, base: number) => {
++  const ms = Math.max(0, ts - base);
++  if (ms < 1000) return `+${Math.round(ms)}ms`;
++  const s = ms / 1000;
++  if (s < 60) return `+${s.toFixed(1)}s`;
++  return `+${Math.floor(s / 60)}m${String(Math.round(s % 60)).padStart(2, '0')}s`;
++};
++
+ function useNow(active: boolean) {
+   const [now, setNow] = useState(performance.now());
+   useEffect(() => {
+@@ -251,6 +301,31 @@ function RealTimeTelemetry({
+   const elapsed = summary.durationMs ?? (now - (summary.startedAt ?? now));
+   const openEntry = tools.find((t) => t.id === openTool);
+ 
++  // Event-type filter chips (local UI state) + per-row expandable JSON.
++  const [hiddenGroups, setHiddenGroups] = useState<Set<EventGroup>>(new Set());
++  const [expanded, setExpanded] = useState<Set<number>>(new Set());
++  const toggleGroup = (g: EventGroup) =>
++    setHiddenGroups((prev) => {
++      const next = new Set(prev);
++      if (next.has(g)) next.delete(g);
++      else next.add(g);
++      return next;
++    });
++  const toggleExpanded = (seq: number) =>
++    setExpanded((prev) => {
++      const next = new Set(prev);
++      if (next.has(seq)) next.delete(seq);
++      else next.add(seq);
++      return next;
++    });
++  const eventRows = items.map((it) => ({ it, group: classifyEvent(it.kind) }));
++  const visibleEvents = eventRows.filter((e) => !hiddenGroups.has(e.group));
++  const counts = EVENT_GROUPS.reduce<Record<string, number>>((acc, g) => {
++    acc[g] = eventRows.filter((e) => e.group === g).length;
++    return acc;
++  }, {});
++  const baseTs = items[0]?.ts ?? Date.now();
++
+   return (
+     <div className="w-full">
+       {/* prompt + run stats */}
+@@ -326,6 +401,68 @@ function RealTimeTelemetry({
+               )}
+             </div>
+           </div>
++
++          {/* raw event stream: type chips + filter row + expandable JSON details */}
++          <div className="mt-5">
++            <div className="mb-2 flex flex-wrap items-center gap-2">
++              <span className="text-[11px] uppercase tracking-[0.2em] text-white/35">Events</span>
++              {EVENT_GROUPS.map((g) => (
++                <button
++                  key={g}
++                  data-testid={`telemetry-filter-${g}`}
++                  aria-pressed={!hiddenGroups.has(g)}
++                  onClick={() => toggleGroup(g)}
++                  title={hiddenGroups.has(g) ? `show ${g} events` : `hide ${g} events`}
++                  className={`rounded-full px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-wide ring-1 transition ${
++                    hiddenGroups.has(g)
++                      ? 'bg-transparent text-white/30 ring-white/10 hover:text-white/50'
++                      : `ring-inset hover:brightness-125 ${GROUP_STYLE[g]}`
++                  }`}
++                >
++                  {g}
++                  {counts[g] > 0 && <span className="ml-1 opacity-60">{counts[g]}</span>}
++                </button>
++              ))}
++            </div>
++
++            {visibleEvents.length === 0 ? (
++              <div className="glass-soft rounded-2xl p-8 text-center font-mono text-xs text-white/35">
++                {items.length === 0 ? 'awaiting run stream…' : 'no events match the current filters'}
++              </div>
++            ) : (
++              <div className="space-y-1.5">
++                {visibleEvents.slice().reverse().map(({ it, group }) => {
++                  const isOpen = expanded.has(it.seq);
++                  const json = typeof it.data === 'string' ? it.data : JSON.stringify(it.data, null, 2) ?? '';
++                  return (
++                    <button
++                      key={it.seq}
++                      data-testid="telemetry-event-row"
++                      onClick={() => toggleExpanded(it.seq)}
++                      className="glass-soft w-full rounded-xl px-3 py-2 text-left transition hover:bg-white/[0.07]"
++                    >
++                      <div className="flex items-center gap-2.5">
++                        <span className={`shrink-0 rounded-full px-2 py-0.5 font-mono text-[9px] uppercase tracking-wide ring-1 ring-inset ${GROUP_STYLE[group]}`}>
++                          {group}
++                        </span>
++                        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-white/70">{it.kind}</span>
++                        <span className="hidden shrink-0 font-mono text-[10px] text-white/30 sm:block">{relTime(it.ts, baseTs)}</span>
++                        <ChevronDown className={`h-3 w-3 shrink-0 text-white/30 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
++                      </div>
++                      {!isOpen && eventSummary(it.data) && (
++                        <div className="mt-1 truncate font-mono text-[10px] text-white/35">{eventSummary(it.data)}</div>
++                      )}
++                      {isOpen && (
++                        <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-white/10 bg-black/40 p-2 text-left font-mono text-[10.5px] leading-relaxed text-white/70">
++                          {json || '(no payload)'}
++                        </pre>
++                      )}
++                    </button>
++                  );
++                })}
++              </div>
++            )}
++          </div>
+         </>
+       )}
+ 
+-- 
+2.55.0
+

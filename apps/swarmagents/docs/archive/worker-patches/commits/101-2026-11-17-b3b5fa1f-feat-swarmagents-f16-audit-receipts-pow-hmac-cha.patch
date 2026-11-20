@@ -1,0 +1,2093 @@
+From b3b5fa1f29444e41e8c0a7c97c6947b52eec065d Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Tue, 17 Nov 2026 08:29:44 -0600
+Subject: [PATCH] =?UTF-8?q?feat(swarmagents):=20F16=20audit=20receipts=20?=
+ =?UTF-8?q?=E2=80=94=20PoW=20HMAC=20chain,=20entry=20extractors,=20wiring?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../runtime/runs/[id]/report/receipt/route.ts |  30 ++
+ .../runs/[id]/report/receipt/verify/route.ts  |  45 ++
+ .../lib/runtime/receipt-entries.test.ts       | 359 +++++++++++++
+ .../lib/runtime/receipt-entries.ts            | 265 ++++++++++
+ .../lib/runtime/receipt-wiring.test.ts        | 475 ++++++++++++++++++
+ .../lib/runtime/report-route-auth.ts          |  41 ++
+ .../lib/runtime/run-receipt.test.ts           | 187 +++++++
+ apps/swarmagents/lib/runtime/run-receipt.ts   | 242 +++++++++
+ .../lib/runtime/run-report-types.ts           |  24 +
+ apps/swarmagents/lib/runtime/run-report.ts    |  41 ++
+ apps/swarmagents/lib/runtime/run-reporter.ts  |  89 +++-
+ .../src/components/RunReportCard.tsx          |  92 ++++
+ 12 files changed, 1888 insertions(+), 2 deletions(-)
+ create mode 100644 apps/swarmagents/app/api/runtime/runs/[id]/report/receipt/route.ts
+ create mode 100644 apps/swarmagents/app/api/runtime/runs/[id]/report/receipt/verify/route.ts
+ create mode 100644 apps/swarmagents/lib/runtime/receipt-entries.test.ts
+ create mode 100644 apps/swarmagents/lib/runtime/receipt-entries.ts
+ create mode 100644 apps/swarmagents/lib/runtime/receipt-wiring.test.ts
+ create mode 100644 apps/swarmagents/lib/runtime/report-route-auth.ts
+ create mode 100644 apps/swarmagents/lib/runtime/run-receipt.test.ts
+ create mode 100644 apps/swarmagents/lib/runtime/run-receipt.ts
+
+diff --git a/apps/swarmagents/app/api/runtime/runs/[id]/report/receipt/route.ts b/apps/swarmagents/app/api/runtime/runs/[id]/report/receipt/route.ts
+new file mode 100644
+index 000000000..2c3de18b6
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/runs/[id]/report/receipt/route.ts
+@@ -0,0 +1,30 @@
++/**
++ * Exportable audit receipt for a run's report (owner-only).
++ *
++ * GET /api/runtime/runs/<id>/report/receipt -> RunReceipt | 404
++ *
++ * Returns the receipt exactly as stored in the run's `report.json` (the
++ * hash chain + signature). Only the run's owner can read it. A run whose
++ * report has no receipt (written before receipts existed, or receipt
++ * build failed at finalize time) answers 404.
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { isValidRunId, loadOwnedReport, reportCaller } from "../../../../../../../lib/runtime/report-route-auth";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
++  const user = reportCaller(req);
++  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
++
++  const { id } = await ctx.params;
++  if (!isValidRunId(id)) return NextResponse.json({ error: "invalid runId" }, { status: 400 });
++
++  const report = loadOwnedReport(id, user);
++  if (!report) return NextResponse.json({ error: "Run report not found." }, { status: 404 });
++  if (!report.receipt) return NextResponse.json({ error: "Run receipt not found." }, { status: 404 });
++
++  return NextResponse.json(report.receipt);
++}
+diff --git a/apps/swarmagents/app/api/runtime/runs/[id]/report/receipt/verify/route.ts b/apps/swarmagents/app/api/runtime/runs/[id]/report/receipt/verify/route.ts
+new file mode 100644
+index 000000000..fd11254db
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/runs/[id]/report/receipt/verify/route.ts
+@@ -0,0 +1,45 @@
++/**
++ * Re-verify a run's audit receipt (owner-only).
++ *
++ * POST /api/runtime/runs/<id>/report/receipt/verify
++ *   -> { ok: true } | { ok: false, failedLink?, reason? }
++ *
++ * Re-checks the stored receipt's hash chain and HMAC signature via
++ * `verifyReceipt` and reports exactly which link fails, if any. With an
++ * optional JSON body `{ receipt }`, verifies that exported bundle instead
++ * of the stored one (same owner check applies). Never throws: a malformed
++ * receipt or body is simply "not verified".
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { isValidRunId, loadOwnedReport, reportCaller } from "../../../../../../../../lib/runtime/report-route-auth";
++import { verifyReceipt } from "../../../../../../../../lib/runtime/run-receipt";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
++  const user = reportCaller(req);
++  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
++
++  const { id } = await ctx.params;
++  if (!isValidRunId(id)) return NextResponse.json({ error: "invalid runId" }, { status: 400 });
++
++  const report = loadOwnedReport(id, user);
++  if (!report) return NextResponse.json({ error: "Run report not found." }, { status: 404 });
++  if (!report.receipt) return NextResponse.json({ error: "Run receipt not found." }, { status: 404 });
++
++  // An exported bundle may be supplied for verification; otherwise the
++  // stored receipt is re-checked. A malformed body falls back to stored.
++  let candidate: unknown = report.receipt;
++  try {
++    const body: unknown = await req.json();
++    if (body && typeof body === "object" && "receipt" in body) {
++      candidate = (body as Record<string, unknown>).receipt;
++    }
++  } catch {
++    // Empty / non-JSON body: verify the stored receipt.
++  }
++
++  return NextResponse.json(verifyReceipt(candidate));
++}
+diff --git a/apps/swarmagents/lib/runtime/receipt-entries.test.ts b/apps/swarmagents/lib/runtime/receipt-entries.test.ts
+new file mode 100644
+index 000000000..3aec9290e
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/receipt-entries.test.ts
+@@ -0,0 +1,359 @@
++/**
++ * F16 — receipt chain entry extractors: approval pairing, per-attempt
++ * attestations, redacted + capped command logs, prompt hashing, and an
++ * end-to-end chain/sign/verify pass with a tamper that names its link.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { sha256Hex } from "../library/proof";
++import { makeRedactor } from "../harness/redact";
++import type { SequencedEvent } from "../telemetry/bus";
++import { RECEIPT_FORMAT, buildReceiptChain, signReceipt, verifyReceipt } from "./run-receipt";
++import {
++  COMMAND_TRUNCATION_MARKER,
++  MAX_COMMAND_TEXT_CHARS,
++  extractApprovalEntries,
++  extractAttestationEntries,
++  extractCommandLogEntries,
++  promptEntry,
++} from "./receipt-entries";
++
++function ev(overrides: Record<string, unknown>): SequencedEvent {
++  return { runId: "run_receipt_entries_1", seq: 1, ts: 1_000, ...overrides } as unknown as SequencedEvent;
++}
++
++function approvalRequired(seq: number, ts: number, approval: Record<string, unknown>) {
++  return ev({ type: "approval.required", seq, ts, approval });
++}
++
++function approvalRequested(seq: number, ts: number, approval: Record<string, unknown>) {
++  return ev({ type: "approval.requested", seq, ts, approval });
++}
++
++function approvalResolved(seq: number, ts: number, id: string, verdict: string) {
++  return ev({ type: "approval.resolved", seq, ts, id, verdict });
++}
++
++function llmCall(
++  seq: number,
++  ts: number,
++  data: Record<string, unknown>,
++): SequencedEvent {
++  return ev({ type: "llm.call", seq, ts, data });
++}
++
++const TEST_SECRET = "test-receipt-secret";
++
++/** A secret-shaped token: `sk-` + 24 chars matches SECRET_PATTERNS. */
++const PLANTED_TOKEN = `sk-${"A".repeat(24)}`;
++
++// --- approvals --------------------------------------------------------------
++
++test("approval pairing: required + resolved yields one entry with both", () => {
++  const events = [
++    approvalRequired(2, 2_000, { id: "a1", tool: "Bash", riskLevel: "ask" }),
++    approvalResolved(5, 5_000, "a1", "approved"),
++  ];
++  const entries = extractApprovalEntries(events);
++  assert.equal(entries.length, 1);
++  assert.deepEqual(entries[0], {
++    kind: "approval",
++    seq: 2,
++    ts: 2_000,
++    riskLevel: "ask",
++    verdict: "approved",
++    tool: "Bash",
++    resolvedAt: 5_000,
++  });
++});
++
++test("approval pairing: requested + required for one approval collapse to one entry", () => {
++  const events = [
++    approvalRequested(2, 2_000, { id: "a1", tool: "Bash", riskLevel: "ask" }),
++    approvalRequired(3, 2_001, { id: "a1", tool: "Bash", riskLevel: "ask" }),
++    approvalResolved(5, 5_000, "a1", "denied"),
++  ];
++  const entries = extractApprovalEntries(events);
++  assert.equal(entries.length, 1);
++  assert.equal(entries[0]?.seq, 2);
++  assert.equal((entries[0] as Record<string, unknown>).verdict, "denied");
++});
++
++test("approval pairing: timeout before an expired resolution is an auto-deny entry", () => {
++  const events = [
++    approvalRequired(2, 2_000, { id: "a1", tool: "Bash", riskLevel: "ask" }),
++    ev({ type: "approval.timeout", seq: 4, ts: 4_000, id: "a1", tool: "Bash" }),
++    approvalResolved(5, 5_000, "a1", "expired"),
++  ];
++  const entries = extractApprovalEntries(events);
++  assert.equal(entries.length, 1);
++  assert.deepEqual(entries[0], {
++    kind: "approval",
++    seq: 2,
++    ts: 2_000,
++    riskLevel: "ask",
++    verdict: "expired",
++    tool: "Bash",
++    resolvedAt: 5_000,
++    timeout: true,
++  });
++});
++
++test("approval pairing: an unresolved approval is pending, never a guessed verdict", () => {
++  const events = [
++    approvalRequired(2, 2_000, { id: "a1", tool: "Bash", riskLevel: "ask" }),
++  ];
++  const entries = extractApprovalEntries(events);
++  assert.equal(entries.length, 1);
++  assert.deepEqual(entries[0], {
++    kind: "approval",
++    seq: 2,
++    ts: 2_000,
++    riskLevel: "ask",
++    verdict: "pending",
++    tool: "Bash",
++  });
++});
++
++test("approval pairing: multiple approvals stay separate and in first-seen order", () => {
++  const events = [
++    approvalRequired(2, 2_000, { id: "a1", tool: "Bash", riskLevel: "ask" }),
++    approvalRequired(3, 3_000, { id: "a2", tool: "Read", riskLevel: "ask" }),
++    approvalResolved(4, 4_000, "a2", "approved"),
++  ];
++  const entries = extractApprovalEntries(events);
++  assert.equal(entries.length, 2);
++  assert.equal((entries[0] as Record<string, unknown>).verdict, "pending");
++  assert.equal((entries[1] as Record<string, unknown>).verdict, "approved");
++  assert.equal((entries[1] as Record<string, unknown>).tool, "Read");
++});
++
++// --- attestations -----------------------------------------------------------
++
++test("attestations: failover retries emit one entry per attempt", () => {
++  const events = [
++    llmCall(2, 2_000, {
++      provider: "nvidia",
++      model: "nemotron-3.5-lightning-30b-a3b",
++      attempt: 1,
++      outcome: "429",
++      latencyMs: 120,
++      costUsd: null,
++    }),
++    llmCall(3, 3_000, {
++      provider: "nvidia",
++      model: "nemotron-3.5-lightning-30b-a3b",
++      attempt: 2,
++      outcome: "ok",
++      latencyMs: 850,
++      inputTokens: 100,
++      outputTokens: 50,
++      costUsd: 0.001,
++    }),
++  ];
++  const entries = extractAttestationEntries(events);
++  assert.equal(entries.length, 2);
++  assert.deepEqual(entries[0], {
++    kind: "attestation",
++    seq: 2,
++    ts: 2_000,
++    provider: "nvidia",
++    model: "nemotron-3.5-lightning-30b-a3b",
++    attempt: 1,
++    outcome: "429",
++    latencyMs: 120,
++  });
++  assert.deepEqual(entries[1], {
++    kind: "attestation",
++    seq: 3,
++    ts: 3_000,
++    provider: "nvidia",
++    model: "nemotron-3.5-lightning-30b-a3b",
++    attempt: 2,
++    outcome: "ok",
++    latencyMs: 850,
++    inputTokens: 100,
++    outputTokens: 50,
++    costUsd: 0.001,
++  });
++});
++
++test("attestations: lens calls are excluded; a lens-only run gets the host-env note", () => {
++  const events = [
++    llmCall(2, 2_000, {
++      provider: "anthropic",
++      model: "claude-sonnet-5-5",
++      attempt: 1,
++      outcome: "ok",
++      latencyMs: 400,
++      source: "lens",
++      lens: "summary",
++      costUsd: 0.002,
++    }),
++  ];
++  const entries = extractAttestationEntries(events);
++  assert.deepEqual(entries, [
++    { kind: "note", note: "no-per-call-attestations", reason: "host-env-run" },
++  ]);
++});
++
++test("attestations: zero llm.call events emit exactly one host-env note", () => {
++  const entries = extractAttestationEntries([
++    ev({ type: "run.started", seq: 1, ts: 1_000 }),
++    ev({ type: "run.finished", seq: 9, ts: 9_000 }),
++  ]);
++  assert.deepEqual(entries, [
++    { kind: "note", note: "no-per-call-attestations", reason: "host-env-run" },
++  ]);
++});
++
++// --- command logs -----------------------------------------------------------
++
++test("command logs: a planted sk- token never appears; [REDACTED] does", () => {
++  const redact = makeRedactor();
++  const events = [
++    ev({ type: "shell.cmd", seq: 2, ts: 2_000, data: { command: "echo hello", argv: ["echo", "hello"] } }),
++    ev({
++      type: "shell.output",
++      seq: 3,
++      ts: 3_000,
++      data: { stream: "stdout", text: `key is ${PLANTED_TOKEN} do not leak` },
++    }),
++    ev({
++      type: "shell.output",
++      seq: 4,
++      ts: 4_000,
++      data: { stream: "stderr", text: "clean line" },
++    }),
++  ];
++  const entries = extractCommandLogEntries(events, redact);
++  assert.equal(entries.length, 3);
++  const texts = entries.map((entry) => (entry as Record<string, unknown>).text as string);
++  for (const text of texts) assert.ok(!text.includes(PLANTED_TOKEN), "planted token leaked");
++  assert.ok(
++    texts.some((text) => text.includes("[REDACTED]")),
++    "expected a [REDACTED] marker in the redacted output",
++  );
++  assert.equal((entries[0] as Record<string, unknown>).stream, "cmd");
++  assert.equal((entries[1] as Record<string, unknown>).stream, "output");
++});
++
++test("command logs: env-carried secrets are redacted by literal value", () => {
++  const envSecret = "hunter2-my-env-secret";
++  const redact = makeRedactor({ MY_API_KEY: envSecret });
++  const events = [
++    ev({
++      type: "shell.output",
++      seq: 2,
++      ts: 2_000,
++      data: { stream: "stdout", text: `token=${envSecret} end` },
++    }),
++  ];
++  const entries = extractCommandLogEntries(events, redact);
++  assert.equal(entries.length, 1);
++  const text = (entries[0] as Record<string, unknown>).text as string;
++  assert.ok(!text.includes(envSecret), "env secret leaked");
++  assert.ok(text.includes("[REDACTED]"));
++});
++
++test("command logs: long output is truncated at the cap with a marker", () => {
++  const redact = makeRedactor();
++  const longText = "x".repeat(MAX_COMMAND_TEXT_CHARS + 500);
++  const events = [
++    ev({ type: "shell.output", seq: 2, ts: 2_000, data: { stream: "stdout", text: longText } }),
++  ];
++  const entries = extractCommandLogEntries(events, redact);
++  assert.equal(entries.length, 1);
++  const text = (entries[0] as Record<string, unknown>).text as string;
++  assert.equal(text.length, MAX_COMMAND_TEXT_CHARS + COMMAND_TRUNCATION_MARKER.length);
++  assert.ok(text.endsWith(COMMAND_TRUNCATION_MARKER));
++});
++
++test("command logs: empty lines are skipped", () => {
++  const redact = makeRedactor();
++  const events = [
++    ev({ type: "shell.output", seq: 2, ts: 2_000, data: { stream: "stdout", text: "" } }),
++    ev({ type: "shell.cmd", seq: 3, ts: 3_000, data: { command: "ls", argv: ["ls"] } }),
++  ];
++  const entries = extractCommandLogEntries(events, redact);
++  assert.equal(entries.length, 1);
++  assert.equal((entries[0] as Record<string, unknown>).stream, "cmd");
++});
++
++// --- prompt -----------------------------------------------------------------
++
++test("prompt entry hashes the run prompt", () => {
++  const prompt = "Deploy the thing";
++  assert.deepEqual(promptEntry(prompt), { kind: "prompt", sha256: sha256Hex(prompt) });
++});
++
++// --- end to end -------------------------------------------------------------
++
++/** A realistic fixture log: prompt, one approval, a failover pair, shell lines. */
++function fixtureEvents(): SequencedEvent[] {
++  return [
++    ev({ type: "run.started", seq: 1, ts: 1_000, provider: "nvidia" }),
++    approvalRequested(2, 2_000, { id: "a1", tool: "Bash", riskLevel: "ask" }),
++    approvalRequired(3, 2_001, { id: "a1", tool: "Bash", riskLevel: "ask" }),
++    approvalResolved(4, 4_000, "a1", "approved"),
++    llmCall(5, 5_000, {
++      provider: "nvidia",
++      model: "nemotron-3.5-lightning-30b-a3b",
++      attempt: 1,
++      outcome: "429",
++      latencyMs: 120,
++      costUsd: null,
++    }),
++    llmCall(6, 6_000, {
++      provider: "nvidia",
++      model: "nemotron-3.5-lightning-30b-a3b",
++      attempt: 2,
++      outcome: "ok",
++      latencyMs: 850,
++      inputTokens: 100,
++      outputTokens: 50,
++      costUsd: 0.001,
++    }),
++    ev({ type: "shell.cmd", seq: 7, ts: 7_000, data: { command: "npm test", argv: ["npm", "test"] } }),
++    ev({
++      type: "shell.output",
++      seq: 8,
++      ts: 8_000,
++      data: { stream: "stdout", text: `leaked ${PLANTED_TOKEN} here` },
++    }),
++  ];
++}
++
++test("end to end: entries chain, sign, and verify; tampering names the link", () => {
++  const redact = makeRedactor();
++  const events = fixtureEvents();
++  const entries = [
++    promptEntry("Deploy the thing"),
++    ...extractApprovalEntries(events),
++    ...extractAttestationEntries(events),
++    ...extractCommandLogEntries(events, redact),
++  ];
++  // prompt + 1 approval + 2 attestations + 2 command lines.
++  assert.equal(entries.length, 6);
++
++  const { links, head } = buildReceiptChain(entries);
++  const receipt = signReceipt(
++    { format: RECEIPT_FORMAT, runId: "run_receipt_entries_1", createdAt: 9_000, head, links },
++    TEST_SECRET,
++  );
++  assert.deepEqual(verifyReceipt(receipt, TEST_SECRET), { ok: true });
++
++  // The planted token must not survive into the signed receipt either.
++  assert.ok(!JSON.stringify(receipt).includes(PLANTED_TOKEN), "planted token in receipt");
++
++  // Tamper the second attestation's outcome (link index 3, "ok" -> "429")
++  // and verify names exactly that link.
++  const tampered = JSON.parse(JSON.stringify(receipt)) as typeof receipt;
++  const tamperedEntry = tampered.links[3]?.entry as Record<string, unknown>;
++  tamperedEntry.outcome = "429";
++  const verdict = verifyReceipt(tampered, TEST_SECRET);
++  assert.equal(verdict.ok, false);
++  assert.equal(verdict.failedLink, 3);
++  assert.equal(verdict.reason, "chain");
++});
+diff --git a/apps/swarmagents/lib/runtime/receipt-entries.ts b/apps/swarmagents/lib/runtime/receipt-entries.ts
+new file mode 100644
+index 000000000..79b722d4a
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/receipt-entries.ts
+@@ -0,0 +1,265 @@
++/**
++ * F16 — receipt chain entry extractors.
++ *
++ * Pure functions that turn a run's persisted telemetry events
++ * (`SequencedEvent[]` from `readRunEvents`, `lib/telemetry/run-log.ts`)
++ * into the `ReceiptChainEntry` values `buildReceiptChain`
++ * (`./run-receipt.ts`) hashes. The extractors never invent evidence:
++ *
++ * - Approvals: only the `"ask"` risk level ever reaches an approval
++ *   (`lib/harness/tool-approval.ts`). `"allow"` proceeds with no approval
++ *   and `"deny"` is blocked with no approval, so neither appears here.
++ *   Each approval is paired by id: `approval.required` /
++ *   `approval.requested` (risk level + tool) with `approval.resolved`
++ *   (human verdict) and `approval.timeout` (auto-deny). An approval
++ *   with no resolution at finalize time is emitted with
++ *   `verdict: "pending"` — never a guessed verdict.
++ * - Attestations: one entry per `llm.call` provider attempt
++ *   (`lib/runtime/llm-gateway.ts`), including failed attempts (failover
++ *   retries stay visible). Lens calls ride the same event type
++ *   (`lib/lenses/run.ts`) and are excluded, exactly as
++ *   `lib/telemetry/usage.ts` excludes them from agent cost.
++ * - Command logs: `shell.cmd` / `shell.output` events. These are
++ *   published UNREDACTED today (`lib/runtime/manager.ts`), so the
++ *   redactor passed in here is load-bearing — no secret that reaches a
++ *   command log may reach the receipt.
++ *
++ * Event shapes differ by emitter: approval events carry their payload
++ * as top-level fields (`approval`, `id`, `verdict`), while `llm.call`
++ * and `shell.*` carry theirs under `data`. The extractors read both
++ * shapes defensively (unknown/malformed payloads are skipped, never
++ * crash the receipt build).
++ */
++
++import { sha256Hex } from "../library/proof";
++import type { SequencedEvent } from "../telemetry/bus";
++import type { ReceiptChainEntry } from "./run-receipt";
++
++/** Max characters of (redacted) text kept in one command entry. */
++export const MAX_COMMAND_TEXT_CHARS = 4000;
++/** Marker appended when a command entry's text was truncated. */
++export const COMMAND_TRUNCATION_MARKER = "\n…[TRUNCATED]";
++
++/** The note entry emitted when a run has no per-call attestations. */
++export const NO_ATTESTATIONS_NOTE = "no-per-call-attestations" as const;
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function asRecord(event: SequencedEvent): Record<string, unknown> {
++  return event as unknown as Record<string, unknown>;
++}
++
++function eventData(event: SequencedEvent): Record<string, unknown> {
++  const data = asRecord(event).data;
++  return isRecord(data) ? data : {};
++}
++
++function str(value: unknown): string | undefined {
++  return typeof value === "string" ? value : undefined;
++}
++
++function num(value: unknown): number | undefined {
++  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
++}
++
++// --- prompt -----------------------------------------------------------------
++
++function promptEntry(prompt: string): ReceiptChainEntry {
++  return { kind: "prompt", sha256: sha256Hex(prompt) };
++}
++
++// --- approvals --------------------------------------------------------------
++
++/** Verdicts an `approval.resolved` event can carry. */
++export type ApprovalVerdict = "approved" | "denied" | "expired" | "pending";
++
++interface ApprovalRecord {
++  /** seq of the first event that mentioned this approval. */
++  seq: number;
++  /** ts of the first event that mentioned this approval. */
++  ts: number;
++  riskLevel: string;
++  tool?: string;
++  verdict?: ApprovalVerdict;
++  resolvedAt?: number;
++  timeout?: boolean;
++}
++
++function isVerdict(value: unknown): value is Exclude<ApprovalVerdict, "pending"> {
++  return value === "approved" || value === "denied" || value === "expired";
++}
++
++/**
++ * One entry per approval in the run, in first-seen order.
++ *
++ * Pairs `approval.required` / `approval.requested` (risk level + tool)
++ * with `approval.resolved` (verdict) and `approval.timeout` (auto-deny)
++ * by approval id. Both `requested` and `required` are emitted for the
++ * same approval — they collapse to a single entry. An approval with no
++ * resolution at finalize time is emitted with `verdict: "pending"`.
++ * A resolution that arrives without a matching required event (e.g. the
++ * log was rotated) still yields an entry, with `riskLevel: "ask"` — the
++ * only level that ever reaches an approval — and the resolution's own
++ * seq/ts.
++ */
++function extractApprovalEntries(events: readonly SequencedEvent[]): ReceiptChainEntry[] {
++  const records = new Map<string, ApprovalRecord>();
++  const order: string[] = [];
++
++  function recordFor(id: string, event: SequencedEvent): ApprovalRecord {
++    let record = records.get(id);
++    if (!record) {
++      record = { seq: event.seq, ts: event.ts, riskLevel: "ask" };
++      records.set(id, record);
++      order.push(id);
++    }
++    return record;
++  }
++
++  for (const event of events) {
++    const fields = asRecord(event);
++    if (event.type === "approval.required" || event.type === "approval.requested") {
++      const approval = isRecord(fields.approval) ? fields.approval : {};
++      const id = str(approval.id) ?? `seq:${event.seq}`;
++      const record = recordFor(id, event);
++      // First required/requested wins for seq/ts; fill in what we know.
++      const riskLevel = str(approval.riskLevel);
++      if (riskLevel) record.riskLevel = riskLevel;
++      const tool = str(approval.tool);
++      if (tool) record.tool = tool;
++      continue;
++    }
++    if (event.type === "approval.resolved") {
++      const id = str(fields.id) ?? `seq:${event.seq}`;
++      const record = recordFor(id, event);
++      // First verdict wins: resolving is idempotent in the store.
++      if (record.verdict === undefined && isVerdict(fields.verdict)) {
++        record.verdict = fields.verdict;
++        record.resolvedAt = event.ts;
++      }
++      continue;
++    }
++    if (event.type === "approval.timeout") {
++      const id = str(fields.id) ?? `seq:${event.seq}`;
++      const record = recordFor(id, event);
++      record.timeout = true;
++      const tool = str(fields.tool);
++      if (tool && !record.tool) record.tool = tool;
++      continue;
++    }
++  }
++
++  return order.map((id) => {
++    const record = records.get(id)!;
++    const entry: Record<string, unknown> = {
++      kind: "approval",
++      seq: record.seq,
++      ts: record.ts,
++      riskLevel: record.riskLevel,
++      verdict: record.verdict ?? "pending",
++    };
++    if (record.tool !== undefined) entry.tool = record.tool;
++    if (record.resolvedAt !== undefined) entry.resolvedAt = record.resolvedAt;
++    if (record.timeout === true) entry.timeout = true;
++    return entry as ReceiptChainEntry;
++  });
++}
++
++// --- attestations -----------------------------------------------------------
++
++/**
++ * One entry per non-lens `llm.call` provider attempt, in event order.
++ * Failed attempts are kept (failover retries stay visible in the chain);
++ * lens calls (`data.source === "lens"`) are excluded. When the run has
++ * no agent `llm.call` events at all — e.g. a host-env fallback run, where
++ * no provider is configured and the gateway is never called — exactly
++ * one note entry is emitted instead; an attestation is never invented.
++ */
++function extractAttestationEntries(events: readonly SequencedEvent[]): ReceiptChainEntry[] {
++  const entries: ReceiptChainEntry[] = [];
++  for (const event of events) {
++    if (event.type !== "llm.call") continue;
++    const data = eventData(event);
++    if (data.source === "lens") continue;
++    const provider = str(data.provider);
++    const model = str(data.model);
++    // Without a provider/model the attempt cannot be attested to.
++    if (!provider || !model) continue;
++    const entry: Record<string, unknown> = {
++      kind: "attestation",
++      seq: event.seq,
++      ts: event.ts,
++      provider,
++      model,
++      attempt: num(data.attempt) ?? 1,
++      outcome: str(data.outcome) ?? "unknown",
++      latencyMs: num(data.latencyMs) ?? 0,
++    };
++    const inputTokens = num(data.inputTokens);
++    if (inputTokens !== undefined) entry.inputTokens = inputTokens;
++    const outputTokens = num(data.outputTokens);
++    if (outputTokens !== undefined) entry.outputTokens = outputTokens;
++    // `costUsd` is `number | null` on the event; null means "unknown",
++    // so only a real number is carried into the chain.
++    const costUsd = num(data.costUsd);
++    if (costUsd !== undefined) entry.costUsd = costUsd;
++    entries.push(entry as ReceiptChainEntry);
++  }
++  if (entries.length === 0) {
++    entries.push({
++      kind: "note",
++      note: NO_ATTESTATIONS_NOTE,
++      reason: "host-env-run",
++    });
++  }
++  return entries;
++}
++
++// --- command logs -----------------------------------------------------------
++
++function truncateCommandText(text: string): string {
++  if (text.length <= MAX_COMMAND_TEXT_CHARS) return text;
++  return text.slice(0, MAX_COMMAND_TEXT_CHARS) + COMMAND_TRUNCATION_MARKER;
++}
++
++/**
++ * One entry per `shell.cmd` / `shell.output` log line, in event order.
++ * Every line is passed through `redact` first (shell logs are published
++ * unredacted today, so this step is what keeps secrets out of the
++ * receipt), then capped at `MAX_COMMAND_TEXT_CHARS` so a huge output
++ * cannot bloat the receipt. Empty lines are skipped.
++ */
++function extractCommandLogEntries(
++  events: readonly SequencedEvent[],
++  redact: (text: string) => string,
++): ReceiptChainEntry[] {
++  const entries: ReceiptChainEntry[] = [];
++  for (const event of events) {
++    const data = eventData(event);
++    let text: string | undefined;
++    let stream: "cmd" | "output";
++    if (event.type === "shell.cmd") {
++      stream = "cmd";
++      text = str(data.command);
++    } else if (event.type === "shell.output") {
++      stream = "output";
++      text = str(data.text);
++    } else {
++      continue;
++    }
++    if (text === undefined) continue;
++    const redacted = truncateCommandText(redact(text));
++    if (redacted.length === 0) continue;
++    entries.push({ kind: "command", seq: event.seq, ts: event.ts, stream, text: redacted });
++  }
++  return entries;
++}
++
++export {
++  extractApprovalEntries,
++  extractAttestationEntries,
++  extractCommandLogEntries,
++  promptEntry,
++};
+diff --git a/apps/swarmagents/lib/runtime/receipt-wiring.test.ts b/apps/swarmagents/lib/runtime/receipt-wiring.test.ts
+new file mode 100644
+index 000000000..241cee210
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/receipt-wiring.test.ts
+@@ -0,0 +1,475 @@
++/**
++ * F16 receipt wiring tests (Worker 3):
++ *   - `hashArtifacts` round-trips content hashes and records a gone or
++ *     over-cap file explicitly as missing (never silently omitted).
++ *   - The reporter attaches a receipt at finalize time: signed when the
++ *     server secret is set, unsigned (`signature: null` + `signingError`)
++ *     when it is not — and the run/report still succeed either way.
++ *   - Command-log secrets never reach the stored receipt (redaction).
++ *   - The receipt routes: GET export + POST verify (pass/fail, exported
++ *     bundle in the body), owner-only auth (401/404).
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++import { TelemetryBus, type SequencedEvent } from "../telemetry/bus";
++import { configureRunsDir } from "../telemetry/paths";
++import { WORKSPACE_ROOT } from "../vm/files";
++import { FakeVmDriver } from "../vm/fake-driver";
++import { VmManager } from "../vm/manager";
++import type { ExecOptions, ExecResult, VmHandle } from "../vm/types";
++import { sha256Hex } from "../library/proof";
++import { assembleReport, hashArtifacts, readRunReport, writeRunReport } from "./run-report";
++import { buildRunReceipt, RunReporter } from "./run-reporter";
++import { verifyReceipt } from "./run-receipt";
++import { GET as GET_RECEIPT } from "../../app/api/runtime/runs/[id]/report/receipt/route";
++import { POST as POST_VERIFY } from "../../app/api/runtime/runs/[id]/report/receipt/verify/route";
++import type { ReportArtifact } from "./run-report-types";
++import type { BrowserControl } from "../browser/manager";
++
++const SECRET = "test-receipt-secret-0123456789abcdef";
++const ARTIFACT_CONTENT = "hello receipt";
++
++/** Fake driver with an overridable /workspace file listing for `find`. */
++class FakeFindDriver extends FakeVmDriver {
++  entries = new Map<string, { size: number; mtimeMs: number }>();
++
++  override async exec(handle: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
++    if (cmd[0] === "find") {
++      const out: string[] = [];
++      for (const [file, entry] of this.entries) {
++        out.push(file, String(entry.size), (entry.mtimeMs / 1000).toFixed(3));
++      }
++      if (out.length > 0) opts?.onStdout?.(`${out.join("\0")}\0`);
++      return { exitCode: 0 };
++    }
++    return super.exec(handle, cmd, opts);
++  }
++}
++
++class StubBrowser implements BrowserControl {
++  async navigate(): Promise<never> {
++    throw new Error("not used");
++  }
++  async screenshot(): Promise<never> {
++    throw new Error("not used");
++  }
++  async getFrame(): Promise<{ frameId: number; jpeg: Buffer; width: number; height: number; capturedAt: number }> {
++    return { frameId: 1, jpeg: Buffer.from([0xff, 0xd8, 0xff, 0xe0]), width: 2, height: 2, capturedAt: Date.now() };
++  }
++  async close(): Promise<void> {}
++}
++
++function tmpDir(): string {
++  return fs.mkdtempSync(path.join(os.tmpdir(), "swarm-receipt-wiring-"));
++}
++
++async function waitFor<T>(fn: () => T | null, timeoutMs = 5000): Promise<T> {
++  const deadline = Date.now() + timeoutMs;
++  for (;;) {
++    const value = fn();
++    if (value !== null && value !== undefined) return value;
++    if (Date.now() > deadline) throw new Error("timed out waiting for condition");
++    await new Promise((resolve) => setTimeout(resolve, 25));
++  }
++}
++
++/** Run `fn` with SWARM_SESSION_SECRET set (or unset), restoring after. */
++async function withSecret<T>(secret: string | undefined, fn: () => Promise<T>): Promise<T> {
++  const prev = process.env.SWARM_SESSION_SECRET;
++  if (secret === undefined) delete process.env.SWARM_SESSION_SECRET;
++  else process.env.SWARM_SESSION_SECRET = secret;
++  try {
++    return await fn();
++  } finally {
++    if (prev === undefined) delete process.env.SWARM_SESSION_SECRET;
++    else process.env.SWARM_SESSION_SECRET = prev;
++  }
++}
++
++function artifact(rel: string, size: number): ReportArtifact {
++  return {
++    path: `${WORKSPACE_ROOT}/${rel}`,
++    rel,
++    size,
++    mtimeMs: 2_000,
++    change: "created",
++  };
++}
++
++// --- hashArtifacts ----------------------------------------------------------
++
++test("hashArtifacts records sha256 + present for readable files", async () => {
++  const driver = new FakeVmDriver();
++  const vm = new VmManager({ customDriver: driver });
++  const handle = await driver.ensure("alice");
++  await driver.writeFile(handle, "/workspace/a.txt", ARTIFACT_CONTENT);
++  const hashed = await hashArtifacts(vm, "alice", [artifact("a.txt", ARTIFACT_CONTENT.length)]);
++  assert.equal(hashed[0]?.sha256, sha256Hex(Buffer.from(ARTIFACT_CONTENT, "utf8")));
++  assert.equal(hashed[0]?.status, "present");
++});
++
++test("hashArtifacts records a file gone between listing and read as missing", async () => {
++  const driver = new FakeVmDriver();
++  const vm = new VmManager({ customDriver: driver });
++  // Listed as an artifact, but never written to the VM: gone at hash time.
++  const hashed = await hashArtifacts(vm, "alice", [artifact("ghost.txt", 4)]);
++  assert.equal(hashed[0]?.sha256, null);
++  assert.equal(hashed[0]?.status, "missing");
++});
++
++test("hashArtifacts records an over-cap file as missing without throwing", async () => {
++  const driver = new FakeVmDriver();
++  const vm = new VmManager({ customDriver: driver });
++  const handle = await driver.ensure("alice");
++  await driver.writeFile(handle, "/workspace/big.txt", "0123456789");
++  // Size (10) exceeds the 4-byte cap passed here: skipped, not crashed.
++  const hashed = await hashArtifacts(vm, "alice", [artifact("big.txt", 10)], 4);
++  assert.equal(hashed[0]?.sha256, null);
++  assert.equal(hashed[0]?.status, "missing");
++});
++
++// --- reporter finalize attaches a receipt ----------------------------------
++
++async function runToReport(opts: {
++  runsDir: string;
++  driver: FakeFindDriver;
++  runId: string;
++  userId: string;
++  publish: (bus: TelemetryBus, runId: string) => void;
++}): Promise<ReturnType<typeof readRunReport>> {
++  const bus = new TelemetryBus({ persist: true, runsDir: () => opts.runsDir });
++  const vm = new VmManager({ customDriver: opts.driver });
++  const reporter = new RunReporter({
++    vm,
++    bus,
++    browser: new StubBrowser(),
++    runsDir: () => opts.runsDir,
++  });
++  reporter.attach(opts.runId, opts.userId);
++  bus.publish(opts.runId, {
++    type: "run.created",
++    data: { prompt: "make a file", userId: opts.userId },
++  });
++  bus.publish(opts.runId, { type: "vm.ready", data: { ms: 1 } });
++  await new Promise((resolve) => setTimeout(resolve, 50));
++  opts.publish(bus, opts.runId);
++  bus.publish(opts.runId, { type: "run.finished", exitCode: 0, sessionId: "s1" } as never);
++  return waitFor(() => readRunReport(opts.runId, opts.runsDir));
++}
++
++test("finalize attaches a signed receipt with hashed artifacts", async () => {
++  await withSecret(SECRET, async () => {
++    const runsDir = tmpDir();
++    try {
++      const driver = new FakeFindDriver();
++      const handle = await driver.ensure("alice");
++      await driver.writeFile(handle, "/workspace/new.txt", ARTIFACT_CONTENT);
++      const report = await runToReport({
++        runsDir,
++        driver,
++        runId: "run_receipt",
++        userId: "alice",
++        publish: (bus, runId) => {
++          driver.entries.set("/workspace/new.txt", { size: ARTIFACT_CONTENT.length, mtimeMs: 2_000 });
++          bus.publish(runId, {
++            type: "approval.required",
++            approval: { id: "ap1", riskLevel: "ask", tool: "Bash" },
++          } as never);
++          bus.publish(runId, { type: "approval.resolved", id: "ap1", verdict: "approved" } as never);
++          bus.publish(runId, {
++            type: "shell.cmd",
++            data: { command: "echo hi" },
++          } as never);
++        },
++      });
++      assert.ok(report);
++      assert.equal(report!.artifacts.length, 1);
++      assert.equal(report!.artifacts[0]?.sha256, sha256Hex(Buffer.from(ARTIFACT_CONTENT, "utf8")));
++      assert.equal(report!.artifacts[0]?.status, "present");
++      const receipt = report!.receipt;
++      assert.ok(receipt, "receipt attached");
++      assert.equal(typeof receipt!.signature, "string");
++      assert.equal(receipt!.signingError, undefined);
++      assert.deepEqual(verifyReceipt(receipt), { ok: true });
++      const kinds = receipt!.links.map((link) => link.kind);
++      assert.equal(kinds[0], "prompt");
++      assert.ok(kinds.includes("approval"));
++      assert.ok(kinds.includes("command"));
++      assert.equal(kinds[kinds.length - 1], "artifact");
++      const artifactEntry = receipt!.links[receipt!.links.length - 1]!.entry as Record<string, unknown>;
++      assert.equal(artifactEntry.rel, "new.txt");
++      assert.equal(artifactEntry.sha256, sha256Hex(Buffer.from(ARTIFACT_CONTENT, "utf8")));
++      assert.equal(artifactEntry.status, "present");
++    } finally {
++      fs.rmSync(runsDir, { recursive: true, force: true });
++    }
++  });
++});
++
++test("finalize records a deleted artifact as missing inside the receipt", async () => {
++  await withSecret(SECRET, async () => {
++    const runsDir = tmpDir();
++    try {
++      const driver = new FakeFindDriver();
++      const report = await runToReport({
++        runsDir,
++        driver,
++        runId: "run_receipt_gone",
++        userId: "alice",
++        publish: () => {
++          // Listed at finalize time but never written: gone at hash time.
++          driver.entries.set("/workspace/gone.txt", { size: 4, mtimeMs: 2_000 });
++        },
++      });
++      assert.ok(report);
++      assert.equal(report!.artifacts[0]?.sha256, null);
++      assert.equal(report!.artifacts[0]?.status, "missing");
++      const artifactEntry = report!.receipt!.links.find((link) => link.kind === "artifact")!
++        .entry as Record<string, unknown>;
++      assert.equal(artifactEntry.rel, "gone.txt");
++      assert.equal(artifactEntry.sha256, null);
++      assert.equal(artifactEntry.status, "missing");
++      assert.deepEqual(verifyReceipt(report!.receipt), { ok: true });
++    } finally {
++      fs.rmSync(runsDir, { recursive: true, force: true });
++    }
++  });
++});
++
++test("finalize stores the receipt unsigned when no secret is set", async () => {
++  await withSecret(undefined, async () => {
++    const runsDir = tmpDir();
++    try {
++      const driver = new FakeFindDriver();
++      const report = await runToReport({
++        runsDir,
++        driver,
++        runId: "run_receipt_unsigned",
++        userId: "alice",
++        publish: () => {},
++      });
++      assert.ok(report, "report still written without a secret");
++      assert.ok(report!.receipt, "receipt still attached");
++      assert.equal(report!.receipt!.signature, null);
++      assert.match(report!.receipt!.signingError ?? "", /SWARM_SESSION_SECRET/);
++      // An unsigned receipt never verifies — but as a signature failure,
++      // not a chain failure.
++      assert.deepEqual(verifyReceipt(report!.receipt), { ok: false, reason: "signature" });
++    } finally {
++      fs.rmSync(runsDir, { recursive: true, force: true });
++    }
++  });
++});
++
++test("a secret-shaped token in a command log never reaches the receipt", async () => {
++  await withSecret(SECRET, async () => {
++    const runsDir = tmpDir();
++    try {
++      const driver = new FakeFindDriver();
++      const leaked = "sk-ant-abcdefghij1234567890";
++      const report = await runToReport({
++        runsDir,
++        driver,
++        runId: "run_receipt_redact",
++        userId: "alice",
++        publish: (bus, runId) => {
++          bus.publish(runId, {
++            type: "shell.cmd",
++            data: { command: `curl -H "x-key: ${leaked}" https://example.invalid` },
++          } as never);
++        },
++      });
++      assert.ok(report?.receipt);
++      assert.ok(!JSON.stringify(report!.receipt).includes(leaked), "secret must not appear in the receipt");
++      assert.ok(JSON.stringify(report!.receipt).includes("[REDACTED]"));
++      assert.deepEqual(verifyReceipt(report!.receipt), { ok: true });
++    } finally {
++      fs.rmSync(runsDir, { recursive: true, force: true });
++    }
++  });
++});
++
++// --- receipt routes ----------------------------------------------------------
++
++function request(
++  url: string,
++  user: string | null = "alice",
++  init?: Omit<RequestInit, "signal">,
++): NextRequest {
++  const headers = new Headers(init?.headers);
++  if (user !== null) headers.set("x-swarm-user", user);
++  return new NextRequest(`http://localhost${url}`, { ...init, headers });
++}
++
++function seedEvents(userId: string): SequencedEvent[] {
++  return [
++    { type: "run.created", data: { prompt: "make two files", userId }, seq: 1, runId: "run_1", ts: 1_000 },
++    { type: "run.started", sessionId: "s1", model: "claude-test", provider: "anthropic", seq: 2, runId: "run_1", ts: 2_000 },
++    { type: "assistant.text", text: "all done", seq: 3, runId: "run_1", ts: 3_000 },
++    { type: "run.finished", exitCode: 0, sessionId: "s1", costUsd: 0.1, durationMs: 5000, numTurns: 2, seq: 4, runId: "run_1", ts: 6_000 },
++  ] as unknown as SequencedEvent[];
++}
++
++function seedReportWithReceipt(runsDir: string): void {
++  const report = assembleReport({
++    runId: "run_1",
++    userId: "alice",
++    events: seedEvents("alice"),
++    createdAt: 1_000,
++    finishedAt: 6_000,
++    artifacts: [
++      {
++        path: "/workspace/a.txt",
++        rel: "a.txt",
++        size: 5,
++        mtimeMs: 6_000,
++        change: "created",
++        sha256: sha256Hex(Buffer.from("hello", "utf8")),
++        status: "present",
++      },
++    ],
++    shots: [],
++  });
++  report.receipt = buildRunReceipt(report, seedEvents("alice"));
++  writeRunReport("run_1", report, runsDir);
++}
++
++test("GET receipt returns the stored receipt; POST verify passes", async () => {
++  await withSecret(SECRET, async () => {
++    const runsDir = tmpDir();
++    configureRunsDir(runsDir);
++    try {
++      seedReportWithReceipt(runsDir);
++      const res = await GET_RECEIPT(request("/api/runtime/runs/run_1/report/receipt"), {
++        params: Promise.resolve({ id: "run_1" }),
++      });
++      assert.equal(res.status, 200);
++      const body = (await res.json()) as { format: string; links: unknown[] };
++      assert.equal(body.format, "swarmagents.receipt/v1");
++      assert.ok(Array.isArray(body.links) && body.links.length > 0);
++
++      const verify = await POST_VERIFY(request("/api/runtime/runs/run_1/report/receipt/verify", "alice", { method: "POST" }), {
++        params: Promise.resolve({ id: "run_1" }),
++      });
++      assert.equal(verify.status, 200);
++      assert.deepEqual(await verify.json(), { ok: true });
++    } finally {
++      configureRunsDir(null);
++      fs.rmSync(runsDir, { recursive: true, force: true });
++    }
++  });
++});
++
++test("POST verify names the failed link when the stored chain is tampered", async () => {
++  await withSecret(SECRET, async () => {
++    const runsDir = tmpDir();
++    configureRunsDir(runsDir);
++    try {
++      seedReportWithReceipt(runsDir);
++      const report = readRunReport("run_1", runsDir)!;
++      // Tamper the prompt entry's hash input without re-signing.
++      const promptLink = report.receipt!.links[0]!;
++      (promptLink.entry as Record<string, unknown>).sha256 = "0".repeat(64);
++      writeRunReport("run_1", report, runsDir);
++
++      const verify = await POST_VERIFY(request("/api/runtime/runs/run_1/report/receipt/verify", "alice", { method: "POST" }), {
++        params: Promise.resolve({ id: "run_1" }),
++      });
++      assert.equal(verify.status, 200);
++      assert.deepEqual(await verify.json(), { ok: false, failedLink: 0, reason: "chain" });
++    } finally {
++      configureRunsDir(null);
++      fs.rmSync(runsDir, { recursive: true, force: true });
++    }
++  });
++});
++
++test("POST verify checks an exported bundle supplied in the body", async () => {
++  await withSecret(SECRET, async () => {
++    const runsDir = tmpDir();
++    configureRunsDir(runsDir);
++    try {
++      seedReportWithReceipt(runsDir);
++      const stored = readRunReport("run_1", runsDir)!.receipt!;
++      const tampered = JSON.parse(JSON.stringify(stored)) as typeof stored;
++      tampered.signature = "0".repeat(64);
++      const verify = await POST_VERIFY(
++        request("/api/runtime/runs/run_1/report/receipt/verify", "alice", {
++          method: "POST",
++          headers: { "content-type": "application/json" },
++          body: JSON.stringify({ receipt: tampered }),
++        }),
++        { params: Promise.resolve({ id: "run_1" }) },
++      );
++      assert.equal(verify.status, 200);
++      assert.deepEqual(await verify.json(), { ok: false, reason: "signature" });
++    } finally {
++      configureRunsDir(null);
++      fs.rmSync(runsDir, { recursive: true, force: true });
++    }
++  });
++});
++
++test("receipt routes are owner-only: 401 without a user, 404 for another owner", async () => {
++  await withSecret(SECRET, async () => {
++    const runsDir = tmpDir();
++    configureRunsDir(runsDir);
++    try {
++      seedReportWithReceipt(runsDir);
++      const ctx = { params: Promise.resolve({ id: "run_1" }) };
++
++      const anon = await GET_RECEIPT(request("/api/runtime/runs/run_1/report/receipt", null), ctx);
++      assert.equal(anon.status, 401);
++      const anonVerify = await POST_VERIFY(
++        request("/api/runtime/runs/run_1/report/receipt/verify", null, { method: "POST" }),
++        ctx,
++      );
++      assert.equal(anonVerify.status, 401);
++
++      const other = await GET_RECEIPT(request("/api/runtime/runs/run_1/report/receipt", "mallory"), ctx);
++      assert.equal(other.status, 404);
++      const otherVerify = await POST_VERIFY(
++        request("/api/runtime/runs/run_1/report/receipt/verify", "mallory", { method: "POST" }),
++        ctx,
++      );
++      assert.equal(otherVerify.status, 404);
++
++      const missing = await GET_RECEIPT(request("/api/runtime/runs/run_nope/report/receipt"), {
++        params: Promise.resolve({ id: "run_nope" }),
++      });
++      assert.equal(missing.status, 404);
++    } finally {
++      configureRunsDir(null);
++      fs.rmSync(runsDir, { recursive: true, force: true });
++    }
++  });
++});
++
++test("GET receipt 404s when the report has no receipt", async () => {
++  const runsDir = tmpDir();
++  configureRunsDir(runsDir);
++  try {
++    const report = assembleReport({
++      runId: "run_1",
++      userId: "alice",
++      events: seedEvents("alice"),
++      createdAt: 1_000,
++      finishedAt: 6_000,
++      artifacts: [],
++      shots: [],
++    });
++    writeRunReport("run_1", report, runsDir);
++    const res = await GET_RECEIPT(request("/api/runtime/runs/run_1/report/receipt"), {
++      params: Promise.resolve({ id: "run_1" }),
++    });
++    assert.equal(res.status, 404);
++  } finally {
++    configureRunsDir(null);
++    fs.rmSync(runsDir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/lib/runtime/report-route-auth.ts b/apps/swarmagents/lib/runtime/report-route-auth.ts
+new file mode 100644
+index 000000000..fac7de8ae
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/report-route-auth.ts
+@@ -0,0 +1,41 @@
++/**
++ * Shared owner-only auth for the per-run report routes
++ * (`app/api/runtime/runs/[id]/report/...`).
++ *
++ * The report route inlines this today; the receipt routes reuse it so the
++ * caller check and the owner check live in exactly one place. Returns the
++ * stored report when the caller owns the run, or null (the caller gets a
++ * 404 either way — a wrong-owner run is indistinguishable from a missing
++ * one, exactly as the report route does it).
++ */
++
++import type { NextRequest } from "next/server";
++import { USER_HEADER } from "../auth";
++import { RUN_ID_RE } from "../telemetry/paths";
++import { getRun } from "./run-store";
++import { readRunReport } from "./run-report";
++import type { RunReport } from "./run-report-types";
++
++/** The `x-swarm-user` caller, or null when unsigned/invalid. */
++export function reportCaller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++/** True when `id` is a syntactically valid run id. */
++export function isValidRunId(id: string): boolean {
++  return RUN_ID_RE.test(id);
++}
++
++/**
++ * Load a run's stored report for its owner, or null when the report does
++ * not exist, the id is invalid, or the caller is not the run's owner.
++ */
++export function loadOwnedReport(id: string, user: string): RunReport | null {
++  if (!RUN_ID_RE.test(id)) return null;
++  const report = readRunReport(id);
++  if (!report) return null;
++  const owner = report.userId || getRun(id)?.summary.userId;
++  if (!owner || owner !== user) return null;
++  return report;
++}
+diff --git a/apps/swarmagents/lib/runtime/run-receipt.test.ts b/apps/swarmagents/lib/runtime/run-receipt.test.ts
+new file mode 100644
+index 000000000..814acae72
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/run-receipt.test.ts
+@@ -0,0 +1,187 @@
++/**
++ * F16 — signed audit receipts: chain construction, sign/verify, tamper
++ * resistance (naming the exact failing link), and secret handling.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  GENESIS_PREV,
++  RECEIPT_DOMAIN,
++  RECEIPT_FORMAT,
++  buildReceiptChain,
++  receiptSigningInput,
++  signReceipt,
++  verifyReceipt,
++  verifyReceiptChain,
++  type ReceiptChainEntry,
++  type RunReceipt,
++} from "./run-receipt";
++
++let savedEnv: NodeJS.ProcessEnv;
++
++test.beforeEach(() => {
++  savedEnv = { ...process.env };
++  process.env.SWARM_SESSION_SECRET = "test-receipt-secret-do-not-use";
++});
++
++test.afterEach(() => {
++  for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
++  Object.assign(process.env, savedEnv);
++});
++
++/** A realistic entry set: prompt, approval, attestation, command, artifact. */
++function sampleEntries(): ReceiptChainEntry[] {
++  return [
++    { kind: "prompt", hash: "a".repeat(64) },
++    { kind: "approval", decision: "allow", tool: "Bash", ts: 1_700_000_000_000 },
++    { kind: "attestation", provider: "test-provider", model: "test-model", ts: 1_700_000_000_001 },
++    { kind: "command", command: "npm test", exitCode: 0, ts: 1_700_000_000_002 },
++    { kind: "artifact", rel: "out.txt", hash: "b".repeat(64), size: 12 },
++  ];
++}
++
++function signedReceipt(entries: ReceiptChainEntry[] = sampleEntries()): RunReceipt {
++  const { links, head } = buildReceiptChain(entries);
++  return signReceipt({
++    format: RECEIPT_FORMAT,
++    runId: "run_receipt_1",
++    createdAt: 1_700_000_000_000,
++    head,
++    links,
++  });
++}
++
++test("a signed receipt verifies, and the chain is deterministic", () => {
++  const receipt = signedReceipt();
++  assert.equal(receipt.format, RECEIPT_FORMAT);
++  assert.equal(receipt.links.length, 5);
++  assert.equal(receipt.links[0]?.prev, GENESIS_PREV);
++  assert.equal(receipt.head, receipt.links[receipt.links.length - 1]?.hash);
++  assert.deepEqual(verifyReceipt(receipt), { ok: true });
++  assert.deepEqual(verifyReceiptChain(receipt.links), { ok: true });
++  // Genesis determinism: the same entries always produce the same head.
++  const again = signedReceipt();
++  assert.equal(again.head, receipt.head);
++  assert.deepEqual(
++    again.links.map((link) => link.hash),
++    receipt.links.map((link) => link.hash),
++  );
++  // The signing input is domain-separated from F4's proof domain.
++  const { signature: _sig, ...unsigned } = receipt;
++  assert.ok(receiptSigningInput(unsigned).startsWith(`${RECEIPT_DOMAIN}:`));
++});
++
++test("tampering any link's entry fails verification and names that link", () => {
++  const entries = sampleEntries();
++  for (let i = 0; i < entries.length; i += 1) {
++    const receipt = signedReceipt(entries);
++    const tampered = structuredClone(receipt);
++    const link = tampered.links[i]!;
++    // Change a field inside the entry (kind-specific, so it is a real tamper).
++    if (link.kind === "approval") link.entry.decision = "deny";
++    else if (link.kind === "prompt") link.entry.hash = "c".repeat(64);
++    else if (link.kind === "attestation") link.entry.model = "other-model";
++    else if (link.kind === "command") link.entry.exitCode = 1;
++    else link.entry.size = 13;
++    const result = verifyReceipt(tampered);
++    assert.equal(result.ok, false, `link ${i} tamper must fail`);
++    assert.equal(result.failedLink, i, `link ${i} tamper must name index ${i}`);
++    assert.equal(result.reason, "chain");
++    // The pure chain check agrees, without needing the signature.
++    assert.deepEqual(verifyReceiptChain(tampered.links), {
++      ok: false,
++      failedLink: i,
++      reason: "chain",
++    });
++  }
++});
++
++test("tampering an artifact entry's hash fails and names its link", () => {
++  const receipt = signedReceipt();
++  const tampered = structuredClone(receipt);
++  const artifactLink = tampered.links[4]!;
++  assert.equal(artifactLink.kind, "artifact");
++  artifactLink.entry.hash = "d".repeat(64);
++  assert.deepEqual(verifyReceipt(tampered), { ok: false, failedLink: 4, reason: "chain" });
++});
++
++test("tampering the head fails verification", () => {
++  const receipt = signedReceipt();
++  // Head is covered by the signature, so a tampered head is a signature failure.
++  const tampered = { ...receipt, head: "e".repeat(64) };
++  assert.deepEqual(verifyReceipt(tampered), { ok: false, reason: "signature" });
++  // A malformed head is a format failure.
++  assert.deepEqual(
++    verifyReceipt({ ...receipt, head: "not-a-hash" }),
++    { ok: false, reason: "format" },
++  );
++});
++
++test("signing refuses an unset secret and verification fails without it", () => {
++  delete process.env.SWARM_SESSION_SECRET;
++  const { links, head } = buildReceiptChain(sampleEntries());
++  assert.throws(
++    () =>
++      signReceipt({ format: RECEIPT_FORMAT, runId: "run_receipt_1", createdAt: 0, head, links }),
++    /SWARM_SESSION_SECRET/,
++  );
++  process.env.SWARM_SESSION_SECRET = "test-receipt-secret-do-not-use";
++  const receipt = signedReceipt();
++  // Wrong secret -> signature failure.
++  assert.deepEqual(verifyReceipt(receipt, "a-different-secret"), {
++    ok: false,
++    reason: "signature",
++  });
++  // No secret at verify time -> never verified.
++  delete process.env.SWARM_SESSION_SECRET;
++  assert.deepEqual(verifyReceipt(receipt), { ok: false, reason: "signature" });
++});
++
++test("verification fails for the wrong format and for malformed receipts", () => {
++  const receipt = signedReceipt();
++  assert.deepEqual(verifyReceipt({ ...receipt, format: "swarmagents.proof/v1" }), {
++    ok: false,
++    reason: "format",
++  });
++  assert.deepEqual(verifyReceipt({ ...receipt, format: "swarmagents.receipt/v2" }), {
++    ok: false,
++    reason: "format",
++  });
++  // Garbage -> never verified, never throws.
++  assert.deepEqual(verifyReceipt(null), { ok: false, reason: "format" });
++  assert.deepEqual(verifyReceipt("signed"), { ok: false, reason: "format" });
++  assert.deepEqual(verifyReceipt({ ...receipt, links: "nope" }), {
++    ok: false,
++    reason: "format",
++  });
++  // Missing signature -> never verified.
++  const { signature: _sig, ...unsigned } = receipt;
++  assert.deepEqual(verifyReceipt(unsigned), { ok: false, reason: "signature" });
++});
++
++test("an empty chain has zero links, a genesis head, and verifies", () => {
++  const { links, head } = buildReceiptChain([]);
++  assert.equal(links.length, 0);
++  assert.equal(head, GENESIS_PREV);
++  assert.deepEqual(verifyReceiptChain(links), { ok: true });
++  const receipt = signReceipt({
++    format: RECEIPT_FORMAT,
++    runId: "run_receipt_empty",
++    createdAt: 1_700_000_000_000,
++    head,
++    links,
++  });
++  assert.deepEqual(verifyReceipt(receipt), { ok: true });
++});
++
++test("reordering links or breaking the prev pointer fails at the first bad link", () => {
++  const receipt = signedReceipt();
++  const swapped = structuredClone(receipt);
++  [swapped.links[1], swapped.links[2]] = [swapped.links[2]!, swapped.links[1]!];
++  assert.deepEqual(verifyReceipt(swapped), { ok: false, failedLink: 1, reason: "chain" });
++
++  const brokenPrev = structuredClone(receipt);
++  brokenPrev.links[3]!.prev = "f".repeat(64);
++  assert.deepEqual(verifyReceipt(brokenPrev), { ok: false, failedLink: 3, reason: "chain" });
++});
+diff --git a/apps/swarmagents/lib/runtime/run-receipt.ts b/apps/swarmagents/lib/runtime/run-receipt.ts
+new file mode 100644
+index 000000000..5b5b96415
+--- /dev/null
++++ b/apps/swarmagents/lib/runtime/run-receipt.ts
+@@ -0,0 +1,242 @@
++/**
++ * F16 — Signed audit receipts for run reports.
++ *
++ * A run report (`report.json`) gains a tamper-evident hash chain plus an
++ * HMAC signature — the "receipt" — so anyone holding the report can check
++ * that the prompt, approval decisions, provider/model attestations, redacted
++ * command logs and artifact hashes it records are exactly what the server
++ * saw at finalize time. Tampering with any link breaks that link and every
++ * link after it, and verification reports exactly which link failed.
++ *
++ * Signing reuses F4's scheme (`lib/library/proof.ts`): HMAC-SHA256 keyed by
++ * `SWARM_SESSION_SECRET`, domain-separated, with its own format marker.
++ * The receipt has its own domain (`swarmagents:receipt:v1`) and its own
++ * shape — it is NOT a `ProofBundle`. The helpers `canonicalJson`,
++ * `sha256Hex` and `proofSecret` are imported from proof.ts rather than
++ * re-implemented, so the two schemes can never drift apart.
++ *
++ * Trust model, stated plainly (same as F4): the signature proves *this
++ * server* produced the receipt from a run it executed — it is not the
++ * publisher's signature, and a receipt signed on one instance will not
++ * verify on another instance with a different secret. If
++ * `SWARM_SESSION_SECRET` is unset, signing refuses outright (an empty key
++ * would be worse than no receipt).
++ *
++ * Chain construction: each link covers the canonical JSON of its entry
++ * plus the previous link's hash —
++ * `hash = sha256Hex(prev + canonicalJson(entry))`. The genesis link's
++ * `prev` is 64 zero characters (`GENESIS_PREV`); there is no "previous
++ * hash" before the first entry, so a fixed, documented constant stands
++ * in. An empty chain (no entries) has zero links and its head is
++ * `GENESIS_PREV`. The head is the hash of the last link and is covered
++ * by the signature, so tampering with the head breaks verification too.
++ *
++ * The receipt is built at finalize time (see `lib/runtime/run-reporter.ts`)
++ * and stored IN `report.json` — unlike `verification`/`audit`, which are
++ * merged at serve time and are not stored.
++ */
++
++import { createHmac, timingSafeEqual } from "node:crypto";
++import { canonicalJson, proofSecret, sha256Hex } from "../library/proof";
++
++/** Receipt format marker; bump if the signed payload shape ever changes. */
++export const RECEIPT_FORMAT = "swarmagents.receipt/v1";
++/** Domain separator for the HMAC input (see module doc). */
++export const RECEIPT_DOMAIN = "swarmagents:receipt:v1";
++/**
++ * `prev` of the genesis (first) link: 64 zero characters. A fixed constant
++ * is used because there is no previous link hash before the first entry;
++ * any verifier re-deriving the chain starts from this same value.
++ */
++export const GENESIS_PREV = "0".repeat(64);
++
++/** Kinds of evidence a receipt chain link can carry. */
++export type ReceiptChainEntryKind =
++  | "prompt"
++  | "approval"
++  | "attestation"
++  | "command"
++  | "artifact"
++  | "note";
++
++/**
++ * One entry in the chain. Kept permissive on purpose: the entry
++ * extractors (prompt hash, approval decisions, attestations, redacted
++ * command logs, artifact hashes) supply the fields; every field must be
++ * JSON-serializable so `canonicalJson` is deterministic. `kind`
++ * discriminates the entry; the free-form fields carry the evidence.
++ */
++export type ReceiptChainEntry =
++  | { kind: "prompt"; [key: string]: unknown }
++  | { kind: "approval"; [key: string]: unknown }
++  | { kind: "attestation"; [key: string]: unknown }
++  | { kind: "command"; [key: string]: unknown }
++  | { kind: "artifact"; [key: string]: unknown }
++  | { kind: "note"; [key: string]: unknown };
++
++/** One link in the hash chain. */
++export interface ReceiptChainLink {
++  /** Position in the chain (0-based); links must be sequential. */
++  seq: number;
++  /** Mirrors `entry.kind` so the chain is readable without parsing entries. */
++  kind: ReceiptChainEntryKind;
++  /** `sha256Hex(prev + canonicalJson(entry))`. */
++  hash: string;
++  /** Previous link's hash, or `GENESIS_PREV` for the first link. */
++  prev: string;
++  /** The canonical entry object this link commits to. */
++  entry: ReceiptChainEntry;
++}
++
++/** The signed receipt stored in `report.json`. */
++export interface RunReceipt {
++  /** Must equal `RECEIPT_FORMAT`. */
++  format: string;
++  runId: string;
++  /** Epoch ms the receipt was built (finalize time). */
++  createdAt: number;
++  /** Hash of the last chain link (`GENESIS_PREV` when the chain is empty). */
++  head: string;
++  links: ReceiptChainLink[];
++  /**
++   * Hex HMAC-SHA256 over the canonical receipt (minus this field).
++   * `null` when signing was unavailable at build time (server secret
++   * unset) — the receipt is stored unsigned rather than failing the run,
++   * and `signingError` records why. A null signature never verifies.
++   */
++  signature: string | null;
++  /** Why the receipt is unsigned, when `signature` is null. */
++  signingError?: string;
++}
++
++/** Outcome of a receipt/chain verification. Never throws. */
++export interface ReceiptVerification {
++  ok: boolean;
++  /** Index of the first chain link that failed re-derivation, when known. */
++  failedLink?: number;
++  /**
++   * Why verification failed: `"format"` (wrong/malformed receipt shape),
++   * `"chain"` (a link hash does not re-derive), or `"signature"` (the
++   * HMAC does not check out — includes a tampered head, which the
++   * signature covers — or the secret is unset/wrong).
++   */
++  reason?: "format" | "chain" | "signature";
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function isHex64(value: unknown): value is string {
++  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
++}
++
++/**
++ * Build the hash chain over the entries, in order. Pure and deterministic:
++ * the same entries always produce the same links and head. An empty entry
++ * list yields zero links and a head of `GENESIS_PREV`.
++ */
++export function buildReceiptChain(entries: ReceiptChainEntry[]): {
++  links: ReceiptChainLink[];
++  head: string;
++} {
++  const links: ReceiptChainLink[] = [];
++  let prev = GENESIS_PREV;
++  for (let seq = 0; seq < entries.length; seq += 1) {
++    const entry = entries[seq]!;
++    const hash = sha256Hex(prev + canonicalJson(entry));
++    links.push({ seq, kind: entry.kind, hash, prev, entry });
++    prev = hash;
++  }
++  return { links, head: prev };
++}
++
++/** The exact bytes the HMAC covers: domain + canonical receipt, no signature. */
++export function receiptSigningInput(receipt: Omit<RunReceipt, "signature">): string {
++  return `${RECEIPT_DOMAIN}:${canonicalJson(receipt)}`;
++}
++
++/**
++ * Sign an unsigned receipt. Throws when the server secret is unset — a
++ * receipt signed with an empty key would be worse than no receipt at all.
++ * An explicit `secret` overrides `SWARM_SESSION_SECRET` (used by tests);
++ * callers in production omit it.
++ */
++export function signReceipt(
++  receipt: Omit<RunReceipt, "signature">,
++  secret?: string,
++): RunReceipt {
++  const key = secret ?? proofSecret();
++  if (!key) {
++    throw new Error(
++      "Receipt signing is not configured on this server (SWARM_SESSION_SECRET is unset).",
++    );
++  }
++  const signature = createHmac("sha256", key).update(receiptSigningInput(receipt)).digest("hex");
++  return { ...receipt, signature };
++}
++
++/**
++ * Pure chain check, no signature involved: re-derive every link hash in
++ * order from `GENESIS_PREV` and confirm each link's `seq`, `kind` and
++ * `prev` line up. Returns the index of the first failing link, or `ok`
++ * when the whole chain re-derives. Never throws.
++ */
++export function verifyReceiptChain(links: unknown): ReceiptVerification {
++  if (!Array.isArray(links)) return { ok: false, reason: "format" };
++  let prev = GENESIS_PREV;
++  for (let seq = 0; seq < links.length; seq += 1) {
++    const link = links[seq] as unknown;
++    if (!isRecord(link)) return { ok: false, failedLink: seq, reason: "chain" };
++    if (link.seq !== seq) return { ok: false, failedLink: seq, reason: "chain" };
++    if (!isRecord(link.entry) || typeof link.entry.kind !== "string") {
++      return { ok: false, failedLink: seq, reason: "chain" };
++    }
++    if (link.kind !== link.entry.kind) return { ok: false, failedLink: seq, reason: "chain" };
++    if (link.prev !== prev) return { ok: false, failedLink: seq, reason: "chain" };
++    if (!isHex64(link.hash)) return { ok: false, failedLink: seq, reason: "chain" };
++    const expected = sha256Hex(prev + canonicalJson(link.entry));
++    if (link.hash !== expected) return { ok: false, failedLink: seq, reason: "chain" };
++    prev = link.hash;
++  }
++  return { ok: true };
++}
++
++/**
++ * Verify a stored receipt: format first, then the whole chain (naming the
++ * first failing link), then the HMAC with a timing-safe comparison. Any
++ * failure — wrong format, tampered link, tampered head (covered by the
++ * signature), missing/malformed signature, unset or wrong secret — is
++ * simply "not verified"; the caller never shows it as verified. Never
++ * throws. An explicit `secret` overrides `SWARM_SESSION_SECRET` (tests).
++ */
++export function verifyReceipt(receipt: unknown, secret?: string): ReceiptVerification {
++  if (!isRecord(receipt)) return { ok: false, reason: "format" };
++  if (receipt.format !== RECEIPT_FORMAT) return { ok: false, reason: "format" };
++  if (typeof receipt.runId !== "string" || !receipt.runId) {
++    return { ok: false, reason: "format" };
++  }
++  if (typeof receipt.createdAt !== "number" || !Number.isFinite(receipt.createdAt)) {
++    return { ok: false, reason: "format" };
++  }
++  if (!isHex64(receipt.head)) return { ok: false, reason: "format" };
++  if (!Array.isArray(receipt.links)) return { ok: false, reason: "format" };
++  const chain = verifyReceiptChain(receipt.links);
++  if (!chain.ok) return chain;
++  // The head is covered by the signature (it is part of the signed
++  // payload), so a tampered head fails the HMAC check below as
++  // "signature" — it is not a link failure.
++  const { signature, ...unsigned } = receipt as unknown as RunReceipt;
++  if (!isHex64(signature)) return { ok: false, reason: "signature" };
++  const key = secret ?? proofSecret();
++  if (!key) return { ok: false, reason: "signature" };
++  const expectedMac = createHmac("sha256", key)
++    .update(receiptSigningInput(unsigned as Omit<RunReceipt, "signature">))
++    .digest("hex");
++  const a = Buffer.from(signature, "utf8");
++  const b = Buffer.from(expectedMac, "utf8");
++  if (a.length !== b.length || !timingSafeEqual(a, b)) {
++    return { ok: false, reason: "signature" };
++  }
++  return { ok: true };
++}
+diff --git a/apps/swarmagents/lib/runtime/run-report-types.ts b/apps/swarmagents/lib/runtime/run-report-types.ts
+index 3af0122b0..c07b4c51b 100644
+--- a/apps/swarmagents/lib/runtime/run-report-types.ts
++++ b/apps/swarmagents/lib/runtime/run-report-types.ts
+@@ -41,6 +41,8 @@ export interface ReportShotMeta {
+   size: number;
+ }
+ 
++import type { RunReceipt } from "./run-receipt";
++
+ /** A file the agent created or modified under /workspace during the run. */
+ export interface ReportArtifact {
+   /** Absolute path inside the VM. */
+@@ -53,6 +55,20 @@ export interface ReportArtifact {
+   mtimeMs: number;
+   /** Whether the file did not exist at run start. */
+   change: "created" | "modified";
++  /**
++   * SHA-256 hex of the file's contents at report-build time (F16 receipt).
++   * `null` means the contents could not be hashed — the file was gone by
++   * hash time, or it exceeded the hash cap (see `status`). Undefined on
++   * reports written before artifact hashing existed.
++   */
++  sha256?: string | null;
++  /**
++   * Whether the file's contents were present when hashed. `sha256: null`
++   * with `status: "missing"` means the file was gone at hash time (created
++   * then deleted mid-run, or larger than the hash cap) — recorded
++   * explicitly, never silently omitted from the report.
++   */
++  status?: "present" | "missing";
+ }
+ 
+ /** Compact summary shown on the report card without fetching the full report. */
+@@ -147,4 +163,12 @@ export interface RunReport {
+    * into the report by the serving route).
+    */
+   verification?: RunVerificationMeta;
++  /**
++   * Tamper-evident audit receipt (F16): hash chain over the prompt,
++   * approvals, attestations, redacted command logs and artifact hashes,
++   * signed with the server secret when one is configured. Attached by the
++   * reporter at finalize time; absent on reports written before receipts
++   * existed, or when receipt-building failed (the run never fails for it).
++   */
++  receipt?: RunReceipt;
+ }
+diff --git a/apps/swarmagents/lib/runtime/run-report.ts b/apps/swarmagents/lib/runtime/run-report.ts
+index 975564b49..d1599dde7 100644
+--- a/apps/swarmagents/lib/runtime/run-report.ts
++++ b/apps/swarmagents/lib/runtime/run-report.ts
+@@ -23,6 +23,7 @@
+ 
+ import fs from "node:fs";
+ import path from "node:path";
++import { sha256Hex } from "../library/proof";
+ import type { SequencedEvent } from "../telemetry/bus";
+ import { getRunsDir } from "../telemetry/paths";
+ import { DESKTOP_DISPLAY } from "../vm/docker-driver";
+@@ -371,6 +372,46 @@ export function diffWorkspaceLists(
+   return artifacts;
+ }
+ 
++/**
++ * Hash each artifact's contents at report-build time (F16 receipt).
++ *
++ * Reads the live file from the VM via `readFileBytes`, capped at `maxBytes`
++ * (default `MAX_ARTIFACT_DOWNLOAD_BYTES`, the same cap as artifact
++ * downloads). A file that is gone between listing and read — or larger than
++ * the cap — is recorded explicitly as `sha256: null, status: "missing"`,
++ * never silently omitted. Never throws: every per-file failure degrades to
++ * a missing marker so hashing can never fail the report or the run.
++ */
++export async function hashArtifacts(
++  vm: VmManager,
++  userId: string,
++  artifacts: readonly ReportArtifact[],
++  maxBytes: number = MAX_ARTIFACT_DOWNLOAD_BYTES,
++): Promise<ReportArtifact[]> {
++  return Promise.all(
++    artifacts.map(async (artifact) => {
++      if (artifact.size > maxBytes) {
++        console.warn(
++          `[run-report] skipping hash for ${artifact.rel}: ${artifact.size} bytes exceeds the ${maxBytes} byte cap`,
++        );
++        return { ...artifact, sha256: null, status: "missing" as const };
++      }
++      try {
++        const file = await vm.readFileBytes(userId, artifact.path, maxBytes);
++        if (file.truncated) {
++          console.warn(
++            `[run-report] skipping hash for ${artifact.rel}: file grew past the ${maxBytes} byte cap`,
++          );
++          return { ...artifact, sha256: null, status: "missing" as const };
++        }
++        return { ...artifact, sha256: sha256Hex(file.content), status: "present" as const };
++      } catch {
++        return { ...artifact, sha256: null, status: "missing" as const };
++      }
++    }),
++  );
++}
++
+ // --- screenshots ------------------------------------------------------------
+ 
+ export interface CapturedShot {
+diff --git a/apps/swarmagents/lib/runtime/run-reporter.ts b/apps/swarmagents/lib/runtime/run-reporter.ts
+index 517a54f71..8d9d55faa 100644
+--- a/apps/swarmagents/lib/runtime/run-reporter.ts
++++ b/apps/swarmagents/lib/runtime/run-reporter.ts
+@@ -25,6 +25,7 @@ import { readRunEvents } from "../telemetry/run-log";
+ import { getBrowserManager, type BrowserControl } from "../browser/manager";
+ import { telemetryBus } from "../telemetry/bus";
+ import type { VmManager } from "../vm/manager";
++import { makeRedactor } from "../harness/redact";
+ import { pinnedLensForRole, runAutoAudit } from "../lenses/audit";
+ import type { RunReport } from "./run-report-types";
+ import {
+@@ -34,12 +35,26 @@ import {
+   captureBrowserFrame,
+   captureDesktopScreenshot,
+   diffWorkspaceLists,
++  hashArtifacts,
+   listWorkspaceFiles,
+   readRunReport,
+   writeRunReport,
+   writeShotFile,
+   type WorkspaceEntry,
+ } from "./run-report";
++import {
++  RECEIPT_FORMAT,
++  buildReceiptChain,
++  signReceipt,
++  type ReceiptChainEntry,
++  type RunReceipt,
++} from "./run-receipt";
++import {
++  extractApprovalEntries,
++  extractAttestationEntries,
++  extractCommandLogEntries,
++  promptEntry,
++} from "./receipt-entries";
+ import type { ReportShotMeta } from "./run-report-types";
+ 
+ export interface RunReporterOptions {
+@@ -75,6 +90,61 @@ function shotFile(index: number, mime: string): string {
+   return `${String(index).padStart(3, "0")}.${ext}`;
+ }
+ 
++/**
++ * Build the F16 audit receipt for a finished report (pure except for the
++ * signing-secret read inside `signReceipt`).
++ *
++ * Chain order: prompt hash, approval decisions, LLM attestations, redacted
++ * command logs, artifact hashes (one entry per artifact, including
++ * `status: "missing"` ones — a file gone at hash time is evidence too).
++ * Command logs go through the pattern redactor, so no secret that reached
++ * a shell log can reach the receipt.
++ *
++ * When the server secret is unset, `signReceipt` throws and the receipt is
++ * stored UNSIGNED (`signature: null` + `signingError`) — the run must not
++ * fail because of receipts, and an unsigned receipt never verifies.
++ */
++export function buildRunReceipt(
++  report: RunReport,
++  events: readonly SequencedEvent[],
++): RunReceipt {
++  const redact = makeRedactor();
++  const entries: ReceiptChainEntry[] = [
++    promptEntry(report.prompt),
++    ...extractApprovalEntries(events),
++    ...extractAttestationEntries(events),
++    ...extractCommandLogEntries(events, redact),
++    ...report.artifacts.map(
++      (artifact): ReceiptChainEntry => ({
++        kind: "artifact",
++        rel: artifact.rel,
++        sha256: artifact.sha256 ?? null,
++        size: artifact.size,
++        change: artifact.change,
++        status: artifact.status ?? "missing",
++      }),
++    ),
++  ];
++  const { links, head } = buildReceiptChain(entries);
++  const unsigned: Omit<RunReceipt, "signature"> = {
++    format: RECEIPT_FORMAT,
++    runId: report.runId,
++    createdAt: Date.now(),
++    head,
++    links,
++  };
++  try {
++    return signReceipt(unsigned);
++  } catch (error) {
++    return {
++      ...unsigned,
++      signature: null,
++      signingError:
++        error instanceof Error ? error.message : "Receipt signing failed.",
++    };
++  }
++}
++
+ export class RunReporter {
+   private readonly vm: VmManager;
+   private readonly bus: TelemetryBus;
+@@ -206,9 +276,15 @@ export class RunReporter {
+     if (events.length === 0) return;
+     const createdAt = events[0]?.ts ?? Date.now();
+     const finishedAt = events[events.length - 1]?.ts ?? Date.now();
+-    // Diff against the fresh listing so artifacts reflect the final state.
++    // Diff against the fresh listing so artifacts reflect the final state,
++    // then hash each artifact's contents for the receipt (a file gone
++    // between listing and read is recorded as missing, never omitted).
+     const after = await listWorkspaceFiles(this.vm, userId);
+-    const artifacts = diffWorkspaceLists(state.startListing, after);
++    const artifacts = await hashArtifacts(
++      this.vm,
++      userId,
++      diffWorkspaceLists(state.startListing, after),
++    );
+ 
+     let finalText: string | undefined;
+     for (const event of events) {
+@@ -232,6 +308,15 @@ export class RunReporter {
+       // instead of assuming the default. Undefined for image-less drivers.
+       vmImage: this.vm.vmImage(),
+     });
++    // Build the audit receipt between assembly and the single report.json
++    // write so it lands in the same document. Receipt-building must never
++    // fail the report or the run: any unexpected failure logs and the
++    // report is written without a receipt.
++    try {
++      report.receipt = buildRunReceipt(report, events);
++    } catch (error) {
++      console.error(`[run-report] receipt build failed for ${runId}:`, error);
++    }
+     writeRunReport(runId, report, runsDir);
+     this.maybeAudit(state, report, runsDir);
+   }
+diff --git a/apps/swarmagents/minimalist-ui/src/components/RunReportCard.tsx b/apps/swarmagents/minimalist-ui/src/components/RunReportCard.tsx
+index 66825e38b..82e606854 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/RunReportCard.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/RunReportCard.tsx
+@@ -49,6 +49,10 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
+   const [loading, setLoading] = useState(false);
+   const [shotIndex, setShotIndex] = useState(0);
+   const [attempts, setAttempts] = useState(0);
++  // Receipt verification state: never a pass badge without verification.
++  const [receiptStatus, setReceiptStatus] = useState<"idle" | "loading" | "verified" | "failed">("idle");
++  const [receiptLinks, setReceiptLinks] = useState(0);
++  const [receiptFailedLink, setReceiptFailedLink] = useState<number | undefined>(undefined);
+ 
+   // The report may lag a terminal run by a moment; poll briefly if it is not
+   // there yet, then give up quietly.
+@@ -68,6 +72,8 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
+         if (signal?.aborted) return;
+         setMeta(body.meta);
+         setReport(body);
++        setReceiptStatus("idle");
++        setReceiptFailedLink(undefined);
+         setLoading(false);
+         setAttempts(0);
+       } catch {
+@@ -99,6 +105,43 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
+     setShotIndex(0);
+   }, [expanded]);
+ 
++  // Verify the stored receipt server-side once the report is loaded. The
++  // badge only ever shows a pass after this endpoint confirms it, and only
++  // when the shadow-verifier gate passed too.
++  useEffect(() => {
++    if (!report?.receipt) return;
++    if (!report.verification?.passed) return;
++    if (receiptStatus !== "idle") return;
++    const ctrl = new AbortController();
++    setReceiptStatus("loading");
++    void fetch(`/api/runtime/runs/${encodeURIComponent(report.runId)}/report/receipt/verify`, {
++      method: "POST",
++      signal: ctrl.signal,
++      cache: "no-store",
++    })
++      .then(async (res) => {
++        if (!res.ok || ctrl.signal.aborted) {
++          if (!ctrl.signal.aborted) setReceiptStatus("failed");
++          return;
++        }
++        const body = (await res.json()) as { ok?: boolean; failedLink?: number };
++        if (ctrl.signal.aborted) return;
++        if (body.ok) {
++          setReceiptLinks(report.receipt?.links.length ?? 0);
++          setReceiptStatus("verified");
++        } else {
++          setReceiptFailedLink(body.failedLink);
++          setReceiptStatus("failed");
++        }
++      })
++      .catch(() => {
++        if (!ctrl.signal.aborted) setReceiptStatus("failed");
++      });
++    return () => {
++      ctrl.abort();
++    };
++  }, [report, receiptStatus]);
++
+   const shots = report?.shots ?? [];
+   useEffect(() => {
+     if (shotIndex >= shots.length) setShotIndex(Math.max(0, shots.length - 1));
+@@ -246,6 +289,55 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
+                 </div>
+               )}
+ 
++              {/* Audit-receipt badge (F16): only when verification passed, and
++                  only a server-verified pass ever shows as verified. */}
++              {report.receipt && report.verification?.passed && (
++                <div
++                  className={`flex items-start gap-2 rounded-lg border px-2.5 py-2 ${
++                    receiptStatus === "verified"
++                      ? "border-emerald-400/25 bg-emerald-400/5"
++                      : receiptStatus === "failed"
++                        ? "border-amber-400/25 bg-amber-400/5"
++                        : "border-white/10 bg-white/[0.02]"
++                  }`}
++                >
++                  {receiptStatus === "verified" ? (
++                    <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-300/80" />
++                  ) : receiptStatus === "failed" ? (
++                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-300/80" />
++                  ) : (
++                    <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-white/40" />
++                  )}
++                  <div className="min-w-0">
++                    <p
++                      className={`text-[10px] font-medium tracking-wide ${
++                        receiptStatus === "verified"
++                          ? "text-emerald-300/80"
++                          : receiptStatus === "failed"
++                            ? "text-amber-300/80"
++                            : "text-white/40"
++                      }`}
++                    >
++                      {receiptStatus === "verified"
++                        ? `Receipt verified · ${receiptLinks} links`
++                        : receiptStatus === "failed"
++                          ? "Receipt verification failed"
++                          : "Verifying receipt…"}
++                    </p>
++                    {receiptStatus === "failed" && receiptFailedLink !== undefined && (
++                      <p className="mt-1 text-[11px] leading-relaxed text-white/60">
++                        Chain link {receiptFailedLink} does not re-derive.
++                      </p>
++                    )}
++                    {receiptStatus === "failed" && receiptFailedLink === undefined && (
++                      <p className="mt-1 text-[11px] leading-relaxed text-white/60">
++                        The stored receipt did not verify (chain or signature).
++                      </p>
++                    )}
++                  </div>
++                </div>
++              )}
++
+               {/* Replay slideshow */}
+               {shots.length > 0 && (
+                 <div className="space-y-1.5">
+-- 
+2.55.0
+

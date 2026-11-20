@@ -1,0 +1,492 @@
+From 59b736d6959366c623ae5ae673802465d7843c0b Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:26:01 -0600
+Subject: [PATCH] feat(vm): desktop VM image (Xvfb/VNC/Chromium/Claude Code)
+
+Adds the swarmagents-vm-desktop image for the swarm VM platform: Debian
+bookworm (node 22) with Xvfb :1 (1280x800x24), openbox + tint2 + feh
+wallpaper, x11vnc on 127.0.0.1:5900, websockify/noVNC on 0.0.0.0:6080,
+a persistent Chromium with remote debugging on 127.0.0.1:9222, the Claude
+Code CLI, and a non-root agent user (uid 1000) owning HOME and /workspace.
+The entrypoint runs a tiny supervisor that restarts any dead service.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/scripts/build-vm-image.sh |  99 +++++++++++
+ apps/swarmagents/vm-image/Dockerfile       |  66 +++++++
+ apps/swarmagents/vm-image/README.md        |  79 +++++++++
+ apps/swarmagents/vm-image/entrypoint.sh    | 197 +++++++++++++++++++++
+ 4 files changed, 441 insertions(+)
+ create mode 100755 apps/swarmagents/scripts/build-vm-image.sh
+ create mode 100644 apps/swarmagents/vm-image/Dockerfile
+ create mode 100644 apps/swarmagents/vm-image/README.md
+ create mode 100755 apps/swarmagents/vm-image/entrypoint.sh
+
+diff --git a/apps/swarmagents/scripts/build-vm-image.sh b/apps/swarmagents/scripts/build-vm-image.sh
+new file mode 100755
+index 000000000..bc64874d4
+--- /dev/null
++++ b/apps/swarmagents/scripts/build-vm-image.sh
+@@ -0,0 +1,99 @@
++#!/usr/bin/env bash
++#
++# build-vm-image.sh — build the swarmagents VM desktop image.
++#
++#   scripts/build-vm-image.sh [--smoke-test]
++#
++# Builds the image from vm-image/ (Dockerfile + entrypoint.sh) and tags it
++# swarmagents-vm-desktop:latest. With --smoke-test, also boots a throwaway
++# container and verifies the acceptance checks: noVNC page served, `claude
++# --version` works, X display is up, Chromium remote debugging is listening.
++set -euo pipefail
++
++cd "$(dirname "$0")/.."
++
++IMAGE="swarmagents-vm-desktop:latest"
++SMOKE=0
++for arg in "$@"; do
++  case "$arg" in
++    --smoke-test) SMOKE=1 ;;
++    *) echo "usage: $0 [--smoke-test]" >&2; exit 2 ;;
++  esac
++done
++
++echo "═══ Building ${IMAGE} ═══"
++docker build --tag "$IMAGE" --file vm-image/Dockerfile vm-image
++
++echo
++echo "═══ Image summary ═══"
++SIZE_BYTES="$(docker image inspect "$IMAGE" --format '{{.Size}}')"
++docker image inspect "$IMAGE" --format \
++  "image: {{.RepoDigests}}
++created: {{.Created}}
++size: ${SIZE_BYTES} bytes ($((SIZE_BYTES / 1048576)) MiB)"
++
++if [ "$SMOKE" -ne 1 ]; then
++  echo
++  echo "Image built. Run it with:"
++  echo "  docker run -d -p 6080:6080 ${IMAGE}"
++  echo "Then open http://localhost:6080/vnc.html"
++  exit 0
++fi
++
++echo
++echo "═══ Smoke test (throwaway container) ═══"
++CNAME="vm-desktop-smoke-$$"
++cleanup() {
++  docker rm -f "$CNAME" >/dev/null 2>&1 || true
++}
++trap cleanup EXIT
++
++# Publish on the host port given in SMOKE_HOST_PORT, or an ephemeral free
++# port if unset (the host may already have something on 6080).
++if [ -n "${SMOKE_HOST_PORT:-}" ]; then
++  HOST_PORT="$SMOKE_HOST_PORT"
++else
++  HOST_PORT="$(python3 - <<'PY'
++import socket
++s = socket.socket()
++s.bind(("127.0.0.1", 0))
++print(s.getsockname()[1])
++s.close()
++PY
++)"
++fi
++echo "Publishing ${HOST_PORT}:6080 (container 6080)"
++docker run -d --name "$CNAME" -p "${HOST_PORT}:6080" "$IMAGE" >/dev/null
++
++pass() { echo "  ✓ $1"; }
++fail() { echo "  ✗ $1"; exit 1; }
++
++# Wait for the noVNC web page (websockify is up and serving /usr/share/novnc).
++ready=false
++for _ in $(seq 1 60); do
++  if docker exec "$CNAME" sh -c '
++      curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null 2>&1'; then
++    ready=true
++    break
++  fi
++  sleep 1
++done
++[ "$ready" = true ] || fail "noVNC page not reachable on :6080"
++pass "noVNC served at http://localhost:6080/vnc.html"
++
++docker exec "$CNAME" claude --version >/dev/null 2>&1 \
++  && pass "docker exec <c> claude --version works" \
++  || fail "claude --version failed inside the container"
++
++docker exec "$CNAME" xdpyinfo -display :1 >/dev/null 2>&1 \
++  && pass "xdpyinfo -display :1 succeeds" \
++  || fail "Xvfb on :1 not running"
++
++docker exec "$CNAME" sh -c '
++  curl -fsS http://127.0.0.1:9222/json/version >/dev/null 2>&1' \
++  && pass "Chromium remote debugging listening on 127.0.0.1:9222" \
++  || fail "Chromium remote debugging not reachable"
++
++echo
++echo "═══ Smoke test passed ═══"
++echo "Container ${CNAME} removed."
+diff --git a/apps/swarmagents/vm-image/Dockerfile b/apps/swarmagents/vm-image/Dockerfile
+new file mode 100644
+index 000000000..cc68d20b1
+--- /dev/null
++++ b/apps/swarmagents/vm-image/Dockerfile
+@@ -0,0 +1,66 @@
++# syntax=docker/dockerfile:1
++#
++# swarmagents-vm-desktop — Debian bookworm (node 22) VM image with a
++# headless X desktop, VNC access via noVNC, a persistent Chromium with a
++# remote-debugging endpoint, and the Claude Code CLI.
++#
++# Services started by the entrypoint (see entrypoint.sh):
++#   Xvfb :1 (1280x800x24) → openbox + tint2 + wallpaper → x11vnc on
++#   127.0.0.1:5900 → websockify/noVNC on 0.0.0.0:6080 → Chromium with
++#   remote debugging on 127.0.0.1:9222.
++
++FROM node:22-bookworm-slim
++
++ENV DEBIAN_FRONTEND=noninteractive \
++    DISPLAY=:1 \
++    HOME=/home/agent \
++    LANG=C.UTF-8
++
++# Desktop + X + VNC stack, browser and tooling. novnc/websockify from the
++# Debian archive keeps the image free of third-party git hosts.
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    xvfb \
++    x11-utils \
++    xauth \
++    openbox \
++    tint2 \
++    feh \
++    imagemagick \
++    x11vnc \
++    novnc \
++    websockify \
++    chromium \
++    git \
++    curl \
++    python3 \
++    build-essential \
++    tmux \
++    ca-certificates \
++    && rm -rf /var/lib/apt/lists/*
++
++# Non-root user for the desktop session (uid 1000, matches the host volume
++# owner) and the workspace mount point. The base image's `node` user also
++# has uid 1000, so drop it first to keep the uid unique.
++RUN userdel -r node \
++    && useradd --create-home --uid 1000 --shell /bin/bash agent \
++    && mkdir -p /workspace /home/agent/.chromium \
++    && chown -R agent:agent /home/agent /workspace
++
++# Simple gradient wallpaper for the desktop.
++RUN convert -size 1280x800 gradient:"#34346a-#14142a" /home/agent/wallpaper.png \
++    && chown agent:agent /home/agent/wallpaper.png
++
++# Claude Code CLI (global install → /usr/local/bin/claude).
++RUN npm install --global @anthropic-ai/claude-code
++
++COPY entrypoint.sh /usr/local/bin/entrypoint.sh
++RUN chmod +x /usr/local/bin/entrypoint.sh
++
++USER agent
++WORKDIR /workspace
++
++# 6080 = noVNC (web + websockify proxy); 9222 = Chromium remote debugging
++# (loopback); 5900 = x11vnc (loopback, proxied via websockify).
++EXPOSE 6080 5900 9222
++
++ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+diff --git a/apps/swarmagents/vm-image/README.md b/apps/swarmagents/vm-image/README.md
+new file mode 100644
+index 000000000..a5cf91fa3
+--- /dev/null
++++ b/apps/swarmagents/vm-image/README.md
+@@ -0,0 +1,79 @@
++# swarmagents-vm-desktop
++
++The SwarmAgents VM image: a Debian bookworm (node 22) container with a
++headless desktop, VNC access, a persistent Chromium with remote debugging,
++and the Claude Code CLI — the baseline for a real agent to watch and drive
++a computer.
++
++## What's inside
++
++| Component | Detail |
++| --- | --- |
++| Base | `node:22-bookworm-slim` (Debian bookworm + Node 22) |
++| Display server | Xvfb on `:1` at 1280x800x24 |
++| Window manager / taskbar | openbox + tint2 (bottom taskbar) |
++| Wallpaper | gradient PNG set with feh on startup |
++| VNC | x11vnc on `127.0.0.1:5900`, no password (only proxyable via websockify) |
++| Web VNC | websockify + noVNC (Debian `novnc` package) serving on `0.0.0.0:6080`, page at `/vnc.html` |
++| Browser | Chromium, persistent, running as `agent` on `:1`, remote debugging on `127.0.0.1:9222`, profile at `/home/agent/.chromium` |
++| Tooling | git, curl, python3, build-essential, tmux |
++| Agent CLI | Claude Code (`@anthropic-ai/claude-code` → `/usr/local/bin/claude`) |
++| User | non-root `agent` (uid 1000), `HOME=/home/agent`, `/workspace` owned by agent |
++| Entrypoint | tiny supervisor: restarts any of Xvfb / openbox / tint2 / x11vnc / websockify / Chromium that dies; sleeps forever; TERM/INT-clean |
++
++## Build
++
++```bash
++scripts/build-vm-image.sh
++```
++
++Produces `swarmagents-vm-desktop:latest`. There is also a `--smoke-test`
++flag that builds, boots a throwaway container, and runs the acceptance
++checks automatically.
++
++## Run
++
++```bash
++docker run -d -p 6080:6080 swarmagents-vm-desktop
++```
++
++Then open http://localhost:6080/vnc.html — you should see the desktop with
++Chromium. (The VNC handshake is password-less; the x11vnc listener binds to
++loopback inside the container, so it is only reachable through the
++websockify proxy on 6080.)
++
++Checks inside the container:
++
++```bash
++docker exec -u agent <c> claude --version   # Claude Code CLI
++docker exec <c> xdpyinfo -display :1        # X server up
++curl http://127.0.0.1:9222/json/version      # Chromium DevTools endpoint
++```
++
++## Ports
++
++| Port | Binding | Purpose |
++| --- | --- | --- |
++| 6080 | `0.0.0.0` | noVNC web client + websockify proxy (publish this one) |
++| 5900 | `127.0.0.1` | x11vnc (loopback only) |
++| 9222 | `127.0.0.1` | Chromium remote debugging (loopback only) |
++
++## Image size
++
++~2.07 GB (2,068,705,914 bytes) on disk as reported by `docker images`
++/ `docker image inspect`. The bulk is Chromium, the X/VNC stack, build
++tooling and Claude Code. If size matters, the smallest high-impact cuts:
++drop `build-essential` (only needed for agents that compile) and
++`imagemagick` (only used at build time to generate the wallpaper — the
++PNG could be committed instead).
++
++## Notes
++
++- The entrypoint runs as `agent` (`USER agent` in the Dockerfile); the
++  supervisor restarts services with its PID-tracking loop. Xvfb uses
++  `-ac` (no access control) because every client is either loopback or in
++  the container — the published surface is only the noVNC page on 6080.
++- Chromium runs with `--no-sandbox` (container-friendly) and
++  `--disable-dev-shm-usage` (small `/dev/shm` in docker).
++- The `agent` user is uid 1000, matching the host volume mounted at
++  `/workspace` by the swarm VM driver.
+diff --git a/apps/swarmagents/vm-image/entrypoint.sh b/apps/swarmagents/vm-image/entrypoint.sh
+new file mode 100755
+index 000000000..c017910e6
+--- /dev/null
++++ b/apps/swarmagents/vm-image/entrypoint.sh
+@@ -0,0 +1,197 @@
++#!/usr/bin/env bash
++#
++# entrypoint.sh — swarmagents-vm-desktop supervisor.
++#
++# Starts and then keeps running (restarting anything that dies):
++#   Xvfb :1 (1280x800x24) → openbox (WM) + tint2 (taskbar) + wallpaper
++#   x11vnc on 127.0.0.1:5900 (no password; only reachable via websockify)
++#   websockify + noVNC on 0.0.0.0:6080
++#   Chromium (as the agent user) with remote debugging on 127.0.0.1:9222
++#
++# Runs forever. Signal-friendly: TERM/INT stop it cleanly, so `docker stop`
++# works with or without --init/tini.
++set -euo pipefail
++
++export HOME=/home/agent
++export DISPLAY=:1
++X_SCREEN="1280x800x24"
++WALLPAPER="$HOME/wallpaper.png"
++
++log() { echo "$(date -Is) [vm-desktop] $*"; }
++
++# ── X server ────────────────────────────────────────────────────────────────
++start_xvfb() {
++  log "starting Xvfb on ${DISPLAY} (${X_SCREEN})"
++  Xvfb "${DISPLAY}" -screen 0 "${X_SCREEN}" -ac -noreset \
++    >/tmp/xvfb.log 2>&1 &
++  XVFB_PID=$!
++}
++
++wait_for_x() {
++  for _ in $(seq 1 100); do
++    if xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
++      return 0
++    fi
++    sleep 0.2
++  done
++  log "X server did not come up; exiting" >&2
++  exit 1
++}
++
++# ── desktop (WM + taskbar + wallpaper) ──────────────────────────────────────
++setup_openbox() {
++  local cfg="$HOME/.config/openbox/rc.xml"
++  mkdir -p "$(dirname "$cfg")"
++  if [ ! -f "$cfg" ]; then
++    cat > "$cfg" <<'XML'
++<?xml version="1.0" encoding="UTF-8"?>
++<openbox_config xmlns="http://openbox.org/3.4/rc">
++  <theme><name>Clearlooks</name></theme>
++  <desktops>
++    <number>1</number>
++    <names><name>Desktop</name></names>
++  </desktops>
++  <resistance><slop>0</slop><edge>0</edge></resistance>
++</openbox_config>
++XML
++  fi
++}
++
++setup_tint2() {
++  local cfg="$HOME/.config/tint2/tint2rc"
++  mkdir -p "$(dirname "$cfg")"
++  if [ ! -f "$cfg" ]; then
++    cat > "$cfg" <<'RC'
++# Tint2 taskbar (default generated by the VM entrypoint)
++rounded = 0
++border_width = 0
++border_sides = L R T B
++border_content_bg = false
++background_color = #1b1f27 95
++border_color = #3a3f4b 100
++
++rounded = 2
++border_width = 0
++border_sides = L R T B
++border_content_bg = false
++background_color = #2f3542 100
++border_color = #5c6474 100
++
++rounded = 2
++border_width = 0
++border_sides = L R T B
++border_content_bg = false
++background_color = #262b36 80
++border_color = #454b59 100
++
++panel_items = LTSC
++panel_size = 100% 32
++panel_margin = 0 0
++panel_padding = 2 2
++panel_background_id = 1
++panel_layer = top
++panel_position = bottom center
++panel_monitor = all
++panel_shrink = 0
++autohide = 0
++
++taskbar_mode = single_desktop
++taskbar_hide_if_empty = 0
++taskbar_always_show_all_desktops = 1
++
++task_icon = 1
++task_text = 1
++task_centered = 0
++task_maximum_size = 200 28
++task_padding = 4 2
++task_background_id = 3
++task_active_background_id = 2
++task_font_color = #c9cdd6 100
++task_active_font_color = #ffffff 100
++task_icon_size = 20
++
++time1_format = %H:%M
++time1_font = sans 10
++clock_font_color = #c9cdd6 100
++clock_padding = 6 0
++clock_background_id = 0
++RC
++  fi
++}
++
++start_wm() {
++  setup_openbox
++  setup_tint2
++  log "setting wallpaper (feh)"
++  feh --bg-fill "$WALLPAPER" || true
++  log "starting openbox"
++  openbox >/tmp/openbox.log 2>&1 &
++  WM_PID=$!
++}
++
++start_tint2() {
++  log "starting tint2 taskbar"
++  tint2 >/tmp/tint2.log 2>&1 &
++  TINT2_PID=$!
++}
++
++# ── VNC + noVNC ─────────────────────────────────────────────────────────────
++start_vnc() {
++  log "starting x11vnc on 127.0.0.1:5900 (no password)"
++  x11vnc -display "${DISPLAY}" -forever -shared -nopw -listen 127.0.0.1 \
++    -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
++  VNC_PID=$!
++}
++
++start_websockify() {
++  log "starting websockify/noVNC on 0.0.0.0:6080"
++  websockify --web /usr/share/novnc 0.0.0.0:6080 localhost:5900 \
++    >/tmp/websockify.log 2>&1 &
++  WEBSOCKIFY_PID=$!
++}
++
++# ── browser (persistent Chromium with remote debugging) ─────────────────────
++start_chromium() {
++  log "starting chromium with remote debugging on 127.0.0.1:9222"
++  chromium --no-sandbox --disable-gpu --disable-dev-shm-usage \
++    --window-size=1280,800 \
++    --remote-debugging-address=127.0.0.1 \
++    --remote-debugging-port=9222 \
++    --user-data-dir="$HOME/.chromium" \
++    about:blank >/tmp/chromium.log 2>&1 &
++  CHROMIUM_PID=$!
++}
++
++# ── supervisor loop ─────────────────────────────────────────────────────────
++# Check liveness via /proc: bash keeps exited background children around as
++# zombies until waited on, so `kill -0` would count a dead service as alive.
++alive() {
++  local pid="$1" state
++  [ -d "/proc/$pid" ] || return 1
++  state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" || return 1
++  [ "$state" != "Z" ]
++}
++
++# Stop cleanly on `docker stop` (with or without tini/--init).
++trap 'log "shutting down"; exit 0' TERM INT
++
++start_xvfb
++wait_for_x
++start_wm
++start_tint2
++start_vnc
++start_websockify
++start_chromium
++
++while true; do
++  if ! alive "$XVFB_PID"; then
++    start_xvfb
++    wait_for_x
++  fi
++  alive "$WM_PID" || start_wm
++  alive "$TINT2_PID" || start_tint2
++  alive "$VNC_PID" || start_vnc
++  alive "$WEBSOCKIFY_PID" || start_websockify
++  alive "$CHROMIUM_PID" || start_chromium
++  sleep 2
++done
+-- 
+2.55.0
+

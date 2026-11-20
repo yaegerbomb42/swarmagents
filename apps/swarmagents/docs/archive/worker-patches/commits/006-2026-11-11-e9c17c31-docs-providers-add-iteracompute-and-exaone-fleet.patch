@@ -1,0 +1,203 @@
+From e9c17c316b00c49d3e0762fe63eba78f183b1205 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:17:27 -0600
+Subject: [PATCH] docs(providers): add IteraCompute and EXAONE fleet example
+
+---
+ apps/swarmagents/README.md                    |  20 +++
+ .../lib/providers/example-file.test.ts        | 114 ++++++++++++++++++
+ apps/swarmagents/providers.example.json       |  30 +++++
+ 3 files changed, 164 insertions(+)
+ create mode 100644 apps/swarmagents/lib/providers/example-file.test.ts
+ create mode 100644 apps/swarmagents/providers.example.json
+
+diff --git a/apps/swarmagents/README.md b/apps/swarmagents/README.md
+index fb493fbdd..7dfba904e 100644
+--- a/apps/swarmagents/README.md
++++ b/apps/swarmagents/README.md
+@@ -241,6 +241,26 @@ Where keys live:
+ `POST /api/providers` (plus the DELETE/PATCH `remove-key`/`rotate-key`/
+ `add-key` actions) manages saved providers and keys server-side.
+ 
++#### Fleet example: IteraCompute and EXAONE (OpenAI-compatible)
++
++`providers.example.json` in this directory is a paste-ready
++`SWARM_PROVIDERS_FILE` sample for two managed fleet providers. Copy it to
++your `SWARM_PROVIDERS_FILE` location (or merge its `providers` array into
++your existing file), keep the `envKeys` pointing at the key pool env vars
++above, and fill in your exact model IDs — the committed file deliberately
++carries no real keys and leaves the exact model IDs as placeholders:
++
++| Entry | `baseUrl` | Wire format | Key env | Default model |
++| --- | --- | --- | --- | --- |
++| `iteracompute` | `https://api.iteracompute.com/v1` | `kind: "openai"` (OpenAI-compatible) | `ITERACOMPUTE_API_KEY` | placeholder — set per tier |
++| `exaone` | `https://api.exaone.ai/v1` | `kind: "openai"` against `chat/completions` | `EXAONE_API_KEY` | `k-exaone_v2.5` (balanced tier) |
++
++Both entries use `envKeys` so keys are read from the environment
++(`ITERACOMPUTE_API_KEY=...`, `EXAONE_API_KEY=...`) and never committed. The
++file is validated by the same schema as any other SWARM_PROVIDERS_FILE —
++missing `id`/`kind` or an unknown `kind` is rejected with a
++`ConfigValidationError`.
++
+ ### Local sign-in (login / signup)
+ 
+ SwarmAgents ships with a small local password auth layer (`lib/auth.ts` +
+diff --git a/apps/swarmagents/lib/providers/example-file.test.ts b/apps/swarmagents/lib/providers/example-file.test.ts
+new file mode 100644
+index 000000000..07e292d57
+--- /dev/null
++++ b/apps/swarmagents/lib/providers/example-file.test.ts
+@@ -0,0 +1,114 @@
++/**
++ * Tests for the committed providers fleet example (providers.example.json).
++ *
++ * The sample is a paste-ready SWARM_PROVIDERS_FILE for the IteraCompute and
++ * EXAONE fleets. It must validate against the same schema as any other
++ * providers file, carry no secrets, and leave exact model IDs as placeholders.
++ */
++import test from "node:test";
++import assert from "node:assert/strict";
++import { readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { fileURLToPath } from "node:url";
++import { loadProvidersFile, loadProvidersFromEnv, ConfigValidationError } from "./config-file";
++
++const EXAMPLE_PATH = fileURLToPath(new URL("../../providers.example.json", import.meta.url));
++
++test("committed providers.example.json loads and validates", () => {
++  const providers = loadProvidersFile(EXAMPLE_PATH);
++  const byId = new Map(providers.map((p) => [p.id, p]));
++
++  const iteracompute = byId.get("iteracompute");
++  assert.ok(iteracompute, "iteracompute entry must exist");
++  assert.equal(iteracompute.kind, "openai");
++  assert.equal(iteracompute.baseUrl, "https://api.iteracompute.com/v1");
++  assert.equal(iteracompute.envKeys, "ITERACOMPUTE_API_KEY");
++
++  const exaone = byId.get("exaone");
++  assert.ok(exaone, "exaone entry must exist");
++  assert.equal(exaone.kind, "openai");
++  assert.equal(exaone.baseUrl, "https://api.exaone.ai/v1");
++  assert.equal(exaone.envKeys, "EXAONE_API_KEY");
++  assert.equal(exaone.models?.balanced, "k-exaone_v2.5");
++});
++
++test("committed example carries no secrets and uses placeholders for exact model ids", () => {
++  const raw = readFileSync(EXAMPLE_PATH, "utf-8");
++  const parsed = JSON.parse(raw) as {
++    providers: Array<Record<string, unknown>>;
++  };
++
++  for (const provider of parsed.providers) {
++    assert.equal(
++      provider.keys,
++      undefined,
++      `provider "${String(provider.id)}" must not carry a keys array`,
++    );
++    const modelIds = Object.values((provider.models ?? {}) as Record<string, string>);
++    const hasPlaceholder =
++      provider.id === "exaone"
++        ? modelIds.some((m) => m.startsWith("<") && m.endsWith(">")) // balanced is the known default
++        : modelIds.length > 0 && modelIds.every((m) => m.startsWith("<") && m.endsWith(">"));
++    assert.ok(
++      hasPlaceholder,
++      `provider "${String(provider.id)}" must use placeholders for exact model ids`,
++    );
++  }
++
++  // Nothing key-shaped anywhere in the file.
++  assert.ok(!/sk-[a-zA-Z0-9]{8,}/.test(raw), "no sk- style secrets");
++  assert.ok(!/api[_-]?key["']\s*:/i.test(raw), "no key fields");
++});
++
++test("example loads through loadProvidersFromEnv via SWARM_PROVIDERS_FILE", () => {
++  const saved = process.env.SWARM_PROVIDERS_FILE;
++  process.env.SWARM_PROVIDERS_FILE = EXAMPLE_PATH;
++  try {
++    const providers = loadProvidersFromEnv();
++    assert.ok(providers);
++    assert.equal(providers!.length, 2);
++  } finally {
++    if (saved === undefined) delete process.env.SWARM_PROVIDERS_FILE;
++    else process.env.SWARM_PROVIDERS_FILE = saved;
++  }
++});
++
++test("schema validation still rejects missing required fields", () => {
++  const dir = mkdtempSync(join(tmpdir(), "swarm-providers-example-"));
++  try {
++    const missingId = join(dir, "missing-id.json");
++    writeFileSync(
++      missingId,
++      JSON.stringify({ providers: [{ kind: "openai", baseUrl: "https://api.exaone.ai/v1" }] }),
++      "utf-8",
++    );
++    assert.throws(() => loadProvidersFile(missingId), ConfigValidationError);
++
++    const missingKind = join(dir, "missing-kind.json");
++    writeFileSync(
++      missingKind,
++      JSON.stringify({ providers: [{ id: "exaone", baseUrl: "https://api.exaone.ai/v1" }] }),
++      "utf-8",
++    );
++    assert.throws(() => loadProvidersFile(missingKind), ConfigValidationError);
++
++    const unknownKind = join(dir, "unknown-kind.json");
++    writeFileSync(
++      unknownKind,
++      JSON.stringify({ providers: [{ id: "exaone", kind: "exaone" }] }),
++      "utf-8",
++    );
++    assert.throws(() => loadProvidersFile(unknownKind), ConfigValidationError);
++
++    const emptyId = join(dir, "empty-id.json");
++    writeFileSync(
++      emptyId,
++      JSON.stringify({ providers: [{ id: "   ", kind: "openai" }] }),
++      "utf-8",
++    );
++    assert.throws(() => loadProvidersFile(emptyId), ConfigValidationError);
++  } finally {
++    rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/providers.example.json b/apps/swarmagents/providers.example.json
+new file mode 100644
+index 000000000..9a580e050
+--- /dev/null
++++ b/apps/swarmagents/providers.example.json
+@@ -0,0 +1,30 @@
++{
++  "providers": [
++    {
++      "id": "iteracompute",
++      "kind": "openai",
++      "baseUrl": "https://api.iteracompute.com/v1",
++      "envKeys": "ITERACOMPUTE_API_KEY",
++      "rank": 10,
++      "enabled": true,
++      "models": {
++        "fast": "<iteracompute-fast-model-placeholder>",
++        "balanced": "<iteracompute-balanced-model-placeholder>",
++        "deep": "<iteracompute-deep-model-placeholder>"
++      }
++    },
++    {
++      "id": "exaone",
++      "kind": "openai",
++      "baseUrl": "https://api.exaone.ai/v1",
++      "envKeys": "EXAONE_API_KEY",
++      "rank": 11,
++      "enabled": true,
++      "models": {
++        "fast": "<exaone-fast-model-placeholder>",
++        "balanced": "k-exaone_v2.5",
++        "deep": "<exaone-deep-model-placeholder>"
++      }
++    }
++  ]
++}
+-- 
+2.55.0
+

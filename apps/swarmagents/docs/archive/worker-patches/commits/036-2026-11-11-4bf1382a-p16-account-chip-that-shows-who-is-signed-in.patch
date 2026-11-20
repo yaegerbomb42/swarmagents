@@ -1,0 +1,438 @@
+From 4bf1382a530671fd74a8309e42516532bbbbaaa7 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 22:57:35 +0000
+Subject: [PATCH] [p16] Account chip that shows who is signed in
+
+---
+ apps/swarmagents/lib/client/useMe.test.ts     | 126 ++++++++++++++++
+ apps/swarmagents/lib/client/useMe.ts          | 117 +++++++++++++++
+ .../src/components/AccountMenu.tsx            | 140 ++++++++++++++++++
+ .../src/components/SiteFooter.tsx             |   2 +
+ 4 files changed, 385 insertions(+)
+ create mode 100644 apps/swarmagents/lib/client/useMe.test.ts
+ create mode 100644 apps/swarmagents/lib/client/useMe.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/AccountMenu.tsx
+
+diff --git a/apps/swarmagents/lib/client/useMe.test.ts b/apps/swarmagents/lib/client/useMe.test.ts
+new file mode 100644
+index 000000000..243119ed4
+--- /dev/null
++++ b/apps/swarmagents/lib/client/useMe.test.ts
+@@ -0,0 +1,126 @@
++/**
++ * Unit tests for useMe's identity logic. The fetch effect itself is not
++ * exercised here (no DOM/fetch mocks in this suite — the established
++ * pattern in lib/client is to test the pure helpers, see
++ * useBrowserFrame.test.ts); the hook's initial state is covered by a
++ * server render below, where effects never run, so the first paint is
++ * exactly what a signed-out visitor sees before any fetch resolves.
++ */
++
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { createElement } from "react";
++import { renderToString } from "react-dom/server";
++import {
++  ME_INITIAL_STATE,
++  meDisplayLabel,
++  nextMeState,
++  parseMeResponse,
++  useMe,
++  type MeState,
++} from "./useMe";
++
++const SIGNED_IN: MeState = {
++  status: "signed-in",
++  user: { id: "user_abc123", email: "user_abc123@swarmagents.local" },
++};
++
++test("initial state is loading with no user — never a stale identity", () => {
++  assert.deepEqual(ME_INITIAL_STATE, { status: "loading", user: null });
++});
++
++test("parseMeResponse accepts a signed-in payload", () => {
++  assert.deepEqual(
++    parseMeResponse({ user: { id: "user_abc123", email: "user_abc123@swarmagents.local" } }),
++    { id: "user_abc123", email: "user_abc123@swarmagents.local" },
++  );
++});
++
++test("parseMeResponse returns null for a signed-out payload", () => {
++  assert.equal(parseMeResponse({ user: null }), null);
++});
++
++test("parseMeResponse returns null for malformed payloads, never a partial user", () => {
++  assert.equal(parseMeResponse(null), null);
++  assert.equal(parseMeResponse(undefined), null);
++  assert.equal(parseMeResponse("user_abc123"), null);
++  assert.equal(parseMeResponse([]), null);
++  assert.equal(parseMeResponse({}), null);
++  assert.equal(parseMeResponse({ user: "user_abc123" }), null);
++  assert.equal(parseMeResponse({ user: { id: "user_abc123" } }), null);
++  assert.equal(parseMeResponse({ user: { email: "a@b.local" } }), null);
++  assert.equal(parseMeResponse({ user: { id: "", email: "a@b.local" } }), null);
++  assert.equal(parseMeResponse({ user: { id: "user_abc123", email: "" } }), null);
++});
++
++test("a signed-in fetch resolves to signed-in", () => {
++  assert.deepEqual(
++    nextMeState(ME_INITIAL_STATE, { ok: true, user: SIGNED_IN.user }),
++    SIGNED_IN,
++  );
++});
++
++test("a signed-out fetch resolves to signed-out with no user", () => {
++  assert.deepEqual(nextMeState(ME_INITIAL_STATE, { ok: true, user: null }), {
++    status: "signed-out",
++    user: null,
++  });
++});
++
++test("a failed fetch resolves to signed-out, never a stale user", () => {
++  assert.deepEqual(nextMeState(ME_INITIAL_STATE, { ok: false }), {
++    status: "signed-out",
++    user: null,
++  });
++});
++
++test("no stale user across calls: a signed-out refetch clears the previous user", () => {
++  assert.deepEqual(nextMeState(SIGNED_IN, { ok: true, user: null }), {
++    status: "signed-out",
++    user: null,
++  });
++});
++
++test("no stale user across calls: a failed refetch clears the previous user", () => {
++  assert.deepEqual(nextMeState(SIGNED_IN, { ok: false }), {
++    status: "signed-out",
++    user: null,
++  });
++});
++
++test("no stale user across calls: a new signed-in user fully replaces the old one", () => {
++  const next = nextMeState(SIGNED_IN, {
++    ok: true,
++    user: { id: "user_xyz789", email: "user_xyz789@swarmagents.local" },
++  });
++  assert.equal(next.status, "signed-in");
++  assert.equal(next.user?.id, "user_xyz789");
++  assert.equal(next.user?.email, "user_xyz789@swarmagents.local");
++});
++
++test("meDisplayLabel prefers the email", () => {
++  assert.equal(
++    meDisplayLabel({ id: "user_abc123", email: "user_abc123@swarmagents.local" }),
++    "user_abc123@swarmagents.local",
++  );
++});
++
++test("meDisplayLabel falls back to a short id when the email is empty", () => {
++  assert.equal(meDisplayLabel({ id: "user_abc123456", email: "" }), "user_abc…");
++  assert.equal(meDisplayLabel({ id: "short", email: "" }), "short");
++});
++
++test("the hook's first render is loading with no user (server render: effects never run)", () => {
++  function Probe() {
++    const me = useMe();
++    return createElement(
++      "span",
++      null,
++      me.status === "loading" ? "checking…" : me.user ? me.user.email : "signed out",
++    );
++  }
++  const html = renderToString(createElement(Probe));
++  assert.match(html, /checking…/);
++  assert.doesNotMatch(html, /swarmagents\.local/);
++  assert.doesNotMatch(html, /signed out/);
++});
+diff --git a/apps/swarmagents/lib/client/useMe.ts b/apps/swarmagents/lib/client/useMe.ts
+new file mode 100644
+index 000000000..5a7a3f29c
+--- /dev/null
++++ b/apps/swarmagents/lib/client/useMe.ts
+@@ -0,0 +1,117 @@
++"use client";
++
++/**
++ * useMe() — who is signed in, from GET /api/me.
++ *
++ * The endpoint reports `{ user: { id, email } | null }` (see
++ * app/api/me/route.ts); the identity comes from the middleware-set
++ * x-swarm-user header, so the client cannot forge it, and a missing
++ * session just reports null instead of failing.
++ *
++ * The hook must never flash the wrong user, so the initial state is
++ * always "loading" with no user — never a stale or guessed identity —
++ * and every fetch outcome fully replaces the previous state: a
++ * signed-out response or a failed fetch clears whatever user was there
++ * before. The outcome-folding lives in the pure `nextMeState` helper so
++ * it is unit-testable without timers, fetch mocks, or a DOM (the
++ * established pattern in lib/client — see useBrowserFrame.test.ts).
++ */
++
++import { useEffect, useState } from "react";
++
++/** The signed-in identity GET /api/me reports. */
++export interface MeUser {
++  id: string;
++  email: string;
++}
++
++/** Loading → known signed-in → known signed-out. There is no "unknown"
++ *  state after the first fetch: a failure is treated as signed-out (the
++ *  chip shows the sign-in link), never as a stale user. */
++export type MeStatus = "loading" | "signed-in" | "signed-out";
++
++export interface MeState {
++  status: MeStatus;
++  /** The signed-in user, or null while loading / signed out. */
++  user: MeUser | null;
++}
++
++/** Initial state: unknown/loading, never a stale user. */
++export const ME_INITIAL_STATE: MeState = { status: "loading", user: null };
++
++/**
++ * Validate a GET /api/me payload. Returns the user when the shape is
++ * `{ user: { id: string, email: string } }`, and null for a signed-out
++ * `{ user: null }` response or anything malformed — a bad payload is
++ * treated as signed-out, never as a user.
++ */
++export function parseMeResponse(data: unknown): MeUser | null {
++  if (typeof data !== "object" || data === null) return null;
++  const user = (data as { user?: unknown }).user;
++  if (user === null || user === undefined) return null;
++  if (typeof user !== "object") return null;
++  const { id, email } = user as { id?: unknown; email?: unknown };
++  if (typeof id !== "string" || id.length === 0) return null;
++  if (typeof email !== "string" || email.length === 0) return null;
++  return { id, email };
++}
++
++/** The outcome of one GET /api/me fetch. */
++export type MeFetchOutcome = { ok: true; user: MeUser | null } | { ok: false };
++
++/**
++ * Fold one fetch outcome into state. Every outcome fully replaces the
++ * previous state, so a signed-out response or a failed fetch after a
++ * signed-in one never leaves a stale user behind, and a failure never
++ * resurrects a previous user either.
++ */
++export function nextMeState(_prev: MeState, outcome: MeFetchOutcome): MeState {
++  if (!outcome.ok) return { status: "signed-out", user: null };
++  if (outcome.user === null) return { status: "signed-out", user: null };
++  return { status: "signed-in", user: outcome.user };
++}
++
++/**
++ * Display label for the account chip: the email, falling back to a short
++ * id when the email is empty (the endpoint currently always synthesises
++ * an email from the id, so the fallback is defensive only).
++ */
++export function meDisplayLabel(user: MeUser): string {
++  if (user.email) return user.email;
++  return user.id.length > 8 ? `${user.id.slice(0, 8)}…` : user.id;
++}
++
++/**
++ * Fetch GET /api/me once on mount and report the signed-in user.
++ * Starts in the loading state with no user; a non-OK response, a network
++ * error, or a malformed payload is treated as signed-out. Aborted cleanly
++ * on unmount, and late responses after unmount are ignored.
++ */
++export function useMe(): MeState {
++  const [state, setState] = useState<MeState>(ME_INITIAL_STATE);
++
++  useEffect(() => {
++    let cancelled = false;
++    const ctrl = new AbortController();
++    const load = async () => {
++      try {
++        const res = await fetch("/api/me", { cache: "no-store", signal: ctrl.signal });
++        if (!res.ok) throw new Error(`GET /api/me responded ${res.status}`);
++        const data: unknown = await res.json();
++        if (cancelled) return;
++        setState((prev) => nextMeState(prev, { ok: true, user: parseMeResponse(data) }));
++      } catch {
++        if (cancelled) return;
++        // Unreachable endpoint or bad payload: signed-out, never a stale user.
++        setState((prev) => nextMeState(prev, { ok: false }));
++      }
++    };
++    void load();
++    return () => {
++      cancelled = true;
++      ctrl.abort();
++    };
++  }, []);
++
++  return state;
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/AccountMenu.tsx b/apps/swarmagents/minimalist-ui/src/components/AccountMenu.tsx
+new file mode 100644
+index 000000000..52c63a7a5
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/AccountMenu.tsx
+@@ -0,0 +1,140 @@
++"use client";
++
++/**
++ * AccountMenu — the account chip in the chrome (mounted in SiteFooter).
++ *
++ * Shows who is signed in: the email from GET /api/me (or a short id),
++ * with a menu linking to Providers and Docs. While the identity is still
++ * loading the chip renders a muted placeholder — never an email — and
++ * when signed out it renders a Sign in link instead.
++ *
++ * Sign out: there is no /api/logout route in this tree (app/api/ has
++ * audit, health, login, mcp, me, providers, runtime, signup — no
++ * logout; task p3 owns adding it and has not landed), so the menu shows
++ * Sign out as a disabled placeholder with a TODO. It must NOT call
++ * POST /api/logout until that endpoint exists.
++ */
++
++import { useEffect, useState } from "react";
++import { BookOpen, ChevronDown, LogOut, PlugZap, User } from "lucide-react";
++import { meDisplayLabel, useMe } from "../../../lib/client/useMe";
++
++export function AccountMenu() {
++  const me = useMe();
++  const [open, setOpen] = useState(false);
++
++  // Close the menu on Escape.
++  useEffect(() => {
++    if (!open) return;
++    const onKey = (e: KeyboardEvent) => {
++      if (e.key === "Escape") setOpen(false);
++    };
++    document.addEventListener("keydown", onKey);
++    return () => document.removeEventListener("keydown", onKey);
++  }, [open ]);
++
++  // Still loading: a muted placeholder, never an email or a stale user.
++  if (me.status === "loading") {
++    return (
++      <span
++        className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.03] px-2.5 py-1 ring-1 ring-white/10"
++        aria-label="Checking signed-in account"
++      >
++        <span className="h-3.5 w-3.5 animate-pulse rounded-full bg-white/15" />
++        <span className="text-white/30">…</span>
++      </span>
++    );
++  }
++
++  // Signed out (or the fetch failed): offer sign-in, never a user.
++  if (me.status === "signed-out" || !me.user) {
++    return (
++      <a
++        href="/login"
++        className="inline-flex items-center gap-1.5 rounded-full bg-white/[0.03] px-2.5 py-1 ring-1 ring-white/10 transition-colors hover:text-cyan-300 active:text-cyan-200"
++      >
++        <User className="h-3.5 w-3.5" />
++        Sign in
++      </a>
++    );
++  }
++
++  const label = meDisplayLabel(me.user);
++  const initial = label.trim().charAt(0).toUpperCase() || "?";
++
++  return (
++    <div className="relative">
++      <button
++        type="button"
++        onClick={() => setOpen((v) => !v)}
++        aria-haspopup="menu"
++        aria-expanded={open}
++        aria-label={`Account: ${label}`}
++        title={label}
++        className="inline-flex max-w-56 items-center gap-1.5 rounded-full bg-white/[0.03] px-2 py-1 ring-1 ring-white/10 transition-colors hover:text-cyan-300 active:text-cyan-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++      >
++        <span className="grid h-4 w-4 shrink-0 place-items-center rounded-full bg-cyan-400/15 text-[9px] font-medium text-cyan-300 ring-1 ring-cyan-400/30">
++          {initial}
++        </span>
++        <span className="min-w-0 truncate">{label}</span>
++        <ChevronDown className={`h-3 w-3 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} />
++      </button>
++
++      {open && (
++        <>
++          {/* Transparent layer to catch outside clicks. */}
++          <button
++            type="button"
++            aria-hidden="true"
++            tabIndex={-1}
++            onClick={() => setOpen(false)}
++            className="fixed inset-0 z-40 cursor-default"
++          />
++          {/* Opens upward: the footer sits at the bottom of the page. */}
++          <div
++            role="menu"
++            aria-label="Account"
++            className="absolute bottom-full right-0 z-50 mb-2 w-52 overflow-hidden rounded-2xl bg-[#141419] py-1 font-mono text-[11px] text-white/70 shadow-xl ring-1 ring-white/10"
++          >
++            <div className="truncate border-b border-white/[0.06] px-3 py-2 text-white/40" title={label}>
++              Signed in as {label}
++            </div>
++            <a
++              role="menuitem"
++              href="/providers"
++              onClick={() => setOpen(false)}
++              className="flex items-center gap-2 px-3 py-2 transition-colors hover:bg-white/5 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++            >
++              <PlugZap className="h-3.5 w-3.5 text-white/40" />
++              Providers
++            </a>
++            <a
++              role="menuitem"
++              href="/docs"
++              onClick={() => setOpen(false)}
++              className="flex items-center gap-2 px-3 py-2 transition-colors hover:bg-white/5 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++            >
++              <BookOpen className="h-3.5 w-3.5 text-white/40" />
++              Docs
++            </a>
++            {/*
++              TODO(p3): wire this to POST /api/logout once that endpoint
++              exists. There is no /api/logout route in this tree yet, so
++              this stays a disabled placeholder — do NOT call it.
++            */}
++            <button
++              type="button"
++              role="menuitem"
++              disabled
++              title="Sign out lands with task p3 — no /api/logout route exists yet"
++              className="flex w-full cursor-not-allowed items-center gap-2 px-3 py-2 text-white/30"
++            >
++              <LogOut className="h-3.5 w-3.5" />
++              Sign out
++            </button>
++          </div>
++        </>
++      )}
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx b/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+index 275345cc4..71031241c 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+@@ -1,5 +1,6 @@
+ import { useEffect, useState } from 'react';
+ import { ExternalLink, GitBranch } from 'lucide-react';
++import { AccountMenu } from './AccountMenu';
+ 
+ interface HealthInfo {
+   version?: string;
+@@ -60,6 +61,7 @@ export function SiteFooter() {
+               {buildLabel}
+             </span>
+           )}
++          <AccountMenu />
+         </div>
+       </div>
+     </footer>
+-- 
+2.55.0
+

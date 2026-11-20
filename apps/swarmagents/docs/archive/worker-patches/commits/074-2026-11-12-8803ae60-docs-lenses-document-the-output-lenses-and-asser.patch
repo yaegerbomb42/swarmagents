@@ -1,0 +1,121 @@
+From 8803ae60e5b6790f743e992f5449e394561de413 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 19:47:41 -0600
+Subject: [PATCH] docs(lenses): document the output lenses and assert the cache
+ in e2e
+
+The lens feature landed with PR #60; this tightens it up:
+
+- README: an "Output lenses" section with the five lenses, the caps, the
+  cheapest-model rule, the per-message+lens cache and the telemetry
+  attribution, so the behaviour is discoverable in the app docs.
+- e2e: picking the same lens on the same message must not reach the server
+  a second time (the answer is cached per message + lens), and a different
+  lens on the same message is a second, uncached answer.
+---
+ apps/swarmagents/README.md          | 35 +++++++++++++++++++++++++++++
+ apps/swarmagents/e2e/README.md      |  6 +++++
+ apps/swarmagents/e2e/lenses.spec.ts | 17 ++++++++++++++
+ 3 files changed, 58 insertions(+)
+
+diff --git a/apps/swarmagents/README.md b/apps/swarmagents/README.md
+index 3bcff7077..f27f4986a 100644
+--- a/apps/swarmagents/README.md
++++ b/apps/swarmagents/README.md
+@@ -203,6 +203,41 @@ policy error rather than hanging forever).
+ - The risk classifier is side-effect free: it never runs, reads, or resolves
+   anything; unit tests cover the policy table.
+ 
++### Output lenses (re-read any answer)
++
++Every agent message in the thread panel carries a **Lens** menu:
++
++| Lens | What it does |
++| --- | --- |
++| `ELI5` | The same answer, explained in plain words for a curious 5-year-old. |
++| `Executive summary` | What changed, why it matters and what to do next — under 120 words. |
++| `Code review` | Concrete issues only, each as `[blocker\|major\|minor] file:line — issue — fix`. |
++| `Security audit` | Findings as `[critical\|high\|medium\|low] issue — impact — fix`. |
++| `Architecture diagram` | One mermaid `flowchart`, rendered as a real diagram. |
++
++Picking a lens sends **that message** — plus the files the run touched, capped
++at 12 000 message characters and 5 files of 4 000 characters each — through a
++short specialised prompt and shows the answer **inline under the message**, in
++a collapsible panel that also shows the serving model and the cost of the
++call.
++
++- The lens runs on the **cheapest capable model** the user has: the `fast`
++  tier of their own providers, ordered by price with free providers first
++  (`lib/lenses/run.ts`). Keys never leave the server.
++- Answers are **cached per message + lens** in the user's own store
++  (`lenses.json`, next to their providers) and in the browser session, so the
++  same lens on the same message never costs a second provider call.
++- The architecture lens is rendered by a dependency-free mermaid renderer
++  (`lib/client/mermaid.ts` + `minimalist-ui/src/components/Mermaid.tsx`), so
++  the user sees a diagram, not the diagram's source.
++- The lens call is published on the agent run's telemetry bus with
++  `source: "lens"`, so its cost shows up in the telemetry drawer and in the
++  usage meter next to the run that produced the message.
++- `POST /api/lenses` is scoped to the caller (`x-swarm-user`), reads the
++  referenced files from that user's own VM, and has its own per-user rate
++  limit (`SWARM_LENS_RATE_LIMIT_PER_MIN`, default 20). Cached answers are free
++  and never touch the rate limit.
++
+ ### Idle hibernation of persistent VMs
+ 
+ A persistent per-user VM holds CPU, memory, and a container slot even when
+diff --git a/apps/swarmagents/e2e/README.md b/apps/swarmagents/e2e/README.md
+index ff444699c..4d540f34c 100644
+--- a/apps/swarmagents/e2e/README.md
++++ b/apps/swarmagents/e2e/README.md
+@@ -66,6 +66,12 @@ requests and the dispatch spec is skipped.
+   which makes the fake claude emit a risky Bash tool call. Asserts the approval
+   card appears, Deny resolves it to `denied` with a run error, and Allow resumes
+   the run to `run finished`.
++- `lenses.spec.ts` - the output lenses on an agent message. The lens API is
++  mocked, so no model or network access is needed: the menu offers the five
++  lenses, an ELI5 answer shows up inline under the message with its cost, the
++  result is collapsible, picking the same lens twice is served from the cache
++  without a second call, and the architecture lens renders its mermaid block as
++  an SVG diagram instead of showing the source.
+ 
+ Every test writes a full-page screenshot (pass or fail) plus an entry in
+ `SCREENSHOT_DIR/summary.json` with `test`, `status`, `error`, and `screenshot`.
+diff --git a/apps/swarmagents/e2e/lenses.spec.ts b/apps/swarmagents/e2e/lenses.spec.ts
+index 83dae8d3b..849ee85c1 100644
+--- a/apps/swarmagents/e2e/lenses.spec.ts
++++ b/apps/swarmagents/e2e/lenses.spec.ts
+@@ -104,6 +104,18 @@ test("lenses: ELI5 answer and a rendered mermaid architecture diagram", { skip:
+     await page.getByTestId("lens-result-toggle").click();
+     await page.getByTestId("lens-result-body").waitFor({ state: "visible" });
+ 
++    // The same lens on the same message is cached: asking again must not
++    // reach the server a second time.
++    await lensButton.click();
++    await page.getByTestId("lens-option-eli5").click();
++    await page.getByTestId("lens-result").waitFor({ state: "visible" });
++    assert.equal(
++      requests.length,
++      1,
++      "the cached answer must not be asked for twice",
++    );
++    await page.getByText("The router tries the next key when a call fails.").waitFor();
++
+     // Architecture: the mermaid block renders as a diagram, not as source.
+     await lensButton.click();
+     await page.getByTestId("lens-option-architecture").click();
+@@ -114,6 +126,11 @@ test("lenses: ELI5 answer and a rendered mermaid architecture diagram", { skip:
+     assert.equal(await diagram.locator("[data-testid='mermaid-node']").count(), 3);
+     await diagram.getByText("Browser", { exact: true }).waitFor();
+     assert.equal(await page.getByTestId("mermaid-source").count(), 0, "the raw source must not be shown");
++
++    // Two lenses, two calls: a different lens on the same message is a
++    // different answer and is not served from the cache.
++    assert.equal(requests.length, 2);
++    assert.equal(requests[1].lens, "architecture");
+   });
+   if (result.skipped) t.skip(result.skipped);
+ });
+-- 
+2.55.0
+

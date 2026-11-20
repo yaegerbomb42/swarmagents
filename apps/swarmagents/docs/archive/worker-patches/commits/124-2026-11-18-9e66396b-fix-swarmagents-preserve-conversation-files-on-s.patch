@@ -1,0 +1,26 @@
+From 9e66396bb16cc1a6471f57fd91bae4f7e045c02c Mon Sep 17 00:00:00 2001
+From: yaeger42 <jyaeger@hawk.iit.edu>
+Date: Wed, 18 Nov 2026 11:42:30 -0600
+Subject: [PATCH] fix(swarmagents): preserve conversation files on storage
+ errors
+
+---
+ apps/swarmagents/lib/board-agent/store.ts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/apps/swarmagents/lib/board-agent/store.ts b/apps/swarmagents/lib/board-agent/store.ts
+index b87a2d9d4..b6ce6d32a 100644
+--- a/apps/swarmagents/lib/board-agent/store.ts
++++ b/apps/swarmagents/lib/board-agent/store.ts
+@@ -24,7 +24,7 @@ export function loadConversations(userId: string): BoardAgentConversation[] {
+   } catch (err) {
+     const code = (err as { code?: string }).code;
+     if (code === "ENOENT") return empty();
+-    return empty();
++    throw err;
+   }
+   try {
+     const parsed = JSON.parse(text) as unknown;
+-- 
+2.55.0
+

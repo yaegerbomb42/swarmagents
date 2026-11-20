@@ -1,0 +1,316 @@
+From 10b8b4ca673c8f243b041e4dbffb3d8622e698ec Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 21:52:35 -0600
+Subject: [PATCH] fix(library): scope tools and permissions per role, harden
+ staged imports
+
+- a role only gets the custom tools assigned to it (the manifest and the
+  seeded scripts are filtered, and the tools MCP server is wired only when
+  the role has assigned tools)
+- user-installed MCP servers and the library tools server are granted in the
+  run's --allowedTools, so the agent can actually call the servers the user
+  assigned
+- a partial role-assignment update no longer wipes the other kinds (toggling
+  a skill kept clearing the role's servers and tools)
+- staged import ids must be slugs, so an id like ../../library cannot read or
+  delete a file outside the account's staging folder
+- e2e: dismiss the real first-run onboarding (Skip / Launch) before opening
+  the Library
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/lib/harness/role-mcp.test.ts | 12 +++
+ .../lib/library/harness-bridge.test.ts        | 85 +++++++++++++++++++
+ .../swarmagents/lib/library/harness-bridge.ts | 16 ++--
+ .../lib/library/skills/import.test.ts         |  8 ++
+ apps/swarmagents/lib/library/skills/import.ts | 15 +++-
+ .../swarmagents/lib/library/skills/vm-sync.ts |  5 +-
+ apps/swarmagents/lib/library/store.test.ts    | 14 +++
+ apps/swarmagents/lib/library/store.ts         | 21 +++--
+ 8 files changed, 157 insertions(+), 19 deletions(-)
+ create mode 100644 apps/swarmagents/lib/library/harness-bridge.test.ts
+
+diff --git a/apps/swarmagents/lib/harness/role-mcp.test.ts b/apps/swarmagents/lib/harness/role-mcp.test.ts
+index 022608b39..94f5d4f03 100644
+--- a/apps/swarmagents/lib/harness/role-mcp.test.ts
++++ b/apps/swarmagents/lib/harness/role-mcp.test.ts
+@@ -59,6 +59,18 @@ test("roleAllowedTools grants the role's MCP servers and passes unknown ids thro
+   assert.ok(weird.includes("Plan"));
+ });
+ 
++test("roleAllowedTools grants library servers assigned to the role (and the tools server)", () => {
++  const role = mainRole();
++  const withLibrary = { ...role, mcpServers: [...role.mcpServers, "my-own-mcp"] };
++  const tools = roleAllowedTools(withLibrary, { extraMcpServers: ["my-own-mcp", "library"] });
++  assert.ok(tools.includes("mcp__my-own-mcp__*"), "a user-installed server keeps its permission");
++  assert.ok(tools.includes("mcp__library__*"), "the custom tools server is callable");
++  // A server the role did not name is not granted just because it exists.
++  const withoutIt = roleAllowedTools({ ...role, mcpServers: [] }, { extraMcpServers: ["library"] });
++  assert.ok(!withoutIt.includes("mcp__my-own-mcp__*"));
++  assert.ok(withoutIt.includes("mcp__library__*"));
++});
++
+ test("roleArgvFlags builds --allowedTools/--mcp-config/--append-system-prompt per role", () => {
+   const implementer = phaseFor("implementer");
+   const flags = roleArgvFlags(implementer);
+diff --git a/apps/swarmagents/lib/library/harness-bridge.test.ts b/apps/swarmagents/lib/library/harness-bridge.test.ts
+new file mode 100644
+index 000000000..4ceb374e2
+--- /dev/null
++++ b/apps/swarmagents/lib/library/harness-bridge.test.ts
+@@ -0,0 +1,85 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import { buildLibraryRunContext, LIBRARY_TOOLS_SERVER_NAME } from "./harness-bridge";
++import { installSkill, installTool, setRoleAssignments } from "./store";
++import { addMcpServer } from "./mcp/store";
++import { VM_TOOLS_MANIFEST } from "./skills/vm-sync";
++
++let counter = 0;
++function account(): string {
++  counter += 1;
++  return `bridge-${counter}@example.com`;
++}
++
++test("a role only gets the custom tools assigned to it", () => {
++  const user = account();
++  installTool(user, {
++    name: "assigned-tool",
++    description: "Assigned.",
++    files: { "tool.mjs": "// assigned" },
++  });
++  installTool(user, {
++    name: "other-tool",
++    description: "Not assigned.",
++    files: { "tool.mjs": "// other" },
++  });
++  setRoleAssignments(user, "main", { tools: ["assigned-tool"] });
++
++  const context = buildLibraryRunContext(user, "main");
++  assert.ok(context.extraServers[LIBRARY_TOOLS_SERVER_NAME], "the tools server is wired");
++  const manifest = context.extraFiles.find((file) => file.path === VM_TOOLS_MANIFEST);
++  assert.ok(manifest);
++  const parsed = JSON.parse(manifest.content) as { tools: Array<{ name: string }> };
++  assert.deepEqual(parsed.tools.map((tool) => tool.name), ["assigned-tool"]);
++  assert.equal(
++    context.extraFiles.some((file) => file.path.includes("/tools/other-tool/")),
++    false,
++    "the unassigned tool's script is never seeded",
++  );
++  assert.match(context.libraryNote, /assigned-tool/);
++  assert.doesNotMatch(context.libraryNote, /other-tool/);
++});
++
++test("a role with no assigned tools gets no tools server", () => {
++  const user = account();
++  installTool(user, { name: "unassigned", files: { "tool.mjs": "// tool" } });
++  const context = buildLibraryRunContext(user, "main");
++  assert.equal(context.extraServers[LIBRARY_TOOLS_SERVER_NAME], undefined);
++  assert.equal(context.extraFiles.some((file) => file.path === VM_TOOLS_MANIFEST), false);
++});
++
++test("a role only gets the MCP servers assigned to it", () => {
++  const user = account();
++  addMcpServer(user, { id: "assigned-mcp", name: "Assigned MCP", transport: "http", url: "https://a.example/mcp" });
++  addMcpServer(user, { id: "other-mcp", name: "Other MCP", transport: "http", url: "https://b.example/mcp" });
++  setRoleAssignments(user, "main", { mcpServers: ["assigned-mcp"] });
++
++  const context = buildLibraryRunContext(user, "main");
++  assert.ok(context.extraServers["assigned-mcp"]);
++  assert.equal(context.extraServers["other-mcp"], undefined);
++});
++
++test("a role only gets the skills assigned to it", () => {
++  const user = account();
++  installSkill(user, {
++    name: "assigned-skill",
++    description: "Assigned.",
++    origin: "editor",
++    files: { "SKILL.md": "---\nname: assigned-skill\ndescription: Assigned.\n---\n\nBody.\n" },
++  });
++  installSkill(user, {
++    name: "other-skill",
++    description: "Not assigned.",
++    origin: "editor",
++    files: { "SKILL.md": "---\nname: other-skill\ndescription: Not assigned.\n---\n\nBody.\n" },
++  });
++  setRoleAssignments(user, "main", { skills: ["assigned-skill"] });
++
++  const context = buildLibraryRunContext(user, "main");
++  assert.equal(
++    context.extraFiles.some((file) => file.path.includes("/assigned-skill/")),
++    true,
++  );
++  assert.equal(context.extraFiles.some((file) => file.path.includes("/other-skill/")), false);
++});
+diff --git a/apps/swarmagents/lib/library/harness-bridge.ts b/apps/swarmagents/lib/library/harness-bridge.ts
+index 91afd410f..2d862d484 100644
+--- a/apps/swarmagents/lib/library/harness-bridge.ts
++++ b/apps/swarmagents/lib/library/harness-bridge.ts
+@@ -89,15 +89,13 @@ export function buildLibraryRunContext(
+     }
+   }
+ 
+-  // 2) The custom tools of the user.
++  // 2) The custom tools assigned to the role. A role only gets the tools the
++  // user assigned to it; the others stay in the library for other roles.
+   const tools = Object.values(state.tools);
+   const toolIds = new Set(state.roleTools[roleId] ?? []);
+-  const toolNames: string[] = [];
+-  for (const tool of tools) {
+-    if (!toolIds.has(tool.id)) continue;
+-    toolNames.push(tool.name);
+-  }
+-  if (tools.length > 0) {
++  const assignedTools = tools.filter((tool) => toolIds.has(tool.id));
++  const toolNames: string[] = assignedTools.map((tool) => tool.name);
++  if (assignedTools.length > 0) {
+     extraServers[LIBRARY_TOOLS_SERVER_NAME] = {
+       type: "stdio",
+       command: "node",
+@@ -106,10 +104,10 @@ export function buildLibraryRunContext(
+     };
+     extraFiles.push({
+       path: VM_TOOLS_MANIFEST,
+-      content: JSON.stringify(toolManifest(userId, options), null, 2),
++      content: JSON.stringify(toolManifest(userId, options, toolIds), null, 2),
+     });
+     extraFiles.push({ path: VM_TOOLS_SERVER, content: LIBRARY_TOOLS_SERVER_SOURCE });
+-    for (const tool of tools) {
++    for (const tool of assignedTools) {
+       const source = readToolSourceFor(userId, tool.id, options);
+       if (source === null) continue;
+       extraFiles.push({ path: `${VM_LIBRARY_DIR}/tools/${tool.id}/tool.mjs`, content: source });
+diff --git a/apps/swarmagents/lib/library/skills/import.test.ts b/apps/swarmagents/lib/library/skills/import.test.ts
+index 46447d226..8d5d22662 100644
+--- a/apps/swarmagents/lib/library/skills/import.test.ts
++++ b/apps/swarmagents/lib/library/skills/import.test.ts
+@@ -93,6 +93,14 @@ test("the editor flow builds a SKILL.md from the form", () => {
+   assert.match(preview.skillMarkdown, /Instructions for the agent./);
+ });
+ 
++test("a staged id cannot walk out of the staging folder", () => {
++  const user = account();
++  assert.equal(discardStagedSkill(user, "../../library/library"), false);
++  assert.throws(() => installStagedSkill(user, "../../library/library"), /no longer available/);
++  // The staging folder itself is untouched.
++  assert.equal(listStagedSkills(user).length, 0);
++});
++
+ test("a zip upload is staged (and a zip slip is refused)", () => {
+   const user = account();
+   const preview = stageSkillFromZip(user, makeZip([{ name: "SKILL.md", content: SKILL_MD }]));
+diff --git a/apps/swarmagents/lib/library/skills/import.ts b/apps/swarmagents/lib/library/skills/import.ts
+index f8f5d5b48..05e242cfe 100644
+--- a/apps/swarmagents/lib/library/skills/import.ts
++++ b/apps/swarmagents/lib/library/skills/import.ts
+@@ -115,9 +115,16 @@ export function listStagedSkills(userId: string, options: DataDirOptions = {}):
+ }
+ 
+ /** One staged import (with its contents) — internal. */
++function stagingFile(userId: string, id: string, options: DataDirOptions = {}): string | null {
++  // A staged id is always a slug. Refusing anything else keeps a caller from
++  // walking out of the staging folder with id="../../something".
++  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) return null;
++  return path.join(stagingDir(userId, options), `${id}.json`);
++}
++
+ function readStaged(userId: string, id: string, options: DataDirOptions = {}): StagedFile | null {
+-  const file = path.join(stagingDir(userId, options), `${id}.json`);
+-  if (!fs.existsSync(file)) return null;
++  const file = stagingFile(userId, id, options);
++  if (!file || !fs.existsSync(file)) return null;
+   try {
+     const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as StagedFile & { userId?: string };
+     if (parsed.userId && parsed.userId !== userId) return null;
+@@ -137,8 +144,8 @@ export function getStagedSkill(userId: string, id: string, options: DataDirOptio
+ 
+ /** Drop a staged import. */
+ export function discardStagedSkill(userId: string, id: string, options: DataDirOptions = {}): boolean {
+-  const file = path.join(stagingDir(userId, options), `${id}.json`);
+-  if (!fs.existsSync(file)) return false;
++  const file = stagingFile(userId, id, options);
++  if (!file || !fs.existsSync(file)) return false;
+   try {
+     fs.rmSync(file, { force: true });
+   } catch {
+diff --git a/apps/swarmagents/lib/library/skills/vm-sync.ts b/apps/swarmagents/lib/library/skills/vm-sync.ts
+index 9e61b7fe3..ae761b0b3 100644
+--- a/apps/swarmagents/lib/library/skills/vm-sync.ts
++++ b/apps/swarmagents/lib/library/skills/vm-sync.ts
+@@ -118,9 +118,12 @@ export interface VmToolsManifest {
+ export function toolManifest(
+   userId: string,
+   options: DataDirOptions = {},
++  onlyIds?: ReadonlySet<string>,
+ ): VmToolsManifest {
+   const state = readLibraryState(userId, options);
+-  const tools: VmToolEntry[] = Object.values(state.tools).map((tool) => ({
++  const tools: VmToolEntry[] = Object.values(state.tools)
++    .filter((tool) => !onlyIds || onlyIds.has(tool.id))
++    .map((tool) => ({
+     name: tool.name,
+     description: tool.description,
+     inputSchema:
+diff --git a/apps/swarmagents/lib/library/store.test.ts b/apps/swarmagents/lib/library/store.test.ts
+index 612a6d63c..c31fc3bb8 100644
+--- a/apps/swarmagents/lib/library/store.test.ts
++++ b/apps/swarmagents/lib/library/store.test.ts
+@@ -149,6 +149,20 @@ test("role assignments only keep installed items", () => {
+   assert.deepEqual(stored.main?.skills, ["demo"]);
+ });
+ 
++test("a partial assignment update leaves the other kinds alone", () => {
++  const alice = account("alice");
++  installSkill(alice, { name: "demo", description: "d", origin: "editor", files: SKILL_FILES });
++  installTool(alice, { name: "my-tool", description: "d", files: { "tool.mjs": "// tool" } });
++  setRoleAssignments(alice, "main", { skills: ["demo"], tools: ["my-tool"] });
++
++  // The UI toggles one kind at a time: a skills update must not wipe tools.
++  const next = setRoleAssignments(alice, "main", { skills: [] });
++  assert.deepEqual(next.skills, []);
++  assert.deepEqual(next.tools, ["my-tool"]);
++  const stored = getRoleAssignments(alice).main;
++  assert.deepEqual(stored?.tools, ["my-tool"]);
++});
++
+ test("uninstalling a skill clears its role assignments", () => {
+   const alice = account("alice");
+ 
+diff --git a/apps/swarmagents/lib/library/store.ts b/apps/swarmagents/lib/library/store.ts
+index 2ef025a0b..009f70192 100644
+--- a/apps/swarmagents/lib/library/store.ts
++++ b/apps/swarmagents/lib/library/store.ts
+@@ -593,12 +593,23 @@ export function setRoleAssignments(
+ ): RoleAssignments {
+   requireUserId(userId);
+   const state = readLibraryState(userId, options);
+-  const clean = (ids: string[] | undefined, known: Set<string>): string[] =>
+-    [...new Set((ids ?? []).filter((id) => known.has(id)))];
++  const clean = (ids: readonly string[], known: Set<string>): string[] =>
++    [...new Set(ids.filter((id) => known.has(id)))];
++  // A partial update (the UI sends one kind at a time) leaves the other kinds
++  // alone: toggling a skill must not clear the role's servers and tools.
+   const next: RoleAssignments = {
+-    skills: clean(assignments.skills, new Set(Object.keys(state.skills))),
+-    mcpServers: clean(assignments.mcpServers, new Set(Object.keys(state.mcpServers))),
+-    tools: clean(assignments.tools, new Set(Object.keys(state.tools))),
++    skills:
++      assignments.skills === undefined
++        ? state.roleSkills[roleId] ?? []
++        : clean(assignments.skills, new Set(Object.keys(state.skills))),
++    mcpServers:
++      assignments.mcpServers === undefined
++        ? state.roleMcpServers[roleId] ?? []
++        : clean(assignments.mcpServers, new Set(Object.keys(state.mcpServers))),
++    tools:
++      assignments.tools === undefined
++        ? state.roleTools[roleId] ?? []
++        : clean(assignments.tools, new Set(Object.keys(state.tools))),
+   };
+   state.roleSkills[roleId] = next.skills;
+   state.roleMcpServers[roleId] = next.mcpServers;
+-- 
+2.55.0
+

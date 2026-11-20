@@ -1,0 +1,53 @@
+From 8e0c9f06eee20edab290e026da442318e5b833ac Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 23:20:03 -0600
+Subject: [PATCH] fix(library): keep both library surfaces after merging with
+ main
+
+The public-library feature (l8) and the skills/MCP/tools library (l5) both
+landed on main and this branch added a component under the same path. Keep
+the workplace drawer/modal (LibraryView) and render the public catalog in
+PublicLibraryView, so /library and the workspace drawer both keep working.
+Restore the main-screen lucide imports the rebuilt App actually uses.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/minimalist-ui/src/App.tsx                    | 1 -
+ .../minimalist-ui/src/components/dashboard/RightDrawer.tsx    | 4 ++--
+ 2 files changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index 32d62232b..5bda0e6f3 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -1,5 +1,4 @@
+ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+-import {
+ import {
+   BookOpen, LayoutGrid, Menu, PanelLeftClose, PanelLeftOpen, PanelRightClose,
+   PanelRightOpen, PlugZap, Settings2, ShieldCheck, UserRound, X,
+diff --git a/apps/swarmagents/minimalist-ui/src/components/dashboard/RightDrawer.tsx b/apps/swarmagents/minimalist-ui/src/components/dashboard/RightDrawer.tsx
+index 02e176c32..e837f6089 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/dashboard/RightDrawer.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/dashboard/RightDrawer.tsx
+@@ -5,7 +5,7 @@ import { Boxes, FolderTree, Globe, Library, ListChecks, X, Loader2 } from "lucid
+ import { FilesView } from "../FilesView";
+ import { BrowserView } from "../BrowserView";
+ import { CodebasePanel } from "../CodebasePanel";
+-import { LibraryView } from "../LibraryView";
++import { PublicLibraryView } from "../PublicLibraryView";
+ 
+ export type DrawerTab = "files" | "browser" | "plan" | "library" | "codebase";
+ 
+@@ -140,7 +140,7 @@ function PlanPane({ busy, runId }: { busy: boolean; runId?: string }) {
+ function LibraryPane() {
+   return (
+     <div className="flex h-full min-h-0 flex-col">
+-      <LibraryView embedded />
++      <PublicLibraryView embedded />
+     </div>
+   );
+ }
+-- 
+2.55.0
+

@@ -1,0 +1,2738 @@
+diff --git a/apps/swarmagents/app/api/runtime/runs/[id]/route.ts b/apps/swarmagents/app/api/runtime/runs/[id]/route.ts
+index 4a0486eb8..63339358f 100644
+--- a/apps/swarmagents/app/api/runtime/runs/[id]/route.ts
++++ b/apps/swarmagents/app/api/runtime/runs/[id]/route.ts
+@@ -1,14 +1,16 @@
+ /**
+  * Replay one run's persisted telemetry.
+  *
+- * GET /api/runtime/runs/<id>[?from=<seq>] -> {runId, summary, events}
++ * GET /api/runtime/runs/<id>[?from=<seq>] -> {runId, summary, events, frames}
+  * `from` returns only events with a greater sequence number, matching the SSE
+- * Last-Event-ID semantics.
++ * Last-Event-ID semantics. `frames` lists the browser frame ids archived for
++ * Run Replay (served at /api/runtime/runs/<id>/frame?frameId=N).
+  */
+ 
+ import { NextResponse, type NextRequest } from "next/server";
+ import { USER_HEADER } from "../../../../../lib/auth";
+ import { RUN_ID_RE } from "../../../../../lib/telemetry/paths";
++import { listRunFrames } from "../../../../../lib/telemetry/frames";
+ import { getRun } from "../../../../../lib/runtime/run-store";
+ 
+ export const runtime = "nodejs";
+@@ -36,5 +38,5 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string
+   const fromSeq = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+   const events = fromSeq > 0 ? run.events.filter((event) => event.seq > fromSeq) : run.events;
+ 
+-  return NextResponse.json({ runId: id, summary: run.summary, events });
++  return NextResponse.json({ runId: id, summary: run.summary, events, frames: listRunFrames(id) });
+ }
+diff --git a/apps/swarmagents/lib/browser/manager.ts b/apps/swarmagents/lib/browser/manager.ts
+index ef14b2140..5f13b60eb 100644
+--- a/apps/swarmagents/lib/browser/manager.ts
++++ b/apps/swarmagents/lib/browser/manager.ts
+@@ -28,6 +28,7 @@
+ import { promises as dns } from "node:dns";
+ import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
+ import { telemetryBus, type TelemetryBus } from "../telemetry/index";
++import { saveRunFrame } from "../telemetry/frames";
+ import {
+   checkNavigation,
+   isAddressLiteral,
+@@ -420,6 +421,9 @@ export class BrowserManager implements BrowserControl {
+         url: session.url,
+         title: session.title,
+       });
++      // Archive the JPEG for Run Replay (bounded, best-effort; see
++      // lib/telemetry/frames.ts). The live view still uses getFrame().
++      saveRunFrame(runId, session.frame.frameId, jpeg);
+     } catch (error) {
+       // The page crashed or closed mid-capture; keep the previous frame.
+       console.error(`[browser] frame capture failed for ${runId}:`, error instanceof Error ? error.message : error);
+diff --git a/apps/swarmagents/lib/client/viewHash.test.ts b/apps/swarmagents/lib/client/viewHash.test.ts
+index aa86a673f..1abf4842a 100644
+--- a/apps/swarmagents/lib/client/viewHash.test.ts
++++ b/apps/swarmagents/lib/client/viewHash.test.ts
+@@ -1,6 +1,6 @@
+ import test from "node:test";
+ import assert from "node:assert/strict";
+-import { buildViewHash, parseViewHash } from "./viewHash";
++import { buildViewHash, parseReplayId, parseViewHash, withReplayParam } from "./viewHash";
+ 
+ test("parseViewHash reads the workspace page and tab from the hash", () => {
+   assert.deepEqual(parseViewHash("#view=computer&tab=browser"), { landing: false, view: "browser" });
+@@ -29,3 +29,19 @@ test("buildViewHash round-trips through parseViewHash", () => {
+   assert.equal(buildViewHash({ landing: true, view: "browser" }), "#view=overview");
+   assert.equal(buildViewHash({ landing: false, view: "browser" }), "#view=computer&tab=browser");
+ });
++
++test("replay ids ride in the view hash without disturbing the tab", () => {
++  const base = buildViewHash({ landing: false, view: "terminal" });
++  const withReplay = withReplayParam(base, "run_abc-1");
++  assert.equal(withReplay, "#view=computer&tab=terminal&replay=run_abc-1");
++  assert.equal(parseReplayId(withReplay), "run_abc-1");
++  assert.deepEqual(parseViewHash(withReplay), { landing: false, view: "terminal" });
++  assert.equal(withReplayParam(withReplay), "#view=computer&tab=terminal");
++  assert.equal(parseReplayId(withReplayParam(withReplay)), undefined);
++
++  // Invalid / absent ids never open the viewer.
++  assert.equal(parseReplayId("#view=computer&replay=bad$id"), undefined);
++  assert.equal(parseReplayId("#view=computer"), undefined);
++  assert.equal(parseReplayId(""), undefined);
++  assert.equal(parseReplayId("#view=computer&replay="), undefined);
++});
+diff --git a/apps/swarmagents/lib/client/viewHash.ts b/apps/swarmagents/lib/client/viewHash.ts
+index becb147d3..bf9d665f5 100644
+--- a/apps/swarmagents/lib/client/viewHash.ts
++++ b/apps/swarmagents/lib/client/viewHash.ts
+@@ -36,3 +36,28 @@ export function buildViewHash(state: ViewHashState): string {
+   if (state.landing) return "#view=overview";
+   return `#view=computer&tab=${state.view}`;
+ }
++
++/**
++ * Run Replay is an overlay on top of the workspace, so it rides in the same
++ * hash as an extra `replay=<runId>` parameter (e.g.
++ * `#view=computer&tab=terminal&replay=run_abc`). parseViewHash ignores unknown
++ * parameters, so the tab behaviour is unchanged when the overlay is closed.
++ */
++const REPLAY_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
++
++export function parseReplayId(hash: string): string | undefined {
++  const raw = hash.startsWith("#") ? hash.slice(1) : hash;
++  if (!raw) return undefined;
++  const id = new URLSearchParams(raw).get("replay");
++  return id !== null && REPLAY_ID_RE.test(id) ? id : undefined;
++}
++
++/** Add (or remove) the replay parameter on an existing view hash. */
++export function withReplayParam(hash: string, replayId?: string): string {
++  const base = hash.startsWith("#") ? hash.slice(1) : hash;
++  const params = new URLSearchParams(base);
++  if (replayId) params.set("replay", replayId);
++  else params.delete("replay");
++  const next = params.toString();
++  return next ? `#${next}` : "#view=overview";
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index b1a33bf39..8e4489099 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -24,10 +24,11 @@ import { SwarmIntro } from './components/SwarmIntro';
+ import { LandingHero } from './components/LandingHero';
+ import { SiteFooter } from './components/SiteFooter';
+ import { ThreadPanel } from './components/ThreadPanel';
++import { RunReplay } from './components/RunReplay';
+ import { useToasts } from './components/Toasts';
+ import { describeFailure } from '../../lib/ui/toasts';
+ import { uploadAttachments } from '../../lib/client/upload';
+-import { buildViewHash, parseViewHash, type WorkspaceView } from '../../lib/client/viewHash';
++import { buildViewHash, parseReplayId, parseViewHash, withReplayParam, type WorkspaceView } from '../../lib/client/viewHash';
+ import { mapKeyToAction } from './utils/keymap';
+ import { useFocusTrap } from './utils/focusTrap';
+ import { usePolledVmStatus } from '../../lib/client/vmStatus';
+@@ -89,21 +90,29 @@ export default function App() {
+   const [showLanding, setShowLanding] = useState(
+     () => parseViewHash(typeof window === 'undefined' ? '' : window.location.hash).landing,
+   );
++  // Run Replay overlay: which finished run is open for time-travel viewing.
++  // Mirrored in the hash (`&replay=<runId>`) so a reload keeps the viewer open
++  // and the link can be shared.
++  const [replayRunId, setReplayRunId] = useState<string | undefined>(() =>
++    typeof window === 'undefined' ? undefined : parseReplayId(window.location.hash),
++  );
+ 
+   // Keep the hash in sync with the page/tab, and apply back/forward
+   // navigation through the hash.
+   useEffect(() => {
+-    const next = buildViewHash({ landing: showLanding, view: activeView });
++    const base = buildViewHash({ landing: showLanding, view: activeView });
++    const next = showLanding ? base : withReplayParam(base, replayRunId);
+     if (typeof window !== 'undefined' && window.location.hash !== next) {
+       window.history.replaceState(null, '', next);
+     }
+-  }, [showLanding, activeView]);
++  }, [showLanding, activeView, replayRunId]);
+ 
+   useEffect(() => {
+     const onHashChange = () => {
+       const parsed = parseViewHash(window.location.hash);
+       setShowLanding(parsed.landing);
+       setActiveView(parsed.view);
++      setReplayRunId(parseReplayId(window.location.hash));
+     };
+     window.addEventListener('hashchange', onHashChange);
+     return () => window.removeEventListener('hashchange', onHashChange);
+@@ -424,6 +433,37 @@ export default function App() {
+     setBusy(false);
+   }, []);
+ 
++  /** Open the replay overlay for a finished run (also deep-linked in the hash). */
++  const handleOpenReplay = useCallback((targetRunId: string) => {
++    setShowLanding(false);
++    setReplayRunId(targetRunId);
++  }, []);
++
++  const handleCloseReplay = useCallback(() => setReplayRunId(undefined), []);
++
++  /**
++   * A fork started from a replay point becomes this page's live run: the
++   * workspace follows it exactly like a dispatched prompt, so the user lands
++   * back on the terminal watching the new run.
++   */
++  const handleFork = useCallback(
++    (newRunId: string, forkPrompt: string) => {
++      setShowLanding(false);
++      setReplayRunId(undefined);
++      setPrompt(forkPrompt);
++      setPromptAtts([]);
++      setLogs([]);
++      setStates({
++        [activeAgent.uid]: { status: 'queued', output: '', tokens: 0, inTokens: 0, model: '' } as AgentState,
++      });
++      setRunStart(performance.now());
++      setRunEnd(undefined);
++      setRunId(newRunId);
++      setBusy(true);
++    },
++    [activeAgent.uid],
++  );
++
+   const hasRun = runStart != null;
+ 
+   // A run is "starting" while busy but no agent has reached a terminal/working
+@@ -747,6 +787,7 @@ export default function App() {
+                   active={busy}
+                   onNewThread={handleNewThread}
+                   onStopRun={handleStopRun}
++                  onReplay={handleOpenReplay}
+                 />
+               </div>
+             )}
+@@ -863,6 +904,11 @@ export default function App() {
+         onSaveCard={setAgentCard}
+       />
+ 
++      {/* 8. Run Replay — time-travel viewer over a finished run's durable log */}
++      {replayRunId && !showLanding && (
++        <RunReplay runId={replayRunId} onClose={handleCloseReplay} onFork={handleFork} />
++      )}
++
+       {/* 8. Keyboard Shortcuts Help Overlay */}
+       {helpOpen && (
+         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ThreadPanel.tsx b/apps/swarmagents/minimalist-ui/src/components/ThreadPanel.tsx
+index b50ea3a87..cc2990882 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ThreadPanel.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ThreadPanel.tsx
+@@ -23,12 +23,15 @@ export function ThreadPanel({
+   active,
+   onNewThread,
+   onStopRun,
++  onReplay,
+ }: {
+   runId?: string;
+   active: boolean;
+   onNewThread: () => void;
+   /** Stop a specific run (queued or running) server-side. */
+   onStopRun?: (runId: string) => void;
++  /** Open the time-travel replay for a finished run. */
++  onReplay?: (runId: string) => void;
+ }) {
+   const [state, dispatch] = useReducer(threadReducer, EMPTY_THREAD);
+   const [threads, setThreads] = useState<ThreadSummary[]>([]);
+@@ -388,10 +391,22 @@ export function ThreadPanel({
+                     <span>— tokens</span>
+                   )}
+                   {entry.costUsd !== undefined && <span>${entry.costUsd.toFixed(3)}</span>}
++                  {!isLive(entry.status) && onReplay && (
++                    <button
++                      type="button"
++                      data-testid="replay-open"
++                      onClick={() => onReplay(entry.runId)}
++                      className="ml-auto flex shrink-0 items-center gap-1 rounded-full bg-white/5 px-1.5 py-0.5 text-[10px] text-white/45 transition hover:bg-violet-400/15 hover:text-violet-200"
++                      title="Replay this run with a scrubber timeline"
++                    >
++                      <History className="h-3 w-3" />
++                      <span>Replay</span>
++                    </button>
++                  )}
+                   <a
+                     href={`/api/runtime/runs/${encodeURIComponent(entry.runId)}/log`}
+                     download
+-                    className="ml-auto shrink-0 rounded-full p-0.5 text-white/30 transition hover:bg-white/10 hover:text-white"
++                    className={`${!isLive(entry.status) && onReplay ? '' : 'ml-auto'} shrink-0 rounded-full p-0.5 text-white/30 transition hover:bg-white/10 hover:text-white`}
+                     title="Download run log (NDJSON telemetry)"
+                   >
+                     <Download className="h-3 w-3" />
+diff --git a/apps/swarmagents/app/api/runtime/runs/[id]/frame/route.test.ts b/apps/swarmagents/app/api/runtime/runs/[id]/frame/route.test.ts
+new file mode 100644
+index 000000000..15e16f601
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/runs/[id]/frame/route.test.ts
+@@ -0,0 +1,76 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++import { GET } from "./route";
++import { TelemetryBus } from "../../../../../../lib/telemetry/bus";
++import { configureRunsDir } from "../../../../../../lib/telemetry/paths";
++import { saveRunFrame } from "../../../../../../lib/telemetry/frames";
++
++function request(url: string, user: string | null = "alice"): NextRequest {
++  const headers = new Headers();
++  if (user !== null) headers.set("x-swarm-user", user);
++  return new NextRequest(`http://localhost${url}`, { headers });
++}
++
++function ctx(id: string): { params: Promise<{ id: string }> } {
++  return { params: Promise.resolve({ id }) };
++}
++
++function seed(dir: string): void {
++  const bus = new TelemetryBus({ persist: true, runsDir: () => dir });
++  bus.publish("run_1", { type: "run.created", data: { prompt: "frame run", userId: "alice" } });
++  bus.publish("run_1", { type: "run.finished", data: { exitCode: 0 } });
++  bus.publish("run_bob", { type: "run.created", data: { prompt: "bob run", userId: "bob" } });
++}
++
++test("GET run frame streams the archived JPEG to its owner", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-frame-route-"));
++  configureRunsDir(dir);
++  try {
++    seed(dir);
++    const jpeg = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9]);
++    assert.ok(saveRunFrame("run_1", 2, jpeg));
++
++    const res = await GET(request("/api/runtime/runs/run_1/frame?frameId=2"), ctx("run_1"));
++    assert.equal(res.status, 200);
++    assert.equal(res.headers.get("content-type"), "image/jpeg");
++    assert.equal(res.headers.get("cache-control"), "no-store");
++    assert.equal(res.headers.get("content-length"), String(jpeg.byteLength));
++    assert.deepEqual([...new Uint8Array(await res.arrayBuffer())], [...jpeg]);
++
++    // The run detail response advertises the archived frame ids.
++    const { GET: replayGET } = await import("../route");
++    const detail = await replayGET(request("/api/runtime/runs/run_1"), ctx("run_1"));
++    const body = (await detail.json()) as { frames: number[] };
++    assert.deepEqual(body.frames, [2]);
++  } finally {
++    configureRunsDir(null);
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("GET run frame guards auth, ids, ownership and missing frames", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-frame-route-"));
++  configureRunsDir(dir);
++  try {
++    seed(dir);
++    saveRunFrame("run_1", 1, Uint8Array.from([1, 2, 3]));
++
++    assert.equal((await GET(request("/api/runtime/runs/run_1/frame?frameId=1", null), ctx("run_1"))).status, 401);
++    assert.equal((await GET(request("/api/runtime/runs/bad$id/frame?frameId=1"), ctx("bad$id"))).status, 400);
++    assert.equal((await GET(request("/api/runtime/runs/run_missing/frame?frameId=1"), ctx("run_missing"))).status, 404);
++    // Another user's run is a 404, exactly like the run itself.
++    assert.equal((await GET(request("/api/runtime/runs/run_bob/frame?frameId=1"), ctx("run_bob"))).status, 404);
++    // Missing/invalid frameId.
++    assert.equal((await GET(request("/api/runtime/runs/run_1/frame"), ctx("run_1"))).status, 400);
++    assert.equal((await GET(request("/api/runtime/runs/run_1/frame?frameId=zero"), ctx("run_1"))).status, 400);
++    assert.equal((await GET(request("/api/runtime/runs/run_1/frame?frameId=-2"), ctx("run_1"))).status, 400);
++    assert.equal((await GET(request("/api/runtime/runs/run_1/frame?frameId=9"), ctx("run_1"))).status, 404);
++  } finally {
++    configureRunsDir(null);
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/app/api/runtime/runs/[id]/frame/route.ts b/apps/swarmagents/app/api/runtime/runs/[id]/frame/route.ts
+new file mode 100644
+index 000000000..61975b2c5
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/runs/[id]/frame/route.ts
+@@ -0,0 +1,55 @@
++/**
++ * Archived browser frame for Run Replay.
++ *
++ * GET /api/runtime/runs/<id>/frame?frameId=<n> -> image/jpeg
++ *
++ * Frames are archived by the browser manager while a run is live (see
++ * lib/telemetry/frames.ts) so a finished run can show what the page looked
++ * like at the replay cursor. Same ownership rule as the run itself: you can
++ * only read frames of runs whose event log belongs to you.
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { USER_HEADER } from "../../../../../../lib/auth";
++import { RUN_ID_RE } from "../../../../../../lib/telemetry/paths";
++import { readRunFrame } from "../../../../../../lib/telemetry/frames";
++import { getRun } from "../../../../../../lib/runtime/run-store";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++function caller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
++  const user = caller(req);
++  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
++
++  const { id } = await ctx.params;
++  if (!RUN_ID_RE.test(id)) return NextResponse.json({ error: "invalid runId" }, { status: 400 });
++
++  const run = getRun(id);
++  if (!run || (run.summary.userId && run.summary.userId !== user)) {
++    return NextResponse.json({ error: "Run not found." }, { status: 404 });
++  }
++
++  const raw = req.nextUrl.searchParams.get("frameId") ?? "";
++  const frameId = Number(raw);
++  if (!/^\d{1,9}$/.test(raw) || !Number.isInteger(frameId) || frameId <= 0) {
++    return NextResponse.json({ error: "frameId must be a positive integer." }, { status: 400 });
++  }
++
++  const jpeg = readRunFrame(id, frameId);
++  if (!jpeg) return NextResponse.json({ error: "Frame not found." }, { status: 404 });
++
++  const bytes = Uint8Array.from(jpeg);
++  return new Response(bytes, {
++    headers: {
++      "Content-Type": "image/jpeg",
++      "Cache-Control": "no-store",
++      "Content-Length": String(bytes.byteLength),
++    },
++  });
++}
+diff --git a/apps/swarmagents/e2e/replay.spec.ts b/apps/swarmagents/e2e/replay.spec.ts
+new file mode 100644
+index 000000000..588c99352
+--- /dev/null
++++ b/apps/swarmagents/e2e/replay.spec.ts
+@@ -0,0 +1,131 @@
++import assert from "node:assert/strict";
++import { after, test } from "node:test";
++import { captureView, closeBrowser, openWorkspace, runPageTest } from "./lib";
++import { RECORDED_EVENTS, RECORDED_PROMPT, RECORDED_RUN_ID } from "../lib/client/replay.fixture";
++
++after(async () => {
++  await closeBrowser();
++});
++
++const TOTAL = RECORDED_EVENTS.length;
++
++const SUMMARY = {
++  status: "finished",
++  prompt: RECORDED_PROMPT,
++  sessionId: "sess_replay",
++  model: "fake-claude",
++  createdAt: RECORDED_EVENTS[0].ts,
++  durationMs: 42_000,
++  exitCode: 0,
++  costUsd: 0.0331,
++  tokensIn: 4400,
++  tokensOut: 1320,
++};
++
++test("replay: scrub, play, panes and fork from a recorded run", async (t) => {
++  const testName = "replay: scrub, play, panes and fork from a recorded run";
++  let forkBody: Record<string, unknown> | undefined;
++
++  const result = await runPageTest(testName, async ({ page, context }) => {
++    await openWorkspace(page, context);
++
++    // Serve the recorded fixture and accept the fork, without touching a VM.
++    await page.route(`**/api/runtime/runs/${RECORDED_RUN_ID}`, async (route) => {
++      await route.fulfill({
++        status: 200,
++        contentType: "application/json",
++        body: JSON.stringify({
++          runId: RECORDED_RUN_ID,
++          summary: SUMMARY,
++          events: RECORDED_EVENTS,
++          frames: [],
++        }),
++      });
++    });
++    await page.route("**/api/runtime/tasks", async (route) => {
++      if (route.request().method() !== "POST") return route.continue();
++      forkBody = JSON.parse(route.request().postData() ?? "{}") as Record<string, unknown>;
++      await route.fulfill({
++        status: 201,
++        contentType: "application/json",
++        body: JSON.stringify({ runId: "run_fork_1" }),
++      });
++    });
++
++    // Deep link: the replay overlay rides in the workspace hash.
++    await page.evaluate((runId) => {
++      window.location.hash = `#view=computer&tab=terminal&replay=${runId}`;
++    }, RECORDED_RUN_ID);
++
++    const root = page.locator("[data-testid='replay-root']");
++    await root.waitFor({ state: "visible", timeout: 15_000 });
++    await page.getByText(`event ${TOTAL}/${TOTAL}`).first().waitFor({ state: "visible", timeout: 10_000 });
++    await captureView(page, testName, "replay-open");
++
++    // Scrub to the beginning-ish: terminal shows the early steps, files are empty.
++    const scrubber = page.locator("[data-testid='replay-scrubber']");
++    await scrubber.evaluate((el, value) => {
++      const input = el as HTMLInputElement;
++      input.value = String(value);
++      input.dispatchEvent(new Event("input", { bubbles: true }));
++      input.dispatchEvent(new Event("change", { bubbles: true }));
++    }, 4);
++    await page.getByText("event 5/").first().waitFor({ state: "visible", timeout: 10_000 });
++    const terminal = page.locator("[data-testid='replay-terminal']");
++    await terminal.getByText(/step 1/).first().waitFor({ state: "visible", timeout: 10_000 });
++
++    await page.locator("[data-testid='replay-tab-files']").click();
++    await page.getByText("No files written or edited up to this point.").waitFor({ state: "visible", timeout: 10_000 });
++
++    // Playback advances the cursor; 16x advances faster than 1x.
++    await page.locator("[data-testid='replay-tab-terminal']").click();
++    await page.locator("[data-testid='replay-speed-16']").click();
++    assert.equal(await page.locator("[data-testid='replay-speed-16']").getAttribute("aria-pressed"), "true");
++    const before = await page.locator("[data-testid='replay-position']").innerText();
++    await page.locator("[data-testid='replay-play']").click();
++    await page.waitForTimeout(700);
++    const afterPlay = await page.locator("[data-testid='replay-position']").innerText();
++    assert.notEqual(afterPlay, before, `playback should advance the cursor (was ${before})`);
++    const indexAfterPlay = Number(afterPlay.split("/")[0]);
++    assert.ok(indexAfterPlay >= 20, `16x playback should jump several events (at ${afterPlay})`);
++    await page.locator("[data-testid='replay-play']").click();
++    await captureView(page, testName, "replay-playing");
++
++    // Jump to the end: the reconstructed file and its diff are visible.
++    await scrubber.evaluate((el, value) => {
++      const input = el as HTMLInputElement;
++      input.value = String(value);
++      input.dispatchEvent(new Event("input", { bubbles: true }));
++      input.dispatchEvent(new Event("change", { bubbles: true }));
++    }, TOTAL - 1);
++    await page.getByText(`event ${TOTAL}/${TOTAL}`).first().waitFor({ state: "visible", timeout: 10_000 });
++    await page.locator("[data-testid='replay-tab-files']").click();
++    await page.getByText("report.md").first().waitFor({ state: "visible", timeout: 10_000 });
++    await page.getByText("reviewed line").first().waitFor({ state: "visible", timeout: 10_000 });
++    await captureView(page, testName, "replay-files");
++
++    // Screen: the fixture has no archived frames, so the honest empty state shows.
++    await page.locator("[data-testid='replay-tab-screen']").click();
++    await page.getByText("No browser frame at or before this point.").waitFor({ state: "visible", timeout: 10_000 });
++
++    // Events: virtualized rows render.
++    await page.locator("[data-testid='replay-tab-events']").click();
++    assert.ok((await page.locator("[data-testid='replay-event-row']").count()) > 5, "virtualized event rows should render");
++    await page.getByText("run.finished").first().waitFor({ state: "visible", timeout: 10_000 });
++
++    // Keyboard: jump to the next error with "e".
++    await page.locator("[data-testid='replay-tab-terminal']").click();
++    await page.keyboard.press("e");
++    await page.getByText(/command exited with status 1/).first().waitFor({ state: "visible", timeout: 10_000 });
++
++    // Fork from here: resumes the recorded session, then hands the page to the new run.
++    await page.locator("[data-testid='replay-fork-input']").fill("Continue from the failing step and fix it");
++    await page.locator("[data-testid='replay-fork-submit']").click();
++    await page.waitForFunction(() => !document.querySelector("[data-testid='replay-root']"), undefined, { timeout: 10_000 });
++    assert.equal(forkBody?.prompt, "Continue from the failing step and fix it");
++    assert.equal(forkBody?.sessionId, "sess_replay");
++    await captureView(page, testName, "replay-forked");
++  });
++
++  if (result.skipped) t.skip(result.skipped);
++});
+diff --git a/apps/swarmagents/lib/client/replay.fixture.ts b/apps/swarmagents/lib/client/replay.fixture.ts
+new file mode 100644
+index 000000000..bd93f6867
+--- /dev/null
++++ b/apps/swarmagents/lib/client/replay.fixture.ts
+@@ -0,0 +1,135 @@
++/**
++ * A recorded run transcript used by the Run Replay tests and the local
++ * Playwright spec (x1). It is deliberately generated from a small, readable
++ * recording script rather than checked in as a 100 KB blob: the shape matches
++ * exactly what lib/telemetry/run-log.ts persists (seq/type/ts/data), and the
++ * recording is long enough (500+ events) to exercise the virtualized views
++ * and the scrubber at scale.
++ */
++
++import type { PersistedRunEvent } from "./replay";
++
++export const RECORDED_RUN_ID = "run_replay_fixture";
++export const RECORDED_PROMPT = "Audit the workspace and write a report";
++
++const BASE_TS = 1_790_000_000_000;
++const STEPS = 110;
++
++export const RECORDED_EVENTS: PersistedRunEvent[] = (() => {
++  const events: PersistedRunEvent[] = [];
++  let seq = 0;
++  const push = (type: string, data?: unknown) => {
++    seq += 1;
++    events.push({ seq, type, ts: BASE_TS + seq * 137, data, runId: RECORDED_RUN_ID });
++  };
++
++  push("run.created", { prompt: RECORDED_PROMPT, userId: "alice@example.com" });
++  push("run.started", { model: "fake-claude", provider: "mock", sessionId: "sess_replay" });
++
++  for (let step = 1; step <= STEPS; step += 1) {
++    push("assistant.text", { text: `Step ${step}: checking the workspace, then writing what changed.` });
++    push("llm.call", {
++      provider: "mock",
++      model: "fake-claude",
++      outcome: "ok",
++      attempt: 1,
++      latencyMs: 120 + (step % 40),
++      costUsd: 0.0003,
++    });
++    push("tool.call", {
++      name: "Bash",
++      id: `call_bash_${step}`,
++      input: { command: `echo step ${step}`, description: `Step ${step}` },
++    });
++    push("tool.result", {
++      id: `call_bash_${step}`,
++      ok: true,
++      truncated: false,
++      output: `step ${step}\nok\nwrote ${step} rows`,
++    });
++    push("usage", { inputTokens: 40, outputTokens: 12 });
++
++    if (step % 10 === 0) {
++      const frameId = step / 10;
++      push("browser.navigated", { url: `https://example.com/page/${frameId}`, title: `Page ${frameId}` });
++      push("browser.frame", {
++        frameId,
++        width: 1280,
++        height: 800,
++        url: `https://example.com/page/${frameId}`,
++        title: `Page ${frameId}`,
++      });
++    }
++
++    if (step === 5) {
++      push("tool.call", {
++        name: "Write",
++        id: "call_write_report",
++        input: {
++          file_path: "/workspace/report.md",
++          content: "# Report\n\nfirst pass\noutdated line\n",
++        },
++      });
++      push("tool.result", { id: "call_write_report", ok: true, truncated: false, output: "Wrote /workspace/report.md" });
++    }
++
++    if (step === 40) {
++      push("tool.call", {
++        name: "Edit",
++        id: "call_edit_report",
++        input: { file_path: "/workspace/report.md", old_string: "outdated line", new_string: "reviewed line" },
++      });
++      push("tool.result", { id: "call_edit_report", ok: true, truncated: false, output: "Edited /workspace/report.md" });
++    }
++
++    if (step === 41) {
++      push("tool.call", {
++        name: "Edit",
++        id: "call_edit_summary",
++        input: {
++          file_path: "/workspace/summary.md",
++          old_string: "TODO",
++          new_string: "Done",
++        },
++      });
++      push("tool.result", { id: "call_edit_summary", ok: true, truncated: false, output: "Edited /workspace/summary.md" });
++    }
++
++    if (step === 70) {
++      push("tool.call", {
++        name: "Bash",
++        id: "call_bash_fail",
++        input: { command: "false", description: "probe failure" },
++      });
++      push("tool.result", {
++        id: "call_bash_fail",
++        ok: false,
++        truncated: false,
++        output: "command exited with status 1",
++      });
++    }
++
++    if (step === 50) {
++      push("approval.required", {
++        approval: {
++          id: "appr_1",
++          tool: "Bash",
++          action: "rm -rf /workspace/tmp",
++          reason: "destructive command",
++          riskLevel: "ask",
++          expiresAt: BASE_TS + seq * 137 + 300_000,
++        },
++      });
++      push("approval.resolved", { id: "appr_1", verdict: "approved" });
++    }
++  }
++
++  push("run.finished", {
++    exitCode: 0,
++    sessionId: "sess_replay",
++    costUsd: 0.0331,
++    durationMs: 42_000,
++    numTurns: STEPS,
++  });
++  return events;
++})();
+diff --git a/apps/swarmagents/lib/client/replay.test.ts b/apps/swarmagents/lib/client/replay.test.ts
+new file mode 100644
+index 000000000..bb8f26511
+--- /dev/null
++++ b/apps/swarmagents/lib/client/replay.test.ts
+@@ -0,0 +1,238 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  adjacentMarkerIndex,
++  advanceReplay,
++  buildMarkers,
++  buildReplayAt,
++  buildReplayItems,
++  classifyTool,
++  diffLines,
++  markerAtFraction,
++  markerCounts,
++  nearestFrame,
++  nextErrorIndex,
++  prevErrorIndex,
++  replayDiffs,
++  replayFiles,
++  windowRange,
++} from "./replay";
++import { RECORDED_EVENTS } from "./replay.fixture";
++
++const items = buildReplayItems(RECORDED_EVENTS);
++const markers = buildMarkers(items);
++
++function indexOfToolCall(id: string): number {
++  const index = items.findIndex(
++    (item) => item.kind === "tool.call" && (item.data as { id?: string } | undefined)?.id === id,
++  );
++  assert.ok(index >= 0, `fixture is missing tool call ${id}`);
++  return index;
++}
++
++test("recorded fixture is long enough to exercise the virtualized replay", () => {
++  assert.ok(items.length >= 500, `expected 500+ events, got ${items.length}`);
++  assert.equal(items[0]?.kind, "run.created");
++  assert.equal(items[items.length - 1]?.kind, "run.finished");
++  // seq is strictly increasing so cursor indexes map cleanly onto the log.
++  for (let i = 1; i < items.length; i += 1) {
++    assert.ok(items[i].seq > items[i - 1].seq);
++  }
++});
++
++test("buildReplayItems strips ownership identifiers from the payload", () => {
++  const created = items[0].data as Record<string, unknown>;
++  assert.equal(created.prompt, "Audit the workspace and write a report");
++  assert.equal(created.userId, undefined);
++});
++
++test("classifyTool maps bash, edit, browser and unknown tools", () => {
++  assert.equal(classifyTool("Bash"), "bash");
++  assert.equal(classifyTool("Write"), "edit");
++  assert.equal(classifyTool("MultiEdit"), "edit");
++  assert.equal(classifyTool("mcp__files__write"), "edit");
++  assert.equal(classifyTool("mcp__playwright__browser_navigate"), "browser");
++  assert.equal(classifyTool("computer_screenshot"), "browser");
++  assert.equal(classifyTool("TodoWrite"), "other");
++});
++
++test("buildMarkers color-codes every tool call and keeps markers ordered", () => {
++  const counts = markerCounts(markers);
++  assert.equal(counts.bash, 111);
++  assert.equal(counts.edit, 3);
++  assert.equal(counts.browser, 22);
++  assert.equal(counts.llm, 110);
++  assert.equal(counts.error, 1);
++  assert.equal(counts.approval, 1);
++
++  for (let i = 1; i < markers.length; i += 1) {
++    assert.ok(markers[i].index > markers[i - 1].index, "markers must be ascending");
++  }
++  for (const marker of markers) {
++    assert.ok(marker.index >= 0 && marker.index < items.length);
++    assert.ok(marker.label.length > 0);
++  }
++});
++
++test("buildReplayAt is a pure prefix reducer — any cursor is valid", () => {
++  for (const cursor of [0, 1, 42, Math.floor(items.length / 2), items.length - 1]) {
++    const view = buildReplayAt(items, cursor, { markers });
++    assert.equal(view.included, cursor + 1);
++    assert.ok(view.terminal.length >= 0);
++    assert.ok(view.files.length >= 0);
++  }
++  // Out-of-range cursors clamp to the log instead of throwing.
++  assert.equal(buildReplayAt(items, -10).included, 1);
++  assert.equal(buildReplayAt(items, items.length + 10).included, items.length);
++  assert.equal(buildReplayAt([], 0).included, 0);
++});
++
++test("terminal transcript grows with the cursor and carries bash output", () => {
++  const early = buildReplayAt(items, indexOfToolCall("call_bash_1") + 1, { markers });
++  assert.ok(early.terminal.some((line) => line.tone === "cmd" && line.text === "echo step 1"));
++  assert.ok(early.terminal.some((line) => line.tone === "out" && line.text === "wrote 1 rows"));
++
++  const later = buildReplayAt(items, indexOfToolCall("call_bash_50"), { markers });
++  assert.ok(later.terminal.length > early.terminal.length);
++
++  const failure = buildReplayAt(items, indexOfToolCall("call_bash_fail") + 1, { markers });
++  assert.ok(failure.terminal.some((line) => line.tone === "err" && line.text.includes("exited with status 1")));
++});
++
++test("files are reconstructed from Write then Edit events", () => {
++  const beforeWrite = buildReplayAt(items, indexOfToolCall("call_write_report") - 1, { markers });
++  assert.equal(beforeWrite.files.length, 0);
++
++  const afterWrite = buildReplayAt(items, indexOfToolCall("call_write_report"), { markers });
++  assert.equal(afterWrite.files.length, 1);
++  assert.equal(afterWrite.files[0].path, "/workspace/report.md");
++  assert.match(afterWrite.files[0].content ?? "", /outdated line/);
++  assert.equal(afterWrite.files[0].writes, 1);
++  assert.deepEqual(afterWrite.diffs[0].rows.filter((row) => row.type === "add").map((row) => row.text), [
++    "# Report",
++    "",
++    "first pass",
++    "outdated line",
++  ]);
++
++  const afterEdit = buildReplayAt(items, indexOfToolCall("call_edit_report"), { markers });
++  assert.match(afterEdit.files[0].content ?? "", /reviewed line/);
++  assert.ok(!(afterEdit.files[0].content ?? "").includes("outdated line"));
++  // The diff still shows the replaced line against the original write.
++  assert.ok(afterEdit.diffs[0].rows.some((row) => row.type === "del" && row.text === "outdated line"));
++  assert.ok(afterEdit.diffs[0].rows.some((row) => row.type === "add" && row.text === "reviewed line"));
++});
++
++test("an edit of an unknown file shows the recorded hunk instead of guessing", () => {
++  const view = buildReplayAt(items, indexOfToolCall("call_edit_summary"), { markers });
++  const summary = view.files.find((file) => file.path === "/workspace/summary.md");
++  assert.ok(summary, "summary.md should be reconstructed");
++  assert.equal(summary?.unknownBase, true);
++  assert.equal(summary?.content, undefined);
++  assert.deepEqual(summary?.hunks, [{ seq: items[indexOfToolCall("call_edit_summary")].seq, before: "TODO", after: "Done" }]);
++  const diff = view.diffs.find((file) => file.path === "/workspace/summary.md");
++  assert.ok(diff?.rows.some((row) => row.type === "del" && row.text === "TODO"));
++  assert.ok(diff?.rows.some((row) => row.type === "add" && row.text === "Done"));
++});
++
++test("replayFiles and replayDiffs agree with buildReplayAt", () => {
++  const cursor = indexOfToolCall("call_edit_report");
++  assert.deepEqual(replayFiles(items, cursor), buildReplayAt(items, cursor).files);
++  assert.deepEqual(replayDiffs(replayFiles(items, cursor)), buildReplayAt(items, cursor).diffs);
++});
++
++test("reasoning collects assistant text up to the cursor", () => {
++  const first = buildReplayAt(items, indexOfToolCall("call_bash_1"), { markers });
++  assert.equal(first.reasoning.length, 1);
++  assert.match(first.reasoning[0].text, /Step 1/);
++
++  const later = buildReplayAt(items, indexOfToolCall("call_bash_20"), { markers });
++  assert.ok(later.reasoning.length > 1);
++});
++
++test("nearestFrame picks the last archived browser frame at or before the cursor", () => {
++  const frameIndexes = items
++    .map((item, index) => (item.kind === "browser.frame" ? index : -1))
++    .filter((index) => index >= 0);
++  assert.ok(frameIndexes.length >= 10);
++
++  const second = frameIndexes[1];
++  assert.equal(nearestFrame(markers, second + 5, [1, 2, 3])?.frameId, 2);
++  assert.equal(nearestFrame(markers, frameIndexes[0] - 1, [1, 2, 3]), undefined);
++  // Frames that were never archived are skipped.
++  assert.equal(nearestFrame(markers, frameIndexes[4], [3, 4])?.frameId, 4);
++  assert.equal(nearestFrame(markers, frameIndexes[frameIndexes.length - 1], [1, 2])?.frameId, 2);
++  // Without an archive filter the event alone decides.
++  assert.equal(nearestFrame(markers, frameIndexes[0])?.frameId, 1);
++});
++
++test("playback advances by the chosen speed and stops at the end", () => {
++  assert.equal(advanceReplay(0, 100, 1), 1);
++  assert.equal(advanceReplay(10, 100, 4), 14);
++  assert.equal(advanceReplay(90, 100, 16), 99);
++  assert.equal(advanceReplay(99, 100, 16), 99);
++  assert.equal(advanceReplay(5, 100, 0), 6, "a speed below 1 still advances by one");
++  assert.equal(advanceReplay(0, 0, 4), 0);
++});
++
++test("error jumps wrap around the run", () => {
++  const error = markers.find((marker) => marker.kind === "error");
++  assert.ok(error);
++  assert.equal(nextErrorIndex(markers, 0), error.index);
++  assert.equal(nextErrorIndex(markers, error.index), error.index, "wraps to the same only error");
++  assert.equal(nextErrorIndex(markers, items.length - 1), error.index);
++  assert.equal(prevErrorIndex(markers, error.index), error.index);
++  assert.equal(nextErrorIndex([], 0), undefined);
++});
++
++test("adjacentMarkerIndex steps between tool calls", () => {
++  const first = markers[0].index;
++  const second = markers[1].index;
++  assert.equal(adjacentMarkerIndex(markers, first, 1), second);
++  assert.equal(adjacentMarkerIndex(markers, second, -1), first);
++  assert.equal(adjacentMarkerIndex(markers, items.length - 1, 1), first, "wraps forward");
++  assert.equal(adjacentMarkerIndex([], 3, 1), undefined);
++});
++
++test("markerAtFraction snaps a scrub position to the nearest previous marker", () => {
++  const second = markers[1].index;
++  assert.equal(markerAtFraction(markers, items.length, 0), 0);
++  assert.equal(markerAtFraction(markers, items.length, second / (items.length - 1)), second);
++  assert.equal(markerAtFraction(markers, 0, 0.5), 0);
++});
++
++test("windowRange keeps a 5,000-row list to a small slice", () => {
++  const range = windowRange(5000, 34 * 2500, 34, 340, 8);
++  assert.ok(range.start > 2480 && range.start < 2500);
++  assert.ok(range.end - range.start < 30);
++  assert.equal(range.padTop, range.start * 34);
++  assert.equal(range.padBottom, (5000 - range.end) * 34);
++
++  const top = windowRange(5000, 0, 34, 340, 8);
++  assert.equal(top.start, 0);
++  assert.equal(top.padTop, 0);
++
++  const empty = windowRange(0, 500, 34, 340);
++  assert.deepEqual(empty, { start: 0, end: 0, padTop: 0, padBottom: 0 });
++});
++
++test("diffLines trims context and marks removed/added lines", () => {
++  const same = diffLines("a\nb\nc", "a\nb\nc");
++  assert.deepEqual(same.rows, []);
++  assert.equal(same.truncated, false);
++
++  const changed = diffLines("a\nb\nc", "a\nB\nc");
++  assert.deepEqual(changed.rows.map((row) => `${row.type}:${row.text}`), [
++    "ctx:a",
++    "del:b",
++    "add:B",
++    "ctx:c",
++  ]);
++
++  const added = diffLines("", "one\ntwo");
++  assert.deepEqual(added.rows.map((row) => `${row.type}:${row.text}`), ["del:", "add:one", "add:two"]);
++
++  const big = diffLines("old", Array.from({ length: 500 }, (_, i) => `line ${i}`).join("\n"));
++  assert.equal(big.truncated, true);
++  assert.equal(big.rows.length, 400);
++});
+diff --git a/apps/swarmagents/lib/client/replay.ts b/apps/swarmagents/lib/client/replay.ts
+new file mode 100644
+index 000000000..a2558065b
+--- /dev/null
++++ b/apps/swarmagents/lib/client/replay.ts
+@@ -0,0 +1,750 @@
++/**
++ * replay.ts — pure model for the Run Replay time-travel viewer (x1).
++ *
++ * A finished run's durable event log (see lib/telemetry/run-log.ts and
++ * GET /api/runtime/runs/<id>) is the source of truth. This module turns that
++ * log into a scrubbable timeline:
++ *
++ *   - `buildMarkers` classifies every tool-ish event into one color-coded
++ *     marker kind (bash, edit, browser, llm, error, approval);
++ *   - `buildReplayAt` reduces the log *up to a cursor index* into the view
++ *     state the UI renders: tool timeline, terminal transcript, reconstructed
++ *     files + diffs, reasoning text, and the nearest browser frame;
++ *   - playback/seek helpers (`advanceReplay`, `nextErrorIndex`) and a
++ *     row-window helper for virtualizing 5,000+ event lists.
++ *
++ * Everything here is DOM-free and deterministic so it unit-tests under
++ * plain node:test and can be replayed on any prefix of the log.
++ */
++
++import { reduceRunTimeline, redactEventData, type RunTimeline } from "./runTimeline";
++import type { RunStreamItem } from "./useRunStream";
++
++/** A persisted telemetry event as returned by GET /api/runtime/runs/<id>. */
++export interface PersistedRunEvent {
++  seq: number;
++  type: string;
++  ts: number;
++  data?: unknown;
++  runId?: string;
++}
++
++/** Marker kinds rendered on the scrubber rail, in legend order. */
++export type ReplayMarkerKind = "bash" | "edit" | "browser" | "llm" | "error" | "approval" | "other";
++
++export const MARKER_KINDS: readonly ReplayMarkerKind[] = ["bash", "edit", "browser", "llm", "error", "approval", "other"];
++
++/** Tailwind-ish swatches used by both the rail and the legend. */
++export const MARKER_COLOR: Record<ReplayMarkerKind, string> = {
++  bash: "#fbbf24",
++  edit: "#38bdf8",
++  browser: "#34d399",
++  llm: "#a78bfa",
++  error: "#fb7185",
++  approval: "#f59e0b",
++  other: "#94a3b8",
++};
++
++export const MARKER_LABEL: Record<ReplayMarkerKind, string> = {
++  bash: "bash",
++  edit: "edit",
++  browser: "browser",
++  llm: "llm",
++  error: "error",
++  approval: "approval",
++  other: "tool",
++};
++
++export interface ReplayMarker {
++  /** Cursor index (event array position) this marker sits on. */
++  index: number;
++  seq: number;
++  ts: number;
++  kind: ReplayMarkerKind;
++  label: string;
++  /** Present on browser.frame markers so the screenshot pane can load it. */
++  frameId?: number;
++  url?: string;
++  title?: string;
++}
++
++export type ReplayTone = "cmd" | "out" | "err" | "note";
++
++export interface ReplayTerminalLine {
++  seq: number;
++  ts: number;
++  tone: ReplayTone;
++  text: string;
++}
++
++export interface ReplayReasoningEntry {
++  seq: number;
++  ts: number;
++  text: string;
++}
++
++export interface ReplayHunk {
++  seq: number;
++  before: string;
++  after: string;
++}
++
++export interface ReplayFile {
++  path: string;
++  /** Reconstructed content, when the log contained a full Write for it. */
++  content?: string;
++  /** Content before the first recorded touch ("" for a fresh Write). */
++  base?: string;
++  /** True when the file was only ever edited, so its base is unknown. */
++  unknownBase: boolean;
++  writes: number;
++  edits: number;
++  lastSeq: number;
++  hunks: ReplayHunk[];
++}
++
++export type ReplayDiffRowType = "ctx" | "add" | "del";
++
++export interface ReplayDiffRow {
++  type: ReplayDiffRowType;
++  text: string;
++}
++
++export interface ReplayFileDiff {
++  path: string;
++  status: "added" | "modified";
++  added: number;
++  removed: number;
++  rows: ReplayDiffRow[];
++  truncated: boolean;
++}
++
++export interface ReplayFrameRef {
++  seq: number;
++  index: number;
++  frameId: number;
++  url?: string;
++  title?: string;
++}
++
++export interface ReplayViewState {
++  /** Number of events included (cursor index + 1). */
++  included: number;
++  timeline: RunTimeline;
++  terminal: ReplayTerminalLine[];
++  reasoning: ReplayReasoningEntry[];
++  files: ReplayFile[];
++  diffs: ReplayFileDiff[];
++  /** Nearest archived browser frame at or before the cursor. */
++  frame?: ReplayFrameRef;
++}
++
++const BASH_TOOLS = new Set(["bash", "shell", "terminal", "exec", "execute", "run_command"]);
++const EDIT_TOOLS = new Set([
++  "write",
++  "edit",
++  "multiedit",
++  "multi_edit",
++  "notebookedit",
++  "notebook_edit",
++  "str_replace_editor",
++  "str_replace_based_edit_tool",
++  "create_file",
++  "apply_patch",
++]);
++const BROWSER_HINTS = ["playwright", "browser", "computer", "desktop", "screenshot", "chrome"];
++
++const MAX_TERMINAL_LINES = 800;
++const MAX_OUTPUT_LINES_PER_RESULT = 80;
++const MAX_REASONING_CHARS = 20_000;
++const MAX_REASONING_ENTRIES = 200;
++const MAX_FILE_CHARS = 400_000;
++const MAX_DIFF_ROWS = 400;
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function asString(value: unknown): string | undefined {
++  return typeof value === "string" ? value : undefined;
++}
++
++function asNumber(value: unknown): number | undefined {
++  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
++}
++
++/** Normalize a tool name for classification: `mcp__browser__open` -> `browser`. */
++function toolKey(name: string): string {
++  return name.trim().toLowerCase().replace(/^mcp__/, "");
++}
++
++function isBrowserTool(name: string): boolean {
++  const key = toolKey(name);
++  return BROWSER_HINTS.some((hint) => key.includes(hint));
++}
++
++/** Classify a tool call into the marker kind that best describes it. */
++export function classifyTool(name: string): ReplayMarkerKind {
++  const key = toolKey(name);
++  if (BASH_TOOLS.has(key) || key.includes("bash")) return "bash";
++  if (EDIT_TOOLS.has(key)) return "edit";
++  if (isBrowserTool(name)) return "browser";
++  const leaf = key.includes("__") ? key.slice(key.lastIndexOf("__") + 2) : key;
++  if (EDIT_TOOLS.has(leaf)) return "edit";
++  if (BASH_TOOLS.has(leaf)) return "bash";
++  if (isBrowserTool(leaf)) return "browser";
++  return "other";
++}
++
++/** Truncate one display line; replay panes never render unbounded strings. */
++export function clip(value: unknown, max = 220): string {
++  const text = typeof value === "string" ? value : value == null ? "" : JSON.stringify(value);
++  const clean = text.replace(/\u0000/g, "");
++  return clean.length > max ? `${clean.slice(0, max)}…` : clean;
++}
++
++/** Convert persisted events into the RunStreamItem shape the reducers consume. */
++export function buildReplayItems(events: readonly PersistedRunEvent[]): RunStreamItem[] {
++  return events.map((event) => ({
++    seq: event.seq,
++    kind: event.type,
++    data: redactEventData(event.data),
++    ts: event.ts,
++    parsed: { id: String(event.seq), event: event.type, data: "" },
++  }));
++}
++
++function toolCallLabel(name: string, input: unknown): string {
++  const data = isRecord(input) ? input : {};
++  const command = asString(data.command);
++  const file = asString(data.file_path) ?? asString(data.path);
++  const url = asString(data.url) ?? asString(data.goto);
++  if (command) return clip(command, 140);
++  if (file) return clip(file, 140);
++  if (url) return clip(url, 140);
++  if (asString(data.description)) return clip(data.description, 140);
++  return clip(name, 140);
++}
++
++/**
++ * Build the marker rail for a whole run. Markers are indexed by their position
++ * in the events array (not seq) so seeking is a single array index.
++ */
++export function buildMarkers(items: readonly RunStreamItem[]): ReplayMarker[] {
++  const markers: ReplayMarker[] = [];
++  const callNames = new Map<string, string>();
++  items.forEach((item, index) => {
++    const data = isRecord(item.data) ? item.data : {};
++    if (item.kind === "tool.call") {
++      const name = asString(data.name) ?? "tool";
++      const id = asString(data.id);
++      if (id) callNames.set(id, name);
++      markers.push({
++        index,
++        seq: item.seq,
++        ts: item.ts,
++        kind: classifyTool(name),
++        label: toolCallLabel(name, data.input),
++      });
++      return;
++    }
++    if (item.kind === "tool.result" && data.ok === false) {
++      const id = asString(data.id);
++      markers.push({
++        index,
++        seq: item.seq,
++        ts: item.ts,
++        kind: "error",
++        label: `${id ? callNames.get(id) ?? "tool" : "tool"} failed`,
++      });
++      return;
++    }
++    if (item.kind === "tool.blocked") {
++      markers.push({
++        index,
++        seq: item.seq,
++        ts: item.ts,
++        kind: "error",
++        label: `${asString(data.name) ?? "tool"} blocked`,
++      });
++      return;
++    }
++    if (item.kind === "browser.frame") {
++      const frameId = asNumber(data.frameId);
++      markers.push({
++        index,
++        seq: item.seq,
++        ts: item.ts,
++        kind: "browser",
++        label: `frame ${frameId ?? "?"}${asString(data.url) ? ` · ${clip(data.url, 80)}` : ""}`,
++        ...(frameId !== undefined ? { frameId } : {}),
++        ...(asString(data.url) ? { url: asString(data.url) } : {}),
++        ...(asString(data.title) ? { title: asString(data.title) } : {}),
++      });
++      return;
++    }
++    if (item.kind === "browser.navigated") {
++      markers.push({
++        index,
++        seq: item.seq,
++        ts: item.ts,
++        kind: "browser",
++        label: `navigated · ${clip(data.url, 80)}`,
++        ...(asString(data.url) ? { url: asString(data.url) } : {}),
++        ...(asString(data.title) ? { title: asString(data.title) } : {}),
++      });
++      return;
++    }
++    if (item.kind === "computer.action") {
++      markers.push({
++        index,
++        seq: item.seq,
++        ts: item.ts,
++        kind: "browser",
++        label: clip(asString(data.action) ?? "desktop action", 100),
++      });
++      return;
++    }
++    if (item.kind === "llm.call") {
++      const provider = asString(data.provider) ?? "llm";
++      const model = asString(data.model) ?? "";
++      markers.push({
++        index,
++        seq: item.seq,
++        ts: item.ts,
++        kind: data.outcome === "ok" ? "llm" : "error",
++        label: `${provider} ${model}`.trim(),
++      });
++      return;
++    }
++    if (item.kind === "approval.required") {
++      const raw = isRecord(data.approval) ? data.approval : data;
++      markers.push({
++        index,
++        seq: item.seq,
++        ts: item.ts,
++        kind: "approval",
++        label: clip(asString(raw.action) ?? asString(raw.tool) ?? "approval", 120),
++      });
++      return;
++    }
++    if (item.kind === "run.error" || item.kind === "vm.error") {
++      markers.push({
++        index,
++        seq: item.seq,
++        ts: item.ts,
++        kind: "error",
++        label: clip(asString(data.message) ?? "run error", 120),
++      });
++    }
++  });
++  return markers;
++}
++
++/** The nearest browser frame at or before the cursor, when one was archived. */
++export function nearestFrame(
++  markers: readonly ReplayMarker[],
++  index: number,
++  archivedFrames?: ReadonlySet<number> | readonly number[],
++): ReplayFrameRef | undefined {
++  const allowed =
++    archivedFrames === undefined
++      ? undefined
++      : new Set<number>(Array.isArray(archivedFrames) ? archivedFrames : Array.from(archivedFrames as ReadonlySet<number>));
++  let found: ReplayFrameRef | undefined;
++  for (const marker of markers) {
++    if (marker.index > index) break;
++    if (marker.kind !== "browser" || marker.frameId === undefined) continue;
++    if (allowed && !allowed.has(marker.frameId)) continue;
++    found = {
++      seq: marker.seq,
++      index: marker.index,
++      frameId: marker.frameId,
++      ...(marker.url ? { url: marker.url } : {}),
++      ...(marker.title ? { title: marker.title } : {}),
++    };
++  }
++  return found;
++}
++
++// --- file reconstruction --------------------------------------------------
++
++interface FileBuilder {
++  path: string;
++  content?: string;
++  base?: string;
++  unknownBase: boolean;
++  writes: number;
++  edits: number;
++  lastSeq: number;
++  hunks: ReplayHunk[];
++}
++
++function applyEdit(content: string, before: string, after: string, replaceAll: boolean): string {
++  if (!before) return content;
++  if (replaceAll) return content.split(before).join(after);
++  const at = content.indexOf(before);
++  if (at < 0) return content;
++  return content.slice(0, at) + after + content.slice(at + before.length);
++}
++
++function noteHunk(file: FileBuilder, before: string, after: string, seq: number): void {
++  file.hunks.push({ seq, before, after });
++  if (file.hunks.length > 40) file.hunks.shift();
++  const size = file.hunks.reduce((sum, hunk) => sum + hunk.before.length + hunk.after.length, 0);
++  if (size > MAX_FILE_CHARS) file.hunks.shift();
++}
++
++function noteEdit(file: FileBuilder, before: string, after: string, seq: number): void {
++  file.edits += 1;
++  file.lastSeq = seq;
++  noteHunk(file, before, after, seq);
++  if (file.content !== undefined) file.content = applyEdit(file.content, before, after, false);
++}
++
++/** Reconstruct the files the agent wrote/edited, up to the cursor. */
++export function replayFiles(items: readonly RunStreamItem[], endIndex = items.length - 1): ReplayFile[] {
++  const files = new Map<string, FileBuilder>();
++  const last = Math.min(endIndex, items.length - 1);
++  for (let i = 0; i <= last; i += 1) {
++    const item = items[i];
++    if (!item || item.kind !== "tool.call") continue;
++    const data = isRecord(item.data) ? item.data : {};
++    const name = asString(data.name) ?? "";
++    if (classifyTool(name) !== "edit") continue;
++    const input = isRecord(data.input) ? data.input : {};
++    const path = asString(input.file_path) ?? asString(input.path);
++    if (!path) continue;
++    const file = files.get(path) ?? {
++      path,
++      unknownBase: true,
++      writes: 0,
++      edits: 0,
++      lastSeq: item.seq,
++      hunks: [],
++    };
++    files.set(path, file);
++
++    const writeContent = asString(input.content);
++    if (writeContent !== undefined && /(^|__)write$|create_file$|^write$/.test(toolKey(name))) {
++      if (file.content === undefined) file.base = ""; // fresh file written from scratch
++      if (file.writes === 0 && file.base === undefined) file.base = "";
++      file.content = writeContent.slice(0, MAX_FILE_CHARS);
++      file.writes += 1;
++      file.unknownBase = false;
++      file.lastSeq = item.seq;
++      continue;
++    }
++
++    const edits: Array<{ old: string; next: string; all: boolean }> = [];
++    const oldString = asString(input.old_string) ?? asString(input.old_str);
++    const newString = asString(input.new_string) ?? asString(input.new_str);
++    if (oldString !== undefined && newString !== undefined) {
++      edits.push({ old: oldString, next: newString, all: input.replace_all === true });
++    }
++    if (Array.isArray(input.edits)) {
++      for (const raw of input.edits) {
++        if (!isRecord(raw)) continue;
++        const old = asString(raw.old_string) ?? asString(raw.old_str);
++        const next = asString(raw.new_string) ?? asString(raw.new_str);
++        if (old !== undefined && next !== undefined) edits.push({ old, next, all: raw.replace_all === true });
++      }
++    }
++    for (const edit of edits) {
++      if (file.content !== undefined) {
++        file.edits += 1;
++        file.lastSeq = item.seq;
++        noteHunk(file, edit.old, edit.next, item.seq);
++        file.content = applyEdit(file.content, edit.old, edit.next, edit.all).slice(0, MAX_FILE_CHARS);
++      } else {
++        noteEdit(file, edit.old, edit.next, item.seq);
++      }
++    }
++  }
++  return [...files.values()]
++    .map((file) => ({
++      path: file.path,
++      ...(file.content !== undefined ? { content: file.content } : {}),
++      ...(file.base !== undefined ? { base: file.base } : {}),
++      unknownBase: file.unknownBase,
++      writes: file.writes,
++      edits: file.edits,
++      lastSeq: file.lastSeq,
++      hunks: file.hunks,
++    }))
++    .sort((a, b) => a.path.localeCompare(b.path));
++}
++
++/**
++ * Line diff: trim the common prefix/suffix, then mark the remaining middle as
++ * removed-then-added. Deterministic, bounded, and honest about what it does
++ * not compute (a word-level diff) — replays only need a readable change view.
++ */
++export function diffLines(before: string, after: string, maxRows = MAX_DIFF_ROWS): { rows: ReplayDiffRow[]; truncated: boolean } {
++  const a = before.split("\n");
++  const b = after.split("\n");
++  let start = 0;
++  while (start < a.length && start < b.length && a[start] === b[start]) start += 1;
++  let endA = a.length - 1;
++  let endB = b.length - 1;
++  while (endA >= start && endB >= start && a[endA] === b[endB]) {
++    endA -= 1;
++    endB -= 1;
++  }
++
++  const rows: ReplayDiffRow[] = [];
++  const hasChange = start <= endA || start <= endB;
++  if (!hasChange) return { rows, truncated: false };
++  const push = (type: ReplayDiffRowType, text: string) => {
++    if (rows.length < maxRows) rows.push({ type, text });
++  };
++  // A little context before the change keeps the hunk readable.
++  for (let i = Math.max(0, start - 3); i < start; i += 1) push("ctx", a[i]);
++  for (let i = start; i <= endA; i += 1) push("del", a[i]);
++  for (let i = start; i <= endB; i += 1) push("add", b[i]);
++  for (let i = endB + 1; i < Math.min(b.length, endB + 4); i += 1) push("ctx", b[i]);
++
++  const total = endA - start + 1 + (endB - start + 1);
++  return { rows, truncated: total > maxRows };
++}
++
++/** Diff view for the reconstructed files at the cursor. */
++export function replayDiffs(files: readonly ReplayFile[]): ReplayFileDiff[] {
++  return files.map((file) => {
++    let before: string;
++    let after: string;
++    let status: "added" | "modified";
++    if (file.hunks.length > 0) {
++      // Edits carry the exact strings that changed; show those rather than
++      // flattening the whole file into one added block.
++      before = file.hunks.map((hunk) => hunk.before).join("\n");
++      after = file.hunks.map((hunk) => hunk.after).join("\n");
++      status = "modified";
++    } else if (file.unknownBase) {
++      before = "";
++      after = "";
++      status = "modified";
++    } else {
++      before = file.base ?? "";
++      after = file.content ?? "";
++      status = file.writes > 0 ? "added" : "modified";
++    }
++    const { rows, truncated } = diffLines(before, after);
++    return {
++      path: file.path,
++      status,
++      added: rows.filter((row) => row.type === "add").length,
++      removed: rows.filter((row) => row.type === "del").length,
++      rows,
++      truncated,
++    };
++  });
++}
++
++// --- terminal + reasoning -------------------------------------------------
++
++function pushOutputLines(out: ReplayTerminalLine[], item: RunStreamItem, output: string, tone: ReplayTone): void {
++  const lines = output.split("\n");
++  const start = Math.max(0, lines.length - MAX_OUTPUT_LINES_PER_RESULT);
++  for (let i = start; i < lines.length; i += 1) {
++    const text = lines[i].replace(/\s+$/, "");
++    if (!text) continue;
++    out.push({ seq: item.seq, ts: item.ts, tone, text: clip(text, 400) });
++  }
++}
++
++/** Bash/terminal transcript, plus run lifecycle notes, up to the cursor. */
++export function replayTerminal(items: readonly RunStreamItem[], endIndex = items.length - 1): ReplayTerminalLine[] {
++  const out: ReplayTerminalLine[] = [];
++  const commands = new Map<string, string>();
++  const last = Math.min(endIndex, items.length - 1);
++  for (let i = 0; i <= last; i += 1) {
++    const item = items[i];
++    if (!item) continue;
++    const data = isRecord(item.data) ? item.data : {};
++    if (item.kind === "shell.cmd") {
++      const command = asString(data.command);
++      if (command) out.push({ seq: item.seq, ts: item.ts, tone: "cmd", text: clip(command, 400) });
++      continue;
++    }
++    if (item.kind === "tool.call") {
++      const name = asString(data.name) ?? "";
++      if (classifyTool(name) !== "bash") continue;
++      const input = isRecord(data.input) ? data.input : {};
++      const command = asString(input.command);
++      const id = asString(data.id);
++      if (id && command) commands.set(id, command);
++      if (command) out.push({ seq: item.seq, ts: item.ts, tone: "cmd", text: clip(command, 400) });
++      continue;
++    }
++    if (item.kind === "tool.result") {
++      const id = asString(data.id);
++      const output = asString(data.output) ?? "";
++      const ok = data.ok !== false;
++      if (id && commands.has(id) && !output) {
++        out.push({ seq: item.seq, ts: item.ts, tone: ok ? "note" : "err", text: ok ? "(no output)" : "command failed" });
++        continue;
++      }
++      pushOutputLines(out, item, output, ok ? "out" : "err");
++      continue;
++    }
++    if (item.kind === "run.started") {
++      const model = asString(data.model);
++      out.push({ seq: item.seq, ts: item.ts, tone: "note", text: model ? `run started · ${model}` : "run started" });
++      continue;
++    }
++    if (item.kind === "run.finished") {
++      const exitCode = asNumber(data.exitCode);
++      out.push({ seq: item.seq, ts: item.ts, tone: exitCode && exitCode !== 0 ? "err" : "note", text: `run finished · exit ${exitCode ?? 0}` });
++      continue;
++    }
++    if (item.kind === "run.error") {
++      out.push({ seq: item.seq, ts: item.ts, tone: "err", text: `error · ${clip(asString(data.message) ?? "unknown", 300)}` });
++      continue;
++    }
++    if (item.kind === "run.cancelled") {
++      out.push({ seq: item.seq, ts: item.ts, tone: "err", text: `stopped${asString(data.reason) ? ` · ${clip(asString(data.reason), 80)}` : ""}` });
++      continue;
++    }
++    if (item.kind === "tool.blocked") {
++      out.push({ seq: item.seq, ts: item.ts, tone: "err", text: `blocked · ${clip(asString(data.name) ?? "tool", 120)} — ${clip(asString(data.reason) ?? "", 200)}` });
++    }
++  }
++  return out.length > MAX_TERMINAL_LINES ? out.slice(-MAX_TERMINAL_LINES) : out;
++}
++
++/** The agent's own words (assistant text), in order, up to the cursor. */
++export function replayReasoning(items: readonly RunStreamItem[], endIndex = items.length - 1): ReplayReasoningEntry[] {
++  const out: ReplayReasoningEntry[] = [];
++  const last = Math.min(endIndex, items.length - 1);
++  for (let i = 0; i <= last; i += 1) {
++    const item = items[i];
++    if (!item || item.kind !== "assistant.text") continue;
++    const text = typeof item.data === "string" ? item.data : asString(isRecord(item.data) ? item.data.text : undefined);
++    if (!text) continue;
++    out.push({ seq: item.seq, ts: item.ts, text: clip(text, MAX_REASONING_CHARS) });
++  }
++  return out.slice(-MAX_REASONING_ENTRIES);
++}
++
++// --- the reducer ----------------------------------------------------------
++
++/**
++ * Reduce the log up to `index` (inclusive) into the replay view state.
++ * Called on every scrub tick; each pane is rebuilt from the same prefix so the
++ * panes can never disagree about "where we are".
++ */
++export function buildReplayAt(
++  items: readonly RunStreamItem[],
++  index: number,
++  options: { markers?: readonly ReplayMarker[]; archivedFrames?: ReadonlySet<number> | readonly number[] } = {},
++): ReplayViewState {
++  const last = items.length === 0 ? -1 : Math.min(Math.max(0, index), items.length - 1);
++  const slice = last >= 0 ? items.slice(0, last + 1) : [];
++  const files = replayFiles(items, last);
++  const markers = options.markers ?? buildMarkers(items);
++  return {
++    included: last + 1,
++    timeline: reduceRunTimeline(slice),
++    terminal: replayTerminal(items, last),
++    reasoning: replayReasoning(items, last),
++    files,
++    diffs: replayDiffs(files),
++    frame: nearestFrame(markers, last, options.archivedFrames),
++  };
++}
++
++// --- playback + seeking ---------------------------------------------------
++
++/** One playback tick at the given speed (1x/4x/16x events per 250ms). */
++export function advanceReplay(index: number, total: number, speed: number): number {
++  if (total <= 0) return 0;
++  const step = Math.max(1, Math.floor(speed));
++  return Math.min(total - 1, Math.max(0, index) + step);
++}
++
++/** The next error marker after the cursor, wrapping to the first error. */
++export function nextErrorIndex(markers: readonly ReplayMarker[], index: number): number | undefined {
++  const errors = markers.filter((marker) => marker.kind === "error");
++  if (errors.length === 0) return undefined;
++  return (errors.find((marker) => marker.index > index) ?? errors[0]).index;
++}
++
++/** The previous error marker before the cursor, wrapping to the last error. */
++export function prevErrorIndex(markers: readonly ReplayMarker[], index: number): number | undefined {
++  const errors = markers.filter((marker) => marker.kind === "error");
++  if (errors.length === 0) return undefined;
++  return ([...errors].reverse().find((marker) => marker.index < index) ?? errors[errors.length - 1]).index;
++}
++
++/** Step the cursor to the previous/next marker of any kind. */
++export function adjacentMarkerIndex(markers: readonly ReplayMarker[], index: number, direction: 1 | -1): number | undefined {
++  if (markers.length === 0) return undefined;
++  if (direction === 1) {
++    return (markers.find((marker) => marker.index > index) ?? markers[0]).index;
++  }
++  return ([...markers].reverse().find((marker) => marker.index < index) ?? markers[markers.length - 1]).index;
++}
++
++/** Index of the marker nearest (but not after) a 0..1 scrubber position. */
++export function markerAtFraction(markers: readonly ReplayMarker[], total: number, fraction: number): number {
++  if (total <= 0) return 0;
++  const target = Math.round(Math.min(1, Math.max(0, fraction)) * (total - 1));
++  let best: ReplayMarker | undefined;
++  for (const marker of markers) {
++    if (marker.index > target) break;
++    best = marker;
++  }
++  return best ? best.index : target;
++}
++
++// --- virtualization -------------------------------------------------------
++
++export interface WindowRange {
++  start: number;
++  end: number;
++  padTop: number;
++  padBottom: number;
++}
++
++/**
++ * Fixed-row virtual window: given the scroll offset, returns the rows worth
++ * rendering plus the spacer heights above and below. Keeps a 5,000-event list
++ * to a few dozen DOM nodes.
++ */
++export function windowRange(
++  total: number,
++  scrollTop: number,
++  rowHeight: number,
++  viewportHeight: number,
++  overscan = 8,
++): WindowRange {
++  const height = Math.max(1, rowHeight);
++  const viewport = Math.max(0, viewportHeight);
++  const visible = Math.ceil(viewport / height) + 1;
++  const safeTotal = Math.max(0, total);
++  if (safeTotal === 0) return { start: 0, end: 0, padTop: 0, padBottom: 0 };
++  const start = Math.min(safeTotal, Math.max(0, Math.floor(Math.max(0, scrollTop) / height) - overscan));
++  const end = Math.min(safeTotal, start + visible + overscan * 2);
++  return {
++    start,
++    end,
++    padTop: start * height,
++    padBottom: Math.max(0, (safeTotal - end) * height),
++  };
++}
++
++/** Marker counts for the legend. */
++export function markerCounts(markers: readonly ReplayMarker[]): Record<ReplayMarkerKind, number> {
++  const counts: Record<ReplayMarkerKind, number> = {
++    bash: 0,
++    edit: 0,
++    browser: 0,
++    llm: 0,
++    error: 0,
++    approval: 0,
++    other: 0,
++  };
++  for (const marker of markers) counts[marker.kind] += 1;
++  return counts;
++}
+diff --git a/apps/swarmagents/lib/telemetry/frames.test.ts b/apps/swarmagents/lib/telemetry/frames.test.ts
+new file mode 100644
+index 000000000..9a453e006
+--- /dev/null
++++ b/apps/swarmagents/lib/telemetry/frames.test.ts
+@@ -0,0 +1,106 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import {
++  MAX_FRAMES_PER_RUN,
++  MAX_FRAME_BYTES,
++  listRunFrames,
++  readRunFrame,
++  runFramesDir,
++  saveRunFrame,
++} from "./frames";
++
++function tempDir(): string {
++  return fs.mkdtempSync(path.join(os.tmpdir(), "swarm-frames-"));
++}
++
++const jpeg = (size = 32, marker = 1): Uint8Array => {
++  const bytes = new Uint8Array(size);
++  bytes.fill(marker);
++  return bytes;
++};
++
++test("saveRunFrame archives and readRunFrame returns the exact bytes", () => {
++  const dir = tempDir();
++  try {
++    const frame = jpeg(64, 7);
++    const file = saveRunFrame("run_a", 1, frame, dir);
++    assert.ok(file);
++    assert.equal(fs.existsSync(runFramesDir("run_a", dir)), true);
++    const read = readRunFrame("run_a", 1, dir);
++    assert.ok(read);
++    assert.deepEqual([...read], [...frame]);
++    assert.equal(read?.byteLength, 64);
++    assert.deepEqual(listRunFrames("run_a", dir), [1]);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("frames are per run and per id", () => {
++  const dir = tempDir();
++  try {
++    saveRunFrame("run_a", 1, jpeg(8, 1), dir);
++    saveRunFrame("run_a", 2, jpeg(8, 2), dir);
++    saveRunFrame("run_b", 1, jpeg(8, 3), dir);
++    assert.deepEqual(listRunFrames("run_a", dir), [1, 2]);
++    assert.deepEqual(listRunFrames("run_b", dir), [1]);
++    assert.equal(readRunFrame("run_a", 2, dir)?.[0], 2);
++    assert.equal(readRunFrame("run_a", 3, dir), null);
++    assert.equal(readRunFrame("run_missing", 1, dir), null);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("saveRunFrame rejects invalid ids, empty bytes and oversized frames", () => {
++  const dir = tempDir();
++  try {
++    assert.equal(saveRunFrame("bad$id", 1, jpeg(), dir), null);
++    assert.equal(saveRunFrame("run_a", 0, jpeg(), dir), null);
++    assert.equal(saveRunFrame("run_a", -1, jpeg(), dir), null);
++    assert.equal(saveRunFrame("run_a", 1.5, jpeg(), dir), null);
++    assert.equal(saveRunFrame("run_a", 1, new Uint8Array(0), dir), null);
++    assert.equal(saveRunFrame("run_a", 1, jpeg(MAX_FRAME_BYTES + 1), dir), null);
++    assert.deepEqual(listRunFrames("run_a", dir), []);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("saveRunFrame is a no-op without storage", () => {
++  assert.equal(saveRunFrame("run_a", 1, jpeg(), null), null);
++  assert.deepEqual(listRunFrames("run_a", null), []);
++  assert.equal(readRunFrame("run_a", 1, null), null);
++});
++
++test("archival keeps only the newest MAX_FRAMES_PER_RUN frames", () => {
++  const dir = tempDir();
++  try {
++    for (let frameId = 1; frameId <= MAX_FRAMES_PER_RUN + 6; frameId += 1) {
++      saveRunFrame("run_a", frameId, jpeg(16, frameId % 200), dir);
++    }
++    const kept = listRunFrames("run_a", dir);
++    assert.equal(kept.length, MAX_FRAMES_PER_RUN);
++    assert.equal(kept[0], 7);
++    assert.equal(kept[kept.length - 1], MAX_FRAMES_PER_RUN + 6);
++    assert.equal(readRunFrame("run_a", 1, dir), null);
++    assert.ok(readRunFrame("run_a", MAX_FRAMES_PER_RUN + 6, dir));
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("a re-saved frame id replaces its bytes without duplicating", () => {
++  const dir = tempDir();
++  try {
++    saveRunFrame("run_a", 4, jpeg(16, 1), dir);
++    saveRunFrame("run_a", 4, jpeg(16, 9), dir);
++    assert.deepEqual(listRunFrames("run_a", dir), [4]);
++    assert.equal(readRunFrame("run_a", 4, dir)?.[0], 9);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/lib/telemetry/frames.ts b/apps/swarmagents/lib/telemetry/frames.ts
+new file mode 100644
+index 000000000..cdaee2787
+--- /dev/null
++++ b/apps/swarmagents/lib/telemetry/frames.ts
+@@ -0,0 +1,124 @@
++/**
++ * frames.ts — durable browser frames for Run Replay.
++ *
++ * The live browser manager publishes `browser.frame` events (frameId, URL,
++ * title) but the JPEG bytes themselves only lived in memory, so a finished
++ * run could never show what the page looked like mid-run. This module archives
++ * the most recent frames of each run on disk next to its telemetry log, with
++ * strict caps so a long run cannot fill the volume:
++ *
++ *   - at most MAX_FRAMES_PER_RUN frames (oldest dropped first),
++ *   - at most MAX_FRAME_BYTES for any single JPEG (larger frames skipped),
++ *   - at most MAX_FRAME_TOTAL_BYTES per run.
++ *
++ * Everything here is best-effort: archival must never break a live run, so
++ * write errors are swallowed and reads return null.
++ */
++
++import fs from "node:fs";
++import path from "node:path";
++import { getRunsDir, RUN_ID_RE } from "./paths";
++
++export const MAX_FRAMES_PER_RUN = 24;
++export const MAX_FRAME_BYTES = 512 * 1024;
++export const MAX_FRAME_TOTAL_BYTES = 8 * 1024 * 1024;
++
++const FRAME_FILE_RE = /^(\d{1,9})\.jpg$/;
++
++/** Directory holding one run's archived frames. */
++export function runFramesDir(runId: string, runsDir: string = getRunsDir() ?? ""): string {
++  return path.join(runsDir, "frames", runId);
++}
++
++function frameFile(runId: string, frameId: number, runsDir: string): string {
++  return path.join(runFramesDir(runId, runsDir), `${frameId}.jpg`);
++}
++
++function validFrameId(frameId: unknown): frameId is number {
++  return typeof frameId === "number" && Number.isInteger(frameId) && frameId > 0 && frameId < 1_000_000_000;
++}
++
++function listFrameFiles(dir: string): Array<{ frameId: number; file: string; size: number }> {
++  let names: string[];
++  try {
++    names = fs.readdirSync(dir);
++  } catch {
++    return [];
++  }
++  const out: Array<{ frameId: number; file: string; size: number }> = [];
++  for (const name of names) {
++    const match = FRAME_FILE_RE.exec(name);
++    if (!match) continue;
++    const file = path.join(dir, name);
++    try {
++      out.push({ frameId: Number(match[1]), file, size: fs.statSync(file).size });
++    } catch {
++      // A frame removed mid-prune: skip it.
++    }
++  }
++  return out.sort((a, b) => a.frameId - b.frameId);
++}
++
++/** Drop the oldest frames until the run is inside the count and byte caps. */
++function prune(dir: string, frames: Array<{ frameId: number; file: string; size: number }>): void {
++  let total = frames.reduce((sum, frame) => sum + frame.size, 0);
++  let count = frames.length;
++  for (const frame of frames) {
++    if (count <= MAX_FRAMES_PER_RUN && total <= MAX_FRAME_TOTAL_BYTES) break;
++    try {
++      fs.unlinkSync(frame.file);
++      count -= 1;
++      total -= frame.size;
++    } catch {
++      // Ignore: a concurrent reader/pruner already removed it.
++    }
++  }
++}
++
++/**
++ * Archive one JPEG frame for a run. Returns the stored path, or null when the
++ * frame/run id is invalid, the frame is too large, or storage is unavailable.
++ */
++export function saveRunFrame(
++  runId: string,
++  frameId: number,
++  jpeg: Uint8Array,
++  runsDir: string | null = getRunsDir(),
++): string | null {
++  if (!runsDir || !RUN_ID_RE.test(runId) || !validFrameId(frameId)) return null;
++  if (!(jpeg instanceof Uint8Array) || jpeg.byteLength === 0 || jpeg.byteLength > MAX_FRAME_BYTES) return null;
++  const dir = runFramesDir(runId, runsDir);
++  const file = frameFile(runId, frameId, runsDir);
++  try {
++    fs.mkdirSync(dir, { recursive: true });
++    fs.writeFileSync(file, jpeg);
++  } catch (err) {
++    console.error(`[telemetry] could not archive browser frame for ${runId}:`, err);
++    return null;
++  }
++  prune(dir, listFrameFiles(dir));
++  return file;
++}
++
++/** Archived frame ids for one run, oldest first. */
++export function listRunFrames(runId: string, runsDir: string | null = getRunsDir()): number[] {
++  if (!runsDir || !RUN_ID_RE.test(runId)) return [];
++  return listFrameFiles(runFramesDir(runId, runsDir)).map((frame) => frame.frameId);
++}
++
++/** Read one archived frame's bytes, or null when it is missing/unreadable. */
++export function readRunFrame(
++  runId: string,
++  frameId: number,
++  runsDir: string | null = getRunsDir(),
++): Buffer | null {
++  if (!runsDir || !RUN_ID_RE.test(runId) || !validFrameId(frameId)) return null;
++  const file = frameFile(runId, frameId, runsDir);
++  try {
++    const stat = fs.statSync(file);
++    if (!stat.isFile() || stat.size === 0 || stat.size > MAX_FRAME_BYTES) return null;
++    return fs.readFileSync(file);
++  } catch {
++    return null;
++  }
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/RunReplay.tsx b/apps/swarmagents/minimalist-ui/src/components/RunReplay.tsx
+new file mode 100644
+index 000000000..750243cdc
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/RunReplay.tsx
+@@ -0,0 +1,801 @@
++"use client";
++
++/**
++ * RunReplay — time-travel viewer for a finished run (x1).
++ *
++ * Opened from the thread panel (or `#view=computer&replay=<runId>`). Loads the
++ * run's durable event log once, then scrubs it entirely client-side:
++ *
++ *   - a color-coded marker rail + range scrubber (drag, click, keyboard);
++ *   - play/pause at 1x/4x/16x and jump-to-next-error;
++ *   - panes for the terminal transcript, reconstructed files + diffs, the
++ *     nearest archived browser frame, the agent's reasoning, and a virtualized
++ *     raw event list;
++ *   - "fork from here": continue the same session as a new live run.
++ *
++ * See lib/client/replay.ts for the pure reducers (unit-tested separately).
++ */
++
++import { useCallback, useEffect, useMemo, useRef, useState } from "react";
++import { AlertTriangle, ChevronLeft, ChevronRight, FileCode2, GitFork, History, Image as ImageIcon, Loader2, Pause, Play, TerminalSquare, X } from 'lucide-react';
++import {
++  MARKER_COLOR,
++  MARKER_KINDS,
++  MARKER_LABEL,
++  adjacentMarkerIndex,
++  advanceReplay,
++  buildMarkers,
++  buildReplayAt,
++  buildReplayItems,
++  markerCounts,
++  nextErrorIndex,
++  prevErrorIndex,
++  windowRange,
++  type PersistedRunEvent,
++  type ReplayMarker,
++} from '../../../lib/client/replay';
++
++interface RunDetailSummary {
++  status?: string;
++  prompt?: string;
++  sessionId?: string;
++  model?: string;
++  createdAt?: number;
++  durationMs?: number;
++  exitCode?: number;
++  error?: string;
++  costUsd?: number;
++  tokensIn?: number;
++  tokensOut?: number;
++}
++
++interface RunDetail {
++  runId: string;
++  summary: RunDetailSummary;
++  events: PersistedRunEvent[];
++  frames?: number[];
++}
++
++type Pane = "terminal" | "files" | "screen" | "reasoning" | "events";
++
++const SPEEDS = [1, 4, 16] as const;
++const EVENT_ROW_HEIGHT = 34;
++const PLAY_TICK_MS = 250;
++
++const fmtDuration = (ms?: number) => {
++  if (ms == null) return '—';
++  if (ms < 1000) return `${Math.round(ms)}ms`;
++  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
++  return `${Math.floor(ms / 60_000)}m${String(Math.round((ms % 60_000) / 1000)).padStart(2, '0')}s`;
++};
++
++const relTime = (ts: number, base: number) => {
++  const ms = Math.max(0, ts - base);
++  if (ms < 1000) return `+${Math.round(ms)}ms`;
++  if (ms < 60_000) return `+${(ms / 1000).toFixed(1)}s`;
++  return `+${Math.floor(ms / 60_000)}m${String(Math.round((ms % 60_000) / 1000)).padStart(2, '0')}s`;
++};
++
++const markerTitle = (marker: ReplayMarker) => `${MARKER_LABEL[marker.kind]} · event ${marker.seq} · ${marker.label}`;
++
++export function RunReplay({
++  runId,
++  onClose,
++  onFork,
++}: {
++  runId: string;
++  onClose: () => void;
++  /** Hand a freshly dispatched fork run back to the workspace. */
++  onFork: (newRunId: string, prompt: string) => void;
++}) {
++  const [detail, setDetail] = useState<RunDetail | null>(null);
++  const [loadError, setLoadError] = useState<string>();
++  const [index, setIndex] = useState(0);
++  const [pane, setPane] = useState<Pane>("terminal");
++  const [speed, setSpeed] = useState<number>(1);
++  const [playing, setPlaying] = useState(false);
++  const [selectedFile, setSelectedFile] = useState<string>();
++  const [forkPrompt, setForkPrompt] = useState('');
++  const [forking, setForking] = useState(false);
++  const [forkError, setForkError] = useState<string>();
++  const [frameBroken, setFrameBroken] = useState(false);
++  const eventScrollRef = useRef<HTMLDivElement>(null);
++  const terminalScrollRef = useRef<HTMLDivElement>(null);
++  const rootRef = useRef<HTMLDivElement>(null);
++
++  // Load the durable log once per run.
++  useEffect(() => {
++    let cancelled = false;
++    setDetail(null);
++    setLoadError(undefined);
++    setIndex(0);
++    setPlaying(false);
++    setFrameBroken(false);
++    fetch(`/api/runtime/runs/${encodeURIComponent(runId)}`, { cache: 'no-store', headers: { Accept: 'application/json' } })
++      .then(async (res) => {
++        if (!res.ok) {
++          const body = (await res.json().catch(() => null)) as { error?: string } | null;
++          throw new Error(body?.error ?? `Could not load the run (HTTP ${res.status}).`);
++        }
++        return (await res.json()) as RunDetail;
++      })
++      .then((body) => {
++        if (cancelled) return;
++        if (!Array.isArray(body.events) || body.events.length === 0) {
++          setLoadError('This run has no recorded events yet.');
++          return;
++        }
++        setDetail(body);
++        setIndex(body.events.length - 1);
++        setSelectedFile(undefined);
++      })
++      .catch((err) => {
++        if (!cancelled) setLoadError((err as Error).message);
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [runId]);
++
++  const items = useMemo(() => (detail ? buildReplayItems(detail.events) : []), [detail]);
++  const markers = useMemo(() => buildMarkers(items), [items]);
++  const counts = useMemo(() => markerCounts(markers), [markers]);
++  const total = items.length;
++  const archived = useMemo(() => new Set<number>(detail?.frames ?? []), [detail]);
++  const view = useMemo(
++    () => (total > 0 ? buildReplayAt(items, index, { markers, archivedFrames: archived }) : null),
++    [items, index, markers, archived, total],
++  );
++
++  const baseTs = items[0]?.ts ?? 0;
++  const summary = view?.timeline.summary;
++  const activeFile = view?.diffs.find((file) => file.path === selectedFile) ?? view?.diffs[0];
++  const frame = view?.frame;
++
++  const seek = useCallback(
++    (next: number) => {
++      if (total === 0) return;
++      setPlaying(false);
++      setIndex(Math.min(total - 1, Math.max(0, next)));
++    },
++    [total],
++  );
++
++  const nextError = useCallback(() => {
++    const target = nextErrorIndex(markers, index);
++    if (target !== undefined) {
++      setPlaying(false);
++      setIndex(target);
++    }
++  }, [markers, index]);
++
++  // Playback: one tick advances 1/4/16 events; stops at the end.
++  useEffect(() => {
++    if (!playing || total === 0) return;
++    const timer = setInterval(() => {
++      setIndex((current) => {
++        const next = advanceReplay(current, total, speed);
++        if (next >= total - 1) setPlaying(false);
++        return next;
++      });
++    }, PLAY_TICK_MS);
++    return () => clearInterval(timer);
++  }, [playing, total, speed]);
++
++  // Keyboard shortcuts (ignored while typing in the fork prompt).
++  useEffect(() => {
++    const onKeyDown = (event: KeyboardEvent) => {
++      const el = event.target as HTMLElement | null;
++      const typing = !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
++      if (typing) return;
++      const step = event.shiftKey ? 5 : 1;
++      switch (event.key) {
++        case 'Escape':
++          event.preventDefault();
++          onClose();
++          break;
++        case ' ':
++          event.preventDefault();
++          setPlaying((value) => !value);
++          break;
++        case 'ArrowLeft':
++          event.preventDefault();
++          if (event.altKey) {
++            const target = adjacentMarkerIndex(markers, index, -1);
++            if (target !== undefined) seek(target);
++          } else {
++            seek(index - step);
++          }
++          break;
++        case 'ArrowRight':
++          event.preventDefault();
++          if (event.altKey) {
++            const target = adjacentMarkerIndex(markers, index, 1);
++            if (target !== undefined) seek(target);
++          } else {
++            seek(index + step);
++          }
++          break;
++        case 'Home':
++          event.preventDefault();
++          seek(0);
++          break;
++        case 'End':
++          event.preventDefault();
++          seek(total - 1);
++          break;
++        case 'e':
++        case 'E':
++          event.preventDefault();
++          nextError();
++          break;
++        default:
++          break;
++      }
++    };
++    window.addEventListener('keydown', onKeyDown);
++    return () => window.removeEventListener('keydown', onKeyDown);
++  }, [index, markers, onClose, seek, nextError, total]);
++
++  // Keep the event list pinned to the cursor.
++  useEffect(() => {
++    if (pane !== 'events') return;
++    const el = eventScrollRef.current;
++    if (!el) return;
++    el.scrollTop = Math.max(0, view ? (view.included - 1) * EVENT_ROW_HEIGHT - el.clientHeight / 2 : 0);
++  }, [index, pane, view]);
++
++  // Keep the terminal pinned to its newest line.
++  useEffect(() => {
++    if (pane !== 'terminal') return;
++    const el = terminalScrollRef.current;
++    if (el) el.scrollTop = el.scrollHeight;
++  }, [index, pane]);
++
++  const fork = async () => {
++    const prompt = forkPrompt.trim();
++    if (!prompt || forking) return;
++    setForking(true);
++    setForkError(undefined);
++    try {
++      const res = await fetch('/api/runtime/tasks', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({
++          prompt,
++          ...(detail?.summary.sessionId ? { sessionId: detail.summary.sessionId } : {}),
++        }),
++      });
++      const body = (await res.json().catch(() => null)) as { runId?: string; error?: string } | null;
++      if (!res.ok || !body?.runId) {
++        setForkError(body?.error ?? `Could not start the fork (HTTP ${res.status}).`);
++        return;
++      }
++      onFork(body.runId, prompt);
++    } catch (err) {
++      setForkError((err as Error).message);
++    } finally {
++      setForking(false);
++    }
++  };
++
++  const position = total > 0 ? ((index + 1) / total) * 100 : 0;
++
++  return (
++    <div
++      ref={rootRef}
++      data-testid="replay-root"
++      role="dialog"
++      aria-modal="true"
++      aria-label="Run replay"
++      className="fixed inset-0 z-50 flex flex-col bg-[#08080c]/97 backdrop-blur-xl"
++    >
++      {/* header */}
++      <header className="flex flex-wrap items-center gap-2 border-b border-white/10 px-3 py-2.5 sm:px-5">
++        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-violet-400/10 text-violet-300">
++          <History className="h-4 w-4" />
++        </span>
++        <div className="min-w-0 flex-1">
++          <div className="truncate text-sm font-medium text-white/90">Run replay</div>
++          <div className="truncate font-mono text-[10px] text-white/40">
++            {runId}
++            {detail?.summary.prompt ? ` · ${detail.summary.prompt}` : ''}
++          </div>
++        </div>
++        <div className="flex items-center gap-3 font-mono text-[10px] text-white/45">
++          <span>event <span data-testid="replay-position" className="text-white/80">{total ? index + 1 : 0}/{total}</span></span>
++          {summary?.durationMs != null && <span>run <span className="text-white/80">{fmtDuration(summary.durationMs)}</span></span>}
++          {summary?.model && <span className="hidden sm:inline">{summary.model}</span>}
++        </div>
++        <button
++          type="button"
++          onClick={onClose}
++          aria-label="Close replay"
++          className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-white/10 text-white/60 transition hover:bg-white/15 hover:text-white"
++        >
++          <X className="h-4 w-4" />
++        </button>
++      </header>
++
++      {loadError ? (
++        <div className="flex flex-1 items-center justify-center p-6">
++          <div className="max-w-md rounded-2xl border border-rose-400/20 bg-rose-400/5 px-5 py-6 text-center">
++            <AlertTriangle className="mx-auto mb-2 h-5 w-5 text-rose-300" />
++            <p className="text-sm text-rose-200">{loadError}</p>
++            <button onClick={onClose} className="mt-4 rounded-full bg-white/10 px-4 py-1.5 text-xs text-white/80 hover:bg-white/15">
++              Back to the workspace
++            </button>
++          </div>
++        </div>
++      ) : !detail || !view ? (
++        <div className="flex flex-1 items-center justify-center gap-2 font-mono text-xs text-white/40">
++          <Loader2 className="h-4 w-4 animate-spin" />
++          loading the recorded run…
++        </div>
++      ) : (
++        <div className="flex min-h-0 flex-1 flex-col">
++          {/* timeline rail */}
++          <div className="border-b border-white/10 px-3 pb-2 pt-3 sm:px-5">
++            <div className="relative h-7 w-full">
++              <div
++                className="absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full bg-white/10"
++                aria-hidden="true"
++              >
++                <div className="h-full rounded-full bg-white/40" style={{ width: `${position}%` }} />
++              </div>
++              <ol className="absolute inset-0" aria-label="Tool markers">
++                {markers.map((marker) => (
++                  <li key={`${marker.kind}-${marker.seq}`} className="absolute top-0 h-full" style={{ left: `${total > 1 ? (marker.index / (total - 1)) * 100 : 0}%` }}>
++                    <button
++                      type="button"
++                      data-testid="replay-marker"
++                      title={markerTitle(marker)}
++                      aria-label={markerTitle(marker)}
++                      onClick={() => seek(marker.index)}
++                      className={`absolute top-1/2 h-3 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-sm transition hover:scale-125 ${
++                        marker.index === index ? 'ring-2 ring-white/80' : ''
++                      }`}
++                      style={{ background: MARKER_COLOR[marker.kind], opacity: marker.index > index ? 0.45 : 1 }}
++                    />
++                  </li>
++                ))}
++              </ol>
++            </div>
++            <div className="mt-2 flex items-center gap-2">
++              <button
++                type="button"
++                data-testid="replay-play"
++                aria-pressed={playing}
++                onClick={() => {
++                  setPlaying((value) => {
++                    if (!value && index >= total - 1) setIndex(0);
++                    return !value;
++                  });
++                }}
++                className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-white/10 text-white/80 transition hover:bg-white/20"
++                title={playing ? 'Pause (space)' : 'Play (space)'}
++              >
++                {playing ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
++              </button>
++              <div className="flex shrink-0 items-center gap-0.5 rounded-full bg-white/5 p-0.5">
++                {SPEEDS.map((value) => (
++                  <button
++                    key={value}
++                    type="button"
++                    data-testid={`replay-speed-${value}`}
++                    aria-pressed={speed === value}
++                    onClick={() => setSpeed(value)}
++                    className={`rounded-full px-2 py-0.5 font-mono text-[10px] transition ${
++                      speed === value ? 'bg-white/15 text-white' : 'text-white/45 hover:text-white/80'
++                    }`}
++                  >
++                    {value}x
++                  </button>
++                ))}
++              </div>
++              <button
++                type="button"
++                onClick={() => seek(index - 1)}
++                disabled={index <= 0}
++                aria-label="Previous event"
++                className="grid h-7 w-7 shrink-0 place-items-center rounded-full text-white/50 transition hover:bg-white/10 hover:text-white disabled:opacity-30"
++              >
++                <ChevronLeft className="h-4 w-4" />
++              </button>
++              <input
++                type="range"
++                data-testid="replay-scrubber"
++                aria-label="Scrub the run"
++                min={0}
++                max={Math.max(0, total - 1)}
++                step={1}
++                value={index}
++                onChange={(event) => seek(Number(event.target.value))}
++                className="h-1.5 min-w-0 flex-1 cursor-pointer accent-violet-400"
++              />
++              <button
++                type="button"
++                onClick={() => seek(index + 1)}
++                disabled={index >= total - 1}
++                aria-label="Next event"
++                className="grid h-7 w-7 shrink-0 place-items-center rounded-full text-white/50 transition hover:bg-white/10 hover:text-white disabled:opacity-30"
++              >
++                <ChevronRight className="h-4 w-4" />
++              </button>
++              <button
++                type="button"
++                onClick={nextError}
++                disabled={counts.error === 0}
++                className="flex shrink-0 items-center gap-1 rounded-full bg-rose-400/10 px-2 py-1 font-mono text-[10px] text-rose-300 transition hover:bg-rose-400/20 disabled:opacity-30"
++                title="Jump to the next error (E)"
++              >
++                <AlertTriangle className="h-3 w-3" />
++                {counts.error}
++              </button>
++            </div>
++            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[9.5px] uppercase tracking-wide text-white/35">
++              {MARKER_KINDS.filter((kind) => counts[kind] > 0).map((kind) => (
++                <span key={kind} className="flex items-center gap-1">
++                  <span className="h-1.5 w-1.5 rounded-full" style={{ background: MARKER_COLOR[kind] }} />
++                  {MARKER_LABEL[kind]} {counts[kind]}
++                </span>
++              ))}
++              <span className="ml-auto hidden text-white/25 sm:inline">←/→ step · alt+←/→ marker · space play · e error</span>
++            </div>
++          </div>
++
++          {/* fork bar */}
++          <div className="flex flex-wrap items-center gap-2 border-b border-white/10 bg-white/[0.02] px-3 py-2 sm:px-5">
++            <span className="flex shrink-0 items-center gap-1.5 text-[11px] text-white/55">
++              <GitFork className="h-3.5 w-3.5" />
++              Fork from here
++            </span>
++            <input
++              data-testid="replay-fork-input"
++              value={forkPrompt}
++              onChange={(event) => setForkPrompt(event.target.value)}
++              onKeyDown={(event) => {
++                if (event.key === 'Enter') void fork();
++              }}
++              placeholder="What should the agent do differently from this point?"
++              className="min-w-0 flex-1 rounded-full border border-white/10 bg-black/40 px-3 py-1.5 text-xs text-white/85 placeholder:text-white/25 focus:border-violet-400/50 focus:outline-none"
++            />
++            <button
++              type="button"
++              data-testid="replay-fork-submit"
++              onClick={() => void fork()}
++              disabled={forking || !forkPrompt.trim()}
++              className="flex shrink-0 items-center gap-1.5 rounded-full bg-violet-500/20 px-3 py-1.5 text-xs text-violet-200 transition hover:bg-violet-500/30 disabled:opacity-40"
++              title={
++                detail.summary.sessionId
++                  ? 'Starts a new run that resumes this session'
++                  : 'Starts a new run with this prompt'
++              }
++            >
++              {forking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <GitFork className="h-3.5 w-3.5" />}
++              Fork
++            </button>
++            {forkError && <span className="w-full text-[11px] text-rose-300/90">{forkError}</span>}
++            <span className="w-full font-mono text-[9.5px] text-white/25">
++              {detail.summary.sessionId
++                ? 'Fork resumes this run\u2019s Claude session; files on the VM stay at their latest state.'
++                : 'This run has no resumable session; the fork starts fresh with your prompt.'}
++            </span>
++          </div>
++
++          {/* panes */}
++          <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
++            <div className="flex min-h-0 flex-1 flex-col">
++              <nav className="flex shrink-0 items-center gap-1 overflow-x-auto px-2 py-1.5" aria-label="Replay panes">
++                <PaneTab pane="terminal" active={pane} onSelect={setPane} icon={<TerminalSquare className="h-3.5 w-3.5" />} label="Terminal" badge={view.terminal.length} />
++                <PaneTab pane="files" active={pane} onSelect={setPane} icon={<FileCode2 className="h-3.5 w-3.5" />} label="Files" badge={view.diffs.length} />
++                <PaneTab pane="screen" active={pane} onSelect={setPane} icon={<ImageIcon className="h-3.5 w-3.5" />} label="Screen" badge={detail.frames?.length ?? 0} />
++                <PaneTab pane="reasoning" active={pane} onSelect={setPane} icon={<History className="h-3.5 w-3.5" />} label="Reasoning" badge={view.reasoning.length} />
++                <PaneTab pane="events" active={pane} onSelect={setPane} icon={<GitFork className="h-3.5 w-3.5" />} label="Events" badge={view.included} />
++              </nav>
++
++              <div className="min-h-0 flex-1 overflow-hidden px-2 pb-2 sm:px-3">
++                {pane === 'terminal' && (
++                  <div
++                    ref={terminalScrollRef}
++                    data-testid="replay-terminal"
++                    className="h-full overflow-y-auto rounded-xl border border-white/10 bg-black/50 p-3 font-mono text-[11px] leading-relaxed"
++                  >
++                    {view.terminal.length === 0 ? (
++                      <p className="text-white/30">No terminal activity up to this point.</p>
++                    ) : (
++                      view.terminal.slice(-300).map((line, i) => (
++                        <div key={`${line.seq}-${i}`} className="flex gap-2">
++                          <span className="w-14 shrink-0 text-right text-white/20">{relTime(line.ts, baseTs)}</span>
++                          <span className={line.tone === 'cmd' ? 'text-cyan-200/90' : line.tone === 'err' ? 'text-rose-300/90' : line.tone === 'note' ? 'text-white/40' : 'text-white/75'}>
++                            {line.tone === 'cmd' ? `$ ${line.text}` : line.text}
++                          </span>
++                        </div>
++                      ))
++                    )}
++                  </div>
++                )}
++
++                {pane === 'files' && (
++                  <div className="flex h-full min-h-0 gap-2">
++                    <div className="w-2/5 min-w-[120px] overflow-y-auto rounded-xl border border-white/10 bg-black/40 p-2">
++                      {view.diffs.length === 0 ? (
++                        <p className="p-1 font-mono text-[10.5px] text-white/30">No files written or edited up to this point.</p>
++                      ) : (
++                        <ul className="space-y-0.5">
++                          {view.diffs.map((file) => (
++                            <li key={file.path}>
++                              <button
++                                type="button"
++                                onClick={() => setSelectedFile(file.path)}
++                                className={`w-full truncate rounded-md px-1.5 py-1 text-left font-mono text-[10.5px] transition ${
++                                  activeFile?.path === file.path ? 'bg-white/10 text-white' : 'text-white/55 hover:bg-white/5 hover:text-white/85'
++                                }`}
++                                title={file.path}
++                              >
++                                {file.path.split('/').pop()}
++                                <span className="ml-1 text-emerald-300/70">+{file.added}</span>
++                                <span className="ml-0.5 text-rose-300/70">-{file.removed}</span>
++                              </button>
++                            </li>
++                          ))}
++                        </ul>
++                      )}
++                    </div>
++                    <div className="min-w-0 flex-1 overflow-auto rounded-xl border border-white/10 bg-black/50 p-3">
++                      {!activeFile ? (
++                        <p className="font-mono text-[10.5px] text-white/30">Pick a file to see its diff at this point in the run.</p>
++                      ) : (
++                        <>
++                          <div className="mb-2 flex flex-wrap items-center gap-2 font-mono text-[10px] text-white/40">
++                            <span className="truncate text-white/70">{activeFile.path}</span>
++                            <span className="rounded-full bg-white/5 px-1.5 py-px uppercase">{activeFile.status}</span>
++                            <span className="text-emerald-300/70">+{activeFile.added}</span>
++                            <span className="text-rose-300/70">-{activeFile.removed}</span>
++                          </div>
++                          {activeFile.rows.map((row, i) => (
++                            <div
++                              key={i}
++                              className={`whitespace-pre-wrap break-words font-mono text-[10.5px] leading-relaxed ${
++                                row.type === 'add' ? 'bg-emerald-400/5 text-emerald-200/90' : row.type === 'del' ? 'bg-rose-400/5 text-rose-200/90' : 'text-white/45'
++                              }`}
++                            >
++                              {row.type === 'add' ? '+ ' : row.type === 'del' ? '- ' : '  '}
++                              {row.text || ' '}
++                            </div>
++                          ))}
++                          {activeFile.truncated && <p className="mt-2 font-mono text-[10px] text-white/30">Diff truncated for readability.</p>}
++                        </>
++                      )}
++                    </div>
++                  </div>
++                )}
++
++                {pane === 'screen' && (
++                  <div className="flex h-full flex-col overflow-auto rounded-xl border border-white/10 bg-black/40 p-3">
++                    {frame && !frameBroken ? (
++                      <>
++                        <div className="mb-2 flex flex-wrap items-center gap-2 font-mono text-[10px] text-white/40">
++                          <span>frame {frame.frameId}</span>
++                          <span>{relTime(frame.seq === 0 ? baseTs : (items.find((item) => item.seq === frame.seq)?.ts ?? baseTs), baseTs)}</span>
++                          {frame.url && <span className="truncate text-white/60">{frame.url}</span>}
++                        </div>
++                        {/* eslint-disable-next-line @next/next/no-img-element */}
++                        <img
++                          src={`/api/runtime/runs/${encodeURIComponent(runId)}/frame?frameId=${frame.frameId}`}
++                          alt={frame.title || `Browser frame ${frame.frameId}`}
++                          className="max-h-[70vh] w-auto max-w-full self-start rounded-lg border border-white/10"
++                          onError={() => setFrameBroken(true)}
++                        />
++                      </>
++                    ) : (
++                      <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
++                        <ImageIcon className="h-6 w-6 text-white/25" />
++                        <p className="font-mono text-[11px] text-white/40">
++                          {frame ? 'This frame was not archived.' : 'No browser frame at or before this point.'}
++                        </p>
++                        <p className="max-w-sm font-mono text-[10px] text-white/25">
++                          Frames are archived while the agent drives the browser; the Screen tab shows the nearest one.
++                        </p>
++                      </div>
++                    )}
++                  </div>
++                )}
++
++                {pane === 'reasoning' && (
++                  <div className="h-full overflow-y-auto rounded-xl border border-white/10 bg-black/40 p-3">
++                    {view.reasoning.length === 0 ? (
++                      <p className="font-mono text-[10.5px] text-white/30">No assistant text up to this point.</p>
++                    ) : (
++                      <ol className="space-y-3">
++                        {view.reasoning.map((entry, i) => (
++                          <li key={`${entry.seq}-${i}`} className="rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2">
++                            <div className="mb-1 font-mono text-[9.5px] text-white/30">
++                              event {entry.seq} · {relTime(entry.ts, baseTs)}
++                            </div>
++                            <p className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-white/75">{entry.text}</p>
++                          </li>
++                        ))}
++                      </ol>
++                    )}
++                  </div>
++                )}
++
++                {pane === 'events' && (
++                  <VirtualEventList
++                    items={items}
++                    included={view.included}
++                    index={index}
++                    onSeek={seek}
++                    scrollRef={eventScrollRef}
++                  />
++                )}
++              </div>
++            </div>
++
++            {/* summary rail (desktop) */}
++            <aside className="hidden w-72 shrink-0 flex-col gap-3 overflow-y-auto border-l border-white/10 p-3 lg:flex">
++              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
++                <div className="mb-2 text-[10px] uppercase tracking-widest text-white/30">At this point</div>
++                <dl className="space-y-1 font-mono text-[10.5px]">
++                  <SummaryRow label="status" value={summary?.error ? 'error' : summary?.cancelledReason ? 'stopped' : summary?.finishedAt ? 'finished' : 'running'} />
++                  <SummaryRow label="elapsed" value={summary?.finishedAt && summary.startedAt ? fmtDuration(summary.finishedAt - summary.startedAt) : '—'} />
++                  <SummaryRow label="tools" value={String(view.timeline.tools.length)} />
++                  <SummaryRow label="tokens" value={summary?.usageReported ? `${summary.tokensIn} in / ${summary.tokensOut} out` : '—'} />
++                  <SummaryRow label="cost" value={summary?.costUsd != null ? `$${summary.costUsd.toFixed(3)}` : '—'} />
++                  <SummaryRow label="files" value={String(view.files.length)} />
++                </dl>
++              </div>
++              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
++                <div className="mb-2 text-[10px] uppercase tracking-widest text-white/30">Tool timeline</div>
++                <ul className="space-y-1">
++                  {view.timeline.tools.slice(-14).reverse().map((tool) => (
++                    <li key={tool.id} className="flex items-center gap-2 font-mono text-[10px] text-white/55">
++                      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tool.ok === false ? 'bg-rose-400' : tool.status === 'running' ? 'bg-cyan-300' : 'bg-white/30'}`} />
++                      <span className="min-w-0 flex-1 truncate">{tool.name}</span>
++                      <span className="shrink-0 text-white/30">{fmtDuration(tool.durationMs)}</span>
++                    </li>
++                  ))}
++                  {view.timeline.tools.length === 0 && <li className="font-mono text-[10px] text-white/25">No tool calls yet</li>}
++                </ul>
++              </div>
++              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 font-mono text-[10px] text-white/40">
++                <div className="mb-1 text-[10px] uppercase tracking-widest text-white/30">Jump</div>
++                <div className="flex flex-wrap gap-1">
++                  <JumpChip label="prev error" onClick={() => { const target = prevErrorIndex(markers, index); if (target !== undefined) seek(target); }} disabled={counts.error === 0} />
++                  <JumpChip label="next error" onClick={nextError} disabled={counts.error === 0} />
++                  <JumpChip label="start" onClick={() => seek(0)} />
++                  <JumpChip label="end" onClick={() => seek(total - 1)} />
++                </div>
++              </div>
++            </aside>
++          </div>
++        </div>
++      )}
++    </div>
++  );
++}
++
++function SummaryRow({ label, value }: { label: string; value: string }) {
++  return (
++    <div className="flex items-center justify-between gap-2">
++      <dt className="text-white/35">{label}</dt>
++      <dd className="truncate text-white/75">{value}</dd>
++    </div>
++  );
++}
++
++function JumpChip({ label, onClick, disabled }: { label: string; onClick: () => void; disabled?: boolean }) {
++  return (
++    <button
++      type="button"
++      onClick={onClick}
++      disabled={disabled}
++      className="rounded-full bg-white/5 px-2 py-0.5 text-white/55 transition hover:bg-white/10 hover:text-white disabled:opacity-30"
++    >
++      {label}
++    </button>
++  );
++}
++
++function PaneTab({
++  pane,
++  active,
++  onSelect,
++  icon,
++  label,
++  badge,
++}: {
++  pane: Pane;
++  active: Pane;
++  onSelect: (pane: Pane) => void;
++  icon: React.ReactNode;
++  label: string;
++  badge: number;
++}) {
++  const isActive = active === pane;
++  return (
++    <button
++      type="button"
++      data-testid={`replay-tab-${pane}`}
++      aria-pressed={isActive}
++      onClick={() => onSelect(pane)}
++      className={`flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] transition ${
++        isActive ? 'bg-white/10 text-white' : 'text-white/45 hover:bg-white/5 hover:text-white/80'
++      }`}
++    >
++      {icon}
++      {label}
++      {badge > 0 && <span className="font-mono text-[9.5px] text-white/30">{badge}</span>}
++    </button>
++  );
++}
++
++/**
++ * Virtualized raw event list: only the rows in view are rendered, so a run
++ * with 5,000+ events stays responsive while the cursor moves.
++ */
++function VirtualEventList({
++  items,
++  included,
++  index,
++  onSeek,
++  scrollRef,
++}: {
++  items: ReturnType<typeof buildReplayItems>;
++  included: number;
++  index: number;
++  onSeek: (index: number) => void;
++  scrollRef: React.RefObject<HTMLDivElement | null>;
++}) {
++  const [scrollTop, setScrollTop] = useState(0);
++  const [viewport, setViewport] = useState(320);
++  const rows = items.slice(0, included);
++  const range = windowRange(rows.length, scrollTop, EVENT_ROW_HEIGHT, viewport);
++
++  useEffect(() => {
++    const el = scrollRef.current;
++    if (!el) return;
++    const measure = () => setViewport(el.clientHeight || 320);
++    measure();
++    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
++    observer?.observe(el);
++    return () => observer?.disconnect();
++  }, [scrollRef]);
++
++  return (
++    <div
++      ref={(node) => {
++        scrollRef.current = node;
++      }}
++      data-testid="replay-events"
++      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
++      className="h-full overflow-y-auto rounded-xl border border-white/10 bg-black/40"
++    >
++      <div style={{ paddingTop: range.padTop, paddingBottom: range.padBottom }}>
++        {rows.slice(range.start, range.end).map((item, offset) => {
++          const rowIndex = range.start + offset;
++          const isCursor = rowIndex === index;
++          const data = item.data;
++          const summary = typeof data === 'string' ? data : data && typeof data === 'object' ? JSON.stringify(data) : '';
++          return (
++            <button
++              key={item.seq}
++              type="button"
++              data-testid="replay-event-row"
++              onClick={() => onSeek(rowIndex)}
++              style={{ height: EVENT_ROW_HEIGHT }}
++              className={`flex w-full items-center gap-2 border-b border-white/5 px-2 text-left font-mono text-[10px] transition ${
++                isCursor ? 'bg-violet-400/15 text-white' : 'text-white/55 hover:bg-white/5'
++              }`}
++            >
++              <span className="w-10 shrink-0 text-white/25">{item.seq}</span>
++              <span className="w-32 shrink-0 truncate text-white/70">{item.kind}</span>
++              <span className="min-w-0 flex-1 truncate text-white/35">{summary.slice(0, 160)}</span>
++            </button>
++          );
++        })}
++      </div>
++    </div>
++  );
++}

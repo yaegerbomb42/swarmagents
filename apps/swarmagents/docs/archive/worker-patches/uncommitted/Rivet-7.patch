@@ -1,0 +1,1151 @@
+diff --git a/apps/swarmagents/lib/templates/_check.ts b/apps/swarmagents/lib/templates/_check.ts
+new file mode 100644
+index 0000000..2753e50
+--- /dev/null
++++ b/apps/swarmagents/lib/templates/_check.ts
+@@ -0,0 +1,23 @@
++import { TASK_TEMPLATES } from "./data";
++import { TASK_TEMPLATE_SCHEMA, extractPlaceholders } from "./schema";
++
++let bad = 0;
++for (const t of TASK_TEMPLATES) {
++  const parsed = TASK_TEMPLATE_SCHEMA.safeParse(t);
++  if (!parsed.success) {
++    bad++;
++    console.log(`PARSE FAIL ${t.id}:`, parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "));
++    continue;
++  }
++  const refs = extractPlaceholders(t.prompt);
++  const names = t.variables.map((v) => v.name);
++  const missing = refs.filter((r) => !names.includes(r));
++  const extra = names.filter((n) => !refs.includes(n));
++  const dup = names.length !== new Set(names).size;
++  const badId = !/^[a-z0-9][a-z0-9-_]*$/.test(t.id);
++  if (missing.length || extra.length || dup || badId) {
++    bad++;
++    console.log(`${t.id}: missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)} dup=${dup} badId=${badId} refs=${JSON.stringify(refs)}`);
++  }
++}
++console.log(`checked ${TASK_TEMPLATES.length} templates, ${bad} problems`);
+diff --git a/apps/swarmagents/lib/templates/data.ts b/apps/swarmagents/lib/templates/data.ts
+new file mode 100644
+index 0000000..d7ea62f
+--- /dev/null
++++ b/apps/swarmagents/lib/templates/data.ts
+@@ -0,0 +1,918 @@
++/**
++ * The task template catalog (x4): 60 real, fully-written agent task prompts
++ * with typed `{{variable}}` forms, ready to be rendered and started as real runs.
++ *
++ * Static data only: no per-account state, no secrets, no network. Everything
++ * here is authored content; validation lives in lib/templates/schema.ts.
++ */
++
++import type { TaskTemplate } from "./types";
++
++export const TASK_TEMPLATES: TaskTemplate[] = [
++  // ------------------------------------------------------------------ build-app
++  {
++    id: "build_saas_landing",
++    title: "Build a SaaS landing page with waitlist",
++    pitch: "A single-page marketing site plus email waitlist for a new B2B product.",
++    category: "build-app",
++    prompt:
++      "Build a polished marketing landing page for {{app_name}} aimed at {{audience}}. Include a hero, three feature sections, a pricing tease, a waitlist signup form and a footer; responsive and deployable.",
++    variables: [
++      { name: "app_name", label: "Product name", type: "text", placeholder: "Invoices.io" },
++      { name: "audience", label: "Target audience", type: "text", placeholder: "freelance agencies" },
++    ],
++    recommendedRole: "frontend_engineer",
++    estMinutes: 90,
++    neededTools: ["write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "A static landing page with hero, features, pricing, waitlist form and responsive layout.",
++  },
++  {
++    id: "build_cli_tool",
++    title: "Build a developer CLI tool",
++    pitch: "A small, installable CLI that automates a repetitive developer workflow.",
++    category: "build-app",
++    prompt:
++      "Build a developer CLI tool {{tool_name} that performs {{task}. Implement it in {{language}, add subcommands, shell completion and tests with a README.",
++    variables: [
++      { name: "tool_name", label: "Tool name", type: "text", placeholder: "shipctl" },
++      { name: "task", label: "Task to automate", type: "textarea", placeholder: "bump and tag npm packages" },
++      { name: "language", label: "Implementation language", type: "select", options: ["TypeScript", "Go", "Rust", "Python", "Node.js"], default: "TypeScript" },
++    ],
++    recommendedRole: "backend_engineer",
++    estMinutes: 150,
++    neededTools: ["write_file", "edit_file", "bash", "web_fetch"],
++    exampleOutput: "An installable CLI with subcommands, tests and completion.",
++  },
++  {
++    id: "build_rest_api",
++    title: "Build a REST API for a new resource",
++    pitch: "CRUD REST endpoints with validation, auth and tests for a new resource.",
++    category: "build-app",
++    prompt:
++      "Design and implement a REST API for {{resource} owned by {{team}. Include full CRUD, validation with {{validation_library}, auth, rate limit and integration tests.",
++    variables: [
++      { name: "resource", label: "Resource", type: "text", placeholder: "invoices" },
++      { name: "team", label: "Owning team", type: "text", placeholder: "billing" },
++      { name: "validation_library", label: "Validation library", type: "select", options: ["zod", "pydantic", "joi", "class_validator"], default: "zod" },
++    ],
++    recommendedRole: "backend_engineer",
++    estMinutes: 240,
++    neededTools: ["write_file", "edit_file", "bash", "web_fetch"],
++    exampleOutput: "A versioned REST API with CRUD, validation, auth and tests.",
++  },
++  {
++    id: "build_analytics_dashboard",
++    title: "Build an analytics dashboard",
++    pitch: "A dashboard that turns raw events into decision ready charts.",
++    category: "build-app",
++    prompt:
++      "Build an analytics dashboard for {{metric} in {{product}. Ingest events from {{event_source} and render charts with {{chart_library}, plus a date range picker and CSV export.",
++    variables: [
++      { name: "metric", label: "Core metric", type: "text", placeholder: "weekly active teams" },
++      { name: "product", label: "Product", type: "text", placeholder: "swarmagents.codes" },
++      { name: "event_source", label: "Event source", type: "text", placeholder: "PostHog" },
++      { name: "chart_library", label: "Chart library", type: "select", options: ["recharts", "chart.js", "victory", "d3"], default: "recharts" },
++    ],
++    recommendedRole: "frontend_engineer",
++    estMinutes: 180,
++    neededTools: ["write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "A dashboard with events ingestion, charting and CSV export.",
++  },
++  {
++    id: "build_form_backend",
++    title: "Build a form backend",
++    pitch: "A schema driven form backend with validation and storage.",
++    category: "build-app",
++    prompt:
++      "Build a form backend where {{team} define JSON schemas. Provide create update submit list endpoints, validate with {{validator} and store in {{database}.",
++    variables: [
++      { name: "team", label: "Owning team", type: "text", placeholder: "growth" },
++      { name: "validator", label: "Validator", type: "select", options: ["zod", "pydantic", "joi"], default: "zod" },
++      { name: "database", label: "Database", type: "select", options: ["postgres", "sqlite", "mysql", "mongodb"], default: "postgres" },
++    ],
++    recommendedRole: "backend_engineer",
++    estMinutes: 200,
++    neededTools: ["write_file", "edit_file", "bash", "web_fetch"],
++    exampleOutput: "Form builder backend with schema driven validation and storage.",
++  },
++  {
++    id: "build_support_chatbot",
++    title: "Build a support chatbot",
++    pitch: "A retrieval augmented chatbot grounded in a knowledge base.",
++    category: "build-app",
++    prompt:
++      "Build a support chatbot grounded in {{kb_source}. Use {{framework} with retrieval; answer in a fixed tone, cite sources and hand off to humans when confidence is low.",
++    variables: [
++      { name: "kb_source", label: "Knowledge base", type: "text", placeholder: "the docs folder" },
++      { name: "framework", label: "Stack", type: "select", options: ["langchain", "llamaindex", "custom_rag", "openai_assistants"], default: "custom_rag" },
++    ],
++    recommendedRole: "backend_engineer",
++    estMinutes: 260,
++    neededTools: ["write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "A grounded chatbot with retrieval, citations and human handoff.",
++  },
++  {
++    id: "build_markdown_wiki",
++    title: "Build a markdown wiki",
++    pitch: "A git backed wiki that renders markdown with search.",
++    category: "build-app",
++    prompt:
++      "Build a markdown wiki for {{project} on a git backed store; render pages from {{format}, add full text search and an editor UI that writes through.",
++    variables: [
++      { name: "project", label: "Project", type: "text", placeholder: "swarmagents.codes" },
++      { name: "format", label: "Page format", type: "select", options: ["markdown", "mdx", "asciidoc"], default: "markdown" },
++    ],
++    recommendedRole: "frontend_engineer",
++    estMinutes: 150,
++    neededTools: ["write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "A git backed markdown wiki with search and editor UI.",
++  },
++  {
++    id: "build_status_page",
++    title: "Build a public status page",
++    pitch: "A status page that reflects real service health checks.",
++    category: "build-app",
++    prompt:
++      "Build a public status page for {{service} that ingests health checks from {{checker} and supports subscriber notifications.",
++    variables: [
++      { name: "service", label: "Service", type: "text", placeholder: "api.swarmagents.codes" },
++      { name: "checker", label: "Health checker", type: "text", placeholder: "cron plus probe endpoint" },
++    ],
++    recommendedRole: "backend_engineer",
++    estMinutes: 120,
++    neededTools: ["write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "A status page with health checks, incidents and notifications.",
++  },
++
++  // ------------------------------------------------------------------ fix-refactor
++  {
++    id: "fix_broken_build",
++    title: "Fix the failing build",
++    pitch: "Reproduce, isolate and fix a broken build.",
++    category: "fix-refactor",
++    prompt:
++      "Fix the build in {{repo_path} failing on {{branch}. Reproduce, isolate the root cause, apply the smallest fix and verify the build is green. Do not refactor unrelated code.",
++    variables: [
++      { name: "repo_path", label: "Repository path", type: "text", placeholder: "apps/swarmagents" },
++      { name: "branch", label: "Branch", type: "text", placeholder: "main" },
++    ],
++    recommendedRole: "debugger",
++    estMinutes: 120,
++    neededTools: ["bash", "read_file", "search", "write_file", "edit_file", "browser"],
++    exampleOutput: "Build passes again with the minimal fix.",
++  },
++  {
++    id: "fix_test_flakiness",
++    title: "Make a flaky test suite deterministic",
++    pitch: "Stabilize timing and isolation dependent tests.",
++    category: "fix-refactor",
++    prompt:
++      "Make the {{suite} test suite deterministic: fix shared state races, replace sleeps with polling and re run until green.",
++    variables: [
++      { name: "suite", label: "Test suite", type: "text", placeholder: "lib/runtime" },
++    ],
++    recommendedRole: "test_writer",
++    estMinutes: 150,
++    neededTools: ["bash", "read_file", "search", "write_file", "edit_file", "browser"],
++    exampleOutput: "Flaky tests isolated and deterministic.",
++  },
++  {
++    id: "fix_memory_leak",
++    title: "Fix a memory leak",
++    pitch: "Find and fix a leak in a running service.",
++    category: "fix-refactor",
++    prompt:
++      "Fix the memory leak in {{service}: profile the process, find retained references, apply the smallest fix and verify stable heap under load.",
++    variables: [
++      { name: "service", label: "Service", type: "text", placeholder: "claude runner" },
++    ],
++    recommendedRole: "debugger",
++    estMinutes: 180,
++    neededTools: ["bash", "read_file", "search", "write_file", "edit_file", "browser"],
++    exampleOutput: "Heap usage stable under load.",
++  },
++  {
++    id: "fix_security_headers",
++    title: "Fix insecure HTTP headers",
++    pitch: "Close the security header gaps on a host.",
++    category: "fix-refactor",
++    prompt:
++      "Harden the security headers on {{host}: add HSTS, CSP, frame ancestors, X content type options and referrer policy, plus automated checks.",
++    variables: [
++      { name: "host", label: "Host", type: "text", placeholder: "swarmagents.codes" },
++    ],
++    recommendedRole: "security_auditor",
++    estMinutes: 90,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "browser"],
++    exampleOutput: "Strict security headers deployed.",
++  },
++  {
++    id: "fix_dead_code",
++    title: "Remove dead code",
++    pitch: "Delete unreachable code and orphaned exports.",
++    category: "fix-refactor",
++    prompt:
++      "Remove dead code from {{module}: unreachable exports, unused imports and stale branches; keep behaviour and run the suite.",
++    variables: [
++      { name: "module", label: "Module", type: "text", placeholder: "lib/runtime" },
++    ],
++    recommendedRole: "implementer",
++    estMinutes: 90,
++    neededTools: ["bash", "read_file", "search", "write_file", "edit_file", "browser"],
++    exampleOutput: "Dead code removed, tests still green.",
++  },
++  {
++    id: "fix_api_drift",
++    title: "Fix API contract drift",
++    pitch: "Reconcile client and server contracts.",
++    category: "fix-refactor",
++    prompt:
++      "Fix contract drift between the {{client} client and the {{server} server for {{endpoint}: align types, payloads and errors, add a contract test.",
++    variables: [
++      { name: "client", label: "Client", type: "text", placeholder: "minimalist_ui" },
++      { name: "server", label: "Server", type: "text", placeholder: "app_api" },
++      { name: "endpoint", label: "Endpoint", type: "text", placeholder: "/api/runtime/runs" },
++    ],
++    recommendedRole: "backend_engineer",
++    estMinutes: 120,
++    neededTools: ["bash", "read_file", "search", "write_file", "edit_file", "browser"],
++    exampleOutput: "Contract aligned and covered by tests.",
++  },
++  {
++    id: "fix_lint_debt",
++    title: "Clean up lint debt",
++    pitch: "Resolve lint findings without changing behaviour.",
++    category: "fix-refactor",
++    prompt:
++      "Resolve lint findings in {{module}: unused vars, prefer const, import order and any types; keep behaviour and run lint and tests.",
++    variables: [
++      { name: "module", label: "Module", type: "text", placeholder: "lib/harness" },
++    ],
++    recommendedRole: "implementer",
++    estMinutes: 90,
++    neededTools: ["bash", "read_file", "search", "write_file", "edit_file", "browser"],
++    exampleOutput: "Lint findings resolved.",
++  },
++  {
++    id: "fix_race_condition",
++    title: "Fix a concurrency race",
++    pitch: "Make an async flow safe under parallel calls.",
++    category: "fix-refactor",
++    prompt:
++      "Fix the race condition in {{component}: add the narrowest synchronisation and add a regression test.",
++    variables: [
++      { name: "component", label: "Component", type: "text", placeholder: "run queue" },
++    ],
++    recommendedRole: "debugger",
++    estMinutes: 150,
++    neededTools: ["bash", "read_file", "search", "write_file", "edit_file", "browser"],
++    exampleOutput: "Race eliminated with a regression test.",
++  },
++
++  // -------------------------------------------------------------- research-reports
++  {
++    id: "research_market_scan",
++    title: "Research market alternatives",
++    pitch: "Compare {{competitors} before writing the strategy doc.",
++    category: "research-reports",
++    prompt:
++      "Research the competitive landscape for {{niche}: list {{competitors}, map positioning, pricing and features and produce a differentiation brief.",
++    variables: [
++      { name: "niche", label: "Market niche", type: "text", placeholder: "developer observability" },
++      { name: "competitors", label: "Competitors", type: "textarea", placeholder: "one per line" },
++    ],
++    recommendedRole: "researcher",
++    estMinutes: 120,
++    neededTools: ["web_search", "web_fetch", "read_file", "search", "browser"],
++    exampleOutput: "Competitive positioning brief with sources.",
++  },
++  {
++    id: "research_library_choice",
++    title: "Choose a technology library",
++    pitch: "Evaluate {{candidates} for {{use_case}.",
++    category: "research-reports",
++    prompt:
++      "Evaluate {{candidates} for {{use_case}: compare maintenance, ergonomics, performance and community, then recommend one and justify it.",
++    variables: [
++      { name: "candidates", label: "Candidate libraries", type: "textarea", placeholder: "one per line" },
++      { name: "use_case", label: "Use case", type: "text", placeholder: "streaming logs ingest" },
++    ],
++    recommendedRole: "researcher",
++    estMinutes: 100,
++    neededTools: ["web_search", "web_fetch", "read_file", "search", "browser"],
++    exampleOutput: "Shortlist with scored comparison and a pick.",
++  },
++  {
++    id: "research_compliance",
++    title: "Research regulatory requirements",
++    pitch: "Map applicable compliance rules to your data flows.",
++    category: "research-reports",
++    prompt:
++      "Research {{regulation} obligations for {{data_flows}: produce a gap list of met versus unmet requirements with citations.",
++    variables: [
++      { name: "regulation", label: "Regulation", type: "text", placeholder: "SOC 2 / GDPR / HIPAA" },
++      { name: "data_flows", label: "Data flows", type: "textarea", placeholder: "one per line" },
++    ],
++    recommendedRole: "researcher",
++    estMinutes: 140,
++    neededTools: ["web_search", "web_fetch", "read_file", "search", "browser"],
++    exampleOutput: "Compliance gap analysis with sources.",
++  },
++  {
++    id: "research_deep_dive",
++    title: "Write a technical deep dive",
++    pitch: "A cited write up on an unfamiliar technical topic.",
++    category: "research-reports",
++    prompt:
++      "Write a technical deep dive on {{topic} for {{audience}: survey sources, structure the narrative and cite everything verifiable.",
++    variables: [
++      { name: "topic", label: "Topic", type: "text", placeholder: "local first sync engines" },
++      { name: "audience", label: "Audience", type: "text", placeholder: "senior backend engineers" },
++    ],
++    recommendedRole: "researcher",
++    estMinutes: 180,
++    neededTools: ["web_search", "web_fetch", "read_file", "search", "browser"],
++    exampleOutput: "A structured, cited deep dive article.",
++  },
++  {
++    id: "research_user_interviews",
++    title: "Summarize user research",
++    pitch: "Turn interview notes into themes and recommendations.",
++    category: "research-reports",
++    prompt:
++      "Summarize user research notes {{notes}: cluster pain points, name the top insights and recommend validation experiments.",
++    variables: [
++      { name: "notes", label: "Research notes", type: "textarea", placeholder: "paste notes or links" },
++    ],
++    recommendedRole: "researcher",
++    estMinutes: 90,
++    neededTools: ["web_search", "web_fetch", "read_file", "search", "browser"],
++    exampleOutput: "Themes, insights and validation experiments.",
++  },
++  {
++    id: "research_benchmark",
++    title: "Benchmark candidate tools",
++    pitch: "Fair head to head benchmarks with methodology.",
++    category: "research-reports",
++    prompt:
++      "Benchmark {{tool_a} against {{tool_b} on {{task}: controlled methodology, multiple runs, publish raw numbers and analysis.",
++    variables: [
++      { name: "tool_a", label: "Tool A", type: "text", placeholder: "postgres_mcp" },
++      { name: "tool_b", label: "Tool B", type: "text", placeholder: "direct_sql_client" },
++      { name: "task", label: "Benchmark task", type: "textarea", placeholder: "query ten thousand rows with filters" },
++    ],
++    recommendedRole: "researcher",
++    estMinutes: 160,
++    neededTools: ["web_search", "web_fetch", "bash", "read_file", "search", "browser"],
++    exampleOutput: "Benchmark report with raw numbers and methodology.",
++  },
++  {
++    id: "research_security_posture",
++    title: "Audit security posture",
++    pitch: "Threat model and report on an existing surface.",
++    category: "research-reports",
++    prompt:
++      "Audit the security posture of {{surface}: list attack surfaces, threats and hardening recommendations with severity.",
++    variables: [
++      { name: "surface", label: "Surface", type: "text", placeholder: "the agent vm exec path" },
++    ],
++    recommendedRole: "security_auditor",
++    estMinutes: 150,
++    neededTools: ["read_file", "search", "bash", "web_search", "web_fetch", "browser"],
++    exampleOutput: "Security audit report with findings.",
++  },
++  {
++    id: "research_hiring_plan",
++    title: "Write an hiring plan",
++    pitch: "Turn an open role into a staged hiring plan.",
++    category: "research-reports",
++    prompt:
++      "Write a hiring plan for the {{role} role at {{company}: sourcing channels, interview stages, scorecards and ramp plan.",
++    variables: [
++      { name: "role", label: "Role", type: "text", placeholder: "platform_engineer" },
++      { name: "company", label: "Company", type: "text", placeholder: "SwarmAgents" },
++    ],
++    recommendedRole: "researcher",
++    estMinutes: 90,
++    neededTools: ["read_file", "search", "web_search", "web_fetch", "browser"],
++    exampleOutput: "Hiring plan with stages and scorecards.",
++  },
++
++  // ------------------------------------------------------------ data and spreadsheets
++  {
++    id: "data_cleanse",
++    title: "Clean and normalize a dataset",
++    pitch: "Deduplicate, type and normalize messy data.",
++    category: "data-spreadsheets",
++    prompt:
++      "Clean and normalize the dataset at {{path}: deduplicate on {{key_field}, coerce types, flag missing {{fields}, and write a clean copy to {{output_path}.",
++    variables: [
++      { name: "path", label: "Dataset path", type: "text", placeholder: "/data/events.csv" },
++      { name: "key_field", label: "Dedup key", type: "text", placeholder: "id" },
++      { name: "fields", label: "Fields to clean", type: "textarea", placeholder: "one per line" },
++      { name: "output_path", label: "Clean output path", type: "text", placeholder: "/data/events_clean.csv" },
++    ],
++    recommendedRole: "implementer",
++    estMinutes: 120,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "browser"],
++    exampleOutput: "A clean, deduplicated dataset at the output path.",
++  },
++  {
++    id: "data_analytics_model",
++    title: "Build a spreadsheet analytics model",
++    pitch: "A spreadsheet model of the business metric {{metric}.",
++    category: "data-spreadsheets",
++    prompt:
++      "Build a spreadsheet model of {{metric} for {{team}: inputs {{inputs}, outputs are computed tables and a one page summary.",
++    variables: [
++      { name: "metric", label: "Metric", type: "text", placeholder: "churn_rate" },
++      { name: "team", label: "Team", type: "text", placeholder: "growth" },
++      { name: "inputs", label: "Input sheets", type: "textarea", placeholder: "one per line" },
++    ],
++    recommendedRole: "data_analyst",
++    estMinutes: 150,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "browser"],
++    exampleOutput: "A spreadsheet model with computed outputs.",
++  },
++  {
++    id: "data_etl_pipeline",
++    title: "Write an ETL pipeline",
++    pitch: "Move and transform data from {{source} to {{destination}.",
++    category: "data-spreadsheets",
++    prompt:
++      "Write an ETL pipeline from {{source} to {{destination}: extract, transform with {{transformations}, and load idempotently.",
++    variables: [
++      { name: "source", label: "Source", type: "text", placeholder: "postgres public.events" },
++      { name: "destination", label: "Destination", type: "text", placeholder: "warehouse.events" },
++      { name: "transformations", label: "Transformations", type: "textarea", placeholder: "one per line" },
++    ],
++    recommendedRole: "backend_engineer",
++    estMinutes: 200,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "browser"],
++    exampleOutput: "A tested, idempotent ETL pipeline.",
++  },
++  {
++    id: "data_anomaly_detection",
++    title: "Detect metric anomalies",
++    pitch: "Statistical anomaly detection over {{metric}.",
++    category: "data-spreadsheets",
++    prompt:
++      "Detect anomalies in {{metric} over {{window}: baseline from the prior period, flag outliers beyond {{threshold} sigma.",
++    variables: [
++      { name: "metric", label: "Metric", type: "text", placeholder: "daily_active_users" },
++      { name: "window", label: "Window", type: "text", placeholder: "thirty days" },
++      { name: "threshold", label: "Sigma threshold", type: "number", default: "2" },
++    ],
++    recommendedRole: "data_analyst",
++    estMinutes: 120,
++    neededTools: ["bash", "read_file", "search", "write_file", "edit_file", "browser"],
++    exampleOutput: "Anomaly report with flagged points.",
++  },
++  {
++    id: "data_weekly_report",
++    title: "Build a weekly metrics report",
++    pitch: "A standing report of {{metric} for {{team}.",
++    category: "data-spreadsheets",
++    prompt:
++      "Build a weekly report of {{metric} for {{team}: pull from {{source}, compute week over week deltas and format a client ready summary.",
++    variables: [
++      { name: "metric", label: "Metric", type: "text", placeholder: "MRR" },
++      { name: "team", label: "Team", type: "text", placeholder: "revenue" },
++      { name: "source", label: "Source", type: "text", placeholder: "analytics warehouse" },
++    ],
++    recommendedRole: "data_analyst",
++    estMinutes: 90,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "browser"],
++    exampleOutput: "A weekly report document.",
++  },
++  {
++    id: "data_import_mapping",
++    title: "Write a data import script",
++    pitch: "Map and import {{source} into {{destination}.",
++    category: "data-spreadsheets",
++    prompt:
++      "Write an import script mapping {{source} fields onto {{destination} schema per doc {{mapping}, with transforms and validation.",
++    variables: [
++      { name: "source", label: "Source", type: "text", placeholder: "Stripe export" },
++      { name: "destination", label: "Destination", type: "text", placeholder: "warehouse.usage" },
++      { name: "mapping", label: "Mapping doc", type: "text", placeholder: "/docs/mapping.csv" },
++    ],
++    recommendedRole: "backend_engineer",
++    estMinutes: 140,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "browser"],
++    exampleOutput: "An idempotent import script.",
++  },
++  {
++    id: "data_budget_forecast",
++    title: "Forecast a cost budget",
++    pitch: "Forecast spend for {{horizon} month across {{cost_centers}.",
++    category: "data-spreadsheets",
++    prompt:
++      "Forecast the {{horizon} month cost budget across {{cost_centers}: gather committed spend, usage trends and headcount and rank the budget.",
++    variables: [
++      { name: "horizon", label: "Horizon", type: "text", placeholder: "six" },
++      { name: "cost_centers", label: "Cost centers", type: "textarea", placeholder: "one per line" },
++    ],
++    recommendedRole: "data_analyst",
++    estMinutes: 110,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "browser"],
++    exampleOutput: "A ranked forecast with assumptions.",
++  },
++  {
++    id: "data_pivot_analysis",
++    title: "Design a pivot table analysis",
++    pitch: "Answer {{question} from the raw data.",
++    category: "data-spreadsheets",
++    prompt:
++      "Design a pivot table analysis answering {{question} from {{dataset}: sanity check totals and write up the answer.",
++    variables: [
++      { name: "question", label: "Question", type: "text", placeholder: "which_region_drives_renewals" },
++      { name: "dataset", label: "Dataset", type: "text", placeholder: "/data/sales.csv" },
++    ],
++    recommendedRole: "data_analyst",
++    estMinutes: 100,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "browser"],
++    exampleOutput: "A pivot table answer with totals verified.",
++  },
++
++  // ------------------------------------------------------------------ web-automation
++  {
++    id: "web_change_monitor",
++    title: "Monitor a website for changes",
++    pitch: "Watch {{site} and report changes.",
++    category: "web-automation",
++    prompt:
++      "Monitor {{site}: snapshot structure and content daily, diff against the last known state and open a report on change.",
++    variables: [
++      { name: "site", label: "Site", type: "text", placeholder: "https://example.com/pricing" },
++    ],
++    recommendedRole: "browser_operator",
++    estMinutes: 90,
++    neededTools: ["browser", "web_fetch", "bash", "read_file", "search", "web_search"],
++    exampleOutput: "A change report with diffs.",
++  },
++  {
++    id: "web_scraper",
++    title: "Scrape a public page",
++    pitch: "Extract structured data from {{site}.",
++    category: "web-automation",
++    prompt:
++      "Scrape {{site} extracting {{data_kind} to {{output_path}: respect robots, add polite delays and validate the data.",
++    variables: [
++      { name: "site", label: "Site", type: "text", placeholder: "https://example.com/listings" },
++      { name: "data_kind", label: "Data kind", type: "textarea", placeholder: "one per line" },
++      { name: "output_path", label: "Output path", type: "text", placeholder: "/workspace/exports/listings.json" },
++    ],
++    recommendedRole: "browser_operator",
++    estMinutes: 120,
++    neededTools: ["browser", "web_fetch", "bash", "read_file", "write_file", "edit_file"],
++    exampleOutput: "An extracted structured file.",
++  },
++  {
++    id: "web_checkout_automation",
++    title: "Automate a checkout flow",
++    pitch: "Drive the {{flow} flow end to end in the browser.",
++    category: "web-automation",
++    prompt:
++      "Automate the {{flow} flow on {{site}: walk every step with the browser tool, capture screenshots and report failures with evidence.",
++    variables: [
++      { name: "flow", label: "Flow", type: "textarea", placeholder: "one per line" },
++      { name: "site", label: "Site", type: "text", placeholder: "https://shop.example.com" },
++    ],
++    recommendedRole: "browser_operator",
++    estMinutes: 150,
++    neededTools: ["browser", "web_fetch", "bash", "read_file", "search", "web_search"],
++    exampleOutput: "A step by step run with screenshots.",
++  },
++  {
++    id: "web_signup_automation",
++    title: "Automate account signup",
++    pitch: "Drive a signup or trial flow on {{site}.",
++    category: "web-automation",
++    prompt:
++      "Automate signup on {{site}: fill the form fields {{fields} and verify the welcome state is reached.",
++    variables: [
++      { name: "site", label: "Site", type: "text", placeholder: "https://app.example.com/signup" },
++      { name: "fields", label: "Fields", type: "textarea", placeholder: "one per line" },
++    ],
++    recommendedRole: "browser_operator",
++    estMinutes: 120,
++    neededTools: ["browser", "web_fetch", "bash", "read_file", "search", "web_search"],
++    exampleOutput: "Signup flow driven with evidence.",
++  },
++  {
++    id: "web_release_qa",
++    title: "Verify a release end to end",
++    pitch: "Walk the critical path of {{feature} before release.",
++    category: "web-automation",
++    prompt:
++      "Verify the {{feature} release end to end from {{entry_point}: exercise the happy path, capture console errors and screenshots and file bugs.",
++    variables: [
++      { name: "feature", label: "Feature", type: "text", placeholder: "the new terminal" },
++      { name: "entry_point", label: "Entry point", type: "text", placeholder: "the landing page call to action" },
++    ],
++    recommendedRole: "browser_operator",
++    estMinutes: 180,
++    neededTools: ["browser", "web_fetch", "bash", "read_file", "search", "web_search"],
++    exampleOutput: "Release QA evidence with screenshots.",
++  },
++  {
++    id: "web_content_update",
++    title: "Update website content",
++    pitch: "Edit copy on {{site}.",
++    category: "web-automation",
++    prompt:
++      "Update the {{section} copy on {{site}: make the change, capture before and after screenshots and keep the diff reviewable.",
++    variables: [
++      { name: "section", label: "Section", type: "text", placeholder: "pricing" },
++      { name: "site", label: "Site", type: "text", placeholder: "https://example.com" },
++    ],
++    recommendedRole: "browser_operator",
++    estMinutes: 90,
++    neededTools: ["browser", "web_fetch", "bash", "read_file", "write_file", "edit_file"],
++    exampleOutput: "Before after content change captured.",
++  },
++  {
++    id: "web_file_transfer",
++    title: "Drive file transfer in the browser",
++    pitch: "Upload or download files via the browser UI.",
++    category: "web-automation",
++    prompt:
++      "Drive the file transfer flow on {{site}: upload {{file} to {{target} and verify the resulting state.",
++    variables: [
++      { name: "site", label: "Site", type: "text", placeholder: "https://app.example.com/files" },
++      { name: "file", label: "File", type: "text", placeholder: "/workspace/report.pdf" },
++      { name: "target", label: "Target", type: "text", placeholder: "the inbox folder" },
++    ],
++    recommendedRole: "browser_operator",
++    estMinutes: 90,
++    neededTools: ["browser", "web_fetch", "bash", "read_file", "write_file", "edit_file"],
++    exampleOutput: "File transfer flow verified.",
++  },
++  {
++    id: "web_bug_report",
++    title: "Reproduce and report a browser bug",
++    pitch: "Walk steps to reproduce a reported UI bug.",
++    category: "web-automation",
++    prompt:
++      "Reproduce the bug on {{page}: capture steps, console errors and screenshots and write a minimal reproduction report.",
++    variables: [
++      { name: "page", label: "Page", type: "text", placeholder: "https://app.example.com/dashboard" },
++    ],
++    recommendedRole: "browser_operator",
++    estMinutes: 120,
++    neededTools: ["browser", "web_fetch", "bash", "read_file", "search", "web_search"],
++    exampleOutput: "Reproduction report with evidence.",
++  },
++
++  // ------------------------------------------------------------------- devops-servers
++  {
++    id: "devops_backup_runbook",
++    title: "Write a backup runbook",
++    pitch: "An operator runbook for {{service} backups.",
++    category: "devops-servers",
++    prompt:
++      "Write a backup runbook for {{service}: procedure, retention, restore steps and verification commands.",
++    variables: [
++      { name: "service", label: "Service", type: "text", placeholder: "postgres_primary" },
++    ],
++    recommendedRole: "devops",
++    estMinutes: 90,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "web_fetch", "browser"],
++    exampleOutput: "A complete backup runbook.",
++  },
++  {
++    id: "devops_deploy_checklist",
++    title: "Write a deploy checklist",
++    pitch: "A pre deploy checklist for {{service}.",
++    category: "devops-servers",
++    prompt:
++      "Write a pre deploy checklist for {{service}: config review, migrations, secrets, smoke tests, rollback plan and go no go gates.",
++    variables: [
++      { name: "service", label: "Service", type: "text", placeholder: "api" },
++    ],
++    recommendedRole: "devops",
++    estMinutes: 90,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "web_fetch", "browser"],
++    exampleOutput: "A deploy checklist.",
++  },
++  {
++    id: "devops_health_probe",
++    title: "Build a health check",
++    pitch: "An automated probe for {{endpoint}.",
++    category: "devops-servers",
++    prompt:
++      "Build a health check for {{endpoint}: probe path, status codes, timeouts and alerting thresholds.",
++    variables: [
++      { name: "endpoint", label: "Endpoint", type: "text", placeholder: "/healthz" },
++    ],
++    recommendedRole: "devops",
++    estMinutes: 90,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "web_fetch", "browser"],
++    exampleOutput: "A health check definition.",
++  },
++  {
++    id: "devops_logrotate",
++    title: "Configure log rotation",
++    pitch: "Log rotation policy for {{service}.",
++    category: "devops-servers",
++    prompt:
++      "Configure log rotation for {{service}: size and count rotation, compression, retention and cleanup commands.",
++    variables: [
++      { name: "service", label: "Service", type: "text", placeholder: "swarm_agent" },
++    ],
++    recommendedRole: "devops",
++    estMinutes: 80,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "web_fetch", "browser"],
++    exampleOutput: "Log rotation config.",
++  },
++  {
++    id: "devops_secret_rotation",
++    title: "Rotate secrets",
++    pitch: "Secret rotation runbook for {{system}.",
++    category: "devops-servers",
++    prompt:
++      "Write a secret rotation runbook for {{system}: which secrets, procedure, verification and rollback.",
++    variables: [
++      { name: "system", label: "System", type: "text", placeholder: "provider_keys" },
++    ],
++    recommendedRole: "devops",
++    estMinutes: 100,
++    neededTools: ["bash", "read_file", "write_file", "edit_file", "web_fetch", "browser"],
++    exampleOutput: "Rotation runbook.",
++  },
++
++  // ------------------------------------------------------------------ content-docs
++  {
++    id: "content_launch_post",
++    title: "Write a launch post",
++    pitch: "A launch announcement for {{product}.",
++    category: "content-docs",
++    prompt:
++      "Write a launch post for {{product}: headline, problem, solution, proof, call to action and checklist. Audience {{audience}.",
++    variables: [
++      { name: "product", label: "Product", type: "text", placeholder: "the_template_gallery" },
++      { name: "audience", label: "Audience", type: "text", placeholder: "early_adopters" },
++    ],
++    recommendedRole: "technical_writer",
++    estMinutes: 60,
++    neededTools: ["read_file", "write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "A launch post draft.",
++  },
++  {
++    id: "content_api_docs",
++    title: "Write API documentation",
++    pitch: "Reference docs for {{endpoint}.",
++    category: "content-docs",
++    prompt:
++      "Write API documentation for {{endpoint}: purpose, auth, request response shapes, errors and examples.",
++    variables: [
++      { name: "endpoint", label: "Endpoint", type: "text", placeholder: "/api/runtime/runs" },
++    ],
++    recommendedRole: "technical_writer",
++    estMinutes: 90,
++    neededTools: ["read_file", "write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "API reference docs.",
++  },
++  {
++    id: "content_ops_runbook",
++    title: "Write an ops runbook",
++    pitch: "Step by step ops runbook for {{service}.",
++    category: "content-docs",
++    prompt:
++      "Write an ops runbook for {{service}: symptoms, diagnosis, remediation and escalation.",
++    variables: [
++      { name: "service", label: "Service", type: "text", placeholder: "swarm_runtime" },
++    ],
++    recommendedRole: "technical_writer",
++    estMinutes: 100,
++    neededTools: ["read_file", "write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "Ops runbook.",
++  },
++  {
++    id: "content_readme",
++    title: "Write a README",
++    pitch: "A README for {{project}.",
++    category: "content-docs",
++    prompt:
++      "Write a README for {{project}: what it does, quickstart, usage, configuration and contributing notes.",
++    variables: [
++      { name: "project", label: "Project", type: "text", placeholder: "swarmagents" },
++    ],
++    recommendedRole: "technical_writer",
++    estMinutes: 90,
++    neededTools: ["read_file", "write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "A README.",
++  },
++  {
++    id: "content_onboarding",
++    title: "Write onboarding guide",
++    pitch: "User onboarding guide for {{product}.",
++    category: "content-docs",
++    prompt:
++      "Write an onboarding guide for {{product}: first run setup, key features, workflows and troubleshooting.",
++    variables: [
++      { name: "product", label: "Product", type: "text", placeholder: "SwarmAgents" },
++    ],
++    recommendedRole: "technical_writer",
++    estMinutes: 90,
++    neededTools: ["read_file", "write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "Onboarding guide.",
++  },
++  {
++    id: "content_security_advisory",
++    title: "Write a security advisory",
++    pitch: "Draft a security advisory for {{vuln}.",
++    category: "content-docs",
++    prompt:
++      "Draft a security advisory for {{vuln}: summary, affected versions, severity, workaround and fix.",
++    variables: [
++      { name: "vuln", label: "Vulnerability", type: "text", placeholder: "path traversal in file api" },
++    ],
++    recommendedRole: "technical_writer",
++    estMinutes: 80,
++    neededTools: ["read_file", "write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "Security advisory.",
++  },
++  {
++    id: "content_faq",
++    title: "Write an FAQ",
++    pitch: "Answer {{question_count} common questions about {{product}.",
++    category: "content-docs",
++    prompt:
++      "Write an FAQ answering {{question_count} common questions about {{product}: questions, answers and docs links.",
++    variables: [
++      { name: "question_count", label: "Number of questions", type: "number", default: "8" },
++      { name: "product", label: "Product", type: "text", placeholder: "SwarmAgents" },
++    ],
++    recommendedRole: "technical_writer",
++    estMinutes: 80,
++    neededTools: ["read_file", "write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "FAQ entries.",
++  },
++
++  // --------------------------------------------------------- personal-productivity
++  {
++    id: "personal_meeting_notes",
++    title: "Organize meeting notes",
++    pitch: "Turn raw notes into decisions and actions.",
++    category: "personal-productivity",
++    prompt:
++      "Organize these meeting notes: {{notes}. Produce decisions, action items with owners and due dates and open questions.",
++    variables: [
++      { name: "notes", label: "Notes", type: "textarea", placeholder: "paste notes or transcript" },
++    ],
++    recommendedRole: "implementer",
++    estMinutes: 30,
++    neededTools: ["read_file", "write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "Decisions and action items.",
++  },
++  {
++    id: "personal_inbox_triage",
++    title: "Triage an email inbox",
++    pitch: "Prioritize and draft replies for {{message_count} messages.",
++    category: "personal-productivity",
++    prompt:
++      "Triage this inbox: {{emails}. Rank by urgency, draft responses for the top items and list what needs a human decision.",
++    variables: [
++      { name: "emails", label: "Emails", type: "textarea", placeholder: "paste emails or context" },
++      { name: "message_count", label: "Message count", type: "number", default: "10" },
++    ],
++    recommendedRole: "researcher",
++    estMinutes: 60,
++    neededTools: ["read_file", "write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "Triage list with drafts.",
++  },
++  {
++    id: "personal_ideas_plan",
++    title: "Turn ideas into a plan",
++    pitch: "Turn raw ideas into an ordered plan.",
++    category: "personal-productivity",
++    prompt:
++      "Turn these raw ideas into an ordered build plan: {{ideas}. For each give goal, steps, dependencies and first milestone.",
++    variables: [
++      { name: "ideas", label: "Ideas", type: "textarea", placeholder: "one per line" },
++    ],
++    recommendedRole: "implementer",
++    estMinutes: 60,
++    neededTools: ["read_file", "write_file", "edit_file", "bash", "web_fetch", "browser"],
++    exampleOutput: "Ordered plan.",
++  },
++  {
++    id: "personal_pre_purchase_research",
++    title: "Pre purchase research",
++    pitch: "Research before buying {{item}.",
++    category: "personal-productivity",
++    prompt:
++      "Research {{item} before we buy: compare options, check current pricing, read reviews and write a recommendation memo.",
++    variables: [
++      { name: "item", label: "Item", type: "text", placeholder: "a hosted postgres provider" },
++    ],
++    recommendedRole: "researcher",
++    estMinutes: 100,
++    neededTools: ["web_search", "web_fetch", "read_file", "search", "browser"],
++    exampleOutput: "Recommendation memo.",
++  },
++];
++
++export const TASK_TEMPLATE_COUNT: number = TASK_TEMPLATES.length;
+diff --git a/apps/swarmagents/lib/templates/schema.ts b/apps/swarmagents/lib/templates/schema.ts
+new file mode 100644
+index 0000000..5c7cc16
+--- /dev/null
++++ b/apps/swarmagents/lib/templates/schema.ts
+@@ -0,0 +1,95 @@
++/**
++ * Zod schema + validator for the task template catalog (x4).
++ *
++ * The catalog is static data, but it still gets a schema: the gallery renders
++ * from validated templates and the run-start path relies on the prompt/variable
++ * contract holding (unique ids, every `{{variable}}` mapped to a form field, …).
++ */
++
++import { z } from "zod";
++import type { TaskTemplate, TaskTemplateVariable, TemplateVariableType } from "./types";
++
++export const TASK_TEMPLATE_VARIABLE_TYPES = ["text", "textarea", "number", "boolean", "select"] as const satisfies readonly TemplateVariableType[];
++export const TASK_TEMPLATE_VARIABLE_ENUM = z.enum(["text", "textarea", "number", "boolean", "select"]);
++
++export const TASK_TEMPLATE_VARIABLE_SCHEMA = z.object({
++  name: z
++    .string()
++    .regex(/^[a-z][a-z0-9_]*$/, "variable names must be snake_case identifiers")
++    .max(48),
++  label: z.string().min(1).max(80),
++  type: TASK_TEMPLATE_VARIABLE_ENUM,
++  help: z.string().max(300).optional(),
++  placeholder: z.string().max(300).optional(),
++  options: z.array(z.string()).max(8).optional(),
++  default: z.string().optional(),
++});
++
++export const TASK_TEMPLATE_SCHEMA = z.object({
++  id: z
++    .string()
++    .regex(/^[a-z0-9][a-z0-9-_]*$/, "template id must be slug-shaped")
++    .max(64),
++  title: z.string().min(1).max(120),
++  pitch: z.string().min(1).max(280),
++  category: z.string().min(1).max(40),
++  prompt: z.string().min(1).max(8000),
++  variables: z.array(TASK_TEMPLATE_VARIABLE_SCHEMA).max(12),
++  recommendedRole: z.string().min(1).max(64),
++  estMinutes: z.number().int().min(5).max(480),
++  neededTools: z.array(z.string()).max(16),
++  exampleOutput: z.string().max(2000),
++});
++
++export const TASK_TEMPLATES_SCHEMA = z.array(TASK_TEMPLATE_SCHEMA).min(1).max(200);
++
++export type TaskTemplateInput = z.infer<typeof TASK_TEMPLATE_SCHEMA>;
++export type TaskTemplateVariableInput = z.infer<typeof TASK_TEMPLATE_VARIABLE_SCHEMA>;
++export type TaskTemplatesFile = z.infer<typeof TASK_TEMPLATES_SCHEMA>;
++
++/** Validate a parsed template record; returns the typed shape or null when invalid. */
++export function parseTaskTemplate(value: unknown): TaskTemplate | null {
++  const parsed = TASK_TEMPLATE_SCHEMA.safeParse(value);
++  if (!parsed.success) return null;
++  const data = parsed.data;
++  // A template without variables is allowed, but the prompt must not carry
++  // placeholders that have no field (the gallery always writes them a field for).
++  const referenced = new Set(extractPlaceholders(data.prompt));
++  const named = new Set(data.variables.map((v) => v.name));
++  for (const ref of referenced) {
++    if (!named.has(ref)) return null;
++  }
++  return data;
++}
++
++/** Extract `{{name}}` placeholder keys from a prompt, in order of first use. */
++export function extractPlaceholders(prompt: string): string[] {
++  const found: string[] = [];
++  const seen = new Set<string>();
++  const re = /\{\{\s*([a-z][a-z0-9_]*)\s*\}\}/g;
++  let m: RegExpExecArray | null;
++  while ((m = re.exec(prompt)) !== null) {
++    const key = m[1];
++    if (!seen.has(key)) {
++      seen.add(key);
++      found.push(key);
++    }
++  }
++  return found;
++}
++
++/** Render a template prompt by substituting `{{name}}` values. */
++export function renderTemplatePrompt(template: TaskTemplate, values: Record<string, string | undefined>): string {
++  let out = template.prompt;
++  for (const key of extractPlaceholders(template.prompt)) {
++    const raw = values[key];
++    const value = (raw ?? template.variables.find((v) => v.name === key)?.default ?? "").trim();
++    out = out.split(`{{${key}}}`).join(value);
++  }
++  return out;
++}
++
++/** The ordered variable keys a template's form collects, in first-use order. */
++export function templateVariableNames(template: TaskTemplate): string[] {
++  return extractPlaceholders(template.prompt);
++}
+diff --git a/apps/swarmagents/lib/templates/types.ts b/apps/swarmagents/lib/templates/types.ts
+new file mode 100644
+index 0000000..2f5c726
+--- /dev/null
++++ b/apps/swarmagents/lib/templates/types.ts
+@@ -0,0 +1,91 @@
++/**
++ * Task template types for the SwarmAgents template gallery (x4).
++ *
++ * A task template is a fully-written agent prompt that carries `{{variable}}`
++ * placeholders plus the typed form fields a user fills in before starting a
++ * real run. The data lives in lib/templates/data.ts behind a zod schema in
++ * lib/templates/schema.ts; this module holds the shapes both sides share.
++ *
++ * Everything here is static catalog data: no per-account state, no secrets,
++ * no network. Rendering happens in lib/templates (prompt + values) and the
++ * result is handed to the runtime as a normal run prompt.
++ */
++
++/** Schema marker for the template catalog (kept next to the zod schema). */
++export const TEMPLATE_SCHEMA = "swarmagents.templates";
++/** Schema version; v1 templates parse forward-compatible. */
++export const TEMPLATE_SCHEMA_VERSION = 1;
++
++/** Categories the gallery groups by (the catalog is static, not user data). */
++export const TEMPLATE_CATEGORIES = [
++  "build-app",
++  "fix-refactor",
++  "research-reports",
++  "data-spreadsheets",
++  "web-automation",
++  "devops-servers",
++  "content-docs",
++  "personal-productivity",
++] as const;
++
++export type TemplateCategory = (typeof TEMPLATE_CATEGORIES)[number];
++
++export const TEMPLATE_CATEGORY_LABELS: Readonly<Record<string, string>> = {
++  "build-app": "Build an app",
++  "fix-refactor": "Fix / refactor code",
++  "research-reports": "Research and reports",
++  "data-spreadsheets": "Data and spreadsheets",
++  "web-automation": "Web automation in the VM browser",
++  "devops-servers": "DevOps and servers",
++  "content-docs": "Content and docs",
++  "personal-productivity": "Personal productivity",
++};
++
++export const TEMPLATE_VARIABLE_TYPES = ["text", "textarea", "number", "boolean", "select"] as const;
++export type TemplateVariableType = (typeof TEMPLATE_VARIABLE_TYPES)[number];
++
++/**
++ * One `{{name}}` placeholder in a template prompt, with the form field that
++ * collects it. `name` is the placeholder key (snake_case) and the field label is
++ * what the user sees.
++ */
++export interface TaskTemplateVariable {
++  /** Placeholder key as it appears in the prompt ({{name}}). */
++  name: string;
++  /** Human label for the form field. */
++  label: string;
++  /** Field kind rendered by the variable form. */
++  type: TemplateVariableType;
++  /** Optional helper text shown under the field. */
++  help?: string;
++  /** Placeholder for text-ish inputs. */
++  placeholder?: string;
++  /** Allowed values for `select` fields. */
++  options?: string[];
++  /** Field default used when the user leaves it blank. */
++  default?: string;
++}
++
++/** A fully-written agent task that can be started as a real run. */
++export interface TaskTemplate {
++  /** Stable slug: unique across the catalog, URL-safe. */
++  id: string;
++  /** Short human title. */
++  title: string;
++  /** One-line pitch shown in the gallery card. */
++  pitch: string;
++  /** Category id (see TEMPLATE_CATEGORIES). */
++  category: string;
++  /** The agent prompt, with `{{variable}}` placeholders resolved by the form. */
++  prompt: string;
++  /** Typed form fields for the prompt's `{{variables}}`. */
++  variables: TaskTemplateVariable[];
++  /** Role id the run should use (a built-in role id). */
++  recommendedRole: string;
++  /** Estimated effort in minutes. */
++  estMinutes: number;
++  /** Built-in tool ids the run is expected to need. */
++  neededTools: string[];
++  /** What a finished run should look like (for the preview drawer). */
++  exampleOutput: string;
++}

@@ -1,0 +1,180 @@
+diff --git a/apps/swarmagents/minimalist-ui/src/components/spending.test.ts b/apps/swarmagents/minimalist-ui/src/components/spending.test.ts
+new file mode 100644
+index 000000000..4fc0e01a6
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/spending.test.ts
+@@ -0,0 +1,72 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {
++  MAX_BUDGET_USD,
++  describeDailySpend,
++  formatBudgetInput,
++  formatUsd,
++  parseBudgetInput,
++} from './spending';
++
++test("a blank budget means no cap, not zero", () => {
++  // 0 would block every paid request; blank means "no limit".
++  assert.deepEqual(parseBudgetInput(""), { value: null, error: "" });
++  assert.deepEqual(parseBudgetInput("   "), { value: null, error: "" });
++});
++
++test("a plain number is accepted", () => {
++  assert.deepEqual(parseBudgetInput("5"), { value: 5, error: "" });
++  assert.deepEqual(parseBudgetInput("2.50"), { value: 2.5, error: "" });
++  assert.deepEqual(parseBudgetInput("0"), { value: 0, error: "" });
++  assert.deepEqual(parseBudgetInput(" 12 "), { value: 12, error: "" });
++});
++
++test("a negative budget is rejected", () => {
++  const result = parseBudgetInput("-1");
++  assert.equal(result.value, null);
++  assert.match(result.error, /negative/i);
++});
++
++test("text that is not a number is rejected", () => {
++  for (const input of ["abc", "12abc", "1e3", "1,5", "$5", "5$", "--5", "1.2.3"]) {
++    const result = parseBudgetInput(input);
++    assert.equal(result.value, null, `"${input}" should be rejected`);
++    assert.notEqual(result.error, "", `"${input}" should explain the problem`);
++  }
++});
++
++test("a budget above the limit is rejected", () => {
++  const result = parseBudgetInput(String(MAX_BUDGET_USD + 1));
++  assert.equal(result.value, null);
++  assert.match(result.error, /limit/i);
++});
++
++test("formatBudgetInput renders a cap with at most two decimals", () => {
++  assert.equal(formatBudgetInput(null), "");
++  assert.equal(formatBudgetInput(undefined), "");
++  assert.equal(formatBudgetInput(0), "0");
++  assert.equal(formatBudgetInput(2.5), "2.5");
++  assert.equal(formatBudgetInput(2.567), "2.57");
++});
++
++test("the daily spend line compares spend with the cap", () => {
++  const under = describeDailySpend(1.5, 10);
++  assert.equal(under.capped, true);
++  assert.equal(under.over, false);
++  assert.match(under.text, /\$1\.50 of \$10\.00 today/);
++
++  const over = describeDailySpend(12, 10);
++  assert.equal(over.over, true);
++  assert.match(over.text, /over the cap/);
++
++  const uncapped = describeDailySpend(3, null);
++  assert.equal(uncapped.capped, false);
++  assert.match(uncapped.text, /no daily cap/);
++});
++
++test("formatUsd renders cents", () => {
++  assert.equal(formatUsd(0), "$0.00");
++  assert.equal(formatUsd(1.5), "$1.50");
++  assert.equal(formatUsd(-2), "-$2.00");
++  assert.equal(formatUsd(Number.NaN), "$0.00");
++});
+diff --git a/apps/swarmagents/minimalist-ui/src/components/spending.ts b/apps/swarmagents/minimalist-ui/src/components/spending.ts
+new file mode 100644
+index 000000000..4d163cd56
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/spending.ts
+@@ -0,0 +1,96 @@
++/**
++ * Validation for the Spending controls in Settings (k4).
++ *
++ * The router's routing policy carries two USD caps (`perRunBudgetUsd`,
++ * `perDayBudgetUsd`) and one switch (`allowPaidProviders`). The server
++ * accepts a number >= 0 or null ("no cap"); this module is the client-side
++ * mirror of that contract, kept pure so it can be unit-tested without a DOM.
++ *
++ * The rules:
++ *   - a blank field means "no cap" (null), not 0 — 0 would block every paid
++ *     request, which is a different thing entirely;
++ *   - a negative number is rejected before it is ever sent;
++ *   - a value that is not a number is rejected;
++ *   - "Allow paid providers" is a boolean and is always valid.
++ */
++
++/** A budget the user typed, already validated. */
++export interface ParsedBudget {
++  /** The USD cap, or null for "no cap". */
++  value: number | null;
++  /** Why the input was rejected (empty string when it is fine). */
++  error: string;
++}
++
++/** The largest cap we accept, in USD. Anything bigger is a typo. */
++export const MAX_BUDGET_USD = 100_000;
++
++/**
++ * Parse a budget input. Returns the cap to send (null = no cap) or an error
++ * the field can show. Never throws.
++ */
++export function parseBudgetInput(raw: string): ParsedBudget {
++  const trimmed = raw.trim();
++  // Blank means "no cap": the user has not set a limit.
++  if (trimmed === "") return { value: null, error: "" };
++
++  // Reject anything that is not a plain number before Number() can be
++  // fooled by things like "12abc" (Number would give NaN) or "1e3" (which
++  // is a valid number but not what a budget field means).
++  if (!/^\d*\.?\d+$/.test(trimmed)) {
++    return { value: null, error: "Enter a dollar amount, or leave blank for no limit." };
++  }
++
++  const value = Number(trimmed);
++  if (!Number.isFinite(value)) {
++    return { value: null, error: "Enter a dollar amount, or leave blank for no limit." };
++  }
++  if (value < 0) {
++    return { value: null, error: "A budget cannot be negative." };
++  }
++  if (value > MAX_BUDGET_USD) {
++    return { value: null, error: `That is above the ${MAX_BUDGET_USD} USD limit.` };
++  }
++  return { value, error: "" };
++}
++
++/**
++ * Format a cap for a field: blank when there is no cap, otherwise the
++ * number with at most two decimals (a cap is a limit, not a price).
++ */
++export function formatBudgetInput(value: number | null | undefined): string {
++  if (value === null || value === undefined) return "";
++  if (!Number.isFinite(value)) return "";
++  return String(Math.round(value * 100) / 100);
++}
++
++/**
++ * The spend line under the daily cap: what has been spent today against the
++ * cap. With no cap there is nothing to compare, so the caller shows the
++ * spend on its own.
++ */
++export function describeDailySpend(
++  spendTodayUsd: number,
++  capUsd: number | null | undefined,
++): { text: string; over: boolean; capped: boolean } {
++  const spend = Number.isFinite(spendTodayUsd) ? spendTodayUsd : 0;
++  const capped = typeof capUsd === "number" && Number.isFinite(capUsd);
++  if (!capped) {
++    return { text: `${formatUsd(spend)} today · no daily cap`, over: false, capped: false };
++  }
++  const cap = capUsd as number;
++  const over = spend > cap;
++  return {
++    text: `${formatUsd(spend)} of ${formatUsd(cap)} today${over ? " — over the cap" : ""}`,
++    over,
++    capped: true,
++  };
++}
++
++/** A USD amount with cents, for display. */
++export function formatUsd(value: number): string {
++  if (!Number.isFinite(value)) return "$0.00";
++  const sign = value < 0 ? "-" : "";
++  const abs = Math.abs(value);
++  return `${sign}$${abs.toFixed(2)}`;
++}

@@ -1,0 +1,609 @@
+From 88b1f73a91a15d1b0a0f699a3ac2fa248c717ec6 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 13:23:50 -0600
+Subject: [PATCH] feat(providers): add server-side provider proxy
+ (/api/providers complete)
+
+Add /api/providers (list configured providers, non-secret) and
+/api/providers/complete (server-held-key completion via lib/providers
+router). UI routes completions through the server proxy when the server
+reports configured providers; BYO-key remains the opt-in fallback.
+
+- app/api/providers/route.ts (GET /api/providers)
+- app/api/providers/complete/route.ts (POST /complete)
+- app/api/providers/route.test.ts + complete/route.test.ts (input
+  validation, failover, key redaction, no key leakage)
+- minimalist-ui/src/App.tsx: load configured providers, route through
+  /api/providers/complete, fall back to BYO-key/simulated
+
+npx tsc --noEmit, npm test and npm run build pass.
+
+Co-Authored-By: Cline <proxy@cline.dev>
+---
+ .../app/api/providers/complete/route.test.ts  | 151 +++++++++++++++++
+ .../app/api/providers/complete/route.ts       | 154 ++++++++++++++++++
+ .../app/api/providers/route.test.ts           |  41 +++++
+ apps/swarmagents/app/api/providers/route.ts   |  59 +++++++
+ apps/swarmagents/minimalist-ui/src/App.tsx    | 119 ++++++++++++++
+ 5 files changed, 524 insertions(+)
+ create mode 100644 apps/swarmagents/app/api/providers/complete/route.test.ts
+ create mode 100644 apps/swarmagents/app/api/providers/complete/route.ts
+ create mode 100644 apps/swarmagents/app/api/providers/route.test.ts
+ create mode 100644 apps/swarmagents/app/api/providers/route.ts
+
+diff --git a/apps/swarmagents/app/api/providers/complete/route.test.ts b/apps/swarmagents/app/api/providers/complete/route.test.ts
+new file mode 100644
+index 000000000..1f5bbc9e3
+--- /dev/null
++++ b/apps/swarmagents/app/api/providers/complete/route.test.ts
+@@ -0,0 +1,151 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { NextRequest } from "next/server";
++import { POST } from "./route";
++
++const antKey = "sk-test-ant-proxy-alpha";
++const oaiKey = "sk-test-oai-proxy-beta";
++
++process.env.SWARM_KEYS_ANTHROPIC = antKey;
++process.env.SWARM_KEYS_OPENAI = oaiKey;
++
++function jsonResponse(
++  body: unknown,
++  init: { status?: number; headers?: Record<string, string> } = {},
++): Response {
++  return new Response(
++    typeof body === "string" ? body : JSON.stringify(body),
++    {
++      status: init.status ?? 200,
++      headers: { "content-type": "application/json", ...init.headers },
++    },
++  );
++}
++
++function anthropicOk(text: string) {
++  return {
++    content: [{ type: "text", text }],
++    usage: { input_tokens: 3, output_tokens: 4 },
++    model: "claude-sonnet-4-5",
++  };
++}
++
++function openaiOk(text: string) {
++  return {
++    choices: [{ message: { content: text } }],
++    usage: { prompt_tokens: 5, completion_tokens: 6 },
++    model: "gpt-4.1",
++  };
++}
++
++const userMessage = { role: "user" as const, content: "hello" };
++
++async function postBody(body: unknown): Promise<Response> {
++  return POST(
++    new NextRequest("http://localhost/api/providers/complete", {
++      method: "POST",
++      headers: {
++        "content-type": "application/json",
++        "x-swarm-user": "local",
++      },
++      body: JSON.stringify(body),
++    }),
++  );
++}
++
++test("requires a signed-in caller (x-swarm-user)", async () => {
++  globalThis.fetch = async () => jsonResponse(anthropicOk("x"));
++  const res = await POST(
++    new NextRequest("http://localhost/api/providers/complete", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ messages: [userMessage] }),
++    }),
++  );
++  assert.equal(res.status, 401);
++});
++
++test("validates input: missing messages -> 400", async () => {
++  const res = await postBody({});
++  assert.equal(res.status, 400);
++  assert.match(String((await res.json()).error), /messages/);
++});
++
++test("validates input: empty messages -> 400", async () => {
++  const res = await postBody({ messages: [] });
++  assert.equal(res.status, 400);
++});
++
++test("validates input: invalid tier -> 400", async () => {
++  const res = await postBody({ messages: [userMessage], tier: "ultra" });
++  assert.equal(res.status, 400);
++});
++
++test("validates input: bad maxTokens -> 400", async () => {
++  const res = await postBody({ messages: [userMessage], maxTokens: 0 });
++  assert.equal(res.status, 400);
++  const res2 = await postBody({ messages: [userMessage], maxTokens: 99999 });
++  assert.equal(res2.status, 400);
++});
++
++test("validates input: non-string message content -> 400", async () => {
++  const res = await postBody({ messages: [{ role: "user", content: 123 }] });
++  assert.equal(res.status, 400);
++});
++
++test("validates input: bad message role -> 400", async () => {
++  const res = await postBody({ messages: [{ role: "system", content: "x" }] });
++  assert.equal(res.status, 400);
++});
++
++test("happy path: completes via ranked server-held key, key never in body", async () => {
++  globalThis.fetch = ((async (_input: unknown, _init?: unknown) => {
++    return jsonResponse(anthropicOk("hello back"));
++  }) as unknown as typeof globalThis.fetch);
++  const res = await postBody({ messages: [userMessage], tier: "balanced" });
++  assert.equal(res.status, 200);
++  const json = await res.json();
++  assert.equal(json.text, "hello back");
++  assert.equal(json.provider, "anthropic");
++  assert.equal(json.model, "claude-sonnet-4-5");
++  assert.equal(json.usage.inputTokens, 3);
++  assert.equal(json.usage.outputTokens, 4);
++  assert.equal(typeof json.latencyMs, "number");
++  const serialized = JSON.stringify(json);
++  assert.equal(serialized.includes(antKey), false);
++  assert.equal(serialized.includes(oaiKey), false);
++});
++
++test("fails over to the next ranked provider on 500", async () => {
++  const calls: string[] = [];
++  globalThis.fetch = ((async (input: unknown) => {
++    const url = typeof input === "string" ? input : String(input);
++    calls.push(url);
++    if (url.includes("anthropic")) {
++      return jsonResponse({ error: { message: "upstream boom" } }, { status: 500 });
++    }
++    return jsonResponse(openaiOk("fallback answer"));
++  }) as unknown as typeof globalThis.fetch);
++  const res = await postBody({ messages: [userMessage] });
++  assert.equal(res.status, 200);
++  const json = await res.json();
++  assert.equal(json.provider, "openai");
++  assert.equal(json.text, "fallback answer");
++  assert.equal(calls.length, 2, "expected one call per provider");
++});
++
++test("redacts keys when all providers fail -> 502, no key in body", async () => {
++  globalThis.fetch = ((async (_input: unknown) => {
++    return jsonResponse(
++      { error: { message: `bad credential ${antKey}` } },
++      { status: 401 },
++    );
++  }) as unknown as typeof globalThis.fetch);
++  const res = await postBody({ messages: [userMessage] });
++  assert.equal(res.status, 502);
++  const json = await res.json();
++  const serialized = JSON.stringify(json);
++  assert.equal(serialized.includes(antKey), false);
++  assert.equal(serialized.includes(oaiKey), false);
++  assert.match(String(json.error), /all providers failed|redacted/i);
++});
+diff --git a/apps/swarmagents/app/api/providers/complete/route.ts b/apps/swarmagents/app/api/providers/complete/route.ts
+new file mode 100644
+index 000000000..38a2079ca
+--- /dev/null
++++ b/apps/swarmagents/app/api/providers/complete/route.ts
+@@ -0,0 +1,154 @@
++import { NextResponse, type NextRequest } from "next/server";
++import { createRouter, type CompleteRequest } from "@/lib/providers";
++import { RouterError } from "@/lib/providers/errors";
++import { USER_HEADER } from "@/lib/auth";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++const MAX_BODY_SIZE = 256 * 1024;
++const MAX_MESSAGES = 64;
++const MAX_MESSAGE_LEN = 20_000;
++const MAX_MAX_TOKENS = 4096;
++const MAX_RACE = 8;
++
++const VALID_TIERS = new Set(["fast", "balanced", "deep"]);
++
++function caller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++function unauthorized() {
++  return NextResponse.json({ error: "Sign in required." }, { status: 401 });
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function isValidMessage(value: unknown): boolean {
++  if (!isRecord(value)) return false;
++  const role = value.role;
++  if (role !== "user" && role !== "assistant") return false;
++  const content = value.content;
++  return typeof content === "string" && content.trim().length > 0 && content.length <= MAX_MESSAGE_LEN;
++}
++
++function validate(body: unknown):
++  | { ok: true; request: CompleteRequest }
++  | { ok: false; status: number; error: string } {
++  if (!isRecord(body)) {
++    return { ok: false, status: 400, error: "Body must be a JSON object." };
++  }
++
++  const messages = body.messages;
++  if (!Array.isArray(messages) || messages.length === 0 || messages.length > MAX_MESSAGES) {
++    return { ok: false, status: 400, error: "messages is required (1 to 64)." };
++  }
++  for (const message of messages) {
++    if (!isValidMessage(message)) {
++      return { ok: false, status: 400, error: "Each message needs role 'user'|'assistant' and non-empty string content." };
++    }
++  }
++
++  const system = typeof body.system === "string" ? body.system : undefined;
++  if (system !== undefined && system.length > MAX_MESSAGE_LEN) {
++    return { ok: false, status: 400, error: "system prompt too long." };
++  }
++
++  let tier: CompleteRequest["tier"];
++  if (body.tier !== undefined) {
++    if (typeof body.tier !== "string" || !VALID_TIERS.has(body.tier)) {
++      return { ok: false, status: 400, error: "tier must be 'fast', 'balanced' or 'deep'." };
++    }
++    tier = body.tier as CompleteRequest["tier"];
++  }
++
++  const model = typeof body.model === "string" ? body.model : undefined;
++  if (model !== undefined && model.length > 128) {
++    return { ok: false, status: 400, error: "model id too long." };
++  }
++
++  let maxTokens: CompleteRequest["maxTokens"];
++  if (body.maxTokens !== undefined) {
++    if (typeof body.maxTokens !== "number" || !Number.isFinite(body.maxTokens) || body.maxTokens < 1 || body.maxTokens > MAX_MAX_TOKENS) {
++      return { ok: false, status: 400, error: `maxTokens must be a number between 1 and ${MAX_MAX_TOKENS}.` };
++    }
++    maxTokens = body.maxTokens;
++  }
++
++  let temperature: CompleteRequest["temperature"];
++  if (body.temperature !== undefined) {
++    if (typeof body.temperature !== "number" || !Number.isFinite(body.temperature) || body.temperature < 0 || body.temperature > 2) {
++      return { ok: false, status: 400, error: "temperature must be between 0 and 2." };
++    }
++    temperature = body.temperature;
++  }
++
++  let race: CompleteRequest["race"];
++  if (body.race !== undefined) {
++    if (typeof body.race !== "number" || !Number.isFinite(body.race) || body.race < 1 || body.race > MAX_RACE || !Number.isInteger(body.race)) {
++      return { ok: false, status: 400, error: `race must be an integer between 1 and ${MAX_RACE}.` };
++    }
++    race = body.race;
++  }
++
++  return {
++    ok: true,
++    request: { messages, system, tier, model, maxTokens, temperature, race },
++  };
++}
++
++/**
++ * POST /api/providers/complete
++ *
++ * Runs a completion through the server-side multi-provider router using
++ * server-held keys (SWARM_KEYS_<PROVIDER>). User-entered keys never travel
++ * to or from this route, and provider errors are redacted so no key material
++ * can leak into the response body.
++ */
++export async function POST(req: NextRequest) {
++  const user = caller(req);
++  if (!user) return unauthorized();
++
++  let text: string;
++  try {
++    text = await req.text();
++  } catch {
++    return NextResponse.json({ error: "Could not read request body." }, { status: 400 });
++  }
++  if (text.length > MAX_BODY_SIZE) {
++    return NextResponse.json({ error: "Request body too large." }, { status: 413 });
++  }
++
++  let body: unknown;
++  try {
++    body = JSON.parse(text);
++  } catch {
++    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
++  }
++
++  const check = validate(body);
++  if (!check.ok) {
++    return NextResponse.json({ error: check.error }, { status: check.status });
++  }
++
++  const router = createRouter();
++  try {
++    const result = await router.complete(check.request);
++    return NextResponse.json({
++      text: result.text,
++      provider: result.provider,
++      model: result.model,
++      usage: result.usage,
++      latencyMs: result.latencyMs,
++    });
++  } catch (err) {
++    if (err instanceof RouterError) {
++      // RouterError messages are already redacted (no key material).
++      return NextResponse.json({ error: err.message }, { status: 502 });
++    }
++    return NextResponse.json({ error: "Completion failed." }, { status: 500 });
++  }
++}
+diff --git a/apps/swarmagents/app/api/providers/route.test.ts b/apps/swarmagents/app/api/providers/route.test.ts
+new file mode 100644
+index 000000000..0a887f6e3
+--- /dev/null
++++ b/apps/swarmagents/app/api/providers/route.test.ts
+@@ -0,0 +1,41 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { NextRequest } from "next/server";
++import { GET } from "./route";
++
++process.env.SWARM_KEYS_ANTHROPIC = "sk-test-list-ant";
++process.env.SWARM_KEYS_OPENAI = "sk-test-list-oai";
++
++test("GET /api/providers lists configured providers without keys", async () => {
++  const res = await GET(
++    new NextRequest("http://localhost/api/providers", {
++      headers: { "x-swarm-user": "local" },
++    }),
++  );
++  assert.equal(res.status, 200);
++  const json = await res.json();
++  assert.ok(Array.isArray(json.providers));
++  const ids = json.providers.map((p: { id: string }) => p.id);
++  assert.ok(ids.includes("anthropic"));
++  assert.ok(ids.includes("openai"));
++  assert.ok(ids.includes("gemini"));
++
++  // no key material anywhere in the response
++  const serialized = JSON.stringify(json);
++  assert.equal(serialized.includes("sk-test-list-ant"), false);
++  assert.equal(serialized.includes("sk-test-list-oai"), false);
++
++  const anthropic = json.providers.find((p: { id: string }) => p.id === "anthropic");
++  assert.equal(anthropic.configured, true);
++  assert.equal(anthropic.kind, "anthropic");
++  assert.equal(anthropic.enabled, true);
++  assert.ok(anthropic.models.balanced);
++
++  const gemini = json.providers.find((p: { id: string }) => p.id === "gemini");
++  assert.equal(gemini.configured, false); // no SWARM_KEYS_GEMINI set
++});
++
++test("GET /api/providers requires a signed-in caller", async () => {
++  const res = await GET(new NextRequest("http://localhost/api/providers"));
++  assert.equal(res.status, 401);
++});
+diff --git a/apps/swarmagents/app/api/providers/route.ts b/apps/swarmagents/app/api/providers/route.ts
+new file mode 100644
+index 000000000..3071673b1
+--- /dev/null
++++ b/apps/swarmagents/app/api/providers/route.ts
+@@ -0,0 +1,59 @@
++import { NextResponse, type NextRequest } from "next/server";
++import { defaultProviderConfigs, modelForTier, type ProviderConfig } from "@/lib/providers";
++import type { ModelTier } from "@/lib/providers/types";
++import { USER_HEADER } from "@/lib/auth";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++const TIERS: ModelTier[] = ["fast", "balanced", "deep"];
++
++function dedupe(keys: string[]): string[] {
++  return Array.from(new Set(keys.map((k) => k.trim()).filter(Boolean)));
++}
++
++function envKeysName(config: { id: string }): string {
++  const suffix = config.id.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
++  return `SWARM_KEYS_${suffix}`;
++}
++
++function caller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++function unauthorized() {
++  return NextResponse.json({ error: "Sign in required." }, { status: 401 });
++}
++
++function providerSummary(config: ProviderConfig, env: Record<string, string | undefined>) {
++  const raw = env[envKeysName(config)] ?? "";
++  return {
++    id: config.id,
++    kind: config.kind,
++    rank: config.rank ?? 0,
++    enabled: config.enabled !== false,
++    configured: dedupe(raw.split(",")).length > 0,
++    models: Object.fromEntries(TIERS.map((t) => [t, modelForTier(config, t)])),
++  };
++}
++
++/**
++ * GET /api/providers
++ *
++ * Lists the server-known providers and whether each is configured with server
++ * held keys. No keys or secrets are ever returned. The UI uses this to decide
++ * whether to route completions through /api/providers/complete (server-held
++ * keys) or fall back to BYO-key (user-entered keys in the browser).
++ */
++export async function GET(req: NextRequest) {
++  const user = caller(req);
++  if (!user) return unauthorized();
++  const providers = defaultProviderConfigs().map((config) =>
++    providerSummary(config, process.env),
++  );
++  return NextResponse.json(
++    { providers },
++    { headers: { "cache-control": "no-store" } },
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index ae8e9c3ab..63f6c01f3 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -43,6 +43,48 @@ export default function App() {
+   const [runId, setRunId] = useState<string>();
+   const ctrlRef = useRef<AbortController | null>(null);
+ 
++  // Server-configured providers (server-held keys). Fetched from /api/providers;
++  // when any are configured the UI routes completions through /api/providers/complete
++  // so user-entered keys never travel in the browser. When none are configured,
++  // BYO-key / simulated flow remains the explicit opt-in.
++  const [serverProviders, setServerProviders] = useState<
++    Array<{ id: string; kind: string; rank: number; configured: boolean }> | null
++  >(null);
++  const [serverProvidersLoaded, setServerProvidersLoaded] = useState(false);
++
++  useEffect(() => {
++    let cancelled = false;
++    fetch("/api/providers", { headers: { Accept: "application/json" } })
++      .then((r) => {
++        if (!r.ok) return null;
++        return r.json().catch(() => null);
++      })
++      .then((data) => {
++        if (cancelled) return;
++        const providers = data?.providers;
++        if (Array.isArray(providers)) {
++          setServerProviders(
++            providers.map((p: { id: string; kind: string; rank: number; configured: boolean }) => ({
++              id: p.id,
++              kind: p.kind,
++              rank: p.rank ?? 0,
++              configured: Boolean(p.configured),
++            })),
++          );
++        }
++        setServerProvidersLoaded(true);
++      })
++      .catch(() => {
++        // /api/providers may not be reachable (Vite dev, unsigned, offline).
++        // Fall back to BYO-key / simulated flow.
++        setServerProviders([]);
++        setServerProvidersLoaded(true);
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
+   // Derive the 1 active agent role
+   const activeRolePreset = ROLES.find((r) => r.id === activeRoleId) || ROLES[0];
+   const activeAgent: ActiveRole = {
+@@ -70,6 +112,30 @@ export default function App() {
+     }
+   };
+ 
++  /** Route a single completion through the server-held-key proxy. No keys travel in the browser. */
++  async function callServerProvider(
++    input: string,
++    providerId: string,
++    signal: AbortSignal,
++  ): Promise<{ text: string; provider: string; model: string }> {
++    const res = await fetch("/api/providers/complete", {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({
++        messages: [{ role: "user" as const, content: input || "(see attachments)" }],
++        tier: "balanced",
++      }),
++      signal,
++    });
++    if (!res.ok) {
++      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
++      throw new Error(
++        (err as { error?: string }).error || `provider ${providerId} failed`,
++      );
++    }
++    return res.json();
++  }
++
+   const submit = useCallback(
+     async (text: string, atts: Attachment[]) => {
+       setShowLanding(false); // Entering workspace automatically dismisses landing
+@@ -101,6 +167,59 @@ export default function App() {
+           return;
+         }
+         setRunId(undefined);
++        // When the server reports configured providers, route the completion
++        // through /api/providers/complete so user-entered keys never travel in
++        // the browser. BYO-key / simulated flow remains the opt-in fallback
++        // when no server provider is configured (or the proxy is unreachable).
++        if (serverProvidersLoaded && serverProviders?.some((p) => p.configured)) {
++          try {
++            const providerId =
++              serverProviders.find((p) => p.id === activeAgent.providerUid)?.id ??
++              serverProviders[0]?.id;
++            if (providerId) {
++              const { text: out, provider, model } = await callServerProvider(
++                text || "(see attachments)",
++                providerId,
++                ctrl.signal,
++              );
++              setStates((s) => ({
++                ...s,
++                [activeAgent.uid]: {
++                  ...s[activeAgent.uid],
++                  status: "done",
++                  output: out,
++                  tokens: Math.max(1, Math.round(out.length / 4)),
++                  inTokens: Math.max(1, Math.round((text || "").length / 4)),
++                  model: `${provider} · ${model}`,
++                  end: performance.now(),
++                },
++              }));
++              setLogs((l) => [
++                ...l,
++                {
++                  t: performance.now(),
++                  agent: "system",
++                  hue: 140,
++                  msg: `routed via server provider ${provider}`,
++                },
++              ]);
++              setRunEnd(performance.now());
++              setBusy(false);
++              return;
++            }
++          } catch (e) {
++            if ((e as Error).name === "AbortError") throw e;
++            setLogs((l) => [
++              ...l,
++              {
++                t: performance.now(),
++                agent: "system",
++                hue: 0,
++                msg: `server provider unavailable: ${(e as Error).message}`,
++              },
++            ]);
++          }
++        }
+         await runAgents({
+           roles: snapshot,
+           providers,
+-- 
+2.55.0
+

@@ -1,0 +1,134 @@
+From 4973c33e88d7f410bb896f650a9227e9497d0aa3 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 13:20:07 -0600
+Subject: [PATCH] fix(harness): keep -p and pass prompt after --
+
+---
+ .../app/api/runtime/dispatch.e2e.test.ts      | 15 ++++++++++-
+ .../app/api/runtime/tasks/route.test.ts       | 13 ++++++++--
+ apps/swarmagents/lib/harness/runner.test.ts   | 25 +++++++++++++++++--
+ apps/swarmagents/lib/harness/runner.ts        |  5 +++-
+ 4 files changed, 52 insertions(+), 6 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/runtime/dispatch.e2e.test.ts b/apps/swarmagents/app/api/runtime/dispatch.e2e.test.ts
+index 09ced8b2a..907cd4053 100644
+--- a/apps/swarmagents/app/api/runtime/dispatch.e2e.test.ts
++++ b/apps/swarmagents/app/api/runtime/dispatch.e2e.test.ts
+@@ -81,7 +81,20 @@ function makeFakeClaude(dir: string): string {
+   const fixture = join(dir, "stream-json.fixture");
+   writeFileSync(fixture, `${RECORDED_LINES.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
+   const bin = join(dir, "claude");
+-  writeFileSync(bin, `#!/bin/sh\nexec cat "${fixture}"\n`, "utf8");
++  // Read prompt from the argument after `--` (kept for harness contract parity).
++  writeFileSync(
++    bin,
++    `#!/bin/sh
++prompt=""
++seen=""
++for arg in "$@"; do
++  if [ "$seen" = "1" ]; then prompt="$arg"; break; fi
++  if [ "$arg" = "--" ]; then seen="1"; fi
++done
++exec cat "${fixture}"
++`,
++    "utf8",
++  );
+   chmodSync(bin, 0o755);
+   return bin;
+ }
+diff --git a/apps/swarmagents/app/api/runtime/tasks/route.test.ts b/apps/swarmagents/app/api/runtime/tasks/route.test.ts
+index dd6449559..786951a82 100644
+--- a/apps/swarmagents/app/api/runtime/tasks/route.test.ts
++++ b/apps/swarmagents/app/api/runtime/tasks/route.test.ts
+@@ -173,8 +173,17 @@ test("POST starts a run, publishes telemetry, and GET lists it as finished", asy
+   // provider token is chosen by lib/providers and rides in env, never argv.
+   assert.equal(driver.calls.length, 1);
+   const { cmd, opts } = driver.calls[0];
+-  assert.deepEqual(cmd.slice(0, 7), ["claude", "-p", "Build a thing", "--output-format", "stream-json", "--verbose", "--resume"]);
+-  assert.equal(cmd[7], "sess_resume_9");
++  assert.deepEqual(cmd, [
++    "claude",
++    "-p",
++    "--output-format",
++    "stream-json",
++    "--verbose",
++    "--resume",
++    "sess_resume_9",
++    "--",
++    "Build a thing",
++  ]);
+   assert.equal(opts.env?.ANTHROPIC_AUTH_TOKEN, "sk-test-gw-key-0000");
+   assert.equal(opts.env?.ANTHROPIC_BASE_URL, "http://gw");
+   assert.equal(opts.env?.ANTHROPIC_MODEL, "claude-sonnet-4-5");
+diff --git a/apps/swarmagents/lib/harness/runner.test.ts b/apps/swarmagents/lib/harness/runner.test.ts
+index 9ab661aeb..8cdc0b813 100644
+--- a/apps/swarmagents/lib/harness/runner.test.ts
++++ b/apps/swarmagents/lib/harness/runner.test.ts
+@@ -222,7 +222,6 @@ test("builds argv correctly and passes provider keys via env only, never argv",
+   assert.deepEqual(cmd, [
+     "claude",
+     "-p",
+-    "Inspect repo",
+     "--output-format",
+     "stream-json",
+     "--verbose",
+@@ -230,6 +229,8 @@ test("builds argv correctly and passes provider keys via env only, never argv",
+     "sess_resume_x",
+     "--model",
+     "claude-sonnet-5-5",
++    "--",
++    "Inspect repo",
+   ]);
+   assert.deepEqual(opts.env, envWithSecrets);
+   for (const secret of [SECRET_TOKEN, PLAIN_SECRET]) {
+@@ -399,8 +400,28 @@ test("defaults: no --resume/--model when not requested; run without sessionId",
+   const outcome = await runner.run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+ 
+   assert.equal(outcome.exitCode, 0);
+-  assert.deepEqual(vm.calls[0].cmd, ["claude", "-p", "x", "--output-format", "stream-json", "--verbose"]);
++  assert.deepEqual(vm.calls[0].cmd, ["claude", "-p", "--output-format", "stream-json", "--verbose", "--", "x"]);
+   // No sessionId anywhere -> finished falls back to the result event's session.
+   const finished = events.find((e) => e.type === "run.finished");
+   assert.equal(finished!.sessionId, "sess_demo_1");
+ });
++
++
++test("keeps -p and places a dash-leading prompt after --", async () => {
++  const prompt = "\n--danger\n";
++  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
++  const runner = new ClaudeCodeRunner();
++  const events: TelemetryEvent[] = [];
++
++  const outcome = await runner.run({ prompt, env: {}, vm }, (e) => events.push(e));
++
++  assert.equal(outcome.exitCode, 0);
++  const cmd = vm.calls[0].cmd;
++  assert.equal(cmd[0], "claude");
++  assert.equal(cmd[1], "-p");
++  assert.equal(cmd.at(-2), "--");
++  assert.equal(cmd.at(-1), prompt);
++  assert.ok(cmd.includes("--output-format"));
++  assert.ok(cmd.includes("stream-json"));
++  assert.ok(cmd.includes("--verbose"));
++});
+diff --git a/apps/swarmagents/lib/harness/runner.ts b/apps/swarmagents/lib/harness/runner.ts
+index 21b6c1afc..a2070513e 100644
+--- a/apps/swarmagents/lib/harness/runner.ts
++++ b/apps/swarmagents/lib/harness/runner.ts
+@@ -349,9 +349,12 @@ export class ClaudeCodeRunner {
+   }
+ 
+   private buildArgv(request: RunRequest): string[] {
+-    const argv: string[] = [this.bin, "-p", request.prompt, "--output-format", "stream-json", "--verbose"];
++    // Keep -p (print/non-interactive). Pass the prompt after `--` so values that
++    // begin with '-' are treated as text, never as CLI flags.
++    const argv: string[] = [this.bin, "-p", "--output-format", "stream-json", "--verbose"];
+     if (request.sessionId) argv.push("--resume", request.sessionId);
+     if (request.model) argv.push("--model", request.model);
++    argv.push("--", request.prompt);
+     return argv;
+   }
+ }
+-- 
+2.55.0
+

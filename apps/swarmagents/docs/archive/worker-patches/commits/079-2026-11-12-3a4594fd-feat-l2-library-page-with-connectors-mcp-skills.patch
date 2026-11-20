@@ -1,0 +1,2413 @@
+From 3a4594fd3f107899154eb93d939ca15d5f3a244e Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 22:51:10 +0000
+Subject: [PATCH] feat(l2): Library page with Connectors / MCP / Skills / Tools
+ tabs
+
+---
+ apps/swarmagents/app/globals.css              |  31 +-
+ apps/swarmagents/e2e/library.spec.ts          | 197 ++++
+ apps/swarmagents/lib/library/client.test.ts   |  91 ++
+ apps/swarmagents/lib/library/client.ts        | 522 ++++++++++
+ apps/swarmagents/lib/library/types.ts         | 137 +++
+ apps/swarmagents/minimalist-ui/src/App.tsx    |  35 +-
+ .../minimalist-ui/src/components/Library.tsx  | 953 ++++++++++++++++++
+ .../src/components/RoleAndVmBar.tsx           | 107 +-
+ .../minimalist-ui/src/components/Settings.tsx |  87 +-
+ apps/swarmagents/minimalist-ui/src/data.ts    |   6 +
+ 10 files changed, 2151 insertions(+), 15 deletions(-)
+ create mode 100644 apps/swarmagents/e2e/library.spec.ts
+ create mode 100644 apps/swarmagents/lib/library/client.test.ts
+ create mode 100644 apps/swarmagents/lib/library/client.ts
+ create mode 100644 apps/swarmagents/lib/library/types.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/Library.tsx
+
+diff --git a/apps/swarmagents/app/globals.css b/apps/swarmagents/app/globals.css
+index d20f9a92a..0125c710d 100644
+--- a/apps/swarmagents/app/globals.css
++++ b/apps/swarmagents/app/globals.css
+@@ -207,18 +207,27 @@ body {
+   text-rendering: optimizeLegibility;
+ }
+ 
+-button {
+-  font: inherit;
+-  color: inherit;
+-  background: none;
+-  border: 0;
+-  cursor: pointer;
+-  padding: 0;
+-}
++/* Base-layer reset: utilities must win over this reset (an unlayered
++ * `button { background: none; }` beats every Tailwind `bg-*` utility on
++ * buttons, which silently killed active tab pills, enable toggles and
++ * accent buttons app-wide — e.g. the Library's toggles rendered with no
++ * track and active tabs with no background). In @layer base the reset
++ * still applies to unstyled buttons, and utilities override it as intended.
++ */
++@layer base {
++  button {
++    font: inherit;
++    color: inherit;
++    background: none;
++    border: 0;
++    cursor: pointer;
++    padding: 0;
++  }
+ 
+-input, textarea, select {
+-  font: inherit;
+-  color: inherit;
++  input, textarea, select {
++    font: inherit;
++    color: inherit;
++  }
+ }
+ 
+ ::selection {
+diff --git a/apps/swarmagents/e2e/library.spec.ts b/apps/swarmagents/e2e/library.spec.ts
+new file mode 100644
+index 000000000..96f5d5da4
+--- /dev/null
++++ b/apps/swarmagents/e2e/library.spec.ts
+@@ -0,0 +1,197 @@
++// Library page e2e — runs against the stubbed Library client (l1's
++// /api/library API has not merged, so the page serves in-memory preview
++// data; see lib/library/client.ts USE_STUB). The flows below — enable /
++// disable, configure + role assignment, add + remove, catalog install,
++// search — exercise the same UI and client calls the real API will serve,
++// so they become end-to-end against l1 by flipping that one flag.
++import assert from "node:assert/strict";
++import { after, test } from "node:test";
++import type { Page } from "playwright-core";
++import { captureView, closeBrowser, openWorkspace, runPageTest } from "./lib";
++
++after(async () => {
++  await closeBrowser();
++});
++
++async function openLibrary(page: Page) {
++  await page.getByRole("button", { name: "Library", exact: true }).first().click();
++  await page.getByTestId("library-page").waitFor({ state: "visible", timeout: 10_000 });
++}
++
++/** The tab pill crossfades its background (150ms transition); wait for the
++ *  newly selected tab to actually show the active color before screenshotting,
++ *  or the capture catches the fade mid-flight. */
++async function waitForTabActive(page: Page, kind: string) {
++  await page.waitForFunction(
++    (k) => {
++      const el = document.querySelector(`[data-testid="library-tab-${k}"]`);
++      if (!el) return false;
++      const bg = getComputedStyle(el).backgroundColor;
++      return bg !== "rgba(0, 0, 0, 0)" && bg !== "oklab(0 0 0 / 0)" && !bg.includes("0 0 0 / 0");
++    },
++    kind,
++    { timeout: 5_000 },
++  );
++}
++
++test("library: four tabs render installed items", async (t) => {
++  const result = await runPageTest("library: four tabs render installed items", async ({ page, context, consoleErrors }) => {
++    await openWorkspace(page, context);
++    await openLibrary(page);
++
++    // Stub notice: honest about preview data until l1 lands.
++    await page.getByTestId("library-stub-notice").waitFor({ state: "visible", timeout: 5_000 });
++
++    // Connectors tab (default): the GitHub connector is installed.
++    await page.getByTestId("library-card-connector-github").waitFor({ state: "visible", timeout: 5_000 });
++    await captureView(page, "library: four tabs render installed items", "connectors");
++
++    // MCP tab: the four hardcoded servers are installed.
++    await page.getByTestId("library-tab-mcp").click();
++    await page.getByTestId("library-card-github-mcp").waitFor({ state: "visible", timeout: 5_000 });
++    await page.getByTestId("library-card-postgres-mcp").waitFor({ state: "visible", timeout: 5_000 });
++    await waitForTabActive(page, "mcp");
++    await captureView(page, "library: four tabs render installed items", "mcp");
++
++    // Skills tab: the three builtin skills are installed.
++    await page.getByTestId("library-tab-skills").click();
++    await page.getByTestId("library-card-terminal-exec").waitFor({ state: "visible", timeout: 5_000 });
++    await page.getByTestId("library-card-browser-live").waitFor({ state: "visible", timeout: 5_000 });
++    await waitForTabActive(page, "skills");
++    await captureView(page, "library: four tabs render installed items", "skills");
++
++    // Tools tab: the agent-created example tool is installed.
++    await page.getByTestId("library-tab-tools").click();
++    await page.getByTestId("library-card-tool-summarize-diff").waitFor({ state: "visible", timeout: 5_000 });
++    await waitForTabActive(page, "tools");
++    await captureView(page, "library: four tabs render installed items", "tools");
++
++    assert.deepEqual(consoleErrors, [], `unexpected page errors: ${consoleErrors.join(" | ")}`);
++  });
++  if (result.skipped) t.skip(result.skipped);
++});
++
++test("library: enable and disable toggle persists", async (t) => {
++  const result = await runPageTest("library: enable and disable toggle persists", async ({ page, context, consoleErrors }) => {
++    await openWorkspace(page, context);
++    await openLibrary(page);
++    await page.getByTestId("library-tab-mcp").click();
++    await page.getByTestId("library-card-postgres-mcp").waitFor({ state: "visible", timeout: 5_000 });
++
++    const toggle = page.getByTestId("library-toggle-postgres-mcp");
++    assert.equal(await toggle.getAttribute("aria-checked"), "false", "postgres-mcp starts disabled");
++
++    await toggle.click();
++    await page.waitForFunction(
++      () => document.querySelector('[data-testid="library-toggle-postgres-mcp"]')?.getAttribute("aria-checked") === "true",
++      { timeout: 5_000 },
++    );
++    assert.equal(await toggle.getAttribute("aria-checked"), "true", "postgres-mcp enables");
++
++    await toggle.click();
++    await page.waitForFunction(
++      () => document.querySelector('[data-testid="library-toggle-postgres-mcp"]')?.getAttribute("aria-checked") === "false",
++      { timeout: 5_000 },
++    );
++    assert.equal(await toggle.getAttribute("aria-checked"), "false", "postgres-mcp disables again");
++
++    assert.deepEqual(consoleErrors, [], `unexpected page errors: ${consoleErrors.join(" | ")}`);
++  });
++  if (result.skipped) t.skip(result.skipped);
++});
++
++test("library: configure drawer assigns a role", async (t) => {
++  const result = await runPageTest("library: configure drawer assigns a role", async ({ page, context, consoleErrors }) => {
++    await openWorkspace(page, context);
++    await openLibrary(page);
++    await page.getByTestId("library-tab-mcp").click();
++    await page.getByTestId("library-card-github-mcp").waitFor({ state: "visible", timeout: 5_000 });
++
++    await page.getByTestId("library-configure-github-mcp").click();
++    const drawer = page.getByTestId("library-drawer");
++    await drawer.waitFor({ state: "visible", timeout: 5_000 });
++
++    // The GitHub server is masked-secret based: the token field shows a
++    // placeholder, never a value.
++    const secret = page.getByTestId("library-drawer-secret").first();
++    assert.equal(await secret.inputValue(), "", "stored secret must arrive blank (masked)");
++
++    // Assign the Debugger role, which is not assigned initially.
++    const debuggerRole = page.getByTestId("library-role-debugger");
++    assert.equal(await debuggerRole.isChecked(), false, "debugger starts unassigned");
++    await debuggerRole.check();
++    await page.getByTestId("library-drawer-save").click();
++    await drawer.waitFor({ state: "hidden", timeout: 5_000 });
++
++    // Reopen: the assignment stuck.
++    await page.getByTestId("library-configure-github-mcp").click();
++    await drawer.waitFor({ state: "visible", timeout: 5_000 });
++    assert.equal(await page.getByTestId("library-role-debugger").isChecked(), true, "debugger stays assigned after save");
++    // The role list on the card reflects the assignment.
++    await page.keyboard.press("Escape");
++    await drawer.waitFor({ state: "hidden", timeout: 5_000 });
++    const card = page.getByTestId("library-card-github-mcp");
++    assert.match((await card.textContent()) ?? "", /debugger/, "card shows the assigned role");
++
++    assert.deepEqual(consoleErrors, [], `unexpected page errors: ${consoleErrors.join(" | ")}`);
++  });
++  if (result.skipped) t.skip(result.skipped);
++});
++
++test("library: add a custom tool and remove it", async (t) => {
++  const result = await runPageTest("library: add a custom tool and remove it", async ({ page, context, consoleErrors }) => {
++    await openWorkspace(page, context);
++    await openLibrary(page);
++    await page.getByTestId("library-tab-tools").click();
++    await page.getByTestId("library-card-tool-summarize-diff").waitFor({ state: "visible", timeout: 5_000 });
++
++    await page.getByTestId("library-add-tools").click();
++    const drawer = page.getByTestId("library-drawer");
++    await drawer.waitFor({ state: "visible", timeout: 5_000 });
++    await page.getByTestId("library-drawer-name").fill("E2E probe tool");
++    await page.getByTestId("library-drawer-description").fill("A tool added by the e2e spec.");
++    await page.getByTestId("library-drawer-script").fill("probe.sh");
++    await page.getByTestId("library-drawer-save").click();
++    await drawer.waitFor({ state: "hidden", timeout: 5_000 });
++
++    const card = page.locator('[data-testid^="library-card-"]', { hasText: "E2E probe tool" });
++    await card.waitFor({ state: "visible", timeout: 5_000 });
++
++    // Remove with confirm: the card goes away.
++    await card.getByRole("button", { name: /Remove E2E probe tool/ }).click();
++    const confirm = card.getByRole("button", { name: /Confirm remove/ });
++    await confirm.waitFor({ state: "visible", timeout: 5_000 });
++    await confirm.click();
++    await card.waitFor({ state: "hidden", timeout: 5_000 });
++
++    assert.deepEqual(consoleErrors, [], `unexpected page errors: ${consoleErrors.join(" | ")}`);
++  });
++  if (result.skipped) t.skip(result.skipped);
++});
++
++test("library: catalog install and search filter", async (t) => {
++  const result = await runPageTest("library: catalog install and search filter", async ({ page, context, consoleErrors }) => {
++    await openWorkspace(page, context);
++    await openLibrary(page);
++    await page.getByTestId("library-tab-mcp").click();
++    await page.getByTestId("library-card-github-mcp").waitFor({ state: "visible", timeout: 5_000 });
++
++    // Untrusted catalog content is previewed before install.
++    const catalogEntry = page.getByTestId("library-catalog-catalog-sqlite-mcp");
++    assert.match((await catalogEntry.textContent()) ?? "", /Before you install/, "catalog entry shows its preview");
++    await page.getByTestId("library-install-catalog-sqlite-mcp").click();
++    await page.getByTestId("library-card-catalog-sqlite-mcp").waitFor({ state: "visible", timeout: 5_000 });
++
++    // Search narrows the installed list.
++    await page.getByTestId("library-search").fill("postgres");
++    await page.waitForFunction(
++      () => document.querySelectorAll('[data-testid="library-card-github-mcp"]').length === 0,
++      { timeout: 5_000 },
++    );
++    assert.equal(await page.getByTestId("library-card-postgres-mcp").count(), 1, "postgres still matches");
++    assert.equal(await page.getByTestId("library-card-github-mcp").count(), 0, "github is filtered out");
++
++    assert.deepEqual(consoleErrors, [], `unexpected page errors: ${consoleErrors.join(" | ")}`);
++  });
++  if (result.skipped) t.skip(result.skipped);
++});
+diff --git a/apps/swarmagents/lib/library/client.test.ts b/apps/swarmagents/lib/library/client.test.ts
+new file mode 100644
+index 000000000..63b216710
+--- /dev/null
++++ b/apps/swarmagents/lib/library/client.test.ts
+@@ -0,0 +1,91 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { ROLE_MCP_SERVER_REGISTRY, ROLE_SKILL_REGISTRY } from "../roles";
++import { StubLibraryClient, stripMaskedEnv } from "./client";
++
++test("library stub: seeds mirror the hardcoded registries", async () => {
++  const client = new StubLibraryClient();
++  const mcp = await client.list("mcp");
++  const registryIds = Object.keys(ROLE_MCP_SERVER_REGISTRY).sort();
++  const seededIds = mcp.items.map((item) => item.id).sort();
++  assert.deepEqual(seededIds, registryIds, "stub MCP seeds must match ROLE_MCP_SERVER_REGISTRY");
++
++  const skills = await client.list("skills");
++  const skillRegistryIds = Object.keys(ROLE_SKILL_REGISTRY).sort();
++  const seededSkillIds = skills.items.map((item) => item.id).sort();
++  assert.deepEqual(seededSkillIds, skillRegistryIds, "stub skill seeds must match ROLE_SKILL_REGISTRY");
++});
++
++test("library stub: enable/disable toggles an item", async () => {
++  const client = new StubLibraryClient();
++  const updated = await client.setEnabled("mcp", "postgres-mcp", true);
++  assert.equal(updated.enabled, true);
++  const list = await client.list("mcp");
++  assert.equal(list.items.find((item) => item.id === "postgres-mcp")?.enabled, true);
++  await client.setEnabled("mcp", "postgres-mcp", false);
++  const again = await client.list("mcp");
++  assert.equal(again.items.find((item) => item.id === "postgres-mcp")?.enabled, false);
++});
++
++test("library stub: role assignment round-trips", async () => {
++  const client = new StubLibraryClient();
++  const updated = await client.setRoles("skills", "terminal-exec", ["main", "debugger"]);
++  assert.deepEqual(updated.roles, ["main", "debugger"]);
++  const list = await client.list("skills");
++  assert.deepEqual(list.items.find((item) => item.id === "terminal-exec")?.roles, ["main", "debugger"]);
++});
++
++test("library stub: builtin items cannot be removed, custom ones can", async () => {
++  const client = new StubLibraryClient();
++  await assert.rejects(() => client.remove("mcp", "github-mcp"), /Built-in items cannot be removed/);
++
++  const created = await client.create("tools", {
++    name: "My tool",
++    description: "test tool",
++    impl: { kind: "script-in-vm", script: "run.sh" },
++    inputSchema: { type: "object", properties: {} },
++  });
++  assert.equal(created.source, "user");
++  await client.remove("tools", created.id);
++  const list = await client.list("tools");
++  assert.equal(list.items.some((item) => item.id === created.id), false);
++});
++
++test("library stub: catalog install shows untrusted content first, then installs", async () => {
++  const client = new StubLibraryClient();
++  const before = await client.list("mcp");
++  const entry = before.catalog.find((item) => item.id === "catalog-sqlite-mcp");
++  assert.ok(entry, "expected a SQLite catalog entry");
++  assert.match(entry.preview, /Runs inside your VM/, "catalog preview must state where it runs");
++  assert.equal(entry.installed, false);
++
++  const installed = await client.installFromCatalog("mcp", "catalog-sqlite-mcp");
++  assert.equal(installed.source, "catalog");
++  const after = await client.list("mcp");
++  assert.equal(after.catalog.find((item) => item.id === "catalog-sqlite-mcp")?.installed, true);
++  assert.equal(after.items.some((item) => item.id === "catalog-sqlite-mcp"), true);
++});
++
++test("library stub: create rejects duplicate ids", async () => {
++  const client = new StubLibraryClient();
++  await assert.rejects(
++    () => client.create("skills", { id: "terminal-exec", name: "dup", description: "" }),
++    /already exists/,
++  );
++});
++
++test("library client: masked secret placeholders are never sent back", () => {
++  const patch = stripMaskedEnv({
++    name: "GitHub",
++    env: { GITHUB_TOKEN: "••••••••", OTHER: "real-value" },
++  } as never);
++  const env = (patch as { env?: Record<string, string> }).env ?? {};
++  assert.equal("GITHUB_TOKEN" in env, false, "masked placeholder must be dropped");
++  assert.equal(env.OTHER, "real-value");
++});
++
++test("library stub: unknown ids fail loudly", async () => {
++  const client = new StubLibraryClient();
++  await assert.rejects(() => client.update("tools", "nope", { enabled: false }), /No tools item/);
++  await assert.rejects(() => client.remove("skills", "nope"), /No skills item/);
++});
+diff --git a/apps/swarmagents/lib/library/client.ts b/apps/swarmagents/lib/library/client.ts
+new file mode 100644
+index 000000000..57e1dec8e
+--- /dev/null
++++ b/apps/swarmagents/lib/library/client.ts
+@@ -0,0 +1,522 @@
++// Library client — the ONE module the Library UI talks to.
++//
++// l1 (Library foundation: per-user store + /api/library/* CRUD API) has NOT
++// merged, so this module ships two adapters behind one interface:
++//
++//   - `StubLibraryClient` — in-memory data seeded from the app's current
++//     hardcoded registries (ROLE_MCP_SERVER_REGISTRY, ROLE_SKILL_REGISTRY,
++//     DEFAULT_MCP_SKILLS). Used while l1 is unmerged.
++//   - `RestLibraryClient` — the real adapter against the l1 REST contract
++//     (GET/POST/PATCH/DELETE /api/library/{mcp,skills,tools}, owner-only,
++//     zod-validated). It is fully written but untested against a live l1
++//     server because none exists on this main yet.
++//
++// Flip the single `USE_STUB` flag below when l1 lands. Components must
++// never call fetch directly — they use `getLibraryClient()` only, so the
++// swap touches this file and nothing else.
++//
++// Secrets: the client NEVER logs or stores secret values. The API returns
++// masked placeholders for env values; `updateItem` only sends env entries
++// the user actually typed (non-empty strings). Masked placeholders are
++// never sent back — sending "••••••••" would overwrite the stored secret.
++
++import {
++  type LibraryCatalogEntry,
++  type LibraryItem,
++  type LibraryItemPatch,
++  type LibraryKind,
++  type LibraryListResult,
++  type LibraryMcpItem,
++  type LibrarySkillItem,
++  type LibraryToolItem,
++} from "./types";
++
++/** Flip to false the moment l1's /api/library routes land on main. */
++export const USE_STUB = true;
++
++export interface LibraryClient {
++  list(kind: LibraryKind): Promise<LibraryListResult>;
++  create(kind: LibraryKind, patch: LibraryItemPatch & { id?: string }): Promise<LibraryItem>;
++  update(kind: LibraryKind, id: string, patch: LibraryItemPatch): Promise<LibraryItem>;
++  remove(kind: LibraryKind, id: string): Promise<void>;
++  setEnabled(kind: LibraryKind, id: string, enabled: boolean): Promise<LibraryItem>;
++  setRoles(kind: LibraryKind, id: string, roles: string[]): Promise<LibraryItem>;
++  installFromCatalog(kind: LibraryKind, catalogId: string): Promise<LibraryItem>;
++}
++
++// ---------------------------------------------------------------------------
++// Stub adapter (in-memory; l1 not merged yet)
++// ---------------------------------------------------------------------------
++
++const MASK = "••••••••";
++
++/** Seed MCP servers — mirrors lib/roles.ts ROLE_MCP_SERVER_REGISTRY. */
++function seedMcp(): LibraryMcpItem[] {
++  return [
++    {
++      id: "postgres-mcp",
++      name: "PostgreSQL",
++      description: "Direct DB query execution, migrations and schema inspection.",
++      source: "builtin",
++      transport: "stdio",
++      command: "npx",
++      args: ["-y", "@modelcontextprotocol/server-postgres"],
++      env: { DATABASE_URL: { masked: MASK, set: false } },
++      enabled: false,
++      roles: ["backend-engineer", "data-analyst"],
++    },
++    {
++      id: "github-mcp",
++      name: "GitHub",
++      description: "Branch management, pull requests and commit checks.",
++      source: "builtin",
++      transport: "stdio",
++      command: "npx",
++      args: ["-y", "@modelcontextprotocol/server-github"],
++      env: { GITHUB_TOKEN: { masked: MASK, set: false } },
++      enabled: true,
++      roles: ["main", "frontend-engineer", "code-reviewer", "devops", "deployer", "security-auditor"],
++    },
++    {
++      id: "computer-mcp",
++      name: "Desktop Computer",
++      description:
++        "Control the on-screen desktop: screenshots, clicks, typing, keys, scrolling and opening apps (desktop VM mode only).",
++      source: "builtin",
++      transport: "stdio",
++      command: "npx",
++      args: ["-y", "@swarmagents/computer-mcp"],
++      enabled: false,
++      roles: [],
++    },
++    {
++      id: "playwright-mcp",
++      name: "Desktop Browser",
++      description:
++        "Drive the visible on-screen Chromium: navigation, clicks, typing and page snapshots (desktop VM mode only).",
++      source: "builtin",
++      transport: "stdio",
++      command: "npx",
++      args: ["-y", "@playwright/mcp"],
++      enabled: false,
++      roles: [],
++    },
++  ];
++}
++
++/** Seed skills — mirrors lib/roles.ts ROLE_SKILL_REGISTRY and
++ *  minimalist-ui/src/data.ts DEFAULT_MCP_SKILLS. */
++function seedSkills(): LibrarySkillItem[] {
++  return [
++    {
++      id: "terminal-exec",
++      name: "Bash & Terminal",
++      description: "Executes shell commands, git and build runners in the VM.",
++      source: "builtin",
++      files: ["SKILL.md"],
++      enabled: true,
++      roles: ["main", "orchestrator", "implementer", "frontend-engineer", "backend-engineer", "debugger", "auditor", "test-writer", "security-auditor", "data-analyst", "technical-writer", "devops", "deployer"],
++    },
++    {
++      id: "browser-live",
++      name: "Live Headed Browser",
++      description: "Interactive browser session streamed into the dashboard.",
++      source: "builtin",
++      files: ["SKILL.md"],
++      enabled: true,
++      roles: ["main", "researcher", "frontend-engineer", "browser-operator", "product-designer"],
++    },
++    {
++      id: "file-editor",
++      name: "Surgical File Editor",
++      description: "Atomic file reading, writing and diff-based patching.",
++      source: "builtin",
++      files: ["SKILL.md"],
++      enabled: true,
++      roles: ["main", "implementer", "frontend-engineer", "backend-engineer", "debugger", "test-writer", "technical-writer", "devops", "deployer"],
++    },
++  ];
++}
++
++/** Seed connectors — the account connections behind the MCP servers. */
++function seedConnectors(): LibraryMcpItem[] {
++  return [
++    {
++      id: "connector-github",
++      name: "GitHub",
++      description: "Connect your GitHub account for repos, PRs and checks.",
++      source: "builtin",
++      transport: "http",
++      url: "https://api.github.com",
++      env: { GITHUB_TOKEN: { masked: MASK, set: false } },
++      enabled: true,
++      roles: ["main"],
++    },
++    {
++      id: "connector-postgres",
++      name: "PostgreSQL",
++      description: "Connect a Postgres database for queries and migrations.",
++      source: "builtin",
++      transport: "stdio",
++      command: "npx",
++      args: ["-y", "@modelcontextprotocol/server-postgres"],
++      env: { DATABASE_URL: { masked: MASK, set: false } },
++      enabled: false,
++      roles: [],
++    },
++  ];
++}
++
++/** Seed tools — one agent-created example so the tab is not empty. */
++function seedTools(): LibraryToolItem[] {
++  return [
++    {
++      id: "tool-summarize-diff",
++      name: "Summarize diff",
++      description: "Summarizes a git diff into a short changelog entry. Created by the agent.",
++      inputSchema: { type: "object", properties: { diff: { type: "string" } }, required: ["diff"] },
++      impl: { kind: "script-in-vm", script: "summarize-diff.sh" },
++      source: "agent",
++      enabled: true,
++      roles: ["main", "code-reviewer"],
++    },
++  ];
++}
++
++/** Untrusted public-catalog entries — always shown before install. */
++function seedCatalog(kind: LibraryKind): LibraryCatalogEntry[] {
++  if (kind === "mcp") {
++    return [
++      {
++        id: "catalog-sqlite-mcp",
++        kind: "mcp",
++        name: "SQLite MCP",
++        description: "Query local SQLite databases from the agent.",
++        source: "catalog",
++        preview: "Installs the @modelcontextprotocol/server-sqlite MCP server (npx, stdio). Runs inside your VM. Requests read access to .db files you point it at — no network, no secrets.",
++        installed: false,
++      },
++      {
++        id: "catalog-filesystem-mcp",
++        kind: "mcp",
++        name: "Filesystem MCP",
++        description: "Scoped file access for the agent beyond the workspace.",
++        source: "catalog",
++        preview: "Installs @modelcontextprotocol/server-filesystem (npx, stdio). Runs inside your VM. You choose which directories it may read — it cannot reach anything outside that list.",
++        installed: false,
++      },
++    ];
++  }
++  if (kind === "skills") {
++    return [
++      {
++        id: "catalog-pdf-reading",
++        kind: "skills",
++        name: "PDF Reading",
++        description: "Extract text and tables from PDF files.",
++        source: "catalog",
++        preview: "Installs the pdf-reading skill (SKILL.md + extract.py). Runs inside your VM. Reads only files you hand it — no network access.",
++        installed: false,
++      },
++    ];
++  }
++  if (kind === "tools") {
++    return [
++      {
++        id: "catalog-weather-tool",
++        kind: "tools",
++        name: "Weather lookup",
++        description: "Current weather for any city, via a public API.",
++        source: "public",
++        preview: "Installs a public tool that calls api.open-meteo.com (GET, no key). Runs as an HTTP call from your VM. Shares only the city name you pass in.",
++        installed: false,
++      },
++    ];
++  }
++  return [
++    {
++      id: "catalog-slack",
++      kind: "connectors",
++      name: "Slack",
++      description: "Connect a Slack workspace for messages and channels.",
++      source: "catalog",
++      preview: "Adds a Slack connector (HTTP). Runs inside your VM. Needs a Slack bot token, stored encrypted — the agent can only read channels you allow.",
++      installed: false,
++    },
++  ];
++}
++
++function slugify(value: string): string {
++  const slug = value
++    .toLowerCase()
++    .trim()
++    .replace(/[^a-z0-9]+/g, "-")
++    .replace(/^-+|-+$/g, "")
++    .slice(0, 48);
++  return slug || "item";
++}
++
++function clone<T>(value: T): T {
++  return JSON.parse(JSON.stringify(value)) as T;
++}
++
++/** In-memory Library client used until l1's API lands. */
++export class StubLibraryClient implements LibraryClient {
++  private readonly store: Record<LibraryKind, LibraryItem[]> = {
++    connectors: seedConnectors(),
++    mcp: seedMcp(),
++    skills: seedSkills(),
++    tools: seedTools(),
++  };
++  private readonly installedCatalog = new Set<string>();
++
++  async list(kind: LibraryKind): Promise<LibraryListResult> {
++    return {
++      items: clone(this.store[kind]),
++      catalog: seedCatalog(kind).map((entry) => ({
++        ...entry,
++        installed: this.installedCatalog.has(entry.id) || this.store[kind].some((item) => item.id === entry.id),
++      })),
++    };
++  }
++
++  async create(kind: LibraryKind, patch: LibraryItemPatch & { id?: string }): Promise<LibraryItem> {
++    const id = patch.id?.trim() || `${slugify((patch as { name?: string }).name ?? "item")}-${Date.now().toString(36)}`;
++    if (this.store[kind].some((item) => item.id === id)) {
++      throw new Error(`An item with id "${id}" already exists.`);
++    }
++    const item = this.buildItem(kind, id, patch);
++    this.store[kind].push(item);
++    return clone(item);
++  }
++
++  async update(kind: LibraryKind, id: string, patch: LibraryItemPatch): Promise<LibraryItem> {
++    const item = this.find(kind, id);
++    this.applyPatch(item, patch);
++    return clone(item);
++  }
++
++  async remove(kind: LibraryKind, id: string): Promise<void> {
++    const index = this.store[kind].findIndex((item) => item.id === id);
++    if (index < 0) throw new Error(`No ${kind} item with id "${id}".`);
++    if (this.store[kind][index].source === "builtin") {
++      throw new Error("Built-in items cannot be removed — disable them instead.");
++    }
++    this.store[kind].splice(index, 1);
++  }
++
++  async setEnabled(kind: LibraryKind, id: string, enabled: boolean): Promise<LibraryItem> {
++    return this.update(kind, id, { enabled } as LibraryItemPatch);
++  }
++
++  async setRoles(kind: LibraryKind, id: string, roles: string[]): Promise<LibraryItem> {
++    return this.update(kind, id, { roles } as LibraryItemPatch);
++  }
++
++  async installFromCatalog(kind: LibraryKind, catalogId: string): Promise<LibraryItem> {
++    const entry = seedCatalog(kind).find((item) => item.id === catalogId);
++    if (!entry) throw new Error(`No catalog entry "${catalogId}".`);
++    if (this.store[kind].some((item) => item.id === entry.id)) {
++      throw new Error(`"${entry.name}" is already installed.`);
++    }
++    const item = this.buildItem(kind, entry.id, {
++      name: entry.name,
++      description: entry.description,
++    } as LibraryItemPatch);
++    item.source = entry.source;
++    this.store[kind].push(item);
++    this.installedCatalog.add(catalogId);
++    return clone(item);
++  }
++
++  private find(kind: LibraryKind, id: string): LibraryItem {
++    const item = this.store[kind].find((candidate) => candidate.id === id);
++    if (!item) throw new Error(`No ${kind} item with id "${id}".`);
++    return item;
++  }
++
++  private buildItem(kind: LibraryKind, id: string, patch: LibraryItemPatch): LibraryItem {
++    const base = {
++      id,
++      name: (patch as { name?: string }).name?.trim() || id,
++      description: (patch as { description?: string }).description?.trim() || "",
++      enabled: (patch as { enabled?: boolean }).enabled ?? true,
++      roles: [...((patch as { roles?: string[] }).roles ?? [])],
++    };
++    if (kind === "mcp" || kind === "connectors") {
++      const mcp = patch as Partial<LibraryMcpItem> & { env?: Record<string, string> };
++      return {
++        ...base,
++        source: "custom",
++        transport: mcp.transport ?? "stdio",
++        ...(mcp.command ? { command: mcp.command } : {}),
++        ...(mcp.args ? { args: mcp.args } : {}),
++        ...(mcp.url ? { url: mcp.url } : {}),
++        env: toMaskedEnv(mcp.env),
++      } satisfies LibraryMcpItem;
++    }
++    if (kind === "skills") {
++      const skill = patch as Partial<LibrarySkillItem>;
++      return { ...base, source: "custom", files: [...(skill.files ?? ["SKILL.md"])] } satisfies LibrarySkillItem;
++    }
++    const tool = patch as Partial<LibraryToolItem>;
++    return {
++      ...base,
++      source: "user",
++      inputSchema: tool.inputSchema ?? { type: "object", properties: {} },
++      impl: tool.impl ?? { kind: "script-in-vm", script: "" },
++    } satisfies LibraryToolItem;
++  }
++
++  private applyPatch(item: LibraryItem, patch: LibraryItemPatch): void {
++    const p = patch as Record<string, unknown>;
++    if (typeof p.name === "string") item.name = p.name.trim() || item.name;
++    if (typeof p.description === "string") item.description = p.description;
++    if (typeof p.enabled === "boolean") item.enabled = p.enabled;
++    if (Array.isArray(p.roles)) {
++      item.roles = [...new Set(p.roles.filter((r): r is string => typeof r === "string"))];
++    }
++    if ("transport" in item && typeof p.transport === "string") {
++      (item as LibraryMcpItem).transport = p.transport as LibraryMcpItem["transport"];
++    }
++    if ("command" in item && typeof p.command === "string") (item as LibraryMcpItem).command = p.command || undefined;
++    if ("args" in item && Array.isArray(p.args)) {
++      (item as LibraryMcpItem).args = p.args.filter((a): a is string => typeof a === "string");
++    }
++    if ("url" in item && typeof p.url === "string") (item as LibraryMcpItem).url = p.url || undefined;
++    if ("env" in item && p.env && typeof p.env === "object") {
++      const next = toMaskedEnv(p.env as Record<string, string>);
++      (item as LibraryMcpItem).env = { ...((item as LibraryMcpItem).env ?? {}), ...next };
++    }
++    if ("files" in item && Array.isArray(p.files)) {
++      (item as LibrarySkillItem).files = p.files.filter((f): f is string => typeof f === "string");
++    }
++    if ("inputSchema" in item && p.inputSchema && typeof p.inputSchema === "object") {
++      (item as LibraryToolItem).inputSchema = p.inputSchema as Record<string, unknown>;
++    }
++    if ("impl" in item && p.impl && typeof p.impl === "object") {
++      (item as LibraryToolItem).impl = p.impl as LibraryToolItem["impl"];
++    }
++  }
++}
++
++/** Turn user-typed env values into masked entries. Empty values are dropped
++ *  (clearing a secret means "leave stored value alone" — the API keeps it).
++ *  The mask placeholder is NEVER treated as a value to store. */
++function toMaskedEnv(env: Record<string, string> | undefined): Record<string, { masked: string; set: boolean }> | undefined {
++  if (!env) return undefined;
++  const out: Record<string, { masked: string; set: boolean }> = {};
++  for (const [key, value] of Object.entries(env)) {
++    if (!key.trim() || !value || value === MASK) continue;
++    out[key.trim()] = { masked: MASK, set: true };
++  }
++  return Object.keys(out).length ? out : undefined;
++}
++
++// ---------------------------------------------------------------------------
++// REST adapter (real l1 API — untested live until l1 merges)
++// ---------------------------------------------------------------------------
++
++const KIND_PATH: Record<LibraryKind, string> = {
++  connectors: "mcp",
++  mcp: "mcp",
++  skills: "skills",
++  tools: "tools",
++};
++
++async function readJson(res: Response): Promise<Record<string, unknown>> {
++  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
++  if (!res.ok) {
++    throw new Error(typeof body.error === "string" ? body.error : `Library API returned HTTP ${res.status}`);
++  }
++  return body;
++}
++
++/** REST client against /api/library/{mcp,skills,tools}. */
++export class RestLibraryClient implements LibraryClient {
++  async list(kind: LibraryKind): Promise<LibraryListResult> {
++    const body = await readJson(await fetch(`/api/library/${KIND_PATH[kind]}`, { headers: { Accept: "application/json" } }));
++    const items = (Array.isArray(body.items) ? body.items : []) as LibraryItem[];
++    const catalog = (Array.isArray(body.catalog) ? body.catalog : []) as LibraryCatalogEntry[];
++    return { items, catalog };
++  }
++
++  async create(kind: LibraryKind, patch: LibraryItemPatch & { id?: string }): Promise<LibraryItem> {
++    const body = await readJson(
++      await fetch(`/api/library/${KIND_PATH[kind]}`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify(stripMaskedEnv(patch)),
++      }),
++    );
++    return body.item as LibraryItem;
++  }
++
++  async update(kind: LibraryKind, id: string, patch: LibraryItemPatch): Promise<LibraryItem> {
++    const body = await readJson(
++      await fetch(`/api/library/${KIND_PATH[kind]}/${encodeURIComponent(id)}`, {
++        method: "PATCH",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify(stripMaskedEnv(patch)),
++      }),
++    );
++    return body.item as LibraryItem;
++  }
++
++  async remove(kind: LibraryKind, id: string): Promise<void> {
++    await readJson(
++      await fetch(`/api/library/${KIND_PATH[kind]}/${encodeURIComponent(id)}`, { method: "DELETE" }),
++    );
++  }
++
++  async setEnabled(kind: LibraryKind, id: string, enabled: boolean): Promise<LibraryItem> {
++    return this.update(kind, id, { enabled } as LibraryItemPatch);
++  }
++
++  async setRoles(kind: LibraryKind, id: string, roles: string[]): Promise<LibraryItem> {
++    return this.update(kind, id, { roles } as LibraryItemPatch);
++  }
++
++  async installFromCatalog(kind: LibraryKind, catalogId: string): Promise<LibraryItem> {
++    const body = await readJson(
++      await fetch(`/api/library/${KIND_PATH[kind]}/install`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ catalogId }),
++      }),
++    );
++    return body.item as LibraryItem;
++  }
++}
++
++/**
++ * Drop masked placeholders from an outgoing payload: the server keeps the
++ * stored secret when a key is absent, and a "••••••••" value must never be
++ * sent as if it were a real secret.
++ */
++export function stripMaskedEnv(patch: LibraryItemPatch): LibraryItemPatch {
++  const env = (patch as { env?: Record<string, string> }).env;
++  if (!env || typeof env !== "object") return patch;
++  const clean: Record<string, string> = {};
++  for (const [key, value] of Object.entries(env)) {
++    if (value && value !== MASK) clean[key] = value;
++  }
++  return { ...patch, env: clean };
++}
++
++// ---------------------------------------------------------------------------
++// Singleton — every component shares one client (and one stub store).
++// ---------------------------------------------------------------------------
++
++let shared: LibraryClient | null = null;
++
++/** The Library client for the whole app. */
++export function getLibraryClient(): LibraryClient {
++  if (!shared) shared = USE_STUB ? new StubLibraryClient() : new RestLibraryClient();
++  return shared;
++}
++
++/** Test hook: replace the shared client (restores the default afterwards). */
++export function __setLibraryClientForTests(client: LibraryClient | null): void {
++  shared = client;
++}
+diff --git a/apps/swarmagents/lib/library/types.ts b/apps/swarmagents/lib/library/types.ts
+new file mode 100644
+index 000000000..15dce5651
+--- /dev/null
++++ b/apps/swarmagents/lib/library/types.ts
+@@ -0,0 +1,137 @@
++// Library item types — the shapes the Library UI is built against.
++//
++// These mirror the l1 (Library foundation) API contract:
++//   REST /api/library/{mcp,skills,tools} list/create/update/delete/enable,
++//   owner-only, zod-validated. l1 has NOT merged yet, so the UI talks to
++//   these types through the client in ./client.ts, which ships a clearly
++//   marked stub adapter (`USE_STUB`) until the real API lands. When l1
++//   lands, flip the flag — components never touch fetch directly.
++//
++// HARD RULES (from the l2 task; l1 owns the server side):
++// - Everything is per account. MCP servers / tools / skills execute INSIDE
++//   the user's VM, never on the host or in the Next.js process.
++// - Secrets are encrypted at rest like provider keys and are NEVER returned
++//   to the client unmasked or logged. The API returns masked placeholders
++//   (e.g. "••••••••") for secret values; the client only ever sends a new
++//   value the user typed, never echoes one back.
++// - A role (and the agent) can never get more than the user's settings
++//   allow: `roles` on an item only grants it to roles the user picked.
++
++/** Where an item came from. Shown as a badge on every card. */
++export type LibrarySource =
++  | "builtin"
++  | "catalog"
++  | "custom"
++  | "agent"
++  | "public";
++
++/** The four Library tabs. */
++export type LibraryKind = "connectors" | "mcp" | "skills" | "tools";
++
++export const LIBRARY_KINDS: readonly LibraryKind[] = [
++  "connectors",
++  "mcp",
++  "skills",
++  "tools",
++];
++
++export const LIBRARY_KIND_LABELS: Record<LibraryKind, string> = {
++  connectors: "Connectors",
++  mcp: "MCP Servers",
++  skills: "Skills",
++  tools: "Tools",
++};
++
++/** A secret value as the API returns it: masked, never the real value. */
++export interface MaskedSecret {
++  /** Always a mask such as "••••••••" — never key material. */
++  masked: string;
++  /** True when a value is stored server-side. */
++  set: boolean;
++}
++
++/**
++ * One MCP server / connector entry.
++ *
++ * Connectors and MCP servers share this shape: a connector is the
++ * user-facing account connection (e.g. "GitHub"), an MCP server is the
++ * transport that serves its tools. The l1 API exposes them under
++ * /api/library/mcp (servers) and the Connectors tab lists the same items
++ * grouped as accounts; both tabs read from this one shape so the stub and
++ * the real API stay interchangeable.
++ */
++export interface LibraryMcpItem {
++  id: string;
++  name: string;
++  description: string;
++  source: LibrarySource;
++  /** Transport the server runs over inside the user's VM. */
++  transport: "stdio" | "http" | "sse";
++  /** stdio command, e.g. "npx". Omitted for http/sse. */
++  command?: string;
++  /** stdio argv. */
++  args?: string[];
++  /** http/sse endpoint. */
++  url?: string;
++  /** Env vars / headers. Values are MaskedSecret — never raw secrets. */
++  env?: Record<string, MaskedSecret | string>;
++  enabled: boolean;
++  /** Role ids this item is available to. Empty = available to no role. */
++  roles: string[];
++}
++
++/** One skill entry (a skill is a bundle of files + instructions). */
++export interface LibrarySkillItem {
++  id: string;
++  name: string;
++  description: string;
++  source: LibrarySource;
++  /** Skill files (SKILL.md + friends), relative paths inside the skill. */
++  files: string[];
++  enabled: boolean;
++  roles: string[];
++}
++
++/** One custom / agent / public tool entry. */
++export interface LibraryToolItem {
++  id: string;
++  name: string;
++  description: string;
++  /** JSON Schema for the tool's input. */
++  inputSchema: Record<string, unknown>;
++  /** How the tool runs: a script inside the user's VM, or an HTTP call. */
++  impl: { kind: "script-in-vm"; script: string } | { kind: "http"; url: string };
++  source: "user" | "agent" | "public";
++  enabled: boolean;
++  roles: string[];
++}
++
++export type LibraryItem = LibraryMcpItem | LibrarySkillItem | LibraryToolItem;
++
++/** Fields a user may change on an item (create/update payloads). */
++export type LibraryItemPatch =
++  | Partial<
++      Pick<LibraryMcpItem, "name" | "description" | "transport" | "command" | "args" | "url" | "enabled" | "roles">
++    > & { env?: Record<string, string> }
++  | Partial<Pick<LibrarySkillItem, "name" | "description" | "files" | "enabled" | "roles">>
++  | Partial<Pick<LibraryToolItem, "name" | "description" | "inputSchema" | "impl" | "enabled" | "roles">>;
++
++/** A catalog (browse) entry shown before install — untrusted content is
++ *  always previewed, never auto-installed. */
++export interface LibraryCatalogEntry {
++  id: string;
++  kind: LibraryKind;
++  name: string;
++  description: string;
++  source: Extract<LibrarySource, "catalog" | "public">;
++  /** What the item would install / run — shown in the preview before install. */
++  preview: string;
++  installed: boolean;
++}
++
++/** What the client returns for a list call. */
++export interface LibraryListResult<T extends LibraryItem = LibraryItem> {
++  items: T[];
++  /** Catalog entries available to browse/install for this kind. */
++  catalog: LibraryCatalogEntry[];
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index c11d0f99f..6eb90e49b 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -1,5 +1,5 @@
+ import { useCallback, useRef, useState, useEffect } from 'react';
+-import { Settings2, IdCard, MonitorPlay, Sparkles, PlugZap, Menu, X } from 'lucide-react';
++import { Settings2, IdCard, MonitorPlay, Sparkles, PlugZap, Library as LibraryIcon, Menu, X } from 'lucide-react';
+ import { MobileTabBar } from './components/MobileTabBar';
+ import {
+   type ActiveRole,
+@@ -17,6 +17,7 @@ import { InputBar } from './components/InputBar';
+ import { ActivityStrip } from './components/ActivityStrip';
+ import { Telemetry } from './components/Telemetry';
+ import { Settings } from './components/Settings';
++import { Library } from './components/Library';
+ import { RoleAndVmBar } from './components/RoleAndVmBar';
+ import { AgentCardModal } from './components/AgentCardModal';
+ import { ComputerScreen } from './components/ComputerScreen';
+@@ -51,6 +52,7 @@ export default function App() {
+     { ...ROLES.find((r) => r.id === activeRoleId) || ROLES[0], uid: uid(), providerUid: providers.find((p) => p.enabled)?.uid || 'sim' },
+   ]);
+   const [settingsOpen, setSettingsOpen] = useState(false);
++  const [libraryOpen, setLibraryOpen] = useState(false);
+   const [agentCardOpen, setAgentCardOpen] = useState(false);
+   const [helpOpen, setHelpOpen] = useState(false);
+   const helpDialogRef = useFocusTrap<HTMLDivElement>(helpOpen);
+@@ -707,6 +709,21 @@ export default function App() {
+             <span>Providers</span>
+           </a>
+ 
++          <button
++            onClick={() => setLibraryOpen(true)}
++            aria-haspopup="dialog"
++            aria-expanded={libraryOpen}
++            className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1.5 text-xs transition-all active:scale-95 ${
++              libraryOpen
++                ? 'border border-cyan-400/30 bg-cyan-400/10 text-cyan-200'
++                : 'glass-soft text-white/70 hover:bg-white/10 hover:text-white'
++            }`}
++            title="Library — connectors, MCP servers, skills and tools"
++          >
++            <LibraryIcon className="h-3.5 w-3.5" />
++            <span>Library</span>
++          </button>
++
+           <button
+             onClick={() => setSettingsOpen(true)}
+             className="glass-soft grid h-9 w-9 shrink-0 place-items-center rounded-full text-white/60 transition hover:rotate-45 hover:bg-white/10 hover:text-white active:scale-95"
+@@ -778,6 +795,17 @@ export default function App() {
+                 <PlugZap className="h-3.5 w-3.5" />
+                 Providers
+               </a>
++              <button
++                onClick={() => {
++                  setLibraryOpen(true);
++                  setNavOpen(false);
++                }}
++                aria-haspopup="dialog"
++                className="flex items-center gap-2 rounded-xl px-3 py-2 text-left text-xs text-white/70 transition-colors hover:bg-white/10 hover:text-white"
++              >
++                <LibraryIcon className="h-3.5 w-3.5" />
++                Library
++              </button>
+               <button
+                 onClick={() => {
+                   setSettingsOpen(true);
+@@ -826,6 +854,7 @@ export default function App() {
+               onChangeRotationStrategy={setRotationStrategy}
+               providers={providers}
+               onOpenSettings={() => setSettingsOpen(true)}
++              onOpenLibrary={() => setLibraryOpen(true)}
+               onResetVm={handleResetVm}
+               vmResetting={vmResetting}
+               onToggleView={handleToggleView}
+@@ -921,8 +950,12 @@ export default function App() {
+         serverProviderCount={serverProviderCount}
+         roles={agentRoles}
+         setRoles={setAgentRoles}
++        onOpenLibrary={() => setLibraryOpen(true)}
+       />
+ 
++      {/* 6b. Library (Connectors / MCP / Skills / Tools) */}
++      <Library open={libraryOpen} onClose={() => setLibraryOpen(false)} />
++
+       {/* 7. Agent Card Modal (role = card text, sent with each task) */}
+       <AgentCardModal
+         open={agentCardOpen}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/Library.tsx b/apps/swarmagents/minimalist-ui/src/components/Library.tsx
+new file mode 100644
+index 000000000..6b362befe
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/Library.tsx
+@@ -0,0 +1,953 @@
++// Library page — one page with four tabs: Connectors / MCP Servers / Skills /
++// Tools.
++//
++// The page talks to the Library ONLY through the client in
++// ../../../lib/library/client (getLibraryClient). While l1's API is unmerged
++// that client is the in-memory stub (USE_STUB in client.ts); flipping the
++// flag swaps in the real /api/library/* REST adapter without touching this
++// file.
++//
++// Per-tab: search box, Installed vs Browse sections, a card per item (icon,
++// name, one-line description, source badge, enable toggle, Configure drawer
++// with masked secret inputs, Remove with confirm), and a "Use in roles"
++// multi-select in the drawer. Secrets are never displayed: stored values
++// arrive masked and the drawer only sends values the user typed.
++
++"use client";
++
++import { useCallback, useEffect, useRef, useState } from "react";
++import {
++  BookOpen,
++  ChevronDown,
++  Eye,
++  EyeOff,
++  LibraryBig,
++  PlugZap,
++  Plus,
++  Search,
++  Server,
++  Trash2,
++  Wrench,
++  X,
++} from "lucide-react";
++import { BUILTIN_ROLES } from "../../../lib/roles";
++import {
++  USE_STUB,
++  getLibraryClient,
++  type LibraryClient,
++} from "../../../lib/library/client";
++import {
++  LIBRARY_KINDS,
++  LIBRARY_KIND_LABELS,
++  type LibraryCatalogEntry,
++  type LibraryItem,
++  type LibraryItemPatch,
++  type LibraryKind,
++  type LibraryListResult,
++  type LibraryMcpItem,
++  type LibrarySkillItem,
++  type LibrarySource,
++  type LibraryToolItem,
++} from "../../../lib/library/types";
++
++const KIND_ICONS: Record<LibraryKind, typeof PlugZap> = {
++  connectors: PlugZap,
++  mcp: Server,
++  skills: BookOpen,
++  tools: Wrench,
++};
++
++const SOURCE_BADGE: Record<LibrarySource | "user", string> = {
++  builtin: "border-cyan-400/30 bg-cyan-400/10 text-cyan-200",
++  catalog: "border-violet-400/30 bg-violet-400/10 text-violet-200",
++  custom: "border-amber-400/30 bg-amber-400/10 text-amber-200",
++  agent: "border-emerald-400/30 bg-emerald-400/10 text-emerald-200",
++  public: "border-sky-400/30 bg-sky-400/10 text-sky-200",
++  user: "border-amber-400/30 bg-amber-400/10 text-amber-200",
++};
++
++const KIND_HINTS: Record<LibraryKind, string> = {
++  connectors: "Accounts the agent connects with — GitHub, databases, chat apps.",
++  mcp: "MCP servers run inside your VM and serve tools to the agent.",
++  skills: "Skill bundles the agent can load — instructions plus files.",
++  tools: "Custom tools the agent can call — yours, the agent's, or public ones.",
++};
++
++function isMcp(item: LibraryItem | undefined): item is LibraryMcpItem {
++  return !!item && "transport" in item;
++}
++
++function isSkill(item: LibraryItem | undefined): item is LibrarySkillItem {
++  return !!item && "files" in item;
++}
++
++function isTool(item: LibraryItem | undefined): item is LibraryToolItem {
++  return !!item && "inputSchema" in item;
++}
++
++function itemMatches(item: LibraryItem | LibraryCatalogEntry, query: string): boolean {
++  const q = query.trim().toLowerCase();
++  if (!q) return true;
++  return `${item.name} ${item.description} ${item.id}`.toLowerCase().includes(q);
++}
++
++function kindLabel(kind: LibraryKind): string {
++  return LIBRARY_KIND_LABELS[kind];
++}
++
++export function Library({ open, onClose }: { open: boolean; onClose: () => void }) {
++  const [tab, setTab] = useState<LibraryKind>("connectors");
++  const [query, setQuery] = useState("");
++  const [data, setData] = useState<Partial<Record<LibraryKind, LibraryListResult>>>({});
++  const [loading, setLoading] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [notice, setNotice] = useState<string | null>(null);
++  const [drawer, setDrawer] = useState<{ kind: LibraryKind; item?: LibraryItem } | null>(null);
++  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
++  const clientRef = useRef<LibraryClient | null>(null);
++  if (!clientRef.current) clientRef.current = getLibraryClient();
++  const searchRef = useRef<HTMLInputElement>(null);
++
++  const load = useCallback(
++    async (kind: LibraryKind) => {
++      const client = clientRef.current as LibraryClient;
++      setLoading(true);
++      setError(null);
++      try {
++        const result = await client.list(kind);
++        setData((prev) => ({ ...prev, [kind]: result }));
++      } catch (e) {
++        setError((e as Error).message || "Could not load the library.");
++      } finally {
++        setLoading(false);
++      }
++    },
++    [],
++  );
++
++  // Load the active tab when the page opens or the tab changes.
++  useEffect(() => {
++    if (open) void load(tab);
++  }, [open, tab, load]);
++
++  // Escape closes the page (and the drawer first, when it is open).
++  useEffect(() => {
++    if (!open) return;
++    const onKeyDown = (e: KeyboardEvent) => {
++      if (e.key !== "Escape") return;
++      if (drawer) setDrawer(null);
++      else onClose();
++    };
++    window.addEventListener("keydown", onKeyDown);
++    return () => window.removeEventListener("keydown", onKeyDown);
++  }, [open, drawer, onClose]);
++
++  if (!open) return null;
++
++  const result = data[tab];
++  const installed = (result?.items ?? []).filter((item) => itemMatches(item, query));
++  const catalog = (result?.catalog ?? []).filter((item) => itemMatches(item, query));
++  const KindIcon = KIND_ICONS[tab];
++
++  const refresh = () => load(tab);
++
++  const toggleEnabled = async (item: LibraryItem) => {
++    try {
++      await (clientRef.current as LibraryClient).setEnabled(tab, item.id, !item.enabled);
++      setNotice(`${item.name} ${!item.enabled ? "enabled" : "disabled"}.`);
++      await refresh();
++    } catch (e) {
++      setError((e as Error).message || "Could not update the item.");
++    }
++  };
++
++  const removeItem = async (item: LibraryItem) => {
++    try {
++      await (clientRef.current as LibraryClient).remove(tab, item.id);
++      setConfirmRemove(null);
++      setNotice(`${item.name} removed.`);
++      await refresh();
++    } catch (e) {
++      setError((e as Error).message || "Could not remove the item.");
++    }
++  };
++
++  const install = async (entry: LibraryCatalogEntry) => {
++    try {
++      await (clientRef.current as LibraryClient).installFromCatalog(tab, entry.id);
++      setNotice(`${entry.name} installed.`);
++      await refresh();
++    } catch (e) {
++      setError((e as Error).message || "Could not install the item.");
++    }
++  };
++
++  const onDrawerSaved = async () => {
++    setDrawer(null);
++    setNotice("Saved.");
++    await refresh();
++  };
++
++  return (
++    <div className="fixed inset-0 z-40 flex flex-col bg-[#0c0c11]/95 backdrop-blur-2xl" role="dialog" aria-modal="true" aria-label="Library">
++      {/* Header */}
++      <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3 sm:px-6">
++        <div className="flex min-w-0 items-center gap-2.5">
++          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-cyan-400/10 text-cyan-300 ring-1 ring-cyan-400/20">
++            <LibraryBig className="h-4 w-4" />
++          </span>
++          <div className="min-w-0">
++            <h2 className="truncate text-base font-semibold text-white">Library</h2>
++            <p className="truncate text-[11px] text-white/40">
++              Connectors, MCP servers, skills and tools for your agent.
++            </p>
++          </div>
++        </div>
++        <button
++          type="button"
++          onClick={onClose}
++          aria-label="Close library"
++          className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-white/10 text-white/70 transition hover:bg-white/15 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++        >
++          <X className="h-4 w-4" />
++        </button>
++      </div>
++
++      {USE_STUB && (
++        <div className="border-b border-amber-400/20 bg-amber-400/[0.06] px-4 py-2 text-[11px] leading-relaxed text-amber-200/80 sm:px-6" data-testid="library-stub-notice">
++          Preview data — the Library API (l1) has not landed yet, so changes here
++          are stored in this browser session only and reset on reload.
++        </div>
++      )}
++
++      {/* Tabs + search */}
++      <div className="border-b border-white/10 px-4 pt-3 sm:px-6">
++        <div
++          role="tablist"
++          aria-label="Library sections"
++          className="flex gap-1 overflow-x-auto rounded-full bg-white/5 p-1 ring-1 ring-white/10"
++          onKeyDown={(e) => {
++            if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
++            const idx = LIBRARY_KINDS.indexOf(tab);
++            const next =
++              LIBRARY_KINDS[(idx + (e.key === "ArrowRight" ? 1 : LIBRARY_KINDS.length - 1)) % LIBRARY_KINDS.length];
++            setTab(next);
++            e.preventDefault();
++          }}
++        >
++          {LIBRARY_KINDS.map((kind) => {
++            const Icon = KIND_ICONS[kind];
++            const count = data[kind]?.items.length;
++            return (
++              <button
++                key={kind}
++                type="button"
++                role="tab"
++                id={`library-tab-${kind}`}
++                aria-selected={tab === kind}
++                aria-controls="library-panel"
++                data-testid={`library-tab-${kind}`}
++                onClick={() => setTab(kind)}
++                className={`flex flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1.5 text-xs transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 ${
++                  tab === kind ? "bg-cyan-400 text-black" : "text-white/60 hover:text-white"
++                }`}
++              >
++                <Icon className="h-3.5 w-3.5" />
++                {kindLabel(kind)}
++                {typeof count === "number" && <span className="font-mono text-[10px] opacity-70">{count}</span>}
++              </button>
++            );
++          })}
++        </div>
++        <div className="flex items-center gap-2 py-3">
++          <div className="relative min-w-0 flex-1">
++            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-white/30" />
++            <input
++              ref={searchRef}
++              type="search"
++              value={query}
++              onChange={(e) => setQuery(e.target.value)}
++              placeholder={`Search ${kindLabel(tab).toLowerCase()}…`}
++              aria-label={`Search ${kindLabel(tab).toLowerCase()}`}
++              data-testid="library-search"
++              className="w-full rounded-full bg-white/[0.05] py-2 pl-9 pr-3 text-xs text-white/85 ring-1 ring-white/10 placeholder:text-white/30 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++            />
++          </div>
++          <button
++            type="button"
++            onClick={() => setDrawer({ kind: tab })}
++            data-testid={`library-add-${tab}`}
++            className="flex shrink-0 items-center gap-1.5 rounded-full bg-cyan-400 px-3 py-2 text-xs font-medium text-black transition hover:bg-cyan-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++          >
++            <Plus className="h-3.5 w-3.5" />
++            <span className="hidden sm:inline">Add custom</span>
++            <span className="sm:hidden">Add</span>
++          </button>
++        </div>
++      </div>
++
++      {/* Body */}
++      <div id="library-panel" role="tabpanel" aria-labelledby={`library-tab-${tab}`} className="flex-1 overflow-y-auto px-4 py-4 sm:px-6" data-testid="library-page">
++        <p className="mb-4 text-[11px] text-white/35">{KIND_HINTS[tab]}</p>
++
++        {notice && (
++          <div className="mb-4 flex items-center justify-between gap-2 rounded-xl bg-emerald-400/10 px-3 py-2 text-[11px] text-emerald-200/90 ring-1 ring-emerald-400/20" role="status">
++            <span>{notice}</span>
++            <button type="button" onClick={() => setNotice(null)} aria-label="Dismiss notice" className="text-emerald-200/60 hover:text-emerald-200">
++              <X className="h-3.5 w-3.5" />
++            </button>
++          </div>
++        )}
++        {error && (
++          <div className="mb-4 flex items-center justify-between gap-2 rounded-xl bg-red-500/10 px-3 py-2 text-[11px] text-red-200/90 ring-1 ring-red-400/20" role="alert">
++            <span>{error}</span>
++            <button type="button" onClick={() => { setError(null); void refresh(); }} className="shrink-0 rounded-full bg-red-500/20 px-2.5 py-1 text-[11px] hover:bg-red-500/30">
++              Retry
++            </button>
++          </div>
++        )}
++
++        {loading && !result ? (
++          <div className="grid gap-2 sm:grid-cols-2" aria-label="Loading library">
++            {[0, 1, 2, 3].map((i) => (
++              <div key={i} className="h-24 animate-pulse rounded-2xl bg-white/[0.04] ring-1 ring-white/10" />
++            ))}
++          </div>
++        ) : (
++          <>
++            <section aria-label={`Installed ${kindLabel(tab).toLowerCase()}`}>
++              <SectionLabel>Installed · {installed.length}</SectionLabel>
++              {installed.length === 0 ? (
++                <div className="grid place-items-center rounded-2xl border border-dashed border-white/10 px-4 py-8 text-center">
++                  <KindIcon className="mb-2 h-5 w-5 text-white/25" />
++                  <p className="text-xs text-white/50">
++                    No {kindLabel(tab).toLowerCase()} installed yet.
++                  </p>
++                  <p className="mt-1 text-[11px] text-white/30">
++                    {catalog.length > 0 ? "Install one from Browse below, or add a custom one." : "Add a custom one above."}
++                  </p>
++                </div>
++              ) : (
++                <div className="grid gap-2 sm:grid-cols-2">
++                  {installed.map((item) => (
++                    <LibraryCard
++                      key={item.id}
++                      item={item}
++                      onToggle={() => void toggleEnabled(item)}
++                      onConfigure={() => setDrawer({ kind: tab, item })}
++                      onRemove={() => void removeItem(item)}
++                      confirmRemove={confirmRemove === item.id}
++                      onAskRemove={() => setConfirmRemove(item.id)}
++                      onCancelRemove={() => setConfirmRemove(null)}
++                    />
++                  ))}
++                </div>
++              )}
++            </section>
++
++            <section aria-label={`Browse ${kindLabel(tab).toLowerCase()}`} className="mt-6">
++              <SectionLabel>Browse</SectionLabel>
++              {catalog.length === 0 ? (
++                <div className="grid place-items-center rounded-2xl border border-dashed border-white/10 px-4 py-6 text-center text-xs text-white/40">
++                  Nothing to browse for {kindLabel(tab).toLowerCase()} yet.
++                </div>
++              ) : (
++                <div className="grid gap-2 sm:grid-cols-2">
++                  {catalog.map((entry) => (
++                    <article key={entry.id} className="rounded-2xl bg-white/[0.03] p-3.5 ring-1 ring-white/[0.07]" data-testid={`library-catalog-${entry.id}`}>
++                      <div className="flex items-start justify-between gap-2">
++                        <div className="min-w-0">
++                          <h3 className="truncate text-xs font-medium text-white/90">{entry.name}</h3>
++                          <p className="mt-0.5 line-clamp-2 text-[11px] leading-relaxed text-white/45">{entry.description}</p>
++                        </div>
++                        <span className={`shrink-0 rounded-full border px-2 py-0.5 font-mono text-[10px] ${SOURCE_BADGE[entry.source]}`}>
++                          {entry.source}
++                        </span>
++                      </div>
++                      <p className="mt-2 rounded-xl bg-black/25 px-2.5 py-2 text-[11px] leading-relaxed text-white/50">
++                        <span className="font-medium text-white/70">Before you install: </span>
++                        {entry.preview}
++                      </p>
++                      <div className="mt-2.5 flex justify-end">
++                        {entry.installed ? (
++                          <span className="rounded-full bg-white/[0.06] px-3 py-1.5 text-[11px] text-white/50 ring-1 ring-white/10">Installed</span>
++                        ) : (
++                          <button
++                            type="button"
++                            onClick={() => void install(entry)}
++                            data-testid={`library-install-${entry.id}`}
++                            className="rounded-full bg-white/10 px-3 py-1.5 text-[11px] text-white/85 ring-1 ring-white/10 transition hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++                          >
++                            Install
++                          </button>
++                        )}
++                      </div>
++                    </article>
++                  ))}
++                </div>
++              )}
++            </section>
++          </>
++        )}
++      </div>
++
++      {drawer && (
++        <ConfigureDrawer
++          kind={drawer.kind}
++          item={drawer.item}
++          onClose={() => setDrawer(null)}
++          onSaved={() => void onDrawerSaved()}
++          onError={(message) => setError(message)}
++        />
++      )}
++    </div>
++  );
++}
++
++function SectionLabel({ children }: { children: React.ReactNode }) {
++  return <h3 className="mb-2 text-[10px] uppercase tracking-[0.2em] text-white/40">{children}</h3>;
++}
++
++function LibraryCard({
++  item,
++  onToggle,
++  onConfigure,
++  onRemove,
++  confirmRemove,
++  onAskRemove,
++  onCancelRemove,
++}: {
++  item: LibraryItem;
++  onToggle: () => void;
++  onConfigure: () => void;
++  onRemove: () => void;
++  confirmRemove: boolean;
++  onAskRemove: () => void;
++  onCancelRemove: () => void;
++}) {
++  const detail = isMcp(item)
++    ? item.transport === "stdio"
++      ? `${item.command ?? ""} ${(item.args ?? []).join(" ")}`.trim() || "stdio"
++      : item.url ?? item.transport
++    : isSkill(item)
++      ? `${item.files.length} file${item.files.length === 1 ? "" : "s"}`
++      : isTool(item)
++        ? item.impl.kind === "script-in-vm"
++          ? `runs in VM · ${item.impl.script || "script"}`
++          : `HTTP · ${item.impl.url}`
++        : "";
++  return (
++    <article className="rounded-2xl bg-white/[0.04] p-3.5 ring-1 ring-white/10" data-testid={`library-card-${item.id}`}>
++      <div className="flex items-start justify-between gap-2">
++        <div className="min-w-0">
++          <h3 className="truncate text-xs font-medium text-white/90">{item.name}</h3>
++          <p className="mt-0.5 line-clamp-2 text-[11px] leading-relaxed text-white/45">{item.description}</p>
++        </div>
++        <span className={`shrink-0 rounded-full border px-2 py-0.5 font-mono text-[10px] ${SOURCE_BADGE[item.source]}`}>
++          {item.source}
++        </span>
++      </div>
++      {detail && <p className="mt-2 truncate font-mono text-[10px] text-white/35">{detail}</p>}
++      {item.roles.length > 0 && (
++        <p className="mt-1.5 truncate text-[10px] text-white/35">
++          Roles: {item.roles.join(", ")}
++        </p>
++      )}
++      <div className="mt-3 flex items-center gap-2">
++        <button
++          type="button"
++          role="switch"
++          aria-checked={item.enabled}
++          aria-label={`${item.enabled ? "Disable" : "Enable"} ${item.name}`}
++          data-testid={`library-toggle-${item.id}`}
++          onClick={onToggle}
++          className={`relative h-5 w-9 shrink-0 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 ${
++            item.enabled ? "bg-cyan-400" : "bg-white/15"
++          }`}
++        >
++          <span className={`absolute top-0.5 h-4 w-4 rounded-full transition-all ${item.enabled ? "left-[18px] bg-black" : "left-0.5 bg-white/70"}`} />
++        </button>
++        <span className="text-[11px] text-white/50">{item.enabled ? "Enabled" : "Disabled"}</span>
++        <div className="ml-auto flex items-center gap-1">
++          <button
++            type="button"
++            onClick={onConfigure}
++            data-testid={`library-configure-${item.id}`}
++            className="rounded-full px-2.5 py-1.5 text-[11px] text-white/70 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++          >
++            Configure
++          </button>
++          {item.source !== "builtin" && (
++            confirmRemove ? (
++              <span className="flex items-center gap-1">
++                <button
++                  type="button"
++                  onClick={onRemove}
++                  data-testid={`library-remove-confirm-${item.id}`}
++                  className="rounded-full bg-red-500/20 px-2.5 py-1.5 text-[11px] text-red-200 ring-1 ring-red-500/30 transition hover:bg-red-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/60"
++                >
++                  Confirm remove?
++                </button>
++                <button
++                  type="button"
++                  onClick={onCancelRemove}
++                  aria-label="Cancel remove"
++                  className="rounded-full px-2 py-1.5 text-[11px] text-white/50 hover:text-white"
++                >
++                  Cancel
++                </button>
++              </span>
++            ) : (
++              <button
++                type="button"
++                onClick={onAskRemove}
++                data-testid={`library-remove-${item.id}`}
++                aria-label={`Remove ${item.name}`}
++                className="grid h-7 w-7 place-items-center rounded-full text-white/40 transition hover:bg-red-500/10 hover:text-red-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/60"
++              >
++                <Trash2 className="h-3.5 w-3.5" />
++              </button>
++            )
++          )}
++        </div>
++      </div>
++    </article>
++  );
++}
++
++// ---------------------------------------------------------------------------
++// Configure drawer
++// ---------------------------------------------------------------------------
++
++function ConfigureDrawer({
++  kind,
++  item,
++  onClose,
++  onSaved,
++  onError,
++}: {
++  kind: LibraryKind;
++  item?: LibraryItem;
++  onClose: () => void;
++  onSaved: () => void;
++  onError: (message: string) => void;
++}) {
++  const isNew = !item;
++  const [name, setName] = useState(item?.name ?? "");
++  const [description, setDescription] = useState(item?.description ?? "");
++  const [enabled, setEnabled] = useState(item?.enabled ?? true);
++  const [roles, setRoles] = useState<string[]>(item?.roles ?? []);
++  const [transport, setTransport] = useState<LibraryMcpItem["transport"]>(
++    isMcp(item) ? item.transport : "stdio",
++  );
++  const [command, setCommand] = useState(isMcp(item) ? item.command ?? "" : "");
++  const [args, setArgs] = useState(isMcp(item) ? (item.args ?? []).join("\n") : "");
++  const [url, setUrl] = useState(isMcp(item) ? item.url ?? "" : "");
++  const [envRows, setEnvRows] = useState<Array<{ key: string; value: string; set: boolean }>>(
++    isMcp(item)
++      ? Object.entries(item.env ?? {}).map(([key, value]) => ({
++          key,
++          value: "",
++          set: value && typeof value === "object" ? value.set : true,
++        }))
++      : [],
++  );
++  const [files, setFiles] = useState(isSkill(item) ? item.files.join("\n") : "SKILL.md");
++  const [implKind, setImplKind] = useState<"script-in-vm" | "http">(
++    isTool(item) ? item.impl.kind : "script-in-vm",
++  );
++  const [implScript, setImplScript] = useState(
++    isTool(item) && item.impl.kind === "script-in-vm" ? item.impl.script : "",
++  );
++  const [implUrl, setImplUrl] = useState(
++    isTool(item) && item.impl.kind === "http" ? item.impl.url : "",
++  );
++  const [inputSchema, setInputSchema] = useState(
++    isTool(item) ? JSON.stringify(item.inputSchema, null, 2) : '{\n  "type": "object",\n  "properties": {}\n}',
++  );
++  const [showSecrets, setShowSecrets] = useState(false);
++  const [saving, setSaving] = useState(false);
++  const [formError, setFormError] = useState<string | null>(null);
++  const headingRef = useRef<HTMLHeadingElement>(null);
++
++  useEffect(() => {
++    headingRef.current?.focus();
++  }, []);
++
++  const toggleRole = (roleId: string) =>
++    setRoles((prev) => (prev.includes(roleId) ? prev.filter((r) => r !== roleId) : [...prev, roleId]));
++
++  const save = async () => {
++    setFormError(null);
++    if (!name.trim()) {
++      setFormError("Give the item a name.");
++      return;
++    }
++    let patch: LibraryItemPatch;
++    try {
++      if (kind === "mcp" || kind === "connectors") {
++        patch = {
++          name: name.trim(),
++          description: description.trim(),
++          transport,
++          command: transport === "stdio" ? command.trim() || undefined : undefined,
++          args: transport === "stdio" ? args.split("\n").map((a) => a.trim()).filter(Boolean) : undefined,
++          url: transport !== "stdio" ? url.trim() || undefined : undefined,
++          env: Object.fromEntries(
++            envRows.filter((row) => row.key.trim()).map((row) => [row.key.trim(), row.value]),
++          ),
++          enabled,
++          roles,
++        };
++      } else if (kind === "skills") {
++        patch = {
++          name: name.trim(),
++          description: description.trim(),
++          files: files.split("\n").map((f) => f.trim()).filter(Boolean),
++          enabled,
++          roles,
++        };
++      } else {
++        let parsed: Record<string, unknown>;
++        try {
++          parsed = JSON.parse(inputSchema) as Record<string, unknown>;
++        } catch {
++          setFormError("Input schema is not valid JSON.");
++          return;
++        }
++        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
++          setFormError("Input schema must be a JSON object.");
++          return;
++        }
++        patch = {
++          name: name.trim(),
++          description: description.trim(),
++          inputSchema: parsed,
++          impl:
++            implKind === "script-in-vm"
++              ? { kind: "script-in-vm", script: implScript.trim() }
++              : { kind: "http", url: implUrl.trim() },
++          enabled,
++          roles,
++        };
++      }
++    } catch (e) {
++      setFormError((e as Error).message);
++      return;
++    }
++
++    setSaving(true);
++    try {
++      const client = getLibraryClient();
++      if (isNew) await client.create(kind, patch);
++      else await client.update(kind, item.id, patch);
++      onSaved();
++    } catch (e) {
++      const message = (e as Error).message || "Could not save the item.";
++      setFormError(message);
++      onError(message);
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  return (
++    <div className="absolute inset-0 z-10" role="dialog" aria-modal="true" aria-label={isNew ? `Add ${kindLabel(kind)}` : `Configure ${item?.name ?? ""}`}>
++      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
++      <aside className="absolute inset-y-0 right-0 flex w-full flex-col overflow-hidden bg-[#121218] shadow-2xl ring-1 ring-white/10 sm:w-[480px]" data-testid="library-drawer">
++        <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
++          <h3 ref={headingRef} tabIndex={-1} className="truncate text-sm font-medium text-white focus:outline-none">
++            {isNew ? `Add ${kindLabel(kind).slice(0, -1)}` : `Configure ${item?.name ?? ""}`}
++          </h3>
++          <button
++            type="button"
++            onClick={onClose}
++            aria-label="Close configuration"
++            className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-white/50 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++          >
++            <X className="h-4 w-4" />
++          </button>
++        </div>
++
++        <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
++          {item && (
++            <p className="rounded-xl bg-white/[0.04] px-3 py-2 text-[11px] leading-relaxed text-white/45 ring-1 ring-white/10">
++              Source: <span className="font-mono text-white/70">{item.source}</span>
++              {item.source === "builtin" ? " · built-in items cannot be removed." : ""}
++              {" · "}Runs inside your VM — never on the host.
++            </p>
++          )}
++
++          <DrawerField label="Name">
++            <input
++              value={name}
++              onChange={(e) => setName(e.target.value)}
++              data-testid="library-drawer-name"
++              className="w-full rounded-xl bg-black/20 px-3 py-2 text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++            />
++          </DrawerField>
++
++          <DrawerField label="Description">
++            <textarea
++              value={description}
++              onChange={(e) => setDescription(e.target.value)}
++              rows={2}
++              data-testid="library-drawer-description"
++              className="w-full resize-y rounded-xl bg-black/20 px-3 py-2 text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++            />
++          </DrawerField>
++
++          {(kind === "mcp" || kind === "connectors") && (
++            <>
++              <DrawerField label="Transport">
++                <div className="relative">
++                  <select
++                    value={transport}
++                    onChange={(e) => setTransport(e.target.value as LibraryMcpItem["transport"])}
++                    data-testid="library-drawer-transport"
++                    className="w-full appearance-none rounded-xl bg-black/20 px-3 py-2 text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                  >
++                    <option value="stdio">stdio — local command</option>
++                    <option value="http">http — endpoint</option>
++                    <option value="sse">sse — streaming endpoint</option>
++                  </select>
++                  <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-white/40" />
++                </div>
++              </DrawerField>
++              {transport === "stdio" ? (
++                <>
++                  <DrawerField label="Command">
++                    <input
++                      value={command}
++                      onChange={(e) => setCommand(e.target.value)}
++                      placeholder="npx"
++                      data-testid="library-drawer-command"
++                      className="w-full rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                    />
++                  </DrawerField>
++                  <DrawerField label="Arguments — one per line">
++                    <textarea
++                      value={args}
++                      onChange={(e) => setArgs(e.target.value)}
++                      rows={2}
++                      data-testid="library-drawer-args"
++                      className="w-full resize-y rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                    />
++                  </DrawerField>
++                </>
++              ) : (
++                <DrawerField label="URL">
++                  <input
++                    value={url}
++                    onChange={(e) => setUrl(e.target.value)}
++                    placeholder="https://…"
++                    data-testid="library-drawer-url"
++                    className="w-full rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                  />
++                </DrawerField>
++              )}
++              <section>
++                <DrawerLabel>Secrets — stored encrypted, shown masked</DrawerLabel>
++                <div className="space-y-2">
++                  {envRows.map((row, i) => (
++                    <div key={i} className="flex items-center gap-2">
++                      <input
++                        value={row.key}
++                        onChange={(e) =>
++                          setEnvRows((rows) => rows.map((r, j) => (j === i ? { ...r, key: e.target.value } : r)))
++                        }
++                        placeholder="KEY_NAME"
++                        aria-label="Secret name"
++                        className="w-32 shrink-0 rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                      />
++                      <div className="flex min-w-0 flex-1 items-center rounded-xl bg-black/20 ring-1 ring-white/10 focus-within:ring-2 focus-within:ring-cyan-400/60">
++                        <input
++                          type={showSecrets ? "text" : "password"}
++                          value={row.value}
++                          onChange={(e) =>
++                            setEnvRows((rows) => rows.map((r, j) => (j === i ? { ...r, value: e.target.value } : r)))
++                          }
++                          placeholder={row.set ? "•••••••• (set — leave blank to keep)" : "value"}
++                          aria-label={`Secret value for ${row.key || "new secret"}`}
++                          data-testid="library-drawer-secret"
++                          className="min-w-0 flex-1 bg-transparent px-3 py-2 font-mono text-xs text-white/85 placeholder:text-white/25 focus:outline-none"
++                        />
++                        <button
++                          type="button"
++                          onClick={() => setShowSecrets((v) => !v)}
++                          aria-label={showSecrets ? "Hide secrets" : "Show secrets"}
++                          className="px-2.5 text-white/40 hover:text-white"
++                        >
++                          {showSecrets ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
++                        </button>
++                      </div>
++                      <button
++                        type="button"
++                        onClick={() => setEnvRows((rows) => rows.filter((_, j) => j !== i))}
++                        aria-label={`Remove secret ${row.key || i + 1}`}
++                        className="shrink-0 rounded-full p-1.5 text-white/40 hover:bg-white/10 hover:text-white"
++                      >
++                        <X className="h-3.5 w-3.5" />
++                      </button>
++                    </div>
++                  ))}
++                  <button
++                    type="button"
++                    onClick={() => setEnvRows((rows) => [...rows, { key: "", value: "", set: false }])}
++                    className="flex items-center gap-1 rounded-full bg-white/5 px-3 py-1.5 text-[11px] text-white/70 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-white"
++                  >
++                    <Plus className="h-3 w-3" /> Add secret
++                  </button>
++                </div>
++                <p className="mt-1.5 text-[10px] leading-relaxed text-white/30">
++                  Secrets are encrypted at rest like provider keys and never shown or logged. Leave a set value blank to keep it.
++                </p>
++              </section>
++            </>
++          )}
++
++          {kind === "skills" && (
++            <DrawerField label="Files — one per line">
++              <textarea
++                value={files}
++                onChange={(e) => setFiles(e.target.value)}
++                rows={3}
++                data-testid="library-drawer-files"
++                className="w-full resize-y rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++              />
++            </DrawerField>
++          )}
++
++          {kind === "tools" && (
++            <>
++              <DrawerField label="Runs as">
++                <div className="relative">
++                  <select
++                    value={implKind}
++                    onChange={(e) => setImplKind(e.target.value as "script-in-vm" | "http")}
++                    data-testid="library-drawer-impl"
++                    className="w-full appearance-none rounded-xl bg-black/20 px-3 py-2 text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                  >
++                    <option value="script-in-vm">Script inside the VM</option>
++                    <option value="http">HTTP call</option>
++                  </select>
++                  <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-white/40" />
++                </div>
++              </DrawerField>
++              {implKind === "script-in-vm" ? (
++                <DrawerField label="Script">
++                  <input
++                    value={implScript}
++                    onChange={(e) => setImplScript(e.target.value)}
++                    placeholder="run.sh"
++                    data-testid="library-drawer-script"
++                    className="w-full rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                  />
++                </DrawerField>
++              ) : (
++                <DrawerField label="URL">
++                  <input
++                    value={implUrl}
++                    onChange={(e) => setImplUrl(e.target.value)}
++                    placeholder="https://…"
++                    data-testid="library-drawer-url"
++                    className="w-full rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                  />
++                </DrawerField>
++              )}
++              <DrawerField label="Input schema (JSON)">
++                <textarea
++                  value={inputSchema}
++                  onChange={(e) => setInputSchema(e.target.value)}
++                  rows={5}
++                  spellCheck={false}
++                  data-testid="library-drawer-schema"
++                  className="w-full resize-y rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
++                />
++              </DrawerField>
++            </>
++          )}
++
++          <section>
++            <DrawerLabel>Use in roles</DrawerLabel>
++            <div className="max-h-44 space-y-0.5 overflow-y-auto rounded-xl bg-black/20 p-1.5 ring-1 ring-white/10">
++              {BUILTIN_ROLES.map((role) => (
++                <label
++                  key={role.id}
++                  className="flex cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-xs text-white/80 transition hover:bg-white/5"
++                >
++                  <input
++                    type="checkbox"
++                    checked={roles.includes(role.id)}
++                    onChange={() => toggleRole(role.id)}
++                    data-testid={`library-role-${role.id}`}
++                    className="h-3.5 w-3.5 shrink-0 accent-cyan-400"
++                  />
++                  <span className="min-w-0 flex-1 truncate">{role.name}</span>
++                  <span className="shrink-0 text-[10px] text-white/30">{role.category}</span>
++                </label>
++              ))}
++            </div>
++            <p className="mt-1.5 text-[10px] leading-relaxed text-white/30">
++              Only checked roles may use this item. A role can never get more than your settings allow.
++            </p>
++          </section>
++
++          <label className="flex cursor-pointer items-center justify-between gap-3 rounded-2xl bg-white/[0.04] px-3 py-2.5 ring-1 ring-white/10">
++            <span className="text-xs text-white/85">Enabled</span>
++            <button
++              type="button"
++              role="switch"
++              aria-checked={enabled}
++              aria-label="Enabled"
++              onClick={() => setEnabled((v) => !v)}
++              className={`relative h-5 w-9 shrink-0 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 ${
++                enabled ? "bg-cyan-400" : "bg-white/15"
++              }`}
++            >
++              <span className={`absolute top-0.5 h-4 w-4 rounded-full transition-all ${enabled ? "left-[18px] bg-black" : "left-0.5 bg-white/70"}`} />
++            </button>
++          </label>
++
++          {formError && (
++            <p className="rounded-xl bg-red-500/10 px-3 py-2 text-[11px] text-red-200/90 ring-1 ring-red-400/20" role="alert">
++              {formError}
++            </p>
++          )}
++        </div>
++
++        <div className="flex items-center justify-end gap-2 border-t border-white/10 px-4 py-3">
++          <button
++            type="button"
++            onClick={onClose}
++            className="rounded-full px-3.5 py-2 text-xs text-white/70 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++          >
++            Cancel
++          </button>
++          <button
++            type="button"
++            onClick={() => void save()}
++            disabled={saving}
++            data-testid="library-drawer-save"
++            className="rounded-full bg-cyan-400 px-4 py-2 text-xs font-medium text-black transition hover:bg-cyan-300 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++          >
++            {saving ? "Saving…" : isNew ? "Add" : "Save"}
++          </button>
++        </div>
++      </aside>
++    </div>
++  );
++}
++
++function DrawerLabel({ children }: { children: React.ReactNode }) {
++  return <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">{children}</span>;
++}
++
++function DrawerField({ label, children }: { label: string; children: React.ReactNode }) {
++  return (
++    <label className="block">
++      <DrawerLabel>{label}</DrawerLabel>
++      {children}
++    </label>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx b/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
+index 945eddc1c..d34ffce2f 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
+@@ -2,8 +2,10 @@
+ 
+ import React, { useCallback, useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
+ import { createPortal } from "react-dom";
+-import { RefreshCw, ChevronDown, Check, UserRound } from "lucide-react";
++import { RefreshCw, ChevronDown, Check, UserRound, Library } from "lucide-react";
+ import { ROLES, type RotationStrategy, type ProviderConfig } from "../data";
++import { getLibraryClient } from "../../../lib/library/client";
++import type { LibraryItem } from "../../../lib/library/types";
+ import { RoleIcon } from "./RoleIcon";
+ 
+ interface RoleAndVmBarProps {
+@@ -13,6 +15,8 @@ interface RoleAndVmBarProps {
+   onChangeRotationStrategy: (strategy: RotationStrategy) => void;
+   providers: ProviderConfig[];
+   onOpenSettings: () => void;
++  /** Open the Library page (Connectors / MCP / Skills / Tools). */
++  onOpenLibrary: () => void;
+   onResetVm: () => void;
+   vmResetting: boolean;
+   onToggleView: (view: "telemetry" | "desktop" | "terminal" | "browser" | "files") => void;
+@@ -213,9 +217,16 @@ interface RoleMenuPanelProps {
+   activeRoleId: string;
+   onSelectRole: (roleId: string) => void;
+   onClose: () => void;
++  /** Display name of the active role (for the Library section heading). */
++  activeRoleName?: string;
++  /** Library skills & MCP for the active role — live Library data. */
++  libraryItems?: LibraryItem[] | null;
++  libraryFailed?: boolean;
++  onToggleLibraryItem?: (item: LibraryItem) => void;
++  onOpenLibrary?: () => void;
+ }
+ 
+-function RoleMenuPanel({ open, anchorRef, activeRoleId, onSelectRole, onClose }: RoleMenuPanelProps) {
++function RoleMenuPanel({ open, anchorRef, activeRoleId, onSelectRole, onClose, activeRoleName, libraryItems, libraryFailed, onToggleLibraryItem, onOpenLibrary }: RoleMenuPanelProps) {
+   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+ 
+   // Keyboard navigation: arrow keys / Home / End move focus between items.
+@@ -303,6 +314,51 @@ function RoleMenuPanel({ open, anchorRef, activeRoleId, onSelectRole, onClose }:
+           );
+         })}
+       </div>
++
++      {/* Skills & MCP for the active role — live Library data. */}
++      <div className="mt-2 border-t border-white/10 pt-2">
++        <div className="text-[10px] font-semibold text-white/40 uppercase px-2 py-1 tracking-wider">
++          Skills &amp; MCP · {activeRoleName ?? ""}
++        </div>
++        {libraryFailed ? (
++          <p className="px-2 py-1 text-[11px] text-white/40">Library unavailable right now.</p>
++        ) : libraryItems === null || libraryItems === undefined ? (
++          <p className="px-2 py-1 text-[11px] text-white/40">Loading library…</p>
++        ) : libraryItems.length === 0 ? (
++          <p className="px-2 py-1 text-[11px] text-white/40">No library items for this role yet.</p>
++        ) : (
++          <div className="flex flex-col gap-0.5">
++            {libraryItems.map((item) => (
++              <div key={item.id} className="flex items-center gap-2 px-2 py-1.5">
++                <span className="min-w-0 flex-1 truncate text-[11px] text-white/80">{item.name}</span>
++                <button
++                  type="button"
++                  role="switch"
++                  aria-checked={item.enabled}
++                  aria-label={`${item.enabled ? "Disable" : "Enable"} ${item.name}`}
++                  onClick={() => void onToggleLibraryItem?.(item)}
++                  className={`relative h-4 w-7 shrink-0 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 ${
++                    item.enabled ? "bg-cyan-400" : "bg-white/15"
++                  }`}
++                >
++                  <span className={`absolute top-0.5 h-3 w-3 rounded-full transition-all ${item.enabled ? "left-[14px] bg-black" : "left-0.5 bg-white/70"}`} />
++                </button>
++              </div>
++            ))}
++          </div>
++        )}
++        <button
++          type="button"
++          onClick={() => {
++            onClose();
++            onOpenLibrary?.();
++          }}
++          className="mt-1 flex w-full items-center gap-1.5 rounded-xl px-2 py-1.5 text-[11px] text-cyan-300/90 transition hover:bg-white/5 hover:text-cyan-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++        >
++          <Library className="h-3.5 w-3.5" />
++          Manage in Library
++        </button>
++      </div>
+     </FloatingMenu>
+   );
+ }
+@@ -407,6 +463,7 @@ export function RoleAndVmBar({
+   onChangeRotationStrategy,
+   providers,
+   onOpenSettings,
++  onOpenLibrary,
+   onResetVm,
+   vmResetting,
+   agentCard,
+@@ -417,6 +474,47 @@ export function RoleAndVmBar({
+   const roleTriggerRef = useRef<HTMLButtonElement | null>(null);
+   const strategyTriggerRef = useRef<HTMLButtonElement | null>(null);
+   const currentRole = ROLES.find((r) => r.id === activeRoleId) || ROLES[0];
++
++  // Library skills & MCP servers for the active role — live data from the
++  // Library client, replacing the old hardcoded DEFAULT_MCP_SKILLS list.
++  // The role's mcpSkills ids are the Library item ids; toggles write back
++  // through the same client the Library page uses.
++  const [libraryItems, setLibraryItems] = useState<LibraryItem[] | null>(null);
++  const [libraryFailed, setLibraryFailed] = useState(false);
++
++  useEffect(() => {
++    if (!roleMenuOpen) return;
++    let cancelled = false;
++    (async () => {
++      try {
++        const client = getLibraryClient();
++        const [mcp, skills] = await Promise.all([client.list("mcp"), client.list("skills")]);
++        if (cancelled) return;
++        const wanted = new Set(currentRole.mcpSkills);
++        setLibraryItems([...mcp.items, ...skills.items].filter((item) => wanted.has(item.id)));
++        setLibraryFailed(false);
++      } catch {
++        if (!cancelled) {
++          setLibraryItems([]);
++          setLibraryFailed(true);
++        }
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, [roleMenuOpen, currentRole.mcpSkills]);
++
++  const toggleLibraryItem = async (item: LibraryItem) => {
++    const kind = "transport" in item ? "mcp" : "skills";
++    try {
++      await getLibraryClient().setEnabled(kind, item.id, !item.enabled);
++      setLibraryItems((prev) => (prev ?? []).map((candidate) => (candidate.id === item.id ? { ...candidate, enabled: !item.enabled } : candidate)));
++    } catch {
++      setLibraryFailed(true);
++    }
++  };
++
+   const currentStrategy =
+     strategyOptions.find((option) => option.value === rotationStrategy) || strategyOptions[0];
+ 
+@@ -453,6 +551,11 @@ export function RoleAndVmBar({
+           activeRoleId={activeRoleId}
+           onSelectRole={onSelectRole}
+           onClose={() => setRoleMenuOpen(false)}
++          activeRoleName={currentRole.name}
++          libraryItems={libraryItems}
++          libraryFailed={libraryFailed}
++          onToggleLibraryItem={toggleLibraryItem}
++          onOpenLibrary={onOpenLibrary}
+         />
+ 
+         {/* Left-mid: compact Agent Card strip (click opens the full card) */}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/Settings.tsx b/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
+index feb9cdee7..08c32c18b 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
+@@ -7,6 +7,9 @@ import {
+ } from '../data';
+ import { callProvider } from '../engine';
+ import { RoleIcon } from './RoleIcon';
++import { BUILTIN_ROLES } from '../../../lib/roles';
++import { getLibraryClient } from '../../../lib/library/client';
++import { LIBRARY_KINDS, type LibraryItem, type LibraryKind } from '../../../lib/library/types';
+ import { removeRole, moveRole } from '../utils/pipeline';
+ 
+ type Tab = 'general' | 'providers' | 'appearance';
+@@ -41,6 +44,7 @@ export function Settings({
+   serverProviderCount = 0,
+   roles,
+   setRoles,
++  onOpenLibrary,
+ }: {
+   open: boolean;
+   onClose: () => void;
+@@ -51,6 +55,8 @@ export function Settings({
+   serverProviderCount?: number;
+   roles: ActiveRole[];
+   setRoles: (fn: (r: ActiveRole[]) => ActiveRole[]) => void;
++  /** Open the Library page (Connectors / MCP / Skills / Tools). */
++  onOpenLibrary?: () => void;
+ }) {
+   const [tab, setTab] = useState<Tab>('general');
+   const [accent, setAccent] = useState<Accent>('cyan');
+@@ -114,7 +120,7 @@ export function Settings({
+         </div>
+ 
+         <div className="flex-1 overflow-y-auto px-5 pb-6 pt-5 scrollbar-thin">
+-          {tab === 'general' && <General roles={roles} setRoles={setRoles} providers={providers} setProviders={setProviders} showHelpers={showHelpers} />}
++          {tab === 'general' && <General roles={roles} setRoles={setRoles} providers={providers} setProviders={setProviders} showHelpers={showHelpers} onOpenLibrary={onOpenLibrary} />}
+           {tab === 'providers' && <Providers providers={providers} setProviders={setProviders} accent={a} showHelpers={showHelpers} serverProviderCount={serverProviderCount} />}
+           {tab === 'appearance' && <Appearance accent={accent} setAccent={setAccent} showHelpers={showHelpers} setShowHelpers={setShowHelpers} />}
+         </div>
+@@ -131,18 +137,56 @@ function General({
+   providers,
+   setProviders,
+   showHelpers,
++  onOpenLibrary,
+ }: {
+   roles: ActiveRole[];
+   setRoles: (fn: (r: ActiveRole[]) => ActiveRole[]) => void;
+   providers: ProviderConfig[];
+   setProviders: (fn: (p: ProviderConfig[]) => ProviderConfig[]) => void;
+   showHelpers: boolean;
++  onOpenLibrary?: () => void;
+ }) {
+   const [dragUid, setDragUid] = useState<string | null>(null);
+   const [dragPreset, setDragPreset] = useState<string | null>(null);
+   const [overGap, setOverGap] = useState<number | null>(null);
+   const [overLib, setOverLib] = useState(false);
+   const [capHit, setCapHit] = useState(false);
++  // Library assignments per role (lib/roles catalog): which Library items
++  // each role may use. Read from the same client the Library page uses, so
++  // the role library here always shows what the Library drawer saved.
++  const [assignments, setAssignments] = useState<Array<{ roleId: string; items: Array<{ kind: LibraryKind; item: LibraryItem }> }> | null>(null);
++  useEffect(() => {
++    let cancelled = false;
++    (async () => {
++      try {
++        const client = getLibraryClient();
++        const byRole = new Map<string, Array<{ kind: LibraryKind; item: LibraryItem }>>();
++        for (const kind of LIBRARY_KINDS) {
++          const { items } = await client.list(kind);
++          for (const item of items) {
++            for (const roleId of item.roles) {
++              const list = byRole.get(roleId) ?? [];
++              list.push({ kind, item });
++              byRole.set(roleId, list);
++            }
++          }
++        }
++        if (!cancelled) {
++          setAssignments(
++            BUILTIN_ROLES.filter((role) => byRole.has(role.id)).map((role) => ({
++              roleId: role.id,
++              items: byRole.get(role.id) ?? [],
++            })),
++          );
++        }
++      } catch {
++        if (!cancelled) setAssignments([]);
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, []);
+   const full = roles.length >= MAX_ROLES;
+   const defaultProv = providers.find((p) => p.enabled)?.uid ?? 'sim';
+   const listRef = useRef<HTMLDivElement>(null);
+@@ -435,6 +479,47 @@ function General({
+         )}
+       </section>
+ 
++      <section>
++        <div className="mb-2 flex items-center justify-between">
++          <Label className="mb-0">Library assignments</Label>
++          {onOpenLibrary && (
++            <button
++              type="button"
++              onClick={onOpenLibrary}
++              className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] text-cyan-300/90 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-cyan-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60"
++            >
++              Open Library
++            </button>
++          )}
++        </div>
++        {assignments === null ? (
++          <p className="text-[11px] text-white/35">Loading library assignments…</p>
++        ) : assignments.length === 0 ? (
++          <p className="text-[11px] leading-relaxed text-white/35">
++            No library items are assigned to roles yet. Use the Library to pick which roles get each connector, MCP server, skill or tool.
++          </p>
++        ) : (
++          <div className="space-y-2">
++            {assignments.map(({ roleId, items }) => {
++              const role = BUILTIN_ROLES.find((r) => r.id === roleId);
++              return (
++                <div key={roleId} className="rounded-2xl bg-white/[0.03] px-3 py-2.5 ring-1 ring-white/[0.07]">
++                  <div className="text-xs text-white/85">{role?.name ?? roleId}</div>
++                  <div className="mt-1.5 flex flex-wrap gap-1">
++                    {items.map(({ kind, item }) => (
++                      <span key={`${kind}:${item.id}`} className="rounded-full bg-white/[0.06] px-2 py-0.5 font-mono text-[10px] text-white/60 ring-1 ring-white/10">
++                        {kind === 'mcp' ? 'MCP' : kind} · {item.name}
++                      </span>
++                    ))}
++                  </div>
++                </div>
++              );
++            })}
++          </div>
++        )}
++        {showHelpers && <p className="mt-2 text-[11px] text-white/30">Edit which roles get an item from its Configure drawer in the Library.</p>}
++      </section>
++
+       <DangerZone
+         title="Reset settings"
+         description="Clears the agent pipeline, configured providers and appearance preferences from this browser."
+diff --git a/apps/swarmagents/minimalist-ui/src/data.ts b/apps/swarmagents/minimalist-ui/src/data.ts
+index b23f73681..fda916245 100644
+--- a/apps/swarmagents/minimalist-ui/src/data.ts
++++ b/apps/swarmagents/minimalist-ui/src/data.ts
+@@ -86,6 +86,12 @@ export const PROVIDERS: ProviderPreset[] = [
+   { id: 'custom', name: 'Custom Gateway (LiteLLM / Claude Code proxy)', baseUrl: 'http://localhost:8000/v1', model: 'custom-model', format: 'openai', keyHint: 'optional', color: '#94a3b8' },
+ ];
+ 
++/**
++ * @deprecated The Library is the source of truth for skills/MCP now
++ * (see lib/library/client + the Library page). Kept only so older saved
++ * state can still resolve these ids; do not render toggles from it — the
++ * RoleAndVmBar reads live Library data instead.
++ */
+ export const DEFAULT_MCP_SKILLS: McpSkill[] = [
+   { id: 'terminal-exec', name: 'Bash & Terminal', description: 'Executes zsh/bash commands, git, build runners directly in the Linux VM', enabled: true, type: 'terminal' },
+   { id: 'browser-live', name: 'Live Headed Browser', description: 'Interactive Chromium session streamed directly into user dashboard', enabled: true, type: 'browser' },
+-- 
+2.55.0
+

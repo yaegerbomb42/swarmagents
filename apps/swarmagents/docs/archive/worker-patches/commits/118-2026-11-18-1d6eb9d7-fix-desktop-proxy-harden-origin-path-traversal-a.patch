@@ -1,0 +1,380 @@
+From 1d6eb9d77775a5c20ae8963c86f03abbbea6ab49 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 11:54:43 -0600
+Subject: [PATCH] fix(desktop-proxy): harden origin, path traversal, and IPv6
+ handling
+
+---
+ .../lib/desktop-proxy/proxy.test.ts           | 201 ++++++++++++++++++
+ apps/swarmagents/lib/desktop-proxy/proxy.ts   | 116 ++++++++--
+ 2 files changed, 298 insertions(+), 19 deletions(-)
+
+diff --git a/apps/swarmagents/lib/desktop-proxy/proxy.test.ts b/apps/swarmagents/lib/desktop-proxy/proxy.test.ts
+index bf9ac46ce..c762a7bd7 100644
+--- a/apps/swarmagents/lib/desktop-proxy/proxy.test.ts
++++ b/apps/swarmagents/lib/desktop-proxy/proxy.test.ts
+@@ -549,12 +549,213 @@ test("desktop proxy: path traversal never reaches the upstream or other routes",
+       headers: { cookie: sessionFor("alice") },
+     });
+     assert.equal(res2.status, 404);
++
++    // Direct HTTP request preserving encoded segments like /desktop/%2e%2e/
++    const encodedTraversalRes = await new Promise<{ status: number; body: string }>((resolve, reject) => {
++      const req = http.request(
++        {
++          host: "127.0.0.1",
++          port,
++          path: "/desktop/%2e%2e/",
++          method: "GET",
++          headers: { cookie: sessionFor("alice") },
++        },
++        (res) => {
++          let body = "";
++          res.on("data", (chunk) => (body += chunk));
++          res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
++        },
++      );
++      req.on("error", reject);
++      req.end();
++    });
++    assert.equal(encodedTraversalRes.status, 404);
++    assert.equal(encodedTraversalRes.body, "Not found.");
++
+     assert.ok(!aliceVm.urls.some((u) => u.includes("api/health")), "upstream never saw a traversal");
+   } finally {
+     await proxy.close();
+   }
+ });
+ 
++test("desktop proxy: IPv6 Host header passes same-origin", async () => {
++  const prevAllowed = process.env.SWARM_ALLOWED_HOSTS;
++  process.env.SWARM_ALLOWED_HOSTS = "127.0.0.1,[::1]";
++  const { proxy, port, aliceVm } = await makeProxy();
++  aliceVm.assets.set("/vnc.html", "<html>ipv6 vnc</html>");
++  try {
++    const res = await new Promise<{ status: number; body: string }>((resolve, reject) => {
++      const req = http.request(
++        {
++          host: "127.0.0.1",
++          port,
++          path: "/desktop/vnc.html",
++          method: "GET",
++          headers: {
++            host: `[::1]:${port}`,
++            origin: `http://[::1]:${port}`,
++            cookie: sessionFor("alice"),
++          },
++        },
++        (r) => {
++          let body = "";
++          r.on("data", (chunk) => (body += chunk));
++          r.on("end", () => resolve({ status: r.statusCode ?? 0, body }));
++        },
++      );
++      req.on("error", reject);
++      req.end();
++    });
++    assert.equal(res.status, 200);
++    assert.equal(res.body, "<html>ipv6 vnc</html>");
++  } finally {
++    if (prevAllowed === undefined) delete process.env.SWARM_ALLOWED_HOSTS;
++    else process.env.SWARM_ALLOWED_HOSTS = prevAllowed;
++    await proxy.close();
++  }
++});
++
++test("desktop proxy: origin check enforces scheme and port", async () => {
++  const { proxy, port, aliceVm } = await makeProxy();
++  aliceVm.assets.set("/vnc.html", "<html>vnc</html>");
++  try {
++    // 1. https origin when Host is http must be rejected with 403
++    const httpsOrigin = await new Promise<{ status: number; body: string }>((resolve, reject) => {
++      const req = http.request(
++        {
++          host: "127.0.0.1",
++          port,
++          path: "/desktop/vnc.html",
++          method: "GET",
++          headers: {
++            host: `127.0.0.1:${port}`,
++            origin: `https://127.0.0.1:${port}`,
++            cookie: sessionFor("alice"),
++          },
++        },
++        (r) => {
++          let body = "";
++          r.on("data", (chunk) => (body += chunk));
++          r.on("end", () => resolve({ status: r.statusCode ?? 0, body }));
++        },
++      );
++      req.on("error", reject);
++      req.end();
++    });
++    assert.equal(httpsOrigin.status, 403);
++    assert.equal(httpsOrigin.body, "Cross-site request blocked.");
++
++    // 2. wrong port must be rejected with 403
++    const wrongPort = await new Promise<{ status: number; body: string }>((resolve, reject) => {
++      const req = http.request(
++        {
++          host: "127.0.0.1",
++          port,
++          path: "/desktop/vnc.html",
++          method: "GET",
++          headers: {
++            host: `127.0.0.1:${port}`,
++            origin: `http://127.0.0.1:9999`,
++            cookie: sessionFor("alice"),
++          },
++        },
++        (r) => {
++          let body = "";
++          r.on("data", (chunk) => (body += chunk));
++          r.on("end", () => resolve({ status: r.statusCode ?? 0, body }));
++        },
++      );
++      req.on("error", reject);
++      req.end();
++    });
++    assert.equal(wrongPort.status, 403);
++    assert.equal(wrongPort.body, "Cross-site request blocked.");
++
++    // 3. SWARM_ALLOWED_HOSTS wrong port or wrong scheme must be rejected
++    const prevAllowed = process.env.SWARM_ALLOWED_HOSTS;
++    process.env.SWARM_ALLOWED_HOSTS = "127.0.0.1,swarm.example.com";
++    try {
++      const allowedWrongPort = await new Promise<{ status: number; body: string }>((resolve, reject) => {
++        const req = http.request(
++          {
++            host: "127.0.0.1",
++            port,
++            path: "/desktop/vnc.html",
++            method: "GET",
++            headers: {
++              host: `127.0.0.1:${port}`,
++              origin: `http://swarm.example.com:9999`,
++              cookie: sessionFor("alice"),
++            },
++          },
++          (r) => {
++            let body = "";
++            r.on("data", (chunk) => (body += chunk));
++            r.on("end", () => resolve({ status: r.statusCode ?? 0, body }));
++          },
++        );
++        req.on("error", reject);
++        req.end();
++      });
++      assert.equal(allowedWrongPort.status, 403);
++
++      const allowedWrongScheme = await new Promise<{ status: number; body: string }>((resolve, reject) => {
++        const req = http.request(
++          {
++            host: "127.0.0.1",
++            port,
++            path: "/desktop/vnc.html",
++            method: "GET",
++            headers: {
++              host: `127.0.0.1:${port}`,
++              origin: `https://swarm.example.com:${port}`,
++              cookie: sessionFor("alice"),
++            },
++          },
++          (r) => {
++            let body = "";
++            r.on("data", (chunk) => (body += chunk));
++            r.on("end", () => resolve({ status: r.statusCode ?? 0, body }));
++          },
++        );
++        req.on("error", reject);
++        req.end();
++      });
++      assert.equal(allowedWrongScheme.status, 403);
++
++      // And matching allowed host works
++      const allowedMatch = await new Promise<{ status: number; body: string }>((resolve, reject) => {
++        const req = http.request(
++          {
++            host: "127.0.0.1",
++            port,
++            path: "/desktop/vnc.html",
++            method: "GET",
++            headers: {
++              host: `127.0.0.1:${port}`,
++              origin: `http://swarm.example.com:${port}`,
++              cookie: sessionFor("alice"),
++            },
++          },
++          (r) => {
++            let body = "";
++            r.on("data", (chunk) => (body += chunk));
++            r.on("end", () => resolve({ status: r.statusCode ?? 0, body }));
++          },
++        );
++        req.on("error", reject);
++        req.end();
++      });
++      assert.equal(allowedMatch.status, 200);
++    } finally {
++      if (prevAllowed === undefined) delete process.env.SWARM_ALLOWED_HOSTS;
++      else process.env.SWARM_ALLOWED_HOSTS = prevAllowed;
++    }
++  } finally {
++    await proxy.close();
++  }
++});
++
+ test("desktop proxy: view session is read-only (input events dropped, framebuffer requests relayed)", async () => {
+   const { proxy, port, aliceVm } = await makeProxy();
+   try {
+diff --git a/apps/swarmagents/lib/desktop-proxy/proxy.ts b/apps/swarmagents/lib/desktop-proxy/proxy.ts
+index da3772ea6..b89800d67 100644
+--- a/apps/swarmagents/lib/desktop-proxy/proxy.ts
++++ b/apps/swarmagents/lib/desktop-proxy/proxy.ts
+@@ -284,22 +284,88 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
+     }
+   }
+ 
+-  function originAllowed(req: IncomingMessage): boolean {
+-    const origin = req.headers.origin;
+-    if (!origin) return true; // non-browser client; cookie auth still required
+-    try {
+-      const originHost = new URL(origin).hostname.toLowerCase();
+-      const host = (req.headers.host ?? "").split(":")[0].toLowerCase();
+-      if (originHost === host) return true;
+-      const allowed = (process.env.SWARM_ALLOWED_HOSTS ?? "")
+-        .split(",")
+-        .map((h) => h.trim().toLowerCase())
+-        .filter(Boolean);
+-      return allowed.includes(originHost);
+-    } catch {
+-      return false; // malformed Origin cannot be trusted
++function parseHostHeader(hostHeader: string | undefined): { hostname: string; port: string | null } {
++  const raw = (hostHeader ?? "").trim();
++  if (!raw) return { hostname: "", port: null };
++  if (raw.startsWith("[")) {
++    const end = raw.indexOf("]");
++    if (end >= 0) {
++      const hostname = raw.slice(0, end + 1).toLowerCase();
++      const rest = raw.slice(end + 1);
++      const port = rest.startsWith(":") ? rest.slice(1) : null;
++      return { hostname, port };
+     }
+   }
++  const parts = raw.split(":");
++  return { hostname: parts[0].toLowerCase(), port: parts[1] ?? null };
++}
++
++function parseAllowedEntry(
++  entry: string,
++  fallbackProto: string,
++): { hasScheme: boolean; protocol: string; hostname: string; port: string | null } | null {
++  const trimmed = entry.trim();
++  if (!trimmed) return null;
++  const hasScheme = /^https?:\/\//i.test(trimmed);
++  try {
++    const u = new URL(hasScheme ? trimmed : `${fallbackProto}//${trimmed}`);
++    const defaultPort = u.protocol === "https:" ? "443" : "80";
++    return {
++      hasScheme,
++      protocol: hasScheme ? u.protocol : fallbackProto,
++      hostname: u.hostname.toLowerCase(),
++      port: u.port || (hasScheme ? defaultPort : null),
++    };
++  } catch {
++    return null;
++  }
++}
++
++function originAllowed(req: IncomingMessage): boolean {
++  const origin = req.headers.origin;
++  if (!origin) return true; // non-browser client; cookie auth still required
++  try {
++    const originUrl = new URL(origin);
++    const originProto = originUrl.protocol.toLowerCase();
++    const originHostname = originUrl.hostname.toLowerCase();
++    const originPort = originUrl.port || (originProto === "https:" ? "443" : "80");
++
++    const hostHeader = Array.isArray(req.headers.host) ? req.headers.host[0] : req.headers.host;
++    const reqProto = "http:";
++    const hostInfo = parseHostHeader(hostHeader);
++    if (!hostInfo.hostname) return false;
++    const hostPort = hostInfo.port || "80";
++
++    if (
++      originProto === reqProto &&
++      originHostname === hostInfo.hostname &&
++      originPort === hostPort
++    ) {
++      return true;
++    }
++
++    const allowed = (process.env.SWARM_ALLOWED_HOSTS ?? "")
++      .split(",")
++      .map((h) => h.trim())
++      .filter(Boolean);
++
++    for (const entry of allowed) {
++      const target = parseAllowedEntry(entry, reqProto);
++      if (!target) continue;
++      if (originHostname !== target.hostname) continue;
++      if (target.hasScheme) {
++        if (originProto !== target.protocol) continue;
++      } else {
++        if (originProto !== reqProto) continue;
++      }
++      const expectedPort = target.port ?? hostPort;
++      if (originPort === expectedPort) return true;
++    }
++    return false;
++  } catch {
++    return false; // malformed Origin cannot be trusted
++  }
++}
+ 
+   async function resolveEndpointFor(userId: string): Promise<VmDesktopEndpoint | null> {
+     const endpoint = await resolveEndpoint(userId);
+@@ -317,9 +383,20 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
+   function mapDeskPath(rawPath: string): string | null {
+     if (!rawPath.startsWith(DESKTOP_HTTP_PREFIX) && rawPath !== "/desktop") return null;
+     const mapped = rawPath.slice(DESKTOP_HTTP_PREFIX.length - 1); // keep leading "/"
+-    if (mapped.includes("\\") || /[\u0000-\u001f\u007f]/.test(mapped)) return null;
+-    if (mapped.split("/").includes("..")) return null;
+-    return mapped === "" ? "/" : mapped;
++    const segments = mapped.split("/").filter((s) => s.length > 0);
++    const decoded: string[] = [];
++    for (const segment of segments) {
++      let part: string;
++      try {
++        part = decodeURIComponent(segment);
++      } catch {
++        return null;
++      }
++      if (part === "." || part === "..") return null;
++      if (part.includes("\\") || /[\u0000-\u001f\u007f]/.test(part)) return null;
++      decoded.push(part);
++    }
++    return `/${decoded.map((s) => encodeURIComponent(s)).join("/")}`;
+   }
+ 
+   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+@@ -331,13 +408,14 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
+     if (!user) return safeError(res, 401, "Sign in required.");
+     if (!originAllowed(req)) return safeError(res, 403, "Cross-site request blocked.");
+ 
+-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+-    const mapped = mapDeskPath(url.pathname);
++    const rawPath = (req.url ?? "/").split("?")[0].split("#")[0];
++    const mapped = mapDeskPath(rawPath);
+     if (mapped === null) return safeError(res, 404, "Not found.");
+ 
+     const endpoint = await resolveEndpointFor(user.id);
+     if (!endpoint) return safeError(res, 404, "No desktop VM for this user.");
+ 
++    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+     // Only the driver-resolved host/port is ever dialed. Client-supplied
+     // path and query are normalized below — userinfo/credentials never make it
+     // into the upstream URL because we construct it from validated pieces.
+-- 
+2.55.0
+

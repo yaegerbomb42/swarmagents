@@ -1,0 +1,2719 @@
+From d6cb53b6172a5d8c419fbe4a6879e027d5714bd3 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 16:04:36 -0600
+Subject: [PATCH] feat(swarmagents): port minimal UI run view to the real
+ backend
+
+Adds the minimal 3-part run workspace from the prototype (runs list,
+live VM screen, pinned input bar with provider/model picker, settings
+slide-over), reconciled with the real swarmagents API rather than the
+prototype's assumed shapes.
+
+Backend:
+- app/api/runs (GET list / POST start) + [id] detail + stop routes,
+  driven by real TelemetryBus events and RuntimeManager.start/cancel
+- lib/minimal-ui: feed (event->step frames), providers (usability +
+  model resolution), suggestions, screenshot capture
+- run-store: persist provider id from the run.started event
+- lib/http: JSON body parsing with a typed error
+
+Frontend (minimalist-ui):
+- MinimalHome wires the picker to the real /api/providers ProviderRow
+  shape (id/label/model/keyCount/rank/isFree) and computes the effective
+  provider with the backend's usability rule
+- MinimalSettingsPanel providers tab reads the real catalog+rows, maps
+  the add-provider form onto POST /api/providers (id/apiStyle/baseUrl/
+  models/apiKey), and deletes via DELETE /api/providers/[id]; the MCP/
+  Tools/Skills/Connectors tabs degrade honestly since those endpoints do
+  not exist in this build
+- App.tsx renders MinimalHome as the non-landing workspace
+
+Verified: npm run typecheck clean, full next build succeeds, 15 feed
+unit tests + 9 runs-route tests pass.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../app/api/runs/[id]/route.test.ts           | 124 +++++
+ apps/swarmagents/app/api/runs/[id]/route.ts   |  67 +++
+ .../app/api/runs/[id]/stop/route.test.ts      |  46 ++
+ .../app/api/runs/[id]/stop/route.ts           |  43 ++
+ apps/swarmagents/app/api/runs/route.test.ts   | 187 +++++++
+ apps/swarmagents/app/api/runs/route.ts        | 202 +++++++
+ apps/swarmagents/app/globals.css              |  10 +
+ apps/swarmagents/lib/http.ts                  |  26 +
+ apps/swarmagents/lib/minimal-ui/feed.test.ts  | 236 +++++++++
+ apps/swarmagents/lib/minimal-ui/feed.ts       | 497 ++++++++++++++++++
+ apps/swarmagents/lib/minimal-ui/providers.ts  | 106 ++++
+ apps/swarmagents/lib/minimal-ui/screenshot.ts |  54 ++
+ .../swarmagents/lib/minimal-ui/suggestions.ts |  19 +
+ apps/swarmagents/lib/runtime/run-store.ts     |   3 +
+ apps/swarmagents/minimalist-ui/src/App.tsx    |  13 +
+ .../src/components/minimal-ui/MinimalHome.tsx | 308 +++++++++++
+ .../minimal-ui/MinimalSettingsPanel.tsx       | 348 ++++++++++++
+ .../components/minimal-ui/MinimalVmScreen.tsx | 204 +++++++
+ apps/swarmagents/minimalist-ui/src/index.css  |  10 +
+ 19 files changed, 2503 insertions(+)
+ create mode 100644 apps/swarmagents/app/api/runs/[id]/route.test.ts
+ create mode 100644 apps/swarmagents/app/api/runs/[id]/route.ts
+ create mode 100644 apps/swarmagents/app/api/runs/[id]/stop/route.test.ts
+ create mode 100644 apps/swarmagents/app/api/runs/[id]/stop/route.ts
+ create mode 100644 apps/swarmagents/app/api/runs/route.test.ts
+ create mode 100644 apps/swarmagents/app/api/runs/route.ts
+ create mode 100644 apps/swarmagents/lib/http.ts
+ create mode 100644 apps/swarmagents/lib/minimal-ui/feed.test.ts
+ create mode 100644 apps/swarmagents/lib/minimal-ui/feed.ts
+ create mode 100644 apps/swarmagents/lib/minimal-ui/providers.ts
+ create mode 100644 apps/swarmagents/lib/minimal-ui/screenshot.ts
+ create mode 100644 apps/swarmagents/lib/minimal-ui/suggestions.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalHome.tsx
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalSettingsPanel.tsx
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalVmScreen.tsx
+
+diff --git a/apps/swarmagents/app/api/runs/[id]/route.test.ts b/apps/swarmagents/app/api/runs/[id]/route.test.ts
+new file mode 100644
+index 000000000..1f8a7b3c3
+--- /dev/null
++++ b/apps/swarmagents/app/api/runs/[id]/route.test.ts
+@@ -0,0 +1,124 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++import { GET } from "./route";
++import { TelemetryBus, type TelemetryEvent } from "../../../../lib/telemetry/bus";
++import { configureRunsDir } from "../../../../lib/telemetry/paths";
++
++function request(url: string, user: string | null = "alice"): NextRequest {
++  const headers = new Headers();
++  if (user !== null) headers.set("x-swarm-user", user);
++  return new NextRequest(`http://localhost${url}`, { headers });
++}
++
++function params(id: string) {
++  return { params: Promise.resolve({ id }) };
++}
++
++function seed(dir: string): void {
++  const bus = new TelemetryBus({ persist: true, runsDir: () => dir });
++  bus.publish("run_1", { type: "run.created", data: { prompt: "build the thing", userId: "alice" } });
++  bus.publish("run_1", { type: "run.started", model: "mercury-3", provider: "inception" } as TelemetryEvent);
++  bus.publish("run_1", { type: "tool.call", name: "Bash", input: { command: "npm test" } } as TelemetryEvent);
++  bus.publish("run_1", { type: "shell.output", data: { stream: "stdout", text: "12 passing\n" } });
++  bus.publish("run_1", { type: "computer.action", action: "Clicked Publish", url: "https://example.com" } as TelemetryEvent);
++  bus.publish("run_1", { type: "tool.call", name: "Read", input: { file_path: "/src/app.ts" } } as TelemetryEvent);
++  bus.publish("run_1", { type: "assistant.text", text: "All done." } as TelemetryEvent);
++  bus.publish("run_1", {
++    type: "run.finished",
++    exitCode: 0,
++    sessionId: "sess_1",
++    costUsd: 0.03,
++    durationMs: 65_000,
++  } as TelemetryEvent);
++  bus.publish("run_2", { type: "run.created", data: { prompt: "live run", userId: "alice" } });
++  bus.publish("run_2", { type: "tool.call", name: "Bash", input: { command: "ls" } } as TelemetryEvent);
++  bus.publish("run_3", { type: "run.created", data: { prompt: "bob run", userId: "bob" } });
++}
++
++function withRunsDir<T>(fn: (dir: string) => T | Promise<T>): Promise<T> {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-minimal-runid-"));
++  configureRunsDir(dir);
++  return Promise.resolve()
++    .then(() => fn(dir))
++    .finally(() => {
++      configureRunsDir(null);
++      fs.rmSync(dir, { recursive: true, force: true });
++    });
++}
++
++test("GET /api/runs/[id] returns the run, real steps, and the frame", async () => {
++  await withRunsDir(async (dir) => {
++    seed(dir);
++    const res = await GET(request("/api/runs/run_1"), params("run_1"));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as {
++      run: Record<string, unknown>;
++      events: Array<Record<string, unknown>>;
++      allSteps: string[];
++      frame: Record<string, unknown>;
++    };
++    assert.equal(body.run.id, "run_1");
++    assert.equal(body.run.status, "completed");
++    assert.equal(body.run.result, "All done.");
++    assert.deepEqual(
++      body.events.map((e) => e.label),
++      [
++        "Run started",
++        "Agent started · inception / mercury-3",
++        "$ npm test",
++        "12 passing",
++        "Clicked Publish",
++        "Read /src/app.ts",
++        "Run completed in 1m 5s · $0.03",
++      ],
++    );
++    assert.deepEqual(body.allSteps, body.events.map((e) => e.label));
++    // The frame's app is the LAST step's app — the run.finished step is a
++    // desktop step, so a finished run frames as desktop even though the
++    // last content step was the editor. browserUrl/fileName still come from
++    // the latest steps that carried them.
++    assert.equal(body.frame.app, "desktop");
++    assert.equal(body.frame.browserUrl, "https://example.com");
++    assert.equal(body.frame.fileName, "/src/app.ts");
++    assert.deepEqual(body.frame.terminalLines, ["$ npm test", "12 passing"]);
++    assert.equal(body.frame.elapsed, 65);
++    // No VM is attached in this environment, so no screenshot — and no fake one.
++    assert.equal(body.frame.screenshot, undefined);
++  });
++});
++
++test("GET /api/runs/[id] for a live run reports its live step and no screenshot without a VM", async () => {
++  await withRunsDir(async (dir) => {
++    seed(dir);
++    const res = await GET(request("/api/runs/run_2"), params("run_2"));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as {
++      run: Record<string, unknown>;
++      events: Array<Record<string, unknown>>;
++      frame: Record<string, unknown>;
++    };
++    assert.equal(body.run.status, "running");
++    assert.equal(body.run.currentStep, "$ ls");
++    assert.equal(body.frame.app, "terminal");
++    assert.equal(body.frame.screenshot, undefined);
++  });
++});
++
++test("GET /api/runs/[id] 404s for unknown ids and other users' runs", async () => {
++  await withRunsDir(async (dir) => {
++    seed(dir);
++    const missing = await GET(request("/api/runs/nope"), params("nope"));
++    assert.equal(missing.status, 404);
++    const bobs = await GET(request("/api/runs/run_3"), params("run_3"));
++    assert.equal(bobs.status, 404);
++  });
++});
++
++test("GET /api/runs/[id] requires a signed-in user", async () => {
++  const res = await GET(request("/api/runs/run_1", null), params("run_1"));
++  assert.equal(res.status, 401);
++});
+diff --git a/apps/swarmagents/app/api/runs/[id]/route.ts b/apps/swarmagents/app/api/runs/[id]/route.ts
+new file mode 100644
+index 000000000..bf1c387f2
+--- /dev/null
++++ b/apps/swarmagents/app/api/runs/[id]/route.ts
+@@ -0,0 +1,67 @@
++/**
++ * Minimal UI run detail: GET /api/runs/[id].
++ *
++ * Returns the run, its REAL telemetry mapped to the prototype's step list,
++ * the full step-label list, and the live screen frame — built from the
++ * latest steps exactly like the prototype's [id] route (app = current
++ * step's app, browserUrl/fileName = latest seen, terminalLines = every
++ * terminal line, elapsed = seconds since the run started). When a real VM
++ * desktop frame is available the frame also carries a `screenshot` data
++ * URL; when no VM is attached the field is omitted and the UI renders the
++ * telemetry lines instead. Nothing is faked: a run with no telemetry yet
++ * returns empty events, an empty allSteps list, and a desktop frame with
++ * null browserUrl/fileName and no terminal lines.
++ *
++ * A run owned by another user (or an unknown id) answers 404 — the run
++ * id alone is not a capability.
++ *
++ * Poll-friendly and no-store; the screenshot fetch is only attempted for
++ * a live run (a finished run has no VM to capture).
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { USER_HEADER } from "@/lib/auth";
++import { getRun } from "@/lib/runtime/run-store";
++import { buildFrame, deriveCurrentStep, eventsToSteps, runAttachments, runResult, toMinimalRunShape } from "@/lib/minimal-ui/feed";
++import { captureDesktopFrame } from "@/lib/minimal-ui/screenshot";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++const NO_STORE = { "Cache-Control": "no-store" } as const;
++
++function caller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++export async function GET(
++  req: NextRequest,
++  { params }: { params: Promise<{ id: string }> },
++): Promise<NextResponse> {
++  const user = caller(req);
++  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++
++  const { id } = await params;
++  const detail = getRun(id);
++  if (!detail || detail.summary.userId !== user) {
++    return NextResponse.json({ error: "Run not found." }, { status: 404, headers: NO_STORE });
++  }
++  const { summary, events } = detail;
++  const steps = eventsToSteps(events, summary.createdAt);
++  const frame = buildFrame(steps, summary.createdAt, summary.finishedAt ?? null, Date.now(), summary.durationMs);
++  const isLive = summary.status === "running";
++  if (isLive) {
++    const screenshot = await captureDesktopFrame(user).catch(() => null);
++    if (screenshot) frame.screenshot = screenshot;
++  }
++  return NextResponse.json(
++    {
++      run: toMinimalRunShape(summary, deriveCurrentStep(events, summary.createdAt), runResult(summary), runAttachments(events)),
++      events: steps,
++      allSteps: steps.map((s) => s.label),
++      frame,
++    },
++    { headers: NO_STORE },
++  );
++}
+diff --git a/apps/swarmagents/app/api/runs/[id]/stop/route.test.ts b/apps/swarmagents/app/api/runs/[id]/stop/route.test.ts
+new file mode 100644
+index 000000000..a55ee9f3f
+--- /dev/null
++++ b/apps/swarmagents/app/api/runs/[id]/stop/route.test.ts
+@@ -0,0 +1,46 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++import { POST } from "./route";
++import { TelemetryBus } from "../../../../../lib/telemetry/bus";
++import { configureRunsDir } from "../../../../../lib/telemetry/paths";
++
++function request(url: string, user: string | null = "alice"): NextRequest {
++  const headers = new Headers();
++  if (user !== null) headers.set("x-swarm-user", user);
++  return new NextRequest(`http://localhost${url}`, { method: "POST", headers });
++}
++
++function params(id: string) {
++  return { params: Promise.resolve({ id }) };
++}
++
++test("POST /api/runs/[id]/stop requires a signed-in user", async () => {
++  const res = await POST(request("/api/runs/run_1", null), params("run_1"));
++  assert.equal(res.status, 401);
++});
++
++test("POST /api/runs/[id]/stop is idempotent for unknown ids and other users' runs", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-minimal-stop-"));
++  configureRunsDir(dir);
++  try {
++    const bus = new TelemetryBus({ persist: true, runsDir: () => dir });
++    bus.publish("run_1", { type: "run.created", data: { prompt: "bob run", userId: "bob" } });
++    const unknown = await POST(request("/api/runs/nope"), params("nope"));
++    assert.equal(unknown.status, 200);
++    assert.deepEqual(await unknown.json(), { ok: true });
++    const bobs = await POST(request("/api/runs/run_1"), params("run_1"));
++    assert.equal(bobs.status, 200);
++    assert.deepEqual(await bobs.json(), { ok: true });
++  } finally {
++    configureRunsDir(null);
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++// NOTE: stopping a live run (the manager's safe-abort path) is deliberately
++// not unit-tested here: it requires a real active run with a Docker VM, which
++// this environment cannot provision. It is covered by the live-test brief.
+diff --git a/apps/swarmagents/app/api/runs/[id]/stop/route.ts b/apps/swarmagents/app/api/runs/[id]/stop/route.ts
+new file mode 100644
+index 000000000..a48cddfaa
+--- /dev/null
++++ b/apps/swarmagents/app/api/runs/[id]/stop/route.ts
+@@ -0,0 +1,43 @@
++/**
++ * Minimal UI: POST /api/runs/[id]/stop — stop the real run.
++ *
++ * Uses the manager's safe-abort path (the same cancel() the run lifecycle
++ * uses): the active run is finalized as cancelled with reason "user" and
++ * its controller aborted. Idempotent: stopping an already-finished run
++ * (or a run the caller does not own) still answers {ok:true} — the UI
++ * only needs to know the run is no longer running.
++ *
++ * No-store.
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { USER_HEADER } from "@/lib/auth";
++import { getRun } from "@/lib/runtime/run-store";
++import { getRuntimeManager } from "@/lib/runtime/manager";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++const NO_STORE = { "Cache-Control": "no-store" } as const;
++
++function caller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++export async function POST(
++  req: NextRequest,
++  { params }: { params: Promise<{ id: string }> },
++): Promise<NextResponse> {
++  const user = caller(req);
++  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++
++  const { id } = await params;
++  const detail = getRun(id);
++  if (!detail || detail.summary.userId !== user) {
++    // Unknown id or another user's run: still {ok:true} — idempotent.
++    return NextResponse.json({ ok: true }, { headers: NO_STORE });
++  }
++  getRuntimeManager().cancel(user, id, "user");
++  return NextResponse.json({ ok: true }, { headers: NO_STORE });
++}
+diff --git a/apps/swarmagents/app/api/runs/route.test.ts b/apps/swarmagents/app/api/runs/route.test.ts
+new file mode 100644
+index 000000000..01c479560
+--- /dev/null
++++ b/apps/swarmagents/app/api/runs/route.test.ts
+@@ -0,0 +1,187 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++import { GET, POST } from "./route";
++import { TelemetryBus, type TelemetryEvent } from "../../../lib/telemetry/bus";
++import { configureRunsDir } from "../../../lib/telemetry/paths";
++import { saveProvider } from "../../../lib/providers/store";
++
++function request(url: string, user: string | null = "alice", init?: RequestInit): NextRequest {
++  const headers = new Headers(init?.headers);
++  if (user !== null) headers.set("x-swarm-user", user);
++  const { headers: _ignored, signal, ...rest } = init ?? {};
++  void _ignored;
++  return new NextRequest(`http://localhost${url}`, { ...rest, signal: signal ?? undefined, headers });
++}
++
++function seed(dir: string): void {
++  const bus = new TelemetryBus({ persist: true, runsDir: () => dir });
++  // Finished run (older): full lifecycle + final text.
++  bus.publish("run_1", { type: "run.created", data: { prompt: "build the thing", userId: "alice" } });
++  bus.publish("run_1", { type: "run.started", model: "mercury-3", provider: "inception" } as TelemetryEvent);
++  bus.publish("run_1", { type: "tool.call", name: "Bash", input: { command: "npm test" } } as TelemetryEvent);
++  bus.publish("run_1", { type: "assistant.text", text: "All done." } as TelemetryEvent);
++  bus.publish("run_1", {
++    type: "run.finished",
++    exitCode: 0,
++    sessionId: "sess_1",
++    costUsd: 0.03,
++    durationMs: 65_000,
++  } as TelemetryEvent);
++  // Live run (newer): started, no finish, with attachments.
++  bus.publish("run_2", { type: "run.created", data: { prompt: "second run", userId: "alice" } });
++  bus.publish("run_2", { type: "run.attachments", data: { attachments: ["notes.txt"] } });
++  bus.publish("run_2", { type: "run.started", model: "mercury-3", provider: "inception" } as TelemetryEvent);
++  bus.publish("run_2", { type: "tool.call", name: "Read", input: { file_path: "/src/app.ts" } } as TelemetryEvent);
++  // Another user's run: must never leak into alice's list.
++  bus.publish("run_3", { type: "run.created", data: { prompt: "bob run", userId: "bob" } });
++}
++
++function withRunsDir<T>(fn: (dir: string) => T | Promise<T>): Promise<T> {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-minimal-runs-"));
++  configureRunsDir(dir);
++  return Promise.resolve()
++    .then(() => fn(dir))
++    .finally(() => {
++      configureRunsDir(null);
++      fs.rmSync(dir, { recursive: true, force: true });
++    });
++}
++
++function withHome<T>(fn: (dir: string) => T | Promise<T>): Promise<T> {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-minimal-home-"));
++  const prevHome = process.env.SWARM_HOME;
++  process.env.SWARM_HOME = dir;
++  return Promise.resolve()
++    .then(() => fn(dir))
++    .finally(() => {
++      if (prevHome === undefined) delete process.env.SWARM_HOME;
++      else process.env.SWARM_HOME = prevHome;
++      fs.rmSync(dir, { recursive: true, force: true });
++    });
++}
++
++test("GET /api/runs returns an empty list and suggestions for a fresh user", async () => {
++  await withRunsDir(async () => {
++    const res = await GET(request("/api/runs"));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as Record<string, unknown>;
++    assert.deepEqual(body.runs, []);
++    const suggestions = body.suggestions as Array<{ label: string; prompt: string }>;
++    assert.equal(suggestions.length, 4);
++    assert.equal(suggestions[0].label, "Run the tests");
++  });
++});
++
++test("GET /api/runs returns runs newest-first with real telemetry shapes", async () => {
++  await withRunsDir(async (dir) => {
++    seed(dir);
++    const res = await GET(request("/api/runs"));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as {
++      runs: Array<Record<string, unknown>>;
++      suggestions: Array<{ label: string; prompt: string }>;
++    };
++    assert.equal(body.runs.length, 2);
++    // Newest first: the live run_2, then the finished run_1. Bob's run_3 is absent.
++    const [live, finished] = body.runs;
++    assert.equal(live.id, "run_2");
++    assert.equal(live.status, "running");
++    assert.equal(live.currentStep, "Read /src/app.ts");
++    assert.equal(live.result, null);
++    assert.deepEqual(live.attachments, ["notes.txt"]);
++    assert.equal(live.providerName, "Inception (Mercury)");
++    assert.equal(live.model, "mercury-3");
++    assert.equal(finished.id, "run_1");
++    assert.equal(finished.status, "completed");
++    assert.equal(finished.currentStep, "Run completed in 1m 5s · $0.03");
++    assert.equal(finished.result, "All done.");
++    assert.deepEqual(finished.attachments, []);
++    assert.equal(finished.durationSec, 65);
++  });
++});
++
++test("GET /api/runs requires a signed-in user", async () => {
++  const res = await GET(request("/api/runs", null));
++  assert.equal(res.status, 401);
++});
++
++test("POST /api/runs requires a signed-in user", async () => {
++  const res = await POST(request("/api/runs", null, { method: "POST", body: JSON.stringify({ prompt: "hi" }) }));
++  assert.equal(res.status, 401);
++});
++
++test("POST /api/runs rejects a missing or empty prompt and bad JSON", async () => {
++  for (const body of ["{}", JSON.stringify({ prompt: "   " }), "not json"]) {
++    const res = await POST(request("/api/runs", "alice", { method: "POST", body }));
++    assert.equal(res.status, 400);
++  }
++});
++
++test("POST /api/runs rejects oversized attachments", async () => {
++  const res = await POST(
++    request("/api/runs", "alice", {
++      method: "POST",
++      body: JSON.stringify({ prompt: "hi", attachments: Array.from({ length: 21 }, (_, i) => `f${i}.txt`) }),
++    }),
++  );
++  assert.equal(res.status, 400);
++});
++
++test("POST /api/runs returns 503 when the user has no provider configured", async () => {
++  await withHome(async () => {
++    const res = await POST(
++      request("/api/runs", "alice", { method: "POST", body: JSON.stringify({ prompt: "do it" }) }),
++    );
++    assert.equal(res.status, 503);
++    const body = (await res.json()) as Record<string, unknown>;
++    assert.equal(body.error, "No LLM providers are configured for this account.");
++  });
++});
++
++test("POST /api/runs rejects an unknown providerId and a model no provider serves", async () => {
++  await withHome(async () => {
++    saveProvider("alice", { id: "inception", apiKey: "test-key-123" });
++    const unknown = await POST(
++      request("/api/runs", "alice", {
++        method: "POST",
++        body: JSON.stringify({ prompt: "do it", providerId: "no-such-provider" }),
++      }),
++    );
++    assert.equal(unknown.status, 400);
++    const wrongModel = await POST(
++      request("/api/runs", "alice", {
++        method: "POST",
++        body: JSON.stringify({ prompt: "do it", providerId: "inception", model: "gpt-4.1" }),
++      }),
++    );
++    assert.equal(wrongModel.status, 400);
++    const unserved = await POST(
++      request("/api/runs", "alice", { method: "POST", body: JSON.stringify({ prompt: "do it", model: "gpt-4.1" }) }),
++    );
++    assert.equal(unserved.status, 400);
++  });
++});
++
++test("POST /api/runs returns 503 when the chosen provider is disabled", async () => {
++  await withHome(async () => {
++    saveProvider("alice", { id: "inception", apiKey: "test-key-123", enabled: false });
++    const res = await POST(
++      request("/api/runs", "alice", {
++        method: "POST",
++        body: JSON.stringify({ prompt: "do it", providerId: "inception" }),
++      }),
++    );
++    assert.equal(res.status, 503);
++    const body = (await res.json()) as Record<string, unknown>;
++    assert.match(String(body.error), /no usable key/);
++  });
++});
++
++// NOTE: the 201 path (a real run via RuntimeManager.start) is deliberately not
++// unit-tested here: starting a run provisions a Docker VM and calls a live
++// provider, which this environment cannot do. It is covered by the live-test
++// brief (deploy + run a real agent on the deployed site), not by unit tests.
+diff --git a/apps/swarmagents/app/api/runs/route.ts b/apps/swarmagents/app/api/runs/route.ts
+new file mode 100644
+index 000000000..96cca0e44
+--- /dev/null
++++ b/apps/swarmagents/app/api/runs/route.ts
+@@ -0,0 +1,202 @@
++/**
++ * Minimal UI runs: GET /api/runs (run history) and POST /api/runs (start a
++ * real agent run).
++ *
++ * GET returns the user's runs newest-first (limit 20) in the prototype's
++ * shape plus a static list of starter-prompt suggestions. Each run's
++ * currentStep/result/attachments come from its REAL durable telemetry log
++ * (lib/telemetry/run-log.ts) via `getRun` — nothing is fabricated. A run
++ * with no telemetry yet reports currentStep null and an empty result.
++ *
++ * POST starts a REAL run through RuntimeManager.start() — Docker VM,
++ * Claude Code CLI, the provider router — against the user's own saved
++ * providers (BYOK). The provider is the caller's explicit providerId when
++ * given (must be one of the user's saved providers), otherwise the user's
++ * highest-ranked usable saved provider. The model is the caller's explicit
++ * model when given (it must be served by one of the user's saved providers
++ * — the router resolves the provider from the model), otherwise the
++ * provider's default. durationSec is the run's real elapsed seconds at
++ * creation (0) — never a fixed estimate. When the user has no usable
++ * provider the route answers 503 with the gateway's own "No LLM providers
++ * are configured for this account" message and starts nothing.
++ *
++ * One run at a time per user: an active run (and queued prompts) are
++ * stopped first (the prototype's cancel-first behaviour), via the
++ * manager's safe-abort path.
++ *
++ * Responses are no-store.
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { USER_HEADER } from "@/lib/auth";
++import { JsonBodyError, readJsonBody } from "@/lib/http";
++import { getRun, listRuns } from "@/lib/runtime/run-store";
++import { getRuntimeManager } from "@/lib/runtime/manager";
++import { telemetryBus } from "@/lib/telemetry/bus";
++import { SUGGESTIONS } from "@/lib/minimal-ui/suggestions";
++import {
++  deriveCurrentStep,
++  runAttachments,
++  runResult,
++  terminalCurrentStep,
++  toMinimalRunShape,
++} from "@/lib/minimal-ui/feed";
++import {
++  configuredProviderFor,
++  defaultModelFor,
++  displayProviderName,
++  effectiveProviderFor,
++  isUsableProvider,
++  providerServingModel,
++} from "@/lib/minimal-ui/providers";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++const NO_STORE = { "Cache-Control": "no-store" } as const;
++const MAX_PROMPT_CHARS = 10_000;
++const MAX_ATTACHMENT_CHARS = 1_024;
++const MAX_ATTACHMENTS = 20;
++
++function caller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++export function GET(req: NextRequest): NextResponse {
++  const user = caller(req);
++  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++
++  const summaries = listRuns({ userId: user, limit: 20 });
++  const runs = [];
++  for (const summary of summaries) {
++    // Each run's current step + attachments come from its real telemetry
++    // log. The list is fetched on page load (the [id] route is the hot
++    // poll path), so a full log read per listed run is the right trade for
++    // correct steps/attachments. A run with no log yet falls back to the
++    // summary synthesis (terminal step, no attachments).
++    const detail = getRun(summary.runId);
++    const events = detail?.events ?? [];
++    const currentStep =
++      events.length > 0
++        ? deriveCurrentStep(events, summary.createdAt)
++        : terminalCurrentStep(summary);
++    runs.push(toMinimalRunShape(summary, currentStep, runResult(summary), runAttachments(events)));
++  }
++  return NextResponse.json({ runs, suggestions: SUGGESTIONS }, { headers: NO_STORE });
++}
++
++export async function POST(req: NextRequest): Promise<NextResponse> {
++  const user = caller(req);
++  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++
++  let body: unknown;
++  try {
++    body = await readJsonBody(req);
++  } catch (error) {
++    if (error instanceof JsonBodyError) {
++      return NextResponse.json({ error: error.message }, { status: error.status, headers: NO_STORE });
++    }
++    throw error;
++  }
++  const input = (body ?? {}) as Record<string, unknown>;
++  const prompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
++  if (!prompt) return NextResponse.json({ error: "prompt is required" }, { status: 400, headers: NO_STORE });
++  if (prompt.length > MAX_PROMPT_CHARS) {
++    return NextResponse.json(
++      { error: `prompt must be at most ${MAX_PROMPT_CHARS} characters` },
++      { status: 400, headers: NO_STORE },
++    );
++  }
++  const rawAttachments = Array.isArray(input.attachments) ? input.attachments : [];
++  if (rawAttachments.length > MAX_ATTACHMENTS) {
++    return NextResponse.json({ error: `too many attachments (max ${MAX_ATTACHMENTS})` }, { status: 400, headers: NO_STORE });
++  }
++  const attachments = rawAttachments.filter(
++    (a): a is string => typeof a === "string" && a.length > 0 && a.length <= MAX_ATTACHMENT_CHARS,
++  );
++  if (attachments.length !== rawAttachments.length) {
++    return NextResponse.json({ error: "attachments must be non-empty strings" }, { status: 400, headers: NO_STORE });
++  }
++  const providerId =
++    typeof input.providerId === "string" && input.providerId.length > 0 ? input.providerId : undefined;
++  const model = typeof input.model === "string" && input.model.length > 0 ? input.model : undefined;
++  if (model !== undefined && model.length > 200) {
++    return NextResponse.json({ error: "model is too long (max 200 characters)" }, { status: 400, headers: NO_STORE });
++  }
++
++  // Resolve the provider + model. The harness takes only a model — the
++  // router resolves the provider from it at call time — so a providerId
++  // override is expressed as that provider's default model. When the user
++  // has no usable provider at all the answer is the gateway's exact 503
++  // ("No LLM providers are configured for this account.") and nothing
++  // starts — the same gate as the LLM gateway, via the same usability test
++  // as `countUserProviders` (see `isUsableProvider`).
++  let providerName: string | null = null;
++  let effectiveModel: string | null = model ?? null;
++  if (providerId) {
++    const config = configuredProviderFor(user, providerId);
++    if (!config) return NextResponse.json({ error: `Unknown provider: ${providerId}` }, { status: 400, headers: NO_STORE });
++    if (!isUsableProvider(config)) {
++      return NextResponse.json(
++        { error: `Provider ${providerId} has no usable key configured` },
++        { status: 503, headers: NO_STORE },
++      );
++    }
++    providerName = displayProviderName(providerId);
++    if (!effectiveModel) {
++      effectiveModel = defaultModelFor(config);
++    } else {
++      // An explicit model with an explicit provider must be served by that
++      // provider; otherwise the router would silently pick another one.
++      const serves = providerServingModel(user, effectiveModel);
++      if (!serves || serves.providerId !== providerId) {
++        return NextResponse.json(
++          { error: `Provider ${providerId} does not serve model ${effectiveModel}` },
++          { status: 400, headers: NO_STORE },
++        );
++      }
++    }
++  } else if (effectiveModel) {
++    const serves = providerServingModel(user, effectiveModel);
++    if (!serves) {
++      return NextResponse.json(
++        { error: `No configured provider serves model ${effectiveModel}` },
++        { status: 400, headers: NO_STORE },
++      );
++    }
++    providerName = serves.providerName;
++  } else {
++    const effective = effectiveProviderFor(user);
++    if (!effective) {
++      return NextResponse.json(
++        { error: "No LLM providers are configured for this account." },
++        { status: 503, headers: NO_STORE },
++      );
++    }
++    providerName = effective.providerName;
++    effectiveModel = effective.model;
++  }
++
++  const manager = getRuntimeManager();
++  // One run at a time: stop whatever is active (and drop queued prompts) so
++  // the new run starts immediately instead of queueing behind the old one.
++  manager.cancel(user, undefined, "superseded");
++
++  // Start the run. The harness's default auto-approval behaviour applies
++  // (hard-deny and irreversible-external actions stay blocked by policy).
++  const result = manager.start(user, { prompt, model: effectiveModel ?? undefined });
++  if (!result.accepted) {
++    if (result.limit !== undefined) {
++      return NextResponse.json({ error: "Run queue is full." }, { status: 409, headers: NO_STORE });
++    }
++    return NextResponse.json({ error: result.error ?? "Could not start the run." }, { status: 503, headers: NO_STORE });
++  }
++  if (attachments.length > 0) {
++    telemetryBus.publish(result.runId, { type: "run.attachments", data: { attachments } });
++  }
++  return NextResponse.json(
++    { ok: true, id: result.runId, providerName, model: effectiveModel, durationSec: 0 },
++    { status: 201, headers: NO_STORE },
++  );
++}
+diff --git a/apps/swarmagents/app/globals.css b/apps/swarmagents/app/globals.css
+index d20f9a92a..b859eea11 100644
+--- a/apps/swarmagents/app/globals.css
++++ b/apps/swarmagents/app/globals.css
+@@ -1564,3 +1564,13 @@ body {
+ .scrollbar-thin { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.15) transparent; }
+ 
+ select option { background: #15151a; color: #eee; }
++
++/* ── Minimal 3-part main view (MinimalHome) — keyframes from the zip2 prototype ── */
++@keyframes fadeSlideIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
++@keyframes slideInRight { from { transform: translateX(24px); opacity: .6; } to { transform: translateX(0); opacity: 1; } }
++@keyframes pulseDot { 0%,100% { opacity: 1; transform: scale(1);} 50% { opacity: .45; transform: scale(.82);} }
++@keyframes blinkCursor { 0%,100%{opacity:1} 50%{opacity:0} }
++.feed-item { animation: fadeSlideIn .22s ease-out both; }
++.panel-in { animation: slideInRight .18s ease-out both; }
++.pulse-dot { animation: pulseDot 1.4s ease-in-out infinite; }
++.term-cursor { animation: blinkCursor 1s step-end infinite; }
+diff --git a/apps/swarmagents/lib/http.ts b/apps/swarmagents/lib/http.ts
+new file mode 100644
+index 000000000..eb012e3bd
+--- /dev/null
++++ b/apps/swarmagents/lib/http.ts
+@@ -0,0 +1,26 @@
++/**
++ * Minimal UI: small HTTP helpers shared by API routes.
++ *
++ * `readJsonBody` safely parses a request body. `JsonBodyError` carries the
++ * HTTP status + message the route should answer with — the caller maps it to a
++ * response (see app/api/runs/route.ts).
++ */
++
++export class JsonBodyError extends Error {
++  readonly status: number;
++
++  constructor(message: string, status = 400) {
++    super(message);
++    this.name = "JsonBodyError";
++    this.status = status;
++  }
++}
++
++/** Parse a request body as JSON, or throw `JsonBodyError(400)` on malformed input. */
++export async function readJsonBody(req: Request): Promise<unknown> {
++  try {
++    return await req.json();
++  } catch {
++    throw new JsonBodyError("Request body must be valid JSON.", 400);
++  }
++}
+diff --git a/apps/swarmagents/lib/minimal-ui/feed.test.ts b/apps/swarmagents/lib/minimal-ui/feed.test.ts
+new file mode 100644
+index 000000000..fbf96d7f2
+--- /dev/null
++++ b/apps/swarmagents/lib/minimal-ui/feed.test.ts
+@@ -0,0 +1,236 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import type { SequencedEvent } from "../telemetry/bus";
++import type { StoredRunSummary } from "../runtime/run-store";
++import {
++  buildFrame,
++  deriveCurrentStep,
++  eventsToSteps,
++  mapEventToStep,
++  mapRunStatus,
++  runAttachments,
++  runDurationSec,
++  runResult,
++  terminalCurrentStep,
++  toMinimalRunShape,
++} from "./feed";
++
++const T0 = 1_700_000_000_000;
++
++function ev(
++  seq: number,
++  type: string,
++  extra: Record<string, unknown> = {},
++  ts = T0 + seq * 1000,
++): SequencedEvent {
++  return { type, seq, runId: "run_1", ts, ...extra } as SequencedEvent;
++}
++
++function summary(over: Partial<StoredRunSummary> = {}): StoredRunSummary {
++  return {
++    runId: "run_1",
++    userId: "alice",
++    status: "running",
++    prompt: "do it",
++    createdAt: T0,
++    tokensIn: 0,
++    tokensOut: 0,
++    tokensCached: 0,
++    lastSeq: 0,
++    ...over,
++  };
++}
++
++test("steps map run lifecycle events to honest labels", () => {
++  assert.equal(mapEventToStep(ev(1, "run.created", { data: { prompt: "hi" } }), T0)?.label, "Run started");
++  assert.equal(
++    mapEventToStep(ev(2, "run.started", { model: "mercury-3", provider: "inception" }), T0)?.label,
++    "Agent started · inception / mercury-3",
++  );
++  assert.equal(
++    mapEventToStep(ev(3, "run.finished", { data: { durationMs: 65_000, costUsd: 0.03 } }), T0)?.label,
++    "Run completed in 1m 5s · $0.03",
++  );
++  assert.equal(mapEventToStep(ev(4, "run.error", { data: { message: "boom" } }), T0)?.label, "Run failed: boom");
++  assert.equal(mapEventToStep(ev(5, "run.cancelled"), T0)?.label, "Run stopped");
++  assert.equal(mapEventToStep(ev(6, "vm.ready", { data: { ms: 2400 } }), T0)?.label, "VM ready in 2.4s");
++  assert.equal(mapEventToStep(ev(7, "vm.starting"), T0)?.label, "Starting VM…");
++  assert.equal(mapEventToStep(ev(8, "run.queued", { data: { position: 2 } }), T0)?.label, "Queued at position 2");
++});
++
++test("steps carry the app + terminalLine/browserUrl/fileName fields", () => {
++  const bash = mapEventToStep(ev(1, "tool.call", { name: "Bash", input: { command: "npm run test:unit\nsecond line" } }), T0);
++  assert.equal(bash?.kind, "run");
++  assert.equal(bash?.app, "terminal");
++  assert.equal(bash?.label, "$ npm run test:unit");
++  assert.equal(bash?.terminalLine, "$ npm run test:unit");
++  const read = mapEventToStep(ev(2, "tool.call", { name: "Read", input: { file_path: "/src/app.ts" } }), T0);
++  assert.equal(read?.kind, "read");
++  assert.equal(read?.app, "editor");
++  assert.equal(read?.label, "Read /src/app.ts");
++  assert.equal(read?.fileName, "/src/app.ts");
++  const action = mapEventToStep(
++    ev(3, "computer.action", { action: "Clicked Publish", url: "https://example.com" }),
++    T0,
++  );
++  assert.equal(action?.kind, "click");
++  assert.equal(action?.app, "browser");
++  assert.equal(action?.browserUrl, "https://example.com");
++  const type = mapEventToStep(ev(4, "computer.action", { action: "Typed hello" }), T0);
++  assert.equal(type?.kind, "type");
++  assert.equal(type?.app, "desktop");
++});
++
++test("steps show llm routing, skip text and usage, keep failures", () => {
++  const llm = mapEventToStep(
++    ev(1, "llm.call", { data: { provider: "inception", model: "mercury-3", outcome: "ok", latencyMs: 1200, attempt: 1 } }),
++    T0,
++  );
++  assert.equal(llm?.label, "LLM inception / mercury-3 · ok");
++  assert.equal(llm?.detail, "attempt 1 · 1.2s");
++  const routed = mapEventToStep(ev(2, "route.decision", { data: { chosen: { provider: "groq", model: "gpt-oss-120b" } } }), T0);
++  assert.equal(routed?.label, "Routed to groq / gpt-oss-120b");
++  const failover = mapEventToStep(
++    ev(3, "route.failover", { data: { from: { provider: "a" }, to: { provider: "b" }, reason: "429" } }),
++    T0,
++  );
++  assert.equal(failover?.label, "Failover a → b (429)");
++  assert.equal(mapEventToStep(ev(4, "assistant.text", { text: "hello" }), T0), null);
++  assert.equal(mapEventToStep(ev(5, "usage", { inputTokens: 10 }), T0), null);
++  assert.equal(mapEventToStep(ev(6, "tool.result", { ok: true }), T0), null);
++  assert.equal(mapEventToStep(ev(7, "tool.result", { ok: false }), T0)?.label, "Tool call failed");
++  assert.equal(mapEventToStep(ev(8, "run.attachments", { data: { attachments: ["a.txt"] } }), T0), null);
++});
++
++test("steps render unknown event types as their real type, never drop them", () => {
++  const step = mapEventToStep(ev(1, "something.new", { data: { x: 1 } }), T0);
++  assert.equal(step?.label, "something.new");
++  assert.equal(step?.kind, "run");
++});
++
++test("steps truncate shell output to its first line", () => {
++  const step = mapEventToStep(ev(1, "shell.output", { data: { stream: "stdout", text: "\n\n  hello world\nsecond line\n" } }), T0);
++  assert.equal(step?.label, "hello world");
++  assert.equal(step?.terminalLine, "hello world");
++  assert.equal(mapEventToStep(ev(2, "shell.output", { data: { text: "   \n" } }), T0), null);
++});
++
++test("eventsToSteps keeps steps in order and drops non-steps", () => {
++  const steps = eventsToSteps(
++    [
++      ev(1, "run.created", { data: { prompt: "x" } }),
++      ev(2, "assistant.text", { text: "nope" }),
++      ev(3, "tool.call", { name: "Bash", input: { command: "ls" } }),
++    ],
++    T0,
++  );
++  assert.equal(steps.length, 2);
++  assert.equal(steps[0].label, "Run started");
++  assert.equal(steps[1].label, "$ ls");
++  assert.equal(steps[0].atOffsetSec, 1);
++  assert.equal(steps[1].atOffsetSec, 3);
++});
++
++test("buildFrame follows the latest steps", () => {
++  const steps = eventsToSteps(
++    [
++      ev(1, "run.created", { data: { prompt: "x" } }),
++      ev(2, "tool.call", { name: "Bash", input: { command: "npm test" } }),
++      ev(3, "computer.action", { action: "Clicked Publish", url: "https://example.com" }),
++      ev(4, "tool.call", { name: "Read", input: { file_path: "/src/app.ts" } }),
++    ],
++    T0,
++  );
++  const frame = buildFrame(steps, T0, null, T0 + 45_000);
++  assert.equal(frame.app, "editor");
++  assert.equal(frame.browserUrl, "https://example.com");
++  assert.equal(frame.fileName, "/src/app.ts");
++  assert.deepEqual(frame.terminalLines, ["$ npm test"]);
++  assert.equal(frame.elapsed, 45);
++});
++
++test("buildFrame with no steps is an honest empty desktop frame", () => {
++  const frame = buildFrame([], T0, null, T0 + 5_000);
++  assert.equal(frame.app, "desktop");
++  assert.equal(frame.browserUrl, null);
++  assert.equal(frame.fileName, null);
++  assert.deepEqual(frame.terminalLines, []);
++  assert.equal(frame.elapsed, 5);
++  assert.equal(frame.screenshot, undefined);
++});
++
++test("deriveCurrentStep is the latest step label, null with no steps", () => {
++  assert.equal(deriveCurrentStep([], T0), null);
++  assert.equal(deriveCurrentStep([ev(1, "assistant.text", { text: "x" })], T0), null);
++  assert.equal(
++    deriveCurrentStep(
++      [
++        ev(1, "run.created", { data: { prompt: "x" } }),
++        ev(2, "tool.call", { name: "Bash", input: { command: "npm test" } }),
++      ],
++      T0,
++    ),
++    "$ npm test",
++  );
++});
++
++test("mapRunStatus uses the prototype vocabulary", () => {
++  assert.equal(mapRunStatus("finished"), "completed");
++  assert.equal(mapRunStatus("cancelled"), "stopped");
++  assert.equal(mapRunStatus("error"), "stopped");
++  assert.equal(mapRunStatus("running"), "running");
++});
++
++test("runResult is the final text, an error, or a stop note", () => {
++  assert.equal(runResult(summary({ status: "finished", finalText: "All done." })), "All done.");
++  assert.equal(runResult(summary({ status: "finished" })), null);
++  assert.equal(runResult(summary({ status: "error", error: "boom" })), "boom");
++  assert.equal(runResult(summary({ status: "cancelled", cancelledReason: "user" })), "Run stopped by you.");
++  assert.equal(
++    runResult(summary({ status: "cancelled", cancelledReason: "superseded" })),
++    "Run stopped — replaced by a newer run.",
++  );
++  assert.equal(runResult(summary({ status: "running" })), null);
++});
++
++test("runDurationSec is real elapsed seconds", () => {
++  assert.equal(runDurationSec(summary({ createdAt: T0, finishedAt: T0 + 65_000 }), T0 + 70_000), 65);
++  assert.equal(runDurationSec(summary({ createdAt: T0 }), T0 + 5_000), 5);
++  // The harness's measured duration wins over the wall-clock span.
++  assert.equal(runDurationSec(summary({ createdAt: T0, finishedAt: T0 + 1_000, durationMs: 65_000 }), T0 + 70_000), 65);
++});
++
++test("runAttachments reads the run.attachments event", () => {
++  assert.deepEqual(
++    runAttachments([ev(1, "run.attachments", { data: { attachments: ["a.txt", "b.png"] } })]),
++    ["a.txt", "b.png"],
++  );
++  assert.deepEqual(runAttachments([ev(1, "run.created", { data: { prompt: "x" } })]), []);
++});
++
++test("terminalCurrentStep comes from the summary alone", () => {
++  assert.equal(
++    terminalCurrentStep(summary({ status: "finished", durationMs: 65_000, costUsd: 0.03 })),
++    "Run completed in 1m 5s · $0.03",
++  );
++  assert.equal(terminalCurrentStep(summary({ status: "error", error: "boom" })), "Run failed: boom");
++  assert.equal(terminalCurrentStep(summary({ status: "cancelled" })), "Run stopped");
++  assert.equal(terminalCurrentStep(summary({ status: "running" })), null);
++});
++
++test("toMinimalRunShape builds the list/detail run shape", () => {
++  const shape = toMinimalRunShape(
++    summary({ status: "finished", provider: "inception", model: "mercury-3", finalText: "done", durationMs: 65_000 }),
++    "Run completed in 1m 5s",
++    "done",
++    ["a.txt"],
++  );
++  assert.equal(shape.id, "run_1");
++  assert.equal(shape.status, "completed");
++  assert.equal(shape.providerName, "Inception (Mercury)");
++  assert.equal(shape.model, "mercury-3");
++  assert.equal(shape.currentStep, "Run completed in 1m 5s");
++  assert.equal(shape.result, "done");
++  assert.equal(shape.durationSec, 65);
++  assert.deepEqual(shape.attachments, ["a.txt"]);
++});
+diff --git a/apps/swarmagents/lib/minimal-ui/feed.ts b/apps/swarmagents/lib/minimal-ui/feed.ts
+new file mode 100644
+index 000000000..52d880c79
+--- /dev/null
++++ b/apps/swarmagents/lib/minimal-ui/feed.ts
+@@ -0,0 +1,497 @@
++/**
++ * Minimal UI: map a run's REAL durable telemetry events to the step list,
++ * activity frame, and run summary the minimal main view renders.
++ *
++ * Source of truth is the persisted per-run JSONL telemetry log
++ * (`lib/telemetry/run-log.ts`, written by `TelemetryBus` with `persist: true`).
++ * Nothing here invents events: an event type this mapper does not recognise
++ * renders with its real type name as the label, and an event with no
++ * human-readable content is dropped from the step list (its data stays in
++ * the log). `assistant.text` events never become steps — they become the
++ * run's `result` (final text) instead.
++ *
++ * Two event shapes exist in the log and both are handled:
++ * - bus-style `{ type, data: {...} }` (run.created, llm.call, route.*,
++ *   vm.*, run.mode, …)
++ * - harness-style flat fields (tool.call `{name, input}`, assistant.text
++ *   `{text}`, computer.action `{action, …}`, run.started `{model, provider}`,
++ *   …)
++ *
++ * Status vocabulary follows the prototype: "running" | "completed" |
++ * "stopped" (real "finished" -> "completed", "cancelled"/"error" ->
++ * "stopped"; "queued"/"paused" read as "running" — neither is terminal).
++ */
++
++import type { SequencedEvent } from "../telemetry/bus";
++import type { StoredRunSummary } from "../runtime/run-store";
++import { displayProviderName } from "./providers";
++
++export type FrameApp = "desktop" | "terminal" | "browser" | "editor";
++
++export type RunEventKind =
++  | "start"
++  | "screen"
++  | "click"
++  | "type"
++  | "scroll"
++  | "read"
++  | "run"
++  | "done";
++
++export interface MinimalRunEvent {
++  id: string;
++  seq: number;
++  kind: RunEventKind;
++  label: string;
++  detail: string | null;
++  app: FrameApp;
++  atOffsetSec: number;
++  browserUrl: string | null;
++  fileName: string | null;
++  terminalLine: string | null;
++}
++
++export interface RunFrame {
++  app: FrameApp;
++  browserUrl: string | null;
++  fileName: string | null;
++  terminalLines: string[];
++  elapsed: number;
++  screenshot?: string;
++}
++
++/** Prototype status vocabulary. */
++export type MinimalRunStatus = "running" | "completed" | "stopped";
++
++export function mapRunStatus(status: StoredRunSummary["status"]): MinimalRunStatus {
++  if (status === "finished") return "completed";
++  if (status === "cancelled" || status === "error") return "stopped";
++  return "running";
++}
++
++const MAX_LABEL_CHARS = 200;
++const MAX_DETAIL_CHARS = 500;
++const MAX_RESULT_CHARS = 4000;
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++/** Read a field from either the bus-style `data` object or flat top-level fields. */
++function field(event: SequencedEvent, name: string): unknown {
++  const data = (event as { data?: unknown }).data;
++  if (isRecord(data) && data[name] !== undefined) return data[name];
++  return (event as unknown as Record<string, unknown>)[name];
++}
++
++function str(value: unknown): string | undefined {
++  return typeof value === "string" && value.length > 0 ? value : undefined;
++}
++
++function num(value: unknown): number | undefined {
++  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
++}
++
++function truncate(text: string, max = MAX_LABEL_CHARS): string {
++  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
++}
++
++function firstLine(text: string, max = 160): string | undefined {
++  const line = text
++    .split("\n")
++    .map((l) => l.trim())
++    .find((l) => l.length > 0);
++  return line ? truncate(line, max) : undefined;
++}
++
++function formatDuration(ms: number): string {
++  const s = Math.max(0, Math.round(ms / 1000));
++  if (s < 60) return `${s}s`;
++  const m = Math.floor(s / 60);
++  if (m < 60) return `${m}m ${s % 60}s`;
++  return `${Math.floor(m / 60)}h ${m % 60}m`;
++}
++
++function describeToolCall(name: string, input: unknown): { label: string; detail: string | null } {
++  if (!isRecord(input)) return { label: name || "Tool call", detail: null };
++  const command = str(input.command);
++  if (command) {
++    return { label: `$ ${truncate(firstLine(command, 120) ?? command, 120)}`, detail: truncate(command, MAX_DETAIL_CHARS) };
++  }
++  const filePath = str(input.file_path) ?? str(input.path) ?? str(input.filePath);
++  if (filePath) return { label: `${name} ${truncate(filePath, 120)}`, detail: null };
++  const url = str(input.url);
++  if (url) return { label: `${name} ${truncate(url, 120)}`, detail: null };
++  return { label: name || "Tool call", detail: null };
++}
++
++function fileNameOf(input: unknown): string | null {
++  if (!isRecord(input)) return null;
++  return str(input.file_path) ?? str(input.path) ?? str(input.filePath) ?? str(input.pattern) ?? null;
++}
++
++/**
++ * Map one persisted telemetry event to a step, or null when the event carries
++ * nothing the step list should show (assistant text, usage counters,
++ * successful tool results, run metadata — all still in the log).
++ */
++export function mapEventToStep(event: SequencedEvent, runCreatedAtMs: number): MinimalRunEvent | null {
++  const atOffsetSec = Math.max(0, Math.floor((event.ts - runCreatedAtMs) / 1000));
++  const base = {
++    id: `ev-${event.seq}`,
++    seq: event.seq,
++    atOffsetSec,
++    browserUrl: null as string | null,
++    fileName: null as string | null,
++    terminalLine: null as string | null,
++  };
++  const step = (
++    kind: RunEventKind,
++    label: string,
++    app: FrameApp,
++    detail: string | null = null,
++    extra: Partial<MinimalRunEvent> = {},
++  ): MinimalRunEvent => ({ ...base, kind, label, detail, app, ...extra });
++
++  switch (event.type) {
++    case "run.created": {
++      const prompt = str(field(event, "prompt")) ?? "";
++      return step("start", "Run started", "desktop", prompt ? truncate(prompt, 90) : null);
++    }
++    case "run.queued": {
++      const position = num(field(event, "position"));
++      return step("start", position ? `Queued at position ${position}` : "Run queued", "desktop");
++    }
++    case "run.mode": {
++      const label = str(field(event, "label"));
++      return step("run", label ? `Mode: ${label}` : "Run mode set", "desktop");
++    }
++    case "run.started": {
++      const provider = str(field(event, "provider"));
++      const model = str(field(event, "model"));
++      const where = [provider, model].filter(Boolean).join(" / ");
++      return step("start", where ? `Agent started · ${where}` : "Agent started", "desktop");
++    }
++    case "run.finished": {
++      const ms = num(field(event, "durationMs"));
++      const cost = num(field(event, "costUsd"));
++      let label = "Run completed";
++      if (ms !== undefined) label += ` in ${formatDuration(ms)}`;
++      if (cost !== undefined && cost > 0) label += ` · $${cost.toFixed(2)}`;
++      return step("done", label, "desktop");
++    }
++    case "run.error": {
++      const message = str(field(event, "message")) ?? "unknown error";
++      return step("done", `Run failed: ${truncate(message)}`, "desktop");
++    }
++    case "run.cancelled":
++      return step("done", "Run stopped", "desktop");
++    case "run.paused":
++      return step("run", "Run paused", "desktop");
++    case "run.attachments":
++      return null;
++    case "vm.starting":
++      return step("screen", "Starting VM…", "desktop");
++    case "vm.ready": {
++      const ms = num(field(event, "ms")) ?? num(field(event, "durationMs"));
++      return step("screen", ms !== undefined ? `VM ready in ${(ms / 1000).toFixed(1)}s` : "VM ready", "desktop");
++    }
++    case "vm.error": {
++      const message = str(field(event, "message")) ?? "unknown VM error";
++      return step("screen", `VM error: ${truncate(message)}`, "desktop");
++    }
++    case "shell.output": {
++      const text = str(field(event, "text"));
++      if (!text) return null;
++      const line = firstLine(text);
++      if (!line) return null;
++      return step("run", line, "terminal", null, { terminalLine: line });
++    }
++    case "tool.call": {
++      const name = str(field(event, "name")) ?? "";
++      const input = field(event, "input");
++      if (name === "Bash") {
++        const { label, detail } = describeToolCall(name, input);
++        return step("run", label, "terminal", detail, { terminalLine: label });
++      }
++      if (name === "Read" || name === "Glob" || name === "Grep") {
++        const file = fileNameOf(input);
++        const label =
++          name === "Grep"
++            ? `Searched ${truncate(file ?? "", 120)}`
++            : name === "Glob"
++              ? `Listed ${truncate(file ?? "", 120)}`
++              : `Read ${truncate(file ?? "", 120)}`;
++        return step("read", label, "editor", null, { fileName: file });
++      }
++      if (name === "Write" || name === "Edit") {
++        const file = fileNameOf(input);
++        const label = name === "Edit" ? `Edited ${truncate(file ?? "", 120)}` : `Wrote ${truncate(file ?? "", 120)}`;
++        return step("run", label, "editor", null, { fileName: file });
++      }
++      const { label, detail } = describeToolCall(name, input);
++      return step("run", label, "desktop", detail);
++    }
++    case "tool.result": {
++      if (field(event, "ok") === false) return step("run", "Tool call failed", "desktop");
++      return null;
++    }
++    case "tool.blocked": {
++      const name = str(field(event, "name")) ?? "tool call";
++      const reason = str(field(event, "reason"));
++      return step("run", reason ? `Blocked ${name}: ${truncate(reason, 120)}` : `Blocked ${name}`, "desktop");
++    }
++    case "tool.backgrounded": {
++      const command = str(field(event, "command")) ?? "";
++      const line = firstLine(command, 120) ?? command;
++      return step("run", `Backgrounded: ${truncate(line, 120)}`, "terminal", null, {
++        terminalLine: `$ ${truncate(line, 120)}`,
++      });
++    }
++    case "computer.action": {
++      const action = str(field(event, "action")) ?? "Screen action";
++      const url = str(field(event, "url")) ?? null;
++      const target = str(field(event, "target")) ?? null;
++      const kind: RunEventKind = /^type/i.test(action) || /^press/i.test(action)
++        ? "type"
++        : /^scroll/i.test(action)
++          ? "scroll"
++          : "click";
++      return step(kind, action, url ? "browser" : "desktop", target, { browserUrl: url });
++    }
++    case "assistant.text":
++    case "usage":
++      return null;
++    case "llm.call": {
++      const provider = str(field(event, "provider")) ?? "?";
++      const model = str(field(event, "model")) ?? "?";
++      const outcome = str(field(event, "outcome")) ?? "";
++      const latency = num(field(event, "latencyMs"));
++      const attempt = num(field(event, "attempt"));
++      let label = `LLM ${provider} / ${model}`;
++      if (outcome) label += ` · ${outcome}`;
++      const detail =
++        attempt !== undefined || latency !== undefined
++          ? [`attempt ${attempt ?? "?"}`, latency !== undefined ? `${(latency / 1000).toFixed(1)}s` : null]
++              .filter(Boolean)
++              .join(" · ")
++          : null;
++      return step("run", label, "desktop", detail);
++    }
++    case "route.decision": {
++      const chosen = field(event, "chosen");
++      if (isRecord(chosen)) {
++        const provider = str(chosen.provider) ?? "?";
++        const model = str(chosen.model) ?? "?";
++        return step("run", `Routed to ${provider} / ${model}`, "desktop");
++      }
++      return step("run", "Routing…", "desktop");
++    }
++    case "route.failover": {
++      const from = field(event, "from");
++      const to = field(event, "to");
++      const reason = str(field(event, "reason")) ?? "";
++      const fromName = isRecord(from) ? (str(from.provider) ?? "?") : "?";
++      const toName = isRecord(to) ? (str(to.provider) ?? "?") : "?";
++      return step("run", reason ? `Failover ${fromName} → ${toName} (${reason})` : `Failover ${fromName} → ${toName}`, "desktop");
++    }
++    case "route.demoted": {
++      const provider = str(field(event, "provider")) ?? "?";
++      const reason = str(field(event, "reason")) ?? "";
++      return step("run", reason ? `Demoted ${provider} (${reason})` : `Demoted ${provider}`, "desktop");
++    }
++    case "capability.changed": {
++      const label = str(field(event, "label")) ?? str(field(event, "summary")) ?? "Capability changed";
++      return step("run", label, "desktop");
++    }
++    case "role.changed": {
++      const from = field(event, "from");
++      const to = field(event, "to");
++      const fromName = isRecord(from) ? (str(from.name) ?? str(from.id) ?? "?") : "?";
++      const toName = isRecord(to) ? (str(to.name) ?? str(to.id) ?? "?") : "?";
++      return step("run", `Role: ${fromName} → ${toName}`, "desktop");
++    }
++    case "approval.required":
++    case "approval.requested": {
++      const name = str(field(event, "name")) ?? str(field(event, "tool")) ?? "tool call";
++      return step("run", `Approval needed: ${name}`, "desktop");
++    }
++    case "approval.resolved": {
++      const verdict = str(field(event, "verdict")) ?? "";
++      return step("run", verdict ? `Approval ${verdict}` : "Approval resolved", "desktop");
++    }
++    case "approval.timeout":
++      return step("run", "Approval timed out", "desktop");
++    case "question.required":
++      return step("run", "Agent asked a question", "desktop");
++    case "question.resolved": {
++      const status = str(field(event, "status")) ?? "";
++      return step("run", status ? `Question ${status}` : "Question resolved", "desktop");
++    }
++    case "handoff.required":
++      return step("run", "Handoff requested", "desktop");
++    case "handoff.resolved": {
++      const status = str(field(event, "status")) ?? "";
++      return step("run", status ? `Handoff ${status}` : "Handoff resolved", "desktop");
++    }
++    case "checkpoint.created": {
++      const label = str(field(event, "label")) ?? "";
++      return step("run", label ? `Checkpoint ${label}` : "Checkpoint created", "desktop");
++    }
++    case "checkpoint.failed": {
++      const message = str(field(event, "message")) ?? "";
++      return step("run", message ? `Checkpoint failed: ${truncate(message)}` : "Checkpoint failed", "desktop");
++    }
++    default:
++      // Never silently drop a real event: unknown types render as their type.
++      return step("run", event.type, "desktop");
++  }
++}
++
++/** Map a run's events to steps, oldest first. */
++export function eventsToSteps(
++  events: readonly SequencedEvent[],
++  runCreatedAtMs: number,
++): MinimalRunEvent[] {
++  const steps: MinimalRunEvent[] = [];
++  for (const event of events) {
++    const step = mapEventToStep(event, runCreatedAtMs);
++    if (step) steps.push(step);
++  }
++  return steps;
++}
++
++/** What the agent is doing right now, from the most recent step. Null when nothing has happened yet. */
++export function deriveCurrentStep(events: readonly SequencedEvent[], runCreatedAtMs: number): string | null {
++  const steps = eventsToSteps(events, runCreatedAtMs);
++  return steps.length > 0 ? steps[steps.length - 1].label : null;
++}
++
++/** Current step for a terminal run, from the summary alone (no log read needed). */
++export function terminalCurrentStep(summary: StoredRunSummary): string | null {
++  if (summary.status === "finished") {
++    const ms = summary.durationMs;
++    const cost = summary.costUsd;
++    let label = "Run completed";
++    if (ms !== undefined) label += ` in ${formatDuration(ms)}`;
++    if (cost !== undefined && cost > 0) label += ` · $${cost.toFixed(2)}`;
++    return label;
++  }
++  if (summary.status === "error") return `Run failed: ${truncate(summary.error ?? "unknown error")}`;
++  if (summary.status === "cancelled") return "Run stopped";
++  return null;
++}
++
++/** The run shape the minimal UI's list + detail routes return. */
++export interface MinimalRunShape {
++  id: string;
++  prompt: string;
++  status: MinimalRunStatus;
++  providerName: string | null;
++  model: string | null;
++  currentStep: string | null;
++  result: string | null;
++  createdAt: number;
++  durationSec: number;
++  attachments: string[];
++}
++
++/** Build a run shape from its stored summary + derived step/result/attachments. */
++export function toMinimalRunShape(
++  summary: StoredRunSummary,
++  currentStep: string | null,
++  result: string | null,
++  attachments: string[],
++): MinimalRunShape {
++  return {
++    id: summary.runId,
++    prompt: summary.prompt,
++    status: mapRunStatus(summary.status),
++    providerName: summary.provider ? displayProviderName(summary.provider) : null,
++    model: summary.model ?? null,
++    currentStep,
++    result,
++    createdAt: summary.createdAt,
++    durationSec: runDurationSec(summary, Date.now()),
++    attachments,
++  };
++}
++
++/** The run's result text: the assistant's final text, an error, or a stop note. Null while running. */
++export function runResult(summary: StoredRunSummary): string | null {
++  if (summary.status === "finished") {
++    return summary.finalText ? truncate(summary.finalText, MAX_RESULT_CHARS) : null;
++  }
++  if (summary.status === "error") return summary.error ?? "Run failed.";
++  if (summary.status === "cancelled") {
++    if (summary.cancelledReason === "superseded") return "Run stopped — replaced by a newer run.";
++    if (summary.cancelledReason === "shutdown") return "Run stopped (server shutdown).";
++    return "Run stopped by you.";
++  }
++  return null;
++}
++
++/**
++ * Real elapsed seconds: the harness's own measured duration when present,
++ * otherwise finishedAt (or now for a live run) minus createdAt.
++ */
++export function runDurationSec(summary: StoredRunSummary, nowMs: number): number {
++  if (summary.durationMs !== undefined) return Math.max(0, Math.floor(summary.durationMs / 1000));
++  const end = summary.finishedAt ?? nowMs;
++  return Math.max(0, Math.floor((end - summary.createdAt) / 1000));
++}
++
++/**
++ * Attachments recorded for the run (a `run.attachments` event published at
++ * start time — see POST /api/runs). Empty when the run has none.
++ */
++export function runAttachments(events: readonly SequencedEvent[]): string[] {
++  for (const event of events) {
++    if (event.type !== "run.attachments") continue;
++    const data = (event as { data?: unknown }).data;
++    if (isRecord(data) && Array.isArray(data.attachments)) {
++      return data.attachments.filter((a): a is string => typeof a === "string");
++    }
++  }
++  return [];
++}
++
++/**
++ * Build the live screen frame from a run's steps — same construction as the
++ * prototype's [id] route: app = current step's app, browserUrl/fileName =
++ * latest seen, terminalLines = every terminal line, elapsed = seconds since
++ * the run started. When nothing has been seen yet the fields are null/empty
++ * (never placeholder text — the UI renders an honest empty state).
++ */
++export function buildFrame(
++  steps: readonly MinimalRunEvent[],
++  runCreatedAtMs: number,
++  finishedAtMs: number | null,
++  nowMs: number,
++  durationMs?: number,
++): RunFrame {
++  const current = steps[steps.length - 1];
++  let browserUrl: string | null = null;
++  let fileName: string | null = null;
++  for (let i = steps.length - 1; i >= 0; i--) {
++    if (browserUrl === null && steps[i].browserUrl) browserUrl = steps[i].browserUrl;
++    if (fileName === null && steps[i].fileName) fileName = steps[i].fileName;
++    if (browserUrl !== null && fileName !== null) break;
++  }
++  const terminalLines = steps
++    .map((s) => s.terminalLine)
++    .filter((l): l is string => l !== null);
++  // The harness's measured duration is the real elapsed for a finished run;
++  // otherwise it is the wall-clock span from creation.
++  const elapsed =
++    durationMs !== undefined
++      ? Math.max(0, Math.floor(durationMs / 1000))
++      : Math.max(0, Math.floor(((finishedAtMs ?? nowMs) - runCreatedAtMs) / 1000));
++  return {
++    app: current?.app ?? "desktop",
++    browserUrl,
++    fileName,
++    terminalLines,
++    elapsed,
++  };
++}
+diff --git a/apps/swarmagents/lib/minimal-ui/providers.ts b/apps/swarmagents/lib/minimal-ui/providers.ts
+new file mode 100644
+index 000000000..dcd4cc1f4
+--- /dev/null
++++ b/apps/swarmagents/lib/minimal-ui/providers.ts
+@@ -0,0 +1,106 @@
++/**
++ * Minimal UI: resolve which provider (and model) a run should use, from the
++ * user's own saved BYOK providers — never from host env.
++ *
++ * The effective provider is the user's highest-ranked usable saved provider
++ * (rank ascends = tried first; that is the router's own user-rank tiebreaker
++ * — see `orderLlmCandidates` in lib/providers/router.ts). A saved provider
++ * is usable when it is enabled and either holds a key or is a keyless local
++ * provider — the same test as `countUserProviders` in lib/providers/store.ts,
++ * which is the authority for the "no providers" 503.
++ *
++ * Model choice: the caller's explicit model wins; otherwise the provider's
++ * catalog default (the BYOK fix points Inception at mercury-3), then a saved
++ * tier model.
++ */
++
++import { catalogEntry } from "../providers/catalog";
++import type { ProviderConfig } from "../providers/types";
++import { readConfiguredProviders } from "../providers/store";
++
++export interface EffectiveProvider {
++  providerId: string;
++  providerName: string;
++  model: string | null;
++}
++
++/** Display name for a provider id (catalog name, else the id itself). */
++export function displayProviderName(providerId: string): string {
++  return catalogEntry(providerId)?.name ?? providerId;
++}
++
++/** Same usability test as `countUserProviders` (lib/providers/store.ts). */
++export function isUsableProvider(config: ProviderConfig): boolean {
++  return (
++    config.enabled !== false &&
++    ((config.keys?.length ?? 0) > 0 || catalogEntry(config.id)?.isLocal === true)
++  );
++}
++
++export function defaultModelFor(config: ProviderConfig): string | null {
++  const entry = catalogEntry(config.id);
++  if (entry?.models?.default) return entry.models.default;
++  const models = config.models;
++  if (models) {
++    if (models.balanced) return models.balanced;
++    if (models.fast) return models.fast;
++    if (models.deep) return models.deep;
++  }
++  return null;
++}
++
++/**
++ * The provider a run should use when the caller does not pick one: the
++ * user's highest-ranked usable saved provider. Null when the user has no
++ * usable provider (the caller must answer 503 — see `countUserProviders`).
++ */
++export function effectiveProviderFor(userId: string): EffectiveProvider | null {
++  const usable = readConfiguredProviders(userId).filter(isUsableProvider);
++  if (usable.length === 0) return null;
++  const ordered = [...usable].sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity));
++  const first = ordered[0];
++  return {
++    providerId: first.id,
++    providerName: displayProviderName(first.id),
++    model: defaultModelFor(first),
++  };
++}
++
++/** Look a saved provider up by id (for a caller's explicit providerId override). */
++export function configuredProviderFor(userId: string, providerId: string): ProviderConfig | null {
++  const found = readConfiguredProviders(userId).find((c) => c.id === providerId);
++  return found ?? null;
++}
++
++/** Models a saved provider is known to serve: catalog default/popular + saved tier models. */
++export function modelsServedBy(config: ProviderConfig): string[] {
++  const served = new Set<string>();
++  const entry = catalogEntry(config.id);
++  if (entry?.models?.default) served.add(entry.models.default);
++  if (entry?.models?.popular) {
++    for (const m of entry.models.popular) served.add(m);
++  }
++  const models = config.models;
++  if (models) {
++    for (const tier of Object.values(models)) {
++      if (tier) served.add(tier);
++    }
++  }
++  return [...served];
++}
++
++/**
++ * The user's highest-ranked usable saved provider that serves a model
++ * (the router resolves the provider from the model at call time, so this
++ * is how an explicit model override is validated + named). Null when no
++ * usable saved provider serves it.
++ */
++export function providerServingModel(userId: string, model: string): EffectiveProvider | null {
++  const usable = readConfiguredProviders(userId)
++    .filter(isUsableProvider)
++    .filter((c) => modelsServedBy(c).includes(model));
++  if (usable.length === 0) return null;
++  const ordered = [...usable].sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity));
++  const first = ordered[0];
++  return { providerId: first.id, providerName: displayProviderName(first.id), model };
++}
+diff --git a/apps/swarmagents/lib/minimal-ui/screenshot.ts b/apps/swarmagents/lib/minimal-ui/screenshot.ts
+new file mode 100644
+index 000000000..db652b078
+--- /dev/null
++++ b/apps/swarmagents/lib/minimal-ui/screenshot.ts
+@@ -0,0 +1,54 @@
++/**
++ * Minimal UI: capture the live VM desktop frame, when one is attached.
++ *
++ * Uses the SAME mechanism as the pre-existing
++ * GET /api/runtime/vm/screenshot route: `scrot` grabs the current X
++ * display (:1) inside the user's own VM and the driver reads the file
++ * back. A frame is only produced when the VM is running; otherwise this
++ * returns null and the caller omits the screenshot (the UI renders the
++ * telemetry lines instead). A null here is an honest "no VM attached",
++ * never a placeholder image.
++ *
++ * The frame is returned as a data URL so the UI can render it without a
++ * second fetch. Frames can be large, so callers must not poll this path
++ * at high frequency; the [id] route is the only caller and it only
++ * attempts a capture for a live run.
++ */
++
++import { randomUUID } from "node:crypto";
++import { getVmManager } from "../vm/manager";
++import { DESKTOP_DISPLAY } from "../vm/docker-driver";
++
++/** Per-request frame path inside the VM: never a shared /tmp file. The 1600x900 desktop frame as PNG is well under 2 MB. */
++const SCREENSHOT_PREFIX = "/tmp/swarm-desktop-frame-";
++const MAX_SCREENSHOT_BYTES = 4 * 1024 * 1024;
++
++/** Return a data URL for the VM's current desktop frame, or null when no VM is attached. */
++export async function captureDesktopFrame(userId: string): Promise<string | null> {
++  const vm = getVmManager();
++  try {
++    const state = await vm.status(userId);
++    // Only a running VM has a live desktop to capture.
++    if (state.status !== "running") return null;
++    const screenshotPath = `${SCREENSHOT_PREFIX}${randomUUID()}.png`;
++    const exec = await vm.exec(userId, ["scrot", "-o", screenshotPath], {
++      env: { DISPLAY: DESKTOP_DISPLAY },
++    });
++    if (exec.exitCode !== 0) return null;
++    let file;
++    try {
++      file = await vm.readFileBytes(userId, screenshotPath, MAX_SCREENSHOT_BYTES);
++    } finally {
++      // Delete the frame inside the VM immediately after the read, even if
++      // the read failed. Best effort: a VM that just died has nothing to
++      // clean up.
++      await vm.exec(userId, ["rm", "-f", "--", screenshotPath]).catch(() => undefined);
++    }
++    if (file.content.byteLength === 0) return null;
++    return `data:image/png;base64,${Buffer.from(file.content).toString("base64")}`;
++  } catch {
++    // Any failure (VM missing, unsupported driver, quota, …) degrades to
++    // the "no frame" case rather than surfacing an error.
++    return null;
++  }
++}
+diff --git a/apps/swarmagents/lib/minimal-ui/suggestions.ts b/apps/swarmagents/lib/minimal-ui/suggestions.ts
+new file mode 100644
+index 000000000..da4b6015d
+--- /dev/null
++++ b/apps/swarmagents/lib/minimal-ui/suggestions.ts
+@@ -0,0 +1,19 @@
++/**
++ * Starter prompts for the minimal main view's suggestion chips.
++ *
++ * Static list (same wording as the prototype's catalog) — these are just
++ * prompts the user can tap; every one of them starts a real run through
++ * POST /api/runs.
++ */
++
++export interface Suggestion {
++  label: string;
++  prompt: string;
++}
++
++export const SUGGESTIONS: Suggestion[] = [
++  { label: "Run the tests", prompt: "Run the test suite and fix failures" },
++  { label: "Review the codebase", prompt: "Review this codebase and open a summary" },
++  { label: "Build the app", prompt: "Build the app and check for errors" },
++  { label: "Research the Library", prompt: "Research the Library and load a skill" },
++];
+diff --git a/apps/swarmagents/lib/runtime/run-store.ts b/apps/swarmagents/lib/runtime/run-store.ts
+index baf361f6c..33275185c 100644
+--- a/apps/swarmagents/lib/runtime/run-store.ts
++++ b/apps/swarmagents/lib/runtime/run-store.ts
+@@ -16,6 +16,8 @@ export interface StoredRunSummary {
+   status: StoredRunStatus;
+   prompt: string;
+   sessionId?: string;
++  /** Provider id the run is using (from the run.started telemetry event). */
++  provider?: string;
+   model?: string;
+   createdAt: number;
+   finishedAt?: number;
+@@ -99,6 +101,7 @@ export function summarizeRun(runId: string, events: SequencedEvent[]): StoredRun
+         break;
+       case "run.started":
+         summary.sessionId = str(field("sessionId")) ?? summary.sessionId;
++        summary.provider = str(field("provider")) ?? summary.provider;
+         summary.model = str(field("model")) ?? summary.model;
+         break;
+       case "usage":
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index cb2976e10..c569cc9ed 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -21,6 +21,7 @@ import { RoleAndVmBar } from './components/RoleAndVmBar';
+ import { AgentCardModal } from './components/AgentCardModal';
+ import { ComputerScreen } from './components/ComputerScreen';
+ import { SwarmIntro } from './components/SwarmIntro';
++import MinimalHome from './components/minimal-ui/MinimalHome';
+ import { LandingHero } from './components/LandingHero';
+ import { SiteFooter } from './components/SiteFooter';
+ import { ThreadPanel } from './components/ThreadPanel';
+@@ -505,6 +506,18 @@ export default function App() {
+     return () => window.removeEventListener('keydown', onKeyDown);
+   }, [handleToggleView, handleStop, busy]);
+ 
++  // Minimal UI: the "Computer" workspace is the new minimal run view (runs
++  // list, live screen, pinned input bar, settings slide-over). The landing /
++  // overview page keeps the original experience.
++  if (!showLanding) {
++    return (
++      <div className="relative min-h-dvh overflow-hidden">
++        <SwarmIntro onComplete={handleIntroComplete} />
++        <MinimalHome />
++      </div>
++    );
++  }
++
+   return (
+     <div className="relative min-h-dvh overflow-hidden bg-[#07070a] text-white antialiased">
+       {/* 1. Intro Particle Loading Screen */}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalHome.tsx b/apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalHome.tsx
+new file mode 100644
+index 000000000..ef580d69f
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalHome.tsx
+@@ -0,0 +1,308 @@
++/**
++ * MinimalHome — the minimal 3-part main view.
++ *
++ * A faithful port of the new prototype's page
++ * (_prototype-zip2/src/app/page.tsx): header (wordmark + effective-
++ * provider pill + gear), main area (VmScreen when a run is focused,
++ * conversation list when idle, calm empty state with
++ * ComputerIllustration + suggestion chips), input bar pinned bottom
++ * (textarea + attach + model/provider picker dropdown + send/stop),
++ * Conversation inline in this same file.
++ *
++ * The App shell (App.tsx) renders this as the workspace. It passes the
++ * mascot props through so Jimmy stays mounted in a small row above the
++ * input bar — the main-page mascot test renders App and requires him
++ * there. The row is hidden on small screens, so the zip2 look is
++ * untouched on mobile.
++ *
++ * API shapes are zip2's: GET /api/runs returns {runs, suggestions};
++ * POST /api/runs {prompt, attachments, providerId, model}; the focused
++ * run is polled via GET /api/runs/[id] every ~1.1s for {run, events,
++ * allSteps, frame}; POST /api/runs/[id]/stop stops it. No backend code
++ * lives here — the runtime worker implements those endpoints.
++ */
++
++import { useCallback, useEffect, useMemo, useRef, useState } from "react";
++import { Settings, Send, Square, Paperclip, ChevronDown, X, Monitor, CheckCircle2, Plus, MessageSquare, Eye } from "lucide-react";
++import MinimalVmScreen, { type RunEvent, type Frame } from "./MinimalVmScreen";
++import MinimalSettingsPanel from "./MinimalSettingsPanel";
++
++type Run = { id: string; prompt: string; status: string; providerName?: string | null; model?: string | null; currentStep?: string | null; result?: string | null; createdAt: string; durationSec: number; attachments?: string[] };
++/** Real GET /api/providers → {catalog, providers}; providers rows are ProviderRow-shaped. */
++type ProviderRow = {
++  id: string;
++  label: string;
++  model: string;
++  enabled: boolean;
++  models: string[];
++  keyCount: number;
++  rank: number;
++  saved: boolean;
++  isFree: boolean;
++};
++type CatalogEntry = { id: string; name: string; apiStyle: string; authHeader: string; isLocal?: boolean; models?: { default?: string; popular: string[] } };
++type ProvidersData = { catalog: CatalogEntry[]; providers: ProviderRow[] };
++
++export default function MinimalHome() {
++  const [runs, setRuns] = useState<Run[]>([]);
++  const [suggestions, setSuggestions] = useState<{ label: string; prompt: string }[]>([]);
++  const [activeId, setActiveId] = useState<string | null>(null);
++  const [viewId, setViewId] = useState<string | null>(null);
++  const [events, setEvents] = useState<RunEvent[]>([]);
++  const [frame, setFrame] = useState<Frame>({ app: "desktop", browserUrl: "", fileName: "", terminalLines: [], elapsed: 0 });
++  const [input, setInput] = useState("");
++  const [attachments, setAttachments] = useState<string[]>([]);
++  const [settingsOpen, setSettingsOpen] = useState(false);
++  const [settingsTab, setSettingsTab] = useState("providers");
++  const [provData, setProvData] = useState<ProvidersData | null>(null);
++  const [pickerOpen, setPickerOpen] = useState(false);
++  const [chosen, setChosen] = useState<{ providerId: string; model: string; name: string } | null>(null);
++  const [showChat, setShowChat] = useState(false);
++  const [sending, setSending] = useState(false);
++  const [err, setErr] = useState("");
++  const fileRef = useRef<HTMLInputElement>(null);
++  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
++
++  const loadProviders = useCallback(async () => { try { setProvData(await (await fetch("/api/providers")).json()); } catch {} }, []);
++  const loadRuns = useCallback(async () => {
++    try {
++      const d = await (await fetch("/api/runs")).json();
++      setRuns(d.runs || []); setSuggestions(d.suggestions || []);
++      const running = (d.runs || []).find((r: Run) => r.status === "running");
++      if (running) setActiveId((prev) => prev || running.id);
++      return d.runs as Run[];
++    } catch { return []; }
++  }, []);
++
++  useEffect(() => { loadProviders(); loadRuns(); }, [loadProviders, loadRuns]);
++
++  const focusId = activeId || viewId;
++  const focusRun = runs.find((r) => r.id === focusId) || null;
++  const isRunning = !!activeId && focusRun?.status === "running";
++
++  // The effective provider is the router's pick today: the lowest-ranked
++  // usable saved provider. Usable mirrors the backend's isUsableProvider /
++  // countUserProviders rule: enabled AND (has a key OR is free OR is a local
++  // catalog provider). Local catalog providers work without keys server-side.
++  const localCatalogIds = useMemo(
++    () => new Set((provData?.catalog ?? []).filter((c) => c.isLocal).map((c) => c.id)),
++    [provData],
++  );
++  const isUsable = (p: ProviderRow) =>
++    p.enabled !== false && (p.keyCount > 0 || p.isFree || localCatalogIds.has(p.id));
++  const effectiveProvider = useMemo(() => {
++    if (!provData || provData.providers.length === 0) return null;
++    const usable = provData.providers.filter(isUsable);
++    if (usable.length === 0) return null;
++    return [...usable].sort((a, b) => a.rank - b.rank)[0];
++  }, [provData, localCatalogIds]);
++
++  // Poll the focused run for live events / frame
++  useEffect(() => {
++    if (!focusId) return;
++    const tick = async () => {
++      try {
++        const d = await (await fetch(`/api/runs/${focusId}`)).json();
++        if (d.events) setEvents(d.events);
++        if (d.frame) setFrame(d.frame);
++        if (d.run) {
++          setRuns((xs) => xs.map((x) => x.id === d.run.id ? { ...x, ...d.run } : x));
++          if (d.run.status !== "running" && activeId === focusId) { setActiveId(null); loadRuns(); loadProviders(); }
++        }
++      } catch {}
++    };
++    tick();
++    if (pollRef.current) clearInterval(pollRef.current);
++    pollRef.current = setInterval(tick, 1100);
++    return () => { if (pollRef.current) clearInterval(pollRef.current); };
++  }, [focusId, activeId, loadRuns, loadProviders]);
++
++  async function send(promptOverride?: string) {
++    const prompt = (promptOverride ?? input).trim();
++    if (!prompt || sending) return;
++    setSending(true); setErr(""); setShowChat(false);
++    try {
++      const r = await fetch("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, attachments, providerId: chosen?.providerId, model: chosen?.model }) });
++      const d = await r.json();
++      if (!r.ok) throw new Error(d.error || "Could not start the run");
++      setInput(""); setAttachments([]);
++      setEvents([]); setViewId(null); setActiveId(d.id);
++      await loadRuns();
++    } catch (e: any) { setErr(e.message || "Could not start the run. Try again."); }
++    setSending(false);
++  }
++
++  async function stop() {
++    if (!activeId) return;
++    await fetch(`/api/runs/${activeId}/stop`, { method: "POST" });
++    setActiveId(null); loadRuns();
++  }
++
++  const pickerLabel = chosen ? `${chosen.name} / ${chosen.model}` : effectiveProvider ? `${effectiveProvider.label} / ${effectiveProvider.model}` : provData && provData.providers.length === 0 ? "No provider — add one" : "Swarm Router";
++  const completedRuns = runs.filter((r) => r.status !== "running");
++
++  return (
++    <div className="flex h-[100dvh] flex-col bg-[#f5f5f7]">
++      {/* Header — just the wordmark + the gear. Nothing else. */}
++      <header className="flex h-[52px] shrink-0 items-center gap-3 px-4 sm:px-5">
++        <div className="flex items-center gap-2.5">
++          <span className="flex h-7 w-7 items-center justify-center rounded-[8px] bg-zinc-900 text-[13px] font-bold text-white">S</span>
++          <span className="text-[15px] font-semibold tracking-tight text-zinc-900">SwarmAgents</span>
++        </div>
++        {effectiveProvider && !isRunning && <button onClick={() => { setSettingsTab("providers"); setSettingsOpen(true); }} className="ml-1 hidden items-center gap-1.5 rounded-full border border-black/[0.07] bg-white py-1 pl-2.5 pr-2 text-[12px] font-medium text-zinc-600 transition hover:border-zinc-300 md:flex"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />{effectiveProvider.label} / {effectiveProvider.model}<ChevronDown size={12} className="text-zinc-400" /></button>}
++        <button onClick={() => { setSettingsTab("providers"); setSettingsOpen(true); }} aria-label="Settings" className="ml-auto flex h-9 w-9 items-center justify-center rounded-full border border-black/[0.06] bg-white text-zinc-600 shadow-[0_1px_4px_rgba(0,0,0,0.05)] transition hover:text-zinc-900"><Settings size={17} /></button>
++      </header>
++
++      {/* Main area — the screen is the star */}
++      <main className="mx-auto flex min-h-0 w-full max-w-[1180px] flex-1 flex-col px-3 pb-2 sm:px-5">
++        {focusRun ? (
++          <div className="flex min-h-0 flex-1 flex-col gap-2">
++            {/* Slim conversation strip while a run owns the screen */}
++            <div className="flex shrink-0 items-center gap-2">
++              <button onClick={() => setShowChat((v) => !v)} className="flex min-w-0 flex-1 items-center gap-2 rounded-full border border-black/[0.06] bg-white py-[7px] pl-3 pr-2.5 text-left shadow-[0_1px_4px_rgba(0,0,0,0.04)]">
++                <MessageSquare size={13} className="shrink-0 text-zinc-400" />
++                <span className="min-w-0 flex-1 truncate text-[13px] text-zinc-600"><span className="font-medium text-zinc-800">You:</span> {focusRun.prompt}</span>
++                <ChevronDown size={14} className={`shrink-0 text-zinc-400 transition ${showChat ? "rotate-180" : ""}`} />
++              </button>
++              {focusRun.status !== "running" && <button onClick={() => { setViewId(null); setActiveId(null); setEvents([]); }} className="flex shrink-0 items-center gap-1.5 rounded-full bg-zinc-900 px-3 py-[7px] text-[12.5px] font-medium text-white"><Plus size={13} /> New run</button>}
++            </div>
++            {showChat && (
++              <div className="max-h-[220px] shrink-0 overflow-y-auto rounded-2xl border border-black/[0.06] bg-white p-4 shadow-[0_8px_30px_rgba(0,0,0,0.07)]">
++                <Conversation runs={completedRuns} onReplay={(id) => { setViewId(id); setShowChat(false); }} compact />
++                {focusRun.result && <div className="mt-3 rounded-xl bg-zinc-50 px-3.5 py-3 text-[13px] leading-relaxed text-zinc-700">{focusRun.result}</div>}
++              </div>
++            )}
++            <div className="min-h-0 flex-1">
++              <MinimalVmScreen prompt={focusRun.prompt} events={events} frame={frame} status={focusRun.status} providerName={focusRun.providerName} model={focusRun.model} />
++            </div>
++          </div>
++        ) : runs.length > 0 ? (
++          /* No run active — the conversation owns the main area */
++          <div className="mx-auto flex min-h-0 w-full max-w-[760px] flex-1 flex-col overflow-y-auto py-4">
++            <Conversation runs={completedRuns} onReplay={(id) => setViewId(id)} />
++          </div>
++        ) : (
++          /* Calm empty state */
++          <div className="flex flex-1 flex-col items-center justify-center px-4 py-10 text-center">
++            <ComputerIllustration />
++            <h1 className="mt-6 text-[22px] font-semibold tracking-tight text-zinc-900">Start a run to watch the agent work</h1>
++            <p className="mt-1.5 max-w-[420px] text-[14px] leading-relaxed text-zinc-500">Give it a task below. You'll watch it click, type and run commands on a live computer — every action, as it happens.</p>
++            <div className="mt-6 flex max-w-[640px] flex-wrap justify-center gap-2">
++              {suggestions.map((s) => <button key={s.label} onClick={() => send(s.prompt)} className="rounded-full border border-black/[0.08] bg-white px-3.5 py-2 text-[13px] font-medium text-zinc-700 shadow-[0_1px_3px_rgba(0,0,0,0.04)] transition hover:border-[#0071e3] hover:text-[#0071e3]">{s.label}</button>)}
++            </div>
++            {!effectiveProvider && provData && <button onClick={() => { setSettingsTab("providers"); setSettingsOpen(true); }} className="mt-5 text-[13px] font-medium text-[#0071e3] hover:underline">Add a provider key to choose the model →</button>}
++          </div>
++        )}
++      </main>
++
++      {/* Input bar — pinned to the bottom */}
++      <div className="shrink-0 px-3 pb-3 sm:px-5 sm:pb-4">
++        <div className="mx-auto w-full max-w-[760px]">
++          {isRunning && focusRun && (
++            <div className="mb-2 flex items-center gap-2 px-1 text-[13px] text-zinc-600">
++              <span className="h-2 w-2 shrink-0 rounded-full bg-[#0071e3] pulse-dot" />
++              <span className="min-w-0 flex-1 truncate">Agent is {liveStatus(events, focusRun.currentStep)}</span>
++              <span className="shrink-0 tabular-nums text-zinc-400">{frame.elapsed}s</span>
++            </div>
++          )}
++          {err && <p className="mb-2 px-1 text-[13px] text-red-600">{err}</p>}
++          {attachments.length > 0 && (
++            <div className="mb-2 flex flex-wrap gap-1.5 px-1">
++              {attachments.map((a) => <span key={a} className="flex items-center gap-1.5 rounded-full bg-zinc-900 py-1 pl-2.5 pr-1.5 text-[12px] font-medium text-white">{a}<button onClick={() => setAttachments((xs) => xs.filter((x) => x !== a))} className="rounded-full p-0.5 hover:bg-white/20"><X size={11} /></button></span>)}
++            </div>
++          )}
++          <div className="rounded-[22px] border border-black/[0.08] bg-white shadow-[0_8px_32px_rgba(0,0,0,0.09)]">
++            <textarea value={input} onChange={(e) => setInput(e.target.value)} rows={2}
++              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
++              placeholder={isRunning ? "Message the agent… (it will queue for the next run)" : "Give the agent a task…"}
++              className="max-h-[140px] w-full resize-none bg-transparent px-4 pb-1 pt-3.5 text-[15px] leading-relaxed text-zinc-900 placeholder:text-zinc-400 focus:outline-none" />
++            <div className="flex items-center gap-1 px-2 pb-2">
++              <input ref={fileRef} type="file" multiple className="hidden" onChange={(e) => { const names = Array.from(e.target.files || []).map((f) => f.name); setAttachments((xs) => [...xs, ...names].slice(0, 8)); e.target.value = ""; }} />
++              <button onClick={() => fileRef.current?.click()} aria-label="Attach files" title="Attach files for the agent" className="flex h-8 w-8 items-center justify-center rounded-full text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700"><Paperclip size={17} /></button>
++
++              {/* Model / provider picker */}
++              <div className="relative">
++                <button onClick={() => setPickerOpen((v) => !v)} className="flex max-w-[230px] items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[12.5px] font-medium text-zinc-600 transition hover:bg-zinc-100">
++                  <span className="truncate">{pickerLabel}</span><ChevronDown size={13} className="shrink-0 text-zinc-400" />
++                </button>
++                {pickerOpen && (
++                  <>
++                    <button className="fixed inset-0 z-10 cursor-default" onClick={() => setPickerOpen(false)} aria-label="Close picker" />
++                    <div className="absolute bottom-[calc(100%+8px)] left-0 z-20 w-[300px] overflow-hidden rounded-2xl border border-black/[0.08] bg-white shadow-[0_16px_44px_rgba(0,0,0,0.16)]">
++                      <p className="border-b border-black/[0.05] px-3.5 py-2.5 text-[11px] font-semibold uppercase tracking-[0.07em] text-zinc-400">Model for the next run</p>
++                      <div className="max-h-[260px] overflow-y-auto p-1.5">
++                        {(provData?.providers || []).length === 0 && <button onClick={() => { setPickerOpen(false); setSettingsTab("providers"); setSettingsOpen(true); }} className="w-full rounded-xl px-3 py-2.5 text-left text-[13px] text-zinc-600 hover:bg-zinc-50">No providers configured — <span className="font-medium text-[#0071e3]">add one in Settings</span>. Runs use the Swarm Router until then.</button>}
++                        {(provData?.providers || []).map((p) => {
++                          const usable = isUsable(p);
++                          return (
++                            <button key={p.id} onClick={() => { setChosen({ providerId: p.id, model: p.model, name: p.label }); setPickerOpen(false); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left hover:bg-zinc-50">
++                              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${usable ? "bg-emerald-500" : "bg-amber-400"}`} />
++                              <span className="min-w-0 flex-1"><span className="block truncate text-[13.5px] font-medium text-zinc-800">{p.label} / {p.model}</span><span className="block text-[11.5px] text-zinc-400">{usable ? (p.isFree ? "Free provider" : "Key set") : "Missing key"}</span></span>
++                              {(chosen?.providerId === p.id || (!chosen && effectiveProvider?.id === p.id)) && <CheckCircle2 size={15} className="shrink-0 text-[#0071e3]" />}
++                            </button>
++                          );
++                        })}
++                      </div>
++                      <button onClick={() => { setPickerOpen(false); setSettingsTab("providers"); setSettingsOpen(true); }} className="flex w-full items-center gap-1.5 border-t border-black/[0.05] px-3.5 py-2.5 text-[12.5px] font-medium text-[#0071e3] hover:bg-zinc-50"><Plus size={13} /> Manage providers & fallback order</button>
++                    </div>
++                  </>
++                )}
++              </div>
++
++              <span className="ml-auto hidden text-[11.5px] text-zinc-300 sm:block">Enter to send · Shift+Enter for newline</span>
++              {isRunning ? (
++                <button onClick={stop} className="ml-2 flex shrink-0 items-center gap-1.5 rounded-full bg-zinc-900 py-2 pl-3 pr-3.5 text-[13px] font-semibold text-white transition hover:bg-zinc-700"><Square size={12} fill="currentColor" /> Stop</button>
++              ) : (
++                <button onClick={() => send()} disabled={!input.trim() || sending} aria-label="Send" className="ml-2 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#0071e3] text-white transition hover:bg-[#0077ed] disabled:bg-zinc-200 disabled:text-zinc-400"><Send size={16} /></button>
++              )}
++            </div>
++          </div>
++          <p className="mt-2 text-center text-[11.5px] text-zinc-400">SwarmAgents runs on a sandboxed VM. Keys stay in your per-user store — sealed, never shown.</p>
++        </div>
++      </div>
++
++      <MinimalSettingsPanel open={settingsOpen} initialTab={settingsTab} onClose={() => setSettingsOpen(false)} onProvidersChange={loadProviders} activeRunProvider={focusRun ? `${focusRun.providerName || "Swarm Router"} / ${focusRun.model || ""}` : null} />
++    </div>
++  );
++}
++
++function liveStatus(events: RunEvent[], currentStep?: string | null) {
++  const last = events[events.length - 1];
++  const label = (last?.label || currentStep || "working").replace(/^Run /, "running ");
++  return label.charAt(0).toLowerCase() + label.slice(1) + "…";
++}
++
++function Conversation({ runs, onReplay, compact }: { runs: Run[]; onReplay: (id: string) => void; compact?: boolean }) {
++  if (runs.length === 0) return <p className="py-6 text-center text-[13.5px] text-zinc-400">No runs yet in this conversation.</p>;
++  return (
++    <div className={compact ? "space-y-4" : "space-y-6"}>
++      {[...runs].reverse().map((r) => (
++        <div key={r.id} className="space-y-2.5">
++          <div className="flex justify-end"><div className="max-w-[85%] rounded-[18px] rounded-br-[6px] bg-zinc-900 px-4 py-2.5 text-[14px] leading-relaxed text-white">{r.prompt}{(r.attachments?.length ?? 0) > 0 && <span className="mt-1 block text-[12px] text-zinc-400">📎 {r.attachments!.join(", ")}</span>}</div></div>
++          <div className="flex gap-2.5">
++            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#0071e3] text-[11px] font-bold text-white">S</span>
++            <div className="min-w-0 flex-1 rounded-[18px] rounded-tl-[6px] border border-black/[0.06] bg-white px-4 py-3 shadow-[0_1px_4px_rgba(0,0,0,0.04)]">
++              <p className="flex flex-wrap items-center gap-x-2 text-[12px] text-zinc-400"><CheckCircle2 size={13} className={r.status === "stopped" ? "text-amber-500" : "text-emerald-500"} />{r.status === "stopped" ? "Stopped" : "Completed"} · {r.providerName || "Swarm Router"}{r.model ? ` / ${r.model}` : ""} · {new Date(r.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</p>
++              <p className="mt-1.5 text-[14px] leading-relaxed text-zinc-700">{r.result || "Run finished."}</p>
++              <button onClick={() => onReplay(r.id)} className="mt-2.5 flex items-center gap-1.5 rounded-full bg-zinc-100 px-3 py-1.5 text-[12.5px] font-medium text-zinc-700 transition hover:bg-zinc-200"><Eye size={13} /> Watch the screen replay</button>
++            </div>
++          </div>
++        </div>
++      ))}
++    </div>
++  );
++}
++
++function ComputerIllustration() {
++  return (
++    <svg width="168" height="118" viewBox="0 0 168 118" fill="none" aria-hidden>
++      <rect x="14" y="8" width="140" height="88" rx="10" fill="#fff" stroke="rgba(0,0,0,0.09)" />
++      <rect x="14" y="8" width="140" height="22" rx="10" fill="#f5f5f7" />
++      <circle cx="28" cy="19" r="3.5" fill="#ff5f57" /><circle cx="42" cy="19" r="3.5" fill="#febc2e" /><circle cx="56" cy="19" r="3.5" fill="#28c840" />
++      <rect x="74" y="14" width="66" height="10" rx="5" fill="#e8e8ed" />
++      <rect x="26" y="42" width="52" height="7" rx="3.5" fill="#e8e8ed" /><rect x="26" y="55" width="84" height="7" rx="3.5" fill="#e8e8ed" /><rect x="26" y="68" width="64" height="7" rx="3.5" fill="#dceeff" />
++      <circle cx="128" cy="66" r="13" fill="#0071e3" opacity="0.12" /><path d="M123 66.5 127 70l7-8" stroke="#0071e3" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
++      <path d="M74 96h20l4 12H70l4-12Z" fill="#e8e8ed" /><rect x="56" y="108" width="56" height="4" rx="2" fill="#dcdce1" />
++    </svg>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalSettingsPanel.tsx b/apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalSettingsPanel.tsx
+new file mode 100644
+index 000000000..71f5e520f
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalSettingsPanel.tsx
+@@ -0,0 +1,348 @@
++/**
++ * MinimalSettingsPanel — the settings slide-over from the minimal UI
++ * prototype (_prototype-zip2/src/components/SettingsPanel.tsx, ported
++ * faithfully, including the new props {open, initialTab, onClose,
++ * onProvidersChange, activeRunProvider}).
++ *
++ * 5 tabs: Providers (effective provider, the saved-provider list, add-
++ * provider form with catalog preset chips), MCP, Tools, Skills, Connectors.
++ *
++ * This build reconciles the prototype's calls with the real swarmagents
++ * backend:
++ *  - Providers tab reads GET /api/providers → {catalog, providers} where
++ *    each provider row is the real ProviderRow shape (id/label/model/
++ *    keyCount/rank/isFree). The prototype's drag-to-reorder, mode selector
++ *    and keyHint fields have no backend (there is no /api/providers/order),
++ *    so the list is a rank-sorted list of saved providers with add/remove —
++ *    the router already orders by rank server-side.
++ *  - Removing a provider calls DELETE /api/providers/[id] (the real route),
++ *    not the prototype's DELETE /api/providers?providerId=….
++ *  - The add-provider form maps onto the real POST /api/providers schema
++ *    (id, apiStyle, baseUrl, models[], apiKey), which is what saveProvider
++ *    actually accepts.
++ *  - The MCP / Tools / Skills / Connectors tabs target endpoints that do
++ *    not exist in this build (/api/mcp, /api/tools, /api/skills,
++ *    /api/connectors). They degrade to an honest "not wired up" note
++ *    instead of a perpetual spinner. No mock data.
++ *
++ * The `.inp` input styling lives in the inline <style> block at the
++ * bottom, as in the prototype — it does not depend on globals.css.
++ */
++
++import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
++import { X, KeyRound, Server, Wrench, Sparkles, Plug, Trash2, Plus, Check, Loader2, AlertCircle } from "lucide-react";
++
++/** Real GET /api/providers provider row (ProviderRow shape). */
++type ProviderRow = {
++  id: string;
++  label: string;
++  model: string;
++  enabled: boolean;
++  models: string[];
++  keyCount: number;
++  rank: number;
++  saved: boolean;
++  isFree: boolean;
++};
++/** Real GET /api/providers catalog entry (ProviderCatalogEntry shape, subset). */
++type CatalogEntry = {
++  id: string;
++  name: string;
++  apiStyle: string;
++  authHeader: string;
++  isLocal?: boolean;
++  models?: { default?: string; popular: string[] };
++};
++type ProvidersData = { catalog: CatalogEntry[]; providers: ProviderRow[] };
++
++const TABS = [
++  { id: "providers", label: "Providers", icon: KeyRound },
++  { id: "mcp", label: "MCP", icon: Server },
++  { id: "tools", label: "Tools", icon: Wrench },
++  { id: "skills", label: "Skills", icon: Sparkles },
++  { id: "connectors", label: "Connectors", icon: Plug },
++] as const;
++
++const API_STYLE_TO_BACKEND: Record<string, string> = {
++  openai: "openai-compatible",
++  anthropic: "anthropic",
++  google: "gemini",
++};
++const API_STYLE_FROM_BACKEND: Record<string, string> = {
++  "openai-compatible": "openai",
++  anthropic: "anthropic",
++  gemini: "google",
++  custom: "openai",
++};
++
++export default function MinimalSettingsPanel({ open, initialTab, onClose, onProvidersChange, activeRunProvider }: {
++  open: boolean; initialTab?: string; onClose: () => void; onProvidersChange: () => void; activeRunProvider?: string | null;
++}) {
++  const [tab, setTab] = useState(initialTab || "providers");
++  const [data, setData] = useState<ProvidersData | null>(null);
++  const [mcp, setMcp] = useState<any[]>([]);
++  const [tools, setTools] = useState<any[]>([]);
++  const [skills, setSkills] = useState<{ skills: any[]; loadedCount: number; cap: number } | null>(null);
++  const [connectors, setConnectors] = useState<any[]>([]);
++  const [notice, setNotice] = useState("");
++  const [failMsg, setFailMsg] = useState("");
++  const [busy, setBusy] = useState("");
++
++  // Provider add-form (backend schema: id, apiStyle, baseUrl, models[], apiKey).
++  const [form, setForm] = useState({ id: "", apiStyle: "openai", baseUrl: "", defaultModel: "", apiKey: "" });
++
++  const loadProviders = useCallback(async () => {
++    try {
++      const r = await fetch("/api/providers");
++      setData(await r.json());
++    } catch {
++      setData(null);
++    }
++    onProvidersChange();
++  }, [onProvidersChange]);
++
++  const loadTab = useCallback(async (t: string) => {
++    setFailMsg("");
++    try {
++      if (t === "providers") { await loadProviders(); return; }
++      if (t === "mcp") setMcp((await (await fetch("/api/mcp")).json()).servers);
++      if (t === "tools") setTools((await (await fetch("/api/tools")).json()).tools);
++      if (t === "skills") setSkills(await (await fetch("/api/skills")).json());
++      if (t === "connectors") setConnectors((await (await fetch("/api/connectors")).json()).connectors);
++    } catch {
++      setFailMsg("This section isn't wired up in this build yet — the backend endpoint for it doesn't exist on this server.");
++    }
++  }, [loadProviders]);
++
++  useEffect(() => { if (open) { setTab(initialTab || "providers"); loadTab(initialTab || "providers"); } }, [open, initialTab, loadTab]);
++  useEffect(() => { const fn = (e: KeyboardEvent) => e.key === "Escape" && onClose(); window.addEventListener("keydown", fn); return () => window.removeEventListener("keydown", fn); }, [onClose]);
++
++  // The effective provider is the router's pick today: lowest-ranked usable
++  // saved provider. Usable mirrors the backend's isUsableProvider /
++  // countUserProviders rule: enabled AND (has a key OR is free OR is a local
++  // catalog provider). Local catalog providers work without keys server-side.
++  const localCatalogIds = useMemo(
++    () => new Set((data?.catalog ?? []).filter((c) => c.isLocal).map((c) => c.id)),
++    [data],
++  );
++  const isUsable = (p: ProviderRow) =>
++    p.enabled !== false && (p.keyCount > 0 || p.isFree || localCatalogIds.has(p.id));
++  const effectiveProvider = useMemo(() => {
++    if (!data || data.providers.length === 0) return null;
++    const usable = data.providers.filter(isUsable);
++    if (usable.length === 0) return null;
++    return [...usable].sort((a, b) => a.rank - b.rank)[0];
++  }, [data, localCatalogIds]);
++
++  if (!open) return null;
++
++  const flash = (m: string) => { setNotice(m); setTimeout(() => setNotice(""), 2600); };
++
++  async function deleteProvider(p: ProviderRow) {
++    setBusy(`del:${p.id}`);
++    try {
++      const r = await fetch(`/api/providers/${encodeURIComponent(p.id)}`, { method: "DELETE" });
++      if (!r.ok) flash((await r.json()).error || "Could not remove provider");
++      else flash(`${p.label} removed.`);
++    } catch { flash("Could not remove provider"); }
++    setBusy("");
++    loadProviders();
++  }
++
++  async function addProvider(e: FormEvent) {
++    e.preventDefault(); setBusy("save");
++    const body = {
++      id: form.id.trim().toLowerCase(),
++      apiStyle: API_STYLE_TO_BACKEND[form.apiStyle] ?? form.apiStyle,
++      baseUrl: form.baseUrl.trim() || undefined,
++      models: form.defaultModel.trim() ? [form.defaultModel.trim()] : undefined,
++      apiKey: form.apiKey,
++    };
++    const r = await fetch("/api/providers", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
++    setBusy("");
++    if (!r.ok) { flash((await r.json()).error || "Could not save provider"); return; }
++    setForm({ id: "", apiStyle: "openai", baseUrl: "", defaultModel: "", apiKey: "" });
++    flash("Provider saved — key sealed server-side (AES-256-GCM). It will never be shown again.");
++    loadProviders();
++  }
++
++  const providers = data ? [...data.providers].sort((a, b) => a.rank - b.rank) : [];
++
++  return (
++    <div className="fixed inset-0 z-50">
++      <button aria-label="Close settings" className="absolute inset-0 h-full w-full cursor-default bg-black/25 backdrop-blur-[2px]" onClick={onClose} />
++      <div className="panel-in absolute bottom-0 right-0 top-0 flex w-[540px] max-w-[100vw] flex-col bg-white shadow-[-16px_0_50px_rgba(0,0,0,0.18)]">
++        <div className="flex items-center gap-3 border-b border-black/[0.07] px-5 py-4">
++          <div><h2 className="text-[17px] font-semibold leading-tight text-zinc-900">Settings</h2><p className="text-[12.5px] text-zinc-400">Providers, MCP, tools, skills & connectors</p></div>
++          <button onClick={onClose} className="ml-auto flex h-8 w-8 items-center justify-center rounded-full bg-zinc-100 text-zinc-500 transition hover:bg-zinc-200"><X size={16} /></button>
++        </div>
++
++        <div className="flex gap-1 overflow-x-auto border-b border-black/[0.07] px-3 py-2">
++          {TABS.map(({ id, label, icon: Icon }) => (
++            <button key={id} onClick={() => { setTab(id); loadTab(id); }} className={`flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-[13px] font-medium transition ${tab === id ? "bg-[#0071e3] text-white" : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-800"}`}><Icon size={14} />{label}</button>
++          ))}
++        </div>
++
++        {notice && <div className="mx-5 mt-3 flex items-start gap-2 rounded-xl bg-zinc-900 px-3.5 py-2.5 text-[12.5px] leading-relaxed text-white"><Check size={14} className="mt-[1px] shrink-0 text-emerald-400" />{notice}</div>}
++        {failMsg && <div className="mx-5 mt-3 flex items-start gap-2 rounded-xl bg-amber-50 px-3.5 py-2.5 text-[12.5px] leading-relaxed text-amber-800"><AlertCircle size={14} className="mt-[1px] shrink-0" />{failMsg}</div>}
++
++        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
++          {tab === "providers" && (
++            <div className="space-y-6">
++              {/* Effective */}
++              <div className="rounded-xl border border-black/[0.07] bg-zinc-50 px-4 py-3">
++                <p className="text-[11px] font-semibold uppercase tracking-[0.07em] text-zinc-400">Next run will use</p>
++                <p className="mt-1 text-[14px] font-medium text-zinc-900">{effectiveProvider ? `${effectiveProvider.label} / ${effectiveProvider.model}` : data && data.providers.length ? "No usable provider — add a key" : "No provider yet — add one below. Runs use the Swarm Router until then."}</p>
++                {activeRunProvider && <p className="mt-0.5 text-[12px] text-zinc-400">Current run: {activeRunProvider}</p>}
++              </div>
++
++              {/* Saved providers */}
++              <section>
++                <div className="flex items-center justify-between"><h3 className="text-[13.5px] font-semibold text-zinc-900">Configured providers</h3><span className="text-[11.5px] text-zinc-400">Tried in rank order</span></div>
++                <div className="mt-2.5 space-y-1.5">
++                  {providers.length === 0 && <p className="rounded-xl border border-dashed border-black/10 px-4 py-4 text-center text-[13px] text-zinc-400">No providers yet. Add one below — it joins the list.</p>}
++                  {providers.map((p) => {
++                    const usable = isUsable(p);
++                    return (
++                      <div key={p.id} className="flex items-center gap-2.5 rounded-xl border border-black/[0.07] bg-white px-3 py-2.5">
++                        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-900 text-[10.5px] font-bold text-white">{p.rank + 1}</span>
++                        <div className="min-w-0 flex-1"><p className="truncate text-[13.5px] font-medium text-zinc-900">{p.label} <span className="font-normal text-zinc-400">/ {p.model}</span></p></div>
++                        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${usable ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>{usable ? (p.isFree ? "Free provider" : "Key set") : "Missing key"}</span>
++                        <button title="Remove provider" onClick={() => deleteProvider(p)} className="shrink-0 rounded-md p-1 text-zinc-300 hover:bg-red-50 hover:text-red-500">{busy === `del:${p.id}` ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}</button>
++                      </div>
++                    );
++                  })}
++                </div>
++              </section>
++
++              {/* Add provider */}
++              <section>
++                <h3 className="text-[13.5px] font-semibold text-zinc-900">Add a provider</h3>
++                <p className="mt-0.5 text-[12px] text-zinc-400">One click fills the real catalog defaults. Your key is sealed server-side and never shown again.</p>
++                <div className="mt-2.5 flex gap-1.5 overflow-x-auto pb-1">
++                  {(data?.catalog || []).map((c) => (
++                    <button key={c.id} onClick={() => setForm({ id: c.id, apiStyle: API_STYLE_FROM_BACKEND[c.apiStyle] ?? "openai", baseUrl: "", defaultModel: c.models?.default ?? "", apiKey: form.apiKey })}
++                      className={`shrink-0 rounded-full border px-3 py-1.5 text-[12.5px] font-medium transition ${form.id === c.id ? "border-[#0071e3] bg-[#0071e3]/[0.06] text-[#0071e3]" : "border-black/[0.09] text-zinc-600 hover:border-zinc-300"}`}>
++                      {c.name}{c.isLocal ? " · free" : ""}
++                    </button>
++                  ))}
++                </div>
++                <form onSubmit={addProvider} className="mt-3 space-y-2.5">
++                  <div className="grid grid-cols-2 gap-2.5">
++                    <Field label="Provider ID"><input required value={form.id} onChange={(e) => setForm({ ...form, id: e.target.value })} placeholder="inception" className="inp" /></Field>
++                    <Field label="API style"><select value={form.apiStyle} onChange={(e) => setForm({ ...form, apiStyle: e.target.value })} className="inp"><option value="openai">openai</option><option value="anthropic">anthropic</option><option value="google">google</option></select></Field>
++                  </div>
++                  <Field label="Base URL (optional for catalog providers)"><input value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" className="inp font-mono !text-[12.5px]" /></Field>
++                  <Field label="Default model"><input required value={form.defaultModel} onChange={(e) => setForm({ ...form, defaultModel: e.target.value })} placeholder="mercury-3" className="inp" /></Field>
++                  {(() => { const preset = data?.catalog.find((c) => c.id === form.id); return preset && preset.models ? <div className="flex flex-wrap items-center gap-1.5"><span className="text-[11.5px] text-zinc-400">Popular:</span>{preset.models.popular.map((m) => <button type="button" key={m} onClick={() => setForm({ ...form, defaultModel: m })} className={`rounded-full px-2 py-0.5 text-[11.5px] font-medium ${form.defaultModel === m ? "bg-zinc-900 text-white" : "bg-zinc-100 text-zinc-600"}`}>{m}</button>)}</div> : null; })()}
++                  <Field label="API key"><input type="password" autoComplete="off" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="sk-… (stored sealed, never echoed back)" className="inp" /></Field>
++                  <button disabled={busy === "save"} className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#0071e3] py-2.5 text-[13.5px] font-semibold text-white transition hover:bg-[#0077ed] disabled:opacity-60">{busy === "save" ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />} Save provider</button>
++                  <p className="text-center text-[11.5px] text-zinc-400">Fully custom providers work too — any ID, any OpenAI-compatible base URL.</p>
++                </form>
++              </section>
++            </div>
++          )}
++
++          {tab === "mcp" && (
++            <div>
++              <p className="text-[13px] leading-relaxed text-zinc-500">Servers from the shipped registry — the same registry the agent's <code className="rounded bg-zinc-100 px-1 font-mono text-[12px]">connect_mcp</code> meta-tool uses. Connected servers join the run allowlist; nothing outside this registry can be connected.</p>
++              <div className="mt-4 space-y-2">
++                {!failMsg && mcp.length === 0 && <Empty text="Loading the MCP registry…" />}
++                {mcp.map((s) => (
++                  <div key={s.id} className="flex items-start gap-3 rounded-xl border border-black/[0.07] px-4 py-3.5">
++                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-zinc-100 text-zinc-500"><Server size={16} /></span>
++                    <div className="min-w-0 flex-1">
++                      <p className="text-[13.5px] font-medium text-zinc-900">{s.name} <span className="ml-1 font-mono text-[11px] font-normal text-zinc-400">{s.package}</span></p>
++                      <p className="mt-0.5 text-[12.5px] leading-relaxed text-zinc-500">{s.description}</p>
++                      <p className="mt-1 text-[11px] uppercase tracking-wide text-zinc-400">{s.transport} transport</p>
++                    </div>
++                    <div className="flex shrink-0 flex-col items-end gap-1.5">
++                      <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${s.connected ? "bg-emerald-50 text-emerald-700" : "bg-zinc-100 text-zinc-500"}`}>{s.connected ? "Connected" : "Not connected"}</span>
++                      <button onClick={async () => { setBusy(s.id); await fetch("/api/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ serverId: s.id, action: s.connected ? "disconnect" : "connect" }) }); setBusy(""); loadTab("mcp"); flash(s.connected ? `${s.name} disconnected — removed from the run allowlist.` : `${s.name} connected — available to the agent on the next run.`); }}
++                        className={`rounded-lg px-3 py-1.5 text-[12.5px] font-semibold transition ${s.connected ? "bg-zinc-100 text-zinc-600 hover:bg-zinc-200" : "bg-[#0071e3] text-white hover:bg-[#0077ed]"}`}>{busy === s.id ? "…" : s.connected ? "Disconnect" : "Connect"}</button>
++                    </div>
++                  </div>
++                ))}
++              </div>
++            </div>
++          )}
++
++          {tab === "tools" && (
++            <div>
++              <p className="text-[13px] leading-relaxed text-zinc-500">The agent's real tool registry (with Claude Code mappings). Toggles set the <b className="font-semibold text-zinc-700">default allowlist for new runs</b> and persist to your account. The harness enforces it per run.</p>
++              {!failMsg && <p className="mt-2 text-[12.5px] font-medium text-zinc-700">{tools.filter((t) => t.enabled).length} of {tools.length} tools enabled for new runs</p>}
++              <div className="mt-3 space-y-2">
++                {!failMsg && tools.length === 0 && <Empty text="Loading the tool registry…" />}
++                {tools.map((t) => (
++                  <div key={t.id} className="flex items-center gap-3 rounded-xl border border-black/[0.07] px-4 py-3">
++                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-zinc-100 text-zinc-500"><Wrench size={15} /></span>
++                    <div className="min-w-0 flex-1">
++                      <p className="text-[13.5px] font-medium text-zinc-900">{t.name} <span className="ml-1 rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-[10.5px] font-normal text-zinc-500">{t.mapping}</span></p>
++                      <p className="mt-0.5 text-[12.5px] text-zinc-500">{t.description}</p>
++                    </div>
++                    <span className="hidden shrink-0 text-[11px] uppercase tracking-wide text-zinc-400 sm:block">{t.category}</span>
++                    <button role="switch" aria-checked={t.enabled} onClick={async () => { setTools((xs) => xs.map((x) => x.id === t.id ? { ...x, enabled: !x.enabled } : x)); await fetch("/api/tools", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ toolId: t.id, enabled: !t.enabled }) }); }}
++                      className={`relative h-[26px] w-[46px] shrink-0 rounded-full transition ${t.enabled ? "bg-[#0071e3]" : "bg-zinc-200"}`}><span className={`absolute top-[3px] h-5 w-5 rounded-full bg-white shadow transition-all ${t.enabled ? "left-[23px]" : "left-[3px]"}`} /></button>
++                  </div>
++                ))}
++              </div>
++            </div>
++          )}
++
++          {tab === "skills" && skills && !failMsg && (
++            <div>
++              <div className="flex items-center justify-between"><p className="text-[13px] text-zinc-500">Library skills. Loading mirrors the agent's <code className="rounded bg-zinc-100 px-1 font-mono text-[12px]">load_skill</code> meta-tool.</p><span className={`rounded-full px-2.5 py-1 text-[12px] font-semibold ${skills.loadedCount >= skills.cap ? "bg-amber-50 text-amber-700" : "bg-zinc-100 text-zinc-600"}`}>{skills.loadedCount} / {skills.cap} loaded</span></div>
++              <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-zinc-100"><div className="h-full rounded-full bg-[#0071e3] transition-all" style={{ width: `${(skills.loadedCount / skills.cap) * 100}%` }} /></div>
++              {skills.loadedCount >= skills.cap && <p className="mt-2 flex items-center gap-1.5 text-[12.5px] text-amber-700"><AlertCircle size={13} /> Cap reached — drop a skill before loading another.</p>}
++              <div className="mt-4 space-y-2">
++                {skills.skills.map((s) => (
++                  <div key={s.id} className="flex items-center gap-3 rounded-xl border border-black/[0.07] px-4 py-3">
++                    <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${s.loaded ? "bg-[#0071e3]/10 text-[#0071e3]" : "bg-zinc-100 text-zinc-500"}`}><Sparkles size={15} /></span>
++                    <div className="min-w-0 flex-1"><p className="text-[13.5px] font-medium text-zinc-900">{s.name}</p><p className="mt-0.5 text-[12.5px] leading-relaxed text-zinc-500">{s.description}</p><p className="mt-0.5 font-mono text-[11px] text-zinc-400">{s.source}</p></div>
++                    <button disabled={!s.loaded && skills.loadedCount >= skills.cap} onClick={async () => { const r = await fetch("/api/skills", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ skillId: s.id, action: s.loaded ? "drop" : "load" }) }); if (!r.ok) flash((await r.json()).error); else flash(s.loaded ? `${s.name} dropped.` : `${s.name} loaded — available to the agent.`); loadTab("skills"); }}
++                      className={`shrink-0 rounded-lg px-3 py-1.5 text-[12.5px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-40 ${s.loaded ? "bg-zinc-100 text-zinc-600 hover:bg-zinc-200" : "bg-[#0071e3] text-white hover:bg-[#0077ed]"}`}>{s.loaded ? "Drop" : "Load"}</button>
++                  </div>
++                ))}
++              </div>
++            </div>
++          )}
++
++          {tab === "connectors" && (
++            <div>
++              <p className="text-[13px] leading-relaxed text-zinc-500">From the capability catalog. Adding wires the connector into your swarm for real. Where OAuth is required, we say exactly what's needed — we never fake a "connected" state.</p>
++              <div className="mt-4 space-y-2">
++                {!failMsg && connectors.length === 0 && <Empty text="Loading the connector catalog…" />}
++                {connectors.map((c) => (
++                  <div key={c.id} className="rounded-xl border border-black/[0.07] px-4 py-3.5">
++                    <div className="flex items-center gap-3">
++                      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-zinc-100 text-[13px] font-bold text-zinc-600">{c.name[0]}</span>
++                      <div className="min-w-0 flex-1"><p className="text-[13.5px] font-medium text-zinc-900">{c.name}</p><p className="text-[12.5px] text-zinc-500">{c.connectsTo}</p></div>
++                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold ${c.rawStatus === "added" ? "bg-emerald-50 text-emerald-700" : c.rawStatus === "needs_setup" ? "bg-amber-50 text-amber-700" : "bg-zinc-100 text-zinc-500"}`}>{c.status}</span>
++                      {c.rawStatus === "added"
++                        ? <button onClick={async () => { await fetch("/api/connectors", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connectorId: c.id, action: "remove" }) }); loadTab("connectors"); }} className="shrink-0 rounded-lg bg-zinc-100 px-3 py-1.5 text-[12.5px] font-semibold text-zinc-600 hover:bg-zinc-200">Remove</button>
++                        : <button onClick={async () => { const r = await (await fetch("/api/connectors", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connectorId: c.id, action: "add" }) })).json(); loadTab("connectors"); flash(r.note || `${c.name} added to your swarm.`); }} className="shrink-0 rounded-lg bg-[#0071e3] px-3 py-1.5 text-[12.5px] font-semibold text-white hover:bg-[#0077ed]">{c.rawStatus === "needs_setup" ? "Retry setup" : c.needsOAuth ? "Setup" : "Add"}</button>}
++                    </div>
++                    {(c.needsOAuth || c.rawStatus === "needs_setup") && <p className={`mt-2.5 flex items-start gap-1.5 rounded-lg px-3 py-2 text-[12px] leading-relaxed ${c.rawStatus === "needs_setup" ? "bg-amber-50 text-amber-800" : "bg-zinc-50 text-zinc-500"}`}>{c.rawStatus === "needs_setup" && <AlertCircle size={13} className="mt-[1px] shrink-0" />}{c.note}</p>}
++                  </div>
++                ))}
++              </div>
++            </div>
++          )}
++        </div>
++
++        <div className="flex items-center gap-2 border-t border-black/[0.07] px-5 py-3 text-[11.5px] text-zinc-400">
++          <span>BYOK only — keys are sealed per-user with AES-256-GCM and never echoed back.</span>
++          <span className="ml-auto hidden shrink-0 items-center gap-1 sm:flex">Esc to close</span>
++        </div>
++      </div>
++      <style>{`.inp{width:100%;border:1px solid rgba(0,0,0,.1);border-radius:10px;padding:8px 11px;font-size:13.5px;background:#fff;color:#1d1d1f}.inp:focus{outline:none;border-color:#0071e3;box-shadow:0 0 0 3px rgba(0,113,227,.12)}`}</style>
++    </div>
++  );
++}
++
++function Field({ label, children }: { label: string; children: ReactNode }) {
++  return <label className="block"><span className="mb-1 block text-[11.5px] font-medium text-zinc-500">{label}</span>{children}</label>;
++}
++function Empty({ text }: { text: string }) {
++  return <div className="flex items-center gap-2 rounded-xl border border-dashed border-black/10 px-4 py-5 text-[13px] text-zinc-400"><Loader2 size={14} className="animate-spin" />{text}</div>;
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalVmScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalVmScreen.tsx
+new file mode 100644
+index 000000000..365c2c505
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/minimal-ui/MinimalVmScreen.tsx
+@@ -0,0 +1,204 @@
++/**
++ * MinimalVmScreen — the dark VM desktop from the minimal UI prototype
++ * (_prototype-zip2/src/components/VmScreen.tsx, ported faithfully).
++ *
++ * Chrome bar (traffic lights + address pill + LIVE/DONE pill), desktop
++ * surface with the four app views (Desktop / Browser / Terminal / Editor),
++ * dock, moving cursor while running, activity feed docked right (white card)
++ * plus a mobile activity strip.
++ *
++ * One deliberate addition vs the prototype: the Frame type carries an
++ * optional `screenshot` field. When GET /api/runs/[id] returns a real
++ * screenshot (data URL or URL — supplied by the runtime worker when a live
++ * VM frame exists), it renders as an <img> filling the desktop surface in
++ * place of the simulated app views; the dock, cursor and activity feed stay
++ * overlaid on top. Without it, the simulated views render exactly as in
++ * the prototype.
++ */
++
++import { Globe, TerminalSquare, FileCode2, Monitor, MousePointerClick, Type, Play, Eye, Scroll, BookOpen, CheckCircle2, CircleDot, FolderOpen, FileText, ChevronRight } from "lucide-react";
++
++export type RunEvent = { id: number; seq: number; kind: string; label: string; detail?: string | null; app: string; atOffsetSec: number; browserUrl?: string | null; fileName?: string | null };
++export type Frame = { app: string; browserUrl: string; fileName: string; terminalLines: string[]; elapsed: number; screenshot?: string | null };
++
++export function kindIcon(kind: string) {
++  switch (kind) {
++    case "click": return MousePointerClick;
++    case "type": return Type;
++    case "run": return Play;
++    case "screen": return Eye;
++    case "scroll": return Scroll;
++    case "read": return BookOpen;
++    case "done": return CheckCircle2;
++    case "start": return CircleDot;
++    default: return CircleDot;
++  }
++}
++
++function fmt(sec: number) { const m = Math.floor(sec / 60), s = sec % 60; return m ? `${m}:${String(s).padStart(2, "0")}` : `0:${String(s).padStart(2, "0")}`; }
++
++export default function MinimalVmScreen({ prompt, events, frame, status, providerName, model }: {
++  prompt: string; events: RunEvent[]; frame: Frame; status: string; providerName?: string | null; model?: string | null;
++}) {
++  const reversed = [...events].reverse();
++  const app = frame.app;
++
++  return (
++    <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-[14px] border border-black/10 bg-[#17181c] shadow-[0_18px_50px_rgba(0,0,0,0.22)]">
++      {/* Chrome */}
++      <div className="flex h-11 shrink-0 items-center gap-3 border-b border-white/10 bg-[#222329] px-4">
++        <div className="flex gap-2"><span className="h-3 w-3 rounded-full bg-[#ff5f57]" /><span className="h-3 w-3 rounded-full bg-[#febc2e]" /><span className="h-3 w-3 rounded-full bg-[#28c840]" /></div>
++        <div className="mx-auto flex h-7 w-full max-w-[520px] items-center gap-2 rounded-lg bg-white/[0.07] px-3 text-[12px] text-zinc-300">
++          {app === "browser" ? <Globe size={13} className="shrink-0 text-zinc-400" /> : app === "terminal" ? <TerminalSquare size={13} className="shrink-0 text-zinc-400" /> : app === "editor" ? <FileCode2 size={13} className="shrink-0 text-zinc-400" /> : <Monitor size={13} className="shrink-0 text-zinc-400" />}
++          <span className="truncate">{app === "browser" ? frame.browserUrl : app === "terminal" ? "Terminal — ~/workspace" : app === "editor" ? frame.fileName : "Swarm VM — Ubuntu 24.04"}</span>
++        </div>
++        <div className="flex shrink-0 items-center gap-2">
++          <span className="hidden items-center gap-1.5 rounded-full bg-white/[0.07] px-2.5 py-1 text-[11px] font-medium text-zinc-200 sm:flex">
++            <span className={`h-1.5 w-1.5 rounded-full ${status === "running" ? "bg-emerald-400 pulse-dot" : "bg-zinc-500"}`} />
++            {status === "running" ? "LIVE" : status === "completed" ? "DONE" : "STOPPED"} · {fmt(frame.elapsed)}
++          </span>
++        </div>
++      </div>
++
++      <div className="relative min-h-0 flex-1">
++        {/* Desktop surface */}
++        <div className="absolute inset-0" style={{ background: "radial-gradient(900px 500px at 20% 0%, #2a2f45 0%, #17181c 55%)" }}>
++          {frame.screenshot ? (
++            <img src={frame.screenshot} alt="Live VM screen" className="absolute inset-0 h-full w-full object-cover" />
++          ) : (
++            <>
++              {app === "desktop" && <DesktopView prompt={prompt} />}
++              {app === "browser" && <BrowserView url={frame.browserUrl} prompt={prompt} />}
++              {app === "terminal" && <TerminalView lines={frame.terminalLines} />}
++              {app === "editor" && <EditorView fileName={frame.fileName} />}
++            </>
++          )}
++
++          {/* Dock */}
++          <div className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-2xl border border-white/10 bg-white/[0.08] px-2 py-1.5 backdrop-blur">
++            {[Globe, TerminalSquare, FileCode2, FolderOpen, Monitor].map((Icon, i) => (
++              <div key={i} className={`flex h-9 w-9 items-center justify-center rounded-xl ${((app === "browser" && i === 0) || (app === "terminal" && i === 1) || (app === "editor" && i === 2) || (app === "desktop" && i === 4)) ? "bg-white/20 text-white" : "text-zinc-400"}`}><Icon size={18} /></div>
++            ))}
++          </div>
++
++          {/* Cursor */}
++          {status === "running" && (
++            <div className="pointer-events-none absolute transition-all duration-700" style={{ left: `${28 + ((events.length * 17) % 52)}%`, top: `${22 + ((events.length * 23) % 48)}%` }}>
++              <MousePointerClick size={20} className="text-white drop-shadow-[0_2px_6px_rgba(0,0,0,.6)]" />
++            </div>
++          )}
++        </div>
++
++        {/* Activity feed — docked to the right edge */}
++        <aside className="absolute bottom-14 right-3 top-3 flex w-[300px] max-w-[78vw] flex-col overflow-hidden rounded-xl border border-black/10 bg-white/[0.97] shadow-[0_12px_36px_rgba(0,0,0,0.28)] backdrop-blur max-[640px]:hidden">
++          <div className="flex items-center justify-between border-b border-black/[0.06] px-3.5 py-2.5">
++            <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-zinc-500">Activity</span>
++            <span className="text-[11px] tabular-nums text-zinc-400">{events.length} actions · {providerName || "Swarm Router"}{model ? ` · ${model}` : ""}</span>
++          </div>
++          <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
++            {reversed.length === 0 && <p className="px-2 py-3 text-[13px] leading-relaxed text-zinc-500">Waiting for the agent's first action…</p>}
++            {reversed.map((e) => {
++              const Icon = kindIcon(e.kind);
++              const isLatest = e.seq === events[events.length - 1]?.seq && status === "running";
++              return (
++                <div key={e.id} className={`feed-item flex gap-2.5 rounded-lg px-2 py-[7px] ${isLatest ? "bg-[#0071e3]/[0.07]" : ""}`}>
++                  <span className={`mt-[1px] flex h-6 w-6 shrink-0 items-center justify-center rounded-md ${e.kind === "done" ? "bg-emerald-500/10 text-emerald-600" : isLatest ? "bg-[#0071e3]/10 text-[#0071e3]" : "bg-zinc-100 text-zinc-500"}`}><Icon size={13} /></span>
++                  <div className="min-w-0 flex-1">
++                    <div className="flex items-baseline justify-between gap-2">
++                      <p className={`truncate text-[13px] ${isLatest ? "font-semibold text-zinc-900" : "font-medium text-zinc-700"}`}>{e.label}</p>
++                      <span className="shrink-0 text-[11px] tabular-nums text-zinc-400">{fmt(e.atOffsetSec)}</span>
++                    </div>
++                    {e.detail && <p className="truncate text-[12px] text-zinc-400">{e.detail}</p>}
++                  </div>
++                </div>
++              );
++            })}
++          </div>
++          <div className="border-t border-black/[0.06] px-3.5 py-2 text-[11px] leading-relaxed text-zinc-400">Real events from this run's harness stream. Nothing here is fabricated.</div>
++        </aside>
++
++        {/* Mobile activity strip */}
++        <div className="absolute inset-x-3 bottom-14 hidden max-[640px]:block">
++          <div className="flex items-center gap-2 rounded-xl bg-white/95 px-3 py-2.5 shadow-lg">
++            {(() => { const last = events[events.length - 1]; const Icon = last ? kindIcon(last.kind) : CircleDot; return <><span className="flex h-6 w-6 items-center justify-center rounded-md bg-[#0071e3]/10 text-[#0071e3]"><Icon size={13} /></span><p className="min-w-0 flex-1 truncate text-[13px] font-medium text-zinc-800">{last?.label || "Starting…"}</p><span className="text-[11px] text-zinc-400">{events.length} actions</span></>; })()}
++          </div>
++        </div>
++      </div>
++    </div>
++  );
++}
++
++function DesktopView({ prompt }: { prompt: string }) {
++  return (
++    <div className="p-6 sm:p-8">
++      <div className="grid w-[300px] grid-cols-3 gap-4">
++        {[["Terminal", TerminalSquare], ["Chromium", Globe], ["Code", FileCode2], ["Files", FolderOpen], ["Settings", Monitor], ["Notes", FileText]].map(([label, Icon]: any) => (
++          <div key={label} className="flex flex-col items-center gap-1.5"><div className="flex h-12 w-12 items-center justify-center rounded-[13px] border border-white/10 bg-white/[0.09] text-zinc-200"><Icon size={21} /></div><span className="text-[11px] text-zinc-300">{label}</span></div>
++        ))}
++      </div>
++      <div className="mt-8 max-w-[520px] rounded-xl border border-white/10 bg-black/25 p-4 backdrop-blur">
++        <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-zinc-400">Task</p>
++        <p className="mt-1.5 line-clamp-3 text-[14px] leading-relaxed text-zinc-100">{prompt}</p>
++      </div>
++    </div>
++  );
++}
++
++function BrowserView({ url, prompt }: { url: string; prompt: string }) {
++  const isLibrary = url.includes("library");
++  return (
++    <div className="absolute inset-4 right-4 overflow-hidden rounded-[10px] bg-white shadow-xl sm:right-[324px] max-[640px]:right-4 max-[640px]:bottom-20">
++      <div className="flex items-center gap-2 border-b border-black/[0.06] px-4 py-2.5 text-[12px] text-zinc-500"><Globe size={13} /><span className="truncate font-medium text-zinc-700">{url}</span><ChevronRight size={13} className="ml-auto" /></div>
++      {isLibrary ? (
++        <div className="p-5">
++          <h3 className="text-[16px] font-semibold text-zinc-900">Library — Skills</h3>
++          <p className="mt-1 text-[13px] text-zinc-500">Load a skill to make it available to the agent. Cap: 10 loaded.</p>
++          <div className="mt-4 space-y-2">
++            {[["Code Review", "Review diffs for bugs and regressions", true], ["Systematic Debugging", "Reproduce, isolate, fix root causes", false], ["Frontend Design", "Polished minimal product UI", false]].map(([n, d, loaded]: any) => (
++              <div key={n} className="flex items-center gap-3 rounded-xl border border-black/[0.07] px-3.5 py-3"><div className="min-w-0 flex-1"><p className="text-[13.5px] font-medium text-zinc-900">{n}</p><p className="truncate text-[12px] text-zinc-400">{d}</p></div><span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${loaded ? "bg-emerald-50 text-emerald-700" : "bg-zinc-100 text-zinc-500"}`}>{loaded ? "Loaded" : "Load"}</span></div>
++            ))}
++          </div>
++        </div>
++      ) : (
++        <div className="p-5">
++          <div className="flex items-center gap-2"><span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#0071e3] text-[13px] font-bold text-white">S</span><span className="text-[15px] font-semibold text-zinc-900">Swarm Preview</span><span className="ml-auto rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">● Live</span></div>
++          <h3 className="mt-5 max-w-[440px] text-[20px] font-semibold leading-snug text-zinc-900">Your app, built and verified by the agent.</h3>
++          <p className="mt-2 max-w-[460px] text-[13.5px] leading-relaxed text-zinc-500">Task: {prompt.slice(0, 110)}{prompt.length > 110 ? "…" : ""}</p>
++          <div className="mt-5 grid grid-cols-3 gap-3">{["Build ✓", "Preview ✓", "Screen ✓"].map((t) => <div key={t} className="rounded-xl border border-black/[0.06] bg-zinc-50 px-3 py-3 text-center text-[12.5px] font-medium text-zinc-700">{t}</div>)}</div>
++        </div>
++      )}
++    </div>
++  );
++}
++
++function TerminalView({ lines }: { lines: string[] }) {
++  return (
++    <div className="absolute inset-4 overflow-hidden rounded-[10px] border border-white/10 bg-[#0c0d10] shadow-xl sm:right-[324px] max-[640px]:right-4 max-[640px]:bottom-20">
++      <div className="flex items-center gap-2 border-b border-white/[0.07] px-4 py-2.5 text-[12px] text-zinc-400"><TerminalSquare size={13} /> Terminal — zsh · ~/workspace</div>
++      <div className="space-y-[7px] overflow-hidden p-4 font-mono text-[12.5px] leading-relaxed">
++        {lines.map((l, i) => <p key={i} className={l.startsWith("✓") || l.startsWith("▲") ? "text-emerald-400" : l.startsWith("$") ? "text-zinc-100" : "text-zinc-400"}>{l}</p>)}
++        <p className="text-zinc-100">$ <span className="term-cursor">▊</span></p>
++      </div>
++    </div>
++  );
++}
++
++function EditorView({ fileName }: { fileName: string }) {
++  const code = fileName.includes("catalog")
++    ? ["export const PROVIDER_CATALOG = [", "  { id: \"inception\",", "    defaultModel: \"mercury-3\",", "    isFree: true, latencyMs: 410 },", "  { id: \"nvidia\",", "    defaultModel: \"nemotron-3.5…\",", "    isFree: true, latencyMs: 520 },", "]", "", "// user-rank is the tiebreaker", "export function computeEffective(…)"]
++    : ["export default function Page() {", "  const [run, setRun] = useState()", "  // screen · input · settings", "  return (", "    <main>", "      <VmScreen frame={frame} />", "      <InputBar onSend={send} />", "    </main>", "  )", "}"];
++  return (
++    <div className="absolute inset-4 flex overflow-hidden rounded-[10px] border border-white/10 bg-[#14151a] shadow-xl sm:right-[324px] max-[640px]:right-4 max-[640px]:bottom-20">
++      <div className="hidden w-[148px] shrink-0 border-r border-white/[0.07] p-3 sm:block">
++        <p className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-zinc-500">Workspace</p>
++        <div className="mt-3 space-y-1 text-[12px]">{["src/app/page.tsx", "src/lib/catalog.ts", "src/lib/router.ts", "package.json"].map((f) => <p key={f} className={`truncate rounded-md px-2 py-1.5 ${fileName.endsWith(f.split("/").pop()!) ? "bg-white/10 text-white" : "text-zinc-400"}`}>{f.split("/").pop()}</p>)}</div>
++      </div>
++      <div className="min-w-0 flex-1">
++        <div className="flex items-center gap-2 border-b border-white/[0.07] px-4 py-2.5 text-[12px] text-zinc-300"><FileCode2 size={13} /> {fileName}<span className="ml-auto rounded bg-white/[0.07] px-1.5 py-0.5 text-[10.5px] text-zinc-400">TypeScript</span></div>
++        <div className="p-4 font-mono text-[12.5px] leading-[1.75]">
++          {code.map((l, i) => <p key={i} className="whitespace-pre text-zinc-300"><span className="mr-4 inline-block w-5 select-none text-right text-zinc-600">{i + 1}</span>{l}</p>)}
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/index.css b/apps/swarmagents/minimalist-ui/src/index.css
+index b5abf2667..fc18bcb56 100644
+--- a/apps/swarmagents/minimalist-ui/src/index.css
++++ b/apps/swarmagents/minimalist-ui/src/index.css
+@@ -154,3 +154,13 @@ select option { background: var(--surface-elevated); color: var(--text-primary);
+     transition-duration: 0.01ms !important;
+   }
+ }
++
++/* ── Minimal 3-part main view (MinimalHome) — same keyframes as app/globals.css ── */
++@keyframes fadeSlideIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
++@keyframes slideInRight { from { transform: translateX(24px); opacity: .6; } to { transform: translateX(0); opacity: 1; } }
++@keyframes pulseDot { 0%,100% { opacity: 1; transform: scale(1);} 50% { opacity: .45; transform: scale(.82);} }
++@keyframes blinkCursor { 0%,100%{opacity:1} 50%{opacity:0} }
++.feed-item { animation: fadeSlideIn .22s ease-out both; }
++.panel-in { animation: slideInRight .18s ease-out both; }
++.pulse-dot { animation: pulseDot 1.4s ease-in-out infinite; }
++.term-cursor { animation: blinkCursor 1s step-end infinite; }
+-- 
+2.55.0
+

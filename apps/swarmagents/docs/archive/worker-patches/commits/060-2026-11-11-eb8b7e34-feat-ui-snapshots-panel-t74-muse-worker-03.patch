@@ -1,0 +1,992 @@
+From eb8b7e34ceef23fe14d78ab97a70a4fdbd97de32 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 20:43:34 +0000
+Subject: [PATCH] feat(ui): snapshots panel (t74, muse-worker-03)
+
+Snapshots section lists the caller's VM checkpoints, creates one with a label validated by the shared server regex, and restores one behind a confirm dialog; API errors surface via the toast layer.
+
+- lib/vm/snapshot-label.ts: browser-safe home for SNAPSHOT_LABEL_RE + validateSnapshotLabel + snapshotLabelError (no node imports, so the minimalist UI can import the exact server rule instead of a divergent client copy); docker-driver.ts now re-exports it.
+- lib/client/snapshots.ts: typed fetch helpers for GET/POST /api/runtime/vm/snapshots (SnapshotsError, describeSnapshotsError).
+- minimalist-ui SnapshotsPanel: list (newest first), create form with live inline label validation, restore confirm dialog, toasts on failure; wired in as a fifth Computer view (tab, mobile tab, Cmd/Ctrl+5).
+- Tests: snapshot-label.test.ts (shared regex) + client/snapshots.test.ts (list/create/restore/error mapping); keymap test extended for Cmd/Ctrl+5.
+
+Path correction: the task named apps/swarmagents-final/, which does not exist (renamed to apps/swarmagents/ in 50046ea9); all work is in apps/swarmagents/. No API/auth/middleware changes; no new dependencies.
+---
+ apps/swarmagents/lib/client/snapshots.test.ts | 117 +++++++
+ apps/swarmagents/lib/client/snapshots.ts      | 181 ++++++++++
+ apps/swarmagents/lib/vm/docker-driver.ts      |  17 +-
+ .../swarmagents/lib/vm/snapshot-label.test.ts |  53 +++
+ apps/swarmagents/lib/vm/snapshot-label.ts     |  38 ++
+ apps/swarmagents/minimalist-ui/src/App.tsx    |  10 +-
+ .../src/components/ComputerScreen.tsx         |  10 +-
+ .../src/components/MobileTabBar.tsx           |   5 +-
+ .../src/components/RoleAndVmBar.tsx           |   4 +-
+ .../src/components/SnapshotsPanel.tsx         | 331 ++++++++++++++++++
+ .../minimalist-ui/src/utils/keymap.test.ts    |   3 +-
+ .../minimalist-ui/src/utils/keymap.ts         |  10 +-
+ 12 files changed, 750 insertions(+), 29 deletions(-)
+ create mode 100644 apps/swarmagents/lib/client/snapshots.test.ts
+ create mode 100644 apps/swarmagents/lib/client/snapshots.ts
+ create mode 100644 apps/swarmagents/lib/vm/snapshot-label.test.ts
+ create mode 100644 apps/swarmagents/lib/vm/snapshot-label.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/SnapshotsPanel.tsx
+
+diff --git a/apps/swarmagents/lib/client/snapshots.test.ts b/apps/swarmagents/lib/client/snapshots.test.ts
+new file mode 100644
+index 000000000..a3e313b1c
+--- /dev/null
++++ b/apps/swarmagents/lib/client/snapshots.test.ts
+@@ -0,0 +1,117 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  SnapshotsError,
++  createSnapshot,
++  describeSnapshotsError,
++  fetchSnapshots,
++  restoreSnapshot,
++  type FetchLike,
++} from "./snapshots";
++
++function fakeFetch(body: unknown, init?: ResponseInit & { raw?: string }): FetchLike {
++  return async () =>
++    new Response(init?.raw ?? JSON.stringify(body), {
++      status: init?.status ?? 200,
++      headers: { "content-type": "application/json" },
++    });
++}
++
++test("fetchSnapshots parses the caller's snapshots newest first", async () => {
++  const fetchImpl = fakeFetch({
++    snapshots: [
++      { label: "second", createdAt: 2000 },
++      { label: "first", createdAt: 1000 },
++    ],
++  });
++  const list = await fetchSnapshots({ fetchImpl });
++  assert.deepEqual(
++    list.map((s) => s.label),
++    ["second", "first"],
++  );
++  assert.equal(list[0]?.createdAt, 2000);
++});
++
++test("fetchSnapshots rejects a malformed list payload", async () => {
++  await assert.rejects(
++    () => fetchSnapshots({ fetchImpl: fakeFetch({ snapshots: "nope" }) }),
++    (err: unknown) => err instanceof SnapshotsError && err.kind === "malformed",
++  );
++  await assert.rejects(
++    () => fetchSnapshots({ fetchImpl: fakeFetch({ snapshots: [{ label: "ok" }] }) }),
++    (err: unknown) => err instanceof SnapshotsError && err.kind === "malformed",
++  );
++});
++
++test("createSnapshot posts create + label and returns the created snapshot", async () => {
++  let seenUrl = "";
++  let seenInit: RequestInit | undefined;
++  const fetchImpl: FetchLike = async (url, init) => {
++    seenUrl = String(url);
++    seenInit = init;
++    return new Response(
++      JSON.stringify({ ok: true, snapshot: { label: "before-edit", createdAt: 3000 } }),
++      { status: 201, headers: { "content-type": "application/json" } },
++    );
++  };
++  const created = await createSnapshot("before-edit", { fetchImpl });
++  assert.equal(seenUrl, "/api/runtime/vm/snapshots");
++  assert.equal(seenInit?.method, "POST");
++  assert.deepEqual(JSON.parse(String(seenInit?.body)), { action: "create", label: "before-edit" });
++  assert.equal(created.label, "before-edit");
++  assert.equal(created.createdAt, 3000);
++});
++
++test("createSnapshot surfaces a 400 label rejection as invalid_label", async () => {
++  await assert.rejects(
++    () =>
++      createSnapshot("BAD", {
++        fetchImpl: fakeFetch({ error: "Invalid snapshot label: \"BAD\"" }, { status: 400 }),
++      }),
++    (err: unknown) =>
++      err instanceof SnapshotsError &&
++      err.kind === "invalid_label" &&
++      /Invalid snapshot label/.test(err.message),
++  );
++});
++
++test("restoreSnapshot posts restore + label and accepts the ok payload", async () => {
++  let seenInit: RequestInit | undefined;
++  const fetchImpl: FetchLike = async (_url, init) => {
++    seenInit = init;
++    return new Response(JSON.stringify({ ok: true, label: "before-edit" }), {
++      status: 200,
++      headers: { "content-type": "application/json" },
++    });
++  };
++  await restoreSnapshot("before-edit", { fetchImpl });
++  assert.equal(seenInit?.method, "POST");
++  assert.deepEqual(JSON.parse(String(seenInit?.body)), { action: "restore", label: "before-edit" });
++});
++
++test("restoreSnapshot maps a 404 to not_found with the server message", async () => {
++  await assert.rejects(
++    () =>
++      restoreSnapshot("ghost", {
++        fetchImpl: fakeFetch({ error: "Snapshot not found: \"ghost\"" }, { status: 404 }),
++      }),
++    (err: unknown) =>
++      err instanceof SnapshotsError &&
++      err.kind === "not_found" &&
++      err.status === 404 &&
++      /not found/i.test(err.message),
++  );
++});
++
++test("a failed fetch becomes a network error, and describeSnapshotsError passes messages through", async () => {
++  const failing: FetchLike = async () => {
++    throw new Error("boom");
++  };
++  await assert.rejects(
++    () => fetchSnapshots({ fetchImpl: failing }),
++    (err: unknown) => err instanceof SnapshotsError && err.kind === "network",
++  );
++  assert.equal(describeSnapshotsError(new SnapshotsError("server", "Server broke.")), "Server broke.");
++  assert.equal(describeSnapshotsError(new Error("plain")), "plain");
++  assert.equal(describeSnapshotsError(undefined), "Could not reach the snapshot API.");
++});
+diff --git a/apps/swarmagents/lib/client/snapshots.ts b/apps/swarmagents/lib/client/snapshots.ts
+new file mode 100644
+index 000000000..c60822505
+--- /dev/null
++++ b/apps/swarmagents/lib/client/snapshots.ts
+@@ -0,0 +1,181 @@
++/**
++ * Client helpers for VM snapshots.
++ *
++ * The UI never talks to the VM directly; it goes through
++ * GET/POST /api/runtime/vm/snapshots. These helpers turn the API's error
++ * payloads into a typed SnapshotsError the panel can surface via toasts.
++ * Label validation itself lives in lib/vm/snapshot-label, shared with the
++ * server — this module only moves snapshots over the wire.
++ */
++
++import type { VmSnapshot } from "../vm/types";
++
++export type { VmSnapshot };
++
++export type SnapshotsErrorKind =
++  | "invalid_label"
++  | "unauthorized"
++  | "not_found"
++  | "bad_request"
++  | "network"
++  | "server"
++  | "malformed";
++
++export class SnapshotsError extends Error {
++  readonly kind: SnapshotsErrorKind;
++  readonly status?: number;
++
++  constructor(kind: SnapshotsErrorKind, message: string, extra?: { status?: number }) {
++    super(message);
++    this.name = "SnapshotsError";
++    this.kind = kind;
++    this.status = extra?.status;
++  }
++}
++
++export type FetchLike = typeof fetch;
++
++export interface SnapshotsRequestOptions {
++  signal?: AbortSignal;
++  /** Injectable fetch for tests and SSR-safe callers. */
++  fetchImpl?: FetchLike;
++}
++
++const SNAPSHOTS_URL = "/api/runtime/vm/snapshots";
++
++const STATUS_ERROR_KIND: Record<number, SnapshotsErrorKind> = {
++  400: "bad_request",
++  401: "unauthorized",
++  404: "not_found",
++};
++
++function isAbortError(err: unknown): boolean {
++  return err instanceof Error && err.name === "AbortError";
++}
++
++function asObject(value: unknown): Record<string, unknown> | null {
++  return value && typeof value === "object" && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : null;
++}
++
++function asString(value: unknown): string | undefined {
++  return typeof value === "string" ? value : undefined;
++}
++
++function asNumber(value: unknown): number | undefined {
++  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
++}
++
++function parseSnapshot(raw: unknown): VmSnapshot {
++  const entry = asObject(raw);
++  const label = asString(entry?.label);
++  const createdAt = asNumber(entry?.createdAt);
++  if (!entry || !label || createdAt === undefined) {
++    throw new SnapshotsError("malformed", "The snapshot API returned an invalid snapshot.");
++  }
++  return {
++    label,
++    createdAt,
++    ...(typeof entry.image === "string" ? { image: entry.image } : {}),
++  };
++}
++
++function parseList(body: unknown): VmSnapshot[] {
++  const obj = asObject(body);
++  if (!obj || !Array.isArray(obj.snapshots)) {
++    throw new SnapshotsError("malformed", "The snapshot API returned an unexpected list payload.");
++  }
++  return obj.snapshots.map(parseSnapshot);
++}
++
++function parseCreated(body: unknown): VmSnapshot {
++  const obj = asObject(body);
++  if (!obj || obj.ok !== true) {
++    throw new SnapshotsError("malformed", "The snapshot API returned an unexpected create payload.");
++  }
++  return parseSnapshot(obj.snapshot);
++}
++
++async function requestJson(
++  init: RequestInit,
++  parse: (body: unknown) => VmSnapshot[] | VmSnapshot,
++  options: SnapshotsRequestOptions,
++): Promise<VmSnapshot[] | VmSnapshot> {
++  const fetchImpl = options.fetchImpl ?? fetch;
++
++  let res: Response;
++  try {
++    res = await fetchImpl(SNAPSHOTS_URL, { ...init, signal: options.signal });
++  } catch (err) {
++    if (isAbortError(err)) throw err;
++    throw new SnapshotsError("network", "Could not reach the snapshot API.");
++  }
++
++  let body: unknown = null;
++  try {
++    body = await res.json();
++  } catch {
++    body = null;
++  }
++
++  if (!res.ok) {
++    const obj = asObject(body);
++    const message = asString(obj?.error) ?? `The snapshot API returned ${res.status}.`;
++    const kind =
++      res.status === 400 && /label/i.test(message)
++        ? "invalid_label"
++        : (STATUS_ERROR_KIND[res.status] ?? "server");
++    throw new SnapshotsError(kind, message, { status: res.status });
++  }
++
++  return parse(body);
++}
++
++/** List the caller's snapshots, newest first (as the API returns them). */
++export async function fetchSnapshots(
++  options: SnapshotsRequestOptions = {},
++): Promise<VmSnapshot[]> {
++  return (await requestJson({ method: "GET" }, parseList, options)) as VmSnapshot[];
++}
++
++/** Create a snapshot with the given label. */
++export async function createSnapshot(
++  label: string,
++  options: SnapshotsRequestOptions = {},
++): Promise<VmSnapshot> {
++  return (await requestJson(
++    {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ action: "create", label }),
++    },
++    parseCreated,
++    options,
++  )) as VmSnapshot;
++}
++
++/** Restore the snapshot with the given label. */
++export async function restoreSnapshot(
++  label: string,
++  options: SnapshotsRequestOptions = {},
++): Promise<void> {
++  await requestJson(
++    {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ action: "restore", label }),
++    },
++    () => [],
++    options,
++  );
++}
++
++/** Message suitable for a toast; unknown errors fall back safely. */
++export function describeSnapshotsError(err: unknown): string {
++  if (err instanceof SnapshotsError) return err.message;
++  if (err instanceof Error && err.message) return err.message;
++  return "Could not reach the snapshot API.";
++}
++
++export { isAbortError };
+diff --git a/apps/swarmagents/lib/vm/docker-driver.ts b/apps/swarmagents/lib/vm/docker-driver.ts
+index 6eb6f379f..691158670 100644
+--- a/apps/swarmagents/lib/vm/docker-driver.ts
++++ b/apps/swarmagents/lib/vm/docker-driver.ts
+@@ -15,6 +15,9 @@ import type {
+   VmSnapshot,
+ } from "./types";
+ import { VmFileError } from "./files";
++import { validateSnapshotLabel, SNAPSHOT_LABEL_RE } from "./snapshot-label";
++
++export { validateSnapshotLabel, SNAPSHOT_LABEL_RE } from "./snapshot-label";
+ import {
+   DEFAULT_VM_CPUS,
+   DEFAULT_VM_MEMORY,
+@@ -303,20 +306,6 @@ export function validateSnapshotName(name: string): void {
+   }
+ }
+ 
+-/**
+- * Snapshot labels become a docker image tag, so keep them to the conservative
+- * tag charset: 1-64 chars, lowercase alphanumerics plus `.`, `_` and `-`,
+- * starting with an alphanumeric, and no `..` (which docker rejects).
+- */
+-const SNAPSHOT_LABEL_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+-
+-/** Validate a user-supplied snapshot label (throws on anything unsafe). */
+-export function validateSnapshotLabel(label: string): void {
+-  if (!SNAPSHOT_LABEL_RE.test(label) || label.includes("..")) {
+-    throw new Error(`Invalid snapshot label: ${JSON.stringify(label)}`);
+-  }
+-}
+-
+ export interface DockerVmDriverOptions {
+   image?: string;
+   memory?: string;
+diff --git a/apps/swarmagents/lib/vm/snapshot-label.test.ts b/apps/swarmagents/lib/vm/snapshot-label.test.ts
+new file mode 100644
+index 000000000..1a4d1e3f7
+--- /dev/null
++++ b/apps/swarmagents/lib/vm/snapshot-label.test.ts
+@@ -0,0 +1,53 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  SNAPSHOT_LABEL_RE,
++  snapshotLabelError,
++  validateSnapshotLabel,
++} from "./snapshot-label.js";
++
++/**
++ * These are the same cases the server enforces in lib/vm/docker-driver.ts
++ * (which re-exports this module) and in app/api/runtime/vm/snapshots/route.ts.
++ * The client panel imports this module directly, so a label the panel accepts
++ * is a label the API accepts — there is no second, divergent client copy.
++ */
++
++test("validateSnapshotLabel accepts safe docker tag labels", () => {
++  for (const label of ["base", "before-edit", "v1.2", "a_b", "checkpoint-2026"]) {
++    assert.doesNotThrow(() => validateSnapshotLabel(label));
++  }
++});
++
++test("validateSnapshotLabel rejects unsafe labels", () => {
++  for (const label of [
++    "",
++    "Snap",
++    "snap!",
++    "snap:tag",
++    "/abs",
++    "a..b",
++    "-lead",
++    ".lead",
++    "_lead",
++    "has space",
++    "a/b",
++    "x".repeat(65),
++  ]) {
++    assert.throws(() => validateSnapshotLabel(label), /Invalid snapshot label/);
++  }
++});
++
++test("SNAPSHOT_LABEL_RE is the single shared regex", () => {
++  assert.equal(SNAPSHOT_LABEL_RE.source, "^[a-z0-9][a-z0-9._-]{0,63}$");
++  assert.equal(validateSnapshotLabel.length, 1);
++});
++
++test("snapshotLabelError returns null for valid labels and a message otherwise", () => {
++  assert.equal(snapshotLabelError("before-edit"), null);
++  assert.equal(snapshotLabelError("v1.2"), null);
++  assert.equal(snapshotLabelError(""), "Label is required.");
++  assert.match(snapshotLabelError("UPPER") ?? "", /Invalid label/);
++  assert.match(snapshotLabelError("a..b") ?? "", /Invalid label/);
++  assert.match(snapshotLabelError("x".repeat(65)) ?? "", /at most 64/);
++});
+diff --git a/apps/swarmagents/lib/vm/snapshot-label.ts b/apps/swarmagents/lib/vm/snapshot-label.ts
+new file mode 100644
+index 000000000..4499df716
+--- /dev/null
++++ b/apps/swarmagents/lib/vm/snapshot-label.ts
+@@ -0,0 +1,38 @@
++/**
++ * Snapshot label validation, shared by the server and the browser UI.
++ *
++ * This module has no imports — not even node builtins — so the minimalist UI
++ * can import it directly. Snapshot labels become a docker image tag, so they
++ * keep the conservative tag charset: 1-64 chars, lowercase alphanumerics plus
++ * `.`, `_` and `-`, starting with an alphanumeric, and no `..` (which docker
++ * rejects). The regex and the rule live here exactly once; docker-driver.ts
++ * re-exports them, and the Snapshots panel validates with the same code the
++ * API route uses.
++ */
++
++/** The server-side label charset, shared with the client. */
++export const SNAPSHOT_LABEL_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
++
++/** Human-readable form of the label rule, for inline form errors. */
++export const SNAPSHOT_LABEL_RULE =
++  "1–64 characters: lowercase letters, digits, . _ -, starting with a letter or digit, no “..”";
++
++/** Validate a user-supplied snapshot label (throws on anything unsafe). */
++export function validateSnapshotLabel(label: string): void {
++  if (!SNAPSHOT_LABEL_RE.test(label) || label.includes("..")) {
++    throw new Error(`Invalid snapshot label: ${JSON.stringify(label)}`);
++  }
++}
++
++/**
++ * Friendly validation message for a label, or null when the label is valid.
++ * The client form uses this so the inline error matches the server rejection.
++ */
++export function snapshotLabelError(label: string): string | null {
++  if (!label) return "Label is required.";
++  if (label.length > 64) return "Label must be at most 64 characters.";
++  if (!SNAPSHOT_LABEL_RE.test(label) || label.includes("..")) {
++    return `Invalid label — ${SNAPSHOT_LABEL_RULE}.`;
++  }
++  return null;
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index 2467e0884..885a2521f 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -38,7 +38,7 @@ export default function App() {
+   const [helpOpen, setHelpOpen] = useState(false);
+   const [navOpen, setNavOpen] = useState(false);
+   const navRef = useRef<HTMLDivElement>(null);
+-  const [activeView, setActiveView] = useState<'telemetry' | 'terminal' | 'browser' | 'files'>('terminal');
++  const [activeView, setActiveView] = useState<'telemetry' | 'terminal' | 'browser' | 'files' | 'snapshots'>('terminal');
+   const [vmResetting, setVmResetting] = useState(false);
+   const [showLanding, setShowLanding] = useState(true);
+ 
+@@ -205,7 +205,7 @@ export default function App() {
+     ctrlRef.current?.abort();
+   }, [runId, activeAgent.uid]);
+ 
+-  // Workspace keyboard shortcuts: Cmd/Ctrl+K focuses the input, Cmd/Ctrl+1..4
++  // Workspace keyboard shortcuts: Cmd/Ctrl+K focuses the input, Cmd/Ctrl+1..5
+   // switch views, ? opens the help overlay, Esc closes it. Bare keys are
+   // ignored while typing so they never hijack text entry (see utils/keymap).
+   useEffect(() => {
+@@ -560,6 +560,12 @@ export default function App() {
+                   ⌘4
+                 </kbd>
+               </li>
++              <li className="flex items-center justify-between gap-4">
++                <span className="text-white/70">Snapshots view</span>
++                <kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[11px] text-white/80">
++                  ⌘5
++                </kbd>
++              </li>
+             </ul>
+             <p className="mt-4 border-t border-white/10 pt-3 text-xs text-white/45">
+               Press <kbd className="rounded bg-white/10 px-1 py-0.5 font-mono text-[11px] text-white/70">?</kbd>{' '}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index fc8620c07..926516faf 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import React, { useCallback, useEffect, useRef, useState } from "react";
+-import { Terminal, Globe, ShieldCheck, Cpu, FileText } from "lucide-react";
++import { Terminal, Globe, ShieldCheck, Cpu, FileText, Camera } from "lucide-react";
+ import type { LogEvent } from "../engine";
+ import { AnsiRenderer } from "../../../components/AnsiRenderer";
+ import { getRunStreamBadge, useRunStream, type RunStreamBadgeTone, type RunStreamItem } from "../../../lib/client/useRunStream";
+@@ -15,6 +15,7 @@ import { useSessionPersisted } from "../store";
+ import { extractApprovals } from "../../../lib/client/runTimeline";
+ import { ApprovalGate } from "./ApprovalGate";
+ import { FilesView } from "./FilesView";
++import { SnapshotsPanel } from "./SnapshotsPanel";
+ import { BrowserView } from "./BrowserView";
+ 
+ interface ComputerScreenProps {
+@@ -25,8 +26,8 @@ interface ComputerScreenProps {
+    * current simulated terminal output.
+    */
+   runId?: string;
+-  activeView: "telemetry" | "terminal" | "browser" | "files";
+-  onToggleView: (view: "telemetry" | "terminal" | "browser" | "files") => void;
++  activeView: "telemetry" | "terminal" | "browser" | "files" | "snapshots";
++  onToggleView: (view: "telemetry" | "terminal" | "browser" | "files" | "snapshots") => void;
+   onResetVm: () => void;
+   vmResetting: boolean;
+   activeRoleName: string;
+@@ -40,6 +41,7 @@ const VIEW_TABS = [
+   { view: "terminal", label: "Terminal", Icon: Terminal },
+   { view: "browser", label: "Browser", Icon: Globe },
+   { view: "files", label: "Files", Icon: FileText },
++  { view: "snapshots", label: "Snapshots", Icon: Camera },
+   { view: "telemetry", label: "Telemetry", Icon: Cpu },
+ ] as const;
+ 
+@@ -631,6 +633,8 @@ export function ComputerScreen({
+ 
+         {activeView === "files" && <FilesView refreshToken={filesRefreshToken} />}
+ 
++        {activeView === "snapshots" && <SnapshotsPanel />}
++
+         {activeView === "telemetry" && (
+           <div className="flex-1 p-6 grid place-items-center text-center">
+             <div className="max-w-md">
+diff --git a/apps/swarmagents/minimalist-ui/src/components/MobileTabBar.tsx b/apps/swarmagents/minimalist-ui/src/components/MobileTabBar.tsx
+index fc1a0bcc1..6733f7a4d 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/MobileTabBar.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/MobileTabBar.tsx
+@@ -1,13 +1,14 @@
+ "use client";
+ 
+-import { Terminal, Globe, FileText, Cpu, type LucideIcon } from "lucide-react";
++import { Terminal, Globe, FileText, Camera, Cpu, type LucideIcon } from "lucide-react";
+ 
+-export type ViewId = "telemetry" | "terminal" | "browser" | "files";
++export type ViewId = "telemetry" | "terminal" | "browser" | "files" | "snapshots";
+ 
+ const TABS: { id: ViewId; label: string; icon: LucideIcon }[] = [
+   { id: "terminal", label: "Terminal", icon: Terminal },
+   { id: "browser", label: "Browser", icon: Globe },
+   { id: "files", label: "Files", icon: FileText },
++  { id: "snapshots", label: "Snapshots", icon: Camera },
+   { id: "telemetry", label: "Telemetry", icon: Cpu },
+ ];
+ 
+diff --git a/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx b/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
+index 254e77aaa..6ae44306c 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/RoleAndVmBar.tsx
+@@ -14,8 +14,8 @@ interface RoleAndVmBarProps {
+   onOpenSettings: () => void;
+   onResetVm: () => void;
+   vmResetting: boolean;
+-  onToggleView: (view: "telemetry" | "terminal" | "browser" | "files") => void;
+-  activeView: "telemetry" | "terminal" | "browser" | "files";
++  onToggleView: (view: "telemetry" | "terminal" | "browser" | "files" | "snapshots") => void;
++  activeView: "telemetry" | "terminal" | "browser" | "files" | "snapshots";
+ }
+ 
+ export function RoleAndVmBar({
+diff --git a/apps/swarmagents/minimalist-ui/src/components/SnapshotsPanel.tsx b/apps/swarmagents/minimalist-ui/src/components/SnapshotsPanel.tsx
+new file mode 100644
+index 000000000..9201bf43b
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/SnapshotsPanel.tsx
+@@ -0,0 +1,331 @@
++"use client";
++
++import React, { useCallback, useEffect, useState } from "react";
++import {
++  AlertTriangle,
++  Camera,
++  History,
++  Loader2,
++  RefreshCw,
++  RotateCcw,
++  X,
++} from "lucide-react";
++import { useToasts } from "./Toasts";
++import {
++  createSnapshot,
++  describeSnapshotsError,
++  fetchSnapshots,
++  restoreSnapshot,
++  type VmSnapshot,
++} from "../../../lib/client/snapshots";
++import {
++  SNAPSHOT_LABEL_RULE,
++  snapshotLabelError,
++} from "../../../lib/vm/snapshot-label";
++
++function isAbort(err: unknown): boolean {
++  return err instanceof Error && err.name === "AbortError";
++}
++
++function pad2(value: number): string {
++  return String(value).padStart(2, "0");
++}
++
++function formatCreated(createdAt: number): string {
++  if (!createdAt || !Number.isFinite(createdAt)) return "—";
++  const date = new Date(createdAt);
++  if (Number.isNaN(date.getTime())) return "—";
++  return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())} ${pad2(
++    date.getUTCHours(),
++  )}:${pad2(date.getUTCMinutes())}`;
++}
++
++/**
++ * Snapshots panel (t74): lists the caller's VM checkpoints, creates one with
++ * a label validated by the same rule the server enforces
++ * (lib/vm/snapshot-label, shared — never a divergent client copy), and
++ * restores one behind a confirm dialog. API failures surface via the toast
++ * layer; the list itself keeps an inline retry state.
++ */
++export function SnapshotsPanel() {
++  const { push: pushToast } = useToasts();
++  const [snapshots, setSnapshots] = useState<VmSnapshot[]>([]);
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState<string>();
++  const [reload, setReload] = useState(0);
++
++  const [label, setLabel] = useState("");
++  const [labelError, setLabelError] = useState<string>();
++  const [creating, setCreating] = useState(false);
++
++  /** Label awaiting a restore confirmation, or null when no dialog is open. */
++  const [confirmRestore, setConfirmRestore] = useState<string | null>(null);
++  const [restoring, setRestoring] = useState(false);
++
++  const load = useCallback(async (signal: AbortSignal) => {
++    setLoading(true);
++    setError(undefined);
++    try {
++      const data = await fetchSnapshots({ signal });
++      if (signal.aborted) return;
++      setSnapshots(data);
++    } catch (err) {
++      if (isAbort(err) || signal.aborted) return;
++      setError(describeSnapshotsError(err));
++    } finally {
++      if (!signal.aborted) setLoading(false);
++    }
++  }, []);
++
++  useEffect(() => {
++    const ctrl = new AbortController();
++    load(ctrl.signal);
++    return () => ctrl.abort();
++  }, [load, reload]);
++
++  const refresh = useCallback(() => setReload((n) => n + 1), []);
++
++  const onLabelChange = useCallback((value: string) => {
++    setLabel(value);
++    // Live validation with the shared server rule, so an invalid label is
++    // caught here with a clear inline error instead of a round trip.
++    setLabelError(snapshotLabelError(value.trim()) ?? undefined);
++  }, []);
++
++  const handleCreate = useCallback(
++    async (e: React.FormEvent) => {
++      e.preventDefault();
++      const trimmed = label.trim();
++      const validation = snapshotLabelError(trimmed);
++      if (validation) {
++        setLabelError(validation);
++        return;
++      }
++      setCreating(true);
++      try {
++        const created = await createSnapshot(trimmed);
++        setSnapshots((prev) => [created, ...prev.filter((s) => s.label !== created.label)]);
++        setLabel("");
++        setLabelError(undefined);
++        pushToast({ tone: "success", message: `Snapshot “${created.label}” created.` });
++      } catch (err) {
++        if (!isAbort(err)) {
++          pushToast({
++            tone: "error",
++            message: "Could not create snapshot.",
++            detail: describeSnapshotsError(err),
++          });
++        }
++      } finally {
++        setCreating(false);
++      }
++    },
++    [label, pushToast],
++  );
++
++  const handleRestore = useCallback(async () => {
++    if (!confirmRestore) return;
++    const target = confirmRestore;
++    setRestoring(true);
++    try {
++      await restoreSnapshot(target);
++      setConfirmRestore(null);
++      pushToast({ tone: "success", message: `Restored snapshot “${target}”.` });
++      refresh();
++    } catch (err) {
++      if (!isAbort(err)) {
++        pushToast({
++          tone: "error",
++          message: `Could not restore snapshot “${target}”.`,
++          detail: describeSnapshotsError(err),
++        });
++      }
++    } finally {
++      setRestoring(false);
++    }
++  }, [confirmRestore, pushToast, refresh]);
++
++  return (
++    <div className="flex flex-1 min-h-0 flex-col">
++      {/* Toolbar: title + refresh */}
++      <div className="flex items-center gap-2 border-b border-white/10 bg-[#0f0f15] px-3 py-2">
++        <Camera className="h-3.5 w-3.5 shrink-0 text-cyan-400/80" />
++        <span className="min-w-0 flex-1 truncate text-[11px] font-mono text-white/70">
++          Snapshots — checkpoints of your VM, restored on demand
++        </span>
++        <button
++          onClick={refresh}
++          title="Refresh"
++          className="flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1 text-[11px] font-mono text-white/50 transition hover:bg-white/10 hover:text-white"
++        >
++          <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
++          <span>Refresh</span>
++        </button>
++      </div>
++
++      {/* Create form */}
++      <form
++        onSubmit={handleCreate}
++        className="flex flex-col gap-1.5 border-b border-white/10 px-3 py-3"
++        noValidate
++      >
++        <div className="flex items-center gap-2">
++          <label htmlFor="snapshot-label" className="shrink-0 text-[11px] font-mono text-white/50">
++            New snapshot
++          </label>
++          <input
++            id="snapshot-label"
++            value={label}
++            onChange={(e) => onLabelChange(e.target.value)}
++            placeholder="e.g. before-edit"
++            autoComplete="off"
++            spellCheck={false}
++            aria-invalid={labelError ? true : undefined}
++            aria-describedby={labelError ? "snapshot-label-error" : "snapshot-label-hint"}
++            className={`min-w-0 flex-1 rounded-lg border bg-black/40 px-2.5 py-1.5 font-mono text-[11px] text-white placeholder:text-white/25 focus:outline-none focus:ring-2 ${
++              labelError
++                ? "border-rose-400/40 focus:ring-rose-400/40"
++                : "border-white/10 focus:border-cyan-400/40 focus:ring-cyan-400/30"
++            }`}
++          />
++          <button
++            type="submit"
++            disabled={creating || !label.trim() || Boolean(labelError)}
++            className="flex shrink-0 items-center gap-1.5 rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-1.5 text-[11px] font-mono text-cyan-200 transition hover:bg-cyan-400/20 disabled:cursor-not-allowed disabled:opacity-40"
++          >
++            {creating ? <Loader2 className="h-3 w-3 animate-spin" /> : <Camera className="h-3 w-3" />}
++            <span>{creating ? "Creating…" : "Create"}</span>
++          </button>
++        </div>
++        {labelError ? (
++          <p id="snapshot-label-error" role="alert" className="text-[11px] text-rose-300/90">
++            {labelError}
++          </p>
++        ) : (
++          <p id="snapshot-label-hint" className="text-[10px] text-white/30">
++            Label rule: {SNAPSHOT_LABEL_RULE}.
++          </p>
++        )}
++      </form>
++
++      {/* Snapshot list */}
++      <div className="flex min-w-0 flex-1 flex-col overflow-y-auto scrollbar-thin">
++        {error ? (
++          <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
++            <AlertTriangle className="h-5 w-5 text-rose-400/70" />
++            <div className="text-xs text-rose-300/90">{error}</div>
++            <button
++              onClick={refresh}
++              className="rounded-lg border border-white/10 px-2.5 py-1 text-[11px] text-white/60 hover:bg-white/10 hover:text-white"
++            >
++              Try again
++            </button>
++          </div>
++        ) : loading && snapshots.length === 0 ? (
++          <div className="flex flex-1 items-center justify-center gap-2 p-6 text-xs text-white/40">
++            <Loader2 className="h-4 w-4 animate-spin" /> Loading snapshots…
++          </div>
++        ) : snapshots.length === 0 ? (
++          <div className="flex flex-1 flex-col items-center justify-center gap-1.5 p-6 text-center">
++            <History className="h-6 w-6 text-white/20" />
++            <div className="text-xs text-white/50">No snapshots yet</div>
++            <div className="max-w-[240px] text-[10px] leading-relaxed text-white/25">
++              Create one above to checkpoint your VM — restore it later to roll back to exactly
++              this state.
++            </div>
++          </div>
++        ) : (
++          <>
++            <div className="sticky top-0 z-10 grid grid-cols-[minmax(0,1fr)_112px_96px] items-center gap-2 border-b border-white/5 bg-[#0b0b10]/95 px-3 py-1.5 font-mono text-[10px] uppercase tracking-wider text-white/30 backdrop-blur">
++              <span>Label</span>
++              <span className="text-right">Created</span>
++              <span className="text-right">Restore</span>
++            </div>
++            <div className="p-1.5">
++              {snapshots.map((snap) => (
++                <div
++                  key={snap.label}
++                  className="grid grid-cols-[minmax(0,1fr)_112px_96px] items-center gap-2 rounded-lg px-2 py-1.5 font-mono text-[11px] text-white/70 hover:bg-white/[0.07]"
++                >
++                  <span className="flex min-w-0 items-center gap-2">
++                    <Camera className="h-3.5 w-3.5 shrink-0 text-cyan-400/80" />
++                    <span className="min-w-0 truncate" title={snap.label}>
++                      {snap.label}
++                    </span>
++                  </span>
++                  <span className="text-right text-[10px] text-white/30">
++                    {formatCreated(snap.createdAt)}
++                  </span>
++                  <span className="flex justify-end">
++                    <button
++                      onClick={() => setConfirmRestore(snap.label)}
++                      disabled={restoring}
++                      title={`Restore snapshot “${snap.label}”`}
++                      className="flex items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-[10px] text-white/60 transition hover:border-emerald-400/40 hover:bg-emerald-400/10 hover:text-emerald-200 disabled:cursor-not-allowed disabled:opacity-40"
++                    >
++                      <RotateCcw className="h-3 w-3" />
++                      <span>Restore</span>
++                    </button>
++                  </span>
++                </div>
++              ))}
++            </div>
++          </>
++        )}
++      </div>
++
++      {/* Restore confirm dialog */}
++      {confirmRestore && (
++        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
++          <div
++            className="absolute inset-0 bg-black/60"
++            onClick={() => !restoring && setConfirmRestore(null)}
++          />
++          <div
++            role="alertdialog"
++            aria-modal="true"
++            aria-label="Confirm snapshot restore"
++            className="relative w-full max-w-sm rounded-2xl border border-white/10 bg-[#0d0d12] p-6 shadow-2xl"
++          >
++            <div className="mb-2 flex items-center justify-between">
++              <h2 className="text-base font-semibold text-white">Restore snapshot?</h2>
++              <button
++                type="button"
++                onClick={() => setConfirmRestore(null)}
++                disabled={restoring}
++                className="rounded-full p-1 text-white/50 transition hover:bg-white/10 hover:text-white disabled:opacity-40"
++                aria-label="Close restore confirmation"
++              >
++                <X className="h-4 w-4" />
++              </button>
++            </div>
++            <p className="text-sm leading-relaxed text-white/60">
++              This rolls your VM back to snapshot{" "}
++              <span className="font-mono text-[13px] text-cyan-200">“{confirmRestore}”</span>. Any
++              changes made since it was created will be lost.
++            </p>
++            <div className="mt-5 flex justify-end gap-2">
++              <button
++                type="button"
++                onClick={() => setConfirmRestore(null)}
++                disabled={restoring}
++                className="rounded-lg border border-white/10 px-3 py-1.5 text-xs text-white/70 transition hover:bg-white/10 hover:text-white disabled:opacity-40"
++              >
++                Cancel
++              </button>
++              <button
++                type="button"
++                onClick={handleRestore}
++                disabled={restoring}
++                className="flex items-center gap-1.5 rounded-lg border border-emerald-400/40 bg-emerald-400/15 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-400/25 disabled:cursor-not-allowed disabled:opacity-50"
++              >
++                {restoring && <Loader2 className="h-3 w-3 animate-spin" />}
++                {restoring ? "Restoring…" : "Restore snapshot"}
++              </button>
++            </div>
++          </div>
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/utils/keymap.test.ts b/apps/swarmagents/minimalist-ui/src/utils/keymap.test.ts
+index 1aacedf8f..a4ff3ee33 100644
+--- a/apps/swarmagents/minimalist-ui/src/utils/keymap.test.ts
++++ b/apps/swarmagents/minimalist-ui/src/utils/keymap.test.ts
+@@ -11,11 +11,12 @@ test("Cmd/Ctrl+K maps to focusing the input", () => {
+   assert.deepEqual(mapKeyToAction(ev({ key: "K", ctrlKey: true }), true), { type: "focusInput" });
+ });
+ 
+-test("Cmd/Ctrl+1..4 maps to the four views in order", () => {
++test("Cmd/Ctrl+1..5 maps to the five views in order", () => {
+   assert.deepEqual(mapKeyToAction(ev({ key: "1", metaKey: true }), false), { type: "view", view: "terminal" });
+   assert.deepEqual(mapKeyToAction(ev({ key: "2", ctrlKey: true }), true), { type: "view", view: "browser" });
+   assert.deepEqual(mapKeyToAction(ev({ key: "3", metaKey: true }), false), { type: "view", view: "files" });
+   assert.deepEqual(mapKeyToAction(ev({ key: "4", ctrlKey: true }), false), { type: "view", view: "telemetry" });
++  assert.deepEqual(mapKeyToAction(ev({ key: "5", metaKey: true }), false), { type: "view", view: "snapshots" });
+ });
+ 
+ test("? opens help and Escape closes, only when not typing", () => {
+diff --git a/apps/swarmagents/minimalist-ui/src/utils/keymap.ts b/apps/swarmagents/minimalist-ui/src/utils/keymap.ts
+index 0dc237c2a..9e20d5d1d 100644
+--- a/apps/swarmagents/minimalist-ui/src/utils/keymap.ts
++++ b/apps/swarmagents/minimalist-ui/src/utils/keymap.ts
+@@ -5,15 +5,15 @@
+  * DOM. The app attaches a window keydown listener and feeds it through
+  * `mapKeyToAction`; this module never touches the DOM.
+  *
+- * Modifier chords (Cmd/Ctrl+K, Cmd/Ctrl+1..4) work anywhere — they cannot be
++ * Modifier chords (Cmd/Ctrl+K, Cmd/Ctrl+1..5) work anywhere — they cannot be
+  * typed as literal text — while bare keys (? and Escape) are ignored when the
+  * focus is inside an input so they never hijack normal typing.
+  */
+ 
+-export type UiView = "telemetry" | "terminal" | "browser" | "files";
++export type UiView = "telemetry" | "terminal" | "browser" | "files" | "snapshots";
+ 
+-/** Digit order for Cmd/Ctrl+1..4 view switching. */
+-export const VIEW_ORDER: readonly UiView[] = ["terminal", "browser", "files", "telemetry"];
++/** Digit order for Cmd/Ctrl+1..5 view switching. */
++export const VIEW_ORDER: readonly UiView[] = ["terminal", "browser", "files", "telemetry", "snapshots"];
+ 
+ export type ShortcutAction =
+   | { type: "focusInput" }
+@@ -28,7 +28,7 @@ export interface KeyEventLike {
+   altKey?: boolean;
+ }
+ 
+-const VIEW_DIGITS = ["1", "2", "3", "4"] as const;
++const VIEW_DIGITS = ["1", "2", "3", "4", "5"] as const;
+ 
+ export function mapKeyToAction(event: KeyEventLike, isTyping: boolean): ShortcutAction | null {
+   // Modifier chords are safe to honor even while typing.
+-- 
+2.55.0
+

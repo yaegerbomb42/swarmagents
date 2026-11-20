@@ -1,0 +1,471 @@
+From 650f7ec845fb478cd0c7fd08f3e6577007221fff Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 22:43:15 +0000
+Subject: [PATCH] [p10] In-app Docs / Help center
+
+---
+ apps/swarmagents/app/docs/page.tsx            | 378 ++++++++++++++++++
+ apps/swarmagents/app/help/page.tsx            |   8 +
+ apps/swarmagents/lib/middleware.test.ts       |  12 +
+ apps/swarmagents/middleware.ts                |   4 +-
+ .../src/components/SiteFooter.tsx             |   6 +
+ 5 files changed, 406 insertions(+), 2 deletions(-)
+ create mode 100644 apps/swarmagents/app/docs/page.tsx
+ create mode 100644 apps/swarmagents/app/help/page.tsx
+
+diff --git a/apps/swarmagents/app/docs/page.tsx b/apps/swarmagents/app/docs/page.tsx
+new file mode 100644
+index 000000000..ba3e0ffca
+--- /dev/null
++++ b/apps/swarmagents/app/docs/page.tsx
+@@ -0,0 +1,378 @@
++import type { Metadata } from "next";
++import type { CSSProperties, ReactNode } from "react";
++
++export const metadata: Metadata = {
++  title: "Docs — SwarmAgents",
++  description: "Getting started with SwarmAgents: signing in, your persistent VM, starting a run, watching it work, approving tools, and adding provider keys.",
++};
++
++// Served fresh on every request (like /login): the root layout reads the
++// per-request CSP nonce from headers, so this page must never be cached.
++export const dynamic = "force-dynamic";
++
++const pageStyle: CSSProperties = {
++  minHeight: "100vh",
++  background: "var(--color-bg)",
++  color: "var(--color-text)",
++  fontFamily: "var(--font-sans)",
++  padding: "var(--space-8, 32px) var(--space-5, 20px) var(--space-16, 64px)",
++};
++
++const columnStyle: CSSProperties = {
++  maxWidth: 720,
++  margin: "0 auto",
++};
++
++const headerStyle: CSSProperties = {
++  display: "flex",
++  alignItems: "center",
++  justifyContent: "space-between",
++  gap: 16,
++  paddingBottom: "var(--space-6, 24px)",
++  borderBottom: "1px solid var(--color-line)",
++  marginBottom: "var(--space-8, 32px)",
++};
++
++const wordmarkStyle: CSSProperties = {
++  display: "flex",
++  alignItems: "center",
++  gap: 10,
++  color: "var(--color-text)",
++  textDecoration: "none",
++  fontSize: 15,
++  fontWeight: 600,
++  letterSpacing: "-0.02em",
++};
++
++const dotStyle: CSSProperties = {
++  width: 10,
++  height: 10,
++  flexShrink: 0,
++  borderRadius: "9999px",
++  background: "var(--color-focus)",
++  boxShadow: "0 0 10px var(--color-focus)",
++};
++
++const signInStyle: CSSProperties = {
++  color: "var(--color-focus)",
++  fontSize: 14,
++  textDecoration: "underline",
++  textUnderlineOffset: 3,
++};
++
++const titleStyle: CSSProperties = {
++  fontSize: "clamp(1.75rem, 1.64rem + 0.55vw, 2rem)",
++  fontWeight: 700,
++  letterSpacing: "-0.02em",
++  lineHeight: "var(--line-height-tight)",
++  margin: "0 0 12px",
++};
++
++const ledeStyle: CSSProperties = {
++  color: "var(--color-text-muted)",
++  fontSize: 15,
++  lineHeight: "var(--line-height-relaxed)",
++  margin: "0 0 32px",
++};
++
++const tocStyle: CSSProperties = {
++  border: "1px solid var(--color-line-strong)",
++  borderRadius: "var(--radius-lg, 12px)",
++  background: "var(--color-bg-elevated)",
++  padding: "var(--space-5, 20px) var(--space-6, 24px)",
++  marginBottom: "var(--space-10, 40px)",
++};
++
++const tocTitleStyle: CSSProperties = {
++  fontSize: 12,
++  fontWeight: 600,
++  letterSpacing: "0.06em",
++  textTransform: "uppercase",
++  color: "var(--color-text-muted)",
++  margin: "0 0 12px",
++};
++
++const tocListStyle: CSSProperties = {
++  listStyle: "none",
++  margin: 0,
++  padding: 0,
++  display: "flex",
++  flexDirection: "column",
++  gap: 8,
++};
++
++const tocLinkStyle: CSSProperties = {
++  color: "var(--color-focus)",
++  fontSize: 14,
++  textDecoration: "none",
++};
++
++const sectionStyle: CSSProperties = {
++  marginBottom: "var(--space-10, 40px)",
++  scrollMarginTop: "var(--space-6, 24px)",
++};
++
++const headingStyle: CSSProperties = {
++  fontSize: "clamp(1.125rem, 1.07rem + 0.28vw, 1.25rem)",
++  fontWeight: 600,
++  letterSpacing: "-0.02em",
++  margin: "0 0 12px",
++};
++
++const bodyStyle: CSSProperties = {
++  color: "var(--color-text-muted)",
++  fontSize: 15,
++  lineHeight: "var(--line-height-relaxed)",
++  margin: "0 0 12px",
++};
++
++const listStyle: CSSProperties = {
++  color: "var(--color-text-muted)",
++  fontSize: 15,
++  lineHeight: "var(--line-height-relaxed)",
++  margin: "0 0 12px",
++  paddingLeft: 20,
++};
++
++const inlineLinkStyle: CSSProperties = {
++  color: "var(--color-focus)",
++  textDecoration: "underline",
++  textUnderlineOffset: 3,
++};
++
++const kbdStyle: CSSProperties = {
++  background: "var(--color-bg-sunken)",
++  border: "1px solid var(--color-line-strong)",
++  borderRadius: "var(--radius-xs, 4px)",
++  padding: "1px 6px",
++  fontFamily: "var(--font-mono)",
++  fontSize: 12,
++  color: "var(--color-text)",
++  whiteSpace: "nowrap",
++};
++
++const noteStyle: CSSProperties = {
++  border: "1px solid var(--color-line-strong)",
++  borderLeft: `3px solid var(--color-warn)`,
++  borderRadius: "var(--radius-md, 8px)",
++  background: "var(--color-bg-elevated)",
++  padding: "var(--space-4, 16px) var(--space-5, 20px)",
++  marginBottom: "var(--space-10, 40px)",
++};
++
++const noteTextStyle: CSSProperties = {
++  color: "var(--color-text-muted)",
++  fontSize: 14,
++  lineHeight: "var(--line-height-relaxed)",
++  margin: 0,
++};
++
++const footerStyle: CSSProperties = {
++  borderTop: "1px solid var(--color-line)",
++  paddingTop: "var(--space-6, 24px)",
++  display: "flex",
++  flexWrap: "wrap",
++  gap: 16,
++  justifyContent: "space-between",
++  color: "var(--color-text-faint)",
++  fontFamily: "var(--font-mono)",
++  fontSize: 12,
++};
++
++function Section({ id, title, children }: { id: string; title: string; children: ReactNode }) {
++  return (
++    <section id={id} style={sectionStyle} aria-labelledby={`${id}-heading`}>
++      <h2 id={`${id}-heading`} style={headingStyle}>
++        {title}
++      </h2>
++      {children}
++    </section>
++  );
++}
++
++function ShortcutRow({ keys, action }: { keys: string; action: string }) {
++  return (
++    <li style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
++      <span>{action}</span>
++      <kbd style={kbdStyle}>{keys}</kbd>
++    </li>
++  );
++}
++
++export default function DocsPage() {
++  return (
++    <main style={pageStyle}>
++      <div style={columnStyle}>
++        <header style={headerStyle}>
++          <a href="/" style={wordmarkStyle}>
++            <span aria-hidden="true" style={dotStyle} />
++            SwarmAgents
++          </a>
++          <a href="/login" style={signInStyle}>
++            Sign in
++          </a>
++        </header>
++
++        <h1 style={titleStyle}>Docs</h1>
++        <p style={ledeStyle}>
++          SwarmAgents is one chat bar, one agent, and a persistent Linux cloud computer that does the
++          work. This guide covers getting in, starting a run, watching it work, and keeping your
++          machine and keys under control.
++        </p>
++
++        <nav style={tocStyle} aria-label="On this page">
++          <p style={tocTitleStyle}>On this page</p>
++          <ul style={tocListStyle}>
++            <li><a href="#signing-in" style={tocLinkStyle}>Signing in</a></li>
++            <li><a href="#persistent-vm" style={tocLinkStyle}>Your persistent VM</a></li>
++            <li><a href="#starting-a-run" style={tocLinkStyle}>Starting a run</a></li>
++            <li><a href="#watching" style={tocLinkStyle}>Watching terminal, browser, and files</a></li>
++            <li><a href="#approving" style={tocLinkStyle}>Approving risky tools</a></li>
++            <li><a href="#provider-keys" style={tocLinkStyle}>Adding a provider key</a></li>
++            <li><a href="#resetting-vm" style={tocLinkStyle}>Resetting the VM</a></li>
++            <li><a href="#keyboard-shortcuts" style={tocLinkStyle}>Keyboard shortcuts</a></li>
++          </ul>
++        </nav>
++
++        <Section id="signing-in" title="Signing in">
++          <p style={bodyStyle}>
++            Open <a href="/login" style={inlineLinkStyle}>/login</a> and sign in with your email and
++            password. If your workspace allows sign-ups, the same page offers a{" "}
++            <strong style={{ color: "var(--color-text)" }}>Create account</strong> option — new
++            accounts are created there, not from inside the app. If you are already signed in,
++            visiting /login sends you straight back to where you were headed.
++          </p>
++          <p style={bodyStyle}>
++            Sessions are signed and expire: if you are sent back to the sign-in page after a while
++            away, just sign in again — your VM and your runs are still there.
++          </p>
++        </Section>
++
++        <Section id="persistent-vm" title="Your persistent VM">
++          <p style={bodyStyle}>
++            Every account gets its own persistent Linux cloud computer. It stays up between runs, so
++            files the agent creates, tools it installs, and work in progress are still there when
++            you come back. The <strong style={{ color: "var(--color-text)" }}>Cloud VM Active</strong>{" "}
++            pill at the top of the app shows its status; if it is starting up or hibernated, give it
++            a moment and it will come ready.
++          </p>
++          <p style={bodyStyle}>
++            The agent has full control of that machine and runs your tasks on it — that is the point
++            — so treat it as your own computer: don&apos;t paste secrets into a run unless you mean
++            for the agent to use them, and reset the machine (below) when you want a clean slate.
++          </p>
++        </Section>
++
++        <Section id="starting-a-run" title="Starting a run">
++          <ol style={listStyle}>
++            <li>Type what you want done in the prompt bar at the bottom of the screen.</li>
++            <li>Pick a provider and model from the provider pill if you want something other than the default.</li>
++            <li>Send it. The agent plans the work, runs tools on your VM, and streams what it is doing.</li>
++          </ol>
++          <p style={bodyStyle}>
++            You can keep chatting while a run is going: follow-up messages steer the same run. If a
++            run stalls or goes off track, stop it and start a fresh one with a clearer prompt.
++          </p>
++        </Section>
++
++        <Section id="watching" title="Watching terminal, browser, and files">
++          <p style={bodyStyle}>
++            Nothing is hidden while a run works. Switch views from the top bar or with the keyboard
++            shortcuts below:
++          </p>
++          <ul style={listStyle}>
++            <li>
++              <strong style={{ color: "var(--color-text)" }}>Terminal</strong> — the agent&apos;s live
++              command output and log stream, as it happens.
++            </li>
++            <li>
++              <strong style={{ color: "var(--color-text)" }}>Browser</strong> — pages the agent opens
++              while it browses or tests something.
++            </li>
++            <li>
++              <strong style={{ color: "var(--color-text)" }}>Files</strong> — the workspace tree; files
++              the agent edits light up so you can see what changed and reload them with the edits
++              highlighted.
++            </li>
++            <li>
++              <strong style={{ color: "var(--color-text)" }}>Telemetry</strong> — run progress, steps,
++              and usage for the current session.
++            </li>
++          </ul>
++        </Section>
++
++        <Section id="approving" title="Approving risky tools">
++          <p style={bodyStyle}>
++            Some tool calls are risky enough that the agent will not run them on its own — for
++            example, commands that change or delete things outside the workspace. When that happens
++            the run pauses and an approval card appears. Nothing runs until you decide: approve it
++            to let that one call through, or deny it and the agent works around it.
++          </p>
++          <p style={bodyStyle}>
++            Approvals are per call, not blanket permission. If you deny something the run genuinely
++            needs, say so in the chat and the agent will find another way or ask again with more
++            context.
++          </p>
++        </Section>
++
++        <Section id="provider-keys" title="Adding a provider key">
++          <p style={bodyStyle}>
++            Models run through providers (for example Nemotron, Mercury, Gemini, Groq, or OpenRouter).
++            To use a provider with your own key, open the{" "}
++            <a href="/providers" style={inlineLinkStyle}>Providers</a> page — linked from the footer
++            of the app — find the provider, and choose <strong style={{ color: "var(--color-text)" }}>Add key</strong>.
++            You can add more than one key per provider, and rotate a key by replacing the slot it
++            lives in.
++          </p>
++          <p style={bodyStyle}>
++            Keys are stored server-side and never travel in the browser; the Providers page only ever
++            shows the last few characters of a key. Removing a key from a slot takes effect
++            immediately for new runs.
++          </p>
++        </Section>
++
++        <Section id="resetting-vm" title="Resetting the VM">
++          <p style={bodyStyle}>
++            The <strong style={{ color: "var(--color-text)" }}>Reset VM</strong> button in the top bar
++            wipes and resets your Linux cloud computer: it clears scratch processes and restores a
++            clean environment. You will be asked to confirm first — this is the way to recover from
++            a wedged machine or to start completely fresh.
++          </p>
++        </Section>
++
++        <Section id="keyboard-shortcuts" title="Keyboard shortcuts">
++          <p style={bodyStyle}>
++            The same list is available inside the app: press <kbd style={kbdStyle}>?</kbd> anywhere
++            to open the shortcuts overlay, or <kbd style={kbdStyle}>Esc</kbd> to close it.
++          </p>
++          <ul style={{ ...listStyle, listStyle: "none", paddingLeft: 0, display: "flex", flexDirection: "column", gap: 12 }}>
++            <ShortcutRow keys="⌘K / Ctrl K" action="Focus the prompt input" />
++            <ShortcutRow keys="⌘1" action="Terminal view" />
++            <ShortcutRow keys="⌘2" action="Browser view" />
++            <ShortcutRow keys="⌘3" action="Files view" />
++            <ShortcutRow keys="⌘4" action="Telemetry view" />
++            <ShortcutRow keys="?" action="Open the shortcuts overlay" />
++            <ShortcutRow keys="Esc" action="Close the shortcuts overlay" />
++          </ul>
++        </Section>
++
++        <aside style={noteStyle} aria-label="Note on the live desktop view">
++          <p style={noteTextStyle}>
++            <strong style={{ color: "var(--color-text)" }}>Note:</strong> a live desktop view — watching
++            the agent&apos;s screen directly and taking control of the mouse and keyboard — is still
++            landing. For now, follow runs in the Terminal, Browser, and Files views above.
++          </p>
++        </aside>
++
++        <footer style={footerStyle}>
++          <span>© SwarmAgents</span>
++          <span>
++            <a href="/" style={{ color: "inherit" }}>Back to the app</a>
++            {" · "}
++            <a href="/login" style={{ color: "inherit" }}>Sign in</a>
++          </span>
++        </footer>
++      </div>
++    </main>
++  );
++}
+diff --git a/apps/swarmagents/app/help/page.tsx b/apps/swarmagents/app/help/page.tsx
+new file mode 100644
+index 000000000..b0ad0ecc9
+--- /dev/null
++++ b/apps/swarmagents/app/help/page.tsx
+@@ -0,0 +1,8 @@
++import { redirect } from "next/navigation";
++
++export const dynamic = "force-dynamic";
++
++/** /help is an alias for the docs: send everyone to /docs. */
++export default function HelpPage() {
++  redirect("/docs");
++}
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index c971b9f25..ac3b893a7 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -53,6 +53,18 @@ test("passes authenticated requests through with a valid session cookie", () =>
+   assert.equal(res.headers.get("location"), null, "authenticated requests must not redirect");
+ });
+ 
++test("lets unauthenticated visitors open /docs (public help center)", () => {
++  const res = middleware(req("http://swarm.example.com/docs", { host: "swarm.example.com" }));
++  assert.equal(res.status, 200);
++  assert.equal(res.headers.get("location"), null, "/docs must not redirect to /login");
++});
++
++test("lets unauthenticated visitors open /help (redirects to /docs at the page)", () => {
++  const res = middleware(req("http://swarm.example.com/help", { host: "swarm.example.com" }));
++  assert.equal(res.status, 200);
++  assert.equal(res.headers.get("location"), null, "/help must not redirect to /login");
++});
++
+ test("rejects cross-site state-changing API requests with 403 JSON", async () => {
+   for (const method of STATE_CHANGING) {
+     const res = middleware(
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index b5268f03e..db20098d1 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -28,8 +28,8 @@ function withSecurityHeaders(
+ // Kept under this name because route handlers that bypass middleware (uploads) import it as their gate.
+ export { isAllowed as isLocal } from "./lib/auth";
+ 
+-/** Reachable signed out: the sign-in page and the endpoints it uses. */
+-const PUBLIC = new Set(["/login", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
++/** Reachable signed out: the sign-in page, the public docs, and the endpoints they use. */
++const PUBLIC = new Set(["/login", "/docs", "/help", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
+ 
+ /** The public board MCP endpoint is exempt from the cross-site gate (external MCP clients call it). */
+ const BOARD_PATH = "/api/mcp/swarm-board";
+diff --git a/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx b/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+index 275345cc4..f37c951ed 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+@@ -39,6 +39,12 @@ export function SiteFooter() {
+       <div className="mx-auto flex w-full max-w-5xl flex-col items-center justify-between gap-2 px-1 py-3 font-mono text-[11px] text-white/40 sm:flex-row">
+         <span className="whitespace-nowrap">© SwarmAgents</span>
+         <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1">
++          <a
++            href="/docs"
++            className="rounded transition-colors hover:text-cyan-300 active:text-cyan-200"
++          >
++            Docs
++          </a>
+           <a
+             href="/providers"
+             className="rounded transition-colors hover:text-cyan-300 active:text-cyan-200"
+-- 
+2.55.0
+

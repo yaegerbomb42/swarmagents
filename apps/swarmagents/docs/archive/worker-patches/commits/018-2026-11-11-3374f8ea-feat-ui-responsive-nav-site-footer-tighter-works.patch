@@ -1,0 +1,336 @@
+From 3374f8eab1f2eb64166ac0af9e6a95f37273d2b1 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 13:33:03 -0600
+Subject: [PATCH] feat(ui): responsive nav, site footer, tighter workspace
+ spacing
+
+---
+ apps/swarmagents/minimalist-ui/src/App.tsx    | 166 ++++++++++++++++--
+ .../src/components/SiteFooter.tsx             |  67 +++++++
+ 2 files changed, 216 insertions(+), 17 deletions(-)
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index e6a3ee121..4e2f5ab25 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -1,5 +1,5 @@
+ import { useCallback, useRef, useState, useEffect } from 'react';
+-import { Settings2, BookOpen, MonitorPlay, Sparkles, PlugZap } from 'lucide-react';
++import { Settings2, BookOpen, MonitorPlay, Sparkles, PlugZap, Menu, X } from 'lucide-react';
+ import {
+   type ActiveRole,
+   type Attachment,
+@@ -19,6 +19,7 @@ import { PromptAndWhyModal } from './components/PromptAndWhyModal';
+ import { ComputerScreen } from './components/ComputerScreen';
+ import { SwarmIntro } from './components/SwarmIntro';
+ import { LandingHero } from './components/LandingHero';
++import { SiteFooter } from './components/SiteFooter';
+ import { ThreadPanel } from './components/ThreadPanel';
+ import { useToasts } from './components/Toasts';
+ import { describeFailure } from '../../lib/ui/toasts';
+@@ -32,6 +33,8 @@ export default function App() {
+ 
+   const [settingsOpen, setSettingsOpen] = useState(false);
+   const [whyOpen, setWhyOpen] = useState(false);
++  const [navOpen, setNavOpen] = useState(false);
++  const navRef = useRef<HTMLDivElement>(null);
+   const [activeView, setActiveView] = useState<'telemetry' | 'terminal' | 'browser' | 'files'>('terminal');
+   const [vmResetting, setVmResetting] = useState(false);
+   const [showLanding, setShowLanding] = useState(true);
+@@ -47,6 +50,25 @@ export default function App() {
+   const ctrlRef = useRef<AbortController | null>(null);
+   const { push: pushToast } = useToasts();
+ 
++  // Close the compact nav when focus/click moves outside it or Escape is pressed.
++  useEffect(() => {
++    if (!navOpen) return;
++    const onPointerDown = (e: MouseEvent | TouchEvent) => {
++      if (navRef.current && !navRef.current.contains(e.target as Node)) setNavOpen(false);
++    };
++    const onKeyDown = (e: KeyboardEvent) => {
++      if (e.key === 'Escape') setNavOpen(false);
++    };
++    document.addEventListener('mousedown', onPointerDown);
++    document.addEventListener('touchstart', onPointerDown);
++    document.addEventListener('keydown', onKeyDown);
++    return () => {
++      document.removeEventListener('mousedown', onPointerDown);
++      document.removeEventListener('touchstart', onPointerDown);
++      document.removeEventListener('keydown', onKeyDown);
++    };
++  }, [navOpen]);
++
+   // Derive the 1 active agent role
+   const activeRolePreset = ROLES.find((r) => r.id === activeRoleId) || ROLES[0];
+   const activeAgent: ActiveRole = {
+@@ -193,43 +215,72 @@ export default function App() {
+       </div>
+ 
+       {/* 3. Top Navigation Bar */}
+-      <header className="fixed top-0 inset-x-0 z-30 flex items-center justify-between px-6 py-4 max-w-6xl mx-auto w-full">
+-        <div className="flex items-center gap-3 cursor-pointer" onClick={() => setShowLanding(!showLanding)}>
+-          <span className="text-base font-semibold tracking-tight text-white font-mono flex items-center gap-1.5">
++      <header className="fixed top-0 inset-x-0 z-30 mx-auto flex w-full max-w-6xl items-center justify-between px-4 py-4 sm:px-6">
++        <div className="flex min-w-0 items-center gap-2 sm:gap-3">
++          <button
++            onClick={() => setShowLanding(true)}
++            className="flex shrink-0 items-center gap-1.5 font-mono text-sm font-semibold tracking-tight text-white transition hover:text-white/90 sm:text-base"
++            title="SwarmAgents home"
++          >
+             swarmagents<span className="text-cyan-400">.codes</span>
+-          </span>
++          </button>
+           {showLanding ? (
+-            <span className="text-[10px] font-mono text-cyan-400 bg-cyan-400/10 px-2 py-0.5 rounded-full border border-cyan-400/20">
++            <span className="shrink-0 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2 py-0.5 font-mono text-[10px] text-cyan-400">
+               Overview
+             </span>
+           ) : (
+-            <span className="text-[10px] font-mono text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded-full border border-emerald-400/20">
++            <span className="shrink-0 rounded-full border border-emerald-400/20 bg-emerald-400/10 px-2 py-0.5 font-mono text-[10px] text-emerald-400">
+               Cloud VM Active
+             </span>
+           )}
+         </div>
+ 
+-        <div className="flex items-center gap-2">
++        {/* Desktop nav */}
++        <nav className="hidden items-center gap-2 sm:flex" aria-label="Primary">
++          <button
++            onClick={() => setShowLanding(true)}
++            aria-pressed={showLanding}
++            className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1.5 text-xs transition-all active:scale-95 ${
++              showLanding
++                ? 'border border-cyan-400/30 bg-cyan-400/10 text-cyan-200'
++                : 'glass-soft text-white/70 hover:bg-white/10 hover:text-white'
++            }`}
++          >
++            <Sparkles className="h-3.5 w-3.5" />
++            <span>Overview</span>
++          </button>
++
+           <button
+-            onClick={() => setShowLanding(!showLanding)}
+-            className="glass-soft flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs text-white/70 hover:text-white transition"
++            onClick={() => setShowLanding(false)}
++            aria-pressed={!showLanding}
++            className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1.5 text-xs transition-all active:scale-95 ${
++              !showLanding
++                ? 'border border-cyan-400/30 bg-cyan-400/10 text-cyan-200'
++                : 'glass-soft text-white/70 hover:bg-white/10 hover:text-white'
++            }`}
+           >
+-            {showLanding ? <MonitorPlay className="w-3.5 h-3.5" /> : <Sparkles className="w-3.5 h-3.5" />}
+-            <span>{showLanding ? 'Go to Computer' : 'About SwarmAgents'}</span>
++            <MonitorPlay className="h-3.5 w-3.5" />
++            <span>Computer</span>
+           </button>
+ 
+           <button
+             onClick={() => setWhyOpen(true)}
+-            className="glass-soft flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs text-white/70 hover:text-white transition"
++            aria-haspopup="dialog"
++            aria-expanded={whyOpen}
++            className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1.5 text-xs transition-all active:scale-95 ${
++              whyOpen
++                ? 'border border-emerald-400/30 bg-emerald-400/10 text-emerald-200'
++                : 'glass-soft text-white/70 hover:bg-white/10 hover:text-white'
++            }`}
+             title="Open Living Why File & Agent Prompt"
+           >
+             <BookOpen className="h-3.5 w-3.5" />
+-            <span>Why File</span>
++            <span>Why</span>
+           </button>
+ 
+           <a
+             href="/providers"
+-            className="glass-soft flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs text-white/70 hover:text-white transition"
++            className="glass-soft flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1.5 text-xs text-white/70 transition-all hover:bg-white/10 hover:text-white active:scale-95"
+             title="Provider catalog — add API keys"
+           >
+             <PlugZap className="h-3.5 w-3.5" />
+@@ -238,16 +289,96 @@ export default function App() {
+ 
+           <button
+             onClick={() => setSettingsOpen(true)}
+-            className="glass-soft grid h-9 w-9 place-items-center rounded-full text-white/60 transition hover:rotate-45 hover:text-white"
++            className="glass-soft grid h-9 w-9 shrink-0 place-items-center rounded-full text-white/60 transition hover:rotate-45 hover:bg-white/10 hover:text-white active:scale-95"
+             title="Manage Providers, API Keys & MCP"
++            aria-label="Open settings"
+           >
+             <Settings2 className="h-4 w-4" />
+           </button>
++        </nav>
++
++        {/* Compact nav (below 640px) */}
++        <div ref={navRef} className="relative sm:hidden">
++          <button
++            onClick={() => setNavOpen((open) => !open)}
++            aria-expanded={navOpen}
++            aria-controls="mobile-nav"
++            aria-label={navOpen ? 'Close navigation menu' : 'Open navigation menu'}
++            className="glass-soft grid h-9 w-9 place-items-center rounded-full text-white/70 transition hover:bg-white/10 hover:text-white active:scale-95"
++          >
++            {navOpen ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}
++          </button>
++
++          {navOpen && (
++            <div
++              id="mobile-nav"
++              className="absolute right-0 top-11 z-50 flex w-56 flex-col gap-1 rounded-2xl border border-white/15 bg-[#121218] p-1.5 shadow-2xl backdrop-blur-2xl"
++            >
++              <button
++                onClick={() => {
++                  setShowLanding(true);
++                  setNavOpen(false);
++                }}
++                aria-pressed={showLanding}
++                className={`flex items-center gap-2 rounded-xl px-3 py-2 text-left text-xs transition-colors ${
++                  showLanding ? 'bg-cyan-400/10 text-cyan-200' : 'text-white/70 hover:bg-white/10 hover:text-white'
++                }`}
++              >
++                <Sparkles className="h-3.5 w-3.5" />
++                Overview
++              </button>
++              <button
++                onClick={() => {
++                  setShowLanding(false);
++                  setNavOpen(false);
++                }}
++                aria-pressed={!showLanding}
++                className={`flex items-center gap-2 rounded-xl px-3 py-2 text-left text-xs transition-colors ${
++                  !showLanding ? 'bg-cyan-400/10 text-cyan-200' : 'text-white/70 hover:bg-white/10 hover:text-white'
++                }`}
++              >
++                <MonitorPlay className="h-3.5 w-3.5" />
++                Computer
++              </button>
++              <button
++                onClick={() => {
++                  setWhyOpen(true);
++                  setNavOpen(false);
++                }}
++                aria-haspopup="dialog"
++                className="flex items-center gap-2 rounded-xl px-3 py-2 text-left text-xs text-white/70 transition-colors hover:bg-white/10 hover:text-emerald-200"
++              >
++                <BookOpen className="h-3.5 w-3.5" />
++                Why
++              </button>
++              <a
++                href="/providers"
++                className="flex items-center gap-2 rounded-xl px-3 py-2 text-left text-xs text-white/70 transition-colors hover:bg-white/10 hover:text-white"
++              >
++                <PlugZap className="h-3.5 w-3.5" />
++                Providers
++              </a>
++              <button
++                onClick={() => {
++                  setSettingsOpen(true);
++                  setNavOpen(false);
++                }}
++                className="flex items-center gap-2 rounded-xl px-3 py-2 text-left text-xs text-white/70 transition-colors hover:bg-white/10 hover:text-white"
++              >
++                <Settings2 className="h-3.5 w-3.5" />
++                Settings
++              </button>
++            </div>
++          )}
+         </div>
+       </header>
+ 
+       {/* 4. Main Body */}
+-      <main className="relative z-10 flex min-h-screen flex-col items-center px-4 pb-36 pt-20 sm:px-8">
++      <main
++        className={`relative z-10 flex flex-col items-center px-4 pt-20 sm:px-8 ${
++          showLanding ? 'min-h-screen pb-36' : 'min-h-screen pb-32 sm:justify-center'
++        }`}
++      >
+         {showLanding ? (
+           <LandingHero onLaunch={() => setShowLanding(false)} />
+         ) : (
+@@ -296,6 +427,7 @@ export default function App() {
+             )}
+           </div>
+         )}
++        {!showLanding && <SiteFooter />}
+       </main>
+ 
+       {/* 5. Minimalist Floating Input Bar (Fixed Bottom) */}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx b/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+new file mode 100644
+index 000000000..275345cc4
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/SiteFooter.tsx
+@@ -0,0 +1,67 @@
++import { useEffect, useState } from 'react';
++import { ExternalLink, GitBranch } from 'lucide-react';
++
++interface HealthInfo {
++  version?: string;
++  commit?: string;
++}
++
++const GITHUB_URL = 'https://github.com/yaegerbomb42/monolith';
++
++export function SiteFooter() {
++  const [health, setHealth] = useState<HealthInfo>({});
++
++  useEffect(() => {
++    let cancelled = false;
++    fetch('/api/health', { cache: 'no-store' })
++      .then((res) => (res.ok ? res.json() : null))
++      .then((body) => {
++        if (!cancelled && body && typeof body === 'object') {
++          setHealth({
++            version: typeof body.version === 'string' ? body.version : undefined,
++            commit: typeof body.commit === 'string' ? body.commit : undefined,
++          });
++        }
++      })
++      .catch(() => null);
++    return () => {
++      cancelled = true;
++    };
++  }, []);
++
++  const version = health.version?.trim();
++  const commit = health.commit?.trim();
++  const shortCommit = commit && commit !== 'unknown' ? commit.slice(0, 7) : undefined;
++  const buildLabel = [version ? `v${version}` : undefined, shortCommit].filter(Boolean).join(' · ');
++
++  return (
++    <footer className="mt-2 w-full border-t border-white/10">
++      <div className="mx-auto flex w-full max-w-5xl flex-col items-center justify-between gap-2 px-1 py-3 font-mono text-[11px] text-white/40 sm:flex-row">
++        <span className="whitespace-nowrap">© SwarmAgents</span>
++        <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1">
++          <a
++            href="/providers"
++            className="rounded transition-colors hover:text-cyan-300 active:text-cyan-200"
++          >
++            Providers
++          </a>
++          <a
++            href={GITHUB_URL}
++            target="_blank"
++            rel="noreferrer noopener"
++            className="inline-flex items-center gap-1 rounded transition-colors hover:text-cyan-300 active:text-cyan-200"
++          >
++            <GitBranch className="h-3 w-3" />
++            GitHub
++            <ExternalLink className="h-2.5 w-2.5 opacity-60" />
++          </a>
++          {buildLabel && (
++            <span className="whitespace-nowrap text-white/30" title={commit}>
++              {buildLabel}
++            </span>
++          )}
++        </div>
++      </div>
++    </footer>
++  );
++}
+-- 
+2.55.0
+

@@ -1,0 +1,244 @@
+From 6bb53bb4065b6b0e873358129483f8ac2ea3761b Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 00:24:14 +0000
+Subject: [PATCH] [p14] Open Graph and Twitter meta plus OG image
+ (muse-worker-03)
+
+---
+ apps/swarmagents/app/layout.tsx              | 29 +++++++-
+ apps/swarmagents/app/og-image.tsx            | 70 ++++++++++++++++++++
+ apps/swarmagents/app/opengraph-image.test.ts | 32 +++++++++
+ apps/swarmagents/app/opengraph-image.tsx     |  7 ++
+ apps/swarmagents/app/twitter-image.tsx       |  7 ++
+ apps/swarmagents/lib/middleware.test.ts      | 13 +++-
+ apps/swarmagents/middleware.ts               |  3 +-
+ 7 files changed, 158 insertions(+), 3 deletions(-)
+ create mode 100644 apps/swarmagents/app/og-image.tsx
+ create mode 100644 apps/swarmagents/app/opengraph-image.test.ts
+ create mode 100644 apps/swarmagents/app/opengraph-image.tsx
+ create mode 100644 apps/swarmagents/app/twitter-image.tsx
+
+diff --git a/apps/swarmagents/app/layout.tsx b/apps/swarmagents/app/layout.tsx
+index fe3a3ea93..8bd4f191a 100644
+--- a/apps/swarmagents/app/layout.tsx
++++ b/apps/swarmagents/app/layout.tsx
+@@ -4,9 +4,36 @@ import { headers } from "next/headers";
+ import { NONCE_HEADER } from "../lib/security-headers";
+ import "./globals.css";
+ 
++// Canonical public origin for absolute Open Graph / Twitter URLs. Overridable
++// with NEXT_PUBLIC_SITE_URL; the live site is swarmagents.codes.
++function siteUrl(): URL {
++  try {
++    return new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "https://swarmagents.codes");
++  } catch {
++    return new URL("https://swarmagents.codes");
++  }
++}
++
++const DESCRIPTION = "One chat bar. One agent. Every tool. Nothing hidden.";
++
+ export const metadata: Metadata = {
++  metadataBase: siteUrl(),
+   title: "SwarmAgents",
+-  description: "One chat bar. One agent. Every tool. Nothing hidden.",
++  description: DESCRIPTION,
++  openGraph: {
++    title: "SwarmAgents",
++    description: DESCRIPTION,
++    type: "website",
++    siteName: "SwarmAgents",
++    // og:image / twitter:image come from the file convention:
++    // app/opengraph-image.tsx and app/twitter-image.tsx.
++  },
++  twitter: {
++    card: "summary_large_image",
++    title: "SwarmAgents",
++    description: DESCRIPTION,
++    // twitter:image comes from app/twitter-image.tsx (file convention).
++  },
+ };
+ 
+ export default async function RootLayout({ children }: { children: ReactNode }) {
+diff --git a/apps/swarmagents/app/og-image.tsx b/apps/swarmagents/app/og-image.tsx
+new file mode 100644
+index 000000000..03c6fb771
+--- /dev/null
++++ b/apps/swarmagents/app/og-image.tsx
+@@ -0,0 +1,70 @@
++import React from "react";
++import { ImageResponse } from "next/og";
++
++// Shared 1200x630 brand image for the Open Graph and Twitter file-convention
++// routes (app/opengraph-image.tsx and app/twitter-image.tsx). Both routes
++// re-export size/contentType and render this same image, so the two URLs stay
++// identical by construction. Brand: black canvas, white wordmark, cyan
++// (#22d3ee, the --color-focus accent) rule and site URL.
++
++export const size = { width: 1200, height: 630 };
++export const contentType = "image/png";
++
++export function renderOgImage(): ImageResponse {
++  return new ImageResponse(
++    (
++      <div
++        style={{
++          width: "100%",
++          height: "100%",
++          display: "flex",
++          flexDirection: "column",
++          justifyContent: "center",
++          padding: "72px 88px",
++          backgroundColor: "#000000",
++        }}
++      >
++        <div
++          style={{
++            width: 96,
++            height: 10,
++            backgroundColor: "#22d3ee",
++            marginBottom: 40,
++          }}
++        />
++        <div
++          style={{
++            fontSize: 116,
++            fontWeight: 800,
++            lineHeight: 1,
++            letterSpacing: -4,
++            color: "#ffffff",
++          }}
++        >
++          SwarmAgents
++        </div>
++        <div
++          style={{
++            marginTop: 28,
++            fontSize: 42,
++            lineHeight: 1.25,
++            color: "#888888",
++          }}
++        >
++          One chat bar. One agent. Every tool.
++        </div>
++        <div
++          style={{
++            marginTop: 56,
++            fontSize: 30,
++            letterSpacing: 2,
++            color: "#22d3ee",
++          }}
++        >
++          swarmagents.codes
++        </div>
++      </div>
++    ),
++    { ...size },
++  );
++}
+diff --git a/apps/swarmagents/app/opengraph-image.test.ts b/apps/swarmagents/app/opengraph-image.test.ts
+new file mode 100644
+index 000000000..5af234604
+--- /dev/null
++++ b/apps/swarmagents/app/opengraph-image.test.ts
+@@ -0,0 +1,32 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import OgImage, { contentType as ogContentType, size as ogSize } from "./opengraph-image";
++import TwitterImage, { contentType as twContentType, size as twSize } from "./twitter-image";
++
++/** PNG signature, then the IHDR width/height at bytes 16-23. */
++function pngDimensions(buf: Buffer): { width: number; height: number } {
++  assert.deepEqual(
++    [...buf.subarray(0, 8)],
++    [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
++    "not a PNG",
++  );
++  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
++}
++
++for (const [name, render, size, contentType] of [
++  ["opengraph-image", OgImage, ogSize, ogContentType],
++  ["twitter-image", TwitterImage, twSize, twContentType],
++] as const) {
++  test(`${name} renders a 1200x630 PNG`, async () => {
++    assert.deepEqual(size, { width: 1200, height: 630 });
++    assert.equal(contentType, "image/png");
++    const res = await render();
++    assert.equal(res.status, 200);
++    assert.match(res.headers.get("content-type") ?? "", /image\/png/);
++    const buf = Buffer.from(await res.arrayBuffer());
++    assert.deepEqual(pngDimensions(buf), { width: 1200, height: 630 });
++    // The render must actually draw something: a blank black canvas would
++    // compress to a few hundred bytes.
++    assert.ok(buf.length > 5000, `image suspiciously small (${buf.length} bytes)`);
++  });
++}
+diff --git a/apps/swarmagents/app/opengraph-image.tsx b/apps/swarmagents/app/opengraph-image.tsx
+new file mode 100644
+index 000000000..0acc575a8
+--- /dev/null
++++ b/apps/swarmagents/app/opengraph-image.tsx
+@@ -0,0 +1,7 @@
++import { contentType, renderOgImage, size } from "./og-image";
++
++export { contentType, size };
++
++export default function OpengraphImage() {
++  return renderOgImage();
++}
+diff --git a/apps/swarmagents/app/twitter-image.tsx b/apps/swarmagents/app/twitter-image.tsx
+new file mode 100644
+index 000000000..fdecd2f18
+--- /dev/null
++++ b/apps/swarmagents/app/twitter-image.tsx
+@@ -0,0 +1,7 @@
++import { contentType, renderOgImage, size } from "./og-image";
++
++export { contentType, size };
++
++export default function TwitterImage() {
++  return renderOgImage();
++}
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index c971b9f25..667f0bf7a 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -1,7 +1,7 @@
+ import test from "node:test";
+ import assert from "node:assert/strict";
+ import { NextRequest } from "next/server";
+-import { middleware } from "../middleware";
++import { config, middleware } from "../middleware";
+ import { SESSION_COOKIE, signSession } from "./auth";
+ import { resetBuckets } from "./rate-limit";
+ 
+@@ -187,3 +187,14 @@ test("429 responses carry Retry-After and rate-limit headers (login bucket)", ()
+   assert.equal(res.headers.get("X-RateLimit-Remaining"), "0");
+   assert.ok(Number(res.headers.get("X-RateLimit-Reset")) >= 0);
+ });
++
++test("matcher excludes the public OG/Twitter image routes (like icon.png)", () => {
++  // Next anchors matcher patterns to the full pathname; mirror that here.
++  const pattern = new RegExp(`^(?:${config.matcher[0]})$`);
++  assert.equal(pattern.test("/opengraph-image"), false, "unfurlers must reach /opengraph-image signed out");
++  assert.equal(pattern.test("/twitter-image"), false, "unfurlers must reach /twitter-image signed out");
++  assert.equal(pattern.test("/icon.png"), false, "icon.png stays excluded");
++  assert.equal(pattern.test("/login"), true, "login still runs through middleware");
++  assert.equal(pattern.test("/"), true, "home still runs through middleware");
++  assert.equal(pattern.test("/_next/static/chunk.js"), false, "static assets stay excluded");
++});
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index b5268f03e..6aafc5c46 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -158,4 +158,5 @@ export function middleware(req: NextRequest) {
+ 
+ // Everything except static assets. Uploads bypass middleware (it buffers bodies with a size cap) and call
+ // isLocal themselves. Node runtime: sessions are looked up in SQLite and hashed with node:crypto, synchronously.
+-export const config = { matcher: ["/((?!_next/static|_next/image|favicon|icon.png|apple-icon.png|manifest.webmanifest|brand/|api/upload).*)"], runtime: "nodejs" };
++// The OG/Twitter image routes are excluded like icon.png so link unfurlers can fetch them signed out.
++export const config = { matcher: ["/((?!_next/static|_next/image|favicon|icon.png|apple-icon.png|opengraph-image|twitter-image|manifest.webmanifest|brand/|api/upload).*)"], runtime: "nodejs" };
+-- 
+2.55.0
+

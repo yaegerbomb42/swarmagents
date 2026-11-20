@@ -1,0 +1,315 @@
+From 6aebab61dd9a71fe3ee9e3820c097d1ef6774b69 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 21:21:36 +0000
+Subject: [PATCH] [t95] board: persist returnReason when work is sent back to
+ open
+
+---
+ .../app/api/mcp/swarm-board/route.test.ts     |  94 ++++++++++++++
+ apps/swarmagents/lib/board/board.test.ts      | 118 ++++++++++++++++++
+ apps/swarmagents/lib/board/handlers.ts        |  20 ++-
+ apps/swarmagents/lib/mcp-types.ts             |  13 ++
+ 4 files changed, 243 insertions(+), 2 deletions(-)
+ create mode 100644 apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+
+diff --git a/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts b/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+new file mode 100644
+index 000000000..a5dec9ad1
+--- /dev/null
++++ b/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+@@ -0,0 +1,94 @@
++/**
++ * Tests for GET /api/mcp/swarm-board: the board listing must include
++ * `returnReason` on tasks that were sent back to open (t95).
++ * Everything runs against a temp store dir.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++import { GET } from "./route";
++import { configureStorePaths, saveStoreAtomic } from "@/lib/board/store";
++import type { BoardStore } from "@/lib/board/types";
++
++let dir: string;
++
++test.beforeEach(() => {
++  dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-board-route-"));
++  configureStorePaths(dir, path.join(dir, "swarm_board.json"));
++});
++
++test.afterEach(() => {
++  fs.rmSync(dir, { recursive: true, force: true });
++});
++
++test("GET lists returnReason on a task sent back to open, and omits it elsewhere", async () => {
++  const seed: BoardStore = {
++    tasks: [
++      {
++        id: "t-returned",
++        title: "Returned task",
++        description: "D",
++        difficulty: "easy",
++        minElo: 1200,
++        constraints: [],
++        status: "open",
++        returnReason: "Tests fail on the happy path; please fix and resubmit.",
++        createdAt: 1000,
++        updatedAt: 2000,
++      },
++      {
++        id: "t-fresh",
++        title: "Fresh task",
++        description: "D",
++        difficulty: "easy",
++        minElo: 1200,
++        constraints: [],
++        status: "open",
++        createdAt: 1000,
++        updatedAt: 1000,
++      },
++    ],
++    proposals: [],
++    messages: [],
++  };
++  await saveStoreAtomic(seed);
++
++  const res = await GET(new NextRequest("http://localhost/api/mcp/swarm-board"));
++  const body = await res.json();
++  assert.equal(body.tasks.length, 2);
++  const returned = body.tasks.find((t: { id: string }) => t.id === "t-returned");
++  const fresh = body.tasks.find((t: { id: string }) => t.id === "t-fresh");
++  assert.equal(returned.returnReason, "Tests fail on the happy path; please fix and resubmit.");
++  assert.equal(fresh.returnReason, undefined);
++});
++
++test("GET with ?status=open still lists returnReason", async () => {
++  const seed: BoardStore = {
++    tasks: [
++      {
++        id: "t-returned",
++        title: "Returned task",
++        description: "D",
++        difficulty: "easy",
++        minElo: 1200,
++        constraints: [],
++        status: "open",
++        returnReason: "Needs rework.",
++        createdAt: 1000,
++        updatedAt: 2000,
++      },
++    ],
++    proposals: [],
++    messages: [],
++  };
++  await saveStoreAtomic(seed);
++
++  const res = await GET(new NextRequest("http://localhost/api/mcp/swarm-board?status=open"));
++  const body = await res.json();
++  assert.equal(body.tasks.length, 1);
++  assert.equal(body.tasks[0].returnReason, "Needs rework.");
++});
+diff --git a/apps/swarmagents/lib/board/board.test.ts b/apps/swarmagents/lib/board/board.test.ts
+index 1467424b6..0192e0787 100644
+--- a/apps/swarmagents/lib/board/board.test.ts
++++ b/apps/swarmagents/lib/board/board.test.ts
+@@ -130,6 +130,124 @@ test("handleReviewAndMergeTask rejects missing feedback", async () => {
+   assert.match(result.error.message, /feedback/);
+ });
+ 
++test("handleReviewAndMergeTask with approved=false sends task back to open with returnReason stored", async () => {
++  const store = emptyStore();
++  store.tasks.push({
++    id: "t1",
++    title: "T",
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status: "in_review",
++    gitBranch: "feat/x",
++    resultSummary: "did the thing",
++    createdAt: 1000,
++    updatedAt: 1000,
++  });
++  const result = await handleReviewAndMergeTask(store, {
++    taskId: "t1",
++    approved: false,
++    feedback: "Tests fail on the happy path; please fix and resubmit.",
++  });
++  assert.ok("result" in result);
++  const parsed = JSON.parse(result.result.content[0].text);
++  assert.equal(parsed.message, "Rejected");
++  assert.equal(parsed.task.status, "open");
++  assert.equal(parsed.task.returnReason, "Tests fail on the happy path; please fix and resubmit.");
++  assert.ok(parsed.task.updatedAt > 1000, "updatedAt must advance on rejection");
++  assert.equal(store.tasks[0].returnReason, "Tests fail on the happy path; please fix and resubmit.");
++});
++
++test("handleReviewAndMergeTask with approved=false overwrites a previous returnReason", async () => {
++  const store = emptyStore();
++  store.tasks.push({
++    id: "t1",
++    title: "T",
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status: "in_review",
++    returnReason: "First round: missing tests.",
++    createdAt: 0,
++    updatedAt: 0,
++  });
++  const result = await handleReviewAndMergeTask(store, {
++    taskId: "t1",
++    approved: false,
++    feedback: "Second round: lint errors remain.",
++  });
++  assert.ok("result" in result);
++  assert.equal(store.tasks[0].returnReason, "Second round: lint errors remain.");
++});
++
++test("handlePollTasks includes returnReason for open tasks", async () => {
++  const store = emptyStore();
++  store.tasks.push({
++    id: "t1",
++    title: "T",
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status: "in_review",
++    createdAt: 0,
++    updatedAt: 0,
++  });
++  await handleReviewAndMergeTask(store, {
++    taskId: "t1",
++    approved: false,
++    feedback: "Needs rework: no tests.",
++  });
++  const result = handlePollTasks(store, { workerElo: 1400, status: "open" });
++  assert.ok("result" in result);
++  const parsed = JSON.parse(result.result.content[0].text);
++  assert.equal(parsed.count, 1);
++  assert.equal(parsed.tasks[0].returnReason, "Needs rework: no tests.");
++});
++
++test("handleClaimTask clears returnReason on successful claim (t95 clearing rule)", async () => {
++  const store = emptyStore();
++  store.tasks.push({
++    id: "t1",
++    title: "T",
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status: "open",
++    returnReason: "Needs rework: no tests.",
++    createdAt: 0,
++    updatedAt: 0,
++  });
++  const result = await handleClaimTask(store, { taskId: "t1", agentName: "worker-1", workerElo: 1400 });
++  assert.ok("result" in result);
++  const parsed = JSON.parse(result.result.content[0].text);
++  assert.equal(parsed.task.status, "claimed");
++  assert.equal(parsed.task.returnReason, undefined);
++  assert.equal(store.tasks[0].returnReason, undefined);
++});
++
++test("handleClaimTask does not clear returnReason when the claim fails", async () => {
++  const store = emptyStore();
++  store.tasks.push({
++    id: "t1",
++    title: "T",
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status: "claimed",
++    returnReason: "Needs rework: no tests.",
++    createdAt: 0,
++    updatedAt: 0,
++  });
++  const result = await handleClaimTask(store, { taskId: "t1", agentName: "worker-2", workerElo: 1400 });
++  assert.ok("error" in result);
++  assert.equal(store.tasks[0].returnReason, "Needs rework: no tests.");
++});
++
+ test("handleSubmitProposal validates difficulty enum", async () => {
+   const store = emptyStore();
+   const result = await handleSubmitProposal(store, { proposedBy: "A", title: "T", problem: "P", proposedSolution: "S", suggestedDifficulty: "extreme" });
+diff --git a/apps/swarmagents/lib/board/handlers.ts b/apps/swarmagents/lib/board/handlers.ts
+index 5b7b12bb9..d8dfbbc09 100644
+--- a/apps/swarmagents/lib/board/handlers.ts
++++ b/apps/swarmagents/lib/board/handlers.ts
+@@ -163,7 +163,8 @@ export function handleToolsList(id: unknown) {
+         },
+         {
+           name: "review_and_merge_task",
+-          description: "Orchestrator tool to verify submitted work on a branch and merge it into main.",
++          description:
++            "Orchestrator tool to verify submitted work on a branch and merge it into main. When approved=false, the task is sent back to open and the feedback is stored as task.returnReason (visible in poll_tasks and GET until the next successful claim clears it).",
+           inputSchema: {
+             type: "object",
+             properties: {
+@@ -247,6 +248,12 @@ export async function handleClaimTask(
+   task.status = "claimed";
+   task.claimedBy = args.agentName as string;
+   task.claimedByElo = Number(args.workerElo);
++  // Clearing rule for returnReason (t95): a successful claim acknowledges the
++  // reason the task was sent back, so it is removed here. The reason stays
++  // visible in poll_tasks / GET while the task is open, and is not cleared on
++  // merge — a returned task must be re-claimed before it can be resubmitted,
++  // so by merge time the field is already gone.
++  delete task.returnReason;
+   task.updatedAt = Date.now();
+   const persistErr = await persistOrError(store);
+   if (persistErr) return { error: persistErr };
+@@ -338,7 +345,16 @@ export async function handleReviewAndMergeTask(
+   }
+   const task = store.tasks.find((t) => t.id === args.taskId);
+   if (!task) return { error: notFound("Task not found") };
+-  task.status = args.approved ? "completed" : "open";
++  if (args.approved) {
++    task.status = "completed";
++  } else {
++    // Rejection: send the task back to open and persist the review feedback
++    // as returnReason so the return is explained, not silent (t95). A later
++    // return overwrites the previous reason; the reason is cleared on the
++    // next successful claim (see handleClaimTask).
++    task.status = "open";
++    task.returnReason = args.feedback as string;
++  }
+   task.updatedAt = Date.now();
+   const persistErr = await persistOrError(store);
+   if (persistErr) return { error: persistErr };
+diff --git a/apps/swarmagents/lib/mcp-types.ts b/apps/swarmagents/lib/mcp-types.ts
+index 8958c273a..925020943 100644
+--- a/apps/swarmagents/lib/mcp-types.ts
++++ b/apps/swarmagents/lib/mcp-types.ts
+@@ -15,6 +15,19 @@ export interface SwarmTask {
+   resultSummary?: string;
+   gitBranch?: string;
+   prUrl?: string;
++  /**
++   * Why the last review sent this task back to open (the `feedback` from a
++   * `review_and_merge_task` call with `approved: false`). Present only while
++   * the task is open awaiting rework.
++   *
++   * Clearing rule (t95): the reason is cleared on the next successful claim.
++   * It stays visible in `poll_tasks` / GET while the task is open so the next
++   * worker can read it before picking the task up; claiming the task
++   * acknowledges it, so the field is removed then. It is NOT cleared on a
++   * completed merge — by then it is already gone, because a returned task
++   * must be re-claimed (which clears it) before it can be resubmitted.
++   */
++  returnReason?: string;
+   createdAt: number;
+   updatedAt: number;
+ }
+-- 
+2.55.0
+

@@ -1,0 +1,123 @@
+From 4a69034116a5369bfc465c9be9ad6bb269b458c9 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 23:38:43 +0000
+Subject: [PATCH] [p13] public robots.txt and sitemap.xml
+
+---
+ apps/swarmagents/app/robots-sitemap.test.ts | 28 +++++++++++++++++++++
+ apps/swarmagents/app/robots.ts              |  9 +++++++
+ apps/swarmagents/app/sitemap.ts             | 18 +++++++++++++
+ apps/swarmagents/lib/middleware.test.ts     |  8 ++++++
+ apps/swarmagents/middleware.ts              |  4 +--
+ 5 files changed, 65 insertions(+), 2 deletions(-)
+ create mode 100644 apps/swarmagents/app/robots-sitemap.test.ts
+ create mode 100644 apps/swarmagents/app/robots.ts
+ create mode 100644 apps/swarmagents/app/sitemap.ts
+
+diff --git a/apps/swarmagents/app/robots-sitemap.test.ts b/apps/swarmagents/app/robots-sitemap.test.ts
+new file mode 100644
+index 000000000..a7031cde2
+--- /dev/null
++++ b/apps/swarmagents/app/robots-sitemap.test.ts
+@@ -0,0 +1,28 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import robots from "./robots";
++import sitemap, { PUBLIC_ROUTES } from "./sitemap";
++
++test("robots.txt points at the sitemap and disallows /api/ and /providers", () => {
++  const r = robots();
++  assert.equal(r.sitemap, "https://swarmagents.codes/sitemap.xml");
++  const rules = Array.isArray(r.rules) ? r.rules : [r.rules];
++  assert.equal(rules.length, 1);
++  assert.equal(rules[0].userAgent, "*");
++  const disallow = Array.isArray(rules[0].disallow) ? rules[0].disallow : [rules[0].disallow];
++  assert.deepEqual(disallow, ["/api/", "/providers"]);
++});
++
++test("sitemap lists only public routes that exist as pages", () => {
++  // /docs, /faq, /pricing, /changelog, /privacy and /terms do not exist on
++  // main yet, and /providers is disallowed — they must not be listed.
++  assert.deepEqual([...PUBLIC_ROUTES], ["/", "/login"]);
++  const entries = sitemap();
++  assert.deepEqual(
++    entries.map((e) => e.url),
++    ["https://swarmagents.codes/", "https://swarmagents.codes/login"],
++  );
++  for (const entry of entries) {
++    assert.ok(entry.lastModified instanceof Date);
++  }
++});
+diff --git a/apps/swarmagents/app/robots.ts b/apps/swarmagents/app/robots.ts
+new file mode 100644
+index 000000000..5c5715673
+--- /dev/null
++++ b/apps/swarmagents/app/robots.ts
+@@ -0,0 +1,9 @@
++import type { MetadataRoute } from "next";
++
++/** Public robots.txt: crawlers may read the public pages and the sitemap; /api/ and /providers stay out. */
++export default function robots(): MetadataRoute.Robots {
++  return {
++    rules: [{ userAgent: "*", disallow: ["/api/", "/providers"] }],
++    sitemap: "https://swarmagents.codes/sitemap.xml",
++  };
++}
+diff --git a/apps/swarmagents/app/sitemap.ts b/apps/swarmagents/app/sitemap.ts
+new file mode 100644
+index 000000000..c6ebce470
+--- /dev/null
++++ b/apps/swarmagents/app/sitemap.ts
+@@ -0,0 +1,18 @@
++import type { MetadataRoute } from "next";
++
++const BASE_URL = "https://swarmagents.codes";
++
++/**
++ * Public routes listed in the sitemap. Only routes that exist as pages on
++ * main are listed: /docs, /faq, /pricing, /changelog, /privacy and /terms do
++ * not exist yet, and /providers is disallowed in robots.txt, so they are
++ * deliberately excluded rather than invented.
++ */
++export const PUBLIC_ROUTES = ["/", "/login"] as const;
++
++export default function sitemap(): MetadataRoute.Sitemap {
++  return PUBLIC_ROUTES.map((route) => ({
++    url: `${BASE_URL}${route}`,
++    lastModified: new Date(),
++  }));
++}
+diff --git a/apps/swarmagents/lib/middleware.test.ts b/apps/swarmagents/lib/middleware.test.ts
+index c971b9f25..821c00a65 100644
+--- a/apps/swarmagents/lib/middleware.test.ts
++++ b/apps/swarmagents/lib/middleware.test.ts
+@@ -187,3 +187,11 @@ test("429 responses carry Retry-After and rate-limit headers (login bucket)", ()
+   assert.equal(res.headers.get("X-RateLimit-Remaining"), "0");
+   assert.ok(Number(res.headers.get("X-RateLimit-Reset")) >= 0);
+ });
++
++test("lets signed-out crawlers through to /robots.txt and /sitemap.xml", () => {
++  for (const path of ["/robots.txt", "/sitemap.xml"]) {
++    const res = middleware(req(`http://swarm.example.com${path}`, { host: "swarm.example.com" }));
++    assert.equal(res.status, 200, `${path} should pass through, got ${res.status}`);
++    assert.equal(res.headers.get("location"), null);
++  }
++});
+diff --git a/apps/swarmagents/middleware.ts b/apps/swarmagents/middleware.ts
+index b5268f03e..e40241369 100644
+--- a/apps/swarmagents/middleware.ts
++++ b/apps/swarmagents/middleware.ts
+@@ -28,8 +28,8 @@ function withSecurityHeaders(
+ // Kept under this name because route handlers that bypass middleware (uploads) import it as their gate.
+ export { isAllowed as isLocal } from "./lib/auth";
+ 
+-/** Reachable signed out: the sign-in page and the endpoints it uses. */
+-const PUBLIC = new Set(["/login", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
++/** Reachable signed out: the sign-in page and the endpoints it uses, plus the public crawler files. */
++const PUBLIC = new Set(["/login", "/robots.txt", "/sitemap.xml", "/api/login", "/api/signup", "/api/me", "/api/mcp/swarm-board", "/api/health"]);
+ 
+ /** The public board MCP endpoint is exempt from the cross-site gate (external MCP clients call it). */
+ const BOARD_PATH = "/api/mcp/swarm-board";
+-- 
+2.55.0
+

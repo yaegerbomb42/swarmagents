@@ -1,0 +1,286 @@
+From 16c2bf5c7633199f1b8dce4bcb5af6f743fadb27 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 12:51:58 -0600
+Subject: [PATCH] fix(browser): vet every request against DNS-aware SSRF policy
+
+A navigation preflight already resolved the hostname, but subresources and
+redirect hops reached the server-side Chromium without a DNS check, and an
+IPv4-mapped dotted-quad answer (e.g. ::ffff:10.0.0.1) slipped past the IPv6
+policy because the trailing dotted-quad was mis-folded into four hex groups.
+
+- Attach a Playwright route handler (attachRequestGuards) that resolves every
+  request URL with dns.lookup(all) and aborts it if any address is private /
+  loopback / link-local / CGNAT / IPv4-mapped, covering subresources and each
+  redirect hop beyond the navigation preflight.
+- Fix expandIpv6 dotted-quad folding to combine octets into two 16-bit groups
+  so raw DNS mapped answers are classified correctly.
+- Keep the post-load final-URL recheck; unit tests stub the resolver for
+  public, private, mixed, metadata, CGNAT, and IPv6-mapped answers and drive
+  the route handler through the fake page, with no network.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/lib/browser/manager.test.ts | 73 ++++++++++++++++++++
+ apps/swarmagents/lib/browser/manager.ts      | 57 ++++++++++++++-
+ apps/swarmagents/lib/browser/policy.test.ts  |  7 ++
+ apps/swarmagents/lib/browser/policy.ts       | 23 +++---
+ 4 files changed, 148 insertions(+), 12 deletions(-)
+
+diff --git a/apps/swarmagents/lib/browser/manager.test.ts b/apps/swarmagents/lib/browser/manager.test.ts
+index acb3e801b..427a9f640 100644
+--- a/apps/swarmagents/lib/browser/manager.test.ts
++++ b/apps/swarmagents/lib/browser/manager.test.ts
+@@ -21,6 +21,31 @@ interface FakePageState {
+   gotoError?: Error;
+   gotoCalls: string[];
+   screenshotCalls: number;
++  routePattern?: string;
++  routeHandler?: FakeRouteHandler;
++}
++
++type FakeRouteHandler = (
++  route: { continue(): Promise<void>; abort(): Promise<void> },
++  request: { url(): string },
++) => unknown;
++
++/** Run one request through the registered route handler; returns its verdict. */
++async function dispatchRequest(state: FakePageState, url: string): Promise<"continued" | "aborted"> {
++  assert.ok(state.routeHandler, "fake page has no route handler registered");
++  let outcome: "continued" | "aborted" = "continued";
++  await state.routeHandler!(
++    {
++      continue: async () => {
++        outcome = "continued";
++      },
++      abort: async () => {
++        outcome = "aborted";
++      },
++    },
++    { url: () => url },
++  );
++  return outcome;
+ }
+ 
+ function fakePage(initial: Partial<FakePageState> & { redirectTo?: string } = {}): { page: Page; state: FakePageState & { redirectTo?: string } } {
+@@ -47,6 +72,10 @@ function fakePage(initial: Partial<FakePageState> & { redirectTo?: string } = {}
+     viewportSize: () => ({ width: 1280, height: 800 }),
+     on: () => {},
+     off: () => {},
++    route: (pattern: string, handler: FakeRouteHandler) => {
++      state.routePattern = pattern;
++      state.routeHandler = handler;
++    },
+   } as unknown as Page;
+   return { page, state };
+ }
+@@ -78,6 +107,9 @@ class FakeBrowserManager extends BrowserManager {
+     super({ bus: telemetryBus, lookup });
+   }
+   protected override async createSession(): Promise<SessionLike> {
++    // Wire the production request guard (DNS-aware route handler) onto the
++    // fake page exactly as a real session would.
++    this.attachRequestGuards(this.session.page);
+     return this.session;
+   }
+ }
+@@ -206,6 +238,47 @@ test("DNS preflight blocks hostnames resolving into private space", async () =>
+   await manager.close(RUN);
+ });
+ 
++test("requests via the route handler are resolved and vetted (DNS, stubbed, no network)", async () => {
++  const { page, state } = fakePage({ url: PUBLIC_URL });
++  const lookup = async (host: string): Promise<string[]> => {
++    if (host === "segments.example.com") return ["10.1.2.3", "93.184.216.34"]; // mixed
++    if (host === "nested.example.com") return ["10.0.0.1"]; // private
++    if (host === "meta.rebind.test") return ["169.254.169.254"]; // cloud metadata
++    if (host === "v6.example.com") return ["::ffff:10.0.0.1", "2606:4700:4700::1111"]; // IPv6-mapped
++    if (host === "dual.example.com") return ["2606:4700:4700::1111", "93.184.216.34", "100.64.0.1"]; // mixed with CGNAT
++    return ["93.184.216.34"]; // public
++  };
++  const manager = new FakeBrowserManager(makeSession(page), lookup);
++
++  // A navigation creates the session, which registers the route handler for
++  // all URLs on the page. public.example.com resolves publicly, so it passes.
++  const nav = await manager.navigate(RUN, "https://public.example.com/");
++  assert.equal(nav.ok, true);
++
++  // The route handler is registered for all URLs on the fake page.
++  assert.equal(state.routePattern, "**/*");
++  assert.ok(state.routeHandler);
++
++  // Public requests pass through.
++  assert.equal(await dispatchRequest(state, "https://example.com/app.js"), "continued");
++  assert.equal(await dispatchRequest(state, "http://public.example.com/x"), "continued");
++
++  // Private literals are aborted before anything is fetched.
++  assert.equal(await dispatchRequest(state, "http://127.0.0.1/health"), "aborted");
++  assert.equal(await dispatchRequest(state, "http://10.0.0.5/internal"), "aborted");
++  assert.equal(await dispatchRequest(state, "http://[::1]/"), "aborted");
++  assert.equal(await dispatchRequest(state, "http://localhost:3000/"), "aborted");
++  assert.equal(await dispatchRequest(state, "http://192.168.1.10/"), "aborted");
++  assert.equal(await dispatchRequest(state, "http://100.64.0.1/"), "aborted"); // CGNAT
++
++  // Hostnames resolving into private space are aborted too (rebinding defense).
++  assert.equal(await dispatchRequest(state, "http://segments.example.com/"), "aborted");
++  assert.equal(await dispatchRequest(state, "http://nested.example.com/"), "aborted");
++  assert.equal(await dispatchRequest(state, "http://meta.rebind.test/"), "aborted");
++  assert.equal(await dispatchRequest(state, "http://v6.example.com/"), "aborted");
++  assert.equal(await dispatchRequest(state, "http://dual.example.com/"), "aborted");
++});
++
+ test("frame capture is rate-limited (<=2 fps) but forced screenshots bypass", async () => {
+   const { page, state } = fakePage({ url: PUBLIC_URL });
+   const session = makeSession(page);
+diff --git a/apps/swarmagents/lib/browser/manager.ts b/apps/swarmagents/lib/browser/manager.ts
+index 77cf429be..13e7670c7 100644
+--- a/apps/swarmagents/lib/browser/manager.ts
++++ b/apps/swarmagents/lib/browser/manager.ts
+@@ -13,9 +13,12 @@
+  * Navigation policy (see ./policy.ts): only http/https, never file://, never
+  * private / loopback / link-local address space. Hostnames that are not IP
+  * literals are resolved *before* Chromium loads them (`dns.lookup`); if any
+- * record lands in private space the navigation is refused. After a successful
+- * load the final URL is re-checked against the same policy, which catches
+- * redirect chains into file:// or private literals.
++ * record lands in private space the navigation is refused. A Playwright route
++ * handler applies the same DNS-aware check to every request the page makes —
++ * subresources and each hop of a redirect chain — so a page cannot reach
++ * private space sideways (e.g. by rebinding its hostname after the preflight).
++ * After a successful load the final URL is re-checked against the same policy,
++ * which catches redirect chains into file:// or private literals.
+  *
+  * The browser process is launched lazily on first use and shared across runs;
+  * sessions idle for SESSION_IDLE_MS are closed by the sweeper, and a run's
+@@ -114,6 +117,27 @@ function dnsBlockedAddress(host: string, lookup: (host: string) => Promise<strin
+   );
+ }
+ 
++/**
++ * Check one request URL (top-level navigation, subresource, or a hop in a
++ * redirect chain) against the full policy, DNS resolution included. Returns
++ * the offending host — the literal host, or a resolved address — when the
++ * request must be refused, else null. Used by the Playwright route handler so
++ * every request the page makes is vetted, not just the initial navigation.
++ */
++export async function requestBlockedByPolicy(
++  raw: string,
++  lookup: (host: string) => Promise<string[]>,
++): Promise<string | null> {
++  const url = parseNavigationUrl(raw);
++  if (!url) return null;
++  const scheme = url.protocol.replace(":", "").toLowerCase();
++  if (scheme !== "http" && scheme !== "https") return null;
++  const host = url.hostname;
++  if (isPrivateHost(host)) return host;
++  if (isLoopbackHostname(host)) return host;
++  return dnsBlockedAddress(host, lookup);
++}
++
+ function executablePath(): string | undefined {
+   return process.env.PW_CHROMIUM_PATH?.trim() || process.env.SWARM_BROWSER_EXECUTABLE?.trim() || undefined;
+ }
+@@ -171,6 +195,8 @@ export class BrowserManager implements BrowserControl {
+       session.lastActivityAt = Date.now();
+     });
+ 
++    this.attachRequestGuards(page);
++
+     // Auto-close when the run ends: no browser left running for a dead run.
+     session.unsubscribe = this.bus.subscribe(runId, 0, (event) => {
+       if (event.type === "run.finished" || event.type === "run.error" || event.type === "run.cancelled") {
+@@ -186,6 +212,31 @@ export class BrowserManager implements BrowserControl {
+     return session;
+   }
+ 
++  /**
++   * Intercept every request the page makes and refuse ones that violate the
++   * DNS-aware policy (see ./policy.ts). This closes the side channels a
++   * navigation preflight cannot see: subresources, and redirect hops that
++   * arrive after the initial resolution, including hostnames whose DNS answer
++   * flipped since then (rebinding). Abort the request before Chromium sends
++   * anything.
++   */
++  protected attachRequestGuards(page: Page): void {
++    page.route("**/*", async (route, request) => {
++      let blocked: string | null = null;
++      try {
++        blocked = await requestBlockedByPolicy(request.url(), this.lookup);
++      } catch {
++        // Unexpected resolver failure must not break the page; Chromium fails
++        // the request itself if the host is genuinely unreachable.
++      }
++      if (blocked) {
++        await route.abort();
++      } else {
++        await route.continue();
++      }
++    });
++  }
++
+   private ensureSession(runId: string): Promise<RunSession> {
+     let pending = this.sessions.get(runId);
+     if (!pending) {
+diff --git a/apps/swarmagents/lib/browser/policy.test.ts b/apps/swarmagents/lib/browser/policy.test.ts
+index ac98930fe..d167d36b4 100644
+--- a/apps/swarmagents/lib/browser/policy.test.ts
++++ b/apps/swarmagents/lib/browser/policy.test.ts
+@@ -98,6 +98,13 @@ test("private IPv6 space is blocked", () => {
+   blocked("http://[::ffff:10.0.0.1]/");
+   allowed("http://[2606:4700:4700::1111]/"); // public IPv6
+   allowed("http://[2001:4860:4860::8888]/");
++  // The dotted-quad mapped form as raw DNS answers carry it (URLs normalize it
++  // away, so the direct helpers must still recognize it).
++  blocked("http://[::ffff:10.0.0.1]:8080/", "Private address");
++  assert.equal(isPrivateHost("::ffff:10.0.0.1"), true);
++  assert.equal(isPrivateHost("::ffff:127.0.0.1"), true);
++  assert.equal(isPrivateHost("::ffff:169.254.169.254"), true);
++  assert.equal(isPrivateHost("::ffff:93.184.216.34"), false); // public IPv4-mapped is allowed
+ });
+ 
+ test("loopback hostnames are blocked (they resolve into 127.0.0.0/8)", () => {
+diff --git a/apps/swarmagents/lib/browser/policy.ts b/apps/swarmagents/lib/browser/policy.ts
+index 206dcf720..b98d64e57 100644
+--- a/apps/swarmagents/lib/browser/policy.ts
++++ b/apps/swarmagents/lib/browser/policy.ts
+@@ -14,12 +14,15 @@
+  * IPv6 forms). Hostnames `localhost` / `*.localhost` resolve into loopback
+  * space and are blocked too.
+  *
+- * Hostnames that are not address literals are resolved at navigation time by
+- * the browser manager (`lib/browser/manager.ts`): if any DNS record points
+- * into private address space the navigation is refused before Chromium is
+- * asked to load it, and the final post-navigation URL is re-checked against
+- * this same policy (which catches redirects into `file://` or private
+- * literals).
++ * Hostnames that are not address literals are resolved when the browser
++ * manager (`lib/browser/manager.ts`) vets a destination: every navigation —
++ * and every request the page issues, subresources and redirect hops included
++ * (via a Playwright route handler) — resolves the hostname with
++ * `dns.lookup(all)` and is refused if any address is private / loopback /
++ * link-local / CGNAT (or an IPv4-mapped IPv6 form thereof) before Chromium is
++ * asked to load anything. The final post-navigation URL is re-checked against
++ * this same policy, which catches redirects into `file://` or private
++ * literals.
+  */
+ 
+ /** Result of checking one destination. */
+@@ -72,11 +75,13 @@ function isPrivateIpv4(host: string): boolean {
+ function expandIpv6(host: string): number[] | null {
+   let h = host.toLowerCase();
+   // Allow a trailing dotted-quad (e.g. `::ffff:127.0.0.1`) by folding it into
+-  // two hex groups; URLs normalize this away, but DNS results may carry it.
++  // two hex groups — an IPv4-mapped address uses two 16-bit groups for the
++  // IPv4 octets (`::ffff:7f00:1`). URLs normalize this away, but raw DNS
++  // lookup results may carry the dotted-quad form.
+   const trailing4 = /^(.*):(\d+\.\d+\.\d+\.\d+)$/.exec(h);
+   if (trailing4) {
+-    const octets = trailing4[2].split(".").map(Number);
+-    h = `${trailing4[1]}:${octets.map((n) => n.toString(16)).join(":")}`;
++    const [a, b, c, d] = trailing4[2].split(".").map(Number);
++    h = `${trailing4[1]}:${(((a << 8) | b).toString(16))}:${(((c << 8) | d).toString(16))}`;
+   }
+   if (!/^[0-9a-f:]+$/.test(h)) return null;
+ 
+-- 
+2.55.0
+

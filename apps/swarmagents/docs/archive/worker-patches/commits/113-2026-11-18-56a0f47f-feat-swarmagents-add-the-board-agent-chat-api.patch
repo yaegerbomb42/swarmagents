@@ -1,0 +1,865 @@
+From 56a0f47f5358495984ef246083e34938f754a1f5 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 11:39:43 -0600
+Subject: [PATCH] feat(swarmagents): add the board agent chat API
+
+Users can turn a chat message into a SwarmBoard task and a VM run without a new board schema or a chat UI.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ .../app/api/board-agent/chat/route.test.ts    |  71 +++++++
+ .../app/api/board-agent/chat/route.ts         |  87 +++++++++
+ .../swarmagents/lib/board-agent/agent.test.ts |  72 +++++++
+ apps/swarmagents/lib/board-agent/agent.ts     | 183 ++++++++++++++++++
+ .../lib/board-agent/dispatch.test.ts          |  37 ++++
+ apps/swarmagents/lib/board-agent/dispatch.ts  |  37 ++++
+ .../swarmagents/lib/board-agent/store.test.ts |  41 ++++
+ apps/swarmagents/lib/board-agent/store.ts     |  66 +++++++
+ .../swarmagents/lib/board-agent/tools.test.ts |  40 ++++
+ apps/swarmagents/lib/board-agent/tools.ts     |  96 +++++++++
+ apps/swarmagents/lib/board-agent/types.ts     |  33 ++++
+ 11 files changed, 763 insertions(+)
+ create mode 100644 apps/swarmagents/app/api/board-agent/chat/route.test.ts
+ create mode 100644 apps/swarmagents/app/api/board-agent/chat/route.ts
+ create mode 100644 apps/swarmagents/lib/board-agent/agent.test.ts
+ create mode 100644 apps/swarmagents/lib/board-agent/agent.ts
+ create mode 100644 apps/swarmagents/lib/board-agent/dispatch.test.ts
+ create mode 100644 apps/swarmagents/lib/board-agent/dispatch.ts
+ create mode 100644 apps/swarmagents/lib/board-agent/store.test.ts
+ create mode 100644 apps/swarmagents/lib/board-agent/store.ts
+ create mode 100644 apps/swarmagents/lib/board-agent/tools.test.ts
+ create mode 100644 apps/swarmagents/lib/board-agent/tools.ts
+ create mode 100644 apps/swarmagents/lib/board-agent/types.ts
+
+diff --git a/apps/swarmagents/app/api/board-agent/chat/route.test.ts b/apps/swarmagents/app/api/board-agent/chat/route.test.ts
+new file mode 100644
+index 000000000..e702ea470
+--- /dev/null
++++ b/apps/swarmagents/app/api/board-agent/chat/route.test.ts
+@@ -0,0 +1,71 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++import { USER_HEADER } from "@/lib/auth";
++import { __setBoardAgentCompleterForTests } from "@/lib/board-agent/agent";
++import { configureStorePaths } from "@/lib/board/store";
++import { GET, POST } from "./route";
++
++const dir = fs.mkdtempSync(path.join(os.tmpdir(), "board-agent-route-"));
++process.env.SWARM_HOME = dir;
++configureStorePaths(dir, path.join(dir, "swarm_board.json"));
++
++function post(body: unknown, user = "alice"): NextRequest {
++  return new NextRequest("http://localhost/api/board-agent/chat", {
++    method: "POST",
++    headers: { "content-type": "application/json", [USER_HEADER]: user },
++    body: typeof body === "string" ? body : JSON.stringify(body),
++  });
++}
++
++test.beforeEach(() => {
++  __setBoardAgentCompleterForTests(async () => "Ready.");
++});
++
++test.after(() => {
++  __setBoardAgentCompleterForTests(null);
++});
++
++test("401 without user", async () => {
++  const res = await POST(new NextRequest("http://localhost/api/board-agent/chat", {
++    method: "POST",
++    body: JSON.stringify({ message: "hi" }),
++  }));
++  assert.equal(res.status, 401);
++});
++
++test("400 for an empty message and 413 over the body cap", async () => {
++  const empty = await POST(post({ message: "" }));
++  assert.equal(empty.status, 400);
++  const huge = await POST(post({ message: "x".repeat(20_000) }));
++  assert.equal(huge.status, 413);
++  const long = await POST(post({ message: "x".repeat(4001) }));
++  assert.equal(long.status, 400);
++});
++
++test("creates a conversation and continues it", async () => {
++  const created = await POST(post({ message: "hello board" }));
++  assert.equal(created.status, 200);
++  const first = await created.json() as { reply: string; conversationId: string };
++  assert.equal(first.reply, "Ready.");
++  const again = await POST(post({ message: "status?", conversationId: first.conversationId }));
++  assert.equal(again.status, 200);
++  const listed = await GET(new NextRequest("http://localhost/api/board-agent/chat", {
++    headers: { [USER_HEADER]: "alice" },
++  }));
++  const listBody = await listed.json() as { conversations: Array<{ id: string; messageCount: number }> };
++  assert.equal(listBody.conversations[0]?.id, first.conversationId);
++  assert.equal(listBody.conversations[0]?.messageCount, 4);
++  const one = await GET(new NextRequest(`http://localhost/api/board-agent/chat?conversationId=${first.conversationId}`, {
++    headers: { [USER_HEADER]: "alice" },
++  }));
++  const conv = await one.json() as { conversation: { messages: unknown[] } };
++  assert.equal(conv.conversation.messages.length, 4);
++  const other = await GET(new NextRequest(`http://localhost/api/board-agent/chat?conversationId=${first.conversationId}`, {
++    headers: { [USER_HEADER]: "bob" },
++  }));
++  assert.equal(other.status, 404);
++});
+diff --git a/apps/swarmagents/app/api/board-agent/chat/route.ts b/apps/swarmagents/app/api/board-agent/chat/route.ts
+new file mode 100644
+index 000000000..7b4b2dd9f
+--- /dev/null
++++ b/apps/swarmagents/app/api/board-agent/chat/route.ts
+@@ -0,0 +1,87 @@
++import { NextResponse, type NextRequest } from "next/server";
++import { randomUUID } from "node:crypto";
++import { USER_HEADER } from "@/lib/auth";
++import { BoardAgentProviderError, runBoardAgent } from "@/lib/board-agent/agent";
++import { getConversation, listConversations, saveConversation } from "@/lib/board-agent/store";
++import type { BoardAgentConversation } from "@/lib/board-agent/types";
++import { JsonBodyError, readJsonBody } from "@/lib/http";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++const NO_STORE = { "cache-control": "no-store" } as const;
++const MAX_BODY = 16 * 1024;
++
++function userIdFrom(request: NextRequest): string | null {
++  const user = request.headers.get(USER_HEADER);
++  if (!user || user.trim().length === 0 || user.length > 128) return null;
++  return user;
++}
++
++export async function POST(request: NextRequest) {
++  const userId = userIdFrom(request);
++  if (!userId) {
++    return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++  }
++  let body: unknown;
++  try {
++    body = await readJsonBody(request, MAX_BODY);
++  } catch (err) {
++    if (err instanceof JsonBodyError) {
++      return NextResponse.json({ error: err.message }, { status: err.status, headers: NO_STORE });
++    }
++    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400, headers: NO_STORE });
++  }
++  if (!body || typeof body !== "object" || Array.isArray(body)) {
++    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400, headers: NO_STORE });
++  }
++  const input = body as { message?: unknown; conversationId?: unknown };
++  if (typeof input.message !== "string" || input.message.length < 1 || input.message.length > 4000) {
++    return NextResponse.json({ error: "message must be 1..4000 characters." }, { status: 400, headers: NO_STORE });
++  }
++  if (input.conversationId !== undefined && typeof input.conversationId !== "string") {
++    return NextResponse.json({ error: "conversationId must be a string." }, { status: 400, headers: NO_STORE });
++  }
++  const existing = typeof input.conversationId === "string" ? getConversation(userId, input.conversationId) : null;
++  if (typeof input.conversationId === "string" && !existing) {
++    return NextResponse.json({ error: "Conversation not found." }, { status: 404, headers: NO_STORE });
++  }
++  const conversation: BoardAgentConversation = existing ?? {
++    id: `conv_${randomUUID()}`,
++    userId,
++    title: input.message.slice(0, 80),
++    messages: [],
++    createdAt: Date.now(),
++    updatedAt: Date.now(),
++  };
++  try {
++    const result = await runBoardAgent(userId, conversation, input.message);
++    await saveConversation(userId, conversation);
++    return NextResponse.json(
++      { reply: result.reply, conversationId: conversation.id, taskIds: result.taskIds, runIds: result.runIds },
++      { headers: NO_STORE },
++    );
++  } catch (err) {
++    if (err instanceof BoardAgentProviderError) {
++      return NextResponse.json({ error: err.message }, { status: err.status, headers: NO_STORE });
++    }
++    const message = err instanceof Error ? err.message : "Board agent failed.";
++    return NextResponse.json({ error: message }, { status: 502, headers: NO_STORE });
++  }
++}
++
++export async function GET(request: NextRequest) {
++  const userId = userIdFrom(request);
++  if (!userId) {
++    return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
++  }
++  const conversationId = request.nextUrl.searchParams.get("conversationId");
++  if (!conversationId) {
++    return NextResponse.json({ conversations: listConversations(userId) }, { headers: NO_STORE });
++  }
++  const conversation = getConversation(userId, conversationId);
++  if (!conversation) {
++    return NextResponse.json({ error: "Conversation not found." }, { status: 404, headers: NO_STORE });
++  }
++  return NextResponse.json({ conversation }, { headers: NO_STORE });
++}
+diff --git a/apps/swarmagents/lib/board-agent/agent.test.ts b/apps/swarmagents/lib/board-agent/agent.test.ts
+new file mode 100644
+index 000000000..6627caa5c
+--- /dev/null
++++ b/apps/swarmagents/lib/board-agent/agent.test.ts
+@@ -0,0 +1,72 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { configureStorePaths } from "../board/store";
++import {
++  __setBoardAgentCompleterForTests,
++  __setBoardAgentDispatchForTests,
++  parseToolCall,
++  runBoardAgent,
++} from "./agent";
++import type { BoardAgentConversation } from "./types";
++
++const dir = fs.mkdtempSync(path.join(os.tmpdir(), "board-agent-loop-"));
++configureStorePaths(dir, path.join(dir, "swarm_board.json"));
++
++function conversation(): BoardAgentConversation {
++  return { id: "c", userId: "u", title: "", messages: [], createdAt: 1, updatedAt: 1 };
++}
++
++test("parse failure is a plain reply", () => {
++  assert.equal(parseToolCall("hello there"), null);
++  assert.equal(parseToolCall("```json\n{not\n```"), null);
++});
++
++test("agent loop creates a task and stops", async () => {
++  const replies = [
++    '```json\n{"tool":"create_board_task","args":{"title":"Note","description":"write it down"}}\n```',
++    "Created the note.",
++  ];
++  __setBoardAgentCompleterForTests(async () => replies.shift() ?? "done");
++  __setBoardAgentDispatchForTests(() => ({ runId: "run_should_not" }));
++  const result = await runBoardAgent("u", conversation(), "Create a task titled Note");
++  assert.equal(result.reply, "Created the note.");
++  assert.equal(result.taskIds.length, 1);
++  assert.deepEqual(result.runIds, []);
++  __setBoardAgentCompleterForTests(null);
++  __setBoardAgentDispatchForTests(null);
++});
++
++test("work request dispatches and records the run id", async () => {
++  const replies = [
++    '```json\n{"tool":"create_board_task","args":{"title":"Fix login","description":"null check"}}\n```',
++    "Started the VM.",
++  ];
++  __setBoardAgentCompleterForTests(async () => replies.shift() ?? "done");
++  __setBoardAgentDispatchForTests(() => ({ runId: "run_stub" }));
++  const result = await runBoardAgent("u", conversation(), "fix the login bug");
++  assert.deepEqual(result.runIds, ["run_stub"]);
++  assert.equal(result.taskIds.length, 1);
++  __setBoardAgentCompleterForTests(null);
++  __setBoardAgentDispatchForTests(null);
++});
++
++test("dispatch error is returned as tool text", async () => {
++  const replies = [
++    '```json\n{"tool":"create_board_task","args":{"title":"Build","description":"ship"}}\n```',
++    "Could not start.",
++  ];
++  __setBoardAgentCompleterForTests(async () => replies.shift() ?? "done");
++  __setBoardAgentDispatchForTests(() => {
++    throw new Error("no VM");
++  });
++  const conv = conversation();
++  const result = await runBoardAgent("u", conv, "build the widget");
++  assert.equal(result.runIds.length, 0);
++  assert.match(conv.messages.find((m) => m.role === "tool")?.content ?? "", /no VM/);
++  assert.equal(result.reply, "Could not start.");
++  __setBoardAgentCompleterForTests(null);
++  __setBoardAgentDispatchForTests(null);
++});
+diff --git a/apps/swarmagents/lib/board-agent/agent.ts b/apps/swarmagents/lib/board-agent/agent.ts
+new file mode 100644
+index 000000000..6c1d3cc68
+--- /dev/null
++++ b/apps/swarmagents/lib/board-agent/agent.ts
+@@ -0,0 +1,183 @@
++import { countUserProviders } from "../providers/store";
++import { forwardLlmNonStreaming } from "../runtime/llm-gateway";
++import { dispatchTaskToVm } from "./dispatch";
++import { createBoardTask, getBoardTask, getRunStatus, listBoardTasks } from "./tools";
++import type { BoardAgentConversation, BoardAgentMessage, BoardAgentToolCall, BoardAgentToolName, BoardAgentToolResult } from "./types";
++import type { SwarmTask } from "../mcp-types";
++
++const SYSTEM = "You are the SwarmBoard agent. You help the user by creating and tracking tasks on the SwarmBoard and running them in the SwarmAgents VM. You can call tools by emitting a single ```json block with { tool, args }. If no tool is needed, reply in plain text. Keep replies short. Never invent a task id, run id, or PR url — only report ids returned by tools.";
++
++const TOOLS: ReadonlySet<string> = new Set([
++  "create_board_task",
++  "list_board_tasks",
++  "get_board_task",
++  "get_run_status",
++]);
++
++const WORK_INTENT = /\b(fix|build|implement|run|dispatch|work on|make|do)\b/i;
++
++export class BoardAgentProviderError extends Error {
++  readonly status: 502 | 503;
++  constructor(message: string, status: 502 | 503) {
++    super(message);
++    this.name = "BoardAgentProviderError";
++    this.status = status;
++  }
++}
++
++type Completer = (userId: string, transcript: string) => Promise<string>;
++type Dispatcher = typeof dispatchTaskToVm;
++
++let testCompleter: Completer | null = null;
++let testDispatcher: Dispatcher | null = null;
++
++export function __setBoardAgentCompleterForTests(fn: Completer | null): void {
++  testCompleter = fn;
++}
++
++export function __setBoardAgentDispatchForTests(fn: Dispatcher | null): void {
++  testDispatcher = fn;
++}
++
++export function wantsVmRun(userMessage: string): boolean {
++  return WORK_INTENT.test(userMessage);
++}
++
++function transcript(conversation: BoardAgentConversation): string {
++  const prior = conversation.messages.slice(-20).map((message) => `${message.role}: ${message.content}`);
++  return [SYSTEM, ...prior].join("\n");
++}
++
++function textFromBody(body: unknown): string {
++  if (!body || typeof body !== "object") return typeof body === "string" ? body : "";
++  const record = body as Record<string, unknown>;
++  if (typeof record.content === "string") return record.content;
++  if (Array.isArray(record.content)) {
++    return record.content
++      .map((part) => (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
++        ? (part as { text: string }).text
++        : ""))
++      .join("");
++  }
++  const choices = record.choices;
++  if (Array.isArray(choices) && choices[0] && typeof choices[0] === "object") {
++    const message = (choices[0] as { message?: { content?: unknown } }).message;
++    if (typeof message?.content === "string") return message.content;
++  }
++  return JSON.stringify(body);
++}
++
++async function defaultComplete(userId: string, transcriptText: string): Promise<string> {
++  if (countUserProviders(userId) === 0) {
++    throw new BoardAgentProviderError(
++      "No provider is configured. Add your key in Settings (BYOK) before I can run.",
++      503,
++    );
++  }
++  try {
++    const completion = await forwardLlmNonStreaming({
++      owner: userId,
++      body: {
++        max_tokens: 1024,
++        messages: [{ role: "user", content: transcriptText }],
++      },
++    });
++    return textFromBody(completion.body);
++  } catch (err) {
++    if (err instanceof BoardAgentProviderError) throw err;
++    const message = err instanceof Error ? err.message : "The model provider failed.";
++    const status = /no provider|not configured|503/i.test(message) ? 503 : 502;
++    throw new BoardAgentProviderError(message, status);
++  }
++}
++
++export function parseToolCall(text: string): BoardAgentToolCall | null {
++  const match = text.match(/```json\s*([\s\S]*?)```/i);
++  if (!match) return null;
++  try {
++    const parsed = JSON.parse(match[1]) as { tool?: unknown; args?: unknown };
++    if (typeof parsed.tool !== "string" || !TOOLS.has(parsed.tool)) return null;
++    const args = parsed.args && typeof parsed.args === "object" && !Array.isArray(parsed.args)
++      ? parsed.args as Record<string, unknown>
++      : {};
++    return { tool: parsed.tool as BoardAgentToolName, args };
++  } catch {
++    return null;
++  }
++}
++
++async function executeTool(
++  userId: string,
++  call: BoardAgentToolCall,
++  userMessage: string,
++): Promise<{ result: BoardAgentToolResult; taskId?: string; runId?: string }> {
++  const dispatch = testDispatcher ?? dispatchTaskToVm;
++  if (call.tool === "create_board_task") {
++    const created = await createBoardTask(userId, {
++      title: String(call.args.title ?? ""),
++      description: String(call.args.description ?? ""),
++      difficulty: typeof call.args.difficulty === "string" ? call.args.difficulty : undefined,
++      constraints: Array.isArray(call.args.constraints) ? call.args.constraints.filter((item): item is string => typeof item === "string") : undefined,
++    });
++    const createdData = created.data as { taskId?: string; task?: SwarmTask } | undefined;
++    if (!created.ok || !createdData?.taskId || !createdData.task) return { result: created };
++    let summary = created.summary;
++    let runId: string | undefined;
++    if (wantsVmRun(userMessage)) {
++      let dispatched: { runId: string } | { error: string };
++      try {
++        dispatched = dispatch(userId, createdData.task);
++      } catch (err) {
++        dispatched = { error: err instanceof Error ? err.message : "The VM could not start the run." };
++      }
++      if ("runId" in dispatched) {
++        runId = dispatched.runId;
++        summary = `${summary} VM run ${runId} started.`;
++      } else {
++        summary = `${summary} VM did not start: ${dispatched.error}`;
++      }
++    }
++    return { result: { ...created, summary }, taskId: createdData.taskId, runId };
++  }
++  if (call.tool === "list_board_tasks") {
++    const status = typeof call.args.status === "string" ? call.args.status : undefined;
++    return { result: listBoardTasks(userId, status ? { status } : {}) };
++  }
++  if (call.tool === "get_board_task") {
++    return { result: getBoardTask(userId, String(call.args.taskId ?? "")) };
++  }
++  return { result: getRunStatus(userId, String(call.args.runId ?? "")) };
++}
++
++export async function runBoardAgent(
++  userId: string,
++  conversation: BoardAgentConversation,
++  userMessage: string,
++): Promise<{ reply: string; taskIds: string[]; runIds: string[] }> {
++  const complete = testCompleter ?? defaultComplete;
++  const now = Date.now();
++  conversation.messages.push({ role: "user", content: userMessage, createdAt: now });
++  const taskIds: string[] = [];
++  const runIds: string[] = [];
++  let reply = "";
++  for (let turn = 0; turn < 4; turn += 1) {
++    reply = await complete(userId, transcript(conversation));
++    const call = turn < 3 ? parseToolCall(reply) : null;
++    if (!call) break;
++    const executed = await executeTool(userId, call, userMessage);
++    if (executed.taskId) taskIds.push(executed.taskId);
++    if (executed.runId) runIds.push(executed.runId);
++    const toolMessage: BoardAgentMessage = {
++      role: "tool",
++      content: executed.result.summary,
++      createdAt: Date.now(),
++      ...(executed.taskId ? { taskId: executed.taskId } : {}),
++      ...(executed.runId ? { runId: executed.runId } : {}),
++    };
++    conversation.messages.push(toolMessage);
++  }
++  conversation.messages.push({ role: "agent", content: reply, createdAt: Date.now() });
++  conversation.updatedAt = Date.now();
++  if (!conversation.title) conversation.title = userMessage.slice(0, 80);
++  return { reply, taskIds, runIds };
++}
+diff --git a/apps/swarmagents/lib/board-agent/dispatch.test.ts b/apps/swarmagents/lib/board-agent/dispatch.test.ts
+new file mode 100644
+index 000000000..799faa576
+--- /dev/null
++++ b/apps/swarmagents/lib/board-agent/dispatch.test.ts
+@@ -0,0 +1,37 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { dispatchTaskToVm, taskRunPrompt } from "./dispatch";
++import type { SwarmTask } from "../mcp-types";
++
++const task: SwarmTask = {
++  id: "task_1",
++  title: "Fix login",
++  description: "null check",
++  difficulty: "medium",
++  minElo: 1000,
++  constraints: ["no merge"],
++  status: "open",
++  createdAt: 1,
++  updatedAt: 1,
++};
++
++test("prompt names the l1 tip and the task", () => {
++  const prompt = taskRunPrompt(task);
++  assert.match(prompt, /0e9a26b46/);
++  assert.match(prompt, /Fix login/);
++  assert.match(prompt, /no merge/);
++});
++
++test("dispatch returns the stubbed run id", () => {
++  const result = dispatchTaskToVm("u", task, () => ({ accepted: true, runId: "run_abc", queued: false }));
++  assert.deepEqual(result, { runId: "run_abc" });
++});
++
++test("dispatch returns a refusal without throwing", () => {
++  const refused = dispatchTaskToVm("u", task, () => ({ accepted: false, runId: "", queued: false, error: "no VM" }));
++  assert.deepEqual(refused, { error: "no VM" });
++  const thrown = dispatchTaskToVm("u", task, () => {
++    throw new Error("no provider");
++  });
++  assert.deepEqual(thrown, { error: "no provider" });
++});
+diff --git a/apps/swarmagents/lib/board-agent/dispatch.ts b/apps/swarmagents/lib/board-agent/dispatch.ts
+new file mode 100644
+index 000000000..2a0bddd6f
+--- /dev/null
++++ b/apps/swarmagents/lib/board-agent/dispatch.ts
+@@ -0,0 +1,37 @@
++import type { SwarmTask } from "../mcp-types";
++import { getRuntimeManager, type StartResult } from "../runtime/manager";
++
++const L1_TIP = "0e9a26b46";
++
++export function taskRunPrompt(task: SwarmTask): string {
++  const constraints = task.constraints.length > 0 ? task.constraints.map((item) => `- ${item}`).join("\n") : "- none";
++  return [
++    `Task ${task.id}: ${task.title}`,
++    task.description,
++    "Constraints:",
++    constraints,
++    `Work on a branch off l1 tip ${L1_TIP}, PR to l1, no merge.`,
++  ].join("\n");
++}
++
++type StartFn = (
++  userId: string,
++  input: { prompt: string },
++) => StartResult;
++
++export function dispatchTaskToVm(
++  userId: string,
++  task: SwarmTask,
++  start?: StartFn,
++): { runId: string } | { error: string } {
++  const startRun = start ?? ((id, input) => getRuntimeManager().start(id, input));
++  try {
++    const result = startRun(userId, { prompt: taskRunPrompt(task) });
++    if (!result.accepted || !result.runId) {
++      return { error: result.error ?? "The VM did not accept the run." };
++    }
++    return { runId: result.runId };
++  } catch (err) {
++    return { error: err instanceof Error ? err.message : "The VM could not start the run." };
++  }
++}
+diff --git a/apps/swarmagents/lib/board-agent/store.test.ts b/apps/swarmagents/lib/board-agent/store.test.ts
+new file mode 100644
+index 000000000..5359401ac
+--- /dev/null
++++ b/apps/swarmagents/lib/board-agent/store.test.ts
+@@ -0,0 +1,41 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { conversationFile, getConversation, listConversations, loadConversations, saveConversation } from "./store";
++import type { BoardAgentConversation } from "./types";
++
++const dir = fs.mkdtempSync(path.join(os.tmpdir(), "board-agent-store-"));
++process.env.SWARM_HOME = dir;
++
++function conv(id: string): BoardAgentConversation {
++  return {
++    id,
++    userId: "user-a",
++    title: "Hello",
++    messages: [{ role: "user", content: "hi", createdAt: 1 }],
++    createdAt: 1,
++    updatedAt: 2,
++  };
++}
++
++test("conversation round-trip and list", async () => {
++  await saveConversation("user-a", conv("c1"));
++  const loaded = loadConversations("user-a");
++  assert.equal(loaded.length, 1);
++  assert.equal(getConversation("user-a", "c1")?.title, "Hello");
++  assert.equal(listConversations("user-a")[0]?.messageCount, 1);
++  const stat = fs.statSync(conversationFile("user-a"));
++  assert.equal(stat.mode & 0o777, 0o600);
++});
++
++test("corrupt conversation file reads as empty", () => {
++  fs.writeFileSync(conversationFile("user-a"), "{not json", { mode: 0o600 });
++  assert.deepEqual(loadConversations("user-a"), []);
++});
++
++test("other users do not see conversations", async () => {
++  await saveConversation("user-b", { ...conv("c2"), userId: "user-b" });
++  assert.equal(getConversation("user-a", "c2"), null);
++});
+diff --git a/apps/swarmagents/lib/board-agent/store.ts b/apps/swarmagents/lib/board-agent/store.ts
+new file mode 100644
+index 000000000..37258eb80
+--- /dev/null
++++ b/apps/swarmagents/lib/board-agent/store.ts
+@@ -0,0 +1,66 @@
++import fs from "node:fs";
++import path from "node:path";
++import { atomicWriteFileAsync } from "../atomic-write";
++import { resolveStorageDir } from "../board/store";
++import type { BoardAgentConversation } from "./types";
++
++function safeUserId(userId: string): string {
++  const cleaned = userId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 128);
++  return cleaned.length > 0 ? cleaned : "user";
++}
++
++export function conversationFile(userId: string): string {
++  return path.join(resolveStorageDir(), "board-agent", `conversations-${safeUserId(userId)}.json`);
++}
++
++function empty(): BoardAgentConversation[] {
++  return [];
++}
++
++export function loadConversations(userId: string): BoardAgentConversation[] {
++  const file = conversationFile(userId);
++  let text: string;
++  try {
++    text = fs.readFileSync(file, "utf-8");
++  } catch (err) {
++    const code = (err as { code?: string }).code;
++    if (code === "ENOENT") return empty();
++    return empty();
++  }
++  try {
++    const parsed = JSON.parse(text) as unknown;
++    if (!Array.isArray(parsed)) return empty();
++    return parsed.filter((row): row is BoardAgentConversation => {
++      if (!row || typeof row !== "object") return false;
++      const conv = row as BoardAgentConversation;
++      return typeof conv.id === "string" && conv.userId === userId && Array.isArray(conv.messages);
++    });
++  } catch {
++    return empty();
++  }
++}
++
++export async function saveConversation(userId: string, conv: BoardAgentConversation): Promise<void> {
++  const all = loadConversations(userId).filter((row) => row.id !== conv.id);
++  all.push({ ...conv, userId });
++  const file = conversationFile(userId);
++  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
++  await atomicWriteFileAsync(file, JSON.stringify(all), { mode: 0o600 });
++}
++
++export function getConversation(userId: string, id: string): BoardAgentConversation | null {
++  return loadConversations(userId).find((row) => row.id === id) ?? null;
++}
++
++export function listConversations(
++  userId: string,
++): Array<Pick<BoardAgentConversation, "id" | "title" | "updatedAt"> & { messageCount: number }> {
++  return loadConversations(userId)
++    .map((row) => ({
++      id: row.id,
++      title: row.title,
++      updatedAt: row.updatedAt,
++      messageCount: row.messages.length,
++    }))
++    .sort((a, b) => b.updatedAt - a.updatedAt);
++}
+diff --git a/apps/swarmagents/lib/board-agent/tools.test.ts b/apps/swarmagents/lib/board-agent/tools.test.ts
+new file mode 100644
+index 000000000..8b99eb766
+--- /dev/null
++++ b/apps/swarmagents/lib/board-agent/tools.test.ts
+@@ -0,0 +1,40 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { configureStorePaths } from "../board/store";
++import { createBoardTask, getBoardTask, listBoardTasks } from "./tools";
++
++const dir = fs.mkdtempSync(path.join(os.tmpdir(), "board-agent-tools-"));
++configureStorePaths(dir, path.join(dir, "swarm_board.json"));
++
++test("createBoardTask validates and defaults difficulty", async () => {
++  const bad = await createBoardTask("u1", { title: "", description: "x" });
++  assert.equal(bad.ok, false);
++  const tooLong = await createBoardTask("u1", { title: "t".repeat(201), description: "d", difficulty: "medium" });
++  assert.match(tooLong.summary, /title/);
++  const created = await createBoardTask("u1", { title: "Fix login", description: "details" });
++  assert.equal(created.ok, true);
++  const taskId = (created.data as { taskId: string }).taskId;
++  assert.ok(taskId.startsWith("task_"));
++  const fetched = getBoardTask("u1", taskId);
++  assert.match(fetched.summary, /medium/);
++  const listed = listBoardTasks("u1", { status: "open" });
++  assert.match(listed.summary, /Fix login/);
++});
++
++test("constraint length is rejected", async () => {
++  const result = await createBoardTask("u1", {
++    title: "T",
++    description: "D",
++    constraints: ["c".repeat(501)],
++  });
++  assert.equal(result.ok, false);
++  assert.match(result.summary, /500/);
++});
++
++test("missing task", () => {
++  const result = getBoardTask("u1", "task_missing");
++  assert.match(result.summary, /not found/);
++});
+diff --git a/apps/swarmagents/lib/board-agent/tools.ts b/apps/swarmagents/lib/board-agent/tools.ts
+new file mode 100644
+index 000000000..12e65bc15
+--- /dev/null
++++ b/apps/swarmagents/lib/board-agent/tools.ts
+@@ -0,0 +1,96 @@
++import { handleCreateTask, handlePollTasks } from "../board/handlers";
++import { loadStore } from "../board/store";
++import { validateCreateTask } from "../board/validation";
++import type { SwarmTask } from "../mcp-types";
++import { getRuntimeManager } from "../runtime/manager";
++import type { BoardAgentToolResult } from "./types";
++
++const DIFFICULTIES = new Set(["trivial", "easy", "medium", "hard", "expert"]);
++
++export interface CreateBoardTaskInput {
++  title: string;
++  description: string;
++  difficulty?: string;
++  constraints?: string[];
++}
++
++function fail(summary: string): BoardAgentToolResult {
++  return { ok: false, summary };
++}
++
++export async function createBoardTask(
++  userId: string,
++  input: CreateBoardTaskInput,
++): Promise<BoardAgentToolResult> {
++  void userId;
++  const difficulty = input.difficulty && DIFFICULTIES.has(input.difficulty) ? input.difficulty : input.difficulty ?? "medium";
++  const args: Record<string, unknown> = {
++    title: input.title,
++    description: input.description,
++    difficulty,
++    ...(input.constraints ? { constraints: input.constraints } : {}),
++  };
++  const errors = validateCreateTask(args);
++  if (errors.length > 0) {
++    return fail(errors.map((err) => `${err.field}: ${err.message}`).join("; "));
++  }
++  const store = loadStore();
++  const created = await handleCreateTask(store, args);
++  if ("error" in created) return fail(created.error.message);
++  const payload = JSON.parse(created.result.content[0]?.text ?? "{}") as { task?: SwarmTask };
++  const task = payload.task;
++  if (!task) return fail("Task was not created.");
++  return {
++    ok: true,
++    summary: `Created task ${task.id} "${task.title}" (${task.status}, ${task.difficulty}).`,
++    data: { taskId: task.id, title: task.title, task },
++  };
++}
++
++export function listBoardTasks(userId: string, input: { status?: string } = {}): BoardAgentToolResult {
++  void userId;
++  const store = loadStore();
++  if (input.status) {
++    const polled = handlePollTasks(store, { status: input.status });
++    if ("error" in polled) return fail(polled.error.message);
++  }
++  const tasks = store.tasks
++    .filter((task) => (input.status ? task.status === input.status : true))
++    .slice(0, 20);
++  if (tasks.length === 0) return { ok: true, summary: "No tasks.", data: [] };
++  const lines = tasks.map(
++    (task) =>
++      `${task.id} | ${task.title} | ${task.status} | claimedBy=${task.claimedBy ?? "-"} | pr=${task.prUrl ?? "-"}`,
++  );
++  return { ok: true, summary: lines.join("\n"), data: tasks.map((task) => ({
++    id: task.id,
++    title: task.title,
++    status: task.status,
++    claimedBy: task.claimedBy,
++    prUrl: task.prUrl,
++  })) };
++}
++
++export function getBoardTask(userId: string, taskId: string): BoardAgentToolResult {
++  void userId;
++  const task = loadStore().tasks.find((row) => row.id === taskId);
++  if (!task) return fail(`Task ${taskId} not found.`);
++  return {
++    ok: true,
++    summary: `${task.id} "${task.title}" status=${task.status} difficulty=${task.difficulty} claimedBy=${task.claimedBy ?? "-"} pr=${task.prUrl ?? "-"}\n${task.description}`,
++    data: task,
++  };
++}
++
++export function getRunStatus(userId: string, runId: string): BoardAgentToolResult {
++  let runs;
++  try {
++    runs = getRuntimeManager().list(userId);
++  } catch (err) {
++    return fail(err instanceof Error ? err.message : "Could not read run status.");
++  }
++  const run = runs.find((row) => row.runId === runId);
++  if (!run) return fail(`Run ${runId} not found.`);
++  const summary = `Run ${run.runId} status=${run.status}${run.error ? ` error=${run.error}` : ""}.`;
++  return { ok: true, summary, data: { runId: run.runId, status: run.status, error: run.error } };
++}
+diff --git a/apps/swarmagents/lib/board-agent/types.ts b/apps/swarmagents/lib/board-agent/types.ts
+new file mode 100644
+index 000000000..b6f03e756
+--- /dev/null
++++ b/apps/swarmagents/lib/board-agent/types.ts
+@@ -0,0 +1,33 @@
++export interface BoardAgentMessage {
++  role: "user" | "agent" | "tool";
++  content: string;
++  createdAt: number;
++  taskId?: string;
++  runId?: string;
++}
++
++export interface BoardAgentConversation {
++  id: string;
++  userId: string;
++  title: string;
++  messages: BoardAgentMessage[];
++  createdAt: number;
++  updatedAt: number;
++}
++
++export type BoardAgentToolName =
++  | "create_board_task"
++  | "list_board_tasks"
++  | "get_board_task"
++  | "get_run_status";
++
++export interface BoardAgentToolCall {
++  tool: BoardAgentToolName;
++  args: Record<string, unknown>;
++}
++
++export interface BoardAgentToolResult {
++  ok: boolean;
++  summary: string;
++  data?: unknown;
++}
+-- 
+2.55.0
+

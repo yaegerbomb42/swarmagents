@@ -1,0 +1,57 @@
+From c5d28b5e81e347b288cee91c948f298584a36c0f Mon Sep 17 00:00:00 2001
+From: yaeger42 <jyaeger@hawk.iit.edu>
+Date: Wed, 18 Nov 2026 11:41:33 -0600
+Subject: [PATCH] fix(swarmagents): serialize board agent task creation
+
+---
+ apps/swarmagents/lib/board-agent/tools.ts | 29 +++++++++++++----------
+ 1 file changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/apps/swarmagents/lib/board-agent/tools.ts b/apps/swarmagents/lib/board-agent/tools.ts
+index 12e65bc15..0173bd5f8 100644
+--- a/apps/swarmagents/lib/board-agent/tools.ts
++++ b/apps/swarmagents/lib/board-agent/tools.ts
+@@ -1,5 +1,5 @@
+ import { handleCreateTask, handlePollTasks } from "../board/handlers";
+-import { loadStore } from "../board/store";
++import { loadStore, withLockedStore } from "../board/store";
+ import { validateCreateTask } from "../board/validation";
+ import type { SwarmTask } from "../mcp-types";
+ import { getRuntimeManager } from "../runtime/manager";
+@@ -34,17 +34,22 @@ export async function createBoardTask(
+   if (errors.length > 0) {
+     return fail(errors.map((err) => `${err.field}: ${err.message}`).join("; "));
+   }
+-  const store = loadStore();
+-  const created = await handleCreateTask(store, args);
+-  if ("error" in created) return fail(created.error.message);
+-  const payload = JSON.parse(created.result.content[0]?.text ?? "{}") as { task?: SwarmTask };
+-  const task = payload.task;
+-  if (!task) return fail("Task was not created.");
+-  return {
+-    ok: true,
+-    summary: `Created task ${task.id} "${task.title}" (${task.status}, ${task.difficulty}).`,
+-    data: { taskId: task.id, title: task.title, task },
+-  };
++  try {
++    return await withLockedStore(async (store) => {
++      const created = await handleCreateTask(store, args);
++      if ("error" in created) return fail(created.error.message);
++      const payload = JSON.parse(created.result.content[0]?.text ?? "{}") as { task?: SwarmTask };
++      const task = payload.task;
++      if (!task) return fail("Task was not created.");
++      return {
++        ok: true,
++        summary: `Created task ${task.id} "${task.title}" (${task.status}, ${task.difficulty}).`,
++        data: { taskId: task.id, title: task.title, task },
++      };
++    });
++  } catch (err) {
++    return fail(err instanceof Error ? err.message : "Could not persist the board task.");
++  }
+ }
+ 
+ export function listBoardTasks(userId: string, input: { status?: string } = {}): BoardAgentToolResult {
+-- 
+2.55.0
+

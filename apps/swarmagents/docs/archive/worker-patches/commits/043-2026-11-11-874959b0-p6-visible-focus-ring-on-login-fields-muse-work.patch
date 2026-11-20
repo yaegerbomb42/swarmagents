@@ -1,0 +1,46 @@
+From 874959b0e9ba9ddfc65f7a5afc302d6933d6ae8c Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 23:27:12 +0000
+Subject: [PATCH] [p6] Visible focus ring on login fields (muse-worker-03)
+
+---
+ apps/swarmagents/app/globals.css          | 10 ++++++++++
+ apps/swarmagents/app/login/login-form.tsx |  1 -
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/apps/swarmagents/app/globals.css b/apps/swarmagents/app/globals.css
+index d20f9a92a..ee62c7197 100644
+--- a/apps/swarmagents/app/globals.css
++++ b/apps/swarmagents/app/globals.css
+@@ -252,6 +252,16 @@ input, textarea, select {
+   outline-offset: 2px;
+ }
+ 
++/* Login form: same --color-focus ring for email/password inputs, the
++   show/hide toggle, Sign in, and Create account. The inputs previously
++   set outline:none inline, which suppressed this ring entirely; the
++   scoped rule keeps the treatment explicit for the only public page.
++   :focus-visible means mouse clicks leave no stuck outline. */
++.login-form :focus-visible {
++  outline: 2px solid var(--color-focus);
++  outline-offset: 2px;
++}
++
+ /* ── Shell ── */
+ .app {
+   display: flex;
+diff --git a/apps/swarmagents/app/login/login-form.tsx b/apps/swarmagents/app/login/login-form.tsx
+index af8636d4b..a45fe271f 100644
+--- a/apps/swarmagents/app/login/login-form.tsx
++++ b/apps/swarmagents/app/login/login-form.tsx
+@@ -21,7 +21,6 @@ const inputStyle: CSSProperties = {
+   fontSize: 14,
+   padding: "10px 40px 10px 12px",
+   borderRadius: "var(--radius-sm, 6px)",
+-  outline: "none",
+ };
+ 
+ const labelStyle: CSSProperties = {
+-- 
+2.55.0
+

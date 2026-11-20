@@ -1,0 +1,171 @@
+From 47567e913fb38e4ac69997e7e70d7417481a3976 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 11:47:49 -0600
+Subject: [PATCH] feat(computers): harden RemoteRunManager queue hygiene and
+ live-job retention
+
+---
+ apps/swarmagents/lib/computers/remote.test.ts | 90 +++++++++++++++++++
+ apps/swarmagents/lib/computers/remote.ts      | 37 +++++++-
+ 2 files changed, 123 insertions(+), 4 deletions(-)
+
+diff --git a/apps/swarmagents/lib/computers/remote.test.ts b/apps/swarmagents/lib/computers/remote.test.ts
+index 906f95e77..cd34e6e67 100644
+--- a/apps/swarmagents/lib/computers/remote.test.ts
++++ b/apps/swarmagents/lib/computers/remote.test.ts
+@@ -204,3 +204,93 @@ test("remote runs: user pause keeps the prompt and resume validates ownership",
+     env.cleanup();
+   }
+ });
++
++test("remote runs: live queued job at index > 100 is not evicted while terminal jobs are evicted", () => {
++  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-remote-history-"));
++  const stateFile = path.join(stateDir, "remote_runs.json");
++  const env = setup({ stateFile });
++  try {
++    // Start job 0 which will remain queued and pushed past index 100
++    const job0 = env.manager.start("alice", { prompt: "Job 0 (queued)", computerId: env.computerId });
++    assert.ok(job0.accepted);
++
++    // Create a second computer for running the other jobs, so job 0 stays in env.computerId's queue
++    const pairing2 = createPairingCode("alice");
++    const redeemed2 = redeemPairingCode(pairing2.code, { name: "Worker 2", os: "linux", mode: "host" });
++    assert.ok(redeemed2);
++    const computer2Id = redeemed2.computer.id;
++
++    // Push 105 more runs for alice on computer 2 that are completed (terminal)
++    for (let i = 1; i <= 105; i++) {
++      const run = env.manager.start("alice", { prompt: `Job ${i}`, computerId: computer2Id });
++      assert.ok(run.accepted);
++      const claimed = env.manager.claim("alice", computer2Id);
++      assert.ok(claimed);
++      assert.equal(claimed.job.runId, run.runId);
++      env.manager.complete("alice", computer2Id, run.runId, { status: "finished", exitCode: 0 });
++    }
++
++    // Alice now has 106 total runs created.
++    // Job 0 is at index > 100 in byUser.
++    // It must NOT have been evicted from this.jobs.
++    assert.equal(env.manager.ownsRun("alice", job0.runId), true);
++    const liveAlice = env.manager.list("alice");
++    assert.ok(liveAlice.some((r) => r.runId === job0.runId && r.status === "queued"));
++
++    // Verify persisted state also still has job 0
++    const store = new RemoteRunStateStore({ filePath: stateFile });
++    const snapshot = store.load();
++    assert.ok(snapshot.jobs.some((j) => j.runId === job0.runId));
++
++    // Terminal jobs beyond history limit (e.g. Job 1) SHOULD have been evicted
++    assert.equal(env.manager.list("alice").length, 1); // Only job0 is live
++  } finally {
++    env.cleanup();
++    fs.rmSync(stateDir, { recursive: true, force: true });
++  }
++});
++
++test("remote runs: claim rejects missing computer record and persists queue cleanup when draining stale IDs", () => {
++  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-remote-claim-"));
++  const stateFile = path.join(stateDir, "remote_runs.json");
++  const env = setup({ stateFile });
++  try {
++    // Claim on missing computer record returns null
++    assert.equal(env.manager.claim("alice", "cmp_nonexistent"), null);
++
++    // Start 2 runs
++    const run1 = env.manager.start("alice", { prompt: "Run 1", computerId: env.computerId });
++    const run2 = env.manager.start("alice", { prompt: "Run 2", computerId: env.computerId });
++    assert.ok(run1.accepted);
++    assert.ok(run2.accepted);
++
++    // Cancel run1 directly or mark stale
++    env.manager.cancel("alice", run1.runId);
++    // run1 status is cancelled, so in queueFor(computerId) it's stale (status != "queued")
++
++    // Call claim: it should drain run1 (stale because status is cancelled) and claim run2
++    const claimed = env.manager.claim("alice", env.computerId);
++    assert.ok(claimed);
++    assert.equal(claimed.job.runId, run2.runId);
++
++    // Now complete run2
++    env.manager.complete("alice", env.computerId, run2.runId, { status: "finished" });
++
++    // Queue is empty. If queue had stale IDs and drained to empty, it persists too.
++    // Let's test draining stale IDs when no valid job is claimed:
++    const run3 = env.manager.start("alice", { prompt: "Run 3", computerId: env.computerId });
++    env.manager.cancel("alice", run3.runId);
++
++    // Queue has run3 (cancelled). claim() should drain it, persist state, and return null.
++    assert.equal(env.manager.claim("alice", env.computerId), null);
++
++    // Check persisted queue for env.computerId is empty
++    const store = new RemoteRunStateStore({ filePath: stateFile });
++    const snapshot = store.load();
++    const q = snapshot.queues[env.computerId] ?? [];
++    assert.equal(q.length, 0);
++  } finally {
++    env.cleanup();
++    fs.rmSync(stateDir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/lib/computers/remote.ts b/apps/swarmagents/lib/computers/remote.ts
+index 9338480fb..14681e99c 100644
+--- a/apps/swarmagents/lib/computers/remote.ts
++++ b/apps/swarmagents/lib/computers/remote.ts
+@@ -188,7 +188,24 @@ export class RemoteRunManager {
+     const list = this.byUser.get(userId) ?? [];
+     list.unshift(runId);
+     if (list.length > HISTORY_LIMIT) {
+-      for (const stale of list.splice(HISTORY_LIMIT)) this.jobs.delete(stale);
++      const retained: string[] = [];
++      let evictions = 0;
++      for (let i = 0; i < list.length; i++) {
++        const id = list[i];
++        if (i < HISTORY_LIMIT) {
++          retained.push(id);
++          continue;
++        }
++        const job = this.jobs.get(id);
++        if (job && this.isLive(job)) {
++          retained.push(id);
++        } else {
++          this.jobs.delete(id);
++          evictions++;
++        }
++      }
++      this.byUser.set(userId, retained);
++      return;
+     }
+     this.byUser.set(userId, list);
+   }
+@@ -259,13 +276,25 @@ export class RemoteRunManager {
+    * flips from queued to running.
+    */
+   claim(userId: string, computerId: string): { job: RemoteJobPublic } | null {
++    const computer = getComputer(userId, computerId);
++    if (!computer) return null;
+     const queue = this.queueFor(computerId);
++    let drainedStale = false;
+     for (;;) {
+       const next = queue.shift();
+-      if (!next) return null;
++      if (!next) {
++        if (drainedStale) this.persist();
++        return null;
++      }
+       const job = this.jobs.get(next);
+-      if (!job || job.userId !== userId) continue;
+-      if (job.status !== "queued") continue;
++      if (!job || job.userId !== userId) {
++        drainedStale = true;
++        continue;
++      }
++      if (job.status !== "queued") {
++        drainedStale = true;
++        continue;
++      }
+       job.status = "running";
+       job.startedAt = Date.now();
+       this.bus.publish(job.runId, {
+-- 
+2.55.0
+

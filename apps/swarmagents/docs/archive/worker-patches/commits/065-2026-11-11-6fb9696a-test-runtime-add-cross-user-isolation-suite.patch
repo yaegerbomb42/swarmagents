@@ -1,0 +1,367 @@
+From 6fb9696ad964d38fc884a1f83241a703ea5deeb4 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:30:11 -0600
+Subject: [PATCH] test(runtime): add cross-user isolation suite
+
+---
+ .../app/api/runtime/isolation.test.ts         | 348 ++++++++++++++++++
+ 1 file changed, 348 insertions(+)
+ create mode 100644 apps/swarmagents/app/api/runtime/isolation.test.ts
+
+diff --git a/apps/swarmagents/app/api/runtime/isolation.test.ts b/apps/swarmagents/app/api/runtime/isolation.test.ts
+new file mode 100644
+index 000000000..6202b276b
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/isolation.test.ts
+@@ -0,0 +1,348 @@
++/**
++ * Cross-user isolation suite.
++ *
++ * One user (alice) owns a run, approval, file, snapshot, shell run, and
++ * browser frame. Another signed-in user (bob) must never be able to read or
++ * mutate any of it. Each route is exercised through its real handler with the
++ * middleware-set x-swarm-user header, plus a middleware check that a forged
++ * header alone is not authentication in server mode.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++
++import { GET as streamGET } from "./stream/[runId]/route";
++import { GET as runsGET } from "./runs/route";
++import { GET as runGET } from "./runs/[id]/route";
++import { GET as logGET } from "./runs/[id]/log/route";
++import { GET as browserGET } from "./browser/[runId]/route";
++import { GET as frameGET } from "./browser/[runId]/frame/route";
++import { POST as approvalPOST } from "./approvals/[id]/route";
++import { GET as filesGET } from "./vm/files/route";
++import { GET as snapshotsGET, POST as snapshotsPOST } from "./vm/snapshots/route";
++import { DELETE as execDELETE } from "./vm/exec/route";
++import { DELETE as tasksDELETE } from "./tasks/route";
++
++import { middleware } from "../../../middleware";
++import { SESSION_COOKIE, USER_HEADER, signSession } from "../../../lib/auth";
++import { RuntimeManager, setRuntimeManagerForTesting } from "../../../lib/runtime/manager";
++import { VmManager, setVmManagerForTesting } from "../../../lib/vm/manager";
++import { FakeVmDriver } from "../../../lib/vm/fake-driver";
++import { TelemetryBus, type TelemetryEvent } from "../../../lib/telemetry/bus";
++import { configureRunsDir } from "../../../lib/telemetry/paths";
++import { ApprovalStore, setApprovalStoreForTesting } from "../../../lib/harness/approvals";
++import {
++  setBrowserManagerForTesting,
++  type BrowserControl,
++  type BrowserFrame,
++  type NavigateResult,
++  type ScreenshotResult,
++} from "../../../lib/browser/manager";
++import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
++
++const ALICE = "alice";
++const BOB = "bob";
++const DURABLE_A = "run_iso_durable_alice";
++const DURABLE_B = "run_iso_durable_bob";
++const ALICE_SECRET = "alice only";
++
++const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
++
++class BlockingVm extends FakeVmDriver {
++  started = 0;
++  aborted = 0;
++
++  override async exec(_handle: VmHandle, _cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
++    this.started += 1;
++    return new Promise<ExecResult>((_resolve, reject) => {
++      const abort = () => {
++        this.aborted += 1;
++        reject(new Error("Aborted"));
++      };
++      if (opts?.signal?.aborted) {
++        abort();
++        return;
++      }
++      opts?.signal?.addEventListener("abort", abort, { once: true });
++    });
++  }
++}
++
++class StubBrowser implements BrowserControl {
++  readonly frame: BrowserFrame = {
++    frameId: 1,
++    jpeg: Buffer.from("fake-jpeg"),
++    width: 1280,
++    height: 800,
++    capturedAt: Date.now(),
++  };
++
++  async navigate(): Promise<NavigateResult> {
++    return { ok: true, url: "https://example.com/", title: "Stub" };
++  }
++
++  async screenshot(): Promise<ScreenshotResult> {
++    return { ok: true, frameId: 1, width: 1280, height: 800 };
++  }
++
++  async getFrame(): Promise<BrowserFrame | null> {
++    return this.frame;
++  }
++
++  async close(): Promise<void> {}
++}
++
++let dir: string;
++let driver: BlockingVm;
++let vm: VmManager;
++let runtime: RuntimeManager;
++let aliceRun: string;
++let aliceShell: string;
++let aliceApproval: string;
++
++function request(url: string, user: string | null = ALICE, init: RequestInit = {}): NextRequest {
++  const headers = new Headers(init.headers);
++  if (user !== null) headers.set(USER_HEADER, user);
++  return new NextRequest(`http://localhost${url}`, { ...init, headers, signal: init.signal ?? undefined });
++}
++
++function ctxRun(runId: string): { params: Promise<{ runId: string }> } {
++  return { params: Promise.resolve({ runId }) };
++}
++
++function ctxId(id: string): { params: Promise<{ id: string }> } {
++  return { params: Promise.resolve({ id }) };
++}
++
++async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
++  const start = Date.now();
++  while (!predicate()) {
++    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
++    await sleep(5);
++  }
++}
++
++test.beforeEach(async () => {
++  dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-isolation-"));
++  configureRunsDir(dir);
++
++  const bus = new TelemetryBus({ persist: true, runsDir: () => dir });
++  bus.publish(DURABLE_A, { type: "run.created", data: { prompt: "alice durable", userId: ALICE } });
++  bus.publish(DURABLE_A, { type: "run.finished", exitCode: 0 } as TelemetryEvent);
++  bus.publish(DURABLE_B, { type: "run.created", data: { prompt: "bob durable", userId: BOB } });
++  bus.publish(DURABLE_B, { type: "run.finished", exitCode: 0 } as TelemetryEvent);
++
++  driver = new BlockingVm();
++  vm = new VmManager({ customDriver: driver, quotas: { maxConcurrentExecsPerUser: 10 } });
++  await vm.writeFile(ALICE, "/workspace/alice-secret.txt", ALICE_SECRET);
++  await vm.snapshot(ALICE, "alice-snap");
++  setVmManagerForTesting(vm);
++
++  runtime = new RuntimeManager({ vm, bus });
++  setRuntimeManagerForTesting(runtime);
++  aliceRun = runtime.start(ALICE, { prompt: "alice active" }).runId;
++  aliceShell = runtime.execShell(ALICE, ["sleep", "30"], "sleep 30").runId;
++
++  const approvals = new ApprovalStore({ ttlMs: 60_000 });
++  setApprovalStoreForTesting(approvals);
++  aliceApproval = approvals.create({
++    runId: aliceRun,
++    userId: ALICE,
++    toolName: "Bash",
++    action: "rm -rf /",
++    reason: "isolation test",
++  }).id;
++
++  setBrowserManagerForTesting(new StubBrowser());
++});
++
++test.afterEach(async () => {
++  try {
++    runtime?.cancel(ALICE);
++    runtime?.cancelShell(ALICE, aliceShell);
++    await waitFor(() => driver.aborted >= driver.started);
++  } catch {
++    // Best-effort teardown; the test assertions already reported the result.
++  }
++  setRuntimeManagerForTesting(null);
++  setVmManagerForTesting(null);
++  setBrowserManagerForTesting(null);
++  setApprovalStoreForTesting(null);
++  configureRunsDir(null);
++  fs.rmSync(dir, { recursive: true, force: true });
++});
++
++test("B cannot stream A's run", async () => {
++  const other = await streamGET(request(`/api/runtime/stream/${DURABLE_A}`, BOB), ctxRun(DURABLE_A));
++  assert.equal(other.status, 404);
++  const body = await other.text();
++  assert.ok(!body.includes("alice durable"));
++
++  const anon = await streamGET(request(`/api/runtime/stream/${DURABLE_A}`, null), ctxRun(DURABLE_A));
++  assert.equal(anon.status, 401);
++
++  const owner = await streamGET(request(`/api/runtime/stream/${DURABLE_A}`, ALICE), ctxRun(DURABLE_A));
++  assert.equal(owner.status, 200);
++  await owner.body?.cancel();
++});
++
++test("B cannot list or replay A's runs", async () => {
++  const list = await runsGET(request("/api/runtime/runs", BOB));
++  assert.equal(list.status, 200);
++  const listed = (await list.json()) as { runs: Array<{ runId: string }> };
++  const ids = listed.runs.map((run) => run.runId);
++  assert.ok(!ids.includes(DURABLE_A));
++  assert.ok(!ids.includes(aliceRun));
++  assert.ok(!ids.includes(aliceShell));
++  assert.ok(ids.includes(DURABLE_B));
++
++  const replay = await runGET(request(`/api/runtime/runs/${DURABLE_A}`, BOB), ctxId(DURABLE_A));
++  assert.equal(replay.status, 404);
++  assert.ok(!(await replay.text()).includes("alice durable"));
++
++  const owner = await runGET(request(`/api/runtime/runs/${DURABLE_A}`, ALICE), ctxId(DURABLE_A));
++  assert.equal(owner.status, 200);
++});
++
++test("B cannot download A's run log", async () => {
++  const other = await logGET(request(`/api/runtime/runs/${DURABLE_A}/log`, BOB), ctxId(DURABLE_A));
++  assert.equal(other.status, 404);
++  assert.ok(!(await other.text()).includes("alice durable"));
++
++  const owner = await logGET(request(`/api/runtime/runs/${DURABLE_A}/log`, ALICE), ctxId(DURABLE_A));
++  assert.equal(owner.status, 200);
++  assert.ok((await owner.text()).includes("alice durable"));
++});
++
++test("B cannot read A's browser frame or control A's active run", async () => {
++  const otherFrame = await browserGET(request(`/api/runtime/browser/${aliceRun}`, BOB), ctxRun(aliceRun));
++  assert.equal(otherFrame.status, 404);
++  const otherRaw = await frameGET(request(`/api/runtime/browser/${aliceRun}/frame`, BOB), ctxRun(aliceRun));
++  assert.equal(otherRaw.status, 404);
++
++  const owner = await browserGET(request(`/api/runtime/browser/${aliceRun}`, ALICE), ctxRun(aliceRun));
++  assert.equal(owner.status, 200);
++  assert.equal(owner.headers.get("content-type"), "image/jpeg");
++  const ownerFrame = await frameGET(request(`/api/runtime/browser/${aliceRun}/frame`, ALICE), ctxRun(aliceRun));
++  assert.equal(ownerFrame.status, 200);
++});
++
++test("B cannot decide A's approval", async () => {
++  const other = await approvalPOST(
++    request(`/api/runtime/approvals/${aliceApproval}`, BOB, {
++      method: "POST",
++      body: JSON.stringify({ decision: "approve" }),
++    }),
++    ctxId(aliceApproval),
++  );
++  assert.equal(other.status, 404);
++  assert.notEqual(runtime.isActiveRun(BOB, aliceRun), true);
++
++  const owner = await approvalPOST(
++    request(`/api/runtime/approvals/${aliceApproval}`, ALICE, {
++      method: "POST",
++      body: JSON.stringify({ decision: "approve" }),
++    }),
++    ctxId(aliceApproval),
++  );
++  assert.equal(owner.status, 200);
++});
++
++test("B cannot read or list A's VM files", async () => {
++  const list = await filesGET(request("/api/runtime/vm/files?path=/workspace", BOB));
++  assert.equal(list.status, 200);
++  const body = (await list.json()) as { entries: Array<{ name: string }> };
++  assert.ok(!body.entries.some((entry) => entry.name === "alice-secret.txt"));
++
++  const read = await filesGET(request("/api/runtime/vm/files?path=/workspace/alice-secret.txt&read=1", BOB));
++  assert.equal(read.status, 404);
++  assert.ok(!(await read.text()).includes(ALICE_SECRET));
++
++  const owner = await filesGET(request("/api/runtime/vm/files?path=/workspace/alice-secret.txt&read=1", ALICE));
++  assert.equal(owner.status, 200);
++  assert.equal(((await owner.json()) as { content: string }).content, ALICE_SECRET);
++});
++
++test("B cannot list or restore A's VM snapshots", async () => {
++  const list = await snapshotsGET(request("/api/runtime/vm/snapshots", BOB));
++  assert.equal(list.status, 200);
++  const body = (await list.json()) as { snapshots: Array<{ label: string }> };
++  assert.ok(!body.snapshots.some((snapshot) => snapshot.label === "alice-snap"));
++
++  const restore = await snapshotsPOST(
++    request("/api/runtime/vm/snapshots", BOB, {
++      method: "POST",
++      body: JSON.stringify({ action: "restore", label: "alice-snap" }),
++    }),
++  );
++  assert.equal(restore.status, 404);
++
++  const owner = await snapshotsGET(request("/api/runtime/vm/snapshots", ALICE));
++  assert.ok(
++    ((await owner.json()) as { snapshots: Array<{ label: string }> }).snapshots.some(
++      (snapshot) => snapshot.label === "alice-snap",
++    ),
++  );
++});
++
++test("B cannot cancel A's shell run", async () => {
++  const other = await execDELETE(request(`/api/runtime/vm/exec?runId=${aliceShell}`, BOB, { method: "DELETE" }));
++  assert.equal(other.status, 404);
++  assert.ok(runtime.list(ALICE).some((run) => run.runId === aliceShell));
++
++  const owner = await execDELETE(request(`/api/runtime/vm/exec?runId=${aliceShell}`, ALICE, { method: "DELETE" }));
++  assert.equal(owner.status, 200);
++});
++
++test("B cannot cancel A's agent run through the tasks route", async () => {
++  const other = await tasksDELETE(request(`/api/runtime/tasks?runId=${aliceRun}`, BOB, { method: "DELETE" }));
++  assert.equal(other.status, 404);
++  assert.equal(runtime.isActiveRun(ALICE, aliceRun), true);
++
++  const owner = await tasksDELETE(request(`/api/runtime/tasks?runId=${aliceRun}`, ALICE, { method: "DELETE" }));
++  assert.equal(owner.status, 200);
++});
++
++test("middleware rejects a forged x-swarm-user header with no session in server mode", async () => {
++  const saved = {
++    mode: process.env.SWARM_SERVER_MODE,
++    hosts: process.env.SWARM_ALLOWED_HOSTS,
++    secret: process.env.SWARM_SESSION_SECRET,
++  };
++  process.env.SWARM_SERVER_MODE = "1";
++  process.env.SWARM_ALLOWED_HOSTS = "swarm.example.com";
++  process.env.SWARM_SESSION_SECRET = "isolation-test-secret";
++
++  try {
++    const forged = middleware(
++      new NextRequest("http://swarm.example.com/api/runtime/tasks", {
++        headers: { host: "swarm.example.com", [USER_HEADER]: ALICE },
++      }),
++    );
++    assert.equal(forged.status, 401);
++    assert.deepEqual(await forged.json(), { error: "Sign in required." });
++
++    const cookie = `${SESSION_COOKIE}=${signSession(ALICE)}`;
++    const impersonating = middleware(
++      new NextRequest("http://swarm.example.com/api/runtime/tasks", {
++        headers: { host: "swarm.example.com", cookie, [USER_HEADER]: BOB },
++      }),
++    );
++    assert.notEqual(impersonating.status, 401);
++    assert.equal(impersonating.headers.get(`x-middleware-request-${USER_HEADER}`), ALICE);
++  } finally {
++    if (saved.mode === undefined) delete process.env.SWARM_SERVER_MODE;
++    else process.env.SWARM_SERVER_MODE = saved.mode;
++    if (saved.hosts === undefined) delete process.env.SWARM_ALLOWED_HOSTS;
++    else process.env.SWARM_ALLOWED_HOSTS = saved.hosts;
++    if (saved.secret === undefined) delete process.env.SWARM_SESSION_SECRET;
++    else process.env.SWARM_SESSION_SECRET = saved.secret;
++  }
++});
++
++test.todo("display (l3) route rejects another user's run once it lands");
++test.todo("pty (l6) route rejects another user's run once it lands");
+-- 
+2.55.0
+

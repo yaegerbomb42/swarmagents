@@ -1,0 +1,118 @@
+From f9b7109a221506df0fbda0f6e6809466e55cc612 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:16:57 -0600
+Subject: [PATCH] docs(swarmagents): document IteraCompute + EXAONE provider
+ fleet entries (t98)
+
+Add an 'OpenAI-compatible fleet entries' subsection to the README provider
+section with ready-to-paste providers.json samples for IteraCompute and
+EXAONE (kind openai, baseUrl, envKeys referencing ITERACOMPUTE_API_KEY /
+EXAONE_API_KEY, tier model placeholders). Add a unit test proving the
+example JSON validates through loadProvidersFile (schema still rejects
+missing required fields, no real keys committed).
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/README.md                    | 34 ++++++++++++++++
+ .../lib/providers/config-file.test.ts         | 40 +++++++++++++++++++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/apps/swarmagents/README.md b/apps/swarmagents/README.md
+index e77bce374..3287057b1 100644
+--- a/apps/swarmagents/README.md
++++ b/apps/swarmagents/README.md
+@@ -151,6 +151,40 @@ the user can read what the agent produced.
+ - The providers page (`/providers`) exposes the same actions: add a key,
+   rotate a slot, drop a key, or remove the provider.
+ 
++#### OpenAI-compatible fleet entries
++
++Operators can add OpenAI-compatible providers by saving them in the providers
++config file (`SWARM_PROVIDERS_FILE`, e.g. `providers.json`). Both entries below
++use `kind: "openai"` (OpenAI-compatible wire format), set `baseUrl` to the
++fleet endpoint, and point `envKeys` at the environment variable that holds the
++key — so no secrets need to be committed. Exact model ids are placeholders;
++replace them with the tier models offered by the fleet.
++
++```json
++{
++  "providers": [
++    {
++      "id": "iteracompute",
++      "kind": "openai",
++      "baseUrl": "https://api.iteracompute.com/v1",
++      "models": { "fast": "<model>", "balanced": "<model>", "deep": "<model>" },
++      "envKeys": "ITERACOMPUTE_API_KEY"
++    },
++    {
++      "id": "exaone",
++      "kind": "openai",
++      "baseUrl": "https://api.exaone.ai/v1",
++      "models": { "fast": "k-exaone_v2.5", "balanced": "k-exaone_v2.5", "deep": "k-exaone_v2.5" },
++      "envKeys": "EXAONE_API_KEY"
++    }
++  ]
++}
++```
++
++Set the key env vars in the environment (never in the repo): `ITERACOMPUTE_API_KEY`
++for IteraCompute and `EXAONE_API_KEY` for EXAONE. The schema still requires `id`
++and `kind` on every entry and rejects missing required fields.
++
+ ### Rate-limit cooldowns survive a restart
+ 
+ When a provider answers `429` (or fails transiently) the router puts that key
+diff --git a/apps/swarmagents/lib/providers/config-file.test.ts b/apps/swarmagents/lib/providers/config-file.test.ts
+index 3b8788fa6..742526f5d 100644
+--- a/apps/swarmagents/lib/providers/config-file.test.ts
++++ b/apps/swarmagents/lib/providers/config-file.test.ts
+@@ -152,6 +152,46 @@ test("loadProvidersFile: throws when file is missing", () => {
+   assert.throws(() => loadProvidersFile(join(tempDir, "missing.json")));
+ });
+ 
++test("loadProvidersFile: validates the IteraCompute + EXAONE fleet example", () => {
++  const path = writeJson("providers.json", {
++    providers: [
++      {
++        id: "iteracompute",
++        kind: "openai",
++        baseUrl: "https://api.iteracompute.com/v1",
++        models: { fast: "<model>", balanced: "<model>", deep: "<model>" },
++        envKeys: "ITERACOMPUTE_API_KEY",
++      },
++      {
++        id: "exaone",
++        kind: "openai",
++        baseUrl: "https://api.exaone.ai/v1",
++        models: { fast: "k-exaone_v2.5", balanced: "k-exaone_v2.5", deep: "k-exaone_v2.5" },
++        envKeys: "EXAONE_API_KEY",
++      },
++    ],
++  });
++
++  const configs = loadProvidersFile(path);
++  assert.equal(configs.length, 2);
++
++  const itera = configs[0];
++  assert.equal(itera.id, "iteracompute");
++  assert.equal(itera.kind, "openai");
++  assert.equal(itera.baseUrl, "https://api.iteracompute.com/v1");
++  assert.equal(itera.models?.fast, "<model>");
++  assert.equal(itera.models?.balanced, "<model>");
++  assert.equal(itera.models?.deep, "<model>");
++  assert.equal(itera.envKeys, "ITERACOMPUTE_API_KEY");
++
++  const exaone = configs[1];
++  assert.equal(exaone.id, "exaone");
++  assert.equal(exaone.kind, "openai");
++  assert.equal(exaone.baseUrl, "https://api.exaone.ai/v1");
++  assert.equal(exaone.models?.balanced, "k-exaone_v2.5");
++  assert.equal(exaone.envKeys, "EXAONE_API_KEY");
++});
++
+ test("loadProvidersFromEnv: returns null when SWARM_PROVIDERS_FILE is unset", () => {
+   assert.equal(loadProvidersFromEnv({}), null);
+ });
+-- 
+2.55.0
+

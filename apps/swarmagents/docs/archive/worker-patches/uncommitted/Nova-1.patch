@@ -1,0 +1,598 @@
+diff --git a/apps/swarmagents/lib/vm/fake-claude.ts b/apps/swarmagents/lib/vm/fake-claude.ts
+index 59dcdcd7a..e88ba965e 100644
+--- a/apps/swarmagents/lib/vm/fake-claude.ts
++++ b/apps/swarmagents/lib/vm/fake-claude.ts
+@@ -163,6 +163,86 @@ export const FAKE_CLAUDE_APPROVAL_TRANSCRIPT_LINES: readonly string[] = [
+ 
+ export const FAKE_CLAUDE_APPROVAL_TRANSCRIPT = `${FAKE_CLAUDE_APPROVAL_TRANSCRIPT_LINES.join("\n")}\n`;
+ 
++/**
++ * Prompt marker that replays the q1 repro: a plain network fetch. Egress to an
++ * unknown host classifies as "ask" (medium risk), so the run must hold the call
++ * until the user decides instead of showing the fetched page straight away.
++ */
++export const FAKE_CLAUDE_FETCH_TRIGGER = "fetch https://example.com";
++export const FAKE_CLAUDE_FETCH_COMMAND = "curl -sS https://example.com";
++export const FAKE_CLAUDE_FETCH_ASSISTANT_TEXT = "Fetching the page now.";
++export const FAKE_CLAUDE_FETCH_RESULT =
++  "<!doctype html><html><head><title>Example Domain</title></head><body><h1>Example Domain</h1></body></html>";
++
++/** The recorded fetch: assistant text, the curl call, its output, the answer. */
++export const FAKE_CLAUDE_FETCH_TRANSCRIPT_LINES: readonly string[] = [
++  JSON.stringify({
++    type: "system",
++    subtype: "init",
++    cwd: "/workspace",
++    session_id: FAKE_CLAUDE_SESSION_ID,
++    model: FAKE_CLAUDE_MODEL,
++  }),
++  JSON.stringify({
++    type: "assistant",
++    message: {
++      id: "msg_fake_fetch_1",
++      role: "assistant",
++      model: FAKE_CLAUDE_MODEL,
++      content: [{ type: "text", text: FAKE_CLAUDE_FETCH_ASSISTANT_TEXT }],
++      usage: { input_tokens: 20, output_tokens: 6, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
++    },
++  }),
++  JSON.stringify({
++    type: "assistant",
++    message: {
++      id: "msg_fake_fetch_2",
++      role: "assistant",
++      model: FAKE_CLAUDE_MODEL,
++      content: [
++        {
++          type: "tool_use",
++          id: "toolu_fake_fetch_1",
++          name: "Bash",
++          input: { command: FAKE_CLAUDE_FETCH_COMMAND },
++        },
++      ],
++    },
++  }),
++  JSON.stringify({
++    type: "user",
++    message: {
++      role: "user",
++      content: [
++        {
++          type: "tool_result",
++          tool_use_id: "toolu_fake_fetch_1",
++          content: FAKE_CLAUDE_FETCH_RESULT,
++          is_error: false,
++        },
++      ],
++    },
++  }),
++  JSON.stringify({
++    type: "assistant",
++    message: {
++      id: "msg_fake_fetch_3",
++      role: "assistant",
++      model: FAKE_CLAUDE_MODEL,
++      content: [{ type: "text", text: "The page fetched successfully." }],
++    },
++  }),
++  JSON.stringify({
++    type: "result",
++    subtype: "success",
++    is_error: false,
++    session_id: FAKE_CLAUDE_SESSION_ID,
++    cost_usd: 0.001,
++    duration_ms: 42,
++    num_turns: 3,
++  }),
++];
++
+ /** Routine ask-classified call that auto-approve must run without a card. */
+ export const FAKE_CLAUDE_AUTO_APPROVE_TRANSCRIPT_LINES: readonly string[] = [
+   JSON.stringify({
+diff --git a/apps/swarmagents/lib/vm/fake-driver.ts b/apps/swarmagents/lib/vm/fake-driver.ts
+index 512d1ba20..2589ee775 100644
+--- a/apps/swarmagents/lib/vm/fake-driver.ts
++++ b/apps/swarmagents/lib/vm/fake-driver.ts
+@@ -6,6 +6,8 @@ import {
+   FAKE_CLAUDE_APPROVAL_TRIGGER,
+   FAKE_CLAUDE_AUTO_APPROVE_TRANSCRIPT_LINES,
+   FAKE_CLAUDE_AUTO_APPROVE_TRIGGER,
++  FAKE_CLAUDE_FETCH_TRANSCRIPT_LINES,
++  FAKE_CLAUDE_FETCH_TRIGGER,
+   FAKE_CLAUDE_MEMORY_ASSISTANT_TEXT,
+   FAKE_CLAUDE_MEMORY_TOOL,
+   FAKE_CLAUDE_MEMORY_TOOL_ID,
+@@ -111,6 +113,7 @@ function transcriptForClaude(cmd: string[]): readonly string[] {
+   if (prompt.includes(FAKE_CLAUDE_QUESTION_TRIGGER)) return FAKE_CLAUDE_QUESTION_TRANSCRIPT_LINES;
+   if (prompt.includes(FAKE_CLAUDE_HOST_TARGET_TRIGGER)) return FAKE_CLAUDE_HOST_TARGET_TRANSCRIPT_LINES;
+   if (prompt.includes(FAKE_CLAUDE_AUTO_APPROVE_TRIGGER)) return FAKE_CLAUDE_AUTO_APPROVE_TRANSCRIPT_LINES;
++  if (prompt.includes(FAKE_CLAUDE_FETCH_TRIGGER)) return FAKE_CLAUDE_FETCH_TRANSCRIPT_LINES;
+   return prompt.includes(FAKE_CLAUDE_APPROVAL_TRIGGER)
+     ? FAKE_CLAUDE_APPROVAL_TRANSCRIPT_LINES
+     : FAKE_CLAUDE_TRANSCRIPT_LINES;
+@@ -133,6 +136,125 @@ interface FakeAsk {
+   allowFreeText: boolean;
+ }
+ 
++/**
++ * The PreToolUse approval hook the runtime installs in a real VM (see
++ * vm-image/hooks/pre-tool-use.mjs), as seen from the fake driver's replay.
++ *
++ * The replay used to emit a tool_use and its recorded result back to back, so a
++ * local run could never show whether the call was actually held before
++ * execution. When the runtime supplies the hook env, the replay now behaves
++ * like the real CLI: it publishes the call to the approval endpoint and blocks
++ * on the verdict, and a denied call gets an error tool_result instead of the
++ * recorded output.
++ */
++interface FakeApprovalGate {
++  url: string;
++  token: string;
++  timeoutMs: number;
++}
++
++interface FakeToolUse {
++  id: string;
++  name: string;
++  input: unknown;
++}
++
++/** The hook env the runtime forwarded to this claude invocation, if any. */
++function approvalGateFromEnv(env: Record<string, string> | undefined): FakeApprovalGate | null {
++  const url = env?.SWARM_APPROVAL_URL?.trim();
++  const token = env?.SWARM_APPROVAL_TOKEN?.trim();
++  if (!url || !token) return null;
++  const timeoutMs = Number(env?.SWARM_APPROVAL_TIMEOUT_MS);
++  return {
++    url,
++    token,
++    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 305_000,
++  };
++}
++
++function parseLine(line: string): { message?: { content?: unknown } } | null {
++  try {
++    const parsed: unknown = JSON.parse(line);
++    return typeof parsed === "object" && parsed !== null ? (parsed as { message?: { content?: unknown } }) : null;
++  } catch {
++    return null;
++  }
++}
++
++/** The first tool_use block in a transcript line, if it has one. */
++function toolUseOfLine(line: string): FakeToolUse | null {
++  const record = parseLine(line);
++  const content = Array.isArray(record?.message?.content) ? record.message.content : [];
++  for (const block of content) {
++    const b = block as { type?: string; id?: string; name?: string; input?: unknown };
++    if (b.type !== "tool_use" || typeof b.name !== "string") continue;
++    return { id: typeof b.id === "string" ? b.id : "", name: b.name, input: b.input };
++  }
++  return null;
++}
++
++/** The tool_use id of a transcript line's tool_result block, if it has one. */
++function toolResultIdOfLine(line: string): string | null {
++  const record = parseLine(line);
++  const content = Array.isArray(record?.message?.content) ? record.message.content : [];
++  for (const block of content) {
++    const b = block as { type?: string; tool_use_id?: string };
++    if (b.type === "tool_result" && typeof b.tool_use_id === "string") return b.tool_use_id;
++  }
++  return null;
++}
++
++/** Replace a recorded tool_result with the denial the CLI would report. */
++function deniedResultLine(line: string, reason: string): string {
++  const parsed = JSON.parse(line) as {
++    message?: { role?: string; content?: Array<Record<string, unknown>> };
++  } & Record<string, unknown>;
++  const message = parsed.message ?? {};
++  const content = (Array.isArray(message.content) ? message.content : []).map((block) =>
++    block.type === "tool_result"
++      ? { ...block, content: reason, is_error: true }
++      : block,
++  );
++  return JSON.stringify({ ...parsed, message: { ...message, content } });
++}
++
++/**
++ * Ask the runtime's approval endpoint about one tool call and block on the
++ * answer. Any failure (network, non-2xx, unparsable, timeout) denies: the hook
++ * in the real VM fails closed, and a replay that guessed "allow" would hide
++ * exactly the bug this path exists to prevent.
++ */
++async function requestApproval(
++  gate: FakeApprovalGate,
++  use: FakeToolUse,
++  signal: AbortSignal | undefined,
++): Promise<{ allow: boolean; reason: string }> {
++  const timeout = AbortSignal.timeout(gate.timeoutMs);
++  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
++  try {
++    const response = await fetch(gate.url, {
++      method: "POST",
++      headers: {
++        "content-type": "application/json",
++        authorization: `Bearer ${gate.token}`,
++      },
++      body: JSON.stringify({ tool_name: use.name, tool_input: use.input ?? {} }),
++      signal: combined,
++    });
++    if (!response.ok) {
++      return { allow: false, reason: `Approval endpoint answered ${response.status}; the call was blocked.` };
++    }
++    const body = (await response.json()) as { decision?: unknown; reason?: unknown };
++    if (body.decision === "allow") return { allow: true, reason: "" };
++    return {
++      allow: false,
++      reason: typeof body.reason === "string" && body.reason ? body.reason : "The user denied this tool call.",
++    };
++  } catch {
++    return { allow: false, reason: "The approval endpoint did not answer; the call was blocked." };
++  }
++}
++
+ /** The ask_user tool_use in a transcript line, if there is one. */
+ function askToolUse(line: string): FakeAsk | undefined {
+   let parsed: unknown;
+@@ -446,10 +568,12 @@ export class FakeVmDriver implements VmDriver {
+   }
+ 
+   /**
+-   * Emit transcript lines in order. When the recorded agent calls ask_user,
+-   * simulate the VM ask server: write the pending file, block until the
+-   * harness writes the answer file, then continue. This makes the local e2e
+-   * exercise the real pause/resume plumbing without a live MCP server.
++   * Emit transcript lines in order. When the runtime supplied the in-VM
++   * approval hook env, every tool_use is published to the approval endpoint and
++   * the replay blocks until the verdict — a denied call gets an error
++   * tool_result instead of its recorded output. When the recorded agent calls
++   * ask_user, simulate the VM ask server: write the pending file, block until
++   * the harness writes the answer file, then continue.
+    */
+   private async replayTranscript(
+     handle: VmHandle,
+@@ -458,8 +582,34 @@ export class FakeVmDriver implements VmDriver {
+     onStdout: (chunk: string) => void,
+   ): Promise<void> {
+     let askIndex = 0;
++    const gate = approvalGateFromEnv(opts?.env);
++    const denied = new Map<string, string>();
++
+     for (const line of lines) {
+       if (opts?.signal?.aborted) throw new Error("Aborted");
++
++      const use = gate ? toolUseOfLine(line) : null;
++      if (gate && use) {
++        // The CLI streams the assistant message before the hook runs, then
++        // blocks: nothing after this line may be emitted until the verdict.
++        onStdout(`${line}\n`);
++        const verdict = await requestApproval(gate, use, opts?.signal);
++        if (!verdict.allow) {
++          denied.set(use.id, verdict.reason);
++          continue;
++        }
++        // An allowed ask_user still needs the VM-side rendezvous.
++        const allowedAsk = askToolUse(line);
++        if (allowedAsk) await this.fakeAskUser(handle, allowedAsk, opts, askIndex++);
++        continue;
++      }
++
++      const resultId = gate ? toolResultIdOfLine(line) : null;
++      if (gate && resultId !== null && denied.has(resultId)) {
++        onStdout(`${deniedResultLine(line, denied.get(resultId)!)}\n`);
++        continue;
++      }
++
+       onStdout(`${line}\n`);
+       const ask = askToolUse(line);
+       if (ask) await this.fakeAskUser(handle, ask, opts, askIndex++);
+diff --git a/apps/swarmagents/app/api/runtime/approvals/gate.e2e.test.ts b/apps/swarmagents/app/api/runtime/approvals/gate.e2e.test.ts
+new file mode 100644
+index 000000000..a2ad24ebf
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/approvals/gate.e2e.test.ts
+@@ -0,0 +1,302 @@
++/**
++ * q1 definition of done, end to end: a medium-risk tool call is held at the
++ * point of execution inside the VM and only runs if the user allows it.
++ *
++ *   POST /api/runtime/tasks ("fetch https://example.com")
++ *     -> the fake claude replay publishes the Bash call to the real
++ *        POST /api/runtime/approvals/hook over HTTP (exactly what
++ *        vm-image/hooks/pre-tool-use.mjs does) and blocks
++ *     -> approval.required reaches the UI while no tool.result exists
++ *     -> Allow  -> the recorded output appears, the run finishes
++ *        Deny   -> the call never runs, Claude is told it was denied
++ *        TTL    -> same as Deny (auto-deny), the run still finishes
++ *
++ * A low-risk call must be unaffected: no card, output straight through.
++ *
++ * The hook server is a thin forwarder to the real route handler, so the test
++ * exercises the run token, the classifier, the approval store and the
++ * decision endpoint together instead of stubbing any of them.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import http from "node:http";
++import { once } from "node:events";
++import type { AddressInfo } from "node:net";
++import { NextRequest } from "next/server";
++import { POST as POST_TASK, GET as GET_TASKS } from "../tasks/route";
++import { POST as POST_HOOK } from "./hook/route";
++import { POST as POST_APPROVAL } from "./[id]/route";
++import { RuntimeManager, setRuntimeManagerForTesting } from "../../../../lib/runtime/manager";
++import { VmManager } from "../../../../lib/vm/manager";
++import { FakeVmDriver } from "../../../../lib/vm/fake-driver";
++import {
++  FAKE_CLAUDE_FETCH_COMMAND,
++  FAKE_CLAUDE_FETCH_RESULT,
++  FAKE_CLAUDE_FETCH_TRIGGER,
++} from "../../../../lib/vm/fake-claude";
++import { telemetryBus } from "../../../../lib/telemetry/index";
++import { ApprovalStore, setApprovalStoreForTesting } from "../../../../lib/harness/approvals";
++import type { RunSummary } from "../../../../lib/runtime/manager";
++
++const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
++
++/** The q1 repro: a plain fetch, which classifies as "ask" (medium risk). */
++const RISKY_PROMPT = `Please ${FAKE_CLAUDE_FETCH_TRIGGER} and tell me what it says.`;
++
++interface HookServer {
++  origin: string;
++  /** Bodies the fake VM posted, in order. */
++  bodies: Array<{ tool_name?: string; tool_input?: { command?: string } }>;
++  close: () => Promise<void>;
++}
++
++/** Forward HTTP requests to the real hook route handler (what the VM calls). */
++async function startHookServer(): Promise<HookServer> {
++  const bodies: HookServer["bodies"] = [];
++  const server = http.createServer(async (req, res) => {
++    const chunks: Buffer[] = [];
++    for await (const chunk of req) chunks.push(chunk as Buffer);
++    const body = Buffer.concat(chunks);
++    try {
++      bodies.push(JSON.parse(body.toString("utf8")) as HookServer["bodies"][number]);
++    } catch {
++      bodies.push({});
++    }
++    const headers = new Headers();
++    for (const [name, value] of Object.entries(req.headers)) {
++      if (typeof value === "string") headers.set(name, value);
++      else if (Array.isArray(value)) headers.set(name, value.join(","));
++    }
++    const request = new NextRequest(new URL(req.url ?? "/", "http://127.0.0.1"), {
++      method: req.method,
++      headers,
++      body,
++    });
++    const response = await POST_HOOK(request);
++    res.writeHead(response.status, { "content-type": "application/json" });
++    res.end(await response.text());
++  });
++  server.listen(0, "127.0.0.1");
++  await once(server, "listening");
++  const { port } = server.address() as AddressInfo;
++  return {
++    origin: `http://127.0.0.1:${port}`,
++    bodies,
++    close: async () => {
++      server.close();
++      await once(server, "close");
++    },
++  };
++}
++
++function request(path: string, init: RequestInit = {}, user: string | null = "alice"): NextRequest {
++  const headers = new Headers(init.headers);
++  if (user !== null) headers.set("x-swarm-user", user);
++  return new NextRequest(`http://localhost${path}`, { ...init, headers, signal: init.signal ?? undefined });
++}
++
++async function json(res: Response): Promise<any> {
++  return res.json();
++}
++
++function postTask(body: unknown): Promise<Response> {
++  return POST_TASK(request("/api/runtime/tasks", { method: "POST", body: JSON.stringify(body) }));
++}
++
++function postApproval(id: string, body: unknown): Promise<Response> {
++  return POST_APPROVAL(
++    request(`/api/runtime/approvals/${id}`, { method: "POST", body: JSON.stringify(body) }),
++    { params: Promise.resolve({ id }) },
++  );
++}
++
++async function listRuns(): Promise<RunSummary[]> {
++  return (await json(await GET_TASKS(request("/api/runtime/tasks", {})))).runs;
++}
++
++/** Every event of a run from seq 0, collected until the predicate holds. */
++async function collectUntil(
++  runId: string,
++  predicate: (events: any[]) => boolean,
++  timeoutMs = 15_000,
++): Promise<any[]> {
++  const events: any[] = [];
++  const start = Date.now();
++  const unsubscribe = telemetryBus.subscribe(runId, 0, (event) => events.push(event));
++  try {
++    while (!predicate(events)) {
++      if (Date.now() - start > timeoutMs) {
++        throw new Error(`timed out waiting; saw: ${events.map((event) => event.type).join(",")}`);
++      }
++      await sleep(5);
++    }
++    return events;
++  } finally {
++    unsubscribe();
++  }
++}
++
++async function waitForEvent(runId: string, type: string, timeoutMs = 15_000): Promise<any> {
++  const events = await collectUntil(runId, (list) => list.some((event) => event.type === type), timeoutMs);
++  return events.find((event) => event.type === type)!;
++}
++
++const previousEnv = {
++  base: process.env.SWARM_VM_APPROVAL_BASE_URL,
++  secret: process.env.SWARM_SESSION_SECRET,
++  ttl: process.env.SWARM_APPROVAL_TIMEOUT_SEC,
++};
++
++function restoreEnv(): void {
++  for (const [key, value] of [
++    ["SWARM_VM_APPROVAL_BASE_URL", previousEnv.base],
++    ["SWARM_SESSION_SECRET", previousEnv.secret],
++    ["SWARM_APPROVAL_TIMEOUT_SEC", previousEnv.ttl],
++  ] as const) {
++    if (value === undefined) delete process.env[key];
++    else process.env[key] = value;
++  }
++}
++
++/** Point the runtime at the hook server and install a fresh approval store. */
++function install(origin: string, ttlMs = 60_000): RuntimeManager {
++  process.env.SWARM_VM_APPROVAL_BASE_URL = origin;
++  process.env.SWARM_SESSION_SECRET = "test-session-secret-for-approval-gate";
++  setApprovalStoreForTesting(new ApprovalStore({ ttlMs }));
++  const manager = new RuntimeManager({ vm: new VmManager({ customDriver: new FakeVmDriver() }) });
++  setRuntimeManagerForTesting(manager);
++  return manager;
++}
++
++test.afterEach(() => {
++  setRuntimeManagerForTesting(null);
++  setApprovalStoreForTesting(null);
++  restoreEnv();
++});
++
++test("q1: the fetch does not run before Allow; it runs after Allow", async () => {
++  const hook = await startHookServer();
++  try {
++    install(hook.origin);
++    const { runId } = await json(await postTask({ prompt: RISKY_PROMPT }));
++
++    const required = await waitForEvent(runId, "approval.required");
++    assert.ok(required.approval.id.startsWith("appr_"));
++    assert.equal(required.approval.tool, "Bash");
++    assert.equal(required.approval.action, FAKE_CLAUDE_FETCH_COMMAND);
++    assert.equal(required.approval.riskLevel, "ask");
++
++    // The hook really reached the endpoint with this call.
++    assert.equal(hook.bodies.length, 1);
++    assert.equal(hook.bodies[0].tool_name, "Bash");
++    assert.equal(hook.bodies[0].tool_input?.command, FAKE_CLAUDE_FETCH_COMMAND);
++
++    // Nothing ran: no result, no fetched HTML, the run is still live.
++    const paused = await collectUntil(runId, (list) => list.some((event) => event.type === "approval.required"));
++    assert.equal(paused.some((event) => event.type === "tool.result"), false);
++    assert.equal(
++      paused.some((event) => JSON.stringify(event).includes("Example Domain")),
++      false,
++      "the fetched page must not be in the stream while the call is pending",
++    );
++    const running = await listRuns();
++    assert.equal(running[0].runId, runId);
++    assert.equal(running[0].status, "running");
++
++    const approve = await postApproval(required.approval.id, { decision: "approve" });
++    assert.equal(approve.status, 200);
++
++    await waitForEvent(runId, "run.finished");
++    const events = await collectUntil(runId, (list) => list.some((event) => event.type === "run.finished"));
++
++    const resolved = events.find((event) => event.type === "approval.resolved");
++    assert.equal(resolved.verdict, "approved");
++    const results = events.filter((event) => event.type === "tool.result");
++    assert.equal(results.length, 1, "the approved call ran exactly once");
++    assert.equal(results[0].ok, true);
++    assert.match(String(results[0].output), /Example Domain/);
++
++    const finished = await listRuns();
++    assert.equal(finished[0].status, "finished");
++  } finally {
++    await hook.close();
++  }
++});
++
++test("q1: Deny means the fetch never runs and the agent is told", async () => {
++  const hook = await startHookServer();
++  try {
++    install(hook.origin);
++    const { runId } = await json(await postTask({ prompt: RISKY_PROMPT }));
++
++    const required = await waitForEvent(runId, "approval.required");
++    const deny = await postApproval(required.approval.id, { decision: "deny" });
++    assert.equal(deny.status, 200);
++
++    // The blocked call is an error result, and the run still finishes so the
++    // user sees the agent's reaction instead of a dead run.
++    await waitForEvent(runId, "run.finished");
++    const events = await collectUntil(runId, (list) => list.some((event) => event.type === "run.finished"));
++
++    const resolved = events.find((event) => event.type === "approval.resolved");
++    assert.equal(resolved.verdict, "denied");
++    const results = events.filter((event) => event.type === "tool.result");
++    assert.equal(results.length, 1);
++    assert.equal(results[0].ok, false, "a denied call reports an error result");
++    assert.match(String(results[0].output), /denied/i);
++    assert.equal(
++      events.some((event) => JSON.stringify(event).includes("Example Domain")),
++      false,
++      "the denied command must never have executed",
++    );
++
++    const finished = await listRuns();
++    assert.equal(finished[0].status, "finished");
++  } finally {
++    await hook.close();
++  }
++});
++
++test("q1: an unanswered approval auto-denies and the fetch never runs", async () => {
++  const hook = await startHookServer();
++  try {
++    install(hook.origin, 400);
++    const { runId } = await json(await postTask({ prompt: RISKY_PROMPT }));
++
++    const required = await waitForEvent(runId, "approval.required");
++    const timeout = await waitForEvent(runId, "approval.timeout");
++    assert.equal(timeout.id, required.approval.id);
++
++    await waitForEvent(runId, "run.finished");
++    const events = await collectUntil(runId, (list) => list.some((event) => event.type === "run.finished"));
++    const resolved = events.find((event) => event.type === "approval.resolved");
++    assert.equal(resolved.verdict, "expired");
++    const results = events.filter((event) => event.type === "tool.result");
++    assert.equal(results.length, 1);
++    assert.equal(results[0].ok, false);
++    assert.equal(
++      events.some((event) => JSON.stringify(event).includes("Example Domain")),
++      false,
++    );
++  } finally {
++    await hook.close();
++  }
++});
++
++test("q1: a low-risk call is unaffected (no card, output straight through)", async () => {
++  const hook = await startHookServer();
++  try {
++    install(hook.origin);
++    const { runId } = await json(await postTask({ prompt: "Run the smoke check." }));
++
++    await waitForEvent(runId, "run.finished");
++    const events = await collectUntil(runId, (list) => list.some((event) => event.type === "run.finished"));
++    assert.equal(events.some((event) => event.type === "approval.required"), false);
++    assert.ok(events.some((event) => event.type === "tool.result" && event.ok === true));
++    // The hook still sees the call (allow verdict), so the VM never bypasses it.
++    assert.equal(hook.bodies[0].tool_name, "Bash");
++  } finally {
++    await hook.close();
++  }
++});

@@ -1,0 +1,152 @@
+From b61d499f31e58ff8ca128b39b1fc3bdb84f39440 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 22:13:24 +0000
+Subject: [PATCH] [p5] /login no-store headers (no year-long cache)
+
+---
+ .../app/login/no-store-headers.test.ts        | 46 +++++++++++++++++++
+ apps/swarmagents/app/login/page.tsx           | 16 +++++++
+ apps/swarmagents/next.config.ts               | 34 ++++++++++++++
+ 3 files changed, 96 insertions(+)
+ create mode 100644 apps/swarmagents/app/login/no-store-headers.test.ts
+
+diff --git a/apps/swarmagents/app/login/no-store-headers.test.ts b/apps/swarmagents/app/login/no-store-headers.test.ts
+new file mode 100644
+index 000000000..c69c1da03
+--- /dev/null
++++ b/apps/swarmagents/app/login/no-store-headers.test.ts
+@@ -0,0 +1,46 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import nextConfig from "../../next.config";
++
++/**
++ * Regression test for the cached-/login bug: GET /login once served
++ * `Cache-Control: s-maxage=31536000` with `x-nextjs-prerender: 1`, so a
++ * stale CSP nonce and a stale allowSignup flag could be served for a year.
++ * The sign-in document and the auth/session endpoints must all be
++ * `no-store`. These assertions run against the headers() config itself
++ * (no server boot needed); verify against a live `next start` with:
++ *   curl -sI http://127.0.0.1:3777/login | grep -i "cache-control"
++ * which must print `cache-control: no-store` and no `s-maxage`.
++ */
++
++const NO_STORE_PATHS = ["/login", "/api/login", "/api/signup", "/api/me", "/api/health"];
++
++test("next.config headers() marks the login document and auth endpoints no-store", async () => {
++  assert.equal(typeof nextConfig.headers, "function", "next.config must define headers()");
++  const rules = await nextConfig.headers!();
++
++  for (const source of NO_STORE_PATHS) {
++    const rule = rules.find((r) => r.source === source);
++    assert.ok(rule, `headers() must include a rule for ${source}`);
++    const cacheControl = rule!.headers.find((h) => h.key.toLowerCase() === "cache-control");
++    assert.ok(cacheControl, `${source} must set Cache-Control`);
++    assert.equal(cacheControl!.value, "no-store", `${source} Cache-Control must be exactly no-store`);
++    const pragma = rule!.headers.find((h) => h.key.toLowerCase() === "pragma");
++    assert.ok(pragma, `${source} must set Pragma`);
++    assert.equal(pragma!.value, "no-cache", `${source} Pragma must be no-cache`);
++  }
++});
++
++test("no headers() rule sets a year-long cache anywhere", async () => {
++  assert.equal(typeof nextConfig.headers, "function", "next.config must define headers()");
++  const rules = await nextConfig.headers!();
++  for (const rule of rules) {
++    for (const header of rule.headers) {
++      assert.doesNotMatch(
++        header.value,
++        /s-maxage=31536000|max-age=31536000/,
++        `${rule.source} must not carry a year-long cache (${header.key}: ${header.value})`,
++      );
++    }
++  }
++});
+diff --git a/apps/swarmagents/app/login/page.tsx b/apps/swarmagents/app/login/page.tsx
+index 6acf14049..d0d449811 100644
+--- a/apps/swarmagents/app/login/page.tsx
++++ b/apps/swarmagents/app/login/page.tsx
+@@ -1,10 +1,23 @@
+ import { redirect } from "next/navigation";
+ import { cookies, headers } from "next/headers";
++import { unstable_noStore as noStore } from "next/cache";
+ import { requestUser, safeNextPath } from "../../lib/auth";
+ import LoginForm from "./login-form";
+ 
+ export const dynamic = "force-dynamic";
+ 
++/**
++ * This document must never be cached: it carries a per-request CSP nonce
++ * and a live allowSignup flag, and a cached copy once served
++ * `Cache-Control: s-maxage=31536000`. App Router pages cannot set response
++ * headers themselves, so the `Cache-Control: no-store` / `Pragma: no-cache`
++ * on the document response comes from the `headers()` rules in
++ * next.config.ts. The `noStore()` call below is the second half of the
++ * fix: it opts this render out of static rendering and the data cache so
++ * the page is never prerendered (no `x-nextjs-prerender`) in the first
++ * place, even if `force-dynamic` is ever dropped.
++ */
++
+ /**
+  * Whether POST /api/signup will accept new accounts: self-signup is open in
+  * development and only when SWARM_ALLOW_SIGNUP is explicitly enabled in
+@@ -23,6 +36,9 @@ function signupSupported(): boolean {
+  * are bounced straight back to their destination.
+  */
+ export default async function LoginPage({ searchParams }: { searchParams: Promise<{ next?: string }> }) {
++  // Never prerender or cache this document (see the note above).
++  noStore();
++
+   const { next } = await searchParams;
+   const target = safeNextPath(next);
+ 
+diff --git a/apps/swarmagents/next.config.ts b/apps/swarmagents/next.config.ts
+index 2d0e2448f..86f9b3b82 100644
+--- a/apps/swarmagents/next.config.ts
++++ b/apps/swarmagents/next.config.ts
+@@ -1,8 +1,42 @@
+ import type { NextConfig } from "next";
+ 
++/**
++ * Paths that must never be cached anywhere (browser, CDN, or proxy).
++ *
++ * The sign-in document carries a per-request CSP nonce (minted in
++ * middleware, surfaced in app/layout.tsx) and a live allowSignup flag, and
++ * the auth/session endpoints carry per-request state. A cached /login once
++ * served `Cache-Control: s-maxage=31536000` with `x-nextjs-prerender: 1`,
++ * so a stale nonce and a stale allowSignup flag could be served for a
++ * year. `no-store` on every one of these paths makes the cacheability
++ * explicit instead of relying on `force-dynamic` alone.
++ *
++ * Kept in next.config.ts (rather than in the page) because App Router
++ * pages cannot set response headers themselves — this is what puts
++ * `Cache-Control: no-store` on the /login document response.
++ */
++const NO_STORE_HEADERS = [
++  { key: "Cache-Control", value: "no-store" },
++  { key: "Pragma", value: "no-cache" },
++];
++
++const NO_STORE_SOURCES = [
++  "/login",
++  "/api/login",
++  "/api/signup",
++  "/api/me",
++  "/api/health",
++];
++
+ const nextConfig: NextConfig = {
+   output: "standalone",
+   poweredByHeader: false,
++  async headers() {
++    return NO_STORE_SOURCES.map((source) => ({
++      source,
++      headers: NO_STORE_HEADERS,
++    }));
++  },
+ };
+ 
+ export default nextConfig;
+-- 
+2.55.0
+

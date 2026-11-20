@@ -1,0 +1,818 @@
+From 1010fba7b73c6df0a74d76992637e412bbb166d6 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 21:55:59 +0000
+Subject: [PATCH] [l8] live file changes: files light up as the agent edits
+
+---
+ apps/swarmagents/lib/client/files.test.ts     | 171 ++++++++++++
+ apps/swarmagents/lib/client/files.ts          | 249 ++++++++++++++++++
+ .../src/components/ComputerScreen.tsx         |   2 +-
+ .../src/components/FilesView.tsx              | 223 +++++++++++++++-
+ 4 files changed, 634 insertions(+), 11 deletions(-)
+
+diff --git a/apps/swarmagents/lib/client/files.test.ts b/apps/swarmagents/lib/client/files.test.ts
+index 022ff43b8..f8bb7de27 100644
+--- a/apps/swarmagents/lib/client/files.test.ts
++++ b/apps/swarmagents/lib/client/files.test.ts
+@@ -1,16 +1,25 @@
+ import { test } from "node:test";
+ import assert from "node:assert/strict";
+ import {
++  LIVE_BASH_REFRESH_DEBOUNCE_MS,
++  LIVE_EDIT_DOT_TTL_MS,
++  LIVE_FILE_REFRESH_DEBOUNCE_MS,
+   FileBrowserError,
+   WORKSPACE_ROOT,
++  debounce,
+   describeFilesError,
++  extractLiveFileActivity,
+   fetchWorkspaceFile,
+   fetchWorkspaceListing,
++  findChangedLineRanges,
+   formatBytes,
++  formatEditedAgo,
+   joinWorkspacePath,
+   normalizeWorkspacePath,
+   parentWorkspacePath,
++  toolCallFilePath,
+   type FetchLike,
++  type LiveStreamItemLike,
+ } from "./files";
+ 
+ function fakeFetch(body: unknown, init?: ResponseInit & { raw?: string }): FetchLike {
+@@ -189,3 +198,165 @@ test("formatBytes and describeFilesError produce friendly text", () => {
+   assert.equal(describeFilesError(new Error("boom")), "boom");
+   assert.equal(describeFilesError("weird"), "Could not load the VM filesystem.");
+ });
++
++// --- Live file activity (l8) ---
++
++function streamItem(kind: string, data: unknown, ts: number): LiveStreamItemLike {
++  return { kind, data, ts };
++}
++
++function toolCall(id: string | undefined, name: string, input: unknown, ts: number): LiveStreamItemLike {
++  return streamItem("tool.call", { type: "tool.call", id, name, input }, ts);
++}
++
++function toolResult(id: string | undefined, ok: boolean, ts: number): LiveStreamItemLike {
++  return streamItem("tool.result", { type: "tool.result", id, ok, truncated: false, output: "" }, ts);
++}
++
++test("toolCallFilePath reads file_path, path, and notebook_path, and stays in the workspace", () => {
++  assert.equal(toolCallFilePath({ file_path: "/workspace/src/app.ts" }), "/workspace/src/app.ts");
++  assert.equal(toolCallFilePath({ file_path: "src/notes.md" }), "/workspace/src/notes.md");
++  assert.equal(toolCallFilePath({ path: "/workspace/a/b.txt" }), "/workspace/a/b.txt");
++  assert.equal(toolCallFilePath({ notebook_path: "/workspace/analysis.ipynb" }), "/workspace/analysis.ipynb");
++  assert.equal(toolCallFilePath({ command: "ls" }), undefined);
++  assert.equal(toolCallFilePath({}), undefined);
++  assert.equal(toolCallFilePath(null), undefined);
++  // Outside the workspace (or traversal) is not a FilesView path.
++  assert.equal(toolCallFilePath({ file_path: "/etc/passwd" }), undefined);
++  assert.equal(toolCallFilePath({ file_path: "../escape.txt" }), undefined);
++});
++
++test("extractLiveFileActivity pairs tool results with their calls by id", () => {
++  const activity = extractLiveFileActivity([
++    toolCall("c1", "Write", { file_path: "/workspace/a.txt", content: "hi" }, 1000),
++    toolCall("c2", "Edit", { file_path: "/workspace/b.ts", old_string: "a", new_string: "b" }, 1100),
++    toolResult("c1", true, 2000),
++    toolResult("c2", true, 2100),
++  ]);
++  assert.equal(activity.changes.length, 2);
++  assert.equal(activity.changes[0].path, "/workspace/a.txt");
++  assert.equal(activity.changes[0].tool, "Write");
++  assert.equal(activity.changes[0].editedAt, 2000);
++  assert.deepEqual(activity.changes[0].newTexts, []);
++  assert.equal(activity.changes[1].path, "/workspace/b.ts");
++  assert.deepEqual(activity.changes[1].newTexts, ["b"]);
++  assert.deepEqual(activity.changes[1].oldTexts, ["a"]);
++  assert.equal(activity.lastBashAt, undefined);
++});
++
++test("extractLiveFileActivity keeps MultiEdit edits in order and the latest edit per file", () => {
++  const activity = extractLiveFileActivity([
++    toolCall("c1", "MultiEdit", {
++      file_path: "/workspace/m.ts",
++      edits: [
++        { old_string: "one", new_string: "uno" },
++        { old_string: "two", new_string: "dos" },
++      ],
++    }, 1000),
++    toolResult("c1", true, 2000),
++    toolCall("c2", "Edit", { file_path: "/workspace/m.ts", old_string: "uno", new_string: "uno!" }, 3000),
++    toolResult("c2", true, 4000),
++  ]);
++  assert.equal(activity.changes.length, 1);
++  assert.deepEqual(activity.changes[0].newTexts, ["uno!"]);
++  assert.equal(activity.changes[0].editedAt, 4000);
++});
++
++test("extractLiveFileActivity ignores failed results, reads, and unmatched results", () => {
++  const activity = extractLiveFileActivity([
++    toolCall("c1", "Write", { file_path: "/workspace/fail.txt" }, 1000),
++    toolResult("c1", false, 2000),
++    toolCall("c2", "Read", { file_path: "/workspace/read.txt" }, 1100),
++    toolResult("c2", true, 2100),
++    toolResult("no-such-call", true, 2200),
++  ]);
++  assert.deepEqual(activity.changes, []);
++  assert.equal(activity.lastBashAt, undefined);
++});
++
++test("extractLiveFileActivity falls back to the most recent running write call without an id", () => {
++  const activity = extractLiveFileActivity([
++    toolCall(undefined, "Write", { file_path: "/workspace/noid.txt" }, 1000),
++    toolResult(undefined, true, 2000),
++  ]);
++  assert.equal(activity.changes.length, 1);
++  assert.equal(activity.changes[0].path, "/workspace/noid.txt");
++});
++
++test("extractLiveFileActivity records Bash results and NotebookEdit paths", () => {
++  const activity = extractLiveFileActivity([
++    toolCall("c1", "Bash", { command: "npm test" }, 1000),
++    toolResult("c1", true, 2000),
++    toolCall("c2", "NotebookEdit", { notebook_path: "/workspace/nb.ipynb" }, 1100),
++    toolResult("c2", true, 2100),
++  ]);
++  assert.equal(activity.lastBashAt, 2000);
++  assert.equal(activity.changes.length, 1);
++  assert.equal(activity.changes[0].path, "/workspace/nb.ipynb");
++  assert.equal(activity.changes[0].tool, "NotebookEdit");
++});
++
++test("findChangedLineRanges locates single and multi-line edits, skipping stale text", () => {
++  const content = "line one\nline two\nline three\nline four\n";
++  assert.deepEqual(findChangedLineRanges(content, ["line two"]), [{ startLine: 2, endLine: 2 }]);
++  assert.deepEqual(findChangedLineRanges(content, ["line two\nline three"]), [
++    { startLine: 2, endLine: 3 },
++  ]);
++  assert.deepEqual(findChangedLineRanges(content, ["line two", "line four"]), [
++    { startLine: 2, endLine: 2 },
++    { startLine: 4, endLine: 4 },
++  ]);
++  assert.deepEqual(findChangedLineRanges(content, ["gone"]), []);
++  assert.deepEqual(findChangedLineRanges(content, [""]), []);
++});
++
++test("formatEditedAgo counts seconds then minutes", () => {
++  assert.equal(formatEditedAgo(1000, 1000), "edited just now");
++  assert.equal(formatEditedAgo(1000, 4000), "edited just now");
++  assert.equal(formatEditedAgo(1000, 6000), "edited 5s ago");
++  assert.equal(formatEditedAgo(1000, 45000), "edited 44s ago");
++  assert.equal(formatEditedAgo(1000, 121000), "edited 2m ago");
++});
++
++test("live refresh debounce constants are the specified 500ms / 2s / 60s", () => {
++  assert.equal(LIVE_FILE_REFRESH_DEBOUNCE_MS, 500);
++  assert.equal(LIVE_BASH_REFRESH_DEBOUNCE_MS, 2000);
++  assert.equal(LIVE_EDIT_DOT_TTL_MS, 60_000);
++});
++
++test("debounce collapses rapid calls into one, and flush runs it early", (t) => {
++  t.mock.timers.enable({ apis: ["setTimeout"] });
++  try {
++    let calls = 0;
++    const debounced = debounce(() => {
++      calls += 1;
++    }, 500);
++    debounced();
++    debounced();
++    debounced();
++    t.mock.timers.tick(499);
++    assert.equal(calls, 0);
++    t.mock.timers.tick(1);
++    assert.equal(calls, 1);
++
++    // A fresh burst collapses again.
++    debounced();
++    t.mock.timers.tick(200);
++    debounced();
++    t.mock.timers.tick(499);
++    assert.equal(calls, 1);
++    t.mock.timers.tick(1);
++    assert.equal(calls, 2);
++
++    // flush runs the pending call immediately; cancel drops it.
++    debounced();
++    debounced.flush();
++    assert.equal(calls, 3);
++    debounced();
++    debounced.cancel();
++    t.mock.timers.tick(1000);
++    assert.equal(calls, 3);
++  } finally {
++    t.mock.timers.reset();
++  }
++});
+diff --git a/apps/swarmagents/lib/client/files.ts b/apps/swarmagents/lib/client/files.ts
+index 7825b6efe..c9c1dc2dd 100644
+--- a/apps/swarmagents/lib/client/files.ts
++++ b/apps/swarmagents/lib/client/files.ts
+@@ -294,3 +294,252 @@ export function describeFilesError(err: unknown): string {
+ }
+ 
+ export { isAbortError };
++
++// ---------------------------------------------------------------------------
++// Live file activity
++//
++// While a run is live, the run stream reports tool.call / tool.result pairs.
++// These pure helpers turn that stream into the file activity FilesView
++// renders: which files the agent just wrote, where the edits landed, and
++// whether a shell command ran (which may have touched anything).
++// ---------------------------------------------------------------------------
++
++/** Tool names that write a file (path taken from the matching tool.call input). */
++export const LIVE_FILE_WRITE_TOOLS: ReadonlySet<string> = new Set([
++  "Write",
++  "Edit",
++  "MultiEdit",
++  "NotebookEdit",
++]);
++
++/** Tool names that run a shell command (may touch any file). */
++export const LIVE_BASH_TOOLS: ReadonlySet<string> = new Set(["Bash", "Terminal", "Shell", "cmd"]);
++
++/** Debounce before re-reading a directory after a write-tool result. */
++export const LIVE_FILE_REFRESH_DEBOUNCE_MS = 500;
++/** Debounce before a full refresh after a Bash tool result. */
++export const LIVE_BASH_REFRESH_DEBOUNCE_MS = 2000;
++/** How long a file keeps its "edited Ns ago" dot after the edit. */
++export const LIVE_EDIT_DOT_TTL_MS = 60_000;
++
++/** A 1-based inclusive line range inside a file preview. */
++export interface ChangedLineRange {
++  startLine: number;
++  endLine: number;
++}
++
++/** One file the agent touched during the current run. */
++export interface LiveFileChange {
++  /** Normalized workspace path. */
++  path: string;
++  /** Tool that wrote it (Write / Edit / MultiEdit / NotebookEdit). */
++  tool: string;
++  /** Wall-clock ms of the tool.result that confirmed the write. */
++  editedAt: number;
++  /** new_string values, in edit order (Edit: one; MultiEdit: one per edit). */
++  newTexts: string[];
++  /** old_string values, parallel to newTexts when present. */
++  oldTexts: string[];
++}
++
++/** Everything FilesView needs to render live activity for the current run. */
++export interface LiveFileActivity {
++  /** One entry per touched file, latest edit wins, in first-touch order. */
++  changes: LiveFileChange[];
++  /** Wall-clock ms of the latest successful Bash tool.result, if any. */
++  lastBashAt?: number;
++}
++
++/** Minimal shape of a run-stream item this module reads (see useRunStream). */
++export interface LiveStreamItemLike {
++  kind: string;
++  data: unknown;
++  ts: number;
++}
++
++function liveAsString(value: unknown): string | undefined {
++  return typeof value === "string" ? value : undefined;
++}
++
++/**
++ * The workspace path a tool call targets, or undefined when the input carries
++ * no usable path (or one outside /workspace). Mirrors the field order the
++ * harness risk classifier uses: file_path, then path, then notebook_path.
++ */
++export function toolCallFilePath(input: unknown): string | undefined {
++  const obj = asObject(input);
++  if (!obj) return undefined;
++  const raw =
++    liveAsString(obj.file_path) ?? liveAsString(obj.path) ?? liveAsString(obj.notebook_path);
++  if (!raw) return undefined;
++  try {
++    return normalizeWorkspacePath(raw);
++  } catch {
++    return undefined;
++  }
++}
++
++function editTextsOf(name: string, input: unknown): { newTexts: string[]; oldTexts: string[] } {
++  const obj = asObject(input);
++  if (!obj) return { newTexts: [], oldTexts: [] };
++  if (name === "Edit") {
++    const next = liveAsString(obj.new_string);
++    const prev = liveAsString(obj.old_string);
++    return {
++      newTexts: next !== undefined ? [next] : [],
++      oldTexts: prev !== undefined ? [prev] : [],
++    };
++  }
++  if (name === "MultiEdit") {
++    const newTexts: string[] = [];
++    const oldTexts: string[] = [];
++    const edits = Array.isArray(obj.edits) ? obj.edits : [];
++    for (const edit of edits) {
++      const entry = asObject(edit);
++      if (!entry) continue;
++      const next = liveAsString(entry.new_string);
++      const prev = liveAsString(entry.old_string);
++      if (next !== undefined) newTexts.push(next);
++      if (prev !== undefined) oldTexts.push(prev);
++    }
++    return { newTexts, oldTexts };
++  }
++  return { newTexts: [], oldTexts: [] };
++}
++
++/**
++ * Reduce run-stream items to live file activity. Each tool.result is paired
++ * with its tool.call (by id, else the most recent still-unmatched write/Bash
++ * call — the same pairing runTimeline uses for results that lost their id).
++ * Failed results (ok === false) wrote nothing and are ignored.
++ */
++export function extractLiveFileActivity(
++  items: readonly LiveStreamItemLike[],
++): LiveFileActivity {
++  const byId = new Map<string, { name: string; input: unknown }>();
++  const unmatched: Array<{ id: string; name: string; input: unknown }> = [];
++  const byPath = new Map<string, LiveFileChange>();
++  let lastBashAt: number | undefined;
++
++  for (const item of items) {
++    const data = asObject(item.data) ?? {};
++    if (item.kind === "tool.call") {
++      const name = liveAsString(data.name) ?? "tool";
++      const id = liveAsString(data.id);
++      // One object shared by both indexes so matching a result by id also
++      // removes it from the unmatched pool.
++      const call = { id: id ?? "", name, input: data.input };
++      if (id) byId.set(id, call);
++      unmatched.push(call);
++      continue;
++    }
++    if (item.kind !== "tool.result") continue;
++
++    const id = liveAsString(data.id);
++    let call = id ? byId.get(id) : undefined;
++    if (!call) {
++      // No id match: close the most recent still-unmatched write/Bash call.
++      for (let i = unmatched.length - 1; i >= 0; i -= 1) {
++        const candidate = unmatched[i];
++        if (LIVE_FILE_WRITE_TOOLS.has(candidate.name) || LIVE_BASH_TOOLS.has(candidate.name)) {
++          call = candidate;
++          break;
++        }
++      }
++    }
++    if (!call) continue;
++    // The call is now matched; drop it from the unmatched pool even when the
++    // result failed, so a later id-less result cannot claim it.
++    const dropIdx = unmatched.findIndex((c) => c === call);
++    if (dropIdx >= 0) unmatched.splice(dropIdx, 1);
++    // A failed result wrote nothing.
++    if (data.ok === false) continue;
++
++    if (LIVE_BASH_TOOLS.has(call.name)) {
++      lastBashAt = item.ts;
++      continue;
++    }
++    if (!LIVE_FILE_WRITE_TOOLS.has(call.name)) continue;
++    const path = toolCallFilePath(call.input);
++    if (!path) continue;
++    const { newTexts, oldTexts } = editTextsOf(call.name, call.input);
++    // Map.set on an existing key keeps its first-touch position; the value
++    // (latest edit) is what changes.
++    byPath.set(path, {
++      path,
++      tool: call.name,
++      editedAt: item.ts,
++      newTexts,
++      oldTexts,
++    });
++  }
++
++  return {
++    changes: [...byPath.values()],
++    ...(lastBashAt !== undefined ? { lastBashAt } : {}),
++  };
++}
++
++/**
++ * Locate each new_text inside the freshly read file content and return the
++ * 1-based line ranges it covers, so the preview can highlight what changed.
++ * Texts that no longer match the content (e.g. overwritten since) are skipped.
++ */
++export function findChangedLineRanges(content: string, newTexts: string[]): ChangedLineRange[] {
++  const ranges: ChangedLineRange[] = [];
++  let searchFrom = 0;
++  for (const text of newTexts) {
++    if (!text) continue;
++    const idx = content.indexOf(text, searchFrom);
++    if (idx < 0) continue;
++    const startLine = content.slice(0, idx).split("\n").length;
++    const endLine = startLine + text.split("\n").length - 1;
++    ranges.push({ startLine, endLine });
++    searchFrom = idx + text.length;
++  }
++  return ranges;
++}
++
++/** "edited just now" / "edited 5s ago" / "edited 2m ago" for the live dot. */
++export function formatEditedAgo(editedAt: number, now: number): string {
++  const seconds = Math.max(0, Math.floor((now - editedAt) / 1000));
++  if (seconds < 5) return "edited just now";
++  if (seconds < 60) return `edited ${seconds}s ago`;
++  return `edited ${Math.floor(seconds / 60)}m ago`;
++}
++
++/** A debounced callback: repeated calls within delayMs collapse into one. */
++export interface DebouncedFunction {
++  (): void;
++  cancel(): void;
++  /** Run the pending call now, if one is scheduled. */
++  flush(): void;
++}
++
++export function debounce(fn: () => void, delayMs: number): DebouncedFunction {
++  let timer: ReturnType<typeof setTimeout> | undefined;
++  let pending = false;
++  const debounced = (() => {
++    pending = true;
++    if (timer !== undefined) clearTimeout(timer);
++    timer = setTimeout(() => {
++      timer = undefined;
++      pending = false;
++      fn();
++    }, delayMs);
++  }) as DebouncedFunction;
++  debounced.cancel = () => {
++    if (timer !== undefined) {
++      clearTimeout(timer);
++      timer = undefined;
++    }
++    pending = false;
++  };
++  debounced.flush = () => {
++    if (!pending) return;
++    debounced.cancel();
++    fn();
++  };
++  return debounced;
++}
++
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index 6196e4888..cb2352ff2 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -650,7 +650,7 @@ export function ComputerScreen({
+           <BrowserView runId={liveRun ? runId : undefined} />
+         )}
+ 
+-        {activeView === "files" && <FilesView refreshToken={filesRefreshToken} />}
++        {activeView === "files" && <FilesView refreshToken={filesRefreshToken} runItems={stream.items} />}
+ 
+         {activeView === "telemetry" && (
+           <div className="flex-1 p-6 grid place-items-center text-center">
+diff --git a/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx b/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx
+index 6009444d7..707d30d18 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx
+@@ -1,6 +1,6 @@
+ "use client";
+ 
+-import React, { useCallback, useEffect, useState } from "react";
++import React, { useCallback, useEffect, useRef, useState } from "react";
+ import {
+   AlertTriangle,
+   Binary,
+@@ -16,19 +16,31 @@ import {
+   Loader2,
+   RefreshCw,
+   X,
++  Zap,
+ } from "lucide-react";
+ import {
++  LIVE_BASH_REFRESH_DEBOUNCE_MS,
++  LIVE_EDIT_DOT_TTL_MS,
++  LIVE_FILE_REFRESH_DEBOUNCE_MS,
+   WORKSPACE_ROOT,
++  debounce,
+   describeFilesError,
++  extractLiveFileActivity,
+   fetchWorkspaceFile,
+   fetchWorkspaceListing,
++  findChangedLineRanges,
+   formatBytes,
++  formatEditedAgo,
+   joinWorkspacePath,
+   parentWorkspacePath,
++  type ChangedLineRange,
++  type LiveFileActivity,
++  type LiveFileChange,
+   type WorkspaceEntry,
+   type WorkspaceFile,
+   type WorkspaceListing,
+ } from "../../../lib/client/files";
++import type { RunStreamItem } from "../../../lib/client/useRunStream";
+ 
+ interface FilesViewProps {
+   /**
+@@ -36,8 +48,17 @@ interface FilesViewProps {
+    * the listing and open preview re-read the workspace after the agent writes.
+    */
+   refreshToken?: number;
++  /**
++   * Live run-stream items (from useRunStream in the parent). FilesView reacts
++   * to tool.result events as they arrive, so files light up while the agent
++   * is still working instead of only at run.finished.
++   */
++  runItems?: readonly RunStreamItem[];
+ }
+ 
++/** Seconds a preview highlight lingers after a live reload. */
++const FLASH_MS = 6000;
++
+ type FileKind = "code" | "image" | "text" | "binary";
+ 
+ const CODE_EXTENSIONS = new Set([
+@@ -162,7 +183,23 @@ function buildCrumbs(path: string): Crumb[] {
+   return crumbs;
+ }
+ 
+-export function FilesView({ refreshToken = 0 }: FilesViewProps) {
++/** Render preview content line by line, tinting the changed line ranges. */
++function renderHighlightedLines(content: string, ranges: ChangedLineRange[]) {
++  return content.split("\n").map((line, index) => {
++    const lineNo = index + 1;
++    const hot = ranges.some((range) => lineNo >= range.startLine && lineNo <= range.endLine);
++    return (
++      <span
++        key={lineNo}
++        className={hot ? "-mx-1 block rounded bg-emerald-400/15 px-1" : "block"}
++      >
++        {line || "\u00a0"}
++      </span>
++    );
++  });
++}
++
++export function FilesView({ refreshToken = 0, runItems }: FilesViewProps) {
+   const [path, setPath] = useState(WORKSPACE_ROOT);
+   const [listing, setListing] = useState<WorkspaceListing>();
+   const [loading, setLoading] = useState(true);
+@@ -175,7 +212,123 @@ export function FilesView({ refreshToken = 0 }: FilesViewProps) {
+   const [fileError, setFileError] = useState<string>();
+   const [copied, setCopied] = useState(false);
+ 
+-  // Directory listing (also reloads when a run finishes or the user refreshes).
++  // Live activity from the run stream: files the agent touched this run.
++  const [activity, setActivity] = useState<LiveFileActivity>({ changes: [] });
++  /** Bumped by the debounced live refreshers; re-reads listing + preview. */
++  const [liveReload, setLiveReload] = useState(0);
++  /** "Agent activity" filter: show only files touched this run. */
++  const [activityOnly, setActivityOnly] = useState(false);
++  /** Wall clock for the "edited Ns ago" dots (ticked so they age + fade). */
++  const [now, setNow] = useState(() => Date.now());
++  /** Change waiting for its preview reload, so ranges can be computed. */
++  const [pendingFlash, setPendingFlash] = useState<LiveFileChange>();
++  /** Active preview highlight: changed line ranges, or empty for a flash. */
++  const [flash, setFlash] = useState<{
++    path: string;
++    ranges: ChangedLineRange[];
++    at: number;
++  }>();
++
++  const processedItemsRef = useRef(0);
++  const activityRef = useRef<LiveFileActivity>({ changes: [] });
++  const dirRefreshRef = useRef<ReturnType<typeof debounce> | undefined>(undefined);
++  const fullRefreshRef = useRef<ReturnType<typeof debounce> | undefined>(undefined);
++  if (!dirRefreshRef.current) {
++    dirRefreshRef.current = debounce(
++      () => setLiveReload((n) => n + 1),
++      LIVE_FILE_REFRESH_DEBOUNCE_MS,
++    );
++  }
++  if (!fullRefreshRef.current) {
++    fullRefreshRef.current = debounce(
++      () => setLiveReload((n) => n + 1),
++      LIVE_BASH_REFRESH_DEBOUNCE_MS,
++    );
++  }
++  useEffect(
++    () => () => {
++      dirRefreshRef.current?.cancel();
++      fullRefreshRef.current?.cancel();
++    },
++    [],
++  );
++
++  // Age the "edited Ns ago" dots and drop them after the TTL.
++  useEffect(() => {
++    const timer = window.setInterval(() => setNow(Date.now()), 5000);
++    return () => window.clearInterval(timer);
++  }, []);
++
++  // React to new run-stream items: record touches, refresh the affected
++  // directory (debounced 500ms), and reload + highlight the open preview.
++  useEffect(() => {
++    const items = runItems ?? [];
++    if (items.length < processedItemsRef.current) {
++      // A new run started: the stream restarted from seq 0.
++      processedItemsRef.current = 0;
++      activityRef.current = { changes: [] };
++      setActivity({ changes: [] });
++      setFlash(undefined);
++      setPendingFlash(undefined);
++    }
++    const fresh = items.slice(processedItemsRef.current);
++    processedItemsRef.current = items.length;
++    if (fresh.length === 0) return;
++
++    const next = extractLiveFileActivity(items);
++    const prev = activityRef.current;
++    activityRef.current = next;
++    setActivity(next);
++
++    const prevByPath = new Map(prev.changes.map((c) => [c.path, c.editedAt]));
++    const freshChanges = next.changes.filter((c) => prevByPath.get(c.path) !== c.editedAt);
++    if (freshChanges.length === 0 && next.lastBashAt === prev.lastBashAt) return;
++
++    // Only the directory holding a changed file is re-read; other folders
++    // are untouched so a busy run does not churn the whole tree.
++    const inCurrentDir = freshChanges.filter((c) => parentWorkspacePath(c.path) === path);
++    if (inCurrentDir.length > 0) dirRefreshRef.current?.();
++
++    const openChange = freshChanges.find((c) => c.path === selected);
++    if (openChange) {
++      setPendingFlash(openChange);
++      // The liveReload bump below re-reads the preview; the flash ranges
++      // are computed once the fresh content arrives.
++      dirRefreshRef.current?.();
++    }
++
++    // A shell command may have touched any file: re-read the current
++    // directory and the open preview, debounced longer (2s).
++    if (next.lastBashAt !== undefined && next.lastBashAt !== prev.lastBashAt) {
++      fullRefreshRef.current?.();
++    }
++  }, [runItems, path, selected]);
++
++  // Once the reloaded preview content arrives, locate the changed lines.
++  useEffect(() => {
++    if (!pendingFlash || !file || file.path !== pendingFlash.path) return;
++    const ranges = file.content
++      ? findChangedLineRanges(file.content, pendingFlash.newTexts)
++      : [];
++    setFlash({ path: file.path, ranges, at: Date.now() });
++    setPendingFlash(undefined);
++  }, [pendingFlash, file]);
++
++  // The highlight (and the "changed" flash) lingers briefly, then clears.
++  useEffect(() => {
++    if (!flash) return;
++    const timer = window.setTimeout(() => setFlash(undefined), FLASH_MS);
++    return () => window.clearTimeout(timer);
++  }, [flash]);
++
++  // A different preview drops any live highlight.
++  useEffect(() => {
++    setFlash(undefined);
++    setPendingFlash(undefined);
++  }, [selected]);
++
++  // Directory listing (also reloads when a run finishes, the user refreshes,
++  // or a live write lands in this directory).
+   useEffect(() => {
+     const ctrl = new AbortController();
+     setLoading(true);
+@@ -193,7 +346,7 @@ export function FilesView({ refreshToken = 0 }: FilesViewProps) {
+         if (!ctrl.signal.aborted) setLoading(false);
+       });
+     return () => ctrl.abort();
+-  }, [path, refreshToken, reload]);
++  }, [path, refreshToken, reload, liveReload]);
+ 
+   // Open file preview (re-read on refresh so the agent's latest writes show).
+   useEffect(() => {
+@@ -220,7 +373,7 @@ export function FilesView({ refreshToken = 0 }: FilesViewProps) {
+         if (!ctrl.signal.aborted) setFileLoading(false);
+       });
+     return () => ctrl.abort();
+-  }, [selected, refreshToken, reload]);
++  }, [selected, refreshToken, reload, liveReload]);
+ 
+   useEffect(() => {
+     setCopied(false);
+@@ -265,6 +418,13 @@ export function FilesView({ refreshToken = 0 }: FilesViewProps) {
+   const selectedName = selected ? selected.slice(selected.lastIndexOf("/") + 1) : undefined;
+   const canCopy = Boolean(file && !file.binary && !fileLoading && !fileError && file.content !== undefined);
+ 
++  const touchedByPath = new Map(activity.changes.map((change) => [change.path, change]));
++  const visibleEntries = activityOnly
++    ? listing?.entries.filter((entry) => touchedByPath.has(entry.path))
++    : listing?.entries;
++  const flashForSelected =
++    flash && selected && flash.path === selected ? flash : undefined;
++
+   return (
+     <div className="flex flex-1 min-h-0 flex-col">
+       {/* Toolbar: breadcrumb path + refresh */}
+@@ -308,6 +468,21 @@ export function FilesView({ refreshToken = 0 }: FilesViewProps) {
+             synced
+           </span>
+         )}
++        <button
++          onClick={() => setActivityOnly((value) => !value)}
++          title="Show only files the agent touched this run"
++          aria-pressed={activityOnly}
++          className={`flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1 text-[11px] font-mono transition ${
++            activityOnly
++              ? "bg-emerald-400/10 text-emerald-300 ring-1 ring-inset ring-emerald-400/30"
++              : "text-white/50 hover:bg-white/10 hover:text-white"
++          }`}
++        >
++          <Zap className="h-3 w-3" />
++          <span>
++            Agent activity{activity.changes.length > 0 ? ` (${activity.changes.length})` : ""}
++          </span>
++        </button>
+         <button
+           onClick={() => setReload((n) => n + 1)}
+           title="Refresh"
+@@ -336,12 +511,16 @@ export function FilesView({ refreshToken = 0 }: FilesViewProps) {
+             <div className="flex flex-1 items-center justify-center gap-2 p-6 text-xs text-white/40">
+               <Loader2 className="h-4 w-4 animate-spin" /> Loading workspace…
+             </div>
+-          ) : listing && listing.entries.length === 0 ? (
++          ) : listing && visibleEntries?.length === 0 ? (
+             <div className="flex flex-1 flex-col items-center justify-center gap-1.5 p-6 text-center">
+               <FolderOpen className="h-6 w-6 text-white/20" />
+-              <div className="text-xs text-white/50">This folder is empty</div>
++              <div className="text-xs text-white/50">
++                {activityOnly ? "No files touched yet this run" : "This folder is empty"}
++              </div>
+               <div className="max-w-[200px] text-[10px] leading-relaxed text-white/25">
+-                Files the agent writes here will show up in this list.
++                {activityOnly
++                  ? "Files the agent writes will show up here as it works."
++                  : "Files the agent writes here will show up in this list."}
+               </div>
+             </div>
+           ) : (
+@@ -352,8 +531,13 @@ export function FilesView({ refreshToken = 0 }: FilesViewProps) {
+                 <span className="text-right">Modified</span>
+               </div>
+               <div className="p-1.5">
+-                {listing?.entries.map((entry) => {
++                {visibleEntries?.map((entry) => {
+                   const active = selected === entry.path;
++                  const change = touchedByPath.get(entry.path);
++                  const age = change ? now - change.editedAt : Number.POSITIVE_INFINITY;
++                  // The emerald dot marks a file the agent just edited; it
++                  // fades after 30s and disappears after 60s.
++                  const showDot = change !== undefined && age < LIVE_EDIT_DOT_TTL_MS;
+                   return (
+                     <button
+                       key={entry.path}
+@@ -367,6 +551,17 @@ export function FilesView({ refreshToken = 0 }: FilesViewProps) {
+                       <span className="flex min-w-0 items-center gap-2">
+                         {entryIcon(entry)}
+                         <span className="min-w-0 truncate">{entry.name}</span>
++                        {showDot && change && (
++                          <span
++                            title={`Edited by the agent (${change.tool})`}
++                            className={`flex shrink-0 items-center gap-1 text-[10px] text-emerald-300 ${
++                              age < 30_000 ? "" : "opacity-50"
++                            }`}
++                          >
++                            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
++                            {formatEditedAgo(change.editedAt, now)}
++                          </span>
++                        )}
+                       </span>
+                       <span className="text-right text-[10px] text-white/30">
+                         {entry.type === "directory" ? "—" : formatBytes(entry.size)}
+@@ -442,8 +637,16 @@ export function FilesView({ refreshToken = 0 }: FilesViewProps) {
+                 </div>
+               ) : (
+                 <div className="flex min-h-0 flex-1 flex-col">
++                  {flashForSelected && flashForSelected.ranges.length === 0 && (
++                    <div className="flex items-center gap-1.5 border-b border-emerald-400/20 bg-emerald-400/10 px-3 py-1.5 text-[10px] text-emerald-200/90">
++                      <Zap className="h-3 w-3 shrink-0" />
++                      <span>Changed by the agent — preview reloaded.</span>
++                    </div>
++                  )}
+                   <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-relaxed text-white/75 scrollbar-thin">
+-                    {file?.content ?? ""}
++                    {flashForSelected && flashForSelected.ranges.length > 0 && file?.content !== undefined
++                      ? renderHighlightedLines(file.content, flashForSelected.ranges)
++                      : (file?.content ?? "")}
+                   </pre>
+                   {file?.truncated && (
+                     <div className="flex items-center gap-1.5 border-t border-amber-400/20 bg-amber-400/10 px-3 py-1.5 text-[10px] text-amber-200/80">
+-- 
+2.55.0
+

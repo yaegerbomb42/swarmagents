@@ -1,0 +1,143 @@
+From 8aa9e22e830ef68543c1e2294c225588a286d31c Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:39:59 -0600
+Subject: [PATCH] test(harness): unit tests for the Claude stream-json parser
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Covers a line split across two chunks, multiple lines in one chunk, flush
+of a trailing line without a newline, empty/whitespace-only line skipping,
+malformed JSON routing to onMalformed without throwing (including on flush),
+and a representative assistant + tool_use stream-json fixture. No parser
+changes needed — the parser already behaves correctly.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../lib/harness/stream-json.test.ts           | 114 ++++++++++++++++++
+ 1 file changed, 114 insertions(+)
+ create mode 100644 apps/swarmagents/lib/harness/stream-json.test.ts
+
+diff --git a/apps/swarmagents/lib/harness/stream-json.test.ts b/apps/swarmagents/lib/harness/stream-json.test.ts
+new file mode 100644
+index 000000000..296dacf89
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/stream-json.test.ts
+@@ -0,0 +1,114 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { createStreamJsonParser } from "./stream-json";
++import type { StreamJsonHandlers } from "./stream-json";
++
++function collector() {
++  const lines: Array<{ raw: unknown; line: string }> = [];
++  const malformed: string[] = [];
++  const handlers: StreamJsonHandlers = {
++    onLine: (raw, line) => lines.push({ raw, line }),
++    onMalformed: (line) => malformed.push(line),
++  };
++  return { lines, malformed, handlers };
++}
++
++test("parses a JSON line split across two chunks", () => {
++  const { lines, handlers } = collector();
++  const p = createStreamJsonParser(handlers);
++  p.push('{"type":"tool_use",');
++  p.push('"name":"Bash"}');
++  p.push("\n");
++  assert.equal(lines.length, 1);
++  assert.deepEqual(lines[0].raw, { type: "tool_use", name: "Bash" });
++  assert.equal(lines[0].line, '{"type":"tool_use","name":"Bash"}');
++});
++
++test("parses multiple complete lines delivered in one chunk", () => {
++  const { lines, handlers } = collector();
++  const p = createStreamJsonParser(handlers);
++  p.push('{"a":1}\n{"b":2}\n{"c":3}\n');
++  assert.equal(lines.length, 3);
++  assert.deepEqual(lines.map((l) => l.raw), [{ a: 1 }, { b: 2 }, { c: 3 }]);
++});
++
++test("flush emits a trailing line that has no newline", () => {
++  const { lines, handlers } = collector();
++  const p = createStreamJsonParser(handlers);
++  p.push('{"done":true}');
++  p.flush();
++  assert.equal(lines.length, 1);
++  assert.deepEqual(lines[0].raw, { done: true });
++});
++
++test("flush is a no-op for an empty or whitespace-only buffer", () => {
++  const { lines, handlers } = collector();
++  const p = createStreamJsonParser(handlers);
++  p.push("");
++  p.flush();
++  p.push("   \n\t\n  ");
++  p.flush();
++  assert.equal(lines.length, 0);
++});
++
++test("skips empty and whitespace-only lines between real events", () => {
++  const { lines, handlers } = collector();
++  const p = createStreamJsonParser(handlers);
++  p.push("\n\n{\"a\":1}\n   \n{\"b\":2}\n\n");
++  assert.equal(lines.length, 2);
++  assert.deepEqual(lines.map((l) => l.raw), [{ a: 1 }, { b: 2 }]);
++});
++
++test("routes malformed lines to onMalformed without throwing and keeps parsing", () => {
++  const { lines, malformed, handlers } = collector();
++  const p = createStreamJsonParser(handlers);
++  assert.doesNotThrow(() => {
++    p.push("this is not json\n{\"ok\":true}\n");
++  });
++  assert.deepEqual(malformed, ["this is not json"]);
++  assert.equal(lines.length, 1);
++  assert.deepEqual(lines[0].raw, { ok: true });
++});
++
++test("a malformed trailing line is surfaced on flush without throwing", () => {
++  const { malformed, handlers } = collector();
++  const p = createStreamJsonParser(handlers);
++  assert.doesNotThrow(() => p.push("{broken"));
++  p.flush();
++  assert.deepEqual(malformed, ["{broken"]);
++});
++
++test("parses a representative assistant + tool_use stream-json fixture", () => {
++  const { lines, handlers } = collector();
++  const p = createStreamJsonParser(handlers);
++
++  const assistant = {
++    type: "assistant",
++    message: {
++      id: "msg_1",
++      type: "message",
++      role: "assistant",
++      content: [{ type: "text", text: "Let me check the file." }],
++      model: "claude-sonnet-5-5",
++      stop_reason: "tool_use",
++      usage: { input_tokens: 10, output_tokens: 5 },
++    },
++  };
++  const toolUse = {
++    type: "tool_use",
++    name: "Bash",
++    input: { command: "ls -la" },
++    tool_use_id: "call_1",
++  };
++
++  p.push(JSON.stringify(assistant));
++  p.push("\n");
++  p.push(JSON.stringify(toolUse));
++  p.push("\n");
++  p.flush();
++
++  assert.equal(lines.length, 2);
++  assert.deepEqual(lines[0].raw, assistant);
++  assert.equal(lines[0].line, JSON.stringify(assistant));
++  assert.deepEqual(lines[1].raw, toolUse);
++});
+-- 
+2.55.0
+

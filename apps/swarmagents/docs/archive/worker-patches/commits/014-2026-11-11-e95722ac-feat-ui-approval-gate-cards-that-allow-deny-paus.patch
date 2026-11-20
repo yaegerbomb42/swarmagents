@@ -1,0 +1,656 @@
+From e95722aca96512c74f9413aedc9f4d64f9e947b1 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 12:45:58 -0600
+Subject: [PATCH] feat(ui): approval gate cards that Allow/Deny paused
+ ask-classified tool calls
+
+Surface approval.required telemetry as pending approval cards in the
+Telemetry view and the live terminal: tool, risk level, redacted command
+and classifier reason, with Allow/Deny buttons that POST
+/api/runtime/approvals/{id}. Resolved (approved/denied/expired) approvals
+disappear via the approval.resolved stream event; decisions hide
+optimistically and are restored if the API rejects them.
+---
+ apps/swarmagents/lib/client/approvals.test.ts |  59 +++++++++
+ apps/swarmagents/lib/client/approvals.ts      |  45 +++++++
+ .../lib/client/runTimeline.test.ts            | 123 +++++++++++++++++-
+ apps/swarmagents/lib/client/runTimeline.ts    |  88 ++++++++++++-
+ apps/swarmagents/lib/harness/runner.ts        |   1 +
+ apps/swarmagents/lib/harness/types.ts         |  15 ++-
+ .../src/components/ApprovalGate.tsx           | 100 ++++++++++++++
+ .../src/components/ComputerScreen.tsx         |  13 ++
+ .../src/components/Telemetry.tsx              |  14 +-
+ 9 files changed, 451 insertions(+), 7 deletions(-)
+ create mode 100644 apps/swarmagents/lib/client/approvals.test.ts
+ create mode 100644 apps/swarmagents/lib/client/approvals.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/ApprovalGate.tsx
+
+diff --git a/apps/swarmagents/lib/client/approvals.test.ts b/apps/swarmagents/lib/client/approvals.test.ts
+new file mode 100644
+index 000000000..c48fb2406
+--- /dev/null
++++ b/apps/swarmagents/lib/client/approvals.test.ts
+@@ -0,0 +1,59 @@
++/**
++ * Unit tests for the client approval decision helper (lib/client/approvals.ts).
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++import { postApprovalDecision } from "./approvals";
++
++function fakeFetch(status: number, body: unknown, calls: Array<{ url: string; init: RequestInit }> = []) {
++  return (async (url: string | URL, init: RequestInit = {}) => {
++    calls.push({ url: String(url), init });
++    return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
++  }) as typeof fetch;
++}
++
++test("approve posts the decision and returns ok with the store status", async () => {
++  const calls: Array<{ url: string; init: RequestInit }> = [];
++  const fetch = fakeFetch(200, { ok: true, status: "approved" }, calls);
++  const result = await postApprovalDecision("appr_abc", "approve", fetch);
++
++  assert.equal(result.ok, true);
++  assert.equal(result.status, "approved");
++  assert.equal(result.error, undefined);
++  assert.equal(calls.length, 1);
++  assert.equal(calls[0].url, "/api/runtime/approvals/appr_abc");
++  assert.equal(calls[0].init.method, "POST");
++  assert.deepEqual(JSON.parse(String(calls[0].init.body)), { decision: "approve" });
++});
++
++test("deny posts the same endpoint with decision deny", async () => {
++  const calls: Array<{ url: string; init: RequestInit }> = [];
++  const fetch = fakeFetch(200, { ok: true, status: "denied" }, calls);
++  const result = await postApprovalDecision("appr_abc", "deny", fetch);
++
++  assert.equal(result.ok, true);
++  assert.deepEqual(JSON.parse(String(calls[0].init.body)), { decision: "deny" });
++});
++
++test("non-ok responses surface the API error message", async () => {
++  const result = await postApprovalDecision("appr_abc", "approve", fakeFetch(409, { error: "Approval already approved." }));
++  assert.equal(result.ok, false);
++  assert.equal(result.error, "Approval already approved.");
++});
++
++test("error responses without a JSON body fall back to a generic message", async () => {
++  const fetchImpl = (async () => new Response("<html>oops</html>", { status: 500 })) as unknown as typeof fetch;
++  const result = await postApprovalDecision("appr_abc", "approve", fetchImpl);
++  assert.equal(result.ok, false);
++  assert.equal(result.error, "decision rejected (500)");
++});
++
++test("network failures become a failed decision instead of a throw", async () => {
++  const fetchImpl = (async () => {
++    throw new Error("network down");
++  }) as unknown as typeof fetch;
++  const result = await postApprovalDecision("appr_abc", "approve", fetchImpl);
++  assert.equal(result.ok, false);
++  assert.equal(result.error, "network down");
++});
+diff --git a/apps/swarmagents/lib/client/approvals.ts b/apps/swarmagents/lib/client/approvals.ts
+new file mode 100644
+index 000000000..53c555596
+--- /dev/null
++++ b/apps/swarmagents/lib/client/approvals.ts
+@@ -0,0 +1,45 @@
++/**
++ * approvals.ts — client helper for the approval gate.
++ *
++ * The approval UI (ApprovalGate) posts the user's Allow/Deny decision to
++ * `POST /api/runtime/approvals/{id}`; the runtime resolves the paused run and
++ * the run stream then confirms with an approval.resolved event. Kept as a tiny
++ * pure-ish module (fetch injectable) so the decision path is unit-testable
++ * without a DOM.
++ */
++
++export type ApprovalDecision = "approve" | "deny";
++
++export interface ApprovalDecisionResult {
++  ok: boolean;
++  /** Store status echoed by the API ("approved"/"denied") on success. */
++  status?: string;
++  /** Human-readable failure reason when ok is false. */
++  error?: string;
++}
++
++export async function postApprovalDecision(
++  id: string,
++  decision: ApprovalDecision,
++  fetchImpl: typeof fetch = fetch,
++): Promise<ApprovalDecisionResult> {
++  let res: Response;
++  try {
++    res = await fetchImpl(`/api/runtime/approvals/${encodeURIComponent(id)}`, {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ decision }),
++    });
++  } catch (err) {
++    return { ok: false, error: err instanceof Error ? err.message : "decision request failed" };
++  }
++  if (res.ok) {
++    const body = (await res.json().catch(() => ({}))) as { status?: string };
++    return { ok: true, status: body.status };
++  }
++  const body = (await res.json().catch(() => ({}))) as { error?: string };
++  return {
++    ok: false,
++    error: body.error ?? `decision rejected (${res.status})`,
++  };
++}
+diff --git a/apps/swarmagents/lib/client/runTimeline.test.ts b/apps/swarmagents/lib/client/runTimeline.test.ts
+index b917b3a89..9cf70a74e 100644
+--- a/apps/swarmagents/lib/client/runTimeline.test.ts
++++ b/apps/swarmagents/lib/client/runTimeline.test.ts
+@@ -1,6 +1,12 @@
+ import { test } from "node:test";
+ import assert from "node:assert/strict";
+-import { reduceRunTimeline, type RunTimeline, type ToolCallEntry } from "./runTimeline";
++import {
++  reduceRunTimeline,
++  extractApprovals,
++  pendingApprovals,
++  type RunTimeline,
++  type ToolCallEntry,
++} from "./runTimeline";
+ import type { RunStreamItem } from "./useRunStream";
+ 
+ function item(kind: string, data: unknown, ts: number, seq: number): RunStreamItem {
+@@ -156,3 +162,118 @@ test("ignores non-timeline events and raw-string payloads", () => {
+   assert.equal(summary.startedAt, T0);
+   assert.equal(summary.tokensIn, 0);
+ });
++
++// ── approvals ──
++
++test("approval.required creates a pending entry with tool, action, reason and risk level", () => {
++  const events = [
++    item("approval.required", {
++      type: "approval.required",
++      approval: {
++        id: "appr_1",
++        tool: "Bash",
++        action: "rm -rf /",
++        reason: "destructive root deletion requires approval",
++        riskLevel: "ask",
++      },
++    }, T1, 1),
++  ];
++  const { approvals, tools, summary } = reduceRunTimeline(events);
++
++  assert.equal(approvals.length, 1);
++  assert.deepEqual(approvals[0], {
++    id: "appr_1",
++    tool: "Bash",
++    action: "rm -rf /",
++    reason: "destructive root deletion requires approval",
++    riskLevel: "ask",
++    status: "pending",
++    ts: T1,
++  });
++  assert.equal(pendingApprovals(approvals).length, 1);
++  // The approval does not shape the tool timeline.
++  assert.equal(tools.length, 0);
++  assert.equal(summary.tokensIn, 0);
++});
++
++test("approval.resolved marks the entry and it stops being pending", () => {
++  const events: RunStreamItem[] = [
++    item("approval.required", {
++      approval: { id: "appr_1", tool: "Bash", action: "rm -rf /", reason: "ask reason", riskLevel: "ask" },
++    }, T1, 1),
++  ];
++
++  const denied = reduceRunTimeline([
++    ...events,
++    item("approval.resolved", { id: "appr_1", verdict: "denied" }, T2, 2),
++  ]);
++  assert.equal(denied.approvals[0].status, "denied");
++  assert.equal(pendingApprovals(denied.approvals).length, 0);
++
++  const approved = reduceRunTimeline([
++    ...events,
++    item("approval.resolved", { id: "appr_1", verdict: "approved" }, T2, 2),
++  ]);
++  assert.equal(approved.approvals[0].status, "approved");
++  assert.equal(pendingApprovals(approved.approvals).length, 0);
++
++  const expired = reduceRunTimeline([
++    ...events,
++    item("approval.resolved", { id: "appr_1", verdict: "expired" }, T2, 2),
++  ]);
++  assert.equal(expired.approvals[0].status, "expired");
++});
++
++test("approval.resolved for an unknown or invalid payload is ignored", () => {
++  const resolved = reduceRunTimeline([
++    item("approval.resolved", { id: "appr_ghost", verdict: "approved" }, T1, 1),
++  ]);
++  assert.equal(resolved.approvals.length, 0);
++
++  const noId = reduceRunTimeline([
++    item("approval.required", { approval: { tool: "Bash", action: "x", reason: "y" } }, T1, 1),
++  ]);
++  assert.equal(noId.approvals.length, 0);
++
++  const badVerdict = reduceRunTimeline([
++    item("approval.required", { approval: { id: "appr_1", tool: "Bash", action: "x", reason: "y", riskLevel: "ask" } }, T1, 1),
++    item("approval.resolved", { id: "appr_1", verdict: "maybe" }, T2, 2),
++  ]);
++  assert.equal(badVerdict.approvals[0].status, "pending");
++});
++
++test("multiple approvals resolve independently and replay refreshes in place", () => {
++  const events: RunStreamItem[] = [
++    item("approval.required", { approval: { id: "appr_1", tool: "Bash", action: "cmd a", reason: "r1", riskLevel: "ask" } }, T1, 1),
++    item("approval.required", { approval: { id: "appr_2", tool: "WebFetch", action: "https://x", reason: "r2", riskLevel: "ask" } }, T1, 2),
++    item("approval.resolved", { id: "appr_1", verdict: "approved" }, T2, 3),
++  ];
++  const { approvals } = reduceRunTimeline(events);
++  assert.equal(approvals.length, 2);
++  assert.equal(approvals[0].status, "approved");
++  assert.equal(approvals[1].status, "pending");
++  assert.equal(pendingApprovals(approvals).length, 1);
++
++  // Replay of approval.required keeps one entry per id.
++  const replayed = reduceRunTimeline([
++    ...events,
++    item("approval.required", { approval: { id: "appr_1", tool: "Bash", action: "cmd a", reason: "r1", riskLevel: "ask" } }, T1, 4),
++  ]);
++  assert.equal(replayed.approvals.length, 2);
++});
++
++test("legacy approval.required without riskLevel defaults to ask", () => {
++  const { approvals } = reduceRunTimeline([
++    item("approval.required", { approval: { id: "appr_1", tool: "Bash", action: "cmd", reason: "r" } }, T1, 1),
++  ]);
++  assert.equal(approvals[0].riskLevel, "ask");
++});
++
++test("extractApprovals matches the reducer's approval list", () => {
++  const events: RunStreamItem[] = [
++    item("tool.call", { id: "t1", name: "Bash", input: {} }, T1, 1),
++    item("approval.required", { approval: { id: "appr_1", tool: "Bash", action: "sudo x", reason: "r", riskLevel: "ask" } }, T1, 2),
++    item("approval.resolved", { id: "appr_1", verdict: "approved" }, T2, 3),
++  ];
++  assert.deepEqual(extractApprovals(events), reduceRunTimeline(events).approvals);
++});
+diff --git a/apps/swarmagents/lib/client/runTimeline.ts b/apps/swarmagents/lib/client/runTimeline.ts
+index 33cf38e01..a1f755442 100644
+--- a/apps/swarmagents/lib/client/runTimeline.ts
++++ b/apps/swarmagents/lib/client/runTimeline.ts
+@@ -31,6 +31,28 @@ export interface ToolCallEntry {
+   truncated?: boolean;
+ }
+ 
++/** Risk level carried on approval.required events (see lib/harness/risk.ts). */
++export type ApprovalRiskLevel = "allow" | "ask" | "deny";
++
++/** Lifecycle of an approval as observed on the run stream. */
++export type ApprovalStatus = "pending" | "approved" | "denied" | "expired";
++
++/** One approval gate: from `approval.required` until its `approval.resolved`. */
++export interface ApprovalEntry {
++  /** The approval id the decision endpoint expects (/api/runtime/approvals/{id}). */
++  id: string;
++  /** Tool that triggered the gate (e.g. "Bash"). */
++  tool: string;
++  /** The flagged action (command / path / url) — already redacted by the harness. */
++  action: string;
++  /** Why the classifier flagged the call. */
++  reason: string;
++  riskLevel: ApprovalRiskLevel;
++  status: ApprovalStatus;
++  /** Wall-clock timestamp of the approval.required event (item.ts). */
++  ts: number;
++}
++
+ /** Run-level totals distilled from events (usage snapshots + run.finished). */
+ export interface RunSummary {
+   startedAt?: number;
+@@ -54,6 +76,8 @@ export interface RunSummary {
+ export interface RunTimeline {
+   tools: ToolCallEntry[];
+   summary: RunSummary;
++  /** Approval gates in stream order, including resolved ones. */
++  approvals: ApprovalEntry[];
+ }
+ 
+ function isRecord(value: unknown): value is Record<string, unknown> {
+@@ -68,8 +92,64 @@ function asNumber(value: unknown): number | undefined {
+   return typeof value === "number" ? value : undefined;
+ }
+ 
++/**
++ * Apply one stream item to the approval list. Shared by the full reducer and
++ * the approvals-only extraction so both derive identical entries.
++ */
++function applyApprovalItem(approvals: ApprovalEntry[], kind: string, data: Record<string, unknown>, ts: number): void {
++  if (kind === "approval.required") {
++    // The payload nests the approval object (`{type, approval:{...}}`); accept
++    // a flat shape too so replayed/legacy items still surface.
++    const raw = isRecord(data.approval) ? data.approval : data;
++    const id = asString(raw.id);
++    if (!id) return;
++    const entry: ApprovalEntry = {
++      id,
++      tool: asString(raw.tool) ?? "tool",
++      action: asString(raw.action) ?? "",
++      reason: asString(raw.reason) ?? "",
++      riskLevel: raw.riskLevel === "deny" ? "deny" : raw.riskLevel === "allow" ? "allow" : "ask",
++      status: "pending",
++      ts,
++    };
++    // A replayed required event refreshes the entry in place.
++    const existing = approvals.findIndex((a) => a.id === id);
++    if (existing >= 0) approvals[existing] = entry;
++    else approvals.push(entry);
++    return;
++  }
++  if (kind === "approval.resolved") {
++    const id = asString(data.id);
++    if (!id) return;
++    const entry = approvals.find((a) => a.id === id);
++    if (!entry) return;
++    const verdict = asString(data.verdict);
++    entry.status =
++      verdict === "approved" || verdict === "denied" || verdict === "expired" ? verdict : entry.status;
++  }
++}
++
++/**
++ * Approvals-only view over the stream: the same entries reduceRunTimeline
++ * produces, for views (e.g. the terminal) that don't need the tool timeline.
++ */
++export function extractApprovals(items: readonly RunStreamItem[]): ApprovalEntry[] {
++  const approvals: ApprovalEntry[] = [];
++  for (const it of items) {
++    const data = isRecord(it.data) ? it.data : {};
++    applyApprovalItem(approvals, it.kind, data, it.ts);
++  }
++  return approvals;
++}
++
++/** Approvals still waiting on a human decision. */
++export function pendingApprovals(approvals: readonly ApprovalEntry[]): ApprovalEntry[] {
++  return approvals.filter((a) => a.status === "pending");
++}
++
+ export function reduceRunTimeline(items: readonly RunStreamItem[]): RunTimeline {
+   const tools: ToolCallEntry[] = [];
++  const approvals: ApprovalEntry[] = [];
+   const summary: RunSummary = { tokensIn: 0, tokensOut: 0, tokensCached: 0 };
+   let callCounter = 0;
+ 
+@@ -172,6 +252,12 @@ export function reduceRunTimeline(items: readonly RunStreamItem[]): RunTimeline
+         break;
+       }
+ 
++      case "approval.required":
++      case "approval.resolved": {
++        applyApprovalItem(approvals, item.kind, data, item.ts);
++        break;
++      }
++
+       default:
+         // assistant.text and any future event kinds do not shape the tool
+         // timeline; ignore them.
+@@ -179,5 +265,5 @@ export function reduceRunTimeline(items: readonly RunStreamItem[]): RunTimeline
+     }
+   }
+ 
+-  return { tools, summary };
++  return { tools, summary, approvals };
+ }
+diff --git a/apps/swarmagents/lib/harness/runner.ts b/apps/swarmagents/lib/harness/runner.ts
+index 3aafdf77a..465b80f10 100644
+--- a/apps/swarmagents/lib/harness/runner.ts
++++ b/apps/swarmagents/lib/harness/runner.ts
+@@ -308,6 +308,7 @@ export class ClaudeCodeRunner {
+         tool: approval.toolName,
+         action: redact(approval.action),
+         reason: approval.reason,
++        riskLevel: "ask",
+       },
+     });
+ 
+diff --git a/apps/swarmagents/lib/harness/types.ts b/apps/swarmagents/lib/harness/types.ts
+index 2ea43241c..016116472 100644
+--- a/apps/swarmagents/lib/harness/types.ts
++++ b/apps/swarmagents/lib/harness/types.ts
+@@ -7,6 +7,8 @@
+  * satisfies VmExec can be plugged in.
+  */
+ 
++import type { RiskLevel } from "./risk";
++
+ /** Minimal exec interface, modeled on VmDriver. Implementations manage the actual process tree. */
+ export interface VmExecOpts {
+   cwd?: string;
+@@ -46,7 +48,18 @@ export type TelemetryEvent =
+    * Emitted when a tool call classifies as "ask": the run pauses until the
+    * user resolves the approval (POST /api/runtime/approvals/{id}).
+    */
+-  | { type: "approval.required"; approval: { id: string; tool: string; action: string; reason: string } }
++  | {
++      type: "approval.required";
++      approval: {
++        id: string;
++        tool: string;
++        /** Human-readable summary of the flagged action (e.g. the shell command). */
++        action: string;
++        reason: string;
++        /** Risk level the classifier assigned (see ./risk.ts). */
++        riskLevel: RiskLevel;
++      };
++    }
+   /** Emitted when a paused run's approval is decided or expires. */
+   | { type: "approval.resolved"; id: string; verdict: "approved" | "denied" | "expired" }
+   /** Emitted when a tool call classifies as "deny" and the run is halted. */
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ApprovalGate.tsx b/apps/swarmagents/minimalist-ui/src/components/ApprovalGate.tsx
+new file mode 100644
+index 000000000..ccc23ce28
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/ApprovalGate.tsx
+@@ -0,0 +1,100 @@
++"use client";
++
++// ApprovalGate — renders the run's pending approval requests and lets the user
++// Allow or Deny them.
++//
++// The harness emits approval.required (with the tool, the flagged action —
++// already secret-scrubbed by the harness redactor before it ever reaches the
++// client — and the classifier's reason + risk level) and pauses the run until
++// a decision arrives at POST /api/runtime/approvals/{id}. A decision POSTed
++// here resolves that gate; the run stream's approval.resolved event then
++// removes the card (the reducer marks it resolved and only pending approvals
++// render). A decision is hidden optimistically on click and restored if the
++// API rejects it, so the button never appears to do nothing.
++
++import { useState } from "react";
++import { ShieldAlert } from "lucide-react";
++import { postApprovalDecision, type ApprovalDecision } from "../../../lib/client/approvals";
++import type { ApprovalEntry } from "../../../lib/client/runTimeline";
++
++export function ApprovalGate({ approvals }: { approvals: ApprovalEntry[] }) {
++  const [busyId, setBusyId] = useState<string | null>(null);
++  const [dismissed, setDismissed] = useState<Record<string, true>>({});
++  const [error, setError] = useState<string | null>(null);
++
++  const visible = approvals.filter((a) => a.status === "pending" && !dismissed[a.id]);
++  if (visible.length === 0) return null;
++
++  const decide = async (approval: ApprovalEntry, decision: ApprovalDecision) => {
++    if (busyId) return;
++    setBusyId(approval.id);
++    setError(null);
++    setDismissed((prev) => ({ ...prev, [approval.id]: true }));
++    const result = await postApprovalDecision(approval.id, decision);
++    if (!result.ok) {
++      // Restore the card so the user can retry.
++      setDismissed((prev) => {
++        const next = { ...prev };
++        delete next[approval.id];
++        return next;
++      });
++      setError(result.error ?? "decision failed");
++    }
++    setBusyId(null);
++  };
++
++  return (
++    <div className="mb-3 space-y-2">
++      {visible.map((a) => (
++        <div
++          key={a.id}
++          data-approval-id={a.id}
++          className="rounded-2xl border border-amber-400/30 bg-amber-400/[0.06] p-4"
++        >
++          <div className="flex flex-wrap items-center gap-2.5">
++            <ShieldAlert className="h-4 w-4 shrink-0 text-amber-300/90" />
++            <span className="text-sm text-white/90">Approval required</span>
++            <span
++              className={`rounded-full px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
++                a.riskLevel === "deny"
++                  ? "bg-rose-400/10 text-rose-300/90"
++                  : "bg-amber-400/10 text-amber-300/90"
++              }`}
++            >
++              {a.riskLevel}
++            </span>
++            <span className="font-mono text-[10px] text-white/40">{a.tool}</span>
++          </div>
++          {a.action !== "" && (
++            <pre className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded-xl bg-black/40 px-3 py-2 font-mono text-[11px] leading-relaxed text-amber-200/90">
++              {a.action}
++            </pre>
++          )}
++          {a.reason !== "" && <div className="mt-2 text-xs text-white/55">{a.reason}</div>}
++          <div className="mt-3 flex items-center gap-2">
++            <button
++              type="button"
++              disabled={busyId != null}
++              onClick={() => decide(a, "approve")}
++              className="rounded-xl bg-emerald-500/20 px-4 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-50"
++            >
++              Allow
++            </button>
++            <button
++              type="button"
++              disabled={busyId != null}
++              onClick={() => decide(a, "deny")}
++              className="rounded-xl bg-rose-500/20 px-4 py-1.5 text-xs font-medium text-rose-200 transition hover:bg-rose-500/30 disabled:cursor-not-allowed disabled:opacity-50"
++            >
++              Deny
++            </button>
++            {busyId === a.id && <span className="font-mono text-[10px] text-white/40">sending…</span>}
++          </div>
++          {error && <div className="mt-2 font-mono text-[10px] text-rose-300/90">{error}</div>}
++        </div>
++      ))}
++    </div>
++  );
++}
++
++export default ApprovalGate;
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index 9d5369de9..10b2a9a3a 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -5,6 +5,8 @@ import { Terminal, Globe, Maximize2, RotateCcw, ShieldCheck, Cpu } from "lucide-
+ import type { LogEvent } from "../engine";
+ import { AnsiRenderer } from "../../../components/AnsiRenderer";
+ import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
++import { extractApprovals } from "../../../lib/client/runTimeline";
++import { ApprovalGate } from "./ApprovalGate";
+ 
+ interface ComputerScreenProps {
+   logs: LogEvent[];
+@@ -122,6 +124,15 @@ function StreamRow({ item }: { item: RunStreamItem }) {
+       const d = item.data as { message?: string } | null;
+       return <SystemLine text={`vm error · ${d?.message ?? "unknown"}`} tone="error" />;
+     }
++    case "approval.required": {
++      const raw = typeof payload.approval === "object" && payload.approval !== null ? (payload.approval as Record<string, unknown>) : {};
++      const action = typeof raw.action === "string" ? raw.action : "";
++      return <SystemLine text={`approval required${action ? ` · ${action}` : ""}`} tone="muted" />;
++    }
++    case "approval.resolved": {
++      const d = payload as { id?: string; verdict?: string };
++      return <SystemLine text={`approval resolved · ${d.verdict ?? "unknown"}`} />;
++    }
+     case "run.started": {
+       const d = payload as { sessionId?: string; model?: string };
+       return <SystemLine text={`run started · ${d.model ?? "claude"}`} />;
+@@ -249,6 +260,8 @@ export function ComputerScreen({
+ 
+             {liveRun ? (
+               <>
++                {/* Allow/Deny cards for the run's pending approval gates. */}
++                <ApprovalGate approvals={extractApprovals(stream.items)} />
+                 {stream.status === "reconnecting" && (
+                   <div className="text-amber-400/60">reconnecting to run stream…</div>
+                 )}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/Telemetry.tsx b/apps/swarmagents/minimalist-ui/src/components/Telemetry.tsx
+index f3cef7752..d6819042d 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/Telemetry.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/Telemetry.tsx
+@@ -4,7 +4,8 @@ import type { ActiveRole, Attachment } from '../data';
+ import type { AgentState, LogEvent } from '../engine';
+ import { RoleIcon } from './RoleIcon';
+ import { useRunStream } from '../../../lib/client/useRunStream';
+-import { reduceRunTimeline, type ToolCallEntry, type RunSummary } from '../../../lib/client/runTimeline';
++import { reduceRunTimeline, pendingApprovals, type ToolCallEntry, type RunSummary } from '../../../lib/client/runTimeline';
++import { ApprovalGate } from './ApprovalGate';
+ 
+ const fmt = (ms?: number) => (ms == null ? '—' : ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`);
+ 
+@@ -239,7 +240,8 @@ function RealTimeTelemetry({
+   openTool: string | null;
+   onOpenTool: (id: string | null) => void;
+ }) {
+-  const { tools, summary } = reduceRunTimeline(items);
++  const { tools, summary, approvals } = reduceRunTimeline(items);
++  const awaitingApproval = pendingApprovals(approvals).length > 0;
+   const live = summary.finishedAt === undefined;
+   const elapsed = summary.durationMs ?? (now - (summary.startedAt ?? now));
+   const openEntry = tools.find((t) => t.id === openTool);
+@@ -256,7 +258,7 @@ function RealTimeTelemetry({
+           )}
+         </div>
+         <div className="flex gap-6 font-mono text-xs">
+-          <Stat label="status" value={<RunStateLabel streamStatus={streamStatus} summary={summary} live={live} />} />
++          <Stat label="status" value={<RunStateLabel streamStatus={streamStatus} summary={summary} live={live} awaitingApproval={awaitingApproval} />} />
+           <Stat label="elapsed" value={fmt(elapsed)} />
+           <Stat label="in" value={summary.tokensIn.toLocaleString()} />
+           <Stat label="out" value={summary.tokensOut.toLocaleString()} />
+@@ -269,6 +271,9 @@ function RealTimeTelemetry({
+       {streamStatus === 'reconnecting' && <Banner tone="warn">reconnecting to run stream…</Banner>}
+       {streamError && streamError !== 'stream closed' && <Banner tone="error">stream error: {streamError}</Banner>}
+ 
++      {/* pending approval gates: Allow / Deny the agent's flagged actions */}
++      <ApprovalGate approvals={approvals} />
++
+       {items.length === 0 ? (
+         <div className="glass-soft rounded-2xl p-8 text-center font-mono text-xs text-white/35">awaiting run stream…</div>
+       ) : (
+@@ -380,11 +385,12 @@ function ToolPill({ tool }: { tool: ToolCallEntry }) {
+   );
+ }
+ 
+-function RunStateLabel({ streamStatus, summary, live }: { streamStatus: ReturnType<typeof useRunStream>['status']; summary: RunSummary; live: boolean }) {
++function RunStateLabel({ streamStatus, summary, live, awaitingApproval }: { streamStatus: ReturnType<typeof useRunStream>['status']; summary: RunSummary; live: boolean; awaitingApproval?: boolean }) {
+   if (streamStatus === 'connecting') return <span className="text-cyan-300/80">connecting</span>;
+   if (streamStatus === 'reconnecting') return <span className="text-amber-300/90">reconnecting</span>;
+   if (summary.error) return <span className="text-rose-300/90">error</span>;
+   if (summary.cancelledReason) return <span className="text-amber-300/90">cancelled</span>;
++  if (awaitingApproval) return <span className="text-amber-300/90">awaiting approval</span>;
+   if (live) return <span className="text-cyan-300/80">running</span>;
+   return <span className="text-white/70">finished</span>;
+ }
+-- 
+2.55.0
+

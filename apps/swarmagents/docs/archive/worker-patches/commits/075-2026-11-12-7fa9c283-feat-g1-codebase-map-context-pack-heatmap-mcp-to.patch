@@ -1,0 +1,4463 @@
+From 7fa9c283feec848151b52974c2574aadf3624740 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 21:02:54 -0600
+Subject: [PATCH] =?UTF-8?q?feat(g1):=20codebase=20map=20=E2=80=94=20contex?=
+ =?UTF-8?q?t=20pack,=20heatmap,=20MCP=20tools,=20drawer=20tab?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a user picks a repository in their VM workspace, the app builds a
+codebase map for it once and keeps it fresh when the repository moves on.
+
+- lib/codebase: the map builder. A small scanner program runs inside the
+  user's VM (the repository lives there), returns the raw material — files,
+  sizes, languages, exports, imports, 90-day churn — and the server turns it
+  into the context pack (languages, entry points, build/test commands, the
+  top-level modules with a one-line purpose each, the key files with their
+  exports ranked by import fan-in, the conventions) and into the heatmap
+  (churn x size x fan-in x the files this account's agent touched).
+  The pack is capped at 8k tokens, estimated and truncated, never more.
+- The map is stored as JSON in the VM at ~/.swarm/codebase/<repoHash>/
+  (map.json + context-pack.md), so the agent's MCP tools and the app read
+  the very same document.
+- Every run on the picked repository gets the pack prepended to its system
+  prompt, once per run; the run log shows a codebase.context.injected event
+  with the token count. Settings -> "Inject codebase context" turns it off.
+- Two MCP tools for the agent: codebase_map_get and codebase_hotspots(n).
+- UI: a Codebase tab in the right drawer with a squarified treemap of the
+  hot files (click one to open it in Files), the repo picker and the pack.
+- Tests: unit tests for the ranking, the token cap, the pack builder, the
+  scanner program and the MCP tools; an e2e spec for the drawer tab.
+---
+ .../app/api/providers/settings/route.ts       |  25 +-
+ .../app/api/runtime/codebase/route.ts         | 135 ++++++
+ apps/swarmagents/e2e/codebase.spec.ts         |  36 ++
+ .../screenshots/codebase-drawer-heatmap.png   | Bin 0 -> 379668 bytes
+ apps/swarmagents/lib/client/codebase.ts       |  86 ++++
+ apps/swarmagents/lib/codebase/analyze.test.ts | 167 +++++++
+ apps/swarmagents/lib/codebase/analyze.ts      | 410 ++++++++++++++++++
+ apps/swarmagents/lib/codebase/hash.ts         |  11 +
+ apps/swarmagents/lib/codebase/index.ts        |  12 +
+ apps/swarmagents/lib/codebase/inject.test.ts  |  78 ++++
+ apps/swarmagents/lib/codebase/inject.ts       |  99 +++++
+ .../swarmagents/lib/codebase/local-scanner.ts | 117 +++++
+ apps/swarmagents/lib/codebase/parse.ts        |  92 ++++
+ apps/swarmagents/lib/codebase/ranking.test.ts | 102 +++++
+ apps/swarmagents/lib/codebase/ranking.ts      |  69 +++
+ apps/swarmagents/lib/codebase/rules.ts        | 156 +++++++
+ apps/swarmagents/lib/codebase/scanner.test.ts |  74 ++++
+ apps/swarmagents/lib/codebase/store.test.ts   | 126 ++++++
+ apps/swarmagents/lib/codebase/store.ts        | 217 +++++++++
+ apps/swarmagents/lib/codebase/tokens.ts       |  53 +++
+ apps/swarmagents/lib/codebase/touches.test.ts |  37 ++
+ apps/swarmagents/lib/codebase/touches.ts      |  75 ++++
+ apps/swarmagents/lib/codebase/types.ts        | 183 ++++++++
+ .../lib/codebase/vm-analyzer-source.ts        | 388 +++++++++++++++++
+ apps/swarmagents/lib/codebase/vm-scanner.ts   | 173 ++++++++
+ .../lib/harness/codebase-mcp-source.ts        | 211 +++++++++
+ .../lib/harness/codebase-mcp.test.ts          | 135 ++++++
+ apps/swarmagents/lib/harness/role-mcp.ts      |  14 +-
+ apps/swarmagents/lib/providers/settings.ts    |  12 +
+ apps/swarmagents/lib/runtime/manager.ts       |  75 +++-
+ .../src/components/CodebasePanel.tsx          | 283 ++++++++++++
+ .../src/components/ComputerScreen.tsx         |  24 +-
+ .../src/components/FilesView.tsx              |  18 +-
+ .../minimalist-ui/src/components/Settings.tsx |  35 +-
+ .../minimalist-ui/src/utils/treemap.test.ts   |  81 ++++
+ .../minimalist-ui/src/utils/treemap.ts        | 120 +++++
+ 36 files changed, 3920 insertions(+), 9 deletions(-)
+ create mode 100644 apps/swarmagents/app/api/runtime/codebase/route.ts
+ create mode 100644 apps/swarmagents/e2e/codebase.spec.ts
+ create mode 100644 apps/swarmagents/e2e/screenshots/codebase-drawer-heatmap.png
+ create mode 100644 apps/swarmagents/lib/client/codebase.ts
+ create mode 100644 apps/swarmagents/lib/codebase/analyze.test.ts
+ create mode 100644 apps/swarmagents/lib/codebase/analyze.ts
+ create mode 100644 apps/swarmagents/lib/codebase/hash.ts
+ create mode 100644 apps/swarmagents/lib/codebase/index.ts
+ create mode 100644 apps/swarmagents/lib/codebase/inject.test.ts
+ create mode 100644 apps/swarmagents/lib/codebase/inject.ts
+ create mode 100644 apps/swarmagents/lib/codebase/local-scanner.ts
+ create mode 100644 apps/swarmagents/lib/codebase/parse.ts
+ create mode 100644 apps/swarmagents/lib/codebase/ranking.test.ts
+ create mode 100644 apps/swarmagents/lib/codebase/ranking.ts
+ create mode 100644 apps/swarmagents/lib/codebase/rules.ts
+ create mode 100644 apps/swarmagents/lib/codebase/scanner.test.ts
+ create mode 100644 apps/swarmagents/lib/codebase/store.test.ts
+ create mode 100644 apps/swarmagents/lib/codebase/store.ts
+ create mode 100644 apps/swarmagents/lib/codebase/tokens.ts
+ create mode 100644 apps/swarmagents/lib/codebase/touches.test.ts
+ create mode 100644 apps/swarmagents/lib/codebase/touches.ts
+ create mode 100644 apps/swarmagents/lib/codebase/types.ts
+ create mode 100644 apps/swarmagents/lib/codebase/vm-analyzer-source.ts
+ create mode 100644 apps/swarmagents/lib/codebase/vm-scanner.ts
+ create mode 100644 apps/swarmagents/lib/harness/codebase-mcp-source.ts
+ create mode 100644 apps/swarmagents/lib/harness/codebase-mcp.test.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/CodebasePanel.tsx
+ create mode 100644 apps/swarmagents/minimalist-ui/src/utils/treemap.test.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/utils/treemap.ts
+
+diff --git a/apps/swarmagents/app/api/providers/settings/route.ts b/apps/swarmagents/app/api/providers/settings/route.ts
+index a09e79120..c3432ac0e 100644
+--- a/apps/swarmagents/app/api/providers/settings/route.ts
++++ b/apps/swarmagents/app/api/providers/settings/route.ts
+@@ -9,7 +9,11 @@
+ 
+ import { NextResponse, type NextRequest } from "next/server";
+ import { providerOwner } from "@/lib/providers/owner";
+-import { readUserSettings, updateUserSettings } from "@/lib/providers/settings";
++import {
++  codebaseContextInjectionEnabled,
++  readUserSettings,
++  updateUserSettings,
++} from "@/lib/providers/settings";
+ import type { UserSettings } from "@/lib/providers/settings";
+ 
+ export const dynamic = "force-dynamic";
+@@ -23,7 +27,13 @@ function unauthorized() {
+ export function GET(request: NextRequest) {
+   const owner = providerOwner(request);
+   if (!owner) return unauthorized();
+-  return NextResponse.json(readUserSettings(owner), { headers: NO_STORE });
++  const settings = readUserSettings(owner);
++  // The codebase context is on unless it was turned off: report the effective
++  // value so the toggle always shows the truth.
++  return NextResponse.json(
++    { ...settings, injectCodebaseContext: codebaseContextInjectionEnabled(settings) },
++    { headers: NO_STORE },
++  );
+ }
+ 
+ export async function PUT(request: NextRequest) {
+@@ -46,6 +56,12 @@ export async function PUT(request: NextRequest) {
+     }
+     patch.preferFreeProviders = input.preferFreeProviders;
+   }
++  if ("injectCodebaseContext" in input) {
++    if (typeof input.injectCodebaseContext !== "boolean") {
++      return NextResponse.json({ error: "injectCodebaseContext must be a boolean." }, { status: 400 });
++    }
++    patch.injectCodebaseContext = input.injectCodebaseContext;
++  }
+   if ("allowPaidProviders" in input) {
+     if (typeof input.allowPaidProviders !== "boolean") {
+       return NextResponse.json({ error: "allowPaidProviders must be a boolean." }, { status: 400 });
+@@ -64,5 +80,8 @@ export async function PUT(request: NextRequest) {
+     return NextResponse.json({ error: "preferFreeProviders must be a boolean." }, { status: 400 });
+   }
+   const next = updateUserSettings(owner, patch);
+-  return NextResponse.json(next, { status: 200, headers: NO_STORE });
++  return NextResponse.json(
++    { ...next, injectCodebaseContext: codebaseContextInjectionEnabled(next) },
++    { status: 200, headers: NO_STORE },
++  );
+ }
+diff --git a/apps/swarmagents/app/api/runtime/codebase/route.ts b/apps/swarmagents/app/api/runtime/codebase/route.ts
+new file mode 100644
+index 000000000..0ffb074fe
+--- /dev/null
++++ b/apps/swarmagents/app/api/runtime/codebase/route.ts
+@@ -0,0 +1,135 @@
++/**
++ * The codebase map API.
++ *
++ * GET  /api/runtime/codebase?repo=<path>&n=50   -> the map of that repository
++ * GET  /api/runtime/codebase?list=1              -> the repositories in the workspace
++ * POST /api/runtime/codebase { "repo": "<path>" } -> rebuild the map now
++ *
++ * The repository lives in the caller's own VM, so the map is built there and
++ * stored under `~/.swarm/codebase/<repoHash>/` inside that VM. Everything is
++ * scoped to the caller: the route only ever touches the VM of the account in
++ * the `x-swarm-user` header.
++ */
++
++import { NextResponse, type NextRequest } from "next/server";
++import { USER_HEADER } from "../../../../lib/auth";
++import { getVmManager } from "../../../../lib/vm/manager";
++import { resolveWorkspacePath } from "../../../../lib/vm/files";
++import {
++  ensureCodebaseMap,
++  listCodebaseRepos,
++  selectCodebaseRepo,
++  selectedCodebaseRepo,
++} from "../../../../lib/codebase/store";
++import { createVmScanner } from "../../../../lib/codebase/vm-scanner";
++import type { CodebaseMap } from "../../../../lib/codebase/types";
++
++export const runtime = "nodejs";
++export const dynamic = "force-dynamic";
++
++function caller(req: NextRequest): string | null {
++  const user = req.headers.get(USER_HEADER);
++  return user && user.length > 0 && user.length <= 128 ? user : null;
++}
++
++/** The summary the UI renders (the map itself is far too big to send). */
++function summarize(map: CodebaseMap, hotspots: number) {
++  return {
++    repoRoot: map.repoRoot,
++    repoName: map.repoName,
++    repoHash: map.repoHash,
++    generatedAt: map.generatedAt,
++    gitHead: map.gitHead,
++    buildMs: map.buildMs,
++    fileCount: map.files.length,
++    tokenEstimate: map.contextPack.tokenEstimate,
++    languages: map.languages,
++    entryPoints: map.entryPoints,
++    buildCommands: map.buildCommands,
++    testCommands: map.testCommands,
++    conventions: map.conventions,
++    topLevelModules: map.topLevelModules,
++    heatmap: map.heatmap.slice(0, hotspots),
++    contextPack: { tokenEstimate: map.contextPack.tokenEstimate, text: map.contextPack.text },
++  };
++}
++
++/** The repository root the caller asked for (always inside the workspace). */
++function repoRootFrom(raw: string | null): string {
++  return resolveWorkspacePath(raw ?? "");
++}
++
++export async function GET(req: NextRequest) {
++  const user = caller(req);
++  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
++
++  const params = req.nextUrl.searchParams;
++  const vm = getVmManager();
++  const scanner = createVmScanner(vm);
++
++  if (params.get("list") === "1" || params.get("list") === "true") {
++    const repos = await listCodebaseRepos(user, scanner);
++    const selected = await selectedCodebaseRepo(user, scanner);
++    return NextResponse.json({ ok: true, repos, selected });
++  }
++
++  const rawN = Number(params.get("n") ?? "");
++  const n = Number.isFinite(rawN) && rawN > 0 ? Math.min(200, Math.floor(rawN)) : 50;
++  const repoRoot = repoRootFrom(params.get("repo"));
++
++  try {
++    // A map that was built before is read back from the VM: the UI polls this
++    // route and must not rebuild the map every time.
++    const stored = await scanner.readMap(user, repoRoot);
++    const map = stored ?? (await ensureCodebaseMap(user, scanner, { repoRoot }));
++    if (!map) {
++      // No map yet is a normal state (the repository was never picked), not an
++      // error: the UI asks for one.
++      return NextResponse.json({
++        ok: true,
++        map: null,
++        repoRoot,
++        error: "No codebase map for this repository yet.",
++      });
++    }
++    return NextResponse.json({ ok: true, map: summarize(map, n) });
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
++    return NextResponse.json({ error: message }, { status: 500 });
++  }
++}
++
++export async function POST(req: NextRequest) {
++  const user = caller(req);
++  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
++
++  let repo: string | null = null;
++  let force = false;
++  try {
++    const body = (await req.json().catch(() => ({}))) as { repo?: unknown; force?: unknown };
++    if (typeof body.repo === "string") repo = body.repo;
++    force = body.force === true;
++  } catch {
++    repo = null;
++  }
++
++  const repoRoot = repoRootFrom(repo);
++  const vm = getVmManager();
++  const scanner = createVmScanner(vm);
++
++  try {
++    const map = await ensureCodebaseMap(user, scanner, { repoRoot, force });
++    if (!map) {
++      return NextResponse.json(
++        { error: "Could not build a codebase map for that repository.", repoRoot },
++        { status: 500 },
++      );
++    }
++    // Picking a repository is what makes its pack part of every run.
++    await selectCodebaseRepo(user, scanner, map.repoRoot);
++    return NextResponse.json({ ok: true, map: summarize(map, 50) });
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
++    return NextResponse.json({ error: message }, { status: 500 });
++  }
++}
+diff --git a/apps/swarmagents/e2e/codebase.spec.ts b/apps/swarmagents/e2e/codebase.spec.ts
+new file mode 100644
+index 000000000..dac440950
+--- /dev/null
++++ b/apps/swarmagents/e2e/codebase.spec.ts
+@@ -0,0 +1,36 @@
++import { after, test } from "node:test";
++import { captureView, closeBrowser, openWorkspace, runPageTest } from "./lib";
++
++after(async () => {
++  await closeBrowser();
++});
++
++test("codebase: the right drawer has a Codebase tab with the heatmap", async (t) => {
++  const testName = "codebase: the right drawer has a Codebase tab with the heatmap";
++  const result = await runPageTest(testName, async ({ page, context }) => {
++    await openWorkspace(page, context);
++
++    // The right drawer docks the run thread and the codebase map.
++    const drawer = page.locator("[data-testid='right-drawer']").first();
++    await drawer.waitFor({ state: "visible", timeout: 15_000 });
++
++    const codebaseTab = page.locator("[data-testid='right-drawer-tab-codebase']").first();
++    await codebaseTab.waitFor({ state: "visible", timeout: 15_000 });
++    await codebaseTab.click();
++
++    // The Codebase tab shows the map: either the treemap of the hot files or
++    // the state that says there is no map for this repository yet.
++    const panel = page.locator("[data-testid='codebase-tab']").first();
++    await panel.waitFor({ state: "visible", timeout: 15_000 });
++
++    const treemap = page.locator("[data-testid='codebase-treemap']").first();
++    const empty = panel.getByText(/No codebase map yet|could not|Could not/).first();
++    const hasTreemap = await treemap.isVisible().catch(() => false);
++    if (!hasTreemap) {
++      await empty.waitFor({ state: "visible", timeout: 30_000 });
++    }
++
++    await captureView(page, testName, "codebase-tab");
++  });
++  if (result.skipped) t.skip(result.skipped);
++});
+diff --git a/apps/swarmagents/e2e/screenshots/codebase-drawer-heatmap.png b/apps/swarmagents/e2e/screenshots/codebase-drawer-heatmap.png
+new file mode 100644
+index 000000000..524fef3d8
+Binary files /dev/null and b/apps/swarmagents/e2e/screenshots/codebase-drawer-heatmap.png differ
+diff --git a/apps/swarmagents/lib/client/codebase.ts b/apps/swarmagents/lib/client/codebase.ts
+new file mode 100644
+index 000000000..f45151a39
+--- /dev/null
++++ b/apps/swarmagents/lib/client/codebase.ts
+@@ -0,0 +1,86 @@
++/** Client helpers for the codebase map API. */
++
++export interface CodebaseHotspot {
++  path: string;
++  churn90d: number;
++  bytes: number;
++  fanIn: number;
++  agentTouches: number;
++  heat: number;
++}
++
++export interface CodebaseModule {
++  path: string;
++  kind?: "dir" | "file";
++  purpose: string;
++  files: number;
++  bytes: number;
++}
++
++export interface CodebaseRepo {
++  /** Workspace-relative path ("" is the workspace root itself). */
++  repo: string;
++  /** Absolute path inside the VM. */
++  repoRoot: string;
++  name: string;
++}
++
++export interface CodebaseMapSummary {
++  repoRoot: string;
++  repoName: string;
++  repoHash: string;
++  generatedAt?: string;
++  gitHead?: string;
++  buildMs?: number;
++  fileCount: number;
++  tokenEstimate: number;
++  languages?: Record<string, number>;
++  entryPoints?: string[];
++  buildCommands?: string[];
++  testCommands?: string[];
++  conventions?: Record<string, unknown>;
++  topLevelModules?: CodebaseModule[];
++  heatmap?: CodebaseHotspot[];
++  contextPack?: { tokenEstimate: number; text: string };
++}
++
++export interface CodebaseApiResponse {
++  ok: boolean;
++  map?: CodebaseMapSummary;
++  repos?: CodebaseRepo[];
++  selected?: string | null;
++  error?: string;
++}
++
++/** The map of the given repository (empty string = the workspace root). */
++export async function fetchCodebaseMap(repo = "", n = 60): Promise<CodebaseApiResponse> {
++  const query = new URLSearchParams({ repo, n: String(n) });
++  const res = await fetch(`/api/runtime/codebase?${query.toString()}`, { cache: "no-store" });
++  const data = (await res.json().catch(() => ({}))) as CodebaseApiResponse;
++  if (!res.ok) throw new Error(data.error || `codebase map failed (${res.status})`);
++  if (!data.map && data.error) throw new Error(data.error);
++  return data;
++}
++
++/** The repositories in the user's workspace and the one that is picked. */
++export async function fetchCodebaseRepos(): Promise<{ repos: CodebaseRepo[]; selected: string | null }> {
++  const res = await fetch("/api/runtime/codebase?list=1", { cache: "no-store" });
++  const data = (await res.json().catch(() => ({}))) as CodebaseApiResponse;
++  if (!res.ok) throw new Error(data.error || `codebase repos failed (${res.status})`);
++  return { repos: Array.isArray(data.repos) ? data.repos : [], selected: data.selected ?? null };
++}
++
++/**
++ * Pick a repository: its map is built (when it is missing) and its context
++ * pack is injected into every run on it.
++ */
++export async function pickCodebaseRepo(repo = "", force = false): Promise<CodebaseApiResponse> {
++  const res = await fetch("/api/runtime/codebase", {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: JSON.stringify({ repo, force }),
++  });
++  const data = (await res.json().catch(() => ({}))) as CodebaseApiResponse;
++  if (!res.ok) throw new Error(data.error || `codebase rebuild failed (${res.status})`);
++  return data;
++}
+diff --git a/apps/swarmagents/lib/codebase/analyze.test.ts b/apps/swarmagents/lib/codebase/analyze.test.ts
+new file mode 100644
+index 000000000..2b8cafe98
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/analyze.test.ts
+@@ -0,0 +1,167 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  buildMapFromScan,
++  buildTopLevelModules,
++  detectConventions,
++  detectEntryPoints,
++  primaryPackage,
++  resolveImportTarget,
++  selectHotspots,
++} from "./analyze";
++import type { CodebaseScan } from "./types";
++
++function scan(overrides: Partial<CodebaseScan> = {}): CodebaseScan {
++  return {
++    repoRoot: "/workspace/demo",
++    repoName: "demo",
++    repoHash: "abcdef0123456789",
++    generatedAt: new Date(0).toISOString(),
++    gitHead: "deadbeef",
++    files: [],
++    churn: {},
++    ...overrides,
++  };
++}
++
++test("resolveImportTarget resolves relative imports to scanned files", () => {
++  const known = new Set(["src/index.ts", "src/lib/util.ts", "src/lib/index.ts"]);
++  assert.equal(resolveImportTarget("src/app.ts", "./lib/util", known), "src/lib/util.ts");
++  assert.equal(resolveImportTarget("src/app.ts", "./lib/util.ts", known), "src/lib/util.ts");
++  assert.equal(resolveImportTarget("src/app.ts", "./lib", known), "src/lib/index.ts");
++  assert.equal(resolveImportTarget("src/app.ts", "react", known), null);
++  assert.equal(resolveImportTarget("src/app.ts", "../outside", known), null);
++});
++
++test("buildMapFromScan counts import fan-in", () => {
++  const map = buildMapFromScan(
++    scan({
++      files: [
++        { path: "src/core.ts", bytes: 100, language: "TypeScript", exports: ["core"] },
++        { path: "src/a.ts", bytes: 50, language: "TypeScript", imports: ["./core"] },
++        { path: "src/b.ts", bytes: 50, language: "TypeScript", imports: ["./core"] },
++        { path: "src/c.ts", bytes: 50, language: "TypeScript", imports: ["./a"] },
++      ],
++    }),
++    { repoRoot: "/workspace/demo" },
++  );
++  assert.equal(map.files.find((f) => f.path === "src/core.ts")?.fanIn, 2);
++  assert.equal(map.files.find((f) => f.path === "src/a.ts")?.fanIn, 1);
++  assert.equal(map.files.find((f) => f.path === "src/b.ts")?.fanIn, 0);
++  assert.equal(map.contextPack.keyFiles[0].path, "src/core.ts");
++  assert.equal(map.contextPack.keyFiles[0].fanIn, 2);
++});
++
++test("buildMapFromScan reports the languages of the repository", () => {
++  const map = buildMapFromScan(
++    scan({
++      files: [
++        { path: "a.ts", bytes: 10, language: "TypeScript" },
++        { path: "b.ts", bytes: 10, language: "TypeScript" },
++        { path: "c.py", bytes: 10, language: "Python" },
++      ],
++    }),
++    { repoRoot: "/workspace/demo" },
++  );
++  assert.deepEqual(map.languages, { TypeScript: 2, Python: 1 });
++  assert.match(map.contextPack.text, /languages: TypeScript:2, Python:1/);
++});
++
++test("buildMapFromScan folds the churn into the heatmap", () => {
++  const map = buildMapFromScan(
++    scan({
++      files: [
++        { path: "hot.ts", bytes: 500, language: "TypeScript" },
++        { path: "cold.ts", bytes: 100, language: "TypeScript" },
++      ],
++      churn: { "hot.ts": 900 },
++    }),
++    { repoRoot: "/workspace/demo" },
++  );
++  assert.equal(map.heatmap[0].path, "hot.ts");
++  assert.ok(map.heatmap[0].heat > map.heatmap[1].heat);
++  assert.equal(selectHotspots(map, 1).length, 1);
++});
++
++test("buildMapFromScan weights the files the agent touched", () => {
++  const files = [
++    { path: "a.ts", bytes: 1000, language: "TypeScript" },
++    { path: "b.ts", bytes: 1000, language: "TypeScript" },
++  ];
++  const plain = buildMapFromScan(scan({ files }), { repoRoot: "/workspace/demo" });
++  const touched = buildMapFromScan(scan({ files }), {
++    repoRoot: "/workspace/demo",
++    agentTouchesByPath: { "b.ts": 4 },
++  });
++  assert.equal(touched.heatmap[0].path, "b.ts");
++  assert.ok(touched.heatmap[0].heat > plain.heatmap[0].heat);
++});
++
++test("buildMapFromScan reports the build and test commands", () => {
++  const map = buildMapFromScan(
++    scan({
++      files: [{ path: "package.json", bytes: 100, language: "JSON" }],
++      packageJson: {
++        scripts: { build: "next build", test: "npm test", typecheck: "tsc --noEmit" },
++        devDependencies: { vitest: "^1.0.0", eslint: "^9.0.0" },
++        packageManager: "pnpm@9.0.0",
++      },
++    }),
++    { repoRoot: "/workspace/demo" },
++  );
++  assert.deepEqual(map.buildCommands, ["npm run build", "npm run typecheck"]);
++  assert.deepEqual(map.testCommands, ["npm run test"]);
++  assert.equal(map.conventions.testFramework, "vitest");
++  assert.equal(map.conventions.lint, "eslint");
++  assert.equal(map.conventions.packageManager, "pnpm");
++  assert.match(map.contextPack.text, /tests: npm run test/);
++});
++
++test("primaryPackage falls back to the shallowest package of a monorepo", () => {
++  const monorepo = scan({
++    packageFiles: [
++      { path: "apps/web/package.json", scripts: { build: "vite build" } },
++      { path: "apps/api/package.json", scripts: { build: "tsc", test: "node --test" } },
++    ],
++  });
++  // Same depth: the package that actually describes how to work wins.
++  assert.equal(primaryPackage(monorepo)?.scripts?.build, "tsc");
++
++  const withRoot = scan({
++    packageJson: { scripts: { build: "turbo build" } },
++    packageFiles: [{ path: "apps/web/package.json", scripts: { build: "vite build" } }],
++  });
++  assert.equal(primaryPackage(withRoot)?.scripts?.build, "turbo build");
++});
++
++test("detectConventions reads the lock files for the package manager", () => {
++  const conventions = detectConventions({ scripts: { test: "node --test" } }, ["pnpm-lock.yaml"]);
++  assert.equal(conventions.packageManager, "pnpm");
++  assert.equal(conventions.testFramework, "node:test");
++});
++
++test("detectEntryPoints finds the pages and the API routes", () => {
++  const points = detectEntryPoints([
++    "app/page.tsx",
++    "app/api/runs/route.ts",
++    "src/main.ts",
++    "lib/thing.ts",
++  ]);
++  assert.ok(points.includes("app/page.tsx"));
++  assert.ok(points.includes("app/api/runs/route.ts"));
++  assert.ok(points.includes("src/main.ts"));
++});
++
++test("buildTopLevelModules describes each top-level module", () => {
++  const infos = new Map([
++    ["lib/a.ts", { path: "lib/a.ts", bytes: 10, fanIn: 0, churn90d: 0, agentTouches: 0, heat: 0 }],
++    ["README.md", { path: "README.md", bytes: 10, fanIn: 0, churn90d: 0, agentTouches: 0, heat: 0 }],
++  ]);
++  const modules = buildTopLevelModules(["lib/a.ts", "README.md"], infos);
++  const lib = modules.find((m) => m.path === "lib");
++  const readme = modules.find((m) => m.path === "README.md");
++  assert.equal(lib?.kind, "dir");
++  assert.equal(lib?.purpose, "Shared server/client libraries");
++  assert.equal(readme?.kind, "file");
++  assert.equal(readme?.purpose, "Project readme / overview");
++});
+diff --git a/apps/swarmagents/lib/codebase/analyze.ts b/apps/swarmagents/lib/codebase/analyze.ts
+new file mode 100644
+index 000000000..9550ef361
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/analyze.ts
+@@ -0,0 +1,410 @@
++/**
++ * Turning a scan into a codebase map.
++ *
++ * The scan (see lib/codebase/vm-analyzer-source.ts) is raw material: files,
++ * their sizes, their imports and their churn. This module turns that into the
++ * two things the product needs:
++ *
++ *   - the context pack: a compact, token-bounded briefing about the repo that
++ *     is prepended to every run's system prompt;
++ *   - the heatmap: per-file churn x size x fan-in x the files this account's
++ *     agent touched before.
++ *
++ * Everything here is pure: it takes a scan and returns a map, so the ranking
++ * and the budget can be unit tested without a VM.
++ */
++
++import path from "node:path";
++import { repoHashForRoot, repoNameForRoot } from "./hash";
++import { guessModulePurpose, inferPurpose } from "./parse";
++import { rankHeatmap, rankKeyFilesByFanIn } from "./ranking";
++import { CONTEXT_PACK_TOKEN_BUDGET, SOURCE_EXTS } from "./rules";
++import { estimateTokens, truncateToTokenBudget } from "./tokens";
++import type {
++  BuildCodebaseMapOptions,
++  CodebaseConventions,
++  CodebaseContextPack,
++  CodebaseFileInfo,
++  CodebaseHeatmapEntry,
++  CodebaseMap,
++  CodebaseModuleInfo,
++  CodebaseScan,
++} from "./types";
++
++/** Extensions tried when a relative import has no extension. */
++const RESOLVE_EXTS = [
++  ".ts",
++  ".tsx",
++  ".js",
++  ".jsx",
++  ".mjs",
++  ".cjs",
++  "/index.ts",
++  "/index.tsx",
++  "/index.js",
++  "/index.jsx",
++];
++
++function toPosix(p: string): string {
++  return p.split(path.sep).join("/");
++}
++
++/**
++ * Resolve an import specifier to a repo-relative file path, when the target
++ * is one of the scanned files. Bare specifiers (node modules) are ignored.
++ */
++export function resolveImportTarget(
++  fromFile: string,
++  specifier: string,
++  knownFiles: Set<string>,
++): string | null {
++  if (!specifier.startsWith(".") && !specifier.startsWith("/")) return null;
++  const fromDir = path.posix.dirname(toPosix(fromFile));
++  const resolved = path.posix.normalize(path.posix.join(fromDir, specifier));
++  const candidates = [resolved];
++  if (!path.posix.extname(resolved)) {
++    for (const ext of RESOLVE_EXTS) candidates.push(resolved + ext);
++  }
++  for (const candidate of candidates) {
++    const norm = candidate.replace(/^\.\//, "");
++    if (knownFiles.has(norm)) return norm;
++  }
++  return null;
++}
++
++/** The build/test commands and the package manager, read from package.json. */
++function readCommands(pkg: CodebaseScan["packageJson"]): {
++  buildCommands: string[];
++  testCommands: string[];
++} {
++  const scripts = pkg?.scripts ?? {};
++  const buildCommands: string[] = [];
++  const testCommands: string[] = [];
++  for (const name of ["build", "typecheck", "lint", "dev"]) {
++    if (scripts[name]) buildCommands.push(`npm run ${name}`);
++  }
++  for (const name of ["test", "test:unit", "test:e2e", "test:all"]) {
++    if (scripts[name]) testCommands.push(`npm run ${name}`);
++  }
++  return { buildCommands, testCommands };
++}
++
++/**
++ * The package that describes the repository: the one at the root, or the
++ * shallowest one in a monorepo (the app the repository is really about).
++ */
++export function primaryPackage(scan: CodebaseScan): CodebaseScan["packageJson"] {
++  if (scan.packageJson?.scripts && Object.keys(scan.packageJson.scripts).length > 0) {
++    return scan.packageJson;
++  }
++  const candidates = scan.packageFiles ?? [];
++  if (candidates.length === 0) return scan.packageJson;
++  const scored = [...candidates].sort((a, b) => {
++    const depth = a.path.split("/").length - b.path.split("/").length;
++    if (depth !== 0) return depth;
++    const scripts = Object.keys(b.scripts ?? {}).length - Object.keys(a.scripts ?? {}).length;
++    if (scripts !== 0) return scripts;
++    return a.path.localeCompare(b.path);
++  });
++  return scored[0];
++}
++
++/** The conventions a contributor should follow in this repository. */
++export function detectConventions(
++  pkg: CodebaseScan["packageJson"],
++  lockFiles: string[] = [],
++): CodebaseConventions {
++  const conventions: CodebaseConventions = { notes: [] };
++  const deps = { ...(pkg?.dependencies ?? {}), ...(pkg?.devDependencies ?? {}) };
++  const scripts = pkg?.scripts ?? {};
++  const test = scripts.test ?? "";
++
++  if (deps.vitest || test.includes("vitest")) conventions.testFramework = "vitest";
++  else if (deps.jest || test.includes("jest")) conventions.testFramework = "jest";
++  else if (test.includes("node --test") || test.includes("tsx --test")) conventions.testFramework = "node:test";
++  else if (deps.pytest) conventions.testFramework = "pytest";
++
++  if (deps.eslint || scripts.lint?.includes("eslint")) conventions.lint = "eslint";
++  else if (deps.biome || scripts.lint?.includes("biome")) conventions.lint = "biome";
++
++  if (deps.prettier || scripts.format?.includes("prettier")) conventions.format = "prettier";
++  else if (deps.biome || scripts.format?.includes("biome")) conventions.format = "biome";
++
++  const manager = typeof pkg?.packageManager === "string" ? pkg.packageManager.split("@")[0] : undefined;
++  if (manager) conventions.packageManager = manager;
++  else if (lockFiles.includes("pnpm-lock.yaml")) conventions.packageManager = "pnpm";
++  else if (lockFiles.includes("yarn.lock")) conventions.packageManager = "yarn";
++  else if (lockFiles.includes("bun.lockb") || lockFiles.includes("bun.lock")) conventions.packageManager = "bun";
++  else if (lockFiles.includes("package-lock.json")) conventions.packageManager = "npm";
++
++  if (scripts.typecheck) conventions.notes!.push(`typecheck: ${scripts.typecheck}`);
++  if (!conventions.notes!.length) delete conventions.notes;
++  return conventions;
++}
++
++/** The files that start the program: pages, entry points and API routes. */
++export function detectEntryPoints(files: string[]): string[] {
++  const known = new Set(files);
++  const candidates = [
++    "app/page.tsx",
++    "app/layout.tsx",
++    "app/main.ts",
++    "pages/index.tsx",
++    "src/main.ts",
++    "src/index.ts",
++    "src/index.tsx",
++    "main.ts",
++    "index.ts",
++    "server.ts",
++    "cmd/main.go",
++    "main.go",
++    "main.py",
++    "app/main.py",
++    "src/main.rs",
++    "src/lib.rs",
++  ];
++  const found = candidates.filter((c) => known.has(c));
++  // Monorepos keep their entry points inside an app: match the well known
++  // names anywhere in the tree.
++  const suffixes = [
++    "/app/page.tsx",
++    "/pages/index.tsx",
++    "/src/main.ts",
++    "/src/index.ts",
++    "/src/index.tsx",
++    "/cmd/main.go",
++    "/src/main.rs",
++    "/server.ts",
++  ];
++  const routes: string[] = [];
++  for (const file of files) {
++    if (suffixes.some((suffix) => file.endsWith(suffix))) found.push(file);
++    if (/(^|\/)app\/api\//.test(file) && file.endsWith("/route.ts")) routes.push(file);
++    if (file.startsWith("src/api/") && file.endsWith("/route.ts")) routes.push(file);
++  }
++  // A few API routes are enough to show the shape of the backend.
++  found.push(...routes.slice(0, 5));
++  return [...new Set(found)].slice(0, 20);
++}
++
++/** Group files into their top-level module and describe each one. */
++export function buildTopLevelModules(
++  files: string[],
++  fileInfos: Map<string, CodebaseFileInfo>,
++): CodebaseModuleInfo[] {
++  const groups = new Map<string, string[]>();
++  for (const file of files) {
++    const top = file.includes("/") ? file.split("/")[0] : file;
++    if (!groups.has(top)) groups.set(top, []);
++    groups.get(top)!.push(file);
++  }
++  const modules: CodebaseModuleInfo[] = [];
++  for (const [top, groupFiles] of groups) {
++    let bytes = 0;
++    for (const file of groupFiles) bytes += fileInfos.get(file)?.bytes ?? 0;
++    const kind: "dir" | "file" = fileInfos.has(top) ? "file" : "dir";
++    modules.push({
++      path: top,
++      kind,
++      purpose: kind === "file" ? (inferPurpose(top) ?? "File") : guessModulePurpose(top, groupFiles),
++      files: groupFiles.length,
++      bytes,
++    });
++  }
++  return modules
++    .sort((a, b) => b.files - a.files || a.path.localeCompare(b.path))
++    .slice(0, 40);
++}
++
++/** Render the context pack as the markdown block the agent reads. */
++export function formatContextPack(
++  pack: Omit<CodebaseContextPack, "text" | "tokenEstimate">,
++  budget: number,
++): string {
++  const lines: string[] = [];
++  lines.push(`# Codebase context: ${pack.repoName}`);
++  lines.push(`root: ${pack.repoRoot}`);
++  if (pack.gitHead) lines.push(`head: ${pack.gitHead.slice(0, 12)}`);
++  const languages = Object.entries(pack.languages)
++    .sort((a, b) => b[1] - a[1])
++    .slice(0, 10)
++    .map(([name, count]) => `${name}:${count}`)
++    .join(", ");
++  if (languages) lines.push(`languages: ${languages}`);
++  if (pack.entryPoints.length) lines.push(`entry points: ${pack.entryPoints.slice(0, 12).join(", ")}`);
++  if (pack.buildCommands.length) lines.push(`build/typecheck: ${pack.buildCommands.join(" | ")}`);
++  if (pack.testCommands.length) lines.push(`tests: ${pack.testCommands.join(" | ")}`);
++  const conventions: string[] = [];
++  if (pack.conventions.testFramework) conventions.push(`test=${pack.conventions.testFramework}`);
++  if (pack.conventions.lint) conventions.push(`lint=${pack.conventions.lint}`);
++  if (pack.conventions.format) conventions.push(`format=${pack.conventions.format}`);
++  if (pack.conventions.packageManager) conventions.push(`pm=${pack.conventions.packageManager}`);
++  if (conventions.length) lines.push(`conventions: ${conventions.join(", ")}`);
++
++  lines.push("");
++  lines.push("## Top-level modules");
++  for (const module of pack.topLevelModules.slice(0, 24)) {
++    const name = module.kind === "dir" ? `${module.path}/` : module.path;
++    lines.push(`- ${name} — ${module.purpose} (${module.files} files)`);
++  }
++
++  lines.push("");
++  lines.push("## Key files (by fan-in)");
++  for (const file of pack.keyFiles.slice(0, 40)) {
++    const exports = file.exports?.length ? ` [exports: ${file.exports.slice(0, 6).join(", ")}]` : "";
++    const purpose = file.purpose ? ` — ${file.purpose}` : "";
++    lines.push(`- ${file.path} (fan-in ${file.fanIn})${purpose}${exports}`);
++  }
++
++  const full = `${lines.join("\n").trim()}\n`;
++  return truncateToTokenBudget(full, budget).text;
++}
++
++/** Build the map for one repository from a scan. */
++export function buildMapFromScan(
++  scan: CodebaseScan,
++  options: BuildCodebaseMapOptions & { nowMs?: number } = { repoRoot: scan.repoRoot },
++): CodebaseMap {
++  const started = Date.now();
++  const budget = Math.max(512, Math.min(options.tokenBudget ?? CONTEXT_PACK_TOKEN_BUDGET, CONTEXT_PACK_TOKEN_BUDGET));
++  const touches = options.agentTouchesByPath ?? {};
++  const nowMs = options.nowMs ?? Date.now();
++
++  const repoRoot = scan.repoRoot || options.repoRoot;
++  const repoName = scan.repoName || repoNameForRoot(repoRoot);
++  const repoHash = scan.repoHash || repoHashForRoot(repoRoot);
++
++  const known = new Set(scan.files.map((f) => f.path));
++  const primary = primaryPackage(scan);
++  const fileInfos = new Map<string, CodebaseFileInfo>();
++  const languages: Record<string, number> = {};
++  const fanInCounts = new Map<string, number>();
++
++  for (const file of scan.files) {
++    const language = file.language;
++    if (language) languages[language] = (languages[language] ?? 0) + 1;
++    const info: CodebaseFileInfo = {
++      path: file.path,
++      bytes: file.bytes,
++      ...(file.lines !== undefined ? { lines: file.lines } : {}),
++      ...(language ? { language } : {}),
++      fanIn: 0,
++      churn90d: scan.churn?.[file.path] ?? 0,
++      agentTouches: touches[file.path] ?? 0,
++      heat: 0,
++    };
++    fileInfos.set(file.path, info);
++  }
++
++  // Fan-in: how many other files import this one.
++  for (const file of scan.files) {
++    for (const specifier of file.imports ?? []) {
++      const target = resolveImportTarget(file.path, specifier, known);
++      if (!target) continue;
++      fanInCounts.set(target, (fanInCounts.get(target) ?? 0) + 1);
++    }
++  }
++  for (const [target, count] of fanInCounts) {
++    const info = fileInfos.get(target);
++    if (info) info.fanIn = count;
++  }
++
++  // Purposes come from the path, falling back to the file's first meaningful
++  // line: the pack stays small but still says what a file is for.
++  const headByPath = new Map(scan.files.map((file) => [file.path, file.head]));
++  for (const info of fileInfos.values()) {
++    const purpose = inferPurpose(info.path, headByPath.get(info.path));
++    if (purpose) info.purpose = purpose;
++  }
++  for (const file of scan.files) {
++    const info = fileInfos.get(file.path);
++    if (info && file.exports?.length) info.exports = file.exports.slice(0, 8);
++  }
++
++  const allInfos = [...fileInfos.values()];
++  const heatmap: CodebaseHeatmapEntry[] = rankHeatmap(
++    allInfos.map((f) => ({
++      path: f.path,
++      bytes: f.bytes,
++      fanIn: f.fanIn,
++      churn90d: f.churn90d,
++      agentTouches: f.agentTouches,
++    })),
++    300,
++  );
++  const heatByPath = new Map(heatmap.map((entry) => [entry.path, entry.heat]));
++  for (const info of allInfos) info.heat = heatByPath.get(info.path) ?? 0;
++
++  const topLevelModules = buildTopLevelModules([...known], fileInfos);
++  const keyFiles = rankKeyFilesByFanIn(
++    allInfos.filter((f) => f.fanIn > 0 || (f.exports?.length ?? 0) > 0),
++    40,
++  ).map((file) => ({
++    path: file.path,
++    ...(file.purpose ? { purpose: file.purpose } : {}),
++    ...(file.exports?.length ? { exports: file.exports.slice(0, 8) } : {}),
++    fanIn: file.fanIn,
++  }));
++
++  const commands = readCommands(primary);
++  const conventions = detectConventions(primary, scan.lockFiles ?? []);
++
++  const basePack = {
++    repoRoot,
++    repoName,
++    repoHash,
++    generatedAt: new Date(nowMs).toISOString(),
++    ...(scan.gitHead ? { gitHead: scan.gitHead } : {}),
++    languages,
++    entryPoints: detectEntryPoints([...known]),
++    buildCommands: commands.buildCommands,
++    testCommands: commands.testCommands,
++    topLevelModules,
++    keyFiles,
++    conventions,
++  };
++
++  let text = formatContextPack(basePack, budget);
++  let tokenEstimate = estimateTokens(text);
++  if (tokenEstimate > budget) {
++    const shrunk = {
++      ...basePack,
++      keyFiles: basePack.keyFiles.slice(0, 20),
++      topLevelModules: basePack.topLevelModules.slice(0, 12),
++    };
++    text = formatContextPack(shrunk, budget);
++    tokenEstimate = estimateTokens(text);
++  }
++  if (tokenEstimate > budget) {
++    const truncated = truncateToTokenBudget(text, budget);
++    text = truncated.text;
++    tokenEstimate = truncated.tokenEstimate;
++  }
++
++  const contextPack: CodebaseContextPack = { ...basePack, tokenEstimate, text };
++
++  return {
++    version: 1,
++    repoRoot,
++    repoName,
++    repoHash,
++    generatedAt: basePack.generatedAt,
++    ...(scan.gitHead ? { gitHead: scan.gitHead } : {}),
++    buildMs: Date.now() - started,
++    files: allInfos,
++    topLevelModules,
++    languages,
++    entryPoints: basePack.entryPoints,
++    buildCommands: basePack.buildCommands,
++    testCommands: basePack.testCommands,
++    conventions,
++    contextPack,
++    heatmap,
++  };
++}
++
++/** The top n hotspots of a map. */
++export function selectHotspots(map: CodebaseMap, n = 20): CodebaseHeatmapEntry[] {
++  const limit = Math.max(1, Math.min(200, Math.floor(n)));
++  return [...(map.heatmap ?? [])].slice(0, limit);
++}
+diff --git a/apps/swarmagents/lib/codebase/hash.ts b/apps/swarmagents/lib/codebase/hash.ts
+new file mode 100644
+index 000000000..84bd0f478
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/hash.ts
+@@ -0,0 +1,11 @@
++import { createHash } from "node:crypto";
++import path from "node:path";
++
++export function repoHashForRoot(repoRoot: string): string {
++  const normalized = path.resolve(repoRoot);
++  return createHash("sha1").update(normalized).digest("hex").slice(0, 16);
++}
++
++export function repoNameForRoot(repoRoot: string): string {
++  return path.basename(path.resolve(repoRoot)) || "repo";
++}
+diff --git a/apps/swarmagents/lib/codebase/index.ts b/apps/swarmagents/lib/codebase/index.ts
+new file mode 100644
+index 000000000..1f4831347
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/index.ts
+@@ -0,0 +1,12 @@
++export * from "./types";
++export * from "./rules";
++export * from "./tokens";
++export * from "./hash";
++export * from "./ranking";
++export * from "./parse";
++export * from "./analyze";
++export * from "./store";
++export * from "./inject";
++export * from "./vm-analyzer-source";
++export * from "./vm-scanner";
++export * from "./local-scanner";
+diff --git a/apps/swarmagents/lib/codebase/inject.test.ts b/apps/swarmagents/lib/codebase/inject.test.ts
+new file mode 100644
+index 000000000..c576ed4e2
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/inject.test.ts
+@@ -0,0 +1,78 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { resolveCodebaseInjection, wrapCodebasePack } from "./inject";
++import { writeUserSettings, readUserSettings } from "../providers/settings";
++import { forgetCodebaseMap } from "./store";
++import type { CodebaseMap, CodebaseRepoOption, CodebaseScan, CodebaseScanner } from "./types";
++
++const SCAN: CodebaseScan = {
++  repoRoot: "/workspace/demo",
++  repoName: "demo",
++  repoHash: "hash",
++  generatedAt: new Date(0).toISOString(),
++  gitHead: "head-1",
++  files: [
++    { path: "src/core.ts", bytes: 100, language: "TypeScript", exports: ["core"] },
++    { path: "src/app.ts", bytes: 50, language: "TypeScript", imports: ["./core"] },
++  ],
++  churn: { "src/core.ts": 10 },
++};
++
++function scanner(selected: string | null = SCAN.repoRoot): CodebaseScanner {
++  return {
++    async scan(): Promise<CodebaseScan | null> {
++      return SCAN;
++    },
++    async head(): Promise<string | undefined> {
++      return "head-1";
++    },
++    async publish(_userId: string, _repoRoot: string, _map: CodebaseMap): Promise<void> {},
++    async listRepos(): Promise<CodebaseRepoOption[]> {
++      return [];
++    },
++    async readMap(): Promise<CodebaseMap | null> {
++      return null;
++    },
++    async selectedRepo(): Promise<string | null> {
++      return selected;
++    },
++    async selectRepo(): Promise<void> {},
++  };
++}
++
++test("the pack is injected when the setting is on (the default)", async () => {
++  const userId = "inject-default";
++  const result = await resolveCodebaseInjection(userId, scanner(), SCAN.repoRoot);
++  assert.equal(result.enabled, true);
++  assert.equal(result.injected, true);
++  assert.ok(result.text?.includes("src/core.ts"));
++  assert.ok((result.tokenEstimate ?? 0) > 0);
++  forgetCodebaseMap(userId, SCAN.repoRoot);
++});
++
++test("the pack is not injected when the user turned it off", async () => {
++  const userId = "inject-off";
++  writeUserSettings(userId, { preferFreeProviders: true, injectCodebaseContext: false });
++  assert.equal(readUserSettings(userId).injectCodebaseContext, false);
++  const result = await resolveCodebaseInjection(userId, scanner(), SCAN.repoRoot);
++  assert.equal(result.enabled, false);
++  assert.equal(result.injected, false);
++  assert.equal(result.reason, "disabled");
++  forgetCodebaseMap(userId, SCAN.repoRoot);
++});
++
++test("the pack is not injected when the account never picked a repository", async () => {
++  const userId = "inject-no-repo";
++  const result = await resolveCodebaseInjection(userId, scanner(null), SCAN.repoRoot);
++  assert.equal(result.enabled, true);
++  assert.equal(result.injected, false);
++  assert.equal(result.reason, "no-repo-picked");
++  forgetCodebaseMap(userId, SCAN.repoRoot);
++});
++
++test("the pack is wrapped in markers that identify it in the prompt", () => {
++  const wrapped = wrapCodebasePack("# Codebase context: demo", { repoHash: "abc" });
++  assert.match(wrapped, /^<codebase_context repo_hash="abc">/);
++  assert.match(wrapped, /<\/codebase_context>$/);
++  assert.match(wrapped, /# Codebase context: demo/);
++});
+diff --git a/apps/swarmagents/lib/codebase/inject.ts b/apps/swarmagents/lib/codebase/inject.ts
+new file mode 100644
+index 000000000..6652981da
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/inject.ts
+@@ -0,0 +1,99 @@
++/**
++ * Injecting the codebase context pack into a run.
++ *
++ * The pack is prepended to the run's system prompt so the agent starts with a
++ * map of the repository it is working in: languages, entry points, commands,
++ * the module layout and the files that everything else depends on.
++ *
++ * The user can turn the injection off (Settings -> Inject codebase context).
++ * When it is on, the pack is injected exactly once per run, and only when it
++ * fits inside the token budget.
++ */
++
++import { codebaseContextInjectionEnabled, readUserSettings } from "../providers/settings";
++import { CONTEXT_PACK_TOKEN_BUDGET } from "./rules";
++import {
++  ensureCodebaseMap,
++  maybeRefreshCodebaseMapOnGitChange,
++  selectedCodebaseRepo,
++} from "./store";
++import type { CodebaseScanner } from "./types";
++
++export interface CodebaseInjectionResult {
++  /** False when the account turned the injection off. */
++  enabled: boolean;
++  /** True when a pack was prepended to the run. */
++  injected: boolean;
++  repoRoot: string;
++  repoHash?: string;
++  tokenEstimate?: number;
++  text?: string;
++  /** Why nothing was injected (for the run log). */
++  reason?: string;
++}
++
++/**
++ * Resolve the pack for a run: honour the toggle, keep the map fresh and
++ * return the text to prepend. Never throws.
++ *
++ * The pack belongs to the repository the account picked (the Codebase tab):
++ * an account that never picked one gets no pack, and no map is built behind
++ * its back.
++ */
++export async function resolveCodebaseInjection(
++  userId: string,
++  scanner: CodebaseScanner,
++  fallbackRepoRoot: string,
++): Promise<CodebaseInjectionResult> {
++  try {
++    const settings = readUserSettings(userId);
++    if (!codebaseContextInjectionEnabled(settings)) {
++      return { enabled: false, injected: false, repoRoot: fallbackRepoRoot, reason: "disabled" };
++    }
++    const selected = await selectedCodebaseRepo(userId, scanner);
++    if (!selected) {
++      return { enabled: true, injected: false, repoRoot: fallbackRepoRoot, reason: "no-repo-picked" };
++    }
++    await maybeRefreshCodebaseMapOnGitChange(userId, scanner, selected).catch(() => undefined);
++    const map = await ensureCodebaseMap(userId, scanner, { repoRoot: selected });
++    if (!map?.contextPack?.text?.trim()) {
++      return { enabled: true, injected: false, repoRoot: selected, reason: "no-map" };
++    }
++    const pack = map.contextPack;
++    if (pack.tokenEstimate > CONTEXT_PACK_TOKEN_BUDGET) {
++      return {
++        enabled: true,
++        injected: false,
++        repoRoot: map.repoRoot,
++        repoHash: map.repoHash,
++        reason: "over-budget",
++      };
++    }
++    return {
++      enabled: true,
++      injected: true,
++      repoRoot: map.repoRoot,
++      repoHash: map.repoHash,
++      tokenEstimate: pack.tokenEstimate,
++      text: pack.text.trim(),
++    };
++  } catch {
++    return { enabled: true, injected: false, repoRoot: fallbackRepoRoot, reason: "error" };
++  }
++}
++
++/** Wrap the pack in the markers that make it recognisable in a prompt. */
++export function wrapCodebasePack(packText: string, meta: { repoHash?: string; repoName?: string } = {}): string {
++  const repoHash = meta.repoHash ? ` repo_hash="${meta.repoHash}"` : "";
++  const repoName = meta.repoName ? ` repo="${meta.repoName}"` : "";
++  return `<codebase_context${repoHash}${repoName}>\n${packText.trim()}\n</codebase_context>`;
++}
++
++/** Prepend the pack to an agent card (the system prompt of the run). */
++export function prefixAgentCardWithCodebasePack(
++  agentCard: string | undefined,
++  packText: string,
++): string {
++  const card = (agentCard ?? "").trim();
++  return card ? `${packText.trim()}\n\n${card}` : packText.trim();
++}
+diff --git a/apps/swarmagents/lib/codebase/local-scanner.ts b/apps/swarmagents/lib/codebase/local-scanner.ts
+new file mode 100644
+index 000000000..b1eab730f
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/local-scanner.ts
+@@ -0,0 +1,117 @@
++/**
++ * A codebase scanner that runs on the app server's own filesystem.
++ *
++ * It runs the very same analyzer program the VM runs (so both sides agree on
++ * what a scan contains) and is used by the tests and by the tooling that
++ * builds a map for a checkout on the server itself.
++ */
++
++import { execFile } from "node:child_process";
++import fs from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { promisify } from "node:util";
++import { repoHashForRoot } from "./hash";
++import type {
++  CodebaseMap,
++  CodebaseRepoOption,
++  CodebaseScan,
++  CodebaseScanner,
++} from "./types";
++import { codebaseAnalyzerSource } from "./vm-analyzer-source";
++
++const execFileAsync = promisify(execFile);
++
++let analyzerPath: string | null = null;
++
++/** Write the analyzer to a temp file once and return its path. */
++async function analyzerFile(): Promise<string> {
++  if (analyzerPath) return analyzerPath;
++  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "swarm-codebase-"));
++  const file = path.join(dir, "codebase-analyzer.mjs");
++  await fs.writeFile(file, codebaseAnalyzerSource(), "utf8");
++  analyzerPath = file;
++  return file;
++}
++
++/** Run the analyzer over a repository and return its scan. */
++export async function scanRepoLocal(
++  repoRoot: string,
++  options?: { sinceHead?: string },
++): Promise<CodebaseScan | null> {
++  const file = await analyzerFile();
++  try {
++    const { stdout } = await execFileAsync(
++      "node",
++      [file, path.resolve(repoRoot), options?.sinceHead ?? "-"],
++      { maxBuffer: 128 * 1024 * 1024 },
++    );
++    const parsed = JSON.parse(stdout) as { ok?: boolean; scanPath?: string };
++    if (!parsed.ok || !parsed.scanPath) return null;
++    const raw = await fs.readFile(parsed.scanPath, "utf8");
++    return JSON.parse(raw) as CodebaseScan;
++  } catch {
++    return null;
++  }
++}
++
++/** The HEAD of a local checkout. */
++export async function localRepoHead(repoRoot: string): Promise<string | undefined> {
++  try {
++    const { stdout } = await execFileAsync("git", ["-C", path.resolve(repoRoot), "rev-parse", "HEAD"], {
++      maxBuffer: 1024 * 1024,
++    });
++    const head = stdout.trim();
++    return head || undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++/** A scanner that reads and writes the server's own filesystem. */
++export function createLocalScanner(home: string = os.homedir()): CodebaseScanner {
++  return {
++    async scan(
++      _userId: string,
++      repoRoot: string,
++      options?: { sinceHead?: string },
++    ): Promise<CodebaseScan | null> {
++      return scanRepoLocal(repoRoot, options);
++    },
++    async head(_userId: string, repoRoot: string): Promise<string | undefined> {
++      return localRepoHead(repoRoot);
++    },
++    async publish(_userId: string, repoRoot: string, map: CodebaseMap): Promise<void> {
++      const dir = path.join(home, ".swarm", "codebase", map.repoHash || repoHashForRoot(repoRoot));
++      await fs.mkdir(dir, { recursive: true });
++      await fs.writeFile(path.join(dir, "map.json"), `${JSON.stringify(map, null, 2)}\n`, "utf8");
++      await fs.writeFile(path.join(dir, "context-pack.md"), map.contextPack.text, "utf8");
++    },
++    async listRepos(_userId: string): Promise<CodebaseRepoOption[]> {
++      return [];
++    },
++    async readMap(_userId: string, repoRoot: string): Promise<CodebaseMap | null> {
++      const hash = repoHashForRoot(repoRoot);
++      try {
++        const raw = await fs.readFile(path.join(home, ".swarm", "codebase", hash, "map.json"), "utf8");
++        return JSON.parse(raw) as CodebaseMap;
++      } catch {
++        return null;
++      }
++    },
++    async selectedRepo(_userId: string): Promise<string | null> {
++      try {
++        const raw = await fs.readFile(path.join(home, ".swarm", "codebase", "selection.json"), "utf8");
++        const parsed = JSON.parse(raw) as { repoRoot?: unknown };
++        return typeof parsed.repoRoot === "string" && parsed.repoRoot ? parsed.repoRoot : null;
++      } catch {
++        return null;
++      }
++    },
++    async selectRepo(_userId: string, repoRoot: string): Promise<void> {
++      const dir = path.join(home, ".swarm", "codebase");
++      await fs.mkdir(dir, { recursive: true });
++      await fs.writeFile(path.join(dir, "selection.json"), `${JSON.stringify({ repoRoot }, null, 2)}\n`, "utf8");
++    },
++  };
++}
+diff --git a/apps/swarmagents/lib/codebase/parse.ts b/apps/swarmagents/lib/codebase/parse.ts
+new file mode 100644
+index 000000000..93a5ab2b2
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/parse.ts
+@@ -0,0 +1,92 @@
++/**
++ * Purpose heuristics: one short line per file and per top-level module.
++ *
++ * The pack is only useful if a line tells the agent *what a thing is*, so
++ * these heuristics look at where a file lives and what it is called before
++ * they fall back to the file's first meaningful line.
++ */
++
++const FILE_PURPOSE_RULES: ReadonlyArray<{ test: (p: string, base: string) => boolean; purpose: string }> = [
++  { test: (_p, base) => base.startsWith("readme"), purpose: "Project readme / overview" },
++  { test: (_p, base) => base === "package.json", purpose: "Package manifest and scripts" },
++  { test: (_p, base) => base.startsWith("tsconfig"), purpose: "TypeScript configuration" },
++  { test: (_p, base) => base.startsWith("next.config"), purpose: "Next.js configuration" },
++  { test: (_p, base) => base === "dockerfile" || base.startsWith("docker-compose"), purpose: "Container / build definition" },
++  { test: (_p, base) => base.startsWith("makefile"), purpose: "Makefile" },
++  { test: (p) => p.includes("/test/") || p.includes("/tests/") || p.includes("/spec/"), purpose: "Tests" },
++  { test: (p) => p.includes("__tests__"), purpose: "Tests" },
++  { test: (p) => /\.(test|spec)\.[a-z]+$/.test(p), purpose: "Tests" },
++  { test: (p) => p.includes("/components/"), purpose: "UI component" },
++  { test: (p) => p.includes("/app/api/") && p.endsWith("route.ts"), purpose: "API route handler" },
++  { test: (p) => p.includes("/app/") && p.endsWith("page.tsx"), purpose: "App page" },
++  { test: (p) => p.includes("/lib/runtime/"), purpose: "Runtime / execution logic" },
++  { test: (p) => p.includes("/lib/harness/"), purpose: "Agent harness" },
++  { test: (p) => p.includes("/lib/vm/"), purpose: "VM management" },
++  { test: (p) => p.includes("/lib/providers/"), purpose: "LLM / provider integration" },
++  { test: (p) => p.includes("/lib/client/"), purpose: "Client helpers" },
++  { test: (p) => p.includes("/e2e/"), purpose: "End-to-end tests" },
++  { test: (p) => p.includes("/lib/"), purpose: "Library module" },
++  { test: (p) => p.includes("/scripts/"), purpose: "Build / maintenance script" },
++  { test: (p) => p.includes("/docs/"), purpose: "Documentation" },
++];
++
++/** A one-line description of what a file is for. */
++export function inferPurpose(filePath: string, content?: string): string | undefined {
++  const base = filePath.split("/").pop()?.toLowerCase() ?? "";
++  const p = filePath.replace(/\\/g, "/").toLowerCase();
++  for (const rule of FILE_PURPOSE_RULES) {
++    if (rule.test(p, base)) return rule.purpose;
++  }
++  if (content) {
++    const first = content
++      .split(/\r?\n/)
++      .map((line) => line.trim())
++      .find(
++        (line) =>
++          line &&
++          !line.startsWith("//") &&
++          !line.startsWith("/*") &&
++          !line.startsWith("*") &&
++          !line.startsWith("#!") &&
++          !line.startsWith("import ") &&
++          !line.startsWith("export ") &&
++          !line.startsWith('"use'),
++      )
++      ?.replace(/^#+\s*/, "");
++    if (first && first.length >= 12 && first.length <= 120) return first;
++  }
++  return undefined;
++}
++
++const MODULE_PURPOSE_RULES: ReadonlyArray<{ test: (p: string, files: string[]) => boolean; purpose: string }> = [
++  { test: (p) => p === "app" || p.endsWith("/app"), purpose: "Next.js app routes and pages" },
++  { test: (p) => p === "apps" || p.endsWith("/apps"), purpose: "Application packages" },
++  { test: (p) => p === "packages" || p.endsWith("/packages"), purpose: "Shared packages" },
++  { test: (p) => p === "lib" || p.endsWith("/lib"), purpose: "Shared server/client libraries" },
++  { test: (p) => p === "components" || p.endsWith("/components"), purpose: "Shared UI components" },
++  { test: (p) => p.includes("runtime"), purpose: "Runtime control plane and run execution" },
++  { test: (p) => p.includes("harness"), purpose: "Agent harness and tool execution" },
++  { test: (p) => p.includes("vm"), purpose: "VM drivers, lifecycle and file access" },
++  { test: (p) => p.includes("provider"), purpose: "LLM provider config and routing" },
++  { test: (p) => p.includes("client"), purpose: "Browser/client utilities" },
++  { test: (p) => p.includes("telemetry"), purpose: "Run telemetry and reporting" },
++  { test: (p) => p.includes("e2e"), purpose: "End-to-end test specs" },
++  { test: (p) => p.split("/").includes("api"), purpose: "API routes" },
++  { test: (p) => p.includes("minimalist-ui"), purpose: "Minimalist UI workspace app" },
++  { test: (p) => p.includes("infra"), purpose: "Infrastructure and deployment" },
++  { test: (p) => p.includes("scripts"), purpose: "Build and maintenance scripts" },
++  { test: (p) => p.includes("docs"), purpose: "Documentation" },
++  { test: (p) => p.includes("test") || p.includes("spec"), purpose: "Tests" },
++];
++
++/** A one-line description of what a top-level module holds. */
++export function guessModulePurpose(modulePath: string, files: string[]): string {
++  const p = modulePath.toLowerCase();
++  for (const rule of MODULE_PURPOSE_RULES) {
++    if (rule.test(p, files)) return rule.purpose;
++  }
++  // A directory that is mostly tests is a test directory.
++  const testFiles = files.filter((file) => /\.(test|spec)\./.test(file)).length;
++  if (files.length > 0 && testFiles / files.length >= 0.6) return "Tests";
++  return "Module";
++}
+diff --git a/apps/swarmagents/lib/codebase/ranking.test.ts b/apps/swarmagents/lib/codebase/ranking.test.ts
+new file mode 100644
+index 000000000..ad948e0a9
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/ranking.test.ts
+@@ -0,0 +1,102 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { rankHeatmap, rankKeyFilesByFanIn } from "./ranking";
++import { estimateTokens, truncateToTokenBudget } from "./tokens";
++import { CONTEXT_PACK_TOKEN_BUDGET } from "./rules";
++import { buildMapFromScan } from "./analyze";
++import type { CodebaseScan } from "./types";
++
++test("rankHeatmap orders by churn x size x fan-in x touches", () => {
++  const ranked = rankHeatmap([
++    { path: "a.ts", bytes: 100, fanIn: 1, churn90d: 10, agentTouches: 0 },
++    { path: "hot.ts", bytes: 500, fanIn: 20, churn90d: 200, agentTouches: 5 },
++    { path: "big.ts", bytes: 2000, fanIn: 0, churn90d: 0, agentTouches: 0 },
++  ]);
++  assert.equal(ranked[0].path, "hot.ts");
++  assert.ok(ranked[0].heat > ranked[1].heat);
++  assert.ok(ranked.every((r) => r.heat >= 0 && r.heat <= 1.000001));
++});
++
++test("rankHeatmap gives the touched file a higher heat", () => {
++  const withoutTouch = rankHeatmap([
++    { path: "a.ts", bytes: 1000, fanIn: 10, churn90d: 100, agentTouches: 0 },
++    { path: "b.ts", bytes: 1000, fanIn: 10, churn90d: 100, agentTouches: 0 },
++  ]);
++  const withTouch = rankHeatmap([
++    { path: "a.ts", bytes: 1000, fanIn: 10, churn90d: 100, agentTouches: 0 },
++    { path: "b.ts", bytes: 1000, fanIn: 10, churn90d: 100, agentTouches: 7 },
++  ]);
++  assert.equal(withoutTouch[0].heat, withoutTouch[1].heat);
++  assert.ok(withTouch[0].heat > withTouch[1].heat);
++  assert.equal(withTouch[0].path, "b.ts");
++});
++
++test("rankHeatmap is stable and honours the limit", () => {
++  const inputs = [
++    { path: "b.ts", bytes: 10, fanIn: 1, churn90d: 1, agentTouches: 0 },
++    { path: "a.ts", bytes: 10, fanIn: 1, churn90d: 1, agentTouches: 0 },
++    { path: "c.ts", bytes: 10, fanIn: 1, churn90d: 1, agentTouches: 0 },
++  ];
++  const first = rankHeatmap(inputs, 2);
++  const second = rankHeatmap(inputs, 2);
++  assert.deepEqual(first.map((r) => r.path), ["a.ts", "b.ts"]);
++  assert.deepEqual(first.map((r) => r.path), second.map((r) => r.path));
++});
++
++test("rankKeyFilesByFanIn prefers higher fan-in", () => {
++  const ranked = rankKeyFilesByFanIn([
++    { path: "b.ts", fanIn: 2 },
++    { path: "a.ts", fanIn: 10 },
++    { path: "c.ts", fanIn: 10 },
++  ], 2);
++  assert.deepEqual(ranked.map((r) => r.path), ["a.ts", "c.ts"]);
++});
++
++test("estimateTokens grows with the text and is zero for an empty string", () => {
++  assert.equal(estimateTokens(""), 0);
++  const small = estimateTokens("export function hello() { return 1; }");
++  const large = estimateTokens("export function hello() { return 1; }".repeat(50));
++  assert.ok(small > 0);
++  assert.ok(large > small * 10);
++});
++
++test("truncateToTokenBudget enforces the budget", () => {
++  const text = Array.from({ length: 5000 }, (_, i) => `line ${i} some codebase context`).join("\n");
++  const out = truncateToTokenBudget(text, 200);
++  assert.ok(out.truncated);
++  assert.ok(out.tokenEstimate <= 200, `estimate ${out.tokenEstimate} must fit the budget`);
++  assert.match(out.text, /truncated to fit budget/);
++});
++
++test("truncateToTokenBudget leaves a text that already fits alone", () => {
++  const text = "short pack";
++  const out = truncateToTokenBudget(text, 1000);
++  assert.equal(out.truncated, false);
++  assert.equal(out.text, text);
++});
++
++test("the context pack never exceeds the token budget", () => {
++  // A repository with far more files than the pack can describe.
++  const files = Array.from({ length: 4000 }, (_, i) => ({
++    path: `src/module-${i}/index.ts`,
++    bytes: 2048,
++    lines: 80,
++    language: "TypeScript",
++    exports: ["handler", "helper", "config"],
++    imports: [`../module-${(i + 1) % 4000}/index`],
++  }));
++  const scan: CodebaseScan = {
++    repoRoot: "/workspace/big",
++    repoName: "big",
++    repoHash: "hash",
++    generatedAt: new Date(0).toISOString(),
++    files,
++    churn: Object.fromEntries(files.map((file) => [file.path, 500])),
++  };
++  const map = buildMapFromScan(scan, { repoRoot: scan.repoRoot, tokenBudget: CONTEXT_PACK_TOKEN_BUDGET });
++  assert.ok(
++    map.contextPack.tokenEstimate <= CONTEXT_PACK_TOKEN_BUDGET,
++    `pack of ${map.contextPack.tokenEstimate} tokens must stay under ${CONTEXT_PACK_TOKEN_BUDGET}`,
++  );
++  assert.ok(map.contextPack.text.length > 0);
++});
+diff --git a/apps/swarmagents/lib/codebase/ranking.ts b/apps/swarmagents/lib/codebase/ranking.ts
+new file mode 100644
+index 000000000..90051fb26
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/ranking.ts
+@@ -0,0 +1,69 @@
++/**
++ * Ranking rules for the codebase map.
++ *
++ * Two rankings come out of a scan:
++ *
++ *   - the heatmap: churn (90d) x size x fan-in x the files this account's
++ *     agent touched before. It answers "where is the risk?".
++ *   - the key files: pure import fan-in. It answers "what is load-bearing?".
++ */
++
++import { HEAT_WEIGHTS } from "./rules";
++import type { CodebaseHeatmapEntry } from "./types";
++
++export interface RankInput {
++  path: string;
++  bytes: number;
++  fanIn: number;
++  churn90d: number;
++  agentTouches: number;
++}
++
++/** Scale a list of raw values into 0..1 against the largest value. */
++function normalize(values: number[]): (value: number) => number {
++  let max = 0;
++  for (const value of values) if (value > max) max = value;
++  if (max <= 0) return () => 0;
++  return (value) => (value > 0 ? value / max : 0);
++}
++
++/**
++ * Rank files by heat. Ties break on fan-in, then churn, then path so the
++ * order is stable across rebuilds (a rebuilt map must not reshuffle the UI).
++ */
++export function rankHeatmap(inputs: RankInput[], limit = 200): CodebaseHeatmapEntry[] {
++  const churn = normalize(inputs.map((i) => i.churn90d));
++  const size = normalize(inputs.map((i) => i.bytes));
++  const fanIn = normalize(inputs.map((i) => i.fanIn));
++  const touches = normalize(inputs.map((i) => i.agentTouches));
++  return inputs
++    .map((input) => ({
++      ...input,
++      heat: Number(
++        (
++          churn(input.churn90d) * HEAT_WEIGHTS.churn +
++          size(input.bytes) * HEAT_WEIGHTS.size +
++          fanIn(input.fanIn) * HEAT_WEIGHTS.fanIn +
++          touches(input.agentTouches) * HEAT_WEIGHTS.touches
++        ).toFixed(6),
++      ),
++    }))
++    .sort(
++      (a, b) =>
++        b.heat - a.heat ||
++        b.fanIn - a.fanIn ||
++        b.churn90d - a.churn90d ||
++        a.path.localeCompare(b.path),
++    )
++    .slice(0, limit);
++}
++
++/** Rank files by import fan-in (how many other files import them). */
++export function rankKeyFilesByFanIn<T extends { fanIn: number; path: string }>(
++  files: T[],
++  limit = 40,
++): T[] {
++  return [...files]
++    .sort((a, b) => b.fanIn - a.fanIn || a.path.localeCompare(b.path))
++    .slice(0, limit);
++}
+diff --git a/apps/swarmagents/lib/codebase/rules.ts b/apps/swarmagents/lib/codebase/rules.ts
+new file mode 100644
+index 000000000..855f05268
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/rules.ts
+@@ -0,0 +1,156 @@
++/**
++ * The rules that define "what this codebase looks like".
++ *
++ * They live here (instead of inside the analyzer program) for two reasons:
++ *
++ *   - the scanner that runs inside the user's VM is generated from these
++ *     values, so the VM and the server always agree on what counts as a
++ *     source file, how imports are spelled and which exports are public;
++ *   - they are plain data, so the unit tests can assert on them directly.
++ */
++
++import path from "node:path";
++
++/** Directories that never contain source worth mapping. */
++export const IGNORE_DIRS: readonly string[] = [
++  ".git",
++  ".hg",
++  ".svn",
++  "node_modules",
++  ".next",
++  ".turbo",
++  ".cache",
++  ".swarm",
++  "dist",
++  "build",
++  "out",
++  "coverage",
++  "vendor",
++  "__pycache__",
++  ".venv",
++  "venv",
++  ".idea",
++  ".vscode",
++  "target",
++];
++
++/** Lock files and generated bundles: big, noisy, never worth mapping. */
++export const IGNORE_FILES: readonly string[] = [
++  "package-lock.json",
++  "pnpm-lock.yaml",
++  "yarn.lock",
++  "bun.lockb",
++  "bun.lock",
++  "composer.lock",
++  "Cargo.lock",
++  "poetry.lock",
++  "go.sum",
++  ".DS_Store",
++];
++
++/** Extensions the scanner parses for imports/exports. */
++export const SOURCE_EXTS: readonly string[] = [
++  ".ts",
++  ".tsx",
++  ".js",
++  ".jsx",
++  ".mts",
++  ".cts",
++  ".mjs",
++  ".cjs",
++  ".py",
++  ".go",
++  ".rs",
++  ".java",
++  ".rb",
++  ".php",
++];
++
++/** Extension -> language label used in the pack's language histogram. */
++export const EXT_LANG: Readonly<Record<string, string>> = {
++  ts: "TypeScript",
++  tsx: "TypeScript",
++  mts: "TypeScript",
++  cts: "TypeScript",
++  js: "JavaScript",
++  jsx: "JavaScript",
++  mjs: "JavaScript",
++  cjs: "JavaScript",
++  py: "Python",
++  go: "Go",
++  rs: "Rust",
++  java: "Java",
++  rb: "Ruby",
++  php: "PHP",
++  css: "CSS",
++  scss: "CSS",
++  html: "HTML",
++  json: "JSON",
++  md: "Markdown",
++  yaml: "YAML",
++  yml: "YAML",
++  sh: "Shell",
++  sql: "SQL",
++};
++
++/** `import x from "y"` / `export * from "y"` — the static import forms. */
++export const STATIC_IMPORT_RE = /(?:import|export)\s+(?:[^"']*?\s+from\s+)?["']([^"']+)["']/g;
++/** `require("y")` — CommonJS. */
++export const REQUIRE_RE = /require\(\s*["']([^"']+)["']\s*\)/g;
++/** `import("y")` — dynamic import. */
++export const DYNAMIC_IMPORT_RE = /import\(\s*["']([^"']+)["']\s*\)/g;
++/** `from .x import y` / `import x` — Python. */
++export const PYTHON_IMPORT_RE = /^\s*(?:from\s+([.\w]+)\s+import|import\s+([.\w]+))/gm;
++
++/**
++ * The export forms the scanner understands, in the order they are reported.
++ * `kind: "list"` means the capture holds a comma separated export list
++ * (`export { a, b as c }`); `kind: "name"` means it holds a single name.
++ */
++export const EXPORT_PATTERNS: ReadonlyArray<{ re: RegExp; kind: "name" | "list" }> = [
++  { re: /export\s+(?:async\s+)?function\*?\s+([A-Za-z0-9_$]+)/g, kind: "name" },
++  { re: /export\s+class\s+([A-Za-z0-9_$]+)/g, kind: "name" },
++  { re: /export\s+(?:const|let|var|type|interface|enum)\s+([A-Za-z0-9_$]+)/g, kind: "name" },
++  { re: /export\s*\{\s*([^}]+)\s*\}/g, kind: "list" },
++  { re: /export\s+default\s+(?:function\*?\s+|class\s+)?([A-Za-z0-9_$]+)/g, kind: "name" },
++];
++
++/** Python: top-level defs/classes. */
++export const PYTHON_EXPORT_RE = /^(?:def|class)\s+([A-Za-z0-9_]+)/gm;
++/** Go: exported top-level identifiers. */
++export const GO_EXPORT_RE = /^(?:func|type|const|var)\s+([A-Z][A-Za-z0-9_]*)/gm;
++/** Rust: public items. */
++export const RUST_EXPORT_RE = /^\s*pub\s+(?:fn|struct|enum|trait|type|const)\s+([A-Za-z0-9_]+)/gm;
++
++/** Weights of the heat formula: churn x size x fan-in x agent touches. */
++export const HEAT_WEIGHTS = {
++  churn: 0.4,
++  size: 0.2,
++  fanIn: 0.25,
++  touches: 0.15,
++} as const;
++
++/** Hard ceiling for the injected context pack, in tokens. */
++export const CONTEXT_PACK_TOKEN_BUDGET = 8000;
++
++/** Files larger than this are measured but not parsed. */
++export const MAX_PARSED_FILE_BYTES = 120_000;
++
++/** Files smaller than this are parsed even when they are not source files. */
++export const MAX_SMALL_FILE_BYTES = 16_000;
++
++/** Cap on the number of files the scanner reports. */
++export const MAX_SCANNED_FILES = 20_000;
++
++/** Cap on the number of import specifiers kept per file. */
++export const MAX_IMPORTS_PER_FILE = 200;
++
++/** The language of a file, derived from its extension. */
++export function languageForPath(filePath: string): string | undefined {
++  const ext = path.extname(filePath).slice(1).toLowerCase();
++  if (EXT_LANG[ext]) return EXT_LANG[ext];
++  const base = path.basename(filePath).toLowerCase();
++  if (base === "dockerfile") return "Dockerfile";
++  if (base === "makefile") return "Makefile";
++  return undefined;
++}
+diff --git a/apps/swarmagents/lib/codebase/scanner.test.ts b/apps/swarmagents/lib/codebase/scanner.test.ts
+new file mode 100644
+index 000000000..69d3392cf
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/scanner.test.ts
+@@ -0,0 +1,74 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { codebaseAnalyzerSource } from "./vm-analyzer-source";
++import { scanRepoLocal } from "./local-scanner";
++
++/** Write a small repository to a temp dir and return its path. */
++function fixtureRepo(): string {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-repo-"));
++  fs.mkdirSync(path.join(dir, "src", "lib"), { recursive: true });
++  fs.mkdirSync(path.join(dir, "node_modules", "junk"), { recursive: true });
++  fs.writeFileSync(
++    path.join(dir, "src", "core.ts"),
++    'export function core() { return 1; }\nexport const VERSION = "1";\n',
++  );
++  fs.writeFileSync(
++    path.join(dir, "src", "app.ts"),
++    'import { core } from "./lib/core";\nexport const app = () => core();\n',
++  );
++  fs.writeFileSync(path.join(dir, "src", "lib", "core.ts"), "export const core = () => 1;\n");
++  fs.writeFileSync(path.join(dir, "README.md"), "# Demo\n");
++  fs.writeFileSync(
++    path.join(dir, "package.json"),
++    JSON.stringify({ name: "demo", scripts: { build: "tsc", test: "node --test" } }, null, 2),
++  );
++  fs.writeFileSync(path.join(dir, "node_modules", "junk", "index.js"), "module.exports = 1;\n");
++  fs.writeFileSync(path.join(dir, "package-lock.json"), "{}\n");
++  return dir;
++}
++
++test("the analyzer program is valid JavaScript", () => {
++  const source = codebaseAnalyzerSource();
++  assert.match(source, /^#!\/usr\/bin\/env node/);
++  // `new Function` cannot parse ESM, so check it as a module body instead.
++  assert.doesNotThrow(() => {
++    // eslint-disable-next-line no-new-func
++    new Function(`return async () => { ${source.replace(/^#!.*\n/, "").replace(/^import .*$/gm, "")} }`);
++  });
++});
++
++test("the analyzer finds the source files, their imports and their exports", async () => {
++  const repo = fixtureRepo();
++  const scan = await scanRepoLocal(repo);
++  assert.ok(scan, "the analyzer must produce a scan");
++  const paths = scan.files.map((file) => file.path);
++  assert.ok(paths.includes("src/app.ts"));
++  assert.ok(paths.includes("src/lib/core.ts"));
++  assert.ok(paths.includes("README.md"));
++  // node_modules and the lock file are noise.
++  assert.ok(!paths.some((file) => file.includes("node_modules")));
++  assert.ok(!paths.includes("package-lock.json"));
++
++  const core = scan.files.find((file) => file.path === "src/core.ts");
++  assert.ok(core?.exports?.includes("core"));
++  assert.ok(core?.exports?.includes("VERSION"));
++
++  const app = scan.files.find((file) => file.path === "src/app.ts");
++  assert.ok(app?.imports?.includes("./lib/core"));
++
++  const pkg = scan.packageJson;
++  assert.equal(pkg?.scripts?.build, "tsc");
++  assert.ok(scan.lockFiles?.includes("package-lock.json"));
++  fs.rmSync(repo, { recursive: true, force: true });
++});
++
++test("the analyzer reports the repository root, its name and its hash", async () => {
++  const repo = fixtureRepo();
++  const scan = await scanRepoLocal(repo);
++  assert.equal(scan?.repoRoot, fs.realpathSync(repo));
++  assert.ok((scan?.repoHash ?? "").length === 16);
++  fs.rmSync(repo, { recursive: true, force: true });
++});
+diff --git a/apps/swarmagents/lib/codebase/store.test.ts b/apps/swarmagents/lib/codebase/store.test.ts
+new file mode 100644
+index 000000000..3e6065b25
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/store.test.ts
+@@ -0,0 +1,126 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  ensureCodebaseMap,
++  forgetCodebaseMap,
++  getCodebaseContextPack,
++  getCodebaseHotspots,
++  maybeRefreshCodebaseMapOnGitChange,
++  normalizeRepoPath,
++  recordAgentTouches,
++} from "./store";
++import type { CodebaseMap, CodebaseRepoOption, CodebaseScan, CodebaseScanner } from "./types";
++
++/** A scanner that serves a fixed scan and counts how often it was asked. */
++function fakeScanner(scan: CodebaseScan, options: { head?: string } = {}): CodebaseScanner & {
++  scans: number;
++  published: CodebaseMap[];
++} {
++  const published: CodebaseMap[] = [];
++  const scanner = {
++    scans: 0,
++    published,
++    async scan(): Promise<CodebaseScan | null> {
++      scanner.scans += 1;
++      return scan;
++    },
++    async head(): Promise<string | undefined> {
++      return options.head;
++    },
++    async publish(_userId: string, _repoRoot: string, map: CodebaseMap): Promise<void> {
++      published.push(map);
++    },
++    async listRepos(): Promise<CodebaseRepoOption[]> {
++      return [];
++    },
++    async readMap(): Promise<CodebaseMap | null> {
++      return null;
++    },
++    async selectedRepo(): Promise<string | null> {
++      return null;
++    },
++    async selectRepo(): Promise<void> {},
++  };
++  return scanner;
++}
++
++const SAMPLE: CodebaseScan = {
++  repoRoot: "/workspace/demo",
++  repoName: "demo",
++  repoHash: "hash",
++  generatedAt: new Date(0).toISOString(),
++  gitHead: "head-1",
++  files: [
++    { path: "src/core.ts", bytes: 100, language: "TypeScript", exports: ["core"] },
++    { path: "src/a.ts", bytes: 50, language: "TypeScript", imports: ["./core"] },
++  ],
++  churn: { "src/core.ts": 10 },
++};
++
++test("ensureCodebaseMap builds the map once and reuses it", async () => {
++  const scanner = fakeScanner(SAMPLE, { head: "head-1" });
++  const first = await ensureCodebaseMap("alice", scanner, { repoRoot: SAMPLE.repoRoot });
++  const second = await ensureCodebaseMap("alice", scanner, { repoRoot: SAMPLE.repoRoot });
++  assert.ok(first);
++  assert.equal(scanner.scans, 1);
++  assert.equal(second, first);
++  assert.equal(scanner.published.length, 1);
++  forgetCodebaseMap("alice", SAMPLE.repoRoot);
++});
++
++test("ensureCodebaseMap rebuilds when the repository moved on", async () => {
++  const scanner = fakeScanner(SAMPLE, { head: "head-2" });
++  await ensureCodebaseMap("bob", scanner, { repoRoot: SAMPLE.repoRoot });
++  const rebuilt = await ensureCodebaseMap("bob", scanner, { repoRoot: SAMPLE.repoRoot });
++  assert.equal(scanner.scans, 2);
++  assert.ok(rebuilt);
++  forgetCodebaseMap("bob", SAMPLE.repoRoot);
++});
++
++test("ensureCodebaseMap keeps the agent touch counters across rebuilds", async () => {
++  const scanner = fakeScanner(SAMPLE, { head: "head-1" });
++  await ensureCodebaseMap("carol", scanner, { repoRoot: SAMPLE.repoRoot });
++  await recordAgentTouches("carol", scanner, SAMPLE.repoRoot, ["src/core.ts"]);
++  await ensureCodebaseMap("carol", scanner, { repoRoot: SAMPLE.repoRoot, force: true });
++  const map = await ensureCodebaseMap("carol", scanner, { repoRoot: SAMPLE.repoRoot });
++  assert.equal(map?.files.find((file) => file.path === "src/core.ts")?.agentTouches, 1);
++  forgetCodebaseMap("carol", SAMPLE.repoRoot);
++});
++
++test("recordAgentTouches raises the heat of the touched file", async () => {
++  const scanner = fakeScanner(SAMPLE, { head: "head-1" });
++  const map = await ensureCodebaseMap("dave", scanner, { repoRoot: SAMPLE.repoRoot });
++  const before = map?.heatmap.find((entry) => entry.path === "src/core.ts")?.heat ?? 0;
++  await recordAgentTouches("dave", scanner, SAMPLE.repoRoot, ["src/core.ts"]);
++  const after = map?.heatmap.find((entry) => entry.path === "src/core.ts")?.heat ?? 0;
++  assert.ok(after > before, `${after} should be hotter than ${before}`);
++  forgetCodebaseMap("dave", SAMPLE.repoRoot);
++});
++
++test("the context pack and the hotspots come from the same map", async () => {
++  const scanner = fakeScanner(SAMPLE, { head: "head-1" });
++  const pack = await getCodebaseContextPack("erin", scanner, SAMPLE.repoRoot);
++  const hotspots = await getCodebaseHotspots("erin", scanner, SAMPLE.repoRoot, 1);
++  assert.ok(pack?.text.includes("src/core.ts"));
++  assert.equal(hotspots.length, 1);
++  assert.equal(hotspots[0].path, "src/core.ts");
++  forgetCodebaseMap("erin", SAMPLE.repoRoot);
++});
++
++test("maybeRefreshCodebaseMapOnGitChange only rebuilds when the head moved", async () => {
++  const scanner = fakeScanner(SAMPLE, { head: "head-1" });
++  await ensureCodebaseMap("frank", scanner, { repoRoot: SAMPLE.repoRoot });
++  await maybeRefreshCodebaseMapOnGitChange("frank", scanner, SAMPLE.repoRoot);
++  assert.equal(scanner.scans, 1);
++  forgetCodebaseMap("frank", SAMPLE.repoRoot);
++});
++
++test("normalizeRepoPath turns workspace paths into repo-relative ones", () => {
++  assert.equal(normalizeRepoPath("/workspace/demo/src/a.ts", "/workspace/demo"), "src/a.ts");
++  assert.equal(normalizeRepoPath("/workspace/demo/src/a.ts"), "demo/src/a.ts");
++  assert.equal(normalizeRepoPath("src/a.ts"), "src/a.ts");
++  assert.equal(normalizeRepoPath("./src/a.ts"), "src/a.ts");
++  assert.equal(normalizeRepoPath("/etc/passwd"), null);
++  assert.equal(normalizeRepoPath("../outside.ts"), null);
++  assert.equal(normalizeRepoPath(""), null);
++});
+diff --git a/apps/swarmagents/lib/codebase/store.ts b/apps/swarmagents/lib/codebase/store.ts
+new file mode 100644
+index 000000000..9039d3369
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/store.ts
+@@ -0,0 +1,217 @@
++/**
++ * The codebase map store.
++ *
++ * One map per (account, repository). The map itself lives in the user's VM
++ * (`~/.swarm/codebase/<repoHash>/map.json`), so the agent's MCP tools and the
++ * app read the very same document; the server keeps a small in-memory cache
++ * so a run does not rebuild the map on every turn.
++ *
++ * Freshness: a map is rebuilt when the repository's HEAD moves (someone
++ * committed) or when the user asks for it explicitly. The map is never
++ * rebuilt silently for a repository the account never picked.
++ */
++
++import { buildMapFromScan, selectHotspots } from "./analyze";
++import { repoHashForRoot } from "./hash";
++import { CONTEXT_PACK_TOKEN_BUDGET } from "./rules";
++import type { CodebaseMap, CodebaseRepoOption, CodebaseScanner } from "./types";
++
++/** Cache key: one map per account and repository. */
++export function repoKey(userId: string, repoRoot: string): string {
++  return `${userId}:${repoHashForRoot(repoRoot)}`;
++}
++
++const memory = new Map<string, CodebaseMap>();
++
++/** Drop the cached map for an account (used by tests and by VM resets). */
++export function forgetCodebaseMap(userId: string, repoRoot: string): void {
++  memory.delete(repoKey(userId, repoRoot));
++}
++
++export interface EnsureOptions {
++  repoRoot: string;
++  /** Rebuild even when the cached map looks current. */
++  force?: boolean;
++}
++
++/**
++ * Return the map for a repository, building it the first time and rebuilding
++ * it when the repository moved on. Never throws: a repository that cannot be
++ * scanned simply has no map.
++ */
++export async function ensureCodebaseMap(
++  userId: string,
++  scanner: CodebaseScanner,
++  options: EnsureOptions,
++): Promise<CodebaseMap | null> {
++  const repoRoot = options.repoRoot;
++  const key = repoKey(userId, repoRoot);
++  const cached = memory.get(key);
++
++  if (!options.force && cached) {
++    const head = await scanner.head(userId, repoRoot).catch(() => undefined);
++    if (!head || !cached.gitHead || head === cached.gitHead) return cached;
++  }
++
++  const scan = await scanner
++    .scan(userId, repoRoot, { sinceHead: cached?.gitHead })
++    .catch(() => null);
++  if (!scan) return cached ?? null;
++
++  const touches: Record<string, number> = {};
++  for (const file of cached?.files ?? []) {
++    if (file.agentTouches) touches[file.path] = file.agentTouches;
++  }
++
++  const map = buildMapFromScan(scan, {
++    repoRoot,
++    tokenBudget: CONTEXT_PACK_TOKEN_BUDGET,
++    agentTouchesByPath: touches,
++  });
++
++  memory.set(key, map);
++  await scanner.publish(userId, repoRoot, map).catch(() => undefined);
++  return map;
++}
++
++/** The context pack for a repository, already inside the token budget. */
++export async function getCodebaseContextPack(
++  userId: string,
++  scanner: CodebaseScanner,
++  repoRoot: string,
++): Promise<CodebaseMap["contextPack"] | null> {
++  const map = await ensureCodebaseMap(userId, scanner, { repoRoot });
++  if (!map) return null;
++  const pack = map.contextPack;
++  if (pack.tokenEstimate <= CONTEXT_PACK_TOKEN_BUDGET) return pack;
++  return { ...pack, tokenEstimate: CONTEXT_PACK_TOKEN_BUDGET };
++}
++
++/** The n hottest files of a repository. */
++export async function getCodebaseHotspots(
++  userId: string,
++  scanner: CodebaseScanner,
++  repoRoot: string,
++  n = 20,
++): Promise<ReturnType<typeof selectHotspots>> {
++  const map = await ensureCodebaseMap(userId, scanner, { repoRoot });
++  if (!map) return [];
++  return selectHotspots(map, n);
++}
++
++/**
++ * Remember which files this account's agent touched, so the heatmap can
++ * show them. The counters live in the map, which lives in the account's own
++ * VM: another account never sees them.
++ *
++ * Only files of a repository the account picked are counted, so a run never
++ * builds a map behind the user's back.
++ */
++export async function recordAgentTouches(
++  userId: string,
++  scanner: CodebaseScanner,
++  repoRoot: string,
++  touchedPaths: string[],
++): Promise<void> {
++  if (touchedPaths.length === 0) return;
++  const key = repoKey(userId, repoRoot);
++  const map = memory.get(key);
++  if (!map) return;
++
++  const byPath = new Map(map.files.map((file) => [file.path, file]));
++  let changed = false;
++  for (const raw of touchedPaths) {
++    const rel = normalizeRepoPath(raw, map.repoRoot);
++    if (!rel) continue;
++    const file = byPath.get(rel);
++    if (!file) continue;
++    file.agentTouches = (file.agentTouches ?? 0) + 1;
++    changed = true;
++  }
++  if (!changed) return;
++
++  const maxTouch = Math.max(1, ...map.files.map((file) => file.agentTouches ?? 0));
++  const churnMax = Math.max(1, ...map.files.map((file) => file.churn90d ?? 0));
++  const sizeMax = Math.max(1, ...map.files.map((file) => file.bytes ?? 0));
++  const fanInMax = Math.max(1, ...map.files.map((file) => file.fanIn ?? 0));
++  for (const entry of map.heatmap) {
++    const file = byPath.get(entry.path);
++    const touches = file?.agentTouches ?? 0;
++    entry.agentTouches = touches;
++    entry.heat = Number(
++      (
++        ((entry.churn90d ?? 0) / churnMax) * 0.4 +
++        ((entry.bytes ?? 0) / sizeMax) * 0.2 +
++        ((entry.fanIn ?? 0) / fanInMax) * 0.25 +
++        (touches / maxTouch) * 0.15
++      ).toFixed(6),
++    );
++  }
++  map.heatmap.sort(
++    (a, b) => b.heat - a.heat || b.fanIn - a.fanIn || b.churn90d - a.churn90d || a.path.localeCompare(b.path),
++  );
++
++  memory.set(key, map);
++  await scanner.publish(userId, repoRoot, map).catch(() => undefined);
++}
++
++/** Rebuild the map when the repository's HEAD moved since the last build. */
++export async function maybeRefreshCodebaseMapOnGitChange(
++  userId: string,
++  scanner: CodebaseScanner,
++  repoRoot: string,
++): Promise<void> {
++  const cached = memory.get(repoKey(userId, repoRoot));
++  if (!cached) return;
++  const head = await scanner.head(userId, repoRoot).catch(() => undefined);
++  if (!head || !cached.gitHead || head === cached.gitHead) return;
++  await ensureCodebaseMap(userId, scanner, { repoRoot, force: true });
++}
++
++/** The repositories this account can pick from its workspace. */
++export async function listCodebaseRepos(
++  userId: string,
++  scanner: CodebaseScanner,
++): Promise<CodebaseRepoOption[]> {
++  const repos = await scanner.listRepos(userId).catch(() => [] as CodebaseRepoOption[]);
++  return repos;
++}
++
++/**
++ * The repository the account picked (the one whose map is injected into its
++ * runs), or null when it never picked one.
++ */
++export async function selectedCodebaseRepo(
++  userId: string,
++  scanner: CodebaseScanner,
++): Promise<string | null> {
++  const repoRoot = await scanner.selectedRepo(userId).catch(() => null);
++  return repoRoot && repoRoot.trim() ? repoRoot.trim() : null;
++}
++
++/** Remember the repository the account picked. */
++export async function selectCodebaseRepo(
++  userId: string,
++  scanner: CodebaseScanner,
++  repoRoot: string,
++): Promise<void> {
++  await scanner.selectRepo(userId, repoRoot).catch(() => undefined);
++}
++
++/**
++ * Normalize a path the agent touched into a path relative to the repository.
++ * Absolute paths are made relative to the repository root when they are
++ * inside it, and to the workspace root otherwise; anything outside the
++ * workspace is refused.
++ */
++export function normalizeRepoPath(raw: string, repoRoot?: string): string | null {
++  let value = String(raw ?? "").trim().replace(/\\/g, "/");
++  if (!value) return null;
++  value = value.replace(/^file:\/\//, "");
++  const root = repoRoot ? repoRoot.replace(/\/+$/, "") : "";
++  if (root && value.startsWith(`${root}/`)) return value.slice(root.length + 1);
++  if (value.startsWith("/workspace/")) return value.slice("/workspace/".length);
++  if (value.startsWith("./")) value = value.slice(2);
++  if (!value || value.startsWith("/") || value.includes("..")) return null;
++  return value;
++}
+diff --git a/apps/swarmagents/lib/codebase/tokens.ts b/apps/swarmagents/lib/codebase/tokens.ts
+new file mode 100644
+index 000000000..46d519df8
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/tokens.ts
+@@ -0,0 +1,53 @@
++/**
++ * Token budgeting for the context pack.
++ *
++ * The pack is prepended to every run's system prompt, so its size has to be
++ * bounded *and* predictable: the same estimate is shown in the UI and used to
++ * decide whether the pack still fits. The estimate is deliberately a little
++ * conservative (code packs more tokens per character than prose).
++ */
++
++/** Rough tokens per character for source code and short English sentences. */
++const CHARS_PER_TOKEN = 3.6;
++
++/** Extra tokens charged per whitespace-separated word. */
++const TOKENS_PER_WORD = 1 / 12;
++
++/** Rough token estimate for a piece of text. */
++export function estimateTokens(text: string): number {
++  if (!text) return 0;
++  const chars = text.length;
++  const words = (text.match(/\S+/g) ?? []).length;
++  return Math.max(1, Math.ceil(chars / CHARS_PER_TOKEN + words * TOKENS_PER_WORD));
++}
++
++/** Marker appended to a pack that had to be cut short. */
++export const TRUNCATION_MARKER = "\n…[codebase context truncated to fit budget]";
++
++/**
++ * Cut `text` down to `budget` estimated tokens. The result always fits the
++ * budget (the marker included) and never ends mid-word when a line break is
++ * close enough to cut on.
++ */
++export function truncateToTokenBudget(
++  text: string,
++  budget: number,
++): { text: string; tokenEstimate: number; truncated: boolean } {
++  const est = estimateTokens(text);
++  if (est <= budget) return { text, tokenEstimate: est, truncated: false };
++
++  // Largest prefix (plus the marker) whose estimate still fits the budget.
++  let lo = 0;
++  let hi = text.length;
++  while (lo < hi) {
++    const mid = Math.ceil((lo + hi) / 2);
++    if (estimateTokens(text.slice(0, mid) + TRUNCATION_MARKER) <= budget) lo = mid;
++    else hi = mid - 1;
++  }
++
++  let out = text.slice(0, lo);
++  const cut = out.lastIndexOf("\n");
++  if (cut > lo * 0.6) out = out.slice(0, cut);
++  out += TRUNCATION_MARKER;
++  return { text: out, tokenEstimate: estimateTokens(out), truncated: true };
++}
+diff --git a/apps/swarmagents/lib/codebase/touches.test.ts b/apps/swarmagents/lib/codebase/touches.test.ts
+new file mode 100644
+index 000000000..2a16b4695
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/touches.test.ts
+@@ -0,0 +1,37 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { extractTouchedPaths, normalizeTouchedPath } from "./touches";
++
++test("normalizeTouchedPath keeps workspace-relative paths", () => {
++  assert.equal(normalizeTouchedPath("/workspace/src/a.ts"), "src/a.ts");
++  assert.equal(normalizeTouchedPath("src/a.ts"), "src/a.ts");
++  assert.equal(normalizeTouchedPath("./src/a.ts"), "src/a.ts");
++  assert.equal(normalizeTouchedPath(""), null);
++  assert.equal(normalizeTouchedPath("/etc/passwd"), null);
++  assert.equal(normalizeTouchedPath("/workspace/../etc/passwd"), null);
++});
++
++test("extractTouchedPaths finds the files of a write tool call", () => {
++  const paths = extractTouchedPaths({ file_path: "/workspace/src/app.ts", content: "x" });
++  assert.deepEqual(paths, ["src/app.ts"]);
++});
++
++test("extractTouchedPaths finds the files a shell command mentions", () => {
++  const paths = extractTouchedPaths({ command: "cd /workspace && npx tsc lib/a.ts lib/b.ts" });
++  assert.ok(paths.includes("lib/a.ts"));
++  assert.ok(paths.includes("lib/b.ts"));
++});
++
++test("extractTouchedPaths walks nested tool arguments", () => {
++  const paths = extractTouchedPaths({
++    edits: [{ path: "/workspace/deep/nested/file.ts" }],
++    meta: { target: { targetPath: "/workspace/other.ts" } },
++  });
++  assert.ok(paths.includes("deep/nested/file.ts"));
++  assert.ok(paths.includes("other.ts"));
++});
++
++test("extractTouchedPaths ignores arguments that are not paths", () => {
++  const paths = extractTouchedPaths({ prompt: "fix the bug in src/app.ts please", timeout: 30 });
++  assert.deepEqual(paths, []);
++});
+diff --git a/apps/swarmagents/lib/codebase/touches.ts b/apps/swarmagents/lib/codebase/touches.ts
+new file mode 100644
+index 000000000..9a15f75bf
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/touches.ts
+@@ -0,0 +1,75 @@
++/**
++ * Which files did the agent touch?
++ *
++ * The heatmap weighs the files this account's agent worked on before, so the
++ * harness has to know which paths a tool call referred to. The tool calls are
++ * Claude Code's (Write, Edit, Read, Bash, ...) and their argument shape
++ * differs per tool, so the paths are collected defensively: anything that
++ * looks like a workspace path is counted, and nothing else is.
++ */
++
++const PATH_KEYS = new Set([
++  "path",
++  "file",
++  "file_path",
++  "filepath",
++  "filePath",
++  "filename",
++  "fileName",
++  "target",
++  "target_path",
++  "targetPath",
++  "uri",
++  "notebook_path",
++  "notebookPath",
++]);
++
++/** Normalize a path the agent mentioned into a workspace-relative path. */
++export function normalizeTouchedPath(raw: string): string | null {
++  let value = String(raw ?? "").trim().replace(/\\/g, "/");
++  if (!value) return null;
++  value = value.replace(/^file:\/\//, "");
++  const marker = "/workspace/";
++  const index = value.indexOf(marker);
++  if (index >= 0) value = value.slice(index + marker.length);
++  else if (value.startsWith("/workspace")) value = value.slice("/workspace".length).replace(/^\/+/, "");
++  else if (value.startsWith("./")) value = value.slice(2);
++  if (!value || value.startsWith("/") || value.includes("..")) return null;
++  return value;
++}
++
++/** The file names a shell command mentions. */
++function pathsFromCommand(command: string): string[] {
++  const out: string[] = [];
++  const re = /(?:^|[\s"'`])((?:\/workspace\/)?[A-Za-z0-9_.@/-]+\.[A-Za-z0-9_-]{1,12})(?=[\s"'`:;,]|$)/g;
++  for (const match of command.matchAll(re)) out.push(match[1]);
++  return out;
++}
++
++/** Collect the workspace-relative paths a tool call refers to. */
++export function extractTouchedPaths(input: unknown): string[] {
++  const out = new Set<string>();
++  const push = (value: unknown) => {
++    if (typeof value !== "string") return;
++    const normalized = normalizeTouchedPath(value);
++    if (normalized) out.add(normalized);
++  };
++
++  const scan = (value: unknown, depth = 0): void => {
++    if (!value || depth > 5) return;
++    if (Array.isArray(value)) {
++      for (const item of value) scan(item, depth + 1);
++      return;
++    }
++    if (typeof value !== "object") return;
++    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
++      if (typeof item === "string" && PATH_KEYS.has(key)) push(item);
++      else if (key === "command" && typeof item === "string") {
++        for (const candidate of pathsFromCommand(item)) push(candidate);
++      } else scan(item, depth + 1);
++    }
++  };
++
++  scan(input);
++  return [...out];
++}
+diff --git a/apps/swarmagents/lib/codebase/types.ts b/apps/swarmagents/lib/codebase/types.ts
+new file mode 100644
+index 000000000..bb5a385b7
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/types.ts
+@@ -0,0 +1,183 @@
++/**
++ * Types for the codebase map.
++ *
++ * A "codebase map" is built for one repository inside a user's VM workspace
++ * and answers two questions:
++ *
++ *   1. What is this codebase?  -> the context pack (a compact, token-bounded
++ *      summary of languages, entry points, commands, modules and key files).
++ *   2. Where is the heat?       -> the heatmap (per-file churn x size x
++ *      fan-in x the files this account's agent touched before).
++ *
++ * The scan is produced by a small program that runs *inside the user's VM*
++ * (lib/codebase/vm-analyzer-source.ts). Everything that decides ranking,
++ * budgeting or wording happens here on the server, so the same rules apply to
++ * every repo and can be unit tested without a VM.
++ */
++
++/** One file as seen by the scanner: repo-relative, posix paths. */
++export interface CodebaseScannedFile {
++  path: string;
++  bytes: number;
++  lines?: number;
++  language?: string;
++  /** Exported symbol names (empty when the file exports nothing). */
++  exports?: string[];
++  /** Raw import specifiers as written in the file. */
++  imports?: string[];
++  /** The first few hundred characters of the file, used to describe it. */
++  head?: string;
++}
++
++/** The `package.json` facts the pack reports (scripts + tool deps). */
++export interface CodebasePackageJson {
++  name?: string;
++  scripts?: Record<string, string>;
++  dependencies?: Record<string, string>;
++  devDependencies?: Record<string, string>;
++  packageManager?: string;
++}
++
++/** Raw scanner output for one repository. */
++export interface CodebaseScan {
++  /** Absolute path of the repository root (inside the VM). */
++  repoRoot: string;
++  repoName: string;
++  repoHash: string;
++  generatedAt: string;
++  /** HEAD commit of the repository, when it is a git checkout. */
++  gitHead?: string;
++  files: CodebaseScannedFile[];
++  /** path -> lines added+deleted in the last 90 days. */
++  churn: Record<string, number>;
++  packageJson?: CodebasePackageJson;
++  /** Every package.json found in the repository (monorepos have many). */
++  packageFiles?: Array<CodebasePackageJson & { path: string }>;
++  /** Lock files seen in the repository (they say which package manager to use). */
++  lockFiles?: string[];
++  /** True when the scanner hit a file or byte cap and stopped early. */
++  truncated?: boolean;
++}
++
++export interface CodebaseFileInfo {
++  path: string; // repo-relative, posix
++  bytes: number;
++  lines?: number;
++  language?: string;
++  purpose?: string;
++  exports?: string[];
++  fanIn: number;
++  churn90d: number;
++  agentTouches: number;
++  heat: number;
++  lastModifiedMs?: number;
++}
++
++export interface CodebaseModuleInfo {
++  path: string; // top-level dir or file
++  kind: "dir" | "file";
++  purpose: string;
++  files: number;
++  bytes: number;
++}
++
++export interface CodebaseConventions {
++  testFramework?: string;
++  lint?: string;
++  format?: string;
++  packageManager?: string;
++  notes?: string[];
++}
++
++export interface CodebaseContextPack {
++  repoRoot: string;
++  repoName: string;
++  repoHash: string;
++  generatedAt: string;
++  gitHead?: string;
++  languages: Record<string, number>;
++  entryPoints: string[];
++  buildCommands: string[];
++  testCommands: string[];
++  topLevelModules: CodebaseModuleInfo[];
++  keyFiles: Array<{
++    path: string;
++    purpose?: string;
++    exports?: string[];
++    fanIn: number;
++  }>;
++  conventions: CodebaseConventions;
++  tokenEstimate: number;
++  text: string;
++}
++
++export interface CodebaseHeatmapEntry {
++  path: string;
++  churn90d: number;
++  bytes: number;
++  fanIn: number;
++  agentTouches: number;
++  heat: number;
++}
++
++export interface CodebaseMap {
++  version: 1;
++  repoRoot: string;
++  repoName: string;
++  repoHash: string;
++  generatedAt: string;
++  gitHead?: string;
++  buildMs: number;
++  files: CodebaseFileInfo[];
++  topLevelModules: CodebaseModuleInfo[];
++  languages: Record<string, number>;
++  entryPoints: string[];
++  buildCommands: string[];
++  testCommands: string[];
++  conventions: CodebaseConventions;
++  contextPack: CodebaseContextPack;
++  heatmap: CodebaseHeatmapEntry[];
++}
++
++/** One repository the account can pick from its VM workspace. */
++export interface CodebaseRepoOption {
++  /** Workspace-relative path ("" is the workspace root itself). */
++  repo: string;
++  /** Absolute path inside the VM. */
++  repoRoot: string;
++  name: string;
++}
++
++/**
++ * The port the map builder uses to reach a repository. Implemented by the
++ * VM scanner (runs the analyzer inside the user's VM) and by the local
++ * scanner (runs the same analyzer with the host's node).
++ */
++export interface CodebaseScanner {
++  /** Scan one repository. Returns null when the path is not a directory. */
++  scan(
++    userId: string,
++    repoRoot: string,
++    options?: { sinceHead?: string },
++  ): Promise<CodebaseScan | null>;
++  /** Current HEAD of the repository, or undefined when it is not a checkout. */
++  head(userId: string, repoRoot: string): Promise<string | undefined>;
++  /** Persist the finished map inside the VM (map.json + context-pack.md). */
++  publish(userId: string, repoRoot: string, map: CodebaseMap): Promise<void>;
++  /** Read back a map that was published before (no rebuild). */
++  readMap(userId: string, repoRoot: string): Promise<CodebaseMap | null>;
++  /** Repositories available in the workspace (git checkouts). */
++  listRepos(userId: string): Promise<CodebaseRepoOption[]>;
++  /** The repository the account picked (null when it never picked one). */
++  selectedRepo(userId: string): Promise<string | null>;
++  /** Remember which repository the account picked. */
++  selectRepo(userId: string, repoRoot: string): Promise<void>;
++}
++
++export interface BuildCodebaseMapOptions {
++  repoRoot: string;
++  tokenBudget?: number;
++  nowMs?: number;
++  /** path -> how many times this account's agent touched the file. */
++  agentTouchesByPath?: Record<string, number>;
++}
+diff --git a/apps/swarmagents/lib/codebase/vm-analyzer-source.ts b/apps/swarmagents/lib/codebase/vm-analyzer-source.ts
+new file mode 100644
+index 000000000..c853e2dee
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/vm-analyzer-source.ts
+@@ -0,0 +1,388 @@
++/**
++ * The codebase scanner that runs *inside the user's VM*.
++ *
++ * The repository lives in the VM, not on the app server, so the scan has to
++ * happen there. This module generates the program that does it: a small,
++ * dependency-free Node script that walks the repository, reads the files it
++ * needs, asks git for the churn of the last 90 days and prints one JSON
++ * document (a `CodebaseScan`) on stdout.
++ *
++ * Every rule it applies comes from lib/codebase/rules.ts, so the VM and the
++ * server can never drift apart on what counts as source, an import or an
++ * export. The server then does all the ranking, budgeting and wording.
++ */
++
++import {
++  DYNAMIC_IMPORT_RE,
++  EXPORT_PATTERNS,
++  EXT_LANG,
++  GO_EXPORT_RE,
++  IGNORE_DIRS,
++  IGNORE_FILES,
++  MAX_IMPORTS_PER_FILE,
++  MAX_PARSED_FILE_BYTES,
++  MAX_SCANNED_FILES,
++  PYTHON_EXPORT_RE,
++  PYTHON_IMPORT_RE,
++  REQUIRE_RE,
++  RUST_EXPORT_RE,
++  SOURCE_EXTS,
++  STATIC_IMPORT_RE,
++} from "./rules";
++
++/** Where the analyzer is written inside the user's VM. */
++export const CODEBASE_ANALYZER_PATH = "/workspace/.swarm/codebase-analyzer.mjs";
++
++function regexLiteral(re: RegExp): string {
++  return `new RegExp(${JSON.stringify(re.source)}, ${JSON.stringify(re.flags)})`;
++}
++
++/** The scanner program, written verbatim into the VM. */
++export function codebaseAnalyzerSource(): string {
++  const lines: string[] = [
++    "#!/usr/bin/env node",
++    "// SwarmAgents codebase scanner (auto-generated). Runs inside the user's VM.",
++    "import fs from 'node:fs';",
++    "import path from 'node:path';",
++    "import crypto from 'node:crypto';",
++    "import { execFileSync } from 'node:child_process';",
++    "",
++    `const EXT_LANG = ${JSON.stringify(EXT_LANG)};`,
++    `const IGNORE_DIRS = new Set(${JSON.stringify(IGNORE_DIRS)});`,
++    `const LOCK_FILES = new Set(['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb', 'bun.lock', 'Cargo.lock', 'poetry.lock', 'composer.lock']);`,
++    `const IGNORE_FILES = new Set(${JSON.stringify(IGNORE_FILES)});`,
++    `const SOURCE_EXTS = new Set(${JSON.stringify(SOURCE_EXTS)});`,
++    `const JS_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs']);`,
++    `const MAX_PARSED_FILE_BYTES = ${MAX_PARSED_FILE_BYTES};`,
++    `const MAX_SCANNED_FILES = ${MAX_SCANNED_FILES};`,
++    `const MAX_IMPORTS_PER_FILE = ${MAX_IMPORTS_PER_FILE};`,
++    `const STATIC_IMPORT_RE = new RegExp(${regexLiteral(STATIC_IMPORT_RE)});`,
++    `const REQUIRE_RE = new RegExp(${regexLiteral(REQUIRE_RE)});`,
++    `const DYNAMIC_IMPORT_RE = new RegExp(${regexLiteral(DYNAMIC_IMPORT_RE)});`,
++    `const PYTHON_IMPORT_RE = new RegExp(${regexLiteral(PYTHON_IMPORT_RE)});`,
++    `const PYTHON_EXPORT_RE = new RegExp(${regexLiteral(PYTHON_EXPORT_RE)});`,
++    `const GO_EXPORT_RE = new RegExp(${regexLiteral(GO_EXPORT_RE)});`,
++    `const RUST_EXPORT_RE = new RegExp(${regexLiteral(RUST_EXPORT_RE)});`,
++    `const EXPORT_PATTERNS = ${JSON.stringify(EXPORT_PATTERNS.map((p) => ({ re: { source: p.re.source, flags: p.re.flags }, kind: p.kind })))};`,    "",
++    "function repoHash(root) {",
++    "  return crypto.createHash('sha1').update(path.resolve(root)).digest('hex').slice(0, 16);",
++    "}",
++    "",
++    "function walk(root) {",
++    "  const files = [];",
++    "  const lockFiles = [];",
++    "  let truncated = false;",
++    "  const stack = [''];",
++    "  while (stack.length) {",
++    "    const rel = stack.pop();",
++    "    let entries;",
++    "    try {",
++    "      entries = fs.readdirSync(path.join(root, rel), { withFileTypes: true });",
++    "    } catch (err) {",
++    "      continue;",
++    "    }",
++    "    for (const entry of entries) {",
++    "      const childRel = rel ? rel + '/' + entry.name : entry.name;",
++    "      if (entry.isDirectory()) {",
++    "        if (IGNORE_DIRS.has(entry.name)) continue;",
++    "        if (entry.name.startsWith('.')) continue;",
++    "        stack.push(childRel);",
++    "        continue;",
++    "      }",
++    "      if (!entry.isFile()) continue;",
++    "      if (LOCK_FILES.has(entry.name)) { lockFiles.push(entry.name); continue; }",
++    "      if (IGNORE_FILES.has(entry.name)) continue;",
++    "      if (entry.name.startsWith('.') && entry.name !== '.env.example') continue;",
++    "      files.push(childRel);",
++    "      if (files.length >= MAX_SCANNED_FILES) { truncated = true; stack.length = 0; break; }",
++    "    }",
++    "  }",
++    "  files.sort();",
++    "  return { files, lockFiles, truncated };",
++    "}",
++    "",
++    "function countLines(text) {",
++    "  if (!text) return 0;",
++    "  let n = 1;",
++    "  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) n++;",
++    "  return n;",
++    "}",
++    "",
++    "function looksBinary(text) {",
++    "  const limit = Math.min(text.length, 8000);",
++    "  for (let i = 0; i < limit; i++) if (text.charCodeAt(i) === 0) return true;",
++    "  return false;",
++    "}",
++    "",
++    "function addName(names, value) {",
++    "  if (!value) return;",
++    "  const name = String(value).trim();",
++    "  if (!name || name === 'default' || name.length > 80) return;",
++    "  names.add(name);",
++    "}",
++    "",
++    "function extractExports(content, ext) {",
++    "  const names = new Set();",
++    "  if (JS_EXTS.has(ext)) {",
++    "    for (const pattern of EXPORT_PATTERNS) {",
++    "      const re = new RegExp(pattern.re.source, pattern.re.flags);",
++    "      let match;",
++    "      while ((match = re.exec(content)) !== null) {",
++    "        if (pattern.kind === 'list') {",
++    "          for (const part of match[1].split(',')) {",
++    "            const bits = part.trim().split(/\\s+as\\s+/i);",
++    "            addName(names, bits[bits.length - 1]);",
++    "          }",
++    "        } else {",
++    "          addName(names, match[1]);",
++    "        }",
++    "      }",
++    "    }",
++    "  } else if (ext === '.py') {",
++    "    const re = new RegExp(PYTHON_EXPORT_RE.source, PYTHON_EXPORT_RE.flags);",
++    "    let match;",
++    "    while ((match = re.exec(content)) !== null) addName(names, match[1]);",
++    "  } else if (ext === '.go') {",
++    "    const re = new RegExp(GO_EXPORT_RE.source, GO_EXPORT_RE.flags);",
++    "    let match;",
++    "    while ((match = re.exec(content)) !== null) addName(names, match[1]);",
++    "  } else if (ext === '.rs') {",
++    "    const re = new RegExp(RUST_EXPORT_RE.source, RUST_EXPORT_RE.flags);",
++    "    let match;",
++    "    while ((match = re.exec(content)) !== null) addName(names, match[1]);",
++    "  }",
++    "  return Array.from(names).slice(0, 20);",
++    "}",
++    "",
++    "function collectImports(content, ext) {",
++    "  const specs = [];",
++    "  if (JS_EXTS.has(ext)) {",
++    "    for (const match of content.matchAll(STATIC_IMPORT_RE)) specs.push(match[1]);",
++    "    for (const match of content.matchAll(REQUIRE_RE)) specs.push(match[1]);",
++    "    for (const match of content.matchAll(DYNAMIC_IMPORT_RE)) specs.push(match[1]);",
++    "  } else if (ext === '.py') {",
++    "    for (const match of content.matchAll(PYTHON_IMPORT_RE)) {",
++    "      const spec = match[1] || match[2];",
++    "      if (spec && spec.startsWith('.')) specs.push(spec);",
++    "    }",
++    "  }",
++    "  const unique = [];",
++    "  const seen = new Set();",
++    "  for (const spec of specs) {",
++    "    if (!spec || seen.has(spec)) continue;",
++    "    seen.add(spec);",
++    "    unique.push(spec);",
++    "    if (unique.length >= MAX_IMPORTS_PER_FILE) break;",
++    "  }",
++    "  return unique;",
++    "}",
++    "",
++    "function languageFor(rel) {",
++    "  const ext = path.extname(rel).slice(1).toLowerCase();",
++    "  if (EXT_LANG[ext]) return EXT_LANG[ext];",
++    "  const base = path.basename(rel).toLowerCase();",
++    "  if (base === 'dockerfile') return 'Dockerfile';",
++    "  if (base === 'makefile') return 'Makefile';",
++    "  return undefined;",
++    "}",
++    "",
++    "function readHead(root) {",
++    "  try {",
++    "    const out = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], {",
++    "      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],",
++    "    }).trim();",
++    "    return out || undefined;",
++    "  } catch (err) {",
++    "    return undefined;",
++    "  }",
++    "}",
++    "",
++    "function readChurn(root, sinceHead, churnPath) {",
++    "  const churn = {};",
++    "  let range = ['--since=90.days'];",
++    "  // A rebuild after a commit only has to diff the commits that were added",
++    "  // since the last build: the rest of the churn is already on disk.",
++    "  if (sinceHead && churnPath) {",
++    "    let stored = null;",
++    "    try { stored = JSON.parse(fs.readFileSync(churnPath, 'utf8')); } catch (err) { stored = null; }",
++    "    if (stored && stored.churn && typeof stored.churn === 'object') {",
++    "      for (const key of Object.keys(stored.churn)) churn[key] = stored.churn[key];",
++    "      range = [sinceHead + '..HEAD'];",
++    "    }",
++    "  }",
++    "  let out;",
++    "  try {",
++    "    out = execFileSync('git', ['-C', root, 'log', '--relative', '--no-ext-diff', '--no-textconv', '--numstat', '--pretty=format:--'].concat(range), {",
++    "      encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],",
++    "    });",
++    "  } catch (err) {",
++    "    // An unusable range (the old commit is gone): fall back to the window.",
++    "    if (range.length === 1) return churn;",
++    "    range = ['--since=90.days'];",
++    "    churn = {};",
++    "    try {",
++    "      out = execFileSync('git', ['-C', root, 'log', '--relative', '--no-ext-diff', '--no-textconv', '--numstat', '--pretty=format:--'].concat(range), {",
++    "        encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],",
++    "      });",
++    "    } catch (err2) {",
++    "      return churn;",
++    "    }",
++    "  }",
++    "  for (const line of out.split('\\n')) {",
++    "    if (!line || line.startsWith('--')) continue;",
++    "    const parts = line.split('\\t');",
++    "    if (parts.length < 3) continue;",
++    "    const added = parts[0] === '-' ? 0 : (parseInt(parts[0], 10) || 0);",
++    "    const removed = parts[1] === '-' ? 0 : (parseInt(parts[1], 10) || 0);",
++    "    const file = parts.slice(2).join('\\t').trim();",
++    "    if (!file) continue;",
++    "    churn[file] = (churn[file] || 0) + added + removed;",
++    "  }",
++    "  return churn;",
++    "}",
++    "",
++    "function readPackageJson(root) {",
++    "  try {",
++    "    const raw = fs.readFileSync(path.join(root, 'package.json'), 'utf8');",
++    "    const pkg = JSON.parse(raw);",
++    "    const out = {};",
++    "    if (typeof pkg.name === 'string') out.name = pkg.name;",
++    "    if (pkg.scripts && typeof pkg.scripts === 'object') out.scripts = pkg.scripts;",
++    "    if (pkg.dependencies && typeof pkg.dependencies === 'object') out.dependencies = pkg.dependencies;",
++    "    if (pkg.devDependencies && typeof pkg.devDependencies === 'object') out.devDependencies = pkg.devDependencies;",
++    "    if (typeof pkg.packageManager === 'string') out.packageManager = pkg.packageManager;",
++    "    return out;",
++    "  } catch (err) {",
++    "    return undefined;",
++    "  }",
++    "}",
++    "",
++    "function summarizePackage(rel, raw) {",
++    "  const out = { path: rel };",
++    "  try {",
++    "    const pkg = JSON.parse(raw);",
++    "    if (typeof pkg.name === 'string') out.name = pkg.name;",
++    "    if (pkg.scripts && typeof pkg.scripts === 'object') out.scripts = pkg.scripts;",
++    "    if (pkg.dependencies && typeof pkg.dependencies === 'object') out.dependencies = pkg.dependencies;",
++    "    if (pkg.devDependencies && typeof pkg.devDependencies === 'object') out.devDependencies = pkg.devDependencies;",
++    "    if (typeof pkg.packageManager === 'string') out.packageManager = pkg.packageManager;",
++    "  } catch (err) {",
++    "    return undefined;",
++    "  }",
++    "  return out;",
++    "}",
++    "",
++    "function listRepos(workspace) {",
++    "  const repos = [];",
++    "  let entries;",
++    "  try {",
++    "    entries = fs.readdirSync(workspace, { withFileTypes: true });",
++    "  } catch (err) {",
++    "    return repos;",
++    "  }",
++    "  for (const entry of entries) {",
++    "    if (!entry.isDirectory()) continue;",
++    "    if (entry.name.startsWith('.')) continue;",
++    "    const repoRoot = path.join(workspace, entry.name);",
++    "    let isRepo = false;",
++    "    try { isRepo = fs.existsSync(path.join(repoRoot, '.git')); } catch (err) { isRepo = false; }",
++    "    if (!isRepo) continue;",
++    "    repos.push({ repo: entry.name, repoRoot: repoRoot, name: entry.name });",
++    "  }",
++    "  let workspaceIsRepo = false;",
++    "  try { workspaceIsRepo = fs.existsSync(path.join(workspace, '.git')); } catch (err) { workspaceIsRepo = false; }",
++    "  if (workspaceIsRepo) repos.unshift({ repo: '', repoRoot: workspace, name: path.basename(workspace) });",
++    "  return repos;",
++    "}",
++    "",
++    "function scan(root, sinceHead, churnPath) {",
++    "  const absRoot = path.resolve(root);",
++    "  const walked = walk(absRoot);",
++    "  const files = [];",
++    "  const packageFiles = [];",
++    "  const lockFiles = walked.lockFiles;",
++    "  for (const rel of walked.files) {",
++    "    const abs = path.join(absRoot, rel);",
++    "    let stat;",
++    "    try { stat = fs.statSync(abs); } catch (err) { continue; }",
++    "    const ext = path.extname(rel).toLowerCase();",
++    "    const record = { path: rel, bytes: stat.size, mtimeMs: Math.round(stat.mtimeMs) };",
++    "    const language = languageFor(rel);",
++    "    if (language) record.language = language;",
++    "    const baseName = path.basename(rel);",
++    "    if (LOCK_FILES.has(baseName)) lockFiles.push(baseName);",
++    "    if (path.basename(rel) === 'package.json' && packageFiles.length < 25) {",
++    "      let raw;",
++    "      try { raw = fs.readFileSync(abs, 'utf8'); } catch (err) { raw = null; }",
++    "      if (raw != null) {",
++    "        const summary = summarizePackage(rel, raw);",
++    "        if (summary) packageFiles.push(summary);",
++    "      }",
++    "    }",
++    "    if (SOURCE_EXTS.has(ext) && stat.size <= MAX_PARSED_FILE_BYTES) {",
++    "      let content;",
++    "      try { content = fs.readFileSync(abs, 'utf8'); } catch (err) { content = null; }",
++    "      if (content != null && !looksBinary(content)) {",
++    "        record.lines = countLines(content);",
++    "        record.head = content.slice(0, 300);",
++    "        const exports = extractExports(content, ext);",
++    "        if (exports.length) record.exports = exports;",
++    "        const imports = collectImports(content, ext);",
++    "        if (imports.length) record.imports = imports;",
++    "      }",
++    "    }",
++    "    files.push(record);",
++    "  }",
++    "  const head = readHead(absRoot);",
++    "  const churn = readChurn(absRoot, sinceHead, churnPath);",
++    "  return {",
++    "    repoRoot: absRoot,",
++    "    repoName: path.basename(absRoot) || absRoot,",
++    "    repoHash: repoHash(absRoot),",
++    "    generatedAt: new Date().toISOString(),",
++    "    gitHead: head,",
++    "    files,",
++    "    churn,",
++    "    packageJson: readPackageJson(absRoot),",
++    "    packageFiles,",
++    "    lockFiles,",
++    "    truncated: walked.truncated,",
++    "  };",
++    "}",
++    "",
++    "const args = process.argv.slice(2);",
++    "if (args[0] === '--list-repos') {",
++    "  const workspace = path.resolve(args[1] || '/workspace');",
++    "  process.stdout.write(JSON.stringify({ ok: true, repos: listRepos(workspace) }));",
++    "  process.exit(0);",
++    "}",
++    "",
++    "const target = path.resolve(args[0] || '/workspace');",
++    "const sinceHead = args[1] && args[1] !== '-' ? args[1] : undefined;",
++    "let stat;",
++    "try { stat = fs.statSync(target); } catch (err) { stat = null; }",
++    "if (!stat || !stat.isDirectory()) {",
++    "  process.stdout.write(JSON.stringify({ ok: false, error: 'not_a_directory', repoRoot: target }));",
++    "  process.exit(2);",
++    "}",
++    "",
++    "// The scan is written next to the finished map so the server can read it",
++    "// back without pushing megabytes through the exec output quota.",
++    "const home = process.env.HOME || '/home/node';",
++    "const dir = path.join(home, '.swarm', 'codebase', repoHash(target));",
++    "const scanPath = path.join(dir, 'scan.json');",
++    "const churnPath = path.join(dir, 'churn.json');",
++    "const result = scan(target, sinceHead, churnPath);",
++    "try {",
++    "  fs.mkdirSync(dir, { recursive: true });",
++    "  fs.writeFileSync(scanPath, JSON.stringify(result));",
++    "  fs.writeFileSync(churnPath, JSON.stringify({ head: result.gitHead, churn: result.churn }));",
++    "} catch (err) {",
++    "  process.stdout.write(JSON.stringify({ ok: false, error: 'write_failed', repoRoot: target }));",
++    "  process.exit(3);",
++    "}",
++    "process.stdout.write(JSON.stringify({ ok: true, scanPath: scanPath, files: result.files.length }));",
++    "",
++  ];
++  return lines.join("\n");
++}
+diff --git a/apps/swarmagents/lib/codebase/vm-scanner.ts b/apps/swarmagents/lib/codebase/vm-scanner.ts
+new file mode 100644
+index 000000000..568666f7d
+--- /dev/null
++++ b/apps/swarmagents/lib/codebase/vm-scanner.ts
+@@ -0,0 +1,173 @@
++/**
++ * The codebase scanner that talks to a user's VM.
++ *
++ * The scanner program (lib/codebase/vm-analyzer-source.ts) is written into
++ * the VM and run there: the repository lives in the VM, so that is the only
++ * place where it can be read. The program leaves its result in
++ * `~/.swarm/codebase/<repoHash>/scan.json`; the app reads that file back and
++ * publishes the finished map next to it.
++ */
++
++import { WORKSPACE_ROOT } from "../vm/files";
++import type { VmManager } from "../vm/manager";
++import { repoHashForRoot } from "./hash";
++import type {
++  CodebaseMap,
++  CodebaseRepoOption,
++  CodebaseScan,
++  CodebaseScanner,
++} from "./types";
++import { CODEBASE_ANALYZER_PATH, codebaseAnalyzerSource } from "./vm-analyzer-source";
++
++/** How long one scan may take inside the VM. */
++const SCAN_TIMEOUT_MS = 120_000;
++
++/** Cached HOME per account (resolved once per VM). */
++const homeCache = new Map<string, string>();
++
++/** The HOME directory inside the user's VM. */
++export async function vmHomeDir(vm: VmManager, userId: string): Promise<string> {
++  const cached = homeCache.get(userId);
++  if (cached) return cached;
++  let out = "";
++  await vm
++    .exec(userId, ["sh", "-c", "echo $HOME"], { onStdout: (chunk) => { out += chunk; } })
++    .catch(() => undefined);
++  const home = out.trim() || "/home/node";
++  homeCache.set(userId, home);
++  return home;
++}
++
++/** Forget the cached HOME (the VM was reset or recreated). */
++export function forgetVmHome(userId: string): void {
++  homeCache.delete(userId);
++}
++
++/** Where a repository's map lives inside the VM. */
++export function vmMapDir(home: string, repoHash: string): string {
++  return `${home}/.swarm/codebase/${repoHash}`;
++}
++
++/** Where the account's choice of repository is remembered inside the VM. */
++export function vmSelectionPath(home: string): string {
++  return `${home}/.swarm/codebase/selection.json`;
++}
++
++/** A scanner that reads and writes inside one user's VM. */
++export function createVmScanner(vm: VmManager): CodebaseScanner {
++  async function runNode(userId: string, args: string[]): Promise<string> {
++    let stdout = "";
++    await vm
++      .exec(userId, ["node", CODEBASE_ANALYZER_PATH, ...args], {
++        timeoutMs: SCAN_TIMEOUT_MS,
++        onStdout: (chunk) => { stdout += chunk; },
++      })
++      .catch(() => undefined);
++    return stdout;
++  }
++
++  return {
++    async scan(
++      userId: string,
++      repoRoot: string,
++      options?: { sinceHead?: string },
++    ): Promise<CodebaseScan | null> {
++      try {
++        await vm.writeFile(userId, CODEBASE_ANALYZER_PATH, codebaseAnalyzerSource());
++      } catch {
++        return null;
++      }
++      const stdout = await runNode(userId, [
++        repoRoot,
++        options?.sinceHead ? options.sinceHead : "-",
++      ]);
++      if (!stdout.trim()) return null;
++      let parsed: { ok?: boolean; scanPath?: string; error?: string };
++      try {
++        parsed = JSON.parse(stdout) as { ok?: boolean; scanPath?: string; error?: string };
++      } catch {
++        return null;
++      }
++      if (!parsed.ok || !parsed.scanPath) return null;
++      try {
++        const raw = await vm.readFile(userId, parsed.scanPath);
++        const scan = JSON.parse(raw) as CodebaseScan;
++        if (!scan || !Array.isArray(scan.files)) return null;
++        return scan;
++      } catch {
++        return null;
++      }
++    },
++
++    async head(userId: string, repoRoot: string): Promise<string | undefined> {
++      let stdout = "";
++      try {
++        await vm.exec(userId, ["git", "-C", repoRoot, "rev-parse", "HEAD"], {
++          timeoutMs: 20_000,
++          onStdout: (chunk) => { stdout += chunk; },
++        });
++      } catch {
++        return undefined;
++      }
++      const head = stdout.trim();
++      return head || undefined;
++    },
++
++    async publish(userId: string, repoRoot: string, map: CodebaseMap): Promise<void> {
++      const home = await vmHomeDir(vm, userId);
++      const dir = vmMapDir(home, map.repoHash || repoHashForRoot(repoRoot));
++      await vm.writeFile(userId, `${dir}/map.json`, `${JSON.stringify(map, null, 2)}\n`).catch(() => undefined);
++      await vm
++        .writeFile(userId, `${dir}/context-pack.md`, map.contextPack.text)
++        .catch(() => undefined);
++    },
++
++    async listRepos(userId: string): Promise<CodebaseRepoOption[]> {
++      try {
++        await vm.writeFile(userId, CODEBASE_ANALYZER_PATH, codebaseAnalyzerSource());
++      } catch {
++        return [];
++      }
++      const stdout = await runNode(userId, ["--list-repos", WORKSPACE_ROOT]);
++      if (!stdout.trim()) return [];
++      try {
++        const parsed = JSON.parse(stdout) as { ok?: boolean; repos?: CodebaseRepoOption[] };
++        if (!parsed.ok || !Array.isArray(parsed.repos)) return [];
++        return parsed.repos;
++      } catch {
++        return [];
++      }
++    },
++
++    async readMap(userId: string, repoRoot: string): Promise<CodebaseMap | null> {
++      const home = await vmHomeDir(vm, userId);
++      const file = `${vmMapDir(home, repoHashForRoot(repoRoot))}/map.json`;
++      try {
++        const raw = await vm.readFile(userId, file);
++        const map = JSON.parse(raw) as CodebaseMap;
++        return map?.contextPack?.text ? map : null;
++      } catch {
++        return null;
++      }
++    },
++
++    async selectedRepo(userId: string): Promise<string | null> {
++      const home = await vmHomeDir(vm, userId);
++      try {
++        const raw = await vm.readFile(userId, vmSelectionPath(home));
++        const parsed = JSON.parse(raw) as { repoRoot?: unknown };
++        const repoRoot = typeof parsed.repoRoot === "string" ? parsed.repoRoot : "";
++        return repoRoot || null;
++      } catch {
++        return null;
++      }
++    },
++
++    async selectRepo(userId: string, repoRoot: string): Promise<void> {
++      const home = await vmHomeDir(vm, userId);
++      await vm
++        .writeFile(userId, vmSelectionPath(home), `${JSON.stringify({ repoRoot }, null, 2)}\n`)
++        .catch(() => undefined);
++    },
++  };
++}
+diff --git a/apps/swarmagents/lib/harness/codebase-mcp-source.ts b/apps/swarmagents/lib/harness/codebase-mcp-source.ts
+new file mode 100644
+index 000000000..690541e0a
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/codebase-mcp-source.ts
+@@ -0,0 +1,211 @@
++/**
++ * The codebase MCP server.
++ *
++ * The server is written into the user's VM next to the role-switch server and
++ * exposed to the agent as the `codebase` MCP server. It exposes two tools:
++ *
++ *   - codebase_map_get()      — the context pack: languages, entry points,
++ *     commands, module layout and the files everything else depends on.
++ *   - codebase_hotspots(n)    — the hottest files (churn x size x fan-in x
++ *     the files the agent touched before).
++ *
++ * It reads the map the app published in the VM
++ * (`~/.swarm/codebase/<repoHash>/map.json`), so the agent and the UI always
++ * talk about the same map.
++ */
++
++/** Name of the stdio MCP server exposing the codebase tools. */
++export const CODEBASE_MCP_SERVER_NAME = "codebase";
++
++/** Path (inside the VM) the server is written to. */
++export const CODEBASE_MCP_SERVER_PATH = "/workspace/.swarm/codebase-server.mjs";
++
++/** The tool the agent calls to read the map. */
++export const CODEBASE_MAP_TOOL = "codebase_map_get";
++
++/** The tool the agent calls to list the hottest files. */
++export const CODEBASE_HOTSPOTS_TOOL = "codebase_hotspots";
++
++/** The server program, written verbatim into the VM. */
++export function codebaseMcpServerSource(): string {
++  return [
++    "#!/usr/bin/env node",
++    "// SwarmAgents codebase MCP stdio server (auto-generated).",
++    "// Speaks newline-delimited JSON-RPC 2.0 over stdin/stdout.",
++    "import fs from 'node:fs';",
++    "import path from 'node:path';",
++    "import crypto from 'node:crypto';",
++    "",
++    "function repoHash(root) {",
++    "  return crypto.createHash('sha1').update(path.resolve(root)).digest('hex').slice(0, 16);",
++    "}",
++    "",
++    "function readJson(file) {",
++    "  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) { return null; }",
++    "}",
++    "",
++    "function mapDir(hash) {",
++    "  const home = process.env.HOME || '/root';",
++    "  return path.join(home, '.swarm', 'codebase', hash);",
++    "}",
++    "",
++    "function loadMap(repoRoot) {",
++    "  const hash = repoHash(repoRoot);",
++    "  const direct = readJson(path.join(mapDir(hash), 'map.json'));",
++    "  if (direct) return direct;",
++    "  // The workspace may hold several repositories: fall back to the newest",
++    "  // map that mentions this repository root.",
++    "  try {",
++    "    const base = path.join(process.env.HOME || '/root', '.swarm', 'codebase');",
++    "    const dirs = fs.readdirSync(base, { withFileTypes: true });",
++    "    const maps = [];",
++    "    for (const dir of dirs) {",
++    "      if (!dir.isDirectory()) continue;",
++    "      const map = readJson(path.join(base, dir.name, 'map.json'));",
++    "      if (map) maps.push(map);",
++    "    }",
++    "    const exact = maps.find((map) => map.repoRoot === repoRoot);",
++    "    if (exact) return exact;",
++    "    maps.sort((a, b) => String(b.generatedAt || '').localeCompare(String(a.generatedAt || '')));",
++    "    return maps[0] || null;",
++    "  } catch (err) {",
++    "    return null;",
++    "  }",
++    "}",
++    "",
++    "const tools = [",
++    "  {",
++    "    name: 'codebase_map_get',",
++    "    description: 'Get the codebase map for the active repository: languages, entry points, build and test commands, top-level modules, key files by import fan-in and the conventions used (test framework, lint, formatting). Use it to orient yourself before editing.',",
++    "    inputSchema: {",
++    "      type: 'object',",
++    "      properties: {",
++    "        repoRoot: { type: 'string', description: 'Optional repository root inside the workspace.' }",
++    "      }",
++    "    }",
++    "  },",
++    "  {",
++    "    name: 'codebase_hotspots',",
++    "    description: 'Get the hottest files of the active repository, ranked by churn (last 90 days) x size x import fan-in x the files this agent touched before. Use it to decide where a change is risky.',",
++    "    inputSchema: {",
++    "      type: 'object',",
++    "      properties: {",
++    "        n: { type: 'number', description: 'How many hotspots to return (default 20, max 200).' },",
++    "        repoRoot: { type: 'string', description: 'Optional repository root inside the workspace.' }",
++    "      }",
++    "    }",
++    "  }",
++    "];",
++    "",
++    "function reply(id, result) {",
++    "  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: id, result: result }) + '\\n');",
++    "}",
++    "",
++    "function replyError(id, code, message) {",
++    "  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: id, error: { code: code, message: message } }) + '\\n');",
++    "}",
++    "",
++    "function toolResult(payload, isError) {",
++    "  return {",
++    "    content: [{ type: 'text', text: JSON.stringify(payload) }],",
++    "    isError: isError === true",
++    "  };",
++    "}",
++    "",
++    "function callTool(name, args) {",
++    "  const repoRoot = (typeof args.repoRoot === 'string' && args.repoRoot.trim())",
++    "    ? args.repoRoot.trim()",
++    "    : (process.env.SWARM_CODEBASE_REPO_ROOT || '/workspace');",
++    "  const map = loadMap(repoRoot);",
++    "  if (!map) {",
++    "    return toolResult({",
++    "      ok: false,",
++    "      error: 'codebase map not found',",
++    "      repoRoot: repoRoot,",
++    "      hint: 'The map is built when a repository is picked in the Codebase tab.'",
++    "    }, true);",
++    "  }",
++    "  if (name === 'codebase_map_get') {",
++    "    const pack = map.contextPack || {};",
++    "    return toolResult({",
++    "      ok: true,",
++    "      repoRoot: map.repoRoot,",
++    "      repoName: map.repoName,",
++    "      repoHash: map.repoHash,",
++    "      generatedAt: map.generatedAt,",
++    "      gitHead: map.gitHead,",
++    "      buildMs: map.buildMs,",
++    "      tokenEstimate: pack.tokenEstimate,",
++    "      languages: map.languages,",
++    "      entryPoints: map.entryPoints,",
++    "      buildCommands: map.buildCommands,",
++    "      testCommands: map.testCommands,",
++    "      conventions: map.conventions,",
++    "      topLevelModules: map.topLevelModules,",
++    "      keyFiles: (pack.keyFiles || []).slice(0, 40),",
++    "      contextPack: pack.text",
++    "    }, false);",
++    "  }",
++    "  if (name === 'codebase_hotspots') {",
++    "    const raw = Number(args.n);",
++    "    const n = Math.max(1, Math.min(200, Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 20));",
++    "    const hotspots = Array.isArray(map.heatmap) ? map.heatmap.slice(0, n) : [];",
++    "    return toolResult({",
++    "      ok: true,",
++    "      repoRoot: map.repoRoot,",
++    "      repoHash: map.repoHash,",
++    "      n: n,",
++    "      hotspots: hotspots",
++    "    }, false);",
++    "  }",
++    "  return toolResult({ ok: false, error: 'unknown tool: ' + name }, true);",
++    "}",
++    "",
++    "function handleMessage(msg) {",
++    "  if (!msg || typeof msg !== 'object') return;",
++    "  const hasId = msg.id !== undefined && msg.id !== null;",
++    "  const method = typeof msg.method === 'string' ? msg.method : '';",
++    "  if (method === 'initialize') {",
++    "    if (hasId) reply(msg.id, {",
++    "      protocolVersion: (msg.params && msg.params.protocolVersion) || '2024-11-05',",
++    "      capabilities: { tools: {} },",
++    "      serverInfo: { name: 'swarm-codebase', version: '1.0.0' }",
++    "    });",
++    "    return;",
++    "  }",
++    "  if (method === 'ping') {",
++    "    if (hasId) reply(msg.id, {});",
++    "    return;",
++    "  }",
++    "  if (method === 'tools/list') {",
++    "    if (hasId) reply(msg.id, { tools: tools });",
++    "    return;",
++    "  }",
++    "  if (method === 'tools/call') {",
++    "    const params = msg.params && typeof msg.params === 'object' ? msg.params : {};",
++    "    const name = typeof params.name === 'string' ? params.name : '';",
++    "    const args = params.arguments && typeof params.arguments === 'object' ? params.arguments : {};",
++    "    if (hasId) reply(msg.id, callTool(name, args));",
++    "    return;",
++    "  }",
++    "  if (method === 'notifications/initialized' || method === 'notifications/cancelled') return;",
++    "  if (hasId) replyError(msg.id, -32601, 'Method not found: ' + method);",
++    "}",
++    "",
++    "process.stdin.setEncoding('utf8');",
++    "let buffer = '';",
++    "process.stdin.on('data', (chunk) => {",
++    "  buffer += chunk;",
++    "  let newline;",
++    "  while ((newline = buffer.indexOf('\\n')) !== -1) {",
++    "    const line = buffer.slice(0, newline).trim();",
++    "    buffer = buffer.slice(newline + 1);",
++    "    if (!line) continue;",
++    "    let msg;",
++    "    try { msg = JSON.parse(line); } catch (err) { continue; }",
++    "    handleMessage(msg);",
++    "  }",
++    "});",
++    "",
++  ].join("\n");
++}
+diff --git a/apps/swarmagents/lib/harness/codebase-mcp.test.ts b/apps/swarmagents/lib/harness/codebase-mcp.test.ts
+new file mode 100644
+index 000000000..4f599c1cf
+--- /dev/null
++++ b/apps/swarmagents/lib/harness/codebase-mcp.test.ts
+@@ -0,0 +1,135 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { spawn } from "node:child_process";
++import crypto from "node:crypto";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { codebaseMcpServerSource } from "./codebase-mcp-source";
++
++interface Rpc {
++  jsonrpc: string;
++  id?: number;
++  result?: any;
++  error?: { code: number; message: string };
++}
++
++function repoHash(repoRoot: string): string {
++  return crypto.createHash("sha1").update(path.resolve(repoRoot)).digest("hex").slice(0, 16);
++}
++
++/** Run the MCP server against a fake map and answer the given requests. */
++async function ask(requests: unknown[], repoRoot: string): Promise<Rpc[]> {
++  const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-mcp-"));
++  const mapDir = path.join(home, ".swarm", "codebase", repoHash(repoRoot));
++  fs.mkdirSync(mapDir, { recursive: true });
++  fs.writeFileSync(
++    path.join(mapDir, "map.json"),
++    JSON.stringify({
++      version: 1,
++      repoRoot,
++      repoName: "demo",
++      repoHash: repoHash(repoRoot),
++      generatedAt: new Date(0).toISOString(),
++      gitHead: "head-1",
++      buildMs: 12,
++      files: [],
++      languages: { TypeScript: 3 },
++      entryPoints: ["src/index.ts"],
++      buildCommands: ["npm run build"],
++      testCommands: ["npm test"],
++      conventions: { testFramework: "node:test" },
++      topLevelModules: [{ path: "src", kind: "dir", purpose: "Source", files: 3, bytes: 100 }],
++      contextPack: {
++        repoRoot,
++        repoName: "demo",
++        repoHash: repoHash(repoRoot),
++        generatedAt: new Date(0).toISOString(),
++        languages: { TypeScript: 3 },
++        entryPoints: ["src/index.ts"],
++        buildCommands: ["npm run build"],
++        testCommands: ["npm test"],
++        topLevelModules: [],
++        keyFiles: [{ path: "src/index.ts", fanIn: 3 }],
++        conventions: {},
++        tokenEstimate: 42,
++        text: "# Codebase context: demo",
++      },
++      heatmap: [
++        { path: "src/index.ts", churn90d: 10, bytes: 100, fanIn: 3, agentTouches: 1, heat: 0.9 },
++        { path: "src/other.ts", churn90d: 1, bytes: 50, fanIn: 0, agentTouches: 0, heat: 0.2 },
++      ],
++    }),
++  );
++
++  const serverPath = path.join(home, "codebase-server.mjs");
++  fs.writeFileSync(serverPath, codebaseMcpServerSource(), "utf8");
++
++  const child = spawn("node", [serverPath], {
++    env: { ...process.env, HOME: home, SWARM_CODEBASE_REPO_ROOT: repoRoot },
++    stdio: ["pipe", "pipe", "pipe"],
++  });
++
++  const replies: Rpc[] = [];
++  let buffer = "";
++  child.stdout.on("data", (chunk) => {
++    buffer += String(chunk);
++    let index: number;
++    while ((index = buffer.indexOf("\n")) !== -1) {
++      const line = buffer.slice(0, index).trim();
++      buffer = buffer.slice(index + 1);
++      if (!line) continue;
++      try {
++        replies.push(JSON.parse(line) as Rpc);
++      } catch {
++        // ignore noise
++      }
++    }
++  });
++
++  for (const request of requests) {
++    child.stdin.write(`${JSON.stringify(request)}\n`);
++  }
++  await new Promise((resolve) => setTimeout(resolve, 400));
++  child.kill();
++  fs.rmSync(home, { recursive: true, force: true });
++  return replies;
++}
++
++test("the codebase MCP server lists its two tools", async () => {
++  const replies = await ask(
++    [
++      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
++      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
++    ],
++    "/workspace/demo",
++  );
++  const list = replies.find((reply) => reply.id === 2);
++  const names = (list?.result?.tools ?? []).map((tool: { name: string }) => tool.name);
++  assert.deepEqual(names, ["codebase_map_get", "codebase_hotspots"]);
++});
++
++test("codebase_map_get returns the context pack", async () => {
++  const replies = await ask(
++    [{ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "codebase_map_get", arguments: {} } }],
++    "/workspace/demo",
++  );
++  const reply = replies.find((item) => item.id === 7);
++  const payload = JSON.parse(reply?.result?.content?.[0]?.text ?? "{}");
++  assert.equal(payload.ok, true);
++  assert.equal(payload.repoName, "demo");
++  assert.match(payload.contextPack, /# Codebase context: demo/);
++  assert.deepEqual(payload.keyFiles, [{ path: "src/index.ts", fanIn: 3 }]);
++});
++
++test("codebase_hotspots returns the hottest files", async () => {
++  const replies = await ask(
++    [{ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "codebase_hotspots", arguments: { n: 1 } } }],
++    "/workspace/demo",
++  );
++  const reply = replies.find((item) => item.id === 8);
++  const payload = JSON.parse(reply?.result?.content?.[0]?.text ?? "{}");
++  assert.equal(payload.ok, true);
++  assert.equal(payload.hotspots.length, 1);
++  assert.equal(payload.hotspots[0].path, "src/index.ts");
++});
+diff --git a/apps/swarmagents/lib/harness/role-mcp.ts b/apps/swarmagents/lib/harness/role-mcp.ts
+index c23f55ad5..589af3821 100644
+--- a/apps/swarmagents/lib/harness/role-mcp.ts
++++ b/apps/swarmagents/lib/harness/role-mcp.ts
+@@ -32,6 +32,7 @@ import {
+ } from "../roles";
+ import type { RolePhase } from "./types";
+ import { SWARM_VM_DESKTOP_ENV } from "../vm/desktop";
++import { CODEBASE_MCP_SERVER_NAME, CODEBASE_MCP_SERVER_PATH, codebaseMcpServerSource } from "./codebase-mcp-source";
+ 
+ /** Name of the stdio MCP server exposing set_role/list_roles. */
+ export const ROLE_MCP_SERVER_NAME = "roles";
+@@ -110,6 +111,7 @@ export function roleAllowedTools(
+     out.add(ROLE_TOOL_PERMISSION[tool] ?? tool);
+   }
+   out.add(`mcp__${ROLE_MCP_SERVER_NAME}__*`);
++  out.add(`mcp__${CODEBASE_MCP_SERVER_NAME}__*`);
+   for (const server of role.mcpServers) {
+     if (server in ROLE_MCP_SERVER_REGISTRY) out.add(`mcp__${server}__*`);
+   }
+@@ -176,6 +178,7 @@ export function roleMcpConfigJson(
+     desktopMode?: boolean;
+     /** The catalog role definition backing this phase (custom roles need it). */
+     roleDef?: RoleDefinition;
++    codebaseRepoRoot?: string;
+   },
+ ): string {
+   const servers: Record<string, unknown> = {
+@@ -188,6 +191,14 @@ export function roleMcpConfigJson(
+         SWARM_ROLE_ALLOWED: [...opts.allowedRoleIds].join(","),
+       },
+     },
++    [CODEBASE_MCP_SERVER_NAME]: {
++      type: "stdio",
++      command: "node",
++      args: [CODEBASE_MCP_SERVER_PATH],
++      env: {
++        SWARM_CODEBASE_REPO_ROOT: opts.codebaseRepoRoot ?? "/workspace",
++      },
++    },
+   };
+   if (opts.desktopMode) {
+     const roleDef = opts.roleDef ?? roleDefinitionForId(role.roleId);
+@@ -227,13 +238,14 @@ export function roleSeedFiles(
+   catalog: readonly RoleDefinition[],
+   allowedRoleIds: ReadonlySet<string>,
+   initialPhase?: RolePhase,
+-  opts: { desktopMode?: boolean } = {},
++  opts: { desktopMode?: boolean; codebaseRepoRoot?: string } = {},
+ ): Array<{ path: string; content: string }> {
+   const phase = initialPhase ?? rolePhase(catalog[0] ?? BUILTIN_ROLES[0], opts);
+   const initialDef = phase.roleId ? catalog.find((role) => role.id === phase.roleId) : undefined;
+   return [
+     { path: ROLE_MCP_SERVER_PATH, content: ROLE_MCP_SERVER_SOURCE },
+     { path: ROLE_CATALOG_PATH, content: roleCatalogJson(catalog) },
++    { path: CODEBASE_MCP_SERVER_PATH, content: codebaseMcpServerSource() },
+     { path: ROLE_MCP_CONFIG_PATH, content: roleMcpConfigJson(phase, { allowedRoleIds, roleDef: initialDef, ...opts }) },
+   ];
+ }
+diff --git a/apps/swarmagents/lib/providers/settings.ts b/apps/swarmagents/lib/providers/settings.ts
+index 75fa37b5d..3119af0ed 100644
+--- a/apps/swarmagents/lib/providers/settings.ts
++++ b/apps/swarmagents/lib/providers/settings.ts
+@@ -21,6 +21,12 @@ export interface UserSettings {
+    * rank inside each group. Defaults to true.
+    */
+   preferFreeProviders: boolean;
++  /**
++   * Auto-prepend the codebase context pack to the system prompt of every run
++   * on the picked repository. Absent means on: the pack is injected unless
++   * the user turns it off.
++   */
++  injectCodebaseContext?: boolean;
+   /**
+    * Allow providers not marked free when no free one is usable. Absent =
+    * allowed (a provider the user saved is a provider they want used).
+@@ -40,6 +46,11 @@ function parseBudget(value: unknown): number | null | undefined {
+ 
+ export const DEFAULT_USER_SETTINGS: UserSettings = { preferFreeProviders: true };
+ 
++/** Is the codebase context pack injected into this account's runs? */
++export function codebaseContextInjectionEnabled(settings: UserSettings): boolean {
++  return settings.injectCodebaseContext !== false;
++}
++
+ /** One user's settings file path. */
+ export function userSettingsFilePath(userId: string, options: DataDirOptions = {}): string {
+   return path.join(userProviderDir(userId, options), USER_SETTINGS_FILE);
+@@ -58,6 +69,7 @@ export function parseUserSettings(raw: unknown): UserSettings {
+       typeof preferFreeProviders === "boolean" ? preferFreeProviders : DEFAULT_USER_SETTINGS.preferFreeProviders,
+   };
+   // Optional routing caps: only present when set to a valid value.
++  if (typeof raw.injectCodebaseContext === "boolean") out.injectCodebaseContext = raw.injectCodebaseContext;
+   if (typeof raw.allowPaidProviders === "boolean") out.allowPaidProviders = raw.allowPaidProviders;
+   const perRun = parseBudget(raw.perRunBudgetUsd);
+   if (perRun !== undefined) out.perRunBudgetUsd = perRun;
+diff --git a/apps/swarmagents/lib/runtime/manager.ts b/apps/swarmagents/lib/runtime/manager.ts
+index f86028b9b..a58f17bf4 100644
+--- a/apps/swarmagents/lib/runtime/manager.ts
++++ b/apps/swarmagents/lib/runtime/manager.ts
+@@ -69,6 +69,12 @@ import {
+   rolePhase,
+   roleSeedFiles,
+ } from "../harness/role-mcp";
++import { resolveCodebaseInjection, wrapCodebasePack } from "../codebase/inject";
++import { recordAgentTouches, selectedCodebaseRepo } from "../codebase/store";
++import { extractTouchedPaths } from "../codebase/touches";
++import { createVmScanner } from "../codebase/vm-scanner";
++import type { CodebaseScanner } from "../codebase/types";
++import { WORKSPACE_ROOT } from "../vm/files";
+ 
+ /**
+  * Only the variables Claude Code needs are forwarded into a user's VM. The server env also holds
+@@ -175,6 +181,8 @@ interface ActiveRun {
+   startedAt?: number;
+   /** Epoch ms of the last telemetry this run produced; heartbeat for the watchdog. */
+   lastActivityAt: number;
++  /** True once the codebase context pack was prepended to this run. */
++  codebaseContextInjected?: boolean;
+ }
+ 
+ /** A one-shot terminal command run (POST /api/runtime/vm/exec). */
+@@ -344,6 +352,8 @@ export class RuntimeManager {
+   private readonly vm: VmManager;
+   private readonly bus: TelemetryBus;
+   private readonly reporter: RunReporter;
++  /** Reads and builds codebase maps inside the user's own VM. */
++  private readonly codebaseScanner: CodebaseScanner;
+   private readonly runner = new ClaudeCodeRunner();
+   private readonly users = new Map<string, UserState>();
+   /**
+@@ -385,6 +395,7 @@ export class RuntimeManager {
+     this.vm = opts.vm ?? vmManager;
+     this.bus = opts.bus ?? telemetryBus;
+     this.reporter = opts.reporter ?? new RunReporter({ vm: this.vm, bus: this.bus });
++    this.codebaseScanner = createVmScanner(this.vm);
+     this.routerOverride = opts.router === undefined ? undefined : opts.router;
+     this.maxQueuedOverride = opts.maxQueued;
+     this.startGraceMs = opts.startGraceMs ?? DEFAULT_START_GRACE_MS;
+@@ -584,7 +595,10 @@ export class RuntimeManager {
+     allowedRoleIds: ReadonlySet<string>,
+     initialPhase: RolePhase,
+   ): Promise<void> {
+-    for (const file of roleSeedFiles(catalog, allowedRoleIds, initialPhase, { desktopMode: desktopModeEnabled() })) {
++    for (const file of roleSeedFiles(catalog, allowedRoleIds, initialPhase, {
++      desktopMode: desktopModeEnabled(),
++      codebaseRepoRoot: WORKSPACE_ROOT,
++    })) {
+       await this.vm.writeFile(userId, file.path, file.content);
+     }
+   }
+@@ -602,6 +616,7 @@ export class RuntimeManager {
+         allowedRoleIds,
+         roleDef: role,
+         desktopMode: desktopModeEnabled(),
++        codebaseRepoRoot: WORKSPACE_ROOT,
+       }),
+     );
+   }
+@@ -1190,6 +1205,10 @@ export class RuntimeManager {
+       return;
+     }
+ 
++    // The codebase context pack is prepended to the run's system prompt, once
++    // per run: the agent starts with a map of the repository it works in.
++    await this.maybeInjectCodebaseContext(active);
++
+     // Phase loop: each role switch continues the same conversation (--resume)
+     // with the new role's phase. The provider failover loop runs per phase.
+     for (let phaseIndex = 0; ; phaseIndex++) {
+@@ -1500,9 +1519,63 @@ export class RuntimeManager {
+         st.active.startedAt = Date.now();
+       }
+     }
++    if (event.type === "tool.call") {
++      // Remember which files the agent worked on: the heatmap weighs them.
++      const touched = extractTouchedPaths((event as { input?: unknown }).input);
++      if (touched.length > 0) {
++        void this.recordCodebaseTouches(userId, touched);
++      }
++    }
+     this.bus.publish(runId, event);
+   }
+ 
++  /**
++   * Note the files the agent touched in the heatmap of the repository the
++   * account picked. Never builds a map: an account that never picked a
++   * repository has no heatmap to update.
++   */
++  private async recordCodebaseTouches(userId: string, touchedPaths: string[]): Promise<void> {
++    try {
++      const repoRoot = await selectedCodebaseRepo(userId, this.codebaseScanner);
++      if (!repoRoot) return;
++      await recordAgentTouches(userId, this.codebaseScanner, repoRoot, touchedPaths);
++    } catch {
++      // best effort
++    }
++  }
++
++  /**
++   * Prepend the codebase context pack to the run's system prompt.
++   *
++   * The pack is injected once per run (the flag on the run makes a second
++   * call a no-op) and only when the account picked a repository and the pack
++   * fits inside the token budget. A failure here never blocks the run.
++   */
++  private async maybeInjectCodebaseContext(active: ActiveRun): Promise<void> {
++    if (active.codebaseContextInjected) return;
++    active.codebaseContextInjected = true;
++    try {
++      const result = await resolveCodebaseInjection(
++        active.userId,
++        this.codebaseScanner,
++        WORKSPACE_ROOT,
++      );
++      if (!result.injected || !result.text) return;
++      const wrapped = wrapCodebasePack(result.text, { repoHash: result.repoHash });
++      active.agentCard = active.agentCard ? `${wrapped}\n\n${active.agentCard}` : wrapped;
++      this.bus.publish(active.runId, {
++        type: "codebase.context.injected",
++        data: {
++          repoHash: result.repoHash,
++          repoRoot: result.repoRoot,
++          tokenEstimate: result.tokenEstimate,
++        },
++      });
++    } catch {
++      // Never block a run on the map.
++    }
++  }
++
+   private finalize(runId: string, patch: TerminalPatch): void {
+     // The run's LLM proxy token dies with the run.
+     revokeRunToken(runId);
+diff --git a/apps/swarmagents/minimalist-ui/src/components/CodebasePanel.tsx b/apps/swarmagents/minimalist-ui/src/components/CodebasePanel.tsx
+new file mode 100644
+index 000000000..73eb4c486
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/CodebasePanel.tsx
+@@ -0,0 +1,283 @@
++"use client";
++
++import React, { useCallback, useEffect, useMemo, useState } from "react";
++import { AlertTriangle, Boxes, FileCode2, FolderGit2, Loader2, RefreshCw } from "lucide-react";
++import {
++  fetchCodebaseMap,
++  fetchCodebaseRepos,
++  pickCodebaseRepo,
++  type CodebaseHotspot,
++  type CodebaseMapSummary,
++  type CodebaseRepo,
++} from "../../../lib/client/codebase";
++import { squarifiedTreemap } from "../utils/treemap";
++
++/** The logical size of the treemap (the SVG scales to the panel width). */
++const MAP_WIDTH = 320;
++const MAP_HEIGHT = 170;
++
++function formatBytes(bytes: number): string {
++  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
++  if (bytes < 1024) return `${bytes} B`;
++  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
++  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
++}
++
++/** The heat colour of one file (cold blue -> hot amber). */
++function heatColor(heat: number): string {
++  const value = Math.max(0, Math.min(1, heat));
++  const hue = 200 - value * 190;
++  return `hsl(${hue.toFixed(0)} 85% ${(28 + value * 26).toFixed(0)}% / ${(0.25 + value * 0.6).toFixed(2)})`;
++}
++
++export function CodebasePanel({ onOpenFile }: { onOpenFile?: (path: string) => void }) {
++  const [repo, setRepo] = useState("");
++  const [repos, setRepos] = useState<CodebaseRepo[]>([]);
++  const [selected, setSelected] = useState<string | null>(null);
++  const [map, setMap] = useState<CodebaseMapSummary | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [picking, setPicking] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [showPack, setShowPack] = useState(false);
++
++  const loadRepos = useCallback(async () => {
++    try {
++      const { repos: list, selected: picked } = await fetchCodebaseRepos();
++      setRepos(list);
++      setSelected(picked);
++      if (picked) setRepo(picked);
++    } catch {
++      setRepos([]);
++    }
++  }, []);
++
++  const loadMap = useCallback(async (target: string) => {
++    setLoading(true);
++    setError(null);
++    try {
++      const data = await fetchCodebaseMap(target, 60);
++      setMap(data.map ?? null);
++      if (!data.map) setError("No codebase map for this repository yet.");
++    } catch (err) {
++      setMap(null);
++      setError(err instanceof Error ? err.message : "Could not load the codebase map.");
++    } finally {
++      setLoading(false);
++    }
++  }, []);
++
++  useEffect(() => {
++    void loadRepos();
++  }, [loadRepos]);
++
++  useEffect(() => {
++    void loadMap(repo);
++  }, [repo, loadMap]);
++
++  /** Pick a repository: build its map and inject its pack into every run. */
++  const pick = useCallback(
++    async (target: string, force = false) => {
++      setPicking(true);
++      setError(null);
++      try {
++        const data = await pickCodebaseRepo(target, force);
++        setMap(data.map ?? null);
++        setSelected(target);
++        if (!data.map) setError("Could not build a map for this repository.");
++      } catch (err) {
++        setError(err instanceof Error ? err.message : "Could not build the codebase map.");
++      } finally {
++        setPicking(false);
++      }
++    },
++    [],
++  );
++
++  const hotspots: CodebaseHotspot[] = useMemo(() => map?.heatmap ?? [], [map]);
++  const rects = useMemo(
++    () =>
++      squarifiedTreemap(
++        hotspots.map((hotspot) => ({ path: hotspot.path, value: hotspot.heat })),
++        MAP_WIDTH,
++        MAP_HEIGHT,
++      ),
++    [hotspots],
++  );
++  const heatByPath = useMemo(
++    () => new Map(hotspots.map((hotspot) => [hotspot.path, hotspot])),
++    [hotspots],
++  );
++
++  const openFile = useCallback(
++    (path: string) => {
++      if (!map) return;
++      onOpenFile?.(`${map.repoRoot}/${path}`);
++    },
++    [map, onOpenFile],
++  );
++
++  return (
++    <div className="flex h-full min-h-0 flex-col gap-2.5" data-testid="codebase-tab">
++      <div className="flex items-start justify-between gap-2">
++        <div className="min-w-0">
++          <div className="flex items-center gap-1.5 text-[11px] font-semibold tracking-wide text-white/85">
++            <Boxes className="h-3.5 w-3.5 shrink-0 text-cyan-300/80" />
++            <span className="truncate">{map?.repoName ?? "Codebase"}</span>
++            {selected && map?.repoRoot === selected && (
++              <span className="shrink-0 rounded-full border border-cyan-400/25 bg-cyan-400/10 px-1.5 py-px text-[9px] font-medium text-cyan-200/80">
++                picked
++              </span>
++            )}
++          </div>
++          <div className="truncate text-[10px] text-white/35">
++            {map ? `${map.repoHash} · ${map.fileCount} files · pack ${map.tokenEstimate} tokens` : "no map yet"}
++          </div>
++        </div>
++        <button
++          type="button"
++          onClick={() => void pick(repo, true)}
++          disabled={picking}
++          className="flex shrink-0 items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-[10px] font-mono text-white/55 transition hover:bg-white/10 hover:text-white disabled:opacity-40"
++          title="Rebuild the codebase map and pick this repository"
++        >
++          {picking ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
++          <span>{picking ? "Building" : "Rebuild"}</span>
++        </button>
++      </div>
++
++      {repos.length > 0 && (
++        <label className="flex items-center gap-1.5 text-[10px] text-white/45">
++          <FolderGit2 className="h-3 w-3 shrink-0" />
++          <select
++            value={repo}
++            onChange={(event) => {
++              const next = event.target.value;
++              setRepo(next);
++              void pick(next);
++            }}
++            className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/40 px-1.5 py-1 font-mono text-[10px] text-white/75 outline-none focus:border-cyan-400/50"
++            aria-label="Repository"
++          >
++            {repos.map((option) => (
++              <option key={option.repo || "root"} value={option.repo}>
++                {option.name}
++              </option>
++            ))}
++          </select>
++        </label>
++      )}
++
++      {error && (
++        <div className="flex items-start gap-1.5 rounded-lg border border-amber-400/25 bg-amber-400/10 p-2 text-[10px] leading-relaxed text-amber-200/90">
++          <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
++          <span>{error}</span>
++        </div>
++      )}
++
++      {loading && !map && (
++        <div className="flex items-center gap-2 py-4 text-[11px] text-white/40">
++          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Building the codebase map…
++        </div>
++      )}
++
++      {map && (
++        <>
++          <div>
++            <div className="mb-1 text-[9px] uppercase tracking-widest text-white/30">Treemap · churn × size × fan-in</div>
++            <svg
++              viewBox={`0 0 ${MAP_WIDTH} ${MAP_HEIGHT}`}
++              className="w-full rounded-lg border border-white/10 bg-black/30"
++              style={{ aspectRatio: `${MAP_WIDTH} / ${MAP_HEIGHT}` }}
++              role="img"
++              aria-label="Codebase heatmap"
++              data-testid="codebase-treemap"
++            >
++              {rects.map((rect) => {
++                const hotspot = heatByPath.get(rect.path);
++                const heat = hotspot?.heat ?? 0;
++                return (
++                  <g key={rect.path}>
++                    <rect
++                      x={rect.x + 0.5}
++                      y={rect.y + 0.5}
++                      width={Math.max(1, rect.width - 1)}
++                      height={Math.max(1, rect.height - 1)}
++                      rx={2}
++                      fill={heatColor(heat)}
++                      stroke="rgba(0,0,0,0.45)"
++                      className="cursor-pointer transition hover:stroke-cyan-200/80"
++                      onClick={() => openFile(rect.path)}
++                    >
++                      <title>{`${rect.path}\nheat ${heat.toFixed(3)} · churn ${hotspot?.churn90d ?? 0} · fan-in ${hotspot?.fanIn ?? 0} · ${formatBytes(hotspot?.bytes ?? 0)}`}</title>
++                    </rect>
++                    {rect.width > 46 && rect.height > 18 && (
++                      <text
++                        x={rect.x + 4}
++                        y={rect.y + 12}
++                        fill="rgba(255,255,255,0.85)"
++                        fontSize="8"
++                        fontFamily="ui-monospace, monospace"
++                        pointerEvents="none"
++                      >
++                        {rect.path.split("/").slice(-1)[0].slice(0, 18)}
++                      </text>
++                    )}
++                  </g>
++                );
++              })}
++              {rects.length === 0 && (
++                <text x={MAP_WIDTH / 2} y={MAP_HEIGHT / 2} fill="rgba(255,255,255,0.35)" fontSize="10" textAnchor="middle">
++                  No hotspots yet
++                </text>
++              )}
++            </svg>
++          </div>
++
++          <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-white/10 bg-white/[0.03]">
++            <button
++              type="button"
++              onClick={() => setShowPack((value) => !value)}
++              className="flex w-full items-center justify-between px-2 py-1.5 text-[9px] uppercase tracking-widest text-white/35 transition hover:text-white/60"
++              aria-expanded={showPack}
++            >
++              <span>Context pack</span>
++              <span className="font-mono normal-case tracking-normal">{map.tokenEstimate} tokens</span>
++            </button>
++            {showPack && (
++              <pre
++                data-testid="codebase-context-pack"
++                className="max-h-[240px] overflow-auto whitespace-pre-wrap break-words border-t border-white/10 px-2 py-1.5 font-mono text-[9px] leading-relaxed text-white/60"
++              >
++                {map.contextPack?.text ?? ""}
++              </pre>
++            )}
++          </div>
++
++          <div className="max-h-[150px] overflow-auto rounded-lg border border-white/10 bg-black/20">
++            <div className="sticky top-0 bg-black/40 px-2 py-1 text-[9px] uppercase tracking-widest text-white/30">
++              Hotspots
++            </div>
++            {hotspots.slice(0, 12).map((hotspot) => (
++              <button
++                key={hotspot.path}
++                type="button"
++                onClick={() => openFile(hotspot.path)}
++                className="flex w-full items-center gap-1.5 px-2 py-1 text-left transition hover:bg-white/[0.06]"
++                title={`${hotspot.path}\nheat ${hotspot.heat.toFixed(3)} · churn ${hotspot.churn90d} · fan-in ${hotspot.fanIn}`}
++              >
++                <FileCode2 className="h-3 w-3 shrink-0 text-white/30" />
++                <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-white/65">{hotspot.path}</span>
++                <span className="shrink-0 font-mono text-[9px] text-white/30">
++                  {hotspot.fanIn}↑ · {hotspot.churn90d}~
++                </span>
++              </button>
++            ))}
++            {hotspots.length === 0 && (
++              <div className="px-2 py-2 text-[10px] text-white/30">No hotspots yet.</div>
++            )}
++          </div>
++        </>
++      )}
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index 8d1318894..a706683c1 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -52,6 +52,11 @@ interface ComputerScreenProps {
+    * Undefined/true keeps the desktop tab (optimistic default).
+    */
+   desktopMode?: boolean;
++  /**
++   * A workspace file to open in the Files tab (the Codebase drawer opens a
++   * file of the map here).
++   */
++  filesOpenPath?: string;
+ }
+ 
+ const CHAR_LIMIT = 4000;
+@@ -279,6 +284,20 @@ function StreamRow({ item }: { item: RunStreamItem }) {
+       const reason = typeof d.reason === "string" && d.reason !== "" ? ` · ${d.reason}` : "";
+       return <SystemLine text={`role switched · ${fromName} → ${toName}${reason}`} tone="muted" />;
+     }
++    case "codebase.context.injected": {
++      const d = payload as { repoHash?: string; tokenEstimate?: number };
++      const tokens = typeof d.tokenEstimate === "number" ? d.tokenEstimate : undefined;
++      return (
++        <SystemLine
++          text={`codebase context injected · ${tokens !== undefined ? `${tokens} tokens` : "pack ready"}`}
++          tone="muted"
++        />
++      );
++    }
++    case "codebase.context.skipped": {
++      const d = payload as { reason?: string };
++      return <SystemLine text={`codebase context skipped · ${d.reason ?? "unknown"}`} tone="muted" />;
++    }
+     default: {
+       // Unknown event types render as a bare kind label. Never dump the raw
+       // payload: lifecycle events carry internal identifiers (userId) that
+@@ -331,6 +350,7 @@ export function ComputerScreen({
+   onStopRun,
+   polledVmStatus,
+   desktopMode = true,
++  filesOpenPath,
+ }: ComputerScreenProps) {
+   const stream = useRunStream(runId);
+   const liveRun = Boolean(runId);
+@@ -737,7 +757,9 @@ export function ComputerScreen({
+           <BrowserView runId={liveRun ? runId : undefined} />
+         )}
+ 
+-        {selectedView === "files" && <FilesView refreshToken={filesRefreshToken} />}
++        {selectedView === "files" && (
++          <FilesView refreshToken={filesRefreshToken} openPath={filesOpenPath} />
++        )}
+       </div>
+     </div>
+   );
+diff --git a/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx b/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx
+index 90408ca95..ed52e6e90 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/FilesView.tsx
+@@ -38,6 +38,12 @@ interface FilesViewProps {
+    * the listing and open preview re-read the workspace after the agent writes.
+    */
+   refreshToken?: number;
++  /**
++   * A workspace path to open (absolute, inside the workspace). The file is
++   * selected and its folder is shown — used by the Codebase tab, which opens
++   * a file of the map in the file browser.
++   */
++  openPath?: string;
+ }
+ 
+ type FileKind = "code" | "image" | "text" | "binary";
+@@ -164,7 +170,7 @@ function buildCrumbs(path: string): Crumb[] {
+   return crumbs;
+ }
+ 
+-export function FilesView({ refreshToken = 0 }: FilesViewProps) {
++export function FilesView({ refreshToken = 0, openPath }: FilesViewProps) {
+   const [path, setPath] = useState(WORKSPACE_ROOT);
+   const [listing, setListing] = useState<WorkspaceListing>();
+   const [loading, setLoading] = useState(true);
+@@ -177,6 +183,16 @@ export function FilesView({ refreshToken = 0 }: FilesViewProps) {
+   const [fileError, setFileError] = useState<string>();
+   const [copied, setCopied] = useState(false);
+ 
++  // A file picked elsewhere (the Codebase treemap) opens here: show its
++  // folder and select it.
++  useEffect(() => {
++    if (!openPath) return;
++    if (!openPath.startsWith(`${WORKSPACE_ROOT}/`)) return;
++    const dir = parentWorkspacePath(openPath);
++    if (dir) setPath(dir);
++    setSelected(openPath);
++  }, [openPath]);
++
+   // Directory listing (also reloads when a run finishes or the user refreshes).
+   useEffect(() => {
+     const ctrl = new AbortController();
+diff --git a/apps/swarmagents/minimalist-ui/src/components/Settings.tsx b/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
+index 63a58de29..da898bbbf 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/Settings.tsx
+@@ -489,6 +489,7 @@ function Providers({
+ }) {
+   const [expanded, setExpanded] = useState<string | null>(null);
+   const [preferFree, setPreferFree] = useState<boolean | null>(null);
++  const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean | null>(null);
+   const [serverRows, setServerRows] = useState<ServerProviderRow[] | null>(null);
+   const [settingsError, setSettingsError] = useState<string | null>(null);
+ 
+@@ -501,8 +502,9 @@ function Providers({
+       try {
+         const settingsRes = await fetch('/api/providers/settings', { headers: { Accept: 'application/json' } });
+         if (settingsRes.ok && !cancelled) {
+-          const body = (await settingsRes.json()) as { preferFreeProviders?: unknown };
++          const body = (await settingsRes.json()) as { preferFreeProviders?: unknown; injectCodebaseContext?: unknown };
+           if (typeof body.preferFreeProviders === 'boolean') setPreferFree(body.preferFreeProviders);
++          if (typeof body.injectCodebaseContext === 'boolean') setInjectCodebaseContext(body.injectCodebaseContext);
+         }
+       } catch {
+         // offline / unsigned — leave the toggle hidden
+@@ -540,6 +542,24 @@ function Providers({
+     }
+   };
+ 
++  const setInjectCodebaseContextRemote = async (v: boolean) => {
++    setSettingsError(null);
++    try {
++      const res = await fetch('/api/providers/settings', {
++        method: 'PUT',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({ injectCodebaseContext: v }),
++      });
++      if (!res.ok) {
++        setSettingsError('Could not save codebase context setting.');
++        return;
++      }
++      setInjectCodebaseContext(v);
++    } catch {
++      setSettingsError('Could not save codebase context setting.');
++    }
++  };
++
+   const patchServerBilling = async (id: string, patch: BillingPatch, row?: ServerProviderRow) => {
+     setSettingsError(null);
+     let body: Record<string, unknown>;
+@@ -596,7 +616,7 @@ function Providers({
+     <div className="space-y-6">
+       {preferFree !== null && (
+         <section>
+-          <div className="rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
++          <div className="space-y-2 rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
+             <div className="flex items-center justify-between gap-3">
+               <div>
+                 <div className="text-xs text-white/85">Prefer free providers</div>
+@@ -606,6 +626,17 @@ function Providers({
+               </div>
+               <Toggle on={preferFree} onChange={(v) => void setPreferFreeRemote(v)} accent={accent} />
+             </div>
++            {injectCodebaseContext !== null && (
++              <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
++                <div>
++                  <div className="text-xs text-white/85">Inject codebase context</div>
++                  <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
++                    Auto-prepend the repo codebase map/context pack to each run (token budget enforced).
++                  </div>
++                </div>
++                <Toggle on={injectCodebaseContext} onChange={(v) => void setInjectCodebaseContextRemote(v)} accent={accent} />
++              </div>
++            )}
+             {settingsError && <div className="mt-2 text-[10px] text-red-300/80">{settingsError}</div>}
+           </div>
+         </section>
+diff --git a/apps/swarmagents/minimalist-ui/src/utils/treemap.test.ts b/apps/swarmagents/minimalist-ui/src/utils/treemap.test.ts
+new file mode 100644
+index 000000000..8a63a4ccb
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/utils/treemap.test.ts
+@@ -0,0 +1,81 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { squarifiedTreemap } from "./treemap";
++
++test("squarifiedTreemap lays every entry out inside the box", () => {
++  const rects = squarifiedTreemap(
++    [
++      { path: "a.ts", value: 40 },
++      { path: "b.ts", value: 30 },
++      { path: "c.ts", value: 20 },
++      { path: "d.ts", value: 10 },
++    ],
++    400,
++    200,
++  );
++  assert.equal(rects.length, 4);
++  for (const rect of rects) {
++    assert.ok(rect.x >= -1e-6, `${rect.path} x`);
++    assert.ok(rect.y >= -1e-6, `${rect.path} y`);
++    assert.ok(rect.x + rect.width <= 400 + 1e-6, `${rect.path} right`);
++    assert.ok(rect.y + rect.height <= 200 + 1e-6, `${rect.path} bottom`);
++    assert.ok(rect.width > 0 && rect.height > 0, `${rect.path} size`);
++  }
++});
++
++test("squarifiedTreemap keeps the rectangles inside each other (no overlap)", () => {
++  const rects = squarifiedTreemap(
++    [
++      { path: "a.ts", value: 9 },
++      { path: "b.ts", value: 5 },
++      { path: "c.ts", value: 4 },
++      { path: "d.ts", value: 2 },
++      { path: "e.ts", value: 1 },
++    ],
++    300,
++    300,
++  );
++  const area = rects.reduce((sum, rect) => sum + rect.width * rect.height, 0);
++  assert.ok(Math.abs(area - 300 * 300) < 1e-3, `area ${area}`);
++
++  for (let i = 0; i < rects.length; i++) {
++    for (let j = i + 1; j < rects.length; j++) {
++      const a = rects[i];
++      const b = rects[j];
++      const overlapX = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
++      const overlapY = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
++      const overlap = Math.max(0, overlapX) * Math.max(0, overlapY);
++      assert.ok(overlap < 1e-3, `${a.path} overlaps ${b.path} by ${overlap}`);
++    }
++  }
++});
++
++test("squarifiedTreemap drops entries without a value", () => {
++  const rects = squarifiedTreemap(
++    [
++      { path: "a.ts", value: 1 },
++      { path: "b.ts", value: 0 },
++      { path: "c.ts", value: Number.NaN },
++    ],
++    100,
++    100,
++  );
++  assert.deepEqual(rects.map((rect) => rect.path), ["a.ts"]);
++});
++
++test("squarifiedTreemap handles a portrait box", () => {
++  const rects = squarifiedTreemap(
++    [
++      { path: "a.ts", value: 3 },
++      { path: "b.ts", value: 2 },
++      { path: "c.ts", value: 1 },
++    ],
++    120,
++    400,
++  );
++  assert.equal(rects.length, 3);
++  for (const rect of rects) {
++    assert.ok(rect.x + rect.width <= 120 + 1e-6);
++    assert.ok(rect.y + rect.height <= 400 + 1e-6);
++  }
++});
+diff --git a/apps/swarmagents/minimalist-ui/src/utils/treemap.ts b/apps/swarmagents/minimalist-ui/src/utils/treemap.ts
+new file mode 100644
+index 000000000..428c76aa3
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/utils/treemap.ts
+@@ -0,0 +1,120 @@
++/**
++ * A squarified treemap.
++ *
++ * The codebase heatmap draws one rectangle per file, sized by its heat. A
++ * squarified treemap (Bruls, Huizing & van Wijk) keeps the rectangles close
++ * to square, so the map stays readable instead of turning into a few long
++ * slivers.
++ */
++
++export interface TreemapEntry {
++  path: string;
++  value: number;
++}
++
++export interface TreemapRect {
++  path: string;
++  x: number;
++  y: number;
++  width: number;
++  height: number;
++}
++
++interface Cell {
++  path: string;
++  area: number;
++}
++
++/** The worst aspect ratio of a row laid out along a side of `side` units. */
++function worstRatio(cells: Cell[], side: number): number {
++  let sum = 0;
++  let max = 0;
++  let min = Infinity;
++  for (const cell of cells) {
++    sum += cell.area;
++    if (cell.area > max) max = cell.area;
++    if (cell.area < min) min = cell.area;
++  }
++  if (sum <= 0 || min <= 0 || side <= 0) return Infinity;
++  const sumSq = sum * sum;
++  const sideSq = side * side;
++  return Math.max((sideSq * max) / sumSq, sumSq / (sideSq * min));
++}
++
++/** Lay the cells out in the given box (any orientation). */
++function layout(cells: Cell[], x: number, y: number, w: number, h: number, out: TreemapRect[]): void {
++  if (cells.length === 0 || w <= 0 || h <= 0) return;
++  if (cells.length === 1) {
++    out.push({ path: cells[0].path, x, y, width: w, height: h });
++    return;
++  }
++
++  // The row is a strip along the long side of the box; its thickness is the
++  // row area divided by that side.
++  const horizontal = w >= h;
++  const long = horizontal ? w : h;
++
++  // Grow a row while it keeps improving the aspect ratio.
++  const row: Cell[] = [];
++  let index = 0;
++  while (index < cells.length) {
++    const candidate = row.concat([cells[index]]);
++    if (row.length === 0 || worstRatio(candidate, long) <= worstRatio(row, long)) {
++      row.push(cells[index]);
++      index += 1;
++    } else break;
++  }
++
++  const rowArea = row.reduce((sum, cell) => sum + cell.area, 0);
++  const rowThickness = rowArea / long;
++  if (!Number.isFinite(rowThickness) || rowThickness <= 0) {
++    // Degenerate row (zero area): give every cell an equal slice.
++    const share = long / row.length;
++    row.forEach((cell, i) => {
++      if (horizontal) out.push({ path: cell.path, x: x + i * share, y, width: share, height: h });
++      else out.push({ path: cell.path, x, y: y + i * share, width: w, height: share });
++    });
++    layout(cells.slice(index), x, y, w, h, out);
++    return;
++  }
++
++  let offset = 0;
++  for (const cell of row) {
++    const cellLength = cell.area / rowThickness;
++    if (horizontal) {
++      out.push({ path: cell.path, x: x + offset, y, width: cellLength, height: rowThickness });
++    } else {
++      out.push({ path: cell.path, x, y: y + offset, width: rowThickness, height: cellLength });
++    }
++    offset += cellLength;
++  }
++  if (horizontal) layout(cells.slice(index), x, y + rowThickness, w, h - rowThickness, out);
++  else layout(cells.slice(index), x + rowThickness, y, w - rowThickness, h, out);
++}
++
++/**
++ * Lay the entries out as a treemap. Entries without a positive value are
++ * dropped; the rest are sized by their share of the total.
++ */
++export function squarifiedTreemap(
++  entries: TreemapEntry[],
++  width: number,
++  height: number,
++): TreemapRect[] {
++  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return [];
++  const usable = entries
++    .filter((entry) => Number.isFinite(entry.value) && entry.value > 0)
++    .sort((a, b) => b.value - a.value || a.path.localeCompare(b.path));
++  if (usable.length === 0) return [];
++  const total = usable.reduce((sum, entry) => sum + entry.value, 0);
++  if (total <= 0) return [];
++
++  const cells: Cell[] = usable.map((entry) => ({
++    path: entry.path,
++    area: (entry.value / total) * width * height,
++  }));
++
++  const out: TreemapRect[] = [];
++  layout(cells, 0, 0, width, height, out);
++  return out;
++}
+-- 
+2.55.0
+

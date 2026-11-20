@@ -1,0 +1,610 @@
+From e1b0abb1d064bc05121dede918acc9cf0b32ca77 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 12:02:17 -0600
+Subject: [PATCH] feat(ui): error handling, toasts, empty states (t14r)
+
+- ErrorBoundary wraps the app with a recoverable fallback (reload / try again)
+- Toast system (pure lib/ui/toasts reducer + ToastsProvider) surfaces provider and
+  network failures as dismissible, auto-expiring toasts; engine.runAgents emits
+  onError for the call layer to surface
+- InputBar gains a "starting" phase: inputs disabled and a spinner while a local
+  run is starting (guarded so server-streamed runs keep the Stop control)
+- Terminal (ComputerScreen) and telemetry panels show friendly empty states when
+  there are no events
+- Unit tests: 11 checks covering the toast reducer and describeFailure mapping
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/lib/ui/toasts.test.ts        |  83 ++++++++++++++
+ apps/swarmagents/lib/ui/toasts.ts             |  43 ++++++++
+ apps/swarmagents/minimalist-ui/src/App.tsx    |  27 ++++-
+ .../src/components/ComputerScreen.tsx         |  37 +++++--
+ .../src/components/ErrorBoundary.tsx          |  59 ++++++++++
+ .../minimalist-ui/src/components/InputBar.tsx |  25 +++--
+ .../minimalist-ui/src/components/Toasts.tsx   | 103 ++++++++++++++++++
+ apps/swarmagents/minimalist-ui/src/engine.ts  |   5 +-
+ apps/swarmagents/minimalist-ui/src/main.tsx   |   8 +-
+ 9 files changed, 370 insertions(+), 20 deletions(-)
+ create mode 100644 apps/swarmagents/lib/ui/toasts.test.ts
+ create mode 100644 apps/swarmagents/lib/ui/toasts.ts
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.tsx
+ create mode 100644 apps/swarmagents/minimalist-ui/src/components/Toasts.tsx
+
+diff --git a/apps/swarmagents/lib/ui/toasts.test.ts b/apps/swarmagents/lib/ui/toasts.test.ts
+new file mode 100644
+index 000000000..04577604a
+--- /dev/null
++++ b/apps/swarmagents/lib/ui/toasts.test.ts
+@@ -0,0 +1,83 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { describeFailure, toastReducer } from "./toasts.js";
++
++const t = (id: string, over: Partial<Parameters<typeof toastReducer>[0][number]> = {}) => ({
++  id,
++  tone: "error" as const,
++  message: "provider failed",
++  ...over,
++});
++
++test("add appends to an empty list", () => {
++  const next = toastReducer([], { type: "add", toast: t("1") });
++  assert.equal(next.length, 1);
++  assert.equal(next[0].id, "1");
++});
++
++test("add is immutable: returns a new array and leaves the old untouched", () => {
++  const before = [t("1")];
++  const next = toastReducer(before, { type: "add", toast: t("2") });
++  assert.notEqual(next, before);
++  assert.equal(before.length, 1);
++  assert.equal(next.length, 2);
++});
++
++test("dismiss removes the matching toast", () => {
++  const before = [t("1"), t("2"), t("3")];
++  const next = toastReducer(before, { type: "dismiss", id: "2" });
++  assert.deepEqual(
++    next.map((x) => x.id),
++    ["1", "3"]
++  );
++});
++
++test("dismiss with an unknown id leaves the list unchanged", () => {
++  const before = [t("1")];
++  const next = toastReducer(before, { type: "dismiss", id: "nope" });
++  assert.equal(next.length, 1);
++  assert.equal(next[0].id, "1");
++});
++
++test("dismiss is immutable: does not mutate the original list", () => {
++  const before = [t("1"), t("2")];
++  toastReducer(before, { type: "dismiss", id: "1" });
++  assert.equal(before.length, 2);
++});
++
++test("add then dismiss round-trips to empty", () => {
++  let state = toastReducer([], { type: "add", toast: t("a") });
++  state = toastReducer(state, { type: "add", toast: t("b") });
++  state = toastReducer(state, { type: "dismiss", id: "a" });
++  state = toastReducer(state, { type: "dismiss", id: "b" });
++  assert.equal(state.length, 0);
++});
++
++test("dismiss removes every toast with the matching id", () => {
++  const before = [t("x"), t("x")];
++  const next = toastReducer(before, { type: "dismiss", id: "x" });
++  assert.equal(next.length, 0);
++});
++
++test("describeFailure maps a fetch network error to a friendly label", () => {
++  const f = describeFailure(new Error("Failed to fetch"));
++  assert.equal(f.message, "Network error");
++  assert.equal(f.detail, "Could not reach the provider. Check your connection or API key.");
++});
++
++test("describeFailure maps a provider error to its message", () => {
++  const f = describeFailure(new Error("401 Unauthorized"));
++  assert.equal(f.message, "Provider error");
++  assert.equal(f.detail, "401 Unauthorized");
++});
++
++test("describeFailure maps an abort to 'Run stopped'", () => {
++  const f = describeFailure(new DOMException("aborted", "AbortError"));
++  assert.equal(f.message, "Run stopped");
++});
++
++test("describeFailure falls back for unknown thrown values", () => {
++  const f = describeFailure(undefined);
++  assert.equal(f.message, "Provider error");
++  assert.equal(f.detail, "unknown error");
++});
+diff --git a/apps/swarmagents/lib/ui/toasts.ts b/apps/swarmagents/lib/ui/toasts.ts
+new file mode 100644
+index 000000000..1a65128ab
+--- /dev/null
++++ b/apps/swarmagents/lib/ui/toasts.ts
+@@ -0,0 +1,43 @@
++// t14r — toast model + reducer.
++//
++// Pure, dependency-free state logic for the dismissible toast UI. Kept outside the
++// React components so it is unit-testable under lib/**/*.test.ts and importable by
++// both the minimalist-ui app and any future surface.
++
++export type ToastTone = "info" | "error" | "success";
++
++export interface Toast {
++  id: string;
++  tone: ToastTone;
++  message: string;
++  /** Optional second line (e.g. provider name, detail). */
++  detail?: string;
++  /** TTL in ms; omit for a persistent toast (only manual dismiss). */
++  ttlMs?: number;
++}
++
++export type ToastAction =
++  | { type: "add"; toast: Toast }
++  | { type: "dismiss"; id: string };
++
++/** Immutable reducer over the visible toast list. */
++export function toastReducer(state: readonly Toast[], action: ToastAction): Toast[] {
++  switch (action.type) {
++    case "add":
++      return [...state, action.toast];
++    case "dismiss":
++      return state.filter((toast) => toast.id !== action.id);
++  }
++}
++
++/** Friendly label for a provider/network failure before it hits the toast. */
++export function describeFailure(err: unknown): { message: string; detail?: string } {
++  if (err instanceof Error && err.name === "AbortError") {
++    return { message: "Run stopped", detail: "The request was cancelled." };
++  }
++  const msg = err instanceof Error ? err.message : String(err ?? "unknown error");
++  if (!msg || msg === "Failed to fetch") {
++    return { message: "Network error", detail: "Could not reach the provider. Check your connection or API key." };
++  }
++  return { message: "Provider error", detail: msg };
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index ae8e9c3ab..44d631e48 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -19,6 +19,8 @@ import { PromptAndWhyModal } from './components/PromptAndWhyModal';
+ import { ComputerScreen } from './components/ComputerScreen';
+ import { SwarmIntro } from './components/SwarmIntro';
+ import { LandingHero } from './components/LandingHero';
++import { useToasts } from './components/Toasts';
++import { describeFailure } from '../../lib/ui/toasts';
+ 
+ export default function App() {
+   const [providers, setProviders] = usePersisted<ProviderConfig[]>('ac.providers', []);
+@@ -42,6 +44,7 @@ export default function App() {
+   const [promptAtts, setPromptAtts] = useState<Attachment[]>([]);
+   const [runId, setRunId] = useState<string>();
+   const ctrlRef = useRef<AbortController | null>(null);
++  const { push: pushToast } = useToasts();
+ 
+   // Derive the 1 active agent role
+   const activeRolePreset = ROLES.find((r) => r.id === activeRoleId) || ROLES[0];
+@@ -114,6 +117,10 @@ export default function App() {
+               return { ...s, [id]: { ...cur, ...p } };
+             }),
+           log: (e) => setLogs((l) => [...l, { ...e, t: performance.now() }]),
++          onError: (agent, err) => {
++            const f = describeFailure(err);
++            pushToast({ tone: 'error', message: f.message, detail: f.detail ? `${agent}: ${f.detail}` : agent });
++          },
+         });
+       } catch (e) {
+         if ((e as Error).name === 'AbortError') {
+@@ -128,11 +135,23 @@ export default function App() {
+         setBusy(false);
+       }
+     },
+-    [activeAgent, providers]
++    [activeAgent, providers, pushToast]
+   );
+ 
+   const hasRun = runStart != null;
+ 
++  // A run is "starting" while busy but no agent has reached a terminal/working
++  // state yet — the InputBar disables typing and shows a spinner during this phase.
++  // The `!runId` guard keeps this local-only: when the real runtime is streaming
++  // (runId set), the state stays "queued" while the terminal fills via SSE, so we
++  // must not lock the input or disable the Stop button for the whole run.
++  const starting =
++    busy &&
++    !runId &&
++    !Object.values(states).some(
++      (s) => s.status === 'thinking' || s.status === 'streaming' || s.status === 'done' || s.status === 'error'
++    );
++
+   const handleStop = useCallback(async () => {
+     if (runId) {
+       // A real runtime run is streaming: cancel it server-side.
+@@ -236,8 +255,9 @@ export default function App() {
+               activeRoleName={activeRolePreset.name}
+             />
+ 
+-            {/* Standby Status / Telemetry Stats */}
+-            {hasRun && activeView === 'telemetry' && (
++            {/* Standby Status / Telemetry Stats. Always rendered so the panel has a
++                friendly empty state before the first run (t14r). */}
++            {activeView === 'telemetry' && (
+               <div className="w-full max-w-5xl">
+                 <Telemetry
+                   roles={[activeAgent]}
+@@ -260,6 +280,7 @@ export default function App() {
+         <div className="mx-auto w-full max-w-2xl">
+           <InputBar
+             busy={busy}
++            starting={starting}
+             onSubmit={submit}
+             onStop={handleStop}
+           />
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+index 646e62382..d06a6c08d 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/ComputerScreen.tsx
+@@ -126,6 +126,17 @@ function SystemLine({ text, tone }: { text: string; tone?: "error" | "muted" })
+   );
+ }
+ 
++/** Friendly empty state for the terminal when there are no events yet (t14r). */
++function TerminalEmptyState({ title, hint }: { title: string; hint: string }) {
++  return (
++    <div className="flex flex-1 flex-col items-center justify-center gap-2 py-10 text-center">
++      <Terminal className="h-5 w-5 text-white/25" />
++      <div className="text-xs font-medium text-white/50">{title}</div>
++      <div className="max-w-xs text-[11px] leading-relaxed text-white/30">{hint}</div>
++    </div>
++  );
++}
++
+ export function ComputerScreen({
+   logs,
+   runId,
+@@ -207,7 +218,10 @@ export function ComputerScreen({
+                   <div className="text-amber-400/60">reconnecting to run stream…</div>
+                 )}
+                 {stream.items.length === 0 ? (
+-                  <div className="text-white/30">awaiting run stream…</div>
++                  <TerminalEmptyState
++                    title="Awaiting run stream"
++                    hint="Once the agent starts, its live terminal events will stream in here."
++                  />
+                 ) : (
+                   stream.items.map((item) => <StreamRow key={item.seq} item={item} />)
+                 )}
+@@ -217,13 +231,20 @@ export function ComputerScreen({
+                 <div className="text-white/30">$ uname -a && echo $SHELL</div>
+                 <div className="text-white/60">Linux agent-vm-01 6.1.0-28-cloud-amd64 #1 SMP /bin/zsh</div>
+ 
+-                {logs.map((l, i) => (
+-                  <div key={i} className="flex gap-2">
+-                    <span className="text-white/30 select-none">$</span>
+-                    <span style={{ color: `hsl(${l.hue} 85% 75%)` }}>[{l.agent}]</span>
+-                    <span className="text-white/80">{l.msg}</span>
+-                  </div>
+-                ))}
++                {logs.length === 0 ? (
++                  <TerminalEmptyState
++                    title="No activity yet"
++                    hint="Run an agent or interact with the computer — terminal output will appear here."
++                  />
++                ) : (
++                  logs.map((l, i) => (
++                    <div key={i} className="flex gap-2">
++                      <span className="text-white/30 select-none">$</span>
++                      <span style={{ color: `hsl(${l.hue} 85% 75%)` }}>[{l.agent}]</span>
++                      <span className="text-white/80">{l.msg}</span>
++                    </div>
++                  ))
++                )}
+               </>
+             )}
+           </div>
+diff --git a/apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.tsx b/apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.tsx
+new file mode 100644
+index 000000000..494f9cddd
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/ErrorBoundary.tsx
+@@ -0,0 +1,59 @@
++import { Component, type ReactNode } from "react";
++
++interface Props {
++  children: ReactNode;
++}
++
++interface State {
++  error: Error | null;
++}
++
++/**
++ * t14r — recoverable error boundary around the workspace.
++ *
++ * Catches render errors anywhere below it and shows a friendly fallback with a one-click
++ * reset and a reload action instead of a blank white screen.
++ */
++export class ErrorBoundary extends Component<Props, State> {
++  state: State = { error: null };
++
++  static getDerivedStateFromError(error: Error): State {
++    return { error };
++  }
++
++  private handleReset = () => this.setState({ error: null });
++
++  render() {
++    if (this.state.error) {
++      return (
++        <div className="grid min-h-screen place-items-center bg-[#07070a] px-4 text-white antialiased">
++          <div className="glass-soft w-full max-w-md rounded-3xl p-8 text-center">
++            <div className="mx-auto mb-4 grid h-12 w-12 place-items-center rounded-2xl bg-red-500/10 text-red-400 ring-1 ring-red-500/20">
++              <span className="text-xl">⚠</span>
++            </div>
++            <div className="text-base font-medium text-white/90">Something went wrong</div>
++            <p className="mt-2 text-sm text-white/45">The workspace hit an unexpected error. You can reload, or try again.</p>
++            <p className="mt-3 break-words rounded-xl bg-white/5 p-3 font-mono text-[10px] leading-relaxed text-red-300/70">
++              {this.state.error.message || String(this.state.error)}
++            </p>
++            <div className="mt-6 flex justify-center gap-3">
++              <button
++                onClick={() => window.location.reload()}
++                className="rounded-full bg-white px-5 py-2 text-xs font-medium text-black transition hover:scale-105"
++              >
++                Reload
++              </button>
++              <button
++                onClick={this.handleReset}
++                className="rounded-full border border-white/15 px-5 py-2 text-xs text-white/70 transition hover:text-white"
++              >
++                Try again
++              </button>
++            </div>
++          </div>
++        </div>
++      );
++    }
++    return this.props.children;
++  }
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx b/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
+index 8f0a047e0..09a9c7bdd 100644
+--- a/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
++++ b/apps/swarmagents/minimalist-ui/src/components/InputBar.tsx
+@@ -1,5 +1,5 @@
+ import { useRef, useState } from 'react';
+-import { ArrowUp, FileText, Film, Music, Paperclip, Square, X, File as FileIcon } from 'lucide-react';
++import { ArrowUp, FileText, Film, Loader2, Music, Paperclip, Square, X, File as FileIcon } from 'lucide-react';
+ import { type Attachment, uid } from '../data';
+ 
+ const TEXT_EXT = /\.(txt|md|json|csv|ts|tsx|js|jsx|py|html|css|xml|yml|yaml|log|sql|sh|rs|go|java|c|cpp|rb)$/i;
+@@ -28,10 +28,13 @@ async function toAttachment(f: File): Promise<Attachment> {
+ 
+ export function InputBar({
+   busy,
++  starting,
+   onSubmit,
+   onStop,
+ }: {
+   busy: boolean;
++  /** True while a run is in its brief pre-stream phase — inputs are disabled and a spinner shows. */
++  starting: boolean;
+   onSubmit: (text: string, atts: Attachment[]) => void;
+   onStop: () => void;
+ }) {
+@@ -105,7 +108,8 @@ export function InputBar({
+       <div className="flex items-end gap-1">
+         <button
+           onClick={() => fileRef.current?.click()}
+-          className="grid h-11 w-11 shrink-0 place-items-center rounded-full text-white/50 transition hover:bg-white/10 hover:text-white"
++          disabled={starting}
++          className="grid h-11 w-11 shrink-0 place-items-center rounded-full text-white/50 transition hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+           title="Attach files, images, video"
+         >
+           <Paperclip className="h-[18px] w-[18px]" />
+@@ -115,6 +119,7 @@ export function InputBar({
+           type="file"
+           multiple
+           hidden
++          disabled={starting}
+           onChange={(e) => {
+             if (e.target.files) add(e.target.files);
+             e.target.value = '';
+@@ -124,7 +129,8 @@ export function InputBar({
+           ref={taRef}
+           rows={1}
+           value={text}
+-          placeholder="Ask the agents anything…"
++          disabled={starting}
++          placeholder={starting ? 'Starting run…' : 'Ask the agents anything…'}
+           onChange={(e) => {
+             setText(e.target.value);
+             e.target.style.height = 'auto';
+@@ -142,16 +148,21 @@ export function InputBar({
+               submit();
+             }
+           }}
+-          className="max-h-[180px] flex-1 resize-none bg-transparent py-3 text-[15px] text-white placeholder:text-white/35 focus:outline-none"
++          className="max-h-[180px] flex-1 resize-none bg-transparent py-3 text-[15px] text-white placeholder:text-white/35 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+         />
+         <button
+           onClick={submit}
+-          disabled={!canSend}
++          disabled={starting || !canSend}
+           className={`grid h-11 w-11 shrink-0 place-items-center rounded-full transition-all ${
+-            canSend ? 'bg-white text-black hover:scale-105' : 'bg-white/10 text-white/30'
++            starting
++              ? 'cursor-default bg-white/10 text-white/50'
++              : canSend
++                ? 'bg-white text-black hover:scale-105'
++                : 'bg-white/10 text-white/30'
+           }`}
++          aria-label={starting ? 'Starting…' : busy ? 'Stop' : 'Send'}
+         >
+-          {busy ? <Square className="h-3.5 w-3.5 fill-current" /> : <ArrowUp className="h-[18px] w-[18px]" />}
++          {starting ? <Loader2 className="h-4 w-4 animate-spin" /> : busy ? <Square className="h-3.5 w-3.5 fill-current" /> : <ArrowUp className="h-[18px] w-[18px]" />}
+         </button>
+       </div>
+     </div>
+diff --git a/apps/swarmagents/minimalist-ui/src/components/Toasts.tsx b/apps/swarmagents/minimalist-ui/src/components/Toasts.tsx
+new file mode 100644
+index 000000000..3fbe7da6e
+--- /dev/null
++++ b/apps/swarmagents/minimalist-ui/src/components/Toasts.tsx
+@@ -0,0 +1,103 @@
++import {
++  createContext,
++  useCallback,
++  useContext,
++  useReducer,
++  type ReactNode,
++} from "react";
++import { AlertTriangle, CheckCircle2, Info, X } from "lucide-react";
++import { toastReducer, type Toast, type ToastTone } from "../../../lib/ui/toasts";
++import { uid } from "../data";
++
++interface PushInput {
++  tone?: ToastTone;
++  message: string;
++  detail?: string;
++  ttlMs?: number;
++}
++
++interface ToastsValue {
++  toasts: Toast[];
++  push: (input: PushInput) => void;
++  dismiss: (id: string) => void;
++}
++
++const ToastsContext = createContext<ToastsValue | null>(null);
++
++const TONE_STYLE: Record<ToastTone, { icon: typeof Info; chip: string; label: string }> = {
++  error: { icon: AlertTriangle, chip: "text-red-400 bg-red-500/12 ring-red-500/25", label: "Error" },
++  success: { icon: CheckCircle2, chip: "text-emerald-400 bg-emerald-500/12 ring-emerald-500/25", label: "Success" },
++  info: { icon: Info, chip: "text-cyan-400 bg-cyan-500/12 ring-cyan-500/25", label: "Info" },
++};
++
++const DEFAULT_TTL = 8000;
++
++/**
++ * t14r — dismissible toast system for provider/network failures (and info/success).
++ * State lives in the pure lib/ui/toasts reducer; this component only wires it to React.
++ */
++export function ToastsProvider({ children }: { children: ReactNode }) {
++  const [toasts, dispatch] = useReducer(toastReducer, []);
++
++  const dismiss = useCallback((id: string) => dispatch({ type: "dismiss", id }), []);
++
++  const push = useCallback((input: PushInput) => {
++    const id = uid();
++    dispatch({ type: "add", toast: {
++      id,
++      tone: input.tone ?? "info",
++      message: input.message,
++      detail: input.detail,
++    } });
++    // Auto-dismiss unless the caller opted out with ttlMs: 0.
++    const ttl = input.ttlMs ?? DEFAULT_TTL;
++    if (ttl > 0) setTimeout(() => dispatch({ type: "dismiss", id }), ttl);
++  }, []);
++
++  return (
++    <ToastsContext.Provider value={{ toasts, push, dismiss }}>
++      {children}
++      {toasts.length > 0 && (
++        <div className="fixed right-4 top-4 z-[60] flex w-[min(92vw,22rem)] flex-col gap-2">
++          {toasts.map((toast) => {
++            const tone = TONE_STYLE[toast.tone];
++            const Icon = tone.icon;
++            return (
++              <div
++                key={toast.id}
++                role="alert"
++                className="glass-soft flex items-start gap-3 rounded-2xl px-4 py-3 shadow-[0_12px_40px_rgba(0,0,0,0.5)]"
++              >
++                <span className={`mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg ring-1 ${tone.chip}`}>
++                  <Icon className="h-4 w-4" />
++                </span>
++                <div className="min-w-0 flex-1">
++                  <div className="text-xs font-medium text-white/90">
++                    <span className="mr-1.5 uppercase tracking-widest text-white/35">{tone.label}</span>
++                    {toast.message}
++                  </div>
++                  {toast.detail && (
++                    <div className="mt-0.5 break-words text-[11px] leading-relaxed text-white/50">{toast.detail}</div>
++                  )}
++                </div>
++                <button
++                  onClick={() => dismiss(toast.id)}
++                  aria-label="Dismiss notification"
++                  className="grid h-6 w-6 shrink-0 place-items-center rounded-full text-white/40 transition hover:bg-white/10 hover:text-white"
++                >
++                  <X className="h-3.5 w-3.5" />
++                </button>
++              </div>
++            );
++          })}
++        </div>
++      )}
++    </ToastsContext.Provider>
++  );
++}
++
++export function useToasts(): ToastsValue {
++  const ctx = useContext(ToastsContext);
++  if (!ctx) throw new Error("useToasts must be used within a ToastsProvider");
++  return ctx;
++}
+diff --git a/apps/swarmagents/minimalist-ui/src/engine.ts b/apps/swarmagents/minimalist-ui/src/engine.ts
+index 6f5d836bb..a45821d43 100644
+--- a/apps/swarmagents/minimalist-ui/src/engine.ts
++++ b/apps/swarmagents/minimalist-ui/src/engine.ts
+@@ -200,8 +200,9 @@ export async function runAgents(opts: {
+   signal: AbortSignal;
+   update: (uid: string, patch: Partial<AgentState> | ((s: AgentState) => Partial<AgentState>)) => void;
+   log: (e: Omit<LogEvent, 't'>) => void;
++  onError?: (agent: string, err: unknown) => void;
+ }) {
+-  const { roles, providers, input, attachments, signal, update, log } = opts;
++  const { roles, providers, input, attachments, signal, update, log, onError } = opts;
+   const outputs: Record<string, string> = {};
+ 
+   const runOne = async (role: ActiveRole, priorIds: string[]) => {
+@@ -235,6 +236,8 @@ export async function runAgents(opts: {
+       const msg = (e as Error).message || 'request failed';
+       update(role.uid, { status: 'error', error: msg, end: performance.now() });
+       log({ agent: role.name, hue: role.hue, msg: `error: ${msg}` });
++      // Surface provider/network failures to the UI toast layer (t14r).
++      onError?.(role.name, e);
+       outputs[role.uid] = '';
+       return;
+     }
+diff --git a/apps/swarmagents/minimalist-ui/src/main.tsx b/apps/swarmagents/minimalist-ui/src/main.tsx
+index 12fa35b98..0b7a211af 100644
+--- a/apps/swarmagents/minimalist-ui/src/main.tsx
++++ b/apps/swarmagents/minimalist-ui/src/main.tsx
+@@ -2,9 +2,15 @@ import { StrictMode } from "react";
+ import { createRoot } from "react-dom/client";
+ import "./index.css";
+ import App from "./App";
++import { ErrorBoundary } from "./components/ErrorBoundary";
++import { ToastsProvider } from "./components/Toasts";
+ 
+ createRoot(document.getElementById("root")!).render(
+   <StrictMode>
+-    <App />
++    <ErrorBoundary>
++      <ToastsProvider>
++        <App />
++      </ToastsProvider>
++    </ErrorBoundary>
+   </StrictMode>
+ );
+-- 
+2.55.0
+

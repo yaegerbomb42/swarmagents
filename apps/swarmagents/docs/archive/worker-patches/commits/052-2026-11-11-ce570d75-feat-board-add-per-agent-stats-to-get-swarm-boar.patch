@@ -1,0 +1,299 @@
+From ce570d75384a0d0e692deb4cf031a8d2f17f3a9b Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:38:41 -0600
+Subject: [PATCH] feat(board): add per-agent stats to GET swarm-board
+
+GET /api/mcp/swarm-board now includes an agents map ({name: {claimed,
+inReview, completed, rejected}}). review_and_merge_task records the worker's
+name on the task's new rejectedBy list when approved=false (immutable append),
+so rejections survive re-claims; computeAgentStats derives the buckets from task
+status/claimedBy plus tracked rejections. Unit tests cover the pure function,
+rejection recording/append, approval, and the GET route's agents payload.
+
+Rebuilt fresh on origin/main (the earlier branch was 50 behind main) to avoid
+rebasing drift.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../app/api/mcp/swarm-board/route.test.ts     | 37 +++++++++++
+ .../app/api/mcp/swarm-board/route.ts          |  2 +
+ .../swarmagents/lib/board/agent-stats.test.ts | 46 ++++++++++++++
+ apps/swarmagents/lib/board/agent-stats.ts     | 48 +++++++++++++++
+ apps/swarmagents/lib/board/board.test.ts      | 61 +++++++++++++++++++
+ apps/swarmagents/lib/board/handlers.ts        |  3 +
+ apps/swarmagents/lib/mcp-types.ts             |  2 +
+ 7 files changed, 199 insertions(+)
+ create mode 100644 apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+ create mode 100644 apps/swarmagents/lib/board/agent-stats.test.ts
+ create mode 100644 apps/swarmagents/lib/board/agent-stats.ts
+
+diff --git a/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts b/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+new file mode 100644
+index 000000000..a2b4628de
+--- /dev/null
++++ b/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+@@ -0,0 +1,37 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { NextRequest } from "next/server";
++import { GET } from "./route";
++import { configureStorePaths, saveStoreAtomic } from "@/lib/board/store";
++import type { BoardStore } from "@/lib/board/types";
++
++test("GET includes per-agent stats (claimed/inReview/completed/rejected)", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-board-route-"));
++  const dataFile = path.join(dir, "swarm_board.json");
++  configureStorePaths(dir, dataFile);
++  try {
++    const store: BoardStore = {
++      tasks: [
++        { id: "t1", title: "T", description: "D", difficulty: "easy", minElo: 1200, constraints: [], status: "claimed", claimedBy: "A", createdAt: 0, updatedAt: 0 },
++        { id: "t2", title: "T", description: "D", difficulty: "easy", minElo: 1200, constraints: [], status: "in_review", claimedBy: "A", createdAt: 0, updatedAt: 0 },
++        { id: "t3", title: "T", description: "D", difficulty: "easy", minElo: 1200, constraints: [], status: "completed", claimedBy: "B", createdAt: 0, updatedAt: 0 },
++        { id: "t4", title: "T", description: "D", difficulty: "easy", minElo: 1200, constraints: [], status: "open", claimedBy: "C", rejectedBy: ["C", "C"], createdAt: 0, updatedAt: 0 },
++      ],
++      proposals: [],
++      messages: [],
++    };
++    await saveStoreAtomic(store);
++
++    const res = await GET(new NextRequest("http://localhost/api/mcp/swarm-board"));
++    assert.equal(res.status, 200);
++    const body = (await res.json()) as { agents: Record<string, { claimed: number; inReview: number; completed: number; rejected: number }> };
++    assert.deepEqual(body.agents["A"], { claimed: 1, inReview: 1, completed: 0, rejected: 0 });
++    assert.deepEqual(body.agents["B"], { claimed: 0, inReview: 0, completed: 1, rejected: 0 });
++    assert.deepEqual(body.agents["C"], { claimed: 0, inReview: 0, completed: 0, rejected: 2 });
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/app/api/mcp/swarm-board/route.ts b/apps/swarmagents/app/api/mcp/swarm-board/route.ts
+index 9eb79f726..d16eab72c 100644
+--- a/apps/swarmagents/app/api/mcp/swarm-board/route.ts
++++ b/apps/swarmagents/app/api/mcp/swarm-board/route.ts
+@@ -1,5 +1,6 @@
+ import { NextRequest, NextResponse } from "next/server";
+ import { loadStore, withLockedStore, getStorageHealth } from "@/lib/board/store";
++import { computeAgentStats } from "@/lib/board/agent-stats";
+ import {
+   handleInitialize,
+   handlePing,
+@@ -49,6 +50,7 @@ export async function GET(req: NextRequest) {
+       completed: store.tasks.filter((t) => t.status === "completed").length,
+       pending_proposals: store.proposals.filter((p) => p.status === "pending").length,
+     },
++    agents: computeAgentStats(store.tasks),
+     tasks,
+     proposals: store.proposals,
+     messages: store.messages.slice(-20),
+diff --git a/apps/swarmagents/lib/board/agent-stats.test.ts b/apps/swarmagents/lib/board/agent-stats.test.ts
+new file mode 100644
+index 000000000..38911b3bb
+--- /dev/null
++++ b/apps/swarmagents/lib/board/agent-stats.test.ts
+@@ -0,0 +1,46 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { computeAgentStats } from "./agent-stats";
++import type { SwarmTask } from "@/lib/mcp-types";
++
++function task(over: Partial<SwarmTask>): SwarmTask {
++  return {
++    id: "t",
++    title: "T",
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status: "open",
++    createdAt: 0,
++    updatedAt: 0,
++    ...over,
++  };
++}
++
++test("computeAgentStats buckets claimed/in-review/completed by claimedBy", () => {
++  const stats = computeAgentStats([
++    task({ status: "claimed", claimedBy: "A" }),
++    task({ status: "in_review", claimedBy: "A" }),
++    task({ status: "completed", claimedBy: "B" }),
++    task({ status: "completed", claimedBy: "B" }),
++  ]);
++  assert.deepEqual(stats["A"], { claimed: 1, inReview: 1, completed: 0, rejected: 0 });
++  assert.deepEqual(stats["B"], { claimed: 0, inReview: 0, completed: 2, rejected: 0 });
++});
++
++test("computeAgentStats counts tracked rejections per agent and ignores open/untracked tasks", () => {
++  const stats = computeAgentStats([
++    task({ status: "open", claimedBy: "A", rejectedBy: ["A"] }),
++    task({ status: "open", claimedBy: "A", rejectedBy: ["A", "C"] }),
++    task({ status: "open" }), // never claimed
++  ]);
++  assert.equal(stats["A"].rejected, 2);
++  assert.equal(stats["C"].rejected, 1);
++  assert.equal(Object.keys(stats).length, 2);
++});
++
++test("computeAgentStats returns an empty map for an empty/blank backlog", () => {
++  assert.deepEqual(computeAgentStats([]), {});
++  assert.deepEqual(computeAgentStats([task({ status: "open" })]), {});
++});
+diff --git a/apps/swarmagents/lib/board/agent-stats.ts b/apps/swarmagents/lib/board/agent-stats.ts
+new file mode 100644
+index 000000000..5dd452f74
+--- /dev/null
++++ b/apps/swarmagents/lib/board/agent-stats.ts
+@@ -0,0 +1,48 @@
++import type { SwarmTask } from "@/lib/mcp-types";
++
++/** Per-agent quality signals, aggregated from the task board. */
++export interface AgentStats {
++  claimed: number;
++  inReview: number;
++  completed: number;
++  rejected: number;
++}
++
++function emptyStats(): AgentStats {
++  return { claimed: 0, inReview: 0, completed: 0, rejected: 0 };
++}
++
++/**
++ * Aggregate per-agent signals across every task.
++ *
++ * - claimed / inReview / completed come from the task's current status and its
++ *   claimedBy owner.
++ * - rejected counts every entry in a task's rejectedBy list (recorded when
++ *   review_and_merge_task completes with approved=false), so a rejection keeps
++ *   counting even after the task is re-claimed by another agent.
++ *
++ * Only agents that own at least one task or rejection appear in the result.
++ */
++export function computeAgentStats(tasks: readonly SwarmTask[]): Record<string, AgentStats> {
++  const stats: Record<string, AgentStats> = {};
++  const bump = (agent: string, key: keyof AgentStats): void => {
++    let s = stats[agent];
++    if (!s) {
++      s = emptyStats();
++      stats[agent] = s;
++    }
++    s[key] += 1;
++  };
++
++  for (const task of tasks) {
++    if (task.claimedBy) {
++      if (task.status === "claimed") bump(task.claimedBy, "claimed");
++      else if (task.status === "in_review") bump(task.claimedBy, "inReview");
++      else if (task.status === "completed") bump(task.claimedBy, "completed");
++    }
++    if (task.rejectedBy) {
++      for (const agent of task.rejectedBy) bump(agent, "rejected");
++    }
++  }
++  return stats;
++}
+diff --git a/apps/swarmagents/lib/board/board.test.ts b/apps/swarmagents/lib/board/board.test.ts
+index 1467424b6..a76139185 100644
+--- a/apps/swarmagents/lib/board/board.test.ts
++++ b/apps/swarmagents/lib/board/board.test.ts
+@@ -130,6 +130,67 @@ test("handleReviewAndMergeTask rejects missing feedback", async () => {
+   assert.match(result.error.message, /feedback/);
+ });
+ 
++test("handleReviewAndMergeTask records a rejection when approved=false", async () => {
++  const store = emptyStore();
++  store.tasks.push({
++    id: "t1",
++    title: "T",
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status: "in_review",
++    claimedBy: "A",
++    createdAt: 0,
++    updatedAt: 0,
++  });
++  const result = await handleReviewAndMergeTask(store, { taskId: "t1", approved: false, feedback: "needs work" });
++  assert.ok("result" in result);
++  const parsed = JSON.parse(result.result.content[0].text);
++  assert.equal(parsed.task.status, "open");
++  assert.deepEqual(parsed.task.rejectedBy, ["A"]);
++});
++
++test("handleReviewAndMergeTask appends multiple rejections on repeated rejection", async () => {
++  const store = emptyStore();
++  store.tasks.push({
++    id: "t1",
++    title: "T",
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status: "in_review",
++    claimedBy: "A",
++    rejectedBy: ["A"],
++    createdAt: 0,
++    updatedAt: 0,
++  });
++  await handleReviewAndMergeTask(store, { taskId: "t1", approved: false, feedback: "again" });
++  assert.deepEqual(store.tasks[0].rejectedBy, ["A", "A"]);
++});
++
++test("handleReviewAndMergeTask approves without recording a rejection", async () => {
++  const store = emptyStore();
++  store.tasks.push({
++    id: "t1",
++    title: "T",
++    description: "D",
++    difficulty: "easy",
++    minElo: 1200,
++    constraints: [],
++    status: "in_review",
++    claimedBy: "A",
++    createdAt: 0,
++    updatedAt: 0,
++  });
++  const result = await handleReviewAndMergeTask(store, { taskId: "t1", approved: true, feedback: "ok" });
++  assert.ok("result" in result);
++  const parsed = JSON.parse(result.result.content[0].text);
++  assert.equal(parsed.task.status, "completed");
++  assert.equal(parsed.task.rejectedBy, undefined);
++});
++
+ test("handleSubmitProposal validates difficulty enum", async () => {
+   const store = emptyStore();
+   const result = await handleSubmitProposal(store, { proposedBy: "A", title: "T", problem: "P", proposedSolution: "S", suggestedDifficulty: "extreme" });
+diff --git a/apps/swarmagents/lib/board/handlers.ts b/apps/swarmagents/lib/board/handlers.ts
+index 5b7b12bb9..7253303f3 100644
+--- a/apps/swarmagents/lib/board/handlers.ts
++++ b/apps/swarmagents/lib/board/handlers.ts
+@@ -339,6 +339,9 @@ export async function handleReviewAndMergeTask(
+   const task = store.tasks.find((t) => t.id === args.taskId);
+   if (!task) return { error: notFound("Task not found") };
+   task.status = args.approved ? "completed" : "open";
++  if (!args.approved && task.claimedBy) {
++    task.rejectedBy = task.rejectedBy ? [...task.rejectedBy, task.claimedBy] : [task.claimedBy];
++  }
+   task.updatedAt = Date.now();
+   const persistErr = await persistOrError(store);
+   if (persistErr) return { error: persistErr };
+diff --git a/apps/swarmagents/lib/mcp-types.ts b/apps/swarmagents/lib/mcp-types.ts
+index 8958c273a..b60fb720d 100644
+--- a/apps/swarmagents/lib/mcp-types.ts
++++ b/apps/swarmagents/lib/mcp-types.ts
+@@ -15,6 +15,8 @@ export interface SwarmTask {
+   resultSummary?: string;
+   gitBranch?: string;
+   prUrl?: string;
++  /** Agents (by name) whose submission was rejected on this task. */
++  rejectedBy?: string[];
+   createdAt: number;
+   updatedAt: number;
+ }
+-- 
+2.55.0
+

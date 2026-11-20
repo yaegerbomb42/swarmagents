@@ -1,0 +1,956 @@
+From cf4a64bd1ab248294250789d48b76ee3ce94dd6b Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 15:26:04 -0600
+Subject: [PATCH] feat(ui): resume real run across reloads (useActiveRun +
+ runtime-only submit)
+
+- new lib/client/useActiveRun: on mount GET /api/runtime/runs, pick the
+  running/queued run (else most recent finished within 10 min) using a
+  sessionStorage hint, restore runId + prompt for the SSE stream
+- App submit no longer falls back to runAgents; 401 shows a sign-in card,
+  429/503/network show the server error in a toast plus inline retry,
+  simulated engine kept only behind ?demo=1
+- Reset VM awaits the response and only prints complete on 2xx
+- SSE stream replays the durable run log on fresh connections so a reload
+  sees the full run even when the ring buffer evicted early events
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../lib/client/useActiveRun.test.ts           | 115 ++++++
+ apps/swarmagents/lib/client/useActiveRun.ts   | 251 +++++++++++++
+ apps/swarmagents/lib/telemetry/sse.test.ts    |  61 ++++
+ apps/swarmagents/lib/telemetry/sse.ts         |  20 +-
+ apps/swarmagents/minimalist-ui/src/App.tsx    | 334 +++++++++---------
+ 5 files changed, 608 insertions(+), 173 deletions(-)
+ create mode 100644 apps/swarmagents/lib/client/useActiveRun.test.ts
+ create mode 100644 apps/swarmagents/lib/client/useActiveRun.ts
+
+diff --git a/apps/swarmagents/lib/client/useActiveRun.test.ts b/apps/swarmagents/lib/client/useActiveRun.test.ts
+new file mode 100644
+index 000000000..78e2a7b93
+--- /dev/null
++++ b/apps/swarmagents/lib/client/useActiveRun.test.ts
+@@ -0,0 +1,115 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import {
++  LAST_RUN_ID_KEY,
++  RESUME_RECENT_WINDOW_MS,
++  readLastRunIdHint,
++  selectRunToResume,
++  writeLastRunIdHint,
++  type RunResumeSelection,
++} from "./useActiveRun";
++
++const NOW = 1_700_000_000_000;
++
++function run(overrides: Partial<{ runId: string; status: string; prompt: string; createdAt: number }> = {}) {
++  return {
++    runId: "run_test",
++    status: "finished",
++    prompt: "hello",
++    createdAt: NOW - 1000,
++    ...overrides,
++  };
++}
++
++function idOf(selection: RunResumeSelection): string | null {
++  return selection.kind === "run" ? selection.run.runId : null;
++}
++
++test("selects the running run when present", () => {
++  const runs = [
++    run({ runId: "run_finished", status: "finished", createdAt: NOW - 60_000 }),
++    run({ runId: "run_running", status: "running", createdAt: NOW - 5000 }),
++  ];
++  assert.equal(idOf(selectRunToResume(runs, null, NOW)), "run_running");
++});
++
++test("prefers the hinted run when it is still running", () => {
++  const runs = [
++    run({ runId: "run_older", status: "running", createdAt: NOW - 60_000 }),
++    run({ runId: "run_newer", status: "running", createdAt: NOW - 5000 }),
++  ];
++  assert.equal(idOf(selectRunToResume(runs, "run_older", NOW)), "run_older");
++});
++
++test("picks the earliest-created running run when no hint", () => {
++  // Dur master summaries fold queued runs to "running"; the active run is the
++  // one created first (queued runs were created after it).
++  const runs = [
++    run({ runId: "run_second", status: "running", createdAt: NOW - 2000 }),
++    run({ runId: "run_first", status: "running", createdAt: NOW - 10_000 }),
++    run({ runId: "run_third", status: "running", createdAt: NOW - 1000 }),
++  ];
++  assert.equal(idOf(selectRunToResume(runs, null, NOW)), "run_first");
++});
++
++test("falls back to the most recent finished run within the window", () => {
++  const runs = [
++    run({ runId: "run_old_finished", status: "finished", createdAt: NOW - RESUME_RECENT_WINDOW_MS - 1000 }),
++    run({ runId: "run_recent_finished", status: "finished", createdAt: NOW - 10_000 }),
++    run({ runId: "run_newer_finished", status: "finished", createdAt: NOW - 2000 }),
++  ];
++  assert.equal(idOf(selectRunToResume(runs, null, NOW)), "run_newer_finished");
++});
++
++test("prefers the hinted finished run when several finished recently", () => {
++  const runs = [
++    run({ runId: "run_b", status: "finished", createdAt: NOW - 2000 }),
++    run({ runId: "run_a", status: "finished", createdAt: NOW - 10_000 }),
++  ];
++  assert.equal(idOf(selectRunToResume(runs, "run_a", NOW)), "run_a");
++});
++
++test("ignores finished runs outside the recent window", () => {
++  const runs = [
++    run({ runId: "run_stale", status: "finished", createdAt: NOW - RESUME_RECENT_WINDOW_MS - 1 }),
++    run({ runId: "run_cancelled", status: "cancelled", createdAt: NOW - 5000 }),
++    run({ runId: "run_error", status: "error", createdAt: NOW - 5000 }),
++  ];
++  assert.equal(selectRunToResume(runs, null, NOW).kind, "none");
++});
++
++test("returns none when no runs qualify", () => {
++  assert.equal(selectRunToResume([], null, NOW).kind, "none");
++  assert.equal(selectRunToResume([run({ status: "cancelled" })], null, NOW).kind, "none");
++});
++
++test("ignores malformed entries", () => {
++  const runs = [null, 42, { status: "running" }, { runId: "" }];
++  assert.equal(selectRunToResume(runs, null, NOW).kind, "none");
++});
++
++test("sessionStorage hint round-trips through read/write", () => {
++  const store = new Map<string, string>();
++  const fakeStorage = {
++    getItem: (key: string) => store.get(key) ?? null,
++    setItem: (key: string, value: string) => void store.set(key, value),
++    removeItem: (key: string) => void store.delete(key),
++  };
++
++  assert.equal(readLastRunIdHint(fakeStorage), null);
++  writeLastRunIdHint("run_abc", fakeStorage);
++  assert.equal(readLastRunIdHint(fakeStorage), "run_abc");
++  assert.equal(store.get(LAST_RUN_ID_KEY), "run_abc");
++
++  writeLastRunIdHint(null, fakeStorage);
++  assert.equal(readLastRunIdHint(fakeStorage), null);
++});
++
++test("hint helpers survive missing storage", () => {
++  assert.equal(readLastRunIdHint(null), null);
++  assert.doesNotThrow(() => writeLastRunIdHint("run_abc", null));
++});
++
++test("resume window is 10 minutes", () => {
++  assert.equal(RESUME_RECENT_WINDOW_MS, 10 * 60 * 1000);
++});
+diff --git a/apps/swarmagents/lib/client/useActiveRun.ts b/apps/swarmagents/lib/client/useActiveRun.ts
+new file mode 100644
+index 000000000..198decb8e
+--- /dev/null
++++ b/apps/swarmagents/lib/client/useActiveRun.ts
+@@ -0,0 +1,251 @@
++"use client";
++
++/**
++ * useActiveRun() — restore the user's live run across reloads.
++ *
++ * runId previously lived only in React state (App.tsx), so a reload lost the
++ * live view while the run kept going server-side. On mount this hook asks
++ * GET /api/runtime/runs for the caller's durable runs and picks the one
++ * worth resuming:
++ *
++ *   - a running run first. The durable summary folds a queued run to "running"
++ *     too, so the earliest-created running run is the active one (queued runs
++ *     are created after it);
++ *   - otherwise the most recent finished run within RESUME_RECENT_WINDOW_MS.
++ *
++ * A sessionStorage hint (LAST_RUN_ID_KEY) is written whenever a run starts or
++ * is restored and biases the choice when several runs qualify, so a reload
++ * lands back on the run the user was watching.
++ *
++ * The caller passes the resolved runId + prompt to the existing useRunStream
++ * machinery (ComputerScreen): the SSE endpoint replays the run's events from
++ * seq 0, falling back to the run's durable log when the in-memory ring buffer
++ * has evicted early events, so the terminal/timeline repopulate and keep
++ * streaming.
++ */
++
++import { useCallback, useEffect, useState } from "react";
++
++export const LAST_RUN_ID_KEY = "ac.lastRunId";
++
++/** Only finished runs this recent are worth resurrecting on reload. */
++export const RESUME_RECENT_WINDOW_MS = 10 * 60 * 1000;
++
++/** Loose client-side view of a StoredRunSummary (GET /api/runtime/runs). */
++export interface StoredRunLite {
++  runId: string;
++  status?: string;
++  prompt?: string;
++  createdAt?: number;
++}
++
++export type RunResumeSelection =
++  | { kind: "run"; run: StoredRunLite }
++  | { kind: "none" };
++
++function isUsableRun(value: unknown): value is StoredRunLite {
++  return (
++    typeof value === "object" &&
++    value !== null &&
++    typeof (value as StoredRunLite).runId === "string" &&
++    (value as StoredRunLite).runId.length > 0
++  );
++}
++
++/**
++ * Pick the run to resume after a reload. Order of preference:
++ *
++ *  1. the hinted run when it is still running — it is what the user was
++ *     watching when they reloaded;
++ *  2. otherwise the running run with the oldest createdAt: the durable summary
++ *     folds queued runs to "running", so this is the active one, since queued
++ *     runs were created after it;
++ *  3. the hinted run when it finished within the recent window;
++ *  4. the most recent finished run within the recent window.
++ *
++ * Cancelled/errored runs are never resumed.
++ */
++export function selectRunToResume(
++  runs: readonly unknown[],
++  hint: string | null,
++  now: number = Date.now(),
++): RunResumeSelection {
++  const valid = runs.filter(isUsableRun);
++
++  const running = valid.filter((run) => run.status === "running");
++  if (running.length > 0) {
++    if (hint) {
++      const hinted = running.find((run) => run.runId === hint);
++      if (hinted) return { kind: "run", run: hinted };
++    }
++    const active = running.reduce((a, b) =>
++      (b.createdAt ?? Number.POSITIVE_INFINITY) <
++      (a.createdAt ?? Number.POSITIVE_INFINITY)
++        ? b
++        : a,
++    );
++    return { kind: "run", run: active };
++  }
++
++  const recentlyFinished = valid.filter(
++    (run) =>
++      run.status === "finished" &&
++      typeof run.createdAt === "number" &&
++      now - run.createdAt <= RESUME_RECENT_WINDOW_MS,
++  );
++  if (recentlyFinished.length > 0) {
++    if (hint) {
++      const hinted = recentlyFinished.find((run) => run.runId === hint);
++      if (hinted) return { kind: "run", run: hinted };
++    }
++    const latest = recentlyFinished.reduce((a, b) =>
++      (b.createdAt ?? 0) > (a.createdAt ?? 0) ? b : a,
++    );
++    return { kind: "run", run: latest };
++  }
++
++  return { kind: "none" };
++}
++
++type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
++
++/** sessionStorage, or null when unavailable (SSR, private mode). */
++function safeSessionStorage(): StorageLike | null {
++  try {
++    return typeof window === "undefined" ? null : window.sessionStorage;
++  } catch {
++    return null;
++  }
++}
++
++export function readLastRunIdHint(
++  storage: StorageLike | null = safeSessionStorage(),
++): string | null {
++  if (!storage) return null;
++  try {
++    const raw = storage.getItem(LAST_RUN_ID_KEY);
++    return raw && raw.length > 0 ? raw.slice(0, 64) : null;
++  } catch {
++    return null;
++  }
++}
++
++export function writeLastRunIdHint(
++  runId: string | null | undefined,
++  storage: StorageLike | null = safeSessionStorage(),
++): void {
++  if (!storage) return;
++  try {
++    if (runId) storage.setItem(LAST_RUN_ID_KEY, runId.slice(0, 64));
++    else storage.removeItem(LAST_RUN_ID_KEY);
++  } catch {
++    // Storage can be unavailable (private mode); the hint is best-effort.
++  }
++}
++
++export type ActiveRunOutcome =
++  | "idle"
++  | "loading"
++  | "restored"
++  | "none"
++  | "unauthorized"
++  | "error";
++
++export interface ActiveRunState {
++  outcome: ActiveRunOutcome;
++  /** True while the initial runs fetch is in flight. */
++  restoring: boolean;
++  /** Resumed run id, when outcome === "restored". */
++  runId?: string;
++  /** The resumed run's prompt (for the telemetry / thread panel). */
++  prompt?: string;
++  /** True when the resumed run is still live (status "running"). */
++  live?: boolean;
++  error?: { status?: number; message: string };
++}
++
++export function useActiveRun(): ActiveRunState & { retry: () => void } {
++  const [state, setState] = useState<ActiveRunState>({
++    outcome: "idle",
++    restoring: false,
++  });
++  const [attempt, setAttempt] = useState(0);
++
++  useEffect(() => {
++    let cancelled = false;
++    setState((prev) => ({
++      ...prev,
++      outcome: "loading",
++      restoring: true,
++      error: undefined,
++    }));
++
++    (async () => {
++      let res: Response;
++      try {
++        res = await fetch("/api/runtime/runs?limit=20", {
++          headers: { Accept: "application/json" },
++          cache: "no-store",
++        });
++      } catch {
++        if (!cancelled) {
++          setState({
++            outcome: "error",
++            restoring: false,
++            error: { message: "Could not reach the runtime." },
++          });
++        }
++        return;
++      }
++      if (cancelled) return;
++
++      if (res.status === 401) {
++        setState({ outcome: "unauthorized", restoring: false });
++        return;
++      }
++      if (!res.ok) {
++        const body: unknown = await res.json().catch(() => null);
++        const message =
++          body &&
++          typeof body === "object" &&
++          typeof (body as { error?: unknown }).error === "string"
++            ? (body as { error: string }).error
++            : `Server responded ${res.status}.`;
++        setState({
++          outcome: "error",
++          restoring: false,
++          error: { status: res.status, message },
++        });
++        return;
++      }
++
++      const body: unknown = await res.json().catch(() => null);
++      const runs =
++        body && typeof body === "object" && Array.isArray((body as { runs?: unknown }).runs)
++          ? (body as { runs: unknown[] }).runs
++          : [];
++      const selection = selectRunToResume(runs, readLastRunIdHint());
++      if (selection.kind === "run") {
++        writeLastRunIdHint(selection.run.runId);
++        setState({
++          outcome: "restored",
++          restoring: false,
++          runId: selection.run.runId,
++          prompt:
++            typeof selection.run.prompt === "string" ? selection.run.prompt : undefined,
++          live: selection.run.status === "running",
++        });
++      } else {
++        setState({ outcome: "none", restoring: false });
++      }
++    })();
++
++    return () => {
++      cancelled = true;
++    };
++  }, [attempt]);
++
++  const retry = useCallback(() => setAttempt((n) => n + 1), []);
++
++  return { ...state, retry };
++}
+diff --git a/apps/swarmagents/lib/telemetry/sse.test.ts b/apps/swarmagents/lib/telemetry/sse.test.ts
+index 0dee73420..f1c8750c5 100644
+--- a/apps/swarmagents/lib/telemetry/sse.test.ts
++++ b/apps/swarmagents/lib/telemetry/sse.test.ts
+@@ -73,6 +73,67 @@ test("replays from the durable run log when the bus buffer is empty", async () =
+   }
+ });
+ 
++test("a fresh connection replays the durable log when the bus holds nothing", async () => {
++  const { dir, cleanup } = tempDir();
++  try {
++    // A run that finished long ago: the bus no longer holds it (idle eviction
++    // or a restart), so a reload connects from seq 0 and must get the whole
++    // run from the durable log.
++    const oldProcess = new TelemetryBus({ persist: true, runsDir: () => dir });
++    oldProcess.publish("run_fresh_log", { type: "one" });
++    oldProcess.publish("run_fresh_log", { type: "two" });
++    oldProcess.publish("run_fresh_log", { type: "three" });
++
++    const fresh = new TelemetryBus();
++    assert.equal(fresh.latestSeq("run_fresh_log"), 0);
++
++    const ac = new AbortController();
++    const stream = sseResponse("run_fresh_log", 0, ac.signal, { bus: fresh, keepAliveMs: 60_000, runsDir: dir });
++    const types = await readUntil(stream, "three", ac);
++    assert.deepEqual(types, ["one", "two", "three"]);
++  } finally {
++    cleanup();
++  }
++});
++
++test("a fresh connection replays evicted early events from the durable log", async () => {
++  const { dir, cleanup } = tempDir();
++  try {
++    // The bus ring buffer evicted the run's early events (capacity 2), so a
++    // fresh connection must fall back to the durable log for the full run —
++    // without duplicating the events the buffer still holds.
++    const bus = new TelemetryBus({ persist: true, runsDir: () => dir, capacity: 2 });
++    bus.publish("run_fresh_evicted", { type: "one" });
++    bus.publish("run_fresh_evicted", { type: "two" });
++    bus.publish("run_fresh_evicted", { type: "three" });
++    bus.publish("run_fresh_evicted", { type: "four" });
++
++    const ac = new AbortController();
++    const stream = sseResponse("run_fresh_evicted", 0, ac.signal, { bus, keepAliveMs: 60_000, runsDir: dir });
++    const types = await readUntil(stream, "four", ac);
++    assert.deepEqual(types, ["one", "two", "three", "four"]);
++  } finally {
++    cleanup();
++  }
++});
++
++test("a fresh connection with a live bus replays the buffer once, no duplicates", async () => {
++  const { dir, cleanup } = tempDir();
++  try {
++    const bus = new TelemetryBus({ persist: true, runsDir: () => dir });
++    bus.publish("run_fresh_live", { type: "one" });
++    bus.publish("run_fresh_live", { type: "two" });
++    bus.publish("run_fresh_live", { type: "three" });
++
++    const ac = new AbortController();
++    const stream = sseResponse("run_fresh_live", 0, ac.signal, { bus, keepAliveMs: 60_000, runsDir: dir });
++    const types = await readUntil(stream, "three", ac);
++    assert.deepEqual(types, ["one", "two", "three"]);
++  } finally {
++    cleanup();
++  }
++});
++
+ test("does not duplicate events present in both the log and the bus buffer", async () => {
+   const { dir, cleanup } = tempDir();
+   try {
+diff --git a/apps/swarmagents/lib/telemetry/sse.ts b/apps/swarmagents/lib/telemetry/sse.ts
+index 1461a08d4..980d9d87c 100644
+--- a/apps/swarmagents/lib/telemetry/sse.ts
++++ b/apps/swarmagents/lib/telemetry/sse.ts
+@@ -48,11 +48,23 @@ export function sseResponse(
+       // then the in-memory bus from the last replayed seq so nothing is
+       // duplicated or skipped. The log is appended synchronously before
+       // listeners fire, so its last seq is never ahead of the bus buffer.
++      //
++      // A fresh connection (no Last-Event-ID) gets the full durable log when
++      // one exists, then resumes from its last seq: the bus buffer is always a
++      // suffix of the log, so this replays early events the ring buffer has
++      // already evicted (or a whole run the bus no longer holds — finished
++      // long ago, idle-evicted, or after a restart) and never duplicates the
++      // tail. See lib/client/useActiveRun for the reload-resume flow.
+       let resumeSeq = fromSeq;
+-      if (fromSeq > 0) {
+-        const dir = options.runsDir === undefined ? getRunsDir() : options.runsDir;
+-        if (dir) {
+-          const logged = readRunEvents(runId, dir).filter((event) => event.seq > fromSeq);
++      const dir = options.runsDir === undefined ? getRunsDir() : options.runsDir;
++      if (dir) {
++        const logged = readRunEvents(runId, dir);
++        if (fromSeq > 0) {
++          const after = logged.filter((event) => event.seq > fromSeq);
++          for (const event of after) safeEnqueue(encodeSse(event));
++          const last = after[after.length - 1];
++          if (last) resumeSeq = last.seq;
++        } else if (logged.length > 0) {
+           for (const event of logged) safeEnqueue(encodeSse(event));
+           const last = logged[logged.length - 1];
+           if (last) resumeSeq = last.seq;
+diff --git a/apps/swarmagents/minimalist-ui/src/App.tsx b/apps/swarmagents/minimalist-ui/src/App.tsx
+index ce28fc122..cc59389da 100644
+--- a/apps/swarmagents/minimalist-ui/src/App.tsx
++++ b/apps/swarmagents/minimalist-ui/src/App.tsx
+@@ -24,6 +24,7 @@ import { SiteFooter } from './components/SiteFooter';
+ import { ThreadPanel } from './components/ThreadPanel';
+ import { useToasts } from './components/Toasts';
+ import { describeFailure } from '../../lib/ui/toasts';
++import { useActiveRun, writeLastRunIdHint } from '../../lib/client/useActiveRun';
+ import { mapKeyToAction } from './utils/keymap';
+ 
+ export default function App() {
+@@ -54,48 +55,39 @@ export default function App() {
+   const inputRef = useRef<HTMLTextAreaElement>(null);
+   const { push: pushToast } = useToasts();
+ 
+-  // Server-configured providers (server-held keys). Fetched from /api/providers;
+-  // when any are configured the UI routes completions through /api/providers/complete
+-  // so user-entered keys never travel in the browser. When none are configured,
+-  // BYO-key / simulated flow remains the explicit opt-in.
+-  // GET /api/providers returns ProviderRow items ({id, keyCount, enabled, ...} —
+-  // key counts and last-4 masks only, never key material); a provider counts as
+-  // configured when it is enabled and holds at least one key.
+-  const [serverProviders, setServerProviders] = useState<
+-    Array<{ id: string; configured: boolean }> | null
+-  >(null);
+-  const [serverProvidersLoaded, setServerProvidersLoaded] = useState(false);
++  // Resume a live run after a reload: the hook picks the running/queued (else
++  // most recent finished within 10 min) run from the durable run list, using a
++  // sessionStorage hint to land back on the run the user was watching.
++  const activeRun = useActiveRun();
++  const [authRequired, setAuthRequired] = useState(false);
++  const [submitError, setSubmitError] = useState<{ message: string }>();
++  const lastAttemptRef = useRef<{ text: string; atts: Attachment[] } | null>(null);
++  const restoreErrorNotifiedRef = useRef(false);
++  const userInitiatedRef = useRef(false);
++
++  // Only explicit ?demo=1 keeps the simulated engine; otherwise a failed POST
++  // surfaces the server error and nothing pretends to run.
++  function demoMode(): boolean {
++    return typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('demo');
++  }
+ 
++  // When a run is restored, hand it to the stream UI (ComputerScreen attaches
++  // useRunStream to runId and replays from seq 0). Sign-in and load failures
++  // surface inline so nothing silently pretends to run. If the user already
++  // interacted (typed/submitted) before the restore resolved, don't clobber
++  // their new state.
+   useEffect(() => {
+-    let cancelled = false;
+-    fetch('/api/providers', { headers: { Accept: 'application/json' } })
+-      .then((r) => {
+-        if (!r.ok) return null;
+-        return r.json().catch(() => null);
+-      })
+-      .then((data) => {
+-        if (cancelled) return;
+-        const providers = data?.providers;
+-        if (Array.isArray(providers)) {
+-          setServerProviders(
+-            providers.map((p: { id: string; keyCount?: number; enabled?: boolean }) => ({
+-              id: p.id,
+-              configured: (p.keyCount ?? 0) > 0 && p.enabled !== false,
+-            })),
+-          );
+-        }
+-        setServerProvidersLoaded(true);
+-      })
+-      .catch(() => {
+-        // /api/providers may not be reachable (Vite dev, unsigned, offline).
+-        // Fall back to BYO-key / simulated flow.
+-        setServerProviders([]);
+-        setServerProvidersLoaded(true);
+-      });
+-    return () => {
+-      cancelled = true;
+-    };
+-  }, []);
++    if (activeRun.outcome === 'restored' && activeRun.runId && !userInitiatedRef.current) {
++      setRunId(activeRun.runId);
++      if (activeRun.prompt) setPrompt(activeRun.prompt);
++      setShowLanding(false);
++    } else if (activeRun.outcome === 'unauthorized') {
++      setAuthRequired(true);
++    } else if (activeRun.outcome === 'error' && activeRun.error && !restoreErrorNotifiedRef.current) {
++      restoreErrorNotifiedRef.current = true;
++      pushToast({ tone: 'error', message: activeRun.error.message });
++    }
++  }, [activeRun, pushToast]);
+ 
+   // Close the compact nav when focus/click moves outside it or Escape is pressed.
+   useEffect(() => {
+@@ -130,46 +122,33 @@ export default function App() {
+     setVmResetting(true);
+     setLogs((l) => [...l, { t: performance.now(), agent: 'system', hue: 0, msg: 'initiating Linux VM factory reset...' }]);
+     try {
+-      await fetch('/api/runtime/tasks', {
++      const res = await fetch('/api/runtime/tasks', {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+         body: JSON.stringify({ action: 'wipe_vm' }),
+-      }).catch(() => null);
++      });
++      const body = await res.json().catch(() => null);
++      if (!res.ok) {
++        const reason = body?.error ?? `Server responded ${res.status}.`;
++        pushToast({ tone: 'error', message: 'VM reset failed', detail: reason });
++        setLogs((l) => [...l, { t: performance.now(), agent: 'system', hue: 0, msg: `reset failed: ${reason}` }]);
++        return;
++      }
+       await new Promise((r) => setTimeout(r, 1200));
+       setStates({});
+       setLogs((l) => [...l, { t: performance.now(), agent: 'system', hue: 140, msg: 'Linux VM factory reset complete. Clean environment ready.' }]);
++    } catch {
++      pushToast({ tone: 'error', message: 'VM reset failed', detail: 'Could not reach the runtime.' });
++      setLogs((l) => [...l, { t: performance.now(), agent: 'system', hue: 0, msg: 'reset failed: could not reach the runtime' }]);
+     } finally {
+       setVmResetting(false);
+     }
+   };
+ 
+-  /** Route a single completion through the server-held-key proxy. No keys travel in the browser. */
+-  async function callServerProvider(
+-    input: string,
+-    providerId: string,
+-    signal: AbortSignal,
+-  ): Promise<{ text: string; provider: string; model: string }> {
+-    const res = await fetch('/api/providers/complete', {
+-      method: 'POST',
+-      headers: { 'Content-Type': 'application/json' },
+-      body: JSON.stringify({
+-        messages: [{ role: 'user' as const, content: input || '(see attachments)' }],
+-        tier: 'balanced',
+-      }),
+-      signal,
+-    });
+-    if (!res.ok) {
+-      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+-      throw new Error(
+-        (err as { error?: string }).error || `provider ${providerId} failed`,
+-      );
+-    }
+-    return res.json();
+-  }
+-
+   const submit = useCallback(
+     async (text: string, atts: Attachment[]) => {
+       setShowLanding(false); // Entering workspace automatically dismisses landing
++      userInitiatedRef.current = true;
+       const ctrl = new AbortController();
+       ctrlRef.current = ctrl;
+       const snapshot = [activeAgent];
+@@ -183,92 +162,58 @@ export default function App() {
+       setRunEnd(undefined);
+       setBusy(true);
+       setRunId(undefined);
++      setSubmitError(undefined);
++      setAuthRequired(false);
++
+       try {
+-        // Prefer the real runtime: POST a task and stream its SSE events in the
+-        // ComputerScreen terminal. When the runtime is unavailable (e.g. not
+-        // signed in, no harness token), fall back to the simulated flow below.
++        // The simulated engine (browser-held keys) is an explicit opt-in only
++        // (?demo=1). The default path is the real runtime; failures surface
++        // instead of pretending to run.
++        if (demoMode()) {
++          await runAgents({
++            roles: snapshot,
++            providers,
++            input: text || '(see attachments)',
++            attachments: atts,
++            signal: ctrl.signal,
++            update: (id, patch) =>
++              setStates((s) => {
++                const cur = s[id];
++                const p = typeof patch === 'function' ? patch(cur) : patch;
++                return { ...s, [id]: { ...cur, ...p } };
++              }),
++            log: (e) => setLogs((l) => [...l, { ...e, t: performance.now() }]),
++            onError: (agent, err) => {
++              const f = describeFailure(err);
++              pushToast({ tone: 'error', message: f.message, detail: f.detail ? `${agent}: ${f.detail}` : agent });
++            },
++          });
++          return;
++        }
++
+         const res = await fetch('/api/runtime/tasks', {
+           method: 'POST',
+           headers: { 'Content-Type': 'application/json' },
+           body: JSON.stringify({ prompt: text || '(see attachments)' }),
+-        }).catch(() => null);
+-        const dispatched = res && res.ok && (await res.json().catch(() => null))?.runId;
+-        if (dispatched) {
+-          setRunId(String(dispatched));
++          signal: ctrl.signal,
++        });
++
++        if (res.status === 401) {
++          setAuthRequired(true);
+           return;
+         }
+-        setRunId(undefined);
+-        // When the server reports configured providers, route the completion
+-        // through /api/providers/complete so user-entered keys never travel in
+-        // the browser. BYO-key / simulated flow remains the opt-in fallback
+-        // when no server provider is configured (or the proxy is unreachable).
+-        if (serverProvidersLoaded && serverProviders?.some((p) => p.configured)) {
+-          try {
+-            const providerId =
+-              serverProviders.find((p) => p.id === activeAgent.providerUid)?.id ??
+-              serverProviders[0]?.id;
+-            if (providerId) {
+-              const { text: out, provider, model } = await callServerProvider(
+-                text || '(see attachments)',
+-                providerId,
+-                ctrl.signal,
+-              );
+-              setStates((s) => ({
+-                ...s,
+-                [activeAgent.uid]: {
+-                  ...s[activeAgent.uid],
+-                  status: 'done',
+-                  output: out,
+-                  tokens: Math.max(1, Math.round(out.length / 4)),
+-                  inTokens: Math.max(1, Math.round((text || '').length / 4)),
+-                  model: `${provider} · ${model}`,
+-                  end: performance.now(),
+-                },
+-              }));
+-              setLogs((l) => [
+-                ...l,
+-                {
+-                  t: performance.now(),
+-                  agent: 'system',
+-                  hue: 140,
+-                  msg: `routed via server provider ${provider}`,
+-                },
+-              ]);
+-              setRunEnd(performance.now());
+-              setBusy(false);
+-              return;
+-            }
+-          } catch (e) {
+-            if ((e as Error).name === 'AbortError') throw e;
+-            setLogs((l) => [
+-              ...l,
+-              {
+-                t: performance.now(),
+-                agent: 'system',
+-                hue: 0,
+-                msg: `server provider unavailable: ${(e as Error).message}`,
+-              },
+-            ]);
+-          }
++
++        const body = await res.json().catch(() => null);
++        if (!res.ok || !body?.runId) {
++          const reason = body?.error ?? `Server responded ${res.status}.`;
++          pushToast({ tone: 'error', message: 'Run not started', detail: reason });
++          setSubmitError({ message: reason });
++          lastAttemptRef.current = { text, atts };
++          return;
+         }
+-        await runAgents({
+-          roles: snapshot,
+-          providers,
+-          input: text || '(see attachments)',
+-          attachments: atts,
+-          signal: ctrl.signal,
+-          update: (id, patch) =>
+-            setStates((s) => {
+-              const cur = s[id];
+-              const p = typeof patch === 'function' ? patch(cur) : patch;
+-              return { ...s, [id]: { ...cur, ...p } };
+-            }),
+-          log: (e) => setLogs((l) => [...l, { ...e, t: performance.now() }]),
+-          onError: (agent, err) => {
+-            const f = describeFailure(err);
+-            pushToast({ tone: 'error', message: f.message, detail: f.detail ? `${agent}: ${f.detail}` : agent });
+-          },
+-        });
++
++        setRunId(String(body.runId));
++        writeLastRunIdHint(String(body.runId));
+       } catch (e) {
+         if ((e as Error).name === 'AbortError') {
+           setLogs((l) => [...l, { t: performance.now(), agent: 'system', hue: 0, msg: 'task stopped' }]);
+@@ -276,18 +221,25 @@ export default function App() {
+             ...s,
+             [activeAgent.uid]: { ...s[activeAgent.uid], status: 'error', error: 'stopped', end: performance.now() },
+           }));
++          return;
+         }
++        const reason = e instanceof Error ? e.message : String(e);
++        pushToast({ tone: 'error', message: 'Could not reach the runtime', detail: reason });
++        setSubmitError({ message: reason });
++        lastAttemptRef.current = { text, atts };
+       } finally {
+         setRunEnd(performance.now());
+         setBusy(false);
+       }
+     },
+-    [activeAgent, providers, pushToast, serverProviders, serverProvidersLoaded]
++    [activeAgent, providers, pushToast]
+   );
+ 
+   const handleNewThread = useCallback(() => {
++    userInitiatedRef.current = true;
+     ctrlRef.current?.abort();
+     setRunId(undefined);
++    writeLastRunIdHint(null);
+     setPrompt(undefined);
+     setPromptAtts([]);
+     setLogs([]);
+@@ -295,6 +247,8 @@ export default function App() {
+     setRunStart(undefined);
+     setRunEnd(undefined);
+     setBusy(false);
++    setSubmitError(undefined);
++    setAuthRequired(false);
+   }, []);
+ 
+   const hasRun = runStart != null;
+@@ -312,14 +266,17 @@ export default function App() {
+     );
+ 
+   const handleStop = useCallback(async () => {
++    userInitiatedRef.current = true;
+     if (runId) {
+       // A real runtime run is streaming: cancel it server-side.
+       await fetch(`/api/runtime/tasks?runId=${encodeURIComponent(runId)}`, { method: 'DELETE' }).catch(() => null);
+       setRunId(undefined);
++      writeLastRunIdHint(null);
+       setStates((s) => ({
+         ...s,
+         [activeAgent.uid]: { ...s[activeAgent.uid], status: 'error', error: 'stopped', end: performance.now() },
+       }));
++      setBusy(false);
+       return;
+     }
+     ctrlRef.current?.abort();
+@@ -539,30 +496,54 @@ export default function App() {
+           <LandingHero onLaunch={() => setShowLanding(false)} />
+         ) : (
+           <div className="w-full flex flex-col items-center">
+-            {/* Top Role & Linux Computer Controls */}
+-            <RoleAndVmBar
+-              activeRoleId={activeRoleId}
+-              onSelectRole={setActiveRoleId}
+-              rotationStrategy={rotationStrategy}
+-              onChangeRotationStrategy={setRotationStrategy}
+-              providers={providers}
+-              onOpenSettings={() => setSettingsOpen(true)}
+-              onResetVm={handleResetVm}
+-              vmResetting={vmResetting}
+-              onToggleView={setActiveView}
+-              activeView={activeView}
+-            />
+-
+-            {/* The Computer Screen: Live Headed Browser, Terminal, or Telemetry */}
+-            <ComputerScreen
+-              logs={logs}
+-              runId={runId}
+-              activeView={activeView}
+-              onToggleView={setActiveView}
+-              onResetVm={handleResetVm}
+-              vmResetting={vmResetting}
+-              activeRoleName={activeRolePreset.name}
+-            />
++            {authRequired ? (
++              <div className="w-full max-w-5xl rounded-3xl border border-white/15 bg-[#0d0d12] px-6 py-14 text-center shadow-[0_25px_70px_rgba(0,0,0,0.8)]">
++                <h2 className="text-base font-semibold text-white">Sign in to use your computer</h2>
++                <p className="mt-2 text-sm text-white/50">Your session expired while this tab was open.</p>
++                <div className="mt-6 flex justify-center gap-3">
++                  <a
++                    href="/login"
++                    className="rounded-full bg-white px-5 py-2 text-sm font-medium text-black transition hover:bg-white/90"
++                  >
++                    Sign in
++                  </a>
++                  <button
++                    type="button"
++                    onClick={() => setAuthRequired(false)}
++                    className="glass-soft rounded-full px-5 py-2 text-sm text-white/70 transition hover:text-white"
++                  >
++                    Dismiss
++                  </button>
++                </div>
++              </div>
++            ) : (
++              <>
++                {/* Top Role & Linux Computer Controls */}
++                <RoleAndVmBar
++                  activeRoleId={activeRoleId}
++                  onSelectRole={setActiveRoleId}
++                  rotationStrategy={rotationStrategy}
++                  onChangeRotationStrategy={setRotationStrategy}
++                  providers={providers}
++                  onOpenSettings={() => setSettingsOpen(true)}
++                  onResetVm={handleResetVm}
++                  vmResetting={vmResetting}
++                  onToggleView={setActiveView}
++                  activeView={activeView}
++                />
++
++                {/* The Computer Screen: Live Headed Browser, Terminal, or Telemetry */}
++                <ComputerScreen
++                  logs={logs}
++                  runId={runId}
++                  activeView={activeView}
++                  onToggleView={setActiveView}
++                  onResetVm={handleResetVm}
++                  vmResetting={vmResetting}
++                  activeRoleName={activeRolePreset.name}
++                />
++              </>
++            )}
+ 
+             {/* Standby Status / Telemetry Stats. Always rendered so the panel has a
+                 friendly empty state before the first run (t14r). */}
+@@ -603,6 +584,21 @@ export default function App() {
+       <div className="fixed inset-x-0 bottom-16 z-20 px-4 pb-[calc(env(safe-area-inset-bottom)+1.25rem)] pt-10 [background:linear-gradient(to_top,#07070a_30%,transparent)] sm:bottom-0 sm:pb-5">
+         <div className="mx-auto w-full max-w-2xl">
+           {!showLanding && <ThreadPanel runId={runId} active={busy} onNewThread={handleNewThread} />}
++          {submitError && (
++            <div className="mb-3 flex items-center justify-between gap-3 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-2.5 backdrop-blur">
++              <span className="min-w-0 text-[11px] leading-snug text-rose-200">{submitError.message}</span>
++              <button
++                type="button"
++                onClick={() => {
++                  const attempt = lastAttemptRef.current;
++                  if (attempt) void submit(attempt.text, attempt.atts);
++                }}
++                className="shrink-0 rounded-full border border-rose-400/40 bg-rose-500/10 px-3 py-1 text-[11px] font-medium text-rose-200 transition hover:bg-rose-500/20"
++              >
++                Retry
++              </button>
++            </div>
++          )}
+           <InputBar
+             busy={busy}
+             starting={starting}
+-- 
+2.55.0
+

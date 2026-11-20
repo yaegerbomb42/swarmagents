@@ -1,0 +1,176 @@
+From 2bf77ebd08e1751a322768c451b8cdf76974e4c8 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 13:38:13 -0600
+Subject: [PATCH] feat(swarmagents): branded 404 and error pages (u17)
+
+Add app/not-found.tsx (server): large cyan 404, short copy, and a 'Back
+to your computer' link to /. Add app/error.tsx (client boundary): an error
+card with 'Try again' (reset()) and 'Go home' buttons. Add a minimal
+app/global-error.tsx fallback with its own <html>/<body> and inline styles
+per Next requirements. All match the dark theme (zinc/black surfaces,
+cyan/emerald accents).
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/app/error.tsx        | 37 +++++++++++++
+ apps/swarmagents/app/global-error.tsx | 76 +++++++++++++++++++++++++++
+ apps/swarmagents/app/not-found.tsx    | 20 +++++++
+ 3 files changed, 133 insertions(+)
+ create mode 100644 apps/swarmagents/app/error.tsx
+ create mode 100644 apps/swarmagents/app/global-error.tsx
+ create mode 100644 apps/swarmagents/app/not-found.tsx
+
+diff --git a/apps/swarmagents/app/error.tsx b/apps/swarmagents/app/error.tsx
+new file mode 100644
+index 000000000..cff3ca454
+--- /dev/null
++++ b/apps/swarmagents/app/error.tsx
+@@ -0,0 +1,37 @@
++"use client";
++
++import Link from "next/link";
++
++export default function AppError({
++  reset,
++}: {
++  error: Error & { digest?: string };
++  reset: () => void;
++}) {
++  return (
++    <div className="flex min-h-dvh flex-col items-center justify-center bg-[#07070a] px-4 text-center text-white">
++      <span className="grid h-12 w-12 place-items-center rounded-2xl border border-red-400/20 bg-red-400/10 font-mono text-red-300">
++        !
++      </span>
++      <h1 className="mt-5 text-2xl font-semibold">Something went wrong</h1>
++      <p className="mt-2 max-w-md text-sm leading-relaxed text-white/50">
++        An unexpected error occurred while rendering this page. You can try
++        again, or head back to your computer.
++      </p>
++      <div className="mt-8 flex items-center gap-3">
++        <button
++          onClick={reset}
++          className="rounded-xl bg-white px-5 py-2.5 text-sm font-medium text-black shadow-md transition hover:bg-white/90"
++        >
++          Try again
++        </button>
++        <Link
++          href="/"
++          className="rounded-xl border border-white/15 px-5 py-2.5 text-sm font-medium text-white/70 transition hover:text-white"
++        >
++          Go home
++        </Link>
++      </div>
++    </div>
++  );
++}
+diff --git a/apps/swarmagents/app/global-error.tsx b/apps/swarmagents/app/global-error.tsx
+new file mode 100644
+index 000000000..5d5b0a7e1
+--- /dev/null
++++ b/apps/swarmagents/app/global-error.tsx
+@@ -0,0 +1,76 @@
++"use client";
++
++export default function GlobalError({
++  reset,
++}: {
++  error: Error & { digest?: string };
++  reset: () => void;
++}) {
++  return (
++    <html lang="en">
++      <body
++        style={{
++          margin: 0,
++          background: "#07070a",
++          color: "#fff",
++          fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
++        }}
++      >
++        <div
++          style={{
++            minHeight: "100dvh",
++            display: "flex",
++            flexDirection: "column",
++            alignItems: "center",
++            justifyContent: "center",
++            padding: "1rem",
++            textAlign: "center",
++          }}
++        >
++          <p
++            style={{
++              margin: 0,
++              fontSize: "0.75rem",
++              letterSpacing: "0.2em",
++              textTransform: "uppercase",
++              color: "#22d3ee",
++              fontFamily: "monospace",
++            }}
++          >
++            SwarmAgents
++          </p>
++          <h1 style={{ marginTop: "1rem", fontSize: "1.5rem", fontWeight: 600 }}>
++            Unexpected error
++          </h1>
++          <p
++            style={{
++              marginTop: "0.5rem",
++              maxWidth: "28rem",
++              fontSize: "0.875rem",
++              lineHeight: 1.5,
++              color: "rgba(255,255,255,.5)",
++            }}
++          >
++            An unrecoverable error occurred. Try again, or reload the page.
++          </p>
++          <button
++            onClick={reset}
++            style={{
++              marginTop: "2rem",
++              border: "none",
++              borderRadius: "0.75rem",
++              background: "#fff",
++              color: "#000",
++              padding: "0.625rem 1.25rem",
++              fontSize: "0.875rem",
++              fontWeight: 500,
++              cursor: "pointer",
++            }}
++          >
++            Try again
++          </button>
++        </div>
++      </body>
++    </html>
++  );
++}
+diff --git a/apps/swarmagents/app/not-found.tsx b/apps/swarmagents/app/not-found.tsx
+new file mode 100644
+index 000000000..3aeeeaca1
+--- /dev/null
++++ b/apps/swarmagents/app/not-found.tsx
+@@ -0,0 +1,20 @@
++import Link from "next/link";
++
++export default function NotFound() {
++  return (
++    <div className="flex min-h-dvh flex-col items-center justify-center bg-[#07070a] px-4 text-center text-white">
++      <p className="font-mono text-7xl font-light tracking-tight text-cyan-400">404</p>
++      <h1 className="mt-3 text-lg font-medium">Page not found</h1>
++      <p className="mt-2 max-w-md text-sm leading-relaxed text-white/50">
++        The page you are looking for doesn&rsquo;t exist or has been moved.
++        Check the URL and try again.
++      </p>
++      <Link
++        href="/"
++        className="mt-8 inline-flex items-center gap-2 rounded-xl bg-white px-5 py-2.5 text-sm font-medium text-black shadow-md transition hover:bg-white/90"
++      >
++        Back to your computer
++      </Link>
++    </div>
++  );
++}
+-- 
+2.55.0
+

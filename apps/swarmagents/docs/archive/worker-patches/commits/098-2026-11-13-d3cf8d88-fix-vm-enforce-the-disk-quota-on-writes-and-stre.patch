@@ -1,0 +1,683 @@
+From d3cf8d88fa50211ea460b30f8ee8847716dbcb65 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <2.03348624e+08+yaegerbomb42@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 02:55:53 +0000
+Subject: [PATCH] fix(vm): enforce the disk quota on writes and stream-cap
+ upload bodies (VM-05, VM-06)
+
+VM-05: uploads never called assertDiskQuota, so an over-quota user could keep
+writing and fill the host disk for every tenant.
+- assertDiskQuota(user, incomingBytes) now refuses a write whose *projected*
+  footprint crosses the quota, not only an already-over workspace.
+- The upload route checks the quota with the batch's total bytes before the
+  first write; snapshot restore is gated the same way and drops the cached du
+  measurement afterwards (the restored volume has a different size).
+
+VM-06: the upload guard read Content-Length (0 for chunked bodies) and the
+route sits outside the middleware matcher, so req.formData() buffered an
+unbounded body.
+- lib/body-limit: capBodyStream() counts bytes as they arrive, errors with
+  BodyTooLargeError the moment the cap is crossed and cancels the source, so
+  the rest of the upload is never read.
+- The upload route feeds that stream to the multipart parser and answers 413
+  body_too_large; Content-Length is only an early hint. The cap defaults to
+  10 files x 10 MB + 1 MB and SWARM_UPLOAD_MAX_BODY_BYTES may only lower it.
+
+Tests: over-quota upload rejected (nothing written), projected-over-quota
+upload rejected, chunked body over the cap cut short with 413, chunked body
+under the cap still parsed, restore refused while over quota, cap unit tests.
+
+Refs b13 (VM-05, VM-06)
+---
+ .../api/runtime/vm/files/upload/route.test.ts | 126 ++++++++++++++++++
+ .../app/api/runtime/vm/files/upload/route.ts  |  70 +++++++---
+ .../api/runtime/vm/snapshots/route.test.ts    |  20 +++
+ .../app/api/runtime/vm/snapshots/route.ts     |  14 ++
+ apps/swarmagents/lib/body-limit.test.ts       |  99 ++++++++++++++
+ apps/swarmagents/lib/body-limit.ts            | 118 ++++++++++++++++
+ apps/swarmagents/lib/vm/disk-quota.test.ts    |  35 +++++
+ apps/swarmagents/lib/vm/manager.ts            |  16 ++-
+ 8 files changed, 479 insertions(+), 19 deletions(-)
+ create mode 100644 apps/swarmagents/lib/body-limit.test.ts
+ create mode 100644 apps/swarmagents/lib/body-limit.ts
+
+diff --git a/apps/swarmagents/app/api/runtime/vm/files/upload/route.test.ts b/apps/swarmagents/app/api/runtime/vm/files/upload/route.test.ts
+index 464c65e38..4e0f1376e 100644
+--- a/apps/swarmagents/app/api/runtime/vm/files/upload/route.test.ts
++++ b/apps/swarmagents/app/api/runtime/vm/files/upload/route.test.ts
+@@ -137,6 +137,7 @@ test.afterEach(() => {
+   delete process.env.SWARM_SERVER_MODE;
+   delete process.env.SWARM_HARNESS_TOKEN;
+   delete process.env.SWARM_ALLOWED_HOSTS;
++  delete process.env.SWARM_UPLOAD_MAX_BODY_BYTES;
+ });
+ 
+ test("local mode: uploads a text file into /workspace/uploads", async () => {
+@@ -390,3 +391,128 @@ test("rate limit applies to uploads in server mode (429 once exhausted)", async
+   }
+   assert.equal(lastStatus, 429);
+ });
++
++// ---------------------------------------------------------------------------
++// VM-05 — workspace disk quota on the upload path
++// ---------------------------------------------------------------------------
++
++test("an over-quota upload is rejected before anything is written", async () => {
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, quotas: { diskQuotaMb: 1 } });
++  setVmManagerForTesting(manager);
++  // Fill the workspace past the 1 MB quota (writeFile bypasses the gate here,
++  // exactly like an existing over-quota workspace).
++  await manager.writeFile("local", "/workspace/old.bin", "x".repeat(2 * 1024 * 1024));
++
++  const res = await POST(request([file("new.txt", "hello")]));
++  assert.equal(res.status, 413);
++  const body = await json(res);
++  assert.equal(body.code, "disk_quota");
++  assert.equal(body.limit, 1);
++  assert.equal(driver.peekFile("local", `${UPLOAD_DIR}/new.txt`), undefined);
++  assert.equal(driver.peekFile("local", `${UPLOAD_DIR}/hello.txt`), undefined);
++});
++
++test("an upload that would cross the quota is rejected even when under it now", async () => {
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, quotas: { diskQuotaMb: 2 } });
++  setVmManagerForTesting(manager);
++  await manager.writeFile("local", "/workspace/old.bin", "x".repeat(1536 * 1024)); // 1.5 MB used
++
++  // 1 MB upload: 1.5 + 1 = 2.5 MB projected > 2 MB quota.
++  const big = file("big.bin", new Uint8Array(1024 * 1024), "application/octet-stream");
++  const res = await POST(request([big]));
++  assert.equal(res.status, 413);
++  const body = await json(res);
++  assert.equal(body.code, "disk_quota");
++  assert.equal(driver.peekFile("local", `${UPLOAD_DIR}/big.bin`), undefined);
++});
++
++test("an upload under the quota still succeeds when the quota is enabled", async () => {
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, quotas: { diskQuotaMb: 5 } });
++  setVmManagerForTesting(manager);
++
++  const res = await POST(request([file("ok.txt", "small")]));
++  assert.equal(res.status, 200);
++  assert.equal(driver.peekFile("local", `${UPLOAD_DIR}/ok.txt`), "small");
++});
++
++// ---------------------------------------------------------------------------
++// VM-06 — streaming body cap (chunked uploads have no Content-Length)
++// ---------------------------------------------------------------------------
++
++/** A request whose body is a stream (no Content-Length) that counts pulls. */
++function chunkedRequest(
++  bodyStream: ReadableStream<Uint8Array>,
++  contentType: string,
++): { req: NextRequest; pulls: () => number } {
++  let pulls = 0;
++  const reader = bodyStream.getReader();
++  const counting = new ReadableStream<Uint8Array>({
++    async pull(controller) {
++      pulls += 1;
++      const { done, value } = await reader.read();
++      if (done) controller.close();
++      else controller.enqueue(value);
++    },
++  });
++  const headers = new Headers({ "content-type": contentType, host: "localhost" });
++  // A stream body needs Node's `duplex: "half"`, which Next's RequestInit type
++  // does not declare; the cast keeps the call site honest about that.
++  const init = {
++    method: "POST",
++    headers,
++    body: counting,
++    duplex: "half",
++  } as unknown as ConstructorParameters<typeof NextRequest>[1];
++  const req = new NextRequest("http://localhost/api/runtime/vm/files/upload", init);
++  return { req, pulls: () => pulls };
++}
++
++test("a chunked upload over the cap is aborted with 413 without buffering it all", async () => {
++  process.env.SWARM_UPLOAD_MAX_BODY_BYTES = "1024"; // lowered cap for the test
++  install();
++
++  // 64 KiB of multipart-ish bytes in 1 KiB chunks, far past the 1 KiB cap.
++  let sent = 0;
++  const total = 64 * 1024;
++  const source = new ReadableStream<Uint8Array>({
++    pull(controller) {
++      if (sent >= total) {
++        controller.close();
++        return;
++      }
++      sent += 1024;
++      controller.enqueue(new Uint8Array(1024).fill(65));
++    },
++  });
++  const { req } = chunkedRequest(source, "multipart/form-data; boundary=----swarm");
++  assert.equal(req.headers.get("content-length"), null, "the body must be chunked");
++
++  const res = await POST(req);
++  assert.equal(res.status, 413);
++  const body = await json(res);
++  assert.equal(body.code, "body_too_large");
++  assert.equal(body.limit, 1024);
++  assert.ok(sent < total, `expected the body to be cut short, streamed ${sent} of ${total} bytes`);
++});
++
++test("a chunked multipart upload under the cap still parses and stores the file", async () => {
++  install();
++  const form = new FormData();
++  form.append("files", new File([new TextEncoder().encode("chunked body")], "chunked.txt"), "chunked.txt");
++  const encoded = new Request("http://localhost/api/runtime/vm/files/upload", {
++    method: "POST",
++    body: form,
++  });
++  const contentType = encoded.headers.get("content-type") ?? "";
++  assert.match(contentType, /^multipart\/form-data; boundary=/);
++  assert.ok(encoded.body, "expected an encoded body stream");
++
++  const { req } = chunkedRequest(encoded.body!, contentType);
++  const res = await POST(req);
++  assert.equal(res.status, 200);
++  const body = await json(res);
++  assert.deepEqual(body.uploaded.map((u: any) => u.name), ["chunked.txt"]);
++});
+diff --git a/apps/swarmagents/app/api/runtime/vm/files/upload/route.ts b/apps/swarmagents/app/api/runtime/vm/files/upload/route.ts
+index a0834ae90..8acede92b 100644
+--- a/apps/swarmagents/app/api/runtime/vm/files/upload/route.ts
++++ b/apps/swarmagents/app/api/runtime/vm/files/upload/route.ts
+@@ -16,21 +16,27 @@
+  * driver call.
+  *
+  * Limits are enforced server-side: at most MAX_UPLOAD_FILES files per
+- * request, each at most MAX_UPLOAD_FILE_BYTES. Violations fail the whole
+- * request before anything is written, so a rejected upload never leaves
+- * partial files behind. Successful uploads append one audit entry.
++ * request, each at most MAX_UPLOAD_FILE_BYTES, and the whole body capped as a
++ * stream (so a chunked request without a Content-Length cannot make the
++ * server buffer an unbounded payload). Violations fail the whole request
++ * before anything is written, so a rejected upload never leaves partial files
++ * behind. The workspace disk quota is checked against the incoming bytes
++ * before the first write. Successful uploads append one audit entry.
+  */
+ 
+ import { NextResponse, type NextRequest } from "next/server";
+ import { hostAllowed, requestUser, serverMode } from "../../../../../../lib/auth";
+ import { rateLimitCheck, rateLimitKey, rateLimitResponse } from "../../../../../../lib/rate-limit";
+ import { getVmManager } from "../../../../../../lib/vm/manager";
++import { QuotaError } from "../../../../../../lib/vm/quotas";
++import { BodyTooLargeError, capBodyStream } from "../../../../../../lib/body-limit";
+ import {
+   MAX_UPLOAD_FILE_BYTES,
+   MAX_UPLOAD_FILES,
+   UPLOAD_DIR,
+   looksBinary,
+   resolveWorkspacePath,
++  uploadRequestBodyCap,
+   VmPathError,
+ } from "../../../../../../lib/vm/files";
+ import { recordAudit } from "../../../../../../lib/audit";
+@@ -38,13 +44,6 @@ import { recordAudit } from "../../../../../../lib/audit";
+ export const runtime = "nodejs";
+ export const dynamic = "force-dynamic";
+ 
+-/**
+- * Upper bound for the whole multipart body: the per-file caps plus 1 MiB of
+- * framing overhead. Checked before `formData()` so a client cannot make the
+- * server buffer an arbitrarily large body just to reject it afterwards.
+- */
+-const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_FILES * MAX_UPLOAD_FILE_BYTES + 1024 * 1024;
+-
+ function unauthorized() {
+   return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+ }
+@@ -131,22 +130,41 @@ export async function POST(req: NextRequest) {
+   }
+   if (!user) return unauthorized();
+ 
++  // The body cap. Content-Length is only a hint (absent on chunked requests,
++  // and not enforced by the runtime), so the real gate is the streaming cap
++  // below: the parser is fed a stream that errors and cancels the upload as
++  // soon as the cap is crossed.
++  const bodyCap = uploadRequestBodyCap();
+   const declaredLength = Number(req.headers.get("content-length") ?? "");
+-  if (Number.isFinite(declaredLength) && declaredLength > MAX_UPLOAD_REQUEST_BYTES) {
++  if (Number.isFinite(declaredLength) && declaredLength > bodyCap) {
+     return reject(
+       user,
+       413,
+-      `Upload body exceeds the ${MAX_UPLOAD_REQUEST_BYTES} byte limit.`,
++      `Upload body exceeds the ${bodyCap} byte limit.`,
+       "body_too_large",
+       "request body",
+-      { limit: MAX_UPLOAD_REQUEST_BYTES },
++      { limit: bodyCap },
+     );
+   }
+ 
++  const capped = capBodyStream(req.body, bodyCap);
+   let form: FormData;
+   try {
+-    form = await req.formData();
+-  } catch {
++    const contentType = req.headers.get("content-type") ?? "";
++    form = await new Response(capped.stream, {
++      headers: contentType ? { "content-type": contentType } : {},
++    }).formData();
++  } catch (err) {
++    if (capped.exceeded() || err instanceof BodyTooLargeError) {
++      return reject(
++        user,
++        413,
++        `Upload body exceeds the ${bodyCap} byte limit.`,
++        "body_too_large",
++        "request body",
++        { limit: bodyCap },
++      );
++    }
+     return errorResponse(400, "Expected a multipart/form-data body.", "bad_request");
+   }
+ 
+@@ -211,6 +229,28 @@ export async function POST(req: NextRequest) {
+   }
+ 
+   const vm = getVmManager();
++
++  // Disk quota, checked against the incoming bytes so an upload cannot push a
++  // workspace past its quota (and fill the shared host disk for every tenant).
++  // This runs before the mkdir/write pass: a refused upload writes nothing.
++  const incomingBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
++  try {
++    await vm.assertDiskQuota(user, incomingBytes);
++  } catch (err) {
++    if (err instanceof QuotaError && err.kind === "disk_quota") {
++      return reject(
++        user,
++        413,
++        err.message,
++        "disk_quota",
++        entries.map((entry) => entry.name).join(", "),
++        { limit: err.limit },
++      );
++    }
++    console.error(`[upload] could not check the disk quota for ${user}:`, err);
++    return reject(user, 500, "Could not check the workspace disk quota.", "quota_check_failed", "disk quota");
++  }
++
+   try {
+     // The base64-decode path needs the directory to exist; writeFile creates
+     // parents itself, but one idempotent mkdir covers both.
+diff --git a/apps/swarmagents/app/api/runtime/vm/snapshots/route.test.ts b/apps/swarmagents/app/api/runtime/vm/snapshots/route.test.ts
+index 26192c9ea..90567877a 100644
+--- a/apps/swarmagents/app/api/runtime/vm/snapshots/route.test.ts
++++ b/apps/swarmagents/app/api/runtime/vm/snapshots/route.test.ts
+@@ -101,3 +101,23 @@ test("checkpoints are isolated per user", async () => {
+   const aliceList = await json(await GET(request("/api/runtime/vm/snapshots", {}, "alice")));
+   assert.deepEqual(aliceList.snapshots.map((s: { label: string }) => s.label), ["alice-snap"]);
+ });
++
++test("restore is refused while the workspace is over its disk quota", async () => {
++  const driver = new FakeVmDriver();
++  const manager = new VmManager({ customDriver: driver, quotas: { diskQuotaMb: 1 } });
++  setVmManagerForTesting(manager);
++
++  await manager.writeFile("alice", "/workspace/data.txt", "before");
++  assert.equal((await post({ action: "create", label: "safe" })).status, 201);
++  // Grow past the 1 MB quota after the checkpoint.
++  await manager.writeFile("alice", "/workspace/big.bin", "x".repeat(2 * 1024 * 1024));
++  manager.clearDiskUsage("alice");
++
++  const res = await post({ action: "restore", label: "safe" });
++  assert.equal(res.status, 413);
++  const body = await json(res);
++  assert.equal(body.code, "disk_quota");
++  assert.equal(body.limit, 1);
++  // The restore did not run: the over-quota file is still there.
++  assert.equal(await manager.readFile("alice", "/workspace/big.bin").then((v) => v.length), 2 * 1024 * 1024);
++});
+diff --git a/apps/swarmagents/app/api/runtime/vm/snapshots/route.ts b/apps/swarmagents/app/api/runtime/vm/snapshots/route.ts
+index 2e1495812..6eeb67ece 100644
+--- a/apps/swarmagents/app/api/runtime/vm/snapshots/route.ts
++++ b/apps/swarmagents/app/api/runtime/vm/snapshots/route.ts
+@@ -13,6 +13,7 @@ import { NextResponse, type NextRequest } from "next/server";
+ import { USER_HEADER } from "../../../../../lib/auth";
+ import { getVmManager } from "../../../../../lib/vm/manager";
+ import { validateSnapshotLabel } from "../../../../../lib/vm/docker-driver";
++import { QuotaError } from "../../../../../lib/vm/quotas";
+ import { recordAudit } from "../../../../../lib/audit";
+ 
+ export const runtime = "nodejs";
+@@ -109,11 +110,24 @@ export async function POST(req: NextRequest) {
+ 
+   if (action === "restore") {
+     try {
++      // A restore rewrites /workspace, so it is a write path: refuse it while
++      // the user is already over their disk quota instead of letting the
++      // restored volume grow further.
++      await vm.assertDiskQuota(user);
+       await vm.restore(user, label);
++      // The restored volume has a different size: drop the cached measurement
++      // so the next quota check measures it instead of trusting the stale one.
++      vm.clearDiskUsage(user);
+       recordAudit({ user, action: "snapshot.restore", target: label, result: "success" });
+       return NextResponse.json({ ok: true, label });
+     } catch (err) {
+       recordAudit({ user, action: "snapshot.restore", target: label, result: "failure" });
++      if (err instanceof QuotaError && err.kind === "disk_quota") {
++        return NextResponse.json(
++          { error: err.message, code: "disk_quota", limit: err.limit },
++          { status: 413 },
++        );
++      }
+       if (isNotFound(err)) {
+         return NextResponse.json({ error: err instanceof Error ? err.message : "Snapshot not found." }, { status: 404 });
+       }
+diff --git a/apps/swarmagents/lib/body-limit.test.ts b/apps/swarmagents/lib/body-limit.test.ts
+new file mode 100644
+index 000000000..8a85c0a8d
+--- /dev/null
++++ b/apps/swarmagents/lib/body-limit.test.ts
+@@ -0,0 +1,99 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { BodyTooLargeError, capBodyStream, readCappedBody } from "./body-limit";
++
++/** A body stream of `chunks` byte arrays that counts how many were pulled. */
++function bodyOf(chunks: Uint8Array[]) {
++  const state = { pulled: 0, cancelled: false };
++  const stream = new ReadableStream<Uint8Array>({
++    pull(controller) {
++      if (state.pulled >= chunks.length) {
++        controller.close();
++        return;
++      }
++      controller.enqueue(chunks[state.pulled++]);
++    },
++    cancel() {
++      state.cancelled = true;
++    },
++  });
++  return { stream, state };
++}
++
++function bytes(n: number, value = 120): Uint8Array {
++  return new Uint8Array(n).fill(value);
++}
++
++async function drain(stream: ReadableStream<Uint8Array>): Promise<number> {
++  const reader = stream.getReader();
++  let total = 0;
++  for (;;) {
++    const { done, value } = await reader.read();
++    if (done) return total;
++    total += value.byteLength;
++  }
++}
++
++test("capBodyStream passes a body under the cap through unchanged", async () => {
++  const { stream } = bodyOf([bytes(100), bytes(100)]);
++  const capped = capBodyStream(stream, 300);
++  assert.equal(await drain(capped.stream), 200);
++  assert.equal(capped.exceeded(), false);
++  assert.equal(capped.bytesRead(), 200);
++});
++
++test("capBodyStream accepts a body exactly at the cap", async () => {
++  const { stream } = bodyOf([bytes(100), bytes(100)]);
++  const capped = capBodyStream(stream, 200);
++  assert.equal(await drain(capped.stream), 200);
++  assert.equal(capped.exceeded(), false);
++});
++
++test("capBodyStream aborts as soon as the cap is crossed and cancels the source", async () => {
++  // 10 x 100 bytes behind a 250 byte cap: the third chunk trips it, so at most
++  // 300 bytes are ever pulled — the remaining 700 are never read.
++  const { stream, state } = bodyOf(Array.from({ length: 10 }, () => bytes(100)));
++  const capped = capBodyStream(stream, 250);
++
++  await assert.rejects(drain(capped.stream), (err: unknown) => {
++    assert.ok(err instanceof BodyTooLargeError);
++    assert.equal(err.limit, 250);
++    return true;
++  });
++  assert.equal(capped.exceeded(), true);
++  assert.equal(capped.bytesRead(), 300);
++  // At most one chunk of stream read-ahead beyond the one that crossed the cap.
++  assert.ok(state.pulled <= 4, `expected at most 4 chunks pulled, got ${state.pulled}`);
++  assert.ok(state.pulled < 10, "the rest of the body must never be pulled");
++  assert.equal(state.cancelled, true, "the upstream must be cancelled");
++});
++
++test("capBodyStream treats a missing body as empty", async () => {
++  const capped = capBodyStream(null, 10);
++  assert.equal(await drain(capped.stream), 0);
++  assert.equal(capped.exceeded(), false);
++});
++
++test("capBodyStream with a non-positive limit does not cap", async () => {
++  const { stream } = bodyOf([bytes(1000)]);
++  const capped = capBodyStream(stream, 0);
++  assert.equal(await drain(capped.stream), 1000);
++  assert.equal(capped.exceeded(), false);
++});
++
++test("readCappedBody returns the bytes under the cap", async () => {
++  const { stream } = bodyOf([bytes(4, 1), bytes(4, 2)]);
++  const buf = await readCappedBody(stream, 100);
++  assert.deepEqual([...buf], [1, 1, 1, 1, 2, 2, 2, 2]);
++});
++
++test("readCappedBody throws BodyTooLargeError without buffering the whole body", async () => {
++  const { stream, state } = bodyOf(Array.from({ length: 20 }, () => bytes(64)));
++  await assert.rejects(readCappedBody(stream, 100), BodyTooLargeError);
++  assert.ok(state.pulled <= 2, `expected at most 2 chunks pulled, got ${state.pulled}`);
++  assert.equal(state.cancelled, true);
++});
++
++test("readCappedBody handles an empty body", async () => {
++  assert.equal((await readCappedBody(null, 10)).length, 0);
++});
+diff --git a/apps/swarmagents/lib/body-limit.ts b/apps/swarmagents/lib/body-limit.ts
+new file mode 100644
+index 000000000..9a7434b65
+--- /dev/null
++++ b/apps/swarmagents/lib/body-limit.ts
+@@ -0,0 +1,118 @@
++// Streaming request-body cap.
++//
++// A route that bypasses middleware (uploads) and reads a body with
++// `formData()` buffers everything the client sends. Content-Length is not a
++// defence: a chunked request has none, and a lying one is not enforced by the
++// runtime. This helper wraps the request body in a stream that counts bytes as
++// they arrive, errors with {@link BodyTooLargeError} the moment the cap is
++// crossed, and cancels the upstream so the rest of the body is never read —
++// a client cannot make the server buffer an unbounded payload just to reject
++// it afterwards.
++
++/** Raised when a request body grows past the configured byte cap. */
++export class BodyTooLargeError extends Error {
++  readonly limit: number;
++
++  constructor(limit: number) {
++    super(`Request body exceeds the ${limit} byte limit.`);
++    this.name = "BodyTooLargeError";
++    this.limit = limit;
++  }
++}
++
++/** A capped body stream plus the counters a route needs to answer 413. */
++export interface CappedBody {
++  /** Body to hand to a parser; rejects with BodyTooLargeError past the cap. */
++  stream: ReadableStream<Uint8Array>;
++  /** True once more than `limit` bytes were pulled from the source. */
++  exceeded: () => boolean;
++  /** Bytes pulled from the source so far (including the chunk that tripped the cap). */
++  bytesRead: () => number;
++}
++
++/**
++ * Wrap a request body in a streaming byte cap.
++ *
++ * The stream pulls one chunk at a time: as soon as the running total passes
++ * `limit` it errors and cancels the source, so the caller's parser sees the
++ * failure before the rest of the body is read. A null body (no payload) reads
++ * as an empty stream. A non-positive limit means "no cap".
++ */
++export function capBodyStream(
++  body: ReadableStream<Uint8Array> | null,
++  limit: number,
++): CappedBody {
++  const reader = body?.getReader();
++  let bytes = 0;
++  let exceeded = false;
++
++  // highWaterMark 0: no read-ahead, so the source is pulled only when the
++  // parser asks for bytes — the cap therefore stops the upload exactly at the
++  // chunk that crosses it instead of buffering a queued chunk first.
++  const stream = new ReadableStream<Uint8Array>({
++    async pull(controller) {
++      if (!reader) {
++        controller.close();
++        return;
++      }
++      let chunk: ReadableStreamReadResult<Uint8Array>;
++      try {
++        chunk = await reader.read();
++      } catch (err) {
++        controller.error(err);
++        return;
++      }
++      if (chunk.done) {
++        controller.close();
++        return;
++      }
++      const value = chunk.value;
++      bytes += value.byteLength;
++      if (limit > 0 && bytes > limit) {
++        exceeded = true;
++        controller.error(new BodyTooLargeError(limit));
++        // Stop the upload: the remaining bytes are never pulled from the socket.
++        await reader.cancel().catch(() => {});
++        return;
++      }
++      controller.enqueue(value);
++    },
++    async cancel(reason) {
++      await reader?.cancel(reason).catch(() => {});
++    },
++  }, { highWaterMark: 0 });
++
++  return { stream, exceeded: () => exceeded, bytesRead: () => bytes };
++}
++
++/**
++ * Read a request body into one buffer, aborting as soon as `limit` is passed.
++ * Used by routes that need the whole payload before parsing (multipart); the
++ * buffer never grows past `limit` and the upstream is cancelled on overflow.
++ *
++ * @throws BodyTooLargeError when the body is over the cap.
++ */
++export async function readCappedBody(
++  body: ReadableStream<Uint8Array> | null,
++  limit: number,
++): Promise<Buffer> {
++  const reader = body?.getReader();
++  if (!reader) return Buffer.alloc(0);
++  const chunks: Uint8Array[] = [];
++  let bytes = 0;
++  try {
++    for (;;) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      bytes += value.byteLength;
++      if (limit > 0 && bytes > limit) {
++        await reader.cancel().catch(() => {});
++        throw new BodyTooLargeError(limit);
++      }
++      chunks.push(value);
++    }
++  } finally {
++    reader.releaseLock();
++  }
++  return Buffer.concat(chunks.map((c) => Buffer.from(c.buffer, c.byteOffset, c.byteLength)));
++}
+diff --git a/apps/swarmagents/lib/vm/disk-quota.test.ts b/apps/swarmagents/lib/vm/disk-quota.test.ts
+index a318f4d43..f48a765d4 100644
+--- a/apps/swarmagents/lib/vm/disk-quota.test.ts
++++ b/apps/swarmagents/lib/vm/disk-quota.test.ts
+@@ -115,3 +115,38 @@ test("VmManager disk usage is per-user", async () => {
+   assert.equal(alice.overQuota, true);
+   assert.equal(bob.overQuota, false);
+ });
++
++test("assertDiskQuota refuses a write that would cross the quota (incoming bytes)", async () => {
++  const manager = new VmManager({
++    customDriver: new CountingFake(),
++    quotas: { diskQuotaMb: 2 },
++  });
++
++  await manager.writeFile("alice", "/workspace/a.bin", mib(1)); // 1 MB used of 2 MB
++
++  // A 1 MB write lands exactly on the quota: allowed.
++  const usage = await manager.assertDiskQuota("alice", 1024 * 1024);
++  assert.equal(usage.usedMb, 1);
++  assert.equal(usage.quotaMb, 2);
++
++  // 1.1 MB more would project to 3 MB: refused before anything is written.
++  await assert.rejects(
++    manager.assertDiskQuota("alice", Math.ceil(1.1 * 1024 * 1024)),
++    (err: unknown) =>
++      err instanceof QuotaError &&
++      err.kind === "disk_quota" &&
++      err.limit === 2 &&
++      /plus this write \(2 MB\)/.test(err.message),
++  );
++});
++
++test("assertDiskQuota with incoming bytes is a no-op when the quota is disabled", async () => {
++  const manager = new VmManager({
++    customDriver: new CountingFake(),
++    quotas: { diskQuotaMb: 0 },
++  });
++  await manager.writeFile("alice", "/workspace/a.bin", mib(5));
++  const usage = await manager.assertDiskQuota("alice", 10 * 1024 * 1024);
++  assert.equal(usage.quotaMb, 0);
++  assert.equal(usage.overQuota, false);
++});
+diff --git a/apps/swarmagents/lib/vm/manager.ts b/apps/swarmagents/lib/vm/manager.ts
+index 56f1d7af6..93edce9bc 100644
+--- a/apps/swarmagents/lib/vm/manager.ts
++++ b/apps/swarmagents/lib/vm/manager.ts
+@@ -265,18 +265,26 @@ export class VmManager {
+    * No-op (and no du call) when the quota is disabled (0). Throws a typed
+    * QuotaError (kind "disk_quota") with an actionable message.
+    */
+-  async assertDiskQuota(userId: string): Promise<VmDiskUsage> {
++  async assertDiskQuota(userId: string, incomingBytes = 0): Promise<VmDiskUsage> {
+     if (this.quotas.diskQuotaMb <= 0) {
+       return { usedMb: 0, quotaMb: 0, overQuota: false };
+     }
+     const usage = await this.diskUsage(userId);
+-    if (usage.overQuota) {
++    // A write is refused when the *projected* footprint would cross the quota,
++    // not only when the workspace is already over it: an upload must not be
++    // able to write the user (and the shared host disk) past the limit.
++    const incomingMb = incomingBytes > 0 ? Math.ceil(incomingBytes / (1024 * 1024)) : 0;
++    const projectedMb = usage.usedMb + incomingMb;
++    if (projectedMb > usage.quotaMb) {
+       throw new QuotaError(
+         "disk_quota",
+         usage.quotaMb,
+         userId,
+-        `Workspace disk usage (${usage.usedMb} MB) exceeds the quota of ${usage.quotaMb} MB. ` +
+-          "Free space in /workspace or reset your VM, then start a new run.",
++        incomingBytes > 0
++          ? `Workspace disk usage (${usage.usedMb} MB) plus this write (${incomingMb} MB) ` +
++              `exceeds the quota of ${usage.quotaMb} MB. Free space in /workspace or reset your VM.`
++          : `Workspace disk usage (${usage.usedMb} MB) exceeds the quota of ${usage.quotaMb} MB. ` +
++              "Free space in /workspace or reset your VM, then start a new run.",
+       );
+     }
+     return usage;
+-- 
+2.55.0
+

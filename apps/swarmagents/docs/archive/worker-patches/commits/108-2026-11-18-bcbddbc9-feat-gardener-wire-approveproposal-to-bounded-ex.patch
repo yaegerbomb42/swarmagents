@@ -1,0 +1,440 @@
+From bcbddbc916869f2c4fdd708f8163094094882191 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 12:04:08 -0600
+Subject: [PATCH] feat(gardener): wire approveProposal to bounded execution and
+ outcome tracking
+
+---
+ apps/swarmagents/app/api/gardener/route.ts    |  13 +-
+ .../swarmagents/lib/gardener/gardener.test.ts | 102 +++++++++++-
+ apps/swarmagents/lib/gardener/proposals.ts    |  46 ++++++
+ apps/swarmagents/lib/gardener/store.ts        |  18 +++
+ apps/swarmagents/lib/gardener/tick.ts         | 148 +++++++++++++++++-
+ apps/swarmagents/lib/gardener/types.ts        |  10 ++
+ 6 files changed, 331 insertions(+), 6 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/gardener/route.ts b/apps/swarmagents/app/api/gardener/route.ts
+index cb433c3b6..c2eb3902d 100644
+--- a/apps/swarmagents/app/api/gardener/route.ts
++++ b/apps/swarmagents/app/api/gardener/route.ts
+@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
+ import { requestUser } from "@/lib/auth";
+ import { getVmManager } from "@/lib/vm/manager";
+ import { readUserGardener, setProposalStatus, updateUserGardener, clampElo } from "@/lib/gardener/store";
+-import { runAutopilotTick } from "@/lib/gardener/tick";
++import { runAutopilotTick, approveProposal } from "@/lib/gardener/tick";
+ 
+ export const dynamic = "force-dynamic";
+ 
+@@ -59,10 +59,17 @@ export async function POST(req: NextRequest) {
+     });
+     return NextResponse.json(state);
+   }
+-  if (body.action === "approve" || body.action === "dismiss") {
++  if (body.action === "approve") {
+     const proposalId = body.proposalId;
+     if (!proposalId) return NextResponse.json({ error: "proposalId required" }, { status: 400 });
+-    const row = setProposalStatus(id, proposalId, body.action === "approve" ? "approved" : "dismissed");
++    const { proposal, runId, error } = await approveProposal(id, proposalId);
++    if (!proposal) return NextResponse.json({ error: "not found" }, { status: 404 });
++    return NextResponse.json({ ...proposal, runId, error });
++  }
++  if (body.action === "dismiss") {
++    const proposalId = body.proposalId;
++    if (!proposalId) return NextResponse.json({ error: "proposalId required" }, { status: 400 });
++    const row = setProposalStatus(id, proposalId, "dismissed");
+     if (!row) return NextResponse.json({ error: "not found" }, { status: 404 });
+     return NextResponse.json(row);
+   }
+diff --git a/apps/swarmagents/lib/gardener/gardener.test.ts b/apps/swarmagents/lib/gardener/gardener.test.ts
+index a6e60e66d..e9a888440 100644
+--- a/apps/swarmagents/lib/gardener/gardener.test.ts
++++ b/apps/swarmagents/lib/gardener/gardener.test.ts
+@@ -7,7 +7,7 @@ import { eloFit, idealBoardTasks } from "./elo";
+ import { hasSurplusQuota } from "./quota";
+ import { proposalsFromAnalysis } from "./proposals";
+ import { configureGardenerDir, readUserGardener, setProposalStatus, updateUserGardener } from "./store";
+-import { decideAutopilotTick } from "./tick";
++import { decideAutopilotTick, approveProposal, executeProposal, type ExecuteProposalDeps, GARDENER_TOOL_ALLOWLIST } from "./tick";
+ import { inAutopilotWindow } from "./window";
+ 
+ const idleMs = 30 * 60_000;
+@@ -118,3 +118,103 @@ test("approval is one status flip and persists", () => {
+   assert.equal(readUserGardener("local").enabled, true);
+   configureGardenerDir(null);
+ });
++
++test("approveProposal enqueues bounded run and records outcome on proposal", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gardener-exec-"));
++  configureGardenerDir(dir);
++
++  updateUserGardener("local", (state) => {
++    state.enabled = true;
++    state.proposals.push({
++      id: "prop_unit_1",
++      userId: "local",
++      kind: "unit-test",
++      title: "Missing unit tests: lib/a.ts",
++      summary: "heat 2.0 with 0% coverage",
++      path: "lib/a.ts",
++      repoRoot: "/repos/app",
++      status: "awaiting_approval",
++      createdAt: 100,
++    });
++  });
++
++  const runsStarted: Array<{ userId: string; prompt: string; fullAuto?: boolean; toolAllowlist?: readonly string[] }> = [];
++  let terminalListener: ((status: string) => void) | undefined;
++
++  const mockDeps: ExecuteProposalDeps = {
++    ensureVm: async () => {},
++    startRun: (userId, input) => {
++      runsStarted.push({ userId, ...input });
++      return { accepted: true, runId: "run_test_123" };
++    },
++    onTerminal: (_runId, listener) => {
++      terminalListener = listener;
++      return () => {};
++    },
++    readReport: (_runId) => ({
++      status: "finished",
++      summary: "Added 5 unit tests for lib/a.ts, all passed.",
++    }),
++  };
++
++  const res = await approveProposal("local", "prop_unit_1", mockDeps);
++  assert.equal(res.proposal?.status, "approved");
++  assert.equal(res.runId, "run_test_123");
++  assert.equal(runsStarted.length, 1);
++  assert.equal(runsStarted[0].fullAuto, true);
++  assert.deepEqual(runsStarted[0].toolAllowlist, GARDENER_TOOL_ALLOWLIST);
++  assert.ok(runsStarted[0].prompt.includes("lib/a.ts"));
++
++  // Check persisted state right after enqueue
++  let persisted = readUserGardener("local").proposals.find((p) => p.id === "prop_unit_1");
++  assert.equal(persisted?.runId, "run_test_123");
++  assert.equal(persisted?.outcome?.status, "running");
++
++  // Terminal event fires
++  assert.ok(terminalListener);
++  terminalListener!("run.finished");
++
++  persisted = readUserGardener("local").proposals.find((p) => p.id === "prop_unit_1");
++  assert.equal(persisted?.outcome?.status, "finished");
++  assert.equal(persisted?.outcome?.summary, "Added 5 unit tests for lib/a.ts, all passed.");
++
++  configureGardenerDir(null);
++});
++
++test("dismissed or rejected proposal enqueues nothing", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gardener-dismiss-"));
++  configureGardenerDir(dir);
++
++  updateUserGardener("local", (state) => {
++    state.enabled = true;
++    state.proposals.push({
++      id: "prop_pr_1",
++      userId: "local",
++      kind: "pr",
++      title: "Review hotspot",
++      summary: "heat 5.0",
++      status: "awaiting_approval",
++      createdAt: 100,
++    });
++  });
++
++  let runCount = 0;
++  const mockDeps: ExecuteProposalDeps = {
++    startRun: () => {
++      runCount++;
++      return { accepted: true, runId: "run_never" };
++    },
++  };
++
++  // Dismissing flips status to dismissed without executing
++  const dismissed = setProposalStatus("local", "prop_pr_1", "dismissed");
++  assert.equal(dismissed?.status, "dismissed");
++  assert.equal(runCount, 0);
++
++  const proposal = readUserGardener("local").proposals.find((p) => p.id === "prop_pr_1");
++  assert.equal(proposal?.status, "dismissed");
++  assert.equal(proposal?.runId, undefined);
++  assert.equal(proposal?.outcome, undefined);
++
++  configureGardenerDir(null);
++});
+diff --git a/apps/swarmagents/lib/gardener/proposals.ts b/apps/swarmagents/lib/gardener/proposals.ts
+index 1a9ea8d43..f787afa5c 100644
+--- a/apps/swarmagents/lib/gardener/proposals.ts
++++ b/apps/swarmagents/lib/gardener/proposals.ts
+@@ -95,3 +95,49 @@ export function proposalsFromBoard(input: {
+   }
+   return out;
+ }
++
++export function proposalPrompt(proposal: GardenerProposal): string {
++  if (proposal.kind === "unit-test") {
++    return [
++      `Autopilot Proposal: Unit Test Implementation`,
++      `Target File: ${proposal.path ?? "hotspot file"}`,
++      proposal.repoRoot ? `Repository Root: ${proposal.repoRoot}` : "",
++      ``,
++      `Instructions:`,
++      `1. Analyze the target file and any existing test suites.`,
++      `2. Write comprehensive unit tests for uncovered code paths and edge cases.`,
++      `3. Run test runner locally to verify tests pass and improve coverage.`,
++      `4. Keep changes focused strictly on unit tests for ${proposal.path ?? "the target file"}.`,
++    ].filter(Boolean).join("\n");
++  }
++
++  if (proposal.kind === "pr") {
++    return [
++      `Autopilot Proposal: Hotspot Review & PR`,
++      `Target File: ${proposal.path ?? "hotspot file"}`,
++      proposal.repoRoot ? `Repository Root: ${proposal.repoRoot}` : "",
++      ``,
++      `Instructions:`,
++      `1. Review the target hotspot file for performance bottlenecks, edge cases, and code quality.`,
++      `2. Implement necessary refactors or safety improvements safely.`,
++      `3. Verify existing tests and typecheck pass without regressions.`,
++      `4. Prepare the changes for a clean pull request.`,
++    ].filter(Boolean).join("\n");
++  }
++
++  // board-task
++  return [
++    `Autopilot Proposal: Swarm Board Task Execution`,
++    `Task ID: ${proposal.taskId ?? "unknown"}`,
++    `Title: ${proposal.title}`,
++    ``,
++    `Summary / Description:`,
++    proposal.summary,
++    ``,
++    `Instructions:`,
++    `1. Read the task requirements carefully.`,
++    `2. Implement the requested changes and any required unit tests.`,
++    `3. Verify typecheck, unit tests, and build pass cleanly.`,
++    `4. Submit the work or prepare submission for the swarm board.`,
++  ].join("\n");
++}
+diff --git a/apps/swarmagents/lib/gardener/store.ts b/apps/swarmagents/lib/gardener/store.ts
+index da005df5b..800340831 100644
+--- a/apps/swarmagents/lib/gardener/store.ts
++++ b/apps/swarmagents/lib/gardener/store.ts
+@@ -80,6 +80,24 @@ export function setProposalStatus(
+     const row = state.proposals.find((p) => p.id === proposalId);
+     if (!row) return;
+     row.status = status;
++    if (status === "approved" && !row.approvedAt) {
++      row.approvedAt = Date.now();
++    }
++    found = row;
++  });
++  return found;
++}
++
++export function updateProposalRecord(
++  userId: string,
++  proposalId: string,
++  mutate: (proposal: GardenerProposal) => void,
++): GardenerProposal | null {
++  let found: GardenerProposal | null = null;
++  updateUserGardener(userId, (state) => {
++    const row = state.proposals.find((p) => p.id === proposalId);
++    if (!row) return;
++    mutate(row);
+     found = row;
+   });
+   return found;
+diff --git a/apps/swarmagents/lib/gardener/tick.ts b/apps/swarmagents/lib/gardener/tick.ts
+index 942a341f9..5e6f9d578 100644
+--- a/apps/swarmagents/lib/gardener/tick.ts
++++ b/apps/swarmagents/lib/gardener/tick.ts
+@@ -5,10 +5,154 @@ import type { CodebaseScanner } from "../codebase/types";
+ import type { VmManager } from "../vm/manager";
+ import { idealBoardTasks } from "./elo";
+ import { hasSurplusQuota } from "./quota";
+-import { proposalsFromAnalysis, proposalsFromBoard } from "./proposals";
+-import { readUserGardener, updateUserGardener } from "./store";
++import { proposalsFromAnalysis, proposalsFromBoard, proposalPrompt } from "./proposals";
++import { readUserGardener, setProposalStatus, updateProposalRecord, updateUserGardener } from "./store";
+ import type { BoardTaskInput, GardenerProposal, HotspotInput, QuotaProvider } from "./types";
+ import { inAutopilotWindow } from "./window";
++import { getRuntimeManager } from "../runtime/manager";
++import { telemetryBus } from "../telemetry/bus";
++import { readRunReport } from "../runtime/run-report";
++
++export const GARDENER_TOOL_ALLOWLIST = ["Read", "Write", "Bash", "Glob", "Grep"] as const;
++export const GARDENER_DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
++
++export interface ExecuteProposalDeps {
++  ensureVm?: (userId: string) => Promise<void>;
++  startRun: (userId: string, input: {
++    prompt: string;
++    fullAuto?: boolean;
++    toolAllowlist?: readonly string[];
++  }) => { accepted: boolean; runId: string; queued?: boolean; error?: string };
++  onTerminal?: (runId: string, listener: (status: string) => void) => () => void;
++  readReport?: (runId: string) => { status?: string; summary?: string } | null;
++}
++
++const TERMINAL_EVENTS = new Set(["run.finished", "run.error", "run.cancelled"]);
++
++function defaultExecutionDeps(): ExecuteProposalDeps {
++  const runtime = getRuntimeManager();
++  return {
++    ensureVm: async (userId) => {
++      await runtime.vmManager.ensure(userId);
++    },
++    startRun: (userId, input) => runtime.start(userId, input),
++    onTerminal: (runId, listener) =>
++      telemetryBus.subscribe(runId, 0, (event) => {
++        if (!TERMINAL_EVENTS.has(event.type)) return;
++        listener(event.type);
++      }),
++    readReport: (runId) => {
++      const rep = readRunReport(runId);
++      if (!rep) return null;
++      return {
++        status: rep.status,
++        summary: rep.finalText?.slice(0, 500) || rep.couldNotDo[0],
++      };
++    },
++  };
++}
++
++let testExecutionDeps: ExecuteProposalDeps | null = null;
++
++export function setGardenerExecutionDepsForTesting(deps: ExecuteProposalDeps | null): void {
++  testExecutionDeps = deps;
++}
++
++export function getGardenerExecutionDeps(): ExecuteProposalDeps {
++  return testExecutionDeps ?? defaultExecutionDeps();
++}
++
++/**
++ * Execute an approved proposal: ensures VM is ready, starts a bounded run,
++ * updates the proposal record with runId, and tracks outcome on completion.
++ */
++export async function executeProposal(
++  userId: string,
++  proposal: GardenerProposal,
++  deps: ExecuteProposalDeps = getGardenerExecutionDeps(),
++): Promise<{ ok: boolean; runId?: string; error?: string }> {
++  try {
++    if (deps.ensureVm) {
++      await deps.ensureVm(userId);
++    }
++  } catch (err) {
++    const errorMsg = err instanceof Error ? err.message : String(err);
++    updateProposalRecord(userId, proposal.id, (p) => {
++      p.outcome = {
++        status: "error",
++        error: `VM preparation failed: ${errorMsg}`,
++        completedAt: Date.now(),
++      };
++    });
++    return { ok: false, error: errorMsg };
++  }
++
++  const prompt = proposalPrompt(proposal);
++  const started = deps.startRun(userId, {
++    prompt,
++    fullAuto: true,
++    toolAllowlist: GARDENER_TOOL_ALLOWLIST,
++  });
++
++  if (!started.accepted || !started.runId) {
++    const errorMsg = started.error ?? "Failed to enqueue proposal run";
++    updateProposalRecord(userId, proposal.id, (p) => {
++      p.outcome = {
++        status: "error",
++        error: errorMsg,
++        completedAt: Date.now(),
++      };
++    });
++    return { ok: false, error: errorMsg };
++  }
++
++  const runId = started.runId;
++  updateProposalRecord(userId, proposal.id, (p) => {
++    p.runId = runId;
++    p.outcome = {
++      status: "running",
++    };
++  });
++
++  if (deps.onTerminal) {
++    const unsubscribe = deps.onTerminal(runId, (eventType) => {
++      unsubscribe?.();
++      const report = deps.readReport?.(runId);
++      const outcomeStatus: "finished" | "error" | "cancelled" =
++        eventType === "run.finished" ? "finished" : eventType === "run.cancelled" ? "cancelled" : "error";
++      updateProposalRecord(userId, proposal.id, (p) => {
++        p.outcome = {
++          status: outcomeStatus,
++          summary: report?.summary,
++          completedAt: Date.now(),
++        };
++      });
++    });
++  }
++
++  return { ok: true, runId };
++}
++
++/**
++ * Approves a proposal and dispatches execution if status transitions to approved.
++ * If proposal is already approved or not found, behaves safely.
++ */
++export async function approveProposal(
++  userId: string,
++  proposalId: string,
++  deps: ExecuteProposalDeps = getGardenerExecutionDeps(),
++): Promise<{ proposal: GardenerProposal | null; runId?: string; error?: string }> {
++  const proposal = setProposalStatus(userId, proposalId, "approved");
++  if (!proposal) return { proposal: null, error: "not found" };
++
++  const execResult = await executeProposal(userId, proposal, deps);
++  const updated = readUserGardener(userId).proposals.find((p) => p.id === proposalId) ?? proposal;
++  return {
++    proposal: updated,
++    runId: execResult.runId,
++    error: execResult.error,
++  };
++}
+ 
+ export interface AutopilotTickInput {
+   userId: string;
+diff --git a/apps/swarmagents/lib/gardener/types.ts b/apps/swarmagents/lib/gardener/types.ts
+index 1b971bbc2..88ac42bb0 100644
+--- a/apps/swarmagents/lib/gardener/types.ts
++++ b/apps/swarmagents/lib/gardener/types.ts
+@@ -3,6 +3,13 @@ export type GardenerProposalKind = "unit-test" | "pr" | "board-task";
+ 
+ export type GardenerProposalStatus = "awaiting_approval" | "approved" | "dismissed";
+ 
++export interface GardenerProposalOutcome {
++  status: "finished" | "error" | "cancelled" | "running";
++  summary?: string;
++  error?: string;
++  completedAt?: number;
++}
++
+ export interface GardenerProposal {
+   id: string;
+   userId: string;
+@@ -15,6 +22,9 @@ export interface GardenerProposal {
+   minElo?: number;
+   status: GardenerProposalStatus;
+   createdAt: number;
++  runId?: string;
++  approvedAt?: number;
++  outcome?: GardenerProposalOutcome;
+ }
+ 
+ export interface PinnedProject {
+-- 
+2.55.0
+

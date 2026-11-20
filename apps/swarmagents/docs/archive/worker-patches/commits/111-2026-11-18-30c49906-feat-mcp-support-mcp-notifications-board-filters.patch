@@ -1,0 +1,459 @@
+From 30c499067d08a72b5280637e82231b9a6b7f751c Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 18 Nov 2026 12:25:50 -0600
+Subject: [PATCH] feat(mcp): support mcp notifications, board filters, and
+ update_task/post_message tools
+
+---
+ .../app/api/mcp/memory/route.test.ts          |   5 +
+ apps/swarmagents/app/api/mcp/memory/route.ts  |  11 ++
+ .../app/api/mcp/swarm-board/route.test.ts     | 161 ++++++++++++++++++
+ .../app/api/mcp/swarm-board/route.ts          |  29 ++++
+ apps/swarmagents/lib/board/handlers.ts        | 110 ++++++++++++
+ apps/swarmagents/lib/board/validation.ts      |  28 +++
+ 6 files changed, 344 insertions(+)
+
+diff --git a/apps/swarmagents/app/api/mcp/memory/route.test.ts b/apps/swarmagents/app/api/mcp/memory/route.test.ts
+index 9321f9189..eda5cd4fe 100644
+--- a/apps/swarmagents/app/api/mcp/memory/route.test.ts
++++ b/apps/swarmagents/app/api/mcp/memory/route.test.ts
+@@ -95,3 +95,8 @@ test("a malformed request is rejected", async () => {
+   const body = (await res.json()) as { error: { code: number } };
+   assert.equal(body.error.code, -32600);
+ });
++
++test("notifications with no id return 202 Accepted", async () => {
++  const res = await POST(rpc({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }));
++  assert.equal(res.status, 202);
++});
+diff --git a/apps/swarmagents/app/api/mcp/memory/route.ts b/apps/swarmagents/app/api/mcp/memory/route.ts
+index 79bbf046f..078958db0 100644
+--- a/apps/swarmagents/app/api/mcp/memory/route.ts
++++ b/apps/swarmagents/app/api/mcp/memory/route.ts
+@@ -81,6 +81,17 @@ export async function POST(request: NextRequest) {
+   const id = payload.id ?? null;
+   const method = typeof payload.method === "string" ? payload.method : "";
+ 
++  // Handle JSON-RPC notifications (no id)
++  if (payload.id === undefined) {
++    if (
++      method === "notifications/initialized" ||
++      method === "notifications/cancelled" ||
++      method.startsWith("notifications/")
++    ) {
++      return new NextResponse(null, { status: 202 });
++    }
++  }
++
+   if (method === "initialize") {
+     return jsonRpcResponse(
+       {
+diff --git a/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts b/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+index 7656656cc..0c7b80319 100644
+--- a/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
++++ b/apps/swarmagents/app/api/mcp/swarm-board/route.test.ts
+@@ -211,3 +211,164 @@ test("POST tools/call with an invalid id type returns -32602 Invalid params", as
+   assert.equal(body.error?.code, -32602);
+   assert.equal(body.result, undefined);
+ });
++
++test("POST notification with no id returns 202 Accepted", async () => {
++  const res = await POST(
++    new NextRequest("http://localhost/api/mcp/swarm-board", {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({
++        jsonrpc: "2.0",
++        method: "notifications/initialized",
++        params: {},
++      }),
++    }),
++  );
++  assert.equal(res.status, 202);
++});
++
++test("GET supports ?difficulty= and ?claimedBy= filters", async () => {
++  const dir = tmpDir();
++  const dataFile = path.join(dir, "swarm_board.json");
++  fs.writeFileSync(
++    dataFile,
++    JSON.stringify({
++      tasks: [
++        {
++          id: "task_easy",
++          title: "Easy open",
++          description: "D",
++          difficulty: "easy",
++          minElo: 1200,
++          constraints: [],
++          status: "open",
++          createdAt: 1,
++          updatedAt: 1,
++        },
++        {
++          id: "task_hard_claimed",
++          title: "Hard claimed",
++          description: "D",
++          difficulty: "hard",
++          minElo: 1600,
++          constraints: [],
++          status: "claimed",
++          claimedBy: "worker-http-infra",
++          createdAt: 2,
++          updatedAt: 2,
++        },
++      ],
++      proposals: [],
++      messages: [],
++    }),
++    "utf-8",
++  );
++  configureStorePaths(dir, dataFile);
++  try {
++    const resDiff = await GET(request("/api/mcp/swarm-board?difficulty=hard"));
++    assert.equal(resDiff.status, 200);
++    const bodyDiff = (await resDiff.json()) as { tasks?: Array<{ id: string }> };
++    assert.equal(bodyDiff.tasks?.length, 1);
++    assert.equal(bodyDiff.tasks?.[0].id, "task_hard_claimed");
++
++    const resClaimed = await GET(request("/api/mcp/swarm-board?claimedBy=worker-http-infra"));
++    assert.equal(resClaimed.status, 200);
++    const bodyClaimed = (await resClaimed.json()) as { tasks?: Array<{ id: string }> };
++    assert.equal(bodyClaimed.tasks?.length, 1);
++    assert.equal(bodyClaimed.tasks?.[0].id, "task_hard_claimed");
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("POST tools/call update_task updates task status and summary", async () => {
++  const dir = tmpDir();
++  const dataFile = path.join(dir, "swarm_board.json");
++  fs.writeFileSync(
++    dataFile,
++    JSON.stringify({
++      tasks: [
++        {
++          id: "task_update_test",
++          title: "Task update test",
++          description: "D",
++          difficulty: "medium",
++          minElo: 1400,
++          constraints: [],
++          status: "claimed",
++          claimedBy: "worker-test",
++          createdAt: 1,
++          updatedAt: 1,
++        },
++      ],
++      proposals: [],
++      messages: [],
++    }),
++    "utf-8",
++  );
++  configureStorePaths(dir, dataFile);
++  try {
++    const res = await POST(
++      new NextRequest("http://localhost/api/mcp/swarm-board", {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({
++          jsonrpc: "2.0",
++          id: 10,
++          method: "tools/call",
++          params: {
++            name: "update_task",
++            arguments: {
++              taskId: "task_update_test",
++              agentName: "worker-test",
++              summary: "Midway checkpoint reached",
++              progress: "50% done",
++            },
++          },
++        }),
++      }),
++    );
++    assert.equal(res.status, 200);
++    const data = (await res.json()) as { result?: { content?: Array<{ text: string }> } };
++    assert.ok(data.result?.content?.[0]?.text);
++    const parsed = JSON.parse(data.result.content[0].text);
++    assert.match(parsed.task.resultSummary, /50% done/);
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
++
++test("POST tools/call post_message appends to store messages", async () => {
++  const dir = tmpDir();
++  const dataFile = path.join(dir, "swarm_board.json");
++  seed(dataFile);
++  configureStorePaths(dir, dataFile);
++  try {
++    const res = await POST(
++      new NextRequest("http://localhost/api/mcp/swarm-board", {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({
++          jsonrpc: "2.0",
++          id: 11,
++          method: "tools/call",
++          params: {
++            name: "post_message",
++            arguments: {
++              fromAgent: "worker-test",
++              channel: "general",
++              content: "Hello swarm",
++            },
++          },
++        }),
++      }),
++    );
++    assert.equal(res.status, 200);
++    const data = (await res.json()) as { result?: { content?: Array<{ text: string }> } };
++    assert.ok(data.result?.content?.[0]?.text);
++    const parsed = JSON.parse(data.result.content[0].text);
++    assert.equal(parsed.swarmMessage.content, "Hello swarm");
++  } finally {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/apps/swarmagents/app/api/mcp/swarm-board/route.ts b/apps/swarmagents/app/api/mcp/swarm-board/route.ts
+index 4a55c5da4..f4b75f04f 100644
+--- a/apps/swarmagents/app/api/mcp/swarm-board/route.ts
++++ b/apps/swarmagents/app/api/mcp/swarm-board/route.ts
+@@ -21,6 +21,8 @@ import {
+   handleRecordMatch,
+   handleSyncArtifact,
+   handleListArtifacts,
++  handleUpdateTask,
++  handlePostMessage,
+ } from "@/lib/board/handlers";
+ 
+ export const dynamic = "force-dynamic";
+@@ -117,11 +119,19 @@ export async function GET(req: NextRequest) {
+   const store = loaded.store;
+   const url = new URL(req.url);
+   const status = url.searchParams.get("status");
++  const difficulty = url.searchParams.get("difficulty");
++  const claimedBy = url.searchParams.get("claimedBy");
+ 
+   let tasks = store.tasks;
+   if (status) {
+     tasks = tasks.filter((t) => t.status === status);
+   }
++  if (difficulty) {
++    tasks = tasks.filter((t) => t.difficulty === difficulty);
++  }
++  if (claimedBy) {
++    tasks = tasks.filter((t) => t.claimedBy === claimedBy);
++  }
+   // Always surface the audit trail, including for tasks persisted before
+   // transition history existed.
+   tasks = tasks.map((t) => ({ ...t, history: Array.isArray(t.history) ? t.history : [] }));
+@@ -180,6 +190,17 @@ export async function POST(req: NextRequest) {
+ 
+   const { id, method, params } = body;
+ 
++  // Handle JSON-RPC notifications (no id)
++  if (id === undefined) {
++    if (
++      method === "notifications/initialized" ||
++      method === "notifications/cancelled" ||
++      (typeof method === "string" && method.startsWith("notifications/"))
++    ) {
++      return new NextResponse(null, { status: 202 });
++    }
++  }
++
+   if (method === "initialize") {
+     return jsonRpcResponse(handleInitialize(id), id);
+   }
+@@ -253,6 +274,14 @@ export async function POST(req: NextRequest) {
+       return runReadTool(id, (store) => handleListArtifacts(store, args));
+     }
+ 
++    if (name === "update_task") {
++      return runLockedTool(id, () => withLockedStore((store) => handleUpdateTask(store, args)));
++    }
++
++    if (name === "post_message") {
++      return runLockedTool(id, () => withLockedStore((store) => handlePostMessage(store, args)));
++    }
++
+     return jsonRpcError(-32601, `Unknown tool: ${name}`, id);
+   }
+ 
+diff --git a/apps/swarmagents/lib/board/handlers.ts b/apps/swarmagents/lib/board/handlers.ts
+index d44f16ac4..9bbd87606 100644
+--- a/apps/swarmagents/lib/board/handlers.ts
++++ b/apps/swarmagents/lib/board/handlers.ts
+@@ -22,9 +22,12 @@ import {
+   validateRecordMatch,
+   validateSyncArtifact,
+   validateListArtifacts,
++  validateUpdateTask,
++  validatePostMessage,
+ } from "./validation";
+ import { randomUUID } from "node:crypto";
+ import type { HybridArtifact } from "./types";
++import type { SwarmMessage } from "@/lib/mcp-types";
+ 
+ export type JsonRpcError = { code: number; message: string };
+ export type JsonRpcResult = { content: Array<{ type: "text"; text: string }> };
+@@ -317,6 +320,34 @@ export function handleToolsList(id: unknown) {
+             },
+           },
+         },
++        {
++          name: "update_task",
++          description: "Update an in-progress task's status, progress, or summary without full review submission.",
++          inputSchema: {
++            type: "object",
++            properties: {
++              taskId: { type: "string" },
++              agentName: { type: "string" },
++              status: { type: "string", enum: ["open", "claimed", "in_review", "completed", "blocked"] },
++              summary: { type: "string" },
++              progress: { type: "string" },
++            },
++            required: ["taskId", "agentName"],
++          },
++        },
++        {
++          name: "post_message",
++          description: "Post a message or blocker update to the swarm communication channel.",
++          inputSchema: {
++            type: "object",
++            properties: {
++              fromAgent: { type: "string" },
++              channel: { type: "string", enum: ["general", "blockers", "announcements", "idle_scouts"] },
++              content: { type: "string" },
++            },
++            required: ["fromAgent", "channel", "content"],
++          },
++        },
+       ],
+     },
+   };
+@@ -629,3 +660,82 @@ export function handleListArtifacts(
+   const artifacts = (store.artifacts ?? []).filter((artifact) => !runId || artifact.runId === runId);
+   return { result: ok(JSON.stringify({ artifacts }, null, 2)) };
+ }
++
++export async function handleUpdateTask(
++  store: BoardStore,
++  args: Record<string, unknown>
++): Promise<{ result: JsonRpcResult } | { error: JsonRpcError }> {
++  const ve = validateUpdateTask(args);
++  if (ve.length) {
++    return { error: invalidParams(ve.map((v) => `${v.field}: ${v.message}`).join("; ")) };
++  }
++
++  const taskId = String(args.taskId);
++  const agentName = String(args.agentName);
++  const task = store.tasks.find((t) => t.id === taskId);
++  if (!task) return { error: notFound("Task not found") };
++
++  // Only the claiming agent or orchestrator can update an assigned task
++  if (task.claimedBy && task.claimedBy !== agentName && agentName !== "orchestrator") {
++    return {
++      error: invalidParams(
++        `Task is claimed by ${task.claimedBy}; agent ${agentName} cannot update it`
++      ),
++    };
++  }
++
++  const prevStatus = task.status;
++  if (args.status && typeof args.status === "string") {
++    const nextStatus = args.status as TaskStatus;
++    if (nextStatus !== prevStatus) {
++      const blocked = assertTransition("task", prevStatus, nextStatus);
++      if (blocked) return { error: invalidParams(blocked) };
++      transitionTask(task, nextStatus, agentName, prevStatus);
++    }
++  }
++
++  if (typeof args.summary === "string") {
++    task.resultSummary = args.summary;
++  }
++  if (typeof args.progress === "string") {
++    // If progress is provided without summary, record it into resultSummary or note
++    task.resultSummary = task.resultSummary ? `${task.resultSummary}\n[Progress]: ${args.progress}` : args.progress;
++  }
++
++  task.updatedAt = Date.now();
++  const persistErr = await persistOrError(store);
++  if (persistErr) return { error: persistErr };
++  return { result: ok(JSON.stringify({ message: "Task updated", task }, null, 2)) };
++}
++
++const MAX_MESSAGES = 500;
++
++export async function handlePostMessage(
++  store: BoardStore,
++  args: Record<string, unknown>
++): Promise<{ result: JsonRpcResult } | { error: JsonRpcError }> {
++  const ve = validatePostMessage(args);
++  if (ve.length) {
++    return { error: invalidParams(ve.map((v) => `${v.field}: ${v.message}`).join("; ")) };
++  }
++
++  const message: SwarmMessage = {
++    id: `msg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
++    fromAgent: String(args.fromAgent),
++    channel: args.channel as SwarmMessage["channel"],
++    content: String(args.content),
++    timestamp: Date.now(),
++  };
++
++  if (!Array.isArray(store.messages)) {
++    store.messages = [];
++  }
++  store.messages.push(message);
++  if (store.messages.length > MAX_MESSAGES) {
++    store.messages = store.messages.slice(-MAX_MESSAGES);
++  }
++
++  const persistErr = await persistOrError(store);
++  if (persistErr) return { error: persistErr };
++  return { result: ok(JSON.stringify({ message: "Message posted", swarmMessage: message }, null, 2)) };
++}
+diff --git a/apps/swarmagents/lib/board/validation.ts b/apps/swarmagents/lib/board/validation.ts
+index 99870c205..6af5baebe 100644
+--- a/apps/swarmagents/lib/board/validation.ts
++++ b/apps/swarmagents/lib/board/validation.ts
+@@ -234,3 +234,31 @@ export function validateReviewAndMergeTask(args: Record<string, unknown>): Valid
+   if (e5) errs.push(e5);
+   return errs;
+ }
++
++export function validateUpdateTask(args: Record<string, unknown>): ValidationError[] {
++  const errs: ValidationError[] = [];
++  const e1 = requiredString(args.taskId, "taskId");
++  if (e1) errs.push(e1);
++  const e2 = requiredString(args.agentName, "agentName", 200);
++  if (e2) errs.push(e2);
++  const e3 = optionalString(args.status, "status");
++  if (e3) errs.push(e3);
++  const e4 = optionalString(args.summary, "summary", 8000);
++  if (e4) errs.push(e4);
++  const e5 = optionalString(args.progress, "progress", 8000);
++  if (e5) errs.push(e5);
++  return errs;
++}
++
++const MESSAGE_CHANNELS = ["general", "blockers", "announcements", "idle_scouts"] as const;
++
++export function validatePostMessage(args: Record<string, unknown>): ValidationError[] {
++  const errs: ValidationError[] = [];
++  const e1 = requiredString(args.fromAgent, "fromAgent", 200);
++  if (e1) errs.push(e1);
++  const e2 = requiredEnum(args.channel, "channel", MESSAGE_CHANNELS);
++  if (e2) errs.push(e2);
++  const e3 = requiredString(args.content, "content", 8000);
++  if (e3) errs.push(e3);
++  return errs;
++}
+-- 
+2.55.0
+

@@ -1,0 +1,193 @@
+From 9e43ffce504220f58c84612539e82c7429875f76 Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Thu, 12 Nov 2026 19:49:08 +0000
+Subject: [PATCH] feat(p4): wire file attachments into the real runtime prompt
+
+---
+ .../app/api/runtime/tasks/route.test.ts       | 64 +++++++++++++++
+ .../app/api/runtime/tasks/route.ts            | 80 ++++++++++++++++++-
+ 2 files changed, 143 insertions(+), 1 deletion(-)
+
+diff --git a/apps/swarmagents/app/api/runtime/tasks/route.test.ts b/apps/swarmagents/app/api/runtime/tasks/route.test.ts
+index 741cf8e4c..c706cf8ba 100644
+--- a/apps/swarmagents/app/api/runtime/tasks/route.test.ts
++++ b/apps/swarmagents/app/api/runtime/tasks/route.test.ts
+@@ -252,6 +252,70 @@ test("agentCard longer than 4000 chars is capped server-side", async () => {
+   assert.ok(!appended.startsWith(long.slice(0, 4001)), "card is capped at 4000 chars");
+ });
+ 
++test("attachments: uploaded paths are named in the prompt the agent receives", async () => {
++  const driver = new ScriptedFakeVm();
++  install(driver);
++  const res = await postTask({
++    prompt: "summarize these",
++    attachments: ["/workspace/uploads/notes.txt", "/workspace/uploads/chart.png"],
++  });
++  assert.equal(res.status, 201);
++  await waitForRuns((r) => r.length === 1 && r[0].status !== "running");
++
++  const { cmd } = driver.calls[0];
++  const delivered = cmd[cmd.length - 1];
++  assert.equal(
++    delivered,
++    "summarize these\n\nUploaded files (in /workspace/uploads/):\n- /workspace/uploads/notes.txt\n- /workspace/uploads/chart.png",
++  );
++  const runs = await listRuns();
++  assert.equal(runs[0].prompt, delivered);
++});
++
++test("attachments: a run with no attachments list is unchanged", async () => {
++  const driver = new ScriptedFakeVm();
++  install(driver);
++  const res = await postTask({ prompt: "plain prompt" });
++  assert.equal(res.status, 201);
++  await waitForRuns((r) => r.length === 1 && r[0].status !== "running");
++
++  const { cmd } = driver.calls[0];
++  assert.equal(cmd[cmd.length - 1], "plain prompt");
++  assert.ok(!cmd[cmd.length - 1].includes("Uploaded files"));
++});
++
++test("attachments: paths outside /workspace/uploads are rejected and start no run", async () => {
++  const driver = new ScriptedFakeVm();
++  install(driver);
++  for (const bad of [
++    "/workspace/notes.txt",
++    "/workspace/uploads/../secret.txt",
++    "/etc/passwd",
++    "../uploads/evil.txt",
++    "/workspace/uploads",
++  ]) {
++    const res = await postTask({ prompt: "p", attachments: [bad] });
++    assert.equal(res.status, 400, `expected "${bad}" to be rejected`);
++  }
++  assert.equal(driver.calls.length, 0, "no run should have started");
++  assert.deepEqual(await listRuns(), []);
++});
++
++test("attachments: a non-array list, a non-string entry, and more than 10 files are rejected", async () => {
++  const driver = new ScriptedFakeVm();
++  install(driver);
++  for (const bad of [
++    "not-an-array",
++    [42],
++    [""],
++    Array.from({ length: 11 }, (_, i) => `/workspace/uploads/f${i}.txt`),
++  ]) {
++    const res = await postTask({ prompt: "p", attachments: bad });
++    assert.equal(res.status, 400, `expected ${JSON.stringify(bad)} to be rejected`);
++  }
++  assert.equal(driver.calls.length, 0, "no run should have started");
++});
++
+ test("queued runs keep their own agent card", async () => {
+   const driver = new ScriptedFakeVm(FIXTURE_LINES, [150]); // first run is slow
+   install(driver);
+diff --git a/apps/swarmagents/app/api/runtime/tasks/route.ts b/apps/swarmagents/app/api/runtime/tasks/route.ts
+index 46c352fb1..6199d95d2 100644
+--- a/apps/swarmagents/app/api/runtime/tasks/route.ts
++++ b/apps/swarmagents/app/api/runtime/tasks/route.ts
+@@ -16,6 +16,12 @@
+ import { NextResponse, type NextRequest } from "next/server";
+ import { USER_HEADER } from "../../../../lib/auth";
+ import { getRuntimeManager } from "../../../../lib/runtime/manager";
++import {
++  MAX_UPLOAD_FILES,
++  UPLOAD_DIR,
++  resolveWorkspacePath,
++  VmPathError,
++} from "../../../../lib/vm/files";
+ 
+ export const runtime = "nodejs";
+ export const dynamic = "force-dynamic";
+@@ -38,6 +44,63 @@ function unauthorized() {
+   return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+ }
+ 
++/**
++ * Validate an `attachments` list: workspace paths the caller already wrote
++ * via POST /api/runtime/vm/files/upload. Every entry must resolve inside
++ * /workspace/uploads/ (the same traversal guard the upload route applies),
++ * so a client can never smuggle a path outside the uploads directory into
++ * the agent's prompt. Returns the resolved paths, or a 400 response.
++ */
++function validateAttachments(
++  value: unknown,
++): { paths: string[] } | { error: ReturnType<typeof NextResponse.json> } {
++  if (!Array.isArray(value)) {
++    return { error: NextResponse.json({ error: "attachments must be an array of workspace paths." }, { status: 400 }) };
++  }
++  if (value.length > MAX_UPLOAD_FILES) {
++    return {
++      error: NextResponse.json(
++        { error: `Too many attachments: at most ${MAX_UPLOAD_FILES} per run.`, limit: MAX_UPLOAD_FILES },
++        { status: 400 },
++      ),
++    };
++  }
++  const paths: string[] = [];
++  for (const entry of value) {
++    if (typeof entry !== "string" || !entry.trim()) {
++      return { error: NextResponse.json({ error: "attachments must be workspace paths." }, { status: 400 }) };
++    }
++    let resolved: string;
++    try {
++      resolved = resolveWorkspacePath(entry);
++    } catch (err) {
++      if (err instanceof VmPathError) {
++        return { error: NextResponse.json({ error: err.message, code: err.code }, { status: 400 }) };
++      }
++      return { error: NextResponse.json({ error: "Invalid attachment path." }, { status: 400 }) };
++    }
++    if (!resolved.startsWith(`${UPLOAD_DIR}/`)) {
++      return {
++        error: NextResponse.json(
++          { error: "Attachments must live under /workspace/uploads/.", code: "outside_uploads" },
++          { status: 400 },
++        ),
++      };
++    }
++    paths.push(resolved);
++  }
++  return { paths };
++}
++
++/**
++ * The block appended to a task prompt naming its uploaded files — the same
++ * wording the UI appends client-side, so the agent can read the files from
++ * /workspace/uploads/ either way.
++ */
++function attachmentBlock(paths: string[]): string {
++  return `\n\nUploaded files (in /workspace/uploads/):\n${paths.map((p) => `- ${p}`).join("\n")}`;
++}
++
+ export async function GET(req: NextRequest) {
+   const user = caller(req);
+   if (!user) return unauthorized();
+@@ -92,7 +155,22 @@ export async function POST(req: NextRequest) {
+       ? body.agentCard.trim().slice(0, MAX_AGENT_CARD_LEN)
+       : undefined;
+ 
+-  const result = getRuntimeManager().start(user, { prompt, agentCard, sessionId });
++  // Attachments already uploaded to /workspace/uploads/ (e.g. by the UI's
++  // upload step) are named in the prompt so the agent can read them. A run
++  // with no attachments list is unchanged.
++  let effectivePrompt = prompt;
++  if (body.attachments !== undefined) {
++    const validated = validateAttachments(body.attachments);
++    if ("error" in validated) return validated.error;
++    if (validated.paths.length > 0) {
++      effectivePrompt = prompt + attachmentBlock(validated.paths);
++      if (effectivePrompt.length > MAX_PROMPT_LEN) {
++        return NextResponse.json({ error: "prompt too long." }, { status: 400 });
++      }
++    }
++  }
++
++  const result = getRuntimeManager().start(user, { prompt: effectivePrompt, agentCard, sessionId });
+   if (!result.accepted) {
+     return NextResponse.json(
+       { error: `Run queue is full (max ${result.limit ?? 3}). Wait for a run to finish.` },
+-- 
+2.55.0
+

@@ -1,0 +1,318 @@
+From 381d1fbc0f2a4205926ea99bba2a984bd95d5b24 Mon Sep 17 00:00:00 2001
+From: mercury-3 <noreply@anthropic.com>
+Date: Wed, 18 Nov 2026 11:25:05 -0600
+Subject: [PATCH] feat(providers): per-user rate limit for outbound
+ probe/discovery routes
+
+Add a dedicated per-user TokenBucket (default 20/min, tunable via
+SWARM_PROVIDER_PROBE_RATE_LIMIT_PER_MIN) for provider test and model-discovery
+routes, mirroring lensBucket. POST /api/providers/test, /discover, and
+/[id]/test now consume one token per request right before the outbound call
+and return 429 with Retry-After when a user's budget is exhausted, so
+outbound DNS/HTTP bursts are bounded per account instead of sharing only the
+app-wide bucket.
+
+Tests: rapid probe calls from one user are throttled (429) while another
+user is unaffected, on all three routes.
+
+Gates: typecheck 0 errors; unit 2568 pass / 0 fail / 1 skipped; build exit 0.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ .../app/api/providers/[id]/test/route.test.ts | 31 +++++++++++++-
+ .../app/api/providers/[id]/test/route.ts      | 10 +++++
+ .../app/api/providers/discover/route.test.ts  | 34 ++++++++++++++-
+ .../app/api/providers/discover/route.ts       | 10 +++++
+ .../app/api/providers/test/route.test.ts      | 42 ++++++++++++++++++-
+ .../app/api/providers/test/route.ts           | 10 +++++
+ apps/swarmagents/lib/rate-limit.ts            | 17 ++++++++
+ 7 files changed, 148 insertions(+), 6 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/providers/[id]/test/route.test.ts b/apps/swarmagents/app/api/providers/[id]/test/route.test.ts
+index 1910daa1d..722328d97 100644
+--- a/apps/swarmagents/app/api/providers/[id]/test/route.test.ts
++++ b/apps/swarmagents/app/api/providers/[id]/test/route.test.ts
+@@ -36,9 +36,11 @@ function ctx(id: string): { params: Promise<{ id: string }> } {
+   return { params: Promise.resolve({ id }) };
+ }
+ 
+-function post(id: string): Promise<Response> {
++function post(id: string, user?: string): Promise<Response> {
++  const headers: Record<string, string> = {};
++  if (user) headers["x-swarm-user"] = user;
+   return POST(
+-    new Request(`http://localhost/api/providers/${id}/test`, { method: "POST" }),
++    new Request(`http://localhost/api/providers/${id}/test`, { method: "POST", headers }),
+     ctx(id)
+   );
+ }
+@@ -106,3 +108,28 @@ test("POST surfaces a failing probe with an error kind and no key material", asy
+     globalThis.fetch = originalFetch;
+   }
+ });
++
++test("POST /api/providers/[id]/test is rate limited per user", async () => {
++  saveProvider("rl-user-a@example.com", { id: "openai", apiKey: KEY });
++  saveProvider("rl-user-b@example.com", { id: "openai", apiKey: KEY });
++
++  const originalFetch = globalThis.fetch;
++  globalThis.fetch = (async () => okResponse()) as typeof fetch;
++  try {
++    let limited = 0;
++    let served = 0;
++    for (let i = 0; i < 30; i += 1) {
++      const res = await post("openai", "rl-user-a@example.com");
++      if (res.status === 429) limited += 1;
++      else served += 1;
++    }
++    assert.ok(limited > 0, "the provider probe rate limit must kick in");
++    assert.ok(served > 0, "some requests are served before the limit");
++
++    // A different user is unaffected.
++    const other = await post("openai", "rl-user-b@example.com");
++    assert.equal(other.status, 200);
++  } finally {
++    globalThis.fetch = originalFetch;
++  }
++});
+diff --git a/apps/swarmagents/app/api/providers/[id]/test/route.ts b/apps/swarmagents/app/api/providers/[id]/test/route.ts
+index c8cb51b0c..e57d03825 100644
+--- a/apps/swarmagents/app/api/providers/[id]/test/route.ts
++++ b/apps/swarmagents/app/api/providers/[id]/test/route.ts
+@@ -9,6 +9,7 @@ import { NextResponse } from "next/server";
+ import { HealthChecker } from "@/lib/providers/health";
+ import { routerProviders } from "@/lib/providers/store";
+ import { providerOwner } from "@/lib/providers/owner";
++import { providerProbeRateLimit } from "@/lib/rate-limit";
+ 
+ export const dynamic = "force-dynamic";
+ 
+@@ -26,6 +27,15 @@ export async function POST(request: Request, ctx: RouteContext) {
+   const params = await Promise.resolve(ctx.params);
+   const id = typeof params?.id === "string" ? params.id : "";
+ 
++  // Outbound health probe sends real network traffic; keep it bounded per user.
++  const rate = providerProbeRateLimit(owner);
++  if (!rate.allowed) {
++    return NextResponse.json(
++      { error: "Too many provider test requests — try again in a moment." },
++      { status: 429, headers: { ...NO_STORE, "Retry-After": String(rate.retryAfter) } },
++    );
++  }
++
+   const checker = new HealthChecker({ providers: routerProviders(owner) });
+   const health = await checker.checkProvider(id);
+   if (!health) {
+diff --git a/apps/swarmagents/app/api/providers/discover/route.test.ts b/apps/swarmagents/app/api/providers/discover/route.test.ts
+index a024ef099..b51a8d5f0 100644
+--- a/apps/swarmagents/app/api/providers/discover/route.test.ts
++++ b/apps/swarmagents/app/api/providers/discover/route.test.ts
+@@ -31,11 +31,13 @@ test.afterEach(() => {
+   rmSync(tempDir, { recursive: true, force: true });
+ });
+ 
+-function discover(body: unknown): Promise<Response> {
++function discover(body: unknown, user?: string): Promise<Response> {
++  const headers: Record<string, string> = { "content-type": "application/json" };
++  if (user) headers["x-swarm-user"] = user;
+   return POST(
+     new NextRequest("http://localhost/api/providers/discover", {
+       method: "POST",
+-      headers: { "content-type": "application/json" },
++      headers,
+       body: JSON.stringify(body),
+     })
+   );
+@@ -109,3 +111,31 @@ test("discover accepts legacy apiStyle aliases instead of rejecting with 400", a
+     globalThis.fetch = originalFetch;
+   }
+ });
++
++test("discover is rate limited per user", async () => {
++  const originalFetch = globalThis.fetch;
++  globalThis.fetch = modelListFetch();
++  try {
++    let limited = 0;
++    let served = 0;
++    for (let i = 0; i < 30; i += 1) {
++      const res = await discover(
++        { id: "custom", baseUrl: "https://api.openai.com/v1", save: false },
++        "rl-user-a@example.com",
++      );
++      if (res.status === 429) limited += 1;
++      else served += 1;
++    }
++    assert.ok(limited > 0, "the provider discovery rate limit must kick in");
++    assert.ok(served > 0, "some discovery requests are served before the limit");
++
++    // A different user is unaffected.
++    const other = await discover(
++      { id: "custom", baseUrl: "https://api.openai.com/v1", save: false },
++      "rl-user-b@example.com",
++    );
++    assert.equal(other.status, 200);
++  } finally {
++    globalThis.fetch = originalFetch;
++  }
++});
+diff --git a/apps/swarmagents/app/api/providers/discover/route.ts b/apps/swarmagents/app/api/providers/discover/route.ts
+index 25d488810..776da5dcb 100644
+--- a/apps/swarmagents/app/api/providers/discover/route.ts
++++ b/apps/swarmagents/app/api/providers/discover/route.ts
+@@ -21,6 +21,7 @@ import {
+   updateProviderSettings,
+ } from "@/lib/providers/store";
+ import { assertResolvableProviderBaseUrl } from "@/lib/providers/url-safety";
++import { providerProbeRateLimit } from "@/lib/rate-limit";
+ import { isApiStyle, isAuthScheme } from "@/lib/providers/types";
+ import type { ApiStyle, ProviderAuth, ProviderConfig } from "@/lib/providers/types";
+ 
+@@ -150,6 +151,15 @@ export async function POST(request: NextRequest) {
+   const providedKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
+   const apiKey = providedKey || saved?.keys?.[0] || "";
+ 
++  // Outbound discovery sends real network traffic; keep it bounded per user.
++  const rate = providerProbeRateLimit(owner);
++  if (!rate.allowed) {
++    return NextResponse.json(
++      { error: "Too many provider discovery requests — try again in a moment." },
++      { status: 429, headers: { ...NO_STORE, "Retry-After": String(rate.retryAfter) } },
++    );
++  }
++
+   try {
+     const result = await discoverProviderModels(config, apiKey);
+     let persisted = false;
+diff --git a/apps/swarmagents/app/api/providers/test/route.test.ts b/apps/swarmagents/app/api/providers/test/route.test.ts
+index 14973d892..64ba3fb38 100644
+--- a/apps/swarmagents/app/api/providers/test/route.test.ts
++++ b/apps/swarmagents/app/api/providers/test/route.test.ts
+@@ -31,11 +31,13 @@ test.afterEach(() => {
+   rmSync(tempDir, { recursive: true, force: true });
+ });
+ 
+-function testProvider(body: unknown): Promise<Response> {
++function testProvider(body: unknown, user?: string): Promise<Response> {
++  const headers: Record<string, string> = { "content-type": "application/json" };
++  if (user) headers["x-swarm-user"] = user;
+   return POST(
+     new NextRequest("http://localhost/api/providers/test", {
+       method: "POST",
+-      headers: { "content-type": "application/json" },
++      headers,
+       body: JSON.stringify(body),
+     })
+   );
+@@ -73,3 +75,39 @@ test("POST /api/providers/test accepts legacy apiStyle aliases instead of 400",
+     globalThis.fetch = originalFetch;
+   }
+ });
++
++test("provider test is rate limited per user", async () => {
++  const originalFetch = globalThis.fetch;
++  globalThis.fetch = (async () =>
++    new Response(
++      JSON.stringify({
++        choices: [{ message: { content: "pong" } }],
++        usage: { prompt_tokens: 1, completion_tokens: 1 },
++        model: "fast",
++      }),
++      { status: 200, headers: { "content-type": "application/json" } }
++    )) as typeof fetch;
++  try {
++    let limited = 0;
++    let served = 0;
++    for (let i = 0; i < 30; i += 1) {
++      const res = await testProvider(
++        { id: "openai", baseUrl: "https://api.openai.com/v1", model: "fast" },
++        "rl-user-a@example.com",
++      );
++      if (res.status === 429) limited += 1;
++      else served += 1;
++    }
++    assert.ok(limited > 0, "the provider probe rate limit must kick in");
++    assert.ok(served > 0, "some requests are served before the limit");
++
++    // A different user is unaffected.
++    const other = await testProvider(
++      { id: "openai", baseUrl: "https://api.openai.com/v1", model: "fast" },
++      "rl-user-b@example.com",
++    );
++    assert.equal(other.status, 200);
++  } finally {
++    globalThis.fetch = originalFetch;
++  }
++});
+diff --git a/apps/swarmagents/app/api/providers/test/route.ts b/apps/swarmagents/app/api/providers/test/route.ts
+index 2888d6093..0ad853a62 100644
+--- a/apps/swarmagents/app/api/providers/test/route.ts
++++ b/apps/swarmagents/app/api/providers/test/route.ts
+@@ -13,6 +13,7 @@ import { providerOwner } from "@/lib/providers/owner";
+ import { JsonBodyError, readJsonBody } from "@/lib/http";
+ import { routerProviders } from "@/lib/providers/store";
+ import { assertResolvableProviderBaseUrl } from "@/lib/providers/url-safety";
++import { providerProbeRateLimit } from "@/lib/rate-limit";
+ import { isApiStyle, isAuthScheme } from "@/lib/providers/types";
+ import type { ApiStyle, ProviderAuth, ProviderConfig } from "@/lib/providers/types";
+ 
+@@ -127,6 +128,15 @@ export async function POST(request: NextRequest) {
+   const apiKey = providedKey || saved?.keys?.[0] || "";
+   const model = typeof input.model === "string" ? input.model : undefined;
+ 
++  // Outbound health-ping sends real network traffic; keep it bounded per user.
++  const rate = providerProbeRateLimit(owner);
++  if (!rate.allowed) {
++    return NextResponse.json(
++      { error: "Too many provider test requests — try again in a moment." },
++      { status: 429, headers: { ...NO_STORE, "Retry-After": String(rate.retryAfter) } },
++    );
++  }
++
+   try {
+     const result = await testProviderConnection(config, apiKey, {
+       ...(model ? { model } : {}),
+diff --git a/apps/swarmagents/lib/rate-limit.ts b/apps/swarmagents/lib/rate-limit.ts
+index 5b98a2b26..7446c3a6e 100644
+--- a/apps/swarmagents/lib/rate-limit.ts
++++ b/apps/swarmagents/lib/rate-limit.ts
+@@ -120,6 +120,17 @@ const loginBucket = new TokenBucket(5, 60_000);
+  */
+ const signupBucket = new TokenBucket(perMinute("SWARM_SIGNUP_RATE_LIMIT_PER_MIN", 5), 60_000);
+ 
++/**
++ * Per-user budget for outbound provider probe / model-discovery routes
++ * (POST /api/providers/test, /discover, and /[id]/test). These send real
++ * network traffic (health pings + discovery) per account, so they get their
++ * own bounded budget rather than sharing the app-wide bucket.
++ */
++const providerProbeBucket = new TokenBucket(
++  perMinute("SWARM_PROVIDER_PROBE_RATE_LIMIT_PER_MIN", 20),
++  60_000,
++);
++
+ /**
+  * Strict degraded-mode bucket for anonymous requests whose client identity
+  * could not be established. It is deliberately separate from `apiBucket` so a
+@@ -231,6 +242,11 @@ export function clientIp(req: NextRequest): string | null {
+   return peerIp(req);
+ }
+ 
++/** Consume one token from a user's provider-probe budget. */
++export function providerProbeRateLimit(user: string): Omit<RateInfo, "limit"> {
++  return providerProbeBucket.consume(`provider-probe:${user}`);
++}
++
+ export function rateLimitKey(req: NextRequest, user: AuthUser | null): string {
+   if (user) return `user:${user.id}`;
+   const ip = clientIp(req);
+@@ -299,6 +315,7 @@ export function resetBuckets(): void {
+   approvalBucket._clear();
+   unidentifiedBucket._clear();
+   shareBucket._clear();
++  providerProbeBucket._clear();
+ }
+ 
+ /** Reset one-time warning state (for tests). */
+-- 
+2.55.0
+

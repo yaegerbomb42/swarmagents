@@ -1,0 +1,109 @@
+From 0a92bc8d6b27101f9c37890b43485d28d48b733c Mon Sep 17 00:00:00 2001
+From: yaegerbomb42 <yaeger.james42@gmail.com>
+Date: Wed, 11 Nov 2026 11:51:44 -0600
+Subject: [PATCH] fix(usage): harden aggregation for code review
+
+- dayKey now buckets in UTC (server + browser "today" agree across timezones)
+- guard missing run.usage and non-finite startedAt to avoid 500/NaN day keys
+- pin local mode in the test before importing the module
+- consolidate auth imports in the upload route
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ apps/swarmagents/app/api/upload/route.ts |  3 +--
+ apps/swarmagents/lib/telemetry/usage.ts  | 28 ++++++++++++++++--------
+ apps/swarmagents/tests/usage.mjs         |  3 +++
+ 3 files changed, 23 insertions(+), 11 deletions(-)
+
+diff --git a/apps/swarmagents/app/api/upload/route.ts b/apps/swarmagents/app/api/upload/route.ts
+index ef6bef8a4..5c81c7da4 100644
+--- a/apps/swarmagents/app/api/upload/route.ts
++++ b/apps/swarmagents/app/api/upload/route.ts
+@@ -1,4 +1,4 @@
+-import { scoped } from "@/lib/auth";
++import { isAllowed as isLocal, scoped } from "@/lib/auth";
+ import { giveToUser } from "@/lib/sandbox";
+ import fs from "node:fs";
+ import path from "node:path";
+@@ -8,7 +8,6 @@ import { pipeline } from "node:stream/promises";
+ import { uploadDir } from "@/lib/agent";
+ import { getMeta } from "@/lib/store";
+ import type { Attachment } from "@/lib/types";
+-import { isAllowed as isLocal } from "@/lib/auth";
+ 
+ export const dynamic = "force-dynamic";
+ 
+diff --git a/apps/swarmagents/lib/telemetry/usage.ts b/apps/swarmagents/lib/telemetry/usage.ts
+index 92e1a54b9..b8dfc62b6 100644
+--- a/apps/swarmagents/lib/telemetry/usage.ts
++++ b/apps/swarmagents/lib/telemetry/usage.ts
+@@ -41,12 +41,15 @@ function addTotals(a: UsageTotals, b: Partial<RunUsage>): UsageTotals {
+   };
+ }
+ 
+-/** Local calendar day for a timestamp, as YYYY-MM-DD. */
++/**
++ * Calendar day for a timestamp, as YYYY-MM-DD, in UTC.
++ *
++ * UTC is used (rather than local time) so the server's bucketing and the browser's "today"
++ * computation always agree — in server-mode deployments client and server timezones can differ,
++ * and a local-time bucketing would then misattribute runs near midnight.
++ */
+ export function dayKey(ts: number): string {
+-  const d = new Date(ts);
+-  const mm = String(d.getMonth() + 1).padStart(2, "0");
+-  const dd = String(d.getDate()).padStart(2, "0");
+-  return `${d.getFullYear()}-${mm}-${dd}`;
++  return new Date(ts).toISOString().slice(0, 10);
+ }
+ 
+ /** One run expanded with its usage totals (what the UI lists as "per run"). */
+@@ -95,20 +98,27 @@ export function aggregateUsage(): UsageSnapshot {
+   for (const task of tasks) {
+     const ledger = loadLedger(task.id);
+     for (const run of ledger.runs) {
++      // Defensive: a legacy/corrupt ledger row may lack usage or a timestamp. Treat missing
++      // usage as empty rather than throwing (which would 500 the whole endpoint), and skip
++      // rows with no timestamp rather than emitting a NaN day key.
++      const usage = run.usage ?? { ...EMPTY_TOTALS };
++      const startedAt = typeof run.startedAt === "number" && Number.isFinite(run.startedAt) ? run.startedAt : undefined;
++      if (startedAt === undefined) continue;
++
+       perRun.push({
+-        ...run.usage,
++        ...usage,
+         runId: run.id,
+         taskId: run.taskId,
+         provider: run.provider,
+         model: run.model,
+         status: run.status,
+-        startedAt: run.startedAt,
++        startedAt,
+         endedAt: run.endedAt,
+       });
+ 
+-      totals = addTotals(totals, run.usage);
++      totals = addTotals(totals, usage);
+ 
+-      const day = dayKey(run.startedAt);
++      const day = dayKey(startedAt);
+       const db = dayMap.get(day) ?? { runs: 0, totals: { ...EMPTY_TOTALS } };
+       db.runs += 1;
+       db.totals = addTotals(db.totals, run.usage);
+diff --git a/apps/swarmagents/tests/usage.mjs b/apps/swarmagents/tests/usage.mjs
+index ba50c32e3..1d984b529 100644
+--- a/apps/swarmagents/tests/usage.mjs
++++ b/apps/swarmagents/tests/usage.mjs
+@@ -13,6 +13,9 @@ const root = path.resolve(here, "..");
+ // Isolated, deterministic home (never the real ~/.swarmagents).
+ const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-usage-"));
+ process.env.SWARM_HOME = home;
++// Pin local mode: userHome()/currentUser() fall back to "local" only when SWARM_MODE is
++// unset — in server mode they throw outside a runAs()/scoped() tenant context.
++delete process.env.SWARM_MODE;
+ 
+ const { aggregateUsage, dayKey } = await import(path.join(root, "lib/telemetry/usage.ts"));
+ 
+-- 
+2.55.0
+

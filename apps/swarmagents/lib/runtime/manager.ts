@@ -255,6 +255,8 @@ interface QueuedRun {
   seedSnapshotLabel?: string;
   /** F1 fork provenance: the run + checkpoint this run was forked from. */
   forkedFrom?: ForkInfo;
+  /** Daemon resume: the recorded checkpoint this run resumes from, if any. */
+  resumePoint?: ResumePoint;
   /** F1 fork: start a fresh conversation instead of resuming the last session. */
   freshSession?: boolean;
   createdAt: number;
@@ -339,6 +341,13 @@ interface ActiveRun {
   forkedFrom?: ForkInfo;
   /** Latest recorded resume point for this run (from auto-checkpoint). */
   resumePoint?: ResumePoint;
+  /**
+   * Set only by the shutdown path for a run with a recorded resume point:
+   * the exec is aborted so the process can exit, but the run must NOT be
+   * finalized — the next process resumes it from its checkpoint. The
+   * process exits immediately after, so this is never cleared.
+   */
+  suspendForResume?: boolean;
 }
 
 /** A one-shot terminal command run (POST /api/runtime/vm/exec). */
@@ -662,9 +671,25 @@ export class RuntimeManager {
     // straight to the log (not via this.bus, whose per-process seq would
     // restart at 1 and corrupt the persisted ordering). It must never break
     // startup, so a failure here is logged and swallowed.
+    //
+    // Runs with a recorded resume point (checkpoint + session) are excluded
+    // from the sweep: the restart restores them from their checkpoint
+    // instead of finalizing them (see restorePersistedState). A snapshot
+    // that cannot be read yields no exclusions, so recovery falls back to
+    // today's safe-abort.
+    const resumableRunIds = new Set<string>();
+    if (this.stateStore) {
+      try {
+        for (const row of Object.values(this.stateStore.load().users)) {
+          if (row.active?.resumePoint?.sessionId) resumableRunIds.add(row.active.runId);
+        }
+      } catch (error) {
+        console.error("[runtime] could not read persisted run state for resume:", error);
+      }
+    }
     let epochRecovered: string[] = [];
     try {
-      epochRecovered = recoverOrphanedRuns();
+      epochRecovered = recoverOrphanedRuns(undefined, { excludeRunIds: resumableRunIds });
     } catch (error) {
       console.error("[runtime] could not recover orphaned runs:", error);
     }
@@ -673,9 +698,10 @@ export class RuntimeManager {
     for (const runId of epochRecovered) {
       getApprovalStore().expireForRunRestart(runId);
     }
-    // Restore the durable queue and abort the previous process's active run
-    // (see design: resume is unsafe without a checkpoint; queued work is not
-    // lost). This also covers runs the epoch sweep cannot prove are stale.
+    // Restore the durable queue and resolve the previous process's active
+    // run: resume it from its recorded checkpoint when one exists, abort it
+    // safely otherwise (see restorePersistedState). This also covers runs
+    // the epoch sweep cannot prove are stale.
     this.restorePersistedState();
 
     // Stuck-run watchdog: periodically sweep active runs for ones that never
@@ -782,6 +808,7 @@ export class RuntimeManager {
       ...(run.compute ? { compute: run.compute } : {}),
       ...(run.fullAuto !== undefined ? { fullAuto: run.fullAuto } : {}),
       ...(run.runMode ? { runMode: run.runMode } : {}),
+      ...(run.resumePoint ? { resumePoint: run.resumePoint } : {}),
       createdAt: run.createdAt,
     };
   }
@@ -810,11 +837,20 @@ export class RuntimeManager {
   /**
    * Restore the previous process's queue and resolve its active run.
    *
-   * Active run: safe-abort-and-notify. A restart kills the VM exec and there
-   * is no reliable checkpoint of side effects already performed, so re-running
-   * the prompt could duplicate them. The run is finalized as an error with the
-   * shared "server restarted" reason (visible in run history), and any pending
-   * approval it owned is explicitly expired with reason "server_restart".
+   * Active run with a recorded resume point (checkpoint label + step +
+   * session): restored to that checkpoint and continued. The run is
+   * re-queued at the front with its checkpoint as the restore seed and its
+   * session id, so the normal start path restores the VM snapshot and
+   * resumes the CLI session (`--resume`) instead of re-running the prompt.
+   * Its pending approvals are left pending: they re-surface when the
+   * resumed agent re-asks, and the store's TTL still bounds them.
+   *
+   * Active run without one: safe-abort-and-notify. A restart kills the VM
+   * exec and there is no reliable checkpoint of side effects already
+   * performed, so re-running the prompt could duplicate them. The run is
+   * finalized as an error with the shared "server restarted" reason
+   * (visible in run history), and any pending approval it owned is
+   * explicitly expired with reason "server_restart".
    *
    * Queued prompts: fully preserved and drained through the normal one-at-a-
    * time path, so nothing accepted before the restart disappears.
@@ -854,21 +890,67 @@ export class RuntimeManager {
         });
       }
       if (row.active) {
-        try {
-          recoverRunOnRestart(row.active.runId, {
-            userId,
-            prompt: row.active.prompt,
-            compute: row.active.compute,
-            createdAt: row.active.createdAt,
-            resumePoint: row.active.resumePoint,
-          });
-        } catch (error) {
-          console.error(`[runtime] could not finalize interrupted run ${row.active.runId}:`, error);
+        const resumePoint = row.active.resumePoint;
+        const resumable = resumePoint?.sessionId !== undefined;
+        if (resumable) {
+          // A run that already reached a terminal state before the process
+          // died must not be replayed (the snapshot write may lag a finish).
+          const status = getRun(row.active.runId)?.summary.status;
+          const alreadyTerminal = status !== undefined && status !== "running" && status !== "queued";
+          if (!alreadyTerminal) {
+            // Resumable: leave the run log running (recoverRunOnRestart
+            // skips the restart error when a resume point is present),
+            // keep its approvals pending, and re-queue it at the front so
+            // it resumes before anything queued behind it. The seed label
+            // is derived from the recorded point; executeInner restores
+            // it before the runner resumes the recorded session.
+            try {
+              recoverRunOnRestart(row.active.runId, {
+                userId,
+                prompt: row.active.prompt,
+                compute: row.active.compute,
+                createdAt: row.active.createdAt,
+                resumePoint,
+              });
+            } catch (error) {
+              console.error(`[runtime] could not preserve interrupted run ${row.active.runId}:`, error);
+            }
+            st.queue.unshift({
+              runId: row.active.runId,
+              userId,
+              prompt: row.active.prompt,
+              ...(row.active.agentCard ? { agentCard: row.active.agentCard } : {}),
+              sessionId: resumePoint.sessionId,
+              ...(row.active.model ? { model: row.active.model } : {}),
+              ...(row.active.role ? { role: row.active.role } : {}),
+              rolePolicy: row.active.rolePolicy,
+              ...(row.active.projectId ? { projectId: row.active.projectId } : {}),
+              ...(row.active.contextPrefix ? { projectContext: row.active.contextPrefix } : {}),
+              ...(row.active.compute ? { compute: row.active.compute } : {}),
+              ...(row.active.fullAuto !== undefined ? { fullAuto: row.active.fullAuto } : {}),
+              ...(row.active.runMode ? { runMode: row.active.runMode } : {}),
+              seedSnapshotLabel: checkpointVmLabel(row.active.runId, resumePoint.stepSeq),
+              resumePoint,
+              createdAt: row.active.createdAt,
+            });
+          }
+        } else {
+          try {
+            recoverRunOnRestart(row.active.runId, {
+              userId,
+              prompt: row.active.prompt,
+              compute: row.active.compute,
+              createdAt: row.active.createdAt,
+              resumePoint: row.active.resumePoint,
+            });
+          } catch (error) {
+            console.error(`[runtime] could not finalize interrupted run ${row.active.runId}:`, error);
+          }
+          // The run is dead; a pending approval for it can never be actioned.
+          // Record the explicit restart outcome instead of letting the TTL
+          // silently deny it later.
+          getApprovalStore().expireForRunRestart(row.active.runId);
         }
-        // The run is dead; a pending approval for it can never be actioned.
-        // Record the explicit restart outcome instead of letting the TTL
-        // silently deny it later.
-        getApprovalStore().expireForRunRestart(row.active.runId);
       }
       if (!st.active && st.queue.length > 0) this.startNext(userId);
     }
@@ -1461,6 +1543,7 @@ export class RuntimeManager {
       ambientRuleId: next.ambientRuleId,
       seedSnapshotLabel: next.seedSnapshotLabel,
       forkedFrom: next.forkedFrom,
+      resumePoint: next.resumePoint,
     };
     st.active = active;
     this.persistState();
@@ -1755,6 +1838,19 @@ export class RuntimeManager {
         const st = this.users.get(userId);
         const target = st?.active;
         if (!st || !target) continue;
+        if (target.resumePoint?.sessionId !== undefined) {
+          // Resumable: suspend, don't finalize. The exec is aborted so the
+          // process can exit, but the run stays in the durable snapshot
+          // with its resume point, and the next process restores it from
+          // its checkpoint. Finalize is suppressed (see suspendForResume)
+          // so no cancelled/error event or approval expiry is recorded.
+          target.suspendForResume = true;
+          target.controller.abort();
+          this.recordCancelling(userId, target.runId);
+          this.persistState();
+          cancelled.push(target.runId);
+          continue;
+        }
         this.finalize(target.runId, { status: "cancelled", cancelledReason: "shutdown" }, false);
         target.controller.abort();
         this.recordCancelling(userId, target.runId);
@@ -1986,7 +2082,9 @@ export class RuntimeManager {
     try {
       await this.executeInner(active);
     } catch (error) {
-      if (!this.isStillActive(runId, userId)) return;
+      // A run suspended for resume must not be finalized: the process is
+      // exiting and the next one resumes it from its checkpoint.
+      if (!this.isStillActive(runId, userId) || active.suspendForResume) return;
       const redact = makeRedactor({ ...process.env } as Record<string, string>);
       const message = redact(error instanceof Error ? error.message : String(error));
       const errorEvent: { type: "run.error"; message: string } = {
@@ -2001,7 +2099,7 @@ export class RuntimeManager {
       // paths finalize before returning), but a run whose exec promise never
       // settles must not hold the thread hostage.
       this.cancelling.delete(runId);
-      if (this.isStillActive(runId, userId)) {
+      if (this.isStillActive(runId, userId) && !active.suspendForResume) {
         const errorEvent: { type: "run.error"; message: string } = {
           type: "run.error",
           message: "run ended without releasing its slot",
@@ -2085,7 +2183,7 @@ export class RuntimeManager {
         this.bus.publish(runId, { type: "vm.error", data: { message } });
         const errorEvent: { type: "run.error"; message: string } = {
           type: "run.error",
-          message: `Could not restore fork checkpoint ${active.seedSnapshotLabel}: ${message}`,
+          message: `Could not restore ${active.resumePoint ? "resume" : "fork"} checkpoint ${active.seedSnapshotLabel}: ${message}`,
         };
         this.bus.publish(runId, errorEvent);
         this.finalize(runId, { status: "error", error: errorEvent.message });
@@ -2093,9 +2191,12 @@ export class RuntimeManager {
       }
       const restoredEvent: Extract<HarnessEvent, { type: "checkpoint.restored" }> = {
         type: "checkpoint.restored",
-        label: active.forkedFrom?.checkpointLabel ?? active.seedSnapshotLabel,
+        label:
+          active.resumePoint?.checkpointLabel ??
+          active.forkedFrom?.checkpointLabel ??
+          active.seedSnapshotLabel,
         vmLabel: active.seedSnapshotLabel,
-        stepSeq: active.forkedFrom?.stepSeq ?? 0,
+        stepSeq: active.resumePoint?.stepSeq ?? active.forkedFrom?.stepSeq ?? 0,
         sourceRunId: active.forkedFrom?.runId ?? "",
       };
       this.bus.publish(runId, restoredEvent);
@@ -3092,6 +3193,12 @@ export class RuntimeManager {
   }
 
   private finalize(runId: string, patch: TerminalPatch, drainQueue = true): void {
+    // A run suspended for resume is never finalized: no token revoke, no
+    // approval expiry, no terminal event. The next process resumes it from
+    // its recorded checkpoint.
+    for (const st of this.users.values()) {
+      if (st.active?.runId === runId && st.active.suspendForResume) return;
+    }
     // The run's LLM proxy token dies with the run.
     revokeRunToken(runId);
     revokeVaultToken(runId);

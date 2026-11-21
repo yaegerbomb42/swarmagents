@@ -6,7 +6,7 @@ import path from "node:path";
 import { TelemetryBus, type SequencedEvent, type TelemetryEvent } from "../telemetry/bus";
 import { readRunEvents } from "../telemetry/run-log";
 import { assembleReport, writeRunReport } from "./run-report";
-import { getRun, listRuns, listThreads, summarizeRun, threadTitle } from "./run-store";
+import { getRun, listRuns, listThreads, summarizeRun, threadTitle, ORPHANED_RUN_REASON, recoverOrphanedRuns, recoverRunOnRestart, setRecoveryEpochForTesting } from "./run-store";
 
 function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "swarm-run-store-"));
@@ -365,4 +365,68 @@ test("threadTitle truncates long prompts and falls back for empty ones", () => {
   const long = "x".repeat(100);
   assert.equal(threadTitle(long).length, 60);
   assert.ok(threadTitle(long).endsWith("…"));
+});
+
+test("recoverOrphanedRuns skips excluded runs; recoverRunOnRestart preserves resumable runs", () => {
+  const dir = tmpDir();
+  try {
+    const bus = persistBus(dir);
+    bus.publish("run_orphan", { type: "run.created", data: { prompt: "old work", userId: "alice" } });
+    bus.publish("run_resume", { type: "run.created", data: { prompt: "checkpointed work", userId: "alice" } });
+    // Pretend this process started after both runs were written.
+    setRecoveryEpochForTesting(Date.now() + 1000);
+    try {
+      const recovered = recoverOrphanedRuns(dir, { excludeRunIds: new Set(["run_resume"]) });
+      assert.deepEqual(recovered, ["run_orphan"]);
+      assert.equal(getRun("run_orphan", dir)?.summary.status, "error");
+      assert.equal(getRun("run_orphan", dir)?.summary.error, ORPHANED_RUN_REASON);
+      assert.equal(getRun("run_resume", dir)?.summary.status, "running");
+    } finally {
+      setRecoveryEpochForTesting(Date.now());
+    }
+
+    // A resume point with a session leaves the log running: the restart
+    // restores this run instead of finalizing it.
+    const kept = recoverRunOnRestart("run_resume", {
+      runsDir: dir,
+      userId: "alice",
+      prompt: "checkpointed work",
+      resumePoint: { runId: "run_resume", checkpointLabel: "auto-pre-step-3", stepSeq: 3, sessionId: "sess_1" },
+    });
+    assert.equal(kept, true);
+    assert.equal(getRun("run_resume", dir)?.summary.status, "running");
+
+    // Without a resume point the same run finalizes with the restart error.
+    const aborted = recoverRunOnRestart("run_resume", {
+      runsDir: dir,
+      userId: "alice",
+      prompt: "checkpointed work",
+    });
+    assert.equal(aborted, true);
+    assert.equal(getRun("run_resume", dir)?.summary.status, "error");
+    assert.equal(getRun("run_resume", dir)?.summary.error, ORPHANED_RUN_REASON);
+
+    // A resumable run with no log yet is seeded without the restart error.
+    const seeded = recoverRunOnRestart("run_nolog", {
+      runsDir: dir,
+      userId: "alice",
+      prompt: "fresh work",
+      resumePoint: { runId: "run_nolog", checkpointLabel: "auto-pre-step-1", stepSeq: 1, sessionId: "sess_2" },
+    });
+    assert.equal(seeded, true);
+    assert.equal(getRun("run_nolog", dir)?.summary.status, "running");
+
+    // A resume point WITHOUT a session cannot be resumed: safe-abort.
+    const sessionless = recoverRunOnRestart("run_nolog2", {
+      runsDir: dir,
+      userId: "alice",
+      prompt: "fresh work",
+      resumePoint: { runId: "run_nolog2", checkpointLabel: "auto-pre-step-1", stepSeq: 1 },
+    });
+    assert.equal(sessionless, true);
+    assert.equal(getRun("run_nolog2", dir)?.summary.status, "error");
+    assert.equal(getRun("run_nolog2", dir)?.summary.error, ORPHANED_RUN_REASON);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

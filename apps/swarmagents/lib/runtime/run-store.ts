@@ -235,13 +235,21 @@ export function listThreads(options: ListThreadsOptions = {}): ThreadSummary[] {
  * event (seq = last persisted seq + 1, so the log stays gapless and
  * ordered) to each orphaned run's log, which flips its durable summary to
  * "error" with the restart reason. Finished, errored and cancelled runs are
- * left untouched. Returns the recovered runIds. Idempotent: a second call
- * finds nothing still running or queued.
+ * left untouched. Runs in `options.excludeRunIds` are skipped: they have a
+ * recorded resume point, so the restart restores them from their checkpoint
+ * instead of finalizing them here. Returns the recovered runIds.
+ * Idempotent: a second call finds nothing still running or queued.
  */
-export function recoverOrphanedRuns(runsDir: string | null = getRunsDir()): string[] {
+export function recoverOrphanedRuns(
+  runsDir: string | null = getRunsDir(),
+  options: { excludeRunIds?: ReadonlySet<string> } = {},
+): string[] {
   if (!runsDir) return [];
   const recovered: string[] = [];
   for (const info of listRunLogs(runsDir)) {
+    // Excluded runs have a recorded resume point: the restart restores
+    // them from their checkpoint instead of finalizing them here.
+    if (options.excludeRunIds?.has(info.runId)) continue;
     const run = getRun(info.runId, runsDir);
     if (!run || (run.summary.status !== "running" && run.summary.status !== "queued")) continue;
     // Skip anything born after this process started: it is either ours or a
@@ -263,6 +271,13 @@ export function recoverOrphanedRuns(runsDir: string | null = getRunsDir()): stri
  * between accepting the run and its first telemetry write), a minimal
  * run.created is seeded so the abort is visible in history instead of
  * vanishing.
+ *
+ * Resume: when `options.resumePoint` carries a session id, the restart
+ * restores this run from its checkpoint instead of finalizing it, so the
+ * log is left running (or seeded without the restart error when there is
+ * no log yet) and the caller re-queues it. A resume point without a
+ * session id cannot be resumed, so it falls through to the safe-abort
+ * below: re-running the prompt could duplicate side effects.
  */
 export function recoverRunOnRestart(
   runId: string,
@@ -277,16 +292,19 @@ export function recoverRunOnRestart(
 ): boolean {
   const runsDir = options.runsDir === undefined ? getRunsDir() : options.runsDir;
   if (!runsDir || !/^[A-Za-z0-9_-]{1,64}$/.test(runId)) return false;
+  const resumable = options.resumePoint?.sessionId !== undefined;
   const run = getRun(runId, runsDir);
   if (run) {
     if (run.summary.status !== "running" && run.summary.status !== "queued") return false;
+    if (resumable) return true;
     appendRestartError(runId, run.summary.lastSeq, runsDir);
     return true;
   }
   if (!options.userId || !options.prompt) return false;
   // Seed the identity the summary needs, then the same restart error the epoch
   // sweep appends. Both writes are direct (not through the bus) so a fresh
-  // process's seq numbering starts where the previous log would have.
+  // process's seq numbering starts where the previous log would have. A
+  // resumable run is seeded without the error: the resume path continues it.
   const created: SequencedEvent = {
     type: "run.created",
     data: {
@@ -301,6 +319,7 @@ export function recoverRunOnRestart(
   };
   appendRunEvent(created, runsDir);
   updateRunIndex(created, runsDir);
+  if (resumable) return true;
   appendRestartError(runId, 1, runsDir);
   return true;
 }

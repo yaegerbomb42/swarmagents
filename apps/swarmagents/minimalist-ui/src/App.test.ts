@@ -36,6 +36,36 @@ test("the workspace opens on the chat: one header, one view switch, one composer
   assert.match(tagOf(html, "open-settings"), /aria-label="Settings"/);
 });
 
+test("run completion notices describe success duration and failures", async () => {
+  installBrowserStubs();
+  const { runCompletionToast, shouldToastRunCompletion } = await import("./App");
+  assert.deepEqual(runCompletionToast("finished", { createdAt: 1_000, finishedAt: 8_000 }), {
+    tone: "success",
+    message: "Run finished in 7s.",
+  });
+  assert.deepEqual(runCompletionToast("error", { createdAt: 1_000, finishedAt: 8_000 }), {
+    tone: "error",
+    message: "Run failed — see the report.",
+  });
+  assert.equal(runCompletionToast("running", { createdAt: 1_000 }), null);
+  assert.equal(
+    shouldToastRunCompletion({ phase: "finished", wasActive: true, view: "board", alreadyNotified: false }),
+    true,
+  );
+  assert.equal(
+    shouldToastRunCompletion({ phase: "finished", wasActive: true, view: "chat", alreadyNotified: false }),
+    false,
+  );
+  assert.equal(
+    shouldToastRunCompletion({ phase: "error", wasActive: false, view: "screen", alreadyNotified: false }),
+    false,
+  );
+  assert.equal(
+    shouldToastRunCompletion({ phase: "finished", wasActive: true, view: "screen", alreadyNotified: true }),
+    false,
+  );
+});
+
 test("the live desktop tab is labelled Computer, never Screen", async () => {
   const html = await renderApp();
   const tab = /<button\b[^>]*data-testid="view-screen"[^>]*>[\s\S]*?<\/button>/.exec(html)?.[0] ?? "";

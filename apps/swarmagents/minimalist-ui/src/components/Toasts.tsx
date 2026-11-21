@@ -27,6 +27,7 @@ interface ToastEntry {
   tone: ToastTone;
   message: string;
   detail?: string;
+  action?: () => void;
   /** Auto-dismiss window in ms. */
   ttlMs: number;
 }
@@ -35,6 +36,7 @@ interface PushInput {
   tone?: ToastTone;
   message: string;
   detail?: string;
+  action?: () => void;
   ttlMs?: number;
 }
 
@@ -214,6 +216,7 @@ export function ToastsProvider({ children }: { children: ReactNode }) {
           tone: input.tone ?? "info",
           message: input.message,
           detail: input.detail,
+          action: input.action,
           ttlMs: ttl,
         },
       });
@@ -304,12 +307,34 @@ export function ToastsProvider({ children }: { children: ReactNode }) {
                     <Icon className="h-4 w-4" aria-hidden="true" />
                   </span>
                   <div className="min-w-0 flex-1">
-                    <div className="text-xs font-medium text-white/90">
-                      <span className="mr-1.5 uppercase tracking-widest text-white/35">{tone.label}</span>
-                      {toast.message}
-                    </div>
-                    {toast.detail && (
-                      <div className="mt-0.5 break-words text-[11px] leading-relaxed text-white/50">{toast.detail}</div>
+                    {toast.action ? (
+                      <button
+                        type="button"
+                        className="block w-full text-left"
+                        aria-label={`Open: ${toast.message}`}
+                        onClick={() => {
+                          toast.action?.();
+                          dismiss(toast.id);
+                        }}
+                      >
+                        <div className="text-xs font-medium text-white/90">
+                          <span className="mr-1.5 uppercase tracking-widest text-white/35">{tone.label}</span>
+                          {toast.message}
+                        </div>
+                        {toast.detail && (
+                          <div className="mt-0.5 break-words text-[11px] leading-relaxed text-white/50">{toast.detail}</div>
+                        )}
+                      </button>
+                    ) : (
+                      <>
+                        <div className="text-xs font-medium text-white/90">
+                          <span className="mr-1.5 uppercase tracking-widest text-white/35">{tone.label}</span>
+                          {toast.message}
+                        </div>
+                        {toast.detail && (
+                          <div className="mt-0.5 break-words text-[11px] leading-relaxed text-white/50">{toast.detail}</div>
+                        )}
+                      </>
                     )}
                   </div>
                   <button

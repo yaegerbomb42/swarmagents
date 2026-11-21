@@ -45,10 +45,9 @@ import type { Attachment } from "./data";
 const NO_LOGS: LogEvent[] = [];
 
 const STARTERS = [
-  "Build a small web app and show it running",
-  "Research a topic and write a summary with sources",
-  "Write a script, run it, and fix whatever breaks",
-  "Check live system telemetry and explore running processes",
+  "Create a file and run a script",
+  "Organize a messy folder",
+  "Fetch a web page and summarize it",
 ];
 
 const APP_TITLE = "SwarmAgents";
@@ -314,6 +313,7 @@ export default function App() {
             <Conversation
               session={session}
               taskLinks={board.links}
+              starters={STARTERS}
               onWatchScreen={view === "screen" ? undefined : watchScreen}
               onOpenTask={openTask}
               onOpenProviders={() => openSettings("providers")}

@@ -62,6 +62,8 @@ export interface ConversationProps {
   session: AgentSession;
   /** Runs started from board tasks, so a turn can point back at its task. */
   taskLinks: TaskRunLinks;
+  /** Example prompts shown on a fresh, empty chat; clicking one starts a run. */
+  starters?: string[];
   /** Show the live VM screen. Left out while the screen is already on show. */
   onWatchScreen?: () => void;
   /** Open the board on a task. */
@@ -582,6 +584,7 @@ const Turn = React.memo(function Turn({
 export function Conversation({
   session,
   taskLinks,
+  starters = [],
   onWatchScreen,
   onOpenTask,
   onOpenProviders,
@@ -643,9 +646,21 @@ export function Conversation({
           {session.turnsLoading && <Loading label="Loading conversation" className="py-10" />}
 
           {!session.turnsLoading && turns.length === 0 && !pending && (
-            <p className="py-10 text-center text-[13px] text-sa-fg2" data-testid="conversation-empty">
-              No messages yet. Tell the agent what you want done.
-            </p>
+            <div className="py-10 text-center" data-testid="conversation-empty">
+              <p className="text-[13px] text-sa-fg2 mb-6">No messages yet. Tell the agent what you want done.</p>
+              <div className="flex flex-col items-center gap-3 sm:flex-row sm:gap-4 sm:justify-center">
+                {starters.map((text) => (
+                  <Button
+                    key={text}
+                    data-testid="starter-prompt"
+                    onClick={() => void send(text, [])}
+                    size="sm"
+                  >
+                    {text}
+                  </Button>
+                ))}
+              </div>
+            </div>
           )}
 
           {turns.map((entry) => {

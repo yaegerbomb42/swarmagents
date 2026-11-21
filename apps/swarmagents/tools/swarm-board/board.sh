@@ -17,17 +17,24 @@ login() {
     || { echo "board.sh: login failed" >&2; exit 1; }
   chmod 600 "$JAR"
 }
+TMP_OUT="$(mktemp)"
+trap 'rm -f "$TMP_OUT"' EXIT
+# call: writes the response body to $TMP_OUT and echoes the HTTP status.
+# Auth failure is decided by the HTTP status, never by response text: task
+# descriptions can contain the words "Sign in required" (a task quoting an
+# old 401), and grepping the body for that phrase caused false re-login
+# attempts on perfectly good 200 responses.
 call() {
   if [ -n "${SWARM_BOARD_TOKEN:-}" ]; then
-    curl -s -m 30 -X POST "$URL/api/mcp/swarm-board" -H "Authorization: Bearer $SWARM_BOARD_TOKEN" -H 'Content-Type: application/json' -d "$body"
+    curl -s -m 30 -o "$TMP_OUT" -w '%{http_code}' -X POST "$URL/api/mcp/swarm-board" -H "Authorization: Bearer $SWARM_BOARD_TOKEN" -H 'Content-Type: application/json' -d "$body"
   else
-    curl -s -m 30 -b "$JAR" -X POST "$URL/api/mcp/swarm-board" -H 'Content-Type: application/json' -d "$body"
+    curl -s -m 30 -o "$TMP_OUT" -w '%{http_code}' -b "$JAR" -X POST "$URL/api/mcp/swarm-board" -H 'Content-Type: application/json' -d "$body"
   fi
 }
 [ -n "${SWARM_BOARD_TOKEN:-}" ] || [ -s "$JAR" ] || login
-out=$(call)
-if printf '%s' "$out" | grep -q 'Sign in required'; then
+code=$(call)
+if [ "$code" = "401" ]; then
   [ -n "${SWARM_BOARD_TOKEN:-}" ] && { echo "board.sh: SWARM_BOARD_TOKEN rejected (server SWARM_HARNESS_TOKEN differs)" >&2; exit 1; }
-  login; out=$(call)
+  login; code=$(call)
 fi
-printf '%s\n' "$out"
+printf '%s\n' "$(cat "$TMP_OUT")"

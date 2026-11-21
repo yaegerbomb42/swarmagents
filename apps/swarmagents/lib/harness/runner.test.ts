@@ -282,6 +282,146 @@ test("omits --append-system-prompt when no agent card is provided", async () => 
   assert.equal(vm.calls[0].cmd.includes("--append-system-prompt"), false);
 });
 
+test("L1 context packer packs the invocation prompt and reports the budget line", async () => {
+  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const runner = new ClaudeCodeRunner({ bin: "claude", contextPacker: "l1" });
+  const events: TelemetryEvent[] = [];
+
+  const outcome = await runner.run(
+    {
+      prompt: "Inspect repo",
+      agentCard: "I am your engineer.",
+      memoryContext: "remember the tests",
+      sessionId: "sess_resume_x",
+      model: "claude-sonnet-5-5",
+      env: envWithSecrets,
+      vm,
+    },
+    (e) => events.push(e),
+  );
+
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(vm.calls.length, 1);
+  const { cmd } = vm.calls[0];
+
+  // An L1 turn is stateless: --resume would replay the whole history.
+  assert.equal(cmd.includes("--resume"), false, "L1 packing must drop --resume");
+  assert.equal(cmd.includes("sess_resume_x"), false);
+
+  // The packed system header folds in the agent card and memory.
+  const idx = cmd.indexOf("--append-system-prompt");
+  assert.ok(idx !== -1, "argv should include --append-system-prompt");
+  const systemPrompt = cmd[idx + 1];
+  assert.match(systemPrompt, /L1 context mode/);
+  assert.match(systemPrompt, /I am your engineer/);
+  assert.match(systemPrompt, /remember the tests/);
+
+  // The user prompt is the packed ledger.
+  const prompt = cmd[cmd.length - 1];
+  assert.match(prompt, /## State ledger \(turn 0\)/);
+  assert.match(prompt, /Goal: Inspect repo/);
+
+  // The budget ledger line rides in telemetry.
+  const budget = events.filter(
+    (e): e is Extract<TelemetryEvent, { type: "capability.changed" }> =>
+      e.type === "capability.changed" && e.tool === "context",
+  );
+  assert.equal(budget.length, 1);
+  assert.equal(budget[0].ok, true);
+  assert.match(budget[0].detail, /^context-packer\[l1\] turn=0 budget=8192 /);
+});
+
+test("without the packer the argv is byte-identical to today and no context telemetry is emitted", async () => {
+  const base = {
+    prompt: "Inspect repo",
+    agentCard: "card",
+    memoryContext: "memory",
+    sessionId: "sess_resume_x",
+    model: "claude-sonnet-5-5",
+    env: envWithSecrets,
+  };
+
+  const runOnce = async (runner: ClaudeCodeRunner) => {
+    const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
+    const events: TelemetryEvent[] = [];
+    const outcome = await runner.run({ ...base, vm }, (e) => events.push(e));
+    assert.equal(outcome.exitCode, 0);
+    return { cmd: vm.calls[0].cmd, events };
+  };
+
+  const implicit = await runOnce(new ClaudeCodeRunner());
+  const explicit = await runOnce(new ClaudeCodeRunner({ contextPacker: "claude-code" }));
+
+  assert.deepEqual(explicit.cmd, implicit.cmd, "an explicit claude-code setting must not change argv");
+  assert.deepEqual(implicit.cmd, [
+    "claude",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--resume",
+    "sess_resume_x",
+    "--model",
+    "claude-sonnet-5-5",
+    "--append-system-prompt",
+    "card\n\nmemory",
+    "--",
+    "Inspect repo",
+  ]);
+  for (const { events } of [implicit, explicit]) {
+    assert.equal(
+      events.some((e) => e.type === "capability.changed" && (e as { tool?: string }).tool === "context"),
+      false,
+      "the default packer must emit no context telemetry",
+    );
+  }
+});
+
+test("a per-role packer default applies when neither the run nor the runner sets one", async () => {
+  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const runner = new ClaudeCodeRunner({ roleContextPackers: { coder: "l1" } });
+  const events: TelemetryEvent[] = [];
+
+  const outcome = await runner.run(
+    {
+      prompt: "Inspect repo",
+      env: {},
+      vm,
+      rolePhase: { roleId: "coder", allowedTools: ["Read"], mcpConfigPath: "/role.json" },
+    },
+    (e) => events.push(e),
+  );
+
+  assert.equal(outcome.exitCode, 0);
+  const { cmd } = vm.calls[0];
+  assert.match(cmd[cmd.length - 1], /## State ledger \(turn 0\)/);
+  // Packing keeps the role's tool allowlist and MCP config.
+  assert.ok(cmd.includes("--allowedTools"));
+  assert.ok(cmd.includes("/role.json"));
+  assert.equal(events.filter((e) => e.type === "capability.changed").length, 1);
+});
+
+test("a per-run packer override wins over the runner setting and role default", async () => {
+  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const runner = new ClaudeCodeRunner({ contextPacker: "l1", roleContextPackers: { coder: "l1" } });
+  const events: TelemetryEvent[] = [];
+  // Passed as a variable so the optional override is allowed structurally.
+  const request = {
+    prompt: "Inspect repo",
+    env: {},
+    vm,
+    rolePhase: { roleId: "coder", allowedTools: ["Read"], mcpConfigPath: "/role.json" },
+    contextPacker: "claude-code",
+  };
+
+  const outcome = await runner.run(request, (e) => events.push(e));
+
+  assert.equal(outcome.exitCode, 0);
+  const { cmd } = vm.calls[0];
+  assert.equal(cmd[cmd.length - 1], "Inspect repo");
+  assert.equal(events.some((e) => e.type === "capability.changed"), false);
+});
+
 test("parses the full recorded fixture, including partial lines and a malformed line", async () => {
   // Inject one garbage line (right after the init line) and stream everything in
   // awkward chunks so every JSON line is split mid-way at least once.

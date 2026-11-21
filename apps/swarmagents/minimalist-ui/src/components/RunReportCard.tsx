@@ -3,10 +3,11 @@
 /**
  * RunReportCard — what a finished run did, one click away from its reply.
  *
- * Collapsed, it is a single row with the numbers (steps, time, files changed,
- * cost). Expanded, it loads the report from the runtime API: the audit and
- * verification verdicts, the screenshots, the timeline, the files the run
- * changed (each downloadable), and what the agent could not do.
+ * Collapsed, it is a single row led by one plain-language sentence (what
+ * changed, how long it took, what it cost). Expanded, it loads the report
+ * from the runtime API: the audit and verification verdicts, the screenshots,
+ * the timeline, the files the run changed (each downloadable), and what the
+ * agent could not do.
  */
 
 import React, { useCallback, useEffect, useState } from "react";
@@ -23,7 +24,7 @@ import {
   Play,
   StopCircle,
 } from "lucide-react";
-import type { ReportCardMeta, RunReport } from "../../../lib/runtime/run-report-types";
+import type { ReportArtifact, ReportCardMeta, RunReport } from "../../../lib/runtime/run-report-types";
 import type { ThreadEntry } from "../../../lib/client/thread";
 import { Button, IconButton, Loading, Notice } from "./ui";
 
@@ -51,6 +52,44 @@ export function reportFacts(meta: ReportCardMeta): string[] {
   facts.push(`${meta.artifacts} ${meta.artifacts === 1 ? "file" : "files"} changed`);
   if (meta.costUsd !== undefined) facts.push(`$${meta.costUsd.toFixed(3)}`);
   return facts;
+}
+
+export function formatReportCost(costUsd?: number): string {
+  if (costUsd === undefined || !Number.isFinite(costUsd)) return "";
+  const subCent = costUsd !== 0 && costUsd < 0.005;
+  return `$${costUsd.toFixed(subCent ? 3 : 2)}`;
+}
+
+function filesSummary(meta: ReportCardMeta, artifacts?: ReportArtifact[]): string {
+  if (!artifacts) {
+    const n = meta.artifacts;
+    return n === 0 ? "No files changed" : `Changed ${n} ${n === 1 ? "file" : "files"}`;
+  }
+  if (artifacts.length === 0) return "No files changed";
+  const created = artifacts.filter((artifact) => artifact.change === "created");
+  const edited = artifacts.filter((artifact) => artifact.change !== "created");
+  const counted = (n: number) => `${n} ${n === 1 ? "file" : "files"}`;
+  if (created.length === 1 && edited.length === 0) return `Created ${created[0].rel}`;
+  if (created.length === 0 && edited.length === 1) return `Edited ${edited[0].rel}`;
+  if (created.length > 0 && edited.length > 0) return `Created ${counted(created.length)} and edited ${counted(edited.length)}`;
+  return created.length > 0 ? `Created ${counted(created.length)}` : `Edited ${counted(edited.length)}`;
+}
+
+/**
+ * One plain-language sentence for the report card, computed from data the
+ * card already has: what changed, how long it took, and what it cost. With
+ * the report loaded the files phrase can name the file ("Created hello.txt");
+ * from the collapsed row's meta alone it counts ("Changed 2 files").
+ */
+export function reportSummarySentence(meta: ReportCardMeta, artifacts?: ReportArtifact[]): string {
+  const parts = [filesSummary(meta, artifacts)];
+  if (meta.durationMs !== undefined && Number.isFinite(meta.durationMs)) parts.push(`in ${formatReportDuration(meta.durationMs)}`);
+  const cost = formatReportCost(meta.costUsd);
+  if (cost) parts.push(`for ${cost}`);
+  const body = parts.join(" ");
+  const prefix = meta.status === "error" ? "Run failed \u2014 " : meta.status === "cancelled" ? "Run stopped \u2014 " : "";
+  const sentence = prefix ? prefix + body.charAt(0).toLowerCase() + body.slice(1) : body;
+  return `${sentence}.`;
 }
 
 type VerdictTone = "ok" | "warn" | "err";
@@ -175,6 +214,7 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
     : "";
   const waiting = expanded && !report && attempts < MAX_POLLS;
   const unavailable = expanded && !report && attempts >= MAX_POLLS;
+  const summary = meta ? reportSummarySentence(meta, report?.artifacts) : "";
 
   return (
     <div className="mt-2 overflow-hidden rounded-xl border border-sa-line bg-sa-panel" data-testid="run-report">
@@ -192,10 +232,12 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
         )}
         <span className="font-medium text-sa-fg">Report</span>
         {meta && (
-          <span className="sa-tabular ml-auto flex min-w-0 flex-wrap justify-end gap-x-3 text-[12px] text-sa-fg3">
-            {reportFacts(meta).map((fact) => (
-              <span key={fact}>{fact}</span>
-            ))}
+          <span
+            className="sa-tabular ml-auto min-w-0 truncate pl-3 text-[12px] text-sa-fg2"
+            data-testid="run-report-summary"
+            title={summary}
+          >
+            {summary}
           </span>
         )}
       </button>

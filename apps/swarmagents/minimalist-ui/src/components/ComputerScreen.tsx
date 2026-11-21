@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowDown, Terminal, Globe, ShieldCheck, FileText, MonitorPlay } from "lucide-react";
+import { ArrowDown, Terminal, Globe, FileText, MonitorPlay } from "lucide-react";
 import type { LogEvent } from "../engine";
 import { AnsiRenderer } from "../../../components/AnsiRenderer";
 import { MascotSvg } from "../../../components/mascot/MascotSvg";
@@ -15,7 +15,7 @@ import {
 } from "../../../lib/client/terminalHistory";
 import { useSessionPersisted } from "../store";
 import { useStickToBottom } from "../../../lib/client/useStickToBottom";
-import { lifecycleEventLine } from "../../../lib/client/runTimeline";
+import { lifecycleEventLine, redactEventData } from "../../../lib/client/runTimeline";
 import {
   latestVmLifecycleEvent,
   resolveVmDisplayStatus,
@@ -66,7 +66,53 @@ interface ComputerScreenProps {
   embedded?: boolean;
 }
 
-const CHAR_LIMIT = 4000;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const TOOL_SUMMARY_LIMIT = 120;
+
+/**
+ * One human line for a tool call: the tool's short name plus its key
+ * argument only (the file path, the command, the search pattern, the URL).
+ * The full input JSON lives behind the collapsed Details disclosure, never
+ * on the main surface.
+ */
+export function toolCallSummary(name: string, input: unknown): string {
+  const short = name.split("__").pop() ?? name;
+  if (!isRecord(input)) return short;
+  const arg = (key: string): string | undefined => {
+    const value = input[key];
+    return typeof value === "string" && value !== "" ? value : undefined;
+  };
+  const key =
+    arg("file_path") ?? arg("path") ?? arg("file") ?? arg("command") ?? arg("pattern") ?? arg("url") ?? arg("query");
+  return key ? `${short} ${key}` : short;
+}
+
+/**
+ * The first non-empty line of a tool result (truncated) plus its byte
+ * count. The full output lives behind the collapsed Details disclosure.
+ */
+export function toolResultSummary(output: string): { line: string; bytes: number } {
+  const bytes = new TextEncoder().encode(output).length;
+  const raw = output.split("\n").find((line) => line.trim() !== "") ?? "";
+  const line = raw.length > TOOL_SUMMARY_LIMIT ? `${raw.slice(0, TOOL_SUMMARY_LIMIT)}…` : raw;
+  return { line, bytes };
+}
+
+/** Whether a tool result has content beyond the one-line summary. */
+function toolResultHasMore(output: string): boolean {
+  const lines = output.split("\n").filter((line) => line.trim() !== "");
+  if (lines.length > 1) return true;
+  return lines.length === 1 && lines[0].length > TOOL_SUMMARY_LIMIT;
+}
+
+/** Human labels for internal stream kinds — never render the raw kind. */
+const INTERNAL_KIND_LABELS: Record<string, string> = {
+  "route.decision": "routing decision",
+  "llm.call": "model call",
+};
 
 const VIEW_TABS = [
   { view: "desktop", label: "Desktop", Icon: MonitorPlay },
@@ -97,12 +143,6 @@ const VM_STATUS_STYLES: Record<
   },
 } as const;
 
-function summarizeInput(input: unknown): string {
-  if (input == null) return "";
-  const text = typeof input === "string" ? input : JSON.stringify(input);
-  return text.length > CHAR_LIMIT ? `${text.slice(0, CHAR_LIMIT)}…` : text;
-}
-
 /**
  * SSE events carry their fields at the top level (e.g. `{type, text}`); a few
  * control-plane events wrap them under `data`. Flatten both shapes so the same
@@ -120,7 +160,8 @@ function eventPayload(item: RunStreamItem): Record<string, unknown> {
   return {};
 }
 
-function StreamRow({ item }: { item: RunStreamItem }) {
+/** One stream event in the terminal. Exported for the static-render tests. */
+export function StreamRow({ item }: { item: RunStreamItem }) {
   const payload = eventPayload(item);
   switch (item.kind) {
     case "shell.cmd": {
@@ -177,16 +218,21 @@ function StreamRow({ item }: { item: RunStreamItem }) {
     }
     case "tool.call": {
       const d = payload as { name?: string; input?: unknown; id?: string };
-      const name = d.name ?? "tool";
-      const preview = summarizeInput(d.input);
+      const summary = toolCallSummary(d.name ?? "tool", d.input);
+      const hasInput = d.input !== undefined && d.input !== null;
       return (
-        <div className="flex gap-2">
-          <span className="text-amber-400/80 select-none shrink-0">$</span>
-          <span className="text-amber-200/90 shrink-0">{name}</span>
-          {preview !== "" && (
-            <span className="text-white/60 whitespace-pre-wrap break-words min-w-0">
-              <AnsiRenderer text={preview} />
-            </span>
+        <div className="min-w-0">
+          <div className="flex gap-2">
+            <span className="text-amber-400/80 select-none shrink-0">$</span>
+            <span className="text-amber-200/90 whitespace-pre-wrap break-words min-w-0">{summary}</span>
+          </div>
+          {hasInput && (
+            <details className="ml-4">
+              <summary className="cursor-pointer text-[11px] text-white/35 select-none">Details</summary>
+              <pre className="whitespace-pre-wrap break-words text-[11px] text-white/50">
+                {JSON.stringify(redactEventData(payload), null, 2)}
+              </pre>
+            </details>
           )}
         </div>
       );
@@ -194,17 +240,30 @@ function StreamRow({ item }: { item: RunStreamItem }) {
     case "tool.result": {
       const d = payload as { ok?: boolean; output?: string; truncated?: boolean };
       const ok = d.ok !== false;
-      const text = summarizeInput(d.output ?? "");
+      const output = typeof d.output === "string" ? d.output : "";
+      const { line, bytes } = toolResultSummary(output);
+      const hasMore = toolResultHasMore(output);
       return (
-        <div className="flex gap-2">
-          <span className={`select-none shrink-0 ${ok ? "text-emerald-400/70" : "text-rose-400/70"}`}>
-            {ok ? "ok" : "err"}
-          </span>
-          <span
-            className={`whitespace-pre-wrap break-words min-w-0 ${ok ? "text-white/80" : "text-rose-300/90"}`}
-          >
-            <AnsiRenderer text={text} />
-          </span>
+        <div className="min-w-0">
+          <div className="flex gap-2">
+            <span className={`select-none shrink-0 ${ok ? "text-emerald-400/70" : "text-rose-400/70"}`}>
+              {ok ? "ok" : "err"}
+            </span>
+            <span
+              className={`whitespace-pre-wrap break-words min-w-0 ${ok ? "text-white/80" : "text-rose-300/90"}`}
+            >
+              <AnsiRenderer text={line} />
+              {bytes > 0 && <span className="text-white/35"> · {bytes} B</span>}
+            </span>
+          </div>
+          {hasMore && (
+            <details className="ml-4">
+              <summary className="cursor-pointer text-[11px] text-white/35 select-none">Details</summary>
+              <pre className="whitespace-pre-wrap break-words text-[11px] text-white/50">
+                <AnsiRenderer text={output} />
+              </pre>
+            </details>
+          )}
         </div>
       );
     }
@@ -264,8 +323,8 @@ function StreamRow({ item }: { item: RunStreamItem }) {
       );
     }
     case "run.started": {
-      const d = payload as { sessionId?: string; model?: string };
-      return <SystemLine text={`run started · ${d.model ?? "claude"}`} />;
+      // No model string: the raw provider model id is internal vocabulary.
+      return <SystemLine text="run started" />;
     }
     case "run.finished": {
       const d = payload as { exitCode?: number; costUsd?: number; durationMs?: number; numTurns?: number; truncated?: boolean };
@@ -306,11 +365,13 @@ function StreamRow({ item }: { item: RunStreamItem }) {
       return <SystemLine text={`codebase context skipped · ${d.reason ?? "unknown"}`} tone="muted" />;
     }
     default: {
-      // Unknown event types render as a bare kind label. Never dump the raw
-      // payload: lifecycle events carry internal identifiers (userId) that
-      // must not appear in the terminal.
+      // Unknown event types never render the raw kind: internal kinds
+      // (route.decision, llm.call) would leak implementation vocabulary,
+      // and the raw payload carries internal identifiers (userId) that
+      // must not appear in the terminal. No Details disclosure here.
       const line = lifecycleEventLine(item.kind, payload);
-      return <SystemLine text={line ?? item.kind} tone="muted" />;
+      if (line) return <SystemLine text={line} tone="muted" />;
+      return <SystemLine text={INTERNAL_KIND_LABELS[item.kind] ?? "event"} tone="muted" />;
     }
   }
 }
@@ -663,11 +724,6 @@ export function ComputerScreen({
               onScroll={terminalScroll.onScroll}
               className="flex-1 p-4 font-mono text-xs overflow-y-auto space-y-1.5 scrollbar-thin"
             >
-              <div className="text-white/40 flex items-center gap-2 mb-2">
-                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Isolated User Sandbox. Dedicated terminal sessions run as non-root uid.</span>
-              </div>
-
               {liveRun ? (
                 <>
                   {/* Approvals replace the narration row under the screen;

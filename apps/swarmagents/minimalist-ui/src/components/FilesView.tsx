@@ -406,9 +406,6 @@ export function FilesView({ refreshToken = 0, openPath }: FilesViewProps) {
             <div className="flex flex-1 flex-col items-center justify-center gap-1 p-6 text-center">
               <FileText className="h-5 w-5 text-white/20" />
               <div className="text-xs text-white/40">Select a file to preview it.</div>
-              <div className="max-w-[220px] text-[10px] leading-relaxed text-white/25">
-                Text previews are capped by the API; binary files show a notice instead of content.
-              </div>
             </div>
           ) : (
             <>

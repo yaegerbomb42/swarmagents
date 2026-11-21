@@ -223,7 +223,7 @@ export default function App() {
 
   const views: SegmentOption<WorkspaceView>[] = [
     { id: "chat", label: "Chat", icon: <MessageSquare className="h-3.5 w-3.5" aria-hidden /> },
-    { id: "screen", label: "Screen", icon: <MonitorPlay className="h-3.5 w-3.5" aria-hidden /> },
+    { id: "screen", label: "Computer", icon: <MonitorPlay className="h-3.5 w-3.5" aria-hidden /> },
     { id: "board", label: "Board", icon: <ClipboardList className="h-3.5 w-3.5" aria-hidden />, count: board.counts.open },
   ];
 
@@ -307,7 +307,7 @@ export default function App() {
                 State the outcome.
               </h1>
               <p className="mx-auto mt-2 max-w-md text-sm text-[var(--mute)] leading-relaxed">
-                The agent acts on its dedicated cloud computer with real tools, live browsing, and code execution. Watch the screen or step in anytime.
+                The agent acts on its dedicated cloud computer with real tools, live browsing, and code execution. Watch the computer or step in anytime.
               </p>
             </div>
           ) : (

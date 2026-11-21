@@ -10,7 +10,7 @@
  * Notice.
  */
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { CircleAlert, Info, Loader2, TriangleAlert, X } from "lucide-react";
 import type { StatusTone } from "../../../lib/client/runPhase";
 import { cn } from "../utils/cn";
@@ -334,6 +334,180 @@ export function Loading({ label, className }: { label: string; className?: strin
     <div role="status" className={cn("flex items-center justify-center gap-2 text-[13px] text-sa-fg2", className)}>
       <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
       {label}
+    </div>
+  );
+}
+
+// ---- Split handle (resizable chat/stage split) ----
+
+/** The chat column never goes below this width, so its content stays readable. */
+export const SPLIT_CHAT_MIN_PX = 480;
+/** The stage never goes below this width either; it shrinks first, never the chat. */
+export const SPLIT_STAGE_MIN_PX = 480;
+/** The flex gap between the two panes (the `gap-3` on the row). */
+export const SPLIT_GAP_PX = 12;
+/** The chat's default share of the row. */
+export const SPLIT_RATIO_DEFAULT = 0.38;
+/** Absolute sanity bounds for a stored ratio, whatever the viewport. */
+export const SPLIT_RATIO_MIN = 0.2;
+export const SPLIT_RATIO_MAX = 0.8;
+
+/** Sanitize a stored split ratio to [0.2, 0.8]; anything unusable becomes the default. */
+export function clampSplitRatio(value: unknown): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : SPLIT_RATIO_DEFAULT;
+  return Math.min(SPLIT_RATIO_MAX, Math.max(SPLIT_RATIO_MIN, n));
+}
+
+/**
+ * The feasible ratio range for a row of this width, given the 480px floors
+ * on both panes. When the row is too narrow for both floors the range is
+ * degenerate and the split sits in the middle.
+ */
+export function splitRatioBounds(
+  containerWidthPx: number,
+  gapPx: number = SPLIT_GAP_PX,
+): { min: number; max: number } {
+  if (!Number.isFinite(containerWidthPx) || containerWidthPx <= SPLIT_CHAT_MIN_PX + SPLIT_STAGE_MIN_PX + gapPx) {
+    return { min: 0.5, max: 0.5 };
+  }
+  return {
+    min: Math.max(SPLIT_RATIO_MIN, SPLIT_CHAT_MIN_PX / containerWidthPx),
+    max: Math.min(SPLIT_RATIO_MAX, (containerWidthPx - SPLIT_STAGE_MIN_PX - gapPx) / containerWidthPx),
+  };
+}
+
+/** Clamp a ratio to the feasible range for a row of this width. */
+export function clampSplitRatioForWidth(
+  value: unknown,
+  containerWidthPx: number,
+  gapPx: number = SPLIT_GAP_PX,
+): number {
+  const { min, max } = splitRatioBounds(containerWidthPx, gapPx);
+  const n = typeof value === "number" && Number.isFinite(value) ? value : SPLIT_RATIO_DEFAULT;
+  return Math.min(max, Math.max(min, n));
+}
+
+/**
+ * The chat column's width in px for a row of this width and ratio — the same
+ * value the CSS clamp below resolves to. The chat floor wins when the row is
+ * too narrow for both floors.
+ */
+export function splitChatWidthPx(
+  containerWidthPx: number,
+  ratio: number,
+  gapPx: number = SPLIT_GAP_PX,
+): number {
+  const r = clampSplitRatioForWidth(ratio, containerWidthPx, gapPx);
+  return Math.max(
+    SPLIT_CHAT_MIN_PX,
+    Math.min(containerWidthPx * r, containerWidthPx - SPLIT_STAGE_MIN_PX - gapPx),
+  );
+}
+
+/** The chat column's width as a CSS clamp: 480px floor, ratio share, stage-keeps-480px ceiling. */
+export function splitChatWidthCss(ratio: number): string {
+  const pct = (clampSplitRatio(ratio) * 100).toFixed(1);
+  return `clamp(${SPLIT_CHAT_MIN_PX}px, ${pct}%, calc(100% - ${SPLIT_STAGE_MIN_PX + SPLIT_GAP_PX}px))`;
+}
+
+export interface SplitHandleProps {
+  /** Ref to the flex row that holds the two panes (measured for the ratio math). */
+  containerRef: React.RefObject<HTMLElement | null>;
+  /** Ref to the chat column (measured at drag start so the divider follows the pointer). */
+  chatRef: React.RefObject<HTMLElement | null>;
+  /** Current chat share of the row, 0..1 (already sanitized). */
+  ratio: number;
+  /** Called with the new ratio, already clamped to the feasible range. */
+  onRatioChange: (ratio: number) => void;
+  testId?: string;
+}
+
+/**
+ * The drag handle between the chat column and the stage. It takes no space
+ * in the flex row (w-0): the grip floats over the gap, so adding it changes
+ * no widths. Dragging moves the divider; arrow keys nudge it (Shift for a
+ * bigger step), Home/End jump to the ends. Hidden below the wide breakpoint
+ * — narrow screens stay a single pane.
+ */
+export function SplitHandle({ containerRef, chatRef, ratio, onRatioChange, testId }: SplitHandleProps) {
+  const [dragging, setDragging] = useState(false);
+  const dragStart = useRef<{ startX: number; startChatPx: number; contentWidth: number } | null>(null);
+
+  const contentWidth = (): number => {
+    const el = containerRef.current;
+    if (!el || typeof window === "undefined") return 0;
+    const rect = el.getBoundingClientRect();
+    const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(el) : null;
+    const pad =
+      (style ? Number.parseFloat(style.paddingLeft || "0") + Number.parseFloat(style.paddingRight || "0") : 24) || 24;
+    return Math.max(0, rect.width - pad);
+  };
+
+  const onPointerDown = (event: React.PointerEvent) => {
+    if (event.button !== 0) return;
+    const width = contentWidth();
+    const chatPx = chatRef.current?.getBoundingClientRect().width ?? 0;
+    if (width <= 0 || chatPx <= 0) return;
+    event.preventDefault();
+    dragStart.current = { startX: event.clientX, startChatPx: chatPx, contentWidth: width };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    setDragging(true);
+  };
+
+  const onPointerMove = (event: React.PointerEvent) => {
+    const start = dragStart.current;
+    if (!dragging || !start) return;
+    const nextPx = start.startChatPx + (event.clientX - start.startX);
+    onRatioChange(clampSplitRatioForWidth(nextPx / start.contentWidth, start.contentWidth));
+  };
+
+  const endDrag = (event: React.PointerEvent) => {
+    if (!dragging) return;
+    dragStart.current = null;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    setDragging(false);
+  };
+
+  const onKeyDown = (event: React.KeyboardEvent) => {
+    const width = contentWidth();
+    const { min, max } = width > 0 ? splitRatioBounds(width) : { min: SPLIT_RATIO_MIN, max: SPLIT_RATIO_MAX };
+    const step = event.shiftKey ? 0.1 : 0.02;
+    let next: number | undefined;
+    if (event.key === "ArrowLeft") next = ratio - step;
+    else if (event.key === "ArrowRight") next = ratio + step;
+    else if (event.key === "Home") next = min;
+    else if (event.key === "End") next = max;
+    if (next === undefined) return;
+    event.preventDefault();
+    onRatioChange(Math.min(max, Math.max(min, next)));
+  };
+
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize chat and stage panels"
+      aria-valuenow={Math.round(clampSplitRatio(ratio) * 100)}
+      aria-valuemin={Math.round(SPLIT_RATIO_MIN * 100)}
+      aria-valuemax={Math.round(SPLIT_RATIO_MAX * 100)}
+      tabIndex={0}
+      data-testid={testId ?? "split-handle"}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onKeyDown={onKeyDown}
+      className={cn("group relative hidden w-0 shrink-0 cursor-col-resize self-stretch outline-none lg:flex")}
+    >
+      {/* Hit area: 12px wide, full height, centred on the gap. The grip floats over it. */}
+      <div className="absolute inset-y-0 left-1/2 w-3 -translate-x-1/2 touch-none" aria-hidden>
+        <div
+          className={cn(
+            "absolute left-1/2 top-1/2 h-16 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full transition-colors",
+            dragging ? "bg-sa-accent-fg opacity-100" : "bg-sa-line-strong opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100 group-focus-visible:bg-sa-accent-fg",
+          )}
+        />
+      </div>
     </div>
   );
 }

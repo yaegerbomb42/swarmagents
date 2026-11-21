@@ -9,6 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ClaudeCodeRunner, isBackgroundedCommand, isSignalKillExitCode } from "./runner.js";
 import { localScorer } from "./system-one/index.js";
+import type { DecisionRouter } from "./decision-brain/index.js";
 import type { TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
 
 const SECRET_TOKEN = "sk-ant-api03-BENCH-FAKE-TOKEN-0000";
@@ -1220,4 +1221,116 @@ test("System-1 on + a throwing gate lets the call proceed (fail-open)", async ()
   assert.equal(events.some((e) => e.type === "approval.required"), false, "no pause");
   assert.equal(events.some((e) => e.type === "tool.blocked"), false, "no halt");
   assert.ok(events.some((e) => e.type === "tool.result"), "the run carried on to tool results");
+});
+
+// ---- Decision Brain wiring ----
+
+const BRAIN_INIT = {
+  type: "system",
+  subtype: "init",
+  cwd: "/home/user",
+  session_id: "sess_brain_1",
+  model: "claude-sonnet-5-5",
+};
+
+const BRAIN_RESULT = {
+  type: "result",
+  subtype: "success",
+  duration_ms: 100,
+  num_turns: 1,
+  result: "Done.",
+  session_id: "sess_brain_1",
+  cost_usd: 0.001,
+};
+
+function brainFixture(toolUse: Record<string, unknown>): string {
+  const call = {
+    type: "assistant",
+    message: { id: "b1", content: [{ type: "tool_use", id: "toolu_b1", ...toolUse }] },
+  };
+  return [BRAIN_INIT, call, BRAIN_RESULT].map((l) => JSON.stringify(l)).join("\n") + "\n";
+}
+
+async function runBrain(runner: ClaudeCodeRunner, request: Record<string, unknown> = {}) {
+  const { fixture, ...rest } = request;
+  const vm = new ScriptedVm([{ chunks: [fixture as string] }]);
+  const events: TelemetryEvent[] = [];
+  const outcome = await runner.run(
+    { prompt: "Inspect repo", env: envWithSecrets, ...rest, vm },
+    (e) => events.push(e),
+  );
+  return { vm, events, outcome };
+}
+
+test("Brain on + heuristic: a relative rm -rf halts with the high-stakes reason", async () => {
+  // The risk gate only asks for absolute/home/wildcard deletion targets;
+  // a relative recursive delete classifies allow. The Brain's destructive
+  // patterns catch it. No approval gateway → halt, never silent.
+  const { events, outcome } = await runBrain(
+    new ClaudeCodeRunner({ decisionBrain: { settings: { enabled: true } } }),
+    {
+      fixture: brainFixture({ name: "Bash", input: { command: "rm -rf build" } }),
+    },
+  );
+  assert.equal(outcome.exitCode, 0);
+  const errors = events.filter((e) => e.type === "run.error");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /Halted by harness risk policy: high-stakes:destructive-pattern/);
+  assert.ok(events.some((e) => e.type === "tool.blocked"), "halt is visible on the stream");
+  assert.equal(events.some((e) => e.type === "run.finished"), false);
+});
+
+test("Brain on + stub router retry: halts with the distinct retry marker", async () => {
+  const retryRouter: DecisionRouter = {
+    decide: async () => ({ decision: "retry", confidence: 0.8, reason: "last step failed", escalated: false }),
+  };
+  const { events } = await runBrain(
+    new ClaudeCodeRunner({
+      decisionBrain: { settings: { enabled: true }, router: retryRouter },
+    }),
+    { fixture: brainFixture({ name: "Bash", input: { command: "ls -la" } }) },
+  );
+  const errors = events.filter((e) => e.type === "run.error");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /decision brain requested retry: last step failed/);
+});
+
+test("Brain on + stub router ask: an approving gateway lets the run finish", async () => {
+  const askRouter: DecisionRouter = {
+    decide: async () => ({ decision: "ask", confidence: 1, reason: "needs a human", escalated: false }),
+  };
+  const approvals: string[] = [];
+  const { events, outcome } = await runBrain(
+    new ClaudeCodeRunner({
+      decisionBrain: { settings: { enabled: true }, router: askRouter },
+    }),
+    {
+      fixture: brainFixture({ name: "Bash", input: { command: "ls -la" } }),
+      approvalGateway: (request: { toolName: string }) => {
+        approvals.push(request.toolName);
+        return { id: `appr_${approvals.length}`, verdict: Promise.resolve("approved" as const) };
+      },
+    },
+  );
+  assert.equal(outcome.exitCode, 0);
+  assert.deepEqual(approvals, ["Bash"]);
+  assert.ok(events.some((e) => e.type === "approval.required"), "the pause is visible");
+  assert.equal(events.some((e) => e.type === "run.error"), false);
+});
+
+test("Brain off: argv and events are byte-identical to today", async () => {
+  const plain = await runSystemOne(new ClaudeCodeRunner());
+  const disabled = await runSystemOne(
+    new ClaudeCodeRunner({ decisionBrain: { settings: { enabled: false } } }),
+  );
+  assert.equal(disabled.outcome.exitCode, 0);
+  assert.deepEqual(disabled.vm.calls[0].cmd, plain.vm.calls[0].cmd, "argv is unchanged");
+  const withoutWallClock = (events: TelemetryEvent[]) =>
+    events.map((event) => {
+      const copy = { ...(event as unknown as Record<string, unknown>) };
+      delete copy.startedAt;
+      delete copy.finishedAt;
+      return copy;
+    });
+  assert.deepEqual(withoutWallClock(disabled.events), withoutWallClock(plain.events), "no Brain telemetry leaks into the run");
 });

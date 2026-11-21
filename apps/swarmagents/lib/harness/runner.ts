@@ -49,6 +49,13 @@ import {
   type BeforeToolVerdict,
   type SystemOneHooksOptions,
 } from "./system-one/index";
+import {
+  DecisionBrainHooks,
+  resolveDecisionBrainSettings,
+  type AgentSnapshot,
+  type BrainVerdict,
+  type DecisionBrainHooksOptions,
+} from "./decision-brain/index";
 import { isRoleListTool, isRoleSwitchTool, ROLE_MCP_CONFIG_PATH } from "./role-mcp";
 import { isAskUserTool, parseAskUserArguments } from "./ask-mcp";
 import { isDesktopHandoffTool, parseDesktopHandoffArguments } from "./desktop-handoff-mcp";
@@ -88,6 +95,14 @@ export interface ClaudeCodeRunnerOptions {
    * unless `settings.enabled` is true, so the default run path is untouched.
    */
   systemOne?: SystemOneHooksOptions;
+  /**
+   * Optional Decision Brain loop control. Nothing is constructed or called
+   * unless `settings.enabled` is true, so the default run path is untouched.
+   * The Brain evaluates each allowed tool call from a snapshot of the loop
+   * state; it can ask, stop, or signal a retry (a manager-level re-drive —
+   * the runner cannot rewind the CLI).
+   */
+  decisionBrain?: DecisionBrainHooksOptions;
 }
 
 /** What buildArgv applied when the L1 packer ran, for the telemetry line. */
@@ -187,6 +202,24 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Snapshot tool args, bounded so a huge tool input cannot bloat the
+ * decision payload. Small inputs pass through verbatim; oversized ones
+ * are replaced by a preview (destructive patterns live at the start of
+ * a command, so the preview keeps the signal the heuristic scans for).
+ */
+function snapshotToolArgs(input: unknown): Record<string, unknown> {
+  if (!isObject(input)) return {};
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(input) ?? "";
+  } catch {
+    return {};
+  }
+  if (serialized.length <= 4000) return input;
+  return { truncated: true, preview: serialized.slice(0, 4000) };
+}
+
 /** Parse a Claude `usage` object (assistant messages and the final result share its shape). */
 function parseUsage(value: unknown): UsageTotals | null {
   if (!isObject(value)) return null;
@@ -213,12 +246,14 @@ export class ClaudeCodeRunner {
   /** Per-role packer defaults, e.g. { coder: "l1" }. */
   private readonly roleContextPackers: Record<string, unknown> | undefined;
   private readonly systemOneOptions: SystemOneHooksOptions | undefined;
+  private readonly decisionBrainOptions: DecisionBrainHooksOptions | undefined;
 
   constructor(options: ClaudeCodeRunnerOptions = {}) {
     this.bin = options.bin ?? process.env.CLAUDE_BIN ?? "claude";
     this.contextPacker = options.contextPacker;
     this.roleContextPackers = options.roleContextPackers;
     this.systemOneOptions = options.systemOne;
+    this.decisionBrainOptions = options.decisionBrain;
   }
 
   /**
@@ -236,6 +271,12 @@ export class ClaudeCodeRunner {
       this.systemOneOptions && resolveSystemOneSettings(this.systemOneOptions.settings).enabled
         ? new SystemOneHooks(this.systemOneOptions)
         : undefined;
+    // The Decision Brain is inert on the same terms: no hooks object, no
+    // await, no events unless its own settings enable it.
+    const brain =
+      this.decisionBrainOptions && resolveDecisionBrainSettings(this.decisionBrainOptions.settings).enabled
+        ? new DecisionBrainHooks(this.decisionBrainOptions)
+        : undefined;
 
     let started = false;
     let lastSessionId: string | undefined;
@@ -250,6 +291,10 @@ export class ClaudeCodeRunner {
     /** Set when the risk gate halts the run (deny or denied/expired ask). */
     let haltedReason: string | null = null;
     let aborted = false;
+    /** Decision Brain loop state: evaluations so far, last result, last failure. */
+    let brainTurnCount = 0;
+    let lastBrainToolResult: { ok: boolean; output: string } | null = null;
+    let lastBrainError: string | null = null;
 
     // Role switching: a validated set_role call aborts this invocation (via an
     // internal signal the manager never sees) so the run can resume with the
@@ -504,6 +549,59 @@ export class ClaudeCodeRunner {
                     }
                   });
                 }
+
+                // Decision Brain loop control, evaluated for calls the
+                // ordinary risk gate allowed. Fail-open like System-1: a
+                // throwing router proceeds, and every verdict goes through
+                // the same visible mechanisms (approval pause / halt).
+                // `retry` halts with a distinct marker — the runner cannot
+                // rewind the CLI, so a manager-level re-drive keys on it.
+                if (brain && decision.level === "allow" && haltedReason === null) {
+                  gateChain = gateChain.then(async () => {
+                    if (haltedReason !== null) return;
+                    brainTurnCount += 1;
+                    const snapshot: AgentSnapshot = {
+                      goal: request.prompt,
+                      lastToolCall: { name, args: snapshotToolArgs(input) },
+                      lastToolResult: lastBrainToolResult,
+                      error: firstErrorMessage ?? lastBrainError,
+                      turnCount: brainTurnCount,
+                      budgetLeft: {
+                        turnsRemaining: Math.max(0, brain.settings.maxTurns - brainTurnCount),
+                        // No run token budget is configured; the heuristic
+                        // exhausts turns only. The sentinel keeps the
+                        // snapshot shape stable for model routers.
+                        tokensRemaining: 1_000_000,
+                      },
+                    };
+                    let verdict: BrainVerdict | undefined;
+                    try {
+                      verdict = await brain.beforeTool(snapshot);
+                    } catch {
+                      verdict = undefined;
+                    }
+                    if (!verdict || verdict.action === "proceed") return;
+                    if (verdict.action === "ask" && request.approvalGateway) {
+                      const userVerdict = await this.gateApproval(request, {
+                        toolName: name,
+                        action: describeAction(name, input),
+                        reason: verdict.reason,
+                      }, emit, redact);
+                      if (userVerdict !== "approved" && haltedReason === null) {
+                        haltedReason = userVerdict === "expired" ? "approval timed out" : "approval denied by user";
+                      }
+                    } else if (verdict.action === "retry") {
+                      if (haltedReason === null) {
+                        haltedReason = `decision brain requested retry: ${verdict.reason}`;
+                        emit({ type: "tool.blocked", name, reason: haltedReason });
+                      }
+                    } else if (haltedReason === null) {
+                      // `ask` without a gateway, or `stop`: halt with the reason.
+                      haltedReason = verdict.reason;
+                      emit({ type: "tool.blocked", name, reason: haltedReason });
+                    }
+                  });
+                }
               }
 
               // ask_user: pause the run until the user answers. The answer is
@@ -594,13 +692,20 @@ export class ClaudeCodeRunner {
           const content = Array.isArray(message.content) ? message.content : [];
           for (const block of content) {
             if (!isObject(block) || block.type !== "tool_result") continue;
+            const output = renderToolOutput(block, redact);
+            const ok = block.is_error !== true;
             emit({
               type: "tool.result",
               id: typeof block.tool_use_id === "string" ? block.tool_use_id : undefined,
-              ok: block.is_error !== true,
+              ok,
               truncated: isTruncated(block),
-              output: renderToolOutput(block, redact),
+              output,
             });
+            // The Brain's loop state: the last result (bounded) and the
+            // last failure. A success clears a stale failure — the loop
+            // recovered, so the next decision must not retry on it.
+            lastBrainToolResult = { ok, output: output.slice(0, 2000) };
+            lastBrainError = ok ? null : output.slice(0, 500);
           }
           break;
         }

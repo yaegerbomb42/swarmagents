@@ -15,7 +15,7 @@ async function renderApp(options: BrowserStubOptions = {}): Promise<string> {
   return renderToStaticMarkup(React.createElement(ToastsProvider, null, React.createElement(App)));
 }
 
-const ALWAYS_IN_REACH = ["workspace-header", "open-history", "new-chat", "open-settings", "composer-input", "composer-send"];
+const ALWAYS_IN_REACH = ["workspace-header", "open-history", "new-chat", "open-settings", "open-shortcuts", "composer-input", "composer-send"];
 
 test("the workspace opens on the chat: one header, one view switch, one composer", async () => {
   const html = await renderApp();
@@ -195,4 +195,28 @@ test("at 900px and up the console returns to the wide split layout", async () =>
   assert.equal(tagOf(html, "workspace-main").includes('data-layout="wide"'), true, "wide layout at desktop width");
   assert.doesNotMatch(tagOf(html, "workspace-main"), /data-layout="one-column"/, "not one-column on wide");
   assert.equal(countOf(html, 'data-testid="split-handle"'), 1, "the split handle returns on wide");
+});
+
+test("the header has a keyboard-shortcuts help button; the panel starts closed", async () => {
+  const html = await renderApp();
+  assert.equal(countOf(html, 'data-testid="open-shortcuts"'), 1, "one '?' help button");
+  assert.match(tagOf(html, "open-shortcuts"), /aria-label="Keyboard shortcuts"/);
+  assert.equal(countOf(html, 'data-testid="shortcuts-help"'), 0, "the help panel is closed by default");
+});
+
+test("workspace chords map to focus and new chat, never bare keys", async () => {
+  const { workspaceChordAction } = await import("./App");
+
+  assert.deepEqual(workspaceChordAction({ key: "k", metaKey: true }), "focusComposer");
+  assert.deepEqual(workspaceChordAction({ key: "K", ctrlKey: true }), "focusComposer");
+  assert.deepEqual(workspaceChordAction({ key: "o", metaKey: true, shiftKey: true }), "newChat");
+  assert.deepEqual(workspaceChordAction({ key: "O", ctrlKey: true, shiftKey: true }), "newChat");
+
+  // Plain Ctrl+O (browser open file), bare keys, and other chords are untouched.
+  assert.equal(workspaceChordAction({ key: "o", ctrlKey: true }), null);
+  assert.equal(workspaceChordAction({ key: "o", metaKey: true }), null);
+  assert.equal(workspaceChordAction({ key: "o", shiftKey: true }), null);
+  assert.equal(workspaceChordAction({ key: "k" }), null);
+  assert.equal(workspaceChordAction({ key: "Escape" }), null);
+  assert.equal(workspaceChordAction({ key: "a", metaKey: true }), null);
 });

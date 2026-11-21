@@ -38,6 +38,7 @@ import { Header, type WorkspaceView } from "./components/Header";
 import { HistoryPanel } from "./components/HistoryPanel";
 import type { SettingsTab } from "./components/Settings";
 import { SettingsSheet } from "./components/SettingsSheet";
+import { ShortcutsHelp } from "./components/ShortcutsHelp";
 import { useToasts } from "./components/Toasts";
 import { ScreenFrame } from "./components/dashboard/ScreenFrame";
 import { Button, Loading, Notice, SplitHandle, clampSplitRatio, splitChatWidthCss, type SegmentOption } from "./components/ui";
@@ -80,6 +81,26 @@ export function shouldToastRunCompletion(input: {
   );
 }
 
+export type WorkspaceChord = "focusComposer" | "newChat";
+
+/**
+ * The workspace's modifier-chord shortcuts, kept pure so tests can pin the
+ * mapping without a DOM. Cmd/Ctrl+K focuses the composer; Cmd/Ctrl+Shift+O
+ * starts a new chat. Plain Cmd/Ctrl+O is left alone (it is the browser's
+ * "open file"). Bare keys never map here — typing must be unaffected.
+ */
+export function workspaceChordAction(event: {
+  key: string;
+  metaKey?: boolean;
+  ctrlKey?: boolean;
+  shiftKey?: boolean;
+}): WorkspaceChord | null {
+  if (!(event.metaKey || event.ctrlKey)) return null;
+  const key = event.key.toLowerCase();
+  if (key === "k") return "focusComposer";
+  if (key === "o" && event.shiftKey) return "newChat";
+  return null;
+}
 export default function App() {
   const { push: pushToast } = useToasts();
   const wide = useIsWide();
@@ -121,6 +142,7 @@ export default function App() {
 
   const [historyOpen, setHistoryOpen] = useState(false);
   const [settings, setSettings] = useState<{ open: boolean; tab: SettingsTab }>({ open: false, tab: "providers" });
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [focusTaskId, setFocusTaskId] = useState<string>();
   const [stopping, setStopping] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -274,17 +296,34 @@ export default function App() {
     [setView],
   );
 
-  // Cmd/Ctrl+K focus
+  // Cmd/Ctrl+K focus (unchanged), Cmd/Ctrl+Shift+O new chat. Esc closes the
+  // console's own overlays — history, settings, the shortcuts help — the way
+  // every other overlay in the app closes (the Sheet component handles its own
+  // Esc; this fallback covers the ones App owns). Bare keys are never handled
+  // here, so typing in the composer is unaffected.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
-      event.preventDefault();
-      if (!wide) setView((current) => (current === "board" ? "chat" : current));
-      focusComposer();
+      const action = workspaceChordAction(event);
+      if (action === "focusComposer") {
+        event.preventDefault();
+        if (!wide) setView((current) => (current === "board" ? "chat" : current));
+        focusComposer();
+        return;
+      }
+      if (action === "newChat") {
+        if (busy) return;
+        event.preventDefault();
+        handleNewChat();
+        return;
+      }
+      if (event.key !== "Escape") return;
+      if (shortcutsOpen) setShortcutsOpen(false);
+      else if (settings.open) closeSettings();
+      else if (historyOpen) setHistoryOpen(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [wide, setView, focusComposer]);
+  }, [wide, setView, focusComposer, handleNewChat, busy, shortcutsOpen, settings.open, closeSettings, historyOpen]);
 
   // ---- Layout configuration ----
 
@@ -340,6 +379,7 @@ export default function App() {
         }}
         onOpenSettings={() => openSettings("providers")}
         settingsNeedsAttention={providerStatus.state === "missing"}
+        onOpenShortcuts={() => setShortcutsOpen(true)}
       />
 
       {session.offline && !session.signedOut && (
@@ -561,6 +601,9 @@ export default function App() {
         busy={busy}
         onResetVm={handleResetVm}
       />
+
+      {/* Slide-over Keyboard Shortcuts Help */}
+      <ShortcutsHelp open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
     </div>
   );
 }

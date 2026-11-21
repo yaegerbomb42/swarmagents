@@ -9,7 +9,7 @@
  */
 
 import React from "react";
-import { ChevronDown, Settings as SettingsIcon, Square, SquarePen, Activity, Monitor, MessageSquare, ClipboardList } from "lucide-react";
+import { ChevronDown, HelpCircle, Settings as SettingsIcon, Square, SquarePen, Activity, Monitor, MessageSquare, ClipboardList } from "lucide-react";
 import { MascotDock } from "../../../components/mascot/MascotDock";
 import type { MascotState } from "../../../components/mascot/frames";
 import { RUN_PHASE_META, formatDuration, type RunPhase } from "../../../lib/client/runPhase";
@@ -84,6 +84,8 @@ export interface HeaderProps {
   run: RunIndicatorProps;
   onOpenSettings: () => void;
   settingsNeedsAttention: boolean;
+  /** Opens the keyboard-shortcuts help panel. */
+  onOpenShortcuts: () => void;
 }
 
 export function Header({
@@ -99,6 +101,7 @@ export function Header({
   run,
   onOpenSettings,
   settingsNeedsAttention,
+  onOpenShortcuts,
 }: HeaderProps) {
   return (
     <header className="glass shrink-0 hair-b relative z-30" data-testid="workspace-header">
@@ -151,6 +154,14 @@ export function Header({
 
         <div className="flex items-center justify-end gap-2">
           <RunIndicator {...run} />
+          <IconButton
+            label="Keyboard shortcuts"
+            onClick={onOpenShortcuts}
+            data-testid="open-shortcuts"
+            className="rounded-xl hair bg-black/20 hover:bg-white/[0.06]"
+          >
+            <HelpCircle className="h-4 w-4" aria-hidden />
+          </IconButton>
           <IconButton
             label="Settings"
             onClick={onOpenSettings}

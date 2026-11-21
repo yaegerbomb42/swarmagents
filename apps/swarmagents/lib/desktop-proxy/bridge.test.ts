@@ -591,3 +591,95 @@ test("bridge: getStatus reports live mode, connected, and spliced state", () => 
   assert.deepEqual(h.closes, ["rfb-view-violation"]);
   assert.equal(h.bridge.getStatus().connected, false);
 });
+
+/**
+ * Soak: a realistic framebuffer session, not just the unit-sized repro.
+ *
+ * Frame sizes vary from a 15-byte cursor update to a 250 KB full frame,
+ * upstream pings are interleaved (including between fragments of one message),
+ * the browser answers keepalives, and a view->control promotion happens
+ * mid-stream. Crucially, every frame is delivered in irregular TCP slices that
+ * do NOT line up with WebSocket frame boundaries: a decoder that reassembled
+ * only what arrived in a single chunk would drop most of this stream, so this
+ * test fails if the streaming WsFrameDecoder is ever reverted.
+ */
+test("bridge: soak — a realistic framebuffer stream holds across mixed frames, pings and a view→control switch", () => {
+  const h = makeBridge("view");
+  handshake(h);
+
+  const key = Buffer.from([4, 1, 0, 0, 0, 0x41]);
+  const fbur = Buffer.from([3, 1, 0, 0, 0, 0, 6, 64, 3, 132]);
+
+  // A view-only client cannot inject input, but framebuffer requests pass.
+  h.client.feedSliced(encodeClientFrame(OP_BINARY, key), 13);
+  assert.equal(h.toUpstream.binary().length, 0, "view mode drops key events");
+  h.client.feedSliced(encodeClientFrame(OP_BINARY, fbur), 13);
+  assert.ok(h.toUpstream.binary().equals(fbur), "view mode relays framebuffer requests");
+
+  // Deterministic pseudo-random TCP slicing: a frame never gets to assume it
+  // arrives in one piece.
+  let seed = 0x2f6e2b1;
+  const sliceSizes = [137, 900, 1500, 4096, 37, 2048, 8192, 211, 777];
+  let feeds = 0;
+  const feedStream = (data: Buffer): void => {
+    let off = 0;
+    while (off < data.length) {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      const size = Math.min(sliceSizes[seed % sliceSizes.length], data.length - off);
+      h.upstream.feed(data.subarray(off, off + size));
+      off += size;
+      feeds++;
+    }
+  };
+
+  const frameSizes = [72, 5120, 200 * 1024, 15, 48 * 1024, 90_000, 300, 250 * 1024, 640, 8 * 1024];
+  const expected: Buffer[] = [];
+
+  for (let cycle = 0; cycle < 2; cycle++) {
+    for (let i = 0; i < frameSizes.length; i++) {
+      const index = cycle * frameSizes.length + i;
+      const payload = bigPayload(frameSizes[i]);
+      expected.push(payload);
+
+      if (index % 3 === 2) {
+        // Fragmented update with a keepalive ping between the two fragments.
+        const cut = Math.floor(payload.length / 2);
+        const label = `hb-${index}`;
+        feedStream(Buffer.concat([
+          frame(OP_BINARY, payload.subarray(0, cut), { fin: false }),
+          frame(OP_PING, Buffer.from(label)),
+          frame(OP_CONTINUATION, payload.subarray(cut), { fin: true }),
+        ]));
+        const pongs = h.toUpstream.read().filter((m) => m.opcode === OP_PONG);
+        assert.equal(pongs.length, 1, `ping ${label} answered`);
+        assert.equal(pongs[0].payload.toString(), label, "pong echoes the ping payload");
+        assert.ok((h.upstream.writes.at(-1)![1] & 0x80) !== 0, "pong toward the container is masked");
+      } else {
+        feedStream(encodeFrame(OP_BINARY, payload));
+      }
+
+      // The browser acknowledges the bridge's own keepalive pings.
+      if (index % 4 === 0) h.client.feed(encodeClientFrame(OP_PONG, Buffer.alloc(0)));
+
+      // Promote mid-stream: the very same socket now allows input.
+      if (index === 7) {
+        h.bridge.setMode("control");
+        h.client.feedSliced(encodeClientFrame(OP_BINARY, key), 7);
+        assert.ok(h.toUpstream.binary().equals(key), "control mode forwards key events mid-stream");
+      }
+    }
+  }
+
+  assert.ok(feeds > expected.length, "frames really were split across multiple TCP chunks");
+
+  const forwarded = h.toClient.read().filter((m) => m.opcode === OP_BINARY).map((m) => m.payload);
+  assert.equal(forwarded.length, expected.length, "one binary message per framebuffer update");
+  assert.ok(Buffer.concat(forwarded).equals(Buffer.concat(expected)), "every update arrives byte-identical and in order");
+
+  assert.deepEqual(h.closes, [], "the bridge never fails during the soak");
+  assert.deepEqual(
+    h.bridge.getStatus(),
+    { mode: "control", connected: true, spliced: true },
+    "session is live and spliced after the soak",
+  );
+});

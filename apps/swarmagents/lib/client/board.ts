@@ -316,6 +316,36 @@ export const TASK_STATUS_META: Record<TaskStatus, TaskStatusMeta> = {
 /** The order a reader scans the board in: what can start, what is moving, what is done. */
 export const BOARD_GROUP_ORDER: readonly TaskStatus[] = ["open", "claimed", "in_review", "blocked", "completed"];
 
+/** Start of the day the canonical repo moved; older work belongs to the frozen archive. */
+export const BOARD_ACTIVE_SINCE = Date.UTC(2026, 10, 20);
+
+export interface BoardTaskSplit {
+  active: SwarmTask[];
+  hidden: SwarmTask[];
+}
+
+/**
+ * Split board tasks into current work and frozen monolith-era leftovers.
+ *
+ * `createdAt` and `updatedAt` are the only dated fields every task carries —
+ * `parseTask` normalizes both to numbers (0 for rows that predate them) — so
+ * the latest of the two is the reliable signal. Display only: the input array
+ * and its tasks are never changed.
+ */
+export function partitionBoardTasks(
+  tasks: readonly SwarmTask[],
+  since: number = BOARD_ACTIVE_SINCE,
+): BoardTaskSplit {
+  const active: SwarmTask[] = [];
+  const hidden: SwarmTask[] = [];
+  for (const task of tasks) {
+    const latest = Math.max(task.createdAt ?? 0, task.updatedAt ?? 0);
+    if (Number.isFinite(latest) && latest >= since) active.push(task);
+    else hidden.push(task);
+  }
+  return { active, hidden };
+}
+
 export interface BoardGroup {
   status: TaskStatus;
   label: string;

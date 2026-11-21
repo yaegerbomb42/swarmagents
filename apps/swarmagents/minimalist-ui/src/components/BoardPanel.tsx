@@ -30,6 +30,7 @@ import {
   extractBranchAndPr,
   groupBoardTasks,
   isSafeHttpUrl,
+  partitionBoardTasks,
   prLabel,
   type TaskRunLink,
 } from "../../../lib/client/board";
@@ -476,9 +477,40 @@ function TaskRow({
 
 // ---- Panel ----
 
+/** Presentational so both filter states can be checked without a DOM. */
+export function BoardStaleToggle({
+  hiddenCount,
+  showAll,
+  onToggle,
+}: {
+  hiddenCount: number;
+  showAll: boolean;
+  onToggle: () => void;
+}) {
+  if (hiddenCount === 0 && !showAll) return null;
+  return (
+    <Button
+      size="sm"
+      variant="ghost"
+      data-testid="board-show-all-toggle"
+      aria-pressed={showAll}
+      onClick={onToggle}
+    >
+      {showAll ? "Show active work only" : `Show all tasks (${hiddenCount} hidden)`}
+    </Button>
+  );
+}
+
 export function BoardPanel({ board, agentName, runFor, onRunTask, onViewRun, focusTaskId, className }: BoardPanelProps) {
-  const groups = useMemo(() => groupBoardTasks(board.tasks), [board.tasks]);
+  const [showAll, setShowAll] = useState(false);
+  const { active, hidden } = useMemo(() => partitionBoardTasks(board.tasks), [board.tasks]);
+  const visibleTasks = showAll ? board.tasks : active;
+  const groups = useMemo(() => groupBoardTasks(visibleTasks), [visibleTasks]);
   const focused = focusTaskId ? board.tasks.find((task) => task.id === focusTaskId) : undefined;
+  // A run can point at older work: reveal it rather than rendering an empty list.
+  useEffect(() => {
+    if (focusTaskId && hidden.some((task) => task.id === focusTaskId)) setShowAll(true);
+  }, [focusTaskId, hidden]);
   // Completed tasks are folded away until asked for, or until one is opened from a run.
   const focusedCompleted = focused?.status === "completed";
   const [showCompleted, setShowCompleted] = useState(focusedCompleted);
@@ -491,7 +523,10 @@ export function BoardPanel({ board, agentName, runFor, onRunTask, onViewRun, foc
       <div className="sa-scroll min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-[860px] space-y-4 px-4 py-6">
           <header>
-            <h2 className="text-xl font-semibold tracking-tight text-sa-fg">Board</h2>
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-xl font-semibold tracking-tight text-sa-fg">Board</h2>
+              <BoardStaleToggle hiddenCount={hidden.length} showAll={showAll} onToggle={() => setShowAll((v) => !v)} />
+            </div>
             <p className="mt-1 text-[13px] text-sa-fg2">
               Tasks for the swarm. Run one on your VM, then submit the result for review.
             </p>

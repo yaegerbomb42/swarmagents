@@ -14,6 +14,7 @@ import { GET, POST } from "../../app/api/mcp/swarm-board/route";
 import { configureStorePaths } from "../board/store";
 import type { SwarmTask } from "../mcp-types";
 import {
+  BOARD_ACTIVE_SINCE,
   BOARD_ENDPOINT,
   TASK_TITLE_MAX,
   agentNameForUser,
@@ -28,6 +29,7 @@ import {
   isSafeHttpUrl,
   linkTaskRun,
   normalizeTaskTitle,
+  partitionBoardTasks,
   parseBoardSnapshot,
   prLabel,
   submitBoardTask,
@@ -340,4 +342,25 @@ test("a task remembers the run started for it, and a run finds its task", () => 
   assert.equal(Object.keys(links).length, 200, "old links are dropped past the cap");
   assert.equal(links.t1, undefined);
   assert.ok(links.bulk_249);
+});
+
+test("partitionBoardTasks hides frozen-era work and keeps tasks from the move onward", () => {
+  const before = BOARD_ACTIVE_SINCE - 1;
+  const at = BOARD_ACTIVE_SINCE;
+  const tasks = [
+    task({ id: "stale", createdAt: before, updatedAt: before }),
+    task({ id: "fresh", createdAt: at, updatedAt: at }),
+    task({ id: "touched", createdAt: 1, updatedAt: at }),
+    task({ id: "zero", createdAt: 0, updatedAt: 0 }),
+  ];
+  const split = partitionBoardTasks(tasks);
+  assert.deepEqual(split.active.map((row) => row.id), ["fresh", "touched"]);
+  assert.deepEqual(split.hidden.map((row) => row.id), ["stale", "zero"]);
+  assert.equal(tasks.length, 4, "the input list is not changed");
+  assert.equal(tasks[0].createdAt, before, "the tasks themselves are not changed");
+});
+
+test("partitionBoardTasks accepts a custom cutoff", () => {
+  const tasks = [task({ id: "old", createdAt: 100, updatedAt: 100 }), task({ id: "new", createdAt: 200, updatedAt: 200 })];
+  assert.deepEqual(partitionBoardTasks(tasks, 150).active.map((row) => row.id), ["new"]);
 });

@@ -43,6 +43,12 @@ import { createStreamJsonParser } from "./stream-json";
 import { makeRedactor, redactValue } from "./redact";
 import { classifyToolCall } from "./risk";
 import { isIrreversibleExternal } from "./tool-approval";
+import {
+  SystemOneHooks,
+  resolveSystemOneSettings,
+  type BeforeToolVerdict,
+  type SystemOneHooksOptions,
+} from "./system-one/index";
 import { isRoleListTool, isRoleSwitchTool, ROLE_MCP_CONFIG_PATH } from "./role-mcp";
 import { isAskUserTool, parseAskUserArguments } from "./ask-mcp";
 import { isDesktopHandoffTool, parseDesktopHandoffArguments } from "./desktop-handoff-mcp";
@@ -77,6 +83,11 @@ export interface ClaudeCodeRunnerOptions {
    * run nor this runner sets a packer explicitly.
    */
   roleContextPackers?: Record<string, ContextPackerMode>;
+  /**
+   * Optional System-1 fail-open pre-checks. Nothing is constructed or called
+   * unless `settings.enabled` is true, so the default run path is untouched.
+   */
+  systemOne?: SystemOneHooksOptions;
 }
 
 /** What buildArgv applied when the L1 packer ran, for the telemetry line. */
@@ -201,11 +212,13 @@ export class ClaudeCodeRunner {
   private readonly contextPacker: unknown;
   /** Per-role packer defaults, e.g. { coder: "l1" }. */
   private readonly roleContextPackers: Record<string, unknown> | undefined;
+  private readonly systemOneOptions: SystemOneHooksOptions | undefined;
 
   constructor(options: ClaudeCodeRunnerOptions = {}) {
     this.bin = options.bin ?? process.env.CLAUDE_BIN ?? "claude";
     this.contextPacker = options.contextPacker;
     this.roleContextPackers = options.roleContextPackers;
+    this.systemOneOptions = options.systemOne;
   }
 
   /**
@@ -217,6 +230,12 @@ export class ClaudeCodeRunner {
   async run(request: RunRequest, onEvent: (event: TelemetryEvent) => void): Promise<RunOutcome> {
     const redact = makeRedactor(request.env, request.redactSecrets);
     const { argv, packer } = this.buildArgv(request);
+    // System-1 is entirely inert when disabled: no hooks object, no await,
+    // no events — the run path is byte-identical to the one without it.
+    const systemOne =
+      this.systemOneOptions && resolveSystemOneSettings(this.systemOneOptions.settings).enabled
+        ? new SystemOneHooks(this.systemOneOptions)
+        : undefined;
 
     let started = false;
     let lastSessionId: string | undefined;
@@ -452,6 +471,38 @@ export class ClaudeCodeRunner {
                 } else if (decision.level === "deny" && haltedReason === null) {
                   haltedReason = decision.reason;
                   emit({ type: "tool.blocked", name, reason: decision.reason });
+                }
+
+                // System-1 adds a pre-check for calls the ordinary risk gate
+                // allowed. A deny is never dropped silently: it goes through
+                // the same visible approval pause. SystemOneHooks already
+                // fails open; the extra catch keeps the run path safe even if
+                // constructing or calling a hook throws.
+                if (systemOne && decision.level === "allow" && haltedReason === null) {
+                  gateChain = gateChain.then(async () => {
+                    if (haltedReason !== null) return;
+                    let s1: BeforeToolVerdict | undefined;
+                    try {
+                      s1 = await systemOne.beforeTool(name, input);
+                    } catch {
+                      s1 = undefined;
+                    }
+                    if (!s1 || (s1.action !== "ask" && s1.action !== "reject")) return;
+                    const reason = s1.action === "ask" ? s1.reason : s1.message;
+                    if (request.approvalGateway) {
+                      const userVerdict = await this.gateApproval(request, {
+                        toolName: name,
+                        action: describeAction(name, input),
+                        reason,
+                      }, emit, redact);
+                      if (userVerdict !== "approved" && haltedReason === null) {
+                        haltedReason = userVerdict === "expired" ? "approval timed out" : "approval denied by user";
+                      }
+                    } else if (haltedReason === null) {
+                      haltedReason = reason;
+                      emit({ type: "tool.blocked", name, reason });
+                    }
+                  });
                 }
               }
 

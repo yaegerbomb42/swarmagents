@@ -8,6 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ClaudeCodeRunner, isBackgroundedCommand, isSignalKillExitCode } from "./runner.js";
+import { localScorer } from "./system-one/index.js";
 import type { TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
 
 const SECRET_TOKEN = "sk-ant-api03-BENCH-FAKE-TOKEN-0000";
@@ -1147,4 +1148,76 @@ test("isSignalKillExitCode classifies exits", () => {
   assert.equal(isSignalKillExitCode(0), false);
   assert.equal(isSignalKillExitCode(128), false);
   assert.equal(isSignalKillExitCode(-1), false);
+});
+
+// ---- System-1 wiring ----
+
+const SYSTEM_ONE_BASE = {
+  prompt: "Inspect repo",
+  agentCard: "card",
+  memoryContext: "memory",
+  sessionId: "sess_resume_x",
+  model: "claude-sonnet-5-5",
+  env: envWithSecrets,
+};
+
+async function runSystemOne(runner: ClaudeCodeRunner, request: Record<string, unknown> = {}) {
+  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const events: TelemetryEvent[] = [];
+  const outcome = await runner.run({ ...SYSTEM_ONE_BASE, ...request, vm }, (e) => events.push(e));
+  return { vm, events, outcome };
+}
+
+test("System-1 off: argv and events are byte-identical to today", async () => {
+  const plain = await runSystemOne(new ClaudeCodeRunner());
+  const disabled = await runSystemOne(new ClaudeCodeRunner({ systemOne: { settings: { enabled: false } } }));
+  assert.equal(disabled.outcome.exitCode, 0);
+  assert.deepEqual(disabled.vm.calls[0].cmd, plain.vm.calls[0].cmd, "argv is unchanged");
+  // Wall-clock fields differ between two real runs by a millisecond; strip
+  // only those, so any other event — including System-1 telemetry — differs.
+  const withoutWallClock = (events: TelemetryEvent[]) =>
+    events.map((event) => {
+      const copy = { ...(event as unknown as Record<string, unknown>) };
+      delete copy.startedAt;
+      delete copy.finishedAt;
+      return copy;
+    });
+  assert.deepEqual(withoutWallClock(disabled.events), withoutWallClock(plain.events), "no System-1 telemetry leaks into the run");
+});
+
+test("System-1 on + a denying gate pauses visibly through the approval flow", async () => {
+  const approvals: Array<{ toolName: string; reason: string }> = [];
+  const { events, outcome } = await runSystemOne(
+    new ClaudeCodeRunner({
+      systemOne: { settings: { enabled: true, gates: { guardrail: true } }, scorer: { ...localScorer, destructive: () => 0.99 } },
+    }),
+    {
+      approvalGateway: (request) => {
+        approvals.push({ toolName: request.toolName, reason: request.reason });
+        return { id: `appr_${approvals.length}`, verdict: Promise.resolve("approved" as const) };
+      },
+    },
+  );
+  assert.equal(outcome.exitCode, 0, "an approved System-1 pause does not halt the run");
+  assert.ok(approvals.length > 0, "the denying gate created an approval");
+  assert.ok(approvals.every((a) => a.toolName === "Bash"), "the flagged calls are the Bash ones");
+  assert.match(approvals[0].reason, /System-1 flags this command/);
+  const required = events.filter((e) => e.type === "approval.required");
+  assert.equal(required.length, approvals.length, "each pause is visible on the stream");
+  assert.equal(events.some((e) => e.type === "tool.blocked"), false, "a deny is never a silent drop");
+});
+
+test("System-1 on + a throwing gate lets the call proceed (fail-open)", async () => {
+  const { events, outcome } = await runSystemOne(
+    new ClaudeCodeRunner({
+      systemOne: {
+        settings: { enabled: true, gates: { guardrail: true } },
+        scorer: { ...localScorer, destructive: () => { throw new Error("gate down"); } },
+      },
+    }),
+  );
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(events.some((e) => e.type === "approval.required"), false, "no pause");
+  assert.equal(events.some((e) => e.type === "tool.blocked"), false, "no halt");
+  assert.ok(events.some((e) => e.type === "tool.result"), "the run carried on to tool results");
 });

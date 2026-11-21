@@ -38,6 +38,7 @@ import {
 import type { PreviewTarget } from "../preview/proxy";
 import type { PreviewShareOwner } from "../preview/tokens";
 import { vncDesResponse, RFB_VERSION, SECURITY_NONE } from "./rfb";
+import { RfbServerDecoder } from "./rfb-server";
 import type { VmDesktopEndpoint } from "../vm/types";
 import { createProject, createShareLink, configureProjectStoreDir } from "../projects/store";
 
@@ -334,6 +335,11 @@ class FakeVncServer {
     for (const s of this.sockets) s.destroy();
     this.server.close();
   }
+
+  /** Push a server->client RFB payload to every connected upstream socket. */
+  push(payload: Buffer): void {
+    for (const s of this.sockets) s.write(encodeFrame(OP_BINARY, payload));
+  }
 }
 
 /** A mock "VM app" with a WebSocket endpoint that echoes frames back. */
@@ -421,6 +427,8 @@ async function makeProxy(opts: {
   resolveGuest?: (token: string) => Promise<string | null>;
   resolvePreviewTarget?: (userId: string, port: number) => Promise<PreviewTarget | null>;
   resolvePreviewShare?: (token: string) => PreviewShareOwner | null;
+  recordFrames?: boolean;
+  recordingDir?: string;
 } = {}): Promise<{
   proxy: DesktopProxy;
   port: number;
@@ -471,6 +479,8 @@ async function makeProxy(opts: {
     port: 0,
     idleMs: opts.idleMs,
     maxViewersPerUser: opts.maxViewers,
+    recordFrames: opts.recordFrames,
+    recordingDir: opts.recordingDir,
   });
   await proxy.listen();
   return { proxy, port: proxy.port, aliceVm, bobVm, aliceApp, bobApp };
@@ -489,6 +499,18 @@ async function openDesktopSession(port: number, userId: string, mode?: "view" | 
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Build a FramebufferUpdate (type 0) with one RAW rect. */
+function fbuRaw(w: number, h: number, fill = 0xab): Buffer {
+  const header = Buffer.alloc(4);
+  header[0] = 0; // FBU
+  header.writeUInt16BE(1, 2); // one rect
+  const rect = Buffer.alloc(12);
+  rect.writeUInt16BE(w, 4);
+  rect.writeUInt16BE(h, 6);
+  rect.writeUInt32BE(0, 8); // encoding RAW
+  return Buffer.concat([header, rect, Buffer.alloc(w * h * 4, fill)]);
 }
 
 async function expectClosed(client: TestWsClient, timeoutMs = 3000): Promise<void> {
@@ -998,6 +1020,48 @@ test("preview WS: share token upgrade works without a session; wrong-port and bo
     assert.ok(bogus instanceof Error, "bogus token is refused");
     assert.match(bogus.message, /HTTP 404/);
     assert.equal(aliceApp.seenUpgrades.length, 1, "refused tokens never dialed the upstream");
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("desktop proxy: recordFrames + recordingDir writes upstream frames to a recording file", async () => {
+  const recordingDir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-recording-"));
+  const { proxy, port, aliceVm } = await makeProxy({ recordFrames: true, recordingDir });
+  try {
+    const client = await openDesktopSession(port, "alice", "control");
+
+    const frameA = fbuRaw(2, 2, 0x11);
+    const frameB = fbuRaw(3, 1, 0x22);
+    aliceVm.push(Buffer.concat([frameA, frameB]));
+    // Let the upstream->proxy frame land and be recorded.
+    await sleep(50);
+
+    const files = fs.readdirSync(recordingDir).filter((f) => f.endsWith(".rfb"));
+    assert.equal(files.length, 1, `exactly one recording file, got ${JSON.stringify(files)}`);
+    assert.ok(files[0].startsWith("frames-alice-"), "file named after user + session");
+
+    const recorded = fs.readFileSync(path.join(recordingDir, files[0]));
+    const decoded = new RfbServerDecoder().push(recorded);
+    assert.equal(decoded.length, 2);
+    assert.ok(decoded[0].raw.equals(frameA), "first recorded frame exact");
+    assert.ok(decoded[1].raw.equals(frameB), "second recorded frame exact");
+
+    client.close();
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("desktop proxy: recording off by default — no recording file is created", async () => {
+  const recordingDir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-norec-"));
+  const { proxy, port, aliceVm } = await makeProxy({});
+  try {
+    const client = await openDesktopSession(port, "alice", "control");
+    aliceVm.push(fbuRaw(1, 1));
+    await sleep(50);
+    assert.equal(fs.readdirSync(recordingDir).length, 0, "no recording dir/file when recordFrames is off");
+    client.close();
   } finally {
     await proxy.close();
   }

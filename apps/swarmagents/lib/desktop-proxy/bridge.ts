@@ -29,6 +29,8 @@ import {
   RfbProtocolError,
   type RfbFilterMode,
 } from "./rfb-filter";
+import { RfbServerDecoder, RfbServerUnsupportedError } from "./rfb-server";
+import { FrameRecorder } from "./frame-recorder";
 import {
   WsFrameDecoder,
   WsBufferOverflowError,
@@ -79,6 +81,16 @@ export interface DesktopBridgeOptions {
   upstreamHead?: Buffer;
   /** Override the WebSocket keepalive ping interval (ms). Default 25_000. */
   pingIntervalMs?: number;
+  /**
+   * Opt-in framebuffer recording. When true with `recordingFile` set, the
+   * bridge decodes the upstream server→client RFB stream and appends only
+   * FramebufferUpdate messages (frames) to the recording file. Input and
+   * control messages are never recorded. Default off: zero overhead and zero
+   * files.
+   */
+  recordFrames?: boolean;
+  /** Recording file path used when `recordFrames` is true. */
+  recordingFile?: string;
 }
 
 export class DesktopBridge {
@@ -106,6 +118,8 @@ export class DesktopBridge {
   /** True after a ping was sent and no pong has arrived yet. */
   private awaitingPong = false;
   private readonly pingIntervalMs: number;
+  private readonly frameDecoder: RfbServerDecoder | null;
+  private readonly recorder: FrameRecorder | null;
 
   constructor(
     private readonly client: net.Socket,
@@ -118,6 +132,8 @@ export class DesktopBridge {
     this.onCloseCb = options.onClose;
     this.maxBufferBytes = options.maxBufferBytes ?? MAX_WS_BUFFER_BYTES;
     this.pingIntervalMs = options.pingIntervalMs ?? PING_INTERVAL_MS;
+    this.frameDecoder = options.recordFrames && options.recordingFile ? new RfbServerDecoder() : null;
+    this.recorder = options.recordFrames && options.recordingFile ? new FrameRecorder(options.recordingFile) : null;
     // Browser frames (client->server) must be masked; upstream frames must not be.
     this.clientDecoder = new WsFrameDecoder(this.maxBufferBytes, true);
     this.upstreamDecoder = new WsFrameDecoder(this.maxBufferBytes, false);
@@ -201,6 +217,7 @@ export class DesktopBridge {
     this.pingTimer = null;
     if (this.backpressureCloseTimer) clearTimeout(this.backpressureCloseTimer);
     this.backpressureCloseTimer = null;
+    this.recorder?.close();
     this.client.destroy();
     this.upstream.destroy();
     this.onCloseCb(reason);
@@ -329,7 +346,30 @@ export class DesktopBridge {
       this.defer(false, payload);
       return;
     }
+    this.recordFrames(payload);
     this.writeClient(encodeFrame(OP_BINARY, payload));
+  }
+
+  /**
+   * Feed the upstream server→client payload to the frame decoder and append
+   * only FramebufferUpdate messages to the recorder. If encoding hits a
+   * message/encoding it cannot size, recording stops cleanly (a terminal note
+   * is written) and the live forward path is unaffected — recording never
+   * crashes the bridge.
+   */
+  private recordFrames(payload: Buffer): void {
+    if (!this.frameDecoder || !this.recorder || !this.recorder.active) return;
+    try {
+      for (const frame of this.frameDecoder.push(payload)) {
+        if (frame.type === 0) this.recorder.append(frame.raw);
+      }
+    } catch (err) {
+      if (err instanceof RfbServerUnsupportedError) {
+        this.recorder.close();
+      } else {
+        this.fail("rfb-recording-error");
+      }
+    }
   }
 
   private maybeSplice(): void {

@@ -39,6 +39,7 @@
 
 import http from "node:http";
 import net from "node:net";
+import path from "node:path";
 import { URL } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
@@ -118,6 +119,15 @@ export interface DesktopProxyOptions {
    * Tests inject a resolver backed by fake shares.
    */
   resolvePreviewShare?: (token: string) => PreviewShareOwner | null;
+  /**
+   * Opt-in framebuffer recording (see DesktopBridgeOptions.recordFrames).
+   * When true, each desktop session appends only its framebuffer update frames
+   * to a capped recording file under `recordingDir`. Default off: zero
+   * overhead and zero files.
+   */
+  recordFrames?: boolean;
+  /** Recording directory used when `recordFrames` is true. */
+  recordingDir?: string;
   now?: () => number;
 }
 
@@ -637,6 +647,10 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
       // The bridge terminates both RFB handshakes (browser side: no password;
       // upstream side: VNCAuth with the server-side password) and then splices
       // the streams, applying view-mode input filtering.
+      const recordingFile =
+        opts.recordFrames && opts.recordingDir
+          ? path.join(opts.recordingDir, `frames-${session.userId}-${session.id}.rfb`)
+          : undefined;
       session.bridge = new DesktopBridge(socket, upSocket, {
         mode: session.mode,
         password: endpoint.password,
@@ -644,6 +658,8 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
         onClose: (reason) => closeSession(session, reason),
         clientHead: head,
         upstreamHead: upHead,
+        recordFrames: opts.recordFrames,
+        recordingFile,
       });
 
       recordAudit({

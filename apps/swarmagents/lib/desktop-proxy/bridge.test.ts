@@ -11,8 +11,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type net from "node:net";
 import { DesktopBridge, type DesktopBridgeOptions } from "./bridge";
+import { RfbServerDecoder } from "./rfb-server";
 import {
   WsFrameDecoder,
   encodeFrame,
@@ -682,4 +686,76 @@ test("bridge: soak — a realistic framebuffer stream holds across mixed frames,
     { mode: "control", connected: true, spliced: true },
     "session is live and spliced after the soak",
   );
+});
+
+/** Build a FramebufferUpdate (type 0) with one RAW rect. */
+function fbuRaw(w: number, h: number, fill = 0xab): Buffer {
+  const rect = Buffer.alloc(12);
+  rect.writeUInt16BE(w, 4);
+  rect.writeUInt16BE(h, 6);
+  rect.writeInt32BE(0, 8); // encoding RAW
+  const header = Buffer.alloc(4);
+  header[0] = 0; // FBU
+  header.writeUInt16BE(1, 2); // one rect
+  const pixels = Buffer.alloc(w * h * 4, fill);
+  return Buffer.concat([header, rect, pixels]);
+}
+
+const recordingTmp = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-recording-"));
+
+test("bridge: with recordFrames on, upstream frames are recorded and decode back in order", () => {
+  const file = path.join(recordingTmp, "frames-1.rfb");
+  const h = makeBridge("control", { recordFrames: true, recordingFile: file });
+  handshake(h);
+
+  const frameA = fbuRaw(2, 2, 0x11);
+  const frameB = fbuRaw(3, 1, 0x22);
+  h.upstream.feed(encodeFrame(OP_BINARY, Buffer.concat([frameA, frameB])));
+
+  // The live forward path is unaffected: the RFB byte stream still reaches the
+  // browser exactly as sent (both frames arrive, possibly in one WS message).
+  const down = h.toClient.read().filter((m) => m.opcode === OP_BINARY);
+  assert.equal(down.length, 1, "frames still forwarded while recording");
+  assert.ok(down[0].payload.equals(Buffer.concat([frameA, frameB])), "byte-identical forward");
+  assert.deepEqual(h.closes, []);
+
+  // The recording file decodes back to exactly those frames, in order.
+  const recorded = fs.readFileSync(file);
+  const decoded = new RfbServerDecoder().push(recorded);
+  assert.equal(decoded.length, 2);
+  assert.ok(decoded[0].raw.equals(frameA), "first recorded frame matches");
+  assert.ok(decoded[1].raw.equals(frameB), "second recorded frame matches");
+});
+
+test("bridge: input (browser→server) events are never written to the recording", () => {
+  const file = path.join(recordingTmp, "frames-2.rfb");
+  const h = makeBridge("control", { recordFrames: true, recordingFile: file });
+  handshake(h);
+
+  // A key event and a pointer event from the browser (the only direction that
+  // carries input) must never reach the recorder.
+  const keyEvent = Buffer.from([4, 1, 0, 0, 0, 0x41]);
+  const pointerEvent = Buffer.from([5, 1, 0, 10, 0, 20]);
+  const encrypted = h.client.feed(encodeClientFrame(OP_BINARY, Buffer.concat([keyEvent, pointerEvent])));
+  assert.ok(h.toUpstream.binary().length > 0, "input still forwarded in control mode");
+
+  // Control messages that are not frames (Bell) are also excluded.
+  h.upstream.feed(encodeFrame(OP_BINARY, Buffer.from([2]))); // Bell
+
+  assert.equal(fs.readFileSync(file).length, 0, "recording stays empty — no input, no control bytes");
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: with recordFrames off, no recording file is created and forwarding is unchanged", () => {
+  const file = path.join(recordingTmp, "should-not-exist.rfb");
+  const h = makeBridge("control", { recordFrames: false, recordingFile: file });
+  handshake(h);
+
+  const frame = fbuRaw(4, 4);
+  h.upstream.feed(encodeFrame(OP_BINARY, frame));
+  const down = h.toClient.read();
+  assert.equal(down.length, 1);
+  assert.ok(down[0].payload.equals(frame), "forwarding byte-identical with recording off");
+  assert.equal(fs.existsSync(file), false, "no recording file created");
+  assert.deepEqual(h.closes, []);
 });

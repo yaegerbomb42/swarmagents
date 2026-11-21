@@ -171,3 +171,28 @@ test("no split handle when the chat is alone, or on a narrow screen", async () =
   assert.equal(countOf(phone, 'data-testid="split-handle"'), 0, "a phone stays a single pane");
   assert.doesNotMatch(tagOf(phone, "chat-column"), /width:clamp/, "no fixed width on a phone");
 });
+
+test("under 900px the console is one column: chat full-width, stage full-width, composer reachable", async () => {
+  const html = await renderApp({ local: { "sa.view": "screen" }, wide: false });
+
+  // The workspace commits to a single column below the 900px breakpoint.
+  assert.equal(tagOf(html, "workspace-main").includes('data-layout="one-column"'), true, "one-column layout below 900px");
+  assert.match(tagOf(html, "workspace-main"), /overflow-y-auto/, "the single column scrolls so the composer stays reachable");
+
+  // Both chat and stage render full-width, stacked (no split handle, no fixed widths).
+  assert.equal(countOf(html, 'data-testid="split-handle"'), 0, "no split handle below 900px");
+  assert.doesNotMatch(tagOf(html, "chat-column"), /width:clamp/, "chat spans the full column width");
+  assert.match(tagOf(html, "chat-column"), /\bflex-col\b/, "chat is its own column");
+  assert.doesNotMatch(tagOf(html, "chat-column"), /\bhidden=""/, "chat stays mounted beside the stage");
+
+  // The composer is always rendered, so it is reachable in the scrollable column.
+  assert.equal(countOf(html, 'data-testid="composer-input"'), 1, "the composer is mounted");
+  assert.equal(countOf(html, 'data-testid="composer-send"'), 1, "the send button is mounted");
+});
+
+test("at 900px and up the console returns to the wide split layout", async () => {
+  const html = await renderApp({ local: { "sa.view": "screen" }, wide: true });
+  assert.equal(tagOf(html, "workspace-main").includes('data-layout="wide"'), true, "wide layout at desktop width");
+  assert.doesNotMatch(tagOf(html, "workspace-main"), /data-layout="one-column"/, "not one-column on wide");
+  assert.equal(countOf(html, 'data-testid="split-handle"'), 1, "the split handle returns on wide");
+});

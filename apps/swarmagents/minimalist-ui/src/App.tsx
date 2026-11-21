@@ -20,7 +20,7 @@ import { usePersisted, useSessionPersisted } from "./store";
 import type { SwarmTask } from "../../lib/mcp-types";
 import { mascotStateForRun } from "../../components/mascot/frames";
 import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus } from "../../lib/client/vmStatus";
-import { RUN_PHASE_META } from "../../lib/client/runPhase";
+import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm } from "../../lib/client/runs";
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
 import { useAgentSession } from "./hooks/useAgentSession";
@@ -52,6 +52,33 @@ const STARTERS = [
 
 const APP_TITLE = "SwarmAgents";
 
+export function runCompletionToast(
+  phase: RunPhase | null,
+  run: { createdAt: number; finishedAt?: number },
+  now = Date.now(),
+): { tone: "success" | "error"; message: string } | null {
+  if (phase === "finished") {
+    const durationMs = Math.max(0, (run.finishedAt ?? now) - run.createdAt);
+    return { tone: "success", message: `Run finished in ${formatDuration(durationMs)}.` };
+  }
+  if (phase === "error") return { tone: "error", message: "Run failed — see the report." };
+  return null;
+}
+
+export function shouldToastRunCompletion(input: {
+  phase: RunPhase | null;
+  wasActive: boolean;
+  view: WorkspaceView;
+  alreadyNotified: boolean;
+}): boolean {
+  return (
+    input.wasActive &&
+    !input.alreadyNotified &&
+    input.view !== "chat" &&
+    (input.phase === "finished" || input.phase === "error")
+  );
+}
+
 export default function App() {
   const { push: pushToast } = useToasts();
   const wide = useIsWide();
@@ -68,8 +95,11 @@ export default function App() {
   const [splitRatio, setSplitRatio] = usePersisted<number>("sa.splitRatio", 0.38);
   const mainRef = useRef<HTMLElement | null>(null);
   const chatRef = useRef<HTMLDivElement | null>(null);
+  const observedActiveRuns = useRef(new Set<string>());
+  const notifiedRuns = useRef(new Set<string>());
 
   const session = useAgentSession({ agentCard, fullAuto, computeTarget: compute.target || undefined });
+  const { selectThread } = session;
   const board = useBoard(view === "board");
 
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -107,6 +137,27 @@ export default function App() {
   const phaseMeta = phase ? RUN_PHASE_META[phase] : undefined;
   const needsAttention =
     phase === "approval" || phase === "question" || phase === "paused" || phase === "error" || vmDisplay.state === "error";
+
+  useEffect(() => {
+    if (activeRun && phaseMeta?.active) observedActiveRuns.current.add(activeRun.runId);
+    if (!headRun || !observedActiveRuns.current.has(headRun.runId) || notifiedRuns.current.has(headRun.runId)) return;
+    const notice = runCompletionToast(phase, headRun);
+    if (!notice) return;
+    notifiedRuns.current.add(headRun.runId);
+    if (!shouldToastRunCompletion({
+      phase,
+      wasActive: observedActiveRuns.current.has(headRun.runId),
+      view,
+      alreadyNotified: false,
+    })) return;
+    pushToast({
+      ...notice,
+      action: () => {
+        selectThread(headRun.sessionId ?? headRun.runId);
+        setView("chat");
+      },
+    });
+  }, [activeRun, headRun, phase, phaseMeta?.active, pushToast, selectThread, setView, view]);
 
   // The screen opens automatically on wide screens when a run starts
   const activeRunId = activeRun?.runId;

@@ -56,6 +56,10 @@ const APP_TITLE = "SwarmAgents";
 export default function App() {
   const { push: pushToast } = useToasts();
   const wide = useIsWide();
+  // The console commits to a single column under 900px (phones and small
+  // tablets), independent of the `wide` desktop breakpoint (1024px). Below
+  // this width chat and the Computer/Board views are stacked full-width.
+  const narrow = !useIsWide("(min-width: 900px)");
   const me = useMe();
   const providerStatus = useProviderStatus();
   const compute = useComputeOptions(undefined);
@@ -293,7 +297,15 @@ export default function App() {
         </Notice>
       )}
 
-      <main ref={mainRef} className="relative z-10 flex min-h-0 flex-1 flex-col lg:flex-row p-2 sm:p-3 gap-2 sm:gap-3">
+      <main
+        ref={mainRef}
+        className={cn(
+          "relative z-10 flex min-h-0 flex-1 flex-col lg:flex-row p-2 sm:p-3 gap-2 sm:gap-3",
+          narrow ? "overflow-y-auto overflow-x-hidden" : "lg:overflow-hidden",
+        )}
+        data-layout={narrow ? "one-column" : "wide"}
+        data-testid="workspace-main"
+      >
         {/* Chat & Narration Column */}
         <div
           hidden={!showChat}

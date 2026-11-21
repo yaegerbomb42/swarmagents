@@ -99,6 +99,7 @@ import type { RunCompute } from "../computers/compute";
 import { readReportMeta } from "./run-report";
 import type { ReportCardMeta, RunVerificationMeta } from "./run-report-types";
 import { RunReporter } from "./run-reporter";
+import { attachRunTrajectory } from "./trajectory";
 import { getLastSession, setLastSession, clearLastSession } from "./session-store";
 import { revokeRunToken, signRunToken } from "./run-token";
 import {
@@ -2024,6 +2025,7 @@ export class RuntimeManager {
     // terminal state. The starting role rides along so a role with a pinned
     // lens (e.g. Coder → security) auto-audits the run on completion.
     this.reporter.attach(runId, userId, active.role?.id);
+    attachRunTrajectory(runId, userId, this.bus);
 
     this.bus.publish(runId, { type: "vm.starting", data: { userId } });
     this.touchActivity(active);

@@ -35,6 +35,11 @@ import { SWARM_VM_DESKTOP_ENV } from "../vm/desktop";
 import { SELF_MANAGE_TAIL } from "../self-manage/prompt";
 import { CODEBASE_MCP_SERVER_NAME, CODEBASE_MCP_SERVER_PATH, codebaseMcpServerSource } from "./codebase-mcp-source";
 import {
+  ATLAS_MCP_SERVER_NAME,
+  ATLAS_MCP_SERVER_PATH,
+  atlasMcpServerSource,
+} from "./atlas-mcp-source";
+import {
   MEMORY_MCP_SERVER_NAME,
   MEMORY_MCP_SERVER_PATH,
   MEMORY_MCP_SERVER_SOURCE,
@@ -85,6 +90,16 @@ export const BROWSER_MCP_SERVER_NAME = "browser-mcp";
 /** Is desktop mode on for this process? (SWARM_VM_DESKTOP=1) */
 export function desktopModeEnabled(env: Record<string, string | undefined> = process.env): boolean {
   return env[SWARM_VM_DESKTOP_ENV] === "1";
+}
+
+/**
+ * Is the capability-atlas MCP server on for this process?
+ * (SWARM_ATLAS_ENABLED=1) Default off: the server is seeded and wired
+ * only when explicitly enabled, and a run without a published registry
+ * simply finds nothing — the server fails open on a missing registry.
+ */
+export function atlasEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return env.SWARM_ATLAS_ENABLED === "1";
 }
 
 /**
@@ -155,7 +170,7 @@ export function isRoleListTool(name: string): boolean {
  */
 export function roleAllowedTools(
   role: RoleDefinition,
-  opts: { desktopMode?: boolean; tools?: boolean } = {},
+  opts: { desktopMode?: boolean; tools?: boolean; atlasEnabled?: boolean } = {},
 ): string[] {
   // Plain chat: the selected model cannot call tools at all.
   if (opts.tools === false) return [];
@@ -172,6 +187,9 @@ export function roleAllowedTools(
   // ask_human_desktop (shadow-to-takeover handoff) is granted to every agent
   // with tools, gated like ask_user: it only pauses the run for a human.
   out.add(`mcp__${DESKTOP_HANDOFF_MCP_SERVER_NAME}__*`);
+  // The capability-atlas server is opt-in (SWARM_ATLAS_ENABLED=1): grant its
+  // tools only when it is wired, so a default run gets exactly today's toolset.
+  if (opts.atlasEnabled) out.add(`mcp__${ATLAS_MCP_SERVER_NAME}__*`);
   for (const server of role.mcpServers) {
     // Desktop servers are wired only by the gui-mode branch below.
     if (DESKTOP_ROLE_MCP_SERVERS.includes(server)) continue;
@@ -247,6 +265,10 @@ export function roleMcpConfigJson(
     extraMcpServers?: Record<string, unknown>;
     /** Path of the in-VM long-term memory MCP server. */
     memoryServerPath?: string;
+    /** Wire the capability-atlas server (opt-in, SWARM_ATLAS_ENABLED=1). */
+    atlasEnabled?: boolean;
+    /** Registry path the atlas server reads (per-user file in the VM). */
+    atlasRegistryPath?: string;
   },
 ): string {
   const servers: Record<string, unknown> = {
@@ -290,6 +312,17 @@ export function roleMcpConfigJson(
       env: { SWARM_DESKTOP_HANDOFF_DIR: DESKTOP_HANDOFF_DIR },
     },
   };
+  // The capability-atlas server is opt-in. The registry path is the
+  // per-user file the scanner published in the VM; when unset, the server
+  // falls back to $HOME/.swarm/atlas/registry.json.
+  if (opts.atlasEnabled) {
+    servers[ATLAS_MCP_SERVER_NAME] = {
+      type: "stdio",
+      command: "node",
+      args: [ATLAS_MCP_SERVER_PATH],
+      ...(opts.atlasRegistryPath ? { env: { SWARM_ATLAS_REGISTRY: opts.atlasRegistryPath } } : {}),
+    };
+  }
   if (opts.desktopMode) {
     const roleDef = opts.roleDef ?? roleDefinitionForId(role.roleId);
     if (roleDef && roleHasDesktopAccess(roleDef)) {
@@ -339,11 +372,17 @@ export function roleSeedFiles(
   catalog: readonly RoleDefinition[],
   allowedRoleIds: ReadonlySet<string>,
   initialPhase?: RolePhase,
-  opts: { desktopMode?: boolean; codebaseRepoRoot?: string; extraMcpServers?: Record<string, unknown> } = {},
+  opts: {
+    desktopMode?: boolean;
+    codebaseRepoRoot?: string;
+    extraMcpServers?: Record<string, unknown>;
+    atlasEnabled?: boolean;
+    atlasRegistryPath?: string;
+  } = {},
 ): Array<{ path: string; content: string }> {
   const phase = initialPhase ?? rolePhase(catalog[0] ?? BUILTIN_ROLES[0], opts);
   const initialDef = phase.roleId ? catalog.find((role) => role.id === phase.roleId) : undefined;
-  return [
+  const files: Array<{ path: string; content: string }> = [
     { path: ROLE_MCP_SERVER_PATH, content: ROLE_MCP_SERVER_SOURCE },
     { path: MEMORY_MCP_SERVER_PATH, content: MEMORY_MCP_SERVER_SOURCE },
     { path: ASK_MCP_SERVER_PATH, content: ASK_MCP_SERVER_SOURCE },
@@ -355,12 +394,16 @@ export function roleSeedFiles(
     { path: CODEBASE_MCP_SERVER_PATH, content: codebaseMcpServerSource() },
     { path: ROLE_MCP_CONFIG_PATH, content: roleMcpConfigJson(phase, { allowedRoleIds, roleDef: initialDef, ...opts }) },
   ];
+  if (opts.atlasEnabled) {
+    files.push({ path: ATLAS_MCP_SERVER_PATH, content: atlasMcpServerSource() });
+  }
+  return files;
 }
 
 /** Build the harness phase (argv config) for a role. */
 export function rolePhase(
   role: RoleDefinition,
-  opts: { desktopMode?: boolean; mcpConfigPath?: string; tools?: boolean } = {},
+  opts: { desktopMode?: boolean; mcpConfigPath?: string; tools?: boolean; atlasEnabled?: boolean } = {},
 ): RolePhase {
   // The long-running-work tail rides with every role's instructions (built-in
   // and custom alike) so the agent always runs user-visible work in the

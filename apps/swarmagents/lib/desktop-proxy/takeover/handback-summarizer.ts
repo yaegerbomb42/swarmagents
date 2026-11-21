@@ -54,12 +54,12 @@ export function truncateToTokenBudget(
   return { text: truncated, tokenCount: estimateTokens(truncated) };
 }
 
-export async function defaultFrameCaptioner(
+export function defaultFrameCaptioner(
   frame: CaptionFrame | null,
   activeWindow: string,
 ): Promise<string> {
   if (!frame) {
-    return `Screen focused on "${activeWindow}" (no frame captured).`;
+    return Promise.resolve(`Screen focused on "${activeWindow}" (no frame captured).`);
   }
   // Compute average luminance across sampled pixels for a factual, deterministic description.
   let lumSum = 0;
@@ -74,8 +74,10 @@ export async function defaultFrameCaptioner(
     samples++;
   }
   const avgLum = samples > 0 ? Math.round(lumSum / samples) : 0;
-  const theme = avgLum < 80 ? "dark-themed" : avgLum > 175 ? "light-themed" : "mid-tone";
-  return `${frame.width}x${frame.height} ${theme} display showing "${activeWindow}".`;
+  let theme = "mid-tone";
+  if (avgLum < 80) theme = "dark-themed";
+  else if (avgLum > 175) theme = "light-themed";
+  return Promise.resolve(`${frame.width}x${frame.height} ${theme} display showing "${activeWindow}".`);
 }
 
 export class HandbackSummarizer {
@@ -158,11 +160,11 @@ export class HandbackSummarizer {
     await this.recordCurrentWindow();
     const durationMs = this.startedAt > 0 ? Date.now() - this.startedAt : 0;
     const windows = [...this.windowTitles];
-    const files = [...this.modifiedFiles].sort();
+    const files = [...this.modifiedFiles].sort((a, b) => a.localeCompare(b));
     const inputs = this.inputEventsCount;
     this.stopTracking();
 
-    const activeWindow = windows[windows.length - 1] ?? "Desktop";
+    const activeWindow = windows.at(-1) ?? "Desktop";
     const lastFrameCaption = await this.captioner(lastFrame, activeWindow);
 
     const parts: string[] = [
@@ -202,7 +204,7 @@ export class HandbackSummarizer {
   private async recordCurrentWindow(): Promise<void> {
     try {
       const title = await this.adapter.getActiveWindowTitle();
-      if (title && this.windowTitles[this.windowTitles.length - 1] !== title) {
+      if (title && this.windowTitles.at(-1) !== title) {
         this.windowTitles.push(title);
       }
     } catch {

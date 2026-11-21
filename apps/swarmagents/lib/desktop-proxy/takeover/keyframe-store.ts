@@ -70,7 +70,7 @@ export class KeyframeStore {
   }
 
   getLatest(): StoredKeyframe | undefined {
-    return this.frames[this.frames.length - 1];
+    return this.frames.at(-1);
   }
 
   private prune(now: number): void {

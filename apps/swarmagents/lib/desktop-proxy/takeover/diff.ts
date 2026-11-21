@@ -20,7 +20,7 @@ export function computeDamageRegions(
   channelDeltaThreshold = 10,
   minChangedRatio = 0.0005,
 ): DiffResult {
-  if (!prev || prev.byteLength !== next.byteLength) {
+  if (prev?.byteLength !== next.byteLength) {
     return {
       changed: true,
       changedRatio: 1,
@@ -40,23 +40,7 @@ export function computeDamageRegions(
     for (let tx = 0; tx < cols; tx++) {
       const xStart = tx * tileSize;
       const xEnd = Math.min(width, xStart + tileSize);
-      let tileDirty = false;
-
-      // Sample every 2nd pixel inside each tile for fast CPU diffing.
-      for (let y = yStart; y < yEnd && !tileDirty; y += 2) {
-        for (let x = xStart; x < xEnd; x += 2) {
-          const idx = (y * width + x) * 4;
-          const dr = Math.abs((next[idx] ?? 0) - (prev[idx] ?? 0));
-          const dg = Math.abs((next[idx + 1] ?? 0) - (prev[idx + 1] ?? 0));
-          const db = Math.abs((next[idx + 2] ?? 0) - (prev[idx + 2] ?? 0));
-          if (dr > channelDeltaThreshold || dg > channelDeltaThreshold || db > channelDeltaThreshold) {
-            tileDirty = true;
-            break;
-          }
-        }
-      }
-
-      if (tileDirty) {
+      if (isTileDirty(prev, next, width, xStart, xEnd, yStart, yEnd, channelDeltaThreshold)) {
         changedTiles++;
         regions.push({
           x: xStart,
@@ -74,4 +58,30 @@ export function computeDamageRegions(
     changedRatio,
     regions,
   };
+}
+
+/** True when any sampled pixel in the tile moved past the channel threshold. */
+function isTileDirty(
+  prev: Uint8Array,
+  next: Uint8Array,
+  width: number,
+  xStart: number,
+  xEnd: number,
+  yStart: number,
+  yEnd: number,
+  channelDeltaThreshold: number,
+): boolean {
+  // Sample every 2nd pixel inside the tile for fast CPU diffing.
+  for (let y = yStart; y < yEnd; y += 2) {
+    for (let x = xStart; x < xEnd; x += 2) {
+      const idx = (y * width + x) * 4;
+      const dr = Math.abs((next[idx] ?? 0) - (prev[idx] ?? 0));
+      const dg = Math.abs((next[idx + 1] ?? 0) - (prev[idx + 1] ?? 0));
+      const db = Math.abs((next[idx + 2] ?? 0) - (prev[idx + 2] ?? 0));
+      if (dr > channelDeltaThreshold || dg > channelDeltaThreshold || db > channelDeltaThreshold) {
+        return true;
+      }
+    }
+  }
+  return false;
 }

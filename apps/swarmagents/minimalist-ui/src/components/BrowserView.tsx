@@ -79,7 +79,7 @@ export function BrowserLoadStatus({ fetching, stillWaiting }: BrowserLoadStatusP
       <div
         className="h-0.5 w-full bg-cyan-500/10 overflow-hidden shrink-0"
         role="progressbar"
-        aria-label="Loading browser frame"
+        aria-label="Loading live page"
         data-testid="browser-loading-bar"
       >
         <div className="h-full w-1/3 bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-pulse" />
@@ -137,24 +137,23 @@ function EmptyState({ hasRun, error }: { hasRun: boolean; error?: string }) {
       </div>
       {error ? (
         <>
-          <div className="text-sm font-medium text-amber-300/90">Frame unavailable</div>
+          <div className="text-sm font-medium text-amber-300/90">Page view unavailable</div>
           <p className="text-xs text-white/40 leading-relaxed">
-            The browser frame could not be fetched ({error}). Retrying with backoff…
+            We couldn’t show the page ({error}). Trying again…
           </p>
         </>
       ) : hasRun ? (
         <>
-          <div className="text-sm font-medium text-white/90">No frame yet</div>
+          <div className="text-sm font-medium text-white/90">No page yet</div>
           <p className="text-xs text-white/40 leading-relaxed">
-            When the agent visits URLs, clicks, or takes screenshots, the live
-            page renders here.
+            The live page appears here when the agent opens a website.
           </p>
         </>
       ) : (
         <>
           <div className="text-sm font-medium text-white/90">Waiting for a run</div>
           <p className="text-xs text-white/40 leading-relaxed">
-            Start an agent to see its live browser session in this viewport.
+            Start a run to see the page the agent is viewing.
           </p>
         </>
       )}
@@ -309,7 +308,7 @@ export function BrowserView({ runId }: BrowserViewProps) {
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder={runId ? "https://…" : "no active run — start an agent"}
+            placeholder={runId ? "https://…" : "start a run to open a page"}
             disabled={!runId || navBusy}
             spellCheck={false}
             autoCapitalize="off"
@@ -354,7 +353,7 @@ export function BrowserView({ runId }: BrowserViewProps) {
           <ShieldAlert className="w-4 h-4 mt-0.5 shrink-0 text-rose-400" />
           <div className="flex-1 min-w-0">
             <div className="text-[11px] font-semibold uppercase tracking-wide text-rose-300">
-              Blocked by policy
+              This address was blocked
             </div>
             <p className="text-[11px] text-rose-200/70 font-mono break-words leading-relaxed">
               {blocked.reason}
@@ -374,7 +373,7 @@ export function BrowserView({ runId }: BrowserViewProps) {
         {frame.frameUrl ? (
           <img
             src={frame.frameUrl}
-            alt="Agent browser"
+            alt="Live page"
             draggable={false}
             className="max-w-full max-h-full w-auto h-auto object-contain rounded-lg shadow-2xl border border-white/10 select-none"
           />

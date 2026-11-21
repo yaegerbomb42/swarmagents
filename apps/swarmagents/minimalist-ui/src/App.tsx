@@ -25,6 +25,7 @@ import { resetVm } from "../../lib/client/runs";
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
 import { useAgentSession } from "./hooks/useAgentSession";
 import { useBoard } from "./hooks/useBoard";
+import { devModeFromSearch, resolveView } from "./devMode";
 import { useIsWide, useMe, useProviderStatus } from "./hooks/useEnvironment";
 import { cn } from "./utils/cn";
 import { ApprovalGate } from "./components/ApprovalGate";
@@ -63,6 +64,18 @@ export default function App() {
   const [agentCard, setAgentCard] = usePersisted<string>("ac.agentCard", DEFAULT_AGENT_CARD);
   const [fullAuto, setFullAuto] = usePersisted<boolean>("ac.fullAuto", true);
   const [view, setView] = usePersisted<WorkspaceView>("sa.view", "chat");
+  // Dev mode gates the Board view: the board is internal build tooling, not a
+  // product feature. Off by default; ?dev=1 turns it on (persisted per
+  // browser), ?dev=0 turns it back off.
+  const [devMode, setDevMode] = usePersisted<boolean>("sa.devMode", false);
+  useEffect(() => {
+    const next = devModeFromSearch(window.location.search, devMode);
+    if (next !== devMode) setDevMode(next);
+  }, [devMode, setDevMode]);
+  // With dev mode off, a persisted "board" view (or any switch to it) falls
+  // back to chat. Board data keeps polling in the background: run-task
+  // linking reads it even while the view is hidden.
+  const effectiveView = resolveView(view, devMode);
   const [draft, setDraft] = useSessionPersisted<string>("sa.draft", "");
   // The chat column's share of the split row, persisted across reloads.
   const [splitRatio, setSplitRatio] = usePersisted<number>("sa.splitRatio", 0.38);
@@ -223,14 +236,16 @@ export default function App() {
   const views: SegmentOption<WorkspaceView>[] = [
     { id: "chat", label: "Chat", icon: <MessageSquare className="h-3.5 w-3.5" aria-hidden /> },
     { id: "screen", label: "Computer", icon: <MonitorPlay className="h-3.5 w-3.5" aria-hidden /> },
-    { id: "board", label: "Board", icon: <ClipboardList className="h-3.5 w-3.5" aria-hidden />, count: board.counts.open },
+    ...(devMode
+      ? [{ id: "board" as const, label: "Board", icon: <ClipboardList className="h-3.5 w-3.5" aria-hidden />, count: board.counts.open }]
+      : []),
   ];
 
-  const showStage = view !== "chat";
-  const showChat = wide || view !== "board";
+  const showStage = effectiveView !== "chat";
+  const showChat = wide || effectiveView !== "board";
   const split = wide && showStage;
   const hero =
-    view === "chat" && session.ready && session.turns.length === 0 && !session.pending && !session.turnsLoading;
+    effectiveView === "chat" && session.ready && session.turns.length === 0 && !session.pending && !session.turnsLoading;
 
   const activeThreadId = activeRun ? (activeRun.sessionId ?? activeRun.runId) : undefined;
   const headDuration =
@@ -242,7 +257,7 @@ export default function App() {
     <div
       className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-[var(--bg)] text-[var(--fg)]"
       data-testid="minimal-main-page"
-      data-view={view}
+      data-view={effectiveView}
     >
       {/* mynow.online ambient background aura + grain */}
       <div className="aura" />
@@ -256,7 +271,7 @@ export default function App() {
         onNewChat={handleNewChat}
         newChatDisabled={busy}
         views={views}
-        view={view}
+        view={effectiveView}
         onView={setView}
         wide={wide}
         run={{
@@ -403,11 +418,11 @@ export default function App() {
           <div
             className={cn(
               "sa-stage-in order-1 flex min-h-0 min-w-0 flex-col lg:order-2 lg:flex-1 glass rounded-[26px] p-2.5 sm:p-4 shadow-2xl hair overflow-hidden",
-              view === "board" ? "flex-1" : "shrink-0 lg:shrink",
+              effectiveView === "board" ? "flex-1" : "shrink-0 lg:shrink",
             )}
             data-testid="stage"
           >
-            {view === "screen" ? (
+            {effectiveView === "screen" ? (
               <ScreenFrame
                 activeView={screenView}
                 onToggleView={setScreenView}

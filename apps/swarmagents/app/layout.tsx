@@ -1,7 +1,6 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { headers } from "next/headers";
-import { NONCE_HEADER } from "../lib/security-headers";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -12,14 +11,14 @@ export const metadata: Metadata = {
 export default async function RootLayout({ children }: { children: ReactNode }) {
   // Middleware mints a fresh nonce per request and forwards it to the render
   // on the x-nonce header (with the full CSP, so Next stamps it onto its own
-  // inline bootstrap scripts). Reading it here keeps every route dynamic so a
-  // stale nonce can never be served from a static cache, and we surface it on
-  // <body> for client code to use when it injects its own inline scripts —
-  // no self-fetch required.
-  const nonce = (await headers()).get(NONCE_HEADER) ?? "";
+  // inline bootstrap scripts). Reading headers() here keeps every route dynamic so a
+  // stale nonce can never be served from a static cache. The nonce is intentionally
+  // NOT mirrored onto <body data-nonce> to avoid re-exposing it to attribute selectors
+  // and client scripts reading document.body.dataset.nonce.
+  await headers();
   return (
     <html lang="en">
-      <body data-nonce={nonce}>{children}</body>
+      <body>{children}</body>
     </html>
   );
 }

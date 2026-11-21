@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type SpawnOptions } from "node:child_process";
 import type { CapabilityEntry } from "../schema";
 import { truncateSummary } from "../schema";
 import { classifyRisk, type McpToolAnnotations } from "../risk";
@@ -146,11 +146,12 @@ async function probeStdioServer(
   if (!server.command) return [];
 
   return new Promise<CapabilityEntry[]>((resolve) => {
-    const child = spawn(server.command!, server.args ?? [], {
+    const options: SpawnOptions = {
       env: buildSandboxedEnv(server.env),
       stdio: ["pipe", "pipe", "ignore"],
       windowsHide: true,
-    });
+    };
+    const child = spawn(server.command!, server.args ?? [], options);
 
     let settled = false;
     let buffer = "";

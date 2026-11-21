@@ -144,13 +144,13 @@ function pad2(value: number): string {
   return String(value).padStart(2, "0");
 }
 
-function formatModified(modifiedAt?: number): string {
+export function formatModified(modifiedAt?: number): string {
   if (!modifiedAt || !Number.isFinite(modifiedAt)) return "—";
   const date = new Date(modifiedAt);
   if (Number.isNaN(date.getTime())) return "—";
-  return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())} ${pad2(
-    date.getUTCHours(),
-  )}:${pad2(date.getUTCMinutes())}`;
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(
+    date.getHours(),
+  )}:${pad2(date.getMinutes())}`;
 }
 
 interface Crumb {

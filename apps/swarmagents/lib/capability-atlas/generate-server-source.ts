@@ -40,8 +40,51 @@ const LOCAL_SOURCES = new Set([
   "./retrieval/index",
 ]);
 
-const IMPORT_RE = /^\s*import\s+(.+?)\s+from\s+['"]([^'"]+)['"];?\s*$/;
 const VALUE_EXPORT_RE = /^\s*export\s+(default\s+)?(class|function|const|let|var|async\s+function)\b/;
+
+/**
+ * Parse the module source of an `import ... from "..."` line without a
+ * backtracking-prone pattern: split on the last " from " and read the
+ * quoted specifier. Returns null when the line is not an import.
+ */
+function parseImportSource(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("import ")) return null;
+  const fromIdx = trimmed.lastIndexOf(" from ");
+  if (fromIdx === -1) return null;
+  const spec = trimmed.slice(fromIdx + 6).trim().replace(/;$/, "");
+  if (spec.length < 2) return null;
+  const quote = spec[0]!;
+  if (quote !== "'" && quote !== '"') return null;
+  if (spec[spec.length - 1] !== quote) return null;
+  return spec.slice(1, -1);
+}
+
+/**
+ * Convert one transpiled line for the concatenation: null omits it, a
+ * string keeps it. Local imports are dropped (their targets are
+ * concatenated into the same script), node: imports are kept, and
+ * anything else throws, so the bundle can never silently gain a
+ * runtime dependency.
+ */
+function convertLine(fileName: string, line: string): string | null {
+  const trimmed = line.trim();
+  if (trimmed === "export {};" || trimmed === "export {}") return null;
+  const source = parseImportSource(line);
+  if (source !== null) {
+    if (source.startsWith("node:")) return line;
+    if (LOCAL_SOURCES.has(source)) return null;
+    throw new Error(`${fileName}: unsupported import source "${source}"`);
+  }
+  if (trimmed.startsWith("import ")) {
+    throw new Error(`${fileName}: unsupported import statement: ${trimmed}`);
+  }
+  if (VALUE_EXPORT_RE.test(line)) return line.replace(/^\s*export\s+/, "");
+  if (trimmed.startsWith("export ")) {
+    throw new Error(`${fileName}: unsupported export statement: ${trimmed}`);
+  }
+  return line;
+}
 
 /**
  * Transpile one TS source to JS (types stripped), then drop module syntax
@@ -59,29 +102,8 @@ function bundleSource(fileName: string, text: string): string[] {
   }).outputText;
   const out: string[] = [];
   for (const line of transpiled.split("\n")) {
-    if (/^\s*export\s*\{\s*\}\s*;?\s*$/.test(line)) continue;
-    const importMatch = IMPORT_RE.exec(line);
-    if (importMatch) {
-      const source = importMatch[2]!;
-      if (source.startsWith("node:")) {
-        out.push(line);
-        continue;
-      }
-      if (LOCAL_SOURCES.has(source)) continue;
-      throw new Error(`${fileName}: unsupported import source "${source}"`);
-    }
-    if (/^\s*import\b/.test(line)) {
-      throw new Error(`${fileName}: unsupported import statement: ${line.trim()}`);
-    }
-    const valueExport = VALUE_EXPORT_RE.exec(line);
-    if (valueExport) {
-      out.push(line.replace(/^\s*export\s+/, ""));
-      continue;
-    }
-    if (/^\s*export\b/.test(line)) {
-      throw new Error(`${fileName}: unsupported export statement: ${line.trim()}`);
-    }
-    out.push(line);
+    const converted = convertLine(fileName, line);
+    if (converted !== null) out.push(converted);
   }
   return out;
 }

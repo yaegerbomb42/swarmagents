@@ -403,6 +403,40 @@ test("a step row shows its label once, with no doubled verb and no 0 ms duration
   assert.equal(countOf(running, "500 ms"), 0);
 });
 
+test("a steps block opens immediately when defaultOpen is set, so 'Show steps' reveals the list", async () => {
+  const { StepsBlock } = await load();
+  const write: ToolEntry = {
+    kind: "tool",
+    key: "tool:t1",
+    ts: 1_000,
+    name: "Write",
+    label: "Writing /workspace/hello.txt",
+    status: "done",
+    input: { file_path: "/workspace/hello.txt" },
+    durationMs: 500,
+  };
+  const html = renderToStaticMarkup(h(StepsBlock, { steps: [write], defaultOpen: true }));
+  assert.match(html, /aria-expanded="true"/, "the step block is expanded");
+  assert.equal(countOf(html, 'data-testid="tool-entry"'), 1, "the step list is revealed immediately");
+});
+
+test("a steps block stays folded without defaultOpen, keeping the live-run chip as it is", async () => {
+  const { StepsBlock } = await load();
+  const write: ToolEntry = {
+    kind: "tool",
+    key: "tool:t1",
+    ts: 1_000,
+    name: "Write",
+    label: "Writing /workspace/hello.txt",
+    status: "done",
+    input: { file_path: "/workspace/hello.txt" },
+    durationMs: 500,
+  };
+  const html = renderToStaticMarkup(h(StepsBlock, { steps: [write] }));
+  assert.match(html, /aria-expanded="false"/);
+  assert.equal(countOf(html, 'data-testid="tool-entry"'), 0, "step detail is hidden until the chip is clicked");
+});
+
 test("the way to the screen is left out while the screen is already on show", async () => {
   const { Conversation } = await load();
   const running = makeEntry({ runId: "run_live", prompt: "Build a thing", status: "running", createdAt: Date.now() - 4000 });

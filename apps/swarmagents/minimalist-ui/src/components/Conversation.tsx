@@ -229,8 +229,8 @@ export function StepRow({ step }: { step: StepEntry }) {
 }
 
 /** A stretch of tool calls, folded to one line until the user opens it. */
-function StepsBlock({ steps }: { steps: StepEntry[] }) {
-  const [open, setOpen] = useState(false);
+export function StepsBlock({ steps, defaultOpen = false }: { steps: StepEntry[]; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
   const summary = summarizeSteps(steps);
   return (
     <div className="overflow-hidden rounded-xl border border-sa-line" data-testid="steps-block">
@@ -391,11 +391,14 @@ function Blocks({
   truncated,
   onAnswer,
   onHandBack,
+  defaultOpen = false,
 }: {
   blocks: TurnBlock[];
   truncated: boolean;
   onAnswer: (id: string, answer: string) => Promise<boolean>;
   onHandBack: (id: string) => void;
+  /** Start step blocks expanded (used when the user asked to see the steps). */
+  defaultOpen?: boolean;
 }) {
   return (
     <>
@@ -404,7 +407,7 @@ function Blocks({
       )}
       {blocks.map((block) => {
         if (block.kind === "agent") return <Markdown key={block.key} text={block.entry.text} />;
-        if (block.kind === "steps") return <StepsBlock key={block.key} steps={block.steps} />;
+        if (block.kind === "steps") return <StepsBlock key={block.key} steps={block.steps} defaultOpen={defaultOpen} />;
         if (block.kind === "question") return <QuestionCard key={block.key} entry={block.entry} onAnswer={onAnswer} />;
         return <HandoffCard key={block.key} entry={block.entry} onHandBack={onHandBack} />;
       })}
@@ -431,7 +434,7 @@ function ReplayedSteps({
       <Loading label="Loading steps" className="justify-start py-1" />
     );
   }
-  return <Blocks blocks={blocks} truncated={isReplayTruncated(stream.items)} onAnswer={onAnswer} onHandBack={onHandBack} />;
+  return <Blocks blocks={blocks} truncated={isReplayTruncated(stream.items)} onAnswer={onAnswer} onHandBack={onHandBack} defaultOpen />;
 }
 
 // ---- Turn ----

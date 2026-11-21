@@ -1173,7 +1173,16 @@ test("System-1 off: argv and events are byte-identical to today", async () => {
   const disabled = await runSystemOne(new ClaudeCodeRunner({ systemOne: { settings: { enabled: false } } }));
   assert.equal(disabled.outcome.exitCode, 0);
   assert.deepEqual(disabled.vm.calls[0].cmd, plain.vm.calls[0].cmd, "argv is unchanged");
-  assert.deepEqual(disabled.events, plain.events, "no System-1 telemetry leaks into the run");
+  // Wall-clock fields differ between two real runs by a millisecond; strip
+  // only those, so any other event — including System-1 telemetry — differs.
+  const withoutWallClock = (events: TelemetryEvent[]) =>
+    events.map((event) => {
+      const copy = { ...(event as unknown as Record<string, unknown>) };
+      delete copy.startedAt;
+      delete copy.finishedAt;
+      return copy;
+    });
+  assert.deepEqual(withoutWallClock(disabled.events), withoutWallClock(plain.events), "no System-1 telemetry leaks into the run");
 });
 
 test("System-1 on + a denying gate pauses visibly through the approval flow", async () => {

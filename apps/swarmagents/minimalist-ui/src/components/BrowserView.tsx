@@ -40,6 +40,66 @@ interface BlockedNotice {
 /** How long a refused-navigation notice stays visible before auto-dismissing. */
 const BLOCKED_NOTICE_MS = 10_000;
 
+/** How long a run may sit with no frame before we say so instead of hinting. */
+export const STILL_WAITING_MS = 10_000;
+
+/** The parts of the poll state the loading indicator cares about. */
+interface FrameSnapshot {
+  status?: string;
+  frameUrl?: string;
+}
+
+/**
+ * The thin bar under the address bar is a *fetch* indicator, not a "no frame
+ * yet" placeholder. The poll hook reports `polling` only while the first frame
+ * fetch is outstanding; a clean 404 flips it to `empty` ("No frame yet"), and
+ * a failure to `error`. Showing the bar in those settled states is what made
+ * the browser look stuck, so they must never render it.
+ */
+export function frameFetchInFlight(runId: string | undefined, frame: FrameSnapshot): boolean {
+  return Boolean(runId) && !frame.frameUrl && frame.status === "polling";
+}
+
+/** Pure 10s threshold, kept out of the timer so it can be unit-tested. */
+export function hasWaitedLongEnough(idleMs: number): boolean {
+  return idleMs >= STILL_WAITING_MS;
+}
+
+export interface BrowserLoadStatusProps {
+  /** A frame request is genuinely in flight (no frame obtained yet). */
+  fetching: boolean;
+  /** The no-frame state has persisted past STILL_WAITING_MS. */
+  stillWaiting: boolean;
+}
+
+/** Under-address-bar status: a real fetch gets the bar, a long idle gets text. */
+export function BrowserLoadStatus({ fetching, stillWaiting }: BrowserLoadStatusProps) {
+  if (fetching) {
+    return (
+      <div
+        className="h-0.5 w-full bg-cyan-500/10 overflow-hidden shrink-0"
+        role="progressbar"
+        aria-label="Loading browser frame"
+        data-testid="browser-loading-bar"
+      >
+        <div className="h-full w-1/3 bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-pulse" />
+      </div>
+    );
+  }
+  if (stillWaiting) {
+    return (
+      <div
+        role="status"
+        data-testid="browser-still-waiting"
+        className="shrink-0 border-b border-cyan-500/20 bg-cyan-500/5 px-4 py-1 text-[11px] font-mono text-cyan-300/80"
+      >
+        Still waiting…
+      </div>
+    );
+  }
+  return null;
+}
+
 /** A run's frame-bearing SSE events carry their metadata under `data`. */
 function frameMeta(item: RunStreamItem): BrowserMeta | null {
   const payload = item.data as { data?: Partial<BrowserMeta> } | null;
@@ -133,7 +193,19 @@ export function BrowserView({ runId }: BrowserViewProps) {
 
   const currentUrl = meta.url ?? draft;
   const secure = currentUrl.startsWith("https://");
-  const waitingForFirstFrame = Boolean(runId) && !frame.frameUrl;
+  // A run with no frame yet (and no hard error) is the state that can look
+  // stuck. Time it so the fetch hint can give way to an honest "Still waiting…".
+  const noFrameYet = Boolean(runId) && !frame.frameUrl && frame.status !== "error";
+  const [waitMs, setWaitMs] = useState(0);
+  useEffect(() => {
+    setWaitMs(0);
+    if (!noFrameYet) return;
+    const started = Date.now();
+    const timer = setInterval(() => setWaitMs(Date.now() - started), 1000);
+    return () => clearInterval(timer);
+  }, [runId, noFrameYet]);
+  const stillWaiting = noFrameYet && hasWaitedLongEnough(waitMs);
+  const fetching = frameFetchInFlight(runId, frame);
 
   // Follow the run stream: current URL/title/dimensions, and refused
   // navigations (browser.error with action "navigate").
@@ -269,16 +341,9 @@ export function BrowserView({ runId }: BrowserViewProps) {
         ) : null}
       </div>
 
-      {/* Thin loading bar while the first frame is on its way */}
-      {waitingForFirstFrame ? (
-        <div
-          className="h-0.5 w-full bg-cyan-500/10 overflow-hidden shrink-0"
-          role="progressbar"
-          aria-label="Loading browser frame"
-        >
-          <div className="h-full w-1/3 bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-pulse" />
-        </div>
-      ) : null}
+      {/* Thin bar only while a frame is actually being fetched; after a long
+          wait with no frame, say so instead of showing a stuck-looking bar. */}
+      <BrowserLoadStatus fetching={fetching} stillWaiting={stillWaiting} />
 
       {/* Refused navigation notice */}
       {blocked ? (

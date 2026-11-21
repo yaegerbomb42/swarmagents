@@ -4,7 +4,7 @@
  * Header — the workspace's primary glass bar with mynow.online aesthetic.
  *
  * Left: Jimmy (mascot animation), the open conversation (opens history), New chat.
- * Middle: Segmented glass view switcher (Chat, Screen, Board).
+ * Middle: Segmented glass view switcher (Chat, Computer, Board).
  * Right: Live telemetry status indicator and Settings.
  */
 

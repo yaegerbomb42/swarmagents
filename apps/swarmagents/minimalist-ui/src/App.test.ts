@@ -31,6 +31,15 @@ test("the workspace opens on the chat: one header, one view switch, one composer
   assert.match(tagOf(html, "open-settings"), /aria-label="Settings"/);
 });
 
+test("the live desktop tab is labelled Computer, never Screen", async () => {
+  const html = await renderApp();
+  const tab = /<button\b[^>]*data-testid="view-screen"[^>]*>[\s\S]*?<\/button>/.exec(html)?.[0] ?? "";
+  assert.match(tab, /Computer/, "the honest label for the live desktop");
+  assert.doesNotMatch(tab, /Screen/, "no stale 'Screen' label on the tab");
+  assert.doesNotMatch(html, />Screen</, "no user-visible 'Screen' label anywhere in the shell");
+  assert.doesNotMatch(html, /Watch the screen/, "the hero copy agrees with the tab");
+});
+
 test("the approval prompt's layer is mounted in every view", async () => {
   for (const view of ["chat", "screen", "board"]) {
     const html = await renderApp({ local: { "sa.view": view } });

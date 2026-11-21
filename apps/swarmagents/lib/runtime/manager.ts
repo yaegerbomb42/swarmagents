@@ -117,6 +117,7 @@ import { userRoleCatalog } from "../roles-store";
 import {
   MAX_ROLE_PHASES,
   ROLE_MCP_CONFIG_PATH,
+  atlasEnabled,
   desktopModeEnabled,
   roleContinuationPrompt,
   roleMcpConfigJson,
@@ -1148,6 +1149,7 @@ export class RuntimeManager {
     const phase = rolePhase(role, {
       desktopMode: desktopModeEnabled() && gui,
       tools: mode === undefined || mode.mode !== "chat",
+      atlasEnabled: atlasEnabled(),
     });
     if (restrictTools) {
       const allow = new Set(restrictTools);
@@ -1234,6 +1236,7 @@ export class RuntimeManager {
       desktopMode: desktopModeEnabled() && gui,
       codebaseRepoRoot: WORKSPACE_ROOT,
       extraMcpServers,
+      atlasEnabled: atlasEnabled(),
     })) {
       await this.vm.writeFile(userId, file.path, file.content);
     }
@@ -1264,6 +1267,7 @@ export class RuntimeManager {
         desktopMode: desktopModeEnabled() && gui,
         codebaseRepoRoot: WORKSPACE_ROOT,
         extraMcpServers,
+        atlasEnabled: atlasEnabled(),
       }),
     );
   }

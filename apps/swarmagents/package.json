@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "next dev -H 127.0.0.1 -p 3777",
     "desktop-proxy:dev": "tsx lib/desktop-proxy/server.ts",
+    "generate:atlas-server": "tsx lib/capability-atlas/generate-server-source.ts",
     "build": "next build && tsc -p tsconfig.desktop-proxy.json",
     "start": "next start -H 127.0.0.1 -p 3777",
     "typecheck": "tsc --noEmit",

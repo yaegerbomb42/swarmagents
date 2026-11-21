@@ -8,8 +8,8 @@
  * header shows, so a run is easy to find again after looking at older chats.
  */
 
-import React from "react";
-import { SquarePen } from "lucide-react";
+import React, { useMemo, useState } from "react";
+import { Search, SquarePen, X } from "lucide-react";
 import { formatRelativeTime, type ThreadSummary } from "../../../lib/client/thread";
 import { cn } from "../utils/cn";
 import { Button, Loading, Notice, Sheet, StatusBadge } from "./ui";
@@ -29,6 +29,15 @@ export interface HistoryPanelProps {
   onRetry: () => void;
 }
 
+export function filterThreads(threads: readonly ThreadSummary[], query: string): ThreadSummary[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return [...threads];
+  return threads.filter((t) => {
+    const title = (t.title || "Untitled chat").toLowerCase();
+    return title.includes(q);
+  });
+}
+
 export function HistoryPanel({
   open,
   onClose,
@@ -41,6 +50,13 @@ export function HistoryPanel({
   newChatDisabled,
   onRetry,
 }: HistoryPanelProps) {
+  const [searchQuery, setSearchQuery] = useState("");
+
+  const filteredThreads = useMemo(
+    () => filterThreads(threads, searchQuery),
+    [threads, searchQuery],
+  );
+
   return (
     <Sheet open={open} onClose={onClose} title="Conversations" side="left" widthClass="sm:max-w-[360px]" testId="history-panel">
       <div className="space-y-3 p-3">
@@ -57,6 +73,32 @@ export function HistoryPanel({
           <SquarePen className="h-4 w-4" aria-hidden />
           New chat
         </Button>
+
+        {state === "ready" && threads.length > 0 && (
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-sa-fg3" aria-hidden="true" />
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search conversations…"
+              aria-label="Search conversations"
+              data-testid="history-search-input"
+              className="w-full rounded-lg border border-sa-line-strong bg-sa-bg py-1.5 pl-8 pr-7 text-xs text-sa-fg outline-none placeholder:text-sa-fg3 focus:border-sa-accent"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery("")}
+                aria-label="Clear search"
+                data-testid="history-search-clear"
+                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-sa-fg3 hover:text-sa-fg"
+              >
+                <X className="h-3 w-3" aria-hidden="true" />
+              </button>
+            )}
+          </div>
+        )}
 
         {state === "loading" && <Loading label="Loading conversations" className="py-8" />}
 
@@ -80,10 +122,17 @@ export function HistoryPanel({
           </p>
         )}
 
-        {threads.length > 0 && (
+        {state === "ready" && threads.length > 0 && filteredThreads.length === 0 && (
+          <p className="px-1 py-8 text-center text-[13px] text-sa-fg2" data-testid="history-no-results">
+            No conversations match &ldquo;{searchQuery}&rdquo;.
+          </p>
+        )}
+
+        {state === "ready" && filteredThreads.length > 0 && (
           <ul className="space-y-0.5" data-testid="history-list">
-            {threads.map((thread) => {
+            {filteredThreads.map((thread) => {
               const current = thread.id === currentId;
+              const displayTitle = thread.title || "Untitled chat";
               return (
                 <li key={thread.id}>
                   <button
@@ -92,6 +141,7 @@ export function HistoryPanel({
                       onSelect(thread.id);
                       onClose();
                     }}
+                    title={displayTitle}
                     aria-current={current ? "true" : undefined}
                     data-testid="history-thread"
                     className={cn(
@@ -99,7 +149,7 @@ export function HistoryPanel({
                       current && "bg-sa-hover",
                     )}
                   >
-                    <span className="block truncate text-sm text-sa-fg">{thread.title || "Untitled chat"}</span>
+                    <span className="block truncate text-sm text-sa-fg">{displayTitle}</span>
                     <span className="mt-0.5 flex items-center gap-2 text-[12px] text-sa-fg3">
                       {thread.id === activeId && <StatusBadge tone="accent" label="Running" live className="text-[12px]" />}
                       <span>{formatRelativeTime(thread.updatedAt)}</span>

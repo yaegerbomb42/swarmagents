@@ -73,6 +73,20 @@ function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
 }
 
+/**
+ * Strip inline markdown markers so a timeline step reads as plain text (the
+ * timeline has no markdown renderer — a raw "**Created:** `hello.txt`"
+ * would show the markers). Only paired markers are stripped, so a literal
+ * glob like `**\/*.ts` (no closing marker) survives untouched.
+ */
+export function stripMarkdown(text: string): string {
+  return text
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1") // [text](url) -> text
+    .replace(/\*\*([^*]+)\*\*/g, "$1") // **bold** -> bold
+    .replace(/__([^_]+)__/g, "$1") // __bold__ -> bold
+    .replace(/`([^`]+)`/g, "$1"); // `code` -> code
+}
+
 // --- timeline steps ---------------------------------------------------------
 
 /**
@@ -114,15 +128,19 @@ export function buildReportSteps(events: readonly SequencedEvent[]): ReportStep[
       case "assistant.text": {
         const text = str(field("text")) ?? "";
         if (!text) break;
+        // The timeline is plain text: strip the markdown markers instead of
+        // showing raw "**Created:** `hello.txt`".
+        const clean = stripMarkdown(text);
+        if (!clean) break;
         const last = steps[steps.length - 1];
         if (last && last.kind === "message") {
           // Telemetry seqs are strictly increasing, so consecutive chunks of
           // one assistant message can never share a seq: merge on kind
           // alone, concatenating directly (no injected spaces — the chunks
           // already carry their own spacing).
-          last.text = truncate(last.text + text, MESSAGE_STEP_MAX);
+          last.text = truncate(last.text + clean, MESSAGE_STEP_MAX);
         } else {
-          push("message", text, { seq: event.seq, ts: event.ts });
+          push("message", clean, { seq: event.seq, ts: event.ts });
         }
         break;
       }
@@ -371,6 +389,98 @@ export function diffWorkspaceLists(
   return artifacts;
 }
 
+/** Tool names that write a file (their input carries the path). */
+const FILE_WRITING_TOOLS = new Set(["Write", "Edit", "MultiEdit"]);
+
+/** The file path a tool-call input targets, if any. */
+function toolCallFilePath(input: unknown): string | undefined {
+  if (!isRecord(input)) return undefined;
+  const value = input.file_path ?? input.path ?? input.file;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Files the run demonstrably wrote, from its own telemetry: Write/Edit/
+ * MultiEdit tool calls that did not explicitly fail, whose target is present
+ * in the end-of-run workspace listing. This is the fallback when the
+ * before/after listing diff misses a file — the start listing is captured
+ * asynchronously after `vm.ready` while the agent starts immediately, so a
+ * file the agent creates quickly can already be in the "before" baseline
+ * (or a listing can fail), and the diff then reports 0 files changed even
+ * though the run wrote files. Only files that exist at run end count, so a
+ * write that was later reverted or deleted is not reported.
+ */
+export function deriveArtifactsFromEvents(
+  events: readonly SequencedEvent[],
+  after: ReadonlyMap<string, WorkspaceEntry>,
+  before: ReadonlyMap<string, WorkspaceEntry> | null,
+): ReportArtifact[] {
+  const calls = new Map<string, { file: string; failed: boolean }>();
+  const unkeyed: { file: string; failed: boolean }[] = [];
+  for (const event of events) {
+    const data = isRecord(event.data) ? event.data : {};
+    const field = (name: string): unknown =>
+      name in event ? (event as unknown as Record<string, unknown>)[name] : data[name];
+    if (event.type === "tool.call") {
+      const rawName = str(field("name")) ?? "";
+      const name = rawName.split("__").pop() ?? rawName;
+      if (!FILE_WRITING_TOOLS.has(name)) continue;
+      const file = toolCallFilePath(field("input"));
+      if (!file) continue;
+      const id = str(field("id"));
+      const record = { file, failed: false };
+      if (id) calls.set(id, record);
+      else unkeyed.push(record);
+    } else if (event.type === "tool.result") {
+      const id = str(field("id"));
+      if (id && calls.has(id) && field("ok") === false) {
+        calls.get(id)!.failed = true;
+      }
+    }
+  }
+  const artifacts: ReportArtifact[] = [];
+  const seen = new Set<string>();
+  const consider = (file: string, failed: boolean): void => {
+    if (failed) return;
+    const abs = file.startsWith("/") ? file : `${WORKSPACE_ROOT}/${file}`;
+    const entry = after.get(abs);
+    if (!entry) return;
+    const rel = abs === WORKSPACE_ROOT ? abs : abs.slice(WORKSPACE_ROOT.length + 1);
+    if (seen.has(rel)) return;
+    seen.add(rel);
+    artifacts.push({
+      path: abs,
+      rel,
+      size: entry.size,
+      mtimeMs: entry.mtimeMs,
+      change: before && before.has(abs) ? "modified" : "created",
+    });
+  };
+  for (const record of calls.values()) consider(record.file, record.failed);
+  for (const record of unkeyed) consider(record.file, record.failed);
+  artifacts.sort((a, b) => a.rel.localeCompare(b.rel));
+  return artifacts.slice(0, MAX_ARTIFACTS);
+}
+
+/**
+ * Union of the listing-diff artifacts and the telemetry-derived ones, by
+ * relative path. The diff wins when both name a file — it compared against
+ * the baseline, so its created/modified call is authoritative.
+ */
+export function mergeArtifacts(
+  diffArtifacts: ReportArtifact[],
+  toolArtifacts: ReportArtifact[],
+): ReportArtifact[] {
+  const byRel = new Map<string, ReportArtifact>();
+  for (const artifact of diffArtifacts) byRel.set(artifact.rel, artifact);
+  for (const artifact of toolArtifacts) {
+    if (!byRel.has(artifact.rel)) byRel.set(artifact.rel, artifact);
+  }
+  const merged = [...byRel.values()];
+  merged.sort((a, b) => a.rel.localeCompare(b.rel));
+  return merged.slice(0, MAX_ARTIFACTS);
+}
+
 // --- screenshots ------------------------------------------------------------
 
 export interface CapturedShot {
@@ -523,6 +633,13 @@ export function assembleReport(inputs: ReportInputs): RunReport {
         break;
     }
   }
+
+  // The run's real elapsed time is the wall clock (created → finished). The
+  // CLI's inner duration (run.finished durationMs) excludes VM setup and the
+  // prompt round-trip, so it disagrees with the run's own "Finished Ns" —
+  // prefer the wall clock whenever it is positive.
+  const wallClockMs = inputs.finishedAt - inputs.createdAt;
+  if (wallClockMs > 0) durationMs = wallClockMs;
 
   const meta: ReportCardMeta = {
     status,

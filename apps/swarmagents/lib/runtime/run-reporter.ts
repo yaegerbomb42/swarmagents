@@ -33,8 +33,10 @@ import {
   assembleReport,
   captureBrowserFrame,
   captureDesktopScreenshot,
+  deriveArtifactsFromEvents,
   diffWorkspaceLists,
   listWorkspaceFiles,
+  mergeArtifacts,
   readRunReport,
   writeRunReport,
   writeShotFile,
@@ -207,8 +209,15 @@ export class RunReporter {
     const createdAt = events[0]?.ts ?? Date.now();
     const finishedAt = events[events.length - 1]?.ts ?? Date.now();
     // Diff against the fresh listing so artifacts reflect the final state.
+    // The diff alone can miss files the run wrote (the start listing is
+    // captured asynchronously after vm.ready, so a file created quickly can
+    // already be in the baseline), so union it with the files the run's own
+    // Write/Edit telemetry proves it wrote.
     const after = await listWorkspaceFiles(this.vm, userId);
-    const artifacts = diffWorkspaceLists(state.startListing, after);
+    const artifacts = mergeArtifacts(
+      diffWorkspaceLists(state.startListing, after),
+      deriveArtifactsFromEvents(events, after, state.startListing),
+    );
 
     let finalText: string | undefined;
     for (const event of events) {

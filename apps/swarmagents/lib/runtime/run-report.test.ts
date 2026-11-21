@@ -9,12 +9,15 @@ import {
   assembleReport,
   buildReportSteps,
   captureDesktopScreenshot,
+  deriveArtifactsFromEvents,
   deriveCouldNotDo,
   diffWorkspaceLists,
+  mergeArtifacts,
   parseFindListing,
   readRunReport,
   readShotBytes,
   sampleShotIndices,
+  stripMarkdown,
   writeRunReport,
   writeShotFile,
 } from "./run-report";
@@ -86,6 +89,103 @@ test("buildReportSteps marks failed tool results on the paired step", () => {
   ];
   const steps = buildReportSteps(events);
   assert.equal(steps[0].ok, false);
+});
+
+test("stripMarkdown removes paired markers but leaves literal globs alone", () => {
+  assert.equal(stripMarkdown("**Created:** `hello.txt` in your workspace"), "Created: hello.txt in your workspace");
+  assert.equal(stripMarkdown("See [the docs](https://example.com) for __details__"), "See the docs for details");
+  assert.equal(stripMarkdown("Finding **/*.ts files"), "Finding **/*.ts files");
+});
+
+test("buildReportSteps strips markdown from assistant text in the timeline", () => {
+  const events = [
+    seq({ type: "assistant.text", seq: 1, text: "**Created:** `hello.txt` in your workspace directory **Content:** `Hello from SwarmAgents`" }),
+  ];
+  const steps = buildReportSteps(events);
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].kind, "message");
+  assert.equal(steps[0].text, "Created: hello.txt in your workspace directory Content: Hello from SwarmAgents");
+  assert.ok(!steps[0].text.includes("**"), "no raw bold markers in the timeline");
+  assert.ok(!steps[0].text.includes("`"), "no raw code markers in the timeline");
+});
+
+test("deriveArtifactsFromEvents counts files the run's Write/Edit calls wrote", () => {
+  const events = [
+    seq({ type: "tool.call", seq: 1, name: "Write", id: "t1", input: { file_path: "/workspace/hello.txt" } }),
+    seq({ type: "tool.result", seq: 2, id: "t1", ok: true }),
+    seq({ type: "tool.call", seq: 3, name: "Edit", id: "t2", input: { file_path: "/workspace/app.py" } }),
+    seq({ type: "tool.result", seq: 4, id: "t2", ok: true }),
+    // A failed Write does not count, even though the file exists at run end.
+    seq({ type: "tool.call", seq: 5, name: "Write", id: "t3", input: { file_path: "/workspace/broken.txt" } }),
+    seq({ type: "tool.result", seq: 6, id: "t3", ok: false, output: "denied" }),
+    // A Bash call is not a file write; a Write whose file is gone at run end
+    // (reverted or deleted) does not count either.
+    seq({ type: "tool.call", seq: 7, name: "Bash", id: "t4", input: { command: "ls" } }),
+    seq({ type: "tool.result", seq: 8, id: "t4", ok: true }),
+    seq({ type: "tool.call", seq: 9, name: "Write", id: "t5", input: { file_path: "/workspace/gone.txt" } }),
+    seq({ type: "tool.result", seq: 10, id: "t5", ok: true }),
+  ];
+  const after = new Map([
+    ["/workspace/hello.txt", { size: 23, mtimeMs: 2_000 }],
+    ["/workspace/app.py", { size: 113, mtimeMs: 2_100 }],
+    ["/workspace/broken.txt", { size: 5, mtimeMs: 2_200 }],
+  ]);
+  const before = new Map([["/workspace/app.py", { size: 10, mtimeMs: 1_000 }]]);
+  const artifacts = deriveArtifactsFromEvents(events, after, before);
+  assert.deepEqual(
+    artifacts.map((a) => [a.rel, a.change, a.size]),
+    [
+      ["app.py", "modified", 113],
+      ["hello.txt", "created", 23],
+    ],
+  );
+});
+
+test("deriveArtifactsFromEvents counts an unpaired Write when the file exists at run end", () => {
+  const events = [
+    seq({ type: "tool.call", seq: 1, name: "Write", id: "t1", input: { file_path: "/workspace/hello.txt" } }),
+  ];
+  const after = new Map([["/workspace/hello.txt", { size: 23, mtimeMs: 2_000 }]]);
+  const artifacts = deriveArtifactsFromEvents(events, after, null);
+  assert.equal(artifacts.length, 1);
+  assert.equal(artifacts[0].rel, "hello.txt");
+  assert.equal(artifacts[0].change, "created");
+});
+
+test("mergeArtifacts unions the diff and the telemetry, preferring the diff", () => {
+  const diff = [{ path: "/workspace/a.txt", rel: "a.txt", size: 25, mtimeMs: 200, change: "modified" as const }];
+  const tool = [
+    { path: "/workspace/a.txt", rel: "a.txt", size: 25, mtimeMs: 200, change: "created" as const },
+    { path: "/workspace/b.txt", rel: "b.txt", size: 7, mtimeMs: 150, change: "created" as const },
+  ];
+  const merged = mergeArtifacts(diff, tool);
+  assert.deepEqual(
+    merged.map((a) => [a.rel, a.change]),
+    [
+      ["a.txt", "modified"],
+      ["b.txt", "created"],
+    ],
+  );
+});
+
+test("assembleReport prefers the run's wall-clock duration over the CLI's inner duration", () => {
+  // The CLI's result event says 3.1s (its own elapsed); the run itself took
+  // 7s wall-clock (createdAt 1000 -> finishedAt 8000). The report must match
+  // the run's displayed "Finished 7s", not the CLI's 3.1s.
+  const events = [
+    seq({ type: "run.created", seq: 1, data: { prompt: "build it", userId: "alice" } }),
+    seq({ type: "run.finished", seq: 2, exitCode: 0, costUsd: 0.1, durationMs: 3100, numTurns: 2 }),
+  ];
+  const report = assembleReport({
+    runId: "run_1",
+    userId: "alice",
+    events,
+    createdAt: 1_000,
+    finishedAt: 8_000,
+    artifacts: [],
+    shots: [],
+  });
+  assert.equal(report.meta.durationMs, 7000);
 });
 
 test("deriveCouldNotDo collects failed steps, blocks, denied approvals, and terminal errors", () => {

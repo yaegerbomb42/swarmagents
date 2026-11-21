@@ -77,4 +77,4 @@ Principles: [docs/architecture/why.md](docs/architecture/why.md).
 
 [CONTRIBUTING.md](CONTRIBUTING.md) | [AGENTS.md](AGENTS.md) (rules for agents) | [SECURITY.md](SECURITY.md)
 
-License: none yet (all rights reserved until the owner chooses one).
+License: AGPL-3.0 (see [LICENSE](LICENSE)).

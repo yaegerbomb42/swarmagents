@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, Loader2, LogOut, Plus, Sparkles, Trash2, X, Zap,
+  AlertTriangle, Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, Loader2, LogOut, Plus, Sparkles, Trash2, X, Zap,
 } from 'lucide-react';
 import {
   type ActiveRole, type ApiFormat, MAX_ROLES, MIN_ROLES, PROVIDERS, type ProviderConfig, ROLES, uid,
@@ -10,6 +10,7 @@ import { RoleIcon } from './RoleIcon';
 import { ComputersSettings } from './ComputersSettings';
 import { AutopilotIdle } from './AutopilotIdle';
 import { removeRole, moveRole } from '../utils/pipeline';
+import { parseBudgetInput } from '../utils/budget';
 import { DEFAULT_MASCOT_VARIANT, MASCOT_VARIANTS, type MascotVariant } from '../../../components/mascot/variant';
 
 type Tab = 'general' | 'providers' | 'agent' | 'computers' | 'appearance' | 'account' | 'memory';
@@ -549,6 +550,11 @@ function Providers({
   const [expanded, setExpanded] = useState<string | null>(null);
   const [preferFree, setPreferFree] = useState<boolean | null>(null);
   const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean | null>(null);
+  const [allowPaidProviders, setAllowPaidProviders] = useState<boolean>(false);
+  const [perRunBudget, setPerRunBudget] = useState<string>('');
+  const [perDayBudget, setPerDayBudget] = useState<string>('');
+  const [todaySpend, setTodaySpend] = useState<number | null>(null);
+  const [spendingError, setSpendingError] = useState<string | null>(null);
   const [ollamaBaseUrl, setOllamaBaseUrl] = useState<string>('http://127.0.0.1:11434');
   const [serverRows, setServerRows] = useState<ServerProviderRow[] | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
@@ -563,13 +569,50 @@ function Providers({
       try {
         const settingsRes = await fetch('/api/providers/settings', { headers: { Accept: 'application/json' } });
         if (settingsRes.ok && !cancelled) {
-          const body = (await settingsRes.json()) as { preferFreeProviders?: unknown; injectCodebaseContext?: unknown; ollamaBaseUrl?: unknown };
+          const body = (await settingsRes.json()) as {
+            preferFreeProviders?: unknown;
+            injectCodebaseContext?: unknown;
+            ollamaBaseUrl?: unknown;
+            allowPaidProviders?: unknown;
+            perRunBudgetUsd?: unknown;
+            perDayBudgetUsd?: unknown;
+          };
           if (typeof body.preferFreeProviders === 'boolean') setPreferFree(body.preferFreeProviders);
           if (typeof body.injectCodebaseContext === 'boolean') setInjectCodebaseContext(body.injectCodebaseContext);
           if (typeof body.ollamaBaseUrl === 'string') setOllamaBaseUrl(body.ollamaBaseUrl);
+          if (typeof body.allowPaidProviders === 'boolean') {
+            setAllowPaidProviders(body.allowPaidProviders);
+          } else {
+            setAllowPaidProviders(false);
+          }
+          if (typeof body.perRunBudgetUsd === 'number') {
+            setPerRunBudget(String(body.perRunBudgetUsd));
+          } else {
+            setPerRunBudget('');
+          }
+          if (typeof body.perDayBudgetUsd === 'number') {
+            setPerDayBudget(String(body.perDayBudgetUsd));
+          } else {
+            setPerDayBudget('');
+          }
         }
       } catch {
         // offline / unsigned — leave the toggle hidden
+      }
+      try {
+        const usageRes = await fetch('/api/runtime/usage?days=1', { headers: { Accept: 'application/json' } });
+        if (usageRes.ok && !cancelled) {
+          const usageBody = (await usageRes.json()) as {
+            days?: Array<{ date: string; costUsd: number }>;
+          };
+          if (Array.isArray(usageBody.days) && usageBody.days.length > 0) {
+            setTodaySpend(usageBody.days[0]?.costUsd ?? 0);
+          } else {
+            setTodaySpend(0);
+          }
+        }
+      } catch {
+        // usage endpoint optional/unreachable
       }
       try {
         const res = await fetch('/api/providers', { headers: { Accept: 'application/json' } });
@@ -585,6 +628,30 @@ function Providers({
       cancelled = true;
     };
   }, [reloadTick]);
+
+  const saveRouterSettings = async (patch: {
+    allowPaidProviders?: boolean;
+    perRunBudgetUsd?: number | null;
+    perDayBudgetUsd?: number | null;
+  }) => {
+    setSpendingError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        setSpendingError(err.error || 'Could not save spending settings.');
+        return false;
+      }
+      return true;
+    } catch {
+      setSpendingError('Could not save spending settings.');
+      return false;
+    }
+  };
 
   const setPreferFreeRemote = async (v: boolean) => {
     setSettingsError(null);
@@ -703,6 +770,105 @@ function Providers({
           </div>
         </section>
       )}
+
+      <section data-testid="settings-spending-section">
+        <Label>Spending</Label>
+        <div className="space-y-3 rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-xs text-white/85">Allow paid providers</div>
+              <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                Allow providers not marked free when no free provider is usable.
+              </div>
+            </div>
+            <Toggle
+              on={allowPaidProviders}
+              onChange={(v) => {
+                setAllowPaidProviders(v);
+                void saveRouterSettings({ allowPaidProviders: v });
+              }}
+              accent={accent}
+            />
+          </div>
+
+          {allowPaidProviders && (
+            <div className="flex items-start gap-2 rounded-xl bg-amber-500/10 p-2 text-[11px] leading-relaxed text-amber-300/90 ring-1 ring-amber-500/20">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
+              <span>Paid providers are enabled. LLM calls may incur charges based on your configured provider rates.</span>
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 gap-3 border-t border-white/10 pt-3">
+            <label className="block">
+              <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">Per-run budget (USD)</span>
+              <input
+                type="number"
+                min={0}
+                step="any"
+                placeholder="No cap"
+                value={perRunBudget}
+                data-testid="spending-per-run-budget"
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setPerRunBudget(val);
+                  const parsed = parseBudgetInput(val);
+                  if (parsed.valid) {
+                    setSpendingError(null);
+                    void saveRouterSettings({ perRunBudgetUsd: parsed.value });
+                  } else {
+                    setSpendingError(parsed.error ?? 'Invalid per-run budget');
+                  }
+                }}
+                className="w-full rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 transition placeholder:text-white/20 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
+              />
+              <span className="mt-1 block text-[10px] text-white/30">Blank = no cap, validated &ge; 0</span>
+            </label>
+
+            <label className="block">
+              <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">Per-day budget (USD)</span>
+              <input
+                type="number"
+                min={0}
+                step="any"
+                placeholder="No cap"
+                value={perDayBudget}
+                data-testid="spending-per-day-budget"
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setPerDayBudget(val);
+                  const parsed = parseBudgetInput(val);
+                  if (parsed.valid) {
+                    setSpendingError(null);
+                    void saveRouterSettings({ perDayBudgetUsd: parsed.value });
+                  } else {
+                    setSpendingError(parsed.error ?? 'Invalid per-day budget');
+                  }
+                }}
+                className="w-full rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 transition placeholder:text-white/20 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
+              />
+              <span className="mt-1 block text-[10px] text-white/30">Blank = no cap, validated &ge; 0</span>
+            </label>
+          </div>
+
+          <div className="flex items-center justify-between border-t border-white/10 pt-2 text-[11px] text-white/40">
+            <span>Today&apos;s spend:</span>
+            <span className="font-mono text-xs text-white/85" data-testid="spending-today-spend">
+              ${(todaySpend ?? 0).toFixed(2)}
+              {perDayBudget.trim() !== '' && !Number.isNaN(Number(perDayBudget)) && Number(perDayBudget) >= 0 ? (
+                <span className="text-white/40"> / ${Number(perDayBudget).toFixed(2)} cap</span>
+              ) : (
+                <span className="text-white/40"> (no daily cap)</span>
+              )}
+            </span>
+          </div>
+
+          {spendingError && (
+            <div data-testid="spending-error" className="mt-1 text-[11px] text-red-400">
+              {spendingError}
+            </div>
+          )}
+        </div>
+      </section>
 
       {serverRows && serverRows.length > 0 && (
         <section>

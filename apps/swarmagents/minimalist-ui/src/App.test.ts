@@ -22,8 +22,13 @@ test("the workspace opens on the chat: one header, one view switch, one composer
 
   assert.match(tagOf(html, "minimal-main-page"), /data-view="chat"/);
   for (const id of ALWAYS_IN_REACH) assert.equal(countOf(html, `data-testid="${id}"`), 1, id);
-  for (const view of ["chat", "screen", "board"]) {
+  for (const view of ["chat", "screen"]) {
     assert.equal(countOf(html, `data-testid="view-${view}"`), 1, `one ${view} tab`);
+  }
+  assert.equal(countOf(html, 'data-testid="view-board"'), 0, "no board tab without dev mode");
+  const dev = await renderApp({ local: { "sa.devMode": true } });
+  for (const view of ["chat", "screen", "board"]) {
+    assert.equal(countOf(dev, `data-testid="view-${view}"`), 1, `one ${view} tab in dev mode`);
   }
   assert.match(tagOf(html, "view-chat"), /aria-selected="true"/);
   assert.equal(countOf(html, 'data-testid="stage"'), 0, "no stage until a view asks for one");
@@ -62,17 +67,28 @@ test("the screen view puts the computer on stage, with its status, beside the ch
 });
 
 test("the board is part of the same workspace: beside the chat when wide, the whole view on a phone", async () => {
-  const wide = await renderApp({ local: { "sa.view": "board" }, wide: true });
+  const wide = await renderApp({ local: { "sa.view": "board", "sa.devMode": true }, wide: true });
   assert.equal(countOf(wide, 'data-testid="board-panel"'), 1);
   assert.doesNotMatch(tagOf(wide, "chat-column"), /hidden=""/);
   assert.match(tagOf(wide, "view-board"), /aria-selected="true"/);
 
-  const phone = await renderApp({ local: { "sa.view": "board" }, wide: false });
+  const phone = await renderApp({ local: { "sa.view": "board", "sa.devMode": true }, wide: false });
   assert.equal(countOf(phone, 'data-testid="board-panel"'), 1);
   assert.match(tagOf(phone, "chat-column"), /hidden=""/, "kept mounted so the draft survives, but out of view");
   for (const view of ["chat", "screen", "board"]) {
     assert.equal(countOf(phone, `data-testid="view-${view}"`), 1, `the way back to ${view} is still there`);
   }
+});
+
+test("the board stays hidden until dev mode is on", async () => {
+  const gated = await renderApp({ local: { "sa.view": "board" }, wide: true });
+  assert.match(tagOf(gated, "minimal-main-page"), /data-view="chat"/, "a saved board view falls back to chat");
+  assert.equal(countOf(gated, 'data-testid="view-board"'), 0, "no board tab without dev mode");
+  assert.equal(countOf(gated, 'data-testid="board-panel"'), 0, "no board panel without dev mode");
+
+  const dev = await renderApp({ local: { "sa.view": "board", "sa.devMode": true }, wide: true });
+  assert.match(tagOf(dev, "minimal-main-page"), /data-view="board"/);
+  assert.equal(countOf(dev, 'data-testid="board-panel"'), 1);
 });
 
 test("nothing in the shell is a placeholder", async () => {
@@ -101,7 +117,7 @@ test("the split view sizes the chat from the persisted ratio, with a 480px floor
     "the default ratio drives the chat width",
   );
 
-  const half = await renderApp({ local: { "sa.view": "board", "sa.splitRatio": 0.5 }, wide: true });
+  const half = await renderApp({ local: { "sa.view": "board", "sa.devMode": true, "sa.splitRatio": 0.5 }, wide: true });
   assert.equal(countOf(half, 'data-testid="split-handle"'), 1, "the handle is there for the board too");
   assert.match(tagOf(half, "chat-column"), /width:clamp\(480px, 50\.0%, calc\(100% - 492px\)\)/);
   assert.match(tagOf(half, "split-handle"), /aria-valuenow="50"/, "the persisted ratio survives a reload");

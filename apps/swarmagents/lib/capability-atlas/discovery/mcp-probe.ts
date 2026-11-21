@@ -48,9 +48,15 @@ const SAFE_ENV_KEYS = [
 ];
 
 function buildSandboxedEnv(
-  serverEnv?: Record<string, string>
-): Record<string, string> {
-  const env: Record<string, string> = {};
+  serverEnv?: Record<string, string>,
+): NodeJS.ProcessEnv {
+  // Next.js types require NODE_ENV on ProcessEnv, so the object carries a
+  // default that the allowlist loop below overwrites whenever the parent
+  // process actually defines NODE_ENV (never inventing a value it set).
+  const nodeEnv = process.env.NODE_ENV;
+  const env: NodeJS.ProcessEnv = {
+    NODE_ENV: nodeEnv === "production" || nodeEnv === "test" ? nodeEnv : "development",
+  };
   for (const k of SAFE_ENV_KEYS) {
     const val = process.env[k];
     if (val !== undefined) env[k] = val;

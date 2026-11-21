@@ -155,7 +155,7 @@ function clip(value: string, max = 6000): string {
   return value.length > max ? `${value.slice(0, max)}…` : value;
 }
 
-function ToolDetail({ entry }: { entry: ToolEntry }) {
+export function ToolDetail({ entry }: { entry: ToolEntry }) {
   const input =
     typeof entry.input === "string" ? entry.input : entry.input === undefined ? "" : JSON.stringify(entry.input, null, 2);
   const sections: Array<{ label: string; body: string }> = [];
@@ -167,7 +167,7 @@ function ToolDetail({ entry }: { entry: ToolEntry }) {
       {sections.map((section) => (
         <div key={section.label}>
           <div className="mb-1 text-[12px] font-medium text-sa-fg3">{section.label}</div>
-          <pre className="sa-scroll sa-mono max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-black/40 p-2.5 text-[12px] leading-relaxed text-sa-fg2">
+          <pre className="sa-scroll sa-mono max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-black/40 p-2.5 text-[12px] leading-[1.6] text-sa-fg2">
             {section.body}
           </pre>
         </div>

@@ -1543,11 +1543,14 @@ select option { background: #15151a; color: #eee; }
 }
 .sa-prose pre {
   margin: 0.85em 0;
-  padding: 12px;
-  overflow-x: auto;
+  padding: 10px 12px;
+  max-height: 14rem;
+  overflow: auto;
   border: 1px solid var(--color-sa-line);
   border-radius: 8px;
   background: #08080a;
+  font-size: 12.5px;
+  line-height: 1.6;
 }
 .sa-prose pre code {
   padding: 0;

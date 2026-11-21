@@ -1,16 +1,15 @@
 /**
- * Unit tests for the run report card's plain-language summary sentence.
- *
- * The sentence is computed from data the card already has (no new fetching):
- * with the full report loaded the files phrase can name the single file;
- * from the collapsed row's meta alone it can only count. Failed and
- * cancelled runs get an explicit status prefix, still one sentence.
+ * Unit tests for the run report card's plain-language summary sentence
+ * and copy-transcript functionality.
  */
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { formatReportCost, formatReportDuration, reportSummarySentence } from "./RunReportCard";
-import type { ReportArtifact, ReportCardMeta, ReportStatus } from "../../../lib/runtime/run-report-types";
+import type { ReportArtifact, ReportCardMeta, ReportStatus, RunReport } from "../../../lib/runtime/run-report-types";
+import { countOf, installBrowserStubs } from "../testing/harness";
 
 function meta(overrides: Partial<ReportCardMeta> = {}): ReportCardMeta {
   return {
@@ -99,4 +98,156 @@ test("durations round the same way the old facts row did", () => {
   assert.equal(formatReportDuration(900), "1s");
   assert.equal(formatReportDuration(64_000), "1m 4s");
   assert.equal(reportSummarySentence(meta({ durationMs: 64_000 }), artifacts("created")), "Created hello.txt in 1m 4s for $0.11.");
+});
+
+function makeReport(overrides: Partial<RunReport> = {}): RunReport {
+  return {
+    runId: "run_1",
+    userId: "user_1",
+    status: "finished",
+    prompt: "Create hello.txt and run it",
+    createdAt: 1_700_000_000_000,
+    finishedAt: 1_700_000_007_432,
+    couldNotDo: [],
+    steps: [
+      { seq: 0, ts: 1, kind: "start", text: "Run started" },
+      { seq: 1, ts: 2, kind: "tool", text: "Creating hello.txt", ok: true, detail: "echo hi > hello.txt" },
+      { seq: 2, ts: 3, kind: "tool", text: "Running the script", ok: false },
+      { seq: 3, ts: 4, kind: "blocked", text: "Network access blocked" },
+    ],
+    artifacts: [
+      {
+        path: "/workspace/hello.txt",
+        rel: "hello.txt",
+        size: 12,
+        mtimeMs: 5,
+        change: "created",
+      },
+    ],
+    shots: [],
+    meta: {
+      status: "finished",
+      steps: 4,
+      shots: 0,
+      artifacts: 1,
+      durationMs: 7_432,
+      costUsd: 0.11,
+      providers: [],
+    },
+    ...overrides,
+  };
+}
+
+// Node exposes navigator as a read-only getter, so redefine it for the clipboard tests.
+const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+function stubNavigator(value: unknown): void {
+  Object.defineProperty(globalThis, "navigator", { value, configurable: true, writable: true });
+}
+function restoreNavigator(): void {
+  if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+  else delete (globalThis as unknown as Record<string, unknown>).navigator;
+}
+
+test("the transcript mirrors the report: prompt, steps with outcomes, files, duration and cost", async () => {
+  const { buildTranscriptMarkdown } = await import("./RunReportCard");
+  const md = buildTranscriptMarkdown(makeReport());
+  assert.match(md, /^# Run transcript/);
+  assert.match(md, /Status: finished/);
+  assert.match(md, /## Prompt\n\nCreate hello\.txt and run it/);
+  assert.match(md, /## Timeline/);
+  const order = [
+    "- Run started",
+    "- Creating hello.txt (done) — echo hi > hello.txt",
+    "- Running the script (failed)",
+    "- Network access blocked (blocked)",
+  ].map((line) => md.indexOf(line));
+  assert.ok(order.every((i) => i >= 0), "every step is present");
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), "steps stay in order");
+  assert.match(md, /## Files changed\n\n- created: `hello\.txt` \(12 B\)/);
+  assert.match(md, /\*\*Duration \/ cost:\*\* 7s · \$0\.110/);
+  assert.match(md, /\n$/);
+});
+
+test("a report with no steps or files still produces a complete transcript", async () => {
+  const { buildTranscriptMarkdown } = await import("./RunReportCard");
+  const md = buildTranscriptMarkdown(
+    makeReport({
+      status: "error",
+      steps: [],
+      artifacts: [],
+      meta: { status: "error", steps: 0, shots: 0, artifacts: 0, providers: [] },
+    }),
+  );
+  assert.match(md, /Status: error/);
+  assert.match(md, /_No steps recorded\._/);
+  assert.match(md, /No files changed\./);
+  assert.match(md, /\*\*Duration \/ cost:\*\* —/);
+});
+
+test("the copy button shows the idle and brief Copied states", async () => {
+  installBrowserStubs({});
+  const { CopyTranscriptButton } = await import("./RunReportCard");
+  const idle = renderToStaticMarkup(React.createElement(CopyTranscriptButton, { copied: false, onCopy() {} }));
+  assert.equal(countOf(idle, 'data-testid="copy-transcript"'), 1);
+  assert.match(idle, /Copy transcript/);
+  assert.doesNotMatch(idle, /Copied/);
+  const done = renderToStaticMarkup(React.createElement(CopyTranscriptButton, { copied: true, onCopy() {} }));
+  assert.match(done, />Copied</);
+  assert.doesNotMatch(done, /Copy transcript/);
+});
+
+test("copy uses the clipboard API when it is allowed", async () => {
+  const { copyTextWithFallback } = await import("./RunReportCard");
+  let written: string | undefined;
+  stubNavigator({ clipboard: { writeText: async (text: string) => { written = text; } } });
+  try {
+    assert.equal(await copyTextWithFallback("hello"), true);
+    assert.equal(written, "hello");
+  } finally {
+    restoreNavigator();
+  }
+});
+
+test("denied clipboard permission falls back to select-and-copy", async () => {
+  const { copyTextWithFallback } = await import("./RunReportCard");
+  const g = globalThis as unknown as Record<string, unknown>;
+  const previousDoc = g.document;
+  const area = {
+    value: "",
+    style: {} as Record<string, string>,
+    setAttribute() {},
+    select() { selected = true; },
+    remove() {},
+  };
+  let selected = false;
+  let copied = false;
+  stubNavigator({ clipboard: { writeText: async () => { throw new Error("denied"); } } });
+  g.document = {
+    createElement: () => area,
+    body: { appendChild() {} },
+    execCommand: (command: string) => { copied = command === "copy"; return true; },
+  };
+  try {
+    assert.equal(await copyTextWithFallback("fallback text"), true);
+    assert.equal(area.value, "fallback text");
+    assert.ok(selected, "the fallback text is selected");
+    assert.ok(copied, "execCommand('copy') is used");
+  } finally {
+    restoreNavigator();
+    g.document = previousDoc;
+  }
+});
+
+test("a totally unavailable clipboard reports failure so the user gets a manual notice", async () => {
+  const { copyTextWithFallback } = await import("./RunReportCard");
+  const g = globalThis as unknown as Record<string, unknown>;
+  const previousDoc = g.document;
+  stubNavigator({ clipboard: { writeText: async () => { throw new Error("denied"); } } });
+  g.document = { createElement: () => { throw new Error("no DOM"); } };
+  try {
+    assert.equal(await copyTextWithFallback("text"), false);
+  } finally {
+    restoreNavigator();
+    g.document = previousDoc;
+  }
 });

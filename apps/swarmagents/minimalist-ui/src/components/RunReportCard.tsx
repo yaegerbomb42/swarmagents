@@ -10,7 +10,7 @@
  * agent could not do.
  */
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Camera,
@@ -19,12 +19,13 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronUp,
+  Copy,
   Download,
   Loader2,
   Play,
   StopCircle,
 } from "lucide-react";
-import type { ReportArtifact, ReportCardMeta, RunReport } from "../../../lib/runtime/run-report-types";
+import type { ReportArtifact, ReportCardMeta, ReportStep, RunReport } from "../../../lib/runtime/run-report-types";
 import type { ThreadEntry } from "../../../lib/client/thread";
 import { Button, IconButton, Loading, Notice } from "./ui";
 
@@ -92,6 +93,91 @@ export function reportSummarySentence(meta: ReportCardMeta, artifacts?: ReportAr
   return `${sentence}.`;
 }
 
+/** The outcome word shown beside a timeline step, mirroring the visible report. */
+function stepOutcome(step: ReportStep): string {
+  if (step.kind === "blocked") return "blocked";
+  if (step.ok === false || (step.kind === "end" && step.text.startsWith("Error"))) return "failed";
+  if (step.ok === true) return "done";
+  return "";
+}
+
+/**
+ * Build the markdown transcript from the report already loaded in the card —
+ * no extra fetch. The sections follow the same order and wording as the
+ * visible report so what you copy matches what you read.
+ */
+export function buildTranscriptMarkdown(report: RunReport): string {
+  const lines: string[] = ["# Run transcript", ""];
+  lines.push(`Status: ${report.status}`, "");
+  lines.push("## Prompt", "", report.prompt, "");
+  lines.push("## Timeline", "");
+  if (report.steps.length === 0) {
+    lines.push("_No steps recorded._");
+  } else {
+    for (const step of report.steps) {
+      const outcome = stepOutcome(step);
+      const detail = step.detail ? ` — ${step.detail}` : "";
+      lines.push(`- ${step.text}${outcome ? ` (${outcome})` : ""}${detail}`);
+    }
+  }
+  lines.push("");
+  lines.push("## Files changed", "");
+  if (report.artifacts.length === 0) {
+    lines.push("No files changed.");
+  } else {
+    for (const artifact of report.artifacts) {
+      lines.push(`- ${artifact.change}: \`${artifact.rel}\` (${formatBytes(artifact.size)})`);
+    }
+  }
+  lines.push("");
+  const meta = report.meta;
+  const duration = meta?.durationMs !== undefined && Number.isFinite(meta.durationMs)
+    ? formatReportDuration(meta.durationMs)
+    : undefined;
+  const cost = meta?.costUsd !== undefined && Number.isFinite(meta.costUsd) ? `$${meta.costUsd.toFixed(3)}` : undefined;
+  lines.push(`**Duration / cost:** ${[duration, cost].filter(Boolean).join(" · ") || "—"}`);
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Copy text with the async clipboard API, falling back to select-and-copy.
+ * Returns false when both fail so the caller can show a manual-copy notice.
+ */
+export async function copyTextWithFallback(text: string): Promise<boolean> {
+  try {
+    if (globalThis.navigator?.clipboard?.writeText) {
+      await globalThis.navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Permission denied or unavailable: try the selection fallback.
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand?.("copy") ?? false;
+    area.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Presentational so both button states can be checked without a DOM. */
+export function CopyTranscriptButton({ copied, onCopy }: { copied: boolean; onCopy: () => void }) {
+  return (
+    <Button size="sm" data-testid="copy-transcript" onClick={onCopy}>
+      {copied ? <CheckCircle2 className="h-3.5 w-3.5" aria-hidden /> : <Copy className="h-3.5 w-3.5" aria-hidden />}
+      {copied ? "Copied" : "Copy transcript"}
+    </Button>
+  );
+}
+
 type VerdictTone = "ok" | "warn" | "err";
 
 const VERDICT_TEXT: Record<VerdictTone, string> = { ok: "text-sa-ok", warn: "text-sa-warn", err: "text-sa-err" };
@@ -126,6 +212,9 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
   const [receiptStatus, setReceiptStatus] = useState<"idle" | "loading" | "verified" | "failed">("idle");
   const [receiptLinks, setReceiptLinks] = useState(0);
   const [receiptFailedLink, setReceiptFailedLink] = useState<number | undefined>(undefined);
+  const [copied, setCopied] = useState(false);
+  const [copyNotice, setCopyNotice] = useState(false);
+  const copyTimer = useRef<number | undefined>(undefined);
 
   const load = useCallback(
     async (signal?: AbortSignal) => {
@@ -148,6 +237,26 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
     },
     [entry.runId],
   );
+
+  const transcript = report ? buildTranscriptMarkdown(report) : "";
+
+  // Copy the transcript built from the loaded report. If the clipboard is
+  // unavailable (permission denied, non-secure context), fall back to a
+  // select-and-copy textarea and say so instead of failing silently.
+  const onCopy = useCallback(async () => {
+    if (!report) return;
+    const ok = await copyTextWithFallback(buildTranscriptMarkdown(report));
+    if (ok) {
+      setCopied(true);
+      setCopyNotice(false);
+      window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopied(false), 1800);
+    } else {
+      setCopyNotice(true);
+    }
+  }, [report]);
+
+  useEffect(() => () => window.clearTimeout(copyTimer.current), []);
 
   // The report may lag a finished run by a moment: poll briefly, then stop and
   // offer a retry.
@@ -262,6 +371,21 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
 
           {report && (
             <div className="space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <SectionTitle>Transcript</SectionTitle>
+                <CopyTranscriptButton copied={copied} onCopy={() => void onCopy()} />
+              </div>
+              {copyNotice && (
+                <Notice tone="info" title="Clipboard unavailable">
+                  Select the transcript below and copy it manually.
+                  <textarea
+                    readOnly
+                    value={transcript}
+                    data-testid="transcript-fallback"
+                    className="mt-2 block h-32 w-full resize-none rounded-lg border border-sa-line bg-sa-raised p-2 font-mono text-[11px] text-sa-fg"
+                  />
+                </Notice>
+              )}
               {report.audit && (
                 <Verdict
                   tone={report.audit.verdict === "warn" ? "warn" : "ok"}

@@ -4,8 +4,9 @@
  * BoardPanel — the SwarmBoard, in the same workspace as the chat and the VM.
  *
  * One calm list, grouped by where each task stands (open, in progress, in
- * review, blocked, completed). Each row shows the title, who claimed it and
- * its pull request. A task moves through the board from here:
+ * review, blocked, completed). Each row shows the title, its status and its
+ * pull request; the same task filed twice reads once. A task moves through
+ * the board from here:
  *
  *   add a task  →  Run (starts a VM run for it and claims it)  →  the run
  *   shows up in the chat and on the screen  →  Submit for review (branch,
@@ -25,6 +26,7 @@ import {
   TASK_PR_URL_MAX,
   TASK_STATUS_META,
   TASK_SUMMARY_MAX,
+  displayTaskTitle,
   extractBranchAndPr,
   groupBoardTasks,
   isSafeHttpUrl,
@@ -104,6 +106,12 @@ function AddTask({ board }: { board: Board }) {
     }
   };
 
+  // A board that cannot save cannot take new tasks: the button says why
+  // instead of failing after the click.
+  const readOnly = !board.writable;
+  const addDisabled = !text.trim() || saving || readOnly;
+  const addHintId = "board-add-readonly-hint";
+
   return (
     <form
       className="space-y-2"
@@ -141,7 +149,15 @@ function AddTask({ board }: { board: Board }) {
         <Button
           type="button"
           variant="ghost"
-          disabled={!text.trim() || saving}
+          disabled={addDisabled}
+          title={
+            readOnly
+              ? "Task creation is disabled — the board can't save right now."
+              : !text.trim()
+                ? "Describe the task first."
+                : undefined
+          }
+          aria-describedby={readOnly ? addHintId : undefined}
           data-testid="board-add-submit"
           onClick={() => {
             const message = text.trim();
@@ -162,6 +178,11 @@ function AddTask({ board }: { board: Board }) {
           Add task
         </Button>
       </div>
+      {readOnly && (
+        <p id={addHintId} className="text-[13px] leading-relaxed text-sa-fg2" data-testid="board-add-readonly-hint">
+          Task creation is disabled — the board can&apos;t save right now.
+        </p>
+      )}
       {reply && (
         <p className="text-[13px] leading-relaxed text-sa-fg2" data-testid="board-agent-reply">
           {reply}
@@ -306,6 +327,7 @@ function TaskRow({
   link,
   run,
   initiallyOpen,
+  duplicateCount,
   onRunTask,
   onViewRun,
 }: {
@@ -315,6 +337,8 @@ function TaskRow({
   link?: TaskRunLink;
   run?: ThreadEntry;
   initiallyOpen: boolean;
+  /** How many same-titled tasks this row stands for (1 when it stands alone). */
+  duplicateCount?: number;
   onRunTask: (task: SwarmTask) => Promise<string | undefined>;
   onViewRun: (link: TaskRunLink) => void;
 }) {
@@ -366,11 +390,19 @@ function TaskRow({
           />
           <span className="min-w-0 flex-1">
             <span className="block truncate text-sm font-medium text-sa-fg" data-testid="board-task-title">
-              {task.title}
+              {displayTaskTitle(task.title)}
             </span>
             <span className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[13px] text-sa-fg2">
               <StatusBadge tone={meta.tone} label={meta.label} />
-              {task.claimedBy && <span className="truncate">{task.claimedBy}</span>}
+              {duplicateCount !== undefined && duplicateCount > 1 && (
+                <span
+                  className="text-sa-fg3"
+                  title={`${duplicateCount} tasks share this title`}
+                  data-testid="board-task-duplicates"
+                >
+                  ×{duplicateCount}
+                </span>
+              )}
               <span className="text-sa-fg3">{formatRelativeTime(task.updatedAt)}</span>
             </span>
           </span>
@@ -408,11 +440,10 @@ function TaskRow({
               ))}
             </ul>
           )}
-          <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3">
             <Fact label="Difficulty">
               <span className="capitalize">{task.difficulty}</span>
             </Fact>
-            <Fact label="Claimed by">{task.claimedBy ?? "Nobody yet"}</Fact>
             <Fact label="Branch">
               {task.gitBranch ? (
                 <span className="inline-flex items-center gap-1 font-mono text-[12px]">
@@ -533,6 +564,7 @@ export function BoardPanel({ board, agentName, runFor, onRunTask, onViewRun, foc
                           link={link}
                           run={link ? runFor(link.runId) : undefined}
                           initiallyOpen={task.id === focusTaskId}
+                          duplicateCount={group.duplicateCounts[task.id]}
                           onRunTask={onRunTask}
                           onViewRun={onViewRun}
                         />

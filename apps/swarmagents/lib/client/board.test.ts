@@ -21,11 +21,13 @@ import {
   buildTaskPrompt,
   claimBoardTask,
   createBoardTask,
+  displayTaskTitle,
   extractBranchAndPr,
   fetchBoard,
   groupBoardTasks,
   isSafeHttpUrl,
   linkTaskRun,
+  normalizeTaskTitle,
   parseBoardSnapshot,
   prLabel,
   submitBoardTask,
@@ -230,10 +232,10 @@ test("parseBoardSnapshot tolerates a partial body and reads the read-only flag",
 
 test("groups follow the reading order and drop empty statuses", () => {
   const groups = groupBoardTasks([
-    task({ id: "a", status: "completed", updatedAt: 5 }),
-    task({ id: "b", status: "open", updatedAt: 1 }),
-    task({ id: "c", status: "open", updatedAt: 9 }),
-    task({ id: "d", status: "claimed", updatedAt: 3 }),
+    task({ id: "a", title: "Ship the release", status: "completed", updatedAt: 5 }),
+    task({ id: "b", title: "Fix the login redirect", status: "open", updatedAt: 1 }),
+    task({ id: "c", title: "Add dark mode", status: "open", updatedAt: 9 }),
+    task({ id: "d", title: "Write the changelog", status: "claimed", updatedAt: 3 }),
   ]);
   assert.deepEqual(
     groups.map((group) => [group.status, group.tasks.map((t) => t.id)]),
@@ -243,6 +245,42 @@ test("groups follow the reading order and drop empty statuses", () => {
       ["completed", ["a"]],
     ],
   );
+});
+
+test("the board shows one row per title, preferring the copy furthest along", () => {
+  const groups = groupBoardTasks([
+    task({ id: "dup_open", title: "[Router] Automatic per-step model routing", status: "open", updatedAt: 9 }),
+    task({ id: "dup_review", title: "[p2] automatic per-step model routing", status: "in_review", updatedAt: 1 }),
+    task({ id: "dup_done", title: "Automatic   per-step model routing", status: "completed", updatedAt: 2 }),
+    task({ id: "other", title: "Track tool I/O", status: "open", updatedAt: 3 }),
+    task({ id: "other_2", title: "[Cost] Track tool I/O", status: "open", updatedAt: 8 }),
+  ]);
+  const completed = groups.find((group) => group.status === "completed");
+  assert.deepEqual(
+    completed?.tasks.map((t) => t.id),
+    ["dup_done"],
+    "the furthest-along copy stands for all three filings",
+  );
+  assert.equal(completed?.duplicateCounts["dup_done"], 3);
+  const open = groups.find((group) => group.status === "open");
+  assert.deepEqual(
+    open?.tasks.map((t) => t.id),
+    ["other_2"],
+    "the same-status pair collapses to the most recently active copy",
+  );
+  assert.equal(open?.duplicateCounts["other_2"], 2);
+  assert.equal(groups.find((group) => group.status === "in_review"), undefined);
+  assert.equal(groups.flatMap((group) => group.tasks).length, 2, "one row per title across the whole board");
+});
+
+test("display titles drop leading bracket tags and normalize for duplicates", () => {
+  assert.equal(displayTaskTitle("[p2] Fix the login redirect"), "Fix the login redirect");
+  assert.equal(displayTaskTitle("[fix] [auth] Fix the login redirect"), "Fix the login redirect");
+  assert.equal(displayTaskTitle("Fix the login redirect"), "Fix the login redirect");
+  assert.equal(displayTaskTitle("[p2]"), "[p2]", "a title that is only a tag keeps its text");
+  assert.equal(normalizeTaskTitle("[Router]  Automatic   per-step model routing"), "automatic per-step model routing");
+  assert.equal(normalizeTaskTitle("AUTOMATIC PER-STEP MODEL ROUTING"), "automatic per-step model routing");
+  assert.equal(normalizeTaskTitle("Track tool I/O"), "track tool i/o");
 });
 
 test("only http(s) links are links, and a pull URL gets a short label", () => {

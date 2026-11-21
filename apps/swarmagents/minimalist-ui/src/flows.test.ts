@@ -335,7 +335,7 @@ test("Flow C: a board task is run on the VM, then submitted for review with the 
   assert.match(html, new RegExp(`data-task-id="${task.id}"[^>]*data-status="in_review"`));
   assert.match(html, /Fix the login redirect/);
   assert.match(html, />In review</);
-  assert.match(html, /carol@example\.com \(VM\)/);
+  assert.doesNotMatch(html, /carol@example\.com \(VM\)/, "worker names stay off the board rows");
   assert.match(html, /href="https:\/\/github\.com\/acme\/app\/pull\/128"/);
   assert.match(html, /fix\/login-redirect/);
   assert.equal(countOf(html, 'data-testid="board-task-result"'), 1, "the submitted result is on the task");

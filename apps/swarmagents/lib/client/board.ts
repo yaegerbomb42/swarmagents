@@ -320,16 +320,82 @@ export interface BoardGroup {
   status: TaskStatus;
   label: string;
   tasks: SwarmTask[];
+  /**
+   * Task ids that stand for more than one same-titled task, mapped to how
+   * many tasks they collapse. Only ids with a count above 1 are present.
+   */
+  duplicateCounts: Record<string, number>;
 }
 
-/** Group tasks by status (empty groups dropped), newest activity first inside each. */
+/**
+ * The title as a reader sees it: leading bracket tags ([fix], [p2],
+ * [Router]…) are internal labels, not part of what the task is, so they are
+ * dropped. A title that is only tags keeps its original text.
+ */
+export function displayTaskTitle(title: string): string {
+  const stripped = title.replace(/^(?:\s*\[[^\]\n]+\])+\s*/, "").trim();
+  return stripped || title.trim() || title;
+}
+
+/** The key two titles share when they name the same task: display form, folded case, one space. */
+export function normalizeTaskTitle(title: string): string {
+  const folded = displayTaskTitle(title).toLowerCase().replace(/\s+/g, " ").trim();
+  return folded || title.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * How far along a status is, for picking which copy of a duplicated title
+ * the board shows: work that was submitted or finished outranks work that
+ * merely started, and a stalled task outranks one nobody picked up.
+ */
+const STATUS_PROGRESS: Record<TaskStatus, number> = {
+  open: 0,
+  claimed: 1,
+  blocked: 2,
+  in_review: 3,
+  completed: 4,
+};
+
+/**
+ * Group tasks by status (empty groups dropped), newest activity first inside
+ * each. Tasks that share a normalized title collapse to one row — the copy
+ * furthest along (then the most recently active) — so the same task filed
+ * twice reads once. Display only: the task list itself is untouched, and the
+ * collapsed count is reported per group in `duplicateCounts`.
+ */
 export function groupBoardTasks(tasks: readonly SwarmTask[]): BoardGroup[] {
+  const byTitle = new Map<string, SwarmTask[]>();
+  for (const task of tasks) {
+    const key = normalizeTaskTitle(task.title);
+    const bucket = byTitle.get(key);
+    if (bucket) bucket.push(task);
+    else byTitle.set(key, [task]);
+  }
+  const representatives: SwarmTask[] = [];
+  const collapsed: Record<string, number> = {};
+  for (const bucket of byTitle.values()) {
+    bucket.sort(
+      (a, b) =>
+        STATUS_PROGRESS[b.status] - STATUS_PROGRESS[a.status] ||
+        b.updatedAt - a.updatedAt ||
+        a.id.localeCompare(b.id),
+    );
+    const representative = bucket[0];
+    representatives.push(representative);
+    if (bucket.length > 1) collapsed[representative.id] = bucket.length;
+  }
   const groups: BoardGroup[] = [];
   for (const status of BOARD_GROUP_ORDER) {
-    const members = tasks
+    const members = representatives
       .filter((task) => task.status === status)
       .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
-    if (members.length > 0) groups.push({ status, label: TASK_STATUS_META[status].label, tasks: members });
+    if (members.length === 0) continue;
+    const duplicateCounts: Record<string, number> = {};
+    for (const task of members) {
+      const count = collapsed[task.id];
+      if (count !== undefined) duplicateCounts[task.id] = count;
+    }
+    groups.push({ status, label: TASK_STATUS_META[status].label, tasks: members, duplicateCounts });
   }
   return groups;
 }

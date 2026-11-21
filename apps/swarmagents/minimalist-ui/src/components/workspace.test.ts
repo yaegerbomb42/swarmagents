@@ -507,11 +507,11 @@ test("a run started from a board task points back to the task", async () => {
 
 // ---- Flow C: the board ----
 
-test("the board lists each task with its status, who claimed it, and its pull request", async () => {
+test("the board lists each task with its status and its pull request, without worker names or bracket tags", async () => {
   const { BoardPanel } = await load();
   const tasks = [
     makeTask({ id: "t_open", title: "Add dark mode", status: "open" }),
-    makeTask({ id: "t_claimed", title: "Fix the login redirect", status: "claimed", claimedBy: "alice@example.com (VM)" }),
+    makeTask({ id: "t_claimed", title: "[p2] Fix the login redirect", status: "claimed", claimedBy: "alice@example.com (VM)" }),
     makeTask({
       id: "t_review",
       title: "Write the changelog",
@@ -541,14 +541,35 @@ test("the board lists each task with its status, who claimed it, and its pull re
   assert.match(html, /data-task-id="t_claimed"[^>]*data-status="claimed"/);
   assert.match(html, />In progress</);
   assert.match(html, />In review</);
-  assert.match(html, /alice@example\.com \(VM\)/);
-  assert.match(html, /bob \(VM\)/);
+  assert.doesNotMatch(html, /alice@example\.com \(VM\)/, "worker names stay off the rows");
+  assert.doesNotMatch(html, /bob \(VM\)/, "worker names stay off the rows");
+  assert.doesNotMatch(html, /\[p2\]/, "bracket tags stay off the rows");
   assert.match(html, /href="https:\/\/github\.com\/acme\/app\/pull\/128"/);
   assert.match(html, /PR #128/);
   assert.match(html, /target="_blank" rel="noreferrer noopener"/);
   // Open tasks can be run; my claimed task can be run again; someone else's cannot.
   assert.equal(countOf(html, 'data-testid="board-run"'), 2);
   assert.equal(countOf(html, 'data-testid="board-add-input"'), 1, "adding a task is always in reach");
+});
+
+test("the board shows a duplicated title once, with its count", async () => {
+  const { BoardPanel } = await load();
+  const html = renderToStaticMarkup(
+    h(BoardPanel, {
+      board: makeBoard([
+        makeTask({ id: "d1", title: "[Router] Automatic per-step model routing", status: "open", updatedAt: 1 }),
+        makeTask({ id: "d2", title: "automatic per-step model routing", status: "open", updatedAt: 2 }),
+      ]),
+      agentName: "alice (VM)",
+      runFor: () => undefined,
+      onRunTask: async () => undefined,
+      onViewRun: noop,
+    }),
+  );
+  assert.equal(countOf(html, 'data-testid="board-task"'), 1, "the same title reads once");
+  assert.equal(countOf(html, 'data-testid="board-task-duplicates"'), 1);
+  assert.match(html, /×2/);
+  assert.doesNotMatch(html, /\[Router\]/);
 });
 
 test("a link that is not http(s) is never rendered as a link", async () => {
@@ -637,6 +658,11 @@ test("the board handles loading, empty, failed and read-only states", async () =
 
   const readOnly = renderToStaticMarkup(h(BoardPanel, { ...props, board: makeBoard([], { writable: false }) }));
   assert.equal(countOf(readOnly, 'data-testid="board-readonly"'), 1);
+  assert.equal(countOf(readOnly, 'data-testid="board-add-readonly-hint"'), 1, "the disabled Add button says why");
+  assert.match(readOnly, /Task creation is disabled/);
+  const addButton = readOnly.match(/<button[^>]*data-testid="board-add-submit"[^>]*>/);
+  assert.ok(addButton, "the Add task button renders");
+  assert.match(addButton[0], /disabled/, "the Add task button is disabled while the board is read-only");
 });
 
 // ---- History and settings ----

@@ -365,6 +365,15 @@ test("restart: run with a recorded resume point resumes from its checkpoint", as
       stateStore: new RunStateStore({ filePath: stateB }),
     });
 
+    // The restart itself must leave the pending approval pending: check
+    // synchronously, before any await lets the fast resumed run finish
+    // (finalize() legitimately expires leftover approvals at run end, so
+    // a later read would see "expired" even though the restart preserved
+    // it — that is the run-end cleanup, not a restart expiry).
+    const recovered = approvalStoreB.get(pending.id);
+    assert.ok(recovered, "approval record should survive the restart");
+    assert.equal(recovered.status, "pending");
+
     // The resumed run continued its recorded session instead of re-running
     // the prompt: the claude argv carries --resume + the session id. The
     // restore runs before the spawn, so by the first call it has happened.
@@ -378,11 +387,6 @@ test("restart: run with a recorded resume point resumes from its checkpoint", as
     const resumed = getRun(active.runId, runsDir);
     assert.ok(resumed);
     assert.notEqual(resumed.summary.status, "error");
-
-    // The pending approval survived the restart still pending.
-    const recovered = approvalStoreB.get(pending.id);
-    assert.ok(recovered, "approval record should survive the restart");
-    assert.equal(recovered.status, "pending");
 
     // Both the resumed run and the queued follow-up finish.
     const runs = await waitFor(
@@ -489,6 +493,11 @@ test("graceful shutdown suspends a checkpointed run instead of cancelling it", a
       stateStore: new RunStateStore({ filePath: stateB }),
     });
 
+    // Same synchronous check as the restart test: the shutdown + restart
+    // preserved the approval pending; the run finishing later expires it
+    // via finalize(), which is the run-end cleanup, not a restart expiry.
+    assert.equal(approvalStoreB.get(pending.id)?.status, "pending");
+
     await waitForCalls(driverB, 1);
     assert.deepEqual(driverB.restores, [vmLabel]);
     const resumedCall = driverB.calls.find((cmd) => cmd.includes("--resume"));
@@ -500,7 +509,6 @@ test("graceful shutdown suspends a checkpointed run instead of cancelling it", a
       (all) => all.length > 0 && all.every((run) => run.status !== "running" && run.status !== "queued"),
     );
     assert.equal(runs.find((run) => run.runId === active.runId)?.status, "finished");
-    assert.equal(approvalStoreB.get(pending.id)?.status, "pending");
   } finally {
     managerA?.cancel("alice");
     managerB?.cancel("alice");

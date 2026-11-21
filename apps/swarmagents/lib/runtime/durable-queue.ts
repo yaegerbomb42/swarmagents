@@ -76,6 +76,8 @@ export interface PersistedQueuedRun {
   compute?: RunCompute;
   fullAuto?: boolean;
   runMode?: RunModeInfo;
+  /** Recorded resume point, when this queued run resumes from a checkpoint. */
+  resumePoint?: ResumePoint;
   createdAt: number;
 }
 
@@ -238,11 +240,13 @@ function normalizeQueued(value: unknown): PersistedQueuedRun | null {
   if (!isRecord(value)) return null;
   const common = normalizeCommon(value);
   if (!common) return null;
+  const resumePoint = normalizeResumePoint(value.resumePoint);
   return {
     ...common,
     ...(str(value.projectContext, MAX_PROMPT_LEN)
       ? { projectContext: str(value.projectContext, MAX_PROMPT_LEN) }
       : {}),
+    ...(resumePoint ? { resumePoint } : {}),
   };
 }
 

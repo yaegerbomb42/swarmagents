@@ -23,6 +23,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { sha256Hex } from "../library/proof";
 import type { SequencedEvent } from "../telemetry/bus";
 import { getRunsDir } from "../telemetry/paths";
 import { DESKTOP_DISPLAY } from "../vm/docker-driver";
@@ -387,6 +388,46 @@ export function diffWorkspaceLists(
   }
   artifacts.sort((a, b) => a.rel.localeCompare(b.rel));
   return artifacts;
+}
+
+/**
+ * Hash each artifact's contents at report-build time (receipt).
+ *
+ * Reads the live file from the VM via `readFileBytes`, capped at `maxBytes`
+ * (default `MAX_ARTIFACT_DOWNLOAD_BYTES`, the same cap as artifact
+ * downloads). A file that is gone between listing and read — or larger than
+ * the cap — is recorded explicitly as `sha256: null, status: "missing"`,
+ * never silently omitted. Never throws: every per-file failure degrades to
+ * a missing marker so hashing can never fail the report or the run.
+ */
+export async function hashArtifacts(
+  vm: VmManager,
+  userId: string,
+  artifacts: readonly ReportArtifact[],
+  maxBytes: number = MAX_ARTIFACT_DOWNLOAD_BYTES,
+): Promise<ReportArtifact[]> {
+  return Promise.all(
+    artifacts.map(async (artifact) => {
+      if (artifact.size > maxBytes) {
+        console.warn(
+          `[run-report] skipping hash for ${artifact.rel}: ${artifact.size} bytes exceeds the ${maxBytes} byte cap`,
+        );
+        return { ...artifact, sha256: null, status: "missing" as const };
+      }
+      try {
+        const file = await vm.readFileBytes(userId, artifact.path, maxBytes);
+        if (file.truncated) {
+          console.warn(
+            `[run-report] skipping hash for ${artifact.rel}: file grew past the ${maxBytes} byte cap`,
+          );
+          return { ...artifact, sha256: null, status: "missing" as const };
+        }
+        return { ...artifact, sha256: sha256Hex(file.content), status: "present" as const };
+      } catch {
+        return { ...artifact, sha256: null, status: "missing" as const };
+      }
+    }),
+  );
 }
 
 /** Tool names that write a file (their input carries the path). */

@@ -41,6 +41,8 @@ export interface ReportShotMeta {
   size: number;
 }
 
+import type { RunReceipt } from "./run-receipt";
+
 /** A file the agent created or modified under /workspace during the run. */
 export interface ReportArtifact {
   /** Absolute path inside the VM. */
@@ -53,6 +55,20 @@ export interface ReportArtifact {
   mtimeMs: number;
   /** Whether the file did not exist at run start. */
   change: "created" | "modified";
+  /**
+   * SHA-256 hex of the file's contents at report-build time (receipt).
+   * `null` means the contents could not be hashed — the file was gone by
+   * hash time, or it exceeded the hash cap (see `status`). Undefined on
+   * reports written before artifact hashing existed.
+   */
+  sha256?: string | null;
+  /**
+   * Whether the file's contents were present when hashed. `sha256: null`
+   * with `status: "missing"` means the file was gone at hash time (created
+   * then deleted mid-run, or larger than the hash cap) — recorded
+   * explicitly, never silently omitted from the report.
+   */
+  status?: "present" | "missing";
 }
 
 /** Compact summary shown on the report card without fetching the full report. */
@@ -147,4 +163,12 @@ export interface RunReport {
    * into the report by the serving route).
    */
   verification?: RunVerificationMeta;
+  /**
+   * Tamper-evident audit receipt: hash chain over the prompt, approvals,
+   * attestations, redacted command logs and artifact hashes, signed with
+   * the server secret when one is configured. Attached by the reporter at
+   * finalize time; absent on reports written before receipts existed, or
+   * when receipt-building failed (the run never fails for it).
+   */
+  receipt?: RunReceipt;
 }

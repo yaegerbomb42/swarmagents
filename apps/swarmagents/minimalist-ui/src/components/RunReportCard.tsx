@@ -19,6 +19,7 @@ import {
   ChevronRight,
   ChevronUp,
   Download,
+  Loader2,
   Play,
   StopCircle,
 } from "lucide-react";
@@ -82,6 +83,10 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
   const [expanded, setExpanded] = useState(false);
   const [shotIndex, setShotIndex] = useState(0);
   const [attempts, setAttempts] = useState(0);
+  // Receipt verification: never show a pass badge without server verification.
+  const [receiptStatus, setReceiptStatus] = useState<"idle" | "loading" | "verified" | "failed">("idle");
+  const [receiptLinks, setReceiptLinks] = useState(0);
+  const [receiptFailedLink, setReceiptFailedLink] = useState<number | undefined>(undefined);
 
   const load = useCallback(
     async (signal?: AbortSignal) => {
@@ -95,6 +100,8 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
         if (signal?.aborted) return;
         setLoadedMeta(body.meta);
         setReport(body);
+        setReceiptStatus("idle");
+        setReceiptFailedLink(undefined);
         setAttempts(0);
       } catch {
         // The next poll tries again; after the last one the card says so.
@@ -119,6 +126,43 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
   useEffect(() => {
     setShotIndex(0);
   }, [expanded]);
+
+  // Verify the stored receipt server-side once the report is loaded. The
+  // badge only ever shows a pass after this endpoint confirms it, and only
+  // when the shadow-verifier gate passed too.
+  useEffect(() => {
+    if (!report?.receipt) return;
+    if (!report.verification?.passed) return;
+    if (receiptStatus !== "idle") return;
+    const ctrl = new AbortController();
+    setReceiptStatus("loading");
+    void fetch(`/api/runtime/runs/${encodeURIComponent(report.runId)}/report/receipt/verify`, {
+      method: "POST",
+      signal: ctrl.signal,
+      cache: "no-store",
+    })
+      .then(async (res) => {
+        if (!res.ok || ctrl.signal.aborted) {
+          if (!ctrl.signal.aborted) setReceiptStatus("failed");
+          return;
+        }
+        const body = (await res.json()) as { ok?: boolean; failedLink?: number };
+        if (ctrl.signal.aborted) return;
+        if (body.ok) {
+          setReceiptLinks(report.receipt?.links.length ?? 0);
+          setReceiptStatus("verified");
+        } else {
+          setReceiptFailedLink(body.failedLink);
+          setReceiptStatus("failed");
+        }
+      })
+      .catch(() => {
+        if (!ctrl.signal.aborted) setReceiptStatus("failed");
+      });
+    return () => {
+      ctrl.abort();
+    };
+  }, [report, receiptStatus]);
 
   const shots = report?.shots ?? [];
   useEffect(() => {
@@ -196,6 +240,55 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
                   }
                   detail={report.verification.violations.length > 0 ? report.verification.violations.join("; ") : undefined}
                 />
+              )}
+
+              {/* Audit receipt: only when verification passed, and only a
+                  server-verified pass ever shows as verified. */}
+              {report.receipt && report.verification?.passed && (
+                <div
+                  className={`flex items-start gap-2 rounded-lg border px-2.5 py-2 ${
+                    receiptStatus === "verified"
+                      ? "border-sa-ok/30 bg-sa-ok/5"
+                      : receiptStatus === "failed"
+                        ? "border-sa-warn/30 bg-sa-warn/5"
+                        : "border-sa-line bg-sa-panel"
+                  }`}
+                >
+                  {receiptStatus === "verified" ? (
+                    <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sa-ok" />
+                  ) : receiptStatus === "failed" ? (
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sa-warn" />
+                  ) : (
+                    <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-sa-fg3" />
+                  )}
+                  <div className="min-w-0">
+                    <p
+                      className={`text-[11px] font-medium ${
+                        receiptStatus === "verified"
+                          ? "text-sa-ok"
+                          : receiptStatus === "failed"
+                            ? "text-sa-warn"
+                            : "text-sa-fg3"
+                      }`}
+                    >
+                      {receiptStatus === "verified"
+                        ? `Receipt verified · ${receiptLinks} links`
+                        : receiptStatus === "failed"
+                          ? "Receipt verification failed"
+                          : "Verifying receipt…"}
+                    </p>
+                    {receiptStatus === "failed" && receiptFailedLink !== undefined && (
+                      <p className="mt-1 text-[11px] leading-relaxed text-sa-fg2">
+                        Chain link {receiptFailedLink} does not re-derive.
+                      </p>
+                    )}
+                    {receiptStatus === "failed" && receiptFailedLink === undefined && (
+                      <p className="mt-1 text-[11px] leading-relaxed text-sa-fg2">
+                        The stored receipt did not verify (chain or signature).
+                      </p>
+                    )}
+                  </div>
+                </div>
               )}
 
               {shots.length > 0 && (

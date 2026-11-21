@@ -35,6 +35,17 @@ export interface ForkInfo {
 }
 
 /**
+ * Resume point recorded at an auto-checkpoint so a server restart can restore
+ * and resume the run safely without repeating mutating side effects.
+ */
+export interface ResumePoint {
+  runId: string;
+  checkpointLabel: string;
+  stepSeq: number;
+  sessionId?: string;
+}
+
+/**
  * Result of one auto-checkpoint attempt. The hook contract is outcome-based,
  * never throw-based: a snapshot failure is returned as `{ok:false}` so the
  * run continues and the failure surfaces in telemetry as checkpoint.failed

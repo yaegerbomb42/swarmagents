@@ -10,6 +10,7 @@ import { appendRunEvent, listRunLogs, readRunEvents } from "../telemetry/run-log
 import { readReportMeta } from "./run-report";
 import { readRunSummary, updateRunIndex } from "./run-index";
 import { summarizeRun, type StoredRunSummary } from "./run-summary";
+import type { ResumePoint } from "./checkpoints";
 
 export type { StoredRunStatus, StoredRunSummary } from "./run-summary";
 export { summarizeRun } from "./run-summary";
@@ -271,6 +272,7 @@ export function recoverRunOnRestart(
     prompt?: string;
     compute?: unknown;
     createdAt?: number;
+    resumePoint?: ResumePoint;
   } = {},
 ): boolean {
   const runsDir = options.runsDir === undefined ? getRunsDir() : options.runsDir;

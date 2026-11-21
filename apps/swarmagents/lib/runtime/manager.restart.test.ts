@@ -217,3 +217,59 @@ test("graceful shutdown preserves the queue instead of cancelling it", async () 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("auto-checkpoint records and persists the resume point in runtime state", async () => {
+  const dir = tmpDir();
+  const runsDir = path.join(dir, "runs");
+  const stateFile = path.join(dir, "state-checkpoint.json");
+  configureRunsDir(runsDir);
+  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
+  let manager: RuntimeManager | undefined;
+
+  try {
+    const driver = new BlockingVmDriver();
+    const store = new RunStateStore({ filePath: stateFile });
+    manager = new RuntimeManager({
+      vm: new VmManager({ customDriver: driver }),
+      bus,
+      router: null,
+      stateStore: store,
+    });
+
+    const active = manager.start("alice", {
+      prompt: "do risky work with checkpoints",
+      sessionId: "sess_resume_test",
+      fullAuto: true,
+    });
+    assert.equal(active.accepted, true);
+
+    await waitForCalls(driver, 1);
+
+    // Initial persisted state has no resumePoint yet
+    const snapshotBefore = store.load();
+    assert.equal(snapshotBefore.users.alice?.active?.runId, active.runId);
+    assert.equal(snapshotBefore.users.alice?.active?.resumePoint, undefined);
+
+    // Trigger an ask-level approval in full-auto mode -> takeAutoCheckpoint fires
+    const verdict = await manager.requestToolApproval(
+      "alice",
+      active.runId,
+      "Bash",
+      { command: "sudo apt-get install -y jq" },
+    );
+    assert.equal(verdict.decision, "allow");
+
+    // The persisted state must now carry the resume point
+    const snapshotAfter = store.load();
+    assert.equal(snapshotAfter.users.alice?.active?.runId, active.runId);
+    assert.ok(snapshotAfter.users.alice?.active?.resumePoint);
+    assert.equal(snapshotAfter.users.alice.active.resumePoint.runId, active.runId);
+    assert.match(snapshotAfter.users.alice.active.resumePoint.checkpointLabel, /^auto-pre-step-\d+$/);
+    assert.ok(snapshotAfter.users.alice.active.resumePoint.stepSeq > 0);
+    assert.equal(snapshotAfter.users.alice.active.resumePoint.sessionId, "sess_resume_test");
+  } finally {
+    manager?.cancel("alice");
+    configureRunsDir(null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

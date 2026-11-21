@@ -26,6 +26,7 @@ import { getStoragePaths } from "../board/store";
 import type { RunCompute } from "../computers/compute";
 import type { RunModeInfo } from "../providers/capabilities";
 import type { RoleDefinition, RunRolePolicy } from "../roles";
+import type { ResumePoint } from "./checkpoints";
 
 export const RUNTIME_STATE_SCHEMA = "swarm-runtime-state";
 export const RUNTIME_STATE_VERSION = 1;
@@ -56,6 +57,8 @@ export interface PersistedActiveRun {
   runMode?: RunModeInfo;
   createdAt: number;
   startedAt?: number;
+  /** Recorded resume point from the run's latest auto-checkpoint. */
+  resumePoint?: ResumePoint;
 }
 
 /** A prompt waiting behind the active run; everything startNext() needs. */
@@ -203,14 +206,31 @@ function normalizeCommon(record: Record<string, unknown>):
   };
 }
 
+function normalizeResumePoint(value: unknown): ResumePoint | undefined {
+  if (!isRecord(value)) return undefined;
+  const runId = str(value.runId, 64);
+  const checkpointLabel = str(value.checkpointLabel, 64);
+  const stepSeq = finiteNumber(value.stepSeq);
+  if (!runId || !checkpointLabel || stepSeq === undefined || stepSeq <= 0) return undefined;
+  const sessionId = str(value.sessionId, 128);
+  return {
+    runId,
+    checkpointLabel,
+    stepSeq,
+    ...(sessionId ? { sessionId } : {}),
+  };
+}
+
 function normalizeActive(value: unknown): PersistedActiveRun | null {
   if (!isRecord(value)) return null;
   const common = normalizeCommon(value);
   if (!common) return null;
+  const resumePoint = normalizeResumePoint(value.resumePoint);
   return {
     ...common,
     ...(str(value.contextPrefix, MAX_PROMPT_LEN) ? { contextPrefix: str(value.contextPrefix, MAX_PROMPT_LEN) } : {}),
     ...(finiteNumber(value.startedAt) !== undefined ? { startedAt: finiteNumber(value.startedAt) } : {}),
+    ...(resumePoint ? { resumePoint } : {}),
   };
 }
 

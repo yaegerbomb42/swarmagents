@@ -172,3 +172,16 @@ test("two concurrent lanes of one run checkpointing the same step do not collide
   // The normal-run (fork) path keeps its old label so existing forks still resolve.
   assert.equal(checkpointVmLabel(RUN_ID, 1), `${RUN_ID}-auto-pre-step-1`);
 });
+
+test("ResumePoint round-trips with runId, checkpointLabel, stepSeq and sessionId", () => {
+  const pt = {
+    runId: RUN_ID,
+    checkpointLabel: checkpointDisplayLabel(5),
+    stepSeq: 5,
+    sessionId: "sess_123",
+  };
+  assert.equal(pt.runId, RUN_ID);
+  assert.equal(pt.checkpointLabel, "auto-pre-step-5");
+  assert.equal(pt.stepSeq, 5);
+  assert.equal(pt.sessionId, "sess_123");
+});

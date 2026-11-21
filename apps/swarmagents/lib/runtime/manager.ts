@@ -61,6 +61,7 @@ import {
   takeRunCheckpoint,
   type CheckpointOutcome,
   type ForkInfo,
+  type ResumePoint,
 } from "./checkpoints";
 import { requestRegisteredApproval } from "./tool-approval-bridge";
 import { getQuestionStore, type QuestionOutcome } from "../harness/questions";
@@ -336,6 +337,8 @@ interface ActiveRun {
   seedSnapshotLabel?: string;
   /** F1 fork provenance: the run + checkpoint this run was forked from. */
   forkedFrom?: ForkInfo;
+  /** Latest recorded resume point for this run (from auto-checkpoint). */
+  resumePoint?: ResumePoint;
 }
 
 /** A one-shot terminal command run (POST /api/runtime/vm/exec). */
@@ -760,6 +763,7 @@ export class RuntimeManager {
       ...(active.runMode ? { runMode: active.runMode } : {}),
       createdAt: active.createdAt,
       ...(active.startedAt !== undefined ? { startedAt: active.startedAt } : {}),
+      ...(active.resumePoint ? { resumePoint: active.resumePoint } : {}),
     };
   }
 
@@ -856,6 +860,7 @@ export class RuntimeManager {
             prompt: row.active.prompt,
             compute: row.active.compute,
             createdAt: row.active.createdAt,
+            resumePoint: row.active.resumePoint,
           });
         } catch (error) {
           console.error(`[runtime] could not finalize interrupted run ${row.active.runId}:`, error);
@@ -1618,11 +1623,24 @@ export class RuntimeManager {
    * publish to this manager's bus.
    */
   private async takeAutoCheckpoint(userId: string, runId: string): Promise<CheckpointOutcome> {
-    return takeRunCheckpoint(
+    const outcome = await takeRunCheckpoint(
       (vmLabel) => this.vm.snapshotDuringRun(userId, vmLabel),
       runId,
       this.bus.latestSeq(runId) + 1,
     );
+    if (outcome.ok) {
+      const active = this.users.get(userId)?.active;
+      if (active && active.runId === runId) {
+        active.resumePoint = {
+          runId,
+          checkpointLabel: outcome.label,
+          stepSeq: outcome.stepSeq,
+          ...(active.sessionId ? { sessionId: active.sessionId } : {}),
+        };
+        this.persistState();
+      }
+    }
+    return outcome;
   }
 
   /**

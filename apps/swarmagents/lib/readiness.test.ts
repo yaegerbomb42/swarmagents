@@ -13,6 +13,11 @@ import {
 
 let tempDir: string;
 
+// Root bypasses filesystem permission bits, so a chmod-based read-only
+// directory cannot enforce a non-writable HOME when running as root. Tests
+// that depend on that condition skip with a stated reason under root.
+const IS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
+
 test.beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "swarm-readiness-"));
 });
@@ -103,7 +108,7 @@ test("SWARM_HOME pointing at a file is not writable", async () => {
   assertNoOperatorDetail(publicReport);
 });
 
-test("a read-only home directory reports HOME_NOT_WRITABLE", async () => {
+test("a read-only home directory reports HOME_NOT_WRITABLE", { skip: IS_ROOT ? "root bypasses fs permission bits; a read-only HOME cannot be constructed as root" : false }, async () => {
   const dir = join(tempDir, "read-only");
   mkdirSync(dir, { mode: 0o500 });
   chmodSync(dir, 0o500);
@@ -116,7 +121,7 @@ test("a read-only home directory reports HOME_NOT_WRITABLE", async () => {
   assertNoOperatorDetail(publicReport);
 });
 
-test("a missing home that cannot be created reports HOME_MISSING", async () => {
+test("a missing home that cannot be created reports HOME_MISSING", { skip: IS_ROOT ? "root bypasses fs permission bits; an uncreatable HOME cannot be constructed as root" : false }, async () => {
   const readOnlyParent = join(tempDir, "read-only-parent");
   mkdirSync(readOnlyParent, { mode: 0o500 });
   chmodSync(readOnlyParent, 0o500);

@@ -520,26 +520,58 @@ test("bridge: a view client sending an unknown RFB type terminates the bridge wi
   assert.equal(closeOut!.readUInt16BE(2), 1002);
 });
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Poll until the bridge has closed with `reason`, failing if `timeoutMs`
+ * elapses first. This is retry-tolerant: a loaded box may delay timers, but
+ * the property being asserted (the bridge must eventually close with the given
+ * reason) is unchanged.
+ */
+async function waitUntilClosed(h: Harness, reason: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (h.closes.includes(reason)) return;
+    await sleep(10);
+  }
+  throw new Error(`expected bridge to close with "${reason}"; closes=${JSON.stringify(h.closes)}`);
+}
+
 test("bridge: missed keepalive pong fails the bridge (ping-timeout)", async () => {
   const h = makeBridge("view", { pingIntervalMs: 20 });
   handshake(h);
-  await new Promise((r) => setTimeout(r, 90));
-  assert.ok(h.closes.includes("ping-timeout"), `expected ping-timeout, got ${JSON.stringify(h.closes)}`);
+  // No pong is ever answered: the watchdog must fire within a generous budget,
+  // regardless of scheduler delays on a loaded box.
+  await waitUntilClosed(h, "ping-timeout", 3000);
   assert.ok(h.client.destroyed && h.upstream.destroyed);
 });
 
 test("bridge: a pong resets the keepalive watchdog", async () => {
-  const h = makeBridge("view", { pingIntervalMs: 50 });
+  const h = makeBridge("view", { pingIntervalMs: 40 });
   handshake(h);
-  // First tick (50ms) sent pings and is awaiting a pong; answer from the browser.
-  await new Promise((r) => setTimeout(r, 70));
-  h.client.feed(encodeClientFrame(OP_PONG, Buffer.alloc(0)));
-  // Second tick (100ms) must not fail: the pong reset the flag.
-  await new Promise((r) => setTimeout(r, 50));
-  assert.equal(h.closes.length, 0, "pong reset the watchdog, no failure at the second tick");
-  // Third tick (150ms) with no further pong: the watchdog fires.
-  await new Promise((r) => setTimeout(r, 60));
-  assert.ok(h.closes.includes("ping-timeout"), "watchdog still fires once pongs stop");
+
+  const respondWithPong = () => h.client.feed(encodeClientFrame(OP_PONG, Buffer.alloc(0)));
+
+  // Answer every ping with a pong across several ticks: the watchdog must stay
+  // quiet (no ping-timeout) the entire time. Event-driven, so a slow machine
+  // cannot skew a fixed-sleep schedule into a false failure.
+  let answered = 0;
+  const answeringDeadline = Date.now() + 2500;
+  while (Date.now() < answeringDeadline) {
+    const msgs = h.toClient.read();
+    const pings = msgs.filter((m) => m.opcode === OP_PING).length;
+    if (pings > 0) {
+      for (let i = 0; i < pings; i += 1) respondWithPong();
+      answered += pings;
+      if (answered >= 4) break;
+    }
+    assert.equal(h.closes.length, 0, "watchdog must not fire while pongs are answered");
+    await sleep(5);
+  }
+  assert.ok(answered >= 4, `expected to answer >=4 pings, got ${answered}`);
+
+  // Stop answering: the next missed pong must fail the bridge.
+  await waitUntilClosed(h, "ping-timeout", 3000);
 });
 
 test("bridge: browser backpressure resumes upstream on drain below 8 MB", () => {

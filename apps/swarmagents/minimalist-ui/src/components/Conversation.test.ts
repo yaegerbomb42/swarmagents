@@ -54,6 +54,7 @@ test("clicking a starter is wired to send its text", async () => {
   assert.equal(sent, undefined, "send is not invoked during a static render");
 });
 
+<<<<<<< HEAD
 function cssRule(selector: string): string {
   const css = readFileSync(fileURLToPath(new URL("../../../app/globals.css", import.meta.url)), "utf8");
   const start = css.indexOf(`\n${selector} {`);
@@ -110,4 +111,9 @@ test("tool detail code blocks size to content and cap long output", async () => 
       "no fixed or minimum height pads a short block with empty space",
     );
   }
+});
+
+test("the Latest pill is hidden while the view is stuck at the bottom", async () => {
+  const html = await renderConversation(makeSession({ turns: [] }));
+  assert.equal(countOf(html, 'data-testid="jump-to-latest"'), 0, "no jump-to-latest pill while stuck at the bottom");
 });

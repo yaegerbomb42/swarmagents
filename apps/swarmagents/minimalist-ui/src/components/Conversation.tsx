@@ -703,7 +703,7 @@ export function Conversation({
           type="button"
           data-testid="jump-to-latest"
           onClick={jumpToLatest}
-          className="sa-fade absolute bottom-3 left-1/2 z-10 inline-flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border border-sa-line-strong bg-sa-raised px-3 text-[13px] font-medium text-sa-fg shadow-lg transition-colors hover:bg-sa-hover"
+          className="mx-auto sa-fade inline-flex h-9 items-center justify-center gap-1.5 rounded-full border border-sa-line-strong bg-sa-raised px-3.5 py-1.5 text-[13px] font-medium text-sa-fg shadow-sm transition-colors hover:bg-sa-hover"
         >
           <ArrowDown className="h-3.5 w-3.5" aria-hidden />
           Latest

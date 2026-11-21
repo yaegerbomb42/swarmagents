@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatModified } from "./FilesView";
+import { describeBinaryPreview, describeTruncatedPreview, formatModified } from "./FilesView";
 
 // PST (UTC-8) in November has no DST, so the expected value is stable.
 process.env.TZ = "America/Los_Angeles";
@@ -32,4 +32,12 @@ test("formatModified uses local getters, not UTC getters", () => {
     d.getDate(),
   ).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   assert.equal(formatModified(ts), expected);
+});
+
+test("file preview notices explain unsupported types and size limits plainly", () => {
+  assert.equal(describeBinaryPreview(1200), "This file type can’t be previewed here. File size: 1.2 KB.");
+  assert.equal(
+    describeTruncatedPreview(1024, 4096),
+    "Only the first 1.0 KB of 4.0 KB is shown. Download the file to see the rest.",
+  );
 });

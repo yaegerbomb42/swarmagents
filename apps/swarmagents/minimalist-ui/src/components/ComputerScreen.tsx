@@ -292,16 +292,16 @@ export function StreamRow({ item }: { item: RunStreamItem }) {
       );
     }
     case "vm.starting": {
-      return <SystemLine text="vm starting · booting isolated linux sandbox" />;
+      return <SystemLine text="Starting a separate Linux computer for this run…" />;
     }
     case "vm.ready": {
       const d = item.data as { ms?: number; durationMs?: number } | null;
       const ms = d?.ms ?? d?.durationMs;
-      return <SystemLine text={`vm ready${ms != null ? ` · ${ms}ms` : ""}`} />;
+      return <SystemLine text={`Computer ready${ms != null ? ` · ${ms}ms` : ""}`} />;
     }
     case "vm.error": {
       const d = item.data as { message?: string } | null;
-      return <SystemLine text={`vm error · ${d?.message ?? "unknown"}`} tone="error" />;
+      return <SystemLine text={`Could not start the computer · ${d?.message ?? "unknown"}`} tone="error" />;
     }
     case "approval.required": {
       const raw = typeof payload.approval === "object" && payload.approval !== null ? (payload.approval as Record<string, unknown>) : {};
@@ -440,7 +440,7 @@ export function ComputerScreen({
     0,
   );
 
-  // VM status pill: the run stream's vm.* telemetry (immediate while a
+  // VM status pill: the run stream's vm.* updates (immediate while a
   // run is live) plus the polled VM state, which is the only signal that
   // sees idle hibernation. The mapping lives in lib/client/vmStatus.
   const latestVmError = [...stream.items]
@@ -639,7 +639,7 @@ export function ComputerScreen({
               title={vmDisplay.tooltip}
             >
               <span className={`h-1.5 w-1.5 rounded-full ${vmStatusStyle.dot}`} />
-              agent-vm-01
+              Computer
               <span className="uppercase tracking-[0.08em] opacity-80">{vmDisplay.label}</span>
             </span>
             <span className="hidden truncate text-[11px] font-mono text-white/40 md:inline">
@@ -683,8 +683,8 @@ export function ComputerScreen({
 
         {/* Right-aligned cwd — truncates with the full path in a tooltip */}
         <div className="flex min-w-0 max-w-[150px] items-center justify-end text-[11px] font-mono text-white/40">
-          <span className="truncate text-right" title="/data/workspace">
-            /data/workspace
+          <span className="truncate text-right" title="Your workspace">
+            Your workspace
           </span>
           {streamBadge && (
             <span

@@ -94,7 +94,7 @@ test("internal kinds render human labels, never the raw kind", async () => {
   assert.ok(!llm.includes("llm.call"), "raw kind never rendered");
 });
 
-test("the terminal header no longer carries the sandbox line", async () => {
+test("the terminal header has no extra environment banner", async () => {
   const { ComputerScreen } = await load();
   const markup = renderToStaticMarkup(
     h(ComputerScreen, {
@@ -106,5 +106,12 @@ test("the terminal header no longer carries the sandbox line", async () => {
       activeRoleName: "test",
     }),
   );
-  assert.ok(!markup.includes("Isolated User Sandbox"), "sandbox line removed");
+  assert.ok(!markup.includes("Isolated User Sandbox"), "no environment banner is rendered");
+});
+
+test("computer startup status uses plain words", async () => {
+  const { StreamRow } = await load();
+  const markup = renderToStaticMarkup(h(StreamRow, { item: item(7, "vm.starting", {}) }));
+  assert.match(markup, /Starting a separate Linux computer for this run/);
+  assert.ok(!markup.includes("sandbox"));
 });

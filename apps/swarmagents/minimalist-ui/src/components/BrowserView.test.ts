@@ -3,7 +3,7 @@ import { test } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { countOf, installBrowserStubs } from "../testing/harness";
-import { BrowserLoadStatus, STILL_WAITING_MS, frameFetchInFlight, hasWaitedLongEnough } from "./BrowserView";
+import { BrowserLoadStatus, BrowserView, STILL_WAITING_MS, frameFetchInFlight, hasWaitedLongEnough } from "./BrowserView";
 
 /**
  * The browser chrome's under-address-bar hint has two jobs that used to be
@@ -58,4 +58,13 @@ test("the status strip renders a bar only for a real fetch, text only when idle"
   const both = renderToStaticMarkup(h(BrowserLoadStatus, { fetching: true, stillWaiting: true }));
   assert.equal(countOf(both, 'data-testid="browser-loading-bar"'), 1, "a live fetch wins over the idle text");
   assert.equal(countOf(both, "Still waiting…"), 0);
+});
+
+test("browser empty states explain what the user will see", () => {
+  installBrowserStubs();
+  const h = React.createElement;
+  const idle = renderToStaticMarkup(h(BrowserView, {}));
+  assert.match(idle, /Start a run to see the page the agent is viewing/);
+  const afterRun = renderToStaticMarkup(h(BrowserView, { runId: "run_1" }));
+  assert.match(afterRun, /The live page appears here when the agent opens a website/);
 });

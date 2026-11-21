@@ -170,6 +170,14 @@ function buildCrumbs(path: string): Crumb[] {
   return crumbs;
 }
 
+export function describeBinaryPreview(size: number): string {
+  return `This file type can’t be previewed here. File size: ${formatBytes(size)}.`;
+}
+
+export function describeTruncatedPreview(limit: number, size: number): string {
+  return `Only the first ${formatBytes(limit)} of ${formatBytes(size)} is shown. Download the file to see the rest.`;
+}
+
 export function FilesView({ refreshToken = 0, openPath }: FilesViewProps) {
   const [path, setPath] = useState(WORKSPACE_ROOT);
   const [listing, setListing] = useState<WorkspaceListing>();
@@ -460,10 +468,7 @@ export function FilesView({ refreshToken = 0, openPath }: FilesViewProps) {
               ) : file?.binary ? (
                 <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
                   <AlertTriangle className="h-5 w-5 text-amber-400/70" />
-                  <div className="text-xs text-white/60">Binary file — preview unavailable.</div>
-                  <div className="text-[10px] text-white/30">
-                    {formatBytes(file.size)} · detected as binary by the file API.
-                  </div>
+                  <div className="text-xs text-white/60">{describeBinaryPreview(file.size)}</div>
                 </div>
               ) : (
                 <div className="flex min-h-0 flex-1 flex-col">
@@ -473,10 +478,7 @@ export function FilesView({ refreshToken = 0, openPath }: FilesViewProps) {
                   {file?.truncated && (
                     <div className="flex items-center gap-1.5 border-t border-amber-400/20 bg-amber-400/10 px-3 py-1.5 text-[10px] text-amber-200/80">
                       <AlertTriangle className="h-3 w-3 shrink-0" />
-                      <span>
-                        Preview truncated at the {formatBytes(file.limit)} limit — showing the first{" "}
-                        {formatBytes(file.limit)} of {formatBytes(file.size)}.
-                      </span>
+                      <span>{describeTruncatedPreview(file.limit, file.size)}</span>
                     </div>
                   )}
                 </div>

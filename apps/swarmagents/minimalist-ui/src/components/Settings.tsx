@@ -1512,6 +1512,24 @@ function Account() {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+
+  const signOut = async () => {
+    setSigningOut(true);
+    setSignOutError(null);
+    try {
+      const res = await fetch('/api/logout', { method: 'POST' });
+      if (res.ok) {
+        window.location.href = '/login';
+        return;
+      }
+      setSignOutError('Could not sign out.');
+    } catch {
+      setSignOutError('Could not sign out.');
+    }
+    setSigningOut(false);
+  };
 
   // Show the signed-in account (per-account; never another user's data).
   useEffect(() => {
@@ -1554,8 +1572,21 @@ function Account() {
       <section>
         <Label>Account</Label>
         <div className="rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
-          <div className="text-xs text-white/85">{email ?? '…'}</div>
-          <div className="mt-0.5 text-[10px] text-white/35">Signed into this device.</div>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-xs text-white/85">{email ?? '…'}</div>
+              <div className="mt-0.5 text-[10px] text-white/35">Signed into this device.</div>
+            </div>
+            <button
+              onClick={() => void signOut()}
+              disabled={signingOut}
+              className="flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1.5 text-xs text-white/80 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"
+            >
+              {signingOut ? <Loader2 className="h-3 w-3 animate-spin" /> : <LogOut className="h-3 w-3" />}
+              Sign out
+            </button>
+          </div>
+          {signOutError && <div className="mt-2 text-[10px] text-red-300/80">{signOutError}</div>}
         </div>
       </section>
 

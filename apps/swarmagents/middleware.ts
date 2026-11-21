@@ -41,6 +41,7 @@ const PUBLIC = new Set([
   "/about",
   "/status",
   "/api/login",
+  "/api/logout",
   "/api/signup",
   "/api/me",
   "/api/health",

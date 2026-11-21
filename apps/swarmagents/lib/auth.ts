@@ -48,6 +48,23 @@ export function sessionCookieOptions(): {
   };
 }
 
+/**
+ * Cookie attributes to clear the session cookie: HttpOnly, Secure, SameSite=Lax,
+ * scoped to the whole site, with maxAge: 0.
+ */
+export function clearSessionCookieOptions(): {
+  httpOnly: boolean;
+  secure: boolean;
+  sameSite: "lax";
+  path: string;
+  maxAge: 0;
+} {
+  return {
+    ...sessionCookieOptions(),
+    maxAge: 0,
+  };
+}
+
 /** Re-exported so server code can validate a `next` param without knowing where it lives. */
 export { safeNextPath } from "./safe-next";
 

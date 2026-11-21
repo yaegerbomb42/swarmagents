@@ -25,6 +25,7 @@ import { readRunEvents } from "../telemetry/run-log";
 import { getBrowserManager, type BrowserControl } from "../browser/manager";
 import { telemetryBus } from "../telemetry/bus";
 import type { VmManager } from "../vm/manager";
+import { makeRedactor } from "../harness/redact";
 import { pinnedLensForRole, runAutoAudit } from "../lenses/audit";
 import type { RunReport } from "./run-report-types";
 import {
@@ -35,6 +36,7 @@ import {
   captureDesktopScreenshot,
   deriveArtifactsFromEvents,
   diffWorkspaceLists,
+  hashArtifacts,
   listWorkspaceFiles,
   mergeArtifacts,
   readRunReport,
@@ -42,6 +44,19 @@ import {
   writeShotFile,
   type WorkspaceEntry,
 } from "./run-report";
+import {
+  RECEIPT_FORMAT,
+  buildReceiptChain,
+  signReceipt,
+  type ReceiptChainEntry,
+  type RunReceipt,
+} from "./run-receipt";
+import {
+  extractApprovalEntries,
+  extractAttestationEntries,
+  extractCommandLogEntries,
+  promptEntry,
+} from "./receipt-entries";
 import type { ReportShotMeta } from "./run-report-types";
 
 export interface RunReporterOptions {
@@ -75,6 +90,61 @@ interface PendingRun {
 function shotFile(index: number, mime: string): string {
   const ext = mime === "image/jpeg" ? "jpg" : "png";
   return `${String(index).padStart(3, "0")}.${ext}`;
+}
+
+/**
+ * Build the audit receipt for a finished report (pure except for the
+ * signing-secret read inside `signReceipt`).
+ *
+ * Chain order: prompt hash, approval decisions, LLM attestations, redacted
+ * command logs, artifact hashes (one entry per artifact, including
+ * `status: "missing"` ones — a file gone at hash time is evidence too).
+ * Command logs go through the pattern redactor, so no secret that reached
+ * a shell log can reach the receipt.
+ *
+ * When the server secret is unset, `signReceipt` throws and the receipt is
+ * stored UNSIGNED (`signature: null` + `signingError`) — the run must not
+ * fail because of receipts, and an unsigned receipt never verifies.
+ */
+export function buildRunReceipt(
+  report: RunReport,
+  events: readonly SequencedEvent[],
+): RunReceipt {
+  const redact = makeRedactor();
+  const entries: ReceiptChainEntry[] = [
+    promptEntry(report.prompt),
+    ...extractApprovalEntries(events),
+    ...extractAttestationEntries(events),
+    ...extractCommandLogEntries(events, redact),
+    ...report.artifacts.map(
+      (artifact): ReceiptChainEntry => ({
+        kind: "artifact",
+        rel: artifact.rel,
+        sha256: artifact.sha256 ?? null,
+        size: artifact.size,
+        change: artifact.change,
+        status: artifact.status ?? "missing",
+      }),
+    ),
+  ];
+  const { links, head } = buildReceiptChain(entries);
+  const unsigned: Omit<RunReceipt, "signature"> = {
+    format: RECEIPT_FORMAT,
+    runId: report.runId,
+    createdAt: Date.now(),
+    head,
+    links,
+  };
+  try {
+    return signReceipt(unsigned);
+  } catch (error) {
+    return {
+      ...unsigned,
+      signature: null,
+      signingError:
+        error instanceof Error ? error.message : "Receipt signing failed.",
+    };
+  }
 }
 
 export class RunReporter {
@@ -214,9 +284,13 @@ export class RunReporter {
     // already be in the baseline), so union it with the files the run's own
     // Write/Edit telemetry proves it wrote.
     const after = await listWorkspaceFiles(this.vm, userId);
-    const artifacts = mergeArtifacts(
-      diffWorkspaceLists(state.startListing, after),
-      deriveArtifactsFromEvents(events, after, state.startListing),
+    const artifacts = await hashArtifacts(
+      this.vm,
+      userId,
+      mergeArtifacts(
+        diffWorkspaceLists(state.startListing, after),
+        deriveArtifactsFromEvents(events, after, state.startListing),
+      ),
     );
 
     let finalText: string | undefined;
@@ -241,6 +315,15 @@ export class RunReporter {
       // instead of assuming the default. Undefined for image-less drivers.
       vmImage: this.vm.vmImage(),
     });
+    // Build the receipt between assembly and the single report.json write so
+    // it lands in the same document. Receipt-building must never fail the
+    // report or the run: any unexpected failure logs and the report is
+    // written without a receipt.
+    try {
+      report.receipt = buildRunReceipt(report, events);
+    } catch (error) {
+      console.error(`[run-report] receipt build failed for ${runId}:`, error);
+    }
     writeRunReport(runId, report, runsDir);
     this.maybeAudit(state, report, runsDir);
   }

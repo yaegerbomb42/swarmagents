@@ -1861,9 +1861,9 @@ export class RuntimeManager {
       const result = await this.vm.exec(userId, cmd, {
         signal: run.controller.signal,
         onStdout: (text) =>
-          this.bus.publish(runId, { type: "shell.output", data: { stream: "stdout", text } }),
+          this.bus.publish(runId, { type: "shell.output", data: { stream: "stdout", text: redact(text) } }),
         onStderr: (text) =>
-          this.bus.publish(runId, { type: "shell.output", data: { stream: "stderr", text } }),
+          this.bus.publish(runId, { type: "shell.output", data: { stream: "stderr", text: redact(text) } }),
       });
       if (!this.isShellActive(runId, userId)) return; // aborted by reset; already finalized
       const durationMs = Date.now() - startedAt;

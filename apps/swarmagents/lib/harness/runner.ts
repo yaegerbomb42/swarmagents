@@ -47,11 +47,50 @@ import { isRoleListTool, isRoleSwitchTool, ROLE_MCP_CONFIG_PATH } from "./role-m
 import { isAskUserTool, parseAskUserArguments } from "./ask-mcp";
 import { isDesktopHandoffTool, parseDesktopHandoffArguments } from "./desktop-handoff-mcp";
 import { classifyDesktopToolCallAsync, computerActionEvent, isDesktopMcpCall } from "./computer-mcp";
+import {
+  ContextGovernor,
+  StateLedger,
+  resolveContextPacker,
+  systemExtrasFrom,
+  toPackedRunRequest,
+  type ContextPackerMode,
+} from "./context/contextGovernor";
 
 export interface ClaudeCodeRunnerOptions {
   /** Path to the claude binary. Defaults to "claude" (or $CLAUDE_BIN). */
   bin?: string;
+  /**
+   * Context packer for the invocation prompt. "claude-code" (the default)
+   * keeps today's behaviour: the prompt and appended system text are passed
+   * through byte-for-byte. "l1" packs the prompt into the fixed L1 budget
+   * (8,192 tokens) before the CLI is spawned. A per-run `contextPacker` on the
+   * request wins over this setting; a per-role default is used when neither is
+   * set.
+   *
+   * Honest limit: one run() is one CLI invocation and the turns happen inside
+   * the CLI, so the packer governs the invocation/resume prompt only — not
+   * turns inside the CLI.
+   */
+  contextPacker?: ContextPackerMode;
+  /**
+   * Per-role packer defaults, e.g. { coder: "l1" }. Consulted when neither the
+   * run nor this runner sets a packer explicitly.
+   */
+  roleContextPackers?: Record<string, ContextPackerMode>;
 }
+
+/** What buildArgv applied when the L1 packer ran, for the telemetry line. */
+interface AppliedContextPacker {
+  mode: ContextPackerMode;
+  logLine: string;
+}
+
+/**
+ * RunRequest plus the optional per-run packer override. The field is read
+ * structurally so a caller can opt one invocation into a packer without
+ * changing the core RunRequest contract (the callers are owned elsewhere).
+ */
+type RunRequestWithPacker = RunRequest & { contextPacker?: unknown };
 
 interface FinalResultMeta {
   sessionId?: string;
@@ -158,9 +197,15 @@ function parseUsage(value: unknown): UsageTotals | null {
 
 export class ClaudeCodeRunner {
   private readonly bin: string;
+  /** Runner-level packer selection; undefined means "use the role default". */
+  private readonly contextPacker: unknown;
+  /** Per-role packer defaults, e.g. { coder: "l1" }. */
+  private readonly roleContextPackers: Record<string, unknown> | undefined;
 
   constructor(options: ClaudeCodeRunnerOptions = {}) {
     this.bin = options.bin ?? process.env.CLAUDE_BIN ?? "claude";
+    this.contextPacker = options.contextPacker;
+    this.roleContextPackers = options.roleContextPackers;
   }
 
   /**
@@ -171,7 +216,7 @@ export class ClaudeCodeRunner {
    */
   async run(request: RunRequest, onEvent: (event: TelemetryEvent) => void): Promise<RunOutcome> {
     const redact = makeRedactor(request.env, request.redactSecrets);
-    const argv = this.buildArgv(request);
+    const { argv, packer } = this.buildArgv(request);
 
     let started = false;
     let lastSessionId: string | undefined;
@@ -215,6 +260,19 @@ export class ClaudeCodeRunner {
     };
 
     const emit = (event: TelemetryEvent) => onEvent(event);
+
+    if (packer) {
+      // Surface the L1 budget ledger line in telemetry. It rides on the
+      // existing capability.changed event (the union already covers "context"
+      // capability changes) so no new event type is needed.
+      emit({
+        type: "capability.changed",
+        tool: "context",
+        ok: true,
+        detail: packer.logLine,
+        why: `context packer ${packer.mode} (invocation-level)`,
+      });
+    }
 
     /**
      * Emit the final `result` usage totals once, when the stream never
@@ -835,26 +893,61 @@ export class ClaudeCodeRunner {
     });
   }
 
-  private buildArgv(request: RunRequest): string[] {
+  /**
+   * Resolve this invocation's packer: an explicit per-run override wins, then
+   * the runner setting, then the active role's default, then "claude-code"
+   * (resolveContextPacker owns the last two steps).
+   */
+  private resolvePackerMode(request: RunRequest): ContextPackerMode {
+    return resolveContextPacker({
+      run: (request as RunRequestWithPacker).contextPacker ?? this.contextPacker,
+      roleId: request.rolePhase?.roleId,
+      roles: this.roleContextPackers,
+    });
+  }
+
+  private buildArgv(request: RunRequest): { argv: string[]; packer?: AppliedContextPacker } {
+    const mode = this.resolvePackerMode(request);
+    let effective = request;
+    let packer: AppliedContextPacker | undefined;
+
+    if (mode === "l1") {
+      // One invocation, one prompt: the request prompt is the ledger goal and
+      // the agent card / role prompt / memory become the packed system header.
+      // File windows and the AST skeleton are empty here because the runner has
+      // no filesystem view of the user's VM; a caller with file state can feed
+      // them in later. toPackedRunRequest also drops --resume: an L1 turn is
+      // stateless, so replaying the whole CLI session would defeat the budget.
+      const packed = new ContextGovernor().pack({
+        turn: 0,
+        ledger: new StateLedger(request.prompt),
+        skeletonFiles: [],
+        workingSet: [],
+        systemExtras: systemExtrasFrom(request),
+      });
+      effective = toPackedRunRequest(request, packed);
+      packer = { mode, logLine: packed.logLine };
+    }
+
     // Keep -p (print/non-interactive). Pass the prompt after `--` so values that
     // begin with '-' are treated as text, never as CLI flags.
     const argv: string[] = [this.bin, "-p", "--output-format", "stream-json", "--verbose"];
-    if (request.sessionId) argv.push("--resume", request.sessionId);
-    if (request.model) argv.push("--model", request.model);
+    if (effective.sessionId) argv.push("--resume", effective.sessionId);
+    if (effective.model) argv.push("--model", effective.model);
     // The agent card, the active role's prompt and the account's long-term
     // memory ride as one appended system prompt, one argv element per value —
     // never interpolated into a shell string.
-    const role = request.rolePhase;
+    const role = effective.rolePhase;
     if (role && role.toolsDisabled !== true) {
       argv.push("--allowedTools", ...role.allowedTools);
       argv.push("--mcp-config", role.mcpConfigPath);
     }
-    const appended = [request.agentCard, role?.appendSystemPrompt, request.memoryContext]
+    const appended = [effective.agentCard, role?.appendSystemPrompt, effective.memoryContext]
       .filter(Boolean)
       .join("\n\n");
     if (appended) argv.push("--append-system-prompt", appended);
-    argv.push("--", request.prompt);
-    return argv;
+    argv.push("--", effective.prompt);
+    return { argv, packer };
   }
 }
 

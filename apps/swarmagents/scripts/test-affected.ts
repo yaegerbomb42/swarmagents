@@ -25,6 +25,12 @@ import { findAffectedTests } from "../lib/harness/oracle/affected.js";
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 
+// Resolve executables to absolute paths from fixed, trusted directories so we
+// never rely on PATH resolution (Sonar S4036).
+const GIT_BIN =
+  ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"].find((p) => fs.existsSync(p)) ?? "/usr/bin/git";
+const TSX_BIN = path.join(PROJECT_ROOT, "node_modules", ".bin", "tsx");
+
 /** Test glob roots, mirroring package.json's test:unit globs. */
 const TEST_ROOTS = ["lib", "app", "components", "minimalist-ui/src", "packages/swarm-node/src"];
 
@@ -48,7 +54,7 @@ function collectTests(root: string): string[] {
     }
   };
   walk(fullRoot);
-  return out.sort();
+  return out.sort((a, b) => a.localeCompare(b));
 }
 
 function readFile(p: string): string | undefined {
@@ -97,13 +103,13 @@ function resolveChanges(args: string[]): { path: string; status: "A" | "M" | "D"
   }
 
   // Default: changed files versus base.
-  const res = spawnSync("git", ["diff", "--name-status", "--diff-filter=AMDR", base], {
+  const res = spawnSync(GIT_BIN, ["diff", "--name-status", "--diff-filter=AMDR", base], {
     cwd: PROJECT_ROOT,
     encoding: "utf8",
   });
   if (res.status !== 0 || res.stdout.trim() === "") {
     // Fall back to working-tree status.
-    const st = spawnSync("git", ["status", "--porcelain"], { cwd: PROJECT_ROOT, encoding: "utf8" });
+    const st = spawnSync(GIT_BIN, ["status", "--porcelain"], { cwd: PROJECT_ROOT, encoding: "utf8" });
     if (st.status !== 0) {
       console.error("test-affected: cannot determine changed files (not a git repo?)");
       process.exit(2);
@@ -140,7 +146,7 @@ function main(): void {
   }
 
   const allTests = TEST_ROOTS.flatMap((root) => collectTests(root));
-  const uniqueTests = [...new Set(allTests)].sort();
+  const uniqueTests = [...new Set(allTests)].sort((a, b) => a.localeCompare(b));
 
   const affected = findAffectedTests({ changed: changes, allTests: uniqueTests, readFile });
 
@@ -154,8 +160,8 @@ function main(): void {
 
   const swarmHome = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "swarm-home-"));
   const res = spawnSync(
-    "npx",
-    ["tsx", "--test", "--test-concurrency=4", ...affected],
+    TSX_BIN,
+    ["--test", "--test-concurrency=4", ...affected],
     { cwd: PROJECT_ROOT, env: { ...process.env, SWARM_HOME: swarmHome }, stdio: "inherit" },
   );
 

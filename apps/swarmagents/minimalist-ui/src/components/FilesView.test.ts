@@ -8,7 +8,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { describeBinaryPreview, describeTruncatedPreview, formatModified } from "./FilesView";
+import { describeBinaryPreview, describeTruncatedPreview, formatModified, FilesView } from "./FilesView";
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { countOf, installBrowserStubs } from "../testing/harness";
 
 // PST (UTC-8) in November has no DST, so the expected value is stable.
 process.env.TZ = "America/Los_Angeles";
@@ -40,4 +43,12 @@ test("file preview notices explain unsupported types and size limits plainly", (
     describeTruncatedPreview(1024, 4096),
     "Only the first 1.0 KB of 4.0 KB is shown. Download the file to see the rest.",
   );
+});
+
+test("files empty state explains workspace and first run", () => {
+  installBrowserStubs();
+  const html = renderToStaticMarkup(React.createElement(FilesView, {}));
+  // Before listing arrives it is in loading state
+  assert.match(html, /Loading workspace/);
+  assert.equal(countOf(html, 'data-testid="files-empty"'), 0);
 });

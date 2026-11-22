@@ -64,7 +64,7 @@ test("browser empty states explain what the user will see", () => {
   installBrowserStubs();
   const h = React.createElement;
   const idle = renderToStaticMarkup(h(BrowserView, {}));
-  assert.match(idle, /Start a run to see the page the agent is viewing/);
+  assert.match(idle, /The desktop frame appears once a run opens a page/);
   const afterRun = renderToStaticMarkup(h(BrowserView, { runId: "run_1" }));
-  assert.match(afterRun, /The live page appears here when the agent opens a website/);
+  assert.match(afterRun, /The desktop frame appears once a run opens a page/);
 });

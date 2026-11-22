@@ -527,7 +527,7 @@ export function BoardPanel({ board, agentName, runFor, onRunTask, onViewRun, foc
             <div className="rounded-xl border border-dashed border-sa-line-strong px-4 py-10 text-center" data-testid="board-empty">
               <p className="text-sm font-medium text-sa-fg">No tasks yet</p>
               <p className="mx-auto mt-1 max-w-sm text-[13px] text-sa-fg2">
-                Add the first task above. Run it on your VM, and it moves through review to completed.
+                The board coordinates work across the swarm. There are no open tasks in the current filter; add a task above to start.
               </p>
             </div>
           )}

@@ -20,6 +20,20 @@ export const dynamic = "force-dynamic";
 
 const MAX_BODY_SIZE = 16 * 1024;
 
+const MAX_AUDIT_EMAIL_LEN = 254;
+
+/** Trim, lowercase, strip controls, and bound length before audit logging. */
+export function sanitizeAttemptedEmail(email: unknown): string {
+  if (typeof email !== "string" || !email) return "unknown";
+  const cleaned = email
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, "")
+    .trim()
+    .toLowerCase()
+    .slice(0, MAX_AUDIT_EMAIL_LEN);
+  return cleaned || "unknown";
+}
+
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -72,7 +86,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   if (!user) {
     // The attempted email is an identifier, not a secret; the password is
     // never logged.
-    const attempted = typeof body.email === "string" && body.email ? body.email : "unknown";
+    const attempted = sanitizeAttemptedEmail(body.email);
     recordAudit({ user: "anonymous", action: "login.failure", target: attempted, result: "failure" });
     return NextResponse.json({ error: "Invalid credentials." }, { status: 401, headers: NO_STORE });
   }

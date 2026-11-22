@@ -7,6 +7,8 @@ import { NextRequest } from "next/server";
 import { POST } from "./route";
 import { configureUserPaths, signupLocalUser } from "../../../lib/users";
 import { verifySession } from "../../../lib/auth";
+import { configureAuditPath, readAuditEntries } from "../../../lib/audit";
+import { sanitizeAttemptedEmail } from "./route";
 
 function request(body: unknown, headers: Record<string, string> = {}): NextRequest {
   return new NextRequest("http://localhost/api/login", {
@@ -31,12 +33,14 @@ let dir = "";
 test.beforeEach(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-login-test-"));
   configureUserPaths(path.join(dir, "users.json"));
+  configureAuditPath(path.join(dir, "audit.jsonl"));
   process.env.SWARM_SESSION_SECRET = "test-session-secret";
   await signupLocalUser("alice@example.com", "correct horse battery staple");
 });
 
 test.afterEach(() => {
   configureUserPaths("");
+  configureAuditPath(undefined);
   delete process.env.SWARM_SESSION_SECRET;
   delete process.env.SWARM_SCRYPT_MAX_CONCURRENCY;
   delete process.env.SWARM_SCRYPT_MAX_QUEUE;
@@ -146,3 +150,31 @@ test("POST /api/login refuses to run without SWARM_SESSION_SECRET", async () => 
   const res = await POST(request({ email: "alice@example.com", password: "correct horse battery staple" }));
   assert.equal(res.status, 500);
 });
+
+test("sanitizeAttemptedEmail strips controls, lowercases, and caps length", () => {
+  assert.equal(sanitizeAttemptedEmail("Alice\n@Example.com"), "alice@example.com");
+  assert.equal(sanitizeAttemptedEmail("a\u0000b\u0007c@x.com"), "abc@x.com");
+  const long = "a".repeat(300) + "@example.com";
+  const out = sanitizeAttemptedEmail(long);
+  assert.ok(out.length <= 254);
+  assert.equal(out, long.toLowerCase().slice(0, 254));
+  assert.equal(sanitizeAttemptedEmail(""), "unknown");
+  assert.equal(sanitizeAttemptedEmail(null), "unknown");
+});
+
+test("failed login writes a sanitized email to audit.jsonl", async () => {
+  const dirty = "Evil\nUser\u0000@Example.COM\u0007" + "x".repeat(300);
+  const res = await POST(request({ email: dirty, password: "nope" }));
+  assert.equal(res.status, 401);
+
+  const entries = readAuditEntries("anonymous");
+  assert.ok(entries.length >= 1);
+  const failure = entries.find((e) => e.action === "login.failure");
+  assert.ok(failure, "expected a login.failure audit entry");
+  assert.match(failure!.target, /^[\x20-\x7E]*$/); // no control chars
+  assert.ok(failure!.target.length <= 254);
+  assert.ok(!failure!.target.includes("\n"));
+  assert.ok(!/\u0000|\u0007/.test(failure!.target));
+  assert.equal(failure!.target, sanitizeAttemptedEmail(dirty).slice(0, 128)); // audit cleanField cap
+});
+

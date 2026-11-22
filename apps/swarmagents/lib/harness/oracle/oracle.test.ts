@@ -9,14 +9,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultOracleChecks, OracleGate, runOracleGate, type OracleCheck } from "./oracle";
 import { countChurn, parsePatchFiles, unsafePatchPaths, type PatchFile } from "./diff";
 import { findAffectedTests, relativeImports, resolveSpecifier, TRANSITIVE_HOPS } from "./affected";
 import { buildRetryContext, diagnosticSymbols, extractDiagnostic, findDefinition } from "./retry";
-import { writeFileViaExec, type OracleExec } from "./exec";
+import { execWithTimeout, writeFileViaExec, type OracleExec } from "./exec";
 import { createScratch } from "./scratch";
 
 const APP = process.cwd();
@@ -533,7 +533,7 @@ test("parsePatchFiles captures every declared path; unsafePatchPaths rejects tra
   ].join("\n");
   const newFiles = parsePatchFiles(symlinkNew);
   assert.equal(newFiles[0]?.symlink, true);
-  assert.deepEqual(unsafePatchPaths(newFiles), ["src/link.ts"]);
+  assert.deepEqual(unsafePatchPaths(newFiles), ["src/link.ts (symlink)"]);
 
   const symlinkMode = [
     "diff --git a/src/link.ts b/src/link.ts",
@@ -545,7 +545,7 @@ test("parsePatchFiles captures every declared path; unsafePatchPaths rejects tra
     "-x",
     "+y",
   ].join("\n");
-  assert.deepEqual(unsafePatchPaths(parsePatchFiles(symlinkMode)), ["src/link.ts"]);
+  assert.deepEqual(unsafePatchPaths(parsePatchFiles(symlinkMode)), ["src/link.ts (symlink)"]);
 
   // A normal mode change (100644 -> 100755) is not a symlink.
   const modeChange = [
@@ -728,4 +728,275 @@ test("defaultOracleChecks: tsc always, eslint on changed sources, tsx --test on 
   assert.deepEqual(tests.command(ctx), ["env", "SWARM_HOME=/tmp/h", "npx", "--no-install", "tsx", "--test", "--test-concurrency=4", "lib/a.test.ts"]);
   assert.equal(lint.command({ ...ctx, changedFiles: ["docs/x.md"] }), null);
   assert.equal(tests.command({ ...ctx, affectedTests: [] }), null);
+});
+
+test("unsafePatchPaths rejects .git in any path segment, case-insensitively, and ignores lookalikes", () => {
+  assert.deepEqual(
+    unsafePatchPaths([
+      { path: "sub/.git/config", status: "M" },
+      { path: "./.git/hooks/pre-commit", status: "M" },
+      { path: "a/b/.GIT/config", status: "M" },
+      { path: "x/.git", status: "M" },
+      { path: ".gitignore", status: "M" },
+      { path: "lib/.github/workflows/ci.yml", status: "M" },
+      { path: "ok.ts", status: "M" },
+    ]),
+    ["sub/.git/config", "./.git/hooks/pre-commit", "a/b/.GIT/config", "x/.git"],
+  );
+});
+
+test("parsePatchFiles handles unquoted paths with spaces via the ---/+++ headers", () => {
+  const diff = [
+    "diff --git a/lib/my file.ts b/lib/my file.ts",
+    "index 1..2 100644",
+    "--- a/lib/my file.ts",
+    "+++ b/lib/my file.ts",
+    "@@ -1 +1 @@",
+    "-a",
+    "+b",
+    "diff --git a/lib/old name.ts b/lib/new name.ts",
+    "similarity index 100%",
+    "rename from lib/old name.ts",
+    "rename to lib/new name.ts",
+    "diff --git a/my b/file.ts b/my b/file.ts",
+    "index 1..2 100644",
+    "--- a/my b/file.ts",
+    "+++ b/my b/file.ts",
+    "@@ -1 +1 @@",
+    "-a",
+    "+b",
+  ].join("\n");
+  assert.deepEqual(parsePatchFiles(diff), [
+    { path: "lib/my file.ts", status: "M" },
+    { path: "lib/new name.ts", status: "R", oldPath: "lib/old name.ts" },
+    // "my b/file.ts" contains " b/" itself, so only the +++ header gets it right.
+    { path: "my b/file.ts", status: "M" },
+  ]);
+});
+
+test("parsePatchFiles flags symlink diffs and unsafePatchPaths rejects them", () => {
+  const diff = [
+    "diff --git a/src/link.ts b/src/link.ts",
+    "new file mode 120000",
+    "--- /dev/null",
+    "+++ b/src/link.ts",
+    "@@ -0,0 +1 @@",
+    "+/etc/passwd",
+    "diff --git a/src/old-link.ts b/src/target.ts",
+    "old mode 120000",
+    "new mode 100644",
+    "--- a/src/old-link.ts",
+    "+++ b/src/target.ts",
+  ].join("\n");
+  const files = parsePatchFiles(diff);
+  assert.deepEqual(files, [
+    { path: "src/link.ts", status: "A", symlink: true },
+    { path: "src/target.ts", status: "M", symlink: true },
+  ]);
+  assert.deepEqual(unsafePatchPaths(files), ["src/link.ts (symlink)", "src/target.ts (symlink)"]);
+});
+
+test("a symlink patch is rejected at safety before any scratch is made", async () => {
+  const calls: string[][] = [];
+  const recording: OracleExec = async (cmd) => {
+    calls.push(cmd);
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+  const link = [
+    "diff --git a/src/link.ts b/src/link.ts",
+    "new file mode 120000",
+    "--- /dev/null",
+    "+++ b/src/link.ts",
+    "@@ -0,0 +1 @@",
+    "+/etc/passwd",
+  ].join("\n");
+  const report = await runOracleGate(recording, [{ id: "link", diff: link }], { repoRoot: "/nowhere", checks: [] });
+  const v = report.verdicts[0];
+  assert.equal(v.status === "rejected" && v.stage, "safety");
+  assert.match(v.status === "rejected" ? v.diagnostic : "", /symlink/);
+  assert.ok(!calls.some((c) => c.includes("worktree")), "no scratch for a symlink patch");
+});
+
+test("a barrel index.ts change runs tests that import the barrel by directory", { timeout: 60_000 }, async () => {
+  const { root, repo, cleanup } = makeRepo();
+  try {
+    // lib/router/index.ts is the barrel; pages.test.ts imports "./router"
+    // and never mentions the word "index", so the old basename-only
+    // pre-filter silently skipped it and the broken patch landed.
+    mkdirSync(join(repo, "app/src/router"), { recursive: true });
+    writeFileSync(join(repo, "app/src/router/index.ts"), 'export function getRoute(): string {\n  return "/home";\n}\n');
+    writeFileSync(
+      join(repo, "app/src/pages.test.ts"),
+      [
+        'import test from "node:test";',
+        'import assert from "node:assert/strict";',
+        'import { getRoute } from "./router";',
+        "",
+        'test("pages use the home route", () => {',
+        '  assert.equal(getRoute(), "/home");',
+        "});",
+        "",
+      ].join("\n"),
+    );
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "router barrel");
+    const broken = diffFor(repo, {
+      "app/src/router/index.ts": 'export function getRoute(): string {\n  return "/wrong";\n}\n',
+    });
+    const report = await runOracleGate(
+      localExec,
+      [{ id: "barrel", diff: broken }],
+      { repoRoot: repo, projectDir: "app", checks: CHECKS, scratchRoot: join(root, "scratch") },
+    );
+    const v = report.verdicts[0];
+    assert.equal(v.status, "rejected");
+    assert.equal(v.status === "rejected" && v.stage, "tests");
+    assert.deepEqual(report.landed, []);
+    assert.match(readFileSync(join(repo, "app/src/router/index.ts"), "utf8"), /"\/home"/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("mode 'best' falls back to the next passing candidate when the winner cannot land", { timeout: 60_000 }, async () => {
+  const { root, repo, cleanup } = makeRepo();
+  try {
+    const small = diffFor(repo, { "app/src/math.ts": MATH + "export const z = 0;\n" });
+    const big = diffFor(repo, { "app/src/math.ts": MATH + "export const z = 0;\nexport const y = 1;\nexport const x = 2;\n" });
+    // The first land check (the winner's) fails; the next candidate lands.
+    let landChecks = 0;
+    const flaky: OracleExec = async (cmd, opts) => {
+      if (cmd[0] === "git" && cmd.includes("apply") && cmd.includes("--check")) {
+        landChecks++;
+        if (landChecks === 1) return { exitCode: 1, stdout: "", stderr: "error: patch does not apply" };
+      }
+      return localExec(cmd, opts);
+    };
+    const report = await runOracleGate(
+      flaky,
+      [
+        { id: "big", diff: big },
+        { id: "small", diff: small },
+      ],
+      { repoRoot: repo, projectDir: "app", checks: CHECKS, scratchRoot: join(root, "scratch") },
+    );
+    assert.deepEqual(report.landed, ["big"]);
+    assert.equal(report.rejected, 1);
+    const smallVerdict = report.verdicts.find((v) => v.id === "small");
+    assert.equal(smallVerdict?.status, "error");
+    assert.equal(smallVerdict?.status === "error" && smallVerdict.stage, "land");
+    assert.match(smallVerdict?.status === "error" ? smallVerdict.retryContext ?? "" : "", /real tree rejected the patch/);
+    assert.match(readFileSync(join(repo, "app/src/math.ts"), "utf8"), /export const x = 2;/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("when nothing lands, the report's retryContext comes from the land error", { timeout: 60_000 }, async () => {
+  const { root, repo, cleanup } = makeRepo();
+  try {
+    const good = diffFor(repo, { "app/src/math.ts": MATH + "export const z = 0;\n" });
+    // Every land check fails: the tree rejects the patch after it passed.
+    const noLand: OracleExec = async (cmd, opts) => {
+      if (cmd[0] === "git" && cmd.includes("apply") && cmd.includes("--check")) {
+        return { exitCode: 1, stdout: "", stderr: "error: patch does not apply" };
+      }
+      return localExec(cmd, opts);
+    };
+    const report = await runOracleGate(
+      noLand,
+      [{ id: "only", diff: good }],
+      { repoRoot: repo, projectDir: "app", checks: CHECKS, mode: "best", scratchRoot: join(root, "scratch") },
+    );
+    assert.deepEqual(report.landed, []);
+    assert.equal(report.verdicts[0].status, "error");
+    assert.equal(report.verdicts[0].status === "error" && report.verdicts[0].stage, "land");
+    assert.match(report.retryContext ?? "", /rejected by the oracle at "land"/);
+    assert.match(report.retryContext ?? "", /real tree rejected the patch/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("mode 'best' with duplicate candidate ids lands the patch once", { timeout: 60_000 }, async () => {
+  const { root, repo, cleanup } = makeRepo();
+  try {
+    const diff = diffFor(repo, { "app/src/math.ts": MATH + "export const z = 0;\n" });
+    const report = await runOracleGate(
+      localExec,
+      [
+        { id: "dup", diff },
+        { id: "dup", diff },
+      ],
+      { repoRoot: repo, projectDir: "app", checks: CHECKS, scratchRoot: join(root, "scratch") },
+    );
+    assert.deepEqual(report.landed, ["dup"]);
+    assert.equal(report.rejected, 0);
+    const second = report.verdicts[1];
+    assert.equal(second.status, "passed");
+    assert.equal(second.status === "passed" && second.landed, false);
+    assert.match(second.status === "passed" ? second.note ?? "" : "", /has less churn/);
+    assert.equal(readFileSync(join(repo, "app/src/math.ts"), "utf8").match(/export const z = 0;/g)?.length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a throwing apply leaves no .candidate.patch file behind", { timeout: 60_000 }, async () => {
+  const { root, repo, cleanup } = makeRepo();
+  try {
+    const scratchRoot = join(root, "scratch");
+    const good = diffFor(repo, { "app/src/math.ts": MATH + "export const z = 0;\n" });
+    // The apply throws instead of returning a non-zero exit: the old code
+    // skipped its rm and leaked `${scratch.dir}.candidate.patch`.
+    const throwing: OracleExec = async (cmd, opts) => {
+      if (cmd[0] === "git" && cmd.includes("apply") && !cmd.includes("--check")) {
+        throw new Error("apply exploded");
+      }
+      return localExec(cmd, opts);
+    };
+    const report = await runOracleGate(
+      throwing,
+      [{ id: "t", diff: good }],
+      { repoRoot: repo, projectDir: "app", checks: CHECKS, scratchRoot },
+    );
+    assert.equal(report.verdicts[0].status, "error");
+    assert.deepEqual(report.landed, []);
+    const leftovers = existsSync(scratchRoot) ? readdirSync(scratchRoot) : [];
+    assert.deepEqual(
+      leftovers.filter((f) => f.endsWith(".candidate.patch")),
+      [],
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("execWithTimeout settles a post-timeout abort as the timeout result, never an unhandled rejection", async () => {
+  const rejections: unknown[] = [];
+  const onRejection = (err: unknown) => {
+    rejections.push(err);
+  };
+  process.on("unhandledRejection", onRejection);
+  try {
+    const exec: OracleExec = (_cmd, opts) =>
+      new Promise((_resolve, reject) => {
+        opts?.signal?.addEventListener("abort", () => reject(new Error("aborted after timeout")), { once: true });
+      });
+    const res = await execWithTimeout(exec, ["sleep", "10"], { timeoutMs: 20 });
+    assert.equal(res.timedOut, true);
+    assert.equal(res.exitCode, 124);
+    // Give the late rejection a chance to surface if it is unhandled.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(rejections, []);
+  } finally {
+    process.off("unhandledRejection", onRejection);
+  }
+});
+
+test("execWithTimeout still propagates a rejection that arrives before the timeout", async () => {
+  const exec: OracleExec = async () => {
+    throw new Error("boom before timeout");
+  };
+  await assert.rejects(execWithTimeout(exec, ["x"], { timeoutMs: 1000 }), /boom before timeout/);
 });

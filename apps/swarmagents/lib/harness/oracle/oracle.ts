@@ -70,7 +70,7 @@ export interface CheckRun {
 export type CandidateVerdict =
   | { id: string; status: "passed"; landed: boolean; churn: number; checks: CheckRun[]; note?: string }
   | { id: string; status: "rejected"; stage: string; diagnostic: string; retryContext: string; checks: CheckRun[] }
-  | { id: string; status: "error"; stage: string; diagnostic: string; checks: CheckRun[] }
+  | { id: string; status: "error"; stage: string; diagnostic: string; retryContext?: string; checks: CheckRun[] }
   | { id: string; status: "skipped"; checks: CheckRun[] };
 
 export interface OracleReport {
@@ -217,13 +217,13 @@ export class OracleGate {
   async run(candidates: OracleCandidate[]): Promise<OracleReport> {
     const verdicts: CandidateVerdict[] = [];
     const landed: string[] = [];
-    const passed: { candidate: OracleCandidate; id: string; diff: string; churn: number }[] = [];
+    const passed: { candidate: OracleCandidate; id: string; diff: string; churn: number; verdictIndex: number }[] = [];
 
     if (this.opts.mode === "best") {
       for (const { candidate, verdict } of await this.evaluateBest(candidates)) {
         verdicts.push(verdict);
         if (verdict.status === "passed") {
-          passed.push({ candidate, id: candidate.id, diff: candidate.diff, churn: verdict.churn });
+          passed.push({ candidate, id: candidate.id, diff: candidate.diff, churn: verdict.churn, verdictIndex: verdicts.length - 1 });
         }
       }
     } else {
@@ -242,12 +242,30 @@ export class OracleGate {
     }
 
     if (this.opts.mode === "best" && passed.length > 0) {
-      const winner = [...passed].sort((a, b) => a.churn - b.churn)[0];
-      for (let i = 0; i < verdicts.length; i++) {
-        const v = verdicts[i];
-        if (v.status !== "passed") continue;
-        if (v.id === winner.id) verdicts[i] = await this.landOrConflict(winner.candidate, v, landed);
-        else verdicts[i] = { ...v, note: `passed but not landed: ${winner.id} has less churn` };
+      // Try in churn order until one lands: a land conflict (the real tree
+      // moved, or a duplicate id) falls through to the next passing
+      // candidate instead of failing the whole gate. The winner is tracked
+      // by verdict index, so duplicate candidate ids cannot land twice.
+      const ranked = [...passed].sort((a, b) => a.churn - b.churn);
+      let landedId: string | undefined;
+      for (const candidate of ranked) {
+        const current = verdicts[candidate.verdictIndex];
+        if (current.status !== "passed") continue;
+        const result = await this.landOrConflict(candidate.candidate, current, landed);
+        verdicts[candidate.verdictIndex] = result;
+        if (result.status === "passed" && result.landed) {
+          landedId = candidate.id;
+          break;
+        }
+      }
+      for (const candidate of passed) {
+        const v = verdicts[candidate.verdictIndex];
+        if (v.status === "passed" && !v.landed) {
+          verdicts[candidate.verdictIndex] = {
+            ...v,
+            note: `passed but not landed: ${landedId ?? "another candidate"} has less churn`,
+          };
+        }
       }
     }
 
@@ -258,13 +276,21 @@ export class OracleGate {
     this.log(summary);
 
     const firstRejection = verdicts.find((v) => v.status === "rejected");
+    const firstError = verdicts.find((v) => v.status === "error");
     return {
       verdicts,
       landed,
       rejected,
       total: candidates.length,
       summary,
-      retryContext: landed.length === 0 && firstRejection?.status === "rejected" ? firstRejection.retryContext : undefined,
+      retryContext:
+        landed.length === 0
+          ? firstRejection?.status === "rejected"
+            ? firstRejection.retryContext
+            : firstError?.status === "error"
+              ? firstError.retryContext
+              : undefined
+          : undefined,
     };
   }
 
@@ -302,7 +328,14 @@ export class OracleGate {
     } catch (error) {
       const diagnostic = extractDiagnostic(error instanceof Error ? error.message : String(error), this.opts.maxDiagnosticChars);
       this.log(`oracle: candidate ${candidate.id} passed but could not land: ${diagnostic.split("\n")[0]}`);
-      return { id: candidate.id, status: "error", stage: "land", diagnostic, checks: verdict.checks };
+      return {
+        id: candidate.id,
+        status: "error",
+        stage: "land",
+        diagnostic,
+        retryContext: buildRetryContext({ stage: "land", diagnostic, locationSymbol: null, files: [] }),
+        checks: verdict.checks,
+      };
     }
   }
 
@@ -333,10 +366,17 @@ export class OracleGate {
         linkDirs: this.opts.linkDirs,
       });
       this.fingerprints.set(candidate, scratch.fingerprint);
-      const patchFile = `${scratch.dir}.candidate.patch`;
+      // The patch file lives inside the scratch, so a failure mid-evaluate
+      // cannot leak it next to the scratch dir; the rm runs in a finally
+      // so it is removed even when the apply throws.
+      const patchFile = path.join(scratch.dir, "candidate.patch");
       await writeFileViaExec(this.exec, patchFile, candidate.diff);
-      const applied = await this.exec(["git", "-C", scratch.dir, "apply", "--whitespace=nowarn", patchFile]);
-      await this.exec(["rm", "-f", patchFile]);
+      let applied;
+      try {
+        applied = await this.exec(["git", "-C", scratch.dir, "apply", "--whitespace=nowarn", patchFile]);
+      } finally {
+        await this.exec(["rm", "-f", patchFile]);
+      }
       if (applied.exitCode !== 0) return await reject("apply", applied.stderr || applied.stdout);
 
       const cwd = path.join(scratch.dir, this.opts.projectDir);

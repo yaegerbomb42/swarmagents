@@ -40,14 +40,27 @@ export async function execWithTimeout(
   const onAbort = () => controller.abort();
   opts.signal?.addEventListener("abort", onAbort, { once: true });
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
   const timeout = new Promise<OracleExecResult & { timedOut: boolean }>((resolve) => {
     timer = setTimeout(() => {
       controller.abort();
+      timedOut = true;
       resolve({ exitCode: 124, stdout: "", stderr: `timed out after ${opts.timeoutMs}ms`, timedOut: true });
     }, opts.timeoutMs);
   });
   try {
-    const run = exec(cmd, { cwd: opts.cwd, signal: controller.signal }).then((r) => ({ ...r, timedOut: false }));
+    const run = exec(cmd, { cwd: opts.cwd, signal: controller.signal })
+      .then((r) => ({ ...r, timedOut: false }))
+      .catch((error: unknown) => {
+        if (timedOut) {
+          // The timeout already won the race: the exec's post-timeout abort
+          // has nowhere to go. Settle it as the timeout result instead of
+          // leaving a rejection attached only to the lost race, where it
+          // surfaces as an unhandled rejection that can terminate Node.
+          return { exitCode: 124, stdout: "", stderr: `timed out after ${opts.timeoutMs}ms`, timedOut: true };
+        }
+        throw error;
+      });
     return await Promise.race([run, timeout]);
   } finally {
     clearTimeout(timer);

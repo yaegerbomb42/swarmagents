@@ -11,7 +11,7 @@ export interface PatchFile {
   status: PatchFileStatus;
   /** Set for renames. */
   oldPath?: string;
-  /** Set when the patch creates or modifies this path as a symlink (mode 120000). */
+  /** Set when the patch creates, deletes, or changes a symlink (mode 120000). */
   symlink?: boolean;
 }
 
@@ -85,6 +85,20 @@ function splitDiffGit(line: string): [string, string] | null {
  * `---`/`+++` headers, and `rename`/`copy from`/`to` — so a crafted patch
  * cannot hide an escaping path behind a benign git header.
  */
+
+/** Whether a declared path is unsafe on its face (traversal, absolute, .git, control chars). Extra declared paths (a --- header, a git a-side) are only kept as separate entries when they are unsafe: a benign old path needs no entry of its own, and keeping it would pollute the file list. */
+function looksUnsafePath(p: string): boolean {
+  if (!p) return true;
+  const parts = p.replace(/\\/g, "/").split("/");
+  return (
+    /[\0-\x1F\x7F]/.test(p) ||
+    p.startsWith("/") ||
+    /^[A-Za-z]:/.test(p) ||
+    parts.includes("..") ||
+    parts.some((part) => part.toLowerCase() === ".git")
+  );
+}
+
 export function parsePatchFiles(diff: string): PatchFile[] {
   const files: PatchFile[] = [];
   const add = (file: PatchFile) => {
@@ -97,10 +111,10 @@ export function parsePatchFiles(diff: string): PatchFile[] {
   /** Inside a git file section, ---/+++ only count before the first hunk. */
   let inHunk = false;
 
-  /** Close the current section, keeping any a-side path it declared. */
+  /** Close the current section, keeping any unsafe a-side path it declared. */
   const flushCurrent = () => {
     if (!current) return;
-    if (gitAside !== null && gitAside !== current.path && gitAside !== current.oldPath) {
+    if (gitAside !== null && gitAside !== current.path && gitAside !== current.oldPath && looksUnsafePath(gitAside)) {
       add({ path: gitAside, status: "M" });
     }
     add(current);
@@ -132,6 +146,7 @@ export function parsePatchFiles(diff: string): PatchFile[] {
         if (/^new file mode 120000$/.test(line)) current.symlink = true;
       } else if (line.startsWith("deleted file mode")) {
         current.status = "D";
+        if (/^deleted file mode 120000$/.test(line)) current.symlink = true;
       } else if (line.startsWith("old mode ")) {
         if (/^old mode 120000$/.test(line)) current.symlink = true;
       } else if (line.startsWith("new mode ")) {
@@ -159,11 +174,18 @@ export function parsePatchFiles(diff: string): PatchFile[] {
       } else if (line.startsWith("+++ ")) {
         const next = stripPrefix(line.slice(4));
         if (next === null) current.status = "D";
-        else if (next !== current.path) add({ path: next, status: current.status });
+        else if (next !== current.path) {
+          // The ---/+++ headers are authoritative for the file's path: the
+          // git header's b/ split can misfire on paths containing " b/".
+          // A correction also proves the git header split unreliable, so the
+          // a-side it produced must not be preserved at flush time.
+          current.path = next;
+          gitAside = null;
+        }
       } else if (line.startsWith("--- ")) {
         const prev = stripPrefix(line.slice(4));
         if (prev === null && current.status === "M") current.status = "A";
-        else if (prev !== null && prev !== current.path && prev !== current.oldPath) {
+        else if (prev !== null && prev !== current.path && prev !== current.oldPath && looksUnsafePath(prev)) {
           add({ path: prev, status: current.status });
         }
       }
@@ -199,7 +221,14 @@ export function unsafePatchPaths(files: PatchFile[]): string[] {
   for (const file of files) {
     // A patch that creates or modifies a path as a symlink is unsafe even
     // when the path itself looks innocent.
-    if (file.symlink) push(file.path || "(empty path)");
+    if (file.symlink) {
+      // A symlink in the patch could point outside the repo; the safety
+      // stage rejects the patch rather than trusting the link target.
+      for (const p of [file.path, file.oldPath]) {
+        if (p !== undefined) push(`${p} (symlink)`);
+      }
+      continue;
+    }
     for (const p of [file.path, file.oldPath]) {
       if (p === undefined) continue;
       const parts = p.replace(/\\/g, "/").split("/");

@@ -61,16 +61,16 @@ export async function POST(request: NextRequest) {
     body = await readJsonBody(request);
   } catch (err) {
     if (err instanceof JsonBodyError) {
-      return NextResponse.json({ error: err.message }, { status: err.status });
+      return NextResponse.json({ error: err.message }, { status: err.status, headers: NO_STORE });
     }
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400, headers: NO_STORE });
   }
   if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400 });
+    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400, headers: NO_STORE });
   }
   const input = body as Record<string, unknown>;
   if (typeof input.fact !== "string" || input.fact.trim() === "") {
-    return NextResponse.json({ error: "fact must be a non-empty string." }, { status: 400 });
+    return NextResponse.json({ error: "fact must be a non-empty string." }, { status: 400, headers: NO_STORE });
   }
 
   try {
@@ -78,7 +78,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ memory: publicFact(memory) }, { status: 201, headers: NO_STORE });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return NextResponse.json({ error: message }, { status: 400 });
+    return NextResponse.json({ error: message }, { status: 400, headers: NO_STORE });
   }
 }
 

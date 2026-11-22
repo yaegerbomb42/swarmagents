@@ -22,7 +22,9 @@ import {
   readAuditEntries,
   DEFAULT_AUDIT_LIMIT,
   MAX_AUDIT_LIMIT,
+  auditEntryTsMs,
   type AuditEntry,
+  type AuditResult,
 } from "../../../lib/audit";
 
 export const runtime = "nodejs";
@@ -34,21 +36,6 @@ const ACTION_FILTER_RE = /^[a-z0-9._*-]{1,64}$/i;
 function caller(req: NextRequest): string | null {
   const user = req.headers.get(USER_HEADER);
   return user && user.length > 0 && user.length <= 128 ? user : null;
-}
-
-function matchesAction(entryAction: string, filter: string): boolean {
-  if (filter.endsWith("*")) {
-    return entryAction.startsWith(filter.slice(0, -1));
-  }
-  if (filter.endsWith(".")) {
-    return entryAction.startsWith(filter);
-  }
-  return entryAction === filter;
-}
-
-/** Unix ms for an entry's ISO `ts`; NaN when the stored string does not parse. */
-function entryTsMs(entry: AuditEntry): number {
-  return Date.parse(entry.ts);
 }
 
 export async function GET(req: NextRequest) {
@@ -97,6 +84,8 @@ export async function GET(req: NextRequest) {
       { status: 400, headers: NO_STORE },
     );
   }
+  const resultOption: AuditResult | undefined =
+    resultFilter === "success" || resultFilter === "failure" ? resultFilter : undefined;
 
   const format = (params.get("format") ?? "json").toLowerCase();
   if (format !== "json" && format !== "ndjson") {
@@ -106,23 +95,39 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  // Over-fetch from the store when filters are active so `limit` applies post-filter
-  const rawEntries = readAuditEntries(user, { limit: MAX_AUDIT_LIMIT });
-  const filtered: AuditEntry[] = [];
-  for (const entry of rawEntries) {
-    if (beforeTs !== null) {
-      const entryMs = entryTsMs(entry);
-      if (!Number.isNaN(entryMs) && entryMs >= beforeTs) continue;
-    }
-    if (actionFilter && !matchesAction(entry.action, actionFilter)) continue;
-    if (resultFilter && entry.result !== resultFilter) continue;
-    filtered.push(entry);
-    if (filtered.length >= limit) break;
+  // Read at most `limit + 1` matching entries, applying all filters inside the
+  // store so a match older than any fixed truncation window remains reachable.
+  let matches: AuditEntry[] = readAuditEntries(user, {
+    limit: limit + 1,
+    beforeTs,
+    action: actionFilter,
+    result: resultOption,
+  });
+
+  // A page never splits a run of entries sharing one timestamp: resuming at a
+  // timestamp cursor would otherwise skip the rest of that same-ms group. Grow
+  // the fetch until the boundary is clean or the log is exhausted.
+  let want = limit + 1;
+  while (
+    want < MAX_AUDIT_LIMIT &&
+    matches.length > limit &&
+    auditEntryTsMs(matches[limit]) === auditEntryTsMs(matches[limit - 1])
+  ) {
+    want = matches.length + 1;
+    const more = readAuditEntries(user, { limit: want, beforeTs, action: actionFilter, result: resultOption });
+    if (more.length === matches.length) break;
+    matches = more;
   }
 
+  let end = Math.min(limit, matches.length);
+  while (end < matches.length && auditEntryTsMs(matches[end]) === auditEntryTsMs(matches[end - 1])) {
+    end += 1;
+  }
+  const filtered = matches.slice(0, end);
+
   let nextCursor: number | null = null;
-  if (filtered.length === limit && filtered.length > 0) {
-    const lastMs = entryTsMs(filtered[filtered.length - 1]);
+  if (filtered.length > 0 && matches.length > end) {
+    const lastMs = auditEntryTsMs(filtered[filtered.length - 1]);
     nextCursor = Number.isNaN(lastMs) ? null : lastMs;
   }
 

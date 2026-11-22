@@ -72,10 +72,15 @@ test("clampedTurnCeiling clamps, honors modelConfig, and floors at 1", () => {
   // No role → the (floored) global value.
   assert.equal(clampedTurnCeiling(undefined, 20), 20);
   assert.equal(clampedTurnCeiling(undefined, 0), 1);
+  assert.equal(clampedTurnCeiling(undefined, NaN), 1);
+  assert.equal(clampedTurnCeiling(undefined, -10), 1);
   // Role above the global → the global wins.
   assert.equal(clampedTurnCeiling({ id: "r", maxTurns: 50 }, 20), 20);
   // Role below 1 still clamps to at least 1.
   assert.equal(clampedTurnCeiling({ id: "r", maxTurns: 0 }, 20), 1);
+  assert.equal(clampedTurnCeiling({ id: "r", maxTurns: -5 }, 20), 1);
+  assert.equal(clampedTurnCeiling({ id: "r", maxTurns: NaN }, 20), 20);
+  assert.equal(clampedTurnCeiling({ id: "r", maxTurns: 8.7 }, 20), 8);
 });
 
 test("clampedDeadlineMs combines role and global deadlines", () => {
@@ -91,19 +96,36 @@ test("clampedDeadlineMs combines role and global deadlines", () => {
   assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: 120_000 }, undefined, 1_000), 121_000);
 });
 
-test("filteredTools keeps only whitelisted tools", () => {
-  const tools = [makeTool("read"), makeTool("bash"), makeTool("write_file")];
-  const role: RoleClamp = { id: "r", name: "R", allowedTools: ["read", "bash"] };
+test("filteredTools keeps only allowed tools (whitelist and permissions)", () => {
+  const tools = [
+    makeTool("read"),
+    makeTool("bash"),
+    makeTool("write_file"),
+    makeTool("Bash"),
+    makeTool("Write"),
+    makeTool("WebSearch"),
+  ];
+  const role: RoleClamp = { id: "r", name: "R", allowedTools: ["read", "bash", "Write"] };
   assert.deepEqual(
     filteredTools(role, tools).map((t) => t.name),
-    ["read", "bash"],
+    ["read", "bash", "Write"],
   );
-  // No whitelist → all tools, unchanged.
+
+  // Permission flags filter even without allowedTools set:
+  const readOnlyRole: RoleClamp = {
+    id: "reader",
+    permissions: { readOnly: true, commandExecutionAllowed: false, networkAllowed: false },
+  };
+  assert.deepEqual(
+    filteredTools(readOnlyRole, tools).map((t) => t.name),
+    ["read"],
+  );
+
+  // No role → all tools, unchanged.
   assert.deepEqual(filteredTools(undefined, tools), tools);
-  assert.deepEqual(filteredTools({ id: "r", name: "R" }, tools), tools);
 });
 
-test("isToolAllowed / toolDenialReason enforce whitelist and permissions", () => {
+test("isToolAllowed / toolDenialReason enforce whitelist and permissions for engine and Claude Code names", () => {
   const role: RoleClamp = { id: "r", name: "R", allowedTools: ["read"] };
   assert.equal(isToolAllowed(role, "read"), true);
   assert.equal(isToolAllowed(role, "bash"), false);
@@ -115,30 +137,65 @@ test("isToolAllowed / toolDenialReason enforce whitelist and permissions", () =>
   assert.equal(isToolAllowed(undefined, "anything"), true);
   assert.equal(toolDenialReason(undefined, "anything"), undefined);
 
-  // Permission flags deny even if the tool is mistakenly whitelisted.
+  // Permission flags deny both engine and Claude Code / permission names.
   const locked: RoleClamp = {
     id: "locked",
     name: "Locked",
-    allowedTools: ["read", "write_file", "bash", "web_search"],
+    allowedTools: [
+      "read",
+      "write_file",
+      "edit_file",
+      "Write",
+      "Edit",
+      "MultiEdit",
+      "NotebookEdit",
+      "bash",
+      "Bash",
+      "web_search",
+      "WebSearch",
+      "WebFetch",
+      "Browser",
+      "ApiRequest",
+      "mcp__github-mcp__*",
+    ],
     permissions: { readOnly: true, networkAllowed: false, commandExecutionAllowed: false },
   };
   assert.equal(isToolAllowed(locked, "read"), true);
-  assert.equal(isToolAllowed(locked, "write_file"), false);
-  assert.equal(isToolAllowed(locked, "bash"), false);
-  assert.equal(isToolAllowed(locked, "web_search"), false);
-  assert.match(toolDenialReason(locked, "write_file") ?? "", /read-only/);
-  assert.match(toolDenialReason(locked, "bash") ?? "", /execute commands/);
-  assert.match(toolDenialReason(locked, "web_search") ?? "", /network/);
+
+  // File mutations denied by readOnly
+  for (const tool of ["write_file", "edit_file", "Write", "Edit", "MultiEdit", "NotebookEdit"]) {
+    assert.equal(isToolAllowed(locked, tool), false, `${tool} must be denied under readOnly`);
+    assert.match(toolDenialReason(locked, tool) ?? "", /read-only/);
+  }
+
+  // Command executions denied by commandExecutionAllowed: false
+  for (const tool of ["bash", "Bash"]) {
+    assert.equal(isToolAllowed(locked, tool), false, `${tool} must be denied under commandExecutionAllowed: false`);
+    assert.match(toolDenialReason(locked, tool) ?? "", /execute commands/);
+  }
+
+  // Network reached tools denied by networkAllowed: false
+  for (const tool of ["web_search", "WebSearch", "WebFetch", "Browser", "ApiRequest", "mcp__github-mcp__*"]) {
+    assert.equal(isToolAllowed(locked, tool), false, `${tool} must be denied under networkAllowed: false`);
+    assert.match(toolDenialReason(locked, tool) ?? "", /network/);
+  }
 });
 
-test("clampedMaxTokens and clampedTurnTimeoutMs", () => {
+test("clampedMaxTokens and clampedTurnTimeoutMs guard non-finite and <= 0 numbers", () => {
   const role: RoleClamp = { id: "r", modelConfig: { maxTokens: 4096, turnTimeoutMs: 5_000 } };
   assert.equal(clampedMaxTokens(role, 8192), 4096);
+  assert.equal(clampedMaxTokens(role, undefined), 4096);
   assert.equal(clampedMaxTokens(undefined, 8192), 8192);
+  assert.equal(clampedMaxTokens(undefined, undefined), undefined);
+  assert.equal(clampedMaxTokens({ id: "r", modelConfig: { maxTokens: NaN } }, 8192), 8192);
+  assert.equal(clampedMaxTokens({ id: "r", modelConfig: { maxTokens: -50 } }, 8192), 8192);
+
   assert.equal(clampedTurnTimeoutMs(role, 30_000), 5_000);
   assert.equal(clampedTurnTimeoutMs({ id: "r", modelConfig: { turnTimeoutMs: 5_000 } }, undefined), 5_000);
   assert.equal(clampedTurnTimeoutMs(undefined, 30_000), 30_000);
   assert.equal(clampedTurnTimeoutMs(undefined, undefined), undefined);
+  assert.equal(clampedTurnTimeoutMs({ id: "r", modelConfig: { turnTimeoutMs: -100 } }, 30_000), 30_000);
+  assert.equal(clampedTurnTimeoutMs({ id: "r", modelConfig: { turnTimeoutMs: NaN } }, 30_000), 30_000);
 });
 
 test("roleSystemPrompt and roleModelRoute", () => {
@@ -236,7 +293,39 @@ test("applyRoleToRunRequest narrows tools, reports denials, and resolves limits"
   assert.match(applied.denials[0].reason, /whitelist/);
 });
 
-test("applyRoleToRunRequest keeps the request unchanged when the whitelist allows all tools", () => {
+test("applyRoleToRunRequest strips permission-denied tools even without allowedTools", () => {
+  const req = makeRequest({
+    rolePhase: makePhase(["Read", "Write", "Bash", "WebFetch", "mcp__github-mcp__*"]),
+  });
+  const role: RoleClamp = {
+    id: "reviewer",
+    permissions: { readOnly: true, commandExecutionAllowed: false, networkAllowed: false },
+  };
+  const applied = applyRoleToRunRequest(req, role);
+
+  assert.equal(applied.changed, true);
+  assert.deepEqual(applied.request.rolePhase?.allowedTools, ["Read"]);
+  assert.equal(applied.denials.length, 4);
+});
+
+test("applyRoleToRunRequest populates limits when defined by role even without opts", () => {
+  const req = makeRequest({ rolePhase: makePhase(["read"]) });
+  const role: RoleClamp = {
+    id: "bounded",
+    maxTurns: 12,
+    modelConfig: { maxTokens: 2048, turnTimeoutMs: 10000, deadlineMs: 50000 },
+  };
+  const applied = applyRoleToRunRequest(req, role);
+
+  assert.deepEqual(applied.limits, {
+    maxTurns: 12,
+    maxTokens: 2048,
+    turnTimeoutMs: 10000,
+    deadlineMs: 50000,
+  });
+});
+
+test("applyRoleToRunRequest keeps the request unchanged when all tools are allowed", () => {
   const req = makeRequest({ rolePhase: makePhase(["read", "bash"]) });
   const role: RoleClamp = { id: "r", allowedTools: ["read", "bash"] };
   const applied = applyRoleToRunRequest(req, role, {});

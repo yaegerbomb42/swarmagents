@@ -17,9 +17,15 @@ import {
 import type { BoardStore } from "./types";
 import type { SwarmTask, TaskProposal } from "@/lib/mcp-types";
 import { configureStorePaths, getStoragePaths, loadStore, withLockedStore, saveStoreAtomic } from "./store";
+import { validateGitBranch } from "./validation";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+
+// The remote branch check defaults on; handler tests use fake branches
+// that were never pushed, so disable it here (the check itself is
+// covered by git-remote.test.ts with a stubbed git).
+process.env.SWARM_GIT_REMOTE_CHECK = "0";
 
 function emptyStore(): BoardStore {
   return { tasks: [], proposals: [], messages: [] };
@@ -143,7 +149,7 @@ test("handlePollTasks filters and sorts", () => {
 
 test("handleSubmitTaskWork requires summary", async () => {
   const store = emptyStore();
-  const result = await handleSubmitTaskWork(store, { taskId: "x", gitBranch: "main" });
+  const result = await handleSubmitTaskWork(store, { taskId: "x", gitBranch: "feat/x" });
   assert.ok("error" in result);
   assert.equal(result.error.code, -32602);
 });
@@ -736,4 +742,67 @@ test("concurrent identical submissions write one history event; a revised branch
   assert.equal(updated.gitBranch, "feat/b");
   assert.equal(updated.prUrl, undefined);
   assert.deepEqual(updated.history?.map(({ from, to }) => [from, to]), [["claimed", "in_review"], ["in_review", "in_review"]]);
+});
+
+test("validateGitBranch accepts feat/fix/docs branches and rejects the rest", () => {
+  for (const branch of ["feat/x", "fix/abc-def", "docs/readme", "feat/a/b/c", " feat/x "]) {
+    assert.equal(validateGitBranch(branch), null, branch);
+  }
+  const rejects: Array<[unknown, RegExp]> = [
+    ["", /required/],
+    ["main", /must not be main or master/],
+    ["master", /must not be main or master/],
+    ["chore/x", /must start with one of/],
+    ["feature/x", /must start with one of/],
+    ["feat/", /must name a branch after its prefix/],
+    ["feat//x", /must name a branch after its prefix/],
+    ["feat/x/", /must name a branch after its prefix/],
+    ["feat/has space", /must not contain whitespace/],
+    ["feat/has..dots", /must not contain whitespace/],
+    [123, /required/],
+  ];
+  for (const [branch, pattern] of rejects) {
+    const err = validateGitBranch(branch);
+    assert.ok(err, String(branch));
+    assert.equal(err.field, "gitBranch");
+    assert.match(err.message, pattern, String(branch));
+  }
+});
+
+test("submit_task_work rejects main/master and non-prefixed branches with a clear error", async () => {
+  for (const [gitBranch, pattern] of [
+    ["main", /must not be main or master/],
+    ["master", /must not be main or master/],
+    ["chore/x", /must start with one of feat\/, fix\/, docs\//],
+  ] as const) {
+    const store = emptyStore();
+    store.tasks.push(makeTask({ status: "claimed", claimedBy: "agent-a" }));
+    const result = await handleSubmitTaskWork(store, {
+      taskId: "t1",
+      agentName: "agent-a",
+      gitBranch,
+      summary: "done",
+    });
+    assert.ok("error" in result, gitBranch);
+    assert.equal(result.error.code, -32602);
+    assert.match(result.error.message, pattern, gitBranch);
+    // No mutation on validation failure.
+    assert.equal(store.tasks[0].status, "claimed");
+    assert.equal(store.tasks[0].gitBranch, undefined);
+  }
+});
+
+test("submit_task_work accepts a docs/ branch end to end", async () => {
+  const store = emptyStore();
+  store.tasks.push(makeTask({ status: "claimed", claimedBy: "agent-a" }));
+  const result = await handleSubmitTaskWork(store, {
+    taskId: "t1",
+    agentName: "agent-a",
+    gitBranch: "docs/board-push-rule",
+    summary: "documented",
+  });
+  assert.ok("result" in result);
+  const parsed = payload(result);
+  assert.equal(parsed.task.status, "in_review");
+  assert.equal(parsed.task.gitBranch, "docs/board-push-rule");
 });

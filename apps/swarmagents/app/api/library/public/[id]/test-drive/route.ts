@@ -17,7 +17,10 @@
  * Both GET paths also run the abandonment sweep for the caller, so a drive
  * the user never revisits is rolled back the next time any drive list is
  * read — the sweep is the background cleanup, and the explicit sweep
- * action is the manual trigger. (There is no app-level periodic hook for
+ * action is the manual trigger. Every path that can restore a snapshot
+ * (keep, rollback, start, both GET sweeps, the sweep action) runs behind
+ * the user's Test-Drive lock, so a background restore can never race a
+ * keep and wipe a kept VM. (There is no app-level periodic hook for
  * library records to piggyback on: the RuntimeManager watchdog and the
  * VM idle sweeper are run/VM-scoped, so the route reads + the sweep
  * action are the mechanism, not a new timer.)
@@ -183,7 +186,11 @@ async function finalizeDriveIfNeeded(
   drive: TestDriveRecord,
   userId: string,
 ): Promise<TestDriveRecord> {
-  if (drive.status !== "running") return drive;
+  // Every caller holds the user's Test-Drive lock, so this re-read sees the
+  // record as the last transition behind that lock left it — never a
+  // concurrently-moving mid-transition state.
+  const current = getTestDrive(drive.id) ?? drive;
+  if (current.status !== "running") return current;
   const report = readRunReport(drive.runId);
   if (!report) return drive;
   if (report.status === "finished") {
@@ -253,28 +260,30 @@ export async function GET(req: Request, context: { params: Promise<{ id: string 
     return jsonError("Invalid request id.", 400);
   }
   const driveId = new URL(req.url).searchParams.get("driveId") ?? "";
-  if (driveId) {
-    const drive = getTestDrive(driveId);
-    if (!drive || drive.userId !== user || drive.publicId !== id) {
-      return jsonError("Test-drive not found.", 404);
+  // A GET drives VM transitions (the sweep + finalize), so it must not run
+  // concurrently with a locked keep/rollback/start: the lock is what keeps a
+  // background restore from wiping a drive the user is keeping.
+  return withUserLock(user, async () => {
+    if (driveId) {
+      const drive = getTestDrive(driveId);
+      if (!drive || drive.userId !== user || drive.publicId !== id) {
+        return jsonError("Test-drive not found.", 404);
+      }
+      await sweepStaleDrives(user);
+      const finalized = await finalizeDriveIfNeeded(drive, user);
+      return NextResponse.json({ drive: driveView(finalized, user) }, { headers: NO_STORE });
     }
     await sweepStaleDrives(user);
-    // Re-read: the sweep may have rolled back this very drive, and the
-    // `drive` object above still carries its pre-sweep status.
-    const fresh = getTestDrive(driveId) ?? drive;
-    const finalized = await finalizeDriveIfNeeded(fresh, user);
-    return NextResponse.json({ drive: driveView(finalized, user) }, { headers: NO_STORE });
-  }
-  await sweepStaleDrives(user);
-  const drives = listTestDrivesForUser(user)
-    .filter((drive) => drive.publicId === id)
-    .slice(0, 10);
-  const views: TestDriveView[] = [];
-  for (const drive of drives) {
-    const finalized = await finalizeDriveIfNeeded(drive, user);
-    views.push(driveView(finalized, user));
-  }
-  return NextResponse.json({ drives: views }, { headers: NO_STORE });
+    const drives = listTestDrivesForUser(user)
+      .filter((drive) => drive.publicId === id)
+      .slice(0, 10);
+    const views: TestDriveView[] = [];
+    for (const drive of drives) {
+      const finalized = await finalizeDriveIfNeeded(drive, user);
+      views.push(driveView(finalized, user));
+    }
+    return NextResponse.json({ drives: views }, { headers: NO_STORE });
+  });
 }
 
 export async function POST(req: Request, context: { params: Promise<{ id: string }> }) {
@@ -345,10 +354,12 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
   }
 
   if (action === "sweep") {
-    const result = await sweepAbandonedDrives(user, (drive) =>
-      getVmManager().restore(drive.userId, drive.snapshotLabel),
-    );
-    return NextResponse.json(result, { headers: NO_STORE });
+    return withUserLock(user, async () => {
+      const result = await sweepAbandonedDrives(user, (drive) =>
+        getVmManager().restore(drive.userId, drive.snapshotLabel),
+      );
+      return NextResponse.json(result, { headers: NO_STORE });
+    });
   }
 
   if (action !== "start") {

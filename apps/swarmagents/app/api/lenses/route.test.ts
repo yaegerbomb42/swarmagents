@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NextRequest } from "next/server";
 import { POST } from "./route";
+import { lensErrorResponse } from "../../../lib/lenses/error-response";
+import { RouterError } from "../../../lib/providers/router";
 import { configureProviderStorePaths, saveProvider } from "../../../lib/providers/store";
 import { configureRunsDir, getRunsDir } from "../../../lib/telemetry/paths";
 import { telemetryBus } from "../../../lib/telemetry";
@@ -140,6 +142,29 @@ test("a failing provider answers with a redacted error, never with key material"
   assert.equal(res.status, 502);
   const body = await res.json();
   assert.equal(String(body.error).includes(apiKey), false);
+});
+
+test("lensErrorResponse surfaces RouterError messages only", async () => {
+  const res = lensErrorResponse(new RouterError("No providers configured.", "no_providers"));
+  assert.equal(res.status, 502);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "No providers configured.");
+});
+
+test("lensErrorResponse hides internals for any non-RouterError", async () => {
+  // A raw leaked internal message (e.g. a stack path or key material) must
+  // never reach the client.
+  const res = lensErrorResponse(new Error(`secret ${apiKey} at /srv/app/lib/foo.ts:12`));
+  assert.equal(res.status, 502);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "Lens failed.");
+  assert.equal(String(body.error).includes(apiKey), false);
+  assert.equal(String(body.error).includes("/srv/app"), false);
+
+  // Non-Error throws are generic too.
+  const thrown = lensErrorResponse("something unexpected");
+  assert.equal(thrown.status, 502);
+  assert.equal(((await thrown.json()) as { error: string }).error, "Lens failed.");
 });
 
 test("a run artifact that is a symlink outside /workspace never reaches the provider", async () => {

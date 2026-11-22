@@ -19,6 +19,7 @@ import {
   verifyLocalUser,
   isScryptBusyError,
   normalizeEmail,
+  localUserIdForEmail,
   type LocalUser,
 } from "../../../lib/users";
 import { recordAudit, auditLoginFailureTarget } from "../../../lib/audit";
@@ -101,9 +102,16 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
   if (!user) {
     // The attempted email is an identifier, not a secret; the password is
-    // never logged. Sanitize before audit so targets stay bounded and printable.
+    // never logged. Attribute the failure to the TARGETED account (its uid)
+    // so brute-force attempts show up in that user's own audit log — not
+    // under a global "anonymous" that nobody can see. Sanitize before audit
+    // so targets stay bounded and printable. The same generic 401 is
+    // returned either way, so attributing the audit line reveals nothing
+    // about whether the account actually exists.
+    const normalized = normalizeEmail(body.email);
+    const attemptedUid = normalized ? localUserIdForEmail(normalized) : "anonymous";
     recordAudit({
-      user: "anonymous",
+      user: attemptedUid,
       action: "login.failure",
       target: auditLoginFailureTarget(body.email),
       result: "failure",

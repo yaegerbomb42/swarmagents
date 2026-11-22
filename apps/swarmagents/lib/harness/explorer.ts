@@ -109,26 +109,33 @@ const SKIP_DIRS: ReadonlySet<string> = new Set([".git", "node_modules"]);
 const MAX_WALK_FILES = 5000;
 
 /** Repo files, newest-agnostic sorted order; never follows symlinks. */
+function isKeptEntry(entry: fs.Dirent): boolean {
+  return !SKIP_DIRS.has(entry.name) && !entry.isSymbolicLink();
+}
+
+function collectRepoFiles(dir: string, stack: string[], out: string[]): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!isKeptEntry(entry)) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) stack.push(full);
+    else if (entry.isFile()) {
+      out.push(full);
+      if (out.length >= MAX_WALK_FILES) return;
+    }
+  }
+}
+
 function walkRepoFiles(repoRoot: string): string[] {
   const out: string[] = [];
   const stack = [repoRoot];
   while (stack.length > 0 && out.length < MAX_WALK_FILES) {
-    const dir = stack.pop() as string;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (SKIP_DIRS.has(entry.name) || entry.isSymbolicLink()) continue;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) stack.push(full);
-      else if (entry.isFile()) {
-        out.push(full);
-        if (out.length >= MAX_WALK_FILES) break;
-      }
-    }
+    collectRepoFiles(stack.pop() as string, stack, out);
   }
   return out.sort((a, b) => a.localeCompare(b));
 }
@@ -165,6 +172,65 @@ function argInt(args: Record<string, unknown>, key: string, fallback: number): n
   return fallback;
 }
 
+function resolveRipgrepRoots(
+  repoRoot: string,
+  scope: string | null,
+): { roots: string[]; error?: string } {
+  if (!scope) return { roots: [repoRoot] };
+  const resolved = resolveInRepo(repoRoot, scope);
+  if (!resolved) return { roots: [], error: `ripgrep: path escapes the repo: ${scope}` };
+  try {
+    const st = fs.lstatSync(resolved);
+    if (st.isSymbolicLink()) return { roots: [], error: `ripgrep: symlinks are not followed: ${scope}` };
+    return { roots: [resolved] };
+  } catch {
+    return { roots: [], error: `ripgrep: no such path: ${scope}` };
+  }
+}
+
+function collectFiles(roots: string[]): string[] {
+  const files: string[] = [];
+  for (const root of roots) {
+    try {
+      const st = fs.lstatSync(root);
+      if (st.isFile()) files.push(root);
+      else if (st.isDirectory()) files.push(...walkRepoFiles(root));
+    } catch {
+      // Unreadable root: skip it.
+    }
+  }
+  return files;
+}
+
+function ripgrepFile(
+  file: string,
+  regex: RegExp,
+  repoRoot: string,
+  maxMatches: number,
+  matches: Array<{ path: string; line: number; text: string }>,
+): void {
+  if (matches.length >= maxMatches) return;
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    return;
+  }
+  if (stat.size > 1024 * 1024 || !isTextFile(file)) return;
+  let text: string;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return;
+  }
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length && matches.length < maxMatches; i++) {
+    if (regex.test(lines[i])) {
+      matches.push({ path: toPosix(repoRoot, file), line: i + 1, text: lines[i].trim().slice(0, 300) });
+    }
+  }
+}
+
 function ripgrep(repoRoot: string, args: Record<string, unknown>): ExplorerToolResult {
   const pattern = argString(args, "pattern");
   if (!pattern) return toolError("ripgrep: pattern is required.");
@@ -176,52 +242,11 @@ function ripgrep(repoRoot: string, args: Record<string, unknown>): ExplorerToolR
   }
   const scope = argString(args, "path");
   const maxMatches = Math.min(Math.max(argInt(args, "maxMatches", 50), 1), 200);
-  let roots: string[];
-  if (scope) {
-    const resolved = resolveInRepo(repoRoot, scope);
-    if (!resolved) return toolError(`ripgrep: path escapes the repo: ${scope}`);
-    try {
-      const st = fs.lstatSync(resolved);
-      if (st.isSymbolicLink()) return toolError(`ripgrep: symlinks are not followed: ${scope}`);
-      roots = [resolved];
-    } catch {
-      return toolError(`ripgrep: no such path: ${scope}`);
-    }
-  } else {
-    roots = [repoRoot];
-  }
+  const { roots, error } = resolveRipgrepRoots(repoRoot, scope);
+  if (error) return toolError(error);
   const matches: Array<{ path: string; line: number; text: string }> = [];
-  const files: string[] = [];
-  for (const root of roots) {
-    try {
-      const st = fs.lstatSync(root);
-      if (st.isFile()) files.push(root);
-      else if (st.isDirectory()) files.push(...walkRepoFiles(root));
-    } catch {
-      // Unreadable root: skip it.
-    }
-  }
-  for (const file of files) {
-    if (matches.length >= maxMatches) break;
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(file);
-    } catch {
-      continue;
-    }
-    if (stat.size > 1024 * 1024 || !isTextFile(file)) continue;
-    let text: string;
-    try {
-      text = fs.readFileSync(file, "utf8");
-    } catch {
-      continue;
-    }
-    const lines = text.split("\n");
-    for (let i = 0; i < lines.length && matches.length < maxMatches; i++) {
-      if (regex.test(lines[i])) {
-        matches.push({ path: toPosix(repoRoot, file), line: i + 1, text: lines[i].trim().slice(0, 300) });
-      }
-    }
+  for (const file of collectFiles(roots)) {
+    ripgrepFile(file, regex, repoRoot, maxMatches, matches);
   }
   return {
     ok: true,
@@ -251,7 +276,7 @@ function globToRegExp(glob: string): RegExp | null {
     } else if (ch === "?") {
       out += "[^/]";
     } else {
-      out += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+      out += ch.replace(/[.+^${}()|[\]\\]/g, String.raw`\$&`);
     }
   }
   out += "$";
@@ -307,7 +332,7 @@ function astOutline(repoRoot: string, args: Record<string, unknown>): ExplorerTo
 
 function lineCount(text: string): number {
   const lines = text.split("\n");
-  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  if (lines.at(-1) === "") lines.pop();
   return lines.length;
 }
 
@@ -330,7 +355,7 @@ function readFileRange(repoRoot: string, args: Record<string, unknown>): Explore
   }
   const lines = text.split("\n");
   // A trailing newline produces a final empty segment that is not a line.
-  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  if (lines.at(-1) === "") lines.pop();
   if (startLine > lines.length) {
     return toolError(`read_file_range: ${p} has ${lines.length} lines; startLine ${startLine} is out of range`);
   }
@@ -481,42 +506,52 @@ function downgrade(confidence: GroundTruthBrief["confidence"]): GroundTruthBrief
  * lines; any strip downgrades the confidence one notch and is recorded in
  * `missingInfo`.
  */
+type BriefLocation = GroundTruthBrief["relevantLocations"][number];
+
+type LocationOutcome =
+  | { kind: "stripped"; reason: string }
+  | { kind: "kept"; location: BriefLocation; corrected: boolean };
+
+/** Re-check one cited location against disk; strip or correct it as needed. */
+function verifyLocation(repoRoot: string, loc: BriefLocation): LocationOutcome {
+  const file = realFile(repoRoot, loc.path);
+  if (!file) return { kind: "stripped", reason: loc.path };
+  let text: string;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return { kind: "stripped", reason: loc.path };
+  }
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  if (loc.lineStart > lines.length || loc.lineStart < 1) {
+    return { kind: "stripped", reason: `${loc.path}:${loc.lineStart}-${loc.lineEnd}` };
+  }
+  const endLine = Math.min(loc.lineEnd, lines.length);
+  const actual = lines.slice(loc.lineStart - 1, endLine).join("\n");
+  // The snippet must be verbatim, not just trim-equal: a trimmed or
+  // reworded snippet is replaced with the exact file lines.
+  if (loc.snippet !== actual) {
+    return { kind: "kept", location: { ...loc, lineEnd: endLine, snippet: actual }, corrected: true };
+  }
+  return { kind: "kept", location: { ...loc, lineEnd: endLine }, corrected: false };
+}
+
 export function verifyBriefLocations(
   repoRoot: string,
   brief: GroundTruthBrief,
 ): { brief: GroundTruthBrief; stripped: number; corrected: number } {
-  const kept: GroundTruthBrief["relevantLocations"] = [];
+  const kept: BriefLocation[] = [];
   const strippedPaths: string[] = [];
   let corrected = 0;
   for (const loc of brief.relevantLocations) {
-    const file = realFile(repoRoot, loc.path);
-    if (!file) {
-      strippedPaths.push(loc.path);
+    const outcome = verifyLocation(repoRoot, loc);
+    if (outcome.kind === "stripped") {
+      strippedPaths.push(outcome.reason);
       continue;
     }
-    let text: string;
-    try {
-      text = fs.readFileSync(file, "utf8");
-    } catch {
-      strippedPaths.push(loc.path);
-      continue;
-    }
-    const lines = text.split("\n");
-    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-    if (loc.lineStart > lines.length || loc.lineStart < 1) {
-      strippedPaths.push(`${loc.path}:${loc.lineStart}-${loc.lineEnd}`);
-      continue;
-    }
-    const endLine = Math.min(loc.lineEnd, lines.length);
-    const actual = lines.slice(loc.lineStart - 1, endLine).join("\n");
-    // The snippet must be verbatim, not just trim-equal: a trimmed or
-    // reworded snippet is replaced with the exact file lines.
-    if (loc.snippet !== actual) {
-      kept.push({ ...loc, lineEnd: endLine, snippet: actual });
-      corrected++;
-    } else {
-      kept.push({ ...loc, lineEnd: endLine });
-    }
+    kept.push(outcome.location);
+    if (outcome.corrected) corrected++;
   }
   let { confidence, missingInfo } = brief;
   if (strippedPaths.length > 0) {
@@ -597,11 +632,17 @@ interface ChatCompletionResponse {
 }
 
 function cleanModelJson(rawText: string): string {
-  return rawText
-    .trim()
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
+  let text = rawText.trim();
+  if (text.startsWith("```")) {
+    text = text.slice(3);
+    // Strip the optional "json" language tag, then leading whitespace.
+    if (text.toLowerCase().startsWith("json")) text = text.slice(4);
+    text = text.replace(/^\s*/, "");
+  }
+  if (text.endsWith("```")) {
+    text = text.slice(0, text.length - 3);
+  }
+  return text.trim();
 }
 
 export interface ExplorerOptions {
@@ -657,24 +698,28 @@ export async function runExplorer(query: string, options: ExplorerOptions): Prom
     if (step.action === "final") {
       const brief = normalizeBrief(step.brief);
       if (brief) return verifyBriefLocations(repoRoot, { ...brief, query }).brief;
-      messages.push({ role: "assistant", content: JSON.stringify(step) });
-      messages.push({
-        role: "user",
-        content: "That brief failed validation (check the query, 120-word answer, 12-line snippets, and location roles). Fix it or use the tools to gather more evidence.",
-      });
+      messages.push(
+        { role: "assistant", content: JSON.stringify(step) },
+        { role: "user", content: "That brief failed validation (check the query, 120-word answer, 12-line snippets, and location roles). Fix it or use the tools to gather more evidence." },
+      );
       continue;
     }
     const result = executeExplorerTool(repoRoot, step.tool, step.args);
-    messages.push({ role: "assistant", content: JSON.stringify(step) });
-    messages.push({
-      role: "user",
-      content: `Tool ${step.tool} result: ${JSON.stringify(result).slice(0, 8000)}`,
-    });
+    messages.push(
+      { role: "assistant", content: JSON.stringify(step) },
+      { role: "user", content: `Tool ${step.tool} result: ${JSON.stringify(result).slice(0, 8000)}` },
+    );
   }
   return verifyBriefLocations(
     repoRoot,
     fallbackBrief(query, `Explorer budget exhausted after ${steps} step${steps === 1 ? "" : "s"} (max ${maxSteps}, ${maxWallClockMs}ms).`),
   ).brief;
+}
+
+function stripTrailingSlashes(url: string): string {
+  let end = url.length;
+  while (end > 0 && url[end - 1] === "/") end--;
+  return url.slice(0, end);
 }
 
 async function callExplorerModel(
@@ -683,7 +728,7 @@ async function callExplorerModel(
   timeoutMs: number,
   fetchImpl: typeof fetch,
 ): Promise<z.infer<typeof ExplorerStepSchema>> {
-  const url = `${endpoint.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const url = `${stripTrailingSlashes(endpoint.baseUrl)}/chat/completions`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.min(endpoint.timeoutMs ?? 20_000, Math.max(timeoutMs, 1)));
   const headers: Record<string, string> = { "content-type": "application/json" };

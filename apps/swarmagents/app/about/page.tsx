@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 
 export const dynamic = "force-dynamic";
 
@@ -49,21 +50,21 @@ export default function AboutPage() {
           </p>
           <p>
             Ready to try it?{" "}
-            <a href="/login" className="text-cyan-300 underline underline-offset-2 hover:text-cyan-200">
+            <Link href="/login" className="text-cyan-300 underline underline-offset-2 hover:text-cyan-200">
               Sign in or create an account
-            </a>{" "}
+            </Link>{" "}
             and add a provider key to run your first task. Service status
             lives on the{" "}
-            <a href="/status" className="text-cyan-300 underline underline-offset-2 hover:text-cyan-200">
+            <Link href="/status" className="text-cyan-300 underline underline-offset-2 hover:text-cyan-200">
               status page
-            </a>
+            </Link>
             .
           </p>
         </div>
         <p className="mt-10 border-t border-white/10 pt-6 text-xs text-white/40">
-          <a href="/" className="text-cyan-300 hover:text-cyan-200">
+          <Link href="/" className="text-cyan-300 hover:text-cyan-200">
             ← Back to the console
-          </a>
+          </Link>
         </p>
       </div>
     </main>

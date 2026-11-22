@@ -86,10 +86,10 @@ const OUTCOME_SUMMARY =
 
 // Built from char codes so the source contains no literal control characters
 // (Sonar S6324).
-const ESC = String.fromCharCode(0x1b);
-const BEL = String.fromCharCode(0x07);
+const ESC = String.fromCodePoint(0x1b);
+const BEL = String.fromCodePoint(0x07);
 const ANSI_RE = new RegExp(
-  `${ESC}\\[[0-9;]*[A-Za-z]|${ESC}\\][^${BEL}${ESC}]*(?:${BEL}|${ESC}\\\\)`,
+  String.raw`${ESC}\[[0-9;]*[A-Za-z]|${ESC}\][^${BEL}${ESC}]*(?:${BEL}|${ESC}\\)`,
   "g",
 );
 
@@ -108,7 +108,7 @@ export function collapseCarriageReturns(text: string): string {
     .map((line) => {
       if (!line.includes("\r")) return line;
       const frames = line.split("\r").map((f) => f.trim()).filter(Boolean);
-      return frames.length ? frames[frames.length - 1] : "";
+      return frames.at(-1) ?? "";
     })
     .join("\n");
 }
@@ -143,9 +143,28 @@ const TEST_COMMAND = /\b(jest|vitest|pytest|go test|cargo test|npm test|yarn tes
 const BUILD_COMMAND = /\b(tsc|eslint|webpack|next build|vite build|rollup)\b/;
 const SEARCH_COMMAND = /^\s*(ls|find|rg|ripgrep|grep|fd)\b/;
 
-const TEST_SIGNATURE =
-  /(^|\n)\s*(PASS|FAIL)\s+\S|✓|✕|×|●.*›|--- (PASS|FAIL):|test .* \.\.\. (ok|FAILED)|test result: (ok|FAILED)|===.*\b(passed|failed)\b/;
-const BUILD_SIGNATURE = /error TS\d+|ERROR in |Failed to compile|:\d+:\d+[ \t]+error\b|✖.*\d+ problems?/;
+// Each signature splits into small patterns to avoid regex backtracking and to
+// keep each one under the complexity budget (Sonar S2311 / S5327).
+const TEST_SIGNATURE = [
+  /(^|\n)\s*(PASS|FAIL)\s+\S/,
+  /✓|✕|×/,
+  /●[^\r\n\u2028\u2029]*›/,
+  /--- (PASS|FAIL):/,
+  /test [^\r\n\u2028\u2029]* \.\.\. (ok|FAILED)/,
+  /test result: (ok|FAILED)/,
+  /===[^\r\n\u2028\u2029]*\b(passed|failed)\b/,
+];
+const BUILD_SIGNATURE = [
+  /error TS\d+/,
+  /ERROR in /,
+  /Failed to compile/,
+  /:\d+:\d+[ \t]+error\b/,
+  /✖[^\r\n\u2028\u2029]*\d+ problems?/,
+];
+
+function matchesAny(patterns: readonly RegExp[], text: string): boolean {
+  return patterns.some((re) => re.test(text));
+}
 const RG_LINE = /^[^:\s][^:]*:\d+:/;
 
 export function detectKind(command: string | undefined, lines: string[]): ObservationKind {
@@ -155,8 +174,8 @@ export function detectKind(command: string | undefined, lines: string[]): Observ
     if (SEARCH_COMMAND.test(command)) return "search";
   }
   const sample = lines.slice(0, 200).join("\n");
-  if (TEST_SIGNATURE.test(sample)) return "test";
-  if (BUILD_SIGNATURE.test(sample)) return "build";
+  if (matchesAny(TEST_SIGNATURE, sample)) return "test";
+  if (matchesAny(BUILD_SIGNATURE, sample)) return "build";
   const rgHits = lines.filter((l) => RG_LINE.test(l)).length;
   if (lines.length >= 20 && rgHits / lines.length > 0.5) return "search";
   return "generic";
@@ -168,13 +187,29 @@ export function detectKind(command: string | undefined, lines: string[]): Observ
 
 const PASS_LINE = /^\s*✓|^\s*PASS\b|PASSED\b|--- PASS:|test .* \.\.\. ok\b|^ok\s+\S/;
 const FAIL_LINE = /^\s*[✕×]|^\s*FAIL\b|FAILED\b|--- FAIL:|test .* \.\.\. FAILED\b|^FAIL\s+\S/;
-const FAIL_HEADER = /^\s*●.*›|^\s*FAIL\s+\S|^_+ \S+ _+$|^\s*FAILURES?:?$|^\s*_{3,}/;
-const SUMMARY_LINE =
-  /Tests:\s+\d+ (passed|failed)|Test Suites:|test result: (ok|FAILED)|===.*\b(passed|failed|error)\b.*===|Time:\s*[\d.]+ ?s|^\s*(ok|FAIL)\s+\S+\s+\d/;
+const FAIL_HEADER = [
+  /^\s*●[^\r\n\u2028\u2029]*›/,
+  /^\s*FAIL\s+\S/,
+  /^_+ \S+ _+$/,
+  /^\s*FAILURES?:?$/,
+  /^\s*_{3,}/,
+];
+const SUMMARY_LINE = [
+  /Tests:\s+\d+ (passed|failed)/,
+  /Test Suites:/,
+  /test result: (ok|FAILED)/,
+  /===[^\r\n\u2028\u2029]*\b(passed|failed|error)\b[^\r\n\u2028\u2029]*===/,
+  /Time:\s*[\d.]+ ?s/,
+  /^\s*(ok|FAIL)\s+\S+\s+\d/,
+];
+
+function isSummaryLine(line: string): boolean {
+  return matchesAny(SUMMARY_LINE, line);
+}
 const ASSERTION_LINE = /AssertionError|Expected|Received|Error:|assert\b|FAILED\s+\S+::|^\s*[>E]\s+\S/;
 const STACK_FRAME = /^\s+at\s+/;
 const INTERNAL_FRAME = /node_modules|site-packages|node:internal|internal\/|dist\/node_modules/;
-const DURATION = /(?:Time|in)\s*:?\s*(\d+(?:\.\d+)?)\s*s/;
+const DURATION = /(?:Time|in)\s*(?::\s*)?(\d+(?:\.\d+)?)\s*s/;
 
 interface TestTally {
   passed: number;
@@ -182,88 +217,111 @@ interface TestTally {
   duration?: string;
 }
 
+interface TestExtractState {
+  tally: TestTally;
+  kept: string[];
+  inFailure: boolean;
+  userFrames: number;
+  internalFrames: number;
+}
+
+function flushInternal(state: TestExtractState): void {
+  if (state.internalFrames > 0) {
+    state.kept.push(`[... ${state.internalFrames} internal frame${state.internalFrames === 1 ? "" : "s"} omitted]`);
+    state.internalFrames = 0;
+  }
+}
+
+/** Counts from a jest-style summary line; returns null when the line has none. */
+function countSummaryCounts(line: string): { passed: number; failed: number } | null {
+  const passedMatch = /(\d+)\s+passed/.exec(line);
+  const failedMatch = /(\d+)\s+failed/.exec(line);
+  if (!passedMatch && !failedMatch) return null;
+  return {
+    passed: passedMatch ? Number(passedMatch[1]) : 0,
+    failed: failedMatch ? Number(failedMatch[1]) : 0,
+  };
+}
+
+function buildTallyLine(tally: TestTally, total: number): string {
+  if (total === 0) return "";
+  const durationSuffix = tally.duration ? ` (${tally.duration})` : "";
+  return `PASS: ${tally.passed}/${total} tests${durationSuffix}`;
+}
+
+function handleSummaryLine(state: TestExtractState, line: string): void {
+  const duration = DURATION.exec(line)?.[1];
+  if (duration && !state.tally.duration) state.tally.duration = `${duration}s`;
+  // Counts from the summary win over line counting when both exist.
+  const counts = countSummaryCounts(line);
+  if (counts && (counts.passed > 0 || counts.failed > 0)) {
+    state.tally.passed = Math.max(state.tally.passed, counts.passed);
+    state.tally.failed = Math.max(state.tally.failed, counts.failed);
+  }
+}
+
+function handleLine(state: TestExtractState, line: string): void {
+  if (isSummaryLine(line)) {
+    handleSummaryLine(state, line);
+    state.kept.push(line);
+    state.inFailure = false;
+    return;
+  }
+  if (PASS_LINE.test(line) && !FAIL_LINE.test(line)) {
+    state.tally.passed++;
+    state.inFailure = false;
+    return;
+  }
+  if (FAIL_LINE.test(line)) {
+    state.tally.failed++;
+    flushInternal(state);
+    state.kept.push(line);
+    state.inFailure = true;
+    state.userFrames = 0;
+    return;
+  }
+  if (matchesAny(FAIL_HEADER, line)) {
+    flushInternal(state);
+    state.kept.push(line);
+    state.inFailure = true;
+    state.userFrames = 0;
+    return;
+  }
+  if (STACK_FRAME.test(line)) {
+    if (INTERNAL_FRAME.test(line)) {
+      state.internalFrames++;
+    } else if (state.userFrames < TEST_MAX_STACK_FRAMES) {
+      flushInternal(state);
+      state.kept.push(line);
+      state.userFrames++;
+    }
+    return;
+  }
+  if (state.inFailure || ASSERTION_LINE.test(line)) {
+    flushInternal(state);
+    state.kept.push(line);
+  }
+}
+
 /** Collapse passing test lists to a tally; keep failure headers, assertion diffs and capped user-code frames. */
 export function extractTest(lines: string[]): { text: string; tally: TestTally } | null {
-  const tally: TestTally = { passed: 0, failed: 0 };
-  const kept: string[] = [];
-  let inFailure = false;
-  let userFrames = 0;
-  let internalFrames = 0;
-
-  const flushInternal = (): void => {
-    if (internalFrames > 0) {
-      kept.push(`[... ${internalFrames} internal frame${internalFrames === 1 ? "" : "s"} omitted]`);
-      internalFrames = 0;
-    }
+  const state: TestExtractState = {
+    tally: { passed: 0, failed: 0 },
+    kept: [],
+    inFailure: false,
+    userFrames: 0,
+    internalFrames: 0,
   };
+  for (const line of lines) handleLine(state, line);
+  flushInternal(state);
 
-  for (const line of lines) {
-    if (SUMMARY_LINE.test(line)) {
-      const duration = DURATION.exec(line)?.[1];
-      if (duration && !tally.duration) tally.duration = `${duration}s`;
-      // Counts from the summary win over line counting when both exist.
-      const summaryCounts = /(\d+)\s+passed(?:,?\s+(\d+)\s+failed)?|(\d+)\s+failed(?:,?\s+(\d+)\s+passed)?/.exec(line);
-      if (summaryCounts) {
-        const passed = Number(summaryCounts[1] ?? summaryCounts[4] ?? 0);
-        const failed = Number(summaryCounts[2] ?? summaryCounts[3] ?? 0);
-        if (passed > 0 || failed > 0) {
-          tally.passed = Math.max(tally.passed, passed);
-          tally.failed = Math.max(tally.failed, failed);
-        }
-      }
-      kept.push(line);
-      inFailure = false;
-      continue;
-    }
-    if (PASS_LINE.test(line) && !FAIL_LINE.test(line)) {
-      tally.passed++;
-      inFailure = false;
-      continue;
-    }
-    if (FAIL_LINE.test(line)) {
-      tally.failed++;
-      flushInternal();
-      kept.push(line);
-      inFailure = true;
-      userFrames = 0;
-      continue;
-    }
-    if (FAIL_HEADER.test(line)) {
-      flushInternal();
-      kept.push(line);
-      inFailure = true;
-      userFrames = 0;
-      continue;
-    }
-    if (STACK_FRAME.test(line)) {
-      if (INTERNAL_FRAME.test(line)) {
-        internalFrames++;
-      } else if (userFrames < TEST_MAX_STACK_FRAMES) {
-        flushInternal();
-        kept.push(line);
-        userFrames++;
-      }
-      continue;
-    }
-    if (inFailure || ASSERTION_LINE.test(line)) {
-      flushInternal();
-      kept.push(line);
-      continue;
-    }
-    // Passing-test chatter, console output and file lists: dropped.
-  }
-  flushInternal();
-
-  if (tally.passed === 0 && tally.failed === 0 && kept.length === 0) return null;
-  const total = tally.passed + tally.failed;
-  const tallyLine =
-    total > 0
-      ? `PASS: ${tally.passed}/${total} tests${tally.duration ? ` (${tally.duration})` : ""}`
-      : "";
-  const body = kept.filter((l) => !SUMMARY_LINE.test(l));
-  const summary = kept.filter((l) => SUMMARY_LINE.test(l));
+  if (state.tally.passed === 0 && state.tally.failed === 0 && state.kept.length === 0) return null;
+  const total = state.tally.passed + state.tally.failed;
+  const tallyLine = buildTallyLine(state.tally, total);
+  const body = state.kept.filter((l) => !isSummaryLine(l));
+  const summary = state.kept.filter((l) => isSummaryLine(l));
   const text = [tallyLine, ...body, ...summary].filter(Boolean).join("\n");
-  return { text, tally };
+  return { text, tally: state.tally };
 }
 
 // ---------------------------------------------------------------------------
@@ -271,8 +329,35 @@ export function extractTest(lines: string[]): { text: string; tally: TestTally }
 // ---------------------------------------------------------------------------
 
 const TSC_ERROR = /^(.+?)\((\d+),(\d+)\): error (TS\d+): (.*)$/;
-const ESLINT_ERROR = /^(.+?):(\d+):(\d+)\s+(error|warning)\s+(.*?)(\s+([a-z0-9@/-]+))?$/;
+const ESLINT_ERROR = /^(.+?):(\d+):(\d+)\s+(error|warning)\s+(.+)$/;
 const WEBPACK_ERROR = /^ERROR in (.+)$/;
+
+const BUILD_LINE_RES = [
+  /Failed to compile/,
+  /error TS\d+/,
+  /✖[^\r\n\u2028\u2029]*problems?/,
+  /compiled with \d+ errors?/,
+  /compiled successfully/,
+];
+
+/** Split an eslint message into the rule token (last whitespace-separated token) and the remainder. */
+function ruleFromMessage(message: string): { rule: string; message: string } {
+  const ruleMatch = /\s([a-z0-9@/-]+)$/.exec(message);
+  if (ruleMatch) {
+    return { rule: ruleMatch[1], message: message.slice(0, message.length - ruleMatch[0].length) };
+  }
+  return { rule: message, message };
+}
+
+/** Keep the header line plus its detail lines until a blank line. */
+function collectWebpackBlock(lines: string[], startIndex: number, kept: string[]): number {
+  let j = startIndex + 1;
+  while (j < lines.length && lines[j].trim() !== "" && !WEBPACK_ERROR.test(lines[j])) {
+    kept.push(lines[j]);
+    j++;
+  }
+  return j;
+}
 
 /** Group errors by file+code, capping cascading identical errors per file. */
 export function extractBuild(lines: string[]): { text: string } | null {
@@ -291,38 +376,37 @@ export function extractBuild(lines: string[]): { text: string } | null {
     }
   };
 
-  for (let i = 0; i < lines.length; i++) {
+  let i = 0;
+  while (i < lines.length) {
     const line = lines[i];
     const tsc = TSC_ERROR.exec(line);
     if (tsc) {
       found = true;
       pushError(`${tsc[1]}|${tsc[4]}|${tsc[5]}`, line);
+      i++;
       continue;
     }
     const eslint = ESLINT_ERROR.exec(line);
-    if (eslint && eslint[4] === "error") {
+    if (eslint?.[4] === "error") {
       found = true;
-      const rule = eslint[7] ?? eslint[5];
-      pushError(`${eslint[1]}|${rule}|${eslint[5]}`, line);
+      const { rule, message } = ruleFromMessage(eslint[5]);
+      pushError(`${eslint[1]}|${rule}|${message}`, line);
+      i++;
       continue;
     }
     const webpack = WEBPACK_ERROR.exec(line);
     if (webpack) {
       found = true;
-      // Keep the header plus its detail lines until a blank line.
       kept.push(line);
-      let j = i + 1;
-      while (j < lines.length && lines[j].trim() !== "" && !WEBPACK_ERROR.test(lines[j])) {
-        kept.push(lines[j]);
-        j++;
-      }
-      i = j - 1;
+      // Keep the header plus its detail lines until a blank line.
+      i = collectWebpackBlock(lines, i, kept);
       continue;
     }
-    if (/Failed to compile|error TS\d+|✖.*problems?|compiled with \d+ errors?|compiled successfully/.test(line)) {
+    if (matchesAny(BUILD_LINE_RES, line)) {
       found = true;
       kept.push(line);
     }
+    i++;
   }
   if (!found) return null;
 

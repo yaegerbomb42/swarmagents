@@ -7,6 +7,7 @@
  * satisfies VmExec can be plugged in.
  */
 
+import type { StateLedgerSnapshot } from "./context/contextGovernor";
 import type { RiskLevel } from "./risk";
 
 /** Minimal exec interface, modeled on VmDriver. Implementations manage the actual process tree. */
@@ -383,6 +384,16 @@ export interface RoleSwitchRequest {
 
 export interface RunRequest {
   prompt: string;
+  /**
+   * Persisted L1 state ledger for this run (StateLedgerSnapshot, see
+   * lib/harness/context/contextGovernor.ts). When the run uses the "l1"
+   * packer, the runner hydrates the ledger from this snapshot instead of
+   * starting fresh, so a resumed or retried run inherits its negative
+   * constraints (failed attempts). The harness never reads files; the
+   * caller owns persisting the snapshot next to the run and passing it
+   * back on the next turn.
+   */
+  stateLedger?: StateLedgerSnapshot;
   /**
    * The agent card text — the user's own description of who the agent is and
    * what it should focus on. Passed to claude as `--append-system-prompt` so

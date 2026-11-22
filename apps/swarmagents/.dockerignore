@@ -30,6 +30,9 @@ e2e
 coverage
 playwright-report
 test-results
+*.test.ts
+*.test.mjs
+**/*.test.*
 
 # Local env files and secrets must never enter the build context.
 .env

@@ -121,6 +121,17 @@ export class DesktopBridge {
   private readonly frameDecoder: RfbServerDecoder | null;
   private readonly recorder: FrameRecorder | null;
 
+  // Bound so fail() can removeListener without leaking.
+  private readonly onClientData = (chunk: Buffer) => this.onClientChunk(chunk);
+  private readonly onUpstreamData = (chunk: Buffer) => this.onUpstreamChunk(chunk);
+  private readonly onClientDrainBound = () => this.onClientDrain();
+  private readonly onClientError = () => this.fail("client-error");
+  private readonly onUpstreamError = () => this.fail("upstream-error");
+  private readonly onClientEnd = () => this.fail("client-end");
+  private readonly onClientClose = () => this.fail("client-close");
+  private readonly onUpstreamEnd = () => this.fail("upstream-end");
+  private readonly onUpstreamClose = () => this.fail("upstream-close");
+
   constructor(
     private readonly client: net.Socket,
     private readonly upstream: net.Socket,
@@ -150,11 +161,16 @@ export class DesktopBridge {
     const startBytes = this.clientHs.start();
     if (startBytes.length > 0) this.writeUpstream(startBytes);
 
-    client.on("data", (chunk: Buffer) => this.onClientChunk(chunk));
-    upstream.on("data", (chunk: Buffer) => this.onUpstreamChunk(chunk));
-    client.on("drain", () => this.onClientDrain());
-    client.on("error", () => this.fail("client-error"));
-    upstream.on("error", () => this.fail("upstream-error"));
+    client.on("data", this.onClientData);
+    upstream.on("data", this.onUpstreamData);
+    client.on("drain", this.onClientDrainBound);
+    client.on("error", this.onClientError);
+    upstream.on("error", this.onUpstreamError);
+    // Detect half-open / peer-gone without waiting for the next ping.
+    client.on("end", this.onClientEnd);
+    client.on("close", this.onClientClose);
+    upstream.on("end", this.onUpstreamEnd);
+    upstream.on("close", this.onUpstreamClose);
 
     this.timeout = setTimeout(() => this.fail("handshake-timeout"), HANDSHAKE_TIMEOUT_MS);
     this.timeout.unref?.();
@@ -216,6 +232,18 @@ export class DesktopBridge {
     } catch {}
   }
 
+  private detachSocketListeners(): void {
+    this.client.removeListener("data", this.onClientData);
+    this.client.removeListener("drain", this.onClientDrainBound);
+    this.client.removeListener("error", this.onClientError);
+    this.client.removeListener("end", this.onClientEnd);
+    this.client.removeListener("close", this.onClientClose);
+    this.upstream.removeListener("data", this.onUpstreamData);
+    this.upstream.removeListener("error", this.onUpstreamError);
+    this.upstream.removeListener("end", this.onUpstreamEnd);
+    this.upstream.removeListener("close", this.onUpstreamClose);
+  }
+
   private fail(reason: string): void {
     if (this.closed) return;
     this.closed = true;
@@ -225,6 +253,7 @@ export class DesktopBridge {
     this.pingTimer = null;
     if (this.backpressureCloseTimer) clearTimeout(this.backpressureCloseTimer);
     this.backpressureCloseTimer = null;
+    this.detachSocketListeners();
     this.recorder?.close();
     this.client.destroy();
     this.upstream.destroy();

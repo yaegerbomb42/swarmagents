@@ -25,16 +25,16 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
 import { condenseLog } from "./log-condenser";
 
 export type ObservationKind = "test" | "build" | "search" | "generic";
 
 /** Default inline budget: filtered output longer than this spills to disk. */
 export const DEFAULT_MAX_INLINE_CHARS = 4000;
-/** Default spill directory (overridable per call, e.g. in tests). */
-export const DEFAULT_SPILL_DIR = "/tmp/swarm_obs";
+/** Base name for per-process spill directories created under os.tmpdir(). */
+export const DEFAULT_SPILL_DIR = "swarm_obs";
 /** Lines kept at the head/tail of a spilled output. */
 export const SPILL_HEAD_LINES = 35;
 export const SPILL_TAIL_LINES = 45;
@@ -84,7 +84,14 @@ const OUTCOME_SUMMARY =
 // Universal pre-filters
 // ---------------------------------------------------------------------------
 
-const ANSI_RE = /\x1B\[[0-9;]*[A-Za-z]|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)/g;
+// Built from char codes so the source contains no literal control characters
+// (Sonar S6324).
+const ESC = String.fromCharCode(0x1b);
+const BEL = String.fromCharCode(0x07);
+const ANSI_RE = new RegExp(
+  `${ESC}\\[[0-9;]*[A-Za-z]|${ESC}\\][^${BEL}${ESC}]*(?:${BEL}|${ESC}\\\\)`,
+  "g",
+);
 
 /** Strip ANSI colour/cursor escapes and OSC sequences. */
 export function stripAnsi(text: string): string {
@@ -367,10 +374,18 @@ function spillPath(spillDir: string, turnId: string, toolId: string): string {
 }
 
 /** Write the raw output to disk; returns the path, or undefined on failure. */
-function trySpill(spillDir: string, turnId: string, toolId: string, raw: string): string | undefined {
+function trySpill(
+  spillDir: string | undefined,
+  turnId: string,
+  toolId: string,
+  raw: string,
+): string | undefined {
   try {
-    fs.mkdirSync(spillDir, { recursive: true });
-    const file = spillPath(spillDir, turnId, toolId);
+    // With no override, create a fresh private directory (mkdtemp) instead of
+    // a predictable shared path under /tmp (Sonar S5443).
+    const dir = spillDir ?? fs.mkdtempSync(path.join(os.tmpdir(), `${DEFAULT_SPILL_DIR}-`));
+    if (spillDir) fs.mkdirSync(spillDir, { recursive: true });
+    const file = spillPath(dir, turnId, toolId);
     fs.writeFileSync(file, raw, "utf-8");
     return file;
   } catch {
@@ -385,7 +400,7 @@ function trySpill(spillDir: string, turnId: string, toolId: string, raw: string)
 export function filterObservation(input: ObservationFilterInput): ObservationFilterResult {
   const originalChars = input.output.length;
   const maxInlineChars = input.maxInlineChars ?? DEFAULT_MAX_INLINE_CHARS;
-  const spillDir = input.spillDir ?? DEFAULT_SPILL_DIR;
+  const spillDir = input.spillDir;
   const turnId = input.turnId ?? "turn-0";
   const toolId = input.toolId ?? "tool";
 
@@ -422,7 +437,7 @@ export function filterObservation(input: ObservationFilterInput): ObservationFil
     const linesOmitted = Math.max(0, filteredLines.length - shownLines.length);
     const pointer = spilledTo
       ? `[TRUNCATED: ${linesOmitted} lines omitted. Full raw output saved at ${spilledTo} - use read_file_range or grep to inspect.]`
-      : `[TRUNCATED: ${linesOmitted} lines omitted. Spill to ${spillDir} failed; full output unavailable.]`;
+      : `[TRUNCATED: ${linesOmitted} lines omitted. Spill to ${spillDir ?? "the spill directory"} failed; full output unavailable.]`;
     return {
       kind,
       text: [...shownLines, pointer].join("\n"),

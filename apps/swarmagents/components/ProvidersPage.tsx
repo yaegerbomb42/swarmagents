@@ -1,9 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { Activity, BookOpen, ChevronDown, ChevronUp, DollarSign, KeyRound, Loader2, Plus, RotateCw, Search, Trash2, X } from "lucide-react";
-import { PROVIDER_CATALOG, providerHue } from "../lib/providers/catalog";
+import { PROVIDER_CATALOG, canonicalProviderId, catalogEntry, providerHue } from "../lib/providers/catalog";
 import type { CatalogApiStyle, ProviderCatalogEntry } from "../lib/providers/catalog";
 
 interface KeySlot {
@@ -40,6 +40,8 @@ interface ProvidersData {
 
 interface AddDraft {
   entry: ProviderCatalogEntry;
+  /** Provider id sent to the API; editable for the custom endpoint. */
+  id: string;
   name: string;
   baseUrl: string;
   model: string;
@@ -75,6 +77,82 @@ const STYLE_CHIPS: ReadonlyArray<{ value: "all" | CatalogApiStyle; label: string
   { value: "custom", label: "Custom" },
 ];
 
+/**
+ * Minimal modal shell: dialog semantics, Escape-to-close and a Tab focus trap.
+ * There is no shared Modal primitive in the app yet, so these two provider
+ * modals carry the behavior themselves.
+ */
+function Dialog({
+  labelledBy,
+  onClose,
+  className,
+  children,
+}: {
+  labelledBy: string;
+  onClose: () => void;
+  className?: string;
+  children: ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusable = () =>
+      Array.from(
+        node.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )
+      );
+    focusable()[0]?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (items.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      previous?.focus();
+    };
+  }, []);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-[2px]" onClick={onClose} />
+      <div
+        ref={ref}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={labelledBy}
+        className={className}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
 export function ProvidersPage() {
   const [data, setData] = useState<ProvidersData | null>(null);
   const [loadError, setLoadError] = useState("");
@@ -85,7 +163,8 @@ export function ProvidersPage() {
   const [saved, setSaved] = useState("");
   /** Provider id whose removal is waiting for a confirmation click. */
   const [confirmRemove, setConfirmRemove] = useState("");
-  const [busy, setBusy] = useState("");
+  /** Provider ids with an in-flight mutation (a set so actions can overlap). */
+  const [busy, setBusy] = useState<Set<string>>(() => new Set());
   /** Per-provider test-connection result (testing flag, ok/latency/error). */
   const [testState, setTestState] = useState<
     Record<string, { testing: boolean; ok?: boolean; latencyMs?: number; error?: string }>
@@ -141,6 +220,31 @@ export function ProvidersPage() {
     [rankedProviders]
   );
 
+  /**
+   * Saved providers only, in router order. These are the entries the reorder
+   * endpoints can actually mutate; env-only providers have no saved row.
+   */
+  const reorderableProviders = useMemo(
+    () => [...(data?.providers ?? [])].filter((row) => row.saved).sort((a, b) => a.rank - b.rank),
+    [data]
+  );
+  const reorderIndexById = useMemo(
+    () => new Map(reorderableProviders.map((row, index) => [row.id, index])),
+    [reorderableProviders]
+  );
+
+  /** The catch-all catalog entry, looked up by id rather than by position. */
+  const customEntry = useMemo(() => catalogEntry("custom"), []);
+
+  const setProviderBusy = useCallback((id: string, value: boolean) => {
+    setBusy((prev) => {
+      const next = new Set(prev);
+      if (value) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+
   /** Catalog rows matching the search box and the active API-style chip. */
   const visibleCatalog = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -173,6 +277,7 @@ export function ProvidersPage() {
     setSaved("");
     setDraft({
       entry,
+      id: entry.id,
       name: entry.name,
       baseUrl: entry.baseUrl ?? "",
       model: entry.models?.default ?? "",
@@ -187,15 +292,22 @@ export function ProvidersPage() {
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!draft) return;
+    const id = canonicalProviderId(draft.id);
+    if (id === "") {
+      setDraft({ ...draft, error: "Enter a provider id (a-z, 0-9, dashes)." });
+      return;
+    }
+    const name = draft.name.trim();
     setDraft({ ...draft, saving: true, error: "" });
     try {
-      const models =
-        draft.model.trim() !== "" ? [draft.model] : draft.entry.models?.popular ?? [];
+      const model = draft.model.trim();
+      const models = model !== "" ? [model] : draft.entry.models?.popular ?? [];
       const res = await fetch("/api/providers", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          id: draft.entry.id,
+          id,
+          name: name !== "" ? name : undefined,
           apiStyle: draft.entry.apiStyle,
           baseUrl: draft.baseUrl.trim() !== "" ? draft.baseUrl.trim() : undefined,
           models: models.length > 0 ? models : undefined,
@@ -206,7 +318,7 @@ export function ProvidersPage() {
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `HTTP ${res.status}`);
       }
-      setSaved(`${draft.entry.name} connected — key stored server-side.`);
+      setSaved(`${name || draft.entry.name} connected — key stored server-side.`);
       setDraft(null);
       await refresh();
     } catch (err) {
@@ -227,9 +339,9 @@ export function ProvidersPage() {
 
   /** PATCH a single key slot: add, rotate or remove. */
   const patchKey = async (entry: ProviderCatalogEntry, body: Record<string, unknown>) => {
-    setBusy(entry.id);
+    setProviderBusy(entry.id, true);
     try {
-      const res = await fetch(`/api/providers/${entry.id}`, {
+      const res = await fetch(`/api/providers/${encodeURIComponent(entry.id)}`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
@@ -240,7 +352,7 @@ export function ProvidersPage() {
       }
       await refresh();
     } finally {
-      setBusy("");
+      setProviderBusy(entry.id, false);
     }
   };
 
@@ -286,10 +398,10 @@ export function ProvidersPage() {
 
   /** DELETE the provider and every key it holds. */
   const removeProvider = async (entry: ProviderCatalogEntry) => {
-    setBusy(entry.id);
+    setProviderBusy(entry.id, true);
     setConfirmRemove("");
     try {
-      const res = await fetch(`/api/providers/${entry.id}`, { method: "DELETE" });
+      const res = await fetch(`/api/providers/${encodeURIComponent(entry.id)}`, { method: "DELETE" });
       if (!res.ok) {
         const payload = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(payload?.error ?? `HTTP ${res.status}`);
@@ -299,16 +411,16 @@ export function ProvidersPage() {
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy("");
+      setProviderBusy(entry.id, false);
     }
   };
 
   /** Move a provider one slot up or down in the router's rank order. */
   const reorderProvider = async (entry: ProviderCatalogEntry, direction: "up" | "down") => {
-    setBusy(entry.id);
+    setProviderBusy(entry.id, true);
     setLoadError("");
     try {
-      const res = await fetch(`/api/providers/${entry.id}`, {
+      const res = await fetch(`/api/providers/${encodeURIComponent(entry.id)}`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ action: direction === "up" ? "move-up" : "move-down" }),
@@ -321,7 +433,7 @@ export function ProvidersPage() {
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy("");
+      setProviderBusy(entry.id, false);
     }
   };
 
@@ -329,7 +441,7 @@ export function ProvidersPage() {
   const testConnection = async (entry: ProviderCatalogEntry) => {
     setTestState((prev) => ({ ...prev, [entry.id]: { testing: true } }));
     try {
-      const res = await fetch(`/api/providers/${entry.id}/test`, {
+      const res = await fetch(`/api/providers/${encodeURIComponent(entry.id)}/test`, {
         method: "POST",
         cache: "no-store",
       });
@@ -428,7 +540,7 @@ export function ProvidersPage() {
             const savedRow = savedById.get(entry.id);
             const connected = row !== undefined;
             const rank = rankById.get(entry.id);
-            const rankIndex = rankedProviders.findIndex((p) => p.id === entry.id);
+            const reorderIndex = reorderIndexById.get(entry.id);
             const keyLink = linkFor(entry, "key");
             const docsLink = linkFor(entry, "docs");
             const pricingLink = linkFor(entry, "pricing");
@@ -537,7 +649,7 @@ export function ProvidersPage() {
                             type="button"
                             title="Remove this key"
                             aria-label={`Remove key ${slot.index + 1} of ${entry.name}`}
-                            disabled={busy === entry.id}
+                            disabled={busy.has(entry.id)}
                             onClick={() => removeKey(entry, slot.index)}
                             className="rounded-full p-1 text-white/40 transition hover:bg-white/10 hover:text-red-300 disabled:opacity-40"
                           >
@@ -587,14 +699,14 @@ export function ProvidersPage() {
                   )}
                 </div>
 
-                {rank !== undefined && rankedProviders.length > 1 && (
+                {savedRow && reorderIndex !== undefined && reorderableProviders.length > 1 && (
                   <div className="mt-3 flex items-center gap-1">
                     <span className="mr-1 text-[11px] text-white/35">Order</span>
                     <button
                       type="button"
                       title="Move earlier in the fallback order"
                       aria-label={`Move ${entry.name} up`}
-                      disabled={rankIndex <= 0 || busy === entry.id}
+                      disabled={reorderIndex <= 0 || busy.has(entry.id)}
                       onClick={() => void reorderProvider(entry, "up")}
                       className="rounded-full p-1 text-white/40 transition hover:bg-white/10 hover:text-white disabled:opacity-30"
                     >
@@ -604,7 +716,7 @@ export function ProvidersPage() {
                       type="button"
                       title="Move later in the fallback order"
                       aria-label={`Move ${entry.name} down`}
-                      disabled={rankIndex < 0 || rankIndex >= rankedProviders.length - 1 || busy === entry.id}
+                      disabled={reorderIndex >= reorderableProviders.length - 1 || busy.has(entry.id)}
                       onClick={() => void reorderProvider(entry, "down")}
                       className="rounded-full p-1 text-white/40 transition hover:bg-white/10 hover:text-white disabled:opacity-30"
                     >
@@ -637,7 +749,7 @@ export function ProvidersPage() {
                         <button
                           type="button"
                           onClick={() => removeProvider(entry)}
-                          disabled={busy === entry.id}
+                          disabled={busy.has(entry.id)}
                           className="flex items-center gap-1.5 rounded-full bg-red-400/15 px-3 py-1.5 text-xs text-red-200 ring-1 ring-red-400/30 transition hover:bg-red-400/25 disabled:opacity-50"
                         >
                           <Trash2 className="h-3 w-3" />
@@ -703,29 +815,63 @@ export function ProvidersPage() {
         </div>
 
         <div className="mt-10">
-          <button
-            onClick={() => openAdd(PROVIDER_CATALOG[PROVIDER_CATALOG.length - 1])}
-            className="flex items-center gap-2 rounded-2xl border border-dashed border-white/15 px-5 py-4 text-sm text-white/60 transition hover:border-white/30 hover:text-white"
-          >
-            <Plus className="h-4 w-4" />
-            Add your own OpenAI-compatible endpoint
-          </button>
+          {customEntry && (
+            <button
+              onClick={() => openAdd(customEntry)}
+              className="flex items-center gap-2 rounded-2xl border border-dashed border-white/15 px-5 py-4 text-sm text-white/60 transition hover:border-white/30 hover:text-white"
+            >
+              <Plus className="h-4 w-4" />
+              Add your own OpenAI-compatible endpoint
+            </button>
+          )}
         </div>
       </div>
 
       {draft && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-[2px]" onClick={closeAdd} />
-          <form
-            onSubmit={submit}
-            className="relative w-full max-w-md rounded-3xl bg-[#0d0d12] p-6 ring-1 ring-white/10"
-          >
+        <Dialog
+          labelledBy="add-provider-title"
+          onClose={closeAdd}
+          className="relative w-full max-w-md rounded-3xl bg-[#0d0d12] p-6 ring-1 ring-white/10"
+        >
+          <form onSubmit={submit}>
             <div className="mb-4 flex items-center justify-between">
-              <div className="text-base font-medium text-white/90">{draft.name}</div>
+              <div id="add-provider-title" className="text-base font-medium text-white/90">
+                {draft.name || draft.entry.name}
+              </div>
               <button type="button" onClick={closeAdd} className="rounded-full p-1.5 text-white/50 hover:bg-white/10 hover:text-white">
                 <X className="h-4 w-4" />
               </button>
             </div>
+
+            {draft.entry.id === "custom" && (
+              <>
+                <label className="mb-3 block">
+                  <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">
+                    Name
+                  </span>
+                  <input
+                    value={draft.name}
+                    onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                    placeholder="My endpoint"
+                    spellCheck={false}
+                    className="w-full rounded-xl bg-black/20 px-3 py-2 text-xs text-white/85 ring-1 ring-white/10 placeholder:text-white/25 focus:outline-none focus:ring-white/30"
+                  />
+                </label>
+
+                <label className="mb-3 block">
+                  <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">
+                    Provider id
+                  </span>
+                  <input
+                    value={draft.id}
+                    onChange={(e) => setDraft({ ...draft, id: e.target.value })}
+                    placeholder="my-endpoint"
+                    spellCheck={false}
+                    className="w-full rounded-xl bg-black/20 px-3 py-2 font-mono text-xs text-white/85 ring-1 ring-white/10 placeholder:text-white/25 focus:outline-none focus:ring-white/30"
+                  />
+                </label>
+              </>
+            )}
 
             <label className="mb-3 block">
               <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">
@@ -798,18 +944,18 @@ export function ProvidersPage() {
               </button>
             </div>
           </form>
-        </div>
+        </Dialog>
       )}
 
       {keyDraft && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-[2px]" onClick={closeKey} />
-          <form
-            onSubmit={submitKey}
-            className="relative w-full max-w-md rounded-3xl bg-[#0d0d12] p-6 ring-1 ring-white/10"
-          >
+        <Dialog
+          labelledBy="key-provider-title"
+          onClose={closeKey}
+          className="relative w-full max-w-md rounded-3xl bg-[#0d0d12] p-6 ring-1 ring-white/10"
+        >
+          <form onSubmit={submitKey}>
             <div className="mb-4 flex items-center justify-between">
-              <div className="text-base font-medium text-white/90">
+              <div id="key-provider-title" className="text-base font-medium text-white/90">
                 {keyDraft.mode === "add" ? "Add key" : "Rotate key"} · {keyDraft.entry.name}
               </div>
               <button type="button" onClick={closeKey} className="rounded-full p-1.5 text-white/50 hover:bg-white/10 hover:text-white">
@@ -884,7 +1030,7 @@ export function ProvidersPage() {
               </button>
             </div>
           </form>
-        </div>
+        </Dialog>
       )}
     </main>
   );

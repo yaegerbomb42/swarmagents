@@ -94,9 +94,22 @@ function finite(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+/**
+ * The edited/read file from a tool input. Prefer `path`; fall back to
+ * `file_path` when `path` is absent or empty — some tool inputs report the
+ * file under `file_path`.
+ */
+function inputPath(o: Record<string, unknown> | undefined): string | undefined {
+  if (!o) return undefined;
+  if (typeof o.path === "string" && o.path.length > 0) return o.path;
+  if (typeof o.file_path === "string" && o.file_path.length > 0) return o.file_path;
+  return undefined;
+}
+
 function oneRange(o: Record<string, unknown>): Range | undefined {
-  if (typeof o.path !== "string" || o.path.length === 0) return undefined;
-  return { path: o.path, start: finite(o.start), end: finite(o.end) };
+  const p = inputPath(o);
+  if (p === undefined) return undefined;
+  return { path: p, start: finite(o.start), end: finite(o.end) };
 }
 
 function readRanges(e: RunEvent): Range[] {
@@ -227,7 +240,7 @@ export function diagnoseRun(events: readonly RunEvent[]): RunFinding[] {
   const cacheDipTurns: number[] = [];
   const deniedTurns: number[] = [];
   const deniedHints: string[] = [];
-  /** turn:tool pairs already reported from a `tool.denied` event, so the matching call is not counted again. */
+  /** turn:tool pairs already reported as denied, from either a `tool.denied` event or an error `tool.call`, so the matching pair is never counted twice regardless of event order. */
   const deniedTools = new Set<string>();
   let activeTurn = 0;
   let seq = 0;
@@ -307,6 +320,8 @@ export function diagnoseRun(events: readonly RunEvent[]): RunFinding[] {
       if (EDIT_MISS_TOOLS.has(tool) && e.isError === true)
         misses.push({ turn: activeTurn, error: errorText(e) });
       if (isDenialCall(e) && !deniedTools.has(`${activeTurn}:${tool}`)) {
+        // Record the pair here too: otherwise a later `tool.denied` event
+        // for the same turn:tool would report the same denial a second time.
         deniedTools.add(`${activeTurn}:${tool}`);
         deniedTurns.push(activeTurn);
         deniedHints.push(denialHint(e, tool));
@@ -412,17 +427,19 @@ export function diagnoseRun(events: readonly RunEvent[]): RunFinding[] {
  * Every path an edit tool touched. `multi_edit` usually carries a top-level
  * path, but models also repeat the path inside `edits`; a multi-file edit may
  * use `files`. Accept all three rather than clearing the wrong (or no) path.
+ * Each level accepts `file_path` as well as `path` (see inputPath).
  */
 function editedPaths(e: RunEvent): string[] {
   const input = callInput(e);
   if (!input) return [];
   const paths: string[] = [];
-  if (typeof input.path === "string" && input.path.length > 0) paths.push(input.path);
+  const top = inputPath(input);
+  if (top) paths.push(top);
   for (const collection of [input.files, input.edits]) {
     if (!Array.isArray(collection)) continue;
     for (const entry of collection) {
-      const rec = recordOf(entry);
-      if (typeof rec?.path === "string" && rec.path.length > 0) paths.push(rec.path);
+      const p = inputPath(recordOf(entry));
+      if (p) paths.push(p);
     }
   }
   return [...new Set(paths)];

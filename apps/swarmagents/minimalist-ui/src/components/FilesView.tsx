@@ -59,6 +59,8 @@ import type { Presence } from "../../../lib/client/presence";
 import { cn } from "../utils/cn";
 
 interface FilesViewProps {
+  /** Refresh the visible workspace while the agent is working. */
+  live?: boolean;
   /**
    * Monotonic token that changes when the current run emits run.finished, so
    * the listing and open preview re-read the workspace after the agent writes.
@@ -216,6 +218,7 @@ function WorkspaceRail({
   error,
   selected,
   changedPath,
+  changed,
   onOpenFile,
   onOpenFolder,
   onRetry,
@@ -226,6 +229,8 @@ function WorkspaceRail({
   error?: string;
   selected?: string;
   changedPath?: string;
+  /** Entries that changed between polls while the run is live. */
+  changed?: string[];
   onOpenFile: (entry: WorkspaceEntry) => void;
   onOpenFolder: (entry: WorkspaceEntry) => void;
   onRetry: () => void;
@@ -267,6 +272,7 @@ function WorkspaceRail({
     const isOpen = Boolean(expanded[entry.path]);
     const isSelected = selected === entry.path;
     const isChanged = changedPath === entry.path;
+    const isUpdated = !isChanged && (changed?.includes(entry.path) ?? false);
     const dirState = dirs[entry.path];
     return (
       <div key={entry.path}>
@@ -283,6 +289,7 @@ function WorkspaceRail({
               ? "bg-sky-400/10 text-white ring-1 ring-inset ring-sky-400/25"
               : "text-white/70 hover:bg-white/[0.06]",
             isChanged && !isSelected && "bg-amber-400/[0.08] text-amber-100/90",
+            isUpdated && !isSelected && "bg-emerald-400/10 text-emerald-200",
           )}
         >
           <span className="flex h-3 w-3 shrink-0 items-center justify-center text-white/30">
@@ -291,6 +298,7 @@ function WorkspaceRail({
           </span>
           {entryIcon(entry, isOpen)}
           <span className="min-w-0 flex-1 truncate">{entry.name}</span>
+          {isUpdated && <span className="shrink-0 text-[10px] text-emerald-300">Updated</span>}
           {isChanged && (
             <span
               className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-300"
@@ -407,12 +415,30 @@ function CodeBody({ content }: { content: string }) {
 
 /* ── The view ────────────────────────────────────────────────────────────── */
 
-export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, presence }: FilesViewProps) {
+/** Compare snapshots only within the same directory; a first listing is not a change. */
+export function changedWorkspaceEntries(previous: WorkspaceListing | undefined, next: WorkspaceListing): string[] {
+  if (!previous || previous.path !== next.path) return [];
+  const old = new Map(previous.entries.map((entry) => [entry.path, entry]));
+  return next.entries.filter((entry) => {
+    const before = old.get(entry.path);
+    return !before || before.modifiedAt !== entry.modifiedAt || before.size !== entry.size || before.type !== entry.type;
+  }).map((entry) => entry.path);
+}
+
+export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, presence, live = false }: FilesViewProps) {
   const [path, setPath] = useState(WORKSPACE_ROOT);
   const [listing, setListing] = useState<WorkspaceListing>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [reload, setReload] = useState(0);
+  const previousListing = useRef<WorkspaceListing | undefined>(undefined);
+  const [changed, setChanged] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!live) return;
+    const timer = window.setInterval(() => setReload((n) => n + 1), 3000);
+    return () => window.clearInterval(timer);
+  }, [live]);
 
   const [selected, setSelected] = useState<string>();
   const [file, setFile] = useState<WorkspaceFile>();
@@ -454,6 +480,10 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
     fetchWorkspaceListing(path, { signal: ctrl.signal })
       .then((data) => {
         if (ctrl.signal.aborted) return;
+        const updates = changedWorkspaceEntries(previousListing.current, data);
+        if (updates.length) setChanged(updates);
+        else if (previousListing.current?.path !== data.path) setChanged([]);
+        previousListing.current = data;
         setListing(data);
       })
       .catch((err) => {
@@ -601,6 +631,7 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
           error={error}
           selected={selected}
           changedPath={changedPath}
+          changed={changed}
           onOpenFile={openEntry}
           onOpenFolder={openEntry}
           onRetry={() => setReload((n) => n + 1)}

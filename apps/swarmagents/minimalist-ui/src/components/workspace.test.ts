@@ -262,6 +262,14 @@ test("the screen frame shows its views, its status and the stage; Take over only
   assert.match(desktop, /Take over/);
   assert.equal(countOf(desktop, 'data-testid="takeover-banner"'), 0);
 
+  for (const activeView of ["desktop", "terminal", "browser", "files"] as const) {
+    const html = renderToStaticMarkup(h(ScreenFrame, { ...base, activeView, showDesktop: true, desktopMode: true }));
+    assert.equal(countOf(html, 'data-testid="desktop-view"'), 1, `desktop remains mounted in ${activeView}`);
+    for (const view of ["desktop", "terminal", "browser", "files"]) {
+      assert.equal(countOf(html, `data-testid="screen-view-${view}"`), 1);
+    }
+  }
+
   const notReady = renderToStaticMarkup(
     h(ScreenFrame, { ...base, activeView: "desktop", showDesktop: true, desktopMode: true, canControl: false }),
   );

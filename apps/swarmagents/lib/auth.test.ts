@@ -38,6 +38,13 @@ function withIssuedAt(token: string, issuedAtSec: number): string {
   return parts.join(".");
 }
 
+/** Mint an old v2-format cookie, as issued by a deployment before the rollout. */
+function signV2Session(userId: string, issuedAtSec: number): string {
+  const secret = process.env.SWARM_SESSION_SECRET ?? "";
+  const mac = createHmac("sha256", secret).update(`v2:${userId}:${issuedAtSec}`).digest("hex");
+  return `v2.${userId}.${issuedAtSec}.${mac}`;
+}
+
 function serverEnv() {
   process.env.SWARM_SERVER_MODE = "1";
   process.env.SWARM_HARNESS_TOKEN = "harness-token";
@@ -397,6 +404,53 @@ test("verifySession round-trips signSession and rejects tampering", () => {
   assert.equal(verifySession("alice."), null);
   assert.equal(verifySession(""), null);
   assert.equal(verifySession("no-dot"), null);
+});
+
+test("v3 sessions carry millisecond issued-at and round-trip through verifySession", () => {
+  process.env.SWARM_SERVER_MODE = "1";
+  process.env.SWARM_SESSION_SECRET = "test-secret";
+  const token = signSession("alice");
+  const parts = token.split(".");
+  assert.equal(parts[0], "v3", "new sessions must use the millisecond format");
+  assert.match(parts[2], /^\d{13}$/, "issued-at must be in milliseconds");
+  assert.equal(verifySession(token), "alice");
+  assert.equal(requestUser(req({}, token))?.id, "alice");
+  assert.equal(verifySession(token + "x"), null, "tampering with the MAC must still fail");
+  // Domain separation: a v2 signature must not authenticate a v3 token.
+  assert.equal(verifySession(signV2Session("alice", Math.floor(Date.now() / 1000)).replace(/^v2\./, "v3.")), null);
+});
+
+test("sign-out everywhere revokes old sessions without locking out an immediate re-login", async () => {
+  serverEnv();
+  setupUsersStore();
+  try {
+    assert.equal((await signupLocalUser("alice@example.com", "correct horse battery")).ok, true);
+    // A real sign-out follows the login response, so the revoked cookie is
+    // strictly older than the epoch; avoid a same-millisecond ambiguity.
+    const before = signSession("local_alice@example.com", Date.now() - 5);
+    const v2 = signV2Session("local_alice@example.com", Math.floor(Date.now() / 1000) - 30);
+    assert.equal(verifySession(before), "local_alice@example.com");
+    assert.equal(verifySession(v2), "local_alice@example.com", "v2 sessions survive the rollout");
+    assert.equal(requestUser(req({}, v2))?.id, "local_alice@example.com");
+
+    assert.equal(await bumpSessionEpoch("alice@example.com"), true);
+    assert.equal(verifySession(before), null, "the old session must be revoked");
+    assert.equal(verifySession(v2), null, "verifySession must enforce the epoch like requestUser");
+    assert.equal(requestUser(req({}, v2)), null);
+
+    // No wait for the next second (v2 used to lock the user out here); just
+    // step past the epoch's own millisecond boundary, as an HTTP round trip
+    // would.
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    const after = signSession("local_alice@example.com");
+    assert.equal(verifySession(after), "local_alice@example.com");
+    assert.equal(requestUser(req({}, after))?.id, "local_alice@example.com");
+
+    const expired = signV2Session("alice", Math.floor(Date.now() / 1000) - 8 * 24 * 60 * 60);
+    assert.equal(verifySession(expired), null, "v2 sessions still expire normally");
+  } finally {
+    teardownUsersStore();
+  }
 });
 
 test("signSession throws when SWARM_SESSION_SECRET is unset or blank", () => {

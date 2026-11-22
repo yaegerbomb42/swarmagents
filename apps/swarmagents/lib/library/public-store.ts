@@ -282,7 +282,7 @@ export function authorHandleFor(userId: string): string {
   return base || "anonymous";
 }
 
-function cleanText(value: unknown, field: string, max: number, required: boolean): string {
+export function cleanText(value: unknown, field: string, max: number, required: boolean): string {
   if (value === undefined || value === null) {
     if (!required) return "";
     throw new LibraryError(`${field} is required.`);

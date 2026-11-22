@@ -12,7 +12,7 @@
  */
 
 import { NextResponse } from "next/server";
-import { connectorById, connectorPayload } from "../../../../lib/library/catalog";
+import { installConnectorItem } from "../../../../lib/library/catalog";
 import { errorResponse, jsonError, libraryOwner, NO_STORE, readJson, unauthorized } from "../../../../lib/library/http";
 import { updateAvailableFor } from "../../../../lib/library/public-store";
 import { addInstalledItem, listInstalledItems } from "../../../../lib/library/user-store";
@@ -54,20 +54,11 @@ export async function POST(request: Request) {
     if (!isRecord(body)) return jsonError("Body must be an object.");
     if (body.connectorId !== undefined) {
       if (typeof body.connectorId !== "string") return jsonError("connectorId must be a string.");
-      const entry = connectorById(body.connectorId);
-      if (!entry) return jsonError("Unknown connector.", 404);
-      const payload = connectorPayload(entry);
-      if (!payload) return jsonError("This connector cannot be installed automatically.", 400);
-      const item = addInstalledItem(owner, {
-        id: `connector-${entry.id}`,
-        kind: "connector",
-        name: entry.name,
-        description: entry.description,
-        payload,
-        secrets: body.secrets,
-        origin: "user",
-      });
-      return NextResponse.json({ item }, { status: 201, headers: NO_STORE });
+      const result = installConnectorItem(owner, body.connectorId, body.secrets);
+      if (!result.ok) {
+        return jsonError(result.error, result.status);
+      }
+      return NextResponse.json({ item: result.item }, { status: 201, headers: NO_STORE });
     }
     const kind: LibraryKind | null = isLibraryKind(body.kind) ? body.kind : null;
     if (!kind) return jsonError("kind must be skill, tool, mcp or connector.");

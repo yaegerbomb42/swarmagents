@@ -81,8 +81,18 @@ function toProjectPath(repoPath: string): string | undefined {
   return undefined; // outside the project
 }
 
+/** A changed file: project-relative path + git status letter. */
+type Change = { path: string; status: "A" | "M" | "D" };
+
+/** Map a raw git status letter to the change kind ("A"/"M"/"D"). */
+function toChangeKind(status: string): "A" | "M" | "D" {
+  if (status === "D") return "D";
+  if (status === "A") return "A";
+  return "M";
+}
+
 /** Parse the change list from args, or default to `git diff` vs a base. */
-function resolveChanges(args: string[]): { path: string; status: "A" | "M" | "D" }[] {
+function resolveChanges(args: string[]): Change[] {
   let files = args;
   let base = "HEAD";
   if (args[0] === "--rev") {
@@ -90,13 +100,13 @@ function resolveChanges(args: string[]): { path: string; status: "A" | "M" | "D"
     files = args.slice(2);
   }
 
-  const rebase = (raw: { path: string; status: "A" | "M" | "D" }[]) =>
+  const rebase = (raw: Change[]) =>
     raw
-      .map<{ path: string; status: "A" | "M" | "D" } | null>((c) => {
+      .map<Change | null>((c) => {
         const p = toProjectPath(c.path);
         return p === undefined ? null : { path: p, status: c.status };
       })
-      .filter((c): c is { path: string; status: "A" | "M" | "D" } => c !== null);
+      .filter((c): c is Change => c !== null);
 
   if (files.length > 0) {
     return rebase(files.map((f) => ({ path: f, status: "M" as const })));
@@ -120,7 +130,7 @@ function resolveChanges(args: string[]): { path: string; status: "A" | "M" | "D"
       .map((line) => {
         const status = line.slice(0, 2).trim();
         const p = line.slice(3).trim().replace(/^"|"$/g, "");
-        const kind = status === "D" ? ("D" as const) : status === "A" ? ("A" as const) : ("M" as const);
+        const kind = toChangeKind(status);
         return { path: p, status: kind };
       });
     return rebase(raw);
@@ -132,7 +142,7 @@ function resolveChanges(args: string[]): { path: string; status: "A" | "M" | "D"
     .filter(Boolean)
     .map((line) => {
       const [status, p] = line.split(/\s+/, 2);
-      const kind = status === "D" ? ("D" as const) : status === "A" ? ("A" as const) : ("M" as const);
+      const kind = toChangeKind(status);
       return { path: p, status: kind };
     });
   return rebase(raw);

@@ -387,3 +387,108 @@ test("reading is asynchronous: the event loop is not blocked by a 20k log", asyn
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Regression: large events, empty active segments, and cursor + cap.
+// ---------------------------------------------------------------------------
+
+test("tail probe and replay survive events larger than the 64 KB probe window", async () => {
+  const dir = tmpRuns();
+  try {
+    // A first line larger than the 4 KB head probe...
+    const bigFirst = "a".repeat(8 * 1024);
+    appendRunEvent({ seq: 1, runId: "run-1", type: "log", data: bigFirst, ts: 0 }, dir);
+    appendRunEvent(event(2, "b"), dir);
+    // ...and a last line larger than the 64 KB tail probe.
+    const bigLast = "z".repeat(100 * 1024);
+    appendRunEvent({ seq: 3, runId: "run-1", type: "log", data: bigLast, ts: 0 }, dir);
+
+    // The tail probe must find the oversized last event, not report 0.
+    assert.equal(tailRunLogLastSeq("run-1", dir), 3);
+    // And replay must not skip the segment just because its probe range
+    // could not be determined from a fixed-size window.
+    const events = await drain(streamRunEventsFrom("run-1", dir, 0));
+    assert.deepEqual(events.map((e) => e.seq), [1, 2, 3]);
+    assert.equal(readRunEvents("run-1", dir).length, 3);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tail probe finds the event before a giant torn tail", async () => {
+  const dir = tmpRuns();
+  try {
+    appendRunEvent(event(1, "a"), dir);
+    appendRunEvent(event(2, "b"), dir);
+    // A torn tail larger than the probe window must not hide seq 2.
+    fs.appendFileSync(path.join(dir, "run-1.jsonl"), `{"runId":"run-1","seq":3,"type":"log","data":"${"x".repeat(100 * 1024)}`, "utf8");
+    assert.equal(tailRunLogLastSeq("run-1", dir), 2);
+    const events = await drain(streamRunEventsFrom("run-1", dir, 0));
+    assert.deepEqual(events.map((e) => e.seq), [1, 2]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("capped replay after rotation reports the newest seq, not the empty active segment's 0", async () => {
+  const dir = tmpRuns();
+  try {
+    // Simulate the state immediately after a rotation: a frozen segment
+    // holding events 1-3 and an empty active file.
+    const segment = [1, 2, 3]
+      .map((seq) => `${JSON.stringify(event(seq, `e${seq}`))}\n`)
+      .join("");
+    fs.writeFileSync(path.join(dir, "run-1.jsonl.1"), segment);
+    fs.writeFileSync(path.join(dir, "run-1.jsonl"), "");
+
+    let window: { truncated: boolean; firstSeq: number; lastSeq: number } | undefined;
+    const events = await drain(
+      streamRunEventsFrom("run-1", dir, 0, {
+        maxEvents: 2,
+        onWindow: (info) => {
+          window = info;
+        },
+      }),
+    );
+    assert.deepEqual(events.map((e) => e.seq), [2, 3]);
+    assert.deepEqual(window, { truncated: true, firstSeq: 2, lastSeq: 3 });
+    assert.equal(tailRunLogLastSeq("run-1", dir), 3);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("capped replay with a cursor counts only events after the cursor", async () => {
+  const dir = tmpRuns();
+  try {
+    seed(dir, "run-1", 10);
+    // Six events sit after the cursor and the cap (8) covers all of them:
+    // nothing after the cursor was omitted, so the replay is not truncated.
+    let window: { truncated: boolean; firstSeq: number; lastSeq: number } | undefined;
+    const all = await drain(
+      streamRunEventsFrom("run-1", dir, 4, {
+        maxEvents: 8,
+        onWindow: (info) => {
+          window = info;
+        },
+      }),
+    );
+    assert.deepEqual(all.map((e) => e.seq), [5, 6, 7, 8, 9, 10]);
+    assert.equal(window, undefined);
+
+    // With a tighter cap the newest events win and the window is reported.
+    let window2: { truncated: boolean; firstSeq: number; lastSeq: number } | undefined;
+    const capped = await drain(
+      streamRunEventsFrom("run-1", dir, 4, {
+        maxEvents: 4,
+        onWindow: (info) => {
+          window2 = info;
+        },
+      }),
+    );
+    assert.deepEqual(capped.map((e) => e.seq), [7, 8, 9, 10]);
+    assert.deepEqual(window2, { truncated: true, firstSeq: 7, lastSeq: 10 });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

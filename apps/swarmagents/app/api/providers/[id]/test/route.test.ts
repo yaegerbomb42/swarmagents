@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { POST } from "./route";
+import { POST, _resetProbeBucketForTests } from "./route";
 import {
   configureProviderStorePaths,
   saveProvider,
@@ -23,6 +23,7 @@ let tempDir: string;
 let providersFile: string;
 
 test.beforeEach(() => {
+  _resetProbeBucketForTests();
   tempDir = mkdtempSync(join(tmpdir(), "swarm-provider-test-route-"));
   providersFile = join(tempDir, "providers.json");
   configureProviderStorePaths(providersFile);
@@ -82,6 +83,7 @@ test("POST returns 404 for an unknown provider", async () => {
   try {
     const res = await post("nope");
     assert.equal(res.status, 404);
+    assert.equal(res.headers.get("cache-control"), "no-store");
     const body = JSON.parse(await res.text()) as { error?: string };
     assert.equal(typeof body.error, "string");
   } finally {

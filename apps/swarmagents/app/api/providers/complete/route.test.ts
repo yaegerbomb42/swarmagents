@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { NextRequest } from "next/server";
-import { POST } from "./route";
+import { POST, _resetCompleteBucketForTests } from "./route";
+
+test.beforeEach(() => {
+  _resetCompleteBucketForTests();
+});
 
 const antKey = "sk-test-ant-proxy-alpha";
 const oaiKey = "sk-test-oai-proxy-beta";
@@ -96,6 +100,51 @@ test("validates input: non-string message content -> 400", async () => {
 test("validates input: bad message role -> 400", async () => {
   const res = await postBody({ messages: [{ role: "system", content: "x" }] });
   assert.equal(res.status, 400);
+});
+
+test("validates input: non-string system / model and blank model -> 400", async () => {
+  assert.equal((await postBody({ messages: [userMessage], system: 1 })).status, 400);
+  assert.equal((await postBody({ messages: [userMessage], model: 1 })).status, 400);
+  assert.equal((await postBody({ messages: [userMessage], model: "   " })).status, 400);
+});
+
+test("every response sends Cache-Control: no-store", async () => {
+  assert.equal((await postBody({})).headers.get("cache-control"), "no-store");
+  const signedOut = await POST(
+    new NextRequest("http://localhost/api/providers/complete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [userMessage] }),
+    }),
+  );
+  assert.equal(signedOut.status, 401);
+  assert.equal(signedOut.headers.get("cache-control"), "no-store");
+});
+
+test("aborted client signal returns 499", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+    if (init?.signal?.aborted) {
+      const err = new Error("aborted");
+      err.name = "AbortError";
+      throw err;
+    }
+    return jsonResponse(anthropicOk("late"));
+  }) as unknown as typeof globalThis.fetch;
+  const res = await POST(
+    new NextRequest("http://localhost/api/providers/complete", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-swarm-user": "local",
+      },
+      body: JSON.stringify({ messages: [userMessage] }),
+      signal: controller.signal,
+    }),
+  );
+  assert.equal(res.status, 499);
+  assert.equal(res.headers.get("cache-control"), "no-store");
 });
 
 test("happy path: completes via ranked server-held key, key never in body", async () => {

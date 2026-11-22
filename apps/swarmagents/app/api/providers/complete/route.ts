@@ -3,9 +3,12 @@ import { createRouter, type CompleteRequest } from "@/lib/providers";
 import { RouterError } from "@/lib/providers/errors";
 import { routerProviders } from "@/lib/providers/store";
 import { USER_HEADER } from "@/lib/auth";
+import { TokenBucket } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const NO_STORE = { "cache-control": "no-store" } as const;
 
 const MAX_BODY_SIZE = 256 * 1024;
 const MAX_MESSAGES = 64;
@@ -15,13 +18,34 @@ const MAX_RACE = 8;
 
 const VALID_TIERS = new Set(["fast", "balanced", "deep"]);
 
+function perMinute(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+/**
+ * Completions cost money and race up to 8 upstream calls, so they get their
+ * own per-user budget (separate from the general API bucket).
+ */
+const completeBucket = new TokenBucket(
+  perMinute("SWARM_PROVIDERS_COMPLETE_RATE_LIMIT_PER_MIN", 60),
+  60_000,
+);
+
 function caller(req: NextRequest): string | null {
   const user = req.headers.get(USER_HEADER);
   return user && user.length > 0 && user.length <= 128 ? user : null;
 }
 
+function json(body: unknown, status = 200, extraHeaders?: HeadersInit): NextResponse {
+  return NextResponse.json(body, {
+    status,
+    headers: { ...NO_STORE, ...(extraHeaders ?? {}) },
+  });
+}
+
 function unauthorized() {
-  return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+  return json({ error: "Sign in required." }, 401);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -34,6 +58,15 @@ function isValidMessage(value: unknown): boolean {
   if (role !== "user" && role !== "assistant") return false;
   const content = value.content;
   return typeof content === "string" && content.trim().length > 0 && content.length <= MAX_MESSAGE_LEN;
+}
+
+function isAbortError(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true;
+  if (typeof err === "object" && err !== null) {
+    const name = (err as { name?: unknown }).name;
+    if (name === "AbortError" || name === "TimeoutError") return true;
+  }
+  return err instanceof Error && err.message.toLowerCase().includes("aborted");
 }
 
 function validate(body: unknown):
@@ -53,9 +86,15 @@ function validate(body: unknown):
     }
   }
 
-  const system = typeof body.system === "string" ? body.system : undefined;
-  if (system !== undefined && system.length > MAX_MESSAGE_LEN) {
-    return { ok: false, status: 400, error: "system prompt too long." };
+  let system: string | undefined;
+  if (body.system !== undefined) {
+    if (typeof body.system !== "string") {
+      return { ok: false, status: 400, error: "system must be a string." };
+    }
+    if (body.system.length > MAX_MESSAGE_LEN) {
+      return { ok: false, status: 400, error: "system prompt too long." };
+    }
+    system = body.system;
   }
 
   let tier: CompleteRequest["tier"];
@@ -66,9 +105,18 @@ function validate(body: unknown):
     tier = body.tier as CompleteRequest["tier"];
   }
 
-  const model = typeof body.model === "string" ? body.model : undefined;
-  if (model !== undefined && model.length > 128) {
-    return { ok: false, status: 400, error: "model id too long." };
+  let model: string | undefined;
+  if (body.model !== undefined) {
+    if (typeof body.model !== "string") {
+      return { ok: false, status: 400, error: "model must be a string." };
+    }
+    if (!body.model.trim()) {
+      return { ok: false, status: 400, error: "model must be a non-empty string." };
+    }
+    if (body.model.length > 128) {
+      return { ok: false, status: 400, error: "model id too long." };
+    }
+    model = body.model;
   }
 
   let maxTokens: CompleteRequest["maxTokens"];
@@ -115,33 +163,42 @@ export async function POST(req: NextRequest) {
   const user = caller(req);
   if (!user) return unauthorized();
 
+  const rate = completeBucket.consume(`providers-complete:${user}`);
+  if (!rate.allowed) {
+    return json(
+      { error: "Too many completion requests — try again in a moment." },
+      429,
+      { "Retry-After": String(rate.retryAfter) },
+    );
+  }
+
   let text: string;
   try {
     text = await req.text();
   } catch {
-    return NextResponse.json({ error: "Could not read request body." }, { status: 400 });
+    return json({ error: "Could not read request body." }, 400);
   }
   if (text.length > MAX_BODY_SIZE) {
-    return NextResponse.json({ error: "Request body too large." }, { status: 413 });
+    return json({ error: "Request body too large." }, 413);
   }
 
   let body: unknown;
   try {
     body = JSON.parse(text);
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return json({ error: "Invalid JSON body." }, 400);
   }
 
   const check = validate(body);
   if (!check.ok) {
-    return NextResponse.json({ error: check.error }, { status: check.status });
+    return json({ error: check.error }, check.status);
   }
 
   const providers = routerProviders(user);
   const router = createRouter({ providers });
   try {
-    const result = await router.complete(check.request);
-    return NextResponse.json({
+    const result = await router.complete({ ...check.request, signal: req.signal });
+    return json({
       text: result.text,
       provider: result.provider,
       model: result.model,
@@ -149,10 +206,18 @@ export async function POST(req: NextRequest) {
       latencyMs: result.latencyMs,
     });
   } catch (err) {
+    if (isAbortError(err, req.signal)) {
+      return json({ error: "Request aborted." }, 499);
+    }
     if (err instanceof RouterError) {
       // RouterError messages are already redacted (no key material).
-      return NextResponse.json({ error: err.message }, { status: 502 });
+      return json({ error: err.message }, 502);
     }
-    return NextResponse.json({ error: "Completion failed." }, { status: 500 });
+    return json({ error: "Completion failed." }, 500);
   }
+}
+
+/** Test-only: reset the completion rate-limit bucket. */
+export function _resetCompleteBucketForTests(): void {
+  completeBucket._clear();
 }

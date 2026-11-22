@@ -30,6 +30,11 @@ import {
 import { DELETE as SHARE_DELETE, POST as SHARE_POST } from "./projects/[id]/share/route";
 import { DELETE as PAIR_DELETE, GET as PAIR_GET, POST as PAIR_POST } from "./byoc/pair/route";
 import { POST as LENSES_POST } from "./lenses/route";
+import { POST as PROVIDERS_COMPLETE, _resetCompleteBucketForTests } from "./providers/complete/route";
+import {
+  POST as PROVIDER_TEST,
+  _resetProbeBucketForTests,
+} from "./providers/[id]/test/route";
 import { ByocTokenStore, setByocTokenStoreForTesting } from "../../lib/byoc/tokens";
 import { configureProjectStoreDir } from "../../lib/projects/store";
 import { configureStorePaths } from "../..//lib/board/store";
@@ -361,6 +366,34 @@ test("the lens route is uncacheable on an auth failure and on a validation error
   );
   assert.equal(unknownLens.status, 400);
   assertNoStore(unknownLens, "lenses POST 400");
+});
+
+test("providers/complete and providers/[id]/test are uncacheable on success and error branches", async () => {
+  _resetCompleteBucketForTests();
+  _resetProbeBucketForTests();
+
+  const signedOut = await PROVIDERS_COMPLETE(
+    userRequest("/api/providers/complete", {
+      method: "POST",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      user: null,
+    }),
+  );
+  assert.equal(signedOut.status, 401);
+  assertNoStore(signedOut, "providers/complete POST 401");
+
+  const badBody = await PROVIDERS_COMPLETE(
+    userRequest("/api/providers/complete", { method: "POST", body: {} }),
+  );
+  assert.equal(badBody.status, 400);
+  assertNoStore(badBody, "providers/complete POST 400");
+
+  const missing = await PROVIDER_TEST(
+    userRequest("/api/providers/nope/test", { method: "POST" }),
+    { params: Promise.resolve({ id: "nope" }) },
+  );
+  assert.equal(missing.status, 404);
+  assertNoStore(missing, "providers/[id]/test POST 404");
 });
 
 test("gardener unpin and removeProposal are uncacheable, including their errors", async () => {

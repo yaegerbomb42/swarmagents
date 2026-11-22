@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { POST } from "./route";
+import { POST, _resetProbeBucketForTests } from "./route";
 import {
   configureProviderStorePaths,
   saveProvider,
@@ -20,6 +20,7 @@ const KEY = "test-key-not-real";
 let tempDir: string;
 
 test.beforeEach(() => {
+  _resetProbeBucketForTests();
   tempDir = mkdtempSync(join(tmpdir(), "swarm-provider-test-errors-"));
   configureProviderStorePaths(join(tempDir, "providers.json"));
   saveProvider("local", { id: "openai", apiKey: KEY });

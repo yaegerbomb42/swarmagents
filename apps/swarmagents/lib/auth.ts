@@ -242,64 +242,90 @@ function sessionSecret(): string {
  * outside the startup guards — a loud failure, never an empty-key signature.
  * Verification (verifySession) never throws; it returns null.
  *
- * Format: `v2.<userId>.<issuedAtSec>.<mac>` where issuedAtSec is the Unix
- * time (seconds) the session was issued and the MAC covers
- * `v2:<userId>:<issuedAtSec>` (domain-separated from the legacy format so a
- * legacy token can never be mistaken for a v2 token). `issuedAtSec` defaults
- * to now; callers (tests) may pass an explicit value to mint an old session.
+ * Format: `v3.<userId>.<issuedAtMs>.<mac>` where issuedAtMs is the Unix time
+ * in milliseconds and the MAC covers `v3:<userId>:<issuedAtMs>` (domain-
+ * separated from v2 and the legacy format, so a token minted in one format can
+ * never be mistaken for another). Millisecond precision is required: a v2
+ * seconds-precision session minted just after "sign out everywhere" inside the
+ * same second was rejected by the millisecond revocation epoch.
+ *
+ * `issuedAt` defaults to now in milliseconds. Legacy callers (tests/tools)
+ * that pass seconds are still accepted: values below 1e12 are seconds and are
+ * scaled up, so their existing fixtures keep working. v2 tokens are still
+ * verified during rollout so active sessions are not dropped.
  */
-export function signSession(userId: string, issuedAtSec: number = Math.floor(Date.now() / 1000)): string {
+export function signSession(userId: string, issuedAt: number = Date.now()): string {
   const secret = process.env.SWARM_SESSION_SECRET ?? "";
   if (!secret.trim()) {
     throw new Error("SWARM_SESSION_SECRET is not set: refusing to sign a session cookie with an empty key");
   }
-  const issuedAt = Math.floor(issuedAtSec);
-  const signingInput = `v2:${userId}:${issuedAt}`;
+  const issuedAtMs = issuedAt < 1e12 ? issuedAt * 1000 : Math.floor(issuedAt);
+  const signingInput = `v3:${userId}:${issuedAtMs}`;
   const mac = createHmac("sha256", secret).update(signingInput).digest("hex");
-  return `v2.${userId}.${issuedAt}.${mac}`;
+  return `v3.${userId}.${issuedAtMs}.${mac}`;
 }
 
-/** A verified v2 session token: the user id plus the issued-at timestamp. */
+/** A verified session token: the user id plus the issued-at in milliseconds. */
 interface VerifiedSession {
   userId: string;
-  issuedAt: number;
+  issuedAtMs: number;
+}
+
+/** Split a signed token into user id, issued-at and MAC for a given prefix. */
+function parseSessionToken(token: string, prefix: string): { userId: string; issuedAtRaw: string; mac: string } | null {
+  if (!token.startsWith(prefix)) return null;
+  const macSep = token.lastIndexOf(".");
+  if (macSep <= prefix.length) return null;
+  const payload = token.slice(0, macSep); // "<prefix><userId>.<issuedAt>"
+  const mac = token.slice(macSep + 1);
+  const iatSep = payload.lastIndexOf(".");
+  if (iatSep <= prefix.length) return null;
+  const userId = payload.slice(prefix.length, iatSep);
+  if (!userId) return null;
+  const issuedAtRaw = payload.slice(iatSep + 1);
+  if (!/^\d+$/.test(issuedAtRaw)) return null;
+  return { userId, issuedAtRaw, mac };
+}
+
+function macMatches(secret: string, signingInput: string, mac: string): boolean {
+  const expected = createHmac("sha256", secret).update(signingInput).digest("hex");
+  const a = Buffer.from(mac);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 /**
- * Verify a v2 session token (`v2.<userId>.<issuedAtSec>.<mac>`).
- * Returns the verified session if valid, null otherwise. The legacy session
- * format (`<userId>.<mac>` with no issued-at) is deliberately NOT accepted:
- * legacy cookies cannot expire and were removed as a security fix — see the
- * task history.
+ * Verify a signed token. v3 carries milliseconds; v2 carries seconds and is
+ * normalized to milliseconds so the epoch comparison has one code path.
  */
-function verifyV2Session(token: string, secret: string): VerifiedSession | null {
-  if (!token.startsWith("v2.")) return null;
-  const macSep = token.lastIndexOf(".");
-  if (macSep <= 3) return null;
-  const payload = token.slice(0, macSep); // "v2.<userId>.<issuedAtSec>"
-  const mac = token.slice(macSep + 1);
-  const iatSep = payload.lastIndexOf(".");
-  if (iatSep <= 3) return null;
-  const issuedAtRaw = payload.slice(iatSep + 1);
-  if (!/^\d+$/.test(issuedAtRaw)) return null;
-  const userId = payload.slice(3, iatSep);
-  if (!userId) return null;
-  const issuedAt = Number(issuedAtRaw);
-  const expected = createHmac("sha256", secret).update(`v2:${userId}:${issuedAt}`).digest("hex");
-  const a = Buffer.from(mac);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
-  const now = Math.floor(Date.now() / 1000);
-  if (issuedAt > now) return null; // issued in the future: not trustworthy
-  if (now - issuedAt > sessionMaxAgeSec()) return null; // expired
-  return { userId, issuedAt };
+function verifySignedSession(token: string, secret: string): VerifiedSession | null {
+  const prefix = token.startsWith("v3.") ? "v3." : token.startsWith("v2.") ? "v2." : null;
+  if (!prefix) return null; // legacy cookies + unknown prefixes are rejected
+
+  const parts = parseSessionToken(token, prefix);
+  if (!parts) return null;
+  const domain = prefix.slice(0, 2);
+  if (!macMatches(secret, `${domain}:${parts.userId}:${parts.issuedAtRaw}`, parts.mac)) return null;
+
+  const issuedAtMs = Number(parts.issuedAtRaw) * (domain === "v2" ? 1000 : 1);
+  const now = Date.now();
+  if (issuedAtMs > now) return null; // issued in the future: not trustworthy
+  if ((now - issuedAtMs) / 1000 > sessionMaxAgeSec()) return null; // expired
+  return { userId: parts.userId, issuedAtMs };
 }
 
-/** Returns the verified user id from a signed v2 session cookie, or null. */
+/**
+ * Returns the verified user id from a signed session cookie, or null. The
+ * per-user revocation epoch is enforced here too: direct callers (WebSocket /
+ * SSE upgrades, proxy routes) must reject "sign out everywhere" just as
+ * requestUser does.
+ */
 export function verifySession(token: string): string | null {
   const secret = sessionSecret();
   if (!secret) return null;
-  return verifyV2Session(token, secret)?.userId ?? null;
+  const verified = verifySignedSession(token, secret);
+  if (!verified || !sessionAllowedByEpoch(verified.userId, verified.issuedAtMs)) return null;
+  return verified.userId;
 }
 
 function harnessTokenValid(token: string): boolean {
@@ -320,22 +346,24 @@ export function isHarnessBearer(req: AuthRequestLike): boolean {
 /**
  * A session is valid only if it was issued at or after the user's current
  * session epoch (see lib/users). Local accounts carry a revocable epoch; any
- * other identity has no epoch to enforce and is unaffected. The epoch is in
- * Unix milliseconds while issuedAt is in seconds, so the comparison is
- * issuedAt * 1000 >= epoch: a session minted in the same second as a
- * revocation — but before it — is rejected, which a second-resolution
- * comparison could not do.
+ * other identity has no epoch to enforce and is unaffected. Both the epoch
+ * and the verified issued-at are Unix milliseconds, so a session minted in
+ * the same second as a revocation — but before it — is rejected, while a
+ * session minted just after it is accepted immediately (no same-second
+ * lockout). v2 tokens are normalized to milliseconds by verifySignedSession.
  */
-function sessionAllowedByEpoch(userId: string, issuedAt: number): boolean {
+function sessionAllowedByEpoch(userId: string, issuedAtMs: number): boolean {
   if (!userId.startsWith("local_")) return true;
   const email = userId.slice("local_".length);
-  return issuedAt * 1000 >= getSessionEpoch(email);
+  // Strictly after the epoch: a cookie minted in the same millisecond as the
+  // revocation was issued before it and must not survive "sign out everywhere".
+  return issuedAtMs > getSessionEpoch(email);
 }
 
 /**
  * Resolve the caller. Local mode: the machine's own agent is always trusted.
- * Server mode: valid harness bearer token, or a signed v2 session cookie that
- * has not been revoked (via the per-user session epoch).
+ * Server mode: valid harness bearer token, or a signed session cookie (v3 or
+ * v2) that has not been revoked (via the per-user session epoch).
  */
 export function requestUser(req: AuthRequestLike): AuthUser | null {
   if (!serverMode()) return LOCAL_USER;
@@ -350,8 +378,8 @@ export function requestUser(req: AuthRequestLike): AuthUser | null {
   if (cookie) {
     const secret = sessionSecret();
     if (secret) {
-      const verified = verifyV2Session(cookie, secret);
-      if (verified && sessionAllowedByEpoch(verified.userId, verified.issuedAt)) {
+      const verified = verifySignedSession(cookie, secret);
+      if (verified && sessionAllowedByEpoch(verified.userId, verified.issuedAtMs)) {
         const userId = verified.userId;
         // Local accounts sign in as `local_<email>`; show the real address, not `<id>@swarmagents.local`.
         const email = userId.startsWith("local_") && userId.includes("@") ? userId.slice(6) : `${userId}@swarmagents.local`;

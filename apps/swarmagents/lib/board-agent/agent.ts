@@ -160,6 +160,9 @@ export async function runBoardAgent(
       });
       text = completionText(completion.body);
     } catch (err) {
+      if (signal?.aborted || (err instanceof Error && (err.name === "AbortError" || err.message.toLowerCase().includes("aborted")))) {
+        throw err;
+      }
       // The gateway's empty provider pool is a structured 503 with no attempts.
       const noProvider = isRecord(err) && err.status === 503 && Array.isArray(err.attempts) && err.attempts.length === 0;
       return finish(withToolSummaries(noProvider ? NO_PROVIDER_REPLY : PROVIDER_ERROR_REPLY), noProvider ? 503 : 502);

@@ -4,6 +4,7 @@ import { USER_HEADER } from "@/lib/auth";
 import { runBoardAgent } from "@/lib/board-agent/agent";
 import { getConversation, listConversations, saveConversation } from "@/lib/board-agent/store";
 import type { BoardAgentConversation } from "@/lib/board-agent/types";
+import { makeRedactor } from "@/lib/harness/redact";
 import { JsonBodyError } from "@/lib/http";
 
 export const runtime = "nodejs";
@@ -79,16 +80,39 @@ export async function POST(request: Request): Promise<NextResponse> {
   activeTurns.add(turnKey);
   try {
     const now = Date.now();
-    const conversation: BoardAgentConversation | undefined = conversationId === undefined
-      ? { id, userId, title: message.trim().replace(/\s+/g, " ").slice(0, 80), messages: [], createdAt: now, updatedAt: now }
-      : getConversation(userId, id);
+    let conversation: BoardAgentConversation | undefined;
+    try {
+      conversation = conversationId === undefined
+        ? { id, userId, title: message.trim().replace(/\s+/g, " ").slice(0, 80), messages: [], createdAt: now, updatedAt: now }
+        : getConversation(userId, id);
+    } catch {
+      return json({ error: STORAGE_ERROR }, 503);
+    }
     if (!conversation) return json({ error: "Conversation not found." }, 404);
 
-    const { reply, taskIds, runIds, providerStatus } = await runBoardAgent(userId, conversation, message, { signal: request.signal });
-    saveConversation(userId, conversation);
+    let result: Awaited<ReturnType<typeof runBoardAgent>>;
+    try {
+      result = await runBoardAgent(userId, conversation, message, { signal: request.signal });
+    } catch (err) {
+      const isAbort = Boolean(request.signal?.aborted) ||
+        (err instanceof Error && (err.name === "AbortError" || err.message.toLowerCase().includes("aborted")));
+      if (isAbort) {
+        return json({ error: "Request aborted." }, 499);
+      }
+      const redact = makeRedactor(process.env as Record<string, string>);
+      const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      console.error("[board-agent] turn execution failed:", redact(msg));
+      return json({ error: "Board agent encountered an error processing your request." }, 500);
+    }
+
+    const { reply, taskIds, runIds, providerStatus } = result;
+    try {
+      saveConversation(userId, conversation);
+    } catch {
+      return json({ error: STORAGE_ERROR }, 503);
+    }
+
     return json({ reply, conversationId: id, taskIds, runIds }, providerStatus);
-  } catch {
-    return json({ error: STORAGE_ERROR }, 503);
   } finally {
     activeTurns.delete(turnKey);
   }

@@ -5,8 +5,7 @@ One chat bar. One agent. Every tool. Nothing hidden.
 SwarmAgents is a single-agent, persistent-Linux-VM computer platform driven by
 the Claude Code CLI. A user types a prompt; the server starts the agent inside
 that user's own long-lived VM container, streams every event (text, tool
-calls, results) over SSE, and renders it live in the UI. A JSON-RPC/MCP
-"swarm board" lets external workers discover, claim, and submit tasks.
+calls, results) over SSE, and renders it live in the UI.
 
 This document describes the code on `main` in `apps/swarmagents/`.
 
@@ -87,7 +86,7 @@ Independent subsystems that support the loop:
   providers and their keys in the providers config file, and
   `lib/providers/keys.ts` masks every key down to its last four characters
   for the API and the UI.
-- **`lib/board` — swarm board.** File-backed store (`swarm_board.json`,
+- **`lib/board` — swarm board (internal build coordination).** File-backed store (`swarm_board.json`,
   written atomically) plus `lib/board/handlers.ts` implementing the MCP tools
   served at `POST /api/mcp/swarm-board` (JSON-RPC 2.0) and summarized at
   `GET /api/mcp/swarm-board`. Also `lib/mcp-types.ts` (task/proposal/message
@@ -568,9 +567,10 @@ Typecheck: `npm run typecheck` (app) and `npx tsc -p e2e/tsconfig.json`.
 
 ## How a worker joins the swarm board
 
-The board is a Remote-MCP-style JSON-RPC 2.0 endpoint at
-`/api/mcp/swarm-board` (public; rate-limited separately). Workers can use any
-MCP/JSON-RPC client.
+The swarm board is an internal build-coordination tool used to develop
+SwarmAgents itself — it is not a user-facing product feature. It is a
+Remote-MCP-style JSON-RPC 2.0 endpoint at `/api/mcp/swarm-board` (public;
+rate-limited separately). Workers can use any MCP/JSON-RPC client.
 
 1. **Initialize** — `POST` `{"jsonrpc":"2.0","id":1,"method":"initialize"}`
    to handshake; `ping` and `tools/list` also work.

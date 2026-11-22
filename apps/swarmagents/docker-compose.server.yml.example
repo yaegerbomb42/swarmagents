@@ -8,12 +8,25 @@
 # deploy key) lives only on the VPS and is deliberately not in this repo.
 #
 # Shape notes (from the in-repo base files and deploy/deploy.sh):
-# - The app listens inside the container on 3777; the deploy health check
-#   polls http://172.17.0.1:3400/api/health?ready=1, i.e. the host port below
-#   as reached through the Docker bridge gateway. Keep the host port and the
-#   HEALTH_URL in deploy/deploy.sh in agreement.
+# - The app listens inside the container on 3777 and is published on host
+#   port 3400; the deploy health check polls
+#   http://172.17.0.1:3400/api/health?ready=1, i.e. the host port below as
+#   reached through the Docker bridge gateway. Keep the host port and the
+#   HEALTH_URL in deploy/deploy.sh in agreement (and the `/` upstream in
+#   deploy/nginx.conf).
 # - The desktop proxy (lib/desktop-proxy) binds inside the container on 3778
 #   and is published on the host loopback ONLY — never expose 3778 publicly.
+# - The BYOC hub (lib/byoc) binds inside the container on 3779 and is
+#   published on the host loopback ONLY — never expose 3779 publicly; the
+#   host nginx vhost routes /byoc/ to it (see "Canonical deploy shape" in
+#   DEPLOY.md).
+# - Desktop mode is ON by default in production (SWARM_VM_DESKTOP: "1"
+#   below): the live VM screen is the flagship surface, and a fresh deploy
+#   from this template must have a working desktop. `deploy` builds the
+#   swarm-vm:desktop image when it is missing, and /api/health reports the
+#   desktop state (liveness `desktop`, readiness DESKTOP_IMAGE_MISSING) so
+#   a desktop-less deploy is loud, never silent. Opt out per the comment at
+#   SWARM_VM_DESKTOP below.
 # - The base docker-compose.yml + docker-compose.docker.yml in this directory
 #   are the development equivalents of this template; this file is the
 #   production merge of the two, with server-mode auth on.
@@ -23,11 +36,14 @@ services:
     container_name: swarmagents
     restart: unless-stopped
     ports:
-      # <FILL IN> host port for the app. Production uses 3400; change it only
-      # together with HEALTH_URL in deploy/deploy.sh.
-      - "<FILL IN: HOST_APP_PORT, e.g. 3400>:3777"
+      # Host port for the app: 3400 (canonical; must match HEALTH_URL in
+      # deploy/deploy.sh and the `/` upstream in deploy/nginx.conf).
+      # Change it only together with both.
+      - "3400:3777"
       # Desktop proxy, host loopback only — do not change the 127.0.0.1 bind.
       - "127.0.0.1:3778:3778"
+      # BYOC hub, host loopback only — do not change the 127.0.0.1 bind.
+      - "127.0.0.1:3779:3779"
     environment:
       NODE_ENV: production
       HOSTNAME: 0.0.0.0
@@ -40,7 +56,47 @@ services:
       SWARM_SESSION_SECRET: "<FILL IN: openssl rand -hex 32>"
       # <FILL IN> public hostname(s), comma-separated, e.g. swarmagents.codes.
       # Must also include the internal service name for VM approval callbacks.
+      # Required: the app refuses to boot in server mode when this is empty.
       SWARM_ALLOWED_HOSTS: "<FILL IN: e.g. swarmagents.codes,swarmagents>"
+      # <FILL IN> public origin of this deployment. REQUIRED in server
+      # mode for real (Docker) runs: per-user VMs reach the app's LLM
+      # proxy through it, and run start is refused without a resolvable
+      # origin (FIX-10/11). If VMs must reach the app at a different
+      # address than the public site, set SWARM_VM_LLM_BASE_URL instead
+      # (commented below; approval callbacks already use the internal
+      # service name — see SWARM_VM_APPROVAL_BASE_URL).
+      SWARM_PUBLIC_ORIGIN: "<FILL IN: e.g. https://swarmagents.codes>"
+      # SWARM_VM_LLM_BASE_URL: "<FILL IN: origin reachable from inside the VMs>"
+      # Session cookies stay Secure (the default): TLS terminates at the
+      # front proxy. Only a plain-HTTP deployment would set
+      # SWARM_COOKIE_SECURE=0 — never in production (see DEPLOY.md).
+      # Self-signup is CLOSED by default in server mode. To open it (the
+      # supported launch posture — also how the first/operator account is
+      # created on a fresh deployment), uncomment and set to "1", recreate
+      # the container, create the account(s), then remove it again to
+      # close sign-up (see DEPLOY.md "Sign-up posture").
+      # SWARM_ALLOW_SIGNUP: "1"
+      # Invite-only sign-up (middle posture): sign-up requires a valid
+      # single-use code from SWARM_INVITE_CODES (comma-separated, long
+      # random values). Takes precedence over SWARM_ALLOW_SIGNUP.
+      # SWARM_SIGNUP_MODE: "invite"
+      # SWARM_INVITE_CODES: "<FILL IN: comma-separated invite codes>"
+      # Signup abuse controls (FIX-44): new accounts start unverified and
+      # cannot start runs until the emailed verification link is clicked
+      # (needs the SMTP settings below). Bot check: set BOTH Turnstile
+      # keys to require a Cloudflare Turnstile token on the sign-up form
+      # — with the secret unset the check is skipped. Set them before
+      # opening sign-ups (see DEPLOY.md "Sign-up posture").
+      # SWARM_TURNSTILE_SITE_KEY: "<FILL IN: Turnstile site key>"
+      # SWARM_TURNSTILE_SECRET: "<FILL IN: Turnstile secret key>"
+      # SWARM_EMAIL_VERIFY_TTL_HOURS: "24"
+      # Bearer token for server-to-server callers (external MCP clients,
+      # harness): the app validates `Authorization: Bearer <token>`
+      # against this value for /api/mcp/swarm-board writes from outside
+      # a browser session. Optional — unset disables bearer auth
+      # (session login still works). Never commit the real value; it
+      # lives in .env.v2 on the VPS only.
+      # SWARM_HARNESS_TOKEN: "<FILL IN: long random bearer token>"
       # <FILL IN> owner account for the admin bootstrap / operator identity.
       SWARM_OWNER_EMAIL: "<FILL IN: owner email>"
       SWARM_HOME: /data
@@ -51,13 +107,64 @@ services:
       # egress rules in swarmagents-egress.sh target this network's subnet.
       SWARM_VM_NETWORK: swarm-vms
       SWARM_VM_APPROVAL_BASE_URL: http://swarmagents:3777
-      SWARM_VM_DESKTOP: "0"
+      # Desktop mode ON (explicit production decision, FIX-16): per-user VMs
+      # are created from the desktop image and the live screen is served
+      # through the desktop proxy on 3778. `deploy` builds swarm-vm:desktop
+      # when it is missing; /api/health?ready=1 fails with
+      # DESKTOP_IMAGE_MISSING if it ever is. Opt out (headless VMs, terminal
+      # screen only) by setting this to "0" here — or run
+      # `./deploy.sh desktop-off` on the VPS, which edits .env.v2 — and
+      # recreate the app container. See DEPLOY.md "The per-user desktop VM
+      # image".
+      SWARM_VM_DESKTOP: "1"
       SWARM_VM_DESKTOP_IMAGE: swarm-vm:desktop
+      # Per-VM memory ceiling. A desktop VM adds a GUI session + browser to
+      # the headless stack; 4g is the recommended desktop ceiling (the
+      # driver default 2g is the floor). See DEPLOY.md "RAM expectations".
+      SWARM_VM_MEMORY: "4g"
+      # Global cap on simultaneously live user VMs (FIX-19): runs beyond
+      # the cap queue with a capacity status instead of starting a VM.
+      # Default 4 (sized for a small VPS at the 4GiB desktop-VM ceiling);
+      # 0 disables the cap. Uncomment to override. See DEPLOY.md
+      # "Global concurrent-VM cap".
+      # SWARM_MAX_CONCURRENT_VMS: "4"
       SWARM_DESKTOP_PROXY_HOST: 0.0.0.0
       SWARM_DESKTOP_PROXY_PORT: "3778"
+      # Frame tap (opt-in): uncomment and set to "1" to enable per-session
+      # keyframe capture (GET /desktop/keyframes), retained keyframes,
+      # takeover handback frame refs, and desktop.damage telemetry. Off by
+      # default (zero overhead); only the exact value "1" enables it.
+      # Memory cost while on: up to ~2x framebuffer plus a 32 MiB keyframe
+      # store per tapped session. See DEPLOY.md "Desktop stream proxy".
+      # SWARM_DESKTOP_FRAME_TAP: "1"
+      # Stored keyframes are downscaled to this largest dimension in px
+      # (default 1280, 0 = full resolution). Only matters with the frame
+      # tap on; uncomment to override.
+      # SWARM_DESKTOP_KEYFRAME_MAX_DIM: "1280"
+      # BYOC hub (in-process, container port 3779): bind 0.0.0.0 so the
+      # host-loopback publish above works; nginx routes /byoc/ to it.
+      # Set SWARM_BYOC_DISABLED=1 to not start the hub at all.
+      SWARM_BYOC_HOST: 0.0.0.0
+      SWARM_BYOC_PORT: "3779"
       # Reverse proxy in front (nginx): rate limits key off the real client.
       SWARM_TRUST_PROXY: "1"
       SWARM_TRUSTED_PROXY_HOPS: "1"
+      # Outbound mail for password-reset and email-verification messages
+      # (FIX-39/FIX-44): without SWARM_SMTP_HOST + SWARM_MAIL_FROM the
+      # deployment cannot deliver reset/verification links (the request
+      # endpoints still answer 200 — set these before opening sign-ups).
+      # Any SMTP provider works (Gmail app password, Fastmail,
+      # SES/Mailgun SMTP, ...). Never commit real credentials; they live
+      # in .env.v2 on the VPS only.
+      # SWARM_SMTP_HOST: "<FILL IN: e.g. smtp.example.com>"
+      # SWARM_SMTP_PORT: "587"
+      # SWARM_SMTP_SECURE: "0"
+      # SWARM_SMTP_USER: "<FILL IN: SMTP username>"
+      # SWARM_SMTP_PASS: "<FILL IN: SMTP password>"
+      # SWARM_SMTP_TIMEOUT_MS: "10000"
+      # SWARM_SMTP_HELO: "<FILL IN: EHLO name, e.g. your server FQDN>"
+      # SWARM_MAIL_FROM: "<FILL IN: e.g. SwarmAgents <no-reply@example.com>>"
+      # SWARM_PASSWORD_RESET_TTL_MIN: "30"
       # <FILL IN> host's docker socket group id (Linux: stat -c '%g'
       # /var/run/docker.sock; macOS: stat -f '%g' /var/run/docker.sock).
       DOCKER_GID: "<FILL IN: docker socket group id>"

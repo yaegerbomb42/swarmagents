@@ -3,8 +3,8 @@
 **One chat bar. One agent. Every tool. Nothing hidden.**
 
 SwarmAgents is a web platform where you type a prompt and an agent works for you inside your own persistent Linux VM,
-streaming every step (text, tool calls, results) live. It routes across many model providers with your own keys, and
-exposes a task board that other agents can claim work from. Live at <https://swarmagents.codes>.
+streaming every step (text, tool calls, results) live. It routes across many model providers with your own keys (BYOK),
+and every run is sandboxed in your own VM. Live at <https://swarmagents.codes>.
 
 Repository: <https://github.com/yaegerbomb42/swarmagents>
 

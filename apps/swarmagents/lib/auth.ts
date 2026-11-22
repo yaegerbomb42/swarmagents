@@ -92,9 +92,31 @@ const LOCAL_USER: AuthUser = { id: LOCAL_USER_ID, email: "local@swarmagents.loca
 const HARNESS_USER: AuthUser = { id: "harness", email: "harness@swarmagents.local" };
 
 /** Server mode: multi-user deployment where requests must authenticate. */
-export function serverMode(): boolean {
-  const v = process.env.SWARM_SERVER_MODE;
+export function serverMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env.SWARM_SERVER_MODE;
   return v === "1" || v === "true" || v === "yes";
+}
+
+/**
+ * Whether self-signup (POST /api/signup) accepts new accounts — the single
+ * source of truth for the signup gate. The login page renders its "Create
+ * account" toggle from this predicate and the signup route enforces it, so
+ * the two can never disagree. (They used to: the page keyed only on
+ * NODE_ENV, so a server-mode, non-production deployment — staging, a test
+ * server, a demo box — offered "Create account" while every attempt 403'd
+ * with "Sign-up is disabled on this server.")
+ *
+ * The rule: open in local (non-server) mode outside production — loopback
+ * only, and creating the first local account is the intended local flow —
+ * and open anywhere when SWARM_ALLOW_SIGNUP is "1"/"true". Closed in
+ * server mode (every environment) and in production unless explicitly
+ * enabled: a reachable server-mode box must not mint accounts (each one
+ * gets a VM) just because NODE_ENV was left unset.
+ */
+export function signupAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  const allow = (env.SWARM_ALLOW_SIGNUP ?? "").toLowerCase();
+  if (allow === "1" || allow === "true") return true;
+  return !serverMode(env) && env.NODE_ENV !== "production";
 }
 
 /** Minimum SWARM_SESSION_SECRET length (characters) enforced at boot in server mode. */

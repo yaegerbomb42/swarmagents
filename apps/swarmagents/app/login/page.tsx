@@ -1,20 +1,10 @@
 import { redirect } from "next/navigation";
 import { cookies, headers } from "next/headers";
-import { requestUser, safeNextPath } from "../../lib/auth";
+import { requestUser, safeNextPath, signupAllowed } from "../../lib/auth";
+import { botCheckSiteKey } from "../../lib/bot-check";
 import LoginForm from "./login-form";
 
 export const dynamic = "force-dynamic";
-
-/**
- * Whether POST /api/signup will accept new accounts: self-signup is open in
- * development and only when SWARM_ALLOW_SIGNUP is explicitly enabled in
- * production. Mirrors the check in app/api/signup/route.ts.
- */
-function signupSupported(): boolean {
-  if (process.env.NODE_ENV !== "production") return true;
-  const allow = (process.env.SWARM_ALLOW_SIGNUP ?? "").toLowerCase();
-  return allow === "1" || allow === "true";
-}
 
 /**
  * Sign-in page. Middleware sends unauthenticated visitors here with
@@ -30,5 +20,9 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
   const user = requestUser({ headers: hdrs, cookies: { get: (name) => cs.get(name) } });
   if (user) redirect(target);
 
-  return <LoginForm next={target} allowSignup={signupSupported()} />;
+  // The toggle renders iff POST /api/signup would accept an account:
+  // signupAllowed() in lib/auth is the one predicate both sides call.
+  // The Turnstile site key (FIX-44) is empty when the bot check is not
+  // configured; the form renders the widget only when it is present.
+  return <LoginForm next={target} allowSignup={signupAllowed()} turnstileSiteKey={botCheckSiteKey()} />;
 }

@@ -18,6 +18,7 @@ import {
   sessionCookieOptions,
   sessionMaxAgeSec,
   signSession,
+  signupAllowed,
   verifySession,
   USER_HEADER,
 } from "./auth.js";
@@ -574,4 +575,77 @@ test("safeNextPath only allows same-origin absolute paths", () => {
   assert.equal(safeNextPath("/x".repeat(3000)), "/");
   assert.equal(safeNextPath(42), "/");
   assert.equal(safeNextPath({ toString: () => "/" }), "/");
+});
+
+test("signupAllowed: full gate matrix (serverMode × production × SWARM_ALLOW_SIGNUP)", () => {
+  const env = (over: Record<string, string | undefined>): NodeJS.ProcessEnv =>
+    ({ ...over }) as NodeJS.ProcessEnv;
+  // The signup route's pre-FIX-41 rule, restated as the oracle: closed iff
+  // (serverMode || production) && allow not in {"1","true"} (lowercased).
+  // signupAllowed must reproduce it in every cell — the route's behaviour
+  // does not change; only the login page stops offering a dead toggle.
+  // Page and route now call this one predicate, so they agree in every
+  // cell by construction.
+  const routeRule = (e: NodeJS.ProcessEnv): boolean => {
+    const allow = (e.SWARM_ALLOW_SIGNUP ?? "").toLowerCase();
+    const sm =
+      e.SWARM_SERVER_MODE === "1" || e.SWARM_SERVER_MODE === "true" || e.SWARM_SERVER_MODE === "yes";
+    return !((sm || e.NODE_ENV === "production") && allow !== "1" && allow !== "true");
+  };
+  for (const mode of [undefined, "0", "1", "true", "yes"] as const) {
+    for (const nodeEnv of [undefined, "development", "test", "production"] as const) {
+      for (const allow of [undefined, "", "0", "1", "true", "TRUE", "yes"] as const) {
+        const e = env({ SWARM_SERVER_MODE: mode, NODE_ENV: nodeEnv, SWARM_ALLOW_SIGNUP: allow });
+        assert.equal(
+          signupAllowed(e),
+          routeRule(e),
+          `SWARM_SERVER_MODE=${mode} NODE_ENV=${nodeEnv} SWARM_ALLOW_SIGNUP=${allow}`,
+        );
+      }
+    }
+  }
+});
+
+test("signupAllowed: the FIX-41 cell — server mode, non-production, no opt-in — is closed", () => {
+  const env = (over: Record<string, string | undefined>): NodeJS.ProcessEnv =>
+    ({ ...over }) as NodeJS.ProcessEnv;
+  // The login page used to render "Create account" here (it keyed only on
+  // NODE_ENV) while POST /api/signup 403'd every attempt.
+  assert.equal(signupAllowed(env({ SWARM_SERVER_MODE: "1", NODE_ENV: "development" })), false);
+  assert.equal(signupAllowed(env({ SWARM_SERVER_MODE: "1", NODE_ENV: "test" })), false);
+  // The explicit opt-in opens it in every environment.
+  assert.equal(
+    signupAllowed(env({ SWARM_SERVER_MODE: "1", NODE_ENV: "development", SWARM_ALLOW_SIGNUP: "1" })),
+    true,
+  );
+  assert.equal(
+    signupAllowed(env({ SWARM_SERVER_MODE: "1", NODE_ENV: "production", SWARM_ALLOW_SIGNUP: "true" })),
+    true,
+  );
+  // Local mode stays open outside production (the first-account flow).
+  assert.equal(signupAllowed(env({ NODE_ENV: "development" })), true);
+  assert.equal(signupAllowed(env({})), true);
+  // Production without server mode stays closed without the opt-in.
+  assert.equal(signupAllowed(env({ NODE_ENV: "production" })), false);
+  // "yes" is not an accepted opt-in value (only "1"/"true", as the route had).
+  assert.equal(signupAllowed(env({ NODE_ENV: "production", SWARM_ALLOW_SIGNUP: "yes" })), false);
+});
+
+test("signupAllowed: defaults to process.env (the page/route call shape)", () => {
+  const previous = {
+    mode: process.env.SWARM_SERVER_MODE,
+    allow: process.env.SWARM_ALLOW_SIGNUP,
+  };
+  try {
+    process.env.SWARM_SERVER_MODE = "1";
+    delete process.env.SWARM_ALLOW_SIGNUP;
+    assert.equal(signupAllowed(), false);
+    process.env.SWARM_ALLOW_SIGNUP = "1";
+    assert.equal(signupAllowed(), true);
+  } finally {
+    if (previous.mode === undefined) delete process.env.SWARM_SERVER_MODE;
+    else process.env.SWARM_SERVER_MODE = previous.mode;
+    if (previous.allow === undefined) delete process.env.SWARM_ALLOW_SIGNUP;
+    else process.env.SWARM_ALLOW_SIGNUP = previous.allow;
+  }
 });

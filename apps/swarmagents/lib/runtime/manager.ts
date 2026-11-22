@@ -46,6 +46,7 @@ import type { RunMode } from "../providers/types";
 import { orderLlmCandidates } from "./llm-gateway";
 import { isTeamRunActive, ownsTeamRun } from "../team/store";
 import { serverMode } from "../auth";
+import { isEmailVerifiedForUserId } from "../users";
 import type {
   AttemptInfo,
   ClaudeSelection,
@@ -1330,6 +1331,23 @@ export class RuntimeManager {
     const configurationError = localDockerApprovalConfigurationError(this.vm);
     if (configurationError) {
       return { accepted: false, runId: "", queued: false, error: configurationError };
+    }
+    // FIX-44: in server mode an unverified local account cannot start
+    // runs — accounts consume VM compute, so open sign-ups must prove
+    // they own the email first. Local mode is a single trusted user and
+    // is never gated; non-local identities carry no verification flag.
+    // Verification only ever flips false -> true, so gating start()
+    // (the single admission point) is sufficient: queued and restored
+    // runs were admitted while verified.
+    if (serverMode() && !isEmailVerifiedForUserId(userId)) {
+      return {
+        accepted: false,
+        runId: "",
+        queued: false,
+        error:
+          "Verify your email before starting a run. Open the verification link we emailed you, " +
+          "or resend it from the verify page (/verify-email).",
+      };
     }
     const runId = `run_${randomUUID()}`;
     const st = this.state(userId);

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { makeEntry, makeTask } from "../testing/harness";
 import { pickActiveRunId, resolveStopTarget, runsInThread, sessionToContinue, stabilizeEntries } from "./useAgentSession";
 import { countTasks, upsertTask } from "./useBoard";
-import { countUsableProviders } from "./useEnvironment";
+import { countUsableProviders, firstRunSetup, type FirstRunSetupInput } from "./useEnvironment";
 
 test("the active run is the one running, else the queued run that starts next", () => {
   // Newest first, as the runs route returns them.
@@ -137,4 +137,49 @@ test("Stop acts on the named run, else the active run, else the run a send in fl
   // A send that failed started nothing: there is nothing to stop and nothing to report.
   assert.deepEqual(await resolveStopTarget(undefined, undefined, Promise.resolve({ ok: false })), { kind: "nothing-started" });
   assert.deepEqual(await resolveStopTarget(undefined, undefined, Promise.reject(new Error("offline"))), { kind: "nothing-started" });
+});
+
+test("a fresh zero-provider account is routed to provider setup (FIX-43)", () => {
+  const fresh: FirstRunSetupInput = {
+    providerState: "missing",
+    signedOut: false,
+    ready: true,
+    threadsReady: true,
+    turns: 0,
+    threads: 0,
+  };
+  assert.deepEqual(firstRunSetup(fresh), { needsProvider: true, firstRun: true });
+
+  // An account with a provider sees the normal UI: no setup, no block.
+  assert.deepEqual(firstRunSetup({ ...fresh, providerState: "configured" }), {
+    needsProvider: false,
+    firstRun: false,
+  });
+
+  // "unknown" is never a guess: nothing blocks until the server answers.
+  assert.deepEqual(firstRunSetup({ ...fresh, providerState: "unknown" }), {
+    needsProvider: false,
+    firstRun: false,
+  });
+
+  // Signed out has its own notice and blocked reason; setup never stacks on it.
+  assert.deepEqual(firstRunSetup({ ...fresh, signedOut: true }), { needsProvider: false, firstRun: false });
+});
+
+test("an established zero-provider account is blocked but not routed (FIX-43)", () => {
+  const base: FirstRunSetupInput = {
+    providerState: "missing",
+    signedOut: false,
+    ready: true,
+    threadsReady: true,
+    turns: 0,
+    threads: 0,
+  };
+  // History in the open conversation: block sending, do not yank into Settings.
+  assert.deepEqual(firstRunSetup({ ...base, turns: 3 }), { needsProvider: true, firstRun: false });
+  // A new chat on an account with conversations is not a first run.
+  assert.deepEqual(firstRunSetup({ ...base, threads: 2 }), { needsProvider: true, firstRun: false });
+  // Lists still loading: "empty" is not yet a fact, so no routing.
+  assert.deepEqual(firstRunSetup({ ...base, ready: false }), { needsProvider: true, firstRun: false });
+  assert.deepEqual(firstRunSetup({ ...base, threadsReady: false }), { needsProvider: true, firstRun: false });
 });

@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { NextRequest } from "next/server";
 import { GET } from "./route";
 import { USER_HEADER } from "../../../lib/auth";
+import { configureStorePaths } from "../../../lib/board/store";
+import { configureProviderStorePaths, saveProvider } from "../../../lib/providers/store";
 
 let tempDir: string;
 const savedEnv: Record<string, string | undefined> = {};
@@ -105,3 +107,56 @@ test("a ready probe returns 200 and no operator detail publicly", async () => {
   assert.equal("detail" in body, false);
   assert.equal(JSON.stringify(body).includes(tempDir), false);
 });
+
+function liveness(headers: Record<string, string> = {}): NextRequest {
+  return new NextRequest("http://localhost/api/health", { headers });
+}
+
+test("providersConfigured reflects a signed-in BYOK NVIDIA provider on liveness", async () => {
+  const KEY = "nvapi-fake-user-key-0123456789";
+  const USER = "local_alice@example.com";
+  process.env.SWARM_HOME = tempDir;
+  configureStorePaths(tempDir, join(tempDir, "swarm_board.json"));
+  configureProviderStorePaths(join(tempDir, "providers.json"));
+
+  const empty = await GET(liveness({ [USER_HEADER]: USER }));
+  assert.equal(empty.status, 200);
+  const emptyBody = await empty.json();
+  assert.equal(emptyBody.providersScope, "user");
+  assert.equal(emptyBody.providersConfigured, 0);
+
+  saveProvider(USER, { id: "nvidia-nim", apiKey: KEY });
+  const res = await GET(liveness({ [USER_HEADER]: USER }));
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.providersScope, "user");
+  assert.equal(body.providersConfigured, 1);
+  const raw = JSON.stringify(body);
+  assert.equal(raw.includes(KEY), false);
+  assert.equal(raw.includes("nvidia-nim"), false);
+  assert.equal(raw.includes("NVIDIA"), false);
+
+  configureProviderStorePaths("");
+});
+
+test("anonymous liveness counts host-env providers without leaking names", async () => {
+  const prev = process.env.SWARM_KEYS_NVIDIA_NIM;
+  try {
+    delete process.env.SWARM_KEYS_NVIDIA_NIM;
+    let res = await GET(liveness());
+    let body = await res.json();
+    assert.equal(body.providersScope, "host-env");
+    const baseline = body.providersConfigured;
+
+    process.env.SWARM_KEYS_NVIDIA_NIM = "nvapi-host-only";
+    res = await GET(liveness());
+    body = await res.json();
+    assert.equal(body.providersConfigured, baseline + 1);
+    assert.equal(JSON.stringify(body).includes("nvapi-host-only"), false);
+    assert.equal(JSON.stringify(body).includes("nvidia"), false);
+  } finally {
+    if (prev === undefined) delete process.env.SWARM_KEYS_NVIDIA_NIM;
+    else process.env.SWARM_KEYS_NVIDIA_NIM = prev;
+  }
+});
+

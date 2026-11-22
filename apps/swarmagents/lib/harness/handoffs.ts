@@ -67,6 +67,8 @@ function defaultFilePath(): string {
 }
 
 const MAX_PERSISTED = 500;
+/** Keep decided handoffs this long in memory so a late waiter still gets its outcome. */
+const DECIDED_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 interface WaitEntry {
   promise: Promise<HandoffOutcome>;
@@ -106,25 +108,8 @@ export class HandoffStore {
     };
     this.handoffs.set(handoff.id, handoff);
 
-    let resolve!: (outcome: HandoffOutcome) => void;
-    const promise = new Promise<HandoffOutcome>((res) => {
-      resolve = res;
-    });
-    this.waiters.set(handoff.id, { promise, resolve });
-
-    const timer = setTimeout(() => {
-      this.timers.delete(handoff.id);
-      const current = this.handoffs.get(handoff.id);
-      if (current && current.status === "pending") {
-        current.status = "expired";
-        current.expiresAt = current.expiresAt;
-        this.waiters.get(handoff.id)?.resolve({ status: "expired" });
-        recordAudit({ user: current.userId, action: "handoff.expire", target: current.id, result: "success" });
-        this.save();
-      }
-    }, ttlMs);
-    timer.unref?.();
-    this.timers.set(handoff.id, timer);
+    this.createWaiter(handoff.id);
+    this.armExpiryTimer(handoff.id, ttlMs);
 
     this.save();
     return handoff;
@@ -136,7 +121,14 @@ export class HandoffStore {
 
   /** Promise that settles when the handoff is resolved, cancelled or expires. */
   waitFor(id: string): Promise<HandoffOutcome> {
-    return this.waiters.get(id)?.promise ?? Promise.resolve({ status: "cancelled" });
+    const waiter = this.waiters.get(id);
+    if (waiter) return waiter.promise;
+    // No waiter: the handoff may already be decided (its waiter was
+    // deleted on settle). Report its outcome instead of a wrong
+    // "cancelled".
+    const handoff = this.handoffs.get(id);
+    if (handoff) return Promise.resolve({ status: handoff.status === "pending" ? "cancelled" : handoff.status });
+    return Promise.resolve({ status: "cancelled" });
   }
 
   /** Resolve a pending handoff (user clicked "Hand Back to Agent"). Idempotent. */
@@ -145,7 +137,7 @@ export class HandoffStore {
     if (!handoff || handoff.status !== "pending") return handoff;
     handoff.status = "answered";
     this.clearTimer(id);
-    this.waiters.get(id)?.resolve({ status: "answered" });
+    this.settleWaiter(id, { status: "answered" });
     this.save();
     return handoff;
   }
@@ -156,7 +148,7 @@ export class HandoffStore {
       if (handoff.runId === runId && handoff.status === "pending") {
         handoff.status = "cancelled";
         this.clearTimer(handoff.id);
-        this.waiters.get(handoff.id)?.resolve({ status: "cancelled" });
+        this.settleWaiter(handoff.id, { status: "cancelled" });
       }
     }
     this.save();
@@ -164,9 +156,14 @@ export class HandoffStore {
 
   /** Pending handoffs, newest first, optionally scoped to one user/run. */
   listPending(filter: { userId?: string; runId?: string } = {}): PendingHandoff[] {
+    const now = this.now();
     const out: PendingHandoff[] = [];
     for (const handoff of this.handoffs.values()) {
       if (handoff.status !== "pending") continue;
+      // Wall-clock guard: a pending handoff whose TTL elapsed (the timer
+      // never fired, or the entry was restored without one) is stale and
+      // must not be shown as awaiting the user.
+      if (handoff.expiresAt <= now) continue;
       if (filter.userId && handoff.userId !== filter.userId) continue;
       if (filter.runId && handoff.runId !== filter.runId) continue;
       out.push(handoff);
@@ -179,6 +176,47 @@ export class HandoffStore {
     for (const id of this.timers.keys()) this.clearTimer(id);
     this.handoffs.clear();
     this.waiters.clear();
+  }
+
+  private createWaiter(id: string): void {
+    let resolve!: (outcome: HandoffOutcome) => void;
+    const promise = new Promise<HandoffOutcome>((res) => {
+      resolve = res;
+    });
+    this.waiters.set(id, { promise, resolve });
+  }
+
+  /**
+   * Resolve a waiter's promise and drop the entry: a settled waiter is
+   * never awaited again, so keeping it would leak one promise per
+   * handoff forever. Late waitFor() calls fall back to the stored
+   * handoff's status, so deleting here loses no information.
+   */
+  private settleWaiter(id: string, outcome: HandoffOutcome): void {
+    const waiter = this.waiters.get(id);
+    if (!waiter) return;
+    this.waiters.delete(id);
+    waiter.resolve(outcome);
+  }
+
+  /** Shared TTL timer: one helper for create() and for restored entries in load(). */
+  private armExpiryTimer(id: string, delayMs: number): void {
+    const timer = setTimeout(() => {
+      this.timers.delete(id);
+      const current = this.handoffs.get(id);
+      if (current && current.status === "pending") {
+        this.expireHandoff(current);
+      }
+    }, Math.max(0, delayMs));
+    timer.unref?.();
+    this.timers.set(id, timer);
+  }
+
+  private expireHandoff(handoff: PendingHandoff): void {
+    handoff.status = "expired";
+    this.settleWaiter(handoff.id, { status: "expired" });
+    recordAudit({ user: handoff.userId, action: "handoff.expire", target: handoff.id, result: "success" });
+    this.save();
   }
 
   private clearTimer(id: string): void {
@@ -220,6 +258,13 @@ export class HandoffStore {
         expiresAt,
         status: effective,
       });
+      if (effective === "pending") {
+        // A restored pending handoff needs a waiter and its remaining-TTL
+        // timer, or it would sit pending forever: no timer ever expires
+        // it, and waitFor() would resolve "cancelled" immediately.
+        this.createWaiter(h.id);
+        this.armExpiryTimer(h.id, expiresAt - now);
+      }
     }
   }
 
@@ -227,6 +272,17 @@ export class HandoffStore {
     if (!this.persist) return;
     try {
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+      const now = this.now();
+      // Prune decided handoffs older than the retention bound from memory
+      // too: disk serialization already trimmed them, but the in-memory
+      // map grew without bound.
+      for (const [id, handoff] of this.handoffs) {
+        if (handoff.status !== "pending" && now - handoff.createdAt > DECIDED_RETENTION_MS) {
+          this.handoffs.delete(id);
+          this.waiters.delete(id);
+          this.clearTimer(id);
+        }
+      }
       const all = [...this.handoffs.values()]
         .sort((a, b) => b.createdAt - a.createdAt)
         .slice(0, MAX_PERSISTED);

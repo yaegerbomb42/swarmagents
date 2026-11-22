@@ -22,6 +22,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { atomicWriteFile } from "../atomic-write";
 import { getStoragePaths } from "../board/store";
 import { recordAudit } from "../audit";
 
@@ -122,6 +123,8 @@ export function getApprovalStorePath(): string {
 interface WaitEntry {
   promise: Promise<ApprovalVerdict>;
   decide: (verdict: ApprovalVerdict) => void;
+  /** Timeout hook for this approval (per-create override, else the store default). */
+  onTimeout?: ApprovalTimeoutHandler;
 }
 
 interface ApprovalsFile {
@@ -243,12 +246,8 @@ export class ApprovalStore {
     };
     this.approvals.set(id, approval);
 
-    let decide!: (verdict: ApprovalVerdict) => void;
-    const promise = new Promise<ApprovalVerdict>((resolve) => {
-      decide = resolve;
-    });
-    this.waiters.set(id, { promise, decide });
-    this.armTimer(id, ttlMs, input.onTimeout ?? this.defaultOnTimeout);
+    this.createWaiter(id, input.onTimeout ?? this.defaultOnTimeout);
+    this.armTimer(id, ttlMs);
     this.persist();
     return approval;
   }
@@ -266,21 +265,35 @@ export class ApprovalStore {
 
   /** Promise that settles when the approval is decided (or expires). */
   waitFor(id: string): Promise<ApprovalVerdict> {
-    return this.waiters.get(id)?.promise ?? Promise.resolve("expired");
+    const waiter = this.waiters.get(id);
+    if (waiter) return waiter.promise;
+    // No waiter: the approval may already be decided (its waiter was
+    // deleted on settle) or restored without one. Report its verdict
+    // instead of a wrong "expired".
+    const approval = this.approvals.get(id);
+    if (approval && approval.status !== "pending") return Promise.resolve(approval.status);
+    return Promise.resolve("expired");
   }
 
   /**
    * Resolve a pending approval. Idempotent: deciding twice keeps the first
-   * verdict.
+   * verdict. A decision that arrives after the TTL has elapsed does not
+   * resurrect the approval: it expires as a timeout instead.
    */
   resolve(id: string, verdict: "approved" | "denied"): PendingApproval | undefined {
     const approval = this.approvals.get(id);
     if (!approval) return undefined;
     if (approval.status === "pending") {
+      if (this.now() >= approval.expiresAt) {
+        // The TTL elapsed but the timer has not fired yet (timers can lag):
+        // expire rather than apply a verdict to a dead approval.
+        this.expireApproval(approval);
+        return approval;
+      }
       approval.status = verdict;
       approval.decidedAt = this.now();
       this.clearTimer(id);
-      this.waiters.get(id)?.decide(verdict);
+      this.settleWaiter(id, verdict);
       this.persist();
     }
     return approval;
@@ -302,7 +315,7 @@ export class ApprovalStore {
       approval.decidedAt = this.now();
       approval.expiredReason = reason;
       this.clearTimer(approval.id);
-      this.waiters.get(approval.id)?.decide("expired");
+      this.settleWaiter(approval.id, "expired");
       changed = true;
       if (reason === "server_restart") {
         recordAudit({
@@ -335,23 +348,56 @@ export class ApprovalStore {
     }
   }
 
-  private armTimer(id: string, delayMs: number, onTimeout?: ApprovalTimeoutHandler): void {
+  private createWaiter(id: string, onTimeout?: ApprovalTimeoutHandler): void {
+    let decide!: (verdict: ApprovalVerdict) => void;
+    const promise = new Promise<ApprovalVerdict>((resolve) => {
+      decide = resolve;
+    });
+    this.waiters.set(id, { promise, decide, onTimeout });
+  }
+
+  /**
+   * Decide a waiter's promise and drop the entry: a settled waiter is
+   * never awaited again, so keeping it would leak one promise per
+   * approval forever. Late waitFor() calls fall back to the stored
+   * approval's verdict, so deleting here loses no information.
+   */
+  private settleWaiter(id: string, verdict: ApprovalVerdict): void {
+    const waiter = this.waiters.get(id);
+    if (!waiter) return;
+    this.waiters.delete(id);
+    waiter.decide(verdict);
+  }
+
+  /**
+   * Expire a pending approval because its TTL elapsed — either the timer
+   * fired, or a decision arrived after the deadline. Fires the timeout
+   * hook exactly once (read from the waiter before settling it) and
+   * audits the expiry.
+   */
+  private expireApproval(approval: PendingApproval): void {
+    const onTimeout = this.waiters.get(approval.id)?.onTimeout;
+    approval.status = "expired";
+    approval.decidedAt = this.now();
+    approval.timedOut = true;
+    approval.expiredReason = "ttl";
+    this.clearTimer(approval.id);
+    this.settleWaiter(approval.id, "expired");
+    recordAudit({ user: approval.userId, action: "approval.expire", target: approval.id, result: "success" });
+    try {
+      onTimeout?.(approval);
+    } catch {
+      // A broken telemetry hook must never keep the run paused.
+    }
+    this.persist();
+  }
+
+  private armTimer(id: string, delayMs: number): void {
     const timer = setTimeout(() => {
       this.timers.delete(id);
       const current = this.approvals.get(id);
       if (!current || current.status !== "pending") return;
-      current.status = "expired";
-      current.decidedAt = this.now();
-      current.timedOut = true;
-      current.expiredReason = "ttl";
-      this.waiters.get(id)?.decide("expired");
-      recordAudit({ user: current.userId, action: "approval.expire", target: id, result: "success" });
-      try {
-        onTimeout?.(current);
-      } catch {
-        // A broken telemetry hook must never keep the run paused.
-      }
-      this.persist();
+      this.expireApproval(current);
     }, Math.max(0, delayMs));
     timer.unref?.();
     this.timers.set(id, timer);
@@ -400,7 +446,11 @@ export class ApprovalStore {
         repaired = true;
         continue;
       }
-      this.armTimer(approval.id, approval.expiresAt - now, this.defaultOnTimeout);
+      // Restored pending approvals need a waiter too: without one,
+      // waitFor() would resolve "expired" immediately for an approval
+      // that is still live, and the paused run would resume wrongly.
+      this.createWaiter(approval.id, this.defaultOnTimeout);
+      this.armTimer(approval.id, approval.expiresAt - now);
     }
     if (repaired) this.persist();
   }
@@ -408,6 +458,20 @@ export class ApprovalStore {
   private persist(): void {
     if (!this.persistPath) return;
     const now = this.now();
+    // Prune decided records older than the retention bound from memory
+    // too: disk serialization already trimmed them, but the in-memory
+    // map grew without bound.
+    for (const [id, approval] of this.approvals) {
+      if (
+        approval.status !== "pending" &&
+        approval.decidedAt !== undefined &&
+        now - approval.decidedAt > DECIDED_RETENTION_MS
+      ) {
+        this.approvals.delete(id);
+        this.waiters.delete(id);
+        this.clearTimer(id);
+      }
+    }
     const entries = [...this.approvals.values()]
       .filter(
         (approval) =>
@@ -429,14 +493,9 @@ export class ApprovalStore {
       } catch {
         // Best effort.
       }
-      const tmp = `${this.persistPath}.tmp.${process.pid}.${Date.now()}`;
-      fs.writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
-      fs.renameSync(tmp, this.persistPath);
-      try {
-        fs.chmodSync(this.persistPath, 0o600);
-      } catch {
-        // Best effort.
-      }
+      // Shared atomic writer: unique temp name (no same-millisecond
+      // collision), fsync before the rename, temp removed on failure.
+      atomicWriteFile(this.persistPath, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
     } catch (error) {
       console.error(`[approvals] could not persist to ${this.persistPath}:`, error);
     }

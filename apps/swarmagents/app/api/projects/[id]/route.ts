@@ -9,8 +9,9 @@
  * caller learns nothing about another user's project.
  */
 
-import { NextResponse, type NextRequest } from "next/server";
+import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../lib/auth";
+import { noStoreJson } from "../../../../lib/http";
 import {
   ProjectError,
   deleteProject,
@@ -34,22 +35,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function notFound() {
-  return NextResponse.json({ error: "Project not found." }, { status: 404 });
+  return noStoreJson({ error: "Project not found." }, { status: 404 });
 }
 
 export async function GET(req: NextRequest, context: { params: Promise<{ id: string }> }) {
   const user = caller(req);
-  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+  if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
   const { id } = await context.params;
   if (!isProjectId(id)) return notFound();
   const project = getProject(user, id);
   if (!project) return notFound();
-  return NextResponse.json({ project });
+  return noStoreJson({ project });
 }
 
 export async function PATCH(req: NextRequest, context: { params: Promise<{ id: string }> }) {
   const user = caller(req);
-  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+  if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
   const { id } = await context.params;
   if (!isProjectId(id)) return notFound();
 
@@ -57,19 +58,19 @@ export async function PATCH(req: NextRequest, context: { params: Promise<{ id: s
   try {
     text = await req.text();
   } catch {
-    return NextResponse.json({ error: "Could not read request body." }, { status: 400 });
+    return noStoreJson({ error: "Could not read request body." }, { status: 400 });
   }
   if (text.length > MAX_BODY_SIZE) {
-    return NextResponse.json({ error: "Request body too large." }, { status: 413 });
+    return noStoreJson({ error: "Request body too large." }, { status: 413 });
   }
   let body: unknown;
   try {
     body = JSON.parse(text);
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return noStoreJson({ error: "Invalid JSON body." }, { status: 400 });
   }
   if (!isRecord(body)) {
-    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400 });
+    return noStoreJson({ error: "Body must be a JSON object." }, { status: 400 });
   }
 
   try {
@@ -82,21 +83,21 @@ export async function PATCH(req: NextRequest, context: { params: Promise<{ id: s
       pinnedNotes: body.pinnedNotes,
       computeTarget: body.computeTarget,
     });
-    return NextResponse.json({ project });
+    return noStoreJson({ project });
   } catch (err) {
     if (err instanceof ProjectError) {
-      return NextResponse.json({ error: err.message }, { status: err.status });
+      return noStoreJson({ error: err.message }, { status: err.status });
     }
-    return NextResponse.json({ error: "Could not update the project." }, { status: 500 });
+    return noStoreJson({ error: "Could not update the project." }, { status: 500 });
   }
 }
 
 export async function DELETE(req: NextRequest, context: { params: Promise<{ id: string }> }) {
   const user = caller(req);
-  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+  if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
   const { id } = await context.params;
   if (!isProjectId(id)) return notFound();
   const deleted = deleteProject(user, id);
   if (!deleted) return notFound();
-  return NextResponse.json({ ok: true });
+  return noStoreJson({ ok: true });
 }

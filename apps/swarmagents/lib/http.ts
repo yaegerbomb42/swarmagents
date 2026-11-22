@@ -9,7 +9,25 @@
  * followed by the route's own shape checks.
  */
 
+import { NextResponse } from "next/server";
+
 export const DEFAULT_MAX_JSON_BODY_BYTES = 256 * 1024;
+
+/** Header that marks a per-user or otherwise dynamic reply as uncacheable. */
+export const NO_STORE = { "cache-control": "no-store" } as const;
+
+/**
+ * A JSON reply that must never be cached. Per-user state (projects, pairing
+ * codes, lens answers) and error branches that echo request shape are all
+ * cacheable-by-default unless the route says otherwise, and a cached copy
+ * serves one account's state to the next reader. `noStoreJson` is the one
+ * place that sets the header so no branch is forgotten.
+ */
+export function noStoreJson(body: unknown, init: ResponseInit = {}): NextResponse {
+  const headers = new Headers(init.headers);
+  headers.set("cache-control", "no-store");
+  return NextResponse.json(body, { ...init, headers });
+}
 
 /** Thrown by `readJsonBody` when the body is unreadable, oversized or invalid. */
 export class JsonBodyError extends Error {

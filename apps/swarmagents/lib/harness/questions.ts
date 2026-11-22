@@ -7,28 +7,25 @@
  * still shows an unanswered question instead of losing the paused run.
  *
  * The in-memory map of waiters is the authority for resuming a run; disk is
- * only a mirror used to re-render pending cards.
+ * only a mirror used to re-render pending cards. Timer/waiter/persistence
+ * mechanics live in PendingInteractionStore (see ./pending-store.ts).
  */
 
-import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { recordAudit } from "../audit";
 import { getStoragePaths } from "../board/store";
 import { ASK_QUESTION_TTL_MS } from "./ask-mcp";
-import { atomicWriteFile } from "../atomic-write";
+import {
+  PendingInteractionStore,
+  type BasePendingInteraction,
+} from "./pending-store";
 
 export type QuestionStatus = "pending" | "answered" | "expired" | "cancelled";
 
-export interface PendingQuestion {
-  id: string;
-  runId: string;
-  userId: string;
+export interface PendingQuestion extends BasePendingInteraction {
   question: string;
   options: string[];
   allowFreeText: boolean;
-  createdAt: number;
-  expiresAt: number;
   status: QuestionStatus;
   answer?: string;
   answeredAt?: number;
@@ -69,183 +66,79 @@ function defaultFilePath(): string {
   return path.join(getStoragePaths().STORAGE_DIR, "questions.json");
 }
 
-const MAX_PERSISTED = 500;
-
-interface WaitEntry {
-  promise: Promise<QuestionOutcome>;
-  resolve: (outcome: QuestionOutcome) => void;
+function normalizeQuestion(raw: unknown, nowMs: number): PendingQuestion | null {
+  if (!raw || typeof raw !== "object") return null;
+  const q = raw as Partial<PendingQuestion>;
+  if (typeof q.id !== "string" || typeof q.question !== "string") return null;
+  const status: QuestionStatus =
+    q.status === "answered" || q.status === "expired" || q.status === "cancelled"
+      ? q.status
+      : "pending";
+  const expiresAt = typeof q.expiresAt === "number" ? q.expiresAt : nowMs;
+  return {
+    id: q.id,
+    runId: typeof q.runId === "string" ? q.runId : "",
+    userId: typeof q.userId === "string" ? q.userId : "",
+    question: q.question,
+    options: Array.isArray(q.options)
+      ? q.options.filter((o): o is string => typeof o === "string")
+      : [],
+    allowFreeText: q.allowFreeText !== false,
+    createdAt: typeof q.createdAt === "number" ? q.createdAt : nowMs,
+    expiresAt,
+    status: status === "pending" && expiresAt <= nowMs ? "expired" : status,
+    ...(typeof q.answer === "string" ? { answer: q.answer } : {}),
+    ...(typeof q.answeredAt === "number" ? { answeredAt: q.answeredAt } : {}),
+  };
 }
 
-export class QuestionStore {
-  private readonly questions = new Map<string, PendingQuestion>();
-  private readonly waiters = new Map<string, WaitEntry>();
-  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+export class QuestionStore extends PendingInteractionStore<PendingQuestion, QuestionOutcome> {
   private readonly ttlMs: number | undefined;
-  private readonly now: () => number;
-  private readonly persist: boolean;
-  private readonly filePath: string;
 
   constructor(options: QuestionStoreOptions = {}) {
+    super({
+      filePath: options.filePath ?? defaultFilePath(),
+      persist: options.persist,
+      now: options.now,
+      auditExpireAction: "question.expire",
+      normalize: normalizeQuestion,
+      onExpire: (item, nowMs) => {
+        item.answeredAt = nowMs;
+      },
+      expiredOutcome: () => ({ status: "expired" }),
+      cancelledOutcome: () => ({ status: "cancelled" }),
+    });
     this.ttlMs = options.ttlMs;
-    this.now = options.now ?? Date.now;
-    this.persist = options.persist !== false;
-    this.filePath = options.filePath ?? defaultFilePath();
-    if (this.persist) this.load();
   }
 
   /** Create a pending question and start its TTL timer. */
   create(input: CreateQuestionInput): PendingQuestion {
     const now = this.now();
     const ttlMs = input.ttlMs ?? this.ttlMs ?? defaultTtlMs();
-    const question: PendingQuestion = {
-      id: input.id || `q_${randomUUID()}`,
-      runId: input.runId,
-      userId: input.userId,
-      question: input.question,
-      options: input.options ?? [],
-      allowFreeText: input.allowFreeText !== false,
-      createdAt: now,
-      expiresAt: now + ttlMs,
-      status: "pending",
-    };
-    this.questions.set(question.id, question);
-
-    let resolve!: (outcome: QuestionOutcome) => void;
-    const promise = new Promise<QuestionOutcome>((res) => {
-      resolve = res;
-    });
-    this.waiters.set(question.id, { promise, resolve });
-
-    const timer = setTimeout(() => {
-      this.timers.delete(question.id);
-      const current = this.questions.get(question.id);
-      if (current && current.status === "pending") {
-        current.status = "expired";
-        current.answeredAt = this.now();
-        this.waiters.get(question.id)?.resolve({ status: "expired" });
-        recordAudit({ user: current.userId, action: "question.expire", target: current.id, result: "success" });
-        this.save();
-      }
-    }, ttlMs);
-    timer.unref?.();
-    this.timers.set(question.id, timer);
-
-    this.save();
-    return question;
-  }
-
-  get(id: string): PendingQuestion | undefined {
-    return this.questions.get(id);
-  }
-
-  /** Promise that settles when the question is answered, cancelled or expires. */
-  waitFor(id: string): Promise<QuestionOutcome> {
-    return this.waiters.get(id)?.promise ?? Promise.resolve({ status: "cancelled" });
+    return this.createPending(
+      {
+        id: input.id || `q_${randomUUID()}`,
+        runId: input.runId,
+        userId: input.userId,
+        question: input.question,
+        options: input.options ?? [],
+        allowFreeText: input.allowFreeText !== false,
+        createdAt: now,
+        expiresAt: now + ttlMs,
+        status: "pending",
+      },
+      ttlMs,
+    );
   }
 
   /** Answer a pending question. Idempotent: the first answer wins. */
   answer(id: string, answer: string): PendingQuestion | undefined {
-    const question = this.questions.get(id);
-    if (!question || question.status !== "pending") return question;
-    question.status = "answered";
-    question.answer = answer;
-    question.answeredAt = this.now();
-    this.clearTimer(id);
-    this.waiters.get(id)?.resolve({ status: "answered", answer });
-    this.save();
-    return question;
-  }
-
-  /** Cancel every pending question for a run (run cancelled / finished). */
-  cancelPendingForRun(runId: string): void {
-    for (const question of this.questions.values()) {
-      if (question.runId === runId && question.status === "pending") {
-        question.status = "cancelled";
-        question.answeredAt = this.now();
-        this.clearTimer(question.id);
-        this.waiters.get(question.id)?.resolve({ status: "cancelled" });
-      }
-    }
-    this.save();
-  }
-
-  /** Pending questions, newest first, optionally scoped to one user/run. */
-  listPending(filter: { userId?: string; runId?: string } = {}): PendingQuestion[] {
-    const out: PendingQuestion[] = [];
-    for (const question of this.questions.values()) {
-      if (question.status !== "pending") continue;
-      if (filter.userId && question.userId !== filter.userId) continue;
-      if (filter.runId && question.runId !== filter.runId) continue;
-      out.push(question);
-    }
-    return out.sort((a, b) => b.createdAt - a.createdAt);
-  }
-
-  /** Test/reset hook: drop all in-memory state (does not delete the file). */
-  clear(): void {
-    for (const id of this.timers.keys()) this.clearTimer(id);
-    this.questions.clear();
-    this.waiters.clear();
-  }
-
-  private clearTimer(id: string): void {
-    const timer = this.timers.get(id);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-      this.timers.delete(id);
-    }
-  }
-
-  private load(): void {
-    let parsed: unknown;
-    try {
-      if (!fs.existsSync(this.filePath)) return;
-      parsed = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
-    } catch (err) {
-      // A corrupt file must never crash the runtime; pending questions are
-      // best-effort and the in-memory store still works.
-      console.error("[questions] could not read persisted questions:", err instanceof Error ? err.message : err);
-      return;
-    }
-    const list = Array.isArray(parsed) ? parsed : [];
-    const now = this.now();
-    for (const raw of list) {
-      if (!raw || typeof raw !== "object") continue;
-      const q = raw as Partial<PendingQuestion>;
-      if (typeof q.id !== "string" || typeof q.question !== "string") continue;
-      const status: QuestionStatus =
-        q.status === "answered" || q.status === "expired" || q.status === "cancelled" ? q.status : "pending";
-      const expiresAt = typeof q.expiresAt === "number" ? q.expiresAt : now;
-      // A pending question whose TTL elapsed while the server was down is
-      // expired, not resurrected.
-      const effective: QuestionStatus = status === "pending" && expiresAt <= now ? "expired" : status;
-      this.questions.set(q.id, {
-        id: q.id,
-        runId: typeof q.runId === "string" ? q.runId : "",
-        userId: typeof q.userId === "string" ? q.userId : "",
-        question: q.question,
-        options: Array.isArray(q.options) ? q.options.filter((o): o is string => typeof o === "string") : [],
-        allowFreeText: q.allowFreeText !== false,
-        createdAt: typeof q.createdAt === "number" ? q.createdAt : now,
-        expiresAt,
-        status: effective,
-        ...(typeof q.answer === "string" ? { answer: q.answer } : {}),
-        ...(typeof q.answeredAt === "number" ? { answeredAt: q.answeredAt } : {}),
-      });
-    }
-  }
-
-  private save(): void {
-    if (!this.persist) return;
-    try {
-      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-      const all = [...this.questions.values()]
-        .sort((a, b) => b.createdAt - a.createdAt)
-        .slice(0, MAX_PERSISTED);
-      atomicWriteFile(this.filePath, JSON.stringify(all));
-    } catch (err) {
-      console.error("[questions] could not persist questions:", err instanceof Error ? err.message : err);
-    }
+    return this.settle(id, (item, nowMs) => {
+      item.status = "answered";
+      item.answer = answer;
+      item.answeredAt = nowMs;
+      return { status: "answered", answer };
+    });
   }
 }
 

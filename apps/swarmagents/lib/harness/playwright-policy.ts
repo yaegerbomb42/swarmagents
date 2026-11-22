@@ -37,7 +37,8 @@ function ipv4(host) {
   return out;
 }
 function expandIpv6(host) {
-  let h = bareIpv6(host).toLowerCase();
+  // Strip any IPv6 zone ID (fe80::1%eth0): zones never affect the address.
+  let h = bareIpv6(host).toLowerCase().split("%")[0];
   const trailing4 = /^(.*):(\d+\.\d+\.\d+\.\d+)$/.exec(h);
   if (trailing4) {
     const parts = trailing4[2].split(".").map(Number);
@@ -65,15 +66,28 @@ function privateIpv4(host) {
     (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||
     (p[0] === 169 && p[1] === 254) ||
     (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
-    (p[0] === 192 && p[1] === 168);
+    (p[0] === 192 && p[1] === 168) ||
+    (p[0] === 192 && p[1] === 0 && p[2] === 0) ||
+    (p[0] === 198 && p[1] >= 18 && p[1] <= 19) ||
+    p[0] >= 224;
 }
 function privateIpv6(host) {
   const g = expandIpv6(host);
-  if (!g) return false;
+  // Fail closed: an unparseable IPv6 literal is treated as private/blocked.
+  if (!g) return true;
   if (g.every((n) => n === 0)) return true;
+  if (g.slice(0, 7).every((n) => n === 0) && g[7] === 1) return true;
   if ((g[0] & 0xfe00) === 0xfc00) return true;
   if ((g[0] & 0xffc0) === 0xfe80) return true;
+  if ((g[0] & 0xffc0) === 0xfec0) return true;
+  if ((g[0] & 0xff00) === 0xff00) return true;
+  if (g[0] === 0x2002) return true;
+  if (g[0] === 0x2001 && g[1] === 0) return true;
+  if (g[0] === 0x64 && g[1] === 0xff9b) return true;
   if (g.slice(0, 5).every((n) => n === 0) && g[5] === 0xffff) {
+    return privateIpv4(((g[6] >> 8) & 255) + "." + (g[6] & 255) + "." + ((g[7] >> 8) & 255) + "." + (g[7] & 255));
+  }
+  if (g.slice(0, 6).every((n) => n === 0)) {
     return privateIpv4(((g[6] >> 8) & 255) + "." + (g[6] & 255) + "." + ((g[7] >> 8) & 255) + "." + (g[7] & 255));
   }
   return false;
@@ -110,9 +124,20 @@ async function blocked(raw) {
 async function resolveTarget(raw) {
   let url;
   try { url = new URL(raw); } catch { return { reason: "malformed URL", addresses: [] }; }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return { reason: null, addresses: [] };
+  // Only HTTP(S) is ever proxied: every other scheme is denied outright
+  // instead of falling through as allowed.
+  if (url.protocol !== "http:" && url.protocol !== "https:") return { reason: "blocked protocol", addresses: [] };
   const host = bareIpv6(url.hostname);
-  if (loopback(host)) return { reason: null, addresses: [] };
+  const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+  if (loopback(host)) {
+    // Never let a rogue resolver answer for localhost: pin it to loopback,
+    // except the proxy's own port, which would loop back into the proxy.
+    if (port === 18793) return { reason: "self-proxy loopback target", addresses: [] };
+    const address = host === "localhost" || host.endsWith(".localhost")
+      ? "127.0.0.1"
+      : host;
+    return { reason: null, addresses: [{ address, family: address.includes(":") ? 6 : 4 }] };
+  }
   if (privateHostname(host) || privateIp(host)) return { reason: host, addresses: [] };
   if (net.isIP(host) !== 0) return { reason: null, addresses: [{ address: host, family: net.isIP(host) }] };
   let records;
@@ -179,6 +204,13 @@ const server = http.createServer(async (req, res) => {
   const lookup = pinned.length
     ? (hostname, options, callback) => {
         const family = typeof options === "number" ? options : (options && options.family) || 0;
+        // Node 20+ autoSelectFamily calls lookup with { all: true } and
+        // expects an array of { address, family } records in return.
+        if (options && options.all) {
+          const matches = pinned.filter((record) => family === 0 || record.family === family);
+          callback(null, (matches.length ? matches : pinned).map((r) => ({ address: r.address, family: r.family })));
+          return;
+        }
         const match = pinned.find((record) => family === 0 || record.family === family) || pinned[0];
         callback(null, match.address, match.family);
       }
@@ -191,11 +223,26 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" });
     res.end("Upstream request failed.\n");
   });
+  // If the client goes away mid-response, stop the upstream work too.
+  if (typeof res.on === "function") res.on("close", () => upstream.destroy());
   req.pipe(upstream);
 });
 server.on("connect", async (req, client, head) => {
+  // Strict host:port parsing: reject anything smuggling userinfo, a path,
+  // a query/fragment, or whitespace (e.g. example.com@10.0.0.1:443).
+  const raw = String(req.url || "");
+  if (/[@/?#\s]/.test(raw)) {
+    client.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    return;
+  }
+  const lastColon = raw.lastIndexOf(":");
+  const port = lastColon > 0 ? Number(raw.slice(lastColon + 1)) : NaN;
+  if (lastColon <= 0 || !raw.slice(0, lastColon) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    client.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    return;
+  }
   let target;
-  try { target = new URL("https://" + req.url); } catch {
+  try { target = new URL("https://" + raw); } catch {
     client.end("HTTP/1.1 403 Forbidden\r\n\r\n");
     return;
   }
@@ -206,7 +253,6 @@ server.on("connect", async (req, client, head) => {
     client.end("HTTP/1.1 403 Forbidden\r\n\r\n");
     return;
   }
-  const port = Number(target.port || 443);
   // Connect to the IP validated by the policy check above, not the hostname:
   // a second DNS resolution here would let a rebinding answer swap in a
   // private address. Loopback and literal-IP targets carry no separate
@@ -219,14 +265,26 @@ server.on("connect", async (req, client, head) => {
     upstream.pipe(client);
     client.pipe(upstream);
   });
+  // Idle tunnels must not linger forever, and either side going away tears
+  // down the peer (not just on error).
+  const idleMs = 120000;
+  if (typeof upstream.setTimeout === "function") {
+    upstream.setTimeout(idleMs, () => { upstream.destroy(); client.destroy(); });
+  }
+  if (typeof client.setTimeout === "function") {
+    client.setTimeout(idleMs, () => { upstream.destroy(); client.destroy(); });
+  }
   upstream.on("error", () => client.destroy());
   client.on("error", () => upstream.destroy());
+  upstream.on("close", () => client.destroy());
+  client.on("close", () => upstream.destroy());
 });
 server.on("error", (err) => {
-  // Without this, a listen failure (e.g. EADDRINUSE on 18793) is an uncaught
-  // exception that kills the proxy; with it the failure is surfaced and the
-  // launcher's health poll reports the proxy as down.
+  // A listen failure (e.g. EADDRINUSE on 18793) must fail fast so the
+  // launcher reports the proxy as down instead of leaving a half-started
+  // proxy behind; without this handler it is an uncaught exception.
   console.error("[playwright-proxy] server error:", err instanceof Error ? err.message : String(err));
+  process.exit(1);
 });
 server.listen(18793, "127.0.0.1");
 `;

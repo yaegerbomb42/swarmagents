@@ -21,10 +21,59 @@
  * creation time while still running).
  */
 
+import fs from "node:fs";
 import type { SequencedEvent } from "./bus";
 import { getRunsDir } from "./paths";
 import { listRunLogs, readRunEvents } from "./run-log";
 import type { ProviderConfig } from "../providers/types";
+
+/**
+ * Bounded LRU of per-run folded usage, validated by the newest log file's
+ * (mtimeMs, size). Rotated segments are immutable once written and new
+ * events only ever land in the newest file (the one listRunLogs returns),
+ * so a matching (mtimeMs, size) means the run's events are unchanged.
+ * This keeps repeated GET /api/usage calls from synchronously re-reading
+ * and re-parsing every run log on disk.
+ */
+const MAX_USAGE_CACHE_ENTRIES = 1024;
+
+interface CachedRunUsage {
+  mtimeMs: number;
+  size: number;
+  usage: RunUsage;
+}
+
+const usageCache = new Map<string, CachedRunUsage>();
+
+export function clearUsageCacheForTesting(): void {
+  usageCache.clear();
+}
+
+function getCachedRunUsage(file: string, runId: string, runsDir: string): RunUsage | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    usageCache.delete(file);
+    return null;
+  }
+  const cached = usageCache.get(file);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    // Refresh LRU recency.
+    usageCache.delete(file);
+    usageCache.set(file, cached);
+    return cached.usage;
+  }
+  const events = readRunEvents(runId, runsDir);
+  if (events.length === 0) return null;
+  const usage = aggregateRunUsage(runId, events);
+  if (usageCache.size >= MAX_USAGE_CACHE_ENTRIES) {
+    const oldestKey = usageCache.keys().next().value;
+    if (oldestKey !== undefined) usageCache.delete(oldestKey);
+  }
+  usageCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, usage });
+  return usage;
+}
 
 export type RunUsageStatus = "queued" | "running" | "finished" | "error" | "cancelled";
 
@@ -339,9 +388,11 @@ export function computeUsage(options: ComputeUsageOptions = {}): UsageReport {
   const cutoff = Date.now() - daysWindow * 24 * 60 * 60 * 1000;
   const runs: RunUsage[] = [];
   for (const info of listRunLogs(runsDir)) {
-    const events = readRunEvents(info.runId, runsDir);
-    if (events.length === 0) continue;
-    const run = aggregateRunUsage(info.runId, events);
+    // Fast path: a log untouched since before the window cannot hold an
+    // event inside it, so skip the read entirely.
+    if (info.mtimeMs < cutoff) continue;
+    const run = getCachedRunUsage(info.file, info.runId, runsDir);
+    if (!run) continue;
     if (options.userId && run.userId !== options.userId) continue;
     if ((run.finishedAt ?? run.createdAt) < cutoff) continue;
     runs.push(run);

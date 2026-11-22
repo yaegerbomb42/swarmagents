@@ -40,6 +40,7 @@ import type {
 } from "./types";
 import { isMetaTool } from "../self-manage/session";
 import { createStreamJsonParser } from "./stream-json";
+import { GateQueue } from "./gate-queue";
 import { makeRedactor, redactValue } from "./redact";
 import { classifyToolCall } from "./risk";
 import { isIrreversibleExternal } from "./tool-approval";
@@ -56,7 +57,7 @@ import {
   type BrainVerdict,
   type DecisionBrainHooksOptions,
 } from "./decision-brain/index";
-import { isRoleListTool, isRoleSwitchTool, ROLE_MCP_CONFIG_PATH } from "./role-mcp";
+import { isRoleListTool, isRoleSwitchTool } from "./role-mcp";
 import { isAskUserTool, parseAskUserArguments } from "./ask-mcp";
 import { isDesktopHandoffTool, parseDesktopHandoffArguments } from "./desktop-handoff-mcp";
 import { classifyDesktopToolCallAsync, computerActionEvent, isDesktopMcpCall } from "./computer-mcp";
@@ -68,12 +69,6 @@ import {
   toPackedRunRequest,
   type ContextPackerMode,
 } from "./context/contextGovernor";
-import {
-  joinSystemSections,
-  orderSystemSections,
-  packSystemSections,
-  systemSectionsFrom,
-} from "./context/system-packer";
 
 export interface ClaudeCodeRunnerOptions {
   /** Path to the claude binary. Defaults to "claude" (or $CLAUDE_BIN). */
@@ -394,13 +389,22 @@ export class ClaudeCodeRunner {
     };
 
     /**
-     * Gates are chained (each ask waits for the previous decision) and the
-     * final terminal handling awaits the chain, so a run never finalizes while
+     * Gates run through a GateQueue (each ask waits for the previous
+     * decision) and the final terminal handling drains the queue, so a run never finalizes while
      * an approval is still pending. Normal allow-path lines are processed
      * synchronously from the exec callbacks — exactly like the original
      * synchronous parser — while gated lines are handled asynchronously.
      */
-    let gateChain = Promise.resolve();
+    const gates = new GateQueue();
+    // A throwing gate must halt the run, never poison the queue: every
+    // enqueue below reports through here so one failure cannot silently
+    // skip all later gates. System-1 / Decision-Brain hooks already fail
+    // open internally; the approval calls inside them still fail closed.
+    const haltOnGateError = (err: unknown): void => {
+      if (haltedReason === null) {
+        haltedReason = `Gate error: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    };
 
     const handleLine = (raw: unknown): void => {
       if (!isObject(raw)) return;
@@ -491,14 +495,14 @@ export class ClaudeCodeRunner {
                 // resolves into private/loopback/metadata space halts the run
                 // just like a synchronous denial.
                 if (decision.level === "allow" && isDesktopMcpCall(name)) {
-                  gateChain = gateChain.then(async () => {
+                  void gates.enqueue(async () => {
                     if (haltedReason !== null) return;
                     const asyncDecision = await classifyDesktopToolCallAsync(name, input);
                     if (asyncDecision && asyncDecision.level === "deny" && haltedReason === null) {
                       haltedReason = asyncDecision.reason;
                       emit({ type: "tool.blocked", name, reason: asyncDecision.reason });
                     }
-                  });
+                  }, { onError: haltOnGateError });
                 }
                 if (
                   decision.level === "ask" &&
@@ -509,7 +513,7 @@ export class ClaudeCodeRunner {
                   // in-VM asks need no human, but irreversible external work
                   // still goes through the approval path below.
                 } else if (decision.level === "ask" && request.approvalGateway) {
-                  gateChain = gateChain.then(async () => {
+                  void gates.enqueue(async () => {
                     const verdict = await this.gateApproval(request, {
                       toolName: name,
                       action: describeAction(name, input),
@@ -518,7 +522,7 @@ export class ClaudeCodeRunner {
                     if (verdict !== "approved" && haltedReason === null) {
                       haltedReason = verdict === "expired" ? "approval timed out" : "approval denied by user";
                     }
-                  });
+                  }, { onError: haltOnGateError });
                 } else if (decision.level === "deny" && haltedReason === null) {
                   haltedReason = decision.reason;
                   emit({ type: "tool.blocked", name, reason: decision.reason });
@@ -530,7 +534,7 @@ export class ClaudeCodeRunner {
                 // fails open; the extra catch keeps the run path safe even if
                 // constructing or calling a hook throws.
                 if (systemOne && decision.level === "allow" && haltedReason === null) {
-                  gateChain = gateChain.then(async () => {
+                  void gates.enqueue(async () => {
                     if (haltedReason !== null) return;
                     let s1: BeforeToolVerdict | undefined;
                     try {
@@ -553,7 +557,7 @@ export class ClaudeCodeRunner {
                       haltedReason = reason;
                       emit({ type: "tool.blocked", name, reason });
                     }
-                  });
+                  }, { onError: haltOnGateError });
                 }
 
                 // Decision Brain loop control, evaluated for calls the
@@ -563,7 +567,7 @@ export class ClaudeCodeRunner {
                 // `retry` halts with a distinct marker — the runner cannot
                 // rewind the CLI, so a manager-level re-drive keys on it.
                 if (brain && decision.level === "allow" && haltedReason === null) {
-                  gateChain = gateChain.then(async () => {
+                  void gates.enqueue(async () => {
                     if (haltedReason !== null) return;
                     brainTurnCount += 1;
                     const snapshot: AgentSnapshot = {
@@ -606,7 +610,7 @@ export class ClaudeCodeRunner {
                       haltedReason = verdict.reason;
                       emit({ type: "tool.blocked", name, reason: haltedReason });
                     }
-                  });
+                  }, { onError: haltOnGateError });
                 }
               }
 
@@ -618,10 +622,10 @@ export class ClaudeCodeRunner {
               if (isAskUserTool(name) && request.questionGateway && haltedReason === null) {
                 const ask = parseAskUserArguments(input);
                 if (ask) {
-                  gateChain = gateChain.then(async () => {
+                  void gates.enqueue(async () => {
                     if (haltedReason !== null) return;
                     await this.gateQuestion(request, ask, emit, redact);
-                  });
+                  }, { onError: haltOnGateError });
                 }
               }
 
@@ -633,10 +637,10 @@ export class ClaudeCodeRunner {
               if (isDesktopHandoffTool(name) && request.handoffGateway && haltedReason === null) {
                 const handoff = parseDesktopHandoffArguments(input);
                 if (handoff) {
-                  gateChain = gateChain.then(async () => {
+                  void gates.enqueue(async () => {
                     if (haltedReason !== null) return;
                     await this.gateHandoff(request, handoff, emit, redact);
-                  });
+                  }, { onError: haltOnGateError });
                 }
               }
 
@@ -649,7 +653,7 @@ export class ClaudeCodeRunner {
                 pendingSwitch.phase === null &&
                 haltedReason === null
               ) {
-                gateChain = gateChain.then(async () => {
+                void gates.enqueue(async () => {
                   if (pendingSwitch.phase !== null || haltedReason !== null) return;
                   const resolver = request.onRoleSwitch;
                   if (!resolver) return;
@@ -677,7 +681,7 @@ export class ClaudeCodeRunner {
                   });
                   pendingSwitch.phase = phase;
                   abortForSwitch();
-                });
+                }, { onError: haltOnGateError });
               }
             }
           }
@@ -818,7 +822,7 @@ export class ClaudeCodeRunner {
 
     // Wait for any outstanding approval/switch decisions so the run never
     // finalizes while a gate is still pending.
-    await gateChain;
+    await gates.drain();
 
     if (pendingSwitch.phase) {
       return {
@@ -1072,8 +1076,6 @@ export class ClaudeCodeRunner {
     const mode = this.resolvePackerMode(request);
     let effective = request;
     let packer: AppliedContextPacker | undefined;
-    const systemPacker = request.systemPacker;
-    const wantOrder = systemPacker?.cacheFriendlyOrder === true;
 
     if (mode === "l1") {
       // One invocation, one prompt: the request prompt is the ledger goal and
@@ -1087,15 +1089,7 @@ export class ClaudeCodeRunner {
         ledger: new StateLedger(request.prompt),
         skeletonFiles: [],
         workingSet: [],
-        systemExtras: wantOrder
-          ? orderSystemSections(
-              systemSectionsFrom({
-                agentCard: request.agentCard,
-                rolePrompt: request.rolePhase?.appendSystemPrompt,
-                memoryContext: request.memoryContext,
-              }),
-            ).map((s) => s.text)
-          : systemExtrasFrom(request),
+        systemExtras: systemExtrasFrom(request),
       });
       effective = toPackedRunRequest(request, packed);
       packer = { mode, logLine: packed.logLine };
@@ -1114,57 +1108,12 @@ export class ClaudeCodeRunner {
       argv.push("--allowedTools", ...role.allowedTools);
       argv.push("--mcp-config", role.mcpConfigPath);
     }
-    const appended = this.appendedSystemPrompt(effective, role?.appendSystemPrompt, mode, (applied) => {
-      packer = applied;
-    });
+    const appended = [effective.agentCard, role?.appendSystemPrompt, effective.memoryContext]
+      .filter(Boolean)
+      .join("\n\n");
     if (appended) argv.push("--append-system-prompt", appended);
     argv.push("--", effective.prompt);
     return { argv, packer };
-  }
-
-  /**
-   * The appended system prompt for one invocation. Default path: the agent
-   * card, role prompt and memory joined untouched — byte-identical to
-   * before the system packer existed. When the run's token-efficiency
-   * options ask for it (claude-code mode only; L1 packs its own header),
-   * the sections are optionally reordered stable-first for prompt caches
-   * and packed to the token budget, lowest-value sections truncated
-   * first. Any packer failure falls back to the legacy join: a packing
-   * bug must never change what the agent is told.
-   */
-  private appendedSystemPrompt(
-    effective: RunRequest,
-    rolePrompt: string | undefined,
-    mode: ContextPackerMode,
-    onApplied: (applied: AppliedContextPacker) => void,
-  ): string {
-    const legacy = [effective.agentCard, rolePrompt, effective.memoryContext]
-      .filter(Boolean)
-      .join("\n\n");
-    const options = effective.systemPacker;
-    if (mode === "l1" || !options || (options.pack !== true && options.cacheFriendlyOrder !== true)) {
-      return legacy;
-    }
-    try {
-      const sections = systemSectionsFrom({
-        agentCard: effective.agentCard,
-        rolePrompt,
-        memoryContext: effective.memoryContext,
-      });
-      const ordered = options.cacheFriendlyOrder === true ? orderSystemSections(sections) : sections;
-      if (options.pack === true) {
-        const packed = packSystemSections(ordered, options.budgetTokens);
-        onApplied({ mode, logLine: packed.logLine });
-        return packed.text;
-      }
-      onApplied({
-        mode,
-        logLine: `system-packer order=cache-friendly sections=${ordered.map((s) => s.id).join(",")}`,
-      });
-      return joinSystemSections(ordered);
-    } catch {
-      return legacy;
-    }
   }
 }
 

@@ -41,6 +41,7 @@ test("Playwright request guard permits public IPs and explicit VM loopback only"
   const handler = await policyHandler();
   for (const url of [
     "http://localhost:5173/",
+    "http://foo.localhost:5173/",
     "http://LOCALHOST./",
     "http://127.0.0.1:5173/",
     "http://127.8.9.10/",
@@ -59,6 +60,27 @@ test("Playwright request guard permits public IPs and explicit VM loopback only"
     "http://[fc00::1]/",
     "http://metadata.google.internal/",
     "http://printer.local/",
+    // The proxy's own endpoint must never be reachable through the guard.
+    "http://127.0.0.1:18793/",
+    "http://[::1]:18793/",
+    // Non-HTTP(S) schemes are denied outright, never allowed through.
+    "file:///etc/passwd",
+    "ws://169.254.169.254/",
+    "wss://example.com/",
+    "ftp://example.com/",
+    // IPv6 zone IDs, multicast, and translation ranges are private.
+    "http://[fe80::1%eth0]/",
+    "http://[ff02::1]/",
+    "http://[fec0::1]/",
+    "http://[2002::1]/",
+    "http://[2001::1]/",
+    "http://[64:ff9b::169.254.169.254]/",
+    "http://[::169.254.169.254]/",
+    // IPv4 multicast, reserved, benchmarking, and IETF protocol ranges.
+    "http://224.0.0.1/",
+    "http://240.0.0.1/",
+    "http://198.18.0.1/",
+    "http://192.0.0.1/",
   ]) {
     assert.equal(await outcome(handler, url), "deny", url);
   }
@@ -177,4 +199,143 @@ test("Playwright proxy connects to the validated IP, never a rebinding answer", 
   assert.equal(lookupCalls, 1, "the CONNECT path must resolve exactly once");
   assert.equal(clientEnded, "", "a public target must not be rejected");
   assert.deepEqual(connectCalls, [{ port: 443, host: PUBLIC_IP }]);
+});
+
+/** Minimal proxy harness with a caller-controlled DNS lookup. */
+function bootProxy(dnsLookup: (host: string) => Promise<Array<{ address: string; family: number }>>) {
+  const handlers = new Map<string, (...args: never[]) => unknown>();
+  const fakeServer = {
+    on: (event: string, fn: (...args: never[]) => unknown) => {
+      handlers.set(event, fn);
+    },
+    listen: () => {},
+  };
+  const connectCalls: Array<{ port: number; host: string }> = [];
+  const requestCalls: Array<{ options: Record<string, unknown> }> = [];
+  const fakeSocket = () => ({ on: () => {}, pipe: () => {}, write: () => {}, destroy: () => {}, setTimeout: () => {} });
+  const fakeRequest = (_url: unknown, options: Record<string, unknown>) => {
+    requestCalls.push({ options });
+    return { on: () => {}, pipe: () => {} };
+  };
+  const isIP = (host: string): number =>
+    /^\d+\.\d+\.\d+\.\d+$/.test(host) ? 4 : host.includes(":") ? 6 : 0;
+  const requireStub = (specifier: string): unknown => {
+    switch (specifier) {
+      case "node:dns":
+        return { promises: { lookup: dnsLookup } };
+      case "node:net":
+        return {
+          isIP,
+          connect: (port: number, host: string, cb?: () => void) => {
+            connectCalls.push({ port, host });
+            const socket = fakeSocket();
+            if (cb) queueMicrotask(cb);
+            return socket;
+          },
+        };
+      case "node:http":
+        return { createServer: (handler: (...args: never[]) => unknown) => {
+          handlers.set("__request", handler);
+          return fakeServer;
+        }, request: fakeRequest };
+      case "node:https":
+        return { request: fakeRequest };
+      case "node:url":
+        return { URL };
+      default:
+        throw new Error(`unexpected require: ${specifier}`);
+    }
+  };
+  new Function("require", "module", "exports", PLAYWRIGHT_PROXY_SOURCE)(
+    requireStub,
+    { exports: {} },
+    {},
+  );
+  return {
+    connectCalls,
+    requestCalls,
+    requestHandler: handlers.get("__request") as unknown as (
+      req: Record<string, unknown>,
+      res: Record<string, unknown>,
+    ) => Promise<void>,
+    connectHandler: handlers.get("connect") as unknown as (
+      req: Record<string, unknown>,
+      client: Record<string, unknown>,
+      head: Buffer,
+    ) => Promise<void>,
+  };
+}
+
+function trackingResponse() {
+  let status = 0;
+  return {
+    status: () => status,
+    res: {
+      writeHead: (code: number) => { status = code; },
+      end: () => {},
+      headersSent: false,
+    },
+  };
+}
+
+test("Playwright proxy blocks a ::1 DNS answer (rebinding to loopback)", async () => {
+  const { requestHandler } = bootProxy(async () => [{ address: "::1", family: 6 }]);
+  const tracking = trackingResponse();
+  await requestHandler(
+    { url: "http://example.com/", method: "GET", headers: { host: "example.com" }, pipe: () => {} },
+    tracking.res,
+  );
+  assert.equal(tracking.status(), 403);
+});
+
+test("Playwright proxy pinned lookup answers { all: true } with a record array", async () => {
+  const PUBLIC_IP = "93.184.216.34";
+  const { requestHandler, requestCalls } = bootProxy(async () => [{ address: PUBLIC_IP, family: 4 }]);
+  await requestHandler(
+    { url: "http://example.com/", method: "GET", headers: { host: "example.com" }, pipe: () => {} },
+    { writeHead: () => {}, end: () => {}, headersSent: false },
+  );
+  assert.equal(requestCalls.length, 1);
+  const lookup = requestCalls[0]!.options.lookup as (
+    hostname: string,
+    options: { all: boolean; family: number },
+    cb: (err: null, records: Array<{ address: string; family: number }>) => void,
+  ) => void;
+  assert.ok(lookup, "the upstream request must carry a pinned lookup");
+  await new Promise<void>((resolve) => {
+    lookup("example.com", { all: true, family: 4 }, (_err, records) => {
+      assert.deepEqual(records, [{ address: PUBLIC_IP, family: 4 }]);
+      resolve();
+    });
+  });
+});
+
+test("Playwright proxy blocks CONNECT to its own endpoint and rejects smuggled targets", async () => {
+  const { connectHandler, connectCalls } = bootProxy(async () => [{ address: "93.184.216.34", family: 4 }]);
+
+  let clientEnded = "";
+  const client = {
+    write: () => {}, end: (data: string) => { clientEnded = data; },
+    on: () => {}, destroy: () => {}, pipe: () => {}, setTimeout: () => {},
+  };
+  await connectHandler({ url: "127.0.0.1:18793" }, client, Buffer.alloc(0));
+  assert.match(clientEnded, /403/);
+  assert.deepEqual(connectCalls, [], "a self-loop must never connect upstream");
+
+  clientEnded = "";
+  await connectHandler({ url: "example.com@10.0.0.1:443" }, client, Buffer.alloc(0));
+  assert.match(clientEnded, /400/);
+  assert.deepEqual(connectCalls, [], "a smuggled CONNECT target must never connect upstream");
+});
+
+test("Playwright proxy pins loopback CONNECT targets to 127.0.0.1", async () => {
+  const { connectHandler, connectCalls } = bootProxy(async () => [{ address: "93.184.216.34", family: 4 }]);
+  let clientEnded = "";
+  const client = {
+    write: () => {}, end: (data: string) => { clientEnded = data; },
+    on: () => {}, destroy: () => {}, pipe: () => {}, setTimeout: () => {},
+  };
+  await connectHandler({ url: "127.0.0.1:5173" }, client, Buffer.alloc(0));
+  assert.equal(clientEnded, "", "a dev-server loopback target must not be rejected");
+  assert.deepEqual(connectCalls, [{ port: 5173, host: "127.0.0.1" }]);
 });

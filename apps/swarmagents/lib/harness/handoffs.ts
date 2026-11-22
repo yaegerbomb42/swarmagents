@@ -8,27 +8,24 @@
  * instead of losing the paused run.
  *
  * The in-memory map of waiters is the authority for resuming a run; disk is
- * only a mirror used to re-render pending cards.
+ * only a mirror used to re-render pending cards. Timer/waiter/persistence
+ * mechanics live in PendingInteractionStore (see ./pending-store.ts).
  */
 
-import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { recordAudit } from "../audit";
 import { getStoragePaths } from "../board/store";
 import { DESKTOP_HANDOFF_TTL_MS } from "./desktop-handoff-mcp";
-import { atomicWriteFile } from "../atomic-write";
+import {
+  PendingInteractionStore,
+  type BasePendingInteraction,
+} from "./pending-store";
 
 export type HandoffStatus = "pending" | "answered" | "expired" | "cancelled";
 
-export interface PendingHandoff {
-  id: string;
-  runId: string;
-  userId: string;
+export interface PendingHandoff extends BasePendingInteraction {
   reason: string;
   description: string;
-  createdAt: number;
-  expiresAt: number;
   status: HandoffStatus;
 }
 
@@ -66,174 +63,68 @@ function defaultFilePath(): string {
   return path.join(getStoragePaths().STORAGE_DIR, "handoffs.json");
 }
 
-const MAX_PERSISTED = 500;
-
-interface WaitEntry {
-  promise: Promise<HandoffOutcome>;
-  resolve: (outcome: HandoffOutcome) => void;
+function normalizeHandoff(raw: unknown, nowMs: number): PendingHandoff | null {
+  if (!raw || typeof raw !== "object") return null;
+  const h = raw as Partial<PendingHandoff>;
+  if (typeof h.id !== "string" || typeof h.reason !== "string") return null;
+  const status: HandoffStatus =
+    h.status === "answered" || h.status === "expired" || h.status === "cancelled"
+      ? h.status
+      : "pending";
+  const expiresAt = typeof h.expiresAt === "number" ? h.expiresAt : nowMs;
+  return {
+    id: h.id,
+    runId: typeof h.runId === "string" ? h.runId : "",
+    userId: typeof h.userId === "string" ? h.userId : "",
+    reason: h.reason,
+    description: typeof h.description === "string" ? h.description : "",
+    createdAt: typeof h.createdAt === "number" ? h.createdAt : nowMs,
+    expiresAt,
+    status: status === "pending" && expiresAt <= nowMs ? "expired" : status,
+  };
 }
 
-export class HandoffStore {
-  private readonly handoffs = new Map<string, PendingHandoff>();
-  private readonly waiters = new Map<string, WaitEntry>();
-  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+export class HandoffStore extends PendingInteractionStore<PendingHandoff, HandoffOutcome> {
   private readonly ttlMs: number | undefined;
-  private readonly now: () => number;
-  private readonly persist: boolean;
-  private readonly filePath: string;
 
   constructor(options: HandoffStoreOptions = {}) {
+    super({
+      filePath: options.filePath ?? defaultFilePath(),
+      persist: options.persist,
+      now: options.now,
+      auditExpireAction: "handoff.expire",
+      normalize: normalizeHandoff,
+      expiredOutcome: () => ({ status: "expired" }),
+      cancelledOutcome: () => ({ status: "cancelled" }),
+    });
     this.ttlMs = options.ttlMs;
-    this.now = options.now ?? Date.now;
-    this.persist = options.persist !== false;
-    this.filePath = options.filePath ?? defaultFilePath();
-    if (this.persist) this.load();
   }
 
   /** Create a pending handoff and start its TTL timer. */
   create(input: CreateHandoffInput): PendingHandoff {
     const now = this.now();
     const ttlMs = input.ttlMs ?? this.ttlMs ?? defaultTtlMs();
-    const handoff: PendingHandoff = {
-      id: input.id || `h_${randomUUID()}`,
-      runId: input.runId,
-      userId: input.userId,
-      reason: input.reason,
-      description: input.description ?? "",
-      createdAt: now,
-      expiresAt: now + ttlMs,
-      status: "pending",
-    };
-    this.handoffs.set(handoff.id, handoff);
-
-    let resolve!: (outcome: HandoffOutcome) => void;
-    const promise = new Promise<HandoffOutcome>((res) => {
-      resolve = res;
-    });
-    this.waiters.set(handoff.id, { promise, resolve });
-
-    const timer = setTimeout(() => {
-      this.timers.delete(handoff.id);
-      const current = this.handoffs.get(handoff.id);
-      if (current && current.status === "pending") {
-        current.status = "expired";
-        current.expiresAt = current.expiresAt;
-        this.waiters.get(handoff.id)?.resolve({ status: "expired" });
-        recordAudit({ user: current.userId, action: "handoff.expire", target: current.id, result: "success" });
-        this.save();
-      }
-    }, ttlMs);
-    timer.unref?.();
-    this.timers.set(handoff.id, timer);
-
-    this.save();
-    return handoff;
-  }
-
-  get(id: string): PendingHandoff | undefined {
-    return this.handoffs.get(id);
-  }
-
-  /** Promise that settles when the handoff is resolved, cancelled or expires. */
-  waitFor(id: string): Promise<HandoffOutcome> {
-    return this.waiters.get(id)?.promise ?? Promise.resolve({ status: "cancelled" });
+    return this.createPending(
+      {
+        id: input.id || `h_${randomUUID()}`,
+        runId: input.runId,
+        userId: input.userId,
+        reason: input.reason,
+        description: input.description ?? "",
+        createdAt: now,
+        expiresAt: now + ttlMs,
+        status: "pending",
+      },
+      ttlMs,
+    );
   }
 
   /** Resolve a pending handoff (user clicked "Hand Back to Agent"). Idempotent. */
   resolve(id: string): PendingHandoff | undefined {
-    const handoff = this.handoffs.get(id);
-    if (!handoff || handoff.status !== "pending") return handoff;
-    handoff.status = "answered";
-    this.clearTimer(id);
-    this.waiters.get(id)?.resolve({ status: "answered" });
-    this.save();
-    return handoff;
-  }
-
-  /** Cancel every pending handoff for a run (run cancelled / finished). */
-  cancelPendingForRun(runId: string): void {
-    for (const handoff of this.handoffs.values()) {
-      if (handoff.runId === runId && handoff.status === "pending") {
-        handoff.status = "cancelled";
-        this.clearTimer(handoff.id);
-        this.waiters.get(handoff.id)?.resolve({ status: "cancelled" });
-      }
-    }
-    this.save();
-  }
-
-  /** Pending handoffs, newest first, optionally scoped to one user/run. */
-  listPending(filter: { userId?: string; runId?: string } = {}): PendingHandoff[] {
-    const out: PendingHandoff[] = [];
-    for (const handoff of this.handoffs.values()) {
-      if (handoff.status !== "pending") continue;
-      if (filter.userId && handoff.userId !== filter.userId) continue;
-      if (filter.runId && handoff.runId !== filter.runId) continue;
-      out.push(handoff);
-    }
-    return out.sort((a, b) => b.createdAt - a.createdAt);
-  }
-
-  /** Test/reset hook: drop all in-memory state (does not delete the file). */
-  clear(): void {
-    for (const id of this.timers.keys()) this.clearTimer(id);
-    this.handoffs.clear();
-    this.waiters.clear();
-  }
-
-  private clearTimer(id: string): void {
-    const timer = this.timers.get(id);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-      this.timers.delete(id);
-    }
-  }
-
-  private load(): void {
-    let parsed: unknown;
-    try {
-      if (!fs.existsSync(this.filePath)) return;
-      parsed = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
-    } catch (err) {
-      // A corrupt file must never crash the runtime; pending handoffs are
-      // best-effort and the in-memory store still works.
-      console.error("[handoffs] could not read persisted handoffs:", err instanceof Error ? err.message : err);
-      return;
-    }
-    const list = Array.isArray(parsed) ? parsed : [];
-    const now = this.now();
-    for (const raw of list) {
-      if (!raw || typeof raw !== "object") continue;
-      const h = raw as Partial<PendingHandoff>;
-      if (typeof h.id !== "string" || typeof h.reason !== "string") continue;
-      const status: HandoffStatus =
-        h.status === "answered" || h.status === "expired" || h.status === "cancelled" ? h.status : "pending";
-      const expiresAt = typeof h.expiresAt === "number" ? h.expiresAt : now;
-      const effective: HandoffStatus = status === "pending" && expiresAt <= now ? "expired" : status;
-      this.handoffs.set(h.id, {
-        id: h.id,
-        runId: typeof h.runId === "string" ? h.runId : "",
-        userId: typeof h.userId === "string" ? h.userId : "",
-        reason: h.reason,
-        description: typeof h.description === "string" ? h.description : "",
-        createdAt: typeof h.createdAt === "number" ? h.createdAt : now,
-        expiresAt,
-        status: effective,
-      });
-    }
-  }
-
-  private save(): void {
-    if (!this.persist) return;
-    try {
-      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-      const all = [...this.handoffs.values()]
-        .sort((a, b) => b.createdAt - a.createdAt)
-        .slice(0, MAX_PERSISTED);
-      atomicWriteFile(this.filePath, JSON.stringify(all));
-    } catch (err) {
-      console.error("[handoffs] could not persist handoffs:", err instanceof Error ? err.message : err);
-    }
+    return this.settle(id, (item) => {
+      item.status = "answered";
+      return { status: "answered" };
+    });
   }
 }
 

@@ -125,3 +125,14 @@ test("the store survives a restart", () => {
   if (!verified.ok) return;
   assert.equal(verified.device.name, "my-laptop");
 });
+
+test("createPairingCode stores preferredName and redeem falls back to it", () => {
+  const { store } = tempStore();
+  const { code, name } = store.createPairingCode("alice", { name: "studio" });
+  assert.equal(name, "studio");
+  const paired = store.redeemPairingCode(code, "");
+  assert.equal(paired.ok, true);
+  if (!paired.ok) return;
+  assert.equal(paired.device.name, "studio");
+});
+

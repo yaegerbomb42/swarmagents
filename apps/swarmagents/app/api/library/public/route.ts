@@ -10,6 +10,7 @@
  */
 
 import { NextResponse } from "next/server";
+import { recordAudit } from "../../../../lib/audit";
 import { isLibraryAdmin } from "../../../../lib/library/admin";
 import { errorResponse, libraryOwner, NO_STORE, readJson, unauthorized } from "../../../../lib/library/http";
 import {
@@ -93,6 +94,7 @@ export async function POST(request: Request) {
       );
     }
     const record = publishItem(owner, input);
+    recordAudit({ user: owner, action: "library.publish", target: record.id, result: "success" });
     // F4: an optional `proofRunId` attaches a signed proof-of-run bundle to
     // version 1. A proof failure never fails the publish — it is reported
     // as `proofError` so the publisher can retry with a finished run.

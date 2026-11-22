@@ -8,6 +8,7 @@
  */
 
 import { NextResponse } from "next/server";
+import { recordAudit } from "../../../../../../lib/audit";
 import { isLibraryAdmin } from "../../../../../../lib/library/admin";
 import { errorResponse, libraryOwner, NO_STORE, readJson, routeParam, unauthorized } from "../../../../../../lib/library/http";
 import { findPublicItem, publicItemDetail, publishVersion, attachProofToCurrentVersion, cleanText } from "../../../../../../lib/library/public-store";
@@ -51,6 +52,7 @@ export async function POST(request: Request, context: RouteContext) {
       );
     }
     const updated = publishVersion(id, owner, input);
+    recordAudit({ user: owner, action: "library.publish", target: id, result: "success" });
     // F4: an optional `proofRunId` attaches a signed proof-of-run bundle to
     // the new version (see the publish route for the failure contract).
     let item = publicItemDetail(updated, owner, isLibraryAdmin(owner));

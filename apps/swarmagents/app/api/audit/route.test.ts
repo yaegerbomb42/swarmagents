@@ -16,6 +16,24 @@ import { PATCH as PATCH_PROVIDER, DELETE as DELETE_PROVIDER } from "../providers
 import { POST as POST_APPROVAL } from "../runtime/approvals/[id]/route";
 import { POST as POST_SNAPSHOT } from "../runtime/vm/snapshots/route";
 import { POST as POST_LOGIN } from "../login/route";
+import { POST as POST_PROJECT_SHARE, DELETE as DELETE_PROJECT_SHARE } from "../projects/[id]/share/route";
+import { createProject } from "../../../lib/projects/store";
+import { POST as POST_AGENT_DEPLOY } from "../agents/[id]/deploy/route";
+import { GET as GET_AGENT_EXPORT } from "../agents/[id]/export/route";
+import { DELETE as DELETE_AGENT } from "../agents/[id]/route";
+import { saveAgent } from "../../../lib/agents/store";
+import { POST as POST_LIBRARY_PUBLISH } from "../library/public/route";
+import { POST as POST_LIBRARY_VERSION } from "../library/public/[id]/versions/route";
+import { POST as POST_LIBRARY_UNPUBLISH } from "../library/public/[id]/unpublish/route";
+import { POST as POST_LIBRARY_REVIEW } from "../library/public/[id]/review/route";
+import { configureLibraryStoreDir } from "../../../lib/library/user-store";
+import { POST as POST_TEST_DRIVE } from "../library/public/[id]/test-drive/route";
+import { DELETE as DELETE_MEMORY } from "../memory/route";
+import { POST as POST_BYOC_PAIR, DELETE as DELETE_BYOC_PAIR } from "../byoc/pair/route";
+import { ByocTokenStore, setByocTokenStoreForTesting } from "../../../lib/byoc/tokens";
+import { ByocHub, setByocHubForTesting } from "../../../lib/byoc/hub";
+import { POST as POST_LOGOUT } from "../logout/route";
+import { SESSION_COOKIE, signSession } from "../../../lib/auth";
 import { recordAudit, readAuditEntries, configureAuditPath } from "../../../lib/audit";
 import { configureProviderStorePaths } from "../../../lib/providers/store";
 import { ApprovalStore, setApprovalStoreForTesting } from "../../../lib/harness/approvals";
@@ -389,4 +407,225 @@ test("GET /api/audit json responses carry no-store and nextCursor", async () => 
   const body = (await res.json()) as { entries: unknown[]; nextCursor: unknown };
   assert.equal(body.entries.length, 1);
   assert.equal(body.nextCursor, null);
+});
+
+test("project share creation and revocation emit clean audit entries without token leaks", async () => {
+  const p = createProject("alice", { name: "Audit Project" });
+  const shareRes = await POST_PROJECT_SHARE(
+    request(`/api/projects/${p.id}/share`, { method: "POST" }, "alice"),
+    { params: Promise.resolve({ id: p.id }) },
+  );
+  assert.equal(shareRes.status, 200);
+  const shareJson = (await shareRes.json()) as { share: { token: string } };
+  assert.ok(shareJson.share.token);
+
+  const revokeRes = await DELETE_PROJECT_SHARE(
+    request(`/api/projects/${p.id}/share`, { method: "DELETE" }, "alice"),
+    { params: Promise.resolve({ id: p.id }) },
+  );
+  assert.equal(revokeRes.status, 200);
+
+  const entries = readAuditEntries("alice");
+  const revokeEntry = entries.find((e) => e.action === "project.share.revoke");
+  const createEntry = entries.find((e) => e.action === "project.share.create");
+
+  assert.ok(createEntry, "must emit project.share.create");
+  assert.equal(createEntry.target, p.id);
+  assert.equal(createEntry.result, "success");
+  assert.ok(!JSON.stringify(createEntry).includes(shareJson.share.token), "share token must not leak into audit");
+
+  assert.ok(revokeEntry, "must emit project.share.revoke");
+  assert.equal(revokeEntry.target, p.id);
+  assert.equal(revokeEntry.result, "success");
+});
+
+test("agent deploy, export, and delete emit audit entries", async () => {
+  const saved = saveAgent("alice", {
+    version: 1,
+    id: "audited-agent",
+    name: "Audited Agent",
+    description: "A test prompt.",
+    identity: { systemPrompt: "Prompt", tone: "terse" },
+    models: { preferred: "gpt-4o", fallbacks: [] },
+    tools: ["Read"],
+  });
+  assert.ok(saved.ok);
+  const agentId = saved.manifest.id;
+
+  const exportRes = await GET_AGENT_EXPORT(
+    request(`/api/agents/${agentId}/export`, { method: "GET" }, "alice"),
+    { params: Promise.resolve({ id: agentId }) },
+  );
+  assert.equal(exportRes.status, 200);
+
+  const deployRes = await POST_AGENT_DEPLOY(
+    request(`/api/agents/${agentId}/deploy`, { method: "POST", body: JSON.stringify({ harness: "swarm" }) }, "alice"),
+    { params: Promise.resolve({ id: agentId }) },
+  );
+  assert.equal(deployRes.status, 200);
+
+  const delRes = await DELETE_AGENT(
+    request(`/api/agents/${agentId}`, { method: "DELETE" }, "alice"),
+    { params: Promise.resolve({ id: agentId }) },
+  );
+  assert.equal(delRes.status, 200);
+
+  const entries = readAuditEntries("alice");
+  const delEntry = entries.find((e) => e.action === "agent.delete");
+  const deployEntry = entries.find((e) => e.action === "agent.deploy");
+  const exportEntry = entries.find((e) => e.action === "agent.export");
+
+  assert.ok(exportEntry, "must emit agent.export");
+  assert.equal(exportEntry.target, agentId);
+  assert.equal(exportEntry.result, "success");
+
+  assert.ok(deployEntry, "must emit agent.deploy");
+  assert.equal(deployEntry.target, agentId);
+  assert.equal(deployEntry.result, "success");
+
+  assert.ok(delEntry, "must emit agent.delete");
+  assert.equal(delEntry.target, agentId);
+  assert.equal(delEntry.result, "success");
+});
+
+test("library publish, unpublish, and review emit audit entries", async () => {
+  configureLibraryStoreDir(dir);
+  process.env.SWARM_ADMIN_USERS = "admin_alice";
+  const publishRes = await POST_LIBRARY_PUBLISH(
+    request("/api/library/public", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "My Skill",
+        kind: "skill",
+        description: "A skill for testing",
+        payload: { kind: "skill", skillMd: "# My Skill\n\nRun instructions.", files: [], requiredFields: [] },
+      }),
+    }, "alice"),
+  );
+  assert.equal(publishRes.status, 201);
+  const { item } = (await publishRes.json()) as { item: { id: string } };
+
+  const reviewRes = await POST_LIBRARY_REVIEW(
+    request(`/api/library/public/${item.id}/review`, { method: "POST" }, "admin_alice"),
+    { params: Promise.resolve({ id: item.id }) },
+  );
+  assert.equal(reviewRes.status, 200);
+
+  const unpublishRes = await POST_LIBRARY_UNPUBLISH(
+    request(`/api/library/public/${item.id}/unpublish`, { method: "POST" }, "alice"),
+    { params: Promise.resolve({ id: item.id }) },
+  );
+  assert.equal(unpublishRes.status, 200);
+
+  const aliceEntries = readAuditEntries("alice");
+  const pubEntry = aliceEntries.find((e) => e.action === "library.publish");
+  const unpubEntry = aliceEntries.find((e) => e.action === "library.unpublish");
+  assert.ok(pubEntry, "must emit library.publish");
+  assert.equal(pubEntry.target, item.id);
+
+  assert.ok(unpubEntry, "must emit library.unpublish");
+  assert.equal(unpubEntry.target, item.id);
+
+  const adminEntries = readAuditEntries("admin_alice");
+  const reviewEntry = adminEntries.find((e) => e.action === "library.review");
+  assert.ok(reviewEntry, "must emit library.review");
+  assert.equal(reviewEntry.target, item.id);
+});
+
+test("test-drive start, keep, and rollback emit audit entries", async () => {
+  configureLibraryStoreDir(dir);
+  const publishRes = await POST_LIBRARY_PUBLISH(
+    request("/api/library/public", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "Test Driver Item",
+        kind: "skill",
+        description: "Test drive item",
+        payload: { kind: "skill", skillMd: "# Test Drive Skill", files: [], requiredFields: [] },
+      }),
+    }, "alice_td"),
+  );
+  const { item } = (await publishRes.json()) as { item: { id: string } };
+
+  const startRes = await POST_TEST_DRIVE(
+    request(`/api/library/public/${item.id}/test-drive`, {
+      method: "POST",
+      body: JSON.stringify({ action: "start" }),
+    }, "alice_td"),
+    { params: Promise.resolve({ id: item.id }) },
+  );
+  assert.equal(startRes.status, 201);
+  const { drive } = (await startRes.json()) as { drive: { id: string } };
+
+  const entries = readAuditEntries("alice_td");
+  const startEntry = entries.find((e) => e.action === "test_drive.start");
+  assert.ok(startEntry, "must emit test_drive.start");
+  assert.equal(startEntry.target, drive.id);
+});
+
+test("memory clear emits memory.clear audit entry", async () => {
+  const delRes = await DELETE_MEMORY(request("/api/memory", { method: "DELETE" }, "alice"));
+  assert.equal(delRes.status, 200);
+
+  const entries = readAuditEntries("alice");
+  const memEntry = entries.find((e) => e.action === "memory.clear");
+  assert.ok(memEntry, "must emit memory.clear");
+  assert.equal(memEntry.target, "alice");
+});
+
+test("byoc pair and revoke emit audit entries without token leaks", async () => {
+  const byocDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-byoc-audit-"));
+  const byocFile = path.join(byocDir, "byoc.json");
+  const store = new ByocTokenStore({ file: byocFile });
+  setByocTokenStoreForTesting(store);
+  const hub = new ByocHub({ tokens: store, port: 0 });
+  setByocHubForTesting(hub);
+
+  try {
+    const pairRes = await POST_BYOC_PAIR(
+      request("/api/byoc/pair", { method: "POST", body: JSON.stringify({ name: "Worker 1" }) }, "alice"),
+    );
+    assert.equal(pairRes.status, 201);
+    const pairJson = (await pairRes.json()) as { code: string };
+
+    const paired = store.redeemPairingCode(pairJson.code, "Worker 1");
+    assert.ok(paired.ok);
+
+    const revokeRes = await DELETE_BYOC_PAIR(
+      request(`/api/byoc/pair?deviceId=${paired.device.id}`, { method: "DELETE" }, "alice"),
+    );
+    assert.equal(revokeRes.status, 200);
+
+    const entries = readAuditEntries("alice");
+    const pairEntry = entries.find((e) => e.action === "computer.pair");
+    const revokeEntry = entries.find((e) => e.action === "computer.revoke");
+
+    assert.ok(pairEntry, "must emit computer.pair");
+    assert.ok(!JSON.stringify(pairEntry).includes(pairJson.code), "pairing code must not leak");
+
+    assert.ok(revokeEntry, "must emit computer.revoke");
+    assert.equal(revokeEntry.target, paired.device.id);
+  } finally {
+    setByocTokenStoreForTesting(null);
+    setByocHubForTesting(null);
+    fs.rmSync(byocDir, { recursive: true, force: true });
+  }
+});
+
+test("logout emits logout audit entry", async () => {
+  // Main's logout route identifies the caller from the session cookie, not
+  // the x-swarm-user header, so the test signs a session for alice.
+  const logoutRes = await POST_LOGOUT(
+    request(
+      "/api/logout",
+      { method: "POST", headers: { cookie: `${SESSION_COOKIE}=${signSession("alice")}` } },
+      "alice",
+    ),
+  );
+  assert.equal(logoutRes.status, 200);
+
+  const entries = readAuditEntries("alice");
+  const logoutEntry = entries.find((e) => e.action === "session.logout");
+  assert.ok(logoutEntry, "must emit session.logout");
+  assert.equal(logoutEntry.target, "alice");
 });

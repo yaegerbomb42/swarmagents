@@ -11,6 +11,7 @@
 
 import { type NextRequest } from "next/server";
 import { routeCaller, unauthorizedResponse } from "../../../../../lib/auth";
+import { recordAudit } from "../../../../../lib/audit";
 import { noStoreJson, noStoreRouteError } from "../../../../../lib/http";
 import {
   createShareLink,
@@ -34,8 +35,10 @@ export async function POST(req: NextRequest, context: { params: Promise<{ id: st
   if (!getProject(user, id)) return notFound();
   try {
     const share = createShareLink(user, id);
+    recordAudit({ user, action: "project.share.create", target: id, result: "success" });
     return noStoreJson({ share: { token: share.token, createdAt: share.createdAt } });
   } catch (err) {
+    recordAudit({ user, action: "project.share.create", target: id, result: "failure" });
     return noStoreRouteError(err, "Could not create the share link.");
   }
 }
@@ -47,5 +50,6 @@ export async function DELETE(req: NextRequest, context: { params: Promise<{ id: 
   if (!isProjectId(id)) return notFound();
   if (!getProject(user, id)) return notFound();
   revokeShareLink(user, id);
+  recordAudit({ user, action: "project.share.revoke", target: id, result: "success" });
   return noStoreJson({ ok: true });
 }

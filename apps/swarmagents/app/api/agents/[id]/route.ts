@@ -5,6 +5,7 @@
  */
 
 import type { NextRequest } from "next/server";
+import { recordAudit } from "@/lib/audit";
 import { deleteAgent, getAgent, updateAgentAtomic } from "@/lib/agents/store";
 import { agentCaller, badRequest, notFound, ok, readAgentBody, routeId, unauthorized } from "@/lib/agents/http";
 
@@ -52,5 +53,6 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
   if (!user) return unauthorized();
   const id = (await routeId(ctx)).trim();
   if (!deleteAgent(user, id)) return notFound();
+  recordAudit({ user, action: "agent.delete", target: id, result: "success" });
   return ok({ ok: true, id });
 }

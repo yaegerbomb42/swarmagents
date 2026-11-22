@@ -88,7 +88,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif action == "heartbeat":
             self._send({"ok": True, "computer": {"id": "cmp_test"}})
         elif action == "complete":
-            self._send({"ok": True})
+            if BEHAVIOR.get("failCompleteCount", 0) > 0:
+                BEHAVIOR["failCompleteCount"] -= 1
+                self._send({"error": "temporary network error"}, 500)
+            else:
+                self._send({"ok": True})
         else:
             self._send({"error": "unknown action"}, 400)
 
@@ -265,6 +269,36 @@ test("SIGTERM terminates the claude child instead of orphaning it", { skip: !HAS
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.ok(claudeGone, "the claude child must be terminated with the worker");
+  } finally {
+    server.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("complete() retries on transient 500 error and eventually succeeds", { skip: !HAS_PYTHON }, async () => {
+  const dir = tmp();
+  // Fail the first complete() attempt with 500, succeeding on the second
+  const server = startFakeServer(dir, { claimOnce: true, failCompleteCount: 1 });
+  try {
+    await waitForServer(server.port);
+    const claude =
+      "#!/bin/sh\n" +
+      "python3 - <<'FAKE'\n" +
+      "import json\n" +
+      'print(json.dumps({"type":"system","subtype":"init","session_id":"sess_fake","model":"claude-sonnet-5-5"}), flush=True)\n' +
+      'print(json.dumps({"type":"result","subtype":"success","session_id":"sess_fake","total_cost_usd":0.01,"duration_ms":100,"num_turns":1}), flush=True)\n' +
+      "FAKE\n";
+    writeFakeClaude(dir, claude);
+    const { worker } = await spawnWorkerUntil(
+      dir,
+      server.port,
+      (requests) => requests.filter((r) => r.action === "complete").length >= 2,
+      15_000,
+    );
+    worker.kill("SIGKILL");
+    const requests = readRequests(dir);
+    const completeRequests = requests.filter((r) => r.action === "complete");
+    assert.ok(completeRequests.length >= 2, `expected at least 2 complete attempts, got ${completeRequests.length}`);
   } finally {
     server.stop();
     fs.rmSync(dir, { recursive: true, force: true });

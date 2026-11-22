@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -147,8 +147,9 @@ test("analyzeFile surfaces an unreadable file as a diagnostic", () => {
   assert.equal(analysis.assertionCount, 0);
 });
 
-test("file helpers aggregate across files on disk", () => {
+test("file helpers aggregate across files on disk", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ast-analysis-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
   const a = join(dir, "a.test.ts");
   const b = join(dir, "b.ts");
   writeFileSync(a, "import { x } from './b';\nimport { y } from '../shared';\nexpect(x).toBe(1);\n");

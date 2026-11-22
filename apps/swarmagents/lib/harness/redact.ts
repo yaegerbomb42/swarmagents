@@ -30,11 +30,28 @@ export const SECRET_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = 
   { pattern: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: "[REDACTED]" },
   // Google/Gemini API keys: AIza + 35 base64url chars.
   { pattern: /AIza[0-9A-Za-z_-]{35}/g, replacement: "[REDACTED]" },
-  // PEM private key headers (the body stays, but the header alone marks the
-  // material as a private key; mask it so logs never carry the shape).
+  // PEM private key blocks: mask the entire block, header and base64 body,
+  // not just the header line (the body alone is the secret material).
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[REDACTED]" },
+  // Truncated / unterminated PEM bodies: a header with no END marker still
+  // carries raw base64 key material; mask the header with the body run after
+  // it (bounded so a stray header cannot swallow an arbitrary amount of log).
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[A-Za-z0-9+/=\s]{1,4096}/g, replacement: "[REDACTED]" },
+  // Bare PEM headers (no body follows) still mark the material as a key.
   { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/g, replacement: "[REDACTED]" },
   // Authorization headers: keep the scheme, mask the credential.
   { pattern: /Bearer [A-Za-z0-9._~+\-/=]{10,}/gi, replacement: "Bearer [REDACTED]" },
+  { pattern: /Basic [A-Za-z0-9+/]{10,}={0,2}/gi, replacement: "Basic [REDACTED]" },
+  // JWTs: three dot-separated base64url segments, the payload starts eyJ.
+  { pattern: /eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g, replacement: "[REDACTED]" },
+  // Groq: gsk_...
+  { pattern: /gsk_[A-Za-z0-9]{20,}/g, replacement: "[REDACTED]" },
+  // Hugging Face: hf_...
+  { pattern: /hf_[A-Za-z0-9]{20,}/g, replacement: "[REDACTED]" },
+  // Perplexity: pplx-...
+  { pattern: /pplx-[A-Za-z0-9]{20,}/g, replacement: "[REDACTED]" },
+  // URL-embedded credentials: keep the scheme, mask user:password@.
+  { pattern: /(https?:\/\/)[^/\s:@]+:[^/\s@]+@/g, replacement: "$1[REDACTED]@" },
 ];
 
 export function makeRedactor(
@@ -52,14 +69,18 @@ export function makeRedactor(
   }
   if (extraSecrets) {
     for (const secret of extraSecrets) {
-      if (typeof secret === "string" && secret.length > 0) secrets.add(secret);
+      // Short strings would fragment surrounding text with little security
+      // value (or false positives), so require a minimum length.
+      if (typeof secret === "string" && secret.length >= 6) secrets.add(secret);
     }
   }
+  // Longest first: a short secret that is a substring of a longer one must
+  // not be redacted first and leave the longer one's residue behind. Hoisted
+  // out of the returned closure so each telemetry event does not re-allocate
+  // and re-sort the secret list.
+  const ordered = [...secrets].sort((a, b) => b.length - a.length);
   return (text) => {
     let out = text;
-    // Longest first: a short secret that is a substring of a longer one must
-    // not be redacted first and leave the longer one's residue behind.
-    const ordered = [...secrets].sort((a, b) => b.length - a.length);
     for (const secret of ordered) {
       if (out.includes(secret)) out = out.split(secret).join("[REDACTED]");
     }
@@ -90,13 +111,25 @@ export function secretPatternSources(): Array<{ source: string; flags: string; r
 }
 
 /** Deep-copy a value, redacting every string inside it (e.g. tool inputs). */
+const MAX_REDACT_DEPTH = 10;
+
 export function redactValue(value: unknown, redact: (text: string) => string): unknown {
-  if (typeof value === "string") return redact(value);
-  if (Array.isArray(value)) return value.map((item) => redactValue(item, redact));
-  if (value !== null && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) out[k] = redactValue(v, redact);
-    return out;
-  }
-  return value;
+  const ancestors = new Set<object>();
+  const walk = (item: unknown, depth: number): unknown => {
+    if (typeof item === "string") return redact(item);
+    if (item === null || typeof item !== "object") return item;
+    if (depth >= MAX_REDACT_DEPTH) return "[MAX_DEPTH]";
+    if (ancestors.has(item)) return "[CYCLE]";
+    ancestors.add(item);
+    const result = Array.isArray(item)
+      ? item.map((entry) => walk(entry, depth + 1))
+      : (() => {
+          const out: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(item)) out[k] = walk(v, depth + 1);
+          return out;
+        })();
+    ancestors.delete(item);
+    return result;
+  };
+  return walk(value, 0);
 }

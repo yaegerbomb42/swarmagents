@@ -922,7 +922,7 @@ export class ClaudeCodeRunner {
         id: ticket.id,
         tool: approval.toolName,
         action: redact(approval.action),
-        reason: approval.reason,
+        reason: redact(approval.reason),
         riskLevel: "ask",
         expiresAt: ticket.expiresAt,
       },
@@ -955,7 +955,7 @@ export class ClaudeCodeRunner {
         id: ticket.id,
         tool: approval.toolName,
         action: redact(approval.action),
-        reason: approval.reason,
+        reason: redact(approval.reason),
         expiresAt: ticket.expiresAt,
       });
     }
@@ -982,8 +982,8 @@ export class ClaudeCodeRunner {
       type: "question.required",
       question: {
         id: ticket.id,
-        question: ticket.question,
-        ...(ticket.options.length > 0 ? { options: ticket.options } : {}),
+        question: redact(ticket.question),
+        ...(ticket.options.length > 0 ? { options: ticket.options.map((option) => redact(option)) } : {}),
         allowFreeText: ticket.allowFreeText,
         ...(ticket.expiresAt !== undefined ? { expiresAt: ticket.expiresAt } : {}),
       },
@@ -1014,7 +1014,7 @@ export class ClaudeCodeRunner {
     request: RunRequest,
     handoff: HandoffRequest,
     emit: (event: TelemetryEvent) => void,
-    _redact: (text: string) => string,
+    redact: (text: string) => string,
   ): Promise<void> {
     const gateway = request.handoffGateway!;
     let ticket: HandoffTicket;
@@ -1029,8 +1029,8 @@ export class ClaudeCodeRunner {
       type: "handoff.required",
       handoff: {
         id: ticket.id,
-        reason: ticket.reason,
-        ...(ticket.description.length > 0 ? { description: ticket.description } : {}),
+        reason: redact(ticket.reason),
+        ...(ticket.description.length > 0 ? { description: redact(ticket.description) } : {}),
         ...(ticket.expiresAt !== undefined ? { expiresAt: ticket.expiresAt } : {}),
       },
     });

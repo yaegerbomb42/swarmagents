@@ -173,3 +173,123 @@ test("isTestFilePath matches test and spec files", () => {
   assert.equal(isTestFilePath("a.ts"), false);
   assert.equal(isTestFilePath("latest.ts"), false);
 });
+
+test("extractExpectations distinguishes negated expectations from positive ones", () => {
+  const source = `
+    it('sign', () => {
+      expect(value).toBe(0);
+      expect(value).not.toBe(0);
+      expect(promise).resolves.not.toBe(null);
+    });
+  `;
+  const found = extractExpectations(source, "sign.test.ts");
+  assert.equal(found.length, 3);
+  assert.equal(found[0]?.negated, false);
+  assert.equal(found[1]?.negated, true);
+  assert.equal(found[2]?.negated, true);
+  assert.equal(found[2]?.modifier, "resolves");
+  assert.notDeepEqual(
+    { expected: found[0]?.expected, negated: found[0]?.negated },
+    { expected: found[1]?.expected, negated: found[1]?.negated },
+  );
+});
+
+test("extractExpectations accepts it.only scopes and template-literal titles", () => {
+  const source = "it.only(`templated title`, () => { expect(1).toBe(1); });";
+  const found = extractExpectations(source, "only.test.ts");
+  assert.equal(found.length, 1);
+  assert.equal(found[0]?.testTitle, "templated title");
+});
+
+test("extractExpectations only accepts fully literal arrays and objects", () => {
+  const source = `
+    it('shapes', () => {
+      expect(a).toEqual({ x: 1, y: [2, 3] });
+      expect(b).toEqual({ x: SOME_CONST });
+      expect(c).toEqual([1, call()]);
+    });
+  `;
+  const found = extractExpectations(source, "shapes.test.ts");
+  assert.equal(found.length, 1);
+  assert.equal(found[0]?.expected, "{ x: 1, y: [2, 3] }");
+});
+
+test("analyzeSourceText counts assert.strict.equal and ignores a bare expect without a matcher", () => {
+  const source = `
+    import assert from 'node:assert/strict';
+    test('x', () => {
+      assert.strict.equal(1, 1);
+      assert.equal(2, 2);
+      expect(3);
+    });
+  `;
+  const analysis = analyzeSourceText(source, "asserts.test.ts");
+  assert.equal(analysis.assertionCount, 2);
+});
+
+test("analyzeSourceText detects node:test option-object skip/only and chained markers", () => {
+  const skipped = analyzeSourceText(
+    `test('x', { skip: true }, () => { expect(1).toBe(1); });`,
+    "skip.test.ts",
+  );
+  assert.equal(skipped.hasSkipOrOnly, true);
+
+  const only = analyzeSourceText(
+    `describe('d', () => { test('x', { only: true }, () => { expect(1).toBe(1); }); });`,
+    "only.test.ts",
+  );
+  assert.equal(only.hasSkipOrOnly, true);
+
+  const each = analyzeSourceText(
+    `test.skip.each([[1], [2]])('x', () => { expect(1).toBe(1); });`,
+    "each.test.ts",
+  );
+  assert.equal(each.hasSkipOrOnly, true);
+
+  const todo = analyzeSourceText(`test.todo('later');`, "todo.test.ts");
+  assert.equal(todo.hasSkipOrOnly, true);
+
+  const plain = analyzeSourceText(`test('x', () => { expect(1).toBe(1); });`, "plain.test.ts");
+  assert.equal(plain.hasSkipOrOnly, false);
+});
+
+test("analyzeSourceText scores constructors, accessors and static blocks as functions", () => {
+  const source = `
+    class Widget {
+      constructor(flag: boolean) { if (flag) { this.flag = flag; } }
+      get value() { if (this.flag) return 1; return 2; }
+      set value(next: number) { if (next) { this.flag = Boolean(next); } }
+      static { if (globalThis) { void 0; } }
+    }
+  `;
+  const analysis = analyzeSourceText(source, "widget.ts");
+  // Each member is its own function (2); without accessor/constructor/static
+  // support their decisions would accumulate in the top-level score.
+  assert.equal(analysis.maxCyclomaticComplexity, 2);
+});
+
+test("analyzeSourceText treats logical assignments as decisions", () => {
+  const source = `
+    export function merge(a: boolean, b: boolean) {
+      let x = a;
+      x &&= b;
+      x ||= a;
+      x ??= true;
+      return x;
+    }
+  `;
+  const analysis = analyzeSourceText(source, "merge.ts");
+  // 1 base + three logical assignments
+  assert.equal(analysis.maxCyclomaticComplexity, 4);
+});
+
+test("analyzeSourceText collects relative re-exports and dynamic imports", () => {
+  const source = `
+    export { a } from './a';
+    export * from '../shared';
+    export const lazy = () => import('./lazy');
+    export { b } from 'some-package';
+  `;
+  const analysis = analyzeSourceText(source, "index.ts");
+  assert.deepEqual(analysis.relativeImports, ["./a", "../shared", "./lazy"]);
+});

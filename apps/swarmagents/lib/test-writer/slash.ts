@@ -8,6 +8,9 @@ export interface TestsSlashCommand {
 
 export type ParsedSlashCommand = TestsSlashCommand | null;
 
+/** Longest target interpolated into a Test Writer prompt; longer targets are truncated so a pasted blob cannot bloat the prompt. */
+export const MAX_TESTS_TARGET_LENGTH = 500;
+
 /** Tokenize on whitespace while respecting single/double quotes. */
 function tokenize(input: string): string[] {
   const tokens: string[] = [];
@@ -96,7 +99,11 @@ export function sanitizeTestsTarget(target: string): string {
 
 export function formatTestsPrompt(target: string, maxIterations = 3): string {
   const safe = sanitizeTestsTarget(target);
-  const label = safe ? `\`${safe}\`` : "the selected target";
+  const shown =
+    safe.length > MAX_TESTS_TARGET_LENGTH
+      ? `${safe.slice(0, MAX_TESTS_TARGET_LENGTH)}…`
+      : safe;
+  const label = shown ? `\`${shown}\`` : "the selected target";
   return [
     `Use the Test Writer workflow for ${label}.`,
     `1. Detect the test framework for this repo/path (vitest, jest, node:test, pytest, or go test) by inspecting configs and dependencies.`,

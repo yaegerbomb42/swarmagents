@@ -155,17 +155,21 @@ threading.Thread(target=heartbeat_loop, daemon=True).start()
 # Buffered event stream: emit() never blocks the stdout drain on an HTTP
 # request. A flusher thread posts batches every ~150ms (or immediately once
 # 10 events are queued) to the batch endpoint.
+# send_lock serializes outgoing event batches and drain_events so the final drain
+# completes and flushes before complete() is called.
 FLUSH_BATCH = 10
 event_queue = []
 event_lock = threading.Lock()
+send_lock = threading.Lock()
 flush_poke = threading.Event()
 
 def emit_now(pending):
-    if len(pending) == 1:
-        single = pending[0]
-        post({"action": "event", "runId": single["runId"], "event": single["event"]})
-    elif pending:
-        post({"action": "events", "events": pending})
+    with send_lock:
+        if len(pending) == 1:
+            single = pending[0]
+            post({"action": "event", "runId": single["runId"], "event": single["event"]})
+        elif pending:
+            post({"action": "events", "events": pending})
 
 def emit_flush_loop():
     while True:
@@ -302,23 +306,48 @@ def complete(run_id, status, code, text="", error="", meta=None):
         for key in ("sessionId", "costUsd", "durationMs", "numTurns"):
             if meta.get(key) is not None:
                 result[key] = meta[key]
-    try:
-        post({"action": "complete", "runId": run_id, "result": result})
-    except Exception:
-        pass
 
-# SIGTERM/SIGINT: terminate the claude child cleanly instead of orphaning it.
+    # Retry complete() with bounded exponential backoff on transient errors (non-4xx)
+    backoff = 0.5
+    for attempt in range(5):
+        try:
+            with send_lock:
+                post({"action": "complete", "runId": run_id, "result": result})
+            return
+        except urllib.error.HTTPError as exc:
+            # 4xx client errors (400, 404, 409 etc) mean the server rejected or the run ended; don't loop
+            if 400 <= exc.code < 500:
+                break
+        except Exception:
+            pass
+        if attempt < 4:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
+
+# SIGTERM/SIGINT: terminate the claude child process group cleanly instead of orphaning it.
 current_proc = [None]
 
 def _worker_signal(signum, frame):
     proc = current_proc[0]
     try:
         if proc is not None and proc.poll() is None:
-            proc.terminate()
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                proc.terminate()
             try:
                 proc.wait(timeout=5)
             except Exception:
-                proc.kill()
+                if hasattr(os, "killpg"):
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    proc.kill()
     finally:
         os._exit(0)
 
@@ -355,6 +384,7 @@ def run_job(job):
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
     except FileNotFoundError:
         complete(run_id, "error", 127, "", "claude is not installed on this computer.", meta)

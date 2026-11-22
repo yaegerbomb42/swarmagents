@@ -29,6 +29,7 @@ import { POST as versionsPOST } from "../../app/api/library/public/[id]/versions
 import { GET as itemsGET, POST as itemsPOST } from "../../app/api/library/items/route";
 import { GET as connectorsGET, POST as connectorsPOST } from "../../app/api/library/connectors/route";
 import { GET as meGET } from "../../app/api/library/me/route";
+import { configureAuditPath, readAuditEntries } from "../audit";
 
 let dir: string;
 let savedEnv: NodeJS.ProcessEnv;
@@ -36,6 +37,7 @@ let savedEnv: NodeJS.ProcessEnv;
 test.beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-public-library-"));
   configureLibraryStoreDir(dir);
+  configureAuditPath(path.join(dir, "audit.jsonl"));
   savedEnv = { ...process.env };
   process.env.SWARM_LIBRARY_PUBLISH_PER_HOUR = "1000";
   delete process.env.SWARM_ADMIN_USERS;
@@ -45,6 +47,7 @@ test.beforeEach(() => {
 
 test.afterEach(() => {
   configureLibraryStoreDir(undefined);
+  configureAuditPath(undefined);
   resetPublishRateLimit();
   for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
   Object.assign(process.env, savedEnv);
@@ -301,6 +304,10 @@ test("reports are counted and only an admin can unpublish another account's item
   });
   assert.equal(allowed.status, 200);
   assert.equal((await json(allowed)).item.moderation, "unpublished");
+  const audit = readAuditEntries("local_admin@swarm.test").find((e) => e.action === "library.unpublish");
+  assert.ok(audit, "unpublish must write a structured audit entry");
+  assert.equal(audit!.target, publicId);
+  assert.equal(audit!.result, "success");
 
   // Gone from browse and from other users' detail views; the owner and an
   // admin can still see what happened.

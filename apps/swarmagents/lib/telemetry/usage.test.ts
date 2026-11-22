@@ -449,3 +449,49 @@ test("computeUsage handles NaN days and limit gracefully", () => {
   }
 });
 
+
+test("providerBudgetStatuses attributes spend to each provider across failovers", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-failover-budget-"));
+  configureRunsDir(dir);
+  try {
+    const bus = new TelemetryBus({ persist: true, runsDir: () => dir });
+    const runId = "run_failover_attribution";
+    bus.publish(runId, { type: "run.created", data: { userId: "alice" } });
+    bus.publish(runId, { type: "run.started", model: "claude-3-opus", provider: "anthropic" } as TelemetryEvent);
+    // Call 1 on anthropic
+    bus.publish(runId, {
+      type: "llm.call",
+      data: { provider: "anthropic", model: "claude-3-opus", outcome: "ok", costUsd: 1.50 },
+    } as TelemetryEvent);
+    // Failover to openai
+    bus.publish(runId, {
+      type: "run.failover",
+      data: { provider: "openai", model: "gpt-4o", message: "rate limited" },
+    } as TelemetryEvent);
+    // Call 2 on openai
+    bus.publish(runId, {
+      type: "llm.call",
+      data: { provider: "openai", model: "gpt-4o", outcome: "ok", costUsd: 2.25 },
+    } as TelemetryEvent);
+    bus.publish(runId, { type: "run.finished", exitCode: 0, sessionId: "s1" } as TelemetryEvent);
+
+    const report = computeUsage({
+      userId: "alice",
+      days: 1,
+      providers: [
+        providerWithBudget("anthropic", 10),
+        providerWithBudget("openai", 10),
+      ],
+    });
+
+    const anthropicBudget = report.budgets.find((b) => b.id === "anthropic")!;
+    const openaiBudget = report.budgets.find((b) => b.id === "openai")!;
+    assert.equal(anthropicBudget.spentTodayUsd, 1.50, "anthropic should be attributed its own call cost ($1.50)");
+    assert.equal(openaiBudget.spentTodayUsd, 2.25, "openai should be attributed its own call cost ($2.25)");
+    assert.equal(anthropicBudget.remainingUsd, 8.50);
+    assert.equal(openaiBudget.remainingUsd, 7.75);
+  } finally {
+    configureRunsDir(null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

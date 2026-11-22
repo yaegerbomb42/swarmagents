@@ -389,16 +389,24 @@ export function aggregateRunCostLatency(
     }
   }
 
+  const providerTtfts = new Map<string, { sum: number; count: number }>();
+  for (const c of report.calls) {
+    if (c.ttftMs !== undefined) {
+      const cur = providerTtfts.get(c.provider) ?? { sum: 0, count: 0 };
+      cur.sum += c.ttftMs;
+      cur.count += 1;
+      providerTtfts.set(c.provider, cur);
+    }
+  }
+
   report.byProvider = [...providers.values()]
     .map((roll) => {
-      const ttfts = report.calls
-        .filter((c) => c.provider === roll.provider && c.ttftMs !== undefined)
-        .map((c) => c.ttftMs as number);
+      const ttftStat = providerTtfts.get(roll.provider);
       return {
         ...roll,
         avgLatencyMs: roll.calls > 0 ? roll.totalLatencyMs / roll.calls : 0,
-        ...(ttfts.length > 0
-          ? { avgTtftMs: ttfts.reduce((sum, ms) => sum + ms, 0) / ttfts.length }
+        ...(ttftStat && ttftStat.count > 0
+          ? { avgTtftMs: ttftStat.sum / ttftStat.count }
           : {}),
       };
     })

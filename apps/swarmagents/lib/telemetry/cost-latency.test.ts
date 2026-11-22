@@ -473,3 +473,29 @@ test("overlapping call timestamps never move the queue boundary backwards", () =
   // 1150 - 1000 = 150, not 1150 - 900 = 250.
   assert.equal(report.calls[2]!.queuedMs, 150);
 });
+
+
+test("single-pass per-provider avgTtftMs computes correctly across multiple providers and calls without ttft", () => {
+  const log = recordedLog();
+  const runId = "run_ttft_test";
+  try {
+    log.bus.publish(runId, { type: "run.created", data: { userId: "alice" } });
+    llmCall(log.bus, runId, { provider: "provider_a", model: "model_1", outcome: "ok", latencyMs: 1000, ttftMs: 200, costUsd: 0.01 });
+    llmCall(log.bus, runId, { provider: "provider_a", model: "model_1", outcome: "ok", latencyMs: 800, ttftMs: 400, costUsd: 0.01 });
+    llmCall(log.bus, runId, { provider: "provider_a", model: "model_1", outcome: "ok", latencyMs: 500, costUsd: 0.01 });
+    llmCall(log.bus, runId, { provider: "provider_b", model: "model_2", outcome: "ok", latencyMs: 600, ttftMs: 150, costUsd: 0.02 });
+
+    const report = aggregateRunCostLatency(runId, log.events(runId));
+    const provA = report.byProvider.find((p) => p.provider === "provider_a");
+    const provB = report.byProvider.find((p) => p.provider === "provider_b");
+    assert.ok(provA);
+    assert.ok(provB);
+    assert.equal(provA.calls, 3);
+    assert.equal(provA.avgTtftMs, 300);
+    assert.equal(provB.calls, 1);
+    assert.equal(provB.avgTtftMs, 150);
+  } finally {
+    configureRunsDir(null);
+    fs.rmSync(log.dir, { recursive: true, force: true });
+  }
+});

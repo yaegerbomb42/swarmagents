@@ -118,6 +118,8 @@ export interface RunUsage {
   lensCostUsd?: number;
   durationMs?: number;
   numTurns?: number;
+  /** Per-provider spend Breakdown (e.g. across failovers) from llm.call telemetry. */
+  byProviderSpend?: Record<string, number>;
 }
 
 /** A summed slice of usage: one day, one provider, one model, or the grand total. */
@@ -274,6 +276,9 @@ export function aggregateRunUsage(runId: string, events: readonly SequencedEvent
           run.provider = call.provider ?? run.provider;
           if (call.costUsd !== null) {
             run.callCostUsd = (run.callCostUsd ?? 0) + call.costUsd;
+            const prov = call.provider ?? run.provider ?? UNKNOWN_PROVIDER;
+            run.byProviderSpend ??= {};
+            run.byProviderSpend[prov] = (run.byProviderSpend[prov] ?? 0) + call.costUsd;
           }
         }
         break;
@@ -365,11 +370,19 @@ export function providerBudgetStatuses(
 }
 
 function spentTodayByProvider(report: UsageReport): Record<string, number> {
-  const today = report.days.find((d) => d.date === dayKey(Date.now()));
+  const todayDate = dayKey(Date.now());
   const spent: Record<string, number> = {};
-  if (today) {
-    for (const [id, slice] of Object.entries(today.byProvider)) {
-      spent[id] = slice.costUsd;
+  for (const run of report.runs) {
+    const runDate = dayKey(run.finishedAt ?? run.createdAt);
+    if (runDate !== todayDate) continue;
+    if (run.byProviderSpend && Object.keys(run.byProviderSpend).length > 0) {
+      for (const [providerId, cost] of Object.entries(run.byProviderSpend)) {
+        spent[providerId] = (spent[providerId] ?? 0) + cost;
+      }
+    } else {
+      const providerId = run.provider || UNKNOWN_PROVIDER;
+      const runCost = run.callCostUsd ?? run.costUsd ?? 0;
+      spent[providerId] = (spent[providerId] ?? 0) + runCost;
     }
   }
   return spent;

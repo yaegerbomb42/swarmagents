@@ -4,9 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { NextRequest } from "next/server";
-import { POST } from "./route";
+import { auditLoginFailureTarget, POST } from "./route";
 import { configureUserPaths, signupLocalUser } from "../../../lib/users";
 import { verifySession } from "../../../lib/auth";
+import { configureAuditPath, readAuditEntries } from "../../../lib/audit";
 
 function request(body: unknown, headers: Record<string, string> = {}): NextRequest {
   return new NextRequest("http://localhost/api/login", {
@@ -146,3 +147,36 @@ test("POST /api/login refuses to run without SWARM_SESSION_SECRET", async () => 
   const res = await POST(request({ email: "alice@example.com", password: "correct horse battery staple" }));
   assert.equal(res.status, 500);
 });
+
+test("auditLoginFailureTarget normalizes, strips controls, and caps length", () => {
+  assert.equal(auditLoginFailureTarget(undefined), "unknown");
+  assert.equal(auditLoginFailureTarget(""), "unknown");
+  assert.equal(auditLoginFailureTarget("  Alice@Example.COM  "), "alice@example.com");
+  assert.equal(auditLoginFailureTarget("bad\nemail\u0000@x.com"), "bademail@x.com");
+  const huge = `a@${"b".repeat(400)}.com`;
+  const capped = auditLoginFailureTarget(huge);
+  assert.equal(capped.length, 254);
+  assert.ok(capped.startsWith("a@bbb"));
+});
+
+test("POST /api/login writes a sanitized login.failure audit target", async () => {
+  const auditFile = path.join(dir, "audit.jsonl");
+  configureAuditPath(auditFile);
+  try {
+    const res = await POST(
+      request({ email: `Evil\n@x.com${"Z".repeat(400)}`, password: "nope" }),
+    );
+    assert.equal(res.status, 401);
+    const entries = readAuditEntries("anonymous");
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].action, "login.failure");
+    assert.equal(entries[0].result, "failure");
+    assert.ok(typeof entries[0].target === "string");
+    assert.ok(entries[0].target.length <= 254);
+    assert.ok(!entries[0].target.includes("\n"));
+    assert.ok(!/[A-Z]/.test(entries[0].target));
+  } finally {
+    configureAuditPath(undefined);
+  }
+});
+

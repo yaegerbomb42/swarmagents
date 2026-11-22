@@ -900,6 +900,8 @@ test("isBackgroundedCommand flags detached work and ignores foreground commands"
     'curl "https://example.com/api?a=1&b=2"',
     'echo "foo & bar"',
     "git push",
+    'curl "https://example.com/api?a=1&b=2"',
+    'echo "foo & bar"',
     "",
     "   ",
   ];
@@ -1005,6 +1007,51 @@ test("does not emit tool.backgrounded for a foreground Bash loop", async () => {
 
   assert.equal(outcome.exitCode, 0);
   assert.equal(events.filter((e) => e.type === "tool.backgrounded").length, 0);
+});
+
+test("does not emit tool.backgrounded for quoted ampersands in commands", async () => {
+  const commands = [
+    'curl "https://example.com/api?a=1&b=2"',
+    'echo "foo & bar"',
+  ];
+  for (const command of commands) {
+    const lines = [
+      INIT,
+      {
+        type: "assistant",
+        message: {
+          id: "m1",
+          content: [{ type: "tool_use", id: "toolu_q", name: "Bash", input: { command } }],
+        },
+      },
+      {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_q", content: "ok", is_error: false }],
+        },
+      },
+      {
+        type: "result",
+        subtype: "success",
+        duration_ms: 10,
+        num_turns: 1,
+        result: "ok",
+        session_id: "sess_q",
+        total_cost_usd: 0.001,
+      },
+    ].map((l) => JSON.stringify(l));
+    const vm = new ScriptedVm([{ chunks: [lines.join("\n") + "\n"] }]);
+    const runner = new ClaudeCodeRunner();
+    const events: TelemetryEvent[] = [];
+    const outcome = await runner.run({ prompt: "test", env: {}, vm }, (e) => events.push(e));
+    assert.equal(outcome.exitCode, 0);
+    assert.equal(
+      events.filter((e) => e.type === "tool.backgrounded").length,
+      0,
+      `unexpected tool.backgrounded for: ${command}`,
+    );
+  }
 });
 
 // --- s5: exit 137 + misleading unrecognized_model ---

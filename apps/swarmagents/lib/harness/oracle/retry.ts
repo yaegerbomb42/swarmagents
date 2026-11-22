@@ -97,7 +97,7 @@ export function diagnosticSymbols(diagnostic: string): string[] {
 
 const DEF_RE = (name: string) =>
   new RegExp(
-    `^\\s*(export\\s+)?(default\\s+)?(declare\\s+)?(abstract\\s+)?(async\\s+)?(function\\*?|class|interface|type|enum|const|let|var)\\s+${name.replace(/\$/g, "\\$")}\\b`,
+    `^\\s*(export\\s+)?(default\\s+)?(declare\\s+)?(abstract\\s+)?(async\\s+)?(function\\*?|class|interface|type|enum|const|let|var)\\s+${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
   );
 
 /**
@@ -117,15 +117,56 @@ export function findDefinition(
     let depth = 0;
     let opened = false;
     let end = at;
+    let inBlockComment = false;
+    let inString: "'" | '"' | "`" | null = null;
+    let stringEscape = false;
     for (let i = at; i < lines.length && i < at + maxLines; i++) {
-      for (const ch of lines[i]) {
+      const line = lines[i];
+      let inLineComment = false;
+      for (let j = 0; j < line.length; j++) {
+        const ch = line[j];
+        const next = line[j + 1];
+        if (inLineComment) break;
+        if (inBlockComment) {
+          if (ch === "*" && next === "/") {
+            inBlockComment = false;
+            j++;
+          }
+          continue;
+        }
+        if (inString) {
+          if (stringEscape) {
+            stringEscape = false;
+            continue;
+          }
+          if (ch === "\\") {
+            stringEscape = true;
+            continue;
+          }
+          if (ch === inString) inString = null;
+          continue;
+        }
+        if (ch === "/" && next === "/") {
+          inLineComment = true;
+          continue;
+        }
+        if (ch === "/" && next === "*") {
+          inBlockComment = true;
+          j++;
+          continue;
+        }
+        if (ch === "'" || ch === '"' || ch === "`") {
+          inString = ch;
+          continue;
+        }
         if (ch === "{") {
           depth++;
           opened = true;
         } else if (ch === "}") depth--;
       }
+      stringEscape = false; // line break ends escape in normal strings; template literals can span lines but we treat conservatively
       end = i;
-      if ((opened && depth <= 0) || (!opened && /;\s*$/.test(lines[i]))) break;
+      if ((opened && depth <= 0) || (!opened && /;\s*$/.test(line))) break;
     }
     const text = lines
       .slice(at, end + 1)

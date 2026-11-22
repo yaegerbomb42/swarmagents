@@ -1279,8 +1279,10 @@ function stripQuotedSegments(command: string): string {
 /**
  * True when a shell command detaches work from the foreground: a background
  * operator (`&` — not `&&`, and not the `&>` / `>&` redirections), `nohup` /
- * `setsid`, `disown`, or a detached tmux/screen session. Quoted ampersands
- * (e.g. `echo "a & b"` or `curl "https://x?a=1&b=2"`) are ignored.
+ * `setsid`, `disown`, or a detached tmux/screen session. Quoted segments are
+ * stripped before matching so `&` inside single/double-quoted strings or URL
+ * query strings does not false-positive. Heuristic for a harness warning, not
+ * a security gate.
  */
 export function isBackgroundedCommand(command: string): boolean {
   if (typeof command !== "string" || command.trim() === "") return false;

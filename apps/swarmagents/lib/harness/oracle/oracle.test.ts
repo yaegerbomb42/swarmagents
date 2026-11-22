@@ -511,6 +511,28 @@ test("diagnostics are trimmed to error lines, redacted and bounded", () => {
   assert.match(ctx, /Definition of `Pool` \(src\/pool\.ts:L1-2\)/);
 });
 
+test("findDefinition ignores braces in comments/strings and escapes regex metacharacters in names", () => {
+  const content = [
+    "export function greet() {",
+    "  // } brace in line comment",
+    "  /* } brace in block comment */",
+    "  const a = \"{\";",
+    "  const b = '}';",
+    "  const c = `{`;",
+    "  return a + b + c;",
+    "}",
+    "const after = 1;",
+  ].join("\n");
+  const def = findDefinition("greet", [{ path: "src/greet.ts", content }]);
+  assert.deepEqual(def && [def.startLine, def.endLine], [1, 8]);
+  assert.match(def?.text ?? "", /return a \+ b \+ c;/);
+  assert.doesNotMatch(def?.text ?? "", /const after = 1/);
+
+  // Regex metacharacters in name should be escaped (no throw / no false match).
+  const odd = findDefinition("foo.bar", [{ path: "src/x.ts", content: "export function foo() {}\n" }]);
+  assert.equal(odd, null);
+});
+
 test("writeFileViaExec round-trips content through argv-only base64 chunks", async () => {
   const dir = mkdtempSync(join(tmpdir(), "oracle-write-"));
   try {

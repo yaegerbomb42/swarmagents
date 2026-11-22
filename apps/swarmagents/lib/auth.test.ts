@@ -10,6 +10,7 @@ import {
   hostAllowed,
   isAllowed,
   isLoopbackHost,
+  isSignupAllowed,
   requestHostname,
   requestUser,
   safeNextPath,

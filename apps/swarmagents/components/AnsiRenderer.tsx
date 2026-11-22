@@ -11,7 +11,8 @@
 // user has not scrolled up — a floating "Jump to latest" button appears when
 // it has — wraps long lines instead of scrolling sideways, and keeps the text
 // selectable so it can be copied straight out of the terminal.
-import {
+import React, {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -78,18 +79,27 @@ const BG = new Map<number, string>([
   [107, "#ffffff"],
 ]);
 
+/** Clamp a colour component to an integer byte (0-255). */
+function clampByte(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(255, Math.max(0, Math.trunc(n)));
+}
+
 /** 256-color palette: 16 base + 6×6×6 cube + 24 grays. */
 function ansi256(n: number): string {
-  if (n < 16) return FG.get(FG.has(n) ? n : 37) ?? "#d4d4d4";
-  if (n < 232) {
-    const cube = n - 16;
+  const index = clampByte(n);
+  if (index < 8) return FG.get(30 + index) ?? "#d4d4d4";
+  if (index < 16) return FG.get(90 + (index - 8)) ?? "#d4d4d4";
+  if (index < 232) {
+    const cube = index - 16;
     const r = Math.floor(cube / 36);
     const g = Math.floor((cube % 36) / 6);
     const b = cube % 6;
     const ch = (v: number) => (v === 0 ? 0 : 55 + v * 40);
     return `rgb(${ch(r)},${ch(g)},${ch(b)})`;
   }
-  const gray = 8 + (n - 232) * 10;
+  const gray = 8 + (index - 232) * 10;
   return `rgb(${gray},${gray},${gray})`;
 }
 
@@ -148,10 +158,17 @@ function applySgr(style: StyleState, params: string[]): StyleState {
         const kind = code === 38 ? "fg" : "bg";
         const mode = Number(params[i + 1]);
         if (mode === 5) {
+          // 38;5;<index> — the index must be present.
+          if (i + 2 >= params.length) break;
           next[kind] = ansi256(Number(params[i + 2]));
           i += 2;
         } else if (mode === 2) {
-          next[kind] = `rgb(${params[i + 2]},${params[i + 3]},${params[i + 4]})`;
+          // 38;2;<r>;<g>;<b> — all three components must be present.
+          if (i + 4 >= params.length) break;
+          const r = clampByte(params[i + 2]);
+          const g = clampByte(params[i + 3]);
+          const b = clampByte(params[i + 4]);
+          next[kind] = `rgb(${r},${g},${b})`;
           i += 4;
         }
         break;
@@ -173,8 +190,10 @@ function toCss(style: StyleState): CSSProperties {
   if (style.bold) out.fontWeight = 700;
   if (style.dim) out.opacity = 0.6;
   if (style.italic) out.fontStyle = "italic";
-  if (style.underline) out.textDecoration = "underline";
-  if (style.strike) out.textDecoration = "line-through";
+  const decorations: string[] = [];
+  if (style.underline) decorations.push("underline");
+  if (style.strike) decorations.push("line-through");
+  if (decorations.length > 0) out.textDecoration = decorations.join(" ");
   if (style.reverse) {
     out.color = style.bg ?? "#1e1e1e";
     out.backgroundColor = style.fg ?? "#d4d4d4";
@@ -224,6 +243,9 @@ export function AnsiRenderer({ text }: { text: string }) {
 
 /** Every ANSI SGR escape sequence. */
 const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
+
+/** Sticky variant used to skip escape sequences without slicing the raw line. */
+const ANSI_AT_OFFSET_RE = /\x1b\[[0-9;]*m/y;
 
 /** Removes ANSI SGR escapes so plain-text heuristics can run on the result. */
 export function stripAnsi(text: string): string {
@@ -275,12 +297,11 @@ function plainIndexToRaw(raw: string, plainIndex: number): number {
   let seen = 0;
   let i = 0;
   while (i < raw.length && seen < plainIndex) {
-    if (raw[i] === "\x1b") {
-      const m = /^\x1b\[[0-9;]*m/.exec(raw.slice(i));
-      if (m) {
-        i += m[0].length;
-        continue;
-      }
+    ANSI_AT_OFFSET_RE.lastIndex = i;
+    const m = ANSI_AT_OFFSET_RE.exec(raw);
+    if (m) {
+      i = ANSI_AT_OFFSET_RE.lastIndex;
+      continue;
     }
     seen += 1;
     i += 1;
@@ -310,7 +331,7 @@ export function parseLogLine(raw: string): LogLine {
 }
 
 /** One terminal row: gutter (timestamp + rail) plus the message. */
-function LogRow({ line }: { line: string }) {
+const LogRow = memo(function LogRow({ line }: { line: string }) {
   const { kind, timestamp, body } = useMemo(() => parseLogLine(line), [line]);
   const nodes = useMemo(() => buildNodes(body), [body]);
   const style = KIND_STYLES[kind];
@@ -329,7 +350,7 @@ function LogRow({ line }: { line: string }) {
       <span className={`whitespace-pre-wrap break-words ${style.text}`}>{nodes}</span>
     </div>
   );
-}
+});
 
 export interface AnsiTerminalProps {
   /** Raw log text; may contain ANSI escapes and newlines. */
@@ -358,9 +379,10 @@ export function AnsiTerminal({
   const jumpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [pinned, setPinned] = useState(true);
 
-  const lines = useMemo(() => {
+  const { lines, startIndex } = useMemo(() => {
     const all = text.split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
-    return all.length > maxLines ? all.slice(all.length - maxLines) : all;
+    const start = Math.max(0, all.length - maxLines);
+    return { lines: start > 0 ? all.slice(start) : all, startIndex: start };
   }, [text, maxLines]);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
@@ -437,7 +459,7 @@ export function AnsiTerminal({
       >
         <div ref={contentRef}>
           {lines.map((line, i) => (
-            <LogRow key={i} line={line} />
+            <LogRow key={startIndex + i} line={line} />
           ))}
         </div>
       </div>

@@ -26,7 +26,7 @@ import { getRunsDir } from "./paths";
 import { listRunLogs, readRunEvents } from "./run-log";
 import type { ProviderConfig } from "../providers/types";
 
-export type RunUsageStatus = "queued" | "running" | "finished" | "error" | "cancelled";
+export type RunUsageStatus = "queued" | "running" | "paused" | "finished" | "error" | "cancelled";
 
 /** Token + cost totals for one run. */
 export interface RunUsage {
@@ -117,7 +117,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function num(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 function str(value: unknown): string | undefined {
@@ -144,7 +144,12 @@ function addRunToSlice(slice: UsageSlice, run: RunUsage): void {
 }
 
 function dayKey(ts: number): string {
-  return new Date(ts).toISOString().slice(0, 10);
+  if (!Number.isFinite(ts) || ts <= 0) return "1970-01-01";
+  try {
+    return new Date(ts).toISOString().slice(0, 10);
+  } catch {
+    return "1970-01-01";
+  }
 }
 
 /** Fold one run's persisted events into its usage totals. */
@@ -177,6 +182,9 @@ export function aggregateRunUsage(runId: string, events: readonly SequencedEvent
         // flips it back to running when the run actually starts.
         run.status = "queued";
         break;
+      case "run.paused":
+        run.status = "paused";
+        break;
       case "run.started":
         run.status = "running";
         run.model = str(field("model")) ?? run.model;
@@ -201,21 +209,23 @@ export function aggregateRunUsage(runId: string, events: readonly SequencedEvent
         // Gateway telemetry per provider attempt (see lib/runtime/llm-gateway.ts).
         // Only ok calls count toward the run cost; the serving provider is the
         // last ok attempt. Event data never contains secrets or prompts.
-        if (data.source === "lens") {
+        if (field("source") === "lens") {
           // Output lenses ride on the same bus (see lib/lenses/run.ts) but are
           // not part of the agent's own calls: their cost is kept apart so it
           // adds to the run's cost instead of replacing it, and the run keeps
           // the provider that served it.
-          if (typeof data.costUsd === "number") {
-            run.lensCostUsd = (run.lensCostUsd ?? 0) + data.costUsd;
+          const lensCost = num(field("costUsd"));
+          if (field("outcome") === "ok" && lensCost !== undefined) {
+            run.lensCostUsd = (run.lensCostUsd ?? 0) + lensCost;
           }
           break;
         }
-        if (data.outcome === "ok") {
-          run.provider = str(data.provider) ?? run.provider;
-        }
-        if (typeof data.costUsd === "number") {
-          run.callCostUsd = (run.callCostUsd ?? 0) + data.costUsd;
+        if (field("outcome") === "ok") {
+          run.provider = str(field("provider")) ?? run.provider;
+          const callCost = num(field("costUsd"));
+          if (callCost !== undefined) {
+            run.callCostUsd = (run.callCostUsd ?? 0) + callCost;
+          }
         }
         break;
       case "run.finished":
@@ -332,8 +342,10 @@ export interface ComputeUsageOptions {
  */
 export function computeUsage(options: ComputeUsageOptions = {}): UsageReport {
   const runsDir = options.runsDir === undefined ? getRunsDir() : options.runsDir;
-  const daysWindow = Math.max(1, Math.min(options.days ?? 30, 90));
-  const limit = Math.max(1, Math.min(options.limit ?? 20, 200));
+  const rawDays = options.days !== undefined && Number.isFinite(options.days) ? options.days : 30;
+  const rawLimit = options.limit !== undefined && Number.isFinite(options.limit) ? options.limit : 20;
+  const daysWindow = Math.max(1, Math.min(rawDays, 90));
+  const limit = Math.max(1, Math.min(rawLimit, 200));
   if (!runsDir) return { days: [], runs: [], budgets: [], totals: emptySlice() };
 
   const cutoff = Date.now() - daysWindow * 24 * 60 * 60 * 1000;

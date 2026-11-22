@@ -154,14 +154,36 @@ function anthropicBody(
   stream: boolean
 ) {
   void config;
+  const breakpoints = request.cacheBreakpoints;
+  // Explicit cache breakpoints (CacheAwarePromptBuilder): one after the
+  // system prompt (Zone 0), one after the first message (Zone 1), one
+  // after the second-to-last message. Each lands on the last content
+  // block of its message. Without breakpoints this is byte-identical to
+  // today's body: system stays a plain string.
+  const messages = request.messages.map((message, index) => {
+    const blocks = toBlocks(message);
+    const isBreakpoint =
+      (breakpoints?.firstMessage === true && index === 0) ||
+      (breakpoints?.secondLastMessage === true && index === request.messages.length - 2);
+    if (!isBreakpoint || blocks.length === 0) return { role: message.role, content: blocks };
+    const last = blocks[blocks.length - 1];
+    return {
+      role: message.role,
+      content: [...blocks.slice(0, -1), { ...last, cache_control: { type: "ephemeral" } }],
+    };
+  });
   return {
     model,
     max_tokens: request.maxTokens ?? 1024,
-    messages: request.messages.map((message) => ({
-      role: message.role,
-      content: toBlocks(message),
-    })),
-    ...(request.system ? { system: request.system } : {}),
+    messages,
+    ...(request.system
+      ? {
+          system:
+            breakpoints?.system === true
+              ? [{ type: "text", text: request.system, cache_control: { type: "ephemeral" } }]
+              : request.system,
+        }
+      : {}),
     ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
     ...(stream ? { stream: true } : {}),
   };
@@ -466,6 +488,12 @@ export function parseResponse(
       usage: {
         inputTokens: asNumber(usage?.input_tokens) ?? 0,
         outputTokens: asNumber(usage?.output_tokens) ?? 0,
+        ...(asNumber(usage?.cache_read_input_tokens) !== undefined
+          ? { cachedInputTokens: asNumber(usage?.cache_read_input_tokens) }
+          : {}),
+        ...(asNumber(usage?.cache_creation_input_tokens) !== undefined
+          ? { cacheWriteTokens: asNumber(usage?.cache_creation_input_tokens) }
+          : {}),
       },
     };
   }
@@ -492,12 +520,14 @@ export function parseResponse(
     // also recognizes the Perplexity cost object / flattened numeric cost
     // defensively. Absent or malformed -> undefined -> usage unchanged.
     const reportedCost = parseReportedCostUsd(usage);
+    const cached = asNumber(asRecord(usage?.prompt_tokens_details)?.cached_tokens);
     return {
       text: requireText(config.id, text),
       model: asString(root.model) ?? requestedModel,
       usage: {
         inputTokens: asNumber(usage?.prompt_tokens) ?? 0,
         outputTokens: asNumber(usage?.completion_tokens) ?? 0,
+        ...(cached !== undefined ? { cachedInputTokens: cached } : {}),
         ...(reportedCost !== undefined ? { costUsd: reportedCost } : {}),
       },
     };
@@ -524,12 +554,16 @@ export function parseResponse(
     }
     const usage = asRecord(root.usage);
     const reportedCost = parseReportedCostUsd(usage);
+    const cached =
+      asNumber(asRecord(usage?.input_tokens_details)?.cached_tokens) ??
+      asNumber(asRecord(usage?.prompt_tokens_details)?.cached_tokens);
     return {
       text: requireText(config.id, text),
       model: asString(root.model) ?? requestedModel,
       usage: {
         inputTokens: asNumber(usage?.input_tokens) ?? 0,
         outputTokens: asNumber(usage?.output_tokens) ?? 0,
+        ...(cached !== undefined ? { cachedInputTokens: cached } : {}),
         ...(reportedCost !== undefined ? { costUsd: reportedCost } : {}),
       },
     };
@@ -558,12 +592,14 @@ export function parseResponse(
     .map((part) => asString(asRecord(part)?.text) ?? "")
     .join("");
   const usage = asRecord(root.usageMetadata);
+  const cached = asNumber(usage?.cachedContentTokenCount);
   return {
     text: requireText(config.id, text),
     model: asString(root.modelVersion) ?? requestedModel,
     usage: {
       inputTokens: asNumber(usage?.promptTokenCount) ?? 0,
       outputTokens: asNumber(usage?.candidatesTokenCount) ?? 0,
+      ...(cached !== undefined ? { cachedInputTokens: cached } : {}),
     },
   };
 }

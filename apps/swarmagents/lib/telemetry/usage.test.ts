@@ -384,3 +384,68 @@ test("computeUsage returns an empty report when persistence is disabled", () => 
     totals: { tokensIn: 0, tokensOut: 0, tokensCached: 0, costUsd: 0, runs: 0, runsWithCost: 0 },
   });
 });
+
+test("failed llm.call does not count toward run cost or shadow run.finished", () => {
+  const events: SequencedEvent[] = [
+    event("r1", "run.created", { userId: "alice" }),
+    event("r1", "llm.call", { outcome: "error", costUsd: 0.25, provider: "anthropic" }),
+    event("r1", "llm.call", { outcome: "error", costUsd: 0, provider: "anthropic" }),
+    event("r1", "run.finished", { costUsd: 0.15 }),
+  ];
+  const run = aggregateRunUsage("r1", events);
+  assert.equal(run.callCostUsd, undefined);
+  assert.equal(run.costUsd, 0.15);
+  // Lens failed calls also do not count
+  const lensEvents: SequencedEvent[] = [
+    event("r2", "run.created", { userId: "alice" }),
+    event("r2", "llm.call", { source: "lens", outcome: "error", costUsd: 0.05 }),
+    event("r2", "llm.call", { source: "lens", outcome: "ok", costUsd: 0.03 }),
+  ];
+  const lensRun = aggregateRunUsage("r2", lensEvents);
+  assert.equal(lensRun.lensCostUsd, 0.03);
+});
+
+test("NaN and negative cost payloads are ignored to prevent poisoning", () => {
+  const events: SequencedEvent[] = [
+    event("r1", "run.created", { userId: "alice" }),
+    event("r1", "llm.call", { outcome: "ok", costUsd: NaN, provider: "anthropic" }),
+    event("r1", "llm.call", { outcome: "ok", costUsd: Infinity, provider: "anthropic" }),
+    event("r1", "llm.call", { outcome: "ok", costUsd: -5, provider: "anthropic" }),
+    event("r1", "llm.call", { outcome: "ok", costUsd: 0.10, provider: "anthropic" }),
+  ];
+  const run = aggregateRunUsage("r1", events);
+  assert.equal(run.callCostUsd, 0.10);
+});
+
+test("run.paused sets status to paused", () => {
+  const events: SequencedEvent[] = [
+    event("r1", "run.created", { userId: "alice" }),
+    event("r1", "run.started", { provider: "anthropic" }),
+    event("r1", "run.paused", {}),
+  ];
+  const run = aggregateRunUsage("r1", events);
+  assert.equal(run.status, "paused");
+});
+
+test("computeUsage handles NaN days and limit gracefully", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-usage-nan-"));
+  configureRunsDir(dir);
+  try {
+    const bus = new TelemetryBus({ persist: true, runsDir: () => dir });
+    bus.publish("run_1", { type: "run.created", data: { userId: "alice" } });
+    bus.publish("run_1", { type: "run.finished", costUsd: 0.10 } as TelemetryEvent);
+
+    const report = computeUsage({
+      runsDir: dir,
+      userId: "alice",
+      days: NaN,
+      limit: NaN,
+    });
+    assert.equal(report.runs.length, 1);
+    assert.equal(report.days.length, 1);
+  } finally {
+    configureRunsDir(null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+

@@ -15,7 +15,8 @@ import {
   type TaskProposal,
   type SwarmMessage,
   type TaskDifficulty,
-  DIFFICULTY_ELO_MAP,
+  DIFFICULTY_RANK,
+  normalizeDifficulty,
 } from "./types.js";
 
 const STORAGE_DIR = process.env.SWARM_HOME || path.join(os.homedir(), ".swarmagents");
@@ -69,7 +70,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "create_task",
-        description: "Orchestrator tool to post new prioritized tasks with explicit difficulty/minElo.",
+        description: "Orchestrator tool to post new prioritized tasks with an explicit difficulty (easy, medium, or hard).",
         inputSchema: {
           type: "object",
           properties: {
@@ -77,8 +78,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: { type: "string", description: "Detailed specification" },
             difficulty: {
               type: "string",
-              enum: ["trivial", "easy", "medium", "hard", "expert"],
-              description: "Difficulty: trivial (1000 Elo), easy (1200), medium (1400), hard (1600), expert (1800+)",
+              enum: ["easy", "medium", "hard"],
+              description: "Difficulty: easy, medium, or hard",
             },
             constraints: {
               type: "array",
@@ -95,22 +96,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            workerElo: { type: "number", description: "Elo of worker model" },
+            difficulty: { type: "string", enum: ["easy", "medium", "hard"], description: "Only tasks of this difficulty" },
             status: { type: "string", enum: ["open", "claimed", "in_review", "completed", "blocked"] },
           },
         },
       },
       {
         name: "claim_task",
-        description: "Claim an open task. Requires workerElo to meet difficulty threshold.",
+        description: "Claim an open task. Any agent may claim any open task.",
         inputSchema: {
           type: "object",
           properties: {
             taskId: { type: "string", description: "Task ID" },
             agentName: { type: "string", description: "Agent name" },
-            workerElo: { type: "number", description: "Worker Elo" },
           },
-          required: ["taskId", "agentName", "workerElo"],
+          required: ["taskId", "agentName"],
         },
       },
       {
@@ -139,7 +139,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             proposedSolution: { type: "string", description: "How you propose solving it" },
             suggestedDifficulty: {
               type: "string",
-              enum: ["trivial", "easy", "medium", "hard", "expert"],
+              enum: ["easy", "medium", "hard"],
               description: "Suggested difficulty level",
             },
           },
@@ -167,7 +167,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             feedback: { type: "string", description: "Orchestrator decision notes" },
             finalDifficulty: {
               type: "string",
-              enum: ["trivial", "easy", "medium", "hard", "expert"],
+              enum: ["easy", "medium", "hard"],
               description: "Override difficulty if different from proposal",
             },
           },
@@ -215,14 +215,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = request.params.arguments as any;
 
   if (name === "create_task") {
-    const difficulty: TaskDifficulty = args.difficulty || "medium";
-    const minElo = DIFFICULTY_ELO_MAP[difficulty];
+    const difficulty: TaskDifficulty = normalizeDifficulty(args.difficulty) || "medium";
     const task: SwarmTask = {
       id: `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
       title: args.title,
       description: args.description,
       difficulty,
-      minElo,
       constraints: args.constraints || [],
       status: "open",
       createdAt: Date.now(),
@@ -237,18 +235,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "poll_tasks") {
     const status = args.status || "open";
-    const workerElo = args.workerElo ?? 1400;
+    const difficultyFilter = normalizeDifficulty(args.difficulty);
+    const hasDifficultyFilter = typeof args.difficulty === "string";
 
     const filtered = store.tasks
       .filter((t) => t.status === status)
-      .map((t) => {
-        const eloDiff = workerElo - t.minElo;
-        let recommendation = "Ideal Match";
-        if (eloDiff < -150) recommendation = "Under-qualified (High Risk)";
-        else if (eloDiff > 350) recommendation = "Over-qualified (Prefer lower tier model)";
-        return { ...t, eloDiff, recommendation };
-      })
-      .sort((a, b) => Math.abs(a.eloDiff) - Math.abs(b.eloDiff));
+      .filter((t) => !hasDifficultyFilter || normalizeDifficulty(t.difficulty) === difficultyFilter)
+      .sort(
+        (a, b) =>
+          DIFFICULTY_RANK[normalizeDifficulty(a.difficulty)] - DIFFICULTY_RANK[normalizeDifficulty(b.difficulty)] ||
+          b.updatedAt - a.updatedAt ||
+          a.id.localeCompare(b.id),
+      );
 
     return {
       content: [
@@ -276,16 +274,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (!task) throw new Error(`Task ${args.taskId} not found`);
     if (task.status !== "open") throw new Error(`Task ${args.taskId} is already ${task.status}`);
 
-    const workerElo = Number(args.workerElo);
-    if (workerElo < task.minElo - 150) {
-      throw new Error(
-        `Elo mismatch: Worker Elo (${workerElo}) is below required task minElo (${task.minElo} - ${task.difficulty}).`
-      );
-    }
-
     task.status = "claimed";
     task.claimedBy = args.agentName;
-    task.claimedByElo = workerElo;
     task.updatedAt = Date.now();
     saveStore(store);
 
@@ -346,13 +336,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     let createdTask: SwarmTask | undefined;
     if (args.approved) {
-      const difficulty: TaskDifficulty = args.finalDifficulty || proposal.suggestedDifficulty;
+      const difficulty: TaskDifficulty = normalizeDifficulty(args.finalDifficulty || proposal.suggestedDifficulty);
       createdTask = {
         id: `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
         title: proposal.title,
         description: `[From Scout Proposal by ${proposal.proposedBy}]\n\nProblem:\n${proposal.problem}\n\nSolution Spec:\n${proposal.proposedSolution}`,
         difficulty,
-        minElo: DIFFICULTY_ELO_MAP[difficulty],
         constraints: ["Must be implemented on git branch", "Unit tests required"],
         status: "open",
         createdAt: Date.now(),

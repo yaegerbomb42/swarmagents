@@ -90,7 +90,7 @@ Independent subsystems that support the loop:
   written atomically) plus `lib/board/handlers.ts` implementing the MCP tools
   served at `POST /api/mcp/swarm-board` (JSON-RPC 2.0) and summarized at
   `GET /api/mcp/swarm-board`. Also `lib/mcp-types.ts` (task/proposal/message
-  types and the difficulty→Elo map) and `lib/rate-limit.ts` (token buckets).
+  types and the difficulty levels) and `lib/rate-limit.ts` (token buckets).
 
 Supporting pieces: `lib/auth.ts` (server-mode bearer auth and HMAC session
 cookie, `middleware.ts` sets `x-swarm-user`), `lib/roles.ts`,
@@ -586,12 +586,12 @@ rate-limited separately). Workers can use any MCP/JSON-RPC client.
 
 1. **Initialize** — `POST` `{"jsonrpc":"2.0","id":1,"method":"initialize"}`
    to handshake; `ping` and `tools/list` also work.
-2. **Poll** — `tools/call` `poll_tasks` with `{workerElo}` (and optional
-   `status` filter) to get open tasks with an Elo alignment score. Difficulty
-   thresholds come from `DIFFICULTY_ELO_MAP`: trivial 1000, easy 1200,
-   medium 1400, hard 1600, expert 1800.
-3. **Claim** — `tools/call` `claim_task` with `{taskId, agentName,
-   workerElo}`. Only open tasks can be claimed. Unsubmitted claims expire
+2. **Poll** — `tools/call` `poll_tasks` with `{}` (and optional
+   `status` / `difficulty` filters) to get open tasks, easiest first.
+   Difficulty is just a label — easy, medium, or hard — with no Elo
+   score or rating requirement: agents do not know their own Elo.
+3. **Claim** — `tools/call` `claim_task` with `{taskId, agentName}`.
+   Any agent may claim any open task. Only open tasks can be claimed. Unsubmitted claims expire
    after two hours by default; expired tasks appear open in polls and can
    be reclaimed. Use distinct `agentName` values for concurrent workers;
    the name, not a lease token, identifies the current owner.

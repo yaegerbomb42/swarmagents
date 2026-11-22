@@ -114,7 +114,7 @@ test("creation rejects invalid lengths, difficulty and constraints without savin
 test("listing filters by status and shows at most the newest 20 compact task summaries", async () => {
   const store = loadStore();
   store.tasks = Array.from({ length: 24 }, (_, n): SwarmTask => ({
-    ...TASK, id: `task_${n}`, difficulty: "easy", minElo: 1200, createdAt: n, updatedAt: n,
+    ...TASK, id: `task_${n}`, difficulty: "easy", createdAt: n, updatedAt: n,
     status: n === 23 ? "in_review" : "open",
     ...(n === 23 ? { claimedBy: "worker", prUrl: "https://example.test/pr/23" } : {}),
   }));
@@ -157,7 +157,7 @@ test("digest reports ready, stale, review and completed work without writing the
   const now = Date.now();
   t.mock.method(Date, "now", () => now);
   const task = (id: string, status: SwarmTask["status"], updatedAt: number): SwarmTask => ({
-    ...TASK, id, status, updatedAt, createdAt: updatedAt, difficulty: "easy", minElo: 1200,
+    ...TASK, id, status, updatedAt, createdAt: updatedAt, difficulty: "easy",
   });
   const current = task("task_active", "claimed", now);
   const expired = {

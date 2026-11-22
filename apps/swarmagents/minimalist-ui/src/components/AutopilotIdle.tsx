@@ -10,11 +10,13 @@ type Proposal = {
 
 type GardenerState = {
   enabled: boolean;
-  workerElo: number;
+  maxDifficulty: "easy" | "medium" | "hard";
   proposals: Proposal[];
   idleMs: number;
   inWindow: boolean;
 };
+
+const DIFFICULTIES: Array<"easy" | "medium" | "hard"> = ["easy", "medium", "hard"];
 
 export function AutopilotIdle() {
   const [state, setState] = useState<GardenerState | null>(null);
@@ -69,10 +71,23 @@ export function AutopilotIdle() {
         </button>
       </div>
       {state?.enabled && (
-        <p className="mt-2 font-mono text-[10px] text-white/40">
-          Elo {state.workerElo}
-          {state.inWindow ? " · idle window open" : " · waiting for idle window"}
-        </p>
+        <div className="mt-2 flex items-center gap-2">
+          <span className="font-mono text-[10px] text-white/40">
+            Max difficulty{state.inWindow ? " · idle window open" : " · waiting for idle window"}
+          </span>
+          {DIFFICULTIES.map((level) => (
+            <button
+              key={level}
+              type="button"
+              className={`rounded-full px-2 py-0.5 text-[10px] capitalize ${
+                state.maxDifficulty === level ? "bg-white text-black" : "bg-white/10 text-white/80"
+              }`}
+              onClick={() => void post({ action: "setDifficulty", maxDifficulty: level })}
+            >
+              {level}
+            </button>
+          ))}
+        </div>
       )}
       {error && <p className="mt-2 text-[11px] text-amber-200/80">{error}</p>}
       <ul className="mt-3 space-y-2">

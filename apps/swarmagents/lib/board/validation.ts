@@ -1,6 +1,6 @@
 import type { TaskDifficulty } from "@/lib/mcp-types";
 
-const DIFFICULTIES: TaskDifficulty[] = ["trivial", "easy", "medium", "hard", "expert"];
+const DIFFICULTIES: TaskDifficulty[] = ["easy", "medium", "hard"];
 const STATUSES = ["open", "claimed", "in_review", "completed", "blocked"] as const;
 const PROPOSAL_STATUSES = ["pending", "approved", "rejected"] as const;
 
@@ -53,17 +53,6 @@ function optionalEnum<T extends string>(v: unknown, field: string, values: reado
   return requiredEnum(v, field, values);
 }
 
-function requiredNumber(v: unknown, field: string): ValidationError | null {
-  if (!isNumber(v)) return { field, message: `${field} is required and must be a number` };
-  return null;
-}
-
-function optionalNumber(v: unknown, field: string): ValidationError | null {
-  if (v === undefined || v === null) return null;
-  if (!isNumber(v)) return { field, message: `${field} must be a number` };
-  return null;
-}
-
 function requiredBoolean(v: unknown, field: string): ValidationError | null {
   if (!isBoolean(v)) return { field, message: `${field} is required and must be a boolean` };
   return null;
@@ -101,7 +90,7 @@ export function validatePollTasks(args: Record<string, unknown>): ValidationErro
   const errs: ValidationError[] = [];
   const e1 = optionalEnum(args.status, "status", STATUSES);
   if (e1) errs.push(e1);
-  const e2 = optionalNumber(args.workerElo, "workerElo");
+  const e2 = optionalEnum(args.difficulty, "difficulty", DIFFICULTIES);
   if (e2) errs.push(e2);
   return errs;
 }
@@ -119,8 +108,6 @@ export function validateClaimTask(args: Record<string, unknown>): ValidationErro
   if (e1) errs.push(e1);
   const e2 = requiredString(args.agentName, "agentName", 200);
   if (e2) errs.push(e2);
-  const e3 = requiredNumber(args.workerElo, "workerElo");
-  if (e3) errs.push(e3);
   return errs;
 }
 

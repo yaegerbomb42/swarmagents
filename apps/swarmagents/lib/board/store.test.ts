@@ -26,7 +26,6 @@ function seededStore(): BoardStore {
     title: "Keep me",
     description: "valid work",
     difficulty: "easy",
-    minElo: 1200,
     constraints: [],
     status: "open",
     createdAt: 1,
@@ -92,7 +91,6 @@ test("saveStoreAtomic round-trips through a writable temp dir", async () => {
       title: "T",
       description: "D",
       difficulty: "easy",
-      minElo: 1200,
       constraints: [],
       status: "open",
       createdAt: 1,
@@ -420,7 +418,7 @@ test("ENOSPC cannot publish a claim, replace the prior snapshot, or leave a temp
     if (to === dataFile) throw ioError("ENOSPC");
     return realRename(from, to);
   });
-  const args = { taskId: "t1", agentName: "worker", workerElo: 1300 };
+  const args = { taskId: "t1", agentName: "worker" };
   const result = await withLockedStore(async (store) => {
     const failed = await handleClaimTask(store, args);
     assert.equal(store.tasks[0].status, "open");

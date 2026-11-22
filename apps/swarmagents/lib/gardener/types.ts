@@ -1,3 +1,5 @@
+import type { TaskDifficulty } from "../mcp-types";
+
 /** One-click proposal produced while a VM sits in the pre-hibernate window. */
 export type GardenerProposalKind = "unit-test" | "pr" | "board-task";
 
@@ -12,7 +14,7 @@ export interface GardenerProposal {
   repoRoot?: string;
   path?: string;
   taskId?: string;
-  minElo?: number;
+  difficulty?: TaskDifficulty;
   status: GardenerProposalStatus;
   createdAt: number;
 }
@@ -27,8 +29,8 @@ export const MAX_PINNED_REPOSITORIES = 50;
 
 export interface GardenerUserState {
   enabled: boolean;
-  /** Agent Elo used when polling the swarm board. Defaults to 1400 (medium). */
-  workerElo: number;
+  /** Hardest board-task difficulty the autopilot may propose. Defaults to medium. */
+  maxDifficulty: TaskDifficulty;
   pinned: PinnedProject[];
   proposals: GardenerProposal[];
 }
@@ -60,5 +62,6 @@ export interface BoardTaskInput {
   title: string;
   description?: string;
   status: string;
-  minElo: number;
+  difficulty: TaskDifficulty;
+  updatedAt?: number;
 }

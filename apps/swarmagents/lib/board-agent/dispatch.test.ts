@@ -7,7 +7,7 @@ import { dispatchTaskToVm } from "./dispatch";
 
 const task: SwarmTask = {
   id: "task_docs", title: "Improve docs", description: "Document the API example", constraints: ["Keep the example short"],
-  difficulty: "medium", minElo: 1200, status: "open", createdAt: 1, updatedAt: 1,
+  difficulty: "medium", status: "open", createdAt: 1, updatedAt: 1,
 };
 
 function stubStart(t: TestContext, start: RuntimeManager["start"]) {

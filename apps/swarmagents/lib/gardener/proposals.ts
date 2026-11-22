@@ -86,9 +86,9 @@ export function proposalsFromBoard(input: {
       title: task.title,
       summary: task.description?.trim()
         ? task.description.trim()
-        : `Open swarm-board task ${task.id} matches this agent's Elo (min ${task.minElo}). Claim waits for one-click approval.`,
+        : `Open swarm-board task ${task.id} (difficulty: ${task.difficulty}). Claim waits for one-click approval.`,
       taskId: task.id,
-      minElo: task.minElo,
+      difficulty: task.difficulty,
       status: "awaiting_approval",
       createdAt: input.now,
     });

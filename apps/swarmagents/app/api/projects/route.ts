@@ -11,8 +11,8 @@
 
 import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../lib/auth";
-import { noStoreJson } from "../../../lib/http";
-import { ProjectError, createProject, listProjects } from "../../../lib/projects/store";
+import { noStoreJson, noStoreRouteError, readJsonObject } from "../../../lib/http";
+import { createProject, listProjects } from "../../../lib/projects/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -22,10 +22,6 @@ const MAX_BODY_SIZE = 64 * 1024;
 function caller(req: NextRequest): string | null {
   const user = req.headers.get(USER_HEADER);
   return user && user.length > 0 && user.length <= 128 ? user : null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export async function GET(req: NextRequest) {
@@ -38,24 +34,9 @@ export async function POST(req: NextRequest) {
   const user = caller(req);
   if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
 
-  let text: string;
-  try {
-    text = await req.text();
-  } catch {
-    return noStoreJson({ error: "Could not read request body." }, { status: 400 });
-  }
-  if (text.length > MAX_BODY_SIZE) {
-    return noStoreJson({ error: "Request body too large." }, { status: 413 });
-  }
-  let body: unknown;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    return noStoreJson({ error: "Invalid JSON body." }, { status: 400 });
-  }
-  if (!isRecord(body)) {
-    return noStoreJson({ error: "Body must be a JSON object." }, { status: 400 });
-  }
+  const parsed = await readJsonObject(req, MAX_BODY_SIZE);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
 
   try {
     const project = createProject(user, {
@@ -66,9 +47,6 @@ export async function POST(req: NextRequest) {
     });
     return noStoreJson({ project }, { status: 201 });
   } catch (err) {
-    if (err instanceof ProjectError) {
-      return noStoreJson({ error: err.message }, { status: err.status });
-    }
-    return noStoreJson({ error: "Could not create the project." }, { status: 500 });
+    return noStoreRouteError(err, "Could not create the project.");
   }
 }

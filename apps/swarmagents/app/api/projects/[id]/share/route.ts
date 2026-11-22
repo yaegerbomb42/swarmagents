@@ -11,9 +11,8 @@
 
 import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../../lib/auth";
-import { noStoreJson } from "../../../../../lib/http";
+import { noStoreJson, noStoreRouteError } from "../../../../../lib/http";
 import {
-  ProjectError,
   createShareLink,
   getProject,
   isProjectId,
@@ -42,10 +41,7 @@ export async function POST(req: NextRequest, context: { params: Promise<{ id: st
     const share = createShareLink(user, id);
     return noStoreJson({ share: { token: share.token, createdAt: share.createdAt } });
   } catch (err) {
-    if (err instanceof ProjectError) {
-      return noStoreJson({ error: err.message }, { status: err.status });
-    }
-    return noStoreJson({ error: "Could not create the share link." }, { status: 500 });
+    return noStoreRouteError(err, "Could not create the share link.");
   }
 }
 

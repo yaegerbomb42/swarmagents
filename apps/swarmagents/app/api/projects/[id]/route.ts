@@ -11,14 +11,8 @@
 
 import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../lib/auth";
-import { noStoreJson } from "../../../../lib/http";
-import {
-  ProjectError,
-  deleteProject,
-  getProject,
-  isProjectId,
-  updateProject,
-} from "../../../../lib/projects/store";
+import { noStoreJson, noStoreRouteError, readJsonObject } from "../../../../lib/http";
+import { deleteProject, getProject, isProjectId, updateProject } from "../../../../lib/projects/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -28,10 +22,6 @@ const MAX_BODY_SIZE = 128 * 1024;
 function caller(req: NextRequest): string | null {
   const user = req.headers.get(USER_HEADER);
   return user && user.length > 0 && user.length <= 128 ? user : null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function notFound() {
@@ -54,24 +44,9 @@ export async function PATCH(req: NextRequest, context: { params: Promise<{ id: s
   const { id } = await context.params;
   if (!isProjectId(id)) return notFound();
 
-  let text: string;
-  try {
-    text = await req.text();
-  } catch {
-    return noStoreJson({ error: "Could not read request body." }, { status: 400 });
-  }
-  if (text.length > MAX_BODY_SIZE) {
-    return noStoreJson({ error: "Request body too large." }, { status: 413 });
-  }
-  let body: unknown;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    return noStoreJson({ error: "Invalid JSON body." }, { status: 400 });
-  }
-  if (!isRecord(body)) {
-    return noStoreJson({ error: "Body must be a JSON object." }, { status: 400 });
-  }
+  const parsed = await readJsonObject(req, MAX_BODY_SIZE);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
 
   try {
     const project = updateProject(user, id, {
@@ -85,10 +60,7 @@ export async function PATCH(req: NextRequest, context: { params: Promise<{ id: s
     });
     return noStoreJson({ project });
   } catch (err) {
-    if (err instanceof ProjectError) {
-      return noStoreJson({ error: err.message }, { status: err.status });
-    }
-    return noStoreJson({ error: "Could not update the project." }, { status: 500 });
+    return noStoreRouteError(err, "Could not update the project.");
   }
 }
 

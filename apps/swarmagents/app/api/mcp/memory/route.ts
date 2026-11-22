@@ -15,19 +15,22 @@
 
 import { NextResponse, type NextRequest } from "next/server";
 import { providerOwner } from "@/lib/providers/owner";
-import { MEMORY_TOOL_SCHEMAS, runMemoryTool } from "@/lib/memory/tools";
+import { JsonBodyError, readJsonBody } from "@/lib/http";
+import { MEMORY_TOOL_SCHEMAS } from "@/lib/memory/tools";
+import {
+  dispatchMcpRequest,
+  isRpcId,
+  NO_STORE,
+  type RpcId,
+} from "@/lib/memory/mcp-rpc";
 
 export const dynamic = "force-dynamic";
 
-const MAX_BODY_SIZE = 256 * 1024;
-const NO_STORE = { "cache-control": "no-store" } as const;
-
-function jsonRpcError(code: number, message: string, id: unknown, status = 200) {
-  return NextResponse.json({ jsonrpc: "2.0", error: { code, message }, id: id ?? null }, { status });
-}
-
-function jsonRpcResponse(payload: { result?: unknown }, id: unknown) {
-  return NextResponse.json({ jsonrpc: "2.0", ...payload, id }, { status: 200, headers: NO_STORE });
+function jsonRpcError(code: number, message: string, id: RpcId, status = 200) {
+  return NextResponse.json(
+    { jsonrpc: "2.0", error: { code, message }, id: id ?? null },
+    { status, headers: NO_STORE },
+  );
 }
 
 /** GET: describe the server (handy for a quick health check). */
@@ -47,75 +50,45 @@ export function GET(request: NextRequest) {
   );
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export async function POST(request: NextRequest) {
   const owner = providerOwner(request);
   if (!owner) {
     return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
   }
 
-  let text: string;
-  try {
-    text = await request.text();
-  } catch {
-    return jsonRpcError(-32700, "Parse error", null, 400);
-  }
-  if (text.length > MAX_BODY_SIZE) {
-    return jsonRpcError(-32602, "Request body too large", null);
-  }
-
   let body: unknown;
   try {
-    body = JSON.parse(text);
-  } catch {
+    body = await readJsonBody(request);
+  } catch (err) {
+    if (err instanceof JsonBodyError && err.status === 413) {
+      return jsonRpcError(-32602, "Request body too large", null);
+    }
     return jsonRpcError(-32700, "Parse error", null, 400);
   }
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return jsonRpcError(-32600, "Invalid Request", null);
+
+  if (!isRecord(body)) return jsonRpcError(-32600, "Invalid Request", null);
+  const { method, params, id: rawId } = body as { method?: unknown; params?: unknown; id?: unknown; jsonrpc?: unknown };
+  if (rawId !== undefined && !isRpcId(rawId)) {
+    // Retain the established tools/call validation code without echoing the
+    // invalid ID in either error envelope.
+    return method === "tools/call"
+      ? jsonRpcError(-32602, "Invalid params: id must be a string, number, or null", null)
+      : jsonRpcError(-32600, "Invalid Request", null);
+  }
+  const id = isRpcId(rawId) ? (rawId as RpcId) : null;
+  if (body.jsonrpc !== "2.0" || typeof method !== "string" || !method.trim()) {
+    return jsonRpcError(-32600, "Invalid Request", id);
   }
 
-  const payload = body as { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown };
-  if (payload.jsonrpc !== "2.0") {
-    return jsonRpcError(-32600, "Invalid Request", payload.id ?? null);
+  // JSON-RPC notifications have no response body. Explicit null is still a
+  // request ID for clients that use it.
+  if (rawId === undefined) {
+    return new NextResponse(null, { status: 202, headers: NO_STORE });
   }
 
-  const id = payload.id ?? null;
-  const method = typeof payload.method === "string" ? payload.method : "";
-
-  if (method === "initialize") {
-    return jsonRpcResponse(
-      {
-        result: {
-          protocolVersion: "2024-11-05",
-          capabilities: { tools: {} },
-          serverInfo: { name: "swarm-memory", version: "1.0.0" },
-        },
-      },
-      id,
-    );
-  }
-
-  if (method === "ping") {
-    return jsonRpcResponse({ result: {} }, id);
-  }
-
-  if (method === "tools/list") {
-    return jsonRpcResponse({ result: { tools: MEMORY_TOOL_SCHEMAS } }, id);
-  }
-
-  if (method === "tools/call") {
-    const params = (payload.params ?? {}) as { name?: unknown; arguments?: unknown };
-    const name = typeof params.name === "string" ? params.name : "";
-    const answer = await runMemoryTool(owner, name, params.arguments ?? {});
-    return jsonRpcResponse(
-      {
-        result: {
-          content: [{ type: "text", text: JSON.stringify(answer) }],
-          isError: answer.ok !== true,
-        },
-      },
-      id,
-    );
-  }
-
-  return jsonRpcError(-32601, "Method not found", id);
+  return dispatchMcpRequest(method, params, id, owner);
 }

@@ -7,6 +7,7 @@ import { NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../lib/auth";
 import { configureProviderStorePaths } from "../../../../lib/providers/store";
 import { POST } from "./route";
+import { setMemoryToolRunnerForTesting } from "../../../../lib/memory/mcp-rpc";
 
 const ALICE = "local_alice@example.com";
 const BOB = "local_bob@example.com";
@@ -94,4 +95,68 @@ test("a malformed request is rejected", async () => {
   assert.equal(res.status, 200);
   const body = (await res.json()) as { error: { code: number } };
   assert.equal(body.error.code, -32600);
+});
+
+test("a notification (no id) gets a 202 with no body and no-store", async () => {
+  const res = await POST(rpc({ jsonrpc: "2.0", method: "notifications/initialized" }));
+  assert.equal(res.status, 202);
+  assert.equal(await res.text(), "");
+  assert.equal(res.headers.get("cache-control"), "no-store");
+});
+
+test("a ping notification is answered with 202, not a JSON-RPC response", async () => {
+  const res = await POST(rpc({ jsonrpc: "2.0", method: "ping" }));
+  assert.equal(res.status, 202);
+  assert.equal(await res.text(), "");
+});
+
+test("error responses carry no-store", async () => {
+  // Unknown method.
+  const unknown = await POST(rpc({ jsonrpc: "2.0", id: 1, method: "no_such_method" }));
+  assert.equal(unknown.status, 200);
+  assert.equal(unknown.headers.get("cache-control"), "no-store");
+  const unknownBody = (await unknown.json()) as { error: { code: number } };
+  assert.equal(unknownBody.error.code, -32601);
+
+  // Invalid request (bad jsonrpc version) also carries no-store.
+  const bad = await POST(rpc({ jsonrpc: "3.0", id: 1, method: "tools/list" }));
+  assert.equal(bad.status, 200);
+  assert.equal(bad.headers.get("cache-control"), "no-store");
+
+  // An invalid-id request is rejected with no-store but without echoing the id.
+  const badId = await POST(rpc({ jsonrpc: "2.0", id: { bad: true }, method: "tools/list" } as unknown as Record<string, unknown>));
+  assert.equal(badId.status, 200);
+  assert.equal(badId.headers.get("cache-control"), "no-store");
+});
+
+test("invalid tools/call params are rejected with -32602", async () => {
+  const res = await POST(rpc({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: 42 } }));
+  const body = (await res.json()) as { error: { code: number } };
+  assert.equal(body.error.code, -32602);
+});
+
+test("an invalid id is rejected without echoing the id", async () => {
+  const res = await POST(rpc({ jsonrpc: "2.0", id: { bad: true }, method: "tools/list" } as unknown as Record<string, unknown>));
+  const body = (await res.json()) as { error: { code: number } };
+  assert.equal(body.error.code, -32600);
+});
+
+test("a tool throw is mapped to -32603 and carries no-store", async () => {
+  const throwing = async () => {
+    throw new Error("disk exploded");
+  };
+  setMemoryToolRunnerForTesting(throwing as never);
+  let res: Awaited<ReturnType<typeof POST>>;
+  try {
+    res = await POST(
+      rpc({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "memory_write", arguments: { fact: "x" } } }),
+    );
+  } finally {
+    setMemoryToolRunnerForTesting();
+  }
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("cache-control"), "no-store");
+  const body = (await res.json()) as { error: { code: number; message: string } };
+  assert.equal(body.error.code, -32603);
+  assert.equal(body.id, 1);
 });

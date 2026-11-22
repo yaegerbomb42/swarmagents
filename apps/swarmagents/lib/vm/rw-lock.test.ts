@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RwLock } from "./rw-lock";
+import { LockTimeoutError, RwLock } from "./rw-lock";
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -93,5 +93,73 @@ test("queued readers are granted together after the writer releases", async () =
   await Promise.all(readers);
   assert.equal(granted, 2);
   lock.releaseRead();
+  lock.releaseRead();
+});
+
+// --- Acquire timeouts (hardening: a leaked release must not wedge waiters) ---
+
+test("acquireWrite times out while a reader holds the lock", async () => {
+  const lock = new RwLock();
+  await lock.acquireRead();
+  await assert.rejects(lock.acquireWrite(20), (err: unknown) => {
+    assert.ok(err instanceof LockTimeoutError);
+    assert.equal((err as LockTimeoutError).code, "LOCK_TIMEOUT");
+    return true;
+  });
+  lock.releaseRead();
+  // The lock is still fully usable after a timeout.
+  await lock.acquireWrite();
+  lock.releaseWrite();
+});
+
+test("acquireRead times out while a writer holds the lock", async () => {
+  const lock = new RwLock();
+  await lock.acquireWrite();
+  await assert.rejects(lock.acquireRead(20), LockTimeoutError);
+  lock.releaseWrite();
+  await lock.acquireRead();
+  lock.releaseRead();
+});
+
+test("a timed-out writer unblocks readers queued behind it", async () => {
+  const lock = new RwLock();
+  await lock.acquireRead();
+  const writer = lock.acquireWrite(20);
+  let readerGranted = false;
+  const reader = lock.acquireRead().then(() => {
+    readerGranted = true;
+  });
+  await tick();
+  assert.equal(readerGranted, false, "reader queues behind the writer (fairness)");
+  await assert.rejects(writer, LockTimeoutError);
+  // Writer dequeued: the reader may now share with the existing reader.
+  assert.equal(await settlesWithin(reader), true, "reader granted once the writer times out");
+  lock.releaseRead();
+  lock.releaseRead();
+  await lock.acquireWrite();
+  lock.releaseWrite();
+});
+
+test("a waiter granted before its timeout does not reject", async () => {
+  const lock = new RwLock();
+  await lock.acquireRead();
+  const writer = lock.acquireWrite(1_000);
+  lock.releaseRead();
+  assert.equal(await settlesWithin(writer), true);
+  lock.releaseWrite();
+});
+
+test("an infinite timeout waits like no timeout", async () => {
+  const lock = new RwLock();
+  await lock.acquireWrite();
+  let granted = false;
+  const reader = lock.acquireRead(Number.POSITIVE_INFINITY).then(() => {
+    granted = true;
+  });
+  await tick();
+  await tick();
+  assert.equal(granted, false, "Infinity must not arm a near-immediate timer");
+  lock.releaseWrite();
+  assert.equal(await settlesWithin(reader), true);
   lock.releaseRead();
 });

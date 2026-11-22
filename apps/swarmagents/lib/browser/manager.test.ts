@@ -128,7 +128,7 @@ interface SessionLike {
   frame: null | { frameId: number; jpeg: Buffer; width: number; height: number; capturedAt: number };
   frameSeq: number;
   pendingChange: boolean;
-  lastActivityAt: number;
+  lastUserActivityAt: number;
   lastCaptureAt: number;
   heartbeat: ReturnType<typeof setInterval>;
   unsubscribe: () => void;
@@ -161,7 +161,7 @@ function makeSession(page: Page, context?: BrowserContext): SessionLike {
     frame: null,
     frameSeq: 0,
     pendingChange: false,
-    lastActivityAt: Date.now(),
+    lastUserActivityAt: Date.now(),
     lastCaptureAt: 0,
     heartbeat: null as unknown as ReturnType<typeof setInterval>,
     unsubscribe: () => {},
@@ -487,4 +487,117 @@ test("evaluate returns the page value and refuses bad expressions", async () => 
   assert.equal(bad.ok, false);
   if (!bad.ok) assert.match(bad.reason, /1\.\.8192/);
   await manager.close(RUN);
+});
+
+test("idle sessions are pruned after the idle timeout, and heartbeat captures do not resurrect them", async () => {
+  const { page } = fakePage({ url: PUBLIC_URL });
+  const session = makeSession(page);
+  const manager = new FakeBrowserManager(session);
+
+  // Navigate to register the session with a fresh user-activity timestamp.
+  assert.equal((await manager.navigate(RUN, PUBLIC_URL)).ok, true);
+  assert.ok(await manager.getFrame(RUN));
+
+  // Simulate an idle period longer than the session idle timeout.
+  const idleMs = 5 * 60 * 1000; // SESSION_IDLE_MS
+  session.lastUserActivityAt = Date.now() - idleMs - 5000;
+  session.pendingChange = true;
+
+  // A background heartbeat-style capture must not bump user activity.
+  await (manager as unknown as { captureFrame: (r: string, s: SessionLike, f: boolean) => Promise<unknown> }).captureFrame(
+    RUN, session, false,
+  );
+  assert.ok(
+    Date.now() - session.lastUserActivityAt > idleMs,
+    "heartbeat capture must not bump user activity",
+  );
+
+  const closed = await manager.prune();
+  assert.equal(closed, 1);
+  assert.equal(await manager.getFrame(RUN), null);
+  await manager.close(RUN);
+});
+
+test("a forced capture counts as user activity; a heartbeat capture does not", async () => {
+  const { page } = fakePage({ url: PUBLIC_URL });
+  const session = makeSession(page);
+  const manager = new FakeBrowserManager(session);
+  const captureFrame = (forced: boolean) =>
+    (manager as unknown as { captureFrame: (r: string, s: SessionLike, f: boolean) => Promise<unknown> }).captureFrame(
+      RUN, session, forced,
+    );
+
+  session.pendingChange = true;
+  const before = session.lastUserActivityAt;
+  await captureFrame(false); // heartbeat-style: must not bump
+  assert.equal(session.lastUserActivityAt, before, "heartbeat capture must not bump user activity");
+
+  await captureFrame(true); // forced: must bump
+  assert.ok(session.lastUserActivityAt >= before, "forced capture must count as user activity");
+  await manager.close(RUN);
+});
+
+/** Minimal fake Browser used to drive launcher-recovery tests. */
+function fakeBrowserHandle() {
+  const handlers: Record<string, Array<(arg: never) => void>> = {};
+  let closed = false;
+  const browser = {
+    on: (event: string, handler: (arg: never) => void) => {
+      (handlers[event] ??= []).push(handler);
+    },
+    close: async () => { closed = true; },
+    isClosed: () => closed,
+    fire: (event: string, arg: never = undefined as never) => {
+      for (const handler of handlers[event] ?? []) handler(arg);
+    },
+  };
+  return browser;
+}
+
+class LauncherProbeManager extends BrowserManager {
+  launcherCalls = 0;
+  private readonly launcher: () => Promise<Browser>;
+  constructor(launcher: () => Promise<Browser>) {
+    super({ bus: telemetryBus, launch: () => launcher() });
+    this.launcher = launcher;
+  }
+  async probeBrowser(): Promise<Browser> {
+    return this.browser();
+  }
+}
+
+test("a failed Chromium launch does not poison later sessions", async () => {
+  const fakeBrowser = fakeBrowserHandle();
+  const manager = new LauncherProbeManager(async () => {
+    manager.launcherCalls += 1;
+    if (manager.launcherCalls === 1) throw new Error("launch boom");
+    return fakeBrowser as unknown as Browser;
+  });
+
+  await assert.rejects(() => manager.probeBrowser(), /launch boom/);
+  // The second attempt must retry fresh rather than reuse the rejected promise.
+  const browser = await manager.probeBrowser();
+  assert.equal(manager.launcherCalls, 2);
+  assert.equal(browser, fakeBrowser as unknown as Browser);
+  await manager.close("run_nonexistent");
+});
+
+test("a mid-run browser disconnect does not poison later sessions", async () => {
+  const first = fakeBrowserHandle();
+  const second = fakeBrowserHandle();
+  const manager = new LauncherProbeManager(async () => {
+    manager.launcherCalls += 1;
+    return (manager.launcherCalls === 1 ? first : second) as unknown as Browser;
+  });
+
+  const browserA = await manager.probeBrowser();
+  assert.equal(manager.launcherCalls, 1);
+
+  // Simulate the browser disconnecting (crash / external close).
+  first.fire("disconnected");
+
+  const browserB = await manager.probeBrowser();
+  assert.equal(manager.launcherCalls, 2, "disconnect must clear the cached launch");
+  assert.equal(browserB, second as unknown as Browser);
+  await manager.close("run_nonexistent");
 });

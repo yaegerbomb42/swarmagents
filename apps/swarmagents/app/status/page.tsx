@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { healthSnapshot } from "@/lib/health";
 
 export const dynamic = "force-dynamic";
@@ -7,6 +8,24 @@ export const metadata: Metadata = {
   title: "Status — SwarmAgents",
   description: "Public health summary for this SwarmAgents deployment.",
 };
+
+function formatUptime(totalSeconds: number): string {
+  const total = Math.max(0, Math.floor(totalSeconds));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    const restMinutes = minutes % 60;
+    return restMinutes > 0 ? `${hours}h ${restMinutes}m` : `${hours}h`;
+  }
+  const parts = [`${Math.floor(hours / 24)}d`];
+  const restHours = hours % 24;
+  const restMinutes = minutes % 60;
+  if (restHours > 0) parts.push(`${restHours}h`);
+  if (restMinutes > 0) parts.push(`${restMinutes}m`);
+  return parts.join(" ");
+}
 
 /**
  * Public status page: a plain-language summary built from the same
@@ -29,7 +48,7 @@ export default function StatusPage() {
     },
     {
       label: "Uptime",
-      value: `${Math.floor(health.uptimeSec / 60)} min`,
+      value: formatUptime(health.uptimeSec),
       ok: null,
     },
     {
@@ -75,7 +94,16 @@ export default function StatusPage() {
             {rows.map((row) => (
               <div key={row.label} className="flex items-baseline justify-between gap-4 px-5 py-3.5">
                 <dt className="text-xs uppercase tracking-widest text-white/40">{row.label}</dt>
-                <dd className="text-right text-sm text-white/85">{row.value}</dd>
+                <dd className="flex items-center justify-end gap-2 text-right text-sm text-white/85">
+                  {row.ok !== null && (
+                    <span
+                      aria-hidden="true"
+                      className={`h-2 w-2 shrink-0 rounded-full ${row.ok ? "bg-emerald-400/70" : "bg-amber-400/70"}`}
+                    />
+                  )}
+                  <span>{row.value}</span>
+                  {row.ok !== null && <span className="sr-only">{row.ok ? "OK" : "Needs attention"}</span>}
+                </dd>
               </div>
             ))}
           </dl>
@@ -89,9 +117,9 @@ export default function StatusPage() {
           .
         </p>
         <p className="mt-10 border-t border-white/10 pt-6 text-xs text-white/40">
-          <a href="/" className="text-cyan-300 hover:text-cyan-200">
+          <Link href="/" className="text-cyan-300 hover:text-cyan-200">
             ← Back to the console
-          </a>
+          </Link>
         </p>
       </div>
     </main>

@@ -19,6 +19,7 @@ import {
   setByocTokenStoreForTesting,
 } from "../../../../lib/byoc/tokens";
 import { setByocHubForTesting } from "../../../../lib/byoc/hub";
+import { configureAuditPath, readAuditEntries } from "../../../../lib/audit";
 
 function request(path: string, init: RequestInit = {}, user: string | null = "alice"): NextRequest {
   const headers = new Headers(init.headers);
@@ -30,18 +31,20 @@ function request(path: string, init: RequestInit = {}, user: string | null = "al
   });
 }
 
-function install(): { hub: ByocHub; store: ByocTokenStore } {
+function install(): { hub: ByocHub; store: ByocTokenStore; dir: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-byoc-api-"));
   const store = new ByocTokenStore({ file: path.join(dir, "byoc.json") });
   const hub = new ByocHub({ port: 0, tokens: store, heartbeatMs: 60_000 });
   setByocTokenStoreForTesting(store);
   setByocHubForTesting(hub);
-  return { hub, store };
+  configureAuditPath(path.join(dir, "audit.jsonl"));
+  return { hub, store, dir };
 }
 
 test.afterEach(() => {
   setByocTokenStoreForTesting(null);
   setByocHubForTesting(null);
+  configureAuditPath(undefined);
 });
 
 test("pair: creating a pairing code needs a signed-in caller", async () => {
@@ -137,3 +140,54 @@ test("pair: the node list never leaks a token", async () => {
   assert.ok(!text.includes(paired.token), "the device token must never be returned");
   assert.ok(!text.includes(store.listDevices("alice")[0].tokenHash), "the token hash must not leak");
 });
+
+test("pair: name is persisted and applied when the node redeems without a name", async () => {
+  const { store } = install();
+  const res = await POST(
+    request("/api/byoc/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "desk-box" }),
+    }),
+  );
+  assert.equal(res.status, 201);
+  const body = (await res.json()) as { code: string; name: string };
+  assert.equal(body.name, "desk-box");
+
+  const paired = store.redeemPairingCode(body.code, "  ");
+  assert.equal(paired.ok, true);
+  if (!paired.ok) return;
+  assert.equal(paired.device.name, "desk-box");
+
+  const audit = readAuditEntries("alice").find((e) => e.action === "computer.pair");
+  assert.ok(audit);
+});
+
+test("pair: malformed JSON returns 400", async () => {
+  install();
+  const res = await POST(
+    request("/api/byoc/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{not-json",
+    }),
+  );
+  assert.equal(res.status, 400);
+  const body = (await res.json()) as { error: string };
+  assert.match(body.error, /Invalid JSON/i);
+});
+
+test("pair: revoke writes a computer.revoke audit entry", async () => {
+  const { store } = install();
+  const { code } = store.createPairingCode("alice");
+  const paired = store.redeemPairingCode(code, "to-revoke");
+  assert.equal(paired.ok, true);
+  if (!paired.ok) return;
+
+  const res = await DELETE(request(`/api/byoc/pair?deviceId=${paired.device.id}`, { method: "DELETE" }));
+  assert.equal(res.status, 200);
+  const audit = readAuditEntries("alice").find((e) => e.action === "computer.revoke");
+  assert.ok(audit);
+  assert.equal(audit!.target, paired.device.id);
+});
+

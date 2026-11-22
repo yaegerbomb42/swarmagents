@@ -288,3 +288,55 @@ test("turn-error logging redacts the caller's BYOK keys", async () => {
   const stranger = boardAgentLogRedactor("nobody@example.test");
   assert.equal(stranger("plain failure, no secrets"), "plain failure, no secrets");
 });
+
+test("releases activeTurns and lock in finally block if saveConversation throws, allowing subsequent turns", async () => {
+  configureFakeProvider();
+  replies.push(providerReply("Reply 1"));
+  replies.push(providerReply("Reply 2"));
+
+  const { conversationId } = await chatReply(await post({ message: "Initial message" }));
+
+  // Simulate saveConversation failure by mocking renameSync to fail on conversation saves
+  const origRename = fs.renameSync;
+  let failRename = true;
+  mock.method(fs, "renameSync", (oldPath: fs.PathLike, newPath: fs.PathLike) => {
+    if (failRename && String(newPath).includes("conversations-")) {
+      failRename = false;
+      throw new Error("Disk full simulation on rename");
+    }
+    return origRename(oldPath, newPath);
+  });
+
+  replies.push(providerReply("Reply 3"));
+  replies.push(providerReply("Reply 4"));
+
+  const res1 = await post({ message: "Followup 1", conversationId });
+  assert.equal(res1.status, 503);
+
+  // Turn 2 for the same conversation should NOT return 409, proving the key was deleted in finally
+  const res2 = await post({ message: "Followup 2", conversationId });
+  assert.equal(res2.status, 200);
+});
+
+test("lock is held across the turn boundary preventing concurrent turns", async () => {
+  configureFakeProvider();
+  replies.push(providerReply("Init."));
+  const { conversationId } = await chatReply(await post({ message: "Setup conversation" }));
+
+  let enter!: () => void;
+  let finish!: (response: Response) => void;
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  const pending = new Promise<Response>((resolve) => { finish = resolve; });
+  replies.push(() => { enter(); return pending; });
+
+  const first = post({ message: "Holding lock", conversationId });
+  await entered;
+
+  const second = await post({ message: "Trying while locked", conversationId });
+  // Concurrent turn on same conversation returns 409 Conflict
+  assert.equal(second.status, 409);
+
+  finish(providerReply("Finished"));
+  const res1 = await first;
+  assert.equal(res1.status, 200);
+});

@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { NO_STORE, routeCaller, unauthorizedResponse } from "@/lib/auth";
 import { runBoardAgent } from "@/lib/board-agent/agent";
 import { boardAgentLogRedactor } from "@/lib/board-agent/redact";
+import { withTurnLock } from "@/lib/board-agent/chat-lock";
 import { getConversation, listConversations, saveConversation } from "@/lib/board-agent/store";
 import type { BoardAgentConversation } from "@/lib/board-agent/types";
 import { JsonBodyError } from "@/lib/http";
@@ -77,41 +78,44 @@ export async function POST(request: Request): Promise<NextResponse> {
   const turnKey = JSON.stringify([userId, id]);
   if (activeTurns.has(turnKey)) return json({ error: "A turn is already in progress for this conversation." }, 409);
   activeTurns.add(turnKey);
+
   try {
-    const now = Date.now();
-    let conversation: BoardAgentConversation | undefined;
-    try {
-      conversation = conversationId === undefined
-        ? { id, userId, title: message.trim().replace(/\s+/g, " ").slice(0, 80), messages: [], createdAt: now, updatedAt: now }
-        : getConversation(userId, id);
-    } catch {
-      return json({ error: STORAGE_ERROR }, 503);
-    }
-    if (!conversation) return json({ error: "Conversation not found." }, 404);
-
-    let result: Awaited<ReturnType<typeof runBoardAgent>>;
-    try {
-      result = await runBoardAgent(userId, conversation, message, { signal: request.signal });
-    } catch (err) {
-      const isAbort = Boolean(request.signal?.aborted) ||
-        (err instanceof Error && (err.name === "AbortError" || err.message.toLowerCase().includes("aborted")));
-      if (isAbort) {
-        return json({ error: "Request aborted." }, 499);
+    return await withTurnLock(turnKey, async () => {
+      const now = Date.now();
+      let conversation: BoardAgentConversation | undefined;
+      try {
+        conversation = conversationId === undefined
+          ? { id, userId, title: message.trim().replace(/\s+/g, " ").slice(0, 80), messages: [], createdAt: now, updatedAt: now }
+          : getConversation(userId, id);
+      } catch {
+        return json({ error: STORAGE_ERROR }, 503);
       }
-      const redact = boardAgentLogRedactor(userId);
-      const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-      console.error("[board-agent] turn execution failed:", redact(msg));
-      return json({ error: "Board agent encountered an error processing your request." }, 500);
-    }
+      if (!conversation) return json({ error: "Conversation not found." }, 404);
 
-    const { reply, taskIds, runIds, providerStatus } = result;
-    try {
-      saveConversation(userId, conversation);
-    } catch {
-      return json({ error: STORAGE_ERROR }, 503);
-    }
+      let result: Awaited<ReturnType<typeof runBoardAgent>>;
+      try {
+        result = await runBoardAgent(userId, conversation, message, { signal: request.signal });
+      } catch (err) {
+        const isAbort = Boolean(request.signal?.aborted) ||
+          (err instanceof Error && (err.name === "AbortError" || err.message.toLowerCase().includes("aborted")));
+        if (isAbort) {
+          return json({ error: "Request aborted." }, 499);
+        }
+        const redact = boardAgentLogRedactor(userId);
+        const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+        console.error("[board-agent] turn execution failed:", redact(msg));
+        return json({ error: "Board agent encountered an error processing your request." }, 500);
+      }
 
-    return json({ reply, conversationId: id, taskIds, runIds }, providerStatus);
+      const { reply, taskIds, runIds, providerStatus } = result;
+      try {
+        saveConversation(userId, conversation);
+      } catch {
+        return json({ error: STORAGE_ERROR }, 503);
+      }
+
+      return json({ reply, conversationId: id, taskIds, runIds }, providerStatus);
+    });
   } finally {
     activeTurns.delete(turnKey);
   }

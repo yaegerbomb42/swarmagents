@@ -58,11 +58,13 @@ test("outlineSymbols finds declarations with line numbers and export flags", () 
       [7, true],
       [11, false],
       [15, true],
+      [16, false],
       [18, true],
       [19, false],
     ],
   );
   assert.match(symbols[1].signature, /^export async function run/);
+  assert.match(symbols[4].signature, /^method\(\)/);
 });
 
 test("getFileOutline renders a header and L<n> rows, and caps the symbol count", () => {
@@ -186,4 +188,33 @@ test("buildWorkingSet orders by priority, falls back to a head window, and repor
   const none = buildWorkingSet([a], 0);
   assert.equal(none.text, "");
   assert.deepEqual(none.omitted, ["a.ts"]);
+});
+
+test("outline includes class methods but excludes control-flow keywords", () => {
+  const content = [
+    "export class Service {",
+    "  async fetch(id: string) {",
+    "    if (id) {",
+    "      for (const x of []) {}",
+    "    }",
+    "  }",
+    "  static build() {",
+    "    return new Service();",
+    "  }",
+    "}",
+  ].join("\n");
+  const outline = getFileOutline({ path: "svc.ts", content });
+  assert.match(outline, /L2: async fetch\(id: string\)/);
+  assert.match(outline, /L7: static build\(\)/);
+  assert.doesNotMatch(outline, /\bif\b/);
+  assert.doesNotMatch(outline, /\bfor\b/);
+});
+
+test("applySlicePatch preserves CRLF line endings and blank lines", () => {
+  const content = "class A {\r\n\r\n  run() {\r\n    return 1;\r\n  }\r\n}\r\n";
+  const out = applySlicePatch(content, "  run() {\r\n    return 1;\r\n  }", "  run() {\r\n    return 2;\r\n  }");
+  assert.ok(out.includes("\r\n"), "keeps CRLF");
+  assert.ok(!/(^|[^\r])\n/.test(out), "does not mix LF into CRLF file");
+  assert.ok(out.startsWith("class A {\r\n\r\n"), "preserves leading blank line");
+  assert.match(out, /return 2;/);
 });

@@ -66,6 +66,14 @@ export interface SectionResult {
 const SIGNATURE_RE =
   /^\s*(export\s+)?(default\s+)?(declare\s+)?(abstract\s+)?(async\s+)?(function\*?|class|interface|type|enum|const|let|var|def|fn|pub\s+fn)\s+([A-Za-z0-9_$]+)/;
 
+/**
+ * TS/JS class/object method declarations. Deliberately excludes control-flow
+ * keywords so `if (...) {` inside a body is not mistaken for a symbol.
+ */
+const METHOD_RE =
+  /^\s+(?:public\s+|private\s+|protected\s+|static\s+|readonly\s+|override\s+|abstract\s+|async\s+|get\s+|set\s+)*\*?\s*([A-Za-z_$#][A-Za-z0-9_$#]*)\s*(?:<[^>]*>)?\s*\(/;
+const METHOD_CONTROL_FLOW = new Set(["if", "for", "while", "switch", "catch"]);
+
 /** Max characters kept from a signature line (the mini used 80). */
 const MAX_SIGNATURE_CHARS = 100;
 
@@ -78,13 +86,26 @@ export function outlineSymbols(content: string): OutlineSymbol[] {
   const out: OutlineSymbol[] = [];
   splitLines(content).forEach((line, idx) => {
     const match = line.match(SIGNATURE_RE);
-    if (!match) return;
-    // Indented const/let/var are locals inside a body, not symbols worth an
-    // outline row (the mini listed them, which flooded outlines with noise).
-    if (/^(const|let|var)$/.test(match[6]) && /^\s/.test(line)) return;
+    if (match) {
+      // Indented const/let/var are locals inside a body, not symbols worth an
+      // outline row (the mini listed them, which flooded outlines with noise).
+      if (/^(const|let|var)$/.test(match[6]) && /^\s/.test(line)) return;
+      out.push({
+        line: idx + 1,
+        exported: Boolean(match[1]),
+        signature: line.trim().slice(0, MAX_SIGNATURE_CHARS),
+      });
+      return;
+    }
+    const method = line.match(METHOD_RE);
+    if (!method) return;
+    const name = method[1];
+    if (METHOD_CONTROL_FLOW.has(name)) return;
+    // Method declarations have a body/block; plain calls like `foo(x);` do not.
+    if (!/[{:]/.test(line.slice(line.indexOf("(", line.indexOf(name)) + 1))) return;
     out.push({
       line: idx + 1,
-      exported: Boolean(match[1]),
+      exported: false,
       signature: line.trim().slice(0, MAX_SIGNATURE_CHARS),
     });
   });
@@ -154,8 +175,10 @@ export function applySlicePatch(content: string, target: string, replacement: st
     throw new SlicePatchError(`Patch target matches ${exact} places; add surrounding lines.`, "ambiguous");
   }
 
-  const lines = content.split("\n");
-  const targetLines = target.replace(/\r\n/g, "\n").trim().split("\n").map((l) => l.trim());
+  const eol = content.includes("\r\n") ? "\r\n" : "\n";
+  const lines = content.split(/\r?\n/);
+  const targetLines = target.replace(/\r\n/g, "\n").split("\n").map((l) => l.trim());
+  const replacementLines = replacement.replace(/\r\n/g, "\n").split("\n");
   const hits: number[] = [];
   for (let i = 0; i + targetLines.length <= lines.length; i++) {
     let match = true;
@@ -172,7 +195,7 @@ export function applySlicePatch(content: string, target: string, replacement: st
     throw new SlicePatchError(`Patch target matches ${hits.length} places; add surrounding lines.`, "ambiguous");
   }
   const i = hits[0];
-  return [...lines.slice(0, i), replacement, ...lines.slice(i + targetLines.length)].join("\n");
+  return [...lines.slice(0, i), ...replacementLines, ...lines.slice(i + targetLines.length)].join(eol);
 }
 
 /**

@@ -59,6 +59,10 @@ jobs:
         working-directory: apps/swarmagents
         run: npm run lint
 
+      - name: E2E typecheck
+        working-directory: apps/swarmagents
+        run: npx tsc -p e2e/tsconfig.json
+
       - name: Build
         working-directory: apps/swarmagents
         run: npm run build

@@ -56,16 +56,34 @@ interface FrameHeader {
   headerLen: number;
 }
 
+/** Opcodes defined by RFC 6455 §5.2; everything else is reserved. */
+const VALID_OPCODES = new Set([
+  OP_CONTINUATION,
+  OP_TEXT,
+  OP_BINARY,
+  OP_CLOSE,
+  OP_PING,
+  OP_PONG,
+]);
+
 /**
  * Parse one frame header at `offset`. Returns null when the header itself is
  * not complete yet (the payload may still be incomplete when it returns).
+ *
+ * Throws on protocol violations that must fail the connection (RFC 6455
+ * §5.2/§7.1.7): reserved bits set without a negotiated extension, reserved
+ * opcodes, and malformed control frames.
  */
 function parseFrameHeader(input: Buffer, offset: number): FrameHeader | null {
   if (offset + 2 > input.length) return null;
   const b0 = input[offset];
   const b1 = input[offset + 1];
   const fin = (b0 & 0x80) !== 0;
+  // RSV1–RSV3 must be zero unless an extension defining them was negotiated;
+  // this codec negotiates none, so any set bit is a protocol error.
+  if ((b0 & 0x70) !== 0) throw new Error("Reserved bits set without negotiated extension");
   const opcode = b0 & 0x0f;
+  if (!VALID_OPCODES.has(opcode)) throw new Error(`Reserved opcode 0x${opcode.toString(16)}`);
   const masked = (b1 & 0x80) !== 0;
   let len = b1 & 0x7f;
   let headerLen = 2;
@@ -261,6 +279,11 @@ export function encodeClientFrame(opcode: number, payload: Buffer): Buffer {
 }
 
 function encodeFrameWithMask(opcode: number, payload: Buffer, maskKey: Buffer | null): Buffer {
+  // The opcode occupies the low nibble of the first header byte; anything
+  // outside 0–15 would silently corrupt the FIN/RSV bits.
+  if (!Number.isInteger(opcode) || opcode < 0 || opcode > 0x0f) {
+    throw new Error(`Invalid opcode ${opcode}`);
+  }
   const len = payload.length;
   let header: Buffer;
   const maskBit = maskKey ? 0x80 : 0;
@@ -282,7 +305,13 @@ function encodeFrameWithMask(opcode: number, payload: Buffer, maskKey: Buffer | 
 }
 
 function closePayload(code: number, reason: string): Buffer {
-  const reasonBuf = Buffer.from(reason, "utf8");
+  // Control-frame payloads are capped at 125 bytes (RFC 6455 §5.5); with the
+  // 2-byte status code the reason gets 123. Truncate on a character boundary
+  // so an over-long reason yields a valid frame instead of a protocol error
+  // at the peer.
+  let trimmed = reason;
+  while (Buffer.byteLength(trimmed, "utf8") > 123) trimmed = trimmed.slice(0, -1);
+  const reasonBuf = Buffer.from(trimmed, "utf8");
   const payload = Buffer.alloc(2 + reasonBuf.length);
   payload.writeUInt16BE(code, 0);
   reasonBuf.copy(payload, 2);

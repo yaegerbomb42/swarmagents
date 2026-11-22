@@ -82,6 +82,19 @@ export function configureAuditPath(file: string | undefined): void {
   override = file;
 }
 
+// Guarantee strictly-increasing timestamps across writes: several actions can
+// otherwise land in the same millisecond, and a timestamp cursor that is shared
+// by consecutive entries makes cursor pagination ambiguous (a page boundary can
+// fall inside a run of equal timestamps).
+let lastRecordedTs = 0;
+
+function nextTs(): string {
+  const now = Date.now();
+  const ts = now > lastRecordedTs ? now : lastRecordedTs + 1;
+  lastRecordedTs = ts;
+  return new Date(ts).toISOString();
+}
+
 /** Where audit lines are stored. Read per call so a temp SWARM_HOME set by a test takes effect. */
 export function getAuditFile(): string {
   if (override !== undefined) return override;
@@ -109,7 +122,7 @@ export interface RecordAuditInput {
  */
 export function recordAudit(input: RecordAuditInput): void {
   const entry: AuditEntry = {
-    ts: new Date().toISOString(),
+    ts: nextTs(),
     user: cleanField(input.user) || "unknown",
     action: input.action,
     target: cleanField(input.target),
@@ -140,18 +153,53 @@ function isAuditEntry(value: unknown): value is AuditEntry {
 export interface ReadAuditOptions {
   /** Max entries returned, newest first. Defaults to 200, clamped to 1..1000. */
   limit?: number;
+  /**
+   * Only entries strictly older than this unix-ms timestamp are returned
+   * (the pagination cursor). Entries whose `ts` does not parse are never
+   * dropped by the cursor — they are treated as unfilterable and kept.
+   */
+  beforeTs?: number | null;
+  /** Exact action, or a prefix ending in `*` / `.`. */
+  action?: string;
+  /** Restrict to a result. */
+  result?: AuditResult;
+}
+
+/** Actions match exactly, or by prefix when the filter ends in `*` or `.`. */
+export function auditActionMatches(entryAction: string, filter: string): boolean {
+  if (filter.endsWith("*")) {
+    return entryAction.startsWith(filter.slice(0, -1));
+  }
+  if (filter.endsWith(".")) {
+    return entryAction.startsWith(filter);
+  }
+  return entryAction === filter;
+}
+
+/** Unix ms for an entry's ISO `ts`; NaN when the stored string does not parse. */
+export function auditEntryTsMs(entry: AuditEntry): number {
+  return Date.parse(entry.ts);
 }
 
 /**
- * All audit entries for one caller, newest first. Malformed lines (e.g. a
- * torn trailing line after a crash) are skipped, never fatal. Entries
- * belonging to other users are never returned.
+ * Audit entries for one caller, newest first, optionally filtered. Malformed
+ * lines (e.g. a torn trailing line after a crash) are skipped, never fatal.
+ * Entries belonging to other users are never returned.
+ *
+ * Filtering happens here — across the entire caller's log, not after
+ * truncating to a fixed window — so an entry older than any fixed cap remains
+ * reachable through cursor pagination. Same-timestamp entries keep their
+ * reverse-insertion order (later line first).
  */
 export function readAuditEntries(user: string, options: ReadAuditOptions = {}): AuditEntry[] {
   const limit = Math.min(
     Math.max(Math.floor(options.limit ?? DEFAULT_AUDIT_LIMIT) || DEFAULT_AUDIT_LIMIT, 1),
     MAX_AUDIT_LIMIT,
   );
+  const beforeTs = options.beforeTs ?? null;
+  const actionFilter = options.action;
+  const resultFilter = options.result;
+
   let text: string;
   try {
     text = fs.readFileSync(getAuditFile(), "utf8");
@@ -169,5 +217,20 @@ export function readAuditEntries(user: string, options: ReadAuditOptions = {}): 
       // Skip a torn or hand-edited line; later appends stay valid.
     }
   }
-  return entries.reverse().slice(0, limit);
+
+  // Newest first; equal timestamps keep reverse-insertion order.
+  entries.reverse();
+
+  const out: AuditEntry[] = [];
+  for (const entry of entries) {
+    if (beforeTs !== null) {
+      const ms = auditEntryTsMs(entry);
+      if (!Number.isNaN(ms) && ms >= beforeTs) continue;
+    }
+    if (actionFilter && !auditActionMatches(entry.action, actionFilter)) continue;
+    if (resultFilter && entry.result !== resultFilter) continue;
+    out.push(entry);
+    if (out.length >= limit) break;
+  }
+  return out;
 }

@@ -17,6 +17,7 @@ import { countChurn, parsePatchFiles, unsafePatchPaths, type PatchFile } from ".
 import { findAffectedTests, relativeImports, resolveSpecifier, TRANSITIVE_HOPS } from "./affected";
 import { buildRetryContext, diagnosticSymbols, extractDiagnostic, findDefinition } from "./retry";
 import { writeFileViaExec, type OracleExec } from "./exec";
+import { createScratch } from "./scratch";
 
 const APP = process.cwd();
 const TSC = join(APP, "node_modules/typescript/bin/tsc");
@@ -230,7 +231,7 @@ test("candidates are judged against uncommitted state; a patch that does not app
       ],
       { repoRoot: repo, projectDir: "app", checks: CHECKS, scratchRoot: join(root, "scratch"), log: (l) => logs.push(l) },
     );
-    assert.equal(report.verdicts[0].status === "rejected" && report.verdicts[0].stage, "apply");
+    assert.equal(report.verdicts[0].status === "rejected" && report.verdicts[0].stage, "apply", JSON.stringify(report.verdicts[0]));
     assert.deepEqual(report.landed, ["uses-helper"]);
     assert.ok(logs.includes("oracle: 1/2 candidates rejected; landed uses-helper"));
     assert.match(readFileSync(join(repo, "app/src/math.ts"), "utf8"), /export const four/);
@@ -278,6 +279,116 @@ test("mode 'all' stacks sequential patches; 'best' prefers the smaller passing d
     const bigVerdict = best.verdicts[0];
     assert.equal(bigVerdict.status === "passed" && bigVerdict.landed, false);
     assert.match(bigVerdict.status === "passed" ? bigVerdict.note ?? "" : "", /small has less churn/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("best mode evaluates candidates concurrently within its configured bound", { timeout: 60_000 }, async () => {
+  const { root, repo, cleanup } = makeRepo();
+  try {
+    const candidates = [1, 2, 3, 4].map((n) => ({
+      id: `candidate-${n}`,
+      diff: diffFor(repo, { "app/src/math.ts": `${MATH}export const candidate${n} = ${n};\n` }),
+    }));
+    let active = 0;
+    let maxActive = 0;
+    const trackedExec: OracleExec = async (cmd, opts) => {
+      const isCheck = cmd[0] === process.execPath && cmd[1] === "-e" && cmd[2] === "setTimeout(() => {}, 80)";
+      if (isCheck) {
+        active++;
+        maxActive = Math.max(maxActive, active);
+      }
+      try {
+        return await localExec(cmd, opts);
+      } finally {
+        if (isCheck) active--;
+      }
+    };
+    const report = await runOracleGate(trackedExec, candidates, {
+      repoRoot: repo,
+      projectDir: "app",
+      checks: [{ name: "delay", command: () => [process.execPath, "-e", "setTimeout(() => {}, 80)"] }],
+      bestConcurrency: 2,
+      scratchRoot: join(root, "scratch"),
+    });
+
+    assert.equal(maxActive, 2);
+    assert.deepEqual(report.verdicts.map((v) => v.id), candidates.map((c) => c.id));
+    assert.deepEqual(report.landed.length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("scratch copies tracked changes through an in-VM diff stream", { timeout: 30_000 }, async () => {
+  const { root, repo, cleanup } = makeRepo();
+  const commands: string[][] = [];
+  let scratch: Awaited<ReturnType<typeof createScratch>> | undefined;
+  try {
+    const changed = `${MATH}export const dirty = true;\n`;
+    writeFileSync(join(repo, "app/src/math.ts"), changed);
+    const recordingExec: OracleExec = (cmd, opts) => {
+      commands.push(cmd);
+      return localExec(cmd, opts);
+    };
+    scratch = await createScratch(recordingExec, { repoRoot: repo, scratchRoot: join(root, "scratch") });
+
+    assert.ok(commands.some((cmd) => cmd[0] === "bash" && cmd.join(" ").includes("git -C \"$1\" diff --binary HEAD | git -C \"$2\" apply --allow-empty")));
+    assert.equal(readFileSync(join(scratch.dir, "app/src/math.ts"), "utf8"), changed);
+  } finally {
+    await scratch?.dispose();
+    cleanup();
+  }
+});
+
+test("best mode refuses to land when the real workspace changed after scratch creation", { timeout: 60_000 }, async () => {
+  const { root, repo, cleanup } = makeRepo();
+  try {
+    const candidate = { id: "stale", diff: diffFor(repo, { "app/src/new.ts": "export const value = 1;\n" }) };
+    let changedRealWorkspace = false;
+    const mutatingExec: OracleExec = async (cmd, opts) => {
+      if (!changedRealWorkspace && cmd[0] === process.execPath && cmd[1] === "-e" && cmd[3] === "mutate-workspace") {
+        changedRealWorkspace = true;
+        writeFileSync(join(repo, "app/src/unrelated.ts"), "export const external = true;\n");
+      }
+      return localExec(cmd, opts);
+    };
+    const report = await runOracleGate(mutatingExec, [candidate], {
+      repoRoot: repo,
+      projectDir: "app",
+      checks: [{ name: "mutate", command: () => [process.execPath, "-e", "process.exit(0)", "mutate-workspace"] }],
+      scratchRoot: join(root, "scratch"),
+    });
+
+    assert.equal(changedRealWorkspace, true);
+    assert.deepEqual(report.landed, []);
+    assert.equal(report.verdicts[0].status, "error");
+    assert.equal(report.verdicts[0].status === "error" && report.verdicts[0].stage, "land");
+    assert.ok(!existsSync(join(repo, "app/src/new.ts")));
+  } finally {
+    cleanup();
+  }
+});
+
+test("candidate inspection batches affected-test and retry-definition file reads", { timeout: 30_000 }, async () => {
+  const { root, repo, cleanup } = makeRepo();
+  try {
+    const candidate = { id: "batch", diff: diffFor(repo, { "app/src/math.ts": MATH.replace("a + b", "a - b") }) };
+    const batchReadCommands: string[][] = [];
+    const recordingExec: OracleExec = (cmd, opts) => {
+      if (cmd[0] === "sh" && cmd[1] === "-c" && cmd[2].includes("for file do") && cmd[2].includes("base64")) batchReadCommands.push(cmd);
+      return localExec(cmd, opts);
+    };
+    const report = await runOracleGate(recordingExec, [candidate], {
+      repoRoot: repo,
+      projectDir: "app",
+      checks: [{ name: "reject", command: () => [process.execPath, "-e", "process.exit(1)"] }],
+      scratchRoot: join(root, "scratch"),
+    });
+
+    assert.equal(report.verdicts[0].status, "rejected");
+    assert.equal(batchReadCommands.length, 2, "one batch for affected tests and one for retry definitions");
   } finally {
     cleanup();
   }

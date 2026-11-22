@@ -37,10 +37,10 @@ export const DEFAULT_MAX_CHARS = 20_000;
 // Stripping them before matching stops escape codes from hiding failure clues
 // and keeps the extract readable. Built from char codes so the source contains
 // no literal control characters (Sonar S6324).
-const ESC = String.fromCharCode(0x1b);
-const BEL = String.fromCharCode(0x07);
+const ESC = String.fromCodePoint(0x1b);
+const BEL = String.fromCodePoint(0x07);
 const ANSI_ESCAPE = new RegExp(
-  `${ESC}(?:\\[[0-?]*[ -/]*[@-~]|\\][^${BEL}]*(?:${BEL}|${ESC}\\\\))`,
+  String.raw`${ESC}(?:\[[0-?]*[ -/]*[@-~]|\][^${BEL}]*(?:${BEL}|${ESC}\\))`,
   "g",
 );
 
@@ -88,36 +88,43 @@ export function condenseLog(raw: string, options: CondenseOptions = {}): string 
 
   const lines = normalized.split("\n");
 
-  let result: string;
-  if (lines.length <= MAX_FAILURE_LINES) {
-    // Small logs pass through (still bounded by maxChars below).
-    result = normalized;
-  } else {
-    const failures: string[] = [];
-    const seen = new Set<string>();
-    for (const line of lines) {
-      if (NOISE_FRAME.some((pattern) => pattern.test(line))) {
-        continue;
-      }
-      if (FAILURE_CLUE.some((pattern) => pattern.test(line))) {
-        const key = line.trim();
-        if (seen.has(key)) continue; // dedupe repeated failure lines
-        seen.add(key);
-        failures.push(line);
-      }
-    }
+  const result =
+    lines.length <= MAX_FAILURE_LINES
+      ? normalized // small logs pass through (still bounded by maxChars below)
+      : extractSignal(lines, maxChars);
 
-    if (failures.length > 0) {
-      result = headTail(failures, MAX_FAILURE_LINES).map((line) => capChars(line, maxChars)).join("\n");
-    } else {
-      // Deterministic fallback: head + tail where errors usually live.
-      result = [
-        ...lines.slice(0, FALLBACK_HEAD_LINES),
-        SNIPPED,
-        ...lines.slice(-FALLBACK_TAIL_LINES),
-      ].join("\n");
+  return capChars(result, maxChars);
+}
+
+/**
+ * Extract the signal lines from a log too large to pass through: drop noise
+ * frames, dedupe repeated failure lines, and keep the head+tail of what
+ * remains. Falls back to a deterministic head/tail splice when nothing
+ * failure-like is found.
+ */
+function extractSignal(lines: string[], maxChars: number): string {
+  const failures: string[] = [];
+  const seen = new Set<string>();
+  for (const line of lines) {
+    if (NOISE_FRAME.some((pattern) => pattern.test(line))) {
+      continue;
+    }
+    if (FAILURE_CLUE.some((pattern) => pattern.test(line))) {
+      const key = line.trim();
+      if (seen.has(key)) continue; // dedupe repeated failure lines
+      seen.add(key);
+      failures.push(line);
     }
   }
 
-  return capChars(result, maxChars);
+  if (failures.length > 0) {
+    return headTail(failures, MAX_FAILURE_LINES).map((line) => capChars(line, maxChars)).join("\n");
+  }
+
+  // Deterministic fallback: head + tail where errors usually live.
+  return [
+    ...lines.slice(0, FALLBACK_HEAD_LINES),
+    SNIPPED,
+    ...lines.slice(-FALLBACK_TAIL_LINES),
+  ].join("\n");
 }

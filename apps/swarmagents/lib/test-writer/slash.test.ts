@@ -36,3 +36,38 @@ test("formatTestsPrompt: includes target and iteration limit and coverage.report
   assert.match(p, /coverage\.report/);
   assert.match(p, /Never weaken assertions/);
 });
+
+test("parseSlashCommand: supports space-separated --max N", () => {
+  const cmd = parseSlashCommand("/tests pkg/foo --max 7");
+  assert.ok(cmd);
+  assert.equal(cmd.target, "pkg/foo");
+  assert.equal(cmd.maxIterations, 7);
+});
+
+test("parseSlashCommand: quoted paths with spaces", () => {
+  const cmd = parseSlashCommand('/tests "src/my feature/math.ts" --max=2');
+  assert.ok(cmd);
+  assert.equal(cmd.target, "src/my feature/math.ts");
+  assert.equal(cmd.maxIterations, 2);
+});
+
+test("parseSlashCommand: ignores unknown flags instead of appending them to target", () => {
+  const cmd = parseSlashCommand("/tests lib/foo.ts --verbose --dry-run");
+  assert.ok(cmd);
+  assert.equal(cmd.target, "lib/foo.ts");
+});
+
+test("formatTestsPrompt: empty target avoids empty backticks", () => {
+  const p = formatTestsPrompt("", 3);
+  assert.equal(p.includes("``"), false);
+  assert.match(p, /selected target/);
+});
+
+test("formatTestsPrompt: strips backticks and newlines from target", () => {
+  const p = formatTestsPrompt("lib/`evil`.ts\ninject more", 3);
+  const first = p.split("\n")[0];
+  assert.equal(first.includes("\n"), false);
+  assert.match(first, /lib\/ evil \.ts inject more/);
+  assert.equal((first.match(/`/g) ?? []).length, 2); // one opening, one closing
+});
+

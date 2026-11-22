@@ -670,7 +670,7 @@ test("the board handles loading, empty, failed and read-only states", async () =
 
   const empty = renderToStaticMarkup(h(BoardPanel, { ...props, board: makeBoard([]) }));
   assert.equal(countOf(empty, 'data-testid="board-empty"'), 1);
-  assert.match(empty, /Add the first task above/);
+  assert.match(empty, /no open tasks in the current filter/);
 
   const failed = renderToStaticMarkup(
     h(BoardPanel, { ...props, board: makeBoard([], { status: "error", error: { message: "Network error", retryable: true } }) }),

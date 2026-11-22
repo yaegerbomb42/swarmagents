@@ -363,11 +363,11 @@ export function FilesView({ refreshToken = 0, openPath }: FilesViewProps) {
               <Loader2 className="h-4 w-4 animate-spin" /> Loading workspace…
             </div>
           ) : listing && listing.entries.length === 0 ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-1.5 p-6 text-center">
+            <div className="flex flex-1 flex-col items-center justify-center gap-1.5 p-6 text-center" data-testid="files-empty">
               <FolderOpen className="h-6 w-6 text-white/20" />
-              <div className="text-xs text-white/50">This folder is empty</div>
-              <div className="max-w-[200px] text-[10px] leading-relaxed text-white/25">
-                Files the agent writes here will show up in this list.
+              <div className="text-xs text-white/50">This workspace is empty</div>
+              <div className="max-w-[260px] text-[11px] leading-relaxed text-white/40">
+                The workspace is the VM’s working directory. The first run fills it with project files.
               </div>
             </div>
           ) : (

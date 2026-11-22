@@ -146,14 +146,14 @@ function EmptyState({ hasRun, error }: { hasRun: boolean; error?: string }) {
         <>
           <div className="text-sm font-medium text-white/90">No page yet</div>
           <p className="text-xs text-white/40 leading-relaxed">
-            The live page appears here when the agent opens a website.
+            The desktop frame appears once a run opens a page.
           </p>
         </>
       ) : (
         <>
           <div className="text-sm font-medium text-white/90">Waiting for a run</div>
           <p className="text-xs text-white/40 leading-relaxed">
-            Start a run to see the page the agent is viewing.
+            The desktop frame appears once a run opens a page. Start a run to begin.
           </p>
         </>
       )}

@@ -136,7 +136,10 @@ export async function acquireFileLock(
     if (tryCreateLock(lockPath, token)) break;
     if (breakIfStale(lockPath, staleMs) && tryCreateLock(lockPath, token)) break;
     if (Date.now() >= deadline) throw new FileLockTimeoutError(lockPath, timeoutMs);
-    await sleep(retryMs + Math.floor(Math.random() * retryMs));
+    // CSPRNG-based retry jitter: backoff randomization does not need a PRNG
+    // (SonarCloud S2245). A uniform [0,1) fraction from randomBytes is fine.
+    const jitter = randomBytes(4).readUInt32BE(0) / 0xffffffff;
+    await sleep(retryMs + Math.floor(jitter * retryMs));
   }
   let released = false;
   return () => {

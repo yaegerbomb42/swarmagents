@@ -17,30 +17,47 @@ function pct(n: unknown): number | undefined {
   return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : undefined;
 }
 
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function parseIstanbulJsonSummary(jsonText: string): CoverageReport | null {
+  let data: unknown;
   try {
-    const data = JSON.parse(jsonText) as Record<string, any>;
-    const total = data.total?.lines;
-    const files: CoverageFile[] = [];
-    const uncoveredRanges: string[] = [];
-    for (const [file, v] of Object.entries(data)) {
-      if (file === "total") continue;
-      const lines = v?.lines;
-      const ranges: string[] = [];
-      // istanbul json-summary doesn't carry ranges; keep uncovered empty, we can fill from text if present
-      const entry: CoverageFile = { path: file, linesPct: pct(lines?.pct), uncovered: ranges };
-      files.push(entry);
-    }
-    return {
-      framework: "istanbul/c8",
-      linesPct: pct(total?.pct),
-      files,
-      uncoveredRanges,
-      raw: jsonText.slice(0, 4000),
-    };
+    data = JSON.parse(jsonText);
   } catch {
     return null;
   }
+  // A summary must be a non-null plain object containing a total object
+  // with lines: "null", "[]", "{}" or any other JSON shape is not a
+  // summary and must not produce a vacuous report (the old code returned
+  // one for "[]" and "{}", since Object.entries over them is empty).
+  if (!isJsonObject(data)) return null;
+  const total = data.total;
+  if (!isJsonObject(total)) return null;
+  const totalLines = total.lines;
+  if (!isJsonObject(totalLines)) return null;
+  const files: CoverageFile[] = [];
+  const uncoveredRanges: string[] = [];
+  for (const [file, v] of Object.entries(data)) {
+    if (file === "total") continue;
+    const lines = isJsonObject(v) ? v.lines : undefined;
+    const ranges: string[] = [];
+    // istanbul json-summary doesn't carry ranges; keep uncovered empty, we can fill from text if present
+    const entry: CoverageFile = {
+      path: file,
+      linesPct: pct(isJsonObject(lines) ? lines.pct : undefined),
+      uncovered: ranges,
+    };
+    files.push(entry);
+  }
+  return {
+    framework: "istanbul/c8",
+    linesPct: pct(totalLines.pct),
+    files,
+    uncoveredRanges,
+    raw: jsonText.slice(0, 4000),
+  };
 }
 
 function parseGoCoverProfile(text: string): CoverageReport | null {
@@ -48,14 +65,18 @@ function parseGoCoverProfile(text: string): CoverageReport | null {
   if (!/^mode:\s*\w+/m.test(text)) return null;
   const fileStats = new Map<string, { covered: number; total: number; uncovered: string[] }>();
   for (const line of text.split("\n")) {
-    const m = line.match(/^(.+):(\d+)\.\d+,(\d+)\.\d+\s+\d+\s+(\d+)$/);
+    // file:startLine.startCol,endLine.endCol numStmt count
+    const m = line.match(/^(.+):(\d+)\.\d+,(\d+)\.\d+\s+(\d+)\s+(\d+)$/);
     if (!m) continue;
-    const [, file, startStr, endStr, countStr] = m;
+    const [, file, startStr, endStr, numStmtStr, countStr] = m;
     const start = Number(startStr), end = Number(endStr), count = Number(countStr);
+    // Weight by numStmt (the statement count), not by the line span:
+    // blocks sharing a line would otherwise double-count it, and a long
+    // block with one statement would count as many lines.
+    const weight = Number(numStmtStr);
     const s = fileStats.get(file) ?? { covered: 0, total: 0, uncovered: [] };
-    const span = Math.max(1, end - start + 1);
-    s.total += span;
-    if (count > 0) s.covered += span;
+    s.total += weight;
+    if (count > 0) s.covered += weight;
     else s.uncovered.push(start === end ? String(start) : `${start}-${end}`);
     fileStats.set(file, s);
   }
@@ -78,20 +99,27 @@ function parseGoCoverProfile(text: string): CoverageReport | null {
 }
 
 function parsePytestCovText(text: string): CoverageReport | null {
-  // pytest-cov / coverage.py term-missing table:
+  // pytest-cov / coverage.py term-missing table, classic and --cov-branch:
   // Name                      Stmts   Miss  Cover   Missing
   // -------------------------------------------------------
   // mypkg/mod.py                 10      2    80%   5-6
   // -------------------------------------------------------
   // TOTAL                        10      2    80%
-  if (!/Name\s+Stmts\s+Miss\s+Cover/i.test(text) || !/TOTAL/i.test(text)) return null;
+  //
+  // --cov-branch adds Branch/BrPart columns between Miss and Cover, and
+  // Cover may be fractional (89.5%).
+  // Name                      Stmts   Miss  Branch BrPart  Cover   Missing
+  // -----------------------------------------------------------------------
+  // mypkg/mod.py                 10      2       4      1    80%   5-6
+  // TOTAL                        10      2       4      1    80%
+  if (!/Name\s+Stmts\s+Miss\s+(Branch\s+BrPart\s+)?Cover/i.test(text) || !/TOTAL/i.test(text)) return null;
   const files: CoverageFile[] = [];
   const uncoveredRanges: string[] = [];
   let totalPct: number | undefined;
   for (const line of text.split("\n")) {
-    const m = line.match(/^(\S.*?)\s+(\d+)\s+(\d+)\s+(\d+)%\s*(.*)$/);
+    const m = line.match(/^(\S.*?)\s+(\d+)\s+(\d+)\s+(?:(\d+)\s+(\d+)\s+)?(\d+(?:\.\d+)?)%\s*(.*)$/);
     if (!m) continue;
-    const [, name, , , cover, missing] = m;
+    const [, name, , , , , cover, missing] = m;
     if (/^TOTAL$/i.test(name.trim())) {
       totalPct = pct(cover);
       continue;
@@ -118,6 +146,81 @@ function parseGenericCoverageText(text: string): CoverageReport | null {
   return { framework: "text", linesPct: totalPct, files: [], uncoveredRanges: [], raw: text.slice(0, 4000) };
 }
 
+/**
+ * Bounds for the inline-JSON extractor below. A coverage summary embedded
+ * in test output is at most a few hundred KB; the caps keep a hostile or
+ * huge log from turning extraction into a hang.
+ */
+const MAX_INLINE_JSON_BYTES = 1024 * 1024;
+const MAX_INLINE_JSON_SCAN = 2 * 1024 * 1024;
+const MAX_INLINE_JSON_CANDIDATES = 100;
+
+function looksLikeIstanbulSummary(candidate: string): boolean {
+  try {
+    const data = JSON.parse(candidate) as unknown;
+    if (!isJsonObject(data)) return false;
+    const total = data.total;
+    if (!isJsonObject(total)) return false;
+    return isJsonObject(total.lines);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Find the first balanced `{...}` JSON object in log output that parses as
+ * an istanbul summary (top-level `total` object with `lines`).
+ *
+ * This replaces the old `/\{[\s\S]*"total"\s*:\s*\{[\s\S]*"lines"[\s\S]*\}/`
+ * match, which had two defects: its three greedy `[\s\S]*` runs backtrack
+ * catastrophically on a large log without a match (ReDoS — the engine tries
+ * every split of the input between the stars), and on a match it spanned
+ * from the first `{` to the last `}` across unrelated output. Brace counting
+ * (skipping string contents, with escape handling) finds the true end of
+ * each candidate, and the scan budget plus the candidate cap bound the total
+ * work no matter what the log contains.
+ */
+function extractIstanbulJson(text: string): string | null {
+  let remaining = MAX_INLINE_JSON_SCAN;
+  let candidates = 0;
+  let start = 0;
+  while (start < text.length && remaining > 0 && candidates < MAX_INLINE_JSON_CANDIDATES) {
+    const open = text.indexOf("{", start);
+    if (open === -1) return null;
+    candidates++;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let close = -1;
+    const limit = Math.min(text.length, open + MAX_INLINE_JSON_BYTES);
+    for (let i = open; i < limit && remaining > 0; i++, remaining--) {
+      const ch = text[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === "\\") escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+    if (close !== -1) {
+      const candidate = text.slice(open, close + 1);
+      if (looksLikeIstanbulSummary(candidate)) return candidate;
+    }
+    // No balanced close in range, or not a summary: try the next "{".
+    start = open + 1;
+  }
+  return null;
+}
+
 export function parseCoverageOutput(opts: { stdout?: string; stderr?: string; files?: Record<string, string> }): CoverageReport | null {
   const out = `${opts.stdout ?? ""}\n${opts.stderr ?? ""}`;
   const files = opts.files ?? {};
@@ -133,9 +236,9 @@ export function parseCoverageOutput(opts: { stdout?: string; stderr?: string; fi
     }
   }
   // Try inline JSON
-  const jsonMatch = out.match(/\{[\s\S]*"total"\s*:\s*\{[\s\S]*"lines"[\s\S]*\}/);
-  if (jsonMatch) {
-    const parsed = parseIstanbulJsonSummary(jsonMatch[0]);
+  const inlineJson = extractIstanbulJson(out);
+  if (inlineJson) {
+    const parsed = parseIstanbulJsonSummary(inlineJson);
     if (parsed) return parsed;
   }
   const go = parseGoCoverProfile(out);

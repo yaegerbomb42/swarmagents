@@ -54,3 +54,132 @@ test("parseCoverageOutput: generic text fallback", () => {
   assert.ok(r);
   assert.equal(Math.round((r.linesPct ?? 0) * 100) / 100, 76.54);
 });
+
+test("parseCoverageOutput: inline istanbul JSON in noisy logs", () => {
+  const summary = JSON.stringify({
+    total: { lines: { total: 200, covered: 170, pct: 85 } },
+    "src/a.ts": { lines: { total: 100, covered: 90, pct: 90 } },
+    "src/b.ts": { lines: { total: 100, covered: 80, pct: 80 } },
+  });
+  const out = [
+    "RUNNING TESTS ...",
+    'some log line with { braces } and "total" and "lines" words',
+    'another { "not": "a summary", "total": 42 } object',
+    summary,
+    "more noise after { }",
+    "DONE",
+  ].join("\n");
+  const r = parseCoverageOutput({ stdout: out });
+  assert.ok(r);
+  assert.equal(r.framework, "istanbul/c8");
+  assert.equal(r.linesPct, 85);
+  assert.equal(r.files.length, 2);
+  assert.equal(r.files[0].path, "src/a.ts");
+});
+
+test("parseCoverageOutput: inline JSON does not span across unrelated objects", () => {
+  // The old regex matched from the first "{" to the last "}", swallowing
+  // everything between two unrelated objects; the extractor must take the
+  // balanced object that actually is a summary.
+  const out = [
+    'config = { "mode": "test", "total": 3 }',
+    JSON.stringify({
+      total: { lines: { total: 10, covered: 9, pct: 90 } },
+      "src/a.ts": { lines: { total: 10, covered: 9, pct: 90 } },
+    }),
+    'trailer = { "done": true }',
+  ].join("\n");
+  const r = parseCoverageOutput({ stdout: out });
+  assert.ok(r);
+  assert.equal(r.framework, "istanbul/c8");
+  assert.equal(r.linesPct, 90);
+  assert.equal(r.files.length, 1);
+});
+
+test("parseCoverageOutput: a huge log without JSON returns null instead of hanging", () => {
+  // The old /\{[\s\S]*"total".../ regex backtracked catastrophically on
+  // input like this (many "{" with "total"/"lines" but no closing match);
+  // the bounded extractor must return promptly.
+  const chunk = '{"total": {"lines": ';
+  const out = chunk.repeat(20000); // ~400KB of unbalanced braces
+  const start = Date.now();
+  const r = parseCoverageOutput({ stdout: out });
+  const elapsed = Date.now() - start;
+  assert.equal(r, null);
+  assert.ok(elapsed < 5000, `extraction took ${elapsed}ms`);
+});
+
+test("parseCoverageOutput: non-summary JSON values return null", () => {
+  for (const bad of ["null", "[]", "{}", '{"total": 42}', '{"total": {"lines": null}}']) {
+    assert.equal(
+      parseCoverageOutput({ files: { "coverage/coverage-summary.json": bad } }),
+      null,
+      `${bad} must not produce a report`,
+    );
+  }
+});
+
+test("parseCoverageOutput: pytest-cov --cov-branch table with fractional cover", () => {
+  const out = `
+---------- coverage: platform linux, python 3.11 ----------
+Name                      Stmts   Miss  Branch BrPart  Cover   Missing
+-----------------------------------------------------------------------
+mypkg/mod.py                 10      2       4      1    80%   5-6
+mypkg/other.py                8      0       2      0   100%
+-----------------------------------------------------------------------
+TOTAL                        18      2       6      1    89.5%
+`;
+  const r = parseCoverageOutput({ stdout: out });
+  assert.ok(r);
+  assert.equal(r.framework, "pytest-cov");
+  assert.equal(r.linesPct, 89.5);
+  assert.equal(r.files.length, 2);
+  assert.equal(r.files[0].path, "mypkg/mod.py");
+  assert.equal(r.files[0].linesPct, 80);
+  assert.equal(r.files[1].linesPct, 100);
+  assert.ok(r.uncoveredRanges.some((x) => x.includes("mypkg/mod.py:5-6")));
+});
+
+test("parseCoverageOutput: pytest-cov fractional cover without branch columns", () => {
+  const out = `
+Name                      Stmts   Miss  Cover   Missing
+-------------------------------------------------------
+pkg/a.py                     10      2    80%   5-6
+-------------------------------------------------------
+TOTAL                        10      2    89.5%
+`;
+  const r = parseCoverageOutput({ stdout: out });
+  assert.ok(r);
+  assert.equal(r.framework, "pytest-cov");
+  assert.equal(r.linesPct, 89.5);
+  assert.equal(r.files.length, 1);
+});
+
+test("parseCoverageOutput: go coverprofile weights by numStmt, not line span", () => {
+  // Two blocks share line 11: line-span weighting counts it twice
+  // (total 4, covered 3 -> 75%); statement weighting counts the 15
+  // statements (total 15, covered 10 -> 66.7%).
+  const out = `mode: count
+pkg/x.go:10.1,12.5 10 1
+pkg/x.go:11.1,11.9 5 0
+`;
+  const r = parseCoverageOutput({ stdout: out });
+  assert.ok(r);
+  assert.equal(r.framework, "go-cover");
+  assert.ok(Math.abs((r.linesPct ?? 0) - (100 * 10) / 15) < 0.01, `expected 66.67%, got ${r.linesPct}`);
+  assert.ok(r.uncoveredRanges.some((x) => x.includes("pkg/x.go:11")));
+});
+
+test("parseCoverageOutput: go coverprofile long block with one statement counts once", () => {
+  // A 100-line block with a single statement must not count as 100 lines:
+  // statement weighting gives total 100, covered 1 -> 1%, where the old
+  // line-span weighting gave 100/101 -> 99%.
+  const out = `mode: count
+pkg/y.go:1.1,100.50 1 1
+pkg/y.go:5.1,5.10 99 0
+`;
+  const r = parseCoverageOutput({ stdout: out });
+  assert.ok(r);
+  assert.equal(r.framework, "go-cover");
+  assert.ok(Math.abs((r.linesPct ?? 0) - 1) < 0.01, `expected 1%, got ${r.linesPct}`);
+});

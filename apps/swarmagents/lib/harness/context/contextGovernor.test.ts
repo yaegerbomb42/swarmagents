@@ -228,3 +228,39 @@ test("toPackedRunRequest swaps in the packed turn, drops --resume and keeps the 
   assert.equal(request.sessionId, "sess-1");
   assert.equal(request.rolePhase?.appendSystemPrompt, "role prompt");
 });
+
+test("a larger custom budget packs beyond the default 7,200-token input ceiling", () => {
+  // total 16384 with a proportionally larger working set. The old code clamped
+  // the input to MAX_INPUT_TOKENS (7200); the fix derives the ceiling from the
+  // budget (16384 - 992 = 15392) so a bigger budget can actually be used.
+  const governor = new ContextGovernor({ budget: { total: 16384, workingSet: 11000 } });
+  const files = Array.from({ length: 8 }, (_, i) => bigFile(`src/big${i}.ts`, 200));
+  const packed = governor.pack({
+    turn: 1,
+    ledger: new StateLedger("Large refactor across the module."),
+    skeletonFiles: files,
+    workingSet: files.slice(0, 4),
+  });
+  const u = packed.usage;
+  assert.ok(u.input > MAX_INPUT_TOKENS, `expected input > ${MAX_INPUT_TOKENS}, got ${u.input}`);
+  assert.ok(u.total <= 16384, `total ${u.total} > 16384`);
+  assert.equal(u.total, u.input + 992);
+  // The working set actually used the larger budget.
+  assert.ok(u.workingSet.used > 7200 - 1500, `working set ${u.workingSet.used} should exceed the old ceiling share`);
+});
+
+test("default-budget packing is unchanged by the ceiling fix", () => {
+  const governor = new ContextGovernor();
+  const files = Array.from({ length: 6 }, (_, i) => bigFile(`src/def${i}.ts`, 120));
+  const packed = governor.pack({
+    turn: 1,
+    ledger: new StateLedger("default"),
+    skeletonFiles: files,
+    workingSet: files.slice(0, 3),
+  });
+  const u = packed.usage;
+  // Default total 8192 - output 992 = 7200, byte-identical to before the fix.
+  assert.ok(u.input <= MAX_INPUT_TOKENS, `default input ${u.input} > ${MAX_INPUT_TOKENS}`);
+  assert.ok(u.total <= 8192, `default total ${u.total} > 8192`);
+  assert.equal(u.reserve.output, 992);
+});

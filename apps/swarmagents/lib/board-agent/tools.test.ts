@@ -317,8 +317,12 @@ test("vm_screenshot is caller-scoped, requires running VM, and cleans up unique 
   assert.equal(shotAlice.data?.mimeType, "image/png");
   assert.equal(Buffer.from(shotAlice.data!.dataBase64, "base64").toString("utf8"), "png-for-alice");
   assert.equal(driver.scrotPaths.length, 1);
-  assert.deepEqual(driver.removedPaths, driver.scrotPaths);
-  await assert.rejects(vm.readFileBytes("alice", driver.scrotPaths[0], 1024));
+  const framePath = driver.scrotPaths[0];
+  const frameDir = path.dirname(framePath);
+  assert.ok(framePath.endsWith("/frame.png"));
+  assert.ok(frameDir.startsWith("/tmp/swarm-desktop-frame-"));
+  assert.deepEqual(driver.removedPaths, [frameDir]);
+  await assert.rejects(vm.readFileBytes("alice", framePath, 1024));
 
   // Bob still does not have a running VM and cannot grab Alice's desktop
   const shotBob = await vmScreenshot("bob", {});

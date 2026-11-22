@@ -22,6 +22,13 @@ test("GET /api/me reports null when signed out", async () => {
   assert.deepEqual(await res.json(), { user: null });
 });
 
+
+test("GET /api/me treats overlong user ids as signed out", async () => {
+  const res = GET(request({ [USER_HEADER]: `local_${"a".repeat(200)}@example.com` }));
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { user: null });
+});
+
 test("GET /api/me never trusts a client-supplied user header", async () => {
   // A caller that fabricates x-swarm-user gets it echoed back as a *string*
   // identity (middleware overwrites this header, so a real deployment cannot

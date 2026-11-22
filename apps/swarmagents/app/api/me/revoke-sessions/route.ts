@@ -12,7 +12,7 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
-import { SESSION_COOKIE, sessionCookieOptions, USER_HEADER } from "../../../../lib/auth";
+import { clearSessionCookieOptions, SESSION_COOKIE, USER_HEADER } from "../../../../lib/auth";
 import { recordAudit } from "../../../../lib/audit";
 import { bumpSessionEpoch, emailForUserId } from "../../../../lib/users";
 
@@ -20,10 +20,11 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
+const MAX_USER_ID_LEN = 128;
 
 export async function POST(req: NextRequest): Promise<Response> {
   const id = req.headers.get(USER_HEADER);
-  if (!id) {
+  if (!id || id.length > MAX_USER_ID_LEN) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401, headers: NO_STORE });
   }
   if (!id.startsWith("local_")) {
@@ -45,8 +46,9 @@ export async function POST(req: NextRequest): Promise<Response> {
   recordAudit({ user: id, action: "session.revoke", target: id, result: "success" });
 
   // Clear this device's cookie: everyone, including the person clicking the
-  // button, is signed out everywhere.
+  // button, is signed out everywhere. Match /api/logout's clear helper so
+  // Secure/HttpOnly/SameSite/Path attributes cannot drift.
   const res = NextResponse.json({ ok: true }, { headers: NO_STORE });
-  res.cookies.set(SESSION_COOKIE, "", { ...sessionCookieOptions(), maxAge: 0 });
+  res.cookies.set(SESSION_COOKIE, "", clearSessionCookieOptions());
   return res;
 }

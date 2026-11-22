@@ -30,6 +30,11 @@ test("POST requires an authenticated caller", async () => {
   assert.equal(res.status, 401);
 });
 
+test("POST rejects overlong user ids", async () => {
+  const res = await POST(request({ [USER_HEADER]: `local_${"a".repeat(200)}@example.com` }));
+  assert.equal(res.status, 401);
+});
+
 test("POST rejects non-local identities", async () => {
   const res = await POST(request({ [USER_HEADER]: "harness" }));
   assert.equal(res.status, 400);
@@ -46,10 +51,15 @@ test("POST bumps the epoch and clears this device's cookie", async () => {
   assert.equal(body.ok, true);
   assert.ok(getSessionEpoch("alice@example.com") > before, "epoch should advance");
 
-  // The current device's session cookie is cleared immediately.
+  // The current device's session cookie is cleared immediately via
+  // clearSessionCookieOptions (HttpOnly/Secure/SameSite/Path + Max-Age=0).
   const setCookie = res.headers.get("set-cookie") ?? "";
   assert.match(setCookie.toLowerCase(), /swarm_session=;/);
   assert.match(setCookie.toLowerCase(), /age=0/);
+  assert.ok(setCookie.includes("HttpOnly"), `expected HttpOnly: ${setCookie}`);
+  assert.ok(setCookie.includes("Secure"), `expected Secure: ${setCookie}`);
+  assert.ok(/SameSite=lax/i.test(setCookie), `expected SameSite=Lax: ${setCookie}`);
+  assert.ok(setCookie.includes("Path=/"), `expected Path=/: ${setCookie}`);
 });
 
 test("POST for an unknown local account fails cleanly", async () => {

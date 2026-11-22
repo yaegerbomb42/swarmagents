@@ -15,8 +15,11 @@ import { emailForUserId } from "../../../lib/users";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const MAX_USER_ID_LEN = 128;
+
 export function GET(req: NextRequest): Response {
-  const id = req.headers.get(USER_HEADER);
+  const raw = req.headers.get(USER_HEADER);
+  const id = raw && raw.length > 0 && raw.length <= MAX_USER_ID_LEN ? raw : null;
   return NextResponse.json(
     { user: id ? { id, email: emailForUserId(id) } : null },
     { headers: { "cache-control": "no-store" } },

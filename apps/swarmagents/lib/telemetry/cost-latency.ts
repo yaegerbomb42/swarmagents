@@ -22,6 +22,9 @@
  *   - `llm.call`: provider, model, attempt, outcome, costUsd, inputTokens,
  *     outputTokens, latencyMs, queuedMs, ttftMs. The gateway carries these in
  *     the event's `data` payload; the fake provider carries them flat.
+ *     Events with `source === "lens"` are output-lens calls (lib/lenses/run.ts):
+ *     they are not agent attempts, so their cost is tracked separately and they
+ *     never enter the routing, provider, latency, or model-switch stats.
  *   - `usage`: inputTokens, outputTokens, cachedTokens (harness side).
  *   - `run.started`: model and the provider that serves the run.
  *   - `run.finished`: costUsd, durationMs, numTurns.
@@ -118,6 +121,13 @@ export interface RunCostLatency {
   provider: string;
   /** Total estimated USD spent by the run. */
   costUsd: number;
+  /**
+   * USD spent by output lenses applied to this run (`llm.call` events with
+   * `source === "lens"`). Kept apart from the agent's calls so a lens adds to
+   * the run total without entering the provider, routing, latency, or
+   * next-call budget projections.
+   */
+  lensCostUsd: number;
   /** Which telemetry the total was derived from. */
   costSource: CostSource;
   /** Tokens consumed (harness `usage` events). */
@@ -176,6 +186,15 @@ function num(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * A usable, non-negative number. Negative telemetry (a clock or usage bug) is
+ * clamped to zero; non-finite values are treated as absent.
+ */
+function nonNegative(value: unknown): number | undefined {
+  const n = num(value);
+  return n === undefined ? undefined : Math.max(0, n);
+}
+
 function str(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -207,6 +226,7 @@ export function aggregateRunCostLatency(
     runId,
     provider: "unknown",
     costUsd: 0,
+    lensCostUsd: 0,
     costSource: "none",
     tokensIn: 0,
     tokensOut: 0,
@@ -253,22 +273,31 @@ export function aggregateRunCostLatency(
         break;
       }
       case "run.finished": {
-        reportedCost = num(field(event, "costUsd"));
+        reportedCost = nonNegative(field(event, "costUsd"));
         report.durationMs = num(field(event, "durationMs"));
         report.numTurns = num(field(event, "numTurns"));
         break;
       }
       case "llm.call": {
+        // Output lenses share the bus but are not agent attempts: keep their
+        // spend separate so they cannot become the run's provider, create a
+        // model switch, or enter the latency waterfall / next-call budget.
+        if (field(event, "source") === "lens") {
+          report.lensCostUsd += nonNegative(field(event, "costUsd")) ?? 0;
+          break;
+        }
         const provider = str(field(event, "provider")) ?? "unknown";
         const model = str(field(event, "model")) ?? "unknown";
         const outcome = str(field(event, "outcome")) ?? "unknown";
-        const latencyMs = num(field(event, "latencyMs")) ?? 0;
-        const ttftMs = num(field(event, "ttftMs"));
+        const latencyMs = nonNegative(field(event, "latencyMs")) ?? 0;
+        const ttftMs = nonNegative(field(event, "ttftMs"));
         const inputTokens = num(field(event, "inputTokens"));
         const outputTokens = num(field(event, "outputTokens"));
-        const costUsd = num(field(event, "costUsd")) ?? null;
+        const costUsd = nonNegative(field(event, "costUsd")) ?? null;
         const startedAt = event.ts - latencyMs;
-        const queuedMs = num(field(event, "queuedMs")) ?? Math.max(0, startedAt - (previousEnd ?? startedAt));
+        const queuedMs =
+          nonNegative(field(event, "queuedMs")) ??
+          Math.max(0, startedAt - (previousEnd ?? startedAt));
 
         const entry: CallCostEntry = {
           seq: event.seq,
@@ -288,7 +317,9 @@ export function aggregateRunCostLatency(
         report.totalLatencyMs += latencyMs;
         if (report.firstCallAt === undefined) report.firstCallAt = event.ts;
         report.lastCallAt = event.ts;
-        previousEnd = event.ts;
+        // Overlapping attempts can report an end time before the previous
+        // attempt's; never move the queue boundary backwards.
+        previousEnd = Math.max(previousEnd ?? 0, event.ts);
 
         let roll = providers.get(provider);
         if (!roll) {
@@ -340,9 +371,14 @@ export function aggregateRunCostLatency(
   }
 
   if (pricedCalls > 0) {
-    report.costUsd = callCost;
+    report.costUsd = callCost + report.lensCostUsd;
     report.costSource = "llm_calls";
     report.pricedCalls = pricedCalls;
+  } else if (report.lensCostUsd > 0) {
+    // No priced agent attempt, but an output lens reported a cost. Mirror
+    // usage.ts: the lens cost is added on top of the run's reported total.
+    report.costUsd = report.lensCostUsd + (reportedCost ?? 0);
+    report.costSource = "llm_calls";
   } else if (reportedCost !== undefined) {
     report.costUsd = reportedCost;
     report.costSource = "run_finished";

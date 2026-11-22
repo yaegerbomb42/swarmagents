@@ -115,8 +115,10 @@ export function recursiveDeleteRisk(command: string): 'wipe' | 'scoped' | 'none'
 
 /** Normalize a directory for boundary checks, without a trailing slash. */
 const normalizeDir = (value: string): string => {
-  const normalized = path.posix.normalize(value);
-  return normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
+  // path.posix.normalize already collapses duplicate separators and strips
+  // trailing slashes (the root is a single slash and passes through unchanged),
+  // so the result is a ready-to-compare directory boundary.
+  return path.posix.normalize(value);
 };
 
 /** True when `candidate` is `root` or sits underneath it. */
@@ -389,6 +391,32 @@ export interface PatchSignals {
  * backslash escapes. This keeps an apostrophe in a comment (for example
  * `// don't`) from opening a fake string that swallows the rest of the line.
  */
+const scanLineComment = (s: string, start: number): number => {
+  let i = start + 2; // skip the opening "//"
+  while (i < s.length && s[i] !== "\n") i += 1;
+  return i;
+};
+
+const scanBlockComment = (s: string, start: number): number => {
+  let i = start + 2; // skip the opening "/*"
+  while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i += 1;
+  return i + 2; // skip the closing "*/" (overshoots harmlessly when unterminated)
+};
+
+const scanQuoted = (s: string, start: number): number => {
+  const quote = s[start];
+  let i = start + 1;
+  while (i < s.length) {
+    if (s[i] === "\\") {
+      i += 2;
+      continue;
+    }
+    if (s[i] === quote) return i + 1;
+    i += 1;
+  }
+  return i;
+};
+
 const bracketBalance = (s: string): number => {
   let balance = 0;
   let i = 0;
@@ -396,30 +424,15 @@ const bracketBalance = (s: string): number => {
     const ch = s[i];
     const next = s[i + 1];
     if (ch === "/" && next === "/") {
-      i += 2;
-      while (i < s.length && s[i] !== "\n") i += 1;
+      i = scanLineComment(s, i);
       continue;
     }
     if (ch === "/" && next === "*") {
-      i += 2;
-      while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i += 1;
-      i += 2;
+      i = scanBlockComment(s, i);
       continue;
     }
     if (ch === '"' || ch === "'" || ch === "`") {
-      const quote = ch;
-      i += 1;
-      while (i < s.length) {
-        if (s[i] === "\\") {
-          i += 2;
-          continue;
-        }
-        if (s[i] === quote) {
-          i += 1;
-          break;
-        }
-        i += 1;
-      }
+      i = scanQuoted(s, i);
       continue;
     }
     if (ch === "{" || ch === "(" || ch === "[") balance += 1;

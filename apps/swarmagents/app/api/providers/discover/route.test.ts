@@ -109,3 +109,23 @@ test("discover accepts legacy apiStyle aliases instead of rejecting with 400", a
     globalThis.fetch = originalFetch;
   }
 });
+
+test("discover blocks hop-by-hop and privileged headers in custom headers and auth", async () => {
+  const blockedNames = ["host", "content-length", "transfer-encoding", "connection", "cookie"];
+  for (const name of blockedNames) {
+    const resHeaders = await discover({
+      id: "openai",
+      baseUrl: "https://api.openai.com/v1",
+      headers: { [name]: "evil-value" },
+    });
+    assert.equal(resHeaders.status, 400);
+
+    const resAuth = await discover({
+      id: "openai",
+      baseUrl: "https://api.openai.com/v1",
+      auth: { scheme: "custom-header", headerName: name },
+    });
+    assert.equal(resAuth.status, 400);
+  }
+});
+

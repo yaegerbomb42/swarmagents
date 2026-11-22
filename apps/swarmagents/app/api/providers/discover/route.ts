@@ -38,13 +38,27 @@ function unauthorized() {
   return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
 }
 
+const BLOCKED_HEADER_NAMES = new Set([
+  "host",
+  "content-length",
+  "transfer-encoding",
+  "connection",
+  "cookie",
+]);
+
+function isBlockedHeader(name: string): boolean {
+  return BLOCKED_HEADER_NAMES.has(name.toLowerCase());
+}
+
 function parseAuth(input: unknown): ProviderAuth | undefined | null {
   if (input === undefined || input === null) return undefined;
   if (typeof input !== "object" || Array.isArray(input)) return null;
   const record = input as Record<string, unknown>;
   if (!isAuthScheme(record.scheme)) return null;
   const headerName = typeof record.headerName === "string" ? record.headerName.trim() : undefined;
-  if (headerName !== undefined && !/^[A-Za-z0-9-]+$/.test(headerName)) return null;
+  if (headerName !== undefined) {
+    if (!/^[A-Za-z0-9-]+$/.test(headerName) || isBlockedHeader(headerName)) return null;
+  }
   return { scheme: record.scheme, ...(headerName ? { headerName } : {}) };
 }
 
@@ -54,7 +68,7 @@ function parseHeaders(input: unknown): Record<string, string> | undefined | null
   if (typeof input !== "object" || Array.isArray(input)) return null;
   const out: Record<string, string> = {};
   for (const [name, value] of Object.entries(input as Record<string, unknown>)) {
-    if (!/^[A-Za-z0-9-]+$/.test(name) || name.length > 64) return null;
+    if (!/^[A-Za-z0-9-]+$/.test(name) || name.length > 64 || isBlockedHeader(name)) return null;
     if (typeof value !== "string" || value.length > 2_048) return null;
     out[name] = value;
   }

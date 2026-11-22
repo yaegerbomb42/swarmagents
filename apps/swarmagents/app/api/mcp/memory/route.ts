@@ -87,7 +87,10 @@ export async function POST(request: NextRequest) {
   // JSON-RPC notifications have no response body. Explicit null is still a
   // request ID for clients that use it.
   if (rawId === undefined) {
-    return new NextResponse(null, { status: 202, headers: NO_STORE });
+    if (method.startsWith("notifications/") || method === "ping") {
+      return new NextResponse(null, { status: 202, headers: NO_STORE });
+    }
+    return jsonRpcError(-32600, "Invalid Request: notifications must be notifications/* or ping", null);
   }
 
   return dispatchMcpRequest(method, params, id, owner);

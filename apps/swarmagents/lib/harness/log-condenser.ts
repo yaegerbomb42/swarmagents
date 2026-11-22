@@ -35,6 +35,12 @@ const TRUNCATED = "...[TRUNCATED]...";
 /** Default ceiling on the number of characters returned. */
 export const DEFAULT_MAX_CHARS = 20_000;
 
+// Lines that look like failure clues but actually report zero failures
+// (a test summary such as "0 failed", "# fail 0" or "0 errors") must not
+// be kept as failure evidence.
+const SUCCESS_SUMMARY =
+  /(\b0\s+(failed|failures?|errors?)\b|#\s*fail\s+0\b|\b(?:failed|errors?)\s*:\s*0\b)/i;
+
 // CSI (colour/cursor, e.g. SGR "\x1b[31m") and OSC (title/hyperlink) sequences.
 // Stripping them before matching stops escape codes from hiding failure clues
 // and keeps the extract readable. Built from char codes so the source contains
@@ -73,7 +79,8 @@ function headTail<T>(items: readonly T[], limit: number): T[] {
  * - Logs that already fit within the failure cap pass through unchanged.
  * - Otherwise internal runtime frames are stripped, repeated failure lines are
  *   deduplicated, and failure-clue lines are kept (capped at
- *   {@link MAX_FAILURE_LINES} with head+tail preservation).
+ *   {@link MAX_FAILURE_LINES} with head+tail preservation). Lines that only
+ *   report zero failures ("0 failed", "0 errors") are not failure clues.
  * - When no failure clues are found, a deterministic head/tail splice keeps the
  *   extract bounded (errors usually live at the tail).
  * - The result is always capped at `maxChars`, including a single huge line.
@@ -111,7 +118,7 @@ function extractSignal(lines: string[], maxChars: number): string {
     if (NOISE_FRAME.some((pattern) => pattern.test(line))) {
       continue;
     }
-    if (FAILURE_CLUE.some((pattern) => pattern.test(line))) {
+    if (FAILURE_CLUE.some((pattern) => pattern.test(line)) && !SUCCESS_SUMMARY.test(line)) {
       const key = line.trim();
       if (seen.has(key)) continue; // dedupe repeated failure lines
       seen.add(key);

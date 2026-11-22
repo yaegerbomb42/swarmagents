@@ -103,7 +103,8 @@ test("fatal and crash lines are failure clues too", () => {
 });
 
 test("garbage input returns a deterministic, safe fallback", () => {
-  // A single enormous line (no newlines) must not throw and must be bounded.
+  // A single enormous line (no newlines) is bounded, not passed through
+  // verbatim, and the cut is marked.
   const huge = "x".repeat(500_000);
   const bounded = condenseLog(huge);
   assert.ok(bounded.length <= DEFAULT_MAX_CHARS, "a single huge line is capped");
@@ -111,9 +112,26 @@ test("garbage input returns a deterministic, safe fallback", () => {
 
   // A run of blank lines with no content reduces cleanly.
   const blanks = "\n".repeat(500);
-  const out = condenseLog(blanks);
-  assert.equal(typeof out, "string");
-  assert.ok(out.length <= 500);
+  const out2 = condenseLog(blanks);
+  assert.equal(typeof out2, "string");
+  assert.ok(out2.length <= 500);
+});
+
+test("zero-failure summaries are not kept as failure clues", () => {
+  const lines = [
+    ...Array.from({ length: 50 }, (_, i) => `  test ${i} ok`),
+    "  0 failed",
+    "  # fail 0",
+    "  0 errors",
+    "  1 failed",
+    "  error: real failure",
+  ].join("\n");
+  const out = condenseLog(lines);
+  assert.ok(!out.includes("0 failed"), "a zero-failure summary is not evidence");
+  assert.ok(!out.includes("# fail 0"), "a zero-failure summary is not evidence");
+  assert.ok(!out.includes("0 errors"), "a zero-failure summary is not evidence");
+  assert.ok(out.includes("1 failed"), "a real failure still survives");
+  assert.ok(out.includes("real failure"), "a real failure still survives");
 });
 
 test("maxChars is configurable and bounds both many lines and one long line", () => {

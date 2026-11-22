@@ -62,15 +62,18 @@ const RESULT_FAIL = JSON.stringify({
   is_error: true,
 });
 
-/** Fake claude transcript driver: "ok" finishes, "fail" errors, "slow" stalls. */
+/** Fake claude transcript driver: "ok" finishes, "fail" errors, "crash" exits nonzero without output, "slow" stalls. */
 class DriveFakeVm extends FakeVmDriver {
-  constructor(private readonly mode: "ok" | "fail" | "slow" = "ok") {
+  constructor(private readonly mode: "ok" | "fail" | "crash" | "slow" = "ok") {
     super();
   }
 
   override async exec(handle: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
     if (cmd[0] === "claude") {
       if (this.mode === "slow") await sleep(800);
+      if (this.mode === "crash") {
+        return { exitCode: 137 };
+      }
       opts?.onStdout?.(`${INIT}\n${ASSISTANT}\n`);
       opts?.onStdout?.(`${this.mode === "fail" ? RESULT_FAIL : RESULT_OK}\n`);
       // A failed claude must exit nonzero or the harness still calls the
@@ -87,7 +90,7 @@ let savedEnv: NodeJS.ProcessEnv;
 let vmManager: VmManager;
 let manager: RuntimeManager;
 
-function setup(mode: "ok" | "fail" | "slow" = "ok"): void {
+function setup(mode: "ok" | "fail" | "crash" | "slow" = "ok"): void {
   const driver = new DriveFakeVm(mode);
   vmManager = new VmManager({ customDriver: driver });
   // Persist the bus or the run log is never written and the RunReporter
@@ -540,3 +543,73 @@ test("an overlapping keep and sweep cannot restore over a kept drive", async () 
   const sweptIds = await json(sweep);
   assert.deepEqual(sweptIds.swept, [], "nothing should be swept once the keep re-reads under the lock");
 });
+
+test("library admin can test-drive an unpublished item during moderation review", async () => {
+  setup("ok");
+  process.env.SWARM_ADMIN_USERS = "admin@swarm.test";
+  try {
+    const id = publishSkill();
+    // Unpublish the item as owner
+    const { unpublishPublicItem } = await import("./public-store");
+    unpublishPublicItem(id, ALICE, { admin: false });
+
+    // Normal non-owner bob is rejected with 404
+    const bobRes = await testDrivePOST(request("bob", id, { action: "start" }), {
+      params: Promise.resolve({ id }),
+    });
+    assert.equal(bobRes.status, 404);
+
+    // Admin user can test-drive
+    const adminRes = await testDrivePOST(request("local_admin@swarm.test", id, { action: "start" }), {
+      params: Promise.resolve({ id }),
+    });
+    assert.equal(adminRes.status, 201);
+    const started = await json(adminRes);
+    assert.equal(started.drive.publicId, id);
+  } finally {
+    delete process.env.SWARM_ADMIN_USERS;
+  }
+});
+
+test("action sweep runs successfully even when path item id does not exist", async () => {
+  setup("ok");
+  const missingId = "pub_non_existent_item_12345";
+  const res = await testDrivePOST(request(ALICE, missingId, { action: "sweep" }), {
+    params: Promise.resolve({ id: missingId }),
+  });
+  assert.equal(res.status, 200);
+  const data = await json(res);
+  assert.deepEqual(data.swept, []);
+  assert.deepEqual(data.failed, []);
+});
+
+test("crashed or cancelled run without RunReport auto-rolls back when read", async () => {
+  setup("ok");
+  const id = publishSkill();
+  const started = await json(
+    await testDrivePOST(request(ALICE, id, { action: "start" }), { params: Promise.resolve({ id }) }),
+  );
+  const driveId: string = started.drive.id;
+
+  // Simulate a run that crashed or disappeared completely without writing a report:
+  // remove the run report file if it was created
+  await sleep(150);
+  const reportPath = path.join(runsDir, "reports", started.runId, "report.json");
+  if (fs.existsSync(reportPath)) {
+    fs.unlinkSync(reportPath);
+  }
+  assert.equal(readRunReport(started.runId), null);
+
+  // Mark the drive startedAt in the past so the initialization grace period passes
+  updateTestDrive(driveId, { startedAt: Date.now() - 20_000 });
+
+  // Read drive status via GET
+  const res = await testDriveGET(getRequest(ALICE, id, driveId), {
+    params: Promise.resolve({ id }),
+  });
+  assert.equal(res.status, 200);
+  const data = await json(res);
+  assert.equal(data.drive.status, "rolled-back");
+  assert.equal(data.drive.rollbackReason, "run-failed");
+});
+

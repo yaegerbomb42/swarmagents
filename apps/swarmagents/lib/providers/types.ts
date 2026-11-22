@@ -195,6 +195,15 @@ export interface CompleteRequest {
   model?: string;
   maxTokens?: number;
   temperature?: number;
+  /**
+   * Explicit cache breakpoints for a prefix-stable prompt, set by
+   * CacheAwarePromptBuilder (lib/providers/cache-aware-prompt.ts).
+   * Absent = today's behaviour (no markers). Only the Anthropic wire
+   * format supports explicit breakpoints; adapters for other styles
+   * ignore this field entirely, so the markers are stripped cleanly
+   * by construction.
+   */
+  cacheBreakpoints?: CacheBreakpoints;
   signal?: AbortSignal;
   /**
    * Race up to this many ranked providers in parallel and take the first valid
@@ -220,9 +229,34 @@ export interface CompleteRequest {
   hedge?: boolean | number;
 }
 
+/**
+ * Explicit prompt-cache breakpoints for a prefix-stable prompt.
+ * Set by CacheAwarePromptBuilder; read by the Anthropic body builder in
+ * adapters.ts. Providers without explicit breakpoint support ignore it.
+ */
+export interface CacheBreakpoints {
+  /** Breakpoint after the system prompt (Zone 0 boundary). */
+  system?: boolean;
+  /** Breakpoint after the first message (Zone 1 boundary). */
+  firstMessage?: boolean;
+  /** Breakpoint after the second-to-last message. */
+  secondLastMessage?: boolean;
+}
+
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
+  /**
+   * Input tokens served from the provider's prompt cache on this call
+   * (Anthropic `cache_read_input_tokens`, OpenAI `cached_tokens`,
+   * Gemini `cachedContentTokenCount`). Absent = the provider reported none.
+   */
+  cachedInputTokens?: number;
+  /**
+   * Input tokens written to the provider's prompt cache on this call
+   * (Anthropic `cache_creation_input_tokens`). Absent = none reported.
+   */
+  cacheWriteTokens?: number;
   /**
    * Provider-reported cost of this call in USD, when the response carried
    * one (e.g. the Perplexity Agent API's `usage.cost.total_cost`, xAI's

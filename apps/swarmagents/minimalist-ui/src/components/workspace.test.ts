@@ -541,12 +541,18 @@ test("a run started from a board task points back to the task", async () => {
 
 // ---- Flow C: the board ----
 
+// The board's default view shows only current work, so these fixtures are
+// dated after the repo move rather than using makeTask's historical default.
+const CURRENT_TASK_AT = Date.UTC(2026, 10, 21);
+const nowTask = (overrides: Parameters<typeof makeTask>[0] = {}) =>
+  makeTask({ createdAt: CURRENT_TASK_AT, updatedAt: CURRENT_TASK_AT, ...overrides });
+
 test("the board lists each task with its status and its pull request, without worker names or bracket tags", async () => {
   const { BoardPanel } = await load();
   const tasks = [
-    makeTask({ id: "t_open", title: "Add dark mode", status: "open" }),
-    makeTask({ id: "t_claimed", title: "[p2] Fix the login redirect", status: "claimed", claimedBy: "alice@example.com (VM)" }),
-    makeTask({
+    nowTask({ id: "t_open", title: "Add dark mode", status: "open" }),
+    nowTask({ id: "t_claimed", title: "[p2] Fix the login redirect", status: "claimed", claimedBy: "alice@example.com (VM)" }),
+    nowTask({
       id: "t_review",
       title: "Write the changelog",
       status: "in_review",
@@ -555,7 +561,7 @@ test("the board lists each task with its status and its pull request, without wo
       prUrl: "https://github.com/acme/app/pull/128",
       resultSummary: "Changelog covers 2.0.",
     }),
-    makeTask({ id: "t_done", title: "Upgrade Node", status: "completed", claimedBy: "carol (VM)" }),
+    nowTask({ id: "t_done", title: "Upgrade Node", status: "completed", claimedBy: "carol (VM)" }),
   ];
   const html = renderToStaticMarkup(
     h(BoardPanel, {
@@ -591,8 +597,8 @@ test("the board shows a duplicated title once, with its count", async () => {
   const html = renderToStaticMarkup(
     h(BoardPanel, {
       board: makeBoard([
-        makeTask({ id: "d1", title: "[Router] Automatic per-step model routing", status: "open", updatedAt: 1 }),
-        makeTask({ id: "d2", title: "automatic per-step model routing", status: "open", updatedAt: 2 }),
+        nowTask({ id: "d1", title: "[Router] Automatic per-step model routing", status: "open", updatedAt: CURRENT_TASK_AT }),
+        nowTask({ id: "d2", title: "automatic per-step model routing", status: "open", updatedAt: CURRENT_TASK_AT + 1 }),
       ]),
       agentName: "alice (VM)",
       runFor: () => undefined,
@@ -610,7 +616,7 @@ test("a link that is not http(s) is never rendered as a link", async () => {
   const { BoardPanel } = await load();
   const html = renderToStaticMarkup(
     h(BoardPanel, {
-      board: makeBoard([makeTask({ id: "t", status: "in_review", claimedBy: "x", prUrl: "javascript:alert(1)" })]),
+      board: makeBoard([nowTask({ id: "t", status: "in_review", claimedBy: "x", prUrl: "javascript:alert(1)" })]),
       agentName: "alice (VM)",
       runFor: () => undefined,
       onRunTask: async () => undefined,
@@ -623,7 +629,7 @@ test("a link that is not http(s) is never rendered as a link", async () => {
 
 test("an opened task shows its details and result; my claimed task can be submitted for review", async () => {
   const { BoardPanel } = await load();
-  const mine = makeTask({
+  const mine = nowTask({
     id: "t_mine",
     title: "Fix the login redirect",
     description: "Fix the login redirect\nUsers land on a blank page.",
@@ -683,7 +689,7 @@ test("the board handles loading, empty, failed and read-only states", async () =
   const stale = renderToStaticMarkup(
     h(BoardPanel, {
       ...props,
-      board: makeBoard([makeTask()], { error: { message: "Network error", retryable: true } }),
+      board: makeBoard([nowTask()], { error: { message: "Network error", retryable: true } }),
     }),
   );
   assert.match(stale, /The board could not be refreshed/);

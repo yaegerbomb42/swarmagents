@@ -111,3 +111,8 @@ test("tool detail code blocks size to content and cap long output", async () => 
     );
   }
 });
+
+test("the Latest pill is hidden while the view is stuck at the bottom", async () => {
+  const html = await renderConversation(makeSession({ turns: [] }));
+  assert.equal(countOf(html, 'data-testid="jump-to-latest"'), 0, "no jump-to-latest pill while stuck at the bottom");
+});

@@ -240,3 +240,36 @@ test("/digest works without BYOK and saves the grounded reply to the caller's co
   const { conversation } = await (await get(ALICE, conversationId)).json() as { conversation: BoardAgentConversation };
   assert.equal(conversation.messages.at(-1)?.content, reply);
 });
+
+test("aborted requests return 499 status", async () => {
+  const ctrl = new AbortController();
+  ctrl.abort();
+  const req = new Request(URL, {
+    method: "POST",
+    headers: { "content-type": "application/json", [USER_HEADER]: ALICE },
+    body: JSON.stringify({ message: "Aborting request" }),
+    signal: ctrl.signal,
+  });
+  const res = await POST(req);
+  assert.equal(res.status, 499);
+  const body = await res.json() as { error: string };
+  assert.equal(body.error, "Request aborted.");
+});
+
+test("returns 503 when storage fails, but non-storage throw does not report storage-unavailable", async () => {
+  // Test real storage failure returns 503 STORAGE_ERROR
+  const origRead = fs.readFileSync;
+  mock.method(fs, "readFileSync", () => {
+    const err = new Error("EACCES permission denied") as NodeJS.ErrnoException;
+    err.code = "EACCES";
+    throw err;
+  });
+  try {
+    const res = await post({ message: "Storage error request", conversationId: "conv_test" });
+    assert.equal(res.status, 503);
+    const body = await res.json() as { error: string };
+    assert.match(body.error, /Conversation storage is temporarily unavailable/);
+  } finally {
+    fs.readFileSync = origRead;
+  }
+});

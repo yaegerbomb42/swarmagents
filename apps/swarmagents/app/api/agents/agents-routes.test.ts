@@ -20,6 +20,7 @@ import { GET as LIST, POST as CREATE } from "./route";
 import { GET as ONE, PUT as REPLACE, DELETE as REMOVE } from "./[id]/route";
 import { POST as CLONE } from "./[id]/clone/route";
 import { GET as EXPORT } from "./[id]/export/route";
+import { containsSecretValue } from "@/lib/agents/export-secrets";
 import { GET as HISTORY } from "./[id]/history/route";
 import { POST as RESTORE } from "./[id]/restore/route";
 import { GET as COMPAT } from "./[id]/compatibility/route";
@@ -257,6 +258,63 @@ test("export refuses an agent whose free text carries a real secret-shaped value
   const exported = await EXPORT(req("GET", "/api/agents/route-bot/export"), ctx("route-bot"));
   assert.equal(exported.status, 500);
   assert.equal(exported.headers.get("cache-control"), "no-store");
+  const body = (await exported.json()) as { error: string };
+  assert.match(body.error, /secret-shaped/);
+});
+
+test("containsSecretValue fails closed on deeply nested (secret-free) trees", () => {
+  // A shallow, secret-free tree must still pass.
+  assert.equal(containsSecretValue({ a: { b: "hello" } }), false);
+  assert.equal(containsSecretValue(["plain", { nested: "value" }]), false);
+
+  // Deeper than the 20-level cutoff: previously returned false (bypassed scan);
+  // now fails closed so a manifest field nested past the limit cannot hide a secret.
+  let deep: unknown = "leaf";
+  for (let i = 0; i < 25; i++) deep = { wrap: deep };
+  assert.equal(containsSecretValue(deep), true);
+});
+
+test("containsSecretValue catches the expanded credential patterns", () => {
+  const secrets = [
+    "Google key: AIzaSyA1234567890abcdefghijklmnopqrstuv",
+    "Groq: gsk_AbCdEfGhIjKlMnOpQrStUvWxYz",
+    "Hugging Face: hf_LmNoPqRsTuVwXyZ0123456789AbCdEf",
+    "Perplexity: pplx-4b7d9f2e1c8a3b6d5e0f9a1c2b3d4e5f6a7b8c9d0e1f2",
+    "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQ==\n-----END PRIVATE KEY-----",
+    "Authorization: Bearer 9f2e1c8a3b6d5e0f9a1c2b3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8g9h0i1j",
+  ];
+  for (const secret of secrets) {
+    assert.equal(
+      containsSecretValue(secret),
+      true,
+      `expected to detect: ${secret.slice(0, 40)}...`,
+    );
+  }
+});
+
+test("containsSecretValue does not flag benign strings that merely resemble new patterns", () => {
+  const benign = [
+    "AIza", // too short
+    "gsk_short", // too short
+    "hf_short",
+    "pplx-short",
+    "Bearer short", // token too short
+    "-----BEGIN PUBLIC KEY-----", // public, not private
+    "Use the Bearer header for API calls, not tokens in bodies.",
+  ];
+  for (const text of benign) {
+    assert.equal(containsSecretValue(text), false, `expected no false positive: ${text}`);
+  }
+});
+
+test("export refuses a prompt carrying a Google API key", async () => {
+  const prompt = "Talk to Google via AIzaSyA1234567890abcdefghijklmnopqrstuv.";
+  assert.equal(
+    (await CREATE(req("POST", "/api/agents", manifest({ identity: { systemPrompt: prompt } })))).status,
+    201,
+  );
+  const exported = await EXPORT(req("GET", "/api/agents/route-bot/export"), ctx("route-bot"));
+  assert.equal(exported.status, 500);
   const body = (await exported.json()) as { error: string };
   assert.match(body.error, /secret-shaped/);
 });

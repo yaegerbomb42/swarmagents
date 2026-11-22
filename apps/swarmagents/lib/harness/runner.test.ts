@@ -1576,3 +1576,91 @@ test("resolveMaxTurns ignores non-positive and non-finite requests", () => {
   assert.equal(resolveMaxTurns(25.7), 25);
   assert.equal(resolveMaxTurns(25, { ...process.env, SWARM_MAX_TURNS: "10" }), 10);
 });
+
+// --- ProgressWatchdog integration ---
+
+const WATCHDOG_SPIN_ERR =
+  "FAIL src/foo.test.ts\n  expected 1 to equal 2\n  at Object.<anonymous> (src/foo.test.ts:42:10)";
+
+function watchdogSpinFixture(): string {
+  const lines: Record<string, unknown>[] = [INIT];
+  for (let n = 1; n <= 3; n++) {
+    lines.push({
+      type: "assistant",
+      message: {
+        id: `ws${n}`,
+        content: [{ type: "tool_use", id: `toolu_ws${n}`, name: "Bash", input: { command: "npm test" } }],
+      },
+    });
+    lines.push({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: `toolu_ws${n}`, content: WATCHDOG_SPIN_ERR, is_error: true }],
+      },
+    });
+  }
+  lines.push(RESULT);
+  return lines.map((l) => JSON.stringify(l)).join("\n") + "\n";
+}
+
+async function runWatchdog(runner: ClaudeCodeRunner, fixture: string) {
+  const vm = new ScriptedVm([{ chunks: [fixture] }]);
+  const events: TelemetryEvent[] = [];
+  const outcome = await runner.run({ prompt: "Fix the test", env: envWithSecrets, vm }, (e) => events.push(e));
+  return { vm, events, outcome };
+}
+
+test("Watchdog on: three identical failures halt with the rewind marker", async () => {
+  const { events, outcome } = await runWatchdog(
+    new ClaudeCodeRunner({ progressWatchdog: { enabled: true } }),
+    watchdogSpinFixture(),
+  );
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.aborted, false);
+  const blocked = events.filter((e) => e.type === "tool.blocked");
+  assert.equal(blocked.length, 1);
+  assert.match(blocked[0].reason, /progress watchdog: exact-spin/);
+  // No cwd in the request, so there is no checkpoint to rewind to.
+  assert.match(blocked[0].reason, /no checkpoint to rewind to, escalate/);
+  assert.match(blocked[0].reason, /do NOT retry/);
+  const errors = events.filter((e) => e.type === "run.error");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /Halted by harness risk policy: progress watchdog: exact-spin/);
+  assert.equal(events.some((e) => e.type === "run.finished"), false);
+});
+
+test("Watchdog off: the same stream runs to completion", async () => {
+  const { events, outcome } = await runWatchdog(new ClaudeCodeRunner(), watchdogSpinFixture());
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(events.some((e) => e.type === "tool.blocked"), false);
+  assert.equal(events.some((e) => e.type === "run.error"), false);
+  assert.equal(events.some((e) => e.type === "run.finished"), true);
+});
+
+test("Watchdog on + read paralysis: six fruitless reads halt the run", async () => {
+  const lines: Record<string, unknown>[] = [INIT];
+  for (let n = 1; n <= 6; n++) {
+    lines.push({
+      type: "assistant",
+      message: {
+        id: `wr${n}`,
+        content: [{ type: "tool_use", id: `toolu_wr${n}`, name: "Read", input: { file_path: "src/foo.ts" } }],
+      },
+    });
+    lines.push({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: `toolu_wr${n}`, content: "export const foo = 1;\n", is_error: false }],
+      },
+    });
+  }
+  lines.push(RESULT);
+  const fixture = lines.map((l) => JSON.stringify(l)).join("\n") + "\n";
+  const { events } = await runWatchdog(new ClaudeCodeRunner({ progressWatchdog: { enabled: true } }), fixture);
+  const blocked = events.filter((e) => e.type === "tool.blocked");
+  assert.equal(blocked.length, 1);
+  assert.match(blocked[0].reason, /progress watchdog: read-paralysis/);
+  assert.equal(events.some((e) => e.type === "run.finished"), false);
+});

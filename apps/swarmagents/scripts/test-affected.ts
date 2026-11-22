@@ -60,13 +60,18 @@ function readFile(p: string): string | undefined {
 }
 
 /**
- * Rebase a repo-root-relative path to project-relative, or undefined when it
- * lives outside the project (e.g. .github/workflows or the repo-root AGENTS.md).
+ * Rebase a path to project-relative, or undefined when it lives outside the
+ * project. Accepts both repo-root-relative (`apps/swarmagents/lib/foo.ts`)
+ * and already project-relative (`lib/foo.ts`) inputs.
  */
 function toProjectPath(repoPath: string): string | undefined {
   const rel = repoPath.replace(/^\.\//, "").split("/");
-  if (rel[0] === "apps" && rel[1] === "swarmagents") return rel.slice(2).join("/");
-  if (rel[0] === "swarmagents") return rel.slice(1).join("/");
+  if (rel.length >= 2 && rel[0] === "apps" && rel[1] === "swarmagents") return rel.slice(2).join("/");
+  if (rel.length >= 1 && rel[0] === "swarmagents") return rel.slice(1).join("/");
+  // Already project-relative (e.g. "lib/foo.ts", "app/api/logout/route.ts").
+  if (rel[0] === "lib" || rel[0] === "app" || rel[0] === "components" || rel[0] === "minimalist-ui" || rel[0] === "packages") {
+    return rel.join("/");
+  }
   return undefined; // outside the project
 }
 

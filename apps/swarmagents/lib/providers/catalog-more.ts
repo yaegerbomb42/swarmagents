@@ -97,6 +97,8 @@ export const MORE_HOSTED_PROVIDERS: readonly ProviderCatalogEntry[] = [
     envVar: "SWARM_KEYS_GITHUB",
     standardEnvVar: "GITHUB_TOKEN",
     links: { apiKeys: "https://github.com/settings/tokens" },
+    // GitHub Models is free with a GitHub token (rate-limited).
+    isFree: true,
     authHint: "A token with the models:read permission.",
   },
   {
@@ -205,6 +207,8 @@ export const MORE_HOSTED_PROVIDERS: readonly ProviderCatalogEntry[] = [
     envVar: "SWARM_KEYS_CLOUDFLARE",
     standardEnvVar: "CLOUDFLARE_API_TOKEN",
     links: { apiKeys: "https://dash.cloudflare.com/profile/api-tokens" },
+    // Workers AI includes a free daily neuron allowance.
+    isFree: true,
     authHint: "Base URL: https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/v1.",
   },
   {
@@ -486,6 +490,35 @@ export const MORE_HOSTED_PROVIDERS: readonly ProviderCatalogEntry[] = [
     standardEnvVar: "MARTIAN_API_KEY",
     links: { apiKeys: "https://app.withmartian.com" },
   },
+  {
+    id: "xkiro",
+    name: "xKiro",
+    shortDescription: "Many vendors behind one key through the xKiro gateway.",
+    apiStyle: "openai-chat",
+    baseUrl: "https://api.xkiro.com/v1",
+    authHeader: "bearer",
+    auth: { scheme: "bearer" },
+    envVar: "SWARM_KEYS_XKIRO",
+    standardEnvVar: "XKIRO_API_KEY",
+    links: { apiKeys: "https://xkiro.com" },
+    // Free plan: 26 free models with a daily token allowance, no card.
+    // Paid plans exist; the flag only asserts a genuine free tier.
+    isFree: true,
+  },
+  {
+    id: "bynara",
+    name: "Bynara (NaraRouter)",
+    shortDescription: "Many vendors behind one key through the Bynara (NaraRouter) gateway.",
+    apiStyle: "openai-chat",
+    baseUrl: "https://router.bynara.id/v1",
+    authHeader: "bearer",
+    auth: { scheme: "bearer" },
+    envVar: "SWARM_KEYS_BYNARA",
+    links: { apiKeys: "https://router.bynara.id", docs: "https://router.bynara.id/docs" },
+    // Free plan: a daily token allowance on the free models, no card.
+    // Paid plans exist; the flag only asserts a genuine free tier.
+    isFree: true,
+  },
 ];
 
 /** Local servers the user runs themselves (OpenAI-compatible, no key). */
@@ -500,6 +533,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_VLLM",
     links: { docs: "https://docs.vllm.ai" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -512,6 +546,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_LLAMACPP",
     links: { docs: "https://github.com/ggml-org/llama.cpp" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -524,6 +559,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_LITELLM",
     links: { docs: "https://docs.litellm.ai" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -536,6 +572,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_JAN",
     links: { docs: "https://jan.ai" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -548,6 +585,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_LOCALAI",
     links: { docs: "https://localai.io" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -560,6 +598,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_KOBOLDCPP",
     links: { docs: "https://github.com/LostRuins/koboldcpp" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -572,6 +611,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_TEXTGEN",
     links: { docs: "https://github.com/oobabooga/text-generation-webui/wiki/12-%E2%80%90-OpenAI-API" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -584,6 +624,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_LLAMAFILE",
     links: { docs: "https://github.com/Mozilla-Ocho/llamafile" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -596,6 +637,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_MLX_LM",
     links: { docs: "https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/SERVER.md" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -608,6 +650,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_APHRODITE",
     links: { docs: "https://github.com/aphrodite-engine/aphrodite-engine" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -620,6 +663,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_SGLANG",
     links: { docs: "https://docs.sglang.io" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -632,6 +676,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_XINFERENCE",
     links: { docs: "https://inference.readthedocs.io" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -645,6 +690,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     envVar: "SWARM_KEYS_DOCKER_MODEL_RUNNER",
     links: { docs: "https://docs.docker.com/ai/model-runner/api-reference/" },
     authHint: "Turn on host-side TCP support in Docker Desktop first.",
+    isFree: true,
     isLocal: true,
   },
   {
@@ -657,6 +703,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     auth: { scheme: "none" },
     envVar: "SWARM_KEYS_LEMONADE",
     links: { docs: "https://lemonade-server.ai/docs/api/openai/" },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -670,6 +717,7 @@ export const MORE_LOCAL_PROVIDERS: readonly ProviderCatalogEntry[] = [
     envVar: "SWARM_KEYS_GPT4ALL",
     links: { docs: "https://docs.gpt4all.io" },
     authHint: "Enable the Local API Server in Settings → Application → Advanced.",
+    isFree: true,
     isLocal: true,
   },
 ];

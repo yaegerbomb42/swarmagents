@@ -6,12 +6,14 @@ export {
   AbortError,
   ProviderError,
   RouterError,
+  classifyProbeError,
   classifyStatus,
   isCooldownKind,
   isRetryableKind,
   parseRetryAfter,
   redact,
 } from "./errors";
+export type { ProbeErrorClass, ProbeErrorInfo } from "./errors";
 export { KeyPool } from "./key-pool";
 export type { KeyFailure, KeyLease, KeyPoolOptions } from "./key-pool";
 export {
@@ -31,6 +33,17 @@ export type {
 } from "./cooldown-store";
 export { HealthChecker } from "./health";
 export type { HealthCheckerOptions, ProviderHealth } from "./health";
+export {
+  MODEL_CACHE_TTL_MS,
+  ModelListCache,
+  discoverModelsWithCache,
+  sharedModelListCache,
+} from "./model-cache";
+export type {
+  CachedDiscoveryResult,
+  DiscoverWithCacheOptions,
+  ModelListSource,
+} from "./model-cache";
 export {
   DEFAULT_BASE_URLS,
   DEFAULT_MODELS,

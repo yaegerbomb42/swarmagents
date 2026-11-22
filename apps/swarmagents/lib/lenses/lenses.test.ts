@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { configureProviderStorePaths } from "../providers/store";
+import { configureProviderStorePaths, saveProvider } from "../providers/store";
 import { buildLensUserMessage, capFiles, MAX_FILES, MAX_MESSAGE_CHARS } from "./prompts";
 import { getCachedLens, lensCacheKey, readLensCache, writeLensCacheEntry } from "./cache";
 import { orderProvidersByCost, providerModelPrice, runLens } from "./run";
@@ -19,9 +19,11 @@ let tempDir: string;
 test.beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "swarm-lenses-"));
   configureProviderStorePaths(join(tempDir, "providers.json"));
-  process.env.SWARM_KEYS_OPENAI = "sk-test-openai-lens";
+  // FIX-04: host SWARM_KEYS_* never serve account ids — seed a per-user key.
+  delete process.env.SWARM_KEYS_OPENAI;
   delete process.env.SWARM_KEYS_ANTHROPIC;
   delete process.env.SWARM_KEYS_GEMINI;
+  saveProvider(USER, { id: "openai", apiKey: "sk-test-openai-lens" });
 });
 
 test.afterEach(() => {

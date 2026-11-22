@@ -8,7 +8,9 @@
  * translates in both directions:
  *
  *   request:  Anthropic -> OpenAI   (system, content blocks text/image,
- *            tools <-> functions, tool_use/tool_result <-> tool_calls/tool role)
+ *            tools <-> functions, tool_use/tool_result <-> tool_calls/tool role,
+ *            tool_choice, tool_result is_error, max_tokens clamped to the
+ *            target model's known output cap)
  *   response: OpenAI -> Anthropic    (content blocks, tool_use from
  *            tool_calls, stop_reason mapping, usage mapping)
  *   SSE:     OpenAI chunks -> Anthropic events (message_start /
@@ -27,6 +29,28 @@ export class BridgeValidationError extends Error {
     super(message);
     this.name = "BridgeValidationError";
   }
+}
+
+/** Optional translation limits resolved by the caller (the gateway). */
+export interface BridgeOptions {
+  /**
+   * Hard cap on output tokens for the target model, when known. A request
+   * asking for more is clamped down to the cap so the upstream provider
+   * never rejects it as oversized. Undefined, zero, negative, or
+   * non-finite = no clamp; the request value passes through unchanged.
+   */
+  maxOutputTokens?: number;
+}
+
+/**
+ * Clamp a requested max_tokens to the target model's output cap.
+ * The value is floored first (matching the previous pass-through behavior);
+ * an unknown cap leaves it untouched.
+ */
+export function clampMaxTokens(maxTokens: number, cap: number | undefined): number {
+  const floored = Math.floor(maxTokens);
+  if (cap === undefined || !Number.isFinite(cap) || cap <= 0) return floored;
+  return Math.min(floored, Math.floor(cap));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -131,6 +155,48 @@ function anthropicToolsToOpenAI(tools: unknown): Record<string, unknown>[] | und
   return out.length > 0 ? out : undefined;
 }
 
+/**
+ * Anthropic tool_choice -> OpenAI tool_choice (+ parallel_tool_calls).
+ *
+ * Anthropic: {type:"auto"|"any"|"none"} or {type:"tool", name}, each
+ * optionally with disable_parallel_tool_use. OpenAI: "auto"|"required"|
+ * "none" or {type:"function", function:{name}}, plus parallel_tool_calls.
+ * Custom providers may already send the OpenAI shape; it passes through.
+ * Unknown shapes yield nothing (never emit an invalid upstream payload).
+ */
+function anthropicToolChoiceToOpenAI(toolChoice: unknown): {
+  toolChoice?: unknown;
+  parallelToolCalls?: boolean;
+} {
+  if (toolChoice === undefined || toolChoice === null) return {};
+  if (typeof toolChoice === "string") {
+    return ["auto", "none", "required"].includes(toolChoice) ? { toolChoice } : {};
+  }
+  const tc = isRecord(toolChoice) ? toolChoice : {};
+  const parallel = tc.disable_parallel_tool_use === true ? false : undefined;
+  switch (tc.type) {
+    case "auto":
+      return { toolChoice: "auto", parallelToolCalls: parallel };
+    case "any":
+      return { toolChoice: "required", parallelToolCalls: parallel };
+    case "none":
+      return { toolChoice: "none" };
+    case "tool": {
+      const name = asString(tc.name);
+      return name
+        ? { toolChoice: { type: "function", function: { name } }, parallelToolCalls: parallel }
+        : {};
+    }
+    case "function": {
+      // Pre-shaped OpenAI named-tool choice.
+      const fn = isRecord(tc.function) ? tc.function : {};
+      return asString(fn.name) ? { toolChoice: tc } : {};
+    }
+    default:
+      return {};
+  }
+}
+
 /** Anthropic assistant message -> OpenAI assistant message (with tool_calls). */
 function anthropicAssistantMessage(message: Record<string, unknown>): Record<string, unknown> {
   const content = message.content;
@@ -171,7 +237,11 @@ function anthropicAssistantMessage(message: Record<string, unknown>): Record<str
  * Translate an Anthropic Messages request into an OpenAI Chat Completions
  * request for `targetModel` (the provider's own model id).
  */
-export function anthropicToOpenAI(body: unknown, targetModel: string): Record<string, unknown> {
+export function anthropicToOpenAI(
+  body: unknown,
+  targetModel: string,
+  options: BridgeOptions = {},
+): Record<string, unknown> {
   const root = isRecord(body) ? body : {};
   const rawMessages = root.messages;
   if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
@@ -208,6 +278,12 @@ export function anthropicToOpenAI(body: unknown, targetModel: string): Record<st
             role: "tool",
             tool_call_id: toolCallId,
             content: openaiToolContent(b.content),
+            // OpenAI chat has no standard error flag on tool messages.
+            // Carry Anthropic's is_error as an extension field (servers
+            // that don't know it ignore it) so the failure semantics
+            // survive translation instead of being silently dropped.
+            // Only emitted when true: the common case stays byte-identical.
+            ...(b.is_error === true ? { is_error: true } : {}),
           });
         }
         if (others.length > 0) {
@@ -228,7 +304,7 @@ export function anthropicToOpenAI(body: unknown, targetModel: string): Record<st
     messages,
   };
   const maxTokens = asNumber(root.max_tokens);
-  if (maxTokens !== undefined) out.max_tokens = Math.floor(maxTokens);
+  if (maxTokens !== undefined) out.max_tokens = clampMaxTokens(maxTokens, options.maxOutputTokens);
   const temperature = asNumber(root.temperature);
   if (temperature !== undefined) out.temperature = temperature;
   const topP = asNumber(root.top_p);
@@ -237,7 +313,14 @@ export function anthropicToOpenAI(body: unknown, targetModel: string): Record<st
     out.stop = root.stop_sequences;
   }
   const tools = anthropicToolsToOpenAI(root.tools);
-  if (tools !== undefined) out.tools = tools;
+  if (tools !== undefined) {
+    out.tools = tools;
+    // tool_choice is only meaningful alongside tools; without them there
+    // is nothing to force, and strict upstreams reject a bare tool_choice.
+    const { toolChoice, parallelToolCalls } = anthropicToolChoiceToOpenAI(root.tool_choice);
+    if (toolChoice !== undefined) out.tool_choice = toolChoice;
+    if (parallelToolCalls !== undefined) out.parallel_tool_calls = parallelToolCalls;
+  }
   if (root.stream === true) {
     out.stream = true;
     out.stream_options = { include_usage: true };

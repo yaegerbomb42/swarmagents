@@ -16,11 +16,13 @@ import {
   removeProviderKey,
   rotateProviderKey,
   setProviderBilling,
+  setProviderEffort,
   setProviderRank,
   type ProviderBillingPatch,
   type ProviderKeyMutation,
 } from "./store";
 import type { ProviderKeySlot } from "./keys";
+import { isPerplexityEffort, type PerplexityEffort } from "./types";
 import { providerRow, type ProviderRow } from "./rows";
 import { recordAudit, type AuditAction } from "../audit";
 
@@ -29,6 +31,8 @@ export type ProviderKeyAction = "add-key" | "remove-key" | "rotate-key";
 export type ProviderRankAction = "set-rank" | "move-up" | "move-down";
 
 export type ProviderBillingAction = "free" | "paid" | "set-prices";
+
+export type ProviderEffortAction = "set-effort";
 
 export interface RankMutationRequest {
   action: ProviderRankAction;
@@ -89,6 +93,38 @@ export function parseBillingMutation(body: unknown): ProviderBillingPatch {
     inputPricePer1mTokens: inputPrice,
     outputPricePer1mTokens: outputPrice,
   };
+}
+
+const EFFORT_ACTIONS: Record<string, ProviderEffortAction> = {
+  "set-effort": "set-effort",
+  effort: "set-effort",
+};
+
+function readEffortAction(input: Record<string, unknown>): ProviderEffortAction | undefined {
+  const raw = typeof input.action === "string" ? input.action.trim().toLowerCase() : "";
+  if (EFFORT_ACTIONS[raw]) return EFFORT_ACTIONS[raw];
+  // `PATCH {effort: "low"}` (or `{effort: null}` to clear) is a convenient
+  // shorthand for `{action:"set-effort", effort}`.
+  if (raw === "" && "effort" in input) return "set-effort";
+  return undefined;
+}
+
+/** Validate a Perplexity effort payload. Returns the level, or null to clear. */
+export function parseEffortMutation(body: unknown): { effort: PerplexityEffort | null } {
+  const input = objectBody(body);
+  const action = readEffortAction(input);
+  if (!action) {
+    throw new ProviderMutationError('action must be "set-effort".', 400);
+  }
+  const effort = input.effort;
+  if (effort === null) return { effort: null };
+  if (!isPerplexityEffort(effort)) {
+    throw new ProviderMutationError(
+      "effort must be one of fast, low, medium, high, xhigh (or null to clear).",
+      400
+    );
+  }
+  return { effort };
 }
 
 function objectBody(body: unknown): Record<string, unknown> {
@@ -260,6 +296,11 @@ export function runKeyMutation(user: string, id: string, body: unknown): Mutatio
       ? readBillingAction(body as Record<string, unknown>)
       : undefined;
   if (billingAction) return runProviderBillingMutation(user, id, body);
+  const effortAction =
+    body && typeof body === "object" && !Array.isArray(body)
+      ? readEffortAction(body as Record<string, unknown>)
+      : undefined;
+  if (effortAction) return runProviderEffortMutation(user, id, body);
 
   let request: KeyMutationRequest | null = null;
   try {
@@ -317,6 +358,35 @@ export function runProviderBillingMutation(
   } catch (err) {
     if (user && patch) {
       recordAudit({ user, action: "provider.billing", target: id, result: "failure" });
+    }
+    return failure(err);
+  }
+}
+
+/** Apply a validated Perplexity effort mutation to one of `userId`'s providers. */
+export function applyEffortMutation(userId: string, id: string, body: unknown): ProviderRow {
+  const { effort } = parseEffortMutation(body);
+  const provider = setProviderEffort(userId, id, effort);
+  return providerRow(provider, { saved: true });
+}
+
+/** Apply a Perplexity effort mutation and shape the API response. */
+export function runProviderEffortMutation(
+  user: string,
+  id: string,
+  body: unknown
+): MutationResponse {
+  let parsed: { effort: PerplexityEffort | null } | null = null;
+  try {
+    parsed = parseEffortMutation(body);
+    const provider = applyEffortMutation(user, id, body);
+    if (user) {
+      recordAudit({ user, action: "provider.effort", target: id, result: "success" });
+    }
+    return { status: 200, body: { ok: true, provider } };
+  } catch (err) {
+    if (user && parsed) {
+      recordAudit({ user, action: "provider.effort", target: id, result: "failure" });
     }
     return failure(err);
   }

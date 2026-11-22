@@ -3,6 +3,9 @@
  *
  * Every llm.call telemetry event carries an estimated cost in USD:
  *   - $0 for providers marked free (isFree),
+ *   - the provider-reported cost when the response carried one
+ *     (usage.costUsd — e.g. the Perplexity Agent API's usage.cost, which
+ *     includes tool fees a token-rate estimate cannot see),
  *   - otherwise a per-model price table, overridable per provider by the
  *     inputPricePer1mTokens/outputPricePer1mTokens config fields,
  *   - "unknown" when no price is known for the provider/model pair.
@@ -76,8 +79,25 @@ export function configuredPrice(config: Pick<ProviderConfig, "inputPricePer1mTok
 }
 
 /**
- * Estimate the USD cost of one completion. Returns 0 for free providers, a
- * number when a price is known, and undefined when the price is unknown.
+ * The provider-reported cost carried on this usage, when usable (finite,
+ * non-negative). Undefined when the provider reported no cost or the value
+ * is malformed — callers then fall back to the price-table estimate.
+ */
+export function providerReportedCostUsd(usage: TokenUsage): number | undefined {
+  const cost = usage.costUsd;
+  return typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : undefined;
+}
+
+/** True when estimateCostUsd would return the provider-reported cost. */
+export function costWasReported(config: ProviderConfig, usage: TokenUsage): boolean {
+  return !isFreeProvider(config) && providerReportedCostUsd(usage) !== undefined;
+}
+
+/**
+ * Estimate the USD cost of one completion. Returns 0 for free providers,
+ * the provider-reported cost when the response carried one (it is the
+ * amount actually billed, tool fees included, so it beats any estimate),
+ * a number when a price is known, and undefined when the price is unknown.
  * Negative/NaN token counts are treated as zero.
  */
 export function estimateCostUsd(
@@ -86,6 +106,8 @@ export function estimateCostUsd(
   usage: TokenUsage,
 ): number | undefined {
   if (isFreeProvider(config)) return 0;
+  const reported = providerReportedCostUsd(usage);
+  if (reported !== undefined) return reported;
   const price = configuredPrice(config) ?? priceForModel(config.id, model);
   if (!price) return undefined;
   const input = Math.max(0, usage.inputTokens);

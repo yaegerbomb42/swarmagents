@@ -397,6 +397,21 @@ export interface RunRequest {
    * agent starts the run already knowing what it remembered last time.
    */
   memoryContext?: string;
+  /**
+   * Token-efficiency options for this invocation's appended system prompt
+   * (see lib/harness/context/system-packer.ts). Absent — or both flags
+   * false — means today's behaviour: the sections are joined untouched,
+   * byte-identical. The runtime fills this from the account's
+   * tokenEfficiency settings; the harness never reads settings itself.
+   */
+  systemPacker?: {
+    /** Pack sections to the token budget, truncating lowest-value first. */
+    pack?: boolean;
+    /** Estimated-token cap for the appended system prompt when packing. */
+    budgetTokens?: number;
+    /** Emit sections stable-first so provider prompt caches hit. */
+    cacheFriendlyOrder?: boolean;
+  };
   /** Resume a prior session instead of starting fresh (passed as --resume). */
   sessionId?: string;
   model?: string;

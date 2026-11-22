@@ -42,6 +42,84 @@ export interface UserSettings {
    * http://127.0.0.1:11434 when absent (the user's own local/BYOC runtime).
    */
   ollamaBaseUrl?: string;
+  /**
+   * Token-efficiency controls for the appended system prompt (see
+   * lib/harness/context/system-packer.ts). Every field is opt-in: absent
+   * means off, and off means the prompt is byte-identical to before.
+   */
+  tokenEfficiency?: TokenEfficiencySettings;
+}
+
+/** Per-user token-efficiency controls; all opt-in, all default off. */
+export interface TokenEfficiencySettings {
+  /**
+   * Pack the appended system prompt (agent card, codebase pack, role
+   * prompt, memory) to `systemBudgetTokens`, truncating the lowest-value
+   * sections first. The agent card core and role instructions are never
+   * truncated. Default false.
+   */
+  packSystemPrompt?: boolean;
+  /**
+   * Estimated-token cap for the appended system prompt when packing.
+   * Default 16,000 (see DEFAULT_SYSTEM_BUDGET_TOKENS in system-packer.ts;
+   * duplicated as a literal here so settings stays dependency-light).
+   */
+  systemBudgetTokens?: number;
+  /**
+   * Emit system-prompt sections stable-first (role → agent card →
+   * codebase pack → memory) so provider prompt caches hit. Changes the
+   * prompt the model sees, so it is opt-in. Default false.
+   */
+  cacheFriendlyOrder?: boolean;
+}
+
+/** Default estimated-token cap for the appended system prompt when packing. */
+export const DEFAULT_SYSTEM_BUDGET_TOKENS = 16_000;
+/** Bounds for a user-configured system-prompt budget. */
+export const MIN_SYSTEM_BUDGET_TOKENS = 1_000;
+export const MAX_SYSTEM_BUDGET_TOKENS = 200_000;
+
+/** Token-efficiency settings with every default resolved. */
+export interface ResolvedTokenEfficiency {
+  packSystemPrompt: boolean;
+  systemBudgetTokens: number;
+  cacheFriendlyOrder: boolean;
+}
+
+/** Resolve a user's token-efficiency settings (absent fields = off/default). */
+export function tokenEfficiencyFor(settings: UserSettings): ResolvedTokenEfficiency {
+  const te = settings.tokenEfficiency;
+  return {
+    packSystemPrompt: te?.packSystemPrompt === true,
+    systemBudgetTokens:
+      typeof te?.systemBudgetTokens === "number" &&
+      Number.isFinite(te.systemBudgetTokens) &&
+      te.systemBudgetTokens > 0
+        ? Math.min(
+            MAX_SYSTEM_BUDGET_TOKENS,
+            Math.max(MIN_SYSTEM_BUDGET_TOKENS, Math.floor(te.systemBudgetTokens)),
+          )
+        : DEFAULT_SYSTEM_BUDGET_TOKENS,
+    cacheFriendlyOrder: te?.cacheFriendlyOrder === true,
+  };
+}
+
+/**
+ * The harness run-request shape for these settings (RunRequest.systemPacker
+ * in lib/harness/types.ts). Kept as a plain object so this module does not
+ * import the harness layer.
+ */
+export function systemPackerOptionsFor(settings: UserSettings): {
+  pack: boolean;
+  budgetTokens: number;
+  cacheFriendlyOrder: boolean;
+} {
+  const resolved = tokenEfficiencyFor(settings);
+  return {
+    pack: resolved.packSystemPrompt,
+    budgetTokens: resolved.systemBudgetTokens,
+    cacheFriendlyOrder: resolved.cacheFriendlyOrder,
+  };
 }
 
 /** Default local Ollama endpoint. */
@@ -83,6 +161,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Parse the nested tokenEfficiency object; invalid fields are dropped. */
+function parseTokenEfficiency(value: unknown): TokenEfficiencySettings | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: TokenEfficiencySettings = {};
+  if (typeof value.packSystemPrompt === "boolean") out.packSystemPrompt = value.packSystemPrompt;
+  if (typeof value.cacheFriendlyOrder === "boolean") out.cacheFriendlyOrder = value.cacheFriendlyOrder;
+  const budget = value.systemBudgetTokens;
+  if (typeof budget === "number" && Number.isFinite(budget) && budget > 0) {
+    out.systemBudgetTokens = Math.min(
+      MAX_SYSTEM_BUDGET_TOKENS,
+      Math.max(MIN_SYSTEM_BUDGET_TOKENS, Math.floor(budget)),
+    );
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** Parse a settings file body; invalid shapes fall back to defaults. */
 export function parseUserSettings(raw: unknown): UserSettings {
   if (!isRecord(raw)) return { ...DEFAULT_USER_SETTINGS };
@@ -100,6 +194,8 @@ export function parseUserSettings(raw: unknown): UserSettings {
   if (perDay !== undefined) out.perDayBudgetUsd = perDay;
   const ollamaBaseUrl = parseOllamaUrl(raw.ollamaBaseUrl);
   if (ollamaBaseUrl !== undefined) out.ollamaBaseUrl = ollamaBaseUrl;
+  const tokenEfficiency = parseTokenEfficiency(raw.tokenEfficiency);
+  if (tokenEfficiency !== undefined) out.tokenEfficiency = tokenEfficiency;
   return out;
 }
 

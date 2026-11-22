@@ -11,10 +11,11 @@ import type {
   ApiStyle,
   AuthScheme,
   ModelCapabilities,
+  PerplexityEffort,
   ProviderConfig,
   ProviderKind,
 } from "./types";
-import { isApiStyle, isAuthScheme } from "./types";
+import { isApiStyle, isAuthScheme, isPerplexityEffort, PERPLEXITY_EFFORTS } from "./types";
 
 const PROVIDER_KINDS = new Set<ProviderKind>(["anthropic", "openai", "gemini"]);
 const VALID_TIER_NAMES = new Set<string>(["fast", "standard", "balanced", "deep"]);
@@ -126,6 +127,16 @@ function parseAuth(value: unknown, path: string): ProviderConfig["auth"] | undef
   };
 }
 
+function parseEffort(value: unknown, path: string): PerplexityEffort | undefined {
+  if (value === undefined) return undefined;
+  if (!isPerplexityEffort(value)) {
+    throw new ConfigValidationError(
+      `${path} must be one of ${PERPLEXITY_EFFORTS.join(", ")}. Got ${JSON.stringify(value)}.`
+    );
+  }
+  return value;
+}
+
 function parseAvailableModels(value: unknown, path: string): string[] | undefined {
   const models = assertOptionalStringArray(value, path);
   if (!models) return undefined;
@@ -226,6 +237,7 @@ function parseProvider(raw: unknown, index: number): ProviderConfig {
     keys: assertOptionalStringArray(obj.keys, `${path}.keys`),
     headers: assertOptionalStringRecord(obj.headers, `${path}.headers`),
     timeoutMs: assertOptionalNumber(obj.timeoutMs, `${path}.timeoutMs`, 0),
+    effort: parseEffort(obj.effort, `${path}.effort`),
   };
 
   return config;

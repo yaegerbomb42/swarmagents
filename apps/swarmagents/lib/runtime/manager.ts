@@ -35,7 +35,7 @@ import {
   isClaudeFailoverEligible,
 } from "../providers";
 import { routerProviders, userCooldownFilePath, userProvidersSignature } from "../providers/store";
-import { readUserSettings } from "../providers/settings";
+import { readUserSettings, systemPackerOptionsFor } from "../providers/settings";
 import {
   CONSERVATIVE_CAPABILITIES,
   mergedModelCapabilities,
@@ -2751,6 +2751,10 @@ export class RuntimeManager {
     // and writes the resolution file (with the post-handoff state summary).
     const handoffGateway: HandoffGateway = this.handoffGatewayFor(active, new Set<string>());
 
+    // Token-efficiency options for this invocation's system prompt, from
+    // the account's settings (absent = off = byte-identical prompt).
+    const systemPacker = systemPackerOptionsFor(readUserSettings(userId));
+
     try {
       const outcome = await this.runner.run(
         {
@@ -2759,6 +2763,7 @@ export class RuntimeManager {
           prompt: active.contextPrefix ? `${active.contextPrefix}\n\n${active.prompt}` : active.prompt,
           agentCard: active.agentCard,
           memoryContext: active.memoryContext,
+          systemPacker,
           sessionId: active.sessionId,
           model: active.model,
           provider: selection?.provider,

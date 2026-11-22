@@ -521,6 +521,8 @@ interface ServerProviderRow {
   inputPricePer1mTokens?: number;
   outputPricePer1mTokens?: number;
   quotaCoolingDownUntil?: number;
+  /** Perplexity Agent API effort level that will be sent, when one is set. */
+  effort?: string;
 }
 
 type BillingPatch = {
@@ -528,6 +530,18 @@ type BillingPatch = {
   inputPricePer1mTokens?: number;
   outputPricePer1mTokens?: number;
 };
+
+/**
+ * Perplexity Agent API effort levels (mirrors PERPLEXITY_EFFORTS in
+ * lib/providers/types.ts, which is server-only and cannot be imported here).
+ */
+const PERPLEXITY_EFFORT_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: 'fast', label: 'Fast' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'X-high' },
+];
 
 const fmtQuotaTime = (until: number): string => {
   const d = new Date(until);
@@ -550,6 +564,9 @@ function Providers({
   const [expanded, setExpanded] = useState<string | null>(null);
   const [preferFree, setPreferFree] = useState<boolean | null>(null);
   const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean | null>(null);
+  const [decisionBrainEnabled, setDecisionBrainEnabled] = useState<boolean | null>(null);
+  const [gitAutoCommit, setGitAutoCommit] = useState<boolean | null>(null);
+  const [autoTestVerification, setAutoTestVerification] = useState<boolean | null>(null);
   const [allowPaidProviders, setAllowPaidProviders] = useState<boolean>(false);
   const [perRunBudget, setPerRunBudget] = useState<string>('');
   const [perDayBudget, setPerDayBudget] = useState<string>('');
@@ -572,6 +589,9 @@ function Providers({
           const body = (await settingsRes.json()) as {
             preferFreeProviders?: unknown;
             injectCodebaseContext?: unknown;
+            decisionBrain?: unknown;
+            gitAutoCommit?: unknown;
+            autoTestVerification?: unknown;
             ollamaBaseUrl?: unknown;
             allowPaidProviders?: unknown;
             perRunBudgetUsd?: unknown;
@@ -579,6 +599,14 @@ function Providers({
           };
           if (typeof body.preferFreeProviders === 'boolean') setPreferFree(body.preferFreeProviders);
           if (typeof body.injectCodebaseContext === 'boolean') setInjectCodebaseContext(body.injectCodebaseContext);
+          if (body.decisionBrain && typeof body.decisionBrain === 'object' && !Array.isArray(body.decisionBrain)) {
+            const brain = body.decisionBrain as { enabled?: unknown };
+            setDecisionBrainEnabled(brain.enabled === true);
+          } else {
+            setDecisionBrainEnabled(false);
+          }
+          if (typeof body.gitAutoCommit === 'boolean') setGitAutoCommit(body.gitAutoCommit);
+          if (typeof body.autoTestVerification === 'boolean') setAutoTestVerification(body.autoTestVerification);
           if (typeof body.ollamaBaseUrl === 'string') setOllamaBaseUrl(body.ollamaBaseUrl);
           if (typeof body.allowPaidProviders === 'boolean') {
             setAllowPaidProviders(body.allowPaidProviders);
@@ -689,6 +717,60 @@ function Providers({
     }
   };
 
+  const setDecisionBrainRemote = async (v: boolean) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ decisionBrain: { enabled: v } }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not save Decision Brain setting.');
+        return;
+      }
+      setDecisionBrainEnabled(v);
+    } catch {
+      setSettingsError('Could not save Decision Brain setting.');
+    }
+  };
+
+  const setGitAutoCommitRemote = async (v: boolean) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ gitAutoCommit: v }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not save auto-commit setting.');
+        return;
+      }
+      setGitAutoCommit(v);
+    } catch {
+      setSettingsError('Could not save auto-commit setting.');
+    }
+  };
+
+  const setAutoTestVerificationRemote = async (v: boolean) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoTestVerification: v }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not save verification-test setting.');
+        return;
+      }
+      setAutoTestVerification(v);
+    } catch {
+      setSettingsError('Could not save verification-test setting.');
+    }
+  };
+
   const patchServerBilling = async (id: string, patch: BillingPatch, row?: ServerProviderRow) => {
     setSettingsError(null);
     let body: Record<string, unknown>;
@@ -730,6 +812,26 @@ function Providers({
     }
   };
 
+  const patchServerEffort = async (id: string, effort: string | null) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch(`/api/providers/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'set-effort', effort }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not update effort level.');
+        return;
+      }
+      setServerRows((rows) =>
+        (rows ?? []).map((r) => (r.id === id ? { ...r, effort: effort ?? undefined } : r)),
+      );
+    } catch {
+      setSettingsError('Could not update effort level.');
+    }
+  };
+
   const add = (presetId: string) => {
     const p = PROVIDERS.find((x) => x.id === presetId)!;
     const cfg: ProviderConfig = {
@@ -764,6 +866,39 @@ function Providers({
                   </div>
                 </div>
                 <Toggle on={injectCodebaseContext} onChange={(v) => void setInjectCodebaseContextRemote(v)} accent={accent} />
+              </div>
+            )}
+            {decisionBrainEnabled !== null && (
+              <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+                <div>
+                  <div className="text-xs text-white/85">Decision Brain loop control</div>
+                  <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                    Review each tool call before it runs: destructive commands pause for approval, exhausted turn budgets stop the run. Off by default; brain failures never block a run.
+                  </div>
+                </div>
+                <Toggle on={decisionBrainEnabled} onChange={(v) => void setDecisionBrainRemote(v)} accent={accent} />
+              </div>
+            )}
+            {gitAutoCommit !== null && (
+              <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+                <div>
+                  <div className="text-xs text-white/85">Auto-commit after runs</div>
+                  <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                    After a successful run, stage tracked changes and commit them with an AI-written message. Off by default; a failed commit never fails the run.
+                  </div>
+                </div>
+                <Toggle on={gitAutoCommit} onChange={(v) => void setGitAutoCommitRemote(v)} accent={accent} />
+              </div>
+            )}
+            {autoTestVerification !== null && (
+              <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+                <div>
+                  <div className="text-xs text-white/85">Verification test after runs</div>
+                  <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                    After a successful run, generate and run a quick verification test for one function the agent edited. Off by default; a failing test is reported, never fails the run.
+                  </div>
+                </div>
+                <Toggle on={autoTestVerification} onChange={(v) => void setAutoTestVerificationRemote(v)} accent={accent} />
               </div>
             )}
             {settingsError && <div className="mt-2 text-[10px] text-red-300/80">{settingsError}</div>}
@@ -908,6 +1043,25 @@ function Providers({
                         value={row.outputPricePer1mTokens}
                         onChange={(v) => void patchServerBilling(row.id, { outputPricePer1mTokens: v }, row)}
                       />
+                    </div>
+                  </div>
+                )}
+                {row.id === 'perplexity' && (
+                  <div className="mt-2">
+                    <label className="block">
+                      <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">Effort level</span>
+                      <select
+                        value={row.effort ?? ''}
+                        onChange={(e) => void patchServerEffort(row.id, e.target.value === '' ? null : e.target.value)}
+                        data-testid="provider-effort-perplexity"
+                        className="w-full rounded-xl bg-black/20 px-3 py-2 text-xs text-white/85 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
+                      >
+                        <option value="">Default (server)</option>
+                        {PERPLEXITY_EFFORT_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                      </select>
+                    </label>
+                    <div className="mt-1 text-[10px] text-white/35">
+                      Agent API effort: higher levels run deeper multi-step research (more steps, more cost).
                     </div>
                   </div>
                 )}

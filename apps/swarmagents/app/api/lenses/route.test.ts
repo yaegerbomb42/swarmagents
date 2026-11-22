@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NextRequest } from "next/server";
 import { POST } from "./route";
-import { configureProviderStorePaths } from "../../../lib/providers/store";
+import { configureProviderStorePaths, saveProvider } from "../../../lib/providers/store";
 import { configureRunsDir, getRunsDir } from "../../../lib/telemetry/paths";
 import { VmManager, setVmManagerForTesting } from "../../../lib/vm/manager";
 import { FakeVmDriver } from "../../../lib/vm/fake-driver";
@@ -20,9 +20,11 @@ test.beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "swarm-lens-route-"));
   configureProviderStorePaths(join(tempDir, "providers.json"));
   configureRunsDir(join(tempDir, "runs"));
-  process.env.SWARM_KEYS_OPENAI = apiKey;
+  // FIX-04: host SWARM_KEYS_* never serve account ids — seed a per-user key.
+  delete process.env.SWARM_KEYS_OPENAI;
   delete process.env.SWARM_KEYS_ANTHROPIC;
   delete process.env.SWARM_KEYS_GEMINI;
+  saveProvider(USER, { id: "openai", apiKey });
 });
 
 test.afterEach(() => {

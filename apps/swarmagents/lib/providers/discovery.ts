@@ -16,6 +16,7 @@ import {
   parseResponse,
 } from "./adapters";
 import { ProviderError, redact } from "./errors";
+import { guardStreamTimeouts } from "./stream";
 import type { ModelCapabilities, ProviderConfig } from "./types";
 
 export interface DiscoveredModel {
@@ -197,13 +198,32 @@ async function requestWithTimeout(
   options: ProbeOptions,
 ): Promise<Response> {
   if (options.signal) return fetchImpl(url, init);
+  const timeoutMs = options.timeoutMs ?? 12_000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 12_000);
+  const startedAt = Date.now();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  let response: Response;
   try {
-    return await fetchImpl(url, { ...init, signal: controller.signal });
-  } finally {
+    response = await fetchImpl(url, { ...init, signal: controller.signal });
+  } catch (err) {
     clearTimeout(timer);
+    throw err;
   }
+  if (!response.body) {
+    clearTimeout(timer);
+    return response;
+  }
+  // The deadline covers the body read too (FIX-06): the guard errors the
+  // stream when the remaining budget runs out, and settling it clears the
+  // abort timer so a completed probe leaves nothing armed.
+  const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+  const guarded = guardStreamTimeouts(response.body, {
+    firstByteMs: remainingMs,
+    idleMs: remainingMs,
+    onSettle: () => clearTimeout(timer),
+  });
+  return new Response(guarded, response);
 }
 
 async function errorFromResponse(

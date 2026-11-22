@@ -43,6 +43,107 @@ export interface ReportShotMeta {
 
 import type { RunReceipt } from "./run-receipt";
 
+/** Token + cost totals for one provider/model pair within a run. */
+export interface ModelTokenAccounting {
+  provider: string;
+  model: string;
+  /** Gateway attempts (llm.call events), ok or not. */
+  calls: number;
+  /** Attempts that succeeded (outcome "ok"). */
+  okCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+  /**
+   * Sum of per-call costs (lib/providers/pricing.ts, stamped on each
+   * llm.call at emit time). Provider-reported costs (usage.cost) are
+   * preferred over estimates when present — see reportedCostCalls.
+   * Undefined when no call reported a price — the UI shows "unknown",
+   * never an invented number.
+   */
+  costUsd?: number;
+  /** Calls whose price was unknown (costUsd null on the event). */
+  unknownCostCalls: number;
+  /** Priced calls whose costUsd is the provider-reported amount. */
+  reportedCostCalls: number;
+}
+
+/**
+ * Per-run token accounting, folded from the run's telemetry at report
+ * time (see lib/telemetry/run-token-accounting.ts). `byModel`/`totals`
+ * come from gateway llm.call events; `harness` is the CLI stream's own
+ * usage accounting, present when the stream reported usage.
+ */
+export interface RunTokenAccounting {
+  /** Per provider/model breakdown, busiest first. */
+  byModel: ModelTokenAccounting[];
+  totals: {
+    calls: number;
+    okCalls: number;
+    inputTokens: number;
+    outputTokens: number;
+    /** Undefined when no call in the run reported a price. */
+    costUsd?: number;
+    unknownCostCalls: number;
+    /** Priced calls whose costUsd is the provider-reported amount. */
+    reportedCostCalls: number;
+  };
+  /** Harness-reported usage (CLI stream), when present. */
+  harness?: {
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+  };
+}
+
+/**
+ * Where a cost figure came from: "reported" (every priced call's amount is
+ * the provider-reported one), "estimated" (every priced call was priced
+ * from local per-token tables — gateway estimates, or the harness CLI's
+ * own total), or "mixed" (both kinds in one run, e.g. failover across
+ * providers).
+ */
+export type CostProvenance = "reported" | "estimated" | "mixed";
+
+/** A classified cost figure plus the call counts the verdict came from. */
+export interface CostProvenanceInfo {
+  provenance: CostProvenance;
+  /** Priced calls (calls − unknownCostCalls). */
+  pricedCalls: number;
+  /** Of the priced calls, how many carry the provider-reported amount. */
+  reportedCalls: number;
+}
+
+/**
+ * Classify a cost figure's provenance from its accounting counts. Every
+ * gateway call either priced (a costUsd was stamped) or counted unknown,
+ * so priced calls = calls − unknownCostCalls; of those, reportedCostCalls
+ * carry the provider-reported amount. Undefined when there is no figure
+ * to classify: cost unknown, a $0 figure (free providers and reported
+ * zeros — the $0 stands alone, unlabeled), or counts too inconsistent to
+ * classify honestly. Legacy accounting without reportedCostCalls reads
+ * as 0 reported — correct, since every cost was an estimate before
+ * reported costs were captured. Shared by the report builder (which
+ * records the verdict on ReportCardMeta) and the report card (which
+ * renders it), so the two can never disagree.
+ */
+export function classifyCostProvenance(accounting: {
+  costUsd?: number;
+  calls: number;
+  unknownCostCalls: number;
+  reportedCostCalls: number;
+}): CostProvenanceInfo | undefined {
+  const { costUsd } = accounting;
+  if (costUsd === undefined || !Number.isFinite(costUsd) || costUsd <= 0) return undefined;
+  const calls = Number.isFinite(accounting.calls) ? accounting.calls : 0;
+  const unknown = Number.isFinite(accounting.unknownCostCalls) ? accounting.unknownCostCalls : 0;
+  const priced = calls - unknown;
+  if (priced <= 0) return undefined;
+  const reportedRaw = Number.isFinite(accounting.reportedCostCalls) ? accounting.reportedCostCalls : 0;
+  const reported = Math.min(Math.max(reportedRaw, 0), priced);
+  const provenance: CostProvenance = reported === priced ? "reported" : reported === 0 ? "estimated" : "mixed";
+  return { provenance, pricedCalls: priced, reportedCalls: reported };
+}
+
 /** A file the agent created or modified under /workspace during the run. */
 export interface ReportArtifact {
   /** Absolute path inside the VM. */
@@ -82,6 +183,19 @@ export interface ReportCardMeta {
   artifacts: number;
   durationMs?: number;
   costUsd?: number;
+  /**
+   * Where costUsd came from (see CostProvenance): the gateway accounting
+   * total classified by its reported/estimated call counts when the run
+   * crossed the gateway, else "estimated" for the harness CLI's own
+   * total. Absent on reports written before provenance was recorded and
+   * when there is no figure worth labeling (no cost, or $0) — the card
+   * then shows the figure bare, exactly as before.
+   */
+  costProvenance?: CostProvenance;
+  /** Input tokens moved by the run (gateway totals, else harness totals). */
+  tokensIn?: number;
+  /** Output tokens moved by the run (gateway totals, else harness totals). */
+  tokensOut?: number;
   /** Provider ids used by the run (empty for legacy host-env runs). */
   providers: string[];
   model?: string;
@@ -153,6 +267,12 @@ export interface RunReport {
   /** Screenshots taken at start, during, and at end of the run. */
   shots: ReportShotMeta[];
   meta: ReportCardMeta;
+  /**
+   * Per-model token accounting folded from the run's llm.call / usage
+   * telemetry. Absent on reports written before it existed, and on runs
+   * whose telemetry carried no usage at all.
+   */
+  tokenAccounting?: RunTokenAccounting;
   /**
    * Auto-audit verdict from the run's role-pinned lens, when one has landed
    * (stored separately and merged into the report by the serving route).

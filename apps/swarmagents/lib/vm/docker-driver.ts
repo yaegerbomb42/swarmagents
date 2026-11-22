@@ -268,6 +268,51 @@ export const VM_CAPABILITIES = [
 /** Pull timeout for SWARM_VM_PULL=1, ms. Default 2 min. */
 export const SWARM_VM_PULL_TIMEOUT_MS = Number(process.env.SWARM_VM_PULL_TIMEOUT_MS ?? "120000");
 
+/** Read a positive timeout (ms) from the environment, falling back when unset/invalid. */
+function envTimeoutMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+/**
+ * Per-command-class deadlines for docker CLI calls (FIX-05). Every `run()` /
+ * `runRaw()` call carries one of these by default, so a wedged Docker daemon
+ * fails the operation with a typed timeout instead of holding the per-user
+ * VM lock forever. An explicit `timeoutMs` at a call site (e.g. the pull
+ * deadline above) always wins over the class default.
+ */
+export type DockerTimeoutClass = "quick" | "standard" | "long" | "commit";
+
+/** Read-only metadata calls (`inspect`, `ls`, `info`): they answer in ms or the daemon is wedged. */
+export const SWARM_VM_DOCKER_QUICK_TIMEOUT_MS = envTimeoutMs("SWARM_VM_DOCKER_QUICK_TIMEOUT_MS", 15_000);
+/** Ordinary mutations (create/remove/rename/start/stop/exec file ops). `docker stop` alone waits out a 10s grace. */
+export const SWARM_VM_DOCKER_TIMEOUT_MS = envTimeoutMs("SWARM_VM_DOCKER_TIMEOUT_MS", 30_000);
+/** Container create/run and bulk copies (`cp` of a workspace tree). */
+export const SWARM_VM_DOCKER_LONG_TIMEOUT_MS = envTimeoutMs("SWARM_VM_DOCKER_LONG_TIMEOUT_MS", 120_000);
+/** `docker commit` of a large container filesystem can legitimately take minutes. */
+export const SWARM_VM_DOCKER_COMMIT_TIMEOUT_MS = envTimeoutMs("SWARM_VM_DOCKER_COMMIT_TIMEOUT_MS", 300_000);
+
+/** Built-in per-class docker CLI deadlines (env-tunable via the constants above). */
+export const DEFAULT_DOCKER_TIMEOUTS: Record<DockerTimeoutClass, number> = {
+  quick: SWARM_VM_DOCKER_QUICK_TIMEOUT_MS,
+  standard: SWARM_VM_DOCKER_TIMEOUT_MS,
+  long: SWARM_VM_DOCKER_LONG_TIMEOUT_MS,
+  commit: SWARM_VM_DOCKER_COMMIT_TIMEOUT_MS,
+};
+
+/** Classify a docker argv into its deadline class. Exported for tests. */
+export function dockerTimeoutClassFor(args: readonly string[]): DockerTimeoutClass {
+  const [cmd, sub] = args;
+  if (cmd === "commit") return "commit";
+  if (cmd === "run" || cmd === "create" || cmd === "cp" || cmd === "pull") return "long";
+  if (cmd === "info") return "quick";
+  if ((cmd === "container" || cmd === "image") && sub === "inspect") return "quick";
+  if (cmd === "volume" && sub === "ls") return "quick";
+  return "standard";
+}
+
 /** Typed error thrown when the Docker VM cannot be made available. */
 export class VmUnavailableError extends Error {
   readonly cause?: Error;
@@ -275,6 +320,26 @@ export class VmUnavailableError extends Error {
     super(message);
     this.name = "VmUnavailableError";
     this.cause = cause;
+  }
+}
+
+/**
+ * A docker CLI call exceeded its deadline and was killed (FIX-05). A
+ * VmUnavailableError subclass so existing availability handling keeps
+ * working, but distinguishable: logs and the UI can say "timed out" (and
+ * which command) instead of a generic failure. Retryable: the daemon may
+ * answer on the next attempt.
+ */
+export class DockerTimeoutError extends VmUnavailableError {
+  /** The docker subcommand that timed out (e.g. "inspect", "run"). */
+  readonly command: string;
+  /** The deadline that was exceeded, ms. */
+  readonly timeoutMs: number;
+  constructor(command: string, timeoutMs: number, signal?: string) {
+    super(`docker ${command} timed out after ${timeoutMs}ms${signal ? ` (${signal})` : ""}.`);
+    this.name = "DockerTimeoutError";
+    this.command = command;
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -688,6 +753,12 @@ export interface DockerVmDriverOptions {
   desktop?: boolean;
   /** How long to wait after the JS timeout deadline before killing the docker CLI. */
   killGraceMs?: number;
+  /**
+   * Per-class docker CLI deadlines (FIX-05). Overrides the
+   * SWARM_VM_DOCKER_*_TIMEOUT_MS env defaults per class; an explicit
+   * `timeoutMs` at a call site still wins over both.
+   */
+  dockerTimeouts?: Partial<Record<DockerTimeoutClass, number>>;
   /** Injectable spawn for tests (defaults to node:child_process spawn). */
   spawnFn?: DockerSpawnFn;
   /**
@@ -722,6 +793,8 @@ export class DockerVmDriver implements VmDriver {
   /** Desktop mode: true when the VM gets a desktop + VNC endpoint. */
   readonly desktop: boolean;
   private readonly killGraceMs: number;
+  /** Resolved per-class docker CLI deadlines (constructor > env > built-in). */
+  private readonly dockerTimeouts: Record<DockerTimeoutClass, number>;
   private readonly spawnFn: DockerSpawnFn;
   /**
    * Per-user VNC passwords generated for desktop containers in this process.
@@ -757,6 +830,7 @@ export class DockerVmDriver implements VmDriver {
     this.runtime = resolveVmRuntime(process.env, opts.runtime);
     this.network = resolveVmNetwork(process.env, opts.network);
     this.killGraceMs = opts.killGraceMs ?? 3000;
+    this.dockerTimeouts = { ...DEFAULT_DOCKER_TIMEOUTS, ...(opts.dockerTimeouts ?? {}) };
     // Node's spawn is overloaded; pin it to our single signature.
     this.spawnFn = opts.spawnFn ?? (spawn as unknown as DockerSpawnFn);
     this.legacyOwnerCandidates = opts.legacyOwnerCandidates ?? defaultLegacyOwnerCandidates;
@@ -770,6 +844,14 @@ export class DockerVmDriver implements VmDriver {
 
   /** Same as run() but keeps stdout as raw bytes (binary-safe). */
   private async runRaw(args: string[], opts?: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; signal?: AbortSignal; stdin?: string | Buffer }): Promise<{ code: number; stdout: Buffer; stderr: string }> {
+    // Every docker CLI call is deadline-bound (FIX-05): an explicit
+    // timeoutMs wins; otherwise the per-class default applies, so a wedged
+    // daemon fails the call with a typed timeout instead of holding the
+    // caller's per-user lock forever.
+    const timeoutMs =
+      opts?.timeoutMs && opts.timeoutMs > 0
+        ? opts.timeoutMs
+        : this.dockerTimeouts[dockerTimeoutClassFor(args)];
     return new Promise((resolve, reject) => {
       const cp = this.spawnFn("docker", args, {
         cwd: opts?.cwd,
@@ -779,10 +861,18 @@ export class DockerVmDriver implements VmDriver {
       });
 
       let settled = false;
+      let t: ReturnType<typeof setTimeout> | null = null;
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearTimers = () => {
+        if (t) clearTimeout(t);
+        if (killTimer) clearTimeout(killTimer);
+        t = null;
+        killTimer = null;
+      };
       const fail = (err: unknown) => {
         if (settled) return;
         settled = true;
-        if (t) clearTimeout(t);
+        clearTimers();
         const errno = err as NodeJS.ErrnoException;
         if (errno?.code === "ENOENT") {
           reject(
@@ -799,6 +889,17 @@ export class DockerVmDriver implements VmDriver {
       const chunks: Buffer[] = [];
       let stderr = "";
       let killedByTimeout = false;
+      // SIGTERM first; a CLI that ignores it gets SIGKILL after the grace
+      // period, so no zombie docker client outlives its deadline or abort.
+      const terminate = () => {
+        try { cp.kill("SIGTERM"); } catch { /* ignore */ }
+        if (!killTimer) {
+          killTimer = setTimeout(() => {
+            try { cp.kill("SIGKILL"); } catch { /* ignore */ }
+          }, this.killGraceMs);
+          killTimer.unref?.();
+        }
+      };
       cp.stdout?.on("data", (buf) => { chunks.push(Buffer.from(buf as Buffer)); });
       cp.stderr?.on("data", (buf) => { stderr += String(buf); });
       // A broken output pipe must settle this call, never escape unhandled.
@@ -814,9 +915,7 @@ export class DockerVmDriver implements VmDriver {
       }
 
       if (opts?.signal) {
-        const onAbort = () => {
-          try { cp.kill("SIGTERM"); } catch { /* ignore */ }
-        };
+        const onAbort = () => terminate();
         if (opts.signal.aborted) {
           onAbort();
         } else {
@@ -824,31 +923,33 @@ export class DockerVmDriver implements VmDriver {
         }
       }
 
-      const t = opts?.timeoutMs && opts.timeoutMs > 0
-        ? setTimeout(() => {
-            killedByTimeout = true;
-            try { cp.kill("SIGTERM"); } catch { /* ignore */ }
-          }, opts.timeoutMs)
-        : null;
+      t = setTimeout(() => {
+        killedByTimeout = true;
+        terminate();
+      }, timeoutMs);
+      t.unref?.();
 
       cp.on("error", fail);
 
       cp.on("close", (code, signal) => {
         if (settled) return;
         settled = true;
-        if (t) clearTimeout(t);
+        clearTimers();
+        // We killed this CLI for exceeding its deadline: report the timeout
+        // (typed, with the command) whatever exit the kill produced.
+        if (killedByTimeout) {
+          reject(new DockerTimeoutError(args[0] ?? "command", timeoutMs, signal ?? undefined));
+          return;
+        }
         // A null exit code means the docker CLI itself was killed by a
         // signal. Never report that as success: a pull/run/rm that died to a
         // timeout must surface the real cause (and its signal), not a later
         // misleading "Unable to find image" from the following call.
         if (code === null) {
           const sig = signal ?? "unknown signal";
-          const reason = killedByTimeout
-            ? `timed out after ${opts?.timeoutMs}ms`
-            : "was terminated by a signal";
           reject(
             new VmUnavailableError(
-              `docker ${args[0] ?? "command"} ${reason} (${sig}).`,
+              `docker ${args[0] ?? "command"} was terminated by a signal (${sig}).`,
             ),
           );
           return;
@@ -1095,7 +1196,8 @@ export class DockerVmDriver implements VmDriver {
       const tarball = execFileSync(
         "tar",
         ["-cf", "-", ...desktopVncTarArgs(), "-C", dir, entryName],
-        { stdio: ["ignore", "pipe", "pipe"] },
+        // One tiny file; bound it anyway so a wedged tar cannot hang ensure().
+        { stdio: ["ignore", "pipe", "pipe"], timeout: 10_000, killSignal: "SIGKILL" },
       );
       const res = await this.run(
         ["cp", "-", `${containerName}:/home/node/.vnc/`],
@@ -1386,10 +1488,28 @@ export class DockerVmDriver implements VmDriver {
 
       const cp = this.spawnFn("docker", argv, { env, shell: false });
 
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearTimers = () => {
+        if (t) clearTimeout(t);
+        if (killTimer) clearTimeout(killTimer);
+        killTimer = null;
+      };
+      // SIGTERM first; a CLI that ignores it gets SIGKILL after the grace
+      // period, so an aborted/timed-out exec never leaves a zombie client.
+      const terminate = () => {
+        try { cp.kill("SIGTERM"); } catch { /* ignore */ }
+        if (!killTimer) {
+          killTimer = setTimeout(() => {
+            try { cp.kill("SIGKILL"); } catch { /* ignore */ }
+          }, this.killGraceMs);
+          killTimer.unref?.();
+        }
+      };
+
       const settle = (code: number) => {
         if (settled) return;
         settled = true;
-        if (t) clearTimeout(t);
+        clearTimers();
         if (removeAbort) removeAbort();
         resolve({ exitCode: code });
       };
@@ -1397,7 +1517,7 @@ export class DockerVmDriver implements VmDriver {
       const fail = (err: unknown) => {
         if (settled) return;
         settled = true;
-        if (t) clearTimeout(t);
+        clearTimers();
         if (removeAbort) removeAbort();
         reject(err);
       };
@@ -1413,7 +1533,7 @@ export class DockerVmDriver implements VmDriver {
         const onAbort = () => {
           if (settled) return;
           aborted = true;
-          try { cp.kill("SIGTERM"); } catch { /* ignore */ }
+          terminate();
           // Best-effort: kill the process group recorded for THIS exec only,
           // so concurrent execs in the same container keep running. Scoped
           // cleanup; if the daemon is wedged, the CLI kill still resolves.
@@ -1433,7 +1553,7 @@ export class DockerVmDriver implements VmDriver {
         ? setTimeout(() => {
             if (settled) return;
             timedOut = true;
-            try { cp.kill("SIGTERM"); } catch { /* ignore */ }
+            terminate();
           }, timeoutMs + this.killGraceMs)
         : null;
 
@@ -1480,7 +1600,9 @@ export class DockerVmDriver implements VmDriver {
     // Create the parent directory first.
     const idx = path.lastIndexOf("/");
     const dir = idx > 0 ? path.slice(0, idx) : "/";
-    const mkdir = await this.exec(handle, ["mkdir", "-p", dir]);
+    const mkdir = await this.exec(handle, ["mkdir", "-p", dir], {
+      timeoutMs: this.dockerTimeouts.standard,
+    });
     if (mkdir.exitCode !== 0) {
       throw new Error(`writeFile failed to create directory ${dir}`);
     }
@@ -1494,6 +1616,9 @@ export class DockerVmDriver implements VmDriver {
       ["sh", "-c", 'if [ -L "$1" ]; then echo "refusing to write through a symlink" >&2; exit 40; fi; cat > "$1"', "sh", path],
       {
         stdin: content,
+        // Content size varies; use the long deadline so a wedged daemon
+        // cannot hang the write (and its caller's lock) forever.
+        timeoutMs: this.dockerTimeouts.long,
         onStderr: (c) => { stderr += c; },
       },
     );

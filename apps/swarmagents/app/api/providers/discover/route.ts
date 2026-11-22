@@ -6,13 +6,18 @@
  * capabilities. Discovery results for a saved provider are persisted as
  * availableModels plus per-model capability overrides when `save` is not false.
  *
+ * Results are cached per user for a short TTL (send `force: true` to
+ * bypass) and fail open: a failed refresh serves the last good list, or
+ * the saved/catalog list, with `source`/`stale`/`warning` saying so. Only
+ * a live fetch is persisted.
+ *
  * Keys are read server-side and never returned; URLs are SSRF-checked before
  * any request leaves the process.
  */
 
 import { NextResponse, type NextRequest } from "next/server";
-import { canonicalProviderId, providerKindForCatalog } from "@/lib/providers/catalog";
-import { discoverProviderModels } from "@/lib/providers/discovery";
+import { canonicalProviderId, catalogEntry, providerKindForCatalog } from "@/lib/providers/catalog";
+import { discoverModelsWithCache } from "@/lib/providers/model-cache";
 import { providerOwner } from "@/lib/providers/owner";
 import { JsonBodyError, readJsonBody } from "@/lib/http";
 import {
@@ -145,9 +150,20 @@ export async function POST(request: NextRequest) {
   const apiKey = providedKey || saved?.keys?.[0] || "";
 
   try {
-    const result = await discoverProviderModels(config, apiKey);
+    // Cached per user with a short TTL; fails open to the last good list,
+    // then to the saved availableModels (or the catalog's popular list for
+    // a draft) so a flaky provider never empties the model picker. A 502
+    // now means there was nothing at all to fall back to — e.g. a bad key
+    // on a first-time draft, which is exactly the signal the UI needs.
+    const result = await discoverModelsWithCache(config, apiKey, {
+      owner,
+      force: input.force === true || input.refresh === true,
+      fallbackModels: saved?.availableModels ?? catalogEntry(config.id)?.models?.popular,
+    });
     let persisted = false;
-    if (saved && input.save !== false && result.models.length > 0) {
+    // Only a live fetch may overwrite the saved list; a stale or fallback
+    // result must never replace real data with older/static ids.
+    if (saved && input.save !== false && result.source === "live" && result.models.length > 0) {
       const capabilities: Record<string, NonNullable<(typeof result.models)[number]["capabilities"]>> = {};
       for (const model of result.models) {
         if (model.capabilities) capabilities[model.id] = model.capabilities;
@@ -166,7 +182,16 @@ export async function POST(request: NextRequest) {
       persisted = true;
     }
     return NextResponse.json(
-      { ok: true, endpoint: result.endpoint, models: result.models, persisted },
+      {
+        ok: true,
+        endpoint: result.endpoint,
+        models: result.models,
+        persisted,
+        source: result.source,
+        stale: result.stale,
+        fetchedAt: result.fetchedAt,
+        ...(result.warning ? { warning: result.warning.slice(0, 500) } : {}),
+      },
       { headers: NO_STORE },
     );
   } catch (err) {

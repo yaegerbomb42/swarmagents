@@ -136,6 +136,43 @@ test("hostEnvKeys defaults off in server mode", () => {
   }
 });
 
+test("host env keys never serve an account, even with server mode off (FIX-04)", () => {
+  const prevMode = process.env.SWARM_SERVER_MODE;
+  const prevKey = process.env.SWARM_KEYS_ANTHROPIC;
+  delete process.env.SWARM_SERVER_MODE;
+  process.env.SWARM_KEYS_ANTHROPIC = "sk-host-anthropic-shared";
+  try {
+    // Default resolution for an account: no host key, whatever the env says.
+    assert.deepEqual(
+      routerProviders(BOB).find((p) => p.id === "anthropic")?.keys,
+      [],
+      "an account must never resolve to a host env key"
+    );
+    // Not even when a caller explicitly asks for host keys.
+    assert.deepEqual(
+      routerProviders(BOB, { hostEnvKeys: true }).find((p) => p.id === "anthropic")?.keys,
+      [],
+      "hostEnvKeys:true is clamped for accounts"
+    );
+    // The local operator identity keeps the machine's env keys.
+    assert.equal(
+      routerProviders("local").find((p) => p.id === "anthropic")?.keys,
+      undefined,
+      "local operator still falls back to env keys"
+    );
+    // …unless explicitly turned off.
+    assert.deepEqual(
+      routerProviders("local", { hostEnvKeys: false }).find((p) => p.id === "anthropic")?.keys,
+      []
+    );
+  } finally {
+    if (prevMode === undefined) delete process.env.SWARM_SERVER_MODE;
+    else process.env.SWARM_SERVER_MODE = prevMode;
+    if (prevKey === undefined) delete process.env.SWARM_KEYS_ANTHROPIC;
+    else process.env.SWARM_KEYS_ANTHROPIC = prevKey;
+  }
+});
+
 test("a missing or oversized user id is refused", () => {
   assert.throws(() => saveProvider("", { id: "openai", apiKey: ALICE_KEY }), ProviderMutationError);
   assert.throws(() => readConfiguredProviders("x".repeat(300)), ProviderMutationError);

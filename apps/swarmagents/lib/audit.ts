@@ -24,6 +24,7 @@ export type AuditAction =
   | "provider.delete"
   | "provider.rank"
   | "provider.billing"
+  | "provider.effort"
   | "provider.key.add"
   | "provider.key.remove"
   | "provider.key.rotate"

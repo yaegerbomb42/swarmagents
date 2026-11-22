@@ -45,22 +45,45 @@ export function presetModelCapabilities(providerId: string, model: string): Mode
 
   if (id === "anthropic" || id === "radium") {
     const vision = ANTHROPIC_VISION.test(m);
+    // Documented Anthropic output caps: Claude 4 family 64k, 3.7 Sonnet 64k,
+    // 3.5 family 8k, Claude 3 family 4k.
+    const maxOutputTokens = /claude-(?:4|sonnet-4|opus-4|haiku-4)/.test(m)
+      ? 64_000
+      : /claude-3[-.]7/.test(m)
+        ? 64_000
+        : /claude-3[-.]5/.test(m)
+          ? 8_192
+          : 4_096;
     return {
       vision,
       tools: true,
       computerUse: vision && ANTHROPIC_COMPUTER.test(m),
       contextWindow: 200_000,
+      maxOutputTokens,
       source: "preset",
     };
   }
 
   if (id === "openai" || id === "azure-openai") {
     const vision = OPENAI_VISION.test(m);
+    // Documented OpenAI output caps, most specific family first.
+    const maxOutputTokens = /gpt-5/.test(m)
+      ? 128_000
+      : /gpt-4\.1/.test(m)
+        ? 32_768
+        : /gpt-4o/.test(m)
+          ? 16_384
+          : /(?:^|[-_/])o[34](?:[-_/]|$)/.test(m)
+            ? 100_000
+            : /(?:gpt-4|gpt-3\.5|chatgpt)/.test(m)
+              ? 4_096
+              : undefined;
     return {
       vision,
       tools: true,
       computerUse: vision && OPENAI_COMPUTER.test(m),
       contextWindow: 200_000,
+      maxOutputTokens,
       source: "preset",
     };
   }
@@ -72,6 +95,8 @@ export function presetModelCapabilities(providerId: string, model: string): Mode
       tools: true,
       computerUse: vision,
       contextWindow: 1_000_000,
+      // Gemini 2.5/3 allow 65k output tokens; 1.5/2.0 cap at 8k.
+      maxOutputTokens: /gemini-(?:2\.5|3)/.test(m) ? 65_536 : 8_192,
       source: "preset",
     };
   }
@@ -93,16 +118,34 @@ export function presetModelCapabilities(providerId: string, model: string): Mode
       tools: true,
       computerUse: false,
       contextWindow: 128_000,
+      // Mistral's API caps max_tokens at 8192 for its hosted models.
+      maxOutputTokens: 8_192,
       source: "preset",
     };
   }
 
   if (id === "cohere") {
-    return { vision: false, tools: true, computerUse: false, contextWindow: 128_000, source: "preset" };
+    return {
+      vision: false,
+      tools: true,
+      computerUse: false,
+      contextWindow: 128_000,
+      // Command R / R+ cap output at 4096 tokens.
+      maxOutputTokens: 4_096,
+      source: "preset",
+    };
   }
 
   if (id === "deepseek") {
-    return { vision: false, tools: true, computerUse: false, contextWindow: 128_000, source: "preset" };
+    return {
+      vision: false,
+      tools: true,
+      computerUse: false,
+      contextWindow: 128_000,
+      // deepseek-chat caps output at 8192; deepseek-reasoner allows 65536.
+      maxOutputTokens: /reasoner/.test(m) ? 65_536 : 8_192,
+      source: "preset",
+    };
   }
 
   // Local runtimes (Ollama, LM Studio) and open-weights routers: only trust the

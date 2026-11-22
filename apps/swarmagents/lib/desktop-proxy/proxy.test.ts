@@ -69,30 +69,41 @@ class TestWsClient {
   rawStream: Buffer[] = [];
   receivedAll: Buffer[] = [];
 
-  private constructor(private readonly sock: net.Socket) {
-    sock.on("data", (chunk: Buffer) => {
-      this.rawStream.push(chunk);
-      const { messages, rest } = decodeFrames(Buffer.concat([this.rest, chunk]));
-      this.rest = rest;
-      for (const m of messages) {
-        if (m.opcode === OP_PING) {
-          this.sock.write(encodeFrame(OP_PONG, m.payload));
-        } else if (m.opcode === OP_PONG) {
-          // ignore
-        } else if (m.opcode === OP_CLOSE) {
-          this.sock.end(encodeClientFrame(OP_CLOSE, m.payload));
-        } else if (m.opcode === OP_BINARY) {
-          this.receivedAll.push(m.payload);
-          this.queue.push(m.payload);
-        }
-      }
-      this.flushWaiters();
-    });
+  private constructor(
+    private readonly sock: net.Socket,
+    head?: Buffer,
+  ) {
+    sock.on("data", (chunk: Buffer) => this.onData(chunk));
     sock.on("close", () => {
       this.closed = true;
       this.flushWaiters(new Error("socket closed"));
     });
     sock.on("error", () => {});
+    // Bytes that arrived in the same read as the 101 response land in the
+    // upgrade event's `head`, not in a later 'data' event. The bridge is
+    // server-first now (it writes its RFB version frame immediately), so
+    // dropping `head` would eat the version frame whenever the two writes
+    // coalesce — feed it through the same path as socket data.
+    if (head && head.length > 0) this.onData(head);
+  }
+
+  private onData(chunk: Buffer): void {
+    this.rawStream.push(chunk);
+    const { messages, rest } = decodeFrames(Buffer.concat([this.rest, chunk]));
+    this.rest = rest;
+    for (const m of messages) {
+      if (m.opcode === OP_PING) {
+        this.sock.write(encodeFrame(OP_PONG, m.payload));
+      } else if (m.opcode === OP_PONG) {
+        // ignore
+      } else if (m.opcode === OP_CLOSE) {
+        this.sock.end(encodeClientFrame(OP_CLOSE, m.payload));
+      } else if (m.opcode === OP_BINARY) {
+        this.receivedAll.push(m.payload);
+        this.queue.push(m.payload);
+      }
+    }
+    this.flushWaiters();
   }
 
   static connect(url: string, headers: Record<string, string> = {}): Promise<TestWsClient> {
@@ -111,7 +122,7 @@ class TestWsClient {
           ...headers,
         },
       });
-      req.on("upgrade", (_res, sock) => resolve(new TestWsClient(sock as net.Socket)));
+      req.on("upgrade", (_res, sock, head) => resolve(new TestWsClient(sock as net.Socket, head)));
       req.on("response", (res) => {
         res.resume();
         reject(new Error(`expected upgrade, got HTTP ${res.statusCode}`));
@@ -158,20 +169,15 @@ class TestWsClient {
 
 /** Speak the RFB client side over a WebSocket until ServerInit is received. */
 async function completeRfbClientHandshake(client: TestWsClient): Promise<void> {
+  // RFB is server-first (RFC 6143): the server sends its version string
+  // immediately on connect; the client replies with its own, and only then
+  // does the server advertise security types. Sending nothing until the
+  // version arrives is what real noVNC does — and what deadlocked against
+  // the old proxy, which waited for the client to speak first.
+  const version = await client.next();
+  assert.equal(version.toString("utf8"), "RFB 003.008\n", "server version arrives first");
   client.sendBinary(Buffer.from("RFB 003.008\n"));
-  const first = await client.next();
-  // The proxy may send version and security types in one frame or two.
-  let version: Buffer;
-  let types: Buffer;
-  if (first.length >= 12 && first.subarray(0, 4).toString() === "RFB ") {
-    version = first.subarray(0, 12);
-    types = first.subarray(12);
-    if (types.length === 0) types = await client.next();
-  } else {
-    version = first;
-    types = await client.next();
-  }
-  assert.equal(version.toString("utf8"), "RFB 003.008\n");
+  const types = await client.next();
   assert.equal(types[0], 1, "server advertises one security type");
   assert.equal(types[1], SECURITY_NONE, "server advertises None");
   client.sendBinary(Buffer.from([SECURITY_NONE]));
@@ -247,6 +253,9 @@ class FakeVncServer {
     let rfbBuf: Buffer = Buffer.alloc(0);
     let phase: "version" | "select" | "challenge" | "auth-result" | "stream" = "version";
     const send = (payload: Buffer) => socket.write(encodeFrame(OP_BINARY, payload));
+    // RFB is server-first (RFC 6143): send the version string immediately,
+    // before reading anything from the client.
+    send(Buffer.from("RFB 003.008\n"));
 
     function serverInit(): Buffer {
       const name = Buffer.from("fake-vnc");
@@ -295,7 +304,6 @@ class FakeVncServer {
             if (phase === "version") {
               if (rfbBuf.length < 12) break;
               rfbBuf = rfbBuf.subarray(12); // client version
-              send(Buffer.from("RFB 003.008\n"));
               // The server advertises its security types immediately after the
               // version exchange: VNCAuth (2) then None (1).
               send(Buffer.from([2, 2, 1]));
@@ -606,19 +614,36 @@ test("desktop proxy: getBridgeStatus reports live bridge state, not the stored m
   try {
     assert.deepEqual(proxy.getBridgeStatus("alice"), [], "no sessions yet");
     assert.deepEqual(proxy.getBridgeStatus("nobody"), [], "unknown user has no sessions");
-    const client = await openDesktopSession(port, "alice", "view");
+    const viewer = await openDesktopSession(port, "alice", "view");
     await sleep(150);
-    const status = proxy.getBridgeStatus("alice");
+    let status = proxy.getBridgeStatus("alice");
     assert.equal(status.length, 1);
     assert.equal(status[0]!.mode, "view");
     assert.equal(status[0]!.connected, true);
     assert.equal(status[0]!.spliced, true);
-    // setUserMode flips the live bridge mode, and the status follows it.
-    proxy.setUserMode("alice", "control");
-    assert.equal(proxy.getBridgeStatus("alice")[0]!.mode, "control");
+    // Control is negotiated through the takeover machine, not flipped by
+    // setUserMode: a control dial requests takeover and (agent paused by
+    // default) is granted immediately, and the status follows each live
+    // bridge. setUserMode("control") is only a safe point now — it no
+    // longer promotes a view session that never requested control.
+    const controller = await openDesktopSession(port, "alice", "control");
+    await sleep(150);
+    status = proxy.getBridgeStatus("alice");
+    assert.equal(status.length, 2);
+    assert.deepEqual(
+      status.map((s) => s.mode).sort(),
+      ["control", "view"],
+      "the granted controller reports control, the viewer stays view",
+    );
+    // Runtime force-view demotes every live bridge immediately.
     proxy.setUserMode("alice", "view");
-    assert.equal(proxy.getBridgeStatus("alice")[0]!.mode, "view");
-    client.close();
+    assert.deepEqual(
+      proxy.getBridgeStatus("alice").map((s) => s.mode),
+      ["view", "view"],
+      "force-view demotes the controller too",
+    );
+    viewer.close();
+    controller.close();
   } finally {
     await proxy.close();
   }

@@ -79,6 +79,48 @@ test("writeConfiguredProviders persists valid file content", () => {
   assert.deepEqual(onDisk[0].keys, ["sk-test"]);
 });
 
+test("readConfiguredProviders repairs the legacy inception mercury default on load", () => {
+  // A config saved while the catalog default was the retired "mercury" id.
+  writeConfiguredProviders(U, [
+    {
+      id: "inception",
+      kind: "openai" as const,
+      baseUrl: "https://api.inceptionlabs.ai/v1",
+      keys: ["sk-inc"],
+      models: { fast: "mercury", balanced: "mercury", deep: "mercury" },
+      availableModels: ["mercury"],
+      modelCapabilities: {
+        mercury: { vision: false, tools: true, computerUse: false, source: "override" as const },
+      },
+    },
+    // Same model name on another provider is the user's own choice: untouched.
+    {
+      id: "custom",
+      kind: "openai" as const,
+      baseUrl: "https://example.invalid/v1",
+      keys: ["sk-custom"],
+      models: { balanced: "mercury" },
+    },
+  ]);
+
+  const [inception, custom] = readConfiguredProviders(U);
+  assert.deepEqual(inception.models, { fast: "mercury-3", balanced: "mercury-3", deep: "mercury-3" });
+  assert.deepEqual(inception.availableModels, ["mercury-3"]);
+  assert.deepEqual(Object.keys(inception.modelCapabilities ?? {}), ["mercury-3"]);
+  assert.deepEqual(custom.models, { balanced: "mercury" }, "repair is scoped to the inception provider");
+
+  // The router view (what gateway/provider-test calls send) is repaired too.
+  const routed = routerProviders(U).find((p) => p.id === "inception");
+  assert.equal(routed?.models?.balanced, "mercury-3");
+});
+
+test("saveProvider for inception inherits the mercury-3 catalog default", () => {
+  const { config } = saveProvider(U, { id: "inception", apiKey: "sk-inc-new" });
+  assert.equal(config.models?.fast, "mercury-3");
+  assert.equal(config.models?.balanced, "mercury-3");
+  assert.equal(config.models?.deep, "mercury-3");
+});
+
 test("saveProvider writes a keyed provider, encrypted at rest", () => {
   const { config, file } = saveProvider(U, {
     id: "openai",
@@ -139,7 +181,10 @@ test("setProviderRank ranks a built-in without shadowing its env keys", () => {
 
   const merged = routerProviders(U).find((p) => p.id === "anthropic");
   assert.equal(merged?.rank, 9);
-  assert.equal(merged?.keys, undefined, "environment keys still apply");
+  // U is an account id: host env keys never serve accounts (FIX-04), so the
+  // router view pins an explicit empty list even though the file entry
+  // itself keeps keys undefined (asserted above).
+  assert.deepEqual(merged?.keys, [], "host env keys never serve an account");
 });
 
 test("moveProviderRank swaps adjacent providers and normalizes ranks", () => {

@@ -26,10 +26,12 @@ import path from "node:path";
 import { sha256Hex } from "../library/proof";
 import type { SequencedEvent } from "../telemetry/bus";
 import { getRunsDir } from "../telemetry/paths";
+import { aggregateRunTokenAccounting } from "../telemetry/run-token-accounting";
 import { DESKTOP_DISPLAY } from "../vm/docker-driver";
 import { WORKSPACE_ROOT } from "../vm/files";
 import type { VmManager } from "../vm/manager";
 import type { BrowserControl } from "../browser/manager";
+import { classifyCostProvenance } from "./run-report-types";
 import type {
   ReportArtifact,
   ReportCardMeta,
@@ -694,6 +696,41 @@ export function assembleReport(inputs: ReportInputs): RunReport {
     ...(inputs.vmImage ? { vmImage: inputs.vmImage } : {}),
   };
 
+  // Per-model token accounting from the same event stream. Gateway
+  // (llm.call) totals win for the card numbers; the harness stream's own
+  // usage is the fallback for runs that never crossed the gateway.
+  const tokenAccounting = aggregateRunTokenAccounting(events);
+  if (tokenAccounting) {
+    const gatewayTokens = tokenAccounting.totals.inputTokens + tokenAccounting.totals.outputTokens;
+    if (gatewayTokens > 0) {
+      meta.tokensIn = tokenAccounting.totals.inputTokens;
+      meta.tokensOut = tokenAccounting.totals.outputTokens;
+    } else if (tokenAccounting.harness) {
+      meta.tokensIn = tokenAccounting.harness.inputTokens;
+      meta.tokensOut = tokenAccounting.harness.outputTokens;
+    }
+    // Cost follows the same rule: the gateway fold is the accounting of
+    // record for runs that crossed the gateway — each call's stamp is
+    // the provider-reported amount where the provider reported one.
+    // The run.finished figure already in meta.costUsd is the harness
+    // CLI's own estimate (tokens × the CLI's price table, applied even
+    // when a BYOK provider served the run), so it is only the fallback
+    // for runs the gateway never saw. The provenance recorded alongside
+    // describes whichever figure meta ends up carrying — never borrowed
+    // from the other derivation.
+    if (tokenAccounting.totals.costUsd !== undefined) {
+      meta.costUsd = tokenAccounting.totals.costUsd;
+      const info = classifyCostProvenance(tokenAccounting.totals);
+      if (info) meta.costProvenance = info.provenance;
+    }
+  }
+  if (meta.costProvenance === undefined && meta.costUsd !== undefined && meta.costUsd > 0) {
+    // The figure is the run.finished one: the harness CLI's estimate.
+    // (A $0 gateway total also lands here with costUsd 0 — no provenance,
+    // matching the card's rule that $0 figures stand unlabeled.)
+    meta.costProvenance = "estimated";
+  }
+
   return {
     runId: inputs.runId,
     userId: inputs.userId,
@@ -707,6 +744,7 @@ export function assembleReport(inputs: ReportInputs): RunReport {
     artifacts: inputs.artifacts,
     shots: inputs.shots,
     meta,
+    ...(tokenAccounting ? { tokenAccounting } : {}),
   };
 }
 

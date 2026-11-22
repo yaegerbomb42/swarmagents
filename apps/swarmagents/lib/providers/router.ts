@@ -54,6 +54,12 @@ export interface RouterOptions {
   /** Per-request timeout when a provider does not set its own. */
   defaultTimeoutMs?: number;
   /**
+   * Streaming only: max gap between provider frames after the first text
+   * before the attempt is declared stalled (FIX-06). Total stream duration
+   * is not capped. Defaults to SWARM_LLM_STREAM_IDLE_TIMEOUT_MS (60s).
+   */
+  streamIdleTimeoutMs?: number;
+  /**
    * Default race mode (per tier or per call). Defaults to "hedged": the
    * primary starts immediately and a second healthy provider starts only after
    * a hedge delay if no first token has arrived. "simultaneous" starts every
@@ -177,6 +183,22 @@ function parseHedgeDelay(raw: string | undefined): number | undefined {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+/** Read a positive timeout (ms) from an env value, falling back when unset/invalid. */
+function envTimeoutMs(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+/**
+ * Default per-attempt deadline (FIX-06): whole fetch + body read for
+ * non-streaming; time-to-first-text for streaming. Always set — an
+ * unbounded attempt lets one hung provider hang the turn forever.
+ */
+const DEFAULT_ROUTER_TIMEOUT_MS = 120_000;
+/** Default max gap between streamed frames before an attempt is declared stalled. */
+const DEFAULT_ROUTER_STREAM_IDLE_TIMEOUT_MS = 60_000;
+
 /** Default provider definitions. Keys are populated from SWARM_KEYS_* env vars. */
 export function defaultProviderConfigs(): ProviderConfig[] {
   return [
@@ -195,7 +217,8 @@ export class Router {
   private readonly fetchImpl: FetchLike;
   private readonly now: () => number;
   private readonly defaultRace: number;
-  private readonly defaultTimeoutMs?: number;
+  private readonly defaultTimeoutMs: number;
+  private readonly streamIdleTimeoutMs: number;
   private readonly candidates: Candidate[];
   private readonly secrets: string[];
   private readonly budgets: Map<string, ProviderBudget>;
@@ -220,8 +243,16 @@ export class Router {
     this.fetchImpl = fetchImpl;
     this.now = options.now ?? Date.now;
     this.defaultRace = options.defaultRace ?? 1;
-    this.defaultTimeoutMs = options.defaultTimeoutMs;
     const env = options.env ?? process.env;
+    // Deadlines are never infinite by default (FIX-06): option > env > default.
+    this.defaultTimeoutMs =
+      options.defaultTimeoutMs && options.defaultTimeoutMs > 0
+        ? options.defaultTimeoutMs
+        : envTimeoutMs(env.SWARM_LLM_TIMEOUT_MS, DEFAULT_ROUTER_TIMEOUT_MS);
+    this.streamIdleTimeoutMs =
+      options.streamIdleTimeoutMs && options.streamIdleTimeoutMs > 0
+        ? options.streamIdleTimeoutMs
+        : envTimeoutMs(env.SWARM_LLM_STREAM_IDLE_TIMEOUT_MS, DEFAULT_ROUTER_STREAM_IDLE_TIMEOUT_MS);
 
     this.defaultRaceMode =
       options.raceMode === false ? undefined : (options.raceMode ?? DEFAULT_RACE_MODE);
@@ -876,7 +907,8 @@ export class Router {
     }
 
     const startedAt = this.now();
-    const timeoutMs = config.timeoutMs ?? this.defaultTimeoutMs;
+    const timeoutMs =
+      config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : this.defaultTimeoutMs;
     const signal = controller.signal;
     let timedOut = false;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -984,7 +1016,9 @@ export class Router {
       clearTimer();
 
       const resolvedModel = streamModel ?? model;
-      const activeFrames = frames;
+      // After first text the first-byte deadline is done; the idle guard
+      // takes over for the rest of the stream (FIX-06).
+      const activeFrames = this.idleGuardedFrames(frames, controller, config.id);
       let settled = false;
       const settle = (): boolean => {
         if (settled) return true;
@@ -1105,6 +1139,49 @@ export class Router {
       this.redact(`Stream from ${providerId} failed: ${errorMessage(err)}`),
       { provider: providerId, kind: "network", retryable: true }
     );
+  }
+
+  /**
+   * Wrap a frame stream with an idle deadline (FIX-06): if no frame arrives
+   * within streamIdleTimeoutMs, abort the provider connection and fail the
+   * attempt with a "timeout" ProviderError. Total stream duration is not
+   * capped — a flowing stream runs as long as it keeps producing frames.
+   */
+  private async *idleGuardedFrames(
+    frames: AsyncGenerator<SseFrame, void, void>,
+    controller: AbortController,
+    providerId: string
+  ): AsyncGenerator<SseFrame, void, void> {
+    const idleMs = this.streamIdleTimeoutMs;
+    try {
+      while (true) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let step: IteratorResult<SseFrame, void>;
+        try {
+          step = await Promise.race([
+            frames.next(),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => {
+                controller.abort();
+                reject(
+                  new ProviderError(
+                    `Stream from ${providerId} stalled for ${idleMs}ms without data.`,
+                    { provider: providerId, kind: "timeout", retryable: true }
+                  )
+                );
+              }, idleMs);
+              timer.unref?.();
+            }),
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+        if (step.done) return;
+        yield step.value;
+      }
+    } finally {
+      void frames.return(undefined).catch(() => {});
+    }
   }
 
   /**
@@ -1450,7 +1527,8 @@ export class Router {
     signal: AbortSignal | undefined
   ): Promise<ReturnType<typeof parseResponse>> {
     const { config } = candidate;
-    const timeoutMs = config.timeoutMs ?? this.defaultTimeoutMs;
+    const timeoutMs =
+      config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : this.defaultTimeoutMs;
 
     let timeoutController: AbortController | undefined;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -1474,8 +1552,9 @@ export class Router {
     try {
       response = await this.fetchImpl(url, init);
     } catch (err) {
+      if (timeoutId) clearTimeout(timeoutId);
       if (timedOut) {
-        throw new ProviderError(`Request to ${config.id} timed out.`, {
+        throw new ProviderError(`Request to ${config.id} timed out after ${timeoutMs}ms.`, {
           provider: config.id,
           kind: "timeout",
           retryable: true,
@@ -1486,19 +1565,28 @@ export class Router {
         `Network error from ${config.id}: ${this.redact(errorMessage(err))}`,
         { provider: config.id, kind: "network", retryable: true }
       );
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
     }
 
+    // The deadline stays armed through the body read (FIX-06): a provider
+    // that sends headers and then stalls must not hang the attempt.
     let body: string;
     try {
       body = await response.text();
     } catch (err) {
+      if (timedOut) {
+        throw new ProviderError(`Request to ${config.id} timed out after ${timeoutMs}ms.`, {
+          provider: config.id,
+          kind: "timeout",
+          retryable: true,
+        });
+      }
       if (signal?.aborted) throw new AbortError();
       throw new ProviderError(
         `Failed to read response from ${config.id}: ${this.redact(errorMessage(err))}`,
         { provider: config.id, kind: "network", retryable: true }
       );
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
     }
 
     if (!response.ok) {

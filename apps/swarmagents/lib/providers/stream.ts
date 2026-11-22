@@ -80,6 +80,89 @@ export async function* readSseFrames(
   }
 }
 
+/** A guarded stream exceeded its first-byte or inter-chunk idle deadline. */
+export class StreamTimeoutError extends Error {
+  readonly phase: "first-byte" | "idle";
+  readonly timeoutMs: number;
+  constructor(phase: "first-byte" | "idle", timeoutMs: number) {
+    super(
+      phase === "first-byte"
+        ? `Stream produced no data within ${timeoutMs}ms.`
+        : `Stream stalled for ${timeoutMs}ms without data.`,
+    );
+    this.name = "StreamTimeoutError";
+    this.phase = phase;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+export interface StreamTimeoutOptions {
+  /** Max wait for the first chunk. <= 0 disables the first-byte deadline. */
+  firstByteMs: number;
+  /** Max gap between chunks after the first. <= 0 disables the idle deadline. */
+  idleMs: number;
+  /** Called once when the guarded stream settles (done, error, or cancel). */
+  onSettle?: () => void;
+}
+
+/**
+ * Wrap a byte stream with first-byte and idle deadlines (FIX-06). Total
+ * duration is NOT capped: a long stream that keeps producing chunks flows
+ * indefinitely. On a deadline the source reader is cancelled and the
+ * guarded stream errors with StreamTimeoutError, so consumers see a typed
+ * failure instead of hanging on a stalled provider.
+ */
+export function guardStreamTimeouts(
+  source: ReadableStream<Uint8Array>,
+  options: StreamTimeoutOptions,
+): ReadableStream<Uint8Array> {
+  const { firstByteMs, idleMs, onSettle } = options;
+  if (!(firstByteMs > 0) && !(idleMs > 0)) return source;
+  const reader = source.getReader();
+  let sawFirst = false;
+  let settled = false;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    onSettle?.();
+  };
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const phase = sawFirst ? "idle" : "first-byte";
+      const limit = sawFirst ? idleMs : firstByteMs;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            if (limit > 0) {
+              timer = setTimeout(() => reject(new StreamTimeoutError(phase, limit)), limit);
+              timer.unref?.();
+            }
+          }),
+        ]);
+        if (result.done) {
+          settle();
+          controller.close();
+          return;
+        }
+        sawFirst = true;
+        controller.enqueue(result.value);
+      } catch (err) {
+        settle();
+        void reader.cancel().catch(() => {});
+        controller.error(err);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+    cancel() {
+      settle();
+      return reader.cancel().catch(() => {});
+    },
+  });
+}
+
 /** Normalized piece extracted from one provider-specific stream frame. */
 export interface StreamPiece {
   text?: string;

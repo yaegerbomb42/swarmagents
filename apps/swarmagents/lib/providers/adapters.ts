@@ -8,13 +8,15 @@ import type {
   FetchInit,
   Message,
   ModelTier,
+  PerplexityEffort,
   ProviderAuth,
   ProviderConfig,
   ProviderKind,
   TextBlock,
   TokenUsage,
 } from "./types";
-import { isModelTier } from "./types";
+import { isModelTier, isPerplexityEffort } from "./types";
+import { parseReportedCostUsd } from "./wire-shims";
 
 export const DEFAULT_BASE_URLS: Record<ProviderKind, string> = {
   anthropic: "https://api.anthropic.com",
@@ -44,6 +46,19 @@ export function isAnthropicStyle(
   config: Pick<ProviderConfig, "kind" | "apiStyle" | "id">
 ): boolean {
   return apiStyleFor(config) === "anthropic";
+}
+
+/**
+ * The Perplexity Agent API effort level to send for this config, if any.
+ * `effort` is a Perplexity-only request field, so every other provider's
+ * requests are left untouched even if a stray value was saved (or a config
+ * file was hand-edited to an invalid one).
+ */
+export function perplexityEffortFor(
+  config: Pick<ProviderConfig, "id" | "effort">
+): PerplexityEffort | undefined {
+  if (config.id !== "perplexity") return undefined;
+  return isPerplexityEffort(config.effort) ? config.effort : undefined;
 }
 
 /** Credential placement for a provider, defaulting sensibly per provider. */
@@ -233,7 +248,7 @@ function responsesContent(blocks: ContentBlock[]): Record<string, unknown>[] {
 }
 
 function responsesBody(config: ProviderConfig, model: string, request: CompleteRequest, stream: boolean) {
-  void config;
+  const effort = perplexityEffortFor(config);
   const input: Record<string, unknown>[] = [];
   for (const message of request.messages) {
     input.push({
@@ -245,6 +260,9 @@ function responsesBody(config: ProviderConfig, model: string, request: CompleteR
     model,
     input,
     max_output_tokens: request.maxTokens ?? 1024,
+    // Perplexity Agent API effort level (top-level `effort`); unset keeps the
+    // model-only request shape every other Responses provider expects.
+    ...(effort ? { effort } : {}),
     ...(request.system ? { instructions: request.system } : {}),
     ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
     ...(stream ? { stream: true } : {}),
@@ -469,12 +487,18 @@ export function parseResponse(
         .join("");
     }
     const usage = asRecord(root.usage);
+    // xAI reports the exact billed cost as usage.cost_in_usd_ticks on chat
+    // completions (docs.x.ai/developers/cost-tracking); parseReportedCostUsd
+    // also recognizes the Perplexity cost object / flattened numeric cost
+    // defensively. Absent or malformed -> undefined -> usage unchanged.
+    const reportedCost = parseReportedCostUsd(usage);
     return {
       text: requireText(config.id, text),
       model: asString(root.model) ?? requestedModel,
       usage: {
         inputTokens: asNumber(usage?.prompt_tokens) ?? 0,
         outputTokens: asNumber(usage?.completion_tokens) ?? 0,
+        ...(reportedCost !== undefined ? { costUsd: reportedCost } : {}),
       },
     };
   }
@@ -499,12 +523,14 @@ export function parseResponse(
       }
     }
     const usage = asRecord(root.usage);
+    const reportedCost = parseReportedCostUsd(usage);
     return {
       text: requireText(config.id, text),
       model: asString(root.model) ?? requestedModel,
       usage: {
         inputTokens: asNumber(usage?.input_tokens) ?? 0,
         outputTokens: asNumber(usage?.output_tokens) ?? 0,
+        ...(reportedCost !== undefined ? { costUsd: reportedCost } : {}),
       },
     };
   }

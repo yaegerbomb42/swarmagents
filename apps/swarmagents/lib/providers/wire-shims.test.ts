@@ -301,3 +301,74 @@ test("gateAnthropicRequestBody strips images nested inside tool results", () => 
     "image",
   );
 });
+
+test("anthropicToResponses: tool_choice, is_error and max_tokens clamp pass through", () => {
+  const body = anthropicBody();
+  (body.messages[2]!.content as Record<string, unknown>[])[0]!.is_error = true;
+  const out = anthropicToResponses(
+    { ...body, max_tokens: 64_000, tool_choice: { type: "tool", name: "shell" } },
+    "gpt-5",
+    { maxOutputTokens: 16_384 },
+  );
+  assert.equal(out.max_output_tokens, 16_384);
+  // Responses named-tool choice is flat: {type:"function", name}.
+  assert.deepEqual(out.tool_choice, { type: "function", name: "shell" });
+  const input = out.input as Record<string, unknown>[];
+  assert.deepEqual(input.find((item) => item.type === "function_call_output"), {
+    type: "function_call_output",
+    call_id: "tool-1",
+    output: "file.txt",
+    is_error: true,
+  });
+
+  // "any" becomes "required"; disable_parallel_tool_use becomes parallel_tool_calls:false.
+  const anyOut = anthropicToResponses(
+    { ...anthropicBody(), tool_choice: { type: "any", disable_parallel_tool_use: true } },
+    "gpt-5",
+  );
+  assert.equal(anyOut.tool_choice, "required");
+  assert.equal(anyOut.parallel_tool_calls, false);
+});
+
+test("anthropicToOllama: is_error passes through and max_tokens clamps to num_predict", () => {
+  const body = anthropicBody();
+  (body.messages[2]!.content as Record<string, unknown>[])[0]!.is_error = true;
+  const out = anthropicToOllama({ ...body, max_tokens: 64_000 }, "llama3.2", {
+    maxOutputTokens: 4_096,
+  });
+  const messages = out.messages as Record<string, unknown>[];
+  const tool = messages.find((m) => m.role === "tool")!;
+  assert.equal(tool.is_error, true);
+  assert.equal((out.options as Record<string, unknown>).num_predict, 4_096);
+});
+
+test("anthropicToGemini: is_error, tool_choice and max_tokens clamp map natively", () => {
+  const body = anthropicBody();
+  (body.messages[2]!.content as Record<string, unknown>[])[0]!.is_error = true;
+  const out = anthropicToGemini(
+    { ...body, max_tokens: 64_000, tool_choice: { type: "tool", name: "shell" } },
+    "gemini-2.5-pro",
+    { maxOutputTokens: 8_192 },
+  );
+  assert.equal((out.generationConfig as Record<string, unknown>).maxOutputTokens, 8_192);
+  assert.deepEqual(out.toolConfig, {
+    functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["shell"] },
+  });
+  const contents = out.contents as Record<string, unknown>[];
+  const allParts = contents.flatMap((c) => c.parts as Record<string, unknown>[]);
+  const fnResponse = allParts.find((p) => p.functionResponse)!.functionResponse as Record<string, unknown>;
+  // Gemini's native error convention: response.error, not response.result.
+  assert.deepEqual(fnResponse.response, { error: "file.txt" });
+
+  // Non-error results and "any" map to result / ANY without allowed names.
+  const okOut = anthropicToGemini(
+    { ...anthropicBody(), tool_choice: { type: "any" } },
+    "gemini-2.5-pro",
+  );
+  assert.deepEqual(okOut.toolConfig, { functionCallingConfig: { mode: "ANY" } });
+  const okParts = (okOut.contents as Record<string, unknown>[]).flatMap(
+    (c) => c.parts as Record<string, unknown>[],
+  );
+  const okResponse = okParts.find((p) => p.functionResponse)!.functionResponse as Record<string, unknown>;
+  assert.deepEqual(okResponse.response, { result: "file.txt" });
+});

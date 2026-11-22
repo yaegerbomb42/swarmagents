@@ -15,8 +15,8 @@ import { recordAudit } from "@/lib/audit";
 import { JsonBodyError, readJsonBody } from "@/lib/http";
 import { routerQuotaCooldowns } from "@/lib/runtime/llm-routing";
 import { assertResolvableProviderBaseUrl } from "@/lib/providers/url-safety";
-import { isApiStyle, isAuthScheme } from "@/lib/providers/types";
-import type { ModelCapabilities, ProviderAuth } from "@/lib/providers/types";
+import { isApiStyle, isAuthScheme, isPerplexityEffort } from "@/lib/providers/types";
+import type { ModelCapabilities, PerplexityEffort, ProviderAuth } from "@/lib/providers/types";
 
 export const dynamic = "force-dynamic";
 
@@ -66,7 +66,9 @@ export function GET(request: Request) {
       keyCount: row?.keyCount ?? 0,
       rank: row?.rank ?? 0,
       saved: row?.saved ?? false,
-      isFree: row?.isFree ?? false,
+      // A saved provider's own billing flag wins; otherwise fall back to
+      // the catalog's verified free-tier mark so the card can show it.
+      isFree: row?.isFree ?? entry.isFree ?? false,
       quotaCoolingDownUntil: row?.quotaCoolingDownUntil,
       keySlots: row?.keySlots ?? [],
     };
@@ -263,6 +265,15 @@ export async function POST(request: Request) {
       { status: 400 }
     );
   }
+  // Perplexity Agent API effort level. Undefined keeps the saved value on
+  // edit; null clears it. saveProvider enforces Perplexity-only.
+  const effort = input.effort;
+  if (effort !== undefined && effort !== null && !isPerplexityEffort(effort)) {
+    return json(
+      { error: "effort must be one of fast, low, medium, high, xhigh (or null to clear)." },
+      { status: 400 }
+    );
+  }
 
   try {
     const { config } = saveProvider(owner, {
@@ -279,6 +290,7 @@ export async function POST(request: Request) {
       isFree,
       inputPricePer1mTokens: inputPrice,
       outputPricePer1mTokens: outputPrice,
+      effort: effort as PerplexityEffort | null | undefined,
     });
     const row = providerRow(config, { saved: true });
     recordAudit({ user: owner, action: "provider.add", target: id, result: "success" });
@@ -366,6 +378,10 @@ export async function PATCH(request: Request) {
     if (availableModels !== undefined && !isValidModelList(availableModels, 500)) {
       return json({ error: "availableModels must be an array of 1-500 model ids." }, { status: 400 });
     }
+    const effort = input.effort;
+    if (effort !== undefined && effort !== null && !isPerplexityEffort(effort)) {
+      return json({ error: "effort must be one of fast, low, medium, high, xhigh (or null to clear)." }, { status: 400 });
+    }
     try {
       const { config } = updateProviderSettings(owner, id, {
         ...(apiStyle !== undefined ? { apiStyle } : {}),
@@ -375,6 +391,7 @@ export async function PATCH(request: Request) {
         ...(availableModels !== undefined ? { availableModels: availableModels as string[] } : {}),
         ...(modelCapabilities !== undefined ? { modelCapabilities } : {}),
         ...(headers !== undefined ? { headers } : {}),
+        ...(effort !== undefined ? { effort: effort as PerplexityEffort | null } : {}),
       });
       return json(
         { ok: true, provider: providerRow(config, { saved: true }) },

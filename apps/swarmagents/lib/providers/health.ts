@@ -1,6 +1,7 @@
 import { apiStyleFor, authFor, buildRequest, modelForTier } from "./adapters";
-import { errorMessage, redact } from "./errors";
-import type { FetchLike, ProviderConfig } from "./types";
+import { classifyStatus, errorMessage, redact } from "./errors";
+import type { ProbeErrorClass } from "./errors";
+import type { FetchLike, ProviderConfig, ProviderErrorKind } from "./types";
 
 export interface ProviderHealth {
   id: string;
@@ -14,6 +15,14 @@ export interface ProviderHealth {
   error?: string;
   /** True when no probe result exists yet for this provider. */
   checking?: boolean;
+  /** Finer failure kind (auth, rate_limit, …) when the probe classified one. */
+  errorKind?: ProviderErrorKind;
+  /** Coarse failure class for UI rendering: auth / network / rate-limit / unknown. */
+  errorClass?: ProbeErrorClass;
+  /** HTTP status the provider answered with, when it answered at all. */
+  status?: number;
+  /** The model the probe actually called. */
+  model?: string;
 }
 
 export interface HealthCheckerOptions {
@@ -322,10 +331,24 @@ export class HealthChecker {
         const detail = body
           ? `: ${redact(body.slice(0, 200), [key])}`
           : "";
+        const errorKind = classifyStatus(response.status);
         return this.recordFailure(
           config.id,
           startedAt,
-          `${httpStatusLabel(response.status)}${detail}`
+          `${httpStatusLabel(response.status)}${detail}`,
+          {
+            errorKind,
+            errorClass:
+              errorKind === "auth"
+                ? "auth"
+                : errorKind === "rate_limit" || errorKind === "quota_exhausted"
+                  ? "rate-limit"
+                  : errorKind === "server" || errorKind === "timeout"
+                    ? "network"
+                    : "unknown",
+            status: response.status,
+            model,
+          }
         );
       }
 
@@ -334,7 +357,12 @@ export class HealthChecker {
       try {
         json = JSON.parse(body);
       } catch {
-        return this.recordFailure(config.id, startedAt, "Invalid response: body was not JSON");
+        return this.recordFailure(config.id, startedAt, "Invalid response: body was not JSON", {
+          errorKind: "invalid_response",
+          errorClass: "unknown",
+          status: response.status,
+          model,
+        });
       }
       // A health probe only needs a well-formed completion, not text: a
       // reasoning model may legitimately answer with empty content.
@@ -343,7 +371,13 @@ export class HealthChecker {
         return this.recordFailure(
           config.id,
           startedAt,
-          `Invalid response from ${config.id}: ${problem}`
+          `Invalid response from ${config.id}: ${problem}`,
+          {
+            errorKind: "invalid_response",
+            errorClass: "unknown",
+            status: response.status,
+            model,
+          }
         );
       }
 
@@ -352,19 +386,27 @@ export class HealthChecker {
         ok: true,
         latencyMs: this.now() - startedAt,
         checkedAt: this.now(),
+        status: response.status,
+        model,
       };
       this.results.set(config.id, result);
       return result;
     } catch (err) {
       clearTimeout(timeoutId);
-      return this.recordFailure(config.id, startedAt, errorMessage(err));
+      // A thrown fetch (DNS, connection, TLS, abort/timeout) is a network
+      // failure — the provider never answered.
+      return this.recordFailure(config.id, startedAt, errorMessage(err), {
+        errorClass: "network",
+        model,
+      });
     }
   }
 
   private recordFailure(
     id: string,
     startedAt: number | null,
-    error: string
+    error: string,
+    extra?: Pick<ProviderHealth, "errorKind" | "errorClass" | "status" | "model">
   ): ProviderHealth {
     const latencyMs = startedAt === null ? null : this.now() - startedAt;
     const result: ProviderHealth = {
@@ -373,6 +415,7 @@ export class HealthChecker {
       latencyMs,
       checkedAt: this.now(),
       error,
+      ...(extra ?? {}),
     };
     this.results.set(id, result);
     const cooldownMs = Math.min(60_000, this.intervalMs * 2);

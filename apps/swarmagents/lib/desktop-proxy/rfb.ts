@@ -284,11 +284,29 @@ class BufferWindow {
  * password. ServerInit is deferred until the upstream server's dimensions are
  * known (serverInit() is called by the bridge once the client handshake is
  * done).
+ *
+ * RFB is server-first (RFC 6143 §7.1): call start() once at connect to emit
+ * the version string before feeding any client bytes. A real client (noVNC)
+ * sends nothing until it has seen the server version, so waiting for the
+ * client to speak first deadlocks the handshake.
  */
 export class RfbServerHandshake {
   private state: "version" | "select" | "result" | "clientinit" | "done" = "version";
   private win = new BufferWindow();
+  private versionSent = false;
   done = false;
+
+  /**
+   * Kick the handshake off: the server sends its version string immediately
+   * on connect, before reading anything from the client. The bridge calls
+   * this once at construction and writes the result to the browser; repeat
+   * calls return nothing.
+   */
+  start(): Buffer {
+    if (this.versionSent) return Buffer.alloc(0);
+    this.versionSent = true;
+    return RFB_VERSION_12;
+  }
 
   /** Feed bytes from the browser. Returns bytes to send back to the browser. */
   feed(chunk: Buffer): RfbHandshakeOutput {
@@ -301,9 +319,9 @@ export class RfbServerHandshake {
         if (!version.subarray(0, 4).equals(Buffer.from("RFB "))) {
           throw new Error("Client sent an invalid RFB version string");
         }
-        // The server responds with its version and immediately advertises its
-        // security types — it does not wait for a client byte first.
-        out = Buffer.concat([out, RFB_VERSION_12, Buffer.from([1, SECURITY_NONE])]);
+        // The client's version reply completes the version exchange; only
+        // now does the server advertise its security types (RFC 6143 §7.1).
+        out = Buffer.concat([out, Buffer.from([1, SECURITY_NONE])]);
         this.state = "select";
       } else if (this.state === "select") {
         if (this.win.size < 1) break;
@@ -362,14 +380,15 @@ export class RfbClientHandshake {
   constructor(private readonly password: string) {}
 
   /**
-   * Kick the handshake off: the RFB client speaks first, so send the version
-   * string immediately. The state stays "version" until the server's version
-   * arrives — the byte order of the exchange is client version, server
-   * version, server security types, …
+   * Kick the handshake off. RFB is server-first (RFC 6143 §7.1): the server
+   * sends its version string immediately on connect and the client replies
+   * with its own, so there is nothing to send yet — the version reply is
+   * emitted by feed() once the server's banner arrives. Kept for symmetry
+   * with RfbServerHandshake.start() so the bridge can treat both ends the
+   * same way: write whatever start() returns, then feed peer bytes.
    */
   start(): Buffer {
-    if (this.state !== "version") return Buffer.alloc(0);
-    return RFB_VERSION_12;
+    return Buffer.alloc(0);
   }
 
   /** Feed bytes from the upstream server. Returns bytes to send upstream. */
@@ -383,6 +402,9 @@ export class RfbClientHandshake {
         if (!version.subarray(0, 4).equals(Buffer.from("RFB "))) {
           throw new Error("Upstream VNC server sent an invalid RFB version string");
         }
+        // The server spoke first; reply with our version string, then wait
+        // for its security types (RFC 6143 §7.1).
+        out = Buffer.concat([out, RFB_VERSION_12]);
         this.state = "security-count";
       } else if (this.state === "security-count") {
         if (this.win.size < 1) break;

@@ -27,7 +27,7 @@ import {
   OP_PONG,
   type WsMessage,
 } from "./ws";
-import { vncDesResponse, RFB_VERSION } from "./rfb";
+import { vncDesResponse, RFB_VERSION, SECURITY_NONE } from "./rfb";
 
 const PASSWORD = "s3cret-pw";
 
@@ -136,23 +136,34 @@ function makeBridge(mode: "view" | "control", extra: Partial<DesktopBridgeOption
 /** Run both RFB handshakes to the spliced state. */
 function handshake(h: Harness): void {
   const challenge = crypto.randomBytes(16);
-  assert.equal(h.toUpstream.binary().toString(), RFB_VERSION, "proxy sends its version first");
+  // RFB is server-first (RFC 6143): toward the container the proxy is the
+  // client, so it sends nothing until the container's version arrives.
+  assert.equal(h.toUpstream.binary().length, 0, "proxy waits for the upstream version");
   h.upstream.feed(encodeFrame(OP_BINARY, Buffer.concat([Buffer.from(RFB_VERSION), Buffer.from([1, 2])])));
-  assert.deepEqual([...h.toUpstream.binary()], [2], "VNCAuth selected");
+  const upReply = h.toUpstream.binary();
+  assert.equal(upReply.subarray(0, 12).toString(), RFB_VERSION, "proxy replies with its version after the banner");
+  assert.deepEqual([...upReply.subarray(12)], [2], "VNCAuth selected");
   h.upstream.feed(encodeFrame(OP_BINARY, challenge));
   assert.ok(h.toUpstream.binary().equals(vncDesResponse(PASSWORD, challenge)), "password injected");
   h.upstream.feed(encodeFrame(OP_BINARY, Buffer.from([0, 0, 0, 0])));
   assert.deepEqual([...h.toUpstream.binary()], [1], "ClientInit");
   h.upstream.feed(encodeFrame(OP_BINARY, serverInit()));
 
+  // Toward the browser the proxy is the server: its version string is
+  // already on the wire before the browser sends a single byte.
+  assert.equal(h.toClient.binary().toString(), RFB_VERSION, "server version sent before the browser speaks");
   h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from(RFB_VERSION)));
   h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
   h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
   const toBrowser = h.toClient.binary();
-  // version(12) + types(2) + result(4) + ServerInit(24 + name)
-  assert.equal(toBrowser.subarray(0, 12).toString(), RFB_VERSION);
-  assert.equal(toBrowser.readUInt16BE(18), 1600, "ServerInit carries upstream width");
-  assert.equal(toBrowser.readUInt16BE(20), 900, "ServerInit carries upstream height");
+  // types(2) + result(4) + ServerInit(24 + name); version already consumed.
+  assert.deepEqual(
+    [...toBrowser.subarray(0, 2)],
+    [1, SECURITY_NONE],
+    "security types advertised after the version exchange",
+  );
+  assert.equal(toBrowser.readUInt16BE(6), 1600, "ServerInit carries upstream width");
+  assert.equal(toBrowser.readUInt16BE(8), 900, "ServerInit carries upstream height");
   assert.deepEqual(h.closes, []);
 }
 
@@ -197,36 +208,63 @@ test("bridge: 1-byte TCP slices in both directions", () => {
 test("bridge: the whole handshake also survives 1-byte slices", () => {
   const h = makeBridge("view");
   const challenge = crypto.randomBytes(16);
-  h.toUpstream.read();
+  assert.equal(h.toUpstream.binary().length, 0, "nothing upstream before the banner");
   const feed = (b: Buffer) => h.upstream.feedSliced(encodeFrame(OP_BINARY, b), 1);
   feed(Buffer.concat([Buffer.from(RFB_VERSION), Buffer.from([1, 2])]));
   feed(challenge);
-  assert.ok(Buffer.concat([Buffer.from([2]), vncDesResponse(PASSWORD, challenge)]).equals(h.toUpstream.binary()));
+  assert.ok(
+    Buffer.concat([Buffer.from(RFB_VERSION), Buffer.from([2]), vncDesResponse(PASSWORD, challenge)]).equals(
+      h.toUpstream.binary(),
+    ),
+    "version reply, security choice, and DES response in order",
+  );
   feed(Buffer.from([0, 0, 0, 0]));
   feed(serverInit());
+  assert.equal(h.toClient.binary().toString(), RFB_VERSION, "server version sent before the browser speaks");
   for (const b of [Buffer.from(RFB_VERSION), Buffer.from([1]), Buffer.from([1])]) {
     h.client.feedSliced(encodeClientFrame(OP_BINARY, b), 1);
   }
   const toBrowser = h.toClient.binary();
-  assert.equal(toBrowser.readUInt16BE(18), 1600);
+  // types(2) + result(4) + ServerInit; version already consumed above.
+  assert.equal(toBrowser.readUInt16BE(6), 1600);
   assert.deepEqual(h.closes, []);
 });
 
 test("bridge: ServerInit split across two WebSocket messages still completes the handshake", () => {
   const h = makeBridge("view");
-  h.toUpstream.read();
   h.upstream.feed(encodeFrame(OP_BINARY, Buffer.concat([Buffer.from(RFB_VERSION), Buffer.from([1, 1])]))); // None
   h.upstream.feed(encodeFrame(OP_BINARY, Buffer.from([0, 0, 0, 0])));
   const init = serverInit(1280, 720, "split-name");
   h.upstream.feed(encodeFrame(OP_BINARY, init.subarray(0, 26))); // mid name-length
   h.upstream.feed(encodeFrame(OP_BINARY, init.subarray(26, 30))); // mid name
   h.upstream.feed(encodeFrame(OP_BINARY, init.subarray(30)));
+  assert.equal(h.toClient.binary().toString(), RFB_VERSION, "server version sent before the browser speaks");
   h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from(RFB_VERSION)));
   h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
   h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
   const toBrowser = h.toClient.binary();
-  assert.equal(toBrowser.readUInt16BE(18), 1280);
-  assert.equal(toBrowser.readUInt16BE(20), 720);
+  // types(2) + result(4) + ServerInit; version already consumed above.
+  assert.equal(toBrowser.readUInt16BE(6), 1280);
+  assert.equal(toBrowser.readUInt16BE(8), 720);
+  assert.deepEqual(h.closes, []);
+});
+
+test("bridge: RFB handshakes are server-first on both ends (RFC 6143)", () => {
+  const h = makeBridge("view");
+  // Toward the browser the proxy is the server: its version string is on
+  // the wire before the browser sends a single byte. Regression: the proxy
+  // used to wait for the browser's version first, but real noVNC waits for
+  // the server version — both sides waited and the handshake timed out
+  // after 15 s ("Desktop offline").
+  assert.equal(h.toClient.binary().toString(), RFB_VERSION, "server version sent immediately");
+  // Toward the container the proxy is the client: it must not speak first.
+  assert.equal(h.toUpstream.binary().length, 0, "nothing upstream before the banner");
+  // The container's banner arrives -> the proxy replies with its version.
+  h.upstream.feed(encodeFrame(OP_BINARY, Buffer.from(RFB_VERSION)));
+  assert.equal(h.toUpstream.binary().toString(), RFB_VERSION, "client version replies to the banner");
+  // The browser replies -> only then are security types advertised.
+  h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from(RFB_VERSION)));
+  assert.deepEqual([...h.toClient.binary()], [1, SECURITY_NONE], "security types follow the version exchange");
   assert.deepEqual(h.closes, []);
 });
 
@@ -345,6 +383,7 @@ test("bridge: pre-splice deferred payload is capped too", () => {
   const h = makeBridge("view", { maxBufferBytes: 64 * 1024 });
   // Browser finishes its handshake, upstream never does: further browser data
   // is deferred, and must not grow without bound.
+  assert.equal(h.toClient.binary().toString(), RFB_VERSION, "server version sent before the browser speaks");
   h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from(RFB_VERSION)));
   h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
   h.client.feed(encodeClientFrame(OP_BINARY, Buffer.from([1])));
@@ -396,7 +435,12 @@ test("bridge: bytes arriving with the upgrade (head) go through the decoders", (
   h.upstream.feed(encodeFrame(OP_BINARY, challenge).subarray(5));
   assert.ok(h.toUpstream.binary().equals(vncDesResponse(PASSWORD, challenge)), "partial head frame completed");
   const toBrowser = h.toClient.binary();
-  assert.equal(toBrowser.subarray(0, 12).toString(), RFB_VERSION, "client head answered");
+  assert.equal(toBrowser.subarray(0, 12).toString(), RFB_VERSION, "server version written at construction");
+  assert.deepEqual(
+    [...toBrowser.subarray(12)],
+    [1, SECURITY_NONE],
+    "client head's version reply answered with security types",
+  );
 });
 
 test("bridge: browser frame with MASK=0 closes with protocol error 1002", () => {

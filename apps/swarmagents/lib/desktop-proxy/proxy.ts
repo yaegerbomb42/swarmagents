@@ -176,13 +176,29 @@ export interface DesktopProxy {
   setUserMode(userId: string, mode: RfbFilterMode): void;
 }
 
+/**
+ * Next.js percent-encodes cookie values when setting them
+ * (encodeURIComponent), so a session token for `local_<email>` arrives as
+ * `local_james%40example.com`. Decode before verification or the HMAC —
+ * computed over the raw user id — never matches and every real user 401s.
+ * Malformed encodings fall back to the raw value (verification then fails
+ * exactly as it did before decoding existed).
+ */
+function decodeCookieValue(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function parseCookieHeader(value: string | undefined): Map<string, string> {
   const out = new Map<string, string>();
   if (!value) return out;
   for (const part of value.split(";")) {
     const idx = part.indexOf("=");
     if (idx > 0) {
-      out.set(part.slice(0, idx).trim(), part.slice(idx + 1).trim());
+      out.set(part.slice(0, idx).trim(), decodeCookieValue(part.slice(idx + 1).trim()));
     }
   }
   return out;

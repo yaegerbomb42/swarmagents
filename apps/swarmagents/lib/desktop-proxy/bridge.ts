@@ -138,7 +138,15 @@ export class DesktopBridge {
     this.clientDecoder = new WsFrameDecoder(this.maxBufferBytes, true);
     this.upstreamDecoder = new WsFrameDecoder(this.maxBufferBytes, false);
 
-    // The proxy is the RFB client toward the container: it speaks first.
+    // RFB is server-first (RFC 6143): toward the browser the proxy is the
+    // server, so it sends its version string immediately — a real noVNC
+    // client waits for it and sends nothing until it arrives. Toward the
+    // container the proxy is the client and must wait for the container's
+    // version string before replying, so clientHs.start() returns nothing
+    // (the reply is emitted by feed() when the banner arrives). The 101
+    // response has already been written by the proxy before construction,
+    // so the version frame safely follows it on the wire.
+    this.writeClient(encodeFrame(OP_BINARY, this.serverHs.start()));
     const startBytes = this.clientHs.start();
     if (startBytes.length > 0) this.writeUpstream(startBytes);
 

@@ -13,23 +13,29 @@
  * decrypted keys for server-side use only; callers must never echo the
  * `keys` field to a client (see rows.ts for the client shape).
  *
- * Server mode never lets a user fall back to host env keys (SWARM_KEYS_*):
- * a provider without a saved key has no keys. Local (single-user) mode keeps
- * the env keys, because the machine and its env belong to that one user.
+ * Host env keys (SWARM_KEYS_*) only ever serve the local single-user
+ * operator identity: a provider without a saved key has no keys for any
+ * account, in every mode. Local (single-user) mode keeps the env keys,
+ * because the machine and its env belong to that one user.
  */
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { serverMode } from "../auth";
-import { authFor } from "./adapters";
+import { LOCAL_USER_ID } from "../auth";
+import { apiStyleFor, authFor } from "./adapters";
 import { resolveOllamaBaseUrl, userSettingsFilePath } from "./settings";
 import {
   canonicalProviderId,
   catalogEntry,
+  LEGACY_API_STYLE_REPAIRS,
+  LEGACY_MODEL_ID_REPAIRS,
+  LEGACY_REPAIR_HOSTS,
   normalizeCatalogApiStyle,
   providerKindForCatalog,
+  repairedApiStyle,
+  repairedModelId,
 } from "./catalog";
 import { ConfigValidationError, parseProvidersData } from "./config-file";
 import { CooldownStore } from "./cooldown-store";
@@ -40,10 +46,11 @@ import type {
   ApiStyle,
   ModelCapabilities,
   ModelTier,
+  PerplexityEffort,
   ProviderAuth,
   ProviderConfig,
 } from "./types";
-import { isApiStyle } from "./types";
+import { isApiStyle, isPerplexityEffort } from "./types";
 
 /** Name of the legacy server-wide file (migration source only). */
 export const DEFAULT_PROVIDERS_FILE = "providers.json";
@@ -242,6 +249,78 @@ function openKeys(userId: string, raw: StoredProvider, options: DataDirOptions):
 }
 
 /**
+ * Whether a provider's legacy repairs apply to this saved config. When
+ * LEGACY_REPAIR_HOSTS names hosts for the provider, the config's
+ * effective base URL must be on one of them — a config pointing the same
+ * provider id at a gateway that still speaks the old wire format keeps
+ * its saved style and model ids. An unparseable base URL never repairs.
+ */
+function legacyRepairsApplyToHost(providerId: string, config: ProviderConfig): boolean {
+  const hosts = LEGACY_REPAIR_HOSTS[providerId];
+  if (!hosts) return true;
+  const baseUrl = config.baseUrl ?? catalogEntry(config.id)?.baseUrl;
+  if (!baseUrl) return false;
+  try {
+    return hosts.includes(new URL(baseUrl).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Rewrite model ids and wire styles that shipped as wrong catalog
+ * defaults (see LEGACY_MODEL_ID_REPAIRS / LEGACY_API_STYLE_REPAIRS in
+ * ./catalog) in a saved config: tier models, the selectable list,
+ * capability-override keys, and the effective wire style. Applied on
+ * load so every resolution path sees the corrected values; the file on
+ * disk catches up on the next write, like plaintext-key re-sealing.
+ * Only exact legacy ids/styles for the named provider are rewritten —
+ * a user's own model that happens to share the name on another provider
+ * is untouched, and providers with a LEGACY_REPAIR_HOSTS entry are only
+ * repaired against their own API host.
+ */
+function repairLegacyModelIds(config: ProviderConfig): ProviderConfig {
+  const providerId = canonicalProviderId(config.id);
+  if (!LEGACY_MODEL_ID_REPAIRS[providerId] && !LEGACY_API_STYLE_REPAIRS[providerId]) {
+    return config;
+  }
+  if (!legacyRepairsApplyToHost(providerId, config)) return config;
+  let changed = false;
+  const fix = (modelId: string): string => {
+    const next = repairedModelId(config.id, modelId);
+    if (next !== modelId) changed = true;
+    return next;
+  };
+  const models = config.models
+    ? (Object.fromEntries(
+        Object.entries(config.models).map(([tier, modelId]) => [tier, modelId ? fix(modelId) : modelId]),
+      ) as Partial<Record<ModelTier, string>>)
+    : config.models;
+  const availableModels = config.availableModels?.map(fix);
+  const modelCapabilities = config.modelCapabilities
+    ? Object.fromEntries(
+        Object.entries(config.modelCapabilities).map(([modelId, caps]) => [fix(modelId), caps]),
+      )
+    : config.modelCapabilities;
+  // The effective style (explicit, or derived from kind) is what the
+  // gateway would send; pin the corrected style explicitly when it moves.
+  const repairedStyle = normalizeCatalogApiStyle(
+    repairedApiStyle(config.id, apiStyleFor(config)),
+  );
+  const apiStyle =
+    repairedStyle && repairedStyle !== config.apiStyle ? repairedStyle : undefined;
+  if (apiStyle) changed = true;
+  if (!changed) return config;
+  return {
+    ...config,
+    ...(models ? { models } : {}),
+    ...(availableModels ? { availableModels } : {}),
+    ...(modelCapabilities ? { modelCapabilities } : {}),
+    ...(apiStyle ? { apiStyle } : {}),
+  };
+}
+
+/**
  * Read one user's saved providers (keys decrypted, server-side only).
  * A missing file returns []. A malformed file, or one that belongs to a
  * different user, returns [] and logs.
@@ -266,7 +345,7 @@ export function readConfiguredProviders(userId: string, options: DataDirOptions 
       void _sealed;
       return { ...rest, keys: openKeys(userId, raw, options) };
     });
-    return parseProvidersData({ providers: plain });
+    return parseProvidersData({ providers: plain }).map(repairLegacyModelIds);
   } catch (err) {
     if (err instanceof ConfigValidationError) {
       console.error(`[swarm-providers] ignoring invalid providers file ${file}: ${err.message}`);
@@ -350,6 +429,11 @@ export interface SaveProviderInput {
   inputPricePer1mTokens?: number;
   /** Output token price per 1M tokens (USD), for cost estimation. */
   outputPricePer1mTokens?: number;
+  /**
+   * Perplexity Agent API effort level. Omit on edit to keep the saved value;
+   * null clears it back to the server default. Perplexity only.
+   */
+  effort?: PerplexityEffort | null;
 }
 
 /** Fields an endpoint/model edit may change without touching keys or rank. */
@@ -362,6 +446,34 @@ export interface ProviderSettingsPatch {
   availableModels?: string[];
   modelCapabilities?: Record<string, ModelCapabilities>;
   headers?: Record<string, string>;
+  /** Perplexity Agent API effort level; null clears it. Perplexity only. */
+  effort?: PerplexityEffort | null;
+}
+
+/**
+ * Validate an effort value from a save/patch input. Effort is a
+ * Perplexity-only Agent API field, so a value on any other provider is a
+ * client error rather than dead config. Returns the value to persist
+ * (undefined = unset/cleared).
+ */
+function cleanEffort(
+  providerId: string,
+  effort: PerplexityEffort | null | undefined,
+): PerplexityEffort | undefined {
+  if (effort === undefined || effort === null) return undefined;
+  if (!isPerplexityEffort(effort)) {
+    throw new ProviderMutationError(
+      "effort must be one of fast, low, medium, high, xhigh.",
+      400,
+    );
+  }
+  if (providerId !== "perplexity") {
+    throw new ProviderMutationError(
+      "effort is only supported for the Perplexity provider.",
+      400,
+    );
+  }
+  return effort;
 }
 
 function cleanHeaders(input: Record<string, string> | undefined): Record<string, string> | undefined {
@@ -481,6 +593,15 @@ export function saveProvider(userId: string, input: SaveProviderInput): SaveProv
     cleanModelCapabilities(input.modelCapabilities) ?? previous?.modelCapabilities;
   const auth = input.auth ? { ...input.auth } : previous?.auth ?? catalog?.auth;
   const name = input.name?.trim() || catalog?.name || id;
+  // Billing flag: an explicit input wins, then the previously saved value,
+  // then the catalog's verified free-tier mark. (An edit that omitted
+  // isFree used to drop the flag silently, unlike every other field here.)
+  const isFree = input.isFree ?? previous?.isFree ?? catalog?.isFree;
+  // Effort: an explicit value wins, null clears back to the server default,
+  // and an omitted field keeps the saved value (same preserve-on-edit rule
+  // as isFree). Validated against the documented enum; Perplexity only.
+  const effort =
+    input.effort === undefined ? previous?.effort : cleanEffort(id, input.effort);
 
   const draft = { id, kind, apiStyle, auth } as Pick<ProviderConfig, "id" | "kind" | "auth" | "apiStyle">;
   if (providerNeedsKey(draft)) {
@@ -525,13 +646,14 @@ export function saveProvider(userId: string, input: SaveProviderInput): SaveProv
       : {}),
     ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
     ...(rank !== undefined ? { rank } : {}),
-    ...(input.isFree !== undefined ? { isFree: input.isFree } : {}),
+    ...(isFree !== undefined ? { isFree } : {}),
     ...(input.inputPricePer1mTokens !== undefined
       ? { inputPricePer1mTokens: input.inputPricePer1mTokens }
       : {}),
     ...(input.outputPricePer1mTokens !== undefined
       ? { outputPricePer1mTokens: input.outputPricePer1mTokens }
       : {}),
+    ...(effort ? { effort } : {}),
     ...(keys !== undefined ? { keys } : {}),
     enabled: input.enabled ?? previous?.enabled ?? true,
   };
@@ -584,6 +706,10 @@ export function updateProviderSettings(
     patch.models !== undefined
       ? tierModels(cleanModelList(patch.models, "models") ?? [])
       : current?.models ?? known.models;
+  // Effort: omitted keeps the saved value, null clears it. Validated
+  // against the documented enum; Perplexity only.
+  const effort =
+    patch.effort === undefined ? current?.effort : cleanEffort(normalized, patch.effort);
 
   const updated: ProviderConfig = {
     ...(current ?? { id: normalized, kind, keys: known.keys, envKeys: known.envKeys }),
@@ -598,6 +724,7 @@ export function updateProviderSettings(
       ? { modelCapabilities }
       : {}),
     ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
+    ...(effort ? { effort } : { effort: undefined }),
   };
   // Drop undefined so merge-on-read cannot clobber built-in defaults.
   const cleaned: Record<string, unknown> = {};
@@ -675,6 +802,44 @@ export function setProviderBilling(
     return next[index];
   }
   const entry: ProviderConfig = { id: normalized, kind: known.kind, ...patch };
+  writeConfiguredProviders(userId, [...existing, entry]);
+  return entry;
+}
+
+/**
+ * Set or clear a provider's Perplexity Agent API effort level without
+ * touching its keys or rank. Null clears back to the server default.
+ * Unknown providers are rejected; built-ins not yet in the file get an
+ * entry that keeps their environment keys.
+ */
+export function setProviderEffort(
+  userId: string,
+  id: string,
+  effort: PerplexityEffort | null,
+): ProviderConfig {
+  requireUserId(userId);
+  const normalized = normalizeProviderId(id);
+  if (!normalized) {
+    throw new ProviderMutationError("Provider id must be a slug (a-z, 0-9, dashes).", 400);
+  }
+  const cleaned = cleanEffort(normalized, effort);
+  const known = routerProviders(userId).find((c) => c.id === normalized);
+  if (!known) throw new ProviderMutationError("Provider not found.", 404);
+
+  const existing = readConfiguredProviders(userId);
+  const index = existing.findIndex((c) => c.id === normalized);
+  if (index >= 0) {
+    const next = existing.map((c) =>
+      c.id === normalized ? { ...c, ...(cleaned ? { effort: cleaned } : { effort: undefined }) } : c,
+    );
+    writeConfiguredProviders(userId, next);
+    return next[index];
+  }
+  const entry: ProviderConfig = {
+    id: normalized,
+    kind: known.kind,
+    ...(cleaned ? { effort: cleaned } : {}),
+  };
   writeConfiguredProviders(userId, [...existing, entry]);
   return entry;
 }
@@ -825,8 +990,10 @@ export function removeProvider(userId: string, id: string): { id: string; file: 
 export interface RouterProvidersOptions extends DataDirOptions {
   /**
    * Let providers without saved keys read host env keys (SWARM_KEYS_*).
-   * Defaults to true only in local (single-user) mode; server mode never
-   * shares host keys across accounts.
+   * Only ever honored for the local single-user operator identity
+   * (LOCAL_USER_ID): an account's providers never fall back to host keys,
+   * in any mode, whatever a caller passes. Defaults to true for the local
+   * operator, false for every account.
    */
   hostEnvKeys?: boolean;
 }
@@ -839,7 +1006,12 @@ export interface RouterProvidersOptions extends DataDirOptions {
  */
 export function routerProviders(userId: string, options: RouterProvidersOptions = {}): ProviderConfig[] {
   const configured = readConfiguredProviders(userId, options);
-  const hostEnvKeys = options.hostEnvKeys ?? !serverMode();
+  // Per-user BYOK is unconditional for accounts: host env keys serve only
+  // the local operator identity, never a signed-in user's run. Keying this
+  // off the user id (not SWARM_SERVER_MODE) means a deploy that forgets
+  // the env var still cannot spend host keys on accounts, and no call
+  // site can opt an account back in.
+  const hostEnvKeys = userId === LOCAL_USER_ID && (options.hostEnvKeys ?? true);
   const fileById = new Map(configured.map((c) => [c.id, c]));
   // File entries are layered over the built-in defaults, so a saved provider
   // keeps the default rank/budget metadata unless the file overrides it.
@@ -859,13 +1031,23 @@ export function routerProviders(userId: string, options: RouterProvidersOptions 
   }
   // The Ollama endpoint is a user setting, not only a catalog default, so a
   // custom local/LAN port chosen in the settings drawer reaches the router.
-  const overlaid = merged.map((config) =>
-    config.apiStyle === "ollama"
-      ? { ...config, baseUrl: resolveOllamaBaseUrl(userId, config.baseUrl, options) }
-      : config,
-  );
+  const overlaid = merged.map((config) => {
+    let next =
+      config.apiStyle === "ollama"
+        ? { ...config, baseUrl: resolveOllamaBaseUrl(userId, config.baseUrl, options) }
+        : config;
+    // Seed the free-tier flag from the catalog when the user has not set
+    // their own billing flag, so built-in defaults (gemini) and providers
+    // saved before the catalog carried the mark still route and price as
+    // free. An explicit user value always wins.
+    if (next.isFree === undefined) {
+      const catalogFree = catalogEntry(next.id)?.isFree;
+      if (catalogFree !== undefined) next = { ...next, isFree: catalogFree };
+    }
+    return next;
+  });
   if (hostEnvKeys) return overlaid;
-  // Server mode: an explicit key list (possibly empty) stops the router from
+  // Account: an explicit key list (possibly empty) stops the router from
   // reading SWARM_KEYS_* — host keys are never shared across accounts.
   return overlaid.map((c) => {
     const { envKeys: _envKeys, ...rest } = c;

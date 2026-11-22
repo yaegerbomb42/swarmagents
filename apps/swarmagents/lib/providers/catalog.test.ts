@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PROVIDER_CATALOG, catalogEntry, providerKindForCatalog, providerHue } from "./catalog";
+import { PROVIDER_CATALOG, catalogEntry, providerKindForCatalog, providerHue, repairedModelId } from "./catalog";
 import type {
   CatalogApiStyle,
   CatalogAuthHeader,
@@ -200,4 +200,31 @@ test("canonicalProviderId normalizes mixed case and invalid chars into slugs", (
   assert.equal(canonicalProviderId(null), "");
   assert.equal(canonicalProviderId(undefined), "");
   assert.equal(canonicalProviderId(123), "");
+});
+
+test("inception defaults to mercury-3, never the retired mercury id", () => {
+  const inception = catalogEntry("inception");
+  assert.ok(inception, "inception catalog entry");
+  assert.equal(inception.models?.default, "mercury-3");
+  assert.deepEqual(inception.models?.popular, ["mercury-3"]);
+  // No entry may ship the retired id as a default or suggestion: saved
+  // configs inherit these values, and Inception rejects "mercury".
+  for (const entry of PROVIDER_CATALOG) {
+    assert.notEqual(entry.models?.default, "mercury", `${entry.id}: default must not be mercury`);
+    assert.equal(
+      (entry.models?.popular ?? []).includes("mercury"),
+      false,
+      `${entry.id}: popular must not include mercury`
+    );
+  }
+});
+
+test("repairedModelId rewrites only the legacy inception default", () => {
+  assert.equal(repairedModelId("inception", "mercury"), "mercury-3");
+  assert.equal(repairedModelId("inception", "mercury-3"), "mercury-3");
+  assert.equal(repairedModelId("inception", "some-other-model"), "some-other-model");
+  // Provider-scoped: another provider's model literally named "mercury"
+  // (e.g. a custom endpoint) is the user's choice, not a legacy default.
+  assert.equal(repairedModelId("openai", "mercury"), "mercury");
+  assert.equal(repairedModelId("custom", "mercury"), "mercury");
 });

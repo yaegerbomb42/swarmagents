@@ -98,3 +98,41 @@ test("run mode is gui only when vision, tools and computer use are all present",
   assert.equal(info.mode, "gui");
   assert.equal(info.label, "Desktop mode");
 });
+
+test("presets carry documented output-token caps for hosted families", () => {
+  assert.equal(presetModelCapabilities("anthropic", "claude-sonnet-4-5").maxOutputTokens, 64_000);
+  assert.equal(presetModelCapabilities("anthropic", "claude-3-7-sonnet-20250219").maxOutputTokens, 64_000);
+  assert.equal(presetModelCapabilities("anthropic", "claude-3-5-sonnet-20241022").maxOutputTokens, 8_192);
+  assert.equal(presetModelCapabilities("anthropic", "claude-3-opus-20240229").maxOutputTokens, 4_096);
+
+  assert.equal(presetModelCapabilities("openai", "gpt-5").maxOutputTokens, 128_000);
+  assert.equal(presetModelCapabilities("openai", "gpt-4.1").maxOutputTokens, 32_768);
+  assert.equal(presetModelCapabilities("openai", "gpt-4o-mini").maxOutputTokens, 16_384);
+  assert.equal(presetModelCapabilities("openai", "o3").maxOutputTokens, 100_000);
+  assert.equal(presetModelCapabilities("openai", "gpt-3.5-turbo").maxOutputTokens, 4_096);
+
+  assert.equal(presetModelCapabilities("gemini", "gemini-2.5-pro").maxOutputTokens, 65_536);
+  assert.equal(presetModelCapabilities("gemini", "gemini-2.0-flash").maxOutputTokens, 8_192);
+
+  assert.equal(presetModelCapabilities("mistral", "mistral-large-latest").maxOutputTokens, 8_192);
+  assert.equal(presetModelCapabilities("deepseek", "deepseek-chat").maxOutputTokens, 8_192);
+  assert.equal(presetModelCapabilities("deepseek", "deepseek-reasoner").maxOutputTokens, 65_536);
+  assert.equal(presetModelCapabilities("cohere", "command-r-plus").maxOutputTokens, 4_096);
+
+  // Unknown/local models have no known cap: the gateway leaves max_tokens alone.
+  assert.equal(presetModelCapabilities("ollama", "llama3.2:3b").maxOutputTokens, undefined);
+  assert.equal(presetModelCapabilities("custom", "mystery-model").maxOutputTokens, undefined);
+});
+
+test("a saved maxOutputTokens override wins over the preset", () => {
+  const merged = mergedModelCapabilities(
+    {
+      id: "openai",
+      modelCapabilities: {
+        "gpt-4o": { vision: true, tools: true, computerUse: true, maxOutputTokens: 2_048 },
+      },
+    },
+    "gpt-4o",
+  );
+  assert.equal(merged.maxOutputTokens, 2_048);
+});

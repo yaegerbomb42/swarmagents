@@ -492,3 +492,98 @@ test("estimateInputTokens counts system, messages, tool blocks", () => {
   const withoutTools = estimateInputTokens({ ...body, tools: undefined });
   assert.ok(withoutTools < n, "tools add tokens");
 });
+
+test("anthropicToOpenAI: tool_result is_error survives as an extension field", () => {
+  const out = anthropicToOpenAI(
+    {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_err", content: "exit 1: boom", is_error: true },
+            { type: "tool_result", tool_use_id: "toolu_ok", content: "done" },
+          ],
+        },
+      ],
+    },
+    TARGET_MODEL,
+  );
+  const messages = out.messages as Array<Record<string, unknown>>;
+  // Error results carry the flag; successful ones stay byte-identical.
+  assert.deepEqual(messages[0], {
+    role: "tool",
+    tool_call_id: "toolu_err",
+    content: "exit 1: boom",
+    is_error: true,
+  });
+  assert.deepEqual(messages[1], {
+    role: "tool",
+    tool_call_id: "toolu_ok",
+    content: "done",
+  });
+});
+
+test("anthropicToOpenAI: tool_choice variants map to OpenAI shapes", () => {
+  const tools = [{ name: "Bash", input_schema: { type: "object" } }];
+  const base = { messages: [{ role: "user", content: "hi" }], tools };
+
+  assert.equal(
+    anthropicToOpenAI({ ...base, tool_choice: { type: "auto" } }, TARGET_MODEL).tool_choice,
+    "auto",
+  );
+  assert.equal(
+    anthropicToOpenAI({ ...base, tool_choice: { type: "any" } }, TARGET_MODEL).tool_choice,
+    "required",
+  );
+  assert.equal(
+    anthropicToOpenAI({ ...base, tool_choice: { type: "none" } }, TARGET_MODEL).tool_choice,
+    "none",
+  );
+  assert.deepEqual(
+    anthropicToOpenAI({ ...base, tool_choice: { type: "tool", name: "Bash" } }, TARGET_MODEL).tool_choice,
+    { type: "function", function: { name: "Bash" } },
+  );
+  // disable_parallel_tool_use -> parallel_tool_calls: false.
+  const noParallel = anthropicToOpenAI(
+    { ...base, tool_choice: { type: "auto", disable_parallel_tool_use: true } },
+    TARGET_MODEL,
+  );
+  assert.equal(noParallel.tool_choice, "auto");
+  assert.equal(noParallel.parallel_tool_calls, false);
+  // Pre-shaped OpenAI choices pass through.
+  assert.equal(
+    anthropicToOpenAI({ ...base, tool_choice: "required" }, TARGET_MODEL).tool_choice,
+    "required",
+  );
+  assert.deepEqual(
+    anthropicToOpenAI(
+      { ...base, tool_choice: { type: "function", function: { name: "Bash" } } },
+      TARGET_MODEL,
+    ).tool_choice,
+    { type: "function", function: { name: "Bash" } },
+  );
+  // Absent tool_choice stays absent; without tools it is dropped entirely.
+  assert.equal("tool_choice" in anthropicToOpenAI(base, TARGET_MODEL), false);
+  const noTools = anthropicToOpenAI(
+    { messages: [{ role: "user", content: "hi" }], tool_choice: { type: "any" } },
+    TARGET_MODEL,
+  );
+  assert.equal("tool_choice" in noTools, false);
+});
+
+test("anthropicToOpenAI: max_tokens clamps to the model's output cap", () => {
+  const body = { messages: [{ role: "user", content: "hi" }], max_tokens: 64_000 };
+  // Above the cap: clamped. Below the cap: unchanged. No cap: unchanged.
+  assert.equal(anthropicToOpenAI(body, TARGET_MODEL, { maxOutputTokens: 8_192 }).max_tokens, 8_192);
+  assert.equal(
+    anthropicToOpenAI({ ...body, max_tokens: 512 }, TARGET_MODEL, { maxOutputTokens: 8_192 }).max_tokens,
+    512,
+  );
+  assert.equal(anthropicToOpenAI(body, TARGET_MODEL).max_tokens, 64_000);
+  assert.equal(anthropicToOpenAI(body, TARGET_MODEL, { maxOutputTokens: 0 }).max_tokens, 64_000);
+  // Absent max_tokens stays absent even with a cap.
+  const noMax = anthropicToOpenAI({ messages: [{ role: "user", content: "hi" }] }, TARGET_MODEL, {
+    maxOutputTokens: 8_192,
+  });
+  assert.equal("max_tokens" in noMax, false);
+});

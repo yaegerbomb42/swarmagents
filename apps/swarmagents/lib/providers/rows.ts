@@ -5,7 +5,7 @@
  * carry a key *count* and last-4 *masks* — never a key value.
  */
 
-import { apiStyleFor, authFor, baseUrlFor } from "./adapters";
+import { apiStyleFor, authFor, baseUrlFor, perplexityEffortFor } from "./adapters";
 import { catalogEntry } from "./catalog";
 import { mergedModelCapabilities } from "./capabilities";
 import { providerKeySlots, type ProviderKeySlot } from "./keys";
@@ -13,6 +13,7 @@ import type {
   ApiStyle,
   AuthScheme,
   ModelCapabilities,
+  PerplexityEffort,
   ProviderConfig,
 } from "./types";
 
@@ -54,6 +55,8 @@ export interface ProviderRow {
   inputPricePer1mTokens?: number;
   /** Output token price per 1M tokens (USD) used for cost estimation. */
   outputPricePer1mTokens?: number;
+  /** Perplexity Agent API effort level that will be sent, when one is set. */
+  effort?: PerplexityEffort;
   /**
    * Epoch ms until which the provider is skipped after a 402 (quota
    * exhausted); absent when it is not cooling down for quota.
@@ -150,6 +153,9 @@ export function providerRow(
     ...(config.outputPricePer1mTokens !== undefined
       ? { outputPricePer1mTokens: config.outputPricePer1mTokens }
       : {}),
+    // Only the effort that will actually be sent (Perplexity-gated), so the
+    // UI never shows a level the gateway would ignore.
+    ...(perplexityEffortFor(config) ? { effort: perplexityEffortFor(config) } : {}),
     ...(quotaUntil !== undefined ? { quotaCoolingDownUntil: quotaUntil } : {}),
     keySlots: providerKeySlots(config.keys),
   };

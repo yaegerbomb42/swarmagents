@@ -80,6 +80,16 @@ export interface ProviderCatalogEntry {
   links: ProviderCatalogLinks;
   /** True for local-only endpoints (http://localhost, no key required). */
   isLocal?: boolean;
+  /**
+   * True when the provider has a genuinely free tier (no card required, or a
+   * local server that costs $0 to run). Drives the saved-config default:
+   * store.saveProvider and routerProviders seed ProviderConfig.isFree from
+   * this when the user has not set their own billing flag, which in turn
+   * makes cost estimates read $0 and enables prefer-free routing. Only set
+   * where the free tier is verified — a trial credit or an eval-only key
+   * does not count.
+   */
+  isFree?: boolean;
   /** Short hint shown in the UI for providers needing special auth/setup. */
   authHint?: string;
   /** Default credential placement, when it differs from the generic auth style. */
@@ -166,6 +176,8 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
       docs: "https://ai.google.dev/gemini-api/docs",
       pricing: "https://ai.google.dev/gemini-api/docs/pricing",
     },
+    // Gemini API has a free tier (rate-limited) in Google AI Studio.
+    isFree: true,
   },
   {
     id: "mistral",
@@ -186,6 +198,8 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
       docs: "https://docs.mistral.ai",
       pricing: "https://mistral.ai/pricing",
     },
+    // La Plateforme's Experiment plan is free (rate-limited).
+    isFree: true,
   },
   {
     id: "groq",
@@ -206,6 +220,8 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
       docs: "https://console.groq.com/docs",
       pricing: "https://groq.com/pricing",
     },
+    // Free tier with no billing card (rate-limited).
+    isFree: true,
   },
   {
     id: "cerebras",
@@ -215,7 +231,7 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     baseUrl: "https://api.cerebras.ai/v1",
     models: {
       default: "llama-3.3-70b",
-      popular: ["llama-3.3-70b", "llama-3.1-8b"],
+      popular: ["llama-3.3-70b", "gpt-oss-120b", "llama-3.1-8b"],
     },
     authHeader: "bearer",
     envVar: "SWARM_KEYS_CEREBRAS",
@@ -226,6 +242,8 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
       docs: "https://inference-docs.cerebras.ai",
       pricing: "https://www.cerebras.ai/pricing",
     },
+    // Free tier with no card required (rate-limited).
+    isFree: true,
   },
   {
     id: "deepseek",
@@ -273,9 +291,10 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     apiStyle: "openai-chat",
     baseUrl: "https://openrouter.ai/api/v1",
     models: {
-      default: "anthropic/claude-sonnet-4-5",
+      // OpenRouter slugs use dots, not dashes: anthropic/claude-sonnet-4.5.
+      default: "anthropic/claude-sonnet-4.5",
       popular: [
-        "anthropic/claude-sonnet-4-5",
+        "anthropic/claude-sonnet-4.5",
         "openai/gpt-4.1-mini",
         "meta-llama/llama-3.3-70b-instruct",
         "deepseek/deepseek-chat",
@@ -334,12 +353,17 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
   {
     id: "perplexity",
     name: "Perplexity",
-    shortDescription: "Sonar models with built-in grounding and citations.",
-    apiStyle: "openai-chat",
+    shortDescription: "Sonar on the Agent API — search-grounded answers with citations.",
+    // Agent API: POST /v1/agent (aliased as /v1/responses), OpenAI
+    // Responses wire format. The legacy Sonar Chat Completions endpoint
+    // retired 2026-09-27; the old sonar* ids are now effort levels
+    // (fast/low/medium/high) of the single perplexity/sonar model.
+    // requestUrl appends /v1/responses to this base.
+    apiStyle: "openai-responses",
     baseUrl: "https://api.perplexity.ai",
     models: {
-      default: "sonar-pro",
-      popular: ["sonar-pro", "sonar", "sonar-reasoning"],
+      default: "perplexity/sonar",
+      popular: ["perplexity/sonar"],
     },
     authHeader: "bearer",
     envVar: "SWARM_KEYS_PERPLEXITY",
@@ -357,8 +381,9 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     apiStyle: "openai-chat",
     baseUrl: "https://api.cohere.ai/compatibility/v1",
     models: {
-      default: "command-a",
-      popular: ["command-a", "command-r-plus", "command-r"],
+      // Cohere ids are date-suffixed; the bare aliases were deprecated.
+      default: "command-a-03-2025",
+      popular: ["command-a-03-2025", "command-a-plus-05-2026", "command-r-plus-08-2024", "command-r-08-2024"],
     },
     authHeader: "bearer",
     envVar: "SWARM_KEYS_COHERE",
@@ -395,8 +420,8 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     apiStyle: "openai-chat",
     baseUrl: "https://api.inceptionlabs.ai/v1",
     models: {
-      default: "mercury",
-      popular: ["mercury"],
+      default: "mercury-3",
+      popular: ["mercury-3"],
     },
     authHeader: "bearer",
     envVar: "SWARM_KEYS_INCEPTION",
@@ -424,7 +449,7 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     baseUrl: "https://api.sambanova.ai/v1",
     models: {
       default: "Meta-Llama-3.3-70B-Instruct",
-      popular: ["Meta-Llama-3.3-70B-Instruct", "Llama-3.2-90B-Vision-Instruct"],
+      popular: ["Meta-Llama-3.3-70B-Instruct", "gpt-oss-120b"],
     },
     authHeader: "bearer",
     envVar: "SWARM_KEYS_SAMBANOVA",
@@ -470,6 +495,7 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
       console: "https://ollama.com",
       docs: "https://github.com/ollama/ollama",
     },
+    isFree: true,
     isLocal: true,
     authHint: "Installed models are discovered automatically from /api/tags.",
   },
@@ -489,6 +515,7 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
       console: "https://lmstudio.ai",
       docs: "https://lmstudio.ai/docs",
     },
+    isFree: true,
     isLocal: true,
   },
   {
@@ -596,8 +623,10 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     apiStyle: "openai-chat",
     baseUrl: "https://api.z.ai/api/paas/v4",
     models: {
+      // GLM thinking is a request parameter ("thinking": {"type": "enabled"}),
+      // not a separate model id; there is no glm-4.5-thinking model.
       default: "glm-4.5",
-      popular: ["glm-4.5", "glm-4.5-air", "glm-4.5-thinking"],
+      popular: ["glm-4.5", "glm-4.5-air"],
     },
     authHeader: "bearer",
     envVar: "SWARM_KEYS_ZAI",
@@ -614,8 +643,9 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     apiStyle: "openai-chat",
     baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     models: {
-      default: "qwen-max",
-      popular: ["qwen-max", "qwen-plus", "qwen-turbo", "qwen3-coder"],
+      // The coder model is qwen3-coder-plus; bare "qwen3-coder" is not an id.
+      default: "qwen3.7-plus",
+      popular: ["qwen3.7-plus", "qwen3.8-max", "qwen-plus", "qwen3-coder-plus"],
     },
     authHeader: "bearer",
     envVar: "SWARM_KEYS_QWEN",
@@ -630,17 +660,18 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     name: "Moonshot AI (Kimi)",
     shortDescription: "Kimi models via the Moonshot platform API.",
     apiStyle: "openai-chat",
-    baseUrl: "https://api.moonshot.cn/v1",
+    // Global endpoint; api.moonshot.cn serves the China platform.
+    baseUrl: "https://api.moonshot.ai/v1",
     models: {
-      default: "kimi-k2",
-      popular: ["kimi-k2", "moonshot-v1-8k", "moonshot-v1-128k"],
+      // The moonshot-v1-* series is sunset and kimi-k2 is retiring.
+      default: "kimi-k3",
+      popular: ["kimi-k3", "kimi-k3.1-pro", "kimi-k2.6", "kimi-k2.7-code"],
     },
     authHeader: "bearer",
     envVar: "SWARM_KEYS_MOONSHOT",
     standardEnvVar: "MOONSHOT_API_KEY",
     links: {
-      console: "https://platform.moonshot.cn",
-      docs: "https://platform.moonshot.cn/docs",
+      console: "https://platform.moonshot.ai",
     },
   },
   {
@@ -648,16 +679,18 @@ export const PROVIDER_CATALOG: readonly ProviderCatalogEntry[] = [
     name: "MiniMax",
     shortDescription: "MiniMax models via the platform API.",
     apiStyle: "openai-chat",
-    baseUrl: "https://api.minimax.chat/v1",
+    // Global endpoint; api.minimax.chat is the legacy host.
+    baseUrl: "https://api.minimax.io/v1",
     models: {
-      default: "MiniMax-Text-01",
-      popular: ["MiniMax-Text-01", "abab6.5s-chat"],
+      default: "MiniMax-M3",
+      popular: ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
     },
     authHeader: "bearer",
     envVar: "SWARM_KEYS_MINIMAX",
     standardEnvVar: "MINIMAX_API_KEY",
     links: {
-      console: "https://platform.minimaxi.com",
+      console: "https://platform.minimax.io",
+      docs: "https://platform.minimax.io/docs/guides/text-generation",
     },
   },
   // More OpenAI-compatible hosts and local servers (see catalog-more.ts).
@@ -693,4 +726,75 @@ export function canonicalProviderId(value: unknown): string {
 export function catalogEntry(id: string): ProviderCatalogEntry | undefined {
   const canonical = canonicalProviderId(id);
   return PROVIDER_CATALOG.find((entry) => entry.id === (canonical || id));
+}
+
+/**
+ * Model ids that shipped as catalog defaults and were later corrected.
+ * Saved provider configs written while the wrong default was live still
+ * carry the old id; the store rewrites them on load (see
+ * repairLegacyModelIds in ./store). Keyed by provider id, then old model id.
+ */
+export const LEGACY_MODEL_ID_REPAIRS: Readonly<
+  Record<string, Readonly<Record<string, string>>>
+> = {
+  inception: { mercury: "mercury-3" },
+  // Sonar Chat Completions ids (retired 2026-09-27). On the Agent API the
+  // old quality tiers are effort levels of the single perplexity/sonar
+  // model; the repair lands on the model and the style repair below moves
+  // the config onto the Responses wire.
+  perplexity: {
+    sonar: "perplexity/sonar",
+    "sonar-pro": "perplexity/sonar",
+    "sonar-reasoning": "perplexity/sonar",
+    "sonar-reasoning-pro": "perplexity/sonar",
+    "sonar-deep-research": "perplexity/sonar",
+  },
+};
+
+/** The corrected model id for a legacy saved id, or the id unchanged. */
+export function repairedModelId(providerId: string, modelId: string): string {
+  return LEGACY_MODEL_ID_REPAIRS[canonicalProviderId(providerId)]?.[modelId] ?? modelId;
+}
+
+/**
+ * Wire styles that shipped as catalog defaults and were later corrected.
+ * Same load-time repair as LEGACY_MODEL_ID_REPAIRS: a saved config still
+ * carrying the old style is rewritten to the current one. Keyed by
+ * provider id, then old style.
+ */
+export const LEGACY_API_STYLE_REPAIRS: Readonly<
+  Record<
+    string,
+    Readonly<
+      Partial<
+        Record<
+          CatalogApiStyle,
+          Exclude<CatalogApiStyle, "openai-compatible" | "custom">
+        >
+      >
+    >
+  >
+> = {
+  // Perplexity retired Sonar Chat Completions (2026-09-27); the Agent API
+  // speaks the OpenAI Responses format.
+  perplexity: { "openai-chat": "openai-responses" },
+};
+
+/**
+ * Hosts a provider's legacy repairs apply to, when a repair is only valid
+ * against the provider's own API. A saved config pointing the same
+ * provider id at a gateway that still speaks the old wire format keeps
+ * its saved style and model ids. Providers not listed are repaired on
+ * any host.
+ */
+export const LEGACY_REPAIR_HOSTS: Readonly<Record<string, readonly string[]>> = {
+  perplexity: ["api.perplexity.ai"],
+};
+
+/** The corrected wire style for a legacy saved style, or the style unchanged. */
+export function repairedApiStyle(
+  providerId: string,
+  style: CatalogApiStyle,
+): CatalogApiStyle {
+  return LEGACY_API_STYLE_REPAIRS[canonicalProviderId(providerId)]?.[style] ?? style;
 }

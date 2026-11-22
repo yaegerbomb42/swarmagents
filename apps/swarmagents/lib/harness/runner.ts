@@ -68,6 +68,12 @@ import {
   toPackedRunRequest,
   type ContextPackerMode,
 } from "./context/contextGovernor";
+import {
+  joinSystemSections,
+  orderSystemSections,
+  packSystemSections,
+  systemSectionsFrom,
+} from "./context/system-packer";
 
 export interface ClaudeCodeRunnerOptions {
   /** Path to the claude binary. Defaults to "claude" (or $CLAUDE_BIN). */
@@ -1066,6 +1072,8 @@ export class ClaudeCodeRunner {
     const mode = this.resolvePackerMode(request);
     let effective = request;
     let packer: AppliedContextPacker | undefined;
+    const systemPacker = request.systemPacker;
+    const wantOrder = systemPacker?.cacheFriendlyOrder === true;
 
     if (mode === "l1") {
       // One invocation, one prompt: the request prompt is the ledger goal and
@@ -1079,7 +1087,15 @@ export class ClaudeCodeRunner {
         ledger: new StateLedger(request.prompt),
         skeletonFiles: [],
         workingSet: [],
-        systemExtras: systemExtrasFrom(request),
+        systemExtras: wantOrder
+          ? orderSystemSections(
+              systemSectionsFrom({
+                agentCard: request.agentCard,
+                rolePrompt: request.rolePhase?.appendSystemPrompt,
+                memoryContext: request.memoryContext,
+              }),
+            ).map((s) => s.text)
+          : systemExtrasFrom(request),
       });
       effective = toPackedRunRequest(request, packed);
       packer = { mode, logLine: packed.logLine };
@@ -1098,12 +1114,57 @@ export class ClaudeCodeRunner {
       argv.push("--allowedTools", ...role.allowedTools);
       argv.push("--mcp-config", role.mcpConfigPath);
     }
-    const appended = [effective.agentCard, role?.appendSystemPrompt, effective.memoryContext]
-      .filter(Boolean)
-      .join("\n\n");
+    const appended = this.appendedSystemPrompt(effective, role?.appendSystemPrompt, mode, (applied) => {
+      packer = applied;
+    });
     if (appended) argv.push("--append-system-prompt", appended);
     argv.push("--", effective.prompt);
     return { argv, packer };
+  }
+
+  /**
+   * The appended system prompt for one invocation. Default path: the agent
+   * card, role prompt and memory joined untouched — byte-identical to
+   * before the system packer existed. When the run's token-efficiency
+   * options ask for it (claude-code mode only; L1 packs its own header),
+   * the sections are optionally reordered stable-first for prompt caches
+   * and packed to the token budget, lowest-value sections truncated
+   * first. Any packer failure falls back to the legacy join: a packing
+   * bug must never change what the agent is told.
+   */
+  private appendedSystemPrompt(
+    effective: RunRequest,
+    rolePrompt: string | undefined,
+    mode: ContextPackerMode,
+    onApplied: (applied: AppliedContextPacker) => void,
+  ): string {
+    const legacy = [effective.agentCard, rolePrompt, effective.memoryContext]
+      .filter(Boolean)
+      .join("\n\n");
+    const options = effective.systemPacker;
+    if (mode === "l1" || !options || (options.pack !== true && options.cacheFriendlyOrder !== true)) {
+      return legacy;
+    }
+    try {
+      const sections = systemSectionsFrom({
+        agentCard: effective.agentCard,
+        rolePrompt,
+        memoryContext: effective.memoryContext,
+      });
+      const ordered = options.cacheFriendlyOrder === true ? orderSystemSections(sections) : sections;
+      if (options.pack === true) {
+        const packed = packSystemSections(ordered, options.budgetTokens);
+        onApplied({ mode, logLine: packed.logLine });
+        return packed.text;
+      }
+      onApplied({
+        mode,
+        logLine: `system-packer order=cache-friendly sections=${ordered.map((s) => s.id).join(",")}`,
+      });
+      return joinSystemSections(ordered);
+    } catch {
+      return legacy;
+    }
   }
 }
 

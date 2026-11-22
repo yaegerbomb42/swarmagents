@@ -9,6 +9,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { canonicalProviderId, providerKindForCatalog } from "@/lib/providers/catalog";
 import { testProviderConnection } from "@/lib/providers/discovery";
+import { classifyProbeError } from "@/lib/providers/errors";
 import { providerOwner } from "@/lib/providers/owner";
 import { JsonBodyError, readJsonBody } from "@/lib/http";
 import { routerProviders } from "@/lib/providers/store";
@@ -131,16 +132,28 @@ export async function POST(request: NextRequest) {
   const apiKey = providedKey || saved?.keys?.[0] || "";
   const model = typeof input.model === "string" ? input.model : undefined;
 
+  const startedAt = Date.now();
   try {
     const result = await testProviderConnection(config, apiKey, {
       ...(model ? { model } : {}),
       timeoutMs: 20_000,
     });
-    return NextResponse.json(result, { headers: NO_STORE });
+    return NextResponse.json({ ...result, status: 200 }, { headers: NO_STORE });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    // Structured failure the UI can render precisely: coarse class
+    // (auth/network/rate-limit/unknown), the finer kind and HTTP status
+    // when known, and how long the probe took. Existing fields unchanged.
+    const probe = classifyProbeError(err);
     return NextResponse.json(
-      { ok: false, error: message.slice(0, 500) },
+      {
+        ok: false,
+        error: message.slice(0, 500),
+        errorClass: probe.errorClass,
+        ...(probe.kind ? { kind: probe.kind } : {}),
+        ...(probe.status !== undefined ? { status: probe.status } : {}),
+        latencyMs: Date.now() - startedAt,
+      },
       { status: 502, headers: NO_STORE },
     );
   }

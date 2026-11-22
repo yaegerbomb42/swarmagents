@@ -85,7 +85,10 @@ export function sessionMaxAgeSec(): number {
   return DEFAULT_SESSION_MAX_AGE_SEC;
 }
 
-const LOCAL_USER: AuthUser = { id: "local", email: "local@swarmagents.local" };
+/** Id of the single-user local operator identity (no sign-in; loopback trust). */
+export const LOCAL_USER_ID = "local";
+
+const LOCAL_USER: AuthUser = { id: LOCAL_USER_ID, email: "local@swarmagents.local" };
 const HARNESS_USER: AuthUser = { id: "harness", email: "harness@swarmagents.local" };
 
 /** Server mode: multi-user deployment where requests must authenticate. */

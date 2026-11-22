@@ -116,3 +116,55 @@ export function parseRetryAfter(value: string | null, now: number): number | und
   if (!Number.isNaN(date)) return Math.max(0, date - now);
   return undefined;
 }
+
+/**
+ * Coarse error class for connection-test results — the four buckets the UI
+ * renders precisely ("auth", "rate-limit", "network", "unknown"). Finer
+ * detail stays in the ProviderError kind and the HTTP status.
+ */
+export type ProbeErrorClass = "auth" | "network" | "rate-limit" | "unknown";
+
+export interface ProbeErrorInfo {
+  errorClass: ProbeErrorClass;
+  /** HTTP status when the provider answered with one. */
+  status?: number;
+  /** The finer ProviderError kind, when the error carried one. */
+  kind?: ProviderErrorKind;
+}
+
+/**
+ * Classify a probe failure for display. ProviderErrors map by kind; a raw
+ * fetch failure (TypeError from undici, an abort) is a network problem;
+ * anything else is unknown. Never throws and never echoes key material —
+ * callers pass the already-redacted error message separately.
+ */
+export function classifyProbeError(err: unknown): ProbeErrorInfo {
+  if (err instanceof ProviderError) {
+    const base: ProbeErrorInfo = {
+      errorClass: "unknown",
+      kind: err.kind,
+      ...(err.status !== undefined ? { status: err.status } : {}),
+    };
+    switch (err.kind) {
+      case "auth":
+        return { ...base, errorClass: "auth" };
+      case "rate_limit":
+      case "quota_exhausted":
+        return { ...base, errorClass: "rate-limit" };
+      case "network":
+      case "timeout":
+      case "server":
+        return { ...base, errorClass: "network" };
+      default:
+        return base;
+    }
+  }
+  if (err instanceof AbortError || (err instanceof Error && err.name === "AbortError")) {
+    return { errorClass: "network" };
+  }
+  // fetch() rejects with a TypeError on DNS/connection/TLS failures.
+  if (err instanceof TypeError) {
+    return { errorClass: "network" };
+  }
+  return { errorClass: "unknown" };
+}

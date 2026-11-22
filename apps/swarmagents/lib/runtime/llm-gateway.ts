@@ -48,6 +48,7 @@ import {
   authFor,
   authHeadersFor,
   modelForTier,
+  perplexityEffortFor,
   requestUrl,
 } from "../providers/adapters";
 import { mergedModelCapabilities } from "../providers/capabilities";
@@ -55,8 +56,8 @@ import type { ApiStyle, ProviderConfig, ProviderErrorKind, TokenUsage } from "..
 import { CooldownStore, type PersistedCooldown } from "../providers/cooldown-store";
 import { routerProviders, userCooldownFilePath } from "../providers/store";
 import { readUserSettings, type UserSettings } from "../providers/settings";
-import { estimateCostUsd } from "../providers/pricing";
-import { readSseFrames } from "../providers/stream";
+import { costWasReported, estimateCostUsd } from "../providers/pricing";
+import { guardStreamTimeouts, readSseFrames, StreamTimeoutError } from "../providers/stream";
 import { telemetryBus, type TelemetryBus } from "../telemetry";
 import { getBudgetGate } from "./budget-gate";
 import { getRunsDir } from "../telemetry/paths";
@@ -75,6 +76,7 @@ import {
   anthropicToGemini,
   anthropicToOllama,
   anthropicToResponses,
+  chatChunkWithReportedCost,
   gateAnthropicRequestBody,
   geminiChunkToChunks,
   geminiFinalChunk,
@@ -84,6 +86,7 @@ import {
   newResponsesStreamState,
   ollamaLineToChunks,
   ollamaToOpenAIResponse,
+  parseReportedCostUsd,
   responsesEventToChunks,
   responsesToOpenAIResponse,
   type OpenAIChunk,
@@ -100,6 +103,24 @@ import {
 
 export const MAX_LLM_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES = 64 * 1024;
+
+/** Read a positive timeout (ms) from the environment, falling back when unset/invalid. */
+function envTimeoutMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+/**
+ * Default per-attempt upstream deadline (FIX-06): a non-streaming attempt's
+ * whole fetch + body read, and a streaming attempt's time-to-first-byte.
+ * A provider's own `timeoutMs` config wins over this; a caller option wins
+ * over both.
+ */
+export const DEFAULT_LLM_TIMEOUT_MS = envTimeoutMs("SWARM_LLM_TIMEOUT_MS", 120_000);
+/** Default max gap between streamed chunks before the attempt is declared stalled. */
+export const DEFAULT_LLM_STREAM_IDLE_TIMEOUT_MS = envTimeoutMs("SWARM_LLM_STREAM_IDLE_TIMEOUT_MS", 60_000);
 
 /** Statuses/error kinds that mean "try the next provider by rank". */
 const FAILOVER_STATUSES = new Set([401, 402, 404, 408, 429]);
@@ -239,6 +260,8 @@ export interface LlmCallEvent {
     outputTokens?: number;
     /** 0 for free providers; a number when a price is known; null = unknown. */
     costUsd: number | null;
+    /** True when costUsd is the provider-reported amount (usage.cost), not an estimate. */
+    costReported?: boolean;
     /**
      * Milliseconds the attempt waited before the provider served it (the
      * queue segment of the waterfall).
@@ -384,6 +407,10 @@ interface LlmRequestContext {
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  /** Per-attempt upstream deadline override (see LlmForwardOptions.timeoutMs). */
+  timeoutMs?: number;
+  /** Streaming idle-gap override (see LlmForwardOptions.streamIdleTimeoutMs). */
+  streamIdleTimeoutMs?: number;
 }
 
 /** Shared per-request state for both forwarding paths. */
@@ -402,6 +429,10 @@ interface LlmRequest {
   attempts: LlmAttempt[];
   entries: PoolEntry[];
   settings: UserSettings;
+  /** Resolved per-attempt deadline default (provider config timeoutMs wins per attempt). */
+  timeoutMs: number;
+  /** Resolved streaming idle-gap deadline. */
+  streamIdleTimeoutMs: number;
 }
 
 function prepareRequest(options: LlmRequestContext): LlmRequest | { error: LlmFailure } {
@@ -435,6 +466,12 @@ function prepareRequest(options: LlmRequestContext): LlmRequest | { error: LlmFa
     attempts: [],
     entries,
     settings,
+    timeoutMs:
+      options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : DEFAULT_LLM_TIMEOUT_MS,
+    streamIdleTimeoutMs:
+      options.streamIdleTimeoutMs && options.streamIdleTimeoutMs > 0
+        ? options.streamIdleTimeoutMs
+        : DEFAULT_LLM_STREAM_IDLE_TIMEOUT_MS,
   };
 }
 
@@ -490,6 +527,7 @@ function recordAttempt(
     ...(timing?.queuedMs !== undefined ? { queuedMs: timing.queuedMs } : {}),
     ...(timing?.ttftMs !== undefined ? { ttftMs: timing.ttftMs } : {}),
     costUsd: cost,
+    ...(cost !== null && usage !== undefined && costWasReported(config, usage) ? { costReported: true } : {}),
   });
 }
 
@@ -1127,14 +1165,25 @@ function providerPayload(
     case "anthropic":
       return body;
     case "openai-responses":
-      return anthropicToResponses(body, model);
+      return anthropicToResponses(body, model, bridgeOptionsFor(config, model), perplexityEffortFor(config));
     case "ollama":
-      return anthropicToOllama(body, model);
+      return anthropicToOllama(body, model, bridgeOptionsFor(config, model));
     case "gemini":
-      return anthropicToGemini(body, model);
+      return anthropicToGemini(body, model, bridgeOptionsFor(config, model));
     default:
-      return anthropicToOpenAI(body, model);
+      return anthropicToOpenAI(body, model, bridgeOptionsFor(config, model));
   }
+}
+
+/**
+ * Bridge translation limits for a (provider, model): clamp Anthropic
+ * max_tokens to the model's known output cap (preset or user override via
+ * modelCapabilities) so an oversized request is never rejected upstream.
+ * Unknown cap = no clamp. Anthropic-wire providers bypass the bridge and
+ * enforce their own limits natively.
+ */
+function bridgeOptionsFor(config: ProviderConfig, model: string): { maxOutputTokens?: number } {
+  return { maxOutputTokens: mergedModelCapabilities(config, model).maxOutputTokens };
 }
 
 /** Translate a provider's non-streaming body back to Anthropic Messages. */
@@ -1227,10 +1276,87 @@ export interface LlmForwardOptions {
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  /**
+   * Per-attempt upstream deadline (FIX-06): the whole fetch + body read for
+   * non-streaming; time-to-first-byte for streaming. A provider config's
+   * own `timeoutMs` overrides this per attempt. Defaults to
+   * SWARM_LLM_TIMEOUT_MS (120s). A timed-out attempt is a failover-eligible
+   * provider failure (kind "timeout"), never a hung turn.
+   */
+  timeoutMs?: number;
+  /**
+   * Streaming only: max gap between upstream chunks before the attempt is
+   * declared stalled. Total stream duration is not capped. Defaults to
+   * SWARM_LLM_STREAM_IDLE_TIMEOUT_MS (60s).
+   */
+  streamIdleTimeoutMs?: number;
   /** Run to which llm.call telemetry events are emitted. */
   runId?: string;
   /** Telemetry bus override (defaults to the global bus). */
   bus?: TelemetryBus;
+}
+
+/**
+ * One attempt's deadline: an AbortController linked to the caller's signal
+ * plus a timer. `timedOut()` distinguishes our deadline from a caller abort,
+ * so a timeout surfaces as a failover-eligible provider failure (kind
+ * "timeout") while a caller abort stays an abort.
+ */
+interface AttemptDeadline {
+  signal: AbortSignal;
+  /** The effective deadline for this attempt, ms. */
+  timeoutMs: number;
+  timedOut: () => boolean;
+  /** Stop the deadline timer (streaming: headers arrived; the stream guard takes over). */
+  clearTimer: () => void;
+  /** Clear the timer and unlink the caller signal. Idempotent. */
+  dispose: () => void;
+}
+
+function attemptDeadline(
+  req: LlmRequest,
+  config: ProviderConfig,
+  callerSignal: AbortSignal | undefined,
+): AttemptDeadline {
+  const timeoutMs =
+    config.timeoutMs && config.timeoutMs > 0 ? config.timeoutMs : req.timeoutMs;
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  timer.unref?.();
+  const onCallerAbort = () => controller.abort();
+  if (callerSignal) {
+    if (callerSignal.aborted) controller.abort();
+    else callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+  }
+  let disposed = false;
+  const clearTimer = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+  };
+  return {
+    signal: controller.signal,
+    timeoutMs,
+    timedOut: () => timedOut,
+    clearTimer,
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      clearTimer();
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+    },
+  };
+}
+
+function attemptTimeoutError(config: ProviderConfig, timeoutMs: number): UpstreamError {
+  return new UpstreamError(
+    `Request to ${config.id} timed out after ${timeoutMs}ms.`,
+    408,
+    "timeout",
+  );
 }
 
 export async function forwardLlmNonStreaming(options: LlmForwardOptions): Promise<LlmCompletion> {
@@ -1258,6 +1384,10 @@ export async function forwardLlmNonStreaming(options: LlmForwardOptions): Promis
     const handle = settleOnce(next);
     const { config } = handle;
     const startedAt = req.now();
+    // Per-attempt deadline (FIX-06): bounds connect, headers, and the body
+    // read below. A timer fire is a failover-eligible "timeout" failure;
+    // a caller abort stays an abort.
+    const deadline = attemptDeadline(req, config, signal);
     try {
       const capabilities = mergedModelCapabilities(config, handle.model);
       const gated = gateAnthropicRequestBody(body, capabilities);
@@ -1273,13 +1403,14 @@ export async function forwardLlmNonStreaming(options: LlmForwardOptions): Promis
         method: "POST",
         headers: providerHeaders(config, handle.apiKey, streaming),
         body: JSON.stringify(payload),
-        signal,
+        signal: deadline.signal,
       };
       let upstream: Response;
       try {
         upstream = await fetchImpl(requestUrl(config, handle.model, streaming), init);
       } catch (err) {
         if (signal?.aborted) throw new Error("aborted");
+        if (deadline.timedOut()) throw attemptTimeoutError(config, deadline.timeoutMs);
         throw new UpstreamError(
           `Network error from ${config.id}: ${errorMessage(err)}`,
           0,
@@ -1321,13 +1452,15 @@ export async function forwardLlmNonStreaming(options: LlmForwardOptions): Promis
         const latencyMs = req.now() - startedAt;
         await handle.succeed({ latencyMs, ttftMs: latencyMs, headers: upstream.headers, outputText: raw.slice(0, MAX_OBSERVED_TEXT) || " " });
         recordAttempt(req, handle, handle.attemptIndex, "ok", latencyMs, undefined, attemptTiming(req, startedAt, latencyMs));
-        return { body: json, usage: usageOf(json), attempts: req.attempts };
+        return { body: json, usage: withReportedCost(usageOf(json), config, json), attempts: req.attempts };
       }
 
       let json: unknown;
       try {
         json = await upstream.json();
       } catch {
+        // A body read aborted by our deadline is a timeout, not bad JSON.
+        if (deadline.timedOut()) throw attemptTimeoutError(config, deadline.timeoutMs);
         const failure: AttemptFailure = { kind: "invalid_response", latencyMs: req.now() - startedAt, message: `Invalid JSON response from ${config.id}.` };
         await handle.fail(failure);
         recordFailure(req, handle, failure, undefined, attemptTiming(req, startedAt));
@@ -1335,7 +1468,7 @@ export async function forwardLlmNonStreaming(options: LlmForwardOptions): Promis
       }
 
       const translated = anthropicResponse(config, json, handle.model);
-      const usage = usageOf(translated);
+      const usage = withReportedCost(usageOf(translated), config, json);
       const latencyMs = req.now() - startedAt;
       const content = contentOf(translated);
       const openAiJson = upstreamOpenAiJson(config, json, handle.model);
@@ -1358,8 +1491,9 @@ export async function forwardLlmNonStreaming(options: LlmForwardOptions): Promis
         handle.release();
         throw err;
       }
-      const up =
-        err instanceof UpstreamError
+      const up = deadline.timedOut()
+        ? attemptTimeoutError(config, deadline.timeoutMs)
+        : err instanceof UpstreamError
           ? err
           : new UpstreamError(`Unexpected error from ${config.id}: ${errorMessage(err)}`, 502, "unknown");
       const failure: AttemptFailure = {
@@ -1373,6 +1507,7 @@ export async function forwardLlmNonStreaming(options: LlmForwardOptions): Promis
       recordFailure(req, handle, failure, up.message.slice(0, 300), attemptTiming(req, startedAt));
       continue;
     } finally {
+      deadline.dispose();
       // Never leak a router slot: a no-op when the attempt already settled,
       // and the release path when the consumer abandoned the stream.
       handle.release();
@@ -1403,6 +1538,22 @@ function usageOf(body: unknown): TokenUsage {
   };
 }
 
+/**
+ * Attach the provider-reported cost from the raw upstream body to gateway
+ * usage. The translated Anthropic body has no cost field, so the raw body
+ * is the only place it survives; relayed bodies stay byte-identical. Only
+ * the OpenAI-wire styles are read: Responses (`usage.cost`, Perplexity) and
+ * chat (`usage.cost_in_usd_ticks`, xAI — docs.x.ai/developers/
+ * cost-tracking). Anthropic/Ollama/Gemini usages carry no cost field in
+ * either documented shape and are untouched.
+ */
+function withReportedCost(usage: TokenUsage, config: ProviderConfig, rawBody: unknown): TokenUsage {
+  const style = apiStyleFor(config);
+  if (style !== "openai-responses" && style !== "openai-chat") return usage;
+  const cost = parseReportedCostUsd(isRecordValue(rawBody) ? rawBody.usage : undefined);
+  return cost !== undefined ? { ...usage, costUsd: cost } : usage;
+}
+
 function providerConfigsFor(owner: string): ProviderConfig[] {
   return routerProviders(owner);
 }
@@ -1421,23 +1572,20 @@ function providerConfigsFor(owner: string): ProviderConfig[] {
  */
 async function* upstreamChunks(
   config: ProviderConfig,
-  upstream: Response,
+  body: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
 ): AsyncGenerator<OpenAIChunk, void, void> {
   const style = apiStyleFor(config);
-  if (!upstream.body) {
-    throw new UpstreamError(`No response body from ${config.id}.`, 502, "invalid_response");
-  }
 
   if (style === "ollama") {
     const state = newOllamaStreamState(config.id);
-    for await (const line of readJsonLines(upstream.body, signal)) {
+    for await (const line of readJsonLines(body, signal)) {
       yield* ollamaLineToChunks(line, state);
     }
     return;
   }
 
-  const frames = readSseFrames(upstream.body, signal);
+  const frames = readSseFrames(body, signal);
   if (style === "openai-responses") {
     const state = newResponsesStreamState(config.id);
     for await (const frame of frames) {
@@ -1479,7 +1627,11 @@ async function* upstreamChunks(
     return;
   }
 
-  // OpenAI chat completions SSE.
+  // OpenAI chat completions SSE. Chunks pass through raw except that a
+  // provider-reported cost (xAI `usage.cost_in_usd_ticks` on the final
+  // usage chunk) is stamped as `cost_usd` for the gateway's accounting
+  // tap, exactly as the Responses shim stamps its terminal chunk; the
+  // bridge drops unknown usage fields, so relayed SSE is unchanged.
   for await (const frame of frames) {
     if (frame.data.trim() === "[DONE]") break;
     let chunk: unknown;
@@ -1488,7 +1640,7 @@ async function* upstreamChunks(
     } catch {
       continue;
     }
-    yield chunk as OpenAIChunk;
+    yield chatChunkWithReportedCost(chunk);
   }
 }
 
@@ -1521,6 +1673,9 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
     const handle = settleOnce(next);
     const { config } = handle;
     const startedAt = req.now();
+    // Per-attempt deadline (FIX-06): bounds connect + headers here; after
+    // headers, the stream guard below bounds first-byte and idle gaps.
+    const deadline = attemptDeadline(req, config, signal);
     try {
       const style = apiStyleFor(config);
       const capabilities = mergedModelCapabilities(config, handle.model);
@@ -1538,15 +1693,21 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
           method: "POST",
           headers: providerHeaders(config, handle.apiKey, true),
           body: JSON.stringify(payload),
-          signal,
+          signal: deadline.signal,
         });
       } catch (err) {
         if (signal?.aborted) throw new Error("aborted");
-        const failure: AttemptFailure = {
-          kind: "network",
-          latencyMs: req.now() - startedAt,
-          message: `Network error from ${config.id}: ${errorMessage(err)}`,
-        };
+        const failure: AttemptFailure = deadline.timedOut()
+          ? {
+              kind: "timeout",
+              latencyMs: req.now() - startedAt,
+              message: `Request to ${config.id} timed out after ${deadline.timeoutMs}ms.`,
+            }
+          : {
+              kind: "network",
+              latencyMs: req.now() - startedAt,
+              message: `Network error from ${config.id}: ${errorMessage(err)}`,
+            };
         await handle.fail(failure);
         recordFailure(req, handle, failure, undefined, attemptTiming(req, startedAt));
         continue;
@@ -1572,31 +1733,71 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
         continue;
       }
 
-      // Committed: this provider owns the stream from here on. Announce it as
-      // a leading SSE comment so the serving provider (which may differ from
-      // the first ranked one after failover) is observable on the wire.
-      yield encoder.encode(`: provider=${config.id}\n\n`);
+      // Headers are in: the fetch deadline is done and the stream guard
+      // takes over — first byte within the remaining attempt budget, then
+      // an idle-gap cap. Total stream duration is never capped (FIX-06).
+      deadline.clearTimer();
+      if (!upstream.body) {
+        throw new UpstreamError(`No response body from ${config.id}.`, 502, "invalid_response");
+      }
+      const guardedBody = guardStreamTimeouts(upstream.body, {
+        firstByteMs: Math.max(1, deadline.timeoutMs - (req.now() - startedAt)),
+        idleMs: req.streamIdleTimeoutMs,
+      });
+
       const observer = new AnthropicStreamObserver(startedAt, req.now);
+      // Provider-reported cost tapped from translated chunks (see below).
+      let reportedStreamCostUsd: number | undefined;
       if (style === "anthropic") {
         // Pass-through: relay the upstream SSE bytes unchanged.
-        const reader = upstream.body?.getReader();
-        if (!reader) {
-          throw new UpstreamError(`No response body from ${config.id}.`, 502, "invalid_response");
-        }
+        const reader = guardedBody.getReader();
+        let committed = false;
         try {
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            observer.pushBytes(value);
-            yield value;
+          // Read the first chunk before announcing the provider: until a
+          // byte is committed to the client, a first-byte timeout (or any
+          // first-read failure) can still fail over to the next provider.
+          const first: Awaited<ReturnType<typeof reader.read>> = await reader.read();
+          committed = true;
+          // Committed: this provider owns the stream from here on. Announce
+          // it as a leading SSE comment so the serving provider (which may
+          // differ from the first ranked one after failover) is observable
+          // on the wire.
+          yield encoder.encode(`: provider=${config.id}\n\n`);
+          if (!first.done) {
+            observer.pushBytes(first.value);
+            yield first.value;
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              observer.pushBytes(value);
+              yield value;
+            }
           }
         } catch (err) {
           if (signal?.aborted) throw new Error("aborted");
+          if (!committed) {
+            // First-byte timeout can fail over. Other body errors on a 200
+            // response are mid-stream (see OpenAI path above).
+            if (err instanceof StreamTimeoutError) {
+              throw attemptTimeoutError(config, deadline.timeoutMs);
+            }
+            yield encoder.encode(`: provider=${config.id}\n\n`);
+            const failure: AttemptFailure = {
+              kind: "network",
+              latencyMs: req.now() - startedAt,
+              message: errorMessage(err),
+            };
+            await handle.fail(failure);
+            recordFailure(req, handle, failure);
+            const body = anthropicErrorBody(502, `Stream error from ${config.id}: ${errorMessage(err)}`);
+            yield encoder.encode(`event: error\ndata: ${body}\n\n`);
+            return;
+          }
           // Bytes are already committed to the client: report the failure
           // and end with an error event instead of splicing in another
           // provider's stream.
           const failure: AttemptFailure = {
-            kind: "network",
+            kind: err instanceof StreamTimeoutError ? "timeout" : "network",
             latencyMs: req.now() - startedAt,
             message: errorMessage(err),
           };
@@ -1610,20 +1811,20 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
         }
       } else {
         const translator = new OpenAIStreamTranslator();
+        const chunks = upstreamChunks(config, guardedBody, deadline.signal);
+        // Pull the first chunk before announcing the provider (see above).
+        let step: IteratorResult<OpenAIChunk>;
         try {
-          for await (const chunk of upstreamChunks(config, upstream, signal)) {
-            const events = translator.push(chunk);
-            for (const event of events) observer.pushData(event.data);
-            if (events.length > 0) yield encoder.encode(events.map(sseLine).join(""));
-          }
-          // Close any open content blocks and emit the terminal events.
-          const final = translator.finish();
-          for (const event of final) observer.pushData(event.data);
-          if (final.length > 0) yield encoder.encode(final.map(sseLine).join(""));
+          step = await chunks.next();
         } catch (err) {
           if (signal?.aborted) throw new Error("aborted");
-          // Mid-stream upstream failure: emit an Anthropic error event, then
-          // stop. We cannot fail over after bytes are committed.
+          // First-byte timeout can still fail over. Any other body error on a
+          // 200 response is treated as mid-stream: the upstream already
+          // committed, and enqueue-then-error fixtures surface on first read.
+          if (err instanceof StreamTimeoutError) {
+            throw attemptTimeoutError(config, deadline.timeoutMs);
+          }
+          yield encoder.encode(`: provider=${config.id}\n\n`);
           const failure: AttemptFailure = {
             kind: "network",
             latencyMs: req.now() - startedAt,
@@ -1635,12 +1836,57 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
           yield encoder.encode(`event: error\ndata: ${body}\n\n`);
           return;
         }
+        // Committed (see above).
+        yield encoder.encode(`: provider=${config.id}\n\n`);
+        try {
+          while (true) {
+            if (step.done) break;
+            const chunk: OpenAIChunk = step.value;
+            const chunkCost = chunk.usage?.cost_usd;
+            if (typeof chunkCost === "number" && Number.isFinite(chunkCost) && chunkCost >= 0) {
+              reportedStreamCostUsd = chunkCost;
+            }
+            const events = translator.push(chunk);
+            for (const event of events) observer.pushData(event.data);
+            if (events.length > 0) yield encoder.encode(events.map(sseLine).join(""));
+            step = await chunks.next();
+          }
+          // Close any open content blocks and emit the terminal events.
+          const final = translator.finish();
+          for (const event of final) observer.pushData(event.data);
+          if (final.length > 0) yield encoder.encode(final.map(sseLine).join(""));
+        } catch (err) {
+          if (signal?.aborted) throw new Error("aborted");
+          // Mid-stream upstream failure: emit an Anthropic error event, then
+          // stop. We cannot fail over after bytes are committed.
+          const failure: AttemptFailure = {
+            kind: err instanceof StreamTimeoutError ? "timeout" : "network",
+            latencyMs: req.now() - startedAt,
+            message: errorMessage(err),
+          };
+          await handle.fail(failure);
+          recordFailure(req, handle, failure);
+          const body = anthropicErrorBody(502, `Stream error from ${config.id}: ${errorMessage(err)}`);
+          yield encoder.encode(`event: error\ndata: ${body}\n\n`);
+          return;
+        } finally {
+          void chunks.return(undefined).catch(() => {});
+        }
       }
 
       const latencyMs = req.now() - startedAt;
       const observed = observer.result();
-      await handle.succeed({ latencyMs, ...observed, headers: upstream.headers });
-      recordAttempt(req, handle, handle.attemptIndex, "ok", latencyMs, observed.usage, attemptTiming(req, startedAt, observed.ttftMs));
+      const observedUsage =
+        observed.usage && reportedStreamCostUsd !== undefined
+          ? { ...observed.usage, costUsd: reportedStreamCostUsd }
+          : observed.usage;
+      await handle.succeed({
+        latencyMs,
+        ...observed,
+        ...(observedUsage ? { usage: observedUsage } : {}),
+        headers: upstream.headers,
+      });
+      recordAttempt(req, handle, handle.attemptIndex, "ok", latencyMs, observedUsage, attemptTiming(req, startedAt, observed.ttftMs));
       return;
     } catch (err) {
       if (signal?.aborted) {
@@ -1651,8 +1897,9 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
         handle.release();
         throw err;
       }
-      const up =
-        err instanceof UpstreamError
+      const up = deadline.timedOut()
+        ? attemptTimeoutError(config, deadline.timeoutMs)
+        : err instanceof UpstreamError
           ? err
           : new UpstreamError(`Unexpected error from ${config.id}: ${errorMessage(err)}`, 502, "unknown");
       const failure: AttemptFailure = {
@@ -1666,6 +1913,7 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
       recordFailure(req, handle, failure, up.message.slice(0, 300), attemptTiming(req, startedAt));
       continue;
     } finally {
+      deadline.dispose();
       // Never leak a router slot: a no-op when the attempt already settled,
       // and the release path when the consumer abandoned the stream.
       handle.release();

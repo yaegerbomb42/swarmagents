@@ -842,13 +842,13 @@ test("DockerVmDriver.writeFile creates parent dir and pipes content via stdin", 
 
   const p = driver.writeFile(handle(), "/workspace/sub/a.txt", "big-content");
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].args, ["exec", "--", "swarm-vm-alice", "mkdir", "-p", "/workspace/sub"]);
+  assert.deepEqual(calls[0].args, ["exec", "--", "swarm-vm-alice", "timeout", "-s", "TERM", "--kill-after=2s", "30.000s", "mkdir", "-p", "/workspace/sub"]);
   calls[0].cp.emitClose(0);
 
   await flush();
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[1].args, [
-    "exec", "-i", "--", "swarm-vm-alice", "sh", "-c",
+    "exec", "-i", "--", "swarm-vm-alice", "timeout", "-s", "TERM", "--kill-after=2s", "120.000s", "sh", "-c",
     'if [ -L "$1" ]; then echo "refusing to write through a symlink" >&2; exit 40; fi; cat > "$1"',
     "sh", "/workspace/sub/a.txt",
   ]);

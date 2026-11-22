@@ -12,7 +12,7 @@
  * It is pure: no I/O, no keys, no platform imports.
  */
 
-import { anthropicToOpenAI } from "./anthropic-bridge";
+import { anthropicToOpenAI, clampMaxTokens, type BridgeOptions } from "./anthropic-bridge";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -80,9 +80,18 @@ function openAiParts(content: unknown): Record<string, unknown>[] {
 /**
  * Anthropic Messages body -> OpenAI Responses request. Built on the OpenAI chat
  * translation so tool calls/results keep their exact semantics.
+ *
+ * `effort` is the Perplexity Agent API effort level (top-level `effort`
+ * field); the caller decides whether the target provider takes one. Omit it
+ * for every other Responses provider so their request shape is unchanged.
  */
-export function anthropicToResponses(body: unknown, targetModel: string): Record<string, unknown> {
-  const chat = anthropicToOpenAI(body, targetModel);
+export function anthropicToResponses(
+  body: unknown,
+  targetModel: string,
+  options: BridgeOptions = {},
+  effort?: string,
+): Record<string, unknown> {
+  const chat = anthropicToOpenAI(body, targetModel, options);
   const rawMessages = Array.isArray(chat.messages) ? chat.messages : [];
   const input: Record<string, unknown>[] = [];
   const instructions: string[] = [];
@@ -100,6 +109,9 @@ export function anthropicToResponses(body: unknown, targetModel: string): Record
         type: "function_call_output",
         call_id: asString(message.tool_call_id) ?? "call_unknown",
         output: contentText(message.content),
+        // Preserve the bridge's is_error extension field (see
+        // anthropic-bridge.ts) so failure semantics survive this hop too.
+        ...(message.is_error === true ? { is_error: true } : {}),
       });
       continue;
     }
@@ -152,9 +164,56 @@ export function anthropicToResponses(body: unknown, targetModel: string): Record
   if (maxTokens !== undefined) out.max_output_tokens = maxTokens;
   const temperature = asNumber(chat.temperature);
   if (temperature !== undefined) out.temperature = temperature;
-  if (tools !== undefined && tools.length > 0) out.tools = tools;
+  if (tools !== undefined && tools.length > 0) {
+    out.tools = tools;
+    // Responses tool_choice mirrors chat's, except the named-tool form is
+    // flat ({type:"function", name}) instead of nested under `function`.
+    const chatChoice = chat.tool_choice;
+    if (typeof chatChoice === "string") {
+      out.tool_choice = chatChoice;
+    } else if (isRecord(chatChoice) && chatChoice.type === "function") {
+      const fn = isRecord(chatChoice.function) ? chatChoice.function : {};
+      const name = asString(fn.name) ?? asString(chatChoice.name);
+      if (name) out.tool_choice = { type: "function", name };
+    }
+    if (chat.parallel_tool_calls === false) out.parallel_tool_calls = false;
+  }
+  if (effort) out.effort = effort;
   if (chat.stream === true) out.stream = true;
   return out;
+}
+
+/**
+ * Provider-reported cost in USD from a provider `usage` object, when the
+ * provider included one. Two documented shapes are recognized:
+ *
+ *   - Perplexity Agent API: `usage.cost = { currency: "USD", total_cost, … }`
+ *     (docs.perplexity.ai/api-reference/agent-post). A bare numeric `cost`
+ *     is also accepted defensively (some gateways flatten the object).
+ *   - xAI: `usage.cost_in_usd_ticks`, where 1 USD = 10^10 ticks
+ *     (docs.x.ai/developers/cost-tracking).
+ *
+ * Anything else — absent, malformed, negative, non-finite, or denominated
+ * in a currency other than USD — returns undefined (fail-open: the caller
+ * falls back to the price-table estimate). A reported $0 is a real cost
+ * and is preserved. When both shapes are present, `cost` wins.
+ */
+export function parseReportedCostUsd(usage: unknown): number | undefined {
+  if (!isRecord(usage)) return undefined;
+  const cost = usage.cost;
+  if (isRecord(cost)) {
+    const currency = asString(cost.currency);
+    if (currency === undefined || currency.toUpperCase() === "USD") {
+      const total = asNumber(cost.total_cost);
+      if (total !== undefined && total >= 0) return total;
+    }
+    return undefined;
+  }
+  const flat = asNumber(cost);
+  if (flat !== undefined && flat >= 0) return flat;
+  const ticks = asNumber(usage.cost_in_usd_ticks);
+  if (ticks !== undefined && ticks >= 0) return ticks / 10_000_000_000;
+  return undefined;
 }
 
 /** Responses API non-streaming body -> OpenAI chat completion body. */
@@ -179,6 +238,7 @@ export function responsesToOpenAIResponse(body: unknown, requestedModel: string)
     }
   }
   const usage = isRecord(root.usage) ? root.usage : {};
+  const reportedCost = parseReportedCostUsd(usage);
   const status = asString(root.status);
   const finishReason = toolCalls.length > 0 ? "tool_calls" : status === "incomplete" ? "length" : "stop";
   return {
@@ -198,6 +258,10 @@ export function responsesToOpenAIResponse(body: unknown, requestedModel: string)
     usage: {
       prompt_tokens: asNumber(usage.input_tokens) ?? 0,
       completion_tokens: asNumber(usage.output_tokens) ?? 0,
+      // Provider-reported cost rides along when present; the Anthropic
+      // bridge ignores unknown usage fields, so relayed bodies are
+      // unchanged. The gateway reads it for llm.call accounting.
+      ...(reportedCost !== undefined ? { cost_usd: reportedCost } : {}),
     },
   };
 }
@@ -315,9 +379,11 @@ export function responsesEventToChunks(event: unknown, state: ResponsesStreamSta
   if (type === "response.completed" || type === "response.incomplete") {
     const response = isRecord(root.response) ? root.response : {};
     const usage = isRecord(response.usage) ? response.usage : {};
+    const reportedCost = parseReportedCostUsd(usage);
     state.usage = {
       prompt_tokens: asNumber(usage.input_tokens) ?? 0,
       completion_tokens: asNumber(usage.output_tokens) ?? 0,
+      ...(reportedCost !== undefined ? { cost_usd: reportedCost } : {}),
     };
     state.finished = true;
     out.push({
@@ -343,13 +409,37 @@ export function responsesEventToChunks(event: unknown, state: ResponsesStreamSta
   return out;
 }
 
+/**
+ * Stamp the provider-reported cost onto an OpenAI chat streaming chunk's
+ * usage as `cost_usd`, mirroring what the Responses shim does on its
+ * terminal chunk. xAI chat streams carry `usage.cost_in_usd_ticks` on the
+ * final chunk when usage is requested (the bridge sends
+ * `stream_options: { include_usage: true }`; docs.x.ai/developers/
+ * cost-tracking). The Anthropic bridge drops unknown usage fields, so
+ * relayed SSE stays byte-identical; the gateway taps `cost_usd` for
+ * llm.call accounting. Chunks without a parseable reported cost are
+ * returned unchanged (same reference).
+ */
+export function chatChunkWithReportedCost(chunk: unknown): OpenAIChunk {
+  if (!isRecord(chunk)) return chunk as OpenAIChunk;
+  const usage = isRecord(chunk.usage) ? chunk.usage : undefined;
+  if (!usage) return chunk as unknown as OpenAIChunk;
+  const reportedCost = parseReportedCostUsd(usage);
+  if (reportedCost === undefined) return chunk as unknown as OpenAIChunk;
+  return { ...chunk, usage: { ...usage, cost_usd: reportedCost } } as unknown as OpenAIChunk;
+}
+
 // ---------------------------------------------------------------------------
 // Ollama native request/response
 // ---------------------------------------------------------------------------
 
 /** Anthropic Messages body -> Ollama /api/chat request. */
-export function anthropicToOllama(body: unknown, targetModel: string): Record<string, unknown> {
-  const chat = anthropicToOpenAI(body, targetModel);
+export function anthropicToOllama(
+  body: unknown,
+  targetModel: string,
+  bridgeOptions: BridgeOptions = {},
+): Record<string, unknown> {
+  const chat = anthropicToOpenAI(body, targetModel, bridgeOptions);
   const rawMessages = Array.isArray(chat.messages) ? chat.messages : [];
   const messages: Record<string, unknown>[] = [];
 
@@ -360,6 +450,10 @@ export function anthropicToOllama(body: unknown, targetModel: string): Record<st
       messages.push({
         role: "tool",
         content: contentText(message.content),
+        // Ollama has no tool_choice and no native error flag; carry the
+        // bridge's is_error extension field through (Ollama ignores
+        // unknown fields) so the semantics aren't lost at this hop.
+        ...(message.is_error === true ? { is_error: true } : {}),
       });
       continue;
     }
@@ -536,7 +630,11 @@ export function ollamaLineToChunks(line: unknown, state: OllamaStreamState): Ope
 // ---------------------------------------------------------------------------
 
 /** Anthropic Messages body -> Gemini generateContent request, tools included. */
-export function anthropicToGemini(body: unknown, targetModel: string): Record<string, unknown> {
+export function anthropicToGemini(
+  body: unknown,
+  targetModel: string,
+  options: BridgeOptions = {},
+): Record<string, unknown> {
   void targetModel;
   const root = isRecord(body) ? body : {};
   const rawMessages = Array.isArray(root.messages) ? root.messages : [];
@@ -572,7 +670,9 @@ export function anthropicToGemini(body: unknown, targetModel: string): Record<st
         parts.push({
           functionResponse: {
             name: toolNames.get(id) ?? "tool",
-            response: { result: text },
+            // Gemini's native error convention: response.error instead of
+            // response.result, so the model sees the call failed.
+            response: block.is_error === true ? { error: text } : { result: text },
           },
         });
       }
@@ -613,14 +713,47 @@ export function anthropicToGemini(body: unknown, targetModel: string): Record<st
 
   const generationConfig: Record<string, unknown> = {};
   const maxTokens = asNumber(root.max_tokens);
-  if (maxTokens !== undefined) generationConfig.maxOutputTokens = maxTokens;
+  if (maxTokens !== undefined) {
+    generationConfig.maxOutputTokens = clampMaxTokens(maxTokens, options.maxOutputTokens);
+  }
   const temperature = asNumber(root.temperature);
   if (temperature !== undefined) generationConfig.temperature = temperature;
+
+  // Anthropic tool_choice -> Gemini toolConfig.functionCallingConfig.
+  // Only meaningful alongside function declarations; disable_parallel_tool_use
+  // has no Gemini equivalent and is dropped.
+  let toolConfig: Record<string, unknown> | undefined;
+  if (functionDeclarations.length > 0) {
+    const tc = root.tool_choice;
+    if (typeof tc === "string") {
+      const mode = tc === "required" ? "ANY" : tc === "none" ? "NONE" : tc === "auto" ? "AUTO" : undefined;
+      if (mode) toolConfig = { functionCallingConfig: { mode } };
+    } else if (isRecord(tc)) {
+      if (tc.type === "auto") {
+        toolConfig = { functionCallingConfig: { mode: "AUTO" } };
+      } else if (tc.type === "any") {
+        toolConfig = { functionCallingConfig: { mode: "ANY" } };
+      } else if (tc.type === "none") {
+        toolConfig = { functionCallingConfig: { mode: "NONE" } };
+      } else if (tc.type === "tool" && asString(tc.name)) {
+        toolConfig = {
+          functionCallingConfig: { mode: "ANY", allowedFunctionNames: [tc.name] },
+        };
+      } else if (tc.type === "function") {
+        const fn = isRecord(tc.function) ? tc.function : {};
+        const name = asString(fn.name) ?? asString(tc.name);
+        if (name) {
+          toolConfig = { functionCallingConfig: { mode: "ANY", allowedFunctionNames: [name] } };
+        }
+      }
+    }
+  }
 
   return {
     contents,
     ...(systemText ? { systemInstruction: { parts: [{ text: systemText }] } } : {}),
     ...(functionDeclarations.length > 0 ? { tools: [{ functionDeclarations }] } : {}),
+    ...(toolConfig ? { toolConfig } : {}),
     ...(Object.keys(generationConfig).length > 0 ? { generationConfig } : {}),
   };
 }

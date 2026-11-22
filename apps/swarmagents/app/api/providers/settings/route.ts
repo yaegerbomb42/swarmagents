@@ -12,11 +12,13 @@ import { providerOwner } from "@/lib/providers/owner";
 import { assertResolvableProviderBaseUrl } from "@/lib/providers/url-safety";
 import { JsonBodyError, readJsonBody } from "@/lib/http";
 import {
+  MAX_SYSTEM_BUDGET_TOKENS,
+  MIN_SYSTEM_BUDGET_TOKENS,
   codebaseContextInjectionEnabled,
   readUserSettings,
   updateUserSettings,
 } from "@/lib/providers/settings";
-import type { UserSettings } from "@/lib/providers/settings";
+import type { TokenEfficiencySettings, UserSettings } from "@/lib/providers/settings";
 
 export const dynamic = "force-dynamic";
 
@@ -109,6 +111,41 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: safe.error }, { status: 400 });
     }
     patch.ollamaBaseUrl = normalized;
+  }
+  if ("tokenEfficiency" in input) {
+    const value = input.tokenEfficiency;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return NextResponse.json({ error: "tokenEfficiency must be an object." }, { status: 400 });
+    }
+    const te = value as Record<string, unknown>;
+    // Merge over the stored values so a partial update (e.g. flipping one
+    // toggle) cannot wipe a budget set through the API earlier.
+    const nextTe: TokenEfficiencySettings = { ...(readUserSettings(owner).tokenEfficiency ?? {}) };
+    for (const field of ["packSystemPrompt", "cacheFriendlyOrder"] as const) {
+      if (!(field in te)) continue;
+      if (typeof te[field] !== "boolean") {
+        return NextResponse.json({ error: `tokenEfficiency.${field} must be a boolean.` }, { status: 400 });
+      }
+      nextTe[field] = te[field] as boolean;
+    }
+    if ("systemBudgetTokens" in te) {
+      const budget = te.systemBudgetTokens;
+      if (
+        typeof budget !== "number" ||
+        !Number.isFinite(budget) ||
+        budget < MIN_SYSTEM_BUDGET_TOKENS ||
+        budget > MAX_SYSTEM_BUDGET_TOKENS
+      ) {
+        return NextResponse.json(
+          {
+            error: `tokenEfficiency.systemBudgetTokens must be a number between ${MIN_SYSTEM_BUDGET_TOKENS} and ${MAX_SYSTEM_BUDGET_TOKENS}.`,
+          },
+          { status: 400 },
+        );
+      }
+      nextTe.systemBudgetTokens = Math.floor(budget);
+    }
+    patch.tokenEfficiency = nextTe;
   }
   if (Object.keys(patch).length === 0) {
     return NextResponse.json({ error: "No supported settings were provided." }, { status: 400 });

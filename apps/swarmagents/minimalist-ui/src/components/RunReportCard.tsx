@@ -25,6 +25,7 @@ import {
   Play,
   StopCircle,
 } from "lucide-react";
+import { classifyCostProvenance } from "../../../lib/runtime/run-report-types";
 import type { ReportArtifact, ReportCardMeta, ReportStep, RunReport } from "../../../lib/runtime/run-report-types";
 import type { ThreadEntry } from "../../../lib/client/thread";
 import { Button, IconButton, Loading, Notice } from "./ui";
@@ -46,12 +47,26 @@ export function formatBytes(bytes?: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Compact token count for the card ("1.2k", "34k", "1.1M"). */
+export function formatTokenCount(tokens?: number): string {
+  if (tokens === undefined || !Number.isFinite(tokens) || tokens < 0) return "—";
+  if (tokens < 1000) return `${Math.round(tokens)}`;
+  if (tokens < 1_000_000) return `${(tokens / 1000).toFixed(tokens < 10_000 ? 1 : 0)}k`;
+  return `${(tokens / 1_000_000).toFixed(1)}M`;
+}
+
 /** The collapsed row's numbers, in reading order. */
 export function reportFacts(meta: ReportCardMeta): string[] {
   const facts = [`${meta.steps} ${meta.steps === 1 ? "step" : "steps"}`];
   if (meta.durationMs !== undefined && Number.isFinite(meta.durationMs)) facts.push(formatReportDuration(meta.durationMs));
   facts.push(`${meta.artifacts} ${meta.artifacts === 1 ? "file" : "files"} changed`);
-  if (meta.costUsd !== undefined) facts.push(`$${meta.costUsd.toFixed(3)}`);
+  if (meta.tokensIn !== undefined || meta.tokensOut !== undefined) {
+    facts.push(`${formatTokenCount((meta.tokensIn ?? 0) + (meta.tokensOut ?? 0))} tokens`);
+  }
+  if (meta.costUsd !== undefined) {
+    const label = metaCostProvenanceLabel(meta);
+    facts.push(`$${meta.costUsd.toFixed(3)}${label ? ` (${label})` : ""}`);
+  }
   return facts;
 }
 
@@ -86,7 +101,8 @@ export function reportSummarySentence(meta: ReportCardMeta, artifacts?: ReportAr
   const parts = [filesSummary(meta, artifacts)];
   if (meta.durationMs !== undefined && Number.isFinite(meta.durationMs)) parts.push(`in ${formatReportDuration(meta.durationMs)}`);
   const cost = formatReportCost(meta.costUsd);
-  if (cost) parts.push(`for ${cost}`);
+  const costLabel = metaCostProvenanceLabel(meta);
+  if (cost) parts.push(`for ${cost}${costLabel ? ` (${costLabel})` : ""}`);
   const body = parts.join(" ");
   const prefix = meta.status === "error" ? "Run failed \u2014 " : meta.status === "cancelled" ? "Run stopped \u2014 " : "";
   const sentence = prefix ? prefix + body.charAt(0).toLowerCase() + body.slice(1) : body;
@@ -134,9 +150,101 @@ export function buildTranscriptMarkdown(report: RunReport): string {
   const duration = meta?.durationMs !== undefined && Number.isFinite(meta.durationMs)
     ? formatReportDuration(meta.durationMs)
     : undefined;
-  const cost = meta?.costUsd !== undefined && Number.isFinite(meta.costUsd) ? `$${meta.costUsd.toFixed(3)}` : undefined;
+  const costLabel = meta ? metaCostProvenanceLabel(meta) : undefined;
+  const cost = meta?.costUsd !== undefined && Number.isFinite(meta.costUsd) ? `$${meta.costUsd.toFixed(3)}${costLabel ? ` (${costLabel})` : ""}` : undefined;
   lines.push(`**Duration / cost:** ${[duration, cost].filter(Boolean).join(" · ") || "—"}`);
+  const usageLines = tokenUsageLines(report);
+  if (usageLines.length > 0) {
+    lines.push("", "## Token usage", "", ...usageLines);
+  }
   return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Where a cost figure came from, as a short label: "reported" (the
+ * provider's own billed amount on every priced call), "estimated" (every
+ * priced call priced from the local tables), or "mixed: N reported, M
+ * estimated". The classification itself is classifyCostProvenance
+ * (lib/runtime/run-report-types) — the same code the report builder uses
+ * to record meta.costProvenance, so the collapsed row and these lines can
+ * never disagree. Undefined when there is no figure to label: cost
+ * unknown, a $0 figure (free providers and reported zeros — the $0
+ * stands alone, unchanged), or counts too inconsistent to classify
+ * honestly. Legacy reports without reportedCostCalls read as 0 reported
+ * — correct, since every cost was an estimate before reported costs
+ * were captured.
+ */
+export function costProvenanceLabel(accounting: {
+  costUsd?: number;
+  calls: number;
+  unknownCostCalls: number;
+  reportedCostCalls: number;
+}): string | undefined {
+  const info = classifyCostProvenance(accounting);
+  if (!info) return undefined;
+  if (info.provenance !== "mixed") return info.provenance;
+  return `mixed: ${info.reportedCalls} reported, ${info.pricedCalls - info.reportedCalls} estimated`;
+}
+
+/**
+ * The collapsed row's cost label, from the provenance the report builder
+ * recorded on the meta: "reported", "estimated", or "mixed" (the counts
+ * live in the expanded Token usage lines). Undefined — the figure stands
+ * bare, exactly as before — when the report predates provenance (field
+ * absent) or there is no figure worth labeling (no cost, or $0, matching
+ * costProvenanceLabel's silence rules).
+ */
+export function metaCostProvenanceLabel(meta: ReportCardMeta): string | undefined {
+  const { costUsd, costProvenance } = meta;
+  if (costUsd === undefined || !Number.isFinite(costUsd) || costUsd <= 0) return undefined;
+  return costProvenance;
+}
+
+/**
+ * The per-model token accounting as plain lines (shared by the transcript
+ * and the expanded card). Each cost is labeled with where it came from —
+ * the provider-reported amount, a local estimate, or a mix (see
+ * costProvenanceLabel); a model with no priced calls reads "cost unknown"
+ * — never a fabricated number.
+ */
+export function tokenUsageLines(report: RunReport): string[] {
+  const accounting = report.tokenAccounting;
+  if (!accounting) return [];
+  const lines: string[] = [];
+  for (const model of accounting.byModel) {
+    const provenance = costProvenanceLabel(model);
+    const cost =
+      model.costUsd !== undefined
+        ? `$${model.costUsd.toFixed(3)}${provenance ? ` (${provenance})` : ""}`
+        : "cost unknown";
+    const unknown =
+      model.unknownCostCalls > 0 && model.costUsd !== undefined
+        ? ` (+${model.unknownCostCalls} unpriced)`
+        : "";
+    lines.push(
+      `- ${model.provider}/${model.model}: ${model.okCalls}/${model.calls} calls, ` +
+        `${formatTokenCount(model.inputTokens)} in / ${formatTokenCount(model.outputTokens)} out, ${cost}${unknown}`,
+    );
+  }
+  if (accounting.byModel.length > 1) {
+    const t = accounting.totals;
+    const totalProvenance = costProvenanceLabel(t);
+    lines.push(
+      `- Total: ${t.okCalls}/${t.calls} calls, ${formatTokenCount(t.inputTokens)} in / ` +
+        `${formatTokenCount(t.outputTokens)} out` +
+        (t.costUsd !== undefined
+          ? `, $${t.costUsd.toFixed(3)}${totalProvenance ? ` (${totalProvenance})` : ""}`
+          : ", cost unknown"),
+    );
+  }
+  if (accounting.harness && accounting.byModel.length === 0) {
+    const h = accounting.harness;
+    lines.push(
+      `- ${formatTokenCount(h.inputTokens)} in / ${formatTokenCount(h.outputTokens)} out` +
+        (h.cachedTokens > 0 ? ` (${formatTokenCount(h.cachedTokens)} cached)` : ""),
+    );
+  }
+  return lines;
 }
 
 /**
@@ -567,6 +675,19 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
                 <div>
                   <SectionTitle>Summary</SectionTitle>
                   <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-sa-fg">{report.finalText}</p>
+                </div>
+              )}
+
+              {tokenUsageLines(report).length > 0 && (
+                <div>
+                  <SectionTitle>Token usage</SectionTitle>
+                  <ul className="space-y-1 text-[12px] leading-relaxed text-sa-fg3">
+                    {tokenUsageLines(report).map((line, i) => (
+                      <li key={i} className="break-words">
+                        {line.replace(/^- /, "")}
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
 

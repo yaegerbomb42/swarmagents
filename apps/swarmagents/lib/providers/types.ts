@@ -49,6 +49,20 @@ export function isAuthScheme(value: unknown): value is AuthScheme {
   return typeof value === "string" && (AUTH_SCHEMES as readonly string[]).includes(value);
 }
 
+/**
+ * Perplexity Agent API effort levels, lowest to highest intensity. An effort
+ * level is a pre-configured model + system prompt + search parameters; it
+ * replaces the retired Sonar model tiers (Sonar/Sonar Pro -> fast, Sonar
+ * Reasoning Pro -> low, Sonar Deep Research -> high).
+ * https://docs.perplexity.ai/docs/agent-api/migrate-from-sonar
+ */
+export const PERPLEXITY_EFFORTS = ["fast", "low", "medium", "high", "xhigh"] as const;
+export type PerplexityEffort = (typeof PERPLEXITY_EFFORTS)[number];
+
+export function isPerplexityEffort(value: unknown): value is PerplexityEffort {
+  return typeof value === "string" && (PERPLEXITY_EFFORTS as readonly string[]).includes(value);
+}
+
 export interface ProviderAuth {
   scheme: AuthScheme;
   /** Header name for `custom-header` (defaults to Authorization). */
@@ -67,6 +81,13 @@ export interface ModelCapabilities {
   /** The model can drive the desktop through computer-use tools. */
   computerUse: boolean;
   contextWindow?: number;
+  /**
+   * Hard cap on output tokens for one response, when known. The gateway
+   * clamps Anthropic `max_tokens` to this before wire translation so an
+   * oversized request is never rejected upstream. Undefined = no known
+   * cap; the request value passes through unchanged.
+   */
+  maxOutputTokens?: number;
   source?: "preset" | "discovery" | "override";
 }
 
@@ -144,6 +165,12 @@ export interface ProviderConfig {
   headers?: Record<string, string>;
   /** Per-request timeout. Defaults to the router's defaultTimeoutMs. */
   timeoutMs?: number;
+  /**
+   * Perplexity Agent API effort level. Only honored for the Perplexity
+   * provider (rejected at save time for others); unset sends a model-only
+   * request and lets the server apply its default.
+   */
+  effort?: PerplexityEffort;
   enabled?: boolean;
   /**
    * Free provider: estimated cost is billed as $0 and, when the user's
@@ -196,6 +223,13 @@ export interface CompleteRequest {
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
+  /**
+   * Provider-reported cost of this call in USD, when the response carried
+   * one (e.g. the Perplexity Agent API's `usage.cost.total_cost`, xAI's
+   * `usage.cost_in_usd_ticks`). Absent = the provider reported no cost;
+   * cost then falls back to the price-table estimate (pricing.ts).
+   */
+  costUsd?: number;
 }
 
 export type ProviderErrorKind =

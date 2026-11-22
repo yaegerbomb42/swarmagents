@@ -71,8 +71,8 @@ function maskValue(value: string): string {
 
 function isValidCredential(value: string): boolean {
   if (value.length === 0 || value.length > 512) return false;
-  for (let i = 0; i < value.length; i += 1) {
-    const code = value.charCodeAt(i);
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
     if (code < 32 || code > 126) return false;
   }
   return true;
@@ -80,6 +80,31 @@ function isValidCredential(value: string): boolean {
 
 function libraryItemIdFor(libraryConnectorId: string): string {
   return `connector-${libraryConnectorId}`;
+}
+
+function connectedFor(
+  entry: ConnectorCatalogEntry,
+  providerConnected: boolean,
+  mcpInstalled: boolean,
+  vaultConfigured: boolean,
+): boolean {
+  if (entry.providerId && entry.libraryConnectorId && entry.vaultSecret) {
+    return providerConnected && mcpInstalled && vaultConfigured;
+  }
+  if (entry.providerId && entry.vaultSecret) return providerConnected && vaultConfigured;
+  if (entry.providerId && entry.libraryConnectorId) return providerConnected && mcpInstalled;
+  if (entry.providerId) return providerConnected;
+  if (entry.libraryConnectorId) return mcpInstalled;
+  return false;
+}
+
+function maskFor(
+  providerKeys: string[],
+  libItem: InstalledItemView | undefined,
+): string | undefined {
+  if (providerKeys.length > 0) return maskValue(providerKeys[0]);
+  if (libItem) return libItem.secretFields.find((f) => f.configured && f.mask)?.mask;
+  return undefined;
 }
 
 function computeStatusView(
@@ -99,28 +124,10 @@ function computeStatusView(
     ? secretsById.has(entry.vaultSecret.id)
     : false;
 
-  let connected = false;
-  if (entry.providerId && entry.libraryConnectorId && entry.vaultSecret) {
-    connected = providerConnected && mcpInstalled && vaultConfigured;
-  } else if (entry.providerId && entry.vaultSecret) {
-    connected = providerConnected && vaultConfigured;
-  } else if (entry.providerId && entry.libraryConnectorId) {
-    connected = providerConnected && mcpInstalled;
-  } else if (entry.providerId) {
-    connected = providerConnected;
-  } else if (entry.libraryConnectorId) {
-    connected = mcpInstalled;
-  }
-
+  const connected = connectedFor(entry, providerConnected, mcpInstalled, vaultConfigured);
   const canActivateFromProvider = providerConnected && !connected;
   const canOneClickConnect = entry.fields.length === 0 || canActivateFromProvider;
-
-  let mask: string | undefined;
-  if (providerKeys.length > 0) {
-    mask = maskValue(providerKeys[0]);
-  } else if (libItem) {
-    mask = libItem.secretFields.find((f) => f.configured && f.mask)?.mask;
-  }
+  const mask = maskFor(providerKeys, libItem);
 
   return {
     ...entry,
@@ -161,17 +168,10 @@ export function getConnectorStatus(userId: string, connectorId: string): Connect
   return computeStatusView(entry, providersById, libraryById, secretsById);
 }
 
-export async function connectConnector(
-  userId: string,
-  connectorId: string,
-  input: ConnectConnectorInput = {},
-): Promise<ConnectorStatusView> {
-  const entry = findCatalogConnector(connectorId);
-  if (!entry) {
-    throw new ConnectorError("Unknown connector.", 404);
-  }
-
-  const rawInputs = input.inputs ?? {};
+function cleanConnectInputs(
+  entry: ConnectorCatalogEntry,
+  rawInputs: Record<string, string>,
+): Record<string, string> {
   const cleanedInputs: Record<string, string> = {};
   for (const field of entry.fields) {
     const raw = rawInputs[field.key];
@@ -185,120 +185,201 @@ export async function connectConnector(
     }
     if (trimmed) cleanedInputs[field.key] = trimmed;
   }
+  return cleanedInputs;
+}
+
+function resolveCloudflareBaseUrl(
+  entry: ConnectorCatalogEntry,
+  cleanedInputs: Record<string, string>,
+): string | undefined {
+  if (entry.id !== "cloudflare" || !cleanedInputs.accountId) return undefined;
+  const accountId = cleanedInputs.accountId;
+  if (!SLUG_RE.test(accountId)) {
+    throw new ConnectorError("Cloudflare Account ID must contain only letters, numbers, '-' or '_'.", 400);
+  }
+  const baseUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1`;
+  const safety = validateProviderBaseUrl(baseUrl);
+  if (!safety.ok) throw new ConnectorError(safety.error, 400);
+  return baseUrl;
+}
+
+interface PrimaryCredential {
+  primaryToken: string | undefined;
+  reusedProviderKey: boolean;
+}
+
+function resolvePrimaryCredential(
+  entry: ConnectorCatalogEntry,
+  existingProvider: ProviderConfig | undefined,
+  cleanedInputs: Record<string, string>,
+): PrimaryCredential {
+  const primarySecretField = entry.fields.find((f) => f.secret && f.required);
+  if (!primarySecretField) return { primaryToken: undefined, reusedProviderKey: false };
+
+  const provided = cleanedInputs[primarySecretField.key];
+  if (provided) {
+    const primaryToken = entry.id === "github" ? provided.replace(/^Bearer\s+/i, "").trim() : provided;
+    return { primaryToken, reusedProviderKey: false };
+  }
+  if (entry.providerId && existingProvider?.keys && existingProvider.keys.length > 0) {
+    return { primaryToken: existingProvider.keys[0], reusedProviderKey: true };
+  }
+  throw new ConnectorError(`${primarySecretField.label} is required.`, 400);
+}
+
+interface LibraryPayload {
+  catalogEntry: NonNullable<ReturnType<typeof connectorById>>;
+  payload: NonNullable<ReturnType<typeof connectorPayload>>;
+}
+
+function resolveLibraryPayload(entry: ConnectorCatalogEntry): LibraryPayload | null {
+  if (!entry.libraryConnectorId) return null;
+  const catalogEntry = connectorById(entry.libraryConnectorId);
+  if (!catalogEntry) return null;
+  const payload = connectorPayload(catalogEntry);
+  if (!payload) return null;
+  return { catalogEntry, payload };
+}
+
+function librarySecretsFor(
+  entry: ConnectorCatalogEntry,
+  primaryToken: string | undefined,
+): Record<string, string> {
+  const secrets: Record<string, string> = {};
+  if (entry.id === "github" && primaryToken) secrets.Authorization = `Bearer ${primaryToken}`;
+  if (entry.id === "brave-search" && primaryToken) secrets.BRAVE_API_KEY = primaryToken;
+  return secrets;
+}
+
+interface WriteTracker {
+  wroteProvider: boolean;
+  wroteLibrary: boolean;
+  wroteVault: boolean;
+  hadProviderBefore: boolean;
+}
+
+function writeConnectorSideEffects(
+  userId: string,
+  entry: ConnectorCatalogEntry,
+  opts: {
+    primaryToken: string | undefined;
+    reusedProviderKey: boolean;
+    cloudflareBaseUrl: string | undefined;
+    library: LibraryPayload | null;
+  },
+  writes: WriteTracker,
+): void {
+  const { primaryToken, reusedProviderKey, cloudflareBaseUrl, library } = opts;
+
+  if (entry.providerId && primaryToken && !reusedProviderKey) {
+    saveProvider(userId, {
+      id: entry.providerId,
+      apiKey: primaryToken,
+      ...(cloudflareBaseUrl ? { baseUrl: cloudflareBaseUrl } : {}),
+    });
+    writes.wroteProvider = true;
+  } else if (entry.providerId && cloudflareBaseUrl && reusedProviderKey) {
+    saveProvider(userId, {
+      id: entry.providerId,
+      baseUrl: cloudflareBaseUrl,
+    });
+    writes.wroteProvider = true;
+  }
+
+  if (library && entry.libraryConnectorId) {
+    addInstalledItem(userId, {
+      id: libraryItemIdFor(entry.libraryConnectorId),
+      kind: "connector",
+      name: library.catalogEntry.name,
+      description: library.catalogEntry.description,
+      payload: library.payload,
+      secrets: librarySecretsFor(entry, primaryToken),
+      origin: "user",
+    });
+    writes.wroteLibrary = true;
+  }
+
+  if (entry.vaultSecret && primaryToken) {
+    putSecret(userId, {
+      id: entry.vaultSecret.id,
+      kind: entry.vaultSecret.kind,
+      label: entry.vaultSecret.label,
+      plaintext: primaryToken,
+    });
+    writes.wroteVault = true;
+  }
+}
+
+function rollbackConnectorWrites(
+  userId: string,
+  entry: ConnectorCatalogEntry,
+  writes: WriteTracker,
+): void {
+  if (writes.wroteVault && entry.vaultSecret) {
+    try {
+      deleteSecret(userId, entry.vaultSecret.id);
+    } catch {
+      // best effort rollback
+    }
+  }
+  if (writes.wroteLibrary && entry.libraryConnectorId) {
+    try {
+      deleteInstalledItem(userId, libraryItemIdFor(entry.libraryConnectorId));
+    } catch {
+      // best effort rollback
+    }
+  }
+  if (writes.wroteProvider && entry.providerId && !writes.hadProviderBefore) {
+    try {
+      removeProvider(userId, entry.providerId);
+    } catch {
+      // best effort rollback
+    }
+  }
+}
+
+export function connectConnector(
+  userId: string,
+  connectorId: string,
+  input: ConnectConnectorInput = {},
+): ConnectorStatusView {
+  const entry = findCatalogConnector(connectorId);
+  if (!entry) {
+    throw new ConnectorError("Unknown connector.", 404);
+  }
+
+  const cleanedInputs = cleanConnectInputs(entry, input.inputs ?? {});
 
   const savedProviders = readConfiguredProviders(userId);
   const existingProvider = entry.providerId
     ? savedProviders.find((p) => p.id === entry.providerId)
     : undefined;
 
-  // Validate provider-specific optional parameters (e.g. Cloudflare accountId -> Workers AI URL).
-  let cloudflareBaseUrl: string | undefined;
-  if (entry.id === "cloudflare" && cleanedInputs.accountId) {
-    if (!SLUG_RE.test(cleanedInputs.accountId)) {
-      throw new ConnectorError("Cloudflare Account ID must contain only letters, numbers, '-' or '_'.", 400);
-    }
-    cloudflareBaseUrl = `https://api.cloudflare.com/client/v4/accounts/${cleanedInputs.accountId}/ai/v1`;
-    const safety = validateProviderBaseUrl(cloudflareBaseUrl);
-    if (!safety.ok) {
-      throw new ConnectorError(safety.error, 400);
-    }
-  }
+  const cloudflareBaseUrl = resolveCloudflareBaseUrl(entry, cleanedInputs);
 
-  // Resolve primary credential: either freshly submitted or reused server-side from Providers.
-  let primaryToken: string | undefined;
-  let reusedProviderKey = false;
-  const primarySecretField = entry.fields.find((f) => f.secret && f.required);
-  if (primarySecretField) {
-    const provided = cleanedInputs[primarySecretField.key];
-    if (provided) {
-      primaryToken = entry.id === "github" ? provided.replace(/^Bearer\s+/i, "").trim() : provided;
-    } else if (entry.providerId && existingProvider?.keys && existingProvider.keys.length > 0) {
-      primaryToken = existingProvider.keys[0];
-      reusedProviderKey = true;
-    } else {
-      throw new ConnectorError(`${primarySecretField.label} is required.`, 400);
-    }
-  }
+  const { primaryToken, reusedProviderKey } = resolvePrimaryCredential(
+    entry,
+    existingProvider,
+    cleanedInputs,
+  );
 
-  // Validate library MCP entry ahead of writes so partial state is minimized.
-  const mcpCatalogEntry = entry.libraryConnectorId ? connectorById(entry.libraryConnectorId) : null;
-  const mcpPayload = mcpCatalogEntry ? connectorPayload(mcpCatalogEntry) : null;
-  if (entry.libraryConnectorId && (!mcpCatalogEntry || !mcpPayload)) {
+  // Validate the library MCP entry ahead of writes so partial state is minimized.
+  const library = resolveLibraryPayload(entry);
+  if (entry.libraryConnectorId && !library) {
     throw new ConnectorError(`Connector "${entry.id}" MCP definition is unavailable.`, 500);
   }
 
-  // Track writes so any later failure rolls back cleanly.
-  let wroteProvider = false;
-  let wroteLibrary = false;
-  let wroteVault = false;
-  const hadProviderBefore = entry.providerId ? savedProviderIds(userId).includes(entry.providerId) : false;
+  const writes: WriteTracker = {
+    wroteProvider: false,
+    wroteLibrary: false,
+    wroteVault: false,
+    hadProviderBefore: entry.providerId ? savedProviderIds(userId).includes(entry.providerId) : false,
+  };
 
   try {
-    if (entry.providerId && primaryToken && !reusedProviderKey) {
-      saveProvider(userId, {
-        id: entry.providerId,
-        apiKey: primaryToken,
-        ...(cloudflareBaseUrl ? { baseUrl: cloudflareBaseUrl } : {}),
-      });
-      wroteProvider = true;
-    } else if (entry.providerId && cloudflareBaseUrl && reusedProviderKey) {
-      saveProvider(userId, {
-        id: entry.providerId,
-        baseUrl: cloudflareBaseUrl,
-      });
-      wroteProvider = true;
-    }
-
-    if (entry.libraryConnectorId && mcpCatalogEntry && mcpPayload) {
-      const secrets: Record<string, string> = {};
-      if (entry.id === "github" && primaryToken) {
-        secrets.Authorization = `Bearer ${primaryToken}`;
-      } else if (entry.id === "brave-search" && primaryToken) {
-        secrets.BRAVE_API_KEY = primaryToken;
-      }
-      addInstalledItem(userId, {
-        id: libraryItemIdFor(entry.libraryConnectorId),
-        kind: "connector",
-        name: mcpCatalogEntry.name,
-        description: mcpCatalogEntry.description,
-        payload: mcpPayload,
-        secrets,
-        origin: "user",
-      });
-      wroteLibrary = true;
-    }
-
-    if (entry.vaultSecret && primaryToken) {
-      putSecret(userId, {
-        id: entry.vaultSecret.id,
-        kind: entry.vaultSecret.kind,
-        label: entry.vaultSecret.label,
-        plaintext: primaryToken,
-      });
-      wroteVault = true;
-    }
+    writeConnectorSideEffects(userId, entry, { primaryToken, reusedProviderKey, cloudflareBaseUrl, library }, writes);
   } catch (err) {
-    if (wroteVault && entry.vaultSecret) {
-      try {
-        deleteSecret(userId, entry.vaultSecret.id);
-      } catch {
-        // best effort rollback
-      }
-    }
-    if (wroteLibrary && entry.libraryConnectorId) {
-      try {
-        deleteInstalledItem(userId, libraryItemIdFor(entry.libraryConnectorId));
-      } catch {
-        // best effort rollback
-      }
-    }
-    if (wroteProvider && entry.providerId && !hadProviderBefore) {
-      try {
-        removeProvider(userId, entry.providerId);
-      } catch {
-        // best effort rollback
-      }
-    }
+    rollbackConnectorWrites(userId, entry, writes);
     if (err instanceof ConnectorError) throw err;
     throw new ConnectorError(err instanceof Error ? err.message : "Could not connect service.", 400);
   }

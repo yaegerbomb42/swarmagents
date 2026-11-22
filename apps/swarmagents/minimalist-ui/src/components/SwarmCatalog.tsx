@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useId, useRef, useState } from "react";
 import { ArrowLeft, BookOpen, Check, ExternalLink, Loader2, Network, Plug, Plus, Search, Unplug, Wrench } from "lucide-react";
-import { libraryApi, LibraryApiError, type InstalledItem } from "../../../lib/client/library";
+import { libraryApi, LibraryApiError, type ConnectorEntry, type InstalledItem } from "../../../lib/client/library";
 import {
   addSwarmCatalogEntry,
   CATALOG_CATEGORIES,
@@ -48,6 +48,45 @@ function EntryIcon({ kind }: { kind: LibraryKind }) {
 
 function needsSetup(entry: SwarmCatalogEntry): boolean {
   return entry.add.via === "provider-settings" || (entry.add.via === "connector" && entry.add.fields.length > 0);
+}
+
+interface EntryActionProps {
+  entry: SwarmCatalogEntry;
+  addingId: string | undefined;
+  removingId: string | undefined;
+  anyBusy: boolean;
+  onOpen: (entry: SwarmCatalogEntry) => void;
+  onAdd: (entry: SwarmCatalogEntry) => void;
+  onRemove: (entry: SwarmCatalogEntry) => void;
+}
+
+function EntryAction({ entry, addingId, removingId, anyBusy, onOpen, onAdd, onRemove }: EntryActionProps) {
+  if (entry.installed) {
+    const isRemoving = removingId === entry.id;
+    return (
+      <div className="flex shrink-0 items-center gap-2">
+        <Installed entry={entry} />
+        {entry.add.via === "connector" && (
+          <button type="button" aria-label={`Disconnect ${entry.name}`} disabled={anyBusy} onClick={() => void onRemove(entry)} className={QUIET_ACTION}>
+            {isRemoving ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Unplug className="h-3.5 w-3.5" aria-hidden="true" />}
+            {isRemoving ? "Removing…" : "Disconnect"}
+          </button>
+        )}
+      </div>
+    );
+  }
+  if (needsSetup(entry)) {
+    return (
+      <button type="button" aria-label={`Set up ${entry.name}`} onClick={() => onOpen(entry)} className={QUIET_ACTION}>Set up</button>
+    );
+  }
+  const isAdding = addingId === entry.id;
+  return (
+    <button type="button" aria-label={`Add ${entry.name}`} disabled={Boolean(addingId)} onClick={() => void onAdd(entry)} className={ACTION}>
+      {isAdding ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Plus className="h-3.5 w-3.5" aria-hidden="true" />}
+      {isAdding ? "Adding…" : "Add"}
+    </button>
+  );
 }
 
 export function SwarmCatalog({
@@ -203,24 +242,15 @@ export function SwarmCatalog({
                       <span className="mt-1 block text-[11px] leading-relaxed text-zinc-400">{entry.vendor} · {LIBRARY_KIND_LABELS[entry.kind]} · {CATALOG_CATEGORIES[entry.category]}</span>
                     </span>
                   </button>
-                  {entry.installed ? (
-                    <div className="flex shrink-0 items-center gap-2">
-                      <Installed entry={entry} />
-                      {entry.add.via === "connector" && (
-                        <button type="button" aria-label={`Disconnect ${entry.name}`} disabled={Boolean(adding || removing)} onClick={() => void removeConnector(entry)} className={QUIET_ACTION}>
-                          {removing === entry.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Unplug className="h-3.5 w-3.5" aria-hidden="true" />}
-                          {removing === entry.id ? "Removing…" : "Disconnect"}
-                        </button>
-                      )}
-                    </div>
-                  ) : needsSetup(entry) ? (
-                    <button type="button" aria-label={`Set up ${entry.name}`} onClick={() => open(entry)} className={QUIET_ACTION}>Set up</button>
-                  ) : (
-                    <button type="button" aria-label={`Add ${entry.name}`} disabled={Boolean(adding)} onClick={() => void add(entry)} className={ACTION}>
-                      {adding === entry.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Plus className="h-3.5 w-3.5" aria-hidden="true" />}
-                      {adding === entry.id ? "Adding…" : "Add"}
-                    </button>
-                  )}
+                  <EntryAction
+                    entry={entry}
+                    addingId={adding}
+                    removingId={removing}
+                    anyBusy={Boolean(adding || removing)}
+                    onOpen={open}
+                    onAdd={(target) => add(target)}
+                    onRemove={removeConnector}
+                  />
                 </li>
               ))}
             </ul>
@@ -233,7 +263,7 @@ export function SwarmCatalog({
   );
 }
 
-function CatalogDetail({ entry, headingId, busy, adding, removing, onBack, onAdd, onRemove }: {
+interface CatalogDetailProps {
   entry: SwarmCatalogEntry;
   headingId: string;
   busy: boolean;
@@ -242,7 +272,122 @@ function CatalogDetail({ entry, headingId, busy, adding, removing, onBack, onAdd
   onBack: () => void;
   onAdd: (inputs: Record<string, string>) => Promise<boolean>;
   onRemove: () => Promise<void>;
-}) {
+}
+
+interface DetailActionsProps {
+  entry: SwarmCatalogEntry;
+  headingId: string;
+  busy: boolean;
+  adding: boolean;
+  removing: boolean;
+  fields: ConnectorEntry["requiredFields"];
+  inputs: Record<string, string>;
+  setInputs: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  onRemove: () => Promise<void>;
+  onAdd: (inputs: Record<string, string>) => Promise<boolean>;
+}
+
+interface AddFormProps {
+  headingId: string;
+  busy: boolean;
+  adding: boolean;
+  fields: ConnectorEntry["requiredFields"];
+  inputs: Record<string, string>;
+  setInputs: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  onAdd: (inputs: Record<string, string>) => Promise<boolean>;
+}
+
+function DetailActions({
+  entry,
+  headingId,
+  busy,
+  adding,
+  removing,
+  fields,
+  inputs,
+  setInputs,
+  onRemove,
+  onAdd,
+}: Readonly<DetailActionsProps>) {
+  if (entry.add.via === "provider-settings") {
+    return (
+      <div className="flex flex-wrap items-center gap-3">
+        {entry.installed && <Installed entry={entry} />}
+        <Link href={PROVIDER_SETTINGS_URL} className={ACTION}>Open Provider Settings</Link>
+      </div>
+    );
+  }
+  if (entry.installed) {
+    return (
+      <div className="flex flex-wrap items-center gap-3">
+        <Installed entry={entry} />
+        {entry.add.via === "connector" && (
+          <button type="button" disabled={busy} onClick={() => void onRemove()} className={QUIET_ACTION}>
+            {removing ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Unplug className="h-3.5 w-3.5" aria-hidden="true" />}
+            {removing ? "Disconnecting…" : "Disconnect"}
+          </button>
+        )}
+      </div>
+    );
+  }
+  return (
+    <AddForm
+      headingId={headingId}
+      busy={busy}
+      adding={adding}
+      fields={fields}
+      inputs={inputs}
+      setInputs={setInputs}
+      onAdd={onAdd}
+    />
+  );
+}
+
+function AddForm({ headingId, busy, adding, fields, inputs, setInputs, onAdd }: Readonly<AddFormProps>) {
+  const missingField = fields.some((field) => !inputs[field.key]?.trim());
+  return (
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        void onAdd(inputs).then((added) => { if (added) setInputs({}); });
+      }}
+    >
+      {fields.length > 0 && (
+        <fieldset className="mb-4 space-y-3" disabled={busy}>
+          <legend className="mb-1 text-sm font-medium text-zinc-100">Connector settings</legend>
+          <p className="text-xs text-zinc-400">Credentials are encrypted in your account. They are not published to the library.</p>
+          {fields.map((field) => (
+            <div key={field.key} className="space-y-1.5">
+              <label htmlFor={`${headingId}-${field.key}`} className="block text-xs font-medium text-zinc-200">{field.label}</label>
+              <input
+                id={`${headingId}-${field.key}`}
+                type={field.secret ? "password" : "text"}
+                autoComplete="off"
+                spellCheck={false}
+                value={inputs[field.key] ?? ""}
+                onChange={(event) => setInputs((current) => ({ ...current, [field.key]: event.target.value }))}
+                maxLength={LIMITS.secretValue}
+                required
+                className={`${INPUT} w-full max-w-md`}
+              />
+              {field.helpUrl && (
+                <a href={field.helpUrl} target="_blank" rel="noreferrer" className={`block w-fit rounded text-xs text-cyan-200 underline-offset-4 hover:underline ${FOCUS}`}>
+                  Setup instructions <ExternalLink className="inline h-3 w-3" aria-hidden="true" />
+                </a>
+              )}
+            </div>
+          ))}
+        </fieldset>
+      )}
+      <button type="submit" disabled={busy || missingField} className={ACTION}>
+        {adding ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Plus className="h-3.5 w-3.5" aria-hidden="true" />}
+        {adding ? "Adding…" : "Add to swarm"}
+      </button>
+    </form>
+  );
+}
+
+function CatalogDetail({ entry, headingId, busy, adding, removing, onBack, onAdd, onRemove }: Readonly<CatalogDetailProps>) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const fields = entry.add.via === "connector" ? entry.add.fields : [];
@@ -268,47 +413,18 @@ function CatalogDetail({ entry, headingId, busy, adding, removing, onBack, onAdd
         View official source <ExternalLink className="h-3 w-3" aria-hidden="true" />
       </a>
       <div className="mt-5 border-t border-white/10 pt-5">
-        {entry.add.via === "provider-settings" ? (
-          <div className="flex flex-wrap items-center gap-3">
-            {entry.installed && <Installed entry={entry} />}
-            <Link href={PROVIDER_SETTINGS_URL} className={ACTION}>Open Provider Settings</Link>
-          </div>
-        ) : entry.installed ? (
-          <div className="flex flex-wrap items-center gap-3">
-            <Installed entry={entry} />
-            {entry.add.via === "connector" && (
-              <button type="button" disabled={busy} onClick={() => void onRemove()} className={QUIET_ACTION}>
-                {removing ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Unplug className="h-3.5 w-3.5" aria-hidden="true" />}
-                {removing ? "Disconnecting…" : "Disconnect"}
-              </button>
-            )}
-          </div>
-        ) : (
-          <form onSubmit={(event) => {
-            event.preventDefault();
-            void onAdd(inputs).then((added) => { if (added) setInputs({}); });
-          }}>
-            {fields.length > 0 && (
-              <fieldset className="mb-4 space-y-3" disabled={busy}>
-                <legend className="mb-1 text-sm font-medium text-zinc-100">Connector settings</legend>
-                <p className="text-xs text-zinc-400">Credentials are encrypted in your account. They are not published to the library.</p>
-                {fields.map((field) => (
-                  <div key={field.key} className="space-y-1.5">
-                    <label htmlFor={`${headingId}-${field.key}`} className="block text-xs font-medium text-zinc-200">{field.label}</label>
-                    <input id={`${headingId}-${field.key}`} type={field.secret ? "password" : "text"} autoComplete="off" spellCheck={false}
-                      value={inputs[field.key] ?? ""} onChange={(event) => setInputs((current) => ({ ...current, [field.key]: event.target.value }))}
-                      maxLength={LIMITS.secretValue} required className={`${INPUT} w-full max-w-md`} />
-                    {field.helpUrl && <a href={field.helpUrl} target="_blank" rel="noreferrer" className={`block w-fit rounded text-xs text-cyan-200 underline-offset-4 hover:underline ${FOCUS}`}>Setup instructions <ExternalLink className="inline h-3 w-3" aria-hidden="true" /></a>}
-                  </div>
-                ))}
-              </fieldset>
-            )}
-            <button type="submit" disabled={busy || fields.some((field) => !inputs[field.key]?.trim())} className={ACTION}>
-              {adding ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Plus className="h-3.5 w-3.5" aria-hidden="true" />}
-              {adding ? "Adding…" : "Add to swarm"}
-            </button>
-          </form>
-        )}
+        <DetailActions
+          entry={entry}
+          headingId={headingId}
+          busy={busy}
+          adding={adding}
+          removing={removing}
+          fields={fields}
+          inputs={inputs}
+          setInputs={setInputs}
+          onAdd={onAdd}
+          onRemove={onRemove}
+        />
       </div>
     </div>
   );

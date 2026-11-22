@@ -38,8 +38,6 @@ import {
 import { getVmManager, vmManager, type VmManager } from "../vm/manager";
 import type { BoardAgentToolResult } from "./types";
 import {
-  isVmMcpTool,
-  VM_MCP_TOOL_DEFINITIONS,
   vmExecInputSchema,
   vmListWorkspaceInputSchema,
   vmReadFileInputSchema,
@@ -57,7 +55,7 @@ export {
   vmReadOutputInputSchema,
   vmScreenshotInputSchema,
   vmWriteFileInputSchema,
-};
+} from "./vm-schemas";
 
 type CreatedTask = { taskId: string; title: string };
 type TaskListItem = Pick<SwarmTask, "id" | "title" | "status" | "claimedBy" | "prUrl">;
@@ -209,6 +207,61 @@ export function getRunStatus(
   return { ok: true, summary: details.join("\n"), data: { runId: run.runId, status: run.status } };
 }
 
+function unauthorizedResult(): BoardAgentToolResult<never> {
+  return {
+    ok: false,
+    error: "unauthorized",
+    summary: "Authenticated user scope (x-swarm-user) is required.",
+  };
+}
+
+function invalidInputResult(summary: string): BoardAgentToolResult<never> {
+  return { ok: false, error: "invalid_input", summary };
+}
+
+function validateExecArgs(argv: string[], source: string, shellLine: boolean): string | null {
+  if (source.includes("\0")) return "cmd contains NUL bytes.";
+  if (argv.length > SHELL_MAX_ARGS) return `cmd has too many arguments (max ${SHELL_MAX_ARGS}).`;
+  if (!shellLine) {
+    for (const arg of argv) {
+      if (Buffer.byteLength(arg, "utf8") > SHELL_MAX_ARG_LEN) {
+        return `an argument is too long (max ${SHELL_MAX_ARG_LEN} bytes).`;
+      }
+    }
+  }
+  if (source.length > SHELL_MAX_CMD_LEN) return "cmd is too long.";
+  return null;
+}
+
+function blockedCommandResult(risk: ReturnType<typeof classifyCommand>): BoardAgentToolResult<never> | null {
+  if (risk.level !== "deny" && risk.level !== "ask") return null;
+  return {
+    ok: false,
+    error: "command_blocked",
+    summary: risk.level === "deny" ? risk.reason : `${risk.reason} — blocked from direct VM exec.`,
+  };
+}
+
+function isTerminalRunStatus(status: string): boolean {
+  return status === "finished" || status === "error" || status === "cancelled";
+}
+
+function buildExecWaitData(runId: string, command: string, data: VmReadOutputResult): VmExecResult {
+  const status = isTerminalRunStatus(data.status) ? (data.status as VmExecResult["status"]) : "running";
+  return {
+    runId,
+    command,
+    status,
+    ...(data.exitCode !== undefined ? { exitCode: data.exitCode } : {}),
+    stdout: data.stdout,
+    stderr: data.stderr,
+    output: data.output,
+    ...(data.error !== undefined ? { error: data.error } : {}),
+    lastSeq: data.lastSeq,
+    truncated: data.truncated,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Per-user VM MCP tools
 // ---------------------------------------------------------------------------
@@ -318,7 +371,7 @@ async function waitForRunSettlement(
     const buffered = runtime.telemetryBus.readBufferedEvents(runId, fromSeq);
     if (buffered.some((event) => isTerminalEventType(event.type))) return true;
     const saved = getRunSummary(runId);
-    if (saved && saved.userId === userId && saved.status !== "running" && saved.status !== "queued") return true;
+    if (saved?.userId === userId && saved.status !== "running" && saved.status !== "queued") return true;
     return false;
   };
 
@@ -388,65 +441,22 @@ export async function vmExec(
   deps?: VmToolDeps,
 ): Promise<BoardAgentToolResult<VmExecResult>> {
   const owner = validateUserId(userId);
-  if (!owner) {
-    return {
-      ok: false,
-      error: "unauthorized",
-      summary: "Authenticated user scope (x-swarm-user) is required.",
-    };
-  }
+  if (!owner) return unauthorizedResult();
 
   const parsed = vmExecInputSchema.safeParse(rawArgs ?? {});
   if (!parsed.success) {
-    return {
-      ok: false,
-      error: "invalid_input",
-      summary: `Invalid vm_exec arguments: ${formatZodIssues(parsed.error)}`,
-    };
+    return invalidInputResult(`Invalid vm_exec arguments: ${formatZodIssues(parsed.error)}`);
   }
 
   const normalized = normalizeExecCommand(parsed.data.cmd);
-  if ("error" in normalized) {
-    return { ok: false, error: "invalid_input", summary: normalized.error };
-  }
+  if ("error" in normalized) return invalidInputResult(normalized.error);
   const { argv, source, shellLine } = normalized;
 
-  if (source.includes("\0")) {
-    return { ok: false, error: "invalid_input", summary: "cmd contains NUL bytes." };
-  }
-  if (argv.length > SHELL_MAX_ARGS) {
-    return {
-      ok: false,
-      error: "invalid_input",
-      summary: `cmd has too many arguments (max ${SHELL_MAX_ARGS}).`,
-    };
-  }
-  if (!shellLine) {
-    for (const arg of argv) {
-      if (Buffer.byteLength(arg, "utf8") > SHELL_MAX_ARG_LEN) {
-        return {
-          ok: false,
-          error: "invalid_input",
-          summary: `an argument is too long (max ${SHELL_MAX_ARG_LEN} bytes).`,
-        };
-      }
-    }
-  }
-  if (source.length > SHELL_MAX_CMD_LEN) {
-    return { ok: false, error: "invalid_input", summary: "cmd is too long." };
-  }
+  const validationError = validateExecArgs(argv, source, shellLine);
+  if (validationError) return invalidInputResult(validationError);
 
-  const risk = classifyCommand(source);
-  if (risk.level === "deny" || risk.level === "ask") {
-    return {
-      ok: false,
-      error: "command_blocked",
-      summary:
-        risk.level === "deny"
-          ? risk.reason
-          : `${risk.reason} — blocked from direct VM exec.`,
-    };
-  }
+  const blocked = blockedCommandResult(classifyCommand(source));
+  if (blocked) return blocked;
 
   const runtime = resolveRuntime(deps);
   const redact = makeRedactor({ ...process.env } as Record<string, string>);
@@ -457,25 +467,10 @@ export async function vmExec(
   if (waitMs > 0) {
     const read = await vmReadOutput(owner, { runId, fromSeq: 0, waitMs }, { runtime });
     if (read.ok && read.data) {
-      const status =
-        read.data.status === "finished" || read.data.status === "error" || read.data.status === "cancelled"
-          ? read.data.status
-          : "running";
       return {
         ok: true,
         summary: read.summary,
-        data: {
-          runId,
-          command: redactedCommand,
-          status,
-          ...(read.data.exitCode !== undefined ? { exitCode: read.data.exitCode } : {}),
-          stdout: read.data.stdout,
-          stderr: read.data.stderr,
-          output: read.data.output,
-          ...(read.data.error !== undefined ? { error: read.data.error } : {}),
-          lastSeq: read.data.lastSeq,
-          truncated: read.data.truncated,
-        },
+        data: buildExecWaitData(runId, redactedCommand, read.data),
       };
     }
   }
@@ -491,27 +486,110 @@ export async function vmExec(
   };
 }
 
+interface OutputAccum {
+  stdoutRaw: string;
+  stderrRaw: string;
+  combinedRaw: string;
+  status: string;
+  exitCode: number | undefined;
+  errorMsg: string | undefined;
+  truncated: boolean;
+  lastSeq: number;
+}
+
+function dataRecordOf(event: SequencedEvent): Record<string, unknown> | null {
+  const data = event.data;
+  return data && typeof data === "object" && !Array.isArray(data)
+    ? (data as Record<string, unknown>)
+    : null;
+}
+
+function applyShellOutputEvent(acc: OutputAccum, event: SequencedEvent, redact: (t: string) => string): void {
+  const data = dataRecordOf(event);
+  const text = data && typeof data.text === "string" ? redact(data.text) : "";
+  if (!text) return;
+  acc.combinedRaw += text;
+  if (data?.stream === "stderr") acc.stderrRaw += text;
+  else acc.stdoutRaw += text;
+}
+
+function applyRunFinishedEvent(acc: OutputAccum, event: SequencedEvent): void {
+  acc.status = "finished";
+  const code = readEventNumber(event, "exitCode");
+  if (code !== undefined) acc.exitCode = code;
+  if ((event as unknown as Record<string, unknown>).truncated === true) acc.truncated = true;
+}
+
+function applyRunErrorEvent(acc: OutputAccum, event: SequencedEvent, redact: (t: string) => string): void {
+  acc.status = "error";
+  const msg = readEventString(event, "message");
+  if (msg) acc.errorMsg = redact(msg);
+  const code = readEventNumber(event, "exitCode");
+  if (code !== undefined) acc.exitCode = code;
+}
+
+function applyAssistantTextEvent(acc: OutputAccum, event: SequencedEvent, redact: (t: string) => string): void {
+  const data = dataRecordOf(event);
+  const text = data?.text;
+  if (typeof text === "string" && text) {
+    const clean = redact(text);
+    acc.stdoutRaw += clean;
+    acc.combinedRaw += clean;
+  }
+}
+
+function applyRunEvent(acc: OutputAccum, event: SequencedEvent, redact: (t: string) => string): void {
+  if (event.seq > acc.lastSeq) acc.lastSeq = event.seq;
+  switch (event.type) {
+    case "shell.output":
+      applyShellOutputEvent(acc, event, redact);
+      break;
+    case "run.finished":
+      applyRunFinishedEvent(acc, event);
+      break;
+    case "run.error":
+      applyRunErrorEvent(acc, event, redact);
+      break;
+    case "run.cancelled":
+      acc.status = "cancelled";
+      break;
+    case "assistant.text":
+      applyAssistantTextEvent(acc, event, redact);
+      break;
+  }
+}
+
+function processRunEvents(
+  events: SequencedEvent[],
+  initial: OutputAccum,
+  redact: (t: string) => string,
+): OutputAccum {
+  for (const event of events) applyRunEvent(initial, event, redact);
+  return initial;
+}
+
+function runStatusHeader(runId: string, status: string, exitCode: number | undefined): string {
+  const exitInfo = exitCode !== undefined ? `, exitCode=${exitCode}` : "";
+  return `Run ${runId} (${status}${exitInfo})`;
+}
+
+function readFileSummary(resolved: string, readSize: number, truncated: boolean, binary: boolean): string {
+  if (binary) return `Read binary file ${resolved} (${readSize} bytes).`;
+  const truncatedInfo = truncated ? ", truncated" : "";
+  return `Read ${resolved} (${readSize} bytes${truncatedInfo}).`;
+}
+
 export async function vmReadOutput(
   userId: string,
   rawArgs: unknown,
   deps?: VmToolDeps,
 ): Promise<BoardAgentToolResult<VmReadOutputResult>> {
   const owner = validateUserId(userId);
-  if (!owner) {
-    return {
-      ok: false,
-      error: "unauthorized",
-      summary: "Authenticated user scope (x-swarm-user) is required.",
-    };
-  }
+  if (!owner) return unauthorizedResult();
 
   const parsed = vmReadOutputInputSchema.safeParse(rawArgs ?? {});
   if (!parsed.success) {
-    return {
-      ok: false,
-      error: "invalid_input",
-      summary: `Invalid vm_read_output arguments: ${formatZodIssues(parsed.error)}`,
-    };
+    return invalidInputResult(`Invalid vm_read_output arguments: ${formatZodIssues(parsed.error)}`);
   }
 
   const { runId } = parsed.data;
@@ -537,73 +615,30 @@ export async function vmReadOutput(
   const savedSummary = saved?.summary.userId === owner ? saved.summary : undefined;
   const redact = makeRedactor({ ...process.env } as Record<string, string>);
 
-  let stdoutRaw = "";
-  let stderrRaw = "";
-  let combinedRaw = "";
-  let status: string = live?.status ?? savedSummary?.status ?? "running";
-  let exitCode: number | undefined = live?.exitCode ?? savedSummary?.exitCode;
-  let errorMsg: string | undefined = live?.error ?? savedSummary?.error;
-  let truncated = false;
-  let lastSeq = fromSeq;
+  const acc = processRunEvents(events, {
+    stdoutRaw: "",
+    stderrRaw: "",
+    combinedRaw: "",
+    status: live?.status ?? savedSummary?.status ?? "running",
+    exitCode: live?.exitCode ?? savedSummary?.exitCode,
+    errorMsg: live?.error ?? savedSummary?.error,
+    truncated: false,
+    lastSeq: fromSeq,
+  }, redact);
 
-  for (const event of events) {
-    if (event.seq > lastSeq) lastSeq = event.seq;
-    if (event.type === "shell.output" && event.data && typeof event.data === "object" && !Array.isArray(event.data)) {
-      const data = event.data as { stream?: unknown; text?: unknown };
-      const text = typeof data.text === "string" ? redact(data.text) : "";
-      if (!text) continue;
-      combinedRaw += text;
-      if (data.stream === "stderr") {
-        stderrRaw += text;
-      } else {
-        stdoutRaw += text;
-      }
-      continue;
-    }
-    if (event.type === "run.finished") {
-      status = "finished";
-      const code = readEventNumber(event, "exitCode");
-      if (code !== undefined) exitCode = code;
-      if ((event as unknown as Record<string, unknown>).truncated === true) truncated = true;
-      continue;
-    }
-    if (event.type === "run.error") {
-      status = "error";
-      const msg = readEventString(event, "message");
-      if (msg) errorMsg = redact(msg);
-      const code = readEventNumber(event, "exitCode");
-      if (code !== undefined) exitCode = code;
-      continue;
-    }
-    if (event.type === "run.cancelled") {
-      status = "cancelled";
-      continue;
-    }
-    if (event.type === "assistant.text" && event.data && typeof event.data === "object" && !Array.isArray(event.data)) {
-      const text = (event.data as { text?: unknown }).text;
-      if (typeof text === "string" && text) {
-        const clean = redact(text);
-        stdoutRaw += clean;
-        combinedRaw += clean;
-      }
-    }
-  }
-
-  if (!stdoutRaw && !stderrRaw && savedSummary?.finalText && fromSeq === 0) {
+  if (!acc.stdoutRaw && !acc.stderrRaw && savedSummary?.finalText && fromSeq === 0) {
     const clean = redact(savedSummary.finalText);
-    stdoutRaw = clean;
-    combinedRaw = clean;
+    acc.stdoutRaw = clean;
+    acc.combinedRaw = clean;
   }
 
-  const outClamp = clampOutputTail(combinedRaw);
-  const stdoutClamp = clampOutputTail(stdoutRaw);
-  const stderrClamp = clampOutputTail(stderrRaw);
-  truncated = truncated || outClamp.truncated || stdoutClamp.truncated || stderrClamp.truncated;
+  const outClamp = clampOutputTail(acc.combinedRaw);
+  const stdoutClamp = clampOutputTail(acc.stdoutRaw);
+  const stderrClamp = clampOutputTail(acc.stderrRaw);
+  const truncated = acc.truncated || outClamp.truncated || stdoutClamp.truncated || stderrClamp.truncated;
 
-  const summaryParts = [
-    `Run ${runId} (${status}${exitCode !== undefined ? `, exitCode=${exitCode}` : ""})`,
-  ];
-  if (errorMsg) summaryParts.push(`Error: ${excerpt(errorMsg, 400)}`);
+  const summaryParts = [runStatusHeader(runId, acc.status, acc.exitCode)];
+  if (acc.errorMsg) summaryParts.push(`Error: ${excerpt(acc.errorMsg, 400)}`);
   if (outClamp.text) summaryParts.push(excerpt(outClamp.text, 2000));
   else summaryParts.push("(no new output)");
 
@@ -612,13 +647,13 @@ export async function vmReadOutput(
     summary: summaryParts.join("\n"),
     data: {
       runId,
-      status,
-      ...(exitCode !== undefined ? { exitCode } : {}),
-      ...(errorMsg !== undefined ? { error: redact(errorMsg) } : {}),
+      status: acc.status,
+      ...(acc.exitCode !== undefined ? { exitCode: acc.exitCode } : {}),
+      ...(acc.errorMsg !== undefined ? { error: redact(acc.errorMsg) } : {}),
       stdout: stdoutClamp.text,
       stderr: stderrClamp.text,
       output: outClamp.text,
-      lastSeq,
+      lastSeq: acc.lastSeq,
       truncated,
     },
   };
@@ -630,21 +665,11 @@ export async function vmReadFile(
   deps?: VmToolDeps,
 ): Promise<BoardAgentToolResult<VmReadFileResult>> {
   const owner = validateUserId(userId);
-  if (!owner) {
-    return {
-      ok: false,
-      error: "unauthorized",
-      summary: "Authenticated user scope (x-swarm-user) is required.",
-    };
-  }
+  if (!owner) return unauthorizedResult();
 
   const parsed = vmReadFileInputSchema.safeParse(rawArgs ?? {});
   if (!parsed.success) {
-    return {
-      ok: false,
-      error: "invalid_input",
-      summary: `Invalid vm_read_file arguments: ${formatZodIssues(parsed.error)}`,
-    };
+    return invalidInputResult(`Invalid vm_read_file arguments: ${formatZodIssues(parsed.error)}`);
   }
 
   let resolved: string;
@@ -676,9 +701,7 @@ export async function vmReadFile(
     };
     return {
       ok: true,
-      summary: binary
-        ? `Read binary file ${resolved} (${read.size} bytes).`
-        : `Read ${resolved} (${read.size} bytes${read.truncated ? ", truncated" : ""}).`,
+      summary: readFileSummary(resolved, read.size, read.truncated, binary),
       data: result,
     };
   } catch (err) {
@@ -692,21 +715,11 @@ export async function vmWriteFile(
   deps?: VmToolDeps,
 ): Promise<BoardAgentToolResult<VmWriteFileResult>> {
   const owner = validateUserId(userId);
-  if (!owner) {
-    return {
-      ok: false,
-      error: "unauthorized",
-      summary: "Authenticated user scope (x-swarm-user) is required.",
-    };
-  }
+  if (!owner) return unauthorizedResult();
 
   const parsed = vmWriteFileInputSchema.safeParse(rawArgs ?? {});
   if (!parsed.success) {
-    return {
-      ok: false,
-      error: "invalid_input",
-      summary: `Invalid vm_write_file arguments: ${formatZodIssues(parsed.error)}`,
-    };
+    return invalidInputResult(`Invalid vm_write_file arguments: ${formatZodIssues(parsed.error)}`);
   }
 
   let resolved: string;
@@ -767,21 +780,11 @@ export async function vmListWorkspace(
   deps?: VmToolDeps,
 ): Promise<BoardAgentToolResult<VmListWorkspaceResult>> {
   const owner = validateUserId(userId);
-  if (!owner) {
-    return {
-      ok: false,
-      error: "unauthorized",
-      summary: "Authenticated user scope (x-swarm-user) is required.",
-    };
-  }
+  if (!owner) return unauthorizedResult();
 
   const parsed = vmListWorkspaceInputSchema.safeParse(rawArgs ?? {});
   if (!parsed.success) {
-    return {
-      ok: false,
-      error: "invalid_input",
-      summary: `Invalid vm_list_workspace arguments: ${formatZodIssues(parsed.error)}`,
-    };
+    return invalidInputResult(`Invalid vm_list_workspace arguments: ${formatZodIssues(parsed.error)}`);
   }
 
   let resolved: string;
@@ -834,21 +837,11 @@ export async function vmScreenshot(
   deps?: VmToolDeps,
 ): Promise<BoardAgentToolResult<VmScreenshotResult>> {
   const owner = validateUserId(userId);
-  if (!owner) {
-    return {
-      ok: false,
-      error: "unauthorized",
-      summary: "Authenticated user scope (x-swarm-user) is required.",
-    };
-  }
+  if (!owner) return unauthorizedResult();
 
   const parsed = vmScreenshotInputSchema.safeParse(rawArgs ?? {});
   if (!parsed.success) {
-    return {
-      ok: false,
-      error: "invalid_input",
-      summary: `Invalid vm_screenshot arguments: ${formatZodIssues(parsed.error)}`,
-    };
+    return invalidInputResult(`Invalid vm_screenshot arguments: ${formatZodIssues(parsed.error)}`);
   }
 
   const vm = resolveVm(deps);

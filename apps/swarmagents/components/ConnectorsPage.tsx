@@ -67,12 +67,12 @@ function Modal({
   labelledBy,
   onClose,
   children,
-}: {
+}: Readonly<{
   labelledBy: string;
   onClose: () => void;
   children: ReactNode;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
+}>) {
+  const ref = useRef<HTMLDialogElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
@@ -97,10 +97,10 @@ function Modal({
         const items = focusables();
         if (items.length === 0) return;
         const first = items[0];
-        const last = items[items.length - 1];
+        const last = items.at(-1);
         if (event.shiftKey && document.activeElement === first) {
           event.preventDefault();
-          last.focus();
+          last?.focus();
         } else if (!event.shiftKey && document.activeElement === last) {
           event.preventDefault();
           first.focus();
@@ -115,23 +115,303 @@ function Modal({
   }, []);
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
-      role="presentation"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div
+        aria-hidden="true"
+        className="absolute inset-0 bg-black/75 backdrop-blur-sm"
+        onClick={onClose}
+      />
+      <dialog
         ref={ref}
-        role="dialog"
+        open
         aria-modal="true"
         aria-labelledby={labelledBy}
-        className="w-full max-w-md rounded-2xl border border-white/15 bg-[#0e0f14] p-6 text-white shadow-2xl"
+        className="relative z-10 w-full max-w-md rounded-2xl border border-white/15 bg-[#0e0f14] p-6 text-white shadow-2xl"
       >
         {children}
-      </div>
+      </dialog>
     </div>
+  );
+}
+
+function oneClickLabel(isBusy: boolean, canActivateFromProvider: boolean): string {
+  if (isBusy) return "Connecting…";
+  return canActivateFromProvider ? "Activate saved key" : "Connect";
+}
+
+function StatusBadge({ entry }: { entry: ConnectorRow }) {
+  if (entry.connected) {
+    return (
+      <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+        <Check className="h-3 w-3" aria-hidden />
+        Connected
+      </span>
+    );
+  }
+  if (entry.canActivateFromProvider) {
+    return (
+      <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-cyan-400/35 bg-cyan-400/10 px-2.5 py-0.5 text-[11px] font-medium text-cyan-200">
+        Key in Providers
+      </span>
+    );
+  }
+  if (entry.fields.length === 0) {
+    return (
+      <span className="inline-flex shrink-0 items-center rounded-full border border-white/15 bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-zinc-300">
+        1-Click
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex shrink-0 items-center rounded-full border border-white/10 px-2.5 py-0.5 text-[11px] text-zinc-400">
+      Not connected
+    </span>
+  );
+}
+
+interface ConnectorCardProps {
+  entry: ConnectorRow;
+  busy: boolean;
+  anyBusy: boolean;
+  onConnect: (entry: ConnectorRow) => void;
+  onDisconnect: (entry: ConnectorRow) => void;
+  onUpdate: (entry: ConnectorRow) => void;
+}
+
+function ConnectorActions({ entry, busy, anyBusy, onConnect, onDisconnect, onUpdate }: ConnectorCardProps) {
+  if (entry.connected) {
+    return (
+      <>
+        <button
+          type="button"
+          disabled={anyBusy}
+          onClick={() => void onDisconnect(entry)}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200 transition hover:bg-red-500/20 disabled:opacity-50"
+        >
+          {busy ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+          ) : (
+            <Unplug className="h-3.5 w-3.5" aria-hidden />
+          )}
+          {busy ? "Disconnecting…" : "Disconnect"}
+        </button>
+        {entry.fields.length > 0 && (
+          <button
+            type="button"
+            disabled={anyBusy}
+            onClick={() => onUpdate(entry)}
+            className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs text-zinc-300 transition hover:bg-white/10 hover:text-white disabled:opacity-50"
+          >
+            <KeyRound className="h-3 w-3" aria-hidden />
+            Update key
+          </button>
+        )}
+      </>
+    );
+  }
+  return (
+    <>
+      {entry.canOneClickConnect ? (
+        <button
+          type="button"
+          disabled={anyBusy}
+          onClick={() => void onConnect(entry)}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-300/35 bg-cyan-400/15 px-3.5 py-1.5 text-xs font-medium text-cyan-100 transition hover:bg-cyan-400/25 disabled:opacity-50"
+        >
+          {busy ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+          ) : (
+            <Plug className="h-3.5 w-3.5" aria-hidden />
+          )}
+          {oneClickLabel(busy, entry.canActivateFromProvider)}
+        </button>
+      ) : (
+        <button
+          type="button"
+          disabled={anyBusy}
+          onClick={() => onUpdate(entry)}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-300/35 bg-cyan-400/15 px-3.5 py-1.5 text-xs font-medium text-cyan-100 transition hover:bg-cyan-400/25 disabled:opacity-50"
+        >
+          <Plug className="h-3.5 w-3.5" aria-hidden />
+          Connect
+        </button>
+      )}
+      {entry.canActivateFromProvider && (
+        <button
+          type="button"
+          disabled={anyBusy}
+          onClick={() => void onDisconnect(entry)}
+          className="inline-flex items-center gap-1 rounded-lg border border-white/10 px-2.5 py-1.5 text-xs text-zinc-400 hover:bg-white/5 hover:text-zinc-200 disabled:opacity-50"
+        >
+          Disconnect
+        </button>
+      )}
+    </>
+  );
+}
+
+function ConnectorCard({ entry, busy, anyBusy, onConnect, onDisconnect, onUpdate }: ConnectorCardProps) {
+  return (
+    <article
+      data-testid={`connector-card-${entry.id}`}
+      className="flex flex-col justify-between rounded-2xl border border-white/10 bg-[#0d0e13] p-5 transition hover:border-white/20"
+    >
+      <div>
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <span
+              className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-white/15 text-xs font-bold tracking-wide"
+              style={{
+                backgroundColor: `${entry.accent}18`,
+                color: entry.accent,
+              }}
+            >
+              {initials(entry.name)}
+            </span>
+            <div>
+              <h2 className="text-base font-semibold text-white">{entry.name}</h2>
+              <p className="text-xs text-zinc-400">{entry.vendor}</p>
+            </div>
+          </div>
+          <StatusBadge entry={entry} />
+        </div>
+
+        <p className="mt-3.5 text-sm leading-relaxed text-zinc-300">{entry.description}</p>
+
+        <div className="mt-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2.5">
+          <p className="text-[11px] font-medium uppercase tracking-wider text-zinc-500">
+            Active capabilities
+          </p>
+          <p className="mt-1 text-xs leading-relaxed text-zinc-400">{entry.unlocks}</p>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {entry.badges.map((badge) => (
+              <span
+                key={badge}
+                className="rounded-md border border-white/10 bg-white/[0.04] px-1.5 py-0.5 text-[10px] font-medium text-zinc-300"
+              >
+                {badge}
+              </span>
+            ))}
+            {entry.mask && (
+              <span className="rounded-md border border-emerald-400/25 bg-emerald-400/10 px-1.5 py-0.5 font-mono text-[10px] text-emerald-300">
+                {entry.mask}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-5 flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.08] pt-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <ConnectorActions
+            entry={entry}
+            busy={busy}
+            anyBusy={anyBusy}
+            onConnect={onConnect}
+            onDisconnect={onDisconnect}
+            onUpdate={onUpdate}
+          />
+        </div>
+        <a
+          href={entry.docsUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-1 text-xs text-zinc-400 hover:text-cyan-200"
+        >
+          Docs
+          <ExternalLink className="h-3 w-3" aria-hidden />
+        </a>
+      </div>
+    </article>
+  );
+}
+
+function LoadingState() {
+  return (
+    <output className="mt-10 flex items-center gap-2.5 text-sm text-zinc-400">
+      <Loader2 className="h-4 w-4 animate-spin text-cyan-300" aria-hidden />
+      Loading your connectors…
+    </output>
+  );
+}
+
+function ErrorState({ loadError, onRetry }: { loadError: string; onRetry: () => void }) {
+  return (
+    <div className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-6">
+      <p role="alert" className="text-sm text-red-200">
+        {loadError}
+      </p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="mt-4 inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-white hover:bg-white/10"
+      >
+        <RefreshCw className="h-3.5 w-3.5" aria-hidden />
+        Retry
+      </button>
+    </div>
+  );
+}
+
+function EmptyState({ onResetFilters }: { onResetFilters: () => void }) {
+  return (
+    <div className="mt-8 rounded-2xl border border-dashed border-white/15 p-10 text-center">
+      <p className="text-sm font-medium text-zinc-200">No connectors match your filter</p>
+      <p className="mt-1 text-xs text-zinc-400">Try clearing the search query or switching categories.</p>
+      <button
+        type="button"
+        onClick={onResetFilters}
+        className="mt-4 rounded-lg border border-white/15 px-3 py-1.5 text-xs text-zinc-200 hover:bg-white/5"
+      >
+        Reset filters
+      </button>
+    </div>
+  );
+}
+
+interface ContentViewProps {
+  loading: boolean;
+  loadError: string | null;
+  filtered: ConnectorRow[];
+  busyId: string | null;
+  onRetry: () => void;
+  onResetFilters: () => void;
+  onConnect: (entry: ConnectorRow) => void;
+  onDisconnect: (entry: ConnectorRow) => void;
+  onUpdate: (entry: ConnectorRow) => void;
+}
+
+function ContentView({
+  loading,
+  loadError,
+  filtered,
+  busyId,
+  onRetry,
+  onResetFilters,
+  onConnect,
+  onDisconnect,
+  onUpdate,
+}: ContentViewProps) {
+  if (loading) return <LoadingState />;
+  if (loadError) return <ErrorState loadError={loadError} onRetry={onRetry} />;
+  if (filtered.length === 0) return <EmptyState onResetFilters={onResetFilters} />;
+  return (
+    <section
+      aria-label="Available connectors"
+      className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3"
+    >
+      {filtered.map((entry) => (
+        <ConnectorCard
+          key={entry.id}
+          entry={entry}
+          busy={busyId === entry.id}
+          anyBusy={Boolean(busyId)}
+          onConnect={onConnect}
+          onDisconnect={onDisconnect}
+          onUpdate={onUpdate}
+        />
+      ))}
+    </section>
   );
 }
 
@@ -263,6 +543,10 @@ export function ConnectorsPage() {
     }
   };
 
+  const openModal = (entry: ConnectorRow) => {
+    setDraft({ entry, inputs: {}, saving: false, error: "" });
+  };
+
   const handleSubmitModal = async (event: FormEvent) => {
     event.preventDefault();
     if (!draft || draft.saving) return;
@@ -383,8 +667,10 @@ export function ConnectorsPage() {
               className="w-full rounded-xl border border-white/10 bg-[#111218] py-2 pl-9 pr-3 text-sm text-white placeholder:text-zinc-500 focus:border-cyan-400/50 focus:outline-none focus:ring-2 focus:ring-cyan-400/20"
             />
           </label>
-          <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Connector categories">
-            {CHIPS.map((item) => {
+          <fieldset className="m-0 min-w-0 border-0 p-0">
+            <legend className="sr-only">Connector categories</legend>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {CHIPS.map((item) => {
               const active = chip === item.id;
               return (
                 <button
@@ -401,7 +687,8 @@ export function ConnectorsPage() {
                 </button>
               );
             })}
-          </div>
+            </div>
+          </fieldset>
         </div>
 
         {/* Notifications */}
@@ -423,10 +710,9 @@ export function ConnectorsPage() {
         )}
         {notice && (
           <div
-            role="status"
             className="mt-5 flex items-center justify-between gap-3 rounded-xl border border-emerald-400/30 bg-emerald-950/30 px-4 py-3 text-sm text-emerald-200"
           >
-            <span>{notice}</span>
+            <output className="flex-1">{notice}</output>
             <button
               type="button"
               onClick={() => setNotice(null)}
@@ -439,205 +725,20 @@ export function ConnectorsPage() {
         )}
 
         {/* Content */}
-        {loading ? (
-          <div className="mt-10 flex items-center gap-2.5 text-sm text-zinc-400" role="status">
-            <Loader2 className="h-4 w-4 animate-spin text-cyan-300" aria-hidden />
-            Loading your connectors…
-          </div>
-        ) : loadError ? (
-          <div className="mt-8 rounded-2xl border border-white/10 bg-white/[0.02] p-6">
-            <p role="alert" className="text-sm text-red-200">
-              {loadError}
-            </p>
-            <button
-              type="button"
-              onClick={() => void load()}
-              className="mt-4 inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-medium text-white hover:bg-white/10"
-            >
-              <RefreshCw className="h-3.5 w-3.5" aria-hidden />
-              Retry
-            </button>
-          </div>
-        ) : filtered.length === 0 ? (
-          <div className="mt-8 rounded-2xl border border-dashed border-white/15 p-10 text-center">
-            <p className="text-sm font-medium text-zinc-200">No connectors match your filter</p>
-            <p className="mt-1 text-xs text-zinc-400">Try clearing the search query or switching categories.</p>
-            <button
-              type="button"
-              onClick={() => {
-                setQuery("");
-                setChip("all");
-              }}
-              className="mt-4 rounded-lg border border-white/15 px-3 py-1.5 text-xs text-zinc-200 hover:bg-white/5"
-            >
-              Reset filters
-            </button>
-          </div>
-        ) : (
-          <section
-            aria-label="Available connectors"
-            className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3"
-          >
-            {filtered.map((entry) => {
-              const isBusy = busyId === entry.id;
-              return (
-                <article
-                  key={entry.id}
-                  data-testid={`connector-card-${entry.id}`}
-                  className="flex flex-col justify-between rounded-2xl border border-white/10 bg-[#0d0e13] p-5 transition hover:border-white/20"
-                >
-                  <div>
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex items-center gap-3">
-                        <span
-                          className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-white/15 text-xs font-bold tracking-wide"
-                          style={{
-                            backgroundColor: `${entry.accent}18`,
-                            color: entry.accent,
-                          }}
-                        >
-                          {initials(entry.name)}
-                        </span>
-                        <div>
-                          <h2 className="text-base font-semibold text-white">{entry.name}</h2>
-                          <p className="text-xs text-zinc-400">{entry.vendor}</p>
-                        </div>
-                      </div>
-
-                      {entry.connected ? (
-                        <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
-                          <Check className="h-3 w-3" aria-hidden />
-                          Connected
-                        </span>
-                      ) : entry.canActivateFromProvider ? (
-                        <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-cyan-400/35 bg-cyan-400/10 px-2.5 py-0.5 text-[11px] font-medium text-cyan-200">
-                          Key in Providers
-                        </span>
-                      ) : entry.fields.length === 0 ? (
-                        <span className="inline-flex shrink-0 items-center rounded-full border border-white/15 bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-zinc-300">
-                          1-Click
-                        </span>
-                      ) : (
-                        <span className="inline-flex shrink-0 items-center rounded-full border border-white/10 px-2.5 py-0.5 text-[11px] text-zinc-400">
-                          Not connected
-                        </span>
-                      )}
-                    </div>
-
-                    <p className="mt-3.5 text-sm leading-relaxed text-zinc-300">{entry.description}</p>
-
-                    <div className="mt-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2.5">
-                      <p className="text-[11px] font-medium uppercase tracking-wider text-zinc-500">
-                        Active capabilities
-                      </p>
-                      <p className="mt-1 text-xs leading-relaxed text-zinc-400">{entry.unlocks}</p>
-                      <div className="mt-2 flex flex-wrap gap-1.5">
-                        {entry.badges.map((badge) => (
-                          <span
-                            key={badge}
-                            className="rounded-md border border-white/10 bg-white/[0.04] px-1.5 py-0.5 text-[10px] font-medium text-zinc-300"
-                          >
-                            {badge}
-                          </span>
-                        ))}
-                        {entry.mask && (
-                          <span className="rounded-md border border-emerald-400/25 bg-emerald-400/10 px-1.5 py-0.5 font-mono text-[10px] text-emerald-300">
-                            {entry.mask}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="mt-5 flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.08] pt-4">
-                    <div className="flex flex-wrap items-center gap-2">
-                      {entry.connected ? (
-                        <>
-                          <button
-                            type="button"
-                            disabled={Boolean(busyId)}
-                            onClick={() => void handleDisconnect(entry)}
-                            className="inline-flex items-center gap-1.5 rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-200 transition hover:bg-red-500/20 disabled:opacity-50"
-                          >
-                            {isBusy ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                            ) : (
-                              <Unplug className="h-3.5 w-3.5" aria-hidden />
-                            )}
-                            {isBusy ? "Disconnecting…" : "Disconnect"}
-                          </button>
-                          {entry.fields.length > 0 && (
-                            <button
-                              type="button"
-                              disabled={Boolean(busyId)}
-                              onClick={() =>
-                                setDraft({ entry, inputs: {}, saving: false, error: "" })
-                              }
-                              className="inline-flex items-center gap-1 rounded-lg border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs text-zinc-300 transition hover:bg-white/10 hover:text-white disabled:opacity-50"
-                            >
-                              <KeyRound className="h-3 w-3" aria-hidden />
-                              Update key
-                            </button>
-                          )}
-                        </>
-                      ) : entry.canOneClickConnect ? (
-                        <button
-                          type="button"
-                          disabled={Boolean(busyId)}
-                          onClick={() => void handleOneClickConnect(entry)}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-300/35 bg-cyan-400/15 px-3.5 py-1.5 text-xs font-medium text-cyan-100 transition hover:bg-cyan-400/25 disabled:opacity-50"
-                        >
-                          {isBusy ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                          ) : (
-                            <Plug className="h-3.5 w-3.5" aria-hidden />
-                          )}
-                          {isBusy
-                            ? "Connecting…"
-                            : entry.canActivateFromProvider
-                              ? "Activate saved key"
-                              : "Connect"}
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          disabled={Boolean(busyId)}
-                          onClick={() =>
-                            setDraft({ entry, inputs: {}, saving: false, error: "" })
-                          }
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-300/35 bg-cyan-400/15 px-3.5 py-1.5 text-xs font-medium text-cyan-100 transition hover:bg-cyan-400/25 disabled:opacity-50"
-                        >
-                          <Plug className="h-3.5 w-3.5" aria-hidden />
-                          Connect
-                        </button>
-                      )}
-                      {entry.canActivateFromProvider && (
-                        <button
-                          type="button"
-                          disabled={Boolean(busyId)}
-                          onClick={() => void handleDisconnect(entry)}
-                          className="inline-flex items-center gap-1 rounded-lg border border-white/10 px-2.5 py-1.5 text-xs text-zinc-400 hover:bg-white/5 hover:text-zinc-200 disabled:opacity-50"
-                        >
-                          Disconnect
-                        </button>
-                      )}
-                    </div>
-
-                    <a
-                      href={entry.docsUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 text-xs text-zinc-400 hover:text-cyan-200"
-                    >
-                      Docs
-                      <ExternalLink className="h-3 w-3" aria-hidden />
-                    </a>
-                  </div>
-                </article>
-              );
-            })}
-          </section>
-        )}
+        <ContentView
+          loading={loading}
+          loadError={loadError}
+          filtered={filtered}
+          busyId={busyId}
+          onRetry={() => void load()}
+          onResetFilters={() => {
+            setQuery("");
+            setChip("all");
+          }}
+          onConnect={handleOneClickConnect}
+          onDisconnect={handleDisconnect}
+          onUpdate={openModal}
+        />
       </div>
 
       {/* Credential connection dialog */}

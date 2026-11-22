@@ -11,7 +11,7 @@
 
 import React from "react";
 import Link from "next/link";
-import { ChevronDown, HelpCircle, Plug, Settings as SettingsIcon, Square, SquarePen, Activity, Monitor, MessageSquare, ClipboardList } from "lucide-react";
+import { ChevronDown, HelpCircle, Plug, Settings as SettingsIcon, Square, SquarePen } from "lucide-react";
 import { MascotDock } from "../../../components/mascot/MascotDock";
 import type { MascotState } from "../../../components/mascot/frames";
 import { RUN_PHASE_META, formatDuration, type RunPhase, type StatusTone } from "../../../lib/client/runPhase";

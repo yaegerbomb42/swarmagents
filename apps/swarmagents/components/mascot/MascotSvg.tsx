@@ -24,6 +24,7 @@
  */
 
 import React, { useEffect, useId, useMemo, useRef, useState } from "react";
+import { usePrefersReducedMotion } from "./usePrefersReducedMotion";
 import {
   MASCOT_SVG_ASPECT,
   segmentFor,
@@ -45,28 +46,6 @@ export interface MascotSvgProps {
   className?: string;
   /** Test override for the `prefers-reduced-motion` media query. */
   reducedMotion?: boolean;
-}
-
-const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
-
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = useState(
-    () =>
-      typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia(REDUCED_MOTION_QUERY).matches,
-  );
-
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const mq = window.matchMedia(REDUCED_MOTION_QUERY);
-    const update = () => setReduced(mq.matches);
-    update();
-    mq.addEventListener("change", update);
-    return () => mq.removeEventListener("change", update);
-  }, []);
-
-  return reduced;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -305,22 +284,6 @@ export interface MascotSvgIds {
   leg: string;
 }
 
-const ID_PARTS = [
-  "shell",
-  "limb",
-  "limbR",
-  "rim",
-  "creamV",
-  "glass",
-  "shadowG",
-  "blur6",
-  "blur3",
-  "faceClip",
-  "headClip",
-  "rimClip",
-  "leg",
-] as const;
-
 /**
  * Turn React's useId output into a collision-free SVG id prefix. useId returns
  * values like ":r0:"; those are legal HTML ids but awkward inside url(#...),
@@ -371,6 +334,20 @@ export function MascotSvg({
   const [time, setTime] = useState(() => segmentFor(state).start);
   const previousState = useRef(state);
 
+  // Animated nodes are updated imperatively inside requestAnimationFrame;
+  // driving them through React state re-rendered the whole SVG 60x/second.
+  const shadowRef = useRef<SVGGElement>(null);
+  const rootRef = useRef<SVGGElement>(null);
+  const headRef = useRef<SVGGElement>(null);
+  const planeRefs = useRef<Array<SVGGElement | null>>([]);
+  const slitRef = useRef<SVGGElement>(null);
+  const glowRef = useRef<SVGRectElement>(null);
+  const litRef = useRef<SVGRectElement>(null);
+  const rightShoulderRef = useRef<SVGGElement>(null);
+  const rightElbowRef = useRef<SVGGElement>(null);
+  const leftShoulderRef = useRef<SVGGElement>(null);
+  const leftElbowRef = useRef<SVGGElement>(null);
+
   // A new state restarts at the first frame of its segment.
   useEffect(() => {
     if (previousState.current === state) return;
@@ -379,20 +356,50 @@ export function MascotSvg({
   }, [state]);
 
   useEffect(() => {
-    if (motionReduced) {
-      setTime(segmentFor(state).start);
-      return;
-    }
+    const apply = (t: number): void => {
+      const p = poseAt(state, t);
+      shadowRef.current?.setAttribute("transform", p.shadow);
+      shadowRef.current?.setAttribute("opacity", p.shadowOpacity);
+      rootRef.current?.setAttribute("transform", p.root);
+      headRef.current?.setAttribute("transform", p.head);
+      planeRefs.current.forEach((el, index) => {
+        const plane = p.planes[index];
+        if (!el || !plane) return;
+        el.setAttribute("transform", plane.transform);
+        el.setAttribute("opacity", plane.opacity);
+      });
+      slitRef.current?.setAttribute("transform", p.slit);
+      glowRef.current?.setAttribute("opacity", p.glowOpacity);
+      litRef.current?.setAttribute("opacity", p.litOpacity);
+      rightShoulderRef.current?.setAttribute("transform", `rotate(${p.rightArm.shoulder})`);
+      rightElbowRef.current?.setAttribute("transform", `translate(0 78) rotate(${p.rightArm.elbow})`);
+      leftShoulderRef.current?.setAttribute("transform", `rotate(${p.leftArm.shoulder})`);
+      leftElbowRef.current?.setAttribute("transform", `translate(0 78) rotate(${p.leftArm.elbow})`);
+    };
+
+    apply(segmentFor(state).start);
+    if (motionReduced) return;
     if (typeof window === "undefined" || typeof requestAnimationFrame !== "function") return;
 
     let frame = 0;
     let startedAt: number | null = null;
+    let lastPaint = Number.NEGATIVE_INFINITY;
     let running = false;
 
     const tick = (now: number) => {
       if (!running) return;
-      if (startedAt === null) startedAt = now;
-      setTime(timelineTimeFor(state, now - startedAt));
+      if (startedAt === null) {
+        startedAt = now;
+        lastPaint = Number.NEGATIVE_INFINITY;
+      }
+      const elapsed = now - startedAt;
+      // Idle is just breathing; ~24fps is indistinguishable and halves the
+      // work. Active gestures keep the display's frame rate.
+      const minFrameMs = state === "idle" ? 1000 / 24 : 0;
+      if (elapsed - lastPaint >= minFrameMs) {
+        apply(timelineTimeFor(state, elapsed));
+        lastPaint = elapsed;
+      }
       frame = requestAnimationFrame(tick);
     };
     const start = () => {
@@ -405,11 +412,17 @@ export function MascotSvg({
       cancelAnimationFrame(frame);
     };
     const onVisibility = () => {
-      if (document.hidden) stop();
-      else start();
+      if (document.hidden) {
+        stop();
+      } else {
+        // Restart the clock: resuming with the old startedAt would jump the
+        // animation forward by the whole time the tab was hidden.
+        startedAt = null;
+        start();
+      }
     };
 
-    // Pause while the tab is hidden; resume without flashing a stale frame.
+    // Pause while the tab is hidden; resume from the segment start.
     if (document.hidden) stop();
     else start();
     document.addEventListener("visibilitychange", onVisibility);
@@ -495,12 +508,12 @@ export function MascotSvg({
         />
       </defs>
 
-      <g transform={pose.shadow} opacity={pose.shadowOpacity}>
+      <g ref={shadowRef} transform={pose.shadow} opacity={pose.shadowOpacity}>
         <ellipse cx="400" cy="670" rx="122" ry="19" fill={fill(ids.shadowG)} />
         <ellipse cx="400" cy="668" rx="70" ry="7" fill="#000" opacity=".35" filter={fill(ids.blur3)} />
       </g>
 
-      <g transform={pose.root}>
+      <g ref={rootRef} transform={pose.root}>
         <use href={`#${ids.leg}`} />
         <use href={`#${ids.leg}`} x="56" />
 
@@ -510,7 +523,7 @@ export function MascotSvg({
           <ellipse cx="400" cy="450" rx="124" ry="175" fill="none" stroke={fill(ids.rim)} strokeWidth="3" />
         </g>
 
-        <g transform={pose.head}>
+        <g ref={headRef} transform={pose.head}>
           <ellipse cx="400" cy="246" rx="116" ry="142" fill={fill(ids.shell)} />
           <g clipPath={`url(#${ids.headClip})`}>
             <ellipse cx="352" cy="160" rx="34" ry="20" fill="#fff" opacity=".14" filter={fill(ids.blur6)} transform="rotate(-28 352 160)" />
@@ -518,22 +531,22 @@ export function MascotSvg({
           <ellipse cx="400" cy="246" rx="116" ry="142" fill="none" stroke={fill(ids.rim)} strokeWidth="3" clipPath={`url(#${ids.rimClip})`} />
           <ellipse cx="400" cy="262" rx="80" ry="135" fill={fill(ids.creamV)} />
           <g clipPath={`url(#${ids.faceClip})`}>
-            <g transform={pose.planes[0].transform} opacity={pose.planes[0].opacity}>
+            <g ref={(el) => { planeRefs.current[0] = el; }} transform={pose.planes[0].transform} opacity={pose.planes[0].opacity}>
               <path d="M322 170 L392 132 L380 300 L330 330 Z" fill="#fff" opacity=".13" />
             </g>
-            <g transform={pose.planes[1].transform} opacity={pose.planes[1].opacity}>
+            <g ref={(el) => { planeRefs.current[1] = el; }} transform={pose.planes[1].transform} opacity={pose.planes[1].opacity}>
               <path d="M470 190 L490 300 L430 390 L440 260 Z" fill="#7b5c33" opacity=".1" />
             </g>
-            <g transform={pose.planes[2].transform} opacity={pose.planes[2].opacity}>
+            <g ref={(el) => { planeRefs.current[2] = el; }} transform={pose.planes[2].transform} opacity={pose.planes[2].opacity}>
               <path d="M340 300 L460 270 L450 345 L350 360 Z" fill="#fff" opacity=".09" />
             </g>
             <ellipse cx="362" cy="200" rx="24" ry="62" fill="#fff" opacity=".22" filter={fill(ids.blur6)} />
           </g>
-          <g transform={pose.slit}>
-            <rect id={`${ids.shell}-glow`} x="376" y="154" width="48" height="88" rx="24" fill="#ffd9a0" filter={fill(ids.blur6)} opacity={pose.glowOpacity} />
+          <g ref={slitRef} transform={pose.slit}>
+            <rect ref={glowRef} id={`${ids.shell}-glow`} x="376" y="154" width="48" height="88" rx="24" fill="#ffd9a0" filter={fill(ids.blur6)} opacity={pose.glowOpacity} />
             <rect x="383" y="162" width="34" height="68" rx="17" fill="#23252d" />
             <rect x="387" y="167" width="26" height="58" rx="13" fill={fill(ids.glass)} />
-            <rect x="387" y="167" width="26" height="58" rx="13" fill="#fff0cf" opacity={pose.litOpacity} />
+            <rect ref={litRef} x="387" y="167" width="26" height="58" rx="13" fill="#fff0cf" opacity={pose.litOpacity} />
             <ellipse cx="394" cy="181" rx="3" ry="7" fill="#fff" opacity=".6" />
             <rect x="383" y="162" width="34" height="68" rx="17" fill="none" stroke="#fff" strokeOpacity=".14" strokeWidth="1.5" />
           </g>
@@ -548,8 +561,8 @@ export function MascotSvg({
 
         {/* Right arm: scale is 1, so the rig is only rotated. */}
         <g transform="translate(512 398)">
-          <g transform={`rotate(${pose.rightArm.shoulder})`}>
-            <g transform={`translate(0 78) rotate(${pose.rightArm.elbow})`}>
+          <g ref={rightShoulderRef} transform={`rotate(${pose.rightArm.shoulder})`}>
+            <g ref={rightElbowRef} transform={`translate(0 78) rotate(${pose.rightArm.elbow})`}>
               <rect x="-19" y="-19" width="38" height="120" rx="19" fill={fill(ids.limb)} />
               <ellipse cx="0" cy="82" rx="22" ry="24" fill={fill(ids.limb)} />
             </g>
@@ -559,8 +572,8 @@ export function MascotSvg({
 
         {/* Left arm: mirrored with scale(-1 1), matching the reference rig. */}
         <g transform="translate(288 398) scale(-1 1)">
-          <g transform={`rotate(${pose.leftArm.shoulder})`}>
-            <g transform={`translate(0 78) rotate(${pose.leftArm.elbow})`}>
+          <g ref={leftShoulderRef} transform={`rotate(${pose.leftArm.shoulder})`}>
+            <g ref={leftElbowRef} transform={`translate(0 78) rotate(${pose.leftArm.elbow})`}>
               <rect x="-19" y="-19" width="38" height="120" rx="19" fill={fill(ids.limbR)} />
               <ellipse cx="0" cy="82" rx="22" ry="24" fill={fill(ids.limbR)} />
             </g>

@@ -96,3 +96,21 @@ test("a labelled mascot is readable and accepts a click to wave", async () => {
   const wrapperTag = /<span[^>]*data-testid="mascot-svg"[^>]*>/.exec(hidden)?.[0] ?? "";
   assert.ok(wrapperTag.includes('aria-hidden="true"'), "unlabelled mascot is hidden");
 });
+
+
+test("SSR starts with reduced motion off even when matchMedia prefers reduce", async () => {
+  // The hydration-safe initial state must not read window during render: the
+  // server has no matchMedia, so a client-only initializer produces a mismatch.
+  const g = globalThis as { window?: unknown };
+  const original = g.window;
+  g.window = {
+    matchMedia: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }),
+  };
+  try {
+    const html = await renderMascotSvg({ state: "idle" });
+    assert.ok(html.includes('data-mascot-reduced="false"'), "initial render is not reduced");
+  } finally {
+    if (original === undefined) delete g.window;
+    else g.window = original;
+  }
+});

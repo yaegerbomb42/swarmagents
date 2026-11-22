@@ -57,13 +57,34 @@ test("POST /api/signup creates a user and signs a hardened session cookie", asyn
 
 test("POST /api/signup rejects duplicates, invalid input, and non-JSON", async () => {
   assert.equal((await POST(request({ email: "a@example.com", password: "long enough password" }))).status, 201);
-  assert.equal((await POST(request({ email: "A@EXAMPLE.COM", password: "another long password" }))).status, 409);
+  // A duplicate is now reported exactly like any other bad signup: generic
+  // 400, never 409, so the endpoint cannot be used to enumerate accounts.
+  assert.equal((await POST(request({ email: "A@EXAMPLE.COM", password: "another long password" }))).status, 400);
   assert.equal((await POST(request({ email: "not-an-email", password: "long enough password" }))).status, 400);
   assert.equal((await POST(request({ email: "a@example.com", password: "short" }))).status, 400);
   assert.equal((await POST(request({ email: "a@example.com" }))).status, 400);
   assert.equal((await POST(request({}))).status, 400);
   assert.equal((await POST(request("not json"))).status, 400);
   assert.equal((await POST(request([]))).status, 400);
+});
+
+test("POST /api/signup cannot be used to enumerate registered emails", async () => {
+  const created = await POST(request({ email: "taken@example.com", password: "long enough password" }));
+  assert.equal(created.status, 201);
+
+  const duplicate = await POST(request({ email: "TAKEN@example.com", password: "another long password" }));
+  const invalid = await POST(request({ email: "not-an-email", password: "another long password" }));
+
+  // Identical status and body for an existing account and a malformed signup.
+  assert.equal(duplicate.status, 400, "duplicate must not return 409");
+  assert.equal(invalid.status, 400);
+  const duplicateBody = await duplicate.text();
+  const invalidBody = await invalid.text();
+  assert.equal(duplicateBody, invalidBody, "duplicate and invalid responses must be byte-identical");
+
+  const parsed = JSON.parse(duplicateBody) as { error: string };
+  assert.match(parsed.error, /valid email/i);
+  assert.doesNotMatch(parsed.error, /already|exist|regist|409/i);
 });
 
 test("POST /api/signup returns 429 when the scrypt concurrency cap is saturated", async () => {

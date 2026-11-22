@@ -4,9 +4,10 @@
  * Create a local password user and mint a session cookie for them.
  *
  * Accepts {email, password, botToken?}; the email is normalized (trimmed,
- * lowercase), passwords are hashed with scrypt in lib/users, and duplicates
- * return a 409 without disclosing whether the account exists for other
- * purposes.
+ * lowercase), passwords are hashed with scrypt in lib/users. Duplicates and
+ * invalid input deliberately share one generic 400 response so this endpoint
+ * cannot be used to enumerate registered email addresses (login does the same
+ * with a generic 401).
  *
  * FIX-44: when the bot check is configured (SWARM_TURNSTILE_SECRET), a
  * valid Turnstile token is required before any account work happens.
@@ -26,6 +27,14 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const MAX_BODY_SIZE = 16 * 1024;
+
+/**
+ * One generic message for malformed signups and for duplicate emails. Keeping
+ * a single constant (rather than two independent string literals) guarantees
+ * the two cases stay byte-for-byte identical in both status and body, so a
+ * caller cannot tell a registered address from an invalid submission.
+ */
+const GENERIC_SIGNUP_ERROR = "Enter a valid email and a password of at least 8 characters.";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -89,8 +98,6 @@ export async function POST(req: NextRequest): Promise<Response> {
   const result = await signupLocalUser(body.email, body.password);
   if (!result.ok) {
     switch (result.error) {
-      case "exists":
-        return NextResponse.json({ error: "An account with this email already exists." }, { status: 409 });
       case "fatal":
         return NextResponse.json({ error: "Could not persist the account." }, { status: 500 });
       case "busy":
@@ -100,8 +107,12 @@ export async function POST(req: NextRequest): Promise<Response> {
           { error: "Too many sign-up attempts right now. Try again shortly." },
           { status: 429, headers: { "Retry-After": "1" } },
         );
+      case "exists":
+      case "invalid":
       default:
-        return NextResponse.json({ error: "Enter a valid email and a password of at least 8 characters." }, { status: 400 });
+        // A taken email and a malformed submission are intentionally
+        // indistinguishable here: same status, same body, no 409.
+        return NextResponse.json({ error: GENERIC_SIGNUP_ERROR }, { status: 400 });
     }
   }
 

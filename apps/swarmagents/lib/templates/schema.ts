@@ -2,8 +2,10 @@
  * Zod schema for the template gallery.
  *
  * The gallery data in ./data/*.ts is static content that ships with the app,
- * so the schema is the contract that keeps it honest: every template is
- * validated once at import time, and the tests re-validate the whole set.
+ * so the schema is the contract that keeps it honest. The test suite validates
+ * the whole catalog with validateTemplates(); callers that build templates
+ * dynamically can validate them the same way. Nothing validates the static
+ * import at module load time.
  *
  * The schema also enforces the rule that makes the gallery usable: every
  * {{variable}} placeholder in a prompt has a matching form field, and every
@@ -78,8 +80,13 @@ export function validateTemplate(input: unknown): string[] {
   }
   if (new Set(fieldNames).size !== fieldNames.length) problems.push("field names must be unique");
   for (const field of template.fields) {
-    if (field.type === "select" && (!field.options || field.options.length === 0)) {
+    if (field.type !== "select") continue;
+    if (!field.options || field.options.length === 0) {
       problems.push(`field "${field.name}" is a select but has no options`);
+    } else if (field.default !== undefined && !field.options.includes(field.default)) {
+      problems.push(
+        `field "${field.name}" has default "${field.default}" which is not one of its options`,
+      );
     }
   }
   return problems;
@@ -90,14 +97,21 @@ export function validateTemplates(templates: readonly unknown[]): Map<string, st
   const problems = new Map<string, string[]>();
   const seen = new Set<string>();
   for (const input of templates) {
-    const id =
+    const rawId =
       typeof input === "object" && input !== null && typeof (input as { id?: unknown }).id === "string"
         ? (input as { id: string }).id
-        : "(unknown)";
+        : undefined;
+    const id = rawId ?? "(unknown)";
     const found = validateTemplate(input);
+    if (rawId === undefined) found.push("template id is missing or not a string");
     if (seen.has(id)) found.push(`duplicate template id "${id}"`);
     seen.add(id);
-    if (found.length > 0) problems.set(id, found);
+    if (found.length === 0) continue;
+    // Merge into any earlier entry for the same id: a duplicate or missing id
+    // must not hide the problems already recorded for the first template.
+    const existing = problems.get(id);
+    if (existing) existing.push(...found);
+    else problems.set(id, found);
   }
   return problems;
 }

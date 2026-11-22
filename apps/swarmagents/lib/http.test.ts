@@ -70,3 +70,44 @@ test("readJsonBody measures bytes, not characters", async () => {
   const ok = await readJsonBody(request(body), 10);
   assert.equal(ok, "é".repeat(4));
 });
+
+/** A request whose body arrives as the given chunks (one pull per chunk). */
+function chunkedRequest(chunks: Uint8Array[], onPull?: () => void): Request {
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      onPull?.();
+      const next = chunks.shift();
+      if (next) controller.enqueue(next);
+      else controller.close();
+    },
+  });
+  return new Request("http://localhost/api/test", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: stream,
+    // Undici requires duplex for stream bodies; harmless elsewhere.
+    duplex: "half",
+  } as RequestInit);
+}
+
+test("readJsonBody reassembles JSON split across chunks (incl. split UTF-8)", async () => {
+  const bytes = new TextEncoder().encode(JSON.stringify({ note: "café" }));
+  // Split inside the two-byte "é" so decoding must happen after reassembly.
+  const splitAt = bytes.indexOf(0xc3) + 1;
+  const body = await readJsonBody(chunkedRequest([bytes.subarray(0, splitAt), bytes.subarray(splitAt)]));
+  assert.deepEqual(body, { note: "café" });
+});
+
+test("readJsonBody stops pulling an oversized stream at the cap", async () => {
+  let pulls = 0;
+  const chunk = new TextEncoder().encode("x".repeat(64));
+  const chunks = Array.from({ length: 100 }, () => chunk);
+  await assert.rejects(readJsonBody(chunkedRequest(chunks, () => pulls++), 100), (err: unknown) => {
+    assert.ok(err instanceof JsonBodyError);
+    assert.equal(err.status, 413);
+    return true;
+  });
+  // Two 64-byte chunks cross the 100-byte cap; the reader must be cancelled
+  // long before all 100 chunks are pulled.
+  assert.ok(pulls < 10, `expected early cancel, got ${pulls} pulls`);
+});

@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   gates:
-    name: Gates (typecheck + unit tests)
+    name: Gates (typecheck + unit tests + lint + build)
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.action == 'deploy' && !inputs.skip_gates) }}
     runs-on: ubuntu-latest
     defaults:
@@ -47,6 +47,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run test:unit
+      - run: npm run lint
+      - run: npm run build
 
   ship:
     name: Run ${{ inputs.action || 'deploy' }} on the VPS

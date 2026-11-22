@@ -8,6 +8,7 @@
  */
 
 import rawConnectors from "./catalog/connectors.json";
+import { addInstalledItem, type InstalledItemView } from "./user-store";
 import { isRecord, type McpPayload } from "./types";
 
 export interface ConnectorField {
@@ -105,3 +106,30 @@ export function connectorPayload(entry: ConnectorEntry): McpPayload | null {
     ...(entry.tools.length ? { tools: entry.tools } : {}),
   };
 }
+
+/**
+ * Common helper to install a verified connector by ID into an owner's library.
+ * Returns the created library item, or an error description.
+ */
+export function installConnectorItem(
+  owner: string,
+  connectorId: string,
+  secrets?: unknown,
+): { ok: true; item: InstalledItemView } | { ok: false; error: string; status: number } {
+  const entry = connectorById(connectorId);
+  if (!entry) return { ok: false, error: "Unknown connector.", status: 404 };
+  const payload = connectorPayload(entry);
+  if (!payload) return { ok: false, error: "This connector cannot be installed automatically.", status: 400 };
+
+  const item = addInstalledItem(owner, {
+    id: `connector-${entry.id}`,
+    kind: "connector",
+    name: entry.name,
+    description: entry.description,
+    payload,
+    secrets: isRecord(secrets) ? (secrets as Record<string, string>) : undefined,
+    origin: "user",
+  });
+  return { ok: true, item };
+}
+

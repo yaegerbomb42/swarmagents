@@ -19,22 +19,42 @@ export const SECRET_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = 
   // Anthropic API keys: sk-ant-api03-...
   { pattern: /sk-ant-[A-Za-z0-9_-]{10,}/g, replacement: "[REDACTED]" },
   // OpenAI-style keys: sk-... / sk-proj-...
-  { pattern: /sk-[A-Za-z0-9_-]{20,}/g, replacement: "[REDACTED]" },
+  // Match csk- first or ensure sk-[A-Za-z0-9_-]{20,} doesn't collide
+  // Cerebras API keys: csk-...
+  { pattern: /csk-[A-Za-z0-9_-]{20,}/g, replacement: "[REDACTED]" },
+  // OpenAI-style keys: sk-... / sk-proj-...
+  { pattern: /(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}/g, replacement: "[REDACTED]" },
   // GitHub tokens: ghp_... (classic PAT) and the other gh*_ prefixes.
   { pattern: /gh[pousr]_[A-Za-z0-9]{20,}/g, replacement: "[REDACTED]" },
   // GitHub fine-grained PATs: github_pat_...
   { pattern: /github_pat_[A-Za-z0-9_]{20,}/g, replacement: "[REDACTED]" },
+  // GitLab personal access tokens: glpat-...
+  { pattern: /glpat-[A-Za-z0-9_-]{20,}/g, replacement: "[REDACTED]" },
+  // npm access tokens: npm_...
+  { pattern: /npm_[A-Za-z0-9_]{20,}/g, replacement: "[REDACTED]" },
   // AWS access key IDs: AKIA + 16 uppercase alphanumerics.
   { pattern: /AKIA[0-9A-Z]{16}/g, replacement: "[REDACTED]" },
+  // AWS temporary STS keys: ASIA + 16 uppercase alphanumerics.
+  { pattern: /ASIA[0-9A-Z]{16}/g, replacement: "[REDACTED]" },
   // Slack tokens: xoxb-... (bot), xoxp-... (user), xoxa-/xoxr-/xoxs-...
   { pattern: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: "[REDACTED]" },
   // Google/Gemini API keys: AIza + 35 base64url chars.
   { pattern: /AIza[0-9A-Za-z_-]{35}/g, replacement: "[REDACTED]" },
-  // PEM private key headers (the body stays, but the header alone marks the
-  // material as a private key; mask it so logs never carry the shape).
-  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/g, replacement: "[REDACTED]" },
+  // HuggingFace tokens: hf_...
+  { pattern: /hf_[A-Za-z0-9]{34,}/g, replacement: "[REDACTED]" },
+  // Groq API keys: gsk_...
+  { pattern: /gsk_[A-Za-z0-9]{48,}/g, replacement: "[REDACTED]" },
+  // NVIDIA NIM / API keys: nvapi-...
+  { pattern: /nvapi-[A-Za-z0-9_-]{40,}/g, replacement: "[REDACTED]" },
+  // Full PEM private key blocks (complete with END marker)
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: "[REDACTED]" },
+  // Fallback for truncated PEM private key blocks: header plus immediate base64 body lines
+  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----(?:\r?\n[A-Za-z0-9+/=]{16,})*/g, replacement: "[REDACTED]" },
   // Authorization headers: keep the scheme, mask the credential.
   { pattern: /Bearer [A-Za-z0-9._~+\-/=]{10,}/gi, replacement: "Bearer [REDACTED]" },
+  { pattern: /Basic [A-Za-z0-9+/=]{10,}/gi, replacement: "Basic [REDACTED]" },
+  // URL embedded credentials: https?://user:pass@host
+  { pattern: /https?:\/\/[^/\s:@]+:[^/\s@]+@/g, replacement: "[REDACTED]@" },
 ];
 
 export function makeRedactor(
@@ -55,11 +75,13 @@ export function makeRedactor(
       if (typeof secret === "string" && secret.length > 0) secrets.add(secret);
     }
   }
+  // Longest first: a short secret that is a substring of a longer one must
+  // not be redacted first and leave the longer one's residue behind.
+  // Pre-sort once here instead of copying and sorting on every redact() call.
+  const ordered = [...secrets].sort((a, b) => b.length - a.length);
+
   return (text) => {
     let out = text;
-    // Longest first: a short secret that is a substring of a longer one must
-    // not be redacted first and leave the longer one's residue behind.
-    const ordered = [...secrets].sort((a, b) => b.length - a.length);
     for (const secret of ordered) {
       if (out.includes(secret)) out = out.split(secret).join("[REDACTED]");
     }
@@ -90,12 +112,25 @@ export function secretPatternSources(): Array<{ source: string; flags: string; r
 }
 
 /** Deep-copy a value, redacting every string inside it (e.g. tool inputs). */
-export function redactValue(value: unknown, redact: (text: string) => string): unknown {
+export function redactValue(
+  value: unknown,
+  redact: (text: string) => string,
+  seen: WeakSet<object> = new WeakSet(),
+): unknown {
   if (typeof value === "string") return redact(value);
-  if (Array.isArray(value)) return value.map((item) => redactValue(item, redact));
   if (value !== null && typeof value === "object") {
+    if (seen.has(value)) {
+      return "[Circular]";
+    }
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      return value.map((item) => redactValue(item, redact, seen));
+    }
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) out[k] = redactValue(v, redact);
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = redactValue(v, redact, seen);
+    }
     return out;
   }
   return value;

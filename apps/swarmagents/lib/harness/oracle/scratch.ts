@@ -79,13 +79,16 @@ export async function createScratch(exec: OracleExec, opts: ScratchOptions): Pro
       }
     }
 
-    // Carry untracked (non-ignored) files.
+    // Carry untracked (non-ignored) files, preserving their relative paths.
+    // Avoid GNU-only `cp --parents` (not available on macOS/BSD): create each
+    // parent directory and copy the file individually.
     const untracked = nulList(
       await must(exec, ["git", "-C", root, "ls-files", "--others", "--exclude-standard", "-z"], undefined, "git ls-files"),
     );
-    for (let i = 0; i < untracked.length; i += 200) {
-      const batch = untracked.slice(i, i + 200);
-      await must(exec, ["cp", "--parents", "-p", "--", ...batch, dir], root, "copy untracked files");
+    for (const file of untracked) {
+      const dstDir = path.join(dir, path.dirname(file));
+      await must(exec, ["mkdir", "-p", dstDir], undefined, "mkdir untracked parent");
+      await must(exec, ["cp", "-p", path.join(root, file), path.join(dstDir, path.basename(file))], undefined, "copy untracked file");
     }
 
     for (const rel of opts.linkDirs ?? []) {

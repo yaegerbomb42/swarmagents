@@ -137,6 +137,16 @@ export interface PolledVmInfo {
   desktop: boolean;
 }
 
+/** Extract the VM status from the route's VmState envelope. */
+export function parsePolledVmStatus(value: unknown): VmStatus | undefined {
+  const state = value && typeof value === "object" && "status" in value
+    ? (value as { status?: unknown }).status
+    : value;
+  return state === "running" || state === "stopped" || state === "missing" || state === "creating" || state === "error"
+    ? state
+    : undefined;
+}
+
 /**
  * Poll GET /api/runtime/vm/status for the caller's VM state. Silent while
  * the endpoint is unreachable — the pill falls back to the run-stream
@@ -144,7 +154,7 @@ export interface PolledVmInfo {
  * error state of its own. Polling does not wake a hibernated VM: the
  * manager answers status from the known handle without re-ensuring it.
  */
-export function usePolledVmStatus(intervalMs: number = VM_STATUS_POLL_MS): PolledVmInfo {
+export function usePolledVmStatus(intervalMs: number = VM_STATUS_POLL_MS, refreshKey?: string): PolledVmInfo {
   const [status, setStatus] = useState<VmStatus | undefined>(undefined);
   const [desktop, setDesktop] = useState(true);
 
@@ -156,7 +166,8 @@ export function usePolledVmStatus(intervalMs: number = VM_STATUS_POLL_MS): Polle
         if (!res.ok) return;
         const data = (await res.json()) as { status?: unknown; desktop?: unknown };
         if (cancelled) return;
-        if (typeof data.status === "string") setStatus(data.status as VmStatus);
+        const nextStatus = parsePolledVmStatus(data.status);
+        if (nextStatus) setStatus(nextStatus);
         if (typeof data.desktop === "boolean") setDesktop(data.desktop);
       } catch {
         // Unreachable endpoint: keep the last known status (or none).
@@ -168,7 +179,7 @@ export function usePolledVmStatus(intervalMs: number = VM_STATUS_POLL_MS): Polle
       cancelled = true;
       clearInterval(id);
     };
-  }, [intervalMs]);
+  }, [intervalMs, refreshKey]);
 
   return { status, desktop };
 }

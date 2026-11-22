@@ -142,14 +142,16 @@ export default function App() {
 
   // ---- VM screen ----
 
-  const polledVm = usePolledVmStatus();
+  const lifecycleEvent = latestVmLifecycleEvent(session.liveItems);
+  const polledVm = usePolledVmStatus(undefined, `${session.busy}:${lifecycleEvent ?? ""}`);
   const [vmResetting, setVmResetting] = useState(false);
   const [takingOver, setTakingOver] = useState(false);
   const [screenView, setScreenView] = useState<ComputerView>("desktop");
   const vmDisplay = resolveVmDisplayStatus({
-    latestVmEvent: latestVmLifecycleEvent(session.liveItems),
+    latestVmEvent: session.busy ? lifecycleEvent : undefined,
     polledStatus: polledVm.status,
-    resetting: vmResetting,
+    // Do not dial (and therefore wake) a VM before its first status arrives.
+    resetting: vmResetting || (!polledVm.status && !lifecycleEvent),
   });
   const canControl = polledVm.desktop !== false && vmDisplay.state === "ready";
 

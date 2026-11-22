@@ -1190,7 +1190,9 @@ export class ClaudeCodeRunner {
     // memory ride as one appended system prompt, one argv element per value —
     // never interpolated into a shell string.
     const role = effective.rolePhase;
-    if (role && role.toolsDisabled !== true) {
+    if (role?.toolsDisabled === true) {
+      argv.push("--tools", "");
+    } else if (role) {
       // Empty values must not produce a bare flag: the CLI would consume the
       // following flag name as the value (e.g. "--mcp-config" as a tool).
       if (role.allowedTools.length > 0) argv.push("--allowedTools", ...role.allowedTools);

@@ -23,6 +23,7 @@
 import type { RoleDefinition } from "../roles";
 import {
   BUILTIN_ROLES,
+  BUILTIN_ROLE_IDS,
   DESKTOP_ROLE_MCP_SERVERS,
   LONG_RUNNING_WORK_TAIL,
   ROLE_SCHEMA,
@@ -409,10 +410,14 @@ function roleDefinitionForId(roleId: string): RoleDefinition | null {
  */
 export function roleArgvFlags(phase: RolePhase): string[] {
   const flags: string[] = [];
-  // A bare flag followed by the next flag's name is worse than no flag at all:
-  // `--allowedTools --mcp-config <path>` makes the CLI treat "--mcp-config" as
-  // a tool name. Only emit a flag when it actually has a value.
-  if (phase.toolsDisabled !== true) {
+  if (phase.toolsDisabled === true) {
+    // Explicitly disable tools in chat mode; the empty value is the value of
+    // --tools, not a bare flag.
+    flags.push("--tools", "");
+  } else {
+    // A bare flag followed by the next flag's name is worse than no flag at all:
+    // `--allowedTools --mcp-config <path>` makes the CLI treat "--mcp-config" as
+    // a tool name. Only emit a flag when it actually has a value.
     if (phase.allowedTools.length > 0) flags.push("--allowedTools", ...phase.allowedTools);
     if (phase.mcpConfigPath) flags.push("--mcp-config", phase.mcpConfigPath);
   }

@@ -8,6 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ClaudeCodeRunner, isBackgroundedCommand, isSignalKillExitCode } from "./runner.js";
+import { StateLedger } from "./context/contextGovernor.js";
 import { localScorer } from "./system-one/index.js";
 import type { DecisionRouter } from "./decision-brain/index.js";
 import type { TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
@@ -331,6 +332,34 @@ test("L1 context packer packs the invocation prompt and reports the budget line"
   assert.equal(budget.length, 1);
   assert.equal(budget[0].ok, true);
   assert.match(budget[0].detail, /^context-packer\[l1\] turn=0 budget=8192 /);
+});
+
+test("L1 packer hydrates the state ledger from the request snapshot", async () => {
+  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const runner = new ClaudeCodeRunner({ bin: "claude", contextPacker: "l1" });
+  const ledger = new StateLedger("Resume the upload fix");
+  ledger.recordFailedAttempt(
+    "bumping the retry count in lib/upload/retry.ts",
+    "upload.test.ts > retries: expected 200, got 500",
+    "bumping the retry count again",
+    3,
+  );
+  const outcome = await runner.run(
+    {
+      prompt: "Ignored when a snapshot is present",
+      stateLedger: ledger.toJSON(),
+      env: {},
+      vm,
+    },
+    () => {},
+  );
+  assert.equal(outcome.exitCode, 0);
+  const { cmd } = vm.calls[0];
+  const prompt = cmd[cmd.length - 1];
+  assert.match(prompt, /Goal: Resume the upload fix/);
+  assert.match(prompt, /## Do not retry/);
+  assert.match(prompt, /bumping the retry count in lib\/upload\/retry\.ts/);
+  assert.doesNotMatch(prompt, /Ignored when a snapshot is present/);
 });
 
 test("without the packer the argv is byte-identical to today and no context telemetry is emitted", async () => {

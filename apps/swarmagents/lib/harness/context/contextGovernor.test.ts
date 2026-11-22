@@ -16,8 +16,10 @@ import {
   DEFAULT_CONTEXT_PACKER,
   DEFAULT_L1_BUDGET,
   fitText,
+  hashDiff,
   MAX_INPUT_TOKENS,
   MAX_TOTAL_TOKENS,
+  normalizeErrorSignature,
   resolveBudget,
   resolveContextPacker,
   StateLedger,
@@ -166,6 +168,164 @@ test("StateLedger keeps goal, last error tail and newest steps within its cap", 
 
   const round = StateLedger.fromJSON(JSON.parse(JSON.stringify(ledger.toJSON())));
   assert.equal(round.render(201, 600), text);
+});
+
+test("StateLedger records failed attempts: duplicates collapse, paths survive verbatim, round-trip", () => {
+  const ledger = new StateLedger("Fix the upload");
+  ledger.recordStep(1, "first look");
+  // No explicit turn: defaults to the latest step's turn.
+  ledger.recordFailedAttempt(
+    "raising the timeout in lib/upload/client.ts",
+    "upload.test.ts > times out after 30s",
+    "raising the timeout again",
+  );
+  assert.equal(ledger.failedAttempts[0].turn, 1);
+
+  ledger.recordFailedAttempt(
+    "bumping the retry count in lib/upload/retry.ts",
+    "upload.test.ts > retries: expected 200, got 500",
+    "bumping the retry count again",
+    2,
+  );
+  ledger.recordFailedAttempt(
+    "bumping the retry count in lib/upload/retry.ts",
+    "upload.test.ts > retries: expected 200, got 500",
+    "bumping the retry count a third time",
+    5,
+  );
+  ledger.recordFailedAttempt(
+    "bumping the retry count in lib/upload/retry.ts",
+    "upload.test.ts > times out after 30s",
+    "bumping the retry count",
+    6,
+  );
+  assert.equal(ledger.failedAttempts.length, 3);
+  assert.equal(ledger.failedAttempts[1].turn, 5);
+  assert.equal(ledger.failedAttempts[1].doNotRetry, "bumping the retry count a third time");
+  // Vacuous entries carry no signal.
+  ledger.recordFailedAttempt("", "some reason", "nothing", 7);
+  ledger.recordFailedAttempt("something", "   ", "nothing", 7);
+  assert.equal(ledger.failedAttempts.length, 3);
+
+  const text = ledger.render(7, 600);
+  assert.match(text, /## Do not retry/);
+  assert.match(
+    text,
+    /tried bumping the retry count in lib\/upload\/retry\.ts -> failed because upload\.test\.ts > retries: expected 200, got 500 -> do NOT retry bumping the retry count a third time/,
+  );
+  assert.match(text, /times out after 30s/);
+
+  const round = StateLedger.fromJSON(JSON.parse(JSON.stringify(ledger.toJSON())));
+  assert.equal(round.render(7, 600), text);
+  assert.deepEqual(round.failedAttempts, ledger.failedAttempts);
+});
+
+test("StateLedger renders a do-not-retry block within its token cap; steps elide first", () => {
+  const ledger = new StateLedger("Fix the flaky upload test", { constraints: ["no new deps"] });
+  for (let t = 1; t <= 200; t++) ledger.recordStep(t, `tried approach ${t} and observed result ${t}`);
+  for (let i = 1; i <= 20; i++) {
+    ledger.recordFailedAttempt(
+      `rewriting the uploader with strategy ${i} in apps/swarmagents/lib/upload/retry.ts`,
+      `upload.test.ts > retries the upload 3 times: expected 200, got 500 (attempt ${i})`,
+      `rewriting the uploader with strategy ${i}`,
+      i,
+    );
+  }
+  const text = ledger.render(201, 600);
+  assert.ok(estimateTokens(text) <= 600, `ledger ${estimateTokens(text)}`);
+  assert.match(text, /## Do not retry/);
+  // Newest failure is present, verbatim with its exact path and test name.
+  assert.match(text, /strategy 20 in apps\/swarmagents\/lib\/upload\/retry\.ts/);
+  assert.match(text, /upload\.test\.ts > retries the upload 3 times/);
+  // The block itself stays inside its 300-500 token sub-cap.
+  const block = text.split("## Do not retry")[1].split("Steps so far:")[0];
+  assert.ok(estimateTokens(block) <= 500, `do-not-retry block ${estimateTokens(block)}`);
+  // Older failures elide with a count, and step summaries give way first.
+  assert.match(text, /\(\d+ earlier failed attempts elided\)/);
+  assert.match(text, /\(\d+ earlier steps elided\)/);
+  assert.doesNotMatch(text, /t1: tried/);
+});
+
+test("normalizeErrorSignature strips volatile parts; recordFailureFromTurn dedups by diff hash", () => {
+  const first = [
+    "2026-11-22T10:15:30.123Z FAIL lib/upload/upload.test.ts:42:7",
+    "upload.test.ts > retries the upload 3 times",
+    "    at Object.<anonymous> (lib/upload/upload.test.ts:42:7)",
+    "AssertionError: expected 200, got 500",
+  ].join("\n");
+  const second = [
+    "2026-11-22T11:02:01.999Z FAIL lib/upload/upload.test.ts:43:11",
+    "upload.test.ts > retries the upload 3 times",
+    "    at Object.<anonymous> (lib/upload/upload.test.ts:43:11)",
+    "AssertionError: expected 200, got 500",
+  ].join("\n");
+  assert.equal(normalizeErrorSignature(first), normalizeErrorSignature(second));
+  const sig = normalizeErrorSignature(first);
+  assert.match(sig, /lib\/upload\/upload\.test\.ts/);
+  assert.match(sig, /retries the upload 3 times/);
+  assert.doesNotMatch(sig, /10:15:30/);
+  assert.doesNotMatch(sig, /:42:7/);
+
+  const ledger = new StateLedger("Fix the upload");
+  const diff = [
+    "--- a/lib/upload/retry.ts",
+    "+++ b/lib/upload/retry.ts",
+    "@@ -1 +1 @@",
+    "-const RETRIES = 3;",
+    "+const RETRIES = 5;",
+  ].join("\n");
+  const hash = hashDiff(diff);
+  assert.match(hash, /^diff-[0-9a-f]{8}$/);
+  assert.equal(hashDiff(diff), hash);
+  ledger.recordFailureFromTurn(1, sig, hash);
+  ledger.recordFailureFromTurn(2, sig, hash);
+  assert.equal(ledger.failedAttempts.length, 1);
+  assert.equal(ledger.failedAttempts[0].turn, 2);
+  ledger.recordFailureFromTurn(3, sig, hashDiff(`${diff}more`));
+  assert.equal(ledger.failedAttempts.length, 2);
+  assert.match(ledger.render(3, 600), new RegExp(`tried change ${hash} -> failed because`));
+});
+
+test("simulation: a 12-turn trajectory that fails the same way 3 times keeps the failure in the ledger from turn 2 onward", () => {
+  const governor = new ContextGovernor();
+  const ledger = new StateLedger("Fix the flaky upload test");
+  const diff = [
+    "--- a/lib/upload/retry.ts",
+    "+++ b/lib/upload/retry.ts",
+    "@@ -1 +1 @@",
+    "-const RETRIES = 3;",
+    "+const RETRIES = 5;",
+  ].join("\n");
+  const hash = hashDiff(diff);
+  const signature = normalizeErrorSignature(
+    "FAIL lib/upload/upload.test.ts\nupload.test.ts > retries the upload 3 times\nAssertionError: expected 200, got 500",
+  );
+  const failingTurns = new Set([1, 5, 9]);
+  let packedTurn2 = "";
+  let packedTurn12 = "";
+  for (let turn = 1; turn <= 12; turn++) {
+    ledger.recordStep(turn, `turn ${turn}: edited retry handling and re-ran the upload suite`);
+    const packed = governor.pack({ turn, ledger, skeletonFiles: [], workingSet: [] });
+    assert.ok(packed.usage.total <= MAX_TOTAL_TOKENS, `turn ${turn}: ${packed.usage.total}`);
+    assert.equal(packed.usage.ledger.cap, 600, "ledger budget is unchanged");
+    if (turn === 2) packedTurn2 = packed.prompt;
+    if (turn === 12) packedTurn12 = packed.prompt;
+    if (failingTurns.has(turn)) ledger.recordFailureFromTurn(turn, signature, hash);
+  }
+  // The same failure recorded 3 times is one entry, stamped with the latest turn.
+  assert.equal(ledger.failedAttempts.length, 1);
+  assert.equal(ledger.failedAttempts[0].turn, 9);
+  // The failed approach is in the ledger from turn 2 onward, exactly once.
+  for (const prompt of [packedTurn2, packedTurn12]) {
+    assert.match(prompt, /## Do not retry/);
+    assert.match(prompt, new RegExp(`tried change ${hash} -> failed because`));
+  }
+  assert.equal(packedTurn12.match(/-> do NOT retry/g)?.length, 1);
+  // …and never re-presented as an open option: the change hash appears only
+  // inside the do-not-retry block, never in the goal or the step summaries.
+  const [before, , after] = packedTurn12.split(/(## Do not retry)/);
+  assert.ok(!before.includes(hash), "hash must not appear before the block");
+  assert.ok(after.includes(hash), "hash must appear inside the block");
 });
 
 test("fitText keeps head, tail or both ends and always fits", () => {

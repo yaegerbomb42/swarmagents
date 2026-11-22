@@ -1078,13 +1078,16 @@ export class ClaudeCodeRunner {
     if (mode === "l1") {
       // One invocation, one prompt: the request prompt is the ledger goal and
       // the agent card / role prompt / memory become the packed system header.
-      // File windows and the AST skeleton are empty here because the runner has
-      // no filesystem view of the user's VM; a caller with file state can feed
-      // them in later. toPackedRunRequest also drops --resume: an L1 turn is
+      // When the caller passes a persisted snapshot (RunRequest.stateLedger),
+      // the ledger is hydrated from it so a resumed or retried run inherits
+      // its negative constraints instead of starting fresh. File windows and
+      // the AST skeleton are empty here because the runner has no filesystem
+      // view of the user's VM; a caller with file state can feed them in
+      // later. toPackedRunRequest also drops --resume: an L1 turn is
       // stateless, so replaying the whole CLI session would defeat the budget.
       const packed = new ContextGovernor().pack({
         turn: 0,
-        ledger: new StateLedger(request.prompt),
+        ledger: request.stateLedger ? StateLedger.fromJSON(request.stateLedger) : new StateLedger(request.prompt),
         skeletonFiles: [],
         workingSet: [],
         systemExtras: wantOrder

@@ -97,6 +97,36 @@ test("a malformed id is rejected with a structured 400 before dispatch", async (
   assert.match(body.error ?? "", /invalid/i);
 });
 
+test("unknown rules and wrong secrets answer identically", async () => {
+  const wrongSecret = await POST(
+    request({}, { "x-swarm-hook-secret": "nope" }),
+    context("user_a", "hook1"),
+  );
+  const unknownId = await POST(
+    request({}, { "x-swarm-hook-secret": SECRET }),
+    context("user_a", "hook_missing"),
+  );
+  const unknownUser = await POST(
+    request({}, { "x-swarm-hook-secret": SECRET }),
+    context("user_z", "hook1"),
+  );
+  assert.equal(wrongSecret.status, 401);
+  assert.equal(unknownId.status, 401);
+  assert.equal(unknownUser.status, 401);
+  const body = await wrongSecret.text();
+  assert.equal(await unknownId.text(), body);
+  assert.equal(await unknownUser.text(), body);
+});
+
+test("the secret is checked before the body is read", async () => {
+  // Malformed body + wrong secret: the answer is 401, never a parse error.
+  const res = await POST(
+    request("{not json", { "x-swarm-hook-secret": "nope" }),
+    context("user_a", "hook1"),
+  );
+  assert.equal(res.status, 401);
+});
+
 test("a webhook with the wrong secret is rejected with 401", async () => {
   const res = await POST(request({ ok: true }, { "x-swarm-hook-secret": "nope" }), context("user_a", "hook1"));
   assert.equal(res.status, 401);

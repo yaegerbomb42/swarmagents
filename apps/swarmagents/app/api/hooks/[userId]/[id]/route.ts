@@ -5,6 +5,9 @@
  *   Authorization: Bearer <rule.webhookSecret>
  *   or X-Swarm-Hook-Secret: <rule.webhookSecret>
  *
+ * The secret is verified before the body is read: an unauthenticated caller
+ * learns nothing and spends no bytes. Unknown ids and wrong secrets answer
+ * with the identical 401, so valid (userId, id) pairs cannot be enumerated.
  * The route enforces a bounded body (oversized or malformed JSON is rejected
  * before the ambient engine runs) and validates userId/id format at the
  * boundary. A JSON body is required; the payload itself is ignored by the
@@ -38,7 +41,14 @@ export async function POST(
   // The ids are path segments that name a store key on disk; enforce the
   // same shape the engine uses, at the boundary, before any dispatch.
   if (!ambientIdsOk(userId, id)) {
-    return NextResponse.json({ error: "Invalid userId or id." }, { status: 400 });
+    return NextResponse.json({ error: "Invalid userId or id." }, { status: 400, headers: NO_STORE });
+  }
+
+  // Secret first: no body is read for an unauthenticated caller, and a
+  // missing rule answers exactly like a wrong secret (same status, same body).
+  const check = getAmbientEngine().checkWebhook(userId, id, presentedSecret(req));
+  if (check === "not found" || check === "unauthorized") {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401, headers: NO_STORE });
   }
 
   // Bounded read: a huge or malformed body never reaches the engine.
@@ -46,17 +56,18 @@ export async function POST(
     await readJsonBody(req);
   } catch (error) {
     if (error instanceof JsonBodyError) {
-      return NextResponse.json({ error: error.message }, { status: error.status });
+      return NextResponse.json({ error: error.message }, { status: error.status, headers: NO_STORE });
     }
     throw error;
   }
 
   const result = await getAmbientEngine().acceptWebhook(userId, id, presentedSecret(req));
-  if (result.error === "unauthorized" || result.error === "invalid id") {
+  if (
+    result.error === "unauthorized" ||
+    result.error === "invalid id" ||
+    result.error === "not found"
+  ) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401, headers: NO_STORE });
-  }
-  if (result.error === "not found") {
-    return NextResponse.json({ error: "Not found." }, { status: 404, headers: NO_STORE });
   }
   if (!result.fired) {
     return NextResponse.json({ error: result.error ?? "Not fired." }, { status: 409, headers: NO_STORE });

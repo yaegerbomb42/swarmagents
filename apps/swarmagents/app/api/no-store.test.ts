@@ -122,6 +122,7 @@ test("POST /api/mcp/swarm-board is uncacheable on success and on a JSON-RPC erro
 
 test("POST /api/hooks/[userId]/[id] is uncacheable on fire and on refusal", async () => {
   setAmbientEngineForTesting({
+    checkWebhook: () => "ok",
     acceptWebhook: async () => ({ fired: true, runId: "run_hook_1", queued: false }),
   } as unknown as AmbientEngine);
 
@@ -137,6 +138,7 @@ test("POST /api/hooks/[userId]/[id] is uncacheable on fire and on refusal", asyn
   assertNoStore(fired, "hook fired");
 
   setAmbientEngineForTesting({
+    checkWebhook: () => "unauthorized",
     acceptWebhook: async () => ({ fired: false, error: "unauthorized" }),
   } as unknown as AmbientEngine);
   const denied = await HOOK(
@@ -151,6 +153,7 @@ test("POST /api/hooks/[userId]/[id] is uncacheable on fire and on refusal", asyn
   assertNoStore(denied, "hook 401");
 
   setAmbientEngineForTesting({
+    checkWebhook: () => "not found",
     acceptWebhook: async () => ({ fired: false, error: "not found" }),
   } as unknown as AmbientEngine);
   const missing = await HOOK(
@@ -161,8 +164,8 @@ test("POST /api/hooks/[userId]/[id] is uncacheable on fire and on refusal", asyn
     }),
     { params: Promise.resolve({ userId: "local", id: "rule_1" }) },
   );
-  assert.equal(missing.status, 404);
-  assertNoStore(missing, "hook 404");
+  assert.equal(missing.status, 401);
+  assertNoStore(missing, "hook unknown id 401");
 });
 
 test("the gardener is uncacheable on read, on a mutation and on a rejected action", async () => {

@@ -34,3 +34,26 @@ test("efficiency flags idle gaps over IDLE_GAP_MS", () => {
   assert.ok(eff);
   assert.ok(eff!.idle_ms > 60_000, `idle should exceed the gap threshold, got ${eff!.idle_ms}`);
 });
+
+
+test("negative durations are clamped instead of inflating idle time", () => {
+  const events: RunEvent[] = [
+    { type: "turn", ts: 0, ms: -120_000, tokens: { cacheRead: 10, uncached: 10 } },
+    { type: "turn", ts: 5_000, ms: 100, tokens: { cacheRead: 10, uncached: 10 } },
+  ];
+  const eff = efficiency(events);
+  assert.ok(eff);
+  assert.equal(eff!.idle_ms, 0);
+});
+
+test("tool calls before the first turn do not inflate calls_per_turn", () => {
+  const events: RunEvent[] = [
+    { type: "tool.call", tool: "read", ts: 100 },
+    { type: "turn", ts: 200, tokens: { cacheRead: 10, uncached: 10 } },
+    { type: "tool.call", tool: "read", ts: 300 },
+  ];
+  const eff = efficiency(events);
+  assert.ok(eff);
+  assert.equal(eff!.tool_calls, 2);
+  assert.equal(eff!.calls_per_turn, 1);
+});

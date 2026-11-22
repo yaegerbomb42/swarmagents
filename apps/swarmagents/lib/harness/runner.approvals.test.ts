@@ -243,3 +243,43 @@ test("legacy full-auto still asks for irreversible external actions", async () =
   assert.equal(outcome.exitCode, 0);
   assert.equal(events.filter((e) => e.type === "run.finished").length, 1);
 });
+
+
+test("deny halts the run and aborts the still-running VM child", async () => {
+  const fixture = [INIT, JSON.stringify({
+    type: "assistant",
+    message: { id: "m2", content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "echo ${API_KEY}" } }] },
+  })].join("\n") + "\n";
+  let abortSeen = false;
+  const vm: VmExec = {
+    async exec(_cmd, opts) {
+      opts?.onStdout?.(fixture);
+      await new Promise<void>((resolve) => {
+        if (opts?.signal?.aborted) {
+          abortSeen = true;
+          resolve();
+          return;
+        }
+        opts?.signal?.addEventListener(
+          "abort",
+          () => {
+            abortSeen = true;
+            resolve();
+          },
+          { once: true },
+        );
+      });
+      return { exitCode: 130 };
+    },
+  };
+  const runner = new ClaudeCodeRunner({ bin: "claude" });
+  const events: TelemetryEvent[] = [];
+
+  const outcome = await runner.run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+
+  assert.equal(abortSeen, true, "the denied run left the VM child running");
+  assert.equal(outcome.exitCode, 130);
+  const errors = events.filter((e) => e.type === "run.error");
+  assert.equal(errors.length, 1);
+  assert.match((errors[0] as Extract<TelemetryEvent, { type: "run.error" }>).message, /Halted by harness risk policy/);
+});

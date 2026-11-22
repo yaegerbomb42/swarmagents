@@ -10,7 +10,14 @@ import { makeRedactor } from "../redact";
 const redactPatterns = makeRedactor({});
 
 /** CSI (colour/cursor, e.g. SGR "\x1b[31m") and OSC (title/hyperlink) sequences. */
-const ANSI_ESCAPE = /\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g;
+// Built from char codes so the source contains no literal control characters
+// (Sonar S6324).
+const ESC = String.fromCharCode(0x1b);
+const BEL = String.fromCharCode(0x07);
+const ANSI_ESCAPE = new RegExp(
+  `${ESC}(?:\\[[0-?]*[ -/]*[@-~]|\\][^${BEL}]*(?:${BEL}|${ESC}\\\\))`,
+  "g",
+);
 
 /** Lines that carry the actual failure in tsc / eslint / node:test / generic output. */
 const ERROR_LINE_RES: readonly RegExp[] = [

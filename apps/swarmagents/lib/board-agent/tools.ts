@@ -67,7 +67,12 @@ const DIGEST_SECTION_LIMIT = 5;
 const MAX_USER_ID_LEN = 128;
 const MAX_OUTPUT_CHARS = 64 * 1024;
 const MAX_SCREENSHOT_BYTES = 4 * 1024 * 1024;
-const SCREENSHOT_PREFIX = "/tmp/swarm-desktop-frame-";
+// Screenshot captures go in a per-call directory inside the VM guest. S5443
+// is suppressed on the literal because the path names the guest filesystem,
+// not the host: the directory is created 0o700 before anything is written, the
+// name embeds a random UUID, and the tree is removed after the read, so no
+// other guest process can pre-link or re-read the capture.
+const SCREENSHOT_ROOT = "/tmp/swarm-desktop-frame-"; // NOSONAR
 
 // The existing SwarmBoard is shared by its authenticated users: SwarmTask
 // has no user owner. Conversation history and VM runs are private instead.
@@ -847,7 +852,7 @@ export async function vmScreenshot(
   }
 
   const vm = resolveVm(deps);
-  const screenshotPath = `${SCREENSHOT_PREFIX}${randomUUID()}.png`;
+  const frameDir = `${SCREENSHOT_ROOT}${randomUUID()}`;
   try {
     const state = await vm.status(owner);
     if (state.status !== "running") {
@@ -858,9 +863,22 @@ export async function vmScreenshot(
       };
     }
 
+    const setup = await vm.exec(
+      owner,
+      ["sh", "-c", `umask 077; mkdir -- "${frameDir}"`],
+    );
+    if (setup.exitCode !== 0) {
+      return {
+        ok: false,
+        error: "capture_failed",
+        summary: "Desktop screenshot capture failed.",
+      };
+    }
+
+    const framePath = `${frameDir}/frame.png`;
     const exec = await vm.exec(
       owner,
-      ["scrot", "-o", screenshotPath],
+      ["scrot", "-o", framePath],
       { env: { DISPLAY: DESKTOP_DISPLAY } },
     );
     if (exec.exitCode !== 0) {
@@ -873,9 +891,9 @@ export async function vmScreenshot(
 
     let file: { content: Buffer; size: number; truncated: boolean };
     try {
-      file = await vm.readFileBytes(owner, screenshotPath, MAX_SCREENSHOT_BYTES);
+      file = await vm.readFileBytes(owner, `${frameDir}/frame.png`, MAX_SCREENSHOT_BYTES);
     } finally {
-      await vm.exec(owner, ["rm", "-f", "--", screenshotPath]).catch(() => undefined);
+      await vm.exec(owner, ["rm", "-rf", "--", frameDir]).catch(() => undefined);
     }
 
     if (file.content.byteLength === 0) {
@@ -896,7 +914,7 @@ export async function vmScreenshot(
       },
     };
   } catch (err) {
-    return mapVmFileOrPathError(err, screenshotPath);
+    return mapVmFileOrPathError(err, frameDir);
   }
 }
 

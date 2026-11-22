@@ -14,6 +14,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { safeNextPath, sessionCookieOptions, signSession, SESSION_COOKIE } from "../../../lib/auth";
 import { verifyLocalUser, isScryptBusyError, type LocalUser } from "../../../lib/users";
 import { recordAudit, auditLoginFailureTarget } from "../../../lib/audit";
+import { JsonBodyError, readJsonBody } from "../../../lib/http";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -22,22 +23,6 @@ const MAX_BODY_SIZE = 16 * 1024;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-async function readBody(req: NextRequest): Promise<Record<string, unknown> | null> {
-  let text: string;
-  try {
-    text = await req.text();
-  } catch {
-    return null;
-  }
-  if (text.length > MAX_BODY_SIZE) return null;
-  try {
-    const body: unknown = JSON.parse(text);
-    return isRecord(body) ? body : null;
-  } catch {
-    return null;
-  }
 }
 
 /** Sign-in responses carry (or refuse) a session cookie: never cache them. */
@@ -51,8 +36,19 @@ export async function POST(req: NextRequest): Promise<Response> {
     );
   }
 
-  const body = await readBody(req);
-  if (!body) {
+  // Bounded, streaming body read: an oversized body is rejected with 413
+  // before it is buffered; anything else unparseable stays a 400, as before.
+  let body: Record<string, unknown>;
+  try {
+    const value = await readJsonBody(req, MAX_BODY_SIZE);
+    if (!isRecord(value)) {
+      return NextResponse.json({ error: "Invalid request body." }, { status: 400, headers: NO_STORE });
+    }
+    body = value;
+  } catch (err) {
+    if (err instanceof JsonBodyError && err.status === 413) {
+      return NextResponse.json({ error: "Request body too large." }, { status: 413, headers: NO_STORE });
+    }
     return NextResponse.json({ error: "Invalid request body." }, { status: 400, headers: NO_STORE });
   }
 

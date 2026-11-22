@@ -363,3 +363,43 @@ test("computers API: requestOrigin multi-hop x-forwarded-proto, fallback allowed
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("computers API: oversized and multibyte bodies are rejected with 413", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-computers-api-"));
+  configureComputersStoreDir(dir);
+  try {
+    // Pair route: 16 KiB cap. An oversized body is a 413, not a 404.
+    const big = JSON.stringify({ code: "AAAAA-AAAAA", pad: "x".repeat(17 * 1024) });
+    assert.equal(
+      (await redeemRoute(request("/api/computers/pair", { method: "POST", body: big }, null))).status,
+      413,
+    );
+    // Multibyte: under the cap in characters, over it in UTF-8 bytes — the
+    // old text.length check would have let this through to a 404.
+    const multi = JSON.stringify({ code: "AAAAA-AAAAA", pad: "é".repeat(9000) });
+    assert.ok(multi.length < 16 * 1024);
+    assert.ok(Buffer.byteLength(multi, "utf8") > 16 * 1024);
+    assert.equal(
+      (await redeemRoute(request("/api/computers/pair", { method: "POST", body: multi }, null))).status,
+      413,
+    );
+
+    // Rename route: 8 KiB cap (the id must be well-formed to reach the parse).
+    const bigRename = JSON.stringify({ name: "x".repeat(9 * 1024) });
+    const renamed = await renameRoute(
+      request("/api/computers/cmp_0123456789abcdef0123456789abcdef", {
+        method: "PATCH",
+        body: bigRename,
+      }),
+      ctx("cmp_0123456789abcdef0123456789abcdef"),
+    );
+    assert.equal(renamed.status, 413);
+
+    // The pairing-code POST still accepts an empty body (no body at all),
+    // which exercises the no-stream fallback of the bounded reader.
+    assert.equal((await pairingRoute(request("/api/computers", { method: "POST" }))).status, 200);
+  } finally {
+    configureComputersStoreDir("");
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

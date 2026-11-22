@@ -18,7 +18,7 @@
 
 import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../lib/auth";
-import { noStoreJson } from "../../../../lib/http";
+import { JsonBodyError, noStoreJson, readBoundedText } from "../../../../lib/http";
 import { recordAudit } from "../../../../lib/audit";
 import { getByocHub } from "../../../../lib/byoc/hub";
 import { getByocTokenStore } from "../../../../lib/byoc/tokens";
@@ -45,14 +45,16 @@ export async function POST(req: NextRequest) {
 
   let name = "";
   // Empty body is allowed (name optional). Non-empty must be valid JSON.
+  // The read is streaming and byte-capped, so an oversized body is rejected
+  // with 413 before it is buffered.
   let rawText = "";
   try {
-    rawText = await req.text();
-  } catch {
+    rawText = await readBoundedText(req, MAX_PAIR_BODY_BYTES);
+  } catch (err) {
+    if (err instanceof JsonBodyError && err.status === 413) {
+      return noStoreJson({ error: "Request body is too large." }, { status: 413 });
+    }
     return noStoreJson({ error: "Could not read the request body." }, { status: 400 });
-  }
-  if (Buffer.byteLength(rawText, "utf8") > MAX_PAIR_BODY_BYTES) {
-    return noStoreJson({ error: "Request body is too large." }, { status: 413 });
   }
   if (rawText.trim().length > 0) {
     let body: unknown;

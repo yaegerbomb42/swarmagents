@@ -19,6 +19,7 @@ import {
   createPairingCode,
   listComputers,
 } from "../../../lib/computers";
+import { JsonBodyError, readBoundedText } from "../../../lib/http";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -120,15 +121,17 @@ export async function POST(req: NextRequest) {
   if (!user) return unauthorized();
 
   // The body is optional today (an empty POST creates a code), but still cap
-  // and validate it so a malformed request gets a clean 400.
+  // and validate it so a malformed request gets a clean 400. The read is
+  // streaming and byte-capped, so an oversized body is rejected with 413
+  // before it is buffered.
   let body: unknown = {};
   try {
-    const text = await req.text();
-    if (text.length > MAX_BODY_SIZE) {
+    const text = await readBoundedText(req, MAX_BODY_SIZE);
+    body = text.trim() ? JSON.parse(text) : {};
+  } catch (err) {
+    if (err instanceof JsonBodyError && err.status === 413) {
       return NextResponse.json({ error: "Request body too large." }, { status: 413, headers: NO_STORE });
     }
-    body = text.trim() ? JSON.parse(text) : {};
-  } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400, headers: NO_STORE });
   }
   if (!body || typeof body !== "object" || Array.isArray(body)) {

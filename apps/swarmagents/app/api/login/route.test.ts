@@ -180,3 +180,26 @@ test("POST /api/login writes a sanitized login.failure audit target", async () =
   }
 });
 
+test("POST /api/login rejects an oversized body with 413", async () => {
+  const res = await POST(
+    request(JSON.stringify({ email: "alice@example.com", password: "x", pad: "x".repeat(17 * 1024) })),
+  );
+  assert.equal(res.status, 413);
+  assert.deepEqual(await res.json(), { error: "Request body too large." });
+});
+
+test("POST /api/login measures the body cap in UTF-8 bytes, not characters", async () => {
+  // "é" is 2 bytes but 1 char: this body is under the 16 KiB cap in
+  // characters yet over it in bytes, so the old text.length check would have
+  // let it through to a 401. The byte cap must fire with a 413.
+  const over = JSON.stringify({ email: "alice@example.com", password: "x", pad: "é".repeat(9000) });
+  assert.ok(over.length < 16 * 1024, `chars ${over.length}`);
+  assert.ok(Buffer.byteLength(over, "utf8") > 16 * 1024);
+  assert.equal((await POST(request(over))).status, 413);
+
+  // And a body that fits in bytes still reaches the credential check.
+  const fits = JSON.stringify({ email: "alice@example.com", password: "wrong", pad: "é".repeat(7000) });
+  assert.ok(Buffer.byteLength(fits, "utf8") < 16 * 1024);
+  assert.equal((await POST(request(fits))).status, 401);
+});
+

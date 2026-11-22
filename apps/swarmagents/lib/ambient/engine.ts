@@ -101,11 +101,21 @@ export class AmbientEngine {
     return timingSafeEqual(rule.webhookSecret, presented);
   }
 
+  /** Secret check without firing. Exists so the HTTP route can reject an
+   *  unauthenticated caller before reading (and spending) the request body. */
+  checkWebhook(userId: string, id: string, secret: string): "ok" | "invalid id" | "not found" | "unauthorized" {
+    if (!ambientIdsOk(userId, id)) return "invalid id";
+    const rule = getRule(userId, id);
+    if (!rule || rule.kind !== "webhook") return "not found";
+    if (!this.webhookSecretOk(rule, secret)) return "unauthorized";
+    return "ok";
+  }
+
   async acceptWebhook(userId: string, id: string, secret: string): Promise<FireResult> {
-    if (!ambientIdsOk(userId, id)) return { fired: false, error: "invalid id" };
+    const check = this.checkWebhook(userId, id, secret);
+    if (check !== "ok") return { fired: false, error: check };
     const rule = getRule(userId, id);
     if (!rule || rule.kind !== "webhook") return { fired: false, error: "not found" };
-    if (!this.webhookSecretOk(rule, secret)) return { fired: false, error: "unauthorized" };
     return this.fire(rule, `webhook /hooks/${userId}/${id}`);
   }
 

@@ -1111,8 +1111,10 @@ export class ClaudeCodeRunner {
     // never interpolated into a shell string.
     const role = effective.rolePhase;
     if (role && role.toolsDisabled !== true) {
-      argv.push("--allowedTools", ...role.allowedTools);
-      argv.push("--mcp-config", role.mcpConfigPath);
+      // Empty values must not produce a bare flag: the CLI would consume the
+      // following flag name as the value (e.g. "--mcp-config" as a tool).
+      if (role.allowedTools.length > 0) argv.push("--allowedTools", ...role.allowedTools);
+      if (role.mcpConfigPath) argv.push("--mcp-config", role.mcpConfigPath);
     }
     const appended = this.appendedSystemPrompt(effective, role?.appendSystemPrompt, mode, (applied) => {
       packer = applied;

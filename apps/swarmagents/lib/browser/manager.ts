@@ -102,7 +102,7 @@ interface RunSession {
   url?: string;
   title?: string;
   pendingChange: boolean;
-  lastActivityAt: number;
+  lastUserActivityAt: number;
   lastCaptureAt: number;
   heartbeat: ReturnType<typeof setInterval>;
   unsubscribe: () => void;
@@ -186,20 +186,28 @@ export class BrowserManager implements BrowserControl {
   private browserPromise: Promise<Browser> | null = null;
   /** Cap on concurrent sessions (bounds Chromium context/tab memory). */
   private readonly maxSessions: number;
+  /** Chromium launcher (injectable in tests). */
+  private readonly launch: (options: Parameters<typeof chromium.launch>[0]) => Promise<Browser>;
 
   constructor(
-    options: { bus?: TelemetryBus; lookup?: (host: string) => Promise<string[]>; maxSessions?: number } = {},
+    options: {
+      bus?: TelemetryBus;
+      lookup?: (host: string) => Promise<string[]>;
+      maxSessions?: number;
+      launch?: (options: Parameters<typeof chromium.launch>[0]) => Promise<Browser>;
+    } = {},
   ) {
     this.bus = options.bus ?? telemetryBus;
     this.lookup = options.lookup ?? lookupAddresses;
     this.maxSessions = options.maxSessions ?? MAX_SESSIONS;
+    this.launch = options.launch ?? ((opts) => chromium.launch(opts));
   }
 
   // --- lifecycle -----------------------------------------------------------
 
-  private browser(): Promise<Browser> {
+  protected browser(): Promise<Browser> {
     if (!this.browserPromise) {
-      this.browserPromise = chromium.launch({
+      const pending = this.launch({
         headless: true,
         executablePath: executablePath(),
         // The server runs in a container (often as root, no SUID sandbox);
@@ -208,6 +216,18 @@ export class BrowserManager implements BrowserControl {
         // inside this platform and never given host credentials.
         args: ["--no-sandbox", "--disable-dev-shm-usage"],
       });
+      // A failed launch (or a mid-run crash/disconnect) must not poison all
+      // later sessions: clear the cached promise so the next call launches a
+      // fresh Chromium instead of reusing the dead one.
+      pending.catch(() => {
+        if (this.browserPromise === pending) this.browserPromise = null;
+      });
+      pending.then((browser) => {
+        browser.on("disconnected", () => {
+          if (this.browserPromise === pending) this.browserPromise = null;
+        });
+      }).catch(() => {});
+      this.browserPromise = pending;
     }
     return this.browserPromise;
   }
@@ -222,7 +242,7 @@ export class BrowserManager implements BrowserControl {
       frame: null,
       frameSeq: 0,
       pendingChange: true,
-      lastActivityAt: Date.now(),
+      lastUserActivityAt: Date.now(),
       lastCaptureAt: 0,
       captureInFlight: null as Promise<BrowserFrame | null> | null,
       diagnostics: [] as BrowserDiagnosticEntry[],
@@ -231,11 +251,11 @@ export class BrowserManager implements BrowserControl {
     // Any browser activity marks the run as needing a fresh frame.
     page.on("load", () => {
       session.pendingChange = true;
-      session.lastActivityAt = Date.now();
+      session.lastUserActivityAt = Date.now();
     });
     page.on("requestfinished", () => {
       session.pendingChange = true;
-      session.lastActivityAt = Date.now();
+      session.lastUserActivityAt = Date.now();
     });
 
     this.attachDiagnostics(page, session);
@@ -368,7 +388,7 @@ export class BrowserManager implements BrowserControl {
       if (!pending) continue;
       try {
         const session = await pending;
-        if (now - session.lastActivityAt > SESSION_IDLE_MS) {
+        if (now - session.lastUserActivityAt > SESSION_IDLE_MS) {
           await this.close(runId);
           closed += 1;
         }
@@ -429,7 +449,7 @@ export class BrowserManager implements BrowserControl {
     session.url = finalUrl;
     session.title = title;
     session.pendingChange = true;
-    session.lastActivityAt = Date.now();
+    session.lastUserActivityAt = Date.now();
     busPublish(this.bus, runId, "browser.navigated", { url: finalUrl, title });
     await this.captureFrame(runId, session, true);
     return { ok: true, url: finalUrl, title };
@@ -484,7 +504,7 @@ export class BrowserManager implements BrowserControl {
       return fail(`Action failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     session.pendingChange = true;
-    session.lastActivityAt = Date.now();
+    session.lastUserActivityAt = Date.now();
 
     const after = await this.verifyCurrentUrl(session);
     if (!after.ok) return fail(after.reason);
@@ -521,7 +541,7 @@ export class BrowserManager implements BrowserControl {
     } catch (error) {
       return fail(`Evaluation failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    session.lastActivityAt = Date.now();
+    session.lastUserActivityAt = Date.now();
 
     const after = await this.verifyCurrentUrl(session);
     if (!after.ok) return fail(after.reason);
@@ -615,7 +635,10 @@ export class BrowserManager implements BrowserControl {
       };
       session.pendingChange = false;
       session.lastCaptureAt = now;
-      session.lastActivityAt = now;
+      // Only explicit/forced captures (navigation, screenshot, actions,
+      // evaluate) count as user activity. Heartbeat captures refresh the
+      // frame but must not keep an idle session alive.
+      if (force) session.lastUserActivityAt = now;
       busPublish(this.bus, runId, "browser.frame", {
         frameId: session.frame.frameId,
         width: session.frame.width,

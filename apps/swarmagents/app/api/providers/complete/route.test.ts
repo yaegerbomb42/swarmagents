@@ -2,6 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { NextRequest } from "next/server";
 import { POST } from "./route";
+import { resetBuckets } from "../../../../lib/rate-limit";
+
+test.beforeEach(() => {
+  resetBuckets();
+});
 
 const antKey = "sk-test-ant-proxy-alpha";
 const oaiKey = "sk-test-oai-proxy-beta";
@@ -148,4 +153,89 @@ test("redacts keys when all providers fail -> 502, no key in body", async () => 
   assert.equal(serialized.includes(antKey), false);
   assert.equal(serialized.includes(oaiKey), false);
   assert.match(String(json.error), /all providers failed|redacted/i);
+});
+
+test("validates input: non-string system -> 400", async () => {
+  const res = await postBody({ messages: [userMessage], system: 42 });
+  assert.equal(res.status, 400);
+  assert.match(String((await res.json()).error), /system must be a string/);
+  assert.equal((res.headers.get("cache-control") ?? "").toLowerCase(), "no-store");
+});
+
+test("validates input: non-string model -> 400", async () => {
+  const res = await postBody({ messages: [userMessage], model: 42 });
+  assert.equal(res.status, 400);
+  assert.match(String((await res.json()).error), /model must be a non-empty string/);
+});
+
+test("validates input: empty or whitespace model -> 400", async () => {
+  const empty = await postBody({ messages: [userMessage], model: "" });
+  assert.equal(empty.status, 400);
+  const blank = await postBody({ messages: [userMessage], model: "   " });
+  assert.equal(blank.status, 400);
+});
+
+test("a pre-aborted request returns 499 and is uncacheable", async () => {
+  globalThis.fetch = ((async () => jsonResponse(anthropicOk("never"))) as unknown as typeof fetch);
+  const controller = new AbortController();
+  controller.abort();
+  const res = await POST(
+    new NextRequest("http://localhost/api/providers/complete", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-swarm-user": "local",
+      },
+      body: JSON.stringify({ messages: [userMessage] }),
+      signal: controller.signal,
+    }),
+  );
+  assert.equal(res.status, 499);
+  assert.equal((res.headers.get("cache-control") ?? "").toLowerCase(), "no-store");
+});
+
+test("per-user completion rate limit trips at 60/min with 429, Retry-After and no-store", async () => {
+  // Each invalid body still consumes a token: the check runs before validation.
+  for (let i = 0; i < 60; i++) {
+    const res = await postBody({});
+    assert.equal(res.status, 400, `request ${i + 1} should fail validation, not rate-limit`);
+  }
+  const limited = await postBody({ messages: [userMessage] });
+  assert.equal(limited.status, 429);
+  assert.ok(Number(limited.headers.get("retry-after") ?? "0") > 0, "expected a Retry-After");
+  assert.equal((limited.headers.get("cache-control") ?? "").toLowerCase(), "no-store");
+
+  // The budget is per user: another account is unaffected.
+  const other = await POST(
+    new NextRequest("http://localhost/api/providers/complete", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-swarm-user": "alice",
+      },
+      body: JSON.stringify({}),
+    }),
+  );
+  assert.equal(other.status, 400);
+});
+
+test("every completion response carries Cache-Control: no-store", async () => {
+  const signedOut = await POST(
+    new NextRequest("http://localhost/api/providers/complete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [userMessage] }),
+    }),
+  );
+  assert.equal(signedOut.status, 401);
+  assert.equal((signedOut.headers.get("cache-control") ?? "").toLowerCase(), "no-store");
+
+  const tooLarge = await postBody({ messages: [{ role: "user", content: "x".repeat(300_000) }] });
+  assert.equal(tooLarge.status, 413);
+  assert.equal((tooLarge.headers.get("cache-control") ?? "").toLowerCase(), "no-store");
+
+  globalThis.fetch = ((async () => jsonResponse(anthropicOk("hello back"))) as unknown as typeof fetch);
+  const ok = await postBody({ messages: [userMessage], tier: "balanced" });
+  assert.equal(ok.status, 200);
+  assert.equal((ok.headers.get("cache-control") ?? "").toLowerCase(), "no-store");
 });

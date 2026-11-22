@@ -21,6 +21,8 @@ import { POST as HOOK } from "./hooks/[userId]/[id]/route";
 import { GET as GARDENER_GET, POST as GARDENER_POST } from "./gardener/route";
 import { GET as PROVIDERS_GET, POST as PROVIDERS_POST } from "./providers/route";
 import { GET as PROVIDER_GET } from "./providers/[id]/route";
+import { POST as PROVIDER_TEST_POST } from "./providers/[id]/test/route";
+import { POST as COMPLETE_POST } from "./providers/complete/route";
 import { GET as PROJECTS_GET, POST as PROJECTS_POST } from "./projects/route";
 import {
   DELETE as PROJECT_DELETE,
@@ -36,7 +38,7 @@ import { configureStorePaths } from "../..//lib/board/store";
 import { configureAmbientStore } from "../../lib/ambient/store";
 import { setAmbientEngineForTesting } from "../../lib/ambient/runtime";
 import { configureGardenerDir } from "../../lib/gardener/store";
-import { configureProviderStorePaths } from "../../lib/providers/store";
+import { configureProviderStorePaths, saveProvider } from "../../lib/providers/store";
 import { configureUserPaths, signupLocalUser } from "../../lib/users";
 import type { AmbientEngine } from "../../lib/ambient/engine";
 
@@ -389,4 +391,124 @@ test("gardener unpin and removeProposal are uncacheable, including their errors"
   );
   assert.equal(badPath.status, 400);
   assertNoStore(badPath, "gardener unpin 400");
+});
+
+test("the provider completion route is uncacheable on success and on every error", async () => {
+  const signedOut = await COMPLETE_POST(
+    userRequest("/api/providers/complete", {
+      method: "POST",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      user: null,
+    }),
+  );
+  assert.equal(signedOut.status, 401);
+  assertNoStore(signedOut, "complete 401");
+
+  const badJson = await COMPLETE_POST(
+    userRequest("/api/providers/complete", { method: "POST", body: "{oops" }),
+  );
+  assert.equal(badJson.status, 400);
+  assertNoStore(badJson, "complete 400 invalid JSON");
+
+  const badBody = await COMPLETE_POST(
+    userRequest("/api/providers/complete", { method: "POST", body: {} }),
+  );
+  assert.equal(badBody.status, 400);
+  assertNoStore(badBody, "complete 400 validation");
+
+  const tooLarge = await COMPLETE_POST(
+    userRequest("/api/providers/complete", {
+      method: "POST",
+      body: { messages: [{ role: "user", content: "x".repeat(300_000) }] },
+    }),
+  );
+  assert.equal(tooLarge.status, 413);
+  assertNoStore(tooLarge, "complete 413");
+
+  // Success and provider failure need the local operator's host keys.
+  const savedKey = process.env.SWARM_KEYS_ANTHROPIC;
+  process.env.SWARM_KEYS_ANTHROPIC = "sk-test-no-store-anthropic";
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          content: [{ type: "text", text: "hello back" }],
+          usage: { input_tokens: 3, output_tokens: 4 },
+          model: "claude-sonnet-4-5",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as typeof fetch;
+    const ok = await COMPLETE_POST(
+      userRequest("/api/providers/complete", {
+        method: "POST",
+        body: { messages: [{ role: "user", content: "hi" }] },
+        user: "local",
+      }),
+    );
+    assert.equal(ok.status, 200);
+    assertNoStore(ok, "complete 200");
+
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: { message: "upstream boom" } }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    const failed = await COMPLETE_POST(
+      userRequest("/api/providers/complete", {
+        method: "POST",
+        body: { messages: [{ role: "user", content: "hi" }] },
+        user: "local",
+      }),
+    );
+    assert.equal(failed.status, 502);
+    assertNoStore(failed, "complete 502");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (savedKey === undefined) delete process.env.SWARM_KEYS_ANTHROPIC;
+    else process.env.SWARM_KEYS_ANTHROPIC = savedKey;
+  }
+
+  // A disconnected client aborts the completion: 499, still uncacheable.
+  const controller = new AbortController();
+  controller.abort();
+  const aborted = await COMPLETE_POST(
+    new NextRequest("http://localhost/api/providers/complete", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-swarm-user": "local" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+      signal: controller.signal,
+    }),
+  );
+  assert.equal(aborted.status, 499);
+  assertNoStore(aborted, "complete 499");
+});
+
+test("the provider test route is uncacheable on success and on a missing provider", async () => {
+  saveProvider("alice", { id: "openai", apiKey: "sk-test-no-store-probe" });
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "pong" } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+          model: "fast",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as typeof fetch;
+    const ok = await PROVIDER_TEST_POST(userRequest("/api/providers/openai/test", { method: "POST" }), {
+      params: Promise.resolve({ id: "openai" }),
+    });
+    assert.equal(ok.status, 200);
+    assertNoStore(ok, "providers/[id]/test 200");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const missing = await PROVIDER_TEST_POST(userRequest("/api/providers/nope/test", { method: "POST" }), {
+    params: Promise.resolve({ id: "nope" }),
+  });
+  assert.equal(missing.status, 404);
+  assertNoStore(missing, "providers/[id]/test 404");
 });

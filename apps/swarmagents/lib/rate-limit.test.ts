@@ -8,6 +8,8 @@ import {
   rateLimitKey,
   rateLimitCheck,
   rateLimitResponse,
+  checkCompleteRateLimit,
+  checkProviderProbeRateLimit,
   resetBuckets,
   resetRateLimitWarnings,
   UNIDENTIFIED_KEY,
@@ -342,4 +344,26 @@ test("rateLimitCheck throttles public share pages with their own bucket", () => 
   assert.ok(blocked!.retryAfter > 0);
   // Another IP still gets its own budget.
   assert.equal(rateLimitCheck("/share/" + "a".repeat(48), "other-key")!.allowed, true);
+});
+
+test("checkCompleteRateLimit allows 60/min per user, independently", () => {
+  resetBuckets();
+  for (let i = 0; i < 60; i++) {
+    assert.equal(checkCompleteRateLimit("alice").allowed, true);
+  }
+  const denied = checkCompleteRateLimit("alice");
+  assert.equal(denied.allowed, false);
+  assert.ok(denied.retryAfter > 0);
+  assert.equal(checkCompleteRateLimit("bob").allowed, true, "budgets are per user");
+});
+
+test("checkProviderProbeRateLimit allows 30/min per user, independently", () => {
+  resetBuckets();
+  for (let i = 0; i < 30; i++) {
+    assert.equal(checkProviderProbeRateLimit("alice").allowed, true);
+  }
+  const denied = checkProviderProbeRateLimit("alice");
+  assert.equal(denied.allowed, false);
+  assert.ok(denied.retryAfter > 0);
+  assert.equal(checkProviderProbeRateLimit("bob").allowed, true, "budgets are per user");
 });

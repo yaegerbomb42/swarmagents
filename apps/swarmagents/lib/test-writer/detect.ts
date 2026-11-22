@@ -39,12 +39,26 @@ function exists(file: string): boolean {
   }
 }
 
-function findUp(startDir: string, names: string[], limit = 8): string | null {
+function safeRead(file: string): string {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+interface Marker {
+  path: string;
+  /** Directory levels between `startDir` and the marker's directory (0 = same dir). */
+  distance: number;
+}
+
+function findUpInfo(startDir: string, names: string[], limit = 8): Marker | null {
   let dir = path.resolve(startDir);
   for (let i = 0; i < limit; i++) {
     for (const name of names) {
       const candidate = path.join(dir, name);
-      if (exists(candidate)) return candidate;
+      if (exists(candidate)) return { path: candidate, distance: i };
     }
     const parent = path.dirname(dir);
     if (parent === dir) break;
@@ -58,123 +72,214 @@ function hasDep(pkg: Pkg | null, name: string): boolean {
   return Boolean(pkg.dependencies?.[name] || pkg.devDependencies?.[name]);
 }
 
+/** Markers close to the target weigh more than ones many directories above it. */
+function proximityWeight(marker: Marker | null): number {
+  if (!marker) return 0;
+  // Gentle decay: distance 0 → 1.0, distance 1 → 0.95, … floor at 0.5.
+  return Math.max(0.5, 1 - 0.05 * marker.distance);
+}
+
+interface Candidate {
+  framework: TestFramework;
+  score: number;
+  reasons: string[];
+  testCommand: string[];
+  coverageCommand: string[];
+}
+
+/** Scores below this resolve to "unknown". */
+const MIN_CONFIDENCE = 0.4;
+
 function scoreFramework(targetPath: string): FrameworkDetection {
   const abs = path.resolve(targetPath);
   const dir = fs.existsSync(abs) && fs.statSync(abs).isDirectory() ? abs : path.dirname(abs);
-  const reasons: string[] = [];
+  const ext = path.extname(abs).toLowerCase();
 
-  const pkgPath = findUp(dir, ["package.json"]);
-  const pkg = pkgPath ? readJson<Pkg>(pkgPath) : null;
-  const root = pkgPath ? path.dirname(pkgPath) : dir;
-
-  const pyproject = findUp(dir, ["pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg", "requirements.txt"]);
-  const goMod = findUp(dir, ["go.mod"]);
-  const vitestConfig = findUp(dir, ["vitest.config.ts", "vitest.config.js", "vitest.config.mts", "vitest.config.mjs", "vite.config.ts", "vite.config.js"]);
-  const jestConfig = findUp(dir, ["jest.config.ts", "jest.config.js", "jest.config.mjs", "jest.config.cjs", "jest.config.json"]);
-
-  // Python / pytest
-  if (pyproject) {
-    let score = 0.7;
-    const base = path.basename(pyproject);
-    if (base.startsWith("pytest") || base === "tox.ini") { score = 0.95; reasons.push(base); }
-    if (base === "pyproject.toml") {
-      try {
-        const txt = fs.readFileSync(pyproject, "utf8");
-        if (/\[tool\.pytest|pytest/i.test(txt)) { score = 0.95; reasons.push("pyproject pytest config"); }
-        else reasons.push("pyproject.toml");
-      } catch { reasons.push("pyproject.toml"); }
-    } else {
-      reasons.push(base);
-    }
-    if (exists(path.join(dir, "conftest.py")) || exists(path.join(root, "conftest.py"))) { score = Math.max(score, 0.9); reasons.push("conftest.py"); }
-    if (/\.py$/i.test(abs)) reasons.push("python target");
-    if (/requirements\.txt$/i.test(base)) {
-      try {
-        const txt = fs.readFileSync(pyproject, "utf8");
-        if (!/pytest/i.test(txt) && !exists(path.join(root, "conftest.py")) && !/\.py$/i.test(abs)) {
-          // weak signal only
-        }
-      } catch {}
-    }
-    if (score >= 0.7) {
-      return {
-        framework: "pytest",
-        confidence: Math.min(1, score),
-        reasons,
-        testCommand: ["python3", "-m", "pytest", "-q"],
-        coverageCommand: ["python3", "-m", "pytest", "--cov", "--cov-report=term-missing", "-q"],
-      };
-    }
-  }
-
-  // Go
-  if (goMod || /\.go$/i.test(abs)) {
-    const r = ["go.mod or .go target"];
-    return {
-      framework: "go test",
-      confidence: goMod ? 0.98 : 0.85,
-      reasons: r,
-      testCommand: ["go", "test", "./..."],
-      coverageCommand: ["go", "test", "./...", "-coverprofile=coverage.out", "-covermode=atomic"],
-    };
-  }
-
-  // JS/TS via package.json signals
-  const vitestDep = hasDep(pkg, "vitest");
-  const jestDep = hasDep(pkg, "jest") || hasDep(pkg, "@jest/globals") || hasDep(pkg, "ts-jest");
+  const pkgM = findUpInfo(dir, ["package.json"]);
+  const pkg = pkgM ? readJson<Pkg>(pkgM.path) : null;
   const scripts = pkg?.scripts ?? {};
   const scriptText = Object.values(scripts).join(" \n ");
 
-  if (vitestDep || (vitestConfig && !jestDep) || /\bvitest\b/i.test(scriptText)) {
-    if (vitestDep) reasons.push("vitest dependency");
-    if (vitestConfig) reasons.push(path.basename(vitestConfig));
-    if (/\bvitest\b/i.test(scriptText)) reasons.push("vitest script");
-    return {
+  const pyM = findUpInfo(dir, ["pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg", "requirements.txt"]);
+  const conftestM = findUpInfo(dir, ["conftest.py"]);
+  const goM = findUpInfo(dir, ["go.mod"]);
+  const vitestConfigM = findUpInfo(dir, ["vitest.config.ts", "vitest.config.js", "vitest.config.mts", "vitest.config.mjs"]);
+  const viteM = findUpInfo(dir, ["vite.config.ts", "vite.config.js"]);
+  const jestConfigM = findUpInfo(dir, ["jest.config.ts", "jest.config.js", "jest.config.mjs", "jest.config.cjs", "jest.config.json"]);
+
+  const candidates: Candidate[] = [];
+
+  // ---- pytest ----
+  {
+    let score = 0;
+    const reasons: string[] = [];
+    if (pyM) {
+      const name = path.basename(pyM.path);
+      const w = proximityWeight(pyM);
+      if (name === "pyproject.toml") {
+        if (/\[tool\.pytest|pytest/i.test(safeRead(pyM.path))) {
+          score = Math.max(score, 0.95 * w);
+          reasons.push("pyproject pytest config");
+        } else {
+          score = Math.max(score, 0.6 * w);
+          reasons.push("pyproject.toml");
+        }
+      } else if (name === "pytest.ini" || name === "tox.ini") {
+        score = Math.max(score, 0.95 * w);
+        reasons.push(name);
+      } else if (name === "setup.cfg") {
+        if (/\[tool:pytest|pytest/i.test(safeRead(pyM.path))) {
+          score = Math.max(score, 0.9 * w);
+          reasons.push("setup.cfg pytest config");
+        } else {
+          score = Math.max(score, 0.4 * w);
+          reasons.push(name);
+        }
+      } else {
+        // requirements.txt: only a real pytest signal, never the default.
+        if (/pytest/i.test(safeRead(pyM.path))) {
+          score = Math.max(score, 0.8 * w);
+          reasons.push("requirements.txt lists pytest");
+        } else {
+          score = Math.max(score, 0.25 * w);
+          reasons.push("requirements.txt (weak)");
+        }
+      }
+    }
+    if (conftestM) {
+      score = Math.max(score, 0.75 * proximityWeight(conftestM));
+      reasons.push("conftest.py");
+    }
+    if (ext === ".py") {
+      score = Math.max(score, 0.85);
+      reasons.push("python target");
+    }
+    candidates.push({
+      framework: "pytest",
+      score,
+      reasons,
+      testCommand: ["python3", "-m", "pytest", "-q"],
+      coverageCommand: ["python3", "-m", "pytest", "--cov", "--cov-report=term-missing", "-q"],
+    });
+  }
+
+  // ---- go ----
+  {
+    let score = 0;
+    const reasons: string[] = [];
+    if (goM) {
+      score = Math.max(score, 0.95 * proximityWeight(goM));
+      reasons.push("go.mod");
+    }
+    if (ext === ".go") {
+      score = Math.max(score, 0.85);
+      reasons.push("go target");
+    }
+    candidates.push({
+      framework: "go test",
+      score,
+      reasons,
+      testCommand: ["go", "test", "./..."],
+      coverageCommand: ["go", "test", "./...", "-coverprofile=coverage.out", "-covermode=atomic"],
+    });
+  }
+
+  // ---- vitest ----
+  {
+    let score = 0;
+    const reasons: string[] = [];
+    const vitestDep = hasDep(pkg, "vitest");
+    if (vitestDep) {
+      score = Math.max(score, 0.95 * proximityWeight(pkgM));
+      reasons.push("vitest dependency");
+    }
+    if (vitestConfigM) {
+      score = Math.max(score, 0.92 * proximityWeight(vitestConfigM));
+      reasons.push(path.basename(vitestConfigM.path));
+    }
+    if (/\bvitest\b/i.test(scriptText)) {
+      score = Math.max(score, 0.85);
+      reasons.push("vitest script");
+    }
+    // A bare vite.config is not a Vitest signal unless it actually configures it.
+    if (viteM && !vitestDep && !vitestConfigM) {
+      if (/vitest|test\s*:/i.test(safeRead(viteM.path))) {
+        score = Math.max(score, 0.8 * proximityWeight(viteM));
+        reasons.push("vite.config references vitest");
+      }
+    }
+    candidates.push({
       framework: "vitest",
-      confidence: vitestDep ? 0.99 : vitestConfig ? 0.9 : 0.8,
+      score,
       reasons,
       testCommand: ["npx", "vitest", "run"],
       coverageCommand: ["npx", "vitest", "run", "--coverage"],
-    };
+    });
   }
 
-  if (jestDep || jestConfig || /\bjest\b/i.test(scriptText)) {
-    if (jestDep) reasons.push("jest dependency");
-    if (jestConfig) reasons.push(path.basename(jestConfig));
-    if (/\bjest\b/i.test(scriptText)) reasons.push("jest script");
-    return {
+  // ---- jest ----
+  {
+    let score = 0;
+    const reasons: string[] = [];
+    const jestDep = hasDep(pkg, "jest") || hasDep(pkg, "@jest/globals") || hasDep(pkg, "ts-jest");
+    if (jestDep) {
+      score = Math.max(score, 0.95 * proximityWeight(pkgM));
+      reasons.push("jest dependency");
+    }
+    if (jestConfigM) {
+      score = Math.max(score, 0.88 * proximityWeight(jestConfigM));
+      reasons.push(path.basename(jestConfigM.path));
+    }
+    if (/\bjest\b/i.test(scriptText)) {
+      score = Math.max(score, 0.85);
+      reasons.push("jest script");
+    }
+    candidates.push({
       framework: "jest",
-      confidence: jestDep ? 0.99 : jestConfig ? 0.9 : 0.8,
+      score,
       reasons,
       testCommand: ["npx", "jest", "--runInBand"],
       coverageCommand: ["npx", "jest", "--coverage", "--runInBand"],
-    };
+    });
   }
 
-  // node:test heuristics
-  if (pkg && (scripts.test?.includes("--test") || scripts["test:unit"]?.includes("--test"))) {
-    reasons.push("package script uses node --test");
-    return {
+  // ---- node:test ----
+  {
+    let score = 0;
+    const reasons: string[] = [];
+    const usesNodeTest = Boolean(pkg && (scripts.test?.includes("--test") || scripts["test:unit"]?.includes("--test")));
+    if (usesNodeTest) {
+      score = Math.max(score, 0.9 * proximityWeight(pkgM));
+      reasons.push("package script uses node --test");
+    }
+    if (/\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(abs) && pkgM) {
+      score = Math.max(score, 0.45 * proximityWeight(pkgM));
+      reasons.push("js/ts target with package.json");
+    }
+    candidates.push({
       framework: "node:test",
-      confidence: 0.9,
+      score,
       reasons,
       testCommand: scripts["test:unit"] ? ["npm", "run", "test:unit"] : ["npm", "test"],
       coverageCommand: ["npx", "c8", "--reporter=text", "--reporter=json-summary", "npm", "test"],
-    };
+    });
   }
 
-  // fallback by file extension/context
-  if (/\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(abs) && pkgPath) {
-    reasons.push("js/ts target with package.json");
+  let best = candidates[0];
+  for (const candidate of candidates) {
+    if (candidate.score > best.score) best = candidate;
+  }
+  if (best.score >= MIN_CONFIDENCE) {
     return {
-      framework: "node:test",
-      confidence: 0.45,
-      reasons,
-      testCommand: ["npm", "test"],
-      coverageCommand: ["npx", "c8", "--reporter=text", "--reporter=json-summary", "npm", "test"],
+      framework: best.framework,
+      confidence: Math.min(1, best.score),
+      reasons: best.reasons,
+      testCommand: best.testCommand,
+      coverageCommand: best.coverageCommand,
     };
   }
 
+  const reasons = candidates.flatMap((candidate) => candidate.reasons);
   return {
     framework: "unknown",
     confidence: 0,

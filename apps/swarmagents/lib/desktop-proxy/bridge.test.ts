@@ -622,6 +622,29 @@ test("bridge: a pong resets the keepalive watchdog", async () => {
   await waitUntilClosed(h, "ping-timeout", 3000);
 });
 
+test("bridge: socket end closes the bridge and clears the ping timer", async () => {
+  const h = makeBridge("view", { pingIntervalMs: 20 });
+  handshake(h);
+  assert.equal((h.bridge as any).pingTimer !== null, true);
+  h.client.emit("end");
+  await waitUntilClosed(h, "client-end", 1000);
+  assert.equal((h.bridge as any).pingTimer, null);
+  assert.equal(h.client.listenerCount("end"), 0);
+  assert.equal(h.client.listenerCount("data"), 0);
+  assert.equal(h.upstream.listenerCount("close"), 0);
+});
+
+test("bridge: socket close cleans up timers and listeners", async () => {
+  const h = makeBridge("control", { pingIntervalMs: 20 });
+  handshake(h);
+  h.upstream.emit("close");
+  await waitUntilClosed(h, "upstream-close", 1000);
+  assert.equal((h.bridge as any).pingTimer, null);
+  assert.equal((h.bridge as any).timeout, null);
+  assert.equal(h.upstream.listenerCount("end"), 0);
+  assert.equal(h.upstream.listenerCount("error"), 0);
+});
+
 test("bridge: browser backpressure resumes upstream on drain below 8 MB", () => {
   const h = makeBridge("control");
   handshake(h);

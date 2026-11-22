@@ -220,7 +220,19 @@ export async function POST(req: NextRequest) {
     fullAuto,
   });
   if (!result.accepted) {
-    if (result.error) return NextResponse.json({ error: result.error }, { status: 400 });
+    if (result.error) {
+      return NextResponse.json(
+        {
+          error: result.error,
+          // Server configuration refusals name the missing variables (names
+          // only, never values) so the UI can tell the operator what to set.
+          ...(result.missingEnv && result.missingEnv.length > 0
+            ? { missingEnv: result.missingEnv }
+            : {}),
+        },
+        { status: 400 },
+      );
+    }
     return NextResponse.json(
       { error: `Run queue is full (max ${result.limit ?? 3}). Wait for a run to finish.` },
       { status: 429 },

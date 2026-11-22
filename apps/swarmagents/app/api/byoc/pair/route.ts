@@ -10,8 +10,9 @@
  * only be revoked by the account that owns it.
  */
 
-import { NextResponse, type NextRequest } from "next/server";
+import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../lib/auth";
+import { noStoreJson } from "../../../../lib/http";
 import { getByocHub } from "../../../../lib/byoc/hub";
 import { getByocTokenStore } from "../../../../lib/byoc/tokens";
 
@@ -24,7 +25,7 @@ function caller(req: NextRequest): string | null {
 }
 
 function unauthorized() {
-  return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+  return noStoreJson({ error: "Sign in required." }, { status: 401 });
 }
 
 /** Create a one-time pairing code for the caller. */
@@ -45,7 +46,7 @@ export async function POST(req: NextRequest) {
 
   const store = getByocTokenStore();
   const { code, expiresAt } = store.createPairingCode(user);
-  return NextResponse.json(
+  return noStoreJson(
     {
       code,
       expiresAt,
@@ -81,7 +82,7 @@ export async function GET(req: NextRequest) {
     };
   });
 
-  return NextResponse.json({ nodes: devices }, { status: 200 });
+  return noStoreJson({ nodes: devices }, { status: 200 });
 }
 
 /** Revoke a node: its token stops working and its live session is killed. */
@@ -91,15 +92,15 @@ export async function DELETE(req: NextRequest) {
 
   const deviceId = new URL(req.url).searchParams.get("deviceId") ?? "";
   if (!/^dev_[A-Za-z0-9_-]{1,64}$/.test(deviceId)) {
-    return NextResponse.json({ error: "Invalid deviceId." }, { status: 400 });
+    return noStoreJson({ error: "Invalid deviceId." }, { status: 400 });
   }
 
   const store = getByocTokenStore();
   if (!store.getDevice(user, deviceId)) {
-    return NextResponse.json({ error: "No such node." }, { status: 404 });
+    return noStoreJson({ error: "No such node." }, { status: 404 });
   }
 
   const hub = getByocHub();
   hub.revokeDevice(user, deviceId, "revoked by the account owner");
-  return NextResponse.json({ ok: true, deviceId }, { status: 200 });
+  return noStoreJson({ ok: true, deviceId }, { status: 200 });
 }

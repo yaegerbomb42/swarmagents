@@ -21,6 +21,17 @@ import { POST as HOOK } from "./hooks/[userId]/[id]/route";
 import { GET as GARDENER_GET, POST as GARDENER_POST } from "./gardener/route";
 import { GET as PROVIDERS_GET, POST as PROVIDERS_POST } from "./providers/route";
 import { GET as PROVIDER_GET } from "./providers/[id]/route";
+import { GET as PROJECTS_GET, POST as PROJECTS_POST } from "./projects/route";
+import {
+  DELETE as PROJECT_DELETE,
+  GET as PROJECT_GET,
+  PATCH as PROJECT_PATCH,
+} from "./projects/[id]/route";
+import { DELETE as SHARE_DELETE, POST as SHARE_POST } from "./projects/[id]/share/route";
+import { DELETE as PAIR_DELETE, GET as PAIR_GET, POST as PAIR_POST } from "./byoc/pair/route";
+import { POST as LENSES_POST } from "./lenses/route";
+import { ByocTokenStore, setByocTokenStoreForTesting } from "../../lib/byoc/tokens";
+import { configureProjectStoreDir } from "../../lib/projects/store";
 import { configureStorePaths } from "../..//lib/board/store";
 import { configureAmbientStore } from "../../lib/ambient/store";
 import { setAmbientEngineForTesting } from "../../lib/ambient/runtime";
@@ -48,6 +59,31 @@ function jsonRequest(url: string, body: unknown, method = "POST"): NextRequest {
   });
 }
 
+interface UserRequestInit {
+  method?: string;
+  body?: unknown;
+  user?: string | null;
+}
+
+/** A caller-scoped request: the middleware sets x-swarm-user for signed-in users. */
+function userRequest(url: string, init: UserRequestInit = {}): NextRequest {
+  const headers = new Headers();
+  const user = init.user === undefined ? "alice" : init.user;
+  if (user !== null) headers.set("x-swarm-user", user);
+  if (init.body !== undefined) headers.set("content-type", "application/json");
+  return new NextRequest(`http://localhost${url}`, {
+    method: init.method ?? "GET",
+    ...(init.body !== undefined
+      ? { body: typeof init.body === "string" ? init.body : JSON.stringify(init.body) }
+      : {}),
+    headers,
+  });
+}
+
+function projectCtx(id: string) {
+  return { params: Promise.resolve({ id }) };
+}
+
 test.beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-no-store-"));
   configureStorePaths(dir, path.join(dir, "swarm_board.json"));
@@ -60,6 +96,8 @@ test.beforeEach(() => {
 
 test.afterEach(() => {
   setAmbientEngineForTesting(null);
+  setByocTokenStoreForTesting(null);
+  configureProjectStoreDir("");
   configureStorePaths(tmpdirUnused(), path.join(tmpdirUnused(), "swarm_board.json"));
   configureProviderStorePaths("");
   configureGardenerDir(null);
@@ -199,4 +237,153 @@ test("the provider routes are uncacheable on read, on create and on validation e
   });
   assert.equal(notFound.status, 404);
   assertNoStore(notFound, "providers/[id] 404");
+});
+
+test("the project routes are uncacheable on success, on auth failures and on missing projects", async () => {
+  const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-no-store-projects-"));
+  configureProjectStoreDir(projectDir);
+  try {
+    const signedOutList = await PROJECTS_GET(userRequest("/api/projects", { user: null }));
+    assert.equal(signedOutList.status, 401);
+    assertNoStore(signedOutList, "projects GET 401");
+
+    const created = await PROJECTS_POST(
+      userRequest("/api/projects", { method: "POST", body: { name: "Atlas", activeBranch: "main" } }),
+    );
+    assert.equal(created.status, 201);
+    assertNoStore(created, "projects POST 201");
+    const { project } = (await created.json()) as { project: { id: string } };
+
+    const list = await PROJECTS_GET(userRequest("/api/projects"));
+    assert.equal(list.status, 200);
+    assertNoStore(list, "projects GET 200");
+
+    const one = await PROJECT_GET(userRequest(`/api/projects/${project.id}`), projectCtx(project.id));
+    assert.equal(one.status, 200);
+    assertNoStore(one, "projects/[id] GET 200");
+
+    const patched = await PROJECT_PATCH(
+      userRequest(`/api/projects/${project.id}`, { method: "PATCH", body: { activeBranch: "feat/x" } }),
+      projectCtx(project.id),
+    );
+    assert.equal(patched.status, 200);
+    assertNoStore(patched, "projects/[id] PATCH 200");
+
+    // Another account gets a 404, which must not be cached either.
+    const other = await PROJECT_GET(
+      userRequest(`/api/projects/${project.id}`, { user: "bob" }),
+      projectCtx(project.id),
+    );
+    assert.equal(other.status, 404);
+    assertNoStore(other, "projects/[id] 404");
+
+    // The share token is a live credential: neither the create nor the
+    // revoke response may be cached.
+    const shared = await SHARE_POST(
+      userRequest(`/api/projects/${project.id}/share`, { method: "POST" }),
+      projectCtx(project.id),
+    );
+    assert.equal(shared.status, 200);
+    assertNoStore(shared, "projects/[id]/share POST 200");
+
+    const revoked = await SHARE_DELETE(
+      userRequest(`/api/projects/${project.id}/share`, { method: "DELETE" }),
+      projectCtx(project.id),
+    );
+    assert.equal(revoked.status, 200);
+    assertNoStore(revoked, "projects/[id]/share DELETE 200");
+
+    const missingShare = await SHARE_POST(
+      userRequest("/api/projects/prj_nope/share", { method: "POST" }),
+      projectCtx("prj_nope"),
+    );
+    assert.equal(missingShare.status, 404);
+    assertNoStore(missingShare, "projects/[id]/share POST 404");
+
+    const deleted = await PROJECT_DELETE(
+      userRequest(`/api/projects/${project.id}`, { method: "DELETE" }),
+      projectCtx(project.id),
+    );
+    assert.equal(deleted.status, 200);
+    assertNoStore(deleted, "projects/[id] DELETE 200");
+  } finally {
+    configureProjectStoreDir("");
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("the BYOC pair route is uncacheable on success and on refusals", async () => {
+  const pairDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-no-store-pair-"));
+  setByocTokenStoreForTesting(new ByocTokenStore({ file: path.join(pairDir, "byoc.json") }));
+  try {
+    const signedOutCreate = await PAIR_POST(userRequest("/api/byoc/pair", { method: "POST", user: null }));
+    assert.equal(signedOutCreate.status, 401);
+    assertNoStore(signedOutCreate, "byoc/pair POST 401");
+
+    // A fresh pairing code is a one-time credential: never cache it.
+    const created = await PAIR_POST(userRequest("/api/byoc/pair", { method: "POST", body: {} }));
+    assert.equal(created.status, 201);
+    assertNoStore(created, "byoc/pair POST 201");
+
+    const list = await PAIR_GET(userRequest("/api/byoc/pair"));
+    assert.equal(list.status, 200);
+    assertNoStore(list, "byoc/pair GET 200");
+
+    const badDevice = await PAIR_DELETE(
+      userRequest("/api/byoc/pair?deviceId=../etc", { method: "DELETE" }),
+    );
+    assert.equal(badDevice.status, 400);
+    assertNoStore(badDevice, "byoc/pair DELETE 400");
+
+    const missingDevice = await PAIR_DELETE(
+      userRequest("/api/byoc/pair?deviceId=dev_missing", { method: "DELETE" }),
+    );
+    assert.equal(missingDevice.status, 404);
+    assertNoStore(missingDevice, "byoc/pair DELETE 404");
+  } finally {
+    setByocTokenStoreForTesting(null);
+    fs.rmSync(pairDir, { recursive: true, force: true });
+  }
+});
+
+test("the lens route is uncacheable on an auth failure and on a validation error", async () => {
+  const signedOut = await LENSES_POST(
+    userRequest("/api/lenses", { method: "POST", body: { lens: "eli5", message: "hi" }, user: null }),
+  );
+  assert.equal(signedOut.status, 401);
+  assertNoStore(signedOut, "lenses POST 401");
+
+  const unknownLens = await LENSES_POST(
+    userRequest("/api/lenses", { method: "POST", body: { lens: "nope", message: "hi" } }),
+  );
+  assert.equal(unknownLens.status, 400);
+  assertNoStore(unknownLens, "lenses POST 400");
+});
+
+test("gardener unpin and removeProposal are uncacheable, including their errors", async () => {
+  // Both branches below used to bypass the file's json() helper, so they are
+  // asserted directly rather than trusting the shared wrapper.
+  const missingProposal = await GARDENER_POST(
+    jsonRequest("http://localhost/api/gardener", { action: "removeProposal" }),
+  );
+  assert.equal(missingProposal.status, 400);
+  assertNoStore(missingProposal, "gardener removeProposal 400");
+
+  const unknownProposal = await GARDENER_POST(
+    jsonRequest("http://localhost/api/gardener", { action: "removeProposal", proposalId: "prop_missing" }),
+  );
+  assert.equal(unknownProposal.status, 404);
+  assertNoStore(unknownProposal, "gardener removeProposal 404");
+
+  const unpinned = await GARDENER_POST(
+    jsonRequest("http://localhost/api/gardener", { action: "unpin", repoRoot: "/workspace/not-pinned" }),
+  );
+  assert.equal(unpinned.status, 404);
+  assertNoStore(unpinned, "gardener unpin 404");
+
+  const badPath = await GARDENER_POST(
+    jsonRequest("http://localhost/api/gardener", { action: "unpin", repoRoot: "/workspace/../etc" }),
+  );
+  assert.equal(badPath.status, 400);
+  assertNoStore(badPath, "gardener unpin 400");
 });

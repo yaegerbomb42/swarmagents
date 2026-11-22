@@ -27,6 +27,25 @@ function userId(req: NextRequest): string | null {
   return requestUser(req)?.id ?? null;
 }
 
+/** Validate a pin/unpin path once: both branches need the same 400 replies. */
+function repoRootFrom(raw: unknown): { ok: true; path: string } | { ok: false; response: NextResponse } {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (!value || value.includes("\0")) {
+    return { ok: false, response: json({ error: "repoRoot required" }, { status: 400 }) };
+  }
+  if (value.length > MAX_REPO_ROOT_LEN) {
+    return { ok: false, response: json({ error: `repoRoot exceeds maximum length of ${MAX_REPO_ROOT_LEN}` }, { status: 400 }) };
+  }
+  try {
+    return { ok: true, path: resolveWorkspacePath(value) };
+  } catch (err) {
+    if (err instanceof VmPathError) {
+      return { ok: false, response: json({ error: err.message }, { status: 400 }) };
+    }
+    return { ok: false, response: json({ error: "invalid repoRoot" }, { status: 400 }) };
+  }
+}
+
 export async function GET(req: NextRequest) {
   const id = userId(req);
   if (!id) return json({ error: "unauthorized" }, { status: 401 });
@@ -90,23 +109,9 @@ export async function POST(req: NextRequest) {
     return json(state);
   }
   if (body.action === "pin") {
-    const rawRepoRoot = typeof body.repoRoot === "string" ? body.repoRoot.trim() : "";
-    if (!rawRepoRoot || rawRepoRoot.includes("\0")) {
-      return json({ error: "repoRoot required" }, { status: 400 });
-    }
-    if (rawRepoRoot.length > MAX_REPO_ROOT_LEN) {
-      return json({ error: `repoRoot exceeds maximum length of ${MAX_REPO_ROOT_LEN}` }, { status: 400 });
-    }
-
-    let repoRoot: string;
-    try {
-      repoRoot = resolveWorkspacePath(rawRepoRoot);
-    } catch (err) {
-      if (err instanceof VmPathError) {
-        return json({ error: err.message }, { status: 400 });
-      }
-      return json({ error: "invalid repoRoot" }, { status: 400 });
-    }
+    const root = repoRootFrom(body.repoRoot);
+    if (!root.ok) return root.response;
+    const repoRoot = root.path;
 
     const currentState = readUserGardener(id);
     const alreadyPinned = currentState.pinned.some((p) => p.repoRoot === repoRoot);
@@ -128,33 +133,19 @@ export async function POST(req: NextRequest) {
     return json(state);
   }
   if (body.action === "unpin") {
-    const rawRepoRoot = typeof body.repoRoot === "string" ? body.repoRoot.trim() : "";
-    if (!rawRepoRoot || rawRepoRoot.includes("\0")) {
-      return NextResponse.json({ error: "repoRoot required" }, { status: 400 });
-    }
-    if (rawRepoRoot.length > MAX_REPO_ROOT_LEN) {
-      return NextResponse.json({ error: `repoRoot exceeds maximum length of ${MAX_REPO_ROOT_LEN}` }, { status: 400 });
-    }
-
-    let repoRoot: string;
-    try {
-      repoRoot = resolveWorkspacePath(rawRepoRoot);
-    } catch (err) {
-      if (err instanceof VmPathError) {
-        return NextResponse.json({ error: err.message }, { status: 400 });
-      }
-      return NextResponse.json({ error: "invalid repoRoot" }, { status: 400 });
-    }
+    const root = repoRootFrom(body.repoRoot);
+    if (!root.ok) return root.response;
+    const repoRoot = root.path;
 
     // Unpinning is a lifecycle step, not an update: nothing pinned means 404.
-    if (!unpinRepo(id, repoRoot)) return NextResponse.json({ error: "not found" }, { status: 404 });
-    return NextResponse.json(readUserGardener(id));
+    if (!unpinRepo(id, repoRoot)) return json({ error: "not found" }, { status: 404 });
+    return json(readUserGardener(id));
   }
   if (body.action === "removeProposal") {
     const proposalId = typeof body.proposalId === "string" ? body.proposalId : "";
-    if (!proposalId) return NextResponse.json({ error: "proposalId required" }, { status: 400 });
-    if (!removeProposal(id, proposalId)) return NextResponse.json({ error: "not found" }, { status: 404 });
-    return NextResponse.json(readUserGardener(id));
+    if (!proposalId) return json({ error: "proposalId required" }, { status: 400 });
+    if (!removeProposal(id, proposalId)) return json({ error: "not found" }, { status: 404 });
+    return json(readUserGardener(id));
   }
   if (body.action === "approve" || body.action === "dismiss") {
     const proposalId = typeof body.proposalId === "string" ? body.proposalId : "";

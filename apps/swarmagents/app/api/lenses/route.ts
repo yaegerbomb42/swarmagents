@@ -15,8 +15,9 @@
  * and is cached per (message, lens, run, files) in the user's own store.
  */
 
-import { NextResponse, type NextRequest } from "next/server";
+import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../lib/auth";
+import { noStoreJson } from "../../../lib/http";
 import { isLensId, type LensId } from "../../../lib/lenses/types";
 import { cachedLens, runLens } from "../../../lib/lenses/run";
 import { MAX_FILES, type ReferencedFile } from "../../../lib/lenses/prompts";
@@ -69,51 +70,51 @@ function parseFiles(value: unknown): ReferencedFile[] {
 
 export async function POST(req: NextRequest) {
   const user = caller(req);
-  if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+  if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
 
   let raw: string;
   try {
     raw = await req.text();
   } catch {
-    return NextResponse.json({ error: "Could not read request body." }, { status: 400 });
+    return noStoreJson({ error: "Could not read request body." }, { status: 400 });
   }
   if (raw.length > MAX_BODY_SIZE) {
-    return NextResponse.json({ error: "Request body too large." }, { status: 413 });
+    return noStoreJson({ error: "Request body too large." }, { status: 413 });
   }
 
   let body: unknown;
   try {
     body = JSON.parse(raw);
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return noStoreJson({ error: "Invalid JSON body." }, { status: 400 });
   }
   if (!isRecord(body)) {
-    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400 });
+    return noStoreJson({ error: "Body must be a JSON object." }, { status: 400 });
   }
 
   if (!isLensId(body.lens)) {
-    return NextResponse.json({ error: "Unknown lens." }, { status: 400 });
+    return noStoreJson({ error: "Unknown lens." }, { status: 400 });
   }
   const lens: LensId = body.lens;
 
   const message = typeof body.message === "string" ? body.message.trim() : "";
   if (!message) {
-    return NextResponse.json({ error: "A message is required." }, { status: 400 });
+    return noStoreJson({ error: "A message is required." }, { status: 400 });
   }
   if (message.length > MAX_MESSAGE_CHARS) {
-    return NextResponse.json({ error: "Message too long." }, { status: 400 });
+    return noStoreJson({ error: "Message too long." }, { status: 400 });
   }
 
   const runId = typeof body.runId === "string" && body.runId ? body.runId : undefined;
   if (runId !== undefined && !RUN_ID_RE.test(runId)) {
-    return NextResponse.json({ error: "Invalid run id." }, { status: 400 });
+    return noStoreJson({ error: "Invalid run id." }, { status: 400 });
   }
   if (runId !== undefined) {
     const run = getRun(runId);
     // A run without an owner is not visible to anybody; another user's run
     // must look like it does not exist.
     if (!run || run.summary.userId !== user) {
-      return NextResponse.json({ error: "Run not found." }, { status: 404 });
+      return noStoreJson({ error: "Run not found." }, { status: 404 });
     }
   }
 
@@ -125,7 +126,7 @@ export async function POST(req: NextRequest) {
   if (runId !== undefined) {
     const rate = lensBucket.consume(`lens:${user}`);
     if (!rate.allowed) {
-      return NextResponse.json(
+      return noStoreJson(
         { error: "Too many lens requests — try again in a moment." },
         { status: 429, headers: { "Retry-After": String(rate.retryAfter) } },
       );
@@ -139,14 +140,14 @@ export async function POST(req: NextRequest) {
   // The files were resolved above, so the lookup is keyed on the same
   // (message, run, files) the lens would run on.
   const cached = cachedLens(user, message, lens, { runId, files });
-  if (cached) return NextResponse.json(cached);
+  if (cached) return noStoreJson(cached);
 
   // Without a run there are no VM reads to protect, so the rate check can stay
   // on the uncached path — cached answers stay free for those callers.
   if (runId === undefined) {
     const rate = lensBucket.consume(`lens:${user}`);
     if (!rate.allowed) {
-      return NextResponse.json(
+      return noStoreJson(
         { error: "Too many lens requests — try again in a moment." },
         { status: 429, headers: { "Retry-After": String(rate.retryAfter) } },
       );
@@ -162,10 +163,10 @@ export async function POST(req: NextRequest) {
       ...(runId ? { runId } : {}),
       signal: req.signal,
     });
-    return NextResponse.json(result);
+    return noStoreJson(result);
   } catch (err) {
     const detail = err instanceof Error ? err.message : "Lens failed.";
     // RouterError messages are already redacted (no key material).
-    return NextResponse.json({ error: detail || "Lens failed." }, { status: 502 });
+    return noStoreJson({ error: detail || "Lens failed." }, { status: 502 });
   }
 }

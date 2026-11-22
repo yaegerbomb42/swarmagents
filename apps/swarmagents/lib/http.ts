@@ -9,7 +9,25 @@
  * followed by the route's own shape checks.
  */
 
+import { NextResponse } from "next/server";
+
 export const DEFAULT_MAX_JSON_BODY_BYTES = 256 * 1024;
+
+/** Header that marks a per-user or otherwise dynamic reply as uncacheable. */
+export const NO_STORE = { "cache-control": "no-store" } as const;
+
+/**
+ * A JSON reply that must never be cached. Per-user state (projects, pairing
+ * codes, lens answers) and error branches that echo request shape are all
+ * cacheable-by-default unless the route says otherwise, and a cached copy
+ * serves one account's state to the next reader. `noStoreJson` is the one
+ * place that sets the header so no branch is forgotten.
+ */
+export function noStoreJson(body: unknown, init: ResponseInit = {}): NextResponse {
+  const headers = new Headers(init.headers);
+  headers.set("cache-control", "no-store");
+  return NextResponse.json(body, { ...init, headers });
+}
 
 /** Thrown by `readJsonBody` when the body is unreadable, oversized or invalid. */
 export class JsonBodyError extends Error {
@@ -49,4 +67,45 @@ export async function readJsonBody(
   } catch {
     throw new JsonBodyError("Invalid JSON body.", 400);
   }
+}
+
+type JsonObject = Record<string, unknown>;
+export type JsonObjectRead =
+  | { ok: true; value: JsonObject }
+  | { ok: false; response: NextResponse };
+
+/**
+ * Read a bounded JSON body that must be a plain object. Keeps the 400/413
+ * replies of the routes that used to repeat this parsing block in one place,
+ * and never lets a successful reply be cached.
+ */
+export async function readJsonObject(
+  request: Request,
+  maxBytes: number = DEFAULT_MAX_JSON_BODY_BYTES,
+): Promise<JsonObjectRead> {
+  let value: unknown;
+  try {
+    value = await readJsonBody(request, maxBytes);
+  } catch (err) {
+    if (err instanceof JsonBodyError) {
+      const message = err.status === 413 ? "Request body too large." : err.message;
+      return { ok: false, response: noStoreJson({ error: message }, { status: err.status }) };
+    }
+    return { ok: false, response: noStoreJson({ error: "Invalid JSON body." }, { status: 400 }) };
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { ok: false, response: noStoreJson({ error: "Body must be a JSON object." }, { status: 400 }) };
+  }
+  return { ok: true, value: value as JsonObject };
+}
+
+/** Map a route error to an uncacheable JSON reply, preserving its HTTP status. */
+export function noStoreRouteError(err: unknown, fallbackMessage: string): NextResponse {
+  const candidate = err as { status?: unknown; message?: unknown } | null;
+  const status = candidate?.status;
+  const message = candidate?.message;
+  if (typeof status === "number" && status >= 400 && status < 600 && typeof message === "string" && message) {
+    return noStoreJson({ error: message }, { status });
+  }
+  return noStoreJson({ error: fallbackMessage }, { status: 500 });
 }

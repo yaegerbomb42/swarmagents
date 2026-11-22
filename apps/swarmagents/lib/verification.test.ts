@@ -369,3 +369,82 @@ test("executeWithPhaseVerification audits the semantic acceptance phase", async 
 
   assert.match(systemPrompt, /Phase 3: Semantic & Acceptance Verification/);
 });
+
+test("executeWithPhaseVerification retries transient verifier errors without burning generator attempts", async () => {
+  let generateCalls = 0;
+  let verifierCalls = 0;
+  const outcome = await executeWithPhaseVerification({
+    taskType: "code",
+    prompt: "p",
+    maxRemediations: 1,
+    maxVerifierRetries: 2,
+    callLLM: async () => {
+      verifierCalls++;
+      if (verifierCalls === 1) return "not json";
+      return JSON.stringify({ passed: true, score: 100, violations: [] });
+    },
+    generate: async (remedy) => {
+      generateCalls++;
+      assert.equal(remedy, undefined);
+      return { output: "candidate" };
+    },
+  });
+
+  assert.equal(generateCalls, 1);
+  assert.equal(verifierCalls, 2);
+  assert.equal(outcome.audit.status, "passed");
+  assert.equal(outcome.audit.passed, true);
+});
+
+test("executeWithPhaseVerification does not rewrite on verifier timeout/malformed JSON", async () => {
+  let generateCalls = 0;
+  let verifierCalls = 0;
+  const outcome = await executeWithPhaseVerification({
+    taskType: "code",
+    prompt: "p",
+    maxRemediations: 1,
+    maxVerifierRetries: 2,
+    timeoutMs: 20,
+    callLLM: async (_system, _user, options) => {
+      verifierCalls++;
+      if (verifierCalls === 1) {
+        return await new Promise<string>((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }
+      return JSON.stringify({ passed: true, score: 95, violations: [] });
+    },
+    generate: async (remedy) => {
+      generateCalls++;
+      assert.equal(remedy, undefined);
+      return { output: "valid work" };
+    },
+  });
+
+  assert.equal(generateCalls, 1);
+  assert.equal(verifierCalls, 2);
+  assert.equal(outcome.result.output, "valid work");
+  assert.equal(outcome.audit.status, "passed");
+});
+
+test("verifyPhase bounds oversized output before building the auditor prompt", async () => {
+  let seenUserPrompt = "";
+  const huge = "A".repeat(30_000);
+  const res = await verifyPhase(
+    {
+      taskType: "analysis",
+      phase: "semantic_acceptance",
+      prompt: "p",
+      output: huge,
+    },
+    async (_system, user) => {
+      seenUserPrompt = user;
+      return JSON.stringify({ passed: true, score: 100, violations: [] });
+    },
+  );
+
+  assert.equal(res.status, "passed");
+  assert.ok(seenUserPrompt.length < huge.length);
+  assert.match(seenUserPrompt, /output truncated for verification/i);
+  assert.match(seenUserPrompt, /A{100}/);
+});

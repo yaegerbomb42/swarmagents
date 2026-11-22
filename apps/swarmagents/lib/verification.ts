@@ -14,7 +14,10 @@ export interface VerificationTarget {
   context?: Record<string, unknown>;
 }
 
+export type VerificationStatus = "passed" | "failed" | "verifier_error";
+
 export interface VerificationResult {
+  status: VerificationStatus;
   passed: boolean;
   score: number; // 0 - 100
   violations: string[];
@@ -26,7 +29,84 @@ export interface VerificationResult {
   };
 }
 
-export type LLMCaller = (systemPrompt: string, userPrompt: string) => Promise<string>;
+export type LLMCaller = (
+  systemPrompt: string,
+  userPrompt: string,
+  options?: { signal?: AbortSignal },
+) => Promise<string>;
+
+const MAX_AUDIT_OUTPUT_CHARS = 12_000;
+
+function boundAuditOutput(output: string, maxChars = MAX_AUDIT_OUTPUT_CHARS): string {
+  if (output.length <= maxChars) return output;
+  const marker = `\n\n[... output truncated for verification: showing first and last ${Math.floor(maxChars / 2)} chars of ${output.length} ...]\n\n`;
+  const headLen = Math.max(0, Math.floor((maxChars - marker.length) / 2));
+  const tailLen = Math.max(0, maxChars - marker.length - headLen);
+  return `${output.slice(0, headLen)}${marker}${output.slice(output.length - tailLen)}`;
+}
+
+function createAbortError(): Error {
+  const err = new Error("Verification aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+async function withVerificationTimeout<T>(
+  work: (signal?: AbortSignal) => Promise<T>,
+  opts?: { signal?: AbortSignal; timeoutMs?: number },
+): Promise<T> {
+  const timeoutMs = opts?.timeoutMs;
+  const hasTimeout = typeof timeoutMs === "number" && timeoutMs > 0;
+  if (!opts?.signal && !hasTimeout) return work(undefined);
+
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  let rejectTimeout: ((reason?: unknown) => void) | undefined;
+  let rejectAbort: ((reason?: unknown) => void) | undefined;
+  const onAbort = () => {
+    controller.abort(opts?.signal?.reason);
+    rejectAbort?.(createAbortError());
+  };
+
+  if (opts?.signal) {
+    if (opts.signal.aborted) {
+      controller.abort(opts.signal.reason);
+      throw createAbortError();
+    }
+    opts.signal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  const timeoutPromise = hasTimeout
+    ? new Promise<never>((_, reject) => {
+        rejectTimeout = reject;
+        timer = setTimeout(() => {
+          const err = new Error(`Verifier timed out after ${timeoutMs}ms`);
+          controller.abort(err);
+          reject(err);
+        }, timeoutMs);
+      })
+    : null;
+
+  const abortPromise = opts?.signal
+    ? new Promise<never>((_, reject) => {
+        rejectAbort = reject;
+      })
+    : null;
+
+  try {
+    const workPromise = work(controller.signal);
+    const racers: Promise<T | never>[] = [workPromise];
+    if (timeoutPromise) racers.push(timeoutPromise);
+    if (abortPromise) racers.push(abortPromise);
+    return await Promise.race(racers);
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (opts?.signal) opts.signal.removeEventListener("abort", onAbort);
+    // prevent unhandled rejections from unused racers
+    void rejectTimeout;
+    void rejectAbort;
+  }
+}
 
 /**
  * Universal verification runner across all three phases:
@@ -36,7 +116,8 @@ export type LLMCaller = (systemPrompt: string, userPrompt: string) => Promise<st
  */
 export async function verifyPhase(
   target: VerificationTarget,
-  callLLM: LLMCaller
+  callLLM: LLMCaller,
+  opts?: { signal?: AbortSignal; timeoutMs?: number },
 ): Promise<VerificationResult> {
   const phaseGuidance: Record<VerificationTarget["phase"], string> = {
     preflight_contract: `Phase 1: Pre-Execution Contract Verification.
@@ -74,12 +155,15 @@ CONSTRAINTS:
 ${(target.constraints || []).map((c, i) => `${i + 1}. ${c}`).join("\n") || "None specified"}
 
 OUTPUT TO AUDIT:
-${target.output}
+${boundAuditOutput(target.output)}
 
 Audit the output against the specification. Return your evaluation in the required JSON format.`;
 
   try {
-    const rawResponse = await callLLM(systemPrompt, userPrompt);
+    const rawResponse = await withVerificationTimeout(
+      (signal) => callLLM(systemPrompt, userPrompt, { signal }),
+      opts,
+    );
     const cleaned = rawResponse.replace(/```json|```/gi, "").trim();
     const parsed = JSON.parse(cleaned);
 
@@ -95,6 +179,7 @@ Audit the output against the specification. Return your evaluation in the requir
           : "Address stated violations.";
 
     return {
+      status: passed ? "passed" : "failed",
       passed,
       score: typeof parsed.score === "number" ? parsed.score : passed ? 100 : 0,
       violations,
@@ -107,6 +192,7 @@ Audit the output against the specification. Return your evaluation in the requir
     };
   } catch {
     return {
+      status: "verifier_error",
       passed: false,
       score: 0,
       violations: ["Verifier output was unparseable or malformed JSON"],
@@ -130,28 +216,48 @@ export async function executeWithPhaseVerification<T extends { output: string }>
   prompt: string;
   constraints?: string[];
   maxRemediations?: number;
+  maxVerifierRetries?: number;
+  timeoutMs?: number;
+  signal?: AbortSignal;
   callLLM: LLMCaller;
   generate: (remedy?: string) => Promise<T>;
 }): Promise<{ result: T; audit: VerificationResult }> {
   const maxAttempts = opts.maxRemediations ?? 3;
+  const maxVerifierRetries = Math.max(0, opts.maxVerifierRetries ?? 2);
   let lastRemedy: string | undefined;
   let lastAudit: VerificationResult | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (opts.signal?.aborted) throw createAbortError();
     const candidate = await opts.generate(lastRemedy);
 
-    const audit = await verifyPhase(
-      {
-        taskType: opts.taskType,
-        phase: "semantic_acceptance",
-        prompt: opts.prompt,
-        constraints: opts.constraints,
-        output: candidate.output,
-      },
-      opts.callLLM
-    );
+    let audit: VerificationResult | null = null;
+    for (let verifierAttempt = 0; verifierAttempt <= maxVerifierRetries; verifierAttempt++) {
+      if (opts.signal?.aborted) throw createAbortError();
+      audit = await verifyPhase(
+        {
+          taskType: opts.taskType,
+          phase: "semantic_acceptance",
+          prompt: opts.prompt,
+          constraints: opts.constraints,
+          output: candidate.output,
+        },
+        opts.callLLM,
+        { signal: opts.signal, timeoutMs: opts.timeoutMs },
+      );
+      if (audit.status !== "verifier_error") break;
+      if (verifierAttempt === maxVerifierRetries) {
+        throw new Error(
+          `Verification infrastructure failed after ${maxVerifierRetries + 1} attempts: ${audit.violations.join(", ")}`,
+        );
+      }
+    }
 
-    if (audit.passed) {
+    if (!audit) {
+      throw new Error("Verification did not produce an audit result");
+    }
+
+    if (audit.status === "passed") {
       return { result: candidate, audit };
     }
 

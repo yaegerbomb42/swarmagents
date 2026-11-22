@@ -12,10 +12,10 @@ const redactPatterns = makeRedactor({});
 /** CSI (colour/cursor, e.g. SGR "\x1b[31m") and OSC (title/hyperlink) sequences. */
 // Built from char codes so the source contains no literal control characters
 // (Sonar S6324).
-const ESC = String.fromCharCode(0x1b);
-const BEL = String.fromCharCode(0x07);
+const ESC = String.fromCodePoint(0x1b);
+const BEL = String.fromCodePoint(0x07);
 const ANSI_ESCAPE = new RegExp(
-  `${ESC}(?:\\[[0-?]*[ -/]*[@-~]|\\][^${BEL}]*(?:${BEL}|${ESC}\\\\))`,
+  String.raw`${ESC}(?:\[[0-?]*[ -/]*[@-~]|\][^${BEL}]*(?:${BEL}|${ESC}\\))`,
   "g",
 );
 
@@ -107,12 +107,12 @@ export function diagnosticSymbols(diagnostic: string): string[] {
 
 /** Escape every regex metacharacter so a symbol name can never alter the pattern. */
 function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return value.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 }
 
 const DEF_RE = (name: string) =>
   new RegExp(
-    `^\\s*(export\\s+)?(default\\s+)?(declare\\s+)?(abstract\\s+)?(async\\s+)?(function\\*?|class|interface|type|enum|const|let|var)\\s+${escapeRegExp(name)}\\b`,
+    String.raw`^\s*(export\s+)?(default\s+)?(declare\s+)?(abstract\s+)?(async\s+)?(function\*?|class|interface|type|enum|const|let|var)\s+${escapeRegExp(name)}\b`,
   );
 
 /**
@@ -120,71 +120,81 @@ const DEF_RE = (name: string) =>
  * (including newlines) so masked lines stay aligned with the original lines.
  * Braces inside them must not end a definition early.
  */
+type MaskState = "code" | "line" | "block" | "single" | "double" | "template";
+
+interface MaskStep {
+  text: string;
+  advance: number;
+  state: MaskState;
+}
+
+/** Code state: swallow comment/string openings, pass everything else through. */
+function maskInCode(ch: string, next: string): MaskStep {
+  if (ch === "/" && next === "/") return { text: "  ", advance: 2, state: "line" };
+  if (ch === "/" && next === "*") return { text: "  ", advance: 2, state: "block" };
+  if (ch === "'") return { text: " ", advance: 1, state: "single" };
+  if (ch === '"') return { text: " ", advance: 1, state: "double" };
+  if (ch === "`") return { text: " ", advance: 1, state: "template" };
+  return { text: ch, advance: 1, state: "code" };
+}
+
+/** Line-comment state: blank everything except the newline that ends it. */
+function maskInLine(ch: string): MaskStep {
+  return ch === "\n"
+    ? { text: "\n", advance: 1, state: "code" }
+    : { text: " ", advance: 1, state: "line" };
+}
+
+/** Block-comment state: blank everything except the closing bracket pair. */
+function maskInBlock(ch: string, next: string): MaskStep {
+  if (ch === "*" && next === "/") return { text: "  ", advance: 2, state: "code" };
+  return { text: ch === "\n" ? "\n" : " ", advance: 1, state: "block" };
+}
+
+/** Single/double-quote string state. */
+function maskInString(state: MaskState, ch: string, next: string): MaskStep {
+  const quote = state === "single" ? "'" : '"';
+  if (ch === "\\") return { text: next === "\n" ? " \n" : "  ", advance: 2, state };
+  if (ch === quote) return { text: ch, advance: 1, state: "code" };
+  return { text: ch === "\n" ? "\n" : " ", advance: 1, state };
+}
+
+/** Template-literal state. */
+function maskInTemplate(ch: string, next: string): MaskStep {
+  if (ch === "\\") return { text: next === "\n" ? " \n" : "  ", advance: 2, state: "template" };
+  if (ch === "`") return { text: ch, advance: 1, state: "code" };
+  return { text: ch === "\n" ? "\n" : " ", advance: 1, state: "template" };
+}
+
 function maskStringsAndComments(source: string): string {
   let out = "";
-  let state: "code" | "line" | "block" | "single" | "double" | "template" = "code";
-  for (let i = 0; i < source.length; i += 1) {
+  let state: MaskState = "code";
+  let i = 0;
+  while (i < source.length) {
     const ch = source[i];
     const next = source[i + 1];
-    if (state === "code") {
-      if (ch === "/" && next === "/") {
-        out += "  ";
-        i += 1;
-        state = "line";
-      } else if (ch === "/" && next === "*") {
-        out += "  ";
-        i += 1;
-        state = "block";
-      } else if (ch === "'") {
-        out += " ";
-        state = "single";
-      } else if (ch === '"') {
-        out += " ";
-        state = "double";
-      } else if (ch === "`") {
-        out += " ";
-        state = "template";
-      } else {
-        out += ch;
-      }
-    } else if (state === "line") {
-      if (ch === "\n") {
-        out += "\n";
-        state = "code";
-      } else {
-        out += " ";
-      }
-    } else if (state === "block") {
-      if (ch === "*" && next === "/") {
-        out += "  ";
-        i += 1;
-        state = "code";
-      } else {
-        out += ch === "\n" ? "\n" : " ";
-      }
-    } else if (state === "single" || state === "double") {
-      const quote = state === "single" ? "'" : '"';
-      if (ch === "\\") {
-        out += next === "\n" ? " \n" : "  ";
-        i += 1;
-      } else if (ch === quote) {
-        out += ch;
-        state = "code";
-      } else {
-        out += ch === "\n" ? "\n" : " ";
-      }
-    } else {
-      // template literal
-      if (ch === "\\") {
-        out += next === "\n" ? " \n" : "  ";
-        i += 1;
-      } else if (ch === "`") {
-        out += ch;
-        state = "code";
-      } else {
-        out += ch === "\n" ? "\n" : " ";
-      }
+    let step: MaskStep;
+    switch (state) {
+      case "code":
+        step = maskInCode(ch, next);
+        break;
+      case "line":
+        step = maskInLine(ch);
+        break;
+      case "block":
+        step = maskInBlock(ch, next);
+        break;
+      case "single":
+      case "double":
+        step = maskInString(state, ch, next);
+        break;
+      default:
+        step = maskInTemplate(ch, next);
+        break;
     }
+    out += step.text;
+    state = step.state;
+    i += step.advance;
   }
   return out;
 }

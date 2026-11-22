@@ -152,6 +152,12 @@ function projectFiles(files: PatchFile[], projectDir: string): PatchFile[] {
     .map((f) => ({ ...f, path: f.path.slice(prefix.length) }));
 }
 
+function spellings(stem: string): string[] {
+  return stem.startsWith("..") || stem.includes("/../")
+    ? []
+    : ["ts", "tsx", "mts", "cts"].flatMap((ext) => [`${stem}.${ext}`, `${stem}/index.${ext}`]);
+}
+
 async function readText(exec: OracleExec, file: string): Promise<string | undefined> {
   try {
     const res = await exec(["cat", "--", file]);
@@ -339,45 +345,75 @@ export class OracleGate {
     const needles = [...names];
     const maybe = new Set(allTests.filter((t) => needles.some((n) => t.includes(n))));
     const rest = allTests.filter((t) => !maybe.has(t));
-    for (let i = 0; i < rest.length && needles.length; i += 200) {
-      const batch = rest.slice(i, i + 200);
-      const grep = await this.exec(["grep", "-l", "-F", ...needles.flatMap((n) => ["-e", n]), "--", ...batch], { cwd });
-      for (const hit of grep.stdout.split("\n").map((l) => l.trim()).filter(Boolean)) maybe.add(hit);
-    }
+    for (const hit of await this.grepNeedles(rest, needles, cwd)) maybe.add(hit);
     const contents = new Map<string, string>();
-    for (const test of maybe) {
-      const text = await readText(this.exec, path.join(cwd, test));
-      if (text !== undefined) contents.set(test, text);
-    }
+    await this.readContents([...maybe], cwd, contents);
 
     // Transitive selection needs the source modules the candidate tests
     // import. Read them (bounded, breadth-first) so findAffectedTests can
     // follow test → module → changed module chains.
-    const spellings = (stem: string): string[] =>
-      stem.startsWith("..") || stem.includes("/../")
-        ? []
-        : ["ts", "tsx", "mts", "cts"].flatMap((ext) => [`${stem}.${ext}`, `${stem}/index.${ext}`]);
-    let frontier = [...new Set([...contents].flatMap(([test, text]) =>
+    let next = [...new Set([...contents].flatMap(([test, text]) =>
       relativeImports(text).flatMap((spec) => spellings(resolveSpecifier(test, spec))),
     ))];
     let budget = 100;
-    for (let hop = 0; hop < 2 && frontier.length > 0 && budget > 0; hop += 1) {
-      const next: string[] = [];
-      for (const sourcePath of frontier) {
-        if (budget <= 0) break;
-        if (contents.has(sourcePath)) continue;
-        const text = await readText(this.exec, path.join(cwd, sourcePath));
-        budget -= 1;
-        if (text === undefined) continue;
-        contents.set(sourcePath, text);
-        for (const spec of relativeImports(text)) {
-          next.push(...spellings(resolveSpecifier(sourcePath, spec)));
-        }
-      }
-      frontier = next;
+    for (let hop = 0; hop < 2 && next.length > 0 && budget > 0; hop += 1) {
+      const { next: following, budget: remaining } = await this.readFrontier(next, cwd, contents, budget);
+      budget = remaining;
+      next = following;
     }
 
     return findAffectedTests({ changed, allTests, readFile: (p) => contents.get(p) });
+  }
+
+  /** Run one grep per 200-file batch over the candidate tests (one batched process, not one per file). */
+  private async grepNeedles(rest: string[], needles: string[], cwd: string): Promise<Set<string>> {
+    if (!needles.length) return new Set();
+    const batches: string[][] = [];
+    for (let i = 0; i < rest.length; i += 200) batches.push(rest.slice(i, i + 200));
+    const greps = await Promise.all(
+      batches.map((batch) =>
+        this.exec(["grep", "-l", "-F", ...needles.flatMap((n) => ["-e", n]), "--", ...batch], { cwd }),
+      ),
+    );
+    const hits = new Set<string>();
+    for (const grep of greps) {
+      for (const hit of grep.stdout.split("\n").map((l) => l.trim()).filter(Boolean)) hits.add(hit);
+    }
+    return hits;
+  }
+
+  /** Read the contents of a set of test files into a Map (undefined reads are skipped). */
+  private async readContents(files: string[], cwd: string, contents: Map<string, string>): Promise<void> {
+    const texts = await Promise.all(files.map((p) => readText(this.exec, path.join(cwd, p))));
+    files.forEach((p, i) => {
+      const text = texts[i];
+      if (text !== undefined) contents.set(p, text);
+    });
+  }
+
+  /**
+   * Breadth-first reads of `frontier` (skip files already in `contents`),
+   * costing one budget unit each. Returns the next frontier (imports of the
+   * freshly read files) and the remaining budget.
+   */
+  private async readFrontier(
+    frontier: string[],
+    cwd: string,
+    contents: Map<string, string>,
+    budget: number,
+  ): Promise<{ next: string[]; budget: number }> {
+    const pending = frontier.filter((p) => !contents.has(p)).slice(0, budget);
+    const texts = await Promise.all(pending.map((p) => readText(this.exec, path.join(cwd, p))));
+    const next: string[] = [];
+    pending.forEach((p, i) => {
+      const text = texts[i];
+      if (text === undefined) return;
+      contents.set(p, text);
+      for (const spec of relativeImports(text)) {
+        next.push(...spellings(resolveSpecifier(p, spec)));
+      }
+    });
+    return { next, budget: budget - pending.length };
   }
 
   /** Identifier at the diagnostic's location, read from the (still live) scratch. */
@@ -394,25 +430,36 @@ export class OracleGate {
     const seen = new Set<string>();
     const queue = files.slice(0, 8).map((f) => f.path);
     // Bound the total work: a diagnostic rarely needs more than a handful.
-    let budget = 16;
-    while (queue.length > 0 && budget > 0) {
-      const file = queue.shift()!;
-      if (seen.has(file)) continue;
+    return this.drainDefinitions(queue, seen, 16, out);
+  }
+
+  /** Process one definition candidate at a time (recursive so no await sits in a loop). */
+  private async drainDefinitions(
+    queue: string[],
+    seen: Set<string>,
+    budget: number,
+    out: { path: string; content: string }[],
+  ): Promise<{ path: string; content: string }[]> {
+    if (queue.length === 0 || budget <= 0) return out;
+    const file = queue.shift()!;
+    if (!seen.has(file)) {
       seen.add(file);
-      if (unsafePatchPaths([{ path: file, status: "M" }]).length) continue;
-      const content = await readText(this.exec, path.join(this.opts.repoRoot, file));
-      if (content === undefined) continue;
-      out.push({ path: file, content });
-      budget -= 1;
-      for (const spec of relativeImports(content)) {
-        const stem = resolveSpecifier(file, spec);
-        if (stem.startsWith("..") || stem.includes("/../")) continue;
-        for (const candidate of [`${stem}.ts`, `${stem}/index.ts`, `${stem}.tsx`]) {
-          if (!seen.has(candidate) && budget > 0) queue.push(candidate);
+      if (!unsafePatchPaths([{ path: file, status: "M" }]).length) {
+        const content = await readText(this.exec, path.join(this.opts.repoRoot, file));
+        if (content !== undefined) {
+          out.push({ path: file, content });
+          budget -= 1;
+          for (const spec of relativeImports(content)) {
+            const stem = resolveSpecifier(file, spec);
+            if (stem.startsWith("..") || stem.includes("/../")) continue;
+            for (const candidate of [`${stem}.ts`, `${stem}/index.ts`, `${stem}.tsx`]) {
+              if (!seen.has(candidate) && budget > 0) queue.push(candidate);
+            }
+          }
         }
       }
     }
-    return out;
+    return this.drainDefinitions(queue, seen, budget, out);
   }
 
   /** Apply to the real tree (check first, so a moved tree is a conflict, never a partial apply). */

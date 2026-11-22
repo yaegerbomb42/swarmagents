@@ -34,7 +34,7 @@ export function moduleStem(p: string): string {
  */
 export function relativeImports(source: string): string[] {
   const out = new Set<string>();
-  const re = /(?:from\s*|import\s*\(\s*|require\s*\(\s*|import\s+)["'](\.{1,2}(?:\/[^"']*)?)["']/g;
+  const re = /(?:from\s*|require\s*\(\s*|import(?:\s+|\s*\(\s*))["'](\.{1,2}(?:\/[^"']*)?)["']/g;
   for (const m of source.matchAll(re)) out.add(m[1]);
   return [...out];
 }

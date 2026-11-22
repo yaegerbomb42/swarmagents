@@ -31,16 +31,48 @@ function each<T extends readonly unknown[]>(cases: readonly T[]) {
 export const it = Object.assign(itImpl, { each });
 export const test = it;
 
-function isSubset(actual: unknown, expected: unknown): boolean {
+function deepEqual(actual: unknown, expected: unknown): boolean {
+  try {
+    assert.deepStrictEqual(actual, expected);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object") return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function isSubset(actual: unknown, expected: unknown, seen = new WeakMap<object, object>()): boolean {
   if (expected === null || typeof expected !== "object") return Object.is(actual, expected);
   if (actual === null || typeof actual !== "object") return false;
-  if (Array.isArray(expected)) {
-    if (!Array.isArray(actual) || actual.length !== expected.length) return false;
-    return expected.every((e, i) => isSubset(actual[i], e));
+  // Non-plain objects (Date, RegExp, Map, Set, class instances) are compared
+  // structurally rather than by their (often empty) enumerable own keys.
+  if (!isPlainObject(expected) && !Array.isArray(expected)) return deepEqual(actual, expected);
+  // Cycle guard: a previously visited expected object must be paired with the
+  // same actual object, otherwise the recursion could loop forever.
+  if (seen.get(expected) === actual) return true;
+  seen.set(expected, actual);
+  try {
+    if (Array.isArray(expected)) {
+      if (!Array.isArray(actual) || actual.length !== expected.length) return false;
+      return expected.every((e, i) => isSubset(actual[i], e, seen));
+    }
+    return Object.entries(expected).every(([k, v]) => {
+      // An absent key must not match an explicitly undefined expectation.
+      if (v === undefined && !Object.prototype.hasOwnProperty.call(actual, k)) return false;
+      return isSubset((actual as Record<string, unknown>)[k], v, seen);
+    });
+  } finally {
+    seen.delete(expected);
   }
-  return Object.entries(expected as Record<string, unknown>).every(([k, v]) =>
-    isSubset((actual as Record<string, unknown>)[k], v),
-  );
+}
+
+function isNumber(value: unknown): value is number {
+  return typeof value === "number" && !Number.isNaN(value);
 }
 
 function matchers(actual: unknown, negate: boolean) {
@@ -51,13 +83,7 @@ function matchers(actual: unknown, negate: boolean) {
   return {
     toBe: (expected: unknown) => check(Object.is(actual, expected), `${show(actual)} to be ${show(expected)}`),
     toEqual: (expected: unknown) => {
-      let pass = true;
-      try {
-        assert.deepStrictEqual(JSON.parse(JSON.stringify(actual ?? null)), JSON.parse(JSON.stringify(expected ?? null)));
-      } catch {
-        pass = false;
-      }
-      check(pass, `${show(actual)} to equal ${show(expected)}`);
+      check(deepEqual(actual, expected), `${show(actual)} to equal ${show(expected)}`);
     },
     toMatchObject: (expected: unknown) => check(isSubset(actual, expected), `${show(actual)} to match ${show(expected)}`),
     toContain: (item: unknown) => {
@@ -75,24 +101,27 @@ function matchers(actual: unknown, negate: boolean) {
     toBeDefined: () => check(actual !== undefined, `${show(actual)} to be defined`),
     toBeTruthy: () => check(Boolean(actual), `${show(actual)} to be truthy`),
     toBeFalsy: () => check(!actual, `${show(actual)} to be falsy`),
-    toBeLessThan: (n: number) => check((actual as number) < n, `${show(actual)} < ${n}`),
-    toBeLessThanOrEqual: (n: number) => check((actual as number) <= n, `${show(actual)} <= ${n}`),
-    toBeGreaterThan: (n: number) => check((actual as number) > n, `${show(actual)} > ${n}`),
-    toBeGreaterThanOrEqual: (n: number) => check((actual as number) >= n, `${show(actual)} >= ${n}`),
+    toBeLessThan: (n: number) => check(isNumber(actual) && actual < n, `${show(actual)} < ${n}`),
+    toBeLessThanOrEqual: (n: number) => check(isNumber(actual) && actual <= n, `${show(actual)} <= ${n}`),
+    toBeGreaterThan: (n: number) => check(isNumber(actual) && actual > n, `${show(actual)} > ${n}`),
+    toBeGreaterThanOrEqual: (n: number) => check(isNumber(actual) && actual >= n, `${show(actual)} >= ${n}`),
     toBeCloseTo: (n: number, digits = 2) =>
-      check(Math.abs((actual as number) - n) < Math.pow(10, -digits) / 2, `${show(actual)} to be close to ${n}`),
+      check(isNumber(actual) && Math.abs(actual - n) < Math.pow(10, -digits) / 2, `${show(actual)} to be close to ${n}`),
     toBeInstanceOf: (ctor: abstract new (...args: never[]) => unknown) =>
       check(actual instanceof ctor, `${show(actual)} to be instance of ${ctor.name}`),
     toThrow: (expected?: string | RegExp | (abstract new (...args: never[]) => unknown)) => {
       let thrown: unknown;
       let didThrow = false;
-      try {
-        (actual as () => unknown)();
-      } catch (err) {
-        didThrow = true;
-        thrown = err;
+      const callable = typeof actual === "function";
+      if (callable) {
+        try {
+          (actual as () => unknown)();
+        } catch (err) {
+          didThrow = true;
+          thrown = err;
+        }
       }
-      let pass = didThrow;
+      let pass = callable && didThrow;
       if (didThrow && expected !== undefined) {
         const msg = thrown instanceof Error ? thrown.message : String(thrown);
         if (typeof expected === "string") pass = msg.includes(expected);

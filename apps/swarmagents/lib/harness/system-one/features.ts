@@ -10,6 +10,8 @@
  * diffed; the only change is this header.
  */
 
+import path from "node:path";
+
 const sigmoid = (z: number): number => 1 / (1 + Math.exp(-z));
 
 interface Signal {
@@ -62,12 +64,19 @@ const SCOPED_OUTPUTS = new Set([
 const WIPE_TARGETS = new Set(['/', '~', '$HOME', '.', '..', '*', './*', '/*', '~/*']);
 const MUTATORS = new Set(['rm', 'mv', 'cp', 'chmod', 'chown', 'tee', 'truncate']);
 
-/** Shell words, split on whitespace with `;`, `&&`, `|` kept as their own tokens. */
+/**
+ * Shell words. Splits on whitespace, newlines, and the control operators
+ * `;`, `&&`, `||`, `|`, and `&`, keeping each operator as its own token so a
+ * command after `&&` or a newline is analysed as a new segment.
+ */
 const words = (command: string): string[] =>
   command
-    .replaceAll(';', ' ; ')
-    .split(/\s+/)
+    .split(/(&&|\|\||[;|&])|\s+/)
+    .filter((w): w is string => typeof w === "string")
+    .map((w) => w.trim())
     .filter((w) => w.length > 0);
+
+const unquote = (w: string): string => w.replace(/^["']/, '').replace(/["']$/, '');
 
 /** The arguments of every `name ...` segment in a command line. */
 function segmentsOf(command: string, names: ReadonlySet<string>): string[][] {
@@ -76,15 +85,13 @@ function segmentsOf(command: string, names: ReadonlySet<string>): string[][] {
   for (const w of words(command)) {
     if (SEPARATORS.has(w)) current = undefined;
     else if (current) current.push(w);
-    else if (names.has(w)) {
+    else if (names.has(path.posix.basename(unquote(w)))) {
       current = [w];
       out.push(current);
     }
   }
   return out;
 }
-
-const unquote = (w: string): string => w.replace(/^["']/, '').replace(/["']$/, '');
 
 /** `rm -r` of a whole tree ("wipe"), of a build output ("scoped"), or neither. */
 export function recursiveDeleteRisk(command: string): 'wipe' | 'scoped' | 'none' {
@@ -105,18 +112,30 @@ export function recursiveDeleteRisk(command: string): 'wipe' | 'scoped' | 'none'
   return risk;
 }
 
+/** Normalize a directory for boundary checks, without a trailing slash. */
+const normalizeDir = (value: string): string => {
+  const normalized = path.posix.normalize(value);
+  return normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
+};
+
+/** True when `candidate` is `root` or sits underneath it. */
+const isInside = (candidate: string, root: string): boolean =>
+  root === "/" ? candidate.startsWith("/") : candidate === root || candidate.startsWith(root + "/");
+
 const outsideRepo = (command: string, cwd: string, repoRoot: string): boolean => {
-  if (repoRoot && cwd && !cwd.startsWith(repoRoot)) return true;
+  if (repoRoot && cwd && !isInside(normalizeDir(cwd), normalizeDir(repoRoot))) return true;
   if (!repoRoot) return false;
+  const root = normalizeDir(repoRoot);
   return segmentsOf(command, MUTATORS).some(([, ...args]) =>
     args
       .map(unquote)
+      .map((a) => path.posix.normalize(a))
       .some(
         (a) =>
-          a.startsWith('/') &&
-          !a.startsWith('/tmp') &&
-          a !== '/dev/null' &&
-          !a.startsWith(repoRoot),
+          a.startsWith("/") &&
+          !(a === "/tmp" || a.startsWith("/tmp/")) &&
+          !(a === "/dev/null" || a.startsWith("/dev/null/")) &&
+          !isInside(a, root),
       ),
   );
 };
@@ -360,13 +379,52 @@ export interface PatchSignals {
   bracketDelta: number;
 }
 
+/**
+ * Bracket balance, ignoring comments and quoted strings.
+ *
+ * A linear-time scanner (no backtracking): `//` and `/* ... *\/` comments are
+ * skipped, as are single-, double-, and template-quoted strings with their
+ * backslash escapes. This keeps an apostrophe in a comment (for example
+ * `// don't`) from opening a fake string that swallows the rest of the line.
+ */
 const bracketBalance = (s: string): number => {
-  let b = 0;
-  for (const ch of s.replace(/(["'`])(?:\\.|(?!\1).)*\1/g, '')) {
-    if (ch === '{' || ch === '(' || ch === '[') b++;
-    else if (ch === '}' || ch === ')' || ch === ']') b--;
+  let balance = 0;
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    const next = s[i + 1];
+    if (ch === "/" && next === "/") {
+      i += 2;
+      while (i < s.length && s[i] !== "\n") i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i += 1;
+      i += 2;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      i += 1;
+      while (i < s.length) {
+        if (s[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (s[i] === quote) {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === "{" || ch === "(" || ch === "[") balance += 1;
+    else if (ch === "}" || ch === ")" || ch === "]") balance -= 1;
+    i += 1;
   }
-  return b;
+  return balance;
 };
 
 export function patchSignals(oldText: string, newText: string): PatchSignals {

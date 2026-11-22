@@ -367,3 +367,45 @@ test("checkProviderProbeRateLimit allows 30/min per user, independently", () => 
   assert.ok(denied.retryAfter > 0);
   assert.equal(checkProviderProbeRateLimit("bob").allowed, true, "budgets are per user");
 });
+
+test("rateLimitCheck gives password-reset endpoints their own strict bucket (FIX-39)", () => {
+  resetBuckets();
+  const key = "test-reset-" + Date.now();
+  const first = rateLimitCheck("/api/password-reset/request", key);
+  assert.ok(first);
+  assert.equal(first!.allowed, true);
+  assert.equal(first!.limit, 5, "reset requests get the login-class budget, not the general 300/min");
+
+  // Request and confirm share the reset bucket...
+  for (let i = 0; i < 4; i++) {
+    assert.equal(rateLimitCheck("/api/password-reset/confirm", key)!.allowed, true);
+  }
+  const blocked = rateLimitCheck("/api/password-reset/request", key);
+  assert.ok(blocked);
+  assert.equal(blocked!.allowed, false);
+  assert.ok(blocked!.retryAfter > 0);
+
+  // ...but the login bucket and the general API bucket are untouched.
+  assert.equal(rateLimitCheck("/api/login", key)!.allowed, true);
+  assert.equal(rateLimitCheck("/api/runtime/tasks", key)!.allowed, true);
+  // Another identity still gets its own reset budget.
+  assert.equal(rateLimitCheck("/api/password-reset/request", "other-key")!.allowed, true);
+});
+
+test("rateLimitCheck routes email-verification endpoints into the strict reset bucket (FIX-44)", () => {
+  resetBuckets();
+  const key = "test-verify-" + Date.now();
+  // Confirm + resend share the password-reset bucket's 5/min budget.
+  for (let i = 0; i < 5; i++) {
+    const path = i % 2 === 0 ? "/api/email-verification/confirm" : "/api/email-verification/resend";
+    assert.equal(rateLimitCheck(path, key)!.allowed, true, `attempt ${i + 1} should be allowed`);
+  }
+  const blocked = rateLimitCheck("/api/email-verification/confirm", key);
+  assert.ok(blocked);
+  assert.equal(blocked!.allowed, false);
+  assert.ok(blocked!.retryAfter > 0);
+  // The reset endpoints share the same (now exhausted) budget...
+  assert.equal(rateLimitCheck("/api/password-reset/request", key)!.allowed, false);
+  // ...while another identity is unaffected.
+  assert.equal(rateLimitCheck("/api/email-verification/resend", "other-key")!.allowed, true);
+});

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  AlertTriangle, Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, Loader2, LogOut, Plus, Sparkles, Trash2, X, Zap,
+  AlertTriangle, Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, KeyRound, Loader2, LogOut, Plus, Sparkles, Trash2, X, Zap,
 } from 'lucide-react';
 import {
   type ActiveRole, type ApiFormat, MAX_ROLES, MIN_ROLES, PROVIDERS, type ProviderConfig, ROLES, uid,
@@ -1827,6 +1827,21 @@ function Appearance({ accent, setAccent, showHelpers, setShowHelpers, mascotVari
 
 /* ---------------- Account ---------------- */
 
+/**
+ * Client-side validation for the change-password form (FIX-40). Mirrors
+ * the server policy in lib/users (new password 8–1024 chars, the same
+ * rule as signup) so obvious mistakes fail before the round trip; the
+ * route re-checks everything and remains the authority. Returns the
+ * error message to show, or null when the form may be submitted.
+ */
+export function validatePasswordChange(current: string, next: string, confirm: string): string | null {
+  if (!current) return 'Enter your current password.';
+  if (next.length < 8) return 'New password must be at least 8 characters.';
+  if (next.length > 1024) return 'New password is too long.';
+  if (next !== confirm) return 'New passwords do not match.';
+  return null;
+}
+
 function Account() {
   const [email, setEmail] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1834,6 +1849,12 @@ function Account() {
   const [error, setError] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
+  const [pwCurrent, setPwCurrent] = useState('');
+  const [pwNext, setPwNext] = useState('');
+  const [pwConfirm, setPwConfirm] = useState('');
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwDone, setPwDone] = useState(false);
+  const [pwError, setPwError] = useState<string | null>(null);
 
   const signOut = async () => {
     setSigningOut(true);
@@ -1887,6 +1908,39 @@ function Account() {
     setBusy(false);
   };
 
+  const changePassword = async () => {
+    const invalid = validatePasswordChange(pwCurrent, pwNext, pwConfirm);
+    if (invalid) {
+      setPwError(invalid);
+      return;
+    }
+    setPwBusy(true);
+    setPwError(null);
+    setPwDone(false);
+    try {
+      const res = await fetch('/api/me/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword: pwCurrent, newPassword: pwNext }),
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        setPwError(body?.error ?? 'Could not change password.');
+        setPwBusy(false);
+        return;
+      }
+      // The route re-minted this device's session cookie; every other
+      // session was revoked server-side.
+      setPwCurrent('');
+      setPwNext('');
+      setPwConfirm('');
+      setPwDone(true);
+    } catch {
+      setPwError('Could not change password.');
+    }
+    setPwBusy(false);
+  };
+
   return (
     <div className="space-y-6">
       <section>
@@ -1907,6 +1961,61 @@ function Account() {
             </button>
           </div>
           {signOutError && <div className="mt-2 text-[10px] text-red-300/80">{signOutError}</div>}
+        </div>
+      </section>
+
+      <section data-testid="settings-change-password-section">
+        <div className="flex items-center gap-2 text-xs font-medium text-white/85">
+          <KeyRound className="h-3.5 w-3.5" /> Change password
+        </div>
+        <p className="mt-1.5 text-[11px] leading-relaxed text-white/40">
+          Rotates this account&apos;s password and signs out every other session. This device stays signed in.
+        </p>
+        <div className="mt-3 space-y-2 rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
+          <Field
+            label="Current password"
+            type="password"
+            autoComplete="current-password"
+            value={pwCurrent}
+            onChange={setPwCurrent}
+            testId="settings-change-password-current"
+          />
+          <Field
+            label="New password"
+            type="password"
+            autoComplete="new-password"
+            value={pwNext}
+            onChange={setPwNext}
+            helper="At least 8 characters."
+            testId="settings-change-password-new"
+          />
+          <Field
+            label="Confirm new password"
+            type="password"
+            autoComplete="new-password"
+            value={pwConfirm}
+            onChange={setPwConfirm}
+            testId="settings-change-password-confirm"
+          />
+          <button
+            onClick={() => void changePassword()}
+            disabled={pwBusy}
+            data-testid="settings-change-password-submit"
+            className="flex items-center gap-1.5 rounded-full bg-white/10 px-3.5 py-1.5 text-xs text-white/80 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"
+          >
+            {pwBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <KeyRound className="h-3 w-3" />}
+            Change password
+          </button>
+          {pwError && (
+            <div data-testid="settings-change-password-error" className="text-[10px] text-red-300/80">
+              {pwError}
+            </div>
+          )}
+          {pwDone && (
+            <div data-testid="settings-change-password-done" className="flex items-center gap-1.5 text-xs text-emerald-300/80">
+              <Check className="h-3.5 w-3.5" /> Password changed. Other sessions were signed out.
+            </div>
+          )}
         </div>
       </section>
 
@@ -2152,11 +2261,13 @@ function Label({ children, className = '' }: { children: React.ReactNode; classN
   return <div className={`mb-2 text-[10px] uppercase tracking-[0.2em] text-white/40 ${className}`}>{children}</div>;
 }
 
-function Field({ label, value, onChange, mono, helper, testId }: { label: string; value: string; onChange: (v: string) => void; mono?: boolean; helper?: string; testId?: string }) {
+function Field({ label, value, onChange, mono, helper, testId, type, autoComplete }: { label: string; value: string; onChange: (v: string) => void; mono?: boolean; helper?: string; testId?: string; type?: string; autoComplete?: string }) {
   return (
     <label className="block">
       <span className="mb-1 block text-[10px] uppercase tracking-widest text-white/35">{label}</span>
       <input
+        type={type}
+        autoComplete={autoComplete}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         data-testid={testId}

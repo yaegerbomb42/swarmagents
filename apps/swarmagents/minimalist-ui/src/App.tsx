@@ -27,7 +27,7 @@ import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/c
 import { useAgentSession } from "./hooks/useAgentSession";
 import { useBoard } from "./hooks/useBoard";
 import { devModeFromSearch, resolveView } from "./devMode";
-import { useIsWide, useMe, useProviderStatus } from "./hooks/useEnvironment";
+import { firstRunSetup, useIsWide, useMe, useProviderStatus } from "./hooks/useEnvironment";
 import { cn } from "./utils/cn";
 import { ApprovalGate } from "./components/ApprovalGate";
 import { BoardPanel } from "./components/BoardPanel";
@@ -35,6 +35,7 @@ import { Composer, type ComposerSendResult } from "./components/Composer";
 import { useComputeOptions } from "./components/ComputePicker";
 import type { ComputerView } from "./components/ComputerScreen";
 import { Conversation } from "./components/Conversation";
+import { FirstRunSetup } from "./components/FirstRunSetup";
 import { Header, type WorkspaceView } from "./components/Header";
 import { HistoryPanel } from "./components/HistoryPanel";
 import type { SettingsTab } from "./components/Settings";
@@ -348,6 +349,26 @@ export default function App() {
   const hero =
     effectiveView === "chat" && session.ready && session.turns.length === 0 && !session.pending && !session.turnsLoading;
 
+  // A zero-provider account cannot start a run. Instead of letting the first
+  // send fail, the workspace blocks the composer with the reason and (for a
+  // fresh account) routes straight to provider setup — once per visit, so
+  // closing Settings without adding a key does not reopen it.
+  const setup = firstRunSetup({
+    providerState: providerStatus.state,
+    signedOut: session.signedOut,
+    ready: session.ready,
+    threadsReady: session.threadsState === "ready",
+    turns: session.turns.length,
+    threads: session.threads.length,
+  });
+  const routedToSetup = useRef(false);
+  useEffect(() => {
+    if (!setup.firstRun || routedToSetup.current) return;
+    routedToSetup.current = true;
+    // Never yank a Settings sheet the user already opened themselves.
+    if (!settings.open) openSettings("providers");
+  }, [setup.firstRun, settings.open, openSettings]);
+
   const activeThreadId = activeRun ? (activeRun.sessionId ?? activeRun.runId) : undefined;
   const headDuration =
     headRun?.finishedAt !== undefined && headRun.finishedAt >= headRun.createdAt
@@ -420,6 +441,9 @@ export default function App() {
           {!session.ready && !session.signedOut ? (
             <Loading label="Connecting to autonomous swarm..." className="flex-1" />
           ) : hero ? (
+            setup.needsProvider ? (
+              <FirstRunSetup onOpenProviders={() => openSettings("providers")} />
+            ) : (
             <div className="mx-auto w-full max-w-[640px] px-4 pb-6 text-center" data-testid="hero">
               <div className="enter flex justify-center mb-6">
                 <div className="orb" data-state="idle" style={{ width: 68, height: 68 }}>
@@ -434,11 +458,12 @@ export default function App() {
                 The agent acts on its dedicated cloud computer with real tools, live browsing, and code execution. Watch the computer or step in anytime.
               </p>
             </div>
+            )
           ) : (
             <Conversation
               session={session}
               taskLinks={board.links}
-              starters={STARTERS}
+              starters={setup.needsProvider ? [] : STARTERS}
               onWatchScreen={view === "screen" ? undefined : watchScreen}
               onOpenTask={openTask}
               onOpenProviders={() => openSettings("providers")}
@@ -465,7 +490,8 @@ export default function App() {
                 Your session ended or you have not signed in yet.
               </Notice>
             ) : (
-              providerStatus.state === "missing" && (
+              setup.needsProvider &&
+              !hero && (
                 <Notice
                   tone="warn"
                   title="Add a model provider to start"
@@ -486,11 +512,13 @@ export default function App() {
               value={draft}
               onChange={setDraft}
               onSend={handleSend}
-              blockedReason={session.signedOut ? "Sign in to send" : undefined}
+              blockedReason={
+                session.signedOut ? "Sign in to send" : setup.needsProvider ? "Add a provider key to send" : undefined
+              }
               inputRef={composerRef}
             />
 
-            {hero && (
+            {hero && !setup.needsProvider && (
               <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-2" aria-label="Ideas to start with">
                 {STARTERS.map((starter) => (
                   <button

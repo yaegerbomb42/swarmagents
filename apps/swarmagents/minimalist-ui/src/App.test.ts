@@ -220,3 +220,14 @@ test("workspace chords map to focus and new chat, never bare keys", async () => 
   assert.equal(workspaceChordAction({ key: "Escape" }), null);
   assert.equal(workspaceChordAction({ key: "a", metaKey: true }), null);
 });
+
+test("an unanswered provider status never shows the setup wall (FIX-43)", async () => {
+  // Effects do not run in a static render, so useProviderStatus stays
+  // "unknown" here — the same state a configured account sees for one
+  // round-trip on load. The setup prompt and the blocked composer are
+  // reserved for a confirmed "missing" (see firstRunSetup's tests).
+  const html = await renderApp();
+  assert.equal(countOf(html, 'data-testid="first-run-setup"'), 0, "no setup prompt on a guess");
+  assert.equal(countOf(html, 'data-testid="provider-notice"'), 0, "no provider notice on a guess");
+  assert.doesNotMatch(tagOf(html, "composer-input"), /disabled=""/, "the composer is not blocked on a guess");
+});

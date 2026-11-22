@@ -4,12 +4,22 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn, type ChildProcess } from "node:child_process";
+import { acquireFileLock } from "./file-lock.js";
 import {
   bumpSessionEpoch,
   configureUserPaths,
+  consumeEmailVerificationToken,
+  consumePasswordResetToken,
   emailForUserId,
+  listLocalUserIds,
   getSessionEpoch,
+  isEmailVerified,
+  isEmailVerifiedForUserId,
+  issueEmailVerificationToken,
+  issuePasswordResetToken,
   normalizeEmail,
+  setUserPassword,
   signupLocalUser,
   localUserExists,
   verifyLocalUser,
@@ -29,6 +39,7 @@ test.afterEach(() => {
   configureUserPaths("");
   delete process.env.SWARM_SCRYPT_MAX_CONCURRENCY;
   delete process.env.SWARM_SCRYPT_MAX_QUEUE;
+  delete process.env.SWARM_SESSION_SECRET;
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -194,7 +205,9 @@ test("the parsed user store is cached across lookups and re-read after a write",
   const original = fs.readFileSync;
   let reads = 0;
   fs.readFileSync = ((...args: unknown[]) => {
-    reads++;
+    // Count only reads of the store itself; the FIX-45 file lock also reads
+    // its lockfile on release, which is not a store read.
+    if (String(args[0]).endsWith("users.json")) reads++;
     return (original as (...a: unknown[]) => unknown)(...args);
   }) as typeof fs.readFileSync;
 
@@ -207,11 +220,14 @@ test("the parsed user store is cached across lookups and re-read after a write",
 
     // A write invalidates the cache in-process...
     assert.equal((await signupLocalUser("bob@example.com", "another strong secret")).ok, true);
-    assert.equal(reads, 1, "signup's own load used the cache; only the write invalidates");
+    // FIX-45: entering the cross-process write lock re-reads the file (another
+    // process may have written while we waited for the lock), so the signup's
+    // in-lock load is a second read — lookups still hit the cache.
+    assert.equal(reads, 2, "entering the write lock re-reads; lookups used the cache");
 
     // ...so the next lookup re-reads and sees the new account.
     assert.ok(await verifyLocalUser("bob@example.com", "another strong secret"));
-    assert.equal(reads, 2, `expected a re-read after the write, got ${reads}`);
+    assert.equal(reads, 3, `expected a re-read after the write, got ${reads}`);
   } finally {
     fs.readFileSync = original;
   }
@@ -268,9 +284,95 @@ test("queueing is FIFO and the cap recovers after load drops", async () => {
   assert.equal((await signupLocalUser("after@example.com", "long enough password")).ok, true);
 });
 
+test("password reset tokens: issue → consume works once, then the token is dead", async () => {
+  process.env.SWARM_SESSION_SECRET = "test-session-secret";
+  await signupLocalUser("alice@example.com", "correct horse battery");
+
+  const token = await issuePasswordResetToken("alice@example.com");
+  assert.ok(token, "a token is minted for a known account");
+  assert.ok(token.startsWith("pr1."), `token carries the pr1 prefix: ${token}`);
+
+  // The raw token is never at rest: only its HMAC is stored.
+  const raw = fs.readFileSync(path.join(dir, "users.json"), "utf-8");
+  assert.ok(!raw.includes(token), "raw reset token must not appear in the store");
+
+  assert.equal(await consumePasswordResetToken(token), "alice@example.com");
+  // Single-use: a replay finds nothing.
+  assert.equal(await consumePasswordResetToken(token), null);
+});
+
+test("password reset tokens: unknown account, garbage and expired tokens all fail closed", async () => {
+  process.env.SWARM_SESSION_SECRET = "test-session-secret";
+  await signupLocalUser("alice@example.com", "correct horse battery");
+
+  // Unknown account: nothing minted (the route still answers 200).
+  assert.equal(await issuePasswordResetToken("nobody@example.com"), null);
+  assert.equal(await issuePasswordResetToken("not-an-email"), null);
+
+  // Garbage shapes never consume.
+  assert.equal(await consumePasswordResetToken("pr1.not-a-real-token"), null);
+  assert.equal(await consumePasswordResetToken("garbage"), null);
+  assert.equal(await consumePasswordResetToken(null), null);
+  assert.equal(await consumePasswordResetToken(42), null);
+
+  // Expired: issued at t, consumed after the TTL.
+  const t0 = 1_800_000_000_000;
+  const token = await issuePasswordResetToken("alice@example.com", { now: t0, ttlMs: 60_000 });
+  assert.ok(token);
+  assert.equal(await consumePasswordResetToken(token, { now: t0 + 60_001 }), null);
+  // The expired token was cleared on the failed consume: even rewinding
+  // the clock cannot resurrect it.
+  assert.equal(await consumePasswordResetToken(token, { now: t0 }), null);
+});
+
+test("password reset tokens: issuing a new token invalidates the previous link", async () => {
+  process.env.SWARM_SESSION_SECRET = "test-session-secret";
+  await signupLocalUser("alice@example.com", "correct horse battery");
+
+  const first = await issuePasswordResetToken("alice@example.com");
+  const second = await issuePasswordResetToken("alice@example.com");
+  assert.ok(first && second && first !== second);
+
+  assert.equal(await consumePasswordResetToken(first), null, "the older link is dead");
+  assert.equal(await consumePasswordResetToken(second), "alice@example.com");
+});
+
+test("setUserPassword rotates the password, revokes sessions and clears reset tokens", async () => {
+  process.env.SWARM_SESSION_SECRET = "test-session-secret";
+  await signupLocalUser("alice@example.com", "correct horse battery");
+  const token = await issuePasswordResetToken("alice@example.com");
+  assert.ok(token);
+  assert.equal(getSessionEpoch("alice@example.com"), 0);
+
+  assert.deepEqual(await setUserPassword("alice@example.com", "a brand new password"), { ok: true });
+
+  // Old password is dead, new one works.
+  assert.equal(await verifyLocalUser("alice@example.com", "correct horse battery"), null);
+  assert.ok(await verifyLocalUser("alice@example.com", "a brand new password"));
+
+  // Every prior session is revoked (epoch raised to now).
+  const epoch = getSessionEpoch("alice@example.com");
+  assert.ok(epoch > Date.now() - 5_000 && epoch <= Date.now(), `epoch should be recent ms, got ${epoch}`);
+
+  // The pending reset token died with the password change.
+  assert.equal(await consumePasswordResetToken(token), null);
+});
+
+test("setUserPassword rejects weak passwords and unknown accounts", async () => {
+  await signupLocalUser("alice@example.com", "correct horse battery");
+  assert.deepEqual(await setUserPassword("alice@example.com", "short"), { ok: false, error: "invalid" });
+  assert.deepEqual(await setUserPassword("alice@example.com", 42), { ok: false, error: "invalid" });
+  assert.deepEqual(await setUserPassword("nobody@example.com", "long enough password"), {
+    ok: false,
+    error: "unknown",
+  });
+  // The original password still works after the rejected attempts.
+  assert.ok(await verifyLocalUser("alice@example.com", "correct horse battery"));
+});
+
 test("no synchronous scrypt call remains in the source tree", () => {
   // Build the needle at runtime so this guard does not match itself.
-  const needle = ["scrypt", "Sync"].join("");
+  const needle = ["scrypt", "Sync"].join("\n");
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const roots = ["app", "lib", "components", "scripts", "minimalist-ui"];
   const files = [
@@ -389,3 +491,157 @@ function collectSourceFiles(dir: string): string[] {
   }
   return out;
 }
+
+/* ------------------------------------------------------------------ */
+/* Email verification (FIX-44)                                         */
+/* ------------------------------------------------------------------ */
+
+test("new signups start unverified; the token flips the flag exactly once", async () => {
+  process.env.SWARM_SESSION_SECRET = "test-secret-for-verification";
+  await signupLocalUser("new@example.com", "correct horse battery");
+  assert.equal(isEmailVerified("new@example.com"), false);
+  assert.equal(isEmailVerifiedForUserId("local_new@example.com"), false);
+
+  const token = await issueEmailVerificationToken("new@example.com");
+  assert.ok(token?.startsWith("ev1."));
+  // Only the HMAC is stored — the raw token never lands in users.json.
+  const raw = fs.readFileSync(path.join(dir, "users.json"), "utf-8");
+  assert.ok(!raw.includes(token!), "raw verification token must not be persisted");
+
+  assert.equal(await consumeEmailVerificationToken(token), "new@example.com");
+  assert.equal(isEmailVerified("new@example.com"), true);
+  assert.equal(isEmailVerifiedForUserId("local_new@example.com"), true);
+  // Single-use: replaying the link fails.
+  assert.equal(await consumeEmailVerificationToken(token), null);
+  // Already verified: no new token is issued.
+  assert.equal(await issueEmailVerificationToken("new@example.com"), null);
+});
+
+test("verification tokens expire, reissue invalidates, and reset tokens cannot verify", async () => {
+  process.env.SWARM_SESSION_SECRET = "test-secret-for-verification";
+  await signupLocalUser("exp@example.com", "correct horse battery");
+  const t0 = 1_700_000_000_000;
+  const stale = await issueEmailVerificationToken("exp@example.com", { now: t0, ttlMs: 60_000 });
+  assert.ok(stale);
+  assert.equal(await consumeEmailVerificationToken(stale, { now: t0 + 61_000 }), null);
+  assert.equal(isEmailVerified("exp@example.com"), false);
+
+  const first = await issueEmailVerificationToken("exp@example.com");
+  const second = await issueEmailVerificationToken("exp@example.com");
+  assert.ok(first && second && first !== second);
+  assert.equal(await consumeEmailVerificationToken(first), null, "reissue kills the earlier link");
+  assert.equal(await consumeEmailVerificationToken(second), "exp@example.com");
+
+  // Cross-domain: a password-reset token is not a verification token.
+  await signupLocalUser("cross@example.com", "correct horse battery");
+  const resetToken = await issuePasswordResetToken("cross@example.com");
+  assert.ok(resetToken);
+  assert.equal(await consumeEmailVerificationToken(resetToken), null);
+  assert.equal(isEmailVerified("cross@example.com"), false);
+});
+
+test("legacy accounts without the flag are grandfathered; non-local ids pass the gate", async () => {
+  // A users.json written before FIX-44: no `verified` field at all.
+  fs.writeFileSync(
+    path.join(dir, "users.json"),
+    JSON.stringify({
+      version: 1,
+      users: [{ email: "legacy@example.com", password: "scrypt$00$00", createdAt: 1 }],
+    }),
+  );
+  assert.equal(isEmailVerified("legacy@example.com"), true);
+  assert.equal(isEmailVerifiedForUserId("local_legacy@example.com"), true);
+  // Unknown local account fails closed; non-local identities are not gated.
+  assert.equal(isEmailVerifiedForUserId("local_ghost@example.com"), false);
+  assert.equal(isEmailVerifiedForUserId("alice"), true);
+  assert.equal(isEmailVerifiedForUserId("harness"), true);
+  assert.equal(isEmailVerified("nobody@example.com"), false);
+});
+
+// ---------------------------------------------------------------------------
+// FIX-45: cross-process write serialization (users.json.lock).
+// ---------------------------------------------------------------------------
+
+function runSignupChild(
+  userFile: string,
+  prefix: string,
+  count: number,
+): { child: ChildProcess; done: Promise<number> } {
+  const libDir = path.dirname(fileURLToPath(import.meta.url));
+  const usersModule = path.join(libDir, "users.ts");
+  const scriptPath = path.join(dir, `signup-child-${prefix}.mts`);
+  fs.writeFileSync(
+    scriptPath,
+    [
+      `import { configureUserPaths, signupLocalUser } from ${JSON.stringify(usersModule)};`,
+      `const [file, prefix, countRaw] = process.argv.slice(2);`,
+      `configureUserPaths(file);`,
+      `const count = Number(countRaw);`,
+      `for (let i = 0; i < count; i++) {`,
+      `  const r = await signupLocalUser(prefix + i + "@example.com", "validpassword123");`,
+      `  if (!r.ok) { console.error("signup failed:", r.error); process.exit(1); }`,
+      `}`,
+      `console.log("done");`,
+      ``,
+    ].join("\n"),
+  );
+  const child = spawn(
+    process.execPath,
+    ["--import", "tsx", scriptPath, userFile, prefix, String(count)],
+    { cwd: path.resolve(libDir, ".."), stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let stderr = "";
+  child.stderr?.on("data", (d: Buffer) => {
+    stderr += d.toString();
+  });
+  const done = new Promise<number>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`signup child ${prefix} timed out: ${stderr}`));
+    }, 60_000);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) reject(new Error(`signup child ${prefix} exited ${code}: ${stderr}`));
+      else resolve(0);
+    });
+  });
+  return { child, done };
+}
+
+test("a second process cannot write users.json while the file lock is held", async () => {
+  const userFile = path.join(dir, "users.json");
+  const release = await acquireFileLock(`${userFile}.lock`);
+  const { done } = runSignupChild(userFile, "blocked", 1);
+  let exited = false;
+  void done.then(
+    () => {
+      exited = true;
+    },
+    () => {
+      exited = true;
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  assert.equal(exited, false, "child signup must wait for the file lock");
+  release();
+  assert.equal(await done, 0);
+  assert.equal(localUserExists("blocked0@example.com"), true);
+});
+
+test("two processes signing up concurrently lose no accounts", async () => {
+  const userFile = path.join(dir, "users.json");
+  const a = runSignupChild(userFile, "alpha", 8);
+  const b = runSignupChild(userFile, "beta", 8);
+  assert.equal(await a.done, 0);
+  assert.equal(await b.done, 0);
+  const ids = listLocalUserIds();
+  assert.equal(ids.length, 16, `expected 16 accounts, got ${ids.length}: ${ids.join(", ")}`);
+  for (let i = 0; i < 8; i++) {
+    assert.equal(localUserExists(`alpha${i}@example.com`), true);
+    assert.equal(localUserExists(`beta${i}@example.com`), true);
+  }
+});

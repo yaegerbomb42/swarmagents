@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { countConfiguredProviders } from './Settings';
+import { countConfiguredProviders, validatePasswordChange } from './Settings';
 import { parseBudgetInput } from '../utils/budget';
 
 // The Settings tab count must reflect the user's own configured providers:
@@ -30,4 +30,18 @@ test('parseBudgetInput validates budget inputs properly', () => {
   assert.equal(parseBudgetInput('abc').valid, false);
   assert.equal(parseBudgetInput('NaN').valid, false);
   assert.equal(parseBudgetInput('Infinity').valid, false);
+});
+
+// The change-password form (FIX-40) validates client-side with the same
+// policy the server enforces (lib/users: 8–1024 chars), so obvious
+// mistakes never round-trip; the route stays the authority.
+test('validatePasswordChange mirrors the server password policy', () => {
+  assert.equal(validatePasswordChange('old password', 'new password', 'new password'), null);
+  assert.equal(validatePasswordChange('', 'new password', 'new password'), 'Enter your current password.');
+  assert.equal(validatePasswordChange('old password', 'short', 'short'), 'New password must be at least 8 characters.');
+  assert.equal(validatePasswordChange('old password', 'x'.repeat(1025), 'x'.repeat(1025)), 'New password is too long.');
+  assert.equal(validatePasswordChange('old password', 'new password', 'different'), 'New passwords do not match.');
+  // Boundary lengths are accepted.
+  assert.equal(validatePasswordChange('old password', '12345678', '12345678'), null);
+  assert.equal(validatePasswordChange('old password', 'x'.repeat(1024), 'x'.repeat(1024)), null);
 });

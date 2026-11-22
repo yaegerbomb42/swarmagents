@@ -45,6 +45,16 @@ const PUBLIC = new Set([
   "/api/signup",
   "/api/me",
   "/api/health",
+  // Password reset (FIX-39): the token in the emailed link is the
+  // credential; both routes are oracle-free and rate-limited.
+  "/reset-password",
+  "/api/password-reset/request",
+  "/api/password-reset/confirm",
+  // Email verification (FIX-44): the token in the emailed link is the
+  // credential; the confirm route is single-use and rate-limited. The
+  // resend route is NOT public — it requires a session.
+  "/verify-email",
+  "/api/email-verification/confirm",
   // BYOC: the node has no session yet; the pairing code / bearer token is the
   // credential and both routes authenticate themselves.
   "/api/computers/pair",

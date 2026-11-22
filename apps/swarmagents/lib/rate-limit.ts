@@ -136,6 +136,17 @@ const probeBucket = new TokenBucket(perMinute("SWARM_PROVIDER_PROBE_RATE_LIMIT_P
 const signupBucket = new TokenBucket(perMinute("SWARM_SIGNUP_RATE_LIMIT_PER_MIN", 5), 60_000);
 
 /**
+ * Password-reset bucket (FIX-39): the request endpoint mints tokens and
+ * sends mail, the confirm endpoint burns a scrypt hash — both get the
+ * same strict per-identity budget as login/signup. 5/min by default,
+ * tunable with SWARM_PASSWORD_RESET_RATE_LIMIT_PER_MIN.
+ */
+const passwordResetBucket = new TokenBucket(
+  perMinute("SWARM_PASSWORD_RESET_RATE_LIMIT_PER_MIN", 5),
+  60_000,
+);
+
+/**
  * Strict degraded-mode bucket for anonymous requests whose client identity
  * could not be established. It is deliberately separate from `apiBucket` so a
  * flood of unidentified traffic can never eat the app-wide 300/min budget,
@@ -283,6 +294,8 @@ export function rateLimitCheck(
   else if (key === UNIDENTIFIED_KEY) bucket = unidentifiedBucket;
   else if (pathname === "/api/login") bucket = loginBucket;
   else if (pathname === "/api/signup") bucket = signupBucket;
+  else if (pathname.startsWith("/api/password-reset/") || pathname.startsWith("/api/email-verification/"))
+    bucket = passwordResetBucket;
   else if (isShare) bucket = shareBucket;
   else bucket = apiBucket;
 
@@ -310,6 +323,7 @@ export function resetBuckets(): void {
   apiBucket._clear();
   loginBucket._clear();
   signupBucket._clear();
+  passwordResetBucket._clear();
   boardBucket._clear();
   approvalBucket._clear();
   unidentifiedBucket._clear();

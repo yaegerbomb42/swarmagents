@@ -81,6 +81,50 @@ export function useProviderStatus(): ProviderStatus {
   return { state, count, refresh };
 }
 
+export interface FirstRunSetupInput {
+  /** Server provider status; "unknown" until the server answers (or when it cannot be reached). */
+  providerState: ProviderStatus["state"];
+  /** The API answered 401; the signed-out notice owns that state. */
+  signedOut: boolean;
+  /** The session's first poll has answered. */
+  ready: boolean;
+  /** The conversation list has loaded, so an empty list is a fact, not a guess. */
+  threadsReady: boolean;
+  /** Runs in the open conversation. */
+  turns: number;
+  /** Conversations on the account. */
+  threads: number;
+}
+
+export interface FirstRunSetup {
+  /** No usable provider: a run cannot start, so sending stays blocked. */
+  needsProvider: boolean;
+  /** A fresh account (no runs, no conversations) with no provider: route to setup. */
+  firstRun: boolean;
+}
+
+/**
+ * What a zero-provider account sees instead of a run that errors (FIX-43).
+ *
+ * `needsProvider` is true only on a confirmed "missing" — never on
+ * "unknown", for the same reason `useProviderStatus` stays unknown on a
+ * failed fetch: blocking the composer on a guess would flash a setup wall
+ * at accounts that do have a key. Signed-out visitors are excluded; their
+ * notice and blocked reason already say what to do.
+ *
+ * `firstRun` additionally requires a fresh account (no runs, no
+ * conversations, both lists actually loaded): that is the just-signed-up
+ * case the workspace routes straight to provider setup. An established
+ * account that removed its only provider gets the blocked composer and
+ * the notice, but is not yanked into Settings.
+ */
+export function firstRunSetup(input: FirstRunSetupInput): FirstRunSetup {
+  const needsProvider = input.providerState === "missing" && !input.signedOut;
+  const firstRun =
+    needsProvider && input.ready && input.threadsReady && input.turns === 0 && input.threads === 0;
+  return { needsProvider, firstRun };
+}
+
 /** True when the viewport is wide enough for chat and stage side by side. */
 export function useIsWide(query = "(min-width: 1024px)"): boolean {
   const [wide, setWide] = useState(() =>

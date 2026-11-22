@@ -10,6 +10,7 @@
  * diffed; the only change is this header.
  */
 
+import os from "node:os";
 import path from "node:path";
 
 const sigmoid = (z: number): number => 1 / (1 + Math.exp(-z));
@@ -126,6 +127,7 @@ const outsideRepo = (command: string, cwd: string, repoRoot: string): boolean =>
   if (repoRoot && cwd && !isInside(normalizeDir(cwd), normalizeDir(repoRoot))) return true;
   if (!repoRoot) return false;
   const root = normalizeDir(repoRoot);
+  const tmpDir = path.posix.normalize(os.tmpdir());
   return segmentsOf(command, MUTATORS).some(([, ...args]) =>
     args
       .map(unquote)
@@ -133,7 +135,7 @@ const outsideRepo = (command: string, cwd: string, repoRoot: string): boolean =>
       .some(
         (a) =>
           a.startsWith("/") &&
-          !(a === "/tmp" || a.startsWith("/tmp/")) &&
+          !(a === tmpDir || a.startsWith(`${tmpDir}/`)) &&
           !(a === "/dev/null" || a.startsWith("/dev/null/")) &&
           !isInside(a, root),
       ),

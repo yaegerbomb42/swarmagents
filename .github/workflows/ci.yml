@@ -4,6 +4,9 @@ name: CI
 # repo-level checks plus the SwarmAgents gates from its own directory.
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   repo-checks:
     name: Repo consistency
@@ -34,6 +37,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: apps/swarmagents/package-lock.json
 
       - name: Install dependencies
         working-directory: apps/swarmagents

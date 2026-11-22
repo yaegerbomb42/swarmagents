@@ -70,6 +70,6 @@ jobs:
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_SSH_KEY: /home/runner/.ssh/swarm_deploy
-          DEPLOY_KNOWN_HOSTS: /home/runner/.ssh/swarm_known_hosts
+          DEPLOY_SSH_KEY: ${{ env.HOME }}/.ssh/swarm_deploy
+          DEPLOY_KNOWN_HOSTS: ${{ env.HOME }}/.ssh/swarm_known_hosts
         run: ./deploy.sh "${{ inputs.action || 'deploy' }}"

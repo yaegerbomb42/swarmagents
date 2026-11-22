@@ -21,6 +21,7 @@ import { noStoreJson } from "../../../lib/http";
 import { isLensId, type LensId } from "../../../lib/lenses/types";
 import { cachedLens, runLens } from "../../../lib/lenses/run";
 import { MAX_FILES, type ReferencedFile } from "../../../lib/lenses/prompts";
+import { AbortError, RouterError } from "../../../lib/providers/errors";
 import { TokenBucket } from "../../../lib/rate-limit";
 import { getRun } from "../../../lib/runtime/run-store";
 import { RUN_ID_RE } from "../../../lib/telemetry/paths";
@@ -165,8 +166,21 @@ export async function POST(req: NextRequest) {
     });
     return noStoreJson(result);
   } catch (err) {
-    const detail = err instanceof Error ? err.message : "Lens failed.";
-    // RouterError messages are already redacted (no key material).
-    return noStoreJson({ error: detail || "Lens failed." }, { status: 502 });
+    // A cancelled request is a client-side abort, not a provider failure.
+    if (
+      req.signal.aborted ||
+      err instanceof AbortError ||
+      (err instanceof RouterError && err.code === "aborted")
+    ) {
+      return noStoreJson({ error: "Request aborted." }, { status: 499 });
+    }
+    // RouterError messages are already redacted (no key material), so the
+    // provider's own wording is safe to surface. Anything else is an
+    // internal failure — its message can carry filesystem paths or stack
+    // fragments, so it never reaches the client.
+    if (err instanceof RouterError) {
+      return noStoreJson({ error: err.message || "Lens failed." }, { status: 502 });
+    }
+    return noStoreJson({ error: "Lens failed." }, { status: 500 });
   }
 }

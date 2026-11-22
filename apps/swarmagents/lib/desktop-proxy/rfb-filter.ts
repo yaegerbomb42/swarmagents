@@ -77,7 +77,7 @@ function maxSizeForType(type: number): number {
     case 3:
       return 10;
     case 4:
-      return 6;
+      return 8;
     case 5:
       return 6;
     case 6:
@@ -105,7 +105,7 @@ const MESSAGE_FIXED_SIZE: Record<number, number> = {
   0: 20, // SetPixelFormat
   2: -1, // SetEncodings
   3: 10, // FramebufferUpdateRequest
-  4: 6, // KeyEvent
+  4: 8, // KeyEvent (type, down-flag, 2 pad, keysym u32)
   5: 6, // PointerEvent
   6: -1, // ClientCutText
   150: 10, // EnableContinuousUpdates

@@ -60,48 +60,69 @@ export interface RoleClamp {
   maxDeadlineMs?: number;
 }
 
-/** Tools that mutate files (engine names and Claude Code / permission names). */
+/**
+ * Canonical key for a tool name, for the permission checks below: lowercased
+ * with separators removed, so "write_file", "Write", "WRITE" and "write-file"
+ * all classify the same way. A few engine names need an explicit alias
+ * because the separator-stripped form still differs from the Claude Code
+ * name ("write_file" -> "writefile" vs "Write" -> "write"). Without this,
+ * any spelling that is not an exact set member slips past readOnly /
+ * commandExecutionAllowed / networkAllowed — a fail-open hole for every
+ * differently-cased or snake_case alias of a guarded tool.
+ */
+const TOOL_ALIASES: Readonly<Record<string, string>> = {
+  writefile: "write",
+  editfile: "edit",
+  restorecheckpoint: "checkpoint",
+};
+
+export function normalizeToolName(toolName: string): string {
+  const compact = toolName.toLowerCase().replace(/[\s_-]+/g, "");
+  return TOOL_ALIASES[compact] ?? compact;
+}
+
+/**
+ * Tools that mutate files, by canonical key (see {@link normalizeToolName}).
+ * Covers the engine snake_case names, the Claude Code PascalCase names, and
+ * the vendored-engine spellings: write_file/Write, edit_file/Edit,
+ * multi_edit/MultiEdit, NotebookEdit, str_replace, replace_lines, and
+ * restore_checkpoint/Checkpoint (a restore rewrites files, so readOnly
+ * blocks it too).
+ */
 const EDIT_TOOLS: ReadonlySet<string> = new Set([
-  "str_replace",
-  "multi_edit",
-  "replace_lines",
-  "write_file",
-  "edit_file",
-  // Claude Code / role-mcp permissions
-  "Write",
-  "Edit",
-  "MultiEdit",
-  "NotebookEdit",
+  "write",
+  "edit",
+  "multiedit",
+  "notebookedit",
+  "strreplace",
+  "replacelines",
+  "checkpoint",
 ]);
 
-/** Tools that execute commands (engine names and Claude Code / permission names). */
-const EXEC_TOOLS: ReadonlySet<string> = new Set([
-  "bash",
-  // Claude Code / role-mcp permissions
-  "Bash",
-]);
+/** Tools that execute commands, by canonical key. */
+const EXEC_TOOLS: ReadonlySet<string> = new Set(["bash"]);
 
-/** Tools that reach the network (engine names and Claude Code / permission names). */
+/**
+ * Tools that reach the network, by canonical key. MCP server tools
+ * (mcp__<server>__<tool>) are matched by prefix in {@link isNetworkTool},
+ * not listed here.
+ */
 const NETWORK_TOOLS: ReadonlySet<string> = new Set([
-  "web_fetch",
-  "web_search",
+  "webfetch",
+  "websearch",
   "browser",
   "mcp",
-  "mcp_call",
-  "mcp_search",
-  "integrations_search",
-  "integrations_install",
-  // Claude Code / role-mcp permissions
-  "WebFetch",
-  "WebSearch",
-  "Browser",
-  "ApiRequest",
+  "mcpcall",
+  "mcpsearch",
+  "integrationssearch",
+  "integrationsinstall",
+  "apirequest",
 ]);
 
 /** Helper to test if a tool reaches the network (including mcp__* servers). */
 function isNetworkTool(toolName: string): boolean {
-  if (NETWORK_TOOLS.has(toolName)) return true;
-  if (toolName.startsWith("mcp__")) return true;
+  if (NETWORK_TOOLS.has(normalizeToolName(toolName))) return true;
+  if (toolName.toLowerCase().startsWith("mcp__")) return true;
   return false;
 }
 
@@ -140,7 +161,11 @@ export function clampedTurnCeiling(role: RoleClamp | undefined, globalMax: numbe
 
 /**
  * Clamp the absolute deadline to the role-defined relative deadline. The
- * role's deadline is measured from `cycleStartMs`.
+ * role's deadline is measured from `cycleStartMs`. A relative deadline must
+ * be a finite, positive duration and the global deadline a finite, positive
+ * epoch time — anything else (NaN, Infinity, <= 0) is ignored as if it were
+ * unset, so a bad value can never produce a NaN, infinite, or already-past
+ * deadline. A non-finite cycle start is treated as 0.
  */
 export function clampedDeadlineMs(
   role: RoleClamp | undefined,
@@ -148,11 +173,19 @@ export function clampedDeadlineMs(
   cycleStartMs: number,
 ): number | undefined {
   const relative = roleDeadlineMs(role);
-  if (relative !== undefined && globalDeadlineMs !== undefined) {
-    return Math.min(cycleStartMs + relative, globalDeadlineMs);
+  const validRelative =
+    typeof relative === "number" && Number.isFinite(relative) && relative > 0 ? relative : undefined;
+  const validGlobal =
+    typeof globalDeadlineMs === "number" && Number.isFinite(globalDeadlineMs) && globalDeadlineMs > 0
+      ? globalDeadlineMs
+      : undefined;
+  const start = Number.isFinite(cycleStartMs) ? cycleStartMs : 0;
+
+  if (validRelative !== undefined && validGlobal !== undefined) {
+    return Math.min(start + validRelative, validGlobal);
   }
-  if (relative !== undefined) return cycleStartMs + relative;
-  return globalDeadlineMs;
+  if (validRelative !== undefined) return start + validRelative;
+  return validGlobal;
 }
 
 /** Filter a tool list by the role's allowedTools whitelist and permission flags. */
@@ -183,10 +216,14 @@ export function toolDenialReason(
     return `tool "${toolName}" is not in the "${role.id}" role whitelist`;
   }
   const perms = role.permissions;
-  if (perms?.readOnly === true && EDIT_TOOLS.has(toolName)) {
+  // Permission checks run on the normalized name: the whitelist above stays
+  // an exact match (fail-closed), but a permission flag must not be dodged
+  // by spelling the same tool differently ("WRITE", "write_file", "webfetch").
+  const key = normalizeToolName(toolName);
+  if (perms?.readOnly === true && EDIT_TOOLS.has(key)) {
     return `role "${role.id}" is read-only and cannot use "${toolName}"`;
   }
-  if (perms?.commandExecutionAllowed === false && EXEC_TOOLS.has(toolName)) {
+  if (perms?.commandExecutionAllowed === false && EXEC_TOOLS.has(key)) {
     return `role "${role.id}" is not permitted to execute commands ("${toolName}")`;
   }
   if (perms?.networkAllowed === false && isNetworkTool(toolName)) {

@@ -57,9 +57,14 @@ import { resolvePreviewShare, type PreviewShareOwner } from "../preview/tokens";
 import { resolveShareOwner } from "../projects/store";
 import { DesktopBridge } from "./bridge";
 import type { RfbFilterMode } from "./rfb-filter";
+import { FrameTap, type FrameTapOptions } from "./frame-tap";
+import type { CaptionFrame, KeyframeMeta } from "./takeover/types";
+import type { StoredKeyframe } from "./takeover/keyframe-store";
 
 export const DESKTOP_WS_PATH = "/desktop/ws";
 export const DESKTOP_HTTP_PREFIX = "/desktop/";
+/** Proxy-local keyframe read API (never forwarded to the VM). */
+export const DESKTOP_KEYFRAMES_PATH = "/desktop/keyframes";
 /** Upgrade requests under this prefix are preview WebSockets, not desktop. */
 export const PREVIEW_WS_PREFIX = "/preview/";
 /** `/preview/share/<token>/<port>/...` — the token-gated preview mount. */
@@ -128,6 +133,14 @@ export interface DesktopProxyOptions {
   recordFrames?: boolean;
   /** Recording directory used when `recordFrames` is true. */
   recordingDir?: string;
+  /**
+   * Opt-in frame tap (damage-region differencing + keyframe capture, see
+   * frame-tap.ts). When set, each desktop session gets a FrameTap fed from
+   * its bridge; captured keyframes are readable via the DesktopProxy
+   * keyframe methods and GET /desktop/keyframes. Default off: zero
+   * overhead and no frames held in memory.
+   */
+  frameTap?: FrameTapOptions;
   now?: () => number;
 }
 
@@ -174,6 +187,24 @@ export interface DesktopProxy {
    * a handoff is outstanding, and to restore control on hand-back).
    */
   setUserMode(userId: string, mode: RfbFilterMode): void;
+  /**
+   * Keyframe metadata across the user's live desktop sessions, oldest
+   * first. Empty when the frame tap is off or no session has captured
+   * frames yet. Keyframes live only as long as their session's bridge.
+   */
+  getKeyframes(userId: string): Array<KeyframeMeta & { sessionId: number }>;
+  /** One stored keyframe (JPEG bytes) by id, optionally scoped to a session. */
+  getKeyframe(userId: string, id: string, sessionId?: number): StoredKeyframe | undefined;
+  /**
+   * The keyframe nearest to `timestamp`: the latest at or before it, else
+   * the earliest available. Optionally scoped to a session.
+   */
+  getKeyframeAt(userId: string, timestamp: number, sessionId?: number): StoredKeyframe | undefined;
+  /**
+   * Latest composited desktop frame as RGBA — the handback summarizer's
+   * caption input. Null when no session has a frame yet.
+   */
+  getLatestDesktopFrame(userId: string): CaptionFrame | null;
 }
 
 /**
@@ -367,6 +398,127 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
     return mapped === "" ? "/" : mapped;
   }
 
+  // --- Keyframe read API (proxy-local, never forwarded to the VM) -------------
+
+  /** Live frame taps for a user, keyed by session id. */
+  function tapsFor(userId: string): Array<{ sessionId: number; tap: FrameTap }> {
+    const set = sessionsByUser.get(userId);
+    if (!set) return [];
+    const out: Array<{ sessionId: number; tap: FrameTap }> = [];
+    for (const session of set) {
+      const tap = session.bridge?.getFrameTap();
+      if (tap) out.push({ sessionId: session.id, tap });
+    }
+    return out;
+  }
+
+  function listKeyframes(userId: string): Array<KeyframeMeta & { sessionId: number }> {
+    const out: Array<KeyframeMeta & { sessionId: number }> = [];
+    for (const { sessionId, tap } of tapsFor(userId)) {
+      for (const meta of tap.keyframes.listMeta()) out.push({ ...meta, sessionId });
+    }
+    out.sort((a, b) => a.timestamp - b.timestamp);
+    return out;
+  }
+
+  function findKeyframe(
+    userId: string,
+    id: string,
+    sessionId?: number,
+  ): StoredKeyframe | undefined {
+    for (const entry of tapsFor(userId)) {
+      if (sessionId !== undefined && entry.sessionId !== sessionId) continue;
+      const found = entry.tap.keyframes.getById(id);
+      if (found) return found;
+    }
+    return undefined;
+  }
+
+  function findKeyframeAt(
+    userId: string,
+    timestamp: number,
+    sessionId?: number,
+  ): StoredKeyframe | undefined {
+    let best: StoredKeyframe | undefined;
+    let earliest: StoredKeyframe | undefined;
+    for (const entry of tapsFor(userId)) {
+      if (sessionId !== undefined && entry.sessionId !== sessionId) continue;
+      for (const meta of entry.tap.keyframes.listMeta()) {
+        if (!earliest || meta.timestamp < earliest.meta.timestamp) {
+          earliest = entry.tap.keyframes.getById(meta.id);
+        }
+        if (meta.timestamp <= timestamp && (!best || meta.timestamp > best.meta.timestamp)) {
+          best = entry.tap.keyframes.getById(meta.id);
+        }
+      }
+    }
+    return best ?? earliest;
+  }
+
+  function latestDesktopFrame(userId: string): CaptionFrame | null {
+    for (const { tap } of tapsFor(userId)) {
+      const frame = tap.latestFrame();
+      if (frame) return frame;
+    }
+    return null;
+  }
+
+  function writeKeyframeJpeg(
+    req: IncomingMessage,
+    res: ServerResponse,
+    frame: StoredKeyframe | undefined,
+  ): void {
+    if (!frame) return safeError(res, 404, "Keyframe not found.");
+    res.writeHead(200, {
+      "content-type": "image/jpeg",
+      "content-length": frame.jpeg.byteLength,
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+    });
+    res.end(req.method === "HEAD" ? undefined : Buffer.from(frame.jpeg));
+  }
+
+  /**
+   * GET /desktop/keyframes            -> JSON metadata list (all sessions)
+   * GET /desktop/keyframes/<id>       -> JPEG bytes (?session=<n> to scope)
+   * GET /desktop/keyframes/at/<ts>    -> JPEG nearest to <ts> (epoch ms)
+   * Session-gated by the same checks as the asset path; keyframes are
+   * screenshots of the user's own desktop and never leave this process
+   * except to the authenticated owner.
+   */
+  function handleKeyframesRequest(
+    req: IncomingMessage,
+    res: ServerResponse,
+    userId: string,
+    url: URL,
+  ): void {
+    const rest = url.pathname.slice(DESKTOP_KEYFRAMES_PATH.length); // "" | "/<id>" | "/at/<ts>"
+    const sessionParam = url.searchParams.get("session");
+    const sessionId =
+      sessionParam !== null && /^\d+$/.test(sessionParam) ? Number(sessionParam) : undefined;
+    if (rest === "" || rest === "/") {
+      const body = JSON.stringify({ keyframes: listKeyframes(userId) });
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+        "x-frame-options": "DENY",
+      });
+      res.end(req.method === "HEAD" ? undefined : body);
+      return;
+    }
+    const atMatch = /^\/at\/(\d+)$/.exec(rest);
+    if (atMatch) {
+      return writeKeyframeJpeg(req, res, findKeyframeAt(userId, Number(atMatch[1]), sessionId));
+    }
+    const idMatch = /^\/(kf_\d+_\d+)$/.exec(rest);
+    if (idMatch) {
+      return writeKeyframeJpeg(req, res, findKeyframe(userId, idMatch[1]!, sessionId));
+    }
+    return safeError(res, 404, "Not found.");
+  }
+
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== "GET" && req.method !== "HEAD") {
       return safeError(res, 405, "Method not allowed on /desktop/*");
@@ -377,6 +529,15 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
     if (!originAllowed(req)) return safeError(res, 403, "Cross-site request blocked.");
 
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    // Proxy-local keyframe read API (never forwarded to the VM): captured
+    // desktop keyframes for the authenticated owner. Same auth gates as
+    // the asset path above (host, session, origin).
+    if (
+      url.pathname === DESKTOP_KEYFRAMES_PATH ||
+      url.pathname.startsWith(`${DESKTOP_KEYFRAMES_PATH}/`)
+    ) {
+      return handleKeyframesRequest(req, res, user.id, url);
+    }
     const mapped = mapDeskPath(url.pathname);
     if (mapped === null) return safeError(res, 404, "Not found.");
 
@@ -667,6 +828,7 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
         opts.recordFrames && opts.recordingDir
           ? path.join(opts.recordingDir, `frames-${session.userId}-${session.id}.rfb`)
           : undefined;
+      const frameTap = opts.frameTap ? new FrameTap(opts.frameTap) : undefined;
       session.bridge = new DesktopBridge(socket, upSocket, {
         mode: session.mode,
         password: endpoint.password,
@@ -676,6 +838,7 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
         upstreamHead: upHead,
         recordFrames: opts.recordFrames,
         recordingFile,
+        frameTap,
       });
 
       recordAudit({
@@ -747,6 +910,18 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
         // promoting to control removes it.
         session.bridge?.setMode(mode);
       }
+    },
+    getKeyframes(userId: string) {
+      return listKeyframes(userId);
+    },
+    getKeyframe(userId: string, id: string, sessionId?: number) {
+      return findKeyframe(userId, id, sessionId);
+    },
+    getKeyframeAt(userId: string, timestamp: number, sessionId?: number) {
+      return findKeyframeAt(userId, timestamp, sessionId);
+    },
+    getLatestDesktopFrame(userId: string) {
+      return latestDesktopFrame(userId);
     },
     get port() {
       return boundPort;

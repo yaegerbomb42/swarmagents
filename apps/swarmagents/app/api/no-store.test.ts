@@ -32,12 +32,16 @@ import {
 import { DELETE as SHARE_DELETE, POST as SHARE_POST } from "./projects/[id]/share/route";
 import { DELETE as PAIR_DELETE, GET as PAIR_GET, POST as PAIR_POST } from "./byoc/pair/route";
 import { POST as LENSES_POST } from "./lenses/route";
+import { GET as CONNECTORS_GET, POST as CONNECTORS_POST } from "./connectors/route";
+import { DELETE as CONNECTOR_DELETE, GET as CONNECTOR_GET } from "./connectors/[id]/route";
 import { ByocTokenStore, setByocTokenStoreForTesting } from "../../lib/byoc/tokens";
+import { configureAuditPath } from "../../lib/audit";
 import { configureProjectStoreDir } from "../../lib/projects/store";
 import { configureStorePaths } from "../..//lib/board/store";
 import { configureAmbientStore } from "../../lib/ambient/store";
 import { setAmbientEngineForTesting } from "../../lib/ambient/runtime";
 import { configureGardenerDir } from "../../lib/gardener/store";
+import { configureLibraryStoreDir } from "../../lib/library/user-store";
 import { configureProviderStorePaths, saveProvider } from "../../lib/providers/store";
 import { configureUserPaths, signupLocalUser } from "../../lib/users";
 import type { AmbientEngine } from "../../lib/ambient/engine";
@@ -92,7 +96,9 @@ test.beforeEach(() => {
   configureAmbientStore(path.join(dir, "ambient"));
   configureGardenerDir(dir);
   configureProviderStorePaths(path.join(dir, "providers.json"));
+  configureLibraryStoreDir(dir);
   configureUserPaths(path.join(dir, "users.json"));
+  configureAuditPath(path.join(dir, "audit.jsonl"));
   process.env.SWARM_SESSION_SECRET = SESSION_SECRET;
 });
 
@@ -102,8 +108,10 @@ test.afterEach(() => {
   configureProjectStoreDir("");
   configureStorePaths(tmpdirUnused(), path.join(tmpdirUnused(), "swarm_board.json"));
   configureProviderStorePaths("");
+  configureLibraryStoreDir(undefined);
   configureGardenerDir(null);
   configureUserPaths("");
+  configureAuditPath(undefined);
   delete process.env.SWARM_SESSION_SECRET;
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -511,4 +519,41 @@ test("the provider test route is uncacheable on success and on a missing provide
   });
   assert.equal(missing.status, 404);
   assertNoStore(missing, "providers/[id]/test 404");
+
+test("the connector routes are uncacheable on read, connect, disconnect, and errors", async () => {
+  const list = CONNECTORS_GET(userRequest("/api/connectors"));
+  assert.equal(list.status, 200);
+  assertNoStore(list, "connectors GET 200");
+
+  const connected = await CONNECTORS_POST(
+    userRequest("/api/connectors", { method: "POST", body: { connectorId: "exa" } }),
+  );
+  assert.equal(connected.status, 201);
+  assertNoStore(connected, "connectors POST 201");
+
+  const badBody = await CONNECTORS_POST(
+    userRequest("/api/connectors", { method: "POST", body: "{not-json" }),
+  );
+  assert.equal(badBody.status, 400);
+  assertNoStore(badBody, "connectors POST 400");
+
+  const one = await CONNECTOR_GET(userRequest("/api/connectors/exa"), {
+    params: Promise.resolve({ id: "exa" }),
+  });
+  assert.equal(one.status, 200);
+  assertNoStore(one, "connectors/[id] GET 200");
+
+  const missing = await CONNECTOR_GET(userRequest("/api/connectors/nope"), {
+    params: Promise.resolve({ id: "nope" }),
+  });
+  assert.equal(missing.status, 404);
+  assertNoStore(missing, "connectors/[id] GET 404");
+
+  const disconnected = await CONNECTOR_DELETE(
+    userRequest("/api/connectors/exa", { method: "DELETE" }),
+    { params: Promise.resolve({ id: "exa" }) },
+  );
+  assert.equal(disconnected.status, 200);
+  assertNoStore(disconnected, "connectors/[id] DELETE 200");
+
 });

@@ -140,6 +140,16 @@ export class TelemetryBus {
     return this.runs.get(runId)?.seq ?? this.lastSeqs.get(runId) ?? 0;
   }
 
+  /**
+   * Read buffered in-memory events with `seq > fromSeq` without allocating a
+   * RunState entry when `runId` is absent.
+   */
+  readBufferedEvents(runId: string, fromSeq = 0): SequencedEvent[] {
+    const run = this.runs.get(runId);
+    if (!run) return [];
+    return run.buffer.filter((event) => event.seq > fromSeq);
+  }
+
   evictIdleRuns(now: number = Date.now()): number {
     let evicted = 0;
     for (const [runId, run] of this.runs) {

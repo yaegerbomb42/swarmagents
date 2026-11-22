@@ -6,7 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { open, seal } from "../providers/secret-box";
-import { resolveDataDir } from "../providers/store";
+import { resolveDataDir, userDirName } from "../providers/store";
 import { isSecretKind, type SecretKind } from "./allowlist";
 
 export interface SecretRecord {
@@ -37,7 +37,14 @@ export interface AwsSecretMaterial {
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 function filePath(userId: string, env?: Record<string, string | undefined>): string {
-  return path.join(resolveDataDir(env ? { env } : {}), "vault", `${userId}.json`);
+  return path.join(resolveDataDir(env ? { env } : {}), "vault", `${userDirName(userId)}.json`);
+}
+
+function boxOptions(env?: Record<string, string | undefined>) {
+  return {
+    ...(env ? { env } : {}),
+    dataDir: resolveDataDir(env ? { env } : {}),
+  };
 }
 
 function readFile(userId: string, env?: Record<string, string | undefined>): RegistryFile {
@@ -75,7 +82,7 @@ export function putSecret(
     id: input.id,
     kind: input.kind,
     label: input.label.slice(0, 80),
-    sealed: seal(input.plaintext, userId, `vault:${input.id}`, env ? { env } : {}),
+    sealed: seal(input.plaintext, userId, `vault:${input.id}`, boxOptions(env)),
     createdAt: new Date().toISOString(),
   };
   const idx = file.secrets.findIndex((s) => s.id === input.id);
@@ -93,8 +100,22 @@ export function openSecret(
 ): { kind: SecretKind; plaintext: string } | null {
   const record = readFile(userId, env).secrets.find((s) => s.id === id);
   if (!record || !isSecretKind(record.kind)) return null;
-  const plaintext = open(record.sealed, userId, `vault:${record.id}`, env ? { env } : {});
+  const plaintext = open(record.sealed, userId, `vault:${record.id}`, boxOptions(env));
   return { kind: record.kind, plaintext };
+}
+
+/** Remove one sealed secret from the caller's vault. Returns true if it existed. */
+export function deleteSecret(
+  userId: string,
+  id: string,
+  env?: Record<string, string | undefined>,
+): boolean {
+  if (!ID_RE.test(id)) return false;
+  const file = readFile(userId, env);
+  const next = file.secrets.filter((s) => s.id !== id);
+  if (next.length === file.secrets.length) return false;
+  writeFile(userId, { secrets: next }, env);
+  return true;
 }
 
 export function parseAwsMaterial(plaintext: string): AwsSecretMaterial {

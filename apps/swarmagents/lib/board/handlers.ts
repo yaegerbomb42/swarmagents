@@ -26,6 +26,7 @@ import {
 } from "./validation";
 import { randomUUID } from "node:crypto";
 import type { HybridArtifact } from "./types";
+import { VM_MCP_TOOL_DEFINITIONS } from "../board-agent/vm-schemas";
 
 export type JsonRpcError = { code: number; message: string };
 export type JsonRpcResult = { content: Array<{ type: "text"; text: string }> };
@@ -357,6 +358,7 @@ export function handleToolsList(id: unknown) {
             },
           },
         },
+        ...VM_MCP_TOOL_DEFINITIONS,
       ],
     },
   };

@@ -25,6 +25,9 @@ import {
 } from "@/lib/board/handlers";
 
 import { JsonBodyError, readJsonBody } from "@/lib/http";
+import { providerOwner } from "@/lib/providers/owner";
+import { callVmMcpTool, isVmMcpTool } from "@/lib/board-agent/tools";
+import type { VmScreenshotResult } from "@/lib/mcp-types";
 
 export const dynamic = "force-dynamic";
 type RpcId = string | number | null;
@@ -156,7 +159,7 @@ export async function GET(req: NextRequest) {
   }, { headers: NO_STORE });
 }
 
-async function dispatchRequest(method: string, params: unknown, id: RpcId): Promise<NextResponse> {
+async function dispatchRequest(method: string, params: unknown, id: RpcId, req: NextRequest): Promise<NextResponse> {
   if (params !== undefined && !isRecord(params) && !Array.isArray(params)) {
     return jsonRpcError(-32602, "Invalid params", id);
   }
@@ -224,6 +227,38 @@ async function dispatchRequest(method: string, params: unknown, id: RpcId): Prom
       return runReadTool(id, (store) => handleListArtifacts(store, args));
     }
 
+    if (isVmMcpTool(name)) {
+      const owner = providerOwner(req);
+      if (!owner) {
+        return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
+      }
+      const res = await callVmMcpTool(owner, name, args);
+      if (!res.ok && res.error === "invalid_input") {
+        return jsonRpcError(-32602, res.summary, id);
+      }
+      const payload = res.ok
+        ? {
+            ok: true,
+            summary: res.summary,
+            ...(isRecord(res.data) ? res.data : res.data !== undefined ? { data: res.data } : {}),
+          }
+        : {
+            ok: false,
+            error: res.error ?? "vm_error",
+            summary: res.summary,
+          };
+      const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [
+        { type: "text", text: JSON.stringify(payload) },
+      ];
+      if (res.ok && name === "vm_screenshot" && isRecord(res.data)) {
+        const shot = res.data as unknown as VmScreenshotResult;
+        if (typeof shot.dataBase64 === "string" && shot.dataBase64.length > 0) {
+          content.push({ type: "image", data: shot.dataBase64, mimeType: shot.mimeType });
+        }
+      }
+      return jsonRpcResponse({ result: { content, isError: !res.ok } }, id);
+    }
+
     return jsonRpcError(-32601, `Unknown tool: ${name}`, id);
   }
 
@@ -267,7 +302,7 @@ export async function POST(req: NextRequest) {
 
   let response: NextResponse;
   try {
-    response = await dispatchRequest(method, params, id);
+    response = await dispatchRequest(method, params, id, req);
   } catch (err) {
     if (isBoardUnavailable(err)) response = boardUnavailableResponse(id);
     else {

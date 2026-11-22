@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import { useEffect, useId, useRef, useState } from "react";
-import { ArrowLeft, BookOpen, Check, ExternalLink, Loader2, Network, Plug, Plus, Search, Wrench } from "lucide-react";
-import { LibraryApiError, type InstalledItem } from "../../../lib/client/library";
+import { ArrowLeft, BookOpen, Check, ExternalLink, Loader2, Network, Plug, Plus, Search, Unplug, Wrench } from "lucide-react";
+import { libraryApi, LibraryApiError, type InstalledItem } from "../../../lib/client/library";
 import {
   addSwarmCatalogEntry,
   CATALOG_CATEGORIES,
@@ -50,7 +50,13 @@ function needsSetup(entry: SwarmCatalogEntry): boolean {
   return entry.add.via === "provider-settings" || (entry.add.via === "connector" && entry.add.fields.length > 0);
 }
 
-export function SwarmCatalog({ onAdded }: { onAdded: (item: InstalledItem) => void }) {
+export function SwarmCatalog({
+  onAdded,
+  onRemoved,
+}: {
+  onAdded: (item: InstalledItem) => void;
+  onRemoved?: (itemId: string) => void;
+}) {
   const headingId = useId();
   const searchRef = useRef<HTMLInputElement>(null);
   const addingRef = useRef(false);
@@ -62,6 +68,7 @@ export function SwarmCatalog({ onAdded }: { onAdded: (item: InstalledItem) => vo
   const [category, setCategory] = useState<CatalogCategory | "all">("all");
   const [detailId, setDetailId] = useState<string>();
   const [adding, setAdding] = useState<string>();
+  const [removing, setRemoving] = useState<string>();
   const [notice, setNotice] = useState<string>();
   const [addError, setAddError] = useState<string>();
 
@@ -99,6 +106,26 @@ export function SwarmCatalog({ onAdded }: { onAdded: (item: InstalledItem) => vo
     }
   }
 
+  async function removeConnector(entry: SwarmCatalogEntry): Promise<void> {
+    if (addingRef.current || removing || entry.add.via !== "connector") return;
+    const itemId = `connector-${entry.add.connectorId}`;
+    addingRef.current = true;
+    setRemoving(entry.id);
+    setNotice(undefined);
+    setAddError(undefined);
+    try {
+      await libraryApi.deleteItem(itemId);
+      setEntries((current) => current?.map((row) => row.id === entry.id ? { ...row, installed: false } : row));
+      onRemoved?.(itemId);
+      setNotice(`${entry.name} was disconnected from your library.`);
+    } catch (error) {
+      setAddError(errorMessage(error, `Could not disconnect ${entry.name}.`));
+    } finally {
+      addingRef.current = false;
+      setRemoving(undefined);
+    }
+  }
+
   function open(entry: SwarmCatalogEntry) {
     setDetailId(entry.id);
     setAddError(undefined);
@@ -114,14 +141,21 @@ export function SwarmCatalog({ onAdded }: { onAdded: (item: InstalledItem) => vo
   return (
     <section aria-labelledby={headingId} className="mx-auto w-full max-w-3xl px-1 py-3 sm:px-4 sm:py-6" data-testid="swarm-catalog">
       {detail ? (
-        <CatalogDetail key={detail.id} entry={detail} headingId={headingId} busy={Boolean(adding)} adding={adding === detail.id}
-          onBack={back} onAdd={(inputs) => add(detail, inputs)} />
+        <CatalogDetail key={detail.id} entry={detail} headingId={headingId} busy={Boolean(adding || removing)} adding={adding === detail.id}
+          removing={removing === detail.id}
+          onBack={back} onAdd={(inputs) => add(detail, inputs)} onRemove={() => removeConnector(detail)} />
       ) : (
         <>
           <header className="mb-5">
             <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-cyan-300/80">Extend your swarm</p>
             <h2 id={headingId} className="mt-1.5 text-2xl font-semibold tracking-tight text-zinc-50">Capability catalog</h2>
             <p className="mt-1.5 text-sm leading-relaxed text-zinc-400">Browse verified connectors, MCP servers, skills and tools for your swarm.</p>
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-cyan-400/20 bg-cyan-400/[0.06] px-3.5 py-2.5 text-xs">
+              <span className="text-zinc-300">One-click account &amp; vault connectors (GitHub, Vercel, Cloudflare, Exa, Brave):</span>
+              <Link href="/connectors" className={`inline-flex items-center gap-1 font-medium text-cyan-200 hover:underline ${FOCUS}`}>
+                <Plug className="h-3.5 w-3.5" aria-hidden="true" /> Open Connector Catalog
+              </Link>
+            </div>
           </header>
           <div className="space-y-2.5">
             <label className="relative block">
@@ -169,7 +203,17 @@ export function SwarmCatalog({ onAdded }: { onAdded: (item: InstalledItem) => vo
                       <span className="mt-1 block text-[11px] leading-relaxed text-zinc-400">{entry.vendor} · {LIBRARY_KIND_LABELS[entry.kind]} · {CATALOG_CATEGORIES[entry.category]}</span>
                     </span>
                   </button>
-                  {entry.installed ? <Installed entry={entry} /> : needsSetup(entry) ? (
+                  {entry.installed ? (
+                    <div className="flex shrink-0 items-center gap-2">
+                      <Installed entry={entry} />
+                      {entry.add.via === "connector" && (
+                        <button type="button" aria-label={`Disconnect ${entry.name}`} disabled={Boolean(adding || removing)} onClick={() => void removeConnector(entry)} className={QUIET_ACTION}>
+                          {removing === entry.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Unplug className="h-3.5 w-3.5" aria-hidden="true" />}
+                          {removing === entry.id ? "Removing…" : "Disconnect"}
+                        </button>
+                      )}
+                    </div>
+                  ) : needsSetup(entry) ? (
                     <button type="button" aria-label={`Set up ${entry.name}`} onClick={() => open(entry)} className={QUIET_ACTION}>Set up</button>
                   ) : (
                     <button type="button" aria-label={`Add ${entry.name}`} disabled={Boolean(adding)} onClick={() => void add(entry)} className={ACTION}>
@@ -189,13 +233,15 @@ export function SwarmCatalog({ onAdded }: { onAdded: (item: InstalledItem) => vo
   );
 }
 
-function CatalogDetail({ entry, headingId, busy, adding, onBack, onAdd }: {
+function CatalogDetail({ entry, headingId, busy, adding, removing, onBack, onAdd, onRemove }: {
   entry: SwarmCatalogEntry;
   headingId: string;
   busy: boolean;
   adding: boolean;
+  removing: boolean;
   onBack: () => void;
   onAdd: (inputs: Record<string, string>) => Promise<boolean>;
+  onRemove: () => Promise<void>;
 }) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const [inputs, setInputs] = useState<Record<string, string>>({});
@@ -227,7 +273,17 @@ function CatalogDetail({ entry, headingId, busy, adding, onBack, onAdd }: {
             {entry.installed && <Installed entry={entry} />}
             <Link href={PROVIDER_SETTINGS_URL} className={ACTION}>Open Provider Settings</Link>
           </div>
-        ) : entry.installed ? <Installed entry={entry} /> : (
+        ) : entry.installed ? (
+          <div className="flex flex-wrap items-center gap-3">
+            <Installed entry={entry} />
+            {entry.add.via === "connector" && (
+              <button type="button" disabled={busy} onClick={() => void onRemove()} className={QUIET_ACTION}>
+                {removing ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Unplug className="h-3.5 w-3.5" aria-hidden="true" />}
+                {removing ? "Disconnecting…" : "Disconnect"}
+              </button>
+            )}
+          </div>
+        ) : (
           <form onSubmit={(event) => {
             event.preventDefault();
             void onAdd(inputs).then((added) => { if (added) setInputs({}); });

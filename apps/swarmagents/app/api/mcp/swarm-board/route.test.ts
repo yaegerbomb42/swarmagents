@@ -6,6 +6,10 @@ import path from "node:path";
 import { NextRequest } from "next/server";
 import { GET, POST } from "./route";
 import { configureStorePaths, getStoragePaths, loadStore } from "@/lib/board/store";
+import { RuntimeManager, setRuntimeManagerForTesting } from "@/lib/runtime/manager";
+import { FakeVmDriver } from "@/lib/vm/fake-driver";
+import { VmManager, setVmManagerForTesting } from "@/lib/vm/manager";
+import type { ExecOptions, ExecResult, VmHandle } from "@/lib/vm/types";
 
 function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "swarm-board-route-"));
@@ -319,3 +323,132 @@ test("workers see the same lease deadline in GET/poll and can reclaim it exactly
   assert.deepEqual(saved.history?.slice(1), [expiryEvent, { from: "open", to: "claimed", actor: saved.claimedBy, at: 2500 }]);
   assert.match((await (await expiredSubmit()).json()).error.message, /only the claiming agent/);
 });
+
+class RouteVmDriver extends FakeVmDriver {
+  override async exec(handle: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
+    if (cmd[0] === "scrot") {
+      const target = cmd[cmd.length - 1];
+      await this.writeFile(handle, target, `frame-${handle.userId}`);
+      return { exitCode: 0 };
+    }
+    if (cmd[0] === "bash" && cmd[1] === "-lc" && cmd[2] === "pwd-echo") {
+      opts?.onStdout?.(`out:${handle.userId}`);
+      return { exitCode: 0 };
+    }
+    return super.exec(handle, cmd, opts);
+  }
+}
+
+function userRpc(method: string, params: unknown, user: string | null): NextRequest {
+  const headers = new Headers({ "content-type": "application/json" });
+  if (user !== null) headers.set("x-swarm-user", user);
+  return new NextRequest("http://localhost/api/mcp/swarm-board", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+}
+
+test("swarm-board MCP advertises and executes per-user VM tools with auth and isolation", async (t) => {
+  const driver = new RouteVmDriver();
+  const vm = new VmManager({ customDriver: driver });
+  const runtime = new RuntimeManager({ router: null, vm });
+  setVmManagerForTesting(vm);
+  setRuntimeManagerForTesting(runtime);
+  const prevSecret = process.env.SWARM_SESSION_SECRET;
+  const prevServerMode = process.env.SWARM_SERVER_MODE;
+  t.after(() => {
+    setVmManagerForTesting(null);
+    setRuntimeManagerForTesting(null);
+    if (prevSecret === undefined) delete process.env.SWARM_SESSION_SECRET;
+    else process.env.SWARM_SESSION_SECRET = prevSecret;
+    if (prevServerMode === undefined) delete process.env.SWARM_SERVER_MODE;
+    else process.env.SWARM_SERVER_MODE = prevServerMode;
+  });
+
+  // 1. tools/list advertises all 6 VM tools alongside board tools
+  const listRes = await POST(rpc("tools/list", {}));
+  assert.equal(listRes.status, 200);
+  const listBody = await listRes.json();
+  const toolNames = (listBody.result.tools as Array<{ name: string }>).map((entry) => entry.name);
+  for (const name of [
+    "vm_exec",
+    "vm_read_output",
+    "vm_read_file",
+    "vm_write_file",
+    "vm_list_workspace",
+    "vm_screenshot",
+  ]) {
+    assert.ok(toolNames.includes(name), `tools/list missing ${name}`);
+  }
+
+  // 2. serverMode() refuses unauthenticated VM tool calls with 401 + no-store
+  process.env.SWARM_SESSION_SECRET = "route-test-secret-01234567890123456789";
+  process.env.SWARM_SERVER_MODE = "1";
+  const unauth = await POST(
+    userRpc("tools/call", { name: "vm_list_workspace", arguments: {} }, null),
+  );
+  assert.equal(unauth.status, 401);
+  assert.equal(unauth.headers.get("cache-control"), "no-store");
+
+  // 3. Invalid arguments return JSON-RPC -32602
+  const invalid = await POST(
+    userRpc("tools/call", { name: "vm_read_file", arguments: {} }, "alice"),
+  );
+  assert.equal((await invalid.json()).error.code, -32602);
+
+  // 4. Write, list, read, exec, read_output, screenshot scoped to Alice and hidden from Bob
+  const writeRes = await (
+    await POST(
+      userRpc(
+        "tools/call",
+        { name: "vm_write_file", arguments: { path: "app.txt", content: "alice-data" } },
+        "alice",
+      ),
+    )
+  ).json();
+  assert.equal(writeRes.result.isError, false);
+
+  const bobRead = await (
+    await POST(
+      userRpc("tools/call", { name: "vm_read_file", arguments: { path: "/workspace/app.txt" } }, "bob"),
+    )
+  ).json();
+  assert.equal(bobRead.result.isError, true);
+
+  const listAlice = await (
+    await POST(userRpc("tools/call", { name: "vm_list_workspace", arguments: {} }, "alice"))
+  ).json();
+  assert.equal(listAlice.result.isError, false);
+  const parsedList = JSON.parse(listAlice.result.content[0].text);
+  assert.equal(parsedList.entries[0].name, "app.txt");
+
+  const execAlice = await (
+    await POST(
+      userRpc("tools/call", { name: "vm_exec", arguments: { cmd: "pwd-echo", waitMs: 2000 } }, "alice"),
+    )
+  ).json();
+  assert.equal(execAlice.result.isError, false);
+  const execData = JSON.parse(execAlice.result.content[0].text);
+  assert.equal(execData.stdout, "out:alice");
+
+  const bobReadRun = await (
+    await POST(
+      userRpc("tools/call", { name: "vm_read_output", arguments: { runId: execData.runId } }, "bob"),
+    )
+  ).json();
+  assert.equal(bobReadRun.result.isError, true);
+  assert.equal(JSON.parse(bobReadRun.result.content[0].text).error, "scope_denied");
+
+  const shotAlice = await (
+    await POST(userRpc("tools/call", { name: "vm_screenshot", arguments: {} }, "alice"))
+  ).json();
+  assert.equal(shotAlice.result.isError, false);
+  assert.equal(shotAlice.result.content[1].type, "image");
+  assert.equal(shotAlice.result.content[1].mimeType, "image/png");
+  assert.equal(
+    Buffer.from(shotAlice.result.content[1].data, "base64").toString("utf8"),
+    "frame-alice",
+  );
+});
+

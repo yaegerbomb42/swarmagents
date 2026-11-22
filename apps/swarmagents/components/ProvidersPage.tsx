@@ -1,8 +1,9 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
-import { Activity, BookOpen, ChevronDown, ChevronUp, DollarSign, KeyRound, Loader2, Plus, RotateCw, Search, Trash2, X } from "lucide-react";
+import { Activity, ArrowLeft, BookOpen, ChevronDown, ChevronUp, DollarSign, KeyRound, Loader2, Plug, Plus, RotateCw, Search, Trash2, X } from "lucide-react";
 import { PROVIDER_CATALOG, canonicalProviderId, catalogEntry, providerHue } from "../lib/providers/catalog";
 import type { CatalogApiStyle, ProviderCatalogEntry } from "../lib/providers/catalog";
 
@@ -479,7 +480,45 @@ export function ProvidersPage() {
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_0%,#07070a_75%)]" />
       </div>
 
-      <div className="relative z-10 mx-auto w-full max-w-6xl px-6 py-10">
+      <nav
+        aria-label="Workspace navigation"
+        className="relative z-10 mx-auto flex w-full max-w-6xl flex-wrap items-center gap-2.5 px-6 pt-6"
+      >
+        <Link
+          href="/"
+          className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-white/75 transition hover:bg-white/10 hover:text-white"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" aria-hidden />
+          Workspace
+        </Link>
+        <p className="mr-2 font-mono text-sm font-semibold tracking-tight">
+          swarmagents<span className="text-cyan-400">.codes</span>
+        </p>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Link
+            href="/connectors"
+            className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-white/70 transition hover:bg-white/10 hover:text-white"
+          >
+            <Plug className="h-3 w-3" aria-hidden />
+            Connectors
+          </Link>
+          <Link
+            href="/providers"
+            aria-current="page"
+            className="inline-flex items-center gap-1.5 rounded-full border border-cyan-400/40 bg-cyan-400/15 px-3 py-1 text-xs font-medium text-cyan-200"
+          >
+            Providers
+          </Link>
+          <Link
+            href="/library"
+            className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-white/70 transition hover:bg-white/10 hover:text-white"
+          >
+            Library
+          </Link>
+        </div>
+      </nav>
+
+      <div className="relative z-10 mx-auto w-full max-w-6xl px-6 pb-10 pt-8">
         <div className="mb-2 text-2xl font-semibold tracking-tight">Providers</div>
         <p className="mb-6 max-w-2xl text-sm text-white/50">
           Pick a provider, paste an API key — this joins the server-side pool used by the

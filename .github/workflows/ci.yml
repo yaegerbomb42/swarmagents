@@ -61,7 +61,7 @@ jobs:
 
       - name: E2E typecheck
         working-directory: apps/swarmagents
-        run: npx tsc -p e2e/tsconfig.json
+        run: npm run typecheck:e2e
 
       - name: Build
         working-directory: apps/swarmagents

@@ -14,6 +14,7 @@
     "build": "next build && tsc -p tsconfig.desktop-proxy.json",
     "start": "next start -H 127.0.0.1 -p 3777",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "typecheck:e2e": "tsc -p e2e/tsconfig.json",
     "lint": "eslint .",
     "vm-image:build": "docker build -t swarm-vm:claude vm-image",
     "vm-image-desktop:build": "docker build -t swarm-vm:desktop vm-image-desktop",

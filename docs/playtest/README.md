@@ -69,8 +69,8 @@ exist yet and the server has `SWARM_ALLOW_SIGNUP=1`, add `SWARM_TEST_SIGNUP=1` t
 ## 4. From GitHub Actions
 
 `.github/workflows/playtest.yml` (manual) signs in as the test account and prints the connected providers. Tick
-`seed` to load the manifest's keys first. It reads (Settings > Secrets and variables > Actions, `production`
-environment or repo level):
+`seed` to load the manifest's keys first. It reads from the dedicated `playtest` GitHub Environment
+(Settings > Environments > playtest), not the `production` environment:
 
 | Secret / variable | What |
 | --- | --- |
@@ -80,10 +80,14 @@ environment or repo level):
 | `TEST_PROVIDERS_MANIFEST` (variable) | the JSON array above |
 | `SWARM_BASE_URL` (variable, optional) | target server, default `https://swarmagents.codes` |
 
+The `playtest` environment must contain only test-account credentials and test provider keys. Keep `DEPLOY_SSH_KEY`,
+`DEPLOY_HOST`, `SWARM_HARNESS_TOKEN` and other production secrets in the `production` environment: the playtest job
+never receives them, so a compromised playtest step cannot read the deploy key or server address.
+
 ## What the owner must provide
 
 1. Create the test account (sign up at `/login` with `SWARM_ALLOW_SIGNUP=1` on the server, or run
    `playtest:login` with `SWARM_TEST_SIGNUP=1` where signup is enabled) and choose its password.
-2. Set `SWARM_TEST_EMAIL`, `SWARM_TEST_PASSWORD`, the `TEST_<PROVIDER>_API_KEY` secrets and the `TEST_PROVIDERS_MANIFEST` variable (the key-loading job is doing the last two).
+2. Create a `playtest` GitHub Environment and set `SWARM_TEST_EMAIL`, `SWARM_TEST_PASSWORD`, the `TEST_<PROVIDER>_API_KEY` secrets and the `TEST_PROVIDERS_MANIFEST` variable there (the key-loading job is doing the last two). Do not put production secrets in this environment.
 3. Share the email and password with agents only through the secret store, never in chat, PRs or files in the repo.
 4. Rotate any key that was ever pasted into chat, a tracked file or an npm package.

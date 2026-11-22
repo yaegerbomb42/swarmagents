@@ -20,6 +20,7 @@ import { FakeVmDriver } from "../vm/fake-driver";
 import { TelemetryBus } from "../telemetry/bus";
 import type { ExecOptions, ExecResult, VmHandle } from "../vm/types";
 import { readRunReport } from "../runtime/run-report";
+import { withUserLock } from "./test-drive-mutex";
 import { POST as testDrivePOST, GET as testDriveGET } from "../../app/api/library/public/[id]/test-drive/route";
 import { resetPublishRateLimit } from "./rate";
 
@@ -467,4 +468,75 @@ test("concurrent keep and rollback on the same drive cannot both win", async () 
     drive.drive.status === "kept" || drive.drive.status === "rolled-back",
     `drive must settle on one outcome, got ${drive.drive.status}`,
   );
+});
+
+test("GET and the sweep action wait for the user's Test-Drive lock", async () => {
+  setup("ok");
+  const id = publishSkill();
+
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let holderDone = false;
+  const holder = withUserLock(ALICE, async () => {
+    await gate;
+    holderDone = true;
+  });
+
+  // Both the GET (drive lookup + sweep + finalize happen under the lock, so
+  // even the 404 waits) and the explicit sweep action must queue behind it:
+  // a GET-driven restore that ignores the lock can wipe a drive the user is
+  // keeping, and two overlapping sweeps can restore the same drive twice.
+  let getDone = false;
+  const fetched = testDriveGET(getRequest(ALICE, id, "drive_missing"), {
+    params: Promise.resolve({ id }),
+  }).then((res) => {
+    getDone = true;
+    return res;
+  });
+  let swept = false;
+  const sweep = testDrivePOST(request(ALICE, id, { action: "sweep" }), {
+    params: Promise.resolve({ id }),
+  }).then((res) => {
+    swept = true;
+    return res;
+  });
+
+  await sleep(100);
+  assert.equal(holderDone, false, "the lock should still be held");
+  assert.equal(getDone, false, "GET must answer only after the lock is released");
+  assert.equal(swept, false, "the sweep action must answer only after the lock is released");
+
+  release();
+  await Promise.all([holder, fetched, sweep]);
+  assert.equal(getDone, true);
+  assert.equal(swept, true);
+});
+
+test("an overlapping keep and sweep cannot restore over a kept drive", async () => {
+  setup("ok");
+  const id = publishSkill();
+  const started = await json(
+    await testDrivePOST(request(ALICE, id, { action: "start" }), { params: Promise.resolve({ id }) }),
+  );
+  await waitForReport(started.drive.runId);
+  const driveId: string = started.drive.id;
+  // Force the drive stale so the sweep considers it (default window: 7 days).
+  updateTestDrive(driveId, { finishedAt: Date.now() - 8 * 24 * 60 * 60 * 1000 });
+
+  const [keep, sweep] = await Promise.all([
+    testDrivePOST(request(ALICE, id, { action: "keep", driveId }), { params: Promise.resolve({ id }) }),
+    testDrivePOST(request(ALICE, id, { action: "sweep" }), { params: Promise.resolve({ id }) }),
+  ]);
+  assert.equal(keep.status, 200);
+
+  const after = await json(
+    await testDriveGET(getRequest(ALICE, id, driveId), { params: Promise.resolve({ id }) }),
+  );
+  assert.equal(
+    after.drive.status,
+    "kept",
+    "the sweep, running after the keep finished, must not restore over a kept drive",
+  );
+  const sweptIds = await json(sweep);
+  assert.deepEqual(sweptIds.swept, [], "nothing should be swept once the keep re-reads under the lock");
 });

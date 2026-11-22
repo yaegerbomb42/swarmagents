@@ -42,6 +42,16 @@ function humanizeAction(action: string): string {
   return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Action";
 }
 
+/**
+ * Key combos are keysym names, charset-restricted by the desktop
+ * validator (validate.mjs KEY_COMBO_RE); strip anything else anyway so a
+ * malformed event can never smuggle free text into the ticker through
+ * the key branch. Mirrors the desktop action overlays' sanitizer.
+ */
+function sanitizeCombo(text: string): string {
+  return text.replace(/[^A-Za-z0-9_+\-]/g, "").slice(0, 32);
+}
+
 function truncate(value: unknown): string {
   if (value == null) return "";
   const text = typeof value === "string" ? value : JSON.stringify(value);
@@ -221,16 +231,33 @@ export function toActivityLine(
     case "computer.action": {
       // Desktop/browser harness events: {action, target?, text?, x?, y?, url?}.
       // Rendered as plain sentences so the activity strip reads like narration.
+      //
+      // Typed text is NEVER rendered here — only its length. The `text`
+      // field can carry credentials the agent was given (a password from
+      // the prompt, a token to paste); the runner redacts known secret
+      // shapes before the event is built, but the ticker must not depend
+      // on redactor coverage. Same posture as the desktop action
+      // overlays' labels ("Typing (N chars)"). Key combos are keysym
+      // names, so they render after charset sanitization.
       const action = asString(data.action);
       if (!action) return null;
       const target = asString(data.target);
       const text = asString(data.text);
+      const textLength = asNumber(data.textLength);
       const url = asString(data.url);
       const x = asNumber(data.x);
       const y = asNumber(data.y);
       if (url) return line(item, "computer.action", `Opening ${url}`, "accent");
-      if (action === "type" && text) return line(item, "computer.action", `Typing “${truncate(text)}”`, "accent");
-      if (action === "key" && text) return line(item, "computer.action", `Pressing ${text}`, "accent");
+      if (action === "type") {
+        const chars = textLength ?? (text !== undefined ? text.length : undefined);
+        if (chars !== undefined) {
+          return line(item, "computer.action", `Typing (${chars} chars)`, "accent");
+        }
+      }
+      if (action === "key" && text) {
+        const combo = sanitizeCombo(text);
+        if (combo) return line(item, "computer.action", `Pressing ${combo}`, "accent");
+      }
       if (action === "click" || action === "double_click") {
         if (target) return line(item, "computer.action", `Clicking ${truncate(target)}`, "accent");
         if (x !== undefined && y !== undefined) {
@@ -244,7 +271,11 @@ export function toActivityLine(
           return line(item, "computer.action", "Scrolling", "accent");
         }
       }
-      const detail = target ? truncate(target) : text ? truncate(text) : undefined;
+      // `text` is deliberately not a fallback detail: on summary-style
+      // events it carries the typed content (see above). The summary in
+      // `action` already narrates the action; `target` (element/app
+      // names) is the only safe detail.
+      const detail = target ? truncate(target) : undefined;
       return line(item, "computer.action", detail ? `${humanizeAction(action)} · ${detail}` : humanizeAction(action), "accent");
     }
 

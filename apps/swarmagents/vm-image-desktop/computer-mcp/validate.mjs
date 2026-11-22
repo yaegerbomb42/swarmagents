@@ -233,9 +233,14 @@ export function summarizeTool(tool, args) {
     case "drag":
       return `Dragging from (${s(input.x1)}, ${s(input.y1)}) to (${s(input.x2)}, ${s(input.y2)})`;
     case "type": {
+      // Length only, never content: typed text can carry credentials the
+      // agent was given (a password from the prompt, a token to paste).
+      // The host redacts known secret shapes before the event is built,
+      // but the summary must not depend on redactor coverage — it is
+      // rendered by the activity strip, the conversation timeline, run
+      // reports, and the trajectory view.
       const text = s(input.text) || "";
-      const shown = text.length > 60 ? `${text.slice(0, 60)}…` : text;
-      return `Typing "${shown}"`;
+      return `Typing (${text.length} chars)`;
     }
     case "key":
       return `Pressing ${s(input.combo) || "key"}`;

@@ -836,7 +836,10 @@ test("emits computer.action events for desktop MCP calls, with redacted summarie
   });
   assert.deepEqual(computer[2], {
     type: "computer.action",
-    action: 'Typing "login as [REDACTED]"',
+    // The summary carries a character count, never typed content; the
+    // structured `text` field keeps the (redacted) text for detail
+    // surfaces. "login as [REDACTED]" is 18 chars.
+    action: "Typing (18 chars)",
     text: "login as [REDACTED]",
   });
 

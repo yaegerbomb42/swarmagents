@@ -204,12 +204,46 @@ test("computer.action: pointer clicks name target or coordinates", () => {
   assert.equal(bare?.text, "Clicking");
 });
 
-test("computer.action: typing and key presses read as plain sentences", () => {
+test("computer.action: typing renders a character count, never the typed text", () => {
   const typing = toActivityLine(item("computer.action", { action: "type", text: "hello world" }));
-  assert.equal(typing?.text, "Typing “hello world”");
+  assert.equal(typing?.text, "Typing (11 chars)");
+  assert.ok(!typing?.text.includes("hello"), "typed content must not reach the ticker");
+
+  // The structured length (desktop action overlays) wins over the text,
+  // and works without the text field at all.
+  const byLength = toActivityLine(item("computer.action", { action: "type", text: "hello world", textLength: 42 }));
+  assert.equal(byLength?.text, "Typing (42 chars)");
+  const lengthOnly = toActivityLine(item("computer.action", { action: "type", textLength: 7 }));
+  assert.equal(lengthOnly?.text, "Typing (7 chars)");
 
   const key = toActivityLine(item("computer.action", { action: "key", text: "Enter" }));
   assert.equal(key?.text, "Pressing Enter");
+});
+
+test("computer.action: summary-style events never append the typed text as detail", () => {
+  // Real events carry a human-readable summary in `action` and the typed
+  // content in `text`; the fallback must not echo the content back.
+  const mapped = toActivityLine(item("computer.action", { action: "Typing (6 chars)", text: "secret" }));
+  assert.equal(mapped?.text, "Typing (6 chars)");
+  assert.ok(!mapped?.text.includes("secret"), "typed content must not reach the ticker");
+
+  // Unknown actions keep their target detail but never a text detail.
+  const unknown = toActivityLine(item("computer.action", { action: "hover", text: "secret" }));
+  assert.equal(unknown?.text, "Hover");
+});
+
+test("computer.action: key combos render sanitized to the keysym charset", () => {
+  const combo = toActivityLine(item("computer.action", { action: "key", text: "ctrl+l" }));
+  assert.equal(combo?.text, "Pressing ctrl+l");
+
+  const smuggled = toActivityLine(item("computer.action", { action: "key", text: "ctrl+l; rm -rf /" }));
+  assert.equal(smuggled?.text, "Pressing ctrl+lrm-rf");
+  assert.ok(!smuggled?.text.includes(";"), "non-charset characters must be stripped");
+  assert.ok(!smuggled?.text.includes("rm -rf"), "smuggled free text must not survive sanitization");
+
+  // A combo that sanitizes to nothing falls back to the plain action line.
+  const empty = toActivityLine(item("computer.action", { action: "key", text: "!!!" }));
+  assert.equal(empty?.text, "Key");
 });
 
 test("computer.action: scrolling and unknown actions get readable fallbacks", () => {

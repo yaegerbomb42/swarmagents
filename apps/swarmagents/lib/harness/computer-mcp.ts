@@ -185,8 +185,11 @@ export function describeDesktopAction(name: string, input: unknown): string {
   if (info.tool === "browser_type") {
     const text = typeof args.text === "string" ? args.text.trim() : "";
     if (!text) return target ? `Typing into ${target}` : "Typing into the page";
-    const shown = text.length > 40 ? `${text.slice(0, 40)}…` : text;
-    return `Typing "${shown}"`;
+    // Length only, never content — see summarizeTool's type case in
+    // validate.mjs. Typed text can carry credentials the agent was
+    // given; the summary is rendered on several surfaces and must not
+    // depend on redactor coverage.
+    return `Typing (${text.length} chars)`;
   }
   if (info.tool === "browser_press_key") {
     const key = typeof args.key === "string" ? args.key : "";

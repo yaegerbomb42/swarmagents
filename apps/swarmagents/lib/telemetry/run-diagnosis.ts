@@ -7,7 +7,7 @@
  * `formatFindings`, `findingsJson`, and their supporting logic. There is no
  * wiring into the run report in this PR (that is a separate decision).
  */
-import { BOOKKEEPING_TOOLS, IDLE_GAP_MS, efficiency, type RunEvent } from "./efficiency";
+import { BOOKKEEPING_TOOLS, IDLE_GAP_MS, coveredMs, efficiency, type RunEvent } from "./efficiency";
 
 /** Look-around tools. One of these alone is a wasted round trip (see the agent loop). */
 const EXPLORE_TOOLS: ReadonlySet<string> = new Set([
@@ -68,18 +68,12 @@ interface EditMiss {
   error: string;
 }
 
-const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+const num = (v: unknown): number =>
+  typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   return value as Record<string, unknown>;
-}
-
-/** Same coverage as `efficiency()`: work that ended at this event is not idle. */
-function coveredMs(e: RunEvent): number {
-  if (e.type === "turn" || e.type === "tool.call" || e.type === "loop.gates") return num(e.ms);
-  if (e.type !== "verify.gates" || !Array.isArray(e.gates)) return 0;
-  return e.gates.reduce<number>((sum, gate) => sum + num(recordOf(gate)?.durationMs), 0);
 }
 
 function callInput(e: RunEvent): Record<string, unknown> | undefined {
@@ -152,7 +146,7 @@ function uniqueTurns(turns: readonly number[]): number[] {
   return out;
 }
 
-function token(e: RunEvent, key: "cacheRead" | "uncached"): number | undefined {
+function token(e: RunEvent, key: "cacheRead" | "uncached" | "cacheWrite"): number | undefined {
   const tokens = recordOf(e.tokens);
   return tokens ? finite(tokens[key]) : undefined;
 }
@@ -227,6 +221,12 @@ export function diagnoseRun(events: readonly RunEvent[]): RunFinding[] {
   const bookTurns: number[] = [];
   const gateTurns: number[] = [];
   const idleTurns: number[] = [];
+  /** Aggregated per-turn findings: one slot each, so they cannot crowd out other kinds. */
+  const exploreTurns: number[] = [];
+  const exploreTools = new Map<string, number>();
+  const cacheDipTurns: number[] = [];
+  const deniedTurns: number[] = [];
+  const deniedHints: string[] = [];
   /** turn:tool pairs already reported from a `tool.denied` event, so the matching call is not counted again. */
   const deniedTools = new Set<string>();
   let activeTurn = 0;
@@ -240,12 +240,8 @@ export function diagnoseRun(events: readonly RunEvent[]): RunFinding[] {
   const flush = (): void => {
     const only = calls.length === 1 ? calls[0] : undefined;
     if (openTurn && activeTurn > 0 && only !== undefined && EXPLORE_TOOLS.has(only)) {
-      findings.push({
-        kind: "single-call-explore",
-        turns: uniqueTurns([activeTurn]),
-        hint: `One ${only} call on this turn. Send every read, search, and outline you need in the same turn.`,
-        score: 20_000,
-      });
+      exploreTurns.push(activeTurn);
+      exploreTools.set(only, (exploreTools.get(only) ?? 0) + 1);
     }
     calls = [];
     openTurn = false;
@@ -264,10 +260,12 @@ export function diagnoseRun(events: readonly RunEvent[]): RunFinding[] {
       flush();
       const n = explicitTurn(e);
       if (n === undefined) seq += 1;
+      else seq = Math.max(seq, n);
       activeTurn = n ?? seq;
       openTurn = true;
       const cacheRead = token(e, "cacheRead");
       const uncached = token(e, "uncached");
+      const cacheWrite = token(e, "cacheWrite");
       if (
         seenTurn &&
         cacheRead !== undefined &&
@@ -276,15 +274,13 @@ export function diagnoseRun(events: readonly RunEvent[]): RunFinding[] {
         prevPrompt > 0 &&
         cacheRead < prevPrompt * CACHE_OF_PREVIOUS
       ) {
-        findings.push({
-          kind: "cache-dip",
-          turns: uniqueTurns([activeTurn]),
-          hint: "Cache read was under 80% of the previous prompt. Keep the prefix stable so the cache hits.",
-          score: 30_000 + (prevPrompt - cacheRead),
-        });
+        cacheDipTurns.push(activeTurn);
       }
       seenTurn = true;
-      prevPrompt = cacheRead !== undefined && uncached !== undefined ? cacheRead + uncached : undefined;
+      prevPrompt =
+        cacheRead !== undefined && uncached !== undefined
+          ? cacheRead + uncached + (cacheWrite ?? 0)
+          : undefined;
     } else if (e.type === "tool.call") {
       const tool = toolName(e);
       calls.push(tool);
@@ -297,31 +293,75 @@ export function diagnoseRun(events: readonly RunEvent[]): RunFinding[] {
           reads.set(key, prior);
         }
       }
-      if (EDIT_TOOLS.has(tool) && e.isError !== true) dropPath(reads, editedPath(e));
+      if (EDIT_TOOLS.has(tool) && e.isError !== true) {
+        // Snapshot the repeated-read finding before the edit clears the path:
+        // read, read, edit must still report the wasted second read.
+        for (const path of editedPaths(e)) {
+          const prefix = `${path}\0`;
+          const pending = new Map<string, number[]>();
+          for (const [key, turns] of reads) if (key.startsWith(prefix)) pending.set(key, [...turns]);
+          findings.push(...repeatedReadFindings(pending));
+          dropPath(reads, path);
+        }
+      }
       if (EDIT_MISS_TOOLS.has(tool) && e.isError === true)
         misses.push({ turn: activeTurn, error: errorText(e) });
       if (isDenialCall(e) && !deniedTools.has(`${activeTurn}:${tool}`)) {
-        findings.push({
-          kind: "denied",
-          turns: uniqueTurns([activeTurn]),
-          hint: denialHint(e, tool),
-          score: 5_000,
-        });
+        deniedTools.add(`${activeTurn}:${tool}`);
+        deniedTurns.push(activeTurn);
+        deniedHints.push(denialHint(e, tool));
       }
     } else if (e.type === "tool.denied") {
       const tool = toolName(e) || "command";
-      deniedTools.add(`${activeTurn}:${tool}`);
-      findings.push({
-        kind: "denied",
-        turns: uniqueTurns([activeTurn]),
-        hint: denialHint(e, tool),
-        score: 5_000,
-      });
+      const key = `${activeTurn}:${tool}`;
+      if (!deniedTools.has(key)) {
+        deniedTools.add(key);
+        deniedTurns.push(activeTurn);
+        deniedHints.push(denialHint(e, tool));
+      }
     } else if (e.type === "loop.gates" || e.type === "verify.gates") {
       gateTurns.push(activeTurn);
     }
   }
   flush();
+
+  if (exploreTurns.length) {
+    const topTool =
+      [...exploreTools.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "look-around";
+    findings.push({
+      kind: "single-call-explore",
+      turns: uniqueTurns(exploreTurns),
+      hint:
+        exploreTurns.length === 1
+          ? `One ${topTool} call on this turn. Send every read, search, and outline you need in the same turn.`
+          : `${exploreTurns.length} turns had a single look-around call (mostly ${topTool}). Batch every read, search, and outline into the turn that needs them.`,
+      score: 20_000 + (exploreTurns.length - 1) * 100,
+    });
+  }
+
+  if (cacheDipTurns.length) {
+    findings.push({
+      kind: "cache-dip",
+      turns: uniqueTurns(cacheDipTurns),
+      hint:
+        cacheDipTurns.length === 1
+          ? "Cache read was under 80% of the previous prompt. Keep the prefix stable so the cache hits."
+          : `Cache read dipped under 80% of the previous prompt on ${cacheDipTurns.length} turns. Keep the prompt prefix stable so the cache hits.`,
+      score: 30_000 + (cacheDipTurns.length - 1) * 100,
+    });
+  }
+
+  if (deniedTurns.length) {
+    findings.push({
+      kind: "denied",
+      turns: uniqueTurns(deniedTurns),
+      hint:
+        deniedHints.length === 1
+          ? deniedHints[0]
+          : `${deniedHints.length} calls were refused. First: ${deniedHints[0]}`,
+      score: 5_000 + (deniedTurns.length - 1) * 100,
+    });
+  }
 
   findings.push(...repeatedReadFindings(reads));
   const miss = editMissFinding(misses);
@@ -368,9 +408,24 @@ export function diagnoseRun(events: readonly RunEvent[]): RunFinding[] {
     .map(({ kind, turns, hint }) => ({ kind, turns, hint }));
 }
 
-function editedPath(e: RunEvent): string | undefined {
-  const path = callInput(e)?.path;
-  return typeof path === "string" ? path : undefined;
+/**
+ * Every path an edit tool touched. `multi_edit` usually carries a top-level
+ * path, but models also repeat the path inside `edits`; a multi-file edit may
+ * use `files`. Accept all three rather than clearing the wrong (or no) path.
+ */
+function editedPaths(e: RunEvent): string[] {
+  const input = callInput(e);
+  if (!input) return [];
+  const paths: string[] = [];
+  if (typeof input.path === "string" && input.path.length > 0) paths.push(input.path);
+  for (const collection of [input.files, input.edits]) {
+    if (!Array.isArray(collection)) continue;
+    for (const entry of collection) {
+      const rec = recordOf(entry);
+      if (typeof rec?.path === "string" && rec.path.length > 0) paths.push(rec.path);
+    }
+  }
+  return [...new Set(paths)];
 }
 
 /** Plain-text report: rank, kind, turns, hint. One line each, worst first. */

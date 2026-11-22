@@ -12,6 +12,7 @@ import { access, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type {
+  EvalRunMetrics,
   EvalTaskDef,
   EvalTrialResult,
   HarnessConfig,
@@ -65,37 +66,40 @@ export class HarnessEvalRunner {
     trial: number
   ): Promise<{ result: EvalTrialResult; grading: GradingResult }> {
     const runDir = await this.isolation.create(task.id, trial);
+    let outcome: { metrics: EvalRunMetrics; grading: GradingResult } | undefined;
+    let runError: unknown;
     try {
-      const { metrics, grading } = await this.driver.run(task, config, runDir);
-      return {
-        result: {
-          taskId: task.id,
-          bucket: task.bucket,
-          configName: config.name,
-          trial,
-          metrics,
-          grading,
-        },
-        grading,
-      };
-    } finally {
-      await this.isolation.destroy(runDir);
-      // Teardown is verified: a leftover directory is a hard failure.
-      try {
-        await access(runDir);
-        throw new Error(
-          `eval isolation teardown failed: ${runDir} still exists after destroy()`
-        );
-      } catch (err) {
-        if (
-          err instanceof Error &&
-          err.message.startsWith("eval isolation teardown failed")
-        ) {
-          throw err;
-        }
-        // access() threw ENOENT: the directory is gone, as expected.
-      }
+      outcome = await this.driver.run(task, config, runDir);
+    } catch (err) {
+      runError = err;
     }
+    // Teardown runs whether the driver succeeded or failed, and the
+    // teardown check throws from here — never from a finally block, where
+    // it would mask the run's own error.
+    await this.isolation.destroy(runDir);
+    const leftover = await access(runDir).then(
+      () => true,
+      () => false, // ENOENT: the directory is gone, as expected.
+    );
+    if (leftover) {
+      throw new Error(
+        `eval isolation teardown failed: ${runDir} still exists after destroy()`,
+        { cause: runError },
+      );
+    }
+    if (runError !== undefined) throw runError;
+    const { metrics, grading } = outcome!;
+    return {
+      result: {
+        taskId: task.id,
+        bucket: task.bucket,
+        configName: config.name,
+        trial,
+        metrics,
+        grading,
+      },
+      grading,
+    };
   }
 
   /** Run a whole suite (default: all 15 tasks) for one config. */

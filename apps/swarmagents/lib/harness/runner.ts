@@ -298,6 +298,8 @@ export class ClaudeCodeRunner {
     let haltedReason: string | null = null;
     let aborted = false;
     /** Decision Brain loop state: evaluations so far, last result, last failure. */
+    // Counts Decision Brain beforeTool invocations (one per gated tool call),
+    // not Claude Code conversation turns / num_turns.
     let brainTurnCount = 0;
     let lastBrainToolResult: { ok: boolean; output: string } | null = null;
     let lastBrainError: string | null = null;
@@ -712,6 +714,9 @@ export class ClaudeCodeRunner {
             // recovered, so the next decision must not retry on it.
             lastBrainToolResult = { ok, output: output.slice(0, 2000) };
             lastBrainError = ok ? null : output.slice(0, 500);
+            // A successful tool result must not keep poisoning Decision Brain
+            // snapshots with a stale stream-json error from earlier in the run.
+            if (ok) firstErrorMessage = undefined;
           }
           break;
         }
@@ -1169,15 +1174,41 @@ export class ClaudeCodeRunner {
 }
 
 /**
+ * Strip single- and double-quoted segments so `&` inside quotes or URL query
+ * strings does not look like a shell background operator.
+ */
+function stripQuotedSegments(command: string): string {
+  let out = "";
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote) {
+      if (ch === "\\" && i + 1 < command.length) {
+        i += 1; // skip escaped char inside quotes
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * True when a shell command detaches work from the foreground: a background
  * operator (`&` — not `&&`, and not the `&>` / `>&` redirections), `nohup` /
- * `setsid`, `disown`, or a detached tmux/screen session. A quoted ampersand
- * (e.g. `echo "a & b"`) can false-positive; the check is a heuristic for the
- * harness warning, not a security gate, so it errs toward flagging.
+ * `setsid`, `disown`, or a detached tmux/screen session. Quoted ampersands
+ * (e.g. `echo "a & b"` or `curl "https://x?a=1&b=2"`) are ignored.
  */
 export function isBackgroundedCommand(command: string): boolean {
   if (typeof command !== "string" || command.trim() === "") return false;
-  return BACKGROUND_PATTERNS.some((pattern) => pattern.test(command));
+  const unquoted = stripQuotedSegments(command);
+  return BACKGROUND_PATTERNS.some((pattern) => pattern.test(unquoted));
 }
 
 const BACKGROUND_PATTERNS: readonly RegExp[] = [

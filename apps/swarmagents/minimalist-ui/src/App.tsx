@@ -11,7 +11,7 @@
  *   4. Settings sheet with complete multi-provider catalog & keys.
  */
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ClipboardList, MessageSquare, MonitorPlay, Sparkles } from "lucide-react";
 import type { ProviderConfig } from "./data";
 import { DEFAULT_AGENT_CARD } from "./data";
@@ -20,6 +20,7 @@ import { usePersisted, useSessionPersisted } from "./store";
 import type { SwarmTask } from "../../lib/mcp-types";
 import { mascotStateForRun } from "../../components/mascot/frames";
 import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus } from "../../lib/client/vmStatus";
+import { derivePresence } from "../../lib/client/presence";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm } from "../../lib/client/runs";
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
@@ -197,6 +198,12 @@ export default function App() {
       },
     });
   }, [activeRun, headRun, phase, phaseMeta?.active, pushToast, selectThread, setView, view]);
+
+  // Presence for the computer's status bar. The page owns the run's stream
+  // (the conversation consumes it), so the screen is handed the summary
+  // instead of opening a second SSE connection. The screen falls back to the
+  // new activity line while this run's events are still being replayed.
+  const screenPresence = useMemo(() => derivePresence(session.liveItems), [session.liveItems]);
 
   // The screen opens automatically on wide screens when a run starts
   const activeRunId = activeRun?.runId;
@@ -537,13 +544,15 @@ export default function App() {
                 vmResetting={vmResetting}
                 polledVmStatus={polledVm.status}
                 desktopMode={polledVm.desktop}
-                activeRoleName="Agent"
+                activeRoleName={agentName}
                 onResetVm={() => openSettings("agent")}
                 onStopRun={() => void handleStop()}
                 control={takingOver}
                 onControlChange={setTakingOver}
                 canControl={canControl}
                 fitToHeight={wide}
+                presence={screenPresence}
+                activity={session.activity ? [{ text: session.activity }] : undefined}
                 className={wide ? "h-full" : undefined}
               />
             ) : (

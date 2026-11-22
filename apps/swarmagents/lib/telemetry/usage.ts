@@ -22,6 +22,14 @@
  */
 
 import type { SequencedEvent } from "./bus";
+import {
+  readLlmCall,
+  readRunCreated,
+  readRunFailover,
+  readRunFinished,
+  readRunStarted,
+  readUsage,
+} from "./events";
 import { getRunsDir } from "./paths";
 import { listRunLogs, readRunEvents } from "./run-log";
 import type { ProviderConfig } from "../providers/types";
@@ -112,18 +120,6 @@ export interface UsageReport {
 export const UNKNOWN_PROVIDER = "unknown";
 export const UNKNOWN_MODEL = "unknown";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function num(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function str(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
 function emptySlice(): UsageSlice {
   return { tokensIn: 0, tokensOut: 0, tokensCached: 0, costUsd: 0, runs: 0, runsWithCost: 0 };
 }
@@ -160,71 +156,74 @@ export function aggregateRunUsage(runId: string, events: readonly SequencedEvent
   };
 
   for (const event of events) {
-    const data = isRecord(event.data) ? event.data : {};
-    // Harness events carry their fields at the top level; run.created carries
-    // a data payload. Read both, as lib/runtime/run-store.ts does.
-    const field = (name: string): unknown =>
-      name in event ? (event as unknown as Record<string, unknown>)[name] : data[name];
-
     switch (event.type) {
-      case "run.created":
-        run.userId = str(data.userId) ?? run.userId;
-        run.model = str(data.model) ?? run.model;
+      case "run.created": {
+        const created = readRunCreated(event);
+        run.userId = created.userId ?? run.userId;
+        run.model = created.model ?? run.model;
         if (typeof event.ts === "number") run.createdAt = event.ts;
         break;
+      }
       case "run.queued":
         // Waiting behind an active run: queued, not running. run.started
         // flips it back to running when the run actually starts.
         run.status = "queued";
         break;
-      case "run.started":
+      case "run.started": {
+        const started = readRunStarted(event);
         run.status = "running";
-        run.model = str(field("model")) ?? run.model;
         // The router records the provider it actually selected; a later
         // failover event may still override it below.
-        run.provider = str(field("provider")) ?? run.provider;
+        run.model = started.model ?? run.model;
+        run.provider = started.provider ?? run.provider;
         break;
-      case "usage":
-        run.tokensIn += num(field("inputTokens")) ?? 0;
-        run.tokensOut += num(field("outputTokens")) ?? 0;
-        run.tokensCached += num(field("cachedTokens")) ?? 0;
+      }
+      case "usage": {
+        const usage = readUsage(event);
+        run.tokensIn += usage.tokensIn;
+        run.tokensOut += usage.tokensOut;
+        run.tokensCached += usage.tokensCached;
         // A later llm event can fill a model gap left by run.started (the
         // harness attaches the generating model to usage events).
-        run.model = str(field("model")) ?? run.model;
+        run.model = usage.model ?? run.model;
         break;
-      case "run.failover":
-        // The serving provider after a failover; the last one wins.
-        run.provider = str(data.provider) ?? run.provider;
-        run.model = str(data.model) ?? run.model;
+      }
+      case "run.failover": {
+        const failover = readRunFailover(event);
+        run.provider = failover.provider ?? run.provider;
+        run.model = failover.model ?? run.model;
         break;
-      case "llm.call":
-        // Gateway telemetry per provider attempt (see lib/runtime/llm-gateway.ts).
-        // Only ok calls count toward the run cost; the serving provider is the
-        // last ok attempt. Event data never contains secrets or prompts.
-        if (data.source === "lens") {
-          // Output lenses ride on the same bus (see lib/lenses/run.ts) but are
-          // not part of the agent's own calls: their cost is kept apart so it
-          // adds to the run's cost instead of replacing it, and the run keeps
-          // the provider that served it.
-          if (typeof data.costUsd === "number") {
-            run.lensCostUsd = (run.lensCostUsd ?? 0) + data.costUsd;
+      }
+      case "llm.call": {
+        const call = readLlmCall(event);
+        if (call.isLens) {
+          // Output lenses ride on the same bus but are not agent calls: their
+          // cost is kept apart so it adds on top of the run's own cost, and
+          // their provider does not take over the one that served the run.
+          if (call.costUsd !== undefined) {
+            run.lensCostUsd = (run.lensCostUsd ?? 0) + call.costUsd;
           }
           break;
         }
-        if (data.outcome === "ok") {
-          run.provider = str(data.provider) ?? run.provider;
-        }
-        if (typeof data.costUsd === "number") {
-          run.callCostUsd = (run.callCostUsd ?? 0) + data.costUsd;
+        // Only successful attempts count toward the run cost; failed ones
+        // burn no money. The serving provider is the last ok attempt.
+        if (call.outcome === "ok") {
+          run.provider = call.provider ?? run.provider;
+          if (call.costUsd !== undefined) {
+            run.callCostUsd = (run.callCostUsd ?? 0) + call.costUsd;
+          }
         }
         break;
-      case "run.finished":
+      }
+      case "run.finished": {
+        const finished = readRunFinished(event);
         run.status = "finished";
         run.finishedAt = event.ts;
-        run.costUsd = num(field("costUsd"));
-        run.durationMs = num(field("durationMs"));
-        run.numTurns = num(field("numTurns"));
+        run.costUsd = finished.costUsd;
+        run.durationMs = finished.durationMs;
+        run.numTurns = finished.numTurns;
         break;
+      }
       case "run.error":
         run.status = "error";
         run.finishedAt = event.ts;
@@ -232,6 +231,10 @@ export function aggregateRunUsage(runId: string, events: readonly SequencedEvent
       case "run.cancelled":
         run.status = "cancelled";
         run.finishedAt = event.ts;
+        break;
+      case "run.paused":
+        // A pause is not a finish: keep the run live so usage keeps accumulating.
+        run.status = "running";
         break;
       default:
         break;

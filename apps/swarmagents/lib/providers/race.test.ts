@@ -11,7 +11,8 @@ const FAKE_KEYS = ["gsk_fake_key_1", "gsk_fake_key_2", "gsk_fake_key_3"];
 
 const GROQ_CONFIG: ProviderConfig = {
   id: "groq",
-  kind: "groq",
+  kind: "openai",
+  apiStyle: "openai-chat",
   baseUrl: "https://api.groq.com/openai/v1",
   models: {
     fast: "llama-3.3-70b-versatile",

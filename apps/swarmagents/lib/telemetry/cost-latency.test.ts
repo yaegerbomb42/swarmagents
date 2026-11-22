@@ -279,7 +279,7 @@ test("a recorded log with no events aggregates to an empty report", () => {
 test("lens calls stay out of agent routing and latency stats", () => {
   const t0 = Date.parse("2026-11-10T10:00:00Z");
   const events: CostEvent[] = [
-    { type: "run.started", seq: 1, ts: t0, provider: "anthropic", model: "claude-sonnet" },
+    { type: "run.started", seq: 1, ts: t0, data: { provider: "anthropic", model: "claude-sonnet" } },
     {
       type: "llm.call",
       seq: 2,
@@ -317,7 +317,7 @@ test("lens calls stay out of agent routing and latency stats", () => {
         source: "lens",
       },
     },
-    { type: "run.finished", seq: 4, ts: t0 + 300, costUsd: 0.5, durationMs: 300, numTurns: 1 },
+    { type: "run.finished", seq: 4, ts: t0 + 300, data: { costUsd: 0.5, durationMs: 300, numTurns: 1 } },
   ];
 
   const report = aggregateRunCostLatency("run_lens", events);

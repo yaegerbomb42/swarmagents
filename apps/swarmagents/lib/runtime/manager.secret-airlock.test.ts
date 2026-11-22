@@ -124,7 +124,7 @@ test("the run report built from scrubbed telemetry carries no key", () => {
     if (e.data && typeof (e.data as Record<string, unknown>).prompt === "string") {
       out.data = { ...(e.data as Record<string, unknown>), prompt: redact((e.data as Record<string, unknown>).prompt as string) };
     }
-    return out as SequencedEvent;
+    return out as unknown as SequencedEvent;
   });
 
   const rawArtifacts = [{ path: `/workspace/report-${FAKE_KEY}.txt`, rel: `report-${FAKE_KEY}.txt`, size: 10, mtimeMs: now, change: "created" as const }];

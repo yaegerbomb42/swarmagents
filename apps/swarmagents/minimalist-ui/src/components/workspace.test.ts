@@ -185,6 +185,7 @@ test("the header keeps the conversation, the views, the run and settings in one 
     onView: noop,
     run: { phase: "approval" as const, since: Date.now(), stopping: false, onStop: noop, onShow: noop },
     onOpenSettings: noop,
+    onOpenShortcuts: noop,
     settingsNeedsAttention: true,
   };
 

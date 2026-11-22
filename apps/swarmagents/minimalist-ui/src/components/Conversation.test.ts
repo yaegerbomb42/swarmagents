@@ -21,6 +21,8 @@ async function renderConversation(session = makeSession()) {
       session,
       taskLinks: makeBoard().links,
       starters: STARTERS,
+      onOpenTask: () => {},
+      onOpenProviders: () => {},
     })
   );
 }
@@ -43,12 +45,12 @@ test("clicking a starter is wired to send its text", async () => {
   const session = makeSession({
     turns: [],
     pending: undefined,
-    send: async (text: string) => { sent = text; return { ok: true, runId: "run_1" }; },
+    send: async (text: string) => { sent = text; return { ok: true, runId: "run_1", queued: false }; },
   });
   installBrowserStubs({});
   const { Conversation } = await import("./Conversation");
   renderToStaticMarkup(
-    React.createElement(Conversation, { session, taskLinks: makeBoard().links, starters: STARTERS })
+    React.createElement(Conversation, { session, taskLinks: makeBoard().links, starters: STARTERS, onOpenTask: () => {}, onOpenProviders: () => {} })
   );
   // Static render cannot fire a click; assert the handler is not invoked during render.
   assert.equal(sent, undefined, "send is not invoked during a static render");

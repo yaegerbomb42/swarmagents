@@ -68,7 +68,7 @@ test("splitChatWidthCss is a clamp with a 480px floor and a stage-keeps-480px ce
   assert.equal(splitChatWidthCss(0.38), "clamp(480px, 38.0%, calc(100% - 492px))");
   assert.equal(splitChatWidthCss(0.5), "clamp(480px, 50.0%, calc(100% - 492px))");
   assert.equal(splitChatWidthCss(0.99), "clamp(480px, 80.0%, calc(100% - 492px))", "out of range clamps");
-  assert.equal(splitChatWidthCss("junk"), "clamp(480px, 38.0%, calc(100% - 492px))", "unusable clamps to the default");
+  assert.equal(splitChatWidthCss(Number.NaN), "clamp(480px, 38.0%, calc(100% - 492px))", "unusable clamps to the default");
 });
 
 test("SplitHandle renders as a keyboard-operable vertical separator, hidden on narrow screens", () => {

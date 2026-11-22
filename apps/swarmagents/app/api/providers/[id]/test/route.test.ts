@@ -16,6 +16,7 @@ import {
   configureProviderStorePaths,
   saveProvider,
 } from "../../../../../lib/providers/store";
+import { resetBuckets } from "../../../../../lib/rate-limit";
 
 const KEY = "sk-secret-test-aaaa";
 
@@ -26,6 +27,7 @@ test.beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "swarm-provider-test-route-"));
   providersFile = join(tempDir, "providers.json");
   configureProviderStorePaths(providersFile);
+  resetBuckets();
 });
 
 test.afterEach(() => {
@@ -105,4 +107,33 @@ test("POST surfaces a failing probe with an error kind and no key material", asy
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("POST returns 404 with Cache-Control: no-store for an unknown provider", async () => {
+  const res = await post("nope");
+  assert.equal(res.status, 404);
+  assert.equal((res.headers.get("cache-control") ?? "").toLowerCase(), "no-store");
+});
+
+test("per-user probe rate limit trips at 30/min with 429, Retry-After and no-store", async () => {
+  // Each unknown-provider probe still consumes a token: the check runs
+  // before the provider lookup.
+  for (let i = 0; i < 30; i++) {
+    const res = await post("nope");
+    assert.equal(res.status, 404, `probe ${i + 1} should miss, not rate-limit`);
+  }
+  const limited = await post("nope");
+  assert.equal(limited.status, 429);
+  assert.ok(Number(limited.headers.get("retry-after") ?? "0") > 0, "expected a Retry-After");
+  assert.equal((limited.headers.get("cache-control") ?? "").toLowerCase(), "no-store");
+
+  // The budget is per user: another account is unaffected.
+  const other = await POST(
+    new Request("http://localhost/api/providers/nope/test", {
+      method: "POST",
+      headers: { "x-swarm-user": "bob" },
+    }),
+    ctx("nope"),
+  );
+  assert.equal(other.status, 404);
 });

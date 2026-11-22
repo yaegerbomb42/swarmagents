@@ -1,8 +1,9 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { createRouter, type CompleteRequest } from "@/lib/providers";
-import { RouterError } from "@/lib/providers/errors";
+import { AbortError, RouterError } from "@/lib/providers/errors";
 import { routerProviders } from "@/lib/providers/store";
 import { USER_HEADER } from "@/lib/auth";
+import { checkCompleteRateLimit } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,13 +16,22 @@ const MAX_RACE = 8;
 
 const VALID_TIERS = new Set(["fast", "balanced", "deep"]);
 
+const NO_STORE = { "cache-control": "no-store" } as const;
+
+/** Every response from this route is per-user live state: never cacheable. */
+function json(body: unknown, status: number, retryAfter?: number): NextResponse {
+  const headers: Record<string, string> = { ...NO_STORE };
+  if (retryAfter !== undefined) headers["retry-after"] = String(retryAfter);
+  return NextResponse.json(body, { status, headers });
+}
+
 function caller(req: NextRequest): string | null {
   const user = req.headers.get(USER_HEADER);
   return user && user.length > 0 && user.length <= 128 ? user : null;
 }
 
 function unauthorized() {
-  return NextResponse.json({ error: "Sign in required." }, { status: 401 });
+  return json({ error: "Sign in required." }, 401);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -54,6 +64,9 @@ function validate(body: unknown):
   }
 
   const system = typeof body.system === "string" ? body.system : undefined;
+  if (body.system !== undefined && typeof body.system !== "string") {
+    return { ok: false, status: 400, error: "system must be a string." };
+  }
   if (system !== undefined && system.length > MAX_MESSAGE_LEN) {
     return { ok: false, status: 400, error: "system prompt too long." };
   }
@@ -66,10 +79,15 @@ function validate(body: unknown):
     tier = body.tier as CompleteRequest["tier"];
   }
 
-  const model = typeof body.model === "string" ? body.model : undefined;
-  if (model !== undefined && model.length > 128) {
-    return { ok: false, status: 400, error: "model id too long." };
+  if (body.model !== undefined) {
+    if (typeof body.model !== "string" || body.model.trim().length === 0) {
+      return { ok: false, status: 400, error: "model must be a non-empty string." };
+    }
+    if (body.model.length > 128) {
+      return { ok: false, status: 400, error: "model id too long." };
+    }
   }
+  const model = typeof body.model === "string" ? body.model : undefined;
 
   let maxTokens: CompleteRequest["maxTokens"];
   if (body.maxTokens !== undefined) {
@@ -115,44 +133,55 @@ export async function POST(req: NextRequest) {
   const user = caller(req);
   if (!user) return unauthorized();
 
+  // Per-user budget, checked before any body work: one completion can fan
+  // out to 8 upstream LLM calls, so a flood here is spend, not just load.
+  const limit = checkCompleteRateLimit(user);
+  if (!limit.allowed) {
+    return json({ error: "Too many completion requests. Try again later." }, 429, limit.retryAfter);
+  }
+
   let text: string;
   try {
     text = await req.text();
   } catch {
-    return NextResponse.json({ error: "Could not read request body." }, { status: 400 });
+    return json({ error: "Could not read request body." }, 400);
   }
   if (text.length > MAX_BODY_SIZE) {
-    return NextResponse.json({ error: "Request body too large." }, { status: 413 });
+    return json({ error: "Request body too large." }, 413);
   }
 
   let body: unknown;
   try {
     body = JSON.parse(text);
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return json({ error: "Invalid JSON body." }, 400);
   }
 
   const check = validate(body);
   if (!check.ok) {
-    return NextResponse.json({ error: check.error }, { status: check.status });
+    return json({ error: check.error }, check.status);
   }
 
   const providers = routerProviders(user);
   const router = createRouter({ providers });
   try {
-    const result = await router.complete(check.request);
-    return NextResponse.json({
+    // The client's disconnect aborts the in-flight/raced upstream calls.
+    const result = await router.complete({ ...check.request, signal: req.signal });
+    return json({
       text: result.text,
       provider: result.provider,
       model: result.model,
       usage: result.usage,
       latencyMs: result.latencyMs,
-    });
+    }, 200);
   } catch (err) {
+    if (req.signal.aborted || err instanceof AbortError || (err instanceof RouterError && err.code === "aborted")) {
+      return json({ error: "Request aborted." }, 499);
+    }
     if (err instanceof RouterError) {
       // RouterError messages are already redacted (no key material).
-      return NextResponse.json({ error: err.message }, { status: 502 });
+      return json({ error: err.message }, 502);
     }
-    return NextResponse.json({ error: "Completion failed." }, { status: 500 });
+    return json({ error: "Completion failed." }, 500);
   }
 }

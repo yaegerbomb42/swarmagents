@@ -114,6 +114,21 @@ const EXEMPT = new Set(["/api/health"]);
 const loginBucket = new TokenBucket(5, 60_000);
 
 /**
+ * Provider completion bucket: one completion can fan out to 8 upstream LLM
+ * calls, so it gets its own per-user budget (tighter than the general API
+ * 300/min) rather than sharing the app-wide bucket. 60/min by default,
+ * tunable with SWARM_COMPLETE_RATE_LIMIT_PER_MIN.
+ */
+const completeBucket = new TokenBucket(perMinute("SWARM_COMPLETE_RATE_LIMIT_PER_MIN", 60), 60_000);
+
+/**
+ * Provider health-probe bucket: a probe is a live outbound call per click.
+ * 30/min per user by default, tunable with
+ * SWARM_PROVIDER_PROBE_RATE_LIMIT_PER_MIN.
+ */
+const probeBucket = new TokenBucket(perMinute("SWARM_PROVIDER_PROBE_RATE_LIMIT_PER_MIN", 30), 60_000);
+
+/**
  * Signup bucket: account creation is also scrypt-heavy, so it gets its own
  * strict per-identity budget rather than sharing the app-wide 300/min bucket.
  * 5/min by default, tunable with SWARM_SIGNUP_RATE_LIMIT_PER_MIN.
@@ -299,6 +314,28 @@ export function resetBuckets(): void {
   approvalBucket._clear();
   unidentifiedBucket._clear();
   shareBucket._clear();
+  completeBucket._clear();
+  probeBucket._clear();
+}
+
+/**
+ * Per-user completion budget for POST /api/providers/complete. Returns
+ * whether the call may proceed and, when denied, how many seconds to wait.
+ * The key is the signed-in user id; callers check auth before calling this.
+ */
+export function checkCompleteRateLimit(user: string): { allowed: boolean; retryAfter: number } {
+  const r = completeBucket.consume(`user:${user}`);
+  return { allowed: r.allowed, retryAfter: r.retryAfter };
+}
+
+/**
+ * Per-user health-probe budget for POST /api/providers/[id]/test. Same
+ * shape as checkCompleteRateLimit; a separate bucket so probe clicks can
+ * never eat the completion budget or vice versa.
+ */
+export function checkProviderProbeRateLimit(user: string): { allowed: boolean; retryAfter: number } {
+  const r = probeBucket.consume(`user:${user}`);
+  return { allowed: r.allowed, retryAfter: r.retryAfter };
 }
 
 /** Reset one-time warning state (for tests). */

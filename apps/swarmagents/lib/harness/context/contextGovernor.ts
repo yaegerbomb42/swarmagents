@@ -14,7 +14,9 @@
  *   reserve       ~2,400  system header (≤1,408) + output buffer (992)
  *
  * 600 + 1,500 + 3,500 + 2,400 = 8,000, leaving 192 tokens of headroom for
- * estimate error. Input never exceeds 7,200 (the mini's MAX_INPUT_TOKENS).
+ * estimate error. With the default budget the input ceiling is 7,200 (the
+ * mini's MAX_INPUT_TOKENS = 8,192 - 992). The ceiling is derived from the
+ * budget (total - outputBuffer), so a larger custom budget packs more.
  * Unused ledger/skeleton budget rolls into the working set; nothing ever
  * rolls into (or out of) the output buffer.
  *
@@ -330,9 +332,11 @@ export class ContextGovernor {
     const skeletonUsed = estimateTokens(skeletonText);
 
     const rollover = Math.max(0, b.ledger - ledgerUsed) + Math.max(0, b.skeleton - skeletonUsed);
-    // Input must also stay under the mini's MAX_INPUT_TOKENS ceiling.
+    // The input ceiling comes from the budget itself (total - output buffer),
+    // so a larger custom budget can pack more than the default 7,200. With the
+    // default budget this is exactly MAX_INPUT_TOKENS (8192 - 992), byte-identical.
     const systemUsed = estimateTokens(systemPrompt);
-    const inputCeiling = Math.min(MAX_INPUT_TOKENS, b.total - b.outputBuffer);
+    const inputCeiling = b.total - b.outputBuffer;
     const workingCap = Math.max(
       0,
       Math.min(b.workingSet + rollover, inputCeiling - systemUsed - ledgerUsed - skeletonUsed - 8),

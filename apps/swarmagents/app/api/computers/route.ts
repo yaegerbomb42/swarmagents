@@ -61,7 +61,13 @@ function allowedHosts(): string[] {
  */
 function requestOrigin(req: NextRequest): string {
   const trusted = process.env.SWARM_TRUST_PROXY === "1";
-  const protoHeader = trusted ? (req.headers.get("x-forwarded-proto") ?? "").trim().toLowerCase() : "";
+  const protoHeader = trusted
+    ? (req.headers.get("x-forwarded-proto") ?? "")
+        .split(",")
+        .map((p) => p.trim().toLowerCase())
+        .filter(Boolean)
+        .pop() ?? ""
+    : "";
   const proto = protoHeader === "http" || protoHeader === "https" ? protoHeader : req.nextUrl.protocol.replace(":", "");
   const forwarded = trusted
     ? (req.headers.get("x-forwarded-host") ?? "")
@@ -72,28 +78,33 @@ function requestOrigin(req: NextRequest): string {
     : "";
   const host = forwarded || (req.headers.get("host") ?? "").trim();
   const candidate = `${proto}://${host}`;
-  if (ORIGIN_RE.test(candidate)) {
-    const allowed = allowedHosts();
-    if (allowed.length > 0) {
-      let hostname = "";
-      try {
-        hostname = new URL(candidate).hostname.toLowerCase();
-      } catch {
-        return FALLBACK_ORIGIN;
-      }
-      if (!allowed.includes(hostname)) return FALLBACK_ORIGIN;
+  const allowed = allowedHosts();
+
+  function isAllowed(urlStr: string): boolean {
+    if (allowed.length === 0) return true;
+    try {
+      const hostname = new URL(urlStr).hostname.toLowerCase();
+      return allowed.includes(hostname);
+    } catch {
+      return false;
     }
+  }
+
+  if (ORIGIN_RE.test(candidate) && isAllowed(candidate)) {
     return candidate;
   }
   const fallback = req.nextUrl.origin;
-  return ORIGIN_RE.test(fallback) ? fallback : FALLBACK_ORIGIN;
+  if (ORIGIN_RE.test(fallback) && isAllowed(fallback)) {
+    return fallback;
+  }
+  return FALLBACK_ORIGIN;
 }
 
 function installCommands(origin: string, code: string) {
   const base = `${origin}/api/computers/node/install`;
   return {
-    linux: `curl -fsSL '${base}?os=linux' | sh -s -- --code ${code} --server ${origin}`,
-    macos: `curl -fsSL '${base}?os=macos' | sh -s -- --code ${code} --server ${origin}`,
+    linux: `curl -fsSL '${base}?os=linux' | sh -s -- --code ${code} --server '${origin}'`,
+    macos: `curl -fsSL '${base}?os=macos' | sh -s -- --code ${code} --server '${origin}'`,
     windows: `& ([scriptblock]::Create((irm '${base}?os=windows'))) -Code '${code}' -Server '${origin}'`,
   };
 }

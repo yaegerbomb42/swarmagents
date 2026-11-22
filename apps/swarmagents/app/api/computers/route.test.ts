@@ -297,3 +297,69 @@ test("computers API: pairing and revocation are audit-logged, without token mate
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("computers API: requestOrigin multi-hop x-forwarded-proto, fallback allowed hosts, and shell quoting", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-computers-origin-"));
+  configureComputersStoreDir(dir);
+  configureComputersClock(() => 1_000_000);
+  const prevTrust = process.env.SWARM_TRUST_PROXY;
+  const prevAllowed = process.env.SWARM_ALLOWED_HOSTS;
+  try {
+    process.env.SWARM_TRUST_PROXY = "1";
+
+    // 1. Multi-hop x-forwarded-proto picks the rightmost hop
+    const multiProto = await pairingRoute(
+      request("/api/computers", {
+        method: "POST",
+        body: "{}",
+        headers: {
+          "x-forwarded-proto": "http, https",
+          "x-forwarded-host": "edge.example, origin.example.com",
+        },
+      }),
+    );
+    assert.equal(multiProto.status, 200);
+    const multiProtoBody = (await multiProto.json()) as { install: { linux: string; macos: string; windows: string } };
+    assert.ok(multiProtoBody.install.linux.includes("--server 'https://origin.example.com'"));
+    assert.ok(multiProtoBody.install.macos.includes("--server 'https://origin.example.com'"));
+    assert.ok(multiProtoBody.install.windows.includes("-Server 'https://origin.example.com'"));
+
+    // 2. IPv6 origin has single quotes around ${origin} in linux & macos install commands
+    const ipv6Res = await pairingRoute(
+      request("/api/computers", {
+        method: "POST",
+        body: "{}",
+        headers: {
+          "x-forwarded-proto": "http",
+          "x-forwarded-host": "[::1]:3000",
+        },
+      }),
+    );
+    assert.equal(ipv6Res.status, 200);
+    const ipv6Body = (await ipv6Res.json()) as { install: { linux: string; macos: string; windows: string } };
+    assert.ok(ipv6Body.install.linux.includes("--server 'http://[::1]:3000'"));
+    assert.ok(ipv6Body.install.macos.includes("--server 'http://[::1]:3000'"));
+
+    // 3. SWARM_ALLOWED_HOSTS validation also applies to req.nextUrl.origin fallback
+    process.env.SWARM_TRUST_PROXY = "0"; // untrusted proxy, candidate fails back to req.nextUrl.origin (localhost)
+    process.env.SWARM_ALLOWED_HOSTS = "allowed.domain.com";
+    const blockedFallback = await pairingRoute(
+      request("/api/computers", {
+        method: "POST",
+        body: "{}",
+      }),
+    );
+    assert.equal(blockedFallback.status, 200);
+    const blockedFallbackBody = (await blockedFallback.json()) as { install: { linux: string } };
+    // localhost is not in allowed.domain.com, so fallback to FALLBACK_ORIGIN
+    assert.ok(blockedFallbackBody.install.linux.includes("--server 'https://swarmagents.codes'"));
+  } finally {
+    if (prevTrust === undefined) delete process.env.SWARM_TRUST_PROXY;
+    else process.env.SWARM_TRUST_PROXY = prevTrust;
+    if (prevAllowed === undefined) delete process.env.SWARM_ALLOWED_HOSTS;
+    else process.env.SWARM_ALLOWED_HOSTS = prevAllowed;
+    configureComputersStoreDir("");
+    configureComputersClock(undefined);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

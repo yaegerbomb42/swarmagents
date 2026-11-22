@@ -163,4 +163,4 @@ export {
   userSettingsFilePath,
   USER_SETTINGS_FILE,
 } from "./settings";
-export type { UserSettings } from "./settings";
+export type { RaceSettings, UserSettings } from "./settings";

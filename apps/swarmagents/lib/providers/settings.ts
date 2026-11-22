@@ -11,6 +11,8 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { userProviderDir, type DataDirOptions } from "./store";
+import { isSearchBackend, type WebSearchConfig } from "../web/search";
+import type { DecisionBrainSettingsInput } from "../harness/decision-brain/settings";
 
 /** Name of the settings file inside the user's directory. */
 export const USER_SETTINGS_FILE = "settings.json";
@@ -59,6 +61,16 @@ export interface UserSettings {
    * Absent = "persistent", the historical behavior.
    */
   vmPersistenceMode?: VmPersistenceMode;
+  /**
+   * Provider racing (lib/providers/race-dispatch.ts). Absent/enabled:false = off.
+   */
+  race?: RaceSettings;
+  /** Host-proxied web search backends (keys never enter the VM). */
+  webSearch?: WebSearchConfig;
+  /**
+   * Decision Brain loop control. Absent = off.
+   */
+  decisionBrain?: DecisionBrainSettingsInput;
 }
 
 /**
@@ -267,6 +279,70 @@ function parseTokenEfficiency(value: unknown): TokenEfficiencySettings | undefin
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** Per-user provider-racing preferences. */
+export interface RaceSettings {
+  enabled: boolean;
+  /** Providers raced concurrently (1..8). Default 3. */
+  maxParallel?: number;
+  /** Keys raced per provider (1..5). Default 2. */
+  keysPerProvider?: number;
+}
+
+export const MAX_SEARCH_KEY_CHARS = 512;
+
+function parseRaceCount(value: unknown, min: number, max: number): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  const n = Math.floor(value);
+  if (n < min || n > max) return undefined;
+  return n;
+}
+
+function parseRaceSettings(value: unknown): RaceSettings | undefined {
+  if (!isRecord(value)) return undefined;
+  if (typeof value.enabled !== "boolean") return undefined;
+  const out: RaceSettings = { enabled: value.enabled };
+  const maxParallel = parseRaceCount(value.maxParallel, 1, 8);
+  if (maxParallel !== undefined) out.maxParallel = maxParallel;
+  const keysPerProvider = parseRaceCount(value.keysPerProvider, 1, 5);
+  if (keysPerProvider !== undefined) out.keysPerProvider = keysPerProvider;
+  return out;
+}
+
+/** Parse host-proxied web-search config; invalid shapes are dropped. */
+export function parseWebSearchConfig(value: unknown): WebSearchConfig | undefined {
+  if (!isRecord(value)) return undefined;
+  if (!isSearchBackend(value.backend)) return undefined;
+  const out: WebSearchConfig = { backend: value.backend };
+  if (typeof value.apiKey === "string") {
+    const key = value.apiKey.trim();
+    if (key && key.length <= MAX_SEARCH_KEY_CHARS) out.apiKey = key;
+  }
+  const searxngUrl = parseOllamaUrl(value.searxngUrl);
+  if (searxngUrl !== undefined) out.searxngUrl = searxngUrl;
+  return out;
+}
+
+/**
+ * Copy known Decision Brain keys with primitive types. Range/default
+ * validation stays with resolveDecisionBrainSettings at run time.
+ */
+function parseDecisionBrain(value: unknown): DecisionBrainSettingsInput | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: DecisionBrainSettingsInput = {};
+  if (typeof value.enabled === "boolean") out.enabled = value.enabled;
+  if (typeof value.confidenceThreshold === "number" && Number.isFinite(value.confidenceThreshold)) {
+    out.confidenceThreshold = value.confidenceThreshold;
+  }
+  if (typeof value.hookTimeoutMs === "number" && Number.isFinite(value.hookTimeoutMs)) {
+    out.hookTimeoutMs = value.hookTimeoutMs;
+  }
+  if (typeof value.maxTurns === "number" && Number.isFinite(value.maxTurns)) {
+    out.maxTurns = value.maxTurns;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+
 /** Parse a settings file body; invalid shapes fall back to defaults. */
 export function parseUserSettings(raw: unknown): UserSettings {
   if (!isRecord(raw)) return { ...DEFAULT_USER_SETTINGS };
@@ -288,6 +364,12 @@ export function parseUserSettings(raw: unknown): UserSettings {
   if (tokenEfficiency !== undefined) out.tokenEfficiency = tokenEfficiency;
   if (isKeySelectionMode(raw.keySelectionMode)) out.keySelectionMode = raw.keySelectionMode;
   if (isVmPersistenceMode(raw.vmPersistenceMode)) out.vmPersistenceMode = raw.vmPersistenceMode;
+  const race = parseRaceSettings(raw.race);
+  if (race !== undefined) out.race = race;
+  const webSearch = parseWebSearchConfig(raw.webSearch);
+  if (webSearch !== undefined) out.webSearch = webSearch;
+  const decisionBrain = parseDecisionBrain(raw.decisionBrain);
+  if (decisionBrain !== undefined) out.decisionBrain = decisionBrain;
   return out;
 }
 

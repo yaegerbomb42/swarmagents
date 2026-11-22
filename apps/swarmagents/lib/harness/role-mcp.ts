@@ -35,6 +35,16 @@ import { SWARM_VM_DESKTOP_ENV } from "../vm/desktop";
 import { SELF_MANAGE_TAIL } from "../self-manage/prompt";
 import { CODEBASE_MCP_SERVER_NAME, CODEBASE_MCP_SERVER_PATH, codebaseMcpServerSource } from "./codebase-mcp-source";
 import {
+  WEB_SEARCH_MCP_SERVER_NAME,
+  WEB_SEARCH_MCP_SERVER_PATH,
+  webSearchMcpServerSource,
+} from "./web-search-mcp-source";
+import {
+  LOCATOR_MCP_SERVER_NAME,
+  LOCATOR_MCP_SERVER_PATH,
+  locatorMcpServerSource,
+} from "./locator-mcp-source";
+import {
   ATLAS_MCP_SERVER_NAME,
   ATLAS_MCP_SERVER_PATH,
   atlasMcpServerSource,
@@ -271,6 +281,12 @@ export function roleMcpConfigJson(
     atlasEnabled?: boolean;
     /** Registry path the atlas server reads (per-user file in the VM). */
     atlasRegistryPath?: string;
+    /**
+     * Full host web-search URL (run token included) for the web-search
+     * server's env. Optional: when unset, the in-VM server derives the host
+     * route from the run's ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN env.
+     */
+    webSearchUrl?: string;
   },
 ): string {
   const servers: Record<string, unknown> = {
@@ -323,6 +339,36 @@ export function roleMcpConfigJson(
       command: "node",
       args: [ATLAS_MCP_SERVER_PATH],
       ...(opts.atlasRegistryPath ? { env: { SWARM_ATLAS_REGISTRY: opts.atlasRegistryPath } } : {}),
+    };
+  }
+  // The web-search server is role-granted only: wired when the role lists it
+  // in mcpServers (registry id "web-search"), never by default, so a default
+  // run gets exactly today's toolset. The search runs host-side with the
+  // account's own key; the in-VM server only holds the per-run token.
+  {
+    const roleDef = opts.roleDef ?? roleDefinitionForId(role.roleId);
+    if (roleDef?.mcpServers.includes(WEB_SEARCH_MCP_SERVER_NAME)) {
+      servers[WEB_SEARCH_MCP_SERVER_NAME] = {
+        type: "stdio",
+        command: "node",
+        args: [WEB_SEARCH_MCP_SERVER_PATH],
+        ...(opts.webSearchUrl ? { env: { SWARM_WEB_SEARCH_URL: opts.webSearchUrl } } : {}),
+      };
+    }
+  }
+  // The locator server is role-granted: it is wired only when the phase's
+  // role lists it in mcpServers (see ROLE_MCP_SERVER_REGISTRY), so a role
+  // that does not grant it gets exactly today's toolset. The search root is
+  // the run's workspace root, same as the codebase server's.
+  const locatorRoleDef = opts.roleDef ?? roleDefinitionForId(role.roleId);
+  if (locatorRoleDef?.mcpServers.includes(LOCATOR_MCP_SERVER_NAME)) {
+    servers[LOCATOR_MCP_SERVER_NAME] = {
+      type: "stdio",
+      command: "node",
+      args: [LOCATOR_MCP_SERVER_PATH],
+      env: {
+        SWARM_LOCATOR_ROOT: opts.codebaseRepoRoot ?? "/workspace",
+      },
     };
   }
   if (opts.desktopMode) {
@@ -399,10 +445,18 @@ export function roleSeedFiles(
     { path: PLAYWRIGHT_LAUNCHER_PATH, content: PLAYWRIGHT_LAUNCHER_SOURCE },
     { path: ROLE_CATALOG_PATH, content: roleCatalogJson(catalog) },
     { path: CODEBASE_MCP_SERVER_PATH, content: codebaseMcpServerSource() },
+    // Seeded unconditionally (like the codebase server): the file is inert
+    // unless a role grants the web-search server in the --mcp-config, and
+    // seeding it always means a mid-run role switch can wire it without a
+    // second seed pass.
+    { path: WEB_SEARCH_MCP_SERVER_PATH, content: webSearchMcpServerSource() },
     { path: ROLE_MCP_CONFIG_PATH, content: roleMcpConfigJson(phase, { allowedRoleIds, roleDef: initialDef, ...opts }) },
   ];
   if (opts.atlasEnabled) {
     files.push({ path: ATLAS_MCP_SERVER_PATH, content: atlasMcpServerSource() });
+  }
+  if (catalog.some((role) => role.mcpServers.includes(LOCATOR_MCP_SERVER_NAME))) {
+    files.push({ path: LOCATOR_MCP_SERVER_PATH, content: locatorMcpServerSource() });
   }
   return files;
 }
@@ -614,3 +668,4 @@ export const ROLE_MCP_SERVER_SOURCE = [
   "process.stdin.on(\"end\", () => {});",
   "",
 ].join("\n");
+

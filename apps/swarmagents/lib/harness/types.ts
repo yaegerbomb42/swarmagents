@@ -9,6 +9,7 @@
 
 import type { StateLedgerSnapshot } from "./context/contextGovernor";
 import type { RiskLevel } from "./risk";
+import type { DecisionBrainHooksOptions } from "./decision-brain/hooks";
 
 /** Minimal exec interface, modeled on VmDriver. Implementations manage the actual process tree. */
 export interface VmExecOpts {
@@ -473,6 +474,17 @@ export interface RunRequest {
    * desktop back (shadow-to-takeover handoff).
    */
   handoffGateway?: HandoffGateway;
+  /**
+   * Per-run Decision Brain loop control. When set (and its settings enable
+   * it), the runner evaluates each risk-allowed tool call through the brain
+   * before it proceeds: `ask` pauses via the approval gateway, `stop` halts,
+   * `retry` halts with a distinct marker. Wins over the runner-level
+   * `decisionBrain` constructor option. Absent or disabled → the brain is
+   * never constructed and the run path is byte-identical to one without it.
+   * The runtime wires the user's saved settings plus an `emit` sink that
+   * publishes `brain.decision` / `brain.error` to the telemetry bus.
+   */
+  decisionBrain?: DecisionBrainHooksOptions;
   /**
    * The role configuration for this invocation (--allowedTools / --mcp-config
    * / --append-system-prompt). When absent the run uses the default toolset.

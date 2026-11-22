@@ -56,6 +56,12 @@ import type { ApiStyle, ProviderConfig, ProviderErrorKind, TokenUsage } from "..
 import { CooldownStore, type PersistedCooldown } from "../providers/cooldown-store";
 import { routerProviders, userCooldownFilePath } from "../providers/store";
 import { readUserSettings, type UserSettings } from "../providers/settings";
+import {
+  extractRacePrompt,
+  raceCompletion,
+  raceConfigFromSettings,
+  raceMaxTokens,
+} from "../providers/race-dispatch";
 import { costWasReported, estimateCostUsd } from "../providers/pricing";
 import { guardStreamTimeouts, readSseFrames, StreamTimeoutError } from "../providers/stream";
 import { telemetryBus, type TelemetryBus } from "../telemetry";
@@ -1368,6 +1374,49 @@ export async function forwardLlmNonStreaming(options: LlmForwardOptions): Promis
   const prepared = prepareRequest(options);
   if ("error" in prepared) throw prepared.error;
   const req = prepared;
+
+  // Provider racing (opt-in per user, default off): when the user enabled
+  // it and the request is a simple text completion, race the top providers
+  // concurrently and take the first valid response. The budget gate runs
+  // first (racing multiplies spend, so the same per-run cap applies), and
+  // every settled attempt is telemetered and counted. Any racing failure
+  // falls through to the sequential path below (fail-open); when racing is
+  // off or the request is ineligible (tools/streaming), this block is
+  // skipped and behavior is byte-identical to the sequential path.
+  const raceCfg = raceConfigFromSettings(req.settings);
+  const racePrompt = raceCfg ? extractRacePrompt(body) : null;
+  if (raceCfg && racePrompt !== null) {
+    const budget = await budgetCheck(req);
+    if (!budget.proceed) throw budget.failure;
+    try {
+      const maxTokens = raceMaxTokens(body);
+      const raced = await raceCompletion({
+        owner: req.owner,
+        prompt: racePrompt,
+        candidates: req.entries.map(({ config, model }) => ({ config, model })),
+        config: raceCfg,
+        allowPaid: req.settings.allowPaidProviders !== false,
+        ...(maxTokens !== undefined ? { maxTokens } : {}),
+        inputTokens: estimateInputTokens(body),
+        attemptBase: req.attempts.length + 1,
+        signal,
+        fetch: fetchImpl,
+        now: req.now,
+        emit: (data) => emitLlmCall(req.runId, req.bus, data),
+        noteSpend: (usd) => {
+          if (req.runId) getBudgetGate().noteSpend(req.runId, usd);
+        },
+      });
+      req.attempts.push(...raced.attempts);
+      req.lastAttemptEnd = req.now();
+      return { body: raced.body, usage: raced.usage, attempts: req.attempts };
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      console.warn(
+        `[llm-gateway] provider race failed, falling back to sequential: ${redact(errorMessage(err), req.secrets)}`,
+      );
+    }
+  }
 
   const streaming = (body as { stream?: unknown }).stream === true;
   const source = await attemptSource(req);

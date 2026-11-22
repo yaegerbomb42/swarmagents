@@ -304,10 +304,13 @@ export class ClaudeCodeRunner {
         ? new SystemOneHooks(this.systemOneOptions)
         : undefined;
     // The Decision Brain is inert on the same terms: no hooks object, no
-    // await, no events unless its own settings enable it.
+    // await, no events unless its own settings enable it. A per-run
+    // `decisionBrain` on the request (the runtime wires the user's saved
+    // settings + telemetry sink there) wins over the constructor option.
+    const brainOptions = request.decisionBrain ?? this.decisionBrainOptions;
     const brain =
-      this.decisionBrainOptions && resolveDecisionBrainSettings(this.decisionBrainOptions.settings).enabled
-        ? new DecisionBrainHooks(this.decisionBrainOptions)
+      brainOptions && resolveDecisionBrainSettings(brainOptions.settings).enabled
+        ? new DecisionBrainHooks(brainOptions)
         : undefined;
 
     let started = false;

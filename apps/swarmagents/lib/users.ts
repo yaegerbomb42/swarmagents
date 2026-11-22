@@ -390,58 +390,14 @@ class UsersLock {
 
 const usersLock = new UsersLock();
 
-const LOCKFILE_STALE_MS = 5000;
-const LOCKFILE_TIMEOUT_MS = 10000;
-
 /**
- * Acquire a cross-process lockfile next to the users file using O_EXCL ('wx').
- * Implements stale-lock detection and automatic cleanup.
+ * Combines in-process serialization and the cross-process lockfile. The
+ * file lock is the single cross-process layer (lib/file-lock.ts) taken
+ * inside the in-process lock, so this process contends for the lockfile
+ * with at most one waiter.
  */
-async function withCrossProcessLock<T>(fn: () => T | Promise<T>): Promise<T> {
-  const lockfile = `${USER_FILE}.lock`;
-  fs.mkdirSync(path.dirname(lockfile), { recursive: true });
-  const start = Date.now();
-
-  while (true) {
-    try {
-      const fd = fs.openSync(lockfile, "wx");
-      try {
-        fs.writeSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
-      } finally {
-        fs.closeSync(fd);
-      }
-      break;
-    } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      try {
-        const stat = fs.statSync(lockfile);
-        if (Date.now() - stat.mtimeMs > LOCKFILE_STALE_MS) {
-          try {
-            fs.unlinkSync(lockfile);
-          } catch {}
-          continue;
-        }
-      } catch {}
-
-      if (Date.now() - start > LOCKFILE_TIMEOUT_MS) {
-        throw new Error("Timeout acquiring cross-process lock for users.json");
-      }
-      await new Promise((r) => setTimeout(r, 20));
-    }
-  }
-
-  try {
-    return await fn();
-  } finally {
-    try {
-      fs.unlinkSync(lockfile);
-    } catch {}
-  }
-}
-
-/** Combines in-process serialization and cross-process lockfile. */
 export async function withUsersLock<T>(fn: () => T | Promise<T>): Promise<T> {
-  return usersLock.acquire(() => withCrossProcessLock(fn));
+  return usersLock.acquire(fn);
 }
 
 /**

@@ -9,6 +9,7 @@
  */
 
 import { useState, type FormEvent } from "react";
+import Link from "next/link";
 import { Loader2 } from "lucide-react";
 
 function Spinner() {
@@ -120,7 +121,7 @@ export default function VerifyForm({ token }: { token: string }) {
         )}
 
         {done ? (
-          <a
+          <Link
             href="/"
             data-testid="verify-continue"
             style={{
@@ -137,7 +138,7 @@ export default function VerifyForm({ token }: { token: string }) {
             }}
           >
             Continue to SwarmAgents
-          </a>
+          </Link>
         ) : token ? (
           <form onSubmit={confirm} style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             <button

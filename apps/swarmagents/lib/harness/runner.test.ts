@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { ClaudeCodeRunner, isBackgroundedCommand, isSignalKillExitCode } from "./runner.js";
 import { localScorer } from "./system-one/index.js";
 import type { DecisionRouter } from "./decision-brain/index.js";
-import type { TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
+import type { RolePhase, TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
 
 const SECRET_TOKEN = "sk-ant-api03-BENCH-FAKE-TOKEN-0000";
 const PLAIN_SECRET = "my-super-secret-key-42";
@@ -1333,4 +1333,129 @@ test("Brain off: argv and events are byte-identical to today", async () => {
       return copy;
     });
   assert.deepEqual(withoutWallClock(disabled.events), withoutWallClock(plain.events), "no Brain telemetry leaks into the run");
+});
+
+
+test("redacts secret-shaped stderr detail on a nonzero exit", async () => {
+  const secret = "plain-secret-value-123";
+  const vm = new ScriptedVm([
+    {
+      chunks: [FIXTURE_LINES[0] + "\n"],
+      err: `fatal: upstream rejected key ${secret}`,
+      exitCode: 1,
+    },
+  ]);
+  const runner = new ClaudeCodeRunner();
+  const events: TelemetryEvent[] = [];
+
+  const outcome = await runner.run({ prompt: "x", env: { API_KEY: secret }, vm }, (e) => events.push(e));
+
+  assert.equal(outcome.exitCode, 1);
+  const error = events.find((e) => e.type === "run.error") as Extract<TelemetryEvent, { type: "run.error" }>;
+  assert.ok(error);
+  assert.ok(!error.message.includes(secret), "stderrTail leaked a secret into run.error");
+  assert.match(error.message, /\[REDACTED\]/);
+});
+
+test("a policy halt aborts the VM child immediately", async () => {
+  const deny = JSON.stringify({
+    type: "assistant",
+    message: { id: "m_deny", content: [{ type: "tool_use", id: "toolu_deny", name: "Bash", input: { command: "echo ${API_KEY}" } }] },
+  });
+  let abortSeen = false;
+  const vm: VmExec = {
+    async exec(_cmd, opts) {
+      opts?.onStdout?.(`${FIXTURE_LINES[0]}\n${deny}\n`);
+      await new Promise<void>((resolve) => {
+        if (opts?.signal?.aborted) {
+          abortSeen = true;
+          resolve();
+          return;
+        }
+        opts?.signal?.addEventListener(
+          "abort",
+          () => {
+            abortSeen = true;
+            resolve();
+          },
+          { once: true },
+        );
+      });
+      return { exitCode: 130 };
+    },
+  };
+  const runner = new ClaudeCodeRunner();
+  const events: TelemetryEvent[] = [];
+
+  const outcome = await runner.run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+
+  assert.equal(abortSeen, true, "the child was not aborted on halt");
+  assert.equal(outcome.exitCode, 130);
+  const error = events.find((e) => e.type === "run.error") as Extract<TelemetryEvent, { type: "run.error" }>;
+  assert.match(error.message, /Halted by harness risk policy/);
+});
+
+test("a final newline-less line is flushed before the halt check", async () => {
+  const deny = JSON.stringify({
+    type: "assistant",
+    message: { id: "m_deny", content: [{ type: "tool_use", id: "toolu_deny", name: "Bash", input: { command: "echo ${API_KEY}" } }] },
+  });
+  const vm: VmExec = {
+    async exec(_cmd, opts) {
+      // The denied call has no trailing newline: it only becomes visible on flush.
+      opts?.onStdout?.(`${FIXTURE_LINES[0]}\n${deny}`);
+      return { exitCode: 0 };
+    },
+  };
+  const runner = new ClaudeCodeRunner();
+  const events: TelemetryEvent[] = [];
+
+  await runner.run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+
+  const error = events.find((e) => e.type === "run.error") as Extract<TelemetryEvent, { type: "run.error" }>;
+  assert.ok(error);
+  assert.match(error.message, /Halted by harness risk policy/);
+  assert.ok(!/no result event/i.test(error.message));
+});
+
+test("a role switch whose VM rejects on abort still returns roleSwitch", async () => {
+  const switchCall = JSON.stringify({
+    type: "assistant",
+    message: {
+      id: "m_switch",
+      content: [{ type: "tool_use", id: "toolu_switch", name: "mcp__roles__set_role", input: { role_id: "debugger" } }],
+    },
+  });
+  const nextPhase: RolePhase = {
+    roleId: "debugger",
+    roleName: "Debugger",
+    allowedTools: ["Read"],
+    mcpConfigPath: "/workspace/.swarm/mcp.json",
+  };
+  const vm: VmExec = {
+    async exec(_cmd, opts) {
+      opts?.onStdout?.(`${FIXTURE_LINES[0]}\n${switchCall}\n`);
+      await new Promise<void>((_resolve, reject) => {
+        opts?.signal?.addEventListener("abort", () => reject(new Error("aborted by role switch")), { once: true });
+      });
+      return { exitCode: 0 };
+    },
+  };
+  const runner = new ClaudeCodeRunner();
+  const events: TelemetryEvent[] = [];
+
+  const outcome = await runner.run(
+    {
+      prompt: "switch",
+      env: {},
+      vm,
+      rolePhase: { roleId: "main", roleName: "Main", allowedTools: ["Read"], mcpConfigPath: "/workspace/.swarm/mcp.json" },
+      onRoleSwitch: async () => nextPhase,
+    },
+    (e) => events.push(e),
+  );
+
+  assert.equal(outcome.roleSwitch?.toRoleId, "debugger");
+  assert.equal(events.some((e) => e.type === "run.error"), false);
+  assert.equal(events.filter((e) => e.type === "role.changed").length, 1);
 });

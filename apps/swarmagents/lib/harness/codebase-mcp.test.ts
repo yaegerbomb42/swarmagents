@@ -18,9 +18,8 @@ function repoHash(repoRoot: string): string {
   return crypto.createHash("sha1").update(path.resolve(repoRoot)).digest("hex").slice(0, 16);
 }
 
-/** Run the MCP server against a fake map and answer the given requests. */
-async function ask(requests: unknown[], repoRoot: string): Promise<Rpc[]> {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-mcp-"));
+/** Seed a fake map for one repo root inside a home dir. */
+function writeMap(home: string, repoRoot: string, repoName: string, generatedAt = new Date(0).toISOString()): string {
   const mapDir = path.join(home, ".swarm", "codebase", repoHash(repoRoot));
   fs.mkdirSync(mapDir, { recursive: true });
   fs.writeFileSync(
@@ -28,9 +27,9 @@ async function ask(requests: unknown[], repoRoot: string): Promise<Rpc[]> {
     JSON.stringify({
       version: 1,
       repoRoot,
-      repoName: "demo",
+      repoName,
       repoHash: repoHash(repoRoot),
-      generatedAt: new Date(0).toISOString(),
+      generatedAt,
       gitHead: "head-1",
       buildMs: 12,
       files: [],
@@ -42,9 +41,9 @@ async function ask(requests: unknown[], repoRoot: string): Promise<Rpc[]> {
       topLevelModules: [{ path: "src", kind: "dir", purpose: "Source", files: 3, bytes: 100 }],
       contextPack: {
         repoRoot,
-        repoName: "demo",
+        repoName,
         repoHash: repoHash(repoRoot),
-        generatedAt: new Date(0).toISOString(),
+        generatedAt,
         languages: { TypeScript: 3 },
         entryPoints: ["src/index.ts"],
         buildCommands: ["npm run build"],
@@ -53,7 +52,7 @@ async function ask(requests: unknown[], repoRoot: string): Promise<Rpc[]> {
         keyFiles: [{ path: "src/index.ts", fanIn: 3 }],
         conventions: {},
         tokenEstimate: 42,
-        text: "# Codebase context: demo",
+        text: `# Codebase context: ${repoName}`,
       },
       heatmap: [
         { path: "src/index.ts", churn90d: 10, bytes: 100, fanIn: 3, agentTouches: 1, heat: 0.9 },
@@ -61,12 +60,26 @@ async function ask(requests: unknown[], repoRoot: string): Promise<Rpc[]> {
       ],
     }),
   );
+  return mapDir;
+}
+
+/** Run the MCP server against fake maps and answer the given requests. */
+async function ask(
+  requests: unknown[],
+  repoRoot: string,
+  options?: { extraMaps?: Array<{ repoRoot: string; repoName: string; generatedAt: string }>; env?: Record<string, string> },
+): Promise<Rpc[]> {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-mcp-"));
+  writeMap(home, repoRoot, "demo");
+  for (const extra of options?.extraMaps ?? []) {
+    writeMap(home, extra.repoRoot, extra.repoName, extra.generatedAt);
+  }
 
   const serverPath = path.join(home, "codebase-server.mjs");
   fs.writeFileSync(serverPath, codebaseMcpServerSource(), "utf8");
 
   const child = spawn("node", [serverPath], {
-    env: { ...process.env, HOME: home, SWARM_CODEBASE_REPO_ROOT: repoRoot },
+    env: { ...process.env, HOME: home, SWARM_CODEBASE_REPO_ROOT: repoRoot, ...(options?.env ?? {}) },
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -140,4 +153,56 @@ test("codebase_hotspots returns the hottest files", async () => {
   assert.equal(payload.ok, true);
   assert.equal(payload.hotspots.length, 1);
   assert.equal(payload.hotspots[0].path, "src/index.ts");
+});
+
+test("codebase_map_get for an explicitly-requested missing repoRoot returns not-found, not another repo's map", async () => {
+  const replies = await ask(
+    [
+      {
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/call",
+        params: { name: "codebase_map_get", arguments: { repoRoot: "/workspace/missing" } },
+      },
+    ],
+    "/workspace/demo",
+    {
+      extraMaps: [
+        {
+          repoRoot: "/workspace/other",
+          repoName: "other",
+          generatedAt: new Date(86400000).toISOString(),
+        },
+      ],
+    },
+  );
+  const reply = replies.find((item) => item.id === 9);
+  const payload = JSON.parse(reply?.result?.content?.[0]?.text ?? "{}");
+  assert.equal(payload.ok, false);
+  assert.match(payload.error, /codebase map not found/);
+  assert.equal(payload.repoRoot, "/workspace/missing");
+  assert.notEqual(payload.repoName, "other");
+});
+
+test("codebase_map_get falls back to the newest map when no repoRoot is requested", async () => {
+  const replies = await ask(
+    [{ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "codebase_map_get", arguments: {} } }],
+    "/workspace/demo",
+    {
+      extraMaps: [
+        {
+          repoRoot: "/workspace/other",
+          repoName: "other",
+          generatedAt: new Date(86400000).toISOString(),
+        },
+      ],
+      // No explicit repoRoot and the default env root has no map, so the
+      // server must fall back to a cached map rather than report missing.
+      env: { SWARM_CODEBASE_REPO_ROOT: "/workspace/nonexistent" },
+    },
+  );
+  const reply = replies.find((item) => item.id === 10);
+  const payload = JSON.parse(reply?.result?.content?.[0]?.text ?? "{}");
+  assert.equal(payload.ok, true);
+  assert.ok(payload.repoName === "other" || payload.repoName === "demo");
 });

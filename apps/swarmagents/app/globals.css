@@ -1501,8 +1501,34 @@ select option { background: #15151a; color: #eee; }
 .sa-sheet-left { animation: sa-sheet-left 220ms cubic-bezier(0.2, 0, 0, 1) both; }
 .sa-fade { animation: sa-fade 160ms ease-out both; }
 .sa-dot-live { animation: sa-dot 1.6s ease-in-out infinite; }
+
+/* ── The VM screen's shared chrome (minimalist-ui/src/design/vm-tokens.ts) ──
+   Presence motion. The terminal's newest agent row gets a short accent wash
+   that fades to transparent; the desktop's presence tint breathes. Both are
+   opacity/background only — never layout — so a streaming run cannot push the
+   terminal's input row around. */
+@keyframes sa-presence-wash {
+  from { background-color: rgba(52, 211, 153, 0.14); }
+  to { background-color: transparent; }
+}
+.sa-presence-row {
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: -1px -4px;
+  animation: sa-presence-wash 900ms ease-out both;
+}
+@keyframes sa-presence-breathe {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 0.95; }
+}
+@keyframes sa-changed-flash {
+  from { background-color: rgba(251, 191, 36, 0.16); }
+  to { background-color: transparent; }
+}
+.sa-changed-flash { animation: sa-changed-flash 2600ms ease-out both; }
 @media (prefers-reduced-motion: reduce) {
-  .sa-enter, .sa-stage-in, .sa-sheet-right, .sa-sheet-left, .sa-fade, .sa-dot-live { animation: none; }
+  .sa-enter, .sa-stage-in, .sa-sheet-right, .sa-sheet-left, .sa-fade, .sa-dot-live,
+  .sa-presence-row, .sa-changed-flash { animation: none; }
 }
 
 /* Agent replies are markdown; this is the only prose style on the page. */

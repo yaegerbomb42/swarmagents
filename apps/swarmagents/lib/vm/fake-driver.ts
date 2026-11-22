@@ -3,6 +3,8 @@
 import { randomBytes } from "node:crypto";
 import {
   FAKE_CLAUDE_APPROVAL_TRANSCRIPT_LINES,
+  FAKE_CLAUDE_WRITE_CONTENT,
+  FAKE_CLAUDE_WRITE_PATH,
   FAKE_CLAUDE_APPROVAL_TRIGGER,
   FAKE_CLAUDE_AUTO_APPROVE_TRANSCRIPT_LINES,
   FAKE_CLAUDE_AUTO_APPROVE_TRIGGER,
@@ -14,6 +16,8 @@ import {
   FAKE_CLAUDE_QUESTION_TRANSCRIPT_LINES,
   FAKE_CLAUDE_QUESTION_TRIGGER,
   FAKE_CLAUDE_TRANSCRIPT_LINES,
+  FAKE_CLAUDE_WRITE_TRANSCRIPT_LINES,
+  FAKE_CLAUDE_WRITE_TRIGGER,
   memoryFactFromPrompt,
   recalledMemoryAssistantText,
   recalledMemoryFromSystemPrompt,
@@ -70,6 +74,27 @@ export interface FakeVmDriverOptions {
    * Defaults to true; set SWARM_FAKE_CLAUDE=0 (or pass false) to disable.
    */
   replayClaude?: boolean;
+  /**
+   * Share one VM table process-wide instead of keeping it per instance.
+   *
+   * The app builds its VM manager once per route bundle, so each API route
+   * would otherwise see its own fake VM: the run would "write" hello.py and
+   * the files API would still report an empty workspace. Tests keep the
+   * default (isolated per instance) so they cannot leak state into each other.
+   */
+  sharedStore?: boolean;
+  /**
+   * Milliseconds to hold between replayed transcript lines. 0 (the default)
+   * replays instantly, which is what tests want; a playtest can set
+   * SWARM_FAKE_REPLAY_DELAY_MS=220 to watch a run stream in real time.
+   */
+  replayDelayMs?: number;
+}
+
+/** The process-wide fake VM table, created on first use (`sharedStore`). */
+function sharedVmStore(): Map<string, FakeVm> {
+  const g = globalThis as typeof globalThis & { __swarmFakeVms?: Map<string, FakeVm> };
+  return (g.__swarmFakeVms ??= new Map<string, FakeVm>());
 }
 
 function isClaudeCommand(prog: string): boolean {
@@ -111,6 +136,7 @@ function transcriptForClaude(cmd: string[]): readonly string[] {
   if (prompt.includes(FAKE_CLAUDE_QUESTION_TRIGGER)) return FAKE_CLAUDE_QUESTION_TRANSCRIPT_LINES;
   if (prompt.includes(FAKE_CLAUDE_HOST_TARGET_TRIGGER)) return FAKE_CLAUDE_HOST_TARGET_TRANSCRIPT_LINES;
   if (prompt.includes(FAKE_CLAUDE_AUTO_APPROVE_TRIGGER)) return FAKE_CLAUDE_AUTO_APPROVE_TRANSCRIPT_LINES;
+  if (prompt.includes(FAKE_CLAUDE_WRITE_TRIGGER)) return FAKE_CLAUDE_WRITE_TRANSCRIPT_LINES;
   return prompt.includes(FAKE_CLAUDE_APPROVAL_TRIGGER)
     ? FAKE_CLAUDE_APPROVAL_TRANSCRIPT_LINES
     : FAKE_CLAUDE_TRANSCRIPT_LINES;
@@ -161,11 +187,15 @@ function askToolUse(line: string): FakeAsk | undefined {
 }
 
 export class FakeVmDriver implements VmDriver {
-  private vms = new Map<string, FakeVm>();
+  private readonly vms: Map<string, FakeVm>;
   private readonly replayClaude: boolean;
+  private readonly replayDelayMs: number;
 
   constructor(options: FakeVmDriverOptions = {}) {
     this.replayClaude = options.replayClaude ?? process.env.SWARM_FAKE_CLAUDE !== "0";
+    this.vms = options.sharedStore ? sharedVmStore() : new Map<string, FakeVm>();
+    const envDelay = Number.parseInt(process.env.SWARM_FAKE_REPLAY_DELAY_MS ?? "", 10);
+    this.replayDelayMs = Math.max(0, options.replayDelayMs ?? (Number.isFinite(envDelay) ? envDelay : 0));
   }
 
   private getOrCreateVm(userId: string): FakeVm {
@@ -334,7 +364,13 @@ export class FakeVmDriver implements VmDriver {
         await this.replayMemoryClaude(vm, fact, onStdout);
         return { exitCode: 0 };
       }
-      await this.replayTranscript(handle, transcriptForClaude(cmd), opts, onStdout);
+      const transcript = transcriptForClaude(cmd);
+      await this.replayTranscript(handle, transcript, opts, onStdout);
+      // The "create a file" replay is the one scenario that changes the
+      // workspace: apply its Write so the files view and presence are real.
+      if (transcript === FAKE_CLAUDE_WRITE_TRANSCRIPT_LINES) {
+        await this.writeFile(handle, FAKE_CLAUDE_WRITE_PATH, FAKE_CLAUDE_WRITE_CONTENT);
+      }
       // A run whose system prompt carries the account's long-term memory
       // starts with the agent recalling it, so a playtest can see that the
       // memory survived into the next run.
@@ -461,6 +497,7 @@ export class FakeVmDriver implements VmDriver {
     for (const line of lines) {
       if (opts?.signal?.aborted) throw new Error("Aborted");
       onStdout(`${line}\n`);
+      if (this.replayDelayMs > 0) await sleep(this.replayDelayMs);
       const ask = askToolUse(line);
       if (ask) await this.fakeAskUser(handle, ask, opts, askIndex++);
     }

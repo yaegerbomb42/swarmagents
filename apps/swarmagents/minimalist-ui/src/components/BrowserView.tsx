@@ -19,10 +19,17 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowRight, Globe, Lock, RotateCcw, ShieldAlert } from "lucide-react";
 import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
 import { useBrowserFrame } from "../../../lib/client/useBrowserFrame";
+import type { Presence } from "../../../lib/client/presence";
 
 interface BrowserViewProps {
   /** Active runtime run id; when absent the view shows its idle state. */
   runId?: string;
+  /**
+   * The agent's current action (see lib/client/presence). When the run is
+   * opening a URL the presence line already knows it, so the browser chrome
+   * can name the page before the first frame lands.
+   */
+  presence?: Presence;
 }
 
 interface BrowserMeta {
@@ -161,7 +168,7 @@ function EmptyState({ hasRun, error }: { hasRun: boolean; error?: string }) {
   );
 }
 
-export function BrowserView({ runId }: BrowserViewProps) {
+export function BrowserView({ runId, presence }: BrowserViewProps) {
   const stream = useRunStream(runId);
 
   // Frame-bearing events force an immediate refetch (refreshKey bump). The
@@ -190,7 +197,10 @@ export function BrowserView({ runId }: BrowserViewProps) {
     return () => clearInterval(timer);
   }, [frame.fetchedAt]);
 
-  const currentUrl = meta.url ?? draft;
+  const presenceUrl = presence?.action?.startsWith("Opening ")
+    ? presence.action.slice("Opening ".length)
+    : undefined;
+  const currentUrl = meta.url ?? (draft || presenceUrl || "");
   const secure = currentUrl.startsWith("https://");
   // A run with no frame yet (and no hard error) is the state that can look
   // stuck. Time it so the fetch hint can give way to an honest "Still waiting…".

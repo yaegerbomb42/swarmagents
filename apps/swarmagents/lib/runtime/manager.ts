@@ -36,6 +36,8 @@ import {
 } from "../providers";
 import { routerProviders, userCooldownFilePath, userProvidersSignature } from "../providers/store";
 import { readUserSettings, systemPackerOptionsFor } from "../providers/settings";
+import { RunProviderPool, runWithPool } from "../providers/run-pool";
+import type { AttemptOutcome, RunAttempt } from "../providers/run-pool";
 import {
   CONSERVATIVE_CAPABILITIES,
   mergedModelCapabilities,
@@ -163,6 +165,12 @@ import { runMemoryTool } from "../memory/tools";
 const ENV_ALLOW = /^(ANTHROPIC_[A-Z0-9_]+|CLAUDE_CODE_[A-Z0-9_]+|DISABLE_TELEMETRY|DISABLE_ERROR_REPORTING)$/;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const HISTORY_LIMIT = 20;
+
+/** Run-level key rotation is opt-in while the integration is being adopted. */
+export function isRunProviderPoolEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const value = env.SWARM_RUN_PROVIDER_POOL?.trim().toLowerCase();
+  return value === "1" || value === "true";
+}
 const SUMMARY_PROMPT_LEN = 300;
 const DEFAULT_MAX_QUEUED = 3;
 /**
@@ -721,7 +729,8 @@ export class RuntimeManager {
    */
   private effectiveRouter(userId: string): Router | null {
     if (this.routerOverride !== undefined) return this.routerOverride;
-    const signature = `${userProvidersSignature(userId)}|${serverMode() ? "server" : "local"}|free:${readUserSettings(userId).preferFreeProviders}`;
+    const runPoolEnabled = isRunProviderPoolEnabled();
+    const signature = `${userProvidersSignature(userId)}|${serverMode() ? "server" : "local"}|free:${readUserSettings(userId).preferFreeProviders}|runPool:${runPoolEnabled}`;
     const cached = this.routers.get(userId);
     if (cached && cached.signature === signature) return cached.router;
     // Free-first: the router ranks providers by `rank`; orderLlmCandidates
@@ -734,7 +743,7 @@ export class RuntimeManager {
     // unchanged would undo the free-first order inside createRouter and the
     // toggle would still change nothing. (With the setting off the order is
     // already by rank, so stamping the position is a no-op.)
-    const providers = orderLlmCandidates(routerProviders(userId), undefined, {
+    const providers = orderLlmCandidates(routerProviders(userId, { hostEnvKeys: !runPoolEnabled }), undefined, {
       preferFree: readUserSettings(userId).preferFreeProviders,
     }).map((candidate, index) => ({ ...candidate.config, rank: index }));
     const router = createRouter({
@@ -2329,6 +2338,23 @@ export class RuntimeManager {
     const approvalHook = Object.keys(approvalEnv).length > 0;
     const verificationEnabled = isShadowVerificationEnabled();
 
+    if (isRunProviderPoolEnabled()) {
+      if (!router) {
+        const message = "Provider pool is enabled, but this user has no configured provider keys.";
+        const errorEvent: Extract<HarnessEvent, { type: "run.error" }> = { type: "run.error", message };
+        this.bus.publish(runId, errorEvent);
+        this.finalize(runId, { status: "error", error: message });
+        return { switched: false };
+      }
+      return this.executeOnePhaseWithProviderPool(active, role, router, {
+        llmBaseUrl,
+        runToken,
+        approvalEnv,
+        approvalHook,
+        verificationEnabled,
+      });
+    }
+
     while (true) {
       const selection = router
         ? router.selectForClaude({ model: active.model }, exhausted)
@@ -2502,6 +2528,101 @@ export class RuntimeManager {
         exitCode: attemptError.exitCode,
       });
       return { switched: false };
+    }
+  }
+
+  private async executeOnePhaseWithProviderPool(
+    active: ActiveRun,
+    role: RoleDefinition | null,
+    router: Router,
+    options: {
+      llmBaseUrl: string | null;
+      runToken: string | null;
+      approvalEnv: Record<string, string>;
+      approvalHook: boolean;
+      verificationEnabled: boolean;
+    },
+  ): Promise<{ switched: true; toRoleId: string; sessionId?: string } | { switched: false }> {
+    const { runId, userId } = active;
+    while (true) {
+      let finishEvent: Extract<HarnessEvent, { type: "run.finished" }> | null = null;
+      const errors: Extract<HarnessEvent, { type: "run.error" }>[] = [];
+      let roleSwitch: RunOutcome["roleSwitch"];
+      let aborted = false;
+      const pool = new RunProviderPool(router, {
+        model: active.model,
+        resumeSessionId: active.sessionId,
+        onEvent: (event) => this.bus.publish(runId, { type: "provider.pool", data: event }),
+      });
+      const result = await runWithPool(pool, async (attempt: RunAttempt): Promise<AttemptOutcome> => {
+        const selection = attempt.selection;
+        active.sessionId = attempt.resumeSessionId ?? active.sessionId;
+        const proxiedEnv = applyLlmProxyEnv(selection, options.llmBaseUrl, options.runToken);
+        const runEnv = {
+          ...scrubHostCredentials({ ...buildRunnerEnv(), ...proxiedEnv }, proxiedEnv),
+          ...options.approvalEnv,
+          ...safeVaultEnv(userId, runId, options.llmBaseUrl),
+        };
+        const selectionMode = this.modeForSelection(active, selection.provider, selection.model);
+        const phase = role
+          ? this.rolePhaseFor(role, libraryAllowedToolPermissions(userId), selectionMode, active.toolAllowlist)
+          : null;
+        const run = await this.runOnce(
+          active,
+          runEnv,
+          selection,
+          phase,
+          options.approvalHook,
+          options.verificationEnabled,
+        );
+        if (run.outcome.roleSwitch) {
+          roleSwitch = run.outcome.roleSwitch;
+          return {
+            status: "error",
+            message: "role switch requested",
+            sessionId: run.outcome.roleSwitch.sessionId,
+          };
+        }
+        if (run.outcome.aborted) {
+          aborted = true;
+          return { status: "error", message: "run aborted" };
+        }
+        if (run.attemptError) {
+          errors.push(run.attemptError);
+          return { status: "error", message: run.attemptError.message };
+        }
+        finishEvent = run.finishEvent;
+        return { status: "done", sessionId: run.finishEvent?.sessionId };
+      });
+
+      if (roleSwitch) {
+        return {
+          switched: true,
+          toRoleId: roleSwitch.toRoleId,
+          ...(roleSwitch.sessionId ? { sessionId: roleSwitch.sessionId } : {}),
+        };
+      }
+      if (aborted) return { switched: false };
+      if (!result.ok) {
+        const lastError = errors.at(-1);
+        const message = result.error ?? lastError?.message ?? "All configured provider keys failed.";
+        if (this.isStillActive(runId, userId)) {
+          const errorEvent: Extract<HarnessEvent, { type: "run.error" }> = {
+            type: "run.error",
+            message,
+            exitCode: lastError?.exitCode,
+          };
+          this.bus.publish(runId, errorEvent);
+          this.finalize(runId, { status: "error", error: message, exitCode: lastError?.exitCode });
+        }
+        return { switched: false };
+      }
+      active.sessionId = result.sessionId ?? active.sessionId;
+      if (!options.verificationEnabled || !finishEvent) return { switched: false };
+      const gate = await this.runShadowGate(active, finishEvent);
+      if (gate.outcome === "finalized") return { switched: false };
+      active.prompt = bounceRemediationPrompt(gate.summary);
+      active.shadowAttempts = (active.shadowAttempts ?? 0) + 1;
     }
   }
 

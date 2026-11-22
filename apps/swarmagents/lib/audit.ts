@@ -59,6 +59,26 @@ export type AuditAction =
 
 export type AuditResult = "success" | "failure";
 
+/**
+ * RFC 5321 path-length cap; keeps audit.jsonl targets bounded.
+ */
+export const MAX_AUDIT_EMAIL_LEN = 254;
+
+/**
+ * Normalize a failed-login email for audit `target`: trim, lowercase, strip
+ * C0/C1 controls, and hard-cap length so unauthenticated callers cannot flood
+ * audit.jsonl with multi-KB payloads.
+ */
+export function auditLoginFailureTarget(email: unknown): string {
+  if (typeof email !== "string" || !email) return "unknown";
+  const cleaned = email
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+    .trim()
+    .toLowerCase()
+    .slice(0, MAX_AUDIT_EMAIL_LEN);
+  return cleaned || "unknown";
+}
+
 export interface AuditEntry {
   ts: string;
   user: string;

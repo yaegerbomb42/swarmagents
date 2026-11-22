@@ -4,10 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { NextRequest } from "next/server";
-import { auditLoginFailureTarget, POST } from "./route";
+import { POST } from "./route";
 import { configureUserPaths, signupLocalUser } from "../../../lib/users";
 import { verifySession } from "../../../lib/auth";
-import { configureAuditPath, readAuditEntries } from "../../../lib/audit";
+import { configureAuditPath, readAuditEntries, auditLoginFailureTarget } from "../../../lib/audit";
 
 function request(body: unknown, headers: Record<string, string> = {}): NextRequest {
   return new NextRequest("http://localhost/api/login", {

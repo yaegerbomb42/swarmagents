@@ -13,7 +13,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { safeNextPath, sessionCookieOptions, signSession, SESSION_COOKIE } from "../../../lib/auth";
 import { verifyLocalUser, isScryptBusyError, type LocalUser } from "../../../lib/users";
-import { recordAudit } from "../../../lib/audit";
+import { recordAudit, auditLoginFailureTarget } from "../../../lib/audit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -42,24 +42,6 @@ async function readBody(req: NextRequest): Promise<Record<string, unknown> | nul
 
 /** Sign-in responses carry (or refuse) a session cookie: never cache them. */
 const NO_STORE = { "cache-control": "no-store" } as const;
-
-/** RFC 5321 path-length cap; keeps audit.jsonl targets bounded. */
-const MAX_AUDIT_EMAIL_LEN = 254;
-
-/**
- * Normalize a failed-login email for audit `target`: trim, lowercase, strip
- * C0/C1 controls, and hard-cap length so unauthenticated callers cannot flood
- * audit.jsonl with multi-KB payloads.
- */
-export function auditLoginFailureTarget(email: unknown): string {
-  if (typeof email !== "string" || !email) return "unknown";
-  const cleaned = email
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
-    .trim()
-    .toLowerCase()
-    .slice(0, MAX_AUDIT_EMAIL_LEN);
-  return cleaned || "unknown";
-}
 
 export async function POST(req: NextRequest): Promise<Response> {
   if (!process.env.SWARM_SESSION_SECRET) {

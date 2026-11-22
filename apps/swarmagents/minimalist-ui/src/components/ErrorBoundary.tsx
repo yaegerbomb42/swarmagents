@@ -1,4 +1,5 @@
 import { Component, type ReactNode } from "react";
+import { TriangleAlert } from "lucide-react";
 
 interface Props {
   children: ReactNode;
@@ -13,6 +14,11 @@ interface State {
  *
  * Catches render errors anywhere below it and shows a friendly fallback with a one-click
  * reset and a reload action instead of a blank white screen.
+ *
+ * The error detail is never shown on the page — it is not actionable to
+ * the visitor and can carry internal paths or messages. This matches the
+ * root error boundary in app/error.tsx; the browser console still has
+ * the original error for debugging.
  */
 export class ErrorBoundary extends Component<Props, State> {
   state: State = { error: null };
@@ -27,14 +33,14 @@ export class ErrorBoundary extends Component<Props, State> {
     if (this.state.error) {
       return (
         <div className="grid min-h-screen place-items-center bg-[#07070a] px-4 text-white antialiased">
-          <div className="glass-soft w-full max-w-md rounded-3xl p-8 text-center">
+          <div role="alert" className="glass-soft w-full max-w-md rounded-3xl p-8 text-center">
             <div className="mx-auto mb-4 grid h-12 w-12 place-items-center rounded-2xl bg-red-500/10 text-red-400 ring-1 ring-red-500/20">
-              <span className="text-xl">⚠</span>
+              <TriangleAlert className="h-5 w-5" aria-hidden />
             </div>
             <div className="text-base font-medium text-white/90">Something went wrong</div>
-            <p className="mt-2 text-sm text-white/45">The workspace hit an unexpected error. You can reload, or try again.</p>
-            <p className="mt-3 break-words rounded-xl bg-white/5 p-3 font-mono text-[10px] leading-relaxed text-red-300/70">
-              {this.state.error.message || String(this.state.error)}
+            <p className="mt-2 text-sm leading-relaxed text-white/45">
+              The workspace hit an unexpected error. Try again — if it keeps happening, reload
+              the page.
             </p>
             <div className="mt-6 flex justify-center gap-3">
               <button

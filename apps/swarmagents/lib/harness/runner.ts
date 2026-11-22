@@ -173,6 +173,31 @@ export function isSignalKillExitCode(exitCode: number): boolean {
   return exitCode > 128 && exitCode <= 128 + 31;
 }
 
+/** Default cap for --max-turns when SWARM_MAX_TURNS is unset or invalid. */
+export const DEFAULT_SWARM_MAX_TURNS = 200;
+
+/**
+ * Effective --max-turns for one invocation: the requested ceiling,
+ * floored to an integer, at least 1, and capped by SWARM_MAX_TURNS (or
+ * the 200 default when the env is unset/invalid). Undefined when no
+ * ceiling was requested — the CLI's own default applies, as today.
+ * The cap is enforced here, at the argv boundary, so every source
+ * (dispatch, role ceiling, direct caller) is capped the same way.
+ */
+export function resolveMaxTurns(
+  requested: number | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): number | undefined {
+  if (requested === undefined || !Number.isFinite(requested) || requested <= 0) return undefined;
+  const rawCap = env.SWARM_MAX_TURNS?.trim();
+  let cap = DEFAULT_SWARM_MAX_TURNS;
+  if (rawCap) {
+    const parsed = Number(rawCap);
+    if (Number.isSafeInteger(parsed) && parsed > 0) cap = parsed;
+  }
+  return Math.max(1, Math.min(Math.floor(requested), cap));
+}
+
 /** Human-readable signal name for a 128+n exit code, e.g. 137 -> "SIGKILL". */
 function signalNameFor(exitCode: number): string {
   return SIGNAL_NAMES[exitCode - 128] ?? `signal ${exitCode - 128}`;
@@ -1146,6 +1171,8 @@ export class ClaudeCodeRunner {
     const argv: string[] = [this.bin, "-p", "--output-format", "stream-json", "--verbose"];
     if (effective.sessionId) argv.push("--resume", effective.sessionId);
     if (effective.model) argv.push("--model", effective.model);
+    const maxTurns = resolveMaxTurns(effective.maxTurns);
+    if (maxTurns !== undefined) argv.push("--max-turns", String(maxTurns));
     // The agent card, the active role's prompt and the account's long-term
     // memory ride as one appended system prompt, one argv element per value —
     // never interpolated into a shell string.

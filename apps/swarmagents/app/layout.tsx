@@ -4,8 +4,25 @@ import { headers } from "next/headers";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "SwarmAgents",
-  description: "One chat bar. One agent. Every tool. Nothing hidden.",
+  metadataBase: new URL("https://swarmagents.codes"),
+  // Plain string, not a template: several pages already hardcode their own
+  // "— SwarmAgents" suffix, and a template would double it.
+  title: "SwarmAgents — Give it a task. It has its own computer.",
+  description:
+    "One chat bar. One agent. Every tool. Nothing hidden. SwarmAgents runs one autonomous agent in your own persistent Linux VM — watch every step live, take over anytime. Free; bring your own model keys.",
+  openGraph: {
+    title: "SwarmAgents — Give it a task. It has its own computer.",
+    description:
+      "One chat bar. One agent. Every tool. Nothing hidden. Your agent works in its own Linux VM while you watch, steer, or take over. Free and open source.",
+    siteName: "SwarmAgents",
+    type: "website",
+  },
+  twitter: {
+    card: "summary",
+    title: "SwarmAgents — Give it a task. It has its own computer.",
+    description:
+      "One chat bar. One agent. Every tool. Nothing hidden. Free and open source — bring your own model keys.",
+  },
 };
 
 export default async function RootLayout({ children }: { children: ReactNode }) {

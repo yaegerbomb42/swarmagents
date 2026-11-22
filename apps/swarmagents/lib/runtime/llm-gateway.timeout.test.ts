@@ -4,6 +4,13 @@
  * failover-eligible "timeout" attempt — never a hung turn. Streaming is
  * bounded by time-to-first-byte and inter-chunk idle gaps, not by total
  * duration. All upstream calls use a stubbed fetch — no network.
+ *
+ * All timers are mocked: the gateway arms its attempt/stream deadlines
+ * with `.unref()`, so a test that awaits a promise settleable only by one
+ * of those timers can see its event loop drain and be cancelled by the
+ * runner ("Promise resolution is still pending but the event loop has
+ * already resolved"). Driving the mocked clock deterministically removes
+ * the real-timer race entirely — no wall-clock time passes in these tests.
  */
 
 import test from "node:test";
@@ -14,6 +21,34 @@ import { configureProviderStorePaths } from "../providers/store";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+/**
+ * Advance the mocked clock until `work` settles (or the fake-time budget
+ * is spent). The gateway arms its timers asynchronously (after fetch +
+ * body parsing), so a single tick is not enough: step the clock and flush
+ * microtasks between steps so newly-armed timers are picked up. Throws
+ * instead of hanging when the work never settles.
+ */
+async function driveClock(
+  timers: { tick: (ms: number) => void },
+  work: Promise<unknown>,
+  budgetMs = 1000,
+): Promise<void> {
+  let settled = false;
+  work.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  for (let elapsed = 0; elapsed < budgetMs && !settled; elapsed += 10) {
+    timers.tick(10);
+    await Promise.resolve();
+  }
+  if (!settled) throw new Error(`driveClock: work did not settle within ${budgetMs}ms of mocked time`);
+}
 
 // Unique owner per test: cooldown state is persisted per owner.
 let ownerSeq = 0;
@@ -147,223 +182,265 @@ function stubFetch(
   return { fetchImpl, calls };
 }
 
-test("non-streaming: a hung provider times out and fails over", async () => {
-  const { fetchImpl, calls } = stubFetch([
-    { prefix: "https://hung.example", respond: (init) => hangingFetch()("", init) },
-    { prefix: "https://good.example", respond: () => jsonResponse(OPENAI_RESPONSE) },
-  ]);
+test("non-streaming: a hung provider times out and fails over", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const { fetchImpl, calls } = stubFetch([
+      { prefix: "https://hung.example", respond: (init) => hangingFetch()("", init) },
+      { prefix: "https://good.example", respond: () => jsonResponse(OPENAI_RESPONSE) },
+    ]);
 
-  const result = await forwardLlmNonStreaming({
-    owner: owner(),
-    providers: [
-      provider({ id: "hung", baseUrl: "https://hung.example/v1", rank: 0 }),
-      provider({ id: "good", baseUrl: "https://good.example/v1", rank: 1 }),
-    ],
-    body: ANTHROPIC_REQ,
-    fetchImpl: fetchImpl as unknown as typeof fetch,
-    timeoutMs: 50,
-  });
-
-  assert.equal(calls.length, 2);
-  assert.equal(result.attempts[0].provider, "hung");
-  assert.equal(result.attempts[0].kind, "timeout");
-  assert.equal(result.attempts[1].provider, "good");
-  assert.equal(result.attempts[1].ok, true);
-});
-
-test("non-streaming: a body that stalls after headers times out and fails over", async () => {
-  const { fetchImpl } = stubFetch([
-    {
-      prefix: "https://stalled.example",
-      respond: (init) => stalledBodyResponse(init.signal ?? undefined),
-    },
-    { prefix: "https://good.example", respond: () => jsonResponse(OPENAI_RESPONSE) },
-  ]);
-
-  const result = await forwardLlmNonStreaming({
-    owner: owner(),
-    providers: [
-      provider({ id: "stalled", baseUrl: "https://stalled.example/v1", rank: 0 }),
-      provider({ id: "good", baseUrl: "https://good.example/v1", rank: 1 }),
-    ],
-    body: ANTHROPIC_REQ,
-    fetchImpl: fetchImpl as unknown as typeof fetch,
-    timeoutMs: 50,
-  });
-
-  assert.equal(result.attempts[0].provider, "stalled");
-  assert.equal(result.attempts[0].kind, "timeout");
-  assert.equal(result.attempts[1].provider, "good");
-  assert.equal(result.attempts[1].ok, true);
-});
-
-test("non-streaming: a per-provider timeoutMs override beats the caller default", async () => {
-  // The provider answers after 80ms. The caller default (30ms) would kill
-  // it; the provider's own timeoutMs (500ms) must win.
-  const { fetchImpl } = stubFetch([
-    {
-      prefix: "https://slow.example",
-      respond: () =>
-        new Promise<Response>((resolve) => {
-          setTimeout(() => resolve(jsonResponse(OPENAI_RESPONSE)), 80);
-        }),
-    },
-  ]);
-
-  const result = await forwardLlmNonStreaming({
-    owner: owner(),
-    providers: [
-      provider({ id: "slow", baseUrl: "https://slow.example/v1", rank: 0, timeoutMs: 500 }),
-    ],
-    body: ANTHROPIC_REQ,
-    fetchImpl: fetchImpl as unknown as typeof fetch,
-    timeoutMs: 30,
-  });
-
-  assert.equal(result.attempts.length, 1);
-  assert.equal(result.attempts[0].ok, true);
-});
-
-test("streaming: first-byte timeout fails over before any byte is committed", async () => {
-  const goodSse =
-    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","model":"claude-x","content":[]}}\n\n' +
-    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pong"}}\n\n' +
-    'event: message_stop\ndata: {"type":"message_stop"}\n\n';
-  const { fetchImpl, calls } = stubFetch([
-    {
-      prefix: "https://hung.example",
-      respond: (init) => sseResponse(stalledBodyResponse(init.signal ?? undefined).body!),
-    },
-    {
-      prefix: "https://good.example",
-      respond: () =>
-        sseResponse(
-          new ReadableStream<Uint8Array>({
-            start(controller) {
-              controller.enqueue(new TextEncoder().encode(goodSse));
-              controller.close();
-            },
-          }),
-        ),
-    },
-  ]);
-
-  const out = await collectStream(
-    forwardLlmStreaming({
+    const promise = forwardLlmNonStreaming({
       owner: owner(),
       providers: [
-        provider({
-          id: "hung",
-          kind: "anthropic",
-          baseUrl: "https://hung.example",
-          models: { balanced: "claude-x" },
-          rank: 0,
-        }),
-        provider({
-          id: "good",
-          kind: "anthropic",
-          baseUrl: "https://good.example",
-          models: { balanced: "claude-x" },
-          rank: 1,
-        }),
+        provider({ id: "hung", baseUrl: "https://hung.example/v1", rank: 0 }),
+        provider({ id: "good", baseUrl: "https://good.example/v1", rank: 1 }),
       ],
-      body: { ...ANTHROPIC_REQ, stream: true },
+      body: ANTHROPIC_REQ,
       fetchImpl: fetchImpl as unknown as typeof fetch,
       timeoutMs: 50,
-      streamIdleTimeoutMs: 50,
-    }),
-  );
+    });
+    await driveClock(t.mock.timers, promise);
+    const result = await promise;
 
-  assert.equal(calls.length, 2);
-  // Nothing from the hung provider was committed; the good one served.
-  assert.equal(out, ": provider=good\n\n" + goodSse);
+    assert.equal(calls.length, 2);
+    assert.equal(result.attempts[0].provider, "hung");
+    assert.equal(result.attempts[0].kind, "timeout");
+    assert.equal(result.attempts[1].provider, "good");
+    assert.equal(result.attempts[1].ok, true);
+  } finally {
+    t.mock.timers.reset();
+  }
 });
 
-test("streaming: an idle stall after the first byte ends with an error event", async () => {
-  const firstChunk =
-    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","model":"claude-x","content":[]}}\n\n';
-  const { fetchImpl } = stubFetch([
-    {
-      prefix: "https://stalling.example",
-      respond: () =>
-        sseResponse(
-          new ReadableStream<Uint8Array>({
-            start(controller) {
-              controller.enqueue(new TextEncoder().encode(firstChunk));
-              // ...then silence: the idle guard must end the stream.
-            },
-          }),
-        ),
-    },
-  ]);
+test("non-streaming: a body that stalls after headers times out and fails over", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const { fetchImpl } = stubFetch([
+      {
+        prefix: "https://stalled.example",
+        respond: (init) => stalledBodyResponse(init.signal ?? undefined),
+      },
+      { prefix: "https://good.example", respond: () => jsonResponse(OPENAI_RESPONSE) },
+    ]);
 
-  const out = await collectStream(
-    forwardLlmStreaming({
+    const promise = forwardLlmNonStreaming({
       owner: owner(),
       providers: [
-        provider({
-          id: "stalling",
-          kind: "anthropic",
-          baseUrl: "https://stalling.example",
-          models: { balanced: "claude-x" },
-        }),
+        provider({ id: "stalled", baseUrl: "https://stalled.example/v1", rank: 0 }),
+        provider({ id: "good", baseUrl: "https://good.example/v1", rank: 1 }),
       ],
-      body: { ...ANTHROPIC_REQ, stream: true },
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-      timeoutMs: 1_000,
-      streamIdleTimeoutMs: 50,
-    }),
-  );
-
-  assert.ok(out.startsWith(": provider=stalling\n\n" + firstChunk));
-  assert.match(out, /event: error/);
-  assert.match(out, /stalled for 50ms/);
-});
-
-test("streaming: a long but flowing stream is not killed by total duration", async () => {
-  // 10 chunks, 30ms apart = ~300ms total, well past the 50ms first-byte
-  // deadline — but every gap is under the 200ms idle deadline.
-  const chunks = Array.from(
-    { length: 10 },
-    (_, i) =>
-      `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"c${i}"}}\n\n`,
-  );
-  const { fetchImpl } = stubFetch([
-    {
-      prefix: "https://flowing.example",
-      respond: () =>
-        sseResponse(
-          new ReadableStream<Uint8Array>({
-            async start(controller) {
-              const encoder = new TextEncoder();
-              for (const chunk of chunks) {
-                controller.enqueue(encoder.encode(chunk));
-                await new Promise((resolve) => setTimeout(resolve, 30));
-              }
-              controller.close();
-            },
-          }),
-        ),
-    },
-  ]);
-
-  const out = await collectStream(
-    forwardLlmStreaming({
-      owner: owner(),
-      providers: [
-        provider({
-          id: "flowing",
-          kind: "anthropic",
-          baseUrl: "https://flowing.example",
-          models: { balanced: "claude-x" },
-        }),
-      ],
-      body: { ...ANTHROPIC_REQ, stream: true },
+      body: ANTHROPIC_REQ,
       fetchImpl: fetchImpl as unknown as typeof fetch,
       timeoutMs: 50,
-      streamIdleTimeoutMs: 200,
-    }),
-  );
+    });
+    await driveClock(t.mock.timers, promise);
+    const result = await promise;
 
-  assert.equal(out, ": provider=flowing\n\n" + chunks.join(""));
+    assert.equal(result.attempts[0].provider, "stalled");
+    assert.equal(result.attempts[0].kind, "timeout");
+    assert.equal(result.attempts[1].provider, "good");
+    assert.equal(result.attempts[1].ok, true);
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test("non-streaming: a per-provider timeoutMs override beats the caller default", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    // The provider answers after 80ms. The caller default (30ms) would kill
+    // it; the provider's own timeoutMs (500ms) must win.
+    const { fetchImpl } = stubFetch([
+      {
+        prefix: "https://slow.example",
+        respond: () =>
+          new Promise<Response>((resolve) => {
+            setTimeout(() => resolve(jsonResponse(OPENAI_RESPONSE)), 80);
+          }),
+      },
+    ]);
+
+    const promise = forwardLlmNonStreaming({
+      owner: owner(),
+      providers: [
+        provider({ id: "slow", baseUrl: "https://slow.example/v1", rank: 0, timeoutMs: 500 }),
+      ],
+      body: ANTHROPIC_REQ,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      timeoutMs: 30,
+    });
+    await driveClock(t.mock.timers, promise);
+    const result = await promise;
+
+    assert.equal(result.attempts.length, 1);
+    assert.equal(result.attempts[0].ok, true);
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test("streaming: first-byte timeout fails over before any byte is committed", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const goodSse =
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","model":"claude-x","content":[]}}\n\n' +
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pong"}}\n\n' +
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+    const { fetchImpl, calls } = stubFetch([
+      {
+        prefix: "https://hung.example",
+        respond: (init) => sseResponse(stalledBodyResponse(init.signal ?? undefined).body!),
+      },
+      {
+        prefix: "https://good.example",
+        respond: () =>
+          sseResponse(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode(goodSse));
+                controller.close();
+              },
+            }),
+          ),
+      },
+    ]);
+
+    const promise = collectStream(
+      forwardLlmStreaming({
+        owner: owner(),
+        providers: [
+          provider({
+            id: "hung",
+            kind: "anthropic",
+            baseUrl: "https://hung.example",
+            models: { balanced: "claude-x" },
+            rank: 0,
+          }),
+          provider({
+            id: "good",
+            kind: "anthropic",
+            baseUrl: "https://good.example",
+            models: { balanced: "claude-x" },
+            rank: 1,
+          }),
+        ],
+        body: { ...ANTHROPIC_REQ, stream: true },
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 50,
+        streamIdleTimeoutMs: 50,
+      }),
+    );
+    await driveClock(t.mock.timers, promise);
+    const out = await promise;
+
+    assert.equal(calls.length, 2);
+    // Nothing from the hung provider was committed; the good one served.
+    assert.equal(out, ": provider=good\n\n" + goodSse);
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test("streaming: an idle stall after the first byte ends with an error event", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const firstChunk =
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","model":"claude-x","content":[]}}\n\n';
+    const { fetchImpl } = stubFetch([
+      {
+        prefix: "https://stalling.example",
+        respond: () =>
+          sseResponse(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode(firstChunk));
+                // ...then silence: the idle guard must end the stream.
+              },
+            }),
+          ),
+      },
+    ]);
+
+    const promise = collectStream(
+      forwardLlmStreaming({
+        owner: owner(),
+        providers: [
+          provider({
+            id: "stalling",
+            kind: "anthropic",
+            baseUrl: "https://stalling.example",
+            models: { balanced: "claude-x" },
+          }),
+        ],
+        body: { ...ANTHROPIC_REQ, stream: true },
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 1_000,
+        streamIdleTimeoutMs: 50,
+      }),
+    );
+    await driveClock(t.mock.timers, promise);
+    const out = await promise;
+
+    assert.ok(out.startsWith(": provider=stalling\n\n" + firstChunk));
+    assert.match(out, /event: error/);
+    assert.match(out, /stalled for 50ms/);
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test("streaming: a long but flowing stream is not killed by total duration", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    // 10 chunks, 30ms apart = ~300ms total, well past the 50ms first-byte
+    // deadline — but every gap is under the 200ms idle deadline.
+    const chunks = Array.from(
+      { length: 10 },
+      (_, i) =>
+        `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"c${i}"}}\n\n`,
+    );
+    const { fetchImpl } = stubFetch([
+      {
+        prefix: "https://flowing.example",
+        respond: () =>
+          sseResponse(
+            new ReadableStream<Uint8Array>({
+              async start(controller) {
+                const encoder = new TextEncoder();
+                for (const chunk of chunks) {
+                  controller.enqueue(encoder.encode(chunk));
+                  await new Promise((resolve) => setTimeout(resolve, 30));
+                }
+                controller.close();
+              },
+            }),
+          ),
+      },
+    ]);
+
+    const promise = collectStream(
+      forwardLlmStreaming({
+        owner: owner(),
+        providers: [
+          provider({
+            id: "flowing",
+            kind: "anthropic",
+            baseUrl: "https://flowing.example",
+            models: { balanced: "claude-x" },
+          }),
+        ],
+        body: { ...ANTHROPIC_REQ, stream: true },
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        timeoutMs: 50,
+        streamIdleTimeoutMs: 200,
+      }),
+    );
+    await driveClock(t.mock.timers, promise);
+    const out = await promise;
+
+    assert.equal(out, ": provider=flowing\n\n" + chunks.join(""));
+  } finally {
+    t.mock.timers.reset();
+  }
 });

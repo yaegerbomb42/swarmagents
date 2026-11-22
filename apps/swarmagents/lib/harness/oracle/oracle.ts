@@ -136,7 +136,7 @@ export function defaultOracleChecks(opts: { testEnv?: Record<string, string> } =
               "--no-install",
               "tsx",
               "--test",
-              "--test-concurrency=1",
+              "--test-concurrency=4",
               ...ctx.affectedTests,
             ]
           : null,

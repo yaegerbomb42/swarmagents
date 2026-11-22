@@ -51,9 +51,19 @@ jobs:
         working-directory: apps/swarmagents
         run: npm run typecheck
 
-      - name: Unit tests
+      - name: Unit tests (JUnit artifact)
         working-directory: apps/swarmagents
-        run: npm run test:unit
+        run: |
+          npm run test:ci
+          echo "junit written: $(wc -c < junit.xml) bytes"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: apps/swarmagents/junit.xml
+          if-no-files-found: warn
 
       - name: Lint
         working-directory: apps/swarmagents

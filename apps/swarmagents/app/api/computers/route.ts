@@ -12,7 +12,7 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
-import { USER_HEADER } from "../../../lib/auth";
+import { NO_STORE, routeCaller, unauthorizedResponse } from "../../../lib/auth";
 import {
   ComputersError,
   MAX_COMPUTERS,
@@ -24,18 +24,8 @@ import { JsonBodyError, readBoundedText } from "../../../lib/http";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const NO_STORE = { "cache-control": "no-store" } as const;
 const MAX_BODY_SIZE = 8 * 1024;
 const ORIGIN_RE = /^https?:\/\/[A-Za-z0-9.\-:[\]]+$/;
-
-function caller(req: NextRequest): string | null {
-  const user = req.headers.get(USER_HEADER);
-  return user && user.length > 0 && user.length <= 128 ? user : null;
-}
-
-function unauthorized() {
-  return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
-}
 
 const FALLBACK_ORIGIN = "https://swarmagents.codes";
 
@@ -111,14 +101,14 @@ function installCommands(origin: string, code: string) {
 }
 
 export async function GET(req: NextRequest) {
-  const user = caller(req);
-  if (!user) return unauthorized();
+  const user = routeCaller(req);
+  if (!user) return unauthorizedResponse();
   return NextResponse.json({ computers: listComputers(user) }, { headers: NO_STORE });
 }
 
 export async function POST(req: NextRequest) {
-  const user = caller(req);
-  if (!user) return unauthorized();
+  const user = routeCaller(req);
+  if (!user) return unauthorizedResponse();
 
   // The body is optional today (an empty POST creates a code), but still cap
   // and validate it so a malformed request gets a clean 400. The read is

@@ -10,8 +10,7 @@ import { setAmbientEngineForTesting } from "../../../../../lib/ambient/runtime";
 import { configureAmbientStore, upsertRule } from "../../../../../lib/ambient/store";
 import type { AmbientRule } from "../../../../../lib/ambient/types";
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hooks-route-"));
-configureAmbientStore(dir);
+let dir: string;
 
 const SECRET = "hook-secret-0123456789abcdef";
 
@@ -55,12 +54,15 @@ function context(userId: string, id: string) {
 }
 
 test.beforeEach(() => {
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), "hooks-route-"));
+  configureAmbientStore(dir);
   setAmbientEngineForTesting(engine());
   upsertRule(rule({}));
 });
 
 test.afterEach(() => {
   setAmbientEngineForTesting(null);
+  if (dir) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("an oversized webhook body is rejected with 413", async () => {

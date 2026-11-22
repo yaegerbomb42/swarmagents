@@ -17,7 +17,7 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
-import { USER_HEADER } from "../../../lib/auth";
+import { NO_STORE, routeCaller, unauthorizedResponse } from "../../../lib/auth";
 import {
   readAuditEntries,
   DEFAULT_AUDIT_LIMIT,
@@ -30,18 +30,12 @@ import {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const NO_STORE = { "cache-control": "no-store" } as const;
 const ACTION_FILTER_RE = /^[a-z0-9._*-]{1,64}$/i;
 
-function caller(req: NextRequest): string | null {
-  const user = req.headers.get(USER_HEADER);
-  return user && user.length > 0 && user.length <= 128 ? user : null;
-}
-
 export async function GET(req: NextRequest) {
-  const user = caller(req);
+  const user = routeCaller(req);
   if (!user) {
-    return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
+    return unauthorizedResponse();
   }
 
   const params = req.nextUrl.searchParams;

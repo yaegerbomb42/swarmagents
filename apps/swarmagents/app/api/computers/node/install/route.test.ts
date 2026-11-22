@@ -71,9 +71,20 @@ function runInstaller(
   });
 }
 
+const createdDirs: string[] = [];
+
 function tmp(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "swarm-install-"));
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-install-"));
+  createdDirs.push(d);
+  return d;
 }
+
+test.afterEach(() => {
+  while (createdDirs.length > 0) {
+    const d = createdDirs.pop();
+    if (d) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
 
 test("installer rejects --mode values that could break the pairing JSON", async () => {
   const dir = tmp();

@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { createRouter, type CompleteRequest } from "@/lib/providers";
 import { AbortError, RouterError } from "@/lib/providers/errors";
 import { routerProviders } from "@/lib/providers/store";
-import { USER_HEADER } from "@/lib/auth";
+import { routeCaller, unauthorizedResponse } from "@/lib/auth";
 import { checkCompleteRateLimit } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
@@ -23,15 +23,6 @@ function json(body: unknown, status: number, retryAfter?: number): NextResponse 
   const headers: Record<string, string> = { ...NO_STORE };
   if (retryAfter !== undefined) headers["retry-after"] = String(retryAfter);
   return NextResponse.json(body, { status, headers });
-}
-
-function caller(req: NextRequest): string | null {
-  const user = req.headers.get(USER_HEADER);
-  return user && user.length > 0 && user.length <= 128 ? user : null;
-}
-
-function unauthorized() {
-  return json({ error: "Sign in required." }, 401);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -130,8 +121,8 @@ function validate(body: unknown):
  * can leak into the response body.
  */
 export async function POST(req: NextRequest) {
-  const user = caller(req);
-  if (!user) return unauthorized();
+  const user = routeCaller(req);
+  if (!user) return unauthorizedResponse();
 
   // Per-user budget, checked before any body work: one completion can fan
   // out to 8 upstream LLM calls, so a flood here is spend, not just load.

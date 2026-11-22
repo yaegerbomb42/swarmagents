@@ -31,20 +31,27 @@ function request(path: string, init: RequestInit = {}, user: string | null = "al
   });
 }
 
-function install(): { hub: ByocHub; store: ByocTokenStore; dir: string } {
+const tempDirs: string[] = [];
+
+function install(): { hub: ByocHub; store: ByocTokenStore } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-byoc-api-"));
+  tempDirs.push(dir);
   const store = new ByocTokenStore({ file: path.join(dir, "byoc.json") });
   const hub = new ByocHub({ port: 0, tokens: store, heartbeatMs: 60_000 });
   setByocTokenStoreForTesting(store);
   setByocHubForTesting(hub);
   configureAuditPath(path.join(dir, "audit.jsonl"));
-  return { hub, store, dir };
+  return { hub, store };
 }
 
 test.afterEach(() => {
   setByocTokenStoreForTesting(null);
   setByocHubForTesting(null);
   configureAuditPath(undefined);
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("pair: creating a pairing code needs a signed-in caller", async () => {

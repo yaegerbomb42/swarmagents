@@ -10,7 +10,7 @@
  */
 
 import { type NextRequest } from "next/server";
-import { USER_HEADER } from "../../../../lib/auth";
+import { routeCaller, unauthorizedResponse } from "../../../../lib/auth";
 import { noStoreJson, noStoreRouteError, readJsonObject } from "../../../../lib/http";
 import { deleteProject, getProject, isProjectId, updateProject } from "../../../../lib/projects/store";
 
@@ -19,18 +19,13 @@ export const dynamic = "force-dynamic";
 
 const MAX_BODY_SIZE = 128 * 1024;
 
-function caller(req: NextRequest): string | null {
-  const user = req.headers.get(USER_HEADER);
-  return user && user.length > 0 && user.length <= 128 ? user : null;
-}
-
 function notFound() {
   return noStoreJson({ error: "Project not found." }, { status: 404 });
 }
 
 export async function GET(req: NextRequest, context: { params: Promise<{ id: string }> }) {
-  const user = caller(req);
-  if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
+  const user = routeCaller(req);
+  if (!user) return unauthorizedResponse();
   const { id } = await context.params;
   if (!isProjectId(id)) return notFound();
   const project = getProject(user, id);
@@ -39,8 +34,8 @@ export async function GET(req: NextRequest, context: { params: Promise<{ id: str
 }
 
 export async function PATCH(req: NextRequest, context: { params: Promise<{ id: string }> }) {
-  const user = caller(req);
-  if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
+  const user = routeCaller(req);
+  if (!user) return unauthorizedResponse();
   const { id } = await context.params;
   if (!isProjectId(id)) return notFound();
 
@@ -65,8 +60,8 @@ export async function PATCH(req: NextRequest, context: { params: Promise<{ id: s
 }
 
 export async function DELETE(req: NextRequest, context: { params: Promise<{ id: string }> }) {
-  const user = caller(req);
-  if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
+  const user = routeCaller(req);
+  if (!user) return unauthorizedResponse();
   const { id } = await context.params;
   if (!isProjectId(id)) return notFound();
   const deleted = deleteProject(user, id);

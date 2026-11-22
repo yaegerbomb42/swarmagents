@@ -42,6 +42,11 @@ import { z } from "zod";
 import type { ModelEndpointConfig } from "./decision-brain/types";
 import { countWords } from "./decision-brain/schema";
 
+// Absolute git path from fixed, trusted dirs so we never rely on PATH
+// resolution (Sonar S4036).
+const GIT_BIN =
+  ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"].find((p) => fs.existsSync(p)) ?? "/usr/bin/git";
+
 /** Hard cap on tool steps per explorer. */
 export const EXPLORER_MAX_STEPS = 8;
 /** Hard cap on wall-clock milliseconds per explorer. */
@@ -125,7 +130,7 @@ function walkRepoFiles(repoRoot: string): string[] {
       }
     }
   }
-  return out.sort();
+  return out.sort((a, b) => a.localeCompare(b));
 }
 
 function toPosix(repoRoot: string, file: string): string {
@@ -343,7 +348,7 @@ function gitLogGrep(repoRoot: string, args: Record<string, unknown>): ExplorerTo
   const maxResults = Math.min(Math.max(argInt(args, "maxResults", 20), 1), 100);
   try {
     const out = execFileSync(
-      "git",
+      GIT_BIN,
       ["-C", repoRoot, "log", "--oneline", "-i", `--grep=${pattern}`, `--max-count=${maxResults}`],
       { encoding: "utf8", timeout: 5000 },
     );

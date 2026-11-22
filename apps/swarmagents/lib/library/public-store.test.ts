@@ -16,6 +16,8 @@ import {
   installPublicItem,
   latestVersion,
   listPublicItems,
+  clampPublicListLimit,
+  clampPublicListOffset,
   publicCatalogFilePath,
   publicItemDetail,
   publicItemSummary,
@@ -195,6 +197,45 @@ test("listPublicItems filters, searches, sorts and paginates without leaking unp
   const page = listPublicItems({ sort: "name", limit: 1, offset: 1 });
   assert.equal(page.total, 2);
   assert.deepEqual(page.items.map((item) => item.name), ["Beta"]);
+});
+
+test("clampPublicListLimit / offset bound negative and huge values", () => {
+  assert.equal(clampPublicListLimit(-1), 1);
+  assert.equal(clampPublicListLimit(1_000_000), 100);
+  assert.equal(clampPublicListLimit(Number.NaN), 50);
+  assert.equal(clampPublicListOffset(-5), 0);
+  assert.equal(clampPublicListOffset("3.9"), 3);
+
+  for (let i = 0; i < 5; i++) {
+    publishItem("alice", { kind: "skill", name: `P${i}`, payload: skill(`#${i}`) });
+  }
+  const neg = listPublicItems({ sort: "name", limit: -1, offset: -10 });
+  assert.equal(neg.items.length, 1, "limit=-1 clamps to 1");
+  assert.equal(neg.total, 5);
+  const huge = listPublicItems({ sort: "name", limit: 1_000_000, offset: 0 });
+  assert.equal(huge.items.length, 5, "limit=1000000 clamps to 100 but only 5 exist");
+});
+
+test("unpublished visibility is consistent between list and detail for owner/admin", () => {
+  const record = publishItem("alice", { kind: "skill", name: "Withdrawn", payload: skill("#w") });
+  unpublishPublicItem(record.id, "alice", { admin: false });
+
+  // Anonymous / other viewers: hidden in both list and detail gate.
+  assert.equal(listPublicItems({}).items.find((i) => i.id === record.id), undefined);
+  assert.equal(listPublicItems({ viewerId: "bob" }).items.find((i) => i.id === record.id), undefined);
+
+  // Owner sees it in the list (same as detail).
+  const ownerList = listPublicItems({ viewerId: "alice", sort: "name" });
+  assert.ok(ownerList.items.some((i) => i.id === record.id), "owner list includes unpublished");
+  const fresh = findPublicItem(record.id)!;
+  const ownerDetail = publicItemDetail(fresh, "alice", false);
+  assert.equal(ownerDetail.isOwner, true);
+
+  // Admin also sees unpublished in the list.
+  assert.ok(
+    listPublicItems({ viewerId: "mod", admin: true }).items.some((i) => i.id === record.id),
+    "admin list includes unpublished",
+  );
 });
 
 test("publicItemDetail marks ownership and moderation capability", () => {

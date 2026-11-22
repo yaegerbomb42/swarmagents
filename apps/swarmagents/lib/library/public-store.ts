@@ -132,6 +132,27 @@ export interface PublicListOptions {
   sort?: "installs" | "newest" | "updated" | "name";
   limit?: number;
   offset?: number;
+  /**
+   * Signed-in viewer. When set, unpublished items owned by this viewer are
+   * included (same rule as GET /api/library/public/[id]).
+   */
+  viewerId?: string;
+  /** Library admins also see unpublished items in the list. */
+  admin?: boolean;
+}
+
+/** Clamp catalog page size to 1..100 (default 50). */
+export function clampPublicListLimit(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n)) return 50;
+  return Math.min(Math.max(Math.trunc(n), 1), 100);
+}
+
+/** Clamp catalog offset to >= 0 (default 0). */
+export function clampPublicListOffset(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(Math.trunc(n), 0);
 }
 
 export function publicCatalogFilePath(options: LibraryStoreOptions = {}): string {
@@ -478,17 +499,28 @@ export function findPublicItem(publicId: string, options: LibraryStoreOptions = 
   return readPublicCatalog(options).items.find((item) => item.id === publicId) ?? null;
 }
 
-/** Browse the catalog. Unpublished items are never listed. */
+/**
+ * Browse the catalog.
+ *
+ * Visibility (matches GET /api/library/public/[id]): unpublished items are
+ * omitted for everyone except their publisher and library admins. Pass
+ * `viewerId` / `admin` so a publisher can see their own withdrawals in the
+ * list the same way the detail endpoint does.
+ */
 export function listPublicItems(
   opts: PublicListOptions = {},
   options: LibraryStoreOptions = {},
 ): { items: PublicItemSummary[]; total: number } {
   const query = (opts.query ?? "").trim().toLowerCase();
   const kind = opts.kind ?? "all";
-  const limit = Math.min(Math.max(Number(opts.limit) || 50, 1), 100);
-  const offset = Math.max(Number(opts.offset) || 0, 0);
+  const limit = clampPublicListLimit(opts.limit ?? 50);
+  const offset = clampPublicListOffset(opts.offset ?? 0);
+  const viewerId = opts.viewerId ?? "";
+  const admin = Boolean(opts.admin);
   const items = readPublicCatalog(options).items.filter((item) => {
-    if (item.moderation === "unpublished") return false;
+    if (item.moderation === "unpublished") {
+      if (!(admin || (viewerId && item.ownerId === viewerId))) return false;
+    }
     if (kind !== "all" && item.kind !== kind) return false;
     if (!query) return true;
     return [item.name, item.description, item.authorHandle, item.kind, item.license]

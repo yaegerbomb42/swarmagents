@@ -11,7 +11,7 @@
 //   - ANSI escapes (bash, logs) are rendered with real colour,
 //   - each block has a copy button and shows line/byte counts.
 
-import { memo, useMemo, useState } from "react";
+import React, { memo, useMemo, useState } from "react";
 import { AnsiRenderer, hasAnsi } from "./AnsiRenderer";
 
 export interface ToolResultViewerProps {
@@ -94,18 +94,26 @@ function Block({ label, text, tone }: { label: string; text: string; tone?: "err
 
   return (
     <div className={`trv-block${tone === "err" ? " tone-err" : ""}`}>
-      <div className="trv-toggle" onClick={toggle} title={open ? "Collapse" : "Expand"}>
-        <Chevron open={open} />
-        <span className="trv-label">{label}</span>
-        <span className="trv-kind">{json ? "JSON" : ansi ? "raw" : "text"}</span>
-        <span className="trv-meta">
-          {lines.length} ln · {bytesLabel(shown.length)}
-        </span>
+      <div className="trv-header">
+        <button
+          type="button"
+          className="trv-toggle"
+          onClick={toggle}
+          aria-expanded={open}
+          title={open ? "Collapse" : "Expand"}
+        >
+          <Chevron open={open} />
+          <span className="trv-label">{label}</span>
+          <span className="trv-kind">{json ? "JSON" : ansi ? "raw" : "text"}</span>
+          <span className="trv-meta">
+            {lines.length} ln · {bytesLabel(shown.length)}
+          </span>
+        </button>
         <span className="trv-spacer" />
         <button
+          type="button"
           className="trv-copy"
-          onClick={(e) => {
-            e.stopPropagation();
+          onClick={() => {
             void copy();
           }}
           title={copied ? "Copied" : "Copy"}
@@ -118,13 +126,19 @@ function Block({ label, text, tone }: { label: string; text: string; tone?: "err
       {open ? (
         <pre className={`trv-pre${json ? " json" : ""}`}>{ansi ? <AnsiRenderer text={text} /> : shown}</pre>
       ) : (
-        <div className="trv-collapsed" onClick={toggle} role="button" tabIndex={0} onKeyDown={(e) => e.key === "Enter" && toggle()}>
+        <button
+          type="button"
+          className="trv-collapsed"
+          onClick={toggle}
+          aria-expanded={false}
+          title="Expand"
+        >
           <pre>
             {preview}
             {hidden > 0 ? `\n… ${hidden} more lines…` : ""}
           </pre>
           <span className="trv-expand">Expand {hidden > 0 ? `(${hidden} lines)` : ""}</span>
-        </div>
+        </button>
       )}
     </div>
   );

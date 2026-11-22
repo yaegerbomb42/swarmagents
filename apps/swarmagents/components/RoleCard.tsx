@@ -1,5 +1,5 @@
 "use client";
-import type { KeyboardEvent, MouseEvent } from "react";
+import React from "react";
 import type { RoleDefinition } from "@/lib/roles";
 import {
   permissionLabels,
@@ -24,16 +24,6 @@ export interface RoleCardProps {
   onDelete?: (role: RoleDefinition) => void;
 }
 
-const modelStyle = {
-  fontFamily: "var(--font-mono)",
-  fontSize: 11,
-  color: "var(--color-text-faint)",
-  margin: "4px 0 0",
-  overflow: "hidden",
-  textOverflow: "ellipsis",
-  whiteSpace: "nowrap",
-} as const;
-
 const actionsStyle = {
   display: "flex",
   alignItems: "center",
@@ -51,28 +41,12 @@ export function RoleCard({ role, active, onSelect, onEdit, onDuplicate, onDelete
   const skills = role.skills.map((id) => ROLE_SKILL_REGISTRY[id]?.label ?? id);
   const interactive = Boolean(onSelect);
 
-  const select = () => onSelect?.(role);
-
-  const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
-    if (!interactive || (event.key !== "Enter" && event.key !== " ")) return;
-    event.preventDefault();
-    select();
-  };
-
-  const stop = (event: MouseEvent) => event.stopPropagation();
-
   return (
     <article
       className="st-card"
-      role={interactive ? "button" : undefined}
-      tabIndex={interactive ? 0 : undefined}
       aria-label={`${role.name} role`}
-      aria-pressed={interactive ? Boolean(active) : undefined}
-      onClick={interactive ? select : undefined}
-      onKeyDown={onKeyDown}
       style={{
         height: "100%",
-        cursor: interactive ? "pointer" : undefined,
         position: "relative",
         borderColor: active ? "var(--color-ok)" : undefined,
         boxShadow: active ? "0 0 0 2px var(--color-bg-elevated), 0 0 0 4px var(--color-ok)" : undefined,
@@ -162,25 +136,33 @@ export function RoleCard({ role, active, onSelect, onEdit, onDuplicate, onDelete
         </div>
       )}
 
-      {(onEdit || onDuplicate || onDelete) && (
-        <div style={actionsStyle} onClick={stop}>
-          {onEdit && (
-            <button type="button" className="st-mini" onClick={() => onEdit(role)}>
-              {role.builtin ? "Customize" : "Edit"}
-            </button>
-          )}
-          {onDuplicate && (
-            <button type="button" className="st-mini" onClick={() => onDuplicate(role)}>
-              Duplicate
-            </button>
-          )}
-          {onDelete && !role.builtin && (
-            <button type="button" className="st-mini" style={{ color: "var(--color-err)" }} onClick={() => onDelete(role)}>
-              Delete
-            </button>
-          )}
-        </div>
-      )}
+      <div style={actionsStyle}>
+        {interactive && (
+          <button
+            type="button"
+            className="st-mini"
+            aria-pressed={Boolean(active)}
+            onClick={() => onSelect?.(role)}
+          >
+            {active ? "Selected" : "Select"}
+          </button>
+        )}
+        {onEdit && (
+          <button type="button" className="st-mini" onClick={() => onEdit(role)}>
+            {role.builtin ? "Customize" : "Edit"}
+          </button>
+        )}
+        {onDuplicate && (
+          <button type="button" className="st-mini" onClick={() => onDuplicate(role)}>
+            Duplicate
+          </button>
+        )}
+        {onDelete && !role.builtin && (
+          <button type="button" className="st-mini" style={{ color: "var(--color-err)" }} onClick={() => onDelete(role)}>
+            Delete
+          </button>
+        )}
+      </div>
     </article>
   );
 }

@@ -127,13 +127,11 @@ export class TelemetryBus {
   }
 
   /**
-   * Flush persisted run logs to disk. Appends are synchronous today, so this
-   * fsyncs the log files — but it is the seam a future buffered writer must
-   * implement so the shutdown handler can guarantee telemetry is durable
-   * before the process exits.
+   * Flush persisted run logs to disk and drain any queued writes so shutdown
+   * can guarantee telemetry is durable before the process exits.
    */
-  flush(): void {
-    flushRunLogs(this.resolveRunsDir());
+  async flush(): Promise<void> {
+    await flushRunLogs(this.resolveRunsDir());
   }
 
   latestSeq(runId: string): number {

@@ -17,6 +17,15 @@ import { ArrowLeft, Loader2 } from "lucide-react";
 import { TemplateCatalog } from "../../minimalist-ui/src/components/TemplateCatalog";
 import type { TaskTemplate } from "../../lib/templates/types";
 
+function seedWorkspaceConversationKey(runId: string): boolean {
+  try {
+    window.localStorage.setItem("sa.thread", JSON.stringify(runId));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function TemplatesPageClient() {
   const router = useRouter();
   const [starting, setStarting] = useState(false);
@@ -34,8 +43,12 @@ export function TemplatesPageClient() {
           const body = (await res.json().catch(() => null)) as { error?: string } | null;
           throw new Error(body?.error ?? `Could not start the run (HTTP ${res.status}).`);
         }
-        // The run is live on the user's VM now; the workspace shows it.
-        router.push("/");
+        const body = (await res.json().catch(() => null)) as { runId?: unknown } | null;
+        const runId = typeof body?.runId === "string" ? body.runId.trim() : "";
+        if (!runId) throw new Error("The run started, but the server sent no run id.");
+        seedWorkspaceConversationKey(runId);
+        router.push(`/?run=${encodeURIComponent(runId)}`);
+        setStarting(false);
       } catch (err) {
         setStarting(false);
         throw err;

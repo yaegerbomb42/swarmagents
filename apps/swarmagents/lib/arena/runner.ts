@@ -50,7 +50,7 @@ function failedOutcome(contender: ArenaContender, reason: string, latencyMs = 0)
     model: contender.model,
     text: "",
     latencyMs,
-    verification: { passed: false, score: 0, violations: [reason] },
+    verification: { status: "failed", passed: false, score: 0, violations: [reason] },
     score: 0,
     passed: false,
     status: "failed",

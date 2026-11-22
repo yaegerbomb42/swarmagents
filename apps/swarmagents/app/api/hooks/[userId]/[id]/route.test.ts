@@ -139,3 +139,20 @@ test("a webhook with the right secret fires a run", async () => {
   assert.equal(body.ok, true);
   assert.equal(body.runId, "run_hook_1");
 });
+
+test("rate limit triggers 429 with no-store after too many attempts", async () => {
+  // Use a distinct hook so other tests aren't affected
+  upsertRule(rule({ id: "hook_rl" }));
+  let lastRes;
+  for (let i = 0; i < 305; i++) {
+    lastRes = await POST(
+      request({ ok: true }, { "x-swarm-hook-secret": "wrong", "x-real-ip": "198.51.100.42" }),
+      context("user_a", "hook_rl"),
+    );
+    if (lastRes.status === 429) break;
+  }
+  assert.ok(lastRes);
+  assert.equal(lastRes.status, 429);
+  assert.equal(lastRes.headers.get("cache-control"), "no-store");
+});
+

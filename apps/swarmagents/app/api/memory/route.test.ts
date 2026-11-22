@@ -179,3 +179,20 @@ test("a memory without a fact is rejected", async () => {
   );
   assert.equal(res.status, 400);
 });
+
+test("GET and DELETE [id] reject invalid id shapes with 404 and no-store", async () => {
+  const badIds = ["not_a_mem_id", "mem_short", "mem_!@#$", "../etc/passwd"];
+  for (const id of badIds) {
+    const getRes = await GET_ONE(request(`/api/memory/${id}`, { user: ALICE }), {
+      params: Promise.resolve({ id }),
+    });
+    assert.equal(getRes.status, 404);
+    assert.equal(getRes.headers.get("cache-control"), "no-store");
+
+    const delRes = await DELETE_ONE(request(`/api/memory/${id}`, { method: "DELETE", user: ALICE }), {
+      params: Promise.resolve({ id }),
+    });
+    assert.equal(delRes.status, 404);
+    assert.equal(delRes.headers.get("cache-control"), "no-store");
+  }
+});

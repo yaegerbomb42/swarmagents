@@ -250,6 +250,17 @@ test("RPC notifications return no body and explicit null remains a request id", 
   assert.equal(notification.status, 202);
   assert.equal(await notification.text(), "");
   assert.equal(notification.headers.get("cache-control"), "no-store");
+
+  const pingNotification = await POST(rawRpc({ jsonrpc: "2.0", method: "ping" }));
+  assert.equal(pingNotification.status, 202);
+  assert.equal(await pingNotification.text(), "");
+
+  // Non-allowlisted notification method without id returns -32600 Invalid Request
+  const disallowedNotification = await POST(rawRpc({ jsonrpc: "2.0", method: "tools/call", params: { name: "poll_tasks" } }));
+  assert.equal(disallowedNotification.status, 200);
+  const disallowedBody = await disallowedNotification.json();
+  assert.equal(disallowedBody.error.code, -32600);
+
   const reply = await POST(rawRpc({ jsonrpc: "2.0", method: "ping", id: null }));
   assert.deepEqual(await reply.json(), { jsonrpc: "2.0", id: null, result: {} });
 });

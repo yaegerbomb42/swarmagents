@@ -14,6 +14,7 @@ import {
 import { runAutopilotTick } from "@/lib/gardener/tick";
 import { MAX_PINNED_REPOSITORIES, MAX_REPO_ROOT_LEN } from "@/lib/gardener/types";
 import { recordAudit } from "@/lib/audit";
+import { TokenBucket } from "@/lib/rate-limit";
 
 export const dynamic = "force-dynamic";
 
@@ -23,6 +24,12 @@ const NO_STORE = { "cache-control": "no-store" } as const;
 function json(body: unknown, init?: { status?: number }): NextResponse {
   return NextResponse.json(body, { ...init, headers: NO_STORE });
 }
+
+// Tick rate limiter: 1 tick per 5 seconds per user (capacity 1, window 5,000ms)
+const tickRateLimiter = new TokenBucket(1, 5_000);
+
+// In-process concurrency guard for tick per user
+const activeUserTicks = new Set<string>();
 
 function userId(req: NextRequest): string | null {
   return requestUser(req)?.id ?? null;
@@ -91,7 +98,10 @@ export async function POST(req: NextRequest) {
   }
 
   if (body.action === "setEnabled") {
-    const enabled = body.enabled === true;
+    if (typeof body.enabled !== "boolean") {
+      return json({ error: "enabled must be a boolean" }, { status: 400 });
+    }
+    const enabled = body.enabled;
     const state = updateUserGardener(id, (next) => {
       next.enabled = enabled;
     });
@@ -121,23 +131,24 @@ export async function POST(req: NextRequest) {
     if (!root.ok) return root.response;
     const repoRoot = root.path;
 
-    const currentState = readUserGardener(id);
-    const alreadyPinned = currentState.pinned.some((p) => p.repoRoot === repoRoot);
-    if (!alreadyPinned && currentState.pinned.length >= MAX_PINNED_REPOSITORIES) {
-      return json(
-        { error: `maximum number of pinned repositories (${MAX_PINNED_REPOSITORIES}) reached` },
-        { status: 400 },
-      );
-    }
-
+    let limitReached = false;
     const state = updateUserGardener(id, (next) => {
-      if (!next.pinned.some((p) => p.repoRoot === repoRoot)) {
+      const alreadyPinned = next.pinned.some((p) => p.repoRoot === repoRoot);
+      if (!alreadyPinned) {
         if (next.pinned.length >= MAX_PINNED_REPOSITORIES) {
+          limitReached = true;
           return;
         }
         next.pinned.push({ repoRoot, pinnedAt: Date.now() });
       }
     });
+
+    if (limitReached) {
+      return json(
+        { error: `maximum number of pinned repositories (${MAX_PINNED_REPOSITORIES}) reached` },
+        { status: 400 },
+      );
+    }
     return json(state);
   }
   if (body.action === "unpin") {
@@ -163,8 +174,27 @@ export async function POST(req: NextRequest) {
     return json(row);
   }
   if (body.action === "tick") {
-    const result = await runAutopilotTick(id, getVmManager());
-    return json({ result, state: readUserGardener(id) });
+    // Rate limit
+    const rate = tickRateLimiter.consume(id);
+    if (!rate.allowed) {
+      return json({ error: "rate limit exceeded, please retry later" }, { status: 429 });
+    }
+
+    // Concurrency guard
+    if (activeUserTicks.has(id)) {
+      return json({ error: "a tick is already in progress for this account" }, { status: 409 });
+    }
+
+    activeUserTicks.add(id);
+    try {
+      const result = await runAutopilotTick(id, getVmManager());
+      return json({ result, state: readUserGardener(id) });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "gardener tick failed";
+      return json({ error: message }, { status: 500 });
+    } finally {
+      activeUserTicks.delete(id);
+    }
   }
   return json({ error: "unknown action" }, { status: 400 });
 }

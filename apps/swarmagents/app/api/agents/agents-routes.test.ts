@@ -212,3 +212,51 @@ test("deploy refuses an incompatible agent and starts a run otherwise", async ()
   const unknown = await DEPLOY(req("POST", "/api/agents/route-bot/deploy", { harness: "nope" }), ctx("route-bot"));
   assert.equal(unknown.status, 400);
 });
+
+test("POST /api/agents returns 409 for an existing id and leaves updates to PUT", async () => {
+  assert.equal((await CREATE(req("POST", "/api/agents", manifest()))).status, 201);
+
+  const again = await CREATE(req("POST", "/api/agents", manifest({ name: "Duplicate" })));
+  assert.equal(again.status, 409);
+  assert.equal(again.headers.get("cache-control"), "no-store");
+  const againBody = (await again.json()) as { error: string };
+  assert.match(againBody.error, /already exists/);
+
+  // The rejected create must not have overwritten the original agent.
+  const one = await ONE(req("GET", "/api/agents/route-bot"), ctx("route-bot"));
+  assert.equal(one.status, 200);
+  assert.equal(((await one.json()) as { agent: { name: string } }).agent.name, "Route bot");
+
+  // Updates still go through PUT.
+  const put = await REPLACE(req("PUT", "/api/agents/route-bot", manifest({ name: "Renamed" })), ctx("route-bot"));
+  assert.equal(put.status, 200);
+});
+
+test("export accepts a system prompt that quotes token/secret inside a JSON example", async () => {
+  // The old serialized-JSON regex matched the escaped `"token":` / `"secret":`
+  // inside this string and failed the export with 500.
+  const prompt = 'When a request contains {"token": "abc", "secret": "def"}, redact it before logging.';
+  assert.equal(
+    (await CREATE(req("POST", "/api/agents", manifest({ identity: { systemPrompt: prompt } })))).status,
+    201,
+  );
+
+  const exported = await EXPORT(req("GET", "/api/agents/route-bot/export"), ctx("route-bot"));
+  assert.equal(exported.status, 200);
+  const pkg = (await exported.json()) as { agent: { identity: { systemPrompt: string } } };
+  assert.equal(pkg.agent.identity.systemPrompt, prompt);
+});
+
+test("export refuses an agent whose free text carries a real secret-shaped value", async () => {
+  const prompt = "Use provider key sk-FAKE0123456789ABCDEF for this agent.";
+  assert.equal(
+    (await CREATE(req("POST", "/api/agents", manifest({ identity: { systemPrompt: prompt } })))).status,
+    201,
+  );
+
+  const exported = await EXPORT(req("GET", "/api/agents/route-bot/export"), ctx("route-bot"));
+  assert.equal(exported.status, 500);
+  assert.equal(exported.headers.get("cache-control"), "no-store");
+  const body = (await exported.json()) as { error: string };
+  assert.match(body.error, /secret-shaped/);
+});

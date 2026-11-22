@@ -13,8 +13,9 @@ Production is <https://swarmagents.codes> on the Oracle VPS (host in the `DEPLOY
    tags the current image as `prev`, rsyncs **`apps/swarmagents/`** from that worktree, builds
    `swarmagents-v2:latest` from `apps/swarmagents/Dockerfile`, brings the compose project up, polls
    `/api/health?ready=1` for up to 90 s, and rolls back automatically on failure. It rebuilds the
-   `swarm-vm:claude` / `swarm-vm:desktop` images only when `apps/swarmagents/vm-image` /
-   `vm-image-desktop` changed.
+   `swarm-vm:claude` / `swarm-vm:desktop` images when `apps/swarmagents/vm-image` /
+   `vm-image-desktop` changed **or the image is missing** (a fresh host has neither; the desktop
+   image builds on top of the headless one, so the headless image is built first).
 3. So **a deploy ships whatever is on `main`**. Merge first, then deploy.
 
 What the server script depends on in this repo (do not move or rename without updating the server copy):
@@ -23,7 +24,7 @@ What the server script depends on in this repo (do not move or rename without up
 | --- | --- |
 | `apps/swarmagents/` | rsync source and Docker build context (so the app must stay at this path) |
 | `apps/swarmagents/Dockerfile` | the image build |
-| `apps/swarmagents/vm-image/`, `apps/swarmagents/vm-image-desktop/` | per-user VM images, rebuilt when changed |
+| `apps/swarmagents/vm-image/`, `apps/swarmagents/vm-image-desktop/` | per-user VM images, rebuilt when changed or missing |
 
 Nothing else in the repo is read by the deploy. The server keeps its working directory under
 `/home/ubuntu/infra/apps/swarmagents`; that directory name is a server-side path baked into
@@ -32,6 +33,98 @@ Nothing else in the repo is read by the deploy. The server keeps its working dir
 Speed: the deploy is incremental. The Docker context excludes `vendor/`, `tools/`, `docs/`, `branding/`,
 `deploy/`, `vm-image/` and `packages/mcp-swarm-board/` (`.dockerignore`), the `npm ci` layer is cached until
 `package*.json` changes, and unchanged VM images are skipped.
+
+## Canonical deploy shape
+
+There is exactly one supported production topology. Every repo artifact that
+mentions a port or a path must agree with this table; if you change a number,
+change it everywhere it appears (`deploy/nginx.conf`, both compose files,
+`HEALTH_URL` in `deploy/deploy.sh`, `deploy/healthcheck.sh`, `.env.example`).
+
+The app container runs three servers in one process (all started from
+`instrumentation.ts`): the Next.js app on container port **3777**, the
+desktop proxy (`lib/desktop-proxy`) on **3778**, and the BYOC hub
+(`lib/byoc`) on **3779**. Compose publishes them on the host as:
+
+| Host port | Container port | Published on | Serves |
+| --- | --- | --- | --- |
+| 3400 | 3777 | all interfaces | Next.js app (UI + `/api/*` + `/preview/<port>/...` HTTP) |
+| 3778 | 3778 | `127.0.0.1` only | desktop proxy: `/desktop/*` HTTP assets, `/desktop/ws`, preview WebSocket upgrades |
+| 3779 | 3779 | `127.0.0.1` only | BYOC hub: `/byoc/ws` node dial-in |
+
+For the loopback publishes to work, the two in-process servers bind
+`0.0.0.0` **inside the container** (`SWARM_DESKTOP_PROXY_HOST=0.0.0.0`,
+`SWARM_BYOC_HOST=0.0.0.0` in both compose files). The host-side bind stays
+loopback-only, so the host nginx vhost is their only public entry. Never
+publish 3778 or 3779 on a public interface.
+
+The host nginx vhost (`deploy/nginx.conf`, installed as
+`/etc/nginx/conf.d/swarmagents.conf` or included from `sites-enabled`)
+routes by path:
+
+| Public path | Upstream | Notes |
+| --- | --- | --- |
+| `/` | `127.0.0.1:3400` | the app; 3400 must match `HEALTH_URL` in `deploy/deploy.sh` |
+| `/api/runtime/stream/…`, `/api/share/<token>/stream` | `127.0.0.1:3400` | SSE: `proxy_buffering off`, 24 h read timeout |
+| `/desktop/` | `127.0.0.1:3778` | WebSocket upgrade headers, 24 h timeouts; session-cookie gate in the proxy |
+| `/preview/` | `127.0.0.1:3400` for HTTP, `127.0.0.1:3778` for `Upgrade: websocket` | split by the `$preview_backend` map; Next.js cannot receive upgrades |
+| `/byoc/` | `127.0.0.1:3779` | WebSocket upgrade headers, 24 h timeouts; node-token hello gate in the hub |
+
+Every location sets `X-Forwarded-Host $host` (and strips client-supplied
+`X-Forwarded-For` / `X-Real-IP`): with `SWARM_TRUST_PROXY=1` the app reads
+the forwarded headers, so nginx must overwrite them, never pass a client's
+values through.
+
+**`deploy/deploy.sh` never touches nginx.** The vhost is installed and
+reloaded by the operator. After any edit to the installed vhost:
+
+```bash
+nginx -t && systemctl reload nginx
+```
+
+**Verification checklist** (run on the VPS after a deploy or a vhost change;
+`https://swarmagents.codes` below assumes TLS is enabled — substitute
+`http://` while it is not):
+
+```bash
+# 1. App on its host port, and through nginx:
+curl -s http://127.0.0.1:3400/api/health?ready=1
+curl -s https://swarmagents.codes/api/health?ready=1
+
+# 2. Desktop proxy answers on loopback and refuses the unauthenticated
+#    request (401 = proxy reached, cookie gate up; the Host header is
+#    needed because server mode checks it against SWARM_ALLOWED_HOSTS —
+#    without it the proxy answers 403, which still proves it is listening;
+#    connection refused = bad publish):
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: swarmagents.codes' \
+  http://127.0.0.1:3778/desktop/
+
+# 3. Desktop WebSocket through nginx reaches the proxy, not Next.js
+#    (401 without a session cookie; 101 with one):
+curl -s -i --max-time 5 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  https://swarmagents.codes/desktop/ws | head -1
+
+# 4. Preview HTTP goes to the app (login redirect / 401 from Next.js) and a
+#    preview WebSocket upgrade goes to the proxy (refused there, not by Next.js):
+curl -s -o /dev/null -w '%{http_code}\n' https://swarmagents.codes/preview/3000/
+curl -s -i --max-time 5 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  https://swarmagents.codes/preview/3000/ | head -1
+
+# 5. BYOC hub accepts the upgrade (101; curl then waits for the hello frame,
+#    hence --max-time). A plain GET without upgrade headers gets no answer —
+#    the hub has no HTTP handler; that is expected, not a routing failure:
+curl -s -i --max-time 3 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  https://swarmagents.codes/byoc/ws | head -1
+
+# 6. SSE streams flush immediately (events appear as they happen, no
+#    buffering delay; needs a real run id and a session cookie):
+curl -s -N --max-time 10 -b 'swarm_session=<cookie>' \
+  https://swarmagents.codes/api/runtime/stream/<runId>
+```
+
 
 ## Deploying from your shell or from GitHub
 
@@ -109,7 +202,7 @@ Any deployment must run in server mode (`SWARM_SERVER_MODE=1`). In local
 mode there is no login at all — anyone reaching port 3777 gets full access
 to runs, VMs, provider keys, and the board — so the Compose files set server
 mode by default and a plain `docker compose up` without a secret fails at
-compose time instead of serving an unauthenticated app. Three variables:
+compose time instead of serving an unauthenticated app. Five variables:
 
 - `SWARM_SERVER_MODE=1` — enables server-mode auth: every route except
   `/login`, `/about`, `/status`, `/api/login`, `/api/signup`, `/api/me`, and
@@ -126,9 +219,35 @@ compose time instead of serving an unauthenticated app. Three variables:
   host allowlist accepts (e.g. `swarmagents.example.com`). When unset,
   every `Host` header is denied in server mode (the only exception is
   loopback `/api/health`, which stays reachable for the Docker healthcheck),
-  so set it in production. If `SWARM_ALLOWED_HOSTS` is set, include the
+  so set it in production — the app refuses to boot in server mode when the
+  list is empty, rather than serving a site-wide 403. Entries may carry a
+  port (`swarmagents.example.com:443`); ports are stripped before matching.
+  If `SWARM_ALLOWED_HOSTS` is set, include the
   internal `swarmagents` hostname as well so VM approval callbacks are
   accepted (see below).
+- `SWARM_COOKIE_SECURE` — session cookies are `Secure` (HTTPS-only) by
+  default. **Pair this with how the app is reached:** with a TLS-terminating
+  proxy in front (the production shape), leave it unset. On a deployment
+  reached over plain HTTP, browsers silently drop Secure cookies — login
+  returns 200, then every page bounces back to `/login` forever with no
+  error shown — so set `SWARM_COOKIE_SECURE=0` there (and only there). At
+  boot, server mode + Secure cookies + no `SWARM_TRUST_PROXY` logs a warning
+  naming this pairing.
+- `SWARM_PUBLIC_ORIGIN` — the public origin of the deployment (e.g.
+  `https://swarmagents.example.com`). Required for real (Docker) runs in
+  server mode: per-user VMs reach the app's LLM proxy and approval endpoint
+  through it. When it (and the `SWARM_VM_LLM_BASE_URL` /
+  `SWARM_VM_APPROVAL_BASE_URL` overrides) is unset, Docker runs are refused
+  at start and the run-start error response names the missing variables
+  (`missingEnv`). Non-Anthropic providers (OpenAI-style APIs) additionally
+  *require* the proxy: the VM's Claude CLI speaks only the Anthropic
+  Messages API, and direct mode would place the raw per-user key in the VM
+  environment, so server mode refuses to start such runs without a proxy
+  origin instead of silently falling back to direct mode. The
+  `SWARM_VM_LLM_BASE_URL` / `SWARM_VM_APPROVAL_BASE_URL` overrides exist for
+  deployments where VMs must reach the app at a different address than the
+  public site (Docker bridge gateway IP, `host.docker.internal`); normally
+  `SWARM_PUBLIC_ORIGIN` covers both.
 
 External MCP clients (including the swarm board at
 `/api/mcp/swarm-board`) authenticate with `SWARM_HARNESS_TOKEN` as a
@@ -136,6 +255,144 @@ External MCP clients (including the swarm board at
 writes both require one of the two in server mode — the board is no longer
 publicly writable. See `apps/swarmagents/.env.example` for placeholder
 values.
+
+#### Sign-up posture (`SWARM_ALLOW_SIGNUP`)
+
+Self-signup is **closed by default** in server mode (and whenever
+`NODE_ENV=production`): `POST /api/signup` answers `403` ("Sign-up is
+disabled on this server.") and the login page does not offer "Create
+account". Local mode is the exception — it trusts loopback only, so
+sign-up stays open there regardless of this variable.
+
+- `SWARM_ALLOW_SIGNUP=1` (or `true`) — opens self-signup. This is the
+  supported launch posture: flip the switch and anyone who can reach the
+  site can create an account. Each account gets its own VM, so open
+  sign-up spends real compute — before opening it, configure the abuse
+  controls in "Email verification + bot check" below (verification
+  email via SMTP, and the Turnstile bot check).
+- `SWARM_SIGNUP_MODE=invite` — **invite-only sign-up**, the middle
+  posture: the "Create account" toggle renders, but `POST /api/signup`
+  additionally requires a valid code from `SWARM_INVITE_CODES`
+  (comma-separated, case-sensitive). Codes are **single-use**: the
+  account created with a code records only the code's keyed hash, and a
+  spent code can never create a second account. Missing, unknown, and
+  spent codes all get the same generic `400` ("A valid invite code is
+  required to sign up.") — the response never distinguishes them, and
+  codes are never logged. Invite mode takes precedence over
+  `SWARM_ALLOW_SIGNUP` (the more restrictive explicit posture wins), and
+  composes with the abuse controls below (bot check first, then the
+  code, then account creation + verification email). Use long random
+  codes (e.g. `openssl rand -hex 16` each) — anyone holding a code can
+  create one account. With invite mode on but `SWARM_INVITE_CODES`
+  empty, sign-up fails closed. Removing a code from the list stops
+  future redemptions; it does not un-redeem a spent code. To issue more
+  codes, append them to `SWARM_INVITE_CODES` and recreate the
+  container.
+- Unset / any other value — sign-up stays closed. To create accounts
+  (including the first operator account on a fresh deployment) while
+  sign-up is closed, set `SWARM_ALLOW_SIGNUP=1`, create the account(s),
+  then unset it and recreate the container so the new environment takes
+  effect.
+
+The login page and the API share one predicate for this gate, so the
+"Create account" toggle renders exactly when the API would accept a
+sign-up (in invite mode: with a code).
+
+#### Email verification + bot check (`SWARM_TURNSTILE_*`)
+
+**Decision (FIX-44): unverified accounts cannot start runs.** They can
+sign up, sign in, and configure providers, but in server mode
+`RuntimeManager.start()` refuses until the emailed verification link
+is clicked — so a fake sign-up consumes no VM compute. The alternative
+(blocking sign-up itself until verified) was rejected: it strands the
+account-creation flow on mail delivery and complicates the first-run
+path. Local mode is never gated (single trusted user on loopback).
+Accounts that predate verification (no `verified` field in
+`users.json`) are grandfathered as verified, so existing deployments
+do not lock out current users.
+
+- Verification links are single-use, HMAC-stored `ev1.` tokens (24 h
+  default, `SWARM_EMAIL_VERIFY_TTL_HOURS`), sent through the same SMTP
+  transport as password reset — configure SMTP (next section) before
+  opening sign-ups, or new users can never verify. A signed-in user
+  who lost the email resends from `/verify-email`.
+- Bot check: set `SWARM_TURNSTILE_SECRET` + `SWARM_TURNSTILE_SITE_KEY`
+  (Cloudflare Turnstile) and the sign-up form requires a valid widget
+  token, verified server-side before any account work. With the secret
+  unset the check is skipped — acceptable for local mode and closed
+  sign-ups, not for open ones.
+
+#### Password-reset email (SMTP)
+
+Password reset ("Forgot password?" on the login page) emails a
+single-use reset link, and email verification (above) emails its link
+through the same transport. It needs an SMTP transport — the app ships a
+dependency-free SMTP client (`lib/mailer.ts`); any provider works
+(Gmail app password, Fastmail, SES/Mailgun SMTP, a local relay):
+
+- `SWARM_SMTP_HOST` — SMTP server host. **Required in server mode** for
+  reset email to be deliverable.
+- `SWARM_MAIL_FROM` — From address, e.g. `SwarmAgents <no-reply@example.com>`.
+  Required alongside the host.
+- `SWARM_SMTP_PORT` — default `587` (`465` when `SWARM_SMTP_SECURE=1`).
+  On port 587 the client upgrades with STARTTLS when the server offers it.
+- `SWARM_SMTP_SECURE=1` — implicit TLS from connect (port 465 style).
+- `SWARM_SMTP_USER` / `SWARM_SMTP_PASS` — AUTH LOGIN credentials, when the
+  provider requires them.
+- `SWARM_SMTP_TIMEOUT_MS` — per-operation SMTP socket timeout in
+  milliseconds (default `10000`; non-positive/invalid values fall back
+  to the default). Raise it only for a slow relay.
+- `SWARM_SMTP_HELO` — EHLO name the client presents (default: the
+  container hostname). Set it when your provider/relay expects a
+  specific EHLO identity (e.g. your server's FQDN).
+- `SWARM_PASSWORD_RESET_TTL_MIN` — reset-link lifetime in minutes
+  (default `30`). Links are single-use; asking for a new link kills the
+  previous one, and a completed reset signs out every existing session.
+
+Without `SWARM_SMTP_HOST`/`SWARM_MAIL_FROM` the request endpoint still
+answers 200 (it must not reveal whether an account exists), but no email
+is sent and a warning is logged — so configure mail **before** opening
+sign-ups, or locked-out users have no recovery path. In local mode the
+reset link is written to the server console instead, so a local operator
+can still recover the account.
+
+#### User store concurrency (`users.json`)
+
+**Decision (FIX-45): cross-process file lock.** Every read-modify-write of
+`users.json` in `lib/users.ts` (sign-up, session revocation, password
+reset/change, email verification) runs under two locks: the in-process
+promise lock that was always there, and an advisory lockfile
+(`users.json.lock` next to the store, `lib/file-lock.ts`) that serializes
+writers across processes. A second app process sharing the same
+`SWARM_HOME`/data volume can therefore no longer silently drop another
+process's account writes — the pre-FIX-45 store assumed one process, and
+two writers loading the same snapshot would clobber each other.
+
+Why not the alternatives:
+
+- *Single-instance only* (document and enforce one process): leaves a
+  silent data-loss footgun the day anyone runs a second process against
+  the same volume (a rolling deploy, a stray dev server). The lock
+  removes the hazard for ~100 lines.
+- *SQLite*: needs a native dependency (or the still-experimental
+  `node:sqlite`) plus a data migration, for a store with a handful of
+  rows. Disproportionate today; revisit if the user count or write rate
+  ever grows.
+
+Limits that remain, by design:
+
+- The lock is advisory and same-host: it serializes writers that go
+  through `lib/users.ts` on a local filesystem. Do not hand-edit
+  `users.json` while the app is running, and do not share the data
+  volume over NFS or between hosts — stay on the single-host canonical
+  deploy shape above, or move the store to a real database first.
+- Sessions are stateless HMAC and were never the problem; they survive
+  multi-process unchanged.
+- A lock left by a crashed process is broken automatically once it is
+  10 s old. A lock that cannot be acquired within 15 s fails the request
+  (HTTP 500) instead of risking a clobbered write. Critical sections are
+  milliseconds long, so either event means something is wedged — look
+  for a stuck process before deleting `users.json.lock` by hand.
 
 Both the `Dockerfile` and `docker-compose.yml` define the same readiness check.
 It probes `http://127.0.0.1:$PORT/api/health?ready=1` (default `3777`) with
@@ -262,6 +519,21 @@ desktop — XFCE on display `:1`, Chromium, a terminal and file manager, and a
 browser-viewable VNC web client (noVNC) on the container's port 6080. The
 desktop image builds on top of the headless one:
 
+**Production default: ON (explicit decision).** The live VM screen is the
+flagship surface, so the server template
+(`docker-compose.server.yml.example`) ships `SWARM_VM_DESKTOP: "1"` (with
+`SWARM_VM_MEMORY: "4g"`), and `deploy` builds `swarm-vm:desktop` when it is
+missing — a fresh deploy from the template has a working desktop with no
+extra steps. The state is never silent: `GET /api/health` always reports
+`desktop`, `/api/health?ready=1` fails with `DESKTOP_IMAGE_MISSING` when
+desktop mode is on but the image is gone (so a bad deploy rolls back
+loudly), and the UI shows a "desktop off" notice in the stage instead of
+silently substituting the terminal. To opt out (headless VMs, terminal
+screen only), set `SWARM_VM_DESKTOP: "0"` in the server compose
+environment — or run `./deploy.sh desktop-off` on the VPS, which edits
+`.env.v2` — and recreate the app container. Local/dev keeps the opt-in
+default (unset = off); see `.env.example`.
+
 ```bash
 cd apps/swarmagents
 npm run vm-image:build                # swarm-vm:claude (dependency)
@@ -386,6 +658,19 @@ with a `VmLimitError` instead of silently running an unbounded container. The
 limits are re-applied (`docker update`) to containers that already exist, so
 lowering a limit also affects VMs that were created earlier.
 
+### Global concurrent-VM cap
+
+Per-VM ceilings bound one container; `SWARM_MAX_CONCURRENT_VMS` bounds how
+many user VMs may be live at once across all users (default `4`, sized for a
+small VPS at the 4GiB desktop ceiling; `0` disables the cap). A run that
+would need a fresh VM past the cap queues with a capacity status (its place
+in line) instead of starting a container or OOMing the host, and starts
+automatically when a slot frees. Idle-but-alive VMs count against the cap
+until the idle sweeper hibernates them (`SWARM_VM_IDLE_MIN`, default 30), so
+capacity turns over on that cadence; a user whose VM is already live is
+never blocked by other users' VMs. Size it as host RAM ÷ per-VM ceiling,
+leaving headroom for the app itself.
+
 ## Desktop stream proxy
 
 The user's live desktop must be reachable only through the app behind login,
@@ -419,6 +704,22 @@ Disable the in-process proxy (e.g. when running a separate instance) with
 `SWARM_DESKTOP_PROXY_DISABLED=1`. The proxy can also run standalone on its
 own port: `npm run desktop-proxy:dev` (or `node dist/desktop-proxy/desktop-proxy/server.js`
 after `npm run build`, which compiles the proxy tree to `dist/desktop-proxy`).
+
+**Frame tap (opt-in).** `SWARM_DESKTOP_FRAME_TAP=1` makes the proxy
+composite each session's RFB stream into a framebuffer shadow and store
+JPEG keyframes on significant screen damage (≥2% of tiles changed, or any
+change after 30 s). Keyframes are readable, session-gated, at
+`GET /desktop/keyframes` (list), `GET /desktop/keyframes/<id>`, and
+`GET /desktop/keyframes/at/<ts>`; they are retained briefly after a
+session closes so a finished run's screen can still be scrubbed. The tap
+also feeds the frame reference in takeover handback summaries and the
+`desktop.damage` run telemetry. Only the exact value `1` enables it —
+unset (the default) constructs no tap at all and costs nothing. While
+enabled, budget up to ~2× framebuffer plus a bounded keyframe store
+(320 frames / 32 MiB) per tapped session. Stored keyframes are
+downscaled to a largest dimension of 1280 px by default (aspect
+preserved); set `SWARM_DESKTOP_KEYFRAME_MAX_DIM=0` for full-resolution
+storage, or another positive value for a different cap.
 
 ### Routing `/desktop/` in production
 
@@ -750,6 +1051,7 @@ template of the production compose file — copy it to
 | Git mirror + read-only deploy key (`monolith.git`, `monolith_deploy_key`) | operator; `deploy/deploy.sh` pulls through them |
 | Host nginx site config (`deploy/nginx.conf`, TLS block enabled) | copy from this repo, enable TLS per above |
 | Egress unit (`swarmagents-egress.{sh,service}`) | in this repo; installed once by the operator (see "Installing the egress unit") |
+| `swarm-vm:claude` + `swarm-vm:desktop` VM images | built by `deploy` when missing (or `./deploy.sh build-desktop`); desktop mode is ON by default in the template — opt out per "The per-user desktop VM image" above |
 | Backup + healthcheck units (`backup.sh`, `restore.sh`, `healthcheck.sh`, `swarmagents-healthcheck.{service,timer}`) | in this repo; install per "Backup and restore" / "Monitoring" above |
 
 What this repo still does **not** contain (VPS-only by design, reconstruct

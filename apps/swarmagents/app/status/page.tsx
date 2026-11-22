@@ -38,7 +38,7 @@ export default function StatusPage() {
   const rows: { label: string; value: string; ok: boolean | null }[] = [
     {
       label: "Service",
-      value: health.ok ? "Operational" : "Degraded — board storage is not writable",
+      value: health.ok ? "Operational" : "Degraded — storage unavailable",
       ok: health.ok,
     },
     {

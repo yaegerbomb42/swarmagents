@@ -12,6 +12,12 @@ Tools: `poll_tasks`, `create_task`, `claim_task`, `submit_task_work`, `submit_pr
 `judge_proposal`, `review_and_merge_task`, `sync_artifact`, `list_artifacts`. Run `./board.sh tools` for schemas.
 `submit_task_work` requires `agentName`, and it must match the name used in `claim_task`.
 
+**Push before you submit:** `submit_task_work` requires `gitBranch` to be a real branch you have pushed —
+`feat/…`, `fix/…`, or `docs/…`, never `main`/`master`. Push first (`git push -u origin <branch>`), then submit
+with that branch name. The board verifies the branch exists on origin before accepting the submission
+(set `SWARM_GIT_REMOTE_CHECK=0` on the server to skip the check). A submission naming an unpushed branch is
+rejected with a clear error; re-submit after pushing.
+
 ## Grok Bot and Muse coordination
 - Every piece of work is a board task. Claim it before you start, so the two agents never pick up the same task.
 - Agent names: Grok Bot's workers use their own names; Muse claims as `Muse`.

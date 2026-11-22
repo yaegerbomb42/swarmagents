@@ -12,9 +12,9 @@ import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultOracleChecks, runOracleGate, type OracleCheck } from "./oracle";
-import { countChurn, parsePatchFiles, unsafePatchPaths } from "./diff";
-import { findAffectedTests, relativeImports, resolveSpecifier } from "./affected";
+import { defaultOracleChecks, OracleGate, runOracleGate, type OracleCheck } from "./oracle";
+import { countChurn, parsePatchFiles, unsafePatchPaths, type PatchFile } from "./diff";
+import { findAffectedTests, relativeImports, resolveSpecifier, TRANSITIVE_HOPS } from "./affected";
 import { buildRetryContext, diagnosticSymbols, extractDiagnostic, findDefinition } from "./retry";
 import { writeFileViaExec, type OracleExec } from "./exec";
 
@@ -489,6 +489,43 @@ test("findAffectedTests: changed tests, siblings and importers only", () => {
   assert.equal(resolveSpecifier("lib/deep/c.test.ts", "../a.js"), "lib/a");
 });
 
+test("findAffectedTests: directory index imports and transitive callers", () => {
+  const files: Record<string, string> = {
+    "lib/deep/x.test.ts": 'import x from "..";',
+    "lib/consumer.test.ts": 'import { w } from "./wrapper";',
+    "lib/wrapper.ts": 'import { thing } from ".";',
+    "lib/unrelated.test.ts": 'import { z } from "./z";',
+  };
+  const affected = findAffectedTests({
+    changed: [{ path: "lib/index.ts", status: "M" }],
+    allTests: Object.keys(files).filter((p) => p.endsWith(".test.ts")),
+    readFile: (p) => files[p],
+  });
+  assert.deepEqual(affected, ["lib/consumer.test.ts", "lib/deep/x.test.ts"]);
+  assert.deepEqual(relativeImports('import a from ".";\nimport b from "..";\nimport c from "./x";'), [".", "..", "./x"]);
+  assert.equal(resolveSpecifier("lib/deep/x.test.ts", ".."), "lib");
+  assert.ok(TRANSITIVE_HOPS >= 2);
+});
+
+test("definitionSources loads the changed file and its direct relative imports", async () => {
+  const { repo, cleanup } = makeRepo();
+  try {
+    writeFileSync(join(repo, "app/src/uses.ts"), 'import { add } from "./math";\nexport const total = add(1, 2);\n');
+    git(repo, "add", ".");
+    git(repo, "commit", "-q", "-m", "add uses");
+    const gate = new OracleGate(localExec, { repoRoot: join(repo, "app") });
+    const sources = await (
+      gate as unknown as {
+        definitionSources: (files: PatchFile[]) => Promise<{ path: string; content: string }[]>;
+      }
+    ).definitionSources([{ path: "src/uses.ts", status: "M" }]);
+    assert.deepEqual(sources.map((s) => s.path).sort(), ["src/math.ts", "src/uses.ts"]);
+    assert.match(sources.find((s) => s.path === "src/math.ts")!.content, /function add/);
+  } finally {
+    cleanup();
+  }
+});
+
 test("diagnostics are trimmed to error lines, redacted and bounded", () => {
   const out = [
     "noise",
@@ -509,6 +546,33 @@ test("diagnostics are trimmed to error lines, redacted and bounded", () => {
   assert.deepEqual(def && [def.startLine, def.endLine], [2, 4]);
   const ctx = buildRetryContext({ stage: "tsc", diagnostic: d, files: [{ path: "src/pool.ts", content: "export class Pool {\n}\n" }] });
   assert.match(ctx, /Definition of `Pool` \(src\/pool\.ts:L1-2\)/);
+});
+
+test("findDefinition ignores braces in strings/comments and escapes regex metacharacters", () => {
+  const source = [
+    "export function tricky() {",
+    '  const s = "{ fake }";',
+    "  // } a closing brace in a line comment",
+    "  /* { an opening brace in a block comment } */",
+    "  const t = `} template brace`;",
+    "  return 1;",
+    "}",
+    "export function next() {}",
+  ].join("\n");
+  const files = [{ path: "x.ts", content: source }];
+  const def = findDefinition("tricky", files);
+  assert.deepEqual(def && [def.startLine, def.endLine], [1, 7]);
+  // Names containing regex metacharacters must not throw or match loosely.
+  assert.equal(findDefinition("tri.ky", files), null);
+  assert.equal(findDefinition("tricky[", files), null);
+  assert.ok(findDefinition("next", files));
+});
+
+test("extractDiagnostic strips non-SGR ANSI sequences", () => {
+  const out = "\x1b[2K\x1b[31mError: boom\x1b[0m\x1b]0;a title\x07";
+  const d = extractDiagnostic(out);
+  assert.match(d, /Error: boom/);
+  assert.doesNotMatch(d, /\x1B/);
 });
 
 test("writeFileViaExec round-trips content through argv-only base64 chunks", async () => {

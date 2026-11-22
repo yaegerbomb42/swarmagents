@@ -30,7 +30,7 @@
  */
 
 import { posix as path } from "node:path";
-import { findAffectedTests, isTestFile } from "./affected";
+import { findAffectedTests, isTestFile, relativeImports, resolveSpecifier } from "./affected";
 import { countChurn, parsePatchFiles, unsafePatchPaths, type PatchFile } from "./diff";
 import { execWithTimeout, writeFileViaExec, type OracleExec } from "./exec";
 import { buildRetryContext, diagnosticLocation, extractDiagnostic, identifierAt } from "./retry";
@@ -325,13 +325,23 @@ export class OracleGate {
     const allTests = listed.stdout.split("\0").filter(Boolean).filter(isTestFile);
     // Only read tests that could be affected: their path or their text
     // mentions a changed module's basename (one batched grep, not one per file).
-    const names = [...new Set(changed.map((f) => path.basename(f.path).replace(/\.[^.]+$/, "").replace(/\.(test|spec)$/, "")))]
-      .filter(Boolean);
-    const maybe = new Set(allTests.filter((t) => names.some((n) => t.includes(n))));
+    // For an `index.*` change, tests usually import the parent directory
+    // (`../dir`), so include that basename in the prefilter as well.
+    const names = new Set<string>();
+    for (const f of changed) {
+      const base = path.basename(f.path).replace(/\.[^.]+$/, "").replace(/\.(test|spec)$/, "");
+      if (base) names.add(base);
+      if (base === "index") {
+        const dir = path.basename(path.dirname(f.path));
+        if (dir && dir !== ".") names.add(dir);
+      }
+    }
+    const needles = [...names];
+    const maybe = new Set(allTests.filter((t) => needles.some((n) => t.includes(n))));
     const rest = allTests.filter((t) => !maybe.has(t));
-    for (let i = 0; i < rest.length && names.length; i += 200) {
+    for (let i = 0; i < rest.length && needles.length; i += 200) {
       const batch = rest.slice(i, i + 200);
-      const grep = await this.exec(["grep", "-l", "-F", ...names.flatMap((n) => ["-e", n]), "--", ...batch], { cwd });
+      const grep = await this.exec(["grep", "-l", "-F", ...needles.flatMap((n) => ["-e", n]), "--", ...batch], { cwd });
       for (const hit of grep.stdout.split("\n").map((l) => l.trim()).filter(Boolean)) maybe.add(hit);
     }
     const contents = new Map<string, string>();
@@ -339,6 +349,34 @@ export class OracleGate {
       const text = await readText(this.exec, path.join(cwd, test));
       if (text !== undefined) contents.set(test, text);
     }
+
+    // Transitive selection needs the source modules the candidate tests
+    // import. Read them (bounded, breadth-first) so findAffectedTests can
+    // follow test → module → changed module chains.
+    const spellings = (stem: string): string[] =>
+      stem.startsWith("..") || stem.includes("/../")
+        ? []
+        : ["ts", "tsx", "mts", "cts"].flatMap((ext) => [`${stem}.${ext}`, `${stem}/index.${ext}`]);
+    let frontier = [...new Set([...contents].flatMap(([test, text]) =>
+      relativeImports(text).flatMap((spec) => spellings(resolveSpecifier(test, spec))),
+    ))];
+    let budget = 100;
+    for (let hop = 0; hop < 2 && frontier.length > 0 && budget > 0; hop += 1) {
+      const next: string[] = [];
+      for (const sourcePath of frontier) {
+        if (budget <= 0) break;
+        if (contents.has(sourcePath)) continue;
+        const text = await readText(this.exec, path.join(cwd, sourcePath));
+        budget -= 1;
+        if (text === undefined) continue;
+        contents.set(sourcePath, text);
+        for (const spec of relativeImports(text)) {
+          next.push(...spellings(resolveSpecifier(sourcePath, spec)));
+        }
+      }
+      frontier = next;
+    }
+
     return findAffectedTests({ changed, allTests, readFile: (p) => contents.get(p) });
   }
 
@@ -350,13 +388,29 @@ export class OracleGate {
     return source === undefined ? null : identifierAt(source, loc.line, loc.column);
   }
 
-  /** Real-tree contents of the patch's files and their direct imports, for retry definitions. */
+  /** Real-tree contents of the patch's files and their direct relative imports, for retry definitions. */
   private async definitionSources(files: PatchFile[]): Promise<{ path: string; content: string }[]> {
     const out: { path: string; content: string }[] = [];
-    for (const file of files.slice(0, 8)) {
-      if (unsafePatchPaths([file]).length) continue;
-      const content = await readText(this.exec, path.join(this.opts.repoRoot, file.path));
-      if (content !== undefined) out.push({ path: file.path, content });
+    const seen = new Set<string>();
+    const queue = files.slice(0, 8).map((f) => f.path);
+    // Bound the total work: a diagnostic rarely needs more than a handful.
+    let budget = 16;
+    while (queue.length > 0 && budget > 0) {
+      const file = queue.shift()!;
+      if (seen.has(file)) continue;
+      seen.add(file);
+      if (unsafePatchPaths([{ path: file, status: "M" }]).length) continue;
+      const content = await readText(this.exec, path.join(this.opts.repoRoot, file));
+      if (content === undefined) continue;
+      out.push({ path: file, content });
+      budget -= 1;
+      for (const spec of relativeImports(content)) {
+        const stem = resolveSpecifier(file, spec);
+        if (stem.startsWith("..") || stem.includes("/../")) continue;
+        for (const candidate of [`${stem}.ts`, `${stem}/index.ts`, `${stem}.tsx`]) {
+          if (!seen.has(candidate) && budget > 0) queue.push(candidate);
+        }
+      }
     }
     return out;
   }

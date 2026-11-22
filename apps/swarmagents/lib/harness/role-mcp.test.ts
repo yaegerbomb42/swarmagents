@@ -76,6 +76,28 @@ test("roleArgvFlags builds --allowedTools/--mcp-config/--append-system-prompt pe
   assert.ok(!flags.some((flag) => flag.trim() === ""), "no empty argv entries");
 });
 
+test("roleArgvFlags omits flags that have no value", () => {
+  const noTools = { ...phaseFor("main"), allowedTools: [] };
+  const noToolsFlags = roleArgvFlags(noTools);
+  assert.ok(!noToolsFlags.includes("--allowedTools"));
+  assert.equal(noToolsFlags[noToolsFlags.indexOf("--mcp-config") + 1], ROLE_MCP_CONFIG_PATH);
+
+  const noConfig = { ...phaseFor("main"), mcpConfigPath: "" };
+  const noConfigFlags = roleArgvFlags(noConfig);
+  assert.ok(noConfigFlags.includes("--allowedTools"));
+  assert.ok(!noConfigFlags.includes("--mcp-config"));
+
+  const bare = { ...phaseFor("main"), allowedTools: [], mcpConfigPath: "" };
+  assert.deepEqual(roleArgvFlags(bare), ["--append-system-prompt", bare.appendSystemPrompt!]);
+});
+
+test("roleCatalogJson keeps cloned built-in roles (id check, not reference equality)", () => {
+  const cloned = BUILTIN_ROLES.map((role) => ({ ...role }));
+  const parsed = JSON.parse(roleCatalogJson(cloned)) as { roles: Array<{ id: string }> };
+  const ids = new Set(parsed.roles.map((role) => role.id));
+  for (const role of BUILTIN_ROLES) assert.ok(ids.has(role.id), `cloned built-in ${role.id} survives the catalog filter`);
+});
+
 test("roleArgvFlags omits the system prompt when the role has none", () => {
   const noInstructions = { ...phaseFor("main"), appendSystemPrompt: undefined };
   const flags = roleArgvFlags(noInstructions);
@@ -94,7 +116,7 @@ test("roleMcpConfigJson always wires the role-switch server with the allowed-rol
   assert.equal(roles.command, "node");
   assert.deepEqual(roles.args, [ROLE_MCP_SERVER_PATH]);
   assert.equal(roles.env.SWARM_ROLE_CATALOG, ROLE_CATALOG_PATH);
-  assert.equal(roles.env.SWARM_ROLE_ALLOWED, "main,debugger");
+  assert.deepEqual(JSON.parse(roles.env.SWARM_ROLE_ALLOWED), ["main", "debugger"]);
 });
 
 test("roleCatalogJson lists built-ins with public shapes only", () => {
@@ -402,6 +424,8 @@ test("chat mode (model cannot call tools) disables every tool and the MCP config
   assert.deepEqual(phase.allowedTools, []);
   assert.equal(phase.mcpConfigPath, "");
   const flags = roleArgvFlags(phase);
-  assert.deepEqual(flags.slice(0, 2), ["--allowedTools", "--mcp-config"]);
+  assert.ok(!flags.includes("--allowedTools"), "no empty --allowedTools flag");
+  assert.ok(!flags.includes("--mcp-config"), "no empty --mcp-config flag");
+  assert.ok(!flags.some((flag) => flag.trim() === ""), "no empty argv entries");
   assert.ok(!flags.join(" ").includes("mcp__"));
 });

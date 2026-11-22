@@ -13,6 +13,9 @@ import {
   signupLocalUser,
   localUserExists,
   verifyLocalUser,
+  hashPassword,
+  parseScryptHash,
+  DEFAULT_SCRYPT_COST,
 } from "./users.js";
 
 let dir = "";
@@ -288,6 +291,82 @@ test("no synchronous scrypt call remains in the source tree", () => {
     if (text.includes(needle)) hits.push(path.relative(root, file));
   }
   assert.deepEqual(hits, [], `${needle} must not be used: ${hits.join(", ")}`);
+});
+
+test("supports versioned scrypt hashes with custom cost parameters", async () => {
+  const customCost = { N: 8192, r: 8, p: 1, maxmem: 16 * 1024 * 1024 };
+  const hashed = await hashPassword("custompassword", customCost);
+  assert.match(hashed, /^scrypt\$N=8192,r=8,p=1\$[0-9a-f]{32}\$[0-9a-f]{64}$/);
+
+  const parsed = parseScryptHash(hashed);
+  assert.ok(parsed);
+  assert.equal(parsed.versioned, true);
+  assert.equal(parsed.cost.N, 8192);
+  assert.equal(parsed.cost.r, 8);
+  assert.equal(parsed.cost.p, 1);
+});
+
+test("authenticates legacy 3-part scrypt hash and transparently upgrades to versioned", async () => {
+  // Manually seed a user with a legacy 3-part hash: scrypt$<salt>$<hash>
+  const legacyHash = "scrypt$33247306aac749054795c00127be0ecf$945ffa6bb3d59a4b3d46e77f8a6f5c1cb0bc5d549c017b4b5d9e90dd74a00ba9";
+  const userFile = path.join(dir, "users.json");
+  fs.writeFileSync(
+    userFile,
+    JSON.stringify({
+      version: 1,
+      users: [{ email: "legacy@example.com", password: legacyHash, createdAt: Date.now() }],
+    }),
+    "utf-8",
+  );
+
+  // Authenticates with wrong password -> fails
+  assert.equal(await verifyLocalUser("legacy@example.com", "wrongpassword"), null);
+
+  // We need a legacy hash with a known password:
+  const pwd = "mypassword123";
+  const newLegacy = (await hashPassword(pwd)).replace(/^scrypt\$N=\d+,r=\d+,p=\d+\$/, "scrypt$");
+  assert.equal(newLegacy.split("$").length, 3);
+
+  fs.writeFileSync(
+    userFile,
+    JSON.stringify({
+      version: 1,
+      users: [{ email: "upgrade@example.com", password: newLegacy, createdAt: Date.now() }],
+    }),
+    "utf-8",
+  );
+
+  const auth = await verifyLocalUser("upgrade@example.com", pwd);
+  assert.ok(auth);
+  assert.equal(auth.email, "upgrade@example.com");
+
+  // Wait briefly for transparent background upgrade to finish
+  await new Promise((r) => setTimeout(r, 100));
+
+  const updatedUsers = JSON.parse(fs.readFileSync(userFile, "utf-8")) as { users: Array<{ password: string }> };
+  const updatedUser = updatedUsers.users.find((u) => u.password !== legacyHash);
+  assert.ok(updatedUser);
+  assert.match(updatedUser.password, /^scrypt\$N=16384,r=8,p=1\$/);
+
+  // Still authenticates cleanly with upgraded hash
+  const authAgain = await verifyLocalUser("upgrade@example.com", pwd);
+  assert.ok(authAgain);
+});
+
+test("session revocation followed by immediate re-login works with counter epoch", async () => {
+  await signupLocalUser("revoker@example.com", "password123");
+  const epochBefore = getSessionEpoch("revoker@example.com");
+  assert.equal(epochBefore, 0);
+
+  const bumped = await bumpSessionEpoch("revoker@example.com");
+  assert.equal(bumped, true);
+  const epochAfter = getSessionEpoch("revoker@example.com");
+  assert.ok(epochAfter > epochBefore);
+
+  // Immediate re-login succeeds
+  const login = await verifyLocalUser("revoker@example.com", "password123");
+  assert.ok(login);
+  assert.equal(login.email, "revoker@example.com");
 });
 
 /** Every .ts/.tsx/.js/.mjs/.cjs file below `dir`, skipping build and vendor dirs. */

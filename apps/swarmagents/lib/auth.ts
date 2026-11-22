@@ -257,7 +257,10 @@ function sessionSecret(): string {
  * scaled up, so their existing fixtures keep working. v2 tokens are still
  * verified during rollout so active sessions are not dropped.
  */
-export function signSession(userId: string, issuedAt: number = Date.now()): string {
+export function signSession(
+  userId: string,
+  issuedAt: number = Date.now(),
+): string {
   const secret = process.env.SWARM_SESSION_SECRET ?? "";
   if (!secret.trim()) {
     throw new Error("SWARM_SESSION_SECRET is not set: refusing to sign a session cookie with an empty key");
@@ -274,19 +277,15 @@ interface VerifiedSession {
   issuedAtMs: number;
 }
 
-/** Split a signed token into user id, issued-at and MAC for a given prefix. */
+/** Split a signed token into components for a given prefix. */
 function parseSessionToken(token: string, prefix: string): { userId: string; issuedAtRaw: string; mac: string } | null {
   if (!token.startsWith(prefix)) return null;
-  const macSep = token.lastIndexOf(".");
-  if (macSep <= prefix.length) return null;
-  const payload = token.slice(0, macSep); // "<prefix><userId>.<issuedAt>"
-  const mac = token.slice(macSep + 1);
-  const iatSep = payload.lastIndexOf(".");
-  if (iatSep <= prefix.length) return null;
-  const userId = payload.slice(prefix.length, iatSep);
-  if (!userId) return null;
-  const issuedAtRaw = payload.slice(iatSep + 1);
-  if (!/^\d+$/.test(issuedAtRaw)) return null;
+  const parts = token.slice(prefix.length).split(".");
+  if (parts.length < 3) return null;
+  const mac = parts[parts.length - 1];
+  const issuedAtRaw = parts[parts.length - 2];
+  const userId = parts.slice(0, parts.length - 2).join(".");
+  if (!userId || !/^\d+$/.test(issuedAtRaw)) return null;
   return { userId, issuedAtRaw, mac };
 }
 
@@ -299,7 +298,7 @@ function macMatches(secret: string, signingInput: string, mac: string): boolean 
 
 /**
  * Verify a signed token. v3 carries milliseconds; v2 carries seconds and is
- * normalized to milliseconds so the epoch comparison has one code path.
+ * normalized to milliseconds.
  */
 function verifySignedSession(token: string, secret: string): VerifiedSession | null {
   const prefix = token.startsWith("v3.") ? "v3." : token.startsWith("v2.") ? "v2." : null;
@@ -308,7 +307,8 @@ function verifySignedSession(token: string, secret: string): VerifiedSession | n
   const parts = parseSessionToken(token, prefix);
   if (!parts) return null;
   const domain = prefix.slice(0, 2);
-  if (!macMatches(secret, `${domain}:${parts.userId}:${parts.issuedAtRaw}`, parts.mac)) return null;
+  const signingInput = `${domain}:${parts.userId}:${parts.issuedAtRaw}`;
+  if (!macMatches(secret, signingInput, parts.mac)) return null;
 
   const issuedAtMs = Number(parts.issuedAtRaw) * (domain === "v2" ? 1000 : 1);
   const now = Date.now();
@@ -358,8 +358,6 @@ export function isHarnessBearer(req: AuthRequestLike): boolean {
 function sessionAllowedByEpoch(userId: string, issuedAtMs: number): boolean {
   if (!userId.startsWith("local_")) return true;
   const email = userId.slice("local_".length);
-  // Strictly after the epoch: a cookie minted in the same millisecond as the
-  // revocation was issued before it and must not survive "sign out everywhere".
   return issuedAtMs > getSessionEpoch(email);
 }
 

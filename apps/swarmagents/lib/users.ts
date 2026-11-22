@@ -18,11 +18,26 @@ const SCHEME = "scrypt";
 const KEY_LEN = 32;
 const SALT_BYTES = 16;
 
+export interface ScryptCost {
+  N: number;
+  r: number;
+  p: number;
+  maxmem?: number;
+}
+
+export const DEFAULT_SCRYPT_COST: ScryptCost = {
+  N: 16384,
+  r: 8,
+  p: 1,
+  maxmem: 32 * 1024 * 1024,
+};
+
 /** Async scrypt (promisified); never blocks the event loop while hashing. */
 const scryptAsync = promisify(scrypt) as (
   password: string | Buffer,
   salt: Buffer | string,
   keylen: number,
+  options?: ScryptCost,
 ) => Promise<Buffer>;
 
 /**
@@ -33,7 +48,7 @@ const scryptAsync = promisify(scrypt) as (
  * by response timing.
  */
 const DUMMY_SCRYPT_HASH =
-  "scrypt$33247306aac749054795c00127be0ecf$945ffa6bb3d59a4b3d46e77f8a6f5c1cb0bc5d549c017b4b5d9e90dd74a00ba9";
+  "scrypt$N=16384,r=8,p=1$33247306aac749054795c00127be0ecf$945ffa6bb3d59a4b3d46e77f8a6f5c1cb0bc5d549c017b4b5d9e90dd74a00ba9";
 const MAX_EMAIL_LEN = 254;
 const MIN_PASSWORD_LEN = 8;
 const MAX_PASSWORD_LEN = 1024;
@@ -136,22 +151,64 @@ async function withScryptSlot<T>(work: () => Promise<T>): Promise<T> {
   }
 }
 
-/** Password hashing: scrypt with a random salt, async (node:crypto, no deps). */
-async function hashPassword(password: string): Promise<string> {
+/** Password hashing: versioned scrypt with cost parameters and random salt, async. */
+export async function hashPassword(password: string, cost: ScryptCost = DEFAULT_SCRYPT_COST): Promise<string> {
   const salt = randomBytes(SALT_BYTES);
-  const hash = await withScryptSlot(() => scryptAsync(password, salt, KEY_LEN));
-  return `${SCHEME}$${salt.toString("hex")}$${hash.toString("hex")}`;
+  const hash = await withScryptSlot(() => scryptAsync(password, salt, KEY_LEN, cost));
+  return `${SCHEME}$N=${cost.N},r=${cost.r},p=${cost.p}$${salt.toString("hex")}$${hash.toString("hex")}`;
+}
+
+export interface ParsedScryptHash {
+  versioned: boolean;
+  cost: ScryptCost;
+  salt: Buffer;
+  hash: Buffer;
+}
+
+/**
+ * Parse a stored hash string. Supports:
+ * - Versioned 4-part: scrypt$N=...,r=...,p=...$<saltHex>$<hashHex>
+ * - Legacy 3-part: scrypt$<saltHex>$<hashHex> (defaults to N=16384, r=8, p=1)
+ */
+export function parseScryptHash(stored: string): ParsedScryptHash | null {
+  const parts = stored.split("$");
+  if (parts[0] !== SCHEME) return null;
+  if (parts.length === 3) {
+    return {
+      versioned: false,
+      cost: { ...DEFAULT_SCRYPT_COST },
+      salt: Buffer.from(parts[1], "hex"),
+      hash: Buffer.from(parts[2], "hex"),
+    };
+  }
+  if (parts.length === 4) {
+    const cost: ScryptCost = { ...DEFAULT_SCRYPT_COST };
+    for (const p of parts[1].split(",")) {
+      const [k, v] = p.split("=");
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      if (k === "N") cost.N = n;
+      else if (k === "r") cost.r = n;
+      else if (k === "p") cost.p = n;
+    }
+    return {
+      versioned: true,
+      cost,
+      salt: Buffer.from(parts[2], "hex"),
+      hash: Buffer.from(parts[3], "hex"),
+    };
+  }
+  return null;
 }
 
 /** Verify a password against a stored scrypt hash; async and constant-time. */
 async function verifyPassword(password: string, stored: string): Promise<boolean> {
-  const parts = stored.split("$");
-  if (parts.length !== 3 || parts[0] !== SCHEME) return false;
-  const expected = Buffer.from(parts[2], "hex");
+  const parsed = parseScryptHash(stored);
+  if (!parsed) return false;
   const actual = await withScryptSlot(() =>
-    scryptAsync(password, Buffer.from(parts[1], "hex"), expected.length),
+    scryptAsync(password, parsed.salt, parsed.hash.length, parsed.cost),
   );
-  return actual.length === expected.length && timingSafeEqualBuf(actual, expected);
+  return actual.length === parsed.hash.length && timingSafeEqualBuf(actual, parsed.hash);
 }
 
 /** In-process cache for the parsed users file, keyed by the file's stat identity. */
@@ -160,6 +217,7 @@ interface UsersCache {
   mtimeNs: bigint;
   size: bigint;
   users: StoredUser[];
+  byEmail: Map<string, StoredUser>;
 }
 
 let usersCache: UsersCache | null = null;
@@ -205,13 +263,22 @@ function loadUsers(): StoredUser[] {
     }
     const data = JSON.parse(fs.readFileSync(USER_FILE, "utf-8")) as UserFile;
     const users = Array.isArray(data.users) ? data.users : [];
-    usersCache = { file: USER_FILE, mtimeNs: stat.mtimeNs, size: stat.size, users };
+    const byEmail = new Map<string, StoredUser>();
+    for (const u of users) {
+      byEmail.set(u.email, u);
+    }
+    usersCache = { file: USER_FILE, mtimeNs: stat.mtimeNs, size: stat.size, users, byEmail };
     return users;
   } catch {
     // Missing or corrupt file: treat as an empty store, never crash login.
     usersCache = null;
     return [];
   }
+}
+
+function findUserByEmail(email: string): StoredUser | undefined {
+  loadUsers();
+  return usersCache?.byEmail.get(email);
 }
 
 function saveUsers(users: StoredUser[]): void {
@@ -266,6 +333,60 @@ class AsyncLock {
 
 const usersLock = new AsyncLock();
 
+const LOCKFILE_STALE_MS = 5000;
+const LOCKFILE_TIMEOUT_MS = 10000;
+
+/**
+ * Acquire a cross-process lockfile next to the users file using O_EXCL ('wx').
+ * Implements stale-lock detection and automatic cleanup.
+ */
+async function withCrossProcessLock<T>(fn: () => T | Promise<T>): Promise<T> {
+  const lockfile = `${USER_FILE}.lock`;
+  fs.mkdirSync(path.dirname(lockfile), { recursive: true });
+  const start = Date.now();
+
+  while (true) {
+    try {
+      const fd = fs.openSync(lockfile, "wx");
+      try {
+        fs.writeSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+      } finally {
+        fs.closeSync(fd);
+      }
+      break;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      try {
+        const stat = fs.statSync(lockfile);
+        if (Date.now() - stat.mtimeMs > LOCKFILE_STALE_MS) {
+          try {
+            fs.unlinkSync(lockfile);
+          } catch {}
+          continue;
+        }
+      } catch {}
+
+      if (Date.now() - start > LOCKFILE_TIMEOUT_MS) {
+        throw new Error("Timeout acquiring cross-process lock for users.json");
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    try {
+      fs.unlinkSync(lockfile);
+    } catch {}
+  }
+}
+
+/** Combines in-process serialization and cross-process lockfile. */
+export async function withUsersLock<T>(fn: () => T | Promise<T>): Promise<T> {
+  return usersLock.acquire(() => withCrossProcessLock(fn));
+}
+
 /**
  * Create a local password user; fires no network calls.
  *
@@ -289,7 +410,7 @@ export async function signupLocalUser(email: unknown, password: unknown): Promis
   }
   // Fast path for the obvious duplicate; the check inside the lock below is
   // the authoritative one.
-  if (loadUsers().some((u) => u.email === normalized)) {
+  if (localUserExists(normalized)) {
     return { ok: false, error: "exists" };
   }
   let hashed: string;
@@ -299,7 +420,7 @@ export async function signupLocalUser(email: unknown, password: unknown): Promis
     if (isScryptBusyError(err)) return { ok: false, error: "busy" };
     throw err;
   }
-  return usersLock.acquire((): SignupResult => {
+  return withUsersLock((): SignupResult => {
     // Re-read inside the critical section: a concurrent signup may have
     // persisted between this call's first load and the hash finishing.
     const users = loadUsers();
@@ -341,15 +462,45 @@ export function listLocalUserIds(): string[] {
 /** True when a local account exists for `email`. */
 export function localUserExists(email: unknown): boolean {
   const normalized = normalizeEmail(email);
-  return Boolean(normalized) && loadUsers().some((u) => u.email === normalized);
+  return Boolean(normalized) && Boolean(findUserByEmail(normalized));
 }
 
-/** Verify a local password; returns the user on success, null otherwise. */
+/**
+ * Upgrade a user's stored password hash to the latest versioned scrypt format
+ * if it was using a legacy format or different parameters. Best-effort and non-blocking.
+ */
+async function upgradeHashIfNeeded(email: string, password: string, storedHash: string): Promise<void> {
+  const parsed = parseScryptHash(storedHash);
+  if (
+    parsed &&
+    parsed.versioned &&
+    parsed.cost.N === DEFAULT_SCRYPT_COST.N &&
+    parsed.cost.r === DEFAULT_SCRYPT_COST.r &&
+    parsed.cost.p === DEFAULT_SCRYPT_COST.p
+  ) {
+    return;
+  }
+  try {
+    const upgraded = await hashPassword(password);
+    await withUsersLock(() => {
+      const users = loadUsers();
+      const idx = users.findIndex((u) => u.email === email);
+      if (idx >= 0) {
+        const next = [...users];
+        next[idx] = { ...next[idx], password: upgraded };
+        saveUsers(next);
+      }
+    });
+  } catch {
+    // Non-fatal: login already succeeded
+  }
+}
+
+/** Verify a local password; returns the user on success, null otherwise. Transparently upgrades hash if needed. */
 export async function verifyLocalUser(email: unknown, password: unknown): Promise<LocalUser | null> {
   const normalized = normalizeEmail(email);
   if (!normalized || typeof password !== "string" || !password) return null;
-  const users = loadUsers();
-  const user = users.find((u) => u.email === normalized);
+  const user = findUserByEmail(normalized);
   if (!user) {
     // Burn the same scrypt cost as a real verification against a fixed dummy
     // hash, so an unknown email is indistinguishable from a wrong password by
@@ -358,33 +509,33 @@ export async function verifyLocalUser(email: unknown, password: unknown): Promis
     return null;
   }
   if (!(await verifyPassword(password, user.password))) return null;
+
+  void upgradeHashIfNeeded(normalized, password, user.password).catch(() => {});
+
   return { uid: localUserIdForEmail(normalized), email: normalized };
 }
 
 /**
- * Current session epoch (Unix milliseconds) for a local account — 0 when the
- * account has never revoked sessions. Sessions issued before this time are
- * invalid. Unknown or invalid emails report 0 (nothing revoked).
+ * Current session epoch counter for a local account — 0 when the account has
+ * never revoked sessions. Each revocation increments this counter monotonically.
  */
 export function getSessionEpoch(email: unknown): number {
   const normalized = normalizeEmail(email);
   if (!normalized) return 0;
-  const user = loadUsers().find((u) => u.email === normalized);
+  const user = findUserByEmail(normalized);
   return user?.sessionEpoch ?? 0;
 }
 
 /**
  * Revoke every existing session for a local account by raising its session
- * epoch to now (Unix milliseconds — see StoredUser.sessionEpoch). Returns
- * true when the account exists and was updated; false for an unknown
- * account or a write failure. Serialized through the users lock and
- * re-read inside it, so two concurrent revocations cannot drop each
- * other's update.
+ * epoch to now (Unix milliseconds). Returns true when the account exists and
+ * was updated; false for an unknown account or a write failure. Serialized through
+ * the cross-process lock.
  */
 export async function bumpSessionEpoch(email: unknown): Promise<boolean> {
   const normalized = normalizeEmail(email);
   if (!normalized) return false;
-  return usersLock.acquire((): boolean => {
+  return withUsersLock((): boolean => {
     const users = loadUsers();
     const idx = users.findIndex((u) => u.email === normalized);
     if (idx < 0) return false;

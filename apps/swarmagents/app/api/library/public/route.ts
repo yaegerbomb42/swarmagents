@@ -12,7 +12,14 @@
 import { NextResponse } from "next/server";
 import { isLibraryAdmin } from "../../../../lib/library/admin";
 import { errorResponse, libraryOwner, NO_STORE, readJson, unauthorized } from "../../../../lib/library/http";
-import { publishItem, listPublicItems, publicItemDetail, attachProofToCurrentVersion } from "../../../../lib/library/public-store";
+import {
+  publishItem,
+  listPublicItems,
+  publicItemDetail,
+  attachProofToCurrentVersion,
+  clampPublicListLimit,
+  clampPublicListOffset,
+} from "../../../../lib/library/public-store";
 import { consumePublishRate, publishLimitPerHour } from "../../../../lib/library/rate";
 import { resolvePublishInput } from "../../../../lib/library/publish";
 import { isLibraryKind } from "../../../../lib/library/types";
@@ -31,20 +38,27 @@ export async function GET(request: Request) {
     sortRaw === "newest" || sortRaw === "updated" || sortRaw === "name" || sortRaw === "installs"
       ? sortRaw
       : "installs";
-  const limitRaw = Number(url.searchParams.get("limit") ?? "50");
-  const offsetRaw = Number(url.searchParams.get("offset") ?? "0");
+  // Clamp before the store so negative / huge query params cannot blow pages.
+  const limit = clampPublicListLimit(url.searchParams.get("limit") ?? "50");
+  const offset = clampPublicListOffset(url.searchParams.get("offset") ?? "0");
+  const admin = isLibraryAdmin(viewer);
+  // Unpublished visibility matches GET /api/library/public/[id]: the
+  // publisher (and admins) see their own unpublished items; everyone else
+  // does not.
   const { items, total } = listPublicItems({
     query: url.searchParams.get("q") ?? "",
     kind,
     sort,
-    limit: Number.isFinite(limitRaw) ? limitRaw : 50,
-    offset: Number.isFinite(offsetRaw) ? offsetRaw : 0,
+    limit,
+    offset,
+    viewerId: viewer,
+    admin,
   });
   return NextResponse.json(
     {
       items,
       total,
-      canModerate: isLibraryAdmin(viewer),
+      canModerate: admin,
       publishLimitPerHour: publishLimitPerHour(),
     },
     { headers: NO_STORE },

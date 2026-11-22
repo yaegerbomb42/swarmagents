@@ -3,7 +3,9 @@
  *
  * Query parameters:
  *   - `limit`  : max rows returned (default 200, max 1000)
- *   - `before` : unix ms timestamp cursor (returns entries strictly older than `before`)
+ *   - `before` : composite cursor "<ms>:<offset>" (returns entries strictly
+ *                older than that position); a bare "<ms>" is accepted for
+ *                legacy clients and means offset 0
  *   - `action` : exact action (e.g. `login.success`) or prefix ending in `*` / `.` (e.g. `provider.`)
  *   - `result` : `success` | `failure`
  *   - `format` : `json` (default) | `ndjson` (downloadable audit export)
@@ -14,15 +16,22 @@
  * `before` cursor and `nextCursor` convert through `Date.parse` — entries
  * whose ts does not parse are treated as unfilterable (kept, never dropped
  * by the cursor) and never produce a cursor.
+ *
+ * The cursor is composite ("<ms>:<offset>") because several entries can
+ * share one millisecond: the offset says how many entries with that exact
+ * ms were already returned, so paging across a same-millisecond boundary
+ * neither drops nor repeats an event.
  */
 
 import { NextResponse, type NextRequest } from "next/server";
 import { NO_STORE, routeCaller, unauthorizedResponse } from "../../../lib/auth";
 import {
-  readAuditEntries,
+  readAuditPage,
+  parseAuditCursor,
+  auditEntryTsMs,
   DEFAULT_AUDIT_LIMIT,
   MAX_AUDIT_LIMIT,
-  auditEntryTsMs,
+  type AuditCursor,
   type AuditEntry,
   type AuditResult,
 } from "../../../lib/audit";
@@ -54,16 +63,15 @@ export async function GET(req: NextRequest) {
   }
 
   const rawBefore = params.get("before");
-  let beforeTs: number | null = null;
+  let before: AuditCursor | null = null;
   if (rawBefore !== null) {
-    const parsed = Number(rawBefore);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
+    before = parseAuditCursor(rawBefore);
+    if (!before) {
       return NextResponse.json(
-        { error: "before must be a positive timestamp in milliseconds." },
+        { error: "before must be a positive timestamp in milliseconds, optionally with :offset." },
         { status: 400, headers: NO_STORE },
       );
     }
-    beforeTs = Math.floor(parsed);
   }
 
   const actionFilter = params.get("action")?.trim() ?? "";
@@ -89,40 +97,40 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  // Read at most `limit + 1` matching entries, applying all filters inside the
-  // store so a match older than any fixed truncation window remains reachable.
-  let matches: AuditEntry[] = readAuditEntries(user, {
-    limit: limit + 1,
-    beforeTs,
-    action: actionFilter,
+  // Predicates are pushed into the read path: the reader streams newest to
+  // oldest and stops once limit+1 matches are collected, so filtering no
+  // longer caps out at the 1,000 newest rows and the request never loads
+  // the whole file.
+  const page = readAuditPage(user, {
+    limit,
+    before: before ?? undefined,
+    action: actionFilter || undefined,
     result: resultOption,
   });
+  const filtered: AuditEntry[] = [...page.entries];
+  let nextCursor = page.nextCursor;
 
-  // A page never splits a run of entries sharing one timestamp: resuming at a
-  // timestamp cursor would otherwise skip the rest of that same-ms group. Grow
-  // the fetch until the boundary is clean or the log is exhausted.
-  let want = limit + 1;
-  while (
-    want < MAX_AUDIT_LIMIT &&
-    matches.length > limit &&
-    auditEntryTsMs(matches[limit]) === auditEntryTsMs(matches[limit - 1])
-  ) {
-    want = matches.length + 1;
-    const more = readAuditEntries(user, { limit: want, beforeTs, action: actionFilter, result: resultOption });
-    if (more.length === matches.length) break;
-    matches = more;
-  }
-
-  let end = Math.min(limit, matches.length);
-  while (end < matches.length && auditEntryTsMs(matches[end]) === auditEntryTsMs(matches[end - 1])) {
-    end += 1;
-  }
-  const filtered = matches.slice(0, end);
-
-  let nextCursor: number | null = null;
-  if (filtered.length > 0 && matches.length > end) {
-    const lastMs = auditEntryTsMs(filtered[filtered.length - 1]);
-    nextCursor = Number.isNaN(lastMs) ? null : lastMs;
+  // A page never splits a run of entries sharing one timestamp: resuming at
+  // a composite cursor would stay exact, but clients that treat one page as
+  // one same-ms group (main's #104 contract) must still see the whole group
+  // together. Grow the fetch while the next page starts in the same
+  // millisecond, capped like the old whole-file path.
+  while (nextCursor && filtered.length < MAX_AUDIT_LIMIT) {
+    const cursor = parseAuditCursor(nextCursor);
+    if (!cursor) break;
+    const following = readAuditPage(user, {
+      limit,
+      before: cursor,
+      action: actionFilter || undefined,
+      result: resultOption,
+    });
+    if (following.entries.length === 0) {
+      nextCursor = following.nextCursor;
+      break;
+    }
+    if (auditEntryTsMs(following.entries[0]) !== auditEntryTsMs(filtered[filtered.length - 1])) break;
+    filtered.push(...following.entries);
+    nextCursor = following.nextCursor;
   }
 
   if (format === "ndjson") {

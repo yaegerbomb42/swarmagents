@@ -15,8 +15,8 @@ test("view filter relays framebuffer requests and drops key/pointer/cuttext mess
   const fburOut = filter.push(fbur);
   assert.ok(fburOut.equals(fbur), "FramebufferUpdateRequest relayed");
 
-  // …a KeyEvent (type 4, 6 bytes total) is dropped…
-  const key = Buffer.from([4, 0, 0, 0, 85, 0]);
+  // …a KeyEvent (type 4, 8 bytes: down-flag, 2 pad, keysym u32) is dropped…
+  const key = Buffer.from([4, 0, 0, 0, 0, 0, 0, 85]); // key up, keysym 'U'
   assert.equal(filter.push(key).length, 0, "KeyEvent dropped");
 
   // …a PointerEvent (type 5, 6 bytes) is dropped…
@@ -33,13 +33,14 @@ test("view filter relays framebuffer requests and drops key/pointer/cuttext mess
 test("view filter handles messages split across chunk boundaries", () => {
   const filter = new RfbInputFilter("view");
 
-  const key = Buffer.from([4, 0, 0, 0, 85, 0]);
+  const key = Buffer.from([4, 0, 0, 0, 0, 0, 0, 85]); // key up, keysym 'U'
   // Feed byte-by-byte: nothing should be emitted until the message is complete,
   // and the complete message must be dropped.
   for (let i = 0; i < key.length - 1; i++) {
     assert.equal(filter.push(key.subarray(i, i + 1)).length, 0);
   }
   assert.equal(filter.push(key.subarray(key.length - 1)).length, 0);
+  assert.equal(filter.dropped, 1, "the full 8-byte KeyEvent was dropped exactly once");
 
   const fbur = Buffer.from([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
   const half = fbur.subarray(0, 6);
@@ -64,7 +65,7 @@ test("view filter passes SetPixelFormat and SetEncodings", () => {
 test("multiple messages in one chunk are each framed", () => {
   const filter = new RfbInputFilter("view");
   const fbur = Buffer.from([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-  const key = Buffer.from([4, 0, 0, 0, 85, 0]);
+  const key = Buffer.from([4, 0, 0, 0, 0, 0, 0, 85]); // key up, keysym 'U'
   const out = filter.push(Buffer.concat([fbur, key, fbur]));
   assert.ok(out.equals(Buffer.concat([fbur, fbur])), "key dropped, both FBURs relayed");
   assert.equal(filter.dropped, 1);
@@ -74,7 +75,7 @@ test("control mode relays everything untouched", () => {
   const filter = new RfbInputFilter("control");
   const blob = Buffer.concat([
     Buffer.from([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-    Buffer.from([4, 0, 0, 0, 85, 0]),
+    Buffer.from([4, 0, 0, 0, 0, 0, 0, 85]), // key up, keysym 'U'
   ]);
   assert.ok(filter.push(blob).equals(blob), "control stream relayed verbatim");
 });
@@ -88,7 +89,7 @@ test("view filter throws on unknown message types instead of falling back to pas
 
 test("view filter throws when [99] is followed by a KeyEvent (no input smuggling)", () => {
   const filter = new RfbInputFilter("view");
-  const key = Buffer.from([4, 0, 0, 0, 85, 0]);
+  const key = Buffer.from([4, 0, 0, 0, 0, 0, 0, 85]); // key up, keysym 'U'
   assert.throws(
     () => filter.push(Buffer.concat([Buffer.from([99, 0, 0, 0]), key])),
     RfbProtocolError,
@@ -121,7 +122,7 @@ test("view filter keeps enforcing after ClientFence / EnableContinuousUpdates (n
   const filter = new RfbInputFilter("view");
   const fence = Buffer.from([248, 0, 0, 0, 0, 0, 0, 1, 3, 9, 9, 9]);
   const ecu = Buffer.from([150, 1, 0, 0, 0, 0, 6, 64, 3, 132]);
-  const key = Buffer.from([4, 1, 0, 0, 0, 65]);
+  const key = Buffer.from([4, 1, 0, 0, 0, 0, 0, 65]); // key down, keysym 'A'
   const out = filter.push(Buffer.concat([fence, ecu, key]));
   assert.ok(out.equals(Buffer.concat([fence, ecu])), "fence and ECU relayed, key dropped");
   assert.equal(filter.dropped, 1);
@@ -224,4 +225,36 @@ test("framed messages get monotonic sequence numbers through push", () => {
   assert.equal(filter.lastSeq, 0);
   filter.push(Buffer.concat([fbur, fbur]));
   assert.equal(filter.lastSeq, 2);
+});
+
+test("view filter frames a real 8-byte KeyEvent at the right offset (regression)", () => {
+  // RFC 6143 §7.5.4: KeyEvent is 8 bytes on the wire (type, down-flag,
+  // 2 padding, keysym u32). Framing it as 6 bytes leaves the last 2 keysym
+  // bytes to be mis-read as the next message's type.
+  const filter = new RfbInputFilter("view");
+  const key = Buffer.from([4, 1, 0, 0, 0, 0, 0, 85]); // key down, keysym 'U'
+  const fbur = Buffer.from([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  const out = filter.push(Buffer.concat([key, fbur]));
+  assert.ok(out.equals(fbur), "message after the KeyEvent framed at the right offset and relayed");
+  assert.equal(filter.dropped, 1, "KeyEvent dropped");
+  assert.equal(filter.lastSeq, 1, "both messages framed as events");
+});
+
+test("view filter resyncs after an 8-byte KeyEvent split inside the keysym (regression)", () => {
+  const filter = new RfbInputFilter("view");
+  const key = Buffer.from([4, 1, 0, 0, 0x12, 0x34, 0x56, 0x78]); // key down, keysym 0x12345678
+  const fbur = Buffer.from([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  // Split inside the keysym: the partial input message is skipped as it
+  // streams, and the following message must still frame correctly.
+  assert.equal(filter.push(key.subarray(0, 5)).length, 0);
+  const out = filter.push(Buffer.concat([key.subarray(5), fbur]));
+  assert.ok(out.equals(fbur), "stream resynchronised after the split KeyEvent");
+  assert.equal(filter.dropped, 1, "KeyEvent dropped exactly once");
+});
+
+test("applyPolicy accepts an 8-byte KeyEvent event (regression)", () => {
+  const filter = new RfbInputFilter("view");
+  const key = Buffer.from([4, 1, 0, 0, 0, 0, 0, 85]); // key down, keysym 'U'
+  filter.applyPolicy({ type: 4, seq: 0, size: 8, payload: key });
+  assert.equal(filter.lastSeq, 0);
 });

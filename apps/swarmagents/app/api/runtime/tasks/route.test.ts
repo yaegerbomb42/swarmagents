@@ -793,3 +793,19 @@ test("POST with unknown roleId returns 400", async () => {
   assert.match(body.error ?? "", /Unknown role "nonexistent_role_123"/);
 });
 
+test("POST with maxTurns passes --max-turns to claude; invalid maxTurns is rejected", async () => {
+  const driver = new ScriptedFakeVm();
+  install(driver);
+  const res = await postTask({ prompt: "Build it", maxTurns: 25 });
+  assert.equal(res.status, 201);
+  await waitForRuns((r) => r.length === 1 && r[0].status !== "running");
+  await waitForAgentCalls(driver, 1);
+  const { cmd } = agentCalls(driver)[0];
+  const i = cmd.indexOf("--max-turns");
+  assert.notEqual(i, -1, "run should include --max-turns");
+  assert.equal(cmd[i + 1], "25");
+
+  const bad = await postTask({ prompt: "Build it", maxTurns: 0 });
+  assert.equal(bad.status, 400);
+  assert.match((await json(bad)).error ?? "", /maxTurns/);
+});

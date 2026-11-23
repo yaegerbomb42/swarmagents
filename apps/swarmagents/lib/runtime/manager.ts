@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import { vaultProxyEnv } from "../secrets/inject";
 import { revokeVaultToken } from "../secrets/token";
 import { ClaudeCodeRunner, isSignalKillExitCode } from "../harness/runner";
+import { roleMaxTurns } from "../harness/role-clamps";
 import { makeRedactor } from "../harness/redact";
 import type {
   ApprovalGateway,
@@ -26,6 +27,7 @@ import type {
   HandoffRequest,
   RolePhase,
   RunOutcome,
+  RunRequest,
   TelemetryEvent as HarnessEvent,
 } from "../harness/types";
 import {
@@ -272,6 +274,12 @@ interface QueuedRun {
   resumePoint?: ResumePoint;
   /** F1 fork: start a fresh conversation instead of resuming the last session. */
   freshSession?: boolean;
+  /**
+   * Turn ceiling for this run, passed to claude as --max-turns (capped by
+   * SWARM_MAX_TURNS in the runner). Absent means no flag — the CLI's own
+   * default applies.
+   */
+  maxTurns?: number;
   createdAt: number;
 }
 
@@ -322,6 +330,12 @@ interface ActiveRun {
   /** Provider serving the run, from the router selection. */
   provider?: string;
   model?: string;
+  /**
+   * Turn ceiling for this run, passed to claude as --max-turns (capped by
+   * SWARM_MAX_TURNS in the runner). Absent means no flag — the CLI's own
+   * default applies.
+   */
+  maxTurns?: number;
   /** The role driving this run (undefined = legacy un-role'd run). */
   role?: RoleDefinition;
   /**
@@ -402,6 +416,21 @@ function maxQueuedFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   const n = Number(raw);
   if (!Number.isSafeInteger(n) || n < 0) return DEFAULT_MAX_QUEUED;
   return n;
+}
+
+/**
+ * Wall-clock run timeout from SWARM_RUN_TIMEOUT_SEC (seconds), in ms.
+ * Unset, non-numeric, or non-positive means no timeout — a run is
+ * bounded only by its turn ceiling. The timeout bounds each harness
+ * attempt (see runOnce); the failover and shadow-gate loops around it
+ * have their own bounded budgets.
+ */
+function runTimeoutMsFromEnv(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const raw = env.SWARM_RUN_TIMEOUT_SEC?.trim();
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+  return Math.floor(seconds * 1000);
 }
 
 interface TerminalPatch {
@@ -705,13 +734,23 @@ export function buildRunnerEnv(env: NodeJS.ProcessEnv = process.env): Record<str
   return out;
 }
 
+/** Minimal runner surface runOnce needs (ClaudeCodeRunner satisfies it). */
+export interface RunnerLike {
+  run(request: RunRequest, onEvent: (event: HarnessEvent) => void): Promise<RunOutcome>;
+}
+
 export class RuntimeManager {
   private readonly vm: VmManager;
   private readonly bus: TelemetryBus;
   private readonly reporter: RunReporter;
   /** Reads and builds codebase maps inside the user's own VM. */
   private readonly codebaseScanner: CodebaseScanner;
-  private readonly runner = new ClaudeCodeRunner();
+  /**
+   * Minimal runner surface runOnce needs. Test hook: inject a fake runner
+   * (one that never resolves lets the wall-clock timeout test run fast
+   * under fake timers); production uses a real ClaudeCodeRunner.
+   */
+  private readonly runner: RunnerLike;
   private readonly users = new Map<string, UserState>();
   /**
    * Test override for the provider router Claude Code is pointed at. When
@@ -759,6 +798,8 @@ export class RuntimeManager {
     reporter?: RunReporter;
     /** Test hook: inject the codebase scanner (default: the user's VM). */
     codebaseScanner?: CodebaseScanner;
+    /** Test hook: inject the harness runner (default: a real ClaudeCodeRunner). */
+    runner?: RunnerLike;
     /**
      * Durable active+queue snapshot. Omitted/null keeps this manager
      * memory-only (tests); the process-wide singleton passes the real store.
@@ -769,6 +810,7 @@ export class RuntimeManager {
     this.bus = opts.bus ?? telemetryBus;
     this.reporter = opts.reporter ?? new RunReporter({ vm: this.vm, bus: this.bus });
     this.codebaseScanner = opts.codebaseScanner ?? createVmScanner(this.vm);
+    this.runner = opts.runner ?? new ClaudeCodeRunner();
     this.routerOverride = opts.router === undefined ? undefined : opts.router;
     this.maxQueuedOverride = opts.maxQueued;
     this.startGraceMs = opts.startGraceMs ?? DEFAULT_START_GRACE_MS;
@@ -1467,6 +1509,12 @@ export class RuntimeManager {
        * would hand the agent history that contradicts the restored state.
        */
       freshSession?: boolean;
+      /**
+       * Turn ceiling for this run, passed to claude as --max-turns (capped
+       * by SWARM_MAX_TURNS in the runner). When absent the starting role's
+       * own ceiling applies, if it has one; otherwise no flag is passed.
+       */
+      maxTurns?: number;
     },
   ): StartResult {
     const configurationError = localDockerApprovalConfigurationError(this.vm);
@@ -1530,6 +1578,16 @@ export class RuntimeManager {
     // catalog). Nothing downstream can widen it except a user approval.
     const rolePolicy = this.rolePolicyFor(userId, role, input.grantedRoleIds);
 
+    // Turn ceiling: an explicit request wins; otherwise the starting
+    // role's own ceiling applies (its prompt hint becomes a hard CLI
+    // limit). A non-positive/non-integer request is ignored, not clamped
+    // — the runner enforces the SWARM_MAX_TURNS cap either way.
+    const requestedMaxTurns =
+      typeof input.maxTurns === "number" && Number.isSafeInteger(input.maxTurns) && input.maxTurns > 0
+        ? input.maxTurns
+        : undefined;
+    const maxTurns = requestedMaxTurns ?? roleMaxTurns(role);
+
     if (st.active) {
       const limit = this.maxQueued();
       if (st.queue.length >= limit) {
@@ -1554,6 +1612,7 @@ export class RuntimeManager {
         seedSnapshotLabel: input.seedSnapshotLabel,
         forkedFrom: input.forkedFrom,
         freshSession: input.freshSession,
+        maxTurns,
         createdAt: Date.now(),
       };
       st.queue.push(queued);
@@ -1610,6 +1669,7 @@ export class RuntimeManager {
       ambientRuleId: input.ambientRuleId,
       seedSnapshotLabel: input.seedSnapshotLabel,
       forkedFrom: input.forkedFrom,
+      maxTurns,
     };
     st.active = active;
 
@@ -1724,6 +1784,7 @@ export class RuntimeManager {
       seedSnapshotLabel: next.seedSnapshotLabel,
       forkedFrom: next.forkedFrom,
       resumePoint: next.resumePoint,
+      maxTurns: next.maxTurns,
     };
     st.active = active;
     this.persistState();
@@ -2957,6 +3018,22 @@ export class RuntimeManager {
     // the account's settings (absent = off = byte-identical prompt).
     const systemPacker = systemPackerOptionsFor(readUserSettings(userId));
 
+    // Wall-clock timeout (SWARM_RUN_TIMEOUT_SEC): aborting the controller
+    // ends the attempt the same way a user cancel does, so the timer is
+    // armed here and cleared in the finally below — a finished run never
+    // trips it, and a timed-out run is rewritten as an error afterwards.
+    const timeoutMs = runTimeoutMsFromEnv();
+    const timeoutMessage =
+      timeoutMs !== undefined ? `Run timeout: exceeded SWARM_RUN_TIMEOUT_SEC (${timeoutMs / 1000}s)` : undefined;
+    let timedOut = false;
+    const timeoutTimer =
+      timeoutMs !== undefined
+        ? setTimeout(() => {
+            timedOut = true;
+            active.controller.abort();
+          }, timeoutMs)
+        : undefined;
+
     try {
       const outcome = await this.runner.run(
         {
@@ -2968,6 +3045,7 @@ export class RuntimeManager {
           systemPacker,
           sessionId: active.sessionId,
           model: active.model,
+          maxTurns: active.maxTurns,
           provider: selection?.provider,
           env,
           // Stable per-run pgid marker: the cancel backstop kills exactly
@@ -3046,12 +3124,29 @@ export class RuntimeManager {
         },
         onAttemptEvent,
       );
+      // Wall-clock timeout: the abort above ends the run like a cancel,
+      // but a timeout is an error, not a cancellation — rewrite the
+      // outcome so the caller finalizes it as run.error 'timeout'
+      // instead of returning early on outcome.aborted. The runner's own
+      // "Run aborted by caller." event is replaced, never published.
+      if (timedOut) {
+        attemptError = {
+          type: "run.error",
+          message: timeoutMessage ?? "Run timeout: exceeded SWARM_RUN_TIMEOUT_SEC",
+        };
+        return { outcome: { ...outcome, aborted: false }, attemptError, finishEvent };
+      }
       return { outcome, attemptError, finishEvent };
     } catch (error) {
       // The runner surfaced a non-run failure (e.g. exec driver error). Treat
       // it as a run error so the caller's terminal handling applies uniformly.
+      // A timeout that surfaced as a throw (driver rejecting on abort) is
+      // still a timeout, not the driver's abort message.
       const redact = makeRedactor({ ...process.env } as Record<string, string>);
-      const message = redact(error instanceof Error ? error.message : String(error));
+      const message =
+        timedOut && timeoutMessage
+          ? timeoutMessage
+          : redact(error instanceof Error ? error.message : String(error));
       const synthetic: Extract<HarnessEvent, { type: "run.error" }> = {
         type: "run.error",
         message,
@@ -3061,6 +3156,7 @@ export class RuntimeManager {
       }
       return { outcome: { exitCode: -1, aborted: false, malformedLines: 0 }, attemptError: synthetic, finishEvent };
     } finally {
+      if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
       memoryBridge.stop();
     }
   }

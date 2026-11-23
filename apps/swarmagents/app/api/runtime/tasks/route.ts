@@ -1,7 +1,7 @@
 /**
  * Runtime tasks control plane.
  *
- * POST  {prompt, sessionId?}        -> starts or queues a run -> {runId, queued, position?}
+ * POST  {prompt, sessionId?}        -> starts or queues a run -> {runId, queued, position?, capacity?}
  * POST  {action:"wipe_vm"}          -> resets the user's VM
  * POST  {action:"new_thread"}       -> cancels active/queued runs and clears the persisted session
  * GET                               -> {runs: RunSummary[]} for the caller
@@ -228,7 +228,14 @@ export async function POST(req: NextRequest) {
   }
   if (result.queued) {
     return NextResponse.json(
-      { runId: result.runId, queued: true, position: result.position },
+      {
+        runId: result.runId,
+        queued: true,
+        position: result.position,
+        // Present when the run is waiting for a global VM slot
+        // (SWARM_MAX_CONCURRENT_VMS) rather than for the caller's own run.
+        ...(result.capacity ? { capacity: result.capacity } : {}),
+      },
       { status: 202 },
     );
   }

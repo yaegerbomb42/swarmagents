@@ -894,6 +894,8 @@ test("isBackgroundedCommand flags detached work and ignores foreground commands"
     "cmd 2>&1 | tee out.log",
     "cmd &> out.log",
     "echo hello && echo world",
+    'curl "https://example.com/api?a=1&b=2"',
+    'echo "foo & bar"',
     "git push",
     "",
     "   ",
@@ -901,6 +903,13 @@ test("isBackgroundedCommand flags detached work and ignores foreground commands"
   for (const command of foreground) {
     assert.ok(!isBackgroundedCommand(command), `expected foreground: ${command}`);
   }
+});
+
+test("isBackgroundedCommand ignores & inside quotes and URL query strings", () => {
+  assert.ok(!isBackgroundedCommand('curl "https://example.com/api?a=1&b=2"'));
+  assert.ok(!isBackgroundedCommand("echo 'foo & bar'"));
+  assert.ok(!isBackgroundedCommand('echo "foo & bar"'));
+  assert.ok(isBackgroundedCommand("sleep 1 &"));
 });
 
 test("emits tool.backgrounded for a detached Bash loop (the count-to-200 QA case)", async () => {

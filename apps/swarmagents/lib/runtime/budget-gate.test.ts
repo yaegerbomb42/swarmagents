@@ -9,6 +9,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+
+// The production watchdogs are intentionally unref'ed so they do not keep a
+// server alive on their own. Keep the test process alive while each test is
+// awaiting one; otherwise node:test cancels the pending promise on idle.
+let keepAlive: ReturnType<typeof setInterval>;
+test.beforeEach(() => { keepAlive = setInterval(() => {}, 60_000); });
+test.afterEach(() => clearInterval(keepAlive));
+
 import { BudgetGate, setBudgetGateForTesting, getBudgetGate } from "./budget-gate";
 
 test("the ledger tracks a run's spend and its expected next call", () => {

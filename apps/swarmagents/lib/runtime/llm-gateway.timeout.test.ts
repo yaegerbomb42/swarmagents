@@ -15,6 +15,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+
+// The production watchdogs are intentionally unref'ed so they do not keep a
+// server alive on their own. Keep the test process alive while each test is
+// awaiting one; otherwise node:test cancels the pending promise on idle.
+let keepAlive: ReturnType<typeof setInterval>;
+test.beforeEach(() => { keepAlive = setInterval(() => {}, 60_000); });
+test.afterEach(() => clearInterval(keepAlive));
+
 import { forwardLlmNonStreaming, forwardLlmStreaming } from "./llm-gateway";
 import type { ProviderConfig } from "../providers/types";
 import { configureProviderStorePaths } from "../providers/store";

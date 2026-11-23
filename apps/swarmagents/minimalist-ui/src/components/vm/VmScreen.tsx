@@ -444,6 +444,7 @@ export function VmScreen({
               changedPath={effectivePresence.wroteFile}
               changedAt={effectivePresence.changedAt}
               presence={effectivePresence}
+              live={liveRun}
             />
           </div>
         )}

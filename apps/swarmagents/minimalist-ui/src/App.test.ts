@@ -17,10 +17,10 @@ async function renderApp(options: BrowserStubOptions = {}): Promise<string> {
 
 const ALWAYS_IN_REACH = ["workspace-header", "open-history", "new-chat", "open-settings", "open-shortcuts", "composer-input", "composer-send"];
 
-test("the workspace opens on the chat: one header, one view switch, one composer", async () => {
+test("the workspace opens on the computer beneath one composer", async () => {
   const html = await renderApp();
 
-  assert.match(tagOf(html, "minimal-main-page"), /data-view="chat"/);
+  assert.match(tagOf(html, "minimal-main-page"), /data-view="screen"/);
   for (const id of ALWAYS_IN_REACH) assert.equal(countOf(html, `data-testid="${id}"`), 1, id);
   for (const view of ["chat", "screen"]) {
     assert.equal(countOf(html, `data-testid="view-${view}"`), 1, `one ${view} tab`);
@@ -30,8 +30,9 @@ test("the workspace opens on the chat: one header, one view switch, one composer
   for (const view of ["chat", "screen", "board"]) {
     assert.equal(countOf(dev, `data-testid="view-${view}"`), 1, `one ${view} tab in dev mode`);
   }
-  assert.match(tagOf(html, "view-chat"), /aria-selected="true"/);
-  assert.equal(countOf(html, 'data-testid="stage"'), 0, "no stage until a view asks for one");
+  assert.match(tagOf(html, "view-screen"), /aria-selected="true"/);
+  assert.equal(countOf(html, 'data-testid="stage"'), 1);
+  assert.ok(html.indexOf('data-testid="composer-input"') < html.indexOf('data-testid="screen-frame"'));
   assert.match(tagOf(html, "composer-input"), /aria-label="Message the agent"/);
   assert.match(tagOf(html, "open-settings"), /aria-label="Settings"/);
 });
@@ -82,7 +83,7 @@ test("the approval prompt's layer is mounted in every view", async () => {
   }
 });
 
-test("the screen view puts the computer on stage, with its status, beside the chat", async () => {
+test("the screen view puts the computer below the composer with its status", async () => {
   for (const wide of [false, true]) {
     const html = await renderApp({ local: { "sa.view": "screen" }, wide });
 
@@ -91,22 +92,19 @@ test("the screen view puts the computer on stage, with its status, beside the ch
     for (const id of ["stage", "screen-frame", "screen-toolbar", "screen-status-pill", "screen-stage"]) {
       assert.equal(countOf(html, `data-testid="${id}"`), 1, `${id} (wide: ${wide})`);
     }
-    assert.doesNotMatch(tagOf(html, "chat-column"), /hidden=""/, "the chat stays with the screen");
+    assert.equal(countOf(html, 'data-testid="workspace-activity"'), 1);
     for (const id of ALWAYS_IN_REACH) assert.equal(countOf(html, `data-testid="${id}"`), 1, id);
   }
 });
 
-test("the board is part of the same workspace: beside the chat when wide, the whole view on a phone", async () => {
-  const wide = await renderApp({ local: { "sa.view": "board", "sa.devMode": true }, wide: true });
-  assert.equal(countOf(wide, 'data-testid="board-panel"'), 1);
-  assert.doesNotMatch(tagOf(wide, "chat-column"), /hidden=""/);
-  assert.match(tagOf(wide, "view-board"), /aria-selected="true"/);
-
-  const phone = await renderApp({ local: { "sa.view": "board", "sa.devMode": true }, wide: false });
-  assert.equal(countOf(phone, 'data-testid="board-panel"'), 1);
-  assert.match(tagOf(phone, "chat-column"), /hidden=""/, "kept mounted so the draft survives, but out of view");
-  for (const view of ["chat", "screen", "board"]) {
-    assert.equal(countOf(phone, `data-testid="view-${view}"`), 1, `the way back to ${view} is still there`);
+test("board and chat keep the composer and computer mounted at every width", async () => {
+  for (const wide of [false, true]) {
+    for (const view of ["chat", "board"]) {
+      const html = await renderApp({ local: { "sa.view": view, "sa.devMode": true }, wide });
+      assert.equal(countOf(html, 'data-testid="screen-frame"'), 1);
+      assert.equal(countOf(html, 'data-testid="composer-input"'), 1);
+      assert.match(tagOf(html, `view-${view}`), /aria-selected="true"/);
+    }
   }
 });
 
@@ -128,73 +126,14 @@ test("nothing in the shell is a placeholder", async () => {
   }
 });
 
-test("the split view has a drag handle between the chat and the stage", async () => {
-  const html = await renderApp({ local: { "sa.view": "screen" }, wide: true });
-  assert.equal(countOf(html, 'data-testid="split-handle"'), 1, "one handle in split view");
-  const handle = tagOf(html, "split-handle");
-  assert.match(handle, /role="separator"/);
-  assert.match(handle, /aria-orientation="vertical"/);
-  assert.match(handle, /aria-valuenow="38"/, "the default ratio");
-  assert.match(handle, /\bhidden\b/, "hidden below the wide breakpoint");
-  assert.match(handle, /\blg:flex\b/, "shown at the wide breakpoint");
-});
-
-test("the split view sizes the chat from the persisted ratio, with a 480px floor", async () => {
-  const html = await renderApp({ local: { "sa.view": "screen" }, wide: true });
-  assert.match(
-    tagOf(html, "chat-column"),
-    /width:clamp\(480px, 38\.0%, calc\(100% - 492px\)\)/,
-    "the default ratio drives the chat width",
-  );
-
-  const half = await renderApp({ local: { "sa.view": "board", "sa.devMode": true, "sa.splitRatio": 0.5 }, wide: true });
-  assert.equal(countOf(half, 'data-testid="split-handle"'), 1, "the handle is there for the board too");
-  assert.match(tagOf(half, "chat-column"), /width:clamp\(480px, 50\.0%, calc\(100% - 492px\)\)/);
-  assert.match(tagOf(half, "split-handle"), /aria-valuenow="50"/, "the persisted ratio survives a reload");
-});
-
-test("an out-of-range persisted ratio is clamped, never trusted", async () => {
-  const tooWide = await renderApp({ local: { "sa.view": "screen", "sa.splitRatio": 0.99 }, wide: true });
-  assert.match(tagOf(tooWide, "chat-column"), /width:clamp\(480px, 80\.0%, calc\(100% - 492px\)\)/);
-  assert.match(tagOf(tooWide, "split-handle"), /aria-valuenow="80"/);
-
-  const junk = await renderApp({ local: { "sa.view": "screen", "sa.splitRatio": "junk" }, wide: true });
-  assert.match(tagOf(junk, "chat-column"), /width:clamp\(480px, 38\.0%, calc\(100% - 492px\)\)/, "junk falls back to the default");
-});
-
-test("no split handle when the chat is alone, or on a narrow screen", async () => {
-  const chatOnly = await renderApp({ local: { "sa.view": "chat" }, wide: true });
-  assert.equal(countOf(chatOnly, 'data-testid="split-handle"'), 0, "no stage, no handle");
-  assert.doesNotMatch(tagOf(chatOnly, "chat-column"), /width:clamp/, "the chat takes the full row");
-
-  const phone = await renderApp({ local: { "sa.view": "screen" }, wide: false });
-  assert.equal(countOf(phone, 'data-testid="split-handle"'), 0, "a phone stays a single pane");
-  assert.doesNotMatch(tagOf(phone, "chat-column"), /width:clamp/, "no fixed width on a phone");
-});
-
-test("under 900px the console is one column: chat full-width, stage full-width, composer reachable", async () => {
-  const html = await renderApp({ local: { "sa.view": "screen" }, wide: false });
-
-  // The workspace commits to a single column below the 900px breakpoint.
-  assert.equal(tagOf(html, "workspace-main").includes('data-layout="one-column"'), true, "one-column layout below 900px");
-  assert.match(tagOf(html, "workspace-main"), /overflow-y-auto/, "the single column scrolls so the composer stays reachable");
-
-  // Both chat and stage render full-width, stacked (no split handle, no fixed widths).
-  assert.equal(countOf(html, 'data-testid="split-handle"'), 0, "no split handle below 900px");
-  assert.doesNotMatch(tagOf(html, "chat-column"), /width:clamp/, "chat spans the full column width");
-  assert.match(tagOf(html, "chat-column"), /\bflex-col\b/, "chat is its own column");
-  assert.doesNotMatch(tagOf(html, "chat-column"), /\bhidden=""/, "chat stays mounted beside the stage");
-
-  // The composer is always rendered, so it is reachable in the scrollable column.
-  assert.equal(countOf(html, 'data-testid="composer-input"'), 1, "the composer is mounted");
-  assert.equal(countOf(html, 'data-testid="composer-send"'), 1, "the send button is mounted");
-});
-
-test("at 900px and up the console returns to the wide split layout", async () => {
-  const html = await renderApp({ local: { "sa.view": "screen" }, wide: true });
-  assert.equal(tagOf(html, "workspace-main").includes('data-layout="wide"'), true, "wide layout at desktop width");
-  assert.doesNotMatch(tagOf(html, "workspace-main"), /data-layout="one-column"/, "not one-column on wide");
-  assert.equal(countOf(html, 'data-testid="split-handle"'), 1, "the split handle returns on wide");
+test("the composer stays above the workspace at desktop and phone widths", async () => {
+  for (const wide of [false, true]) {
+    const html = await renderApp({ local: { "sa.view": "screen" }, wide });
+    assert.match(tagOf(html, "workspace-main"), /overflow-hidden/);
+    assert.match(tagOf(html, "stage"), /overflow-y-auto/);
+    assert.ok(html.indexOf('data-testid="composer-input"') < html.indexOf('data-testid="stage"'));
+    assert.equal(countOf(html, 'data-testid="split-handle"'), 0);
+  }
 });
 
 test("the header has a keyboard-shortcuts help button; the panel starts closed", async () => {

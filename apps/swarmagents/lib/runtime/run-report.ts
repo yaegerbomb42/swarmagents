@@ -339,6 +339,10 @@ export async function listWorkspaceFiles(
   vm: VmManager,
   userId: string,
 ): Promise<Map<string, WorkspaceEntry>> {
+  // If the VM was deliberately stopped (e.g. freed for capacity), do not
+  // resurrect it just to build the report — there is nothing to list, and
+  // re-ensuring would re-commit a VM slot and block a queued successor.
+  if (typeof vm.isVmLive === "function" && !vm.isVmLive(userId)) return new Map();
   const chunks: Buffer[] = [];
   try {
     const res = await vm.exec(
@@ -356,6 +360,7 @@ export async function listWorkspaceFiles(
       ],
       {
         timeoutMs: 30_000,
+        noResurrect: true,
         onStdout: (chunk) => chunks.push(Buffer.from(chunk)),
         onStderr: () => {},
       },
@@ -408,6 +413,11 @@ export async function hashArtifacts(
   artifacts: readonly ReportArtifact[],
   maxBytes: number = MAX_ARTIFACT_DOWNLOAD_BYTES,
 ): Promise<ReportArtifact[]> {
+  // Same policy as listWorkspaceFiles: never resurrect a stopped VM to hash
+  // artifacts — every artifact degrades to an unreadable "missing" marker.
+  if (typeof vm.isVmLive === "function" && !vm.isVmLive(userId)) {
+    return artifacts.map((artifact) => ({ ...artifact, sha256: null, status: "missing" as const }));
+  }
   return Promise.all(
     artifacts.map(async (artifact) => {
       if (artifact.size > maxBytes) {
@@ -417,7 +427,7 @@ export async function hashArtifacts(
         return { ...artifact, sha256: null, status: "missing" as const };
       }
       try {
-        const file = await vm.readFileBytes(userId, artifact.path, maxBytes);
+        const file = await vm.readFileBytes(userId, artifact.path, maxBytes, { noResurrect: true });
         if (file.truncated) {
           console.warn(
             `[run-report] skipping hash for ${artifact.rel}: file grew past the ${maxBytes} byte cap`,
@@ -536,6 +546,8 @@ export async function captureDesktopScreenshot(
   vm: VmManager,
   userId: string,
 ): Promise<CapturedShot | null> {
+  // Never resurrect a stopped VM just to capture a frame.
+  if (typeof vm.isVmLive === "function" && !vm.isVmLive(userId)) return null;
   const tmp = `/tmp/swarm-report-shot-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`;
   const chunks: Buffer[] = [];
   try {
@@ -554,6 +566,7 @@ export async function captureDesktopScreenshot(
         timeoutMs: 20_000,
         // scrot needs the desktop display; docker exec does not inherit it.
         env: { DISPLAY: DESKTOP_DISPLAY },
+        noResurrect: true,
         onStdout: (chunk) => chunks.push(Buffer.from(chunk)),
         onStderr: () => {},
       },

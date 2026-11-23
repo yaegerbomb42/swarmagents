@@ -172,6 +172,11 @@ test("cancel reaps the run's process group before the successor's harness spawns
     );
     assert.equal(manager.list(userId).find((run) => run.runId === second.runId)?.status, "running");
   } finally {
+    try {
+      manager.cancel(userId, second.runId);
+    } catch {
+      /* already finished */
+    }
     driver.releaseAll();
   }
 });
@@ -200,6 +205,11 @@ test("a wedged reap times out and the successor still starts", async () => {
     assert.ok(killIndex < successorClaudeIndex, "the reap attempt precedes the successor spawn");
     assert.equal(manager.list(userId).find((run) => run.runId === second.runId)?.status, "running");
   } finally {
+    try {
+      manager.cancel(userId, second.runId);
+    } catch {
+      /* already finished */
+    }
     driver.releaseAll();
   }
 });

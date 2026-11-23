@@ -25,8 +25,6 @@
 
 import React from "react";
 import { ArrowDown, Square } from "lucide-react";
-import { MascotSvg } from "../../../../components/mascot/MascotSvg";
-import { svgStateForRun } from "../../../../components/mascot/svg-timeline";
 import { useStickToBottom } from "../../../../lib/client/useStickToBottom";
 import type { RunStreamState } from "../../../../lib/client/useRunStream";
 import type { Presence } from "../../../../lib/client/presence";
@@ -38,15 +36,13 @@ import { StreamRow } from "./streamRows";
 export function TerminalEmptyState({
   title,
   hint,
-  mascotState = "idle",
 }: {
   title: string;
   hint: string;
-  mascotState?: "hello" | "idle" | "working" | "attention";
 }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-2 py-10 text-center">
-      <MascotSvg state={svgStateForRun(mascotState)} size={64} />
+      <img src="/brand/mark-dark.svg" alt="" width={48} height={48} />
       <div className="text-xs font-medium text-white/50">{title}</div>
       <div className="max-w-xs text-[11px] leading-relaxed text-white/30">{hint}</div>
     </div>
@@ -143,13 +139,11 @@ export function TerminalView({
                 <TerminalEmptyState
                   title="This run left no terminal events"
                   hint="The agent ran without shell output — its chat reply has what changed."
-                  mascotState="idle"
                 />
               ) : (
                 <TerminalEmptyState
-                  title="Jimmy is warming up the terminal"
+                  title="Warming up the terminal"
                   hint="Once the agent starts, its live terminal events will stream in here."
-                  mascotState="working"
                 />
               )
             ) : (
@@ -164,9 +158,8 @@ export function TerminalView({
           </>
         ) : logs.length === 0 ? (
           <TerminalEmptyState
-            title="Jimmy is ready when you are"
+            title="Ready when you are"
             hint="Run an agent or interact with the computer — terminal output will appear here."
-            mascotState="idle"
           />
         ) : (
           logs.map((log, index) => (

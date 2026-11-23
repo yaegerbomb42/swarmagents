@@ -18,7 +18,7 @@ export const ROLE_SCHEMA = "swarmagents.roles";
 export const ROLE_SCHEMA_VERSION = 2;
 export const ROLES_STORAGE_KEY = "swarmagents.roles.custom.v1";
 
-/** The default role a fresh workspace starts with (generalist Main Agent). */
+/** The default role a fresh workspace starts with (A1, the generalist). The id stays "main" for persisted selections. */
 export const DEFAULT_ROLE_ID = "main";
 
 // ---- Categories ----
@@ -220,7 +220,7 @@ export const LONG_RUNNING_WORK_TAIL =
 export const BUILTIN_ROLES: readonly RoleDefinition[] = [
   {
     id: "main",
-    name: "Main Agent",
+    name: "A1",
     description: "The generalist default: plans, codes, browses, runs checks, and switches roles when specialization helps.",
     glyph: "★",
     model: "",
@@ -229,7 +229,7 @@ export const BUILTIN_ROLES: readonly RoleDefinition[] = [
     mcpServers: ["github-mcp"],
     skills: ["terminal-exec", "file-editor", "browser-live"],
     instructions:
-      "You are the Main Agent. You are the generalist default: plan the work, code, run checks, browse when needed, and delegate when a specialist is better. You can switch roles yourself with set_role when a task calls for a specialist, and list_roles to see what is available. Never claim verification you did not perform.",
+      "You are A1. You are the generalist default: plan the work, code, run checks, browse when needed, and delegate when a specialist is better. You can switch roles yourself with set_role when a task calls for a specialist, and list_roles to see what is available. Never claim verification you did not perform.",
     category: "core",
     builtin: true,
   },
@@ -739,7 +739,7 @@ export function buildRunRolePolicy(
 /**
  * The ids an agent may switch to by default under `startingRole`: the starting
  * role plus every role whose capabilities are a subset of it. With no explicit
- * starting role (legacy callers) the catalog's Main Agent is the baseline.
+ * starting role (legacy callers) the catalog's A1 is the baseline.
  */
 export function defaultAllowedRoleIds(
   catalog: readonly RoleDefinition[],
@@ -759,7 +759,7 @@ export const DESKTOP_ROLE_MCP_SERVERS: readonly string[] = ["computer-mcp", "pla
  * servers in desktop VM mode)?
  *
  * Built-in roles get the servers when they have browser access
- * (`allowBrowser` — the Main Agent and the browser/research roles). Custom
+ * (`allowBrowser` — A1 and the browser/research roles). Custom
  * roles must opt in by listing a desktop MCP server in `mcpServers`, so the
  * harness never exceeds the user's own settings for a custom role.
  */

@@ -148,7 +148,7 @@ test("roleContinuationPrompt names both roles and the timing", () => {
   const from = BUILTIN_ROLES.find((role) => role.id === DEFAULT_ROLE_ID)!;
   const to = BUILTIN_ROLES.find((role) => role.id === "debugger")!;
   const prompt = roleContinuationPrompt(from, to);
-  assert.match(prompt, /Main Agent/);
+  assert.match(prompt, /\bA1\b/);
   assert.match(prompt, /Debugger/);
   assert.match(prompt, /role switch/);
 });

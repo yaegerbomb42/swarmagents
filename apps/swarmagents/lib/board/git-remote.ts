@@ -17,7 +17,7 @@ import path from "node:path";
 const execFileAsync = promisify(execFile);
 const REMOTE_CHECK_TIMEOUT_MS = 10_000;
 
-export function isGitRemoteCheckEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+export function isGitRemoteCheckEnabled(env: Record<string, string | undefined> = process.env): boolean {
   return env.SWARM_GIT_REMOTE_CHECK !== "0";
 }
 

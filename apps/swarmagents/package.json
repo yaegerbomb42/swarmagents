@@ -9,7 +9,7 @@
     "generate:atlas-server": "tsx lib/capability-atlas/generate-server-source.ts",
     "build": "next build && tsc -p tsconfig.desktop-proxy.json",
     "start": "next start -H 127.0.0.1 -p 3777",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "lint": "eslint .",
     "vm-image:build": "docker build -t swarm-vm:claude vm-image",
     "vm-image-desktop:build": "docker build -t swarm-vm:desktop vm-image-desktop",
@@ -19,7 +19,8 @@
     "test:all": "bash scripts/test-all.sh",
     "playtest:login": "node scripts/playtest.mjs login",
     "playtest:seed": "node scripts/playtest.mjs seed",
-    "playtest:check": "node scripts/playtest.mjs check"
+    "playtest:check": "node scripts/playtest.mjs check",
+    "typecheck:tests": "tsc -p tsconfig.test.json --noEmit"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.7",

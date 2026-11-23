@@ -11,7 +11,7 @@ import { ClaudeCodeRunner, isBackgroundedCommand, isSignalKillExitCode } from ".
 import { StateLedger } from "./context/contextGovernor.js";
 import { localScorer } from "./system-one/index.js";
 import type { DecisionRouter } from "./decision-brain/index.js";
-import type { RolePhase, TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
+import type { ApprovalRequest, RolePhase, TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
 
 const SECRET_TOKEN = "sk-ant-api03-BENCH-FAKE-TOKEN-0000";
 const PLAIN_SECRET = "my-super-secret-key-42";
@@ -1222,7 +1222,7 @@ test("System-1 on + a denying gate pauses visibly through the approval flow", as
       systemOne: { settings: { enabled: true, gates: { guardrail: true } }, scorer: { ...localScorer, destructive: () => 0.99 } },
     }),
     {
-      approvalGateway: (request) => {
+      approvalGateway: (request: ApprovalRequest) => {
         approvals.push({ toolName: request.toolName, reason: request.reason });
         return { id: `appr_${approvals.length}`, verdict: Promise.resolve("approved" as const) };
       },

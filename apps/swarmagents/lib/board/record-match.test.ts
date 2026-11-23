@@ -95,6 +95,7 @@ test("end-to-end: a winning arena battle feeds the Elo leaderboard", async () =>
       contenders: [contender("openai", 820), contender("anthropic", 1300)],
       verify: async ({ provider }) =>
         ({
+          status: "passed",
           passed: true,
           score: provider === "openai" ? 90 : 80,
           violations: [],

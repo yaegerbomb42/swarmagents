@@ -30,26 +30,32 @@ export async function GET(request: NextRequest) {
   const owner = providerOwner(request);
   if (!owner) return unauthorized();
 
-  const params = request.nextUrl.searchParams;
-  const query = (params.get("q") ?? params.get("query") ?? "").trim();
-  const tag = (params.get("tag") ?? "").trim();
-  const rawK = Number(params.get("k"));
-  const k = Number.isFinite(rawK) && rawK > 0 ? Math.min(Math.floor(rawK), MAX_SEARCH_K) : undefined;
+  try {
+    const params = request.nextUrl.searchParams;
+    const query = (params.get("q") ?? params.get("query") ?? "").trim();
+    const tag = (params.get("tag") ?? "").trim();
+    const rawK = Number(params.get("k"));
+    const k = Number.isFinite(rawK) && rawK > 0 ? Math.min(Math.floor(rawK), MAX_SEARCH_K) : undefined;
 
-  if (!query && !tag) {
-    const memories = listMemories(owner).map(publicFact);
+    if (!query && !tag) {
+      const memories = listMemories(owner).map(publicFact);
+      return NextResponse.json({ memories, total: memories.length }, { headers: NO_STORE });
+    }
+
+    const memories = (await searchMemories(owner, query, { k, tag: tag || undefined })).map((memory) => ({
+      id: memory.id,
+      fact: memory.fact,
+      tags: memory.tags,
+      score: memory.score,
+      createdAt: memory.createdAt,
+      updatedAt: memory.updatedAt,
+    }));
     return NextResponse.json({ memories, total: memories.length }, { headers: NO_STORE });
+  } catch {
+    // Reads are fail-safe in the store, so this guards a future store or
+    // embedder failure — never let its detail reach the client.
+    return NextResponse.json({ error: "Memory is temporarily unavailable." }, { status: 503, headers: NO_STORE });
   }
-
-  const memories = (await searchMemories(owner, query, { k, tag: tag || undefined })).map((memory) => ({
-    id: memory.id,
-    fact: memory.fact,
-    tags: memory.tags,
-    score: memory.score,
-    createdAt: memory.createdAt,
-    updatedAt: memory.updatedAt,
-  }));
-  return NextResponse.json({ memories, total: memories.length }, { headers: NO_STORE });
 }
 
 export async function POST(request: NextRequest) {
@@ -76,15 +82,20 @@ export async function POST(request: NextRequest) {
   try {
     const memory = await writeMemory(owner, { fact: input.fact, tags: input.tags });
     return NextResponse.json({ memory: publicFact(memory) }, { status: 201, headers: NO_STORE });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return NextResponse.json({ error: message }, { status: 400, headers: NO_STORE });
+  } catch {
+    // Validation already ran above, so anything thrown here is a storage
+    // failure — never surface its message (filesystem paths, errno text).
+    return NextResponse.json({ error: "Could not store memory." }, { status: 500, headers: NO_STORE });
   }
 }
 
 export async function DELETE(request: NextRequest) {
   const owner = providerOwner(request);
   if (!owner) return unauthorized();
-  const forgotten = clearMemories(owner);
-  return NextResponse.json({ forgotten }, { headers: NO_STORE });
+  try {
+    const forgotten = clearMemories(owner);
+    return NextResponse.json({ forgotten }, { headers: NO_STORE });
+  } catch {
+    return NextResponse.json({ error: "Could not clear memories." }, { status: 500, headers: NO_STORE });
+  }
 }

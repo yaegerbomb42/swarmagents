@@ -3213,8 +3213,25 @@ export class RuntimeManager {
     }
     if (event.type === "run.started") {
       const st = this.users.get(userId);
-      if (st?.active?.runId === runId && st.active.startedAt === undefined) {
-        st.active.startedAt = Date.now();
+      if (st?.active?.runId === runId) {
+        const current = st.active;
+        if (current.startedAt === undefined) current.startedAt = Date.now();
+        // Capture the live harness session id so auto-checkpoints record it
+        // in the ResumePoint. Without this, a fresh run (no sessionId at
+        // acceptance) checkpoints with no session id and a server restart
+        // safe-aborts it instead of resuming. The still-active guard above
+        // makes this safe against late events: a run.started arriving after
+        // finalize (or after another run took the slot) is ignored. A
+        // resume point recorded before the session event is backfilled —
+        // never overwritten, because its recorded session was the one live
+        // at checkpoint time and must stay paired with that snapshot.
+        if (event.sessionId && current.sessionId !== event.sessionId) {
+          current.sessionId = event.sessionId;
+          if (current.resumePoint && current.resumePoint.sessionId === undefined) {
+            current.resumePoint = { ...current.resumePoint, sessionId: event.sessionId };
+          }
+          this.persistState();
+        }
       }
       // A fresh attempt means a fresh CLI process: any tool left open by a
       // previous attempt died with that process and must not keep this

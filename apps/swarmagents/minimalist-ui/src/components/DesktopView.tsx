@@ -183,10 +183,17 @@ export function DesktopView({
   // across the reconnect-to-switch dials and the state poll.
   const clientIdRef = useRef("");
   if (!clientIdRef.current) {
-    clientIdRef.current =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `client-${Math.random().toString(36).slice(2, 12)}`;
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+      clientIdRef.current = crypto.randomUUID();
+    } else if (typeof crypto !== "undefined" && "getRandomValues" in crypto) {
+      const bytes = new Uint8Array(10);
+      crypto.getRandomValues(bytes);
+      clientIdRef.current = `client-${[...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+    } else {
+      // No WebCrypto at all (ancient engine): a timestamped id is still unique
+      // per mount; it is an identity key, not a credential.
+      clientIdRef.current = `client-${Date.now().toString(36)}-${(performance.now() * 1000).toString(36)}`;
+    }
   }
   // When the current dial opened (RFB connect). Polls older than this
   // describe the previous session and must not read as a denial.

@@ -45,10 +45,16 @@ import type { ControlState, HandbackSummary, InputEvent } from "./takeover/types
 export const DEFAULT_TAKEOVER_REQUEST_TIMEOUT_MS = 15_000;
 export const DEFAULT_WINDOW_POLL_MS = 1_500;
 
-/** In-VM marker touched at drive start; handback diffs `find -newer` it. */
-const DRIVE_MARKER_PATH = "/tmp/.swarm-takeover-start";
 /** Workspace root inside the VM (see VM_WORKSPACE_DISK_PATH in lib/vm/manager). */
 const WORKSPACE_ROOT = "/workspace";
+/**
+ * In-VM marker touched at drive start; handback diffs `find -newer` it.
+ * Lives on the workspace volume, not /tmp: a predictable name in a publicly
+ * writable directory is a symlink-planting surface (Sonar S5443), and the
+ * volume is private to this user's VM. The marker never lists itself in the
+ * diff — a file is not newer than itself.
+ */
+const DRIVE_MARKER_PATH = `${WORKSPACE_ROOT}/.swarm-takeover-start`;
 /** Cap on files fed to the summarizer from one diff (output hygiene). */
 const MAX_DIFF_FILES = 200;
 /** Per-exec budget for the title/marker/diff calls. */

@@ -21,13 +21,14 @@
  */
 
 import React, { useCallback, useEffect, useState } from "react";
-import { Hand, Maximize2, Minimize2, MousePointerClick, Square } from "lucide-react";
+import { Hand, Maximize2, Minimize2, Square } from "lucide-react";
 import type { LogEvent } from "../../engine";
 import type { DesktopConnectionInfo } from "../DesktopView";
 import type { StatusTone } from "../../../../lib/client/runPhase";
 import type { VmStatus } from "../../../../lib/vm/types";
 import { cn } from "../../utils/cn";
-import { Button, IconButton, StatusBadge } from "../ui";
+import { Button, IconButton } from "../ui";
+import { StatusPill, TakeoverButton, type PillStatus } from "../brand";
 import { VmScreen, type ComputerView } from "../vm/VmScreen";
 import type { Presence } from "../../../../lib/client/presence";
 
@@ -99,6 +100,22 @@ export function screenStatus(input: {
   }
   if (input.runActive) return { label: "Live", tone: "ok", live: true };
   return { label: "Idle", tone: "muted", live: false };
+}
+
+/** The brand pill tone for a screen status: accent is the Signal `running` tone. */
+export function screenPillStatus(status: ScreenStatus): PillStatus {
+  switch (status.tone) {
+    case "accent":
+      return "running";
+    case "ok":
+      return "ok";
+    case "warn":
+      return "warn";
+    case "err":
+      return "error";
+    case "muted":
+      return "idle";
+  }
 }
 
 /** The largest 16:10 rectangle inside a box, as a scale of 1280×800. */
@@ -176,31 +193,25 @@ export function ScreenFrame({
   const showStageDesktop = activeView === "desktop" && desktopMode;
   const status = screenStatus({ activeView, runActive, control, phase: conn?.phase, latencyMs: conn?.latencyMs });
 
-  // The workspace controls that live in the shared top bar.
+  // The workspace controls that live in the shared top bar. The status pill
+  // and the take-over control are the brand components (spec 3g): one
+  // dot-and-word vocabulary, one driver slot, in the chrome of the frame.
   const frameControls = (
     <>
       {/* The one live-status light, in the same vocabulary as a run's. The
           full status bar sits under the stage; this is the at-a-glance copy. */}
-      <StatusBadge tone={status.tone} label={status.label} live={status.live} testId="screen-status-pill" />
+      <StatusPill status={screenPillStatus(status)} live={status.live} testId="screen-status-pill">
+        {status.label}
+      </StatusPill>
       {showStageDesktop && (
-        <Button
-          size="sm"
-          variant={control ? "primary" : "secondary"}
-          aria-pressed={control}
+        <TakeoverButton
+          driver={control ? "human" : "agent"}
+          onTakeover={() => onControlChange(true)}
+          onHandback={() => onControlChange(false)}
           disabled={!control && !canControl}
-          title={
-            control
-              ? "Give the desktop back to the agent (Esc)"
-              : canControl
-                ? "Use the desktop yourself"
-                : "The desktop is not ready yet"
-          }
-          onClick={() => onControlChange(!control)}
-          data-testid="take-over"
-        >
-          <MousePointerClick className="h-3.5 w-3.5" aria-hidden />
-          {control ? "Hand back" : "Take over"}
-        </Button>
+          disabledReason="The desktop is not ready yet"
+          testId="take-over"
+        />
       )}
       {theater && runActive && (
         <Button variant="danger" size="sm" onClick={onStopRun} data-testid="screen-stop-run">

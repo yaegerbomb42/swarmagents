@@ -3,7 +3,10 @@
 /**
  * StatusPill — status is always a dot plus a word, in one of five tones.
  * `running` breathes (live ring) while a run streams; the ring is disabled
- * under prefers-reduced-motion by tokens.css.
+ * under prefers-reduced-motion by tokens.css. `live` overrides the pulse:
+ * a live `ok`/`warn` still breathes, a steady `running` (e.g. the human
+ * holding the controls) does not. Labels render verbatim — no casing
+ * transform, so "Live · 42 ms" stays "42 ms".
  */
 
 import type { ReactNode } from "react";
@@ -37,23 +40,28 @@ const TONE: Record<PillStatus, { pill: string; dot: string }> = {
 export interface StatusPillProps {
   status: PillStatus;
   children: ReactNode;
+  /** Pulse the dot. Defaults to true only for `running`. */
+  live?: boolean;
+  testId?: string;
   className?: string;
 }
 
-export function StatusPill({ status, children, className }: StatusPillProps) {
+export function StatusPill({ status, children, live, testId, className }: StatusPillProps) {
   const tone = TONE[status];
+  const pulsing = live ?? status === "running";
   return (
     <span
       data-status={status}
+      data-testid={testId}
       className={cn(
-        "inline-flex shrink-0 items-center gap-1.5 rounded-[var(--brand-radius-full)] border px-2 py-[3px] text-[11px] font-semibold capitalize leading-none",
+        "inline-flex shrink-0 items-center gap-1.5 rounded-[var(--brand-radius-full)] border px-2 py-[3px] text-[11px] font-semibold leading-none",
         tone.pill,
         className,
       )}
     >
       <span
         aria-hidden
-        className={cn("h-[5px] w-[5px] shrink-0 rounded-full", tone.dot, status === "running" && "brand-live-dot")}
+        className={cn("h-[5px] w-[5px] shrink-0 rounded-full", tone.dot, pulsing && "brand-live-dot")}
       />
       {children}
     </span>

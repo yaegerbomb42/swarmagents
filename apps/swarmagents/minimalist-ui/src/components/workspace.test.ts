@@ -19,7 +19,7 @@ const noop = () => {};
 /** Components are imported after the browser stubs are in place. */
 async function load() {
   installBrowserStubs();
-  const [composer, header, conversation, board, history, settings, screen] = await Promise.all([
+  const [composer, header, conversation, board, history, settings, screen, brandPill] = await Promise.all([
     import("./Composer"),
     import("./Header"),
     import("./Conversation"),
@@ -27,8 +27,9 @@ async function load() {
     import("./HistoryPanel"),
     import("./SettingsSheet"),
     import("./dashboard/ScreenFrame"),
+    import("./brand/StatusPill"),
   ]);
-  return { ...composer, ...header, ...conversation, ...board, ...history, ...settings, ...screen };
+  return { ...composer, ...header, ...conversation, ...board, ...history, ...settings, ...screen, ...brandPill };
 }
 
 // ---- Flow B: the composer ----
@@ -206,7 +207,7 @@ test("the header keeps the conversation, the views, the run and settings in one 
 });
 
 test("the screen reports its state in the same dot-and-word vocabulary as a run", async () => {
-  const { screenStatus, fitStageScale } = await load();
+  const { screenStatus, screenPillStatus, fitStageScale } = await load();
   const desktop = { activeView: "desktop" as const, runActive: true, control: false };
 
   assert.deepEqual(screenStatus({ ...desktop, phase: "live", latencyMs: 42 }), { label: "Live · 42 ms", tone: "ok", live: true });
@@ -218,6 +219,13 @@ test("the screen reports its state in the same dot-and-word vocabulary as a run"
   assert.deepEqual(screenStatus({ ...desktop, phase: "live", control: true }), { label: "You are in control", tone: "accent", live: false });
   assert.deepEqual(screenStatus({ activeView: "terminal", runActive: true, control: false }), { label: "Live", tone: "ok", live: true });
   assert.deepEqual(screenStatus({ activeView: "files", runActive: false, control: false }), { label: "Idle", tone: "muted", live: false });
+
+  // The screen status maps onto the brand pill's five tones (spec 3g).
+  assert.equal(screenPillStatus({ label: "You are in control", tone: "accent", live: false }), "running");
+  assert.equal(screenPillStatus({ label: "Live", tone: "ok", live: true }), "ok");
+  assert.equal(screenPillStatus({ label: "Starting", tone: "warn", live: true }), "warn");
+  assert.equal(screenPillStatus({ label: "Offline", tone: "err", live: false }), "error");
+  assert.equal(screenPillStatus({ label: "Idle", tone: "muted", live: false }), "idle");
 
   // The stage is the largest 16:10 rectangle in the box it is given.
   assert.equal(fitStageScale({ width: 0, height: 0 }), null);
@@ -248,6 +256,7 @@ test("the screen frame shows its views, its status and the stage; Take over only
   for (const id of ["screen-frame", "screen-toolbar", "screen-stage", "screen-status-pill", "screen-fullscreen"]) {
     assert.equal(countOf(terminal, `data-testid="${id}"`), 1, id);
   }
+  assert.match(tagOf(terminal, "screen-status-pill"), /data-status="ok"/, "brand pill carries the mapped tone");
   assert.equal(countOf(terminal, 'data-testid="screen-view-desktop"'), 0, "no desktop tab when the VM has no desktop");
   for (const view of ["terminal", "browser", "files"]) {
     assert.equal(countOf(terminal, `data-testid="screen-view-${view}"`), 1, view);
@@ -282,10 +291,23 @@ test("the screen frame shows its views, its status and the stage; Take over only
   );
   assert.match(tagOf(driving, "screen-frame"), /data-control="true"/);
   assert.match(tagOf(driving, "take-over"), /aria-pressed="true"/);
+  assert.match(tagOf(driving, "screen-status-pill"), /data-status="running"/, "holding the controls reads as Signal running");
   assert.match(driving, /Hand back/);
   assert.equal(countOf(driving, 'data-testid="takeover-banner"'), 1);
   assert.match(driving, /You are in control/);
   assert.match(driving, /The agent is still working/);
+});
+
+test("the brand status pill pulses only when live, and never re-cases its label", async () => {
+  const { StatusPill } = await load();
+  const live = renderToStaticMarkup(h(StatusPill, { status: "ok", live: true, children: "Live · 42 ms" }));
+  assert.match(live, /brand-live-dot/, "a live ok still breathes");
+  assert.match(live, /Live · 42 ms/, "the latency label renders verbatim");
+  const steady = renderToStaticMarkup(h(StatusPill, { status: "running", live: false, children: "You are in control" }));
+  assert.doesNotMatch(steady, /brand-live-dot/, "a steady running pill does not breathe");
+  assert.match(steady, /You are in control/);
+  const running = renderToStaticMarkup(h(StatusPill, { status: "running", live: true, children: "Running" }));
+  assert.match(running, /brand-live-dot/);
 });
 
 // ---- Flow B: the conversation ----

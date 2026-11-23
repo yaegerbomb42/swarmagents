@@ -838,8 +838,8 @@ test("emits computer.action events for desktop MCP calls, with redacted summarie
     type: "computer.action",
     // The summary carries a character count, never typed content; the
     // structured `text` field keeps the (redacted) text for detail
-    // surfaces. "login as [REDACTED]" is 18 chars.
-    action: "Typing (18 chars)",
+    // surfaces. "login as [REDACTED]" is 19 chars.
+    action: "Typing (19 chars)",
     text: "login as [REDACTED]",
   });
 

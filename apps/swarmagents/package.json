@@ -2,6 +2,10 @@
   "name": "swarmagents",
   "version": "2.0.0",
   "private": true,
+  "engines": {
+    "node": "22.x"
+  },
+  "packageManager": "npm@10.9.4",
   "description": "One chat bar. One agent. Every tool. Nothing hidden.",
   "scripts": {
     "dev": "next dev -H 127.0.0.1 -p 3777",

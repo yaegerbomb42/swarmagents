@@ -1,0 +1,36 @@
+# Dependency audit: a scheduled `npm audit` for the lockfile'd manifests.
+# Kept out of ci.yml on purpose (that file is owned by the gates) — this runs
+# weekly plus on demand via workflow_dispatch. It fails on high/critical
+# vulnerabilities so a new one is visible as a failed run; low/moderate
+# findings are still listed in the log. `npm audit` reads the lockfile, so
+# no install step is needed. Run it manually after merging to confirm the
+# registry is reachable from Actions (this VM's registry policy blocks the
+# audit endpoint, so it could not be verified locally).
+name: Dependency audit
+
+on:
+  schedule:
+    # Mondays 09:00 UTC, matching the Dependabot schedule.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Audit swarmagents
+        working-directory: apps/swarmagents
+        run: npm audit --audit-level=high
+
+      - name: Audit mcp-swarm-board
+        working-directory: apps/swarmagents/packages/mcp-swarm-board
+        run: npm audit --audit-level=high

@@ -447,6 +447,9 @@ Never commit real keys. All provider keys live in env only.
 
 ## Local development
 
+Requires Node 22 (see `.nvmrc` at the repo root; `engines` in
+`apps/swarmagents/package.json`).
+
 ```bash
 npm install
 npm run dev            # next dev on http://127.0.0.1:3777

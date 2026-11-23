@@ -10,6 +10,10 @@ import {
   rateLimitResponse,
   checkCompleteRateLimit,
   checkProviderProbeRateLimit,
+  checkLoginRateLimit,
+  refundLoginRateLimit,
+  LOGIN_EMAIL_LIMIT,
+  LOGIN_IP_LIMIT,
   resetBuckets,
   resetRateLimitWarnings,
   UNIDENTIFIED_KEY,
@@ -408,4 +412,84 @@ test("rateLimitCheck routes email-verification endpoints into the strict reset b
   assert.equal(rateLimitCheck("/api/password-reset/request", key)!.allowed, false);
   // ...while another identity is unaffected.
   assert.equal(rateLimitCheck("/api/email-verification/resend", "other-key")!.allowed, true);
+});
+
+test("TokenBucket.refund hands tokens back, clamped at capacity", () => {
+  const bucket = new TokenBucket(3, 60_000);
+  assert.equal(bucket.consume("key").remaining, 2);
+  assert.equal(bucket.consume("key").remaining, 1);
+  bucket.refund("key");
+  assert.equal(bucket.consume("key").remaining, 1);
+  // Refunding past capacity never overfills the bucket.
+  bucket.refund("key");
+  bucket.refund("key");
+  bucket.refund("key");
+  assert.equal(bucket.consume("key").remaining, 2);
+  // Refunding an unknown key is a no-op, not a fresh bucket.
+  bucket.refund("no-such-key");
+  assert.equal(bucket.consume("no-such-key").remaining, 2);
+});
+
+test("checkLoginRateLimit trips the per-email bucket and refunds on success", () => {
+  resetBuckets();
+  const email = "login-bucket-alice-" + Date.now() + "@example.com";
+  const ip = "ip:203.0.113.40";
+  for (let i = 0; i < LOGIN_EMAIL_LIMIT; i++) {
+    assert.equal(checkLoginRateLimit(email, ip).allowed, true, `attempt ${i + 1} should be allowed`);
+  }
+  const blocked = checkLoginRateLimit(email, ip);
+  assert.equal(blocked.allowed, false);
+  assert.ok(blocked.retryAfter > 0);
+  // A refunded (successful) attempt restores the budget.
+  refundLoginRateLimit(email, ip);
+  assert.equal(checkLoginRateLimit(email, ip).allowed, true);
+});
+
+test("checkLoginRateLimit trips per-email and per-IP buckets independently", () => {
+  resetBuckets();
+  const ip = "ip:203.0.113.41";
+  // Exhaust the email bucket for one account from this IP.
+  for (let i = 0; i < LOGIN_EMAIL_LIMIT; i++) {
+    assert.equal(checkLoginRateLimit("victim@example.com", ip).allowed, true);
+  }
+  assert.equal(checkLoginRateLimit("victim@example.com", ip).allowed, false);
+  // A different account from the same IP still has budget (IP limit is 30).
+  assert.equal(checkLoginRateLimit("other@example.com", ip).allowed, true);
+  // Exhaust the IP bucket with distinct accounts.
+  for (let i = 0; i < LOGIN_IP_LIMIT - LOGIN_EMAIL_LIMIT - 1; i++) {
+    assert.equal(checkLoginRateLimit(`filler-${i}@example.com`, ip).allowed, true);
+  }
+  assert.equal(checkLoginRateLimit("fresh@example.com", ip).allowed, false);
+  // A different IP is unaffected by the exhausted one.
+  assert.equal(checkLoginRateLimit("fresh@example.com", "ip:203.0.113.42").allowed, true);
+});
+
+test("checkLoginRateLimit hands the email token back when the IP bucket denies", () => {
+  resetBuckets();
+  const ip = "ip:203.0.113.43";
+  // Burn the IP budget with throwaway accounts (each also takes an email token).
+  for (let i = 0; i < LOGIN_IP_LIMIT; i++) {
+    assert.equal(checkLoginRateLimit(`burner-${i}@example.com`, ip).allowed, true);
+  }
+  assert.equal(checkLoginRateLimit("held@example.com", ip).allowed, false);
+  // The denied attempt must not have drained the held account's own budget:
+  // from a fresh IP it still has its full allowance.
+  for (let i = 0; i < LOGIN_EMAIL_LIMIT; i++) {
+    assert.equal(
+      checkLoginRateLimit("held@example.com", "ip:203.0.113.44").allowed,
+      true,
+      `held account attempt ${i + 1} should be allowed`,
+    );
+  }
+});
+
+test("checkLoginRateLimit still enforces the IP bucket without an email key", () => {
+  resetBuckets();
+  const ip = "ip:203.0.113.45";
+  for (let i = 0; i < LOGIN_IP_LIMIT; i++) {
+    assert.equal(checkLoginRateLimit(null, ip).allowed, true);
+  }
+  const blocked = checkLoginRateLimit(null, ip);
+  assert.equal(blocked.allowed, false);
+  assert.ok(blocked.retryAfter > 0);
 });

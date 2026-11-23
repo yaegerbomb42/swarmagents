@@ -179,6 +179,14 @@ const permissions = (overrides: Partial<RolePermissions>): RolePermissions => ({
 export const ROLE_MCP_SERVER_REGISTRY: Readonly<Record<string, { label: string; description: string }>> = {
   "postgres-mcp": { label: "PostgreSQL", description: "Direct DB query execution, migrations and schema inspection." },
   "github-mcp": { label: "GitHub", description: "Branch management, pull requests and commit checks." },
+  "web-search": {
+    label: "Web Search",
+    description: "Search the web mid-run (Brave/Tavily/Exa/SearXNG) with the account's own configured key, proxied by the host so the key never enters the VM.",
+  },
+  "locator": {
+    label: "Code Locator",
+    description: "Ripgrep-backed symbol/concept search over the workspace: returns ranked file:line matches with snippets.",
+  },
   "computer-mcp": {
     label: "Desktop Computer",
     description: "Control the on-screen desktop: screenshots, clicks, typing, keys, scrolling and opening apps (desktop VM mode only).",
@@ -256,7 +264,7 @@ export const BUILTIN_ROLES: readonly RoleDefinition[] = [
     model: "",
     permissions: permissions({ readOnly: true, allowNetwork: true, allowBrowser: true }),
     tools: ["read_file", "search", "web_search", "web_fetch", "browser", "dispatch_explorer"],
-    mcpServers: [],
+    mcpServers: ["web-search"],
     skills: ["browser-live"],
     instructions:
       "You are a researcher. Answer the question with evidence, not guesses. Prefer primary sources and the live codebase. Give exact paths, line numbers, URLs and quoted evidence. Separate verified facts from inference, note what you could not determine, and do not modify files.",
@@ -941,3 +949,4 @@ export function roleModelLabel(model: string): string {
 export function roleCategoryLabel(category: RoleCategory): string {
   return ROLE_CATEGORY_BY_ID.get(category)?.label ?? "Core";
 }
+

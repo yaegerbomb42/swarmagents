@@ -9,6 +9,7 @@ import {
   PERMISSION_KEYS,
   ROLES_STORAGE_KEY,
   ROLE_CATEGORIES,
+  ROLE_MCP_SERVER_REGISTRY,
   ROLE_SCHEMA,
   ROLE_SCHEMA_VERSION,
   ROLE_TOOLS,
@@ -694,4 +695,35 @@ test("normalizeRoleDefinition carries a valid lens through and drops an invalid 
   assert.equal(invalid?.lens, undefined);
   const generic = normalizeRoleDefinition({ name: "z" });
   assert.equal(generic?.lens, undefined);
+});
+
+test("the researcher built-in grants the web-search MCP server", () => {
+  const researcher = builtinRole("researcher");
+  assert.deepEqual(researcher.mcpServers, ["web-search"]);
+  // The grant must reference a server the registry knows, or role-mcp
+  // wiring silently has nothing to wire.
+  assert.ok(
+    ROLE_MCP_SERVER_REGISTRY["web-search"],
+    "web-search must be registered in ROLE_MCP_SERVER_REGISTRY",
+  );
+});
+
+test("web-search is granted to the researcher built-in only", () => {
+  const granting = BUILTIN_ROLES.filter((role) => role.mcpServers.includes("web-search")).map(
+    (role) => role.id,
+  );
+  assert.deepEqual(granting, ["researcher"]);
+  // The default role's toolset is unchanged: no web-search MCP grant.
+  assert.equal(builtinRole(DEFAULT_ROLE_ID).mcpServers.includes("web-search"), false);
+});
+
+test("every built-in role's MCP servers are registered servers", () => {
+  for (const role of BUILTIN_ROLES) {
+    for (const server of role.mcpServers) {
+      assert.ok(
+        ROLE_MCP_SERVER_REGISTRY[server],
+        `${role.id} references unregistered MCP server ${server}`,
+      );
+    }
+  }
 });

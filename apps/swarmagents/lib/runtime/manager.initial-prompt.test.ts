@@ -86,7 +86,7 @@ test("history keeps the original prompt after a role switch", async () => {
   try {
     const driver = new ScriptedDriver((index) =>
       index === 0
-        ? { lines: [INIT_LINE, switchLine("researcher")], exitCode: 0 }
+        ? { lines: [INIT_LINE, switchLine("orchestrator")], exitCode: 0 }
         : { lines: [...FAKE_CLAUDE_TRANSCRIPT_LINES], exitCode: 0 },
     );
     const manager = new RuntimeManager({ vm: new VmManager({ customDriver: driver }), router: null });

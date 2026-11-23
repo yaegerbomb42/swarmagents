@@ -20,6 +20,7 @@ import { revokeVaultToken } from "../secrets/token";
 import { ClaudeCodeRunner, isSignalKillExitCode } from "../harness/runner";
 import { roleMaxTurns } from "../harness/role-clamps";
 import { makeRedactor } from "../harness/redact";
+import type { BrainEvent } from "../harness/decision-brain/index";
 import type {
   ApprovalGateway,
   QuestionGateway,
@@ -3355,6 +3356,34 @@ export class RuntimeManager {
           autoApprove: active.fullAuto === true,
           questionGateway,
           handoffGateway,
+          // Decision Brain loop control from the user's saved settings
+          // (absent = off; the runner never constructs the hooks then). The
+          // emit sink publishes each verdict to the bus so the run log and
+          // trajectory record what was decided, why, and how long it took.
+          // A brain error is telemetry only — the hooks fail open, so a
+          // broken brain can never block or alter a run.
+          decisionBrain: {
+            settings: readUserSettings(userId).decisionBrain,
+            emit: (event: BrainEvent) => {
+              if (event.type === "brain.decision") {
+                this.bus.publish(runId, {
+                  type: "brain.decision",
+                  data: {
+                    decision: event.decision,
+                    confidence: event.confidence,
+                    reason: event.reason,
+                    escalated: event.escalated,
+                    latencyMs: event.latencyMs,
+                  },
+                });
+              } else {
+                this.bus.publish(runId, {
+                  type: "brain.error",
+                  data: { message: event.message },
+                });
+              }
+            },
+          },
           rolePhase:
             phase ??
             this.defaultRolePhase(

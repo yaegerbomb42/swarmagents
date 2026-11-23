@@ -1,0 +1,27 @@
+# Dependabot: weekly dependency updates for the lockfile'd manifests.
+# packages/swarm-node has no lockfile, so it is not listed here — add one
+# before enabling updates for it. github-actions covers the workflows in
+# .github/workflows (ci, deploy, playtest, dependency-audit).
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/apps/swarmagents"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 10
+  - package-ecosystem: "npm"
+    directory: "/apps/swarmagents/packages/mcp-swarm-board"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5

@@ -55,6 +55,7 @@ import {
 import { taskLinkForRun, type TaskRunLink, type TaskRunLinks } from "../../../lib/client/board";
 import { cn } from "../utils/cn";
 import { Button, Loading, Notice, StatusBadge } from "./ui";
+import { EmptyState } from "./brand/EmptyState";
 import { RunReportCard } from "./RunReportCard";
 import { HandoffCard } from "./dashboard/HandoffCard";
 
@@ -646,21 +647,14 @@ export function Conversation({
           {session.turnsLoading && <Loading label="Loading conversation" className="py-10" />}
 
           {!session.turnsLoading && turns.length === 0 && !pending && (
-            <div className="py-10 text-center" data-testid="conversation-empty">
-              <p className="text-[13px] text-sa-fg2 mb-6">No messages yet. Tell the agent what you want done.</p>
-              <div className="flex flex-col items-center gap-3 sm:flex-row sm:gap-4 sm:justify-center">
-                {starters.map((text) => (
-                  <Button
-                    key={text}
-                    data-testid="starter-prompt"
-                    onClick={() => void send(text, [])}
-                    size="sm"
-                  >
-                    {text}
-                  </Button>
-                ))}
-              </div>
-            </div>
+            <EmptyState
+              testId="conversation-empty"
+              title="No messages yet"
+              description="Tell the agent what you want done."
+              starters={starters.map((text) => ({ label: text }))}
+              starterTestId="starter-prompt"
+              onStarterSelect={(task) => void send(task, [])}
+            />
           )}
 
           {turns.map((entry) => {

@@ -13,6 +13,7 @@ import { Search, SquarePen, X } from "lucide-react";
 import { formatRelativeTime, type ThreadSummary } from "../../../lib/client/thread";
 import { cn } from "../utils/cn";
 import { Button, Loading, Notice, Sheet, StatusBadge } from "./ui";
+import { EmptyState } from "./brand/EmptyState";
 
 export interface HistoryPanelProps {
   open: boolean;
@@ -117,15 +118,21 @@ export function HistoryPanel({
         )}
 
         {state === "ready" && threads.length === 0 && (
-          <p className="px-1 py-8 text-center text-[13px] text-sa-fg2" data-testid="history-empty">
-            No conversations yet. Your chats with the agent are kept here.
-          </p>
+          <EmptyState
+            testId="history-empty"
+            icon="chat-bar"
+            title="No conversations yet"
+            description="Your chats with the agent are kept here."
+          />
         )}
 
         {state === "ready" && threads.length > 0 && filteredThreads.length === 0 && (
-          <p className="px-1 py-8 text-center text-[13px] text-sa-fg2" data-testid="history-no-results">
-            No conversations match &ldquo;{searchQuery}&rdquo;.
-          </p>
+          <EmptyState
+            testId="history-no-results"
+            icon="chat-bar"
+            title="No conversations match"
+            description={`Nothing matches \u201c${searchQuery}\u201d.`}
+          />
         )}
 
         {state === "ready" && filteredThreads.length > 0 && (

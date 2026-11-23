@@ -29,6 +29,7 @@ import { classifyCostProvenance } from "../../../lib/runtime/run-report-types";
 import type { ReportArtifact, ReportCardMeta, ReportStep, RunReport } from "../../../lib/runtime/run-report-types";
 import type { ThreadEntry } from "../../../lib/client/thread";
 import { Button, IconButton, Loading, Notice } from "./ui";
+import { Card } from "./brand/Card";
 
 const POLL_MS = 2000;
 const MAX_POLLS = 10;
@@ -434,7 +435,7 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
   const summary = meta ? reportSummarySentence(meta, report?.artifacts) : "";
 
   return (
-    <div className="mt-2 overflow-hidden rounded-xl border border-sa-line bg-sa-panel" data-testid="run-report">
+    <Card flush className="mt-2 overflow-hidden" data-testid="run-report">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
@@ -706,6 +707,6 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
           )}
         </div>
       )}
-    </div>
+    </Card>
   );
 }

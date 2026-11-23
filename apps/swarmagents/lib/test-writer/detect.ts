@@ -90,9 +90,22 @@ interface Candidate {
 /** Scores below this resolve to "unknown". */
 const MIN_CONFIDENCE = 0.4;
 
+/**
+ * True only when `p` stats as a directory. A broken symlink under the
+ * scanned tree — or a path that vanishes between the existence check and
+ * the stat — must not throw out of detectFramework().
+ */
+function isDirectory(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function scoreFramework(targetPath: string): FrameworkDetection {
   const abs = path.resolve(targetPath);
-  const dir = fs.existsSync(abs) && fs.statSync(abs).isDirectory() ? abs : path.dirname(abs);
+  const dir = isDirectory(abs) ? abs : path.dirname(abs);
   const ext = path.extname(abs).toLowerCase();
 
   const pkgM = findUpInfo(dir, ["package.json"]);

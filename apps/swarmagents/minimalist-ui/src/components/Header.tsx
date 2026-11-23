@@ -11,10 +11,20 @@
 
 import React from "react";
 import { ChevronDown, HelpCircle, Settings as SettingsIcon, Square, SquarePen, Activity, Monitor, MessageSquare, ClipboardList } from "lucide-react";
-import { RUN_PHASE_META, formatDuration, type RunPhase } from "../../../lib/client/runPhase";
+import { RUN_PHASE_META, formatDuration, type RunPhase, type StatusTone } from "../../../lib/client/runPhase";
 import { cn } from "../utils/cn";
 import { Elapsed } from "./Conversation";
-import { Button, IconButton, Segmented, StatusBadge, type SegmentOption } from "./ui";
+import { StatusPill, type PillTone } from "../design/primitives";
+import { Button, IconButton, Segmented, type SegmentOption } from "./ui";
+
+/** Run phases speak in five tones; the brand pill speaks in five of its own. */
+export const RUN_TONE_TO_PILL: Record<StatusTone, PillTone> = {
+  accent: "running",
+  ok: "ok",
+  warn: "warn",
+  err: "err",
+  muted: "neutral",
+};
 
 export type WorkspaceView = "chat" | "screen" | "board";
 
@@ -43,7 +53,9 @@ export function RunIndicator({ phase, since, durationMs, activity, stopping, onS
         className="flex h-8 min-w-0 items-center gap-2 rounded-xl hair px-2.5 bg-black/30 transition-colors hover:bg-white/[0.06]"
       >
         <span role="status" className="flex min-w-0">
-          <StatusBadge tone={meta.tone} label={meta.label} live={meta.active} className="min-w-0 truncate" />
+          <StatusPill tone={RUN_TONE_TO_PILL[meta.tone]} live={meta.active}>
+            {meta.label}
+          </StatusPill>
         </span>
         {meta.active && since !== undefined ? (
           <Elapsed since={since} className="hidden min-[420px]:inline text-xs text-[var(--ok)] mono" />

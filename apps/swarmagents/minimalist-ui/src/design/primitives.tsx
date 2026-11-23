@@ -72,12 +72,13 @@ const PILL: Record<PillTone, string> = {
   running: "border-[color:var(--color-run)]/45 bg-[color:var(--color-run)]/12 text-[color:var(--color-run)]",
 };
 
-export function StatusPill({ tone = "neutral", children }: { tone?: PillTone; children: ReactNode }) {
+export function StatusPill({ tone = "neutral", live = false, children }: { tone?: PillTone; live?: boolean; children: ReactNode }) {
   return (
     <span
+      data-tone={tone}
       className={`inline-flex items-center gap-1.5 rounded border px-1.5 py-[3px] text-[9px] font-semibold capitalize ${PILL[tone]}`}
     >
-      <span className="h-[5px] w-[5px] rounded-full bg-current" />
+      <span className={`h-[5px] w-[5px] rounded-full bg-current ${live ? "animate-pulse" : ""}`} />
       {children}
     </span>
   );

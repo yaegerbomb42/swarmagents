@@ -3,12 +3,15 @@
 /**
  * App — SwarmAgents Unified Workspace
  *
- * Implements the brand system (Void Navy / Signal Cyan, cursor-eye mark),
- * luminous borders, tactile ripples, and live telemetry) seamlessly wired to:
- *   1. Live VM Screen Frame (noVNC viewer, takeover, terminal view, reset).
- *   2. Real-time Run stream telemetry, tool narration, and Conversation.
- *   3. Cute Mascot animation (MascotDock) with full state sync.
- *   4. Settings sheet with complete multi-provider catalog & keys.
+ * Three components, nothing else in the main view:
+ *   1. The main area: the user's VM screen (noVNC viewer, takeover,
+ *      terminal view, reset) with a one-line activity summary. Before the
+ *      first run it shows the brand hero instead.
+ *   2. The bottom input bar: one composer, any attachment (paperclip,
+ *      paste, drop).
+ *   3. Settings: the top-right header icon opening the settings sheet
+ *      (providers, agent, compute).
+ * Chat and board stay one tap away in the header view switcher.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -375,6 +378,11 @@ export default function App() {
       ? headRun.finishedAt - headRun.createdAt
       : undefined;
 
+  // Before the first run there is no screen worth showing yet: the main
+  // area carries the brand hero and starter chips. The screen stays
+  // mounted (hidden) so its streams survive the switch.
+  const showHero = effectiveView === "screen" && !headRun && session.turns.length === 0;
+
   return (
     <div
       className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-[var(--bg)] text-[var(--fg)]"
@@ -412,66 +420,40 @@ export default function App() {
       )}
 
       <main className="relative z-10 flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-3 sm:p-4" data-testid="workspace-main">
-        <section className="mx-auto w-full max-w-3xl shrink-0" aria-label="Ask the agent">
-          <div className="mb-3 flex justify-center">
-            <img src="/brand/mark-dark.svg" alt="" width={48} height={48} />
-          </div>
-          <h1 className="mb-2 text-center text-lg font-semibold tracking-tight sm:text-2xl">Give it a task. It has its own computer.</h1>
-          <p className="mx-auto mb-4 max-w-md text-center text-sm leading-relaxed text-[var(--mute)]">
-            One autonomous agent in your own persistent Linux VM. Describe the work, watch every step live, take over anytime. Free — bring your own model keys.
-          </p>
-          {session.signedOut ? (
-            <Notice
-              tone="warn"
-              title="Sign in to use the agent"
-              className="mb-2"
-              testId="signed-out-notice"
-              action={
-                <a
-                  href="/login"
-                  className="inline-flex h-8 items-center rounded-xl bg-[var(--fg)] px-3 text-[13px] font-medium text-[var(--inv)] transition-colors hover:opacity-90"
-                >
-                  Sign in
-                </a>
-              }
-            >
-              Your session ended or you have not signed in yet.
-            </Notice>
-          ) : (
-            setup.needsProvider && (
-              <Notice
-                tone="warn"
-                title="Add a model provider to start"
-                className="mb-2"
-                testId="provider-notice"
-                action={
-                  <Button size="sm" variant="primary" onClick={() => openSettings("providers")}>
-                    Add provider key
-                  </Button>
-                }
-              >
-                Runs use your configured provider keys.
-              </Notice>
-            )
-          )}
-          <Composer
-            value={draft}
-            onChange={setDraft}
-            onSend={handleSend}
-            blockedReason={
-              session.signedOut ? "Sign in to send" : setup.needsProvider ? "Add a provider key to send" : undefined
-            }
-            inputRef={composerRef}
-          />
-        </section>
-
+        {/* Component 2: the main area — the user's VM screen. */}
         <section className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-2 overflow-y-auto rounded-[24px] glass hair p-3 sm:p-4" data-testid="stage">
           <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--mute)]" role="status" aria-live="polite" data-testid="workspace-activity">
             <span className={cn("h-2 w-2 shrink-0 rounded-full", phaseMeta?.active ? "bg-emerald-400 animate-pulse" : "bg-white/30")} />
             <span className="truncate">{phaseMeta?.label ?? vmDisplay.label}{activitySuffix}</span>
           </div>
+          {showHero && (
+            <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 py-10 text-center" data-testid="workspace-hero">
+              <img src="/brand/mark-dark.svg" alt="" width={56} height={56} className="mb-5" />
+              <h1 className="mb-2 text-xl font-semibold tracking-tight sm:text-3xl">Give it a task. It has its own computer.</h1>
+              <p className="mb-6 max-w-md text-sm leading-relaxed text-[var(--mute)]">
+                One autonomous agent in your own persistent Linux VM. Describe the work, watch every step live, take over anytime. Free — bring your own model keys.
+              </p>
+              {!setup.needsProvider && !session.signedOut && (
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  {STARTERS.map((starter) => (
+                    <button
+                      key={starter}
+                      type="button"
+                      className="glass hair rounded-full px-3.5 py-1.5 text-xs text-[var(--mute)] transition-colors hover:text-[var(--fg)]"
+                      onClick={() => {
+                        setDraft(starter);
+                        focusComposer();
+                      }}
+                    >
+                      {starter}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {/* Keep the desktop and runtime streams mounted when switching workspace tabs. */}
-          <div className={cn("min-h-[300px] flex-1", effectiveView !== "screen" && "hidden")} aria-hidden={effectiveView !== "screen"}>
+          <div className={cn("min-h-[300px] flex-1", (effectiveView !== "screen" || showHero) && "hidden")} aria-hidden={effectiveView !== "screen" || showHero}>
             <ScreenFrame
               activeView={screenView}
               onToggleView={setScreenView}
@@ -521,6 +503,53 @@ export default function App() {
               className="flex-1"
             />
           )}
+        </section>
+
+        {/* Component 1: the bottom input bar — any attachment. */}
+        <section className="mx-auto w-full max-w-3xl shrink-0" aria-label="Ask the agent">
+          {session.signedOut ? (
+            <Notice
+              tone="warn"
+              title="Sign in to use the agent"
+              className="mb-2"
+              testId="signed-out-notice"
+              action={
+                <a
+                  href="/login"
+                  className="inline-flex h-8 items-center rounded-xl bg-[var(--fg)] px-3 text-[13px] font-medium text-[var(--inv)] transition-colors hover:opacity-90"
+                >
+                  Sign in
+                </a>
+              }
+            >
+              Your session ended or you have not signed in yet.
+            </Notice>
+          ) : (
+            setup.needsProvider && (
+              <Notice
+                tone="warn"
+                title="Add a model provider to start"
+                className="mb-2"
+                testId="provider-notice"
+                action={
+                  <Button size="sm" variant="primary" onClick={() => openSettings("providers")}>
+                    Add provider key
+                  </Button>
+                }
+              >
+                Runs use your configured provider keys.
+              </Notice>
+            )
+          )}
+          <Composer
+            value={draft}
+            onChange={setDraft}
+            onSend={handleSend}
+            blockedReason={
+              session.signedOut ? "Sign in to send" : setup.needsProvider ? "Add a provider key to send" : undefined
+            }
+            inputRef={composerRef}
+          />
         </section>
       </main>
 

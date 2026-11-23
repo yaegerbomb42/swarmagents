@@ -175,9 +175,18 @@ const DEFAULT_MAX_QUEUED = 3;
  * tool call (e.g. an agent sleeping in a loop) legitimately produces no
  * telemetry for a while. A wedged docker exec or a run whose process exited
  * without releasing the exec stream is what they exist to break.
+ *
+ * Silence while a tool is in flight gets the longer TOOL_SILENCE_MS window:
+ * a tool.call with no tool.result yet means work may legitimately be running
+ * inside the VM (a big build, a long test suite) with nothing to report, and
+ * event silence alone cannot tell that from a wedge. The window is capped —
+ * aligned with the agent exec duration quota (agentMaxExecDurationMs in
+ * lib/vm/quotas.ts) — so a tool that hangs forever is still declared stuck
+ * once even that generous bound passes.
  */
 const DEFAULT_START_GRACE_MS = 5 * 60 * 1000;
 const DEFAULT_SILENCE_MS = 30 * 60 * 1000;
+const DEFAULT_TOOL_SILENCE_MS = 2 * 60 * 60 * 1000;
 
 export type RunStatus = "queued" | "running" | "finished" | "error" | "cancelled";
 
@@ -328,6 +337,14 @@ interface ActiveRun {
   startedAt?: number;
   /** Epoch ms of the last telemetry this run produced; heartbeat for the watchdog. */
   lastActivityAt: number;
+  /**
+   * Tool calls announced (tool.call) but not yet resulted (tool.result),
+   * counted by tool id ("" when the CLI gave none). The watchdog reads this
+   * as "a tool may legitimately be running inside the VM": event silence
+   * with an open tool gets the longer tool-silence window instead of the
+   * plain silence window. In-memory only — a restored run starts empty.
+   */
+  openTools?: Map<string, number>;
   /** True once the codebase context pack was prepended to this run. */
   codebaseContextInjected?: boolean;
   /** g9 full-auto: the synchronous approval hook auto-allows in-VM asks. */
@@ -620,6 +637,7 @@ export class RuntimeManager {
   private readonly maxQueuedOverride: number | undefined;
   private readonly startGraceMs: number;
   private readonly silenceMs: number;
+  private readonly toolSilenceMs: number;
   private readonly watchdogSweepMs: number = 30_000;
   /**
    * Durable snapshot of active+queued work. Null in direct constructions
@@ -645,6 +663,8 @@ export class RuntimeManager {
      */
     startGraceMs?: number;
     silenceMs?: number;
+    /** Silence tolerated while a tool is in flight (default 2h; see DEFAULT_TOOL_SILENCE_MS). */
+    toolSilenceMs?: number;
     /** Watchdog sweep cadence, ms (default 30s; minimum 20ms in tests). */
     watchdogSweepMs?: number;
     /** Test hook: inject the run-report reporter. */
@@ -665,6 +685,7 @@ export class RuntimeManager {
     this.maxQueuedOverride = opts.maxQueued;
     this.startGraceMs = opts.startGraceMs ?? DEFAULT_START_GRACE_MS;
     this.silenceMs = opts.silenceMs ?? DEFAULT_SILENCE_MS;
+    this.toolSilenceMs = opts.toolSilenceMs ?? DEFAULT_TOOL_SILENCE_MS;
     this.watchdogSweepMs = Math.max(20, opts.watchdogSweepMs ?? 30_000);
     this.stateStore = opts.stateStore ?? null;
 
@@ -968,12 +989,42 @@ export class RuntimeManager {
   }
 
   /**
+   * Mark a tool call as in flight for the watchdog. Keyed by tool id (""
+   * when the CLI gave none) and counted, so parallel calls and id-less
+   * calls both pair up with their results.
+   */
+  private noteToolCall(active: ActiveRun, id?: string): void {
+    if (!active.openTools) active.openTools = new Map();
+    const open = active.openTools;
+    const key = id ?? "";
+    open.set(key, (open.get(key) ?? 0) + 1);
+  }
+
+  /** Clear a tool call's in-flight mark once its result arrives. */
+  private noteToolResult(active: ActiveRun, id?: string): void {
+    const open = active.openTools;
+    if (!open) return;
+    const key = id ?? "";
+    const count = open.get(key);
+    if (count === undefined) return;
+    if (count <= 1) open.delete(key);
+    else open.set(key, count - 1);
+  }
+
+  /**
    * Watchdog sweep: finalize active runs that are stuck. A run is stuck when
    * it never emitted run.started within startGraceMs, or when it has been
    * entirely silent (no telemetry at all) for silenceMs after starting. Both
    * are generous so a long single tool call (e.g. an agent looping with
    * sleep) is never mistaken for a hang; they exist to break a wedged exec
    * stream or a process that exited without releasing the slot.
+   *
+   * A started run with a tool still in flight (tool.call seen, no
+   * tool.result yet) gets the longer toolSilenceMs window instead: silence
+   * then most likely means work is running inside the VM with nothing to
+   * report, not a wedge. The window is still finite, so a tool that hangs
+   * forever is declared stuck once it passes. The never-started window is
+   * unaffected — a run that never started cannot have a tool in flight.
    */
   private scanWatchdogs(): void {
     const now = Date.now();
@@ -982,9 +1033,11 @@ export class RuntimeManager {
       if (!active) continue;
       const elapsed = now - active.lastActivityAt;
       const neverStarted = active.startedAt === undefined;
+      const toolInFlight = (active.openTools?.size ?? 0) > 0;
+      const silenceLimit = toolInFlight ? this.toolSilenceMs : this.silenceMs;
       const stuck =
         (neverStarted && elapsed >= this.startGraceMs) ||
-        (!neverStarted && elapsed >= this.silenceMs);
+        (!neverStarted && elapsed >= silenceLimit);
       if (!stuck) continue;
       const reason = neverStarted
         ? "run did not start and was stopped by the watchdog"
@@ -3163,13 +3216,23 @@ export class RuntimeManager {
       if (st?.active?.runId === runId && st.active.startedAt === undefined) {
         st.active.startedAt = Date.now();
       }
+      // A fresh attempt means a fresh CLI process: any tool left open by a
+      // previous attempt died with that process and must not keep this
+      // attempt on the watchdog's long tool-silence window.
+      active.openTools?.clear();
     }
     if (event.type === "tool.call") {
+      // The watchdog's tool-in-flight signal: silence after this point may
+      // be a long tool running inside the VM, not a wedge.
+      this.noteToolCall(active, event.id);
       // Remember which files the agent worked on: the heatmap weighs them.
       const touched = extractTouchedPaths((event as { input?: unknown }).input);
       if (touched.length > 0) {
         void this.recordCodebaseTouches(userId, touched);
       }
+    }
+    if (event.type === "tool.result") {
+      this.noteToolResult(active, event.id);
     }
     this.bus.publish(runId, event);
   }

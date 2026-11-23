@@ -424,3 +424,101 @@ test("writeShotFile + readShotBytes round-trip image bytes", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("assembleReport records the git.commit result in the report and its meta", () => {
+  const events = [
+    seq({ type: "run.created", seq: 1, data: { prompt: "build it", userId: "alice" } }),
+    seq({
+      type: "git.commit",
+      seq: 2,
+      data: {
+        success: true,
+        commitMessage: "feat(app): add the thing",
+        filesCommitted: ["src/app.ts", "src/app.test.ts"],
+        output: "[main abc1234] feat(app): add the thing",
+      },
+    }),
+    seq({ type: "run.finished", seq: 3, exitCode: 0, costUsd: 0.1, durationMs: 5000, numTurns: 2 }),
+  ];
+  const report = assembleReport({
+    runId: "run_1",
+    userId: "alice",
+    events,
+    createdAt: 1_000,
+    finishedAt: 6_000,
+    artifacts: [],
+    shots: [],
+  });
+  assert.deepEqual(report.gitCommit, {
+    success: true,
+    commitMessage: "feat(app): add the thing",
+    filesCommitted: ["src/app.ts", "src/app.test.ts"],
+    output: "[main abc1234] feat(app): add the thing",
+  });
+  assert.deepEqual(report.meta.gitCommit, report.gitCommit);
+});
+
+test("assembleReport omits gitCommit when no git.commit event exists", () => {
+  const report = assembleReport({
+    runId: "run_1",
+    userId: "alice",
+    events: ORDERED_EVENTS,
+    createdAt: 1_000,
+    finishedAt: 6_000,
+    artifacts: [],
+    shots: [],
+  });
+  assert.equal(report.gitCommit, undefined);
+  assert.equal(report.meta.gitCommit, undefined);
+});
+
+test("buildReportSteps shows a successful commit and hides the no-changes case", () => {
+  const committed = buildReportSteps([
+    seq({
+      type: "git.commit",
+      seq: 1,
+      data: {
+        success: true,
+        commitMessage: "feat(app): add the thing",
+        filesCommitted: ["src/app.ts"],
+        output: "[main abc1234] feat(app): add the thing",
+      },
+    }),
+  ]);
+  assert.equal(committed.length, 1);
+  assert.equal(committed[0].kind, "notice");
+  assert.equal(committed[0].text, "Committed: feat(app): add the thing");
+  assert.equal(committed[0].ok, true);
+  assert.equal(committed[0].detail, "1 file");
+
+  const noChanges = buildReportSteps([
+    seq({
+      type: "git.commit",
+      seq: 1,
+      data: {
+        success: false,
+        commitMessage: "",
+        filesCommitted: [],
+        output: "No staged changes to commit.",
+      },
+    }),
+  ]);
+  assert.equal(noChanges.length, 0);
+
+  const failed = buildReportSteps([
+    seq({
+      type: "git.commit",
+      seq: 1,
+      data: {
+        success: false,
+        commitMessage: "",
+        filesCommitted: [],
+        output: "git commit failed: Author identity unknown",
+      },
+    }),
+  ]);
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].text, "Auto-commit failed");
+  assert.equal(failed[0].ok, false);
+  assert.equal(failed[0].detail, "git commit failed: Author identity unknown");
+});

@@ -25,6 +25,7 @@ import { vaultProxyEnv } from "../secrets/inject";
 import { revokeVaultToken } from "../secrets/token";
 import { ClaudeCodeRunner, isSignalKillExitCode } from "../harness/runner";
 import { makeRedactor } from "../harness/redact";
+import { smartCommit, smartCommitDepsFor, type GitCommitResult } from "../harness/git-committer";
 import type {
   ApprovalGateway,
   QuestionGateway,
@@ -41,8 +42,13 @@ import {
   createRouter,
   isClaudeFailoverEligible,
 } from "../providers";
-import { routerProviders, userCooldownFilePath, userProvidersSignature } from "../providers/store";
-import { readUserSettings, systemPackerOptionsFor } from "../providers/settings";
+import {
+  countUserProviders,
+  routerProviders,
+  userCooldownFilePath,
+  userProvidersSignature,
+} from "../providers/store";
+import { gitAutoCommitEnabled, readUserSettings, systemPackerOptionsFor } from "../providers/settings";
 import {
   CONSERVATIVE_CAPABILITIES,
   mergedModelCapabilities,
@@ -107,6 +113,7 @@ import type { RunCompute } from "../computers/compute";
 import { readReportMeta } from "./run-report";
 import type { ReportCardMeta, RunVerificationMeta } from "./run-report-types";
 import { RunReporter } from "./run-reporter";
+import { maybeAutoCommitAfterRun } from "./auto-commit";
 import { attachRunTrajectory } from "./trajectory";
 import { getLastSession, setLastSession, clearLastSession } from "./session-store";
 import { revokeRunToken, signRunToken } from "./run-token";
@@ -454,6 +461,33 @@ function maxConcurrentVmsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   return n;
 }
 
+/**
+ * Default idle floor for on-demand VM eviction: a live VM idle for at
+ * least this long may be hibernated to free a global VM slot for a
+ * capacity-queued run. Deliberately much shorter than the idle
+ * sweeper's window (SWARM_VM_IDLE_MIN, default 30 min) — a queued run
+ * should not wait half an hour while a VM sits unused — but long enough
+ * that a VM whose run just finished, or that is merely between execs,
+ * is never yanked. The sweeper's safety predicate (no exec in flight,
+ * activity re-checked under the write lock) applies in full regardless.
+ */
+const DEFAULT_EVICTION_MIN_IDLE_MS = 60_000;
+
+/**
+ * On-demand eviction idle floor from SWARM_VM_EVICTION_MIN_IDLE_SEC
+ * (default 60s; 0 = no floor beyond the sweeper's safety predicate).
+ * Invalid or negative values fall back to the default. Eviction also
+ * requires hibernation to be enabled (SWARM_VM_IDLE_MIN > 0) — see
+ * VmManager.idleVmCandidates.
+ */
+function evictionMinIdleMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.SWARM_VM_EVICTION_MIN_IDLE_SEC?.trim();
+  if (!raw) return DEFAULT_EVICTION_MIN_IDLE_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_EVICTION_MIN_IDLE_MS;
+  return Math.round(n * 1000);
+}
+
 interface TerminalPatch {
   status: "finished" | "error" | "cancelled";
   exitCode?: number;
@@ -689,6 +723,8 @@ export class RuntimeManager {
   private readonly reporter: RunReporter;
   /** Reads and builds codebase maps inside the user's own VM. */
   private readonly codebaseScanner: CodebaseScanner;
+  /** Post-run auto-commit (opt-in per user; see auto-commit.ts). */
+  private readonly autoCommitFn: (userId: string) => Promise<GitCommitResult>;
   private readonly runner = new ClaudeCodeRunner();
   private readonly users = new Map<string, UserState>();
   /**
@@ -702,8 +738,11 @@ export class RuntimeManager {
   private readonly routers = new Map<string, { signature: string; router: Router }>();
   private readonly maxQueuedOverride: number | undefined;
   private readonly maxConcurrentVmsOverride: number | undefined;
+  private readonly evictionMinIdleMsOverride: number | undefined;
   /** Set by cancelAll("shutdown"): capacity drains must not start runs while the process exits. */
   private shuttingDown = false;
+  /** The in-flight on-demand eviction loop, if any (one at a time). */
+  private evictionInFlight: Promise<void> | null = null;
   private readonly startGraceMs: number;
   private readonly silenceMs: number;
   private readonly toolSilenceMs: number;
@@ -752,6 +791,12 @@ export class RuntimeManager {
      */
     maxConcurrentVms?: number;
     /**
+     * On-demand eviction idle floor override, ms
+     * (SWARM_VM_EVICTION_MIN_IDLE_SEC when unset). Tests use this to
+     * exercise eviction without waiting out the production floor.
+     */
+    evictionMinIdleMs?: number;
+    /**
      * Watchdog thresholds, ms. Overridable so tests can exercise stuck runs
      * quickly; production uses the conservative defaults.
      */
@@ -777,6 +822,8 @@ export class RuntimeManager {
     reporter?: RunReporter;
     /** Test hook: inject the codebase scanner (default: the user's VM). */
     codebaseScanner?: CodebaseScanner;
+    /** Test hook: inject the post-run auto-commit (default: smartCommit over the user's VM). */
+    autoCommit?: (userId: string) => Promise<GitCommitResult>;
     /**
      * Durable active+queue snapshot. Omitted/null keeps this manager
      * memory-only (tests); the process-wide singleton passes the real store.
@@ -787,9 +834,12 @@ export class RuntimeManager {
     this.bus = opts.bus ?? telemetryBus;
     this.reporter = opts.reporter ?? new RunReporter({ vm: this.vm, bus: this.bus });
     this.codebaseScanner = opts.codebaseScanner ?? createVmScanner(this.vm);
+    this.autoCommitFn =
+      opts.autoCommit ?? ((userId) => smartCommit(userId, smartCommitDepsFor(this.vm)));
     this.routerOverride = opts.router === undefined ? undefined : opts.router;
     this.maxQueuedOverride = opts.maxQueued;
     this.maxConcurrentVmsOverride = opts.maxConcurrentVms;
+    this.evictionMinIdleMsOverride = opts.evictionMinIdleMs;
     this.startGraceMs = opts.startGraceMs ?? DEFAULT_START_GRACE_MS;
     this.silenceMs = opts.silenceMs ?? DEFAULT_SILENCE_MS;
     this.toolSilenceMs = opts.toolSilenceMs ?? DEFAULT_TOOL_SILENCE_MS;
@@ -916,6 +966,14 @@ export class RuntimeManager {
   }
 
   /**
+   * Idle floor for on-demand VM eviction (SWARM_VM_EVICTION_MIN_IDLE_SEC,
+   * default 60s). See evictionMinIdleMsFromEnv.
+   */
+  private evictionMinIdleMs(): number {
+    return this.evictionMinIdleMsOverride ?? evictionMinIdleMsFromEnv();
+  }
+
+  /**
    * Users whose VM slot is committed: their VM is live (ensured and not
    * hibernated/stopped/reset — an idle-but-alive VM still holds host RAM,
    * so it counts until the idle sweeper reaps it) or they have an active
@@ -980,6 +1038,15 @@ export class RuntimeManager {
    * already live never waits for capacity. No-op during shutdown.
    */
   drainCapacityQueue(): void {
+    this.drainCapacityQueueNow();
+    // A run still waiting for a slot after the drain would otherwise sit
+    // until the idle sweeper's window (SWARM_VM_IDLE_MIN) reaps an
+    // idle-but-alive VM. Try freeing a slot now by hibernating the
+    // longest-idle VM instead.
+    this.tryEvictIdleVmForCapacity();
+  }
+
+  private drainCapacityQueueNow(): void {
     if (this.shuttingDown) return;
     for (;;) {
       let best: { userId: string; createdAt: number } | null = null;
@@ -1000,6 +1067,84 @@ export class RuntimeManager {
       // startNext sets the active run synchronously; if it did not (the
       // gate raced a state change), stop instead of spinning.
       if (!this.users.get(best.userId)?.active) return;
+    }
+  }
+
+  /**
+   * The oldest capacity-queued run head: a queued run whose user has no
+   * active run and no global VM slot available — exactly the run
+   * drainCapacityQueue cannot start. Null when nobody waits for capacity.
+   */
+  private capacityQueuedHead(): { userId: string; runId: string } | null {
+    let best: { userId: string; runId: string; createdAt: number } | null = null;
+    for (const [userId, st] of this.users) {
+      if (st.active || st.queue.length === 0) continue;
+      if (this.vmSlotAvailable(userId)) continue;
+      const head = st.queue[0];
+      if (
+        !best ||
+        head.createdAt < best.createdAt ||
+        (head.createdAt === best.createdAt && userId < best.userId)
+      ) {
+        best = { userId, runId: head.runId, createdAt: head.createdAt };
+      }
+    }
+    return best ? { userId: best.userId, runId: best.runId } : null;
+  }
+
+  /**
+   * Kick off on-demand VM eviction for capacity-queued runs (fire and
+   * forget; one loop at a time). Called when a run queues for capacity
+   * and after every capacity drain, so a VM that crosses the eviction
+   * idle floor later is still picked up by the watchdog-sweep drain.
+   * No-op when the cap is disabled, during shutdown, or while a loop is
+   * already running.
+   */
+  private tryEvictIdleVmForCapacity(): void {
+    if (this.shuttingDown || this.evictionInFlight) return;
+    if (this.maxConcurrentVms() <= 0) return;
+    const run = this.evictIdleVmsForCapacity();
+    this.evictionInFlight = run;
+    void run.finally(() => {
+      if (this.evictionInFlight === run) this.evictionInFlight = null;
+    });
+  }
+
+  /**
+   * While a run waits for a global VM slot, hibernate the longest-idle
+   * live VM to free one — instead of waiting out the idle sweeper's
+   * window. A victim must pass the sweeper's safety predicate (idle past
+   * the eviction floor, no exec in flight, activity re-checked under
+   * the write lock) and have no active run and no queued work; the
+   * waiting run's own user is never a victim (their VM is not live —
+   * that is why they wait — and they have queued work). One eviction at
+   * a time, then a drain; the loop is bounded by the candidate count
+   * because every iteration either evicts a distinct VM or stops.
+   * Best-effort: a failed or raced eviction leaves the run queued
+   * exactly as before.
+   */
+  private async evictIdleVmsForCapacity(): Promise<void> {
+    try {
+      for (;;) {
+        if (this.shuttingDown) return;
+        const head = this.capacityQueuedHead();
+        if (!head) return;
+        const floor = this.evictionMinIdleMs();
+        const victim = this.vm.idleVmCandidates(floor).find((candidate) => {
+          const st = this.users.get(candidate.userId);
+          return !st?.active && (st?.queue.length ?? 0) === 0;
+        });
+        if (!victim) return;
+        const evicted = await this.vm.evictIdleVm(victim.userId, floor);
+        if (!evicted) return; // raced or failed: stop rather than spin
+        this.bus.publish(head.runId, {
+          type: "vm.evicted",
+          data: { evictedUserId: victim.userId, idleMs: victim.idleMs, reason: "capacity" },
+        });
+        this.drainCapacityQueue();
+      }
+    } catch (err) {
+      console.error("[runtime] on-demand VM eviction failed:", err);
     }
   }
 
@@ -1344,6 +1489,9 @@ export class RuntimeManager {
     try {
       await this.vm.ensure(userId);
       await this.vm.exec(userId, buildPgidKillCommand(pgidFile), {
+        // Control lane: the reap must run even while a long agent exec
+        // holds every general slot, or orphans outlive the run.
+        lane: "control",
         timeoutMs: KILL_TIMEOUT_MS,
         signal: AbortSignal.timeout(KILL_TIMEOUT_MS),
       });
@@ -1574,6 +1722,7 @@ export class RuntimeManager {
     // (rm -f exits 0), and a failure here must never block the run.
     try {
       await this.vm.exec(userId, ["sh", "-c", `rm -f ${ASK_QUESTIONS_DIR}/*.pending.json`], {
+        lane: "control",
         timeoutMs: 10_000,
       });
     } catch {
@@ -1697,6 +1846,30 @@ export class RuntimeManager {
           "or resend it from the verify page (/verify-email).",
       };
     }
+    // Zero-provider guard (FIX-43 follow-up): in server mode a run gets
+    // credentials only from the account's own saved providers — host env
+    // keys are stripped from the router (routerProviders) and scrubbed
+    // from the no-selection fallback env (envFallback), per the per-user
+    // BYOK rule — so an account with no usable provider can never
+    // complete a run. Refuse at admission with the fix named, instead of
+    // accepting the run and failing it in the VM ("Run failed."). Local
+    // mode is never gated: the single trusted user's host env
+    // (SWARM_KEYS_* / ANTHROPIC_*) legitimately serves runs with zero
+    // saved providers. "Configured but keys invalid" is deliberately not
+    // gated here — countUserProviders checks presence only; invalid keys
+    // are the router's failover domain. Queued/restored runs were
+    // admitted through this same gate, so gating start() (the single
+    // admission point) is sufficient.
+    if (serverMode() && countUserProviders(userId) === 0) {
+      return {
+        accepted: false,
+        runId: "",
+        queued: false,
+        error:
+          "No model provider is configured for this account. " +
+          "Add a provider API key in Settings under Providers, then try again.",
+      };
+    }
     const runId = `run_${randomUUID()}`;
     const st = this.state(userId);
     // A restored queue drains on a deferred tick after construction (see
@@ -1787,6 +1960,11 @@ export class RuntimeManager {
         },
       });
       this.persistState();
+      // A capacity wait may be avoidable: try hibernating the
+      // longest-idle VM to free a slot now instead of waiting out the
+      // idle sweeper's window. Fire and forget — the run starts via the
+      // drain that follows a successful eviction.
+      if (capacityWait) this.tryEvictIdleVmForCapacity();
       return { accepted: true, runId, queued: true, position, ...(capacity ? { capacity } : {}) };
     }
 
@@ -2815,6 +2993,11 @@ export class RuntimeManager {
     const approvalEnv = hookBaseUrl && runToken ? approvalHookEnv(hookBaseUrl, runToken) : {};
     const approvalHook = Object.keys(approvalEnv).length > 0;
     const verificationEnabled = isShadowVerificationEnabled();
+    // Opt-in post-run auto-commit: when enabled, the run's finish is
+    // deferred (like the shadow gate) so finalizeFinished can commit the
+    // tracked changes before the terminal event. Read once per phase;
+    // finalizeFinished re-checks the setting at commit time.
+    const autoCommitEnabled = gitAutoCommitEnabled(readUserSettings(userId));
 
     while (true) {
       const selection = router
@@ -2852,12 +3035,18 @@ export class RuntimeManager {
           null,
           fallbackPhase,
           approvalHook,
-          verificationEnabled,
+          verificationEnabled || autoCommitEnabled,
         );
         if (outcome.roleSwitch) return { switched: true, ...outcome.roleSwitch };
         if (outcome.aborted) return { switched: false };
         if (!attemptError) {
-          if (!verificationEnabled || !finishEvent) return { switched: false }; // success finalized via run.finished
+          if (!finishEvent) return { switched: false }; // success finalized via run.finished
+          if (!verificationEnabled) {
+            // The finish was deferred only for the opt-in auto-commit:
+            // finalize directly (finalizeFinished runs the commit first).
+            await this.finalizeFinished(active, finishEvent, undefined);
+            return { switched: false };
+          }
           const gate = await this.runShadowGate(active, finishEvent);
           if (gate.outcome === "finalized") return { switched: false };
           active.prompt = bounceRemediationPrompt(gate.summary);
@@ -2911,7 +3100,7 @@ export class RuntimeManager {
         selection,
         phase,
         approvalHook,
-        verificationEnabled,
+        verificationEnabled || autoCommitEnabled,
       );
       if (outcome.roleSwitch) {
         selection.release();
@@ -2961,7 +3150,13 @@ export class RuntimeManager {
       // agent (bounded) if the code is unverified or the build broke.
       if (!attemptError) {
         selection.settle({ ok: true });
-        if (!verificationEnabled || !finishEvent) return { switched: false }; // success finalized via run.finished
+        if (!finishEvent) return { switched: false }; // success finalized via run.finished
+        if (!verificationEnabled) {
+          // The finish was deferred only for the opt-in auto-commit:
+          // finalize directly (finalizeFinished runs the commit first).
+          await this.finalizeFinished(active, finishEvent, undefined);
+          return { switched: false };
+        }
         const gate = await this.runShadowGate(active, finishEvent);
         if (gate.outcome === "finalized") return { switched: false };
         active.prompt = bounceRemediationPrompt(gate.summary);
@@ -3039,11 +3234,11 @@ export class RuntimeManager {
   }
 
   /** Finalize a finished run with its verification badge, if any. */
-  private finalizeFinished(
+  private async finalizeFinished(
     active: ActiveRun,
     finishEvent: Extract<HarnessEvent, { type: "run.finished" }>,
     summary: ShadowVerificationSummary | undefined,
-  ): void {
+  ): Promise<void> {
     const patch: TerminalPatch = {
       status: "finished",
       exitCode: finishEvent.exitCode,
@@ -3063,6 +3258,19 @@ export class RuntimeManager {
       patch.verification = meta;
       writeRunVerification(active.runId, meta);
     }
+    // Opt-in auto-commit (per-user `gitAutoCommit` setting, default off):
+    // commit the run's tracked changes before the terminal event so the
+    // git.commit result lands inside the run stream. Best-effort — a
+    // failure (including a VM without a git identity) is published as the
+    // event payload and never blocks or fails the finished run. When the
+    // setting is off this is a no-op and the path below is unchanged.
+    const autoCommitted = await maybeAutoCommitAfterRun(
+      { commit: this.autoCommitFn, publish: (runId, event) => this.bus.publish(runId, event) },
+      { userId: active.userId, runId: active.runId, exitCode: finishEvent.exitCode },
+    );
+    // The commit awaited VM/LLM work; a cancel that landed meanwhile has
+    // already finalized this run — do not publish a second terminal event.
+    if (autoCommitted && !this.isStillActive(active.runId, active.userId)) return;
     this.bus.publish(active.runId, finishEvent);
     this.finalize(active.runId, patch);
   }
@@ -3091,12 +3299,12 @@ export class RuntimeManager {
     try {
       const plan = await this.resolveVerificationPlan(active);
       if (!plan) {
-        this.finalizeFinished(active, finishEvent, undefined);
+        await this.finalizeFinished(active, finishEvent, undefined);
         return { outcome: "finalized" };
       }
       const callLLM = createCheapCallLLM(userId, { signal: active.controller.signal });
       if (!callLLM) {
-        this.finalizeFinished(active, finishEvent, undefined);
+        await this.finalizeFinished(active, finishEvent, undefined);
         return { outcome: "finalized" };
       }
       const deps: ShadowVerifierDeps = {
@@ -3111,7 +3319,7 @@ export class RuntimeManager {
       });
       if (!summary.passed) {
         if (attemptsUsed + 1 >= SHADOW_VERIFIER_MAX_ROUNDS) {
-          this.finalizeFinished(active, finishEvent, summary);
+          await this.finalizeFinished(active, finishEvent, summary);
           return { outcome: "finalized" };
         }
         return { outcome: "bounce", summary };
@@ -3129,7 +3337,7 @@ export class RuntimeManager {
         });
         if (!gate.summary.passed) {
           if (attemptsUsed + 1 >= SHADOW_VERIFIER_MAX_ROUNDS) {
-            this.finalizeFinished(active, finishEvent, gate.summary);
+            await this.finalizeFinished(active, finishEvent, gate.summary);
             return { outcome: "finalized" };
           }
           return { outcome: "bounce", summary: gate.summary };
@@ -3137,11 +3345,11 @@ export class RuntimeManager {
       } catch {
         // Gate plumbing failed — finalize with the passing shadow summary.
       }
-      this.finalizeFinished(active, finishEvent, summary);
+      await this.finalizeFinished(active, finishEvent, summary);
       return { outcome: "finalized" };
     } catch {
       // Never let a verifier failure wedge or falsely bounce a run.
-      this.finalizeFinished(active, finishEvent, undefined);
+      await this.finalizeFinished(active, finishEvent, undefined);
       return { outcome: "finalized" };
     }
   }

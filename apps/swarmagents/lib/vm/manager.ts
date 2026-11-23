@@ -72,6 +72,13 @@ interface ActivityRecord {
   seq: number;
 }
 
+/** A live VM that may be hibernated on demand (see idleVmCandidates). */
+export interface IdleVmCandidate {
+  userId: string;
+  /** Milliseconds since the user's last recorded VM activity. */
+  idleMs: number;
+}
+
 function resolveDriver(name?: string): VmDriver {
   // Development/tests may opt into the transcript driver, but a production
   // process must never silently present simulated work as a real VM run.
@@ -109,8 +116,9 @@ function combineSignals(signals: (AbortSignal | undefined)[]): AbortSignal | und
  *   concurrently under shared access, while reset/stop/snapshot take
  *   exclusive access so they cannot interleave with an exec mid-flight and
  *   block new operations until they finish.
- * - Enforces per-user quotas (concurrency, exec duration, output bytes,
- *   workspace disk) and rejects violations with a typed QuotaError.
+ * - Enforces per-user quotas (concurrency — with a reserved control lane
+ *   for host management execs — exec duration, output bytes, workspace
+ *   disk) and rejects violations with a typed QuotaError.
  * - Measures /workspace usage with `du` (cached 60 s) so new runs can be
  *   refused while a user is over SWARM_VM_DISK_QUOTA_MB.
  * - Tracks the last activity per user so idle VMs can be hibernated
@@ -125,7 +133,7 @@ export class VmManager {
   private cache = new Map<string, Promise<VmHandle>>();
   private handles = new Map<string, VmHandle>();
   private locks = new Map<string, RwLock>();
-  private execSlots = new Map<string, number>();
+  private execSlots = new Map<string, { general: number; control: number }>();
   private activity = new Map<string, ActivityRecord>();
   private activitySeq = 0;
   private diskUsageCache = new Map<string, DiskUsageCacheEntry>();
@@ -166,26 +174,40 @@ export class VmManager {
     }
   }
 
-  /** Reserve an exec slot; throws QuotaError when the user is over the cap. */
-  private acquireExecSlot(userId: string): void {
-    const limit = this.quotas.maxConcurrentExecsPerUser;
-    if (limit <= 0) return;
-    const current = this.execSlots.get(userId) ?? 0;
-    if (current >= limit) {
+  /**
+   * Reserve an exec slot in the caller's lane; throws QuotaError when the
+   * user is over that lane's cap. The two lanes are independent pools:
+   * general execs can never consume the reserved control capacity, and
+   * control execs never count against the general pool. Slots are always
+   * counted (so hasActiveExec stays accurate); a cap of 0 disables
+   * enforcement for that lane.
+   */
+  private acquireExecSlot(userId: string, lane: "general" | "control"): void {
+    const limit =
+      lane === "control"
+        ? this.quotas.controlMaxConcurrentExecsPerUser
+        : this.quotas.maxConcurrentExecsPerUser;
+    const slots = this.execSlots.get(userId) ?? { general: 0, control: 0 };
+    const current = slots[lane];
+    if (limit > 0 && current >= limit) {
       throw new QuotaError(
         "max_concurrent_execs",
         limit,
         userId,
-        `User ${userId} already has ${current} exec(s) in flight (limit ${limit}).`,
+        lane === "control"
+          ? `User ${userId} already has ${current} control exec(s) in flight (limit ${limit}).`
+          : `User ${userId} already has ${current} exec(s) in flight (limit ${limit}).`,
       );
     }
-    this.execSlots.set(userId, current + 1);
+    slots[lane] = current + 1;
+    this.execSlots.set(userId, slots);
   }
 
-  private releaseExecSlot(userId: string): void {
-    const current = this.execSlots.get(userId) ?? 0;
-    if (current <= 1) this.execSlots.delete(userId);
-    else this.execSlots.set(userId, current - 1);
+  private releaseExecSlot(userId: string, lane: "general" | "control"): void {
+    const slots = this.execSlots.get(userId);
+    if (!slots) return;
+    slots[lane] = Math.max(0, slots[lane] - 1);
+    if (slots.general <= 0 && slots.control <= 0) this.execSlots.delete(userId);
   }
 
   // -------------------------------------------------------------------------
@@ -240,9 +262,10 @@ export class VmManager {
     return ids;
   }
 
-  /** True while an exec is in flight for the user. */
+  /** True while an exec (either lane) is in flight for the user. */
   hasActiveExec(userId: string): boolean {
-    return (this.execSlots.get(userId) ?? 0) > 0;
+    const slots = this.execSlots.get(userId);
+    return !!slots && slots.general + slots.control > 0;
   }
 
   // -------------------------------------------------------------------------
@@ -435,9 +458,10 @@ export class VmManager {
    * an idle sweep can never stop the VM while this exec is running.
    */
   async exec(userId: string, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
+    const lane = opts?.lane ?? "general";
     let acquired = false;
     try {
-      this.acquireExecSlot(userId);
+      this.acquireExecSlot(userId, lane);
       acquired = true;
       this.touch(userId);
       return await this.withRead(userId, async () => {
@@ -447,7 +471,7 @@ export class VmManager {
         return result;
       });
     } finally {
-      if (acquired) this.releaseExecSlot(userId);
+      if (acquired) this.releaseExecSlot(userId, lane);
     }
   }
 
@@ -801,39 +825,105 @@ export class VmManager {
 
     const stopped: string[] = [];
     for (const [userId, record] of [...this.activity]) {
-      if (now - record.at < this.idle.idleMs) continue;
-      if (this.hasActiveExec(userId)) continue;
-      const handle = this.handles.get(userId);
-      if (!handle) continue;
-
-      let hibernated = false;
-      try {
-        hibernated = await this.withWrite(userId, async () => {
-          // Re-check under the exclusive lock: the user may have become
-          // active (or started an exec) while we waited for the lock.
-          const current = this.activity.get(userId);
-          if (!current || current.seq !== record.seq) return false;
-          if (this.hasActiveExec(userId)) return false;
-          const live = this.handles.get(userId);
-          if (!live) return false;
-          await this.driver.stop(live);
-          // Drop the cached handle promise so the next ensure() re-ensures
-          // (and restarts) the VM. The volume is kept by the driver.
-          this.cache.delete(userId);
-          return true;
-        });
-      } catch (err) {
-        console.error(`[vm] failed to hibernate idle VM for ${userId}:`, err);
-        continue;
-      }
-
-      if (hibernated) {
-        // The VM is hibernated: forget its activity until it is used again.
-        this.activity.delete(userId);
+      if (await this.hibernateIdleRecord(userId, record, now, this.idle.idleMs)) {
         stopped.push(userId);
       }
     }
     return stopped;
+  }
+
+  /**
+   * Live VMs that may be hibernated right now to free host capacity,
+   * longest-idle first: ensured (holding a slot), idle for at least
+   * `minIdleMs`, and with no exec in flight — the idle sweeper's safety
+   * predicate with a caller-chosen idle floor in place of the sweeper
+   * window. Read-only: never ensures, touches, or stops anything.
+   *
+   * Empty when hibernation is disabled (`SWARM_VM_IDLE_MIN=0`): an
+   * operator who turned hibernation off gets no on-demand eviction
+   * either — the two share one mechanism (see evictIdleVm).
+   */
+  idleVmCandidates(minIdleMs: number, now: number = this.now()): IdleVmCandidate[] {
+    if (this.idle.idleMs <= 0) return [];
+    const candidates: IdleVmCandidate[] = [];
+    for (const [userId, record] of this.activity) {
+      const idleMs = now - record.at;
+      if (idleMs < minIdleMs) continue;
+      // Must actually hold a slot: a stopped VM keeps its activity record
+      // and handle, but its cached handle promise is gone (see isVmLive).
+      if (!this.cache.has(userId)) continue;
+      if (!this.handles.has(userId)) continue;
+      if (this.hasActiveExec(userId)) continue;
+      candidates.push({ userId, idleMs });
+    }
+    candidates.sort(
+      (a, b) => b.idleMs - a.idleMs || (a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0),
+    );
+    return candidates;
+  }
+
+  /**
+   * Hibernate one user's VM on demand (capacity pressure), reusing the
+   * idle sweeper's exact stop path and safety checks with `minIdleMs` as
+   * the idle floor instead of the sweeper window. Returns true only when
+   * a live VM was actually hibernated (a slot freed). A VM that is not
+   * live, became active, or has an exec in flight is left alone; a driver
+   * failure is logged and reported as false — never thrown.
+   */
+  async evictIdleVm(userId: string, minIdleMs: number, now: number = this.now()): Promise<boolean> {
+    if (this.idle.idleMs <= 0) return false;
+    const record = this.activity.get(userId);
+    if (!record) return false;
+    if (!this.cache.has(userId)) return false;
+    return this.hibernateIdleRecord(userId, record, now, minIdleMs);
+  }
+
+  /**
+   * Hibernate one VM iff it has been idle for at least `minIdleMs` and is
+   * safe to stop. Shared by sweepIdle (floor = the idle window) and
+   * evictIdleVm (floor = the caller's eviction floor) so both paths stop
+   * VMs identically: never with an exec in flight, activity re-checked
+   * under the per-user write lock, volume kept, cached handle promise
+   * dropped so the next ensure() restarts the VM. Driver failures are
+   * logged and reported as false.
+   */
+  private async hibernateIdleRecord(
+    userId: string,
+    record: ActivityRecord,
+    now: number,
+    minIdleMs: number,
+  ): Promise<boolean> {
+    if (now - record.at < minIdleMs) return false;
+    if (this.hasActiveExec(userId)) return false;
+    const handle = this.handles.get(userId);
+    if (!handle) return false;
+
+    let hibernated = false;
+    try {
+      hibernated = await this.withWrite(userId, async () => {
+        // Re-check under the exclusive lock: the user may have become
+        // active (or started an exec) while we waited for the lock.
+        const current = this.activity.get(userId);
+        if (!current || current.seq !== record.seq) return false;
+        if (this.hasActiveExec(userId)) return false;
+        const live = this.handles.get(userId);
+        if (!live) return false;
+        await this.driver.stop(live);
+        // Drop the cached handle promise so the next ensure() re-ensures
+        // (and restarts) the VM. The volume is kept by the driver.
+        this.cache.delete(userId);
+        return true;
+      });
+    } catch (err) {
+      console.error(`[vm] failed to hibernate idle VM for ${userId}:`, err);
+      return false;
+    }
+
+    if (hibernated) {
+      // The VM is hibernated: forget its activity until it is used again.
+      this.activity.delete(userId);
+    }
+    return hibernated;
   }
 }
 
@@ -870,7 +960,9 @@ export function bindExec(manager: VmManager, userId: string): BoundVmExec {
       // Claude Code is a long-lived, stream-json-producing invocation, not a
       // short terminal command. Keep explicit agent abuse limits without
       // applying the much smaller terminal duration/output defaults to it.
-      return manager.exec(userId, cmd, { ...opts, quotaProfile: "agent" });
+      // Agent work also stays in the general lane: the reserved control
+      // lane is for short host management calls, never for the agent.
+      return manager.exec(userId, cmd, { ...opts, quotaProfile: "agent", lane: "general" });
     },
   };
 }

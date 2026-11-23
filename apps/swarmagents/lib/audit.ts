@@ -61,7 +61,8 @@ export type AuditAction =
   | "vault.proxy"
   | "run.compare.remember"
   | "gardener.autopilot"
-  | "library.unpublish";
+  | "library.unpublish"
+  | "git.commit";
 
 export type AuditResult = "success" | "failure";
 

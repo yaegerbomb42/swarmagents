@@ -1,8 +1,12 @@
 // Per-user VM quotas: prevent a single user from exhausting the host.
 //
 // Independent limits, all enforced by VmManager.exec():
-//  - maxConcurrentExecsPerUser: how many execs may be in flight (running or
-//    queued behind the per-user lock) at once. Extra attempts are rejected.
+//  - maxConcurrentExecsPerUser: how many general-lane execs may be in flight
+//    (running or queued behind the per-user lock) at once. Extra attempts
+//    are rejected.
+//  - controlMaxConcurrentExecsPerUser: separate reserved lane for short
+//    host control-plane execs (kill/reap, health probes, git/status), so a
+//    long agent exec can never starve the host's own management calls.
 //  - maxExecDurationMs / maxOutputBytes: short terminal-exec wall-clock and
 //    combined stdout+stderr caps. On expiry the exec's signal is aborted;
 //    excess output is truncated with a marker.
@@ -36,8 +40,10 @@ export class QuotaError extends Error {
 }
 
 export interface VmQuotaOptions {
-  /** Max execs in flight per user (0 = unlimited). Default 2. */
+  /** Max general-lane execs in flight per user (0 = unlimited). Default 2. */
   maxConcurrentExecsPerUser: number;
+  /** Max control-lane execs in flight per user (0 = unlimited). Default 1. */
+  controlMaxConcurrentExecsPerUser: number;
   /** Max wall-clock duration of a short terminal exec, ms (0 = unlimited). Default 5 min. */
   maxExecDurationMs: number;
   /** Max terminal stdout+stderr bytes forwarded through exec callbacks (0 = unlimited). Default 1 MiB. */
@@ -52,6 +58,7 @@ export interface VmQuotaOptions {
 
 export const DEFAULT_VM_QUOTAS: VmQuotaOptions = {
   maxConcurrentExecsPerUser: 2,
+  controlMaxConcurrentExecsPerUser: 1,
   maxExecDurationMs: 5 * 60_000,
   maxOutputBytes: 1024 * 1024,
   agentMaxExecDurationMs: 2 * 60 * 60_000,
@@ -71,7 +78,8 @@ function parseLimit(raw: number | string | null | undefined, fallback: number): 
 
 /**
  * Merge explicit options over SWARM_VM_* env vars over defaults.
- * Env: SWARM_VM_MAX_CONCURRENT_EXECS, SWARM_VM_MAX_EXEC_MS, SWARM_VM_MAX_OUTPUT_BYTES,
+ * Env: SWARM_VM_MAX_CONCURRENT_EXECS, SWARM_VM_CONTROL_MAX_CONCURRENT_EXECS,
+ * SWARM_VM_MAX_EXEC_MS, SWARM_VM_MAX_OUTPUT_BYTES,
  * SWARM_VM_AGENT_MAX_EXEC_MS, SWARM_VM_AGENT_MAX_OUTPUT_BYTES,
  * SWARM_VM_DISK_QUOTA_MB.
  */
@@ -82,6 +90,10 @@ export function resolveVmQuotas(partial?: Partial<VmQuotaOptions>): VmQuotaOptio
     maxConcurrentExecsPerUser: parseLimit(
       partial?.maxConcurrentExecsPerUser ?? env.SWARM_VM_MAX_CONCURRENT_EXECS,
       d.maxConcurrentExecsPerUser,
+    ),
+    controlMaxConcurrentExecsPerUser: parseLimit(
+      partial?.controlMaxConcurrentExecsPerUser ?? env.SWARM_VM_CONTROL_MAX_CONCURRENT_EXECS,
+      d.controlMaxConcurrentExecsPerUser,
     ),
     maxExecDurationMs: parseLimit(
       partial?.maxExecDurationMs ?? env.SWARM_VM_MAX_EXEC_MS,

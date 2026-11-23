@@ -15,6 +15,7 @@ import {
   MAX_SYSTEM_BUDGET_TOKENS,
   MIN_SYSTEM_BUDGET_TOKENS,
   codebaseContextInjectionEnabled,
+  gitAutoCommitEnabled,
   readUserSettings,
   updateUserSettings,
 } from "@/lib/providers/settings";
@@ -35,7 +36,11 @@ export function GET(request: NextRequest) {
   // The codebase context is on unless it was turned off: report the effective
   // value so the toggle always shows the truth.
   return NextResponse.json(
-    { ...settings, injectCodebaseContext: codebaseContextInjectionEnabled(settings) },
+    {
+      ...settings,
+      injectCodebaseContext: codebaseContextInjectionEnabled(settings),
+      gitAutoCommit: gitAutoCommitEnabled(settings),
+    },
     { headers: NO_STORE },
   );
 }
@@ -74,6 +79,12 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: "allowPaidProviders must be a boolean." }, { status: 400 });
     }
     patch.allowPaidProviders = input.allowPaidProviders;
+  }
+  if ("gitAutoCommit" in input) {
+    if (typeof input.gitAutoCommit !== "boolean") {
+      return NextResponse.json({ error: "gitAutoCommit must be a boolean." }, { status: 400 });
+    }
+    patch.gitAutoCommit = input.gitAutoCommit;
   }
   for (const field of ["perRunBudgetUsd", "perDayBudgetUsd"] as const) {
     if (!(field in input)) continue;
@@ -152,7 +163,11 @@ export async function PUT(request: NextRequest) {
   }
   const next = updateUserSettings(owner, patch);
   return NextResponse.json(
-    { ...next, injectCodebaseContext: codebaseContextInjectionEnabled(next) },
+    {
+      ...next,
+      injectCodebaseContext: codebaseContextInjectionEnabled(next),
+      gitAutoCommit: gitAutoCommitEnabled(next),
+    },
     { status: 200, headers: NO_STORE },
   );
 }

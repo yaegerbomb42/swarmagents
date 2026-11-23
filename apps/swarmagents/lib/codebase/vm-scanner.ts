@@ -31,7 +31,7 @@ export async function vmHomeDir(vm: VmManager, userId: string): Promise<string> 
   if (cached) return cached;
   let out = "";
   await vm
-    .exec(userId, ["sh", "-c", "echo $HOME"], { onStdout: (chunk) => { out += chunk; } })
+    .exec(userId, ["sh", "-c", "echo $HOME"], { lane: "control", onStdout: (chunk) => { out += chunk; } })
     .catch(() => undefined);
   const home = out.trim() || "/home/node";
   homeCache.set(userId, home);
@@ -103,6 +103,7 @@ export function createVmScanner(vm: VmManager): CodebaseScanner {
       let stdout = "";
       try {
         await vm.exec(userId, ["git", "-C", repoRoot, "rev-parse", "HEAD"], {
+          lane: "control",
           timeoutMs: 20_000,
           onStdout: (chunk) => { stdout += chunk; },
         });

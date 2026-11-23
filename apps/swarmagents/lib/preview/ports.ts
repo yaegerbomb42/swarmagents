@@ -93,7 +93,10 @@ export function parseProcNetListening(content: string): number[] {
 
 /** Minimal exec surface `detectListeningPorts` needs (matches VmManager.exec). */
 export interface PreviewProbeExec {
-  (cmd: string[], opts?: { onStdout?: (chunk: string) => void; timeoutMs?: number }): Promise<{
+  (
+    cmd: string[],
+    opts?: { onStdout?: (chunk: string) => void; timeoutMs?: number; lane?: "general" | "control" },
+  ): Promise<{
     exitCode: number;
   }>;
 }
@@ -105,6 +108,9 @@ async function runProbe(exec: PreviewProbeExec, cmd: string[]): Promise<string> 
       onStdout: (chunk) => {
         stdout += chunk;
       },
+      // Status probe: control lane, so port detection still answers while
+      // long tool execs hold every general slot.
+      lane: "control",
       timeoutMs: PREVIEW_PROBE_TIMEOUT_MS,
     });
   } catch {

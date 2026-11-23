@@ -48,6 +48,13 @@ export interface UserSettings {
    * means off, and off means the prompt is byte-identical to before.
    */
   tokenEfficiency?: TokenEfficiencySettings;
+  /**
+   * Commit the workspace's tracked changes automatically after each
+   * successful agent run (LLM-written conventional-commit message; see
+   * lib/harness/git-committer.ts). Absent means off: runs never commit
+   * unless the user opted in.
+   */
+  gitAutoCommit?: boolean;
 }
 
 /** Per-user token-efficiency controls; all opt-in, all default off. */
@@ -152,6 +159,11 @@ export function codebaseContextInjectionEnabled(settings: UserSettings): boolean
   return settings.injectCodebaseContext !== false;
 }
 
+/** Does this account auto-commit tracked changes after successful runs? */
+export function gitAutoCommitEnabled(settings: UserSettings): boolean {
+  return settings.gitAutoCommit === true;
+}
+
 /** One user's settings file path. */
 export function userSettingsFilePath(userId: string, options: DataDirOptions = {}): string {
   return path.join(userProviderDir(userId, options), USER_SETTINGS_FILE);
@@ -196,6 +208,7 @@ export function parseUserSettings(raw: unknown): UserSettings {
   if (ollamaBaseUrl !== undefined) out.ollamaBaseUrl = ollamaBaseUrl;
   const tokenEfficiency = parseTokenEfficiency(raw.tokenEfficiency);
   if (tokenEfficiency !== undefined) out.tokenEfficiency = tokenEfficiency;
+  if (typeof raw.gitAutoCommit === "boolean") out.gitAutoCommit = raw.gitAutoCommit;
   return out;
 }
 

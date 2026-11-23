@@ -38,6 +38,7 @@ import type {
   ReportShotMeta,
   ReportStatus,
   ReportStep,
+  RunGitCommitMeta,
   RunReport,
 } from "./run-report-types";
 
@@ -215,6 +216,30 @@ export function buildReportSteps(events: readonly SequencedEvent[]): ReportStep[
           seq: event.seq,
           ts: event.ts,
         });
+        break;
+      }
+      case "git.commit": {
+        const success = data.success === true;
+        const message = str(data.commitMessage) ?? "";
+        const output = str(data.output) ?? "";
+        if (success) {
+          const files = Array.isArray(data.filesCommitted) ? data.filesCommitted.length : 0;
+          push("notice", `Committed: ${message}`, {
+            seq: event.seq,
+            ts: event.ts,
+            ok: true,
+            detail: files > 0 ? `${files} file${files === 1 ? "" : "s"}` : undefined,
+          });
+        } else if (!output.startsWith("No staged changes")) {
+          // A no-changes run is the common case, not a timeline event; the
+          // full result still lands in the report meta (assembleReport).
+          push("notice", "Auto-commit failed", {
+            seq: event.seq,
+            ts: event.ts,
+            ok: false,
+            detail: output || undefined,
+          });
+        }
         break;
       }
       case "run.finished": {
@@ -633,6 +658,7 @@ export function assembleReport(inputs: ReportInputs): RunReport {
   let durationMs: number | undefined;
   let numTurns: number | undefined;
   let derivedPrompt: string | undefined;
+  let gitCommit: RunGitCommitMeta | undefined;
 
   for (const event of events) {
     const data = isRecord(event.data) ? event.data : {};
@@ -658,6 +684,17 @@ export function assembleReport(inputs: ReportInputs): RunReport {
           seen.add(provider);
           providers.push(provider);
         }
+        break;
+      }
+      case "git.commit": {
+        gitCommit = {
+          success: data.success === true,
+          commitMessage: str(data.commitMessage) ?? "",
+          filesCommitted: Array.isArray(data.filesCommitted)
+            ? data.filesCommitted.filter((f): f is string => typeof f === "string")
+            : [],
+          output: str(data.output) ?? "",
+        };
         break;
       }
       case "run.finished":
@@ -694,6 +731,7 @@ export function assembleReport(inputs: ReportInputs): RunReport {
     providers,
     model,
     ...(inputs.vmImage ? { vmImage: inputs.vmImage } : {}),
+    ...(gitCommit ? { gitCommit } : {}),
   };
 
   // Per-model token accounting from the same event stream. Gateway
@@ -745,6 +783,7 @@ export function assembleReport(inputs: ReportInputs): RunReport {
     shots: inputs.shots,
     meta,
     ...(tokenAccounting ? { tokenAccounting } : {}),
+    ...(gitCommit ? { gitCommit } : {}),
   };
 }
 

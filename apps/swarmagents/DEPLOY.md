@@ -671,6 +671,18 @@ capacity turns over on that cadence; a user whose VM is already live is
 never blocked by other users' VMs. Size it as host RAM ÷ per-VM ceiling,
 leaving headroom for the app itself.
 
+A queued run does not have to wait out the idle window: when a run queues
+for capacity, the longest-idle live VM with no active run, no queued work,
+and no exec in flight is hibernated on demand (the same stop path and
+safety checks as the idle sweeper) once it has been idle for
+`SWARM_VM_EVICTION_MIN_IDLE_SEC` seconds (default 60), freeing a slot for
+the head of the capacity line; the queued run's stream records a
+`vm.evicted` event naming the hibernated user. Eviction is best-effort —
+if no VM qualifies or the stop fails, the run simply keeps waiting for the
+sweeper as before. It requires hibernation to be enabled
+(`SWARM_VM_IDLE_MIN` > 0); with hibernation off, capacity waits are
+unbounded unless the cap is raised or disabled.
+
 ## Desktop stream proxy
 
 The user's live desktop must be reachable only through the app behind login,

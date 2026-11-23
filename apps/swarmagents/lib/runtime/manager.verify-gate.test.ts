@@ -22,6 +22,7 @@ import {
   issueEmailVerificationToken,
   signupLocalUser,
 } from "../users";
+import { configureProviderStorePaths, saveProvider } from "../providers/store";
 
 function makeManager(dir: string): RuntimeManager {
   const runsDir = path.join(dir, "runs");
@@ -42,6 +43,11 @@ test("server mode: unverified local account is refused at start(); verified and 
   process.env.SWARM_SERVER_MODE = "1";
   const manager = makeManager(dir);
   try {
+    // Zero-provider guard (FIX-43 follow-up): server-mode runs need a saved
+    // provider. Seed one for every account the test expects to pass.
+    configureProviderStorePaths(path.join(dir, "providers.json"));
+    saveProvider("alice", { id: "deepseek", apiKey: "sk-test" });
+    saveProvider("local_gate@example.com", { id: "deepseek", apiKey: "sk-test" });
     await signupLocalUser("gate@example.com", "correct horse battery");
     const refused = manager.start("local_gate@example.com", { prompt: "do a thing" });
     assert.equal(refused.accepted, false);
@@ -61,6 +67,7 @@ test("server mode: unverified local account is refused at start(); verified and 
   } finally {
     await manager.cancelAll("shutdown");
     configureUserPaths("");
+    configureProviderStorePaths("");
     delete process.env.SWARM_SESSION_SECRET;
     delete process.env.SWARM_SERVER_MODE;
     fs.rmSync(dir, { recursive: true, force: true });

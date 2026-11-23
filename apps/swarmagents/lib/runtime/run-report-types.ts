@@ -208,6 +208,8 @@ export interface ReportCardMeta {
   vmImage?: string;
   /** Shadow-verifier gate result, when one ran for the run. */
   verification?: RunVerificationMeta;
+  /** Post-run auto-commit result, when the account enabled it. */
+  gitCommit?: RunGitCommitMeta;
 }
 
 /** The shadow-verifier gate result for a run. */
@@ -219,6 +221,17 @@ export interface RunVerificationMeta {
   roundsUsed: number;
   violations: string[];
   passed: boolean;
+}
+
+/** The post-run auto-commit result for a run (git.commit telemetry). */
+export interface RunGitCommitMeta {
+  success: boolean;
+  /** The conventional-commit subject that was committed ("" on failure). */
+  commitMessage: string;
+  /** Files in the commit (empty on failure). */
+  filesCommitted: string[];
+  /** Committer output: git stdout on success, the failure reason otherwise. */
+  output: string;
 }
 
 /** Verdict of an auto-audit of a run's artifacts. */
@@ -283,6 +296,11 @@ export interface RunReport {
    * into the report by the serving route).
    */
   verification?: RunVerificationMeta;
+  /**
+   * Post-run auto-commit result, when the account enabled `gitAutoCommit`
+   * (derived from the run's git.commit telemetry event).
+   */
+  gitCommit?: RunGitCommitMeta;
   /**
    * Tamper-evident audit receipt: hash chain over the prompt, approvals,
    * attestations, redacted command logs and artifact hashes, signed with

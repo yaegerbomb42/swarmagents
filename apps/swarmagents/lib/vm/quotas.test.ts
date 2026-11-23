@@ -381,3 +381,191 @@ test("bound agent execs use long-run quotas instead of short terminal defaults",
   assert.equal(terminal.truncated, true);
   assert.match(terminalChunks.join(""), /output truncated/);
 });
+
+// ---------------------------------------------------------------------------
+// VmManager: reserved control lane (FIX-36)
+// ---------------------------------------------------------------------------
+
+/** Driver whose "hold"/"holdctl" execs block until the test releases them. */
+class LaneGatedFake extends FakeVmDriver {
+  gates: Array<() => void> = [];
+  override async exec(h: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
+    if (cmd[0] === "hold" || cmd[0] === "holdctl") {
+      await new Promise<void>((resolve) => this.gates.push(resolve));
+      return { exitCode: 0 };
+    }
+    return super.exec(h, cmd, opts);
+  }
+}
+
+test("control-lane exec runs immediately while both general slots are occupied", async () => {
+  const driver = new LaneGatedFake();
+  const manager = new VmManager({ customDriver: driver });
+
+  // Two long general execs hold every general slot.
+  const p1 = manager.exec("alice", ["hold", "1"]);
+  await flush();
+  const p2 = manager.exec("alice", ["hold", "2"]);
+  await flush();
+
+  // A third general exec is still rejected...
+  await assert.rejects(
+    manager.exec("alice", ["hold", "3"]),
+    (err: unknown) => err instanceof QuotaError && err.kind === "max_concurrent_execs",
+  );
+
+  // ...but a control-plane exec (kill/reap, probe) is admitted at once.
+  const control = await manager.exec("alice", ["true"], { lane: "control" });
+  assert.equal(control.exitCode, 0);
+
+  driver.gates[0]!();
+  driver.gates[1]!();
+  assert.deepEqual(await p1, { exitCode: 0 });
+  assert.deepEqual(await p2, { exitCode: 0 });
+});
+
+test("control lane respects its own cap and does not consume general slots", async () => {
+  const driver = new LaneGatedFake();
+  const manager = new VmManager({
+    customDriver: driver,
+    quotas: { controlMaxConcurrentExecsPerUser: 1 },
+  });
+
+  const held = manager.exec("alice", ["holdctl"], { lane: "control" });
+  await flush();
+
+  // The reserved lane is full: a second control exec is rejected...
+  await assert.rejects(
+    manager.exec("alice", ["true"], { lane: "control" }),
+    (err: unknown) =>
+      err instanceof QuotaError && err.kind === "max_concurrent_execs" && err.limit === 1,
+  );
+
+  // ...while the general pool is untouched by the held control exec.
+  const g1 = manager.exec("alice", ["hold", "1"]);
+  await flush();
+  const g2 = manager.exec("alice", ["hold", "2"]);
+  await flush();
+
+  // Releasing the control exec frees the reserved slot for the next one.
+  driver.gates[0]!();
+  assert.deepEqual(await held, { exitCode: 0 });
+  await flush();
+  const again = await manager.exec("alice", ["true"], { lane: "control" });
+  assert.equal(again.exitCode, 0);
+
+  driver.gates[1]!();
+  driver.gates[2]!();
+  assert.deepEqual(await g1, { exitCode: 0 });
+  assert.deepEqual(await g2, { exitCode: 0 });
+});
+
+test("general execs cannot consume the reserved control slot", async () => {
+  const driver = new LaneGatedFake();
+  const manager = new VmManager({ customDriver: driver });
+
+  // Saturate the general pool; the control lane must stay available.
+  const g1 = manager.exec("alice", ["hold", "1"]);
+  await flush();
+  const g2 = manager.exec("alice", ["hold", "2"]);
+  await flush();
+  await assert.rejects(
+    manager.exec("alice", ["hold", "3"]),
+    (err: unknown) => err instanceof QuotaError && err.kind === "max_concurrent_execs",
+  );
+
+  const control = manager.exec("alice", ["holdctl"], { lane: "control" });
+  await flush();
+  // The control exec is in flight (gated), not rejected.
+  assert.equal(driver.gates.length, 3);
+
+  driver.gates[0]!();
+  driver.gates[1]!();
+  driver.gates[2]!();
+  assert.deepEqual(await g1, { exitCode: 0 });
+  assert.deepEqual(await g2, { exitCode: 0 });
+  assert.deepEqual(await control, { exitCode: 0 });
+});
+
+test("hasActiveExec counts control-lane execs", async () => {
+  const driver = new LaneGatedFake();
+  const manager = new VmManager({ customDriver: driver });
+
+  assert.equal(manager.hasActiveExec("alice"), false);
+  const held = manager.exec("alice", ["holdctl"], { lane: "control" });
+  await flush();
+  assert.equal(manager.hasActiveExec("alice"), true);
+
+  driver.gates[0]!();
+  await held;
+  await flush();
+  assert.equal(manager.hasActiveExec("alice"), false);
+});
+
+test("bound agent execs stay in the general lane", async () => {
+  const driver = new LaneGatedFake();
+  const manager = new VmManager({ customDriver: driver });
+
+  const g1 = manager.exec("alice", ["hold", "1"]);
+  await flush();
+  const g2 = manager.exec("alice", ["hold", "2"]);
+  await flush();
+
+  // The agent harness (bindExec) must not sneak into the reserved lane
+  // even though it is free.
+  await assert.rejects(
+    bindExec(manager, "alice").exec(["hold", "agent"]),
+    (err: unknown) => err instanceof QuotaError && err.kind === "max_concurrent_execs",
+  );
+
+  driver.gates[0]!();
+  driver.gates[1]!();
+  assert.deepEqual(await g1, { exitCode: 0 });
+  assert.deepEqual(await g2, { exitCode: 0 });
+});
+
+test("control lane: 0 disables the cap", async () => {
+  const driver = new LaneGatedFake();
+  const manager = new VmManager({
+    customDriver: driver,
+    quotas: { controlMaxConcurrentExecsPerUser: 0 },
+  });
+
+  const c1 = manager.exec("alice", ["holdctl", "1"], { lane: "control" });
+  await flush();
+  const c2 = manager.exec("alice", ["holdctl", "2"], { lane: "control" });
+  await flush();
+  assert.equal(driver.gates.length, 2);
+
+  driver.gates[0]!();
+  driver.gates[1]!();
+  assert.deepEqual(await c1, { exitCode: 0 });
+  assert.deepEqual(await c2, { exitCode: 0 });
+});
+
+test("resolveVmQuotas: control lane default, env, override, invalid fallback", () => {
+  assert.equal(DEFAULT_VM_QUOTAS.controlMaxConcurrentExecsPerUser, 1);
+  assert.equal(resolveVmQuotas().controlMaxConcurrentExecsPerUser, 1);
+
+  const prev = process.env.SWARM_VM_CONTROL_MAX_CONCURRENT_EXECS;
+  try {
+    process.env.SWARM_VM_CONTROL_MAX_CONCURRENT_EXECS = "3";
+    assert.equal(resolveVmQuotas().controlMaxConcurrentExecsPerUser, 3);
+    // Explicit options win over env.
+    assert.equal(
+      resolveVmQuotas({ controlMaxConcurrentExecsPerUser: 2 }).controlMaxConcurrentExecsPerUser,
+      2,
+    );
+    // 0 explicitly disables the cap.
+    assert.equal(
+      resolveVmQuotas({ controlMaxConcurrentExecsPerUser: 0 }).controlMaxConcurrentExecsPerUser,
+      0,
+    );
+    // Invalid env falls back to the default.
+    process.env.SWARM_VM_CONTROL_MAX_CONCURRENT_EXECS = "nope";
+    assert.equal(resolveVmQuotas().controlMaxConcurrentExecsPerUser, 1);
+  } finally {
+    if (prev === undefined) delete process.env.SWARM_VM_CONTROL_MAX_CONCURRENT_EXECS;
+    else process.env.SWARM_VM_CONTROL_MAX_CONCURRENT_EXECS = prev;
+  }
+});

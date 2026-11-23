@@ -23,6 +23,14 @@ export interface ExecOptions {
    * limits by default; Claude Code invocations use SWARM_VM_AGENT_MAX_*.
    */
   quotaProfile?: "terminal" | "agent";
+  /**
+   * Concurrency-quota lane. "general" (default) draws from the per-user
+   * pool shared with agent/terminal work; "control" draws from a small
+   * reserved pool so host control-plane execs (kill/reap, health probes,
+   * git/status checks) are never starved by long-running tool execs.
+   * Only short, bounded host operations should use the control lane.
+   */
+  lane?: "general" | "control";
   signal?: AbortSignal;
   /**
    * In-container path of the process-group marker file for this exec. When

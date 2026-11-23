@@ -34,6 +34,7 @@ function productionDeps(): AmbientEngineDeps {
       let stdout = "";
       const target = `${WORKSPACE_ROOT}/${filePath}`;
       const result = await runtime.vmManager.exec(userId, ["stat", "-c", "%Y", target], {
+        lane: "control",
         timeoutMs: 10_000,
         onStdout: (chunk) => {
           stdout += chunk;

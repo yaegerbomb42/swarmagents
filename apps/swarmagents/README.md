@@ -444,6 +444,15 @@ Never commit real keys. All provider keys live in env only.
 | `SWARM_MAX_QUEUED` | `3` | Max prompts queued per user behind the active run (FIFO). |
 | `SWARM_GIT_SHA` | `unknown` | Commit SHA reported by `GET /api/health`. |
 | `SWARM_BUILD_TIME` | unset | Build timestamp reported by `GET /api/health` (`null` when unset). |
+| `SWARM_ADMIN_USERS` | unset (local mode: `local` owner is admin; server mode: nobody) | Comma-separated user ids or account emails allowed to review/unpublish public-library items — the library-moderation trust boundary. Matched case-insensitively; a `local_<email>` session id also matches the bare email. |
+| `SWARM_LIBRARY_PUBLISH_PER_HOUR` | `10` | Public-library publishes allowed per account per hour. |
+| `SWARM_COMPLETE_RATE_LIMIT_PER_MIN` | `60` | Per-minute token-bucket rate for run-completion calls. |
+| `SWARM_PROVIDER_PROBE_RATE_LIMIT_PER_MIN` | `30` | Per-minute token-bucket rate for provider probe calls. |
+| `SWARM_SIGNUP_RATE_LIMIT_PER_MIN` | `5` | Per-minute token-bucket rate for signups. |
+| `SWARM_BYOC_PORT` | `3779` | Port the BYOC hub listens on. |
+| `SWARM_NODE_HOME` | `~/.swarm-node` | State directory for swarm-node (workspaces, credentials). |
+| `SWARM_CLOUD_POOL_CAPACITY` | `5` | Live cloud-pool capacity; `0` simulates a full pool. |
+| `SWARM_TEST_DRIVE_SWEEP_INTERVAL_SEC` | `3600` | Seconds between sweeps that roll back abandoned library test-drives. |
 
 ## Local development
 

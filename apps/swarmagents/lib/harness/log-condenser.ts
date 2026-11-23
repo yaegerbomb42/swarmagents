@@ -15,6 +15,8 @@ const NOISE_FRAME = [/node:internal/i, /node_modules/i, /at async Promise/i];
 // Lines that hint at an actual failure worth surfacing.
 const FAILURE_CLUE = [
   /fail/i,
+  /fatal/i,
+  /crash/i,
   /error/i,
   /expected/i,
   /received/i,

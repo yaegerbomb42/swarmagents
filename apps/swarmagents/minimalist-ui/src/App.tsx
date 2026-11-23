@@ -42,7 +42,7 @@ import { SettingsSheet } from "./components/SettingsSheet";
 import { ShortcutsHelp } from "./components/ShortcutsHelp";
 import { useToasts } from "./components/Toasts";
 import { ScreenFrame } from "./components/dashboard/ScreenFrame";
-import { Button, Notice, type SegmentOption } from "./components/ui";
+import { Button, Loading, Notice, type SegmentOption } from "./components/ui";
 import type { Attachment } from "./data";
 
 const NO_LOGS: LogEvent[] = [];

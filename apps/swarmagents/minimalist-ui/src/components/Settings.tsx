@@ -558,6 +558,7 @@ function Providers({
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [preferFree, setPreferFree] = useState<boolean | null>(null);
+  const [keySelectionMode, setKeySelectionMode] = useState<string | null>(null);
   const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean | null>(null);
   const [decisionBrainEnabled, setDecisionBrainEnabled] = useState<boolean | null>(null);
   const [gitAutoCommit, setGitAutoCommit] = useState<boolean | null>(null);
@@ -591,6 +592,7 @@ function Providers({
             allowPaidProviders?: unknown;
             perRunBudgetUsd?: unknown;
             perDayBudgetUsd?: unknown;
+            keySelectionMode?: unknown;
           };
           if (typeof body.preferFreeProviders === 'boolean') setPreferFree(body.preferFreeProviders);
           if (typeof body.injectCodebaseContext === 'boolean') setInjectCodebaseContext(body.injectCodebaseContext);
@@ -617,6 +619,16 @@ function Providers({
             setPerDayBudget(String(body.perDayBudgetUsd));
           } else {
             setPerDayBudget('');
+          }
+          if (
+            body.keySelectionMode === 'round-robin' ||
+            body.keySelectionMode === 'fallback' ||
+            body.keySelectionMode === 'random' ||
+            body.keySelectionMode === 'tiered'
+          ) {
+            setKeySelectionMode(body.keySelectionMode);
+          } else {
+            setKeySelectionMode('round-robin');
           }
         }
       } catch {
@@ -673,6 +685,24 @@ function Providers({
     } catch {
       setSpendingError('Could not save spending settings.');
       return false;
+    }
+  };
+
+  const setKeySelectionModeRemote = async (v: string) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keySelectionMode: v }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not save key selection mode.');
+        return;
+      }
+      setKeySelectionMode(v);
+    } catch {
+      setSettingsError('Could not save key selection mode.');
     }
   };
 
@@ -852,6 +882,27 @@ function Providers({
               </div>
               <Toggle on={preferFree} onChange={(v) => void setPreferFreeRemote(v)} accent={accent} />
             </div>
+            {keySelectionMode !== null && (
+              <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+                <div>
+                  <div className="text-xs text-white/85">Key selection (quota fallback)</div>
+                  <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                    How a provider&apos;s keys are picked when several are usable: round-robin rotates healthiest-first, fallback always uses the first key until it cools down, random spreads evenly, tiered prefers the fastest healthy key.
+                  </div>
+                </div>
+                <select
+                  value={keySelectionMode}
+                  onChange={(e) => void setKeySelectionModeRemote(e.target.value)}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  className="max-w-28 shrink-0 truncate rounded-lg bg-black/25 px-2 py-1 text-[10px] text-white/70 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
+                >
+                  <option value="round-robin">Round-robin</option>
+                  <option value="fallback">Fallback</option>
+                  <option value="random">Random</option>
+                  <option value="tiered">Tiered</option>
+                </select>
+              </div>
+            )}
             {injectCodebaseContext !== null && (
               <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
                 <div>

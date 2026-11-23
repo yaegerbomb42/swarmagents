@@ -17,6 +17,7 @@ import { routerProviders } from "./store";
 import type { DataDirOptions } from "./store";
 import { RunProviderPool } from "./run-pool";
 import type { RunPoolOptions } from "./run-pool";
+import { keySelectionModeFor, readUserSettings } from "./settings";
 
 export interface UserPoolRouterOptions extends DataDirOptions {
   now?: () => number;
@@ -43,6 +44,7 @@ export function userPoolRouter(userId: string, options: UserPoolRouterOptions = 
     ...(options.fetch ? { fetch: options.fetch } : {}),
     ...(options.cooldownBaseMs !== undefined ? { cooldownBaseMs: options.cooldownBaseMs } : {}),
     ...(options.cooldownMaxMs !== undefined ? { cooldownMaxMs: options.cooldownMaxMs } : {}),
+    keySelectionMode: keySelectionModeFor(readUserSettings(userId, options)),
   });
 }
 

@@ -407,10 +407,14 @@ test("negative and non-finite telemetry values are clamped", () => {
   assert.equal(clamped.calls[0]!.latencyMs, 0);
   assert.equal(clamped.calls[0]!.queuedMs, 0);
   assert.equal(clamped.calls[0]!.ttftMs, 0);
-  assert.equal(clamped.calls[0]!.costUsd, 0);
+  // A negative cost is corrupt telemetry, not a priced $0 call: like the NaN
+  // cost below, it is unknown, so the call is not priced. Durations still
+  // clamp to zero; costs never do — the rule usage.ts already applied, now
+  // shared via ./events.ts.
+  assert.equal(clamped.calls[0]!.costUsd, null);
   assert.equal(clamped.totalLatencyMs, 0);
   assert.equal(clamped.costUsd, 0);
-  assert.equal(clamped.costSource, "llm_calls");
+  assert.equal(clamped.costSource, "none");
 
   const nonFinite: CostEvent[] = [
     {

@@ -140,7 +140,7 @@ test("the composer is labelled and offers Send only when there is something to s
 // ---- Flow A: run status, Stop, and the screen ----
 
 test("the run indicator names every phase, and offers Stop exactly while the agent is busy", async () => {
-  const { RunIndicator } = await load();
+  const { RunIndicator, RUN_TONE_TO_PILL } = await load();
   const render = (phase: RunPhase | null) =>
     renderToStaticMarkup(
       h(RunIndicator, { phase, since: Date.now() - 5000, activity: "Running npm test", stopping: false, onStop: noop, onShow: noop }),
@@ -152,7 +152,9 @@ test("the run indicator names every phase, and offers Stop exactly while the age
     const meta = RUN_PHASE_META[phase];
     assert.match(tagOf(html, "run-indicator"), new RegExp(`data-phase="${phase}"`));
     assert.ok(html.includes(`>${meta.label}<`) || html.includes(`${meta.label}</span>`), `${phase} shows "${meta.label}"`);
-    assert.match(html, new RegExp(`data-tone="${meta.tone}"`));
+    assert.match(html, new RegExp(`data-tone="${RUN_TONE_TO_PILL[meta.tone]}"`));
+    // The brand pill pulses while the agent is busy, and sits still once done.
+    assert.equal(html.includes("animate-pulse"), meta.active, `live pulse for ${phase}`);
     assert.equal(countOf(html, 'data-testid="stop-run"'), meta.active ? 1 : 0, `Stop for ${phase}`);
     // What the agent is doing is said while it works; the other phases already say what is going on.
     assert.equal(countOf(html, 'data-testid="run-activity"'), phase === "running" ? 1 : 0, `activity for ${phase}`);

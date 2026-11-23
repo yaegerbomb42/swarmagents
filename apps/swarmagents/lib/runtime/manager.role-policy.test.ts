@@ -195,13 +195,13 @@ test("an approved researcher -> deployer escalation resumes the run as deployer"
   }
 });
 
-test("a subset switch (main -> researcher) is allowed without an approval", async () => {
+test("a subset switch (main -> orchestrator) is allowed without an approval", async () => {
   const store = new ApprovalStore({ ttlMs: 5_000 });
   setApprovalStoreForTesting(store);
   try {
     const driver = new ScriptedDriver((index) =>
       index === 0
-        ? { lines: [INIT_LINE, switchLine("researcher")], exitCode: 0 }
+        ? { lines: [INIT_LINE, switchLine("orchestrator")], exitCode: 0 }
         : { lines: [...FAKE_CLAUDE_TRANSCRIPT_LINES], exitCode: 0 },
     );
     const manager = managerWith(driver);

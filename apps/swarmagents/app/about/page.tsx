@@ -231,9 +231,9 @@ export default function AboutPage() {
       {/* Trust & control */}
       <section className="border-t border-white/10">
         <div className="mx-auto max-w-5xl px-5 py-16">
-          <h2 className="text-2xl font-semibold">You're in control</h2>
+          <h2 className="text-2xl font-semibold">You&rsquo;re in control</h2>
           <p className="mt-3 max-w-2xl text-sm leading-relaxed text-white/60">
-            An agent with a computer is only useful if you can trust what it's
+            An agent with a computer is only useful if you can trust what it&rsquo;s
             doing. SwarmAgents is built so you never have to wonder.
           </p>
           <div className="mt-8 grid gap-4 sm:grid-cols-2">
@@ -257,7 +257,7 @@ export default function AboutPage() {
         <div className="mx-auto max-w-5xl px-5 py-16">
           <h2 className="text-2xl font-semibold">Free. Really.</h2>
           <p className="mt-3 max-w-2xl text-sm leading-relaxed text-white/60">
-            SwarmAgents doesn't sell you tokens. You connect your own provider
+            SwarmAgents doesn&rsquo;t sell you tokens. You connect your own provider
             keys — or run the agent on your own hardware — and pay only for
             what you use, to them.
           </p>
@@ -315,11 +315,11 @@ export default function AboutPage() {
       <section className="border-t border-white/10">
         <div className="mx-auto max-w-5xl px-5 py-16 text-center">
           <h2 className="text-2xl font-semibold">
-            Your agent's computer is waiting
+            Your agent&rsquo;s computer is waiting
           </h2>
           <p className="mx-auto mt-3 max-w-xl text-sm leading-relaxed text-white/60">
             Create an account, add a provider key, and type your first task.
-            You'll watch your VM boot and get to work.
+            You&rsquo;ll watch your VM boot and get to work.
           </p>
           <Link
             href="/login"

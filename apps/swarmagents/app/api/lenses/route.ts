@@ -17,10 +17,11 @@
 
 import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../lib/auth";
-import { noStoreJson } from "../../../lib/http";
+import { noStoreJson, readJsonObject } from "../../../lib/http";
 import { isLensId, type LensId } from "../../../lib/lenses/types";
 import { cachedLens, runLens } from "../../../lib/lenses/run";
 import { MAX_FILES, type ReferencedFile } from "../../../lib/lenses/prompts";
+import { AbortError, RouterError } from "../../../lib/providers/errors";
 import { TokenBucket } from "../../../lib/rate-limit";
 import { getRun } from "../../../lib/runtime/run-store";
 import { RUN_ID_RE } from "../../../lib/telemetry/paths";
@@ -72,25 +73,11 @@ export async function POST(req: NextRequest) {
   const user = caller(req);
   if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
 
-  let raw: string;
-  try {
-    raw = await req.text();
-  } catch {
-    return noStoreJson({ error: "Could not read request body." }, { status: 400 });
-  }
-  if (raw.length > MAX_BODY_SIZE) {
-    return noStoreJson({ error: "Request body too large." }, { status: 413 });
-  }
-
-  let body: unknown;
-  try {
-    body = JSON.parse(raw);
-  } catch {
-    return noStoreJson({ error: "Invalid JSON body." }, { status: 400 });
-  }
-  if (!isRecord(body)) {
-    return noStoreJson({ error: "Body must be a JSON object." }, { status: 400 });
-  }
+  // Bounded, streaming body read: an oversized body is rejected with 413
+  // before it is buffered; a malformed body or a non-object stays a 400.
+  const parsed = await readJsonObject(req, MAX_BODY_SIZE);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
 
   if (!isLensId(body.lens)) {
     return noStoreJson({ error: "Unknown lens." }, { status: 400 });
@@ -165,8 +152,21 @@ export async function POST(req: NextRequest) {
     });
     return noStoreJson(result);
   } catch (err) {
-    const detail = err instanceof Error ? err.message : "Lens failed.";
-    // RouterError messages are already redacted (no key material).
-    return noStoreJson({ error: detail || "Lens failed." }, { status: 502 });
+    // A cancelled request is a client-side abort, not a provider failure.
+    if (
+      req.signal.aborted ||
+      err instanceof AbortError ||
+      (err instanceof RouterError && err.code === "aborted")
+    ) {
+      return noStoreJson({ error: "Request aborted." }, { status: 499 });
+    }
+    // RouterError messages are already redacted (no key material), so the
+    // provider's own wording is safe to surface. Anything else is an
+    // internal failure — its message can carry filesystem paths or stack
+    // fragments, so it never reaches the client.
+    if (err instanceof RouterError) {
+      return noStoreJson({ error: err.message || "Lens failed." }, { status: 502 });
+    }
+    return noStoreJson({ error: "Lens failed." }, { status: 500 });
   }
 }

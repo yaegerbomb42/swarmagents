@@ -9,6 +9,7 @@ import type { VmDriver } from "../../../../../../lib/vm/types";
 import { clearPreviewPortsCache } from "../../../../../../lib/preview/ports";
 import { configurePreviewShareDir, resolvePreviewShare } from "../../../../../../lib/preview/tokens";
 import { DELETE as revokeShare, GET as listShares, POST as createShare } from "./route";
+import { DEFAULT_MAX_JSON_BODY_BYTES } from "../../../../../../lib/http";
 
 const SS_SAMPLE = [
   "Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process",
@@ -91,4 +92,28 @@ test("preview share API: create, list, revoke — owner only, listening ports on
 
   const again = await revokeShare(request("/api/runtime/vm/preview/share?port=3000", { method: "DELETE" }));
   assert.equal(((await again.json()) as { revoked: boolean }).revoked, false);
+});
+
+test("preview share POST rejects an oversized body with 413", async (t) => {
+  await setup(t);
+  const huge = JSON.stringify({
+    port: 3000,
+    padding: "x".repeat(DEFAULT_MAX_JSON_BODY_BYTES + 1024),
+  });
+  const res = await createShare(
+    request("/api/runtime/vm/preview/share", { method: "POST", body: huge }),
+  );
+  assert.equal(res.status, 413);
+  const data = (await res.json()) as { error?: string };
+  assert.match(data.error ?? "", /too large/i);
+});
+
+test("preview share POST treats a malformed body as a missing port (400)", async (t) => {
+  await setup(t);
+  const res = await createShare(
+    request("/api/runtime/vm/preview/share", { method: "POST", body: "{not json" }),
+  );
+  assert.equal(res.status, 400);
+  const data = (await res.json()) as { error?: string };
+  assert.equal(data.error, "A valid port is required.");
 });

@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { USER_HEADER } from "@/lib/auth";
 import { runBoardAgent } from "@/lib/board-agent/agent";
+import { boardAgentLogRedactor } from "@/lib/board-agent/redact";
 import { getConversation, listConversations, saveConversation } from "@/lib/board-agent/store";
 import type { BoardAgentConversation } from "@/lib/board-agent/types";
-import { makeRedactor } from "@/lib/harness/redact";
 import { JsonBodyError } from "@/lib/http";
 
 export const runtime = "nodejs";
@@ -99,7 +99,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       if (isAbort) {
         return json({ error: "Request aborted." }, 499);
       }
-      const redact = makeRedactor(process.env as Record<string, string>);
+      const redact = boardAgentLogRedactor(userId);
       const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       console.error("[board-agent] turn execution failed:", redact(msg));
       return json({ error: "Board agent encountered an error processing your request." }, 500);

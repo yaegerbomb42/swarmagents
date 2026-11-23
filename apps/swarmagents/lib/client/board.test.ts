@@ -11,6 +11,11 @@ import path from "node:path";
 import { test } from "node:test";
 import { NextRequest } from "next/server";
 import { GET, POST } from "../../app/api/mcp/swarm-board/route";
+
+// The remote branch check defaults on; tests submit branches that were
+// never pushed, so disable it here (the check itself is covered by
+// git-remote.test.ts with a stubbed git).
+process.env.SWARM_GIT_REMOTE_CHECK = "0";
 import { configureStorePaths } from "../board/store";
 import type { SwarmTask } from "../mcp-types";
 import {

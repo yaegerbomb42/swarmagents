@@ -156,3 +156,55 @@ test("installCrashGuard still exits on an unknown error", () => {
     uninstall();
   }
 });
+
+test("readFile refuses a file larger than the buffered-output cap", async () => {
+  const child = fakeChild();
+  const driver = new DockerVmDriver({
+    spawnFn: () => child.cp,
+    desktop: false,
+    maxRunStdoutBytes: 8,
+  });
+
+  const pending = driver.readFile(handle(), "/workspace/big.txt");
+  child.stdout.write(Buffer.alloc(100, 0x61));
+  // Let the PassThrough deliver before the close lands.
+  await new Promise((resolve) => setImmediate(resolve));
+  child.emitClose(0);
+
+  await assert.rejects(pending, /buffered read cap/);
+});
+
+test("readFile returns content under the cap unchanged", async () => {
+  const child = fakeChild();
+  const driver = new DockerVmDriver({
+    spawnFn: () => child.cp,
+    desktop: false,
+    maxRunStdoutBytes: 8,
+  });
+
+  const pending = driver.readFile(handle(), "/workspace/small.txt");
+  child.stdout.write("hello");
+  await new Promise((resolve) => setImmediate(resolve));
+  child.emitClose(0);
+
+  assert.equal(await pending, "hello");
+});
+
+test("runRaw keeps only the stderr tail past the cap", async () => {
+  const child = fakeChild();
+  const driver = new DockerVmDriver({
+    spawnFn: () => child.cp,
+    desktop: false,
+    maxRunStderrBytes: 8,
+  });
+
+  // status() surfaces stderr as the error on a non-zero inspect.
+  const pending = driver.status(handle());
+  child.stderr.write(`${"x".repeat(90)}TAILMARKER`);
+  await new Promise((resolve) => setImmediate(resolve));
+  child.emitClose(1);
+
+  const state = await pending;
+  assert.equal(state.status, "missing");
+  assert.equal(state.error, "ILMARKER");
+});

@@ -10,6 +10,7 @@ import type {
 import { DIFFICULTY_ELO_MAP } from "@/lib/mcp-types";
 import { saveStoreAtomic } from "./store";
 import { applyArenaMatch } from "./leaderboard";
+import { checkBranchOnRemote, isGitRemoteCheckEnabled } from "./git-remote";
 import {
   validateCreateTask,
   validatePollTasks,
@@ -477,13 +478,33 @@ export async function handleSubmitTaskWork(
   if (isClaimExpired(task, now)) {
     return { error: invalidParams("Task claim expired. Claim the task again before submitting work.") };
   }
-  const gitBranch = args.gitBranch as string;
+  const gitBranch = (args.gitBranch as string).trim();
   const resultSummary = args.summary as string;
   // An omitted link can retain the PR on the same branch, but must not
   // attach the previous branch's PR to a different submission.
   const prUrl = (args.prUrl as string | undefined) || (gitBranch === task.gitBranch ? task.prUrl : undefined);
   const unchanged = task.status === "in_review" && task.gitBranch === gitBranch &&
     task.resultSummary === resultSummary && task.prUrl === prUrl;
+  // A branch that was never pushed cannot be reviewed: verify the ref
+  // exists on origin before accepting new or changed work. An idempotent
+  // retry after a lost response is not re-verified.
+  if (!unchanged && isGitRemoteCheckEnabled()) {
+    const checked = await checkBranchOnRemote(gitBranch);
+    if (!checked.ok) {
+      return {
+        error: invalidParams(
+          `Could not verify gitBranch "${gitBranch}" on origin (${checked.reason}). Make sure the branch is pushed (git push -u origin ${gitBranch}); if it is, the board could not reach the remote — the operator can skip this check with SWARM_GIT_REMOTE_CHECK=0.`,
+        ),
+      };
+    }
+    if (!checked.exists) {
+      return {
+        error: invalidParams(
+          `gitBranch "${gitBranch}" was not found on origin — push it first (git push -u origin ${gitBranch}) before submitting work.`,
+        ),
+      };
+    }
+  }
   const submitted = unchanged ? task : transitionTask({ ...task, gitBranch, resultSummary, prUrl }, "in_review", agentName, now);
   // A retry after a lost response is a no-op; revised work is still accepted.
   if (!unchanged) {

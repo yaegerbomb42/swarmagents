@@ -77,6 +77,21 @@ function assertNoKeyMaterial(text: string, keys: string[]): void {
   }
 }
 
+test("PATCH refuses a body over the 16kb cap with 413", async () => {
+  saveProvider(OWNER, { id: "openai", apiKey: KEY_ONE });
+  const res = await PATCH(
+    new Request("http://localhost/api/providers/openai", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "add-key", apiKey: "sk-test", pad: "x".repeat(16 * 1024) }),
+    }),
+    ctx("openai"),
+  );
+  assert.equal(res.status, 413);
+  const body = (await res.json()) as { error?: string };
+  assert.equal(body.error, "Request body is too large.");
+});
+
 test("PATCH adds a single key and answers with counts and last-4 masks only", async () => {
   saveProvider(OWNER, { id: "openai", apiKey: KEY_ONE });
 

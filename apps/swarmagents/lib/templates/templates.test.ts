@@ -18,6 +18,7 @@ import {
   renderPrompt,
   searchTemplates,
   templatesInCategory,
+  type TaskTemplate,
 } from "./index";
 import { promptVariables, taskTemplateSchema, validateTemplate, validateTemplates } from "./schema";
 import { BUILTIN_ROLE_IDS } from "../roles";
@@ -197,4 +198,134 @@ test("validateTemplate rejects a template whose placeholder has no field", () =>
   };
   const problems = validateTemplate(broken);
   assert.ok(problems.some((problem) => problem.includes("missing_field")));
+});
+
+/** A minimal template that passes validateTemplate unless a test overrides it. */
+function templateWith(overrides: Partial<TaskTemplate> = {}): TaskTemplate {
+  return {
+    id: "valid-template",
+    category: "build-an-app",
+    title: "Valid template",
+    pitch: "A valid pitch long enough for the schema.",
+    prompt: "Use {{flavor}} and write the result to {{output_path}}.",
+    fields: [
+      { name: "flavor", label: "Flavor", type: "select", options: ["vanilla", "chocolate"] },
+      { name: "output_path", label: "Output path", type: "text", default: "/workspace/out.md" },
+    ],
+    role: "main",
+    estimatedMinutes: 5,
+    tools: ["bash"],
+    mcp: [],
+    example: "Wrote the result to /workspace/out.md with the vanilla choice.",
+    ...overrides,
+  };
+}
+
+test("renderPrompt uses the first select option when there is no answer or default", () => {
+  const template = templateWith({
+    id: "select-fallback",
+    prompt: "Choose {{flavor}} for the build.",
+    fields: [{ name: "flavor", label: "Flavor", type: "select", options: ["vanilla", "chocolate"] }],
+  });
+
+  assert.equal(renderPrompt(template, {}), "Choose vanilla for the build.");
+  assert.equal(renderPrompt(template, { flavor: "" }), "Choose vanilla for the build.");
+  assert.equal(renderPrompt(template, { flavor: "chocolate" }), "Choose chocolate for the build.");
+
+  // An inherited property is not a user answer.
+  const inherited = Object.create({ flavor: "chocolate" }) as Record<string, string>;
+  assert.equal(renderPrompt(template, inherited), "Choose vanilla for the build.");
+});
+
+test("validateTemplates merges problems for duplicate template ids", () => {
+  const first = templateWith({
+    id: "duplicate-id",
+    prompt: "Use {{flavor}} and {{output_path}}; also {{missing_first}}.",
+  });
+  const second = templateWith({
+    id: "duplicate-id",
+    prompt: "Use {{flavor}} and {{output_path}}; also {{missing_second}}.",
+  });
+
+  const problems = validateTemplates([first, second]);
+  const issues = problems.get("duplicate-id");
+  assert.ok(issues, "the duplicate id should have an entry");
+  assert.ok(issues.some((problem) => problem.includes("missing_first")));
+  assert.ok(issues.some((problem) => problem.includes("missing_second")));
+  assert.ok(issues.some((problem) => problem.includes('duplicate template id "duplicate-id"')));
+});
+
+test("validateTemplates merges problems for missing template ids", () => {
+  // Schema parsing stops at the id error, so give each template a second,
+  // distinct schema problem to prove both entries survive the merge.
+  const first = { ...templateWith({ title: "X" }), prompt: "Use {{flavor}} and {{output_path}}." };
+  const second = { ...templateWith({ pitch: "short" }), prompt: "Use {{flavor}} and {{output_path}}." };
+  delete (first as Partial<TaskTemplate>).id;
+  delete (second as Partial<TaskTemplate>).id;
+
+  const problems = validateTemplates([first, second]);
+  assert.deepEqual([...problems.keys()], ["(unknown)"], "missing ids share one entry");
+  const issues = problems.get("(unknown)");
+  assert.ok(issues);
+  assert.ok(issues.some((problem) => problem.includes("title")), "the first template's problem survived");
+  assert.ok(issues.some((problem) => problem.includes("pitch")), "the second template's problem survived");
+  assert.ok(
+    issues.filter((problem) => problem.includes("template id is missing or not a string")).length >= 2,
+    "both missing-id problems were recorded",
+  );
+});
+
+test("validateTemplate rejects a select default that is not one of its options", () => {
+  const bad = templateWith({
+    prompt: "Choose {{flavor}} for the build and write the result out.",
+    fields: [
+      {
+        name: "flavor",
+        label: "Flavor",
+        type: "select",
+        options: ["vanilla", "chocolate"],
+        default: "strawberry",
+      },
+    ],
+  });
+  const problems = validateTemplate(bad);
+  assert.ok(
+    problems.some(
+      (problem) =>
+        problem.includes('default "strawberry"') && problem.includes("not one of its options"),
+    ),
+    `expected an invalid-select-default problem, got: ${problems.join("; ")}`,
+  );
+
+  const good = templateWith({
+    prompt: "Choose {{flavor}} for the build and write the result out.",
+    fields: [
+      {
+        name: "flavor",
+        label: "Flavor",
+        type: "select",
+        options: ["vanilla", "chocolate"],
+        default: "chocolate",
+      },
+    ],
+  });
+  assert.deepEqual(validateTemplate(good), []);
+});
+
+test("the browser login template references a password environment variable, not a password", () => {
+  const template = findTemplate("log-in-and-read-data");
+  assert.ok(template);
+  assert.ok(!template.fields.some((field) => field.name === "password"));
+  assert.ok(!JSON.stringify(template).includes("hunter2"));
+  const passwordEnv = template.fields.find((field) => field.name === "password_env");
+  assert.ok(passwordEnv, "the template should ask for a password environment variable");
+  assert.ok(template.prompt.includes("{{password_env}}"));
+  assert.ok(!template.prompt.includes("{{password}}"));
+});
+
+test("read-the-git-history lists write_file because its prompt writes output_path", () => {
+  const template = findTemplate("read-the-git-history");
+  assert.ok(template);
+  assert.ok(template.prompt.includes("{{output_path}}"));
+  assert.ok(template.tools.includes("write_file"));
 });

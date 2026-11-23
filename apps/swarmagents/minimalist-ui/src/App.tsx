@@ -3,17 +3,16 @@
 /**
  * App — SwarmAgents Unified Workspace
  *
- * The frontier-minimal workspace on the brand system (Void Navy / Signal
- * Cyan, cursor-eye mark — branding/BRAND.md): the live VM screen front and
- * center, a short running summary of what the agent is doing, one chat bar,
- * provider state. Wired to:
+ * Implements the brand system (Void Navy / Signal Cyan, cursor-eye mark),
+ * luminous borders, tactile ripples, and live telemetry) seamlessly wired to:
  *   1. Live VM Screen Frame (noVNC viewer, takeover, terminal view, reset).
  *   2. Real-time Run stream telemetry, tool narration, and Conversation.
- *   3. Settings sheet with complete multi-provider catalog & keys.
+ *   3. Cute Mascot animation (MascotDock) with full state sync.
+ *   4. Settings sheet with complete multi-provider catalog & keys.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ClipboardList, MessageSquare, MonitorPlay, Sparkles } from "lucide-react";
+import { ClipboardList, MessageSquare, MonitorPlay } from "lucide-react";
 import type { ProviderConfig } from "./data";
 import { DEFAULT_AGENT_CARD } from "./data";
 import type { LogEvent } from "./engine";
@@ -35,7 +34,6 @@ import { Composer, type ComposerSendResult } from "./components/Composer";
 import { useComputeOptions } from "./components/ComputePicker";
 import type { ComputerView } from "./components/ComputerScreen";
 import { Conversation } from "./components/Conversation";
-import { FirstRunSetup } from "./components/FirstRunSetup";
 import { Header, type WorkspaceView } from "./components/Header";
 import { HistoryPanel } from "./components/HistoryPanel";
 import type { SettingsTab } from "./components/Settings";
@@ -43,7 +41,7 @@ import { SettingsSheet } from "./components/SettingsSheet";
 import { ShortcutsHelp } from "./components/ShortcutsHelp";
 import { useToasts } from "./components/Toasts";
 import { ScreenFrame } from "./components/dashboard/ScreenFrame";
-import { Button, Loading, Notice, SplitHandle, clampSplitRatio, splitChatWidthCss, type SegmentOption } from "./components/ui";
+import { Button, Loading, Notice, type SegmentOption } from "./components/ui";
 import type { Attachment } from "./data";
 
 const NO_LOGS: LogEvent[] = [];
@@ -103,13 +101,20 @@ export function workspaceChordAction(event: {
   if (key === "o" && event.shiftKey) return "newChat";
   return null;
 }
+/** The activity suffix under the workspace label: what the agent is doing, or the computer's state. */
+function workspaceActivitySuffix(
+  activity: string | undefined,
+  phaseActive: boolean | undefined,
+  vmLabel: string,
+): string {
+  if (activity) return ` · ${activity}`;
+  if (phaseActive) return " · Agent is working";
+  return ` · Computer ${vmLabel.toLowerCase()}`;
+}
+
 export default function App() {
   const { push: pushToast } = useToasts();
   const wide = useIsWide();
-  // The console commits to a single column under 900px (phones and small
-  // tablets), independent of the `wide` desktop breakpoint (1024px). Below
-  // this width chat and the Computer/Board views are stacked full-width.
-  const narrow = !useIsWide("(min-width: 900px)");
   const me = useMe();
   const providerStatus = useProviderStatus();
   const compute = useComputeOptions(undefined);
@@ -117,7 +122,7 @@ export default function App() {
   const [providers, setProviders] = usePersisted<ProviderConfig[]>("ac.providers", []);
   const [agentCard, setAgentCard] = usePersisted<string>("ac.agentCard", DEFAULT_AGENT_CARD);
   const [fullAuto, setFullAuto] = usePersisted<boolean>("ac.fullAuto", true);
-  const [view, setView] = usePersisted<WorkspaceView>("sa.view", "chat");
+  const [view, setView] = usePersisted<WorkspaceView>("sa.view", "screen");
   // Dev mode gates the Board view: the board is internal build tooling, not a
   // product feature. Off by default; ?dev=1 turns it on (persisted per
   // browser), ?dev=0 turns it back off.
@@ -131,10 +136,6 @@ export default function App() {
   // linking reads it even while the view is hidden.
   const effectiveView = resolveView(view, devMode);
   const [draft, setDraft] = useSessionPersisted<string>("sa.draft", "");
-  // The chat column's share of the split row, persisted across reloads.
-  const [splitRatio, setSplitRatio] = usePersisted<number>("sa.splitRatio", 0.38);
-  const mainRef = useRef<HTMLElement | null>(null);
-  const chatRef = useRef<HTMLDivElement | null>(null);
   const observedActiveRuns = useRef(new Set<string>());
   const notifiedRuns = useRef(new Set<string>());
 
@@ -151,14 +152,16 @@ export default function App() {
 
   // ---- VM screen ----
 
-  const polledVm = usePolledVmStatus();
+  const lifecycleEvent = latestVmLifecycleEvent(session.liveItems);
+  const polledVm = usePolledVmStatus(undefined, `${session.busy}:${lifecycleEvent ?? ""}`);
   const [vmResetting, setVmResetting] = useState(false);
   const [takingOver, setTakingOver] = useState(false);
   const [screenView, setScreenView] = useState<ComputerView>("desktop");
   const vmDisplay = resolveVmDisplayStatus({
-    latestVmEvent: latestVmLifecycleEvent(session.liveItems),
+    latestVmEvent: session.busy ? lifecycleEvent : undefined,
     polledStatus: polledVm.status,
-    resetting: vmResetting,
+    // Do not dial (and therefore wake) a VM before its first status arrives.
+    resetting: vmResetting || (!polledVm.status && !lifecycleEvent),
   });
   const canControl = polledVm.desktop !== false && vmDisplay.state === "ready";
 
@@ -176,6 +179,9 @@ export default function App() {
 
   const { phase, busy, headRun, activeRun } = session;
   const phaseMeta = phase ? RUN_PHASE_META[phase] : undefined;
+  const activitySuffix = workspaceActivitySuffix(session.activity, phaseMeta?.active, vmDisplay.label);
+  const needsAttention =
+    phase === "approval" || phase === "question" || phase === "paused" || phase === "error" || vmDisplay.state === "error";
 
   useEffect(() => {
     if (activeRun && phaseMeta?.active) observedActiveRuns.current.add(activeRun.runId);
@@ -236,9 +242,10 @@ export default function App() {
   const handleSend = useCallback(
     async (text: string, attachments: Attachment[]): Promise<ComposerSendResult> => {
       const result = await session.send(text, attachments);
+      if (result.ok && !result.queued) setView("screen");
       return result.ok ? { ok: true } : { ok: false, error: result.error };
     },
-    [session],
+    [session, setView],
   );
 
   const handleStop = useCallback(async () => {
@@ -341,11 +348,6 @@ export default function App() {
       : []),
   ];
 
-  const showStage = effectiveView !== "chat";
-  const showChat = wide || effectiveView !== "board";
-  const split = wide && showStage;
-  const hero =
-    effectiveView === "chat" && session.ready && session.turns.length === 0 && !session.pending && !session.turnsLoading;
 
   // A zero-provider account cannot start a run. Instead of letting the first
   // send fail, the workspace blocks the composer with the reason and (for a
@@ -409,183 +411,117 @@ export default function App() {
         </Notice>
       )}
 
-      <main
-        ref={mainRef}
-        className={cn(
-          "relative z-10 flex min-h-0 flex-1 flex-col lg:flex-row p-2 sm:p-3 gap-2 sm:gap-3",
-          narrow ? "overflow-y-auto overflow-x-hidden" : "lg:overflow-hidden",
-        )}
-        data-layout={narrow ? "one-column" : "wide"}
-        data-testid="workspace-main"
-      >
-        {/* Chat & Narration Column */}
-        <div
-          hidden={!showChat}
-          ref={chatRef}
-          style={split ? { width: splitChatWidthCss(splitRatio) } : undefined}
-          className={cn(
-            "order-2 flex min-h-0 min-w-0 flex-1 flex-col lg:order-1 glass rounded-[26px] p-2.5 sm:p-4 shadow-2xl hair",
-            split && "lg:flex-none",
-            hero && "justify-center",
-            !showChat && "hidden",
-          )}
-          data-testid="chat-column"
-        >
-          {!session.ready && !session.signedOut ? (
-            <Loading label="Connecting to autonomous swarm..." className="flex-1" />
-          ) : hero ? (
-            setup.needsProvider ? (
-              <FirstRunSetup onOpenProviders={() => openSettings("providers")} />
-            ) : (
-            <div className="mx-auto w-full max-w-[640px] px-4 pb-6 text-center" data-testid="hero">
-              <div className="enter flex justify-center mb-6">
-                <img src="/brand/mark-dark.svg" alt="" width={64} height={64} />
-              </div>
-              <h1 className="text-[28px] font-semibold leading-tight tracking-tight text-[var(--fg)]">
-                Give it a task. It has its own computer.
-              </h1>
-              <p className="mx-auto mt-2 max-w-md text-sm text-[var(--mute)] leading-relaxed">
-                One autonomous agent in your own persistent Linux VM. Describe the work in one chat bar, watch every step stream live, and take over whenever you want. Free — bring your own model keys.
-              </p>
-            </div>
-            )
+      <main className="relative z-10 flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-3 sm:p-4" data-testid="workspace-main">
+        <section className="mx-auto w-full max-w-3xl shrink-0" aria-label="Ask the agent">
+          <div className="mb-3 flex justify-center">
+            <img src="/brand/mark-dark.svg" alt="" width={48} height={48} />
+          </div>
+          <h1 className="mb-2 text-center text-lg font-semibold tracking-tight sm:text-2xl">Give it a task. It has its own computer.</h1>
+          <p className="mx-auto mb-4 max-w-md text-center text-sm leading-relaxed text-[var(--mute)]">
+            One autonomous agent in your own persistent Linux VM. Describe the work, watch every step live, take over anytime. Free — bring your own model keys.
+          </p>
+          {session.signedOut ? (
+            <Notice
+              tone="warn"
+              title="Sign in to use the agent"
+              className="mb-2"
+              testId="signed-out-notice"
+              action={
+                <a
+                  href="/login"
+                  className="inline-flex h-8 items-center rounded-xl bg-[var(--fg)] px-3 text-[13px] font-medium text-[var(--inv)] transition-colors hover:opacity-90"
+                >
+                  Sign in
+                </a>
+              }
+            >
+              Your session ended or you have not signed in yet.
+            </Notice>
           ) : (
-            <Conversation
-              session={session}
-              taskLinks={board.links}
-              starters={setup.needsProvider ? [] : STARTERS}
-              onWatchScreen={view === "screen" ? undefined : watchScreen}
-              onOpenTask={openTask}
-              onOpenProviders={() => openSettings("providers")}
+            setup.needsProvider && (
+              <Notice
+                tone="warn"
+                title="Add a model provider to start"
+                className="mb-2"
+                testId="provider-notice"
+                action={
+                  <Button size="sm" variant="primary" onClick={() => openSettings("providers")}>
+                    Add provider key
+                  </Button>
+                }
+              >
+                Runs use your configured provider keys.
+              </Notice>
+            )
+          )}
+          <Composer
+            value={draft}
+            onChange={setDraft}
+            onSend={handleSend}
+            blockedReason={
+              session.signedOut ? "Sign in to send" : setup.needsProvider ? "Add a provider key to send" : undefined
+            }
+            inputRef={composerRef}
+          />
+        </section>
+
+        <section className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-2 overflow-y-auto rounded-[24px] glass hair p-3 sm:p-4" data-testid="stage">
+          <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--mute)]" role="status" aria-live="polite" data-testid="workspace-activity">
+            <span className={cn("h-2 w-2 shrink-0 rounded-full", phaseMeta?.active ? "bg-emerald-400 animate-pulse" : "bg-white/30")} />
+            <span className="truncate">{phaseMeta?.label ?? vmDisplay.label}{activitySuffix}</span>
+          </div>
+          {/* Keep the desktop and runtime streams mounted when switching workspace tabs. */}
+          <div className={cn("min-h-[300px] flex-1", effectiveView !== "screen" && "hidden")} aria-hidden={effectiveView !== "screen"}>
+            <ScreenFrame
+              activeView={screenView}
+              onToggleView={setScreenView}
+              showDesktop={polledVm.desktop}
+              logs={NO_LOGS}
+              runId={session.liveRunId}
+              runActive={Boolean(phaseMeta?.active && activeRun)}
+              vmState={vmDisplay.state}
+              vmResetting={vmResetting}
+              polledVmStatus={polledVm.status}
+              desktopMode={polledVm.desktop}
+              activeRoleName={agentName}
+              onResetVm={() => openSettings("agent")}
+              onStopRun={() => void handleStop()}
+              control={takingOver}
+              onControlChange={setTakingOver}
+              canControl={canControl}
+              fitToHeight={wide}
+              presence={screenPresence}
+              activity={session.activity ? [{ text: session.activity }] : undefined}
+              className={wide ? "h-full" : undefined}
+            />
+          </div>
+          {effectiveView === "chat" && (
+            !session.ready && !session.signedOut ? (
+              <Loading label="Connecting to autonomous swarm..." className="min-h-0 flex-1" />
+            ) : (
+              <Conversation
+                session={session}
+                taskLinks={board.links}
+                starters={setup.needsProvider ? [] : STARTERS}
+                onWatchScreen={view === "screen" ? undefined : watchScreen}
+                onOpenTask={openTask}
+                onOpenProviders={() => openSettings("providers")}
+                className="min-h-0 flex-1"
+              />
+            )
+          )}
+          {effectiveView === "board" && (
+            <BoardPanel
+              board={board}
+              agentName={agentName}
+              runFor={session.runById}
+              onRunTask={runTask}
+              onViewRun={viewTaskRun}
+              focusTaskId={focusTaskId}
               className="flex-1"
             />
           )}
-
-          <div className={cn("mx-auto w-full pt-2", hero ? "max-w-[640px]" : "max-w-[760px]")}>
-            {session.signedOut ? (
-              <Notice
-                tone="warn"
-                title="Sign in to use the agent"
-                className="mb-2"
-                testId="signed-out-notice"
-                action={
-                  <a
-                    href="/login"
-                    className="inline-flex h-8 items-center rounded-xl bg-[var(--fg)] px-3 text-[13px] font-medium text-[var(--inv)] transition-colors hover:opacity-90"
-                  >
-                    Sign in
-                  </a>
-                }
-              >
-                Your session ended or you have not signed in yet.
-              </Notice>
-            ) : (
-              setup.needsProvider &&
-              !hero && (
-                <Notice
-                  tone="warn"
-                  title="Add a model provider to start"
-                  className="mb-2"
-                  testId="provider-notice"
-                  action={
-                    <Button size="sm" variant="primary" onClick={() => openSettings("providers")}>
-                      Add provider key
-                    </Button>
-                  }
-                >
-                  Runs use your configured provider keys.
-                </Notice>
-              )
-            )}
-
-            <Composer
-              value={draft}
-              onChange={setDraft}
-              onSend={handleSend}
-              blockedReason={
-                session.signedOut ? "Sign in to send" : setup.needsProvider ? "Add a provider key to send" : undefined
-              }
-              inputRef={composerRef}
-            />
-
-            {hero && !setup.needsProvider && (
-              <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-2" aria-label="Ideas to start with">
-                {STARTERS.map((starter) => (
-                  <button
-                    key={starter}
-                    type="button"
-                    onClick={() => {
-                      setDraft(starter);
-                      focusComposer();
-                    }}
-                    className="press edge rounded-2xl hair bg-black/20 p-3 text-left transition hover:bg-white/[0.05]"
-                  >
-                    <div className="flex items-center gap-2 text-[12.5px] text-[var(--fg-2)] hover:text-white">
-                      <Sparkles className="h-3.5 w-3.5 text-[var(--sig)] shrink-0" />
-                      <span className="truncate">{starter}</span>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Drag handle between the chat column and the stage (split view only). */}
-        {split && (
-          <SplitHandle
-            containerRef={mainRef}
-            chatRef={chatRef}
-            ratio={clampSplitRatio(splitRatio)}
-            onRatioChange={(next) => setSplitRatio(clampSplitRatio(next))}
-          />
-        )}
-
-        {/* Live VM Screen / Board Stage */}
-        {showStage && (
-          <div
-            className={cn(
-              "sa-stage-in order-1 flex min-h-0 min-w-0 flex-col lg:order-2 lg:flex-1 glass rounded-[26px] p-2.5 sm:p-4 shadow-2xl hair overflow-hidden",
-              effectiveView === "board" ? "flex-1" : "shrink-0 lg:shrink",
-            )}
-            data-testid="stage"
-          >
-            {effectiveView === "screen" ? (
-              <ScreenFrame
-                activeView={screenView}
-                onToggleView={setScreenView}
-                showDesktop={polledVm.desktop}
-                logs={NO_LOGS}
-                runId={session.liveRunId}
-                runActive={Boolean(phaseMeta?.active && activeRun)}
-                vmState={vmDisplay.state}
-                vmResetting={vmResetting}
-                polledVmStatus={polledVm.status}
-                desktopMode={polledVm.desktop}
-                activeRoleName={agentName}
-                onResetVm={() => openSettings("agent")}
-                onStopRun={() => void handleStop()}
-                control={takingOver}
-                onControlChange={setTakingOver}
-                canControl={canControl}
-                fitToHeight={wide}
-                presence={screenPresence}
-                activity={session.activity ? [{ text: session.activity }] : undefined}
-                className={wide ? "h-full" : undefined}
-              />
-            ) : (
-              <BoardPanel
-                board={board}
-                agentName={agentName}
-                runFor={session.runById}
-                onRunTask={runTask}
-                onViewRun={viewTaskRun}
-                focusTaskId={focusTaskId}
-                className="flex-1"
-              />
-            )}
-          </div>
-        )}
+        </section>
       </main>
 
       {/* Floating Approval Gate for Risky Actions */}

@@ -140,13 +140,97 @@ export function validateSubmitTaskWork(args: Record<string, unknown>): Validatio
   } else if (args.agentName.length > 200) {
     errs.push({ field: "agentName", message: "agentName exceeds maximum length of 200" });
   }
-  const e2 = requiredString(args.gitBranch, "gitBranch", 200);
+  const e2 = validateGitBranch(args.gitBranch);
   if (e2) errs.push(e2);
   const e3 = requiredString(args.summary, "summary", 8000);
   if (e3) errs.push(e3);
   const e4 = optionalString(args.prUrl, "prUrl", 500);
   if (e4) errs.push(e4);
   return errs;
+}
+
+/**
+ * Branch prefixes a submission may name. Work is reviewed from a PR off
+ * main, never from main itself: a submission naming main (or a branch
+ * that was never pushed) has nothing reviewable attached to it.
+ */
+export const SUBMIT_BRANCH_PREFIXES = ["feat/", "fix/", "docs/"] as const;
+
+/**
+ * Shape-check a submission branch: non-empty, not main/master, one of
+ * the feat/|fix/|docs/ prefixes, and a plausible ref (no whitespace,
+ * control characters, `..`, empty components, or trailing slash).
+ * This is the cheap half of the t97 rule; the remote half (the ref
+ * actually exists on origin) lives in git-remote.ts and runs in the
+ * handler, after the ownership/status/expiry checks.
+ *
+ * The ref-shape half follows `git check-ref-format` (the rules for
+ * `refs/heads/<branch>`): no glob metacharacters (`*`, `?`, `[`),
+ * no `~`, `^`, `:`, `\`, no `@{`, no component starting with `.`
+ * or ending with `.lock`, no trailing `.`. This matters because the
+ * remote check passes the branch to `git ls-remote`, whose pattern
+ * argument is fnmatch — without this, `feat/*` would match every
+ * feat branch on origin and false-positive as "pushed".
+ */
+export function validateGitBranch(branch: unknown): ValidationError | null {
+  const base = requiredString(branch, "gitBranch", 200);
+  if (base) return base;
+  // Surrounding whitespace is trimmed (the client does the same) — only
+  // interior whitespace is rejected.
+  const name = (branch as string).trim();
+  if (name === "main" || name === "master") {
+    return {
+      field: "gitBranch",
+      message: "gitBranch must not be main or master — submit work from its own branch",
+    };
+  }
+  const prefix = SUBMIT_BRANCH_PREFIXES.find((p) => name.startsWith(p));
+  if (!prefix) {
+    return {
+      field: "gitBranch",
+      message: `gitBranch must start with one of ${SUBMIT_BRANCH_PREFIXES.join(", ")}`,
+    };
+  }
+  const rest = name.slice(prefix.length);
+  if (rest.length === 0 || rest.endsWith("/") || name.includes("//")) {
+    return { field: "gitBranch", message: "gitBranch must name a branch after its prefix" };
+  }
+  if (/[\s\x00-\x1F\x7F]|\.\./.test(name)) {
+    return {
+      field: "gitBranch",
+      message: "gitBranch must not contain whitespace, control characters, or ..",
+    };
+  }
+  if (!isValidGitRefName(name)) {
+    return {
+      field: "gitBranch",
+      message:
+        "gitBranch is not a valid git branch name (see git-check-ref-format) — it must not contain glob or ref metacharacters (* ? [ ~ ^ : \\ @{), leading dots, .lock suffixes, or a trailing dot",
+    };
+  }
+  return null;
+}
+
+/**
+ * Mirror of `git check-ref-format refs/heads/<name>` for the rules that
+ * matter to the ls-remote glob hole and to ref safety. Kept in sync with
+ * git's own rules (git-check-ref-format(1)):
+ * - not `@` alone, no leading/trailing `/`, no `//`, no `..`, no `@{`
+ * - no ASCII control chars, space, `~`, `^`, `:`, `?`, `*`, `[`, `\`
+ * - no trailing `.`; no component starting with `.` or ending with `.lock`
+ */
+function isValidGitRefName(name: string): boolean {
+  if (name === "@") return false;
+  if (name.startsWith("/") || name.endsWith("/")) return false;
+  if (name.includes("//") || name.includes("..") || name.includes("@{")) return false;
+  if (/[\x00-\x1F\x7F\s~^:?*\[\\]/.test(name)) return false;
+  if (name.endsWith(".")) return false;
+  for (const part of name.split("/")) {
+    if (part.length === 0) return false;
+    if (part.startsWith(".")) return false;
+    if (part.endsWith(".lock")) return false;
+  }
+  return true;
 }
 
 export function validateRecordMatch(args: Record<string, unknown>): ValidationError[] {

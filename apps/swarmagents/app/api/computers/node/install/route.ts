@@ -8,7 +8,9 @@
  * a heartbeat and claims/executes runs with the local `claude` CLI. It is plain
  * text so it can be piped into sh (POSIX) or invoked as a PowerShell
  * scriptblock. No secret is embedded in the script: the code is passed on the
- * command line and the token is written only to the node's own config file.
+ * command line and the token is written only to the node's own config file —
+ * the worker reads it back from there, so the token never appears in a
+ * process argument list where any local user could read it via ps(1).
  *
  * The POSIX worker heartbeats from a background thread while `claude` runs,
  * streams `--output-format stream-json` events back as `action: "event"`, and
@@ -34,9 +36,15 @@ SERVER="https://swarmagents.codes"
 MODE="host"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --code) CODE="$2"; shift 2 ;;
-    --server) SERVER="$2"; shift 2 ;;
-    --mode) MODE="$2"; shift 2 ;;
+    --code)
+      if [ $# -lt 2 ]; then echo "Missing value for --code." >&2; exit 2; fi
+      CODE="$2"; shift 2 ;;
+    --server)
+      if [ $# -lt 2 ]; then echo "Missing value for --server." >&2; exit 2; fi
+      SERVER="$2"; shift 2 ;;
+    --mode)
+      if [ $# -lt 2 ]; then echo "Missing value for --mode." >&2; exit 2; fi
+      MODE="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -54,6 +62,30 @@ case "$MODE" in
   host|docker|sandbox) ;;
   *) echo "Invalid --mode. Use host, docker or sandbox." >&2; exit 2 ;;
 esac
+# --server is interpolated into JSON and used as a curl base, so it must be
+# a bare http(s) origin: strip trailing slashes, then require scheme + host
+# with no path, query, fragment, quote, backslash, space, or control
+# character (none of those can appear in a host/port, so any of them fails
+# closed instead of smuggling a different destination into the request).
+SERVER=$(printf '%s' "$SERVER" | sed 's|/*$||')
+case "$SERVER" in
+  http://*|https://*) ;;
+  *) echo "Invalid --server. Use an http(s) origin like https://swarmagents.codes." >&2; exit 2 ;;
+esac
+SERVER_REST=$(printf '%s' "$SERVER" | cut -d/ -f3-)
+case "$SERVER_REST" in
+  ""|*[!A-Za-z0-9.:-]*)
+    echo "Invalid --server. Use an http(s) origin like https://swarmagents.codes." >&2; exit 2 ;;
+esac
+# A port, when present, is a single numeric suffix (host:port).
+case "$SERVER_REST" in
+  *:*)
+    SERVER_PORT=$(printf '%s' "$SERVER_REST" | cut -d: -f2-)
+    case "$SERVER_PORT" in
+      ""|*[!0-9]*|*:*) echo "Invalid --server. Use an http(s) origin like https://swarmagents.codes." >&2; exit 2 ;;
+    esac
+    ;;
+esac
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required to pair and serve runs. Install it and run this command again." >&2
   exit 1
@@ -64,6 +96,11 @@ case "$(uname -s)" in
   Linux) OS=linux ;;
 esac
 ARCH=$(uname -m 2>/dev/null || echo unknown)
+# $ARCH is interpolated into JSON below: accept only the characters a
+# machine architecture can contain, and fall back to "unknown" otherwise.
+case "$ARCH" in
+  ""|*[!A-Za-z0-9_.-]*) ARCH="unknown" ;;
+esac
 PAYLOAD=$(printf '{"code":"%s","machine":{"os":"%s","arch":"%s","mode":"%s"}}' "$CODE" "$OS" "$ARCH" "$MODE")
 RESP=$(curl -fsSL -X POST -H "content-type: application/json" --data "$PAYLOAD" "$SERVER/api/computers/pair") || {
   echo "Pairing failed. The code may be expired or already used." >&2
@@ -107,16 +144,41 @@ if [ -z "$CID" ] || [ -z "$TOKEN" ]; then
   exit 1
 fi
 DIR="$HOME/.swarmagents"
+# Create the config directory and file with private permissions from the
+# start: without this, the directory exists at 755 and the token file at
+# 644 until the chmods below run, and the plaintext token is world-readable
+# in that window.
+umask 077
 mkdir -p "$DIR"
 chmod 700 "$DIR" 2>/dev/null || true
 CONFIG="$DIR/computer.json"
 printf '{"computerId":"%s","nodeToken":"%s","server":"%s"}\n' "$CID" "$TOKEN" "$SERVER" > "$CONFIG"
 chmod 600 "$CONFIG"
 echo "Paired as $CID. Keeping this computer online (Ctrl-C to stop)."
-exec python3 - "$SERVER" "$CID" "$TOKEN" "$OS" "$ARCH" "$MODE" <<'PY'
-import json, os, signal, subprocess, sys, threading, time, urllib.request
+exec python3 - "$OS" "$ARCH" "$MODE" <<'PY'
+import json, os, re, signal, subprocess, sys, threading, time, urllib.request
 
-server, cid, token, os_name, arch, mode = sys.argv[1:7]
+# Credentials come from the node config, never from argv: a token on the
+# command line is visible to every local user via ps(1) / /proc/<pid>/cmdline.
+try:
+    with open(os.path.join(os.path.expanduser("~"), ".swarmagents", "computer.json"), encoding="utf-8") as _config_file:
+        _config = json.load(_config_file)
+except Exception:
+    sys.exit("computer config missing or unreadable; re-run the installer.")
+if not isinstance(_config, dict):
+    sys.exit("computer config is not an object; re-run the installer.")
+server = _config.get("server") or ""
+cid = _config.get("computerId") or ""
+token = _config.get("nodeToken") or ""
+if not isinstance(server, str) or not server.startswith(("http://", "https://")):
+    sys.exit("computer config has an invalid server; re-run the installer.")
+if not isinstance(cid, str) or not cid.startswith("cmp_"):
+    sys.exit("computer config has an invalid computer id; re-run the installer.")
+if not isinstance(token, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", token):
+    sys.exit("computer config has an invalid node token; re-run the installer.")
+if len(sys.argv) < 4:
+    sys.exit("worker started without os/arch/mode; re-run the installer.")
+os_name, arch, mode = sys.argv[1:4]
 endpoint = server + "/api/computers/node"
 headers = {
     "content-type": "application/json",

@@ -6,7 +6,7 @@ import path from "node:path";
 import { eloFit, idealBoardTasks } from "./elo";
 import { hasSurplusQuota } from "./quota";
 import { proposalsFromAnalysis } from "./proposals";
-import { configureGardenerDir, readUserGardener, setProposalStatus, updateUserGardener } from "./store";
+import { configureGardenerDir, loadGardener, readUserGardener, setProposalStatus, updateUserGardener } from "./store";
 import { decideAutopilotTick } from "./tick";
 import { inAutopilotWindow } from "./window";
 
@@ -117,4 +117,16 @@ test("approval is one status flip and persists", () => {
   assert.equal(readUserGardener("local").proposals[0].status, "approved");
   assert.equal(readUserGardener("local").enabled, true);
   configureGardenerDir(null);
+});
+
+test("a corrupt gardener.json falls back to empty state instead of throwing", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gardener-corrupt-"));
+  configureGardenerDir(dir);
+  try {
+    fs.writeFileSync(path.join(dir, "gardener.json"), "{not json");
+    assert.deepEqual(loadGardener(), { version: 1, users: {} });
+    assert.deepEqual(readUserGardener("local"), { enabled: false, workerElo: 1400, pinned: [], proposals: [] });
+  } finally {
+    configureGardenerDir(null);
+  }
 });

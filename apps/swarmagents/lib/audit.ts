@@ -59,6 +59,7 @@ export type AuditAction =
   | "preview.share.create"
   | "preview.share.revoke"
   | "vault.proxy"
+  | "auto-test.run"
   | "run.compare.remember"
   | "gardener.autopilot"
   | "library.unpublish";

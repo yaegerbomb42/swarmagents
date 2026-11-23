@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { PLAYWRIGHT_LAUNCHER_SOURCE, PLAYWRIGHT_POLICY_SOURCE, PLAYWRIGHT_PROXY_SOURCE } from "./playwright-policy";
+import { PLAYWRIGHT_LAUNCHER_SOURCE, PLAYWRIGHT_POLICY_SOURCE, PLAYWRIGHT_PROXY_SOURCE, PLAYWRIGHT_PROXY_VERSION } from "./playwright-policy";
 
 type RouteHandler = (route: { abort: (reason: string) => Promise<void>; continue: () => Promise<void> }, request: { url: () => string }) => Promise<void>;
 
@@ -35,6 +35,13 @@ test("Playwright proxy and launcher sources parse as CommonJS", () => {
   // errors instead of crashing on an unhandled 'error' event.
   assert.match(PLAYWRIGHT_PROXY_SOURCE, /resolveTarget\(/);
   assert.match(PLAYWRIGHT_PROXY_SOURCE, /server\.on\("error"/);
+  // The proxy version is a 16-hex content hash embedded in the health
+  // endpoint and in the launcher, so the launcher can spot a stale proxy.
+  assert.match(PLAYWRIGHT_PROXY_VERSION, /^[0-9a-f]{16}$/);
+  assert.ok(PLAYWRIGHT_PROXY_SOURCE.includes(`swarm-playwright-policy ${PLAYWRIGHT_PROXY_VERSION}`));
+  assert.ok(PLAYWRIGHT_LAUNCHER_SOURCE.includes(PLAYWRIGHT_PROXY_VERSION));
+  assert.match(PLAYWRIGHT_PROXY_SOURCE, /__swarm_policy_shutdown/);
+  assert.match(PLAYWRIGHT_LAUNCHER_SOURCE, /__swarm_policy_shutdown/);
 });
 
 test("Playwright request guard permits public IPs and explicit VM loopback only", async () => {
@@ -212,10 +219,12 @@ function bootProxy(dnsLookup: (host: string) => Promise<Array<{ address: string;
   };
   const connectCalls: Array<{ port: number; host: string }> = [];
   const requestCalls: Array<{ options: Record<string, unknown> }> = [];
-  const fakeSocket = () => ({ on: () => {}, pipe: () => {}, write: () => {}, destroy: () => {}, setTimeout: () => {} });
+  const upstreamTimeouts: number[] = [];
+  const socketTimeouts: number[] = [];
+  const fakeSocket = () => ({ on: () => {}, pipe: () => {}, write: () => {}, destroy: () => {}, setTimeout: (ms: number) => { socketTimeouts.push(ms); } });
   const fakeRequest = (_url: unknown, options: Record<string, unknown>) => {
     requestCalls.push({ options });
-    return { on: () => {}, pipe: () => {} };
+    return { on: () => {}, pipe: () => {}, setTimeout: (ms: number) => { upstreamTimeouts.push(ms); } };
   };
   const isIP = (host: string): number =>
     /^\d+\.\d+\.\d+\.\d+$/.test(host) ? 4 : host.includes(":") ? 6 : 0;
@@ -254,6 +263,8 @@ function bootProxy(dnsLookup: (host: string) => Promise<Array<{ address: string;
   return {
     connectCalls,
     requestCalls,
+    upstreamTimeouts,
+    socketTimeouts,
     requestHandler: handlers.get("__request") as unknown as (
       req: Record<string, unknown>,
       res: Record<string, unknown>,
@@ -338,4 +349,248 @@ test("Playwright proxy pins loopback CONNECT targets to 127.0.0.1", async () => 
   await connectHandler({ url: "127.0.0.1:5173" }, client, Buffer.alloc(0));
   assert.equal(clientEnded, "", "a dev-server loopback target must not be rejected");
   assert.deepEqual(connectCalls, [{ port: 5173, host: "127.0.0.1" }]);
+});
+
+/** Boot the proxy source with a fake process + captured setTimeout (control endpoints). */
+function bootProxyControl() {
+  const handlers = new Map<string, (...args: never[]) => unknown>();
+  const fakeServer = {
+    on: (event: string, fn: (...args: never[]) => unknown) => {
+      handlers.set(event, fn);
+    },
+    listen: () => {},
+  };
+  const exits: number[] = [];
+  const timeouts: Array<{ fn: () => void; ms: number }> = [];
+  const fakeProcess = { exit: (code: number) => { exits.push(code); } };
+  const fakeSetTimeout = (fn: () => void, ms: number): number => {
+    timeouts.push({ fn, ms });
+    return 0;
+  };
+  const requireStub = (specifier: string): unknown => {
+    switch (specifier) {
+      case "node:dns":
+        return { promises: { lookup: async () => [{ address: "93.184.216.34", family: 4 }] } };
+      case "node:net":
+        return { isIP: (host: string) => (/^\d+\.\d+\.\d+\.\d+$/.test(host) ? 4 : host.includes(":") ? 6 : 0), connect: () => ({ on: () => {}, pipe: () => {}, write: () => {}, destroy: () => {}, setTimeout: () => {} }) };
+      case "node:http":
+        return { createServer: (handler: (...args: never[]) => unknown) => {
+          handlers.set("__request", handler);
+          return fakeServer;
+        }, request: () => ({ on: () => {}, pipe: () => {} }) };
+      case "node:https":
+        return { request: () => ({ on: () => {}, pipe: () => {} }) };
+      case "node:url":
+        return { URL };
+      default:
+        throw new Error(`unexpected require: ${specifier}`);
+    }
+  };
+  new Function("require", "module", "exports", "process", "setTimeout", PLAYWRIGHT_PROXY_SOURCE)(
+    requireStub,
+    { exports: {} },
+    {},
+    fakeProcess,
+    fakeSetTimeout,
+  );
+  return {
+    exits,
+    timeouts,
+    requestHandler: handlers.get("__request") as unknown as (
+      req: Record<string, unknown>,
+      res: Record<string, unknown>,
+    ) => Promise<void>,
+  };
+}
+
+function captureResponse() {
+  let status = 0;
+  let body = "";
+  return {
+    status: () => status,
+    body: () => body,
+    res: {
+      writeHead: (code: number) => { status = code; },
+      end: (text?: string) => { body = text ?? ""; },
+      headersSent: false,
+    },
+  };
+}
+
+test("Playwright proxy health endpoint reports its version; shutdown is loopback-only", async () => {
+  const { requestHandler, exits, timeouts } = bootProxyControl();
+
+  const health = captureResponse();
+  await requestHandler(
+    { url: "/__swarm_policy_health", method: "GET", socket: { remoteAddress: "127.0.0.1" } },
+    health.res,
+  );
+  assert.equal(health.status(), 200);
+  assert.equal(health.body(), `swarm-playwright-policy ${PLAYWRIGHT_PROXY_VERSION}\n`);
+
+  const shutdown = captureResponse();
+  await requestHandler(
+    { url: "/__swarm_policy_shutdown", method: "POST", socket: { remoteAddress: "127.0.0.1" } },
+    shutdown.res,
+  );
+  assert.equal(shutdown.status(), 200);
+  assert.equal(shutdown.body(), "shutting down\n");
+  assert.equal(timeouts.length, 1, "shutdown schedules the exit");
+  assert.equal(timeouts[0]!.ms, 50);
+  timeouts[0]!.fn();
+  assert.deepEqual(exits, [0], "the scheduled exit kills the stale proxy");
+
+  const foreign = captureResponse();
+  await requestHandler(
+    { url: "/__swarm_policy_shutdown", method: "POST", socket: { remoteAddress: "10.0.0.1" } },
+    foreign.res,
+  );
+  assert.equal(foreign.status(), 403, "a non-loopback shutdown must be refused");
+  assert.equal(timeouts.length, 1, "a refused shutdown schedules no exit");
+});
+
+test("Playwright proxy bounds idle upstream requests and CONNECT tunnels", async () => {
+  const { requestHandler, connectHandler, upstreamTimeouts, socketTimeouts } = bootProxy(
+    async () => [{ address: "93.184.216.34", family: 4 }],
+  );
+  await requestHandler(
+    { url: "http://example.com/", method: "GET", headers: { host: "example.com" }, pipe: () => {} },
+    { writeHead: () => {}, end: () => {}, headersSent: false },
+  );
+  assert.deepEqual(upstreamTimeouts, [120000], "the HTTP upstream request must get an idle timeout");
+
+  const clientTimeouts: number[] = [];
+  const client = {
+    write: () => {}, end: () => {}, on: () => {}, destroy: () => {}, pipe: () => {},
+    setTimeout: (ms: number) => { clientTimeouts.push(ms); },
+  };
+  await connectHandler({ url: "example.com:443" }, client, Buffer.alloc(0));
+  assert.deepEqual(socketTimeouts, [120000], "the tunnel upstream socket must get an idle timeout");
+  assert.deepEqual(clientTimeouts, [120000], "the tunnel client socket must get an idle timeout");
+});
+
+test("Playwright launcher replaces a stale-version proxy and logs its stderr", async () => {
+  const CURRENT = PLAYWRIGHT_PROXY_VERSION;
+  // Scripted health answers: stale -> down (after shutdown) -> ok.
+  const healthScript: Array<{ status: number; body: string } | { error: true }> = [
+    { status: 200, body: "swarm-playwright-policy 0000000000000000\n" },
+    { error: true },
+    { status: 200, body: `swarm-playwright-policy ${CURRENT}\n` },
+  ];
+  let healthCalls = 0;
+  const shutdownCalls: Array<{ url: string; method: string }> = [];
+  const spawnCalls: Array<{ cmd: string; args: string[]; options: Record<string, unknown> }> = [];
+  const renamed: Array<[string, string]> = [];
+  const unlinked: string[] = [];
+  const opened: Array<{ path: string; flags: string }> = [];
+  const exits: number[] = [];
+
+  function fakeResponse(status: number, body: string) {
+    const handlers: Record<string, (...args: unknown[]) => void> = {};
+    return {
+      statusCode: status,
+      on: (event: string, fn: (...args: unknown[]) => void) => { handlers[event] = fn; },
+      resume: () => {},
+      _emit: () => {
+        handlers["data"]?.(body);
+        handlers["end"]?.();
+      },
+    };
+  }
+  const httpStub = {
+    get: (url: string, _options: unknown, cb: (res: ReturnType<typeof fakeResponse>) => void) => {
+      const handlers: Record<string, (...args: unknown[]) => void> = {};
+      const scripted = healthScript[Math.min(healthCalls, healthScript.length - 1)]!;
+      healthCalls += 1;
+      queueMicrotask(() => {
+        if ("error" in scripted) {
+          handlers["error"]?.(new Error("ECONNREFUSED"));
+          return;
+        }
+        const res = fakeResponse(scripted.status, scripted.body);
+        cb(res);
+        res._emit();
+      });
+      return { on: (event: string, fn: (...args: unknown[]) => void) => { handlers[event] = fn; }, destroy: () => {} };
+    },
+    request: (url: string, options: { method: string }, cb: (res: ReturnType<typeof fakeResponse>) => void) => {
+      const handlers: Record<string, (...args: unknown[]) => void> = {};
+      shutdownCalls.push({ url, method: options.method });
+      queueMicrotask(() => {
+        const res = fakeResponse(200, "shutting down\n");
+        cb(res);
+        res._emit();
+      });
+      return { on: (event: string, fn: (...args: unknown[]) => void) => { handlers[event] = fn; }, destroy: () => {}, end: () => {} };
+    },
+  };
+  const fsStub = {
+    existsSync: () => true,
+    statSync: () => ({ size: 2 * 1024 * 1024 }),
+    renameSync: (a: string, b: string) => { renamed.push([a, b]); },
+    unlinkSync: (p: string) => { unlinked.push(p); },
+    openSync: (p: string, flags: string) => { opened.push({ path: p, flags }); return 9; },
+  };
+  const requireStub = (specifier: string): unknown => {
+    switch (specifier) {
+      case "node:http":
+        return httpStub;
+      case "node:fs":
+        return fsStub;
+      case "node:child_process":
+        return {
+          spawn: (cmd: string, args: string[], options: Record<string, unknown>) => {
+            spawnCalls.push({ cmd, args, options });
+            return { unref: () => {}, on: () => {}, kill: () => {} };
+          },
+        };
+      default:
+        throw new Error(`unexpected require: ${specifier}`);
+    }
+  };
+  const processStub = {
+    execPath: "/usr/bin/node",
+    argv: ["node", "launcher.cjs"],
+    env: {},
+    on: () => {},
+    kill: () => {},
+    pid: 123,
+    exit: (code: number) => { exits.push(code); },
+  };
+  new Function("require", "module", "exports", "process", PLAYWRIGHT_LAUNCHER_SOURCE)(
+    requireStub,
+    { exports: {} },
+    {},
+    processStub,
+  );
+
+  const deadline = Date.now() + 5000;
+  while (!spawnCalls.some((c) => c.cmd === "playwright-mcp") && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.ok(spawnCalls.some((c) => c.cmd === "playwright-mcp"), "the launcher must exec playwright-mcp");
+  assert.deepEqual(
+    shutdownCalls,
+    [{ url: "http://127.0.0.1:18793/__swarm_policy_shutdown", method: "POST" }],
+    "a stale proxy is asked to shut down before replacement",
+  );
+  assert.equal(spawnCalls[0]!.cmd, "/usr/bin/node");
+  assert.deepEqual(spawnCalls[0]!.args, ["/workspace/.swarm/playwright-proxy.cjs"]);
+  assert.deepEqual(
+    spawnCalls[0]!.options.stdio,
+    ["ignore", "ignore", 9],
+    "proxy stderr goes to the log file descriptor, not /dev/null",
+  );
+  assert.deepEqual(
+    renamed,
+    [["/workspace/.swarm/playwright-proxy.log", "/workspace/.swarm/playwright-proxy.log.1"]],
+    "an overgrown proxy log rotates before the new proxy starts",
+  );
+  assert.deepEqual(unlinked, ["/workspace/.swarm/playwright-proxy.log.1"]);
+  assert.deepEqual(opened, [{ path: "/workspace/.swarm/playwright-proxy.log", flags: "a" }]);
+  const mcp = spawnCalls.find((c) => c.cmd === "playwright-mcp")!;
+  assert.ok(mcp.args.includes("--proxy-server"));
+  assert.ok(mcp.args.includes("http://127.0.0.1:18793"));
+  assert.ok(mcp.args.includes("--proxy-bypass"));
+  assert.deepEqual(exits, [], "the launcher must not exit while replacing the proxy");
 });

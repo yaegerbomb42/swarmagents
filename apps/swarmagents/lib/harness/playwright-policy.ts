@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /** Network endpoint shared by Playwright MCP processes inside one VM. */
 export const PLAYWRIGHT_PROXY_ORIGIN = "http://127.0.0.1:18793";
 export const PLAYWRIGHT_PROXY_PATH = "/workspace/.swarm/playwright-proxy.cjs";
@@ -160,8 +162,15 @@ exports.default = async ({ page }) => {
 
 const NETWORK_POLICY_HELPERS = PLAYWRIGHT_POLICY_SOURCE.slice(0, PLAYWRIGHT_POLICY_SOURCE.indexOf("exports.default"));
 
-/** A loopback-only HTTP/CONNECT proxy that cannot be bypassed by redirects. */
-export const PLAYWRIGHT_PROXY_SOURCE = NETWORK_POLICY_HELPERS + String.raw`
+/**
+ * A loopback-only HTTP/CONNECT proxy that cannot be bypassed by redirects.
+ *
+ * The template embeds __SWARM_PROXY_VERSION__ in the health endpoint; the
+ * exported source replaces it with PLAYWRIGHT_PROXY_VERSION, a content hash
+ * of the template, so the launcher can tell a stale proxy (deployed before
+ * the current code) from a live one and replace it on startup.
+ */
+const PROXY_SOURCE_TEMPLATE = NETWORK_POLICY_HELPERS + String.raw`
 const http = require("node:http");
 const https = require("node:https");
 const { URL } = require("node:url");
@@ -178,7 +187,22 @@ function requestTarget(req) {
 const server = http.createServer(async (req, res) => {
   if (req.url === "/__swarm_policy_health") {
     res.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" });
-    res.end("swarm-playwright-policy\n");
+    res.end("swarm-playwright-policy __SWARM_PROXY_VERSION__\n");
+    return;
+  }
+  if (req.url === "/__swarm_policy_shutdown" && req.method === "POST") {
+    // Loopback-only: the server binds 127.0.0.1, and the remote address is
+    // checked again here so a forwarded request cannot kill the proxy.
+    const remote = req.socket && req.socket.remoteAddress;
+    if (remote && remote !== "127.0.0.1" && remote !== "::1" && remote !== "::ffff:127.0.0.1") {
+      res.writeHead(403, { "content-type": "text/plain" });
+      res.end("Forbidden.\n");
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" });
+    res.end("shutting down\n");
+    // Let the response flush before exiting.
+    setTimeout(() => process.exit(0), 50);
     return;
   }
   const target = requestTarget(req);
@@ -219,6 +243,14 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(reply.statusCode || 502, reply.headers);
     reply.pipe(res);
   });
+  // An upstream that stalls forever holds a socket pair open and leaks
+  // FDs on long-lived VMs; the CONNECT path has the same bound.
+  if (typeof upstream.setTimeout === "function") {
+    upstream.setTimeout(120000, () => {
+      upstream.destroy();
+      if (typeof res.destroy === "function") res.destroy();
+    });
+  }
   upstream.on("error", () => {
     if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain" });
     res.end("Upstream request failed.\n");
@@ -289,33 +321,96 @@ server.on("error", (err) => {
 server.listen(18793, "127.0.0.1");
 `;
 
+/**
+ * Content hash of the proxy source template; changes whenever the proxy
+ * code changes, so a launcher from a newer deploy never reuses a stale
+ * proxy left behind by an older one.
+ */
+export const PLAYWRIGHT_PROXY_VERSION: string = createHash("sha256")
+  .update(PROXY_SOURCE_TEMPLATE)
+  .digest("hex")
+  .slice(0, 16);
+
+/** The proxy source with its version embedded in the health endpoint. */
+export const PLAYWRIGHT_PROXY_SOURCE = PROXY_SOURCE_TEMPLATE.replaceAll(
+  "__SWARM_PROXY_VERSION__",
+  PLAYWRIGHT_PROXY_VERSION,
+);
+
 /** Start (or reuse) the per-VM proxy, then exec the pinned Playwright MCP. */
 export const PLAYWRIGHT_LAUNCHER_SOURCE = String.raw`// SwarmAgents Playwright MCP launcher (CommonJS).
 const http = require("node:http");
+const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const proxyOrigin = "http://127.0.0.1:18793";
-function healthy() {
+const expectedVersion = "${PLAYWRIGHT_PROXY_VERSION}";
+const proxyLogPath = "/workspace/.swarm/playwright-proxy.log";
+const MAX_PROXY_LOG_BYTES = 1024 * 1024;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+// "ok" when a proxy with the current version answers, "stale" when an older
+// proxy is still listening, "down" when nothing answers.
+function healthStatus() {
   return new Promise((resolve) => {
     const req = http.get(proxyOrigin + "/__swarm_policy_health", { timeout: 750 }, (res) => {
       let text = "";
       res.on("data", (chunk) => { text += chunk; });
-      res.on("end", () => resolve(res.statusCode === 200 && text.includes("swarm-playwright-policy")));
+      res.on("end", () => {
+        if (res.statusCode !== 200) return resolve("down");
+        resolve(text.trim() === "swarm-playwright-policy " + expectedVersion ? "ok" : "stale");
+      });
+    });
+    req.on("error", () => resolve("down"));
+    req.on("timeout", () => { req.destroy(); resolve("down"); });
+  });
+}
+function shutdownStale() {
+  return new Promise((resolve) => {
+    const req = http.request(proxyOrigin + "/__swarm_policy_shutdown", { method: "POST", timeout: 1000 }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(true));
     });
     req.on("error", () => resolve(false));
     req.on("timeout", () => { req.destroy(); resolve(false); });
+    req.end();
   });
 }
+function rotateProxyLog() {
+  try {
+    if (fs.existsSync(proxyLogPath) && fs.statSync(proxyLogPath).size > MAX_PROXY_LOG_BYTES) {
+      try { fs.unlinkSync(proxyLogPath + ".1"); } catch { /* previous rotation may not exist */ }
+      fs.renameSync(proxyLogPath, proxyLogPath + ".1");
+    }
+  } catch {
+    // Best effort: a stale log must never block starting the proxy.
+  }
+}
 async function main() {
-  if (!(await healthy())) {
+  const status = await healthStatus();
+  if (status === "stale") {
+    // A proxy from an older deploy is still listening: ask it to exit
+    // cleanly, then wait for the port to free before starting the new one.
+    await shutdownStale();
+    for (let i = 0; i < 20; i++) {
+      if ((await healthStatus()) === "down") break;
+      await sleep(100);
+    }
+  }
+  if (status !== "ok") {
+    rotateProxyLog();
+    // Proxy stderr goes to a bounded log instead of /dev/null so a crash
+    // leaves diagnostics behind; the log rotates once it passes 1 MiB.
+    const logFd = fs.openSync(proxyLogPath, "a");
     const proxy = spawn(process.execPath, ["/workspace/.swarm/playwright-proxy.cjs"], {
       detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", logFd],
     });
     proxy.unref();
     let ready = false;
     for (let i = 0; i < 60 && !ready; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      ready = await healthy();
+      await sleep(100);
+      ready = (await healthStatus()) === "ok";
     }
     if (!ready) throw new Error("Could not start the browser network-policy proxy on loopback port 18793.");
   }

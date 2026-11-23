@@ -158,7 +158,7 @@ export function flushRunLogs(runsDir: string | null): void {
     const file = path.join(runsDir, name);
     let fd: number | undefined;
     try {
-      fd = fs.openSync(file, "r");
+      fd = openForFsync(file);
       fs.fsyncSync(fd);
     } catch {
       // A log file may be rotated or deleted mid-flush; skip it.
@@ -171,6 +171,21 @@ export function flushRunLogs(runsDir: string | null): void {
         }
       }
     }
+  }
+}
+
+/**
+ * Open a log segment for fsync. "r+" (read/write) is required on some
+ * platforms — notably Windows, where fsync on a read-only handle fails —
+ * while "r" works everywhere else. Fall back to "r" when the segment cannot
+ * be opened for writing (e.g. a frozen read-only rotated segment, or a
+ * directory entry), so the flush stays best-effort instead of throwing.
+ */
+function openForFsync(file: string): number {
+  try {
+    return fs.openSync(file, "r+");
+  } catch {
+    return fs.openSync(file, "r");
   }
 }
 

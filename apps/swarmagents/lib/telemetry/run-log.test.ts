@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   INITIAL_REPLAY_CAP,
   appendRunEvent,
+  flushRunLogs,
   readRunEvents,
   streamRunEventsFrom,
   tailRunLogLastSeq,
@@ -488,6 +489,95 @@ test("capped replay with a cursor counts only events after the cursor", async ()
     );
     assert.deepEqual(capped.map((e) => e.seq), [7, 8, 9, 10]);
     assert.deepEqual(window2, { truncated: true, firstSeq: 7, lastSeq: 10 });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Record every fs.openSync(path, flags) call made while `fn` runs, then restore. */
+function recordOpenFlags(fn: () => void): Array<{ file: string; flags: string }> {
+  const seen: Array<{ file: string; flags: string }> = [];
+  const original = fs.openSync;
+  // run-log.ts imports the same node:fs object, so patching it here observes
+  // the opens flushRunLogs performs.
+  (fs as { openSync: typeof fs.openSync }).openSync = ((p: fs.PathLike, flags?: string | number, mode?: number) => {
+    seen.push({ file: String(p), flags: String(flags) });
+    return (original as (p: fs.PathLike, flags?: string | number, mode?: number) => number)(p, flags, mode);
+  }) as typeof fs.openSync;
+  try {
+    fn();
+  } finally {
+    (fs as { openSync: typeof fs.openSync }).openSync = original;
+  }
+  return seen;
+}
+
+test("flushRunLogs opens segments r+ for cross-platform fsync and leaves them intact", () => {
+  const dir = tmpRuns();
+  try {
+    seed(dir, "run-1", 50, 200);
+    const segments = fs
+      .readdirSync(dir)
+      .filter((name) => /^run-1\.jsonl(\.\d+)?$/.test(name))
+      .sort();
+    assert.ok(segments.length >= 2, `expected a base + rotated segment, got ${segments.join(", ")}`);
+    const before = new Map(segments.map((name) => [name, fs.readFileSync(path.join(dir, name), "utf8")]));
+
+    const opens = recordOpenFlags(() => flushRunLogs(dir));
+
+    // Every segment must be attempted with "r+" first: on Windows, fsync on
+    // a read-only handle fails, so "r" alone is not fsync-safe there.
+    for (const name of segments) {
+      const file = path.join(dir, name);
+      const attempts = opens.filter((o) => o.file === file).map((o) => o.flags);
+      assert.deepEqual(attempts, ["r+"], `${name} should be opened r+ (got ${attempts.join(", ")})`);
+      assert.equal(fs.readFileSync(file, "utf8"), before.get(name), `${name} must be byte-identical after flush`);
+    }
+    // No segment may be left open by the flush.
+    assert.equal(readRunEvents("run-1", dir).length, 50);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("flushRunLogs falls back to r when a segment cannot be opened r+", () => {
+  const dir = tmpRuns();
+  try {
+    // A directory whose name matches a log segment cannot be opened "r+"
+    // (EISDIR) on any platform, so it deterministically exercises the "r"
+    // fallback — the same path a frozen read-only segment takes on Windows.
+    const dirSegment = path.join(dir, "run-1.jsonl");
+    fs.mkdirSync(dirSegment);
+    seed(dir, "run-2", 3);
+
+    const opens = recordOpenFlags(() => flushRunLogs(dir));
+
+    const attempts = opens.filter((o) => o.file === dirSegment).map((o) => o.flags);
+    assert.deepEqual(attempts, ["r+", "r"], `directory segment should fall back r+ -> r (got ${attempts.join(", ")})`);
+    assert.equal(readRunEvents("run-2", dir).length, 3);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("flushRunLogs tolerates a read-only segment and missing dirs", () => {
+  const dir = tmpRuns();
+  try {
+    seed(dir, "run-1", 5);
+    const file = path.join(dir, "run-1.jsonl");
+    const before = fs.readFileSync(file, "utf8");
+    fs.chmodSync(file, 0o444);
+    try {
+      // Must not throw even where "r+" is refused for the read-only segment.
+      flushRunLogs(dir);
+    } finally {
+      fs.chmodSync(file, 0o644);
+    }
+    assert.equal(fs.readFileSync(file, "utf8"), before);
+    assert.equal(readRunEvents("run-1", dir).length, 5);
+
+    flushRunLogs(null);
+    flushRunLogs(path.join(dir, "does-not-exist"));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

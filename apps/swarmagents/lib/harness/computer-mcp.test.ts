@@ -240,7 +240,7 @@ test("describeDesktopAction summarizes computer-mcp calls readably", () => {
   assert.equal(describeDesktopAction("mcp__computer-mcp__click", { x: 1, y: 1, button: 3 }), "Right-clicking at (1, 1)");
   assert.equal(describeDesktopAction("mcp__computer-mcp__double_click", { x: 1, y: 1 }), "Double-clicking at (1, 1)");
   assert.equal(describeDesktopAction("mcp__computer-mcp__move", { x: 1, y: 1 }), "Moving pointer to (1, 1)");
-  assert.equal(describeDesktopAction("mcp__computer-mcp__type", { text: "hello" }), 'Typing "hello"');
+  assert.equal(describeDesktopAction("mcp__computer-mcp__type", { text: "hello" }), "Typing (5 chars)");
   assert.equal(describeDesktopAction("mcp__computer-mcp__key", { combo: "ctrl+l" }), "Pressing ctrl+l");
   assert.equal(describeDesktopAction("mcp__computer-mcp__open_app", { name: "browser" }), "Opening browser");
   assert.equal(describeDesktopAction("mcp__computer-mcp__screenshot", {}), "Taking a screenshot");
@@ -257,7 +257,7 @@ test("describeDesktopAction summarizes playwright calls readably", () => {
   assert.equal(describeDesktopAction("mcp__playwright-mcp__browser_snapshot", {}), "Reading the page");
   assert.equal(
     describeDesktopAction("mcp__playwright-mcp__browser_type", { text: "search term" }),
-    'Typing "search term"',
+    "Typing (11 chars)",
   );
   assert.equal(describeDesktopAction("mcp__playwright-mcp__browser_press_key", { key: "Enter" }), "Pressing Enter");
   assert.equal(describeDesktopAction("mcp__playwright-mcp__browser_mouse_wheel", { deltaY: 100 }), "Scrolling the page");
@@ -267,7 +267,9 @@ test("describeDesktopAction summarizes playwright calls readably", () => {
 
 test("summarizeTool (server side) stays consistent with the harness summaries", () => {
   assert.equal(summarizeTool("click", { x: 10, y: 20 }), "Clicking at (10, 20)");
-  assert.equal(summarizeTool("type", { text: "hi" }), 'Typing "hi"');
+  assert.equal(summarizeTool("type", { text: "hi" }), "Typing (2 chars)");
+  // Typed content never appears in a summary, however long: count only.
+  assert.equal(summarizeTool("type", { text: "x".repeat(100) }), "Typing (100 chars)");
   assert.equal(summarizeTool("key", { combo: "Return" }), "Pressing Return");
   assert.equal(summarizeTool("open_app", { name: "browser" }), "Opening browser");
   assert.equal(summarizeTool("scroll", { dx: 0, dy: -4 }), "Scrolling up");

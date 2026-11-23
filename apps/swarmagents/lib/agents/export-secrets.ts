@@ -41,14 +41,22 @@ const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
  * True when any string value in the tree matches a credential-shaped pattern.
  *
  * Fails closed: a tree nested deeper than the recursion limit is treated as
- * containing a secret so a deeply nested manifest field cannot bypass the scan.
+ * containing a secret so a deeply nested manifest field cannot bypass the
+ * scan, and a circular reference is treated the same way instead of
+ * recursing forever or silently skipping the unscanned remainder.
  */
-export function containsSecretValue(value: unknown, depth = 0): boolean {
+export function containsSecretValue(value: unknown, depth = 0, seen = new WeakSet<object>()): boolean {
   if (depth > 20) return true;
   if (typeof value === "string") return SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value));
-  if (Array.isArray(value)) return value.some((entry) => containsSecretValue(entry, depth + 1));
-  if (value && typeof value === "object") {
-    return Object.values(value as Record<string, unknown>).some((entry) => containsSecretValue(entry, depth + 1));
+  if (value === null || typeof value !== "object") return false;
+  if (seen.has(value)) return true;
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) return value.some((entry) => containsSecretValue(entry, depth + 1, seen));
+    return Object.values(value as Record<string, unknown>).some((entry) =>
+      containsSecretValue(entry, depth + 1, seen),
+    );
+  } finally {
+    seen.delete(value);
   }
-  return false;
 }

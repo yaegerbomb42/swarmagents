@@ -166,34 +166,24 @@ export default function ResetForm({ token }: { token: string }) {
             marginBottom: 4,
           }}
         >
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
-            src="/brand/logo.png"
-            alt=""
-            aria-hidden="true"
-            width={28}
-            height={28}
-            style={{ flexShrink: 0 }}
-            // The logo lives behind Git LFS; if it is unresolved, hide the
-            // element rather than painting a broken image.
-            onError={(e) => {
-              e.currentTarget.style.display = "none";
-            }}
-          />
-          <h1
-            data-testid="reset-wordmark"
-            style={{
-              fontSize: "clamp(1rem, 4vw + 0.25rem, 1.25rem)",
-              fontWeight: 600,
-              margin: 0,
-              letterSpacing: "-0.02em",
-              whiteSpace: "nowrap",
-              overflow: "visible",
-              minWidth: 0,
-            }}
-          >
-            SwarmAgents
-          </h1>
+          {/* Brand mark + wordmark (branding/BRAND.md) — same lockup as
+              the workspace Header and the login page; hand-built SVG. */}
+          <span data-testid="brand-lockup" style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/brand/mark-dark.svg" alt="" aria-hidden="true" width={32} height={32} />
+            <span
+              data-testid="reset-wordmark"
+              style={{
+                fontSize: "clamp(1rem, 4vw + 0.25rem, 1.25rem)",
+                fontWeight: 600,
+                letterSpacing: "-0.02em",
+                whiteSpace: "nowrap",
+                color: "var(--color-text)",
+              }}
+            >
+              SwarmAgents
+            </span>
+          </span>
         </div>
         <p style={{ color: "var(--color-text-muted)", fontSize: 13, margin: "0 0 24px" }}>
           Choose a new password for your account.

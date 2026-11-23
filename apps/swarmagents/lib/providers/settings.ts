@@ -48,6 +48,50 @@ export interface UserSettings {
    * means off, and off means the prompt is byte-identical to before.
    */
   tokenEfficiency?: TokenEfficiencySettings;
+  /**
+   * How the key pool picks which of a provider's keys serves a call when
+   * several are usable (quota fallback method). Absent = "round-robin",
+   * the historical behavior.
+   */
+  keySelectionMode?: KeySelectionMode;
+}
+
+/**
+ * Quota fallback method: how a provider's key pool chooses among usable
+ * keys.
+ * - "round-robin": rotate through keys, healthiest first (fewest
+ *   consecutive failures, then least recently used). The default.
+ * - "fallback": strict priority — always the first usable key in the
+ *   order saved; later keys serve only while earlier ones cool down.
+ * - "random": uniform random among usable keys.
+ * - "tiered": healthiest tier first (fewest consecutive failures), then
+ *   lowest average latency, then least recently used.
+ */
+export type KeySelectionMode = "round-robin" | "fallback" | "random" | "tiered";
+
+/** Every valid key-selection mode, for validation and UI lists. */
+export const KEY_SELECTION_MODES: readonly KeySelectionMode[] = [
+  "round-robin",
+  "fallback",
+  "random",
+  "tiered",
+];
+
+/** The key-selection mode when a user has not chosen one. */
+export const DEFAULT_KEY_SELECTION_MODE: KeySelectionMode = "round-robin";
+
+/** Is this value a valid key-selection mode? */
+export function isKeySelectionMode(value: unknown): value is KeySelectionMode {
+  return (
+    value === "round-robin" || value === "fallback" || value === "random" || value === "tiered"
+  );
+}
+
+/** The key-selection mode for one user's settings (absent = round-robin). */
+export function keySelectionModeFor(settings: UserSettings): KeySelectionMode {
+  return isKeySelectionMode(settings.keySelectionMode)
+    ? settings.keySelectionMode
+    : DEFAULT_KEY_SELECTION_MODE;
 }
 
 /** Per-user token-efficiency controls; all opt-in, all default off. */
@@ -196,6 +240,7 @@ export function parseUserSettings(raw: unknown): UserSettings {
   if (ollamaBaseUrl !== undefined) out.ollamaBaseUrl = ollamaBaseUrl;
   const tokenEfficiency = parseTokenEfficiency(raw.tokenEfficiency);
   if (tokenEfficiency !== undefined) out.tokenEfficiency = tokenEfficiency;
+  if (isKeySelectionMode(raw.keySelectionMode)) out.keySelectionMode = raw.keySelectionMode;
   return out;
 }
 

@@ -39,7 +39,7 @@ import {
 } from "../providers";
 import { routerProviders, userCooldownFilePath, userProvidersSignature } from "../providers/store";
 import { isAnthropicStyle } from "../providers/adapters";
-import { readUserSettings, systemPackerOptionsFor } from "../providers/settings";
+import { keySelectionModeFor, readUserSettings, systemPackerOptionsFor } from "../providers/settings";
 import { RunProviderPool, runWithPool } from "../providers/run-pool";
 import type { AttemptOutcome, RunAttempt } from "../providers/run-pool";
 import {
@@ -913,7 +913,7 @@ export class RuntimeManager {
   private effectiveRouter(userId: string): Router | null {
     if (this.routerOverride !== undefined) return this.routerOverride;
     const runPoolEnabled = isRunProviderPoolEnabled();
-    const signature = `${userProvidersSignature(userId)}|${serverMode() ? "server" : "local"}|free:${readUserSettings(userId).preferFreeProviders}|runPool:${runPoolEnabled}`;
+    const signature = `${userProvidersSignature(userId)}|${serverMode() ? "server" : "local"}|free:${readUserSettings(userId).preferFreeProviders}|keys:${keySelectionModeFor(readUserSettings(userId))}|runPool:${runPoolEnabled}`;
     const cached = this.routers.get(userId);
     if (cached && cached.signature === signature) return cached.router;
     // Free-first: the router ranks providers by `rank`; orderLlmCandidates
@@ -933,6 +933,7 @@ export class RuntimeManager {
       providers,
       persistCooldowns: true,
       cooldownFile: userCooldownFilePath(userId),
+      keySelectionMode: keySelectionModeFor(readUserSettings(userId)),
     });
     this.routers.set(userId, { signature, router });
     return router;

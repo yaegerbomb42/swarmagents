@@ -12,9 +12,12 @@ import { providerOwner } from "@/lib/providers/owner";
 import { assertResolvableProviderBaseUrl } from "@/lib/providers/url-safety";
 import { JsonBodyError, readJsonBody } from "@/lib/http";
 import {
+  KEY_SELECTION_MODES,
   MAX_SYSTEM_BUDGET_TOKENS,
   MIN_SYSTEM_BUDGET_TOKENS,
   codebaseContextInjectionEnabled,
+  isKeySelectionMode,
+  keySelectionModeFor,
   readUserSettings,
   updateUserSettings,
 } from "@/lib/providers/settings";
@@ -35,7 +38,11 @@ export function GET(request: NextRequest) {
   // The codebase context is on unless it was turned off: report the effective
   // value so the toggle always shows the truth.
   return NextResponse.json(
-    { ...settings, injectCodebaseContext: codebaseContextInjectionEnabled(settings) },
+    {
+      ...settings,
+      injectCodebaseContext: codebaseContextInjectionEnabled(settings),
+      keySelectionMode: keySelectionModeFor(settings),
+    },
     { headers: NO_STORE },
   );
 }
@@ -74,6 +81,15 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: "allowPaidProviders must be a boolean." }, { status: 400 });
     }
     patch.allowPaidProviders = input.allowPaidProviders;
+  }
+  if ("keySelectionMode" in input) {
+    if (!isKeySelectionMode(input.keySelectionMode)) {
+      return NextResponse.json(
+        { error: `keySelectionMode must be one of: ${KEY_SELECTION_MODES.join(", ")}.` },
+        { status: 400 },
+      );
+    }
+    patch.keySelectionMode = input.keySelectionMode;
   }
   for (const field of ["perRunBudgetUsd", "perDayBudgetUsd"] as const) {
     if (!(field in input)) continue;

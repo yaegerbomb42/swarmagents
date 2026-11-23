@@ -22,6 +22,7 @@ import {
 } from "./errors";
 import { KeyPool } from "./key-pool";
 import type { KeyLease } from "./key-pool";
+import type { KeySelectionMode } from "./settings";
 import { parseStreamFrame, readSseFrames } from "./stream";
 import type { SseFrame, StreamPiece } from "./stream";
 import type {
@@ -49,6 +50,11 @@ export interface RouterOptions {
   now?: () => number;
   cooldownBaseMs?: number;
   cooldownMaxMs?: number;
+  /**
+   * How each provider's key pool picks among usable keys (the user's
+   * quota fallback method). Defaults to "round-robin".
+   */
+  keySelectionMode?: KeySelectionMode;
   /** Default number of providers to race. 1 = sequential failover. */
   defaultRace?: number;
   /** Per-request timeout when a provider does not set its own. */
@@ -279,6 +285,9 @@ export class Router {
             : {}),
           ...(options.cooldownMaxMs !== undefined
             ? { cooldownMaxMs: options.cooldownMaxMs }
+            : {}),
+          ...(options.keySelectionMode !== undefined
+            ? { selectionMode: options.keySelectionMode }
             : {}),
           onStateChange: () => this.persistCooldownState(),
         });

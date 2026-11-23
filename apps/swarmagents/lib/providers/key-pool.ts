@@ -2,6 +2,7 @@ import { hashProviderKey, DEFAULT_QUOTA_COOLDOWN_MS } from "./cooldown-store";
 import type { PersistedCooldown } from "./cooldown-store";
 import { isCooldownKind } from "./errors";
 import type { KeyStat, ProviderErrorKind } from "./types";
+import type { KeySelectionMode } from "./settings";
 
 export interface KeyPoolOptions {
   /** First cooldown, before exponential growth. */
@@ -15,6 +16,14 @@ export interface KeyPoolOptions {
   quotaCooldownMs?: number;
   /** Injectable clock, primarily for deterministic tests. */
   now?: () => number;
+  /**
+   * How acquire() picks among usable keys (the user's quota fallback
+   * method). Defaults to "round-robin" — fewest consecutive failures,
+   * then least recently used.
+   */
+  selectionMode?: KeySelectionMode;
+  /** Injectable randomness for "random" mode, primarily for tests. */
+  random?: () => number;
   /**
    * Called whenever the cooldown/backoff state of a key changes. The router
    * uses it to persist the state so it survives a restart.
@@ -88,6 +97,8 @@ export class KeyPool {
   private readonly cooldownMaxMs: number;
   private readonly quotaCooldownMs: number;
   private readonly now: () => number;
+  private readonly selectionMode: KeySelectionMode;
+  private readonly random: () => number;
   private readonly onStateChange?: (providerId: string) => void;
   private tick = 0;
 
@@ -97,6 +108,8 @@ export class KeyPool {
     this.cooldownMaxMs = options.cooldownMaxMs ?? DEFAULT_COOLDOWN_MAX_MS;
     this.quotaCooldownMs = options.quotaCooldownMs ?? DEFAULT_QUOTA_COOLDOWN_MS;
     this.now = options.now ?? Date.now;
+    this.selectionMode = options.selectionMode ?? "round-robin";
+    this.random = options.random ?? Math.random;
     this.onStateChange = options.onStateChange;
     this.states = dedupe(keys).map((value, index) => ({
       id: `${this.providerId}:key-${index + 1}`,
@@ -130,21 +143,48 @@ export class KeyPool {
   /** Returns a lease on the best available key, or null if all are cooling. */
   acquire(): KeyLease | null {
     const now = this.now();
-    let chosen: KeyState | undefined;
+    const available = this.states.filter((state) => state.cooldownUntil <= now);
+    if (available.length === 0) return null;
 
-    for (const state of this.states) {
-      if (state.cooldownUntil > now) continue;
-      if (
-        !chosen ||
-        state.consecutiveFailures < chosen.consecutiveFailures ||
-        (state.consecutiveFailures === chosen.consecutiveFailures &&
-          state.lastUsedTick < chosen.lastUsedTick)
-      ) {
-        chosen = state;
+    let chosen: KeyState;
+    switch (this.selectionMode) {
+      case "fallback":
+        // Strict priority: the first usable key in saved order serves
+        // until it cools down; later keys are pure fallbacks.
+        chosen = available[0]!;
+        break;
+      case "random": {
+        const index = Math.min(
+          available.length - 1,
+          Math.max(0, Math.floor(this.random() * available.length)),
+        );
+        chosen = available[index]!;
+        break;
       }
+      case "tiered":
+        // Healthiest tier first, then fastest average latency, then LRU.
+        chosen = available.reduce((best, state) =>
+          state.consecutiveFailures < best.consecutiveFailures ||
+          (state.consecutiveFailures === best.consecutiveFailures &&
+            (state.avgLatencyMs < best.avgLatencyMs ||
+              (state.avgLatencyMs === best.avgLatencyMs &&
+                state.lastUsedTick < best.lastUsedTick)))
+            ? state
+            : best,
+        );
+        break;
+      case "round-robin":
+      default:
+        // Fewest consecutive failures, then least recently used.
+        chosen = available.reduce((best, state) =>
+          state.consecutiveFailures < best.consecutiveFailures ||
+          (state.consecutiveFailures === best.consecutiveFailures &&
+            state.lastUsedTick < best.lastUsedTick)
+            ? state
+            : best,
+        );
+        break;
     }
-
-    if (!chosen) return null;
 
     chosen.lastUsedTick = ++this.tick;
     const state = chosen;

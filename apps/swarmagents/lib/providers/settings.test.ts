@@ -12,6 +12,8 @@ import { join } from "node:path";
 import { configureProviderStorePaths } from "./store";
 import {
   DEFAULT_USER_SETTINGS,
+  isKeySelectionMode,
+  keySelectionModeFor,
   parseUserSettings,
   readUserSettings,
   updateUserSettings,
@@ -60,4 +62,20 @@ test("parseUserSettings and readUserSettings tolerate corrupt or malformed files
   assert.deepEqual(readUserSettings(U), DEFAULT_USER_SETTINGS);
   writeFileSync(file, JSON.stringify({ preferFreeProviders: false }), "utf8");
   assert.deepEqual(readUserSettings(U), { preferFreeProviders: false });
+});
+
+test("keySelectionMode parses valid modes, drops invalid ones, and defaults to round-robin", () => {
+  for (const mode of ["round-robin", "fallback", "random", "tiered"] as const) {
+    assert.equal(isKeySelectionMode(mode), true);
+    assert.equal(parseUserSettings({ keySelectionMode: mode }).keySelectionMode, mode);
+    assert.equal(keySelectionModeFor({ preferFreeProviders: true, keySelectionMode: mode }), mode);
+  }
+  assert.equal(isKeySelectionMode("chaos"), false);
+  assert.equal(isKeySelectionMode(42), false);
+  assert.equal(parseUserSettings({ keySelectionMode: "chaos" }).keySelectionMode, undefined);
+  assert.equal(keySelectionModeFor({ preferFreeProviders: true }), "round-robin");
+  assert.equal(
+    keySelectionModeFor({ preferFreeProviders: true, keySelectionMode: "chaos" as never }),
+    "round-robin",
+  );
 });

@@ -14,6 +14,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { vaultProxyEnv } from "../secrets/inject";
 import { revokeVaultToken } from "../secrets/token";
 import { ClaudeCodeRunner, isSignalKillExitCode } from "../harness/runner";
@@ -145,6 +146,11 @@ import {
   type ShadowVerificationSummary,
 } from "../verification/shadow-verifier";
 import { runDiffHygieneGate } from "../verification/diff-hygiene-gate";
+import { defaultOracleChecks, runOracleGate } from "../harness/oracle";
+import { deriveArtifactsFromEvents, diffWorkspaceLists, listWorkspaceFiles, mergeArtifacts } from "./run-report";
+import type { WorkspaceEntry } from "./run-report";
+import { getRunsDir } from "../telemetry/paths";
+import { readRunEvents } from "../telemetry/run-log";
 import { createCheapCallLLM } from "../verification/llm-caller";
 import { writeRunVerification } from "../verification/store";
 import { WORKSPACE_ROOT } from "../vm/files";
@@ -175,6 +181,29 @@ export function isRunProviderPoolEnabled(env: Record<string, string | undefined>
   const value = env.SWARM_RUN_PROVIDER_POOL?.trim().toLowerCase();
   return value === "1" || value === "true";
 }
+
+/** Post-run Oracle is opt-in until its run-time cost and coverage are proven. */
+export function isOraclePostRunEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const value = env.SWARM_ORACLE_POST_RUN?.trim().toLowerCase();
+  return value === "1" || value === "true";
+}
+
+export function mergeOracleSummary(
+  summary: ShadowVerificationSummary,
+  oracle: ShadowVerificationSummary,
+): ShadowVerificationSummary {
+  const passed = summary.passed && oracle.passed;
+  return {
+    ...summary,
+    passed,
+    score: Math.min(summary.score, oracle.score),
+    badge: passed ? summary.badge : "fail",
+    violations: [...summary.violations, ...oracle.violations],
+    testsRan: summary.testsRan || oracle.testsRan,
+    buildBroke: summary.buildBroke || oracle.buildBroke,
+  };
+}
+
 const SUMMARY_PROMPT_LEN = 300;
 const DEFAULT_MAX_QUEUED = 3;
 /**
@@ -384,6 +413,8 @@ interface ActiveRun {
   ambientRuleId?: string;
   /** Completed shadow-verifier attempts (bounds the bounce-back loop). */
   shadowAttempts?: number;
+  /** Workspace baseline for the opt-in post-run Oracle artifact diff. */
+  oracleStartListing?: Map<string, WorkspaceEntry>;
   /** F1 fork seed: VM snapshot label restored when this run starts. */
   seedSnapshotLabel?: string;
   /** F1 fork provenance: the run + checkpoint this run was forked from. */
@@ -2497,6 +2528,11 @@ export class RuntimeManager {
     // survives a VM reset.
     active.memoryContext = await this.memoryContextFor(userId, active.prompt);
 
+    // Keep the pre-run listing only when the opt-in Oracle gate needs it. The
+    // report artifact diff is more precise than a whole-repository git diff,
+    // which could otherwise pick up a user's pre-existing workspace changes.
+    if (isOraclePostRunEnabled()) active.oracleStartListing = await listWorkspaceFiles(this.vm, userId);
+
     // Phase loop: each role switch continues the same conversation (--resume)
     // with the new role's phase. The provider failover loop runs per phase.
     for (let phaseIndex = 0; ; phaseIndex++) {
@@ -2573,6 +2609,7 @@ export class RuntimeManager {
     const approvalEnv = hookBaseUrl && runToken ? approvalHookEnv(hookBaseUrl, runToken) : {};
     const approvalHook = Object.keys(approvalEnv).length > 0;
     const verificationEnabled = isShadowVerificationEnabled();
+    const postRunGateEnabled = verificationEnabled || isOraclePostRunEnabled();
 
     if (isRunProviderPoolEnabled()) {
       if (!router) {
@@ -2588,6 +2625,7 @@ export class RuntimeManager {
         approvalEnv,
         approvalHook,
         verificationEnabled,
+        postRunGateEnabled,
       });
     }
 
@@ -2627,13 +2665,13 @@ export class RuntimeManager {
           null,
           fallbackPhase,
           approvalHook,
-          verificationEnabled,
+          postRunGateEnabled,
         );
         if (outcome.roleSwitch) return { switched: true, ...outcome.roleSwitch };
         if (outcome.aborted) return { switched: false };
         if (!attemptError) {
-          if (!verificationEnabled || !finishEvent) return { switched: false }; // success finalized via run.finished
-          const gate = await this.runShadowGate(active, finishEvent);
+          if (!postRunGateEnabled || !finishEvent) return { switched: false }; // success finalized via run.finished
+          const gate = await this.runPostRunGate(active, finishEvent, verificationEnabled);
           if (gate.outcome === "finalized") return { switched: false };
           active.prompt = bounceRemediationPrompt(gate.summary);
           active.shadowAttempts = (active.shadowAttempts ?? 0) + 1;
@@ -2713,7 +2751,7 @@ export class RuntimeManager {
         selection,
         phase,
         approvalHook,
-        verificationEnabled,
+        postRunGateEnabled,
       );
       if (outcome.roleSwitch) {
         selection.release();
@@ -2763,8 +2801,8 @@ export class RuntimeManager {
       // agent (bounded) if the code is unverified or the build broke.
       if (!attemptError) {
         selection.settle({ ok: true });
-        if (!verificationEnabled || !finishEvent) return { switched: false }; // success finalized via run.finished
-        const gate = await this.runShadowGate(active, finishEvent);
+        if (!postRunGateEnabled || !finishEvent) return { switched: false }; // success finalized via run.finished
+        const gate = await this.runPostRunGate(active, finishEvent, verificationEnabled);
         if (gate.outcome === "finalized") return { switched: false };
         active.prompt = bounceRemediationPrompt(gate.summary);
         active.shadowAttempts = (active.shadowAttempts ?? 0) + 1;
@@ -2804,6 +2842,7 @@ export class RuntimeManager {
       approvalEnv: Record<string, string>;
       approvalHook: boolean;
       verificationEnabled: boolean;
+      postRunGateEnabled: boolean;
     },
   ): Promise<{ switched: true; toRoleId: string; sessionId?: string } | { switched: false }> {
     const { runId, userId } = active;
@@ -2881,8 +2920,8 @@ export class RuntimeManager {
         return { switched: false };
       }
       active.sessionId = result.sessionId ?? active.sessionId;
-      if (!options.verificationEnabled || !finishEvent) return { switched: false };
-      const gate = await this.runShadowGate(active, finishEvent);
+      if (!options.postRunGateEnabled || !finishEvent) return { switched: false };
+      const gate = await this.runPostRunGate(active, finishEvent, options.verificationEnabled);
       if (gate.outcome === "finalized") return { switched: false };
       active.prompt = bounceRemediationPrompt(gate.summary);
       active.shadowAttempts = (active.shadowAttempts ?? 0) + 1;
@@ -2933,6 +2972,114 @@ export class RuntimeManager {
       });
       return { exitCode: result.exitCode, stdout, stderr };
     };
+  }
+
+  /**
+   * Verify only files the run demonstrably wrote. Oracle's "best" mode lands
+   * a passing candidate, so give it a disposable worktree; the user's live
+   * workspace must never be changed by a post-run audit.
+   */
+  private async runPostRunOracle(active: ActiveRun): Promise<ShadowVerificationSummary | undefined> {
+    if (!isOraclePostRunEnabled()) return undefined;
+    let isolatedRoot: string | undefined;
+    let worktreeGitRoot: string | undefined;
+    const exec = this.shadowExecFor(active.userId);
+    try {
+      const repoRoot = await selectedCodebaseRepo(active.userId, this.codebaseScanner);
+      if (!repoRoot) return undefined;
+      const rootResult = await exec(["git", "rev-parse", "--show-toplevel"], { cwd: repoRoot });
+      if (rootResult.exitCode !== 0) throw new Error("could not locate repository root");
+      const gitRoot = rootResult.stdout.trim();
+      worktreeGitRoot = gitRoot;
+      const projectDir = path.posix.relative(gitRoot, repoRoot) || ".";
+      const runsDir = getRunsDir();
+      const events = runsDir ? readRunEvents(active.runId, runsDir) : [];
+      const after = await listWorkspaceFiles(this.vm, active.userId);
+      const artifacts = mergeArtifacts(
+        diffWorkspaceLists(active.oracleStartListing ?? null, after),
+        deriveArtifactsFromEvents(events, after, active.oracleStartListing ?? null),
+      );
+      const paths = [...new Set(artifacts.map((artifact) => path.posix.relative(gitRoot, artifact.path)))].filter(
+        (file) => file && !file.startsWith("../") && file !== ".." && !path.posix.isAbsolute(file),
+      );
+      if (paths.length === 0) return undefined;
+
+      const patches: string[] = [];
+      for (const file of paths) {
+        const tracked = await exec(["git", "ls-files", "--error-unmatch", "--", file], { cwd: gitRoot });
+        const patch = tracked.exitCode === 0
+          ? await exec(["git", "diff", "--binary", "HEAD", "--", file], { cwd: gitRoot })
+          : await exec(["git", "diff", "--no-index", "--binary", "/dev/null", file], { cwd: gitRoot });
+        if (patch.exitCode !== 0 && !(tracked.exitCode !== 0 && patch.exitCode === 1)) {
+          throw new Error(`could not capture diff for ${file}`);
+        }
+        if (patch.stdout.trim()) patches.push(patch.stdout);
+      }
+      const diff = patches.join("\n");
+      if (!diff.trim()) return undefined;
+
+      isolatedRoot = path.posix.join(path.posix.dirname(gitRoot), `.swarm-oracle-${active.runId}`);
+      const worktree = await exec(["git", "-C", gitRoot, "worktree", "add", "--detach", isolatedRoot, "HEAD"]);
+      if (worktree.exitCode !== 0) throw new Error("could not create isolated Oracle worktree");
+      const projectNodeModules = path.posix.join(gitRoot, projectDir, "node_modules");
+      const isolatedNodeModules = path.posix.join(isolatedRoot, projectDir, "node_modules");
+      await exec(["ln", "-s", projectNodeModules, isolatedNodeModules]);
+
+      const report = await runOracleGate(exec, [{ id: active.runId, diff }], {
+        repoRoot: isolatedRoot,
+        projectDir,
+        mode: "best",
+        checks: defaultOracleChecks(),
+        linkDirs: [path.posix.join(projectDir, "node_modules")],
+        signal: active.controller.signal,
+      });
+      const verdict = report.verdicts[0];
+      const passed = verdict?.status === "passed";
+      const detail = verdict && "diagnostic" in verdict ? verdict.diagnostic : report.summary;
+      return {
+        passed,
+        score: passed ? 100 : 0,
+        badge: passed ? "pass" : "fail",
+        violations: passed ? [] : [`Oracle: ${detail}`],
+        testsRan: Boolean(verdict && verdict.status !== "skipped" && verdict.checks.length > 0),
+        buildBroke: Boolean(verdict && "stage" in verdict && verdict.stage === "tsc"),
+      };
+    } catch (error) {
+      // Fail closed into the report, never into the run control path.
+      const message = makeRedactor({ ...process.env } as Record<string, string>)(
+        error instanceof Error ? error.message : String(error),
+      );
+      return {
+        passed: false,
+        score: 0,
+        badge: "fail",
+        violations: [`Oracle error: ${message}`],
+        testsRan: false,
+        buildBroke: false,
+      };
+    } finally {
+      if (isolatedRoot) {
+        try {
+          if (worktreeGitRoot) {
+            await exec(["git", "-C", worktreeGitRoot, "worktree", "remove", "--force", isolatedRoot]);
+            await exec(["git", "-C", worktreeGitRoot, "worktree", "prune"]);
+          }
+        } catch {
+          // A failed cleanup is operationally recoverable and must not fail the run.
+        }
+      }
+    }
+  }
+
+  private async runPostRunGate(
+    active: ActiveRun,
+    finishEvent: Extract<HarnessEvent, { type: "run.finished" }>,
+    shadowEnabled: boolean,
+  ): Promise<{ outcome: "finalized" } | { outcome: "bounce"; summary: ShadowVerificationSummary }> {
+    if (shadowEnabled) return this.runShadowGate(active, finishEvent);
+    const oracle = await this.runPostRunOracle(active);
+    this.finalizeFinished(active, finishEvent, oracle);
+    return { outcome: "finalized" };
   }
 
   /** Finalize a finished run with its verification badge, if any. */
@@ -2988,19 +3135,21 @@ export class RuntimeManager {
     try {
       const plan = await this.resolveVerificationPlan(active);
       if (!plan) {
-        this.finalizeFinished(active, finishEvent, undefined);
+        const oracle = await this.runPostRunOracle(active);
+        this.finalizeFinished(active, finishEvent, oracle);
         return { outcome: "finalized" };
       }
       const callLLM = createCheapCallLLM(userId, { signal: active.controller.signal });
       if (!callLLM) {
-        this.finalizeFinished(active, finishEvent, undefined);
+        const oracle = await this.runPostRunOracle(active);
+        this.finalizeFinished(active, finishEvent, oracle);
         return { outcome: "finalized" };
       }
       const deps: ShadowVerifierDeps = {
         exec: this.shadowExecFor(userId),
         callLLM,
       };
-      const summary = await shadowVerifyRound(deps, {
+      let summary = await shadowVerifyRound(deps, {
         repoRoot: plan.repoRoot,
         testCommands: plan.testCommands,
         prompt: active.prompt,
@@ -3034,11 +3183,19 @@ export class RuntimeManager {
       } catch {
         // Gate plumbing failed — finalize with the passing shadow summary.
       }
+      const oracle = await this.runPostRunOracle(active);
+      if (oracle) {
+        summary = mergeOracleSummary(summary, oracle);
+      }
+      if (!summary.passed && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS) {
+        return { outcome: "bounce", summary };
+      }
       this.finalizeFinished(active, finishEvent, summary);
       return { outcome: "finalized" };
     } catch {
       // Never let a verifier failure wedge or falsely bounce a run.
-      this.finalizeFinished(active, finishEvent, undefined);
+      const oracle = await this.runPostRunOracle(active);
+      this.finalizeFinished(active, finishEvent, oracle);
       return { outcome: "finalized" };
     }
   }

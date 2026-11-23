@@ -60,28 +60,28 @@ import { cn } from "../utils/cn";
 
 interface FilesViewProps {
   /** Refresh the visible workspace while the agent is working. */
-  live?: boolean;
+  readonly live?: boolean;
   /**
    * Monotonic token that changes when the current run emits run.finished, so
    * the listing and open preview re-read the workspace after the agent writes.
    */
-  refreshToken?: number;
+  readonly refreshToken?: number;
   /**
    * A workspace path to open (absolute, inside the workspace). The file is
    * selected and its folder is shown — used by the Codebase tab, which opens
    * a file of the map in the file browser.
    */
-  openPath?: string;
+  readonly openPath?: string;
   /**
    * The file the agent last wrote (from presence). It is highlighted in the
-   * rail and re-read while the run streams, so the view shows the agent's
-   * work as it happens.
+   * rail and re-read while the run is still streaming, so the view shows the
+   * agent's work as it happens.
    */
-  changedPath?: string;
+  readonly changedPath?: string;
   /** Epoch ms of that write; a new value restarts the flash. */
-  changedAt?: number;
+  readonly changedAt?: number;
   /** The full presence summary, for the rail's "agent wrote this" marker. */
-  presence?: Presence;
+  readonly presence?: Presence;
 }
 
 type FileKind = "code" | "image" | "text" | "binary";
@@ -205,6 +205,91 @@ interface DirState {
   error?: string;
 }
 
+/** Row highlight for a rail entry: selected wins, then just-changed, then updated while live. */
+function entryRowClassName(isSelected: boolean, isChanged: boolean, isUpdated: boolean): string {
+  if (isSelected) return "bg-sky-400/10 text-white ring-1 ring-inset ring-sky-400/25";
+  if (isChanged) return "bg-amber-400/[0.08] text-amber-100/90";
+  if (isUpdated) return "bg-emerald-400/10 text-emerald-200";
+  return "text-white/70 hover:bg-white/[0.06]";
+}
+
+function RowChevron({ isDir, isOpen }: { readonly isDir: boolean; readonly isOpen: boolean }) {
+  if (!isDir) return null;
+  return isOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />;
+}
+
+/** The badges after a rail entry's name: updated, just-changed, and the folder affordance. */
+function RowBadges({
+  isDir,
+  isUpdated,
+  isChanged,
+}: {
+  readonly isDir: boolean;
+  readonly isUpdated: boolean;
+  readonly isChanged: boolean;
+}) {
+  return (
+    <>
+      {isUpdated && <span className="shrink-0 text-[10px] text-emerald-300">Updated</span>}
+      {isChanged && (
+        <span
+          className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-300"
+          title="The agent wrote this file"
+          aria-label="Just changed by the agent"
+        />
+      )}
+      {isDir && (
+        <span className="shrink-0 text-[9px] uppercase tracking-wide text-white/25 opacity-0 transition-opacity group-hover:opacity-100">
+          open
+        </span>
+      )}
+    </>
+  );
+}
+
+/** An open folder's children in the rail: loading, error, empty, or the nested rows. */
+function DirChildren({
+  isOpen,
+  dirState,
+  depth,
+  renderEntry,
+}: {
+  readonly isOpen: boolean;
+  readonly dirState?: DirState;
+  readonly depth: number;
+  readonly renderEntry: (entry: WorkspaceEntry, depth: number) => React.ReactNode;
+}) {
+  if (!isOpen) return null;
+  if (dirState?.loading) {
+    return (
+      <div className="ml-2 border-l border-white/5 pl-1">
+        <div className="flex items-center gap-1.5 px-2 py-1 font-mono text-[10px] text-white/30">
+          <Loader2 className="h-3 w-3 animate-spin" /> reading…
+        </div>
+      </div>
+    );
+  }
+  if (dirState?.error) {
+    return (
+      <div className="ml-2 border-l border-white/5 pl-1">
+        <div className="px-2 py-1 font-mono text-[10px] text-rose-300/70">{dirState.error}</div>
+      </div>
+    );
+  }
+  if (dirState?.entries?.length === 0) {
+    return (
+      <div className="ml-2 border-l border-white/5 pl-1">
+        <div className="px-2 py-1 font-mono text-[10px] text-white/25">empty</div>
+      </div>
+    );
+  }
+  return (
+    <div className="ml-2 border-l border-white/5 pl-1">
+      {dirState?.entries?.map((child) => renderEntry(child, depth + 1))}
+    </div>
+  );
+}
+
 /**
  * The rail: the current folder's children, with a folder's contents revealed
  * inline when it is opened. Only expanded folders are listed (one request
@@ -223,17 +308,17 @@ function WorkspaceRail({
   onOpenFolder,
   onRetry,
 }: {
-  path: string;
-  entries?: WorkspaceEntry[];
-  loading: boolean;
-  error?: string;
-  selected?: string;
-  changedPath?: string;
+  readonly path: string;
+  readonly entries?: WorkspaceEntry[];
+  readonly loading: boolean;
+  readonly error?: string;
+  readonly selected?: string;
+  readonly changedPath?: string;
   /** Entries that changed between polls while the run is live. */
-  changed?: string[];
-  onOpenFile: (entry: WorkspaceEntry) => void;
-  onOpenFolder: (entry: WorkspaceEntry) => void;
-  onRetry: () => void;
+  readonly changed?: string[];
+  readonly onOpenFile: (entry: WorkspaceEntry) => void;
+  readonly onOpenFolder: (entry: WorkspaceEntry) => void;
+  readonly onRetry: () => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [dirs, setDirs] = useState<Record<string, DirState>>({});
@@ -285,48 +370,18 @@ function WorkspaceRail({
           data-testid={isChanged ? "files-changed-entry" : undefined}
           className={cn(
             "group flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left font-mono text-[11px] transition-colors",
-            isSelected
-              ? "bg-sky-400/10 text-white ring-1 ring-inset ring-sky-400/25"
-              : "text-white/70 hover:bg-white/[0.06]",
-            isChanged && !isSelected && "bg-amber-400/[0.08] text-amber-100/90",
-            isUpdated && !isSelected && "bg-emerald-400/10 text-emerald-200",
+            entryRowClassName(isSelected, isChanged, isUpdated),
           )}
         >
           <span className="flex h-3 w-3 shrink-0 items-center justify-center text-white/30">
-            {isDir &&
-              (isOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />)}
+            <RowChevron isDir={isDir} isOpen={isOpen} />
           </span>
           {entryIcon(entry, isOpen)}
           <span className="min-w-0 flex-1 truncate">{entry.name}</span>
-          {isUpdated && <span className="shrink-0 text-[10px] text-emerald-300">Updated</span>}
-          {isChanged && (
-            <span
-              className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-300"
-              title="The agent wrote this file"
-              aria-label="Just changed by the agent"
-            />
-          )}
-          {isDir && (
-            <span className="shrink-0 text-[9px] uppercase tracking-wide text-white/25 opacity-0 transition-opacity group-hover:opacity-100">
-              open
-            </span>
-          )}
+          <RowBadges isDir={isDir} isUpdated={isUpdated} isChanged={isChanged} />
         </button>
-        {isDir && isOpen && (
-          <div className="ml-2 border-l border-white/5 pl-1">
-            {dirState?.loading && (
-              <div className="flex items-center gap-1.5 px-2 py-1 font-mono text-[10px] text-white/30">
-                <Loader2 className="h-3 w-3 animate-spin" /> reading…
-              </div>
-            )}
-            {dirState?.error && (
-              <div className="px-2 py-1 font-mono text-[10px] text-rose-300/70">{dirState.error}</div>
-            )}
-            {dirState?.entries?.length === 0 && (
-              <div className="px-2 py-1 font-mono text-[10px] text-white/25">empty</div>
-            )}
-            {dirState?.entries?.map((child) => renderEntry(child, depth + 1))}
-          </div>
+        {isDir && (
+          <DirChildren isOpen={isOpen} dirState={dirState} depth={depth} renderEntry={renderEntry} />
         )}
       </div>
     );
@@ -372,7 +427,7 @@ function WorkspaceRail({
 
 /* ── The reading pane ────────────────────────────────────────────────────── */
 
-function CodeBody({ content }: { content: string }) {
+function CodeBody({ content }: { readonly content: string }) {
   const [limit, setLimit] = useState(FILE_RENDER_CHUNK);
   const { lines, hidden } = useMemo(() => visibleSlice(content, limit), [content, limit]);
   // A new file starts at the first chunk again.
@@ -421,8 +476,146 @@ export function changedWorkspaceEntries(previous: WorkspaceListing | undefined, 
   const old = new Map(previous.entries.map((entry) => [entry.path, entry]));
   return next.entries.filter((entry) => {
     const before = old.get(entry.path);
-    return !before || before.modifiedAt !== entry.modifiedAt || before.size !== entry.size || before.type !== entry.type;
+    return (
+      before?.modifiedAt !== entry.modifiedAt || before?.size !== entry.size || before?.type !== entry.type
+    );
   }).map((entry) => entry.path);
+}
+
+/** The body of the reading pane: loading, error, binary, or the file text. */
+function PreviewBody({
+  file,
+  fileLoading,
+  fileError,
+}: {
+  readonly file?: WorkspaceFile;
+  readonly fileLoading: boolean;
+  readonly fileError?: string;
+}) {
+  if (fileLoading && !file) {
+    return (
+      <div className="flex flex-1 items-center justify-center gap-2 p-6 text-xs text-white/40">
+        <Loader2 className="h-4 w-4 animate-spin" /> Reading file…
+      </div>
+    );
+  }
+  if (fileError) {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+        <AlertTriangle className="h-5 w-5 text-rose-400/70" />
+        <div className="text-xs text-rose-300/90">{fileError}</div>
+      </div>
+    );
+  }
+  if (file?.binary) {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+        <AlertTriangle className="h-5 w-5 text-amber-400/70" />
+        <div className="text-xs text-white/60">{describeBinaryPreview(file.size)}</div>
+      </div>
+    );
+  }
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <CodeBody content={file?.content ?? ""} />
+      {file?.truncated && (
+        <div className="flex items-center gap-1.5 border-t border-amber-400/20 bg-amber-400/10 px-3 py-1.5 text-[10px] text-amber-200/80">
+          <AlertTriangle className="h-3 w-3 shrink-0" />
+          <span>{describeTruncatedPreview(file.limit, file.size)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The open file: identity header (name, size, copy, download, close) above its body. */
+function FilePreview({
+  selected,
+  selectedName,
+  isChangedOpen,
+  changedFlashKey,
+  file,
+  fileLoading,
+  fileError,
+  canCopy,
+  copied,
+  onCopy,
+  onClose,
+}: {
+  readonly selected: string;
+  readonly selectedName?: string;
+  readonly isChangedOpen: boolean;
+  readonly changedFlashKey: string;
+  readonly file?: WorkspaceFile;
+  readonly fileLoading: boolean;
+  readonly fileError?: string;
+  readonly canCopy: boolean;
+  readonly copied: boolean;
+  readonly onCopy: () => void;
+  readonly onClose: () => void;
+}) {
+  return (
+    <>
+      <div
+        key={isChangedOpen ? changedFlashKey : undefined}
+        className={cn(
+          "flex h-8 shrink-0 items-center gap-2 border-b border-white/[0.07] bg-[#0d0d11] px-2.5",
+          isChangedOpen && "sa-changed-flash",
+        )}
+      >
+        <FileText className="h-3.5 w-3.5 shrink-0 text-white/40" />
+        <span className="min-w-0 shrink truncate font-mono text-[11px] text-white/70" title={selected}>
+          {selectedName}
+        </span>
+        {isChangedOpen && (
+          <span className="hidden shrink-0 rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-amber-300 sm:inline">
+            just changed
+          </span>
+        )}
+        {file && (
+          <span className="shrink-0 font-mono text-[10px] text-white/30">
+            {formatBytes(file.size)}
+            {file.content !== undefined && ` · ${countLines(file.content)} lines`}
+          </span>
+        )}
+        <span className="ml-auto flex shrink-0 items-center gap-1">
+          <a
+            href={workspaceFileDownloadUrl(selected)}
+            download
+            title="Download file"
+            aria-label="Download file"
+            className="flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10px] text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+          >
+            <Download className="h-3 w-3" />
+          </a>
+          <button
+            type="button"
+            onClick={onCopy}
+            disabled={!canCopy}
+            title="Copy file contents"
+            aria-label="Copy file contents"
+            className={cn(
+              "flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10px] transition-colors disabled:cursor-not-allowed disabled:opacity-30",
+              copied ? "bg-emerald-400/10 text-emerald-300" : "text-white/50 hover:bg-white/10 hover:text-white",
+            )}
+          >
+            {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            title="Close preview"
+            aria-label="Close preview"
+            className="grid h-5 w-5 place-items-center rounded text-white/40 transition-colors hover:bg-white/10 hover:text-white"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </span>
+      </div>
+
+      <PreviewBody file={file} fileLoading={fileLoading} fileError={fileError} />
+    </>
+  );
 }
 
 export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, presence, live = false }: FilesViewProps) {
@@ -649,90 +842,19 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
               </div>
             </div>
           ) : (
-            <>
-              <div
-                key={isChangedOpen ? changedFlashKey : undefined}
-                className={cn(
-                  "flex h-8 shrink-0 items-center gap-2 border-b border-white/[0.07] bg-[#0d0d11] px-2.5",
-                  isChangedOpen && "sa-changed-flash",
-                )}
-              >
-                <FileText className="h-3.5 w-3.5 shrink-0 text-white/40" />
-                <span className="min-w-0 shrink truncate font-mono text-[11px] text-white/70" title={selected}>
-                  {selectedName}
-                </span>
-                {isChangedOpen && (
-                  <span className="hidden shrink-0 rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-amber-300 sm:inline">
-                    just changed
-                  </span>
-                )}
-                {file && (
-                  <span className="shrink-0 font-mono text-[10px] text-white/30">
-                    {formatBytes(file.size)}
-                    {file.content !== undefined && ` · ${countLines(file.content)} lines`}
-                  </span>
-                )}
-                <span className="ml-auto flex shrink-0 items-center gap-1">
-                  <a
-                    href={workspaceFileDownloadUrl(selected)}
-                    download
-                    title="Download file"
-                    aria-label="Download file"
-                    className="flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10px] text-white/50 transition-colors hover:bg-white/10 hover:text-white"
-                  >
-                    <Download className="h-3 w-3" />
-                  </a>
-                  <button
-                    type="button"
-                    onClick={copyContent}
-                    disabled={!canCopy}
-                    title="Copy file contents"
-                    aria-label="Copy file contents"
-                    className={cn(
-                      "flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10px] transition-colors disabled:cursor-not-allowed disabled:opacity-30",
-                      copied ? "bg-emerald-400/10 text-emerald-300" : "text-white/50 hover:bg-white/10 hover:text-white",
-                    )}
-                  >
-                    {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSelected(undefined)}
-                    title="Close preview"
-                    aria-label="Close preview"
-                    className="grid h-5 w-5 place-items-center rounded text-white/40 transition-colors hover:bg-white/10 hover:text-white"
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                </span>
-              </div>
-
-              {fileLoading && !file ? (
-                <div className="flex flex-1 items-center justify-center gap-2 p-6 text-xs text-white/40">
-                  <Loader2 className="h-4 w-4 animate-spin" /> Reading file…
-                </div>
-              ) : fileError ? (
-                <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-                  <AlertTriangle className="h-5 w-5 text-rose-400/70" />
-                  <div className="text-xs text-rose-300/90">{fileError}</div>
-                </div>
-              ) : file?.binary ? (
-                <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-                  <AlertTriangle className="h-5 w-5 text-amber-400/70" />
-                  <div className="text-xs text-white/60">{describeBinaryPreview(file.size)}</div>
-                </div>
-              ) : (
-                <div className="flex min-h-0 flex-1 flex-col">
-                  <CodeBody content={file?.content ?? ""} />
-                  {file?.truncated && (
-                    <div className="flex items-center gap-1.5 border-t border-amber-400/20 bg-amber-400/10 px-3 py-1.5 text-[10px] text-amber-200/80">
-                      <AlertTriangle className="h-3 w-3 shrink-0" />
-                      <span>{describeTruncatedPreview(file.limit, file.size)}</span>
-                    </div>
-                  )}
-                </div>
-              )}
-            </>
+            <FilePreview
+              selected={selected}
+              selectedName={selectedName}
+              isChangedOpen={isChangedOpen}
+              changedFlashKey={changedFlashKey}
+              file={file}
+              fileLoading={fileLoading}
+              fileError={fileError}
+              canCopy={canCopy}
+              copied={copied}
+              onCopy={copyContent}
+              onClose={() => setSelected(undefined)}
+            />
           )}
         </div>
       </div>

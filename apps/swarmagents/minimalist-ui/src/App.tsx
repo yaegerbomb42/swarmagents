@@ -102,6 +102,17 @@ export function workspaceChordAction(event: {
   if (key === "o" && event.shiftKey) return "newChat";
   return null;
 }
+/** The activity suffix under the workspace label: what the agent is doing, or the computer's state. */
+function workspaceActivitySuffix(
+  activity: string | undefined,
+  phaseActive: boolean | undefined,
+  vmLabel: string,
+): string {
+  if (activity) return ` · ${activity}`;
+  if (phaseActive) return " · Agent is working";
+  return ` · Computer ${vmLabel.toLowerCase()}`;
+}
+
 export default function App() {
   const { push: pushToast } = useToasts();
   const wide = useIsWide();
@@ -169,6 +180,7 @@ export default function App() {
 
   const { phase, busy, headRun, activeRun } = session;
   const phaseMeta = phase ? RUN_PHASE_META[phase] : undefined;
+  const activitySuffix = workspaceActivitySuffix(session.activity, phaseMeta?.active, vmDisplay.label);
   const needsAttention =
     phase === "approval" || phase === "question" || phase === "paused" || phase === "error" || vmDisplay.state === "error";
 
@@ -456,7 +468,7 @@ export default function App() {
         <section className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-2 overflow-y-auto rounded-[24px] glass hair p-3 sm:p-4" data-testid="stage">
           <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--mute)]" role="status" aria-live="polite" data-testid="workspace-activity">
             <span className={cn("h-2 w-2 shrink-0 rounded-full", phaseMeta?.active ? "bg-emerald-400 animate-pulse" : "bg-white/30")} />
-            <span className="truncate">{phaseMeta?.label ?? vmDisplay.label}{session.activity ? ` · ${session.activity}` : phaseMeta?.active ? " · Agent is working" : ` · Computer ${vmDisplay.label.toLowerCase()}`}</span>
+            <span className="truncate">{phaseMeta?.label ?? vmDisplay.label}{activitySuffix}</span>
           </div>
           {/* Keep the desktop and runtime streams mounted when switching workspace tabs. */}
           <div className={cn("min-h-[300px] flex-1", effectiveView !== "screen" && "hidden")} aria-hidden={effectiveView !== "screen"}>

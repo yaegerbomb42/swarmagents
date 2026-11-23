@@ -26,11 +26,16 @@
  *   - The VNC password is injected server-side into the upstream WebSocket
  *     URL; it is never echoed to the browser, never logged, and never appears
  *     in any response.
- *   - Sessions are `view` (read-only) by default. `control` is granted only
- *     when the client explicitly requests takeover, and only one control
- *     session per user exists at a time. View mode is enforced twice: the
- *     upstream connection is told `viewonly=1`, and RFB input messages are
- *     dropped by the proxy (see rfb-filter.ts).
+ *   - Sessions are `view` (read-only) by default. `control` is negotiated
+ *     through the per-user TakeoverStateMachine (lib/desktop-proxy/
+ *     takeover-session.ts): a control dial requests takeover, input stays
+ *     filtered until the grant (agent safe point, agent paused, or the
+ *     request timeout), and only one client per user can hold or await
+ *     control at a time (409 otherwise). Guests never enter the machine.
+ *     View mode is enforced twice: the upstream connection is told
+ *     `viewonly=1` for view-intent dials, and RFB input messages are
+ *     dropped by the proxy (see rfb-filter.ts) whenever the machine does
+ *     not currently accept input from that session.
  *   - Per-user connection limit (default 3 concurrent sessions) and an idle
  *     timeout close abandoned sessions.
  *   - Session opens are recorded in the audit log as desktop.view /
@@ -57,9 +62,22 @@ import { resolvePreviewShare, type PreviewShareOwner } from "../preview/tokens";
 import { resolveShareOwner } from "../projects/store";
 import { DesktopBridge } from "./bridge";
 import type { RfbFilterMode } from "./rfb-filter";
+import {
+  StateTransitionError,
+  TakeoverSessionManager,
+  type TakeoverStateSnapshot,
+} from "./takeover-session";
+import type { HandbackSummary } from "./takeover/types";
 
 export const DESKTOP_WS_PATH = "/desktop/ws";
 export const DESKTOP_HTTP_PREFIX = "/desktop/";
+/**
+ * Proxy-local JSON endpoint reporting the caller's takeover state
+ * (`{state, isController, canAcceptInput, agentPaused, requestedAt}`).
+ * Intercepted before asset proxying; session-cookie gated like every
+ * other desktop route. The client polls it while a takeover is pending.
+ */
+export const DESKTOP_TAKEOVER_STATE_PATH = "/desktop/takeover-state";
 /** Upgrade requests under this prefix are preview WebSockets, not desktop. */
 export const PREVIEW_WS_PREFIX = "/preview/";
 /** `/preview/share/<token>/<port>/...` — the token-gated preview mount. */
@@ -128,12 +146,28 @@ export interface DesktopProxyOptions {
   recordFrames?: boolean;
   /** Recording directory used when `recordFrames` is true. */
   recordingDir?: string;
+  /**
+   * Takeover session manager (state machine + summarizer glue). Defaults
+   * to a manager backed by the app's VM manager. Tests inject one with
+   * fake exec/timers. The proxy registers its own transition listener
+   * (bridge mode sync) on top of any the manager was constructed with.
+   */
+  takeoverSession?: TakeoverSessionManager;
   now?: () => number;
 }
 
 interface ProxySession {
   id: number;
   userId: string;
+  /**
+   * Takeover identity for this session: the client's `client` query param
+   * when it supplied a valid one, else `session-<id>`. The state machine
+   * keys control to this id, so it survives the reconnect-to-switch flow
+   * when the client reuses its id across dials.
+   */
+  clientId: string;
+  /** True for share-token guests (always view-only, never in the machine). */
+  guest: boolean;
   mode: RfbFilterMode;
   sockets: Set<net.Socket>;
   lastActivity: number;
@@ -172,8 +206,28 @@ export interface DesktopProxy {
    * Force every active desktop session for a user into view or control mode
    * (used by the desktop-handoff runtime to keep the human at the wheel while
    * a handoff is outstanding, and to restore control on hand-back).
+   *
+   * With the takeover machine in charge: "view" ends any takeover (cancel
+   * a pending request, force-handback an active drive) and demotes every
+   * bridge; "control" is a safe point — it grants a pending request and
+   * syncs bridges to the machine (only the controller's bridge goes
+   * control; there is no longer a promote-everyone mode).
    */
   setUserMode(userId: string, mode: RfbFilterMode): void;
+  /**
+   * Runtime hook: the agent reached a safe point (tool boundary, run end,
+   * handoff pause). Grants a pending takeover request, if any.
+   */
+  notifyTakeoverSafePoint(userId: string): void;
+  /**
+   * Runtime hook: the agent can(not) act on the desktop right now. While
+   * paused, takeover requests grant immediately.
+   */
+  setAgentPaused(userId: string, paused: boolean): void;
+  /** The most recent completed handback summary for a user, if any. */
+  getTakeoverSummary(userId: string): HandbackSummary | null;
+  /** Live takeover state snapshot for a user (tests/metrics/state route). */
+  getTakeoverState(userId: string): TakeoverStateSnapshot;
 }
 
 /**
@@ -286,6 +340,33 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
   const sessionsByUser = new Map<string, Set<ProxySession>>();
   let nextSessionId = 1;
 
+  // Takeover negotiation: one state machine per user decides who may send
+  // input. The proxy's job is only to keep each bridge's filter in step
+  // with the machine: the controller's bridge goes control on grant,
+  // everyone else (and everyone, on handback/cancel) stays view.
+  const takeover = opts.takeoverSession ?? new TakeoverSessionManager();
+
+  function syncSessionMode(session: ProxySession): void {
+    const mode: RfbFilterMode =
+      !session.guest && takeover.canAcceptInput(session.userId, session.clientId)
+        ? "control"
+        : "view";
+    if (session.mode !== mode) {
+      session.mode = mode;
+      session.bridge?.setMode(mode);
+    }
+  }
+
+  function syncUserModes(userId: string): void {
+    const set = sessionsByUser.get(userId);
+    if (!set) return;
+    for (const session of set) syncSessionMode(session);
+  }
+
+  takeover.addTransitionListener((userId) => {
+    syncUserModes(userId);
+  });
+
   function sessionsFor(userId: string): Set<ProxySession> {
     let set = sessionsByUser.get(userId);
     if (!set) {
@@ -323,6 +404,10 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
     const set = sessionsByUser.get(session.userId);
     set?.delete(session);
     if (set && set.size === 0) sessionsByUser.delete(session.userId);
+    // A departing controller cancels its pending request or force-handbacks
+    // its drive (with summary). No-op for view/guest sessions. Fire-and-
+    // forget: the summary finalize must not block socket teardown.
+    void takeover.handleDisconnect(session.userId, session.clientId).catch(() => {});
     if (reason) {
       // The password itself is never logged; only the reason.
       console.warn(`[desktop-proxy] session ${session.id} closed (${reason})`);
@@ -377,6 +462,28 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
     if (!originAllowed(req)) return safeError(res, 403, "Cross-site request blocked.");
 
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    // Proxy-local takeover state (never forwarded to the VM): the client
+    // polls this while a takeover request is pending. Same auth gates as
+    // the asset path above (host, session, origin); guests have no state.
+    if (url.pathname === DESKTOP_TAKEOVER_STATE_PATH) {
+      const clientId = url.searchParams.get("client") ?? "";
+      const snap = takeover.getState(user.id);
+      const body = JSON.stringify({
+        state: snap.state,
+        isController: clientId !== "" && snap.controllerId === clientId,
+        canAcceptInput: clientId !== "" && takeover.canAcceptInput(user.id, clientId),
+        agentPaused: snap.agentPaused,
+        requestedAt: snap.requestedAt,
+      });
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+        "x-frame-options": "DENY",
+      });
+      res.end(body);
+      return;
+    }
     const mapped = mapDeskPath(url.pathname);
     if (mapped === null) return safeError(res, 404, "Not found.");
 
@@ -578,7 +685,6 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
 
     const wantsControl =
       url.searchParams.get("mode") === "control" || url.searchParams.get("takeover") === "1";
-    const mode: RfbFilterMode = guest || !wantsControl ? "view" : "control";
 
     const endpoint = await resolveEndpointFor(user.id);
     if (!endpoint) return writeUpgradeRefusal(socket, 404, "No desktop VM for this user.");
@@ -587,13 +693,36 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
     if (active.size >= maxViewers) {
       return writeUpgradeRefusal(socket, 429, "Too many desktop viewers for this user.");
     }
-    if (mode === "control" && [...active].some((s) => s.mode === "control")) {
-      return writeUpgradeRefusal(socket, 409, "A control session is already active.");
+
+    const sessionId = nextSessionId++;
+    // The takeover identity: a client-supplied id (validated shape, safe to
+    // log) survives the reconnect-to-switch flow; otherwise the session id.
+    const rawClient = url.searchParams.get("client");
+    const clientId =
+      rawClient && /^[A-Za-z0-9_-]{1,64}$/.test(rawClient) ? rawClient : `session-${sessionId}`;
+
+    // Control is negotiated, not granted at dial: the machine decides who
+    // may send input, and the bridge filter follows it. A control dial
+    // while another client holds/awaits control is a 409, exactly as the
+    // old one-control-session check behaved. Guests never enter the machine.
+    let mode: RfbFilterMode = "view";
+    if (wantsControl && !guest) {
+      try {
+        takeover.requestTakeover(user.id, clientId);
+      } catch (err) {
+        if (err instanceof StateTransitionError && err.code === "TAKEOVER_ALREADY_ACTIVE") {
+          return writeUpgradeRefusal(socket, 409, "A control session is already active.");
+        }
+        throw err;
+      }
+      mode = takeover.canAcceptInput(user.id, clientId) ? "control" : "view";
     }
 
     const session: ProxySession = {
-      id: nextSessionId++,
+      id: sessionId,
       userId: user.id,
+      clientId,
+      guest,
       mode,
       sockets: new Set([socket]),
       lastActivity: now(),
@@ -607,7 +736,11 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
     // inside the RFB VNCAuth handshake performed by the bridge.
     const upstreamPath = upstreamWsPath.startsWith("/") ? upstreamWsPath : `/${upstreamWsPath}`;
     const upstreamUrl = new URL(`http://${endpoint.host}:${endpoint.port}${upstreamPath}`);
-    upstreamUrl.searchParams.set(upstreamViewonlyParam, mode === "control" ? "0" : "1");
+    // Upstream viewonly is a hint that follows the dial's declared intent;
+    // the bridge filter (synced to the takeover machine) is the actual
+    // enforcement point, so a requested-but-ungranted session can be
+    // promoted mid-stream without re-dialing upstream.
+    upstreamUrl.searchParams.set(upstreamViewonlyParam, wantsControl && !guest ? "0" : "1");
 
     const upHeaders: http.OutgoingHttpHeaders = {
       connection: "Upgrade",
@@ -676,14 +809,16 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
         upstreamHead: upHead,
         recordFrames: opts.recordFrames,
         recordingFile,
+        // Decoded human input feeds the takeover summarizer (counted only
+        // while this session is the controller; ignored otherwise).
+        onInputEvent: (event) => takeover.recordInput(session.userId, session.clientId, event),
       });
 
-      recordAudit({
-        user: session.userId,
-        action: session.mode === "control" ? "desktop.takeover" : "desktop.view",
-        target: session.userId,
-        result: "success",
-      });
+      // The session manager audits control intent (request + grant); the
+      // proxy audits view dials here, as before.
+      if (session.mode === "view" && !wantsControl) {
+        recordAudit({ user: session.userId, action: "desktop.view", target: session.userId, result: "success" });
+      }
     });
 
     upReq.end();
@@ -721,6 +856,7 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
         for (const set of sessionsByUser.values()) {
           for (const session of [...set]) closeSession(session, "proxy-closed");
         }
+        takeover.disposeAll();
         server.close(() => resolve());
       });
     },
@@ -738,15 +874,37 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
       });
     },
     setUserMode(userId: string, mode: RfbFilterMode) {
-      const set = sessionsByUser.get(userId);
-      if (!set) return;
-      for (const session of set) {
-        session.mode = mode;
-        // Takes effect immediately on the live bridge: demoting a control
-        // session installs the view filter (blocking further input), and
-        // promoting to control removes it.
-        session.bridge?.setMode(mode);
+      if (mode === "view") {
+        // Runtime force-view (handoff starting): end any takeover — cancel
+        // a pending request, force-handback an active drive (summary still
+        // finalized) — and demote every bridge immediately.
+        void takeover.forceHandback(userId).catch(() => {});
+        const set = sessionsByUser.get(userId);
+        if (set) {
+          for (const session of set) {
+            session.mode = "view";
+            session.bridge?.setMode("view");
+          }
+        }
+      } else {
+        // Runtime restore: treat as a safe point. Grant a pending request
+        // and sync bridges to the machine (only the controller goes
+        // control — there is no promote-everyone mode anymore).
+        takeover.notifySafePoint(userId);
+        syncUserModes(userId);
       }
+    },
+    notifyTakeoverSafePoint(userId: string) {
+      takeover.notifySafePoint(userId);
+    },
+    setAgentPaused(userId: string, paused: boolean) {
+      takeover.setAgentPaused(userId, paused);
+    },
+    getTakeoverSummary(userId: string) {
+      return takeover.getLastSummary(userId);
+    },
+    getTakeoverState(userId: string) {
+      return takeover.getState(userId);
     },
     get port() {
       return boundPort;

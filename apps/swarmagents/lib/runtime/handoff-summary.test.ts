@@ -40,3 +40,55 @@ test("handoff summary: never contains a credential and is bounded", () => {
   assert.equal(summary.includes("token"), false);
   assert.equal(summary.includes("secret"), false);
 });
+
+test("handoff summary: merges the takeover handback summary", () => {
+  const summary = buildHandoffSummary({
+    startedAt: 0,
+    resolvedAt: 30_000,
+    shot: fakeShot(),
+    takeoverSummary: {
+      text: "Human drove for 30s. Windows: Editor — notes.txt. Modified files: notes.txt.",
+      tokenCount: 20,
+      windowTitles: ["Editor — notes.txt"],
+      modifiedFiles: ["notes.txt"],
+      lastFrameCaption: "",
+      durationMs: 30_000,
+      inputEventsCount: 42,
+      generatedAt: 30_000,
+    },
+  });
+  assert.ok(summary.includes("Human drove for 30s"));
+  assert.ok(summary.includes("notes.txt"));
+  // The framing lines survive around the merged text.
+  assert.ok(summary.includes("handed the desktop back"));
+  assert.ok(summary.includes("Continue the task"));
+  assert.ok(summary.length <= 1200);
+});
+
+test("handoff summary: takeover text is redacted and truncated to the budget", () => {
+  const summary = buildHandoffSummary({
+    startedAt: 0,
+    resolvedAt: 1,
+    shot: null,
+    takeoverSummary: {
+      text: `Window: sk-${"a".repeat(48)} ${"filler ".repeat(400)}`,
+      tokenCount: 300,
+      windowTitles: [],
+      modifiedFiles: [],
+      lastFrameCaption: "",
+      durationMs: 1,
+      inputEventsCount: 1,
+      generatedAt: 1,
+    },
+  });
+  assert.ok(summary.length <= 1200);
+  assert.ok(!summary.includes(`sk-${"a".repeat(48)}`), "key-shaped text is redacted");
+  assert.ok(summary.includes("[REDACTED]"));
+  assert.ok(summary.includes("Continue the task"), "closing instructions are not amputated");
+});
+
+test("handoff summary: a null takeover summary changes nothing", () => {
+  const withNull = buildHandoffSummary({ startedAt: 0, resolvedAt: 1000, shot: null, takeoverSummary: null });
+  const without = buildHandoffSummary({ startedAt: 0, resolvedAt: 1000, shot: null });
+  assert.equal(withNull, without);
+});

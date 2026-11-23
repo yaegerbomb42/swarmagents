@@ -36,15 +36,18 @@ import { Expand, Hand, MousePointerClick, Play, RefreshCw, MonitorPlay } from "l
 import RFB from "@novnc/novnc/lib/rfb";
 import {
   DESKTOP_SCREENSHOT_PATH,
+  desktopTakeoverStateUrl,
   desktopWsUrl,
   type DesktopMode,
 } from "../../../lib/client/desktopConfig";
 import {
+  controlModeForTakeoverState,
   describeDesktopPhase,
   INITIAL_DESKTOP_CONN,
   reduceDesktopConn,
   type DesktopControlMode,
   type DesktopPhase,
+  type ServerTakeoverState,
 } from "../../../lib/client/desktopState";
 import type { VmDisplayState } from "../../../lib/client/vmStatus";
 import { presenceHintRegion, type Presence } from "../../../lib/client/presence";
@@ -56,6 +59,11 @@ export interface DesktopConnectionInfo {
   latencyMs?: number;
   fps: number;
   attempt: number;
+  /**
+   * Effective takeover mode for this client: "requested" while the server
+   * holds the request for the agent's safe point, "control" once granted.
+   */
+  takeover: DesktopControlMode;
 }
 
 export interface DesktopViewProps {
@@ -147,9 +155,19 @@ export function DesktopView({
   canControl = true,
 }: DesktopViewProps) {
   const [conn, dispatch] = useReducer(reduceDesktopConn, INITIAL_DESKTOP_CONN);
-  const [internalMode, setInternalMode] = useState<DesktopControlMode>("watch");
+  // Control is negotiated server-side: the user expresses INTENT (Take
+  // over), the proxy's takeover machine grants at the agent's safe point.
+  // `serverMode` is the last mode the server reported for this client; the
+  // effective UI mode is "requested" from intent until the grant lands.
+  const [internalIntent, setInternalIntent] = useState(false);
   const controlled = control !== undefined;
-  const mode: DesktopControlMode = controlled ? (control ? "control" : "watch") : internalMode;
+  const intentControl = controlled ? Boolean(control) : internalIntent;
+  const [serverMode, setServerMode] = useState<DesktopControlMode>("watch");
+  const mode: DesktopControlMode = !intentControl
+    ? "watch"
+    : serverMode === "control"
+      ? "control"
+      : "requested";
   const [fps, setFps] = useState(0);
   const [latencyMs, setLatencyMs] = useState<number>();
   const [frameSrc, setFrameSrc] = useState<string>();
@@ -160,6 +178,19 @@ export function DesktopView({
   const surfaceHolderRef = useRef<HTMLDivElement>(null);
   const rfbRef = useRef<RFB | null>(null);
   const modeRef = useRef<DesktopControlMode>(mode);
+  const intentRef = useRef(intentControl);
+  // Stable takeover identity for this mount: the server keys control to it
+  // across the reconnect-to-switch dials and the state poll.
+  const clientIdRef = useRef("");
+  if (!clientIdRef.current) {
+    clientIdRef.current =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `client-${Math.random().toString(36).slice(2, 12)}`;
+  }
+  // When the current dial opened (RFB connect). Polls older than this
+  // describe the previous session and must not read as a denial.
+  const dialOpenedAtRef = useRef(0);
   const meterRef = useRef<DesktopFpsMeter | null>(null);
   const frameUrlRef = useRef<string | undefined>(undefined);
   const dialStartedRef = useRef<number | undefined>(undefined);
@@ -220,15 +251,20 @@ export function DesktopView({
     const holder = surfaceHolderRef.current;
     if (!holder) return;
     let opened = false;
-    const mode = modeRef.current;
+    const wantsControl = intentRef.current;
     const target = document.createElement("div");
     holder.replaceChildren();
     holder.appendChild(target);
     let rfb: RFB;
     try {
-      // UI mode "watch" is the proxy's wire mode "view" (read-only).
+      // Intent is the proxy's wire mode: "view" (read-only) or "control"
+      // (a takeover request the server grants at the agent's safe point).
       dialStartedRef.current = performance.now();
-      rfb = new RFB(target, desktopWsUrl(mode === "watch" ? "view" : "control"), { shared: true });
+      rfb = new RFB(
+        target,
+        desktopWsUrl(wantsControl ? "control" : "view", undefined, clientIdRef.current),
+        { shared: true },
+      );
     } catch {
       target.remove();
       dispatch({ type: "refused" });
@@ -238,14 +274,17 @@ export function DesktopView({
     rfb.scaleViewport = true;
     rfb.resizeSession = false;
     rfb.showDotCursor = false;
-    rfb.viewOnly = mode === "watch";
+    // Input stays off until the server grants control (the proxy filters
+    // server-side too; this just keeps noVNC from sending into the void).
+    rfb.viewOnly = modeRef.current !== "control";
     rfb.addEventListener("connect", () => {
       opened = true;
+      dialOpenedAtRef.current = Date.now();
       if (dialStartedRef.current !== undefined) {
         setLatencyMs(Math.max(0, Math.round(performance.now() - dialStartedRef.current)));
       }
       dispatch({ type: "open" });
-      if (mode === "control") rfb.focus({ preventScroll: true });
+      if (modeRef.current === "control") rfb.focus({ preventScroll: true });
     });
     rfb.addEventListener("disconnect", (ev) => {
       if (rfbRef.current !== rfb) return; // stale teardown event — ignore
@@ -320,24 +359,80 @@ export function DesktopView({
     releaseFrameUrl();
   }, [teardown, releaseFrameUrl]);
 
-  // Controlled mode change (View only ↔ Take over): both are different proxy
-  // query params, so keep exactly one dial for the new mode.
+  // Keep the effective-mode ref current for the dial loop's viewOnly/focus.
   useEffect(() => {
-    if (modeRef.current === mode) return;
     modeRef.current = mode;
+  }, [mode]);
+
+  // Intent change (Watch ↔ Take over): different proxy query params, so
+  // keep exactly one dial for the new intent. Server-side refinements
+  // (requested → control) do NOT re-dial — the grant flips the live
+  // socket's filter server-side.
+  useEffect(() => {
+    if (intentRef.current === intentControl) return;
+    intentRef.current = intentControl;
+    setServerMode("watch");
     teardown();
     dispatch({ type: "retry-now" });
-  }, [mode, teardown]);
+  }, [intentControl, teardown]);
+
+  // Grant/handback on the live socket: flip noVNC's input gate in step
+  // with the effective mode (the proxy enforces the same server-side).
+  useEffect(() => {
+    const rfb = rfbRef.current;
+    if (!rfb) return;
+    rfb.viewOnly = mode !== "control";
+    if (mode === "control" && conn.phase === "live") rfb.focus({ preventScroll: true });
+  }, [mode, conn.phase]);
+
+  // While a takeover is pending (or held), poll the proxy's takeover-state
+  // endpoint: the grant (and a denial/expiry) arrives here, not on the RFB
+  // stream, which carries no in-band messages.
+  useEffect(() => {
+    if (!intentControl || conn.phase !== "live") return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await fetch(desktopTakeoverStateUrl(clientIdRef.current), {
+          headers: { Accept: "application/json" },
+        });
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as ServerTakeoverState;
+        if (cancelled) return;
+        setServerMode(controlModeForTakeoverState(data.state, data.isController));
+        // Denied or expired server-side (agent driving, not us) on a poll
+        // that post-dates this dial: drop the intent back to watch. Polls
+        // from before the dial opened describe the previous session.
+        if (
+          data.state === "AGENT_DRIVING" &&
+          !data.isController &&
+          Date.now() > dialOpenedAtRef.current + 500
+        ) {
+          if (controlled) onControlChange?.(false);
+          else setInternalIntent(false);
+        }
+      } catch {
+        /* transient; the next tick retries */
+      }
+    };
+    void tick();
+    const timer = setInterval(tick, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [intentControl, conn.phase, controlled, onControlChange]);
 
   // Tell the frame pill what this connection is doing.
   useEffect(() => {
-    onConnection?.({ phase: conn.phase, latencyMs, fps, attempt: conn.attempt });
-  }, [onConnection, conn.phase, conn.attempt, latencyMs, fps]);
+    onConnection?.({ phase: conn.phase, latencyMs, fps, attempt: conn.attempt, takeover: mode });
+  }, [onConnection, conn.phase, conn.attempt, latencyMs, fps, mode]);
 
   const switchMode = useCallback((next: DesktopControlMode) => {
-    if (next === modeRef.current) return;
-    if (controlled) onControlChange?.(next === "control");
-    else setInternalMode(next);
+    const wantsControl = next === "control";
+    if (wantsControl === intentRef.current) return;
+    if (controlled) onControlChange?.(wantsControl);
+    else setInternalIntent(wantsControl);
   }, [controlled, onControlChange]);
 
   const onReconnect = useCallback(() => {
@@ -370,7 +465,8 @@ export function DesktopView({
             pointing at, and pointer events pass through it. */}
         <PresenceGlow presence={presence} />
 
-        {/* Watch mode, always visible in control: the one way out. */}
+        {/* Watch mode, always visible in control: the one way out. While the
+            takeover is only requested, the same button cancels the request. */}
         {control && (
           <button
             type="button"
@@ -378,7 +474,7 @@ export function DesktopView({
             className="absolute right-2 top-2 z-10 inline-flex items-center gap-1.5 rounded-full border border-sa-accent/50 bg-sa-accent/20 px-2.5 py-1 font-mono text-[10px] text-white backdrop-blur transition-colors hover:bg-sa-accent/30"
             data-testid="desktop-hand-back"
           >
-            <Hand className="h-3 w-3" aria-hidden /> Hand back
+            <Hand className="h-3 w-3" aria-hidden /> {mode === "requested" ? "Cancel" : "Hand back"}
           </button>
         )}
 
@@ -463,6 +559,16 @@ export function DesktopView({
               Stop agent run
             </button>
           )}
+        </div>
+      )}
+
+      {/* Takeover-requested banner: the agent still has the wheel. */}
+      {mode === "requested" && live && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-amber-400/35 bg-amber-500/15 px-4 py-2 text-[11px] font-mono text-amber-200" data-testid="desktop-requested-banner">
+          <span className="font-semibold uppercase tracking-wide">Takeover requested</span>
+          <span className="text-amber-100/80">
+            Waiting for the agent to reach a safe point — input still goes to the agent.
+          </span>
         </div>
       )}
 
@@ -565,6 +671,28 @@ export function DesktopView({
             >
               <MousePointerClick className="h-3 w-3 shrink-0" />
               <span className="hidden sm:inline">Take over</span>
+            </button>
+          </>
+        ) : mode === "requested" ? (
+          <>
+            <span
+              aria-live="polite"
+              className="inline-flex items-center gap-1.5 rounded-full border border-amber-400/35 bg-amber-500/15 px-2.5 py-1 text-[11px] font-mono text-amber-200"
+              data-testid="desktop-mode-requested"
+            >
+              <RefreshCw className="h-3 w-3 shrink-0 animate-spin" />
+              <span className="hidden sm:inline">Waiting for safe point…</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => switchMode("watch")}
+              title="Cancel the takeover request"
+              aria-label="Cancel takeover request"
+              data-testid="desktop-cancel-takeover-button"
+              className="inline-flex items-center gap-1.5 rounded-full border border-white/20 bg-white/10 px-2.5 py-1 text-[11px] font-mono text-white/85 transition hover:bg-white/20"
+            >
+              <Hand className="h-3 w-3 shrink-0" />
+              <span className="hidden sm:inline">Cancel</span>
             </button>
           </>
         ) : (

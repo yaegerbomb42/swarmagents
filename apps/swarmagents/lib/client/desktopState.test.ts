@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   INITIAL_DESKTOP_CONN,
   MAX_DESKTOP_ATTEMPTS,
+  controlModeForTakeoverState,
   desktopBackoffMs,
   reduceDesktopConn,
 } from "./desktopState";
@@ -93,4 +94,14 @@ test("vm-starting during boot keeps the screen in the starting phase", () => {
   assert.equal(s1.phase, "starting");
   // Clearing out of starting still works once the VM reports ready.
   assert.equal(reduceDesktopConn(s1, { type: "vm-ready" }).phase, "connecting");
+});
+
+test("takeover state maps to the UI control mode for the controller only", () => {
+  assert.equal(controlModeForTakeoverState("HUMAN_DRIVING", true), "control");
+  assert.equal(controlModeForTakeoverState("HUMAN_REQUESTED", true), "requested");
+  assert.equal(controlModeForTakeoverState("AGENT_DRIVING", true), "watch");
+  assert.equal(controlModeForTakeoverState("HANDBACK", true), "watch");
+  // Bystanders always watch, whatever the machine is doing.
+  assert.equal(controlModeForTakeoverState("HUMAN_DRIVING", false), "watch");
+  assert.equal(controlModeForTakeoverState("HUMAN_REQUESTED", false), "watch");
 });

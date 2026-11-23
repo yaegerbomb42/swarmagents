@@ -19,6 +19,13 @@ export type DesktopMode = "view" | "control";
 export const DESKTOP_WS_PATH = "/desktop/ws";
 
 /**
+ * Takeover-state endpoint on the desktop proxy (proxy-local, session-cookie
+ * gated): GET `?client=<id>` returns the caller's takeover state as JSON.
+ * Polled while a takeover request is pending.
+ */
+export const DESKTOP_TAKEOVER_STATE_PATH = "/desktop/takeover-state";
+
+/**
  * Latest-screenshot frame endpoint used when the live socket is unavailable.
  * Captured on demand inside the user's VM (GET /api/runtime/vm/screenshot).
  */
@@ -31,11 +38,25 @@ export const DESKTOP_FRAME_HEIGHT = 900;
 /**
  * Build the browser-safe websocket URL for the desktop proxy. Same-origin by
  * definition: the proxy lives on the app server and fans out to the VM.
+ *
+ * `clientId` is the takeover identity: the server keys control to it, so the
+ * same id must be reused across reconnect-to-switch dials (and on the
+ * takeover-state poll) for the session to keep its place in the machine.
  */
 export function desktopWsUrl(
   mode: DesktopMode,
   location: { protocol: string; host: string } = globalThis.location,
+  clientId?: string,
 ): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}${DESKTOP_WS_PATH}?mode=${mode}`;
+  const client = clientId ? `&client=${encodeURIComponent(clientId)}` : "";
+  return `${proto}//${location.host}${DESKTOP_WS_PATH}?mode=${mode}${client}`;
+}
+
+/** Build the takeover-state poll URL for a client id. */
+export function desktopTakeoverStateUrl(
+  clientId: string,
+  location: { protocol: string; host: string } = globalThis.location,
+): string {
+  return `${location.protocol}//${location.host}${DESKTOP_TAKEOVER_STATE_PATH}?client=${encodeURIComponent(clientId)}`;
 }

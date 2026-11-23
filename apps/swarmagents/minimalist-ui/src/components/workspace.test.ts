@@ -217,6 +217,9 @@ test("the screen reports its state in the same dot-and-word vocabulary as a run"
   assert.deepEqual(screenStatus({ ...desktop, phase: "reconnecting" }), { label: "Reconnecting", tone: "warn", live: true });
   assert.deepEqual(screenStatus({ ...desktop, phase: "offline" }), { label: "Offline", tone: "err", live: false });
   assert.deepEqual(screenStatus({ ...desktop, phase: "live", control: true }), { label: "You are in control", tone: "accent", live: false });
+  // A requested takeover outranks the control flag: the agent still has the wheel.
+  assert.deepEqual(screenStatus({ ...desktop, phase: "live", control: true, takeover: "requested" }), { label: "Waiting for safe point", tone: "warn", live: true });
+  assert.deepEqual(screenStatus({ ...desktop, phase: "live", control: true, takeover: "control" }), { label: "You are in control", tone: "accent", live: false });
   assert.deepEqual(screenStatus({ activeView: "terminal", runActive: true, control: false }), { label: "Live", tone: "ok", live: true });
   assert.deepEqual(screenStatus({ activeView: "files", runActive: false, control: false }), { label: "Idle", tone: "muted", live: false });
 

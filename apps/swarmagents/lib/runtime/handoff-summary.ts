@@ -10,6 +10,8 @@
  */
 
 import type { CapturedShot } from "./run-report";
+import { makeRedactor } from "../harness/redact";
+import type { HandbackSummary } from "../desktop-proxy/takeover/types";
 
 export const HANDOFF_SUMMARY_MAX_CHARS = 1200;
 
@@ -22,6 +24,13 @@ export interface HandoffSummaryInput {
   shot?: CapturedShot | null;
   /** Optional free-text detail the agent gave in the tool call. */
   description?: string;
+  /**
+   * Handback summary from the takeover session manager (what the human
+   * did while driving: windows, modified files, input counts). Its text
+   * is pattern-redacted before inclusion and truncated to whatever room
+   * the 1,200-char budget leaves after the fixed framing lines.
+   */
+  takeoverSummary?: HandbackSummary | null;
 }
 
 function shotDescriptor(shot: CapturedShot): string {
@@ -33,19 +42,40 @@ function shotDescriptor(shot: CapturedShot): string {
 export function buildHandoffSummary(input: HandoffSummaryInput): string {
   const elapsedMs = Math.max(0, input.resolvedAt - input.startedAt);
   const elapsedSec = Math.round(elapsedMs / 1000);
-  const parts: string[] = [
+  const head: string[] = [
     "The user handed the desktop back to you.",
     `The desktop was with the user for ~${elapsedSec}s.`,
   ];
+  const tail: string[] = [];
   if (input.shot) {
-    parts.push(shotDescriptor(input.shot));
+    tail.push(shotDescriptor(input.shot));
   } else {
-    parts.push("A post-handoff screenshot could not be captured; re-check the on-screen state yourself.");
+    tail.push("A post-handoff screenshot could not be captured; re-check the on-screen state yourself.");
   }
   if (input.description && input.description.trim()) {
     const brief = input.description.trim().slice(0, 300);
-    parts.push(`The agent noted: "${brief}".`);
+    tail.push(`The agent noted: "${brief}".`);
   }
-  parts.push("Continue the task from the current on-screen state. Session cookies in the VM remain alive; the desktop is back under your control.");
+  tail.push("Continue the task from the current on-screen state. Session cookies in the VM remain alive; the desktop is back under your control.");
+
+  // The takeover summary is the only variable-length part. Redact it
+  // (pattern-based: window titles and file names can carry key-shaped
+  // strings) and fit it into the budget the framing leaves, truncating
+  // with an ellipsis rather than letting the final slice amputate the
+  // closing instructions.
+  const takeoverText = input.takeoverSummary?.text?.trim()
+    ? makeRedactor()(input.takeoverSummary.text.trim())
+    : "";
+  const parts = [...head];
+  if (takeoverText) {
+    const fixedLen = [...head, ...tail].join(" ").length;
+    const room = HANDOFF_SUMMARY_MAX_CHARS - fixedLen - 1; // 1 for the join space
+    if (room >= 40) {
+      const fitted =
+        takeoverText.length <= room ? takeoverText : `${takeoverText.slice(0, room - 1)}…`;
+      parts.push(fitted);
+    }
+  }
+  parts.push(...tail);
   return parts.join(" ").slice(0, HANDOFF_SUMMARY_MAX_CHARS);
 }

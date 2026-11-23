@@ -50,7 +50,7 @@ class TestStore extends PendingInteractionStore<TestItem, TestOutcome> {
   }
 
   create(id: string, runId = "run-1"): TestItem {
-    const now = Date.now();
+    const now = this.now();
     return this.createPending(
       {
         id,
@@ -108,9 +108,14 @@ test("pending store: a duplicate id cancels the prior waiter", async () => {
 
 test("pending store: restored pending items expire after a restart", async () => {
   const file = tmpFile();
-  const first = new TestStore({ filePath: file, ttlMs: 15 });
+  // Controlled clock: the first create() (with its fsync) can take longer
+  // than the 15ms TTL on a slow machine, which would expire the item
+  // before the second store even loads it. Freezing `now` keeps the
+  // restored item pending until the real 15ms timer fires it.
+  let now = 1_000_000;
+  const first = new TestStore({ filePath: file, ttlMs: 15, now: () => now });
   first.create("t-1");
-  const second = new TestStore({ filePath: file, ttlMs: 15 });
+  const second = new TestStore({ filePath: file, ttlMs: 15, now: () => now });
   assert.deepEqual(second.listPending().map((i) => i.id), ["t-1"]);
   const waiter = second.waitFor("t-1");
   assert.deepEqual(await waiter, { status: "expired" });

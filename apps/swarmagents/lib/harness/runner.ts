@@ -852,7 +852,7 @@ export class ClaudeCodeRunner {
       // Real exec drivers reject when the abort signal fires. A role switch or
       // a policy halt is a normal outcome, not an exec failure: settle the
       // gates and return the same shape the non-throwing path returns.
-      await gateChain;
+      await gates.drain();
       if (pendingSwitch.phase) {
         return {
           exitCode,

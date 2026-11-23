@@ -11,6 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../lib/auth";
 import { writeConfiguredProviders } from "../../../../lib/providers/store";
 import { RuntimeManager, setRuntimeManagerForTesting } from "../../../../lib/runtime/manager";
@@ -58,7 +59,7 @@ test.afterEach(() => cleanup());
 
 function post(body: unknown): Promise<Response> {
   return POST(
-    new Request(URL, {
+    new NextRequest(URL, {
       method: "POST",
       headers: { "content-type": "application/json", [USER_HEADER]: ALICE },
       body: JSON.stringify(body),

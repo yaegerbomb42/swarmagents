@@ -187,6 +187,30 @@ headers = {
 }
 machine = {"os": os_name, "arch": arch, "mode": mode}
 
+# Active claude child process (used for clean shutdown on signal or 401).
+current_proc = [None]
+
+def kill_claude_process():
+    proc = current_proc[0]
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+    except ProcessLookupError:
+        pass
+    except Exception:
+        pass
+
 def post(payload, timeout=60):
     req = urllib.request.Request(
         endpoint, data=json.dumps(payload).encode(), headers=headers, method="POST"
@@ -195,8 +219,9 @@ def post(payload, timeout=60):
         with urllib.request.urlopen(req, timeout=timeout) as res:
             raw = res.read()
     except urllib.error.HTTPError as exc:
-        # The node has been revoked — exit instead of looping forever.
+        # The node has been revoked — kill child process group and exit instead of looping forever.
         if exc.code == 401:
+            kill_claude_process()
             os._exit(0)
         raise
     return json.loads(raw.decode() or "{}")
@@ -387,29 +412,10 @@ def complete(run_id, status, code, text="", error="", meta=None):
             backoff = min(backoff * 2, 8.0)
 
 # SIGTERM/SIGINT: terminate the claude child process group cleanly instead of orphaning it.
-current_proc = [None]
 
 def _worker_signal(signum, frame):
-    proc = current_proc[0]
     try:
-        if proc is not None and proc.poll() is None:
-            if hasattr(os, "killpg"):
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            else:
-                proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                if hasattr(os, "killpg"):
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                else:
-                    proc.kill()
+        kill_claude_process()
     finally:
         os._exit(0)
 

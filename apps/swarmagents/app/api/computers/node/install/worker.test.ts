@@ -63,6 +63,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        try:
+            with open(os.path.join(PATH, "behavior.json")) as f:
+                behavior = json.load(f)
+        except Exception:
+            behavior = BEHAVIOR
         length = int(self.headers.get("content-length", "0") or 0)
         raw = self.rfile.read(length).decode() if length else ""
         try:
@@ -71,12 +76,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = None
         action = data.get("action") if isinstance(data, dict) else None
         record({"action": action, "body": data})
-        if BEHAVIOR.get("return401"):
+        if behavior.get("return401"):
             self._send({"error": "revoked"}, 401)
             return
         if action == "claim":
             state["claim"] += 1
-            if BEHAVIOR.get("claimOnce", True) and state["claim"] == 1:
+            if behavior.get("claimOnce", True) and state["claim"] == 1:
                 self._send({"job": {"runId": "run_test_1", "prompt": "run the fake job", "sessionId": None}})
             else:
                 self._send({"job": None})
@@ -334,6 +339,56 @@ test("complete() retries on transient 500 error and eventually succeeds", { skip
     const requests = readRequests(dir);
     const completeRequests = requests.filter((r) => r.action === "complete");
     assert.ok(completeRequests.length >= 2, `expected at least 2 complete attempts, got ${completeRequests.length}`);
+  } finally {
+    server.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+test("simulated HTTP 401 revocation terminates the claude process group and leaves no child behind", { skip: !HAS_PYTHON }, async () => {
+  const dir = tmp();
+  const server = startFakeServer(dir, { claimOnce: true });
+  const pidFile = path.join(dir, "claude.pid");
+  try {
+    await waitForServer(server.port);
+    const claude =
+      "#!/bin/sh\n" +
+      "python3 - <<'FAKE'\n" +
+      "import json, os, time\n" +
+      `with open("${pidFile}", "w") as f:\n` +
+      "    f.write(str(os.getpid()))\n" +
+      'print(json.dumps({"type":"assistant","message":{"role":"assistant","id":"m1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"token 1"}]}}), flush=True)\n' +
+      "time.sleep(1)\n" +
+      'print(json.dumps({"type":"assistant","message":{"role":"assistant","id":"m2","model":"claude-sonnet-5-5","content":[{"type":"text","text":"token 2"}]}}), flush=True)\n' +
+      "time.sleep(3600)\n" +
+      "FAKE\n";
+    writeFakeClaude(dir, claude);
+
+    const { worker } = await spawnWorkerUntil(
+      dir,
+      server.port,
+      () => fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf8").trim().length > 0,
+      15_000,
+    );
+
+    // Switch server to return 401 on the second event flush
+    fs.writeFileSync(path.join(dir, "behavior.json"), JSON.stringify({ return401: true }));
+
+    const claudePid = Number((fs.readFileSync(pidFile, "utf8") || "").trim());
+    const deadline = Date.now() + 15_000;
+    let claudeGone = false;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(claudePid, 0);
+      } catch {
+        claudeGone = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    worker.kill("SIGKILL");
+    assert.ok(claudeGone, "the claude child process must be terminated when worker encounters 401");
   } finally {
     server.stop();
     fs.rmSync(dir, { recursive: true, force: true });

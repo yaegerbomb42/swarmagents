@@ -241,3 +241,170 @@ test("the in-VM server exits cleanly when stdin closes", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("the in-VM server scrubs nested secrets in arrays and objects with cycle protection", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "swarm-memory-scrub-"));
+  const rpcDir = join(dir, "rpc");
+  const script = join(dir, "memory-server.mjs");
+  writeFileSync(script, MEMORY_MCP_SERVER_SOURCE, "utf8");
+
+  const child = spawn(process.execPath, [script], {
+    env: { ...process.env, SWARM_MEMORY_DIR: rpcDir, SWARM_MEMORY_POLL_MS: "20" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  const plantedKey = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+  const lines: string[] = [];
+  let buffer = "";
+  child.stdout.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline = buffer.indexOf("\n");
+    while (newline !== -1) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (line) lines.push(line);
+      newline = buffer.indexOf("\n");
+    }
+  });
+
+  const send = (message: unknown) => {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+  };
+
+  try {
+    send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "memory_write",
+        arguments: {
+          fact: "Harmless top-level fact",
+          nested: {
+            config: {
+              token: plantedKey,
+              list: ["harmless", plantedKey],
+            },
+          },
+        },
+      },
+    });
+
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && listRequests(rpcDir).length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const [req] = listRequests(rpcDir);
+    assert.ok(req, "expected a request to be written");
+    const raw = readFileSync(join(rpcDir, req), "utf8");
+    assert.doesNotMatch(raw, /sk-ant-api03/);
+    assert.match(raw, /\[REDACTED\]/);
+    const parsed = JSON.parse(raw) as { args: { nested: { config: { token: string; list: string[] } } } };
+    assert.equal(parsed.args.nested.config.token, "[REDACTED]");
+    assert.deepEqual(parsed.args.nested.config.list, ["harmless", "[REDACTED]"]);
+  } finally {
+    child.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("atomic request file creation writes via .tmp before rename", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "swarm-memory-atomic-"));
+  const rpcDir = join(dir, "rpc");
+  const script = join(dir, "memory-server.mjs");
+  writeFileSync(script, MEMORY_MCP_SERVER_SOURCE, "utf8");
+
+  const child = spawn(process.execPath, [script], {
+    env: { ...process.env, SWARM_MEMORY_DIR: rpcDir, SWARM_MEMORY_POLL_MS: "20" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  try {
+    child.stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "memory_write", arguments: { fact: "testing atomic write" } },
+      })}\n`,
+    );
+
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && listRequests(rpcDir).length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const files = readdirSync(rpcDir);
+    const reqFiles = files.filter((f) => f.startsWith("req-") && f.endsWith(".json"));
+    const tmpFiles = files.filter((f) => f.endsWith(".tmp"));
+    assert.equal(reqFiles.length, 1);
+    assert.equal(tmpFiles.length, 0, "temporary file must be renamed into final request file");
+  } finally {
+    child.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("invalid env timeout and poll values fall back safely without spin loop or immediate timeout", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "swarm-memory-env-"));
+  const rpcDir = join(dir, "rpc");
+  const script = join(dir, "memory-server.mjs");
+  writeFileSync(script, MEMORY_MCP_SERVER_SOURCE, "utf8");
+
+  // Pass NaN / negative / zero values in environment
+  const child = spawn(process.execPath, [script], {
+    env: {
+      ...process.env,
+      SWARM_MEMORY_DIR: rpcDir,
+      SWARM_MEMORY_TIMEOUT_MS: "not-a-number",
+      SWARM_MEMORY_POLL_MS: "-5",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  const lines: string[] = [];
+  let buffer = "";
+  child.stdout.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+    let newline = buffer.indexOf("\n");
+    while (newline !== -1) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (line) lines.push(line);
+      newline = buffer.indexOf("\n");
+    }
+  });
+
+  try {
+    child.stdin.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "memory_search", arguments: { query: "preferences" } },
+      })}\n`,
+    );
+
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && listRequests(rpcDir).length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const [req] = listRequests(rpcDir);
+    assert.ok(req, "expected request file to be written even with invalid env numbers");
+
+    // Respond from host side
+    const id = req.replace(/^req-/, "").replace(/\.json$/, "");
+    writeFileSync(join(rpcDir, `res-${id}.json`), JSON.stringify({ ok: true, memories: [] }), "utf8");
+
+    const answerDeadline = Date.now() + 2000;
+    while (Date.now() < answerDeadline && lines.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(lines.length > 0, "server should successfully read host response without crashing");
+    const parsed = JSON.parse(lines[0]) as { id: number; result: { content: Array<{ text: string }> } };
+    assert.equal(parsed.id, 1);
+    assert.ok(parsed.result.content[0].text.includes('"ok":true'));
+  } finally {
+    child.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

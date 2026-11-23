@@ -96,6 +96,12 @@ export class HandoffStore extends PendingInteractionStore<PendingHandoff, Handof
       normalize: normalizeHandoff,
       expiredOutcome: () => ({ status: "expired" }),
       cancelledOutcome: () => ({ status: "cancelled" }),
+      // A late waitFor() on a decided handoff reports the stored outcome.
+      decidedOutcome: (item) => ({
+        status: item.status === "answered" ? "answered" : item.status === "expired" ? "expired" : "cancelled",
+      }),
+      // Keep decided handoffs 24h so a late waiter still gets its outcome.
+      decidedRetentionMs: 24 * 60 * 60 * 1000,
     });
     this.ttlMs = options.ttlMs;
   }

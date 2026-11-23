@@ -10,8 +10,10 @@
  * Restored pending items get a fresh waiter and TTL timer on load, so a
  * server restart never leaves an item stuck in pending forever. `clear()`
  * resolves outstanding waiters as cancelled so test teardown never leaves
- * dangling promises. `listPending()` settles items whose TTL elapsed before
- * returning, so callers never see a stale pending card.
+ * dangling promises. `listPending()` hides items whose TTL elapsed (the
+ * armed timer still expires them), so callers never see a stale pending
+ * card. A late `waitFor()` on a decided item reports the stored outcome
+ * through `decidedOutcome` instead of a wrong "cancelled".
  */
 
 import fs from "node:fs";
@@ -46,6 +48,19 @@ export interface PendingStoreConfig<
   onExpire?: (item: TItem, nowMs: number) => void;
   expiredOutcome: () => TOutcome;
   cancelledOutcome: () => TOutcome;
+  /**
+   * Outcome for a late waitFor() on an already-decided item. When absent,
+   * waitFor falls back to expired/cancelled by status. Subclasses should
+   * pass one so a decided item reports its real outcome (e.g. an answered
+   * handoff reports "answered", not "cancelled").
+   */
+  decidedOutcome?: (item: TItem) => TOutcome;
+  /**
+   * Prune decided items older than this from memory on save (in addition
+   * to the MAX_PERSISTED cap). Handoffs keep decided items 24h so a late
+   * waiter still gets its outcome; older ones are dropped.
+   */
+  decidedRetentionMs?: number;
 }
 
 const DEFAULT_MAX_PERSISTED = 500;
@@ -108,8 +123,12 @@ export class PendingInteractionStore<
     const waiter = this.waiters.get(id);
     if (waiter) return waiter.promise;
     const existing = this.items.get(id);
-    if (existing?.status === "expired") {
-      return Promise.resolve(this.config.expiredOutcome());
+    if (existing && existing.status !== "pending") {
+      // Decided already (its waiter was deleted on settle): report the
+      // stored outcome instead of a wrong "cancelled".
+      if (this.config.decidedOutcome) return Promise.resolve(this.config.decidedOutcome(existing));
+      if (existing.status === "expired") return Promise.resolve(this.config.expiredOutcome());
+      return Promise.resolve(this.config.cancelledOutcome());
     }
     return Promise.resolve(this.config.cancelledOutcome());
   }
@@ -149,10 +168,15 @@ export class PendingInteractionStore<
 
   /** Pending items, newest first, optionally scoped to one user/run. */
   listPending(filter: { userId?: string; runId?: string } = {}): TItem[] {
-    this.expireOverdue();
+    const nowMs = this.now();
     const out: TItem[] = [];
     for (const item of this.items.values()) {
       if (item.status !== "pending") continue;
+      // Wall-clock guard: a pending item whose TTL elapsed (the timer
+      // never fired, or the entry was restored without one) is stale and
+      // must not be shown as awaiting the user. The guard only hides it;
+      // the armed timer still expires it.
+      if (item.expiresAt <= nowMs) continue;
       if (filter.userId && item.userId !== filter.userId) continue;
       if (filter.runId && item.runId !== filter.runId) continue;
       out.push(item);
@@ -191,15 +215,6 @@ export class PendingInteractionStore<
     });
     this.resolveWaiter(id, this.config.expiredOutcome());
     this.save();
-  }
-
-  private expireOverdue(): void {
-    const nowMs = this.now();
-    for (const item of this.items.values()) {
-      if (item.status === "pending" && item.expiresAt <= nowMs) {
-        this.expire(item.id);
-      }
-    }
   }
 
   private clearTimer(id: string): void {
@@ -255,6 +270,34 @@ export class PendingInteractionStore<
     if (!this.persist) return;
     try {
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+      const nowMs = this.now();
+      // Prune decided items older than the retention bound from memory
+      // too: disk serialization already trimmed them, but the in-memory
+      // map grew without bound.
+      const retentionMs = this.config.decidedRetentionMs;
+      if (retentionMs !== undefined) {
+        for (const [id, item] of this.items) {
+          if (item.status !== "pending" && nowMs - item.createdAt > retentionMs) {
+            this.items.delete(id);
+            this.waiters.delete(id);
+            this.clearTimer(id);
+          }
+        }
+      }
+      // Cap the in-memory map at maxPersisted, always keeping pending
+      // items: drop the oldest decided items beyond the cap.
+      const sorted = [...this.items.values()].sort((a, b) => b.createdAt - a.createdAt);
+      const keep = new Set<string>();
+      for (const item of sorted) {
+        if (item.status === "pending" || keep.size < this.maxPersisted) keep.add(item.id);
+      }
+      for (const id of [...this.items.keys()]) {
+        if (!keep.has(id)) {
+          this.items.delete(id);
+          this.waiters.delete(id);
+          this.clearTimer(id);
+        }
+      }
       const all = [...this.items.values()]
         .sort((a, b) => b.createdAt - a.createdAt)
         .slice(0, this.maxPersisted);
@@ -263,4 +306,5 @@ export class PendingInteractionStore<
       console.error("[pending-store] could not persist items:", err instanceof Error ? err.message : err);
     }
   }
+
 }

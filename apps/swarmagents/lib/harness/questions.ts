@@ -107,6 +107,16 @@ export class QuestionStore extends PendingInteractionStore<PendingQuestion, Ques
       },
       expiredOutcome: () => ({ status: "expired" }),
       cancelledOutcome: () => ({ status: "cancelled" }),
+      // A late waitFor() on a decided question reports the stored outcome,
+      // including the answer when one was given.
+      decidedOutcome: (item) =>
+        item.status === "answered"
+          ? { status: "answered", answer: item.answer ?? "" }
+          : item.status === "expired"
+            ? { status: "expired" }
+            : { status: "cancelled" },
+      // Keep decided questions 24h so a late waiter still gets its outcome.
+      decidedRetentionMs: 24 * 60 * 60 * 1000,
     });
     this.ttlMs = options.ttlMs;
   }

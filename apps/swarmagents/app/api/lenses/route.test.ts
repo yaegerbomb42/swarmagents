@@ -337,4 +337,15 @@ test("an unexpected failure inside runLens answers 500 without leaking internals
   assert.equal(body.error, "Lens failed.");
   assert.equal(JSON.stringify(body).includes("/tmp/internal/secret-path"), false);
   assert.equal(res.headers.get("cache-control"), "no-store");
+
+test("rejects an oversized body with 413", async () => {
+  const res = await POST(
+    new NextRequest("http://localhost/api/lenses", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-swarm-user": USER },
+      body: JSON.stringify({ lens: "eli5", message: "hello", pad: "x".repeat(300 * 1024) }),
+    }),
+  );
+  assert.equal(res.status, 413);
+  assert.deepEqual(await res.json(), { error: "Request body too large." });
 });

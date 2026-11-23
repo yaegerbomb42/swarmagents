@@ -17,7 +17,7 @@
 
 import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../lib/auth";
-import { noStoreJson } from "../../../lib/http";
+import { noStoreJson, readJsonObject } from "../../../lib/http";
 import { isLensId, type LensId } from "../../../lib/lenses/types";
 import { cachedLens, runLens } from "../../../lib/lenses/run";
 import { MAX_FILES, type ReferencedFile } from "../../../lib/lenses/prompts";
@@ -73,25 +73,11 @@ export async function POST(req: NextRequest) {
   const user = caller(req);
   if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
 
-  let raw: string;
-  try {
-    raw = await req.text();
-  } catch {
-    return noStoreJson({ error: "Could not read request body." }, { status: 400 });
-  }
-  if (raw.length > MAX_BODY_SIZE) {
-    return noStoreJson({ error: "Request body too large." }, { status: 413 });
-  }
-
-  let body: unknown;
-  try {
-    body = JSON.parse(raw);
-  } catch {
-    return noStoreJson({ error: "Invalid JSON body." }, { status: 400 });
-  }
-  if (!isRecord(body)) {
-    return noStoreJson({ error: "Body must be a JSON object." }, { status: 400 });
-  }
+  // Bounded, streaming body read: an oversized body is rejected with 413
+  // before it is buffered; a malformed body or a non-object stays a 400.
+  const parsed = await readJsonObject(req, MAX_BODY_SIZE);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
 
   if (!isLensId(body.lens)) {
     return noStoreJson({ error: "Unknown lens." }, { status: 400 });

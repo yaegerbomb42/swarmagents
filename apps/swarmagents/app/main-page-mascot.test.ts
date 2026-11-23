@@ -4,11 +4,12 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 /**
- * Render test for the main page: it must put Jimmy on screen, waving hello on
- * first load. The page's module graph pulls in noVNC (which touches browser
- * globals at import time), so install the minimal DOM stubs before importing
- * it. Effects never run during a static render, which is exactly what makes
- * this a deterministic check of the server-visible markup.
+ * Render test for the main page: it must put the brand lockup (cursor-eye
+ * mark + wordmark) in the header on first load. The page's module graph pulls
+ * in noVNC (which touches browser globals at import time), so install the
+ * minimal DOM stubs before importing it. Effects never run during a static
+ * render, which is exactly what makes this a deterministic check of the
+ * server-visible markup.
  */
 function installBrowserStubs(hash: string) {
   const g = globalThis as unknown as Record<string, unknown>;
@@ -71,7 +72,7 @@ function installBrowserStubs(hash: string) {
   g.React = React;
 }
 
-test("the main page shows the mascot and waves hello on first load", async () => {
+test("the main page shows the brand lockup in the header on first load", async () => {
   installBrowserStubs("#view=computer&tab=terminal");
 
   const { default: App } = await import("../minimalist-ui/src/App");
@@ -81,8 +82,8 @@ test("the main page shows the mascot and waves hello on first load", async () =>
     React.createElement(ToastsProvider, null, React.createElement(App)),
   );
 
-  assert.ok(html.includes('data-testid="mascot-svg"'), "mascot is on the main page and renders the SVG variant");
-  assert.ok(!html.includes("/brand/mascot/mascot-sheet.png"), "the sprite sheet fallback is not mounted by default");
-  assert.ok(html.includes('data-mascot-state="wave"'), "he greets on first load");
-  assert.ok(html.includes("Click Jimmy to wave hello"), "he is clickable to wave again");
+  assert.ok(html.includes('data-testid="brand-lockup"'), "brand lockup is in the header");
+  assert.ok(html.includes("/brand/mark-dark.svg"), "the cursor-eye mark renders on dark");
+  assert.ok(html.includes("SwarmAgents"), "the wordmark renders next to the mark");
+  assert.ok(!html.includes('data-testid="mascot-svg"'), "the mascot is gone from the main page");
 });

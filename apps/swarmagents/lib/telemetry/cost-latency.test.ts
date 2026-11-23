@@ -279,7 +279,7 @@ test("a recorded log with no events aggregates to an empty report", () => {
 test("lens calls stay out of agent routing and latency stats", () => {
   const t0 = Date.parse("2026-11-10T10:00:00Z");
   const events: CostEvent[] = [
-    { type: "run.started", seq: 1, ts: t0, provider: "anthropic", model: "claude-sonnet" },
+    { type: "run.started", seq: 1, ts: t0, data: { provider: "anthropic", model: "claude-sonnet" } },
     {
       type: "llm.call",
       seq: 2,
@@ -317,7 +317,7 @@ test("lens calls stay out of agent routing and latency stats", () => {
         source: "lens",
       },
     },
-    { type: "run.finished", seq: 4, ts: t0 + 300, costUsd: 0.5, durationMs: 300, numTurns: 1 },
+    { type: "run.finished", seq: 4, ts: t0 + 300, data: { costUsd: 0.5, durationMs: 300, numTurns: 1 } },
   ];
 
   const report = aggregateRunCostLatency("run_lens", events);
@@ -407,10 +407,14 @@ test("negative and non-finite telemetry values are clamped", () => {
   assert.equal(clamped.calls[0]!.latencyMs, 0);
   assert.equal(clamped.calls[0]!.queuedMs, 0);
   assert.equal(clamped.calls[0]!.ttftMs, 0);
-  assert.equal(clamped.calls[0]!.costUsd, 0);
+  // A negative cost is corrupt telemetry, not a priced $0 call: like the NaN
+  // cost below, it is unknown, so the call is not priced. Durations still
+  // clamp to zero; costs never do — the rule usage.ts already applied, now
+  // shared via ./events.ts.
+  assert.equal(clamped.calls[0]!.costUsd, null);
   assert.equal(clamped.totalLatencyMs, 0);
   assert.equal(clamped.costUsd, 0);
-  assert.equal(clamped.costSource, "llm_calls");
+  assert.equal(clamped.costSource, "none");
 
   const nonFinite: CostEvent[] = [
     {

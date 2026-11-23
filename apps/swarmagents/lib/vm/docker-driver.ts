@@ -302,6 +302,21 @@ export const DEFAULT_DOCKER_TIMEOUTS: Record<DockerTimeoutClass, number> = {
   commit: SWARM_VM_DOCKER_COMMIT_TIMEOUT_MS,
 };
 
+/**
+ * Default cap on stdout buffered by one docker CLI call. Every `run`/`runRaw`
+ * call is deadline-bound, but a deadline bounds time, not bytes: a chatty
+ * command (`docker pull` progress, `cat` of a huge file) could allocate
+ * gigabytes before the timer fires. Past the cap the stream is still drained
+ * (so the child never blocks on a full pipe) but discarded, and the result
+ * is flagged `stdoutTruncated`.
+ */
+export const MAX_RUN_STDOUT_BYTES = 32 * 1024 * 1024;
+/**
+ * Default cap on stderr retained by one docker CLI call. Only the tail is
+ * kept — the actionable part of a failure message is at the end.
+ */
+export const MAX_RUN_STDERR_BYTES = 1024 * 1024;
+
 /** Classify a docker argv into its deadline class. Exported for tests. */
 export function dockerTimeoutClassFor(args: readonly string[]): DockerTimeoutClass {
   const [cmd, sub] = args;
@@ -759,6 +774,13 @@ export interface DockerVmDriverOptions {
    * `timeoutMs` at a call site still wins over both.
    */
   dockerTimeouts?: Partial<Record<DockerTimeoutClass, number>>;
+  /**
+   * Cap on stdout buffered per docker CLI call (default
+   * {@link MAX_RUN_STDOUT_BYTES}); a per-call `maxStdoutBytes` still wins.
+   */
+  maxRunStdoutBytes?: number;
+  /** Cap on stderr retained per docker CLI call (default {@link MAX_RUN_STDERR_BYTES}). */
+  maxRunStderrBytes?: number;
   /** Injectable spawn for tests (defaults to node:child_process spawn). */
   spawnFn?: DockerSpawnFn;
   /**
@@ -795,6 +817,10 @@ export class DockerVmDriver implements VmDriver {
   private readonly killGraceMs: number;
   /** Resolved per-class docker CLI deadlines (constructor > env > built-in). */
   private readonly dockerTimeouts: Record<DockerTimeoutClass, number>;
+  /** Cap on stdout buffered per docker CLI call. */
+  private readonly maxRunStdoutBytes: number;
+  /** Cap on stderr retained per docker CLI call. */
+  private readonly maxRunStderrBytes: number;
   private readonly spawnFn: DockerSpawnFn;
   /**
    * Per-user VNC passwords generated for desktop containers in this process.
@@ -831,19 +857,29 @@ export class DockerVmDriver implements VmDriver {
     this.network = resolveVmNetwork(process.env, opts.network);
     this.killGraceMs = opts.killGraceMs ?? 3000;
     this.dockerTimeouts = { ...DEFAULT_DOCKER_TIMEOUTS, ...(opts.dockerTimeouts ?? {}) };
+    this.maxRunStdoutBytes =
+      opts.maxRunStdoutBytes && opts.maxRunStdoutBytes > 0 ? opts.maxRunStdoutBytes : MAX_RUN_STDOUT_BYTES;
+    this.maxRunStderrBytes =
+      opts.maxRunStderrBytes && opts.maxRunStderrBytes > 0 ? opts.maxRunStderrBytes : MAX_RUN_STDERR_BYTES;
     // Node's spawn is overloaded; pin it to our single signature.
     this.spawnFn = opts.spawnFn ?? (spawn as unknown as DockerSpawnFn);
     this.legacyOwnerCandidates = opts.legacyOwnerCandidates ?? defaultLegacyOwnerCandidates;
   }
 
   /** Spawn a process with argv array, return { code, stdout, stderr }. */
-  private async run(args: string[], opts?: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; signal?: AbortSignal; stdin?: string | Buffer }): Promise<{ code: number; stdout: string; stderr: string }> {
+  private async run(args: string[], opts?: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; signal?: AbortSignal; stdin?: string | Buffer; maxStdoutBytes?: number; maxStderrBytes?: number }): Promise<{ code: number; stdout: string; stderr: string; stdoutTruncated: boolean; stderrTruncated: boolean }> {
     const raw = await this.runRaw(args, opts);
-    return { code: raw.code, stdout: raw.stdout.toString("utf8"), stderr: raw.stderr };
+    return {
+      code: raw.code,
+      stdout: raw.stdout.toString("utf8"),
+      stderr: raw.stderr,
+      stdoutTruncated: raw.stdoutTruncated,
+      stderrTruncated: raw.stderrTruncated,
+    };
   }
 
   /** Same as run() but keeps stdout as raw bytes (binary-safe). */
-  private async runRaw(args: string[], opts?: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; signal?: AbortSignal; stdin?: string | Buffer }): Promise<{ code: number; stdout: Buffer; stderr: string }> {
+  private async runRaw(args: string[], opts?: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; signal?: AbortSignal; stdin?: string | Buffer; maxStdoutBytes?: number; maxStderrBytes?: number }): Promise<{ code: number; stdout: Buffer; stderr: string; stdoutTruncated: boolean; stderrTruncated: boolean }> {
     // Every docker CLI call is deadline-bound (FIX-05): an explicit
     // timeoutMs wins; otherwise the per-class default applies, so a wedged
     // daemon fails the call with a typed timeout instead of holding the
@@ -886,8 +922,19 @@ export class DockerVmDriver implements VmDriver {
         }
       };
 
+      const maxStdoutBytes =
+        opts?.maxStdoutBytes && opts.maxStdoutBytes > 0 ? opts.maxStdoutBytes : this.maxRunStdoutBytes;
+      const maxStderrBytes =
+        opts?.maxStderrBytes && opts.maxStderrBytes > 0 ? opts.maxStderrBytes : this.maxRunStderrBytes;
       const chunks: Buffer[] = [];
-      let stderr = "";
+      let stdoutBytes = 0;
+      let stdoutTruncated = false;
+      // stderr keeps only the tail (the actionable part of a failure), held
+      // as chunks behind a head index so trimming stays O(1) amortized.
+      const stderrChunks: Buffer[] = [];
+      let stderrHead = 0;
+      let stderrBytes = 0;
+      let stderrTruncated = false;
       let killedByTimeout = false;
       // SIGTERM first; a CLI that ignores it gets SIGKILL after the grace
       // period, so no zombie docker client outlives its deadline or abort.
@@ -900,8 +947,40 @@ export class DockerVmDriver implements VmDriver {
           killTimer.unref?.();
         }
       };
-      cp.stdout?.on("data", (buf) => { chunks.push(Buffer.from(buf as Buffer)); });
-      cp.stderr?.on("data", (buf) => { stderr += String(buf); });
+      cp.stdout?.on("data", (buf) => {
+        const chunk = Buffer.from(buf as Buffer);
+        if (stdoutTruncated) return; // keep draining, discard past the cap
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > maxStdoutBytes) {
+          stdoutTruncated = true;
+          const keep = chunk.length - (stdoutBytes - maxStdoutBytes);
+          if (keep > 0) chunks.push(chunk.subarray(0, keep));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      cp.stderr?.on("data", (buf) => {
+        const chunk = Buffer.from(buf as Buffer);
+        stderrChunks.push(chunk);
+        stderrBytes += chunk.length;
+        while (stderrBytes > maxStderrBytes && stderrHead < stderrChunks.length) {
+          stderrTruncated = true;
+          const head = stderrChunks[stderrHead]!;
+          const excess = stderrBytes - maxStderrBytes;
+          if (head.length <= excess) {
+            stderrBytes -= head.length;
+            stderrHead++;
+          } else {
+            stderrChunks[stderrHead] = head.subarray(excess);
+            stderrBytes -= excess;
+          }
+        }
+        // Release dropped chunks so a spewing stderr cannot pin them.
+        if (stderrHead >= 1024) {
+          stderrChunks.splice(0, stderrHead);
+          stderrHead = 0;
+        }
+      });
       // A broken output pipe must settle this call, never escape unhandled.
       watchChildStream(cp.stdout, (err) => fail(vmStreamError("stdout", err)));
       watchChildStream(cp.stderr, (err) => fail(vmStreamError("stderr", err)));
@@ -954,7 +1033,13 @@ export class DockerVmDriver implements VmDriver {
           );
           return;
         }
-        resolve({ code, stdout: Buffer.concat(chunks), stderr });
+        resolve({
+          code,
+          stdout: Buffer.concat(chunks),
+          stderr: Buffer.concat(stderrChunks.slice(stderrHead)).toString("utf8"),
+          stdoutTruncated,
+          stderrTruncated,
+        });
       });
     });
   }
@@ -1673,6 +1758,13 @@ export class DockerVmDriver implements VmDriver {
     if (res.code !== 0) {
       throw new Error(`readFile failed: ${res.stderr}`);
     }
+    // Never hand back a silently truncated file: past the buffered-output
+    // cap the caller must use readFileBytes with an explicit limit.
+    if (res.stdoutTruncated) {
+      throw new Error(
+        `readFile failed: ${path} exceeds the ${this.maxRunStdoutBytes}-byte buffered read cap; use readFileBytes with an explicit limit.`,
+      );
+    }
     return res.stdout;
   }
 
@@ -1733,9 +1825,12 @@ export class DockerVmDriver implements VmDriver {
       throw new VmFileError("not_a_file", `Not a file: ${path}`);
     }
     // head -c caps the read even if the file grows between stat and read.
-    const res = await this.runRaw([
-      "exec", handle.containerName, "head", "-c", String(Math.max(0, maxBytes)), "--", path,
-    ]);
+    // The matching maxStdoutBytes keeps runRaw's buffered-output cap from
+    // truncating a read the caller explicitly sized.
+    const res = await this.runRaw(
+      ["exec", handle.containerName, "head", "-c", String(Math.max(0, maxBytes)), "--", path],
+      { maxStdoutBytes: Math.max(1, maxBytes) },
+    );
     if (res.code !== 0) {
       if (res.code === 127) {
         throw new VmFileError("unsupported", "The VM image has no `head` binary.");

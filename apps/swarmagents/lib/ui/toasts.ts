@@ -2,7 +2,11 @@
 //
 // Pure, dependency-free state logic for the dismissible toast UI. Kept outside the
 // React components so it is unit-testable under lib/**/*.test.ts and importable by
-// both the minimalist-ui app and any future surface.
+// both the minimalist-ui app and any future surface. The only import is the
+// secret-shape patterns from the harness redactor (itself dependency-free),
+// so error text shown in toasts can never leak credentials.
+
+import { SECRET_PATTERNS } from "../harness/redact";
 
 export type ToastTone = "info" | "error" | "success";
 
@@ -61,6 +65,19 @@ export function toastReducer(state: readonly Toast[], action: ToastAction): Toas
   }
 }
 
+/**
+ * Replace known secret shapes (API keys, tokens, Bearer credentials) with
+ * [REDACTED]. Uses String.replace, which resets a global regex's lastIndex
+ * before matching, so repeated calls never skip matches.
+ */
+function scrubSecrets(text: string): string {
+  let out = text;
+  for (const { pattern, replacement } of SECRET_PATTERNS) {
+    out = out.replace(pattern, replacement);
+  }
+  return out;
+}
+
 /** Friendly label for a provider/network failure before it hits the toast. */
 export function describeFailure(err: unknown): { message: string; detail?: string } {
   if (isNamedError(err, "AbortError")) {
@@ -101,5 +118,8 @@ export function describeFailure(err: unknown): { message: string; detail?: strin
     return { message: "Server error", detail: "The provider had a server error. Try again in a moment." };
   }
 
-  return { message: "Provider error", detail: msg.length > 220 ? `${msg.slice(0, 220)}…` : msg };
+  // Fallback: echo the raw message, but scrub secret-shaped values first so
+  // error text shown in toasts cannot leak credentials, then truncate.
+  const detail = scrubSecrets(msg);
+  return { message: "Provider error", detail: detail.length > 220 ? `${detail.slice(0, 220)}…` : detail };
 }

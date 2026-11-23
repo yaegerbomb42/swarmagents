@@ -499,4 +499,45 @@ test("legacy log events sharing a seq number are all replayed", async () => {
   } finally {
     cleanup();
   }
+  })
+test("encodeSse sanitizes CRLF in event type and seq to prevent SSE injection", () => {
+  const dirtyEvent = {
+    seq: ("1\nevent: injected\ndata: fake" as unknown) as number,
+    runId: "run_inject",
+    ts: Date.now(),
+    type: "normal\r\nevent: malicious\r\ndata: pwned",
+    data: { hello: "world" },
+  };
+  const encoded = encodeSse(dirtyEvent);
+  assert.ok(!encoded.includes("\nevent: injected\n"), "must not contain injected event via seq");
+  assert.ok(!encoded.includes("\nevent: malicious\n"), "must not contain injected event via type");
+  // The dirty seq is not a positive number, so the synthetic-frame rule also
+  // applies: no id line at all, therefore no injected Last-Event-ID is possible.
+  assert.ok(!/^id:/m.test(encoded), `a non-numeric seq must not produce an id line: ${encoded}`);
+});
+
+
+test("run.paused does not close the SSE stream as terminal", async () => {
+  const bus = new TelemetryBus();
+  const ac = new AbortController();
+  const stream = sseResponse("run_paused_stream", 0, ac.signal, { bus, keepAliveMs: 60_000, runsDir: null });
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+
+  bus.publish("run_paused_stream", { type: "run.created", data: { userId: "alice" } });
+  bus.publish("run_paused_stream", { type: "run.paused", data: { reason: "budget" } });
+  bus.publish("run_paused_stream", { type: "run.resumed", data: {} });
+
+  let text = "";
+  for (let i = 0; i < 20; i++) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+    if (text.includes("event: run.resumed\n")) break;
+  }
+  const types = parseSse(text).map((m) => (JSON.parse(m.data) as { type: string }).type);
+  assert.deepEqual(types, ["run.created", "run.paused", "run.resumed"]);
+  assert.equal(ac.signal.aborted, false, "stream remained open across run.paused and received run.resumed");
+  ac.abort();
+  await reader.cancel().catch(() => {});
 });

@@ -24,6 +24,8 @@ interface RouteContext {
 }
 
 const NO_STORE = { "cache-control": "no-store" } as const;
+/** Bounded body size for provider key mutations; rejects oversized payloads with 413. */
+const MAX_PROVIDER_BODY_BYTES = 16 * 1024;
 
 /**
  * Every provider response is per-user configuration: never let a cache in
@@ -68,7 +70,7 @@ export async function PATCH(request: Request, ctx: RouteContext) {
   const id = await routeId(ctx);
   let body: unknown;
   try {
-    body = await readJsonBody(request);
+    body = await readJsonBody(request, MAX_PROVIDER_BODY_BYTES);
   } catch (err) {
     if (err instanceof JsonBodyError) {
       return json({ error: err.message }, { status: err.status });

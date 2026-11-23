@@ -12,13 +12,23 @@ export interface KeyframeStoreOptions {
   minIntervalMs?: number;
   /** Maximum keyframes in memory */
   maxFrames?: number;
+  /**
+   * Maximum total keyframe bytes in memory (default: 32 MiB). Oldest frames
+   * are evicted while the total exceeds the cap; a single frame larger than
+   * the cap is rejected outright.
+   */
+  maxBytes?: number;
 }
+
+export const DEFAULT_KEYFRAME_MAX_BYTES = 32 * 1024 * 1024;
 
 export class KeyframeStore {
   private readonly retentionMs: number;
   private readonly minIntervalMs: number;
   private readonly maxFrames: number;
+  private readonly maxBytes: number;
   private readonly frames: StoredKeyframe[] = [];
+  private totalBytes = 0;
   private seq = 0;
   private lastStoredAt = 0;
 
@@ -26,6 +36,7 @@ export class KeyframeStore {
     this.retentionMs = options.retentionMs ?? 10 * 60 * 1000;
     this.minIntervalMs = options.minIntervalMs ?? 2_000;
     this.maxFrames = options.maxFrames ?? 320;
+    this.maxBytes = options.maxBytes ?? DEFAULT_KEYFRAME_MAX_BYTES;
   }
 
   maybeStore(
@@ -37,6 +48,11 @@ export class KeyframeStore {
     force = false,
   ): StoredKeyframe | null {
     if (!force && now - this.lastStoredAt < this.minIntervalMs) {
+      return null;
+    }
+    // A frame that alone exceeds the byte cap can never be kept: rejecting
+    // it here keeps prune() from evicting the whole ring for one frame.
+    if (jpeg.byteLength > this.maxBytes) {
       return null;
     }
 
@@ -55,6 +71,7 @@ export class KeyframeStore {
       jpeg: copy,
     };
     this.frames.push(entry);
+    this.totalBytes += copy.byteLength;
     this.lastStoredAt = now;
     this.prune(now);
     return entry;
@@ -73,13 +90,22 @@ export class KeyframeStore {
     return this.frames.at(-1);
   }
 
+  /** Total bytes currently held (after pruning to `now`). */
+  bytesHeld(now = Date.now()): number {
+    this.prune(now);
+    return this.totalBytes;
+  }
+
   private prune(now: number): void {
     const cutoff = now - this.retentionMs;
     while (
       this.frames.length > 0 &&
-      (this.frames[0]!.meta.timestamp < cutoff || this.frames.length > this.maxFrames)
+      (this.frames[0]!.meta.timestamp < cutoff ||
+        this.frames.length > this.maxFrames ||
+        this.totalBytes > this.maxBytes)
     ) {
-      this.frames.shift();
+      const evicted = this.frames.shift()!;
+      this.totalBytes -= evicted.jpeg.byteLength;
     }
   }
 }

@@ -1,0 +1,1 @@
+{"exclude":["node_modules","vendor","tools","packages/mcp-swarm-board","e2e","docs","scripts","minimalist-ui/src/testing"],"extends":"./tsconfig.json","include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"]}

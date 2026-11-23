@@ -7,11 +7,11 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ClaudeCodeRunner, isBackgroundedCommand, isSignalKillExitCode } from "./runner.js";
+import { ClaudeCodeRunner, isBackgroundedCommand, isSignalKillExitCode, resolveMaxTurns } from "./runner.js";
 import { StateLedger } from "./context/contextGovernor.js";
 import { localScorer } from "./system-one/index.js";
 import type { DecisionRouter } from "./decision-brain/index.js";
-import type { RolePhase, TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
+import type { ApprovalRequest, RolePhase, TelemetryEvent, VmExec, VmExecOpts } from "./types.js";
 
 const SECRET_TOKEN = "sk-ant-api03-BENCH-FAKE-TOKEN-0000";
 const PLAIN_SECRET = "my-super-secret-key-42";
@@ -897,6 +897,8 @@ test("isBackgroundedCommand flags detached work and ignores foreground commands"
     "cmd 2>&1 | tee out.log",
     "cmd &> out.log",
     "echo hello && echo world",
+    'curl "https://example.com/api?a=1&b=2"',
+    'echo "foo & bar"',
     "git push",
     "",
     "   ",
@@ -904,6 +906,13 @@ test("isBackgroundedCommand flags detached work and ignores foreground commands"
   for (const command of foreground) {
     assert.ok(!isBackgroundedCommand(command), `expected foreground: ${command}`);
   }
+});
+
+test("isBackgroundedCommand ignores & inside quotes and URL query strings", () => {
+  assert.ok(!isBackgroundedCommand('curl "https://example.com/api?a=1&b=2"'));
+  assert.ok(!isBackgroundedCommand("echo 'foo & bar'"));
+  assert.ok(!isBackgroundedCommand('echo "foo & bar"'));
+  assert.ok(isBackgroundedCommand("sleep 1 &"));
 });
 
 test("emits tool.backgrounded for a detached Bash loop (the count-to-200 QA case)", async () => {
@@ -1225,7 +1234,7 @@ test("System-1 on + a denying gate pauses visibly through the approval flow", as
       systemOne: { settings: { enabled: true, gates: { guardrail: true } }, scorer: { ...localScorer, destructive: () => 0.99 } },
     }),
     {
-      approvalGateway: (request) => {
+      approvalGateway: (request: ApprovalRequest) => {
         approvals.push({ toolName: request.toolName, reason: request.reason });
         return { id: `appr_${approvals.length}`, verdict: Promise.resolve("approved" as const) };
       },
@@ -1367,7 +1376,6 @@ test("Brain off: argv and events are byte-identical to today", async () => {
   assert.deepEqual(withoutWallClock(disabled.events), withoutWallClock(plain.events), "no Brain telemetry leaks into the run");
 });
 
-
 test("redacts secret-shaped stderr detail on a nonzero exit", async () => {
   const secret = "plain-secret-value-123";
   const vm = new ScriptedVm([
@@ -1490,4 +1498,59 @@ test("a role switch whose VM rejects on abort still returns roleSwitch", async (
   assert.equal(outcome.roleSwitch?.toRoleId, "debugger");
   assert.equal(events.some((e) => e.type === "run.error"), false);
   assert.equal(events.filter((e) => e.type === "role.changed").length, 1);
+});
+
+// --- maxTurns / --max-turns ---
+
+async function argvFor(request: Record<string, unknown>): Promise<string[]> {
+  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const runner = new ClaudeCodeRunner({ bin: "claude" });
+  await runner.run({ prompt: "Inspect repo", env: envWithSecrets, vm, ...request }, () => {});
+  return vm.calls[0].cmd;
+}
+
+function withEnv(key: string, value: string | undefined, fn: () => Promise<void>): Promise<void> {
+  const prev = process.env[key];
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+  return fn().finally(() => {
+    if (prev === undefined) delete process.env[key];
+    else process.env[key] = prev;
+  });
+}
+
+test("maxTurns is passed as --max-turns; absent means no flag", async () => {
+  const plain = await argvFor({});
+  assert.ok(!plain.includes("--max-turns"), "no flag without maxTurns");
+  const cmd = await argvFor({ maxTurns: 25 });
+  const i = cmd.indexOf("--max-turns");
+  assert.notEqual(i, -1);
+  assert.equal(cmd[i + 1], "25");
+});
+
+test("maxTurns is capped by SWARM_MAX_TURNS; invalid env falls back to the 200 default", async () => {
+  await withEnv("SWARM_MAX_TURNS", "100", async () => {
+    const cmd = await argvFor({ maxTurns: 500 });
+    const i = cmd.indexOf("--max-turns");
+    assert.equal(cmd[i + 1], "100");
+    const under = await argvFor({ maxTurns: 50 });
+    assert.equal(under[under.indexOf("--max-turns") + 1], "50");
+  });
+  await withEnv("SWARM_MAX_TURNS", "banana", async () => {
+    const cmd = await argvFor({ maxTurns: 500 });
+    assert.equal(cmd[cmd.indexOf("--max-turns") + 1], "200");
+  });
+  await withEnv("SWARM_MAX_TURNS", undefined, async () => {
+    const cmd = await argvFor({ maxTurns: 500 });
+    assert.equal(cmd[cmd.indexOf("--max-turns") + 1], "200");
+  });
+});
+
+test("resolveMaxTurns ignores non-positive and non-finite requests", () => {
+  assert.equal(resolveMaxTurns(undefined), undefined);
+  assert.equal(resolveMaxTurns(0), undefined);
+  assert.equal(resolveMaxTurns(-5), undefined);
+  assert.equal(resolveMaxTurns(Number.NaN), undefined);
+  assert.equal(resolveMaxTurns(25.7), 25);
+  assert.equal(resolveMaxTurns(25, { ...process.env, SWARM_MAX_TURNS: "10" }), 10);
 });

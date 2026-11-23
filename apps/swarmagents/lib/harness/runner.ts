@@ -173,6 +173,31 @@ export function isSignalKillExitCode(exitCode: number): boolean {
   return exitCode > 128 && exitCode <= 128 + 31;
 }
 
+/** Default cap for --max-turns when SWARM_MAX_TURNS is unset or invalid. */
+export const DEFAULT_SWARM_MAX_TURNS = 200;
+
+/**
+ * Effective --max-turns for one invocation: the requested ceiling,
+ * floored to an integer, at least 1, and capped by SWARM_MAX_TURNS (or
+ * the 200 default when the env is unset/invalid). Undefined when no
+ * ceiling was requested — the CLI's own default applies, as today.
+ * The cap is enforced here, at the argv boundary, so every source
+ * (dispatch, role ceiling, direct caller) is capped the same way.
+ */
+export function resolveMaxTurns(
+  requested: number | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): number | undefined {
+  if (requested === undefined || !Number.isFinite(requested) || requested <= 0) return undefined;
+  const rawCap = env.SWARM_MAX_TURNS?.trim();
+  let cap = DEFAULT_SWARM_MAX_TURNS;
+  if (rawCap) {
+    const parsed = Number(rawCap);
+    if (Number.isSafeInteger(parsed) && parsed > 0) cap = parsed;
+  }
+  return Math.max(1, Math.min(Math.floor(requested), cap));
+}
+
 /** Human-readable signal name for a 128+n exit code, e.g. 137 -> "SIGKILL". */
 function signalNameFor(exitCode: number): string {
   return SIGNAL_NAMES[exitCode - 128] ?? `signal ${exitCode - 128}`;
@@ -298,6 +323,8 @@ export class ClaudeCodeRunner {
     let haltedReason: string | null = null;
     let aborted = false;
     /** Decision Brain loop state: evaluations so far, last result, last failure. */
+    // Counts Decision Brain beforeTool invocations (one per gated tool call),
+    // not Claude Code conversation turns / num_turns.
     let brainTurnCount = 0;
     let lastBrainToolResult: { ok: boolean; output: string } | null = null;
     let lastBrainError: string | null = null;
@@ -722,6 +749,9 @@ export class ClaudeCodeRunner {
             // recovered, so the next decision must not retry on it.
             lastBrainToolResult = { ok, output: output.slice(0, 2000) };
             lastBrainError = ok ? null : output.slice(0, 500);
+            // A successful tool result must not keep poisoning Decision Brain
+            // snapshots with a stale stream-json error from earlier in the run.
+            if (ok) firstErrorMessage = undefined;
           }
           break;
         }
@@ -954,7 +984,7 @@ export class ClaudeCodeRunner {
         id: ticket.id,
         tool: approval.toolName,
         action: redact(approval.action),
-        reason: approval.reason,
+        reason: redact(approval.reason),
         riskLevel: "ask",
         expiresAt: ticket.expiresAt,
       },
@@ -987,7 +1017,7 @@ export class ClaudeCodeRunner {
         id: ticket.id,
         tool: approval.toolName,
         action: redact(approval.action),
-        reason: approval.reason,
+        reason: redact(approval.reason),
         expiresAt: ticket.expiresAt,
       });
     }
@@ -1014,8 +1044,8 @@ export class ClaudeCodeRunner {
       type: "question.required",
       question: {
         id: ticket.id,
-        question: ticket.question,
-        ...(ticket.options.length > 0 ? { options: ticket.options } : {}),
+        question: redact(ticket.question),
+        ...(ticket.options.length > 0 ? { options: ticket.options.map((option) => redact(option)) } : {}),
         allowFreeText: ticket.allowFreeText,
         ...(ticket.expiresAt !== undefined ? { expiresAt: ticket.expiresAt } : {}),
       },
@@ -1046,7 +1076,7 @@ export class ClaudeCodeRunner {
     request: RunRequest,
     handoff: HandoffRequest,
     emit: (event: TelemetryEvent) => void,
-    _redact: (text: string) => string,
+    redact: (text: string) => string,
   ): Promise<void> {
     const gateway = request.handoffGateway!;
     let ticket: HandoffTicket;
@@ -1061,8 +1091,8 @@ export class ClaudeCodeRunner {
       type: "handoff.required",
       handoff: {
         id: ticket.id,
-        reason: ticket.reason,
-        ...(ticket.description.length > 0 ? { description: ticket.description } : {}),
+        reason: redact(ticket.reason),
+        ...(ticket.description.length > 0 ? { description: redact(ticket.description) } : {}),
         ...(ticket.expiresAt !== undefined ? { expiresAt: ticket.expiresAt } : {}),
       },
     });
@@ -1141,6 +1171,8 @@ export class ClaudeCodeRunner {
     const argv: string[] = [this.bin, "-p", "--output-format", "stream-json", "--verbose"];
     if (effective.sessionId) argv.push("--resume", effective.sessionId);
     if (effective.model) argv.push("--model", effective.model);
+    const maxTurns = resolveMaxTurns(effective.maxTurns);
+    if (maxTurns !== undefined) argv.push("--max-turns", String(maxTurns));
     // The agent card, the active role's prompt and the account's long-term
     // memory ride as one appended system prompt, one argv element per value —
     // never interpolated into a shell string.
@@ -1206,15 +1238,41 @@ export class ClaudeCodeRunner {
 }
 
 /**
+ * Strip single- and double-quoted segments so `&` inside quotes or URL query
+ * strings does not look like a shell background operator.
+ */
+function stripQuotedSegments(command: string): string {
+  let out = "";
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote) {
+      if (ch === "\\" && i + 1 < command.length) {
+        i += 1; // skip escaped char inside quotes
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * True when a shell command detaches work from the foreground: a background
  * operator (`&` — not `&&`, and not the `&>` / `>&` redirections), `nohup` /
- * `setsid`, `disown`, or a detached tmux/screen session. A quoted ampersand
- * (e.g. `echo "a & b"`) can false-positive; the check is a heuristic for the
- * harness warning, not a security gate, so it errs toward flagging.
+ * `setsid`, `disown`, or a detached tmux/screen session. Quoted ampersands
+ * (e.g. `echo "a & b"` or `curl "https://x?a=1&b=2"`) are ignored.
  */
 export function isBackgroundedCommand(command: string): boolean {
   if (typeof command !== "string" || command.trim() === "") return false;
-  return BACKGROUND_PATTERNS.some((pattern) => pattern.test(command));
+  const unquoted = stripQuotedSegments(command);
+  return BACKGROUND_PATTERNS.some((pattern) => pattern.test(unquoted));
 }
 
 const BACKGROUND_PATTERNS: readonly RegExp[] = [

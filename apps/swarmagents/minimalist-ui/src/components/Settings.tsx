@@ -11,7 +11,7 @@ import { ComputersSettings } from './ComputersSettings';
 import { AutopilotIdle } from './AutopilotIdle';
 import { removeRole, moveRole } from '../utils/pipeline';
 import { parseBudgetInput } from '../utils/budget';
-import { DEFAULT_MASCOT_VARIANT, MASCOT_VARIANTS, type MascotVariant } from '../../../components/mascot/variant';
+
 
 type Tab = 'general' | 'providers' | 'agent' | 'computers' | 'appearance' | 'account' | 'memory';
 export type SettingsTab = Tab;
@@ -49,8 +49,6 @@ export function Settings({
   serverProviderCount = 0,
   roles = NO_ROLES,
   setRoles = keepRoles,
-  mascotVariant = DEFAULT_MASCOT_VARIANT,
-  onMascotVariantChange,
   embedded,
   tabs = DEFAULT_TABS,
   initialTab,
@@ -66,9 +64,6 @@ export function Settings({
   /** The legacy agent pipeline (General tab). Optional: the workspace does not show that tab. */
   roles?: ActiveRole[];
   setRoles?: (fn: (r: ActiveRole[]) => ActiveRole[]) => void;
-  /** Which Jimmy renderer the main page shows. */
-  mascotVariant?: MascotVariant;
-  onMascotVariantChange?: (variant: MascotVariant) => void;
   /**
    * Render inline inside the settings drawer (minimal main page). No backdrop
    * and no fixed positioning; `open` is ignored in this mode.
@@ -152,7 +147,7 @@ export function Settings({
           {tab === 'providers' && <Providers providers={providers} setProviders={setProviders} accent={a} showHelpers={showHelpers} serverProviderCount={serverProviderCount} />}
           {tab === 'agent' && agentPanel}
           {tab === 'computers' && <ComputersSettings />}
-          {tab === 'appearance' && <Appearance accent={accent} setAccent={setAccent} showHelpers={showHelpers} setShowHelpers={setShowHelpers} mascotVariant={mascotVariant} onMascotVariantChange={onMascotVariantChange} />}
+          {tab === 'appearance' && <Appearance accent={accent} setAccent={setAccent} showHelpers={showHelpers} setShowHelpers={setShowHelpers} />}
           {tab === 'account' && <Account />}
           {tab === 'memory' && <Memory />}
         </div>
@@ -1763,8 +1758,7 @@ function ProviderCard({
 
 /* ---------------- Appearance ---------------- */
 
-function Appearance({ accent, setAccent, showHelpers, setShowHelpers, mascotVariant, onMascotVariantChange }: { accent: Accent; setAccent: (a: Accent) => void; showHelpers: boolean; setShowHelpers: (v: boolean) => void; mascotVariant: MascotVariant; onMascotVariantChange?: (variant: MascotVariant) => void }) {
-  const variantLabel: Record<MascotVariant, string> = { sprite: 'Sprite sheet', svg: 'SVG' };
+function Appearance({ accent, setAccent, showHelpers, setShowHelpers }: { accent: Accent; setAccent: (a: Accent) => void; showHelpers: boolean; setShowHelpers: (v: boolean) => void }) {
   return (
     <div className="space-y-6">
       <section>
@@ -1786,27 +1780,6 @@ function Appearance({ accent, setAccent, showHelpers, setShowHelpers, mascotVari
           ))}
         </div>
         <p className="mt-2 text-[11px] text-white/30">Highlights the active tab and toggles in this panel.</p>
-      </section>
-
-      <section>
-        <Label>Mascot style</Label>
-        <div className="flex items-center gap-2.5">
-          {MASCOT_VARIANTS.map((variant) => (
-            <button
-              key={variant}
-              type="button"
-              onClick={() => onMascotVariantChange?.(variant)}
-              aria-pressed={mascotVariant === variant}
-              className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/60 ${
-                mascotVariant === variant ? `bg-white/10 text-white ring-2 ${ACCENTS[accent].swatchRing}` : 'bg-white/5 text-white/60 ring-1 ring-white/10 hover:bg-white/10 hover:text-white'
-              }`}
-            >
-              {variantLabel[variant]}
-              {mascotVariant === variant && <Check className="h-3 w-3" />}
-            </button>
-          ))}
-        </div>
-        <p className="mt-2 text-[11px] text-white/30">How Jimmy animates on the main page. You can also use ?mascot=svg or ?mascot=sprite in the URL.</p>
       </section>
 
       <section>

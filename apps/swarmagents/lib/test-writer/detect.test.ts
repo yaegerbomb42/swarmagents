@@ -95,3 +95,25 @@ test("detectFramework: a Vite app without Vitest is not vitest", (t) => {
   const d = detectFramework(path.join(dir, "src", "App.tsx"));
   assert.notEqual(d.framework, "vitest", "a Vite app without Vitest must not be detected as vitest");
 });
+
+test("detectFramework: broken symlink as the target does not crash", () => {
+  const dir = mkTmp("tw-broken-link-");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ devDependencies: { vitest: "^1.0.0" } }));
+  const link = path.join(dir, "dangling.ts");
+  fs.symlinkSync(path.join(dir, "does-not-exist.ts"), link);
+  // Must not throw: statSync on a dangling link raises ENOENT.
+  const d = detectFramework(link);
+  assert.equal(d.framework, "vitest");
+  assert.ok(d.confidence >= 0.9);
+});
+
+test("detectFramework: broken symlink under the scanned tree does not crash", () => {
+  const dir = mkTmp("tw-broken-tree-");
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ devDependencies: { vitest: "^1.0.0" } }));
+  fs.symlinkSync(path.join(dir, "missing.ts"), path.join(dir, "dangling.ts"));
+  const real = path.join(dir, "real.ts");
+  fs.writeFileSync(real, "export const x = 1;\n");
+  const d = detectFramework(real);
+  assert.equal(d.framework, "vitest");
+  assert.ok(d.confidence >= 0.9);
+});

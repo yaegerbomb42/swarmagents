@@ -41,7 +41,9 @@ export async function assessCommand(
   const remote = await scorer.destructive(input);
   // The calibrated features are a floor: a model can't talk the gate out of `rm -rf /`.
   const floor = destructiveProb(input.command, input.cwd, input.repoRoot, input.allowOutsideRepo);
-  const prob = Math.max(Number.isFinite(remote) ? remote : 0, floor);
+  // A misbehaving scorer must not push the probability outside [0, 1].
+  const remoteProb = Number.isFinite(remote) ? Math.min(1, Math.max(0, remote)) : 0;
+  const prob = Math.max(remoteProb, floor);
   return { prob, destructive: prob > threshold };
 }
 

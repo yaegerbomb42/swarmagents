@@ -163,7 +163,7 @@ test("a tool throw is mapped to -32603 and carries no-store", async () => {
   }
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("cache-control"), "no-store");
-  const body = (await res.json()) as { error: { code: number; message: string } };
+  const body = (await res.json()) as { error: { code: number; message: string }; id: number };
   assert.equal(body.error.code, -32603);
   assert.equal(body.id, 1);
 });

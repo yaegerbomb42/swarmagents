@@ -46,6 +46,11 @@ import { VmManager } from "../../lib/vm/manager";
 import type { ExecOptions, ExecResult, VmHandle } from "../../lib/vm/types";
 import { countOf, installBrowserStubs, makeBoard, makeSession, uninstallBrowserStubs } from "./testing/harness";
 
+// The remote branch check defaults on; Flow C submits a branch that was
+// never pushed, so disable it here (the check itself is covered by
+// git-remote.test.ts with a stubbed git).
+process.env.SWARM_GIT_REMOTE_CHECK = "0";
+
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 const REPLY = "The redirect now goes to the dashboard.\n\nBranch: fix/login-redirect\nPR: https://github.com/acme/app/pull/128";

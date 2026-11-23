@@ -58,6 +58,7 @@ test("runAndRecordBattle updates Elo, metrics, match history, and emits telemetr
         mode: "hedged",
         hedgeDelayMs: 1500,
         verify: async ({ provider }) => ({
+          status: "passed",
           passed: true,
           score: provider === "openai" ? 94 : 81,
           violations: [],
@@ -98,7 +99,7 @@ test("mutual verification failure records a draw instead of rewarding broken out
         fakeContender("anthropic", "claude-sonnet-4-5", 400),
         fakeContender("openai", "gpt-5", 900),
       ],
-      verify: async () => ({ passed: false, score: 20, violations: ["tests failed"] }),
+      verify: async () => ({ status: "failed", passed: false, score: 20, violations: ["tests failed"] }),
     });
 
     assert.equal(match.outcome, "draw");
@@ -130,7 +131,7 @@ test("selectArenaMatchup prioritizes uncalibrated models and avoids immediate re
     // Record a match between anthropic and openai first.
     await store.runAndRecordBattle({
       contenders: [pool[0], pool[1]],
-      verify: async () => ({ passed: true, score: 90, violations: [] }),
+      verify: async () => ({ status: "passed", passed: true, score: 90, violations: [] }),
     });
 
     // Next matchup must include the unplayed google contender rather than repeating anthropic vs openai.

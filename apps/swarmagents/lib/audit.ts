@@ -49,6 +49,7 @@ export type AuditAction =
   | "email.verify.resend"
   | "signup.botcheck"
   | "session.revoke"
+  | "session.logout"
   | "computer.pair"
   | "computer.revoke"
   | "vm.file.upload"
@@ -59,6 +60,7 @@ export type AuditAction =
   | "preview.share.create"
   | "preview.share.revoke"
   | "vault.proxy"
+  | "auto-test.run"
   | "run.compare.remember"
   | "gardener.autopilot"
   | "library.unpublish";

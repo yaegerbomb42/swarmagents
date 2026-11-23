@@ -317,12 +317,25 @@ test("POST and PATCH normalize legacy apiStyle aliases to openai-chat", async ()
   assert.equal(updated?.baseUrl, "https://gw.example.com/v1");
 });
 
-test("POST refuses an oversized JSON body with a 413", async () => {
+test("POST refuses a body over the 16kb cap with 413", async () => {
   const res = await POST(
     new Request("http://localhost/api/providers", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id: "openai", pad: "x".repeat(300 * 1024) }),
+      body: JSON.stringify({ id: "openai", apiKey: "sk-test", pad: "x".repeat(16 * 1024) }),
+    }),
+  );
+  assert.equal(res.status, 413);
+  const body = (await res.json()) as { error?: string };
+  assert.equal(body.error, "Request body is too large.");
+});
+
+test("PATCH refuses a body over the 16kb cap with 413", async () => {
+  const res = await PATCH(
+    new Request("http://localhost/api/providers", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "openai", action: "add-key", apiKey: "sk-test", pad: "x".repeat(16 * 1024) }),
     }),
   );
   assert.equal(res.status, 413);

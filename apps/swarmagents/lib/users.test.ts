@@ -7,11 +7,13 @@ import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { acquireFileLock } from "./file-lock.js";
 import {
+  UsersStoreError,
   bumpSessionEpoch,
   configureUserPaths,
   consumeEmailVerificationToken,
   consumePasswordResetToken,
   emailForUserId,
+  getScryptSlotStateForTesting,
   listLocalUserIds,
   getSessionEpoch,
   isEmailVerified,
@@ -644,4 +646,145 @@ test("two processes signing up concurrently lose no accounts", async () => {
     assert.equal(localUserExists(`alpha${i}@example.com`), true);
     assert.equal(localUserExists(`beta${i}@example.com`), true);
   }
+});
+
+test("a corrupt users file is never overwritten by signup or revocation", async () => {
+  await signupLocalUser("alice@example.com", "correct horse battery");
+  const file = path.join(dir, "users.json");
+  assert.ok(fs.readFileSync(file, "utf-8").includes("alice@example.com"));
+  fs.writeFileSync(file, "{not json");
+  const corrupt = fs.readFileSync(file, "utf-8");
+
+  assert.deepEqual(await signupLocalUser("bob@example.com", "another strong secret"), { ok: false, error: "fatal" });
+  assert.equal(await bumpSessionEpoch("alice@example.com"), false);
+  assert.equal(fs.readFileSync(file, "utf-8"), corrupt, "the corrupt store must survive untouched");
+  await assert.rejects(verifyLocalUser("alice@example.com", "correct horse battery"), UsersStoreError);
+
+  // The fast-path duplicate check also fails fatal instead of proceeding.
+  assert.deepEqual(await signupLocalUser("alice@example.com", "correct horse battery"), { ok: false, error: "fatal" });
+});
+
+test("an unreadable users file (a directory in its place) is never overwritten", async () => {
+  const file = path.join(dir, "users.json");
+  fs.mkdirSync(file);
+  assert.deepEqual(await signupLocalUser("bob@example.com", "another strong secret"), { ok: false, error: "fatal" });
+  assert.equal(await bumpSessionEpoch("bob@example.com"), false);
+  assert.ok(fs.statSync(file).isDirectory(), "the directory must survive untouched");
+});
+
+test("verifyPassword rejects empty and wrong-length hash segments for any password", async () => {
+  const file = path.join(dir, "users.json");
+  const users = [
+    { email: "empty@example.com", password: "scrypt$$", createdAt: Date.now() },
+    { email: "short@example.com", password: "scrypt$00$00", createdAt: Date.now() },
+    { email: "nohash@example.com", password: "", createdAt: Date.now() },
+    { email: "badhex@example.com", password: "scrypt$zz$zz", createdAt: Date.now() },
+  ];
+  fs.writeFileSync(file, JSON.stringify({ version: 1, users }));
+  for (const u of users) {
+    assert.equal(await verifyLocalUser(u.email, "anything at all"), null, `${u.email} must never authenticate`);
+    assert.equal(await verifyLocalUser(u.email, ""), null);
+  }
+  // A well-formed hash still authenticates: the strict check must not break real logins.
+  await signupLocalUser("real@example.com", "correct horse battery");
+  assert.ok(await verifyLocalUser("real@example.com", "correct horse battery"));
+});
+
+test("verifyLocalUser rejects passwords over 1024 chars without hashing", async () => {
+  await signupLocalUser("alice@example.com", "correct horse battery");
+  assert.equal(await verifyLocalUser("alice@example.com", "x".repeat(1025)), null);
+  assert.equal(await verifyLocalUser("alice@example.com", "x".repeat(10_000)), null);
+  assert.equal(await verifyLocalUser("nobody@example.com", "x".repeat(1025)), null);
+  // A 1024-char wrong password still goes through verification and fails.
+  assert.equal(await verifyLocalUser("alice@example.com", "x".repeat(1024)), null);
+
+  // The rejection happens before any scrypt work: with the scrypt pool
+  // saturated, an oversized password still returns null instead of
+  // throwing ScryptBusyError.
+  process.env.SWARM_SCRYPT_MAX_CONCURRENCY = "1";
+  process.env.SWARM_SCRYPT_MAX_QUEUE = "0";
+  const busy = verifyLocalUser("alice@example.com", "correct horse battery");
+  assert.equal(await verifyLocalUser("alice@example.com", "x".repeat(1025)), null);
+  assert.ok(await busy);
+});
+
+test("normalizeEmail rejects malformed addresses and path traversal", () => {
+  for (const bad of [
+    "@",
+    "a@b@c",
+    "foo@",
+    "@bar",
+    "a/b@c",
+    "a\\b@c",
+    "a..b@c",
+    ".a@b.com",
+    "a.@b.com",
+    "a@.b.com",
+    "a@b.com.",
+    "a@b@c@d",
+    "a b@c.com",
+  ]) {
+    assert.equal(normalizeEmail(bad), "", `${bad} must be rejected`);
+  }
+  assert.equal(normalizeEmail("a@b"), "a@b", "a dotless domain is still a local address");
+  assert.equal(normalizeEmail("first.last@example.com"), "first.last@example.com");
+  assert.equal(normalizeEmail("Alice+tag@Example.COM"), "alice+tag@example.com");
+});
+
+test("configureUserPaths(\"\") resets to the default resolution instead of writing to \"\"", async () => {
+  const prevHome = process.env.SWARM_HOME;
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-users-home2-"));
+  try {
+    process.env.SWARM_HOME = home2;
+    // A custom path first.
+    await signupLocalUser("custom@example.com", "correct horse battery");
+    assert.equal(fs.existsSync(path.join(home2, "users.json")), false, "nothing written to the default location yet");
+    assert.equal(localUserExists("custom@example.com"), true);
+
+    // Reset: the store now resolves to SWARM_HOME, not the custom file.
+    configureUserPaths("");
+    assert.equal(localUserExists("custom@example.com"), false, "the custom store is no longer visible after reset");
+    assert.equal((await signupLocalUser("home@example.com", "correct horse battery")).ok, true);
+    assert.equal(fs.existsSync(path.join(home2, "users.json")), true, "the default location is used after reset");
+    assert.equal(localUserExists("home@example.com"), true);
+  } finally {
+    if (prevHome === undefined) delete process.env.SWARM_HOME;
+    else process.env.SWARM_HOME = prevHome;
+    fs.rmSync(home2, { recursive: true, force: true });
+  }
+});
+
+test("lowering SWARM_SCRYPT_MAX_CONCURRENCY drains in-flight slots instead of handing them off", async () => {
+  process.env.SWARM_SCRYPT_MAX_CONCURRENCY = "4";
+  process.env.SWARM_SCRYPT_MAX_QUEUE = "10";
+  await signupLocalUser("drain@example.com", "correct horse battery");
+  const password = "correct horse battery";
+  const runs = Array.from({ length: 8 }, () => verifyLocalUser("drain@example.com", password));
+  // Wait until 4 are in flight and 4 are queued.
+  let state = getScryptSlotStateForTesting();
+  const start = Date.now();
+  while (!(state.active === 4 && state.queued === 4) && Date.now() - start < 5000) {
+    await new Promise((r) => setTimeout(r, 1));
+    state = getScryptSlotStateForTesting();
+  }
+  assert.deepEqual(state, { active: 4, queued: 4 });
+  // Lower the cap below the in-flight count.
+  process.env.SWARM_SCRYPT_MAX_CONCURRENCY = "2";
+  // A finish must drain (active drops while the queue is untouched) rather
+  // than hand the slot off (active stays, queue drops).
+  let drained = false;
+  const drainStart = Date.now();
+  while (Date.now() - drainStart < 5000) {
+    state = getScryptSlotStateForTesting();
+    if (state.queued === 4 && state.active < 4) {
+      drained = true;
+      break;
+    }
+    if (state.active === 0 && state.queued === 0) break;
+    await new Promise((r) => setTimeout(r, 1));
+  }
+  assert.ok(drained, `expected a drain (queued 4, active < 4), last state ${JSON.stringify(state)}`);
+  const results = await Promise.all(runs);
+  assert.ok(results.every(Boolean), "all eight verifications still succeed");
+  assert.deepEqual(getScryptSlotStateForTesting(), { active: 0, queued: 0 });
 });

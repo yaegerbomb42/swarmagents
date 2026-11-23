@@ -60,11 +60,42 @@ test("masks Google/Gemini keys (AIza...) without env", () => {
   assert.equal(redact(`key=${key} done`), "key=[REDACTED] done");
 });
 
-test("masks PEM private key headers without env", () => {
+test("masks full PEM private key blocks (header + body) without env", () => {
   const redact = makeRedactor({});
-  const text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA";
-  assert.equal(redact(text), "[REDACTED]\nMIIEowIBAAKCAQEA");
+  const pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowFAKEBODY0123456789abcdefgh+/=\n-----END RSA PRIVATE KEY-----";
+  const out = redact(`key below\n${pem}\nafter`);
+  assert.equal(out, "key below\n[REDACTED]\nafter");
+  assert.ok(!out.includes("MIIEowFAKEBODY"), "base64 key material must not survive");
+  assert.ok(!out.includes("PRIVATE KEY"), "no key header residue may survive");
+});
+
+test("masks truncated / unterminated PEM key bodies without env", () => {
+  const redact = makeRedactor({});
+  const truncated = "-----BEGIN PRIVATE KEY-----\nMIIEowFAKEBODY0123456789abcdefgh+/=";
+  const out = redact(truncated);
+  assert.equal(out, "[REDACTED]");
+  assert.ok(!out.includes("MIIEowFAKEBODY"), "unterminated key material must not survive");
+  // A bare header with no body still masks cleanly.
   assert.equal(redact("-----BEGIN PRIVATE KEY-----"), "[REDACTED]");
+});
+
+test("masks JWTs, Groq, Hugging Face, Perplexity, Basic auth, and URL credentials", () => {
+  const redact = makeRedactor({});
+  const jwt = "eyJFAKEHEADER0123.eyJFAKEPAYLOAD0123.FAKESIGNATURE0123456";
+  assert.equal(redact(`token ${jwt} done`), "token [REDACTED] done");
+  assert.equal(redact("groq gsk_FAKEGROQKEY0123456789abcdef"), "groq [REDACTED]");
+  assert.equal(redact("hf hf_FAKEHUGGINGFACEKEY012345678"), "hf [REDACTED]");
+  assert.equal(redact("pplx pplx-FAKEPERPLEXITYKEY012345678"), "pplx [REDACTED]");
+  assert.equal(
+    redact("Authorization: Basic RkFLRVVTRVI6RkFLRVBBU1NXT1JE"),
+    "Authorization: Basic [REDACTED]",
+  );
+  assert.equal(
+    redact("git clone https://user:pass@example.invalid/repo.git"),
+    "git clone https://[REDACTED]@example.invalid/repo.git",
+  );
+  // Regular URLs without credentials are untouched.
+  assert.equal(redact("see https://example.invalid/docs"), "see https://example.invalid/docs");
 });
 
 test("redacts the longer secret first when one is a substring of another", () => {
@@ -138,4 +169,36 @@ test("redactValue deep-redacts key shapes inside structured tool payloads", () =
 test("known env values are still masked by exact match", () => {
   const redact = makeRedactor({ MY_API_KEY: "my-super-secret-key-42" });
   assert.equal(redact("leaked my-super-secret-key-42 here"), "leaked [REDACTED] here");
+});
+
+test("extraSecrets shorter than 6 characters are ignored", () => {
+  const redact = makeRedactor(undefined, ["ab", "abcde"]);
+  assert.equal(redact("keep ab and abcde"), "keep ab and abcde");
+  const redactLong = makeRedactor(undefined, ["long-enough-secret"]);
+  assert.equal(redactLong("leak long-enough-secret here"), "leak [REDACTED] here");
+});
+
+test("redactValue survives circular structures and deep nesting", () => {
+  const redact = makeRedactor({});
+  const circular: Record<string, unknown> = { note: "hello" };
+  circular.self = circular;
+  const out = redactValue(circular, redact) as Record<string, unknown>;
+  assert.equal(out.note, "hello");
+  assert.equal(out.self, "[CYCLE]");
+
+  // A shared (non-cyclic) reference must survive as data, not become [CYCLE].
+  const shared = { value: "keep me" };
+  const dag = { a: shared, b: shared };
+  const outDag = redactValue(dag, redact) as { a: unknown; b: unknown };
+  assert.deepEqual(outDag.a, { value: "keep me" });
+  assert.deepEqual(outDag.b, { value: "keep me" });
+
+  let node: Record<string, unknown> = {};
+  const deep = node;
+  for (let i = 0; i < 50; i++) {
+    node.inner = {};
+    node = node.inner as Record<string, unknown>;
+  }
+  const outDeep = JSON.stringify(redactValue(deep, redact));
+  assert.ok(outDeep?.includes("[MAX_DEPTH]"), "deep nesting must terminate with a marker");
 });

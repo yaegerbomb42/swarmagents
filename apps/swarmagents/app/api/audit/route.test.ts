@@ -218,12 +218,13 @@ test("login success and failure are audit-logged without the password", async ()
   assert.equal(bad.status, 401);
 
   const entries = readAuditEntries("local_alice@example.com");
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0].action, "login.success");
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].action, "login.failure");
+  assert.equal(entries[0].target, "alice@example.com");
+  assert.equal(entries[1].action, "login.success");
+  // Failed logins are attributed to the targeted account, not "anonymous".
   const failed = readAuditEntries("anonymous");
-  assert.equal(failed.length, 1);
-  assert.equal(failed[0].action, "login.failure");
-  assert.equal(failed[0].target, "alice@example.com");
+  assert.equal(failed.length, 0);
   const raw = fs.readFileSync(path.join(dir, "audit.jsonl"), "utf8");
   assert.ok(!raw.includes("correct horse"), "audit log must never contain password material");
   assert.ok(!raw.includes("wrong password"), "audit log must never contain password material");

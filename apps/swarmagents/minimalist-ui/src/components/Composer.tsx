@@ -236,7 +236,7 @@ export function Composer({
       : busy
         ? "Add a follow-up. It runs when the current run finishes."
         : hero
-          ? "Describe what you want done"
+          ? "Describe the task. The agent has its own computer."
           : "Message the agent";
 
   return (
@@ -257,7 +257,7 @@ export function Composer({
         data-testid="composer-drop-zone"
         className={cn(
           "glass-2 composer-ring rounded-[24px] hair transition-all",
-          dragging ? "border-indigo-400/80 shadow-[0_0_24px_rgba(99,102,241,0.25)]" : "border-white/10",
+          dragging ? "border-[var(--brand-signal)] shadow-[0_0_24px_rgba(0,208,240,0.25)]" : "border-white/10",
           hero && "shadow-[0_20px_60px_-20px_rgba(0,0,0,0.9)]",
         )}
       >
@@ -340,7 +340,7 @@ export function Composer({
             disabled={!sendable}
             aria-label={busy ? "Queue message" : "Send message"}
             title={busy ? "Queue message (Enter)" : "Send (Enter)"}
-            className="press grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[var(--fg)] text-[var(--inv)] transition-transform hover:scale-105 disabled:cursor-not-allowed disabled:bg-white/[0.08] disabled:text-[var(--mute)] disabled:hover:scale-100"
+            className="press grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[var(--brand-signal)] text-[var(--brand-text-on-signal)] transition-transform hover:scale-105 disabled:cursor-not-allowed disabled:bg-white/[0.08] disabled:text-[var(--mute)] disabled:hover:scale-100"
           >
             {sending ? (
               <Loader2 className="h-4 w-4 animate-spin" aria-hidden />

@@ -9,7 +9,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { BrowserContext, Page } from "playwright-core";
+import type { Browser, BrowserContext, Page } from "playwright-core";
 import { BrowserManager, MAX_FPS, type BrowserFrame } from "./manager";
 import type { BrowserDiagnosticEntry } from "./actions";
 import { telemetryBus } from "../telemetry/index";
@@ -568,7 +568,7 @@ class LauncherProbeManager extends BrowserManager {
 
 test("a failed Chromium launch does not poison later sessions", async () => {
   const fakeBrowser = fakeBrowserHandle();
-  const manager = new LauncherProbeManager(async () => {
+  const manager: LauncherProbeManager = new LauncherProbeManager(async () => {
     manager.launcherCalls += 1;
     if (manager.launcherCalls === 1) throw new Error("launch boom");
     return fakeBrowser as unknown as Browser;
@@ -585,7 +585,7 @@ test("a failed Chromium launch does not poison later sessions", async () => {
 test("a mid-run browser disconnect does not poison later sessions", async () => {
   const first = fakeBrowserHandle();
   const second = fakeBrowserHandle();
-  const manager = new LauncherProbeManager(async () => {
+  const manager: LauncherProbeManager = new LauncherProbeManager(async () => {
     manager.launcherCalls += 1;
     return (manager.launcherCalls === 1 ? first : second) as unknown as Browser;
   });

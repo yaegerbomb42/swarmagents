@@ -37,6 +37,7 @@ import {
   targetCoveragePct,
 } from "../../../../../lib/codebase/slice";
 import { runExplainLens } from "../../../../../lib/codebase/strike-lens";
+import { JsonBodyError, readJsonBody } from "../../../../../lib/http";
 import { getRuntimeManager } from "../../../../../lib/runtime/manager";
 import type { CodebaseScanner } from "../../../../../lib/codebase/types";
 
@@ -89,8 +90,13 @@ export async function POST(req: NextRequest) {
 
   let body: { repo?: unknown; path?: unknown; action?: unknown } = {};
   try {
-    body = (await req.json().catch(() => ({}))) as typeof body;
-  } catch {
+    body = (await readJsonBody(req)) as typeof body;
+  } catch (err) {
+    // An oversized body is rejected; a malformed or empty body keeps the
+    // old fallback (treated as no body, so validation below reports it).
+    if (err instanceof JsonBodyError && err.status === 413) {
+      return NextResponse.json({ error: "Request body is too large." }, { status: 413 });
+    }
     body = {};
   }
 

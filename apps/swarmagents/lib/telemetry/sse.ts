@@ -3,16 +3,18 @@ import { getRunsDir } from "./paths";
 import { INITIAL_REPLAY_CAP, streamRunEventsFrom, tailRunLogLastEvent } from "./run-log";
 
 export function encodeSse(event: SequencedEvent): string {
+  const safeSeq = String(event.seq).replace(/[\r\n]/g, "");
+  const safeType = String(event.type).replace(/[\r\n]/g, "");
   // Synthetic frames (stream.error seq -1, run.snapshot seq 0) must not carry
   // an id: EventSource would persist it as Last-Event-ID and replay the whole
   // run on the next reconnect. Real events start at seq 1.
-  const id = event.seq > 0 ? `id: ${event.seq}\n` : "";
-  return `${id}event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+  const id = event.seq > 0 ? `id: ${safeSeq}\n` : "";
+  return `${id}event: ${safeType}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
 /** Run events after which no further events can arrive for a run. */
 export function isTerminalRunEvent(type: string): boolean {
-  return type === "run.finished" || type === "run.error" || type === "run.cancelled" || type === "run.paused";
+  return type === "run.finished" || type === "run.error" || type === "run.cancelled";
 }
 
 export interface SseStreamOptions {

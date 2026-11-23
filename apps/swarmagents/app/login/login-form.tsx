@@ -35,7 +35,6 @@ const inputStyle: CSSProperties = {
   fontSize: 14,
   padding: "10px 40px 10px 12px",
   borderRadius: "var(--radius-sm, 6px)",
-  outline: "none",
 };
 
 const labelStyle: CSSProperties = {
@@ -168,9 +167,10 @@ export default function LoginForm({
         headers: { "content-type": "application/json" },
         body: JSON.stringify(isSignup ? { email, password, botToken } : { email, password, next }),
       });
-      const data = (await res.json()) as { error?: string; next?: string };
+      const data = ((await res.json().catch(() => ({}))) ?? {}) as { error?: string; next?: string };
       if (!res.ok) {
         setError(data.error ?? (isSignup ? "Account creation failed." : "Sign-in failed."));
+        setBusy(false);
         return;
       }
       if (isSignup) {
@@ -185,7 +185,6 @@ export default function LoginForm({
       window.location.assign(safeNextPath(data.next));
     } catch {
       setError("Network error. Please try again.");
-    } finally {
       setBusy(false);
     }
   }
@@ -254,7 +253,7 @@ export default function LoginForm({
         <p style={{ color: "var(--color-text-muted)", fontSize: 13, margin: "0 0 24px" }}>
           {isReset
             ? "Enter your email and we will send you a link to reset your password."
-            : isSignup ? "Create your account to continue." : "Sign in to continue."}
+            : isSignup ? "Create your account to get started." : "Sign in to your workspace."}
         </p>
 
         <form onSubmit={submit} className="login-form" style={{ display: "flex", flexDirection: "column", gap: 16 }}>

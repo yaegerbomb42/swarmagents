@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import fs, { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { NextRequest } from "next/server";
 import { USER_HEADER } from "../../../lib/auth";
 import { configureProviderStorePaths } from "../../../lib/providers/store";
+import { userMemoryFilePath } from "../../../lib/memory/store";
 import { DELETE, GET, POST } from "./route";
 import { DELETE as DELETE_ONE, GET as GET_ONE } from "./[id]/route";
 
@@ -195,4 +196,63 @@ test("GET and DELETE [id] reject invalid id shapes with 404 and no-store", async
     assert.equal(delRes.status, 404);
     assert.equal(delRes.headers.get("cache-control"), "no-store");
   }
+});
+
+test("POST returns a generic 500 when the memory store cannot be written", async () => {
+  // memory.json as a directory: the atomic rename that commits the write
+  // fails with EISDIR, and the raw errno text must never reach the client.
+  const file = userMemoryFilePath(ALICE);
+  mkdirSync(file, { recursive: true });
+  const res = await POST(
+    request("/api/memory", {
+      method: "POST",
+      user: ALICE,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fact: "The sky is blue." }),
+    }),
+  );
+  assert.equal(res.status, 500);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "Could not store memory.");
+  assert.equal(JSON.stringify(body).includes("memory.json"), false);
+  assert.equal(JSON.stringify(body).includes("EISDIR"), false);
+  assert.equal(res.headers.get("cache-control"), "no-store");
+});
+
+test("DELETE returns a generic 500 when the memory store cannot be cleared", async (t) => {
+  const created = await POST(
+    request("/api/memory", {
+      method: "POST",
+      user: ALICE,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fact: "Remember this." }),
+    }),
+  );
+  assert.equal(created.status, 201);
+
+  // Fail the atomic rename that commits the cleared file.
+  const origRename = fs.renameSync;
+  t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+    if (String(to).includes("memory.json")) {
+      throw new Error("boom: rename failed at /tmp/internal/secret-path");
+    }
+    return origRename(from, to);
+  });
+  const res = await DELETE(request("/api/memory", { method: "DELETE", user: ALICE }));
+  assert.equal(res.status, 500);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "Could not clear memories.");
+  assert.equal(JSON.stringify(body).includes("/tmp/internal/secret-path"), false);
+  assert.equal(res.headers.get("cache-control"), "no-store");
+});
+
+test("GET treats a corrupt memory file as empty instead of failing", async () => {
+  const file = userMemoryFilePath(ALICE);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, "{not json", "utf-8");
+  const res = await GET(request("/api/memory", { user: ALICE }));
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { memories: unknown[]; total: number };
+  assert.deepEqual(body.memories, []);
+  assert.equal(body.total, 0);
 });

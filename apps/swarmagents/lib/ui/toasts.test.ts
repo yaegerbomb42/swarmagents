@@ -153,3 +153,45 @@ test("add caps the active toast queue", () => {
   assert.equal(state[MAX_TOASTS - 1].id, String(MAX_TOASTS + 3));
 });
 
+test("describeFailure scrubs an sk- key from the fallback detail", () => {
+  const key = "sk-abcdefghij1234567890xyz";
+  const f = describeFailure(new Error(`provider exploded using ${key} please help`));
+  assert.equal(f.message, "Provider error");
+  assert.ok(!(f.detail ?? "").includes(key), "raw key must not appear in the detail");
+  assert.match(f.detail!, /\[REDACTED\]/);
+});
+
+test("describeFailure scrubs a Bearer token from the fallback detail", () => {
+  const token = "abcdefghij1234567890";
+  const f = describeFailure(new Error(`call failed: Authorization: Bearer ${token}`));
+  assert.equal(f.message, "Provider error");
+  assert.ok(!(f.detail ?? "").includes(token), "raw token must not appear in the detail");
+  assert.match(f.detail!, /Bearer \[REDACTED\]/);
+});
+
+test("describeFailure scrubs GitHub and Gemini token shapes from the fallback detail", () => {
+  const gh = "ghp_abcdefghij1234567890";
+  const gemini = `AIzaSy${"A".repeat(33)}`; // AIza + 35 base64url chars
+  const f = describeFailure(new Error(`tokens leaked: ${gh} and ${gemini}`));
+  assert.equal(f.message, "Provider error");
+  assert.ok(!(f.detail ?? "").includes(gh));
+  assert.ok(!(f.detail ?? "").includes(gemini));
+  assert.match(f.detail!, /\[REDACTED\]/);
+});
+
+test("describeFailure scrubs secrets repeatedly without skipping matches", () => {
+  const key = "sk-abcdefghij1234567890xyz";
+  // Call twice with the same secret: a stateful global-regex scan would skip
+  // the match on the second call.
+  for (let i = 0; i < 2; i++) {
+    const f = describeFailure(new Error(`attempt ${i} using ${key}`));
+    assert.ok(!(f.detail ?? "").includes(key));
+    assert.match(f.detail!, /\[REDACTED\]/);
+  }
+});
+
+test("describeFailure leaves a secret-free fallback detail untouched", () => {
+  const f = describeFailure(new Error("weird provider glitch, please retry"));
+  assert.equal(f.message, "Provider error");
+  assert.equal(f.detail, "weird provider glitch, please retry");
+});

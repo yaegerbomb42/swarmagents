@@ -7,6 +7,7 @@
 
 import { NextResponse, type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../lib/auth";
+import { JsonBodyError, readJsonBody } from "../../../../lib/http";
 import { loadRules, upsertRule } from "../../../../lib/ambient/store";
 import type { AmbientRule, AmbientTriggerKind } from "../../../../lib/ambient/types";
 
@@ -50,8 +51,11 @@ export async function POST(req: NextRequest) {
   if (!user) return NextResponse.json({ error: "Sign in required." }, { status: 401 });
   let body: unknown;
   try {
-    body = await req.json();
-  } catch {
+    body = await readJsonBody(req);
+  } catch (err) {
+    if (err instanceof JsonBodyError && err.status === 413) {
+      return NextResponse.json({ error: "Request body is too large." }, { status: 413 });
+    }
     return NextResponse.json({ error: "Invalid JSON." }, { status: 400 });
   }
   if (!body || typeof body !== "object") return NextResponse.json({ error: "Invalid body." }, { status: 400 });

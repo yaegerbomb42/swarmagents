@@ -10,9 +10,9 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
-import { CircleCheck, Info, OctagonAlert, TriangleAlert, X, type LucideIcon } from "lucide-react";
 import { type ToastTone as SharedToastTone } from "../../../lib/ui/toasts";
 import { uid } from "../data";
+import { Toast, type ToastTone as BrandToastTone } from "./brand/Toast";
 
 /**
  * Toast tones rendered by the console. The shared model in lib/ui/toasts.ts
@@ -48,53 +48,26 @@ interface ToastsValue {
 
 const ToastsContext = createContext<ToastsValue | null>(null);
 
-interface ToneStyle {
-  icon: LucideIcon;
-  /** Icon chip (icon colour + tinted plate + ring). */
-  chip: string;
-  /** Uppercase tone label rendered next to the message. */
-  label: string;
-  /** Card border tint. */
-  border: string;
-  /** Auto-dismiss progress bar colour. */
-  bar: string;
-  /** Live region: failures interrupt, everything else is announced politely. */
-  role: "status" | "alert";
-}
+/**
+ * Provider tones mapped onto the brand Toast tones. The brand Toast owns the
+ * card chrome (icon, border, Void Navy surface); this provider keeps owning
+ * the behaviour — auto-dismiss timers, hover pause, the leave animation and
+ * the draining progress bar — so the brand Toast is rendered sticky
+ * (durationMs: 0) and dismissed by the provider.
+ */
+const BRAND_TONE: Record<ToastTone, BrandToastTone> = {
+  info: "info",
+  success: "ok",
+  warning: "warn",
+  error: "err",
+};
 
-const TONE_STYLE: Record<ToastTone, ToneStyle> = {
-  error: {
-    icon: OctagonAlert,
-    chip: "text-red-400 bg-red-500/12 ring-red-500/25",
-    label: "Error",
-    border: "border-red-500/35",
-    bar: "bg-red-400/90",
-    role: "alert",
-  },
-  warning: {
-    icon: TriangleAlert,
-    chip: "text-amber-400 bg-amber-500/12 ring-amber-500/25",
-    label: "Warning",
-    border: "border-amber-400/35",
-    bar: "bg-amber-300/90",
-    role: "alert",
-  },
-  success: {
-    icon: CircleCheck,
-    chip: "text-emerald-400 bg-emerald-500/12 ring-emerald-500/25",
-    label: "Success",
-    border: "border-emerald-500/35",
-    bar: "bg-emerald-400/90",
-    role: "status",
-  },
-  info: {
-    icon: Info,
-    chip: "text-cyan-400 bg-cyan-500/12 ring-cyan-500/25",
-    label: "Info",
-    border: "border-cyan-400/30",
-    bar: "bg-cyan-300/90",
-    role: "status",
-  },
+/** Drain-bar colour per provider tone, matching the brand tone. */
+const TONE_BAR: Record<ToastTone, string> = {
+  info: "bg-cyan-300/90",
+  success: "bg-emerald-400/90",
+  warning: "bg-amber-300/90",
+  error: "bg-red-400/90",
 };
 
 /** At most four toasts are on screen; the oldest one falls off when it overflows. */
@@ -282,17 +255,12 @@ export function ToastsProvider({ children }: { children: ReactNode }) {
       {toasts.length > 0 && (
         <div className="pointer-events-none fixed inset-x-0 bottom-0 z-[60] flex flex-col items-stretch gap-2 px-3 pb-[calc(env(safe-area-inset-bottom)+12.5rem)] pt-3 sm:left-auto sm:right-4 sm:bottom-4 sm:w-[min(92vw,22rem)] sm:items-end sm:px-0 sm:pb-0 sm:pt-0">
           {toasts.map((toast) => {
-            const tone = TONE_STYLE[toast.tone];
-            const Icon = tone.icon;
             const isPaused = paused.has(toast.id);
             const isLeaving = leaving.has(toast.id);
             const sticky = toast.ttlMs <= 0;
             return (
               <div
                 key={toast.id}
-                role={tone.role}
-                aria-live={tone.role === "alert" ? "assertive" : "polite"}
-                aria-atomic="true"
                 data-testid="toast"
                 data-tone={toast.tone}
                 data-leaving={isLeaving ? "true" : undefined}
@@ -300,57 +268,31 @@ export function ToastsProvider({ children }: { children: ReactNode }) {
                 onMouseLeave={() => resume(toast.id)}
                 onFocusCapture={() => pause(toast.id)}
                 onBlurCapture={() => resume(toast.id)}
-                className={`sa-toast pointer-events-auto relative overflow-hidden rounded-2xl border bg-[#0b0b10]/95 px-3.5 py-3 shadow-[0_18px_50px_-16px_rgba(0,0,0,0.9)] backdrop-blur-xl ${tone.border}`}
+                className="sa-toast pointer-events-auto relative w-[min(360px,92vw)] overflow-hidden rounded-[var(--brand-radius-lg)] max-sm:mx-auto"
               >
-                <div className="flex items-start gap-3">
-                  <span className={`mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg ring-1 ${tone.chip}`}>
-                    <Icon className="h-4 w-4" aria-hidden="true" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    {toast.action ? (
-                      <button
-                        type="button"
-                        className="block w-full text-left"
-                        aria-label={`Open: ${toast.message}`}
-                        onClick={() => {
+                <Toast
+                  toast={{
+                    id: toast.id,
+                    tone: BRAND_TONE[toast.tone],
+                    title: toast.message,
+                    description: toast.detail,
+                    // Sticky: the provider owns auto-dismiss (and hover pause).
+                    durationMs: 0,
+                    actionLabel: toast.action ? "Open" : undefined,
+                    onAction: toast.action
+                      ? () => {
                           toast.action?.();
                           dismiss(toast.id);
-                        }}
-                      >
-                        <div className="text-xs font-medium text-white/90">
-                          <span className="mr-1.5 uppercase tracking-widest text-white/35">{tone.label}</span>
-                          {toast.message}
-                        </div>
-                        {toast.detail && (
-                          <div className="mt-0.5 break-words text-[11px] leading-relaxed text-white/50">{toast.detail}</div>
-                        )}
-                      </button>
-                    ) : (
-                      <>
-                        <div className="text-xs font-medium text-white/90">
-                          <span className="mr-1.5 uppercase tracking-widest text-white/35">{tone.label}</span>
-                          {toast.message}
-                        </div>
-                        {toast.detail && (
-                          <div className="mt-0.5 break-words text-[11px] leading-relaxed text-white/50">{toast.detail}</div>
-                        )}
-                      </>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => dismiss(toast.id)}
-                    aria-label="Dismiss notification"
-                    className="grid h-6 w-6 shrink-0 place-items-center rounded-full text-white/40 transition hover:bg-white/10 hover:text-white"
-                  >
-                    <X className="h-3.5 w-3.5" aria-hidden="true" />
-                  </button>
-                </div>
+                        }
+                      : undefined,
+                  }}
+                  onDismiss={dismiss}
+                />
                 {!sticky && (
                   <div
                     data-testid="toast-progress"
                     data-paused={isPaused ? "true" : undefined}
-                    className={`sa-toast-progress absolute inset-x-0 bottom-0 h-[2px] ${tone.bar}`}
+                    className={`sa-toast-progress absolute inset-x-0 bottom-0 h-[2px] ${TONE_BAR[toast.tone]}`}
                     style={{ "--sa-toast-ttl": `${toast.ttlMs}ms` } as CSSProperties}
                   />
                 )}

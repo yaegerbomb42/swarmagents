@@ -21,6 +21,9 @@ export interface ToastData {
   description?: string;
   /** Auto-dismiss after this many ms. 0 = sticky. Default 6000. */
   durationMs?: number;
+  /** Optional action, rendered as a small link-style button under the text. */
+  actionLabel?: string;
+  onAction?: () => void;
 }
 
 const TONE: Record<ToastTone, { icon: IconName; color: string; border: string }> = {
@@ -77,6 +80,15 @@ export function Toast({
         <p className="text-[13px] font-medium leading-snug text-[var(--brand-text)]">{toast.title}</p>
         {toast.description ? (
           <p className="mt-0.5 text-[12px] leading-snug text-[var(--brand-text-2)]">{toast.description}</p>
+        ) : null}
+        {toast.onAction && toast.actionLabel ? (
+          <button
+            type="button"
+            onClick={toast.onAction}
+            className="mt-1.5 text-[12px] font-medium text-[var(--brand-signal)] hover:underline focus-visible:outline-none focus-visible:shadow-[var(--brand-focus-ring)]"
+          >
+            {toast.actionLabel}
+          </button>
         ) : null}
       </div>
       <button

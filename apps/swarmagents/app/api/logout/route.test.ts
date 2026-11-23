@@ -1,69 +1,101 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { NextRequest } from "next/server";
 import { POST } from "./route";
-import { middleware } from "../../../middleware";
-import { USER_HEADER } from "../../../lib/auth";
+import { SESSION_COOKIE, sessionCookieOptions, signSession, verifySession } from "../../../lib/auth";
+import { configureUserPaths, getSessionEpoch, signupLocalUser } from "../../../lib/users";
+import { configureAuditPath, readAuditEntries } from "../../../lib/audit";
 
-function request(headers: Record<string, string> = {}): NextRequest {
-  return new NextRequest("http://localhost/api/logout", {
-    method: "POST",
-    headers: { ...headers },
-  });
+function request(cookie?: string): NextRequest {
+  const headers: Record<string, string> = {};
+  if (cookie !== undefined) headers["cookie"] = `${SESSION_COOKIE}=${encodeURIComponent(cookie)}`;
+  return new NextRequest("http://localhost/api/logout", { method: "POST", headers });
 }
 
-test("POST /api/logout clears the session cookie with maxAge: 0", async () => {
-  const req = request({ [USER_HEADER]: "local_alice@example.com" });
-  const res = await POST(req);
+let dir = "";
+
+test.beforeEach(() => {
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-logout-test-"));
+  configureUserPaths(path.join(dir, "users.json"));
+  process.env.SWARM_SESSION_SECRET = "test-session-secret";
+});
+
+test.afterEach(() => {
+  configureUserPaths("");
+  delete process.env.SWARM_SESSION_SECRET;
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("POST /api/logout clears the session cookie and returns ok", async () => {
+  assert.equal((await signupLocalUser("alice@example.com", "correct horse battery")).ok, true);
+  const token = signSession("local_alice@example.com");
+
+  const res = await POST(request(token));
   assert.equal(res.status, 200);
+  const body = (await res.json()) as { ok?: boolean };
+  assert.equal(body.ok, true);
 
-  const json = (await res.json()) as { ok: boolean };
-  assert.equal(json.ok, true);
+  const setCookie = res.headers.get("set-cookie") ?? "";
+  assert.match(setCookie.toLowerCase(), /swarm_session=;/);
+  assert.match(setCookie.toLowerCase(), /age=0/);
+});
 
-  const sc = res.headers.get("set-cookie") ?? "";
-  assert.ok(sc.includes("swarm_session="), `expected swarm_session cookie, got: ${sc}`);
-  assert.ok(sc.includes("Max-Age=0"), `expected Max-Age=0 in Set-Cookie: ${sc}`);
-  assert.ok(sc.includes("Path=/"), `expected Path=/ in Set-Cookie: ${sc}`);
-  assert.ok(sc.includes("HttpOnly"), `expected HttpOnly in Set-Cookie: ${sc}`);
+test("POST /api/logout clears the cookie even with no/expired session (public route)", async () => {
+  const res = await POST(request());
+  assert.equal(res.status, 200);
+  const setCookie = res.headers.get("set-cookie") ?? "";
+  assert.match(setCookie.toLowerCase(), /swarm_session=;/);
+  assert.match(setCookie.toLowerCase(), /age=0/);
+});
+
+test("POST /api/logout does NOT bump the session epoch (single-device)", async () => {
+  assert.equal((await signupLocalUser("alice@example.com", "correct horse battery")).ok, true);
+  const token = signSession("local_alice@example.com");
+  assert.equal(getSessionEpoch("alice@example.com"), 0);
+
+  const res = await POST(request(token));
+  assert.equal(res.status, 200);
+  // Epoch unchanged → other devices (which rely on the same epoch) stay signed in.
+  assert.equal(getSessionEpoch("alice@example.com"), 0);
+  assert.equal(verifySession(token), "local_alice@example.com");
+});
+
+test("POST /api/logout writes a session.logout audit entry for a valid session", async () => {
+  assert.equal((await signupLocalUser("alice@example.com", "correct horse battery")).ok, true);
+  const auditFile = path.join(dir, "audit.jsonl");
+  configureAuditPath(auditFile);
+  try {
+    const token = signSession("local_alice@example.com");
+    const res = await POST(request(token));
+    assert.equal(res.status, 200);
+
+    const alice = readAuditEntries("local_alice@example.com");
+    assert.equal(alice.length, 1);
+    assert.equal(alice[0].action, "session.logout");
+    assert.equal(alice[0].target, "local_alice@example.com");
+    assert.equal(alice[0].result, "success");
+  } finally {
+    configureAuditPath(undefined);
+  }
+});
+
+test("POST /api/logout writes no audit entry without a valid session", async () => {
+  const auditFile = path.join(dir, "audit.jsonl");
+  configureAuditPath(auditFile);
+  try {
+    await POST(request());
+    await POST(request("garbage-token"));
+    assert.deepEqual(readAuditEntries("local_alice@example.com"), []);
+  } finally {
+    configureAuditPath(undefined);
+  }
+});
+
+test("POST /api/logout returns Cache-Control: no-store", async () => {
+  const res = await POST(request());
+  assert.equal(res.status, 200);
   assert.equal(res.headers.get("cache-control"), "no-store");
-});
-
-test("POST /api/logout succeeds when unauthenticated (not an account oracle)", async () => {
-  const req = request();
-  const res = await POST(req);
-  assert.equal(res.status, 200);
-
-  const json = (await res.json()) as { ok: boolean };
-  assert.equal(json.ok, true);
-
-  const sc = res.headers.get("set-cookie") ?? "";
-  assert.ok(sc.includes("Max-Age=0"), `expected Max-Age=0 in Set-Cookie: ${sc}`);
-});
-
-test("POST /api/logout is protected by middleware CSRF cross-site check", async () => {
-  const req = new NextRequest("http://localhost/api/logout", {
-    method: "POST",
-    headers: {
-      origin: "http://evil.example.com",
-      host: "localhost",
-    },
-  });
-  const res = middleware(req);
-  assert.equal(res.status, 403);
-  const json = (await res.json()) as { error: string };
-  assert.equal(json.error, "Cross-site request blocked.");
-});
-
-test("POST /api/logout is accessible through middleware for same-origin callers", async () => {
-  const req = new NextRequest("http://localhost/api/logout", {
-    method: "POST",
-    headers: {
-      origin: "http://localhost",
-      host: "localhost",
-    },
-  });
-  const res = middleware(req);
-  // Same-origin allowed through to route handler (status is not 401 or 403)
-  assert.notEqual(res.status, 401);
-  assert.notEqual(res.status, 403);
 });

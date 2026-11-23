@@ -182,6 +182,27 @@ test("POST /api/login writes a sanitized login.failure audit target", async () =
   }
 });
 
+test("failed logins are attributed to the targeted account's audit, not anonymous", async () => {
+  const auditFile = path.join(dir, "audit.jsonl");
+  // capture audit via the module's configured path
+  const { configureAuditPath, readAuditEntries } = await import("../../../lib/audit");
+  configureAuditPath(auditFile);
+  try {
+    // Wrong password against a real account.
+    const res = await POST(request({ email: "alice@example.com", password: "bad" }));
+    assert.equal(res.status, 401);
+    const alice = readAuditEntries("local_alice@example.com");
+    assert.equal(alice.length, 1);
+    assert.equal(alice[0].action, "login.failure");
+    assert.equal(alice[0].target, "alice@example.com");
+    assert.equal(alice[0].result, "failure");
+    // It must NOT be logged under the generic "anonymous" identity.
+    assert.deepEqual(readAuditEntries("anonymous"), []);
+  } finally {
+    configureAuditPath(undefined);
+  }
+});
+
 test("POST /api/login rejects an oversized body with 413", async () => {
   const res = await POST(
     request(JSON.stringify({ email: "alice@example.com", password: "x", pad: "x".repeat(17 * 1024) })),

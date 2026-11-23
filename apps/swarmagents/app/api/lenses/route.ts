@@ -18,6 +18,7 @@
 import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../lib/auth";
 import { noStoreJson, readJsonObject } from "../../../lib/http";
+import { lensErrorResponse } from "../../../lib/lenses/error-response";
 import { isLensId, type LensId } from "../../../lib/lenses/types";
 import { cachedLens, runLens } from "../../../lib/lenses/run";
 import { MAX_FILES, type ReferencedFile } from "../../../lib/lenses/prompts";
@@ -161,11 +162,11 @@ export async function POST(req: NextRequest) {
       return noStoreJson({ error: "Request aborted." }, { status: 499 });
     }
     // RouterError messages are already redacted (no key material), so the
-    // provider's own wording is safe to surface. Anything else is an
-    // internal failure — its message can carry filesystem paths or stack
-    // fragments, so it never reaches the client.
+    // provider's own wording is safe to surface via the shared helper.
+    // Anything else is an internal failure — its message can carry
+    // filesystem paths or stack fragments, so it never reaches the client.
     if (err instanceof RouterError) {
-      return noStoreJson({ error: err.message || "Lens failed." }, { status: 502 });
+      return lensErrorResponse(err);
     }
     return noStoreJson({ error: "Lens failed." }, { status: 500 });
   }

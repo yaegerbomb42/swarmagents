@@ -21,6 +21,8 @@ import type { ModelCapabilities, PerplexityEffort, ProviderAuth } from "@/lib/pr
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "cache-control": "no-store" } as const;
+/** Bounded body size for provider config writes; rejects oversized payloads with 413. */
+const MAX_PROVIDER_BODY_BYTES = 16 * 1024;
 
 /**
  * Every provider response is per-user configuration: never let a cache in
@@ -157,7 +159,7 @@ export async function POST(request: Request) {
   if (!owner) return unauthorized();
   let body: unknown;
   try {
-    body = await readJsonBody(request);
+    body = await readJsonBody(request, MAX_PROVIDER_BODY_BYTES);
   } catch (err) {
     if (err instanceof JsonBodyError) {
       return json({ error: err.message }, { status: err.status });
@@ -319,7 +321,7 @@ export async function PATCH(request: Request) {
   if (!owner) return unauthorized();
   let body: unknown;
   try {
-    body = await readJsonBody(request);
+    body = await readJsonBody(request, MAX_PROVIDER_BODY_BYTES);
   } catch (err) {
     if (err instanceof JsonBodyError) {
       return json({ error: err.message }, { status: err.status });

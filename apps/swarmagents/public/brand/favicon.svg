@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="SwarmAgents favicon">
+  <title>SwarmAgents favicon</title>
+  <rect width="64" height="64" rx="12" fill="#13192C"/>
+  <g transform="translate(7 17.5) scale(0.1515)">
+    <path d="M8 100 Q165 -45 322 100 Q165 245 8 100 Z" fill="none" stroke="#00D0F0" stroke-width="16" stroke-linejoin="round"/>
+    <rect x="134" y="76" width="62" height="48" rx="4" fill="#00D0F0"/>
+  </g>
+</svg>

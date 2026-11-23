@@ -1,30 +1,32 @@
 @import "tailwindcss";
+@import "../minimalist-ui/src/components/brand/tokens.css";
 
 /**
  * Workspace tokens — the one visual language of the main page.
  *
- * A quiet graphite surface so the VM screen and the content carry the page.
- * Indigo is the only accent and means "you can act here"; green / amber / rose
- * mean status and nothing else. Every text color clears WCAG AA (4.5:1) on
- * every surface below. Utilities: bg-sa-*, text-sa-*, border-sa-*.
+ * The SwarmAgents brand system (branding/BRAND.md): Void Navy surfaces so the
+ * VM screen and the content carry the page. Signal Cyan is the only accent
+ * and means "you can act here"; green / amber / rose mean status and nothing
+ * else. Every text color clears WCAG AA (4.5:1) on every surface below.
+ * Utilities: bg-sa-*, text-sa-*, border-sa-*.
  *
  *   type     12 meta · 13 secondary · 14 body · 16 input (mobile) · 20 title · 28 hero
  *   space    4 · 8 · 12 · 16 · 24 · 32 · 48
  *   radius   8 controls · 12 cards · 16 composer and stage
  */
 @theme {
-  --color-sa-bg: #0b0b0d;
-  --color-sa-panel: #111114;
-  --color-sa-raised: #18181c;
-  --color-sa-hover: #202026;
-  --color-sa-line: #25252b;
-  --color-sa-line-strong: #36363e;
-  --color-sa-fg: #ededf0;
-  --color-sa-fg2: #a6a6b0;
-  --color-sa-fg3: #8a8a94;
-  --color-sa-accent: #5b5ef0;
-  --color-sa-accent-hover: #4d50e2;
-  --color-sa-accent-fg: #a5b4fc;
+  --color-sa-bg: #13192c;
+  --color-sa-panel: #171f36;
+  --color-sa-raised: #1c2540;
+  --color-sa-hover: #222c4a;
+  --color-sa-line: #26304d;
+  --color-sa-line-strong: #36436a;
+  --color-sa-fg: #f2f5fb;
+  --color-sa-fg2: #b4bed2;
+  --color-sa-fg3: #93a0ba;
+  --color-sa-accent: #00d0f0;
+  --color-sa-accent-hover: #00b8d9;
+  --color-sa-accent-fg: #00d0f0;
   --color-sa-ok: #34d399;
   --color-sa-warn: #fbbf24;
   --color-sa-err: #fb7185;
@@ -37,44 +39,44 @@
  */
 
 :root {
-  /* ── Color ── */
-  --color-bg: #000000;
-  --color-bg-elevated: #0a0a0a;
-  --color-bg-sunken: #050505;
+  /* ── Color (brand system — branding/BRAND.md) ── */
+  --color-bg: var(--brand-bg);
+  --color-bg-elevated: var(--brand-surface);
+  --color-bg-sunken: var(--brand-well);
   /* The workspace canvas (z1 referenced this before it was defined). */
-  --bg-base: #09090b;
+  --bg-base: var(--brand-bg);
 
-  --color-line: #1a1a1a;
-  --color-line-strong: #2a2a2a;
-  --color-line-glow: #3a3a3a;
+  --color-line: var(--brand-hairline);
+  --color-line-strong: var(--brand-hairline-strong);
+  --color-line-glow: rgba(0, 208, 240, 0.35);
 
-  --color-text: #ffffff;
-  --color-text-muted: #888888;
-  --color-text-faint: #555555;
-  --color-text-inverted: #000000;
+  --color-text: var(--brand-text);
+  --color-text-muted: var(--brand-text-2);
+  --color-text-faint: var(--brand-text-3);
+  --color-text-inverted: var(--brand-ink);
 
-  --color-accent: #ffffff;
-  --color-accent-text: #000000;
-  --color-accent-muted: #444444;
+  --color-accent: var(--brand-signal);
+  --color-accent-text: var(--brand-text-on-signal);
+  --color-accent-muted: var(--brand-deep);
 
-  --color-focus: #818cf8;   /* indigo-400 — keyboard focus ring */
+  --color-focus: var(--brand-signal);   /* keyboard focus ring */
 
-  --color-ok: #22c55e;
-  --color-ok-glow: rgba(34, 197, 94, 0.4);
-  --color-warn: #fbbf24;
+  --color-ok: var(--brand-ok);
+  --color-ok-glow: rgba(52, 211, 153, 0.4);
+  --color-warn: var(--brand-warn);
   --color-warn-glow: rgba(251, 191, 36, 0.4);
-  --color-err: #ef4444;
-  --color-err-glow: rgba(239, 68, 68, 0.4);
-  --color-run: #6366f1;
-  --color-run-glow: rgba(99, 102, 241, 0.4);
+  --color-err: var(--brand-err);
+  --color-err-glow: rgba(251, 113, 133, 0.4);
+  --color-run: var(--brand-signal);
+  --color-run-glow: rgba(0, 208, 240, 0.4);
 
-  --color-neon: #ffffff;
-  --color-neon-soft: rgba(255, 255, 255, 0.15);
-  --color-neon-med: rgba(255, 255, 255, 0.3);
-  --color-neon-strong: rgba(255, 255, 255, 0.6);
+  --color-neon: var(--brand-signal);
+  --color-neon-soft: rgba(0, 208, 240, 0.15);
+  --color-neon-med: rgba(0, 208, 240, 0.3);
+  --color-neon-strong: rgba(0, 208, 240, 0.6);
 
-  --color-code-bg: #080808;
-  --color-code-line: #1a1a1a;
+  --color-code-bg: var(--brand-well);
+  --color-code-line: var(--brand-hairline);
 
   /* ── Spacing ── */
   --space-0: 0;
@@ -1523,28 +1525,30 @@ select option { background: #15151a; color: #eee; }
 }
 
 /* ==========================================================================
-   mynow UI Design Tokens (Glass, Aura, Edge, Orb, Pulse)
+   Brand UI tokens (Void Navy / Signal Cyan — branding/BRAND.md).
+   Legacy names (--bg, --fg, --glass…) are kept as aliases onto the brand
+   system so every existing component shifts palette without a rewrite.
    ========================================================================== */
 :root {
-  --bg: #050505;
-  --bg-2: #0c0c0c;
-  --fg: #fafafa;
-  --fg-2: #c8c8c8;
-  --mute: #7c7c7c;
-  --line: rgba(255, 255, 255, 0.07);
-  --line-2: rgba(255, 255, 255, 0.13);
-  --glass: rgba(22, 22, 22, 0.55);
-  --glass-2: rgba(28, 28, 28, 0.72);
-  --glass-hi: rgba(40, 40, 40, 0.9);
-  --inv: #000000;
-  --ok: #3ddc84;
-  --warn: #ffb547;
-  --err: #ff5a52;
-  --sig: #7d93ff;
-  --shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 30px 60px -30px rgba(0, 0, 0, 0.9), 0 2px 8px -2px rgba(0, 0, 0, 0.5);
-  --aura-a: rgba(90, 110, 255, 0.16);
-  --aura-b: rgba(255, 120, 80, 0.09);
-  --aura-c: rgba(60, 220, 180, 0.08);
+  --bg: var(--brand-bg);
+  --bg-2: var(--brand-bg-deep);
+  --fg: var(--brand-text);
+  --fg-2: var(--brand-text-2);
+  --mute: var(--brand-text-3);
+  --line: var(--brand-hairline);
+  --line-2: var(--brand-hairline-strong);
+  --glass: var(--brand-surface);
+  --glass-2: var(--brand-surface-raised);
+  --glass-hi: var(--brand-surface-hover);
+  --inv: var(--brand-ink);
+  --ok: var(--brand-ok);
+  --warn: var(--brand-warn);
+  --err: var(--brand-err);
+  --sig: var(--brand-signal);
+  --shadow: 0 1px 0 var(--brand-top-light) inset, 0 30px 60px -30px rgba(0, 0, 0, 0.9), 0 2px 8px -2px rgba(0, 0, 0, 0.5);
+  --aura-a: rgba(0, 208, 240, 0.10);
+  --aura-b: rgba(0, 80, 128, 0.12);
+  --aura-c: rgba(0, 208, 240, 0.06);
 }
 
 .mono {
@@ -1554,15 +1558,11 @@ select option { background: #15151a; color: #eee; }
 
 .glass {
   background: var(--glass);
-  backdrop-filter: blur(28px) saturate(170%);
-  -webkit-backdrop-filter: blur(28px) saturate(170%);
   border: 1px solid var(--line);
   box-shadow: var(--shadow);
 }
 .glass-2 {
   background: var(--glass-2);
-  backdrop-filter: blur(36px) saturate(180%);
-  -webkit-backdrop-filter: blur(36px) saturate(180%);
   border: 1px solid var(--line-2);
   box-shadow: var(--shadow);
 }
@@ -1599,25 +1599,11 @@ select option { background: #15151a; color: #eee; }
   opacity: 0.35;
 }
 
-.aura {
-  position: fixed;
-  inset: -20%;
-  z-index: 0;
-  pointer-events: none;
-  background:
-    radial-gradient(40% 35% at 20% 15%, var(--aura-a), transparent 70%),
-    radial-gradient(35% 30% at 85% 25%, var(--aura-b), transparent 70%),
-    radial-gradient(45% 40% at 60% 95%, var(--aura-c), transparent 70%);
-  filter: blur(40px);
-  animation: aura-drift 28s ease-in-out infinite alternate;
-}
+/* Brand system: flat Void Navy canvas — no ambient aura or grain. The
+   classes stay defined (display:none) so any leftover markup is inert. */
+.aura,
 .grain {
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  opacity: 0.05;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  display: none;
 }
 @keyframes aura-drift {
   0% { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
@@ -1645,8 +1631,8 @@ select option { background: #15151a; color: #eee; }
   width: 100%;
   height: 100%;
   border-radius: 9999px;
-  background: radial-gradient(circle at 35% 30%, #ffffff 0%, #a5b4fc 40%, #4338ca 100%);
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.4) inset, 0 4px 12px -2px rgba(67, 56, 202, 0.5);
+  background: radial-gradient(circle at 35% 30%, #ffffff 0%, var(--brand-signal) 45%, var(--brand-deep) 100%);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.4) inset, 0 4px 12px -2px rgba(0, 80, 128, 0.5);
   transition: transform 0.4s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 .orb[data-state="acting"] .orb-core {

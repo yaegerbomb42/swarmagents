@@ -176,7 +176,6 @@ test("the header keeps the conversation, the views, the run and settings in one 
   ];
   const props = {
     title: "Fix the login redirect",
-    mascotState: "idle" as const,
     onOpenHistory: noop,
     onNewChat: noop,
     newChatDisabled: false,

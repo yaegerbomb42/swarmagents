@@ -12,16 +12,22 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { RuntimeManager, type RunSummary } from "./manager";
+import {
+  RuntimeManager,
+  getRuntimeManager,
+  setRuntimeManagerForTesting,
+  type RunSummary,
+} from "./manager";
 import { RunStateStore } from "./durable-queue";
-import { VmManager } from "../vm/manager";
+import { VmManager, vmManager } from "../vm/manager";
 import { FakeVmDriver } from "../vm/fake-driver";
 import { TelemetryBus } from "../telemetry/bus";
+import { telemetryBus } from "../telemetry/index";
 import { configureRunsDir } from "../telemetry/paths";
 import { ORPHANED_RUN_REASON, getRun } from "./run-store";
 import { checkpointVmLabel } from "./checkpoints";
 import { ApprovalStore, setApprovalStoreForTesting } from "../harness/approvals";
-import type { ExecOptions, ExecResult, VmHandle } from "../vm/types";
+import type { ExecOptions, ExecResult, VmDriver, VmHandle } from "../vm/types";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -514,6 +520,262 @@ test("graceful shutdown suspends a checkpointed run instead of cancelling it", a
     managerB?.cancel("alice");
     configureRunsDir(null);
     setApprovalStoreForTesting(null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("restart: restored runs do not start during construction, then start after (FIX-35)", async () => {
+  const dir = tmpDir();
+  const runsDir = path.join(dir, "runs");
+  const stateA = path.join(dir, "state-a.json");
+  const stateB = path.join(dir, "state-b.json");
+  configureRunsDir(runsDir);
+  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
+  let managerA: RuntimeManager | undefined;
+  let managerB: RuntimeManager | undefined;
+
+  try {
+    const driverA = new BlockingVmDriver();
+    const storeA = new RunStateStore({ filePath: stateA });
+    managerA = new RuntimeManager({
+      vm: new VmManager({ customDriver: driverA }),
+      bus,
+      router: null,
+      stateStore: storeA,
+    });
+    const active = managerA.start("alice", { prompt: "long active prompt" });
+    const queued = managerA.start("alice", { prompt: "queued follow-up prompt" });
+    assert.equal(active.accepted, true);
+    assert.equal(queued.queued, true);
+    await waitForCalls(driverA, 1);
+    fs.copyFileSync(stateA, stateB);
+
+    // vm.starting is published from executeInner's synchronous prefix, so
+    // whether it fires before or after `new RuntimeManager` returns proves
+    // whether the restored run started inside the constructor.
+    let constructionDone = false;
+    let vmStartingAfterConstruction: boolean | undefined;
+    const unsubscribe = bus.subscribe(queued.runId, 0, (event) => {
+      if (event.type === "vm.starting") vmStartingAfterConstruction = constructionDone;
+    });
+
+    const driverB = new FastVmDriver();
+    managerB = new RuntimeManager({
+      vm: new VmManager({ customDriver: driverB }),
+      bus,
+      router: null,
+      stateStore: new RunStateStore({ filePath: stateB }),
+    });
+    constructionDone = true;
+
+    // Synchronously after construction the restored run is still queued —
+    // not started, no vm.starting, no exec.
+    const immediate = managerB.list("alice").find((run) => run.runId === queued.runId);
+    assert.equal(immediate?.status, "queued");
+    assert.equal(vmStartingAfterConstruction, undefined);
+    assert.equal(driverB.calls.length, 0);
+
+    // On the next tick it starts (vm.starting after construction) and
+    // runs to completion.
+    const runs = await waitFor(
+      managerB,
+      "alice",
+      (all) => all.length > 0 && all.every((run) => run.status !== "running" && run.status !== "queued"),
+    );
+    assert.equal(vmStartingAfterConstruction, true);
+    assert.equal(runs.find((run) => run.runId === queued.runId)?.status, "finished");
+    unsubscribe();
+  } finally {
+    managerA?.cancel("alice");
+    managerB?.cancel("alice");
+    configureRunsDir(null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("restart: fresh prompt before the deferred drain queues behind restored work (FIX-35)", async () => {
+  const dir = tmpDir();
+  const runsDir = path.join(dir, "runs");
+  const stateA = path.join(dir, "state-a.json");
+  const stateB = path.join(dir, "state-b.json");
+  configureRunsDir(runsDir);
+  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
+  let managerA: RuntimeManager | undefined;
+  let managerB: RuntimeManager | undefined;
+
+  try {
+    const driverA = new BlockingVmDriver();
+    const storeA = new RunStateStore({ filePath: stateA });
+    managerA = new RuntimeManager({
+      vm: new VmManager({ customDriver: driverA }),
+      bus,
+      router: null,
+      stateStore: storeA,
+    });
+    managerA.start("alice", { prompt: "long active prompt" });
+    const queued = managerA.start("alice", { prompt: "queued follow-up prompt" });
+    assert.equal(queued.queued, true);
+    await waitForCalls(driverA, 1);
+    fs.copyFileSync(stateA, stateB);
+
+    const driverB = new FastVmDriver();
+    managerB = new RuntimeManager({
+      vm: new VmManager({ customDriver: driverB }),
+      bus,
+      router: null,
+      stateStore: new RunStateStore({ filePath: stateB }),
+    });
+
+    // No await yet: the deferred restored-start has not fired. A fresh
+    // prompt submitted in this window must not jump the restored queue —
+    // the restored head starts first and the fresh prompt queues behind
+    // it, exactly as with the old synchronous restore.
+    const fresh = managerB.start("alice", { prompt: "fresh prompt after restart" });
+    assert.equal(fresh.accepted, true);
+    assert.equal(fresh.queued, true);
+    assert.equal(fresh.position, 1);
+    const listed = managerB.list("alice");
+    assert.equal(listed.find((run) => run.runId === queued.runId)?.status, "running");
+    assert.equal(listed.find((run) => run.runId === fresh.runId)?.status, "queued");
+
+    const runs = await waitFor(
+      managerB,
+      "alice",
+      (all) => all.length > 0 && all.every((run) => run.status !== "running" && run.status !== "queued"),
+    );
+    assert.equal(runs.find((run) => run.runId === queued.runId)?.status, "finished");
+    assert.equal(runs.find((run) => run.runId === fresh.runId)?.status, "finished");
+  } finally {
+    managerA?.cancel("alice");
+    managerB?.cancel("alice");
+    configureRunsDir(null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("restart: shutdown before the deferred drain leaves restored runs queued and durable (FIX-35)", async () => {
+  const dir = tmpDir();
+  const runsDir = path.join(dir, "runs");
+  const stateA = path.join(dir, "state-a.json");
+  const stateB = path.join(dir, "state-b.json");
+  configureRunsDir(runsDir);
+  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
+  let managerA: RuntimeManager | undefined;
+  let managerB: RuntimeManager | undefined;
+
+  try {
+    const driverA = new BlockingVmDriver();
+    const storeA = new RunStateStore({ filePath: stateA });
+    managerA = new RuntimeManager({
+      vm: new VmManager({ customDriver: driverA }),
+      bus,
+      router: null,
+      stateStore: storeA,
+    });
+    managerA.start("alice", { prompt: "long active prompt" });
+    const queued = managerA.start("alice", { prompt: "queued follow-up prompt" });
+    assert.equal(queued.queued, true);
+    await waitForCalls(driverA, 1);
+    fs.copyFileSync(stateA, stateB);
+
+    const driverB = new FastVmDriver();
+    managerB = new RuntimeManager({
+      vm: new VmManager({ customDriver: driverB }),
+      bus,
+      router: null,
+      stateStore: new RunStateStore({ filePath: stateB }),
+    });
+
+    // SIGTERM lands before the deferred tick: the shutdown must not start
+    // restored work during the flush (same contract as finalize with
+    // drainQueue off). Nothing was active, so nothing is cancelled.
+    assert.deepEqual(managerB.cancelAll("shutdown"), []);
+    await sleep(50); // let the deferred tick fire
+
+    const listed = managerB.list("alice").find((run) => run.runId === queued.runId);
+    assert.equal(listed?.status, "queued");
+    assert.equal(driverB.calls.length, 0);
+
+    // Still durable: the next process restores it as usual.
+    const snapshot = new RunStateStore({ filePath: stateB }).load();
+    assert.equal(snapshot.users.alice?.active, null);
+    assert.equal(snapshot.users.alice?.queue[0]?.runId, queued.runId);
+  } finally {
+    managerA?.cancel("alice");
+    managerB?.cancel("alice");
+    configureRunsDir(null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("singleton: restored start after registration returns the same instance (FIX-35)", async () => {
+  const dir = tmpDir();
+  const runsDir = path.join(dir, "runs");
+  const stateA = path.join(dir, "state-a.json");
+  configureRunsDir(runsDir);
+  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
+  const defaultStore = new RunStateStore();
+  // The singleton's VmManager is the process-wide one; swap its driver for
+  // a fake so the restored run never touches docker, and restore it after.
+  const vmSingleton = vmManager as unknown as { driver: VmDriver };
+  const originalDriver = vmSingleton.driver;
+  let managerA: RuntimeManager | undefined;
+  let singleton: RuntimeManager | undefined;
+  let unsubscribe: (() => void) | undefined;
+
+  try {
+    // A previous process left an active + queued run in the default store.
+    const driverA = new BlockingVmDriver();
+    managerA = new RuntimeManager({
+      vm: new VmManager({ customDriver: driverA }),
+      bus,
+      router: null,
+      stateStore: new RunStateStore({ filePath: stateA }),
+    });
+    managerA.start("alice", { prompt: "long active prompt" });
+    const queued = managerA.start("alice", { prompt: "queued follow-up prompt" });
+    assert.equal(queued.queued, true);
+    await waitForCalls(driverA, 1);
+    fs.copyFileSync(stateA, defaultStore.filePath);
+
+    vmSingleton.driver = new FastVmDriver();
+    setRuntimeManagerForTesting(null);
+
+    // A telemetry subscriber that calls back into the singleton while a
+    // restored run starts: it must get the registered instance, never
+    // construct a second manager.
+    let reentrant: RuntimeManager | undefined;
+    let reentered = false;
+    unsubscribe = telemetryBus.subscribe(queued.runId, 0, (event) => {
+      if (event.type !== "vm.starting" || reentered) return;
+      reentered = true;
+      reentrant = getRuntimeManager();
+    });
+
+    singleton = getRuntimeManager();
+
+    // Construction did not start the restored run: still queued, the
+    // subscriber has not fired, and the singleton is registered.
+    assert.equal(
+      singleton.list("alice").find((run) => run.runId === queued.runId)?.status,
+      "queued",
+    );
+    assert.equal(reentrant, undefined);
+    assert.equal(getRuntimeManager(), singleton);
+
+    // After the deferred tick the run starts; the reentrant lookup inside
+    // its vm.starting publish returns the very same instance.
+    for (let i = 0; i < 200 && !reentered; i++) await sleep(10);
+    assert.equal(reentered, true);
+    assert.equal(reentrant, singleton);
+  } finally {
+    unsubscribe?.();
+    singleton?.cancel("alice");
+    setRuntimeManagerForTesting(null);
+    vmSingleton.driver = originalDriver;
+    defaultStore.clear();
+    managerA?.cancel("alice");
+    configureRunsDir(null);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -588,6 +588,24 @@ export class VmManager {
     return { status: "missing" };
   }
 
+  /**
+   * True when this process has ensured (or is ensuring) the user's VM and
+   * has not stopped, hibernated, or reset it since — i.e. a container is
+   * up or coming up and holding host resources. Synchronous and
+   * driver-free: the cached handle promise is dropped on stop, hibernate
+   * (sweepIdle), and reset, so its presence is exactly the live signal.
+   * A hibernated VM (volume kept, container stopped) does not count as
+   * live. Used by the runtime manager's global concurrent-VM cap.
+   */
+  isVmLive(userId: string): boolean {
+    return this.cache.has(userId);
+  }
+
+  /** User ids whose VMs are currently live (see isVmLive). */
+  liveVmUserIds(): string[] {
+    return [...this.cache.keys()];
+  }
+
   /** Stop the VM (keeps the volume for later). The next exec re-ensures it. */
   async stop(userId: string): Promise<void> {
     this.touch(userId);

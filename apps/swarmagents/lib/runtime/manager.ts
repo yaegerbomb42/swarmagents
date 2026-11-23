@@ -35,6 +35,7 @@ import {
   isClaudeFailoverEligible,
 } from "../providers";
 import { routerProviders, userCooldownFilePath, userProvidersSignature } from "../providers/store";
+import { isAnthropicStyle } from "../providers/adapters";
 import { readUserSettings, systemPackerOptionsFor } from "../providers/settings";
 import {
   CONSERVATIVE_CAPABILITIES,
@@ -283,6 +284,12 @@ export interface StartResult {
   limit?: number;
   /** Set when a request was refused (e.g. an unknown role id). */
   error?: string;
+  /**
+   * Names of required environment variables that are missing when the
+   * refusal is a server configuration error (names only, never values), so
+   * the API/UI can tell the operator exactly what to set.
+   */
+  missingEnv?: string[];
 }
 
 interface ActiveRun {
@@ -472,26 +479,107 @@ export function resolveApprovalBaseUrl(): string | null {
 }
 
 /**
+ * Names of the environment variables a real Docker run needs for its managed
+ * PreToolUse approval hook that are currently unset (names only, never
+ * values). Empty when the driver is not Docker or everything required is
+ * configured. In server mode SWARM_PUBLIC_ORIGIN is listed alongside
+ * SWARM_VM_APPROVAL_BASE_URL: either one makes the approval endpoint
+ * reachable from inside the VM, and the public origin is the one a server
+ * deployment normally sets.
+ */
+export function missingDockerApprovalEnv(vm: VmManager): string[] {
+  if (!(vm.driver instanceof DockerVmDriver)) return [];
+  const missing: string[] = [];
+  if (!resolveApprovalBaseUrl()) {
+    missing.push("SWARM_VM_APPROVAL_BASE_URL");
+    if (serverMode()) missing.push("SWARM_PUBLIC_ORIGIN");
+  }
+  if (!process.env.SWARM_SESSION_SECRET?.trim()) missing.push("SWARM_SESSION_SECRET");
+  return missing;
+}
+
+/**
  * Return an actionable startup error when any real Docker run would start
  * the managed PreToolUse hook without any way to reach or authenticate to its
  * approval endpoint. Never fall back to the legacy post-hoc stdout gate here:
  * the managed hook has already denied the tool before stdout could be gated.
  */
 export function localDockerApprovalConfigurationError(vm: VmManager): string | null {
-  if (!(vm.driver instanceof DockerVmDriver)) return null;
-  const missing: string[] = [];
-  if (!resolveApprovalBaseUrl()) missing.push("SWARM_VM_APPROVAL_BASE_URL");
-  if (!process.env.SWARM_SESSION_SECRET?.trim()) missing.push("SWARM_SESSION_SECRET");
+  const missing = missingDockerApprovalEnv(vm);
   if (missing.length === 0) return null;
   return (
     `Docker VM startup configuration error: ${missing.join(" and ")} must be configured. ` +
     "The managed VM image always enables its PreToolUse approval hook, so running without " +
     "a reachable authenticated approval endpoint would deny every non-allowlisted tool. " +
-    "Set SWARM_VM_APPROVAL_BASE_URL to an origin reachable from inside the VM and " +
-    "SWARM_SESSION_SECRET to sign its per-run token. Do not use the VM's 127.0.0.1 or " +
-    "localhost for the host app: Docker Desktop normally uses host.docker.internal, while " +
-    "Linux normally uses the Docker bridge gateway IP. See README.md for listener requirements."
+    "Set SWARM_VM_APPROVAL_BASE_URL (or, in server mode, SWARM_PUBLIC_ORIGIN) to an origin " +
+    "reachable from inside the VM and SWARM_SESSION_SECRET to sign its per-run token. " +
+    "Do not use the VM's 127.0.0.1 or localhost for the host app: Docker Desktop normally " +
+    "uses host.docker.internal, while Linux normally uses the Docker bridge gateway IP. " +
+    "See README.md for listener requirements."
   );
+}
+
+/**
+ * Names of the environment variables that would enable the server-side LLM
+ * proxy for VM runs, when none of them is set in server mode (names only,
+ * never values). Empty in local mode (direct provider mode is the legacy
+ * local behavior) and whenever a proxy base URL already resolves.
+ */
+export function missingLlmProxyEnv(): string[] {
+  if (!serverMode()) return [];
+  if (resolveLlmBaseUrl()) return [];
+  return ["SWARM_VM_LLM_BASE_URL", "SWARM_PUBLIC_ORIGIN"];
+}
+
+/** Actionable error for a non-Anthropic-wire provider in server-mode direct mode. */
+function directModeErrorMessage(providerId: string): string {
+  const missing = missingLlmProxyEnv();
+  const names = (
+    missing.length > 0 ? missing : ["SWARM_VM_LLM_BASE_URL", "SWARM_PUBLIC_ORIGIN"]
+  ).join(" and ");
+  return (
+    `LLM proxy configuration error: ${names} must be configured ` +
+    `in server mode. The selected provider (${providerId}) does not speak the Anthropic ` +
+    "Messages API, so the VM's Claude CLI cannot call it directly, and direct mode would " +
+    "place the raw provider key in the VM environment. Set SWARM_PUBLIC_ORIGIN to the " +
+    "public site origin (or SWARM_VM_LLM_BASE_URL to an origin reachable from inside the " +
+    "VM) so runs use the server-side LLM proxy."
+  );
+}
+
+/**
+ * In server mode, direct provider mode (no LLM proxy base URL) is only safe
+ * for providers that speak the Anthropic Messages API: the VM's Claude CLI
+ * speaks only that wire format, so an OpenAI-style provider is unreachable
+ * directly, and the raw per-user key would enter the VM environment,
+ * defeating the host-proxied design. Returns an actionable error naming the
+ * missing variables when a real Docker run's effective (first usable)
+ * provider is not Anthropic-wire and no proxy base URL is configured. Local
+ * mode and non-Docker drivers are unchanged: direct mode remains the legacy
+ * local behavior there, and only a real VM ever receives the provider env.
+ */
+export function directModeConfigurationError(
+  vm: VmManager,
+  userId: string,
+  model?: string,
+): string | null {
+  if (!(vm.driver instanceof DockerVmDriver)) return null;
+  if (missingLlmProxyEnv().length === 0) return null;
+  let providerId: string;
+  try {
+    const candidates = orderLlmCandidates(routerProviders(userId), model, {
+      preferFree: readUserSettings(userId).preferFreeProviders,
+    });
+    // Mirror selectForClaude: providers without a usable key are skipped.
+    const first = candidates.find((c) => (c.config.keys?.length ?? 0) > 0);
+    if (!first || isAnthropicStyle(first.config)) return null;
+    providerId = first.config.id;
+  } catch {
+    // A broken provider store must not invent a configuration error here;
+    // the usual "no providers" path reports it.
+    return null;
+  }
+  return directModeErrorMessage(providerId);
 }
 
 /** Throw the local Docker approval startup error, if one applies. */
@@ -1383,7 +1471,23 @@ export class RuntimeManager {
   ): StartResult {
     const configurationError = localDockerApprovalConfigurationError(this.vm);
     if (configurationError) {
-      return { accepted: false, runId: "", queued: false, error: configurationError };
+      return {
+        accepted: false,
+        runId: "",
+        queued: false,
+        error: configurationError,
+        missingEnv: missingDockerApprovalEnv(this.vm),
+      };
+    }
+    const directModeError = directModeConfigurationError(this.vm, userId, input.model);
+    if (directModeError) {
+      return {
+        accepted: false,
+        runId: "",
+        queued: false,
+        error: directModeError,
+        missingEnv: missingLlmProxyEnv(),
+      };
     }
     // FIX-44: in server mode an unverified local account cannot start
     // runs — accounts consume VM compute, so open sign-ups must prove
@@ -2464,6 +2568,33 @@ export class RuntimeManager {
           });
         }
         return { switched: false };
+      }
+
+      // Fail closed in server mode: without a proxy base URL (or a run token
+      // to authenticate to it) the selection's raw env — provider key
+      // included — would enter the VM, and a non-Anthropic-wire provider is
+      // unreachable from the VM's Claude CLI anyway. start() rejects this
+      // configuration up front; this guard covers failover onto a
+      // non-Anthropic provider and env changes while a run was queued.
+      if (
+        serverMode() &&
+        this.vm.driver instanceof DockerVmDriver &&
+        (!llmBaseUrl || !runToken)
+      ) {
+        const config = routerProviders(userId).find((c) => c.id === selection.provider);
+        if (!config || !isAnthropicStyle(config)) {
+          const message = directModeErrorMessage(selection.provider);
+          selection.release();
+          if (this.isStillActive(runId, userId)) {
+            const errorEvent: { type: "run.error"; message: string } = {
+              type: "run.error",
+              message,
+            };
+            this.bus.publish(runId, errorEvent);
+            this.finalize(runId, { status: "error", error: message });
+          }
+          return { switched: false };
+        }
       }
 
       // OpenAI-format providers have no /v1/messages; route them through the

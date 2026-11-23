@@ -60,28 +60,71 @@ export interface RoleClamp {
   maxDeadlineMs?: number;
 }
 
-/** Tools that mutate files. */
+/**
+ * Canonical key for a tool name, for the permission checks below: lowercased
+ * with separators removed, so "write_file", "Write", "WRITE" and "write-file"
+ * all classify the same way. A few engine names need an explicit alias
+ * because the separator-stripped form still differs from the Claude Code
+ * name ("write_file" -> "writefile" vs "Write" -> "write"). Without this,
+ * any spelling that is not an exact set member slips past readOnly /
+ * commandExecutionAllowed / networkAllowed — a fail-open hole for every
+ * differently-cased or snake_case alias of a guarded tool.
+ */
+const TOOL_ALIASES: Readonly<Record<string, string>> = {
+  writefile: "write",
+  editfile: "edit",
+  restorecheckpoint: "checkpoint",
+};
+
+export function normalizeToolName(toolName: string): string {
+  const compact = toolName.toLowerCase().replace(/[\s_-]+/g, "");
+  return TOOL_ALIASES[compact] ?? compact;
+}
+
+/**
+ * Tools that mutate files, by canonical key (see {@link normalizeToolName}).
+ * Covers the engine snake_case names, the Claude Code PascalCase names, and
+ * the vendored-engine spellings: write_file/Write, edit_file/Edit,
+ * multi_edit/MultiEdit, NotebookEdit, str_replace, replace_lines, and
+ * restore_checkpoint/Checkpoint (a restore rewrites files, so readOnly
+ * blocks it too).
+ */
 const EDIT_TOOLS: ReadonlySet<string> = new Set([
-  "str_replace",
-  "multi_edit",
-  "replace_lines",
-  "write_file",
+  "write",
+  "edit",
+  "multiedit",
+  "notebookedit",
+  "strreplace",
+  "replacelines",
+  "checkpoint",
 ]);
 
-/** Tools that execute commands. */
+/** Tools that execute commands, by canonical key. */
 const EXEC_TOOLS: ReadonlySet<string> = new Set(["bash"]);
 
-/** Tools that reach the network. */
+/**
+ * Tools that reach the network, by canonical key. MCP server tools
+ * (mcp__<server>__<tool>) are matched by prefix in {@link isNetworkTool},
+ * not listed here.
+ */
 const NETWORK_TOOLS: ReadonlySet<string> = new Set([
-  "web_fetch",
-  "web_search",
+  "webfetch",
+  "websearch",
   "browser",
   "mcp",
-  "mcp_call",
-  "mcp_search",
-  "integrations_search",
-  "integrations_install",
+  "mcpcall",
+  "mcpsearch",
+  "integrationssearch",
+  "integrationsinstall",
+  "apirequest",
 ]);
+
+/** Helper to test if a tool reaches the network (including mcp__* servers). */
+function isNetworkTool(toolName: string): boolean {
+  if (NETWORK_TOOLS.has(normalizeToolName(toolName))) return true;
+  if (toolName.toLowerCase().startsWith("mcp__")) return true;
+  return false;
+}
 
 /** Effective turn ceiling: `modelConfig.maxTurns` wins over the shorthand `maxTurns`. */
 export function roleMaxTurns(role: RoleClamp | undefined): number | undefined {
@@ -99,15 +142,30 @@ export function roleDeadlineMs(role: RoleClamp | undefined): number | undefined 
  * least 1.
  */
 export function clampedTurnCeiling(role: RoleClamp | undefined, globalMax: number): number {
-  const roleMax = roleMaxTurns(role);
-  const floorGlobal = Math.max(1, Math.floor(globalMax));
-  if (roleMax !== undefined) return Math.max(1, Math.min(roleMax, floorGlobal));
-  return floorGlobal;
+  const roleRaw = roleMaxTurns(role);
+  const roleMax =
+    typeof roleRaw === "number" && Number.isFinite(roleRaw)
+      ? Math.max(1, Math.floor(roleRaw))
+      : undefined;
+
+  const validGlobal =
+    typeof globalMax === "number" && Number.isFinite(globalMax)
+      ? Math.max(1, Math.floor(globalMax))
+      : 1;
+
+  if (roleMax !== undefined) {
+    return Math.max(1, Math.min(roleMax, validGlobal));
+  }
+  return validGlobal;
 }
 
 /**
  * Clamp the absolute deadline to the role-defined relative deadline. The
- * role's deadline is measured from `cycleStartMs`.
+ * role's deadline is measured from `cycleStartMs`. A relative deadline must
+ * be a finite, positive duration and the global deadline a finite, positive
+ * epoch time — anything else (NaN, Infinity, <= 0) is ignored as if it were
+ * unset, so a bad value can never produce a NaN, infinite, or already-past
+ * deadline. A non-finite cycle start is treated as 0.
  */
 export function clampedDeadlineMs(
   role: RoleClamp | undefined,
@@ -115,21 +173,28 @@ export function clampedDeadlineMs(
   cycleStartMs: number,
 ): number | undefined {
   const relative = roleDeadlineMs(role);
-  if (relative !== undefined && globalDeadlineMs !== undefined) {
-    return Math.min(cycleStartMs + relative, globalDeadlineMs);
+  const validRelative =
+    typeof relative === "number" && Number.isFinite(relative) && relative > 0 ? relative : undefined;
+  const validGlobal =
+    typeof globalDeadlineMs === "number" && Number.isFinite(globalDeadlineMs) && globalDeadlineMs > 0
+      ? globalDeadlineMs
+      : undefined;
+  const start = Number.isFinite(cycleStartMs) ? cycleStartMs : 0;
+
+  if (validRelative !== undefined && validGlobal !== undefined) {
+    return Math.min(start + validRelative, validGlobal);
   }
-  if (relative !== undefined) return cycleStartMs + relative;
-  return globalDeadlineMs;
+  if (validRelative !== undefined) return start + validRelative;
+  return validGlobal;
 }
 
-/** Filter a tool list by the role's allowedTools whitelist. */
+/** Filter a tool list by the role's allowedTools whitelist and permission flags. */
 export function filteredTools<T extends { name: string }>(
   role: RoleClamp | undefined,
   tools: readonly T[],
 ): readonly T[] {
-  if (!role?.allowedTools?.length) return tools;
-  const ok = new Set(role.allowedTools);
-  return tools.filter((t) => ok.has(t.name));
+  if (!role) return tools;
+  return tools.filter((t) => isToolAllowed(role, t.name));
 }
 
 /** Return true if the tool name is allowed by the role (whitelist + permissions). */
@@ -151,13 +216,17 @@ export function toolDenialReason(
     return `tool "${toolName}" is not in the "${role.id}" role whitelist`;
   }
   const perms = role.permissions;
-  if (perms?.readOnly === true && EDIT_TOOLS.has(toolName)) {
+  // Permission checks run on the normalized name: the whitelist above stays
+  // an exact match (fail-closed), but a permission flag must not be dodged
+  // by spelling the same tool differently ("WRITE", "write_file", "webfetch").
+  const key = normalizeToolName(toolName);
+  if (perms?.readOnly === true && EDIT_TOOLS.has(key)) {
     return `role "${role.id}" is read-only and cannot use "${toolName}"`;
   }
-  if (perms?.commandExecutionAllowed === false && EXEC_TOOLS.has(toolName)) {
+  if (perms?.commandExecutionAllowed === false && EXEC_TOOLS.has(key)) {
     return `role "${role.id}" is not permitted to execute commands ("${toolName}")`;
   }
-  if (perms?.networkAllowed === false && NETWORK_TOOLS.has(toolName)) {
+  if (perms?.networkAllowed === false && isNetworkTool(toolName)) {
     return `role "${role.id}" is not permitted to use the network ("${toolName}")`;
   }
   return undefined;
@@ -192,11 +261,26 @@ export function assertToolAllowed(role: RoleClamp | undefined, toolName: string)
 }
 
 /** Clamp the provider max_tokens to the role's modelConfig.maxTokens. */
-export function clampedMaxTokens(role: RoleClamp | undefined, globalMaxTokens: number): number {
-  if (role?.modelConfig?.maxTokens !== undefined) {
-    return Math.min(role.modelConfig.maxTokens, globalMaxTokens);
+export function clampedMaxTokens(
+  role: RoleClamp | undefined,
+  globalMaxTokens: number | undefined,
+): number | undefined {
+  const roleRaw = role?.modelConfig?.maxTokens;
+  const roleTokens =
+    typeof roleRaw === "number" && Number.isFinite(roleRaw) && roleRaw > 0
+      ? Math.floor(roleRaw)
+      : undefined;
+
+  const validGlobal =
+    typeof globalMaxTokens === "number" && Number.isFinite(globalMaxTokens) && globalMaxTokens > 0
+      ? Math.floor(globalMaxTokens)
+      : undefined;
+
+  if (roleTokens !== undefined && validGlobal !== undefined) {
+    return Math.min(roleTokens, validGlobal);
   }
-  return globalMaxTokens;
+  if (roleTokens !== undefined) return roleTokens;
+  return validGlobal;
 }
 
 /** Clamp a per-turn timeout the way `withTurnTimeout` would. */
@@ -204,12 +288,22 @@ export function clampedTurnTimeoutMs(
   role: RoleClamp | undefined,
   globalTimeoutMs: number | undefined,
 ): number | undefined {
-  const roleTimeout = role?.modelConfig?.turnTimeoutMs;
-  if (roleTimeout !== undefined && globalTimeoutMs !== undefined) {
-    return Math.min(roleTimeout, globalTimeoutMs);
+  const roleRaw = role?.modelConfig?.turnTimeoutMs;
+  const roleTimeout =
+    typeof roleRaw === "number" && Number.isFinite(roleRaw) && roleRaw > 0
+      ? Math.floor(roleRaw)
+      : undefined;
+
+  const validGlobal =
+    typeof globalTimeoutMs === "number" && Number.isFinite(globalTimeoutMs) && globalTimeoutMs > 0
+      ? Math.floor(globalTimeoutMs)
+      : undefined;
+
+  if (roleTimeout !== undefined && validGlobal !== undefined) {
+    return Math.min(roleTimeout, validGlobal);
   }
   if (roleTimeout !== undefined) return roleTimeout;
-  return globalTimeoutMs;
+  return validGlobal;
 }
 
 /** The role's appended system prompt, when set. */
@@ -265,7 +359,7 @@ export function applyRoleToLoopDeps<T extends RoleLoopSlice>(deps: T, now = deps
 
   const maxTurns = clampedTurnCeiling(role, deps.budget.max_turns_per_cycle);
   const deadlineMs = clampedDeadlineMs(role, deps.deadlineMs, now);
-  const maxTokens = clampedMaxTokens(role, deps.maxTokens);
+  const maxTokens = clampedMaxTokens(role, deps.maxTokens) ?? deps.maxTokens;
   const tools = filteredTools(role, deps.tools);
   const turnTimeoutMs = clampedTurnTimeoutMs(role, deps.turnTimeoutMs);
 
@@ -336,10 +430,10 @@ export interface AppliedRoleRun {
  * Apply a role's clamps to a {@link RunRequest}.
  *
  * - With no role the original request is returned unchanged (same reference).
- * - The role's `allowedTools` whitelist narrows `request.rolePhase.allowedTools`
+ * - The role's whitelist and permission flags narrow `request.rolePhase.allowedTools`
  *   (a copy is returned only when something is actually removed).
  * - Turn / deadline / token / timeout clamps are resolved against the supplied
- *   global limits (a limit is reported only when a global or role value exists).
+ *   global limits (a limit is reported whenever a global or role value exists).
  * - Every tool the role would reject is reported in `denials` with its reason.
  */
 export function applyRoleToRunRequest(
@@ -352,28 +446,30 @@ export function applyRoleToRunRequest(
   const now = opts.cycleStartMs ?? 0;
 
   const limits: RunLimits = {};
-  if (opts.globalMaxTurns !== undefined) {
-    limits.maxTurns = clampedTurnCeiling(role, opts.globalMaxTurns);
+  if (opts.globalMaxTurns !== undefined || roleMaxTurns(role) !== undefined) {
+    const defaultGlobal = opts.globalMaxTurns ?? Number.MAX_SAFE_INTEGER;
+    const maxTurns = clampedTurnCeiling(role, defaultGlobal);
+    if (maxTurns !== undefined) limits.maxTurns = maxTurns;
   }
   if (opts.globalDeadlineMs !== undefined || roleDeadlineMs(role) !== undefined) {
     const deadlineMs = clampedDeadlineMs(role, opts.globalDeadlineMs, now);
     if (deadlineMs !== undefined) limits.deadlineMs = deadlineMs;
   }
-  if (opts.globalMaxTokens !== undefined) {
-    limits.maxTokens = clampedMaxTokens(role, opts.globalMaxTokens);
+  if (opts.globalMaxTokens !== undefined || role.modelConfig?.maxTokens !== undefined) {
+    const maxTokens = clampedMaxTokens(role, opts.globalMaxTokens);
+    if (maxTokens !== undefined) limits.maxTokens = maxTokens;
   }
   if (opts.globalTurnTimeoutMs !== undefined || role.modelConfig?.turnTimeoutMs !== undefined) {
     const turnTimeoutMs = clampedTurnTimeoutMs(role, opts.globalTurnTimeoutMs);
     if (turnTimeoutMs !== undefined) limits.turnTimeoutMs = turnTimeoutMs;
   }
 
-  // Narrow the request's role tool surface to the whitelist.
+  // Narrow the request's role tool surface to allowed tools (whitelist + permissions).
   let next = request;
   let changed = false;
   const phase = request.rolePhase;
-  if (phase && role.allowedTools?.length) {
-    const allowed = new Set(role.allowedTools);
-    const filtered = phase.allowedTools.filter((t) => allowed.has(t));
+  if (phase) {
+    const filtered = phase.allowedTools.filter((tool) => isToolAllowed(role, tool));
     if (filtered.length !== phase.allowedTools.length) {
       next = { ...request, rolePhase: { ...phase, allowedTools: filtered } };
       changed = true;

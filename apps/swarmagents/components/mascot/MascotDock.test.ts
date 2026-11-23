@@ -32,3 +32,14 @@ test("the dock renders the SVG variant when asked", async () => {
   assert.ok(html.includes('data-mascot-state="wave"'), "first load still waves hello");
   assert.ok(html.includes("Click Jimmy to wave hello"), "the greeting is clickable");
 });
+
+
+test("the SVG greeting uses the full SVG wave segment, not the sprite duration", async () => {
+  const { mascotWaveDurationMs } = await import("./MascotDock");
+  const { MASCOT_HELLO_MS } = await import("./frames");
+  const { segmentSeconds } = await import("./svg-timeline");
+  assert.equal(segmentSeconds("wave"), 3);
+  assert.equal(mascotWaveDurationMs("svg"), 3000);
+  assert.equal(mascotWaveDurationMs("sprite"), MASCOT_HELLO_MS);
+  assert.notEqual(mascotWaveDurationMs("svg"), MASCOT_HELLO_MS);
+});

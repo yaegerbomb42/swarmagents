@@ -26,7 +26,7 @@ const HAS_PYTHON = REAL_PYTHON.length > 0;
 async function workerSource(): Promise<string> {
   const res = await GET(new NextRequest("http://localhost/api/computers/node/install?os=linux"));
   const script = await res.text();
-  const marker = "exec python3 - \"$SERVER\" \"$CID\" \"$TOKEN\" \"$OS\" \"$ARCH\" \"$MODE\" <<'PY'\n";
+  const marker = "exec python3 - \"$OS\" \"$ARCH\" \"$MODE\" <<'PY'\n";
   const start = script.indexOf(marker);
   assert.ok(start >= 0, "worker heredoc marker not found in the install script");
   const bodyStart = start + marker.length;
@@ -88,7 +88,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif action == "heartbeat":
             self._send({"ok": True, "computer": {"id": "cmp_test"}})
         elif action == "complete":
-            self._send({"ok": True})
+            if BEHAVIOR.get("failCompleteCount", 0) > 0:
+                BEHAVIOR["failCompleteCount"] -= 1
+                self._send({"error": "temporary network error"}, 500)
+            else:
+                self._send({"ok": True})
         else:
             self._send({"error": "unknown action"}, 400)
 
@@ -154,6 +158,20 @@ function writeFakeClaude(dir: string, body: string): void {
   fs.writeFileSync(path.join(binDir, "claude"), body, { mode: 0o755 });
 }
 
+/** The worker reads its credentials from ~/.swarmagents/computer.json (never argv). */
+function writeWorkerConfig(dir: string, port: number): void {
+  const configDir = path.join(dir, ".swarmagents");
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(configDir, "computer.json"),
+    JSON.stringify({
+      computerId: "cmp_test",
+      nodeToken: "ab".repeat(32),
+      server: `http://127.0.0.1:${port}`,
+    }),
+  );
+}
+
 /** Spawn the worker and wait until `condition(requests)` holds or the timeout hits. */
 async function spawnWorkerUntil(
   dir: string,
@@ -163,10 +181,11 @@ async function spawnWorkerUntil(
 ): Promise<{ worker: ReturnType<typeof spawn>; requests: Array<{ action: string | null; body: any }> }> {
   const workerPath = path.join(dir, "worker.py");
   fs.writeFileSync(workerPath, await workerSource());
+  writeWorkerConfig(dir, port);
   const worker = spawn(
     REAL_PYTHON,
-    [workerPath, `http://127.0.0.1:${port}`, "cmp_test", "ab".repeat(32), "linux", "x86_64", "host"],
-    { env: { ...process.env, PATH: `${path.join(dir, "bin")}:${process.env.PATH ?? ""}` }, stdio: "ignore" },
+    [workerPath, "linux", "x86_64", "host"],
+    { env: { ...process.env, HOME: dir, PATH: `${path.join(dir, "bin")}:${process.env.PATH ?? ""}` }, stdio: "ignore" },
   );
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -212,6 +231,25 @@ test("verbose tool runs flush events as batches, not one blocking POST per line"
   }
 });
 
+test("the worker refuses to start without its config file", { skip: !HAS_PYTHON }, async () => {
+  const dir = tmp();
+  try {
+    const workerPath = path.join(dir, "worker.py");
+    fs.writeFileSync(workerPath, await workerSource());
+    // No ~/.swarmagents/computer.json under this HOME: the worker must fail
+    // closed instead of running with empty credentials.
+    const result = spawnSync(
+      REAL_PYTHON,
+      [workerPath, "linux", "x86_64", "host"],
+      { env: { ...process.env, HOME: dir }, encoding: "utf8", timeout: 15_000 },
+    );
+    assert.notEqual(result.status, 0, "the worker must not start without its config");
+    assert.match(String(result.stderr), /computer config missing/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a revoked node (HTTP 401) exits the daemon instead of looping forever", { skip: !HAS_PYTHON }, async () => {
   const dir = tmp();
   const server = startFakeServer(dir, { return401: true });
@@ -219,11 +257,12 @@ test("a revoked node (HTTP 401) exits the daemon instead of looping forever", { 
     await waitForServer(server.port);
     const workerPath = path.join(dir, "worker.py");
     fs.writeFileSync(workerPath, await workerSource());
+    writeWorkerConfig(dir, server.port);
     const started = Date.now();
     const result = spawnSync(
       REAL_PYTHON,
-      [workerPath, `http://127.0.0.1:${server.port}`, "cmp_test", "ab".repeat(32), "linux", "x86_64", "host"],
-      { env: { ...process.env }, encoding: "utf8", timeout: 15_000 },
+      [workerPath, "linux", "x86_64", "host"],
+      { env: { ...process.env, HOME: dir }, encoding: "utf8", timeout: 15_000 },
     );
     assert.ok(!result.error, `worker must exit on its own, got: ${result.error}`);
     assert.ok(Date.now() - started < 15_000, "the worker survived until the test timeout instead of exiting on 401");
@@ -265,6 +304,36 @@ test("SIGTERM terminates the claude child instead of orphaning it", { skip: !HAS
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     assert.ok(claudeGone, "the claude child must be terminated with the worker");
+  } finally {
+    server.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("complete() retries on transient 500 error and eventually succeeds", { skip: !HAS_PYTHON }, async () => {
+  const dir = tmp();
+  // Fail the first complete() attempt with 500, succeeding on the second
+  const server = startFakeServer(dir, { claimOnce: true, failCompleteCount: 1 });
+  try {
+    await waitForServer(server.port);
+    const claude =
+      "#!/bin/sh\n" +
+      "python3 - <<'FAKE'\n" +
+      "import json\n" +
+      'print(json.dumps({"type":"system","subtype":"init","session_id":"sess_fake","model":"claude-sonnet-5-5"}), flush=True)\n' +
+      'print(json.dumps({"type":"result","subtype":"success","session_id":"sess_fake","total_cost_usd":0.01,"duration_ms":100,"num_turns":1}), flush=True)\n' +
+      "FAKE\n";
+    writeFakeClaude(dir, claude);
+    const { worker } = await spawnWorkerUntil(
+      dir,
+      server.port,
+      (requests) => requests.filter((r) => r.action === "complete").length >= 2,
+      15_000,
+    );
+    worker.kill("SIGKILL");
+    const requests = readRequests(dir);
+    const completeRequests = requests.filter((r) => r.action === "complete");
+    assert.ok(completeRequests.length >= 2, `expected at least 2 complete attempts, got ${completeRequests.length}`);
   } finally {
     server.stop();
     fs.rmSync(dir, { recursive: true, force: true });

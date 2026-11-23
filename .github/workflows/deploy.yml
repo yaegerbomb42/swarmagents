@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   gates:
-    name: Gates (typecheck + unit tests)
+    name: Gates (typecheck + unit tests + lint + build)
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.action == 'deploy' && !inputs.skip_gates) }}
     runs-on: ubuntu-latest
     defaults:
@@ -47,6 +47,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run test:unit
+      - run: npm run lint
+      - run: npm run build
 
   ship:
     name: Run ${{ inputs.action || 'deploy' }} on the VPS
@@ -70,6 +72,9 @@ jobs:
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_SSH_KEY: ${{ env.HOME }}/.ssh/swarm_deploy
-          DEPLOY_KNOWN_HOSTS: ${{ env.HOME }}/.ssh/swarm_known_hosts
-        run: ./deploy.sh "${{ inputs.action || 'deploy' }}"
+        run: |
+          # Resolve key paths from the runner's real $HOME (the `${{ env.HOME }}`
+          # expression is empty in this context and yields a bad path).
+          export DEPLOY_SSH_KEY="$HOME/.ssh/swarm_deploy"
+          export DEPLOY_KNOWN_HOSTS="$HOME/.ssh/swarm_known_hosts"
+          ./deploy.sh "${{ inputs.action || 'deploy' }}"

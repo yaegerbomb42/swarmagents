@@ -3,6 +3,18 @@ interface QueuedTask {
   taskId: string;
   canRunNow: () => boolean;
   start: () => void;
+  reject: (err: Error) => void;
+  settled: boolean;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+export class QueueWaitTimeoutError extends Error {
+  readonly code = "QUEUE_WAIT_TIMEOUT";
+
+  constructor(message = "Timed out waiting for a fair-queue slot") {
+    super(message);
+    this.name = "QueueWaitTimeoutError";
+  }
 }
 
 /**
@@ -13,6 +25,10 @@ interface QueuedTask {
  * `globalMaxConcurrent` slots until its owner calls the release function it
  * was handed — i.e. for the whole upstream LLM call, not just for the time
  * it takes to pick a route.
+ *
+ * A task may pass `waitTimeoutMs`: if it has not been dispatched by then it
+ * is dequeued and its promise rejects with QueueWaitTimeoutError, instead of
+ * waiting forever behind a slot whose release was leaked.
  */
 export class FairTenantQueue {
   private readonly queues = new Map<string, QueuedTask[]>();
@@ -39,12 +55,18 @@ export class FairTenantQueue {
    * synchronously at dispatch time) and a `release` that frees the global
    * slot. `run` receives that release too, and may call it right away (for
    * example when no route was found and nothing will be sent upstream).
+   *
+   * With `opts.waitTimeoutMs`, a task still queued when the timeout expires
+   * is dequeued and the promise rejects with QueueWaitTimeoutError. The
+   * timeout covers queueing only — once dispatched, the slot is held until
+   * `release` as before.
    */
   enqueue<T>(
     userId: string,
     taskId: string,
     canRunNow: () => boolean,
     run: (release: () => void) => T,
+    opts?: { waitTimeoutMs?: number },
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       let userQueue = this.queues.get(userId);
@@ -53,11 +75,15 @@ export class FairTenantQueue {
         this.queues.set(userId, userQueue);
         this.userOrder.push(userId);
       }
-      userQueue.push({
+      const task: QueuedTask = {
         userId,
         taskId,
         canRunNow,
+        settled: false,
+        reject,
         start: () => {
+          task.settled = true;
+          if (task.timer !== undefined) clearTimeout(task.timer);
           let released = false;
           const release = () => {
             if (released) return;
@@ -72,13 +98,38 @@ export class FairTenantQueue {
             reject(err);
           }
         },
-      });
+      };
+      const waitTimeoutMs = opts?.waitTimeoutMs;
+      // Only finite timeouts arm a timer: setTimeout(Infinity) fires almost
+      // immediately in Node, which would invert the caller's intent.
+      if (waitTimeoutMs !== undefined && Number.isFinite(waitTimeoutMs)) {
+        task.timer = setTimeout(() => this.expireTask(task, waitTimeoutMs), waitTimeoutMs);
+      }
+      userQueue.push(task);
       this.drain();
     });
   }
 
   /** Re-check queued tasks (e.g. after a per-user or per-key slot freed up). */
   notifyCapacityAvailable(): void {
+    this.drain();
+  }
+
+  private expireTask(task: QueuedTask, waitTimeoutMs: number): void {
+    if (task.settled) return;
+    task.settled = true;
+    const queue = this.queues.get(task.userId);
+    if (queue) {
+      const index = queue.indexOf(task);
+      if (index >= 0) queue.splice(index, 1);
+      if (queue.length === 0) this.removeUser(task.userId);
+    }
+    task.reject(
+      new QueueWaitTimeoutError(
+        `Task ${task.taskId} timed out after ${waitTimeoutMs}ms waiting for a slot`,
+      ),
+    );
+    // Removing a blocked head task can make the next task dispatchable.
     this.drain();
   }
 

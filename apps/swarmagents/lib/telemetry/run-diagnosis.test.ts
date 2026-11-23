@@ -10,7 +10,11 @@ import assert from "node:assert/strict";
 import { diagnoseRun, formatFindings, findingsJson, MAX_FINDINGS, type RunFinding } from "./run-diagnosis";
 import type { RunEvent } from "./efficiency";
 
-function turn(n: number, ts: number, tokens: { cacheRead: number; uncached: number } = { cacheRead: 1000, uncached: 200 }): RunEvent {
+function turn(
+  n: number,
+  ts: number,
+  tokens: { cacheRead: number; uncached: number; cacheWrite?: number } = { cacheRead: 1000, uncached: 200 },
+): RunEvent {
   return { type: "turn", turn: n, ts, tokens, ms: 100 };
 }
 
@@ -151,4 +155,68 @@ test("findingsJson embeds run id and ranked findings", () => {
   assert.equal(parsed.findings[0].rank, 1);
   assert.equal(parsed.findings[0].kind, "idle");
   assert.deepEqual(parsed.findings[0].turns, [1]);
+});
+
+
+test("read, read, edit still reports the repeated read before the edit clears it", () => {
+  const events: RunEvent[] = [
+    turn(1, 1000),
+    readCall("a.ts", 2000),
+    readCall("a.ts", 3000),
+    toolCall("str_replace", 4000, { input: { path: "a.ts" } }),
+  ];
+  const f = findingOf(events, "repeated-read");
+  assert.ok(f, "the edit must not erase the repeated-read finding");
+  assert.deepEqual(f!.turns, [1]);
+});
+
+test("multi_edit clears every edited path (top-level and per-edit)", () => {
+  const events: RunEvent[] = [
+    turn(1, 1000),
+    readCall("a.ts", 2000),
+    readCall("a.ts", 3000),
+    readCall("b.ts", 3500),
+    readCall("b.ts", 3600),
+    toolCall("multi_edit", 4000, {
+      input: { edits: [{ path: "a.ts" }, { path: "b.ts" }] },
+    }),
+  ];
+  const repeated = diagnoseRun(events).filter((f) => f.kind === "repeated-read");
+  assert.equal(repeated.length, 2, "both edited paths are cleared");
+});
+
+test("turn-1 cacheWrite counts toward the previous prompt for the turn-2 dip", () => {
+  const events: RunEvent[] = [
+    turn(1, 1000, { cacheRead: 100, uncached: 100, cacheWrite: 1000 }),
+    turn(2, 2000, { cacheRead: 100, uncached: 100 }),
+  ];
+  const f = findingOf(events, "cache-dip");
+  assert.ok(f, "a 1000-token cache write makes the next 100-token read a dip");
+  assert.deepEqual(f!.turns, [2]);
+});
+
+test("mixed explicit and implicit turn numbers never move backwards", () => {
+  const events: RunEvent[] = [
+    turn(5, 1000),
+    { type: "turn", ts: 2000, ms: 100, tokens: { cacheRead: 1000, uncached: 200 } },
+    readCall("a.ts", 3000),
+    turn(7, 4000),
+  ];
+  const f = findingOf(events, "single-call-explore");
+  assert.ok(f, "expected a single-call-explore finding");
+  assert.deepEqual(f!.turns, [6], "the implicit turn after 5 is 6, not 1");
+});
+
+test("aggregated repeat findings leave slots for bookkeeping and gates", () => {
+  const events: RunEvent[] = [turn(1, 0)];
+  for (let i = 1; i <= 6; i++) {
+    events.push(turn(i + 1, i * 100));
+    events.push(readCall(`f${i}.ts`, i * 100 + 10));
+  }
+  events.push(toolCall("todo", 800, {}), toolCall("todo", 810, {}), toolCall("todo", 820, {}));
+  events.push({ type: "loop.gates", ts: 900, ms: 4000 });
+  const kinds = new Set(diagnoseRun(events).map((f) => f.kind));
+  assert.ok(kinds.has("single-call-explore"));
+  assert.ok(kinds.has("bookkeeping"), "bookkeeping must not be crowded out by explore findings");
+  assert.ok(kinds.has("gate-time"), "gate-time must not be crowded out by explore findings");
 });

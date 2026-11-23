@@ -218,12 +218,13 @@ test("login success and failure are audit-logged without the password", async ()
   assert.equal(bad.status, 401);
 
   const entries = readAuditEntries("local_alice@example.com");
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0].action, "login.success");
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].action, "login.failure");
+  assert.equal(entries[0].target, "alice@example.com");
+  assert.equal(entries[1].action, "login.success");
+  // Failed logins are attributed to the targeted account, not "anonymous".
   const failed = readAuditEntries("anonymous");
-  assert.equal(failed.length, 1);
-  assert.equal(failed[0].action, "login.failure");
-  assert.equal(failed[0].target, "alice@example.com");
+  assert.equal(failed.length, 0);
   const raw = fs.readFileSync(path.join(dir, "audit.jsonl"), "utf8");
   assert.ok(!raw.includes("correct horse"), "audit log must never contain password material");
   assert.ok(!raw.includes("wrong password"), "audit log must never contain password material");
@@ -299,6 +300,70 @@ test("GET /api/audit paginates with before cursor and nextCursor", async () => {
     ["snap-0"],
   );
   assert.equal(page3.nextCursor, null);
+});
+
+test("GET /api/audit reaches matches older than the newest 1,000 rows when filtering", async () => {
+  // Entries 0..9 are login.success (oldest); 10..1009 are snapshot.create. The
+  // newest 1,000 rows are therefore all snapshot.create, so the ten login.success
+  // entries predate the old pre-filter truncation window and were unreachable.
+  const lines: string[] = [];
+  for (let i = 0; i < 1010; i++) {
+    const action = i < 10 ? "login.success" : "snapshot.create";
+    lines.push(
+      JSON.stringify({
+        ts: new Date(Date.UTC(2026, 0, 1, 0, 0, 0, i)).toISOString(),
+        user: "alice",
+        action,
+        target: `entry-${i}`,
+        result: "success",
+      }),
+    );
+  }
+  fs.appendFileSync(path.join(dir, "audit.jsonl"), `${lines.join("\n")}\n`, "utf8");
+
+  const collected: string[] = [];
+  let before = "";
+  for (let page = 0; page < 10; page++) {
+    const query = `?action=login.success&limit=2${before ? `&before=${before}` : ""}`;
+    const res = await auditGet("alice", query);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { entries: Array<{ target: string }>; nextCursor: number | null };
+    for (const entry of body.entries) collected.push(entry.target);
+    if (body.nextCursor === null) break;
+    before = String(body.nextCursor);
+  }
+  assert.equal(collected.length, 10, "all ten old matching entries are reachable");
+  assert.deepEqual(
+    [...collected].sort(),
+    Array.from({ length: 10 }, (_, i) => `entry-${i}`).sort(),
+  );
+});
+
+test("GET /api/audit never skips entries that share the cursor timestamp", async () => {
+  const sameTs = new Date(Date.UTC(2026, 0, 1, 0, 0, 0, 123));
+  const lines = Array.from({ length: 6 }, (_, i) =>
+    JSON.stringify({
+      ts: sameTs.toISOString(),
+      user: "alice",
+      action: "snapshot.create",
+      target: `snap-${i}`,
+      result: "success",
+    }),
+  );
+  fs.appendFileSync(path.join(dir, "audit.jsonl"), `${lines.join("\n")}\n`, "utf8");
+
+  const page1 = (await (await auditGet("alice", "?limit=2")).json()) as {
+    entries: Array<{ target: string }>;
+    nextCursor: number | null;
+  };
+  // All six entries share one millisecond, so they must come back together rather
+  // than splitting a same-ms group and quietly dropping the remainder on resume.
+  assert.equal(page1.entries.length, 6);
+  assert.equal(page1.nextCursor, null);
+  assert.deepEqual(
+    new Set(page1.entries.map((entry) => entry.target)),
+    new Set(["snap-0", "snap-1", "snap-2", "snap-3", "snap-4", "snap-5"]),
+  );
 });
 
 test("GET /api/audit ndjson export returns attachment with one line per entry", async () => {

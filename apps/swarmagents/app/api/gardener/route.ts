@@ -13,6 +13,7 @@ import {
 } from "@/lib/gardener/store";
 import { runAutopilotTick } from "@/lib/gardener/tick";
 import { MAX_PINNED_REPOSITORIES, MAX_REPO_ROOT_LEN } from "@/lib/gardener/types";
+import { recordAudit } from "@/lib/audit";
 
 export const dynamic = "force-dynamic";
 
@@ -90,8 +91,15 @@ export async function POST(req: NextRequest) {
   }
 
   if (body.action === "setEnabled") {
+    const enabled = body.enabled === true;
     const state = updateUserGardener(id, (next) => {
-      next.enabled = body.enabled === true;
+      next.enabled = enabled;
+    });
+    recordAudit({
+      user: id,
+      action: "gardener.autopilot",
+      target: enabled ? "enabled" : "disabled",
+      result: "success",
     });
     return json(state);
   }

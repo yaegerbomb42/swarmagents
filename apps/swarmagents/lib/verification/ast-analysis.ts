@@ -136,12 +136,24 @@ export interface ExpectedAssertion {
   actual: string;
   /** 1-based line of the matcher call in the source text. */
   line: number;
+  /** True when the chain includes `.not` (`expect(x).not.toBe(y)`). */
+  negated: boolean;
+  /** `.resolves` / `.rejects` when present on the expect chain. */
+  modifier?: "resolves" | "rejects";
 }
 
 const EXPECT_MATCHERS = new Set(["toBe", "toEqual", "toStrictEqual"]);
 
 /** Literal expected values only: a non-literal (`toBe(SOME_CONST)`) cannot be compared by text. */
 function isLiteralExpected(node: ts.Node): boolean {
+  if (ts.isArrayLiteralExpression(node)) return node.elements.every((element) => isLiteralExpected(element));
+  if (ts.isObjectLiteralExpression(node)) {
+    // Only plain `key: literal` entries are comparable; shorthand, methods and
+    // spreads make the textual value unstable.
+    return node.properties.every(
+      (property) => ts.isPropertyAssignment(property) && isLiteralExpected(property.initializer),
+    );
+  }
   return (
     ts.isNumericLiteral(node) ||
     ts.isStringLiteral(node) ||
@@ -149,26 +161,52 @@ function isLiteralExpected(node: ts.Node): boolean {
     node.kind === ts.SyntaxKind.TrueKeyword ||
     node.kind === ts.SyntaxKind.FalseKeyword ||
     node.kind === ts.SyntaxKind.NullKeyword ||
-    ts.isArrayLiteralExpression(node) ||
-    ts.isObjectLiteralExpression(node) ||
     (ts.isPrefixUnaryExpression(node) &&
       (node.operator === ts.SyntaxKind.MinusToken || node.operator === ts.SyntaxKind.PlusToken) &&
       ts.isNumericLiteral(node.operand))
   );
 }
 
+interface ExpectChain {
+  root?: ts.CallExpression;
+  negated: boolean;
+  modifier?: "resolves" | "rejects";
+}
+
 /**
- * The `expect(...)` call a matcher chain hangs off (`expect(x).toBe` /
- * `expect(x).not.toBe`), or undefined when the chain does not root at one.
+ * The `expect(...)` call a matcher chain hangs off, plus the `.not` and
+ * `.resolves` / `.rejects` modifiers in the chain. Walking the whole chain is
+ * what lets the verifier notice `toBe(0)` -> `not.toBe(0)` as a changed
+ * expectation rather than an identical one.
  */
-function expectRoot(node: ts.Node): ts.CallExpression | undefined {
-  if (ts.isCallExpression(node)) {
-    const callee = node.expression;
-    if (ts.isIdentifier(callee) && callee.text === "expect") return node;
-    return undefined;
+function expectChain(node: ts.Node): ExpectChain {
+  let negated = false;
+  let modifier: "resolves" | "rejects" | undefined;
+  let current: ts.Node = node;
+  while (ts.isPropertyAccessExpression(current)) {
+    const name = current.name.text;
+    if (name === "not") negated = true;
+    else if (name === "resolves" || name === "rejects") modifier = name;
+    current = current.expression;
   }
-  if (ts.isPropertyAccessExpression(node)) return expectRoot(node.expression);
-  return undefined;
+  if (ts.isCallExpression(current)) {
+    const callee = current.expression;
+    if (ts.isIdentifier(callee) && callee.text === "expect") {
+      return { root: current, negated, modifier };
+    }
+  }
+  return { negated, modifier };
+}
+
+/** Split a call callee into its root identifier and the property chain below it. */
+function calleeChain(callee: ts.Expression): { name: string; modifiers: string[] } | undefined {
+  const modifiers: string[] = [];
+  let current: ts.Expression = callee;
+  while (ts.isPropertyAccessExpression(current)) {
+    modifiers.unshift(current.name.text);
+    current = current.expression;
+  }
+  return ts.isIdentifier(current) ? { name: current.text, modifiers } : undefined;
 }
 
 /**
@@ -189,17 +227,18 @@ export function extractExpectations(sourceText: string, fileName = "file.ts"): E
 
     const titleOf = (call: ts.CallExpression): string | undefined => {
       const first = call.arguments[0];
-      return first && ts.isStringLiteral(first) ? first.text : undefined;
+      return first && (ts.isStringLiteral(first) || ts.isNoSubstitutionTemplateLiteral(first))
+        ? first.text
+        : undefined;
     };
 
     const visit = (node: ts.Node, scope: string, testTitle: string): void => {
       if (ts.isCallExpression(node)) {
         const callee = node.expression;
-        // describe('...', fn): extend the scope for the children.
-        if (
-          ts.isIdentifier(callee) &&
-          (callee.text === "describe" || callee.text === "xdescribe")
-        ) {
+        const info = calleeChain(callee);
+        const describeModifiers = info?.modifiers.every((m) => m === "skip" || m === "only") ?? false;
+        // describe('...', fn) / describe.skip / describe.only: extend the scope.
+        if (info && (info.name === "describe" || info.name === "xdescribe") && describeModifiers) {
           const title = titleOf(node);
           const nextScope = title === undefined ? scope : scope ? `${scope} › ${title}` : title;
           node.forEachChild((child) => {
@@ -207,27 +246,15 @@ export function extractExpectations(sourceText: string, fileName = "file.ts"): E
           });
           return;
         }
+        // it('...', fn) / test.only / test.skip / test.todo: the callback's
+        // assertions belong to this title.
         if (
-          ts.isPropertyAccessExpression(callee) &&
-          ts.isIdentifier(callee.expression) &&
-          callee.expression.text === "describe" &&
-          (callee.name.text === "skip" || callee.name.text === "only")
-        ) {
-          const title = titleOf(node);
-          const nextScope = title === undefined ? scope : scope ? `${scope} › ${title}` : title;
-          node.forEachChild((child) => {
-            visit(child, nextScope, testTitle);
-          });
-          return;
-        }
-        // it('...', fn) / test('...', fn): the callback's assertions belong to this title.
-        if (
-          ts.isIdentifier(callee) &&
-          (callee.text === "it" ||
-            callee.text === "test" ||
-            callee.text === "xit" ||
-            callee.text === "fit" ||
-            callee.text === "xtest")
+          info &&
+          (info.name === "it" ||
+            info.name === "test" ||
+            info.name === "xit" ||
+            info.name === "fit" ||
+            info.name === "xtest")
         ) {
           const title = titleOf(node);
           const full = title === undefined ? testTitle : scope ? `${scope} › ${title}` : title;
@@ -238,15 +265,17 @@ export function extractExpectations(sourceText: string, fileName = "file.ts"): E
         }
         // expect(<actual>).toBe/toEqual/toStrictEqual(<literal>)
         if (ts.isPropertyAccessExpression(callee) && EXPECT_MATCHERS.has(callee.name.text)) {
-          const root = expectRoot(callee.expression);
+          const chain = expectChain(callee.expression);
           const expectedArg = node.arguments[0];
-          if (root && root.arguments.length > 0 && expectedArg && isLiteralExpected(expectedArg)) {
+          if (chain.root && chain.root.arguments.length > 0 && expectedArg && isLiteralExpected(expectedArg)) {
             out.push({
               testTitle,
               matcher: callee.name.text as ExpectedAssertion["matcher"],
               expected: expectedArg.getText(sf),
-              actual: (root.arguments[0] as ts.Node).getText(sf),
+              actual: (chain.root.arguments[0] as ts.Node).getText(sf),
               line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
+              negated: chain.negated,
+              ...(chain.modifier ? { modifier: chain.modifier } : {}),
             });
           }
         }
@@ -283,7 +312,10 @@ function isDecision(node: ts.Node): boolean {
     return (
       op === ts.SyntaxKind.AmpersandAmpersandToken ||
       op === ts.SyntaxKind.BarBarToken ||
-      op === ts.SyntaxKind.QuestionQuestionToken
+      op === ts.SyntaxKind.QuestionQuestionToken ||
+      op === ts.SyntaxKind.AmpersandAmpersandEqualsToken ||
+      op === ts.SyntaxKind.BarBarEqualsToken ||
+      op === ts.SyntaxKind.QuestionQuestionEqualsToken
     );
   }
   return false;
@@ -300,10 +332,19 @@ export function analyzeSourceText(sourceText: string, fileName = "file.ts"): Sou
 
     const isTestCall = (node: ts.CallExpression): boolean => {
       const callee = node.expression;
-      if (ts.isIdentifier(callee)) return callee.text === "expect" || callee.text === "assert";
-      if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)) {
-        return callee.expression.text === "expect" || callee.expression.text === "assert";
+      // A bare `expect(x)` has no matcher and is not an assertion; a bare
+      // `assert(x)` (node:assert callable form) is.
+      if (ts.isIdentifier(callee)) return callee.text === "assert";
+      // Walk the whole property chain so `assert.strict.equal(...)` and
+      // `expect(x).not.toBe(...)` both count.
+      let current: ts.Node = callee;
+      while (ts.isPropertyAccessExpression(current)) current = current.expression;
+      if (ts.isCallExpression(current)) {
+        // A matcher chain roots at the `expect(...)` call itself.
+        const root = current.expression;
+        return ts.isIdentifier(root) && root.text === "expect";
       }
+      if (ts.isIdentifier(current)) return current.text === "assert";
       return false;
     };
 
@@ -311,7 +352,11 @@ export function analyzeSourceText(sourceText: string, fileName = "file.ts"): Sou
       ts.isFunctionDeclaration(node) ||
       ts.isFunctionExpression(node) ||
       ts.isArrowFunction(node) ||
-      ts.isMethodDeclaration(node);
+      ts.isMethodDeclaration(node) ||
+      ts.isConstructorDeclaration(node) ||
+      ts.isGetAccessorDeclaration(node) ||
+      ts.isSetAccessorDeclaration(node) ||
+      ts.isClassStaticBlockDeclaration(node);
 
     // Cyclomatic complexity, scored per function (nested functions get their own
     // budget) plus one unit for top-level code.
@@ -345,12 +390,30 @@ export function analyzeSourceText(sourceText: string, fileName = "file.ts"): Sou
         const spec = node.moduleSpecifier.text;
         if (spec.startsWith(".")) relativeImports.push(spec);
       }
+      if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+        // `export { x } from "./x"` / `export * from "./x"` is an edge too.
+        const spec = node.moduleSpecifier.text;
+        if (spec.startsWith(".")) relativeImports.push(spec);
+      }
+      if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        // `await import("./x")` is a real dependency edge.
+        const arg = node.arguments[0];
+        if (arg && ts.isStringLiteral(arg) && arg.text.startsWith(".")) relativeImports.push(arg.text);
+      }
       if (ts.isCallExpression(node)) {
         if (isTestCall(node)) assertionCount++;
         const callee = node.expression;
-        if (ts.isPropertyAccessExpression(callee) && SKIP_ONLY.has(callee.name.text)) {
-          const obj = callee.expression;
-          if (ts.isIdentifier(obj) && TEST_FNS.has(obj.text)) hasSkipOrOnly = true;
+        if (ts.isPropertyAccessExpression(callee)) {
+          // Walk the chain so test.skip.each / test.only.each and it.todo are
+          // caught, not only one-level test.skip.
+          let current: ts.Expression = callee;
+          let marker = false;
+          while (ts.isPropertyAccessExpression(current)) {
+            const name = current.name.text;
+            if (SKIP_ONLY.has(name) || name === "todo") marker = true;
+            current = current.expression;
+          }
+          if (marker && ts.isIdentifier(current) && TEST_FNS.has(current.text)) hasSkipOrOnly = true;
         }
         if (
           ts.isIdentifier(callee) &&
@@ -361,6 +424,26 @@ export function analyzeSourceText(sourceText: string, fileName = "file.ts"): Sou
             callee.text === "fdescribe")
         ) {
           hasSkipOrOnly = true;
+        }
+        // node:test option object: test('x', { skip: true }, fn) / { only: true }.
+        if (ts.isIdentifier(callee) && TEST_FNS.has(callee.text)) {
+          for (const arg of node.arguments) {
+            if (!ts.isObjectLiteralExpression(arg)) continue;
+            for (const property of arg.properties) {
+              if (!ts.isPropertyAssignment(property)) continue;
+              const key = ts.isIdentifier(property.name)
+                ? property.name.text
+                : ts.isStringLiteral(property.name)
+                  ? property.name.text
+                  : "";
+              if (
+                (key === "skip" || key === "only" || key === "todo") &&
+                property.initializer.kind === ts.SyntaxKind.TrueKeyword
+              ) {
+                hasSkipOrOnly = true;
+              }
+            }
+          }
         }
       }
       ts.forEachChild(node, visit);

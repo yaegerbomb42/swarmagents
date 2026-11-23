@@ -47,8 +47,7 @@ import {
   type DesktopPhase,
 } from "../../../lib/client/desktopState";
 import type { VmDisplayState } from "../../../lib/client/vmStatus";
-import { MascotSvg } from "../../../components/mascot/MascotSvg";
-import { svgStateForRun } from "../../../components/mascot/svg-timeline";
+import { presenceHintRegion, type Presence } from "../../../lib/client/presence";
 import { DesktopFpsMeter } from "../utils/desktopFps";
 
 /** Connection facts the ScreenFrame's LIVE pill needs. */
@@ -83,12 +82,57 @@ export interface DesktopViewProps {
   onControlChange?: (control: boolean) => void;
   /** Reports connection phase/fps/latency changes to the frame pill. */
   onConnection?: (info: DesktopConnectionInfo) => void;
+  /**
+   * What the agent is doing right now. The desktop paints a soft, blurred
+   * tint over the region a change most plausibly happened in (see
+   * presenceHintRegion) and fades it out when the agent stops — "where the
+   * agent is" without claiming pixel accuracy the harness does not provide.
+   */
+  presence?: Presence;
+  /** The frame's Take over button controls interaction; shown on the overlay. */
+  canControl?: boolean;
 }
 
 const PHASE_OVERLAY_TEXT: Record<string, string> = {
   starting: "Starting VM…",
   connecting: "Connecting to desktop…",
 };
+
+/**
+ * The presence tint over the live desktop. The region comes from
+ * presenceHintRegion (a coarse guess, deliberately), the intensity from the
+ * run state: working breathes, waiting holds steady and warmer, idle paints
+ * nothing at all. `pointer-events-none` keeps every pixel clickable through
+ * it, and a CSS opacity transition makes it appear/disappear with the run
+ * rather than snapping.
+ */
+export function PresenceGlow({ presence }: { presence?: Presence }) {
+  const region = presence ? presenceHintRegion(presence) : null;
+  if (!presence || !region || presence.runState === "idle") return null;
+  const waiting = presence.runState === "waiting";
+  return (
+    <div
+      aria-hidden
+      data-testid="desktop-presence-glow"
+      data-run-state={presence.runState}
+      className="pointer-events-none absolute z-[5] rounded-3xl transition-opacity duration-700"
+      style={{
+        left: `${(region.x / 1280) * 100}%`,
+        top: `${(region.y / 800) * 100}%`,
+        width: `${(region.w / 1280) * 100}%`,
+        height: `${(region.h / 800) * 100}%`,
+        background: waiting
+          ? "radial-gradient(closest-side, rgba(251,191,36,0.16), rgba(251,191,36,0.05) 60%, transparent)"
+          : "radial-gradient(closest-side, rgba(165,180,252,0.16), rgba(99,102,241,0.06) 60%, transparent)",
+        boxShadow: waiting
+          ? "inset 0 0 0 1px rgba(251,191,36,0.18)"
+          : "inset 0 0 0 1px rgba(165,180,252,0.18)",
+        filter: "blur(2px)",
+        animation: "sa-presence-breathe 3.2s ease-in-out infinite",
+      }}
+    />
+  );
+}
 
 export function DesktopView({
   vmState,
@@ -99,6 +143,8 @@ export function DesktopView({
   control,
   onControlChange,
   onConnection,
+  presence,
+  canControl = true,
 }: DesktopViewProps) {
   const [conn, dispatch] = useReducer(reduceDesktopConn, INITIAL_DESKTOP_CONN);
   const [internalMode, setInternalMode] = useState<DesktopControlMode>("watch");
@@ -316,8 +362,25 @@ export function DesktopView({
   // fullscreen and control banner.
   if (embedded) {
     return (
-      <div className="relative h-full w-full bg-[#08080c]" data-testid="desktop-view">
+      <div className="relative h-full w-full bg-black" data-testid="desktop-view">
         <div ref={surfaceHolderRef} className="absolute inset-0" aria-hidden={!live} />
+
+        {/* Presence: the agent is working here. A blurred tint over the
+            region, fading with the run — it never covers the pixels it is
+            pointing at, and pointer events pass through it. */}
+        <PresenceGlow presence={presence} />
+
+        {/* Watch mode, always visible in control: the one way out. */}
+        {control && (
+          <button
+            type="button"
+            onClick={() => onControlChange?.(false)}
+            className="absolute right-2 top-2 z-10 inline-flex items-center gap-1.5 rounded-full border border-sa-accent/50 bg-sa-accent/20 px-2.5 py-1 font-mono text-[10px] text-white backdrop-blur transition-colors hover:bg-sa-accent/30"
+            data-testid="desktop-hand-back"
+          >
+            <Hand className="h-3 w-3" aria-hidden /> Hand back
+          </button>
+        )}
 
         {conn.phase === "offline" && conn.hasFrame && frameSrc && (
           /* eslint-disable-next-line @next/next/no-img-element */
@@ -330,10 +393,10 @@ export function DesktopView({
         )}
 
         {(conn.phase === "starting" || conn.phase === "connecting") && (
-          <div data-testid="desktop-overlay" className="absolute inset-0 grid place-items-center bg-[#08080c]">
+          <div data-testid="desktop-overlay" className="absolute inset-0 z-20 grid place-items-center bg-black">
             <div className="flex flex-col items-center gap-2 text-center">
-              <MascotSvg state={svgStateForRun("idle")} size={64} />
-              <div className="font-mono text-xs text-white/60">Jimmy is waking up your computer.</div>
+              <img src="/brand/mark-dark.svg" alt="" width={48} height={48} />
+              <div className="font-mono text-xs text-white/60">Waking up your computer.</div>
               <div className="font-mono text-[11px] text-white/35">
                 {PHASE_OVERLAY_TEXT[conn.phase] ?? describeDesktopPhase(conn.phase)}
               </div>
@@ -342,7 +405,7 @@ export function DesktopView({
         )}
 
         {conn.phase === "reconnecting" && (
-          <div data-testid="desktop-overlay" className="absolute inset-0 grid place-items-center bg-[#08080c]/85">
+          <div data-testid="desktop-overlay" className="absolute inset-0 z-20 grid place-items-center bg-black/85">
             <div className="flex flex-col items-center gap-2 text-center">
               <RefreshCw className="h-5 w-5 animate-spin text-amber-300/80" />
               <div className="font-mono text-xs text-white/70">
@@ -361,7 +424,7 @@ export function DesktopView({
         )}
 
         {conn.phase === "offline" && (
-          <div data-testid="desktop-overlay" className="absolute inset-0 grid place-items-center bg-[#08080c]/85">
+          <div data-testid="desktop-overlay" className="absolute inset-0 z-20 grid place-items-center bg-black/85">
             <div className="flex flex-col items-center gap-2 px-6 text-center">
               <span className="font-mono text-xs text-white/60">Desktop offline</span>
               <span className="max-w-[420px] font-mono text-[11px] text-white/35">

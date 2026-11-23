@@ -16,6 +16,7 @@ import {
   clampedTurnTimeoutMs,
   filteredTools,
   isToolAllowed,
+  normalizeToolName,
   roleDeadlineMs,
   roleMaxTurns,
   roleModelRoute,
@@ -72,10 +73,15 @@ test("clampedTurnCeiling clamps, honors modelConfig, and floors at 1", () => {
   // No role → the (floored) global value.
   assert.equal(clampedTurnCeiling(undefined, 20), 20);
   assert.equal(clampedTurnCeiling(undefined, 0), 1);
+  assert.equal(clampedTurnCeiling(undefined, NaN), 1);
+  assert.equal(clampedTurnCeiling(undefined, -10), 1);
   // Role above the global → the global wins.
   assert.equal(clampedTurnCeiling({ id: "r", maxTurns: 50 }, 20), 20);
   // Role below 1 still clamps to at least 1.
   assert.equal(clampedTurnCeiling({ id: "r", maxTurns: 0 }, 20), 1);
+  assert.equal(clampedTurnCeiling({ id: "r", maxTurns: -5 }, 20), 1);
+  assert.equal(clampedTurnCeiling({ id: "r", maxTurns: NaN }, 20), 20);
+  assert.equal(clampedTurnCeiling({ id: "r", maxTurns: 8.7 }, 20), 8);
 });
 
 test("clampedDeadlineMs combines role and global deadlines", () => {
@@ -91,19 +97,159 @@ test("clampedDeadlineMs combines role and global deadlines", () => {
   assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: 120_000 }, undefined, 1_000), 121_000);
 });
 
-test("filteredTools keeps only whitelisted tools", () => {
-  const tools = [makeTool("read"), makeTool("bash"), makeTool("write_file")];
-  const role: RoleClamp = { id: "r", name: "R", allowedTools: ["read", "bash"] };
-  assert.deepEqual(
-    filteredTools(role, tools).map((t) => t.name),
-    ["read", "bash"],
-  );
-  // No whitelist → all tools, unchanged.
-  assert.deepEqual(filteredTools(undefined, tools), tools);
-  assert.deepEqual(filteredTools({ id: "r", name: "R" }, tools), tools);
+test("clampedDeadlineMs ignores NaN, infinite, and non-positive inputs", () => {
+  // A bad role deadline is ignored, never NaN / infinite / already-past.
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: NaN }, undefined, 0), undefined);
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: Infinity }, undefined, 0), undefined);
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: 0 }, undefined, 1_000), undefined);
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: -100 }, undefined, 1_000), undefined);
+  // With a valid global the role value is dropped and the global wins.
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: NaN }, 600_000, 0), 600_000);
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: Infinity }, 600_000, 0), 600_000);
+  // A bad global is ignored the same way, leaving the role deadline.
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: 120_000 }, NaN, 1_000), 121_000);
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: 120_000 }, Infinity, 1_000), 121_000);
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: 120_000 }, 0, 1_000), 121_000);
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: 120_000 }, -5, 1_000), 121_000);
+  // Both bad → undefined, never NaN.
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: NaN }, NaN, 0), undefined);
+  assert.equal(clampedDeadlineMs(undefined, NaN, 0), undefined);
+  // A non-finite cycle start is treated as 0 rather than poisoning the sum.
+  assert.equal(clampedDeadlineMs({ id: "r", maxDeadlineMs: 120_000 }, undefined, NaN), 120_000);
 });
 
-test("isToolAllowed / toolDenialReason enforce whitelist and permissions", () => {
+test("normalizeToolName unifies snake_case, PascalCase, and odd casings", () => {
+  assert.equal(normalizeToolName("write_file"), "write");
+  assert.equal(normalizeToolName("Write"), "write");
+  assert.equal(normalizeToolName("WRITE"), "write");
+  assert.equal(normalizeToolName("write-file"), "write");
+  assert.equal(normalizeToolName("edit_file"), "edit");
+  assert.equal(normalizeToolName("Edit"), "edit");
+  assert.equal(normalizeToolName("multi_edit"), "multiedit");
+  assert.equal(normalizeToolName("MultiEdit"), "multiedit");
+  assert.equal(normalizeToolName("MULTIEDIT"), "multiedit");
+  assert.equal(normalizeToolName("NotebookEdit"), "notebookedit");
+  assert.equal(normalizeToolName("notebook_edit"), "notebookedit");
+  assert.equal(normalizeToolName("restore_checkpoint"), "checkpoint");
+  assert.equal(normalizeToolName("Checkpoint"), "checkpoint");
+  assert.equal(normalizeToolName("Bash"), "bash");
+  assert.equal(normalizeToolName("BASH"), "bash");
+  assert.equal(normalizeToolName("web_fetch"), "webfetch");
+  assert.equal(normalizeToolName("WebFetch"), "webfetch");
+  assert.equal(normalizeToolName("api_request"), "apirequest");
+  assert.equal(normalizeToolName("ApiRequest"), "apirequest");
+  assert.equal(normalizeToolName("str_replace"), "strreplace");
+  assert.equal(normalizeToolName("StrReplace"), "strreplace");
+  // Unknown names pass through unchanged (lowercased, separators stripped).
+  assert.equal(normalizeToolName("read"), "read");
+  assert.equal(normalizeToolName("Read"), "read");
+});
+
+test("permission flags deny every casing and alias of a guarded tool", () => {
+  const locked: RoleClamp = {
+    id: "locked",
+    permissions: { readOnly: true, networkAllowed: false, commandExecutionAllowed: false },
+  };
+  // File mutations denied by readOnly, however they are spelled.
+  for (const tool of [
+    "write_file",
+    "Write",
+    "WRITE",
+    "write",
+    "write-file",
+    "edit_file",
+    "Edit",
+    "EDIT",
+    "edit",
+    "multi_edit",
+    "MultiEdit",
+    "MULTIEDIT",
+    "NotebookEdit",
+    "notebook_edit",
+    "str_replace",
+    "StrReplace",
+    "replace_lines",
+    "restore_checkpoint",
+    "Checkpoint",
+  ]) {
+    assert.equal(isToolAllowed(locked, tool), false, `${tool} must be denied under readOnly`);
+    assert.match(toolDenialReason(locked, tool) ?? "", /read-only/);
+  }
+
+  // Command execution denied however it is spelled.
+  for (const tool of ["bash", "Bash", "BASH"]) {
+    assert.equal(isToolAllowed(locked, tool), false, `${tool} must be denied under commandExecutionAllowed: false`);
+    assert.match(toolDenialReason(locked, tool) ?? "", /execute commands/);
+  }
+
+  // Network tools denied however they are spelled, including MCP servers.
+  for (const tool of [
+    "web_fetch",
+    "WebFetch",
+    "webfetch",
+    "Webfetch",
+    "web_search",
+    "WebSearch",
+    "Browser",
+    "browser",
+    "BROWSER",
+    "ApiRequest",
+    "api_request",
+    "mcp__github-mcp__get_issue",
+    "mcp__browser-mcp__navigate",
+    "mcp__playwright-mcp__browser_navigate",
+    "MCP__github-mcp__get_issue",
+  ]) {
+    assert.equal(isToolAllowed(locked, tool), false, `${tool} must be denied under networkAllowed: false`);
+    assert.match(toolDenialReason(locked, tool) ?? "", /network/);
+  }
+
+  // Read-only tools stay allowed under the same role.
+  for (const tool of ["read", "Read", "read_file", "search", "Grep", "Glob", "plan"]) {
+    assert.equal(isToolAllowed(locked, tool), true, `${tool} must stay allowed`);
+  }
+});
+
+test("the whitelist stays an exact match even though permissions normalize", () => {
+  // A whitelist entry for the engine name does not admit the Claude Code
+  // spelling (and vice versa): the whitelist is fail-closed, only the
+  // permission sets normalize.
+  const role: RoleClamp = { id: "r", allowedTools: ["write_file"] };
+  assert.equal(isToolAllowed(role, "write_file"), true);
+  assert.equal(isToolAllowed(role, "Write"), false);
+  assert.match(toolDenialReason(role, "Write") ?? "", /whitelist/);
+});
+
+test("filteredTools keeps only allowed tools (whitelist and permissions)", () => {
+  const tools = [
+    makeTool("read"),
+    makeTool("bash"),
+    makeTool("write_file"),
+    makeTool("Bash"),
+    makeTool("Write"),
+    makeTool("WebSearch"),
+  ];
+  const role: RoleClamp = { id: "r", name: "R", allowedTools: ["read", "bash", "Write"] };
+  assert.deepEqual(
+    filteredTools(role, tools).map((t) => t.name),
+    ["read", "bash", "Write"],
+  );
+
+  // Permission flags filter even without allowedTools set:
+  const readOnlyRole: RoleClamp = {
+    id: "reader",
+    permissions: { readOnly: true, commandExecutionAllowed: false, networkAllowed: false },
+  };
+  assert.deepEqual(
+    filteredTools(readOnlyRole, tools).map((t) => t.name),
+    ["read"],
+  );
+
+  // No role → all tools, unchanged.
+  assert.deepEqual(filteredTools(undefined, tools), tools);
+});
+
+test("isToolAllowed / toolDenialReason enforce whitelist and permissions for engine and Claude Code names", () => {
   const role: RoleClamp = { id: "r", name: "R", allowedTools: ["read"] };
   assert.equal(isToolAllowed(role, "read"), true);
   assert.equal(isToolAllowed(role, "bash"), false);
@@ -115,30 +261,65 @@ test("isToolAllowed / toolDenialReason enforce whitelist and permissions", () =>
   assert.equal(isToolAllowed(undefined, "anything"), true);
   assert.equal(toolDenialReason(undefined, "anything"), undefined);
 
-  // Permission flags deny even if the tool is mistakenly whitelisted.
+  // Permission flags deny both engine and Claude Code / permission names.
   const locked: RoleClamp = {
     id: "locked",
     name: "Locked",
-    allowedTools: ["read", "write_file", "bash", "web_search"],
+    allowedTools: [
+      "read",
+      "write_file",
+      "edit_file",
+      "Write",
+      "Edit",
+      "MultiEdit",
+      "NotebookEdit",
+      "bash",
+      "Bash",
+      "web_search",
+      "WebSearch",
+      "WebFetch",
+      "Browser",
+      "ApiRequest",
+      "mcp__github-mcp__*",
+    ],
     permissions: { readOnly: true, networkAllowed: false, commandExecutionAllowed: false },
   };
   assert.equal(isToolAllowed(locked, "read"), true);
-  assert.equal(isToolAllowed(locked, "write_file"), false);
-  assert.equal(isToolAllowed(locked, "bash"), false);
-  assert.equal(isToolAllowed(locked, "web_search"), false);
-  assert.match(toolDenialReason(locked, "write_file") ?? "", /read-only/);
-  assert.match(toolDenialReason(locked, "bash") ?? "", /execute commands/);
-  assert.match(toolDenialReason(locked, "web_search") ?? "", /network/);
+
+  // File mutations denied by readOnly
+  for (const tool of ["write_file", "edit_file", "Write", "Edit", "MultiEdit", "NotebookEdit"]) {
+    assert.equal(isToolAllowed(locked, tool), false, `${tool} must be denied under readOnly`);
+    assert.match(toolDenialReason(locked, tool) ?? "", /read-only/);
+  }
+
+  // Command executions denied by commandExecutionAllowed: false
+  for (const tool of ["bash", "Bash"]) {
+    assert.equal(isToolAllowed(locked, tool), false, `${tool} must be denied under commandExecutionAllowed: false`);
+    assert.match(toolDenialReason(locked, tool) ?? "", /execute commands/);
+  }
+
+  // Network reached tools denied by networkAllowed: false
+  for (const tool of ["web_search", "WebSearch", "WebFetch", "Browser", "ApiRequest", "mcp__github-mcp__*"]) {
+    assert.equal(isToolAllowed(locked, tool), false, `${tool} must be denied under networkAllowed: false`);
+    assert.match(toolDenialReason(locked, tool) ?? "", /network/);
+  }
 });
 
-test("clampedMaxTokens and clampedTurnTimeoutMs", () => {
+test("clampedMaxTokens and clampedTurnTimeoutMs guard non-finite and <= 0 numbers", () => {
   const role: RoleClamp = { id: "r", modelConfig: { maxTokens: 4096, turnTimeoutMs: 5_000 } };
   assert.equal(clampedMaxTokens(role, 8192), 4096);
+  assert.equal(clampedMaxTokens(role, undefined), 4096);
   assert.equal(clampedMaxTokens(undefined, 8192), 8192);
+  assert.equal(clampedMaxTokens(undefined, undefined), undefined);
+  assert.equal(clampedMaxTokens({ id: "r", modelConfig: { maxTokens: NaN } }, 8192), 8192);
+  assert.equal(clampedMaxTokens({ id: "r", modelConfig: { maxTokens: -50 } }, 8192), 8192);
+
   assert.equal(clampedTurnTimeoutMs(role, 30_000), 5_000);
   assert.equal(clampedTurnTimeoutMs({ id: "r", modelConfig: { turnTimeoutMs: 5_000 } }, undefined), 5_000);
   assert.equal(clampedTurnTimeoutMs(undefined, 30_000), 30_000);
   assert.equal(clampedTurnTimeoutMs(undefined, undefined), undefined);
+  assert.equal(clampedTurnTimeoutMs({ id: "r", modelConfig: { turnTimeoutMs: -100 } }, 30_000), 30_000);
+  assert.equal(clampedTurnTimeoutMs({ id: "r", modelConfig: { turnTimeoutMs: NaN } }, 30_000), 30_000);
 });
 
 test("roleSystemPrompt and roleModelRoute", () => {
@@ -236,7 +417,58 @@ test("applyRoleToRunRequest narrows tools, reports denials, and resolves limits"
   assert.match(applied.denials[0].reason, /whitelist/);
 });
 
-test("applyRoleToRunRequest keeps the request unchanged when the whitelist allows all tools", () => {
+test("applyRoleToRunRequest strips permission-denied tools even without allowedTools", () => {
+  const req = makeRequest({
+    rolePhase: makePhase(["Read", "Write", "Bash", "WebFetch", "mcp__github-mcp__*"]),
+  });
+  const role: RoleClamp = {
+    id: "reviewer",
+    permissions: { readOnly: true, commandExecutionAllowed: false, networkAllowed: false },
+  };
+  const applied = applyRoleToRunRequest(req, role);
+
+  assert.equal(applied.changed, true);
+  assert.deepEqual(applied.request.rolePhase?.allowedTools, ["Read"]);
+  assert.equal(applied.denials.length, 4);
+});
+
+test("applyRoleToRunRequest strips oddly-cased and aliased tools from the phase", () => {
+  const req = makeRequest({
+    rolePhase: makePhase(["Read", "write", "WRITE", "BASH", "webfetch", "MCP__github-mcp__x"]),
+  });
+  const role: RoleClamp = {
+    id: "reviewer",
+    permissions: { readOnly: true, commandExecutionAllowed: false, networkAllowed: false },
+  };
+  const applied = applyRoleToRunRequest(req, role);
+
+  assert.equal(applied.changed, true);
+  assert.deepEqual(applied.request.rolePhase?.allowedTools, ["Read"]);
+  assert.equal(applied.denials.length, 5);
+  assert.deepEqual(
+    applied.denials.map((d) => d.tool),
+    ["write", "WRITE", "BASH", "webfetch", "MCP__github-mcp__x"],
+  );
+});
+
+test("applyRoleToRunRequest populates limits when defined by role even without opts", () => {
+  const req = makeRequest({ rolePhase: makePhase(["read"]) });
+  const role: RoleClamp = {
+    id: "bounded",
+    maxTurns: 12,
+    modelConfig: { maxTokens: 2048, turnTimeoutMs: 10000, deadlineMs: 50000 },
+  };
+  const applied = applyRoleToRunRequest(req, role);
+
+  assert.deepEqual(applied.limits, {
+    maxTurns: 12,
+    maxTokens: 2048,
+    turnTimeoutMs: 10000,
+    deadlineMs: 50000,
+  });
+});
+
+test("applyRoleToRunRequest keeps the request unchanged when all tools are allowed", () => {
   const req = makeRequest({ rolePhase: makePhase(["read", "bash"]) });
   const role: RoleClamp = { id: "r", allowedTools: ["read", "bash"] };
   const applied = applyRoleToRunRequest(req, role, {});

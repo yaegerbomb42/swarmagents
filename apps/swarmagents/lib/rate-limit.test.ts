@@ -8,6 +8,12 @@ import {
   rateLimitKey,
   rateLimitCheck,
   rateLimitResponse,
+  checkCompleteRateLimit,
+  checkProviderProbeRateLimit,
+  checkLoginRateLimit,
+  refundLoginRateLimit,
+  LOGIN_EMAIL_LIMIT,
+  LOGIN_IP_LIMIT,
   resetBuckets,
   resetRateLimitWarnings,
   UNIDENTIFIED_KEY,
@@ -342,4 +348,148 @@ test("rateLimitCheck throttles public share pages with their own bucket", () => 
   assert.ok(blocked!.retryAfter > 0);
   // Another IP still gets its own budget.
   assert.equal(rateLimitCheck("/share/" + "a".repeat(48), "other-key")!.allowed, true);
+});
+
+test("checkCompleteRateLimit allows 60/min per user, independently", () => {
+  resetBuckets();
+  for (let i = 0; i < 60; i++) {
+    assert.equal(checkCompleteRateLimit("alice").allowed, true);
+  }
+  const denied = checkCompleteRateLimit("alice");
+  assert.equal(denied.allowed, false);
+  assert.ok(denied.retryAfter > 0);
+  assert.equal(checkCompleteRateLimit("bob").allowed, true, "budgets are per user");
+});
+
+test("checkProviderProbeRateLimit allows 30/min per user, independently", () => {
+  resetBuckets();
+  for (let i = 0; i < 30; i++) {
+    assert.equal(checkProviderProbeRateLimit("alice").allowed, true);
+  }
+  const denied = checkProviderProbeRateLimit("alice");
+  assert.equal(denied.allowed, false);
+  assert.ok(denied.retryAfter > 0);
+  assert.equal(checkProviderProbeRateLimit("bob").allowed, true, "budgets are per user");
+});
+
+test("rateLimitCheck gives password-reset endpoints their own strict bucket (FIX-39)", () => {
+  resetBuckets();
+  const key = "test-reset-" + Date.now();
+  const first = rateLimitCheck("/api/password-reset/request", key);
+  assert.ok(first);
+  assert.equal(first!.allowed, true);
+  assert.equal(first!.limit, 5, "reset requests get the login-class budget, not the general 300/min");
+
+  // Request and confirm share the reset bucket...
+  for (let i = 0; i < 4; i++) {
+    assert.equal(rateLimitCheck("/api/password-reset/confirm", key)!.allowed, true);
+  }
+  const blocked = rateLimitCheck("/api/password-reset/request", key);
+  assert.ok(blocked);
+  assert.equal(blocked!.allowed, false);
+  assert.ok(blocked!.retryAfter > 0);
+
+  // ...but the login bucket and the general API bucket are untouched.
+  assert.equal(rateLimitCheck("/api/login", key)!.allowed, true);
+  assert.equal(rateLimitCheck("/api/runtime/tasks", key)!.allowed, true);
+  // Another identity still gets its own reset budget.
+  assert.equal(rateLimitCheck("/api/password-reset/request", "other-key")!.allowed, true);
+});
+
+test("rateLimitCheck routes email-verification endpoints into the strict reset bucket (FIX-44)", () => {
+  resetBuckets();
+  const key = "test-verify-" + Date.now();
+  // Confirm + resend share the password-reset bucket's 5/min budget.
+  for (let i = 0; i < 5; i++) {
+    const path = i % 2 === 0 ? "/api/email-verification/confirm" : "/api/email-verification/resend";
+    assert.equal(rateLimitCheck(path, key)!.allowed, true, `attempt ${i + 1} should be allowed`);
+  }
+  const blocked = rateLimitCheck("/api/email-verification/confirm", key);
+  assert.ok(blocked);
+  assert.equal(blocked!.allowed, false);
+  assert.ok(blocked!.retryAfter > 0);
+  // The reset endpoints share the same (now exhausted) budget...
+  assert.equal(rateLimitCheck("/api/password-reset/request", key)!.allowed, false);
+  // ...while another identity is unaffected.
+  assert.equal(rateLimitCheck("/api/email-verification/resend", "other-key")!.allowed, true);
+});
+
+test("TokenBucket.refund hands tokens back, clamped at capacity", () => {
+  const bucket = new TokenBucket(3, 60_000);
+  assert.equal(bucket.consume("key").remaining, 2);
+  assert.equal(bucket.consume("key").remaining, 1);
+  bucket.refund("key");
+  assert.equal(bucket.consume("key").remaining, 1);
+  // Refunding past capacity never overfills the bucket.
+  bucket.refund("key");
+  bucket.refund("key");
+  bucket.refund("key");
+  assert.equal(bucket.consume("key").remaining, 2);
+  // Refunding an unknown key is a no-op, not a fresh bucket.
+  bucket.refund("no-such-key");
+  assert.equal(bucket.consume("no-such-key").remaining, 2);
+});
+
+test("checkLoginRateLimit trips the per-email bucket and refunds on success", () => {
+  resetBuckets();
+  const email = "login-bucket-alice-" + Date.now() + "@example.com";
+  const ip = "ip:203.0.113.40";
+  for (let i = 0; i < LOGIN_EMAIL_LIMIT; i++) {
+    assert.equal(checkLoginRateLimit(email, ip).allowed, true, `attempt ${i + 1} should be allowed`);
+  }
+  const blocked = checkLoginRateLimit(email, ip);
+  assert.equal(blocked.allowed, false);
+  assert.ok(blocked.retryAfter > 0);
+  // A refunded (successful) attempt restores the budget.
+  refundLoginRateLimit(email, ip);
+  assert.equal(checkLoginRateLimit(email, ip).allowed, true);
+});
+
+test("checkLoginRateLimit trips per-email and per-IP buckets independently", () => {
+  resetBuckets();
+  const ip = "ip:203.0.113.41";
+  // Exhaust the email bucket for one account from this IP.
+  for (let i = 0; i < LOGIN_EMAIL_LIMIT; i++) {
+    assert.equal(checkLoginRateLimit("victim@example.com", ip).allowed, true);
+  }
+  assert.equal(checkLoginRateLimit("victim@example.com", ip).allowed, false);
+  // A different account from the same IP still has budget (IP limit is 30).
+  assert.equal(checkLoginRateLimit("other@example.com", ip).allowed, true);
+  // Exhaust the IP bucket with distinct accounts.
+  for (let i = 0; i < LOGIN_IP_LIMIT - LOGIN_EMAIL_LIMIT - 1; i++) {
+    assert.equal(checkLoginRateLimit(`filler-${i}@example.com`, ip).allowed, true);
+  }
+  assert.equal(checkLoginRateLimit("fresh@example.com", ip).allowed, false);
+  // A different IP is unaffected by the exhausted one.
+  assert.equal(checkLoginRateLimit("fresh@example.com", "ip:203.0.113.42").allowed, true);
+});
+
+test("checkLoginRateLimit hands the email token back when the IP bucket denies", () => {
+  resetBuckets();
+  const ip = "ip:203.0.113.43";
+  // Burn the IP budget with throwaway accounts (each also takes an email token).
+  for (let i = 0; i < LOGIN_IP_LIMIT; i++) {
+    assert.equal(checkLoginRateLimit(`burner-${i}@example.com`, ip).allowed, true);
+  }
+  assert.equal(checkLoginRateLimit("held@example.com", ip).allowed, false);
+  // The denied attempt must not have drained the held account's own budget:
+  // from a fresh IP it still has its full allowance.
+  for (let i = 0; i < LOGIN_EMAIL_LIMIT; i++) {
+    assert.equal(
+      checkLoginRateLimit("held@example.com", "ip:203.0.113.44").allowed,
+      true,
+      `held account attempt ${i + 1} should be allowed`,
+    );
+  }
+});
+
+test("checkLoginRateLimit still enforces the IP bucket without an email key", () => {
+  resetBuckets();
+  const ip = "ip:203.0.113.45";
+  for (let i = 0; i < LOGIN_IP_LIMIT; i++) {
+    assert.equal(checkLoginRateLimit(null, ip).allowed, true);
+  }
+  const blocked = checkLoginRateLimit(null, ip);
+  assert.equal(blocked.allowed, false);
+  assert.ok(blocked.retryAfter > 0);
 });

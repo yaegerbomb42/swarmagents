@@ -12,7 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { TelemetryBus, type TelemetryEvent } from "./bus";
-import { sseResponse } from "./sse";
+import { encodeSse, sseResponse } from "./sse";
 import { parseSse } from "../client/sse";
 
 function tempDir(): { dir: string; cleanup: () => void } {
@@ -369,4 +369,175 @@ test("b14: abort at setup on a finished run replays the terminal event cleanly",
   } finally {
     cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------
+// SSE hygiene: no 0 ms keep-alive timer, no synthetic Last-Event-ID clobbering,
+// no abort-listener retention, and no dropped legacy duplicate-seq events.
+// ---------------------------------------------------------------------------
+
+test("keepAliveMs: 0 does not create a keep-alive timer", async () => {
+  const bus = new TelemetryBus();
+  bus.publish("run_no_keepalive", { type: "run.finished", exitCode: 0 } as TelemetryEvent);
+  const original = globalThis.setInterval;
+  let created = 0;
+  globalThis.setInterval = ((...args: Parameters<typeof setInterval>) => {
+    created++;
+    return original(...args);
+  }) as typeof setInterval;
+  let stream: ReadableStream<Uint8Array> | undefined;
+  try {
+    const ac = new AbortController();
+    stream = sseResponse("run_no_keepalive", 0, ac.signal, { bus, keepAliveMs: 0, runsDir: null });
+  } finally {
+    globalThis.setInterval = original;
+  }
+  assert.ok(stream);
+  const text = await readToEnd(stream);
+  assert.equal(created, 0, "no timer should be created when keepAliveMs is 0");
+  assert.ok(!text.includes("keep-alive"), `unexpected keep-alive frames: ${text}`);
+});
+
+test("encodeSse omits the id line on synthetic frames", () => {
+  const error = encodeSse({ seq: -1, runId: "r", ts: 1, type: "stream.error", data: { message: "x" } });
+  assert.ok(error.includes("event: stream.error"));
+  assert.ok(!/^id:/m.test(error), `stream.error must not set Last-Event-ID: ${error}`);
+  const snapshot = encodeSse({ seq: 0, runId: "r", ts: 1, type: "run.snapshot", data: {} });
+  assert.ok(snapshot.includes("event: run.snapshot"));
+  assert.ok(!/^id:/m.test(snapshot), `run.snapshot must not set Last-Event-ID: ${snapshot}`);
+  const real = encodeSse({ seq: 7, runId: "r", ts: 1, type: "one", data: {} });
+  assert.ok(real.startsWith("id: 7\n"), `real events must keep their id: ${real}`);
+});
+
+/** Minimal AbortSignal stand-in that records listener attach/detach calls. */
+class CountingSignal {
+  aborted = false;
+  added = 0;
+  removed = 0;
+  private readonly listeners = new Set<() => void>();
+
+  addEventListener(type: string, fn: () => void): void {
+    if (type === "abort") {
+      this.added++;
+      this.listeners.add(fn);
+    }
+  }
+  removeEventListener(type: string, fn: () => void): void {
+    if (type === "abort") {
+      this.removed++;
+      this.listeners.delete(fn);
+    }
+  }
+  fire(): void {
+    this.aborted = true;
+    for (const fn of [...this.listeners]) fn();
+  }
+}
+
+test("abort listeners are detached when the stream closes", async () => {
+  const bus = new TelemetryBus();
+  bus.publish("run_detach_terminal", { type: "run.finished", exitCode: 0 } as TelemetryEvent);
+  const signal = new CountingSignal();
+  const stream = sseResponse("run_detach_terminal", 0, signal as unknown as AbortSignal, {
+    bus,
+    keepAliveMs: 60_000,
+    runsDir: null,
+  });
+  await readToEnd(stream);
+  assert.equal(signal.added, 1);
+  assert.equal(signal.removed, 1, "terminal close must detach the abort listener");
+});
+
+test("abort listeners are detached on a mid-stream abort", async () => {
+  const bus = new TelemetryBus();
+  const signal = new CountingSignal();
+  const stream = sseResponse("run_detach_abort", 0, signal as unknown as AbortSignal, {
+    bus,
+    keepAliveMs: 60_000,
+    runsDir: null,
+  });
+  const reader = stream.getReader();
+  bus.publish("run_detach_abort", { type: "run.created" });
+  await reader.read(); // client receives data before disconnecting
+  signal.fire();
+  for (let i = 0; i < 10; i++) {
+    const { done } = await reader.read();
+    if (done) break;
+  }
+  assert.equal(signal.added, 1);
+  assert.equal(signal.removed, 1, "abort close must detach the abort listener");
+  assert.equal(bus.subscriberCount("run_detach_abort"), 0);
+});
+
+test("legacy log events sharing a seq number are all replayed", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const runId = "run_dup_seq";
+    const lines = [
+      { seq: 1, runId, ts: 1000, type: "first", data: {} },
+      { seq: 1, runId, ts: 2000, type: "second", data: {} },
+      { seq: 2, runId, ts: 3000, type: "third", data: {} },
+    ];
+    fs.writeFileSync(path.join(dir, `${runId}.jsonl`), `${lines.map((e) => JSON.stringify(e)).join("\n")}\n`);
+
+    const ac = new AbortController();
+    const stream = sseResponse(runId, 0, ac.signal, { bus: new TelemetryBus(), keepAliveMs: 60_000, runsDir: dir });
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    for (let i = 0; i < 100; i++) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+      if (text.includes("event: third\n")) break;
+    }
+    ac.abort();
+    await reader.read().catch(() => {});
+
+    const types = parseSse(text).map((m) => (JSON.parse(m.data) as { type: string }).type);
+    assert.deepEqual(types, ["first", "second", "third"], "duplicate seq events must not be dropped");
+  } finally {
+    cleanup();
+  }
+  })
+test("encodeSse sanitizes CRLF in event type and seq to prevent SSE injection", () => {
+  const dirtyEvent = {
+    seq: ("1\nevent: injected\ndata: fake" as unknown) as number,
+    runId: "run_inject",
+    ts: Date.now(),
+    type: "normal\r\nevent: malicious\r\ndata: pwned",
+    data: { hello: "world" },
+  };
+  const encoded = encodeSse(dirtyEvent);
+  assert.ok(!encoded.includes("\nevent: injected\n"), "must not contain injected event via seq");
+  assert.ok(!encoded.includes("\nevent: malicious\n"), "must not contain injected event via type");
+  // The dirty seq is not a positive number, so the synthetic-frame rule also
+  // applies: no id line at all, therefore no injected Last-Event-ID is possible.
+  assert.ok(!/^id:/m.test(encoded), `a non-numeric seq must not produce an id line: ${encoded}`);
+});
+
+
+test("run.paused does not close the SSE stream as terminal", async () => {
+  const bus = new TelemetryBus();
+  const ac = new AbortController();
+  const stream = sseResponse("run_paused_stream", 0, ac.signal, { bus, keepAliveMs: 60_000, runsDir: null });
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+
+  bus.publish("run_paused_stream", { type: "run.created", data: { userId: "alice" } });
+  bus.publish("run_paused_stream", { type: "run.paused", data: { reason: "budget" } });
+  bus.publish("run_paused_stream", { type: "run.resumed", data: {} });
+
+  let text = "";
+  for (let i = 0; i < 20; i++) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+    if (text.includes("event: run.resumed\n")) break;
+  }
+  const types = parseSse(text).map((m) => (JSON.parse(m.data) as { type: string }).type);
+  assert.deepEqual(types, ["run.created", "run.paused", "run.resumed"]);
+  assert.equal(ac.signal.aborted, false, "stream remained open across run.paused and received run.resumed");
+  ac.abort();
+  await reader.cancel().catch(() => {});
 });

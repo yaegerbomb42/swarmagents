@@ -56,7 +56,7 @@ import {
   type BrainVerdict,
   type DecisionBrainHooksOptions,
 } from "./decision-brain/index";
-import { isRoleListTool, isRoleSwitchTool, ROLE_MCP_CONFIG_PATH } from "./role-mcp";
+import { isRoleListTool, isRoleSwitchTool } from "./role-mcp";
 import { isAskUserTool, parseAskUserArguments } from "./ask-mcp";
 import { isDesktopHandoffTool, parseDesktopHandoffArguments } from "./desktop-handoff-mcp";
 import { classifyDesktopToolCallAsync, computerActionEvent, isDesktopMcpCall } from "./computer-mcp";
@@ -171,6 +171,31 @@ const SIGNAL_NAMES: Record<number, string> = {
 /** True when the exit code means the process was killed by a signal (128+n). */
 export function isSignalKillExitCode(exitCode: number): boolean {
   return exitCode > 128 && exitCode <= 128 + 31;
+}
+
+/** Default cap for --max-turns when SWARM_MAX_TURNS is unset or invalid. */
+export const DEFAULT_SWARM_MAX_TURNS = 200;
+
+/**
+ * Effective --max-turns for one invocation: the requested ceiling,
+ * floored to an integer, at least 1, and capped by SWARM_MAX_TURNS (or
+ * the 200 default when the env is unset/invalid). Undefined when no
+ * ceiling was requested — the CLI's own default applies, as today.
+ * The cap is enforced here, at the argv boundary, so every source
+ * (dispatch, role ceiling, direct caller) is capped the same way.
+ */
+export function resolveMaxTurns(
+  requested: number | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): number | undefined {
+  if (requested === undefined || !Number.isFinite(requested) || requested <= 0) return undefined;
+  const rawCap = env.SWARM_MAX_TURNS?.trim();
+  let cap = DEFAULT_SWARM_MAX_TURNS;
+  if (rawCap) {
+    const parsed = Number(rawCap);
+    if (Number.isSafeInteger(parsed) && parsed > 0) cap = parsed;
+  }
+  return Math.max(1, Math.min(Math.floor(requested), cap));
 }
 
 /** Human-readable signal name for a 128+n exit code, e.g. 137 -> "SIGKILL". */
@@ -298,6 +323,8 @@ export class ClaudeCodeRunner {
     let haltedReason: string | null = null;
     let aborted = false;
     /** Decision Brain loop state: evaluations so far, last result, last failure. */
+    // Counts Decision Brain beforeTool invocations (one per gated tool call),
+    // not Claude Code conversation turns / num_turns.
     let brainTurnCount = 0;
     let lastBrainToolResult: { ok: boolean; output: string } | null = null;
     let lastBrainError: string | null = null;
@@ -307,6 +334,14 @@ export class ClaudeCodeRunner {
     // new role's phase. `pendingSwitch` holds the phase to hand back to the
     // caller in the outcome.
     const switchAbort = new AbortController();
+    // A policy halt must stop the claude child now, not when it happens to
+    // finish: the VM would otherwise keep burning tokens after a denial.
+    const haltAbort = new AbortController();
+    const halt = (reason: string): void => {
+      if (haltedReason !== null) return;
+      haltedReason = reason;
+      if (!haltAbort.signal.aborted) haltAbort.abort();
+    };
     // Mutable holder: pendingSwitch is assigned from inside chained gate
     // closures, so a plain let would be narrowed to `never` by flow analysis.
     const pendingSwitch: { phase: RolePhase | null } = { phase: null };
@@ -448,8 +483,9 @@ export class ClaudeCodeRunner {
               // Self-management: the live allowlist rejects tools the current
               // role (clamped to the run policy ceiling) does not include.
               if (request.selfManage && !request.selfManage.toolAllowed(name) && haltedReason === null) {
-                haltedReason = `tool ${name} is outside the current allowlist`;
-                emit({ type: "tool.blocked", name, reason: haltedReason });
+                const reason = `tool ${name} is outside the current allowlist`;
+                halt(reason);
+                emit({ type: "tool.blocked", name, reason });
               }
 
               if (request.selfManage && isMetaTool(name) && haltedReason === null) {
@@ -495,7 +531,7 @@ export class ClaudeCodeRunner {
                     if (haltedReason !== null) return;
                     const asyncDecision = await classifyDesktopToolCallAsync(name, input);
                     if (asyncDecision && asyncDecision.level === "deny" && haltedReason === null) {
-                      haltedReason = asyncDecision.reason;
+                      halt(asyncDecision.reason);
                       emit({ type: "tool.blocked", name, reason: asyncDecision.reason });
                     }
                   });
@@ -516,11 +552,11 @@ export class ClaudeCodeRunner {
                       reason: decision.reason,
                     }, emit, redact);
                     if (verdict !== "approved" && haltedReason === null) {
-                      haltedReason = verdict === "expired" ? "approval timed out" : "approval denied by user";
+                      halt(verdict === "expired" ? "approval timed out" : "approval denied by user");
                     }
                   });
                 } else if (decision.level === "deny" && haltedReason === null) {
-                  haltedReason = decision.reason;
+                  halt(decision.reason);
                   emit({ type: "tool.blocked", name, reason: decision.reason });
                 }
 
@@ -547,10 +583,10 @@ export class ClaudeCodeRunner {
                         reason,
                       }, emit, redact);
                       if (userVerdict !== "approved" && haltedReason === null) {
-                        haltedReason = userVerdict === "expired" ? "approval timed out" : "approval denied by user";
+                        halt(userVerdict === "expired" ? "approval timed out" : "approval denied by user");
                       }
                     } else if (haltedReason === null) {
-                      haltedReason = reason;
+                      halt(reason);
                       emit({ type: "tool.blocked", name, reason });
                     }
                   });
@@ -594,17 +630,18 @@ export class ClaudeCodeRunner {
                         reason: verdict.reason,
                       }, emit, redact);
                       if (userVerdict !== "approved" && haltedReason === null) {
-                        haltedReason = userVerdict === "expired" ? "approval timed out" : "approval denied by user";
+                        halt(userVerdict === "expired" ? "approval timed out" : "approval denied by user");
                       }
                     } else if (verdict.action === "retry") {
                       if (haltedReason === null) {
-                        haltedReason = `decision brain requested retry: ${verdict.reason}`;
-                        emit({ type: "tool.blocked", name, reason: haltedReason });
+                        const reason = `decision brain requested retry: ${verdict.reason}`;
+                        halt(reason);
+                        emit({ type: "tool.blocked", name, reason });
                       }
                     } else if (haltedReason === null) {
                       // `ask` without a gateway, or `stop`: halt with the reason.
-                      haltedReason = verdict.reason;
-                      emit({ type: "tool.blocked", name, reason: haltedReason });
+                      halt(verdict.reason);
+                      emit({ type: "tool.blocked", name, reason: verdict.reason });
                     }
                   });
                 }
@@ -712,6 +749,9 @@ export class ClaudeCodeRunner {
             // recovered, so the next decision must not retry on it.
             lastBrainToolResult = { ok, output: output.slice(0, 2000) };
             lastBrainError = ok ? null : output.slice(0, 500);
+            // A successful tool result must not keep poisoning Decision Brain
+            // snapshots with a stale stream-json error from earlier in the run.
+            if (ok) firstErrorMessage = undefined;
           }
           break;
         }
@@ -766,7 +806,7 @@ export class ClaudeCodeRunner {
           if (haltedReason === null) {
             const message = error instanceof Error ? error.message : String(error);
             emit({ type: "run.error", message: redact(message), sessionId: lastSessionId });
-            haltedReason = "internal harness error";
+            halt("internal harness error");
           }
         }
       },
@@ -778,7 +818,9 @@ export class ClaudeCodeRunner {
     const execOpts: VmExecOpts = {
       cwd: request.cwd,
       env: request.env,
-      signal: request.signal ? AbortSignal.any([request.signal, switchAbort.signal]) : switchAbort.signal,
+      signal: request.signal
+        ? AbortSignal.any([request.signal, switchAbort.signal, haltAbort.signal])
+        : AbortSignal.any([switchAbort.signal, haltAbort.signal]),
       ...(request.pgidFile ? { pgidFile: request.pgidFile } : {}),
       onStdout: (chunk) => parser.push(chunk),
       onStderr: (chunk) => {
@@ -786,7 +828,7 @@ export class ClaudeCodeRunner {
       },
     };
 
-    let exitCode: number;
+    let exitCode = -1;
     try {
       const result = await request.vm.exec(argv, execOpts);
       exitCode = result.exitCode;
@@ -797,13 +839,28 @@ export class ClaudeCodeRunner {
       // reported as an error (e.g. the max-duration quota reaping the process
       // group while a background child kept stdout open).
       parser.flush();
-      if (
-        !request.signal?.aborted &&
-        haltedReason === null &&
-        pendingSwitch.phase === null &&
-        finalMeta &&
-        resultSucceeded(finalMeta)
-      ) {
+      // Real exec drivers reject when the abort signal fires. A role switch or
+      // a policy halt is a normal outcome, not an exec failure: settle the
+      // gates and return the same shape the non-throwing path returns.
+      await gateChain;
+      if (pendingSwitch.phase) {
+        return {
+          exitCode,
+          aborted: false,
+          malformedLines,
+          roleSwitch: { toRoleId: pendingSwitch.phase.roleId, sessionId: lastSessionId ?? request.sessionId },
+        };
+      }
+      if (haltedReason !== null) {
+        emit({
+          type: "run.error",
+          message: `Halted by harness risk policy: ${haltedReason}`,
+          exitCode,
+          sessionId: lastSessionId,
+        });
+        return { exitCode, aborted: false, malformedLines };
+      }
+      if (!request.signal?.aborted && finalMeta && resultSucceeded(finalMeta)) {
         return emitFinished();
       }
       const message = error instanceof Error ? error.message : String(error);
@@ -813,8 +870,13 @@ export class ClaudeCodeRunner {
         message: redact(cleaned ? cleaned : "claude exec failed"),
         sessionId: lastSessionId,
       });
-      return { exitCode: -1, aborted: request.signal?.aborted === true, malformedLines };
+      return { exitCode, aborted: request.signal?.aborted === true, malformedLines };
     }
+
+    // Flush the last partial line before gates run: a gated tool call or the
+    // final result may arrive without a trailing newline, and the gate must
+    // still be awaited and enforced.
+    if (!request.signal?.aborted) parser.flush();
 
     // Wait for any outstanding approval/switch decisions so the run never
     // finalizes while a gate is still pending.
@@ -872,7 +934,7 @@ export class ClaudeCodeRunner {
     if (exitCode !== 0) {
       const rawDetail = firstErrorMessage ?? (stderrTail.trim() ? stderrTail.trim() : undefined);
       const cleaned = rawDetail === undefined ? undefined : stripBenignWarnings(rawDetail);
-      const detail = cleaned ? cleaned : undefined;
+      const detail = cleaned ? redact(cleaned) : undefined;
       const message = isSignalKillExitCode(exitCode)
         ? detail
           ? `${describeKill(exitCode, stderrTail)} ${detail}`
@@ -880,7 +942,7 @@ export class ClaudeCodeRunner {
         : `claude exited with code ${exitCode}${detail ? `: ${detail}` : ""}`;
       emit({
         type: "run.error",
-        message,
+        message: redact(message),
         exitCode,
         sessionId: lastSessionId,
       });
@@ -922,7 +984,7 @@ export class ClaudeCodeRunner {
         id: ticket.id,
         tool: approval.toolName,
         action: redact(approval.action),
-        reason: approval.reason,
+        reason: redact(approval.reason),
         riskLevel: "ask",
         expiresAt: ticket.expiresAt,
       },
@@ -955,7 +1017,7 @@ export class ClaudeCodeRunner {
         id: ticket.id,
         tool: approval.toolName,
         action: redact(approval.action),
-        reason: approval.reason,
+        reason: redact(approval.reason),
         expiresAt: ticket.expiresAt,
       });
     }
@@ -982,8 +1044,8 @@ export class ClaudeCodeRunner {
       type: "question.required",
       question: {
         id: ticket.id,
-        question: ticket.question,
-        ...(ticket.options.length > 0 ? { options: ticket.options } : {}),
+        question: redact(ticket.question),
+        ...(ticket.options.length > 0 ? { options: ticket.options.map((option) => redact(option)) } : {}),
         allowFreeText: ticket.allowFreeText,
         ...(ticket.expiresAt !== undefined ? { expiresAt: ticket.expiresAt } : {}),
       },
@@ -1014,7 +1076,7 @@ export class ClaudeCodeRunner {
     request: RunRequest,
     handoff: HandoffRequest,
     emit: (event: TelemetryEvent) => void,
-    _redact: (text: string) => string,
+    redact: (text: string) => string,
   ): Promise<void> {
     const gateway = request.handoffGateway!;
     let ticket: HandoffTicket;
@@ -1029,8 +1091,8 @@ export class ClaudeCodeRunner {
       type: "handoff.required",
       handoff: {
         id: ticket.id,
-        reason: ticket.reason,
-        ...(ticket.description.length > 0 ? { description: ticket.description } : {}),
+        reason: redact(ticket.reason),
+        ...(ticket.description.length > 0 ? { description: redact(ticket.description) } : {}),
         ...(ticket.expiresAt !== undefined ? { expiresAt: ticket.expiresAt } : {}),
       },
     });
@@ -1078,13 +1140,16 @@ export class ClaudeCodeRunner {
     if (mode === "l1") {
       // One invocation, one prompt: the request prompt is the ledger goal and
       // the agent card / role prompt / memory become the packed system header.
-      // File windows and the AST skeleton are empty here because the runner has
-      // no filesystem view of the user's VM; a caller with file state can feed
-      // them in later. toPackedRunRequest also drops --resume: an L1 turn is
+      // When the caller passes a persisted snapshot (RunRequest.stateLedger),
+      // the ledger is hydrated from it so a resumed or retried run inherits
+      // its negative constraints instead of starting fresh. File windows and
+      // the AST skeleton are empty here because the runner has no filesystem
+      // view of the user's VM; a caller with file state can feed them in
+      // later. toPackedRunRequest also drops --resume: an L1 turn is
       // stateless, so replaying the whole CLI session would defeat the budget.
       const packed = new ContextGovernor().pack({
         turn: 0,
-        ledger: new StateLedger(request.prompt),
+        ledger: request.stateLedger ? StateLedger.fromJSON(request.stateLedger) : new StateLedger(request.prompt),
         skeletonFiles: [],
         workingSet: [],
         systemExtras: wantOrder
@@ -1106,13 +1171,17 @@ export class ClaudeCodeRunner {
     const argv: string[] = [this.bin, "-p", "--output-format", "stream-json", "--verbose"];
     if (effective.sessionId) argv.push("--resume", effective.sessionId);
     if (effective.model) argv.push("--model", effective.model);
+    const maxTurns = resolveMaxTurns(effective.maxTurns);
+    if (maxTurns !== undefined) argv.push("--max-turns", String(maxTurns));
     // The agent card, the active role's prompt and the account's long-term
     // memory ride as one appended system prompt, one argv element per value —
     // never interpolated into a shell string.
     const role = effective.rolePhase;
     if (role && role.toolsDisabled !== true) {
-      argv.push("--allowedTools", ...role.allowedTools);
-      argv.push("--mcp-config", role.mcpConfigPath);
+      // Empty values must not produce a bare flag: the CLI would consume the
+      // following flag name as the value (e.g. "--mcp-config" as a tool).
+      if (role.allowedTools.length > 0) argv.push("--allowedTools", ...role.allowedTools);
+      if (role.mcpConfigPath) argv.push("--mcp-config", role.mcpConfigPath);
     }
     const appended = this.appendedSystemPrompt(effective, role?.appendSystemPrompt, mode, (applied) => {
       packer = applied;
@@ -1169,15 +1238,41 @@ export class ClaudeCodeRunner {
 }
 
 /**
+ * Strip single- and double-quoted segments so `&` inside quotes or URL query
+ * strings does not look like a shell background operator.
+ */
+function stripQuotedSegments(command: string): string {
+  let out = "";
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote) {
+      if (ch === "\\" && i + 1 < command.length) {
+        i += 1; // skip escaped char inside quotes
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * True when a shell command detaches work from the foreground: a background
  * operator (`&` — not `&&`, and not the `&>` / `>&` redirections), `nohup` /
- * `setsid`, `disown`, or a detached tmux/screen session. A quoted ampersand
- * (e.g. `echo "a & b"`) can false-positive; the check is a heuristic for the
- * harness warning, not a security gate, so it errs toward flagging.
+ * `setsid`, `disown`, or a detached tmux/screen session. Quoted ampersands
+ * (e.g. `echo "a & b"` or `curl "https://x?a=1&b=2"`) are ignored.
  */
 export function isBackgroundedCommand(command: string): boolean {
   if (typeof command !== "string" || command.trim() === "") return false;
-  return BACKGROUND_PATTERNS.some((pattern) => pattern.test(command));
+  const unquoted = stripQuotedSegments(command);
+  return BACKGROUND_PATTERNS.some((pattern) => pattern.test(unquoted));
 }
 
 const BACKGROUND_PATTERNS: readonly RegExp[] = [

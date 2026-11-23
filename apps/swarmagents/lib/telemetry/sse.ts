@@ -3,12 +3,18 @@ import { getRunsDir } from "./paths";
 import { INITIAL_REPLAY_CAP, streamRunEventsFrom, tailRunLogLastEvent } from "./run-log";
 
 export function encodeSse(event: SequencedEvent): string {
-  return `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+  const safeSeq = String(event.seq).replace(/[\r\n]/g, "");
+  const safeType = String(event.type).replace(/[\r\n]/g, "");
+  // Synthetic frames (stream.error seq -1, run.snapshot seq 0) must not carry
+  // an id: EventSource would persist it as Last-Event-ID and replay the whole
+  // run on the next reconnect. Real events start at seq 1.
+  const id = event.seq > 0 ? `id: ${safeSeq}\n` : "";
+  return `${id}event: ${safeType}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
 /** Run events after which no further events can arrive for a run. */
 export function isTerminalRunEvent(type: string): boolean {
-  return type === "run.finished" || type === "run.error" || type === "run.cancelled" || type === "run.paused";
+  return type === "run.finished" || type === "run.error" || type === "run.cancelled";
 }
 
 export interface SseStreamOptions {
@@ -46,6 +52,7 @@ export function sseResponse(
       let terminalSent = false;
       let unsubscribe: (() => void) | null = null;
       let pendingUnsubscribe = false;
+      let onAbort: (() => void) | null = null;
       const abortAtSetup = signal.aborted;
 
       const safeEnqueue = (chunk: string) => {
@@ -61,7 +68,13 @@ export function sseResponse(
         if (closed) return;
         closed = true;
         dbg("close", why);
-        clearInterval(keepAlive);
+        if (keepAlive !== undefined) clearInterval(keepAlive);
+        // Long-lived AbortSignals (e.g. the request's) outlive a closed stream;
+        // detaching here prevents an ever-growing chain of closed-over frames.
+        if (onAbort) {
+          signal.removeEventListener("abort", onAbort);
+          onAbort = null;
+        }
         if (unsubscribe) unsubscribe();
         else pendingUnsubscribe = true;
         try {
@@ -93,8 +106,10 @@ export function sseResponse(
 
       cleanup = () => closeStream("cancel");
 
-      const keepAlive = setInterval(() => safeEnqueue(": keep-alive\n\n"), keepAliveMs);
-      keepAlive.unref?.();
+      // keepAliveMs: 0 is used by tests and means "no timer": a 0 ms interval
+      // would otherwise spin and flood the stream with keep-alive frames.
+      const keepAlive = keepAliveMs > 0 ? setInterval(() => safeEnqueue(": keep-alive\n\n"), keepAliveMs) : undefined;
+      keepAlive?.unref?.();
 
       // Replay newer events from the durable run log asynchronously. The log
       // survives buffer eviction and restarts, so it is the only copy of an
@@ -107,19 +122,36 @@ export function sseResponse(
       //
       // Subscribe immediately so no live event is missed between stream
       // creation and the async replay completing. Events are buffered in
-      // `pending` (deduped by seq) until replay finishes, then flushed in seq
-      // order. After replay, live events are forwarded straight through —
+      // `pending` (deduped by content) until replay finishes, then flushed in
+      // seq order. After replay, live events are forwarded straight through —
       // mirroring the bus's live semantics (no fromSeq filtering on live events).
       const dir = options.runsDir === undefined ? getRunsDir() : options.runsDir;
       const maxReplay = fromSeq > 0 ? Infinity : INITIAL_REPLAY_CAP;
-      const pending = new Map<number, SequencedEvent>();
+      // Key on the whole event, not just seq: legacy disk logs can contain
+      // distinct events sharing a seq number, and keying by seq alone would
+      // silently drop them. Identical events appearing in both the log and
+      // the bus buffer still dedupe to a single frame.
+      const pending = new Map<string, SequencedEvent>();
+      const pendingKey = (event: SequencedEvent) => {
+        try {
+          return `${event.seq}\u0000${JSON.stringify(event)}`;
+        } catch {
+          // A non-JSON-safe payload must still be deliverable; fall back to
+          // the identity fields rather than dropping the event entirely.
+          return `${event.seq}\u0000${event.ts}\u0000${event.type}`;
+        }
+      };
+      const buffer = (event: SequencedEvent) => {
+        const key = pendingKey(event);
+        if (!pending.has(key)) pending.set(key, event);
+      };
       let replayDone = false;
       // A new viewer only receives the capped tail. Announce the window up
       // front (seq 0 sorts before every real event) so the client knows the
       // head of the run was omitted instead of silently starting mid-run.
       const noteReplayWindow = (info: { truncated: boolean; firstSeq: number; lastSeq: number }) => {
         if (!info.truncated || fromSeq > 0) return;
-        pending.set(0, {
+        buffer({
           seq: 0,
           runId,
           ts: Date.now(),
@@ -137,7 +169,7 @@ export function sseResponse(
           send(event);
           return;
         }
-        if (!pending.has(event.seq)) pending.set(event.seq, event);
+        buffer(event);
       };
       unsubscribe = bus.subscribe(runId, fromSeq, listener);
       // A terminal event may have buffered the bus replay before subscribe()
@@ -152,7 +184,8 @@ export function sseResponse(
       // quietly just releases the subscription. Attach before the async
       // replay so a disconnect during replay stops the read promptly.
       if (!abortAtSetup) {
-        signal.addEventListener("abort", () => closeStream("abort"), { once: true });
+        onAbort = () => closeStream("abort");
+        signal.addEventListener("abort", onAbort, { once: true });
       }
 
       // Abort that fires before the stream ever delivered data (the signal is
@@ -195,7 +228,7 @@ export function sseResponse(
               onWindow: noteReplayWindow,
             })) {
               if (closed) break;
-              if (!pending.has(event.seq)) pending.set(event.seq, event);
+              buffer(event);
             }
           } catch (err) {
             console.error(`[telemetry] log replay failed for ${runId}:`, err);
@@ -209,6 +242,9 @@ export function sseResponse(
           send(event);
           if (closed) break;
         }
+        // The replay buffer can hold thousands of events; drop the references
+        // once flushed so they are not retained for the live part of the stream.
+        pending.clear();
         if (closed) return;
         if (abortAtSetup) finishSetupAbort();
       })();

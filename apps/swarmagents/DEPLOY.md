@@ -249,6 +249,14 @@ compose time instead of serving an unauthenticated app. Five variables:
   public site (Docker bridge gateway IP, `host.docker.internal`); normally
   `SWARM_PUBLIC_ORIGIN` covers both.
 
+Library moderation is a separate trust boundary: `SWARM_ADMIN_USERS`
+(comma-separated user ids or account emails) names who may review and
+unpublish public-library items. In server mode nobody is an admin until
+it is set — set it on any deployment with a public catalog. See
+`apps/swarmagents/.env.example` and the `README.md` environment-variables
+table for the full list of production knobs (rate limits, BYOC port,
+node home, cloud-pool capacity, test-drive sweep interval).
+
 External MCP clients (including the swarm board at
 `/api/mcp/swarm-board`) authenticate with `SWARM_HARNESS_TOKEN` as a
 `Bearer` token; browser sessions use the signed cookie. Board reads and

@@ -9,16 +9,19 @@ import { MAX_REPO_ROOT_LEN, MAX_PINNED_REPOSITORIES } from "@/lib/gardener/types
 import { configureGardenerDir, readUserGardener, updateUserGardener } from "@/lib/gardener/store";
 import type { GardenerProposal } from "@/lib/gardener/types";
 import { DEFAULT_MAX_JSON_BODY_BYTES } from "@/lib/http";
+import { configureAuditPath, readAuditEntries } from "@/lib/audit";
 
 let tempDir: string;
 
 test.beforeEach(() => {
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gardener-route-test-"));
   configureGardenerDir(tempDir);
+  configureAuditPath(path.join(tempDir, "audit.jsonl"));
 });
 
 test.afterEach(() => {
   configureGardenerDir(null);
+  configureAuditPath(undefined);
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -221,3 +224,19 @@ test("removeProposal removes exactly one proposal", async () => {
   const data = (await noId.json()) as { error?: string };
   assert.match(data.error ?? "", /proposalId required/i);
 });
+
+test("setEnabled writes a gardener.autopilot audit entry", async () => {
+  const res = await post({ action: "setEnabled", enabled: true });
+  assert.equal(res.status, 200);
+  const entries = readAuditEntries("local");
+  const hit = entries.find((e) => e.action === "gardener.autopilot");
+  assert.ok(hit);
+  assert.equal(hit!.target, "enabled");
+  assert.equal(hit!.result, "success");
+
+  const off = await post({ action: "setEnabled", enabled: false });
+  assert.equal(off.status, 200);
+  const again = readAuditEntries("local").filter((e) => e.action === "gardener.autopilot");
+  assert.ok(again.some((e) => e.target === "disabled"));
+});
+

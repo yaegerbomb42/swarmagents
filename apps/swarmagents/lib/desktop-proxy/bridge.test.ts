@@ -397,12 +397,12 @@ test("bridge: view-only still drops input when RFB messages are split across fra
   const h = makeBridge("view");
   handshake(h);
   const fbur = Buffer.from([3, 1, 0, 0, 0, 0, 6, 64, 3, 132]);
-  const key = Buffer.from([4, 1, 0, 0, 0, 0x41, 0, 0].slice(0, 6)); // KeyEvent
+  const key = Buffer.from([4, 1, 0, 0, 0, 0, 0, 0x41]); // KeyEvent
   const pointer = Buffer.from([5, 1, 0, 10, 0, 20]);
   const cut = Buffer.concat([Buffer.from([6, 0, 0, 0, 0, 0, 0, 5]), Buffer.from("hello")]);
   const fence = Buffer.from([248, 0, 0, 0, 0, 0, 0, 1, 2, 0xaa, 0xbb]); // ClientFence, 2-byte payload
   const ecu = Buffer.from([150, 1, 0, 0, 0, 0, 6, 64, 3, 132]); // EnableContinuousUpdates
-  const qemuKey = Buffer.from([255, 0, 0, 1, 0, 0, 0, 0x41, 0, 0, 0, 30]);
+  const qemuKey = Buffer.from([255, 0, 0, 1, 0, 0, 0, 0x41, 0, 0, 0, 30]); // QEMU extended key (12 bytes)
   const resize = Buffer.concat([Buffer.from([251, 0, 7, 128, 4, 56, 1, 0]), Buffer.alloc(16)]);
 
   // One WS message with everything, delivered in 1-byte TCP slices.
@@ -516,7 +516,7 @@ test("bridge: browser backpressure pauses upstream at 8 MB and closes if still o
 test("bridge: setMode demotes a live control session to view and restores control", () => {
   const h = makeBridge("control");
   handshake(h);
-  const key = Buffer.from([4, 1, 0, 0, 0, 0x41]);
+  const key = Buffer.from([4, 1, 0, 0, 0, 0, 0, 0x41]); // KeyEvent: down-flag, 2 pad, keysym u32
   const fbur = Buffer.from([3, 1, 0, 0, 0, 0, 6, 64, 3, 132]);
 
   // Control: input forwarded.
@@ -538,7 +538,7 @@ test("bridge: setMode demotes a live control session to view and restores contro
 test("bridge: setMode view->view is a no-op and view->control unblocks input", () => {
   const h = makeBridge("view");
   handshake(h);
-  const key = Buffer.from([4, 1, 0, 0, 0, 0x41]);
+  const key = Buffer.from([4, 1, 0, 0, 0, 0, 0, 0x41]); // KeyEvent: down-flag, 2 pad, keysym u32
   const fbur = Buffer.from([3, 1, 0, 0, 0, 0, 6, 64, 3, 132]);
 
   h.client.feed(encodeClientFrame(OP_BINARY, key));
@@ -557,7 +557,7 @@ test("bridge: setMode view->view is a no-op and view->control unblocks input", (
 test("bridge: a view client sending an unknown RFB type terminates the bridge with 1002", () => {
   const h = makeBridge("view");
   handshake(h);
-  const key = Buffer.from([4, 1, 0, 0, 0, 0x41]);
+  const key = Buffer.from([4, 1, 0, 0, 0, 0, 0, 0x41]); // KeyEvent: down-flag, 2 pad, keysym u32
   // [99] (unknown) followed by a KeyEvent must not smuggle input through.
   h.client.feed(encodeClientFrame(OP_BINARY, Buffer.concat([Buffer.from([99, 0, 0, 0]), key])));
   assert.deepEqual(h.closes, ["rfb-view-violation"]);
@@ -620,6 +620,29 @@ test("bridge: a pong resets the keepalive watchdog", async () => {
 
   // Stop answering: the next missed pong must fail the bridge.
   await waitUntilClosed(h, "ping-timeout", 3000);
+});
+
+test("bridge: socket end closes the bridge and clears the ping timer", async () => {
+  const h = makeBridge("view", { pingIntervalMs: 20 });
+  handshake(h);
+  assert.equal((h.bridge as any).pingTimer !== null, true);
+  h.client.emit("end");
+  await waitUntilClosed(h, "client-end", 1000);
+  assert.equal((h.bridge as any).pingTimer, null);
+  assert.equal(h.client.listenerCount("end"), 0);
+  assert.equal(h.client.listenerCount("data"), 0);
+  assert.equal(h.upstream.listenerCount("close"), 0);
+});
+
+test("bridge: socket close cleans up timers and listeners", async () => {
+  const h = makeBridge("control", { pingIntervalMs: 20 });
+  handshake(h);
+  h.upstream.emit("close");
+  await waitUntilClosed(h, "upstream-close", 1000);
+  assert.equal((h.bridge as any).pingTimer, null);
+  assert.equal((h.bridge as any).timeout, null);
+  assert.equal(h.upstream.listenerCount("end"), 0);
+  assert.equal(h.upstream.listenerCount("error"), 0);
 });
 
 test("bridge: browser backpressure resumes upstream on drain below 8 MB", () => {
@@ -687,7 +710,7 @@ test("bridge: soak — a realistic framebuffer stream holds across mixed frames,
   const h = makeBridge("view");
   handshake(h);
 
-  const key = Buffer.from([4, 1, 0, 0, 0, 0x41]);
+  const key = Buffer.from([4, 1, 0, 0, 0, 0, 0, 0x41]); // KeyEvent: down-flag, 2 pad, keysym u32
   const fbur = Buffer.from([3, 1, 0, 0, 0, 0, 6, 64, 3, 132]);
 
   // A view-only client cannot inject input, but framebuffer requests pass.
@@ -810,7 +833,7 @@ test("bridge: input (browser→server) events are never written to the recording
 
   // A key event and a pointer event from the browser (the only direction that
   // carries input) must never reach the recorder.
-  const keyEvent = Buffer.from([4, 1, 0, 0, 0, 0x41]);
+  const keyEvent = Buffer.from([4, 1, 0, 0, 0, 0, 0, 0x41]); // KeyEvent
   const pointerEvent = Buffer.from([5, 1, 0, 10, 0, 20]);
   const encrypted = h.client.feed(encodeClientFrame(OP_BINARY, Buffer.concat([keyEvent, pointerEvent])));
   assert.ok(h.toUpstream.binary().length > 0, "input still forwarded in control mode");

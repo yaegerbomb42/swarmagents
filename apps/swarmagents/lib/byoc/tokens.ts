@@ -42,6 +42,8 @@ export interface ByocPairingRecord {
   /** SHA-256 (hex) of the code. The code itself is never stored. */
   codeHash: string;
   userId: string;
+  /** Optional display name chosen when the code was created; applied at redeem. */
+  preferredName?: string;
   createdAt: number;
   expiresAt: number;
   usedAt?: number;
@@ -173,21 +175,31 @@ export class ByocTokenStore {
   }
 
   /** Create a one-time pairing code for a user. Returns the clear code. */
-  createPairingCode(userId: string, ttlMs?: number): { code: string; expiresAt: number } {
+  createPairingCode(
+    userId: string,
+    ttlMsOrOptions?: number | { ttlMs?: number; name?: string },
+  ): { code: string; expiresAt: number; name: string } {
     this.load();
     const now = this.now();
-    const ttl = ttlMs ?? this.pairingTtlMs;
+    const opts =
+      typeof ttlMsOrOptions === "number"
+        ? { ttlMs: ttlMsOrOptions }
+        : ttlMsOrOptions ?? {};
+    const ttl = opts.ttlMs ?? this.pairingTtlMs;
+    const preferredName =
+      typeof opts.name === "string" ? opts.name.trim().slice(0, 64) : "";
     const code = generateCode();
     // Drop expired codes so the file does not grow without bound.
     this.state.codes = this.state.codes.filter((c) => c.expiresAt > now && !c.usedAt);
     this.state.codes.push({
       codeHash: hashSecret(code),
       userId,
+      ...(preferredName ? { preferredName } : {}),
       createdAt: now,
       expiresAt: now + ttl,
     });
     this.save();
-    return { code: formatPairingCode(code), expiresAt: now + ttl };
+    return { code: formatPairingCode(code), expiresAt: now + ttl, name: preferredName };
   }
 
   /**
@@ -208,10 +220,14 @@ export class ByocTokenStore {
 
     record.usedAt = now;
     const token = generateDeviceToken();
+    const fromRedeem = deviceName.trim().slice(0, 64);
+    const fromCode = (record.preferredName ?? "").trim().slice(0, 64);
     const device: ByocDeviceRecord = {
       id: `dev_${crypto.randomBytes(9).toString("base64url")}`,
       userId: record.userId,
-      name: deviceName.slice(0, 64) || "swarm-node",
+      // Redeem-time name wins when the node supplies one; otherwise the name
+      // chosen when the pairing code was created (POST /api/byoc/pair).
+      name: fromRedeem || fromCode || "swarm-node",
       tokenHash: hashSecret(token),
       createdAt: now,
     };

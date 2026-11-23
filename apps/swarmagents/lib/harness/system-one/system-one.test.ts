@@ -8,7 +8,7 @@ import { completionProb, destructiveProb, intentWeights, isPlaceholder, patchSig
 import { SystemOneHooks, type SystemOneEvent } from "./hooks";
 import { localScorer, withFallback, type SystemOneScorer } from "./scorer";
 import { DEFAULT_SYSTEM_ONE_SETTINGS, resolveSystemOneSettings } from "./settings";
-import { ContinuationTracker, patchOf, searchTerms } from "./gates";
+import { ContinuationTracker, assessCommand, patchOf, searchTerms } from "./gates";
 
 const ON = { enabled: true };
 
@@ -247,4 +247,46 @@ test("ContinuationTracker: failing verification resets eligibility; unknown tool
   t.record([{ name: "mcp__db__query", input: {}, isError: false }], "");
   assert.equal(t.eligible("x".repeat(100)), false);
   assert.equal(t.redundantReadOnly, 0);
+});
+
+test("features: shell separators and absolute command paths are analysed", () => {
+  assert.equal(recursiveDeleteRisk("echo ok&&rm -rf /"), "wipe");
+  assert.equal(recursiveDeleteRisk("echo ok || /bin/rm -rf /"), "wipe");
+  assert.equal(recursiveDeleteRisk("echo ok\nrm -rf /"), "wipe");
+  assert.equal(recursiveDeleteRisk("echo /bin/rm"), "none");
+  assert.ok(destructiveProb("/bin/rm -rf /", "/repo", "/repo") > 0.85);
+});
+
+test("features: outsideRepo normalizes paths and enforces directory boundaries", () => {
+  for (const target of [
+    "/workspace/app-evil",
+    "/tmp-evil",
+    "/workspace/app/../../etc/passwd",
+  ]) {
+    assert.ok(
+      destructiveProb(`cp notes.txt ${target}`, "/workspace/app", "/workspace/app") > 0.85,
+      `${target} should be treated as outside the repo`,
+    );
+  }
+  assert.ok(
+    destructiveProb("cp notes.txt /tmp/scratch", "/workspace/app", "/workspace/app") < 0.1,
+    "/tmp is allowed",
+  );
+});
+
+test("features: bracketBalance ignores comments and quoted strings", () => {
+  assert.equal(patchSignals("", "// don't\n{").bracketDelta, 1);
+  assert.equal(patchSignals("", "/* { don't */ }").bracketDelta, -1);
+  assert.equal(patchSignals("", 'const s = "{";').bracketDelta, 0);
+  assert.equal(patchSignals("", "// }\n{").bracketDelta, 1);
+});
+
+test("gates: assessCommand clamps a misbehaving remote score to [0, 1]", async () => {
+  const input = { command: "ls", cwd: "/repo", repoRoot: "/repo", allowOutsideRepo: false };
+  const high: SystemOneScorer = { ...localScorer, destructive: () => 1.5 };
+  const low: SystemOneScorer = { ...localScorer, destructive: () => -1 };
+  const highVerdict = await assessCommand(high, input, 0.5);
+  const lowVerdict = await assessCommand(low, input, 0.5);
+  assert.equal(highVerdict.prob, 1);
+  assert.ok(lowVerdict.prob >= 0);
 });

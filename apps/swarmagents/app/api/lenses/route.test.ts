@@ -5,8 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NextRequest } from "next/server";
 import { POST } from "./route";
+import { lensErrorResponse } from "../../../lib/lenses/error-response";
+import { RouterError } from "../../../lib/providers/router";
 import { configureProviderStorePaths, saveProvider } from "../../../lib/providers/store";
 import { configureRunsDir, getRunsDir } from "../../../lib/telemetry/paths";
+import { telemetryBus } from "../../../lib/telemetry";
 import { VmManager, setVmManagerForTesting } from "../../../lib/vm/manager";
 import { FakeVmDriver } from "../../../lib/vm/fake-driver";
 import type { VmFileBytes, VmHandle } from "../../../lib/vm/types";
@@ -139,6 +142,29 @@ test("a failing provider answers with a redacted error, never with key material"
   assert.equal(res.status, 502);
   const body = await res.json();
   assert.equal(String(body.error).includes(apiKey), false);
+});
+
+test("lensErrorResponse surfaces RouterError messages only", async () => {
+  const res = lensErrorResponse(new RouterError("No providers configured.", "no_providers"));
+  assert.equal(res.status, 502);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "No providers configured.");
+});
+
+test("lensErrorResponse hides internals for any non-RouterError", async () => {
+  // A raw leaked internal message (e.g. a stack path or key material) must
+  // never reach the client.
+  const res = lensErrorResponse(new Error(`secret ${apiKey} at /srv/app/lib/foo.ts:12`));
+  assert.equal(res.status, 502);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "Lens failed.");
+  assert.equal(String(body.error).includes(apiKey), false);
+  assert.equal(String(body.error).includes("/srv/app"), false);
+
+  // Non-Error throws are generic too.
+  const thrown = lensErrorResponse("something unexpected");
+  assert.equal(thrown.status, 502);
+  assert.equal(((await thrown.json()) as { error: string }).error, "Lens failed.");
 });
 
 test("a run artifact that is a symlink outside /workspace never reaches the provider", async () => {
@@ -282,4 +308,70 @@ test("a rate-limited caller cannot trigger VM artifact reads", async () => {
   const probe = await post({ lens: "eli5", message: "summarize the run differently", runId });
   assert.equal(probe.status, 429);
   assert.equal(driver.reads, readsBefore, "a rate-limited caller must not trigger VM artifact reads");
+});
+
+/** A second caller so these tests never share USER's rate-limit bucket. */
+const USER2 = "lens-user-2@example.com";
+
+test("an aborted lens request returns 499, not a provider error", async () => {
+  saveProvider(USER2, { id: "openai", apiKey });
+  globalThis.fetch = (async () => jsonResponse(openaiOk("x"))) as unknown as typeof globalThis.fetch;
+  const ctrl = new AbortController();
+  ctrl.abort();
+  const res = await POST(
+    new NextRequest("http://localhost/api/lenses", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-swarm-user": USER2 },
+      body: JSON.stringify({ lens: "eli5", message: "hello" }),
+      signal: ctrl.signal,
+    }),
+  );
+  assert.equal(res.status, 499);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "Request aborted.");
+  assert.equal(res.headers.get("cache-control"), "no-store");
+});
+
+test("an unexpected failure inside runLens answers 500 without leaking internals", async (t) => {
+  saveProvider(USER2, { id: "openai", apiKey });
+  // Seed a run owned by USER2 so the lens runs with a runId and attributes
+  // its cost through the telemetry bus.
+  const runsDir = getRunsDir();
+  assert.ok(runsDir, "a runs dir is required for this test");
+  mkdirSync(runsDir, { recursive: true });
+  const runId = "lens_telemetry_run";
+  writeFileSync(
+    join(runsDir, `${runId}.jsonl`),
+    `${JSON.stringify({
+      seq: 1,
+      runId,
+      ts: 1,
+      type: "run.created",
+      data: { userId: USER2, prompt: "hello telemetry" },
+    })}\n`,
+    "utf-8",
+  );
+  globalThis.fetch = (async () => jsonResponse(openaiOk("Telemetry boom."))) as unknown as typeof globalThis.fetch;
+  const boom = new Error("telemetry write failed at /tmp/internal/secret-path/run.log");
+  t.mock.method(telemetryBus, "publish", () => {
+    throw boom;
+  });
+  const res = await post({ lens: "eli5", message: "hello telemetry", runId }, USER2);
+  assert.equal(res.status, 500);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "Lens failed.");
+  assert.equal(JSON.stringify(body).includes("/tmp/internal/secret-path"), false);
+  assert.equal(res.headers.get("cache-control"), "no-store");
+});
+
+test("rejects an oversized body with 413", async () => {
+  const res = await POST(
+    new NextRequest("http://localhost/api/lenses", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-swarm-user": USER },
+      body: JSON.stringify({ lens: "eli5", message: "hello", pad: "x".repeat(300 * 1024) }),
+    }),
+  );
+  assert.equal(res.status, 413);
+  assert.deepEqual(await res.json(), { error: "Request body too large." });
 });

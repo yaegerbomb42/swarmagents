@@ -20,7 +20,7 @@ import {
 function makeReport(runId: string, userId: string): ReturnType<typeof assembleReport> {
   const events: SequencedEvent[] = [
     { type: "run.created", data: { prompt: "hello", userId }, seq: 1, runId, ts: 1_000 },
-    { type: "run.finished", exitCode: 0, seq: 2, runId, ts: 2_000 },
+    { type: "run.finished", data: { exitCode: 0 }, seq: 2, runId, ts: 2_000 },
   ];
   return assembleReport({ runId, userId, events, createdAt: 1_000, finishedAt: 2_000, artifacts: [], shots: [] });
 }
@@ -58,7 +58,7 @@ test("opted-in capture stores ordered events and the final report in one JSONL f
     attachRunTrajectory("run_trajectory", "alice", bus, { enabled: true, runsDir });
     bus.publish("run_trajectory", { type: "run.created", data: { prompt: "hello", userId: "alice" } });
     bus.publish("run_trajectory", { type: "assistant.text", data: { text: "done" } });
-    bus.publish("run_trajectory", { type: "run.finished", exitCode: 0 });
+    bus.publish("run_trajectory", { type: "run.finished", data: { exitCode: 0 } });
     writeRunReport("run_trajectory", makeReport("run_trajectory", "alice"), runsDir);
 
     let record = readRunTrajectory("run_trajectory", runsDir);
@@ -99,7 +99,7 @@ test("a final report is retained after oversized events are dropped", async () =
   try {
     attachRunTrajectory("run_report_cap", "alice", bus, { enabled: true, runsDir });
     bus.publish("run_report_cap", { type: "large.event", data: { payload: "x".repeat(MAX_TRAJECTORY_BYTES + 1) } });
-    bus.publish("run_report_cap", { type: "run.finished", exitCode: 0 });
+    bus.publish("run_report_cap", { type: "run.finished", data: { exitCode: 0 } });
     writeRunReport("run_report_cap", makeReport("run_report_cap", "alice"), runsDir);
 
     let record = readRunTrajectory("run_report_cap", runsDir);

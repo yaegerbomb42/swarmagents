@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -67,17 +68,23 @@ test("the MCP server entry carries the RPC directory", () => {
   assert.equal(entry.env.SWARM_MEMORY_DIR, "/tmp/swarm-memory");
 });
 
-test("the in-VM server answers initialize, tools/list and tools/call", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "swarm-memory-mcp-"));
-  const rpcDir = join(dir, "rpc");
+interface MemoryServer {
+  child: ChildProcessWithoutNullStreams;
+  lines: string[];
+  send: (message: unknown) => void;
+}
+
+const POLL_MS = 20;
+const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Spawn the generated server with a collecting stdout and a JSON-lines send helper. */
+function startServer(dir: string, rpcDir = join(dir, "rpc"), env: Record<string, string> = {}): MemoryServer {
   const script = join(dir, "memory-server.mjs");
   writeFileSync(script, MEMORY_MCP_SERVER_SOURCE, "utf8");
-
   const child = spawn(process.execPath, [script], {
-    env: { ...process.env, SWARM_MEMORY_DIR: rpcDir, SWARM_MEMORY_POLL_MS: "20" },
+    env: { ...process.env, SWARM_MEMORY_DIR: rpcDir, SWARM_MEMORY_POLL_MS: String(POLL_MS), ...env },
     stdio: ["pipe", "pipe", "pipe"],
   });
-
   const lines: string[] = [];
   let buffer = "";
   child.stdout.on("data", (chunk: Buffer) => {
@@ -90,44 +97,52 @@ test("the in-VM server answers initialize, tools/list and tools/call", async () 
       newline = buffer.indexOf("\n");
     }
   });
+  return { child, lines, send: (message) => child.stdin.write(`${JSON.stringify(message)}\n`) };
+}
 
-  const send = (message: unknown) => {
-    child.stdin.write(`${JSON.stringify(message)}\n`);
-  };
+async function waitForRequest(rpcDir: string): Promise<{ raw: Record<string, unknown>; id: string } | null> {
+  for (let i = 0; i < 100; i++) {
+    await wait(POLL_MS);
+    const files = listRequests(rpcDir);
+    if (!files.length) continue;
+    const raw = JSON.parse(readFileSync(join(rpcDir, files[0]), "utf8")) as Record<string, unknown>;
+    return { raw, id: files[0].replace(/^req-/, "").replace(/\.json$/, "") };
+  }
+  return null;
+}
 
+function answer(rpcDir: string, id: string, payload: unknown): void {
+  writeFileSync(join(rpcDir, `res-${id}.json`), JSON.stringify(payload), "utf8");
+}
+
+async function waitForLines(lines: string[], count: number): Promise<void> {
+  for (let i = 0; i < 100 && lines.length < count; i++) await wait(POLL_MS);
+}
+
+test("the in-VM server answers initialize, tools/list and tools/call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "swarm-memory-mcp-"));
+  const rpcDir = join(dir, "rpc");
+  const server = startServer(dir, rpcDir);
   try {
-    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
-    send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-    send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "memory_write", arguments: { fact: "the user prefers pnpm" } } });
+    server.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    server.send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    server.send({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "memory_write", arguments: { fact: "the user prefers pnpm" } },
+    });
 
-    // The server writes the request envelope into the VM's RPC directory and
-    // waits for the host's answer: play the host here.
-    let request: { tool?: string; args?: { fact?: string } } | null = null;
-    for (let i = 0; i < 100 && request === null; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      const files = listRequests(rpcDir);
-      if (files.length === 0) continue;
-      const raw = JSON.parse(readFileSync(join(rpcDir, files[0]), "utf8")) as { tool?: string; args?: { fact?: string } };
-      request = raw;
-      const id = files[0].replace(/^req-/, "").replace(/\.json$/, "");
-      writeFileSync(
-        join(rpcDir, `res-${id}.json`),
-        JSON.stringify({ ok: true, message: `stored ${raw.args?.fact ?? ""}` }),
-        "utf8",
-      );
-    }
-
+    // The server writes one request envelope and waits for the host's answer.
+    const request = await waitForRequest(rpcDir);
     assert.ok(request, "the in-VM server never asked the host");
-    assert.equal(request.tool, "memory_write");
-    assert.equal(request.args?.fact, "the user prefers pnpm");
+    assert.equal(request.raw.tool, "memory_write");
+    assert.deepEqual(request.raw.args, { fact: "the user prefers pnpm" });
+    answer(rpcDir, request.id, { ok: true, message: "stored the user prefers pnpm" });
 
-    // Wait for the answers to come back on stdout.
-    for (let i = 0; i < 100 && lines.length < 3; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    const answers = lines.map((line) => JSON.parse(line) as { id: number; result?: Record<string, unknown> });
-    const init = answers.find((answer) => answer.id === 1);
-    assert.ok(init, "no initialize answer");
+    await waitForLines(server.lines, 3);
+    const answers = server.lines.map((line) => JSON.parse(line) as { id: number; result?: Record<string, unknown> });
+    assert.ok(answers.find((answer) => answer.id === 1), "no initialize answer");
     const list = answers.find((answer) => answer.id === 2);
     const tools = (list?.result?.tools ?? []) as Array<{ name: string }>;
     assert.deepEqual(tools.map((tool) => tool.name), ["memory_write", "memory_search", "memory_forget"]);
@@ -135,7 +150,7 @@ test("the in-VM server answers initialize, tools/list and tools/call", async () 
     const content = (call?.result?.content ?? []) as Array<{ text: string }>;
     assert.match(content[0]?.text ?? "", /"ok":true/);
   } finally {
-    child.kill("SIGTERM");
+    server.child.kill("SIGTERM");
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -143,38 +158,86 @@ test("the in-VM server answers initialize, tools/list and tools/call", async () 
 test("the in-VM server scrubs secrets before the fact leaves the VM", async () => {
   const dir = mkdtempSync(join(tmpdir(), "swarm-memory-mcp-"));
   const rpcDir = join(dir, "rpc");
-  const script = join(dir, "memory-server.mjs");
-  writeFileSync(script, MEMORY_MCP_SERVER_SOURCE, "utf8");
-
-  const child = spawn(process.execPath, [script], {
-    env: { ...process.env, SWARM_MEMORY_DIR: rpcDir, SWARM_MEMORY_POLL_MS: "20" },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
+  const server = startServer(dir, rpcDir);
+  const secret = "sk-test-0123456789abcdefghij";
   try {
-    const secret = "sk-FAKE-VM-KEY-0123456789ABCDEF0123456789";
-    child.stdin.write(
-      `${JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: { name: "memory_write", arguments: { fact: `the key is ${secret}` } },
-      })}\n`,
-    );
-
-    let request: { args?: { fact?: string } } | null = null;
-    for (let i = 0; i < 100 && request === null; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      const files = listRequests(rpcDir);
-      if (files.length === 0) continue;
-      request = JSON.parse(readFileSync(join(rpcDir, files[0]), "utf8")) as { args?: { fact?: string } };
-    }
-
+    server.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "memory_write", arguments: { fact: `the key is ${secret}` } },
+    });
+    const request = await waitForRequest(rpcDir);
     assert.ok(request, "the in-VM server never asked the host");
-    assert.ok(!(request.args?.fact ?? "").includes(secret), "the secret left the VM");
-    assert.match(request.args?.fact ?? "", /\[REDACTED\]/);
+    const args = request.raw.args as { fact?: string } | undefined;
+    assert.ok(!(args?.fact ?? "").includes(secret), "the secret left the VM");
+    assert.match(args?.fact ?? "", /\[REDACTED\]/);
   } finally {
-    child.kill("SIGTERM");
+    server.child.kill("SIGTERM");
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the in-VM server scrubs secrets nested inside objects and arrays", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "swarm-memory-mcp-"));
+  const rpcDir = join(dir, "rpc");
+  const server = startServer(dir, rpcDir);
+  const secret = "sk-nested-0123456789abcdef";
+  try {
+    server.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "memory_write",
+        arguments: { fact: "outer", meta: { nested: { key: secret } }, list: [{ token: secret }] },
+      },
+    });
+    const request = await waitForRequest(rpcDir);
+    assert.ok(request, "the in-VM server never asked the host");
+    const args = request.raw.args as
+      | { meta?: { nested?: { key?: string } }; list?: Array<{ token?: string }> }
+      | undefined;
+    assert.equal(args?.meta?.nested?.key, "[REDACTED]");
+    assert.equal(args?.list?.[0]?.token, "[REDACTED]");
+  } finally {
+    server.child.kill("SIGTERM");
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the in-VM server answers a request whose id is null", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "swarm-memory-mcp-"));
+  const server = startServer(dir);
+  try {
+    server.send({ jsonrpc: "2.0", id: null, method: "tools/list" });
+    await waitForLines(server.lines, 1);
+    assert.equal(server.lines.length, 1, "a null id must still receive a response");
+    const answer = JSON.parse(server.lines[0]) as { id: null; result?: { tools?: unknown[] } };
+    assert.equal(answer.id, null);
+    assert.ok(Array.isArray(answer.result?.tools));
+  } finally {
+    server.child.kill("SIGTERM");
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the in-VM server exits cleanly when stdin closes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "swarm-memory-mcp-"));
+  const server = startServer(dir);
+  const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    server.child.on("close", (code, signal) => resolve({ code, signal }));
+  });
+  try {
+    server.child.stdin.end();
+    const result = await Promise.race([
+      exit,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
+    ]);
+    assert.ok(result, "the server did not exit after stdin EOF");
+    assert.equal(result.code, 0);
+  } finally {
+    server.child.kill("SIGTERM");
     rmSync(dir, { recursive: true, force: true });
   }
 });

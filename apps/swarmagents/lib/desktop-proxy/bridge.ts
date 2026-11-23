@@ -31,6 +31,9 @@ import {
 } from "./rfb-filter";
 import { RfbServerDecoder, RfbServerUnsupportedError } from "./rfb-server";
 import { FrameRecorder } from "./frame-recorder";
+import { RfbInputObserver } from "./rfb-input-observer";
+import type { InputEvent } from "./takeover/types";
+import type { FrameTap } from "./frame-tap";
 import {
   WsFrameDecoder,
   WsBufferOverflowError,
@@ -91,6 +94,21 @@ export interface DesktopBridgeOptions {
   recordFrames?: boolean;
   /** Recording file path used when `recordFrames` is true. */
   recordingFile?: string;
+  /**
+   * Optional sink for decoded client->server input events (key/pointer/
+   * clipboard), observed fail-open by RfbInputObserver. Used by the
+   * takeover summarizer to count human input while driving. Observation
+   * never alters the forwarded bytes and never throws across the bridge.
+   */
+  onInputEvent?: (event: InputEvent) => void;
+  /**
+   * Optional frame tap (damage-region differencing + keyframe capture).
+   * Fed the same upstream server→client payloads as the recorder, plus the
+   * pre-splice deferred bytes so its framebuffer shadow starts in sync.
+   * The tap is fail-open by contract; if it ever throws anyway, the bridge
+   * drops it and keeps streaming. Default: no tap, zero overhead.
+   */
+  frameTap?: FrameTap;
 }
 
 export class DesktopBridge {
@@ -120,6 +138,21 @@ export class DesktopBridge {
   private readonly pingIntervalMs: number;
   private readonly frameDecoder: RfbServerDecoder | null;
   private readonly recorder: FrameRecorder | null;
+  private readonly inputObserver: RfbInputObserver | null;
+  private readonly onInputEvent?: (event: InputEvent) => void;
+  /** Frame tap; nulled if it ever violates its never-throw contract. */
+  private frameTap: FrameTap | null;
+
+  // Bound so fail() can removeListener without leaking.
+  private readonly onClientData = (chunk: Buffer) => this.onClientChunk(chunk);
+  private readonly onUpstreamData = (chunk: Buffer) => this.onUpstreamChunk(chunk);
+  private readonly onClientDrainBound = () => this.onClientDrain();
+  private readonly onClientError = () => this.fail("client-error");
+  private readonly onUpstreamError = () => this.fail("upstream-error");
+  private readonly onClientEnd = () => this.fail("client-end");
+  private readonly onClientClose = () => this.fail("client-close");
+  private readonly onUpstreamEnd = () => this.fail("upstream-end");
+  private readonly onUpstreamClose = () => this.fail("upstream-close");
 
   constructor(
     private readonly client: net.Socket,
@@ -134,6 +167,9 @@ export class DesktopBridge {
     this.pingIntervalMs = options.pingIntervalMs ?? PING_INTERVAL_MS;
     this.frameDecoder = options.recordFrames && options.recordingFile ? new RfbServerDecoder() : null;
     this.recorder = options.recordFrames && options.recordingFile ? new FrameRecorder(options.recordingFile) : null;
+    this.inputObserver = options.onInputEvent ? new RfbInputObserver() : null;
+    this.onInputEvent = options.onInputEvent;
+    this.frameTap = options.frameTap ?? null;
     // Browser frames (client->server) must be masked; upstream frames must not be.
     this.clientDecoder = new WsFrameDecoder(this.maxBufferBytes, true);
     this.upstreamDecoder = new WsFrameDecoder(this.maxBufferBytes, false);
@@ -150,11 +186,16 @@ export class DesktopBridge {
     const startBytes = this.clientHs.start();
     if (startBytes.length > 0) this.writeUpstream(startBytes);
 
-    client.on("data", (chunk: Buffer) => this.onClientChunk(chunk));
-    upstream.on("data", (chunk: Buffer) => this.onUpstreamChunk(chunk));
-    client.on("drain", () => this.onClientDrain());
-    client.on("error", () => this.fail("client-error"));
-    upstream.on("error", () => this.fail("upstream-error"));
+    client.on("data", this.onClientData);
+    upstream.on("data", this.onUpstreamData);
+    client.on("drain", this.onClientDrainBound);
+    client.on("error", this.onClientError);
+    upstream.on("error", this.onUpstreamError);
+    // Detect half-open / peer-gone without waiting for the next ping.
+    client.on("end", this.onClientEnd);
+    client.on("close", this.onClientClose);
+    upstream.on("end", this.onUpstreamEnd);
+    upstream.on("close", this.onUpstreamClose);
 
     this.timeout = setTimeout(() => this.fail("handshake-timeout"), HANDSHAKE_TIMEOUT_MS);
     this.timeout.unref?.();
@@ -200,6 +241,15 @@ export class DesktopBridge {
     };
   }
 
+  /**
+   * The frame tap attached to this bridge, if any. The proxy's keyframe
+   * read API and the handback summarizer's latest-frame lookup go through
+   * here. Null when no tap was configured or it was dropped after throwing.
+   */
+  getFrameTap(): FrameTap | null {
+    return this.frameTap;
+  }
+
   /** One keepalive tick: fail on a missed pong, otherwise ping both peers. */
   private sendKeepalivePing(): void {
     if (this.closed || !this.spliced) return;
@@ -216,6 +266,18 @@ export class DesktopBridge {
     } catch {}
   }
 
+  private detachSocketListeners(): void {
+    this.client.removeListener("data", this.onClientData);
+    this.client.removeListener("drain", this.onClientDrainBound);
+    this.client.removeListener("error", this.onClientError);
+    this.client.removeListener("end", this.onClientEnd);
+    this.client.removeListener("close", this.onClientClose);
+    this.upstream.removeListener("data", this.onUpstreamData);
+    this.upstream.removeListener("error", this.onUpstreamError);
+    this.upstream.removeListener("end", this.onUpstreamEnd);
+    this.upstream.removeListener("close", this.onUpstreamClose);
+  }
+
   private fail(reason: string): void {
     if (this.closed) return;
     this.closed = true;
@@ -225,7 +287,13 @@ export class DesktopBridge {
     this.pingTimer = null;
     if (this.backpressureCloseTimer) clearTimeout(this.backpressureCloseTimer);
     this.backpressureCloseTimer = null;
+    this.detachSocketListeners();
     this.recorder?.close();
+    try {
+      this.frameTap?.close();
+    } catch {
+      // tap teardown must never block bridge teardown
+    }
     this.client.destroy();
     this.upstream.destroy();
     this.onCloseCb(reason);
@@ -356,6 +424,22 @@ export class DesktopBridge {
     }
     this.recordFrames(payload);
     this.writeClient(encodeFrame(OP_BINARY, payload));
+    // Tap after forwarding: the live path is never delayed by tap work.
+    this.feedFrameTap(payload);
+  }
+
+  /**
+   * Feed the upstream payload to the frame tap. The tap's contract is
+   * never-throw (it disables itself on bad input); if an implementation
+   * violates that anyway, drop the tap — the stream must not notice.
+   */
+  private feedFrameTap(payload: Buffer): void {
+    if (!this.frameTap) return;
+    try {
+      this.frameTap.feed(payload);
+    } catch {
+      this.frameTap = null;
+    }
   }
 
   /**
@@ -388,6 +472,17 @@ export class DesktopBridge {
     // dimensions before any message bytes flow.
     const serverInit = this.serverHs.serverInit(this.clientHs.width, this.clientHs.height);
     this.writeClient(encodeFrame(OP_BINARY, serverInit));
+    // The tap sizes its framebuffer shadow from the upstream ServerInit and
+    // receives the deferred upstream bytes below, so its compositor starts
+    // at a message boundary (the recorder does not get the deferred bytes —
+    // a pre-existing gap this does not change).
+    if (this.frameTap) {
+      try {
+        this.frameTap.setFramebufferSize(this.clientHs.width, this.clientHs.height);
+      } catch {
+        this.frameTap = null;
+      }
+    }
     if (this.clientDeferred.length > 0) {
       const deferred = this.clientDeferred;
       this.clientDeferred = Buffer.alloc(0);
@@ -396,11 +491,24 @@ export class DesktopBridge {
     if (this.upstreamDeferred.length > 0) {
       const deferred = this.upstreamDeferred;
       this.upstreamDeferred = Buffer.alloc(0);
+      this.feedFrameTap(deferred);
       this.writeClient(encodeFrame(OP_BINARY, deferred));
     }
   }
 
   private forwardToUpstream(payload: Buffer): void {
+    // Observe (never alter) client input for the takeover summarizer. The
+    // observer is fail-open and the sink is guarded: neither may break the
+    // stream, in view mode or control mode.
+    if (this.inputObserver && this.onInputEvent) {
+      for (const event of this.inputObserver.observe(payload)) {
+        try {
+          this.onInputEvent(event);
+        } catch {
+          /* observer sink must not break the stream */
+        }
+      }
+    }
     try {
       const out = this.filter ? this.filter.push(payload) : payload;
       if (out.length > 0) this.writeUpstream(out);

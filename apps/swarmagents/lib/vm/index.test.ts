@@ -5,6 +5,11 @@ import { PassThrough } from "node:stream";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { FakeVmDriver } from "./fake-driver.js";
 import {
+  FAKE_CLAUDE_WRITE_CONTENT,
+  FAKE_CLAUDE_WRITE_PATH,
+  FAKE_CLAUDE_WRITE_TRIGGER,
+} from "./fake-claude.js";
+import {
   DockerVmDriver,
   VmUnavailableError,
   VmRuntimeError,
@@ -155,6 +160,42 @@ test("FakeVmDriver writeFile and readFile round-trip", async () => {
   await driver.writeFile(h, "/workspace/test.txt", "alpha");
   const out = await driver.readFile(h, "/workspace/test.txt");
   assert.equal(out, "alpha");
+});
+
+test("FakeVmDriver replays the write scenario onto the workspace", async () => {
+  const driver = new FakeVmDriver();
+  const h = await driver.ensure("writer");
+  const chunks: string[] = [];
+  const result = await driver.exec(
+    h,
+    ["claude", "-p", FAKE_CLAUDE_WRITE_TRIGGER, "--", FAKE_CLAUDE_WRITE_TRIGGER],
+    { onStdout: (c) => chunks.push(c) },
+  );
+  assert.equal(result.exitCode, 0);
+  assert.ok(chunks.join("").includes("File created successfully"));
+  assert.equal(await driver.readFile(h, FAKE_CLAUDE_WRITE_PATH), FAKE_CLAUDE_WRITE_CONTENT);
+  const listing = await driver.listDir(h, "/workspace");
+  assert.deepEqual(
+    listing.map((entry) => entry.name),
+    ["hello.py"],
+  );
+});
+
+test("FakeVmDriver keeps a per-instance VM table unless sharedStore is set", async () => {
+  const isolatedA = new FakeVmDriver();
+  const isolatedB = new FakeVmDriver();
+  const ha = await isolatedA.ensure("isolated-user");
+  await isolatedA.writeFile(ha, "/workspace/only-a.txt", "a");
+  const hb = await isolatedB.ensure("isolated-user");
+  await assert.rejects(isolatedB.readFile(hb, "/workspace/only-a.txt"), /File not found/);
+
+  // The app's driver shares one table across route bundles: one machine.
+  const sharedA = new FakeVmDriver({ sharedStore: true });
+  const sharedB = new FakeVmDriver({ sharedStore: true });
+  const hsa = await sharedA.ensure("shared-user");
+  await sharedA.writeFile(hsa, "/workspace/shared.txt", "hello");
+  const hsb = await sharedB.ensure("shared-user");
+  assert.equal(await sharedB.readFile(hsb, "/workspace/shared.txt"), "hello");
 });
 
 test("FakeVmDriver status reflects running / stopped", async () => {

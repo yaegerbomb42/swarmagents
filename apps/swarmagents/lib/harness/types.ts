@@ -7,6 +7,7 @@
  * satisfies VmExec can be plugged in.
  */
 
+import type { StateLedgerSnapshot } from "./context/contextGovernor";
 import type { RiskLevel } from "./risk";
 
 /** Minimal exec interface, modeled on VmDriver. Implementations manage the actual process tree. */
@@ -384,6 +385,16 @@ export interface RoleSwitchRequest {
 export interface RunRequest {
   prompt: string;
   /**
+   * Persisted L1 state ledger for this run (StateLedgerSnapshot, see
+   * lib/harness/context/contextGovernor.ts). When the run uses the "l1"
+   * packer, the runner hydrates the ledger from this snapshot instead of
+   * starting fresh, so a resumed or retried run inherits its negative
+   * constraints (failed attempts). The harness never reads files; the
+   * caller owns persisting the snapshot next to the run and passing it
+   * back on the next turn.
+   */
+  stateLedger?: StateLedgerSnapshot;
+  /**
    * The agent card text — the user's own description of who the agent is and
    * what it should focus on. Passed to claude as `--append-system-prompt` so
    * it is treated as part of the system prompt, never as an instruction
@@ -415,6 +426,12 @@ export interface RunRequest {
   /** Resume a prior session instead of starting fresh (passed as --resume). */
   sessionId?: string;
   model?: string;
+  /**
+   * Turn ceiling for this invocation, passed to claude as `--max-turns`.
+   * The runner caps it at SWARM_MAX_TURNS (see resolveMaxTurns). Absent
+   * means no flag — the CLI's own default applies, as today.
+   */
+  maxTurns?: number;
   /** Stable provider id the run is pointed at (from the router selection). */
   provider?: string;
   env: Record<string, string>;

@@ -20,7 +20,11 @@ jobs:
     # Never runs for pull requests or forks: manual dispatch on main only.
     if: ${{ github.repository == 'yaegerbomb42/swarmagents' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    environment: production
+    # Dedicated playtest environment: it must contain only test-account
+    # credentials and TEST_<PROVIDER>_API_KEY secrets. Production secrets
+    # (DEPLOY_SSH_KEY, DEPLOY_HOST, SWARM_HARNESS_TOKEN, ...) live in the
+    # production environment and are never exposed to this job.
+    environment: playtest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -34,9 +38,9 @@ jobs:
           SWARM_TEST_EMAIL: ${{ secrets.SWARM_TEST_EMAIL }}
           SWARM_TEST_PASSWORD: ${{ secrets.SWARM_TEST_PASSWORD }}
           TEST_PROVIDERS_MANIFEST: ${{ vars.TEST_PROVIDERS_MANIFEST }}
-          # Secrets cannot be enumerated by name at run time, so the job passes
-          # them to the script as one blob; the script only reads the names the
-          # manifest lists and never prints values (GitHub also masks them).
+          # The playtest environment is the only source of secrets here; it
+          # must not contain production credentials. The script only reads the
+          # names the manifest lists and never prints values (GitHub masks them).
           ALL_SECRETS_JSON: ${{ toJSON(secrets) }}
           ALL_VARS_JSON: ${{ toJSON(vars) }}
         run: node scripts/playtest.mjs seed

@@ -25,6 +25,23 @@ export const FAKE_CLAUDE_HOST_TARGET_TRIGGER = "read the host filesystem";
 export const FAKE_CLAUDE_HOST_PATH = "/host/etc/passwd";
 
 /**
+ * The "build something" replay: a Write followed by a Bash run. It is the one
+ * fake scenario that changes the workspace, so it exercises the workspace
+ * files view, the presence line and the agent-wrote-this highlight without a
+ * real model.
+ */
+export const FAKE_CLAUDE_WRITE_TRIGGER = "create a file and run a script";
+export const FAKE_CLAUDE_WRITE_PATH = "/workspace/hello.py";
+export const FAKE_CLAUDE_WRITE_CONTENT = [
+  "print(\"hello from your computer\")",
+  "",
+].join("\n");
+export const FAKE_CLAUDE_WRITE_COMMAND = "python3 hello.py";
+export const FAKE_CLAUDE_WRITE_SUCCESS_TEXT = "hello from your computer";
+export const FAKE_CLAUDE_WRITE_ASSISTANT_TEXT =
+  "Created hello.py in your workspace and ran it — it printed hello from your computer.";
+
+/**
  * Prompt phrase that replays a routine ask-classified command. Auto-approve
  * mode runs it without an approval card; only host-targeted and irreversible
  * external calls stay gated.
@@ -96,6 +113,119 @@ export const FAKE_CLAUDE_TRANSCRIPT_LINES: readonly string[] = [
 ];
 
 export const FAKE_CLAUDE_TRANSCRIPT = `${FAKE_CLAUDE_TRANSCRIPT_LINES.join("\n")}\n`;
+
+/**
+ * Transcript for the "create a file and run a script" prompt. The Write tool
+ * call names a workspace path, so the run stream carries a tool.call whose
+ * presence entry marks /workspace/hello.py as written, and the Files view can
+ * follow it. The fake VM writes nothing itself: the transcript is the agent's
+ * side of the conversation, exactly like the other replays.
+ */
+export const FAKE_CLAUDE_WRITE_TRANSCRIPT_LINES: readonly string[] = [
+  JSON.stringify({
+    type: "system",
+    subtype: "init",
+    cwd: "/workspace",
+    session_id: FAKE_CLAUDE_SESSION_ID,
+    model: FAKE_CLAUDE_MODEL,
+  }),
+  JSON.stringify({
+    type: "assistant",
+    message: {
+      id: "msg_fake_write_1",
+      role: "assistant",
+      model: FAKE_CLAUDE_MODEL,
+      content: [
+        {
+          type: "text",
+          text: "I will create a small script and run it to check the Python setup.",
+        },
+      ],
+      usage: { input_tokens: 24, output_tokens: 12, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    },
+  }),
+  JSON.stringify({
+    type: "assistant",
+    message: {
+      id: "msg_fake_write_2",
+      role: "assistant",
+      model: FAKE_CLAUDE_MODEL,
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_fake_write_1",
+          name: "Write",
+          input: { file_path: FAKE_CLAUDE_WRITE_PATH, content: FAKE_CLAUDE_WRITE_CONTENT },
+        },
+      ],
+    },
+  }),
+  JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_fake_write_1",
+          content: "File created successfully.",
+          is_error: false,
+        },
+      ],
+    },
+  }),
+  JSON.stringify({
+    type: "assistant",
+    message: {
+      id: "msg_fake_write_3",
+      role: "assistant",
+      model: FAKE_CLAUDE_MODEL,
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_fake_write_2",
+          name: "Bash",
+          input: { command: FAKE_CLAUDE_WRITE_COMMAND },
+        },
+      ],
+    },
+  }),
+  JSON.stringify({
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_fake_write_2",
+          content: FAKE_CLAUDE_WRITE_SUCCESS_TEXT,
+          is_error: false,
+        },
+      ],
+    },
+  }),
+  JSON.stringify({
+    type: "assistant",
+    message: {
+      id: "msg_fake_write_4",
+      role: "assistant",
+      model: FAKE_CLAUDE_MODEL,
+      content: [{ type: "text", text: FAKE_CLAUDE_WRITE_ASSISTANT_TEXT }],
+      usage: { input_tokens: 40, output_tokens: 24, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    },
+  }),
+  JSON.stringify({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    duration_ms: 4200,
+    num_turns: 3,
+    total_cost_usd: 0.002,
+    session_id: FAKE_CLAUDE_SESSION_ID,
+  }),
+];
+
+export const FAKE_CLAUDE_WRITE_TRANSCRIPT = `${FAKE_CLAUDE_WRITE_TRANSCRIPT_LINES.join("\n")}\n`;
 
 /**
  * Transcript replayed when the prompt asks the fake agent to run a destructive

@@ -77,7 +77,10 @@ function resolveDriver(name?: string): VmDriver {
   // process must never silently present simulated work as a real VM run.
   const n = (name ?? defaultDriverName()) as DriverName;
   if (n === "docker") return new DockerVmDriver();
-  if (n === "fake") return new FakeVmDriver();
+  // One shared VM table across route bundles: the fake must behave like one
+  // machine no matter which route touches it (a run's Write has to be visible
+  // to the files API, and the terminal has to see the run's files).
+  if (n === "fake") return new FakeVmDriver({ sharedStore: true });
   if (n === "byoc") {
     // The BYOC driver pulls in the node protocol (shared with the standalone
     // runner). Load it on demand so a deploy that only runs the docker driver

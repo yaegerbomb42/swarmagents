@@ -12,9 +12,8 @@ const LOG_NAME_RE = /^([A-Za-z0-9_-]{1,64})\.jsonl(?:\.(\d+))?$/;
 const REPLAY_YIELD_EVERY = 512;
 /** New-viewer replay is capped to the most recent events for responsiveness. */
 export const INITIAL_REPLAY_CAP = 2000;
-/** Bytes read from the head/tail of a segment to probe its seq range. */
+/** Bytes read from the head of a segment to probe its first seq. */
 const PROBE_HEAD_BYTES = 4096;
-const PROBE_TAIL_BYTES = 64 * 1024;
 /** Segment-index cache entries kept before the oldest run is evicted. */
 const SEGMENT_INDEX_CACHE_MAX = 512;
 
@@ -124,6 +123,10 @@ export function appendRunEvent(
     fs.appendFileSync(file, line, "utf8");
     rememberFramed(file, size + bytes);
   } catch (err) {
+    // A partial/failed write (e.g. ENOSPC) may have left the file mid-line:
+    // drop the cached frame so the next append re-checks the last byte
+    // instead of trusting a size that now matches a torn tail.
+    framedSizes.delete(file);
     // Telemetry persistence must never break a live run.
     console.error(`[telemetry] could not persist event for ${event.runId}:`, err);
   }
@@ -211,6 +214,51 @@ function listOrderedSegments(runId: string, runsDir: string): string[] {
 
 const TAIL_READ_BYTES = 64 * 1024;
 
+/**
+ * Last parseable event among the final lines of a file. The tail window
+ * starts at TAIL_READ_BYTES and doubles until it holds a parseable event (or
+ * covers the whole file), so a single event — or a torn tail — larger than
+ * the window cannot hide the events written before it.
+ */
+function lastEventInTail(fd: number, size: number, runId: string): SequencedEvent | null {
+  let readLen = Math.min(size, TAIL_READ_BYTES);
+  while (true) {
+    const buf = Buffer.alloc(readLen);
+    fs.readSync(fd, buf, 0, readLen, size - readLen);
+    let offset = 0;
+    if (readLen < size) {
+      const nl = buf.indexOf(0x0a);
+      offset = nl === -1 ? 0 : nl + 1;
+    }
+    const lines = buf.toString("utf8", offset, readLen).split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const ev = safeParseEvent(lines[i], runId);
+      if (ev) return ev;
+    }
+    if (readLen === size) return null;
+    readLen = Math.min(size, readLen * 2);
+  }
+}
+
+/** Seq of the first event in a segment, expanding the head probe past a first line larger than PROBE_HEAD_BYTES. */
+function probeFirstSeq(fd: number, size: number, runId: string): number {
+  let readLen = Math.min(size, PROBE_HEAD_BYTES);
+  while (true) {
+    const head = Buffer.alloc(readLen);
+    fs.readSync(fd, head, 0, readLen, 0);
+    const text = head.toString("utf8");
+    const nl = text.indexOf("\n");
+    if (nl !== -1) {
+      return safeParseEvent(text.slice(0, nl), runId)?.seq ?? 0;
+    }
+    if (readLen === size) {
+      // The whole file is one unterminated line; try it as the first event.
+      return safeParseEvent(text, runId)?.seq ?? 0;
+    }
+    readLen = Math.min(size, readLen * 2);
+  }
+}
+
 /** Last parseable event among the final JSON lines of a log file. */
 function lastEventInFileTail(file: string, runId: string): SequencedEvent | null {
   let fd: number | undefined;
@@ -218,24 +266,7 @@ function lastEventInFileTail(file: string, runId: string): SequencedEvent | null
     fd = fs.openSync(file, "r");
     const size = fs.fstatSync(fd).size;
     if (size === 0) return null;
-    const readLen = Math.min(size, TAIL_READ_BYTES);
-    const buf = Buffer.alloc(readLen);
-    let offset = 0;
-    let len = readLen;
-    if (size > readLen) {
-      fs.readSync(fd, buf, 0, readLen, size - readLen);
-      const nl = buf.indexOf(0x0a);
-      offset = nl === -1 ? 0 : nl + 1;
-      len = readLen - offset;
-    } else {
-      fs.readSync(fd, buf, 0, readLen, 0);
-    }
-    const lines = buf.toString("utf8", offset, offset + len).split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const ev = safeParseEvent(lines[i], runId);
-      if (ev) return ev;
-    }
-    return null;
+    return lastEventInTail(fd, size, runId);
   } catch {
     return null;
   } finally {
@@ -278,36 +309,8 @@ function probeSegmentRange(file: string, runId: string): { first: number; last: 
     const size = fs.fstatSync(fd).size;
     if (size === 0) return range;
 
-    const headLen = Math.min(size, PROBE_HEAD_BYTES);
-    const head = Buffer.alloc(headLen);
-    fs.readSync(fd, head, 0, headLen, 0);
-    const headText = head.toString("utf8");
-    const nl = headText.indexOf("\n");
-    if (nl !== -1) {
-      const ev = safeParseEvent(headText.slice(0, nl), runId);
-      if (ev) range.first = ev.seq;
-    }
-
-    const tailLen = Math.min(size, PROBE_TAIL_BYTES);
-    const tail = Buffer.alloc(tailLen);
-    let offset = 0;
-    let len = tailLen;
-    if (size > tailLen) {
-      fs.readSync(fd, tail, 0, tailLen, size - tailLen);
-      const nl2 = tail.indexOf(0x0a);
-      offset = nl2 === -1 ? 0 : nl2 + 1;
-      len = tailLen - offset;
-    } else {
-      fs.readSync(fd, tail, 0, tailLen, 0);
-    }
-    const lines = tail.toString("utf8", offset, offset + len).split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const ev = safeParseEvent(lines[i], runId);
-      if (ev) {
-        range.last = ev.seq;
-        break;
-      }
-    }
+    range.first = probeFirstSeq(fd, size, runId);
+    range.last = lastEventInTail(fd, size, runId)?.seq ?? 0;
     return range;
   } catch {
     return range;
@@ -332,6 +335,8 @@ interface SegmentMeta extends SegmentFile {
   lastSeq: number;
   /** Number of valid events in the segment, or -1 until it has been counted. */
   count: number;
+  /** Events with seq > `fromSeq`, cached per cursor (filled lazily by capped replays). */
+  afterCounts: Map<number, number>;
 }
 
 /**
@@ -357,8 +362,9 @@ function currentSegmentFiles(runId: string, runsDir: string): SegmentFile[] {
 }
 
 async function segmentIndex(runId: string, runsDir: string): Promise<SegmentMeta[]> {
+  const cacheKey = `${runsDir}\0${runId}`;
   const files = currentSegmentFiles(runId, runsDir);
-  const cached = segmentIndexCache.get(runId);
+  const cached = segmentIndexCache.get(cacheKey);
   const previous = new Map<string, SegmentMeta>();
   if (cached) for (const m of cached.meta) previous.set(m.path, m);
 
@@ -366,14 +372,14 @@ async function segmentIndex(runId: string, runsDir: string): Promise<SegmentMeta
     const prev = previous.get(entry.path);
     if (prev && prev.size === entry.size) return prev;
     if (entry.size === 0) {
-      return { ...entry, firstSeq: 0, lastSeq: 0, count: 0 };
+      return { ...entry, firstSeq: 0, lastSeq: 0, count: 0, afterCounts: new Map() };
     }
     const { first, last } = probeSegmentRange(entry.path, runId);
-    return { ...entry, firstSeq: first, lastSeq: last, count: -1 };
+    return { ...entry, firstSeq: first, lastSeq: last, count: -1, afterCounts: new Map() };
   });
 
-  segmentIndexCache.delete(runId);
-  segmentIndexCache.set(runId, { files, meta });
+  segmentIndexCache.delete(cacheKey);
+  segmentIndexCache.set(cacheKey, { files, meta });
   if (segmentIndexCache.size > SEGMENT_INDEX_CACHE_MAX) {
     const oldest = segmentIndexCache.keys().next().value;
     if (oldest !== undefined) segmentIndexCache.delete(oldest);
@@ -409,6 +415,42 @@ async function countSegmentEvents(meta: SegmentMeta, runId: string): Promise<num
     // Segment missing/rotated: whatever was counted stays valid.
   }
   meta.count = count;
+  return count;
+}
+
+/**
+ * Count a segment's parseable events with seq > `fromSeq` (async; cached
+ * per cursor on its index entry). The probe range answers the easy cases
+ * without reading: a segment entirely behind the cursor contributes 0, and
+ * one entirely ahead of it contributes its full count.
+ */
+async function countSegmentEventsAfter(
+  meta: SegmentMeta,
+  runId: string,
+  fromSeq: number,
+): Promise<number> {
+  const cached = meta.afterCounts.get(fromSeq);
+  if (cached !== undefined) return cached;
+  let count: number;
+  if (meta.count === 0 || (meta.lastSeq > 0 && meta.lastSeq <= fromSeq)) {
+    count = 0;
+  } else if (meta.firstSeq > fromSeq) {
+    count = await countSegmentEvents(meta, runId);
+  } else {
+    count = 0;
+    let lines = 0;
+    try {
+      for await (const line of readLines(meta.path)) {
+        lines++;
+        if (lines % REPLAY_YIELD_EVERY === 0) await yieldToEventLoop();
+        const event = safeParseEvent(line, runId);
+        if (event && event.seq > fromSeq) count++;
+      }
+    } catch {
+      // Segment missing/rotated: whatever was counted stays valid.
+    }
+  }
+  meta.afterCounts.set(fromSeq, count);
   return count;
 }
 
@@ -453,7 +495,9 @@ export async function* streamRunEventsFrom(
 
   // Locate the first segment/event of a capped replay by counting only from
   // the newest segment backwards until the cap is filled. Older segments are
-  // never counted or read.
+  // never counted or read. When a cursor is set, only events after it consume
+  // the cap: events at or behind the cursor must neither eat the budget nor
+  // report the replay as truncated.
   let startSegment = 0;
   let skipInStart = 0;
   let truncated = false;
@@ -461,7 +505,10 @@ export async function* streamRunEventsFrom(
     let remaining = maxEvents;
     let found = false;
     for (let i = meta.length - 1; i >= 0; i--) {
-      const count = await countSegmentEvents(meta[i], runId);
+      const count =
+        fromSeq > 0
+          ? await countSegmentEventsAfter(meta[i], runId, fromSeq)
+          : await countSegmentEvents(meta[i], runId);
       if (count >= remaining) {
         startSegment = i;
         skipInStart = count - remaining;
@@ -477,14 +524,27 @@ export async function* streamRunEventsFrom(
     }
     truncated = startSegment > 0 || skipInStart > 0;
   }
-  const newestSeq = meta.length > 0 ? meta[meta.length - 1].lastSeq : 0;
+  // Newest seq across segments: the active segment is empty (lastSeq 0)
+  // immediately after a rotation, so fall back to the newest segment that
+  // actually holds events.
+  let newestSeq = 0;
+  for (let i = meta.length - 1; i >= 0; i--) {
+    if (meta[i].lastSeq > 0) {
+      newestSeq = meta[i].lastSeq;
+      break;
+    }
+  }
   let announcedWindow = false;
 
   let emitted = 0;
   for (let i = startSegment; i < meta.length; i++) {
     const m = meta[i];
     // Entirely behind the cursor (or empty): no need to open the segment.
-    if (m.lastSeq <= fromSeq) continue;
+    // A non-empty segment whose probe could not determine a range
+    // (lastSeq 0, e.g. a trailing event larger than the probe window) must
+    // still be read — skipping it would silently drop its events.
+    if (m.size === 0 || m.count === 0) continue;
+    if (m.lastSeq > 0 && m.lastSeq <= fromSeq) continue;
     let skip = i === startSegment ? skipInStart : 0;
     let lines = 0;
     try {
@@ -493,11 +553,13 @@ export async function* streamRunEventsFrom(
         if (lines % REPLAY_YIELD_EVERY === 0) await yieldToEventLoop();
         const event = safeParseEvent(line, runId);
         if (!event) continue;
+        if (event.seq <= fromSeq) continue;
+        // The cap skip counts only events after the cursor, matching the
+        // after-cursor counts used to place the replay window.
         if (skip > 0) {
           skip--;
           continue;
         }
-        if (event.seq <= fromSeq) continue;
         if (truncated && !announcedWindow && options.onWindow) {
           announcedWindow = true;
           options.onWindow({ truncated, firstSeq: event.seq, lastSeq: newestSeq });
@@ -597,20 +659,15 @@ export function readRunEvents(runId: string, runsDir: string): SequencedEvent[] 
   }
   rotated.sort((a, b) => a.n - b.n);
 
-  // Assign a monotonically increasing write-position ordinal while reading.
-  // Replay orders by write position alone, so a legacy log that already has
-  // duplicate seqs from the old eviction bug replays in the order events were
-  // actually written (which is also the correct chronology for healthy logs).
-  const entries: Array<{ event: SequencedEvent; order: number }> = [];
-  let order = 0;
+  // Segments are already in write order (rotated oldest→newest, then the
+  // active file), so replay orders by write position alone: a legacy log
+  // that already has duplicate seqs from the old eviction bug replays in the
+  // order events were actually written (which is also the correct
+  // chronology for healthy logs).
+  const events: SequencedEvent[] = [];
   for (const segment of rotated) {
-    for (const event of readSegment(segment.file, runId)) {
-      entries.push({ event, order: order++ });
-    }
+    events.push(...readSegment(segment.file, runId));
   }
-  for (const event of readSegment(base, runId)) {
-    entries.push({ event, order: order++ });
-  }
-  entries.sort((a, b) => a.order - b.order);
-  return entries.map((entry) => entry.event);
+  events.push(...readSegment(base, runId));
+  return events;
 }

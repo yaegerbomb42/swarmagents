@@ -8,6 +8,7 @@ import {
   parseResponse,
   requestUrl,
 } from "./adapters";
+import { CacheAwarePromptBuilder } from "./cache-aware-prompt";
 import type { CompleteRequest, ProviderConfig } from "./types";
 
 const base = (overrides: Partial<ProviderConfig> = {}): ProviderConfig => ({
@@ -259,4 +260,118 @@ test("parseResponse refuses an empty completion", () => {
     () => parseResponse(base({ apiStyle: "openai-chat" }), { choices: [{ message: {} }] }, "m"),
     /no text content/,
   );
+});
+
+test("anthropic buildRequest injects cache_control breakpoints at the zone boundaries", () => {
+  const builder = new CacheAwarePromptBuilder({
+    zone0: "You are a senior engineer.",
+    zone1: "## Repo skeleton\nsrc/a.ts",
+  });
+  const { request } = builder.build({
+    trajectory: [
+      { role: "user", content: "turn 1" },
+      { role: "assistant", content: "did turn 1" },
+    ],
+    zone3: "Budget: 100 tokens.",
+  });
+  const { body } = built(
+    base({ kind: "anthropic", apiStyle: "anthropic", baseUrl: "https://api.anthropic.com" }),
+    request,
+  );
+  // System (Zone 0) becomes a single block with a breakpoint.
+  assert.deepEqual(body.system, [
+    { type: "text", text: "You are a senior engineer.", cache_control: { type: "ephemeral" } },
+  ]);
+  // Messages: [Zone 1, turn 1, did turn 1, Zone 3]. Breakpoints land on the
+  // first message (Zone 1) and the second-to-last (last trajectory turn).
+  assert.equal(body.messages.length, 4);
+  const marked = (index: number) => body.messages[index].content.at(-1).cache_control;
+  assert.deepEqual(marked(0), { type: "ephemeral" });
+  assert.equal(marked(1), undefined);
+  assert.deepEqual(marked(2), { type: "ephemeral" });
+  assert.equal(marked(3), undefined);
+  assert.equal(JSON.stringify(body).split("cache_control").length - 1, 3, "exactly 3 breakpoints");
+});
+
+test("openai-chat, gemini and responses strip cache breakpoints cleanly", () => {
+  const builder = new CacheAwarePromptBuilder({
+    zone0: "You are a senior engineer.",
+    zone1: "## Repo skeleton\nsrc/a.ts",
+  });
+  const { request } = builder.build({
+    trajectory: [{ role: "user", content: "turn 1" }],
+    zone3: "Budget: 100 tokens.",
+  });
+  for (const style of ["openai-chat", "openai-responses", "gemini", "ollama"] as const) {
+    const config = base({
+      kind: style === "gemini" ? "gemini" : "openai",
+      apiStyle: style,
+      baseUrl: "https://api.example.com/v1",
+    });
+    const { body } = built(config, request);
+    assert.ok(!JSON.stringify(body).includes("cache_control"), `${style} must not carry breakpoints`);
+  }
+  // …but the zone order survives: system first, Zone 1 first message, Zone 3 last.
+  const { body } = built(base({ apiStyle: "openai-chat", baseUrl: "https://api.example.com/v1" }), request);
+  assert.deepEqual(body.messages, [
+    { role: "system", content: "You are a senior engineer." },
+    { role: "user", content: "## Repo skeleton\nsrc/a.ts" },
+    { role: "user", content: "turn 1" },
+    { role: "user", content: "Budget: 100 tokens." },
+  ]);
+});
+
+test("parseResponse reads prompt-cache usage fields per provider", () => {
+  const anthropic = parseResponse(
+    base({ kind: "anthropic", apiStyle: "anthropic" }),
+    {
+      model: "claude-x",
+      content: [{ type: "text", text: "hi" }],
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 10,
+        cache_read_input_tokens: 800,
+        cache_creation_input_tokens: 200,
+      },
+    },
+    "requested",
+  );
+  assert.deepEqual(anthropic.usage, {
+    inputTokens: 1000,
+    outputTokens: 10,
+    cachedInputTokens: 800,
+    cacheWriteTokens: 200,
+  });
+
+  const openai = parseResponse(
+    base({ apiStyle: "openai-chat" }),
+    {
+      model: "gpt-x",
+      choices: [{ message: { content: "pong" } }],
+      usage: { prompt_tokens: 1000, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 750 } },
+    },
+    "requested",
+  );
+  assert.equal(openai.usage.cachedInputTokens, 750);
+
+  const responses = parseResponse(
+    base({ apiStyle: "openai-responses" }),
+    {
+      model: "resp-x",
+      output: [{ type: "message", content: [{ type: "output_text", text: "responses" }] }],
+      usage: { input_tokens: 1000, output_tokens: 10, input_tokens_details: { cached_tokens: 600 } },
+    },
+    "requested",
+  );
+  assert.equal(responses.usage.cachedInputTokens, 600);
+
+  const gemini = parseResponse(
+    base({ kind: "gemini", apiStyle: "gemini" }),
+    {
+      candidates: [{ content: { parts: [{ text: "gemini" }] } }],
+      usageMetadata: { promptTokenCount: 1000, candidatesTokenCount: 10, cachedContentTokenCount: 900 },
+    },
+    "requested",
+  );
+  assert.equal(gemini.usage.cachedInputTokens, 900);
 });

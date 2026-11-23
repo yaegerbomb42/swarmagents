@@ -756,3 +756,56 @@ test("without pool keys, host ANTHROPIC_* env is forwarded untouched (legacy fal
   assert.equal(agentCalls(driver)[0].opts.env?.ANTHROPIC_BASE_URL, "https://gw.example.com/v1");
   assert.equal(agentCalls(driver)[0].opts.env?.ANTHROPIC_AUTH_TOKEN, "host-auth-token");
 });
+
+test("POST with roleId 'researcher' applies researcher role constraints (no Bash/Write/Edit)", async () => {
+  const driver = new ScriptedFakeVm();
+  install(driver);
+
+  const res = await postTask({ prompt: "find the docs", roleId: "researcher" });
+  assert.equal(res.status, 201);
+  const { runId } = await json(res);
+
+  const runs = await waitForRuns((r) => r.length > 0 && r[0].status !== "running");
+  assert.equal(runs[0].runId, runId);
+  assert.equal(runs[0].status, "finished");
+
+  await waitForAgentCalls(driver, 1);
+  const { cmd } = agentCalls(driver)[0];
+
+  const allowedIdx = cmd.indexOf("--allowedTools");
+  assert.ok(allowedIdx !== -1, "role phase should pass --allowedTools");
+  const allowed = cmd.slice(allowedIdx + 1, cmd.indexOf("--mcp-config"));
+
+  // Researcher has Read, Grep, WebSearch, WebFetch, Browser, etc., but NO Bash, Write, Edit
+  assert.ok(allowed.includes("Read"));
+  assert.ok(!allowed.includes("Bash"), "researcher must not have Bash tool");
+  assert.ok(!allowed.includes("Write"), "researcher must not have Write tool");
+  assert.ok(!allowed.includes("Edit"), "researcher must not have Edit tool");
+});
+
+test("POST with unknown roleId returns 400", async () => {
+  const driver = new ScriptedFakeVm();
+  install(driver);
+
+  const res = await postTask({ prompt: "do something", roleId: "nonexistent_role_123" });
+  assert.equal(res.status, 400);
+  const body = await json(res);
+  assert.match(body.error ?? "", /Unknown role "nonexistent_role_123"/);
+});
+
+test("POST with maxTurns passes --max-turns to claude; invalid maxTurns is rejected", async () => {
+  const driver = new ScriptedFakeVm();
+  install(driver);
+  const res = await postTask({ prompt: "Build it", maxTurns: 25 });
+  assert.equal(res.status, 201);
+  await waitForRuns((r) => r.length === 1 && r[0].status !== "running");
+  await waitForAgentCalls(driver, 1);
+  const { cmd } = agentCalls(driver)[0];
+  const i = cmd.indexOf("--max-turns");
+  assert.notEqual(i, -1, "run should include --max-turns");
+  assert.equal(cmd[i + 1], "25");
+
+  const bad = await postTask({ prompt: "Build it", maxTurns: 0 });
+  assert.equal(bad.status, 400);
+  assert.match((await json(bad)).error ?? "", /maxTurns/);
+});

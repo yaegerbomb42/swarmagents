@@ -8,7 +8,8 @@
  * mini packed one payload; the harness needs a multi-file turn, so the
  * budget is split into four named sections:
  *
- *   state ledger   ~600   goal, constraints, last error, recent steps
+ *   state ledger   ~600   goal, constraints, last error, failed attempts,
+ *                            recent steps
  *   AST skeleton  ~1,500  symbol outlines of the files in scope
  *   working set   ~3,500  numbered line windows of the files being edited
  *   reserve       ~2,400  system header (≤1,408) + output buffer (992)
@@ -127,12 +128,70 @@ export interface LedgerStep {
   summary: string;
 }
 
+/**
+ * One failed approach, remembered so a later turn does not re-try it.
+ * `tried` names the approach (for a verification failure, the change's
+ * content hash — see recordFailureFromTurn); `failedBecause` is the
+ * normalized failure signature; `doNotRetry` is the concrete thing to
+ * avoid. All three are stored and rendered verbatim: exact file paths,
+ * symbol names and failing test names are never paraphrased.
+ */
+export interface FailedAttempt {
+  tried: string;
+  failedBecause: string;
+  doNotRetry: string;
+  turn: number;
+}
+
 export interface StateLedgerSnapshot {
   goal: string;
   constraints: string[];
   steps: LedgerStep[];
   lastError?: string;
   notes: string[];
+  failedAttempts: FailedAttempt[];
+}
+
+/** Sub-cap for the rendered "## Do not retry" block (spec: 300-500 tokens). */
+export const FAILED_ATTEMPTS_BLOCK_CAP_TOKENS = 400;
+
+/**
+ * Normalize raw verification output into a stable failure signature:
+ * strip ANSI escapes, timestamps and `:line[:col]` suffixes (which change
+ * every run), collapse whitespace and repeated lines. File paths and
+ * failing test names survive verbatim — only the volatile parts are cut —
+ * so the same failure re-occurring later dedups against the first record.
+ *
+ * This is the local stand-in for the ProgressWatchdog's normalized
+ * errorSignature (Wave 1 Task 4), which is not in the tree yet: when it
+ * lands, its signature can be passed straight to recordFailureFromTurn
+ * as `errorSignature` instead of this helper's output.
+ */
+export function normalizeErrorSignature(raw: string): string {
+  const lines = raw
+    .replace(/\x1B\[[0-9;]*[A-Za-z]/g, "")
+    .replace(/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/g, "")
+    .replace(/\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b/g, "")
+    // Keep the path/test name, drop only the volatile location numbers.
+    .replace(/((?:[A-Za-z]:)?[^\s:()]+?\.[a-zA-Z]{1,5}):\d+(?::\d+)?/g, "$1")
+    .replace(/\bline \d+\b/gi, "line ?")
+    .replace(/\b0x[0-9a-fA-F]+\b/g, "0x?")
+    .split("\n")
+    .map((line) => line.trim().replace(/\s+/g, " "))
+    .filter(Boolean);
+  const deduped = lines.filter((line, i) => i === 0 || line !== lines[i - 1]);
+  const joined = deduped.join(" / ");
+  return joined.length > 240 ? `${joined.slice(0, 237).trimEnd()}…` : joined;
+}
+
+/** Short deterministic content hash identifying one attempted change. */
+export function hashDiff(diff: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < diff.length; i++) {
+    h ^= diff.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `diff-${(h >>> 0).toString(16).padStart(8, "0")}`;
 }
 
 /**
@@ -149,6 +208,7 @@ export class StateLedger {
       steps: [...(init.steps ?? [])],
       lastError: init.lastError,
       notes: [...(init.notes ?? [])],
+      failedAttempts: [...(init.failedAttempts ?? [])],
     };
   }
 
@@ -164,8 +224,58 @@ export class StateLedger {
     return this.snapshot.goal;
   }
 
+  get failedAttempts(): FailedAttempt[] {
+    return this.snapshot.failedAttempts.map((a) => ({ ...a }));
+  }
+
   recordStep(turn: number, summary: string): void {
     this.snapshot.steps.push({ turn, summary: summary.trim() });
+  }
+
+  /**
+   * Remember a failed approach. Recording the same (tried, failedBecause)
+   * pair twice updates the existing entry's turn (and its do-not-retry
+   * wording) instead of appending a duplicate, so a failure that keeps
+   * re-occurring stays one line. Vacuous entries (no approach or no
+   * reason) carry no signal and are ignored. `turn` defaults to the
+   * latest recorded step's turn.
+   */
+  recordFailedAttempt(tried: string, failedBecause: string, doNotRetry: string, turn?: number): void {
+    const entry: FailedAttempt = {
+      tried: tried.trim(),
+      failedBecause: failedBecause.trim(),
+      doNotRetry: doNotRetry.trim(),
+      turn: turn ?? this.latestTurn(),
+    };
+    if (!entry.tried || !entry.failedBecause) return;
+    const existing = this.snapshot.failedAttempts.find(
+      (a) => a.tried === entry.tried && a.failedBecause === entry.failedBecause,
+    );
+    if (existing) {
+      existing.turn = entry.turn;
+      existing.doNotRetry = entry.doNotRetry;
+      return;
+    }
+    this.snapshot.failedAttempts.push(entry);
+  }
+
+  /**
+   * Record a turn that ended with a failing verification. The attempted
+   * change is identified by its content hash, so re-applying the same
+   * change and failing the same way dedups against the first record.
+   * The caller is the verification driver (the oracle, which owns both
+   * the failing checks and the turn's diff): the runner itself runs no
+   * verification, so it cannot call this — it only carries the ledger
+   * across invocations via RunRequest.stateLedger.
+   */
+  recordFailureFromTurn(turn: number, errorSignature: string, diffHash: string): void {
+    const label = diffHash.trim() ? `change ${diffHash.trim()}` : "an untracked change";
+    this.recordFailedAttempt(label, errorSignature, `re-applying ${label}`, turn);
+  }
+
+  private latestTurn(): number {
+    const steps = this.snapshot.steps;
+    return steps.length ? steps[steps.length - 1].turn : 0;
   }
 
   setError(error: string | undefined): void {
@@ -178,8 +288,10 @@ export class StateLedger {
 
   /**
    * Render within `cap` tokens. Priority: goal (≤40% of cap), last error
-   * (≤35%, tail kept), constraints, notes, then the most recent steps that
-   * still fit, with a count of the elided older ones.
+   * (≤35%, tail kept), constraints, notes, failed attempts (own 400-token
+   * sub-cap, newest first), then the most recent steps that still fit,
+   * with a count of the elided older ones. Step summaries elide before
+   * failed attempts do.
    */
   render(turn: number, cap: number): string {
     if (cap <= 0) return "";
@@ -196,6 +308,33 @@ export class StateLedger {
     for (const n of s.notes) {
       const candidate = `- note: ${n}`;
       if (estimateTokens(fixed([...extras, candidate])) <= cap) extras.push(candidate);
+    }
+
+    // Failed attempts outrank step summaries: they render before the steps
+    // (which elide first when the cap binds) and inside their own sub-cap,
+    // so a long failure history can never crowd out the goal or the last
+    // error. Entries render verbatim, newest first, with a count of the
+    // elided older ones.
+    const failedBlock: string[] = ["## Do not retry"];
+    let failedElided = 0;
+    for (let i = s.failedAttempts.length - 1; i >= 0; i--) {
+      const a = s.failedAttempts[i];
+      const candidate = `- tried ${a.tried} -> failed because ${a.failedBecause} -> do NOT retry ${a.doNotRetry}`;
+      const marker = i > 0 ? [`(${i} earlier failed attempts elided)`] : [];
+      const blockText = [...failedBlock, ...marker, candidate].join("\n");
+      if (
+        estimateTokens(blockText) <= FAILED_ATTEMPTS_BLOCK_CAP_TOKENS &&
+        estimateTokens(fixed([...extras, ...failedBlock, ...marker, candidate])) <= cap
+      ) {
+        failedBlock.push(candidate);
+      } else {
+        failedElided = i + 1;
+        break;
+      }
+    }
+    if (failedBlock.length > 1) {
+      extras.push(...failedBlock);
+      if (failedElided) extras.push(`(${failedElided} earlier failed attempts elided)`);
     }
 
     const recent: string[] = [];

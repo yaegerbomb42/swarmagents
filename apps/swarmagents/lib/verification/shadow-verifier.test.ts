@@ -133,9 +133,9 @@ test("buildShadowTarget surfaces test output, diff, and constraints", () => {
 });
 
 test("deriveBadge maps pass/warn/fail", () => {
-  assert.equal(deriveBadge({ passed: true, score: 40, violations: [] } as VerificationResult), "pass");
-  assert.equal(deriveBadge({ passed: false, score: SHADOW_VERIFIER_MIN_PASS_SCORE, violations: ["x"] } as VerificationResult), "warn");
-  assert.equal(deriveBadge({ passed: false, score: 10, violations: ["x"] } as VerificationResult), "fail");
+  assert.equal(deriveBadge({ status: "passed", passed: true, score: 40, violations: [] } as VerificationResult), "pass");
+  assert.equal(deriveBadge({ status: "failed", passed: false, score: SHADOW_VERIFIER_MIN_PASS_SCORE, violations: ["x"] } as VerificationResult), "warn");
+  assert.equal(deriveBadge({ status: "failed", passed: false, score: 10, violations: ["x"] } as VerificationResult), "fail");
 });
 
 test("shouldBounce bounds the remediation loop", () => {

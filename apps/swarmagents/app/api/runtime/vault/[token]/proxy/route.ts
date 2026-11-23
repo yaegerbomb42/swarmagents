@@ -4,6 +4,7 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
+import { JsonBodyError, readJsonBody } from "../../../../../../lib/http";
 import { proxyVaultRequest } from "../../../../../../lib/secrets/proxy";
 
 export const runtime = "nodejs";
@@ -19,8 +20,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ token: str
     body?: unknown;
   };
   try {
-    parsed = (await req.json()) as typeof parsed;
-  } catch {
+    parsed = (await readJsonBody(req)) as typeof parsed;
+  } catch (err) {
+    if (err instanceof JsonBodyError && err.status === 413) {
+      return NextResponse.json({ error: "Request body is too large." }, { status: 413 });
+    }
     return NextResponse.json({ error: "JSON body required." }, { status: 400 });
   }
   if (typeof parsed.secretId !== "string" || typeof parsed.url !== "string") {

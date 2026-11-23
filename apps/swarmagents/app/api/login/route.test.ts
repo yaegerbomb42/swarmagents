@@ -7,6 +7,8 @@ import { NextRequest } from "next/server";
 import { POST } from "./route";
 import { configureUserPaths, signupLocalUser } from "../../../lib/users";
 import { verifySession } from "../../../lib/auth";
+import { configureAuditPath, readAuditEntries, auditLoginFailureTarget } from "../../../lib/audit";
+import { resetBuckets, LOGIN_EMAIL_LIMIT, LOGIN_IP_LIMIT } from "../../../lib/rate-limit";
 
 function request(body: unknown, headers: Record<string, string> = {}): NextRequest {
   return new NextRequest("http://localhost/api/login", {
@@ -32,6 +34,7 @@ test.beforeEach(async () => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-login-test-"));
   configureUserPaths(path.join(dir, "users.json"));
   process.env.SWARM_SESSION_SECRET = "test-session-secret";
+  resetBuckets();
   await signupLocalUser("alice@example.com", "correct horse battery staple");
 });
 
@@ -145,4 +148,139 @@ test("POST /api/login refuses to run without SWARM_SESSION_SECRET", async () => 
   delete process.env.SWARM_SESSION_SECRET;
   const res = await POST(request({ email: "alice@example.com", password: "correct horse battery staple" }));
   assert.equal(res.status, 500);
+});
+
+test("auditLoginFailureTarget normalizes, strips controls, and caps length", () => {
+  assert.equal(auditLoginFailureTarget(undefined), "unknown");
+  assert.equal(auditLoginFailureTarget(""), "unknown");
+  assert.equal(auditLoginFailureTarget("  Alice@Example.COM  "), "alice@example.com");
+  assert.equal(auditLoginFailureTarget("bad\nemail\u0000@x.com"), "bademail@x.com");
+  const huge = `a@${"b".repeat(400)}.com`;
+  const capped = auditLoginFailureTarget(huge);
+  assert.equal(capped.length, 254);
+  assert.ok(capped.startsWith("a@bbb"));
+});
+
+test("POST /api/login writes a sanitized login.failure audit target", async () => {
+  const auditFile = path.join(dir, "audit.jsonl");
+  configureAuditPath(auditFile);
+  try {
+    const res = await POST(
+      request({ email: `Evil\n@x.com${"Z".repeat(400)}`, password: "nope" }),
+    );
+    assert.equal(res.status, 401);
+    const entries = readAuditEntries("anonymous");
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].action, "login.failure");
+    assert.equal(entries[0].result, "failure");
+    assert.ok(typeof entries[0].target === "string");
+    assert.ok(entries[0].target.length <= 254);
+    assert.ok(!entries[0].target.includes("\n"));
+    assert.ok(!/[A-Z]/.test(entries[0].target));
+  } finally {
+    configureAuditPath(undefined);
+  }
+});
+
+test("failed logins are attributed to the targeted account's audit, not anonymous", async () => {
+  const auditFile = path.join(dir, "audit.jsonl");
+  // capture audit via the module's configured path
+  const { configureAuditPath, readAuditEntries } = await import("../../../lib/audit");
+  configureAuditPath(auditFile);
+  try {
+    // Wrong password against a real account.
+    const res = await POST(request({ email: "alice@example.com", password: "bad" }));
+    assert.equal(res.status, 401);
+    const alice = readAuditEntries("local_alice@example.com");
+    assert.equal(alice.length, 1);
+    assert.equal(alice[0].action, "login.failure");
+    assert.equal(alice[0].target, "alice@example.com");
+    assert.equal(alice[0].result, "failure");
+    // It must NOT be logged under the generic "anonymous" identity.
+    assert.deepEqual(readAuditEntries("anonymous"), []);
+  } finally {
+    configureAuditPath(undefined);
+  }
+});
+
+test("POST /api/login rejects an oversized body with 413", async () => {
+  const res = await POST(
+    request(JSON.stringify({ email: "alice@example.com", password: "x", pad: "x".repeat(17 * 1024) })),
+  );
+  assert.equal(res.status, 413);
+  assert.deepEqual(await res.json(), { error: "Request body too large." });
+});
+
+test("POST /api/login measures the body cap in UTF-8 bytes, not characters", async () => {
+  // "é" is 2 bytes but 1 char: this body is under the 16 KiB cap in
+  // characters yet over it in bytes, so the old text.length check would have
+  // let it through to a 401. The byte cap must fire with a 413.
+  const over = JSON.stringify({ email: "alice@example.com", password: "x", pad: "é".repeat(9000) });
+  assert.ok(over.length < 16 * 1024, `chars ${over.length}`);
+  assert.ok(Buffer.byteLength(over, "utf8") > 16 * 1024);
+  assert.equal((await POST(request(over))).status, 413);
+
+  // And a body that fits in bytes still reaches the credential check.
+  const fits = JSON.stringify({ email: "alice@example.com", password: "wrong", pad: "é".repeat(7000) });
+  assert.ok(Buffer.byteLength(fits, "utf8") < 16 * 1024);
+  assert.equal((await POST(request(fits))).status, 401);
+});
+
+test("per-email bucket trips after 10 failures and blocks even a correct password", async () => {
+  for (let i = 0; i < LOGIN_EMAIL_LIMIT; i++) {
+    const res = await POST(request({ email: "alice@example.com", password: "wrong" }));
+    assert.equal(res.status, 401, `failure ${i + 1} should be 401`);
+  }
+  // The limit engages before verifyLocalUser runs: even the right password
+  // is refused once the account budget is spent.
+  const blocked = await POST(
+    request({ email: "alice@example.com", password: "correct horse battery staple" }),
+  );
+  assert.equal(blocked.status, 429);
+  assert.ok(Number(blocked.headers.get("Retry-After")) > 0);
+  assert.deepEqual(await blocked.json(), { error: "Too many sign-in attempts. Try again later." });
+});
+
+test("per-IP bucket trips after 30 failures from distinct emails", async () => {
+  const ip = { "x-real-ip": "203.0.113.50" };
+  for (let i = 0; i < LOGIN_IP_LIMIT; i++) {
+    const res = await POST(request({ email: `sweep-${i}@example.com`, password: "wrong" }, ip));
+    assert.equal(res.status, 401, `failure ${i + 1} should be 401`);
+  }
+  const blocked = await POST(request({ email: "sweep-31@example.com", password: "wrong" }, ip));
+  assert.equal(blocked.status, 429);
+  assert.ok(Number(blocked.headers.get("Retry-After")) > 0);
+});
+
+test("successful logins do not consume the failure budget", async () => {
+  for (let i = 0; i < LOGIN_EMAIL_LIMIT + 2; i++) {
+    const res = await POST(
+      request({ email: "alice@example.com", password: "correct horse battery staple" }),
+    );
+    assert.equal(res.status, 200, `success ${i + 1} should be 200`);
+  }
+  // A wrong password after many successes is still a plain 401, not a 429.
+  const wrong = await POST(request({ email: "alice@example.com", password: "wrong" }));
+  assert.equal(wrong.status, 401);
+});
+
+test("email and IP buckets trip independently", async () => {
+  const ipA = { "x-real-ip": "203.0.113.51" };
+  const ipB = { "x-real-ip": "203.0.113.52" };
+  // Exhaust alice's per-email budget from IP A.
+  for (let i = 0; i < LOGIN_EMAIL_LIMIT; i++) {
+    assert.equal((await POST(request({ email: "alice@example.com", password: "wrong" }, ipA))).status, 401);
+  }
+  assert.equal((await POST(request({ email: "alice@example.com", password: "wrong" }, ipA))).status, 429);
+  // A different account from the same IP still has budget.
+  const other = await POST(request({ email: "bob@example.com", password: "wrong" }, ipA));
+  assert.equal(other.status, 401);
+  // Alice is blocked from any IP while her account budget is spent...
+  const aliceElsewhere = await POST(
+    request({ email: "alice@example.com", password: "correct horse battery staple" }, ipB),
+  );
+  assert.equal(aliceElsewhere.status, 429);
+  // ...but a fresh account from the other IP is unaffected.
+  const fresh = await POST(request({ email: "carol@example.com", password: "wrong" }, ipB));
+  assert.equal(fresh.status, 401);
 });

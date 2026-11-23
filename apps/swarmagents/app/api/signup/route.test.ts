@@ -5,8 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { NextRequest } from "next/server";
 import { POST } from "./route";
-import { configureUserPaths, signupLocalUser } from "../../../lib/users";
+import { configureUserPaths, isEmailVerified, signupLocalUser } from "../../../lib/users";
 import { verifySession } from "../../../lib/auth";
+import { setMailTransportForTests, type MailMessage } from "../../../lib/mailer";
 
 function request(body: unknown): NextRequest {
   return new NextRequest("http://localhost/api/signup", {
@@ -121,5 +122,67 @@ test("POST /api/signup is closed in server mode in non-production unless SWARM_A
     assert.equal(open.status, 201);
   } finally {
     env.NODE_ENV = prevNodeEnv;
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Email verification + bot check (FIX-44)                             */
+/* ------------------------------------------------------------------ */
+
+test("POST /api/signup sends a verification email and the account starts unverified", async () => {
+  const sent: MailMessage[] = [];
+  setMailTransportForTests(async (message) => {
+    sent.push(message);
+    return { ok: true };
+  });
+  try {
+    const res = await POST(request({ email: "verifyme@example.com", password: "a very long password" }));
+    assert.equal(res.status, 201);
+    const json = (await res.json()) as { emailVerification?: string };
+    assert.equal(json.emailVerification, "pending");
+    assert.equal(isEmailVerified("verifyme@example.com"), false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].to, "verifyme@example.com");
+    assert.ok(sent[0].text.includes("/verify-email?token=ev1."), "email carries the verify link");
+  } finally {
+    setMailTransportForTests(null);
+  }
+});
+
+test("POST /api/signup rejects when the configured bot check fails, creating nothing", async () => {
+  process.env.SWARM_TURNSTILE_SECRET = "test-turnstile-secret";
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ success: false }), { status: 200 })) as typeof fetch;
+  try {
+    const res = await POST(
+      request({ email: "bot@example.com", password: "a very long password", botToken: "bad-token" }),
+    );
+    assert.equal(res.status, 400);
+    // No account was created: the same email can still sign up afterwards.
+    const created = await signupLocalUser("bot@example.com", "a very long password");
+    assert.equal(created.ok, true);
+  } finally {
+    globalThis.fetch = realFetch;
+    delete process.env.SWARM_TURNSTILE_SECRET;
+  }
+});
+
+test("POST /api/signup accepts a passing bot check", async () => {
+  process.env.SWARM_TURNSTILE_SECRET = "test-turnstile-secret";
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ success: true }), { status: 200 })) as typeof fetch;
+  setMailTransportForTests(async () => ({ ok: true }));
+  try {
+    const res = await POST(
+      request({ email: "human@example.com", password: "a very long password", botToken: "good-token" }),
+    );
+    assert.equal(res.status, 201);
+  } finally {
+    globalThis.fetch = realFetch;
+    setMailTransportForTests(null);
+    delete process.env.SWARM_TURNSTILE_SECRET;
   }
 });

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   latestVmLifecycleEvent,
+  parsePolledVmStatus,
   resolveVmDisplayStatus,
   VM_STATUS_POLL_MS,
 } from "./vmStatus";
@@ -127,4 +128,14 @@ test("latestVmLifecycleEvent lets a later vm.ready clear an earlier vm.error", (
 
 test("poll interval is a sane 30s", () => {
   assert.equal(VM_STATUS_POLL_MS, 30_000);
+});
+
+
+test("poll reads the route's VmState envelope and rejects unknown statuses", () => {
+  assert.equal(parsePolledVmStatus({ status: "missing" }), "missing");
+  assert.equal(parsePolledVmStatus({ status: "running" }), "running");
+  assert.equal(parsePolledVmStatus({ status: "error", error: "failed" }), "error");
+  assert.equal(parsePolledVmStatus("stopped"), "stopped");
+  assert.equal(parsePolledVmStatus({ status: "invalid" }), undefined);
+  assert.equal(parsePolledVmStatus(null), undefined);
 });

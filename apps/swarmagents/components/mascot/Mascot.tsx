@@ -18,11 +18,11 @@
  */
 
 import React, { useEffect, useRef, useState } from "react";
+import { usePrefersReducedMotion } from "./usePrefersReducedMotion";
 import {
   MASCOT_COLUMNS,
   MASCOT_FRAME_HEIGHT,
   MASCOT_FRAME_MS,
-  MASCOT_FRAME_RANGES,
   MASCOT_FRAME_WIDTH,
   MASCOT_ROWS,
   MASCOT_SHEET,
@@ -50,28 +50,6 @@ export interface MascotProps {
    * render tests can cover the reduced-motion branch without a DOM.
    */
   reducedMotion?: boolean;
-}
-
-const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
-
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = useState(
-    () =>
-      typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia(REDUCED_MOTION_QUERY).matches,
-  );
-
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const mq = window.matchMedia(REDUCED_MOTION_QUERY);
-    const update = () => setReduced(mq.matches);
-    update();
-    mq.addEventListener("change", update);
-    return () => mq.removeEventListener("change", update);
-  }, []);
-
-  return reduced;
 }
 
 export function Mascot({

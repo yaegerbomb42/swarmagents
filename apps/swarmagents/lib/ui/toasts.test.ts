@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { describeFailure, toastReducer } from "./toasts.js";
+import { describeFailure, MAX_TOASTS, toastReducer } from "./toasts.js";
 
 const t = (id: string, over: Partial<Parameters<typeof toastReducer>[0][number]> = {}) => ({
   id,
@@ -111,4 +111,87 @@ test("describeFailure truncates very long provider messages", () => {
   const long = "x".repeat(500);
   const f = describeFailure(new Error(long));
   assert.ok((f.detail ?? "").length <= 221);
+});
+
+test("describeFailure does not treat a missing file as a missing model", () => {
+  const f = describeFailure(new Error("File foo.ts not found"));
+  assert.equal(f.message, "Provider error");
+  assert.match(f.detail!, /foo\.ts/);
+});
+
+test("describeFailure does not treat token counts as HTTP 5xx", () => {
+  const f = describeFailure(new Error("exceeded 512 tokens"));
+  assert.equal(f.message, "Provider error");
+  assert.match(f.detail!, /512 tokens/);
+});
+
+test("describeFailure detects AbortError across realms", () => {
+  const crossRealm = { name: "AbortError", message: "aborted" };
+  const f = describeFailure(crossRealm);
+  assert.equal(f.message, "Run stopped");
+});
+
+test("describeFailure maps TimeoutError", () => {
+  const f = describeFailure({ name: "TimeoutError", message: "timed out" });
+  assert.equal(f.message, "Timed out");
+});
+
+test("add with an existing id replaces instead of duplicating", () => {
+  const before = [t("1", { message: "old" })];
+  const next = toastReducer(before, { type: "add", toast: t("1", { message: "new" }) });
+  assert.equal(next.length, 1);
+  assert.equal(next[0].message, "new");
+});
+
+test("add caps the active toast queue", () => {
+  let state: ReturnType<typeof toastReducer> = [];
+  for (let i = 0; i < MAX_TOASTS + 4; i++) {
+    state = toastReducer(state, { type: "add", toast: t(String(i)) });
+  }
+  assert.equal(state.length, MAX_TOASTS);
+  assert.equal(state[0].id, "4");
+  assert.equal(state[MAX_TOASTS - 1].id, String(MAX_TOASTS + 3));
+});
+
+test("describeFailure scrubs an sk- key from the fallback detail", () => {
+  const key = "sk-abcdefghij1234567890xyz";
+  const f = describeFailure(new Error(`provider exploded using ${key} please help`));
+  assert.equal(f.message, "Provider error");
+  assert.ok(!(f.detail ?? "").includes(key), "raw key must not appear in the detail");
+  assert.match(f.detail!, /\[REDACTED\]/);
+});
+
+test("describeFailure scrubs a Bearer token from the fallback detail", () => {
+  const token = "abcdefghij1234567890";
+  const f = describeFailure(new Error(`call failed: Authorization: Bearer ${token}`));
+  assert.equal(f.message, "Provider error");
+  assert.ok(!(f.detail ?? "").includes(token), "raw token must not appear in the detail");
+  assert.match(f.detail!, /Bearer \[REDACTED\]/);
+});
+
+test("describeFailure scrubs GitHub and Gemini token shapes from the fallback detail", () => {
+  const gh = "ghp_abcdefghij1234567890";
+  const gemini = `AIzaSy${"A".repeat(33)}`; // AIza + 35 base64url chars
+  const f = describeFailure(new Error(`tokens leaked: ${gh} and ${gemini}`));
+  assert.equal(f.message, "Provider error");
+  assert.ok(!(f.detail ?? "").includes(gh));
+  assert.ok(!(f.detail ?? "").includes(gemini));
+  assert.match(f.detail!, /\[REDACTED\]/);
+});
+
+test("describeFailure scrubs secrets repeatedly without skipping matches", () => {
+  const key = "sk-abcdefghij1234567890xyz";
+  // Call twice with the same secret: a stateful global-regex scan would skip
+  // the match on the second call.
+  for (let i = 0; i < 2; i++) {
+    const f = describeFailure(new Error(`attempt ${i} using ${key}`));
+    assert.ok(!(f.detail ?? "").includes(key));
+    assert.match(f.detail!, /\[REDACTED\]/);
+  }
+});
+
+test("describeFailure leaves a secret-free fallback detail untouched", () => {
+  const f = describeFailure(new Error("weird provider glitch, please retry"));
+  assert.equal(f.message, "Provider error");
+  assert.equal(f.detail, "weird provider glitch, please retry");
 });

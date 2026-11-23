@@ -21,6 +21,7 @@ import {
   expectedNextCallUsd,
   projectRunBudget,
   BUDGET_WARN_FRACTION,
+  type CostEvent,
 } from "./cost-latency";
 
 /** A temp runs dir wired into the telemetry bus, so events are persisted. */
@@ -273,4 +274,202 @@ test("a recorded log with no events aggregates to an empty report", () => {
   assert.equal(report.modelSwitches.length, 0);
   assert.equal(report.provider, "unknown");
   assert.deepEqual(report.calls, []);
+});
+
+test("lens calls stay out of agent routing and latency stats", () => {
+  const t0 = Date.parse("2026-11-10T10:00:00Z");
+  const events: CostEvent[] = [
+    { type: "run.started", seq: 1, ts: t0, data: { provider: "anthropic", model: "claude-sonnet" } },
+    {
+      type: "llm.call",
+      seq: 2,
+      ts: t0 + 100,
+      data: {
+        provider: "anthropic",
+        model: "claude-sonnet",
+        attempt: 1,
+        outcome: "ok",
+        latencyMs: 100,
+        queuedMs: 10,
+        ttftMs: 40,
+        inputTokens: 100,
+        outputTokens: 20,
+        costUsd: 0.004,
+      },
+    },
+    {
+      // An output lens rides on the same bus but is not an agent attempt.
+      type: "llm.call",
+      seq: 3,
+      ts: t0 + 200,
+      data: {
+        provider: "openai",
+        model: "gpt-4.1-mini",
+        attempt: 1,
+        outcome: "ok",
+        latencyMs: 50,
+        queuedMs: 5,
+        ttftMs: 20,
+        inputTokens: 30,
+        outputTokens: 10,
+        costUsd: 0.0012,
+        lens: "eli5",
+        source: "lens",
+      },
+    },
+    { type: "run.finished", seq: 4, ts: t0 + 300, data: { costUsd: 0.5, durationMs: 300, numTurns: 1 } },
+  ];
+
+  const report = aggregateRunCostLatency("run_lens", events);
+
+  // The lens provider never becomes the run's serving provider.
+  assert.equal(report.provider, "anthropic");
+  assert.equal(report.calls.length, 1);
+  assert.equal(report.calls[0]!.provider, "anthropic");
+  assert.equal(report.modelSwitches.length, 0);
+  assert.equal(report.totalLatencyMs, 100);
+  assert.equal(report.avgLatencyMs, 100);
+  assert.equal(report.byProvider.length, 1);
+  assert.equal(report.byProvider[0]!.provider, "anthropic");
+  assert.equal(report.byProvider[0]!.costUsd, 0.004);
+
+  // Lens spend is tracked separately and added on top of the agent's cost.
+  assert.equal(report.lensCostUsd, 0.0012);
+  assert.equal(report.costUsd, 0.0052);
+  assert.equal(report.costSource, "llm_calls");
+  assert.equal(report.pricedCalls, 1);
+  // The next-call projection is the agent's mean, not the lens's cost.
+  assert.equal(expectedNextCallUsd(report), 0.004);
+});
+
+test("a lens call does not advance the agent's queue boundary", () => {
+  const t0 = Date.parse("2026-11-10T10:00:00Z");
+  const events: CostEvent[] = [
+    {
+      type: "llm.call",
+      seq: 1,
+      ts: t0 + 1000,
+      data: { provider: "p", model: "m", attempt: 1, outcome: "ok", latencyMs: 100, queuedMs: 5, costUsd: 0.001 },
+    },
+    {
+      type: "llm.call",
+      seq: 2,
+      ts: t0 + 1100,
+      data: {
+        provider: "lens-provider",
+        model: "lens-model",
+        attempt: 1,
+        outcome: "ok",
+        latencyMs: 50,
+        costUsd: 0.01,
+        source: "lens",
+      },
+    },
+    {
+      type: "llm.call",
+      seq: 3,
+      ts: t0 + 1200,
+      data: { provider: "p", model: "m", attempt: 2, outcome: "ok", latencyMs: 50, costUsd: 0.001 },
+    },
+  ];
+
+  const report = aggregateRunCostLatency("run_lens_queue", events);
+
+  // The third agent call starts at 1150; the queue boundary is still 1000,
+  // not the lens call's 1100.
+  assert.equal(report.calls.length, 2);
+  assert.equal(report.calls[1]!.queuedMs, 150);
+  assert.equal(report.lensCostUsd, 0.01);
+  assert.equal(report.provider, "p");
+});
+
+test("negative and non-finite telemetry values are clamped", () => {
+  const negative: CostEvent[] = [
+    {
+      type: "llm.call",
+      seq: 1,
+      ts: 1000,
+      data: {
+        provider: "p",
+        model: "m",
+        attempt: 1,
+        outcome: "ok",
+        latencyMs: -100,
+        queuedMs: -5,
+        ttftMs: -1,
+        inputTokens: 10,
+        outputTokens: 5,
+        costUsd: -0.5,
+      },
+    },
+  ];
+  const clamped = aggregateRunCostLatency("run_clamp", negative);
+  assert.equal(clamped.calls[0]!.latencyMs, 0);
+  assert.equal(clamped.calls[0]!.queuedMs, 0);
+  assert.equal(clamped.calls[0]!.ttftMs, 0);
+  // A negative cost is corrupt telemetry, not a priced $0 call: like the NaN
+  // cost below, it is unknown, so the call is not priced. Durations still
+  // clamp to zero; costs never do — the rule usage.ts already applied, now
+  // shared via ./events.ts.
+  assert.equal(clamped.calls[0]!.costUsd, null);
+  assert.equal(clamped.totalLatencyMs, 0);
+  assert.equal(clamped.costUsd, 0);
+  assert.equal(clamped.costSource, "none");
+
+  const nonFinite: CostEvent[] = [
+    {
+      type: "llm.call",
+      seq: 1,
+      ts: 2000,
+      data: {
+        provider: "p",
+        model: "m",
+        attempt: 1,
+        outcome: "ok",
+        latencyMs: Number.NaN,
+        queuedMs: Number.POSITIVE_INFINITY,
+        ttftMs: Number.NEGATIVE_INFINITY,
+        costUsd: Number.NaN,
+      },
+    },
+  ];
+  const cleaned = aggregateRunCostLatency("run_nonfinite", nonFinite);
+  assert.equal(cleaned.calls[0]!.latencyMs, 0);
+  assert.equal(cleaned.calls[0]!.queuedMs, 0);
+  assert.equal(cleaned.calls[0]!.ttftMs, undefined);
+  assert.equal(cleaned.calls[0]!.costUsd, null);
+  assert.equal(cleaned.costUsd, 0);
+  assert.equal(cleaned.costSource, "none");
+});
+
+test("overlapping call timestamps never move the queue boundary backwards", () => {
+  const t0 = Date.parse("2026-11-10T10:00:00Z");
+  const events: CostEvent[] = [
+    {
+      type: "llm.call",
+      seq: 1,
+      ts: t0 + 1000,
+      data: { provider: "p", model: "m", attempt: 1, outcome: "ok", latencyMs: 100, queuedMs: 5, costUsd: 0.001 },
+    },
+    {
+      // Overlaps the first call and reports an earlier timestamp.
+      type: "llm.call",
+      seq: 2,
+      ts: t0 + 900,
+      data: { provider: "p", model: "m", attempt: 2, outcome: "ok", latencyMs: 50, costUsd: 0.001 },
+    },
+    {
+      type: "llm.call",
+      seq: 3,
+      ts: t0 + 1200,
+      data: { provider: "p", model: "m", attempt: 3, outcome: "ok", latencyMs: 50, costUsd: 0.001 },
+    },
+  ];
+
+  const report = aggregateRunCostLatency("run_overlap", events);
+
+  // 850 < 1000, so the second call reports no queue time.
+  assert.equal(report.calls[1]!.queuedMs, 0);
+  // 1150 - 1000 = 150, not 1150 - 900 = 250.
+  assert.equal(report.calls[2]!.queuedMs, 150);
 });

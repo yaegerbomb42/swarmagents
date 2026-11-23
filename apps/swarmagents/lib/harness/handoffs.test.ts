@@ -85,3 +85,77 @@ test("handoffs: waitFor of an unknown id resolves cancelled (safe default)", asy
   const store = makeStore();
   assert.deepEqual(await store.waitFor("nope"), { status: "cancelled" });
 });
+
+test("handoffs: waitFor after settle still reports the outcome", async () => {
+  const store = makeStore();
+  const h = store.create({ runId: "r1", userId: "u1", reason: "2FA" });
+  const outcome = store.waitFor(h.id);
+  store.resolve(h.id);
+  assert.deepEqual(await outcome, { status: "answered" });
+  // The waiter was deleted on settle; a late waitFor falls back to the
+  // stored status instead of the "cancelled" default.
+  assert.deepEqual(await store.waitFor(h.id), { status: "answered" });
+});
+
+test("handoffs: a restored pending handoff has a waiter and can still be resolved", async () => {
+  const file = path.join(TMP, `handoffs-restore-${Math.random().toString(36).slice(2)}.json`);
+  let now = 1_000_000;
+  const first = new HandoffStore({ now: () => now, filePath: file, ttlMs: 10_000 });
+  const h = first.create({ runId: "r1", userId: "u1", reason: "CAPTCHA" });
+
+  now += 4_000;
+  const second = new HandoffStore({ now: () => now, filePath: file, ttlMs: 10_000 });
+  assert.equal(second.get(h.id)?.status, "pending");
+  const outcome = second.waitFor(h.id);
+  const raced = await Promise.race([
+    outcome.then(() => "settled" as const),
+    new Promise((resolve) => setTimeout(() => resolve("pending" as const), 20)),
+  ]);
+  assert.equal(raced, "pending", "waitFor must not resolve immediately for a live restored handoff");
+  second.resolve(h.id);
+  assert.deepEqual(await outcome, { status: "answered" });
+});
+
+test("handoffs: a restored pending handoff expires when its remaining TTL elapses", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const file = path.join(TMP, `handoffs-restore-ttl-${Math.random().toString(36).slice(2)}.json`);
+  let now = 1_000_000;
+  const first = new HandoffStore({ now: () => now, filePath: file, ttlMs: 10_000 });
+  const h = first.create({ runId: "r1", userId: "u1", reason: "drag" });
+
+  now += 4_000;
+  const second = new HandoffStore({ now: () => now, filePath: file, ttlMs: 10_000 });
+  assert.equal(second.get(h.id)?.status, "pending");
+  const outcome = second.waitFor(h.id);
+  t.mock.timers.tick(5_999);
+  assert.equal(second.get(h.id)?.status, "pending");
+  t.mock.timers.tick(1);
+  assert.deepEqual(await outcome, { status: "expired" });
+  assert.equal(second.get(h.id)?.status, "expired");
+});
+
+test("handoffs: listPending hides a stale pending handoff whose TTL elapsed", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let now = 1_000_000;
+  const store = makeStore(() => now);
+  const h = store.create({ runId: "r1", userId: "u1", reason: "drag", ttlMs: 10 });
+  assert.equal(store.listPending().length, 1);
+  // The TTL elapsed but the timer has not fired yet.
+  now += 100;
+  assert.equal(store.listPending().length, 0);
+  assert.equal(store.get(h.id)?.status, "pending", "the guard only hides the entry; the timer still expires it");
+  t.mock.timers.tick(10);
+  assert.equal(store.get(h.id)?.status, "expired");
+});
+
+test("handoffs: decided handoffs older than the retention bound are pruned from memory", () => {
+  let now = 1_000_000;
+  const store = makeStore(() => now);
+  const old = store.create({ runId: "r1", userId: "u1", reason: "old" });
+  store.resolve(old.id);
+  assert.ok(store.get(old.id));
+
+  now += 25 * 60 * 60 * 1000;
+  store.create({ runId: "r2", userId: "u2", reason: "new" });
+  assert.equal(store.get(old.id), undefined);
+});

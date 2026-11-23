@@ -17,6 +17,7 @@ import {
 } from "../../../../lib/computers";
 import { recordAudit } from "../../../../lib/audit";
 import { getRemoteRunManager } from "../../../../lib/computers/remote";
+import { readJsonObject } from "../../../../lib/http";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -43,27 +44,14 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
   const { id } = await ctx.params;
   if (!isComputerId(id)) return notFound();
 
-  let text: string;
-  try {
-    text = await req.text();
-  } catch {
-    return NextResponse.json({ error: "Could not read request body." }, { status: 400, headers: NO_STORE });
-  }
-  if (text.length > MAX_BODY_SIZE) {
-    return NextResponse.json({ error: "Request body too large." }, { status: 413, headers: NO_STORE });
-  }
-  let body: unknown;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400, headers: NO_STORE });
-  }
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return NextResponse.json({ error: "Body must be a JSON object." }, { status: 400, headers: NO_STORE });
-  }
+  // Bounded, streaming body read: an oversized body is rejected with 413
+  // before it is buffered; a malformed body or a non-object stays a 400.
+  const parsed = await readJsonObject(req, MAX_BODY_SIZE);
+  if (!parsed.ok) return parsed.response;
+  const body: Record<string, unknown> = parsed.value;
 
   try {
-    const computer = renameComputer(user, id, (body as Record<string, unknown>).name);
+    const computer = renameComputer(user, id, body.name);
     if (!computer) return notFound();
     return NextResponse.json({ computer }, { headers: NO_STORE });
   } catch (err) {

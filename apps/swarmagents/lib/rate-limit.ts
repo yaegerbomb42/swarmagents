@@ -77,6 +77,24 @@ export class TokenBucket {
     };
   }
 
+  /**
+   * Return tokens to a bucket (e.g. a login that turned out to be
+   * legitimate). Applies the same time-based refill first, then adds the
+   * tokens back, clamped at capacity. A no-op when the key has no bucket.
+   */
+  refund(key: string, tokens = 1): void {
+    const bucket = this.buckets.get(key);
+    if (!bucket) return;
+    const now = Date.now();
+    const elapsed = now - bucket.lastRefill;
+    bucket.tokens = Math.min(
+      this.capacity,
+      bucket.tokens + (elapsed / this.windowMs) * this.capacity + tokens,
+    );
+    bucket.lastRefill = now;
+    this.buckets.set(key, bucket);
+  }
+
   /** Internal: clear all buckets. */
   _clear(): void {
     this.buckets.clear();
@@ -113,12 +131,97 @@ const EXEMPT = new Set(["/api/health"]);
 /** Stricter login bucket: 5 requests per minute. */
 const loginBucket = new TokenBucket(5, 60_000);
 
+/** Window for the failed-login budgets below (15 minutes). */
+const LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
+
+function perCount(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+/** Failed-login budget per account (SWARM_LOGIN_EMAIL_LIMIT, default 10 per 15 min). */
+export const LOGIN_EMAIL_LIMIT = perCount("SWARM_LOGIN_EMAIL_LIMIT", 10);
+/** Failed-login budget per client IP (SWARM_LOGIN_IP_LIMIT, default 30 per 15 min). */
+export const LOGIN_IP_LIMIT = perCount("SWARM_LOGIN_IP_LIMIT", 30);
+
+/**
+ * Failed-login budgets for POST /api/login. Unlike the middleware's
+ * per-minute login bucket (which counts every request), these count only
+ * failed credential checks: a token is taken before verifyLocalUser runs
+ * and handed back when the login succeeds, so legitimate sign-ins never
+ * consume the failure budget.
+ */
+const loginEmailBucket = new TokenBucket(LOGIN_EMAIL_LIMIT, LOGIN_FAILURE_WINDOW_MS);
+const loginIpBucket = new TokenBucket(LOGIN_IP_LIMIT, LOGIN_FAILURE_WINDOW_MS);
+
+/** Decision from the failed-login buckets. */
+export interface LoginRateLimit {
+  allowed: boolean;
+  /** Seconds until the tripped bucket admits another attempt (0 when allowed). */
+  retryAfter: number;
+}
+
+/**
+ * Take one token from the per-email bucket (when an email key is given) and
+ * one from the per-IP bucket. When the IP bucket denies, the email token is
+ * handed back so a denied attempt cannot drain the account budget.
+ */
+export function checkLoginRateLimit(
+  emailKey: string | null,
+  ipKey: string,
+): LoginRateLimit {
+  if (emailKey) {
+    const email = loginEmailBucket.consume(emailKey);
+    if (!email.allowed) return { allowed: false, retryAfter: email.retryAfter };
+    const ip = loginIpBucket.consume(ipKey);
+    if (!ip.allowed) {
+      loginEmailBucket.refund(emailKey);
+      return { allowed: false, retryAfter: ip.retryAfter };
+    }
+    return { allowed: true, retryAfter: 0 };
+  }
+  const ip = loginIpBucket.consume(ipKey);
+  return { allowed: ip.allowed, retryAfter: ip.retryAfter };
+}
+
+/** Hand back the tokens taken by checkLoginRateLimit (successful login, or an attempt that never ran as a credential check). */
+export function refundLoginRateLimit(emailKey: string | null, ipKey: string): void {
+  if (emailKey) loginEmailBucket.refund(emailKey);
+  loginIpBucket.refund(ipKey);
+}
+
+/**
+ * Provider completion bucket: one completion can fan out to 8 upstream LLM
+ * calls, so it gets its own per-user budget (tighter than the general API
+ * 300/min) rather than sharing the app-wide bucket. 60/min by default,
+ * tunable with SWARM_COMPLETE_RATE_LIMIT_PER_MIN.
+ */
+const completeBucket = new TokenBucket(perMinute("SWARM_COMPLETE_RATE_LIMIT_PER_MIN", 60), 60_000);
+
+/**
+ * Provider health-probe bucket: a probe is a live outbound call per click.
+ * 30/min per user by default, tunable with
+ * SWARM_PROVIDER_PROBE_RATE_LIMIT_PER_MIN.
+ */
+const probeBucket = new TokenBucket(perMinute("SWARM_PROVIDER_PROBE_RATE_LIMIT_PER_MIN", 30), 60_000);
+
 /**
  * Signup bucket: account creation is also scrypt-heavy, so it gets its own
  * strict per-identity budget rather than sharing the app-wide 300/min bucket.
  * 5/min by default, tunable with SWARM_SIGNUP_RATE_LIMIT_PER_MIN.
  */
 const signupBucket = new TokenBucket(perMinute("SWARM_SIGNUP_RATE_LIMIT_PER_MIN", 5), 60_000);
+
+/**
+ * Password-reset bucket (FIX-39): the request endpoint mints tokens and
+ * sends mail, the confirm endpoint burns a scrypt hash — both get the
+ * same strict per-identity budget as login/signup. 5/min by default,
+ * tunable with SWARM_PASSWORD_RESET_RATE_LIMIT_PER_MIN.
+ */
+const passwordResetBucket = new TokenBucket(
+  perMinute("SWARM_PASSWORD_RESET_RATE_LIMIT_PER_MIN", 5),
+  60_000,
+);
 
 /**
  * Strict degraded-mode bucket for anonymous requests whose client identity
@@ -268,6 +371,8 @@ export function rateLimitCheck(
   else if (key === UNIDENTIFIED_KEY) bucket = unidentifiedBucket;
   else if (pathname === "/api/login") bucket = loginBucket;
   else if (pathname === "/api/signup") bucket = signupBucket;
+  else if (pathname.startsWith("/api/password-reset/") || pathname.startsWith("/api/email-verification/"))
+    bucket = passwordResetBucket;
   else if (isShare) bucket = shareBucket;
   else bucket = apiBucket;
 
@@ -294,11 +399,36 @@ export function rateLimitResponse(rate: RateInfo): NextResponse {
 export function resetBuckets(): void {
   apiBucket._clear();
   loginBucket._clear();
+  loginEmailBucket._clear();
+  loginIpBucket._clear();
   signupBucket._clear();
+  passwordResetBucket._clear();
   boardBucket._clear();
   approvalBucket._clear();
   unidentifiedBucket._clear();
   shareBucket._clear();
+  completeBucket._clear();
+  probeBucket._clear();
+}
+
+/**
+ * Per-user completion budget for POST /api/providers/complete. Returns
+ * whether the call may proceed and, when denied, how many seconds to wait.
+ * The key is the signed-in user id; callers check auth before calling this.
+ */
+export function checkCompleteRateLimit(user: string): { allowed: boolean; retryAfter: number } {
+  const r = completeBucket.consume(`user:${user}`);
+  return { allowed: r.allowed, retryAfter: r.retryAfter };
+}
+
+/**
+ * Per-user health-probe budget for POST /api/providers/[id]/test. Same
+ * shape as checkCompleteRateLimit; a separate bucket so probe clicks can
+ * never eat the completion budget or vice versa.
+ */
+export function checkProviderProbeRateLimit(user: string): { allowed: boolean; retryAfter: number } {
+  const r = probeBucket.consume(`user:${user}`);
+  return { allowed: r.allowed, retryAfter: r.retryAfter };
 }
 
 /** Reset one-time warning state (for tests). */

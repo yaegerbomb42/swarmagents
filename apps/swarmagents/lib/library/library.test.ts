@@ -29,6 +29,7 @@ import { POST as versionsPOST } from "../../app/api/library/public/[id]/versions
 import { GET as itemsGET, POST as itemsPOST } from "../../app/api/library/items/route";
 import { GET as connectorsGET, POST as connectorsPOST } from "../../app/api/library/connectors/route";
 import { GET as meGET } from "../../app/api/library/me/route";
+import { configureAuditPath, readAuditEntries } from "../audit";
 
 let dir: string;
 let savedEnv: NodeJS.ProcessEnv;
@@ -36,6 +37,7 @@ let savedEnv: NodeJS.ProcessEnv;
 test.beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-public-library-"));
   configureLibraryStoreDir(dir);
+  configureAuditPath(path.join(dir, "audit.jsonl"));
   savedEnv = { ...process.env };
   process.env.SWARM_LIBRARY_PUBLISH_PER_HOUR = "1000";
   delete process.env.SWARM_ADMIN_USERS;
@@ -45,6 +47,7 @@ test.beforeEach(() => {
 
 test.afterEach(() => {
   configureLibraryStoreDir(undefined);
+  configureAuditPath(undefined);
   resetPublishRateLimit();
   for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
   Object.assign(process.env, savedEnv);
@@ -301,6 +304,10 @@ test("reports are counted and only an admin can unpublish another account's item
   });
   assert.equal(allowed.status, 200);
   assert.equal((await json(allowed)).item.moderation, "unpublished");
+  const audit = readAuditEntries("local_admin@swarm.test").find((e) => e.action === "library.unpublish");
+  assert.ok(audit, "unpublish must write a structured audit entry");
+  assert.equal(audit!.target, publicId);
+  assert.equal(audit!.result, "success");
 
   // Gone from browse and from other users' detail views; the owner and an
   // admin can still see what happened.
@@ -588,3 +595,56 @@ test("listPublicItems hides unpublished items and newest sort works at the store
   const summary = listPublicItems({}).items.find((item) => item.id === third.id)!;
   assert.equal(JSON.stringify(summary).includes("reporter"), false);
 });
+
+test("publish validation failure does not consume hourly rate limit", async () => {
+  process.env.SWARM_LIBRARY_PUBLISH_PER_HOUR = "1";
+  resetPublishRateLimit();
+  // Invalid payload: missing name
+  const res1 = await publicPOST(request({
+    kind: "skill",
+    payload: skillPayload("# test"),
+  }, "rate_tester"));
+  assert.equal(res1.status, 400);
+
+  // Valid payload should still succeed since quota wasn't burned
+  const res2 = await publicPOST(request({
+    kind: "skill",
+    name: "Valid Skill",
+    payload: skillPayload("# test"),
+  }, "rate_tester"));
+  assert.equal(res2.status, 201);
+});
+
+test("connectors installed status ignores non-connector items with connector-prefix", async () => {
+  // Add a non-connector item (e.g. tool) that happens to have id connector-github
+  addInstalledItem("connector_tester", {
+    id: "connector-github",
+    kind: "tool",
+    name: "Fake Connector",
+    payload: {
+      kind: "tool",
+      language: "javascript",
+      code: "export default function() {}",
+      inputSchema: {},
+      requiredFields: [],
+      timeoutMs: 30000,
+    },
+    origin: "user",
+  });
+
+  const res = await connectorsGET(get("connector_tester", "http://localhost/api/library/connectors"));
+  assert.equal(res.status, 200);
+  const data = await json(res);
+  const github = data.connectors.find((c: { id: string }) => c.id === "github");
+  assert.ok(github);
+  // Should NOT be marked as installed because kind !== "connector"
+  assert.equal(github.installed, false);
+});
+
+test("public catalog clamps pagination bounds", async () => {
+  const res = await publicGET(get("alice", "http://localhost/api/library/public?limit=-10&offset=-5"));
+  assert.equal(res.status, 200);
+  const data = await json(res);
+  assert.ok(Array.isArray(data.items));
+});
+

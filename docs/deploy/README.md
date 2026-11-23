@@ -16,7 +16,7 @@ Other actions: `rollback` (restore the previous image and env), `logs` (last 200
 
 ## Required secrets
 
-Set under Settings > Secrets and variables > Actions (repo, or a `production` environment with optional reviewers). Never commit values.
+Set under Settings > Secrets and variables > Actions, in the `production` environment (optionally with reviewers). Never commit values.
 
 | Secret | Value |
 | --- | --- |
@@ -64,6 +64,7 @@ Then verify with Actions > Deploy > `status`, and deploy normally. The directory
 `monolith_deploy_key`): they are server paths in the installed script, not repo names. Rollback of the cutover: set-url back to the old origin and
 `git -C monolith.git fetch origin +main:main`, then reset the worktree to `origin/main` again.
 
-Secrets for this repo (Settings > Secrets and variables > Actions, preferably under a protected `production` environment): `DEPLOY_SSH_KEY`,
-`DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_KNOWN_HOSTS`. For playtests also `SWARM_TEST_EMAIL`, `SWARM_TEST_PASSWORD`, `TEST_<PROVIDER>_API_KEY`, and the
-variable `TEST_PROVIDERS_MANIFEST`.
+Secrets for this repo (Settings > Secrets and variables > Actions, under a protected `production` environment): `DEPLOY_SSH_KEY`,
+`DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_KNOWN_HOSTS`. Playtest credentials (`SWARM_TEST_EMAIL`, `SWARM_TEST_PASSWORD`,
+`TEST_<PROVIDER>_API_KEY`, and the `TEST_PROVIDERS_MANIFEST` variable) belong in the separate `playtest` environment, never in
+`production`.

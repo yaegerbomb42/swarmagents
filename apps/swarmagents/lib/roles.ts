@@ -116,6 +116,10 @@ export const ROLE_TOOLS: readonly RoleTool[] = [
   { name: "browser", label: "Browser", hint: "Drive the shared headless browser.", mutating: true, claude: "Browser" },
   { name: "api_request", label: "API request", hint: "Call an API using a saved tool key.", mutating: true, claude: "ApiRequest" },
   { name: "subagent", label: "Sub-agent", hint: "Delegate independent pieces of work in parallel.", mutating: true, claude: "Task" },
+  // Read-only explorer subagent (lib/harness/explorer.ts): answers a codebase
+  // question with a verified Ground-Truth Brief. Non-mutating; the VM-side
+  // MCP server that serves it to Claude is a follow-up to the runtime.
+  { name: "dispatch_explorer", label: "Explorer", hint: "Dispatch a read-only explorer subagent to answer a codebase question.", mutating: false, claude: "dispatch_explorer" },
 ];
 
 const TOOL_LABELS = new Map(ROLE_TOOLS.map((tool) => [tool.name, tool.label] as const));
@@ -221,7 +225,7 @@ export const BUILTIN_ROLES: readonly RoleDefinition[] = [
     glyph: "★",
     model: "",
     permissions: permissions({ allowBash: true, allowWrite: true, allowNetwork: true, allowBrowser: true, allowSubagents: true }),
-    tools: ["plan", "read_file", "search", "write_file", "edit_file", "restore_checkpoint", "bash", "web_search", "web_fetch", "browser", "api_request", "subagent"],
+    tools: ["plan", "read_file", "search", "write_file", "edit_file", "restore_checkpoint", "bash", "web_search", "web_fetch", "browser", "api_request", "subagent", "dispatch_explorer"],
     mcpServers: ["github-mcp"],
     skills: ["terminal-exec", "file-editor", "browser-live"],
     instructions:
@@ -236,7 +240,7 @@ export const BUILTIN_ROLES: readonly RoleDefinition[] = [
     glyph: "◎",
     model: "",
     permissions: permissions({ allowNetwork: true, allowSubagents: true }),
-    tools: ["plan", "read_file", "search", "web_search", "web_fetch", "subagent"],
+    tools: ["plan", "read_file", "search", "web_search", "web_fetch", "subagent", "dispatch_explorer"],
     mcpServers: [],
     skills: ["terminal-exec"],
     instructions:
@@ -251,7 +255,7 @@ export const BUILTIN_ROLES: readonly RoleDefinition[] = [
     glyph: "⌕",
     model: "",
     permissions: permissions({ readOnly: true, allowNetwork: true, allowBrowser: true }),
-    tools: ["read_file", "search", "web_search", "web_fetch", "browser"],
+    tools: ["read_file", "search", "web_search", "web_fetch", "browser", "dispatch_explorer"],
     mcpServers: [],
     skills: ["browser-live"],
     instructions:

@@ -79,6 +79,7 @@ import {
   routeParam,
   unauthorized,
 } from "../../../../../../lib/library/http";
+import { isLibraryAdmin } from "../../../../../../lib/library/admin";
 import { findPublicItem, latestVersion } from "../../../../../../lib/library/public-store";
 import {
   createTestDrive,
@@ -178,9 +179,9 @@ function driveView(drive: TestDriveRecord, userId: string): TestDriveView {
 }
 
 /**
- * Advance a "running" drive once its run report exists: a finished run
- * becomes "awaiting-decision"; a failed/cancelled run is rolled back on the
- * spot (its restore failure is recorded, never thrown).
+ * Advance a "running" drive once its run report exists or the run has terminated:
+ * a finished run becomes "awaiting-decision"; a failed/cancelled/crashed run is
+ * rolled back on the spot (its restore failure is recorded, never thrown).
  */
 async function finalizeDriveIfNeeded(
   drive: TestDriveRecord,
@@ -191,30 +192,73 @@ async function finalizeDriveIfNeeded(
   // concurrently-moving mid-transition state.
   const current = getTestDrive(drive.id) ?? drive;
   if (current.status !== "running") return current;
-  const report = readRunReport(drive.runId);
-  if (!report) return drive;
-  if (report.status === "finished") {
+
+  const report = readRunReport(current.runId);
+  if (report) {
+    if (report.status === "finished") {
+      return (
+        updateTestDrive(current.id, { status: "awaiting-decision", finishedAt: report.finishedAt }) ??
+        current
+      );
+    }
+    // Failed or cancelled with a report -> auto-rollback
+    try {
+      await getVmManager().restore(userId, current.snapshotLabel);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return (
+        updateTestDrive(current.id, {
+          lastError: `Automatic roll-back after the failed drive run failed: ${message}`,
+        }) ?? current
+      );
+    }
     return (
-      updateTestDrive(drive.id, { status: "awaiting-decision", finishedAt: report.finishedAt }) ??
-      drive
+      updateTestDrive(current.id, {
+        status: "rolled-back",
+        rollbackReason: "run-failed",
+        finishedAt: report.finishedAt,
+      }) ?? current
     );
   }
+
+  // No RunReport written. Check if the run is still active or terminated/crashed.
+  const live = getRuntimeManager()
+    .list(userId)
+    .find((run) => run.runId === current.runId);
+  const summary = getRunSummary(current.runId);
+
+  // If the run is known to be still running or queued, leave it alone.
+  if (live?.status === "running" || live?.status === "queued") {
+    return current;
+  }
+  if (summary?.status === "running" || summary?.status === "queued") {
+    return current;
+  }
+
+  // If the run is not known to be running/queued, but also not yet terminal (e.g. still initializing before manager marks active), check:
+  // If neither live nor summary exists, but the drive was started within the last 15 seconds, don't auto-rollback prematurely.
+  if (!live && !summary && Date.now() - current.startedAt < 15_000) {
+    return current;
+  }
+
+  // If live reports error or cancelled, or summary reports error or cancelled, or run is missing after timeout:
+  // Auto-rollback on the spot so the drive is not stuck in "running".
   try {
-    await getVmManager().restore(userId, drive.snapshotLabel);
+    await getVmManager().restore(userId, current.snapshotLabel);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return (
-      updateTestDrive(drive.id, {
+      updateTestDrive(current.id, {
         lastError: `Automatic roll-back after the failed drive run failed: ${message}`,
-      }) ?? drive
+      }) ?? current
     );
   }
   return (
-    updateTestDrive(drive.id, {
+    updateTestDrive(current.id, {
       status: "rolled-back",
       rollbackReason: "run-failed",
-      finishedAt: report.finishedAt,
-    }) ?? drive
+      finishedAt: live?.finishedAt ?? summary?.finishedAt ?? Date.now(),
+    }) ?? current
   );
 }
 
@@ -295,11 +339,6 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
   } catch {
     return jsonError("Invalid request id.", 400);
   }
-  const record = findPublicItem(id);
-  if (!record) return jsonError("Item not found.", 404);
-  if (record.moderation === "unpublished" && record.ownerId !== user) {
-    return jsonError("Item not found.", 404);
-  }
 
   let body: unknown;
   try {
@@ -309,6 +348,23 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
   }
   if (!isRecord(body)) return jsonError("Body must be a JSON object.", 400);
   const action = typeof body.action === "string" ? body.action.trim().toLowerCase() : "";
+
+  // action: "sweep" is per-user and does not depend on the path item's existence.
+  if (action === "sweep") {
+    return withUserLock(user, async () => {
+      const result = await sweepAbandonedDrives(user, (drive) =>
+        getVmManager().restore(drive.userId, drive.snapshotLabel),
+      );
+      return NextResponse.json(result, { headers: NO_STORE });
+    });
+  }
+
+  const record = findPublicItem(id);
+  if (!record) return jsonError("Item not found.", 404);
+  const admin = isLibraryAdmin(user);
+  if (record.moderation === "unpublished" && record.ownerId !== user && !admin) {
+    return jsonError("Item not found.", 404);
+  }
 
   if (action === "keep" || action === "rollback") {
     return withUserLock(user, async () => {
@@ -353,15 +409,6 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
     });
   }
 
-  if (action === "sweep") {
-    return withUserLock(user, async () => {
-      const result = await sweepAbandonedDrives(user, (drive) =>
-        getVmManager().restore(drive.userId, drive.snapshotLabel),
-      );
-      return NextResponse.json(result, { headers: NO_STORE });
-    });
-  }
-
   if (action !== "start") {
     return jsonError('action must be "start", "keep", "rollback", or "sweep".', 400);
   }
@@ -398,36 +445,47 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
       return jsonError(`Could not snapshot your VM before the test-drive: ${message}`, 500);
     }
 
-    const prompt = testDrivePrompt({
-      publicId: record.id,
-      name: record.name,
-      kind: record.kind,
-      version: version.version,
-      payload: version.payload,
-      ...(userPrompt ? { userPrompt } : {}),
-    });
-    const started = getRuntimeManager().start(user, { prompt, freshSession: true });
-    if (!started.accepted) {
-      // Nothing ran — restore the snapshot immediately so the VM is untouched.
+    try {
+      const prompt = testDrivePrompt({
+        publicId: record.id,
+        name: record.name,
+        kind: record.kind,
+        version: version.version,
+        payload: version.payload,
+        ...(userPrompt ? { userPrompt } : {}),
+      });
+      const started = getRuntimeManager().start(user, { prompt, freshSession: true });
+      if (!started.accepted) {
+        // Nothing ran — restore the snapshot immediately so the VM is untouched.
+        try {
+          await vm.restore(user, label);
+        } catch {
+          /* best effort: the snapshot remains for a manual restore */
+        }
+        return jsonError(started.error ?? "Could not start the test-drive run.", 400);
+      }
+
+      const drive = createTestDrive({
+        userId: user,
+        publicId: record.id,
+        publicName: record.name,
+        version: version.version,
+        snapshotLabel: label,
+        runId: started.runId,
+      });
+      return NextResponse.json(
+        { drive: driveView(drive, user), runId: started.runId, snapshotLabel: label, queued: started.queued },
+        { status: 201, headers: NO_STORE },
+      );
+    } catch (error) {
+      // Unhandled error after snapshot succeeded: restore snapshot to prevent orphan
       try {
         await vm.restore(user, label);
       } catch {
-        /* best effort: the snapshot remains for a manual restore */
+        /* best effort */
       }
-      return jsonError(started.error ?? "Could not start the test-drive run.", 400);
+      const message = error instanceof Error ? error.message : "Failed to start test-drive run.";
+      return jsonError(`Could not start the test-drive: ${message}`, 500);
     }
-
-    const drive = createTestDrive({
-      userId: user,
-      publicId: record.id,
-      publicName: record.name,
-      version: version.version,
-      snapshotLabel: label,
-      runId: started.runId,
-    });
-    return NextResponse.json(
-      { drive: driveView(drive, user), runId: started.runId, snapshotLabel: label, queued: started.queued },
-      { status: 201, headers: NO_STORE },
-    );
   });
 }

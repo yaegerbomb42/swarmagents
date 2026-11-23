@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import { vaultProxyEnv } from "../secrets/inject";
 import { revokeVaultToken } from "../secrets/token";
 import { ClaudeCodeRunner, isSignalKillExitCode } from "../harness/runner";
+import { roleMaxTurns } from "../harness/role-clamps";
 import { makeRedactor } from "../harness/redact";
 import type {
   ApprovalGateway,
@@ -26,6 +27,7 @@ import type {
   HandoffRequest,
   RolePhase,
   RunOutcome,
+  RunRequest,
   TelemetryEvent as HarnessEvent,
 } from "../harness/types";
 import {
@@ -35,6 +37,7 @@ import {
   isClaudeFailoverEligible,
 } from "../providers";
 import { routerProviders, userCooldownFilePath, userProvidersSignature } from "../providers/store";
+import { isAnthropicStyle } from "../providers/adapters";
 import { readUserSettings, systemPackerOptionsFor } from "../providers/settings";
 import { RunProviderPool, runWithPool } from "../providers/run-pool";
 import type { AttemptOutcome, RunAttempt } from "../providers/run-pool";
@@ -48,6 +51,7 @@ import type { RunMode } from "../providers/types";
 import { orderLlmCandidates } from "./llm-gateway";
 import { isTeamRunActive, ownsTeamRun } from "../team/store";
 import { serverMode } from "../auth";
+import { isEmailVerifiedForUserId } from "../users";
 import type {
   AttemptInfo,
   ClaudeSelection,
@@ -182,9 +186,18 @@ const DEFAULT_MAX_QUEUED = 3;
  * tool call (e.g. an agent sleeping in a loop) legitimately produces no
  * telemetry for a while. A wedged docker exec or a run whose process exited
  * without releasing the exec stream is what they exist to break.
+ *
+ * Silence while a tool is in flight gets the longer TOOL_SILENCE_MS window:
+ * a tool.call with no tool.result yet means work may legitimately be running
+ * inside the VM (a big build, a long test suite) with nothing to report, and
+ * event silence alone cannot tell that from a wedge. The window is capped —
+ * aligned with the agent exec duration quota (agentMaxExecDurationMs in
+ * lib/vm/quotas.ts) — so a tool that hangs forever is still declared stuck
+ * once even that generous bound passes.
  */
 const DEFAULT_START_GRACE_MS = 5 * 60 * 1000;
 const DEFAULT_SILENCE_MS = 30 * 60 * 1000;
+const DEFAULT_TOOL_SILENCE_MS = 2 * 60 * 60 * 1000;
 
 export type RunStatus = "queued" | "running" | "finished" | "error" | "cancelled";
 
@@ -269,6 +282,12 @@ interface QueuedRun {
   resumePoint?: ResumePoint;
   /** F1 fork: start a fresh conversation instead of resuming the last session. */
   freshSession?: boolean;
+  /**
+   * Turn ceiling for this run, passed to claude as --max-turns (capped by
+   * SWARM_MAX_TURNS in the runner). Absent means no flag — the CLI's own
+   * default applies.
+   */
+  maxTurns?: number;
   createdAt: number;
 }
 
@@ -281,6 +300,12 @@ export interface StartResult {
   limit?: number;
   /** Set when a request was refused (e.g. an unknown role id). */
   error?: string;
+  /**
+   * Names of required environment variables that are missing when the
+   * refusal is a server configuration error (names only, never values), so
+   * the API/UI can tell the operator exactly what to set.
+   */
+  missingEnv?: string[];
 }
 
 interface ActiveRun {
@@ -313,6 +338,12 @@ interface ActiveRun {
   /** Provider serving the run, from the router selection. */
   provider?: string;
   model?: string;
+  /**
+   * Turn ceiling for this run, passed to claude as --max-turns (capped by
+   * SWARM_MAX_TURNS in the runner). Absent means no flag — the CLI's own
+   * default applies.
+   */
+  maxTurns?: number;
   /** The role driving this run (undefined = legacy un-role'd run). */
   role?: RoleDefinition;
   /**
@@ -335,6 +366,14 @@ interface ActiveRun {
   startedAt?: number;
   /** Epoch ms of the last telemetry this run produced; heartbeat for the watchdog. */
   lastActivityAt: number;
+  /**
+   * Tool calls announced (tool.call) but not yet resulted (tool.result),
+   * counted by tool id ("" when the CLI gave none). The watchdog reads this
+   * as "a tool may legitimately be running inside the VM": event silence
+   * with an open tool gets the longer tool-silence window instead of the
+   * plain silence window. In-memory only — a restored run starts empty.
+   */
+  openTools?: Map<string, number>;
   /** True once the codebase context pack was prepended to this run. */
   codebaseContextInjected?: boolean;
   /** g9 full-auto: the synchronous approval hook auto-allows in-VM asks. */
@@ -385,6 +424,21 @@ function maxQueuedFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   const n = Number(raw);
   if (!Number.isSafeInteger(n) || n < 0) return DEFAULT_MAX_QUEUED;
   return n;
+}
+
+/**
+ * Wall-clock run timeout from SWARM_RUN_TIMEOUT_SEC (seconds), in ms.
+ * Unset, non-numeric, or non-positive means no timeout — a run is
+ * bounded only by its turn ceiling. The timeout bounds each harness
+ * attempt (see runOnce); the failover and shadow-gate loops around it
+ * have their own bounded budgets.
+ */
+function runTimeoutMsFromEnv(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const raw = env.SWARM_RUN_TIMEOUT_SEC?.trim();
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+  return Math.floor(seconds * 1000);
 }
 
 interface TerminalPatch {
@@ -462,26 +516,107 @@ export function resolveApprovalBaseUrl(): string | null {
 }
 
 /**
+ * Names of the environment variables a real Docker run needs for its managed
+ * PreToolUse approval hook that are currently unset (names only, never
+ * values). Empty when the driver is not Docker or everything required is
+ * configured. In server mode SWARM_PUBLIC_ORIGIN is listed alongside
+ * SWARM_VM_APPROVAL_BASE_URL: either one makes the approval endpoint
+ * reachable from inside the VM, and the public origin is the one a server
+ * deployment normally sets.
+ */
+export function missingDockerApprovalEnv(vm: VmManager): string[] {
+  if (!(vm.driver instanceof DockerVmDriver)) return [];
+  const missing: string[] = [];
+  if (!resolveApprovalBaseUrl()) {
+    missing.push("SWARM_VM_APPROVAL_BASE_URL");
+    if (serverMode()) missing.push("SWARM_PUBLIC_ORIGIN");
+  }
+  if (!process.env.SWARM_SESSION_SECRET?.trim()) missing.push("SWARM_SESSION_SECRET");
+  return missing;
+}
+
+/**
  * Return an actionable startup error when any real Docker run would start
  * the managed PreToolUse hook without any way to reach or authenticate to its
  * approval endpoint. Never fall back to the legacy post-hoc stdout gate here:
  * the managed hook has already denied the tool before stdout could be gated.
  */
 export function localDockerApprovalConfigurationError(vm: VmManager): string | null {
-  if (!(vm.driver instanceof DockerVmDriver)) return null;
-  const missing: string[] = [];
-  if (!resolveApprovalBaseUrl()) missing.push("SWARM_VM_APPROVAL_BASE_URL");
-  if (!process.env.SWARM_SESSION_SECRET?.trim()) missing.push("SWARM_SESSION_SECRET");
+  const missing = missingDockerApprovalEnv(vm);
   if (missing.length === 0) return null;
   return (
     `Docker VM startup configuration error: ${missing.join(" and ")} must be configured. ` +
     "The managed VM image always enables its PreToolUse approval hook, so running without " +
     "a reachable authenticated approval endpoint would deny every non-allowlisted tool. " +
-    "Set SWARM_VM_APPROVAL_BASE_URL to an origin reachable from inside the VM and " +
-    "SWARM_SESSION_SECRET to sign its per-run token. Do not use the VM's 127.0.0.1 or " +
-    "localhost for the host app: Docker Desktop normally uses host.docker.internal, while " +
-    "Linux normally uses the Docker bridge gateway IP. See README.md for listener requirements."
+    "Set SWARM_VM_APPROVAL_BASE_URL (or, in server mode, SWARM_PUBLIC_ORIGIN) to an origin " +
+    "reachable from inside the VM and SWARM_SESSION_SECRET to sign its per-run token. " +
+    "Do not use the VM's 127.0.0.1 or localhost for the host app: Docker Desktop normally " +
+    "uses host.docker.internal, while Linux normally uses the Docker bridge gateway IP. " +
+    "See README.md for listener requirements."
   );
+}
+
+/**
+ * Names of the environment variables that would enable the server-side LLM
+ * proxy for VM runs, when none of them is set in server mode (names only,
+ * never values). Empty in local mode (direct provider mode is the legacy
+ * local behavior) and whenever a proxy base URL already resolves.
+ */
+export function missingLlmProxyEnv(): string[] {
+  if (!serverMode()) return [];
+  if (resolveLlmBaseUrl()) return [];
+  return ["SWARM_VM_LLM_BASE_URL", "SWARM_PUBLIC_ORIGIN"];
+}
+
+/** Actionable error for a non-Anthropic-wire provider in server-mode direct mode. */
+function directModeErrorMessage(providerId: string): string {
+  const missing = missingLlmProxyEnv();
+  const names = (
+    missing.length > 0 ? missing : ["SWARM_VM_LLM_BASE_URL", "SWARM_PUBLIC_ORIGIN"]
+  ).join(" and ");
+  return (
+    `LLM proxy configuration error: ${names} must be configured ` +
+    `in server mode. The selected provider (${providerId}) does not speak the Anthropic ` +
+    "Messages API, so the VM's Claude CLI cannot call it directly, and direct mode would " +
+    "place the raw provider key in the VM environment. Set SWARM_PUBLIC_ORIGIN to the " +
+    "public site origin (or SWARM_VM_LLM_BASE_URL to an origin reachable from inside the " +
+    "VM) so runs use the server-side LLM proxy."
+  );
+}
+
+/**
+ * In server mode, direct provider mode (no LLM proxy base URL) is only safe
+ * for providers that speak the Anthropic Messages API: the VM's Claude CLI
+ * speaks only that wire format, so an OpenAI-style provider is unreachable
+ * directly, and the raw per-user key would enter the VM environment,
+ * defeating the host-proxied design. Returns an actionable error naming the
+ * missing variables when a real Docker run's effective (first usable)
+ * provider is not Anthropic-wire and no proxy base URL is configured. Local
+ * mode and non-Docker drivers are unchanged: direct mode remains the legacy
+ * local behavior there, and only a real VM ever receives the provider env.
+ */
+export function directModeConfigurationError(
+  vm: VmManager,
+  userId: string,
+  model?: string,
+): string | null {
+  if (!(vm.driver instanceof DockerVmDriver)) return null;
+  if (missingLlmProxyEnv().length === 0) return null;
+  let providerId: string;
+  try {
+    const candidates = orderLlmCandidates(routerProviders(userId), model, {
+      preferFree: readUserSettings(userId).preferFreeProviders,
+    });
+    // Mirror selectForClaude: providers without a usable key are skipped.
+    const first = candidates.find((c) => (c.config.keys?.length ?? 0) > 0);
+    if (!first || isAnthropicStyle(first.config)) return null;
+    providerId = first.config.id;
+  } catch {
+    // A broken provider store must not invent a configuration error here;
+    // the usual "no providers" path reports it.
+    return null;
+  }
+  return directModeErrorMessage(providerId);
 }
 
 /** Throw the local Docker approval startup error, if one applies. */
@@ -607,13 +742,23 @@ export function buildRunnerEnv(env: NodeJS.ProcessEnv = process.env): Record<str
   return out;
 }
 
+/** Minimal runner surface runOnce needs (ClaudeCodeRunner satisfies it). */
+export interface RunnerLike {
+  run(request: RunRequest, onEvent: (event: HarnessEvent) => void): Promise<RunOutcome>;
+}
+
 export class RuntimeManager {
   private readonly vm: VmManager;
   private readonly bus: TelemetryBus;
   private readonly reporter: RunReporter;
   /** Reads and builds codebase maps inside the user's own VM. */
   private readonly codebaseScanner: CodebaseScanner;
-  private readonly runner = new ClaudeCodeRunner();
+  /**
+   * Minimal runner surface runOnce needs. Test hook: inject a fake runner
+   * (one that never resolves lets the wall-clock timeout test run fast
+   * under fake timers); production uses a real ClaudeCodeRunner.
+   */
+  private readonly runner: RunnerLike;
   private readonly users = new Map<string, UserState>();
   /**
    * Test override for the provider router Claude Code is pointed at. When
@@ -627,6 +772,7 @@ export class RuntimeManager {
   private readonly maxQueuedOverride: number | undefined;
   private readonly startGraceMs: number;
   private readonly silenceMs: number;
+  private readonly toolSilenceMs: number;
   private readonly watchdogSweepMs: number = 30_000;
   /**
    * Durable snapshot of active+queued work. Null in direct constructions
@@ -652,12 +798,16 @@ export class RuntimeManager {
      */
     startGraceMs?: number;
     silenceMs?: number;
+    /** Silence tolerated while a tool is in flight (default 2h; see DEFAULT_TOOL_SILENCE_MS). */
+    toolSilenceMs?: number;
     /** Watchdog sweep cadence, ms (default 30s; minimum 20ms in tests). */
     watchdogSweepMs?: number;
     /** Test hook: inject the run-report reporter. */
     reporter?: RunReporter;
     /** Test hook: inject the codebase scanner (default: the user's VM). */
     codebaseScanner?: CodebaseScanner;
+    /** Test hook: inject the harness runner (default: a real ClaudeCodeRunner). */
+    runner?: RunnerLike;
     /**
      * Durable active+queue snapshot. Omitted/null keeps this manager
      * memory-only (tests); the process-wide singleton passes the real store.
@@ -668,10 +818,12 @@ export class RuntimeManager {
     this.bus = opts.bus ?? telemetryBus;
     this.reporter = opts.reporter ?? new RunReporter({ vm: this.vm, bus: this.bus });
     this.codebaseScanner = opts.codebaseScanner ?? createVmScanner(this.vm);
+    this.runner = opts.runner ?? new ClaudeCodeRunner();
     this.routerOverride = opts.router === undefined ? undefined : opts.router;
     this.maxQueuedOverride = opts.maxQueued;
     this.startGraceMs = opts.startGraceMs ?? DEFAULT_START_GRACE_MS;
     this.silenceMs = opts.silenceMs ?? DEFAULT_SILENCE_MS;
+    this.toolSilenceMs = opts.toolSilenceMs ?? DEFAULT_TOOL_SILENCE_MS;
     this.watchdogSweepMs = Math.max(20, opts.watchdogSweepMs ?? 30_000);
     this.stateStore = opts.stateStore ?? null;
 
@@ -976,12 +1128,42 @@ export class RuntimeManager {
   }
 
   /**
+   * Mark a tool call as in flight for the watchdog. Keyed by tool id (""
+   * when the CLI gave none) and counted, so parallel calls and id-less
+   * calls both pair up with their results.
+   */
+  private noteToolCall(active: ActiveRun, id?: string): void {
+    if (!active.openTools) active.openTools = new Map();
+    const open = active.openTools;
+    const key = id ?? "";
+    open.set(key, (open.get(key) ?? 0) + 1);
+  }
+
+  /** Clear a tool call's in-flight mark once its result arrives. */
+  private noteToolResult(active: ActiveRun, id?: string): void {
+    const open = active.openTools;
+    if (!open) return;
+    const key = id ?? "";
+    const count = open.get(key);
+    if (count === undefined) return;
+    if (count <= 1) open.delete(key);
+    else open.set(key, count - 1);
+  }
+
+  /**
    * Watchdog sweep: finalize active runs that are stuck. A run is stuck when
    * it never emitted run.started within startGraceMs, or when it has been
    * entirely silent (no telemetry at all) for silenceMs after starting. Both
    * are generous so a long single tool call (e.g. an agent looping with
    * sleep) is never mistaken for a hang; they exist to break a wedged exec
    * stream or a process that exited without releasing the slot.
+   *
+   * A started run with a tool still in flight (tool.call seen, no
+   * tool.result yet) gets the longer toolSilenceMs window instead: silence
+   * then most likely means work is running inside the VM with nothing to
+   * report, not a wedge. The window is still finite, so a tool that hangs
+   * forever is declared stuck once it passes. The never-started window is
+   * unaffected — a run that never started cannot have a tool in flight.
    */
   private scanWatchdogs(): void {
     const now = Date.now();
@@ -990,9 +1172,11 @@ export class RuntimeManager {
       if (!active) continue;
       const elapsed = now - active.lastActivityAt;
       const neverStarted = active.startedAt === undefined;
+      const toolInFlight = (active.openTools?.size ?? 0) > 0;
+      const silenceLimit = toolInFlight ? this.toolSilenceMs : this.silenceMs;
       const stuck =
         (neverStarted && elapsed >= this.startGraceMs) ||
-        (!neverStarted && elapsed >= this.silenceMs);
+        (!neverStarted && elapsed >= silenceLimit);
       if (!stuck) continue;
       const reason = neverStarted
         ? "run did not start and was stopped by the watchdog"
@@ -1334,11 +1518,50 @@ export class RuntimeManager {
        * would hand the agent history that contradicts the restored state.
        */
       freshSession?: boolean;
+      /**
+       * Turn ceiling for this run, passed to claude as --max-turns (capped
+       * by SWARM_MAX_TURNS in the runner). When absent the starting role's
+       * own ceiling applies, if it has one; otherwise no flag is passed.
+       */
+      maxTurns?: number;
     },
   ): StartResult {
     const configurationError = localDockerApprovalConfigurationError(this.vm);
     if (configurationError) {
-      return { accepted: false, runId: "", queued: false, error: configurationError };
+      return {
+        accepted: false,
+        runId: "",
+        queued: false,
+        error: configurationError,
+        missingEnv: missingDockerApprovalEnv(this.vm),
+      };
+    }
+    const directModeError = directModeConfigurationError(this.vm, userId, input.model);
+    if (directModeError) {
+      return {
+        accepted: false,
+        runId: "",
+        queued: false,
+        error: directModeError,
+        missingEnv: missingLlmProxyEnv(),
+      };
+    }
+    // FIX-44: in server mode an unverified local account cannot start
+    // runs — accounts consume VM compute, so open sign-ups must prove
+    // they own the email first. Local mode is a single trusted user and
+    // is never gated; non-local identities carry no verification flag.
+    // Verification only ever flips false -> true, so gating start()
+    // (the single admission point) is sufficient: queued and restored
+    // runs were admitted while verified.
+    if (serverMode() && !isEmailVerifiedForUserId(userId)) {
+      return {
+        accepted: false,
+        runId: "",
+        queued: false,
+        error:
+          "Verify your email before starting a run. Open the verification link we emailed you, " +
+          "or resend it from the verify page (/verify-email).",
+      };
     }
     const runId = `run_${randomUUID()}`;
     const st = this.state(userId);
@@ -1364,6 +1587,16 @@ export class RuntimeManager {
     // catalog). Nothing downstream can widen it except a user approval.
     const rolePolicy = this.rolePolicyFor(userId, role, input.grantedRoleIds);
 
+    // Turn ceiling: an explicit request wins; otherwise the starting
+    // role's own ceiling applies (its prompt hint becomes a hard CLI
+    // limit). A non-positive/non-integer request is ignored, not clamped
+    // — the runner enforces the SWARM_MAX_TURNS cap either way.
+    const requestedMaxTurns =
+      typeof input.maxTurns === "number" && Number.isSafeInteger(input.maxTurns) && input.maxTurns > 0
+        ? input.maxTurns
+        : undefined;
+    const maxTurns = requestedMaxTurns ?? roleMaxTurns(role);
+
     if (st.active) {
       const limit = this.maxQueued();
       if (st.queue.length >= limit) {
@@ -1388,6 +1621,7 @@ export class RuntimeManager {
         seedSnapshotLabel: input.seedSnapshotLabel,
         forkedFrom: input.forkedFrom,
         freshSession: input.freshSession,
+        maxTurns,
         createdAt: Date.now(),
       };
       st.queue.push(queued);
@@ -1444,6 +1678,7 @@ export class RuntimeManager {
       ambientRuleId: input.ambientRuleId,
       seedSnapshotLabel: input.seedSnapshotLabel,
       forkedFrom: input.forkedFrom,
+      maxTurns,
     };
     st.active = active;
 
@@ -1558,6 +1793,7 @@ export class RuntimeManager {
       seedSnapshotLabel: next.seedSnapshotLabel,
       forkedFrom: next.forkedFrom,
       resumePoint: next.resumePoint,
+      maxTurns: next.maxTurns,
     };
     st.active = active;
     this.persistState();
@@ -2421,6 +2657,33 @@ export class RuntimeManager {
         return { switched: false };
       }
 
+      // Fail closed in server mode: without a proxy base URL (or a run token
+      // to authenticate to it) the selection's raw env — provider key
+      // included — would enter the VM, and a non-Anthropic-wire provider is
+      // unreachable from the VM's Claude CLI anyway. start() rejects this
+      // configuration up front; this guard covers failover onto a
+      // non-Anthropic provider and env changes while a run was queued.
+      if (
+        serverMode() &&
+        this.vm.driver instanceof DockerVmDriver &&
+        (!llmBaseUrl || !runToken)
+      ) {
+        const config = routerProviders(userId).find((c) => c.id === selection.provider);
+        if (!config || !isAnthropicStyle(config)) {
+          const message = directModeErrorMessage(selection.provider);
+          selection.release();
+          if (this.isStillActive(runId, userId)) {
+            const errorEvent: { type: "run.error"; message: string } = {
+              type: "run.error",
+              message,
+            };
+            this.bus.publish(runId, errorEvent);
+            this.finalize(runId, { status: "error", error: message });
+          }
+          return { switched: false };
+        }
+      }
+
       // OpenAI-format providers have no /v1/messages; route them through the
       // server-side translation endpoint instead of the provider's raw host.
       // The provider's real key stays on the server — the VM only gets the
@@ -2876,6 +3139,22 @@ export class RuntimeManager {
     // the account's settings (absent = off = byte-identical prompt).
     const systemPacker = systemPackerOptionsFor(readUserSettings(userId));
 
+    // Wall-clock timeout (SWARM_RUN_TIMEOUT_SEC): aborting the controller
+    // ends the attempt the same way a user cancel does, so the timer is
+    // armed here and cleared in the finally below — a finished run never
+    // trips it, and a timed-out run is rewritten as an error afterwards.
+    const timeoutMs = runTimeoutMsFromEnv();
+    const timeoutMessage =
+      timeoutMs !== undefined ? `Run timeout: exceeded SWARM_RUN_TIMEOUT_SEC (${timeoutMs / 1000}s)` : undefined;
+    let timedOut = false;
+    const timeoutTimer =
+      timeoutMs !== undefined
+        ? setTimeout(() => {
+            timedOut = true;
+            active.controller.abort();
+          }, timeoutMs)
+        : undefined;
+
     try {
       const outcome = await this.runner.run(
         {
@@ -2887,6 +3166,7 @@ export class RuntimeManager {
           systemPacker,
           sessionId: active.sessionId,
           model: active.model,
+          maxTurns: active.maxTurns,
           provider: selection?.provider,
           env,
           // Stable per-run pgid marker: the cancel backstop kills exactly
@@ -2965,12 +3245,29 @@ export class RuntimeManager {
         },
         onAttemptEvent,
       );
+      // Wall-clock timeout: the abort above ends the run like a cancel,
+      // but a timeout is an error, not a cancellation — rewrite the
+      // outcome so the caller finalizes it as run.error 'timeout'
+      // instead of returning early on outcome.aborted. The runner's own
+      // "Run aborted by caller." event is replaced, never published.
+      if (timedOut) {
+        attemptError = {
+          type: "run.error",
+          message: timeoutMessage ?? "Run timeout: exceeded SWARM_RUN_TIMEOUT_SEC",
+        };
+        return { outcome: { ...outcome, aborted: false }, attemptError, finishEvent };
+      }
       return { outcome, attemptError, finishEvent };
     } catch (error) {
       // The runner surfaced a non-run failure (e.g. exec driver error). Treat
       // it as a run error so the caller's terminal handling applies uniformly.
+      // A timeout that surfaced as a throw (driver rejecting on abort) is
+      // still a timeout, not the driver's abort message.
       const redact = makeRedactor({ ...process.env } as Record<string, string>);
-      const message = redact(error instanceof Error ? error.message : String(error));
+      const message =
+        timedOut && timeoutMessage
+          ? timeoutMessage
+          : redact(error instanceof Error ? error.message : String(error));
       const synthetic: Extract<HarnessEvent, { type: "run.error" }> = {
         type: "run.error",
         message,
@@ -2980,6 +3277,7 @@ export class RuntimeManager {
       }
       return { outcome: { exitCode: -1, aborted: false, malformedLines: 0 }, attemptError: synthetic, finishEvent };
     } finally {
+      if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
       memoryBridge.stop();
     }
   }
@@ -3263,16 +3561,43 @@ export class RuntimeManager {
     }
     if (event.type === "run.started") {
       const st = this.users.get(userId);
-      if (st?.active?.runId === runId && st.active.startedAt === undefined) {
-        st.active.startedAt = Date.now();
+      if (st?.active?.runId === runId) {
+        const current = st.active;
+        if (current.startedAt === undefined) current.startedAt = Date.now();
+        // Capture the live harness session id so auto-checkpoints record it
+        // in the ResumePoint. Without this, a fresh run (no sessionId at
+        // acceptance) checkpoints with no session id and a server restart
+        // safe-aborts it instead of resuming. The still-active guard above
+        // makes this safe against late events: a run.started arriving after
+        // finalize (or after another run took the slot) is ignored. A
+        // resume point recorded before the session event is backfilled —
+        // never overwritten, because its recorded session was the one live
+        // at checkpoint time and must stay paired with that snapshot.
+        if (event.sessionId && current.sessionId !== event.sessionId) {
+          current.sessionId = event.sessionId;
+          if (current.resumePoint && current.resumePoint.sessionId === undefined) {
+            current.resumePoint = { ...current.resumePoint, sessionId: event.sessionId };
+          }
+          this.persistState();
+        }
       }
+      // A fresh attempt means a fresh CLI process: any tool left open by a
+      // previous attempt died with that process and must not keep this
+      // attempt on the watchdog's long tool-silence window.
+      active.openTools?.clear();
     }
     if (event.type === "tool.call") {
+      // The watchdog's tool-in-flight signal: silence after this point may
+      // be a long tool running inside the VM, not a wedge.
+      this.noteToolCall(active, event.id);
       // Remember which files the agent worked on: the heatmap weighs them.
       const touched = extractTouchedPaths((event as { input?: unknown }).input);
       if (touched.length > 0) {
         void this.recordCodebaseTouches(userId, touched);
       }
+    }
+    if (event.type === "tool.result") {
+      this.noteToolResult(active, event.id);
     }
     this.bus.publish(runId, event);
   }

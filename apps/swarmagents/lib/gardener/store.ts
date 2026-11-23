@@ -26,17 +26,26 @@ function emptyFile(): GardenerFile {
 
 export function loadGardener(): GardenerFile {
   const file = filePath();
+  let raw: string;
   try {
-    const raw = fs.readFileSync(file, "utf8");
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return emptyFile();
+    throw err;
+  }
+  try {
     const parsed = JSON.parse(raw) as GardenerFile;
     if (!parsed || parsed.version !== 1 || typeof parsed.users !== "object" || parsed.users === null) {
       return emptyFile();
     }
     return parsed;
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return emptyFile();
-    throw err;
+    // A truncated or hand-edited gardener.json must not break every gardener
+    // API call and tick for all users until manually deleted. Match the
+    // ambient/computers stores: fall back to empty state and log corruption.
+    console.error(`[swarm-gardener] gardener file is corrupt (${file}):`, err instanceof Error ? err.message : err);
+    return emptyFile();
   }
 }
 

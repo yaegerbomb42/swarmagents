@@ -8,16 +8,26 @@
  * Every route is scoped to the caller (the middleware-set x-swarm-user
  * header): a code belongs to the account that created it, and a device can
  * only be revoked by the account that owns it.
+ *
+ * Parallel BYOC surfaces: `/api/byoc/*` (lib/byoc) is the swarm-node path;
+ * `/api/computers/*` (lib/computers) is the older computer-pairing path.
+ * They share audit action names (`computer.pair` / `computer.revoke`) so the
+ * audit trail stays one stream, but their stores are not unified yet — do
+ * not assume a fix in one applies to the other.
  */
 
 import { type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../lib/auth";
-import { noStoreJson } from "../../../../lib/http";
+import { JsonBodyError, noStoreJson, readBoundedText } from "../../../../lib/http";
+import { recordAudit } from "../../../../lib/audit";
 import { getByocHub } from "../../../../lib/byoc/hub";
 import { getByocTokenStore } from "../../../../lib/byoc/tokens";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+/** Pairing bodies are tiny; keep the cap tight. */
+const MAX_PAIR_BODY_BYTES = 4 * 1024;
 
 function caller(req: NextRequest): string | null {
   const user = req.headers.get(USER_HEADER);
@@ -34,23 +44,40 @@ export async function POST(req: NextRequest) {
   if (!user) return unauthorized();
 
   let name = "";
+  // Empty body is allowed (name optional). Non-empty must be valid JSON.
+  // The read is streaming and byte-capped, so an oversized body is rejected
+  // with 413 before it is buffered.
+  let rawText = "";
   try {
-    const text = await req.text();
-    if (text.trim().length > 0) {
-      const body = JSON.parse(text) as { name?: unknown };
-      if (typeof body.name === "string") name = body.name.trim().slice(0, 64);
+    rawText = await readBoundedText(req, MAX_PAIR_BODY_BYTES);
+  } catch (err) {
+    if (err instanceof JsonBodyError && err.status === 413) {
+      return noStoreJson({ error: "Request body is too large." }, { status: 413 });
     }
-  } catch {
-    // An empty or malformed body simply means "no name".
+    return noStoreJson({ error: "Could not read the request body." }, { status: 400 });
+  }
+  if (rawText.trim().length > 0) {
+    let body: unknown;
+    try {
+      body = JSON.parse(rawText) as unknown;
+    } catch {
+      return noStoreJson({ error: "Invalid JSON body." }, { status: 400 });
+    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return noStoreJson({ error: "Body must be a JSON object." }, { status: 400 });
+    }
+    const rawName = (body as { name?: unknown }).name;
+    if (typeof rawName === "string") name = rawName.trim().slice(0, 64);
   }
 
   const store = getByocTokenStore();
-  const { code, expiresAt } = store.createPairingCode(user);
+  const { code, expiresAt, name: storedName } = store.createPairingCode(user, { name });
+  recordAudit({ user, action: "computer.pair", target: storedName || "pairing-code", result: "success" });
   return noStoreJson(
     {
       code,
       expiresAt,
-      name,
+      name: storedName,
       command: `npx swarm-node --pair ${code}`,
     },
     { status: 201 },
@@ -102,5 +129,6 @@ export async function DELETE(req: NextRequest) {
 
   const hub = getByocHub();
   hub.revokeDevice(user, deviceId, "revoked by the account owner");
+  recordAudit({ user, action: "computer.revoke", target: deviceId, result: "success" });
   return noStoreJson({ ok: true, deviceId }, { status: 200 });
 }

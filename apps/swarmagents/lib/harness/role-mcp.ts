@@ -241,7 +241,9 @@ export function roleCatalogJson(catalog: readonly RoleDefinition[]): string {
   return JSON.stringify({
     schema: ROLE_SCHEMA,
     version: ROLE_SCHEMA_VERSION,
-    roles: catalog.filter((role) => !role.builtin || BUILTIN_ROLES.includes(role)).map(publicRole),
+    roles: catalog
+      .filter((role) => !role.builtin || BUILTIN_ROLES.some((builtin) => builtin.id === role.id))
+      .map(publicRole),
   });
 }
 
@@ -278,7 +280,7 @@ export function roleMcpConfigJson(
       args: [opts.serverPath ?? ROLE_MCP_SERVER_PATH],
       env: {
         SWARM_ROLE_CATALOG: opts.catalogPath ?? ROLE_CATALOG_PATH,
-        SWARM_ROLE_ALLOWED: [...opts.allowedRoleIds].join(","),
+        SWARM_ROLE_ALLOWED: JSON.stringify([...opts.allowedRoleIds]),
       },
     },
     [CODEBASE_MCP_SERVER_NAME]: {
@@ -361,8 +363,13 @@ function roleDefinitionForId(roleId: string): RoleDefinition | null {
  */
 export function roleArgvFlags(phase: RolePhase): string[] {
   const flags: string[] = [];
-  flags.push("--allowedTools", ...phase.allowedTools);
-  flags.push("--mcp-config", phase.mcpConfigPath);
+  // A bare flag followed by the next flag's name is worse than no flag at all:
+  // `--allowedTools --mcp-config <path>` makes the CLI treat "--mcp-config" as
+  // a tool name. Only emit a flag when it actually has a value.
+  if (phase.toolsDisabled !== true) {
+    if (phase.allowedTools.length > 0) flags.push("--allowedTools", ...phase.allowedTools);
+    if (phase.mcpConfigPath) flags.push("--mcp-config", phase.mcpConfigPath);
+  }
   if (phase.appendSystemPrompt) flags.push("--append-system-prompt", phase.appendSystemPrompt);
   return flags;
 }
@@ -449,8 +456,14 @@ export const ROLE_MCP_SERVER_SOURCE = [
   "import fs from \"node:fs\";",
   "",
   "const catalogPath = process.env.SWARM_ROLE_CATALOG || \"\";",
-  "const allowedRaw = process.env.SWARM_ROLE_ALLOWED || \"\";",
-  "const allowed = new Set(allowedRaw.split(\",\").map((s) => s.trim()).filter(Boolean));",
+  "const allowedRaw = process.env.SWARM_ROLE_ALLOWED || \"[]\";",
+  "let allowed = new Set();",
+  "try {",
+  "  const parsedAllowed = JSON.parse(allowedRaw);",
+  "  if (Array.isArray(parsedAllowed)) allowed = new Set(parsedAllowed.map((s) => String(s).trim()).filter(Boolean));",
+  "} catch (err) {",
+  "  allowed = new Set();",
+  "}",
   "let catalog = [];",
   "try {",
   "  const parsed = JSON.parse(fs.readFileSync(catalogPath, \"utf8\"));",
@@ -532,6 +545,13 @@ export const ROLE_MCP_SERVER_SOURCE = [
   "  return toolResult({ error: \"unknown_tool\", message: \"Unknown tool: \" + name }, true);",
   "}",
   "",
+  "// A client that closes its end early makes stdout emit EPIPE; that is a",
+  "// normal shutdown, not a server fault.",
+  "process.stdout.on(\"error\", (err) => {",
+  "  if (err && err.code === \"EPIPE\") return;",
+  "  throw err;",
+  "});",
+  "",
   "function reply(id, result) {",
   "  process.stdout.write(JSON.stringify({ jsonrpc: \"2.0\", id: id, result: result }) + \"\\n\");",
   "}",
@@ -542,7 +562,8 @@ export const ROLE_MCP_SERVER_SOURCE = [
   "",
   "function handleMessage(msg) {",
   "  if (!msg || typeof msg !== \"object\") return;",
-  "  const hasId = msg.id !== undefined && msg.id !== null;",
+  "  // JSON-RPC 2.0: a request id may be null; only a missing id is a notification.",
+  "  const hasId = msg.id !== undefined;",
   "  const method = typeof msg.method === \"string\" ? msg.method : \"\";",
   "  if (method === \"initialize\") {",
   "    if (hasId) reply(msg.id, {",
@@ -574,17 +595,20 @@ export const ROLE_MCP_SERVER_SOURCE = [
   "",
   "process.stdin.setEncoding(\"utf8\");",
   "let buffer = \"\";",
+  "const MAX_LINE_CHARS = 1024 * 1024;",
   "process.stdin.on(\"data\", (chunk) => {",
   "  buffer += chunk;",
   "  let newline;",
   "  while ((newline = buffer.indexOf(\"\\n\")) !== -1) {",
   "    const line = buffer.slice(0, newline).trim();",
   "    buffer = buffer.slice(newline + 1);",
-  "    if (!line) continue;",
+  "    if (!line || line.length > MAX_LINE_CHARS) continue;",
   "    let msg;",
   "    try { msg = JSON.parse(line); } catch (err) { continue; }",
   "    handleMessage(msg);",
   "  }",
+  "  // A peer that never sends a newline must not grow our memory without bound.",
+  "  if (buffer.length > MAX_LINE_CHARS) buffer = \"\";",
   "});",
   "",
   "process.stdin.on(\"end\", () => {});",

@@ -1,18 +1,19 @@
 @import "tailwindcss";
+@import "./components/brand/tokens.css";
 
-/* ── Dark theme tokens ── */
+/* ── Brand theme tokens (Void Navy / Signal Cyan — branding/BRAND.md) ── */
 :root {
-  --surface-base: #07070a;
-  --surface-elevated: #101015;
-  --border-subtle: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.16);
-  --text-primary: #ffffff;
-  --text-secondary: rgba(255, 255, 255, 0.6);
-  --text-faint: rgba(255, 255, 255, 0.35);
-  --accent: #6366f1;               /* indigo-500 — acting / you-can-act only */
-  --accent-emerald: #34d399;       /* emerald-400 */
-  --focus-ring: #818cf8;
-  --selection-bg: rgba(99, 102, 241, 0.30);
+  --surface-base: var(--brand-bg);
+  --surface-elevated: var(--brand-surface);
+  --border-subtle: var(--brand-hairline);
+  --border-strong: var(--brand-hairline-strong);
+  --text-primary: var(--brand-text);
+  --text-secondary: var(--brand-text-2);
+  --text-faint: var(--brand-text-3);
+  --accent: var(--brand-signal);   /* Signal Cyan — acting / you-can-act only */
+  --accent-emerald: var(--brand-ok);
+  --focus-ring: var(--brand-signal);
+  --selection-bg: rgba(0, 208, 240, 0.30);
   --scrollbar-thumb: rgba(255, 255, 255, 0.15);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.28);
 }
@@ -59,19 +60,15 @@ body {
 }
 
 .glass {
-  background: linear-gradient(135deg, rgba(255,255,255,.09), rgba(255,255,255,.03));
-  backdrop-filter: blur(28px) saturate(160%);
-  -webkit-backdrop-filter: blur(28px) saturate(160%);
+  background: var(--brand-surface);
   box-shadow:
-    inset 0 1px 0 rgba(255,255,255,.14),
-    inset 0 0 0 1px rgba(255,255,255,.08),
+    inset 0 1px 0 var(--brand-top-light),
+    inset 0 0 0 1px var(--brand-hairline),
     0 20px 60px -20px rgba(0,0,0,.7);
 }
 .glass-soft {
-  background: rgba(255,255,255,.04);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.08), inset 0 0 0 1px rgba(255,255,255,.06);
+  background: var(--brand-surface-raised);
+  box-shadow: inset 0 1px 0 var(--brand-top-light), inset 0 0 0 1px var(--brand-hairline);
 }
 
 /* Chat input bar: subtle accent focus glow, 120–180ms, layout-stable */

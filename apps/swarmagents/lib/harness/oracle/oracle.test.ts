@@ -12,11 +12,11 @@ import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultOracleChecks, runOracleGate, type OracleCheck, type OracleExec } from "./oracle";
+import { defaultOracleChecks, runOracleGate, type OracleCheck } from "./oracle";
 import { countChurn, parsePatchFiles, unsafePatchPaths } from "./diff";
 import { findAffectedTests, relativeImports, resolveSpecifier } from "./affected";
 import { buildRetryContext, diagnosticSymbols, extractDiagnostic, findDefinition } from "./retry";
-import { writeFileViaExec } from "./exec";
+import { writeFileViaExec, type OracleExec } from "./exec";
 
 const APP = process.cwd();
 const TSC = join(APP, "node_modules/typescript/bin/tsc");
@@ -26,8 +26,11 @@ const TSX = join(APP, "node_modules/tsx/dist/cli.mjs");
  * Child env for the local exec. NODE_TEST_CONTEXT is dropped: node:test sets
  * it for its own children, and a nested `--test` run would then report to
  * this runner instead of exiting non-zero on failure (the VM exec never has it).
+ * Typed as ProcessEnv: spawn's env option requires it, and the filtered
+ * Object.fromEntries shape alone does not satisfy it.
  */
-const CHILD_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "NODE_TEST_CONTEXT"));
+const CHILD_ENV: NodeJS.ProcessEnv = { ...process.env };
+delete CHILD_ENV.NODE_TEST_CONTEXT;
 
 /** Local exec: argv only, no shell — the same contract as the VM exec. */
 const localExec: OracleExec = (cmd, opts) =>
@@ -356,6 +359,116 @@ test("parsePatchFiles reads git and plain diffs, renames, adds and deletes", () 
     ".git/config",
   ]);
   assert.equal(countChurn("--- a/x\n+++ b/x\n@@\n-a\n+b\n+c\n context\n"), 3);
+});
+
+test("parsePatchFiles captures every declared path; unsafePatchPaths rejects traversal, .git and symlinks", () => {
+  // Mismatched git header vs +++ header: the escaping +++ path must surface.
+  const mismatched = [
+    "diff --git a/src/safe.ts b/src/safe.ts",
+    "--- a/src/safe.ts",
+    "+++ b/../outside.ts",
+    "@@ -1 +1 @@",
+    "-x",
+    "+y",
+  ].join("\n");
+  const mismatchedFiles = parsePatchFiles(mismatched);
+  assert.ok(
+    mismatchedFiles.some((f) => f.path === "../outside.ts"),
+    `the +++ path must be captured: ${JSON.stringify(mismatchedFiles)}`,
+  );
+  assert.deepEqual(unsafePatchPaths(mismatchedFiles), ["../outside.ts"]);
+
+  // Mismatched git header a-side vs b-side.
+  const aside = parsePatchFiles(
+    "diff --git a/../outside.ts b/src/safe.ts\n--- a/../outside.ts\n+++ b/src/safe.ts\n@@ -1 +1 @@\n-x\n+y\n",
+  );
+  assert.deepEqual(unsafePatchPaths(aside), ["../outside.ts"]);
+
+  // A --- header naming an escaping path inside a git section.
+  const dashDash = parsePatchFiles(
+    "diff --git a/src/safe.ts b/src/safe.ts\n--- a/../outside.ts\n+++ b/src/safe.ts\n@@ -1 +1 @@\n-x\n+y\n",
+  );
+  assert.deepEqual(unsafePatchPaths(dashDash), ["../outside.ts"]);
+
+  // A rename target that escapes, while the git header looks benign.
+  const renamed = [
+    "diff --git a/src/r1.ts b/src/r2.ts",
+    "similarity index 100%",
+    "rename from src/r1.ts",
+    "rename to ../outside.ts",
+  ].join("\n");
+  assert.deepEqual(unsafePatchPaths(parsePatchFiles(renamed)), ["../outside.ts"]);
+
+  // .git in any normalized segment, any case.
+  for (const p of ["./.git/config", ".GIT/config", "sub/.git/hooks/post-commit", "a/.Git/x"]) {
+    assert.deepEqual(unsafePatchPaths([{ path: p, status: "M" }]), [p], p);
+  }
+  // .git as a substring of a longer name is fine.
+  assert.deepEqual(unsafePatchPaths([{ path: "src/.github/workflows.ts", status: "M" }]), []);
+  assert.deepEqual(unsafePatchPaths([{ path: "src/agitator.ts", status: "M" }]), []);
+
+  // NUL / control characters.
+  assert.deepEqual(unsafePatchPaths([{ path: "src/a\0b.ts", status: "M" }]), ["src/a\0b.ts"]);
+  assert.deepEqual(unsafePatchPaths([{ path: "src/a\nb.ts", status: "M" }]), ["src/a\nb.ts"]);
+
+  // Symlink modes: new file, and a mode change to 120000.
+  const symlinkNew = [
+    "diff --git a/src/link.ts b/src/link.ts",
+    "new file mode 120000",
+    "--- /dev/null",
+    "+++ b/src/link.ts",
+    "@@ -0,0 +1 @@",
+    "+src/real.ts",
+  ].join("\n");
+  const newFiles = parsePatchFiles(symlinkNew);
+  assert.equal(newFiles[0]?.symlink, true);
+  assert.deepEqual(unsafePatchPaths(newFiles), ["src/link.ts"]);
+
+  const symlinkMode = [
+    "diff --git a/src/link.ts b/src/link.ts",
+    "old mode 100644",
+    "new mode 120000",
+    "--- a/src/link.ts",
+    "+++ b/src/link.ts",
+    "@@ -1 +1 @@",
+    "-x",
+    "+y",
+  ].join("\n");
+  assert.deepEqual(unsafePatchPaths(parsePatchFiles(symlinkMode)), ["src/link.ts"]);
+
+  // A normal mode change (100644 -> 100755) is not a symlink.
+  const modeChange = [
+    "diff --git a/src/run.sh b/src/run.sh",
+    "old mode 100644",
+    "new mode 100755",
+    "--- a/src/run.sh",
+    "+++ b/src/run.sh",
+    "@@ -1 +1 @@",
+    "-x",
+    "+y",
+  ].join("\n");
+  const modeFiles = parsePatchFiles(modeChange);
+  assert.equal(modeFiles[0]?.symlink, undefined);
+  assert.deepEqual(unsafePatchPaths(modeFiles), []);
+
+  // Quoted paths with escaped quotes, and unquoted paths with spaces.
+  const quoted = parsePatchFiles(
+    'diff --git "a/fi\\"le.ts" "b/fi\\"le.ts"\n--- "a/fi\\"le.ts"\n+++ "b/fi\\"le.ts"\n@@ -1 +1 @@\n-x\n+y\n',
+  );
+  assert.deepEqual(quoted, [{ path: 'fi"le.ts', status: "M" }]);
+  const spaced = parsePatchFiles(
+    "diff --git a/my file.ts b/my file.ts\n--- a/my file.ts\n+++ b/my file.ts\n@@ -1 +1 @@\n-x\n+y\n",
+  );
+  assert.deepEqual(spaced, [{ path: "my file.ts", status: "M" }]);
+
+  // copy from/to is captured as an add with the source as oldPath.
+  const copied = [
+    "diff --git a/src/orig.ts b/src/copy.ts",
+    "similarity index 100%",
+    "copy from src/orig.ts",
+    "copy to src/copy.ts",
+  ].join("\n");
+  assert.deepEqual(parsePatchFiles(copied), [{ path: "src/copy.ts", status: "A", oldPath: "src/orig.ts" }]);
 });
 
 test("findAffectedTests: changed tests, siblings and importers only", () => {

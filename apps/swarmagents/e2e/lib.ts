@@ -268,15 +268,10 @@ export async function openWorkspace(page: Page, context?: BrowserContext): Promi
 
   if (context) await assertUIAccessible(page, context);
 
-  // `domcontentloaded` fires before React renders: wait for the shell, then
-  // for the session to load (the chat shows either the first-run prompt or
-  // the conversation that was open last).
+  // The composer and computer are present regardless of the selected workspace tab.
   await page.getByTestId("minimal-main-page").waitFor({ state: "visible", timeout: 15_000 });
   await page.getByTestId("composer-input").waitFor({ state: "visible", timeout: 15_000 });
-  await page
-    .locator('[data-testid="hero"], [data-testid="conversation-log"]')
-    .first()
-    .waitFor({ state: "visible", timeout: 15_000 });
+
 }
 
 /**
@@ -288,7 +283,7 @@ export async function startNewChat(page: Page): Promise<void> {
   // New chat is disabled while a run from an earlier spec is still winding down.
   await page.waitForFunction(`!document.querySelector('[data-testid="new-chat"]')?.disabled`, null, { timeout: 60_000 });
   await newChat.click();
-  await page.getByTestId("hero").waitFor({ state: "visible", timeout: 15_000 });
+  await page.getByTestId("conversation-empty").waitFor({ state: "visible", timeout: 15_000 });
 }
 
 /** Send a message from the composer. */

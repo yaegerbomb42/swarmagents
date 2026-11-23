@@ -256,6 +256,15 @@ export async function POST(req: NextRequest) {
       : jsonRpcError(-32600, "Invalid Request", null);
   }
 
+  // JSON-RPC notifications (id === undefined): allowlist valid notification methods.
+  // Mutating requests or methods requiring a reply without an id are rejected with -32600.
+  if (rawId === undefined) {
+    if (method.startsWith("notifications/") || method === "ping") {
+      return new NextResponse(null, { status: 202, headers: NO_STORE });
+    }
+    return jsonRpcError(-32600, "Invalid Request: notifications must be notifications/* or ping", null);
+  }
+
   let response: NextResponse;
   try {
     response = await dispatchRequest(method, params, id);
@@ -266,7 +275,5 @@ export async function POST(req: NextRequest) {
       response = jsonRpcError(-32603, "Internal error", id);
     }
   }
-  // JSON-RPC notifications have no response body. Explicit null is still
-  // a request ID for clients that use it.
-  return rawId === undefined ? new NextResponse(null, { status: 202, headers: NO_STORE }) : response;
+  return response;
 }

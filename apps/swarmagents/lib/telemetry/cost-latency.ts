@@ -22,10 +22,25 @@
  *   - `llm.call`: provider, model, attempt, outcome, costUsd, inputTokens,
  *     outputTokens, latencyMs, queuedMs, ttftMs. The gateway carries these in
  *     the event's `data` payload; the fake provider carries them flat.
+ *     Events with `source === "lens"` are output-lens calls (lib/lenses/run.ts):
+ *     they are not agent attempts, so their cost is tracked separately and they
+ *     never enter the routing, provider, latency, or model-switch stats.
  *   - `usage`: inputTokens, outputTokens, cachedTokens (harness side).
  *   - `run.started`: model and the provider that serves the run.
  *   - `run.finished`: costUsd, durationMs, numTurns.
+ *
+ * Field reading and event normalization live in ./events.ts, shared with
+ * usage.ts so the two meters cannot drift apart again.
  */
+
+import {
+  readLlmCall,
+  readRunCreated,
+  readRunFailover,
+  readRunStarted,
+  readTerminalEvent,
+  readUsage,
+} from "./events";
 
 /**
  * A telemetry event as recorded in a run's log. Deliberately structural: the
@@ -118,6 +133,13 @@ export interface RunCostLatency {
   provider: string;
   /** Total estimated USD spent by the run. */
   costUsd: number;
+  /**
+   * USD spent by output lenses applied to this run (`llm.call` events with
+   * `source === "lens"`). Kept apart from the agent's calls so a lens adds to
+   * the run total without entering the provider, routing, latency, or
+   * next-call budget projections.
+   */
+  lensCostUsd: number;
   /** Which telemetry the total was derived from. */
   costSource: CostSource;
   /** Tokens consumed (harness `usage` events). */
@@ -168,30 +190,6 @@ export interface BudgetProjection {
   status: BudgetStatus;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function num(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function str(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-/**
- * Read a field from an event. Gateway events (`llm.call`) carry their payload
- * in `data`; harness events (`usage`, `run.finished`) carry it at the top
- * level. Both are accepted.
- */
-function field(event: CostEvent, name: string): unknown {
-  const flat = (event as unknown as Record<string, unknown>)[name];
-  if (flat !== undefined) return flat;
-  const data = isRecord(event.data) ? event.data : undefined;
-  return data ? data[name] : undefined;
-}
-
 /**
  * Fold a run's recorded events into its cost and latency report.
  *
@@ -207,6 +205,7 @@ export function aggregateRunCostLatency(
     runId,
     provider: "unknown",
     costUsd: 0,
+    lensCostUsd: 0,
     costSource: "none",
     tokensIn: 0,
     tokensOut: 0,
@@ -230,52 +229,69 @@ export function aggregateRunCostLatency(
   for (const event of events) {
     switch (event.type) {
       case "run.created": {
-        const data = isRecord(event.data) ? event.data : {};
-        report.userId = str(data.userId) ?? report.userId;
-        report.model = str(data.model) ?? report.model;
+        const created = readRunCreated(event);
+        report.userId = created.userId ?? report.userId;
+        report.model = created.model ?? report.model;
         break;
       }
       case "run.started": {
-        report.model = str(field(event, "model")) ?? report.model;
-        report.provider = str(field(event, "provider")) ?? report.provider;
+        const started = readRunStarted(event);
+        report.model = started.model ?? report.model;
+        report.provider = started.provider ?? report.provider;
         break;
       }
       case "run.failover": {
+        const failover = readRunFailover(event);
         // The provider that served the run after a failover; the last one wins.
-        report.provider = str(field(event, "provider")) ?? report.provider;
-        report.model = str(field(event, "model")) ?? report.model;
+        report.provider = failover.provider ?? report.provider;
+        report.model = failover.model ?? report.model;
         break;
       }
       case "usage": {
-        report.tokensIn += num(field(event, "inputTokens")) ?? 0;
-        report.tokensOut += num(field(event, "outputTokens")) ?? 0;
-        report.tokensCached += num(field(event, "cachedTokens")) ?? 0;
+        const usage = readUsage(event);
+        report.tokensIn += usage.inputTokens;
+        report.tokensOut += usage.outputTokens;
+        report.tokensCached += usage.cachedTokens;
         break;
       }
       case "run.finished": {
-        reportedCost = num(field(event, "costUsd"));
-        report.durationMs = num(field(event, "durationMs"));
-        report.numTurns = num(field(event, "numTurns"));
+        const terminal = readTerminalEvent(event);
+        reportedCost = terminal?.costUsd;
+        report.durationMs = terminal?.durationMs;
+        report.numTurns = terminal?.numTurns;
         break;
       }
       case "llm.call": {
-        const provider = str(field(event, "provider")) ?? "unknown";
-        const model = str(field(event, "model")) ?? "unknown";
-        const outcome = str(field(event, "outcome")) ?? "unknown";
-        const latencyMs = num(field(event, "latencyMs")) ?? 0;
-        const ttftMs = num(field(event, "ttftMs"));
-        const inputTokens = num(field(event, "inputTokens"));
-        const outputTokens = num(field(event, "outputTokens"));
-        const costUsd = num(field(event, "costUsd")) ?? null;
+        const call = readLlmCall(event);
+        // Output lenses share the bus but are not agent attempts: keep their
+        // spend separate so they cannot become the run's provider, create a
+        // model switch, or enter the latency waterfall / next-call budget.
+        // Only ok lens calls count, matching usage.ts — a failed lens call
+        // spent nothing the meter can price.
+        if (call.source === "lens") {
+          if (call.outcome === "ok" && call.costUsd !== null) {
+            report.lensCostUsd += call.costUsd;
+          }
+          break;
+        }
+        const provider = call.provider ?? "unknown";
+        const model = call.model ?? "unknown";
+        const outcome = call.outcome;
+        const latencyMs = call.latencyMs;
+        const ttftMs = call.ttftMs;
+        const inputTokens = call.inputTokens;
+        const outputTokens = call.outputTokens;
+        const costUsd = call.costUsd;
         const startedAt = event.ts - latencyMs;
-        const queuedMs = num(field(event, "queuedMs")) ?? Math.max(0, startedAt - (previousEnd ?? startedAt));
+        const queuedMs =
+          call.queuedMs ?? Math.max(0, startedAt - (previousEnd ?? startedAt));
 
         const entry: CallCostEntry = {
           seq: event.seq,
           ts: event.ts,
           provider,
           model,
-          attempt: num(field(event, "attempt")) ?? 1,
+          attempt: call.attempt,
           outcome,
           costUsd,
           queuedMs,
@@ -288,7 +304,9 @@ export function aggregateRunCostLatency(
         report.totalLatencyMs += latencyMs;
         if (report.firstCallAt === undefined) report.firstCallAt = event.ts;
         report.lastCallAt = event.ts;
-        previousEnd = event.ts;
+        // Overlapping attempts can report an end time before the previous
+        // attempt's; never move the queue boundary backwards.
+        previousEnd = Math.max(previousEnd ?? 0, event.ts);
 
         let roll = providers.get(provider);
         if (!roll) {
@@ -340,9 +358,14 @@ export function aggregateRunCostLatency(
   }
 
   if (pricedCalls > 0) {
-    report.costUsd = callCost;
+    report.costUsd = callCost + report.lensCostUsd;
     report.costSource = "llm_calls";
     report.pricedCalls = pricedCalls;
+  } else if (report.lensCostUsd > 0) {
+    // No priced agent attempt, but an output lens reported a cost. Mirror
+    // usage.ts: the lens cost is added on top of the run's reported total.
+    report.costUsd = report.lensCostUsd + (reportedCost ?? 0);
+    report.costSource = "llm_calls";
   } else if (reportedCost !== undefined) {
     report.costUsd = reportedCost;
     report.costSource = "run_finished";

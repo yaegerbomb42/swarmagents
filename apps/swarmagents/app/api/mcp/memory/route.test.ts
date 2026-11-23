@@ -110,6 +110,13 @@ test("a ping notification is answered with 202, not a JSON-RPC response", async 
   assert.equal(await res.text(), "");
 });
 
+test("a mutating tools/call without an id is rejected as invalid request", async () => {
+  const res = await POST(rpc({ jsonrpc: "2.0", method: "tools/call", params: { name: "memory_write" } }));
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { error: { code: number } };
+  assert.equal(body.error.code, -32600);
+});
+
 test("error responses carry no-store", async () => {
   // Unknown method.
   const unknown = await POST(rpc({ jsonrpc: "2.0", id: 1, method: "no_such_method" }));
@@ -156,7 +163,7 @@ test("a tool throw is mapped to -32603 and carries no-store", async () => {
   }
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("cache-control"), "no-store");
-  const body = (await res.json()) as { error: { code: number; message: string } };
+  const body = (await res.json()) as { error: { code: number; message: string }; id: number };
   assert.equal(body.error.code, -32603);
   assert.equal(body.id, 1);
 });

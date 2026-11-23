@@ -58,6 +58,15 @@ class StubBrowser implements BrowserControl {
   async screenshot(): Promise<never> {
     throw new Error("not used");
   }
+  async act(): Promise<never> {
+    throw new Error("not used");
+  }
+  async evaluate(): Promise<never> {
+    throw new Error("not used");
+  }
+  async getDiagnostics(): Promise<never> {
+    throw new Error("not used");
+  }
   async getFrame(): Promise<{ frameId: number; jpeg: Buffer; width: number; height: number; capturedAt: number }> {
     return { frameId: 1, jpeg: Buffer.from([0xff, 0xd8, 0xff, 0xe0]), width: 2, height: 2, capturedAt: Date.now() };
   }

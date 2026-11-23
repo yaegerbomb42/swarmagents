@@ -142,16 +142,16 @@ test("built-in roles are well formed and reference known tools", () => {
   }
 });
 
-test("the role library has a Main Agent default and at least 12 distinct built-ins", () => {
+test("the role library has an A1 default and at least 12 distinct built-ins", () => {
   const main = BUILTIN_ROLES.find((role) => role.id === DEFAULT_ROLE_ID);
-  assert.ok(main, "Main Agent role exists");
+  assert.ok(main, "A1 role exists");
   assert.equal(main.builtin, true);
   assert.ok(main.tools.includes("bash"));
   assert.ok(main.tools.includes("subagent"));
   assert.ok(main.instructions.toLowerCase().includes("set_role"));
   assert.ok(BUILTIN_ROLES.length >= 13, `expected >= 13 built-ins, got ${BUILTIN_ROLES.length}`);
   const names = BUILTIN_ROLES.map((role) => role.name);
-  for (const expected of ["Main Agent", "Frontend Engineer", "Backend Engineer", "Debugger", "Code Reviewer", "Test Writer", "Security Auditor", "DevOps", "Deployer", "Researcher", "Data Analyst", "Technical Writer", "Browser Operator", "Product Designer"]) {
+  for (const expected of ["A1", "Frontend Engineer", "Backend Engineer", "Debugger", "Code Reviewer", "Test Writer", "Security Auditor", "DevOps", "Deployer", "Researcher", "Data Analyst", "Technical Writer", "Browser Operator", "Product Designer"]) {
     assert.ok(names.includes(expected), `missing built-in role ${expected}`);
   }
 });

@@ -1,0 +1,434 @@
+/**
+ * Server-side per-account Connector Catalog store.
+ *
+ * Bridges SwarmAgents' real backend primitives so every connector in the UI
+ * reflects actual runtime state with zero fake toggles:
+ * - LLM provider entries in `lib/providers/store.ts` (models, rate limits, keys)
+ * - MCP server definitions in `lib/library/user-store.ts` (--mcp-config seeding)
+ * - Secret vault entries in `lib/secrets/registry.ts` (allowlisted HTTP proxy)
+ *
+ * All reads return sanitized status & masked hints only — sealed secrets never
+ * cross to the client.
+ */
+
+import { recordAudit } from "../audit";
+import { connectorById, connectorPayload } from "../library/catalog";
+import {
+  addInstalledItem,
+  deleteInstalledItem,
+  listInstalledItems,
+  type InstalledItemView,
+} from "../library/user-store";
+import {
+  readConfiguredProviders,
+  removeProvider,
+  saveProvider,
+  savedProviderIds,
+} from "../providers/store";
+import { validateProviderBaseUrl } from "../providers/url-safety";
+import { deleteSecret, listSecrets, putSecret, type SecretView } from "../secrets/registry";
+import type { ProviderConfig } from "../providers/types";
+import {
+  CONNECTOR_CATALOG,
+  findCatalogConnector,
+  type ConnectorCatalogEntry,
+} from "./catalog";
+
+export class ConnectorError extends Error {
+  readonly status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.name = "ConnectorError";
+    this.status = status;
+  }
+}
+
+export interface ConnectorStatusView extends ConnectorCatalogEntry {
+  connected: boolean;
+  providerConnected: boolean;
+  mcpInstalled: boolean;
+  vaultConfigured: boolean;
+  /** True when a key is already saved in Providers and just needs 1-click agent activation. */
+  canActivateFromProvider: boolean;
+  /** True when clicking Connect succeeds without typing a new credential. */
+  canOneClickConnect: boolean;
+  mask?: string;
+}
+
+export interface ConnectConnectorInput {
+  inputs?: Record<string, string>;
+  useProviderKey?: boolean;
+}
+
+const SLUG_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+function maskValue(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.length <= 4) return "••••";
+  return `••••${trimmed.slice(-4)}`;
+}
+
+function isValidCredential(value: string): boolean {
+  if (value.length === 0 || value.length > 512) return false;
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code < 32 || code > 126) return false;
+  }
+  return true;
+}
+
+function libraryItemIdFor(libraryConnectorId: string): string {
+  return `connector-${libraryConnectorId}`;
+}
+
+function connectedFor(
+  entry: ConnectorCatalogEntry,
+  providerConnected: boolean,
+  mcpInstalled: boolean,
+  vaultConfigured: boolean,
+): boolean {
+  if (entry.providerId && entry.libraryConnectorId && entry.vaultSecret) {
+    return providerConnected && mcpInstalled && vaultConfigured;
+  }
+  if (entry.providerId && entry.vaultSecret) return providerConnected && vaultConfigured;
+  if (entry.providerId && entry.libraryConnectorId) return providerConnected && mcpInstalled;
+  if (entry.providerId) return providerConnected;
+  if (entry.libraryConnectorId) return mcpInstalled;
+  return false;
+}
+
+function maskFor(
+  providerKeys: string[],
+  libItem: InstalledItemView | undefined,
+): string | undefined {
+  if (providerKeys.length > 0) return maskValue(providerKeys[0]);
+  if (libItem) return libItem.secretFields.find((f) => f.configured && f.mask)?.mask;
+  return undefined;
+}
+
+function computeStatusView(
+  entry: ConnectorCatalogEntry,
+  providersById: ReadonlyMap<string, ProviderConfig>,
+  libraryById: ReadonlyMap<string, InstalledItemView>,
+  secretsById: ReadonlyMap<string, SecretView>,
+): ConnectorStatusView {
+  const provider = entry.providerId ? providersById.get(entry.providerId) : undefined;
+  const providerKeys = provider?.keys ?? [];
+  const providerConnected = Boolean(provider && providerKeys.length > 0);
+  const libItem = entry.libraryConnectorId
+    ? libraryById.get(libraryItemIdFor(entry.libraryConnectorId))
+    : undefined;
+  const mcpInstalled = Boolean(libItem);
+  const vaultConfigured = entry.vaultSecret
+    ? secretsById.has(entry.vaultSecret.id)
+    : false;
+
+  const connected = connectedFor(entry, providerConnected, mcpInstalled, vaultConfigured);
+  const canActivateFromProvider = providerConnected && !connected;
+  const canOneClickConnect = entry.fields.length === 0 || canActivateFromProvider;
+  const mask = maskFor(providerKeys, libItem);
+
+  return {
+    ...entry,
+    connected,
+    providerConnected,
+    mcpInstalled,
+    vaultConfigured,
+    canActivateFromProvider,
+    canOneClickConnect,
+    ...(mask ? { mask } : {}),
+  };
+}
+
+function buildStatusContext(userId: string) {
+  const providersById = new Map<string, ProviderConfig>(
+    readConfiguredProviders(userId).map((p) => [p.id, p]),
+  );
+  const libraryById = new Map<string, InstalledItemView>(
+    listInstalledItems(userId).map((item) => [item.id, item]),
+  );
+  const secretsById = new Map<string, SecretView>(
+    listSecrets(userId).map((s) => [s.id, s]),
+  );
+  return { providersById, libraryById, secretsById };
+}
+
+export function listConnectorStatuses(userId: string): ConnectorStatusView[] {
+  const { providersById, libraryById, secretsById } = buildStatusContext(userId);
+  return CONNECTOR_CATALOG.map((entry) =>
+    computeStatusView(entry, providersById, libraryById, secretsById),
+  );
+}
+
+export function getConnectorStatus(userId: string, connectorId: string): ConnectorStatusView | null {
+  const entry = findCatalogConnector(connectorId);
+  if (!entry) return null;
+  const { providersById, libraryById, secretsById } = buildStatusContext(userId);
+  return computeStatusView(entry, providersById, libraryById, secretsById);
+}
+
+function cleanConnectInputs(
+  entry: ConnectorCatalogEntry,
+  rawInputs: Record<string, string>,
+): Record<string, string> {
+  const cleanedInputs: Record<string, string> = {};
+  for (const field of entry.fields) {
+    const raw = rawInputs[field.key];
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== "string") {
+      throw new ConnectorError(`${field.label} must be a string.`, 400);
+    }
+    const trimmed = raw.trim();
+    if (trimmed && field.secret && !isValidCredential(trimmed)) {
+      throw new ConnectorError(`${field.label} must be 1-512 printable characters.`, 400);
+    }
+    if (trimmed) cleanedInputs[field.key] = trimmed;
+  }
+  return cleanedInputs;
+}
+
+function resolveCloudflareBaseUrl(
+  entry: ConnectorCatalogEntry,
+  cleanedInputs: Record<string, string>,
+): string | undefined {
+  if (entry.id !== "cloudflare" || !cleanedInputs.accountId) return undefined;
+  const accountId = cleanedInputs.accountId;
+  if (!SLUG_RE.test(accountId)) {
+    throw new ConnectorError("Cloudflare Account ID must contain only letters, numbers, '-' or '_'.", 400);
+  }
+  const baseUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1`;
+  const safety = validateProviderBaseUrl(baseUrl);
+  if (!safety.ok) throw new ConnectorError(safety.error, 400);
+  return baseUrl;
+}
+
+interface PrimaryCredential {
+  primaryToken: string | undefined;
+  reusedProviderKey: boolean;
+}
+
+function resolvePrimaryCredential(
+  entry: ConnectorCatalogEntry,
+  existingProvider: ProviderConfig | undefined,
+  cleanedInputs: Record<string, string>,
+): PrimaryCredential {
+  const primarySecretField = entry.fields.find((f) => f.secret && f.required);
+  if (!primarySecretField) return { primaryToken: undefined, reusedProviderKey: false };
+
+  const provided = cleanedInputs[primarySecretField.key];
+  if (provided) {
+    const primaryToken = entry.id === "github" ? provided.replace(/^Bearer\s+/i, "").trim() : provided;
+    return { primaryToken, reusedProviderKey: false };
+  }
+  if (entry.providerId && existingProvider?.keys && existingProvider.keys.length > 0) {
+    return { primaryToken: existingProvider.keys[0], reusedProviderKey: true };
+  }
+  throw new ConnectorError(`${primarySecretField.label} is required.`, 400);
+}
+
+interface LibraryPayload {
+  catalogEntry: NonNullable<ReturnType<typeof connectorById>>;
+  payload: NonNullable<ReturnType<typeof connectorPayload>>;
+}
+
+function resolveLibraryPayload(entry: ConnectorCatalogEntry): LibraryPayload | null {
+  if (!entry.libraryConnectorId) return null;
+  const catalogEntry = connectorById(entry.libraryConnectorId);
+  if (!catalogEntry) return null;
+  const payload = connectorPayload(catalogEntry);
+  if (!payload) return null;
+  return { catalogEntry, payload };
+}
+
+function librarySecretsFor(
+  entry: ConnectorCatalogEntry,
+  primaryToken: string | undefined,
+): Record<string, string> {
+  const secrets: Record<string, string> = {};
+  if (entry.id === "github" && primaryToken) secrets.Authorization = `Bearer ${primaryToken}`;
+  if (entry.id === "brave-search" && primaryToken) secrets.BRAVE_API_KEY = primaryToken;
+  return secrets;
+}
+
+interface WriteTracker {
+  wroteProvider: boolean;
+  wroteLibrary: boolean;
+  wroteVault: boolean;
+  hadProviderBefore: boolean;
+}
+
+function writeConnectorSideEffects(
+  userId: string,
+  entry: ConnectorCatalogEntry,
+  opts: {
+    primaryToken: string | undefined;
+    reusedProviderKey: boolean;
+    cloudflareBaseUrl: string | undefined;
+    library: LibraryPayload | null;
+  },
+  writes: WriteTracker,
+): void {
+  const { primaryToken, reusedProviderKey, cloudflareBaseUrl, library } = opts;
+
+  if (entry.providerId && primaryToken && !reusedProviderKey) {
+    saveProvider(userId, {
+      id: entry.providerId,
+      apiKey: primaryToken,
+      ...(cloudflareBaseUrl ? { baseUrl: cloudflareBaseUrl } : {}),
+    });
+    writes.wroteProvider = true;
+  } else if (entry.providerId && cloudflareBaseUrl && reusedProviderKey) {
+    saveProvider(userId, {
+      id: entry.providerId,
+      baseUrl: cloudflareBaseUrl,
+    });
+    writes.wroteProvider = true;
+  }
+
+  if (library && entry.libraryConnectorId) {
+    addInstalledItem(userId, {
+      id: libraryItemIdFor(entry.libraryConnectorId),
+      kind: "connector",
+      name: library.catalogEntry.name,
+      description: library.catalogEntry.description,
+      payload: library.payload,
+      secrets: librarySecretsFor(entry, primaryToken),
+      origin: "user",
+    });
+    writes.wroteLibrary = true;
+  }
+
+  if (entry.vaultSecret && primaryToken) {
+    putSecret(userId, {
+      id: entry.vaultSecret.id,
+      kind: entry.vaultSecret.kind,
+      label: entry.vaultSecret.label,
+      plaintext: primaryToken,
+    });
+    writes.wroteVault = true;
+  }
+}
+
+function rollbackConnectorWrites(
+  userId: string,
+  entry: ConnectorCatalogEntry,
+  writes: WriteTracker,
+): void {
+  if (writes.wroteVault && entry.vaultSecret) {
+    try {
+      deleteSecret(userId, entry.vaultSecret.id);
+    } catch {
+      // best effort rollback
+    }
+  }
+  if (writes.wroteLibrary && entry.libraryConnectorId) {
+    try {
+      deleteInstalledItem(userId, libraryItemIdFor(entry.libraryConnectorId));
+    } catch {
+      // best effort rollback
+    }
+  }
+  if (writes.wroteProvider && entry.providerId && !writes.hadProviderBefore) {
+    try {
+      removeProvider(userId, entry.providerId);
+    } catch {
+      // best effort rollback
+    }
+  }
+}
+
+export function connectConnector(
+  userId: string,
+  connectorId: string,
+  input: ConnectConnectorInput = {},
+): ConnectorStatusView {
+  const entry = findCatalogConnector(connectorId);
+  if (!entry) {
+    throw new ConnectorError("Unknown connector.", 404);
+  }
+
+  const cleanedInputs = cleanConnectInputs(entry, input.inputs ?? {});
+
+  const savedProviders = readConfiguredProviders(userId);
+  const existingProvider = entry.providerId
+    ? savedProviders.find((p) => p.id === entry.providerId)
+    : undefined;
+
+  const cloudflareBaseUrl = resolveCloudflareBaseUrl(entry, cleanedInputs);
+
+  const { primaryToken, reusedProviderKey } = resolvePrimaryCredential(
+    entry,
+    existingProvider,
+    cleanedInputs,
+  );
+
+  // Validate the library MCP entry ahead of writes so partial state is minimized.
+  const library = resolveLibraryPayload(entry);
+  if (entry.libraryConnectorId && !library) {
+    throw new ConnectorError(`Connector "${entry.id}" MCP definition is unavailable.`, 500);
+  }
+
+  const writes: WriteTracker = {
+    wroteProvider: false,
+    wroteLibrary: false,
+    wroteVault: false,
+    hadProviderBefore: entry.providerId ? savedProviderIds(userId).includes(entry.providerId) : false,
+  };
+
+  try {
+    writeConnectorSideEffects(userId, entry, { primaryToken, reusedProviderKey, cloudflareBaseUrl, library }, writes);
+  } catch (err) {
+    rollbackConnectorWrites(userId, entry, writes);
+    if (err instanceof ConnectorError) throw err;
+    throw new ConnectorError(err instanceof Error ? err.message : "Could not connect service.", 400);
+  }
+
+  recordAudit({
+    user: userId,
+    action: "connector.connect",
+    target: entry.id,
+    result: "success",
+  });
+
+  const updated = getConnectorStatus(userId, entry.id);
+  if (!updated) throw new ConnectorError("Connector state missing after save.", 500);
+  return updated;
+}
+
+export function disconnectConnector(
+  userId: string,
+  connectorId: string,
+): { removed: boolean; connector: ConnectorStatusView } {
+  const entry = findCatalogConnector(connectorId);
+  if (!entry) {
+    throw new ConnectorError("Unknown connector.", 404);
+  }
+
+  let removed = false;
+  if (entry.libraryConnectorId) {
+    if (deleteInstalledItem(userId, libraryItemIdFor(entry.libraryConnectorId))) {
+      removed = true;
+    }
+  }
+  if (entry.vaultSecret) {
+    if (deleteSecret(userId, entry.vaultSecret.id)) {
+      removed = true;
+    }
+  }
+  if (entry.providerId && savedProviderIds(userId).includes(entry.providerId)) {
+    removeProvider(userId, entry.providerId);
+    removed = true;
+  }
+
+  recordAudit({
+    user: userId,
+    action: "connector.disconnect",
+    target: entry.id,
+    result: "success",
+  });
+
+  const connector = getConnectorStatus(userId, entry.id);
+  if (!connector) throw new ConnectorError("Unknown connector.", 404);
+  return { removed, connector };
+}

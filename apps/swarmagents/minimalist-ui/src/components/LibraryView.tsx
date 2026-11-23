@@ -599,7 +599,10 @@ export function LibraryView({ embedded = false }: { embedded?: boolean }) {
         )}
 
         {tab === "catalog" && (
-          <SwarmCatalog onAdded={(item) => setInstalled((current) => [...current.filter((row) => row.id !== item.id), item])} />
+          <SwarmCatalog
+            onAdded={(item) => setInstalled((current) => [...current.filter((row) => row.id !== item.id), item])}
+            onRemoved={(itemId) => setInstalled((current) => current.filter((row) => row.id !== itemId))}
+          />
         )}
 
         {(tab === "mcp" || tab === "skills" || tab === "tools") && (

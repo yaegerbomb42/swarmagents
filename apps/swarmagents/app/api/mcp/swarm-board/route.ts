@@ -25,6 +25,9 @@ import {
 } from "@/lib/board/handlers";
 
 import { JsonBodyError, readJsonBody } from "@/lib/http";
+import { providerOwner } from "@/lib/providers/owner";
+import { callVmMcpTool, isVmMcpTool } from "@/lib/board-agent/tools";
+import type { VmScreenshotResult } from "@/lib/mcp-types";
 
 export const dynamic = "force-dynamic";
 type RpcId = string | number | null;
@@ -156,7 +159,96 @@ export async function GET(req: NextRequest) {
   }, { headers: NO_STORE });
 }
 
-async function dispatchRequest(method: string, params: unknown, id: RpcId): Promise<NextResponse> {
+type LibraryToolHandler = () => Promise<NextResponse> | NextResponse;
+
+function dispatchLibraryTool(
+  id: RpcId,
+  name: string,
+  args: Record<string, unknown>,
+): LibraryToolHandler | null {
+  const handlers: Record<string, () => Promise<NextResponse> | NextResponse> = {
+    create_task: () => runLockedTool(id, () => withLockedStore((store) => handleCreateTask(store, args))),
+    poll_tasks: () => runReadTool(id, (store) => handlePollTasks(store, args)),
+    claim_task: () => runLockedTool(id, () => withLockedStore((store) => handleClaimTask(store, args))),
+    submit_task_work: () => runLockedTool(id, () => withLockedStore((store) => handleSubmitTaskWork(store, args))),
+    submit_proposal: () => runLockedTool(id, () => withLockedStore((store) => handleSubmitProposal(store, args))),
+    list_proposals: () => runReadTool(id, (store) => handleListProposals(store, args)),
+    judge_proposal: () => runLockedTool(id, () => withLockedStore((store) => handleJudgeProposal(store, args))),
+    review_and_merge_task: () => runLockedTool(id, () => withLockedStore((store) => handleReviewAndMergeTask(store, args))),
+    record_match: () => runLockedTool(id, () => withLockedStore((store) => handleRecordMatch(store, args))),
+    sync_artifact: () => runLockedTool(id, () => withLockedStore((store) => handleSyncArtifact(store, args))),
+    list_artifacts: () => runReadTool(id, (store) => handleListArtifacts(store, args)),
+  };
+  return handlers[name] ?? null;
+}
+
+function buildVmPayload(res: { ok: boolean; data?: unknown; summary: string; error?: string }) {
+  if (res.ok) {
+    return {
+      ok: true,
+      summary: res.summary,
+      ...(isRecord(res.data) ? res.data : res.data !== undefined ? { data: res.data } : {}),
+    };
+  }
+  return { ok: false, error: res.error ?? "vm_error", summary: res.summary };
+}
+
+function appendScreenshotImage(
+  content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>,
+  name: string,
+  res: { ok: boolean; data?: unknown },
+): void {
+  if (!res.ok || name !== "vm_screenshot" || !isRecord(res.data)) return;
+  const shot = res.data as unknown as VmScreenshotResult;
+  if (typeof shot.dataBase64 === "string" && shot.dataBase64.length > 0) {
+    content.push({ type: "image", data: shot.dataBase64, mimeType: shot.mimeType });
+  }
+}
+
+async function dispatchVmToolCall(
+  id: RpcId,
+  name: string,
+  args: Record<string, unknown>,
+  req: NextRequest,
+): Promise<NextResponse> {
+  const owner = providerOwner(req);
+  if (!owner) {
+    return NextResponse.json({ error: "Sign in required." }, { status: 401, headers: NO_STORE });
+  }
+
+  const res = await callVmMcpTool(owner, name, args);
+  if (!res.ok && res.error === "invalid_input") {
+    return jsonRpcError(-32602, res.summary, id);
+  }
+
+  const payload = buildVmPayload(res);
+  const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [
+    { type: "text", text: JSON.stringify(payload) },
+  ];
+  appendScreenshotImage(content, name, res);
+  return jsonRpcResponse({ result: { content, isError: !res.ok } }, id);
+}
+
+async function dispatchToolsCall(
+  id: RpcId,
+  params: unknown,
+  req: NextRequest,
+): Promise<NextResponse> {
+  if (!isRecord(params) || typeof params.name !== "string" || !params.name.trim() ||
+      (params.arguments !== undefined && !isRecord(params.arguments))) {
+    return jsonRpcError(-32602, "Invalid params: expected a tool name and optional arguments object", id);
+  }
+  const { name, arguments: args = {} } = params;
+
+  const handler = dispatchLibraryTool(id, name, args);
+  if (handler) return await handler();
+
+  if (isVmMcpTool(name)) return await dispatchVmToolCall(id, name, args, req);
+
+  return jsonRpcError(-32601, `Unknown tool: ${name}`, id);
+}
+
+async function dispatchRequest(method: string, params: unknown, id: RpcId, req: NextRequest): Promise<NextResponse> {
   if (params !== undefined && !isRecord(params) && !Array.isArray(params)) {
     return jsonRpcError(-32602, "Invalid params", id);
   }
@@ -174,60 +266,17 @@ async function dispatchRequest(method: string, params: unknown, id: RpcId): Prom
   }
 
   if (method === "tools/call") {
-    if (!isRecord(params) || typeof params.name !== "string" || !params.name.trim() ||
-        (params.arguments !== undefined && !isRecord(params.arguments))) {
-      return jsonRpcError(-32602, "Invalid params: expected a tool name and optional arguments object", id);
-    }
-    const { name, arguments: args = {} } = params;
-
-    if (name === "create_task") {
-      return runLockedTool(id, () => withLockedStore((store) => handleCreateTask(store, args)));
-    }
-
-    if (name === "poll_tasks") {
-      return runReadTool(id, (store) => handlePollTasks(store, args));
-    }
-
-    if (name === "claim_task") {
-      return runLockedTool(id, () => withLockedStore((store) => handleClaimTask(store, args)));
-    }
-
-    if (name === "submit_task_work") {
-      return runLockedTool(id, () => withLockedStore((store) => handleSubmitTaskWork(store, args)));
-    }
-
-    if (name === "submit_proposal") {
-      return runLockedTool(id, () => withLockedStore((store) => handleSubmitProposal(store, args)));
-    }
-
-    if (name === "list_proposals") {
-      return runReadTool(id, (store) => handleListProposals(store, args));
-    }
-
-    if (name === "judge_proposal") {
-      return runLockedTool(id, () => withLockedStore((store) => handleJudgeProposal(store, args)));
-    }
-
-    if (name === "review_and_merge_task") {
-      return runLockedTool(id, () => withLockedStore((store) => handleReviewAndMergeTask(store, args)));
-    }
-
-    if (name === "record_match") {
-      return runLockedTool(id, () => withLockedStore((store) => handleRecordMatch(store, args)));
-    }
-
-    if (name === "sync_artifact") {
-      return runLockedTool(id, () => withLockedStore((store) => handleSyncArtifact(store, args)));
-    }
-
-    if (name === "list_artifacts") {
-      return runReadTool(id, (store) => handleListArtifacts(store, args));
-    }
-
-    return jsonRpcError(-32601, `Unknown tool: ${name}`, id);
+    return dispatchToolsCall(id, params, req);
   }
 
   return jsonRpcError(-32601, "Method not found", id);
+}
+
+function invalidIdError(method: string): NextResponse {
+  if (method === "tools/call") {
+    return jsonRpcError(-32602, "Invalid params: id must be a string, number, or null", null);
+  }
+  return jsonRpcError(-32600, "Invalid Request", null);
 }
 
 // POST: Single JSON-RPC 2.0 request (batch calls are not part of this endpoint).
@@ -251,9 +300,7 @@ export async function POST(req: NextRequest) {
   if (rawId !== undefined && !isRpcId(rawId)) {
     // Retain the established tools/call validation code without echoing
     // the invalid ID in either error envelope.
-    return method === "tools/call"
-      ? jsonRpcError(-32602, "Invalid params: id must be a string, number, or null", null)
-      : jsonRpcError(-32600, "Invalid Request", null);
+    return invalidIdError(method);
   }
 
   // JSON-RPC notifications (id === undefined): allowlist valid notification methods.
@@ -267,7 +314,7 @@ export async function POST(req: NextRequest) {
 
   let response: NextResponse;
   try {
-    response = await dispatchRequest(method, params, id);
+    response = await dispatchRequest(method, params, id, req);
   } catch (err) {
     if (isBoardUnavailable(err)) response = boardUnavailableResponse(id);
     else {

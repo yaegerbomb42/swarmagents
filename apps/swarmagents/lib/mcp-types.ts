@@ -83,3 +83,104 @@ export const DIFFICULTY_ELO_MAP: Record<TaskDifficulty, number> = {
   hard: 1600,    // Claude 3.5 Sonnet, GPT-4o
   expert: 1800,  // OpenAI o1/o3, Opus
 };
+
+export type VmMcpToolName =
+  | "vm_exec"
+  | "vm_read_output"
+  | "vm_read_file"
+  | "vm_write_file"
+  | "vm_list_workspace"
+  | "vm_screenshot";
+
+export interface McpToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+export interface VmExecArgs {
+  cmd: string | string[];
+  waitMs?: number;
+}
+
+export interface VmExecResult {
+  runId: string;
+  command: string;
+  status: "running" | "finished" | "error" | "cancelled";
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  output?: string;
+  error?: string;
+  lastSeq?: number;
+  truncated?: boolean;
+}
+
+export interface VmReadOutputArgs {
+  runId: string;
+  fromSeq?: number;
+  waitMs?: number;
+}
+
+export interface VmReadOutputResult {
+  runId: string;
+  status: string;
+  exitCode?: number;
+  error?: string;
+  stdout: string;
+  stderr: string;
+  output: string;
+  lastSeq: number;
+  truncated: boolean;
+}
+
+export interface VmReadFileArgs {
+  path: string;
+}
+
+export interface VmReadFileResult {
+  path: string;
+  size: number;
+  binary: boolean;
+  truncated: boolean;
+  limit: number;
+  content?: string;
+}
+
+export interface VmWriteFileArgs {
+  path: string;
+  content: string;
+}
+
+export interface VmWriteFileResult {
+  path: string;
+  bytesWritten: number;
+}
+
+export interface VmListWorkspaceArgs {
+  path?: string;
+}
+
+export interface VmWorkspaceEntry {
+  name: string;
+  path: string;
+  type: "file" | "directory" | "other";
+  size: number;
+  modifiedAt?: number;
+}
+
+export interface VmListWorkspaceResult {
+  path: string;
+  root: string;
+  parent: string | null;
+  entries: VmWorkspaceEntry[];
+}
+
+export type VmScreenshotArgs = Record<string, never>;
+
+export interface VmScreenshotResult {
+  mimeType: "image/png";
+  bytes: number;
+  dataBase64: string;
+}
+

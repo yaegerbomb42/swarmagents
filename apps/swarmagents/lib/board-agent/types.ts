@@ -1,3 +1,5 @@
+import type { VmMcpToolName } from "../mcp-types";
+
 export interface BoardAgentMessage {
   role: "user" | "agent" | "tool";
   content: string;
@@ -15,13 +17,22 @@ export interface BoardAgentConversation {
   updatedAt: number;
 }
 
+export type BoardAgentToolName =
+  | "create_board_task"
+  | "list_board_tasks"
+  | "get_board_task"
+  | "get_run_status"
+  | "get_board_digest"
+  | VmMcpToolName;
+
 export interface BoardAgentToolCall {
-  tool: "create_board_task" | "list_board_tasks" | "get_board_task" | "get_run_status" | "get_board_digest";
+  tool: BoardAgentToolName;
   args: Record<string, unknown>;
 }
 
 export interface BoardAgentToolResult<T = unknown> {
   ok: boolean;
   summary: string;
+  error?: string;
   data?: T;
 }

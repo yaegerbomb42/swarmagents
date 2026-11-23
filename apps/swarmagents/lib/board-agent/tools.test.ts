@@ -8,7 +8,54 @@ import type { SwarmTask } from "../mcp-types";
 import { RuntimeManager, setRuntimeManagerForTesting, type RunSummary } from "../runtime/manager";
 import { TelemetryBus } from "../telemetry/bus";
 import { configureRunsDir } from "../telemetry/paths";
-import { createBoardTask, getBoardDigest, getBoardTask, getRunStatus, listBoardTasks } from "./tools";
+import { FakeVmDriver } from "../vm/fake-driver";
+import { VmManager, setVmManagerForTesting } from "../vm/manager";
+import type { ExecOptions, ExecResult, VmHandle } from "../vm/types";
+import {
+  createBoardTask,
+  getBoardDigest,
+  getBoardTask,
+  getRunStatus,
+  listBoardTasks,
+  vmExec,
+  vmListWorkspace,
+  vmReadFile,
+  vmReadOutput,
+  vmScreenshot,
+  vmWriteFile,
+  VM_MCP_TOOL_DEFINITIONS,
+} from "./tools";
+
+class StubVmDriver extends FakeVmDriver {
+  scrotPaths: string[] = [];
+  removedPaths: string[] = [];
+
+  override async exec(handle: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
+    if (cmd[0] === "scrot") {
+      const target = cmd[cmd.length - 1];
+      this.scrotPaths.push(target);
+      await this.writeFile(handle, target, `png-for-${handle.userId}`);
+      return { exitCode: 0 };
+    }
+    if (cmd[0] === "rm") {
+      this.removedPaths.push(cmd[cmd.length - 1]);
+      return super.exec(handle, cmd, opts);
+    }
+    if (cmd[0] === "bash" && cmd[1] === "-lc") {
+      const line = cmd[2] ?? "";
+      if (line.includes("echo-test")) {
+        opts?.onStdout?.(`hello-${handle.userId}\n`);
+        opts?.onStderr?.(`warn-${handle.userId}\n`);
+        return { exitCode: 0 };
+      }
+      if (line.includes("exit-7")) {
+        opts?.onStderr?.("boom\n");
+        return { exitCode: 7 };
+      }
+    }
+    return super.exec(handle, cmd, opts);
+  }
+}
 
 let runsDir: string;
 let cleanup: () => void;
@@ -20,6 +67,7 @@ test.beforeEach(() => {
   configureRunsDir(runsDir);
   cleanup = () => {
     setRuntimeManagerForTesting(null);
+    setVmManagerForTesting(null);
     configureRunsDir(null);
     configureStorePaths(STORAGE_DIR, DATA_FILE);
     fs.rmSync(dir, { recursive: true, force: true });
@@ -136,3 +184,150 @@ test("digest reports ready, stale, review and completed work without writing the
   assert.deepEqual(listBoardTasks("alice", { status: "claimed" }).data?.map(({ id }) => id), [current.id]);
   assert.equal(fs.readFileSync(getStoragePaths().DATA_FILE, "utf-8"), original);
 });
+
+test("VM MCP tool definitions include all 6 schemas without $schema", () => {
+  const names = VM_MCP_TOOL_DEFINITIONS.map((t) => t.name);
+  assert.deepEqual(names, [
+    "vm_exec",
+    "vm_read_output",
+    "vm_read_file",
+    "vm_write_file",
+    "vm_list_workspace",
+    "vm_screenshot",
+  ]);
+  for (const def of VM_MCP_TOOL_DEFINITIONS) {
+    assert.equal("$schema" in def.inputSchema, false);
+    assert.equal(def.inputSchema.type, "object");
+  }
+});
+
+test("vm_exec and vm_read_output execute per-user commands, filter high-risk cmds, and enforce scope", async () => {
+  const driver = new StubVmDriver();
+  const vm = new VmManager({ customDriver: driver });
+  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
+  const runtime = new RuntimeManager({ router: null, bus, vm });
+  setVmManagerForTesting(vm);
+  setRuntimeManagerForTesting(runtime);
+
+  const invalid = await vmExec("alice", { cmd: "" });
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.error, "invalid_input");
+
+  const blocked = await vmExec("alice", { cmd: "sudo rm -rf /" });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error, "command_blocked");
+
+  const runAlice = await vmExec("alice", { cmd: "echo-test", waitMs: 2000 });
+  assert.equal(runAlice.ok, true);
+  assert.equal(runAlice.data?.status, "finished");
+  assert.equal(runAlice.data?.exitCode, 0);
+  assert.match(runAlice.data?.stdout ?? "", /hello-alice/);
+  assert.match(runAlice.data?.stderr ?? "", /warn-alice/);
+
+  const readAlice = await vmReadOutput("alice", { runId: runAlice.data!.runId });
+  assert.equal(readAlice.ok, true);
+  assert.equal(readAlice.data?.status, "finished");
+  assert.match(readAlice.data?.stdout ?? "", /hello-alice/);
+
+  const incremental = await vmReadOutput("alice", {
+    runId: runAlice.data!.runId,
+    fromSeq: readAlice.data!.lastSeq,
+  });
+  assert.equal(incremental.ok, true);
+  assert.equal(incremental.data?.output, "");
+
+  // Bob must NEVER see Alice's run or output
+  const crossUser = await vmReadOutput("bob", { runId: runAlice.data!.runId });
+  assert.equal(crossUser.ok, false);
+  assert.equal(crossUser.error, "scope_denied");
+  assert.doesNotMatch(crossUser.summary, /hello-alice/);
+
+  const badRun = await vmReadOutput("alice", { runId: "../escape" });
+  assert.equal(badRun.ok, false);
+  assert.equal(badRun.error, "invalid_input");
+});
+
+test("vm_write_file, vm_read_file, and vm_list_workspace stay in /workspace and isolate callers", async () => {
+  const driver = new StubVmDriver();
+  const vm = new VmManager({ customDriver: driver });
+  const runtime = new RuntimeManager({ router: null, vm });
+  setVmManagerForTesting(vm);
+  setRuntimeManagerForTesting(runtime);
+
+  // Path containment rejections
+  for (const badPath of ["/etc/passwd", "../secret.txt", "/workspace/../etc/shadow", "a\\b"]) {
+    assert.equal((await vmReadFile("alice", { path: badPath })).ok, false);
+    assert.equal((await vmWriteFile("alice", { path: badPath, content: "x" })).ok, false);
+    assert.equal((await vmListWorkspace("alice", { path: badPath })).ok, false);
+  }
+  assert.equal((await vmWriteFile("alice", { path: "/workspace", content: "x" })).error, "is_a_directory");
+
+  // Symlink escape containment
+  await vm.writeFile("alice", "/workspace/seed.txt", "ok");
+  driver.symlink("alice", "/workspace/escape", "/etc/hosts");
+  assert.equal((await vmReadFile("alice", { path: "/workspace/escape" })).error, "outside_workspace");
+  assert.equal((await vmWriteFile("alice", { path: "/workspace/escape", content: "x" })).error, "outside_workspace");
+
+  // Happy path + cross-user isolation
+  const wrote = await vmWriteFile("alice", { path: "notes/hello.txt", content: "alice-secret" });
+  assert.equal(wrote.ok, true);
+  assert.equal(wrote.data?.path, "/workspace/notes/hello.txt");
+
+  const readAlice = await vmReadFile("alice", { path: "/workspace/notes/hello.txt" });
+  assert.equal(readAlice.ok, true);
+  assert.equal(readAlice.data?.content, "alice-secret");
+
+  const listedAlice = await vmListWorkspace("alice", { path: "/workspace/notes" });
+  assert.equal(listedAlice.ok, true);
+  assert.deepEqual(listedAlice.data?.entries.map((e) => e.name), ["hello.txt"]);
+
+  // Binary omission
+  await vm.writeFile("alice", "/workspace/bin.dat", Buffer.from([0, 1, 2, 3]).toString("binary"));
+  const readBin = await vmReadFile("alice", { path: "/workspace/bin.dat" });
+  assert.equal(readBin.ok, true);
+  assert.equal(readBin.data?.binary, true);
+  assert.equal(readBin.data?.content, undefined);
+
+  // Bob's VM is completely isolated from Alice's files
+  const bobRead = await vmReadFile("bob", { path: "/workspace/notes/hello.txt" });
+  assert.equal(bobRead.ok, false);
+  assert.equal(bobRead.error, "not_found");
+  const bobList = await vmListWorkspace("bob", {});
+  assert.equal(bobList.ok, true);
+  assert.deepEqual(bobList.data?.entries, []);
+});
+
+test("vm_screenshot is caller-scoped, requires running VM, and cleans up unique scrot frames", async () => {
+  const driver = new StubVmDriver();
+  const vm = new VmManager({ customDriver: driver });
+  const runtime = new RuntimeManager({ router: null, vm });
+  setVmManagerForTesting(vm);
+  setRuntimeManagerForTesting(runtime);
+
+  // Neither Alice nor Bob has a running VM yet
+  const cold = await vmScreenshot("alice", {});
+  assert.equal(cold.ok, false);
+  assert.equal(cold.error, "vm_not_running");
+
+  // Start only Alice's VM
+  await vm.writeFile("alice", "/workspace/init.txt", "1");
+
+  const shotAlice = await vmScreenshot("alice", {});
+  assert.equal(shotAlice.ok, true);
+  assert.equal(shotAlice.data?.mimeType, "image/png");
+  assert.equal(Buffer.from(shotAlice.data!.dataBase64, "base64").toString("utf8"), "png-for-alice");
+  assert.equal(driver.scrotPaths.length, 1);
+  const framePath = driver.scrotPaths[0];
+  const frameDir = path.dirname(framePath);
+  assert.ok(framePath.endsWith("/frame.png"));
+  assert.ok(frameDir.startsWith("/tmp/swarm-desktop-frame-"));
+  assert.deepEqual(driver.removedPaths, [frameDir]);
+  await assert.rejects(vm.readFileBytes("alice", framePath, 1024));
+
+  // Bob still does not have a running VM and cannot grab Alice's desktop
+  const shotBob = await vmScreenshot("bob", {});
+  assert.equal(shotBob.ok, false);
+  assert.equal(shotBob.error, "vm_not_running");
+  assert.equal(driver.scrotPaths.length, 1);
+});
+

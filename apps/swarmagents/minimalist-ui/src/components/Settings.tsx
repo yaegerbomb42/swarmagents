@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
 import {
-  AlertTriangle, Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, KeyRound, Loader2, LogOut, Plus, Sparkles, Trash2, X, Zap,
+  AlertTriangle, Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, KeyRound, Loader2, LogOut, Plug, Plus, Sparkles, Trash2, X, Zap,
 } from 'lucide-react';
 import {
   type ActiveRole, type ApiFormat, MAX_ROLES, MIN_ROLES, PROVIDERS, type ProviderConfig, ROLES, uid,
@@ -1220,6 +1221,21 @@ function Providers({
         <p className="mt-4 text-[11px] leading-relaxed text-white/30">
           Keys are stored per-account on the server, encrypted at rest. Any OpenAI-compatible API works via &quot;Custom endpoint&quot;.
         </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Link
+            href="/connectors"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-cyan-400/25 bg-cyan-400/10 px-3 py-1.5 text-[11px] font-medium text-cyan-200 transition hover:bg-cyan-400/20"
+          >
+            <Plug className="h-3 w-3" aria-hidden />
+            Open Connector Catalog
+          </Link>
+          <Link
+            href="/providers"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11px] text-white/75 transition hover:bg-white/10 hover:text-white"
+          >
+            Open Providers page
+          </Link>
+        </div>
       </section>
 
       <DangerZone

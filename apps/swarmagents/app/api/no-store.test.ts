@@ -39,6 +39,8 @@ import { configureAmbientStore } from "../../lib/ambient/store";
 import { setAmbientEngineForTesting } from "../../lib/ambient/runtime";
 import { configureGardenerDir } from "../../lib/gardener/store";
 import { configureProviderStorePaths, saveProvider } from "../../lib/providers/store";
+import { GET as CONNECTORS_GET, POST as CONNECTORS_POST } from "./connectors/route";
+import { DELETE as CONNECTOR_DELETE, GET as CONNECTOR_GET } from "./connectors/[id]/route";
 import { configureUserPaths, signupLocalUser } from "../../lib/users";
 import type { AmbientEngine } from "../../lib/ambient/engine";
 
@@ -511,4 +513,41 @@ test("the provider test route is uncacheable on success and on a missing provide
   });
   assert.equal(missing.status, 404);
   assertNoStore(missing, "providers/[id]/test 404");
+});
+
+test("the connector routes are uncacheable on read, connect, disconnect, and errors", async () => {
+  const list = CONNECTORS_GET(userRequest("/api/connectors"));
+  assert.equal(list.status, 200);
+  assertNoStore(list, "connectors GET 200");
+
+  const connected = await CONNECTORS_POST(
+    userRequest("/api/connectors", { method: "POST", body: { connectorId: "exa" } }),
+  );
+  assert.equal(connected.status, 201);
+  assertNoStore(connected, "connectors POST 201");
+
+  const badBody = await CONNECTORS_POST(
+    userRequest("/api/connectors", { method: "POST", body: "{not-json" }),
+  );
+  assert.equal(badBody.status, 400);
+  assertNoStore(badBody, "connectors POST 400");
+
+  const one = await CONNECTOR_GET(userRequest("/api/connectors/exa"), {
+    params: Promise.resolve({ id: "exa" }),
+  });
+  assert.equal(one.status, 200);
+  assertNoStore(one, "connectors/[id] GET 200");
+
+  const missing = await CONNECTOR_GET(userRequest("/api/connectors/nope"), {
+    params: Promise.resolve({ id: "nope" }),
+  });
+  assert.equal(missing.status, 404);
+  assertNoStore(missing, "connectors/[id] GET 404");
+
+  const disconnected = await CONNECTOR_DELETE(
+    userRequest("/api/connectors/exa", { method: "DELETE" }),
+    { params: Promise.resolve({ id: "exa" }) },
+  );
+  assert.equal(disconnected.status, 200);
+  assertNoStore(disconnected, "connectors/[id] DELETE 200");
 });

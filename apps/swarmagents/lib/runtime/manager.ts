@@ -951,6 +951,11 @@ export class RuntimeManager {
     return this.vm;
   }
 
+  /** Telemetry bus emitting events for this runtime manager's active runs. */
+  get telemetryBus(): TelemetryBus {
+    return this.bus;
+  }
+
   /**
    * The provider router for one user (the same long-lived router the runs
    * use, so key cooldowns and budgets are shared). The LLM translation proxy

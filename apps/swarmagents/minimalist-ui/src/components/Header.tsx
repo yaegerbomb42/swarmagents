@@ -10,7 +10,10 @@
  */
 
 import React from "react";
-import { ChevronDown, HelpCircle, Settings as SettingsIcon, Square, SquarePen, Activity, Monitor, MessageSquare, ClipboardList } from "lucide-react";
+import Link from "next/link";
+import { ChevronDown, HelpCircle, Plug, Settings as SettingsIcon, Square, SquarePen } from "lucide-react";
+import { MascotDock } from "../../../components/mascot/MascotDock";
+import type { MascotState } from "../../../components/mascot/frames";
 import { RUN_PHASE_META, formatDuration, type RunPhase, type StatusTone } from "../../../lib/client/runPhase";
 import { cn } from "../utils/cn";
 import { Elapsed } from "./Conversation";
@@ -168,6 +171,15 @@ export function Header({
 
         <div className="flex items-center justify-end gap-2">
           <RunIndicator {...run} />
+          <Link
+            href="/connectors"
+            aria-label="Connectors"
+            title="Connector Catalog"
+            data-testid="open-connectors"
+            className="press flex h-9 w-9 items-center justify-center rounded-xl hair bg-black/20 text-[var(--mute)] transition-colors hover:bg-white/[0.06] hover:text-[var(--fg)]"
+          >
+            <Plug className="h-4 w-4" aria-hidden />
+          </Link>
           <IconButton
             label="Keyboard shortcuts"
             onClick={onOpenShortcuts}

@@ -26,6 +26,10 @@ function readCall(path: string, ts: number): RunEvent {
   return toolCall("read", ts, { input: { files: [{ path, start: 1, end: 1 }] } });
 }
 
+function filePathReadCall(path: string, ts: number): RunEvent {
+  return toolCall("read", ts, { input: { file_path: path, start: 1, end: 1 } });
+}
+
 function findingOf(events: RunEvent[], kind: string): RunFinding | undefined {
   return diagnoseRun(events).find((f) => f.kind === kind);
 }
@@ -94,6 +98,51 @@ test("a tool denial event is a denied finding", () => {
   assert.ok(f, "expected a denied finding");
   assert.deepEqual(f!.turns, [1]);
   assert.match(f!.hint, /npm test/);
+});
+
+test("a read range reported via file_path is tracked as a repeated read", () => {
+  const events: RunEvent[] = [
+    turn(1, 1000),
+    filePathReadCall("a.ts", 2000),
+    filePathReadCall("a.ts", 3000),
+  ];
+  const f = findingOf(events, "repeated-read");
+  assert.ok(f, "expected a repeated-read finding for a file_path read");
+  assert.deepEqual(f!.turns, [1]);
+  assert.match(f!.hint, /a\.ts/);
+});
+
+test("a read range reported via file_path inside files[] is tracked", () => {
+  const events: RunEvent[] = [
+    turn(1, 1000),
+    toolCall("read", 2000, { input: { files: [{ file_path: "b.ts", start: 1, end: 1 }] } }),
+    toolCall("read", 3000, { input: { files: [{ file_path: "b.ts", start: 1, end: 1 }] } }),
+  ];
+  const f = findingOf(events, "repeated-read");
+  assert.ok(f, "expected a repeated-read finding for a file_path entry in files[]");
+  assert.deepEqual(f!.turns, [1]);
+  assert.match(f!.hint, /b\.ts/);
+});
+
+test("an edit reported via file_path clears the repeated read for that file", () => {
+  const events: RunEvent[] = [
+    turn(1, 1000),
+    readCall("a.ts", 2000),
+    toolCall("str_replace", 3000, { input: { file_path: "a.ts" } }),
+    readCall("a.ts", 4000),
+  ];
+  assert.equal(findingOf(events, "repeated-read"), undefined);
+});
+
+test("a denial reported by both an error call and a denied event is one finding either way round", () => {
+  const deniedCall: RunEvent = { type: "tool.call", tool: "run", ts: 2000, ms: 50, isError: true, error: "denied by policy" };
+  const deniedEarly: RunEvent = { type: "tool.denied", tool: "run", ts: 1500, command: "npm test", reason: "policy" };
+  const deniedLate: RunEvent = { type: "tool.denied", tool: "run", ts: 3000, command: "npm test", reason: "policy" };
+  for (const denied of [deniedEarly, deniedLate]) {
+    const found = diagnoseRun([turn(1, 1000), deniedCall, denied]).filter((f) => f.kind === "denied");
+    assert.equal(found.length, 1, `expected exactly one denied finding (denied event ts=${denied.ts})`);
+    assert.deepEqual(found[0].turns, [1]);
+  }
 });
 
 test("a cache read under 80% of the previous prompt is a cache-dip finding", () => {

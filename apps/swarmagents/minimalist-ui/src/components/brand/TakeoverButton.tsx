@@ -20,6 +20,7 @@ export interface TakeoverButtonProps {
   onHandback: () => void;
   disabled?: boolean;
   disabledReason?: string;
+  testId?: string;
   className?: string;
 }
 
@@ -29,6 +30,7 @@ export function TakeoverButton({
   onHandback,
   disabled = false,
   disabledReason,
+  testId,
   className,
 }: TakeoverButtonProps) {
   const humanDriving = driver === "human";
@@ -37,6 +39,7 @@ export function TakeoverButton({
       type="button"
       onClick={humanDriving ? onHandback : onTakeover}
       disabled={disabled}
+      data-testid={testId}
       aria-pressed={humanDriving}
       aria-label={humanDriving ? "Hand control back to the agent" : "Take over control of the computer"}
       title={disabled ? disabledReason : humanDriving ? "Hand control back to the agent" : "Take over control"}

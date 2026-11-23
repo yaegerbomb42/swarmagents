@@ -233,6 +233,17 @@ test("POST /api/agents returns 409 for an existing id and leaves updates to PUT"
   assert.equal(put.status, 200);
 });
 
+test("concurrent POST /api/agents with identical id returns 409 for the loser", async () => {
+  const m = manifest({ id: "race-bot" });
+  const [res1, res2] = await Promise.all([
+    CREATE(req("POST", "/api/agents", m)),
+    CREATE(req("POST", "/api/agents", m)),
+  ]);
+
+  const statuses = [res1.status, res2.status].sort();
+  assert.deepEqual(statuses, [201, 409], "One request must succeed (201) and the concurrent one must conflict (409)");
+});
+
 test("export accepts a system prompt that quotes token/secret inside a JSON example", async () => {
   // The old serialized-JSON regex matched the escaped `"token":` / `"secret":`
   // inside this string and failed the export with 500.

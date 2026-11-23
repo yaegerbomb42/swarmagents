@@ -240,3 +240,28 @@ test("setEnabled writes a gardener.autopilot audit entry", async () => {
   assert.ok(again.some((e) => e.target === "disabled"));
 });
 
+test("setEnabled validates that enabled is strictly a boolean", async () => {
+  for (const bad of ["true", "false", 1, 0, null, undefined, {}]) {
+    const res = await post({ action: "setEnabled", enabled: bad });
+    assert.equal(res.status, 400, `Expected 400 for enabled: ${JSON.stringify(bad)}`);
+    const data = (await res.json()) as { error?: string };
+    assert.match(data.error ?? "", /boolean/i);
+  }
+
+  const resTrue = await post({ action: "setEnabled", enabled: true });
+  assert.equal(resTrue.status, 200);
+  assert.equal(((await resTrue.json()) as { enabled: boolean }).enabled, true);
+
+  const resFalse = await post({ action: "setEnabled", enabled: false });
+  assert.equal(resFalse.status, 200);
+  assert.equal(((await resFalse.json()) as { enabled: boolean }).enabled, false);
+});
+
+test("tick has rate-limiting and returns no-store", async () => {
+  const res1 = await post({ action: "tick" });
+  assert.equal(res1.headers.get("cache-control"), "no-store");
+  // Second immediate tick must trigger rate limit 429
+  const res2 = await post({ action: "tick" });
+  assert.equal(res2.status, 429);
+  assert.equal(res2.headers.get("cache-control"), "no-store");
+});

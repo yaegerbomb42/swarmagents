@@ -153,9 +153,102 @@ function writeHistory(userId: string, id: string, entries: AgentHistoryEntry[]):
   atomicWriteFile(historyFile(userId, id), JSON.stringify(trimmed, null, 2), { mode: 0o600 });
 }
 
+class AsyncLock {
+  private tail: Promise<void> = Promise.resolve();
+  async acquire<T>(fn: () => T | Promise<T>): Promise<T> {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+}
+
+const globals = globalThis as typeof globalThis & { __swarmAgentWriteLocks?: Map<string, AsyncLock> };
+const agentLocks = (globals.__swarmAgentWriteLocks ??= new Map<string, AsyncLock>());
+
+function getLock(userId: string, id: string): AsyncLock {
+  const key = `${userId}:${id}`;
+  let lock = agentLocks.get(key);
+  if (!lock) {
+    lock = new AsyncLock();
+    agentLocks.set(key, lock);
+  }
+  return lock;
+}
+
+/**
+ * Execute a mutation on a specific agent under an in-process per-agent lock.
+ */
+export function withAgentLock<T>(userId: string, id: string, fn: () => T | Promise<T>): Promise<T> {
+  const canonicalId = id.trim();
+  return getLock(userId, canonicalId).acquire(fn);
+}
+
 export type SaveAgentResult =
   | { ok: true; manifest: AgentManifest; warnings: string[] }
   | { ok: false; errors: string[]; warnings: string[] };
+
+/**
+ * Create a new agent atomically: checks whether the agent already exists inside
+ * the lock and rejects with conflict: true if so, eliminating check-then-act races.
+ */
+export async function createAgentAtomic(
+  userId: string,
+  input: unknown,
+  catalog: AgentCatalog = catalogFor(userId),
+): Promise<
+  | { ok: true; manifest: AgentManifest; warnings: string[] }
+  | { ok: false; conflict: true; id: string }
+  | { ok: false; conflict?: false; errors: string[]; warnings: string[] }
+> {
+  const rawId =
+    input && typeof input === "object" && !Array.isArray(input)
+      ? (input as Record<string, unknown>).id
+      : undefined;
+  const id = typeof rawId === "string" ? rawId.trim() : "";
+  if (!id) {
+    const validated = validateManifest(input, catalog);
+    if (!validated.ok) return { ok: false, errors: validated.errors, warnings: validated.warnings };
+    return saveAgent(userId, input, catalog);
+  }
+
+  return withAgentLock(userId, id, () => {
+    if (getAgent(userId, id)) {
+      return { ok: false, conflict: true, id };
+    }
+    return saveAgent(userId, input, catalog);
+  });
+}
+
+/**
+ * Update an existing agent atomically: verifies existence inside the lock
+ * before replacing, eliminating check-then-act races.
+ */
+export async function updateAgentAtomic(
+  userId: string,
+  id: string,
+  input: unknown,
+  catalog: AgentCatalog = catalogFor(userId),
+): Promise<
+  | { ok: true; manifest: AgentManifest; warnings: string[] }
+  | { ok: false; notFound: true }
+  | { ok: false; errors: string[]; warnings: string[] }
+> {
+  const canonicalId = id.trim();
+  return withAgentLock(userId, canonicalId, () => {
+    if (!getAgent(userId, canonicalId)) {
+      return { ok: false, notFound: true };
+    }
+    return saveAgent(userId, input, catalog);
+  });
+}
 
 /**
  * Validate, then write. The previous version (when there is one) moves into

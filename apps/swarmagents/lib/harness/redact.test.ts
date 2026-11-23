@@ -197,7 +197,7 @@ test("redactValue survives circular structures and deep nesting", () => {
   const deep = node;
   for (let i = 0; i < 50; i++) {
     node.inner = {};
-    node = node.inner;
+    node = node.inner as Record<string, unknown>;
   }
   const outDeep = JSON.stringify(redactValue(deep, redact));
   assert.ok(outDeep?.includes("[MAX_DEPTH]"), "deep nesting must terminate with a marker");

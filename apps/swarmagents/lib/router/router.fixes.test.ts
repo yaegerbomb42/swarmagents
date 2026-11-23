@@ -141,7 +141,10 @@ describe("router fixes", () => {
   it("x-ratelimit-reset given as seconds-from-now is not read as a 1970 epoch", () => {
     const now = Date.parse("2026-11-12T10:00:00.000Z");
     assert.equal(parseRateLimitHeaders({ "x-ratelimit-reset": "30" }, now).resetAtMs, now + 30_000);
-    assert.equal(parseRateLimitHeaders({ "x-ratelimit-reset": "1800000000" }, now).resetAtMs, 1_800_000_000_000);
+    // Epoch-seconds values parse as epoch time (not seconds-from-now), then
+    // clamp to one day out: provider headers are untrusted, so a reset 63
+    // days ahead must not exclude the key that long (see rolling-window.ts).
+    assert.equal(parseRateLimitHeaders({ "x-ratelimit-reset": "1800000000" }, now).resetAtMs, now + 86_400_000);
   });
 
   it("one early failure is not a 100% error rate, and idle health decays back", async () => {

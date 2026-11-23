@@ -3,6 +3,14 @@ import type { WindowEntry } from "./types";
 export const ONE_MINUTE_MS = 60_000;
 export const ONE_DAY_MS = 86_400_000;
 
+/**
+ * Ceiling for provider-supplied retry/reset delays. These values come from
+ * upstream response headers, so they are untrusted input: without a bound,
+ * `Retry-After: Infinity` (or an overflowing duration like `999999999h`)
+ * excludes a key forever. Anything at or beyond a day is treated as a day.
+ */
+const MAX_RETRY_AFTER_MS = ONE_DAY_MS;
+
 export function pruneWindow(entries: WindowEntry[], windowMs: number, now: number): WindowEntry[] {
   const cutoff = now - windowMs;
   let firstValid = 0;
@@ -61,8 +69,11 @@ function normalizeHeaders(headers?: Record<string, string | undefined>): Record<
 
 function parseDurationStringToMs(raw: string): number | undefined {
   const numeric = Number(raw);
-  if (!Number.isNaN(numeric) && numeric >= 0) {
-    return Math.ceil(numeric * 1000);
+  // Number("Infinity") and Number("1e309") are >= 0 but not finite: without
+  // the finite check they would exclude the key forever. Clamp as well —
+  // numeric * 1000 can overflow to Infinity for large finite inputs.
+  if (Number.isFinite(numeric) && numeric >= 0) {
+    return Math.min(Math.ceil(numeric * 1000), MAX_RETRY_AFTER_MS);
   }
   // Support formats like "12s", "500ms", "2m30s"
   let totalMs = 0;
@@ -77,8 +88,11 @@ function parseDurationStringToMs(raw: string): number | undefined {
     else if (unit === "s") totalMs += val * 1000;
     else if (unit === "m") totalMs += val * 60_000;
     else if (unit === "h") totalMs += val * 3_600_000;
+    // Huge values (or a digit string long enough to parse as Infinity) must
+    // not produce an unbounded exclusion.
+    if (totalMs >= MAX_RETRY_AFTER_MS) return MAX_RETRY_AFTER_MS;
   }
-  return matched ? Math.ceil(totalMs) : undefined;
+  return matched ? Math.min(Math.ceil(totalMs), MAX_RETRY_AFTER_MS) : undefined;
 }
 
 export function parseRateLimitHeaders(
@@ -96,7 +110,7 @@ export function parseRateLimitHeaders(
     } else {
       const parsedDate = Date.parse(retryAfter);
       if (!Number.isNaN(parsedDate)) {
-        result.retryAfterMs = Math.max(0, parsedDate - now);
+        result.retryAfterMs = Math.min(Math.max(0, parsedDate - now), MAX_RETRY_AFTER_MS);
       }
     }
   }
@@ -124,17 +138,27 @@ export function parseRateLimitHeaders(
   const resetRaw = h["x-ratelimit-reset"];
   if (resetRaw) {
     const asNum = Number(resetRaw);
-    if (!Number.isNaN(asNum)) {
+    // Finite check first: "Infinity"/"1e309" would otherwise satisfy the
+    // epoch-milliseconds branch and exclude the key forever.
+    if (Number.isFinite(asNum)) {
       // Epoch milliseconds, epoch seconds, or (small values) seconds from now.
       // Some providers send a delta here; treating "30" as epoch seconds
       // would yield a 1970 reset time and un-exclude the key immediately.
-      if (asNum > 1e12) result.resetAtMs = asNum;
-      else if (asNum > 1e9) result.resetAtMs = asNum * 1000;
-      else if (asNum >= 0) result.resetAtMs = now + Math.ceil(asNum * 1000);
+      const candidate =
+        asNum > 1e12
+          ? asNum
+          : asNum > 1e9
+            ? asNum * 1000
+            : asNum >= 0
+              ? now + Math.ceil(asNum * 1000)
+              : undefined;
+      if (candidate !== undefined) {
+        result.resetAtMs = Math.min(candidate, now + MAX_RETRY_AFTER_MS);
+      }
     } else {
       const asDate = Date.parse(resetRaw);
       if (!Number.isNaN(asDate)) {
-        result.resetAtMs = asDate;
+        result.resetAtMs = Math.min(asDate, now + MAX_RETRY_AFTER_MS);
       }
     }
   }

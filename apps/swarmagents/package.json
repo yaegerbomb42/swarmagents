@@ -14,7 +14,7 @@
     "vm-image:build": "docker build -t swarm-vm:claude vm-image",
     "vm-image-desktop:build": "docker build -t swarm-vm:desktop vm-image-desktop",
     "test": "npm run test:unit",
-    "test:unit": "SWARM_HOME=$(mktemp -d) tsx --test --test-concurrency=1 \"lib/**/*.test.ts\" \"app/**/*.test.ts\" \"components/**/*.test.ts\" \"minimalist-ui/src/**/*.test.ts\" \"packages/swarm-node/src/**/*.test.ts\"",
+    "test:unit": "bash scripts/test-unit.sh",
     "test:e2e": "tsx --test --test-concurrency=1 e2e/*.spec.ts",
     "test:all": "bash scripts/test-all.sh",
     "playtest:login": "node scripts/playtest.mjs login",

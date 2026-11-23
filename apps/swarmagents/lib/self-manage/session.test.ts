@@ -25,7 +25,9 @@ function session(startingId: string, granted: string[] = []) {
 }
 
 test("set_role adopts a subset role and writes its library skills", () => {
-  const run = session("main");
+  // Researcher carries the web-search MCP server, which main does not, so
+  // the switch is a capability addition and needs the grant.
+  const run = session("main", ["researcher"]);
   const result = run.apply("set_role", { roleId: "researcher", reason: "needs sources" });
   assert.equal(result.ok, true);
   assert.match(result.injection, /Researcher/);
@@ -76,7 +78,9 @@ test("connect_mcp rejects servers outside the allowlist and the registry", () =>
 });
 
 test("manage_context pins a skill so a role change keeps it", () => {
-  const run = session("main");
+  // Granted: researcher's web-search MCP server is a capability addition
+  // over main (see the set_role test above).
+  const run = session("main", ["researcher"]);
   assert.equal(run.apply("load_skill", { skillId: "file-editor" }).ok, true);
   assert.equal(run.apply("manage_context", { action: "pin", target: "file-editor" }).ok, true);
   const switched = run.apply("set_role", { roleId: "researcher" });

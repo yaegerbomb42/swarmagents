@@ -5,6 +5,7 @@ import path from "node:path";
 import test, { mock } from "node:test";
 import { USER_HEADER } from "@/lib/auth";
 import type { BoardAgentConversation } from "@/lib/board-agent/types";
+import { boardAgentLogRedactor } from "@/lib/board-agent/redact";
 import { configureStorePaths, getStoragePaths, loadStore } from "@/lib/board/store";
 import { writeConfiguredProviders } from "@/lib/providers/store";
 import { resetLlmRoutingForTests } from "@/lib/runtime/llm-routing";
@@ -272,4 +273,18 @@ test("returns 503 when storage fails, but non-storage throw does not report stor
   } finally {
     fs.readFileSync = origRead;
   }
+});
+
+test("turn-error logging redacts the caller's BYOK keys", async () => {
+  // BYOK keys live in the per-user provider store, not process.env: the
+  // turn-error log must scrub them just like env secrets.
+  configureFakeProvider();
+  const redact = boardAgentLogRedactor(ALICE);
+  const logged = redact("upstream exploded, key=fake-key-for-board-chat-tests, retry later");
+  assert.equal(logged.includes("fake-key-for-board-chat-tests"), false);
+  assert.match(logged, /upstream exploded/);
+  assert.match(logged, /\[REDACTED\]/);
+  // A caller with no provider configured still gets the env redactor.
+  const stranger = boardAgentLogRedactor("nobody@example.test");
+  assert.equal(stranger("plain failure, no secrets"), "plain failure, no secrets");
 });

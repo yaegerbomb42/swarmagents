@@ -47,8 +47,6 @@ import {
   type DesktopPhase,
 } from "../../../lib/client/desktopState";
 import type { VmDisplayState } from "../../../lib/client/vmStatus";
-import { MascotSvg } from "../../../components/mascot/MascotSvg";
-import { svgStateForRun } from "../../../components/mascot/svg-timeline";
 import { presenceHintRegion, type Presence } from "../../../lib/client/presence";
 import { DesktopFpsMeter } from "../utils/desktopFps";
 
@@ -397,8 +395,8 @@ export function DesktopView({
         {(conn.phase === "starting" || conn.phase === "connecting") && (
           <div data-testid="desktop-overlay" className="absolute inset-0 z-20 grid place-items-center bg-black">
             <div className="flex flex-col items-center gap-2 text-center">
-              <MascotSvg state={svgStateForRun("idle")} size={64} />
-              <div className="font-mono text-xs text-white/60">Jimmy is waking up your computer.</div>
+              <img src="/brand/mark-dark.svg" alt="" width={48} height={48} />
+              <div className="font-mono text-xs text-white/60">Waking up your computer.</div>
               <div className="font-mono text-[11px] text-white/35">
                 {PHASE_OVERLAY_TEXT[conn.phase] ?? describeDesktopPhase(conn.phase)}
               </div>

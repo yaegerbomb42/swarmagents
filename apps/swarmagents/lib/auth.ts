@@ -424,3 +424,4 @@ export function isAllowed(req: AuthRequestLike): boolean {
   if (!hostAllowed(req)) return false;
   return !serverMode() || requestUser(req) !== null;
 }
+

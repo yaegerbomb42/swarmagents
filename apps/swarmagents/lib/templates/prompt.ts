@@ -18,11 +18,16 @@ import type { TaskTemplate, TemplateField } from "./types";
  */
 export function renderPrompt(template: TaskTemplate, values: Record<string, string>): string {
   return template.prompt.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_match, name: string) => {
-    const value = values[name];
-    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    // Only an own property counts as an answer; inherited properties are not
+    // user input. A blank answer falls through to the field's initial value.
+    if (Object.hasOwn(values, name)) {
+      const value = values[name];
+      if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    }
     const field = template.fields.find((candidate) => candidate.name === name);
-    const fallback = field?.default?.trim();
-    return fallback && fallback.length > 0 ? fallback : "";
+    // fieldInitialValue also covers select fields without an explicit default:
+    // they start at their first option instead of rendering as "".
+    return field ? fieldInitialValue(field) : "";
   });
 }
 

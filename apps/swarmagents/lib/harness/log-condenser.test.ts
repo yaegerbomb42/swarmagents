@@ -8,7 +8,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { condenseLog, MAX_FAILURE_LINES } from "./log-condenser";
+import { condenseLog, DEFAULT_MAX_CHARS, MAX_FAILURE_LINES } from "./log-condenser";
 
 function noiseFrame(index: number): string {
   return `    at node:internal/modules/cjs/loader:${100 + index}:${10 + index} (internal frame)`;
@@ -105,11 +105,61 @@ test("fatal and crash lines are failure clues too", () => {
 test("garbage input returns a deterministic, safe fallback", () => {
   // A single enormous line (no newlines) must not throw and must be bounded.
   const huge = "x".repeat(500_000);
-  assert.equal(condenseLog(huge).length, huge.length);
+  const bounded = condenseLog(huge);
+  assert.ok(bounded.length <= DEFAULT_MAX_CHARS, "a single huge line is capped");
+  assert.match(bounded, /\[TRUNCATED\]/, "output carries the truncation marker");
 
   // A run of blank lines with no content reduces cleanly.
   const blanks = "\n".repeat(500);
   const out = condenseLog(blanks);
   assert.equal(typeof out, "string");
   assert.ok(out.length <= 500);
+});
+
+test("maxChars is configurable and bounds both many lines and one long line", () => {
+  const many = Array.from({ length: 100 }, (_, i) => `  error: failure ${i}`).join("\n");
+  const small = condenseLog(many, { maxChars: 200 });
+  assert.ok(small.length <= 200, "many failure lines respect a small cap");
+
+  const oneLong = `  error: ${"y".repeat(100_000)}`;
+  const capped = condenseLog(oneLong, { maxChars: 500 });
+  assert.ok(capped.length <= 500, "one long failure line respects the cap");
+});
+
+test("CRLF/CR line endings are normalized before condensing", () => {
+  const crlf = ["ok 1", "ok 2", "ok 3"].join("\r\n");
+  assert.equal(condenseLog(crlf), condenseLog(["ok 1", "ok 2", "ok 3"].join("\n")));
+
+  const crOnly = ["ok 1", "ok 2", "ok 3"].join("\r");
+  assert.equal(condenseLog(crOnly), condenseLog(["ok 1", "ok 2", "ok 3"].join("\n")));
+
+  // Failure clues split by CRLF still survive the cap check.
+  const noisy = Array.from({ length: 60 }, (_, i) => `  passing ${i}\r\n`).join("");
+  const out = condenseLog(noisy + "  error: real failure\r\n");
+  assert.match(out, /real failure/);
+  assert.ok(!out.includes("\r"), "no carriage returns survive");
+});
+
+test("ANSI escape sequences are stripped before failure matching", () => {
+  const lines = Array.from({ length: 60 }, (_, i) => `  \x1b[32m✓ passing ${i}\x1b[0m`);
+  lines.push("  \x1b[31merror: coloured failure\x1b[0m");
+  const out = condenseLog(lines.join("\n"));
+  assert.match(out, /error: coloured failure/);
+  assert.ok(!/\x1B/.test(out), "no ANSI escapes survive");
+});
+
+test("repeated failure lines are deduplicated", () => {
+  const lines = Array.from({ length: 80 }, () => "  error: the same root cause");
+  const out = condenseLog(lines.join("\n"));
+  assert.equal(out.split("\n").filter((l) => l.includes("the same root cause")).length, 1);
+});
+
+test("head and tail failure lines are both preserved when capped", () => {
+  const lines: string[] = [];
+  for (let i = 0; i < 120; i += 1) lines.push(`  error: failure ${i}`);
+  const out = condenseLog(lines.join("\n"));
+  const kept = out.split("\n");
+  assert.equal(kept.length, MAX_FAILURE_LINES);
+  assert.match(kept[0], /failure 0\b/, "earliest failure kept");
+  assert.match(kept[kept.length - 1], /failure 119\b/, "latest failure kept");
 });

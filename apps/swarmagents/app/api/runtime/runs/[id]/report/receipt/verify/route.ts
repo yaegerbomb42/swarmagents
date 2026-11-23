@@ -12,6 +12,7 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
+import { JsonBodyError, readJsonBody } from "../../../../../../../../lib/http";
 import { isValidRunId, loadOwnedReport, reportCaller } from "../../../../../../../../lib/runtime/report-route-auth";
 import { verifyReceipt } from "../../../../../../../../lib/runtime/run-receipt";
 
@@ -31,13 +32,17 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   // An exported bundle may be supplied for verification; otherwise the
   // stored receipt is re-checked. A malformed body falls back to stored.
+  // An oversized body is rejected outright (it is not a malformed receipt).
   let candidate: unknown = report.receipt;
   try {
-    const body: unknown = await req.json();
+    const body: unknown = await readJsonBody(req);
     if (body && typeof body === "object" && "receipt" in body) {
       candidate = (body as Record<string, unknown>).receipt;
     }
-  } catch {
+  } catch (err) {
+    if (err instanceof JsonBodyError && err.status === 413) {
+      return NextResponse.json({ error: "Request body is too large." }, { status: 413 });
+    }
     // Empty / non-JSON body: verify the stored receipt.
   }
 

@@ -77,6 +77,24 @@ export class TokenBucket {
     };
   }
 
+  /**
+   * Return tokens to a bucket (e.g. a login that turned out to be
+   * legitimate). Applies the same time-based refill first, then adds the
+   * tokens back, clamped at capacity. A no-op when the key has no bucket.
+   */
+  refund(key: string, tokens = 1): void {
+    const bucket = this.buckets.get(key);
+    if (!bucket) return;
+    const now = Date.now();
+    const elapsed = now - bucket.lastRefill;
+    bucket.tokens = Math.min(
+      this.capacity,
+      bucket.tokens + (elapsed / this.windowMs) * this.capacity + tokens,
+    );
+    bucket.lastRefill = now;
+    this.buckets.set(key, bucket);
+  }
+
   /** Internal: clear all buckets. */
   _clear(): void {
     this.buckets.clear();
@@ -112,6 +130,65 @@ const EXEMPT = new Set(["/api/health"]);
 
 /** Stricter login bucket: 5 requests per minute. */
 const loginBucket = new TokenBucket(5, 60_000);
+
+/** Window for the failed-login budgets below (15 minutes). */
+const LOGIN_FAILURE_WINDOW_MS = 15 * 60_000;
+
+function perCount(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+/** Failed-login budget per account (SWARM_LOGIN_EMAIL_LIMIT, default 10 per 15 min). */
+export const LOGIN_EMAIL_LIMIT = perCount("SWARM_LOGIN_EMAIL_LIMIT", 10);
+/** Failed-login budget per client IP (SWARM_LOGIN_IP_LIMIT, default 30 per 15 min). */
+export const LOGIN_IP_LIMIT = perCount("SWARM_LOGIN_IP_LIMIT", 30);
+
+/**
+ * Failed-login budgets for POST /api/login. Unlike the middleware's
+ * per-minute login bucket (which counts every request), these count only
+ * failed credential checks: a token is taken before verifyLocalUser runs
+ * and handed back when the login succeeds, so legitimate sign-ins never
+ * consume the failure budget.
+ */
+const loginEmailBucket = new TokenBucket(LOGIN_EMAIL_LIMIT, LOGIN_FAILURE_WINDOW_MS);
+const loginIpBucket = new TokenBucket(LOGIN_IP_LIMIT, LOGIN_FAILURE_WINDOW_MS);
+
+/** Decision from the failed-login buckets. */
+export interface LoginRateLimit {
+  allowed: boolean;
+  /** Seconds until the tripped bucket admits another attempt (0 when allowed). */
+  retryAfter: number;
+}
+
+/**
+ * Take one token from the per-email bucket (when an email key is given) and
+ * one from the per-IP bucket. When the IP bucket denies, the email token is
+ * handed back so a denied attempt cannot drain the account budget.
+ */
+export function checkLoginRateLimit(
+  emailKey: string | null,
+  ipKey: string,
+): LoginRateLimit {
+  if (emailKey) {
+    const email = loginEmailBucket.consume(emailKey);
+    if (!email.allowed) return { allowed: false, retryAfter: email.retryAfter };
+    const ip = loginIpBucket.consume(ipKey);
+    if (!ip.allowed) {
+      loginEmailBucket.refund(emailKey);
+      return { allowed: false, retryAfter: ip.retryAfter };
+    }
+    return { allowed: true, retryAfter: 0 };
+  }
+  const ip = loginIpBucket.consume(ipKey);
+  return { allowed: ip.allowed, retryAfter: ip.retryAfter };
+}
+
+/** Hand back the tokens taken by checkLoginRateLimit (successful login, or an attempt that never ran as a credential check). */
+export function refundLoginRateLimit(emailKey: string | null, ipKey: string): void {
+  if (emailKey) loginEmailBucket.refund(emailKey);
+  loginIpBucket.refund(ipKey);
+}
 
 /**
  * Provider completion bucket: one completion can fan out to 8 upstream LLM
@@ -322,6 +399,8 @@ export function rateLimitResponse(rate: RateInfo): NextResponse {
 export function resetBuckets(): void {
   apiBucket._clear();
   loginBucket._clear();
+  loginEmailBucket._clear();
+  loginIpBucket._clear();
   signupBucket._clear();
   passwordResetBucket._clear();
   boardBucket._clear();

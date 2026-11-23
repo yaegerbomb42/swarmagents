@@ -103,14 +103,15 @@ export const WEB_AUTOMATION_IN_THE_VM_BROWSER: TaskTemplate[] = [
     id: "log-in-and-read-data",
     category: "web-automation-in-the-vm-browser",
     title: "Log in and read the data behind it",
-    pitch: "The browser signs in with the credentials you give, then reads the page you care about.",
+    pitch: "The browser signs in with the credentials you configure, then reads the page you care about.",
     prompt:
       "Sign in to {{url}} in the browser and then read {{page_description}}.\n\n" +
       "Credentials:\n" +
       "  username: {{username}}\n" +
-      "  password: {{password}}\n\n" +
+      "  password: read it from the {{password_env}} environment variable inside the VM\n\n" +
       "Requirements:\n" +
       "- Log in through the form on the site. Do not put the password in the URL or in a script that is saved to disk.\n" +
+      "- Read the password from {{password_env}} at run time. Never write it into the prompt, a file, or a screenshot.\n" +
       "- Navigate to {{target_page}} and extract {{fields}}.\n" +
       "- Write the result to {{output_path}}.\n" +
       "- Do not print the password in your output, in any file you write, or in a screenshot name.\n" +
@@ -119,7 +120,7 @@ export const WEB_AUTOMATION_IN_THE_VM_BROWSER: TaskTemplate[] = [
     fields: [
       { name: "url", label: "Login URL", type: "text", default: "https://example.com/login" },
       { name: "username", label: "Username", type: "text", default: "demo@example.com" },
-      { name: "password", label: "Password", type: "text", default: "hunter2" },
+      { name: "password_env", label: "Environment variable holding the password", type: "text", default: "APP_PASSWORD" },
       { name: "target_page", label: "Page to read after login", type: "text", default: "/orders" },
       { name: "page_description", label: "What to read", type: "text", default: "the list of open orders" },
       { name: "fields", label: "Fields to extract", type: "text", default: "order id, customer, total, status" },
@@ -133,7 +134,7 @@ export const WEB_AUTOMATION_IN_THE_VM_BROWSER: TaskTemplate[] = [
       "Logged in at https://example.com/login and read /orders.\n" +
       "  extracted 24 rows -> orders.csv (order_id, customer, total, status)\n" +
       "  final URL: https://example.com/orders\n" +
-      "The password does not appear in any file or in this report; it was typed into the form and never written down.",
+      "The password was read from the APP_PASSWORD environment variable inside the VM; it does not appear in any file, screenshot or this report.",
   },
   {
     id: "watch-a-page-for-a-change",

@@ -1,17 +1,16 @@
 "use client";
 
 /**
- * Header — the workspace's primary glass bar with mynow.online aesthetic.
+ * Header — the workspace's primary bar on the brand system.
  *
- * Left: Jimmy (mascot animation), the open conversation (opens history), New chat.
- * Middle: Segmented glass view switcher (Chat, Computer, Board).
- * Right: Live telemetry status indicator and Settings.
+ * Left: the cursor-eye mark + wordmark, the open conversation (opens
+ * history), New chat.
+ * Middle: Segmented view switcher (Chat, Computer, Board).
+ * Right: Live run status indicator and Settings.
  */
 
 import React from "react";
 import { ChevronDown, HelpCircle, Settings as SettingsIcon, Square, SquarePen, Activity, Monitor, MessageSquare, ClipboardList } from "lucide-react";
-import { MascotDock } from "../../../components/mascot/MascotDock";
-import type { MascotState } from "../../../components/mascot/frames";
 import { RUN_PHASE_META, formatDuration, type RunPhase } from "../../../lib/client/runPhase";
 import { cn } from "../utils/cn";
 import { Elapsed } from "./Conversation";
@@ -73,7 +72,6 @@ export function RunIndicator({ phase, since, durationMs, activity, stopping, onS
 
 export interface HeaderProps {
   title: string;
-  mascotState: MascotState;
   onOpenHistory: () => void;
   onNewChat: () => void;
   newChatDisabled: boolean;
@@ -90,7 +88,6 @@ export interface HeaderProps {
 
 export function Header({
   title,
-  mascotState,
   onOpenHistory,
   onNewChat,
   newChatDisabled,
@@ -112,9 +109,14 @@ export function Header({
         )}
       >
         <div className="flex min-w-0 items-center gap-2">
-          {/* Cute Agent Mascot Dock */}
-          <MascotDock state={mascotState} size={32} className="shrink-0 transition-transform hover:scale-105" />
-          
+          {/* Brand mark + wordmark (branding/BRAND.md) */}
+          <span className="flex shrink-0 items-center gap-2" data-testid="brand-lockup">
+            <img src="/brand/mark-dark.svg" alt="" width={28} height={28} className="shrink-0" />
+            <span className="hidden text-[15px] font-semibold tracking-tight text-[var(--fg)] min-[560px]:inline">
+              SwarmAgents
+            </span>
+          </span>
+
           <button
             type="button"
             onClick={onOpenHistory}

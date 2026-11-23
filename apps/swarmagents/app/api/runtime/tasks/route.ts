@@ -123,6 +123,18 @@ export async function POST(req: NextRequest) {
       : undefined;
   const model =
     typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined;
+  // Turn ceiling, passed to claude as --max-turns (capped by
+  // SWARM_MAX_TURNS in the runner). Present-but-invalid is rejected so a
+  // typo cannot silently run unbounded.
+  const maxTurns =
+    body.maxTurns === undefined
+      ? undefined
+      : typeof body.maxTurns === "number" && Number.isSafeInteger(body.maxTurns) && body.maxTurns > 0
+        ? body.maxTurns
+        : null;
+  if (maxTurns === null) {
+    return NextResponse.json({ error: "maxTurns must be a positive integer." }, { status: 400 });
+  }
   // g9 full-auto: the synchronous approval hook auto-approves in-VM asks while
   // still denying hard-deny and irreversible-external actions. The minimal
   // main page sends `autoApprove` for the same mode.
@@ -212,6 +224,7 @@ export async function POST(req: NextRequest) {
     agentCard,
     sessionId,
     model,
+    ...(maxTurns ? { maxTurns } : {}),
     ...(roleId ? { roleId } : {}),
     ...(grantedRoleIds ? { grantedRoleIds } : {}),
     projectId,
@@ -220,7 +233,19 @@ export async function POST(req: NextRequest) {
     fullAuto,
   });
   if (!result.accepted) {
-    if (result.error) return NextResponse.json({ error: result.error }, { status: 400 });
+    if (result.error) {
+      return NextResponse.json(
+        {
+          error: result.error,
+          // Server configuration refusals name the missing variables (names
+          // only, never values) so the UI can tell the operator what to set.
+          ...(result.missingEnv && result.missingEnv.length > 0
+            ? { missingEnv: result.missingEnv }
+            : {}),
+        },
+        { status: 400 },
+      );
+    }
     return NextResponse.json(
       { error: `Run queue is full (max ${result.limit ?? 3}). Wait for a run to finish.` },
       { status: 429 },

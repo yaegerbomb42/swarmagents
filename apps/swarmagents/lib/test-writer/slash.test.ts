@@ -71,3 +71,17 @@ test("formatTestsPrompt: strips backticks and newlines from target", () => {
   assert.equal((first.match(/`/g) ?? []).length, 2); // one opening, one closing
 });
 
+
+test("formatTestsPrompt: caps an over-long target instead of interpolating it whole", () => {
+  const long = "x".repeat(2000);
+  const p = formatTestsPrompt(long);
+  assert.ok(!p.includes(long), "the full over-long target must not appear in the prompt");
+  assert.ok(p.includes(`${"x".repeat(500)}…`), "the target is truncated to the cap with an ellipsis");
+});
+
+test("formatTestsPrompt: leaves a target at the cap untouched", () => {
+  const atCap = "y".repeat(500);
+  const p = formatTestsPrompt(atCap);
+  assert.ok(p.includes(`\`${atCap}\``), "a 500-char target is interpolated whole");
+  assert.ok(!p.includes("…"), "no ellipsis is added at the cap");
+});

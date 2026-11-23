@@ -15,6 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import { NextRequest } from "next/server";
 import { POST } from "./route";
+import { DEFAULT_MAX_JSON_BODY_BYTES } from "../../../../../lib/http";
 import { buildMapFromScan } from "../../../../../lib/codebase/analyze";
 import { createLocalScanner, scanRepoLocal } from "../../../../../lib/codebase/local-scanner";
 import { setStrikeLensRunnerForTesting } from "../../../../../lib/codebase/strike-lens";
@@ -210,4 +211,35 @@ test("POST strike does not run the lens for refactor or tests", async () => {
   assert.equal(data.ok, true);
   assert.equal(calls, 0);
   assert.equal(data.lens, undefined);
+});
+
+test("POST strike rejects an oversized body with 413", async () => {
+  const huge = JSON.stringify({
+    path: "src/app.ts",
+    action: "refactor",
+    padding: "x".repeat(DEFAULT_MAX_JSON_BODY_BYTES + 1024),
+  });
+  const res = await POST(
+    new NextRequest("http://localhost/api/runtime/codebase/strike", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-swarm-user": "alice" },
+      body: huge,
+    }),
+  );
+  assert.equal(res.status, 413);
+  const data = (await res.json()) as { error?: string };
+  assert.match(data.error ?? "", /too large/i);
+});
+
+test("POST strike treats a malformed body as no body (400 action error)", async () => {
+  const res = await POST(
+    new NextRequest("http://localhost/api/runtime/codebase/strike", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-swarm-user": "alice" },
+      body: "{not json",
+    }),
+  );
+  assert.equal(res.status, 400);
+  const data = (await res.json()) as { error?: string };
+  assert.match(data.error ?? "", /action must be one of/);
 });

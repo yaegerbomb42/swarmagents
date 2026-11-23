@@ -16,6 +16,7 @@
 
 import { NextResponse, type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../../../lib/auth";
+import { JsonBodyError, readJsonBody } from "../../../../../../lib/http";
 import { recordAudit } from "../../../../../../lib/audit";
 import { getVmManager } from "../../../../../../lib/vm/manager";
 import { isPreviewablePort } from "../../../../../../lib/preview/ports";
@@ -50,14 +51,16 @@ function parsePortParam(value: string | null): number | null {
 async function readPort(req: NextRequest): Promise<number | null> {
   if (req.method === "POST") {
     try {
-      const body = (await req.json()) as unknown;
+      const body = (await readJsonBody(req)) as unknown;
       if (!body || typeof body !== "object") return null;
       return parsePortParam(
         typeof (body as Record<string, unknown>).port === "number"
           ? String((body as Record<string, unknown>).port)
           : null,
       );
-    } catch {
+    } catch (err) {
+      // An oversized body is a real rejection, not a missing port.
+      if (err instanceof JsonBodyError && err.status === 413) throw err;
       return null;
     }
   }
@@ -78,7 +81,15 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const user = caller(req);
   if (!user) return unauthorized();
-  const port = await readPort(req);
+  let port: number | null;
+  try {
+    port = await readPort(req);
+  } catch (err) {
+    if (err instanceof JsonBodyError && err.status === 413) {
+      return NextResponse.json({ error: "Request body is too large." }, { status: 413 });
+    }
+    throw err;
+  }
   if (port === null) {
     return NextResponse.json({ error: "A valid port is required." }, { status: 400 });
   }

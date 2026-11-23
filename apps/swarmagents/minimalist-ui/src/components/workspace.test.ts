@@ -176,7 +176,6 @@ test("the header keeps the conversation, the views, the run and settings in one 
   ];
   const props = {
     title: "Fix the login redirect",
-    mascotState: "idle" as const,
     onOpenHistory: noop,
     onNewChat: noop,
     newChatDisabled: false,
@@ -185,6 +184,7 @@ test("the header keeps the conversation, the views, the run and settings in one 
     onView: noop,
     run: { phase: "approval" as const, since: Date.now(), stopping: false, onStop: noop, onShow: noop },
     onOpenSettings: noop,
+    onOpenShortcuts: noop,
     settingsNeedsAttention: true,
   };
 
@@ -261,6 +261,14 @@ test("the screen frame shows its views, its status and the stage; Take over only
   assert.match(tagOf(desktop, "take-over"), /aria-pressed="false"/);
   assert.match(desktop, /Take over/);
   assert.equal(countOf(desktop, 'data-testid="takeover-banner"'), 0);
+
+  for (const activeView of ["desktop", "terminal", "browser", "files"] as const) {
+    const html = renderToStaticMarkup(h(ScreenFrame, { ...base, activeView, showDesktop: true, desktopMode: true }));
+    assert.equal(countOf(html, 'data-testid="desktop-view"'), 1, `desktop remains mounted in ${activeView}`);
+    for (const view of ["desktop", "terminal", "browser", "files"]) {
+      assert.equal(countOf(html, `data-testid="screen-view-${view}"`), 1);
+    }
+  }
 
   const notReady = renderToStaticMarkup(
     h(ScreenFrame, { ...base, activeView: "desktop", showDesktop: true, desktopMode: true, canControl: false }),
@@ -373,6 +381,8 @@ test("the live turn shows what the agent is doing, with a way to its screen", as
   assert.match(html, /Running npm test/);
   assert.match(html, />Running</);
   assert.equal(countOf(html, 'data-testid="watch-screen"'), 1, "jump to this run's screen");
+  assert.match(html, />Watch computer</, "the button reads 'Watch computer'");
+  assert.doesNotMatch(html, /Watch screen/, "no 'Watch screen' label remains");
   assert.equal(countOf(html, 'data-testid="run-report"'), 0, "no report until the run ends");
 });
 

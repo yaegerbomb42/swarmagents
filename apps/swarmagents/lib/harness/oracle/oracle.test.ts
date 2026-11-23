@@ -12,11 +12,11 @@ import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultOracleChecks, runOracleGate, type OracleCheck, type OracleExec } from "./oracle";
+import { defaultOracleChecks, runOracleGate, type OracleCheck } from "./oracle";
 import { countChurn, parsePatchFiles, unsafePatchPaths } from "./diff";
 import { findAffectedTests, relativeImports, resolveSpecifier } from "./affected";
 import { buildRetryContext, diagnosticSymbols, extractDiagnostic, findDefinition } from "./retry";
-import { writeFileViaExec } from "./exec";
+import { writeFileViaExec, type OracleExec } from "./exec";
 
 const APP = process.cwd();
 const TSC = join(APP, "node_modules/typescript/bin/tsc");
@@ -26,8 +26,11 @@ const TSX = join(APP, "node_modules/tsx/dist/cli.mjs");
  * Child env for the local exec. NODE_TEST_CONTEXT is dropped: node:test sets
  * it for its own children, and a nested `--test` run would then report to
  * this runner instead of exiting non-zero on failure (the VM exec never has it).
+ * Typed as ProcessEnv: spawn's env option requires it, and the filtered
+ * Object.fromEntries shape alone does not satisfy it.
  */
-const CHILD_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "NODE_TEST_CONTEXT"));
+const CHILD_ENV: NodeJS.ProcessEnv = { ...process.env };
+delete CHILD_ENV.NODE_TEST_CONTEXT;
 
 /** Local exec: argv only, no shell — the same contract as the VM exec. */
 const localExec: OracleExec = (cmd, opts) =>

@@ -426,6 +426,12 @@ export interface RunRequest {
   /** Resume a prior session instead of starting fresh (passed as --resume). */
   sessionId?: string;
   model?: string;
+  /**
+   * Turn ceiling for this invocation, passed to claude as `--max-turns`.
+   * The runner caps it at SWARM_MAX_TURNS (see resolveMaxTurns). Absent
+   * means no flag — the CLI's own default applies, as today.
+   */
+  maxTurns?: number;
   /** Stable provider id the run is pointed at (from the router selection). */
   provider?: string;
   env: Record<string, string>;

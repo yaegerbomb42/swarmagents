@@ -149,7 +149,7 @@ export const RESEARCH_AND_REPORTS: TaskTemplate[] = [
     ],
     role: "researcher",
     estimatedMinutes: 20,
-    tools: ["bash", "read_file", "search"],
+    tools: ["bash", "read_file", "search", "write_file"],
     mcp: [],
     example:
       "# How the fetch retry logic got here\n\n" +

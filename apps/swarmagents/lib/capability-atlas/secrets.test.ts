@@ -13,6 +13,7 @@ describe("Secret safety", () => {
       ANTHROPIC_API_KEY: "sk-ant-SUPER_SECRET_ANTHROPIC_VALUE_88888",
       GEMINI_API_KEY: "AIzaSySUPER_SECRET_GEMINI_VALUE_77777",
       GROQ_API_KEY: "gsk_SUPER_SECRET_GROQ_VALUE_66666",
+      NODE_ENV: "test" as const,
     };
 
     const entries = await scanAiProviders({

@@ -85,7 +85,7 @@ test("acceptance: a run completes across a free-tier key rotation with no provid
 
   const result = await runWithPool(pool, cli.execute);
 
-  assert.equal(result.ok, true, result.error);
+  assert.equal(result.ok, true, result.error ?? "");
   assert.equal(result.error, undefined, "the user sees no provider error");
   assert.deepEqual(
     result.attempts.map((a) => [a.provider, a.keyId, a.reason]),
@@ -218,7 +218,7 @@ test("acceptance: a run switches to a different model family mid-task and resume
   );
   const result = await runWithPool(pool, cli.execute);
 
-  assert.equal(result.ok, true, result.error);
+  assert.equal(result.ok, true, result.error ?? "");
   assert.deepEqual(
     result.attempts.map((a) => [a.provider, a.model, a.family, a.reason]),
     [
@@ -346,7 +346,7 @@ test("familyModelFor prefers the requested model, then tier models, then discove
   const config: ProviderConfig = {
     id: "openrouter",
     kind: "openai",
-    models: { default: "anthropic/claude-sonnet-4-5" },
+    models: { balanced: "anthropic/claude-sonnet-4-5" },
     availableModels: ["openai/gpt-4.1", "google/gemini-2.5-pro"],
   };
   assert.equal(familyModelFor(config, "gpt"), "openai/gpt-4.1");

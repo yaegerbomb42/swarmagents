@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import {
   WsFrameDecoder,
   WsBufferOverflowError,
+  closeFrame,
   decodeFrames,
   encodeFrame,
   encodeClientFrame,
@@ -51,4 +52,28 @@ test("decodeFrames (stateless) still returns the incomplete remainder", () => {
   const { messages, rest } = decodeFrames(wire.subarray(0, 100));
   assert.equal(messages.length, 0);
   assert.equal(rest.length, 100);
+});
+
+test("WsFrameDecoder rejects reserved bits and reserved opcodes", () => {
+  // RSV1 set (0x40) on an otherwise valid binary frame.
+  assert.throws(() => new WsFrameDecoder().push(Buffer.from([0xc2, 0])), /Reserved bits/);
+  // Opcode 0x3 is reserved for future data frames.
+  assert.throws(() => new WsFrameDecoder().push(Buffer.from([0x83, 0])), /Reserved opcode/);
+  // Opcode 0xb is reserved for future control frames.
+  assert.throws(() => new WsFrameDecoder().push(Buffer.from([0x8b, 0])), /Reserved opcode/);
+  // The stateless decoder applies the same checks.
+  assert.throws(() => decodeFrames(Buffer.from([0xc2, 0])), /Reserved bits/);
+});
+
+test("closeFrame truncates an over-long reason to the 125-byte control cap", () => {
+  const frame = closeFrame(1000, "x".repeat(500));
+  const { messages } = decodeFrames(frame);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].payload.length, 125);
+  assert.equal(messages[0].payload.readUInt16BE(0), 1000);
+});
+
+test("encodeFrame rejects an opcode outside the low nibble", () => {
+  assert.throws(() => encodeFrame(0x1f, Buffer.alloc(0)), /Invalid opcode/);
+  assert.throws(() => encodeFrame(-1, Buffer.alloc(0)), /Invalid opcode/);
 });

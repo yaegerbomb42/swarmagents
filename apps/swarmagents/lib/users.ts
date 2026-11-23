@@ -9,7 +9,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { createHmac, randomBytes, randomUUID, scrypt } from "node:crypto";
+import { createHmac, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import { resolveStorageDir, isDirWritable } from "./board/store";
 import { atomicWriteFile } from "./atomic-write";
@@ -18,6 +18,9 @@ import { acquireFileLock } from "./file-lock";
 const SCHEME = "scrypt";
 const KEY_LEN = 32;
 const SALT_BYTES = 16;
+// Stored hashes are always a 16-byte salt and a 32-byte hash (hex-encoded).
+const SALT_HEX_RE = /^[0-9a-fA-F]{32}$/;
+const HASH_HEX_RE = /^[0-9a-fA-F]{64}$/;
 
 export interface ScryptCost {
   N: number;
@@ -173,9 +176,21 @@ async function acquireScryptSlot(): Promise<void> {
 }
 
 function releaseScryptSlot(): void {
-  const next = scryptWaiters.shift();
-  if (next) next();
-  else activeScrypt = Math.max(0, activeScrypt - 1);
+  const max = positiveInt("SWARM_SCRYPT_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENT_SCRYPT);
+  // Hand the freed slot to the next waiter only while the in-flight count
+  // is within the (possibly lowered) cap; otherwise return the slot so
+  // activeScrypt drains back under the cap instead of staying above it.
+  if (scryptWaiters.length > 0 && activeScrypt <= max) {
+    const next = scryptWaiters.shift();
+    if (next) next();
+    return;
+  }
+  activeScrypt = Math.max(0, activeScrypt - 1);
+}
+
+/** Scrypt slot state for tests: in-flight derivations and queued waiters. */
+export function getScryptSlotStateForTesting(): { active: number; queued: number } {
+  return { active: activeScrypt, queued: scryptWaiters.length };
 }
 
 /** Run one scrypt derivation under the global concurrency cap. */
@@ -206,11 +221,18 @@ export interface ParsedScryptHash {
  * Parse a stored hash string. Supports:
  * - Versioned 4-part: scrypt$N=...,r=...,p=...$<saltHex>$<hashHex>
  * - Legacy 3-part: scrypt$<saltHex>$<hashHex> (defaults to N=16384, r=8, p=1)
+ *
+ * The hex segments are validated strictly: stored hashes are always a
+ * 16-byte salt and a 32-byte hash. An empty (or short) segment decodes to
+ * a 0-byte (or short) buffer, and a 0-byte derivation compares equal to an
+ * empty expected hash — letting any password in. Malformed hashes are
+ * rejected here, before any derivation.
  */
 export function parseScryptHash(stored: string): ParsedScryptHash | null {
   const parts = stored.split("$");
   if (parts[0] !== SCHEME) return null;
   if (parts.length === 3) {
+    if (!SALT_HEX_RE.test(parts[1]) || !HASH_HEX_RE.test(parts[2])) return null;
     return {
       versioned: false,
       cost: { ...DEFAULT_SCRYPT_COST },
@@ -228,6 +250,7 @@ export function parseScryptHash(stored: string): ParsedScryptHash | null {
       else if (k === "r") cost.r = n;
       else if (k === "p") cost.p = n;
     }
+    if (!SALT_HEX_RE.test(parts[2]) || !HASH_HEX_RE.test(parts[3])) return null;
     return {
       versioned: true,
       cost,
@@ -245,7 +268,7 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
   const actual = await withScryptSlot(() =>
     scryptAsync(password, parsed.salt, parsed.hash.length, parsed.cost),
   );
-  return actual.length === parsed.hash.length && timingSafeEqualBuf(actual, parsed.hash);
+  return actual.length === parsed.hash.length && timingSafeEqual(actual, parsed.hash);
 }
 
 /** In-process cache for the parsed users file, keyed by the file's stat identity. */
@@ -259,13 +282,6 @@ interface UsersCache {
 
 let usersCache: UsersCache | null = null;
 
-function timingSafeEqualBuf(a: Buffer, b: Buffer): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
-}
-
 /** The users file lives next to the swarm board in the same data dir. */
 function resolveUserFile(): string {
   const home = process.env.SWARM_HOME;
@@ -273,12 +289,35 @@ function resolveUserFile(): string {
   return path.join(resolveStorageDir(), "users.json");
 }
 
-let USER_FILE = resolveUserFile();
+let userFileOverride: string | undefined;
 
-/** Point the store at a different file (tests). */
+/** Point the store at a different file (tests). Pass "" to reset to the default resolution. */
 export function configureUserPaths(file: string): void {
-  USER_FILE = file;
+  userFileOverride = file === "" ? undefined : file;
   usersCache = null;
+}
+
+/**
+ * The users file: the test override when set, else resolved lazily per call
+ * so a SWARM_HOME set after module import takes effect (the previous
+ * module-level constant froze the import-time value).
+ */
+function getUserFile(): string {
+  if (userFileOverride !== undefined) return userFileOverride;
+  return resolveUserFile();
+}
+
+/**
+ * Thrown when the users store cannot be read for a reason other than "does
+ * not exist yet": corrupt JSON, a wrong shape, or an I/O error (EACCES,
+ * EMFILE, EISDIR, ...). Write paths must not swallow this into an empty
+ * store — that would overwrite users.json and wipe every account.
+ */
+export class UsersStoreError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "UsersStoreError";
+  }
 }
 
 /**
@@ -286,31 +325,49 @@ export function configureUserPaths(file: string): void {
  * size are unchanged. Stat-only hits avoid re-reading and re-parsing the JSON
  * on every login/signup/lookup. Every in-process write invalidates the cache,
  * and external edits are detected by the stat identity.
+ *
+ * Only a missing file (ENOENT) yields an empty store. Any other failure is
+ * a UsersStoreError: a corrupt or unreadable store must fail loudly, never
+ * masquerade as "no users".
  */
 function loadUsers(): StoredUser[] {
+  const file = getUserFile();
+  let stat: fs.BigIntStats;
   try {
-    const stat = fs.statSync(USER_FILE, { bigint: true });
-    if (
-      usersCache &&
-      usersCache.file === USER_FILE &&
-      usersCache.mtimeNs === stat.mtimeNs &&
-      usersCache.size === stat.size
-    ) {
-      return usersCache.users;
+    stat = fs.statSync(file, { bigint: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      usersCache = null;
+      return [];
     }
-    const data = JSON.parse(fs.readFileSync(USER_FILE, "utf-8")) as UserFile;
-    const users = Array.isArray(data.users) ? data.users : [];
-    const byEmail = new Map<string, StoredUser>();
-    for (const u of users) {
-      byEmail.set(u.email, u);
-    }
-    usersCache = { file: USER_FILE, mtimeNs: stat.mtimeNs, size: stat.size, users, byEmail };
-    return users;
-  } catch {
-    // Missing or corrupt file: treat as an empty store, never crash login.
-    usersCache = null;
-    return [];
+    throw new UsersStoreError(`users store unreadable: ${file}`, { cause: err });
   }
+  if (
+    usersCache &&
+    usersCache.file === file &&
+    usersCache.mtimeNs === stat.mtimeNs &&
+    usersCache.size === stat.size
+  ) {
+    return usersCache.users;
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch (err) {
+    usersCache = null;
+    throw new UsersStoreError(`users store is corrupt: ${file}`, { cause: err });
+  }
+  const users = (data as Partial<UserFile> | null)?.users;
+  if (!Array.isArray(users)) {
+    usersCache = null;
+    throw new UsersStoreError(`users store has an invalid shape: ${file}`);
+  }
+  const byEmail = new Map<string, StoredUser>();
+  for (const u of users) {
+    byEmail.set(u.email, u);
+  }
+  usersCache = { file, mtimeNs: stat.mtimeNs, size: stat.size, users, byEmail };
+  return users;
 }
 
 function findUserByEmail(email: string): StoredUser | undefined {
@@ -319,11 +376,12 @@ function findUserByEmail(email: string): StoredUser | undefined {
 }
 
 function saveUsers(users: StoredUser[]): void {
-  fs.mkdirSync(path.dirname(USER_FILE), { recursive: true });
+  const file = getUserFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   // Random suffix as well as time+pid: two writes in the same millisecond
   // must not collide on the temp name (randomUUID, stronger than the
   // Math.random() suffix run-index.ts uses for the same purpose).
-  atomicWriteFile(USER_FILE, JSON.stringify({ version: 1, users } satisfies UserFile, null, 2), { encoding: "utf-8", mode: 0o600 });
+  atomicWriteFile(file, JSON.stringify({ version: 1, users } satisfies UserFile, null, 2), { encoding: "utf-8", mode: 0o600 });
   // Invalidate after every write so the next read re-stats (and re-reads if
   // another process touched the file in the meantime).
   usersCache = null;
@@ -334,8 +392,17 @@ export function normalizeEmail(email: unknown): string {
   if (typeof email !== "string") return "";
   const e = email.trim().toLowerCase();
   if (!e || e.length > MAX_EMAIL_LEN) return "";
-  // Minimal sanity: one @ and no whitespace/control characters.
-  if (!e.includes("@") || /[\s\u0000-\u001f\u007f]/.test(e)) return "";
+  // No whitespace/control characters.
+  if (/[\s\u0000-\u001f\u007f]/.test(e)) return "";
+  // Exactly one "@" with non-empty local and domain parts.
+  const at = e.indexOf("@");
+  if (at <= 0 || at !== e.lastIndexOf("@") || at === e.length - 1) return "";
+  const local = e.slice(0, at);
+  const domain = e.slice(at + 1);
+  if (local.startsWith(".") || local.endsWith(".") || domain.startsWith(".") || domain.endsWith(".")) return "";
+  // No path separators or traversal: the normalized email is embedded
+  // directly into local_<email> user ids.
+  if (e.includes("/") || e.includes("\\") || e.includes("..")) return "";
   return e;
 }
 
@@ -378,7 +445,7 @@ class UsersLock {
     await release;
     let releaseFile: (() => void) | null = null;
     try {
-      releaseFile = await acquireFileLock(`${USER_FILE}.lock`);
+      releaseFile = await acquireFileLock(`${getUserFile()}.lock`);
       usersCache = null;
       return await fn();
     } finally {
@@ -422,8 +489,16 @@ export async function signupLocalUser(email: unknown, password: unknown): Promis
     return { ok: false, error: "invalid" };
   }
   // Fast path for the obvious duplicate; the check inside the lock below is
-  // the authoritative one.
-  if (localUserExists(normalized)) {
+  // the authoritative one. A store error here is fatal: proceeding would
+  // hash a password for an account that may already exist, and the write
+  // below would overwrite the unreadable store.
+  let duplicate: boolean;
+  try {
+    duplicate = localUserExists(normalized);
+  } catch {
+    return { ok: false, error: "fatal" };
+  }
+  if (duplicate) {
     return { ok: false, error: "exists" };
   }
   let hashed: string;
@@ -436,7 +511,13 @@ export async function signupLocalUser(email: unknown, password: unknown): Promis
   return withUsersLock((): SignupResult => {
     // Re-read inside the critical section: a concurrent signup may have
     // persisted between this call's first load and the hash finishing.
-    const users = loadUsers();
+    // A store error is fatal, never an empty snapshot to overwrite.
+    let users: StoredUser[];
+    try {
+      users = loadUsers();
+    } catch {
+      return { ok: false, error: "fatal" };
+    }
     if (users.some((u) => u.email === normalized)) {
       return { ok: false, error: "exists" };
     }
@@ -515,6 +596,10 @@ async function upgradeHashIfNeeded(email: string, password: string, storedHash: 
 export async function verifyLocalUser(email: unknown, password: unknown): Promise<LocalUser | null> {
   const normalized = normalizeEmail(email);
   if (!normalized || typeof password !== "string" || !password) return null;
+  // Reject oversized passwords before any scrypt work: hashing a huge
+  // password burns CPU and memory for an input that can never be valid.
+  // ScryptBusyError propagates to the login route, which answers 429.
+  if (password.length > MAX_PASSWORD_LEN) return null;
   const user = findUserByEmail(normalized);
   if (!user) {
     // Burn the same scrypt cost as a real verification against a fixed dummy
@@ -551,7 +636,14 @@ export async function bumpSessionEpoch(email: unknown): Promise<boolean> {
   const normalized = normalizeEmail(email);
   if (!normalized) return false;
   return withUsersLock((): boolean => {
-    const users = loadUsers();
+    // A store error is a failed revocation, never an empty snapshot to
+    // overwrite: return false (the route answers 500) and write nothing.
+    let users: StoredUser[];
+    try {
+      users = loadUsers();
+    } catch {
+      return false;
+    }
     const idx = users.findIndex((u) => u.email === normalized);
     if (idx < 0) return false;
     const now = Date.now();

@@ -253,7 +253,7 @@ export default function LoginForm({
         <p style={{ color: "var(--color-text-muted)", fontSize: 13, margin: "0 0 24px" }}>
           {isReset
             ? "Enter your email and we will send you a link to reset your password."
-            : isSignup ? "Create your account to continue." : "Sign in to continue."}
+            : isSignup ? "Create your account to get started." : "Sign in to your workspace."}
         </p>
 
         <form onSubmit={submit} className="login-form" style={{ display: "flex", flexDirection: "column", gap: 16 }}>

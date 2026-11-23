@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1110 200" role="img" aria-label="SwarmAgents logo">
+  <title>SwarmAgents logo (for light surfaces)</title>
+  <path d="M8 100 Q165 -45 322 100 Q165 245 8 100 Z" fill="none" stroke="#005080" stroke-width="13" stroke-linejoin="round"/>
+  <rect x="138" y="79" width="54" height="42" rx="3" fill="#005080"/>
+  <text x="372" y="130" font-family="'DejaVu Sans', 'Segoe UI', system-ui, sans-serif" font-size="92" font-weight="700" fill="#0B1020">SwarmAgents</text>
+</svg>

@@ -1,0 +1,210 @@
+/**
+ * SwarmAgents brand design tokens — hand-built UI system.
+ *
+ * Source of truth for color: apps/swarmagents/branding/BRAND.md (PR #181).
+ *   Void Navy  #13192C — primary background (dark surfaces)
+ *   Signal Cyan #00D0F0 — primary accent: the mark on dark, links, active states
+ *   Deep Signal #005080 — the mark on light, headings on light
+ *   Ink        #0B1020 — wordmark + body text on light; deepest surface on dark
+ *   Paper      #FFFFFF — light background
+ *   Mist       #B4BED2 — secondary text on dark
+ *
+ * Everything below the palette is derived for product UI on Void Navy:
+ * raised surfaces are Void lifted toward Paper, hairlines are Paper at low
+ * alpha, and the three status hues (ok / warn / err) are status-only — they
+ * never carry brand meaning. Components read these variables; nothing in the
+ * brand library hard-codes a hex.
+ *
+ * Import once at the app root:  import "./components/brand/tokens.css";
+ */
+
+:root {
+  /* ── Brand palette (BRAND.md) ─────────────────────────────────────────── */
+  --brand-void: #13192c;
+  --brand-ink: #0b1020;
+  --brand-signal: #00d0f0;
+  --brand-deep: #005080;
+  --brand-paper: #ffffff;
+  --brand-mist: #b4bed2;
+
+  /* ── Derived surfaces (dark primary) ──────────────────────────────────── */
+  --brand-bg: var(--brand-void);
+  --brand-bg-deep: var(--brand-ink);
+  --brand-surface: #171f36;        /* card on Void */
+  --brand-surface-raised: #1c2540; /* popovers, panels, chat bar */
+  --brand-surface-hover: #222c4a;
+  --brand-well: #0e1424;           /* inset wells: VM stage, code, inputs */
+  --brand-hairline: rgba(255, 255, 255, 0.08);
+  --brand-hairline-strong: rgba(255, 255, 255, 0.16);
+  --brand-top-light: rgba(255, 255, 255, 0.06); /* 1px inset top highlight */
+
+  /* ── Text ─────────────────────────────────────────────────────────────── */
+  --brand-text: #f2f5fb;                    /* body on dark */
+  --brand-text-2: var(--brand-mist);        /* secondary on dark */
+  --brand-text-3: rgba(180, 190, 210, 0.62);/* faint / timestamps */
+  --brand-text-on-signal: var(--brand-ink); /* text on Signal Cyan fills */
+  --brand-link: var(--brand-signal);
+
+  /* ── Status (status only, never brand) ────────────────────────────────── */
+  --brand-ok: #34d399;
+  --brand-warn: #fbbf24;
+  --brand-err: #fb7185;
+
+  /* ── Spacing (4px base) ───────────────────────────────────────────────── */
+  --brand-space-1: 4px;
+  --brand-space-2: 8px;
+  --brand-space-3: 12px;
+  --brand-space-4: 16px;
+  --brand-space-5: 20px;
+  --brand-space-6: 24px;
+  --brand-space-8: 32px;
+  --brand-space-10: 40px;
+  --brand-space-12: 48px;
+
+  /* ── Radii ────────────────────────────────────────────────────────────── */
+  --brand-radius-sm: 6px;
+  --brand-radius-md: 10px;
+  --brand-radius-lg: 14px;
+  --brand-radius-xl: 20px;
+  --brand-radius-full: 999px;
+
+  /* ── Shadows & glow ───────────────────────────────────────────────────── */
+  --brand-shadow-card:
+    inset 0 1px 0 var(--brand-top-light),
+    0 1px 2px rgba(0, 0, 0, 0.35);
+  --brand-shadow-pop:
+    inset 0 1px 0 var(--brand-top-light),
+    0 24px 64px -24px rgba(0, 0, 0, 0.75);
+  --brand-shadow-stage:
+    inset 0 0 0 1px var(--brand-hairline),
+    0 32px 80px -32px rgba(0, 0, 0, 0.8);
+  --brand-glow-signal: 0 0 0 1px rgba(0, 208, 240, 0.35), 0 0 24px -6px rgba(0, 208, 240, 0.45);
+  --brand-focus-ring: 0 0 0 2px var(--brand-bg), 0 0 0 4px var(--brand-signal);
+
+  /* ── Typography ───────────────────────────────────────────────────────── */
+  --brand-font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --brand-font-mono: "DejaVu Sans Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --brand-text-xs: 11px;
+  --brand-text-sm: 13px;
+  --brand-text-md: 14px;
+  --brand-text-lg: 16px;
+  --brand-text-xl: 20px;
+  --brand-text-2xl: 28px;
+  --brand-leading-tight: 1.25;
+  --brand-leading: 1.5;
+  --brand-tracking-label: 0.13em; /* uppercase micro-labels */
+
+  /* ── Motion ───────────────────────────────────────────────────────────── */
+  --brand-motion-fast: 120ms;
+  --brand-motion: 180ms;
+  --brand-motion-slow: 320ms;
+  --brand-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --brand-ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+
+  /* ── Layers ───────────────────────────────────────────────────────────── */
+  --brand-z-panel: 60;
+  --brand-z-toast: 80;
+}
+
+/* ── Shared component CSS (things Tailwind utilities can't say) ─────────── */
+
+/* Live dot: a breathing ring while a run is streaming. */
+.brand-live-dot {
+  position: relative;
+}
+.brand-live-dot::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: var(--brand-radius-full);
+  border: 1px solid currentColor;
+  opacity: 0.45;
+  animation: brand-ping 1.8s var(--brand-ease-out) infinite;
+}
+@keyframes brand-ping {
+  0% { transform: scale(0.55); opacity: 0.5; }
+  70%, 100% { transform: scale(1.25); opacity: 0; }
+}
+
+/* Skeleton shimmer. */
+.brand-skeleton {
+  background: linear-gradient(
+    100deg,
+    rgba(255, 255, 255, 0.05) 40%,
+    rgba(255, 255, 255, 0.11) 50%,
+    rgba(255, 255, 255, 0.05) 60%
+  );
+  background-size: 200% 100%;
+  animation: brand-shimmer 1.6s linear infinite;
+}
+@keyframes brand-shimmer {
+  from { background-position: 120% 0; }
+  to { background-position: -80% 0; }
+}
+
+/* Spinner ring (LoadingState). */
+.brand-spinner {
+  border-radius: var(--brand-radius-full);
+  border: 2px solid rgba(0, 208, 240, 0.18);
+  border-top-color: var(--brand-signal);
+  animation: brand-spin 0.8s linear infinite;
+}
+@keyframes brand-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Toast entrance. */
+.brand-toast-in {
+  animation: brand-toast-in var(--brand-motion) var(--brand-ease-out) both;
+}
+@keyframes brand-toast-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Settings panel slide-in. */
+.brand-panel-in {
+  animation: brand-panel-in var(--brand-motion-slow) var(--brand-ease-out) both;
+}
+@keyframes brand-panel-in {
+  from { opacity: 0; transform: translateX(24px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.brand-scrim-in {
+  animation: brand-fade-in var(--brand-motion) ease-out both;
+}
+@keyframes brand-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Chat bar focus glow (layout-stable: shadow only, no size change). */
+.brand-chatbar {
+  transition:
+    box-shadow var(--brand-motion) var(--brand-ease-out),
+    background-color var(--brand-motion) var(--brand-ease-out),
+    border-color var(--brand-motion) var(--brand-ease-out);
+}
+.brand-chatbar:focus-within {
+  border-color: rgba(0, 208, 240, 0.45);
+  box-shadow: var(--brand-glow-signal), var(--brand-shadow-pop);
+}
+.brand-chatbar--drag {
+  border-color: rgba(255, 255, 255, 0.35);
+  background-color: var(--brand-surface-hover);
+}
+
+/* Reduced motion: brand animations become instant, never removed mid-state. */
+@media (prefers-reduced-motion: reduce) {
+  .brand-live-dot::after,
+  .brand-skeleton,
+  .brand-spinner,
+  .brand-toast-in,
+  .brand-panel-in,
+  .brand-scrim-in {
+    animation: none;
+  }
+  .brand-chatbar {
+    transition: none;
+  }
+}

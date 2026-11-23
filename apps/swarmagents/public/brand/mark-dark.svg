@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 330 200" role="img" aria-label="SwarmAgents mark">
+  <title>SwarmAgents mark — eye with terminal cursor pupil (for dark surfaces)</title>
+  <path d="M8 100 Q165 -45 322 100 Q165 245 8 100 Z" fill="none" stroke="#00D0F0" stroke-width="13" stroke-linejoin="round"/>
+  <rect x="138" y="79" width="54" height="42" rx="3" fill="#00D0F0"/>
+</svg>

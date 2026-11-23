@@ -3,7 +3,7 @@
 /**
  * App — SwarmAgents Unified Workspace
  *
- * Implements the mynow.online aesthetic (dark glass tokens, ambient aura,
+ * Implements the brand system (Void Navy / Signal Cyan, cursor-eye mark),
  * luminous borders, tactile ripples, and live telemetry) seamlessly wired to:
  *   1. Live VM Screen Frame (noVNC viewer, takeover, terminal view, reset).
  *   2. Real-time Run stream telemetry, tool narration, and Conversation.
@@ -18,7 +18,6 @@ import { DEFAULT_AGENT_CARD } from "./data";
 import type { LogEvent } from "./engine";
 import { usePersisted, useSessionPersisted } from "./store";
 import type { SwarmTask } from "../../lib/mcp-types";
-import { mascotStateForRun } from "../../components/mascot/frames";
 import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus } from "../../lib/client/vmStatus";
 import { derivePresence } from "../../lib/client/presence";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
@@ -382,14 +381,9 @@ export default function App() {
       data-testid="minimal-main-page"
       data-view={effectiveView}
     >
-      {/* mynow.online ambient background aura + grain */}
-      <div className="aura" />
-      <div className="grain" />
-
-      {/* Header with mascot, view switcher and telemetry indicator */}
+      {/* Header with brand lockup, view switcher and run indicator */}
       <Header
         title={session.title}
-        mascotState={mascotStateForRun({ busy, needsAttention })}
         onOpenHistory={() => setHistoryOpen(true)}
         onNewChat={handleNewChat}
         newChatDisabled={busy}
@@ -419,7 +413,13 @@ export default function App() {
 
       <main className="relative z-10 flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-3 sm:p-4" data-testid="workspace-main">
         <section className="mx-auto w-full max-w-3xl shrink-0" aria-label="Ask the agent">
-          <h1 className="mb-2 text-center text-lg font-semibold tracking-tight sm:text-2xl">What would you like to get done?</h1>
+          <div className="mb-3 flex justify-center">
+            <img src="/brand/mark-dark.svg" alt="" width={48} height={48} />
+          </div>
+          <h1 className="mb-2 text-center text-lg font-semibold tracking-tight sm:text-2xl">Give it a task. It has its own computer.</h1>
+          <p className="mx-auto mb-4 max-w-md text-center text-sm leading-relaxed text-[var(--mute)]">
+            One autonomous agent in your own persistent Linux VM. Describe the work, watch every step live, take over anytime. Free — bring your own model keys.
+          </p>
           {session.signedOut ? (
             <Notice
               tone="warn"

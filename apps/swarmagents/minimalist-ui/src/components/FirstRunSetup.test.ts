@@ -23,6 +23,13 @@ test("the first-run setup prompt leads to adding a key", async () => {
   assert.equal(countOf(html, 'data-testid="first-run-add-provider"'), 1, "one call to action");
   assert.match(html, />Add provider key</, "the button opens provider setup");
   assert.doesNotMatch(html, /State the outcome/, "the marketing hero is replaced, not stacked");
+  assert.equal(countOf(html, 'data-testid="first-run-steps"'), 1, "the setup steps render");
+  assert.match(html, /stored for your account only/, "step one says the key stays per-account");
+  assert.match(html, /Describe the outcome/, "step two sets the first-run expectation");
+  assert.match(html, /Watch, approve, take over/, "step three names the controls");
+  assert.equal(countOf(html, 'data-testid="first-run-starters"'), 1, "starter previews render");
+  assert.match(html, /Create a file and run a script/, "a concrete first task is previewed");
+  assert.match(html, /Fetch a web page and summarize it/, "the starter wording matches the hero");
 });
 
 test("with no provider the composer is blocked, so no run can error", async () => {

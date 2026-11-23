@@ -17,7 +17,7 @@ async function renderApp(options: BrowserStubOptions = {}): Promise<string> {
 
 const ALWAYS_IN_REACH = ["workspace-header", "open-history", "new-chat", "open-settings", "open-shortcuts", "composer-input", "composer-send"];
 
-test("the workspace opens on the computer beneath one composer", async () => {
+test("the workspace opens on the computer above one composer", async () => {
   const html = await renderApp();
 
   assert.match(tagOf(html, "minimal-main-page"), /data-view="screen"/);
@@ -32,7 +32,7 @@ test("the workspace opens on the computer beneath one composer", async () => {
   }
   assert.match(tagOf(html, "view-screen"), /aria-selected="true"/);
   assert.equal(countOf(html, 'data-testid="stage"'), 1);
-  assert.ok(html.indexOf('data-testid="composer-input"') < html.indexOf('data-testid="screen-frame"'));
+  assert.ok(html.indexOf('data-testid="screen-frame"') < html.indexOf('data-testid="composer-input"'));
   assert.match(tagOf(html, "composer-input"), /aria-label="Message the agent"/);
   assert.match(tagOf(html, "open-settings"), /aria-label="Settings"/);
 });
@@ -83,7 +83,7 @@ test("the approval prompt's layer is mounted in every view", async () => {
   }
 });
 
-test("the screen view puts the computer below the composer with its status", async () => {
+test("the screen view puts the computer above the composer with its status", async () => {
   for (const wide of [false, true]) {
     const html = await renderApp({ local: { "sa.view": "screen" }, wide });
 
@@ -126,12 +126,12 @@ test("nothing in the shell is a placeholder", async () => {
   }
 });
 
-test("the composer stays above the workspace at desktop and phone widths", async () => {
+test("the composer stays pinned below the workspace at desktop and phone widths", async () => {
   for (const wide of [false, true]) {
     const html = await renderApp({ local: { "sa.view": "screen" }, wide });
     assert.match(tagOf(html, "workspace-main"), /overflow-hidden/);
     assert.match(tagOf(html, "stage"), /overflow-y-auto/);
-    assert.ok(html.indexOf('data-testid="composer-input"') < html.indexOf('data-testid="stage"'));
+    assert.ok(html.indexOf('data-testid="stage"') < html.indexOf('data-testid="composer-input"'));
     assert.equal(countOf(html, 'data-testid="split-handle"'), 0);
   }
 });

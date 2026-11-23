@@ -91,6 +91,17 @@ test("head/tail fallback when no failure clues are found", () => {
   assert.equal(kept.length, 10 + 1 + 15);
 });
 
+test("fatal and crash lines are failure clues too", () => {
+  const noisy = [
+    ...Array.from({ length: 50 }, (_, i) => `  info line ${i}`),
+    "FATAL: worker crashed (exit 137) in lib/runtime/manager.ts:1024:3",
+    "  crash: segfault at 0xdeadbeef in app/server.ts:31:14",
+  ].join("\n");
+  const out = condenseLog(noisy);
+  assert.match(out, /FATAL: worker crashed/);
+  assert.match(out, /crash: segfault/);
+});
+
 test("garbage input returns a deterministic, safe fallback", () => {
   // A single enormous line (no newlines) must not throw and must be bounded.
   const huge = "x".repeat(500_000);

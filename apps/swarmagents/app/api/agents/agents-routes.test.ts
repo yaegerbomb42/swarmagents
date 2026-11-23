@@ -274,6 +274,16 @@ test("containsSecretValue fails closed on deeply nested (secret-free) trees", ()
   assert.equal(containsSecretValue(deep), true);
 });
 
+test("containsSecretValue fails closed on circular references", () => {
+  // A circular tree must not recurse forever or silently skip the cycle.
+  const cyclic: Record<string, unknown> = { a: "hello" };
+  cyclic.self = cyclic;
+  assert.equal(containsSecretValue(cyclic), true);
+  // A shared (non-circular) subtree is scanned, not mistaken for a cycle.
+  const shared = { note: "hello" };
+  assert.equal(containsSecretValue({ x: shared, y: shared }), false);
+});
+
 test("containsSecretValue catches the expanded credential patterns", () => {
   const secrets = [
     "Google key: AIzaSyA1234567890abcdefghijklmnopqrstuv",

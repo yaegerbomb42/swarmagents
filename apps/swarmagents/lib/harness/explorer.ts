@@ -40,6 +40,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { z } from "zod";
 import type { ModelEndpointConfig } from "./decision-brain/types";
+export type { ModelEndpointConfig } from "./decision-brain/types";
 import { countWords } from "./decision-brain/schema";
 
 // Absolute git path from fixed, trusted dirs so we never rely on PATH

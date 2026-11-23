@@ -337,6 +337,7 @@ test("an unexpected failure inside runLens answers 500 without leaking internals
   assert.equal(body.error, "Lens failed.");
   assert.equal(JSON.stringify(body).includes("/tmp/internal/secret-path"), false);
   assert.equal(res.headers.get("cache-control"), "no-store");
+});
 
 test("rejects an oversized body with 413", async () => {
   const res = await POST(

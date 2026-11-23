@@ -129,8 +129,20 @@ async function fetchWithRetry(
   let lastErr: unknown;
   for (let attempt = 0; attempt <= opts.retries; attempt++) {
     let res: Response | undefined;
+    // A ref'd timer + controller, not AbortSignal.timeout(): the latter's
+    // timer is unref'd, so when a hung backend is the only pending work the
+    // process can exit before the timeout ever fires (seen as
+    // "cancelledByParent" subtests in CI's --test-concurrency=1 run).
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(new DOMException("search timed out", "TimeoutError")),
+      opts.timeoutMs,
+    );
+    const signal = init.signal
+      ? AbortSignal.any([init.signal, controller.signal])
+      : controller.signal;
     try {
-      res = await opts.fetchImpl(url, { ...init, signal: AbortSignal.timeout(opts.timeoutMs) });
+      res = await opts.fetchImpl(url, { ...init, signal });
       if (!retryable(res.status) || attempt === opts.retries) return res;
       await res.body?.cancel().catch(() => undefined);
     } catch (err) {
@@ -139,6 +151,8 @@ async function fetchWithRetry(
           ? new WebSearchError("timeout", `search timed out after ${opts.timeoutMs}ms`)
           : err;
       if (attempt === opts.retries) break;
+    } finally {
+      clearTimeout(timer);
     }
     await sleep(retryDelay(res, attempt, DEFAULT_BASE_DELAY_MS));
   }

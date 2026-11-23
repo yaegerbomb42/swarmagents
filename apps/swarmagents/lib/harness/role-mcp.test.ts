@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   BUILTIN_ROLES,
+  BUILTIN_ROLE_IDS,
   DEFAULT_ROLE_ID,
   DESKTOP_ROLE_MCP_SERVERS,
   ROLE_MCP_SERVER_REGISTRY,
@@ -127,6 +128,12 @@ test("roleCatalogJson lists built-ins with public shapes only", () => {
   assert.ok(ids.includes("frontend-engineer"));
   // No permissions (or other private fields) leak into the agent-visible catalog.
   for (const role of parsed.roles) assert.equal(role.permissions, undefined);
+});
+
+test("roleCatalogJson retains cloned built-in roles by id", () => {
+  const catalog = BUILTIN_ROLES.map((role) => ({ ...role }));
+  const parsed = JSON.parse(roleCatalogJson(catalog)) as { roles: Array<{ id: string }> };
+  assert.deepEqual(parsed.roles.map((role) => role.id), [...BUILTIN_ROLE_IDS]);
 });
 
 test("roleSeedFiles writes the server script, catalog and mcp config", () => {
@@ -424,8 +431,8 @@ test("chat mode (model cannot call tools) disables every tool and the MCP config
   assert.deepEqual(phase.allowedTools, []);
   assert.equal(phase.mcpConfigPath, "");
   const flags = roleArgvFlags(phase);
+  assert.deepEqual(flags.slice(0, 2), ["--tools", ""], "tools explicitly disabled");
   assert.ok(!flags.includes("--allowedTools"), "no empty --allowedTools flag");
   assert.ok(!flags.includes("--mcp-config"), "no empty --mcp-config flag");
-  assert.ok(!flags.some((flag) => flag.trim() === ""), "no empty argv entries");
   assert.ok(!flags.join(" ").includes("mcp__"));
 });

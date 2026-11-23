@@ -432,6 +432,28 @@ test("a per-role packer default applies when neither the run nor the runner sets
   assert.equal(events.filter((e) => e.type === "capability.changed").length, 1);
 });
 
+test("chat mode explicitly disables Claude tools without loading an MCP config", async () => {
+  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const runner = new ClaudeCodeRunner();
+  const outcome = await runner.run(
+    {
+      prompt: "Answer conversationally",
+      env: {},
+      vm,
+      rolePhase: { roleId: "chat", allowedTools: [], mcpConfigPath: "", toolsDisabled: true },
+    },
+    () => {},
+  );
+
+  assert.equal(outcome.exitCode, 0);
+  const { cmd } = vm.calls[0];
+  const toolsIndex = cmd.indexOf("--tools");
+  assert.notEqual(toolsIndex, -1);
+  assert.equal(cmd[toolsIndex + 1], "");
+  assert.ok(!cmd.includes("--allowedTools"));
+  assert.ok(!cmd.includes("--mcp-config"));
+});
+
 test("a per-run packer override wins over the runner setting and role default", async () => {
   const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
   const runner = new ClaudeCodeRunner({ contextPacker: "l1", roleContextPackers: { coder: "l1" } });

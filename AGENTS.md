@@ -8,8 +8,27 @@ Production is built on the VPS from `main`. Merge first, then deploy.
    Other actions: `status`, `rollback`, `logs`, `cleanup`.
 2. Or from a shell: `export DEPLOY_HOST=<host> DEPLOY_SSH_KEY=<key path>` then `./deploy.sh deploy|status|rollback|logs`.
 3. Secrets (never in the repo): `DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_KNOWN_HOSTS`. See `docs/deploy/README.md`.
-4. Gates (from `apps/swarmagents`): `npm ci`, `npm run typecheck`, `npm run test:unit`, `npm run lint`, `npm run build`.
+4. Gates (from `apps/swarmagents`): `npm ci`, `npm run typecheck`, `npm run test:full`, `npm run lint`, `npm run build`.
 5. Rollback: Deploy workflow with `rollback`. Status: same workflow with `status`.
+
+## Testing
+
+Run from `apps/swarmagents`. Tests use Node's built-in runner (`tsx --test`).
+
+```bash
+npm run test:fast     # unit tier: lib + components + minimalist-ui + swarm-node (~30s)
+npm run test:full     # everything including API-route tests — the merge gate
+npm run test:affected # run ONLY tests affected by your change (impact-based)
+npm run test:coverage # full suite with a coverage summary (lines/branches/funcs)
+```
+
+- **Prefer `test:affected` while iterating** — it runs only tests that touch your
+  changed files (the changed test itself, sibling tests, and tests that import a
+  changed module). Run the full suite before opening a PR.
+  `npx tsx scripts/test-affected.ts` (vs HEAD), `--rev origin/main`, or pass files:
+  `npx tsx scripts/test-affected.ts lib/foo.ts lib/bar.ts`.
+- `test:full` runs at `--test-concurrency=4` (~40s, was ~2.5min serial).
+- CI emits a JUnit XML artifact (`junit.xml`) for every run.
 
 ## Playtest
 

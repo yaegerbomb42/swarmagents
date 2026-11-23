@@ -614,7 +614,7 @@ test("defaultOracleChecks: tsc always, eslint on changed sources, tsx --test on 
   const ctx = { cwd: "/s/app", scratchDir: "/s", changedFiles: ["lib/a.ts", "README.md"], affectedTests: ["lib/a.test.ts"] };
   assert.deepEqual(tsc.command(ctx), ["npx", "--no-install", "tsc", "--noEmit", "--incremental", "false"]);
   assert.deepEqual(lint.command(ctx), ["npx", "--no-install", "eslint", "--no-warn-ignored", "--", "lib/a.ts"]);
-  assert.deepEqual(tests.command(ctx), ["env", "SWARM_HOME=/tmp/h", "npx", "--no-install", "tsx", "--test", "--test-concurrency=1", "lib/a.test.ts"]);
+  assert.deepEqual(tests.command(ctx), ["env", "SWARM_HOME=/tmp/h", "npx", "--no-install", "tsx", "--test", "--test-concurrency=4", "lib/a.test.ts"]);
   assert.equal(lint.command({ ...ctx, changedFiles: ["docs/x.md"] }), null);
   assert.equal(tests.command({ ...ctx, affectedTests: [] }), null);
 });

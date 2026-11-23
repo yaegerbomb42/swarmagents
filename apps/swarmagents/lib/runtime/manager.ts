@@ -1486,6 +1486,11 @@ export class RuntimeManager {
     // No recorded group: there is nothing safe to target, so do nothing
     // rather than fall back to a broad kill.
     if (!pgidFile) return;
+    // If the VM is no longer live (stopped/evicted to free capacity), its
+    // process group is already gone — there is nothing to reap, and
+    // re-ensuring it would re-commit a VM slot and block a queued successor
+    // forever. Only ensure the VM when it is still running.
+    if (!this.vm.liveVmUserIds().includes(userId)) return;
     try {
       await this.vm.ensure(userId);
       await this.vm.exec(userId, buildPgidKillCommand(pgidFile), {

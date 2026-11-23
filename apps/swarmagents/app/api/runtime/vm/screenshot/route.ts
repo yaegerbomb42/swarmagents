@@ -51,7 +51,7 @@ export async function GET(req: NextRequest) {
     const exec = await vm.exec(
       user,
       ["scrot", "-o", screenshotPath],
-      { lane: "control", env: { DISPLAY: DESKTOP_DISPLAY } },
+      { env: { DISPLAY: DESKTOP_DISPLAY } },
     );
     if (exec.exitCode !== 0) {
       return NextResponse.json({ error: "Desktop capture failed." }, { status: 404 });
@@ -63,7 +63,7 @@ export async function GET(req: NextRequest) {
       // Delete the frame inside the VM immediately after the read, even if
       // the read failed. Best effort: a VM that just died has nothing to
       // clean up, and the frame must never break the response.
-      await vm.exec(user, ["rm", "-f", "--", screenshotPath], { lane: "control" }).catch(() => undefined);
+      await vm.exec(user, ["rm", "-f", "--", screenshotPath]).catch(() => undefined);
     }
     if (file.content.byteLength === 0) {
       return NextResponse.json({ error: "Empty capture." }, { status: 404 });

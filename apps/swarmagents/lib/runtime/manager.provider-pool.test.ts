@@ -26,7 +26,7 @@ class KeyFailoverDriver extends FakeVmDriver {
     if (key === BAD_KEY) {
       const line = "401 invalid api key";
       opts?.onStderr?.(`${line} ${key}\n`);
-      return { exitCode: 1, stderr: `${line} ${key}` };
+      return { exitCode: 1 };
     }
     const lines = [
       { type: "system", subtype: "init", session_id: "sess_pool_ok", model: "claude-sonnet-4-5" },

@@ -75,6 +75,16 @@ import {
   packSystemSections,
   systemSectionsFrom,
 } from "./context/system-packer";
+import {
+  ProgressWatchdog,
+  errorSignature,
+  extractDiscoveredSymbols,
+  isMutatingTool,
+  isReadTool,
+  vmExecGitRunner,
+  type ProgressWatchdogOptions,
+  type TurnSignal,
+} from "./progress-watchdog";
 
 export interface ClaudeCodeRunnerOptions {
   /** Path to the claude binary. Defaults to "claude" (or $CLAUDE_BIN). */
@@ -110,6 +120,18 @@ export interface ClaudeCodeRunnerOptions {
    * the runner cannot rewind the CLI).
    */
   decisionBrain?: DecisionBrainHooksOptions;
+  /**
+   * Optional ProgressWatchdog loop monitoring. Nothing is constructed or
+   * called unless `enabled` is true, so the default run path is untouched.
+   * The watchdog observes each tool result, checkpoints the working tree
+   * every few mutating turns, and halts with a distinct rewind marker
+   * when a failure pathology fires (a manager-level re-drive — the
+   * runner cannot rewind the CLI). Test counts and diff hashes are not
+   * visible to the runner, so its verdicts cover exact spin and read
+   * paralysis; the oracle/manager feed the richer signals via the same
+   * observe() API for diff thrash and monotonic regression.
+   */
+  progressWatchdog?: ProgressWatchdogOptions;
 }
 
 /** What buildArgv applied when the L1 packer ran, for the telemetry line. */
@@ -279,6 +301,7 @@ export class ClaudeCodeRunner {
   private readonly roleContextPackers: Record<string, unknown> | undefined;
   private readonly systemOneOptions: SystemOneHooksOptions | undefined;
   private readonly decisionBrainOptions: DecisionBrainHooksOptions | undefined;
+  private readonly progressWatchdogOptions: ProgressWatchdogOptions | undefined;
 
   constructor(options: ClaudeCodeRunnerOptions = {}) {
     this.bin = options.bin ?? process.env.CLAUDE_BIN ?? "claude";
@@ -286,6 +309,7 @@ export class ClaudeCodeRunner {
     this.roleContextPackers = options.roleContextPackers;
     this.systemOneOptions = options.systemOne;
     this.decisionBrainOptions = options.decisionBrain;
+    this.progressWatchdogOptions = options.progressWatchdog;
   }
 
   /**
@@ -312,6 +336,23 @@ export class ClaudeCodeRunner {
       brainOptions && resolveDecisionBrainSettings(brainOptions.settings).enabled
         ? new DecisionBrainHooks(brainOptions)
         : undefined;
+    // The ProgressWatchdog is inert on the same terms. When enabled it
+    // observes each tool result (via the gate chain, like the Brain) and
+    // checkpoints the working tree in the VM; a pathology halts the run
+    // with a rewind marker for a manager-level re-drive. The git runner
+    // is VmExec-backed so snapshots run inside the VM at request.cwd;
+    // without a cwd there is nothing to snapshot and the watchdog is
+    // detection-only.
+    const watchdog =
+      this.progressWatchdogOptions?.enabled === true
+        ? new ProgressWatchdog({
+            ...this.progressWatchdogOptions,
+            cwd: this.progressWatchdogOptions.cwd ?? request.cwd,
+            git:
+              this.progressWatchdogOptions.git ??
+              (request.cwd ? vmExecGitRunner(request.vm) : undefined),
+          })
+        : undefined;
 
     let started = false;
     let lastSessionId: string | undefined;
@@ -332,6 +373,9 @@ export class ClaudeCodeRunner {
     let brainTurnCount = 0;
     let lastBrainToolResult: { ok: boolean; output: string } | null = null;
     let lastBrainError: string | null = null;
+    /** ProgressWatchdog loop state: tool_use id -> tool name, turn count. */
+    let watchdogTurnCount = 0;
+    const watchdogToolNames = new Map<string, string>();
 
     // Role switching: a validated set_role call aborts this invocation (via an
     // internal signal the manager never sees) so the run can resume with the
@@ -469,6 +513,7 @@ export class ClaudeCodeRunner {
               const name = typeof block.name === "string" ? block.name : "";
               const input = block.input;
               const toolId = typeof block.id === "string" ? block.id : undefined;
+              if (toolId) watchdogToolNames.set(toolId, name);
               emit({
                 type: "tool.call",
                 name,
@@ -765,6 +810,44 @@ export class ClaudeCodeRunner {
             // A successful tool result must not keep poisoning Decision Brain
             // snapshots with a stale stream-json error from earlier in the run.
             if (ok) firstErrorMessage = undefined;
+
+            // ProgressWatchdog: observe the result synchronously (pure
+            // detection, no I/O). A pathology halts the run with a rewind
+            // marker for a manager-level re-drive — the runner cannot
+            // rewind the CLI. Checkpointing is best-effort and async, so
+            // it never blocks the stream.
+            if (watchdog) {
+              const resultId = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined;
+              const toolName = resultId ? watchdogToolNames.get(resultId) : undefined;
+              if (resultId) watchdogToolNames.delete(resultId);
+              watchdogTurnCount += 1;
+              const signal: TurnSignal = {
+                turn: watchdogTurnCount,
+                toolName,
+                readOnly: isReadTool(toolName),
+                edited: isMutatingTool(toolName),
+                ...(ok ? {} : { errorSignature: errorSignature(output.slice(0, 2000)) }),
+                ...(isReadTool(toolName)
+                  ? { symbolsDiscovered: extractDiscoveredSymbols(output.slice(0, 2000)) }
+                  : {}),
+              };
+              const verdict = watchdog.observe(signal);
+              void watchdog.maybeCheckpoint(signal).catch(() => {});
+              if (verdict.action !== "none" && haltedReason === null) {
+                const checkpoint = verdict.checkpoint?.treeHash;
+                const disposition =
+                  verdict.action === "rewind" && checkpoint
+                    ? `rewind to ${checkpoint}`
+                    : verdict.action === "rewind"
+                      ? "no checkpoint to rewind to, escalate"
+                      : "rewind cap reached, escalate";
+                haltedReason =
+                  `progress watchdog: ${verdict.pathology}; ${disposition}` +
+                  ` (rewinds ${verdict.rewindsUsed}/${verdict.maxRewinds})` +
+                  (verdict.failedHypotheses.length ? `; ${verdict.failedHypotheses.join(" ")}` : "");
+                emit({ type: "tool.blocked", name: toolName ?? "unknown", reason: haltedReason });
+              }
+            }
           }
           break;
         }

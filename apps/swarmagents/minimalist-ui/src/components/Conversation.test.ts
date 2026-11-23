@@ -35,6 +35,20 @@ test("a fresh empty chat shows exactly three clickable starter prompts", async (
   }
 });
 
+test("the watch button reads 'Watch computer' and no 'Screen' label remains", async () => {
+  const source = readFileSync(fileURLToPath(new URL("./Conversation.tsx", import.meta.url)), "utf8");
+  assert.ok(source.includes("Watch computer"), "the button label is 'Watch computer'");
+  assert.ok(!source.includes("Watch screen"), "the old 'Watch screen' label is gone");
+  // User-visible text only: comments and internal identifiers
+  // (onWatchScreen, data-testid="watch-screen") are not labels.
+  const visible = source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|\s)\/\/.*$/gm, "$1")
+    .replace(/onWatchScreen/g, "")
+    .replace(/watch-screen/g, "");
+  assert.ok(!visible.includes("Screen"), "no user-visible 'Screen' label remains");
+});
+
 test("an existing thread shows no starter prompts", async () => {
   const html = await renderConversation(makeSession({ turns: [makeEntry()] }));
   assert.equal(countOf(html, 'data-testid="starter-prompt"'), 0, "no starters on an existing thread");

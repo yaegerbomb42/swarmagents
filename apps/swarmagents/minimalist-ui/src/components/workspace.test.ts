@@ -382,6 +382,8 @@ test("the live turn shows what the agent is doing, with a way to its screen", as
   assert.match(html, /Running npm test/);
   assert.match(html, />Running</);
   assert.equal(countOf(html, 'data-testid="watch-screen"'), 1, "jump to this run's screen");
+  assert.match(html, />Watch computer</, "the button reads 'Watch computer'");
+  assert.doesNotMatch(html, /Watch screen/, "no 'Watch screen' label remains");
   assert.equal(countOf(html, 'data-testid="run-report"'), 0, "no report until the run ends");
 });
 

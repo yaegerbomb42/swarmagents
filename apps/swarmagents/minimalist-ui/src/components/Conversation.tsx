@@ -550,7 +550,7 @@ const Turn = React.memo(function Turn({
             {onWatchScreen && meta.active && phase !== "queued" && phase !== "starting" && (
               <Button size="sm" variant="ghost" onClick={onWatchScreen} data-testid="watch-screen">
                 <MonitorPlay className="h-3.5 w-3.5" aria-hidden />
-                Watch screen
+                Watch computer
               </Button>
             )}
             {!live && !meta.active && (

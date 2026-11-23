@@ -37,45 +37,63 @@ after(async () => {
 const skip = mode() === "prod" ? "prod mode is read-only" : false;
 const PHONE = { width: 390, height: 844 };
 
-/** Every button, link and field on the page has a name a screen reader can say. */
-const UNNAMED_CONTROLS = `(() => {
-  const visible = (el) => {
+/**
+ * Every button, link and field on the page has a name a screen reader can say.
+ *
+ * A plain function declaration with no nested functions: tsx injects a
+ * `__name` helper into arrow functions assigned to consts inside the
+ * evaluated function, and the serialized source then throws
+ * `__name is not defined` when Playwright evaluates it in the page.
+ * (Strings are no better: the app's CSP blocks the eval Playwright uses
+ * for string predicates.)
+ */
+function unnamedControlsFn(): string[] {
+  const out: string[] = [];
+  const els = document.querySelectorAll("button, a[href], input:not([type=hidden]), textarea, select");
+  for (let i = 0; i < els.length; i++) {
+    const el = els[i];
     const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== "hidden";
-  };
-  const named = (el) => {
+    if (!(rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== "hidden")) continue;
     const label = el.getAttribute("aria-label") || el.getAttribute("title") || "";
-    if (label.trim()) return true;
-    if (el.getAttribute("aria-labelledby")) return true;
-    if ((el.textContent || "").trim()) return true;
-    if (el.labels && el.labels.length > 0) return true;
-    return Boolean(el.getAttribute("placeholder"));
-  };
-  return Array.from(document.querySelectorAll("button, a[href], input:not([type=hidden]), textarea, select"))
-    .filter((el) => visible(el) && !named(el))
-    .map((el) => el.outerHTML.slice(0, 160));
-})()`;
+    let named = false;
+    if (label.trim()) named = true;
+    else if (el.getAttribute("aria-labelledby")) named = true;
+    else if ((el.textContent || "").trim()) named = true;
+    else {
+      const withLabels = el as HTMLElement & { labels?: { length: number } | null };
+      if (withLabels.labels && withLabels.labels.length > 0) named = true;
+      else if (el.getAttribute("placeholder")) named = true;
+    }
+    if (!named) out.push(el.outerHTML.slice(0, 160));
+  }
+  return out;
+}
 
-// Page scripts are passed as strings: the test runner's compiler adds a helper
-// to nested functions that does not exist inside the page.
+// Page functions are passed as plain self-contained functions, never strings:
+// the app's CSP blocks the eval Playwright uses for string predicates, and a
+// function that closes over test-file scope would not survive serialization
+// into the page anyway.
 function unnamedControls(page: Page): Promise<string[]> {
-  return page.evaluate(UNNAMED_CONTROLS) as Promise<string[]>;
+  return page.evaluate(unnamedControlsFn) as Promise<string[]>;
 }
 
 /** How far the page scrolls sideways (0 when it does not). */
 function overflowX(page: Page): Promise<number> {
-  return page.evaluate("document.documentElement.scrollWidth - window.innerWidth") as Promise<number>;
+  return page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth) as Promise<number>;
 }
 
 function waitForFocus(page: Page, testId: string): Promise<unknown> {
   return page.waitForFunction(
-    `document.activeElement && document.activeElement.getAttribute("data-testid") === ${JSON.stringify(testId)}`,
-    null,
+    (wanted) => {
+      const el = document.activeElement;
+      return el !== null && el.getAttribute("data-testid") === wanted;
+    },
+    testId,
     { timeout: 5_000 },
   );
 }
 
-const NO_STOP_BUTTON = `!document.querySelector('[data-testid="stop-run"]')`;
+const NO_STOP_BUTTON = (): boolean => !document.querySelector('[data-testid="stop-run"]');
 
 async function setApprovals(page: Page, mode: "auto" | "ask"): Promise<void> {
   await page.getByTestId("open-settings").click();
@@ -103,7 +121,10 @@ test("flow A+B: a message becomes a run, the screen opens, the reply and report 
     assert.equal(await page.getByTestId("composer-input").inputValue(), "", "the box emptied");
 
     // The run is announced in the header with Stop, and the screen opens beside the chat.
-    await page.getByTestId("stop-run").waitFor({ state: "visible", timeout: 15_000 });
+    // 30s, not 15s: on a cold server (or a loaded shared runner) the fake
+    // VM takes a while to pick the run up, and the message is already in the
+    // log — the run itself just has not started yet.
+    await page.getByTestId("stop-run").waitFor({ state: "visible", timeout: 30_000 });
     await page.getByTestId("screen-frame").waitFor({ state: "visible", timeout: 15_000 });
     assert.equal(await page.getByTestId("minimal-main-page").getAttribute("data-view"), "screen");
     await page.getByTestId("screen-status-pill").waitFor({ state: "visible" });
@@ -152,7 +173,7 @@ test("flow A: Stop ends the run from every view, even when pressed before the se
   // The question transcript holds the run open until it is answered: a run that cannot finish on its own.
   const prompt = `Before you start, ${FAKE_CLAUDE_QUESTION_TRIGGER} should we use?`;
   const result = await runPageTest(testName, async ({ page, context }) => {
-    await openWorkspace(page, context);
+    await openWorkspace(page, context, { devMode: true });
     await startNewChat(page);
 
     // Stop is on screen the moment a message is sent. Pressed right then,
@@ -160,7 +181,7 @@ test("flow A: Stop ends the run from every view, even when pressed before the se
     await sendMessage(page, prompt);
     await page.getByTestId("stop-run").click();
     await waitForLastTurn(page, "cancelled", 30_000);
-    await page.waitForFunction(NO_STOP_BUTTON, null, { timeout: 15_000 });
+    await page.waitForFunction(NO_STOP_BUTTON, undefined, { timeout: 15_000 });
 
     // A run that is under way: Stop is in reach from every view.
     await sendMessage(page, prompt);
@@ -173,7 +194,7 @@ test("flow A: Stop ends the run from every view, even when pressed before the se
 
     await page.getByTestId("stop-run").click();
     await waitForLastTurn(page, "cancelled", 30_000);
-    await page.waitForFunction(NO_STOP_BUTTON, null, { timeout: 15_000 });
+    await page.waitForFunction(NO_STOP_BUTTON, undefined, { timeout: 15_000 });
     assert.equal(await page.getByTestId("run-indicator").getAttribute("data-phase"), "cancelled");
     await page.getByTestId("run-indicator").getByText("Stopped").waitFor({ state: "visible" });
 
@@ -208,7 +229,7 @@ test("flow A: a question from the agent is answered in place and the run continu
 test("flow A: with approvals on, the prompt is in front of every view and Deny / Approve act in place", { skip }, async (t) => {
   const testName = "workspace: approval prompt";
   const result = await runPageTest(testName, async ({ page, context }) => {
-    await openWorkspace(page, context);
+    await openWorkspace(page, context, { devMode: true });
     await startNewChat(page);
     await setApprovals(page, "ask");
 
@@ -231,8 +252,8 @@ test("flow A: with approvals on, the prompt is in front of every view and Deny /
       // Tab moves into the prompt.
       await page.keyboard.press("Tab");
       await page.waitForFunction(
-        `Boolean(document.activeElement && document.activeElement.closest('[role="alertdialog"]'))`,
-        null,
+        () => Boolean(document.activeElement && document.activeElement.closest('[role="alertdialog"]')),
+        undefined,
         { timeout: 5_000 },
       );
       await captureView(page, testName, "1-asked-on-screen");
@@ -244,18 +265,18 @@ test("flow A: with approvals on, the prompt is in front of every view and Deny /
 
       await dialog.getByRole("button", { name: /^Deny/ }).click();
       await dialog.waitFor({ state: "hidden", timeout: 15_000 });
-      await page.waitForFunction(NO_STOP_BUTTON, null, { timeout: 60_000 });
+      await page.waitForFunction(NO_STOP_BUTTON, undefined, { timeout: 60_000 });
       assert.equal(await page.locator('[role="alertdialog"]').count(), 0);
       await captureView(page, testName, "3-denied");
 
       // Approve.
       await page.getByTestId("view-chat").click();
-      await page.waitForFunction(NO_STOP_BUTTON, null, { timeout: 60_000 });
+      await page.waitForFunction(NO_STOP_BUTTON, undefined, { timeout: 60_000 });
       await sendMessage(page, `Now really ${FAKE_CLAUDE_APPROVAL_TRIGGER}, I am sure.`);
       await dialog.waitFor({ state: "visible", timeout: 30_000 });
       await dialog.getByRole("button", { name: /Allow approval/ }).click();
       await dialog.waitFor({ state: "hidden", timeout: 15_000 });
-      await page.waitForFunction(NO_STOP_BUTTON, null, { timeout: 60_000 });
+      await page.waitForFunction(NO_STOP_BUTTON, undefined, { timeout: 60_000 });
       await captureView(page, testName, "4-approved");
     } finally {
       await page.getByTestId("view-chat").click().catch(() => undefined);
@@ -269,7 +290,7 @@ test("flow C: a task is added to the board, run on the VM, and submitted for rev
   const testName = "workspace: board task to review";
   const title = `Fix the login redirect ${Date.now()}`;
   const result = await runPageTest(testName, async ({ page, context }) => {
-    await openWorkspace(page, context);
+    await openWorkspace(page, context, { devMode: true });
     await startNewChat(page);
     await page.getByTestId("view-board").click();
     const board = page.getByTestId("board-panel");
@@ -318,7 +339,7 @@ test("phone: the same three flows fit a 390px screen without sideways scrolling"
   const result = await runPageTest(
     testName,
     async ({ page, context }) => {
-      await openWorkspace(page, context);
+      await openWorkspace(page, context, { devMode: true });
       await startNewChat(page);
       assert.ok((await overflowX(page)) <= 0, "no sideways scroll on the new chat");
       await captureView(page, testName, "1-new-chat");
@@ -362,7 +383,7 @@ test("phone: the same three flows fit a 390px screen without sideways scrolling"
 test("keyboard: the composer is one shortcut away and the sheets close with Escape", { skip }, async (t) => {
   const testName = "workspace: keyboard";
   const result = await runPageTest(testName, async ({ page, context }) => {
-    await openWorkspace(page, context);
+    await openWorkspace(page, context, { devMode: true });
     await page.getByTestId("view-board").click();
     await page.keyboard.press("ControlOrMeta+k");
     await waitForFocus(page, "composer-input");
@@ -385,8 +406,8 @@ test("keyboard: the composer is one shortcut away and the sheets close with Esca
     await page.getByTestId("settings-sheet").waitFor({ state: "visible" });
     assert.equal(await page.getByTestId("settings-tab-providers").getAttribute("aria-selected"), "true");
     await page.waitForFunction(
-      `Boolean(document.activeElement && document.activeElement.closest('[data-testid="settings-sheet"]'))`,
-      null,
+      () => Boolean(document.activeElement && document.activeElement.closest('[data-testid="settings-sheet"]')),
+      undefined,
       { timeout: 5_000 },
     );
     await captureView(page, testName, "settings-providers");

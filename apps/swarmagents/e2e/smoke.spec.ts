@@ -23,7 +23,7 @@ test("smoke: API health and swarm-board", async () => {
 
 test("smoke: home UI workspace", async (t) => {
   const result = await runPageTest("smoke: home UI workspace", async ({ page, context, consoleErrors }) => {
-    await openWorkspace(page, context);
+    await openWorkspace(page, context, { devMode: true });
 
     const input = page.locator("textarea").first();
     assert.equal(await input.isVisible(), true, "expected the prompt input bar to be visible");

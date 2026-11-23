@@ -121,7 +121,7 @@ test(
         await input.fill("check the kernel with uname");
         await input.focus();
         await input.press("Enter");
-        await page.getByText(/run started ·/).first().waitFor({ state: "visible", timeout: 30_000 });
+        await page.getByText(/run started/).first().waitFor({ state: "visible", timeout: 30_000 });
         await page.getByTestId("conversation-log").getByText(FAKE_CLAUDE_ASSISTANT_TEXT).first().waitFor({ state: "visible", timeout: 30_000 });
         // Let the run finish so the next spec's workspace is not restored in
         // an active state.

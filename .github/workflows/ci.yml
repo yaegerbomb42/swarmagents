@@ -44,9 +44,9 @@ jobs:
         working-directory: apps/swarmagents
         run: npm ci
 
-      # Typecheck, unit tests, lint — the same gates as scripts/test-all.sh
-      # minus the Docker-dependent build/boot/e2e stages, which cannot run
-      # on a stock ubuntu-latest runner.
+      # Typecheck, unit tests, lint, build. The boot + e2e half of
+      # scripts/test-all.sh runs in the e2e job below (fake VM driver,
+      # no Docker needed) so a flaky unit failure cannot hide e2e signal.
       - name: Typecheck
         working-directory: apps/swarmagents
         run: npm run typecheck
@@ -76,3 +76,55 @@ jobs:
       - name: Build
         working-directory: apps/swarmagents
         run: npm run build
+
+  e2e:
+    name: E2E (boot + specs, fake VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/swarmagents/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/swarmagents
+        run: npm ci
+
+      # The specs drive a real Chromium via playwright-core; the runner
+      # image ships no browser. --with-deps installs the system
+      # libraries headless Chromium needs (passwordless sudo on hosted
+      # runners).
+      - name: Install Chromium for e2e
+        working-directory: apps/swarmagents
+        run: npx playwright-core install --with-deps chromium
+
+      # The byoc spec starts a real swarm-node in --host-mode, whose desktop
+      # needs Xvfb + x11vnc + websockify; without them the node reports no
+      # desktop and the spec fails at the desktop step.
+      - name: Install host-desktop packages for BYOC e2e
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc websockify
+
+      - name: Build
+        working-directory: apps/swarmagents
+        run: npm run build
+
+      # Boots the built app on a free port (fake VM driver, temp
+      # SWARM_HOME) and runs the specs against it. Typecheck/unit
+      # already ran in the gates job, so this job does not repeat them.
+      - name: Boot + E2E
+        working-directory: apps/swarmagents
+        env:
+          SCREENSHOT_DIR: ${{ github.workspace }}/e2e-screenshots
+        run: scripts/boot-and-e2e.sh
+
+      - name: Upload e2e screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: e2e-screenshots
+          if-no-files-found: ignore

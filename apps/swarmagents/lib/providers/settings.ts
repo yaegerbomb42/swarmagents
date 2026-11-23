@@ -54,6 +54,11 @@ export interface UserSettings {
    * the historical behavior.
    */
   keySelectionMode?: KeySelectionMode;
+  /**
+   * How the user's VM is kept between tasks (VM persistence toggle).
+   * Absent = "persistent", the historical behavior.
+   */
+  vmPersistenceMode?: VmPersistenceMode;
 }
 
 /**
@@ -92,6 +97,47 @@ export function keySelectionModeFor(settings: UserSettings): KeySelectionMode {
   return isKeySelectionMode(settings.keySelectionMode)
     ? settings.keySelectionMode
     : DEFAULT_KEY_SELECTION_MODE;
+}
+
+/**
+ * VM persistence mode: what happens to the user's per-account VM between
+ * tasks.
+ * - "fresh-per-task": the VM is reset (destroyed, volume wiped) before each
+ *   task starts, so every task begins on a clean machine. Fork seeds keep
+ *   their checkpoint workspace (the restore runs right after ensure).
+ * - "persistent": the VM and its /workspace volume survive across tasks;
+ *   the idle sweeper may hibernate (stop) it, and the next task restarts it
+ *   with files intact. The default.
+ * - "terminate-at-project-end": like "persistent" while work remains, but
+ *   when a run finishes and no active or queued run is left for the user
+ *   (the project has no more work), the VM is stopped immediately instead
+ *   of waiting for the idle sweeper. The volume is kept, so a later task
+ *   restarts with files intact.
+ */
+export type VmPersistenceMode = "fresh-per-task" | "persistent" | "terminate-at-project-end";
+
+/** Every valid VM persistence mode, for validation and UI lists. */
+export const VM_PERSISTENCE_MODES: readonly VmPersistenceMode[] = [
+  "fresh-per-task",
+  "persistent",
+  "terminate-at-project-end",
+];
+
+/** The VM persistence mode when a user has not chosen one. */
+export const DEFAULT_VM_PERSISTENCE_MODE: VmPersistenceMode = "persistent";
+
+/** Is this value a valid VM persistence mode? */
+export function isVmPersistenceMode(value: unknown): value is VmPersistenceMode {
+  return (
+    value === "fresh-per-task" || value === "persistent" || value === "terminate-at-project-end"
+  );
+}
+
+/** The VM persistence mode for one user's settings (absent = persistent). */
+export function vmPersistenceModeFor(settings: UserSettings): VmPersistenceMode {
+  return isVmPersistenceMode(settings.vmPersistenceMode)
+    ? settings.vmPersistenceMode
+    : DEFAULT_VM_PERSISTENCE_MODE;
 }
 
 /** Per-user token-efficiency controls; all opt-in, all default off. */
@@ -241,6 +287,7 @@ export function parseUserSettings(raw: unknown): UserSettings {
   const tokenEfficiency = parseTokenEfficiency(raw.tokenEfficiency);
   if (tokenEfficiency !== undefined) out.tokenEfficiency = tokenEfficiency;
   if (isKeySelectionMode(raw.keySelectionMode)) out.keySelectionMode = raw.keySelectionMode;
+  if (isVmPersistenceMode(raw.vmPersistenceMode)) out.vmPersistenceMode = raw.vmPersistenceMode;
   return out;
 }
 

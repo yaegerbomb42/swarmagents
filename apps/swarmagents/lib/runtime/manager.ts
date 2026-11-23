@@ -39,7 +39,13 @@ import {
 } from "../providers";
 import { routerProviders, userCooldownFilePath, userProvidersSignature } from "../providers/store";
 import { isAnthropicStyle } from "../providers/adapters";
-import { keySelectionModeFor, readUserSettings, systemPackerOptionsFor } from "../providers/settings";
+import {
+  keySelectionModeFor,
+  readUserSettings,
+  systemPackerOptionsFor,
+  vmPersistenceModeFor,
+} from "../providers/settings";
+import { shouldResetVmAtRunStart, shouldStopVmAtRunEnd } from "./vm-persistence";
 import { RunProviderPool, runWithPool } from "../providers/run-pool";
 import type { AttemptOutcome, RunAttempt } from "../providers/run-pool";
 import {
@@ -2410,6 +2416,16 @@ export class RuntimeManager {
     this.touchActivity(active);
     const ensureStartedAt = Date.now();
     try {
+      // VM persistence toggle (spec 3d): "fresh-per-task" resets the VM
+      // (destroy + wipe volume) before each task starts. Fork seeds keep
+      // their checkpoint workspace — see shouldResetVmAtRunStart.
+      if (
+        shouldResetVmAtRunStart(vmPersistenceModeFor(readUserSettings(userId)), {
+          seedSnapshotLabel: active.seedSnapshotLabel,
+        })
+      ) {
+        await this.vm.reset(userId);
+      }
       await this.vm.ensure(userId);
       // Refuse new runs while the user is over their workspace disk quota
       // (SWARM_VM_DISK_QUOTA_MB): a run that fills the host disk is a
@@ -3870,7 +3886,24 @@ export class RuntimeManager {
     // draining the queue, so a crash during the next run cannot resurrect a
     // finished run or lose a queued one.
     this.persistState();
-    if (nextUserId !== undefined && drainQueue) this.startNext(nextUserId);
+    if (nextUserId !== undefined && drainQueue) {
+      this.startNext(nextUserId);
+      // VM persistence toggle (spec 3d): "terminate-at-project-end" stops
+      // the VM as soon as the user's last run finishes and nothing is
+      // queued behind it, instead of waiting for the idle sweeper. The
+      // volume is kept; the next task re-ensures. Shutdown finalizes pass
+      // drainQueue=false and never stop the VM (a deploy must not kill a
+      // VM a resumed run still needs).
+      const st = this.users.get(nextUserId);
+      if (
+        st &&
+        shouldStopVmAtRunEnd(vmPersistenceModeFor(readUserSettings(nextUserId)), {
+          hasRemainingWork: st.active !== null || st.queue.length > 0 || st.shellRuns.size > 0,
+        })
+      ) {
+        void this.vm.stop(nextUserId).catch(() => {});
+      }
+    }
   }
 }
 

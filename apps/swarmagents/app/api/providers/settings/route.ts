@@ -15,11 +15,14 @@ import {
   KEY_SELECTION_MODES,
   MAX_SYSTEM_BUDGET_TOKENS,
   MIN_SYSTEM_BUDGET_TOKENS,
+  VM_PERSISTENCE_MODES,
   codebaseContextInjectionEnabled,
   isKeySelectionMode,
+  isVmPersistenceMode,
   keySelectionModeFor,
   readUserSettings,
   updateUserSettings,
+  vmPersistenceModeFor,
 } from "@/lib/providers/settings";
 import type { TokenEfficiencySettings, UserSettings } from "@/lib/providers/settings";
 
@@ -42,6 +45,7 @@ export function GET(request: NextRequest) {
       ...settings,
       injectCodebaseContext: codebaseContextInjectionEnabled(settings),
       keySelectionMode: keySelectionModeFor(settings),
+      vmPersistenceMode: vmPersistenceModeFor(settings),
     },
     { headers: NO_STORE },
   );
@@ -90,6 +94,15 @@ export async function PUT(request: NextRequest) {
       );
     }
     patch.keySelectionMode = input.keySelectionMode;
+  }
+  if ("vmPersistenceMode" in input) {
+    if (!isVmPersistenceMode(input.vmPersistenceMode)) {
+      return NextResponse.json(
+        { error: `vmPersistenceMode must be one of: ${VM_PERSISTENCE_MODES.join(", ")}.` },
+        { status: 400 },
+      );
+    }
+    patch.vmPersistenceMode = input.vmPersistenceMode;
   }
   for (const field of ["perRunBudgetUsd", "perDayBudgetUsd"] as const) {
     if (!(field in input)) continue;

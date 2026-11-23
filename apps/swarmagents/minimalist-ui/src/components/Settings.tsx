@@ -559,6 +559,7 @@ function Providers({
   const [expanded, setExpanded] = useState<string | null>(null);
   const [preferFree, setPreferFree] = useState<boolean | null>(null);
   const [keySelectionMode, setKeySelectionMode] = useState<string | null>(null);
+  const [vmPersistenceMode, setVmPersistenceMode] = useState<string | null>(null);
   const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean | null>(null);
   const [decisionBrainEnabled, setDecisionBrainEnabled] = useState<boolean | null>(null);
   const [gitAutoCommit, setGitAutoCommit] = useState<boolean | null>(null);
@@ -593,6 +594,7 @@ function Providers({
             perRunBudgetUsd?: unknown;
             perDayBudgetUsd?: unknown;
             keySelectionMode?: unknown;
+            vmPersistenceMode?: unknown;
           };
           if (typeof body.preferFreeProviders === 'boolean') setPreferFree(body.preferFreeProviders);
           if (typeof body.injectCodebaseContext === 'boolean') setInjectCodebaseContext(body.injectCodebaseContext);
@@ -629,6 +631,15 @@ function Providers({
             setKeySelectionMode(body.keySelectionMode);
           } else {
             setKeySelectionMode('round-robin');
+          }
+          if (
+            body.vmPersistenceMode === 'fresh-per-task' ||
+            body.vmPersistenceMode === 'persistent' ||
+            body.vmPersistenceMode === 'terminate-at-project-end'
+          ) {
+            setVmPersistenceMode(body.vmPersistenceMode);
+          } else {
+            setVmPersistenceMode('persistent');
           }
         }
       } catch {
@@ -703,6 +714,24 @@ function Providers({
       setKeySelectionMode(v);
     } catch {
       setSettingsError('Could not save key selection mode.');
+    }
+  };
+
+  const setVmPersistenceModeRemote = async (v: string) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ vmPersistenceMode: v }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not save VM persistence mode.');
+        return;
+      }
+      setVmPersistenceMode(v);
+    } catch {
+      setSettingsError('Could not save VM persistence mode.');
     }
   };
 
@@ -900,6 +929,26 @@ function Providers({
                   <option value="fallback">Fallback</option>
                   <option value="random">Random</option>
                   <option value="tiered">Tiered</option>
+                </select>
+              </div>
+            )}
+            {vmPersistenceMode !== null && (
+              <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+                <div>
+                  <div className="text-xs text-white/85">VM persistence</div>
+                  <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                    What happens to your VM between tasks: fresh-per-task wipes it before each new task, persistent keeps files across tasks (hibernates when idle), terminate-at-project-end stops it as soon as no work is left (files kept).
+                  </div>
+                </div>
+                <select
+                  value={vmPersistenceMode}
+                  onChange={(e) => void setVmPersistenceModeRemote(e.target.value)}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  className="max-w-28 shrink-0 truncate rounded-lg bg-black/25 px-2 py-1 text-[10px] text-white/70 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
+                >
+                  <option value="persistent">Persistent</option>
+                  <option value="fresh-per-task">Fresh per task</option>
+                  <option value="terminate-at-project-end">Terminate at project end</option>
                 </select>
               </div>
             )}

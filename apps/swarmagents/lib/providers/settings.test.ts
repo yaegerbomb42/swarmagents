@@ -13,7 +13,9 @@ import { configureProviderStorePaths } from "./store";
 import {
   DEFAULT_USER_SETTINGS,
   isKeySelectionMode,
+  isVmPersistenceMode,
   keySelectionModeFor,
+  vmPersistenceModeFor,
   parseUserSettings,
   readUserSettings,
   updateUserSettings,
@@ -77,5 +79,21 @@ test("keySelectionMode parses valid modes, drops invalid ones, and defaults to r
   assert.equal(
     keySelectionModeFor({ preferFreeProviders: true, keySelectionMode: "chaos" as never }),
     "round-robin",
+  );
+});
+
+test("vmPersistenceMode parses valid modes, drops invalid ones, and defaults to persistent", () => {
+  for (const mode of ["fresh-per-task", "persistent", "terminate-at-project-end"] as const) {
+    assert.equal(isVmPersistenceMode(mode), true);
+    assert.equal(parseUserSettings({ vmPersistenceMode: mode }).vmPersistenceMode, mode);
+    assert.equal(vmPersistenceModeFor({ preferFreeProviders: true, vmPersistenceMode: mode }), mode);
+  }
+  assert.equal(isVmPersistenceMode("ephemeral"), false);
+  assert.equal(isVmPersistenceMode(42), false);
+  assert.equal(parseUserSettings({ vmPersistenceMode: "ephemeral" }).vmPersistenceMode, undefined);
+  assert.equal(vmPersistenceModeFor({ preferFreeProviders: true }), "persistent");
+  assert.equal(
+    vmPersistenceModeFor({ preferFreeProviders: true, vmPersistenceMode: "ephemeral" as never }),
+    "persistent",
   );
 });

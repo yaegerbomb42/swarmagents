@@ -30,7 +30,8 @@
     "playtest:login": "node scripts/playtest.mjs login",
     "playtest:seed": "node scripts/playtest.mjs seed",
     "playtest:check": "node scripts/playtest.mjs check",
-    "typecheck:tests": "tsc -p tsconfig.test.json --noEmit"
+    "typecheck:tests": "tsc -p tsconfig.test.json --noEmit",
+    "eval:dry-run": "tsx tools/eval-harness/run.ts --dry-run"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.7",

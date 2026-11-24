@@ -437,10 +437,20 @@ export class VmManager {
   async exec(userId: string, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
     let acquired = false;
     try {
-      this.acquireExecSlot(userId);
-      acquired = true;
+      // The reap's SIGKILL bypasses the slot limit (see bypassExecSlotLimit):
+      // it must never be starved by the processes it exists to kill.
+      if (!opts?.bypassExecSlotLimit) {
+        this.acquireExecSlot(userId);
+        acquired = true;
+      }
       this.touch(userId);
       return await this.withRead(userId, async () => {
+        // Atomic against a concurrent stop (we hold the read lock now): if a
+        // caller asked not to resurrect a stopped VM, fail rather than
+        // re-creating it and re-committing a freed capacity slot.
+        if (opts?.noResurrect && !this.cache.has(userId)) {
+          throw new Error(`vm not live (noResurrect): ${userId}`);
+        }
         const handle = await this.ensureLocked(userId);
         const result = await this.quotaGuardedExec(handle, cmd, opts);
         this.touch(userId);
@@ -560,8 +570,20 @@ export class VmManager {
   }
 
   /** Raw bytes of a file inside the user's VM, capped at maxBytes. */
-  async readFileBytes(userId: string, path: string, maxBytes: number): Promise<VmFileBytes> {
-    const handle = await this.ensure(userId);
+  async readFileBytes(
+    userId: string,
+    path: string,
+    maxBytes: number,
+    opts?: { noResurrect?: boolean },
+  ): Promise<VmFileBytes> {
+    // Same liveness policy as exec's noResurrect: if the caller asks not to
+    // resurrect a stopped VM, fail (after the lock) instead of re-ensuring.
+    const handle = opts?.noResurrect
+      ? await this.withRead(userId, async () => {
+          if (!this.cache.has(userId)) throw new Error(`vm not live (noResurrect): ${userId}`);
+          return this.ensureLocked(userId);
+        })
+      : await this.ensure(userId);
     return this.withRead(userId, async () => {
       if (!this.driver.readFileBytes) {
         throw new VmFileError("unsupported", "This VM driver cannot read raw file bytes.");
@@ -586,6 +608,24 @@ export class VmManager {
     // An ensure is in flight but has not produced a handle yet.
     if (this.cache.has(userId)) return { status: "creating" };
     return { status: "missing" };
+  }
+
+  /**
+   * True when this process has ensured (or is ensuring) the user's VM and
+   * has not stopped, hibernated, or reset it since — i.e. a container is
+   * up or coming up and holding host resources. Synchronous and
+   * driver-free: the cached handle promise is dropped on stop, hibernate
+   * (sweepIdle), and reset, so its presence is exactly the live signal.
+   * A hibernated VM (volume kept, container stopped) does not count as
+   * live. Used by the runtime manager's global concurrent-VM cap.
+   */
+  isVmLive(userId: string): boolean {
+    return this.cache.has(userId);
+  }
+
+  /** User ids whose VMs are currently live (see isVmLive). */
+  liveVmUserIds(): string[] {
+    return [...this.cache.keys()];
   }
 
   /** Stop the VM (keeps the volume for later). The next exec re-ensures it. */

@@ -35,7 +35,13 @@ class ScriptedFakeVm extends FakeVmDriver {
 }
 
 function install(driver: ScriptedFakeVm): RuntimeManager {
-  const manager = new RuntimeManager({ vm: new VmManager({ customDriver: driver }) });
+  // This suite verifies catalog completeness (every template starts), not
+  // capacity, so pin the concurrent-VM cap to unlimited instead of the
+  // default 4 (which would queue the 5th distinct template user → 202).
+  const manager = new RuntimeManager({
+    vm: new VmManager({ customDriver: driver }),
+    maxConcurrentVms: 0,
+  });
   setRuntimeManagerForTesting(manager);
   return manager;
 }

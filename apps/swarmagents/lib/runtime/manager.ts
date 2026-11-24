@@ -11,6 +11,13 @@
  * and the next queued run starts when the active one finishes. DELETE
  * cancels the active run and/or removes queued items. State is per-process;
  * server restarts lose it.
+ *
+ * A second, global invariant bounds host load: at most
+ * SWARM_MAX_CONCURRENT_VMS (default 4) user VMs may be live at once. A run
+ * that would need a fresh VM past the cap queues for capacity — with its
+ * place in line reported — and starts when a slot frees (a VM hibernates,
+ * is stopped, or is reset). A user whose VM is already live never waits
+ * for capacity.
  */
 
 import { randomUUID } from "node:crypto";
@@ -23,6 +30,8 @@ import { makeRedactor } from "../harness/redact";
 import type { BrainEvent } from "../harness/decision-brain/index";
 import type {
   ApprovalGateway,
+  ApprovalRequest,
+  ApprovalTicket,
   QuestionGateway,
   QuestionRequest,
   HandoffGateway,
@@ -213,6 +222,27 @@ export function mergeOracleSummary(
 
 const SUMMARY_PROMPT_LEN = 300;
 const DEFAULT_MAX_QUEUED = 3;
+
+/**
+ * Create one approval record for an ask-classified tool call and return
+ * its ticket. Both ask paths (the runner's createApproval hook and the
+ * agent's approval gateway) share it so the record shape cannot drift.
+ */
+function createRunApproval(runId: string, userId: string, ask: ApprovalRequest): ApprovalTicket {
+  const approval = getApprovalStore().create({
+    runId,
+    userId,
+    toolName: ask.toolName,
+    action: ask.action,
+    reason: ask.reason,
+  });
+  return {
+    id: approval.id,
+    expiresAt: approval.expiresAt,
+    timedOut: () => getApprovalStore().get(approval.id)?.timedOut === true,
+    verdict: getApprovalStore().waitFor(approval.id),
+  };
+}
 /**
  * Watchdog thresholds for stuck runs. A run that is active but never emits
  * run.started within START_GRACE_MS — or goes entirely silent for SILENCE_MS
@@ -234,6 +264,16 @@ const DEFAULT_MAX_QUEUED = 3;
 const DEFAULT_START_GRACE_MS = 5 * 60 * 1000;
 const DEFAULT_SILENCE_MS = 30 * 60 * 1000;
 const DEFAULT_TOOL_SILENCE_MS = 2 * 60 * 60 * 1000;
+/**
+ * Minimum spacing between turn-boundary auto-checkpoints (FIX-21). A turn
+ * checkpoint is a full VM snapshot, so back-to-back turns must not each pay
+ * for one: the first boundary at or after the interval checkpoints, later
+ * ones inside it are skipped. Ask-gate checkpoints share the same clock, so
+ * a gate checkpoint just taken also suppresses a redundant turn checkpoint.
+ */
+const DEFAULT_TURN_CHECKPOINT_MIN_INTERVAL_MS = 60_000;
+/** Reason recorded on checkpoint telemetry taken at a turn boundary. */
+const TURN_CHECKPOINT_REASON = "turn boundary";
 
 export type RunStatus = "queued" | "running" | "finished" | "error" | "cancelled";
 
@@ -266,6 +306,8 @@ export interface RunSummary {
   modeReason?: string;
   /** 1-based queue position while status is "queued". */
   position?: number;
+  /** Set on a queued run waiting for a global VM slot, not for the user's own active run. */
+  queueReason?: "capacity";
   lastSeq: number;
   /** Compact report-card counts; present once the run's report exists. */
   report?: ReportCardMeta;
@@ -327,6 +369,16 @@ interface QueuedRun {
   createdAt: number;
 }
 
+/** Global VM-capacity snapshot for a run queued waiting for a VM slot. */
+export interface VmCapacityStatus {
+  /** Configured cap (SWARM_MAX_CONCURRENT_VMS). */
+  limit: number;
+  /** VM slots currently committed (live VMs plus users with an active run). */
+  inUse: number;
+  /** 1-based place in the global capacity line for this run. */
+  waiting: number;
+}
+
 export interface StartResult {
   accepted: boolean;
   runId: string;
@@ -342,6 +394,8 @@ export interface StartResult {
    * the API/UI can tell the operator exactly what to set.
    */
   missingEnv?: string[];
+  /** Present when the run queued for a global VM slot (SWARM_MAX_CONCURRENT_VMS). */
+  capacity?: VmCapacityStatus;
 }
 
 interface ActiveRun {
@@ -428,6 +482,12 @@ interface ActiveRun {
   forkedFrom?: ForkInfo;
   /** Latest recorded resume point for this run (from auto-checkpoint). */
   resumePoint?: ResumePoint;
+  /** Tool calls emitted but not yet closed by a result (turn tracking). */
+  openToolCalls?: number;
+  /** Epoch ms of the last auto-checkpoint attempt (gate or turn). */
+  lastCheckpointAt?: number;
+  /** True while a turn-boundary checkpoint snapshot is in flight. */
+  turnCheckpointInFlight?: boolean;
   /**
    * Set only by the shutdown path for a run with a recorded resume point:
    * the exec is aborted so the process can exit, but the run must NOT be
@@ -479,6 +539,26 @@ function runTimeoutMsFromEnv(env: NodeJS.ProcessEnv = process.env): number | und
   return Math.floor(seconds * 1000);
 }
 
+/**
+ * Default global concurrent-VM cap, sized for a small VPS at the 4GiB
+ * desktop-VM ceiling (see DEPLOY.md "Global concurrent-VM cap"). Operators
+ * on bigger hosts raise it via SWARM_MAX_CONCURRENT_VMS.
+ */
+const DEFAULT_MAX_CONCURRENT_VMS = 4;
+
+/**
+ * Global concurrent-VM cap from SWARM_MAX_CONCURRENT_VMS (default 4). A
+ * value of 0 or negative disables the cap (unlimited), matching the
+ * VmManager quota convention; invalid values fall back to the default.
+ */
+function maxConcurrentVmsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.SWARM_MAX_CONCURRENT_VMS?.trim();
+  if (!raw) return DEFAULT_MAX_CONCURRENT_VMS;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n)) return DEFAULT_MAX_CONCURRENT_VMS;
+  return n;
+}
+
 interface TerminalPatch {
   status: "finished" | "error" | "cancelled";
   exitCode?: number;
@@ -515,13 +595,22 @@ const HOST_CREDENTIAL = /(API_KEY|AUTH_TOKEN|_TOKEN|_SECRET|_KEY)$/;
  * Kill escalation windows for a cancelled agent run. The first abort signal
  * propagates to the exec driver, which terminates the docker CLI and sends a
  * best-effort SIGTERM to the in-container process tree. The slot frees
- * immediately, but if the container's leftover processes are still standing
- * after KILL_GRACE_MS (TERM ignored, or detached children of the agent's
- * shell) and no successor run has taken the slot, a hard SIGKILL is sent to
- * the container's children of PID 1 within the promised ~3s window.
+ * immediately. The hard SIGKILL step (killRunTree, scoped to the run's own
+ * recorded process group) completes the ladder: when a successor run is
+ * queued it runs in startNext before the successor's harness spawns, so no
+ * orphaned process of the cancelled run shares the VM with the next run;
+ * with no successor queued it fires after KILL_GRACE_MS (TERM ignored, or
+ * detached children of the agent's shell) within the promised ~3s window.
  */
 const KILL_GRACE_MS = 3000;
 const KILL_TIMEOUT_MS = 3000;
+/**
+ * Overall bound on reaping one cancelled run before its successor starts.
+ * The reap exec itself is bounded by KILL_TIMEOUT_MS, but the vm.ensure()
+ * ahead of it is not; a wedged reap must never block the queue forever, so
+ * the successor starts anyway once this elapses (and the timeout is logged).
+ */
+const REAP_TIMEOUT_MS = 5000;
 
 /**
  * Base URL of the server-side LLM translation endpoint, reachable from the
@@ -808,10 +897,16 @@ export class RuntimeManager {
   /** Per-user routers, rebuilt when that user's saved providers change. */
   private readonly routers = new Map<string, { signature: string; router: Router }>();
   private readonly maxQueuedOverride: number | undefined;
+  private readonly maxConcurrentVmsOverride: number | undefined;
+  /** Set by cancelAll("shutdown"): capacity drains must not start runs while the process exits. */
+  private shuttingDown = false;
   private readonly startGraceMs: number;
   private readonly silenceMs: number;
   private readonly toolSilenceMs: number;
+  private readonly turnCheckpointMinIntervalMs: number;
   private readonly watchdogSweepMs: number = 30_000;
+  private readonly killGraceMs: number;
+  private readonly reapTimeoutMs: number;
   /**
    * Durable snapshot of active+queued work. Null in direct constructions
    * (unit tests stay isolated); the process-wide manager supplies the real
@@ -821,15 +916,37 @@ export class RuntimeManager {
   /**
    * Runs whose controller was aborted but whose execute promise has not yet
    * settled (their in-container process may still be dying). Kill escalation
-   * keys on this; execute()'s finally removes entries. Never holds a slot.
+   * keys on this; entries are drained by the reap in startNext (successor
+   * queued), the grace timer in recordCancelling (no successor), or
+   * execute()'s finally (clean unwind). Never holds a slot.
    */
   private readonly cancelling = new Map<string, { userId: string; pgidFile?: string }>();
+  /**
+   * Users whose restored queue is waiting for its first drain. Restore runs
+   * in the constructor, but starting a run there is a reentrancy hazard:
+   * the process-wide singleton is registered only after `new RuntimeManager`
+   * returns (see getRuntimeManager), and execute()'s synchronous prefix
+   * (reporter attach, bus publish) could call back into getRuntimeManager()
+   * and construct a second manager. Restored starts are therefore deferred
+   * to a microtask (see scheduleRestoredStarts) and tracked here so a
+   * shutdown landing in between can suppress them — the queue itself stays
+   * in the durable snapshot either way.
+   */
+  private readonly pendingRestoredStarts = new Set<string>();
+  /** Latch: the deferred restored-start microtask is queued at most once. */
+  private restoredStartScheduled = false;
 
   constructor(opts: {
     vm?: VmManager;
     bus?: TelemetryBus;
     router?: Router | null;
     maxQueued?: number;
+    /**
+     * Global concurrent-VM cap override (SWARM_MAX_CONCURRENT_VMS when
+     * unset; 0 or negative disables). Tests use this to exercise capacity
+     * queueing with two or three users.
+     */
+    maxConcurrentVms?: number;
     /**
      * Watchdog thresholds, ms. Overridable so tests can exercise stuck runs
      * quickly; production uses the conservative defaults.
@@ -838,8 +955,20 @@ export class RuntimeManager {
     silenceMs?: number;
     /** Silence tolerated while a tool is in flight (default 2h; see DEFAULT_TOOL_SILENCE_MS). */
     toolSilenceMs?: number;
+    /**
+     * Minimum spacing between turn-boundary auto-checkpoints, ms.
+     * Overridable so tests can checkpoint every turn; production uses the
+     * conservative default (a snapshot per turn would be too costly).
+     */
+    turnCheckpointMinIntervalMs?: number;
     /** Watchdog sweep cadence, ms (default 30s; minimum 20ms in tests). */
     watchdogSweepMs?: number;
+    /**
+     * Cancel kill-escalation windows, ms. Overridable so tests can exercise
+     * the reap quickly; production uses the conservative defaults.
+     */
+    killGraceMs?: number;
+    reapTimeoutMs?: number;
     /** Test hook: inject the run-report reporter. */
     reporter?: RunReporter;
     /** Test hook: inject the codebase scanner (default: the user's VM). */
@@ -859,10 +988,15 @@ export class RuntimeManager {
     this.runner = opts.runner ?? new ClaudeCodeRunner();
     this.routerOverride = opts.router === undefined ? undefined : opts.router;
     this.maxQueuedOverride = opts.maxQueued;
+    this.maxConcurrentVmsOverride = opts.maxConcurrentVms;
     this.startGraceMs = opts.startGraceMs ?? DEFAULT_START_GRACE_MS;
     this.silenceMs = opts.silenceMs ?? DEFAULT_SILENCE_MS;
     this.toolSilenceMs = opts.toolSilenceMs ?? DEFAULT_TOOL_SILENCE_MS;
+    this.turnCheckpointMinIntervalMs =
+      opts.turnCheckpointMinIntervalMs ?? DEFAULT_TURN_CHECKPOINT_MIN_INTERVAL_MS;
     this.watchdogSweepMs = Math.max(20, opts.watchdogSweepMs ?? 30_000);
+    this.killGraceMs = opts.killGraceMs ?? KILL_GRACE_MS;
+    this.reapTimeoutMs = opts.reapTimeoutMs ?? REAP_TIMEOUT_MS;
     this.stateStore = opts.stateStore ?? null;
 
     // A previous process may have died mid-run; its persisted runs would
@@ -977,6 +1111,102 @@ export class RuntimeManager {
 
   private maxQueued(): number {
     return this.maxQueuedOverride ?? maxQueuedFromEnv();
+  }
+
+  /**
+   * Global concurrent-VM cap (SWARM_MAX_CONCURRENT_VMS, default 4; 0 or
+   * negative disables it). See maxConcurrentVmsFromEnv.
+   */
+  private maxConcurrentVms(): number {
+    return this.maxConcurrentVmsOverride ?? maxConcurrentVmsFromEnv();
+  }
+
+  /**
+   * Users whose VM slot is committed: their VM is live (ensured and not
+   * hibernated/stopped/reset — an idle-but-alive VM still holds host RAM,
+   * so it counts until the idle sweeper reaps it) or they have an active
+   * run (whose ensure may not have landed yet, but the slot is spoken
+   * for). The union keeps the count correct in the window between a run
+   * going active and its VM finishing ensure, and for a run whose VM was
+   * stopped mid-flight.
+   */
+  private committedVmUserIds(): Set<string> {
+    const ids = new Set<string>(this.vm.liveVmUserIds());
+    for (const [userId, st] of this.users) {
+      if (st.active) ids.add(userId);
+    }
+    return ids;
+  }
+
+  /**
+   * True when starting a run for `userId` stays within the global VM cap.
+   * A user whose VM is already live needs no new slot — their run reuses
+   * the container that is already counted — so they are never blocked by
+   * other users' VMs. A disabled cap (<= 0) always allows.
+   */
+  private vmSlotAvailable(userId: string): boolean {
+    const cap = this.maxConcurrentVms();
+    if (cap <= 0) return true;
+    if (this.vm.isVmLive(userId)) return true;
+    return this.committedVmUserIds().size < cap;
+  }
+
+  /**
+   * Capacity snapshot for a run queued waiting for a VM slot: the cap, the
+   * slots currently committed, and the run's 1-based place in the global
+   * capacity line (slot-needing queue heads, oldest first, plus the run's
+   * offset within its own user's queue).
+   */
+  private capacityStatusFor(userId: string, runId: string): VmCapacityStatus {
+    const heads: Array<{ userId: string; createdAt: number }> = [];
+    for (const [uid, st] of this.users) {
+      if (st.active || st.queue.length === 0) continue;
+      if (this.vm.isVmLive(uid)) continue;
+      heads.push({ userId: uid, createdAt: st.queue[0].createdAt });
+    }
+    heads.sort(
+      (a, b) =>
+        a.createdAt - b.createdAt || (a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0),
+    );
+    const lineIndex = heads.findIndex((head) => head.userId === userId);
+    const ownIndex = this.users.get(userId)?.queue.findIndex((run) => run.runId === runId) ?? 0;
+    return {
+      limit: this.maxConcurrentVms(),
+      inUse: this.committedVmUserIds().size,
+      waiting: (lineIndex >= 0 ? lineIndex + 1 : heads.length + 1) + Math.max(0, ownIndex),
+    };
+  }
+
+  /**
+   * Start queued runs that were waiting for a global VM slot, oldest head
+   * first. Called whenever a slot may have freed: a run finalized, the
+   * idle sweeper hibernated a VM, or the watchdog sweep ticked (backstop
+   * for stops/resets that free a slot without an event). Per-user FIFO is
+   * preserved — only queue heads are eligible — and a user whose VM is
+   * already live never waits for capacity. No-op during shutdown.
+   */
+  drainCapacityQueue(): void {
+    if (this.shuttingDown) return;
+    for (;;) {
+      let best: { userId: string; createdAt: number } | null = null;
+      for (const [userId, st] of this.users) {
+        if (st.active || st.queue.length === 0) continue;
+        if (!this.vmSlotAvailable(userId)) continue;
+        const createdAt = st.queue[0].createdAt;
+        if (
+          !best ||
+          createdAt < best.createdAt ||
+          (createdAt === best.createdAt && userId < best.userId)
+        ) {
+          best = { userId, createdAt };
+        }
+      }
+      if (!best) return;
+      this.startNext(best.userId);
+      // startNext sets the active run synchronously; if it did not (the
+      // gate raced a state change), stop instead of spinning.
+      if (!this.users.get(best.userId)?.active) return;
+    }
   }
 
   private activeToPersisted(active: ActiveRun): PersistedActiveRun {
@@ -1159,11 +1389,39 @@ export class RuntimeManager {
           getApprovalStore().expireForRunRestart(row.active.runId);
         }
       }
-      if (!st.active && st.queue.length > 0) this.startNext(userId);
+      // Defer the first drain until after construction (see
+      // scheduleRestoredStarts): starting a run here would execute its
+      // synchronous prefix before the singleton is registered.
+      if (!st.active && st.queue.length > 0) this.pendingRestoredStarts.add(userId);
     }
+    if (this.pendingRestoredStarts.size > 0) this.scheduleRestoredStarts();
     // Normalize the file (drop terminal queue entries, clear the aborted
     // active run) so the next restart sees a clean snapshot.
     this.persistState();
+  }
+
+  /**
+   * Start restored runs after construction completes. restorePersistedState
+   * only enqueues; the actual startNext calls run in a microtask, which
+   * fires once the current synchronous stack empties — by then
+   * getRuntimeManager() has registered the singleton, so a restored run
+   * that synchronously calls back into the manager (telemetry subscribers,
+   * reporter attach) sees the one true instance instead of constructing a
+   * second. startNext already no-ops when a slot is taken, so a user whose
+   * head was drained early (start() drains synchronously) or suppressed by
+   * a shutdown cancelAll is simply skipped here.
+   */
+  private scheduleRestoredStarts(): void {
+    if (this.restoredStartScheduled) return;
+    this.restoredStartScheduled = true;
+    queueMicrotask(() => {
+      this.pendingRestoredStarts.clear();
+      // Drain through the capacity gate (FIX-19), oldest head first, so a
+      // restart with more queued users than VM slots resumes fairly — but
+      // deferred past construction (FIX-35) so no run's synchronous prefix
+      // executes before the singleton is registered.
+      this.drainCapacityQueue();
+    });
   }
 
   /** Refresh a run's heartbeat (called on any telemetry it produces). */
@@ -1230,19 +1488,31 @@ export class RuntimeManager {
         message: reason,
       };
       this.bus.publish(active.runId, errorEvent);
+      // Record before finalize so a successor draining out of finalize can
+      // reap this run's process group before its harness spawns.
+      this.recordCancelling(userId, active.runId, active.pgidFile);
       this.finalize(active.runId, { status: "error", error: reason });
       active.controller.abort();
-      this.recordCancelling(userId, active.runId, active.pgidFile);
     }
+    // Backstop for the global VM cap: a slot freed by a VM stop/reset (or
+    // a hibernation whose sweeper callback was not wired) starts any
+    // capacity-queued run within one sweep cadence.
+    this.drainCapacityQueue();
   }
 
   /**
    * Remember a run whose process tree may still be dying after abort. The
    * slot itself is freed immediately (finalize ran before the abort), so this
-   * only guards the process side: if after the grace period nothing has taken
-   * the slot, the container's leftover processes can only belong to the
-   * cancelled run and are hard-killed. When a successor run already started,
-   * the wedge is broken and killing anything would risk the wrong process.
+   * only guards the process side. The entry is drained by whichever comes
+   * first: the reap in startNext (a successor is about to take the slot, so
+   * the kill ladder completes before its harness spawns), this grace timer
+   * (no successor queued), or execute()'s finally (the aborted exec settled
+   * cleanly and needs no backstop). The kill is scoped to the cancelled
+   * run's own recorded process group, so it is safe to run even when a
+   * successor already holds the slot — there is no stand-down.
+   *
+   * Callers record BEFORE finalize() so the entry exists when finalize
+   * drains the queue into startNext.
    */
   private recordCancelling(userId: string, runId: string, pgidFile?: string): void {
     this.cancelling.set(runId, { userId, pgidFile });
@@ -1250,9 +1520,8 @@ export class RuntimeManager {
       const entry = this.cancelling.get(runId);
       if (!entry) return;
       this.cancelling.delete(runId);
-      if (this.users.get(userId)?.active !== null) return;
       void this.killRunTree(entry.userId, entry.pgidFile);
-    }, KILL_GRACE_MS);
+    }, this.killGraceMs);
     timer.unref();
   }
 
@@ -1266,26 +1535,82 @@ export class RuntimeManager {
    * cancel. When the marker file is already gone the group died with the
    * abort (or the exec never started) and there is nothing to kill.
    *
-   * Residual gap, stated plainly: a process that ignored the abort-time
-   * SIGTERM has its marker removed by the abort cleanup, and a process the
-   * agent detached from its own group (re-parented to PID 1) is
-   * indistinguishable from a desktop daemon — neither is reaped here.
+   * Residual gap, stated plainly: a process the agent detached from its own
+   * group (re-parented to PID 1) is indistinguishable from a desktop daemon
+   * and is not reaped here. On the grace-timer path a process that ignored
+   * the abort-time SIGTERM may also survive: the abort cleanup removes the
+   * marker after TERM, so the group is no longer findable. The successor
+   * path (reapCancelling, run from startNext before the abort fires) reads
+   * the marker first, so that race does not apply there.
    */
   private async killRunTree(userId: string, pgidFile?: string): Promise<void> {
     // No recorded group: there is nothing safe to target, so do nothing
     // rather than fall back to a broad kill.
     if (!pgidFile) return;
+    // If the VM is no longer live (stopped/evicted to free capacity), its
+    // process group is already gone — there is nothing to reap, and
+    // re-ensuring it would re-commit a VM slot and block a queued successor
+    // forever. Only ensure the VM when it is still running.
+    if (!this.vm.liveVmUserIds().includes(userId)) return;
     try {
-      if (this.users.get(userId)?.active !== null) return;
       await this.vm.ensure(userId);
-      if (this.users.get(userId)?.active !== null) return;
       await this.vm.exec(userId, buildPgidKillCommand(pgidFile), {
         timeoutMs: KILL_TIMEOUT_MS,
         signal: AbortSignal.timeout(KILL_TIMEOUT_MS),
+        // The kill must not be starved by the exec-slot limit: the dying
+        // run's own processes (and the successor's startup execs) occupy
+        // the slots the reap needs one of.
+        bypassExecSlotLimit: true,
       });
     } catch {
       // Best-effort only; the watchdog finalization already freed the slot.
     }
+  }
+
+  /**
+   * Reap every cancelled run of this user whose process tree may still be
+   * dying, before a successor run's harness spawns in the same VM. Each reap
+   * is bounded by reapTimeoutMs: a wedged reap (e.g. vm.ensure stuck on a
+   * wedged daemon) is logged and skipped so the queue keeps draining; the
+   * underlying kill exec is itself bounded by KILL_TIMEOUT_MS and only ever
+   * targets the dead run's own process group, so letting it finish in the
+   * background is safe. Never throws.
+   */
+  private async reapCancelling(userId: string): Promise<void> {
+    const pending = [...this.cancelling.entries()].filter(
+      ([, entry]) => entry.userId === userId,
+    );
+    for (const [runId, entry] of pending) {
+      this.cancelling.delete(runId);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = await Promise.race([
+        this.killRunTree(entry.userId, entry.pgidFile).then(
+          () => false,
+          () => false,
+        ),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(true), this.reapTimeoutMs);
+          timer.unref();
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (timedOut) {
+        console.error(
+          `[runtime] reap of cancelled run ${runId} timed out after ${this.reapTimeoutMs}ms; starting successor anyway`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Start a successor run only after the previous run's leftovers are
+   * reaped: a cancelled run's orphaned processes must never share the VM
+   * with the next run's harness. The slot was already claimed synchronously
+   * in startNext, so a concurrent start() queues behind this run as usual.
+   */
+  private async reapThenExecute(active: ActiveRun): Promise<void> {
+    await this.reapCancelling(active.userId);
+    await this.execute(active);
   }
 
   /**
@@ -1347,6 +1672,31 @@ export class RuntimeManager {
         ...(info.model ? { model: info.model } : {}),
       },
     });
+  }
+
+  /** Announce a run (queued or starting) and its mode in one place. */
+  private publishRunCreated(
+    runId: string,
+    userId: string,
+    input: { prompt: string; sessionId?: string; model?: string; projectId?: string; forkedFrom?: unknown },
+    runMode: RunModeInfo,
+  ): void {
+    this.bus.publish(runId, {
+      type: "run.created",
+      data: {
+        prompt: truncate(input.prompt, SUMMARY_PROMPT_LEN),
+        sessionId: input.sessionId,
+        userId,
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.projectId ? { projectId: input.projectId } : {}),
+        ...(input.forkedFrom ? { forkedFrom: input.forkedFrom } : {}),
+        compute: { kind: "cloud" },
+        mode: runMode.mode,
+        modeLabel: runMode.label,
+        modeReason: runMode.reason,
+      },
+    });
+    this.publishMode(runId, runMode);
   }
 
   /**
@@ -1512,10 +1862,12 @@ export class RuntimeManager {
   /**
    * Start a run for a user. If the user already has an active run the prompt
    * is queued (FIFO) instead of superseding it, up to SWARM_MAX_QUEUED. A
-   * queued prompt emits run.queued with its 1-based position and starts
-   * automatically when the active run finishes. Returns the runId
-   * immediately; execution proceeds in the background and events stream
-   * through the telemetry bus.
+   * run that would need a fresh VM past the global cap
+   * (SWARM_MAX_CONCURRENT_VMS) queues the same way, with its capacity
+   * status reported. A queued prompt emits run.queued with its 1-based
+   * position and starts automatically when the active run finishes (or a
+   * VM slot frees). Returns the runId immediately; execution proceeds in
+   * the background and events stream through the telemetry bus.
    */
   start(
     userId: string,
@@ -1609,6 +1961,12 @@ export class RuntimeManager {
     }
     const runId = `run_${randomUUID()}`;
     const st = this.state(userId);
+    // A restored queue drains on a deferred tick after construction (see
+    // scheduleRestoredStarts). If a fresh prompt lands in that window,
+    // start the restored head first so FIFO order matches the old
+    // synchronous restore; this prompt then queues behind it as usual.
+    // In steady state the condition is unreachable (finalize drains).
+    if (!st.active && st.queue.length > 0) this.startNext(userId);
     const fullAuto = input.fullAuto ?? process.env.SWARM_FULL_AUTO === "1";
     const runMode = this.modeFor(userId, input.model);
 
@@ -1641,7 +1999,12 @@ export class RuntimeManager {
         : undefined;
     const maxTurns = requestedMaxTurns ?? roleMaxTurns(role);
 
-    if (st.active) {
+    // A run queues when the user already has an active run (the per-user
+    // invariant) or when starting it would exceed the global VM cap and
+    // the user's VM is not already live. Both waits share the same
+    // per-user queue and depth limit; only the reported reason differs.
+    const capacityWait = !st.active && !this.vmSlotAvailable(userId);
+    if (st.active || capacityWait) {
       const limit = this.maxQueued();
       if (st.queue.length >= limit) {
         return { accepted: false, runId: "", queued: false, limit };
@@ -1670,28 +2033,19 @@ export class RuntimeManager {
       };
       st.queue.push(queued);
       const position = st.queue.length;
-      this.bus.publish(runId, {
-        type: "run.created",
-        data: {
-          prompt: truncate(input.prompt, SUMMARY_PROMPT_LEN),
-          sessionId: input.sessionId,
-          userId,
-          ...(input.model ? { model: input.model } : {}),
-          ...(input.projectId ? { projectId: input.projectId } : {}),
-          ...(input.forkedFrom ? { forkedFrom: input.forkedFrom } : {}),
-          compute: { kind: "cloud" },
-          mode: runMode.mode,
-          modeLabel: runMode.label,
-          modeReason: runMode.reason,
-        },
-      });
-      this.publishMode(runId, runMode);
+      const capacity = capacityWait ? this.capacityStatusFor(userId, runId) : undefined;
+      this.publishRunCreated(runId, userId, input, runMode);
       this.bus.publish(runId, {
         type: "run.queued",
-        data: { position, prompt: truncate(input.prompt, SUMMARY_PROMPT_LEN), userId },
+        data: {
+          position,
+          prompt: truncate(input.prompt, SUMMARY_PROMPT_LEN),
+          userId,
+          ...(capacity ? { reason: "capacity", capacity } : {}),
+        },
       });
       this.persistState();
-      return { accepted: true, runId, queued: true, position };
+      return { accepted: true, runId, queued: true, position, ...(capacity ? { capacity } : {}) };
     }
 
     const persistedSession =
@@ -1726,25 +2080,12 @@ export class RuntimeManager {
     };
     st.active = active;
 
-    this.bus.publish(runId, {
-      type: "run.created",
-      data: {
-        prompt: truncate(input.prompt, SUMMARY_PROMPT_LEN),
-        sessionId: input.sessionId,
-        userId,
-        ...(input.model ? { model: input.model } : {}),
-        ...(input.projectId ? { projectId: input.projectId } : {}),
-        ...(input.forkedFrom ? { forkedFrom: input.forkedFrom } : {}),
-        compute: { kind: "cloud" },
-        mode: runMode.mode,
-        modeLabel: runMode.label,
-        modeReason: runMode.reason,
-      },
-    });
-    this.publishMode(runId, runMode);
+    this.publishRunCreated(runId, userId, input, runMode);
     this.persistState();
 
-    void this.execute(active);
+    // Reap any cancelled predecessor's leftover processes before this run's
+    // harness spawns in the same VM (bounded; see reapCancelling).
+    void this.reapThenExecute(active);
     return { accepted: true, runId, queued: false };
   }
 
@@ -1807,6 +2148,10 @@ export class RuntimeManager {
   private startNext(userId: string): void {
     const st = this.users.get(userId);
     if (!st || st.active) return;
+    // Global VM cap: a queued run that needs a fresh VM stays queued until
+    // a slot frees (drainCapacityQueue retries it then). A user whose VM
+    // is already live is never blocked.
+    if (st.queue.length === 0 || !this.vmSlotAvailable(userId)) return;
     const next = st.queue.shift();
     if (!next) return;
     const persistedSession =
@@ -1842,7 +2187,9 @@ export class RuntimeManager {
     st.active = active;
     this.persistState();
     if (next.runMode) this.publishMode(next.runId, next.runMode);
-    void this.execute(active);
+    // Reap any cancelled predecessor's leftover processes before this run's
+    // harness spawns in the same VM (bounded; see reapCancelling).
+    void this.reapThenExecute(active);
   }
 
   /** All runs for a user: active agent run, queued prompts, shell runs, then history. */
@@ -1865,6 +2212,9 @@ export class RuntimeManager {
         lastSeq: this.bus.latestSeq(run.runId),
         kind: "agent",
         position: index + 1,
+        // Queued with no active run for this user means the run is waiting
+        // for a global VM slot, not for the user's own run to finish.
+        ...(!st.active ? { queueReason: "capacity" as const } : {}),
         ...(run.runMode
           ? { mode: run.runMode.mode, modeReason: run.runMode.reason }
           : {}),
@@ -1961,21 +2311,7 @@ export class RuntimeManager {
       // F1: an ask-classified call that is cleared to execute gets a
       // checkpoint first, so the mutation it precedes has a branch point.
       takeCheckpoint: () => this.takeAutoCheckpoint(userId, runId),
-      createApproval: (ask) => {
-        const approval = getApprovalStore().create({
-          runId,
-          userId,
-          toolName: ask.toolName,
-          action: ask.action,
-          reason: ask.reason,
-        });
-        return {
-          id: approval.id,
-          expiresAt: approval.expiresAt,
-          timedOut: () => getApprovalStore().get(approval.id)?.timedOut === true,
-          verdict: getApprovalStore().waitFor(approval.id),
-        };
-      },
+      createApproval: (ask) => createRunApproval(runId, userId, ask),
     });
   }
 
@@ -2014,10 +2350,89 @@ export class RuntimeManager {
           stepSeq: outcome.stepSeq,
           ...(active.sessionId ? { sessionId: active.sessionId } : {}),
         };
+        // Gate and turn checkpoints share one throttle clock: a checkpoint
+        // just taken here suppresses a redundant turn-boundary snapshot.
+        active.lastCheckpointAt = Date.now();
         this.persistState();
       }
     }
     return outcome;
+  }
+
+  /**
+   * FIX-21: checkpoint at a turn boundary so allow-only runs — which never
+   * hit an ask-gate and therefore never checkpointed — still record resume
+   * points and can resume after a restart. Fire-and-forget from
+   * forwardEvent; a boundary is dropped while a snapshot is in flight or
+   * inside the min interval since the last checkpoint attempt (gate or
+   * turn), so snapshot cost stays bounded no matter how fast turns come.
+   */
+  private maybeTurnCheckpoint(active: ActiveRun): void {
+    if (active.turnCheckpointInFlight) return;
+    const now = Date.now();
+    if (
+      active.lastCheckpointAt !== undefined &&
+      now - active.lastCheckpointAt < this.turnCheckpointMinIntervalMs
+    ) {
+      return;
+    }
+    // The attempt consumes the throttle slot even if the snapshot fails, so
+    // a persistently failing snapshot path cannot retry every turn.
+    active.lastCheckpointAt = now;
+    active.turnCheckpointInFlight = true;
+    void this.takeTurnCheckpoint(active).finally(() => {
+      active.turnCheckpointInFlight = false;
+    });
+  }
+
+  /**
+   * Take a turn-boundary checkpoint via the shared auto-checkpoint path
+   * (records the resume point and persists state on success) and emit the
+   * same checkpoint telemetry the approval gate emits, so the timeline
+   * shows the branch point. There is no guarded tool — the checkpoint sits
+   * after the turn it captures — so `tool` is empty and the reason names
+   * the trigger. Never throws into the event stream.
+   */
+  private async takeTurnCheckpoint(active: ActiveRun): Promise<void> {
+    const { userId, runId } = active;
+    let outcome: CheckpointOutcome;
+    try {
+      outcome = await this.takeAutoCheckpoint(userId, runId);
+    } catch (error) {
+      // takeAutoCheckpoint is outcome-based and never throws; belt-and-braces
+      // so a surprise here surfaces as telemetry instead of breaking the run.
+      this.forwardEvent(active, {
+        type: "checkpoint.failed",
+        label: "",
+        vmLabel: "",
+        stepSeq: 0,
+        tool: "",
+        reason: TURN_CHECKPOINT_REASON,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    if (outcome.ok) {
+      this.forwardEvent(active, {
+        type: "checkpoint.created",
+        label: outcome.label,
+        vmLabel: outcome.vmLabel,
+        stepSeq: outcome.stepSeq,
+        tool: "",
+        reason: TURN_CHECKPOINT_REASON,
+        createdAt: outcome.createdAt,
+      });
+      return;
+    }
+    this.forwardEvent(active, {
+      type: "checkpoint.failed",
+      label: outcome.label,
+      vmLabel: outcome.vmLabel,
+      stepSeq: outcome.stepSeq,
+      tool: "",
+      reason: TURN_CHECKPOINT_REASON,
+      error: outcome.error,
+    });
   }
 
   /**
@@ -2044,9 +2459,11 @@ export class RuntimeManager {
       if (!target) return queued.length > 0 ? { ok: true, runId: queued[0].runId } : { ok: false };
       // Queue is empty, so finishing the active run cannot start another one.
       const pgidFile = target.pgidFile;
+      // Record before finalize so a successor draining out of finalize can
+      // reap this run's process group before its harness spawns.
+      this.recordCancelling(userId, target.runId, pgidFile);
       this.finalize(target.runId, { status: "cancelled", cancelledReason: reason });
       target.controller.abort();
-      this.recordCancelling(userId, target.runId, pgidFile);
       return { ok: true, runId: target.runId };
     }
 
@@ -2055,9 +2472,11 @@ export class RuntimeManager {
       // prompt starts the moment the slot frees (finalize -> startNext).
       const controller = st.active.controller;
       const pgidFile = st.active.pgidFile;
+      // Record before finalize so the successor draining out of finalize
+      // reaps this run's process group before its harness spawns.
+      this.recordCancelling(userId, runId, pgidFile);
       this.finalize(runId, { status: "cancelled", cancelledReason: reason });
       controller.abort();
-      this.recordCancelling(userId, runId, pgidFile);
       return { ok: true, runId };
     }
 
@@ -2121,7 +2540,17 @@ export class RuntimeManager {
    * deploy drops no in-flight telemetry. Returns the cancelled runIds.
    */
   cancelAll(reason: "user" | "superseded" | "shutdown" = "shutdown"): string[] {
+    // A process on its way out must not start capacity-queued runs.
+    if (reason === "shutdown") this.shuttingDown = true;
     const cancelled: string[] = [];
+    if (reason === "shutdown") {
+      // A restored queue whose deferred start has not fired yet must stay
+      // queued (durable) rather than start during the shutdown flush —
+      // the same reason the shutdown branch below finalizes with
+      // drainQueue off. The already-queued microtask then finds nothing
+      // to start, and the next process restores the queue as usual.
+      this.pendingRestoredStarts.clear();
+    }
     for (const userId of [...this.users.keys()]) {
       if (reason === "shutdown") {
         // A deploy must not discard work the user already queued. Cancel only
@@ -2140,14 +2569,14 @@ export class RuntimeManager {
           // so no cancelled/error event or approval expiry is recorded.
           target.suspendForResume = true;
           target.controller.abort();
-          this.recordCancelling(userId, target.runId);
+          this.recordCancelling(userId, target.runId, target.pgidFile);
           this.persistState();
           cancelled.push(target.runId);
           continue;
         }
         this.finalize(target.runId, { status: "cancelled", cancelledReason: "shutdown" }, false);
         target.controller.abort();
-        this.recordCancelling(userId, target.runId);
+        this.recordCancelling(userId, target.runId, target.pgidFile);
         cancelled.push(target.runId);
         continue;
       }
@@ -3279,21 +3708,7 @@ export class RuntimeManager {
     };
 
     // Ask-classified tool calls pause the run until POST /api/runtime/approvals/{id}.
-    const approvalGateway: ApprovalGateway = async (ask) => {
-      const approval = getApprovalStore().create({
-        runId,
-        userId,
-        toolName: ask.toolName,
-        action: ask.action,
-        reason: ask.reason,
-      });
-      return {
-        id: approval.id,
-        expiresAt: approval.expiresAt,
-        timedOut: () => getApprovalStore().get(approval.id)?.timedOut === true,
-        verdict: getApprovalStore().waitFor(approval.id),
-      };
-    };
+    const approvalGateway: ApprovalGateway = async (ask) => createRunApproval(runId, userId, ask);
 
     // The agent's memory tools run against the host-side store: the in-VM MCP
     // server forwards every call over a small file RPC and this bridge
@@ -3543,20 +3958,23 @@ export class RuntimeManager {
   }
 
   /**
-   * Find the pending file the VM ask server just wrote. Polls briefly because
-   * the tool call can reach the harness stream a tick before the file lands.
-   * Returns null when the server is unavailable (the card is still shown; the
-   * tool call itself will time out in the VM).
+   * Poll a VM directory for a `<id>.pending.json` file the VM-side server
+   * just wrote, newest first, skipping ids already seen and partially
+   * written files. Shared by the ask-question and desktop-handoff rendezvous:
+   * both poll the same way and differ only in the directory and in how the
+   * parsed JSON is mapped (with the caller's request as the fallback).
+   * Returns null when nothing lands within 5s.
    */
-  private async waitForPendingQuestion(
+  private async pollPendingFile<T>(
     userId: string,
+    dir: string,
     seen: Set<string>,
-    ask: QuestionRequest,
-  ): Promise<{ id: string; question: string; options: string[]; allowFreeText: boolean } | null> {
+    map: (parsed: Record<string, unknown>, id: string) => T,
+  ): Promise<T | null> {
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
       try {
-        const entries = await this.vm.listDir(userId, ASK_QUESTIONS_DIR);
+        const entries = await this.vm.listDir(userId, dir);
         const candidates = entries
           .filter((entry) => entry.type === "file" && entry.name.endsWith(".pending.json"))
           .map((entry) => ({ entry, id: entry.name.slice(0, -".pending.json".length) }))
@@ -3571,14 +3989,7 @@ export class RuntimeManager {
           }
           if (!parsed || typeof parsed.id !== "string") continue;
           seen.add(parsed.id);
-          return {
-            id: parsed.id,
-            question: typeof parsed.question === "string" ? parsed.question : ask.question,
-            options: Array.isArray(parsed.options)
-              ? parsed.options.filter((option): option is string => typeof option === "string")
-              : ask.options,
-            allowFreeText: parsed.allowFreeText !== false,
-          };
+          return map(parsed, parsed.id);
         }
       } catch {
         // Directory may not exist yet; keep polling.
@@ -3586,6 +3997,27 @@ export class RuntimeManager {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     return null;
+  }
+
+  /**
+   * Find the pending file the VM ask server just wrote. Polls briefly because
+   * the tool call can reach the harness stream a tick before the file lands.
+   * Returns null when the server is unavailable (the card is still shown; the
+   * tool call itself will time out in the VM).
+   */
+  private async waitForPendingQuestion(
+    userId: string,
+    seen: Set<string>,
+    ask: QuestionRequest,
+  ): Promise<{ id: string; question: string; options: string[]; allowFreeText: boolean } | null> {
+    return this.pollPendingFile(userId, ASK_QUESTIONS_DIR, seen, (parsed, id) => ({
+      id,
+      question: typeof parsed.question === "string" ? parsed.question : ask.question,
+      options: Array.isArray(parsed.options)
+        ? parsed.options.filter((option): option is string => typeof option === "string")
+        : ask.options,
+      allowFreeText: parsed.allowFreeText !== false,
+    }));
   }
 
   /** Write the answer (or cancellation) file the VM ask server is polling. */
@@ -3674,36 +4106,11 @@ export class RuntimeManager {
     seen: Set<string>,
     request: HandoffRequest,
   ): Promise<{ id: string; reason: string; description: string } | null> {
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline) {
-      try {
-        const entries = await this.vm.listDir(userId, DESKTOP_HANDOFF_DIR);
-        const candidates = entries
-          .filter((entry) => entry.type === "file" && entry.name.endsWith(".pending.json"))
-          .map((entry) => ({ entry, id: entry.name.slice(0, -".pending.json".length) }))
-          .filter(({ id }) => !seen.has(id))
-          .sort((a, b) => (b.entry.modifiedAt ?? 0) - (a.entry.modifiedAt ?? 0));
-        for (const { entry, id } of candidates) {
-          let parsed: Record<string, unknown>;
-          try {
-            parsed = JSON.parse(await this.vm.readFile(userId, entry.path)) as Record<string, unknown>;
-          } catch {
-            continue; // partially written; retry on the next poll
-          }
-          if (!parsed || typeof parsed.id !== "string") continue;
-          seen.add(parsed.id);
-          return {
-            id: parsed.id,
-            reason: typeof parsed.reason === "string" ? parsed.reason : request.reason,
-            description: typeof parsed.description === "string" ? parsed.description : request.description,
-          };
-        }
-      } catch {
-        // Directory may not exist yet; keep polling.
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    return null;
+    return this.pollPendingFile(userId, DESKTOP_HANDOFF_DIR, seen, (parsed, id) => ({
+      id,
+      reason: typeof parsed.reason === "string" ? parsed.reason : request.reason,
+      description: typeof parsed.description === "string" ? parsed.description : request.description,
+    }));
   }
 
   /**
@@ -3793,11 +4200,16 @@ export class RuntimeManager {
       // previous attempt died with that process and must not keep this
       // attempt on the watchdog's long tool-silence window.
       active.openTools?.clear();
+      // A fresh harness invocation (start or failover retry) starts with no
+      // tool in flight; stale counts from a dead attempt must not suppress
+      // turn boundaries for the new one.
+      active.openToolCalls = 0;
     }
     if (event.type === "tool.call") {
       // The watchdog's tool-in-flight signal: silence after this point may
       // be a long tool running inside the VM, not a wedge.
       this.noteToolCall(active, event.id);
+      active.openToolCalls = (active.openToolCalls ?? 0) + 1;
       // Remember which files the agent worked on: the heatmap weighs them.
       const touched = extractTouchedPaths((event as { input?: unknown }).input);
       if (touched.length > 0) {
@@ -3806,6 +4218,19 @@ export class RuntimeManager {
     }
     if (event.type === "tool.result") {
       this.noteToolResult(active, event.id);
+      // The last open tool call closing ends the turn: the workspace and
+      // the session transcript are quiescent until the next model call.
+      const open = active.openToolCalls ?? 0;
+      if (open > 0) {
+        active.openToolCalls = open - 1;
+        if (active.openToolCalls === 0) this.maybeTurnCheckpoint(active);
+      }
+    }
+    if (event.type === "usage" && (active.openToolCalls ?? 0) === 0) {
+      // Text-only turn: the usage event closes the assistant message and no
+      // tool is pending, so the turn is complete. (A usage event after a
+      // tool call arrives while the call is still open and does not fire.)
+      this.maybeTurnCheckpoint(active);
     }
     this.bus.publish(runId, event);
   }
@@ -3910,7 +4335,10 @@ export class RuntimeManager {
         ...(patch.verification ? { verification: patch.verification } : {}),
       };
       st.active = null;
-      this.cancelling.delete(runId);
+      // Deliberately NOT deleting the cancelling entry here: cancel paths
+      // record it before finalize so startNext can reap the run's process
+      // group before the successor spawns. Entries are drained by that
+      // reap, the grace timer, or execute()'s finally.
       st.history.unshift(summary);
       if (st.history.length > HISTORY_LIMIT) st.history.length = HISTORY_LIMIT;
       nextUserId = userId;
@@ -3920,23 +4348,27 @@ export class RuntimeManager {
     // draining the queue, so a crash during the next run cannot resurrect a
     // finished run or lose a queued one.
     this.persistState();
-    if (nextUserId !== undefined && drainQueue) {
-      this.startNext(nextUserId);
-      // VM persistence toggle (spec 3d): "terminate-at-project-end" stops
-      // the VM as soon as the user's last run finishes and nothing is
-      // queued behind it, instead of waiting for the idle sweeper. The
-      // volume is kept; the next task re-ensures. Shutdown finalizes pass
-      // drainQueue=false and never stop the VM (a deploy must not kill a
-      // VM a resumed run still needs).
-      const st = this.users.get(nextUserId);
-      if (
-        st &&
-        shouldStopVmAtRunEnd(vmPersistenceModeFor(readUserSettings(nextUserId)), {
-          hasRemainingWork: st.active !== null || st.queue.length > 0 || st.shellRuns.size > 0,
-        })
-      ) {
-        void this.vm.stop(nextUserId).catch(() => {});
+    if (drainQueue) {
+      if (nextUserId !== undefined) {
+        this.startNext(nextUserId);
+        // VM persistence toggle (spec 3d): "terminate-at-project-end" stops
+        // the VM as soon as the user's last run finishes and nothing is
+        // queued behind it, instead of waiting for the idle sweeper. The
+        // volume is kept; the next task re-ensures. Shutdown finalizes pass
+        // drainQueue=false and never stop the VM (a deploy must not kill a
+        // VM a resumed run still needs).
+        const st = this.users.get(nextUserId);
+        if (
+          st &&
+          shouldStopVmAtRunEnd(vmPersistenceModeFor(readUserSettings(nextUserId)), {
+            hasRemainingWork: st.active !== null || st.queue.length > 0 || st.shellRuns.size > 0,
+          })
+        ) {
+          void this.vm.stop(nextUserId).catch(() => {});
+        }
       }
+      // A freed slot may also unblock another user's capacity-queued run.
+      this.drainCapacityQueue();
     }
   }
 }
@@ -3958,6 +4390,9 @@ export function getRuntimeManager(): RuntimeManager {
       if (userIds.length === 0) return;
       void import("../gardener/tick").then((mod) => mod.runAutopilotForUsers(userIds, manager.vmManager));
     },
+    // A hibernated VM frees a global VM slot: start any run that was
+    // queued waiting for capacity.
+    onHibernated: () => manager.drainCapacityQueue(),
   });
   // Abandoned test-drives are rolled back on a background timer too
   // (hourly by default, SWARM_TEST_DRIVE_SWEEP_INTERVAL_SEC to tune):

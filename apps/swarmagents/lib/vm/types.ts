@@ -34,6 +34,22 @@ export interface ExecOptions {
   pgidFile?: string;
   onStdout?: (chunk: string) => void;
   onStderr?: (chunk: string) => void;
+  /**
+   * Do not resurrect a VM that is not currently live. The exec fails
+   * (after acquiring the per-user lock, so it is atomic against a
+   * concurrent stop) instead of ensuring a stopped VM back into being.
+   * Used by best-effort reporting reads that must never re-commit a freed
+   * capacity slot.
+   */
+  noResurrect?: boolean;
+  /**
+   * Skip the per-user concurrent-exec slot limit for this call. Only for
+   * tiny safety-critical cleanup execs (the cancelled-run reap's SIGKILL):
+   * the reap must never be starved by the very processes it exists to
+   * kill, which are the ones occupying the slots. Never set for agent or
+   * tool execs.
+   */
+  bypassExecSlotLimit?: boolean;
 }
 
 /** Result of an exec() call. */

@@ -83,7 +83,7 @@ function setup(driver: FakeFindDriver, runsDir: string, maxStepShots?: number) {
   const vm = new VmManager({ customDriver: driver });
   const browser = new StubBrowser();
   const reporter = new RunReporter({ vm, bus, browser, runsDir: () => runsDir, maxStepShots });
-  return { bus, reporter, browser };
+  return { bus, reporter, browser, vm };
 }
 
 test("reporter records the driver's VM image in the report meta", async () => {
@@ -200,8 +200,9 @@ test("reporter creates a report with artifacts diffed from the workspace listing
   try {
     const driver = new FakeFindDriver();
     driver.entries.set("/workspace/existing.txt", { size: 4, mtimeMs: 1_000 });
-    const { bus, reporter } = setup(driver, runsDir);
+    const { bus, reporter, vm } = setup(driver, runsDir);
     const runId = "run_2";
+    await vm.ensure("bob");
     reporter.attach(runId, "bob");
     bus.publish(runId, { type: "run.created", data: { prompt: "edit files", userId: "bob" } });
     bus.publish(runId, { type: "vm.ready", data: { ms: 1 } });
@@ -237,8 +238,9 @@ test("reporter counts a file the Write telemetry proves it wrote, even when the 
     // listing diff alone would report 0 files changed — the live bug. The
     // run's own Write call is the proof the run wrote it.
     driver.entries.set("/workspace/hello.txt", { size: 23, mtimeMs: 2_000 });
-    const { bus, reporter } = setup(driver, runsDir);
+    const { bus, reporter, vm } = setup(driver, runsDir);
     const runId = "run_write_proof";
+    await vm.ensure("alice");
     reporter.attach(runId, "alice");
     bus.publish(runId, { type: "run.created", data: { prompt: "create hello.txt", userId: "alice" } });
     bus.publish(runId, { type: "vm.ready", data: { ms: 1 } });
@@ -368,6 +370,7 @@ test("reporter runs a background audit when the run's role pins a lens", async (
       lensRunner: stubLens,
     });
     const runId = "run_audit";
+    await vm.ensure("alice");
     reporter.attach(runId, "alice", "implementer");
     bus.publish(runId, { type: "run.created", data: { prompt: "write code", userId: "alice" } });
     bus.publish(runId, { type: "vm.ready", data: { ms: 1 } });

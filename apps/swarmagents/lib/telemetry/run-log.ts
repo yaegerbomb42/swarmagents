@@ -282,6 +282,23 @@ function drainPendingSync(runId: string): void {
 }
 
 /**
+ * Mark an event as already persisted without polluting its JSON: the bus
+ * buffer holds the same object reference, and the SSE layer dedupes log
+ * copies against bus copies by full JSON — an enumerable marker would make
+ * the two copies stringify differently and replay every event twice.
+ * Mirrors the non-enumerable `__logMeta` below.
+ */
+function markWritten(event: SequencedEvent): void {
+  try {
+    Object.defineProperty(event as unknown as Record<string, unknown>, "__written", {
+      value: true,
+      enumerable: false,
+      configurable: true,
+    });
+  } catch { /* ignore */ }
+}
+
+/**
  * Append one event as a JSON line. Writes are serialized per run through an
  * async queue and drained by flushRunLogs() on shutdown. For sync reader
  * compatibility, the write is performed immediately and the queue tracks
@@ -320,7 +337,7 @@ export function appendRunEvent(
       const marker = (event as unknown as { __written?: boolean }).__written;
       if (!marker) {
         writeEventSync(event, runsDir, maxBytes, perRunMaxBytes, globalMaxBytes);
-        try { (event as unknown as Record<string, unknown>).__written = true; } catch { /* */ }
+        markWritten(event);
       }
     } finally {
       resolveDone();
@@ -342,7 +359,7 @@ export function appendRunEvent(
       if (pendingNow.length === 0) pendingByRun.delete(runId);
     }
     writeEventSync(event, runsDir, maxBytes, perRunMaxBytes, globalMaxBytes);
-    try { (event as unknown as Record<string, unknown>).__written = true; } catch { /* */ }
+    markWritten(event);
   } catch { /* writeEventSync already logs */ }
 }
 
@@ -777,14 +794,31 @@ export async function* streamRunEventsFrom(
 
   let emitted = 0;
   let lastEmittedSeq = fromSeq;
+  // Dedup by whole-event content, not seq alone: legacy disk logs can hold
+  // distinct events sharing a seq number (old eviction bug), and keying by
+  // seq would silently drop them. This set only matters when a segment is
+  // re-read after a mid-read rotation (ENOENT restart below); within a
+  // single pass the log holds each event once. It mirrors the SSE layer's
+  // pendingKey so log and bus copies of the same event collapse the same way.
+  const emittedKeys = new Set<string>();
+  const eventKey = (event: SequencedEvent): string => {
+    try {
+      return `${event.seq}\u0000${JSON.stringify(event)}`;
+    } catch {
+      return `${event.seq}\u0000${event.ts}\u0000${event.type}`;
+    }
+  };
   for (let i = startSegment; i < meta.length; i++) {
     const m = meta[i];
     // Entirely behind the cursor (or empty): no need to open the segment.
     // A non-empty segment whose probe could not determine a range
     // (lastSeq 0, e.g. a trailing event larger than the probe window) must
     // still be read — skipping it would silently drop its events.
+    // Use a strict comparison: a segment whose newest seq merely equals the
+    // high-water mark may still hold distinct same-seq events, which the
+    // content-key set below dedups correctly on re-read.
     if (m.size === 0 || m.count === 0) continue;
-    if (m.lastSeq > 0 && m.lastSeq <= lastEmittedSeq) continue;
+    if (m.lastSeq > 0 && m.lastSeq < lastEmittedSeq) continue;
     let skip = i === startSegment ? skipInStart : 0;
     let lines = 0;
     try {
@@ -800,21 +834,23 @@ export async function* streamRunEventsFrom(
           skip--;
           continue;
         }
-        if (event.seq <= lastEmittedSeq) continue;
+        const key = eventKey(event);
+        if (emittedKeys.has(key)) continue;
+        emittedKeys.add(key);
         if (truncated && !announcedWindow && options.onWindow) {
           announcedWindow = true;
           options.onWindow({ truncated, firstSeq: event.seq, lastSeq: newestSeq });
         }
         yield event;
         emitted++;
-        lastEmittedSeq = event.seq;
+        lastEmittedSeq = Math.max(lastEmittedSeq, event.seq);
         if (emitted >= maxEvents) return;
       }
     } catch (err) {
       const code = (err as NodeJS.ErrnoException | undefined)?.code;
       if (code === "ENOENT") {
         // Segment rotated away mid-read: re-resolve and continue without
-        // dropping events. Skip already-emitted seqs.
+        // dropping events. Already-emitted events are skipped by content key.
         meta.splice(0, meta.length, ...(await segmentIndex(runId, runsDir)));
         i = -1;
         startSegment = 0;

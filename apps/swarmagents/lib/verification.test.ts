@@ -120,7 +120,31 @@ test("verifyPhase sends the task, constraints and output to the verifier", async
   assert.match(userPrompt, /1\. Keep the public API/);
   assert.match(userPrompt, /2\. No new dependencies/);
   assert.match(userPrompt, /function parse\(\)/);
+  assert.match(userPrompt, /<untrusted_audited_output>/);
+  assert.match(userPrompt, /<\/untrusted_audited_output>/);
   assert.match(userPrompt, /semantic_acceptance/);
+});
+
+test("verifyPhase includes filesChanged and context in the auditor prompt", async () => {
+  let userPrompt = "";
+  await verifyPhase(
+    {
+      taskType: "code",
+      phase: "semantic_acceptance",
+      prompt: "Review this change",
+      output: "diff output",
+      filesChanged: ["lib/a.ts", "lib/b.ts"],
+      context: { issue: 42, branch: "feature/example" },
+    },
+    async (_system, user) => {
+      userPrompt = user;
+      return JSON.stringify({ passed: true, score: 100, violations: [] });
+    }
+  );
+
+  assert.match(userPrompt, /FILES CHANGED:\n\["lib\/a\.ts","lib\/b\.ts"\]/);
+  assert.match(userPrompt, /"issue":42/);
+  assert.match(userPrompt, /"branch":"feature\/example"/);
 });
 
 test("verifyPhase uses the phase guidance of the audited phase", async () => {
@@ -170,6 +194,26 @@ test("verifyPhase strips markdown code fences around the JSON", async () => {
 
   assert.equal(res.passed, true);
   assert.equal(res.score, 91);
+});
+
+test("verifyPhase preserves code fences inside remediationPrompt", async () => {
+  const remediationPrompt = "Keep this sample:\n```ts\nconst x = `value`;\n```";
+  const res = await verifyPhase(
+    { taskType: "code", phase: "semantic_acceptance", prompt: "p", output: "o" },
+    async () => `\`\`\`json\n${JSON.stringify({ passed: false, score: 35, violations: ["issue"], remediationPrompt })}\n\`\`\``
+  );
+
+  assert.equal(res.remediationPrompt, remediationPrompt);
+});
+
+test("verifyPhase clamps scores to the finite 0..100 range", async () => {
+  for (const [score, expected] of [[145, 100], [-12, 0]] as const) {
+    const res = await verifyPhase(
+      { taskType: "general", phase: "semantic_acceptance", prompt: "p", output: "o" },
+      async () => JSON.stringify({ passed: true, score, violations: [] })
+    );
+    assert.equal(res.score, expected);
+  }
 });
 
 test("verifyPhase fails a 'passed' verdict that still lists violations", async () => {
@@ -247,19 +291,13 @@ test("verifyPhase reports metadata about the audited phase", async () => {
 
 // ---- verifyPhase: error paths ----
 
-test("verifyPhase fails safely when the verifier throws", async () => {
-  const res = await verifyPhase(
+test("verifyPhase propagates LLM errors instead of masking them as parse failures", async () => {
+  await assert.rejects(verifyPhase(
     { taskType: "code", phase: "semantic_acceptance", prompt: "p", output: "o" },
     async () => {
       throw new Error("provider exploded");
     }
-  );
-
-  assert.equal(res.passed, false);
-  assert.equal(res.score, 0);
-  assert.deepEqual(res.violations, ["Verifier output was unparseable or malformed JSON"]);
-  assert.equal(res.remediationPrompt, "Re-run verification with strictly formatted JSON response.");
-  assert.equal(res.metadata?.phase, "semantic_acceptance");
+  ), /provider exploded/);
 });
 
 test("verifyPhase fails safely when the verifier returns a non-string", async () => {
@@ -280,6 +318,7 @@ test("verifyPhase fails safely when the verifier returns JSON that is not an obj
 
   assert.equal(res.passed, false);
   assert.equal(res.score, 0);
+  assert.deepEqual(res.violations, ["Verifier response must be a JSON object"]);
 });
 
 // ---- executeWithPhaseVerification ----
@@ -336,6 +375,19 @@ test("executeWithPhaseVerification throws after the remediation budget is spent"
 
   assert.equal(generations, 2);
   assert.equal(audits, 2);
+});
+
+test("executeWithPhaseVerification rejects a zero remediation budget", async () => {
+  await assert.rejects(
+    executeWithPhaseVerification({
+      taskType: "code",
+      prompt: "p",
+      maxRemediations: 0,
+      callLLM: async () => JSON.stringify({ passed: true, score: 100, violations: [] }),
+      generate: async () => ({ output: "unused" }),
+    }),
+    /maxRemediations must be an integer greater than or equal to 1/
+  );
 });
 
 test("executeWithPhaseVerification stops at the first passing attempt", async () => {
@@ -447,4 +499,22 @@ test("verifyPhase bounds oversized output before building the auditor prompt", a
   assert.ok(seenUserPrompt.length < huge.length);
   assert.match(seenUserPrompt, /output truncated for verification/i);
   assert.match(seenUserPrompt, /A{100}/);
+});
+
+test("executeWithPhaseVerification runs the configured phases in order", async () => {
+  const phases: string[] = [];
+  const outcome = await executeWithPhaseVerification({
+    taskType: "code",
+    prompt: "p",
+    phases: ["preflight_contract", "incremental_milestone", "semantic_acceptance"],
+    callLLM: async (system) => {
+      const match = system.match(/Phase [123]/);
+      phases.push(match?.[0] ?? "missing");
+      return JSON.stringify({ passed: true, score: 100, violations: [] });
+    },
+    generate: async () => ({ output: "o" }),
+  });
+
+  assert.deepEqual(phases, ["Phase 1", "Phase 2", "Phase 3"]);
+  assert.equal(outcome.audit.metadata?.phase, "semantic_acceptance");
 });

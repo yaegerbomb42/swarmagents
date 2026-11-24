@@ -293,6 +293,35 @@ function parseUsage(value: unknown): UsageTotals | null {
   };
 }
 
+/**
+ * Race a ticket outcome against the run's abort signal. The abort listener
+ * is detached in a finally once the race settles: a `{ once: true }`
+ * listener lingers on a long-lived request signal whenever the ticket
+ * settles first (answer/denial/timeout), keeping the run's closure alive.
+ */
+export async function raceAgainstAbort<T>(
+  outcome: Promise<T>,
+  signal: AbortSignal | undefined,
+  onAbortValue: T,
+): Promise<T> {
+  if (!signal) return outcome;
+  // Already aborted: the race is lost before it starts, so resolve the abort
+  // value directly instead of letting an already-settled outcome win.
+  if (signal.aborted) return onAbortValue;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      outcome,
+      new Promise<T>((resolve) => {
+        onAbort = () => resolve(onAbortValue);
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export class ClaudeCodeRunner {
   private readonly bin: string;
   /** Runner-level packer selection; undefined means "use the role default". */
@@ -883,15 +912,18 @@ export class ClaudeCodeRunner {
       }
     };
 
+    const onAbort = () => {
+      aborted = true;
+    };
     if (request.signal) {
       if (request.signal.aborted) {
         aborted = true;
       } else {
-        request.signal.addEventListener("abort", () => {
-          aborted = true;
-        }, { once: true });
+        request.signal.addEventListener("abort", onAbort, { once: true });
       }
     }
+
+    try {
 
     const parser = createStreamJsonParser({
       onLine: (raw, line) => {
@@ -1056,6 +1088,11 @@ export class ClaudeCodeRunner {
     }
 
     return emitFinished();
+    } finally {
+      // The run settled: the abort listener is no longer needed. Detach it
+      // so a long-lived request signal does not keep this run's closure alive.
+      if (request.signal) request.signal.removeEventListener("abort", onAbort);
+    }
   }
 
   private async gateApproval(
@@ -1087,19 +1124,7 @@ export class ClaudeCodeRunner {
     });
 
     // Wait for the human decision, or for the run to be aborted/cancelled.
-    const wait = async (): Promise<"approved" | "denied" | "expired"> => {
-      if (!request.signal) return ticket.verdict;
-      return Promise.race([
-        ticket.verdict,
-        new Promise<"approved" | "denied" | "expired">((resolve) => {
-          if (request.signal!.aborted) return resolve("expired");
-          const onAbort = () => resolve("expired");
-          request.signal!.addEventListener("abort", onAbort, { once: true });
-        }),
-      ]);
-    };
-
-    const verdict = await wait();
+    const verdict = await raceAgainstAbort(ticket.verdict, request.signal, "expired");
     // An "expired" verdict from the TTL is a timeout; one caused by a
     // cancellation is not. Tickets without the probe keep the historical
     // behaviour (expired means timed out).
@@ -1149,16 +1174,7 @@ export class ClaudeCodeRunner {
 
     // A question outlives the agent's tool call, but never the run: a cancel
     // resolves the waiter with "cancelled" so finalization cannot hang.
-    const signal = request.signal;
-    const outcome = signal
-      ? await Promise.race([
-          ticket.outcome,
-          new Promise<{ status: "cancelled" }>((resolve) => {
-            if (signal.aborted) resolve({ status: "cancelled" });
-            else signal.addEventListener("abort", () => resolve({ status: "cancelled" }), { once: true });
-          }),
-        ])
-      : await ticket.outcome;
+    const outcome = await raceAgainstAbort(ticket.outcome, request.signal, { status: "cancelled" as const });
 
     emit({
       type: "question.resolved",
@@ -1195,16 +1211,7 @@ export class ClaudeCodeRunner {
 
     // The handoff outlives the agent's tool call, but never the run: a cancel
     // resolves the waiter with "cancelled" so finalization cannot hang.
-    const signal = request.signal;
-    const outcome = signal
-      ? await Promise.race([
-          ticket.outcome,
-          new Promise<{ status: "cancelled" }>((resolve) => {
-            if (signal.aborted) resolve({ status: "cancelled" });
-            else signal.addEventListener("abort", () => resolve({ status: "cancelled" }), { once: true });
-          }),
-        ])
-      : await ticket.outcome;
+    const outcome = await raceAgainstAbort(ticket.outcome, request.signal, { status: "cancelled" as const });
 
     emit({
       type: "handoff.resolved",

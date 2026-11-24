@@ -7,7 +7,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ClaudeCodeRunner, isBackgroundedCommand, isSignalKillExitCode, resolveMaxTurns } from "./runner.js";
+import { ClaudeCodeRunner, isBackgroundedCommand, isSignalKillExitCode, raceAgainstAbort, resolveMaxTurns } from "./runner.js";
 import { StateLedger } from "./context/contextGovernor.js";
 import { localScorer } from "./system-one/index.js";
 import type { DecisionRouter } from "./decision-brain/index.js";
@@ -1663,4 +1663,97 @@ test("Watchdog on + read paralysis: six fruitless reads halt the run", async () 
   assert.equal(blocked.length, 1);
   assert.match(blocked[0].reason, /progress watchdog: read-paralysis/);
   assert.equal(events.some((e) => e.type === "run.finished"), false);
+});
+/** A minimal AbortSignal stand-in that records listener attach/detach. */
+function fakeSignal(): {
+  signal: AbortSignal;
+  listeners: Set<() => void>;
+  abort: () => void;
+} {
+  const listeners = new Set<() => void>();
+  const raw = {
+    aborted: false,
+    addEventListener(_type: string, fn: () => void) {
+      listeners.add(fn);
+    },
+    removeEventListener(_type: string, fn: () => void) {
+      listeners.delete(fn);
+    },
+  };
+  const signal = raw as unknown as AbortSignal;
+  return {
+    signal,
+    listeners,
+    abort() {
+      raw.aborted = true;
+      for (const fn of [...listeners]) fn();
+    },
+  };
+}
+
+test("raceAgainstAbort detaches the abort listener once the outcome settles", async () => {
+  const { signal, listeners } = fakeSignal();
+  let resolveOutcome!: (value: string) => void;
+  const outcome = new Promise<string>((resolve) => {
+    resolveOutcome = resolve;
+  });
+  const raced = raceAgainstAbort(outcome, signal, "aborted");
+  assert.equal(listeners.size, 1);
+  resolveOutcome("answered");
+  assert.equal(await raced, "answered");
+  assert.equal(listeners.size, 0, "the listener must be detached after the race settles");
+});
+
+test("raceAgainstAbort resolves the abort value when the signal fires", async () => {
+  const { signal, listeners, abort } = fakeSignal();
+  const outcome = new Promise<string>(() => {});
+  const raced = raceAgainstAbort(outcome, signal, "aborted");
+  assert.equal(listeners.size, 1);
+  abort();
+  assert.equal(await raced, "aborted");
+  assert.equal(listeners.size, 0);
+});
+
+test("raceAgainstAbort resolves immediately for an already-aborted signal", async () => {
+  const { signal, listeners, abort } = fakeSignal();
+  abort();
+  const raced = raceAgainstAbort(Promise.resolve("answered"), signal, "aborted");
+  assert.equal(await raced, "aborted");
+  assert.equal(listeners.size, 0, "no listener may be added for an already-aborted signal");
+});
+
+test("raceAgainstAbort passes the outcome through with no signal", async () => {
+  assert.equal(await raceAgainstAbort(Promise.resolve("answered"), undefined, "aborted"), "answered");
+});
+
+test("run detaches the request-signal abort listener once the run settles", async () => {
+  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const runner = new ClaudeCodeRunner({ bin: "claude" });
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const added: unknown[] = [];
+  const removed: unknown[] = [];
+  const origAdd = signal.addEventListener.bind(signal);
+  const origRemove = signal.removeEventListener.bind(signal);
+  signal.addEventListener = function (
+    type: string,
+    listener: EventListenerOrEventListenerObject,
+    options?: boolean | AddEventListenerOptions,
+  ) {
+    if (type === "abort" && typeof listener === "function") added.push(listener);
+    return origAdd(type, listener, options);
+  } as AbortSignal["addEventListener"];
+  signal.removeEventListener = function (
+    type: string,
+    listener: EventListenerOrEventListenerObject,
+    options?: boolean | EventListenerOptions,
+  ) {
+    if (type === "abort" && typeof listener === "function") removed.push(listener);
+    return origRemove(type, listener, options);
+  } as AbortSignal["removeEventListener"];
+
+  const outcome = await runner.run({ prompt: "Inspect repo", env: {}, vm, signal }, () => {});
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(added.length, 1, "the run registers one abort listener");
+  assert.deepEqual(removed, added, "the listener is detached once the run settles");
 });

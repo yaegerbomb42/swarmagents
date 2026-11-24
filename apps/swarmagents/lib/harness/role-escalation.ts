@@ -113,14 +113,30 @@ export async function awaitRoleEscalation(
   let verdict: "approved" | "denied" | "expired";
   if (!opts.signal) {
     verdict = await verdictPromise;
+  } else if (opts.signal.aborted) {
+    // Already cancelled: expire the record instead of leaving it pending
+    // until its TTL, then resolve as expired.
+    store.expirePendingForRun(approval.runId);
+    verdict = "expired";
   } else {
-    verdict = await Promise.race([
-      verdictPromise,
-      new Promise<"expired">((resolve) => {
-        if (opts.signal!.aborted) return resolve("expired");
-        opts.signal!.addEventListener("abort", () => resolve("expired"), { once: true });
-      }),
-    ]);
+    const signal = opts.signal;
+    let onAbort: (() => void) | undefined;
+    try {
+      verdict = await Promise.race([
+        verdictPromise,
+        new Promise<"expired">((resolve) => {
+          onAbort = () => {
+            // The run is being cancelled: expire the pending record so it
+            // does not linger until its TTL (and so its waiter resolves).
+            store.expirePendingForRun(approval.runId);
+            resolve("expired");
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
   }
 
   if (verdict === "expired" && !opts.signal?.aborted && store.get(approval.id)?.timedOut === true) {

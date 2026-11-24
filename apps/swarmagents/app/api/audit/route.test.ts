@@ -292,17 +292,17 @@ test("GET /api/audit paginates with before cursor and nextCursor", async () => {
 
   const page1 = (await (await auditGet("alice", "?limit=2")).json()) as {
     entries: Array<{ target: string; ts: string }>;
-    nextCursor: number | null;
+    nextCursor: string | null;
   };
   assert.deepEqual(
     page1.entries.map((e) => e.target),
     ["snap-4", "snap-3"],
   );
-  assert.equal(page1.nextCursor, Date.parse(page1.entries[1].ts));
+  assert.equal(page1.nextCursor, `${Date.parse(page1.entries[1].ts)}:0`);
 
   const page2 = (await (await auditGet("alice", `?limit=2&before=${page1.nextCursor}`)).json()) as {
     entries: Array<{ target: string }>;
-    nextCursor: number | null;
+    nextCursor: string | null;
   };
   assert.deepEqual(
     page2.entries.map((e) => e.target),
@@ -311,13 +311,81 @@ test("GET /api/audit paginates with before cursor and nextCursor", async () => {
 
   const page3 = (await (await auditGet("alice", `?limit=2&before=${page2.nextCursor}`)).json()) as {
     entries: Array<{ target: string }>;
-    nextCursor: number | null;
+    nextCursor: string | null;
   };
   assert.deepEqual(
     page3.entries.map((e) => e.target),
     ["snap-0"],
   );
   assert.equal(page3.nextCursor, null);
+
+  // A bare-ms cursor (legacy clients) is still accepted, as offset 0.
+  const legacy = (await (await auditGet("alice", `?limit=2&before=${Date.parse(page1.entries[1].ts)}`)).json()) as {
+    entries: Array<{ target: string }>;
+  };
+  assert.deepEqual(
+    legacy.entries.map((e) => e.target),
+    ["snap-2", "snap-1"],
+  );
+
+  assert.equal((await auditGet("alice", "?before=123:")).status, 400);
+  assert.equal((await auditGet("alice", "?before=123:-1")).status, 400);
+});
+
+test("GET /api/audit pages exactly across a same-millisecond boundary", async () => {
+  const ms = Date.UTC(2026, 0, 1);
+  const mk = (target: string, ts: number) =>
+    JSON.stringify({
+      ts: new Date(ts).toISOString(),
+      user: "alice",
+      action: "snapshot.create",
+      target,
+      result: "success",
+    });
+  const lines = [mk("before", ms - 1), mk("same-0", ms), mk("same-1", ms), mk("same-2", ms), mk("after", ms + 1)];
+  fs.appendFileSync(path.join(dir, "audit.jsonl"), `${lines.join("\n")}\n`, "utf8");
+
+  const seen: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = (await (
+      await auditGet("alice", `?limit=2${cursor ? `&before=${encodeURIComponent(cursor)}` : ""}`)
+    ).json()) as { entries: Array<{ target: string }>; nextCursor: string | null };
+    seen.push(...page.entries.map((e) => e.target));
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor);
+  assert.deepEqual(seen, ["after", "same-2", "same-1", "same-0", "before"]);
+});
+
+test("GET /api/audit paginates past 1,000 entries", async () => {
+  const base = Date.UTC(2026, 0, 1);
+  const lines: string[] = [];
+  for (let i = 0; i < 1100; i++) {
+    lines.push(
+      JSON.stringify({
+        ts: new Date(base + i).toISOString(),
+        user: "alice",
+        action: "login.success",
+        target: `t-${i}`,
+        result: "success",
+      }),
+    );
+  }
+  fs.appendFileSync(path.join(dir, "audit.jsonl"), `${lines.join("\n")}\n`, "utf8");
+
+  const seen: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = (await (
+      await auditGet("alice", `?limit=500${cursor ? `&before=${encodeURIComponent(cursor)}` : ""}`)
+    ).json()) as { entries: Array<{ target: string }>; nextCursor: string | null };
+    seen.push(...page.entries.map((e) => e.target));
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor);
+  assert.equal(seen.length, 1100);
+  assert.equal(new Set(seen).size, 1100);
+  assert.equal(seen[0], "t-1099");
+  assert.equal(seen[1099], "t-0");
 });
 
 test("GET /api/audit reaches matches older than the newest 1,000 rows when filtering", async () => {

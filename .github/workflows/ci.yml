@@ -90,17 +90,24 @@ jobs:
           cache: npm
           cache-dependency-path: apps/swarmagents/package-lock.json
 
+      # --ignore-scripts: no dependency lifecycle scripts run at install
+      # time. The one install script the e2e run needs (esbuild's platform
+      # binary download, required by tsx) is run explicitly below; fsevents
+      # is darwin-only and a no-op on Linux.
       - name: Install dependencies
         working-directory: apps/swarmagents
-        run: npm ci
+        run: npm ci --ignore-scripts && node node_modules/esbuild/install.js
 
       # The specs drive a real Chromium via playwright-core; the runner
       # image ships no browser. --with-deps installs the system
       # libraries headless Chromium needs (passwordless sudo on hosted
       # runners).
+      # Use the locally installed playwright-core binary (version pinned by
+      # the lockfile) instead of npx, which would fetch and run packages
+      # on demand.
       - name: Install Chromium for e2e
         working-directory: apps/swarmagents
-        run: npx playwright-core install --with-deps chromium
+        run: ./node_modules/.bin/playwright-core install --with-deps chromium
 
       # The byoc spec starts a real swarm-node in --host-mode, whose desktop
       # needs Xvfb + x11vnc + websockify; without them the node reports no

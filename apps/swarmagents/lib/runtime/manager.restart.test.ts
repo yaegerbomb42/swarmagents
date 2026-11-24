@@ -94,7 +94,28 @@ function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "swarm-restart-"));
 }
 
-test("restart: queued prompt survives, active run aborts cleanly, pending approval expires explicitly", async () => {
+/**
+ * Shared scaffolding for the restart tests: one manager over durable
+ * state (the "first process"), plus the copy-and-rebuild step that
+ * simulates the next process. Six tests repeat this setup; the helper
+ * keeps the per-test bodies to what each test actually asserts.
+ */
+interface RestartPair {
+  dir: string;
+  runsDir: string;
+  stateA: string;
+  stateB: string;
+  approvalsA: string;
+  approvalsB: string;
+  bus: TelemetryBus;
+  driverA: BlockingVmDriver;
+  storeA: RunStateStore;
+  approvalStoreA: ApprovalStore | undefined;
+  managerA: RuntimeManager;
+  cleanup(managerB?: RuntimeManager): void;
+}
+
+function beginRestartPair(withApprovals: boolean): RestartPair {
   const dir = tmpDir();
   const runsDir = path.join(dir, "runs");
   const stateA = path.join(dir, "state-a.json");
@@ -103,20 +124,78 @@ test("restart: queued prompt survives, active run aborts cleanly, pending approv
   const approvalsB = path.join(dir, "approvals-b.json");
   configureRunsDir(runsDir);
   const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
-  let managerA: RuntimeManager | undefined;
+  const driverA = new BlockingVmDriver();
+  const storeA = new RunStateStore({ filePath: stateA });
+  const approvalStoreA = withApprovals
+    ? new ApprovalStore({ persistPath: approvalsA, ttlMs: 60_000 })
+    : undefined;
+  if (approvalStoreA) setApprovalStoreForTesting(approvalStoreA);
+  const managerA = new RuntimeManager({
+    vm: new VmManager({ customDriver: driverA }),
+    bus,
+    router: null,
+    stateStore: storeA,
+  });
+  return {
+    dir,
+    runsDir,
+    stateA,
+    stateB,
+    approvalsA,
+    approvalsB,
+    bus,
+    driverA,
+    storeA,
+    approvalStoreA,
+    managerA,
+    cleanup(managerB?: RuntimeManager): void {
+      managerA.cancel("alice");
+      managerB?.cancel("alice");
+      configureRunsDir(null);
+      setApprovalStoreForTesting(null);
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * "Restart": copy the durable snapshot to the B side and build a fresh
+ * manager over it. Synchronous on purpose: the restored run starts on a
+ * deferred microtask after construction, so an await here would let that
+ * tick fire before the test's synchronous assertions (FIX-35). Tests that
+ * need the new VM snapshotted first (the resume-point tests) create vmB,
+ * await its snapshot, and pass it in.
+ */
+function restartPair(
+  pair: RestartPair,
+  driverB: FakeVmDriver,
+  vmB?: VmManager,
+): { driverB: FakeVmDriver; managerB: RuntimeManager; approvalStoreB: ApprovalStore | undefined } {
+  fs.copyFileSync(pair.stateA, pair.stateB);
+  if (pair.approvalStoreA) fs.copyFileSync(pair.approvalsA, pair.approvalsB);
+  const managerVm = vmB ?? new VmManager({ customDriver: driverB });
+  const approvalStoreB = pair.approvalStoreA
+    ? new ApprovalStore({ persistPath: pair.approvalsB, ttlMs: 60_000 })
+    : undefined;
+  if (approvalStoreB) setApprovalStoreForTesting(approvalStoreB);
+  const managerB = new RuntimeManager({
+    vm: managerVm,
+    bus: pair.bus,
+    router: null,
+    stateStore: new RunStateStore({ filePath: pair.stateB }),
+  });
+  return { driverB, managerB, approvalStoreB };
+}
+
+test("restart: queued prompt survives, active run aborts cleanly, pending approval expires explicitly", async () => {
+  const pair = beginRestartPair(true);
+  const approvalStoreA = pair.approvalStoreA;
+  assert.ok(approvalStoreA);
+  const { bus, driverA, storeA, managerA } = pair;
+  const runsDir = pair.runsDir;
+  let managerB: RuntimeManager | undefined;
 
   try {
-    const driverA = new BlockingVmDriver();
-    const storeA = new RunStateStore({ filePath: stateA });
-    const approvalStoreA = new ApprovalStore({ persistPath: approvalsA, ttlMs: 60_000 });
-    setApprovalStoreForTesting(approvalStoreA);
-    managerA = new RuntimeManager({
-      vm: new VmManager({ customDriver: driverA }),
-      bus,
-      router: null,
-      stateStore: storeA,
-    });
-
     const active = managerA.start("alice", { prompt: "long active prompt" });
     assert.equal(active.accepted, true);
     assert.equal(active.queued, false);
@@ -143,19 +222,10 @@ test("restart: queued prompt survives, active run aborts cleanly, pending approv
     assert.deepEqual(snapshot.users.alice.queue.map((run) => run.prompt), [
       "queued follow-up prompt",
     ]);
-    fs.copyFileSync(stateA, stateB);
-    fs.copyFileSync(approvalsA, approvalsB);
-
     // "Restart": a fresh manager over the copied durable state.
     const driverB = new FastVmDriver();
-    const approvalStoreB = new ApprovalStore({ persistPath: approvalsB, ttlMs: 60_000 });
-    setApprovalStoreForTesting(approvalStoreB);
-    const managerB = new RuntimeManager({
-      vm: new VmManager({ customDriver: driverB }),
-      bus,
-      router: null,
-      stateStore: new RunStateStore({ filePath: stateB }),
-    });
+    const { managerB: restarted, approvalStoreB } = restartPair(pair, driverB);
+    managerB = restarted;
 
     // The interrupted run is visibly failed, not silently vanished.
     const interrupted = getRun(active.runId, runsDir);
@@ -165,6 +235,7 @@ test("restart: queued prompt survives, active run aborts cleanly, pending approv
 
     // The approval record survived, and its outcome is an explicit restart
     // expiry — never a user denial and never a TTL surprise.
+    assert.ok(approvalStoreB, "restart preserves the approval store");
     const recovered = approvalStoreB.get(approval.id);
     assert.ok(recovered, "approval record should survive the restart");
     assert.equal(recovered.status, "expired");
@@ -182,13 +253,10 @@ test("restart: queued prompt survives, active run aborts cleanly, pending approv
     assert.equal(followUp.status, "finished");
 
     // The snapshot was normalized: no stale active run, no stale queue.
-    const after = new RunStateStore({ filePath: stateB }).load();
+    const after = new RunStateStore({ filePath: pair.stateB }).load();
     assert.equal(after.users.alice, undefined);
   } finally {
-    managerA?.cancel("alice");
-    configureRunsDir(null);
-    setApprovalStoreForTesting(null);
-    fs.rmSync(dir, { recursive: true, force: true });
+    pair.cleanup(managerB);
   }
 });
 
@@ -292,29 +360,14 @@ test("auto-checkpoint records and persists the resume point in runtime state", a
 });
 
 test("restart: run with a recorded resume point resumes from its checkpoint", async () => {
-  const dir = tmpDir();
-  const runsDir = path.join(dir, "runs");
-  const stateA = path.join(dir, "state-a.json");
-  const stateB = path.join(dir, "state-b.json");
-  const approvalsA = path.join(dir, "approvals-a.json");
-  const approvalsB = path.join(dir, "approvals-b.json");
-  configureRunsDir(runsDir);
-  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
-  let managerA: RuntimeManager | undefined;
+  const pair = beginRestartPair(true);
+  const approvalStoreA = pair.approvalStoreA;
+  assert.ok(approvalStoreA);
+  const { bus, driverA, storeA, managerA } = pair;
+  const runsDir = pair.runsDir;
   let managerB: RuntimeManager | undefined;
 
   try {
-    const driverA = new BlockingVmDriver();
-    const storeA = new RunStateStore({ filePath: stateA });
-    const approvalStoreA = new ApprovalStore({ persistPath: approvalsA, ttlMs: 60_000 });
-    setApprovalStoreForTesting(approvalStoreA);
-    managerA = new RuntimeManager({
-      vm: new VmManager({ customDriver: driverA }),
-      bus,
-      router: null,
-      stateStore: storeA,
-    });
-
     const active = managerA.start("alice", {
       prompt: "do risky work with checkpoints",
       sessionId: "sess_resume_test",
@@ -354,28 +407,20 @@ test("restart: run with a recorded resume point resumes from its checkpoint", as
     assert.equal(queued.accepted, true);
     assert.equal(queued.queued, true);
 
-    fs.copyFileSync(stateA, stateB);
-    fs.copyFileSync(approvalsA, approvalsB);
-
     // "Restart": a fresh manager over the copied durable state. The VM
     // snapshot survives in the (persistent) driver, like production.
     const driverB = new RecordingFastVmDriver();
     const vmB = new VmManager({ customDriver: driverB });
     await vmB.snapshot("alice", vmLabel);
-    const approvalStoreB = new ApprovalStore({ persistPath: approvalsB, ttlMs: 60_000 });
-    setApprovalStoreForTesting(approvalStoreB);
-    managerB = new RuntimeManager({
-      vm: vmB,
-      bus,
-      router: null,
-      stateStore: new RunStateStore({ filePath: stateB }),
-    });
+    const { managerB: restarted, approvalStoreB } = restartPair(pair, driverB, vmB);
+    managerB = restarted;
 
     // The restart itself must leave the pending approval pending: check
     // synchronously, before any await lets the fast resumed run finish
     // (finalize() legitimately expires leftover approvals at run end, so
     // a later read would see "expired" even though the restart preserved
     // it — that is the run-end cleanup, not a restart expiry).
+    assert.ok(approvalStoreB, "restart preserves the approval store");
     const recovered = approvalStoreB.get(pending.id);
     assert.ok(recovered, "approval record should survive the restart");
     assert.equal(recovered.status, "pending");
@@ -407,38 +452,19 @@ test("restart: run with a recorded resume point resumes from its checkpoint", as
     assert.ok(followUp, "queued run should be restored and started");
     assert.equal(followUp.status, "finished");
   } finally {
-    managerA?.cancel("alice");
-    managerB?.cancel("alice");
-    configureRunsDir(null);
-    setApprovalStoreForTesting(null);
-    fs.rmSync(dir, { recursive: true, force: true });
+    pair.cleanup(managerB);
   }
 });
 
 test("graceful shutdown suspends a checkpointed run instead of cancelling it", async () => {
-  const dir = tmpDir();
-  const runsDir = path.join(dir, "runs");
-  const stateA = path.join(dir, "state-a.json");
-  const stateB = path.join(dir, "state-b.json");
-  const approvalsA = path.join(dir, "approvals-a.json");
-  const approvalsB = path.join(dir, "approvals-b.json");
-  configureRunsDir(runsDir);
-  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
-  let managerA: RuntimeManager | undefined;
+  const pair = beginRestartPair(true);
+  const approvalStoreA = pair.approvalStoreA;
+  assert.ok(approvalStoreA);
+  const { bus, driverA, storeA, managerA } = pair;
+  const runsDir = pair.runsDir;
   let managerB: RuntimeManager | undefined;
 
   try {
-    const driverA = new BlockingVmDriver();
-    const storeA = new RunStateStore({ filePath: stateA });
-    const approvalStoreA = new ApprovalStore({ persistPath: approvalsA, ttlMs: 60_000 });
-    setApprovalStoreForTesting(approvalStoreA);
-    managerA = new RuntimeManager({
-      vm: new VmManager({ customDriver: driverA }),
-      bus,
-      router: null,
-      stateStore: storeA,
-    });
-
     const active = managerA.start("alice", {
       prompt: "do risky work with checkpoints",
       sessionId: "sess_shutdown_test",
@@ -485,23 +511,16 @@ test("graceful shutdown suspends a checkpointed run instead of cancelling it", a
     assert.equal(log.summary.status, "running");
 
     // The next process resumes it from the checkpoint.
-    fs.copyFileSync(stateA, stateB);
-    fs.copyFileSync(approvalsA, approvalsB);
     const driverB = new RecordingFastVmDriver();
     const vmB = new VmManager({ customDriver: driverB });
     await vmB.snapshot("alice", vmLabel);
-    const approvalStoreB = new ApprovalStore({ persistPath: approvalsB, ttlMs: 60_000 });
-    setApprovalStoreForTesting(approvalStoreB);
-    managerB = new RuntimeManager({
-      vm: vmB,
-      bus,
-      router: null,
-      stateStore: new RunStateStore({ filePath: stateB }),
-    });
+    const { managerB: restarted, approvalStoreB } = restartPair(pair, driverB, vmB);
+    managerB = restarted;
 
     // Same synchronous check as the restart test: the shutdown + restart
     // preserved the approval pending; the run finishing later expires it
     // via finalize(), which is the run-end cleanup, not a restart expiry.
+    assert.ok(approvalStoreB, "restart preserves the approval store");
     assert.equal(approvalStoreB.get(pending.id)?.status, "pending");
 
     await waitForCalls(driverB, 1);
@@ -516,39 +535,22 @@ test("graceful shutdown suspends a checkpointed run instead of cancelling it", a
     );
     assert.equal(runs.find((run) => run.runId === active.runId)?.status, "finished");
   } finally {
-    managerA?.cancel("alice");
-    managerB?.cancel("alice");
-    configureRunsDir(null);
-    setApprovalStoreForTesting(null);
-    fs.rmSync(dir, { recursive: true, force: true });
+    pair.cleanup(managerB);
   }
 });
 
 test("restart: restored runs do not start during construction, then start after (FIX-35)", async () => {
-  const dir = tmpDir();
-  const runsDir = path.join(dir, "runs");
-  const stateA = path.join(dir, "state-a.json");
-  const stateB = path.join(dir, "state-b.json");
-  configureRunsDir(runsDir);
-  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
-  let managerA: RuntimeManager | undefined;
+  const pair = beginRestartPair(false);
+  const { bus, driverA, storeA, managerA } = pair;
+  const runsDir = pair.runsDir;
   let managerB: RuntimeManager | undefined;
 
   try {
-    const driverA = new BlockingVmDriver();
-    const storeA = new RunStateStore({ filePath: stateA });
-    managerA = new RuntimeManager({
-      vm: new VmManager({ customDriver: driverA }),
-      bus,
-      router: null,
-      stateStore: storeA,
-    });
     const active = managerA.start("alice", { prompt: "long active prompt" });
     const queued = managerA.start("alice", { prompt: "queued follow-up prompt" });
     assert.equal(active.accepted, true);
     assert.equal(queued.queued, true);
     await waitForCalls(driverA, 1);
-    fs.copyFileSync(stateA, stateB);
 
     // vm.starting is published from executeInner's synchronous prefix, so
     // whether it fires before or after `new RuntimeManager` returns proves
@@ -560,12 +562,7 @@ test("restart: restored runs do not start during construction, then start after 
     });
 
     const driverB = new FastVmDriver();
-    managerB = new RuntimeManager({
-      vm: new VmManager({ customDriver: driverB }),
-      bus,
-      router: null,
-      stateStore: new RunStateStore({ filePath: stateB }),
-    });
+    managerB = restartPair(pair, driverB).managerB;
     constructionDone = true;
 
     // Synchronously after construction the restored run is still queued —
@@ -586,45 +583,24 @@ test("restart: restored runs do not start during construction, then start after 
     assert.equal(runs.find((run) => run.runId === queued.runId)?.status, "finished");
     unsubscribe();
   } finally {
-    managerA?.cancel("alice");
-    managerB?.cancel("alice");
-    configureRunsDir(null);
-    fs.rmSync(dir, { recursive: true, force: true });
+    pair.cleanup(managerB);
   }
 });
 
 test("restart: fresh prompt before the deferred drain queues behind restored work (FIX-35)", async () => {
-  const dir = tmpDir();
-  const runsDir = path.join(dir, "runs");
-  const stateA = path.join(dir, "state-a.json");
-  const stateB = path.join(dir, "state-b.json");
-  configureRunsDir(runsDir);
-  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
-  let managerA: RuntimeManager | undefined;
+  const pair = beginRestartPair(false);
+  const { bus, driverA, storeA, managerA } = pair;
+  const runsDir = pair.runsDir;
   let managerB: RuntimeManager | undefined;
 
   try {
-    const driverA = new BlockingVmDriver();
-    const storeA = new RunStateStore({ filePath: stateA });
-    managerA = new RuntimeManager({
-      vm: new VmManager({ customDriver: driverA }),
-      bus,
-      router: null,
-      stateStore: storeA,
-    });
     managerA.start("alice", { prompt: "long active prompt" });
     const queued = managerA.start("alice", { prompt: "queued follow-up prompt" });
     assert.equal(queued.queued, true);
     await waitForCalls(driverA, 1);
-    fs.copyFileSync(stateA, stateB);
 
     const driverB = new FastVmDriver();
-    managerB = new RuntimeManager({
-      vm: new VmManager({ customDriver: driverB }),
-      bus,
-      router: null,
-      stateStore: new RunStateStore({ filePath: stateB }),
-    });
+    managerB = restartPair(pair, driverB).managerB;
 
     // No await yet: the deferred restored-start has not fired. A fresh
     // prompt submitted in this window must not jump the restored queue —
@@ -646,45 +622,24 @@ test("restart: fresh prompt before the deferred drain queues behind restored wor
     assert.equal(runs.find((run) => run.runId === queued.runId)?.status, "finished");
     assert.equal(runs.find((run) => run.runId === fresh.runId)?.status, "finished");
   } finally {
-    managerA?.cancel("alice");
-    managerB?.cancel("alice");
-    configureRunsDir(null);
-    fs.rmSync(dir, { recursive: true, force: true });
+    pair.cleanup(managerB);
   }
 });
 
 test("restart: shutdown before the deferred drain leaves restored runs queued and durable (FIX-35)", async () => {
-  const dir = tmpDir();
-  const runsDir = path.join(dir, "runs");
-  const stateA = path.join(dir, "state-a.json");
-  const stateB = path.join(dir, "state-b.json");
-  configureRunsDir(runsDir);
-  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
-  let managerA: RuntimeManager | undefined;
+  const pair = beginRestartPair(false);
+  const { bus, driverA, storeA, managerA } = pair;
+  const runsDir = pair.runsDir;
   let managerB: RuntimeManager | undefined;
 
   try {
-    const driverA = new BlockingVmDriver();
-    const storeA = new RunStateStore({ filePath: stateA });
-    managerA = new RuntimeManager({
-      vm: new VmManager({ customDriver: driverA }),
-      bus,
-      router: null,
-      stateStore: storeA,
-    });
     managerA.start("alice", { prompt: "long active prompt" });
     const queued = managerA.start("alice", { prompt: "queued follow-up prompt" });
     assert.equal(queued.queued, true);
     await waitForCalls(driverA, 1);
-    fs.copyFileSync(stateA, stateB);
 
     const driverB = new FastVmDriver();
-    managerB = new RuntimeManager({
-      vm: new VmManager({ customDriver: driverB }),
-      bus,
-      router: null,
-      stateStore: new RunStateStore({ filePath: stateB }),
-    });
+    managerB = restartPair(pair, driverB).managerB;
 
     // SIGTERM lands before the deferred tick: the shutdown must not start
     // restored work during the flush (same contract as finalize with
@@ -697,14 +652,11 @@ test("restart: shutdown before the deferred drain leaves restored runs queued an
     assert.equal(driverB.calls.length, 0);
 
     // Still durable: the next process restores it as usual.
-    const snapshot = new RunStateStore({ filePath: stateB }).load();
+    const snapshot = new RunStateStore({ filePath: pair.stateB }).load();
     assert.equal(snapshot.users.alice?.active, null);
     assert.equal(snapshot.users.alice?.queue[0]?.runId, queued.runId);
   } finally {
-    managerA?.cancel("alice");
-    managerB?.cancel("alice");
-    configureRunsDir(null);
-    fs.rmSync(dir, { recursive: true, force: true });
+    pair.cleanup(managerB);
   }
 });
 

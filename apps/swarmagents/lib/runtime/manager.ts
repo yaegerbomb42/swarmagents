@@ -1651,6 +1651,31 @@ export class RuntimeManager {
     });
   }
 
+  /** Announce a run (queued or starting) and its mode in one place. */
+  private publishRunCreated(
+    runId: string,
+    userId: string,
+    input: { prompt: string; sessionId?: string; model?: string; projectId?: string; forkedFrom?: unknown },
+    runMode: RunModeInfo,
+  ): void {
+    this.bus.publish(runId, {
+      type: "run.created",
+      data: {
+        prompt: truncate(input.prompt, SUMMARY_PROMPT_LEN),
+        sessionId: input.sessionId,
+        userId,
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.projectId ? { projectId: input.projectId } : {}),
+        ...(input.forkedFrom ? { forkedFrom: input.forkedFrom } : {}),
+        compute: { kind: "cloud" },
+        mode: runMode.mode,
+        modeLabel: runMode.label,
+        modeReason: runMode.reason,
+      },
+    });
+    this.publishMode(runId, runMode);
+  }
+
   /**
    * Refine the run mode from the provider actually selected for an attempt.
    * Failover can move a run between models, so the mode is recomputed before
@@ -1986,22 +2011,7 @@ export class RuntimeManager {
       st.queue.push(queued);
       const position = st.queue.length;
       const capacity = capacityWait ? this.capacityStatusFor(userId, runId) : undefined;
-      this.bus.publish(runId, {
-        type: "run.created",
-        data: {
-          prompt: truncate(input.prompt, SUMMARY_PROMPT_LEN),
-          sessionId: input.sessionId,
-          userId,
-          ...(input.model ? { model: input.model } : {}),
-          ...(input.projectId ? { projectId: input.projectId } : {}),
-          ...(input.forkedFrom ? { forkedFrom: input.forkedFrom } : {}),
-          compute: { kind: "cloud" },
-          mode: runMode.mode,
-          modeLabel: runMode.label,
-          modeReason: runMode.reason,
-        },
-      });
-      this.publishMode(runId, runMode);
+      this.publishRunCreated(runId, userId, input, runMode);
       this.bus.publish(runId, {
         type: "run.queued",
         data: {
@@ -2047,22 +2057,7 @@ export class RuntimeManager {
     };
     st.active = active;
 
-    this.bus.publish(runId, {
-      type: "run.created",
-      data: {
-        prompt: truncate(input.prompt, SUMMARY_PROMPT_LEN),
-        sessionId: input.sessionId,
-        userId,
-        ...(input.model ? { model: input.model } : {}),
-        ...(input.projectId ? { projectId: input.projectId } : {}),
-        ...(input.forkedFrom ? { forkedFrom: input.forkedFrom } : {}),
-        compute: { kind: "cloud" },
-        mode: runMode.mode,
-        modeLabel: runMode.label,
-        modeReason: runMode.reason,
-      },
-    });
-    this.publishMode(runId, runMode);
+    this.publishRunCreated(runId, userId, input, runMode);
     this.persistState();
 
     // Reap any cancelled predecessor's leftover processes before this run's

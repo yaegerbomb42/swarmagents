@@ -183,7 +183,11 @@ export async function gradeRunDir(
     const { stdout } = await execFileAsync(
       process.execPath,
       ["--test", "--test-reporter=tap", absolute],
-      { cwd: runDir, timeout: 30_000, maxBuffer: 1024 * 1024, env }
+      // Generous timeout: under a parallel test run the machine is
+      // saturated and a grading subprocess can take far longer than the
+      // ~1s it needs unloaded. A timeout here fails a trial, which the
+      // baseline-vs-baseline gate reads as a regression.
+      { cwd: runDir, timeout: 120_000, maxBuffer: 1024 * 1024, env }
     );
     return parseTap(stdout);
   } catch (err) {

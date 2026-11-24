@@ -14,13 +14,14 @@
 // and that no isolated run directory leaks. It exits 0 only if all checks
 // behave as expected.
 
-import { readdir } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
   aggregateReport,
   compareReports,
   HarnessEvalRunner,
+  LocalTempIsolation,
   renderMarkdownReport,
   writeParetoReport,
   EVAL_SUITE,
@@ -83,11 +84,11 @@ function configFor(name: string, profile: HarnessConfig["profile"], modelTier: "
   return { name, profile, modelTier };
 }
 
-async function leftoverRunDirs(before: Set<string>): Promise<string[]> {
-  const entries = await readdir(os.tmpdir());
-  return entries.filter(
-    (e) => e.startsWith("swarm-eval-") && !before.has(e)
-  );
+async function leftoverRunDirs(root: string): Promise<string[]> {
+  // Scoped to this run's own isolation root: the shared tmpdir also holds
+  // other concurrent eval runs, whose in-flight directories are not leaks.
+  const entries = await readdir(root);
+  return entries.filter((e) => e.startsWith("swarm-eval-"));
 }
 
 interface CheckResult {
@@ -98,8 +99,12 @@ interface CheckResult {
 
 async function runDryRun(opts: CliOptions): Promise<number> {
   const checks: CheckResult[] = [];
-  const runner = new HarnessEvalRunner();
-  const before = new Set(await readdir(os.tmpdir()));
+  // The dry-run's runs live under their own isolation root, so the leak
+  // check sees only this run's directories — never another concurrent
+  // eval run's in-flight directories in the shared tmpdir.
+  const isolationRoot = await mkdtemp(path.join(os.tmpdir(), "swarm-eval-dryrun-"));
+  const runner = new HarnessEvalRunner({ isolation: new LocalTempIsolation(isolationRoot) });
+  try {
 
   const baselineConfig = configFor("baseline", "baseline", opts.modelTier);
   const baselineResults = await runner.runSuite(baselineConfig, { trialsPerTask: 1 });
@@ -138,7 +143,7 @@ async function runDryRun(opts: CliOptions): Promise<number> {
     detail: `${baseline.tasksRun} tasks, buckets: ${["surgical", "feature", "long-horizon"].map((b) => baseline.byBucket[b as keyof EvalReport["byBucket"]].tasks).join("/")}`,
   });
 
-  const leaked = await leftoverRunDirs(before);
+  const leaked = await leftoverRunDirs(isolationRoot);
   checks.push({
     name: "no isolated run directory leaked",
     pass: leaked.length === 0,
@@ -151,6 +156,9 @@ async function runDryRun(opts: CliOptions): Promise<number> {
     if (!check.pass) allPass = false;
   }
   return allPass ? 0 : 1;
+  } finally {
+    await rm(isolationRoot, { recursive: true, force: true });
+  }
 }
 
 async function runAb(opts: CliOptions): Promise<number> {

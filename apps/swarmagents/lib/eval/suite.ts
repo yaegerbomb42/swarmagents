@@ -17,18 +17,33 @@ function task(t: EvalTaskDef): EvalTaskDef {
   return t;
 }
 
-export const EVAL_SUITE: EvalTaskDef[] = [
-  // ---- Bucket A: surgical, single-file bug fixes (target <= 15 turns) ----
-  task({
-    id: "surgical-rate-limiter-off-by-one",
-    bucket: "surgical",
-    title: "Sliding-window rate limiter allows limit+1 requests",
-    targetTurns: 8,
-    repoCommit: PIN,
-    description:
-      "allow() increments the counter before checking it, so a limit of 3 admits a 4th request inside the window.",
-    files: {
-      "src/limiter.mjs": `export class SlidingWindowLimiter {
+
+/**
+ * Derive a file variant (a task's `solution` or `broken` implementation)
+ * from its base (the starting file, or the solution) by exact-substring
+ * replacement. Each search must occur exactly once in the base, so an edit
+ * can never silently land on the wrong lines; a miss or an ambiguous search
+ * throws at module load instead of grading a wrong file. Fixture variants
+ * differ from their base by a few lines, so storing them as edits keeps the
+ * suite readable and keeps near-identical copies of every implementation
+ * out of the file.
+ */
+function variant(base: string, edits: [search: string, replacement: string][]): string {
+  let out = base;
+  for (const [search, replacement] of edits) {
+    const first = out.indexOf(search);
+    if (first === -1) {
+      throw new Error(`variant: search text not found: ${JSON.stringify(search.slice(0, 80))}`);
+    }
+    if (out.indexOf(search, first + 1) !== -1) {
+      throw new Error(`variant: search text is not unique: ${JSON.stringify(search.slice(0, 80))}`);
+    }
+    out = out.slice(0, first) + replacement + out.slice(first + search.length);
+  }
+  return out;
+}
+
+const START_SURGICAL_RATE_LIMITER_OFF_BY_ONE_LIMITER = `export class SlidingWindowLimiter {
   constructor(limit, windowMs, now = () => Date.now()) {
     this.limit = limit;
     this.windowMs = windowMs;
@@ -46,7 +61,501 @@ export const EVAL_SUITE: EvalTaskDef[] = [
     return this.count <= this.limit + 1;
   }
 }
-`,
+`;
+
+const SOLUTION_SURGICAL_RATE_LIMITER_OFF_BY_ONE_LIMITER = variant(START_SURGICAL_RATE_LIMITER_OFF_BY_ONE_LIMITER, [
+        [`    }
+    this.count += 1;`, `    }
+    if (this.count >= this.limit) return false;
+    this.count += 1;`],
+        [`    this.count += 1;
+    return this.count <= this.limit + 1;
+  }`, `    this.count += 1;
+    return true;
+  }`],
+      ]);
+
+const START_SURGICAL_TTL_CACHE_NEVER_EXPIRES_CACHE = `export class TtlCache {
+  constructor(now = () => Date.now()) {
+    this.now = now;
+    this.store = new Map();
+  }
+  set(key, value, ttlMs) {
+    this.store.set(key, { value, expiresAt: this.now() + ttlMs });
+  }
+  get(key) {
+    const entry = this.store.get(key);
+    if (!entry) return undefined;
+    return entry.value;
+  }
+  delete(key) {
+    return this.store.delete(key);
+  }
+}
+`;
+
+const SOLUTION_SURGICAL_TTL_CACHE_NEVER_EXPIRES_CACHE = variant(START_SURGICAL_TTL_CACHE_NEVER_EXPIRES_CACHE, [
+        [`    if (!entry) return undefined;
+    return entry.value;`, `    if (!entry) return undefined;
+    if (this.now() > entry.expiresAt) {
+      this.store.delete(key);
+      return undefined;
+    }
+    return entry.value;`],
+      ]);
+
+const SOLUTION_SURGICAL_CSV_QUOTED_COMMA_CSV = `export function parseLine(line) {
+  const fields = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      fields.push(field);
+      field = "";
+    } else {
+      field += ch;
+    }
+  }
+  fields.push(field);
+  return fields;
+}
+`;
+
+const SOLUTION_SURGICAL_RETRY_THROWS_FIRST_FAILURE_RETRY = `export async function retry(fn, { retries = 3 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+`;
+
+const START_SURGICAL_URL_DOUBLE_ENCODE_URL = `export function buildUrl(base, params) {
+  const pairs = Object.entries(params).map(
+    ([k, v]) => encodeURIComponent(k + "=" + String(v))
+  );
+  return base + "?" + pairs.join("&");
+}
+`;
+
+const SOLUTION_SURGICAL_URL_DOUBLE_ENCODE_URL = variant(START_SURGICAL_URL_DOUBLE_ENCODE_URL, [
+        [`  const pairs = Object.entries(params).map(
+    ([k, v]) => encodeURIComponent(k + "=" + String(v))
+  );`, `  const pairs = Object.entries(params).map(
+    ([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(String(v))
+  );`],
+      ]);
+
+const SOLUTION_FEATURE_PAGINATE_LIST_PAGINATE = `export function paginate(items, { page, pageSize }) {
+  if (!Number.isInteger(page) || page < 1) {
+    throw new RangeError("page must be an integer >= 1");
+  }
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
+    throw new RangeError("pageSize must be an integer between 1 and 100");
+  }
+  const total = items.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const start = (page - 1) * pageSize;
+  return {
+    items: items.slice(start, start + pageSize),
+    page,
+    pageSize,
+    total,
+    totalPages,
+    hasNext: page < totalPages,
+    hasPrev: page > 1,
+  };
+}
+`;
+
+const START_FEATURE_TTL_STORE_SWEEP_STORE = `export class Store {
+  constructor(now = () => Date.now()) {
+    this.now = now;
+    this.map = new Map();
+  }
+  set(key, value, ttlMs = Infinity) {
+    this.map.set(key, value);
+  }
+  get(key) {
+    return this.map.get(key);
+  }
+  delete(key) {
+    return this.map.delete(key);
+  }
+  size() {
+    return this.map.size;
+  }
+  sweep() {
+    return 0;
+  }
+}
+`;
+
+const SOLUTION_FEATURE_TTL_STORE_SWEEP_STORE = variant(START_FEATURE_TTL_STORE_SWEEP_STORE, [
+        [`  set(key, value, ttlMs = Infinity) {
+    this.map.set(key, value);
+  }`, `  set(key, value, ttlMs = Infinity) {
+    this.map.set(key, { value, expiresAt: this.now() + ttlMs });
+  }`],
+        [`  get(key) {
+    return this.map.get(key);
+  }`, `  get(key) {
+    const entry = this.map.get(key);
+    if (!entry) return undefined;
+    if (this.now() > entry.expiresAt) {
+      this.map.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  }`],
+        [`  sweep() {
+    return 0;
+  }`, `  sweep() {
+    let removed = 0;
+    for (const [key, entry] of this.map) {
+      if (this.now() > entry.expiresAt) {
+        this.map.delete(key);
+        removed++;
+      }
+    }
+    return removed;
+  }`],
+      ]);
+
+const SOLUTION_FEATURE_CSV_EXPORT_EXPORT_CSV = `function escapeField(value) {
+  const s = String(value);
+  if (/[",\\n]/.test(s)) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+export function toCsv(rows) {
+  if (rows.length === 0) return "";
+  const headers = Object.keys(rows[0]);
+  const lines = [headers.join(",")];
+  for (const row of rows) {
+    lines.push(headers.map((h) => escapeField(row[h] ?? "")).join(","));
+  }
+  return lines.join("\\n");
+}
+`;
+
+const SOLUTION_FEATURE_INPUT_VALIDATOR_VALIDATE = `export function validate(obj, schema) {
+  const errors = [];
+  for (const [field, rule] of Object.entries(schema)) {
+    const value = obj[field];
+    if (value === undefined || value === null) {
+      if (rule.required) errors.push(field + " is required");
+      continue;
+    }
+    if (rule.type && typeof value !== rule.type) {
+      errors.push(field + " must be a " + rule.type);
+      continue;
+    }
+    if (rule.type === "number") {
+      if (rule.min !== undefined && value < rule.min) {
+        errors.push(field + " must be >= " + rule.min);
+      }
+      if (rule.max !== undefined && value > rule.max) {
+        errors.push(field + " must be <= " + rule.max);
+      }
+    }
+    if (rule.type === "string" && rule.pattern && !rule.pattern.test(value)) {
+      errors.push(field + " does not match " + rule.pattern);
+    }
+  }
+  return errors;
+}
+`;
+
+const SOLUTION_FEATURE_EVENT_EMITTER_EMITTER = `export class Emitter {
+  constructor() {
+    this.listeners = new Map();
+  }
+  on(event, fn) {
+    if (!this.listeners.has(event)) this.listeners.set(event, []);
+    this.listeners.get(event).push({ fn, once: false });
+    return this;
+  }
+  once(event, fn) {
+    if (!this.listeners.has(event)) this.listeners.set(event, []);
+    this.listeners.get(event).push({ fn, once: true });
+    return this;
+  }
+  off(event, fn) {
+    const list = this.listeners.get(event);
+    if (!list) return this;
+    const idx = list.findIndex((entry) => entry.fn === fn);
+    if (idx !== -1) list.splice(idx, 1);
+    return this;
+  }
+  emit(event, ...args) {
+    const list = this.listeners.get(event);
+    if (!list || list.length === 0) return 0;
+    const snapshot = [...list];
+    for (const entry of snapshot) {
+      entry.fn(...args);
+      if (entry.once) {
+        const idx = list.indexOf(entry);
+        if (idx !== -1) list.splice(idx, 1);
+      }
+    }
+    return snapshot.length;
+  }
+}
+`;
+
+const START_LONGHORIZON_TASK_QUEUE_ACK_WORKER = `import { JobQueue } from "./queue.mjs";
+
+export const MAX_ATTEMPTS = 3;
+
+export class Worker {
+  constructor(queue) {
+    this.queue = queue;
+  }
+  /** Run one job through handler; returns "done" | "retried" | "dead" | "idle". */
+  step(handler) {
+    const job = this.queue.take();
+    if (!job) return "idle";
+    try {
+      handler(job);
+      return "done";
+    } catch {
+      return "retried";
+    }
+  }
+}
+`;
+
+const SOLUTION_LONGHORIZON_TASK_QUEUE_ACK_WORKER = variant(START_LONGHORIZON_TASK_QUEUE_ACK_WORKER, [
+        [`    } catch {
+      return "retried";`, `    } catch {
+      job.attempts += 1;
+      if (job.attempts >= MAX_ATTEMPTS) {
+        this.queue.toDeadLetter(job);
+        return "dead";
+      }
+      this.queue.requeue(job);
+      return "retried";`],
+      ]);
+
+const START_LONGHORIZON_ROUTER_MIDDLEWARE_ORDER_APP = `import { Router } from "./router.mjs";
+import { authGuard } from "./auth.mjs";
+import { makeRateLimiter } from "./ratelimit.mjs";
+
+export function createApp({ limit = 100 } = {}) {
+  const router = new Router();
+  const rateLimit = makeRateLimiter(limit);
+  const middlewares = [authGuard, rateLimit];
+  return {
+    router,
+    handle(req) {
+      const route = router.find(req.method, req.path);
+      if (!route) return { status: 404, body: "not found" };
+      const result = route.handler(req);
+      for (const mw of middlewares) {
+        const blocked = mw(req);
+        if (blocked) return blocked;
+      }
+      return result;
+    },
+  };
+}
+`;
+
+const SOLUTION_LONGHORIZON_ROUTER_MIDDLEWARE_ORDER_APP = variant(START_LONGHORIZON_ROUTER_MIDDLEWARE_ORDER_APP, [
+        [`      if (!route) return { status: 404, body: "not found" };
+      const result = route.handler(req);
+      for (const mw of middlewares) {`, `      if (!route) return { status: 404, body: "not found" };
+      for (const mw of middlewares) {`],
+        [`      }
+      return result;
+    },`, `      }
+      return route.handler(req);
+    },`],
+      ]);
+
+const START_LONGHORIZON_DB_INDEX_STALE_TABLE = `export class Table {
+  constructor(indexField) {
+    this.indexField = indexField;
+    this.rows = new Map();
+    this.index = new Map();
+  }
+  insert(row) {
+    this.rows.set(row.id, { ...row });
+    this.index.set(row[this.indexField], row.id);
+  }
+  get(id) {
+    const row = this.rows.get(id);
+    return row ? { ...row } : undefined;
+  }
+  findByIndex(value) {
+    const id = this.index.get(value);
+    return id === undefined ? undefined : this.get(id);
+  }
+  update(id, patch) {
+    const row = this.rows.get(id);
+    if (!row) return false;
+    Object.assign(row, patch);
+    return true;
+  }
+  delete(id) {
+    const row = this.rows.get(id);
+    if (!row) return false;
+    this.index.delete(row[this.indexField]);
+    this.rows.delete(id);
+    return true;
+  }
+}
+`;
+
+const SOLUTION_LONGHORIZON_DB_INDEX_STALE_TABLE = variant(START_LONGHORIZON_DB_INDEX_STALE_TABLE, [
+        [`    if (!row) return false;
+    Object.assign(row, patch);`, `    if (!row) return false;
+    if (
+      patch[this.indexField] !== undefined &&
+      patch[this.indexField] !== row[this.indexField]
+    ) {
+      this.index.delete(row[this.indexField]);
+    }
+    Object.assign(row, patch);`],
+        [`    Object.assign(row, patch);
+    return true;`, `    Object.assign(row, patch);
+    this.index.set(row[this.indexField], id);
+    return true;`],
+      ]);
+
+const START_LONGHORIZON_PUBSUB_REDELIVERY_BROKER = `export class Broker {
+  constructor() {
+    this.topics = new Map();
+    this.seq = 0;
+  }
+  publish(topic, payload) {
+    if (!this.topics.has(topic)) {
+      this.topics.set(topic, { pending: [], acked: new Set() });
+    }
+    const msg = { id: ++this.seq, topic, payload, attempts: 0 };
+    this.topics.get(topic).pending.push(msg);
+    return msg.id;
+  }
+  consume(topic) {
+    const state = this.topics.get(topic);
+    if (!state) return undefined;
+    const msg = state.pending.shift();
+    if (msg) msg.attempts++;
+    return msg;
+  }
+  ack(topic, id) {
+    const state = this.topics.get(topic);
+    if (!state) return false;
+    state.acked.add(id);
+    return true;
+  }
+  redeliver(topic) {
+    const state = this.topics.get(topic);
+    if (!state) return 0;
+    const unacked = state.pending.filter((m) => !state.acked.has(m.id));
+    state.pending = [...state.pending, ...unacked];
+    return unacked.length;
+  }
+}
+`;
+
+const SOLUTION_LONGHORIZON_PUBSUB_REDELIVERY_BROKER = variant(START_LONGHORIZON_PUBSUB_REDELIVERY_BROKER, [
+        [`    if (!this.topics.has(topic)) {
+      this.topics.set(topic, { pending: [], acked: new Set() });
+    }`, `    if (!this.topics.has(topic)) {
+      this.topics.set(topic, { pending: [], inflight: [], acked: new Set() });
+    }`],
+        [`    const msg = state.pending.shift();
+    if (msg) msg.attempts++;
+    return msg;`, `    const msg = state.pending.shift();
+    if (msg) {
+      msg.attempts++;
+      state.inflight.push(msg);
+    }
+    return msg;`],
+        [`    state.acked.add(id);
+    return true;`, `    state.acked.add(id);
+    state.inflight = state.inflight.filter((m) => m.id !== id);
+    return true;`],
+        [`    if (!state) return 0;
+    const unacked = state.pending.filter((m) => !state.acked.has(m.id));
+    state.pending = [...state.pending, ...unacked];
+    return unacked.length;`, `    if (!state) return 0;
+    const unacked = state.inflight.filter((m) => !state.acked.has(m.id));
+    state.inflight = [];
+    state.pending = [...unacked, ...state.pending];
+    return unacked.length;`],
+      ]);
+
+const START_LONGHORIZON_FILESYNC_DELETIONS_DIFF = `export function diff(source, target) {
+  const added = [];
+  const modified = [];
+  for (const [path, content] of source) {
+    if (!target.has(path)) added.push(path);
+    else if (target.get(path) !== content) modified.push(path);
+  }
+  return { added, modified, deleted: [] };
+}
+`;
+
+const START_LONGHORIZON_FILESYNC_DELETIONS_APPLY = `export function applyChanges(target, source, changes) {
+  for (const path of [...changes.added, ...changes.modified]) {
+    target.set(path, source.get(path));
+  }
+  for (const path of changes.deleted) {
+    target.delete(path);
+  }
+}
+`;
+
+const SOLUTION_LONGHORIZON_FILESYNC_DELETIONS_DIFF = variant(START_LONGHORIZON_FILESYNC_DELETIONS_DIFF, [
+        [`  const modified = [];
+  for (const [path, content] of source) {`, `  const modified = [];
+  const deleted = [];
+  for (const [path, content] of source) {`],
+        [`  }
+  return { added, modified, deleted: [] };
+}`, `  }
+  for (const path of target.keys()) {
+    if (!source.has(path)) deleted.push(path);
+  }
+  return { added, modified, deleted };
+}`],
+      ]);
+
+export const EVAL_SUITE: EvalTaskDef[] = [
+  // ---- Bucket A: surgical, single-file bug fixes (target <= 15 turns) ----
+  task({
+    id: "surgical-rate-limiter-off-by-one",
+    bucket: "surgical",
+    title: "Sliding-window rate limiter allows limit+1 requests",
+    targetTurns: 8,
+    repoCommit: PIN,
+    description:
+      "allow() increments the counter before checking it, so a limit of 3 admits a 4th request inside the window.",
+    files: {
+      "src/limiter.mjs": START_SURGICAL_RATE_LIMITER_OFF_BY_ONE_LIMITER,
     },
     test: {
       path: "test/limiter.test.mjs",
@@ -75,48 +584,16 @@ test("a new window admits again", () => {
 `,
     },
     solution: {
-      "src/limiter.mjs": `export class SlidingWindowLimiter {
-  constructor(limit, windowMs, now = () => Date.now()) {
-    this.limit = limit;
-    this.windowMs = windowMs;
-    this.now = now;
-    this.count = 0;
-    this.windowStart = now();
-  }
-  allow() {
-    const t = this.now();
-    if (t - this.windowStart >= this.windowMs) {
-      this.windowStart = t;
-      this.count = 0;
-    }
-    if (this.count >= this.limit) return false;
-    this.count += 1;
-    return true;
-  }
-}
-`,
+      "src/limiter.mjs": SOLUTION_SURGICAL_RATE_LIMITER_OFF_BY_ONE_LIMITER,
     },
     broken: {
-      "src/limiter.mjs": `export class SlidingWindowLimiter {
-  constructor(limit, windowMs, now = () => Date.now()) {
-    this.limit = limit;
-    this.windowMs = windowMs;
-    this.now = now;
-    this.count = 0;
-    this.windowStart = now();
-  }
-  allow() {
-    const t = this.now();
-    if (t - this.windowStart >= this.windowMs) {
-      this.windowStart = t;
-      this.count = 0;
-    }
+      "src/limiter.mjs": variant(SOLUTION_SURGICAL_RATE_LIMITER_OFF_BY_ONE_LIMITER, [
+        [`    }
+    if (this.count >= this.limit) return false;
+    this.count += 1;`, `    }
     if (this.count >= this.limit - 1) return false;
-    this.count += 1;
-    return true;
-  }
-}
-`,
+    this.count += 1;`],
+      ]),
     },
   }),
   task({
@@ -128,24 +605,7 @@ test("a new window admits again", () => {
     description:
       "Entries are stored with an expiresAt but get() never checks it, so expired values are served forever.",
     files: {
-      "src/cache.mjs": `export class TtlCache {
-  constructor(now = () => Date.now()) {
-    this.now = now;
-    this.store = new Map();
-  }
-  set(key, value, ttlMs) {
-    this.store.set(key, { value, expiresAt: this.now() + ttlMs });
-  }
-  get(key) {
-    const entry = this.store.get(key);
-    if (!entry) return undefined;
-    return entry.value;
-  }
-  delete(key) {
-    return this.store.delete(key);
-  }
-}
-`,
+      "src/cache.mjs": START_SURGICAL_TTL_CACHE_NEVER_EXPIRES_CACHE,
     },
     test: {
       path: "test/cache.test.mjs",
@@ -178,53 +638,20 @@ test("an entry inside its TTL is still served", () => {
 `,
     },
     solution: {
-      "src/cache.mjs": `export class TtlCache {
-  constructor(now = () => Date.now()) {
-    this.now = now;
-    this.store = new Map();
-  }
-  set(key, value, ttlMs) {
-    this.store.set(key, { value, expiresAt: this.now() + ttlMs });
-  }
-  get(key) {
-    const entry = this.store.get(key);
-    if (!entry) return undefined;
-    if (this.now() > entry.expiresAt) {
-      this.store.delete(key);
-      return undefined;
-    }
-    return entry.value;
-  }
-  delete(key) {
-    return this.store.delete(key);
-  }
-}
-`,
+      "src/cache.mjs": SOLUTION_SURGICAL_TTL_CACHE_NEVER_EXPIRES_CACHE,
     },
     broken: {
-      "src/cache.mjs": `export class TtlCache {
-  constructor(now = () => Date.now()) {
-    this.now = now;
-    this.store = new Map();
+      "src/cache.mjs": variant(SOLUTION_SURGICAL_TTL_CACHE_NEVER_EXPIRES_CACHE, [
+        [`    this.store = new Map();
+  }`, `    this.store = new Map();
     this.createdAt = now();
-  }
-  set(key, value, ttlMs) {
-    this.store.set(key, { value, expiresAt: this.now() + ttlMs });
-  }
-  get(key) {
-    const entry = this.store.get(key);
-    if (!entry) return undefined;
+  }`],
+        [`    if (!entry) return undefined;
+    if (this.now() > entry.expiresAt) {
+      this.store.delete(key);`, `    if (!entry) return undefined;
     if (this.now() > this.createdAt) {
-      this.store.delete(key);
-      return undefined;
-    }
-    return entry.value;
-  }
-  delete(key) {
-    return this.store.delete(key);
-  }
-}
-`,
+      this.store.delete(key);`],
+      ]),
     },
   }),
   task({
@@ -261,12 +688,11 @@ test("doubled quotes unescape to one quote", () => {
 `,
     },
     solution: {
-      "src/csv.mjs": `export function parseLine(line) {
-  const fields = [];
-  let field = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
+      "src/csv.mjs": SOLUTION_SURGICAL_CSV_QUOTED_COMMA_CSV,
+    },
+    broken: {
+      "src/csv.mjs": variant(SOLUTION_SURGICAL_CSV_QUOTED_COMMA_CSV, [
+        [`    const ch = line[i];
     if (inQuotes) {
       if (ch === '"') {
         if (line[i + 1] === '"') {
@@ -281,38 +707,13 @@ test("doubled quotes unescape to one quote", () => {
     } else if (ch === '"') {
       inQuotes = true;
     } else if (ch === ",") {
-      fields.push(field);
-      field = "";
-    } else {
-      field += ch;
-    }
-  }
-  fields.push(field);
-  return fields;
-}
-`,
-    },
-    broken: {
-      "src/csv.mjs": `export function parseLine(line) {
-  const fields = [];
-  let field = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
+      fields.push(field);`, `    const ch = line[i];
     if (ch === '"') {
       inQuotes = !inQuotes;
       field += ch;
     } else if (ch === "," && !inQuotes) {
-      fields.push(field);
-      field = "";
-    } else {
-      field += ch;
-    }
-  }
-  fields.push(field);
-  return fields;
-}
-`,
+      fields.push(field);`],
+      ]),
     },
   }),
   task({
@@ -366,32 +767,16 @@ test("throws after exhausting retries", async () => {
 `,
     },
     solution: {
-      "src/retry.mjs": `export async function retry(fn, { retries = 3 } = {}) {
-  let lastError;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-    }
-  }
-  throw lastError;
-}
-`,
+      "src/retry.mjs": SOLUTION_SURGICAL_RETRY_THROWS_FIRST_FAILURE_RETRY,
     },
     broken: {
-      "src/retry.mjs": `export async function retry(fn, { retries = 3 } = {}) {
-  let lastError;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-    }
-  }
+      "src/retry.mjs": variant(SOLUTION_SURGICAL_RETRY_THROWS_FIRST_FAILURE_RETRY, [
+        [`  }
+  throw lastError;
+}`, `  }
   return undefined;
-}
-`,
+}`],
+      ]),
     },
   }),
   task({
@@ -403,13 +788,7 @@ test("throws after exhausting retries", async () => {
     description:
       "buildUrl runs encodeURIComponent over the whole 'k=v' pair, so '=' and '&' come out percent-encoded.",
     files: {
-      "src/url.mjs": `export function buildUrl(base, params) {
-  const pairs = Object.entries(params).map(
-    ([k, v]) => encodeURIComponent(k + "=" + String(v))
-  );
-  return base + "?" + pairs.join("&");
-}
-`,
+      "src/url.mjs": START_SURGICAL_URL_DOUBLE_ENCODE_URL,
     },
     test: {
       path: "test/url.test.mjs",
@@ -433,22 +812,16 @@ test("plain values pass through", () => {
 `,
     },
     solution: {
-      "src/url.mjs": `export function buildUrl(base, params) {
-  const pairs = Object.entries(params).map(
-    ([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(String(v))
-  );
-  return base + "?" + pairs.join("&");
-}
-`,
+      "src/url.mjs": SOLUTION_SURGICAL_URL_DOUBLE_ENCODE_URL,
     },
     broken: {
-      "src/url.mjs": `export function buildUrl(base, params) {
-  const pairs = Object.entries(params).map(
+      "src/url.mjs": variant(SOLUTION_SURGICAL_URL_DOUBLE_ENCODE_URL, [
+        [`  const pairs = Object.entries(params).map(
+    ([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(String(v))
+  );`, `  const pairs = Object.entries(params).map(
     ([k, v]) => encodeURI(k) + "=" + encodeURI(String(v))
-  );
-  return base + "?" + pairs.join("&");
-}
-`,
+  );`],
+      ]),
     },
   }),
   // ---- Bucket B: feature, multi-file additions (target <= 80 turns) ----
@@ -499,50 +872,21 @@ test("invalid page and pageSize throw RangeError", () => {
 `,
     },
     solution: {
-      "src/paginate.mjs": `export function paginate(items, { page, pageSize }) {
-  if (!Number.isInteger(page) || page < 1) {
-    throw new RangeError("page must be an integer >= 1");
-  }
-  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
-    throw new RangeError("pageSize must be an integer between 1 and 100");
-  }
-  const total = items.length;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const start = (page - 1) * pageSize;
-  return {
-    items: items.slice(start, start + pageSize),
-    page,
-    pageSize,
-    total,
-    totalPages,
-    hasNext: page < totalPages,
-    hasPrev: page > 1,
-  };
-}
-`,
+      "src/paginate.mjs": SOLUTION_FEATURE_PAGINATE_LIST_PAGINATE,
     },
     broken: {
-      "src/paginate.mjs": `export function paginate(items, { page, pageSize }) {
-  if (!Number.isInteger(page) || page < 1) {
-    throw new RangeError("page must be an integer >= 1");
-  }
-  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) {
-    throw new RangeError("pageSize must be an integer between 1 and 100");
-  }
-  const total = items.length;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      "src/paginate.mjs": variant(SOLUTION_FEATURE_PAGINATE_LIST_PAGINATE, [
+        [`  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const start = (page - 1) * pageSize;
+  return {`, `  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const start = (page - 1) * pageSize - 1;
-  return {
+  return {`],
+        [`  return {
+    items: items.slice(start, start + pageSize),
+    page,`, `  return {
     items: items.slice(Math.max(0, start), Math.max(0, start) + pageSize),
-    page,
-    pageSize,
-    total,
-    totalPages,
-    hasNext: page < totalPages,
-    hasPrev: page > 1,
-  };
-}
-`,
+    page,`],
+      ]),
     },
   }),
   task({
@@ -554,28 +898,7 @@ test("invalid page and pageSize throw RangeError", () => {
     description:
       "The store is a plain Map wrapper. Add per-key TTL, lazy expiry on get, and a sweep() that drops only expired keys.",
     files: {
-      "src/store.mjs": `export class Store {
-  constructor(now = () => Date.now()) {
-    this.now = now;
-    this.map = new Map();
-  }
-  set(key, value, ttlMs = Infinity) {
-    this.map.set(key, value);
-  }
-  get(key) {
-    return this.map.get(key);
-  }
-  delete(key) {
-    return this.map.delete(key);
-  }
-  size() {
-    return this.map.size;
-  }
-  sweep() {
-    return 0;
-  }
-}
-`,
+      "src/store.mjs": START_FEATURE_TTL_STORE_SWEEP_STORE,
     },
     test: {
       path: "test/store.test.mjs",
@@ -614,79 +937,20 @@ test("delete removes a key", () => {
 `,
     },
     solution: {
-      "src/store.mjs": `export class Store {
-  constructor(now = () => Date.now()) {
-    this.now = now;
-    this.map = new Map();
-  }
-  set(key, value, ttlMs = Infinity) {
-    this.map.set(key, { value, expiresAt: this.now() + ttlMs });
-  }
-  get(key) {
-    const entry = this.map.get(key);
-    if (!entry) return undefined;
-    if (this.now() > entry.expiresAt) {
-      this.map.delete(key);
-      return undefined;
-    }
-    return entry.value;
-  }
-  delete(key) {
-    return this.map.delete(key);
-  }
-  size() {
-    return this.map.size;
-  }
-  sweep() {
-    let removed = 0;
-    for (const [key, entry] of this.map) {
-      if (this.now() > entry.expiresAt) {
-        this.map.delete(key);
-        removed++;
-      }
-    }
-    return removed;
-  }
-}
-`,
+      "src/store.mjs": SOLUTION_FEATURE_TTL_STORE_SWEEP_STORE,
     },
     broken: {
-      "src/store.mjs": `export class Store {
-  constructor(now = () => Date.now()) {
-    this.now = now;
-    this.map = new Map();
+      "src/store.mjs": variant(SOLUTION_FEATURE_TTL_STORE_SWEEP_STORE, [
+        [`    this.map = new Map();
+  }`, `    this.map = new Map();
     this.createdAt = now();
-  }
-  set(key, value, ttlMs = Infinity) {
-    this.map.set(key, { value, expiresAt: this.now() + ttlMs });
-  }
-  get(key) {
-    const entry = this.map.get(key);
-    if (!entry) return undefined;
-    if (this.now() > entry.expiresAt) {
-      this.map.delete(key);
-      return undefined;
-    }
-    return entry.value;
-  }
-  delete(key) {
-    return this.map.delete(key);
-  }
-  size() {
-    return this.map.size;
-  }
-  sweep() {
-    let removed = 0;
-    for (const [key, entry] of this.map) {
+  }`],
+        [`    for (const [key, entry] of this.map) {
+      if (this.now() > entry.expiresAt) {
+        this.map.delete(key);`, `    for (const [key, entry] of this.map) {
       if (this.now() > this.createdAt) {
-        this.map.delete(key);
-        removed++;
-      }
-    }
-    return removed;
-  }
-}
-`,
+        this.map.delete(key);`],
+      ]),
     },
   }),
   task({
@@ -732,44 +996,16 @@ test("empty input yields an empty string", () => {
 `,
     },
     solution: {
-      "src/export-csv.mjs": `function escapeField(value) {
-  const s = String(value);
-  if (/[",\\n]/.test(s)) {
-    return '"' + s.replace(/"/g, '""') + '"';
-  }
-  return s;
-}
-
-export function toCsv(rows) {
-  if (rows.length === 0) return "";
-  const headers = Object.keys(rows[0]);
-  const lines = [headers.join(",")];
-  for (const row of rows) {
-    lines.push(headers.map((h) => escapeField(row[h] ?? "")).join(","));
-  }
-  return lines.join("\\n");
-}
-`,
+      "src/export-csv.mjs": SOLUTION_FEATURE_CSV_EXPORT_EXPORT_CSV,
     },
     broken: {
-      "src/export-csv.mjs": `function escapeField(value) {
-  const s = String(value);
-  if (/[",\\n]/.test(s)) {
+      "src/export-csv.mjs": variant(SOLUTION_FEATURE_CSV_EXPORT_EXPORT_CSV, [
+        [`  if (/[",\\n]/.test(s)) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }`, `  if (/[",\\n]/.test(s)) {
     return '"' + s + '"';
-  }
-  return s;
-}
-
-export function toCsv(rows) {
-  if (rows.length === 0) return "";
-  const headers = Object.keys(rows[0]);
-  const lines = [headers.join(",")];
-  for (const row of rows) {
-    lines.push(headers.map((h) => escapeField(row[h] ?? "")).join(","));
-  }
-  return lines.join("\\n");
-}
-`,
+  }`],
+      ]),
     },
   }),
   task({
@@ -818,58 +1054,18 @@ test("wrong types, out-of-range values and bad patterns are all reported", () =>
 `,
     },
     solution: {
-      "src/validate.mjs": `export function validate(obj, schema) {
-  const errors = [];
-  for (const [field, rule] of Object.entries(schema)) {
-    const value = obj[field];
-    if (value === undefined || value === null) {
-      if (rule.required) errors.push(field + " is required");
+      "src/validate.mjs": SOLUTION_FEATURE_INPUT_VALIDATOR_VALIDATE,
+    },
+    broken: {
+      "src/validate.mjs": variant(SOLUTION_FEATURE_INPUT_VALIDATOR_VALIDATE, [
+        [`      if (rule.required) errors.push(field + " is required");
       continue;
     }
     if (rule.type && typeof value !== rule.type) {
       errors.push(field + " must be a " + rule.type);
-      continue;
-    }
-    if (rule.type === "number") {
-      if (rule.min !== undefined && value < rule.min) {
-        errors.push(field + " must be >= " + rule.min);
-      }
-      if (rule.max !== undefined && value > rule.max) {
-        errors.push(field + " must be <= " + rule.max);
-      }
-    }
-    if (rule.type === "string" && rule.pattern && !rule.pattern.test(value)) {
-      errors.push(field + " does not match " + rule.pattern);
-    }
-  }
-  return errors;
-}
-`,
-    },
-    broken: {
-      "src/validate.mjs": `export function validate(obj, schema) {
-  const errors = [];
-  for (const [field, rule] of Object.entries(schema)) {
-    const value = obj[field];
-    if (value === undefined || value === null) {
-      if (rule.required) errors.push(field + " is required");
-      continue;
-    }
-    if (rule.type === "number") {
-      if (rule.min !== undefined && value < rule.min) {
-        errors.push(field + " must be >= " + rule.min);
-      }
-      if (rule.max !== undefined && value > rule.max) {
-        errors.push(field + " must be <= " + rule.max);
-      }
-    }
-    if (rule.type === "string" && rule.pattern && !rule.pattern.test(value)) {
-      errors.push(field + " does not match " + rule.pattern);
-    }
-  }
-  return errors;
-}
-`,
+      continue;`, `      if (rule.required) errors.push(field + " is required");
+      continue;`],
+      ]),
     },
   }),
   task({
@@ -941,76 +1137,23 @@ test("emit with no listeners returns 0", () => {
 `,
     },
     solution: {
-      "src/emitter.mjs": `export class Emitter {
-  constructor() {
-    this.listeners = new Map();
-  }
-  on(event, fn) {
-    if (!this.listeners.has(event)) this.listeners.set(event, []);
-    this.listeners.get(event).push({ fn, once: false });
-    return this;
-  }
-  once(event, fn) {
-    if (!this.listeners.has(event)) this.listeners.set(event, []);
+      "src/emitter.mjs": SOLUTION_FEATURE_EVENT_EMITTER_EMITTER,
+    },
+    broken: {
+      "src/emitter.mjs": variant(SOLUTION_FEATURE_EVENT_EMITTER_EMITTER, [
+        [`    if (!this.listeners.has(event)) this.listeners.set(event, []);
     this.listeners.get(event).push({ fn, once: true });
-    return this;
-  }
-  off(event, fn) {
-    const list = this.listeners.get(event);
-    if (!list) return this;
-    const idx = list.findIndex((entry) => entry.fn === fn);
-    if (idx !== -1) list.splice(idx, 1);
-    return this;
-  }
-  emit(event, ...args) {
-    const list = this.listeners.get(event);
-    if (!list || list.length === 0) return 0;
-    const snapshot = [...list];
-    for (const entry of snapshot) {
-      entry.fn(...args);
+    return this;`, `    if (!this.listeners.has(event)) this.listeners.set(event, []);
+    this.listeners.get(event).push({ fn, once: false });
+    return this;`],
+        [`      entry.fn(...args);
       if (entry.once) {
         const idx = list.indexOf(entry);
         if (idx !== -1) list.splice(idx, 1);
       }
-    }
-    return snapshot.length;
-  }
-}
-`,
-    },
-    broken: {
-      "src/emitter.mjs": `export class Emitter {
-  constructor() {
-    this.listeners = new Map();
-  }
-  on(event, fn) {
-    if (!this.listeners.has(event)) this.listeners.set(event, []);
-    this.listeners.get(event).push({ fn, once: false });
-    return this;
-  }
-  once(event, fn) {
-    if (!this.listeners.has(event)) this.listeners.set(event, []);
-    this.listeners.get(event).push({ fn, once: false });
-    return this;
-  }
-  off(event, fn) {
-    const list = this.listeners.get(event);
-    if (!list) return this;
-    const idx = list.findIndex((entry) => entry.fn === fn);
-    if (idx !== -1) list.splice(idx, 1);
-    return this;
-  }
-  emit(event, ...args) {
-    const list = this.listeners.get(event);
-    if (!list || list.length === 0) return 0;
-    const snapshot = [...list];
-    for (const entry of snapshot) {
-      entry.fn(...args);
-    }
-    return snapshot.length;
-  }
-}
-`,
+    }`, `      entry.fn(...args);
+    }`],
+      ]),
     },
   }),
   // ---- Bucket C: long-horizon, 4+ interacting components ----
@@ -1042,27 +1185,7 @@ test("emit with no listeners returns 0", () => {
   }
 }
 `,
-      "src/worker.mjs": `import { JobQueue } from "./queue.mjs";
-
-export const MAX_ATTEMPTS = 3;
-
-export class Worker {
-  constructor(queue) {
-    this.queue = queue;
-  }
-  /** Run one job through handler; returns "done" | "retried" | "dead" | "idle". */
-  step(handler) {
-    const job = this.queue.take();
-    if (!job) return "idle";
-    try {
-      handler(job);
-      return "done";
-    } catch {
-      return "retried";
-    }
-  }
-}
-`,
+      "src/worker.mjs": START_LONGHORIZON_TASK_QUEUE_ACK_WORKER,
       "src/metrics.mjs": `export class Metrics {
   constructor() {
     this.done = 0;
@@ -1125,61 +1248,20 @@ test("a permanently failing job ends in the dead-letter queue", () => {
 `,
     },
     solution: {
-      "src/worker.mjs": `import { JobQueue } from "./queue.mjs";
-
-export const MAX_ATTEMPTS = 3;
-
-export class Worker {
-  constructor(queue) {
-    this.queue = queue;
-  }
-  /** Run one job through handler; returns "done" | "retried" | "dead" | "idle". */
-  step(handler) {
-    const job = this.queue.take();
-    if (!job) return "idle";
-    try {
-      handler(job);
-      return "done";
-    } catch {
-      job.attempts += 1;
-      if (job.attempts >= MAX_ATTEMPTS) {
-        this.queue.toDeadLetter(job);
-        return "dead";
-      }
-      this.queue.requeue(job);
-      return "retried";
-    }
-  }
-}
-`,
+      "src/worker.mjs": SOLUTION_LONGHORIZON_TASK_QUEUE_ACK_WORKER,
     },
     broken: {
-      "src/worker.mjs": `import { JobQueue } from "./queue.mjs";
-
-export const MAX_ATTEMPTS = 3;
-
-export class Worker {
-  constructor(queue) {
-    this.queue = queue;
-  }
-  /** Run one job through handler; returns "done" | "retried" | "dead" | "idle". */
-  step(handler) {
-    const job = this.queue.take();
-    if (!job) return "idle";
-    try {
-      handler(job);
-      return "done";
-    } catch {
-      if (job.attempts >= MAX_ATTEMPTS) {
-        this.queue.toDeadLetter(job);
-        return "dead";
-      }
+      "src/worker.mjs": variant(SOLUTION_LONGHORIZON_TASK_QUEUE_ACK_WORKER, [
+        [`    } catch {
+      job.attempts += 1;
+      if (job.attempts >= MAX_ATTEMPTS) {`, `    } catch {
+      if (job.attempts >= MAX_ATTEMPTS) {`],
+        [`      }
+      this.queue.requeue(job);
+      return "retried";`, `      }
       this.queue.requeue({ ...job, attempts: 0 });
-      return "retried";
-    }
-  }
-}
-`,
+      return "retried";`],
+      ]),
     },
   }),
   task({
@@ -1219,29 +1301,7 @@ export class Worker {
   };
 }
 `,
-      "src/app.mjs": `import { Router } from "./router.mjs";
-import { authGuard } from "./auth.mjs";
-import { makeRateLimiter } from "./ratelimit.mjs";
-
-export function createApp({ limit = 100 } = {}) {
-  const router = new Router();
-  const rateLimit = makeRateLimiter(limit);
-  const middlewares = [authGuard, rateLimit];
-  return {
-    router,
-    handle(req) {
-      const route = router.find(req.method, req.path);
-      if (!route) return { status: 404, body: "not found" };
-      const result = route.handler(req);
-      for (const mw of middlewares) {
-        const blocked = mw(req);
-        if (blocked) return blocked;
-      }
-      return result;
-    },
-  };
-}
-`,
+      "src/app.mjs": START_LONGHORIZON_ROUTER_MIDDLEWARE_ORDER_APP,
     },
     test: {
       path: "test/app.test.mjs",
@@ -1289,52 +1349,29 @@ test("unknown routes are 404", () => {
 `,
     },
     solution: {
-      "src/app.mjs": `import { Router } from "./router.mjs";
-import { authGuard } from "./auth.mjs";
-import { makeRateLimiter } from "./ratelimit.mjs";
-
-export function createApp({ limit = 100 } = {}) {
-  const router = new Router();
-  const rateLimit = makeRateLimiter(limit);
+      "src/app.mjs": SOLUTION_LONGHORIZON_ROUTER_MIDDLEWARE_ORDER_APP,
+    },
+    broken: {
+      "src/app.mjs": variant(SOLUTION_LONGHORIZON_ROUTER_MIDDLEWARE_ORDER_APP, [
+        [`  const rateLimit = makeRateLimiter(limit);
   const middlewares = [authGuard, rateLimit];
-  return {
-    router,
-    handle(req) {
-      const route = router.find(req.method, req.path);
-      if (!route) return { status: 404, body: "not found" };
+  return {`, `  const rateLimit = makeRateLimiter(limit);
+  return {`],
+        [`      if (!route) return { status: 404, body: "not found" };
       for (const mw of middlewares) {
         const blocked = mw(req);
         if (blocked) return blocked;
       }
       return route.handler(req);
-    },
-  };
-}
-`,
-    },
-    broken: {
-      "src/app.mjs": `import { Router } from "./router.mjs";
-import { authGuard } from "./auth.mjs";
-import { makeRateLimiter } from "./ratelimit.mjs";
-
-export function createApp({ limit = 100 } = {}) {
-  const router = new Router();
-  const rateLimit = makeRateLimiter(limit);
-  return {
-    router,
-    handle(req) {
-      const route = router.find(req.method, req.path);
-      if (!route) return { status: 404, body: "not found" };
+    },`, `      if (!route) return { status: 404, body: "not found" };
       const blocked = authGuard(req);
       if (blocked) return blocked;
       const result = route.handler(req);
       const limited = rateLimit(req);
       if (limited) return limited;
       return result;
-    },
-  };
-}
-`,
+    },`],
+      ]),
     },
   }),
   task({
@@ -1346,39 +1383,7 @@ export function createApp({ limit = 100 } = {}) {
     description:
       "update() rewrites the row but never touches the secondary index, so findByIndex returns stale rows; transactions must also roll back cleanly.",
     files: {
-      "src/table.mjs": `export class Table {
-  constructor(indexField) {
-    this.indexField = indexField;
-    this.rows = new Map();
-    this.index = new Map();
-  }
-  insert(row) {
-    this.rows.set(row.id, { ...row });
-    this.index.set(row[this.indexField], row.id);
-  }
-  get(id) {
-    const row = this.rows.get(id);
-    return row ? { ...row } : undefined;
-  }
-  findByIndex(value) {
-    const id = this.index.get(value);
-    return id === undefined ? undefined : this.get(id);
-  }
-  update(id, patch) {
-    const row = this.rows.get(id);
-    if (!row) return false;
-    Object.assign(row, patch);
-    return true;
-  }
-  delete(id) {
-    const row = this.rows.get(id);
-    if (!row) return false;
-    this.index.delete(row[this.indexField]);
-    this.rows.delete(id);
-    return true;
-  }
-}
-`,
+      "src/table.mjs": START_LONGHORIZON_DB_INDEX_STALE_TABLE,
       "src/tx.mjs": `export class Transaction {
   constructor(table) {
     this.table = table;
@@ -1450,87 +1455,17 @@ test("delete removes the row and its index entry", () => {
 `,
     },
     solution: {
-      "src/table.mjs": `export class Table {
-  constructor(indexField) {
-    this.indexField = indexField;
-    this.rows = new Map();
-    this.index = new Map();
-  }
-  insert(row) {
-    this.rows.set(row.id, { ...row });
-    this.index.set(row[this.indexField], row.id);
-  }
-  get(id) {
-    const row = this.rows.get(id);
-    return row ? { ...row } : undefined;
-  }
-  findByIndex(value) {
-    const id = this.index.get(value);
-    return id === undefined ? undefined : this.get(id);
-  }
-  update(id, patch) {
-    const row = this.rows.get(id);
-    if (!row) return false;
-    if (
-      patch[this.indexField] !== undefined &&
-      patch[this.indexField] !== row[this.indexField]
-    ) {
-      this.index.delete(row[this.indexField]);
-    }
-    Object.assign(row, patch);
-    this.index.set(row[this.indexField], id);
-    return true;
-  }
-  delete(id) {
-    const row = this.rows.get(id);
-    if (!row) return false;
-    this.index.delete(row[this.indexField]);
-    this.rows.delete(id);
-    return true;
-  }
-}
-`,
+      "src/table.mjs": SOLUTION_LONGHORIZON_DB_INDEX_STALE_TABLE,
     },
     broken: {
-      "src/table.mjs": `export class Table {
-  constructor(indexField) {
-    this.indexField = indexField;
-    this.rows = new Map();
-    this.index = new Map();
-  }
-  insert(row) {
-    this.rows.set(row.id, { ...row });
-    this.index.set(row[this.indexField], row.id);
-  }
-  get(id) {
-    const row = this.rows.get(id);
-    return row ? { ...row } : undefined;
-  }
-  findByIndex(value) {
-    const id = this.index.get(value);
-    return id === undefined ? undefined : this.get(id);
-  }
-  update(id, patch) {
-    const row = this.rows.get(id);
-    if (!row) return false;
-    if (
-      patch[this.indexField] !== undefined &&
-      patch[this.indexField] !== row[this.indexField]
-    ) {
-      this.index.delete(row[this.indexField]);
-    }
+      "src/table.mjs": variant(SOLUTION_LONGHORIZON_DB_INDEX_STALE_TABLE, [
+        [`    }
+    Object.assign(row, patch);
+    this.index.set(row[this.indexField], id);
+    return true;`, `    }
     this.index.set(patch[this.indexField] ?? row[this.indexField], id);
-    return true;
-  }
-  delete(id) {
-    const row = this.rows.get(id);
-    if (!row) return false;
-    this.index.delete(row[this.indexField]);
-    this.rows.delete(id);
-    return true;
-  }
-}
-`,
+    return true;`],
+      ]),
     },
   }),
   task({
@@ -1542,41 +1477,7 @@ test("delete removes the row and its index entry", () => {
     description:
       "redeliver() re-queues every message including ones already acked, so consumers see duplicates forever.",
     files: {
-      "src/broker.mjs": `export class Broker {
-  constructor() {
-    this.topics = new Map();
-    this.seq = 0;
-  }
-  publish(topic, payload) {
-    if (!this.topics.has(topic)) {
-      this.topics.set(topic, { pending: [], acked: new Set() });
-    }
-    const msg = { id: ++this.seq, topic, payload, attempts: 0 };
-    this.topics.get(topic).pending.push(msg);
-    return msg.id;
-  }
-  consume(topic) {
-    const state = this.topics.get(topic);
-    if (!state) return undefined;
-    const msg = state.pending.shift();
-    if (msg) msg.attempts++;
-    return msg;
-  }
-  ack(topic, id) {
-    const state = this.topics.get(topic);
-    if (!state) return false;
-    state.acked.add(id);
-    return true;
-  }
-  redeliver(topic) {
-    const state = this.topics.get(topic);
-    if (!state) return 0;
-    const unacked = state.pending.filter((m) => !state.acked.has(m.id));
-    state.pending = [...state.pending, ...unacked];
-    return unacked.length;
-  }
-}
-`,
+      "src/broker.mjs": START_LONGHORIZON_PUBSUB_REDELIVERY_BROKER,
     },
     test: {
       path: "test/broker.test.mjs",
@@ -1612,88 +1513,23 @@ test("redeliver re-queues only unacked messages, once", () => {
 `,
     },
     solution: {
-      "src/broker.mjs": `export class Broker {
-  constructor() {
-    this.topics = new Map();
-    this.seq = 0;
-  }
-  publish(topic, payload) {
-    if (!this.topics.has(topic)) {
-      this.topics.set(topic, { pending: [], inflight: [], acked: new Set() });
-    }
-    const msg = { id: ++this.seq, topic, payload, attempts: 0 };
-    this.topics.get(topic).pending.push(msg);
-    return msg.id;
-  }
-  consume(topic) {
-    const state = this.topics.get(topic);
-    if (!state) return undefined;
-    const msg = state.pending.shift();
-    if (msg) {
-      msg.attempts++;
-      state.inflight.push(msg);
-    }
-    return msg;
-  }
-  ack(topic, id) {
-    const state = this.topics.get(topic);
-    if (!state) return false;
-    state.acked.add(id);
-    state.inflight = state.inflight.filter((m) => m.id !== id);
-    return true;
-  }
-  redeliver(topic) {
-    const state = this.topics.get(topic);
-    if (!state) return 0;
-    const unacked = state.inflight.filter((m) => !state.acked.has(m.id));
-    state.inflight = [];
-    state.pending = [...unacked, ...state.pending];
-    return unacked.length;
-  }
-}
-`,
+      "src/broker.mjs": SOLUTION_LONGHORIZON_PUBSUB_REDELIVERY_BROKER,
     },
     broken: {
-      "src/broker.mjs": `export class Broker {
-  constructor() {
-    this.topics = new Map();
-    this.seq = 0;
-  }
-  publish(topic, payload) {
-    if (!this.topics.has(topic)) {
-      this.topics.set(topic, { pending: [], inflight: [], acked: new Set() });
-    }
-    const msg = { id: ++this.seq, topic, payload, attempts: 0 };
-    this.topics.get(topic).pending.push(msg);
-    return msg.id;
-  }
-  consume(topic) {
-    const state = this.topics.get(topic);
-    if (!state) return undefined;
-    const msg = state.pending.shift();
-    if (msg) {
-      msg.attempts++;
-      state.inflight.push(msg);
-    }
-    return msg;
-  }
-  ack(topic, id) {
-    const state = this.topics.get(topic);
-    if (!state) return false;
-    state.acked.add(id);
-    state.inflight = state.inflight.filter((m) => m.id !== id);
-    return true;
-  }
-  redeliver(topic) {
-    const state = this.topics.get(topic);
-    if (!state) return 0;
+      "src/broker.mjs": variant(SOLUTION_LONGHORIZON_PUBSUB_REDELIVERY_BROKER, [
+        [`    if (!state) return 0;
+    const unacked = state.inflight.filter((m) => !state.acked.has(m.id));
+    state.inflight = [];`, `    if (!state) return 0;
     const acked = state.inflight.filter((m) => state.acked.has(m.id));
-    state.inflight = [];
+    state.inflight = [];`],
+        [`    state.inflight = [];
+    state.pending = [...unacked, ...state.pending];
+    return unacked.length;
+  }`, `    state.inflight = [];
     state.pending = [...acked, ...state.pending];
     return acked.length;
-  }
-}
-`,
+  }`],
+      ]),
     },
   }),
   task({
@@ -1709,25 +1545,8 @@ test("redeliver re-queues only unacked messages, once", () => {
   return new Map(Object.entries(files));
 }
 `,
-      "src/diff.mjs": `export function diff(source, target) {
-  const added = [];
-  const modified = [];
-  for (const [path, content] of source) {
-    if (!target.has(path)) added.push(path);
-    else if (target.get(path) !== content) modified.push(path);
-  }
-  return { added, modified, deleted: [] };
-}
-`,
-      "src/apply.mjs": `export function applyChanges(target, source, changes) {
-  for (const path of [...changes.added, ...changes.modified]) {
-    target.set(path, source.get(path));
-  }
-  for (const path of changes.deleted) {
-    target.delete(path);
-  }
-}
-`,
+      "src/diff.mjs": START_LONGHORIZON_FILESYNC_DELETIONS_DIFF,
+      "src/apply.mjs": START_LONGHORIZON_FILESYNC_DELETIONS_APPLY,
       "src/conflicts.mjs": `export function detectConflicts(base, source, target) {
   const conflicts = [];
   for (const [path, content] of source) {
@@ -1781,42 +1600,18 @@ test("a both-modified file is a conflict", () => {
 `,
     },
     solution: {
-      "src/diff.mjs": `export function diff(source, target) {
-  const added = [];
-  const modified = [];
-  const deleted = [];
-  for (const [path, content] of source) {
-    if (!target.has(path)) added.push(path);
-    else if (target.get(path) !== content) modified.push(path);
-  }
-  for (const path of target.keys()) {
-    if (!source.has(path)) deleted.push(path);
-  }
-  return { added, modified, deleted };
-}
-`,
+      "src/diff.mjs": SOLUTION_LONGHORIZON_FILESYNC_DELETIONS_DIFF,
     },
     broken: {
-      "src/diff.mjs": `export function diff(source, target) {
-  const added = [];
-  const modified = [];
-  const deleted = [];
-  for (const [path, content] of source) {
-    if (!target.has(path)) added.push(path);
-    else if (target.get(path) !== content) modified.push(path);
+      "src/diff.mjs": SOLUTION_LONGHORIZON_FILESYNC_DELETIONS_DIFF,
+      "src/apply.mjs": variant(START_LONGHORIZON_FILESYNC_DELETIONS_APPLY, [
+        [`  }
+  for (const path of changes.deleted) {
+    target.delete(path);
   }
-  for (const path of target.keys()) {
-    if (!source.has(path)) deleted.push(path);
-  }
-  return { added, modified, deleted };
-}
-`,
-      "src/apply.mjs": `export function applyChanges(target, source, changes) {
-  for (const path of [...changes.added, ...changes.modified]) {
-    target.set(path, source.get(path));
-  }
-}
-`,
+}`, `  }
+}`],
+      ]),
     },
   }),
 ];

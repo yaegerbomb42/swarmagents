@@ -62,26 +62,36 @@ class TestWsClient {
   private waiters: Array<{ resolve: (m: Buffer) => void; reject: (e: Error) => void }> = [];
   closed = false;
 
-  private constructor(private readonly sock: net.Socket) {
-    sock.on("data", (chunk: Buffer) => {
-      const { messages, rest } = decodeFrames(Buffer.concat([this.rest, chunk]));
-      this.rest = rest;
-      for (const m of messages) {
-        if (m.opcode === OP_PING) {
-          this.sock.write(encodeFrame(OP_PONG, m.payload));
-        } else if (m.opcode === OP_CLOSE) {
-          this.sock.end(encodeClientFrame(OP_CLOSE, m.payload));
-        } else if (m.opcode === OP_BINARY) {
-          this.queue.push(m.payload);
-        }
-      }
-      this.flushWaiters();
-    });
+  private constructor(
+    private readonly sock: net.Socket,
+    head: Buffer = Buffer.alloc(0),
+  ) {
+    sock.on("data", (chunk: Buffer) => this.onData(chunk));
     sock.on("close", () => {
       this.closed = true;
       this.flushWaiters(new Error("socket closed"));
     });
     sock.on("error", () => {});
+    // Bytes that arrived with the upgrade (the proxy writes the 101 and the
+    // bridge's version frame back-to-back, so they often coalesce) are
+    // delivered as `head`, not via "data" — dropping them would eat the
+    // version frame. Feed them through the same path as socket data.
+    if (head.length > 0) this.onData(head);
+  }
+
+  private onData(chunk: Buffer): void {
+    const { messages, rest } = decodeFrames(Buffer.concat([this.rest, chunk]));
+    this.rest = rest;
+    for (const m of messages) {
+      if (m.opcode === OP_PING) {
+        this.sock.write(encodeFrame(OP_PONG, m.payload));
+      } else if (m.opcode === OP_CLOSE) {
+        this.sock.end(encodeClientFrame(OP_CLOSE, m.payload));
+      } else if (m.opcode === OP_BINARY) {
+        this.queue.push(m.payload);
+      }
+    }
+    this.flushWaiters();
   }
 
   static connect(url: string, headers: Record<string, string> = {}): Promise<TestWsClient> {
@@ -100,7 +110,9 @@ class TestWsClient {
           ...headers,
         },
       });
-      req.on("upgrade", (_res, sock) => resolve(new TestWsClient(sock as net.Socket)));
+      req.on("upgrade", (_res, sock, head) =>
+        resolve(new TestWsClient(sock as net.Socket, head)),
+      );
       req.on("response", (res) => {
         res.resume();
         reject(new Error(`expected upgrade, got HTTP ${res.statusCode}`));

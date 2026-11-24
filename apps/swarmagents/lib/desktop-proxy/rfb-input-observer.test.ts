@@ -76,7 +76,7 @@ test("rfb observer: key events carry names, codes, and modifier state", () => {
       key(true, 0x61), // 'a' down (shift held)
       key(false, 0x61), // 'a' up
       key(false, 0xffe1), // Shift_L up
-      key(true, 0xff0d), // Return
+      key(true, 0xff0d), // Return (XK_Return; main's keysym table names it "Return")
     ]),
   );
   assert.deepEqual(
@@ -86,7 +86,7 @@ test("rfb observer: key events carry names, codes, and modifier state", () => {
   const a = events[1];
   assert.ok(a.kind === "key_down" && a.key === "a" && a.code === "KeyA" && a.modifiers.shift === true);
   const ret = events[4];
-  assert.ok(ret.kind === "key_down" && ret.key === "Enter" && ret.modifiers.shift === false);
+  assert.ok(ret.kind === "key_down" && ret.key === "Return" && ret.modifiers.shift === false);
 });
 
 test("rfb observer: clipboard payloads are never carried into events", () => {

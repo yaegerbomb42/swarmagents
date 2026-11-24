@@ -4238,7 +4238,6 @@ export class RuntimeManager {
       // A tool boundary is a safe point: grant a pending takeover request.
       this.takeoverSignal(userId, (proxy) => proxy.notifyTakeoverSafePoint(userId));
     }
-    }
     if (event.type === "tool.call") {
       // The watchdog's tool-in-flight signal: silence after this point may
       // be a long tool running inside the VM, not a wedge.

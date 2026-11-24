@@ -183,11 +183,14 @@ export function DesktopView({
   // across the reconnect-to-switch dials and the state poll.
   const clientIdRef = useRef("");
   if (!clientIdRef.current) {
-    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-      clientIdRef.current = crypto.randomUUID();
-    } else if (typeof crypto !== "undefined" && "getRandomValues" in crypto) {
+    // typeof checks (not `in`) so TS does not narrow crypto to never when
+    // randomUUID is absent: the Crypto type declares it required.
+    const webCrypto = typeof crypto !== "undefined" ? crypto : undefined;
+    if (webCrypto && typeof webCrypto.randomUUID === "function") {
+      clientIdRef.current = webCrypto.randomUUID();
+    } else if (webCrypto && typeof webCrypto.getRandomValues === "function") {
       const bytes = new Uint8Array(10);
-      crypto.getRandomValues(bytes);
+      webCrypto.getRandomValues(bytes);
       clientIdRef.current = `client-${[...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
     } else {
       // No WebCrypto at all (ancient engine): a timestamped id is still unique

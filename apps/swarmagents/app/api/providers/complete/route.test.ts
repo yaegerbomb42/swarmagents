@@ -14,6 +14,12 @@ const oaiKey = "sk-test-oai-proxy-beta";
 process.env.SWARM_KEYS_ANTHROPIC = antKey;
 process.env.SWARM_KEYS_OPENAI = oaiKey;
 
+const originalFetch = globalThis.fetch;
+
+test.afterEach(() => {
+  globalThis.fetch = originalFetch;
+});
+
 function jsonResponse(
   body: unknown,
   init: { status?: number; headers?: Record<string, string> } = {},

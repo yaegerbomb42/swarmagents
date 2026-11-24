@@ -18,6 +18,7 @@ const USER = "lens-user@example.com";
 const apiKey = "sk-test-openai-lens-route";
 
 let tempDir: string;
+const originalFetch = globalThis.fetch;
 
 test.beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "swarm-lens-route-"));
@@ -31,6 +32,7 @@ test.beforeEach(() => {
 });
 
 test.afterEach(() => {
+  globalThis.fetch = originalFetch;
   setVmManagerForTesting(null);
   configureRunsDir(null);
   rmSync(tempDir, { recursive: true, force: true });

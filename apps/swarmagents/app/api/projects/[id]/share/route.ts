@@ -10,7 +10,7 @@
  */
 
 import { type NextRequest } from "next/server";
-import { USER_HEADER } from "../../../../../lib/auth";
+import { routeCaller, unauthorizedResponse } from "../../../../../lib/auth";
 import { noStoreJson, noStoreRouteError } from "../../../../../lib/http";
 import {
   createShareLink,
@@ -22,18 +22,13 @@ import {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function caller(req: NextRequest): string | null {
-  const user = req.headers.get(USER_HEADER);
-  return user && user.length > 0 && user.length <= 128 ? user : null;
-}
-
 function notFound() {
   return noStoreJson({ error: "Project not found." }, { status: 404 });
 }
 
 export async function POST(req: NextRequest, context: { params: Promise<{ id: string }> }) {
-  const user = caller(req);
-  if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
+  const user = routeCaller(req);
+  if (!user) return unauthorizedResponse();
   const { id } = await context.params;
   if (!isProjectId(id)) return notFound();
   if (!getProject(user, id)) return notFound();
@@ -46,8 +41,8 @@ export async function POST(req: NextRequest, context: { params: Promise<{ id: st
 }
 
 export async function DELETE(req: NextRequest, context: { params: Promise<{ id: string }> }) {
-  const user = caller(req);
-  if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
+  const user = routeCaller(req);
+  if (!user) return unauthorizedResponse();
   const { id } = await context.params;
   if (!isProjectId(id)) return notFound();
   if (!getProject(user, id)) return notFound();

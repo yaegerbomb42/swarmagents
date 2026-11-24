@@ -16,7 +16,7 @@
  */
 
 import { type NextRequest } from "next/server";
-import { USER_HEADER } from "../../../lib/auth";
+import { routeCaller, unauthorizedResponse } from "../../../lib/auth";
 import { noStoreJson, readJsonObject } from "../../../lib/http";
 import { lensErrorResponse } from "../../../lib/lenses/error-response";
 import { isLensId, type LensId } from "../../../lib/lenses/types";
@@ -47,11 +47,6 @@ function perMinute(name: string, fallback: number): number {
  */
 const lensBucket = new TokenBucket(perMinute("SWARM_LENS_RATE_LIMIT_PER_MIN", 20), 60_000);
 
-function caller(req: NextRequest): string | null {
-  const user = req.headers.get(USER_HEADER);
-  return user && user.length > 0 && user.length <= 128 ? user : null;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -71,8 +66,8 @@ function parseFiles(value: unknown): ReferencedFile[] {
 }
 
 export async function POST(req: NextRequest) {
-  const user = caller(req);
-  if (!user) return noStoreJson({ error: "Sign in required." }, { status: 401 });
+  const user = routeCaller(req);
+  if (!user) return unauthorizedResponse();
 
   // Bounded, streaming body read: an oversized body is rejected with 413
   // before it is buffered; a malformed body or a non-object stays a 400.

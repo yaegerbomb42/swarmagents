@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
-import { USER_HEADER } from "@/lib/auth";
+import { NO_STORE, routeCaller, unauthorizedResponse } from "@/lib/auth";
 import { runBoardAgent } from "@/lib/board-agent/agent";
 import { boardAgentLogRedactor } from "@/lib/board-agent/redact";
 import { getConversation, listConversations, saveConversation } from "@/lib/board-agent/store";
@@ -10,7 +10,6 @@ import { JsonBodyError } from "@/lib/http";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const NO_STORE = { "cache-control": "no-store" };
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_MESSAGE_LENGTH = 4000;
 const STORAGE_ERROR = "Conversation storage is temporarily unavailable. Try again shortly.";
@@ -53,8 +52,8 @@ async function readChatBody(request: Request): Promise<unknown> {
 
 export async function POST(request: Request): Promise<NextResponse> {
   // Middleware clears any client-supplied value and sets the authenticated id.
-  const userId = request.headers.get(USER_HEADER);
-  if (!userId) return json({ error: "Sign in required." }, 401);
+  const userId = routeCaller(request);
+  if (!userId) return unauthorizedResponse();
 
   let body: unknown;
   try {
@@ -119,8 +118,8 @@ export async function POST(request: Request): Promise<NextResponse> {
 }
 
 export async function GET(request: Request): Promise<NextResponse> {
-  const userId = request.headers.get(USER_HEADER);
-  if (!userId) return json({ error: "Sign in required." }, 401);
+  const userId = routeCaller(request);
+  if (!userId) return unauthorizedResponse();
 
   const id = new URL(request.url).searchParams.get("conversationId");
   try {

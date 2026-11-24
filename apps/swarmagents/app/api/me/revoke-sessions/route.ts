@@ -12,19 +12,16 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
-import { clearSessionCookieOptions, SESSION_COOKIE, USER_HEADER } from "../../../../lib/auth";
+import { clearSessionCookieOptions, NO_STORE, routeCaller, SESSION_COOKIE } from "../../../../lib/auth";
 import { recordAudit } from "../../../../lib/audit";
 import { bumpSessionEpoch, emailForUserId } from "../../../../lib/users";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const NO_STORE = { "cache-control": "no-store" } as const;
-const MAX_USER_ID_LEN = 128;
-
 export async function POST(req: NextRequest): Promise<Response> {
-  const id = req.headers.get(USER_HEADER);
-  if (!id || id.length > MAX_USER_ID_LEN) {
+  const id = routeCaller(req);
+  if (!id) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401, headers: NO_STORE });
   }
   if (!id.startsWith("local_")) {

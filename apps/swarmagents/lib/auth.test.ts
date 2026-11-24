@@ -21,6 +21,9 @@ import {
   signupAllowed,
   verifySession,
   USER_HEADER,
+  routeCaller,
+  unauthorizedResponse,
+  NO_STORE,
 } from "./auth.js";
 
 /** 64-char session-secret fixture: long enough to pass the boot length check. */
@@ -648,4 +651,24 @@ test("signupAllowed: defaults to process.env (the page/route call shape)", () =>
     if (previous.allow === undefined) delete process.env.SWARM_ALLOW_SIGNUP;
     else process.env.SWARM_ALLOW_SIGNUP = previous.allow;
   }
+});
+
+test("routeCaller extracts and validates x-swarm-user header", () => {
+  assert.equal(routeCaller({ headers: new Headers() }), null);
+  assert.equal(routeCaller({ headers: new Headers({ [USER_HEADER]: "" }) }), null);
+  assert.equal(routeCaller({ headers: new Headers({ [USER_HEADER]: "   " }) }), null);
+  assert.equal(routeCaller({ headers: new Headers({ [USER_HEADER]: "a".repeat(129) }) }), null);
+  assert.equal(routeCaller({ headers: new Headers({ [USER_HEADER]: "alice" }) }), "alice");
+  assert.equal(routeCaller({ headers: new Headers({ [USER_HEADER]: "  bob  " }) }), "bob");
+});
+
+test("unauthorizedResponse returns 401 with no-store headers", async () => {
+  const res = unauthorizedResponse();
+  assert.equal(res.status, 401);
+  assert.equal(res.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await res.json(), { error: "Sign in required." });
+
+  const custom = unauthorizedResponse("Custom unauthorized");
+  assert.equal(custom.status, 401);
+  assert.deepEqual(await custom.json(), { error: "Custom unauthorized" });
 });

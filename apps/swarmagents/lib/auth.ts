@@ -5,6 +5,7 @@
 // is gated in server mode; nothing is public except the login/signup/health
 // surface listed in middleware.ts.
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { NextResponse } from "next/server";
 import { getSessionEpoch } from "./users";
 
 /** Request shape we rely on — NextRequest and plain Request both satisfy it. */
@@ -20,6 +21,33 @@ export interface AuthUser {
 
 /** Route handlers learn who is calling from this header (set by middleware). */
 export const USER_HEADER = "x-swarm-user";
+
+/** Header that marks a per-user or otherwise dynamic reply as uncacheable. */
+export const NO_STORE = { "cache-control": "no-store" } as const;
+
+export const MAX_USER_ID_LENGTH = 128;
+
+/**
+ * Standardized extraction and validation of the authenticated caller identity
+ * from the middleware-set `x-swarm-user` header.
+ *
+ * Ensures the value is a trimmed, non-empty string of length <= 128.
+ */
+export function routeCaller(req: AuthRequestLike | Request): string | null {
+  const user = req.headers.get(USER_HEADER);
+  if (!user) return null;
+  const trimmed = user.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_USER_ID_LENGTH) return null;
+  return trimmed;
+}
+
+/**
+ * Standardized 401 Unauthorized response for unauthenticated route calls,
+ * carrying Cache-Control: no-store.
+ */
+export function unauthorizedResponse(message = "Sign in required."): NextResponse {
+  return NextResponse.json({ error: message }, { status: 401, headers: NO_STORE });
+}
 
 /** Signed session cookie name. */
 export const SESSION_COOKIE = "swarm_session";

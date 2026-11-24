@@ -14,38 +14,6 @@ interface ClaimResponse {
   job: { runId: string; prompt: string } | null;
 }
 
-/**
- * Enter the workspace from a cold browser context. The shared helper waits for
- * the composer before dismissing onboarding/launch, which only works when
- * localStorage already says the intro was seen; a fresh e2e context has to
- * clear those two overlays first.
- */
-async function enterWorkspace(page: Page): Promise<void> {
-  const response = await page.goto("/", { waitUntil: "domcontentloaded" });
-  assert.ok(response && response.status() < 400, `home page HTTP ${response?.status()}`);
-  // Mark the first-run tour as seen, then reload so it never mounts. This is
-  // what a returning user's browser has, and it avoids racing the tour's
-  // overlay while the client bundle hydrates.
-  await page.evaluate(() => {
-    try {
-      localStorage.setItem("sa.intro.seen", "1");
-    } catch {}
-  });
-  await page.reload({ waitUntil: "domcontentloaded" });
-  const launch = page.getByRole("button", { name: "Launch Agent Workspace" });
-  await launch.waitFor({ state: "visible", timeout: 20_000 });
-  for (let attempt = 0; attempt < 4; attempt++) {
-    await launch.click().catch(() => undefined);
-    try {
-      await page.locator("textarea").first().waitFor({ state: "visible", timeout: 5_000 });
-      return;
-    } catch {
-      // Hydration may not have attached the click handler yet; retry.
-    }
-  }
-  throw new Error("workspace composer did not appear after Launch");
-}
-
 /** Poll the node channel until the server hands this computer a job. */
 async function claimJob(page: Page, computerId: string, token: string): Promise<ClaimResponse["job"]> {
   const headers = { authorization: `Bearer ${token}`, "x-computer-id": computerId };

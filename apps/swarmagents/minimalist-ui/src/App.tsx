@@ -245,10 +245,12 @@ export default function App() {
   const handleSend = useCallback(
     async (text: string, attachments: Attachment[]): Promise<ComposerSendResult> => {
       const result = await session.send(text, attachments);
-      if (result.ok && !result.queued) setView("screen");
+      // The screen opens automatically on wide screens when a run starts; on
+      // a phone the conversation stays put (the screen is a tab away).
+      if (result.ok && !result.queued && wide) setView("screen");
       return result.ok ? { ok: true } : { ok: false, error: result.error };
     },
-    [session, setView],
+    [session, setView, wide],
   );
 
   const handleStop = useCallback(async () => {

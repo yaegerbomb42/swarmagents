@@ -140,6 +140,22 @@ class DesktopClient {
     }
   }
 
+  /**
+   * Read exactly `n` bytes, accumulating across frames: TCP segmentation is
+   * arbitrary, so a single frame is never a whole RFB message.
+   */
+  private pending = Buffer.alloc(0);
+  async readExact(n: number, timeoutMs = 15_000): Promise<Buffer> {
+    const start = Date.now();
+    while (this.pending.length < n) {
+      const frame = await this.nextBinary(Math.max(1_000, timeoutMs - (Date.now() - start)));
+      this.pending = Buffer.concat([this.pending, frame]);
+    }
+    const out = this.pending.subarray(0, n);
+    this.pending = this.pending.subarray(n);
+    return Buffer.from(out);
+  }
+
   /** Send raw bytes as a masked binary frame (as a browser would). */
   send(payload: Buffer): void {
     this.socket.write(encodeClientFrame(0x2, payload));
@@ -244,23 +260,35 @@ test("byoc e2e: a node pairs, runs a task and shows its desktop", async (t) => {
   );
   t.after(() => client.close());
 
-  // The RFB handshake, exactly as the noVNC client performs it.
+  // The RFB handshake, exactly as the noVNC client performs it. The desktop
+  // proxy terminates RFB toward the browser (and injects the VNC password
+  // server-side), so the client sees security type None.
+  //
+  // RFB 3.8 order: the server sends its version first, and only lists its
+  // security types after the client answers with its own version — the types
+  // are not part of the greeting.
+  const greeting = await client.readExact(12);
+  assert.equal(greeting.toString("utf8"), "RFB 003.008\n");
+
   client.send(Buffer.from("RFB 003.008\n", "utf8"));
-  const greeting = await client.nextBinary();
-  assert.equal(greeting.subarray(0, 12).toString("utf8"), "RFB 003.008\n");
-  const securityTypes = greeting.subarray(12);
-  assert.ok(securityTypes.length >= 1, "expected the security types");
+  const secCount = await client.readExact(1);
+  assert.ok(secCount[0] >= 1, "expected at least one security type");
+  const securityTypes = await client.readExact(secCount[0]);
+  assert.ok(securityTypes.includes(1), "expected security type None (1)");
 
   client.send(Buffer.from([1])); // security type: None
-  const securityResult = await client.nextBinary();
-  assert.deepEqual([...securityResult.subarray(0, 4)], [0, 0, 0, 0]);
+  const securityResult = await client.readExact(4);
+  assert.deepEqual([...securityResult], [0, 0, 0, 0]);
 
   client.send(Buffer.from([1])); // ClientInit: shared
-  const serverInit = await client.nextBinary();
-  assert.ok(serverInit.length >= 24, "expected the server init message");
+  const serverInit = await client.readExact(24);
   const width = serverInit.readUInt16BE(0);
   const height = serverInit.readUInt16BE(2);
   assert.ok(width > 0 && height > 0, `expected a real framebuffer, got ${width}x${height}`);
+  // ServerInit is a 24-byte fixed prefix plus a variable-length desktop
+  // name: consume the name or the next read starts mid-name.
+  const nameLen = serverInit.readUInt32BE(20);
+  await client.readExact(nameLen);
 
   // The desktop is live: ask for the screen (like the noVNC client does)
   // and wait for the framebuffer update that comes back through the tunnel.
@@ -273,7 +301,7 @@ test("byoc e2e: a node pairs, runs a task and shows its desktop", async (t) => {
   request.writeUInt16BE(height, 8); // height
   client.send(request);
 
-  const update = await client.nextBinary();
+  const update = await client.readExact(4);
   assert.equal(update[0], 0, "expected a framebuffer update message");
   assert.ok(update.readUInt16BE(2) > 0, "expected at least one updated rectangle");
 

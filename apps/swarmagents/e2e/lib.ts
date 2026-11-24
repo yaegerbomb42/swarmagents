@@ -260,10 +260,24 @@ export async function assertUIAccessible(page: Page, context: BrowserContext): P
   );
 }
 
-export async function openWorkspace(page: Page, context?: BrowserContext): Promise<void> {
+export async function openWorkspace(
+  page: Page,
+  context?: BrowserContext,
+  options: { devMode?: boolean } = {},
+): Promise<void> {
+  // A fresh account has no provider, so the workspace shows first-run setup
+  // instead of the hero/conversation: register the fake provider first (local
+  // mode only; the fake VM replays a recorded transcript instead of calling
+  // it). Without this, whichever spec runs first on a fresh server times out
+  // waiting for the hero or the conversation log.
+  if (mode() === "local") await ensureFakeProvider(page);
+
   // The workspace is the home page: one shell with the chat, the computer's
   // screen and the board. There is no landing page or intro in front of it.
-  const response = await page.goto("/", { waitUntil: "domcontentloaded" });
+  // The Board view is dev-mode only (?dev=1 turns it on, persisted per
+  // browser), so specs that exercise it navigate with the flag.
+  const url = options.devMode ? "/?dev=1" : "/";
+  const response = await page.goto(url, { waitUntil: "domcontentloaded" });
   if (response && response.status() >= 400) throw new Error(`Home page returned HTTP ${response.status()}`);
 
   if (context) await assertUIAccessible(page, context);
@@ -275,13 +289,47 @@ export async function openWorkspace(page: Page, context?: BrowserContext): Promi
 }
 
 /**
+ * A fake provider for the local account: a local stub URL that is never
+ * actually called — the local fake VM replays a recorded transcript instead
+ * of talking to a provider. Registering it is what keeps a fresh account out
+ * of first-run setup, so the workspace loads with the hero/conversation.
+ */
+export const FAKE_PROVIDER = {
+  id: "fake-e2e",
+  apiStyle: "openai-compatible",
+  baseUrl: "http://127.0.0.1:9/v1",
+  models: ["fake-model"],
+  apiKey: "sk-fake-e2e",
+  isFree: false,
+  inputPricePer1mTokens: 1000,
+  outputPricePer1mTokens: 1000,
+};
+
+/** Register the fake provider for the local account (idempotent upsert). */
+export async function ensureFakeProvider(page: Page): Promise<void> {
+  const saved = await page.request.post("/api/providers", { data: FAKE_PROVIDER });
+  if (!saved.ok()) {
+    throw new Error(`could not register the fake provider: HTTP ${saved.status()} ${await saved.text()}`);
+  }
+}
+
+/**
  * Start from an empty conversation. The e2e server keeps one account, so a
  * fresh browser context reopens whatever conversation ran last.
  */
 export async function startNewChat(page: Page): Promise<void> {
   const newChat = page.getByTestId("new-chat");
   // New chat is disabled while a run from an earlier spec is still winding down.
-  await page.waitForFunction(`!document.querySelector('[data-testid="new-chat"]')?.disabled`, null, { timeout: 60_000 });
+  // Function predicate, not a string: the app's CSP blocks eval, which is how
+  // Playwright evaluates string predicates (see waitForLastTurn below).
+  await page.waitForFunction(
+    () => {
+      const el = document.querySelector('[data-testid="new-chat"]') as HTMLButtonElement | null;
+      return !el?.disabled;
+    },
+    undefined,
+    { timeout: 60_000 },
+  );
   await newChat.click();
   await page.getByTestId("conversation-empty").waitFor({ state: "visible", timeout: 15_000 });
 }
@@ -293,15 +341,44 @@ export async function sendMessage(page: Page, text: string): Promise<void> {
   await input.press("Enter");
 }
 
+/**
+ * Switch to the chat view and stay there. The run opens the screen when it
+ * starts, so wait until it is actually under way (Stop appears) before
+ * switching back: clicking earlier loses to the active-run effect, which
+ * re-opens the screen when the run starts. A run that finishes before Stop
+ * is ever observed is already done, so the click below is safe either way;
+ * if the run never starts, the log-text waits that follow will say so.
+ * Call this right after the send, with no click in between: a click before
+ * the wait can delay the wait past a fast run's lifetime.
+ */
+export async function showChat(page: Page): Promise<void> {
+  try {
+    await page.getByTestId("stop-run").waitFor({ state: "visible", timeout: 30_000 });
+  } catch {
+    // No Stop observed: the run already finished, or never started.
+  }
+  await page.getByTestId("view-chat").click();
+  // If the run started after the click, the effect re-opens the screen;
+  // switch back once more if the log is still hidden after a beat.
+  await page.waitForTimeout(500);
+  if (!(await page.getByTestId("conversation-log").isVisible().catch(() => false))) {
+    await page.getByTestId("view-chat").click();
+  }
+}
+
 /** Wait until the newest turn in the conversation is in `phase` (finished, error, cancelled, ...). */
 export async function waitForLastTurn(page: Page, phase: string, timeout = 60_000): Promise<void> {
+  // Function predicate with the phase as an argument, not a string: the app's
+  // CSP (script-src 'self' + nonce, no 'unsafe-eval') blocks the eval
+  // Playwright uses for string predicates, so the string form throws
+  // EvalError on every call.
   await page.waitForFunction(
-    `(() => {
+    (wanted) => {
       const turns = document.querySelectorAll('[data-testid="turn"]');
       const last = turns[turns.length - 1];
-      return Boolean(last) && last.getAttribute("data-phase") === ${JSON.stringify(phase)};
-    })()`,
-    null,
+      return Boolean(last) && last.getAttribute("data-phase") === wanted;
+    },
+    phase,
     { timeout },
   );
 }

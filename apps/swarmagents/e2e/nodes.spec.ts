@@ -1,15 +1,19 @@
 /**
- * End-to-end test for Settings → Nodes.
+ * End-to-end test for BYOC node pairing.
  *
  * A real `swarm-node` process pairs with the app's in-process BYOC hub using
- * the one-time code the panel created. The machine shows up as online and,
- * when the account revokes it, the live session is killed and the runner
- * stops.
+ * a one-time code from the pair API. The node shows up as online and, when
+ * the account revokes it, the live session is killed and the runner stops.
  *
  * The node runs in its default container mode (it never has to receive a
  * command here, so Docker does not have to be running) so the test exercises
  * the path a real user takes. The command/desktop path is covered by
  * `byoc.spec.ts`.
+ *
+ * The pairing used to go through the Settings → Nodes tab, but that panel
+ * (ByocNodes) is unmounted dead code — the Nodes tab no longer exists — so
+ * the spec drives the same pair API the panel used (POST/GET/DELETE
+ * /api/byoc/pair). The node UI itself is covered by `computers.spec.ts`.
  */
 
 import assert from "node:assert/strict";
@@ -20,12 +24,20 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Page } from "playwright-core";
-import { UISkipError, captureView, closeBrowser, mode, runPageTest } from "./lib";
+import { UISkipError, closeBrowser, mode, openWorkspace, runPageTest } from "./lib";
 
-const TEST_NAME = "nodes: pair a BYOC node from Settings, see it online, then revoke it";
+const TEST_NAME = "nodes: pair a BYOC node, see it online, then revoke it";
 const APP_ROOT = path.resolve(__dirname, "..");
 const TSX = path.join(APP_ROOT, "node_modules", ".bin", "tsx");
 const NODE_CLI = path.join(APP_ROOT, "packages", "swarm-node", "src", "cli.ts");
+
+interface ByocNodeRow {
+  id: string;
+  name: string;
+  online: boolean;
+  hostMode: boolean;
+  revokedAt: number | null;
+}
 
 /** True when something accepts TCP connections on the loopback port. */
 function canConnect(port: number, timeoutMs = 1_500): Promise<boolean> {
@@ -42,28 +54,12 @@ function canConnect(port: number, timeoutMs = 1_500): Promise<boolean> {
   });
 }
 
-/** Enter the workspace from a cold browser context. */
-async function enterWorkspace(page: Page): Promise<void> {
-  const response = await page.goto("/", { waitUntil: "domcontentloaded" });
-  assert.ok(response && response.status() < 400, `home page HTTP ${response?.status()}`);
-  await page.evaluate(() => {
-    try {
-      localStorage.setItem("sa.intro.seen", "1");
-    } catch {}
-  });
-  await page.reload({ waitUntil: "domcontentloaded" });
-  const launch = page.getByRole("button", { name: "Launch Agent Workspace" });
-  await launch.waitFor({ state: "visible", timeout: 20_000 });
-  for (let attempt = 0; attempt < 4; attempt++) {
-    await launch.click().catch(() => undefined);
-    try {
-      await page.locator("textarea").first().waitFor({ state: "visible", timeout: 5_000 });
-      return;
-    } catch {
-      // Hydration may not have attached the click handler yet; retry.
-    }
-  }
-  throw new Error("workspace composer did not appear after Launch");
+/** The account's nodes, via the pair API the old panel used. */
+async function listNodes(page: Page): Promise<ByocNodeRow[]> {
+  const res = await page.request.get("/api/byoc/pair");
+  assert.ok(res.ok(), `node list failed: HTTP ${res.status()}`);
+  const body = (await res.json()) as { nodes?: ByocNodeRow[] };
+  return Array.isArray(body.nodes) ? body.nodes : [];
 }
 
 test(TEST_NAME, { skip: mode() === "prod" ? "prod mode is read-only" : false }, async () => {
@@ -76,22 +72,15 @@ test(TEST_NAME, { skip: mode() === "prod" ? "prod mode is read-only" : false }, 
       );
     }
 
-    await enterWorkspace(page);
-    await page.getByRole("button", { name: "Settings", exact: true }).first().click();
-    await page.getByRole("tab", { name: "Nodes" }).click();
-    await page.getByTestId("byoc-nodes").waitFor({ state: "visible", timeout: 10_000 });
-    await page.getByTestId("byoc-empty").waitFor({ state: "visible", timeout: 10_000 });
+    await openWorkspace(page);
 
-    // The panel hands out a one-time pairing code and the command to run.
-    await page.getByTestId("byoc-create-code").click();
-    const codeEl = page.getByTestId("byoc-pairing-code");
-    await codeEl.waitFor({ state: "visible", timeout: 10_000 });
-    const code = (await codeEl.innerText()).trim();
+    // The pair API hands out a one-time pairing code and the command to run.
+    const created = await page.request.post("/api/byoc/pair", { data: {} });
+    assert.ok(created.ok(), `pairing code creation failed: HTTP ${created.status()}`);
+    const { code, command } = (await created.json()) as { code: string; command: string };
     assert.match(code, /^[A-Z0-9]{4}-[A-Z0-9]{4}$/);
-    const command = (await page.getByTestId("byoc-pairing-command").innerText()).trim();
     assert.ok(command.includes(code), "the command carries the pairing code");
     assert.ok(command.includes("swarm-node"), "the command runs the runner");
-    await captureView(page, TEST_NAME, "pairing-code");
 
     // A real runner pairs with the app's hub using that code.
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-node-e2e-"));
@@ -124,27 +113,37 @@ test(TEST_NAME, { skip: mode() === "prod" ? "prod mode is read-only" : false }, 
     const exited = new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code)));
 
     try {
-      // The panel polls the account; once the runner connects the row says
-      // online and shows that it is in container mode.
-      const row = page.locator('[data-testid="byoc-node-row"]').first();
-      await row.waitFor({ state: "visible", timeout: 45_000 });
-      await page
-        .locator('[data-testid="byoc-node-online"][data-online="true"]')
-        .waitFor({ state: "visible", timeout: 45_000 });
-      await row.getByText("E2E Node").waitFor({ state: "visible", timeout: 5_000 });
-      await row.getByText(/container/).waitFor({ state: "visible", timeout: 5_000 });
-      await captureView(page, TEST_NAME, "paired-online");
+      // Poll the account until the runner connects: the node says online
+      // and is in container mode (no --host-mode flag was passed).
+      let deviceId = "";
+      const start = Date.now();
+      for (;;) {
+        const row = (await listNodes(page)).find((n) => n.name === "E2E Node");
+        if (row?.online) {
+          deviceId = row.id;
+          assert.equal(row.hostMode, false, "expected container mode");
+          break;
+        }
+        if (Date.now() - start > 45_000) throw new Error(`the runner did not come online:\n${nodeLog}`);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
 
       // Revoking kills the live session; the runner sees it and stops.
-      await row.getByTestId("byoc-revoke").click();
-      await page.getByTestId("byoc-empty").waitFor({ state: "visible", timeout: 20_000 });
+      const revoked = await page.request.delete(`/api/byoc/pair?deviceId=${encodeURIComponent(deviceId)}`);
+      assert.ok(revoked.ok(), `revoke failed: HTTP ${revoked.status()}`);
+      const goneStart = Date.now();
+      for (;;) {
+        const row = (await listNodes(page)).find((n) => n.id === deviceId);
+        if (row && !row.online && row.revokedAt !== null) break;
+        if (Date.now() - goneStart > 20_000) throw new Error(`the node did not go offline after revocation:\n${nodeLog}`);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
       const exitCode = await Promise.race([
         exited,
         new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 20_000)),
       ]);
       assert.notEqual(exitCode, "timeout", `the runner did not stop after revocation:\n${nodeLog}`);
       assert.equal(exitCode, 0, `the runner exited with ${exitCode}:\n${nodeLog}`);
-      await captureView(page, TEST_NAME, "revoked");
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
     }

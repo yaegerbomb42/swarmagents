@@ -15,7 +15,7 @@ const skip = mode() === "prod" ? "prod mode is read-only" : false;
 
 test("team: a task filed on the board is the coordination surface", { skip }, async (t) => {
   const result = await runPageTest("team: board task", async ({ page, context }) => {
-    await openWorkspace(page, context);
+    await openWorkspace(page, context, { devMode: true });
     assert.equal(await page.getByTestId("team-panel").count(), 0);
     assert.equal(await page.getByTestId("team-mode-toggle").count(), 0);
     await page.getByTestId("view-board").click();

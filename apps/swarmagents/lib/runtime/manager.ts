@@ -30,6 +30,8 @@ import { makeRedactor } from "../harness/redact";
 import type { BrainEvent } from "../harness/decision-brain/index";
 import type {
   ApprovalGateway,
+  ApprovalRequest,
+  ApprovalTicket,
   QuestionGateway,
   QuestionRequest,
   HandoffGateway,
@@ -220,6 +222,27 @@ export function mergeOracleSummary(
 
 const SUMMARY_PROMPT_LEN = 300;
 const DEFAULT_MAX_QUEUED = 3;
+
+/**
+ * Create one approval record for an ask-classified tool call and return
+ * its ticket. Both ask paths (the runner's createApproval hook and the
+ * agent's approval gateway) share it so the record shape cannot drift.
+ */
+function createRunApproval(runId: string, userId: string, ask: ApprovalRequest): ApprovalTicket {
+  const approval = getApprovalStore().create({
+    runId,
+    userId,
+    toolName: ask.toolName,
+    action: ask.action,
+    reason: ask.reason,
+  });
+  return {
+    id: approval.id,
+    expiresAt: approval.expiresAt,
+    timedOut: () => getApprovalStore().get(approval.id)?.timedOut === true,
+    verdict: getApprovalStore().waitFor(approval.id),
+  };
+}
 /**
  * Watchdog thresholds for stuck runs. A run that is active but never emits
  * run.started within START_GRACE_MS — or goes entirely silent for SILENCE_MS
@@ -2288,21 +2311,7 @@ export class RuntimeManager {
       // F1: an ask-classified call that is cleared to execute gets a
       // checkpoint first, so the mutation it precedes has a branch point.
       takeCheckpoint: () => this.takeAutoCheckpoint(userId, runId),
-      createApproval: (ask) => {
-        const approval = getApprovalStore().create({
-          runId,
-          userId,
-          toolName: ask.toolName,
-          action: ask.action,
-          reason: ask.reason,
-        });
-        return {
-          id: approval.id,
-          expiresAt: approval.expiresAt,
-          timedOut: () => getApprovalStore().get(approval.id)?.timedOut === true,
-          verdict: getApprovalStore().waitFor(approval.id),
-        };
-      },
+      createApproval: (ask) => createRunApproval(runId, userId, ask),
     });
   }
 
@@ -3699,21 +3708,7 @@ export class RuntimeManager {
     };
 
     // Ask-classified tool calls pause the run until POST /api/runtime/approvals/{id}.
-    const approvalGateway: ApprovalGateway = async (ask) => {
-      const approval = getApprovalStore().create({
-        runId,
-        userId,
-        toolName: ask.toolName,
-        action: ask.action,
-        reason: ask.reason,
-      });
-      return {
-        id: approval.id,
-        expiresAt: approval.expiresAt,
-        timedOut: () => getApprovalStore().get(approval.id)?.timedOut === true,
-        verdict: getApprovalStore().waitFor(approval.id),
-      };
-    };
+    const approvalGateway: ApprovalGateway = async (ask) => createRunApproval(runId, userId, ask);
 
     // The agent's memory tools run against the host-side store: the in-VM MCP
     // server forwards every call over a small file RPC and this bridge
@@ -3963,20 +3958,23 @@ export class RuntimeManager {
   }
 
   /**
-   * Find the pending file the VM ask server just wrote. Polls briefly because
-   * the tool call can reach the harness stream a tick before the file lands.
-   * Returns null when the server is unavailable (the card is still shown; the
-   * tool call itself will time out in the VM).
+   * Poll a VM directory for a `<id>.pending.json` file the VM-side server
+   * just wrote, newest first, skipping ids already seen and partially
+   * written files. Shared by the ask-question and desktop-handoff rendezvous:
+   * both poll the same way and differ only in the directory and in how the
+   * parsed JSON is mapped (with the caller's request as the fallback).
+   * Returns null when nothing lands within 5s.
    */
-  private async waitForPendingQuestion(
+  private async pollPendingFile<T>(
     userId: string,
+    dir: string,
     seen: Set<string>,
-    ask: QuestionRequest,
-  ): Promise<{ id: string; question: string; options: string[]; allowFreeText: boolean } | null> {
+    map: (parsed: Record<string, unknown>, id: string) => T,
+  ): Promise<T | null> {
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
       try {
-        const entries = await this.vm.listDir(userId, ASK_QUESTIONS_DIR);
+        const entries = await this.vm.listDir(userId, dir);
         const candidates = entries
           .filter((entry) => entry.type === "file" && entry.name.endsWith(".pending.json"))
           .map((entry) => ({ entry, id: entry.name.slice(0, -".pending.json".length) }))
@@ -3991,14 +3989,7 @@ export class RuntimeManager {
           }
           if (!parsed || typeof parsed.id !== "string") continue;
           seen.add(parsed.id);
-          return {
-            id: parsed.id,
-            question: typeof parsed.question === "string" ? parsed.question : ask.question,
-            options: Array.isArray(parsed.options)
-              ? parsed.options.filter((option): option is string => typeof option === "string")
-              : ask.options,
-            allowFreeText: parsed.allowFreeText !== false,
-          };
+          return map(parsed, parsed.id);
         }
       } catch {
         // Directory may not exist yet; keep polling.
@@ -4006,6 +3997,27 @@ export class RuntimeManager {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     return null;
+  }
+
+  /**
+   * Find the pending file the VM ask server just wrote. Polls briefly because
+   * the tool call can reach the harness stream a tick before the file lands.
+   * Returns null when the server is unavailable (the card is still shown; the
+   * tool call itself will time out in the VM).
+   */
+  private async waitForPendingQuestion(
+    userId: string,
+    seen: Set<string>,
+    ask: QuestionRequest,
+  ): Promise<{ id: string; question: string; options: string[]; allowFreeText: boolean } | null> {
+    return this.pollPendingFile(userId, ASK_QUESTIONS_DIR, seen, (parsed, id) => ({
+      id,
+      question: typeof parsed.question === "string" ? parsed.question : ask.question,
+      options: Array.isArray(parsed.options)
+        ? parsed.options.filter((option): option is string => typeof option === "string")
+        : ask.options,
+      allowFreeText: parsed.allowFreeText !== false,
+    }));
   }
 
   /** Write the answer (or cancellation) file the VM ask server is polling. */
@@ -4094,36 +4106,11 @@ export class RuntimeManager {
     seen: Set<string>,
     request: HandoffRequest,
   ): Promise<{ id: string; reason: string; description: string } | null> {
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline) {
-      try {
-        const entries = await this.vm.listDir(userId, DESKTOP_HANDOFF_DIR);
-        const candidates = entries
-          .filter((entry) => entry.type === "file" && entry.name.endsWith(".pending.json"))
-          .map((entry) => ({ entry, id: entry.name.slice(0, -".pending.json".length) }))
-          .filter(({ id }) => !seen.has(id))
-          .sort((a, b) => (b.entry.modifiedAt ?? 0) - (a.entry.modifiedAt ?? 0));
-        for (const { entry, id } of candidates) {
-          let parsed: Record<string, unknown>;
-          try {
-            parsed = JSON.parse(await this.vm.readFile(userId, entry.path)) as Record<string, unknown>;
-          } catch {
-            continue; // partially written; retry on the next poll
-          }
-          if (!parsed || typeof parsed.id !== "string") continue;
-          seen.add(parsed.id);
-          return {
-            id: parsed.id,
-            reason: typeof parsed.reason === "string" ? parsed.reason : request.reason,
-            description: typeof parsed.description === "string" ? parsed.description : request.description,
-          };
-        }
-      } catch {
-        // Directory may not exist yet; keep polling.
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    return null;
+    return this.pollPendingFile(userId, DESKTOP_HANDOFF_DIR, seen, (parsed, id) => ({
+      id,
+      reason: typeof parsed.reason === "string" ? parsed.reason : request.reason,
+      description: typeof parsed.description === "string" ? parsed.description : request.description,
+    }));
   }
 
   /**

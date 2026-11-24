@@ -17,6 +17,7 @@ import {
   getRuntimeManager,
   setRuntimeManagerForTesting,
   type RunSummary,
+  type StartResult,
 } from "./manager";
 import { RunStateStore } from "./durable-queue";
 import { VmManager, vmManager } from "../vm/manager";
@@ -95,11 +96,58 @@ function tmpDir(): string {
 }
 
 /**
- * Shared scaffolding for the restart tests: one manager over durable
- * state (the "first process"), plus the copy-and-rebuild step that
- * simulates the next process. Six tests repeat this setup; the helper
- * keeps the per-test bodies to what each test actually asserts.
+ * Single-manager setup for the non-restart tests: a temp dir, a bus, a
+ * blocking driver and a manager over one durable state file.
  */
+function beginManager(stateFile: string): {
+  dir: string;
+  runsDir: string;
+  store: RunStateStore;
+  driver: BlockingVmDriver;
+  manager: RuntimeManager;
+  cleanup(): void;
+} {
+  const dir = tmpDir();
+  const runsDir = path.join(dir, "runs");
+  configureRunsDir(runsDir);
+  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
+  const driver = new BlockingVmDriver();
+  const store = new RunStateStore({ filePath: stateFile });
+  const manager = new RuntimeManager({
+    vm: new VmManager({ customDriver: driver }),
+    bus,
+    router: null,
+    stateStore: store,
+  });
+  return {
+    dir,
+    runsDir,
+    store,
+    driver,
+    manager,
+    cleanup(): void {
+      manager.cancel("alice");
+      configureRunsDir(null);
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * Start the pair's long active run plus its queued follow-up (the shared
+ * opening of the FIX-35 restart tests) and wait for the first claude call.
+ */
+async function startActiveAndQueued(pair: RestartPair): Promise<{
+  active: StartResult;
+  queued: StartResult;
+}> {
+  const active = pair.managerA.start("alice", { prompt: "long active prompt" });
+  const queued = pair.managerA.start("alice", { prompt: "queued follow-up prompt" });
+  assert.equal(active.accepted, true);
+  assert.equal(queued.queued, true);
+  await waitForCalls(pair.driverA, 1);
+  return { active, queued };
+}
 interface RestartPair {
   dir: string;
   runsDir: string;
@@ -261,23 +309,11 @@ test("restart: queued prompt survives, active run aborts cleanly, pending approv
 });
 
 test("graceful shutdown preserves the queue instead of cancelling it", async () => {
-  const dir = tmpDir();
-  const runsDir = path.join(dir, "runs");
-  const stateFile = path.join(dir, "state.json");
-  configureRunsDir(runsDir);
-  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
-  let manager: RuntimeManager | undefined;
+  const env = beginManager(path.join(tmpDir(), "state.json"));
+  const { store, manager } = env;
+  const runsDir = env.runsDir;
 
   try {
-    const driver = new BlockingVmDriver();
-    const store = new RunStateStore({ filePath: stateFile });
-    manager = new RuntimeManager({
-      vm: new VmManager({ customDriver: driver }),
-      bus,
-      router: null,
-      stateStore: store,
-    });
-
     const active = manager.start("alice", { prompt: "active" });
     const queued = manager.start("alice", { prompt: "still queued after deploy" });
     assert.equal(active.queued, false);
@@ -297,30 +333,16 @@ test("graceful shutdown preserves the queue instead of cancelling it", async () 
     assert.equal(summary?.status, "cancelled");
     assert.equal(summary?.cancelledReason, "shutdown");
   } finally {
-    manager?.cancel("alice");
-    configureRunsDir(null);
-    fs.rmSync(dir, { recursive: true, force: true });
+    env.cleanup();
   }
 });
 
+
 test("auto-checkpoint records and persists the resume point in runtime state", async () => {
-  const dir = tmpDir();
-  const runsDir = path.join(dir, "runs");
-  const stateFile = path.join(dir, "state-checkpoint.json");
-  configureRunsDir(runsDir);
-  const bus = new TelemetryBus({ persist: true, runsDir: () => runsDir });
-  let manager: RuntimeManager | undefined;
+  const env = beginManager(path.join(tmpDir(), "state-checkpoint.json"));
+  const { store, driver, manager } = env;
 
   try {
-    const driver = new BlockingVmDriver();
-    const store = new RunStateStore({ filePath: stateFile });
-    manager = new RuntimeManager({
-      vm: new VmManager({ customDriver: driver }),
-      bus,
-      router: null,
-      stateStore: store,
-    });
-
     const active = manager.start("alice", {
       prompt: "do risky work with checkpoints",
       sessionId: "sess_resume_test",
@@ -353,11 +375,10 @@ test("auto-checkpoint records and persists the resume point in runtime state", a
     assert.ok(snapshotAfter.users.alice.active.resumePoint.stepSeq > 0);
     assert.equal(snapshotAfter.users.alice.active.resumePoint.sessionId, "sess_resume_test");
   } finally {
-    manager?.cancel("alice");
-    configureRunsDir(null);
-    fs.rmSync(dir, { recursive: true, force: true });
+    env.cleanup();
   }
 });
+
 
 test("restart: run with a recorded resume point resumes from its checkpoint", async () => {
   const pair = beginRestartPair(true);
@@ -546,11 +567,7 @@ test("restart: restored runs do not start during construction, then start after 
   let managerB: RuntimeManager | undefined;
 
   try {
-    const active = managerA.start("alice", { prompt: "long active prompt" });
-    const queued = managerA.start("alice", { prompt: "queued follow-up prompt" });
-    assert.equal(active.accepted, true);
-    assert.equal(queued.queued, true);
-    await waitForCalls(driverA, 1);
+    const { active, queued } = await startActiveAndQueued(pair);
 
     // vm.starting is published from executeInner's synchronous prefix, so
     // whether it fires before or after `new RuntimeManager` returns proves
@@ -594,10 +611,7 @@ test("restart: fresh prompt before the deferred drain queues behind restored wor
   let managerB: RuntimeManager | undefined;
 
   try {
-    managerA.start("alice", { prompt: "long active prompt" });
-    const queued = managerA.start("alice", { prompt: "queued follow-up prompt" });
-    assert.equal(queued.queued, true);
-    await waitForCalls(driverA, 1);
+    const { queued } = await startActiveAndQueued(pair);
 
     const driverB = new FastVmDriver();
     managerB = restartPair(pair, driverB).managerB;
@@ -633,10 +647,7 @@ test("restart: shutdown before the deferred drain leaves restored runs queued an
   let managerB: RuntimeManager | undefined;
 
   try {
-    managerA.start("alice", { prompt: "long active prompt" });
-    const queued = managerA.start("alice", { prompt: "queued follow-up prompt" });
-    assert.equal(queued.queued, true);
-    await waitForCalls(driverA, 1);
+    const { queued } = await startActiveAndQueued(pair);
 
     const driverB = new FastVmDriver();
     managerB = restartPair(pair, driverB).managerB;

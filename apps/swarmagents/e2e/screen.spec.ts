@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import type { BrowserContext, Page } from "playwright-core";
-import { captureView, closeBrowser, mode, openWorkspace, runPageTest } from "./lib";
+import { captureView, closeBrowser, mode, openWorkspace, runPageTest, showChat, startNewChat } from "./lib";
 import {
   FAKE_CLAUDE_ASSISTANT_TEXT,
   FAKE_CLAUDE_AUTO_APPROVE_ASSISTANT_TEXT,
@@ -39,7 +39,7 @@ async function waitEnabled(page: Page, testId: string): Promise<void> {
 }
 
 test(
-  "screen: take over shows the accent banner, disables the composer, and Esc hands back",
+  "screen: take over requests control, shows the waiting banner, and Esc hands back",
   { skip: readOnly ? "prod mode is read-only" : false },
   async (t) => {
     const testName = "screen: take over and Esc hand back";
@@ -48,6 +48,14 @@ test(
       async ({ page, context }) => {
         await useDesktopVm(context);
         await openWorkspace(page, context);
+        await startNewChat(page);
+
+        // The screen frame only mounts once a run exists: a new chat shows
+        // the hero, not the computer. Start a run first so the layout under
+        // test is the one the user watches.
+        const firstInput = page.getByTestId("composer-input");
+        await firstInput.fill("Run a quick end-to-end smoke check.");
+        await firstInput.press("Enter");
 
         // The frame replaces the old double screen chrome: no role <select>
         // on the main page. Role controls live in the settings drawer.
@@ -62,16 +70,24 @@ test(
         await waitEnabled(page, "take-over");
         await page.getByRole("button", { name: "Take over" }).click();
 
-        const banner = page.getByTestId("takeover-banner");
+        // The fake VM driver has no desktop, so the server can never grant
+        // control here: the deterministic state after Take over is the
+        // requested banner, not the in-control banner (the grant path is
+        // covered by the workspace unit tests, which render the frame
+        // driving). The pill still reads as the accent/running tone while
+        // the request is held.
+        const banner = page.getByTestId("takeover-requested-banner");
         await banner.waitFor({ state: "visible", timeout: 10_000 });
-        assert.match(await banner.innerText(), /in control/i, "expected the control banner");
-        assert.match(await banner.innerText(), /Press Esc to hand back/i, "hand-back stays on the banner");
-        assert.doesNotMatch(await banner.innerText(), /paused/i, "there is no pause API, so never say paused");
+        assert.match(await banner.innerText(), /Takeover requested/i, "expected the waiting banner");
+        assert.match(await banner.innerText(), /Press Esc to cancel/i, "Esc cancels the request");
         assert.equal(await frame.getAttribute("data-control"), "true");
+        // While the grant is pending the pill reads "Waiting for safe
+        // point" (warn) — the accent/running tone is for the granted
+        // state, which the fake driver never reaches (see above).
         assert.equal(
-          await page.getByTestId("screen-status-pill").getAttribute("data-tone"),
-          "accent",
-          "the status pill switches while you have the desktop",
+          await page.getByTestId("screen-status-pill").getAttribute("data-status"),
+          "warn",
+          "the status pill waits for the safe point while the request is held",
         );
 
         const composerTextarea = page.getByTestId("composer-input");
@@ -100,6 +116,7 @@ test(
       async ({ page, context }) => {
         await page.emulateMedia({ reducedMotion: "reduce" });
         await openWorkspace(page, context);
+        await startNewChat(page);
 
         const reduced = await page.evaluate(() => window.matchMedia("(prefers-reduced-motion: reduce)").matches);
         assert.equal(reduced, true, "emulated reduced motion must be active");
@@ -121,7 +138,13 @@ test(
         await input.fill("check the kernel with uname");
         await input.focus();
         await input.press("Enter");
-        await page.getByText(/run started/).first().waitFor({ state: "visible", timeout: 30_000 });
+        // The run plays on the screen on wide screens; the log only renders
+        // in the chat view. Switch back and stay there (see showChat in lib).
+        // showChat already waited for the run to start (Stop visible), and
+        // the "run started" line is a stream row: it renders in the screen /
+        // terminal narration, never in the chat log, so there is nothing to
+        // wait for here beyond the narration below.
+        await showChat(page);
         await page.getByTestId("conversation-log").getByText(FAKE_CLAUDE_ASSISTANT_TEXT).first().waitFor({ state: "visible", timeout: 30_000 });
         // Let the run finish so the next spec's workspace is not restored in
         // an active state.
@@ -172,12 +195,16 @@ test(
       testName,
       async ({ page, context }) => {
         await openWorkspace(page, context);
+        await startNewChat(page);
 
         const input = page.locator("textarea").first();
         await input.fill(`Please ${FAKE_CLAUDE_AUTO_APPROVE_TRIGGER} so we can keep going.`);
         await input.focus();
         await input.press("Enter");
 
+        // A phone stays on the chat (no auto-switch to the screen), so the
+        // log is already visible; showChat returns at once there.
+        await showChat(page);
         const log = page.getByTestId("conversation-log");
         await log.getByText(/Running: pip install flask/).waitFor({ state: "visible", timeout: 30_000 });
         await log.getByText(FAKE_CLAUDE_AUTO_APPROVE_ASSISTANT_TEXT).first().waitFor({ state: "visible", timeout: 30_000 });

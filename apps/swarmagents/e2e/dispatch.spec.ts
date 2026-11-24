@@ -1,5 +1,5 @@
 import { after, test } from "node:test";
-import { captureView, closeBrowser, mode, openWorkspace, runPageTest } from "./lib";
+import { captureView, closeBrowser, mode, openWorkspace, runPageTest, showChat, startNewChat } from "./lib";
 import { FAKE_CLAUDE_ASSISTANT_TEXT } from "../lib/vm/fake-claude";
 
 after(async () => {
@@ -15,11 +15,17 @@ test(
     const testName = "dispatch: prompt streams log lines into the UI";
     const result = await runPageTest(testName, async ({ page, context }) => {
       await openWorkspace(page, context);
+      await startNewChat(page);
 
       const input = page.getByTestId("composer-input");
       await input.fill("Run a quick end-to-end smoke check.");
       await input.press("Enter");
 
+      // The run plays on the screen on wide screens; the log only renders
+      // in the chat view. Switch back and stay there: the active-run effect
+      // re-opens the screen when the run starts, so a single click right
+      // after the send can lose the race.
+      await showChat(page);
       // The local fake VM replays a recorded stream-json transcript through the
       // real runtime pipeline, so the conversation shows the user ask, the
       // agent's message, a readable tool line and the terminal status.
@@ -44,11 +50,15 @@ test(
       testName,
       async ({ page, context }) => {
         await openWorkspace(page, context);
+        await startNewChat(page);
 
         const input = page.getByTestId("composer-input");
         await input.fill("Run a quick end-to-end smoke check.");
         await input.press("Enter");
 
+        // A phone stays on the chat (no auto-switch to the screen), so the
+        // log is already visible; showChat returns at once there.
+        await showChat(page);
         const log = page.getByTestId("conversation-log");
         await log.getByText(/Running: uname -a/).first().waitFor({ state: "visible", timeout: 30_000 });
         await captureView(page, testName, "running-mobile");

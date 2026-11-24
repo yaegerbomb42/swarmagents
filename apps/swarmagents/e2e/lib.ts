@@ -341,6 +341,31 @@ export async function sendMessage(page: Page, text: string): Promise<void> {
   await input.press("Enter");
 }
 
+/**
+ * Switch to the chat view and stay there. The run opens the screen when it
+ * starts, so wait until it is actually under way (Stop appears) before
+ * switching back: clicking earlier loses to the active-run effect, which
+ * re-opens the screen when the run starts. A run that finishes before Stop
+ * is ever observed is already done, so the click below is safe either way;
+ * if the run never starts, the log-text waits that follow will say so.
+ * Call this right after the send, with no click in between: a click before
+ * the wait can delay the wait past a fast run's lifetime.
+ */
+export async function showChat(page: Page): Promise<void> {
+  try {
+    await page.getByTestId("stop-run").waitFor({ state: "visible", timeout: 30_000 });
+  } catch {
+    // No Stop observed: the run already finished, or never started.
+  }
+  await page.getByTestId("view-chat").click();
+  // If the run started after the click, the effect re-opens the screen;
+  // switch back once more if the log is still hidden after a beat.
+  await page.waitForTimeout(500);
+  if (!(await page.getByTestId("conversation-log").isVisible().catch(() => false))) {
+    await page.getByTestId("view-chat").click();
+  }
+}
+
 /** Wait until the newest turn in the conversation is in `phase` (finished, error, cancelled, ...). */
 export async function waitForLastTurn(page: Page, phase: string, timeout = 60_000): Promise<void> {
   // Function predicate with the phase as an argument, not a string: the app's

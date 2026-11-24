@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { closeBrowser, mode, openWorkspace, runPageTest } from "./lib";
+import { closeBrowser, mode, openWorkspace, runPageTest, showChat, startNewChat } from "./lib";
 import { FAKE_CLAUDE_ASSISTANT_TEXT } from "../lib/vm/fake-claude";
 
 /**
@@ -17,6 +17,7 @@ const skip = mode() === "prod" ? "prod mode is read-only" : false;
 test("templates: standing instructions are in Agent settings, and a composer run still completes", { skip }, async (t) => {
   const result = await runPageTest("templates: composer run", async ({ page, context }) => {
     await openWorkspace(page, context);
+    await startNewChat(page);
     await page.getByTestId("open-settings").click();
     await page.getByTestId("settings-tab-agent").click();
     await page.getByTestId("agent-instructions").waitFor({ state: "visible" });
@@ -25,6 +26,9 @@ test("templates: standing instructions are in Agent settings, and a composer run
     const input = page.getByTestId("composer-input");
     await input.fill("Run a quick end-to-end smoke check.");
     await input.press("Enter");
+    // The run plays on the screen on wide screens; the log only renders
+    // in the chat view. Switch back and stay there (see showChat in lib).
+    await showChat(page);
     await page.getByTestId("conversation-log").getByText(FAKE_CLAUDE_ASSISTANT_TEXT).first().waitFor({ state: "visible", timeout: 30_000 });
   });
   if (result.skipped) t.skip(result.skipped);

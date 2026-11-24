@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import type { Page } from "playwright-core";
-import { captureView, closeBrowser, mode, openWorkspace, runPageTest } from "./lib";
+import { captureView, closeBrowser, mode, openWorkspace, runPageTest, showChat, startNewChat } from "./lib";
 import {
   FAKE_CLAUDE_ASSISTANT_TEXT,
   FAKE_CLAUDE_AUTO_APPROVE_ASSISTANT_TEXT,
@@ -58,6 +58,9 @@ async function send(page: Page, text: string): Promise<void> {
   await input.fill(text);
   await input.focus();
   await input.press("Enter");
+  // No view switch here: showChat must run right after the send, and a
+  // click in between can delay its Stop wait past a fast run's lifetime.
+  // Tests that need the log call showChat (or click view-chat) themselves.
 }
 
 test(
@@ -148,8 +151,12 @@ test(
       testName,
       async ({ page, context }) => {
         await openWorkspace(page, context);
+        await startNewChat(page);
 
         await send(page, "Run a quick end-to-end smoke check.");
+        // The run plays on the screen on wide screens; the log only renders
+        // in the chat view, so switch back once the run is under way.
+        await showChat(page);
         const log = page.getByTestId("conversation-log");
         await log.getByText("Run a quick end-to-end smoke check.").first().waitFor({ state: "visible", timeout: 30_000 });
         await log.getByText(/Running: uname -a/).first().waitFor({ state: "visible", timeout: 30_000 });
@@ -161,6 +168,7 @@ test(
         // A routine ask-classified call (pip install) is auto-approved: no
         // approval dialog and the run finishes.
         await send(page, "Install flask so we can test the auto-approve path.");
+        await showChat(page);
         await log.getByText(/Running: pip install flask/).first().waitFor({ state: "visible", timeout: 30_000 });
         await log.getByText(FAKE_CLAUDE_AUTO_APPROVE_ASSISTANT_TEXT).first().waitFor({ state: "visible", timeout: 30_000 });
         await page.waitForFunction(() => document.querySelector('[data-testid="run-indicator"]')?.getAttribute("data-phase") === "finished");
@@ -199,11 +207,16 @@ test(
 
         const log = page.getByTestId("conversation-log");
         await send(page, "This prompt requires real VM execution.");
+        // No run ever starts here (the dispatch fails), so there is no
+        // screen auto-switch to race; a plain click keeps the log visible
+        // for the assertions below.
+        await page.getByTestId("view-chat").click();
         await page.getByTestId("composer-error").getByText(/runtime control plane unavailable/).waitFor({ state: "visible", timeout: 10_000 });
         assert.equal(providerCompletionCalls, 0);
 
         networkFailure = true;
         await send(page, "A network failure must also remain an error.");
+        await page.getByTestId("view-chat").click();
         await page.getByTestId("composer-error").getByText(/Network error|failed/i).waitFor({ state: "visible", timeout: 10_000 });
         assert.equal(providerCompletionCalls, 0);
 
@@ -229,7 +242,9 @@ test(
       testName,
       async ({ page, context }) => {
         await openWorkspace(page, context);
+        await startNewChat(page);
         await send(page, `Build me a game. ${FAKE_CLAUDE_QUESTION_TRIGGER} to use.`);
+        await showChat(page);
 
         let card = page.getByTestId("question-card");
         await card.waitFor({ state: "visible", timeout: 30_000 });
@@ -240,6 +255,7 @@ test(
         // paused run is not lost.
         await page.reload({ waitUntil: "domcontentloaded" });
         await openWorkspace(page, context);
+        await page.getByTestId("view-chat").click();
         card = page.getByTestId("question-card");
         await card.waitFor({ state: "visible", timeout: 30_000 });
         assert.match(await card.innerText(), new RegExp(FAKE_CLAUDE_QUESTION));
@@ -269,6 +285,7 @@ test(
       async ({ page, context }) => {
         await openWorkspace(page, context);
         await send(page, `Please ${FAKE_CLAUDE_HOST_TARGET_TRIGGER} before we start.`);
+        await showChat(page);
 
         const log = page.getByTestId("conversation-log");
         const steps = log.getByTestId("steps-block").last();

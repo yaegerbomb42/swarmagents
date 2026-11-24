@@ -163,7 +163,6 @@ export function makeTask(overrides: Partial<SwarmTask> = {}): SwarmTask {
     title: "A task",
     description: "A task",
     difficulty: "medium",
-    minElo: 1400,
     constraints: [],
     status: "open",
     createdAt: 1_700_000_000_000,

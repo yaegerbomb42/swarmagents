@@ -35,13 +35,7 @@ export const TASK_SUMMARY_MAX = 8000;
 export const TASK_BRANCH_MAX = 200;
 export const TASK_PR_URL_MAX = 500;
 
-/**
- * The rating a claim records when the worker has no arena rating of its own.
- * It is the board's own baseline (poll_tasks defaults workerElo to 1400).
- */
-export const DEFAULT_WORKER_ELO = 1400;
-
-export const TASK_DIFFICULTIES: readonly TaskDifficulty[] = ["trivial", "easy", "medium", "hard", "expert"];
+export const TASK_DIFFICULTIES: readonly TaskDifficulty[] = ["easy", "medium", "hard"];
 
 export interface BoardCounts {
   tasks: number;
@@ -265,12 +259,12 @@ export async function askBoard(
 }
 
 export function claimBoardTask(
-  input: { taskId: string; agentName: string; workerElo?: number },
+  input: { taskId: string; agentName: string },
   fetchImpl: typeof fetch = fetch,
 ): Promise<BoardResult<SwarmTask>> {
   return callBoardTool(
     "claim_task",
-    { taskId: input.taskId, agentName: input.agentName, workerElo: input.workerElo ?? DEFAULT_WORKER_ELO },
+    { taskId: input.taskId, agentName: input.agentName },
     fetchImpl,
   );
 }

@@ -38,7 +38,6 @@ function makeTask(overrides: Partial<SwarmTask> = {}): SwarmTask {
     title: "T",
     description: "D",
     difficulty: "easy",
-    minElo: 1200,
     constraints: [],
     status: "open",
     history: [],
@@ -102,13 +101,12 @@ test("handleClaimTask rejects non-open task", async () => {
     title: "T",
     description: "D",
     difficulty: "easy",
-    minElo: 1200,
     constraints: [],
     status: "claimed",
     createdAt: 0,
     updatedAt: Date.now(),
   });
-  const result = await handleClaimTask(store, { taskId: "t1", agentName: "A", workerElo: 1300 });
+  const result = await handleClaimTask(store, { taskId: "t1", agentName: "A" });
   assert.ok("error" in result);
   assert.equal(result.error.code, -32602);
   assert.match(result.error.message, /not open/);
@@ -121,13 +119,12 @@ test("handleClaimTask claims open task", async () => {
     title: "T",
     description: "D",
     difficulty: "easy",
-    minElo: 1200,
     constraints: [],
     status: "open",
     createdAt: 0,
     updatedAt: 0,
   });
-  const result = await handleClaimTask(store, { taskId: "t1", agentName: "A", workerElo: 1300 });
+  const result = await handleClaimTask(store, { taskId: "t1", agentName: "A" });
   assert.ok("result" in result);
   const parsed = JSON.parse(result.result.content[0].text);
   assert.equal(parsed.task.status, "claimed");
@@ -137,14 +134,19 @@ test("handleClaimTask claims open task", async () => {
 test("handlePollTasks filters and sorts", () => {
   const store = emptyStore();
   store.tasks.push(
-    { id: "t1", title: "A", description: "D", difficulty: "easy", minElo: 1200, constraints: [], status: "open", createdAt: 0, updatedAt: 0 },
-    { id: "t2", title: "B", description: "D", difficulty: "hard", minElo: 1600, constraints: [], status: "open", createdAt: 0, updatedAt: 0 }
+    { id: "t1", title: "A", description: "D", difficulty: "easy", constraints: [], status: "open", createdAt: 0, updatedAt: 0 },
+    { id: "t2", title: "B", description: "D", difficulty: "hard", constraints: [], status: "open", createdAt: 0, updatedAt: 0 }
   );
-  const result = handlePollTasks(store, { workerElo: 1400, status: "open" });
+  const result = handlePollTasks(store, { status: "open" });
   assert.ok("result" in result);
   const parsed = JSON.parse(result.result.content[0].text);
   assert.equal(parsed.count, 2);
-  assert.equal(parsed.tasks[0].id, "t1"); // closer elo diff
+  assert.equal(parsed.tasks[0].id, "t1"); // easy sorts before hard
+  const filtered = handlePollTasks(store, { status: "open", difficulty: "hard" });
+  assert.ok("result" in filtered);
+  const filteredParsed = JSON.parse(filtered.result.content[0].text);
+  assert.equal(filteredParsed.count, 1);
+  assert.equal(filteredParsed.tasks[0].id, "t2");
 });
 
 test("handleSubmitTaskWork requires summary", async () => {
@@ -223,7 +225,6 @@ test("withLockedStore prevents concurrent double claim", async () => {
       title: "T",
       description: "D",
       difficulty: "easy",
-      minElo: 1200,
       constraints: [],
       status: "open",
       createdAt: 0,
@@ -235,8 +236,8 @@ test("withLockedStore prevents concurrent double claim", async () => {
   await saveStoreAtomic(seed);
 
   const results = await Promise.all([
-    withLockedStore((s) => handleClaimTask(s, { taskId: "t1", agentName: "A1", workerElo: 1300 })),
-    withLockedStore((s) => handleClaimTask(s, { taskId: "t1", agentName: "A2", workerElo: 1300 })),
+    withLockedStore((s) => handleClaimTask(s, { taskId: "t1", agentName: "A1" })),
+    withLockedStore((s) => handleClaimTask(s, { taskId: "t1", agentName: "A2" })),
   ]);
 
   const successes = results.filter((r) => "result" in r);
@@ -456,7 +457,7 @@ test("create → claim → submit → review happy path produces a complete audi
   assert.ok("result" in created);
   const taskId = payload(created).task.id;
 
-  assert.ok("result" in (await handleClaimTask(store, { taskId, agentName: "agent-a", workerElo: 1300 })));
+  assert.ok("result" in (await handleClaimTask(store, { taskId, agentName: "agent-a" })));
   assert.ok(
     "result" in
       (await handleSubmitTaskWork(store, {
@@ -698,7 +699,7 @@ test("judge_proposal is gated by the write lock: concurrent judges cannot double
 test("a claim cannot steal a task already in review", async () => {
   const task = makeTask({ status: "in_review", claimedBy: "agent-a", gitBranch: "feat/a" });
   const store = { ...emptyStore(), tasks: [task] };
-  const result = await handleClaimTask(store, { taskId: task.id, agentName: "agent-b", workerElo: 1300 });
+  const result = await handleClaimTask(store, { taskId: task.id, agentName: "agent-b" });
   assert.ok("error" in result);
   assert.equal(result.error.code, -32602);
   assert.equal(store.tasks[0], task);

@@ -122,8 +122,7 @@ export function listBoardTasks(
   const errors = validatePollTasks({ status });
   if (errors.length) return { ok: false, summary: errors[0].message };
   try {
-    // MCP poll_tasks defaults to open and ranks for a worker. Chat shows all
-    // statuses unless asked to filter, most recently updated first.
+    // Chat shows all statuses unless asked to filter, most recently updated first.
     const now = Date.now();
     const matches = loadStore().tasks.map((task) => viewBoardTask(task, now))
       .filter((task) => status == null || status === task.status);

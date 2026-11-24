@@ -1,4 +1,4 @@
-export type TaskDifficulty = "trivial" | "easy" | "medium" | "hard" | "expert";
+export type TaskDifficulty = "easy" | "medium" | "hard";
 
 export type TaskStatus = "open" | "claimed" | "in_review" | "completed" | "blocked";
 
@@ -7,11 +7,9 @@ export interface SwarmTask {
   title: string;
   description: string;
   difficulty: TaskDifficulty;
-  minElo: number;
   constraints: string[];
   status: TaskStatus;
   claimedBy?: string;
-  claimedByElo?: number;
   resultSummary?: string;
   gitBranch?: string;
   prUrl?: string;
@@ -42,10 +40,16 @@ export interface SwarmMessage {
   timestamp: number;
 }
 
-export const DIFFICULTY_ELO_MAP: Record<TaskDifficulty, number> = {
-  trivial: 1000, // Flash-Lite, Haiku
-  easy: 1200,    // Gemini Flash, GPT-4o-mini
-  medium: 1400,  // Standard Coding models
-  hard: 1600,    // Claude 3.5 Sonnet, GPT-4o
-  expert: 1800,  // OpenAI o1/o3, Opus
+/** Difficulty order, easiest first. */
+export const DIFFICULTY_RANK: Record<TaskDifficulty, number> = {
+  easy: 0,
+  medium: 1,
+  hard: 2,
 };
+
+/** Map a legacy difficulty (trivial/expert) onto the current three levels. */
+export function normalizeDifficulty(value: unknown): TaskDifficulty {
+  if (value === "trivial" || value === "easy") return "easy";
+  if (value === "expert" || value === "hard") return "hard";
+  return "medium";
+}

@@ -7,7 +7,7 @@ import type {
   ProposalStatus,
   ProposalDecision,
 } from "@/lib/mcp-types";
-import { DIFFICULTY_ELO_MAP } from "@/lib/mcp-types";
+import { DIFFICULTY_RANK } from "@/lib/mcp-types";
 import { saveStoreAtomic } from "./store";
 import { applyArenaMatch } from "./leaderboard";
 import { checkBranchOnRemote, isGitRemoteCheckEnabled } from "./git-remote";
@@ -120,7 +120,6 @@ export function isClaimExpired(task: SwarmTask, now: number): boolean {
 function clearAssignment(task: SwarmTask): SwarmTask {
   const next = { ...task };
   delete next.claimedBy;
-  delete next.claimedByElo;
   delete next.gitBranch;
   delete next.resultSummary;
   delete next.prUrl;
@@ -192,13 +191,13 @@ export function handleToolsList(id: unknown) {
       tools: [
         {
           name: "create_task",
-          description: "Orchestrator tool to post new prioritized tasks with explicit difficulty/minElo.",
+          description: "Orchestrator tool to post new prioritized tasks with an explicit difficulty (easy, medium, or hard).",
           inputSchema: {
             type: "object",
             properties: {
               title: { type: "string" },
               description: { type: "string" },
-              difficulty: { type: "string", enum: ["trivial", "easy", "medium", "hard", "expert"] },
+              difficulty: { type: "string", enum: ["easy", "medium", "hard"] },
               constraints: { type: "array", items: { type: "string" } },
             },
             required: ["title", "description", "difficulty"],
@@ -206,11 +205,11 @@ export function handleToolsList(id: unknown) {
         },
         {
           name: "poll_tasks",
-          description: "Worker tool to query tasks with Elo alignment score.",
+          description: "Worker tool to query tasks, optionally filtered by difficulty (easy, medium, or hard).",
           inputSchema: {
             type: "object",
             properties: {
-              workerElo: { type: "number" },
+              difficulty: { type: "string", enum: ["easy", "medium", "hard"] },
               status: { type: "string", enum: ["open", "claimed", "in_review", "completed", "blocked"] },
             },
           },
@@ -223,9 +222,8 @@ export function handleToolsList(id: unknown) {
             properties: {
               taskId: { type: "string" },
               agentName: { type: "string" },
-              workerElo: { type: "number" },
             },
-            required: ["taskId", "agentName", "workerElo"],
+            required: ["taskId", "agentName"],
           },
         },
         {
@@ -258,7 +256,7 @@ export function handleToolsList(id: unknown) {
               title: { type: "string" },
               problem: { type: "string" },
               proposedSolution: { type: "string" },
-              suggestedDifficulty: { type: "string", enum: ["trivial", "easy", "medium", "hard", "expert"] },
+              suggestedDifficulty: { type: "string", enum: ["easy", "medium", "hard"] },
             },
             required: ["proposedBy", "title", "problem", "proposedSolution", "suggestedDifficulty"],
           },
@@ -283,7 +281,7 @@ export function handleToolsList(id: unknown) {
               proposalId: { type: "string" },
               approved: { type: "boolean" },
               feedback: { type: "string" },
-              finalDifficulty: { type: "string", enum: ["trivial", "easy", "medium", "hard", "expert"] },
+              finalDifficulty: { type: "string", enum: ["easy", "medium", "hard"] },
               actor: {
                 type: "string",
                 description: "Optional judge identity recorded in the decisions log (default: orchestrator).",
@@ -374,14 +372,12 @@ export async function handleCreateTask(
     return { error: invalidParams(ve.map((v) => `${v.field}: ${v.message}`).join("; ")) };
   }
   const difficulty = (args.difficulty as TaskDifficulty) || "medium";
-  const minElo = DIFFICULTY_ELO_MAP[difficulty];
   const now = Date.now();
   const task = transitionTask({
     id: `task_${randomUUID()}`,
     title: args.title as string,
     description: args.description as string,
     difficulty,
-    minElo,
     constraints: (args.constraints as string[]) || [],
     status: "open",
     createdAt: now,
@@ -401,19 +397,19 @@ export function handlePollTasks(
     return { error: invalidParams(ve.map((v) => `${v.field}: ${v.message}`).join("; ")) };
   }
   const status = (args.status as string) || "open";
-  const workerElo = (args.workerElo as number) ?? 1400;
+  const difficulty = args.difficulty as TaskDifficulty | undefined;
   const now = Date.now();
   const filtered = store.tasks
     .map((task) => viewBoardTask(task, now))
     .filter((t) => t.status === status)
-    .map((t) => {
-      const eloDiff = workerElo - t.minElo;
-      let recommendation = "Ideal Match";
-      if (eloDiff < -150) recommendation = "Under-qualified (High Risk)";
-      else if (eloDiff > 350) recommendation = "Over-qualified (Prefer lower tier model)";
-      return { ...t, history: Array.isArray(t.history) ? t.history : [], eloDiff, recommendation };
-    })
-    .sort((a, b) => Math.abs(a.eloDiff) - Math.abs(b.eloDiff));
+    .filter((t) => !difficulty || t.difficulty === difficulty)
+    .map((t) => ({ ...t, history: Array.isArray(t.history) ? t.history : [] }))
+    .sort(
+      (a, b) =>
+        DIFFICULTY_RANK[a.difficulty] - DIFFICULTY_RANK[b.difficulty] ||
+        b.updatedAt - a.updatedAt ||
+        a.id.localeCompare(b.id),
+    );
 
   return { result: ok(JSON.stringify({ count: filtered.length, tasks: filtered }, null, 2)) };
 }
@@ -439,7 +435,6 @@ export async function handleClaimTask(
   const claimed = transitionTask({
     ...clearAssignment(task),
     claimedBy: agentName,
-    claimedByElo: args.workerElo as number,
   }, "claimed", agentName, now);
   const persistErr = await persistTask(store, claimed, index);
   if (persistErr) return { error: persistErr };

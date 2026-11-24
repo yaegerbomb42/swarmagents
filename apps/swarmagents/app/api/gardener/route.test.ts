@@ -79,30 +79,20 @@ test("rejects non-object body with status 400", async () => {
   assert.match(data.error ?? "", /Body must be a JSON object/i);
 });
 
-test("setElo rejects non-finite workerElo with status 400", async () => {
-  for (const invalidElo of [NaN, Infinity, -Infinity, "not-a-number", null, undefined]) {
-    const res = await post({ action: "setElo", workerElo: invalidElo });
-    assert.equal(res.status, 400, `Expected 400 for workerElo: ${String(invalidElo)}`);
+test("setDifficulty rejects anything outside easy/medium/hard with status 400", async () => {
+  for (const invalid of ["trivial", "expert", "1400", 1400, null, undefined]) {
+    const res = await post({ action: "setDifficulty", maxDifficulty: invalid });
+    assert.equal(res.status, 400, `Expected 400 for maxDifficulty: ${String(invalid)}`);
     const data = (await res.json()) as { error?: string };
-    assert.match(data.error ?? "", /finite number/i);
+    assert.match(data.error ?? "", /maxDifficulty must be one of easy, medium, hard/i);
   }
 });
 
-test("setElo clamps valid finite workerElo within [1000, 1800]", async () => {
-  const resLow = await post({ action: "setElo", workerElo: 500 });
-  assert.equal(resLow.status, 200);
-  const dataLow = (await resLow.json()) as { workerElo: number };
-  assert.equal(dataLow.workerElo, 1000);
-
-  const resHigh = await post({ action: "setElo", workerElo: 2500 });
-  assert.equal(resHigh.status, 200);
-  const dataHigh = (await resHigh.json()) as { workerElo: number };
-  assert.equal(dataHigh.workerElo, 1800);
-
-  const resValid = await post({ action: "setElo", workerElo: 1542.4 });
-  assert.equal(resValid.status, 200);
-  const dataValid = (await resValid.json()) as { workerElo: number };
-  assert.equal(dataValid.workerElo, 1542);
+test("setDifficulty stores the chosen max difficulty", async () => {
+  const res = await post({ action: "setDifficulty", maxDifficulty: "hard" });
+  assert.equal(res.status, 200);
+  const data = (await res.json()) as { maxDifficulty?: string };
+  assert.equal(data.maxDifficulty, "hard");
 });
 
 test("pin rejects repoRoot outside /workspace with status 400", async () => {

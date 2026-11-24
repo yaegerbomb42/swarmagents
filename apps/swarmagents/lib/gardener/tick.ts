@@ -3,11 +3,13 @@ import { providerQuotaCooldowns, readConfiguredProviders } from "../providers/st
 import { getCodebaseHotspots, selectedCodebaseRepo } from "../codebase/store";
 import type { CodebaseScanner } from "../codebase/types";
 import type { VmManager } from "../vm/manager";
-import { idealBoardTasks } from "./elo";
+import { tasksWithinDifficulty } from "./difficulty";
 import { hasSurplusQuota } from "./quota";
 import { proposalsFromAnalysis, proposalsFromBoard } from "./proposals";
 import { readUserGardener, updateUserGardener } from "./store";
+import { normalizeDifficulty } from "../mcp-types";
 import type { BoardTaskInput, GardenerProposal, HotspotInput, QuotaProvider } from "./types";
+import type { TaskDifficulty } from "../mcp-types";
 import { inAutopilotWindow } from "./window";
 
 export interface AutopilotTickInput {
@@ -18,7 +20,7 @@ export interface AutopilotTickInput {
   idleForMs: number;
   activeExec: boolean;
   providers: QuotaProvider[];
-  workerElo: number;
+  maxDifficulty: TaskDifficulty;
   tasks: BoardTaskInput[];
   hotspotsByRepo: Record<string, HotspotInput[]>;
 }
@@ -57,7 +59,7 @@ export function decideAutopilotTick(
       }),
     );
   }
-  const matched = idealBoardTasks(input.tasks, input.workerElo);
+  const matched = tasksWithinDifficulty(input.tasks, input.maxDifficulty);
   added.push(
     ...proposalsFromBoard({
       userId: input.userId,
@@ -97,7 +99,8 @@ function openTasks(): BoardTaskInput[] {
       title: task.title,
       description: task.description,
       status: task.status,
-      minElo: task.minElo,
+      difficulty: normalizeDifficulty(task.difficulty),
+      updatedAt: task.updatedAt,
     }));
   } catch {
     return [];
@@ -143,7 +146,7 @@ export async function runAutopilotTick(
       idleForMs: vm.idleForMs(userId, now),
       activeExec: vm.hasActiveExec(userId),
       providers: providersFor(userId, now),
-      workerElo: state.workerElo,
+      maxDifficulty: state.maxDifficulty,
       tasks: openTasks(),
       hotspotsByRepo,
     },

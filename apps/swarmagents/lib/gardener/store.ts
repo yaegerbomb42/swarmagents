@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveStorageDir } from "../board/store";
+import type { TaskDifficulty } from "../mcp-types";
 import type { GardenerFile, GardenerProposal, GardenerUserState } from "./types";
 
-const DEFAULT_ELO = 1400;
+const DEFAULT_MAX_DIFFICULTY: TaskDifficulty = "medium";
 
 let dirOverride: string | null = null;
 
@@ -17,7 +18,7 @@ function filePath(): string {
 }
 
 function emptyUser(): GardenerUserState {
-  return { enabled: false, workerElo: DEFAULT_ELO, pinned: [], proposals: [] };
+  return { enabled: false, maxDifficulty: DEFAULT_MAX_DIFFICULTY, pinned: [], proposals: [] };
 }
 
 function emptyFile(): GardenerFile {
@@ -68,15 +69,30 @@ export function updateUserGardener(
   const data = loadGardener();
   const state = data.users[userId] ?? emptyUser();
   mutate(state);
-  state.workerElo = clampElo(state.workerElo);
+  state.maxDifficulty = normalizeGardenerDifficulty(state);
   data.users[userId] = state;
   saveGardener(data);
   return state;
 }
 
-export function clampElo(elo: number): number {
-  if (!Number.isFinite(elo)) return DEFAULT_ELO;
-  return Math.max(1000, Math.min(1800, Math.round(elo)));
+/**
+ * Normalize a stored gardener state, including rows written before the Elo
+ * removal: a legacy `workerElo` maps onto a max difficulty (<=1200 easy,
+ * <=1400 medium, above that hard), and legacy trivial/expert difficulties
+ * map onto easy/hard.
+ */
+export function normalizeGardenerDifficulty(
+  state: GardenerUserState & { workerElo?: unknown },
+): TaskDifficulty {
+  const raw = (state as { maxDifficulty?: unknown }).maxDifficulty;
+  if (raw === "easy" || raw === "medium" || raw === "hard") return raw;
+  if (raw === "trivial") return "easy";
+  if (raw === "expert") return "hard";
+  const elo = (state as { workerElo?: unknown }).workerElo;
+  if (typeof elo === "number" && Number.isFinite(elo)) {
+    return elo <= 1200 ? "easy" : elo <= 1400 ? "medium" : "hard";
+  }
+  return DEFAULT_MAX_DIFFICULTY;
 }
 
 /**

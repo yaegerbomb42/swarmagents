@@ -4,7 +4,6 @@ import { JsonBodyError, readJsonBody } from "@/lib/http";
 import { resolveWorkspacePath, VmPathError } from "@/lib/vm/files";
 import { getVmManager } from "@/lib/vm/manager";
 import {
-  clampElo,
   readUserGardener,
   removeProposal,
   setProposalStatus,
@@ -88,7 +87,7 @@ export async function POST(req: NextRequest) {
   const body = rawBody as {
     action?: unknown;
     enabled?: unknown;
-    workerElo?: unknown;
+    maxDifficulty?: unknown;
     repoRoot?: unknown;
     proposalId?: unknown;
   };
@@ -113,16 +112,12 @@ export async function POST(req: NextRequest) {
     });
     return json(state);
   }
-  if (body.action === "setElo") {
-    if (body.workerElo === null || body.workerElo === undefined || typeof body.workerElo === "boolean") {
-      return json({ error: "workerElo must be a finite number" }, { status: 400 });
-    }
-    const num = typeof body.workerElo === "number" ? body.workerElo : Number(body.workerElo);
-    if (!Number.isFinite(num)) {
-      return json({ error: "workerElo must be a finite number" }, { status: 400 });
+  if (body.action === "setDifficulty") {
+    if (body.maxDifficulty !== "easy" && body.maxDifficulty !== "medium" && body.maxDifficulty !== "hard") {
+      return json({ error: "maxDifficulty must be one of easy, medium, hard" }, { status: 400 });
     }
     const state = updateUserGardener(id, (next) => {
-      next.workerElo = clampElo(num);
+      next.maxDifficulty = body.maxDifficulty as "easy" | "medium" | "hard";
     });
     return json(state);
   }

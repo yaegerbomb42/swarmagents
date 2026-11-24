@@ -25,7 +25,6 @@ function seed(dataFile: string): void {
           title: "Survive an I/O blip",
           description: "D",
           difficulty: "easy",
-          minElo: 1200,
           constraints: [],
           status: "open",
           createdAt: 1,
@@ -293,7 +292,7 @@ test("workers see the same lease deadline in GET/poll and can reclaim it exactly
   let now = 1000;
   t.mock.method(Date, "now", () => now);
   const tool = (name: string, args: Record<string, unknown>) => POST(rpc("tools/call", { name, arguments: args }));
-  const claim = (agentName: string) => tool("claim_task", { taskId: "task_1", agentName, workerElo: 1300 });
+  const claim = (agentName: string) => tool("claim_task", { taskId: "task_1", agentName });
   const expiredSubmit = () => tool("submit_task_work", {
     taskId: "task_1", agentName: "old-worker", gitBranch: "feat/late", summary: "Late work",
   });

@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { eloFit, idealBoardTasks } from "./elo";
+import type { TaskDifficulty } from "../mcp-types";
+import { fitsDifficulty, tasksWithinDifficulty } from "./difficulty";
 import { hasSurplusQuota } from "./quota";
 import { proposalsFromAnalysis } from "./proposals";
 import { configureGardenerDir, loadGardener, readUserGardener, setProposalStatus, updateUserGardener } from "./store";
@@ -36,17 +37,18 @@ test("surplus quota accepts free and loopback providers only", () => {
   assert.equal(hasSurplusQuota([{ id: "free", isFree: true, enabled: false }]).ok, false);
 });
 
-test("board poll keeps ideal Elo matches between 1000 and 1800", () => {
-  const tasks = [
-    { id: "low", status: "open", minElo: 1000, title: "a" },
-    { id: "mid", status: "open", minElo: 1400, title: "b" },
-    { id: "high", status: "open", minElo: 1800, title: "c" },
-    { id: "done", status: "completed", minElo: 1400, title: "d" },
+test("board poll keeps tasks at or below the max difficulty, easiest first", () => {
+  const tasks: { id: string; status: string; difficulty: TaskDifficulty; title: string }[] = [
+    { id: "low", status: "open", difficulty: "easy", title: "a" },
+    { id: "mid", status: "open", difficulty: "medium", title: "b" },
+    { id: "high", status: "open", difficulty: "hard", title: "c" },
+    { id: "done", status: "completed", difficulty: "medium", title: "d" },
   ];
-  assert.equal(eloFit(1400, 1800), "under");
-  assert.equal(eloFit(1400, 1000), "over");
-  const matched = idealBoardTasks(tasks, 1400);
-  assert.deepEqual(matched.map((t) => t.id), ["mid"]);
+  assert.equal(fitsDifficulty("hard", "medium"), false);
+  assert.equal(fitsDifficulty("easy", "medium"), true);
+  assert.equal(fitsDifficulty("medium", "medium"), true);
+  const matched = tasksWithinDifficulty(tasks, "medium");
+  assert.deepEqual(matched.map((t) => t.id), ["low", "mid"]);
 });
 
 test("analysis proposes missing tests and a hotspot PR awaiting approval", () => {
@@ -83,8 +85,8 @@ test("tick refuses work outside the window and queues when quota is surplus", ()
     idleForMs: 5 * 60_000,
     activeExec: false,
     providers: [{ id: "free", isFree: true }],
-    workerElo: 1400,
-    tasks: [{ id: "t1", title: "Fix parser", status: "open", minElo: 1400, description: "edge cases" }],
+    maxDifficulty: "medium" as TaskDifficulty,
+    tasks: [{ id: "t1", title: "Fix parser", status: "open", difficulty: "medium" as TaskDifficulty, description: "edge cases" }],
     hotspotsByRepo: { "/repo": [{ path: "lib/x.ts", heat: 4, coveragePct: 0 }] },
   };
   const idle = decideAutopilotTick({ ...base, idleForMs: 0 }, []);
@@ -125,7 +127,7 @@ test("a corrupt gardener.json falls back to empty state instead of throwing", ()
   try {
     fs.writeFileSync(path.join(dir, "gardener.json"), "{not json");
     assert.deepEqual(loadGardener(), { version: 1, users: {} });
-    assert.deepEqual(readUserGardener("local"), { enabled: false, workerElo: 1400, pinned: [], proposals: [] });
+    assert.deepEqual(readUserGardener("local"), { enabled: false, maxDifficulty: "medium", pinned: [], proposals: [] });
   } finally {
     configureGardenerDir(null);
   }

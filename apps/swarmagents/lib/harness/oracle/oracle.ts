@@ -34,7 +34,7 @@ import { findAffectedTests, isTestFile, relativeImports, resolveSpecifier } from
 import { countChurn, parsePatchFiles, unsafePatchPaths, type PatchFile } from "./diff";
 import { execWithTimeout, writeFileViaExec, type OracleExec } from "./exec";
 import { buildRetryContext, diagnosticLocation, extractDiagnostic, identifierAt } from "./retry";
-import { createScratch, type Scratch } from "./scratch";
+import { createScratch, workspaceFingerprint, type Scratch } from "./scratch";
 
 export interface OracleCandidate {
   id: string;
@@ -95,6 +95,8 @@ export interface OracleGateOptions {
   projectDir?: string;
   checks?: OracleCheck[];
   mode?: "best" | "first" | "all";
+  /** Candidate evaluations to run concurrently in best mode (clamped to 1–4). */
+  bestConcurrency?: number;
   /** Repo-relative dirs symlinked into each scratch (e.g. node_modules). */
   linkDirs?: string[];
   scratchRoot?: string;
@@ -167,8 +169,33 @@ async function readText(exec: OracleExec, file: string): Promise<string | undefi
   }
 }
 
+/** Read many text files in one VM exec, with base64 records safe for arbitrary newlines. Files that do not exist are skipped (no record). */
+async function readFiles(exec: OracleExec, cwd: string, files: string[]): Promise<Map<string, string>> {
+  if (files.length === 0) return new Map();
+  const res = await exec(
+    [
+      "sh",
+      "-c",
+      'for file do [ -f "$file" ] || continue; printf "%s\\t" "$file"; base64 < "$file" | tr -d "\\n"; printf "\\n"; done',
+      "sh",
+      ...files,
+    ],
+    { cwd },
+  );
+  const contents = new Map<string, string>();
+  if (res.exitCode !== 0) return contents;
+  for (const line of res.stdout.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab < 0) continue;
+    const file = line.slice(0, tab);
+    contents.set(file, Buffer.from(line.slice(tab + 1), "base64").toString("utf8"));
+  }
+  return contents;
+}
+
 export class OracleGate {
   private readonly exec: OracleExec;
+  private readonly fingerprints = new WeakMap<OracleCandidate, string>();
   private readonly opts: Required<Pick<OracleGateOptions, "projectDir" | "mode" | "checkTimeoutMs" | "maxDiagnosticChars">> &
     OracleGateOptions;
 
@@ -190,23 +217,28 @@ export class OracleGate {
   async run(candidates: OracleCandidate[]): Promise<OracleReport> {
     const verdicts: CandidateVerdict[] = [];
     const landed: string[] = [];
-    const passed: { id: string; diff: string; churn: number }[] = [];
+    const passed: { candidate: OracleCandidate; id: string; diff: string; churn: number }[] = [];
 
-    for (const candidate of candidates) {
-      if (this.opts.signal?.aborted) {
-        verdicts.push({ id: candidate.id, status: "skipped", checks: [] });
-        continue;
+    if (this.opts.mode === "best") {
+      for (const { candidate, verdict } of await this.evaluateBest(candidates)) {
+        verdicts.push(verdict);
+        if (verdict.status === "passed") {
+          passed.push({ candidate, id: candidate.id, diff: candidate.diff, churn: verdict.churn });
+        }
       }
-      if (this.opts.mode === "first" && landed.length > 0) {
-        verdicts.push({ id: candidate.id, status: "skipped", checks: [] });
-        continue;
+    } else {
+      for (const candidate of candidates) {
+        if (this.opts.signal?.aborted) {
+          verdicts.push({ id: candidate.id, status: "skipped", checks: [] });
+          continue;
+        }
+        if (this.opts.mode === "first" && landed.length > 0) {
+          verdicts.push({ id: candidate.id, status: "skipped", checks: [] });
+          continue;
+        }
+        const verdict = await this.evaluate(candidate);
+        verdicts.push(verdict.status === "passed" ? await this.landOrConflict(candidate, verdict, landed) : verdict);
       }
-      let verdict = await this.evaluate(candidate);
-      if (verdict.status === "passed") {
-        if (this.opts.mode === "best") passed.push({ id: candidate.id, diff: candidate.diff, churn: verdict.churn });
-        else verdict = await this.landOrConflict(candidate, verdict, landed);
-      }
-      verdicts.push(verdict);
     }
 
     if (this.opts.mode === "best" && passed.length > 0) {
@@ -214,7 +246,7 @@ export class OracleGate {
       for (let i = 0; i < verdicts.length; i++) {
         const v = verdicts[i];
         if (v.status !== "passed") continue;
-        if (v.id === winner.id) verdicts[i] = await this.landOrConflict(winner, v, landed);
+        if (v.id === winner.id) verdicts[i] = await this.landOrConflict(winner.candidate, v, landed);
         else verdicts[i] = { ...v, note: `passed but not landed: ${winner.id} has less churn` };
       }
     }
@@ -234,6 +266,26 @@ export class OracleGate {
       summary,
       retryContext: landed.length === 0 && firstRejection?.status === "rejected" ? firstRejection.retryContext : undefined,
     };
+  }
+
+  private async evaluateBest(candidates: OracleCandidate[]): Promise<{ candidate: OracleCandidate; verdict: CandidateVerdict }[]> {
+    const requested = this.opts.bestConcurrency ?? 3;
+    const concurrency = Math.max(1, Math.min(4, Number.isFinite(requested) ? Math.floor(requested) : 3));
+    const outcomes = new Array<{ candidate: OracleCandidate; verdict: CandidateVerdict }>(candidates.length);
+    let next = 0;
+    const worker = async () => {
+      while (true) {
+        const index = next++;
+        if (index >= candidates.length) return;
+        const candidate = candidates[index];
+        const verdict = this.opts.signal?.aborted
+          ? { id: candidate.id, status: "skipped" as const, checks: [] }
+          : await this.evaluate(candidate);
+        outcomes[index] = { candidate, verdict };
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, candidates.length) }, () => worker()));
+    return outcomes;
   }
 
   /** Land a passing candidate; it becomes an error when the real tree no longer accepts it. */
@@ -280,6 +332,7 @@ export class OracleGate {
         scratchRoot: this.opts.scratchRoot,
         linkDirs: this.opts.linkDirs,
       });
+      this.fingerprints.set(candidate, scratch.fingerprint);
       const patchFile = `${scratch.dir}.candidate.patch`;
       await writeFileViaExec(this.exec, patchFile, candidate.diff);
       const applied = await this.exec(["git", "-C", scratch.dir, "apply", "--whitespace=nowarn", patchFile]);
@@ -384,11 +437,9 @@ export class OracleGate {
 
   /** Read the contents of a set of test files into a Map (undefined reads are skipped). */
   private async readContents(files: string[], cwd: string, contents: Map<string, string>): Promise<void> {
-    const texts = await Promise.all(files.map((p) => readText(this.exec, path.join(cwd, p))));
-    files.forEach((p, i) => {
-      const text = texts[i];
-      if (text !== undefined) contents.set(p, text);
-    });
+    // One batched read for the whole set: these are listed test files, all exist.
+    const texts = await readFiles(this.exec, cwd, files);
+    for (const [p, text] of texts) contents.set(p, text);
   }
 
   /**
@@ -433,7 +484,7 @@ export class OracleGate {
     return this.drainDefinitions(queue, seen, 16, out);
   }
 
-  /** Process one definition candidate at a time (recursive so no await sits in a loop). */
+  /** Process one definition level at a time (recursive so no await sits in a loop). One batched read per level; missing spelling candidates are skipped. */
   private async drainDefinitions(
     queue: string[],
     seen: Set<string>,
@@ -441,21 +492,26 @@ export class OracleGate {
     out: { path: string; content: string }[],
   ): Promise<{ path: string; content: string }[]> {
     if (queue.length === 0 || budget <= 0) return out;
-    const file = queue.shift()!;
-    if (!seen.has(file)) {
+    const level: string[] = [];
+    while (queue.length > 0 && level.length < budget) {
+      const file = queue.shift()!;
+      if (seen.has(file)) continue;
       seen.add(file);
-      if (!unsafePatchPaths([{ path: file, status: "M" }]).length) {
-        const content = await readText(this.exec, path.join(this.opts.repoRoot, file));
-        if (content !== undefined) {
-          out.push({ path: file, content });
-          budget -= 1;
-          for (const spec of relativeImports(content)) {
-            const stem = resolveSpecifier(file, spec);
-            if (stem.startsWith("..") || stem.includes("/../")) continue;
-            for (const candidate of [`${stem}.ts`, `${stem}/index.ts`, `${stem}.tsx`]) {
-              if (!seen.has(candidate) && budget > 0) queue.push(candidate);
-            }
-          }
+      if (unsafePatchPaths([{ path: file, status: "M" }]).length) continue;
+      level.push(file);
+    }
+    if (level.length === 0) return this.drainDefinitions(queue, seen, budget, out);
+    const contents = await readFiles(this.exec, this.opts.repoRoot, level);
+    for (const file of level) {
+      const content = contents.get(file);
+      if (content === undefined) continue;
+      out.push({ path: file, content });
+      budget -= 1;
+      for (const spec of relativeImports(content)) {
+        const stem = resolveSpecifier(file, spec);
+        if (stem.startsWith("..") || stem.includes("/../")) continue;
+        for (const candidate of [`${stem}.ts`, `${stem}/index.ts`, `${stem}.tsx`]) {
+          if (!seen.has(candidate) && budget > 0) queue.push(candidate);
         }
       }
     }
@@ -463,11 +519,17 @@ export class OracleGate {
   }
 
   /** Apply to the real tree (check first, so a moved tree is a conflict, never a partial apply). */
-  private async land(candidate: { id: string; diff: string }): Promise<void> {
+  private async land(candidate: OracleCandidate): Promise<void> {
     const root = this.opts.repoRoot;
+    const expectedFingerprint = this.fingerprints.get(candidate);
+    if (!expectedFingerprint) throw new Error("workspace fingerprint missing for candidate");
     const patchFile = path.join(path.dirname(root), `.oracle-land-${candidate.id.replace(/[^\w.-]/g, "_")}.patch`);
     await writeFileViaExec(this.exec, patchFile, candidate.diff);
     try {
+      const currentFingerprint = await workspaceFingerprint(this.exec, root);
+      if (currentFingerprint !== expectedFingerprint) {
+        throw new Error("real workspace changed since candidate scratch was created");
+      }
       const check = await this.exec(["git", "-C", root, "apply", "--check", "--whitespace=nowarn", patchFile]);
       if (check.exitCode !== 0) throw new Error(`real tree rejected the patch: ${check.stderr.trim()}`);
       const apply = await this.exec(["git", "-C", root, "apply", "--whitespace=nowarn", patchFile]);

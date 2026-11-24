@@ -115,7 +115,7 @@ function artifact(rel: string, size: number): ReportArtifact {
 test("hashArtifacts records sha256 + present for readable files", async () => {
   const driver = new FakeVmDriver();
   const vm = new VmManager({ customDriver: driver });
-  const handle = await driver.ensure("alice");
+  const handle = await vm.ensure("alice");
   await driver.writeFile(handle, "/workspace/a.txt", ARTIFACT_CONTENT);
   const hashed = await hashArtifacts(vm, "alice", [artifact("a.txt", ARTIFACT_CONTENT.length)]);
   assert.equal(hashed[0]?.sha256, sha256Hex(Buffer.from(ARTIFACT_CONTENT, "utf8")));
@@ -134,7 +134,7 @@ test("hashArtifacts records a file gone between listing and read as missing", as
 test("hashArtifacts records an over-cap file as missing without throwing", async () => {
   const driver = new FakeVmDriver();
   const vm = new VmManager({ customDriver: driver });
-  const handle = await driver.ensure("alice");
+  const handle = await vm.ensure("alice");
   await driver.writeFile(handle, "/workspace/big.txt", "0123456789");
   // Size (10) exceeds the 4-byte cap passed here: skipped, not crashed.
   const hashed = await hashArtifacts(vm, "alice", [artifact("big.txt", 10)], 4);
@@ -159,6 +159,7 @@ async function runToReport(opts: {
     browser: new StubBrowser(),
     runsDir: () => opts.runsDir,
   });
+  await vm.ensure(opts.userId);
   reporter.attach(opts.runId, opts.userId);
   bus.publish(opts.runId, {
     type: "run.created",

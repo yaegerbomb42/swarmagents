@@ -65,6 +65,7 @@
  */
 
 import { NextResponse } from "next/server";
+import { recordAudit } from "../../../../../../lib/audit";
 import { getVmManager } from "../../../../../../lib/vm/manager";
 import { getRuntimeManager } from "../../../../../../lib/runtime/manager";
 import { getRunSummary } from "../../../../../../lib/runtime/run-store";
@@ -390,6 +391,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
       if (action === "keep") {
         const kept =
           updateTestDrive(finalized.id, { status: "kept", finishedAt: Date.now() }) ?? finalized;
+        recordAudit({ user, action: "test_drive.keep", target: finalized.id, result: "success" });
         return NextResponse.json({ drive: driveView(kept, user) }, { headers: NO_STORE });
       }
       try {
@@ -397,6 +399,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
       } catch (error) {
         const message = error instanceof Error ? error.message : "Could not restore the snapshot.";
         updateTestDrive(finalized.id, { lastError: `Roll-back failed: ${message}` });
+        recordAudit({ user, action: "test_drive.rollback", target: finalized.id, result: "failure" });
         return jsonError(`Roll-back failed: ${message}`, 500);
       }
       const rolled =
@@ -405,6 +408,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
           rollbackReason: "user",
           finishedAt: Date.now(),
         }) ?? finalized;
+      recordAudit({ user, action: "test_drive.rollback", target: finalized.id, result: "success" });
       return NextResponse.json({ drive: driveView(rolled, user) }, { headers: NO_STORE });
     });
   }
@@ -473,6 +477,7 @@ export async function POST(req: Request, context: { params: Promise<{ id: string
         snapshotLabel: label,
         runId: started.runId,
       });
+      recordAudit({ user, action: "test_drive.start", target: drive.id, result: "success" });
       return NextResponse.json(
         { drive: driveView(drive, user), runId: started.runId, snapshotLabel: label, queued: started.queued },
         { status: 201, headers: NO_STORE },

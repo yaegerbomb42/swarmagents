@@ -7,6 +7,7 @@
  */
 
 import type { NextRequest } from "next/server";
+import { recordAudit } from "@/lib/audit";
 import { exportAgent, exportContainsSecrets } from "@/lib/agents/store";
 import { containsSecretValue } from "@/lib/agents/export-secrets";
 import { agentCaller, notFound, ok, routeId, serverError, unauthorized } from "@/lib/agents/http";
@@ -20,7 +21,14 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
   const id = await routeId(ctx);
   const pkg = exportAgent(user, id);
   if (!pkg) return notFound();
-  if (exportContainsSecrets(pkg)) return serverError("Refusing to export: the package still contains secret-shaped keys.");
-  if (containsSecretValue(pkg)) return serverError("Refusing to export: the package still contains secret-shaped values.");
+  if (exportContainsSecrets(pkg)) {
+    recordAudit({ user, action: "agent.export", target: id, result: "failure" });
+    return serverError("Refusing to export: the package still contains secret-shaped keys.");
+  }
+  if (containsSecretValue(pkg)) {
+    recordAudit({ user, action: "agent.export", target: id, result: "failure" });
+    return serverError("Refusing to export: the package still contains secret-shaped values.");
+  }
+  recordAudit({ user, action: "agent.export", target: id, result: "success" });
   return ok(pkg);
 }

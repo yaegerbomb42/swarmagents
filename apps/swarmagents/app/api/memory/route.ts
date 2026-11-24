@@ -12,6 +12,7 @@
  */
 
 import { NextResponse, type NextRequest } from "next/server";
+import { recordAudit } from "@/lib/audit";
 import { providerOwner } from "@/lib/providers/owner";
 import { JsonBodyError, readJsonBody } from "@/lib/http";
 import { clearMemories, listMemories, searchMemories, writeMemory } from "@/lib/memory/store";
@@ -94,6 +95,7 @@ export async function DELETE(request: NextRequest) {
   if (!owner) return unauthorized();
   try {
     const forgotten = clearMemories(owner);
+    recordAudit({ user: owner, action: "memory.clear", target: owner, result: "success" });
     return NextResponse.json({ forgotten }, { headers: NO_STORE });
   } catch {
     return NextResponse.json({ error: "Could not clear memories." }, { status: 500, headers: NO_STORE });

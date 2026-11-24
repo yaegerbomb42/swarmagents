@@ -5,6 +5,7 @@
  */
 
 import type { NextRequest } from "next/server";
+import { recordAudit } from "@/lib/audit";
 import { getAgent } from "@/lib/agents/store";
 import { compatibilityReport } from "@/lib/agents/compatibility";
 import { harnessAdapters } from "@/lib/agents/adapters/swarm";
@@ -31,7 +32,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const report = compatibilityReport(manifest, { userId: user });
   const result = await adapter.deploy(user, manifest);
   if (!result.ok) {
+    recordAudit({ user, action: "agent.deploy", target: id, result: "failure" });
     return badRequest(result.error, { missing: result.missing ?? report.missing, report });
   }
+  recordAudit({ user, action: "agent.deploy", target: id, result: "success" });
   return ok({ runId: result.runId, queued: result.queued, harness: adapter.id, report });
 }

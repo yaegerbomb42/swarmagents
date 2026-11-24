@@ -29,6 +29,11 @@ echo "Booting built app for e2e (fake VM, temp SWARM_HOME)"
 echo "App will listen on http://127.0.0.1:${PORT}"
 
 export SWARM_VM_DRIVER=fake
+# The board's pushed-branch check verifies refs on the checkout's origin,
+# which in e2e is a test checkout with no work branches — a submitted test
+# branch can never exist there. Disable the check for the e2e server only;
+# production keeps it on.
+export SWARM_GIT_REMOTE_CHECK=0
 SWARM_HOME="$(mktemp -d)"
 export SWARM_HOME
 # Keep the gate self-contained on machines without a /workspace mount.

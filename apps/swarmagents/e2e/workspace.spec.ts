@@ -109,7 +109,9 @@ test("flow A+B: a message becomes a run, the screen opens, the reply and report 
   const result = await runPageTest(testName, async ({ page, context, consoleErrors }) => {
     await openWorkspace(page, context);
     await startNewChat(page);
-    assert.equal(await page.getByTestId("stage").count(), 0, "a new chat is just the prompt");
+    // The stage is the always-mounted main area since the three-component
+    // view: a new chat is just the prompt when it holds no turns yet.
+    assert.equal(await page.getByTestId("turn").count(), 0, "a new chat is just the prompt");
     assert.deepEqual(await unnamedControls(page), []);
     await captureView(page, testName, "1-new-chat");
 
@@ -131,6 +133,8 @@ test("flow A+B: a message becomes a run, the screen opens, the reply and report 
     await captureView(page, testName, "2-running");
 
     // The result: the agent's reply, a Finished status, no more Stop, and the report.
+    // Turns only render in the chat view; the run plays on the screen.
+    await page.getByTestId("view-chat").click();
     await waitForLastTurn(page, "finished");
     await log.getByText(FAKE_CLAUDE_ASSISTANT_TEXT).first().waitFor({ state: "visible", timeout: 15_000 });
     await page.getByTestId("stop-run").waitFor({ state: "hidden", timeout: 15_000 });
@@ -144,7 +148,8 @@ test("flow A+B: a message becomes a run, the screen opens, the reply and report 
 
     // The steps the agent took are readable on the finished turn.
     await page.getByTestId("view-chat").click();
-    assert.equal(await page.getByTestId("stage").count(), 0);
+    assert.equal(await page.getByTestId("minimal-main-page").getAttribute("data-view"), "chat");
+    assert.equal(await page.getByTestId("screen-frame").isVisible(), false, "the screen is hidden behind the chat");
     await captureView(page, testName, "4-chat-only");
 
     // Chat survives a reload: same conversation, same reply.
@@ -180,11 +185,14 @@ test("flow A: Stop ends the run from every view, even when pressed before the se
     // before the server has created the run, it still stops that run.
     await sendMessage(page, prompt);
     await page.getByTestId("stop-run").click();
+    // Turns only render in the chat view; the run plays on the screen.
+    await page.getByTestId("view-chat").click();
     await waitForLastTurn(page, "cancelled", 30_000);
     await page.waitForFunction(NO_STOP_BUTTON, undefined, { timeout: 15_000 });
 
     // A run that is under way: Stop is in reach from every view.
     await sendMessage(page, prompt);
+    await page.getByTestId("view-chat").click();
     await page.getByTestId("question-card").last().getByTestId("question-option").first().waitFor({ state: "visible", timeout: 30_000 });
     for (const view of ["chat", "board", "screen"]) {
       await page.getByTestId(`view-${view}`).click();
@@ -193,6 +201,7 @@ test("flow A: Stop ends the run from every view, even when pressed before the se
     await captureView(page, testName, "1-waiting");
 
     await page.getByTestId("stop-run").click();
+    await page.getByTestId("view-chat").click();
     await waitForLastTurn(page, "cancelled", 30_000);
     await page.waitForFunction(NO_STOP_BUTTON, undefined, { timeout: 15_000 });
     assert.equal(await page.getByTestId("run-indicator").getAttribute("data-phase"), "cancelled");
@@ -213,6 +222,8 @@ test("flow A: a question from the agent is answered in place and the run continu
     await startNewChat(page);
     await sendMessage(page, `Build a small game. First tell me ${FAKE_CLAUDE_QUESTION_TRIGGER} to use.`);
 
+    // The question card only renders in the chat view; the run plays on the screen.
+    await page.getByTestId("view-chat").click();
     const card = page.getByTestId("question-card");
     await card.waitFor({ state: "visible", timeout: 30_000 });
     await card.getByText(FAKE_CLAUDE_QUESTION).waitFor({ state: "visible" });
@@ -295,7 +306,9 @@ test("flow C: a task is added to the board, run on the VM, and submitted for rev
     await page.getByTestId("view-board").click();
     const board = page.getByTestId("board-panel");
     await board.waitFor({ state: "visible" });
-    assert.equal(await page.getByTestId("chat-column").isVisible(), true, "the chat stays beside the board");
+    // The board takes the whole view in the three-component layout; the chat
+    // is a tab away, not a column beside it.
+    assert.equal(await page.getByTestId("minimal-main-page").getAttribute("data-view"), "board");
 
     // Add.
     await page.getByTestId("board-add-input").fill(`${title}\nUsers land on a blank page after sign in.`);
@@ -310,11 +323,15 @@ test("flow C: a task is added to the board, run on the VM, and submitted for rev
     await row.getByTestId("board-run").click();
     await page.getByTestId("stop-run").waitFor({ state: "visible", timeout: 15_000 });
     await page.locator(`[data-testid="board-task"][data-status="claimed"]`, { hasText: title }).waitFor({ state: "visible", timeout: 15_000 });
-    await page.getByTestId("conversation-log").getByText(title).first().waitFor({ state: "visible", timeout: 15_000 });
     await captureView(page, testName, "2-running");
+
+    // The run's prompt is in the conversation, which only mounts in the chat view.
+    await page.getByTestId("view-chat").click();
+    await page.getByTestId("conversation-log").getByText(title).first().waitFor({ state: "visible", timeout: 15_000 });
 
     // Result: the run finishes; the row links to it and offers to submit.
     await waitForLastTurn(page, "finished");
+    await page.getByTestId("view-board").click();
     const claimed = page.locator('[data-testid="board-task"]', { hasText: title });
     await claimed.getByTestId("board-view-run").waitFor({ state: "visible", timeout: 15_000 });
     await claimed.getByTestId("board-task-title").click();
@@ -355,6 +372,8 @@ test("phone: the same three flows fit a 390px screen without sideways scrolling"
       assert.ok((await overflowX(page)) <= 0, "no sideways scroll with the screen open");
       await captureView(page, testName, "2-screen");
 
+      // Turns only render in the chat view; the run plays on the screen.
+      await page.getByTestId("view-chat").click();
       await waitForLastTurn(page, "finished");
       await captureView(page, testName, "3-finished");
 

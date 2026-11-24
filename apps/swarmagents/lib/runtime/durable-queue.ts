@@ -59,6 +59,8 @@ export interface PersistedActiveRun {
   startedAt?: number;
   /** Recorded resume point from the run's latest auto-checkpoint. */
   resumePoint?: ResumePoint;
+  /** Watchdog recoveries already spent on this run (bounded; survives restarts). */
+  recoveryAttempts?: number;
 }
 
 /** A prompt waiting behind the active run; everything startNext() needs. */
@@ -78,6 +80,8 @@ export interface PersistedQueuedRun {
   runMode?: RunModeInfo;
   /** Recorded resume point, when this queued run resumes from a checkpoint. */
   resumePoint?: ResumePoint;
+  /** Watchdog recoveries already spent on this run (bounded; survives restarts). */
+  recoveryAttempts?: number;
   createdAt: number;
 }
 
@@ -126,6 +130,13 @@ function str(value: unknown, max: number): string | undefined {
 
 function finiteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** A spent-recovery counter: a non-negative integer, or absent when invalid. */
+function normalizeRecoveryAttempts(value: unknown): number | undefined {
+  const n = finiteNumber(value);
+  if (n === undefined || n < 0) return undefined;
+  return Math.floor(n);
 }
 
 function normalizeCompute(value: unknown): RunCompute | undefined {
@@ -178,6 +189,7 @@ function normalizeCommon(record: Record<string, unknown>):
       | "compute"
       | "fullAuto"
       | "runMode"
+      | "recoveryAttempts"
       | "createdAt"
     >
   | null {
@@ -191,6 +203,7 @@ function normalizeCommon(record: Record<string, unknown>):
   const role = normalizeJsonObject<RoleDefinition>(record.role);
   const compute = normalizeCompute(record.compute);
   const runMode = normalizeRunMode(record.runMode);
+  const recoveryAttempts = normalizeRecoveryAttempts(record.recoveryAttempts);
   return {
     runId,
     userId,
@@ -204,6 +217,7 @@ function normalizeCommon(record: Record<string, unknown>):
     ...(compute ? { compute } : {}),
     ...(typeof record.fullAuto === "boolean" ? { fullAuto: record.fullAuto } : {}),
     ...(runMode ? { runMode } : {}),
+    ...(recoveryAttempts !== undefined ? { recoveryAttempts } : {}),
     createdAt,
   };
 }

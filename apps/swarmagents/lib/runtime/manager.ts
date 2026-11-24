@@ -275,6 +275,20 @@ const DEFAULT_TURN_CHECKPOINT_MIN_INTERVAL_MS = 60_000;
 /** Reason recorded on checkpoint telemetry taken at a turn boundary. */
 const TURN_CHECKPOINT_REASON = "turn boundary";
 
+/** Watchdog recoveries per stuck run before it is finalized as an error. */
+const DEFAULT_MAX_RECOVERY_ATTEMPTS = 2;
+/**
+ * Hard ceiling on watchdog recoveries per run, whatever the configured
+ * option says: a run that keeps wedging must eventually error instead of
+ * resurrecting forever.
+ */
+const MAX_RECOVERY_ATTEMPTS_CAP = 10;
+
+function normalizeMaxRecoveryAttempts(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_MAX_RECOVERY_ATTEMPTS;
+  return Math.min(MAX_RECOVERY_ATTEMPTS_CAP, Math.max(0, Math.floor(value)));
+}
+
 export type RunStatus = "queued" | "running" | "finished" | "error" | "cancelled";
 
 export interface RunSummary {
@@ -358,6 +372,8 @@ interface QueuedRun {
   forkedFrom?: ForkInfo;
   /** Daemon resume: the recorded checkpoint this run resumes from, if any. */
   resumePoint?: ResumePoint;
+  /** Watchdog recoveries already spent on this run (bounded; see maxRecoveryAttempts). */
+  recoveryAttempts?: number;
   /** F1 fork: start a fresh conversation instead of resuming the last session. */
   freshSession?: boolean;
   /**
@@ -488,6 +504,8 @@ interface ActiveRun {
   lastCheckpointAt?: number;
   /** True while a turn-boundary checkpoint snapshot is in flight. */
   turnCheckpointInFlight?: boolean;
+  /** Watchdog recoveries already spent on this run (bounded; see maxRecoveryAttempts). */
+  recoveryAttempts?: number;
   /**
    * Set only by the shutdown path for a run with a recorded resume point:
    * the exec is aborted so the process can exit, but the run must NOT be
@@ -904,6 +922,7 @@ export class RuntimeManager {
   private readonly silenceMs: number;
   private readonly toolSilenceMs: number;
   private readonly turnCheckpointMinIntervalMs: number;
+  private readonly maxRecoveryAttempts: number;
   private readonly watchdogSweepMs: number = 30_000;
   private readonly killGraceMs: number;
   private readonly reapTimeoutMs: number;
@@ -961,6 +980,13 @@ export class RuntimeManager {
      * conservative default (a snapshot per turn would be too costly).
      */
     turnCheckpointMinIntervalMs?: number;
+    /**
+     * Watchdog recoveries per stuck run before it is finalized as an error
+     * (default 2; 0 disables recovery, restoring the finalize-on-stuck
+     * behavior). Clamped to a hard cap so no configuration can resurrect a
+     * run forever.
+     */
+    maxRecoveryAttempts?: number;
     /** Watchdog sweep cadence, ms (default 30s; minimum 20ms in tests). */
     watchdogSweepMs?: number;
     /**
@@ -994,6 +1020,7 @@ export class RuntimeManager {
     this.toolSilenceMs = opts.toolSilenceMs ?? DEFAULT_TOOL_SILENCE_MS;
     this.turnCheckpointMinIntervalMs =
       opts.turnCheckpointMinIntervalMs ?? DEFAULT_TURN_CHECKPOINT_MIN_INTERVAL_MS;
+    this.maxRecoveryAttempts = normalizeMaxRecoveryAttempts(opts.maxRecoveryAttempts);
     this.watchdogSweepMs = Math.max(20, opts.watchdogSweepMs ?? 30_000);
     this.killGraceMs = opts.killGraceMs ?? KILL_GRACE_MS;
     this.reapTimeoutMs = opts.reapTimeoutMs ?? REAP_TIMEOUT_MS;
@@ -1227,6 +1254,7 @@ export class RuntimeManager {
       createdAt: active.createdAt,
       ...(active.startedAt !== undefined ? { startedAt: active.startedAt } : {}),
       ...(active.resumePoint ? { resumePoint: active.resumePoint } : {}),
+      ...(active.recoveryAttempts !== undefined ? { recoveryAttempts: active.recoveryAttempts } : {}),
     };
   }
 
@@ -1246,6 +1274,7 @@ export class RuntimeManager {
       ...(run.fullAuto !== undefined ? { fullAuto: run.fullAuto } : {}),
       ...(run.runMode ? { runMode: run.runMode } : {}),
       ...(run.resumePoint ? { resumePoint: run.resumePoint } : {}),
+      ...(run.recoveryAttempts !== undefined ? { recoveryAttempts: run.recoveryAttempts } : {}),
       createdAt: run.createdAt,
     };
   }
@@ -1323,6 +1352,9 @@ export class RuntimeManager {
           ...(queued.compute ? { compute: queued.compute } : {}),
           ...(queued.fullAuto !== undefined ? { fullAuto: queued.fullAuto } : {}),
           ...(queued.runMode ? { runMode: queued.runMode } : {}),
+          ...(queued.recoveryAttempts !== undefined
+            ? { recoveryAttempts: queued.recoveryAttempts }
+            : {}),
           createdAt: queued.createdAt,
         });
       }
@@ -1368,6 +1400,9 @@ export class RuntimeManager {
               ...(row.active.runMode ? { runMode: row.active.runMode } : {}),
               seedSnapshotLabel: checkpointVmLabel(row.active.runId, resumePoint.stepSeq),
               resumePoint,
+              ...(row.active.recoveryAttempts !== undefined
+                ? { recoveryAttempts: row.active.recoveryAttempts }
+                : {}),
               createdAt: row.active.createdAt,
             });
           }
@@ -1466,6 +1501,16 @@ export class RuntimeManager {
    * report, not a wedge. The window is still finite, so a tool that hangs
    * forever is declared stuck once it passes. The never-started window is
    * unaffected — a run that never started cannot have a tool in flight.
+   *
+   * A stuck run with a recorded resume point (checkpoint + session) is
+   * recovered from its checkpoint instead of erroring, up to
+   * maxRecoveryAttempts times (see recoverStuckRun). A run with no resume
+   * point — never started, or no checkpoint yet — has nothing safe to
+   * resume (re-running the prompt could duplicate side effects), and a run
+   * whose attempts are exhausted has proven it cannot make progress: both
+   * keep the error finalization below. User-cancelled and
+   * deterministically-failed runs are already finalized and never reach
+   * this sweep, so recovery can never resurrect them.
    */
   private scanWatchdogs(): void {
     const now = Date.now();
@@ -1483,6 +1528,28 @@ export class RuntimeManager {
       const reason = neverStarted
         ? "run did not start and was stopped by the watchdog"
         : "run was silent for too long and was stopped by the watchdog";
+      const resumePoint = active.resumePoint;
+      const attempts = active.recoveryAttempts ?? 0;
+      if (resumePoint?.sessionId !== undefined && attempts < this.maxRecoveryAttempts) {
+        try {
+          this.recoverStuckRun(userId, st, active, resumePoint, reason, attempts + 1);
+          continue;
+        } catch (error) {
+          // A recovery failure must not crash the sweep or strand the slot.
+          // If recovery got far enough to free the slot and re-queue, drain
+          // the queue so the run still restarts; if it already replaced the
+          // slot owner, the wedged execution no longer owns the run and
+          // there is nothing to finalize. Only when the wedged execution
+          // still owns the slot do we fall through to the error finalization
+          // below.
+          console.error(`[runtime] watchdog recovery failed for run ${active.runId}:`, error);
+          if (!st.active && st.queue.length > 0) {
+            this.startNext(userId);
+            continue;
+          }
+          if (st.active !== active) continue;
+        }
+      }
       const errorEvent: { type: "run.error"; message: string } = {
         type: "run.error",
         message: reason,
@@ -1498,6 +1565,68 @@ export class RuntimeManager {
     // a hibernation whose sweeper callback was not wired) starts any
     // capacity-queued run within one sweep cadence.
     this.drainCapacityQueue();
+  }
+
+  /**
+   * Recover one stuck run from its recorded checkpoint: abort the wedged
+   * execution, re-queue the run at the front with its checkpoint as the
+   * restore seed and its recorded session, and restart it immediately. This
+   * is the restart-resume queue-entry shape (see restorePersistedState):
+   * executeInner restores the VM snapshot before the runner resumes the CLI
+   * session (`--resume`), so the agent continues from the checkpoint instead
+   * of re-running the prompt. The run is NOT finalized — no terminal event,
+   * no approval expiry (pending approvals re-surface when the resumed agent
+   * re-asks, exactly like a restart resume) — and its durable summary stays
+   * "running". The attempt counter rides the queue entry and the persisted
+   * snapshot, so the bound holds across server restarts too.
+   */
+  private recoverStuckRun(
+    userId: string,
+    st: UserState,
+    active: ActiveRun,
+    resumePoint: ResumePoint,
+    reason: string,
+    attempt: number,
+  ): void {
+    const recoveringEvent: { type: "run.recovering"; attempt: number; reason: string } = {
+      type: "run.recovering",
+      attempt,
+      reason,
+    };
+    this.bus.publish(active.runId, recoveringEvent);
+    const pgidFile = active.pgidFile;
+    // Free the slot before restarting: startNext must not launch the resumed
+    // run while the wedged execution still owns it.
+    st.active = null;
+    st.queue.unshift({
+      runId: active.runId,
+      userId,
+      prompt: active.prompt,
+      ...(active.agentCard ? { agentCard: active.agentCard } : {}),
+      sessionId: resumePoint.sessionId,
+      ...(active.model ? { model: active.model } : {}),
+      ...(active.role ? { role: active.role } : {}),
+      rolePolicy: active.rolePolicy,
+      ...(active.projectId ? { projectId: active.projectId } : {}),
+      ...(active.contextPrefix ? { projectContext: active.contextPrefix } : {}),
+      ...(active.compute ? { compute: active.compute } : {}),
+      ...(active.fullAuto !== undefined ? { fullAuto: active.fullAuto } : {}),
+      ...(active.runMode ? { runMode: active.runMode } : {}),
+      ...(active.toolAllowlist ? { toolAllowlist: active.toolAllowlist } : {}),
+      ...(active.ambientRuleId ? { ambientRuleId: active.ambientRuleId } : {}),
+      seedSnapshotLabel: checkpointVmLabel(active.runId, resumePoint.stepSeq),
+      resumePoint,
+      recoveryAttempts: attempt,
+      createdAt: active.createdAt,
+    });
+    // Abort after the re-queue is in place: the wedged exec unwinds against
+    // a slot that is already free, and its late settle paths see a
+    // superseded ActiveRun (identity check in isStillActive), so they
+    // cannot finalize the resumed run.
+    active.controller.abort();
+    this.recordCancelling(userId, active.runId, pgidFile);
+    this.persistState();
+    this.startNext(userId);
   }
 
   /**
@@ -2183,6 +2312,7 @@ export class RuntimeManager {
       forkedFrom: next.forkedFrom,
       resumePoint: next.resumePoint,
       maxTurns: next.maxTurns,
+      recoveryAttempts: next.recoveryAttempts,
     };
     st.active = active;
     this.persistState();
@@ -2801,13 +2931,13 @@ export class RuntimeManager {
    * next queued prompt, so the queue can never wedge.
    */
   private async execute(active: ActiveRun): Promise<void> {
-    const { runId, userId } = active;
+    const { runId } = active;
     try {
       await this.executeInner(active);
     } catch (error) {
       // A run suspended for resume must not be finalized: the process is
       // exiting and the next one resumes it from its checkpoint.
-      if (!this.isStillActive(runId, userId) || active.suspendForResume) return;
+      if (!this.isStillActive(active) || active.suspendForResume) return;
       const redact = makeRedactor({ ...process.env } as Record<string, string>);
       const message = redact(error instanceof Error ? error.message : String(error));
       const errorEvent: { type: "run.error"; message: string } = {
@@ -2822,7 +2952,7 @@ export class RuntimeManager {
       // paths finalize before returning), but a run whose exec promise never
       // settles must not hold the thread hostage.
       this.cancelling.delete(runId);
-      if (this.isStillActive(runId, userId) && !active.suspendForResume) {
+      if (this.isStillActive(active) && !active.suspendForResume) {
         const errorEvent: { type: "run.error"; message: string } = {
           type: "run.error",
           message: "run ended without releasing its slot",
@@ -3095,7 +3225,7 @@ export class RuntimeManager {
           const message = aggregateFailureSummary(failovers.map(recordToAttempt));
           // Cancelled runs already finalized as "cancelled": publishing
           // run.error here would overwrite that durable status with "error".
-          if (this.isStillActive(runId, userId)) {
+          if (this.isStillActive(active)) {
             const errorEvent: { type: "run.error"; message: string } = { type: "run.error", message };
             this.bus.publish(runId, errorEvent);
             this.finalize(runId, { status: "error", error: message });
@@ -3131,7 +3261,7 @@ export class RuntimeManager {
         }
         // Same guard as the failovers-exhausted branch above: a run cancelled
         // while this attempt was unwinding must stay "cancelled", not "error".
-        if (this.isStillActive(runId, userId)) {
+        if (this.isStillActive(active)) {
           const errorEvent: { type: "run.error"; message: string; exitCode?: number } = {
             type: "run.error",
             message: attemptError.message,
@@ -3162,7 +3292,7 @@ export class RuntimeManager {
         if (!config || !isAnthropicStyle(config)) {
           const message = directModeErrorMessage(selection.provider);
           selection.release();
-          if (this.isStillActive(runId, userId)) {
+          if (this.isStillActive(active)) {
             const errorEvent: { type: "run.error"; message: string } = {
               type: "run.error",
               message,
@@ -3269,17 +3399,23 @@ export class RuntimeManager {
               recordToAttempt({ sel: selection, message: attemptError.message }),
             ])
           : attemptError.message;
-      const finalError: { type: "run.error"; message: string; exitCode?: number } = {
-        type: "run.error",
-        message,
-        exitCode: attemptError.exitCode,
-      };
-      this.bus.publish(runId, finalError);
-      this.finalize(runId, {
-        status: "error",
-        error: message,
-        exitCode: attemptError.exitCode,
-      });
+      // Same guard as the branches above: a run superseded while this attempt
+      // was unwinding (cancelled, or recovered by the watchdog under a fresh
+      // ActiveRun for the same runId) must not be finalized by its old
+      // execution.
+      if (this.isStillActive(active)) {
+        const finalError: { type: "run.error"; message: string; exitCode?: number } = {
+          type: "run.error",
+          message,
+          exitCode: attemptError.exitCode,
+        };
+        this.bus.publish(runId, finalError);
+        this.finalize(runId, {
+          status: "error",
+          error: message,
+          exitCode: attemptError.exitCode,
+        });
+      }
       return { switched: false };
     }
   }
@@ -3360,7 +3496,7 @@ export class RuntimeManager {
       if (!result.ok) {
         const lastError = errors.at(-1);
         const message = result.error ?? lastError?.message ?? "All configured provider keys failed.";
-        if (this.isStillActive(runId, userId)) {
+        if (this.isStillActive(active)) {
           const errorEvent: Extract<HarnessEvent, { type: "run.error" }> = {
             type: "run.error",
             message,
@@ -3380,9 +3516,14 @@ export class RuntimeManager {
     }
   }
 
-  private isStillActive(runId: string, userId: string): boolean {
-    const st = this.users.get(userId);
-    return st?.active?.runId === runId;
+  /**
+   * Whether `active` still owns its user's slot. Identity, not runId: a
+   * watchdog recovery replaces the ActiveRun object for the same runId, and
+   * the wedged execution's late settle paths must not finalize (or publish a
+   * terminal error over) its replacement.
+   */
+  private isStillActive(active: ActiveRun): boolean {
+    return this.users.get(active.userId)?.active === active;
   }
 
   /**
@@ -3540,6 +3681,10 @@ export class RuntimeManager {
     finishEvent: Extract<HarnessEvent, { type: "run.finished" }>,
     summary: ShadowVerificationSummary | undefined,
   ): void {
+    // A superseded execution (cancelled, or recovered by the watchdog under
+    // a fresh ActiveRun for the same runId) must not finalize its
+    // replacement: the gate can outlive the abort that replaced it.
+    if (!this.isStillActive(active)) return;
     const patch: TerminalPatch = {
       status: "finished",
       exitCode: finishEvent.exitCode,
@@ -3693,6 +3838,10 @@ export class RuntimeManager {
           finishEvent = event;
           return; // the shadow-verifier gate decides whether to finalize
         }
+        // A superseded execution (cancelled, or recovered by the watchdog
+        // under a fresh ActiveRun for the same runId) must not publish a
+        // terminal finish over its replacement.
+        if (!this.isStillActive(active)) return;
         this.bus.publish(runId, event);
         this.finalize(runId, {
           status: "finished",
@@ -3895,7 +4044,7 @@ export class RuntimeManager {
         type: "run.error",
         message,
       };
-      if (!this.isStillActive(runId, userId)) {
+      if (!this.isStillActive(active)) {
         return { outcome: { exitCode: -1, aborted: true, malformedLines: 0 }, attemptError: synthetic, finishEvent };
       }
       return { outcome: { exitCode: -1, aborted: false, malformedLines: 0 }, attemptError: synthetic, finishEvent };

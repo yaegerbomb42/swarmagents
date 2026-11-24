@@ -100,7 +100,7 @@ import {
 } from "../harness/desktop-handoff-mcp";
 import { buildHandoffSummary } from "./handoff-summary";
 import { captureDesktopScreenshot } from "./run-report";
-import { getGlobalDesktopProxy } from "../desktop-proxy/proxy";
+import { getGlobalDesktopProxy, type DesktopProxy } from "../desktop-proxy/proxy";
 import type { RfbFilterMode } from "../desktop-proxy/rfb-filter";
 import { noteProjectRunEvent } from "../projects/recorder";
 import { getBudgetGate } from "./budget-gate";
@@ -4212,8 +4212,10 @@ export class RuntimeManager {
 
       // The user now holds the wheel: keep every desktop session read-only so
       // only the inline take-the-wheel canvas (opened in control mode) sends
-      // input while the handoff is outstanding.
+      // input while the handoff is outstanding. The agent is paused, so a
+      // takeover request from the canvas grants immediately.
       this.forceDesktopMode(userId, "view");
+      this.takeoverSignal(userId, (proxy) => proxy.setAgentPaused(userId, true));
 
       const settled = this.waitForHandoffOutcome(store.waitFor(handoff.id), active);
       return {
@@ -4277,16 +4279,27 @@ export class RuntimeManager {
     let payload: Record<string, unknown>;
     if (outcome.status === "answered") {
       // Restore control to the user's desktop sessions (the wheel is handed
-      // back to the agent).
+      // back to the agent). setUserMode("control") is a safe point for the
+      // takeover machine; the agent is live again, so future requests wait
+      // for the next safe point instead of granting instantly.
       this.forceDesktopMode(userId, "control");
+      this.takeoverSignal(userId, (proxy) => proxy.setAgentPaused(userId, false));
       const resolvedAt = Date.now();
       const startedAt = getHandoffStore().get(id)?.createdAt ?? resolvedAt;
       const shot = await captureDesktopScreenshot(this.vm, userId);
+      const takeoverSummary = (() => {
+        try {
+          return getGlobalDesktopProxy()?.getTakeoverSummary(userId) ?? null;
+        } catch {
+          return null;
+        }
+      })();
       const summary = buildHandoffSummary({
         startedAt,
         resolvedAt,
         shot,
         description: request.description,
+        takeoverSummary,
       });
       payload = { status: "answered", summary, resolvedAt };
     } else {
@@ -4308,6 +4321,19 @@ export class RuntimeManager {
       getGlobalDesktopProxy()?.setUserMode(userId, mode);
     } catch {
       // best-effort; the handoff still resolves through the VM files
+    }
+  }
+
+  /**
+   * Best-effort takeover signal to the desktop proxy (agent paused/live,
+   * safe points). Never throws: a missing/failed proxy must not break a run.
+   */
+  private takeoverSignal(userId: string, fn: (proxy: DesktopProxy) => void): void {
+    try {
+      const proxy = getGlobalDesktopProxy();
+      if (proxy) fn(proxy);
+    } catch {
+      // best-effort; takeover falls back to its request timeout
     }
   }
 
@@ -4353,6 +4379,13 @@ export class RuntimeManager {
       // tool in flight; stale counts from a dead attempt must not suppress
       // turn boundaries for the new one.
       active.openToolCalls = 0;
+      // The agent can act on the desktop again: takeover requests stop
+      // granting instantly and wait for the next safe point.
+      this.takeoverSignal(userId, (proxy) => proxy.setAgentPaused(userId, false));
+    }
+    if (event.type === "tool.result") {
+      // A tool boundary is a safe point: grant a pending takeover request.
+      this.takeoverSignal(userId, (proxy) => proxy.notifyTakeoverSafePoint(userId));
     }
     if (event.type === "tool.call") {
       // The watchdog's tool-in-flight signal: silence after this point may
@@ -4488,6 +4521,12 @@ export class RuntimeManager {
       // record it before finalize so startNext can reap the run's process
       // group before the successor spawns. Entries are drained by that
       // reap, the grace timer, or execute()'s finally.
+      // The agent is done acting on the desktop: grant a pending takeover
+      // (safe point) and let future requests grant immediately.
+      this.takeoverSignal(userId, (proxy) => {
+        proxy.setAgentPaused(userId, true);
+        proxy.notifyTakeoverSafePoint(userId);
+      });
       st.history.unshift(summary);
       if (st.history.length > HISTORY_LIMIT) st.history.length = HISTORY_LIMIT;
       nextUserId = userId;

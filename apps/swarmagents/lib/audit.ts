@@ -57,6 +57,8 @@ export type AuditAction =
   | "vm.migrate"
   | "desktop.view"
   | "desktop.takeover"
+  | "desktop.takeover.request"
+  | "desktop.handback"
   | "preview.share.create"
   | "preview.share.revoke"
   | "project.share.create"

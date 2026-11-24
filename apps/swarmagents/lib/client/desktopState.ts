@@ -23,8 +23,43 @@ export type DesktopPhase =
   | "reconnecting"
   | "offline";
 
-/** Watch = read-only mirror (default); control = the user drives the desktop. */
-export type DesktopControlMode = "watch" | "control";
+/**
+ * Watch = read-only mirror (default); requested = takeover asked for, waiting
+ * for the agent's safe point (input still filtered server-side); control =
+ * the user drives the desktop.
+ */
+export type DesktopControlMode = "watch" | "requested" | "control";
+
+/** Server-side takeover states (mirror of lib/desktop-proxy/takeover/types). */
+export type ServerTakeoverStateName =
+  | "AGENT_DRIVING"
+  | "HUMAN_REQUESTED"
+  | "HUMAN_DRIVING"
+  | "HANDBACK";
+
+/** Wire shape of GET /desktop/takeover-state (see the desktop proxy). */
+export interface ServerTakeoverState {
+  state: ServerTakeoverStateName;
+  isController: boolean;
+  canAcceptInput: boolean;
+  agentPaused: boolean;
+  requestedAt: number | null;
+}
+
+/**
+ * Map the server's takeover state to the UI control mode for THIS client.
+ * Only the controller sees requested/control; everyone else watches, and a
+ * handback in flight reads as watch (input is already cut server-side).
+ */
+export function controlModeForTakeoverState(
+  state: ServerTakeoverStateName,
+  isController: boolean,
+): DesktopControlMode {
+  if (!isController) return "watch";
+  if (state === "HUMAN_DRIVING") return "control";
+  if (state === "HUMAN_REQUESTED") return "requested";
+  return "watch";
+}
 
 export interface DesktopConnState {
   phase: DesktopPhase;

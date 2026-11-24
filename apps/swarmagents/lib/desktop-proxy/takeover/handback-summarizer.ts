@@ -113,6 +113,10 @@ export class HandbackSummarizer {
 
     await this.recordCurrentWindow();
 
+    // stopTracking() may have run during the await above (dispose during a
+    // grant): do not arm the poller/watchers for a drive that already ended.
+    if (!this.active) return;
+
     this.pollTimer = setInterval(() => {
       void this.recordCurrentWindow();
     }, this.windowPollIntervalMs);

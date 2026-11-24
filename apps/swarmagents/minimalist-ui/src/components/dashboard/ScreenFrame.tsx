@@ -24,6 +24,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { Hand, Maximize2, Minimize2, Square } from "lucide-react";
 import type { LogEvent } from "../../engine";
 import type { DesktopConnectionInfo } from "../DesktopView";
+import type { DesktopControlMode } from "../../../../lib/client/desktopState";
 import type { StatusTone } from "../../../../lib/client/runPhase";
 import type { VmStatus } from "../../../../lib/vm/types";
 import { cn } from "../../utils/cn";
@@ -85,7 +86,12 @@ export function screenStatus(input: {
   control: boolean;
   phase?: string;
   latencyMs?: number;
+  /** Effective takeover mode reported by DesktopView (requested ≠ control). */
+  takeover?: DesktopControlMode;
 }): ScreenStatus {
+  if (input.takeover === "requested") {
+    return { label: "Waiting for safe point", tone: "warn", live: true };
+  }
   if (input.control) return { label: "You are in control", tone: "accent", live: false };
   if (input.activeView === "desktop") {
     const phase = input.phase ?? "connecting";
@@ -191,7 +197,7 @@ export function ScreenFrame({
 
   const onConn = useCallback((info: DesktopConnectionInfo) => setConn(info), []);
   const showStageDesktop = activeView === "desktop" && desktopMode;
-  const status = screenStatus({ activeView, runActive, control, phase: conn?.phase, latencyMs: conn?.latencyMs });
+  const status = screenStatus({ activeView, runActive, control, phase: conn?.phase, latencyMs: conn?.latencyMs, takeover: conn?.takeover });
 
   // The workspace controls that live in the shared top bar. The status pill
   // and the take-over control are the brand components (spec 3g): one
@@ -240,7 +246,21 @@ export function ScreenFrame({
       data-fullscreen={theater ? "true" : "false"}
       data-view={activeView}
     >
-      {control && (
+      {conn?.takeover === "requested" ? (
+        <div
+          role="status"
+          data-testid="takeover-requested-banner"
+          className="mb-1 flex shrink-0 items-center gap-2 rounded-lg border border-sa-warn/40 bg-sa-warn/15 px-3 py-2 text-[13px] font-medium text-sa-warn"
+        >
+          <Hand className="h-4 w-4 shrink-0" aria-hidden />
+          <span className="min-w-0">
+            Takeover requested.{" "}
+            <span className="font-normal text-sa-fg2">
+              Waiting for the agent to reach a safe point — input still goes to the agent. Press Esc to cancel.
+            </span>
+          </span>
+        </div>
+      ) : control ? (
         <div
           role="status"
           data-testid="takeover-banner"
@@ -254,7 +274,7 @@ export function ScreenFrame({
             </span>
           </span>
         </div>
-      )}
+      ) : null}
 
       {/*
         One VmScreen for the whole session. Its four stages are mounted on
@@ -287,6 +307,7 @@ export function ScreenFrame({
           control={control}
           onControlChange={onControlChange}
           canControl={canControl}
+          onConnection={onConn}
           controls={frameControls}
           activity={activity}
           presence={presence}

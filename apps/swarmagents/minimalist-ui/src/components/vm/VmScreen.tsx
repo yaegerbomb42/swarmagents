@@ -54,8 +54,9 @@ import {
 import type { LogEvent } from "../../engine";
 import { useSessionPersisted } from "../../store";
 import { cn } from "../../utils/cn";
+import type { DesktopControlMode } from "../../../../lib/client/desktopState";
 import { BrowserView } from "../BrowserView";
-import { DesktopView } from "../DesktopView";
+import { DesktopView, type DesktopConnectionInfo } from "../DesktopView";
 import { FilesView } from "../FilesView";
 import { shortPath } from "../../design/vm-tokens";
 import { useIdleChrome, VM_VIEW_TABS, VmFrame, VmStatusBar, type ComputerView } from "./VmChrome";
@@ -98,6 +99,12 @@ export interface VmScreenProps {
   control?: boolean;
   onControlChange?: (control: boolean) => void;
   canControl?: boolean;
+  /**
+   * Desktop connection facts (phase, latency, effective takeover mode),
+   * forwarded from DesktopView so the frame's status pill and takeover
+   * banner can follow the negotiated control state.
+   */
+  onConnection?: (info: DesktopConnectionInfo) => void;
   /** Extra controls rendered at the right end of the top bar. */
   controls?: React.ReactNode;
   className?: string;
@@ -118,6 +125,8 @@ export interface VmScreenProps {
 interface DesktopConnInfo {
   latencyMs?: number;
   phase?: string;
+  /** Effective takeover mode (requested ≠ control), for the frame pill. */
+  takeover?: DesktopControlMode;
 }
 
 export function VmScreen({
@@ -136,6 +145,7 @@ export function VmScreen({
   control,
   onControlChange,
   canControl,
+  onConnection: onDesktopConnection,
   controls,
   className,
   activity,
@@ -312,7 +322,13 @@ export function VmScreen({
   const idle = useIdleChrome(selectedView === "desktop" && !control, frameRef);
 
   const [conn, setConn] = useState<DesktopConnInfo>({});
-  const onConnection = useCallback((info: DesktopConnInfo) => setConn(info), []);
+  const onConnection = useCallback(
+    (info: DesktopConnectionInfo) => {
+      setConn(info);
+      onDesktopConnection?.(info);
+    },
+    [onDesktopConnection],
+  );
 
   const connection = liveRun ? { status: stream.status, reconnecting: stream.status === "reconnecting" } : null;
   const streamBadge = liveRun ? getRunStreamBadge(stream) : null;

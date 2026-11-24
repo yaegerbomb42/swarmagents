@@ -5,6 +5,9 @@ import type { SequencedEvent } from "./bus";
 import { RUN_ID_RE } from "./paths";
 
 export const MAX_RUN_LOG_BYTES = 5 * 1024 * 1024;
+export const MAX_RUN_EVENT_BYTES = 256 * 1024;
+export const MAX_RUN_RETAINED_BYTES = 20 * 1024 * 1024;
+export const MAX_RUN_LOG_TOTAL_BYTES = 200 * 1024 * 1024;
 
 const LOG_NAME_RE = /^([A-Za-z0-9_-]{1,64})\.jsonl(?:\.(\d+))?$/;
 
@@ -17,14 +20,34 @@ const PROBE_HEAD_BYTES = 4096;
 /** Segment-index cache entries kept before the oldest run is evicted. */
 const SEGMENT_INDEX_CACHE_MAX = 512;
 
+const runsDirReady = new Set<string>();
+const nextRotationByBase = new Map<string, number>();
+const writeQueues = new Map<string, Promise<void>>();
+const pendingByRun = new Map<string, SequencedEvent[]>();
+
 export function runLogFile(runsDir: string, runId: string): string {
   return path.join(runsDir, `${runId}.jsonl`);
 }
 
+function ensureRunsDir(runsDir: string): void {
+  if (runsDirReady.has(runsDir)) return;
+  fs.mkdirSync(runsDir, { recursive: true });
+  runsDirReady.add(runsDir);
+}
+
 function rotationFile(base: string): string {
-  let n = 1;
+  let n = nextRotationByBase.get(base) ?? 1;
   while (fs.existsSync(`${base}.${n}`)) n += 1;
+  nextRotationByBase.set(base, n + 1);
   return `${base}.${n}`;
+}
+
+function rememberRotationFromName(base: string, name: string): void {
+  const m = LOG_NAME_RE.exec(path.basename(name));
+  if (!m || !m[2]) return;
+  const n = Number(m[2]);
+  const cur = nextRotationByBase.get(base) ?? 1;
+  if (n >= cur) nextRotationByBase.set(base, n + 1);
 }
 
 /**
@@ -85,51 +108,259 @@ function ensureLineBoundary(file: string, size: number): number {
   return repaired;
 }
 
+function truncateForLog(event: SequencedEvent, maxBytes: number): SequencedEvent {
+  let line = `${JSON.stringify(event)}\n`;
+  if (Buffer.byteLength(line, "utf8") <= maxBytes) return event;
+  const base: Record<string, unknown> = {
+    ...((event as unknown) as Record<string, unknown>),
+    truncated: true,
+  };
+  // Prefer trimming large payload fields, then fall back to a compact marker.
+  for (const key of ["data", "text", "message", "output", "error", "args", "result"]) {
+    if (typeof base[key] === "string") {
+      const s = base[key] as string;
+      base[key] = s.length > 512 ? `${s.slice(0, 512)}…[truncated]` : s;
+    } else if (base[key] !== undefined) {
+      try {
+        const s = JSON.stringify(base[key]);
+        base[key] = s.length > 512 ? `${s.slice(0, 512)}…[truncated]` : base[key];
+      } catch {
+        base[key] = "[unserializable]";
+      }
+    }
+    line = `${JSON.stringify(base)}\n`;
+    if (Buffer.byteLength(line, "utf8") <= maxBytes) return base as unknown as SequencedEvent;
+  }
+  const minimal: Record<string, unknown> = {
+    runId: event.runId,
+    seq: event.seq,
+    ts: event.ts,
+    type: (event as unknown as { type?: unknown }).type ?? "log",
+    truncated: true,
+    data: "[event truncated]",
+  };
+  line = `${JSON.stringify(minimal)}\n`;
+  if (Buffer.byteLength(line, "utf8") <= maxBytes) return minimal as unknown as SequencedEvent;
+  minimal.data = "[truncated]";
+  return minimal as unknown as SequencedEvent;
+}
+
+function listRunSegmentFiles(runId: string, runsDir: string): string[] {
+  try {
+    const names = fs.readdirSync(runsDir);
+    const base = runLogFile(runsDir, runId);
+    const rotated: Array<{ n: number; file: string }> = [];
+    for (const name of names) {
+      const m = LOG_NAME_RE.exec(name);
+      if (!m || m[1] !== runId || !m[2]) continue;
+      const file = path.join(runsDir, name);
+      rotated.push({ n: Number(m[2]), file });
+      rememberRotationFromName(base, file);
+    }
+    rotated.sort((a, b) => a.n - b.n);
+    return [...rotated.map((r) => r.file), base];
+  } catch {
+    return [];
+  }
+}
+
+function totalRunLogBytes(runId: string, runsDir: string): number {
+  let total = 0;
+  for (const file of listRunSegmentFiles(runId, runsDir)) {
+    try { total += fs.statSync(file).size; } catch { /* missing */ }
+  }
+  return total;
+}
+
+function totalRunsDirBytes(runsDir: string): number {
+  let total = 0;
+  try {
+    for (const name of fs.readdirSync(runsDir)) {
+      if (!LOG_NAME_RE.test(name)) continue;
+      try { total += fs.statSync(path.join(runsDir, name)).size; } catch { /* missing */ }
+    }
+  } catch { /* no dir */ }
+  return total;
+}
+
+function enforceRetention(runId: string, runsDir: string, perRunMaxBytes: number, globalMaxBytes: number): void {
+  // Per-run: delete oldest rotated segments first.
+  const base = runLogFile(runsDir, runId);
+  let runTotal = totalRunLogBytes(runId, runsDir);
+  if (runTotal > perRunMaxBytes) {
+    const segments = listRunSegmentFiles(runId, runsDir).filter((f) => f !== base);
+    for (const seg of segments) {
+      if (runTotal <= perRunMaxBytes) break;
+      try {
+        const sz = fs.statSync(seg).size;
+        fs.rmSync(seg, { force: true });
+        framedSizes.delete(seg);
+        runTotal -= sz;
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Global: delete oldest rotated segments across all runs.
+  let globalTotal = totalRunsDirBytes(runsDir);
+  if (globalTotal > globalMaxBytes) {
+    let candidates: Array<{ file: string; mtimeMs: number; size: number; isBase: boolean }> = [];
+    try {
+      for (const name of fs.readdirSync(runsDir)) {
+        const m = LOG_NAME_RE.exec(name);
+        if (!m) continue;
+        const file = path.join(runsDir, name);
+        try {
+          const st = fs.statSync(file);
+          candidates.push({ file, mtimeMs: st.mtimeMs, size: st.size, isBase: !m[2] });
+        } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
+    // Prefer deleting rotated segments; keep active base files as last resort.
+    candidates.sort((a, b) => (Number(a.isBase) - Number(b.isBase)) || (a.mtimeMs - b.mtimeMs));
+    for (const c of candidates) {
+      if (globalTotal <= globalMaxBytes) break;
+      try {
+        fs.rmSync(c.file, { force: true });
+        framedSizes.delete(c.file);
+        globalTotal -= c.size;
+      } catch { /* ignore */ }
+    }
+  }
+}
+
+function writeEventSync(
+  event: SequencedEvent,
+  runsDir: string,
+  maxBytes: number,
+  perRunMaxBytes: number,
+  globalMaxBytes: number,
+): void {
+  if (!RUN_ID_RE.test(event.runId)) return;
+  const bounded = truncateForLog(event, MAX_RUN_EVENT_BYTES);
+  const line = `${JSON.stringify(bounded)}\n`;
+  const bytes = Buffer.byteLength(line, "utf8");
+  const file = runLogFile(runsDir, event.runId);
+  try {
+    ensureRunsDir(runsDir);
+    let size = 0;
+    try { size = fs.statSync(file).size; } catch { /* No active file yet. */ }
+    size = ensureLineBoundary(file, size);
+    if (size > 0 && size + bytes > maxBytes) {
+      const rotated = rotationFile(file);
+      fs.renameSync(file, rotated);
+      rememberFramed(rotated, size);
+      framedSizes.delete(file);
+      size = 0;
+      enforceRetention(event.runId, runsDir, perRunMaxBytes, globalMaxBytes);
+    }
+    // If per-run/global limits are already exceeded, still try to write the new event
+    // (it may be the latest important signal) but enforce retention again.
+    fs.appendFileSync(file, line, "utf8");
+    rememberFramed(file, size + bytes);
+    const runTotal = totalRunLogBytes(event.runId, runsDir);
+    const globalTotal = totalRunsDirBytes(runsDir);
+    if (runTotal > perRunMaxBytes || globalTotal > globalMaxBytes) {
+      enforceRetention(event.runId, runsDir, perRunMaxBytes, globalMaxBytes);
+    }
+  } catch (err) {
+    // Telemetry persistence must never break a live run.
+    console.error(`[telemetry] could not persist event for ${event.runId}:`, err);
+  }
+}
+
+function drainPendingSync(runId: string): void {
+  const pending = pendingByRun.get(runId);
+  if (!pending || pending.length === 0) return;
+  // Pending writes are flushed by the queue; this is a safety net for sync readers.
+  // We can't force-await here, but we can write synchronously if anything remains.
+  while (pending.length > 0) {
+    const item = pending.shift()!;
+    const meta = (item as unknown as { __logMeta?: { runsDir: string; maxBytes: number; perRunMaxBytes: number; globalMaxBytes: number } }).__logMeta;
+    if (meta) writeEventSync(item, meta.runsDir, meta.maxBytes, meta.perRunMaxBytes, meta.globalMaxBytes);
+  }
+  pendingByRun.delete(runId);
+}
+
 /**
- * Append one event as a JSON line. Before writing, the active file is repaired
- * to end on a newline (see `ensureLineBoundary`); the same guarantee applies
- * when the file rotates, so every rotated segment ends on a line boundary
- * too. The active file rotates to `<runId>.jsonl.<n>` once it would exceed
- * `maxBytes`, keeping writes bounded without losing older events (replay reads
- * every segment).
+ * Mark an event as already persisted without polluting its JSON: the bus
+ * buffer holds the same object reference, and the SSE layer dedupes log
+ * copies against bus copies by full JSON — an enumerable marker would make
+ * the two copies stringify differently and replay every event twice.
+ * Mirrors the non-enumerable `__logMeta` below.
+ */
+function markWritten(event: SequencedEvent): void {
+  try {
+    Object.defineProperty(event as unknown as Record<string, unknown>, "__written", {
+      value: true,
+      enumerable: false,
+      configurable: true,
+    });
+  } catch { /* ignore */ }
+}
+
+/**
+ * Append one event as a JSON line. Writes are serialized per run through an
+ * async queue and drained by flushRunLogs() on shutdown. For sync reader
+ * compatibility, the write is performed immediately and the queue tracks
+ * completion.
  */
 export function appendRunEvent(
   event: SequencedEvent,
   runsDir: string,
   maxBytes: number = MAX_RUN_LOG_BYTES,
+  perRunMaxBytes: number = MAX_RUN_RETAINED_BYTES,
+  globalMaxBytes: number = MAX_RUN_LOG_TOTAL_BYTES,
 ): void {
   if (!RUN_ID_RE.test(event.runId)) return;
-  const line = `${JSON.stringify(event)}\n`;
-  const bytes = Buffer.byteLength(line, "utf8");
-  const file = runLogFile(runsDir, event.runId);
+  // Attach meta for safety-net drains (non-enumerable to avoid polluting JSON).
   try {
-    fs.mkdirSync(runsDir, { recursive: true });
-    let size = 0;
+    Object.defineProperty(event as unknown as Record<string, unknown>, "__logMeta", {
+      value: { runsDir, maxBytes, perRunMaxBytes, globalMaxBytes },
+      enumerable: false,
+      configurable: true,
+    });
+  } catch { /* ignore */ }
+
+  const runId = event.runId;
+  const prev = writeQueues.get(runId) ?? Promise.resolve();
+  let resolveDone!: () => void;
+  const done = new Promise<void>((r) => { resolveDone = r; });
+  const next = prev.catch(() => {}).then(() => {
     try {
-      size = fs.statSync(file).size;
-    } catch {
-      // No active file yet.
+      const pending = pendingByRun.get(runId);
+      if (pending) {
+        const idx = pending.indexOf(event);
+        if (idx >= 0) pending.splice(idx, 1);
+        if (pending.length === 0) pendingByRun.delete(runId);
+      }
+      // If already written by a sync drain, skip.
+      const marker = (event as unknown as { __written?: boolean }).__written;
+      if (!marker) {
+        writeEventSync(event, runsDir, maxBytes, perRunMaxBytes, globalMaxBytes);
+        markWritten(event);
+      }
+    } finally {
+      resolveDone();
     }
-    size = ensureLineBoundary(file, size);
-    if (size > 0 && size + bytes > maxBytes) {
-      const rotated = rotationFile(file);
-      fs.renameSync(file, rotated);
-      // The segment was repaired above, so it ends on a line boundary before
-      // it is frozen; the fresh active file starts empty.
-      rememberFramed(rotated, size);
-      framedSizes.delete(file);
-      size = 0;
+  });
+  writeQueues.set(runId, next);
+
+  const pending = pendingByRun.get(runId) ?? [];
+  pending.push(event);
+  pendingByRun.set(runId, pending);
+
+  // Perform the write now for sync-reader compatibility, but keep the queue
+  // as the serialization/drain point.
+  try {
+    const pendingNow = pendingByRun.get(runId);
+    if (pendingNow) {
+      const idx = pendingNow.indexOf(event);
+      if (idx >= 0) pendingNow.splice(idx, 1);
+      if (pendingNow.length === 0) pendingByRun.delete(runId);
     }
-    fs.appendFileSync(file, line, "utf8");
-    rememberFramed(file, size + bytes);
-  } catch (err) {
-    // A partial/failed write (e.g. ENOSPC) may have left the file mid-line:
-    // drop the cached frame so the next append re-checks the last byte
-    // instead of trusting a size that now matches a torn tail.
-    framedSizes.delete(file);
-    // Telemetry persistence must never break a live run.
-    console.error(`[telemetry] could not persist event for ${event.runId}:`, err);
-  }
+    writeEventSync(event, runsDir, maxBytes, perRunMaxBytes, globalMaxBytes);
+    markWritten(event);
+  } catch { /* writeEventSync already logs */ }
 }
 
 export interface RunLogInfo {
@@ -138,14 +369,22 @@ export interface RunLogInfo {
   mtimeMs: number;
 }
 
+async function drainPendingAsync(runId: string): Promise<void> {
+  const q = writeQueues.get(runId);
+  if (q) {
+    try { await q; } catch { /* best effort */ }
+  }
+  drainPendingSync(runId);
+}
+
 /**
- * fsync every run-log segment on disk so in-flight telemetry reaches durable
- * storage before the process exits. Appends are synchronous today, so this
- * only flushes OS buffers — but it is the seam a future buffered writer must
- * implement, and it is what the shutdown handler calls. Best-effort: a
- * missing or rotated file is skipped, never thrown.
+ * Drain pending per-run writes and fsync every run-log segment on disk so
+ * in-flight telemetry reaches durable storage before the process exits.
+ * Best-effort: missing or rotated files are skipped, never thrown.
  */
-export function flushRunLogs(runsDir: string | null): void {
+export async function flushRunLogs(runsDir: string | null): Promise<void> {
+  await Promise.all([...writeQueues.values()].map((p) => p.catch(() => {})));
+  for (const runId of [...pendingByRun.keys()]) drainPendingSync(runId);
   if (!runsDir) return;
   let names: string[];
   try {
@@ -302,6 +541,7 @@ function lastEventInFileTail(file: string, runId: string): SequencedEvent | null
  */
 export function tailRunLogLastEvent(runId: string, runsDir: string): SequencedEvent | null {
   if (!RUN_ID_RE.test(runId)) return null;
+  drainPendingSync(runId);
   const segments = listOrderedSegments(runId, runsDir);
   for (let i = segments.length - 1; i >= 0; i--) {
     const ev = lastEventInFileTail(segments[i], runId);
@@ -407,7 +647,7 @@ function yieldToEventLoop(): Promise<void> {
 }
 
 async function* readLines(file: string): AsyncGenerator<string> {
-  const rl = createInterface({ input: createReadStream(file), crlfDelay: Infinity });
+  const rl = createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
   try {
     for await (const line of rl) yield line;
   } finally {
@@ -504,6 +744,7 @@ export async function* streamRunEventsFrom(
   } = {},
 ): AsyncGenerator<SequencedEvent> {
   if (!RUN_ID_RE.test(runId)) return;
+  await drainPendingAsync(runId);
   const maxEvents = options.maxEvents ?? Infinity;
 
   const meta = await segmentIndex(runId, runsDir);
@@ -552,14 +793,32 @@ export async function* streamRunEventsFrom(
   let announcedWindow = false;
 
   let emitted = 0;
+  let lastEmittedSeq = fromSeq;
+  // Dedup by whole-event content, not seq alone: legacy disk logs can hold
+  // distinct events sharing a seq number (old eviction bug), and keying by
+  // seq would silently drop them. This set only matters when a segment is
+  // re-read after a mid-read rotation (ENOENT restart below); within a
+  // single pass the log holds each event once. It mirrors the SSE layer's
+  // pendingKey so log and bus copies of the same event collapse the same way.
+  const emittedKeys = new Set<string>();
+  const eventKey = (event: SequencedEvent): string => {
+    try {
+      return `${event.seq}\u0000${JSON.stringify(event)}`;
+    } catch {
+      return `${event.seq}\u0000${event.ts}\u0000${event.type}`;
+    }
+  };
   for (let i = startSegment; i < meta.length; i++) {
     const m = meta[i];
     // Entirely behind the cursor (or empty): no need to open the segment.
     // A non-empty segment whose probe could not determine a range
     // (lastSeq 0, e.g. a trailing event larger than the probe window) must
     // still be read — skipping it would silently drop its events.
+    // Use a strict comparison: a segment whose newest seq merely equals the
+    // high-water mark may still hold distinct same-seq events, which the
+    // content-key set below dedups correctly on re-read.
     if (m.size === 0 || m.count === 0) continue;
-    if (m.lastSeq > 0 && m.lastSeq <= fromSeq) continue;
+    if (m.lastSeq > 0 && m.lastSeq < lastEmittedSeq) continue;
     let skip = i === startSegment ? skipInStart : 0;
     let lines = 0;
     try {
@@ -575,16 +834,30 @@ export async function* streamRunEventsFrom(
           skip--;
           continue;
         }
+        const key = eventKey(event);
+        if (emittedKeys.has(key)) continue;
+        emittedKeys.add(key);
         if (truncated && !announcedWindow && options.onWindow) {
           announcedWindow = true;
           options.onWindow({ truncated, firstSeq: event.seq, lastSeq: newestSeq });
         }
         yield event;
         emitted++;
+        lastEmittedSeq = Math.max(lastEmittedSeq, event.seq);
         if (emitted >= maxEvents) return;
       }
-    } catch {
-      // A segment rotated away mid-stream: resume with the next one.
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT") {
+        // Segment rotated away mid-read: re-resolve and continue without
+        // dropping events. Already-emitted events are skipped by content key.
+        meta.splice(0, meta.length, ...(await segmentIndex(runId, runsDir)));
+        i = -1;
+        startSegment = 0;
+        skipInStart = 0;
+        continue;
+      }
+      // Other read errors: resume with the next segment.
     }
   }
 }
@@ -659,6 +932,7 @@ function readSegment(file: string, runId: string): SequencedEvent[] {
 /** All persisted events for a run, oldest first, across rotated segments. */
 export function readRunEvents(runId: string, runsDir: string): SequencedEvent[] {
   if (!RUN_ID_RE.test(runId)) return [];
+  drainPendingSync(runId);
   const base = runLogFile(runsDir, runId);
   const rotated: Array<{ n: number; file: string }> = [];
   let names: string[];

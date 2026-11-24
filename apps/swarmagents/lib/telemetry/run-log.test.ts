@@ -5,6 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import {
   INITIAL_REPLAY_CAP,
+  MAX_RUN_EVENT_BYTES,
+  MAX_RUN_LOG_TOTAL_BYTES,
+  MAX_RUN_RETAINED_BYTES,
   appendRunEvent,
   flushRunLogs,
   readRunEvents,
@@ -416,6 +419,21 @@ test("tail probe and replay survive events larger than the 64 KB probe window", 
   }
 });
 
+test("oversized events are truncated with a marker", () => {
+  const dir = tmpRuns();
+  try {
+    const huge = "x".repeat(MAX_RUN_EVENT_BYTES * 2);
+    appendRunEvent({ seq: 1, runId: "run-big", type: "log", data: huge, ts: 0 } as any, dir);
+    const events = readRunEvents("run-big", dir);
+    assert.equal(events.length, 1);
+    assert.equal((events[0] as any).truncated, true);
+    const line = fs.readFileSync(path.join(dir, "run-big.jsonl"), "utf8").trim();
+    assert.ok(Buffer.byteLength(line, "utf8") <= MAX_RUN_EVENT_BYTES);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("tail probe finds the event before a giant torn tail", async () => {
   const dir = tmpRuns();
   try {
@@ -425,6 +443,65 @@ test("tail probe finds the event before a giant torn tail", async () => {
     fs.appendFileSync(path.join(dir, "run-1.jsonl"), `{"runId":"run-1","seq":3,"type":"log","data":"${"x".repeat(100 * 1024)}`, "utf8");
     assert.equal(tailRunLogLastSeq("run-1", dir), 2);
     const events = await drain(streamRunEventsFrom("run-1", dir, 0));
+    assert.deepEqual(events.map((e) => e.seq), [1, 2]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("retention limits remove old rotated segments", () => {
+  const dir = tmpRuns();
+  try {
+    const maxBytes = 300;
+    const perRunMax = 900;
+    const globalMax = 50_000;
+    for (let i = 1; i <= 40; i++) {
+      appendRunEvent({ seq: i, runId: "run-ret", type: "log", data: "payload-" + i, ts: 0 } as any, dir, maxBytes, perRunMax, globalMax);
+    }
+    const files = fs.readdirSync(dir).filter((n) => n.startsWith("run-ret.jsonl"));
+    let total = 0;
+    for (const f of files) total += fs.statSync(path.join(dir, f)).size;
+    assert.ok(total <= perRunMax + maxBytes, `total ${total} should be bounded`);
+    const events = readRunEvents("run-ret", dir);
+    assert.ok(events.length > 0);
+    assert.equal(events[events.length - 1].seq, 40);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("rotation during a read re-resolves ENOENT and drops no events", async (t) => {
+  const dir = tmpRuns();
+  try {
+    const total = seed(dir, "run-race", 30, 220);
+    const files = fs.readdirSync(dir);
+    assert.ok(files.some((n) => /^run-race\.jsonl\.\d+$/.test(n)), "expected rotation");
+    const original = fs.createReadStream;
+    let injected = false;
+    t.mock.method(fs, "createReadStream", ((p: fs.PathLike, opts?: any) => {
+      const name = String(p);
+      if (!injected && /run-race\.jsonl\.1$/.test(name)) {
+        injected = true;
+        const err = Object.assign(new Error("ENOENT injected"), { code: "ENOENT" });
+        throw err;
+      }
+      return original(p as any, opts as any);
+    }) as any);
+    const events = await drain(streamRunEventsFrom("run-race", dir, 0));
+    assert.equal(events.length, total);
+    assert.deepEqual(events.map((e) => e.seq), Array.from({ length: total }, (_, i) => i + 1));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("flushRunLogs drains pending writes on shutdown", async () => {
+  const dir = tmpRuns();
+  try {
+    appendRunEvent({ seq: 1, runId: "run-flush", type: "log", data: "a", ts: 0 } as any, dir);
+    appendRunEvent({ seq: 2, runId: "run-flush", type: "log", data: "b", ts: 0 } as any, dir);
+    await flushRunLogs(dir);
+    const events = readRunEvents("run-flush", dir);
     assert.deepEqual(events.map((e) => e.seq), [1, 2]);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -494,25 +571,28 @@ test("capped replay with a cursor counts only events after the cursor", async ()
   }
 });
 
-/** Record every fs.openSync(path, flags) call made while `fn` runs, then restore. */
-function recordOpenFlags(fn: () => void): Array<{ file: string; flags: string }> {
+/**
+ * Record every fs.openSync(path, flags) call made while `fn` runs, then restore.
+ * flushRunLogs is async (it drains the per-run write queues first), so the
+ * patch must stay installed until the returned promise settles, or the fsync
+ * opens happen after restore and are never recorded.
+ */
+async function recordOpenFlagsAsync(fn: () => Promise<void>): Promise<Array<{ file: string; flags: string }>> {
   const seen: Array<{ file: string; flags: string }> = [];
   const original = fs.openSync;
-  // run-log.ts imports the same node:fs object, so patching it here observes
-  // the opens flushRunLogs performs.
   (fs as { openSync: typeof fs.openSync }).openSync = ((p: fs.PathLike, flags?: string | number, mode?: number) => {
     seen.push({ file: String(p), flags: String(flags) });
     return (original as (p: fs.PathLike, flags?: string | number, mode?: number) => number)(p, flags, mode);
   }) as typeof fs.openSync;
   try {
-    fn();
+    await fn();
   } finally {
     (fs as { openSync: typeof fs.openSync }).openSync = original;
   }
   return seen;
 }
 
-test("flushRunLogs opens segments r+ for cross-platform fsync and leaves them intact", () => {
+test("flushRunLogs opens segments r+ for cross-platform fsync and leaves them intact", async () => {
   const dir = tmpRuns();
   try {
     seed(dir, "run-1", 50, 200);
@@ -523,7 +603,7 @@ test("flushRunLogs opens segments r+ for cross-platform fsync and leaves them in
     assert.ok(segments.length >= 2, `expected a base + rotated segment, got ${segments.join(", ")}`);
     const before = new Map(segments.map((name) => [name, fs.readFileSync(path.join(dir, name), "utf8")]));
 
-    const opens = recordOpenFlags(() => flushRunLogs(dir));
+    const opens = await recordOpenFlagsAsync(() => flushRunLogs(dir));
 
     // Every segment must be attempted with "r+" first: on Windows, fsync on
     // a read-only handle fails, so "r" alone is not fsync-safe there.
@@ -540,7 +620,7 @@ test("flushRunLogs opens segments r+ for cross-platform fsync and leaves them in
   }
 });
 
-test("flushRunLogs falls back to r when a segment cannot be opened r+", () => {
+test("flushRunLogs falls back to r when a segment cannot be opened r+", async () => {
   const dir = tmpRuns();
   try {
     // A directory whose name matches a log segment cannot be opened "r+"
@@ -550,7 +630,7 @@ test("flushRunLogs falls back to r when a segment cannot be opened r+", () => {
     fs.mkdirSync(dirSegment);
     seed(dir, "run-2", 3);
 
-    const opens = recordOpenFlags(() => flushRunLogs(dir));
+    const opens = await recordOpenFlagsAsync(() => flushRunLogs(dir));
 
     const attempts = opens.filter((o) => o.file === dirSegment).map((o) => o.flags);
     assert.deepEqual(attempts, ["r+", "r"], `directory segment should fall back r+ -> r (got ${attempts.join(", ")})`);
@@ -560,7 +640,7 @@ test("flushRunLogs falls back to r when a segment cannot be opened r+", () => {
   }
 });
 
-test("flushRunLogs tolerates a read-only segment and missing dirs", () => {
+test("flushRunLogs tolerates a read-only segment and missing dirs", async () => {
   const dir = tmpRuns();
   try {
     seed(dir, "run-1", 5);
@@ -569,15 +649,15 @@ test("flushRunLogs tolerates a read-only segment and missing dirs", () => {
     fs.chmodSync(file, 0o444);
     try {
       // Must not throw even where "r+" is refused for the read-only segment.
-      flushRunLogs(dir);
+      await flushRunLogs(dir);
     } finally {
       fs.chmodSync(file, 0o644);
     }
     assert.equal(fs.readFileSync(file, "utf8"), before);
     assert.equal(readRunEvents("run-1", dir).length, 5);
 
-    flushRunLogs(null);
-    flushRunLogs(path.join(dir, "does-not-exist"));
+    await flushRunLogs(null);
+    await flushRunLogs(path.join(dir, "does-not-exist"));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

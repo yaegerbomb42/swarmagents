@@ -42,6 +42,14 @@ export interface ExecOptions {
    * capacity slot.
    */
   noResurrect?: boolean;
+  /**
+   * Skip the per-user concurrent-exec slot limit for this call. Only for
+   * tiny safety-critical cleanup execs (the cancelled-run reap's SIGKILL):
+   * the reap must never be starved by the very processes it exists to
+   * kill, which are the ones occupying the slots. Never set for agent or
+   * tool execs.
+   */
+  bypassExecSlotLimit?: boolean;
 }
 
 /** Result of an exec() call. */

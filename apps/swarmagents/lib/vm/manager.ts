@@ -437,8 +437,12 @@ export class VmManager {
   async exec(userId: string, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
     let acquired = false;
     try {
-      this.acquireExecSlot(userId);
-      acquired = true;
+      // The reap's SIGKILL bypasses the slot limit (see bypassExecSlotLimit):
+      // it must never be starved by the processes it exists to kill.
+      if (!opts?.bypassExecSlotLimit) {
+        this.acquireExecSlot(userId);
+        acquired = true;
+      }
       this.touch(userId);
       return await this.withRead(userId, async () => {
         // Atomic against a concurrent stop (we hold the read lock now): if a

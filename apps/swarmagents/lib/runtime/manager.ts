@@ -1534,6 +1534,10 @@ export class RuntimeManager {
       await this.vm.exec(userId, buildPgidKillCommand(pgidFile), {
         timeoutMs: KILL_TIMEOUT_MS,
         signal: AbortSignal.timeout(KILL_TIMEOUT_MS),
+        // The kill must not be starved by the exec-slot limit: the dying
+        // run's own processes (and the successor's startup execs) occupy
+        // the slots the reap needs one of.
+        bypassExecSlotLimit: true,
       });
     } catch {
       // Best-effort only; the watchdog finalization already freed the slot.

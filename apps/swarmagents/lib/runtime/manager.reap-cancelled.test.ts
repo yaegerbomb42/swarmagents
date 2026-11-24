@@ -148,12 +148,14 @@ test("cancel reaps the run's process group before the successor's harness spawns
   const driver = new ReapDriver({ hangClaude: true });
   const manager = managerWith(driver);
   const userId = "u-reap-before-successor";
+  let secondRunId: string | undefined;
   try {
     const first = manager.start(userId, { prompt: "do a slow thing" });
     assert.equal(first.accepted, true);
     await driver.waitForClaude();
 
     const second = manager.start(userId, { prompt: "next thing" });
+    secondRunId = second.runId;
     assert.equal(second.accepted, true);
     assert.equal(second.queued, true);
 
@@ -172,10 +174,12 @@ test("cancel reaps the run's process group before the successor's harness spawns
     );
     assert.equal(manager.list(userId).find((run) => run.runId === second.runId)?.status, "running");
   } finally {
-    try {
-      manager.cancel(userId, second.runId);
-    } catch {
-      /* already finished */
+    if (secondRunId !== undefined) {
+      try {
+        manager.cancel(userId, secondRunId);
+      } catch {
+        /* already finished */
+      }
     }
     driver.releaseAll();
   }
@@ -185,12 +189,14 @@ test("a wedged reap times out and the successor still starts", async () => {
   const driver = new ReapDriver({ hangClaude: true, hangKill: true });
   const manager = managerWith(driver, { reapTimeoutMs: 250 });
   const userId = "u-reap-timeout";
+  let secondRunId: string | undefined;
   try {
     const first = manager.start(userId, { prompt: "do a slow thing" });
     assert.equal(first.accepted, true);
     await driver.waitForClaude();
 
     const second = manager.start(userId, { prompt: "next thing" });
+    secondRunId = second.runId;
     assert.equal(second.queued, true);
 
     manager.cancel(userId, first.runId);
@@ -205,10 +211,12 @@ test("a wedged reap times out and the successor still starts", async () => {
     assert.ok(killIndex < successorClaudeIndex, "the reap attempt precedes the successor spawn");
     assert.equal(manager.list(userId).find((run) => run.runId === second.runId)?.status, "running");
   } finally {
-    try {
-      manager.cancel(userId, second.runId);
-    } catch {
-      /* already finished */
+    if (secondRunId !== undefined) {
+      try {
+        manager.cancel(userId, secondRunId);
+      } catch {
+        /* already finished */
+      }
     }
     driver.releaseAll();
   }

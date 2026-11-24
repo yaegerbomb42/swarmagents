@@ -8,7 +8,13 @@
 
 import { createDesktopProxy } from "./proxy";
 
-const proxy = createDesktopProxy();
+// Frame tap (damage-region differencing + keyframe capture) is opt-in:
+// SWARM_DESKTOP_FRAME_TAP=1 enables per-session keyframe capture readable
+// at GET /desktop/keyframes. Off by default — zero overhead, no frames
+// held in memory.
+const proxy = createDesktopProxy({
+  frameTap: process.env.SWARM_DESKTOP_FRAME_TAP === "1" ? {} : undefined,
+});
 
 proxy.listen().then(() => {
   console.log(`[desktop-proxy] listening on ${proxy.host}:${proxy.port} (${proxy.server.listening ? "up" : "down"})`);

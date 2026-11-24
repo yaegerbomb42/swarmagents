@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { TaskDifficulty } from "../mcp-types";
 import { fitsDifficulty, tasksWithinDifficulty } from "./difficulty";
 import { hasSurplusQuota } from "./quota";
 import { proposalsFromAnalysis } from "./proposals";
@@ -37,7 +38,7 @@ test("surplus quota accepts free and loopback providers only", () => {
 });
 
 test("board poll keeps tasks at or below the max difficulty, easiest first", () => {
-  const tasks = [
+  const tasks: { id: string; status: string; difficulty: TaskDifficulty; title: string }[] = [
     { id: "low", status: "open", difficulty: "easy", title: "a" },
     { id: "mid", status: "open", difficulty: "medium", title: "b" },
     { id: "high", status: "open", difficulty: "hard", title: "c" },
@@ -84,8 +85,8 @@ test("tick refuses work outside the window and queues when quota is surplus", ()
     idleForMs: 5 * 60_000,
     activeExec: false,
     providers: [{ id: "free", isFree: true }],
-    maxDifficulty: "medium",
-    tasks: [{ id: "t1", title: "Fix parser", status: "open", difficulty: "medium", description: "edge cases" }],
+    maxDifficulty: "medium" as TaskDifficulty,
+    tasks: [{ id: "t1", title: "Fix parser", status: "open", difficulty: "medium" as TaskDifficulty, description: "edge cases" }],
     hotspotsByRepo: { "/repo": [{ path: "lib/x.ts", heat: 4, coveragePct: 0 }] },
   };
   const idle = decideAutopilotTick({ ...base, idleForMs: 0 }, []);
@@ -126,7 +127,7 @@ test("a corrupt gardener.json falls back to empty state instead of throwing", ()
   try {
     fs.writeFileSync(path.join(dir, "gardener.json"), "{not json");
     assert.deepEqual(loadGardener(), { version: 1, users: {} });
-    assert.deepEqual(readUserGardener("local"), { enabled: false, workerElo: 1400, pinned: [], proposals: [] });
+    assert.deepEqual(readUserGardener("local"), { enabled: false, maxDifficulty: "medium", pinned: [], proposals: [] });
   } finally {
     configureGardenerDir(null);
   }

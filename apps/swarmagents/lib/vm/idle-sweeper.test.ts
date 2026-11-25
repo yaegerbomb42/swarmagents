@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { IdleSweeper, type SetIntervalFn } from "./idle-sweeper";
-import type { VmManager } from "./manager";
+import { FakeVmDriver } from "./fake-driver";
+import { VmManager } from "./manager";
 
 interface FakeVm {
   lastUsed: number;
@@ -81,6 +82,60 @@ test("onIdleWindow runs before sweepIdle and a hook failure does not stop the sw
   assert.deepEqual(await sweeper.sweep(), ["idle"]);
   assert.deepEqual(order, ["window:idle", "error", "hibernated"]);
   assert.deepEqual(calls, [10_000]);
+});
+
+test("always-on users are never hibernated while ordinary idle VMs are", async () => {
+  let now = 0;
+  const driver = new FakeVmDriver();
+  const manager = new VmManager({
+    customDriver: driver,
+    now: () => now,
+    idle: { idleMinutes: 1 },
+    alwaysOnUsers: new Set(["always"]),
+  });
+  const alwaysHandle = await manager.ensure("always");
+  await manager.ensure("regular");
+  assert.equal(manager.isAlwaysOnUser("always"), true);
+  assert.equal(manager.isAlwaysOnUser("regular"), false);
+
+  // Both VMs are now past the 60s idle window.
+  now = 2 * 60_000;
+  const sweeper = new IdleSweeper({ manager, now: () => now });
+  const hibernated = await sweeper.sweep();
+
+  assert.ok(hibernated.includes("regular"), "the ordinary idle VM hibernates");
+  assert.equal(hibernated.includes("always"), false, "the 24/7 VM is exempt");
+  assert.equal(manager.isVmLive("always"), true);
+  assert.equal(manager.isVmLive("regular"), false);
+  assert.equal((await driver.status(alwaysHandle)).status, "running");
+});
+
+test("a stopped always-on VM is re-ensured by the health sweep", async () => {
+  let now = 0;
+  const driver = new FakeVmDriver();
+  const manager = new VmManager({
+    customDriver: driver,
+    now: () => now,
+    idle: { idleMinutes: 1 },
+    isAlwaysOn: (userId) => userId === "always",
+  });
+  const handle = await manager.ensure("always");
+  await driver.stop(handle); // the container dies behind the manager's back
+  assert.equal((await driver.status(handle)).status, "stopped");
+
+  const originalEnsure = driver.ensure.bind(driver);
+  let ensureCalls = 0;
+  driver.ensure = async (userId: string) => {
+    ensureCalls++;
+    return originalEnsure(userId);
+  };
+
+  now = 2 * 60_000;
+  const sweeper = new IdleSweeper({ manager, now: () => now });
+  assert.deepEqual(await sweeper.sweep(), []);
+  assert.equal(ensureCalls, 1, "ensure() was called to restart the dead container");
+  assert.equal((await driver.status(handle)).status, "running");
+  assert.equal(manager.isVmLive("always"), true);
 });
 
 test("start/stop are idempotent and respect a disabled interval", () => {

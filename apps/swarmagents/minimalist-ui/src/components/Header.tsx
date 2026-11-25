@@ -99,6 +99,8 @@ export interface HeaderProps {
   settingsNeedsAttention: boolean;
   /** Opens the keyboard-shortcuts help panel. */
   onOpenShortcuts: () => void;
+  /** The account's 24/7 always-on VM mode (shows the live badge when on). */
+  alwaysOn247?: boolean;
 }
 
 export function Header({
@@ -114,6 +116,7 @@ export function Header({
   onOpenSettings,
   settingsNeedsAttention,
   onOpenShortcuts,
+  alwaysOn247 = false,
 }: HeaderProps) {
   return (
     <header className="glass shrink-0 hair-b relative z-30" data-testid="workspace-header">
@@ -170,6 +173,15 @@ export function Header({
         )}
 
         <div className="flex items-center justify-end gap-2">
+          {alwaysOn247 && (
+            <span
+              data-testid="always-on-247-pill"
+              title="Always-On 24/7: your VM stays live and self-heals"
+              className="hidden shrink-0 items-center rounded-full bg-emerald-400/15 px-2 py-1 font-mono text-[10px] font-semibold text-emerald-300 ring-1 ring-emerald-400/30 min-[420px]:inline-flex"
+            >
+              24/7
+            </span>
+          )}
           <RunIndicator {...run} />
           <Link
             href="/connectors"

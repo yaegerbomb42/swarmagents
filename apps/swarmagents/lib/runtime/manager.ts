@@ -4570,6 +4570,12 @@ export function getRuntimeManager(): RuntimeManager {
   if (g.__swarmRuntimeManager) return g.__swarmRuntimeManager;
   const manager = new RuntimeManager({ stateStore: new RunStateStore() });
   g.__swarmRuntimeManager = manager;
+  // 24/7 users keep their VM alive: the idle sweeper skips hibernation for
+  // them and re-ensures a dead container on each health sweep. Settings can
+  // change at runtime, so the predicate reads the user's file on every check.
+  manager.vmManager.setAlwaysOnPredicate(
+    (userId) => readUserSettings(userId).alwaysOn247 === true,
+  );
   // Persistent VMs are hibernated after SWARM_VM_IDLE_MIN minutes of
   // inactivity; the sweeper stops them and the next run transparently
   // restarts the container (the /workspace volume is kept).

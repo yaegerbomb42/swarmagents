@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configureProviderStorePaths } from "./store";
 import {
+  alwaysOn247For,
   DEFAULT_USER_SETTINGS,
   isKeySelectionMode,
   isVmPersistenceMode,
@@ -64,6 +65,27 @@ test("parseUserSettings and readUserSettings tolerate corrupt or malformed files
   assert.deepEqual(readUserSettings(U), DEFAULT_USER_SETTINGS);
   writeFileSync(file, JSON.stringify({ preferFreeProviders: false }), "utf8");
   assert.deepEqual(readUserSettings(U), { preferFreeProviders: false });
+});
+
+test("alwaysOn247 parses only booleans and defaults to off", () => {
+  assert.equal(alwaysOn247For(DEFAULT_USER_SETTINGS), false);
+  assert.equal(alwaysOn247For(parseUserSettings({})), false);
+  assert.equal(parseUserSettings({ alwaysOn247: true }).alwaysOn247, true);
+  assert.equal(alwaysOn247For(parseUserSettings({ alwaysOn247: true })), true);
+  assert.equal(parseUserSettings({ alwaysOn247: false }).alwaysOn247, false);
+  assert.equal(alwaysOn247For(parseUserSettings({ alwaysOn247: false })), false);
+  for (const bad of ["true", 1, null, {}, []]) {
+    assert.equal(parseUserSettings({ alwaysOn247: bad }).alwaysOn247, undefined);
+  }
+});
+
+test("alwaysOn247 round-trips through the per-user settings file", () => {
+  writeUserSettings(U, { preferFreeProviders: true, alwaysOn247: true });
+  assert.equal(readUserSettings(U).alwaysOn247, true);
+  assert.equal(alwaysOn247For(readUserSettings(U)), true);
+
+  updateUserSettings(U, { alwaysOn247: false });
+  assert.equal(alwaysOn247For(readUserSettings(U)), false);
 });
 
 test("keySelectionMode parses valid modes, drops invalid ones, and defaults to round-robin", () => {

@@ -21,6 +21,7 @@ import {
   isRoleWithinRole,
   loadCustomRoles,
   mergeCustomRoles,
+  normalizeBestOfN,
   normalizeCategory,
   normalizeMcpServers,
   normalizePermissions,
@@ -353,6 +354,36 @@ test("normalizeRoleDefinition rejects non-objects and nameless roles", () => {
   assert.equal(normalizeRoleDefinition([]), null);
   assert.equal(normalizeRoleDefinition({}), null);
   assert.equal(normalizeRoleDefinition({ name: "   " }), null);
+});
+
+test("normalizeBestOfN keeps a valid config and clamps N", () => {
+  assert.deepEqual(normalizeBestOfN({ n: 2, families: ["deepseek", "qwen"], mode: "best" }), {
+    n: 2,
+    families: ["deepseek", "qwen"],
+    mode: "best",
+  });
+  assert.deepEqual(normalizeBestOfN({ n: 9 }), { n: 3 });
+  assert.deepEqual(normalizeBestOfN({ n: 0 }), { n: 1 });
+  assert.deepEqual(normalizeBestOfN({ n: "2", families: ["deepseek:deepseek-chat"] }), {
+    n: 2,
+    families: ["deepseek:deepseek-chat"],
+  });
+  assert.equal(normalizeBestOfN({ mode: "bogus" }), undefined);
+  assert.equal(normalizeBestOfN({}), undefined);
+  assert.equal(normalizeBestOfN(undefined), undefined);
+  assert.equal(normalizeBestOfN("deepseek"), undefined);
+});
+
+test("normalizeRoleDefinition carries a valid bestOfN config and drops junk", () => {
+  const role = normalizeRoleDefinition({ name: "Coder", bestOfN: { n: 2, families: ["deepseek", "glm"] } });
+  assert.ok(role);
+  assert.deepEqual(role.bestOfN, { n: 2, families: ["deepseek", "glm"] });
+  const junk = normalizeRoleDefinition({ name: "Coder", bestOfN: { mode: "bogus" } });
+  assert.ok(junk);
+  assert.equal(junk.bestOfN, undefined);
+  const plain = normalizeRoleDefinition({ name: "Coder" });
+  assert.ok(plain);
+  assert.equal(plain.bestOfN, undefined);
 });
 
 test("normalizeRoleDefinition accepts label as a name fallback", () => {

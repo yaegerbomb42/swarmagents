@@ -168,6 +168,15 @@ import {
 } from "../verification/shadow-verifier";
 import { runDiffHygieneGate } from "../verification/diff-hygiene-gate";
 import { defaultOracleChecks, runOracleGate } from "../harness/oracle";
+import { createScratch } from "../harness/oracle/scratch";
+import { parsePatchFiles } from "../harness/oracle/diff";
+import { writeFileViaExec } from "../harness/oracle/exec";
+import {
+  modelForFamily,
+  resolveBestOfNConfig,
+  runBestOfN,
+  shouldFanOutBestOfN,
+} from "../harness/bestOfN";
 import { deriveArtifactsFromEvents, diffWorkspaceLists, listWorkspaceFiles, mergeArtifacts } from "./run-report";
 import type { WorkspaceEntry } from "./run-report";
 import { getRunsDir } from "../telemetry/paths";
@@ -926,6 +935,24 @@ export function buildRunnerEnv(env: NodeJS.ProcessEnv = process.env): Record<str
 /** Minimal runner surface runOnce needs (ClaudeCodeRunner satisfies it). */
 export interface RunnerLike {
   run(request: RunRequest, onEvent: (event: HarnessEvent) => void): Promise<RunOutcome>;
+}
+
+/** Per-invocation overrides for a best-of-N candidate run (see RuntimeManager.runOnce). */
+export interface RunOnceOverrides {
+  /** Isolated scratch worktree for this invocation (default "/workspace"). */
+  cwd?: string;
+  /** `--model` override (default active.model). */
+  model?: string;
+  /** Full prompt override (default context prefix + active.prompt). */
+  prompt?: string;
+  /** pgid marker override (default active.pgidFile). */
+  pgidFile?: string;
+  /** Start a fresh CLI session instead of resuming active.sessionId. */
+  freshSession?: boolean;
+  /** Skip the L1 working-set read and the "l1" packer for this invocation. */
+  skipL1?: boolean;
+  /** Don't write the outcome's ledger/edited-files back onto the ActiveRun. */
+  skipStateWriteBack?: boolean;
 }
 
 export class RuntimeManager {
@@ -3302,6 +3329,20 @@ export class RuntimeManager {
           if (!postRunGateEnabled || !finishEvent) return { switched: false }; // success finalized via run.finished
           const gate = await this.runPostRunGate(active, finishEvent, verificationEnabled);
           if (gate.outcome === "finalized") return { switched: false };
+          // Best-of-N: a rejected non-trivial diff fans out to other model
+          // families instead of re-driving the same model. A landed winner
+          // finalizes the run; anything else falls through to the bounce.
+          if (
+            gate.diff &&
+            (await this.maybeFanOutBestOfN(active, gate.diff, {
+              env: fallbackEnv,
+              phase: fallbackPhase,
+              approvalHook,
+              finishEvent,
+            }))
+          ) {
+            return { switched: false };
+          }
           active.prompt = bounceRemediationPrompt(gate.summary);
           active.shadowAttempts = (active.shadowAttempts ?? 0) + 1;
           continue;
@@ -3433,6 +3474,20 @@ export class RuntimeManager {
         if (!postRunGateEnabled || !finishEvent) return { switched: false }; // success finalized via run.finished
         const gate = await this.runPostRunGate(active, finishEvent, verificationEnabled);
         if (gate.outcome === "finalized") return { switched: false };
+        // Best-of-N: a rejected non-trivial diff fans out to other model
+        // families instead of re-driving the same model. A landed winner
+        // finalizes the run; anything else falls through to the bounce.
+        if (
+          gate.diff &&
+          (await this.maybeFanOutBestOfN(active, gate.diff, {
+            env: runEnv,
+            phase,
+            approvalHook,
+            finishEvent,
+          }))
+        ) {
+          return { switched: false };
+        }
         active.prompt = bounceRemediationPrompt(gate.summary);
         active.shadowAttempts = (active.shadowAttempts ?? 0) + 1;
         continue;
@@ -3486,6 +3541,11 @@ export class RuntimeManager {
       const errors: Extract<HarnessEvent, { type: "run.error" }>[] = [];
       let roleSwitch: RunOutcome["roleSwitch"];
       let aborted = false;
+      // The attempt's env/phase, for the best-of-N fan-out at the gate
+      // below: they are built inside the pool callback, which the gate
+      // site cannot see.
+      let attemptEnv: Record<string, string> | null = null;
+      let attemptPhase: RolePhase | null = null;
       const pool = new RunProviderPool(router, {
         model: active.model,
         resumeSessionId: active.sessionId,
@@ -3504,6 +3564,8 @@ export class RuntimeManager {
         const phase = role
           ? this.rolePhaseFor(role, libraryAllowedToolPermissions(userId), selectionMode, active.toolAllowlist)
           : null;
+        attemptEnv = runEnv;
+        attemptPhase = phase;
         const run = await this.runOnce(
           active,
           runEnv,
@@ -3558,6 +3620,21 @@ export class RuntimeManager {
       if (!options.postRunGateEnabled || !finishEvent) return { switched: false };
       const gate = await this.runPostRunGate(active, finishEvent, options.verificationEnabled);
       if (gate.outcome === "finalized") return { switched: false };
+      // Best-of-N: a rejected non-trivial diff fans out to other model
+      // families instead of re-driving the same model. A landed winner
+      // finalizes the run; anything else falls through to the bounce.
+      if (
+        gate.diff &&
+        attemptEnv &&
+        (await this.maybeFanOutBestOfN(active, gate.diff, {
+          env: attemptEnv,
+          phase: attemptPhase,
+          approvalHook: options.approvalHook,
+          finishEvent,
+        }))
+      ) {
+        return { switched: false };
+      }
       active.prompt = bounceRemediationPrompt(gate.summary);
       active.shadowAttempts = (active.shadowAttempts ?? 0) + 1;
     }
@@ -3628,7 +3705,7 @@ export class RuntimeManager {
    */
   private async runPostRunOracle(
     active: ActiveRun,
-  ): Promise<{ summary: ShadowVerificationSummary; rejected: boolean } | undefined> {
+  ): Promise<{ summary: ShadowVerificationSummary; rejected: boolean; diff?: string } | undefined> {
     if (!isOraclePostRunEnabled()) return undefined;
     let isolatedRoot: string | undefined;
     let worktreeGitRoot: string | undefined;
@@ -3710,6 +3787,9 @@ export class RuntimeManager {
           ...(rejected && report.retryContext ? { remediationPrompt: report.retryContext } : {}),
         },
         rejected,
+        // The primary diff, so the bounce path can offer it to the
+        // best-of-N fan-out (which reverts it when a winner lands).
+        diff,
       };
     } catch (error) {
       // Fail closed into the report, never into the run control path.
@@ -3745,7 +3825,10 @@ export class RuntimeManager {
     active: ActiveRun,
     finishEvent: Extract<HarnessEvent, { type: "run.finished" }>,
     shadowEnabled: boolean,
-  ): Promise<{ outcome: "finalized" } | { outcome: "bounce"; summary: ShadowVerificationSummary }> {
+  ): Promise<
+    | { outcome: "finalized" }
+    | { outcome: "bounce"; summary: ShadowVerificationSummary; diff?: string }
+  > {
     if (shadowEnabled) return this.runShadowGate(active, finishEvent);
     const oracle = await this.runPostRunOracle(active);
     // An Oracle rejection bounces the run back to the primary agent with
@@ -3753,10 +3836,201 @@ export class RuntimeManager {
     // the same bounded loop as the shadow gate. An Oracle error never
     // bounces: it finalizes with the fail badge.
     if (oracle && shouldBounceOnOracleRejection(oracle.rejected, active.shadowAttempts ?? 0)) {
-      return { outcome: "bounce", summary: oracle.summary };
+      // Carry the primary diff: the bounce path may offer it to the
+      // best-of-N fan-out instead of re-driving the same model.
+      return { outcome: "bounce", summary: oracle.summary, diff: oracle.diff };
     }
     this.finalizeFinished(active, finishEvent, oracle?.summary);
     return { outcome: "finalized" };
+  }
+
+  /**
+   * Best-of-N fan-out (master plan PR 1.2), attempted from the bounce path
+   * when the post-run oracle rejects the primary diff. Returns true when a
+   * candidate from another model family passed the oracle and its diff
+   * landed — the run is finalized as finished and the caller must not
+   * bounce. Returns false for every other outcome (feature off, trivial
+   * diff, no candidate passed, any infrastructure error) and the caller
+   * bounces exactly as before. Never throws: a fan-out failure must not
+   * take down a run that still has its normal retry loop.
+   */
+  private async maybeFanOutBestOfN(
+    active: ActiveRun,
+    diff: string | undefined,
+    ctx: {
+      env: Record<string, string>;
+      phase: RolePhase | null;
+      approvalHook: boolean;
+      finishEvent: Extract<HarnessEvent, { type: "run.finished" }>;
+    },
+  ): Promise<boolean> {
+    if (!diff) return false;
+    const config = resolveBestOfNConfig(active.role?.bestOfN, process.env);
+    if (!shouldFanOutBestOfN(config, diff)) return false;
+    const prompt = active.contextPrefix ? `${active.contextPrefix}\n\n${active.prompt}` : active.prompt;
+    try {
+      return await this.runBestOfNFanOut(active, { diff, prompt, config, ...ctx });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.publishLog(active.runId, `best-of-n: fan-out failed: ${message}`);
+      return false;
+    }
+  }
+
+  private publishLog(runId: string, line: string): void {
+    try {
+      this.bus.publish(runId, { type: "log", data: line });
+    } catch {
+      // Logging must never break the gate.
+    }
+  }
+
+  /**
+   * The fan-out itself: one candidate per configured family, each a full
+   * agent invocation in its own clean-HEAD scratch worktree (same prompt,
+   * a different `--model`), run in parallel. Surviving diffs go to the
+   * oracle gate in the config's mode; the first passing candidate's diff
+   * replaces the primary's in the real tree (revert + apply) and the run
+   * finalizes as finished.
+   *
+   * Candidates reuse the attempt's env and role phase (provider keys travel
+   * in env; the model id selects the family at the proxy). They run with a
+   * fresh CLI session, no L1 carry-through, no state write-back onto the
+   * shared ActiveRun, and their telemetry is swallowed — only the fan-out
+   * log lines reach the run's visible log. A candidate that asks the user
+   * a question pauses until the run timeout, like any attempt.
+   */
+  private async runBestOfNFanOut(
+    active: ActiveRun,
+    opts: {
+      diff: string;
+      prompt: string;
+      config: ReturnType<typeof resolveBestOfNConfig>;
+      env: Record<string, string>;
+      phase: RolePhase | null;
+      approvalHook: boolean;
+      finishEvent: Extract<HarnessEvent, { type: "run.finished" }>;
+    },
+  ): Promise<boolean> {
+    const { runId, userId } = active;
+    const exec = this.shadowExecFor(userId);
+    const repoRoot = await selectedCodebaseRepo(userId, this.codebaseScanner);
+    if (!repoRoot) return false;
+    const rootResult = await exec(["git", "rev-parse", "--show-toplevel"], { cwd: repoRoot });
+    if (rootResult.exitCode !== 0) return false;
+    const gitRoot = rootResult.stdout.trim();
+    const projectDir = path.posix.relative(gitRoot, repoRoot) || ".";
+    const nodeModules = path.posix.join(projectDir, "node_modules");
+    const log = (line: string): void => this.publishLog(runId, line);
+    log(
+      `best-of-n: primary diff rejected; fanning out to ${opts.config.families.length} families ` +
+        `(${opts.config.families.map((family) => family.family).join(", ")})`,
+    );
+
+    // Gate worktree: the oracle judges candidates in a disposable copy,
+    // never in the live workspace (same pattern as runPostRunOracle).
+    const isolatedRoot = path.posix.join(path.posix.dirname(gitRoot), `.swarm-bestofn-${runId}`);
+    const worktree = await exec(["git", "-C", gitRoot, "worktree", "add", "--detach", isolatedRoot, "HEAD"]);
+    if (worktree.exitCode !== 0) return false;
+    await exec(["ln", "-s", path.posix.join(gitRoot, nodeModules), path.posix.join(isolatedRoot, nodeModules)]);
+    try {
+      const outcome = await runBestOfN(
+        {
+          runCandidate: async (family, index) => {
+            // A clean-HEAD scratch: the candidate redoes the edit from
+            // scratch, so its diff is pure and applies onto the reverted
+            // tree. createScratch carries the primary's dirty state in,
+            // so reset it away first.
+            const scratch = await createScratch(exec, { repoRoot: gitRoot, linkDirs: [nodeModules] });
+            try {
+              await exec(["git", "-C", scratch.dir, "checkout", "--", "."], { cwd: scratch.dir });
+              await exec(["git", "-C", scratch.dir, "clean", "-fdq"], { cwd: scratch.dir });
+              const result = await this.runOnce(active, opts.env, null, opts.phase, opts.approvalHook, true, () => {}, {
+                cwd: scratch.dir,
+                model: modelForFamily(family) ?? active.model,
+                prompt: opts.prompt,
+                pgidFile: active.pgidFile ? `${active.pgidFile}.bon-${index}` : undefined,
+                freshSession: true,
+                skipL1: true,
+                skipStateWriteBack: true,
+              });
+              if (result.attemptError || result.outcome.aborted || !this.isStillActive(active)) return null;
+              await exec(["git", "-C", scratch.dir, "add", "-N", "."], { cwd: scratch.dir });
+              const diffResult = await exec(["git", "-C", scratch.dir, "diff", "--binary", "HEAD"], {
+                cwd: scratch.dir,
+              });
+              if (diffResult.exitCode !== 0 || !diffResult.stdout.trim()) return null;
+              return { id: `bon-${family.family}-${index}`, diff: diffResult.stdout };
+            } finally {
+              await scratch.dispose();
+            }
+          },
+          gate: (candidates) =>
+            runOracleGate(exec, candidates, {
+              repoRoot: isolatedRoot,
+              projectDir,
+              mode: opts.config.mode,
+              checks: defaultOracleChecks(),
+              linkDirs: [nodeModules],
+              signal: active.controller.signal,
+              log,
+            }),
+          log,
+        },
+        { families: opts.config.families },
+      );
+      if (!outcome.winner) {
+        log(`best-of-n: ${outcome.summary}; falling back to the normal bounce`);
+        return false;
+      }
+
+      // Land the winner: revert exactly the primary diff's files (never a
+      // blanket checkout — the tree may hold dirt from before the run),
+      // then apply the winner's clean-HEAD diff. A failed apply leaves the
+      // tree at HEAD; the run bounces normally and redoes the edit.
+      const files = parsePatchFiles(opts.diff);
+      const added = files.filter((file) => file.status === "A").map((file) => file.path);
+      const modified = files.filter((file) => file.status !== "A").map((file) => file.path);
+      for (let i = 0; i < modified.length; i += 100) {
+        const batch = modified.slice(i, i + 100);
+        const reverted = await exec(["git", "-C", gitRoot, "checkout", "--", ...batch], { cwd: gitRoot });
+        if (reverted.exitCode !== 0) return false;
+      }
+      for (let i = 0; i < added.length; i += 100) {
+        const batch = added.slice(i, i + 100);
+        await exec(["rm", "-f", "--", ...batch], { cwd: gitRoot });
+      }
+      const patchPath = path.posix.join(path.posix.dirname(gitRoot), `.swarm-bestofn-${runId}.patch`);
+      try {
+        await writeFileViaExec(exec, patchPath, outcome.winner.diff);
+        const applied = await exec(["git", "-C", gitRoot, "apply", "--whitespace=nowarn", patchPath], {
+          cwd: gitRoot,
+        });
+        if (applied.exitCode !== 0) {
+          log(`best-of-n: winner ${outcome.winner.id} could not be applied; falling back to the normal bounce`);
+          return false;
+        }
+      } finally {
+        await exec(["rm", "-f", patchPath]);
+      }
+      log(outcome.summary);
+      this.finalizeFinished(active, opts.finishEvent, {
+        passed: true,
+        score: 100,
+        badge: "pass",
+        violations: [],
+        testsRan: true,
+        buildBroke: false,
+      });
+      return true;
+    } finally {
+      try {
+        await exec(["git", "-C", gitRoot, "worktree", "remove", "--force", isolatedRoot]);
+        await exec(["git", "-C", gitRoot, "worktree", "prune"]);
+      } catch {
+        // A failed cleanup is operationally recoverable and must not fail the run.
+      }
+    }
   }
 
   /** Finalize a finished run with its verification badge, if any. */
@@ -3914,6 +4188,13 @@ export class RuntimeManager {
    * Run one claude invocation with the given provider env. The runner's stream
    * is forwarded to the bus; run.error is captured and returned so the caller
    * decides whether to fail over. run.finished finalizes the run here.
+   *
+   * `overrides` is the best-of-N fan-out's handle: a candidate invocation
+   * runs the same edit in an isolated scratch worktree (`cwd`), with a
+   * different model family (`model`), a fresh session, no L1 carry-through
+   * (its ledger belongs to the primary attempt, not the candidate), and no
+   * write-back onto the shared ActiveRun (parallel candidates must not race
+   * on `active.stateLedger` / `active.editedFiles`).
    */
   private async runOnce(
     active: ActiveRun,
@@ -3923,6 +4204,7 @@ export class RuntimeManager {
     approvalHook = false,
     deferFinish = false,
     forward: (event: HarnessEvent) => void = (event) => this.forwardEvent(active, event),
+    overrides?: RunOnceOverrides,
   ): Promise<{
     outcome: RunOutcome;
     attemptError: Extract<HarnessEvent, { type: "run.error" }> | null;
@@ -4034,29 +4316,34 @@ export class RuntimeManager {
         // L1 context packer: rebuild this invocation's prompt from the files
         // the previous attempt edited (read from the VM) plus the accumulated
         // ledger. First attempt: no file state yet, ledger starts fresh.
-        const l1Files = await this.readL1WorkingSet(active);
+        // Best-of-N candidates skip it: they work in a scratch worktree,
+        // and the primary attempt owns the ledger.
+        const l1Files = overrides?.skipL1 ? undefined : await this.readL1WorkingSet(active);
         const outcome = await this.runner.run(
         {
           // The project digest rides in front of the user's ask on a fresh
           // thread only; history and Telemetry keep showing the real prompt.
-          prompt: active.contextPrefix ? `${active.contextPrefix}\n\n${active.prompt}` : active.prompt,
+          prompt:
+            overrides?.prompt ??
+            (active.contextPrefix ? `${active.contextPrefix}\n\n${active.prompt}` : active.prompt),
           agentCard: active.agentCard,
           memoryContext: active.memoryContext,
           systemPacker,
-          ...(contextPacker === "l1" ? { contextPacker: "l1" as const } : {}),
+          ...(contextPacker === "l1" && !overrides?.skipL1 ? { contextPacker: "l1" as const } : {}),
           ...(active.stateLedger ? { stateLedger: active.stateLedger } : {}),
           ...(l1Files ?? {}),
           sessionId,
-          model: active.model,
+          model: overrides?.model ?? active.model,
           maxTurns: active.maxTurns,
           provider: selection?.provider,
           env,
           // Stable per-run pgid marker: the cancel backstop kills exactly
-          // this run's process group (never PID 1's children).
-          pgidFile: active.pgidFile,
+          // this run's process group (never PID 1's children). Candidates
+          // get their own marker so a cancel kills exactly one candidate.
+          pgidFile: overrides?.pgidFile ?? active.pgidFile,
           vm: bindExec(this.vm, userId),
           signal: active.controller.signal,
-          cwd: "/workspace",
+          cwd: overrides?.cwd ?? "/workspace",
           redactSecrets: selection?.secrets,
           approvalGateway,
           approvalHook,
@@ -4160,8 +4447,12 @@ export class RuntimeManager {
         // L1 packer: carry the updated ledger and the files this attempt
         // edited into the next invocation, so each turn packs from
         // accumulated state instead of resuming unbounded history.
-        if (outcome.stateLedger) active.stateLedger = outcome.stateLedger;
-        if (outcome.editedFiles) active.editedFiles = outcome.editedFiles;
+        // Best-of-N candidates skip the write-back: parallel invocations
+        // must not race on the shared ActiveRun.
+        if (!overrides?.skipStateWriteBack) {
+          if (outcome.stateLedger) active.stateLedger = outcome.stateLedger;
+          if (outcome.editedFiles) active.editedFiles = outcome.editedFiles;
+        }
         return { outcome, attemptError, finishEvent };
       };
 
@@ -4186,7 +4477,7 @@ export class RuntimeManager {
         };
       };
 
-      let result = rewriteTimeout(await invoke(active.sessionId));
+      let result = rewriteTimeout(await invoke(overrides?.freshSession ? undefined : active.sessionId));
       if (timedOut) return result;
       // Stale --resume: the persisted session is gone from the VM (VM
       // reset, session expiry), so the CLI rejected the resume before

@@ -131,6 +131,21 @@ export function toolLabel(name: string): string {
 
 // ---- Role definition ----
 
+/**
+ * Per-role best-of-N config, as stored on RoleDefinition.bestOfN
+ * (master plan PR 1.2). Families are strings: a bare family ("deepseek"),
+ * a provider:model pair ("deepseek:deepseek-chat"), or a bare model id
+ * ("deepseek-chat"). Parsing/clamping lives in lib/harness/bestOfN.ts.
+ */
+export interface RoleBestOfNConfig {
+  /** Number of parallel candidates (2–3; clamped). Absent = env/default. */
+  n?: number;
+  /** Families to dispatch across. Absent = env/default. */
+  families?: string[];
+  /** Oracle selection: "first" passing wins (default) or "best" (smallest churn). */
+  mode?: "first" | "best";
+}
+
 export interface RoleDefinition {
   /** Stable slug used for storage and references (e.g. "orchestrator"). */
   id: string;
@@ -160,6 +175,15 @@ export interface RoleDefinition {
    * audit. Configurable per role (e.g. Coder → security).
    */
   lens?: LensId;
+  /**
+   * Best-of-N config for this role (master plan PR 1.2): on a non-trivial
+   * edit whose primary diff fails the oracle, dispatch N candidates across
+   * the listed model families in parallel and take the first one that
+   * passes. Omitted = the feature stays off for this role (env fallback).
+   * Families are strings: "deepseek", "deepseek:deepseek-chat", or a bare
+   * model id ("deepseek-chat"). N is clamped to 2–3 at resolution.
+   */
+  bestOfN?: RoleBestOfNConfig;
 }
 
 const permissions = (overrides: Partial<RolePermissions>): RolePermissions => ({
@@ -589,6 +613,29 @@ export function normalizeCategory(raw: unknown): RoleCategory {
 }
 
 /**
+ * Defensive parse of a role's best-of-N config (master plan PR 1.2).
+ * Returns undefined when nothing usable is present (feature stays off).
+ * N clamps to 1–3 here; the harness requires N >= 2 and >= 2 families to
+ * enable the fan-out. Families keep their raw spec strings (parsed by
+ * lib/harness/bestOfN.ts) — junk specs are dropped there.
+ */
+export function normalizeBestOfN(raw: unknown): RoleBestOfNConfig | undefined {
+  const r = asRecord(raw);
+  if (!r) return undefined;
+  const out: RoleBestOfNConfig = {};
+  if (typeof r.n === "number" && Number.isFinite(r.n)) {
+    out.n = Math.min(3, Math.max(1, Math.floor(r.n)));
+  } else if (typeof r.n === "string") {
+    const n = Number.parseInt(r.n, 10);
+    if (Number.isFinite(n)) out.n = Math.min(3, Math.max(1, n));
+  }
+  const families = normalizeStringList(r.families, 3, 80);
+  if (families.length > 0) out.families = families;
+  if (r.mode === "first" || r.mode === "best") out.mode = r.mode;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
  * Defensive parse of anything that claims to be a role (hand-edited JSON,
  * localStorage, an import). Returns null when there is no usable name.
  * Imported roles are always custom so they can never shadow a built-in.
@@ -601,6 +648,7 @@ export function normalizeRoleDefinition(raw: unknown): RoleDefinition | null {
   if (!name) return null;
   const glyphSource = asText(r.glyph, 8);
   const glyph = Array.from(glyphSource).slice(0, 2).join("") || "◇";
+  const bestOfN = normalizeBestOfN(r.bestOfN);
   return {
     id: asText(r.id, 64) || slugifyRoleId(name),
     name,
@@ -615,6 +663,7 @@ export function normalizeRoleDefinition(raw: unknown): RoleDefinition | null {
     category: normalizeCategory(r.category),
     builtin: false,
     ...(isLensId(r.lens) ? { lens: r.lens } : {}),
+    ...(bestOfN ? { bestOfN } : {}),
   };
 }
 

@@ -161,6 +161,65 @@ export function BrowserFrameImage({
   );
 }
 
+/** Persistent VM browser-profile status, as returned by the profile route. */
+export interface BrowserProfileStatus {
+  /** True when the profile directory exists in the VM. */
+  exists: boolean;
+  /** Total profile size in MB (rounded up); 0 when missing. */
+  sizeMb: number;
+}
+
+/** Human size for the profile pill ("12 MB"); the route already rounds up. */
+export function formatBrowserProfileSize(sizeMb: number): string {
+  return `${Math.max(0, Math.round(sizeMb))} MB`;
+}
+
+export interface BrowserProfilePillProps {
+  /** Null while the status is unknown (not fetched yet, or the fetch failed). */
+  profile: BrowserProfileStatus | null;
+  /** A clear request is in flight; the button stays disabled. */
+  busy: boolean;
+  /** Clear the VM browser session (the caller confirms first). */
+  onClear: () => void;
+}
+
+/**
+ * Persistent-session indicator for the browser chrome: how big the saved
+ * VM browser profile is, with a Clear action. Only existence + size are
+ * ever shown — the profile holds cookies and logins, which never leave
+ * the VM. Pure presentational so it can be checked with a static render.
+ */
+export function BrowserProfilePill({ profile, busy, onClear }: BrowserProfilePillProps) {
+  if (!profile) return null;
+  if (!profile.exists) {
+    return (
+      <span
+        data-testid="browser-profile-absent"
+        className="text-[10px] font-mono text-white/35 shrink-0 hidden sm:inline"
+      >
+        No saved browser session
+      </span>
+    );
+  }
+  return (
+    <span className="flex items-center gap-1.5 shrink-0" data-testid="browser-profile-present">
+      <span className="text-[10px] font-mono text-white/40 hidden sm:inline">
+        Browser session · {formatBrowserProfileSize(profile.sizeMb)}
+      </span>
+      <button
+        type="button"
+        data-testid="browser-profile-clear"
+        onClick={onClear}
+        disabled={busy}
+        title="Clear the VM browser session (signs out everywhere in the VM browser)"
+        className="rounded px-1.5 py-0.5 text-[10px] font-medium text-white/45 hover:bg-white/10 hover:text-white/80 disabled:opacity-40"
+      >
+        {busy ? "Clearing…" : "Clear session"}
+      </button>
+    </span>
+  );
+}
+
 /** A run's frame-bearing SSE events carry their metadata under `data`. */
 function frameMeta(item: RunStreamItem): BrowserMeta | null {
   const payload = item.data as { data?: Partial<BrowserMeta> } | null;
@@ -242,6 +301,48 @@ export function BrowserView({ runId, presence }: BrowserViewProps) {
   const [navBusy, setNavBusy] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const blockedTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  // Persistent VM browser profile (desktop Chromium + headed Playwright MCP
+  // share /workspace/.swarm/browser-profile). Fetched once on mount — never
+  // polled — and refreshed after a clear. A failed fetch leaves the pill
+  // hidden rather than breaking the browser view.
+  const [profile, setProfile] = useState<BrowserProfileStatus | null>(null);
+  const [profileBusy, setProfileBusy] = useState(false);
+  const loadProfile = useCallback(async () => {
+    try {
+      const res = await fetch("/api/runtime/vm/browser-profile", { cache: "no-store" });
+      if (!res.ok) return;
+      const body = (await res.json().catch(() => null)) as BrowserProfileStatus | null;
+      if (body && typeof body.exists === "boolean" && typeof body.sizeMb === "number") {
+        setProfile(body);
+      }
+    } catch {
+      // Offline / signed out: no pill, no error noise.
+    }
+  }, []);
+  useEffect(() => {
+    void loadProfile();
+  }, [loadProfile]);
+
+  const clearProfile = useCallback(async () => {
+    if (profileBusy) return;
+    if (
+      !window.confirm(
+        "Clear the VM browser session? This signs you out of every site in the VM browser and cannot be undone.",
+      )
+    ) {
+      return;
+    }
+    setProfileBusy(true);
+    try {
+      const res = await fetch("/api/runtime/vm/browser-profile", { method: "DELETE" });
+      if (res.ok) await loadProfile();
+    } catch {
+      // Leave the stale pill up; the user can retry.
+    } finally {
+      setProfileBusy(false);
+    }
+  }, [profileBusy, loadProfile]);
 
   // Tick once a second so the "last updated" caption stays current.
   useEffect(() => {
@@ -390,6 +491,8 @@ export function BrowserView({ runId, presence }: BrowserViewProps) {
         >
           <ArrowRight className="w-4 h-4" />
         </button>
+
+        <BrowserProfilePill profile={profile} busy={profileBusy} onClear={() => void clearProfile()} />
 
         {frame.fetchedAt ? (
           <span className="text-[10px] font-mono text-white/35 shrink-0 hidden sm:inline">

@@ -204,6 +204,9 @@ test("headless browser roles get a real isolated Playwright MCP server", () => {
   assert.ok(browser.args.includes("--headless"));
   assert.ok(browser.args.includes("--isolated"));
   assert.ok(browser.args.includes("/usr/bin/chromium"));
+  // Headless runs stay on an ephemeral profile: no persistent user-data-dir,
+  // so one run's logins never leak into another run.
+  assert.ok(!browser.args.includes("--user-data-dir"));
   assert.equal(browser.args[0], "/workspace/.swarm/playwright-mcp-launcher.cjs");
 
   const implementer = BUILTIN_ROLES.find((role) => role.id === "implementer")!;
@@ -233,6 +236,7 @@ test("desktopMcpServerEntry produces concrete stdio entries for the desktop serv
     "/workspace/.swarm/playwright-mcp-launcher.cjs",
     "--browser", "chromium",
     "--executable-path", "/usr/bin/chromium",
+    "--user-data-dir", "/workspace/.swarm/browser-profile",
     "--no-sandbox",
     "--init-page", "/workspace/.swarm/playwright-policy.cjs",
   ]);

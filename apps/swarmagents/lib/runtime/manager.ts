@@ -170,12 +170,21 @@ import {
 } from "../verification/shadow-verifier";
 import { runDiffHygieneGate } from "../verification/diff-hygiene-gate";
 import { createBrowserControlBackend, runRepoBrowserGate } from "../verification/browser-gate";
+import {
+  ADVERSARIAL_QA_MAX_PROBE_BYTES,
+  ADVERSARIAL_QA_PROBE_TIMEOUT_MS,
+  adversarialQaAppUrl,
+  adversarialQaEnabled,
+  runAdversarialQa,
+  type AdversarialQaSummary,
+  type HttpTrace,
+} from "../verification/adversarial-qa";
 import { defaultOracleChecks, runOracleGate } from "../harness/oracle";
 import { deriveArtifactsFromEvents, diffWorkspaceLists, listWorkspaceFiles, mergeArtifacts } from "./run-report";
 import type { WorkspaceEntry } from "./run-report";
 import { getRunsDir } from "../telemetry/paths";
 import { readRunEvents } from "../telemetry/run-log";
-import { createCheapCallLLM } from "../verification/llm-caller";
+import { createCheapCallLLM, createAdversarialQaCallLLM } from "../verification/llm-caller";
 import { writeRunVerification } from "../verification/store";
 import { WORKSPACE_ROOT } from "../vm/files";
 import { applyWarmGoldenSnapshot, type HotspotHint } from "../vm/warm-snapshots";
@@ -273,6 +282,62 @@ export function mergeOracleSummary(
  */
 export function shouldBounceOnOracleRejection(rejected: boolean, attemptsUsed: number): boolean {
   return rejected && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS;
+}
+
+/**
+ * Whether an adversarial QA failure bounces the run back for another attempt.
+ * Bounded by the same round cap as the shadow gate.
+ */
+export function shouldBounceOnQaFailure(failed: boolean, attemptsUsed: number): boolean {
+  return failed && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS;
+}
+
+export function mergeQaSummary(
+  summary: ShadowVerificationSummary,
+  qa: AdversarialQaSummary,
+): ShadowVerificationSummary {
+  const passed = summary.passed && qa.passed;
+  return {
+    ...summary,
+    passed,
+    score: Math.min(summary.score, qa.score),
+    badge: passed ? summary.badge : "fail",
+    violations: [...summary.violations, ...qa.violations],
+    testsRan: summary.testsRan || qa.testsRan,
+    buildBroke: summary.buildBroke || qa.buildBroke,
+    // A failed QA carries its remediation prompt (findings + HTTP traces)
+    // as the bounce prompt, so the builder fixes what the live app
+    // showed. A passing QA must not override the shadow summary's own
+    // remediation.
+    ...(qa.passed || !qa.remediationPrompt ? {} : { remediationPrompt: qa.remediationPrompt }),
+  };
+}
+
+/**
+ * Read at most `maxBytes` of a probe response body and discard the rest.
+ * Traces carry status and latency, never bodies.
+ */
+async function readBoundedProbeBody(res: Response, maxBytes: number): Promise<number> {
+  if (!res.body) return 0;
+  const reader = res.body.getReader();
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total >= maxBytes) {
+        await reader.cancel().catch(() => {});
+        break;
+      }
+    }
+  } catch {
+    // A body read failure after headers arrived is not a probe failure;
+    // the status already arrived. Report the bytes read so far.
+  } finally {
+    reader.releaseLock();
+  }
+  return Math.min(total, maxBytes);
 }
 
 const SUMMARY_PROMPT_LEN = 300;
@@ -3842,6 +3907,89 @@ export class RuntimeManager {
     }
   }
 
+  /**
+   * Adversarial QA gate (master-plan PR 2.2), run just before a run would
+   * finalize. An independent QA role on a different model family probes
+   * the live app (HTTP traces + headed-browser screenshot) and judges it
+   * against the run's acceptance criteria — with no access to the
+   * builder's chat, diff, or run log.
+   *
+   * Returns undefined when the gate is disabled, no different-family
+   * provider is configured, or QA infrastructure failed: the run is never
+   * blocked by the QA gate itself, only by a QA verdict.
+   */
+  private async runPostRunQa(active: ActiveRun): Promise<AdversarialQaSummary | undefined> {
+    if (!adversarialQaEnabled()) return undefined;
+    const qa = createAdversarialQaCallLLM(active.userId, active.model, { signal: active.controller.signal });
+    if (!qa) return undefined;
+    const appUrl = adversarialQaAppUrl();
+    const log = (line: string) => {
+      try {
+        this.bus.publish(active.runId, { type: "log", data: line });
+      } catch {
+        // Swallowed: a logging failure is not a gate failure.
+      }
+    };
+    const fetchUrl = async (url: string): Promise<HttpTrace> => {
+      const started = Date.now();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), ADVERSARIAL_QA_PROBE_TIMEOUT_MS);
+      try {
+        const res = await fetch(url, { method: "GET", redirect: "follow", signal: controller.signal });
+        const bytes = await readBoundedProbeBody(res, ADVERSARIAL_QA_MAX_PROBE_BYTES);
+        return { label: "", url, method: "GET", status: res.status, ok: res.ok, latencyMs: Date.now() - started, bytes };
+      } catch (error) {
+        return {
+          label: "",
+          url,
+          method: "GET",
+          status: 0,
+          ok: false,
+          latencyMs: Date.now() - started,
+          bytes: 0,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    // Screenshot the live app in the run's headed browser. The navigation
+    // and frame publish to the run stream, so the screenshot is visible
+    // evidence in the run UI; the gate itself only keeps the label.
+    // Any failure degrades to traces-only QA, never blocks the run.
+    const screenshot = async (url: string): Promise<{ ok: true; label: string } | { ok: false; reason: string }> => {
+      try {
+        const browser = getBrowserManager();
+        const nav = await browser.navigate(active.runId, url);
+        if (!nav.ok) return { ok: false, reason: nav.reason };
+        const shot = await browser.screenshot(active.runId);
+        if (!shot.ok) return { ok: false, reason: shot.reason };
+        return { ok: true, label: `Live app screenshot (${shot.width}x${shot.height}, frame #${shot.frameId})` };
+      } catch (error) {
+        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+      }
+    };
+    try {
+      return await runAdversarialQa(
+        { callLLM: qa.callLLM, fetchUrl, screenshot, log },
+        {
+          acceptanceCriteria: active.prompt,
+          appUrl,
+          checks: [
+            { label: "app", url: appUrl },
+            { label: "health", url: `${appUrl}/api/health` },
+          ],
+          qaProvider: qa.provider,
+          qaModel: qa.model,
+          qaFamily: qa.family,
+          signal: active.controller.signal,
+        },
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
   private async runPostRunGate(
     active: ActiveRun,
     finishEvent: Extract<HarnessEvent, { type: "run.finished" }>,
@@ -3855,6 +4003,20 @@ export class RuntimeManager {
     // bounces: it finalizes with the fail badge.
     if (oracle && shouldBounceOnOracleRejection(oracle.rejected, active.shadowAttempts ?? 0)) {
       return { outcome: "bounce", summary: oracle.summary };
+    }
+    // Adversarial QA is the last gate before finalize: a QA failure
+    // bounces the run back with the findings + HTTP traces, bounded by
+    // the same round cap. A pass (or a skipped gate) merges into the
+    // verification badge the run finalizes with.
+    const qa = await this.runPostRunQa(active);
+    if (qa) {
+      if (shouldBounceOnQaFailure(!qa.passed, active.shadowAttempts ?? 0)) {
+        const summary = oracle?.summary ? mergeQaSummary(oracle.summary, qa) : qa;
+        return { outcome: "bounce", summary };
+      }
+      const summary = oracle?.summary ? mergeQaSummary(oracle.summary, qa) : qa;
+      this.finalizeFinished(active, finishEvent, summary);
+      return { outcome: "finalized" };
     }
     this.finalizeFinished(active, finishEvent, oracle?.summary);
     return { outcome: "finalized" };
@@ -3980,6 +4142,15 @@ export class RuntimeManager {
       const oracle = await this.runPostRunOracle(active);
       if (oracle) {
         summary = mergeOracleSummary(summary, oracle.summary);
+      }
+      // Adversarial QA is the last gate: a different-family QA role
+      // probes the live app and judges it against the acceptance
+      // criteria. A failure merges into the summary, and the existing
+      // bounded bounce check below sends the run back with the findings
+      // + HTTP traces. A skipped gate changes nothing.
+      const qa = await this.runPostRunQa(active);
+      if (qa) {
+        summary = mergeQaSummary(summary, qa);
       }
       if (!summary.passed && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS) {
         return { outcome: "bounce", summary };

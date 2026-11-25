@@ -413,6 +413,7 @@ export default function App() {
         onOpenSettings={() => openSettings("providers")}
         settingsNeedsAttention={providerStatus.state === "missing"}
         onOpenShortcuts={() => setShortcutsOpen(true)}
+        user={me}
       />
 
       {session.offline && !session.signedOut && (

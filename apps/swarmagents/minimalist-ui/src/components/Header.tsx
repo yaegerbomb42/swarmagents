@@ -99,6 +99,8 @@ export interface HeaderProps {
   settingsNeedsAttention: boolean;
   /** Opens the keyboard-shortcuts help panel. */
   onOpenShortcuts: () => void;
+  /** Optional authenticated user summary for top-right Sign in / Account pill. */
+  user?: { email?: string | null; name?: string | null } | null;
 }
 
 export function Header({
@@ -114,6 +116,7 @@ export function Header({
   onOpenSettings,
   settingsNeedsAttention,
   onOpenShortcuts,
+  user,
 }: HeaderProps) {
   return (
     <header className="glass shrink-0 hair-b relative z-30" data-testid="workspace-header">
@@ -196,6 +199,24 @@ export function Header({
           >
             <SettingsIcon className="h-4 w-4" aria-hidden />
           </IconButton>
+          {user ? (
+            <Link
+              href="/login"
+              data-testid="header-account"
+              title={user.email || user.name || "Account"}
+              className="press hidden sm:flex h-9 max-w-[140px] items-center rounded-xl hair bg-white/[0.06] px-3 text-xs font-medium text-[var(--fg)] transition-colors hover:bg-white/[0.12]"
+            >
+              <span className="truncate">{user.name || user.email || "Account"}</span>
+            </Link>
+          ) : (
+            <Link
+              href="/login"
+              data-testid="header-sign-in"
+              className="press flex h-9 items-center rounded-xl hair bg-white/[0.08] px-3 text-xs font-medium text-[var(--fg)] transition-colors hover:bg-white/[0.14]"
+            >
+              Sign in
+            </Link>
+          )}
         </div>
       </div>
 

@@ -296,6 +296,11 @@ export function roleMcpConfigJson(
      * route from the run's ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN env.
      */
     webSearchUrl?: string;
+    /**
+     * Full host connector-enable URL (run token included) for the tool-forge
+     * server's env. Optional: when unset, the in-VM server explains /connectors.
+     */
+    connectorEnableUrl?: string;
   },
 ): string {
   const servers: Record<string, unknown> = {
@@ -342,7 +347,10 @@ export function roleMcpConfigJson(
       type: "stdio",
       command: "node",
       args: [TOOL_FORGE_MCP_SERVER_PATH],
-      env: { SWARM_TOOL_CATALOG: TOOL_FORGE_CATALOG_PATH },
+      env: {
+        SWARM_TOOL_CATALOG: TOOL_FORGE_CATALOG_PATH,
+        ...(opts.connectorEnableUrl ? { SWARM_CONNECTOR_ENABLE_URL: opts.connectorEnableUrl } : {}),
+      },
     },
   };
   // The capability-atlas server is opt-in. The registry path is the
@@ -450,6 +458,8 @@ export function roleSeedFiles(
     extraMcpServers?: Record<string, unknown>;
     atlasEnabled?: boolean;
     atlasRegistryPath?: string;
+    webSearchUrl?: string;
+    connectorEnableUrl?: string;
   } = {},
 ): Array<{ path: string; content: string }> {
   const phase = initialPhase ?? rolePhase(catalog[0] ?? BUILTIN_ROLES[0], opts);

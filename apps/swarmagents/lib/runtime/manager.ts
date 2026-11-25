@@ -28,6 +28,7 @@ import { ClaudeCodeRunner, isSignalKillExitCode } from "../harness/runner";
 import { contextPackerFromEnv, type StateLedgerSnapshot } from "../harness/context/contextGovernor";
 import type { SourceFile, WorkingSetItem } from "../harness/context/astSlicer";
 import { roleMaxTurns } from "../harness/role-clamps";
+import { TrajectoryOptimizer } from "../harness/context/trajectory-manager";
 import { makeRedactor } from "../harness/redact";
 import type { BrainEvent } from "../harness/decision-brain/index";
 import type {
@@ -53,6 +54,7 @@ import { routerProviders, userCooldownFilePath, userProvidersSignature } from ".
 import { isAnthropicStyle } from "../providers/adapters";
 import {
   atlasEnabledForUser,
+  autoCondenseLogsFor,
   contextPackerModeFor,
   keySelectionModeFor,
   readUserSettings,
@@ -167,6 +169,7 @@ import {
   type ShadowVerificationSummary,
 } from "../verification/shadow-verifier";
 import { runDiffHygieneGate } from "../verification/diff-hygiene-gate";
+import { createBrowserControlBackend, runRepoBrowserGate } from "../verification/browser-gate";
 import { defaultOracleChecks, runOracleGate } from "../harness/oracle";
 import { deriveArtifactsFromEvents, diffWorkspaceLists, listWorkspaceFiles, mergeArtifacts } from "./run-report";
 import type { WorkspaceEntry } from "./run-report";
@@ -207,6 +210,39 @@ export function isRunProviderPoolEnabled(env: Record<string, string | undefined>
 export function isOraclePostRunEnabled(env: Record<string, string | undefined> = process.env): boolean {
   const value = env.SWARM_ORACLE_POST_RUN?.trim().toLowerCase();
   return value === "1" || value === "true";
+}
+
+/** Max auto-resume phases for a max-turns run (bounded continuation). */
+export const MAX_CONTINUATION_PHASES = 5;
+
+/** Bounded L1 token budget for a continuation packet. */
+export const CONTINUATION_PACKET_BUDGET = {
+  total: 8192,
+  ledger: 2048,
+  skeleton: 1024,
+  workingSet: 2048,
+  reserve: 3072,
+  outputBuffer: 512,
+};
+
+/** True when the run should auto-continue after hitting max_turns. */
+export function shouldAutoContinue(
+  reason: string | undefined,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (reason !== "max_turns") return false;
+  return autoContinueEnabled(env);
+}
+
+/**
+ * True when auto-continuation is enabled via env (`SWARM_AUTO_CONTINUE`
+ * or `SWARM_ALWAYS_ON_247`). Used to decide whether run.finished is deferred
+ * so a max-turns finish can be auto-resumed cleanly.
+ */
+export function autoContinueEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const auto = env.SWARM_AUTO_CONTINUE?.trim().toLowerCase();
+  const on247 = env.SWARM_ALWAYS_ON_247?.trim().toLowerCase();
+  return auto === "1" || auto === "true" || on247 === "1" || on247 === "true";
 }
 
 export function mergeOracleSummary(
@@ -477,6 +513,10 @@ interface ActiveRun {
    */
   stateLedger?: StateLedgerSnapshot;
   editedFiles?: string[];
+  /** Signed per-run token minted for VM-facing runtime endpoints. */
+  runToken?: string;
+  /** Signed per-run connector-enable URL for the in-VM tool-forge. */
+  connectorEnableUrl?: string;
   /** Provider serving the run, from the router selection. */
   provider?: string;
   model?: string;
@@ -542,6 +582,8 @@ interface ActiveRun {
   turnCheckpointInFlight?: boolean;
   /** Watchdog recoveries already spent on this run (bounded; see maxRecoveryAttempts). */
   recoveryAttempts?: number;
+  /** Auto-continuation phases already run for this run (bounded, max MAX_CONTINUATION_PHASES). */
+  continuationPhases?: number;
   /**
    * Set only by the shutdown path for a run with a recorded resume point:
    * the exec is aborted so the process can exit, but the run must NOT be
@@ -1972,6 +2014,7 @@ export class RuntimeManager {
     initialPhase: RolePhase,
     extraMcpServers: Record<string, unknown>,
     mode?: RunModeInfo,
+    connectorEnableUrl?: string,
   ): Promise<void> {
     const gui = mode === undefined || mode.mode === "gui";
     const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
@@ -1993,6 +2036,7 @@ export class RuntimeManager {
       extraMcpServers,
       atlasEnabled: useAtlas,
       ...(useAtlas ? { atlasRegistryPath: VM_ATLAS_REGISTRY_PATH } : {}),
+      ...(connectorEnableUrl ? { connectorEnableUrl } : {}),
     })) {
       await this.vm.writeFile(userId, file.path, file.content);
     }
@@ -2015,6 +2059,7 @@ export class RuntimeManager {
     extraMcpServers: Record<string, unknown>,
     mode?: RunModeInfo,
     restrictTools?: readonly string[],
+    connectorEnableUrl?: string,
   ): Promise<void> {
     const gui = mode === undefined || mode.mode === "gui";
     const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
@@ -2029,6 +2074,7 @@ export class RuntimeManager {
         extraMcpServers,
         atlasEnabled: useAtlas,
         ...(useAtlas ? { atlasRegistryPath: VM_ATLAS_REGISTRY_PATH } : {}),
+        ...(connectorEnableUrl ? { connectorEnableUrl } : {}),
       }),
     );
   }
@@ -3129,6 +3175,21 @@ export class RuntimeManager {
     const initialPhase = active.role
       ? this.rolePhaseFor(active.role, libraryPermissions, active.runMode, active.toolAllowlist, useAtlas)
       : this.defaultRolePhase(libraryPermissions, active.runMode, active.toolAllowlist, useAtlas);
+    const llmBaseUrlForRun = resolveLlmBaseUrl();
+    const approvalBaseUrlForRun = resolveApprovalBaseUrl();
+    if ((llmBaseUrlForRun || approvalBaseUrlForRun) && !active.runToken) {
+      try {
+        active.runToken = signRunToken(userId, runId);
+      } catch {
+        active.runToken = undefined;
+      }
+    }
+    if (active.runToken) {
+      const connectorBase = approvalBaseUrlForRun || llmBaseUrlForRun;
+      if (connectorBase) {
+        active.connectorEnableUrl = `${connectorBase}/api/runtime/connectors/${active.runToken}/enable`;
+      }
+    }
     try {
       await this.seedRoleFiles(
         userId,
@@ -3137,6 +3198,7 @@ export class RuntimeManager {
         initialPhase,
         libraryServers,
         active.runMode,
+        active.connectorEnableUrl,
       );
     } catch (error) {
       const message = redact(error instanceof Error ? error.message : String(error));
@@ -3160,7 +3222,9 @@ export class RuntimeManager {
     // Keep the pre-run listing only when the opt-in Oracle gate needs it. The
     // report artifact diff is more precise than a whole-repository git diff,
     // which could otherwise pick up a user's pre-existing workspace changes.
-    if (isOraclePostRunEnabled()) active.oracleStartListing = await listWorkspaceFiles(this.vm, userId);
+    if (isOraclePostRunEnabled() || userSettings.oraclePostRun === true) {
+      active.oracleStartListing = await listWorkspaceFiles(this.vm, userId);
+    }
 
     // Phase loop: each role switch continues the same conversation (--resume)
     // with the new role's phase. The provider failover loop runs per phase.
@@ -3194,6 +3258,7 @@ export class RuntimeManager {
           libraryMcpEntries(userId),
           active.runMode,
           active.toolAllowlist,
+          active.connectorEnableUrl,
         );
       } catch (error) {
         const message = redact(error instanceof Error ? error.message : String(error));
@@ -3226,19 +3291,29 @@ export class RuntimeManager {
     // finalizes (revoked in finalize). Local Docker runs have already passed
     // startup validation; other runtimes retain the legacy stdout gate when
     // no signing secret is configured.
-    let runToken: string | null = null;
-    if (llmBaseUrl || approvalBaseUrl) {
+    let runToken: string | null = active.runToken ?? null;
+    if (!runToken && (llmBaseUrl || approvalBaseUrl)) {
       try {
         runToken = signRunToken(userId, runId);
+        active.runToken = runToken;
       } catch {
         runToken = null;
+      }
+    }
+    if (runToken && !active.connectorEnableUrl) {
+      const connectorBase = approvalBaseUrl || llmBaseUrl;
+      if (connectorBase) {
+        active.connectorEnableUrl = `${connectorBase}/api/runtime/connectors/${runToken}/enable`;
       }
     }
     const hookBaseUrl = approvalBaseUrl && runToken ? approvalBaseUrl : null;
     const approvalEnv = hookBaseUrl && runToken ? approvalHookEnv(hookBaseUrl, runToken) : {};
     const approvalHook = Object.keys(approvalEnv).length > 0;
     const verificationEnabled = isShadowVerificationEnabled();
-    const postRunGateEnabled = verificationEnabled || isOraclePostRunEnabled();
+    // The Oracle gate runs when the env switch is on or the account opted in
+    // through Settings (oraclePostRun).
+    const oraclePostRun = isOraclePostRunEnabled() || readUserSettings(userId).oraclePostRun === true;
+    const postRunGateEnabled = verificationEnabled || oraclePostRun;
 
     if (isRunProviderPoolEnabled()) {
       if (!router) {
@@ -3483,6 +3558,7 @@ export class RuntimeManager {
     const { runId, userId } = active;
     while (true) {
       let finishEvent: Extract<HarnessEvent, { type: "run.finished" }> | null = null;
+      let finishReason: string | undefined;
       const errors: Extract<HarnessEvent, { type: "run.error" }>[] = [];
       let roleSwitch: RunOutcome["roleSwitch"];
       let aborted = false;
@@ -3510,7 +3586,9 @@ export class RuntimeManager {
           selection,
           phase,
           options.approvalHook,
-          options.verificationEnabled,
+          // Defer finalization when post-run gate is active or auto-continue
+          // is enabled (so a max-turns finish can resume instead of committing).
+          options.postRunGateEnabled || autoContinueEnabled(),
         );
         if (run.outcome.roleSwitch) {
           roleSwitch = run.outcome.roleSwitch;
@@ -3529,6 +3607,7 @@ export class RuntimeManager {
           return { status: "error", message: run.attemptError.message };
         }
         finishEvent = run.finishEvent;
+        finishReason = run.finishEvent?.reason;
         return { status: "done", sessionId: run.finishEvent?.sessionId };
       });
 
@@ -3555,7 +3634,29 @@ export class RuntimeManager {
         return { switched: false };
       }
       active.sessionId = result.sessionId ?? active.sessionId;
-      if (!options.postRunGateEnabled || !finishEvent) return { switched: false };
+      if (
+        shouldAutoContinue(finishReason) &&
+        (active.continuationPhases ?? 0) < MAX_CONTINUATION_PHASES &&
+        this.isStillActive(active)
+      ) {
+        active.continuationPhases = (active.continuationPhases ?? 0) + 1;
+        this.bus.publish(runId, {
+          type: "run.continued",
+          data: { phase: active.continuationPhases, reason: finishReason },
+        });
+        const optimizer = new TrajectoryOptimizer(active.prompt);
+        optimizer.recordTurn({
+          stepSummary: `Phase ${active.continuationPhases} ended at the turn ceiling; resuming with reduced context.`,
+        });
+        const packet = optimizer.buildContinuationPacket({ budget: CONTINUATION_PACKET_BUDGET });
+        active.prompt = `${active.prompt}\n\n${packet.prompt}`;
+        if (active.maxTurns !== undefined) active.maxTurns = active.maxTurns * 2;
+        continue;
+      }
+      if (!options.postRunGateEnabled || !finishEvent) {
+        if (finishEvent) this.finalizeFinished(active, finishEvent, undefined);
+        return { switched: false };
+      }
       const gate = await this.runPostRunGate(active, finishEvent, options.verificationEnabled);
       if (gate.outcome === "finalized") return { switched: false };
       active.prompt = bounceRemediationPrompt(gate.summary);
@@ -3629,7 +3730,7 @@ export class RuntimeManager {
   private async runPostRunOracle(
     active: ActiveRun,
   ): Promise<{ summary: ShadowVerificationSummary; rejected: boolean } | undefined> {
-    if (!isOraclePostRunEnabled()) return undefined;
+    if (!isOraclePostRunEnabled() && readUserSettings(active.userId).oraclePostRun !== true) return undefined;
     let isolatedRoot: string | undefined;
     let worktreeGitRoot: string | undefined;
     const exec = this.shadowExecFor(active.userId);
@@ -3864,6 +3965,18 @@ export class RuntimeManager {
       } catch {
         // Gate plumbing failed — finalize with the passing shadow summary.
       }
+      const browserGateSummary = await runRepoBrowserGate(
+        deps.exec,
+        plan.repoRoot,
+        () => createBrowserControlBackend(getBrowserManager(), `${active.runId}-gate`),
+        process.env.SWARM_BROWSER_GATE_URL,
+      );
+      if (browserGateSummary) {
+        summary = mergeOracleSummary(summary, browserGateSummary);
+        if (!summary.passed && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS) {
+          return { outcome: "bounce", summary };
+        }
+      }
       const oracle = await this.runPostRunOracle(active);
       if (oracle) {
         summary = mergeOracleSummary(summary, oracle.summary);
@@ -4004,6 +4117,7 @@ export class RuntimeManager {
     const currentSettings = readUserSettings(userId);
     const systemPacker = systemPackerOptionsFor(currentSettings);
     const contextPacker = contextPackerModeFor(currentSettings);
+    const autoCondenseLogs = autoCondenseLogsFor(currentSettings);
     const useAtlas = atlasEnabled() || atlasEnabledForUser(currentSettings);
 
     // Wall-clock timeout (SWARM_RUN_TIMEOUT_SEC): aborting the controller
@@ -4044,6 +4158,7 @@ export class RuntimeManager {
           memoryContext: active.memoryContext,
           systemPacker,
           ...(contextPacker === "l1" ? { contextPacker: "l1" as const } : {}),
+          ...(autoCondenseLogs ? { autoCondenseLogs: true } : {}),
           ...(active.stateLedger ? { stateLedger: active.stateLedger } : {}),
           ...(l1Files ?? {}),
           sessionId,

@@ -12,7 +12,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultOracleChecks, OracleGate, runOracleGate, type OracleCheck } from "./oracle";
+import { defaultOracleChecks, OracleGate, runBestOfNOracle, runOracleGate, type OracleCheck } from "./oracle";
 import { countChurn, parsePatchFiles, unsafePatchPaths, type PatchFile } from "./diff";
 import { findAffectedTests, relativeImports, resolveSpecifier, TRANSITIVE_HOPS } from "./affected";
 import { buildRetryContext, diagnosticSymbols, extractDiagnostic, findDefinition } from "./retry";
@@ -161,6 +161,99 @@ test("acceptance: a seeded broken patch never lands; log says 'oracle: 2/3 candi
     // Scratch worktrees are gone.
     assert.equal(git(repo, "worktree", "list").trim().split("\n").length, 1);
     for (const line of logs) console.log(line);
+  } finally {
+    cleanup();
+  }
+});
+
+test("runBestOfNOracle lands only the passing candidate and logs 'oracle: 2/3 candidates rejected'", { timeout: 120_000 }, async () => {
+  assert.ok(existsSync(TSC) && existsSync(TSX), "typescript and tsx must be installed");
+  const { root, repo, cleanup } = makeRepo();
+  try {
+    // Three model-family candidates: a type error, a test-breaking logic
+    // error, and one that compiles and keeps the tests green.
+    const typeError = diffFor(repo, { "app/src/math.ts": MATH.replace("return a + b;", 'return `${a}${b}`;') });
+    const brokenLogic = diffFor(repo, { "app/src/math.ts": MATH.replace("a + b", "a - b") });
+    const good = diffFor(repo, {
+      "app/src/math.ts": MATH + "export function mul(a: number, b: number): number {\n  return a * b;\n}\n",
+      "app/src/mul.test.ts":
+        'import test from "node:test";\nimport assert from "node:assert/strict";\nimport { mul } from "./math";\n\ntest("mul", () => {\n  assert.equal(mul(2, 3), 6);\n});\n',
+    });
+    assert.ok(typeError && brokenLogic && good);
+
+    const logs: string[] = [];
+    const report = await runBestOfNOracle(
+      [
+        { id: "family-a", diff: typeError },
+        { id: "family-b", diff: brokenLogic },
+        { id: "family-c", diff: good },
+      ],
+      {
+        exec: localExec,
+        repoRoot: repo,
+        projectDir: "app",
+        // Production defaults to defaultOracleChecks(); the lint step is a
+        // stand-in here for the same reason as the gate's acceptance test.
+        checks: CHECKS,
+        scratchRoot: join(root, "scratch"),
+        log: (l) => logs.push(l),
+      },
+    );
+
+    assert.ok(
+      logs.some((line) => /^oracle: 2\/3 candidates rejected/.test(line)),
+      logs.join("\n"),
+    );
+    assert.equal(report.total, 3);
+    assert.equal(report.rejected, 2);
+    assert.deepEqual(report.landed, ["family-c"]);
+    assert.deepEqual(
+      report.verdicts.map((v) => `${v.id}:${v.status}`),
+      ["family-a:rejected", "family-b:rejected", "family-c:passed"],
+    );
+
+    // Only the passing patch reached the real tree; the failed ones are evicted.
+    const math = readFileSync(join(repo, "app/src/math.ts"), "utf8");
+    assert.match(math, /return a \+ b;/);
+    assert.match(math, /export function mul/);
+    assert.doesNotMatch(math, /a - b|\$\{a\}\$\{b\}/);
+    assert.ok(existsSync(join(repo, "app/src/mul.test.ts")));
+
+    // Every scratch worktree is gone.
+    assert.equal(git(repo, "worktree", "list").trim().split("\n").length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("runBestOfNOracle lands the first passing candidate in input order, not the smallest", { timeout: 120_000 }, async () => {
+  const { root, repo, cleanup } = makeRepo();
+  try {
+    // Both pass; the first one listed must win even though the second is a
+    // smaller change (churn order belongs to the gate's "best" mode).
+    const first = diffFor(repo, {
+      "app/src/math.ts": MATH + "export function sub(a: number, b: number): number {\n  return a - b;\n}\n",
+      "app/src/sub.test.ts":
+        'import test from "node:test";\nimport assert from "node:assert/strict";\nimport { sub } from "./math";\n\ntest("sub", () => {\n  assert.equal(sub(5, 3), 2);\n});\n',
+    });
+    const second = diffFor(repo, { "app/src/math.ts": MATH + "export const two = 2;\n" });
+
+    const report = await runBestOfNOracle(
+      [
+        { id: "first", diff: first },
+        { id: "second", diff: second },
+      ],
+      { exec: localExec, repoRoot: repo, projectDir: "app", checks: CHECKS, scratchRoot: join(root, "scratch") },
+    );
+
+    assert.deepEqual(report.landed, ["first"]);
+    assert.equal(report.rejected, 0);
+    const secondVerdict = report.verdicts[1];
+    assert.equal(secondVerdict.status, "passed");
+    assert.equal(secondVerdict.status === "passed" && secondVerdict.landed, false);
+    assert.match(secondVerdict.status === "passed" ? secondVerdict.note ?? "" : "", /passed first/);
+    assert.match(readFileSync(join(repo, "app/src/math.ts"), "utf8"), /export function sub/);
+    assert.doesNotMatch(readFileSync(join(repo, "app/src/math.ts"), "utf8"), /export const two = 2;/);
   } finally {
     cleanup();
   }

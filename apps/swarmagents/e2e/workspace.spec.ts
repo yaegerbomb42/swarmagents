@@ -185,8 +185,13 @@ test("flow A: Stop ends the run from every view, even when pressed before the se
     // before the server has created the run, it still stops that run.
     await sendMessage(page, prompt);
     await page.getByTestId("stop-run").click();
-    // Turns only render in the chat view; the run plays on the screen.
+    // Turns only render in the chat view; if the active-run effect opens the
+    // screen right as the run lands, click chat again once it settles.
     await page.getByTestId("view-chat").click();
+    await page.waitForTimeout(300);
+    if (!(await page.getByTestId("conversation-log").isVisible().catch(() => false))) {
+      await page.getByTestId("view-chat").click();
+    }
     await waitForLastTurn(page, "cancelled", 30_000);
     await page.waitForFunction(NO_STOP_BUTTON, undefined, { timeout: 15_000 });
 

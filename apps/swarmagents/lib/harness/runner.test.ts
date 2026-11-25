@@ -1931,3 +1931,59 @@ test("run detaches the request-signal abort listener once the run settles", asyn
   assert.equal(added.length, 1, "the run registers one abort listener");
   assert.deepEqual(removed, added, "the listener is detached once the run settles");
 });
+
+test("autoCondenseLogs filters oversized tool.result logs via observation-filter while redacting secrets first", async () => {
+  const passingLines = Array.from({ length: 180 }, (_, i) => `  ✓ passing check ${i} ok (2 ms)`).join("\n");
+  const bigTestOutput = [
+    "FAIL src/auth.test.ts",
+    passingLines,
+    "  ● Auth › rejects invalid token",
+    "    Expected: 401",
+    "    Received: 200",
+    `    token=${SECRET_TOKEN}`,
+    "Tests:       1 failed, 180 passed, 181 total",
+  ].join("\n");
+  assert.ok(bigTestOutput.length > 4000);
+
+  const lines = [
+    JSON.stringify(INIT),
+    JSON.stringify({
+      type: "assistant",
+      message: { id: "m_bash", content: [{ type: "tool_use", id: "toolu_big", name: "Bash", input: { command: "npx jest src/auth.test.ts" } }] },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "toolu_big", content: bigTestOutput, is_error: true }],
+      },
+    }),
+    JSON.stringify(RESULT),
+  ];
+
+  // Off by default: raw output passes through untouched (still redacted).
+  const offEvents: TelemetryEvent[] = [];
+  await new ClaudeCodeRunner({ bin: "claude" }).run(
+    { prompt: "test", env: {}, vm: new ScriptedVm([{ chunks: [lines.join("\n") + "\n"] }]) },
+    (e) => offEvents.push(e),
+  );
+  const offResult = offEvents.find((e): e is Extract<TelemetryEvent, { type: "tool.result" }> => e.type === "tool.result");
+  assert.ok(offResult);
+  assert.ok(offResult.output.includes("passing check 0 ok"));
+  assert.ok(!offResult.output.includes(SECRET_TOKEN));
+
+  // Enabled: observation filter collapses passing lines and preserves failure + redaction.
+  const onEvents: TelemetryEvent[] = [];
+  await new ClaudeCodeRunner({ bin: "claude" }).run(
+    { prompt: "test", env: {}, autoCondenseLogs: true, vm: new ScriptedVm([{ chunks: [lines.join("\n") + "\n"] }]) },
+    (e) => onEvents.push(e),
+  );
+  const onResult = onEvents.find((e): e is Extract<TelemetryEvent, { type: "tool.result" }> => e.type === "tool.result");
+  assert.ok(onResult);
+  assert.ok(onResult.output.length < offResult.output.length);
+  assert.ok(!onResult.output.includes("passing check 0 ok"));
+  assert.match(onResult.output, /rejects invalid token/);
+  assert.match(onResult.output, /Expected: 401/);
+  assert.ok(!onResult.output.includes(SECRET_TOKEN));
+  assert.ok(onResult.output.includes("[REDACTED]"));
+});

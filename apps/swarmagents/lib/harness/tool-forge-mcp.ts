@@ -1,7 +1,7 @@
 /**
  * In-VM Tool Forge MCP server (lib/harness/tool-forge-mcp.ts).
  *
- * Exposes four token-frugal tools inside every user VM:
+ * Exposes seven token-frugal tools inside every user VM:
  *   - search_mcp_catalog(query, limit) — searches the compact connector catalog
  *   - search_online_skills(query, source, limit) — searches 900+ online SKILL.md repos
  *   - install_online_skill(id) — installs an online SKILL.md into /workspace/.claude/skills
@@ -9,6 +9,7 @@
  *     secret-scans, syntax-checks, smoke-tests, and registers custom tools/MCPs
  *   - list_my_tools() — lists custom tools and active VM MCP servers
  *   - manage_mcp(action, id) — inspect, enable, or disable custom MCP tools
+ *   - enable_connector(connectorId) — activates a zero-key catalog connector mid-run
  *
  * Dependency-free (Node builtins only) so it runs inside any VM container or host.
  */
@@ -31,6 +32,7 @@ const CUSTOM_DIR = process.env.SWARM_CUSTOM_TOOLS_DIR || ${JSON.stringify(TOOL_F
 const MANIFEST_PATH = path.join(CUSTOM_DIR, "manifest.json");
 const MCP_CONFIG_PATH = process.env.SWARM_MCP_CONFIG || "/workspace/.swarm/mcp.json";
 const ATLAS_PATH = process.env.SWARM_ATLAS_REGISTRY || "/workspace/.swarm/atlas/registry.json";
+const CONNECTOR_ENABLE_URL = process.env.SWARM_CONNECTOR_ENABLE_URL || "";
 
 const SLUG_RE = /^[a-z0-9][a-z0-9_-]{1,48}$/;
 const MAX_CODE_BYTES = 64 * 1024;
@@ -264,6 +266,33 @@ function manageMcp(args) {
   return { ok: false, message: "action must be inspect, enable, or disable." };
 }
 
+async function enableConnector(args) {
+  const connectorId = String(args.connectorId || "").trim();
+  if (!connectorId) return { ok: false, message: "connectorId is required." };
+  if (!CONNECTOR_ENABLE_URL) {
+    return {
+      ok: false,
+      message: "In-run connector activation is unavailable. Configure connectors in /connectors.",
+    };
+  }
+  try {
+    const res = await fetch(CONNECTOR_ENABLE_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ connectorId }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data || data.ok !== true) {
+      const errMsg = data && typeof data.error === "string" ? data.error : "Connector enable failed (" + res.status + ").";
+      return { ok: false, message: errMsg };
+    }
+    const name = data.connector && data.connector.name ? data.connector.name : connectorId;
+    return { ok: true, text: "Connector '" + name + "' enabled for this account. MCP config refreshed." };
+  } catch (err) {
+    return { ok: false, message: "Connector enable request failed: " + String(err && err.message ? err.message : err) };
+  }
+}
+
 const TOOLS = [
   {
     name: "search_mcp_catalog",
@@ -332,6 +361,17 @@ const TOOLS = [
         id: { type: "string" },
       },
       required: ["action", "id"],
+    },
+  },
+  {
+    name: "enable_connector",
+    description: "Enable a zero-key connector from the Swarm connector catalog for this account mid-run. Keyed connectors must be configured in /connectors.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        connectorId: { type: "string", description: "Connector catalog id (e.g. exa, sqlite-read-only)." },
+      },
+      required: ["connectorId"],
     },
   },
 ];
@@ -510,6 +550,12 @@ async function handleMessage(msg) {
     else sendError(id, -32602, out.message);
     return;
   }
+  if (params.name === "enable_connector") {
+    const out = await enableConnector(args);
+    if (out.ok) sendResult(id, out.text);
+    else sendError(id, -32602, out.message);
+    return;
+  }
   sendError(id, -32602, "unknown tool: " + String(params.name));
 }
 
@@ -517,7 +563,7 @@ const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on("line", (line) => {
   if (!line.trim()) return;
   try {
-    void handleMessage(JSON.parse(line));
+    void handleMessage(JSON.parse(line)).catch(() => {});
   } catch {
     // ignore malformed json lines
   }

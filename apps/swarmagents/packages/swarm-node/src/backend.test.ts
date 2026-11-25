@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ContainerBackend, HostBackend, NODE_DESKTOP_PORT, sanitizeUserId } from "./backend";
+import { ContainerBackend, HostBackend, NODE_DESKTOP_PORT, runCommand, sanitizeUserId } from "./backend";
 
 function tempRoot(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "swarm-node-backend-"));
@@ -75,6 +75,44 @@ test("container backend: the sandbox is hardened and the desktop stays on loopba
   // The workspace is a volume, never a host bind mount.
   assert.ok(args.includes("/workspace"));
   assert.ok(!args.includes(":rw"));
+});
+
+test("runCommand: aborting the signal kills the child and rejects fast", async () => {
+  const controller = new AbortController();
+  const started = Date.now();
+  const pending = runCommand(process.execPath, ["-e", "setTimeout(() => {}, 30_000)"], {
+    signal: controller.signal,
+  });
+  // Let the child spawn, then abort: the run must end in milliseconds,
+  // not when the 30s sleep would have finished.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  controller.abort();
+  await assert.rejects(() => pending, /aborted/i);
+  assert.ok(Date.now() - started < 10_000, "abort took too long");
+});
+
+test("runCommand: an already-aborted signal rejects without spawning", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    () => runCommand(process.execPath, ["-e", "process.exit(0)"], { signal: controller.signal }),
+    /aborted/i,
+  );
+});
+
+test("host backend: exec honours the abort signal", async () => {
+  const root = tempRoot();
+  const backend = new HostBackend({ root });
+  await backend.ensure("alice");
+  const controller = new AbortController();
+  const started = Date.now();
+  const pending = backend.exec("alice", [process.execPath, "-e", "setTimeout(() => {}, 30_000)"], {
+    signal: controller.signal,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  controller.abort();
+  await assert.rejects(() => pending, /aborted/i);
+  assert.ok(Date.now() - started < 10_000, "abort took too long");
 });
 
 test("container backend: user ids cannot inject docker flags", () => {

@@ -71,7 +71,7 @@ test("tool-forge MCP server searches catalog, authors + smoke-tests a custom too
       .split("\n")
       .map((line) => JSON.parse(line) as { id: number; error?: { message?: string }; result?: { content?: Array<{ text: string }>; tools?: unknown[] } });
 
-    assert.equal(replies.find((r) => r.id === 2)?.result?.tools?.length, 6);
+    assert.equal(replies.find((r) => r.id === 2)?.result?.tools?.length, 7);
     assert.match(replies.find((r) => r.id === 3)?.result?.content?.[0]?.text ?? "", /slack \|/);
     assert.match(replies.find((r) => r.id === 4)?.result?.content?.[0]?.text ?? "", /HELLO/);
     assert.match(replies.find((r) => r.id === 5)?.result?.content?.[0]?.text ?? "", /disabled/);

@@ -62,7 +62,16 @@ export type TelemetryEvent =
   | { type: "tool.started"; name: string; id?: string }
   | { type: "tool.result"; id?: string; ok: boolean; truncated: boolean; output: string }
   | { type: "usage"; inputTokens: number; outputTokens: number; cachedTokens?: number; model?: string }
-  | { type: "run.finished"; exitCode: number; sessionId: string; costUsd?: number; durationMs?: number; numTurns?: number }
+  | {
+      type: "run.finished";
+      exitCode: number;
+      sessionId: string;
+      costUsd?: number;
+      durationMs?: number;
+      numTurns?: number;
+      /** Why the invocation ended (e.g. "max_turns" when the turn ceiling was hit). */
+      reason?: string;
+    }
   | { type: "run.error"; message: string; exitCode?: number; sessionId?: string }
   /**
    * Emitted when a tool call classifies as "ask": the run pauses until the
@@ -443,6 +452,12 @@ export interface RunRequest {
   /** Resume a prior session instead of starting fresh (passed as --resume). */
   sessionId?: string;
   model?: string;
+  /**
+   * Filter/condense oversized `tool.result` output (> 4000 chars) via
+   * `filterObservation` (lib/harness/observation-filter.ts) before emitting/storing.
+   * Disabled by default; runtime fills this from the account's settings.
+   */
+  autoCondenseLogs?: boolean;
   /**
    * Turn ceiling for this invocation, passed to claude as `--max-turns`.
    * The runner caps it at SWARM_MAX_TURNS (see resolveMaxTurns). Absent

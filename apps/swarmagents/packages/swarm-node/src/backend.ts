@@ -43,6 +43,12 @@ export interface NodeRunOptions {
   capture?: boolean;
   /** Collect stdout as raw bytes instead of text (binary-safe reads). */
   captureBinary?: boolean;
+  /**
+   * Abort the run: the child is killed and the promise rejects with an
+   * "aborted" error. The server's cmd.cancel and a dropped tunnel both
+   * drive this, so a cancelled command never keeps running unnoticed.
+   */
+  signal?: AbortSignal;
 }
 
 /** Metadata about one path (mirrors the app's VmFileStat). */
@@ -192,6 +198,9 @@ export function runCommand(
   opts: NodeRunOptions = {},
 ): Promise<NodeRunResult> {
   const capture = opts.capture !== false;
+  if (opts.signal?.aborted) {
+    return Promise.reject(new Error("Command aborted."));
+  }
   return new Promise<NodeRunResult>((resolve, reject) => {
     const child: ChildProcess = spawn(command, args, {
       cwd: opts.cwd,
@@ -204,6 +213,19 @@ export function runCommand(
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let settled = false;
+
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      reject(new Error("Command aborted."));
+    };
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
 
     const timer =
       opts.timeoutMs && opts.timeoutMs > 0
@@ -228,12 +250,14 @@ export function runCommand(
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
+      opts.signal?.removeEventListener("abort", onAbort);
       if (timer) clearTimeout(timer);
       reject(err);
     });
     child.on("close", (code, signal) => {
       if (settled) return;
       settled = true;
+      opts.signal?.removeEventListener("abort", onAbort);
       if (timer) clearTimeout(timer);
       const outBuffer = Buffer.concat(stdoutChunks);
       const errBuffer = Buffer.concat(stderrChunks);
@@ -419,6 +443,7 @@ export class ContainerBackend implements NodeBackend {
       env: Object.keys(env).length > 0 ? env : undefined,
       stdin: opts.stdin,
       timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
       onStdout: opts.onStdout,
       onStderr: opts.onStderr,
     });
@@ -704,6 +729,7 @@ export class HostBackend implements NodeBackend {
       env: opts.env,
       stdin: opts.stdin,
       timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
       onStdout: opts.onStdout,
       onStderr: opts.onStderr,
     });

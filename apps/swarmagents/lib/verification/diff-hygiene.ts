@@ -32,6 +32,7 @@
 
 import { analyzeSourceText, extractExpectations } from "./ast-analysis";
 import { SECRET_PATTERNS } from "../harness/redact";
+import { checkAntiCheat, type AntiCheatChange } from "./ratchet";
 
 /**
  * Safety denylist — paths an agent run must never touch. Adapted from the
@@ -189,6 +190,8 @@ export interface DiffHygieneInput {
   /** Unified diff of the change (tracked files) + synthetic diffs for new files. */
   diff: string;
   changedFiles: readonly string[];
+  /** Optional git status entries (`A`/`M`/`D`) for deleted-test & snapshot-rewrite checks. */
+  changes?: readonly AntiCheatChange[] | undefined;
   /** Current blob SHA per changed file (via `git hash-object`), for oscillation. */
   blobShas?: ReadonlyMap<string, string> | undefined;
   /** Blob SHAs a recent autonomous task replaced — restoring one is oscillation. */
@@ -377,6 +380,17 @@ export function checkDiffHygiene(input: DiffHygieneInput): DiffHygieneResult {
     violations.push(
       `assertion count in changed tests fell ${input.baselineAssertionCount} → ${assertionCount}`,
     );
+  }
+  if (input.diff || input.changes?.length) {
+    for (const ac of checkAntiCheat({ changes: input.changes ?? [], patch: input.diff })) {
+      if (
+        ac.rule === "skip-marker" ||
+        ac.rule === "deleted-test" ||
+        ac.rule === "snapshot-rewrite"
+      ) {
+        violations.push(`anti-cheat (${ac.rule}): ${ac.detail}`);
+      }
+    }
   }
 
   // Weakened expectations + test-only diff (needs HEAD content to compare).

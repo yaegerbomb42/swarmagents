@@ -32,7 +32,7 @@ import { GLASS } from "../../design/vm-tokens";
 import { Button, IconButton } from "../ui";
 import { StatusPill, TakeoverButton, type PillStatus } from "../brand";
 import { VmScreen, type ComputerView } from "../vm/VmScreen";
-import type { Presence } from "../../../../lib/client/presence";
+import type { ComputerAction, Presence } from "../../../../lib/client/presence";
 
 export interface ScreenFrameProps {
   activeView: ComputerView;
@@ -71,6 +71,8 @@ export interface ScreenFrameProps {
   activity?: ReadonlyArray<{ text: string }>;
   /** The page's already-derived presence (it owns the run's stream). */
   presence?: Presence;
+  /** The page's already-derived latest computer-use action. */
+  computerAction?: ComputerAction;
 }
 
 export interface ScreenStatus {
@@ -158,6 +160,7 @@ export function ScreenFrame({
   filesOpenPath,
   activity,
   presence,
+  computerAction,
 }: ScreenFrameProps) {
   const [theater, setTheater] = useState(false);
   const [conn, setConn] = useState<DesktopConnectionInfo>();
@@ -317,6 +320,7 @@ export function ScreenFrame({
           controls={frameControls}
           activity={activity}
           presence={presence}
+          computerAction={computerAction}
           className="h-full rounded-none border-0"
         />
       </div>

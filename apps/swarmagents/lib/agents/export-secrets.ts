@@ -8,34 +8,35 @@
  * key.
  */
 
+import { SECRET_PATTERNS } from "../harness/redact";
+
 /**
  * Credential-shaped *values* (not keys): provider tokens, GitHub PATs, cloud
  * access keys, Slack tokens, JWTs, Google/Groq/Hugging Face/Perplexity keys,
  * PEM private-key blocks and Bearer tokens. Secret-shaped keys are handled
  * structurally by `containsSecretKeys`; this catches a secret pasted into free
  * text such as a system prompt.
+ *
+ * The pattern set is derived from the harness's canonical `SECRET_PATTERNS`
+ * (single source of truth) so secret-pattern fixes apply in one place and the
+ * value scanner cannot drift from the redactor. `SECRET_PATTERNS` carry the
+ * `g` flag for replacement, which would make `.test()` stateful, so each is
+ * re-cloned without it for stateless matching.
  */
-const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
-  /\bsk-[A-Za-z0-9_-]{16,}\b/,
-  /\bghp_[A-Za-z0-9]{20,}\b/,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
-  // Google API keys.
-  /\bAIza[0-9A-Za-z_-]{35}\b/,
-  // Groq.
-  /\bgsk_[A-Za-z0-9]{20,}\b/,
-  // Hugging Face.
-  /\bhf_[A-Za-z0-9]{20,}\b/,
-  // Perplexity.
-  /\bpplx-[A-Za-z0-9]{20,}\b/,
-  // PEM private key blocks (leading \b is intentionally omitted: the block
-  // opens with a non-word `-`, so a word boundary would never match).
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  // Bearer tokens: an opaque bearer token of at least 20 token characters.
-  /\bBearer\s+[A-Za-z0-9._~+\/=]{20,}/,
-];
+function valuePatterns(): readonly RegExp[] {
+  return [
+    ...SECRET_PATTERNS.map(({ pattern }) => {
+      const flags = pattern.flags.replace("g", "");
+      return flags.length > 0 ? new RegExp(pattern.source, flags) : new RegExp(pattern.source);
+    }),
+    // Superset preservation: the export scanner historically flagged `sk-`
+    // tokens from 16 chars (the redactor only masks at 20+). Keep the broader
+    // threshold so no currently-caught shape is lost in the import.
+    /\bsk-[A-Za-z0-9_-]{16,}\b/,
+  ];
+}
+
+const SECRET_VALUE_PATTERNS: readonly RegExp[] = valuePatterns();
 
 /**
  * True when any string value in the tree matches a credential-shaped pattern.

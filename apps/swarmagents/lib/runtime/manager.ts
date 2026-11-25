@@ -220,7 +220,21 @@ export function mergeOracleSummary(
     violations: [...summary.violations, ...oracle.violations],
     testsRan: summary.testsRan || oracle.testsRan,
     buildBroke: summary.buildBroke || oracle.buildBroke,
+    // A failed Oracle carries the retry context (diagnostic + symbol
+    // definition) as the remediation prompt, so a bounce feeds the agent
+    // just that — never the failed patch. A passing Oracle must not
+    // override the shadow summary's own remediation.
+    ...(oracle.passed || !oracle.remediationPrompt ? {} : { remediationPrompt: oracle.remediationPrompt }),
   };
+}
+
+/**
+ * Whether an Oracle rejection bounces the run back for another attempt.
+ * Bounded by the same round cap as the shadow gate; an Oracle error (as
+ * opposed to a rejection) never bounces — it finalizes with the fail badge.
+ */
+export function shouldBounceOnOracleRejection(rejected: boolean, attemptsUsed: number): boolean {
+  return rejected && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS;
 }
 
 const SUMMARY_PROMPT_LEN = 300;
@@ -3585,8 +3599,17 @@ export class RuntimeManager {
    * Verify only files the run demonstrably wrote. Oracle's "best" mode lands
    * a passing candidate, so give it a disposable worktree; the user's live
    * workspace must never be changed by a post-run audit.
+   *
+   * Returns the verification summary plus whether the run's diff was
+   * rejected (as opposed to passed, skipped, or errored). On rejection the
+   * summary's remediation prompt carries the gate's retry context —
+   * diagnostic plus the named symbol's definition, never the failed patch —
+   * so the caller can bounce the run with just that. The gate's log lines
+   * are published to the run's visible log as they arrive.
    */
-  private async runPostRunOracle(active: ActiveRun): Promise<ShadowVerificationSummary | undefined> {
+  private async runPostRunOracle(
+    active: ActiveRun,
+  ): Promise<{ summary: ShadowVerificationSummary; rejected: boolean } | undefined> {
     if (!isOraclePostRunEnabled()) return undefined;
     let isolatedRoot: string | undefined;
     let worktreeGitRoot: string | undefined;
@@ -3639,17 +3662,35 @@ export class RuntimeManager {
         checks: defaultOracleChecks(),
         linkDirs: [path.posix.join(projectDir, "node_modules")],
         signal: active.controller.signal,
+        // The gate's log lines (per-candidate verdicts and the
+        // "oracle: k/n candidates rejected" summary) go to the run's
+        // visible log, so a rejection is observable — not just a badge.
+        // Logging must never break the gate.
+        log: (line) => {
+          try {
+            this.bus.publish(active.runId, { type: "log", data: line });
+          } catch {
+            // Swallowed: a logging failure is not a gate failure.
+          }
+        },
       });
       const verdict = report.verdicts[0];
       const passed = verdict?.status === "passed";
+      const rejected = verdict?.status === "rejected";
       const detail = verdict && "diagnostic" in verdict ? verdict.diagnostic : report.summary;
       return {
-        passed,
-        score: passed ? 100 : 0,
-        badge: passed ? "pass" : "fail",
-        violations: passed ? [] : [`Oracle: ${detail}`],
-        testsRan: Boolean(verdict && verdict.status !== "skipped" && verdict.checks.length > 0),
-        buildBroke: Boolean(verdict && "stage" in verdict && verdict.stage === "tsc"),
+        summary: {
+          passed,
+          score: passed ? 100 : 0,
+          badge: passed ? "pass" : "fail",
+          violations: passed ? [] : [`Oracle: ${detail}`],
+          testsRan: Boolean(verdict && verdict.status !== "skipped" && verdict.checks.length > 0),
+          buildBroke: Boolean(verdict && "stage" in verdict && verdict.stage === "tsc"),
+          // The retry context is just the diagnostic plus the named
+          // symbol's definition; the failed patch itself stays evicted.
+          ...(rejected && report.retryContext ? { remediationPrompt: report.retryContext } : {}),
+        },
+        rejected,
       };
     } catch (error) {
       // Fail closed into the report, never into the run control path.
@@ -3657,12 +3698,15 @@ export class RuntimeManager {
         error instanceof Error ? error.message : String(error),
       );
       return {
-        passed: false,
-        score: 0,
-        badge: "fail",
-        violations: [`Oracle error: ${message}`],
-        testsRan: false,
-        buildBroke: false,
+        summary: {
+          passed: false,
+          score: 0,
+          badge: "fail",
+          violations: [`Oracle error: ${message}`],
+          testsRan: false,
+          buildBroke: false,
+        },
+        rejected: false,
       };
     } finally {
       if (isolatedRoot) {
@@ -3685,7 +3729,14 @@ export class RuntimeManager {
   ): Promise<{ outcome: "finalized" } | { outcome: "bounce"; summary: ShadowVerificationSummary }> {
     if (shadowEnabled) return this.runShadowGate(active, finishEvent);
     const oracle = await this.runPostRunOracle(active);
-    this.finalizeFinished(active, finishEvent, oracle);
+    // An Oracle rejection bounces the run back to the primary agent with
+    // the retry context (diagnostic + symbol definition) as the prompt —
+    // the same bounded loop as the shadow gate. An Oracle error never
+    // bounces: it finalizes with the fail badge.
+    if (oracle && shouldBounceOnOracleRejection(oracle.rejected, active.shadowAttempts ?? 0)) {
+      return { outcome: "bounce", summary: oracle.summary };
+    }
+    this.finalizeFinished(active, finishEvent, oracle?.summary);
     return { outcome: "finalized" };
   }
 
@@ -3747,13 +3798,13 @@ export class RuntimeManager {
       const plan = await this.resolveVerificationPlan(active);
       if (!plan) {
         const oracle = await this.runPostRunOracle(active);
-        this.finalizeFinished(active, finishEvent, oracle);
+        this.finalizeFinished(active, finishEvent, oracle?.summary);
         return { outcome: "finalized" };
       }
       const callLLM = createCheapCallLLM(userId, { signal: active.controller.signal });
       if (!callLLM) {
         const oracle = await this.runPostRunOracle(active);
-        this.finalizeFinished(active, finishEvent, oracle);
+        this.finalizeFinished(active, finishEvent, oracle?.summary);
         return { outcome: "finalized" };
       }
       const deps: ShadowVerifierDeps = {
@@ -3796,7 +3847,7 @@ export class RuntimeManager {
       }
       const oracle = await this.runPostRunOracle(active);
       if (oracle) {
-        summary = mergeOracleSummary(summary, oracle);
+        summary = mergeOracleSummary(summary, oracle.summary);
       }
       if (!summary.passed && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS) {
         return { outcome: "bounce", summary };
@@ -3806,7 +3857,7 @@ export class RuntimeManager {
     } catch {
       // Never let a verifier failure wedge or falsely bounce a run.
       const oracle = await this.runPostRunOracle(active);
-      this.finalizeFinished(active, finishEvent, oracle);
+      this.finalizeFinished(active, finishEvent, oracle?.summary);
       return { outcome: "finalized" };
     }
   }

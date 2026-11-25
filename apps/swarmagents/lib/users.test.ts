@@ -444,11 +444,15 @@ test("authenticates legacy 3-part scrypt hash and transparently upgrades to vers
   assert.ok(auth);
   assert.equal(auth.email, "upgrade@example.com");
 
-  // Wait briefly for transparent background upgrade to finish
-  await new Promise((r) => setTimeout(r, 100));
-
-  const updatedUsers = JSON.parse(fs.readFileSync(userFile, "utf-8")) as { users: Array<{ password: string }> };
-  const updatedUser = updatedUsers.users.find((u) => u.password !== legacyHash);
+  // Wait for transparent background upgrade to finish (scrypt hashing under CI load can exceed 100ms).
+  let updatedUser: { password: string } | undefined;
+  const deadline = Date.now() + 2500;
+  while (Date.now() < deadline) {
+    const updatedUsers = JSON.parse(fs.readFileSync(userFile, "utf-8")) as { users: Array<{ password: string }> };
+    updatedUser = updatedUsers.users.find((u) => u.password !== legacyHash);
+    if (updatedUser && /^scrypt\$N=16384,r=8,p=1\$/.test(updatedUser.password)) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
   assert.ok(updatedUser);
   assert.match(updatedUser.password, /^scrypt\$N=16384,r=8,p=1\$/);
 

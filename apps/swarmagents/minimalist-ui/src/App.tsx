@@ -408,10 +408,11 @@ export default function App() {
 
   return (
     <div
-      className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-[var(--bg)] text-[var(--fg)]"
+      className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-transparent text-[var(--fg)]"
       data-testid="minimal-main-page"
       data-view={effectiveView}
     >
+      <div className="aura" aria-hidden="true" />
       {/* Header with brand lockup, view switcher and run indicator */}
       <Header
         title={session.title}
@@ -468,8 +469,10 @@ export default function App() {
           </div>
           {showHero && (
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 py-10 text-center" data-testid="workspace-hero">
-              <img src="/brand/mark-dark.svg" alt="" width={56} height={56} className="mb-5" />
-              <h1 className="mb-2 text-xl font-semibold tracking-tight sm:text-3xl">Give it a task. It has its own computer.</h1>
+              <div className="neo-pill mb-5 grid h-16 w-16 place-items-center rounded-[22px] p-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.22),0_0_32px_-8px_rgba(0,208,240,0.4)]">
+                <img src="/brand/mark-dark.svg" alt="" width={56} height={56} className="h-11 w-11" />
+              </div>
+              <h1 className="mb-2 bg-gradient-to-b from-white to-slate-300 bg-clip-text text-xl font-semibold tracking-tight text-transparent sm:text-3xl">Give it a task. It has its own computer.</h1>
               <p className="mb-6 max-w-md text-sm leading-relaxed text-[var(--mute)]">
                 One autonomous agent in your own persistent Linux VM. Describe the work, watch every step live, take over anytime. Free — bring your own model keys.
               </p>

@@ -53,7 +53,7 @@ export function RunIndicator({ phase, since, durationMs, activity, stopping, onS
         type="button"
         onClick={onShow}
         title={meta.active ? "Show the run" : "Show the result"}
-        className="flex h-8 min-w-0 items-center gap-2 rounded-xl hair px-2.5 bg-black/30 transition-colors hover:bg-white/[0.06]"
+        className="neo-pill flex h-8 min-w-0 items-center gap-1.5 sm:gap-2 rounded-xl px-2 sm:px-2.5"
       >
         <span role="status" className="flex min-w-0">
           <StatusPill tone={RUN_TONE_TO_PILL[meta.tone]} live={meta.active}>
@@ -61,10 +61,10 @@ export function RunIndicator({ phase, since, durationMs, activity, stopping, onS
           </StatusPill>
         </span>
         {meta.active && since !== undefined ? (
-          <Elapsed since={since} className="hidden min-[420px]:inline text-xs text-[var(--ok)] mono" />
+          <Elapsed since={since} className="hidden sm:inline text-xs text-[var(--ok)] mono" />
         ) : (
           durationMs !== undefined && (
-            <span className="mono hidden text-[12px] text-[var(--mute)] min-[420px]:inline tabular-nums">
+            <span className="mono hidden text-[12px] text-[var(--mute)] sm:inline tabular-nums">
               {formatDuration(durationMs)}
             </span>
           )
@@ -122,14 +122,14 @@ export function Header({
     <header className="glass shrink-0 hair-b relative z-30" data-testid="workspace-header">
       <div
         className={cn(
-          "grid h-13 items-center gap-2 px-3 sm:px-4",
+          "grid h-13 items-center gap-1.5 sm:gap-2 px-2.5 sm:px-4",
           wide ? "grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]" : "grid-cols-[minmax(0,1fr)_auto]",
         )}
       >
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 items-center gap-1.5 sm:gap-2 overflow-hidden">
           {/* Brand mark + wordmark (branding/BRAND.md) */}
           <span className="flex shrink-0 items-center gap-2" data-testid="brand-lockup">
-            <img src="/brand/mark-dark.svg" alt="" width={28} height={28} className="shrink-0" />
+            <img src="/brand/mark-dark.svg" alt="" width={28} height={28} className="h-6 w-6 sm:h-7 sm:w-7 shrink-0 drop-shadow-[0_0_10px_rgba(0,208,240,0.45)]" />
             <span className="hidden text-[15px] font-semibold tracking-tight text-[var(--fg)] min-[560px]:inline">
               SwarmAgents
             </span>
@@ -141,7 +141,7 @@ export function Header({
             data-testid="open-history"
             aria-haspopup="dialog"
             title="Conversations"
-            className="press flex h-9 min-w-0 items-center gap-1.5 rounded-xl hair bg-black/20 px-2.5 text-sm font-medium text-[var(--fg)] transition-colors hover:bg-white/[0.06]"
+            className="press neo-pill flex h-8 sm:h-9 min-w-0 max-w-[116px] sm:max-w-[230px] items-center gap-1 rounded-xl px-2 sm:px-2.5 text-xs sm:text-sm font-medium text-[var(--fg)]"
           >
             <span className="truncate" data-testid="thread-title">
               {title}
@@ -154,7 +154,7 @@ export function Header({
             onClick={onNewChat}
             disabled={newChatDisabled}
             data-testid="new-chat"
-            className="rounded-xl hair bg-black/20 hover:bg-white/[0.06]"
+            className="neo-pill h-8 w-8 sm:h-9 sm:w-9 shrink-0 rounded-xl"
           >
             <SquarePen className="h-4 w-4" aria-hidden />
           </IconButton>
@@ -167,19 +167,19 @@ export function Header({
               options={views}
               value={view}
               onChange={onView}
-              className="glass hair rounded-2xl p-1"
+              className="glass neo-well rounded-2xl p-1"
             />
           </div>
         )}
 
-        <div className="flex items-center justify-end gap-2">
+        <div className="flex shrink-0 items-center justify-end gap-1 sm:gap-2">
           <RunIndicator {...run} />
           <Link
             href="/connectors"
             aria-label="Connectors"
             title="Connector Catalog"
             data-testid="open-connectors"
-            className="press flex h-9 w-9 items-center justify-center rounded-xl hair bg-black/20 text-[var(--mute)] transition-colors hover:bg-white/[0.06] hover:text-[var(--fg)]"
+            className="press neo-pill flex h-8 w-8 sm:h-9 sm:w-9 shrink-0 items-center justify-center rounded-xl text-[var(--mute)] hover:text-[var(--fg)]"
           >
             <Plug className="h-4 w-4" aria-hidden />
           </Link>
@@ -187,7 +187,7 @@ export function Header({
             label="Keyboard shortcuts"
             onClick={onOpenShortcuts}
             data-testid="open-shortcuts"
-            className="rounded-xl hair bg-black/20 hover:bg-white/[0.06]"
+            className="neo-pill hidden sm:grid h-9 w-9 shrink-0 rounded-xl"
           >
             <HelpCircle className="h-4 w-4" aria-hidden />
           </IconButton>
@@ -195,7 +195,7 @@ export function Header({
             label="Settings"
             onClick={onOpenSettings}
             data-testid="open-settings"
-            className="rounded-xl hair bg-black/20 hover:bg-white/[0.06]"
+            className="neo-pill h-8 w-8 sm:h-9 sm:w-9 shrink-0 rounded-xl"
           >
             <SettingsIcon className="h-4 w-4" aria-hidden />
           </IconButton>
@@ -204,23 +204,23 @@ export function Header({
               href="/login"
               data-testid="header-account"
               title={user.email || user.name || "Account"}
-              className="press flex h-9 max-w-[96px] sm:max-w-[140px] items-center rounded-xl hair bg-white/[0.06] px-2.5 sm:px-3 text-xs font-medium text-[var(--fg)] transition-colors hover:bg-white/[0.12]"
+              className="press neo-pill flex h-8 sm:h-9 max-w-[74px] sm:max-w-[140px] shrink-0 items-center gap-1.5 rounded-xl px-2 sm:px-3 text-xs font-medium text-[var(--fg)]"
             >
               <span className="truncate">{user.name || user.email || "Account"}</span>
             </Link>
           ) : (
-            <div className="flex items-center gap-1.5">
+            <div className="flex shrink-0 items-center gap-1.5">
               <Link
                 href="/login"
                 data-testid="header-sign-in"
-                className="press flex h-9 items-center rounded-xl hair bg-white/[0.06] px-2.5 sm:px-3 text-xs font-medium text-[var(--fg)] transition-colors hover:bg-white/[0.12]"
+                className="press neo-pill flex h-8 sm:h-9 items-center rounded-xl px-2 sm:px-3 text-xs font-medium text-[var(--fg)]"
               >
                 Sign in
               </Link>
               <Link
                 href="/login?mode=signup"
                 data-testid="header-sign-up"
-                className="press hidden sm:flex h-9 items-center rounded-xl border border-cyan-400/35 bg-cyan-400/15 px-3 text-xs font-medium text-cyan-100 transition-colors hover:bg-cyan-400/25"
+                className="press hidden sm:flex h-9 items-center rounded-xl border border-cyan-400/40 bg-cyan-400/15 px-3 text-xs font-medium text-cyan-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.25),0_0_18px_-6px_rgba(0,208,240,0.4)] transition-all hover:bg-cyan-400/25"
               >
                 Sign up
               </Link>
@@ -230,8 +230,8 @@ export function Header({
       </div>
 
       {!wide && (
-        <div className="flex justify-center hair-t bg-black/20 px-3 py-1.5">
-          <Segmented<WorkspaceView> label="Views" options={views} value={view} onChange={onView} className="w-full justify-center glass hair rounded-xl p-0.5" />
+        <div className="flex justify-center hair-t bg-black/20 px-3 py-1.5 backdrop-blur-xl">
+          <Segmented<WorkspaceView> label="Views" options={views} value={view} onChange={onView} className="w-full justify-center glass neo-well rounded-xl p-0.5" />
         </div>
       )}
     </header>

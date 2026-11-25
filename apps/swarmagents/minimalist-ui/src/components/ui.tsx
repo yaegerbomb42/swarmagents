@@ -22,10 +22,11 @@ type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
 type ButtonSize = "sm" | "md";
 
 const BUTTON_VARIANT: Record<ButtonVariant, string> = {
-  primary: "bg-sa-accent text-white hover:bg-sa-accent-hover",
-  secondary: "border border-sa-line-strong bg-sa-raised text-sa-fg hover:bg-sa-hover",
-  ghost: "text-sa-fg2 hover:bg-sa-hover hover:text-sa-fg",
-  danger: "border border-sa-err/40 text-sa-err hover:bg-sa-err/10",
+  primary:
+    "bg-gradient-to-b from-cyan-400 to-cyan-500 text-slate-950 font-semibold shadow-[inset_0_1px_0_rgba(255,255,255,0.4),0_8px_22px_-8px_rgba(0,208,240,0.55)] hover:from-cyan-300 hover:to-cyan-400",
+  secondary: "neo-pill text-sa-fg",
+  ghost: "text-sa-fg2 hover:bg-white/[0.07] hover:text-sa-fg",
+  danger: "border border-sa-err/40 bg-sa-err/[0.08] text-sa-err hover:bg-sa-err/15",
 };
 
 const BUTTON_SIZE: Record<ButtonSize, string> = {
@@ -242,8 +243,10 @@ export function Segmented<T extends string>({
             onClick={() => onChange(option.id)}
             onKeyDown={(event) => onKeyDown(event, index)}
             className={cn(
-              "inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-[13px] font-medium transition-colors",
-              selected ? "bg-sa-hover text-sa-fg" : "text-sa-fg2 hover:text-sa-fg",
+              "inline-flex h-8 items-center gap-1.5 rounded-xl px-3 text-[13px] font-medium transition-all",
+              selected
+                ? "bg-white/[0.11] text-sa-fg shadow-[inset_0_1px_0_rgba(255,255,255,0.22),0_4px_12px_-4px_rgba(0,0,0,0.6)]"
+                : "text-sa-fg2 hover:bg-white/[0.04] hover:text-sa-fg",
             )}
           >
             {option.icon}

@@ -73,6 +73,7 @@ RUN apt-get update \
         xdotool \
         xclip \
         scrot \
+        tesseract-ocr \
         imagemagick \
         wmctrl \
         fonts-noto \

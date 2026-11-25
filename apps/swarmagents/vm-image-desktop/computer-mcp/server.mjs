@@ -19,7 +19,7 @@ import fs from "node:fs";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { parseToolArgs, summarizeTool, COMPUTER_TOOLS } from "./validate.mjs";
+import { parseToolArgs, summarizeTool, COMPUTER_TOOLS, parseWmctrlWindows, parseTesseractTsv } from "./validate.mjs";
 
 const DISPLAY = process.env.SWARM_COMPUTER_DISPLAY || process.env.DISPLAY || ":1";
 // Constrain the tools' own child processes, never the server itself.
@@ -124,6 +124,60 @@ async function captureScreenshot() {
   }
 }
 
+/**
+ * Structured non-vision desktop inspection: screen dimensions, pointer location,
+ * open windows with clickable center coordinates, and optional OCR text lines
+ * with bounding boxes + center (x, y) coordinates for click/double_click.
+ */
+async function describeScreen(args) {
+  const includeOcr = args?.includeOcr !== false;
+  const maxItems = Math.min(Math.max(Number(args?.maxItems) || 80, 1), 150);
+
+  const [geomRes, mouseRes, winRes, activeRes] = await Promise.all([
+    run("xdotool", ["getdisplaygeometry"], { timeoutMs: 5_000 }),
+    run("xdotool", ["getmouselocation"], { timeoutMs: 5_000 }),
+    run("wmctrl", ["-lG"], { timeoutMs: 5_000 }),
+    run("xdotool", ["getactivewindow", "getwindowname"], { timeoutMs: 5_000 }),
+  ]);
+
+  const geom = geomRes.code === 0 ? geomRes.stdout.trim().replace(/\s+/g, "x") : "unknown";
+  const pointer = mouseRes.code === 0 ? mouseRes.stdout.trim() : "unknown";
+  const activeWin = activeRes.code === 0 ? activeRes.stdout.trim() : "none";
+  const windows = winRes.code === 0 ? parseWmctrlWindows(winRes.stdout) : [];
+
+  const lines = [
+    `Screen: ${geom} | Active window: ${activeWin || "none"} | Pointer: ${pointer}`,
+    windows.length > 0
+      ? "Windows:\n" + windows.map((w) => `  [${w.id}] "${w.title}" @ (${w.x},${w.y} ${w.w}x${w.h}) center=(${w.cx},${w.cy})`).join("\n")
+      : "Windows: none",
+  ];
+
+  if (includeOcr) {
+    const file = path.join(SCREENSHOT_DIR, `swarm-ocr-${process.pid}-${Date.now()}.png`);
+    const shot = await run("scrot", ["-o", file], { timeoutMs: 12_000 });
+    try {
+      if (shot.code === 0) {
+        const ocr = await run("tesseract", [file, "stdout", "--psm", "11", "tsv"], { timeoutMs: 15_000 });
+        if (ocr.code === 0) {
+          const targets = parseTesseractTsv(ocr.stdout, maxItems);
+          lines.push(
+            targets.length > 0
+              ? `Clickable text targets (${targets.length}):\n` +
+                  targets.map((t) => `  "${t.text}" -> click(${t.cx}, ${t.cy}) [${t.x},${t.y} ${t.w}x${t.h}]`).join("\n")
+              : "Clickable text targets: none detected",
+          );
+        } else {
+          lines.push(`OCR skipped (${(ocr.stderr || "tesseract unavailable").trim().slice(0, 120)})`);
+        }
+      }
+    } finally {
+      fs.promises.unlink(file).catch(() => {});
+    }
+  }
+
+  return textResult(lines.join("\n"));
+}
+
 async function callTool(tool, args) {
   // All input tools go through the shared validator, producing argv arrays.
   const parsed = parseToolArgs(tool, args);
@@ -132,6 +186,8 @@ async function callTool(tool, args) {
   switch (tool) {
     case "screenshot":
       return captureScreenshot();
+    case "describe_screen":
+      return describeScreen(args);
     case "wait": {
       const ms = Number(args?.ms ?? 0);
       await new Promise((resolve) => setTimeout(resolve, ms));
@@ -180,6 +236,14 @@ function toolSpec(tool) {
   switch (tool) {
     case "screenshot":
       return { description: "Capture the desktop as a PNG, downscaled to at most 1280px wide (display :1).", shape: {} };
+    case "describe_screen":
+      return {
+        description: "Inspect display :1 without vision: returns screen geometry, window bounds/centers, and OCR clickable text coordinates (x, y).",
+        shape: {
+          includeOcr: z.boolean().optional().describe("Include OCR word/line coordinates (default true)."),
+          maxItems: z.number().optional().describe("Max OCR targets to return (1..150, default 80)."),
+        },
+      };
     case "click":
       return { description: "Move the pointer to (x, y) and click the given button.", shape: XY_SHAPE };
     case "double_click":

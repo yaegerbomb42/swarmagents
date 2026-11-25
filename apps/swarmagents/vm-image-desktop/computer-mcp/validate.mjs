@@ -15,6 +15,7 @@
 /** Tools this server exposes. */
 export const COMPUTER_TOOLS = Object.freeze([
   "screenshot",
+  "describe_screen",
   "click",
   "double_click",
   "move",
@@ -191,6 +192,8 @@ export function parseToolArgs(tool, args) {
   switch (tool) {
     case "screenshot":
       return ok([]);
+    case "describe_screen":
+      return ok([]);
     case "click":
       return clickArgs(input, { double: false });
     case "double_click":
@@ -221,6 +224,8 @@ export function summarizeTool(tool, args) {
   switch (tool) {
     case "screenshot":
       return "Taking a screenshot";
+    case "describe_screen":
+      return "Reading screen layout and clickable text";
     case "click": {
       const b = button(input.button);
       const label = b === 3 ? "right-clicking" : b === 2 ? "middle-clicking" : "clicking";
@@ -264,4 +269,91 @@ export function summarizeTool(tool, args) {
     default:
       return `Desktop action (${tool})`;
   }
+}
+
+/**
+ * Parse `wmctrl -lG` stdout into window records with clickable center coords.
+ * Enables non-vision LLMs to locate desktop windows without reading images.
+ */
+export function parseWmctrlWindows(stdout) {
+  const rows = [];
+  for (const raw of String(stdout || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = /^(\S+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+\S+\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const [, id, , xStr, yStr, wStr, hStr, title] = m;
+    const x = Number(xStr);
+    const y = Number(yStr);
+    const w = Number(wStr);
+    const h = Number(hStr);
+    rows.push({
+      id,
+      x,
+      y,
+      w,
+      h,
+      cx: Math.round(x + w / 2),
+      cy: Math.round(y + h / 2),
+      title: title.trim() || "(untitled)",
+    });
+  }
+  return rows;
+}
+
+/**
+ * Parse Tesseract TSV output into grouped line/word clickable bounding boxes.
+ * Filters low-confidence noise and returns compact { text, cx, cy, x, y, w, h } targets.
+ */
+export function parseTesseractTsv(tsv, maxItems = 80) {
+  const groups = new Map();
+  const lines = String(tsv || "").split(/\r?\n/);
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split("\t");
+    if (cols.length < 12) continue;
+    const level = Number(cols[0]);
+    if (level !== 5) continue;
+    const text = cols[11].trim();
+    const conf = Number(cols[10]);
+    if (!text || !Number.isFinite(conf) || conf < 35) continue;
+    const left = Number(cols[6]);
+    const top = Number(cols[7]);
+    const width = Number(cols[8]);
+    const height = Number(cols[9]);
+    if (![left, top, width, height].every(Number.isFinite) || width <= 0 || height <= 0) continue;
+    const lineKey = `${cols[1]}:${cols[2]}:${cols[3]}:${cols[4]}`;
+    const existing = groups.get(lineKey);
+    if (!existing) {
+      groups.set(lineKey, {
+        text,
+        x1: left,
+        y1: top,
+        x2: left + width,
+        y2: top + height,
+      });
+    } else {
+      existing.text += ` ${text}`;
+      existing.x1 = Math.min(existing.x1, left);
+      existing.y1 = Math.min(existing.y1, top);
+      existing.x2 = Math.max(existing.x2, left + width);
+      existing.y2 = Math.max(existing.y2, top + height);
+    }
+  }
+  const cap = Math.min(Math.max(Number(maxItems) || 80, 1), 150);
+  const out = [];
+  for (const g of groups.values()) {
+    const w = g.x2 - g.x1;
+    const h = g.y2 - g.y1;
+    out.push({
+      text: g.text.slice(0, 120),
+      x: g.x1,
+      y: g.y1,
+      w,
+      h,
+      cx: Math.round(g.x1 + w / 2),
+      cy: Math.round(g.y1 + h / 2),
+    });
+    if (out.length >= cap) break;
+  }
+  return out;
 }

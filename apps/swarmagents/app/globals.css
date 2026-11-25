@@ -39,6 +39,7 @@
  */
 
 :root {
+  --in-oklab: ;
   /* ── Color (brand system — branding/BRAND.md) ── */
   --color-bg: var(--brand-bg);
   --color-bg-elevated: var(--brand-surface);
@@ -192,6 +193,12 @@
   --transition-shadow: 250ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+@supports (background: linear-gradient(in oklab, white, black)) {
+  :root {
+    --in-oklab: in oklab;
+  }
+}
+
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
   :root {
@@ -235,7 +242,7 @@
  * Tailwind v4 emits its utilities into `@layer utilities`, and in the CSS
  * cascade an *unlayered* rule beats every layer regardless of specificity. With
  * these resets unlayered, `button { border: 0; background: none; padding: 0 }`
- * silently defeated every `border-*`, `bg-*` and `px-*/py-*` utility on every
+ * silently defeated every `border-*`, `bg-*` and `px-*` / `py-*` utility on every
  * <button> in the app: the Publish button on /library computes to a 0px border
  * and a transparent background despite being authored with both. The same
  * unlayered reset made bg-*, border-*, px-* and text-* do nothing on workspace
@@ -253,8 +260,14 @@
   }
 
   body {
-    background: var(--color-bg);
+    background-color: var(--color-bg);
+    background-image:
+      radial-gradient(62% 52% at 14% -8%, rgba(0, 208, 240, 0.14) 0%, transparent 65%),
+      radial-gradient(54% 48% at 88% 8%, rgba(99, 102, 241, 0.14) 0%, transparent 64%),
+      radial-gradient(48% 42% at 50% 106%, rgba(56, 189, 248, 0.09) 0%, transparent 68%);
+    background-attachment: fixed;
     color: var(--color-text);
+    color-scheme: dark;
     font: var(--type-size-0) / var(--line-height-normal) var(--font-sans);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
@@ -1535,20 +1548,24 @@ select option { background: #15151a; color: #eee; }
   --fg: var(--brand-text);
   --fg-2: var(--brand-text-2);
   --mute: var(--brand-text-3);
-  --line: var(--brand-hairline);
-  --line-2: var(--brand-hairline-strong);
-  --glass: var(--brand-surface);
-  --glass-2: var(--brand-surface-raised);
-  --glass-hi: var(--brand-surface-hover);
+  --line: rgba(255, 255, 255, 0.10);
+  --line-2: rgba(255, 255, 255, 0.18);
+  --glass: rgba(18, 26, 48, 0.56);
+  --glass-2: rgba(24, 35, 64, 0.72);
+  --glass-hi: rgba(34, 49, 86, 0.78);
   --inv: var(--brand-ink);
   --ok: var(--brand-ok);
   --warn: var(--brand-warn);
   --err: var(--brand-err);
   --sig: var(--brand-signal);
-  --shadow: 0 1px 0 var(--brand-top-light) inset, 0 30px 60px -30px rgba(0, 0, 0, 0.9), 0 2px 8px -2px rgba(0, 0, 0, 0.5);
-  --aura-a: rgba(0, 208, 240, 0.10);
-  --aura-b: rgba(0, 80, 128, 0.12);
-  --aura-c: rgba(0, 208, 240, 0.06);
+  --shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    inset 0 -1px 0 rgba(2, 6, 23, 0.45),
+    0 24px 64px -20px rgba(2, 6, 23, 0.88),
+    0 4px 16px -4px rgba(0, 0, 0, 0.55);
+  --aura-a: rgba(0, 208, 240, 0.14);
+  --aura-b: rgba(99, 102, 241, 0.15);
+  --aura-c: rgba(56, 189, 248, 0.10);
 }
 
 .mono {
@@ -1557,14 +1574,58 @@ select option { background: #15151a; color: #eee; }
 }
 
 .glass {
-  background: var(--glass);
+  background: linear-gradient(155deg var(--in-oklab), rgba(28, 40, 74, 0.64), rgba(14, 21, 40, 0.48));
+  backdrop-filter: blur(26px) saturate(165%);
+  -webkit-backdrop-filter: blur(26px) saturate(165%);
   border: 1px solid var(--line);
   box-shadow: var(--shadow);
 }
 .glass-2 {
-  background: var(--glass-2);
+  background: linear-gradient(155deg var(--in-oklab), rgba(34, 49, 86, 0.76), rgba(18, 27, 50, 0.62));
+  backdrop-filter: blur(32px) saturate(180%);
+  -webkit-backdrop-filter: blur(32px) saturate(180%);
   border: 1px solid var(--line-2);
-  box-shadow: var(--shadow);
+  box-shadow:
+    inset 0 1.5px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.48),
+    0 20px 56px -18px rgba(0, 0, 0, 0.9);
+}
+.neo-pill {
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.02));
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.35),
+    0 6px 18px -8px rgba(0, 0, 0, 0.7);
+  transition: background-color 150ms ease, border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+}
+.neo-pill:hover:not(:disabled) {
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.04));
+  border-color: rgba(0, 208, 240, 0.32);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    0 0 22px -8px rgba(0, 208, 240, 0.35),
+    0 8px 20px -8px rgba(0, 0, 0, 0.75);
+}
+.neo-well {
+  background: rgba(8, 12, 24, 0.64);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow:
+    inset 0 2px 6px rgba(0, 0, 0, 0.65),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+}
+.composer-ring {
+  transition: border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;
+}
+.composer-ring:focus-within {
+  border-color: rgba(0, 208, 240, 0.48);
+  box-shadow:
+    inset 0 1.5px 0 rgba(255, 255, 255, 0.24),
+    0 0 0 1px rgba(0, 208, 240, 0.35),
+    0 0 36px -8px rgba(0, 208, 240, 0.42),
+    0 24px 60px -20px rgba(0, 0, 0, 0.9);
 }
 .hair {
   border: 1px solid var(--line);
@@ -1574,6 +1635,15 @@ select option { background: #15151a; color: #eee; }
 }
 .hair-t {
   border-top: 1px solid var(--line);
+}
+
+@media (forced-colors: active) {
+  .glass,
+  .glass-2,
+  .neo-pill,
+  .neo-well {
+    border: 1px solid CanvasText;
+  }
 }
 
 .edge {
@@ -1599,9 +1669,23 @@ select option { background: #15151a; color: #eee; }
   opacity: 0.35;
 }
 
-/* Brand system: flat Void Navy canvas — no ambient aura or grain. The
-   classes stay defined (display:none) so any leftover markup is inert. */
-.aura,
+/* Ambient frosted nebula orbs glowing subtly behind translucent .glass panels. */
+.aura {
+  pointer-events: none;
+  position: fixed;
+  inset: -12%;
+  z-index: 0;
+  background:
+    radial-gradient(38% 36% at 18% 18%, var(--aura-a), transparent 70%),
+    radial-gradient(42% 38% at 84% 22%, var(--aura-b), transparent 72%),
+    radial-gradient(36% 32% at 52% 88%, var(--aura-c), transparent 70%);
+  filter: blur(40px);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .aura {
+    animation: aura-drift 28s ease-in-out infinite alternate;
+  }
+}
 .grain {
   display: none;
 }

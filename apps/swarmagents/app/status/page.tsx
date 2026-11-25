@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { healthSnapshot } from "@/lib/health";
+import { deepHealthSnapshot } from "@/lib/health";
 
 export const dynamic = "force-dynamic";
 
@@ -33,7 +33,7 @@ function formatUptime(totalSeconds: number): string {
  * values, no paths, nothing that could aid an attacker.
  */
 export default function StatusPage() {
-  const health = healthSnapshot(process.env);
+  const health = deepHealthSnapshot(process.env);
 
   const rows: { label: string; value: string; ok: boolean | null }[] = [
     {
@@ -53,8 +53,18 @@ export default function StatusPage() {
     },
     {
       label: "VM driver",
-      value: health.vmDriver === "none" ? "Not configured" : health.vmDriver,
+      value: health.vmDriver === "none" ? "Not configured" : `${health.vmDriver}${health.subsystems.desktopEnabled ? " · Desktop GUI" : ""}`,
       ok: health.vmDriver === "none" ? null : true,
+    },
+    {
+      label: "Verified MCP connectors",
+      value: `${health.subsystems.catalogConnectorCount} ready in hub`,
+      ok: health.subsystems.catalogConnectorCount >= 40,
+    },
+    {
+      label: "Capability Atlas & Tool Forge",
+      value: health.subsystems.atlasReady && health.subsystems.toolForgeReady ? "Active (zero-bloat search + self-authoring)" : "Unavailable",
+      ok: health.subsystems.atlasReady && health.subsystems.toolForgeReady,
     },
     {
       label: "Providers configured",
@@ -79,7 +89,7 @@ export default function StatusPage() {
           Live health summary for this deployment, refreshed on every visit.
         </p>
 
-        <div className="mt-8 overflow-hidden rounded-2xl ring-1 ring-white/10">
+        <div className="mt-8 overflow-hidden rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl shadow-[0_24px_70px_-25px_rgba(0,0,0,0.85)]">
           <div
             className={`flex items-center gap-2.5 px-5 py-4 text-sm font-medium ${
               health.ok ? "bg-emerald-400/10 text-emerald-300" : "bg-amber-400/10 text-amber-300"
@@ -110,17 +120,27 @@ export default function StatusPage() {
         </div>
 
         <p className="mt-6 text-xs leading-relaxed text-white/40">
-          This is a summary only. The machine-readable signal lives at{" "}
+          This is a summary only. Machine-readable signals live at{" "}
           <a href="/api/health" className="font-mono text-cyan-300 hover:text-cyan-200">
             /api/health
+          </a>{" "}
+          and{" "}
+          <a href="/api/health?deep=1" className="font-mono text-cyan-300 hover:text-cyan-200">
+            /api/health?deep=1
           </a>
           .
         </p>
-        <p className="mt-10 border-t border-white/10 pt-6 text-xs text-white/40">
+        <div className="mt-10 flex flex-wrap items-center gap-4 border-t border-white/10 pt-6 text-xs text-white/40">
           <Link href="/" className="text-cyan-300 hover:text-cyan-200">
             ← Back to the console
           </Link>
-        </p>
+          <Link href="/connectors" className="text-white/60 hover:text-white">
+            Connector Hub
+          </Link>
+          <Link href="/providers" className="text-white/60 hover:text-white">
+            Providers
+          </Link>
+        </div>
       </div>
     </main>
   );

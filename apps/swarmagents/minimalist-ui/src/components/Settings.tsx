@@ -558,14 +558,14 @@ function Providers({
   serverProviderCount?: number;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [preferFree, setPreferFree] = useState<boolean | null>(null);
-  const [keySelectionMode, setKeySelectionMode] = useState<string | null>(null);
-  const [vmPersistenceMode, setVmPersistenceMode] = useState<string | null>(null);
-  const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean | null>(null);
+  const [preferFree, setPreferFree] = useState<boolean>(true);
+  const [keySelectionMode, setKeySelectionMode] = useState<string>('round-robin');
+  const [vmPersistenceMode, setVmPersistenceMode] = useState<string>('persistent');
+  const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean>(true);
   const [decisionBrainEnabled, setDecisionBrainEnabled] = useState<boolean | null>(null);
   const [gitAutoCommit, setGitAutoCommit] = useState<boolean | null>(null);
   const [autoTestVerification, setAutoTestVerification] = useState<boolean | null>(null);
-  const [enableAtlas, setEnableAtlas] = useState<boolean | null>(null);
+  const [enableAtlas, setEnableAtlas] = useState<boolean>(true);
   const [packSystemPrompt, setPackSystemPrompt] = useState<boolean>(false);
   const [cacheFriendlyOrder, setCacheFriendlyOrder] = useState<boolean>(false);
   const [autoCondenseLogs, setAutoCondenseLogs] = useState<boolean>(false);

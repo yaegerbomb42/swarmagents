@@ -424,7 +424,7 @@ export default function App() {
 
       <main className="relative z-10 flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-3 sm:p-4" data-testid="workspace-main">
         {/* Component 2: the main area — the user's VM screen. */}
-        <section className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-2 overflow-y-auto rounded-[24px] glass hair p-3 sm:p-4" data-testid="stage">
+        <section className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-2 overflow-y-auto rounded-[28px] glass hair p-3 sm:p-5 shadow-[0_24px_80px_-28px_rgba(0,0,0,0.85)]" data-testid="stage">
           <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--mute)]" role="status" aria-live="polite" data-testid="workspace-activity">
             <span className={cn("h-2 w-2 shrink-0 rounded-full", phaseMeta?.active ? "bg-emerald-400 animate-pulse" : "bg-white/30")} />
             <span className="truncate">{phaseMeta?.label ?? vmDisplay.label}{activitySuffix}</span>
@@ -509,7 +509,7 @@ export default function App() {
         </section>
 
         {/* Component 1: the bottom input bar — any attachment. */}
-        <section className="mx-auto w-full max-w-3xl shrink-0" aria-label="Ask the agent">
+        <section className="mx-auto w-full max-w-3xl shrink-0 pb-3 sm:pb-0" aria-label="Ask the agent">
           {session.signedOut ? (
             <Notice
               tone="warn"

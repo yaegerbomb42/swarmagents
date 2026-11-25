@@ -982,13 +982,13 @@ export function ConnectorsPage() {
             )}
             {!registryLoading && registryRows && registryRows.length > 0 && (
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-                {registryRows.map((srv) => {
+                {registryRows.map((srv, idx) => {
                   const installable =
                     (srv.transport === "http" && Boolean(srv.url)) ||
                     (srv.transport === "stdio" && Boolean(srv.packageName));
                   return (
                     <article
-                      key={srv.id}
+                      key={`${srv.id}@${srv.version}-${idx}`}
                       className="flex flex-col justify-between rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition hover:border-white/25"
                     >
                       <div>

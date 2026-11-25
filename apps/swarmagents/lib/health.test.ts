@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { healthSnapshot } from "./health";
+import { deepHealthSnapshot, healthSnapshot } from "./health";
 import { configureStorePaths } from "./board/store";
 import { configureProviderStorePaths, saveProvider } from "./providers/store";
 
@@ -205,4 +205,18 @@ test("board.writable stays true before first boot when the parent is writable", 
     process.env.SWARM_HOME || path.join(os.homedir(), ".swarmagents"),
     path.join(process.env.SWARM_HOME || path.join(os.homedir(), ".swarmagents"), "swarm_board.json"),
   );
+});
+
+test("deepHealthSnapshot exposes non-secret subsystem diagnostics", () => {
+  process.env.SWARM_KEYS_ANTHROPIC = "sk-test-anthropic-secret";
+  try {
+    const deep = deepHealthSnapshot();
+    assert.equal(deep.subsystems.toolForgeReady, true);
+    assert.equal(deep.subsystems.atlasReady, true);
+    assert.ok(deep.subsystems.catalogConnectorCount >= 40);
+    assert.equal(typeof deep.subsystems.desktopEnabled, "boolean");
+    assert.equal(JSON.stringify(deep).includes("sk-test-anthropic-secret"), false);
+  } finally {
+    delete process.env.SWARM_KEYS_ANTHROPIC;
+  }
 });

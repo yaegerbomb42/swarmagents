@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { healthSnapshot } from "@/lib/health";
+import { deepHealthSnapshot, healthSnapshot } from "@/lib/health";
 import { adminReadinessReport, publicReadinessReport, readinessDetail, readinessSnapshot } from "@/lib/readiness";
 import { USER_HEADER, serverMode } from "@/lib/auth";
 import { localUserIdForEmail, normalizeEmail } from "@/lib/users";
@@ -53,7 +53,11 @@ export async function GET(req: NextRequest) {
   // route), so a signed-in caller sees a count of their own providers.
   const user = req.headers.get(USER_HEADER);
   const userId = user && user.length <= 128 ? user : null;
-  return NextResponse.json(healthSnapshot(process.env, userId), {
+  const payload =
+    req.nextUrl.searchParams.get("deep") === "1"
+      ? deepHealthSnapshot(process.env, userId)
+      : healthSnapshot(process.env, userId);
+  return NextResponse.json(payload, {
     headers: { "cache-control": "no-store", vary: "cookie" },
   });
 }

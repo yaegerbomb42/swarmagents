@@ -89,10 +89,15 @@ export async function searchMcpRegistry(
 
   const body = (await res.json()) as { servers?: unknown[] };
   const rows = Array.isArray(body.servers) ? body.servers : [];
+  const seen = new Set<string>();
   const results = rows
     .filter((r): r is Record<string, unknown> => typeof r === "object" && r !== null)
     .map(summarizeServer)
-    .filter((s): s is RegistryMcpSummary => s !== null);
+    .filter((s): s is RegistryMcpSummary => {
+      if (s === null || seen.has(s.id)) return false;
+      seen.add(s.id);
+      return true;
+    });
 
   cache.set(cacheKey, { expiresAt: now() + CACHE_TTL_MS, results });
   return results;

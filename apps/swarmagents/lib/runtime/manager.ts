@@ -3818,6 +3818,12 @@ export class RuntimeManager {
     const { runId, userId } = active;
     let attemptError: Extract<HarnessEvent, { type: "run.error" }> | null = null;
     let finishEvent: Extract<HarnessEvent, { type: "run.finished" }> | null = null;
+    // True once the CLI emitted any non-terminal event: the invocation did
+    // real work, so a later unknown-session error must NOT trigger a fresh
+    // retry (re-running the prompt could duplicate side effects). A resume
+    // the CLI rejects at startup emits nothing but run.error, so it is safe
+    // to retry fresh exactly once.
+    let sawProgress = false;
 
     // The router's selection is the provider/model actually serving this
     // attempt. Record it on the active run before the runner starts, so
@@ -3853,6 +3859,7 @@ export class RuntimeManager {
         });
         return;
       }
+      sawProgress = true;
       forward(event);
     };
 
@@ -3900,7 +3907,15 @@ export class RuntimeManager {
         : undefined;
 
     try {
-      const outcome = await this.runner.run(
+      // Invoke the runner; a closure so a stale --resume can be retried
+      // once fresh below without duplicating the request literal. Each
+      // invocation resets the captured outcome so the caller only ever
+      // sees the latest attempt.
+      const invoke = async (sessionId: string | undefined) => {
+        attemptError = null;
+        finishEvent = null;
+        sawProgress = false;
+        const outcome = await this.runner.run(
         {
           // The project digest rides in front of the user's ask on a fresh
           // thread only; history and Telemetry keep showing the real prompt.
@@ -3908,7 +3923,7 @@ export class RuntimeManager {
           agentCard: active.agentCard,
           memoryContext: active.memoryContext,
           systemPacker,
-          sessionId: active.sessionId,
+          sessionId,
           model: active.model,
           maxTurns: active.maxTurns,
           provider: selection?.provider,
@@ -4017,19 +4032,58 @@ export class RuntimeManager {
         },
         onAttemptEvent,
       );
+        return { outcome, attemptError, finishEvent };
+      };
+
       // Wall-clock timeout: the abort above ends the run like a cancel,
       // but a timeout is an error, not a cancellation — rewrite the
       // outcome so the caller finalizes it as run.error 'timeout'
       // instead of returning early on outcome.aborted. The runner's own
       // "Run aborted by caller." event is replaced, never published.
-      if (timedOut) {
-        attemptError = {
-          type: "run.error",
-          message: timeoutMessage ?? "Run timeout: exceeded SWARM_RUN_TIMEOUT_SEC",
+      const rewriteTimeout = (result: {
+        outcome: RunOutcome;
+        attemptError: Extract<HarnessEvent, { type: "run.error" }> | null;
+        finishEvent: Extract<HarnessEvent, { type: "run.finished" }> | null;
+      }) => {
+        if (!timedOut) return result;
+        return {
+          outcome: { ...result.outcome, aborted: false },
+          attemptError: {
+            type: "run.error",
+            message: timeoutMessage ?? "Run timeout: exceeded SWARM_RUN_TIMEOUT_SEC",
+          } as Extract<HarnessEvent, { type: "run.error" }>,
+          finishEvent: result.finishEvent,
         };
-        return { outcome: { ...outcome, aborted: false }, attemptError, finishEvent };
+      };
+
+      let result = rewriteTimeout(await invoke(active.sessionId));
+      if (timedOut) return result;
+      // Stale --resume: the persisted session is gone from the VM (VM
+      // reset, session expiry), so the CLI rejected the resume before
+      // doing any work — sawProgress is false. Drop the dead session
+      // (persisted store and this run) and retry once fresh instead of
+      // failing a trajectory the user could have continued. A fresh
+      // retry re-runs the prompt without the project-context prefix,
+      // which start() only attaches to genuinely fresh threads; the
+      // codebase context pack was already injected into the system
+      // prompt for this run, so the retry still sees the repo map.
+      if (
+        result.attemptError &&
+        active.sessionId !== undefined &&
+        isUnknownSessionError(result.attemptError.message) &&
+        !sawProgress &&
+        this.isStillActive(active) &&
+        !active.controller.signal.aborted
+      ) {
+        const staleSessionId = active.sessionId;
+        await clearLastSession(userId).catch(() => {});
+        active.sessionId = undefined;
+        console.error(
+          `[runtime] stale --resume session ${staleSessionId} for run ${runId}; retrying once fresh`,
+        );
+        result = rewriteTimeout(await invoke(undefined));
       }
-      return { outcome, attemptError, finishEvent };
+      return result;
     } catch (error) {
       // The runner surfaced a non-run failure (e.g. exec driver error). Treat
       // it as a run error so the caller's terminal handling applies uniformly.

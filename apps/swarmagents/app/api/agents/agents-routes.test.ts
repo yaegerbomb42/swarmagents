@@ -21,6 +21,7 @@ import { GET as ONE, PUT as REPLACE, DELETE as REMOVE } from "./[id]/route";
 import { POST as CLONE } from "./[id]/clone/route";
 import { GET as EXPORT } from "./[id]/export/route";
 import { containsSecretValue } from "@/lib/agents/export-secrets";
+import { SECRET_PATTERNS, makeRedactor } from "@/lib/harness/redact";
 import { GET as HISTORY } from "./[id]/history/route";
 import { POST as RESTORE } from "./[id]/restore/route";
 import { GET as COMPAT } from "./[id]/compatibility/route";
@@ -313,6 +314,67 @@ test("containsSecretValue catches the expanded credential patterns", () => {
   }
 });
 
+test("SECRET_PATTERNS covers every GitHub token prefix in one shared pattern", () => {
+  // The redactor must recognize all GitHub PAT prefixes (classic ghp_ plus
+  // fine-grained gho_/ghu_/ghs_/ghr_) so the export scanner, which derives
+  // from this same list, rejects each one.
+  const ghSources = SECRET_PATTERNS.map(({ pattern }) => pattern.source);
+  assert.ok(ghSources.some((src) => /gh\[pousr\]_/.test(src)), "missing gh[pousr]_ prefix pattern");
+  for (const prefix of ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]) {
+    const token = `${prefix}${"Aa".repeat(20)}`;
+    // Test against a fresh non-global copy: the /g flag makes .test() stateful
+    // (lastIndex persists), which would flake here.
+    const matched = SECRET_PATTERNS.some(({ pattern }) => new RegExp(pattern.source).test(token));
+    assert.equal(matched, true, `SECRET_PATTERNS should match ${prefix}`);
+  }
+});
+
+test("containsSecretValue rejects every GitHub token prefix (ghp_/gho_/ghu_/ghs_/ghr_)", () => {
+  for (const prefix of ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]) {
+    const token = `${prefix}${"A".repeat(30)}`;
+    assert.equal(containsSecretValue(token), true, `expected to detect ${prefix} token`);
+    assert.equal(containsSecretValue(`deploy with ${token} here`), true, `expected to detect ${prefix} in prose`);
+  }
+  // Fine-grained GitHub PATs are rejected too.
+  assert.equal(containsSecretValue("github_pat_" + "B".repeat(30)), true);
+});
+
+test("value scanner and redactor stay in sync on the same secret shapes", () => {
+  // The export route's value scanner derives from redact.ts SECRET_PATTERNS,
+  // so every representative secret must be BOTH refused by the value scanner
+  // AND masked by the redactor. Either side drifting independently fails here.
+  // Build each representative secret by concatenating innocuous fragments so no
+  // literal credential-shaped string sits in the source (keeps the repo's
+  // secret scanner quiet while still exercising the full shape at runtime).
+  const pad = (n: number) => "A".repeat(n);
+  const secrets = [
+    "sk-ant-api03-" + "H0AnMYyPl00lolECbMmsIaSgWO3UiM3cbe5AD9wZ2e1vCSmnkM1A",
+    "sk-proj-" + "FkLxVpY8wQeRtYuIoPaSdFgHjKlZxCvBnM",
+    "gho_" + pad(30),
+    "ghs_" + pad(30),
+    "ghr_" + pad(30),
+    "ghu_" + pad(30),
+    "github_pat_" + pad(40),
+    "AKIA" + "IOSFODNN7EXAMPLE",
+    "xoxb-" + "123456789012" + "-" + pad(24),
+    "AIzaSy" + "A1234567890abcdefghijklmnopqrstuv",
+    "-----BEGIN PRIVATE KEY-----\n" + "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQ==" + "\n" + "-----END PRIVATE KEY-----",
+    "Bearer " + "9f2e1c8a3b6d5e0f9a1c2b3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8g9h0i1j",
+    "Basic " + "dXNlcjpwYXNzd29yZA==",
+    "eyJhbGciOiJIUzI1NiJ9" + "." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0" + "." + "dozjgNryP4J3jVmNHl0w5N_XgL0n8I9ImFhX0R1t1s",
+    "gsk_" + pad(30),
+    "hf_" + pad(30),
+    "pplx-" + pad(30),
+    "https://user:password@example.com/path",
+  ];
+  const redact = makeRedactor();
+  for (const secret of secrets) {
+    assert.equal(containsSecretValue(secret), true, `value scanner should catch: ${secret.slice(0, 32)}...`);
+    const scrubbed = redact(secret);
+    assert.ok(!scrubbed.includes(secret), `redactor should mask: ${secret.slice(0, 32)}...`);
+  }
+});
+
 test("containsSecretValue does not flag benign strings that merely resemble new patterns", () => {
   const benign = [
     "AIza", // too short
@@ -325,6 +387,24 @@ test("containsSecretValue does not flag benign strings that merely resemble new 
   ];
   for (const text of benign) {
     assert.equal(containsSecretValue(text), false, `expected no false positive: ${text}`);
+  }
+});
+
+test("export refuses a prompt carrying a GitHub token", async () => {
+  for (const prefix of ["gho_", "ghu_", "ghs_", "ghr_"]) {
+    const id = `gh-${prefix.slice(0, -1)}`;
+    const prompt = `Clone via ${prefix}${"Ab".repeat(20)} for this repo.`;
+    assert.equal(
+      (await CREATE(
+        req("POST", "/api/agents", manifest({ id, identity: { systemPrompt: prompt } })),
+      )).status,
+      201,
+      `create should succeed for ${prefix}`,
+    );
+    const exported = await EXPORT(req("GET", `/api/agents/${id}/export`), ctx(id));
+    assert.equal(exported.status, 500, `export should refuse ${prefix} token`);
+    const body = (await exported.json()) as { error: string };
+    assert.match(body.error, /secret-shaped/);
   }
 });
 

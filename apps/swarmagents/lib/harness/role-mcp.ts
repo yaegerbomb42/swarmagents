@@ -33,6 +33,7 @@ import {
 } from "../roles";
 import type { RolePhase } from "./types";
 import { SWARM_VM_DESKTOP_ENV } from "../vm/desktop";
+import { VM_BROWSER_PROFILE_PATH } from "../vm/manager";
 import { SELF_MANAGE_TAIL } from "../self-manage/prompt";
 import { CODEBASE_MCP_SERVER_NAME, CODEBASE_MCP_SERVER_PATH, codebaseMcpServerSource } from "./codebase-mcp-source";
 import {
@@ -139,7 +140,9 @@ export function desktopMcpServerEntry(server: string): Record<string, unknown> |
       command: "node",
       // Headed by default (the user sees every navigation on the desktop).
       // The launcher also starts the loopback network-policy proxy.
-      args: [PLAYWRIGHT_LAUNCHER_PATH, "--browser", "chromium", "--executable-path", "/usr/bin/chromium", "--no-sandbox", "--init-page", PLAYWRIGHT_POLICY_PATH],
+      // The browser profile is the persistent one on the /workspace volume,
+      // shared with the desktop Chromium, so logins survive hibernation.
+      args: [PLAYWRIGHT_LAUNCHER_PATH, "--browser", "chromium", "--executable-path", "/usr/bin/chromium", "--user-data-dir", VM_BROWSER_PROFILE_PATH, "--no-sandbox", "--init-page", PLAYWRIGHT_POLICY_PATH],
       env: { DISPLAY: ":1" },
     };
   }
@@ -159,6 +162,11 @@ export function headlessBrowserMcpServerEntry(): Record<string, unknown> {
       "/usr/bin/chromium",
       "--no-sandbox",
       "--headless",
+      // Headless runs stay isolated (--isolated): each run gets a fresh,
+      // ephemeral profile, so one run's logins never leak into another run
+      // and concurrent runs never contend for one Chromium profile lock.
+      // Only the headed desktop browser (and its Playwright MCP server)
+      // shares the persistent /workspace/.swarm/browser-profile.
       "--isolated",
       "--output-dir",
       "/workspace/.swarm/browser-output",

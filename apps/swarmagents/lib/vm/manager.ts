@@ -33,6 +33,15 @@ export { defaultDriverName } from "./driver-default";
 
 /** Where the user-writable data lives inside the VM; du measures this path. */
 export const VM_WORKSPACE_DISK_PATH = "/workspace";
+/**
+ * Persistent browser profile inside the VM workspace. The desktop Chromium
+ * and the headed Playwright MCP server share this user-data-dir, so
+ * authenticated browser sessions survive hibernation and container
+ * recreation: the /workspace named volume is kept by the driver.
+ * Never read or return anything under this path — it holds cookies and
+ * session tokens. Only existence + total size are ever exposed.
+ */
+export const VM_BROWSER_PROFILE_PATH = "/workspace/.swarm/browser-profile";
 /** How long a du measurement is reused before it is re-run. */
 export const DISK_USAGE_TTL_MS = 60_000;
 /** du -sk prints "<kilobytes>\t<path>". */
@@ -46,6 +55,17 @@ export interface VmDiskUsage {
   quotaMb: number;
   /** True when the quota is enabled and usedMb exceeds it. */
   overQuota: boolean;
+}
+
+/**
+ * Persistent browser-profile status for one user. Existence + total size
+ * only — never file names, let alone cookie or token contents.
+ */
+export interface VmBrowserProfileStatus {
+  /** True when the profile directory exists in the VM. */
+  exists: boolean;
+  /** Total profile size in MB (rounded up); 0 when missing. */
+  sizeMb: number;
 }
 
 interface DiskUsageCacheEntry {
@@ -368,6 +388,72 @@ export class VmManager {
     const usedMb = this.diskUsageCache.get(userId)?.usedMb ?? 0;
     const quotaMb = this.quotas.diskQuotaMb;
     return { usedMb, quotaMb, overQuota: quotaMb > 0 && usedMb > quotaMb };
+  }
+
+  // -------------------------------------------------------------------------
+  // Persistent browser profile
+  // -------------------------------------------------------------------------
+
+  /**
+   * `du -sk` for one path inside the VM, in MB (rounded up). 0 when the
+   * path is missing or the measurement fails — fail-open, like the
+   * workspace disk measurement.
+   */
+  private async measurePathMb(userId: string, path: string): Promise<number> {
+    try {
+      return await this.withRead(userId, async () => {
+        const handle = await this.ensureLocked(userId);
+        let stdout = "";
+        await this.driver.exec(handle, ["du", "-sk", path], {
+          onStdout: (chunk) => {
+            stdout += chunk;
+          },
+        });
+        const kb = Number.parseInt(stdout.split("\t")[0].trim(), 10);
+        return Number.isFinite(kb) && kb >= 0 ? Math.ceil(kb / 1024) : 0;
+      });
+    } catch (error) {
+      console.error(`[vm] could not measure ${path} for ${userId}:`, error);
+      return 0;
+    }
+  }
+
+  /**
+   * Browser-profile status for a user: whether the persistent profile
+   * directory exists, and its total size. Only existence + size are ever
+   * returned — the profile holds cookies and session tokens, which must
+   * never be read out of the VM.
+   *
+   * May ensure (wake) a hibernated VM: measuring requires a live
+   * container. This is an on-demand user action (Settings / browser view),
+   * not a poll, so waking is acceptable.
+   */
+  async browserProfileStatus(userId: string): Promise<VmBrowserProfileStatus> {
+    try {
+      await this.stat(userId, VM_BROWSER_PROFILE_PATH);
+    } catch (error) {
+      if (error instanceof VmFileError && error.code === "not_found") {
+        return { exists: false, sizeMb: 0 };
+      }
+      throw error;
+    }
+    const sizeMb = await this.measurePathMb(userId, VM_BROWSER_PROFILE_PATH);
+    return { exists: true, sizeMb };
+  }
+
+  /**
+   * Delete the user's persistent browser profile (cookies, logins, session
+   * storage) from the workspace volume. The path is a fixed constant and
+   * the command runs inside the caller's own VM only — no caller input
+   * reaches it — so one user can never delete another's profile.
+   * Idempotent: removing a missing profile succeeds. Drops the cached disk
+   * measurement so the next status poll re-measures instead of reporting
+   * the deleted bytes.
+   */
+  async clearBrowserProfile(userId: string): Promise<VmBrowserProfileStatus> {
+    await this.exec(userId, ["rm", "-rf", "--", VM_BROWSER_PROFILE_PATH]);
+    this.clearDiskUsage(userId);
+    return { exists: false, sizeMb: 0 };
   }
 
   /**

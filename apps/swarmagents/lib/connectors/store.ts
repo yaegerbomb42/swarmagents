@@ -214,11 +214,23 @@ function resolvePrimaryCredential(
   cleanedInputs: Record<string, string>,
 ): PrimaryCredential {
   const primarySecretField = entry.fields.find((f) => f.secret && f.required);
-  if (!primarySecretField) return { primaryToken: undefined, reusedProviderKey: false };
+  if (!primarySecretField) {
+    for (const field of entry.fields) {
+      if (field.required && !cleanedInputs[field.key]) {
+        throw new ConnectorError(`${field.label} is required.`, 400);
+      }
+    }
+    return { primaryToken: undefined, reusedProviderKey: false };
+  }
 
   const provided = cleanedInputs[primarySecretField.key];
   if (provided) {
     const primaryToken = entry.id === "github" ? provided.replace(/^Bearer\s+/i, "").trim() : provided;
+    for (const field of entry.fields) {
+      if (field.required && field.key !== primarySecretField.key && !cleanedInputs[field.key]) {
+        throw new ConnectorError(`${field.label} is required.`, 400);
+      }
+    }
     return { primaryToken, reusedProviderKey: false };
   }
   if (entry.providerId && existingProvider?.keys && existingProvider.keys.length > 0) {
@@ -244,8 +256,13 @@ function resolveLibraryPayload(entry: ConnectorCatalogEntry): LibraryPayload | n
 function librarySecretsFor(
   entry: ConnectorCatalogEntry,
   primaryToken: string | undefined,
+  cleanedInputs: Record<string, string>,
 ): Record<string, string> {
   const secrets: Record<string, string> = {};
+  for (const field of entry.fields) {
+    const val = cleanedInputs[field.key];
+    if (val) secrets[field.key] = val;
+  }
   if (entry.id === "github" && primaryToken) secrets.Authorization = `Bearer ${primaryToken}`;
   if (entry.id === "brave-search" && primaryToken) secrets.BRAVE_API_KEY = primaryToken;
   return secrets;
@@ -266,10 +283,11 @@ function writeConnectorSideEffects(
     reusedProviderKey: boolean;
     cloudflareBaseUrl: string | undefined;
     library: LibraryPayload | null;
+    cleanedInputs: Record<string, string>;
   },
   writes: WriteTracker,
 ): void {
-  const { primaryToken, reusedProviderKey, cloudflareBaseUrl, library } = opts;
+  const { primaryToken, reusedProviderKey, cloudflareBaseUrl, library, cleanedInputs } = opts;
 
   if (entry.providerId && primaryToken && !reusedProviderKey) {
     saveProvider(userId, {
@@ -293,7 +311,7 @@ function writeConnectorSideEffects(
       name: library.catalogEntry.name,
       description: library.catalogEntry.description,
       payload: library.payload,
-      secrets: librarySecretsFor(entry, primaryToken),
+      secrets: librarySecretsFor(entry, primaryToken, cleanedInputs),
       origin: "user",
     });
     writes.wroteLibrary = true;
@@ -377,7 +395,7 @@ export function connectConnector(
   };
 
   try {
-    writeConnectorSideEffects(userId, entry, { primaryToken, reusedProviderKey, cloudflareBaseUrl, library }, writes);
+    writeConnectorSideEffects(userId, entry, { primaryToken, reusedProviderKey, cloudflareBaseUrl, library, cleanedInputs }, writes);
   } catch (err) {
     rollbackConnectorWrites(userId, entry, writes);
     if (err instanceof ConnectorError) throw err;
@@ -431,4 +449,112 @@ export function disconnectConnector(
   const connector = getConnectorStatus(userId, entry.id);
   if (!connector) throw new ConnectorError("Unknown connector.", 404);
   return { removed, connector };
+}
+
+const REGISTRY_ID_RE = /^[A-Za-z0-9._:/-]{2,120}$/;
+const NPM_PKG_RE = /^(@[a-z0-9._-]+\/)?[a-z0-9._-]+(@[A-Za-z0-9._-]+)?$/;
+const UVX_PKG_RE = /^[A-Za-z0-9._-]+$/;
+
+export interface InstallRegistryMcpInput {
+  id: string;
+  name: string;
+  description?: string;
+  transport: "http" | "stdio";
+  url?: string;
+  packageManager?: "npx" | "uvx";
+  packageName?: string;
+  env?: Record<string, string>;
+}
+
+/**
+ * Install an MCP server discovered from the live MCP Registry (or custom URL/package)
+ * directly into the user's Library store so it seeds into their VM --mcp-config.
+ */
+export function installRegistryMcp(
+  userId: string,
+  input: InstallRegistryMcpInput,
+): InstalledItemView {
+  const rawId = input.id.trim();
+  if (!REGISTRY_ID_RE.test(rawId)) {
+    throw new ConnectorError("Invalid MCP server id.", 400);
+  }
+  const slug = rawId.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "mcp";
+  const itemId = `registry-${slug}`;
+  const name = (input.name || rawId).trim().slice(0, 80);
+  const description = (input.description || `Installed MCP server (${rawId}).`).trim().slice(0, 280);
+
+  let payload: Record<string, unknown>;
+  if (input.transport === "http") {
+    const rawUrl = (input.url ?? "").trim();
+    const safety = validateProviderBaseUrl(rawUrl);
+    if (!safety.ok) {
+      throw new ConnectorError(safety.error || "Invalid remote MCP URL.", 400);
+    }
+    payload = {
+      kind: "connector",
+      transport: "http",
+      url: rawUrl,
+      requiredFields: [],
+    };
+  } else {
+    const pkgMgr = input.packageManager === "uvx" ? "uvx" : "npx";
+    const pkg = (input.packageName ?? "").trim();
+    if (pkgMgr === "npx" && !NPM_PKG_RE.test(pkg)) {
+      throw new ConnectorError("Invalid npm package name for stdio MCP.", 400);
+    }
+    if (pkgMgr === "uvx" && !UVX_PKG_RE.test(pkg)) {
+      throw new ConnectorError("Invalid Python package name for stdio MCP.", 400);
+    }
+    payload = {
+      kind: "connector",
+      transport: "stdio",
+      command: pkgMgr,
+      args: pkgMgr === "npx" ? ["-y", pkg] : [pkg],
+      requiredFields: [],
+    };
+  }
+
+  const installed = addInstalledItem(userId, {
+    id: itemId,
+    kind: "connector",
+    name,
+    description,
+    payload: payload as Parameters<typeof addInstalledItem>[1]["payload"],
+    secrets: {},
+    origin: "user",
+  });
+
+  recordAudit({
+    user: userId,
+    action: "connector.connect",
+    target: itemId,
+    result: "success",
+  });
+
+  return installed;
+}
+
+/** List installed custom, registry, and agent-authored MCPs/tools (excluding catalog connectors). */
+export function listCustomConnectors(userId: string): InstalledItemView[] {
+  const catalogLibIds = new Set(
+    CONNECTOR_CATALOG.map((c) => (c.libraryConnectorId ? libraryItemIdFor(c.libraryConnectorId) : "")).filter(Boolean),
+  );
+  return listInstalledItems(userId).filter(
+    (item) => !catalogLibIds.has(item.id),
+  );
+}
+
+export function removeCustomConnector(userId: string, itemId: string): boolean {
+  const id = itemId.trim();
+  if (!id) throw new ConnectorError("Connector item id is required.", 400);
+  const removed = deleteInstalledItem(userId, id);
+  if (removed) {
+    recordAudit({
+      user: userId,
+      action: "connector.disconnect",
+      target: id,
+      result: "success",
+    });
+  }
+  return removed;
 }

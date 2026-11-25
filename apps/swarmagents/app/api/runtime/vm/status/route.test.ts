@@ -7,7 +7,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { NextRequest } from "next/server";
-import { GET } from "./route";
+import { GET, POST } from "./route";
 import { VmManager, setVmManagerForTesting } from "../../../../../lib/vm/manager";
 import { FakeVmDriver } from "../../../../../lib/vm/fake-driver";
 import type { ExecOptions, ExecResult, VmHandle } from "../../../../../lib/vm/types";
@@ -42,7 +42,8 @@ test("status route rejects unauthenticated requests", async () => {
 
 test("status route reports a never-seen VM as missing without creating it", async () => {
   const driver = new CountingDriver();
-  setVmManagerForTesting(new VmManager({ customDriver: driver }));
+  const manager = new VmManager({ customDriver: driver });
+  setVmManagerForTesting(manager);
 
   const res = await GET(request());
   assert.equal(res.status, 200);
@@ -72,4 +73,26 @@ test("status route serves the cached disk usage and never measures it", async ()
   assert.equal(body.desktop, false);
   assert.equal(driver.ensureCalls, ensuresBefore, "the poll must not re-ensure (wake) the VM");
   assert.equal(driver.duCalls, duBefore, "the poll must not run du");
+});
+
+test("POST status wakes/boots the caller's VM and rejects unauthenticated requests", async () => {
+  const driver = new CountingDriver();
+  const manager = new VmManager({ customDriver: driver });
+  setVmManagerForTesting(manager);
+
+  assert.equal((await POST(request(null))).status, 401);
+
+  const res = await POST(request("alice"));
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as any;
+  assert.equal(body.status.status, "running");
+  assert.equal(driver.ensureCalls, 1, "POST status explicitly ensures the VM");
+
+  // Simulate container removed/stopped outside VmManager while handle was cached:
+  await driver.stop(await manager.ensure("alice"));
+  const woke = await POST(request("alice"));
+  assert.equal(woke.status, 200);
+  const wokeBody = (await woke.json()) as any;
+  assert.equal(wokeBody.status.status, "running");
+  assert.equal(driver.ensureCalls, 2, "POST status recovers a dead/stopped cached container");
 });

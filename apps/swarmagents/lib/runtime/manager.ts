@@ -50,11 +50,14 @@ import {
 import { routerProviders, userCooldownFilePath, userProvidersSignature } from "../providers/store";
 import { isAnthropicStyle } from "../providers/adapters";
 import {
+  atlasEnabledForUser,
+  contextPackerModeFor,
   keySelectionModeFor,
   readUserSettings,
   systemPackerOptionsFor,
   vmPersistenceModeFor,
 } from "../providers/settings";
+import { VM_ATLAS_REGISTRY_PATH, serializeUserVmAtlasRegistry } from "../capability-atlas/vm-registry";
 import { shouldResetVmAtRunStart, shouldStopVmAtRunEnd } from "./vm-persistence";
 import { RunProviderPool, runWithPool } from "../providers/run-pool";
 import type { AttemptOutcome, RunAttempt } from "../providers/run-pool";
@@ -1860,12 +1863,13 @@ export class RuntimeManager {
     extraAllowedTools: readonly string[] = [],
     mode?: RunModeInfo,
     restrictTools?: readonly string[],
+    useAtlas = atlasEnabled(),
   ): RolePhase {
     const gui = mode === undefined || mode.mode === "gui";
     const phase = rolePhase(role, {
       desktopMode: desktopModeEnabled() && gui,
       tools: mode === undefined || mode.mode !== "chat",
-      atlasEnabled: atlasEnabled(),
+      atlasEnabled: useAtlas,
     });
     if (restrictTools) {
       const allow = new Set(restrictTools);
@@ -1900,9 +1904,10 @@ export class RuntimeManager {
     extraAllowedTools: readonly string[] = [],
     mode?: RunModeInfo,
     restrictTools?: readonly string[],
+    useAtlas = atlasEnabled(),
   ): RolePhase {
     const main = BUILTIN_ROLES.find((role) => role.id === DEFAULT_ROLE_ID) ?? BUILTIN_ROLES[0];
-    return this.rolePhaseFor(main, extraAllowedTools, mode, restrictTools);
+    return this.rolePhaseFor(main, extraAllowedTools, mode, restrictTools, useAtlas);
   }
 
   /**
@@ -1936,6 +1941,7 @@ export class RuntimeManager {
     mode?: RunModeInfo,
   ): Promise<void> {
     const gui = mode === undefined || mode.mode === "gui";
+    const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
     // A run aborted mid-question leaves its .pending.json behind; the new
     // run's question gateway would otherwise adopt the orphan as its own
     // (waitForPendingQuestion takes the newest unseen pending file). Clear
@@ -1952,9 +1958,13 @@ export class RuntimeManager {
       desktopMode: desktopModeEnabled() && gui,
       codebaseRepoRoot: WORKSPACE_ROOT,
       extraMcpServers,
-      atlasEnabled: atlasEnabled(),
+      atlasEnabled: useAtlas,
+      ...(useAtlas ? { atlasRegistryPath: VM_ATLAS_REGISTRY_PATH } : {}),
     })) {
       await this.vm.writeFile(userId, file.path, file.content);
+    }
+    if (useAtlas) {
+      await this.vm.writeFile(userId, VM_ATLAS_REGISTRY_PATH, serializeUserVmAtlasRegistry(userId));
     }
     const libraryFiles = librarySeedFiles(userId);
     await cleanupLibrarySeedFiles(this.vm, userId, libraryFiles);
@@ -1974,16 +1984,18 @@ export class RuntimeManager {
     restrictTools?: readonly string[],
   ): Promise<void> {
     const gui = mode === undefined || mode.mode === "gui";
+    const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
     await this.vm.writeFile(
       userId,
       ROLE_MCP_CONFIG_PATH,
-      roleMcpConfigJson(this.rolePhaseFor(role, extraAllowedTools, mode, restrictTools), {
+      roleMcpConfigJson(this.rolePhaseFor(role, extraAllowedTools, mode, restrictTools, useAtlas), {
         allowedRoleIds,
         roleDef: role,
         desktopMode: desktopModeEnabled() && gui,
         codebaseRepoRoot: WORKSPACE_ROOT,
         extraMcpServers,
-        atlasEnabled: atlasEnabled(),
+        atlasEnabled: useAtlas,
+        ...(useAtlas ? { atlasRegistryPath: VM_ATLAS_REGISTRY_PATH } : {}),
       }),
     );
   }
@@ -3079,9 +3091,11 @@ export class RuntimeManager {
     const libraryPermissions = libraryAllowedToolPermissions(userId);
     const libraryServers = libraryMcpEntries(userId);
     const initialRole = active.role ?? policy.startingRole;
+    const userSettings = readUserSettings(userId);
+    const useAtlas = atlasEnabled() || atlasEnabledForUser(userSettings);
     const initialPhase = active.role
-      ? this.rolePhaseFor(active.role, libraryPermissions, active.runMode, active.toolAllowlist)
-      : this.defaultRolePhase(libraryPermissions, active.runMode, active.toolAllowlist);
+      ? this.rolePhaseFor(active.role, libraryPermissions, active.runMode, active.toolAllowlist, useAtlas)
+      : this.defaultRolePhase(libraryPermissions, active.runMode, active.toolAllowlist, useAtlas);
     try {
       await this.seedRoleFiles(
         userId,
@@ -3881,7 +3895,10 @@ export class RuntimeManager {
 
     // Token-efficiency options for this invocation's system prompt, from
     // the account's settings (absent = off = byte-identical prompt).
-    const systemPacker = systemPackerOptionsFor(readUserSettings(userId));
+    const currentSettings = readUserSettings(userId);
+    const systemPacker = systemPackerOptionsFor(currentSettings);
+    const contextPacker = contextPackerModeFor(currentSettings);
+    const useAtlas = atlasEnabled() || atlasEnabledForUser(currentSettings);
 
     // Wall-clock timeout (SWARM_RUN_TIMEOUT_SEC): aborting the controller
     // ends the attempt the same way a user cancel does, so the timer is
@@ -3908,6 +3925,7 @@ export class RuntimeManager {
           agentCard: active.agentCard,
           memoryContext: active.memoryContext,
           systemPacker,
+          ...(contextPacker === "l1" ? { contextPacker: "l1" as const } : {}),
           sessionId: active.sessionId,
           model: active.model,
           maxTurns: active.maxTurns,
@@ -3959,6 +3977,7 @@ export class RuntimeManager {
               libraryAllowedToolPermissions(userId),
               active.runMode,
               active.toolAllowlist,
+              useAtlas,
             ),
           onRoleSwitch: async (request) => {
             // The run's frozen policy is the source of truth. `catalog` here
@@ -3977,6 +3996,7 @@ export class RuntimeManager {
                 libraryAllowedToolPermissions(userId),
                 active.runMode,
                 active.toolAllowlist,
+                useAtlas,
               );
             }
             if (decision.error === "unknown_role") return null;

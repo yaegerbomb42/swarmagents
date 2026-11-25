@@ -61,6 +61,8 @@ body {
 
 .glass {
   background: var(--brand-surface);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
   box-shadow:
     inset 0 1px 0 var(--brand-top-light),
     inset 0 0 0 1px var(--brand-hairline),
@@ -68,6 +70,8 @@ body {
 }
 .glass-soft {
   background: var(--brand-surface-raised);
+  backdrop-filter: blur(12px) saturate(130%);
+  -webkit-backdrop-filter: blur(12px) saturate(130%);
   box-shadow: inset 0 1px 0 var(--brand-top-light), inset 0 0 0 1px var(--brand-hairline);
 }
 

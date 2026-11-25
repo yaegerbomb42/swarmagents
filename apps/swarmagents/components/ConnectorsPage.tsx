@@ -7,16 +7,46 @@ import {
   ArrowLeft,
   Check,
   ExternalLink,
+  Globe,
   KeyRound,
   Loader2,
   Plug,
   RefreshCw,
   Search,
   ShieldCheck,
+  Sparkles,
+  Trash2,
   Unplug,
+  Wrench,
   X,
 } from "lucide-react";
 import type { ConnectorCategory, ConnectorFieldSpec } from "../lib/connectors/catalog";
+
+interface RegistryServerRow {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  transport: "http" | "stdio" | "unknown";
+  url?: string;
+  packageManager?: "npx" | "uvx";
+  packageName?: string;
+}
+
+interface CustomConnectorRow {
+  id: string;
+  kind: string;
+  name: string;
+  description: string;
+  origin: "user" | "agent" | "public";
+  updatedAt: number;
+  payload?: {
+    transport?: string;
+    url?: string;
+    command?: string;
+    args?: string[];
+  };
+}
 
 interface ConnectorRow {
   id: string;
@@ -47,13 +77,17 @@ interface ConnectorsResponse {
   connectors: ConnectorRow[];
 }
 
-type FilterChip = "all" | "connected" | ConnectorCategory;
+type FilterChip = "all" | "connected" | "one-click" | ConnectorCategory;
+type HubMode = "catalog" | "registry" | "custom";
 
 const CHIPS: ReadonlyArray<{ id: FilterChip; label: string }> = [
   { id: "all", label: "All" },
   { id: "connected", label: "Connected" },
+  { id: "one-click", label: "1-Click Free" },
   { id: "code-cloud", label: "Code & Cloud" },
   { id: "search-data", label: "Search & Data" },
+  { id: "apps-productivity", label: "Apps & Productivity" },
+  { id: "design-files", label: "Design & Files" },
 ];
 
 function initials(name: string): string {
@@ -254,7 +288,7 @@ function ConnectorCard({ entry, busy, anyBusy, onConnect, onDisconnect, onUpdate
   return (
     <article
       data-testid={`connector-card-${entry.id}`}
-      className="flex flex-col justify-between rounded-2xl border border-white/10 bg-[#0d0e13] p-5 transition hover:border-white/20"
+      className="flex flex-col justify-between rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition hover:border-white/25 hover:bg-white/[0.05]"
     >
       <div>
         <div className="flex items-start justify-between gap-3">
@@ -416,20 +450,66 @@ function ContentView({
 }
 
 export function ConnectorsPage() {
+  const [hubMode, setHubMode] = useState<HubMode>("catalog");
   const [connectors, setConnectors] = useState<ConnectorRow[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [chip, setChip] = useState<FilterChip>("all");
+  const [visibleCount, setVisibleCount] = useState(60);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [registryQuery, setRegistryQuery] = useState("");
+  const [registryRows, setRegistryRows] = useState<RegistryServerRow[] | null>(null);
+  const [registryLoading, setRegistryLoading] = useState(false);
+  const [registryError, setRegistryError] = useState<string | null>(null);
+  const [customRows, setCustomRows] = useState<CustomConnectorRow[] | null>(null);
+  const [customLoading, setCustomLoading] = useState(false);
   const [draft, setDraft] = useState<{
     entry: ConnectorRow;
     inputs: Record<string, string>;
     saving: boolean;
     error: string;
   } | null>(null);
+
+  const loadCustom = useCallback(async () => {
+    setCustomLoading(true);
+    try {
+      const res = await fetch("/api/connectors/custom", { cache: "no-store" });
+      if (res.ok) {
+        const data = (await res.json()) as { items?: CustomConnectorRow[] };
+        setCustomRows(Array.isArray(data.items) ? data.items : []);
+      }
+    } catch {
+      // ignore optional load errors
+    } finally {
+      setCustomLoading(false);
+    }
+  }, []);
+
+  const searchRegistry = useCallback(async (q: string) => {
+    setRegistryLoading(true);
+    setRegistryError(null);
+    try {
+      const res = await fetch(`/api/connectors/registry?q=${encodeURIComponent(q)}&limit=30`, {
+        cache: "no-store",
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        servers?: RegistryServerRow[];
+        error?: string;
+      };
+      if (!res.ok) {
+        setRegistryError(data.error ?? "Could not search the MCP registry.");
+        return;
+      }
+      setRegistryRows(Array.isArray(data.servers) ? data.servers : []);
+    } catch {
+      setRegistryError("Network error while querying the MCP registry.");
+    } finally {
+      setRegistryLoading(false);
+    }
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -456,14 +536,22 @@ export function ConnectorsPage() {
 
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadCustom();
+  }, [load, loadCustom]);
+
+  useEffect(() => {
+    if (hubMode === "registry" && registryRows === null && !registryLoading) {
+      void searchRegistry("");
+    }
+  }, [hubMode, registryRows, registryLoading, searchRegistry]);
 
   const filtered = useMemo(() => {
     if (!connectors) return [];
     const q = query.trim().toLowerCase();
     return connectors.filter((c) => {
       if (chip === "connected" && !c.connected) return false;
-      if (chip !== "all" && chip !== "connected" && c.category !== chip) return false;
+      if (chip === "one-click" && !c.canOneClickConnect) return false;
+      if (chip !== "all" && chip !== "connected" && chip !== "one-click" && c.category !== chip) return false;
       if (!q) return true;
       return (
         c.name.toLowerCase().includes(q) ||
@@ -474,6 +562,71 @@ export function ConnectorsPage() {
       );
     });
   }, [connectors, query, chip]);
+
+  useEffect(() => {
+    setVisibleCount(60);
+  }, [query, chip]);
+
+  const visibleFiltered = useMemo(
+    () => filtered.slice(0, visibleCount),
+    [filtered, visibleCount],
+  );
+
+  const handleInstallRegistry = async (srv: RegistryServerRow) => {
+    if (busyId) return;
+    setBusyId(srv.id);
+    setNotice(null);
+    setActionError(null);
+    try {
+      const res = await fetch("/api/connectors/registry", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          id: srv.id,
+          name: srv.name,
+          description: srv.description,
+          transport: srv.transport === "stdio" ? "stdio" : "http",
+          url: srv.url,
+          packageManager: srv.packageManager,
+          packageName: srv.packageName,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) {
+        setActionError(data.error ?? `Could not install ${srv.name}.`);
+        return;
+      }
+      setNotice(`${srv.name} installed into your VM --mcp-config.`);
+      void loadCustom();
+    } catch {
+      setActionError(`Network error while installing ${srv.name}.`);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleRemoveCustom = async (item: CustomConnectorRow) => {
+    if (busyId) return;
+    setBusyId(item.id);
+    setNotice(null);
+    setActionError(null);
+    try {
+      const res = await fetch(`/api/connectors/custom?id=${encodeURIComponent(item.id)}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        setActionError(data.error ?? `Could not remove ${item.name}.`);
+        return;
+      }
+      setNotice(`${item.name} removed from your VM tools.`);
+      void loadCustom();
+    } catch {
+      setActionError(`Network error while removing ${item.name}.`);
+    } finally {
+      setBusyId(null);
+    }
+  };
 
   const connectedCount = useMemo(
     () => (connectors ?? []).filter((c) => c.connected).length,
@@ -651,45 +804,122 @@ export function ConnectorsPage() {
           )}
         </header>
 
-        {/* Search + Filter pills */}
-        <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <label className="relative block w-full sm:max-w-xs">
-            <Search
-              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
-              aria-hidden
-            />
-            <input
-              type="search"
-              aria-label="Search connectors"
-              placeholder="Search GitHub, Vercel, Exa…"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              className="w-full rounded-xl border border-white/10 bg-[#111218] py-2 pl-9 pr-3 text-sm text-white placeholder:text-zinc-500 focus:border-cyan-400/50 focus:outline-none focus:ring-2 focus:ring-cyan-400/20"
-            />
-          </label>
-          <fieldset className="m-0 min-w-0 border-0 p-0">
-            <legend className="sr-only">Connector categories</legend>
-            <div className="flex flex-wrap items-center gap-1.5">
-              {CHIPS.map((item) => {
-              const active = chip === item.id;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setChip(item.id)}
-                  className={
-                    active
-                      ? "rounded-full border border-cyan-400/40 bg-cyan-400/15 px-3 py-1.5 text-xs font-medium text-cyan-200"
-                      : "rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-zinc-400 transition hover:bg-white/[0.08] hover:text-white"
-                  }
-                >
-                  {item.label}
-                </button>
-              );
-            })}
-            </div>
-          </fieldset>
+        {/* Hub Mode Switcher */}
+        <div className="mt-6 flex flex-wrap items-center gap-2 border-b border-white/10 pb-4">
+          <button
+            type="button"
+            onClick={() => setHubMode("catalog")}
+            className={
+              hubMode === "catalog"
+                ? "inline-flex items-center gap-1.5 rounded-xl border border-cyan-400/40 bg-cyan-400/15 px-3.5 py-2 text-xs font-medium text-cyan-200 backdrop-blur-md"
+                : "inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-2 text-xs text-zinc-400 hover:bg-white/[0.07] hover:text-white"
+            }
+          >
+            <Plug className="h-3.5 w-3.5" aria-hidden />
+            Verified Connectors ({connectors?.length ?? 44})
+          </button>
+          <button
+            type="button"
+            onClick={() => setHubMode("registry")}
+            className={
+              hubMode === "registry"
+                ? "inline-flex items-center gap-1.5 rounded-xl border border-cyan-400/40 bg-cyan-400/15 px-3.5 py-2 text-xs font-medium text-cyan-200 backdrop-blur-md"
+                : "inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-2 text-xs text-zinc-400 hover:bg-white/[0.07] hover:text-white"
+            }
+          >
+            <Globe className="h-3.5 w-3.5" aria-hidden />
+            Live MCP Registry (100s)
+          </button>
+          <button
+            type="button"
+            onClick={() => setHubMode("custom")}
+            className={
+              hubMode === "custom"
+                ? "inline-flex items-center gap-1.5 rounded-xl border border-cyan-400/40 bg-cyan-400/15 px-3.5 py-2 text-xs font-medium text-cyan-200 backdrop-blur-md"
+                : "inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-2 text-xs text-zinc-400 hover:bg-white/[0.07] hover:text-white"
+            }
+          >
+            <Wrench className="h-3.5 w-3.5" aria-hidden />
+            Custom & Agent-Authored ({customRows?.length ?? 0})
+          </button>
         </div>
+
+        {hubMode === "catalog" && (
+          <>
+            {/* Search + Filter pills */}
+            <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <label className="relative block w-full sm:max-w-xs">
+                <Search
+                  className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
+                  aria-hidden
+                />
+                <input
+                  type="search"
+                  aria-label="Search connectors"
+                  placeholder="Search GitHub, Slack, Postgres, Exa…"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  className="w-full rounded-xl border border-white/10 bg-white/[0.04] backdrop-blur-md py-2 pl-9 pr-3 text-sm text-white placeholder:text-zinc-500 focus:border-cyan-400/50 focus:outline-none focus:ring-2 focus:ring-cyan-400/20"
+                />
+              </label>
+              <fieldset className="m-0 min-w-0 border-0 p-0">
+                <legend className="sr-only">Connector categories</legend>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {CHIPS.map((item) => {
+                  const active = chip === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => setChip(item.id)}
+                      className={
+                        active
+                          ? "rounded-full border border-cyan-400/40 bg-cyan-400/15 px-3 py-1.5 text-xs font-medium text-cyan-200"
+                          : "rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-zinc-400 transition hover:bg-white/[0.08] hover:text-white"
+                      }
+                    >
+                      {item.label}
+                    </button>
+                  );
+                })}
+                </div>
+              </fieldset>
+            </div>
+          </>
+        )}
+
+        {hubMode === "registry" && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void searchRegistry(registryQuery);
+            }}
+            className="mt-5 flex flex-col gap-2 sm:flex-row sm:items-center"
+          >
+            <label className="relative block flex-1">
+              <Globe
+                className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
+                aria-hidden
+              />
+              <input
+                type="search"
+                aria-label="Search official MCP Registry"
+                placeholder="Search hundreds of live MCP servers (e.g. stripe, postgres, notion, github, memory)…"
+                value={registryQuery}
+                onChange={(e) => setRegistryQuery(e.target.value)}
+                className="w-full rounded-xl border border-white/10 bg-white/[0.04] backdrop-blur-md py-2 pl-9 pr-3 text-sm text-white placeholder:text-zinc-500 focus:border-cyan-400/50 focus:outline-none focus:ring-2 focus:ring-cyan-400/20"
+              />
+            </label>
+            <button
+              type="submit"
+              disabled={registryLoading}
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-cyan-300/35 bg-cyan-400/15 px-4 py-2 text-xs font-medium text-cyan-100 hover:bg-cyan-400/25 disabled:opacity-50"
+            >
+              {registryLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Search className="h-3.5 w-3.5" aria-hidden />}
+              Search Registry
+            </button>
+          </form>
+        )}
 
         {/* Notifications */}
         {actionError && (
@@ -725,20 +955,162 @@ export function ConnectorsPage() {
         )}
 
         {/* Content */}
-        <ContentView
-          loading={loading}
-          loadError={loadError}
-          filtered={filtered}
-          busyId={busyId}
-          onRetry={() => void load()}
-          onResetFilters={() => {
-            setQuery("");
-            setChip("all");
-          }}
-          onConnect={handleOneClickConnect}
-          onDisconnect={handleDisconnect}
-          onUpdate={openModal}
-        />
+        {hubMode === "catalog" && (
+          <>
+            <ContentView
+              loading={loading}
+              loadError={loadError}
+              filtered={visibleFiltered}
+              busyId={busyId}
+              onRetry={() => void load()}
+              onResetFilters={() => {
+                setQuery("");
+                setChip("all");
+              }}
+              onConnect={handleOneClickConnect}
+              onDisconnect={handleDisconnect}
+              onUpdate={openModal}
+            />
+            {!loading && !loadError && filtered.length > visibleCount && (
+              <div className="mt-6 flex flex-col items-center gap-2">
+                <p className="text-xs text-zinc-500">
+                  Showing {visibleFiltered.length} of {filtered.length} connectors
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount((n) => n + 60)}
+                  className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-200 transition hover:bg-white/[0.08]"
+                >
+                  Load 60 more ({filtered.length - visibleCount} remaining)
+                </button>
+              </div>
+            )}
+          </>
+        )}
+
+        {hubMode === "registry" && (
+          <section className="mt-6" aria-label="Live MCP Registry results">
+            {registryLoading && (
+              <output className="mt-6 flex items-center gap-2 text-sm text-zinc-400">
+                <Loader2 className="h-4 w-4 animate-spin text-cyan-300" aria-hidden />
+                Searching official MCP Registry…
+              </output>
+            )}
+            {registryError && (
+              <p role="alert" className="mt-4 rounded-xl border border-red-400/30 bg-red-950/40 p-4 text-sm text-red-200">
+                {registryError}
+              </p>
+            )}
+            {!registryLoading && !registryError && registryRows && registryRows.length === 0 && (
+              <div className="mt-6 rounded-2xl border border-dashed border-white/15 p-10 text-center text-sm text-zinc-400">
+                No MCP servers matched &ldquo;{registryQuery}&rdquo;. Try another keyword.
+              </div>
+            )}
+            {!registryLoading && registryRows && registryRows.length > 0 && (
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+                {registryRows.map((srv, idx) => {
+                  const installable =
+                    (srv.transport === "http" && Boolean(srv.url)) ||
+                    (srv.transport === "stdio" && Boolean(srv.packageName));
+                  return (
+                    <article
+                      key={`${srv.id}@${srv.version}-${idx}`}
+                      className="flex flex-col justify-between rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition hover:border-white/25"
+                    >
+                      <div>
+                        <div className="flex items-start justify-between gap-2">
+                          <h2 className="truncate text-sm font-semibold text-white">{srv.name}</h2>
+                          <span className="shrink-0 rounded-full border border-white/15 bg-white/[0.05] px-2 py-0.5 font-mono text-[10px] text-zinc-300">
+                            {srv.transport}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-xs leading-relaxed text-zinc-400">
+                          {srv.description || "Official MCP registry server."}
+                        </p>
+                        {srv.packageName && (
+                          <p className="mt-2 truncate font-mono text-[11px] text-cyan-300/80">
+                            {srv.packageManager ?? "npx"} {srv.packageName}
+                          </p>
+                        )}
+                      </div>
+                      <div className="mt-4 flex items-center justify-between border-t border-white/[0.08] pt-3">
+                        <span className="font-mono text-[10px] text-zinc-500">v{srv.version}</span>
+                        {installable ? (
+                          <button
+                            type="button"
+                            disabled={Boolean(busyId)}
+                            onClick={() => void handleInstallRegistry(srv)}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-300/35 bg-cyan-400/15 px-3 py-1.5 text-xs font-medium text-cyan-100 hover:bg-cyan-400/25 disabled:opacity-50"
+                          >
+                            {busyId === srv.id ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                            ) : (
+                              <Sparkles className="h-3.5 w-3.5" aria-hidden />
+                            )}
+                            Install to VM
+                          </button>
+                        ) : (
+                          <span className="text-[11px] text-zinc-500">Manual config</span>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
+
+        {hubMode === "custom" && (
+          <section className="mt-6" aria-label="Custom and agent-authored tools">
+            {customLoading && (
+              <output className="mt-6 flex items-center gap-2 text-sm text-zinc-400">
+                <Loader2 className="h-4 w-4 animate-spin text-cyan-300" aria-hidden />
+                Loading custom &amp; agent-authored MCPs…
+              </output>
+            )}
+            {!customLoading && (!customRows || customRows.length === 0) && (
+              <div className="mt-6 rounded-2xl border border-dashed border-white/15 p-10 text-center">
+                <p className="text-sm font-medium text-zinc-200">No custom or agent-authored MCPs installed yet</p>
+                <p className="mt-1 text-xs text-zinc-400">
+                  Install servers from the Live MCP Registry tab, or ask your agent inside the VM to author and register a custom tool.
+                </p>
+              </div>
+            )}
+            {!customLoading && customRows && customRows.length > 0 && (
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+                {customRows.map((item) => (
+                  <article
+                    key={item.id}
+                    className="flex flex-col justify-between rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl p-5"
+                  >
+                    <div>
+                      <div className="flex items-start justify-between gap-2">
+                        <h2 className="truncate text-sm font-semibold text-white">{item.name}</h2>
+                        <span className="shrink-0 rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2 py-0.5 text-[10px] font-medium text-cyan-200">
+                          {item.origin === "agent" ? "Agent-authored" : item.kind}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-xs leading-relaxed text-zinc-400">{item.description}</p>
+                    </div>
+                    <div className="mt-4 flex items-center justify-between border-t border-white/[0.08] pt-3">
+                      <span className="font-mono text-[10px] text-zinc-500">{item.id}</span>
+                      <button
+                        type="button"
+                        disabled={Boolean(busyId)}
+                        onClick={() => void handleRemoveCustom(item)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-red-400/30 bg-red-500/10 px-2.5 py-1 text-xs text-red-200 hover:bg-red-500/20 disabled:opacity-50"
+                      >
+                        <Trash2 className="h-3 w-3" aria-hidden />
+                        Remove
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
       </div>
 
       {/* Credential connection dialog */}

@@ -263,6 +263,9 @@ export function DesktopView({
     let opened = false;
     const wantsControl = intentRef.current;
     const target = document.createElement("div");
+    target.className = "h-full w-full";
+    target.style.width = "100%";
+    target.style.height = "100%";
     holder.replaceChildren();
     holder.appendChild(target);
     let rfb: RFB;
@@ -287,6 +290,18 @@ export function DesktopView({
     // Input stays off until the server grants control (the proxy filters
     // server-side too; this just keeps noVNC from sending into the void).
     rfb.viewOnly = modeRef.current !== "control";
+    const rescaleIfVisible = () => {
+      if (rfbRef.current !== rfb) return;
+      const rect = holder.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        rfb.scaleViewport = true;
+      }
+    };
+    const resizeObserver =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(() => rescaleIfVisible())
+        : null;
+    resizeObserver?.observe(holder);
     rfb.addEventListener("connect", () => {
       opened = true;
       dialOpenedAtRef.current = Date.now();
@@ -294,24 +309,32 @@ export function DesktopView({
         setLatencyMs(Math.max(0, Math.round(performance.now() - dialStartedRef.current)));
       }
       dispatch({ type: "open" });
+      rescaleIfVisible();
       if (modeRef.current === "control") rfb.focus({ preventScroll: true });
     });
     rfb.addEventListener("disconnect", (ev) => {
       if (rfbRef.current !== rfb) return; // stale teardown event — ignore
       const clean = Boolean(ev.detail?.clean);
-      // Live socket said goodbye (or the dial failed outright): reconnect
-      // with backoff, or fall back offline. teardown() also releases the
-      // meter and the surface DOM.
-      teardown();
+      // RFB already transitioned to "disconnected" before emitting "disconnect";
+      // avoid calling rfb.disconnect() again or noVNC logs a disconnected-state error.
+      resizeObserver?.disconnect();
+      rfbRef.current = null;
+      meterRef.current?.stop();
+      meterRef.current = null;
+      if (surfaceHolderRef.current) {
+        surfaceHolderRef.current.replaceChildren();
+      }
       dispatch(clean && !opened ? { type: "refused" } : { type: "drop" });
     });
     rfb.addEventListener("credentialsrequired", () => {
       // Auth is injected proxy-side; asking the browser for credentials means
       // the contract is broken — treat as a refused dial.
+      resizeObserver?.disconnect();
       if (rfbRef.current === rfb) teardown();
       dispatch({ type: "refused" });
     });
     return () => {
+      resizeObserver?.disconnect();
       if (rfbRef.current === rfb && !opened) {
         // A dial that never opened is torn down here (unmount, mode switch,
         // or the phase moved on). Live sockets are torn down on their own
@@ -390,9 +413,9 @@ export function DesktopView({
   // with the effective mode (the proxy enforces the same server-side).
   useEffect(() => {
     const rfb = rfbRef.current;
-    if (!rfb) return;
+    if (!rfb || conn.phase !== "live") return;
     rfb.viewOnly = mode !== "control";
-    if (mode === "control" && conn.phase === "live") rfb.focus({ preventScroll: true });
+    if (mode === "control") rfb.focus({ preventScroll: true });
   }, [mode, conn.phase]);
 
   // While a takeover is pending (or held), poll the proxy's takeover-state
@@ -446,9 +469,12 @@ export function DesktopView({
   }, [controlled, onControlChange]);
 
   const onReconnect = useCallback(() => {
+    if (conn.phase === "offline") {
+      void fetch("/api/runtime/vm/status", { method: "POST" }).catch(() => undefined);
+    }
     teardown();
     dispatch({ type: "retry-now" });
-  }, [teardown]);
+  }, [conn.phase, teardown]);
 
   const onFullscreen = useCallback(() => {
     const frame = frameRef.current;

@@ -21,3 +21,32 @@ export function parseToolArgs(tool: string, args: Record<string, unknown>): Pars
 
 /** Short human-readable summary of a tool call (for telemetry/activity strip). */
 export function summarizeTool(tool: string, args: Record<string, unknown>): string;
+
+/** Window entry parsed from wmctrl -lG for non-vision LLM targeting. */
+export interface WmctrlWindow {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  cx: number;
+  cy: number;
+  title: string;
+}
+
+/** OCR text bounding box parsed from Tesseract TSV output. */
+export interface OcrTarget {
+  text: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  cx: number;
+  cy: number;
+}
+
+/** Parse `wmctrl -lG` stdout into window records with clickable center coords. */
+export function parseWmctrlWindows(stdout: string): WmctrlWindow[];
+
+/** Parse Tesseract TSV output into grouped clickable text coordinates. */
+export function parseTesseractTsv(tsv: string, maxItems?: number): OcrTarget[];

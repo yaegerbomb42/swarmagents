@@ -71,6 +71,11 @@ export interface UserSettings {
    * Decision Brain loop control. Absent = off.
    */
   decisionBrain?: DecisionBrainSettingsInput;
+  /**
+   * Zero-bloat capability discovery (capability-atlas BM25 + local embedding
+   * search over 40+ connectors and custom VM tools). Absent = on.
+   */
+  enableAtlas?: boolean;
 }
 
 /**
@@ -173,6 +178,16 @@ export interface TokenEfficiencySettings {
    * prompt the model sees, so it is opt-in. Default false.
    */
   cacheFriendlyOrder?: boolean;
+  /**
+   * Context packer mode ("claude-code" default, or "l1" for 8,192-token
+   * AST-sliced fresh rebuild per turn).
+   */
+  contextPacker?: "claude-code" | "l1";
+  /**
+   * Condense noisy build/test tool logs across long trajectories. Default true
+   * when packSystemPrompt is enabled, or explicitly toggled.
+   */
+  autoCondenseLogs?: boolean;
 }
 
 /** Default estimated-token cap for the appended system prompt when packing. */
@@ -204,6 +219,19 @@ export function tokenEfficiencyFor(settings: UserSettings): ResolvedTokenEfficie
         : DEFAULT_SYSTEM_BUDGET_TOKENS,
     cacheFriendlyOrder: te?.cacheFriendlyOrder === true,
   };
+}
+
+export function contextPackerModeFor(settings: UserSettings): "claude-code" | "l1" {
+  return settings.tokenEfficiency?.contextPacker === "l1" ? "l1" : "claude-code";
+}
+
+export function autoCondenseLogsFor(settings: UserSettings): boolean {
+  return settings.tokenEfficiency?.autoCondenseLogs === true;
+}
+
+/** Is zero-bloat capability-atlas discovery enabled for this user? Default true. */
+export function atlasEnabledForUser(settings: UserSettings): boolean {
+  return settings.enableAtlas !== false;
 }
 
 /**
@@ -269,6 +297,10 @@ function parseTokenEfficiency(value: unknown): TokenEfficiencySettings | undefin
   const out: TokenEfficiencySettings = {};
   if (typeof value.packSystemPrompt === "boolean") out.packSystemPrompt = value.packSystemPrompt;
   if (typeof value.cacheFriendlyOrder === "boolean") out.cacheFriendlyOrder = value.cacheFriendlyOrder;
+  if (value.contextPacker === "l1" || value.contextPacker === "claude-code") {
+    out.contextPacker = value.contextPacker;
+  }
+  if (typeof value.autoCondenseLogs === "boolean") out.autoCondenseLogs = value.autoCondenseLogs;
   const budget = value.systemBudgetTokens;
   if (typeof budget === "number" && Number.isFinite(budget) && budget > 0) {
     out.systemBudgetTokens = Math.min(
@@ -370,6 +402,7 @@ export function parseUserSettings(raw: unknown): UserSettings {
   if (webSearch !== undefined) out.webSearch = webSearch;
   const decisionBrain = parseDecisionBrain(raw.decisionBrain);
   if (decisionBrain !== undefined) out.decisionBrain = decisionBrain;
+  if (typeof raw.enableAtlas === "boolean") out.enableAtlas = raw.enableAtlas;
   return out;
 }
 

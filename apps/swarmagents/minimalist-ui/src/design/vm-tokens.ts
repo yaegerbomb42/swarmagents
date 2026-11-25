@@ -28,13 +28,13 @@ import type { StatusTone } from "../../../lib/client/runPhase";
 /** The stage: what the views are painted on. One black, everywhere. */
 export const SURFACE = {
   /** Outer frame of the screen (behind the chrome). */
-  stage: "bg-[#08080b]",
+  stage: "bg-[#090e1c]/80 backdrop-blur-2xl shadow-[inset_0_1px_0_rgba(255,255,255,0.14),0_24px_60px_-24px_rgba(0,0,0,0.85)]",
   /** The well inside the chrome: the viewport each view fills. */
-  well: "bg-[#0a0a0e]",
+  well: "bg-[#060913]/90",
   /** Raised strips inside the well (a browser address bar, a file preview head). */
-  raised: "bg-[#111116]",
+  raised: "bg-[#121a30]/80 backdrop-blur-md",
   /** Hairline between chrome and content. */
-  line: "border-[#232329]",
+  line: "border-white/[0.09]",
   /** The desktop stage keeps pure black so the noVNC pixels are never tinted. */
   desktop: "bg-black",
 } as const;
@@ -49,15 +49,15 @@ export const SURFACE = {
 export const CHROME = {
   /** The one top bar: view tabs, presence, controls. */
   bar: "flex h-9 shrink-0 items-center gap-2 border-b px-2",
-  barLook: "border-[#232329] bg-[#0d0d11]",
+  barLook: "border-white/[0.09] bg-white/[0.03] backdrop-blur-xl",
   /** The one status bar under the stage: VM, run, connection, presence. */
   statusBar: "flex h-8 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-t px-2.5 text-[11px]",
-  statusBarLook: "border-[#232329] bg-[#0d0d11]",
+  statusBarLook: "border-white/[0.09] bg-white/[0.03] backdrop-blur-xl",
   /** The view switcher: one pill group, identical in every view. */
-  tabGroup: "inline-flex h-7 shrink-0 items-center gap-0.5 rounded-lg border border-[#26262d] bg-black/40 p-0.5",
-  tab: "inline-flex h-6 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sa-accent-fg/60",
-  tabActive: "bg-[#23232b] text-sa-fg",
-  tabIdle: "text-sa-fg3 hover:bg-white/5 hover:text-sa-fg2",
+  tabGroup: "inline-flex h-7 shrink-0 items-center gap-0.5 rounded-xl border border-white/[0.09] bg-black/35 p-0.5 shadow-[inset_0_1px_3px_rgba(0,0,0,0.5)]",
+  tab: "inline-flex h-6 items-center gap-1.5 rounded-lg px-2 text-[11px] font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sa-accent-fg/60",
+  tabActive: "bg-white/[0.12] text-sa-fg shadow-[inset_0_1px_0_rgba(255,255,255,0.2),0_2px_8px_-2px_rgba(0,0,0,0.6)]",
+  tabIdle: "text-sa-fg3 hover:bg-white/[0.05] hover:text-sa-fg2",
   /** Small icon-only control in the bar. */
   iconButton:
     "grid h-6 w-6 shrink-0 place-items-center rounded-md text-sa-fg3 transition-colors hover:bg-white/5 hover:text-sa-fg disabled:cursor-not-allowed disabled:opacity-40",

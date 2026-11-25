@@ -12,7 +12,12 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseToolArgs, summarizeTool } from "../../vm-image-desktop/computer-mcp/validate.mjs";
+import {
+  parseTesseractTsv,
+  parseToolArgs,
+  parseWmctrlWindows,
+  summarizeTool,
+} from "../../vm-image-desktop/computer-mcp/validate.mjs";
 import {
   classifyDesktopToolCall,
   classifyDesktopToolCallAsync,
@@ -273,4 +278,28 @@ test("summarizeTool (server side) stays consistent with the harness summaries", 
   assert.equal(summarizeTool("key", { combo: "Return" }), "Pressing Return");
   assert.equal(summarizeTool("open_app", { name: "browser" }), "Opening browser");
   assert.equal(summarizeTool("scroll", { dx: 0, dy: -4 }), "Scrolling up");
+  assert.equal(summarizeTool("describe_screen", {}), "Reading screen layout and clickable text");
+});
+
+test("non-vision desktop helpers parse describe_screen, wmctrl windows, and Tesseract TSV coordinates", () => {
+  assert.deepEqual(parseToolArgs("describe_screen", {}), { ok: true, cmds: [] });
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__describe_screen", {})?.level, "allow");
+
+  const windows = parseWmctrlWindows(
+    "0x01a00003  0 10   28   1580 840  node Chromium\n0x02400001  0 0    0    1600 28   node xfce4-panel\n",
+  );
+  assert.equal(windows.length, 2);
+  assert.equal(windows[0].title, "Chromium");
+  assert.deepEqual({ cx: windows[0].cx, cy: windows[0].cy }, { cx: 800, cy: 448 });
+
+  const tsv = [
+    "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext",
+    "5\t1\t1\t1\t1\t1\t100\t200\t40\t16\t92\tSign",
+    "5\t1\t1\t1\t1\t2\t148\t200\t32\t16\t95\tIn",
+    "5\t1\t2\t1\t1\t1\t10\t10\t20\t10\t12\tnoise",
+  ].join("\n");
+  const targets = parseTesseractTsv(tsv, 10);
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0].text, "Sign In");
+  assert.deepEqual({ cx: targets[0].cx, cy: targets[0].cy }, { cx: 140, cy: 208 });
 });

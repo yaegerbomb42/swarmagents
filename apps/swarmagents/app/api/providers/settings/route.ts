@@ -17,12 +17,16 @@ import {
   MAX_SYSTEM_BUDGET_TOKENS,
   MIN_SYSTEM_BUDGET_TOKENS,
   VM_PERSISTENCE_MODES,
+  atlasEnabledForUser,
+  autoCondenseLogsFor,
   codebaseContextInjectionEnabled,
+  contextPackerModeFor,
   isKeySelectionMode,
   isVmPersistenceMode,
   keySelectionModeFor,
   parseWebSearchConfig,
   readUserSettings,
+  tokenEfficiencyFor,
   updateUserSettings,
   vmPersistenceModeFor,
 } from "@/lib/providers/settings";
@@ -38,6 +42,12 @@ function publicSettings(settings: UserSettings): Record<string, unknown> {
   const out: Record<string, unknown> = {
     ...settings,
     injectCodebaseContext: codebaseContextInjectionEnabled(settings),
+    enableAtlas: atlasEnabledForUser(settings),
+    tokenEfficiency: {
+      ...tokenEfficiencyFor(settings),
+      contextPacker: contextPackerModeFor(settings),
+      autoCondenseLogs: autoCondenseLogsFor(settings),
+    },
     keySelectionMode: keySelectionModeFor(settings),
     vmPersistenceMode: vmPersistenceModeFor(settings),
   };
@@ -94,6 +104,12 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: "injectCodebaseContext must be a boolean." }, { status: 400 });
     }
     patch.injectCodebaseContext = input.injectCodebaseContext;
+  }
+  if ("enableAtlas" in input) {
+    if (typeof input.enableAtlas !== "boolean") {
+      return NextResponse.json({ error: "enableAtlas must be a boolean." }, { status: 400 });
+    }
+    patch.enableAtlas = input.enableAtlas;
   }
   if ("allowPaidProviders" in input) {
     if (typeof input.allowPaidProviders !== "boolean") {
@@ -165,12 +181,21 @@ export async function PUT(request: NextRequest) {
     // Merge over the stored values so a partial update (e.g. flipping one
     // toggle) cannot wipe a budget set through the API earlier.
     const nextTe: TokenEfficiencySettings = { ...(readUserSettings(owner).tokenEfficiency ?? {}) };
-    for (const field of ["packSystemPrompt", "cacheFriendlyOrder"] as const) {
+    for (const field of ["packSystemPrompt", "cacheFriendlyOrder", "autoCondenseLogs"] as const) {
       if (!(field in te)) continue;
       if (typeof te[field] !== "boolean") {
         return NextResponse.json({ error: `tokenEfficiency.${field} must be a boolean.` }, { status: 400 });
       }
       nextTe[field] = te[field] as boolean;
+    }
+    if ("contextPacker" in te) {
+      if (te.contextPacker !== "claude-code" && te.contextPacker !== "l1") {
+        return NextResponse.json(
+          { error: "tokenEfficiency.contextPacker must be 'claude-code' or 'l1'." },
+          { status: 400 },
+        );
+      }
+      nextTe.contextPacker = te.contextPacker;
     }
     if ("systemBudgetTokens" in te) {
       const budget = te.systemBudgetTokens;

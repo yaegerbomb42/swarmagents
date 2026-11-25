@@ -558,13 +558,19 @@ function Providers({
   serverProviderCount?: number;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [preferFree, setPreferFree] = useState<boolean | null>(null);
-  const [keySelectionMode, setKeySelectionMode] = useState<string | null>(null);
-  const [vmPersistenceMode, setVmPersistenceMode] = useState<string | null>(null);
-  const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean | null>(null);
+  const [preferFree, setPreferFree] = useState<boolean>(true);
+  const [keySelectionMode, setKeySelectionMode] = useState<string>('round-robin');
+  const [vmPersistenceMode, setVmPersistenceMode] = useState<string>('persistent');
+  const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean>(true);
   const [decisionBrainEnabled, setDecisionBrainEnabled] = useState<boolean | null>(null);
   const [gitAutoCommit, setGitAutoCommit] = useState<boolean | null>(null);
   const [autoTestVerification, setAutoTestVerification] = useState<boolean | null>(null);
+  const [enableAtlas, setEnableAtlas] = useState<boolean>(true);
+  const [packSystemPrompt, setPackSystemPrompt] = useState<boolean>(false);
+  const [cacheFriendlyOrder, setCacheFriendlyOrder] = useState<boolean>(false);
+  const [autoCondenseLogs, setAutoCondenseLogs] = useState<boolean>(false);
+  const [contextPacker, setContextPacker] = useState<'claude-code' | 'l1'>('claude-code');
+  const [systemBudgetTokens, setSystemBudgetTokens] = useState<number>(16000);
   const [allowPaidProviders, setAllowPaidProviders] = useState<boolean>(false);
   const [perRunBudget, setPerRunBudget] = useState<string>('');
   const [perDayBudget, setPerDayBudget] = useState<string>('');
@@ -587,6 +593,8 @@ function Providers({
           const body = (await settingsRes.json()) as {
             preferFreeProviders?: unknown;
             injectCodebaseContext?: unknown;
+            enableAtlas?: unknown;
+            tokenEfficiency?: unknown;
             decisionBrain?: unknown;
             gitAutoCommit?: unknown;
             autoTestVerification?: unknown;
@@ -599,6 +607,17 @@ function Providers({
           };
           if (typeof body.preferFreeProviders === 'boolean') setPreferFree(body.preferFreeProviders);
           if (typeof body.injectCodebaseContext === 'boolean') setInjectCodebaseContext(body.injectCodebaseContext);
+          if (typeof body.enableAtlas === 'boolean') setEnableAtlas(body.enableAtlas);
+          if (body.tokenEfficiency && typeof body.tokenEfficiency === 'object' && !Array.isArray(body.tokenEfficiency)) {
+            const te = body.tokenEfficiency as Record<string, unknown>;
+            if (typeof te.packSystemPrompt === 'boolean') setPackSystemPrompt(te.packSystemPrompt);
+            if (typeof te.cacheFriendlyOrder === 'boolean') setCacheFriendlyOrder(te.cacheFriendlyOrder);
+            if (typeof te.autoCondenseLogs === 'boolean') setAutoCondenseLogs(te.autoCondenseLogs);
+            if (te.contextPacker === 'l1' || te.contextPacker === 'claude-code') setContextPacker(te.contextPacker);
+            if (typeof te.systemBudgetTokens === 'number' && Number.isFinite(te.systemBudgetTokens)) {
+              setSystemBudgetTokens(te.systemBudgetTokens);
+            }
+          }
           if (body.decisionBrain && typeof body.decisionBrain === 'object' && !Array.isArray(body.decisionBrain)) {
             const brain = body.decisionBrain as { enabled?: unknown };
             setDecisionBrainEnabled(brain.enabled === true);
@@ -826,6 +845,54 @@ function Providers({
     }
   };
 
+  const setEnableAtlasRemote = async (v: boolean) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enableAtlas: v }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not save capability discovery setting.');
+        return;
+      }
+      setEnableAtlas(v);
+    } catch {
+      setSettingsError('Could not save capability discovery setting.');
+    }
+  };
+
+  const saveTokenEfficiencyRemote = async (patch: {
+    packSystemPrompt?: boolean;
+    cacheFriendlyOrder?: boolean;
+    autoCondenseLogs?: boolean;
+    contextPacker?: 'claude-code' | 'l1';
+    systemBudgetTokens?: number;
+  }) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ tokenEfficiency: patch }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not save token-efficiency settings.');
+        return false;
+      }
+      if (patch.packSystemPrompt !== undefined) setPackSystemPrompt(patch.packSystemPrompt);
+      if (patch.cacheFriendlyOrder !== undefined) setCacheFriendlyOrder(patch.cacheFriendlyOrder);
+      if (patch.autoCondenseLogs !== undefined) setAutoCondenseLogs(patch.autoCondenseLogs);
+      if (patch.contextPacker !== undefined) setContextPacker(patch.contextPacker);
+      if (patch.systemBudgetTokens !== undefined) setSystemBudgetTokens(patch.systemBudgetTokens);
+      return true;
+    } catch {
+      setSettingsError('Could not save token-efficiency settings.');
+      return false;
+    }
+  };
+
   const patchServerBilling = async (id: string, patch: BillingPatch, row?: ServerProviderRow) => {
     setSettingsError(null);
     let body: Record<string, unknown>;
@@ -947,7 +1014,7 @@ function Providers({
                   onMouseDown={(e) => e.stopPropagation()}
                   className="max-w-28 shrink-0 truncate rounded-lg bg-black/25 px-2 py-1 text-[10px] text-white/70 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
                 >
-                  <option value="persistent">Persistent</option>
+                  <option value="persistent">Persistent (24/7 Ready)</option>
                   <option value="fresh-per-task">Fresh per task</option>
                   <option value="terminate-at-project-end">Terminate at project end</option>
                 </select>
@@ -998,6 +1065,108 @@ function Providers({
               </div>
             )}
             {settingsError && <div className="mt-2 text-[10px] text-red-300/80">{settingsError}</div>}
+          </div>
+        </section>
+      )}
+
+      {preferFree !== null && (
+        <section data-testid="settings-context-efficiency-section">
+          <div className="mb-2 flex items-center justify-between">
+            <Label>Context &amp; Token Efficiency</Label>
+            <Link
+              href="/connectors"
+              className="inline-flex items-center gap-1 rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-0.5 text-[10px] font-medium text-cyan-200 hover:bg-cyan-400/20"
+            >
+              <Plug className="h-3 w-3" aria-hidden />
+              MCP &amp; Connector Hub
+            </Link>
+          </div>
+          <div className="space-y-2 rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
+            {enableAtlas !== null && (
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs text-white/85">Zero-bloat capability discovery (Atlas)</div>
+                  <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                    Index 40+ connectors, CLIs, and custom VM tools via BM25 + embeddings (~20 tokens/result) instead of flooding prompt context.
+                  </div>
+                </div>
+                <Toggle on={enableAtlas} onChange={(v) => void setEnableAtlasRemote(v)} accent={accent} />
+              </div>
+            )}
+            <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+              <div>
+                <div className="text-xs text-white/85">Cache-friendly prompt ordering</div>
+                <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                  Emit stable role &amp; card instructions before dynamic repo/memory slices to maximize provider prompt cache hits.
+                </div>
+              </div>
+              <Toggle
+                on={cacheFriendlyOrder}
+                onChange={(v) => void saveTokenEfficiencyRemote({ cacheFriendlyOrder: v })}
+                accent={accent}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+              <div>
+                <div className="text-xs text-white/85">Budgeted system prompt packing</div>
+                <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                  Cap appended system prompt tokens and trim low-value sections first without touching core instructions.
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                {packSystemPrompt && (
+                  <select
+                    aria-label="System prompt token budget"
+                    value={String(systemBudgetTokens)}
+                    onChange={(e) => void saveTokenEfficiencyRemote({ systemBudgetTokens: Number(e.target.value) })}
+                    className="rounded-lg bg-black/25 px-2 py-1 text-[10px] text-white/75 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
+                  >
+                    <option value="8000">8K</option>
+                    <option value="16000">16K</option>
+                    <option value="32000">32K</option>
+                  </select>
+                )}
+                <Toggle
+                  on={packSystemPrompt}
+                  onChange={(v) => void saveTokenEfficiencyRemote({ packSystemPrompt: v })}
+                  accent={accent}
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+              <div>
+                <div className="text-xs text-white/85">Auto-condense noisy tool logs</div>
+                <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                  Strip stack boilerplate and keep root-cause failure lines in long trajectories.
+                </div>
+              </div>
+              <Toggle
+                on={autoCondenseLogs}
+                onChange={(v) => void saveTokenEfficiencyRemote({ autoCondenseLogs: v })}
+                accent={accent}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+              <div>
+                <div className="text-xs text-white/85">Context packing strategy</div>
+                <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                  Standard preserves full CLI session; L1 8K rebuilds turns with AST skeletons + state ledger.
+                </div>
+              </div>
+              <select
+                aria-label="Context packing strategy"
+                value={contextPacker}
+                onChange={(e) =>
+                  void saveTokenEfficiencyRemote({
+                    contextPacker: e.target.value === 'l1' ? 'l1' : 'claude-code',
+                  })
+                }
+                className="max-w-32 shrink-0 truncate rounded-lg bg-black/25 px-2 py-1 text-[10px] text-white/70 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
+              >
+                <option value="claude-code">Standard</option>
+                <option value="l1">L1 8K AST-Sliced</option>
+              </select>
+            </div>
           </div>
         </section>
       )}

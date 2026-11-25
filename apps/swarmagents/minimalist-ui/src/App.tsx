@@ -21,7 +21,7 @@ import { DEFAULT_AGENT_CARD } from "./data";
 import type { LogEvent } from "./engine";
 import { usePersisted, useSessionPersisted } from "./store";
 import type { SwarmTask } from "../../lib/mcp-types";
-import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus } from "../../lib/client/vmStatus";
+import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus, wakeVmStatus } from "../../lib/client/vmStatus";
 import { derivePresence } from "../../lib/client/presence";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm } from "../../lib/client/runs";
@@ -156,7 +156,10 @@ export default function App() {
   // ---- VM screen ----
 
   const lifecycleEvent = latestVmLifecycleEvent(session.liveItems);
-  const polledVm = usePolledVmStatus(undefined, `${session.busy}:${lifecycleEvent ?? ""}`);
+  const [vmWakeTick, setVmWakeTick] = useState(0);
+  const [vmWaking, setVmWaking] = useState(false);
+  const [showDesktopBeforeRun, setShowDesktopBeforeRun] = useState(false);
+  const polledVm = usePolledVmStatus(undefined, `${session.busy}:${lifecycleEvent ?? ""}:${vmWakeTick}`);
   const [vmResetting, setVmResetting] = useState(false);
   const [takingOver, setTakingOver] = useState(false);
   const [screenView, setScreenView] = useState<ComputerView>("desktop");
@@ -262,9 +265,27 @@ export default function App() {
 
   const handleNewChat = useCallback(() => {
     session.newChat();
+    setShowDesktopBeforeRun(false);
     setView("chat");
     focusComposer();
   }, [session, setView, focusComposer]);
+
+  const handleOpenLiveDesktop = useCallback(async () => {
+    if (session.signedOut) {
+      openSettings("account");
+      return;
+    }
+    setShowDesktopBeforeRun(true);
+    setView("screen");
+    setScreenView("desktop");
+    setVmWaking(true);
+    try {
+      await wakeVmStatus();
+      setVmWakeTick((n) => n + 1);
+    } finally {
+      setVmWaking(false);
+    }
+  }, [session.signedOut, openSettings, setView]);
 
   const handleResetVm = useCallback(async (): Promise<string | undefined> => {
     setVmResetting(true);
@@ -383,14 +404,15 @@ export default function App() {
   // Before the first run there is no screen worth showing yet: the main
   // area carries the brand hero and starter chips. The screen stays
   // mounted (hidden) so its streams survive the switch.
-  const showHero = effectiveView === "screen" && !headRun && session.turns.length === 0;
+  const showHero = effectiveView === "screen" && !headRun && session.turns.length === 0 && !showDesktopBeforeRun;
 
   return (
     <div
-      className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-[var(--bg)] text-[var(--fg)]"
+      className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-transparent text-[var(--fg)]"
       data-testid="minimal-main-page"
       data-view={effectiveView}
     >
+      <div className="aura" aria-hidden="true" />
       {/* Header with brand lockup, view switcher and run indicator */}
       <Header
         title={session.title}
@@ -413,6 +435,7 @@ export default function App() {
         onOpenSettings={() => openSettings("providers")}
         settingsNeedsAttention={providerStatus.state === "missing"}
         onOpenShortcuts={() => setShortcutsOpen(true)}
+        user={me}
       />
 
       {session.offline && !session.signedOut && (
@@ -423,15 +446,33 @@ export default function App() {
 
       <main className="relative z-10 flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-3 sm:p-4" data-testid="workspace-main">
         {/* Component 2: the main area — the user's VM screen. */}
-        <section className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-2 overflow-y-auto rounded-[24px] glass hair p-3 sm:p-4" data-testid="stage">
+        <section className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-2 overflow-y-auto rounded-[28px] glass hair p-3 sm:p-5 shadow-[0_24px_80px_-28px_rgba(0,0,0,0.85)]" data-testid="stage">
           <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--mute)]" role="status" aria-live="polite" data-testid="workspace-activity">
             <span className={cn("h-2 w-2 shrink-0 rounded-full", phaseMeta?.active ? "bg-emerald-400 animate-pulse" : "bg-white/30")} />
             <span className="truncate">{phaseMeta?.label ?? vmDisplay.label}{activitySuffix}</span>
+            {effectiveView === "screen" && !headRun && session.turns.length === 0 && (
+              <button
+                type="button"
+                data-testid="toggle-live-desktop-btn"
+                onClick={() => {
+                  if (showHero) {
+                    void handleOpenLiveDesktop();
+                  } else {
+                    setShowDesktopBeforeRun(false);
+                  }
+                }}
+                className="ml-auto shrink-0 rounded-full border border-white/10 bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-zinc-200 transition hover:bg-white/[0.08]"
+              >
+                {showHero ? (vmWaking ? "Booting VM…" : "Live Desktop") : "Overview"}
+              </button>
+            )}
           </div>
           {showHero && (
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 py-10 text-center" data-testid="workspace-hero">
-              <img src="/brand/mark-dark.svg" alt="" width={56} height={56} className="mb-5" />
-              <h1 className="mb-2 text-xl font-semibold tracking-tight sm:text-3xl">Give it a task. It has its own computer.</h1>
+              <div className="neo-pill mb-5 grid h-16 w-16 place-items-center rounded-[22px] p-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.22),0_0_32px_-8px_rgba(0,208,240,0.4)]">
+                <img src="/brand/mark-dark.svg" alt="" width={56} height={56} className="h-11 w-11" />
+              </div>
+              <h1 className="mb-2 bg-gradient-to-b from-white to-slate-300 bg-clip-text text-xl font-semibold tracking-tight text-transparent sm:text-3xl">Give it a task. It has its own computer.</h1>
               <p className="mb-6 max-w-md text-sm leading-relaxed text-[var(--mute)]">
                 One autonomous agent in your own persistent Linux VM. Describe the work, watch every step live, take over anytime. Free — bring your own model keys.
               </p>
@@ -452,6 +493,18 @@ export default function App() {
                   ))}
                 </div>
               )}
+              <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5">
+                <button
+                  type="button"
+                  data-testid="launch-desktop-btn"
+                  disabled={vmWaking}
+                  onClick={() => void handleOpenLiveDesktop()}
+                  className="inline-flex items-center gap-2 rounded-full border border-indigo-400/35 bg-indigo-500/15 px-4 py-2 text-xs font-medium text-indigo-100 shadow-sm backdrop-blur transition hover:border-indigo-300/50 hover:bg-indigo-500/25 disabled:opacity-60"
+                >
+                  <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                  {vmWaking ? "Booting Linux Desktop…" : "Launch live Linux desktop"}
+                </button>
+              </div>
             </div>
           )}
           {/* Keep the desktop and runtime streams mounted when switching workspace tabs. */}
@@ -508,7 +561,7 @@ export default function App() {
         </section>
 
         {/* Component 1: the bottom input bar — any attachment. */}
-        <section className="mx-auto w-full max-w-3xl shrink-0" aria-label="Ask the agent">
+        <section className="mx-auto w-full max-w-3xl shrink-0 pb-3 sm:pb-0" aria-label="Ask the agent">
           {session.signedOut ? (
             <Notice
               tone="warn"

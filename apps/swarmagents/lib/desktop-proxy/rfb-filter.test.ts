@@ -217,6 +217,26 @@ test("view filter throws on a ClientCutText declaring over 1 MiB", () => {
   assert.throws(() => filter.push(header), RfbProtocolError);
 });
 
+test("view filter drops TigerVNC/noVNC ExtendedClipboard negative-length ClientCutText without closing stream", () => {
+  const filter = new RfbInputFilter("view");
+  const header = Buffer.alloc(8);
+  header[0] = 6;
+  header.writeInt32BE(-8, 4);
+  const payload = Buffer.from([0x0f, 0, 0, 0x01, 0, 0, 0, 0]);
+  const fbur = Buffer.from([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  const out = filter.push(Buffer.concat([header, payload, fbur]));
+  assert.ok(out.equals(fbur), "extended clipboard dropped cleanly and stream stayed aligned");
+  assert.equal(filter.dropped, 1);
+});
+
+test("view filter rejects oversized negative ExtendedClipboard length (> 1 MiB)", () => {
+  const filter = new RfbInputFilter("view");
+  const header = Buffer.alloc(8);
+  header[0] = 6;
+  header.writeInt32BE(-1_048_577, 4);
+  assert.throws(() => filter.push(header), RfbProtocolError);
+});
+
 test("framed messages get monotonic sequence numbers through push", () => {
   const filter = new RfbInputFilter("view");
   const fbur = Buffer.from([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);

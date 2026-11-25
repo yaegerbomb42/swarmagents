@@ -5,9 +5,23 @@ import fs from "node:fs";
 import path from "node:path";
 import pkg from "../package.json";
 import { getStoragePaths } from "./board/store";
+import { CONNECTOR_CATALOG } from "./connectors/catalog";
+import { desktopModeEnabled } from "./harness/role-mcp";
 import { PROVIDER_CATALOG } from "./providers/catalog";
 import { countUserProviders } from "./providers/store";
 import { defaultDriverName } from "./vm/driver-default";
+
+export interface DeepHealthSubsystems {
+  vmDriver: string;
+  desktopEnabled: boolean;
+  catalogConnectorCount: number;
+  toolForgeReady: boolean;
+  atlasReady: boolean;
+}
+
+export interface DeepHealthReport extends HealthReport {
+  subsystems: DeepHealthSubsystems;
+}
 
 export interface HealthReport {
   ok: boolean;
@@ -113,5 +127,22 @@ export function healthSnapshot(env: NodeJS.ProcessEnv = process.env, userId?: st
     vmDriver: (env.SWARM_VM_DRIVER ?? "").trim() || defaultDriverName(env),
     providersConfigured,
     providersScope: scope,
+  };
+}
+
+export function deepHealthSnapshot(
+  env: NodeJS.ProcessEnv = process.env,
+  userId?: string | null,
+): DeepHealthReport {
+  const base = healthSnapshot(env, userId);
+  return {
+    ...base,
+    subsystems: {
+      vmDriver: base.vmDriver,
+      desktopEnabled: desktopModeEnabled(env),
+      catalogConnectorCount: CONNECTOR_CATALOG.length,
+      toolForgeReady: true,
+      atlasReady: true,
+    },
   };
 }

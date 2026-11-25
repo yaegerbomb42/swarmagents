@@ -237,6 +237,9 @@ export function middleware(req: NextRequest) {
     if (pathname.startsWith("/api/")) {
       return withSecurityHeaders(NextResponse.json({ error: "Sign in required." }, { status: 401 }), nonce, headerOpts, rate);
     }
+    if (process.env.SWARM_ALLOW_GUEST_UI === "1" && req.method.toUpperCase() === "GET" && pathname === "/") {
+      return withSecurityHeaders(NextResponse.next({ request: { headers } }), nonce, headerOpts, rate);
+    }
     // Build the target from the public Host header (already allowlisted): behind the proxy req.url carries the
     // internal host and port, and middleware rejects relative Locations.
     return withSecurityHeaders(NextResponse.redirect(`${redirectOrigin(req)}/login?next=${encodeURIComponent(pathname + search)}`, 303), nonce, headerOpts, rate);

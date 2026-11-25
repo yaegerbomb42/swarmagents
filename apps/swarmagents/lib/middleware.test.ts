@@ -552,3 +552,18 @@ test("non-preview pages keep frame-ancestors 'none'", () => {
   assert.match(res.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
   assert.equal(res.headers.get("x-frame-options"), "DENY");
 });
+
+test("SWARM_ALLOW_GUEST_UI=1 allows unauthenticated GET / while keeping APIs 401", async () => {
+  const prev = process.env.SWARM_ALLOW_GUEST_UI;
+  process.env.SWARM_ALLOW_GUEST_UI = "1";
+  try {
+    const landing = middleware(req("http://swarm.example.com/", { host: "swarm.example.com" }));
+    assert.equal(landing.status, 200);
+
+    const api = middleware(req("http://swarm.example.com/api/providers/health", { host: "swarm.example.com" }));
+    assert.equal(api.status, 401);
+  } finally {
+    if (prev === undefined) delete process.env.SWARM_ALLOW_GUEST_UI;
+    else process.env.SWARM_ALLOW_GUEST_UI = prev;
+  }
+});

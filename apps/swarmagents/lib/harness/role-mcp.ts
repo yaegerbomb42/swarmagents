@@ -76,6 +76,13 @@ import {
   PLAYWRIGHT_PROXY_PATH,
   PLAYWRIGHT_PROXY_SOURCE,
 } from "./playwright-policy";
+import {
+  TOOL_FORGE_CATALOG_PATH,
+  TOOL_FORGE_MCP_SERVER_NAME,
+  TOOL_FORGE_MCP_SERVER_PATH,
+  toolForgeMcpServerSource,
+} from "./tool-forge-mcp";
+import { compactConnectorCatalog } from "../self-manage/tool-author";
 
 /** Name of the stdio MCP server exposing set_role/list_roles. */
 export const ROLE_MCP_SERVER_NAME = "roles";
@@ -198,6 +205,7 @@ export function roleAllowedTools(
   // ask_human_desktop (shadow-to-takeover handoff) is granted to every agent
   // with tools, gated like ask_user: it only pauses the run for a human.
   out.add(`mcp__${DESKTOP_HANDOFF_MCP_SERVER_NAME}__*`);
+  out.add(`mcp__${TOOL_FORGE_MCP_SERVER_NAME}__*`);
   // The capability-atlas server is opt-in (SWARM_ATLAS_ENABLED=1): grant its
   // tools only when it is wired, so a default run gets exactly today's toolset.
   if (opts.atlasEnabled) out.add(`mcp__${ATLAS_MCP_SERVER_NAME}__*`);
@@ -330,6 +338,12 @@ export function roleMcpConfigJson(
       args: [DESKTOP_HANDOFF_MCP_SERVER_PATH],
       env: { SWARM_DESKTOP_HANDOFF_DIR: DESKTOP_HANDOFF_DIR },
     },
+    [TOOL_FORGE_MCP_SERVER_NAME]: {
+      type: "stdio",
+      command: "node",
+      args: [TOOL_FORGE_MCP_SERVER_PATH],
+      env: { SWARM_TOOL_CATALOG: TOOL_FORGE_CATALOG_PATH },
+    },
   };
   // The capability-atlas server is opt-in. The registry path is the
   // per-user file the scanner published in the VM; when unset, the server
@@ -456,6 +470,8 @@ export function roleSeedFiles(
     // second seed pass.
     { path: WEB_SEARCH_MCP_SERVER_PATH, content: webSearchMcpServerSource() },
     { path: ROLE_MCP_CONFIG_PATH, content: roleMcpConfigJson(phase, { allowedRoleIds, roleDef: initialDef, ...opts }) },
+    { path: TOOL_FORGE_MCP_SERVER_PATH, content: toolForgeMcpServerSource() },
+    { path: TOOL_FORGE_CATALOG_PATH, content: JSON.stringify(compactConnectorCatalog()) },
   ];
   if (opts.atlasEnabled) {
     files.push({ path: ATLAS_MCP_SERVER_PATH, content: atlasMcpServerSource() });

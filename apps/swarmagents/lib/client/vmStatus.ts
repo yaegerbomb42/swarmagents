@@ -183,3 +183,18 @@ export function usePolledVmStatus(intervalMs: number = VM_STATUS_POLL_MS, refres
 
   return { status, desktop };
 }
+
+/** Boot or wake the user's isolated Linux VM on demand via POST /api/runtime/vm/status. */
+export async function wakeVmStatus(): Promise<PolledVmInfo | null> {
+  try {
+    const res = await fetch("/api/runtime/vm/status", { method: "POST" });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { status?: unknown; desktop?: unknown };
+    return {
+      status: parsePolledVmStatus(data.status),
+      desktop: typeof data.desktop === "boolean" ? data.desktop : true,
+    };
+  } catch {
+    return null;
+  }
+}

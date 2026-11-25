@@ -255,11 +255,11 @@ export function Composer({
         onDragLeave={() => setDragging(false)}
         onDrop={onDrop}
         data-testid="composer-drop-zone"
-        className={cn(
-          "glass-2 composer-ring rounded-[24px] hair transition-all",
-          dragging ? "border-[var(--brand-signal)] shadow-[0_0_24px_rgba(0,208,240,0.25)]" : "border-white/10",
-          hero && "shadow-[0_20px_60px_-20px_rgba(0,0,0,0.9)]",
-        )}
+          className={cn(
+            "glass-2 composer-ring rounded-[24px] transition-all",
+            dragging ? "border-[var(--brand-signal)] shadow-[0_0_24px_rgba(0,208,240,0.25)]" : "",
+            hero && "shadow-[0_24px_64px_-18px_rgba(0,0,0,0.9)]",
+          )}
       >
         {attachments.length > 0 && (
           <ul className="flex flex-wrap gap-2 px-3 pt-3" aria-label="Attached files" data-testid="composer-attachments">

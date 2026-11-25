@@ -166,7 +166,8 @@ export class RfbInputObserver {
           size = 4 + count * 4;
         } else if (type === 6) {
           if (this.buffer.length < 8) break;
-          const length = this.buffer.readUInt32BE(4);
+          const signedLength = this.buffer.readInt32BE(4);
+          const length = signedLength < 0 ? -signedLength : signedLength;
           if (length > MAX_CUT_TEXT_BYTES) throw new Error("ClientCutText length exceeds limit");
           size = 8 + length;
         } else if (type === 248) {

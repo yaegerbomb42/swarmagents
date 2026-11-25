@@ -386,3 +386,15 @@ test("summarizeTraceStretch of an empty stretch has no duration or label", () =>
   const summary = summarizeTraceStretch([]);
   assert.deepEqual(summary, { count: 0, running: false, failed: 0, label: "" });
 });
+
+test("tool.blocked settles the matching running call with the blocked label and reason", () => {
+  const steps = stepsOf([
+    call("c1", "Bash", { command: "ls /etc" }, T0, 1),
+    item("tool.blocked", { name: "Bash", reason: "VM-only policy: outside /workspace" }, T0 + 15, 2),
+  ]);
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].status, "error");
+  assert.equal(steps[0].ok, false);
+  assert.match(steps[0].label, /Blocked Bash/);
+  assert.match(steps[0].label, /VM-only policy/);
+});

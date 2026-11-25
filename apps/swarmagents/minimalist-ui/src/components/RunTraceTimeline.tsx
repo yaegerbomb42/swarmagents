@@ -102,7 +102,7 @@ function StepCard({ step }: { step: TimelineStep }) {
   const hasBody = step.diff !== undefined;
   const showPreview = step.preview !== step.label;
   return (
-    <li data-testid="trace-step" data-kind={step.kind} className="border-t border-sa-line first:border-t-0">
+    <li data-testid={step.kind === "thinking" ? "trace-step" : "tool-entry"} data-kind={step.kind} className="border-t border-sa-line first:border-t-0">
       <button
         type="button"
         onClick={() => (hasBody ? setOpen((value) => !value) : undefined)}
@@ -179,7 +179,7 @@ export function RunTraceTimeline({
   const summary = useMemo(() => summarizeTraceStretch(steps), [steps]);
   if (steps.length === 0) return null;
   return (
-    <div className="overflow-hidden rounded-xl border border-sa-line" data-testid="trace-timeline">
+    <div className="overflow-hidden rounded-xl border border-sa-line" data-testid="steps-block">
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}

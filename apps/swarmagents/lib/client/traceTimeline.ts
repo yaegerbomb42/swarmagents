@@ -443,6 +443,36 @@ export function buildTraceTimeline(items: readonly RunStreamItem[]): TimelineStr
         }
         break;
       }
+      case "tool.blocked": {
+        const name = asString(data.name) ?? "tool";
+        const reason = asString(data.reason);
+        const label = `Blocked ${name}${reason ? ` — ${reason.slice(0, 180)}` : ""}`;
+        const all = stretches.flatMap((stretch) => stretch.steps);
+        const running = [...all].reverse().find((s) => s.status === "running" && s.toolName !== undefined);
+        if (running) {
+          running.status = "error";
+          running.ok = false;
+          running.endedAt = item.ts;
+          running.durationMs =
+            running.startedAt !== undefined ? Math.max(0, item.ts - running.startedAt) : 0;
+          running.label = label;
+          running.preview = reason ?? label;
+        } else {
+          currentSteps().push({
+            id: `blocked-${++callCounter}`,
+            kind: classifyToolKind(name),
+            toolName: name,
+            label,
+            status: "error",
+            startedAt: item.ts,
+            endedAt: item.ts,
+            durationMs: 0,
+            ok: false,
+            preview: reason ?? label,
+          });
+        }
+        break;
+      }
       case "run.finished":
         settleRunning("done");
         break;

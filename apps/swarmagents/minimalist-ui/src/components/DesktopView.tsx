@@ -50,7 +50,8 @@ import {
   type ServerTakeoverState,
 } from "../../../lib/client/desktopState";
 import type { VmDisplayState } from "../../../lib/client/vmStatus";
-import { presenceHintRegion, type Presence } from "../../../lib/client/presence";
+import { presenceHintRegion, type ComputerAction, type Presence } from "../../../lib/client/presence";
+import { ComputerActionOverlay } from "./ComputerActionOverlay";
 import { DesktopFpsMeter } from "../utils/desktopFps";
 
 /** Connection facts the ScreenFrame's LIVE pill needs. */
@@ -97,6 +98,14 @@ export interface DesktopViewProps {
    * agent is" without claiming pixel accuracy the harness does not provide.
    */
   presence?: Presence;
+  /**
+   * The agent's latest computer-use action (see deriveComputerAction). The
+   * desktop paints a click ripple / cursor reticle at the action's
+   * framebuffer coordinates plus a floating HUD chip naming it — in both the
+   * embedded and the standalone view. The overlay is pointer-events-none,
+   * so it can never intercept a human takeover.
+   */
+  computerAction?: ComputerAction;
   /** The frame's Take over button controls interaction; shown on the overlay. */
   canControl?: boolean;
 }
@@ -152,6 +161,7 @@ export function DesktopView({
   onControlChange,
   onConnection,
   presence,
+  computerAction,
   canControl = true,
 }: DesktopViewProps) {
   const [conn, dispatch] = useReducer(reduceDesktopConn, INITIAL_DESKTOP_CONN);
@@ -475,6 +485,10 @@ export function DesktopView({
             pointing at, and pointer events pass through it. */}
         <PresenceGlow presence={presence} />
 
+        {/* Computer-use action: click ripple / cursor reticle + HUD chip at
+            the action's coordinates. Pointer-events-none throughout. */}
+        <ComputerActionOverlay action={computerAction} />
+
         {/* Watch mode, always visible in control: the one way out. While the
             takeover is only requested, the same button cancels the request. */}
         {control && (
@@ -591,6 +605,9 @@ export function DesktopView({
         >
           {/* noVNC surface (live) */}
           <div ref={surfaceHolderRef} className="absolute inset-0" aria-hidden={!live} />
+
+          {/* Computer-use action overlay: ripple / reticle + HUD chip. */}
+          <ComputerActionOverlay action={computerAction} />
 
           {/* Offline fallback: latest screenshot frame */}
           {conn.phase === "offline" && conn.hasFrame && frameSrc && (

@@ -378,3 +378,410 @@ export function presenceFromActivity(
   if (wroteFile) presence.wroteFile = wroteFile;
   return presence;
 }
+
+/* ------------------------------------------------------------------ *
+ * Computer-use action telemetry — the live desktop overlay's input.
+ *
+ * The harness gives the agent two ways to drive the screen: the
+ * computer-mcp server (screenshot/click/type/key/scroll/...) on the desktop
+ * framebuffer, and the Playwright MCP servers (browser_navigate/browser_click/
+ * ...) in Chromium. Both arrive in the run stream as tool calls
+ * (`mcp__<server>__<tool>`, sometimes bare) and as `computer.action`
+ * telemetry events. This section parses either shape into one structured
+ * action the DesktopView overlay can render: where the agent touched, what
+ * it did, and a safe human detail. Typed text is never carried — only its
+ * length — and key combos are restricted to the keysym charset, because the
+ * overlay renders on every surface the activity strip does.
+ * ------------------------------------------------------------------ */
+
+/** The desktop VM's framebuffer: computer-mcp coordinates live here. */
+export const DESKTOP_FRAMEBUFFER: FramebufferSize = { width: 1600, height: 900 };
+/** The headless browser viewport: browser-surface coordinates live here. */
+export const BROWSER_VIEWPORT: FramebufferSize = { width: 1280, height: 800 };
+
+export interface FramebufferSize {
+  width: number;
+  height: number;
+}
+
+/** The computer-use actions the overlay knows how to show. */
+export type ComputerActionKind =
+  | "click"
+  | "double_click"
+  | "move"
+  | "type"
+  | "keypress"
+  | "scroll"
+  | "navigate"
+  | "screenshot";
+
+/**
+ * One parsed computer-use action. Coordinates are clamped framebuffer pixels
+ * (see framebuffer); actions without a screen target (type, navigate,
+ * screenshot) carry no coordinates and the overlay shows only the HUD chip.
+ * `detail` is safe to render: app names, key combos, URL hosts, element
+ * descriptions, typed-character counts — never typed content.
+ */
+export interface ComputerAction {
+  kind: ComputerActionKind;
+  /** Clamped framebuffer coordinates, when the action has a screen target. */
+  x?: number;
+  y?: number;
+  /** Safe human detail (see above). */
+  detail?: string;
+  /** Epoch ms of the action. */
+  at: number;
+  /** The framebuffer the coordinates were clamped to (overlay positioning). */
+  framebuffer: FramebufferSize;
+}
+
+/** Key-combo charset: printable keysym names plus modifiers, no shell chars. */
+export function sanitizeKeyCombo(text: string): string {
+  return text.replace(/[^A-Za-z0-9_+\-]/g, "").slice(0, 32);
+}
+
+/** A coordinate argument: a finite number, or an integer string ("640"). */
+function toCoord(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.round(value);
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
+    return Number.parseInt(value.trim(), 10);
+  }
+  return undefined;
+}
+
+/**
+ * Clamp a point onto the framebuffer (valid pixel indices: 0..width-1,
+ * 0..height-1). Returns null when either coordinate is missing or invalid —
+ * the caller keeps the action but drops the point, so a malformed click
+ * still narrates instead of pointing off-screen.
+ */
+export function clampFramebufferPoint(
+  x: number | undefined,
+  y: number | undefined,
+  framebuffer: FramebufferSize,
+): { x: number; y: number } | null {
+  if (x === undefined || y === undefined) return null;
+  return {
+    x: Math.min(Math.max(x, 0), Math.max(framebuffer.width - 1, 0)),
+    y: Math.min(Math.max(y, 0), Math.max(framebuffer.height - 1, 0)),
+  };
+}
+
+function capText(value: string, max = 80): string {
+  const text = value.trim();
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/** URL host for a navigation target, or the raw string capped. */
+function hostOfUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return "";
+  try {
+    return new URL(trimmed).hostname || capText(trimmed);
+  } catch {
+    return capText(trimmed.replace(/^[a-z]+:\/\//i, "").split("/")[0] ?? trimmed);
+  }
+}
+
+/** The element/ref description a Playwright call names, capped. */
+function elementDetail(input: Record<string, unknown>): string | undefined {
+  const element = str(input.element) ?? str(input.target);
+  return element ? capText(element) : undefined;
+}
+
+/** "Typing (12 chars)" — length only, never the typed content. */
+function typeDetail(input: Record<string, unknown>): string | undefined {
+  const text = str(input.text);
+  return text !== undefined ? `(${text.length} chars)` : undefined;
+}
+
+/** "down", "up and left" — the scroll direction from dx/dy deltas. */
+function scrollDirection(dx: number | undefined, dy: number | undefined): string | undefined {
+  const parts: string[] = [];
+  if (dy !== undefined && dy > 0) parts.push("down");
+  if (dy !== undefined && dy < 0) parts.push("up");
+  if (dx !== undefined && dx > 0) parts.push("right");
+  if (dx !== undefined && dx < 0) parts.push("left");
+  return parts.length > 0 ? parts.join(" and ") : undefined;
+}
+
+/** Split `mcp__<server>__<tool>`; bare tool names get an empty server. */
+function splitMcpName(name: string): { server: string; tool: string } {
+  const parts = name.split("__");
+  if (parts.length < 2) return { server: "", tool: name };
+  return { server: parts[parts.length - 2] ?? "", tool: parts[parts.length - 1] ?? "" };
+}
+
+/** computer-mcp tools this parser covers (the task's eight actions). */
+const COMPUTER_TOOLS = new Set([
+  "click",
+  "double_click",
+  "move",
+  "type",
+  "key",
+  "scroll",
+  "screenshot",
+]);
+
+function pointAction(
+  kind: ComputerActionKind,
+  input: Record<string, unknown>,
+  at: number,
+  framebuffer: FramebufferSize,
+  detail?: string,
+): ComputerAction {
+  const point = clampFramebufferPoint(toCoord(input.x), toCoord(input.y), framebuffer);
+  const action: ComputerAction = { kind, at, framebuffer };
+  if (point) {
+    action.x = point.x;
+    action.y = point.y;
+  }
+  if (detail) action.detail = detail;
+  return action;
+}
+
+/**
+ * Parse one computer-use tool call into a structured action, or null when
+ * the call is not a computer-use action (or not one of the eight the overlay
+ * shows). Coordinates are clamped onto `framebuffer` (default: the desktop
+ * framebuffer); `at` defaults to now.
+ */
+export function parseComputerAction(
+  name: string,
+  input: unknown,
+  at: number = Date.now(),
+  framebuffer: FramebufferSize = DESKTOP_FRAMEBUFFER,
+): ComputerAction | null {
+  const { server, tool } = splitMcpName(name);
+  if (!tool) return null;
+  const args = isRecord(input) ? input : {};
+  const isComputer =
+    server === "computer-mcp" || (server === "" && COMPUTER_TOOLS.has(tool));
+  const isPlaywright =
+    server === "playwright-mcp" ||
+    server === "browser-mcp" ||
+    (server === "" && tool.startsWith("browser_"));
+
+  if (isComputer) {
+    switch (tool) {
+      case "click": {
+        const button = toCoord(args.button);
+        const detail =
+          button === 3 ? "Right-click" : button === 2 ? "Middle-click" : undefined;
+        return pointAction("click", args, at, framebuffer, detail);
+      }
+      case "double_click":
+        return pointAction("double_click", args, at, framebuffer);
+      case "move":
+        return pointAction("move", args, at, framebuffer);
+      case "type":
+        return { kind: "type", detail: typeDetail(args), at, framebuffer };
+      case "key": {
+        const combo = str(args.combo);
+        const detail = combo ? sanitizeKeyCombo(combo) : undefined;
+        return { kind: "keypress", detail, at, framebuffer };
+      }
+      case "scroll":
+        return {
+          kind: "scroll",
+          detail: scrollDirection(toCoord(args.dx), toCoord(args.dy)),
+          at,
+          framebuffer,
+        };
+      case "screenshot":
+        return { kind: "screenshot", at, framebuffer };
+      default:
+        return null;
+    }
+  }
+
+  if (isPlaywright) {
+    switch (tool) {
+      case "browser_navigate": {
+        const url = str(args.url) ?? "";
+        return { kind: "navigate", detail: hostOfUrl(url) || undefined, at, framebuffer };
+      }
+      case "browser_click":
+        return { kind: "click", detail: elementDetail(args), at, framebuffer };
+      case "browser_type":
+        return {
+          kind: "type",
+          detail: typeDetail(args) ?? elementDetail(args),
+          at,
+          framebuffer,
+        };
+      case "browser_press_key": {
+        const key = str(args.key);
+        const detail = key ? sanitizeKeyCombo(key) : undefined;
+        return { kind: "keypress", detail, at, framebuffer };
+      }
+      case "browser_mouse_wheel":
+        return {
+          kind: "scroll",
+          detail: scrollDirection(toCoord(args.deltaX), toCoord(args.deltaY)),
+          at,
+          framebuffer,
+        };
+      case "browser_hover":
+        return { kind: "move", detail: elementDetail(args), at, framebuffer };
+      case "browser_snapshot":
+      case "browser_accessible_snapshot":
+      case "browser_take_screenshot":
+        return { kind: "screenshot", at, framebuffer };
+      default:
+        return null;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Parse a `computer.action` telemetry event payload ({ action, x?, y?,
+ * text?, target?, url? }) into a structured action. Best-effort: the
+ * `action` field is the harness's human summary (see summarizeTool /
+ * describeDesktopAction), so the kind is inferred from its prefix and the
+ * coordinates come from the structured x/y fields. Tool-call parsing
+ * (parseComputerAction) is authoritative when both are available.
+ */
+export function computerActionFromEvent(
+  data: unknown,
+  at: number = Date.now(),
+  framebuffer: FramebufferSize = DESKTOP_FRAMEBUFFER,
+): ComputerAction | null {
+  if (!isRecord(data)) return null;
+  const summary = str(data.action);
+  const point = clampFramebufferPoint(toCoord(data.x), toCoord(data.y), framebuffer);
+  const target = str(data.target);
+  const url = str(data.url);
+  const text = str(data.text);
+  const withPoint = (
+    kind: ComputerActionKind,
+    detail?: string,
+  ): ComputerAction => {
+    const action: ComputerAction = { kind, at, framebuffer };
+    if (point) {
+      action.x = point.x;
+      action.y = point.y;
+    }
+    if (detail) action.detail = detail;
+    return action;
+  };
+
+  if (!summary) {
+    if (url) return { kind: "navigate", detail: hostOfUrl(url) || undefined, at, framebuffer };
+    return null;
+  }
+  if (summary === "Taking a screenshot" || summary === "Reading the page") {
+    return { kind: "screenshot", at, framebuffer };
+  }
+  if (summary.startsWith("Double-clicking at")) return withPoint("double_click");
+  if (
+    summary.startsWith("Right-clicking at") ||
+    summary.startsWith("Middle-clicking at") ||
+    summary.startsWith("Clicking at")
+  ) {
+    const detail = summary.startsWith("Right-clicking")
+      ? "Right-click"
+      : summary.startsWith("Middle-clicking")
+        ? "Middle-click"
+        : undefined;
+    return withPoint("click", detail);
+  }
+  if (summary.startsWith("Moving pointer to")) return withPoint("move");
+  if (summary.startsWith("Dragging from")) return withPoint("move", "Drag");
+  if (summary.startsWith("Typing (")) {
+    const chars = summary.match(/\((\d+) chars\)/);
+    return { kind: "type", detail: chars ? `(${chars[1]} chars)` : undefined, at, framebuffer };
+  }
+  if (summary.startsWith("Pressing ")) {
+    const combo = text ? sanitizeKeyCombo(text) : sanitizeKeyCombo(summary.slice("Pressing ".length));
+    return { kind: "keypress", detail: combo || undefined, at, framebuffer };
+  }
+  if (summary.startsWith("Scrolling")) {
+    const detail = summary.slice("Scrolling".length).trim() || undefined;
+    return { kind: "scroll", detail, at, framebuffer };
+  }
+  if (summary.startsWith("Clicking ")) {
+    return withPoint("click", (target ?? summary.slice("Clicking ".length).trim()) || undefined);
+  }
+  if (summary.startsWith("Typing into ")) {
+    return { kind: "type", detail: target, at, framebuffer };
+  }
+  if (summary.startsWith("Hovering ")) {
+    return withPoint("move", (target ?? summary.slice("Hovering ".length).trim()) || undefined);
+  }
+  if (summary === "Moving the pointer") return withPoint("move");
+  if (summary === "Scrolling the page") return { kind: "scroll", at, framebuffer };
+  if (summary.startsWith("Opening ")) {
+    const detail =
+      target ?? (url ? hostOfUrl(url) : undefined) ?? summary.slice("Opening ".length).trim();
+    return { kind: "navigate", detail: detail || undefined, at, framebuffer };
+  }
+  if (summary === "Opening a new tab") return { kind: "navigate", at, framebuffer };
+  return null;
+}
+
+/**
+ * One short HUD line for an action ("Clicking (640, 420)", "Typing…").
+ * Coordinates win over the detail; the detail is the fallback when the
+ * action has no screen target.
+ */
+export function computerActionLabel(action: ComputerAction): string {
+  const hasPoint = action.x !== undefined && action.y !== undefined;
+  const point = hasPoint ? `(${action.x}, ${action.y})` : undefined;
+  switch (action.kind) {
+    case "click": {
+      const verb =
+        action.detail === "Right-click"
+          ? "Right-clicking"
+          : action.detail === "Middle-click"
+            ? "Middle-clicking"
+            : "Clicking";
+      if (point) return `${verb} ${point}`;
+      if (action.detail && action.detail !== "Right-click" && action.detail !== "Middle-click") {
+        return `Clicking ${action.detail}`;
+      }
+      return verb;
+    }
+    case "double_click":
+      return point ? `Double-clicking ${point}` : "Double-clicking";
+    case "move":
+      if (point) return `Moving to ${point}`;
+      if (action.detail) return `Moving to ${action.detail}`;
+      return "Moving the pointer";
+    case "type":
+      return action.detail ? `Typing ${action.detail}` : "Typing…";
+    case "keypress":
+      return action.detail ? `Pressing ${action.detail}` : "Pressing a key";
+    case "scroll":
+      return action.detail ? `Scrolling ${action.detail}` : "Scrolling";
+    case "navigate":
+      return action.detail ? `Opening ${action.detail}` : "Opening a page";
+    case "screenshot":
+      return "Taking a screenshot";
+  }
+}
+
+/**
+ * Fold the run stream into the latest computer-use action, for the desktop
+ * overlay. Tool calls are authoritative; `computer.action` telemetry events
+ * are the fallback when a stream carries only those. Returns undefined when
+ * the stream has no computer-use action.
+ */
+export function deriveComputerAction(items: readonly RunStreamItem[]): ComputerAction | undefined {
+  let latest: ComputerAction | undefined;
+  for (const item of items) {
+    if (item.kind === "tool.call") {
+      const payload = payloadOf(item);
+      const name = str(payload.name);
+      if (!name) continue;
+      const action = parseComputerAction(name, payload.input, item.ts);
+      if (action) latest = action;
+    } else if (item.kind === "computer.action") {
+      const action = computerActionFromEvent(payloadOf(item), item.ts);
+      if (action) latest = action;
+    }
+  }
+  return latest;
+}

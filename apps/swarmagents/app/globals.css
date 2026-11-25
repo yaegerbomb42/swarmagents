@@ -1436,6 +1436,16 @@ select option { background: #15151a; color: #eee; }
   0%, 100% { opacity: 0.55; }
   50% { opacity: 0.95; }
 }
+@keyframes sa-click-ripple {
+  from { transform: scale(0.35); opacity: 0.9; }
+  to { transform: scale(1.5); opacity: 0; }
+}
+.sa-click-ripple { animation: sa-click-ripple 900ms ease-out both; }
+@keyframes sa-reticle-pulse {
+  0%, 100% { opacity: 0.65; }
+  50% { opacity: 1; }
+}
+.sa-reticle-pulse { animation: sa-reticle-pulse 1.6s ease-in-out infinite; }
 @keyframes sa-changed-flash {
   from { background-color: rgba(251, 191, 36, 0.16); }
   to { background-color: transparent; }
@@ -1444,6 +1454,7 @@ select option { background: #15151a; color: #eee; }
 @media (prefers-reduced-motion: reduce) {
   .sa-enter, .sa-stage-in, .sa-sheet-right, .sa-sheet-left, .sa-fade, .sa-dot-live,
   .sa-presence-row, .sa-changed-flash { animation: none; }
+  .sa-click-ripple, .sa-reticle-pulse { animation: none; }
 }
 
 /* Agent replies are markdown; this is the only prose style on the page. */

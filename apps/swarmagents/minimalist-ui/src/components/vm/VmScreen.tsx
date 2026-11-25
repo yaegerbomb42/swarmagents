@@ -33,8 +33,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Square } from "lucide-react";
 import type { VmStatus } from "../../../../lib/vm/types";
 import {
+  deriveComputerAction,
   derivePresence,
   presenceFromActivity,
+  type ComputerAction,
   type Presence,
   type PresenceRunState,
 } from "../../../../lib/client/presence";
@@ -119,6 +121,12 @@ export interface VmScreenProps {
    * Wins over this component's own derivation when it carries events.
    */
   presence?: Presence;
+  /**
+   * The agent's latest computer-use action, derived by the page from the
+   * run stream it already consumes. Wins over this component's own
+   * derivation when present (same pattern as `presence`).
+   */
+  computerAction?: ComputerAction;
 }
 
 /** The facts the status bar needs about the live desktop connection. */
@@ -150,6 +158,7 @@ export function VmScreen({
   className,
   activity,
   presence: pagePresence,
+  computerAction: pageComputerAction,
 }: VmScreenProps) {
   const stream = useRunStream(runId);
   const liveRun = Boolean(runId);
@@ -168,6 +177,15 @@ export function VmScreen({
       : stream.items.length > 0
         ? presence
         : (fallbackPresence ?? presence);
+
+  // The latest computer-use action for the desktop overlay: the page's
+  // derivation wins when the page owns the run's stream, else this
+  // component's own stream (same pattern as presence above).
+  const streamComputerAction = useMemo(
+    () => deriveComputerAction(stream.items),
+    [stream.items],
+  );
+  const effectiveComputerAction = pageComputerAction ?? streamComputerAction;
 
   // VM display state: the run stream's vm.* updates (immediate while a run is
   // live) plus the polled VM state, which is the only signal that sees idle
@@ -406,6 +424,7 @@ export function VmScreen({
               runActive={liveRun}
               onStopRun={onStopRun}
               presence={effectivePresence}
+              computerAction={effectiveComputerAction}
               embedded
               control={control}
               onControlChange={onControlChange}

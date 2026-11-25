@@ -22,7 +22,7 @@ import type { LogEvent } from "./engine";
 import { usePersisted, useSessionPersisted } from "./store";
 import type { SwarmTask } from "../../lib/mcp-types";
 import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus } from "../../lib/client/vmStatus";
-import { derivePresence } from "../../lib/client/presence";
+import { deriveComputerAction, derivePresence } from "../../lib/client/presence";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm } from "../../lib/client/runs";
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
@@ -212,6 +212,13 @@ export default function App() {
   // instead of opening a second SSE connection. The screen falls back to the
   // new activity line while this run's events are still being replayed.
   const screenPresence = useMemo(() => derivePresence(session.liveItems), [session.liveItems]);
+
+  // The latest computer-use action for the desktop overlay, from the same
+  // stream (the screen falls back to its own derivation when this is absent).
+  const screenComputerAction = useMemo(
+    () => deriveComputerAction(session.liveItems),
+    [session.liveItems],
+  );
 
   // The screen opens automatically on wide screens when a run starts
   const activeRunId = activeRun?.runId;
@@ -475,6 +482,7 @@ export default function App() {
               canControl={canControl}
               fitToHeight={wide}
               presence={screenPresence}
+              computerAction={screenComputerAction}
               activity={session.activity ? [{ text: session.activity }] : undefined}
               className={wide ? "h-full" : undefined}
             />

@@ -3,6 +3,8 @@
  *
  * Exposes four token-frugal tools inside every user VM:
  *   - search_mcp_catalog(query, limit) — searches the compact connector catalog
+ *   - search_online_skills(query, source, limit) — searches 900+ online SKILL.md repos
+ *   - install_online_skill(id) — installs an online SKILL.md into /workspace/.claude/skills
  *   - author_tool(id, name, description, runtime, code, testArgs) — writes,
  *     secret-scans, syntax-checks, smoke-tests, and registers custom tools/MCPs
  *   - list_my_tools() — lists custom tools and active VM MCP servers
@@ -265,7 +267,7 @@ function manageMcp(args) {
 const TOOLS = [
   {
     name: "search_mcp_catalog",
-    description: "Search 40+ verified MCP connectors without bloating context. Returns compact id | category | auth | summary lines.",
+    description: "Search 680+ verified MCP connectors without bloating context. Returns compact id | category | auth | summary lines.",
     inputSchema: {
       type: "object",
       properties: {
@@ -273,6 +275,30 @@ const TOOLS = [
         limit: { type: "number", default: 10 },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "search_online_skills",
+    description: "Search 900+ open-source SKILL.md skills across anthropics/skills, openai/skills, and ComposioHQ without bloating prompt context.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        source: { type: "string", enum: ["all", "anthropic", "openai", "composio"], default: "all" },
+        limit: { type: "number", default: 12 },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "install_online_skill",
+    description: "Download and install an online SKILL.md by id (e.g. 'anthropic/mcp-builder' or 'openai/cloudflare-deploy') into /workspace/.claude/skills.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+      },
+      required: ["id"],
     },
   },
   {
@@ -310,6 +336,119 @@ const TOOLS = [
   },
 ];
 
+const SKILLS_DIR = process.env.SWARM_SKILLS_DIR || "/workspace/.claude/skills";
+const SKILL_ID_RE = /^(?:(anthropic|openai|composio)\\/)?([a-z0-9][a-z0-9._-]{0,64})$/i;
+const SKILL_REPOS = [
+  { id: "anthropic", label: "anthropics/skills", owner: "anthropics", repo: "skills", branch: "main", re: /^skills\\/([a-z0-9][a-z0-9._-]{0,64})\\/SKILL\\.md$/i },
+  { id: "openai", label: "openai/skills", owner: "openai", repo: "skills", branch: "main", re: /^skills\\/\\.(?:curated|experimental)\\/([a-z0-9][a-z0-9._-]{0,64})\\/SKILL\\.md$/i },
+  { id: "composio", label: "ComposioHQ/awesome-claude-skills", owner: "ComposioHQ", repo: "awesome-claude-skills", branch: "master", re: /^(?:composio-skills\\/)?([a-z0-9][a-z0-9._-]{0,64})\\/SKILL\\.md$/i },
+];
+let skillsCache = { expiresAt: 0, items: [] };
+
+async function loadOnlineSkills() {
+  if (skillsCache.expiresAt > Date.now() && skillsCache.items.length > 0) return skillsCache.items;
+  const settled = await Promise.allSettled(SKILL_REPOS.map(async (r) => {
+    const res = await fetch("https://api.github.com/repos/" + r.owner + "/" + r.repo + "/git/trees/" + r.branch + "?recursive=1", {
+      headers: { Accept: "application/vnd.github+json", "User-Agent": "swarmagents-tool-forge" },
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const list = [];
+    const seen = new Set();
+    for (const node of (Array.isArray(data.tree) ? data.tree : [])) {
+      if (!node || typeof node.path !== "string") continue;
+      const m = r.re.exec(node.path);
+      if (!m || m[1].includes("..")) continue;
+      const slug = m[1];
+      const id = r.id + "/" + slug;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      list.push({
+        id,
+        slug,
+        sourceId: r.id,
+        source: r.label,
+        rawUrl: "https://raw.githubusercontent.com/" + r.owner + "/" + r.repo + "/" + r.branch + "/" + node.path.split("/").map(encodeURIComponent).join("/"),
+      });
+    }
+    return list;
+  }));
+  const items = [];
+  for (const s of settled) {
+    if (s.status === "fulfilled") items.push(...s.value);
+  }
+  if (items.length > 0) skillsCache = { expiresAt: Date.now() + 15 * 60 * 1000, items };
+  return items;
+}
+
+async function searchOnlineSkillsTool(args) {
+  const query = String(args.query || "").trim().toLowerCase();
+  const source = String(args.source || "all").trim().toLowerCase();
+  const limit = Math.min(Math.max(Number(args.limit) || 12, 1), 25);
+  try {
+    const all = await loadOnlineSkills();
+    if (all.length === 0) return { ok: false, message: "Online skills registry unreachable from VM right now." };
+    const tokens = query.split(/\\s+/).filter(Boolean);
+    const pool = source === "all" ? all : all.filter((s) => s.sourceId === source);
+    const matches = tokens.length === 0
+      ? pool
+      : pool.filter((s) => tokens.every((t) => s.id.toLowerCase().includes(t) || s.source.toLowerCase().includes(t)));
+    const slice = matches.slice(0, limit);
+    if (slice.length === 0) return { ok: true, text: "No matching online skills found." };
+    return {
+      ok: true,
+      text: "Matched " + matches.length + " skills (showing " + slice.length + "):\\n" + slice.map((s) => s.id + " | " + s.source).join("\\n"),
+    };
+  } catch (err) {
+    return { ok: false, message: String(err && err.message ? err.message : err) };
+  }
+}
+
+async function installOnlineSkillTool(args) {
+  const rawId = String(args.id || "").trim();
+  const m = SKILL_ID_RE.exec(rawId);
+  if (!m || rawId.includes("..")) return { ok: false, message: "Invalid skill id." };
+  const sourceId = (m[1] || "anthropic").toLowerCase();
+  const slug = m[2];
+  const fullId = sourceId + "/" + slug;
+  try {
+    const all = await loadOnlineSkills().catch(() => []);
+    const hit = all.find((s) => s.id.toLowerCase() === fullId.toLowerCase());
+    const urls = hit
+      ? [hit.rawUrl]
+      : sourceId === "anthropic"
+        ? ["https://raw.githubusercontent.com/anthropics/skills/main/skills/" + encodeURIComponent(slug) + "/SKILL.md"]
+        : sourceId === "openai"
+          ? ["https://raw.githubusercontent.com/openai/skills/main/skills/.curated/" + encodeURIComponent(slug) + "/SKILL.md"]
+          : ["https://raw.githubusercontent.com/ComposioHQ/awesome-claude-skills/master/composio-skills/" + encodeURIComponent(slug) + "/SKILL.md"];
+    let content = "";
+    for (const u of urls) {
+      const res = await fetch(u, { headers: { "User-Agent": "swarmagents-tool-forge" } });
+      if (res.ok) {
+        content = await res.text();
+        break;
+      }
+    }
+    if (!content.trim() || content.length > 200 * 1024) {
+      return { ok: false, message: "Could not download valid SKILL.md for " + fullId };
+    }
+    const targetDir = path.join(SKILLS_DIR, slug);
+    fs.mkdirSync(targetDir, { recursive: true });
+    fs.writeFileSync(path.join(targetDir, "SKILL.md"), content, "utf8");
+    updateAtlasEntry({
+      id: "skill:" + slug,
+      kind: "skill",
+      name: slug,
+      summary: "Installed online skill from " + fullId,
+      risk: "read-only",
+      source: fullId,
+    });
+    return { ok: true, text: "Installed skill '" + fullId + "' into " + path.join(targetDir, "SKILL.md") + "." };
+  } catch (err) {
+    return { ok: false, message: String(err && err.message ? err.message : err) };
+  }
+}
+
 function sendResult(id, text) {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }] } }) + "\\n");
 }
@@ -317,7 +456,7 @@ function sendError(id, code, message) {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\\n");
 }
 
-function handleMessage(msg) {
+async function handleMessage(msg) {
   if (!msg || typeof msg.method !== "string") return;
   const id = msg.id ?? null;
   if (id === null && msg.method !== "initialize") return;
@@ -343,6 +482,18 @@ function handleMessage(msg) {
     sendResult(id, searchCatalog(args.query, args.limit));
     return;
   }
+  if (params.name === "search_online_skills") {
+    const out = await searchOnlineSkillsTool(args);
+    if (out.ok) sendResult(id, out.text);
+    else sendError(id, -32000, out.message);
+    return;
+  }
+  if (params.name === "install_online_skill") {
+    const out = await installOnlineSkillTool(args);
+    if (out.ok) sendResult(id, out.text);
+    else sendError(id, -32602, out.message);
+    return;
+  }
   if (params.name === "author_tool") {
     const out = authorTool(args);
     if (out.ok) sendResult(id, out.text);
@@ -366,7 +517,7 @@ const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on("line", (line) => {
   if (!line.trim()) return;
   try {
-    handleMessage(JSON.parse(line));
+    void handleMessage(JSON.parse(line));
   } catch {
     // ignore malformed json lines
   }

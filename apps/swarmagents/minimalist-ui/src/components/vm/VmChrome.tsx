@@ -415,7 +415,7 @@ export function VmFrame({
         onBlur={() => setHovered(false)}
       >
         <ViewTabs tabs={tabs} value={activeView} onChange={onToggleView} compact={compactTabs} />
-        {presence && <PresenceChip presence={presence} className="min-w-0" />}
+        {presence && <PresenceChip presence={presence} className="hidden min-w-0 sm:inline-flex" />}
         {toolbar && <div className="ml-auto flex min-w-0 items-center gap-1.5">{toolbar}</div>}
         {controls && <div className={cn("flex shrink-0 items-center gap-1.5", !toolbar && "ml-auto")}>{controls}</div>}
       </div>

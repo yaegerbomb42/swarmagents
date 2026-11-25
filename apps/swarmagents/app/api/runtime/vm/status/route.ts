@@ -47,3 +47,24 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
+
+/**
+ * Wake or boot the caller's isolated Linux VM container on demand (e.g. when
+ * clicking "Launch live desktop" before the first agent prompt).
+ */
+export async function POST(req: NextRequest) {
+  const user = caller(req);
+  if (!user) return unauthorized();
+
+  const vm = getVmManager();
+  try {
+    await vm.wake(user);
+    const status = await vm.status(user);
+    const disk = vm.cachedDiskUsage(user);
+    const desktop = vm.driver.desktop === true;
+    return NextResponse.json({ status, disk, desktop });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Could not start VM.";
+    return NextResponse.json({ error: message }, { status: 503 });
+  }
+}

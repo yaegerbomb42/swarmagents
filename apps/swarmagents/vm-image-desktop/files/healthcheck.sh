@@ -12,7 +12,7 @@ if [ -e /dev/tcp ]; then
   exit 0
 fi
 
-# POSIX sh fallback: /proc/net/tcp lists listeners in hex; the listener on
-# 127.0.0.1:$port has state 0A (LISTEN).
+# POSIX sh fallback: /proc/net/tcp lists listeners in hex; websockify typically
+# binds *:6080 (00000000) or 127.0.0.1:6080 (0100007F) with state 0A (LISTEN).
 hex=$(printf '%04X' "$port")
-grep -E "^[[:space:]]*[0-9]+:[[:space:]]*0100007F:${hex} " /proc/net/tcp | grep -q ' 0A '
+grep -E "^[[:space:]]*[0-9]+:[[:space:]]*(0100007F|00000000):${hex} " /proc/net/tcp | grep -q ' 0A '

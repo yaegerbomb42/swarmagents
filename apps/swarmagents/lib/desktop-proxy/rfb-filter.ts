@@ -203,7 +203,12 @@ export class RfbInputFilter {
           size = 4 + count * 4;
         } else if (type === 6) {
           if (this.buffer.length < 8) break;
-          const length = this.buffer.readUInt32BE(4);
+          // RFC 6143 §7.5.6: standard ClientCutText carries an unsigned length;
+          // TigerVNC / noVNC ExtendedClipboard passes a negative int32 length
+          // whose payload has `-signedLength` bytes. Both stay capped and
+          // dropped cleanly in view mode.
+          const signedLength = this.buffer.readInt32BE(4);
+          const length = signedLength < 0 ? -signedLength : signedLength;
           if (length > MAX_CUT_TEXT_BYTES) {
             throw new RfbProtocolError("ClientCutText length exceeds limit");
           }

@@ -117,6 +117,13 @@ export function LibraryView({ embedded = false }: { embedded?: boolean }) {
 
   const [installed, setInstalled] = useState<InstalledItem[]>([]);
   const [notifications, setNotifications] = useState<LibraryNotification[]>([]);
+  const [onlineQuery, setOnlineQuery] = useState("");
+  const [onlineSource, setOnlineSource] = useState<"all" | "anthropic" | "openai" | "composio">("all");
+  const [onlineSkills, setOnlineSkills] = useState<Array<{ id: string; slug: string; name: string; source: string; sourceId: string; description: string; htmlUrl: string }>>([]);
+  const [onlineTotal, setOnlineTotal] = useState(0);
+  const [onlineLoading, setOnlineLoading] = useState(false);
+  const [onlineError, setOnlineError] = useState<string | null>(null);
+  const [installingSkillId, setInstallingSkillId] = useState<string | null>(null);
 
   const [publishOpen, setPublishOpen] = useState(false);
   const [publishKind, setPublishKind] = useState<LibraryKind>("skill");
@@ -170,6 +177,56 @@ export function LibraryView({ embedded = false }: { embedded?: boolean }) {
     if (tab === "browse") void refreshPublic();
     if (tab === "mcp" || tab === "skills" || tab === "tools") void refreshInstalled();
   }, [tab, refreshPublic, refreshInstalled]);
+
+  const refreshOnlineSkills = useCallback(async (q = onlineQuery, src = onlineSource) => {
+    setOnlineLoading(true);
+    setOnlineError(null);
+    try {
+      const params = new URLSearchParams({ q, source: src, limit: "30" });
+      const res = await fetch(`/api/library/skills/registry?${params.toString()}`, { cache: "no-store" });
+      const body = (await res.json().catch(() => ({}))) as {
+        skills?: Array<{ id: string; slug: string; name: string; source: string; sourceId: string; description: string; htmlUrl: string }>;
+        total?: number;
+        error?: string;
+      };
+      if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      setOnlineSkills(Array.isArray(body.skills) ? body.skills : []);
+      setOnlineTotal(typeof body.total === "number" ? body.total : (body.skills?.length ?? 0));
+    } catch (err) {
+      setOnlineError(errorText(err));
+    } finally {
+      setOnlineLoading(false);
+    }
+  }, [onlineQuery, onlineSource]);
+
+  useEffect(() => {
+    if (tab !== "skills") return;
+    const timer = window.setTimeout(() => {
+      void refreshOnlineSkills(onlineQuery, onlineSource);
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [tab, onlineQuery, onlineSource, refreshOnlineSkills]);
+
+  async function installOnlineSkill(skill: { id: string; name: string }) {
+    if (installingSkillId) return;
+    setInstallingSkillId(skill.id);
+    setError(null);
+    try {
+      const res = await fetch("/api/library/skills/registry", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ skillId: skill.id }),
+      });
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      setNotice(`Installed "${skill.name}" SKILL.md into your VM skills library.`);
+      await refreshInstalled();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setInstallingSkillId(null);
+    }
+  }
 
   // F4: when the publish form opens, offer the publisher's recent finished
   // runs as proof-of-run candidates.
@@ -655,6 +712,92 @@ export function LibraryView({ embedded = false }: { embedded?: boolean }) {
                 <li className="rounded-xl border border-dashed border-white/10 p-6 text-center text-[12px] text-zinc-500">Nothing installed in this tab yet.</li>
               )}
             </ul>
+
+            {tab === "skills" && (
+              <div className="mt-6 border-t border-white/[0.07] pt-4" data-testid="online-skills-directory">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-[12px] font-semibold text-zinc-100">
+                      Online Skills Directory {onlineTotal > 0 ? `(${onlineTotal})` : ""}
+                    </h3>
+                    <p className="text-[11px] text-zinc-500">
+                      Install verified SKILL.md packs from anthropics/skills, openai/skills, and ComposioHQ directly into your VM.
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                  <label className="relative flex min-w-[160px] flex-1 items-center">
+                    <Search className="pointer-events-none absolute left-2 h-3.5 w-3.5 text-zinc-500" aria-hidden />
+                    <input
+                      value={onlineQuery}
+                      onChange={(e) => setOnlineQuery(e.target.value)}
+                      placeholder="Search 900+ online skills (playwright, cloudflare, slack, pdf)…"
+                      aria-label="Search online skills"
+                      className="w-full rounded-md border border-white/10 bg-black/30 py-1.5 pl-7 pr-2 text-[12px] outline-none placeholder:text-zinc-600 focus:border-cyan-400/50"
+                    />
+                  </label>
+                  <select
+                    value={onlineSource}
+                    onChange={(e) => setOnlineSource(e.target.value as typeof onlineSource)}
+                    aria-label="Filter online skills source"
+                    className="rounded-md border border-white/10 bg-black/30 px-2 py-1.5 text-[11px]"
+                  >
+                    <option value="all">All registries</option>
+                    <option value="anthropic">anthropics/skills</option>
+                    <option value="openai">openai/skills</option>
+                    <option value="composio">ComposioHQ (860+)</option>
+                  </select>
+                </div>
+                {onlineLoading && (
+                  <p className="mt-3 flex items-center gap-1.5 text-[11px] text-zinc-400">
+                    <Loader2 className="h-3 w-3 animate-spin" aria-hidden /> Loading online skills…
+                  </p>
+                )}
+                {onlineError && (
+                  <p className="mt-3 rounded-lg border border-red-400/20 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-200">
+                    {onlineError}
+                  </p>
+                )}
+                <ul className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  {onlineSkills.map((sk) => {
+                    const expectedId = `skill-${sk.id.replace(/[^a-z0-9._-]+/gi, "-")}`;
+                    const isInstalled = installed.some((row) => row.id === expectedId || row.id === `skill-${sk.slug}`);
+                    const busy = installingSkillId === sk.id;
+                    return (
+                      <li key={sk.id} data-testid="online-skill-item" className="flex flex-col justify-between rounded-xl border border-white/[0.08] bg-white/[0.02] p-3">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-[12px] font-medium text-zinc-100">{sk.name}</span>
+                            <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-zinc-400">{sk.source}</span>
+                          </div>
+                          <p className="mt-1 line-clamp-2 text-[11px] text-zinc-400">{sk.description}</p>
+                        </div>
+                        <div className="mt-2.5 flex items-center justify-between gap-2">
+                          <a href={sk.htmlUrl} target="_blank" rel="noreferrer" className="text-[10px] text-zinc-500 hover:text-zinc-300">
+                            Source
+                          </a>
+                          {isInstalled ? (
+                            <span className="inline-flex items-center gap-1 rounded-md bg-emerald-400/10 px-2 py-1 text-[10px] font-medium text-emerald-200">
+                              <Check className="h-3 w-3" aria-hidden /> Installed
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled={Boolean(installingSkillId)}
+                              onClick={() => void installOnlineSkill(sk)}
+                              className="inline-flex items-center gap-1 rounded-md border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-1 text-[10px] font-medium text-cyan-200 hover:bg-cyan-400/20 disabled:opacity-50"
+                            >
+                              {busy ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden /> : <Plus className="h-3 w-3" aria-hidden />}
+                              Install skill
+                            </button>
+                          )}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            )}
           </section>
         )}
 

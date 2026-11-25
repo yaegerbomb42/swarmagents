@@ -584,11 +584,17 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
       sessionParam !== null && /^\d+$/.test(sessionParam) ? Number(sessionParam) : undefined;
     if (rest === "" || rest === "/") {
       const body = JSON.stringify({ keyframes: listKeyframes(userId) });
+      const corsHeaders: Record<string, string> = {};
+      if (!process.env.SWARM_SERVER_MODE && typeof req.headers.origin === "string") {
+        corsHeaders["access-control-allow-origin"] = req.headers.origin;
+        corsHeaders["access-control-allow-credentials"] = "true";
+      }
       res.writeHead(200, {
         "content-type": "application/json",
         "cache-control": "no-store",
         "x-content-type-options": "nosniff",
         "x-frame-options": "DENY",
+        ...corsHeaders,
       });
       res.end(req.method === "HEAD" ? undefined : body);
       return;
@@ -627,11 +633,17 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
         agentPaused: snap.agentPaused,
         requestedAt: snap.requestedAt,
       });
+      const corsHeaders: Record<string, string> = {};
+      if (!process.env.SWARM_SERVER_MODE && typeof req.headers.origin === "string") {
+        corsHeaders["access-control-allow-origin"] = req.headers.origin;
+        corsHeaders["access-control-allow-credentials"] = "true";
+      }
       res.writeHead(200, {
         "content-type": "application/json",
         "cache-control": "no-store",
         "x-content-type-options": "nosniff",
         "x-frame-options": "DENY",
+        ...corsHeaders,
       });
       res.end(body);
       return;

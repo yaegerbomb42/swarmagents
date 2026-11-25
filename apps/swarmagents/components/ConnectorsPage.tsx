@@ -456,6 +456,7 @@ export function ConnectorsPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [chip, setChip] = useState<FilterChip>("all");
+  const [visibleCount, setVisibleCount] = useState(60);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -561,6 +562,15 @@ export function ConnectorsPage() {
       );
     });
   }, [connectors, query, chip]);
+
+  useEffect(() => {
+    setVisibleCount(60);
+  }, [query, chip]);
+
+  const visibleFiltered = useMemo(
+    () => filtered.slice(0, visibleCount),
+    [filtered, visibleCount],
+  );
 
   const handleInstallRegistry = async (srv: RegistryServerRow) => {
     if (busyId) return;
@@ -946,20 +956,36 @@ export function ConnectorsPage() {
 
         {/* Content */}
         {hubMode === "catalog" && (
-          <ContentView
-            loading={loading}
-            loadError={loadError}
-            filtered={filtered}
-            busyId={busyId}
-            onRetry={() => void load()}
-            onResetFilters={() => {
-              setQuery("");
-              setChip("all");
-            }}
-            onConnect={handleOneClickConnect}
-            onDisconnect={handleDisconnect}
-            onUpdate={openModal}
-          />
+          <>
+            <ContentView
+              loading={loading}
+              loadError={loadError}
+              filtered={visibleFiltered}
+              busyId={busyId}
+              onRetry={() => void load()}
+              onResetFilters={() => {
+                setQuery("");
+                setChip("all");
+              }}
+              onConnect={handleOneClickConnect}
+              onDisconnect={handleDisconnect}
+              onUpdate={openModal}
+            />
+            {!loading && !loadError && filtered.length > visibleCount && (
+              <div className="mt-6 flex flex-col items-center gap-2">
+                <p className="text-xs text-zinc-500">
+                  Showing {visibleFiltered.length} of {filtered.length} connectors
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount((n) => n + 60)}
+                  className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2 text-xs font-medium text-zinc-200 transition hover:bg-white/[0.08]"
+                >
+                  Load 60 more ({filtered.length - visibleCount} remaining)
+                </button>
+              </div>
+            )}
+          </>
         )}
 
         {hubMode === "registry" && (

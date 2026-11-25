@@ -49,6 +49,7 @@ test("tool-forge MCP server searches catalog, authors + smoke-tests a custom too
       },
       { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "manage_mcp", arguments: { action: "disable", id: "echo-upper" } } },
       { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "list_my_tools", arguments: {} } },
+      { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "install_online_skill", arguments: { id: "../etc/passwd" } } },
     ]
       .map((m) => JSON.stringify(m))
       .join("\n") + "\n";
@@ -68,13 +69,14 @@ test("tool-forge MCP server searches catalog, authors + smoke-tests a custom too
     const replies = res.stdout
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { id: number; result?: { content?: Array<{ text: string }>; tools?: unknown[] } });
+      .map((line) => JSON.parse(line) as { id: number; error?: { message?: string }; result?: { content?: Array<{ text: string }>; tools?: unknown[] } });
 
-    assert.equal(replies.find((r) => r.id === 2)?.result?.tools?.length, 4);
+    assert.equal(replies.find((r) => r.id === 2)?.result?.tools?.length, 6);
     assert.match(replies.find((r) => r.id === 3)?.result?.content?.[0]?.text ?? "", /slack \|/);
     assert.match(replies.find((r) => r.id === 4)?.result?.content?.[0]?.text ?? "", /HELLO/);
     assert.match(replies.find((r) => r.id === 5)?.result?.content?.[0]?.text ?? "", /disabled/);
     assert.match(replies.find((r) => r.id === 6)?.result?.content?.[0]?.text ?? "", /echo-upper\[off\]/);
+    assert.match(replies.find((r) => r.id === 7)?.error?.message ?? "", /Invalid skill id/);
 
     const atlas = JSON.parse(fs.readFileSync(atlasPath, "utf8")) as { entries: Array<{ id: string }> };
     assert.ok(atlas.entries.some((e) => e.id === "custom:echo-upper"));

@@ -84,6 +84,7 @@ export const SWARM_VM_IMAGE = process.env.SWARM_VM_IMAGE ?? DEFAULT_IMAGE;
  * When unset everything behaves exactly as before with swarm-vm:claude.
  */
 export const SWARM_VM_DESKTOP = process.env.SWARM_VM_DESKTOP === "1";
+export const SWARM_VM_LOCAL_PUBLISH = process.env.SWARM_VM_LOCAL_PUBLISH === "1";
 export const DEFAULT_DESKTOP_IMAGE = "swarm-vm:desktop";
 export const SWARM_VM_DESKTOP_IMAGE =
   (process.env.SWARM_VM_DESKTOP_IMAGE ?? "").trim() || DEFAULT_DESKTOP_IMAGE;
@@ -598,6 +599,29 @@ export function isNotFoundError(stderr: string): boolean {
  * The limits are validated first: a malformed value must never reach the
  * docker CLI (where it would either be ignored or fail the whole run).
  */
+/**
+ * Parse `docker port <container> 6080` stdout into a loopback host port.
+ * Prefers explicit `127.0.0.1:<port>` bindings over wildcard bindings.
+ */
+export function parseDockerPublishedPort(stdout: string): number | null {
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  lines.sort((a, b) => {
+    const aLoop = a.startsWith("127.0.0.1:") ? 0 : 1;
+    const bLoop = b.startsWith("127.0.0.1:") ? 0 : 1;
+    return aLoop - bLoop;
+  });
+  for (const line of lines) {
+    const match = /^(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::\]):(\d+)$/.exec(line);
+    if (!match) continue;
+    const port = Number(match[1]);
+    if (Number.isInteger(port) && port >= 1 && port <= 65535) return port;
+  }
+  return null;
+}
+
 export function buildRunArgs(opts: {
   containerName: string;
   volume: string;
@@ -613,9 +637,12 @@ export function buildRunArgs(opts: {
    * Desktop mode: size /dev/shm for a browser (e.g. "1g"), forward env
    * values by name only (the values travel in the spawn env, never argv),
    * and omit the `tail -f /dev/null` override so the image's own CMD
-   * (desktop init + supervisord) runs. No ports are ever published.
+   * (desktop init + supervisord) runs. No ports are ever published unless
+   * `publishDesktopPort` is explicitly enabled for macOS/Colima local dev.
    */
   desktop?: boolean;
+  /** Bind VNC port 6080 to an ephemeral loopback port (`-p 127.0.0.1::6080`). */
+  publishDesktopPort?: boolean;
   shmSize?: string;
   env?: Record<string, string>;
   /** Docker labels to stamp on the created container (e.g. the owner label). */
@@ -648,6 +675,9 @@ export function buildRunArgs(opts: {
   if (runtime) args.push("--runtime", runtime);
   if (network) args.push("--network", network);
   if (opts.shmSize) args.push("--shm-size", opts.shmSize);
+  if (opts.desktop && opts.publishDesktopPort) {
+    args.push("-p", `127.0.0.1::${DESKTOP_VNC_PORT}`);
+  }
   if (opts.env) {
     for (const name of Object.keys(opts.env)) {
       validateEnvName(name);
@@ -766,6 +796,8 @@ export interface DockerVmDriverOptions {
    * desktopEndpoint().
    */
   desktop?: boolean;
+  /** Bind desktop VNC 6080 onto 127.0.0.1:<ephemeral> (macOS Colima bridge). */
+  localPublish?: boolean;
   /** How long to wait after the JS timeout deadline before killing the docker CLI. */
   killGraceMs?: number;
   /**
@@ -814,6 +846,8 @@ export class DockerVmDriver implements VmDriver {
   readonly network: string | undefined;
   /** Desktop mode: true when the VM gets a desktop + VNC endpoint. */
   readonly desktop: boolean;
+  /** Bind desktop VNC to 127.0.0.1:<ephemeral> when Docker runs inside a host VM (macOS Colima). */
+  readonly localPublish: boolean;
   private readonly killGraceMs: number;
   /** Resolved per-class docker CLI deadlines (constructor > env > built-in). */
   private readonly dockerTimeouts: Record<DockerTimeoutClass, number>;
@@ -832,11 +866,15 @@ export class DockerVmDriver implements VmDriver {
   private readonly legacyOwnerCandidates: () => string[];
 
   constructor(opts: DockerVmDriverOptions = {}) {
-    this.desktop = opts.desktop ?? SWARM_VM_DESKTOP;
+    this.desktop = opts.desktop ?? (process.env.SWARM_VM_DESKTOP === "1" || SWARM_VM_DESKTOP);
+    this.localPublish =
+      opts.localPublish ?? (process.env.SWARM_VM_LOCAL_PUBLISH === "1" || SWARM_VM_LOCAL_PUBLISH);
     // Desktop mode picks the desktop image by default; under the hood it is
     // still just the image the user configures (env wins, explicit option
     // wins over env).
-    this.image = opts.image ?? (this.desktop ? SWARM_VM_DESKTOP_IMAGE : SWARM_VM_IMAGE);
+    const envDesktopImg = (process.env.SWARM_VM_DESKTOP_IMAGE ?? "").trim() || SWARM_VM_DESKTOP_IMAGE;
+    const envBaseImg = process.env.SWARM_VM_IMAGE ?? SWARM_VM_IMAGE;
+    this.image = opts.image ?? (this.desktop ? envDesktopImg : envBaseImg);
     // Explicit options win over env, env wins over the defaults. An invalid
     // value throws a VmLimitError here rather than reaching the docker CLI.
     // Desktop mode keeps the standard 2g default ceiling (never lower), but
@@ -1362,6 +1400,14 @@ export class DockerVmDriver implements VmDriver {
     }
     if (!password) return null;
 
+    if (this.localPublish) {
+      const portRes = await this.run(["port", handle.containerName, String(DESKTOP_VNC_PORT)]);
+      if (portRes.code === 0) {
+        const hostPort = parseDockerPublishedPort(portRes.stdout);
+        if (hostPort) return { host: "127.0.0.1", port: hostPort, password };
+      }
+    }
+
     return { host: ip, port: DESKTOP_VNC_PORT, password };
   }
 
@@ -1487,6 +1533,7 @@ export class DockerVmDriver implements VmDriver {
           runtime: this.runtime,
           network: this.network,
           desktop: this.desktop,
+          publishDesktopPort: this.localPublish,
           create: this.desktop,
           shmSize: this.desktop ? DESKTOP_SHM_SIZE : undefined,
           env: runEnv,
@@ -2040,6 +2087,7 @@ export class DockerVmDriver implements VmDriver {
         runtime: this.runtime,
         network: this.network,
         desktop: this.desktop,
+        publishDesktopPort: this.localPublish,
         create: this.desktop,
         shmSize: this.desktop ? DESKTOP_SHM_SIZE : undefined,
         env: runEnv,
@@ -2091,6 +2139,7 @@ export class DockerVmDriver implements VmDriver {
         runtime: this.runtime,
         network: this.network,
         desktop: this.desktop,
+        publishDesktopPort: this.localPublish,
         create: this.desktop,
         shmSize: this.desktop ? DESKTOP_SHM_SIZE : undefined,
         env: runEnv,

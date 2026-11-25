@@ -399,6 +399,24 @@ export class VmManager {
   }
 
   /**
+   * Wake/recover the user's VM: if a cached handle's container stopped or
+   * disappeared out-of-band (e.g. daemon restart / image upgrade), evict the
+   * stale cache entry and re-ensure a live container.
+   */
+  async wake(userId: string): Promise<VmHandle> {
+    const known = this.handles.get(userId);
+    if (known) {
+      const current = await this.driver.status(known);
+      if (current.status !== "running" && current.status !== "creating") {
+        await this.withWrite(userId, async () => {
+          this.cache.delete(userId);
+        });
+      }
+    }
+    return this.ensure(userId);
+  }
+
+  /**
    * ensure() without taking the lock — callers must already hold the
    * per-user read lock (or the write lock).
    */

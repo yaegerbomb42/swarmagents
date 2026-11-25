@@ -21,6 +21,7 @@ import {
   DockerVmDriver,
   VmUnavailableError,
   buildRunArgs,
+  parseDockerPublishedPort,
   desktopVncTarArgs,
   generateVncPassword,
   containerNameFor,
@@ -742,4 +743,40 @@ test("legacy migration: an ambiguous legacy name is left alone and a fresh VM is
     assert.match(txt, /"action":"vm\.migrate"/);
     assert.match(txt, /"result":"failure"/);
   });
+});
+
+test("parseDockerPublishedPort extracts loopback host ports", () => {
+  assert.equal(parseDockerPublishedPort("127.0.0.1:49201\n"), 49201);
+  assert.equal(parseDockerPublishedPort("[::]:49202\n127.0.0.1:49201\n"), 49201);
+  assert.equal(parseDockerPublishedPort("invalid\n"), null);
+});
+
+test("buildRunArgs binds ephemeral loopback VNC port only when publishDesktopPort is set", () => {
+  const argv = buildRunArgs({
+    ...baseRunOpts,
+    desktop: true,
+    publishDesktopPort: true,
+    shmSize: DESKTOP_SHM_SIZE,
+  });
+  const pIdx = argv.indexOf("-p");
+  assert.ok(pIdx >= 0, "expected -p flag for localPublish");
+  assert.equal(argv[pIdx + 1], `127.0.0.1::${DESKTOP_VNC_PORT}`);
+});
+
+test("DockerVmDriver.desktopEndpoint uses docker port mapping when localPublish is true", async () => {
+  const { spawnFn, calls } = makeFakeSpawn();
+  const driver = new DockerVmDriver({ spawnFn, desktop: true, localPublish: true });
+  const p = driver.desktopEndpoint(handle());
+  calls[0].cp.stdout.emit("data", Buffer.from(endpointInspect("running", "172.30.0.9", "alice")));
+  calls[0].cp.emitClose(0);
+  await flush();
+  calls[1].cp.stdout.emit("data", Buffer.from("vnc-pass-1\n"));
+  calls[1].cp.emitClose(0);
+  await flush();
+  const portCall = calls[2];
+  assert.deepEqual(portCall.args, ["port", containerNameFor("alice"), String(DESKTOP_VNC_PORT)]);
+  portCall.cp.stdout.emit("data", Buffer.from("127.0.0.1:51234\n"));
+  portCall.cp.emitClose(0);
+  const endpoint = await p;
+  assert.deepEqual(endpoint, { host: "127.0.0.1", port: 51234, password: "vnc-pass-1" });
 });

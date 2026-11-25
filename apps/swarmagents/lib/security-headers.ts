@@ -46,7 +46,9 @@ function directives(nonce: string, dev: boolean, frameAncestors = "'none'"): str
     "font-src 'self' data:",
     // Provider calls go straight from the browser to user-configured https
     // endpoints (Anthropic, OpenAI, Gemini, ...), hence https: for connect-src.
-    "connect-src 'self' https: wss: ws:",
+    dev
+      ? "connect-src 'self' http://127.0.0.1:3778 http://localhost:3778 https: wss: ws:"
+      : "connect-src 'self' https: wss: ws:",
     "worker-src 'self' blob:",
   ];
 }

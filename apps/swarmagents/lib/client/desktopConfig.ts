@@ -43,6 +43,14 @@ export const DESKTOP_FRAME_HEIGHT = 900;
  * same id must be reused across reconnect-to-switch dials (and on the
  * takeover-state poll) for the session to keep its place in the machine.
  */
+function desktopProxyHost(host: string): string {
+  // In local Next.js dev (127.0.0.1:3777 / localhost:3777 without nginx),
+  // instrumentation.ts serves the WebSocket desktop proxy on port 3778.
+  return host === "127.0.0.1:3777" || host === "localhost:3777"
+    ? host.replace(/:3777$/, ":3778")
+    : host;
+}
+
 export function desktopWsUrl(
   mode: DesktopMode,
   location: { protocol: string; host: string } = globalThis.location,
@@ -50,7 +58,7 @@ export function desktopWsUrl(
 ): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const client = clientId ? `&client=${encodeURIComponent(clientId)}` : "";
-  return `${proto}//${location.host}${DESKTOP_WS_PATH}?mode=${mode}${client}`;
+  return `${proto}//${desktopProxyHost(location.host)}${DESKTOP_WS_PATH}?mode=${mode}${client}`;
 }
 
 /** Build the takeover-state poll URL for a client id. */
@@ -58,5 +66,5 @@ export function desktopTakeoverStateUrl(
   clientId: string,
   location: { protocol: string; host: string } = globalThis.location,
 ): string {
-  return `${location.protocol}//${location.host}${DESKTOP_TAKEOVER_STATE_PATH}?client=${encodeURIComponent(clientId)}`;
+  return `${location.protocol}//${desktopProxyHost(location.host)}${DESKTOP_TAKEOVER_STATE_PATH}?client=${encodeURIComponent(clientId)}`;
 }

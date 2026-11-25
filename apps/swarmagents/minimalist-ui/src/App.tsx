@@ -21,7 +21,7 @@ import { DEFAULT_AGENT_CARD } from "./data";
 import type { LogEvent } from "./engine";
 import { usePersisted, useSessionPersisted } from "./store";
 import type { SwarmTask } from "../../lib/mcp-types";
-import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus } from "../../lib/client/vmStatus";
+import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus, wakeVmStatus } from "../../lib/client/vmStatus";
 import { derivePresence } from "../../lib/client/presence";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm } from "../../lib/client/runs";
@@ -156,7 +156,10 @@ export default function App() {
   // ---- VM screen ----
 
   const lifecycleEvent = latestVmLifecycleEvent(session.liveItems);
-  const polledVm = usePolledVmStatus(undefined, `${session.busy}:${lifecycleEvent ?? ""}`);
+  const [vmWakeTick, setVmWakeTick] = useState(0);
+  const [vmWaking, setVmWaking] = useState(false);
+  const [showDesktopBeforeRun, setShowDesktopBeforeRun] = useState(false);
+  const polledVm = usePolledVmStatus(undefined, `${session.busy}:${lifecycleEvent ?? ""}:${vmWakeTick}`);
   const [vmResetting, setVmResetting] = useState(false);
   const [takingOver, setTakingOver] = useState(false);
   const [screenView, setScreenView] = useState<ComputerView>("desktop");
@@ -262,9 +265,27 @@ export default function App() {
 
   const handleNewChat = useCallback(() => {
     session.newChat();
+    setShowDesktopBeforeRun(false);
     setView("chat");
     focusComposer();
   }, [session, setView, focusComposer]);
+
+  const handleOpenLiveDesktop = useCallback(async () => {
+    if (session.signedOut) {
+      openSettings("account");
+      return;
+    }
+    setShowDesktopBeforeRun(true);
+    setView("screen");
+    setScreenView("desktop");
+    setVmWaking(true);
+    try {
+      await wakeVmStatus();
+      setVmWakeTick((n) => n + 1);
+    } finally {
+      setVmWaking(false);
+    }
+  }, [session.signedOut, openSettings, setView]);
 
   const handleResetVm = useCallback(async (): Promise<string | undefined> => {
     setVmResetting(true);
@@ -383,7 +404,7 @@ export default function App() {
   // Before the first run there is no screen worth showing yet: the main
   // area carries the brand hero and starter chips. The screen stays
   // mounted (hidden) so its streams survive the switch.
-  const showHero = effectiveView === "screen" && !headRun && session.turns.length === 0;
+  const showHero = effectiveView === "screen" && !headRun && session.turns.length === 0 && !showDesktopBeforeRun;
 
   return (
     <div
@@ -428,6 +449,22 @@ export default function App() {
           <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--mute)]" role="status" aria-live="polite" data-testid="workspace-activity">
             <span className={cn("h-2 w-2 shrink-0 rounded-full", phaseMeta?.active ? "bg-emerald-400 animate-pulse" : "bg-white/30")} />
             <span className="truncate">{phaseMeta?.label ?? vmDisplay.label}{activitySuffix}</span>
+            {effectiveView === "screen" && !headRun && session.turns.length === 0 && (
+              <button
+                type="button"
+                data-testid="toggle-live-desktop-btn"
+                onClick={() => {
+                  if (showHero) {
+                    void handleOpenLiveDesktop();
+                  } else {
+                    setShowDesktopBeforeRun(false);
+                  }
+                }}
+                className="ml-auto shrink-0 rounded-full border border-white/10 bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-zinc-200 transition hover:bg-white/[0.08]"
+              >
+                {showHero ? (vmWaking ? "Booting VM…" : "Live Desktop") : "Overview"}
+              </button>
+            )}
           </div>
           {showHero && (
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 py-10 text-center" data-testid="workspace-hero">
@@ -453,6 +490,18 @@ export default function App() {
                   ))}
                 </div>
               )}
+              <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5">
+                <button
+                  type="button"
+                  data-testid="launch-desktop-btn"
+                  disabled={vmWaking}
+                  onClick={() => void handleOpenLiveDesktop()}
+                  className="inline-flex items-center gap-2 rounded-full border border-indigo-400/35 bg-indigo-500/15 px-4 py-2 text-xs font-medium text-indigo-100 shadow-sm backdrop-blur transition hover:border-indigo-300/50 hover:bg-indigo-500/25 disabled:opacity-60"
+                >
+                  <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                  {vmWaking ? "Booting Linux Desktop…" : "Launch live Linux desktop"}
+                </button>
+              </div>
             </div>
           )}
           {/* Keep the desktop and runtime streams mounted when switching workspace tabs. */}

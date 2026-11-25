@@ -198,6 +198,8 @@ export interface SettingsSheetProps extends AgentSettingsProps {
   providers: ProviderConfig[];
   setProviders: (fn: (p: ProviderConfig[]) => ProviderConfig[]) => void;
   serverProviderCount: number;
+  /** Notified when the 24/7 always-on toggle loads or changes (header badge). */
+  onAlwaysOn247Change?: (value: boolean) => void;
 }
 
 export function SettingsSheet({
@@ -207,6 +209,7 @@ export function SettingsSheet({
   providers,
   setProviders,
   serverProviderCount,
+  onAlwaysOn247Change,
   ...agent
 }: SettingsSheetProps) {
   return (
@@ -223,6 +226,7 @@ export function SettingsSheet({
         providers={providers}
         setProviders={setProviders}
         serverProviderCount={serverProviderCount}
+        onAlwaysOn247Change={onAlwaysOn247Change}
       />
     </Sheet>
   );

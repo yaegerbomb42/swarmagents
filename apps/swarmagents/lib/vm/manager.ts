@@ -62,6 +62,13 @@ export interface VmManagerOptions {
   idle?: VmIdleOptions;
   /** Injectable clock — tests drive it with a fake timer. */
   now?: () => number;
+  /**
+   * Per-user 24/7 mode: their VM is never hibernated by sweepIdle and a
+   * dead/stopped container is re-ensured on every health sweep.
+   */
+  alwaysOnUsers?: ReadonlySet<string>;
+  /** Dynamic form of alwaysOnUsers (e.g. backed by per-user settings). */
+  isAlwaysOn?: (userId: string) => boolean;
 }
 
 /** One activity record per user: when it happened and how many events so far. */
@@ -129,12 +136,26 @@ export class VmManager {
   private activity = new Map<string, ActivityRecord>();
   private activitySeq = 0;
   private diskUsageCache = new Map<string, DiskUsageCacheEntry>();
+  private readonly alwaysOnUsers: ReadonlySet<string>;
+  private isAlwaysOnFn?: (userId: string) => boolean;
 
   constructor(opts?: VmManagerOptions) {
     this.driver = opts?.customDriver ?? resolveDriver(opts?.driver ?? process.env.SWARM_VM_DRIVER);
     this.quotas = resolveVmQuotas(opts?.quotas);
     this.idle = resolveIdlePolicy({ idleMinutes: opts?.idle?.idleMinutes });
     this.now = opts?.now ?? Date.now;
+    this.alwaysOnUsers = opts?.alwaysOnUsers ?? new Set<string>();
+    this.isAlwaysOnFn = opts?.isAlwaysOn;
+  }
+
+  /** Wire the per-user 24/7 predicate (called when the runtime boots). */
+  setAlwaysOnPredicate(fn: (userId: string) => boolean): void {
+    this.isAlwaysOnFn = fn;
+  }
+
+  /** Is this user in 24/7 always-on mode? */
+  isAlwaysOnUser(userId: string): boolean {
+    return this.alwaysOnUsers.has(userId) || this.isAlwaysOnFn?.(userId) === true;
   }
 
   private lockFor(userId: string): RwLock {
@@ -232,6 +253,7 @@ export class VmManager {
     if (this.idle.idleMs <= 0) return [];
     const ids: string[] = [];
     for (const [userId, record] of this.activity) {
+      if (this.isAlwaysOnUser(userId)) continue;
       const idle = now - record.at;
       if (idle <= 0 || idle >= this.idle.idleMs) continue;
       if (this.hasActiveExec(userId)) continue;
@@ -826,6 +848,33 @@ export class VmManager {
   // -------------------------------------------------------------------------
 
   /**
+   * Re-start a 24/7 user's VM when its container is gone or stopped. A
+   * cached handle promise would make ensure() a no-op, so it is dropped
+   * first; the driver keeps the /workspace volume either way.
+   */
+  private async healAlwaysOn(userId: string): Promise<void> {
+    if (this.hasActiveExec(userId)) return;
+    const handle = this.handles.get(userId);
+    if (!handle) return; // never ensured here — do not create a VM on a sweep
+
+    let dead = false;
+    if (!this.cache.has(userId)) {
+      // The container was stopped/hibernated: stop() drops the cache entry.
+      dead = true;
+    } else {
+      try {
+        const state = await this.driver.status(handle);
+        dead = state.status === "stopped" || state.status === "missing" || state.status === "error";
+      } catch {
+        dead = true;
+      }
+    }
+    if (!dead) return;
+    this.cache.delete(userId);
+    await this.ensure(userId);
+  }
+
+  /**
    * Stop every VM that has been idle for longer than the idle window and
    * return the ids of the users that were hibernated.
    *
@@ -835,12 +884,29 @@ export class VmManager {
    *
    * The driver's stop() keeps the /workspace volume; the cached handle
    * promise is dropped so the next ensure() re-ensures (restarts) the VM.
+   *
+   * 24/7 users are exempt from hibernation. Instead their container is
+   * health-checked on every sweep and re-ensured when it has stopped or
+   * died, so an always-on VM heals itself without waiting for a task.
    */
   async sweepIdle(now: number = this.now()): Promise<string[]> {
     if (this.idle.idleMs <= 0) return [];
 
+    // Heal always-on VMs first, then hibernate the ordinary idle ones. Only
+    // users with a known container are healed — a user who never ran a task
+    // must not get a VM spun up just because they enabled the toggle.
+    for (const userId of new Set([...this.handles.keys(), ...this.activity.keys()])) {
+      if (!this.isAlwaysOnUser(userId)) continue;
+      try {
+        await this.healAlwaysOn(userId);
+      } catch (err) {
+        console.error(`[vm] failed to restart always-on VM for ${userId}:`, err);
+      }
+    }
+
     const stopped: string[] = [];
     for (const [userId, record] of [...this.activity]) {
+      if (this.isAlwaysOnUser(userId)) continue;
       if (now - record.at < this.idle.idleMs) continue;
       if (this.hasActiveExec(userId)) continue;
       const handle = this.handles.get(userId);

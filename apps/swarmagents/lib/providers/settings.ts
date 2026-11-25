@@ -62,6 +62,12 @@ export interface UserSettings {
    */
   vmPersistenceMode?: VmPersistenceMode;
   /**
+   * Keep this user's VM alive around the clock: the idle sweeper never
+   * hibernates it and re-ensures the container if it stops or dies. Absent =
+   * off (a stopped VM is restarted on next use, as before).
+   */
+  alwaysOn247?: boolean;
+  /**
    * Provider racing (lib/providers/race-dispatch.ts). Absent/enabled:false = off.
    */
   race?: RaceSettings;
@@ -155,6 +161,11 @@ export function vmPersistenceModeFor(settings: UserSettings): VmPersistenceMode 
   return isVmPersistenceMode(settings.vmPersistenceMode)
     ? settings.vmPersistenceMode
     : DEFAULT_VM_PERSISTENCE_MODE;
+}
+
+/** Is 24/7 always-on VM mode enabled for this user? Absent = off. */
+export function alwaysOn247For(settings: UserSettings): boolean {
+  return settings.alwaysOn247 === true;
 }
 
 /** Per-user token-efficiency controls; all opt-in, all default off. */
@@ -396,6 +407,7 @@ export function parseUserSettings(raw: unknown): UserSettings {
   if (tokenEfficiency !== undefined) out.tokenEfficiency = tokenEfficiency;
   if (isKeySelectionMode(raw.keySelectionMode)) out.keySelectionMode = raw.keySelectionMode;
   if (isVmPersistenceMode(raw.vmPersistenceMode)) out.vmPersistenceMode = raw.vmPersistenceMode;
+  if (typeof raw.alwaysOn247 === "boolean") out.alwaysOn247 = raw.alwaysOn247;
   const race = parseRaceSettings(raw.race);
   if (race !== undefined) out.race = race;
   const webSearch = parseWebSearchConfig(raw.webSearch);

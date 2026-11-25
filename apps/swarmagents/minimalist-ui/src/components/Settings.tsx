@@ -54,6 +54,7 @@ export function Settings({
   tabs = DEFAULT_TABS,
   initialTab,
   agentPanel,
+  onAlwaysOn247Change,
 }: {
   open: boolean;
   onClose: () => void;
@@ -76,6 +77,8 @@ export function Settings({
   initialTab?: Tab;
   /** Content of the 'agent' tab: the run settings the workspace supplies. */
   agentPanel?: React.ReactNode;
+  /** Notified when the 24/7 always-on toggle loads or changes (for the header badge). */
+  onAlwaysOn247Change?: (value: boolean) => void;
 }) {
   const [tab, setTab] = useState<Tab>(initialTab ?? tabs[0] ?? 'general');
   const [accent, setAccent] = useState<Accent>('cyan');
@@ -145,7 +148,7 @@ export function Settings({
 
         <div className="flex-1 overflow-y-auto px-5 pb-6 pt-5 scrollbar-thin">
           {tab === 'general' && <General roles={roles} setRoles={setRoles} providers={providers} setProviders={setProviders} showHelpers={showHelpers} />}
-          {tab === 'providers' && <Providers providers={providers} setProviders={setProviders} accent={a} showHelpers={showHelpers} serverProviderCount={serverProviderCount} />}
+          {tab === 'providers' && <Providers providers={providers} setProviders={setProviders} accent={a} showHelpers={showHelpers} serverProviderCount={serverProviderCount} onAlwaysOn247Change={onAlwaysOn247Change} />}
           {tab === 'agent' && agentPanel}
           {tab === 'computers' && <ComputersSettings />}
           {tab === 'appearance' && <Appearance accent={accent} setAccent={setAccent} showHelpers={showHelpers} setShowHelpers={setShowHelpers} />}
@@ -550,17 +553,20 @@ function Providers({
   accent,
   showHelpers,
   serverProviderCount = 0,
+  onAlwaysOn247Change,
 }: {
   providers: ProviderConfig[];
   setProviders: (fn: (p: ProviderConfig[]) => ProviderConfig[]) => void;
   accent: AccentStyle;
   showHelpers: boolean;
   serverProviderCount?: number;
+  onAlwaysOn247Change?: (value: boolean) => void;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [preferFree, setPreferFree] = useState<boolean>(true);
   const [keySelectionMode, setKeySelectionMode] = useState<string>('round-robin');
   const [vmPersistenceMode, setVmPersistenceMode] = useState<string>('persistent');
+  const [alwaysOn247, setAlwaysOn247] = useState(false);
   const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean>(true);
   const [decisionBrainEnabled, setDecisionBrainEnabled] = useState<boolean | null>(null);
   const [gitAutoCommit, setGitAutoCommit] = useState<boolean | null>(null);
@@ -604,6 +610,7 @@ function Providers({
             perDayBudgetUsd?: unknown;
             keySelectionMode?: unknown;
             vmPersistenceMode?: unknown;
+            alwaysOn247?: unknown;
           };
           if (typeof body.preferFreeProviders === 'boolean') setPreferFree(body.preferFreeProviders);
           if (typeof body.injectCodebaseContext === 'boolean') setInjectCodebaseContext(body.injectCodebaseContext);
@@ -661,6 +668,9 @@ function Providers({
           } else {
             setVmPersistenceMode('persistent');
           }
+          const alwaysOn = body.alwaysOn247 === true;
+          setAlwaysOn247(alwaysOn);
+          onAlwaysOn247Change?.(alwaysOn);
         }
       } catch {
         // offline / unsigned — leave the toggle hidden
@@ -693,7 +703,7 @@ function Providers({
     return () => {
       cancelled = true;
     };
-  }, [reloadTick]);
+  }, [reloadTick, onAlwaysOn247Change]);
 
   const saveRouterSettings = async (patch: {
     allowPaidProviders?: boolean;
@@ -752,6 +762,25 @@ function Providers({
       setVmPersistenceMode(v);
     } catch {
       setSettingsError('Could not save VM persistence mode.');
+    }
+  };
+
+  const setAlwaysOn247Remote = async (v: boolean) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ alwaysOn247: v }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not save Always-On 24/7 mode.');
+        return;
+      }
+      setAlwaysOn247(v);
+      onAlwaysOn247Change?.(v);
+    } catch {
+      setSettingsError('Could not save Always-On 24/7 mode.');
     }
   };
 
@@ -1020,6 +1049,15 @@ function Providers({
                 </select>
               </div>
             )}
+            <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2" data-testid="settings-always-on-247">
+              <div>
+                <div className="text-xs text-white/85">Always-On 24/7 Mode</div>
+                <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                  Keep your VM running around the clock: it is never hibernated when idle, and a stopped or crashed container restarts automatically on the next health sweep.
+                </div>
+              </div>
+              <Toggle on={alwaysOn247} onChange={(v) => void setAlwaysOn247Remote(v)} accent={accent} />
+            </div>
             {injectCodebaseContext !== null && (
               <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
                 <div>

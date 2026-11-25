@@ -12,6 +12,7 @@ import { providerOwner } from "@/lib/providers/owner";
 import { assertResolvableProviderBaseUrl } from "@/lib/providers/url-safety";
 import { JsonBodyError, readJsonBody } from "@/lib/http";
 import {
+  alwaysOn247For,
   KEY_SELECTION_MODES,
   MAX_SEARCH_KEY_CHARS,
   MAX_SYSTEM_BUDGET_TOKENS,
@@ -50,6 +51,7 @@ function publicSettings(settings: UserSettings): Record<string, unknown> {
     },
     keySelectionMode: keySelectionModeFor(settings),
     vmPersistenceMode: vmPersistenceModeFor(settings),
+    alwaysOn247: alwaysOn247For(settings),
   };
   if (settings.webSearch) {
     out.webSearch = {
@@ -134,6 +136,12 @@ export async function PUT(request: NextRequest) {
       );
     }
     patch.vmPersistenceMode = input.vmPersistenceMode;
+  }
+  if ("alwaysOn247" in input) {
+    if (typeof input.alwaysOn247 !== "boolean") {
+      return NextResponse.json({ error: "alwaysOn247 must be a boolean." }, { status: 400 });
+    }
+    patch.alwaysOn247 = input.alwaysOn247;
   }
   for (const field of ["perRunBudgetUsd", "perDayBudgetUsd"] as const) {
     if (!(field in input)) continue;

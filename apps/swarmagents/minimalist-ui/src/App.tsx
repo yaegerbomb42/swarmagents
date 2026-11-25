@@ -121,6 +121,23 @@ export default function App() {
   const me = useMe();
   const providerStatus = useProviderStatus();
   const compute = useComputeOptions(undefined);
+  // 24/7 badge in the header: read the account setting once on mount; the
+  // Settings toggle notifies us immediately when the user flips it.
+  const [alwaysOn247, setAlwaysOn247] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/providers/settings', { headers: { Accept: 'application/json' } });
+        if (!res.ok) return;
+        const body = (await res.json()) as { alwaysOn247?: unknown };
+        if (!cancelled && typeof body.alwaysOn247 === 'boolean') setAlwaysOn247(body.alwaysOn247);
+      } catch {
+        // offline / unsigned — the badge stays hidden
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const [providers, setProviders] = usePersisted<ProviderConfig[]>("ac.providers", []);
   const [agentCard, setAgentCard] = usePersisted<string>("ac.agentCard", DEFAULT_AGENT_CARD);
@@ -436,6 +453,7 @@ export default function App() {
         settingsNeedsAttention={providerStatus.state === "missing"}
         onOpenShortcuts={() => setShortcutsOpen(true)}
         user={me}
+        alwaysOn247={alwaysOn247}
       />
 
       {session.offline && !session.signedOut && (
@@ -651,6 +669,7 @@ export default function App() {
         compute={compute}
         busy={busy}
         onResetVm={handleResetVm}
+        onAlwaysOn247Change={setAlwaysOn247}
       />
 
       {/* Slide-over Keyboard Shortcuts Help */}

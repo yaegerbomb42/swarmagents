@@ -14,6 +14,7 @@
 import { EventEmitter } from "node:events";
 import os from "node:os";
 import {
+  BYOC_HEARTBEAT_TIMEOUT_MS,
   BYOC_PROTOCOL_VERSION,
   decodeDesktopFrame,
   encodeDesktopFrame,
@@ -42,6 +43,12 @@ export const DEFAULT_SERVER_URL = "wss://swarmagents.codes/byoc/ws";
 const MIN_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
 
+/** How long the server has to answer the hello before the node reconnects. */
+export const DEFAULT_HELLO_TIMEOUT_MS = 20_000;
+
+/** How often the silence watchdog checks for traffic from the server. */
+const SERVER_SILENCE_CHECK_MS = 5_000;
+
 export interface SwarmNodeOptions {
   /** WebSocket URL of the server (ws:// or wss://). */
   server: string;
@@ -63,6 +70,20 @@ export interface SwarmNodeOptions {
   backend?: NodeBackend;
   /** False when the machine cannot offer a desktop at all. */
   desktop?: boolean;
+  /**
+   * How long the server has to answer the hello before the attempt is
+   * abandoned and the node reconnects (default 20s). Without this, a
+   * server that accepts the socket but never answers would stall the
+   * runner forever: no reconnect, no heartbeat, no error.
+   */
+  helloTimeoutMs?: number;
+  /**
+   * Drop and reconnect when the server has sent nothing for this long
+   * (default 45s, the hub's heartbeat timeout). The heartbeat is
+   * fire-and-forget, so without this a half-open socket — server gone,
+   * TCP never closed — would look connected forever.
+   */
+  serverSilenceTimeoutMs?: number;
 }
 
 /** Raised when the server refuses the node's credentials. */
@@ -93,6 +114,8 @@ export class SwarmNode extends EventEmitter {
   private backoff = MIN_BACKOFF_MS;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  /** When the server last sent anything (drives the silence watchdog). */
+  private lastServerMessageAt = 0;
   private readonly abortControllers = new Map<string, AbortController>();
 
   constructor(options: SwarmNodeOptions) {
@@ -142,6 +165,7 @@ export class SwarmNode extends EventEmitter {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.stopHeartbeat();
+    this.abortAllCommands();
     this.closeAllDesktops();
     try {
       this.client?.close();
@@ -156,6 +180,21 @@ export class SwarmNode extends EventEmitter {
   /** Emit "error" without crashing callers that have no listener. */
   private emitError(err: Error): void {
     if (this.listenerCount("error") > 0) this.emit("error", err);
+  }
+
+  /**
+   * Kill every command that is still running.
+   *
+   * A command whose socket dropped (or whose server cancelled it) must not
+   * keep running orphaned on the node: the hub fails it server-side and the
+   * driver retries it after the reconnect, so an orphan would run the same
+   * command twice.
+   */
+  private abortAllCommands(): void {
+    for (const controller of this.abortControllers.values()) {
+      controller.abort();
+    }
+    this.abortControllers.clear();
   }
 
   private sleep(ms: number): Promise<void> {
@@ -225,10 +264,36 @@ export class SwarmNode extends EventEmitter {
       this.emit("paired", { deviceId: ready.deviceId });
     }
     this.emit("connected", { deviceId: ready.deviceId });
+    this.lastServerMessageAt = Date.now();
     this.startHeartbeat();
 
+    // The hub pings every 15s and acks our heartbeats, so a live server is
+    // never silent for long. A half-open socket produces no traffic at all:
+    // close it so the reconnect loop can re-establish the tunnel instead of
+    // sitting on a dead connection forever.
+    const silenceTimeoutMs =
+      this.options.serverSilenceTimeoutMs ?? BYOC_HEARTBEAT_TIMEOUT_MS;
+    // Check often enough to notice quickly, but never more than every 5s.
+    const checkMs = Math.max(
+      50,
+      Math.min(SERVER_SILENCE_CHECK_MS, silenceTimeoutMs / 2),
+    );
+    const silenceTimer = setInterval(() => {
+      if (Date.now() - this.lastServerMessageAt > silenceTimeoutMs) {
+        this.log("no traffic from the server — reconnecting");
+        try {
+          client.close();
+        } catch {
+          /* the socket is already gone */
+        }
+      }
+    }, checkMs);
+    silenceTimer.unref?.();
+
     await closed;
+    clearInterval(silenceTimer);
     this.stopHeartbeat();
+    this.abortAllCommands();
     this.closeAllDesktops();
     if (this.running) this.emit("disconnected");
   }
@@ -257,6 +322,15 @@ export class SwarmNode extends EventEmitter {
         resolve({ ok: false, error: new Error("No connection.") });
         return;
       }
+      const timeoutMs = this.options.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS;
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve({
+          ok: false,
+          error: new Error("The server did not answer the hello in time."),
+        });
+      }, timeoutMs);
+      timer.unref?.();
       const onMessage = (payload: Buffer) => {
         const message = parseMessage(payload.toString("utf8"));
         if (!message) return;
@@ -279,6 +353,7 @@ export class SwarmNode extends EventEmitter {
         resolve({ ok: false, error: new Error("The server closed the connection.") });
       };
       const cleanup = () => {
+        clearTimeout(timer);
         client.off("message", onMessage);
         client.off("close", onClose);
       };
@@ -289,6 +364,7 @@ export class SwarmNode extends EventEmitter {
 
   /** Handle a control message from the server. */
   private async handleMessage(message: ByocMessage): Promise<void> {
+    this.lastServerMessageAt = Date.now();
     switch (message.t) {
       case "heartbeat":
         this.send({ t: "heartbeat", ts: Date.now() });
@@ -356,6 +432,7 @@ export class SwarmNode extends EventEmitter {
           env: p.env,
           stdin: p.stdin,
           timeoutMs: p.timeoutMs,
+          signal: controller.signal,
           onStdout: (chunk) => this.sendOutput(id, "stdout", chunk),
           onStderr: (chunk) => this.sendOutput(id, "stderr", chunk),
         });
@@ -376,6 +453,7 @@ export class SwarmNode extends EventEmitter {
           env: p.env,
           stdin: p.stdin,
           timeoutMs: p.timeoutMs,
+          signal: controller.signal,
           onStdout: (chunk) => this.sendOutput(id, "stdout", chunk),
           onStderr: (chunk) => this.sendOutput(id, "stderr", chunk),
         });
@@ -563,6 +641,7 @@ export class SwarmNode extends EventEmitter {
 
   /** Relay desktop bytes coming from the server down to the noVNC client. */
   private handleBinary(payload: Buffer): void {
+    this.lastServerMessageAt = Date.now();
     const frame = decodeDesktopFrame(payload);
     if (!frame) return;
     const client = this.desktopClients.get(frame.channelId);

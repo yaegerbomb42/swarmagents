@@ -265,6 +265,26 @@ test("byoc driver: the desktop endpoint is loopback-only and carries the node pa
   assert.equal(endpoint?.password, "test-vnc-password");
 });
 
+test("byoc driver: an already-aborted exec never reaches the node", async (t) => {
+  const { hub, store } = await harness();
+  t.after(() => hub.close());
+  const node = await startPair(hub, store, "alice");
+  t.after(() => node.close());
+
+  const driver = new ByocVmDriver({ hub });
+  const handle = await driver.ensure("alice");
+
+  const controller = new AbortController();
+  controller.abort();
+  const result = await driver.exec(handle, ["echo", "hi"], { signal: controller.signal });
+  assert.equal(result.exitCode, 130);
+  // Only the ensure went out; the aborted exec was never dispatched.
+  assert.deepEqual(
+    node.received.map((command) => command.kind),
+    ["ensure"],
+  );
+});
+
 test("byoc driver: a handle of another account is never routed to this node", async (t) => {
   const { hub, store } = await harness();
   t.after(() => hub.close());

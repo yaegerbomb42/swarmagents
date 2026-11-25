@@ -34,6 +34,11 @@ export async function register(): Promise<void> {
     if (process.env.SWARM_AMBIENT_WATCHERS !== "0" && process.env.NEXT_PHASE !== "phase-production-build") {
       const { startAmbientWatchers } = await import("./lib/ambient/runtime");
       startAmbientWatchers();
+      // Scheduled workflows share the ambient-watchers gate: the same
+      // background lifecycle, one unref'd interval each, never blocking a
+      // request handler.
+      const { startScheduleTicks } = await import("./lib/runtime/schedules");
+      startScheduleTicks();
     }
     // Next.js route handlers cannot upgrade WebSockets, so the owner-only
     // desktop proxy (lib/desktop-proxy) runs as a small dedicated Node server

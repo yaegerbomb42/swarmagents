@@ -17,6 +17,7 @@ import { DEFAULT_AGENT_CARD } from "../data";
 import { MAX_AGENT_CARD_LEN } from "../../../lib/client/runs";
 import { cn } from "../utils/cn";
 import { ComputePicker, type ComputeOptions } from "./ComputePicker";
+import { SchedulesSection } from "./SchedulesSection";
 import { Settings, type SettingsTab } from "./Settings";
 import { Button, Notice, Sheet } from "./ui";
 
@@ -148,6 +149,8 @@ export function AgentSettings({
           </Button>
         </div>
       </Section>
+
+      <SchedulesSection />
 
       <Section
         title="Reset the VM"

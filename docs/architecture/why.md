@@ -24,5 +24,7 @@ SwarmAgents is the only project in this repository. These are the lessons it is 
 
 ## Where code is going
 
-`apps/swarmagents/vendor/{omnexx,agl,claude-code-mini}` are reference snapshots of three earlier projects.
-The plan is to port the useful parts into the app by PR and delete each vendored folder once it is mined.
+- `apps/swarmagents/vendor/omnexx/` and `apps/swarmagents/vendor/swarmagents-repo/` remain as temporary read-only reference snapshots until any remaining optional pieces (`anchors`, `edit-recovery`, `nimble`, `cascade-router`) are either ported by PR or explicitly dropped.
+- `vendor/claude-code-mini/` has been fully mined (context governor, AST slicer, log condenser, auto-test generator, locator + dependency radar) and removed.
+- `vendor/agl/` and `tools/agl/` were audited and removed: an S-expression DSL with hardcoded prototype runners adds prompt/syntax overhead without beating SwarmAgents' native TypeScript harness, `SwarmRouter`, and `tool-forge-mcp`.
+- Core runtime wiring now routes oversized `tool.result` outputs through `filterObservation` (when `autoCondenseLogs` is enabled), compresses `shadow-verifier` test logs (`filterObservation` on green runs, `testDigest` on failing runs), enforces full Stage 0 anti-cheat rules (multi-language skip markers, deleted tests, snapshot rewrites) in `diff-hygiene-gate`, and runs `.swarm/browser-gate.{yaml,yml,json}` via `BrowserControl` when present, alongside standalone `differential-tdr`, `ratchet`, and `redundant-read` modules.

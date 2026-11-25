@@ -210,6 +210,51 @@ export const CONNECTOR_CATALOG: readonly ConnectorCatalogEntry[] = [
     libraryConnectorId: "sqlite-read-only",
     fields: [],
   },
+  {
+    id: "playwright-browser",
+    name: "Playwright Browser",
+    vendor: "Microsoft MCP",
+    category: "code-cloud",
+    description:
+      "One-click zero-key browser automation MCP server for navigating live pages, filling forms, and capturing screenshots inside agent VMs.",
+    unlocks: "browser_navigate, browser_click, browser_type, and screenshot tools inside agent VMs.",
+    badges: ["MCP", "1-Click", "Zero Key"],
+    isFree: true,
+    accent: "#34d399",
+    docsUrl: "https://github.com/microsoft/playwright-mcp",
+    libraryConnectorId: "playwright",
+    fields: [],
+  },
+  {
+    id: "fetch-web",
+    name: "Web Fetch",
+    vendor: "MCP Reference",
+    category: "search-data",
+    description:
+      "One-click zero-key HTTP/Markdown fetch MCP server for reading documentation, APIs, and web pages cleanly.",
+    unlocks: "fetch tool for converting web pages to clean markdown inside agent VMs.",
+    badges: ["MCP", "1-Click", "Zero Key"],
+    isFree: true,
+    accent: "#60a5fa",
+    docsUrl: "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
+    libraryConnectorId: "fetch",
+    fields: [],
+  },
+  {
+    id: "git-workspace",
+    name: "Git Workspace",
+    vendor: "MCP Reference",
+    category: "code-cloud",
+    description:
+      "One-click zero-key Git MCP server for inspecting diffs, commit history, branches, and status in /workspace.",
+    unlocks: "git_status, git_diff, git_log, and branch tools inside agent VMs.",
+    badges: ["MCP", "1-Click", "Zero Key"],
+    isFree: true,
+    accent: "#f472b6",
+    docsUrl: "https://github.com/modelcontextprotocol/servers/tree/main/src/git",
+    libraryConnectorId: "git",
+    fields: [],
+  },
 ];
 
 export function findCatalogConnector(id: string): ConnectorCatalogEntry | null {

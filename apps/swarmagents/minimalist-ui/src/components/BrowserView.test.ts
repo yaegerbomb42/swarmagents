@@ -3,7 +3,7 @@ import { test } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { countOf, installBrowserStubs, tagOf } from "../testing/harness";
-import { BrowserFrameImage, BrowserLoadStatus, BrowserView, STILL_WAITING_MS, frameFetchInFlight, hasWaitedLongEnough } from "./BrowserView";
+import { BrowserFrameImage, BrowserLoadStatus, BrowserProfilePill, BrowserView, STILL_WAITING_MS, formatBrowserProfileSize, frameFetchInFlight, hasWaitedLongEnough } from "./BrowserView";
 
 /**
  * The browser chrome's under-address-bar hint has two jobs that used to be
@@ -67,6 +67,38 @@ test("browser empty states explain what the user will see", () => {
   assert.match(idle, /The desktop frame appears once a run opens a page/);
   const afterRun = renderToStaticMarkup(h(BrowserView, { runId: "run_1" }));
   assert.match(afterRun, /The desktop frame appears once a run opens a page/);
+});
+
+test("the browser-profile pill shows the saved session size and a clear action", () => {
+  installBrowserStubs();
+  const h = React.createElement;
+
+  const unknown = renderToStaticMarkup(h(BrowserProfilePill, { profile: null, busy: false, onClear: () => {} }));
+  assert.equal(unknown, "", "no pill before the status loads");
+
+  const absent = renderToStaticMarkup(
+    h(BrowserProfilePill, { profile: { exists: false, sizeMb: 0 }, busy: false, onClear: () => {} }),
+  );
+  assert.equal(countOf(absent, 'data-testid="browser-profile-absent"'), 1);
+  assert.match(absent, /No saved browser session/);
+  assert.equal(countOf(absent, 'data-testid="browser-profile-clear"'), 0, "nothing to clear");
+
+  const present = renderToStaticMarkup(
+    h(BrowserProfilePill, { profile: { exists: true, sizeMb: 12 }, busy: false, onClear: () => {} }),
+  );
+  assert.equal(countOf(present, 'data-testid="browser-profile-present"'), 1);
+  assert.match(present, /Browser session · 12 MB/, "size only, never contents");
+  assert.equal(countOf(present, 'data-testid="browser-profile-clear"'), 1, "clear action offered");
+  assert.match(present, /Clear session/);
+
+  const busy = renderToStaticMarkup(
+    h(BrowserProfilePill, { profile: { exists: true, sizeMb: 12 }, busy: true, onClear: () => {} }),
+  );
+  assert.match(busy, /Clearing…/, "busy state names itself");
+  assert.match(tagOf(busy, "browser-profile-clear"), /disabled/, "no double clear while one is in flight");
+
+  assert.equal(formatBrowserProfileSize(0), "0 MB");
+  assert.equal(formatBrowserProfileSize(1.4), "1 MB", "defensive rounding; the route already returns whole MB");
 });
 
 test("the live page crossfades between frames instead of flashing", () => {

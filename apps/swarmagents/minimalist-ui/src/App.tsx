@@ -269,18 +269,23 @@ export default function App() {
     providerStatus.refresh();
   }, [providerStatus]);
 
+  const stopDuringSendRef = useRef(false);
+
   const handleSend = useCallback(
     async (text: string, attachments: Attachment[]): Promise<ComposerSendResult> => {
+      stopDuringSendRef.current = false;
       const result = await session.send(text, attachments);
       // The screen opens automatically on wide screens when a run starts; on
-      // a phone the conversation stays put (the screen is a tab away).
-      if (result.ok && !result.queued && wide) setView("screen");
+      // a phone — or when the user already clicked Stop mid-request — stay put.
+      if (result.ok && !result.queued && wide && !stopDuringSendRef.current) setView("screen");
+      stopDuringSendRef.current = false;
       return result.ok ? { ok: true } : { ok: false, error: result.error };
     },
     [session, setView, wide],
   );
 
   const handleStop = useCallback(async () => {
+    stopDuringSendRef.current = true;
     setStopping(true);
     const result = await session.stop();
     setStopping(false);

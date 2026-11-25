@@ -28,6 +28,7 @@ import { ClaudeCodeRunner, isSignalKillExitCode } from "../harness/runner";
 import { contextPackerFromEnv, type StateLedgerSnapshot } from "../harness/context/contextGovernor";
 import type { SourceFile, WorkingSetItem } from "../harness/context/astSlicer";
 import { roleMaxTurns } from "../harness/role-clamps";
+import { TrajectoryOptimizer } from "../harness/context/trajectory-manager";
 import { makeRedactor } from "../harness/redact";
 import type { BrainEvent } from "../harness/decision-brain/index";
 import type {
@@ -53,6 +54,7 @@ import { routerProviders, userCooldownFilePath, userProvidersSignature } from ".
 import { isAnthropicStyle } from "../providers/adapters";
 import {
   atlasEnabledForUser,
+  autoCondenseLogsFor,
   contextPackerModeFor,
   keySelectionModeFor,
   readUserSettings,
@@ -167,12 +169,22 @@ import {
   type ShadowVerificationSummary,
 } from "../verification/shadow-verifier";
 import { runDiffHygieneGate } from "../verification/diff-hygiene-gate";
+import { createBrowserControlBackend, runRepoBrowserGate } from "../verification/browser-gate";
+import {
+  ADVERSARIAL_QA_MAX_PROBE_BYTES,
+  ADVERSARIAL_QA_PROBE_TIMEOUT_MS,
+  adversarialQaAppUrl,
+  adversarialQaEnabled,
+  runAdversarialQa,
+  type AdversarialQaSummary,
+  type HttpTrace,
+} from "../verification/adversarial-qa";
 import { defaultOracleChecks, runOracleGate } from "../harness/oracle";
 import { deriveArtifactsFromEvents, diffWorkspaceLists, listWorkspaceFiles, mergeArtifacts } from "./run-report";
 import type { WorkspaceEntry } from "./run-report";
 import { getRunsDir } from "../telemetry/paths";
 import { readRunEvents } from "../telemetry/run-log";
-import { createCheapCallLLM } from "../verification/llm-caller";
+import { createCheapCallLLM, createAdversarialQaCallLLM } from "../verification/llm-caller";
 import { writeRunVerification } from "../verification/store";
 import { WORKSPACE_ROOT } from "../vm/files";
 import { applyWarmGoldenSnapshot, type HotspotHint } from "../vm/warm-snapshots";
@@ -209,6 +221,39 @@ export function isOraclePostRunEnabled(env: Record<string, string | undefined> =
   return value === "1" || value === "true";
 }
 
+/** Max auto-resume phases for a max-turns run (bounded continuation). */
+export const MAX_CONTINUATION_PHASES = 5;
+
+/** Bounded L1 token budget for a continuation packet. */
+export const CONTINUATION_PACKET_BUDGET = {
+  total: 8192,
+  ledger: 2048,
+  skeleton: 1024,
+  workingSet: 2048,
+  reserve: 3072,
+  outputBuffer: 512,
+};
+
+/** True when the run should auto-continue after hitting max_turns. */
+export function shouldAutoContinue(
+  reason: string | undefined,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (reason !== "max_turns") return false;
+  return autoContinueEnabled(env);
+}
+
+/**
+ * True when auto-continuation is enabled via env (`SWARM_AUTO_CONTINUE`
+ * or `SWARM_ALWAYS_ON_247`). Used to decide whether run.finished is deferred
+ * so a max-turns finish can be auto-resumed cleanly.
+ */
+export function autoContinueEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const auto = env.SWARM_AUTO_CONTINUE?.trim().toLowerCase();
+  const on247 = env.SWARM_ALWAYS_ON_247?.trim().toLowerCase();
+  return auto === "1" || auto === "true" || on247 === "1" || on247 === "true";
+}
+
 export function mergeOracleSummary(
   summary: ShadowVerificationSummary,
   oracle: ShadowVerificationSummary,
@@ -237,6 +282,62 @@ export function mergeOracleSummary(
  */
 export function shouldBounceOnOracleRejection(rejected: boolean, attemptsUsed: number): boolean {
   return rejected && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS;
+}
+
+/**
+ * Whether an adversarial QA failure bounces the run back for another attempt.
+ * Bounded by the same round cap as the shadow gate.
+ */
+export function shouldBounceOnQaFailure(failed: boolean, attemptsUsed: number): boolean {
+  return failed && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS;
+}
+
+export function mergeQaSummary(
+  summary: ShadowVerificationSummary,
+  qa: AdversarialQaSummary,
+): ShadowVerificationSummary {
+  const passed = summary.passed && qa.passed;
+  return {
+    ...summary,
+    passed,
+    score: Math.min(summary.score, qa.score),
+    badge: passed ? summary.badge : "fail",
+    violations: [...summary.violations, ...qa.violations],
+    testsRan: summary.testsRan || qa.testsRan,
+    buildBroke: summary.buildBroke || qa.buildBroke,
+    // A failed QA carries its remediation prompt (findings + HTTP traces)
+    // as the bounce prompt, so the builder fixes what the live app
+    // showed. A passing QA must not override the shadow summary's own
+    // remediation.
+    ...(qa.passed || !qa.remediationPrompt ? {} : { remediationPrompt: qa.remediationPrompt }),
+  };
+}
+
+/**
+ * Read at most `maxBytes` of a probe response body and discard the rest.
+ * Traces carry status and latency, never bodies.
+ */
+async function readBoundedProbeBody(res: Response, maxBytes: number): Promise<number> {
+  if (!res.body) return 0;
+  const reader = res.body.getReader();
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total >= maxBytes) {
+        await reader.cancel().catch(() => {});
+        break;
+      }
+    }
+  } catch {
+    // A body read failure after headers arrived is not a probe failure;
+    // the status already arrived. Report the bytes read so far.
+  } finally {
+    reader.releaseLock();
+  }
+  return Math.min(total, maxBytes);
 }
 
 const SUMMARY_PROMPT_LEN = 300;
@@ -477,6 +578,10 @@ interface ActiveRun {
    */
   stateLedger?: StateLedgerSnapshot;
   editedFiles?: string[];
+  /** Signed per-run token minted for VM-facing runtime endpoints. */
+  runToken?: string;
+  /** Signed per-run connector-enable URL for the in-VM tool-forge. */
+  connectorEnableUrl?: string;
   /** Provider serving the run, from the router selection. */
   provider?: string;
   model?: string;
@@ -542,6 +647,8 @@ interface ActiveRun {
   turnCheckpointInFlight?: boolean;
   /** Watchdog recoveries already spent on this run (bounded; see maxRecoveryAttempts). */
   recoveryAttempts?: number;
+  /** Auto-continuation phases already run for this run (bounded, max MAX_CONTINUATION_PHASES). */
+  continuationPhases?: number;
   /**
    * Set only by the shutdown path for a run with a recorded resume point:
    * the exec is aborted so the process can exit, but the run must NOT be
@@ -1972,6 +2079,7 @@ export class RuntimeManager {
     initialPhase: RolePhase,
     extraMcpServers: Record<string, unknown>,
     mode?: RunModeInfo,
+    connectorEnableUrl?: string,
   ): Promise<void> {
     const gui = mode === undefined || mode.mode === "gui";
     const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
@@ -1993,6 +2101,7 @@ export class RuntimeManager {
       extraMcpServers,
       atlasEnabled: useAtlas,
       ...(useAtlas ? { atlasRegistryPath: VM_ATLAS_REGISTRY_PATH } : {}),
+      ...(connectorEnableUrl ? { connectorEnableUrl } : {}),
     })) {
       await this.vm.writeFile(userId, file.path, file.content);
     }
@@ -2015,6 +2124,7 @@ export class RuntimeManager {
     extraMcpServers: Record<string, unknown>,
     mode?: RunModeInfo,
     restrictTools?: readonly string[],
+    connectorEnableUrl?: string,
   ): Promise<void> {
     const gui = mode === undefined || mode.mode === "gui";
     const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
@@ -2029,6 +2139,7 @@ export class RuntimeManager {
         extraMcpServers,
         atlasEnabled: useAtlas,
         ...(useAtlas ? { atlasRegistryPath: VM_ATLAS_REGISTRY_PATH } : {}),
+        ...(connectorEnableUrl ? { connectorEnableUrl } : {}),
       }),
     );
   }
@@ -3129,6 +3240,21 @@ export class RuntimeManager {
     const initialPhase = active.role
       ? this.rolePhaseFor(active.role, libraryPermissions, active.runMode, active.toolAllowlist, useAtlas)
       : this.defaultRolePhase(libraryPermissions, active.runMode, active.toolAllowlist, useAtlas);
+    const llmBaseUrlForRun = resolveLlmBaseUrl();
+    const approvalBaseUrlForRun = resolveApprovalBaseUrl();
+    if ((llmBaseUrlForRun || approvalBaseUrlForRun) && !active.runToken) {
+      try {
+        active.runToken = signRunToken(userId, runId);
+      } catch {
+        active.runToken = undefined;
+      }
+    }
+    if (active.runToken) {
+      const connectorBase = approvalBaseUrlForRun || llmBaseUrlForRun;
+      if (connectorBase) {
+        active.connectorEnableUrl = `${connectorBase}/api/runtime/connectors/${active.runToken}/enable`;
+      }
+    }
     try {
       await this.seedRoleFiles(
         userId,
@@ -3137,6 +3263,7 @@ export class RuntimeManager {
         initialPhase,
         libraryServers,
         active.runMode,
+        active.connectorEnableUrl,
       );
     } catch (error) {
       const message = redact(error instanceof Error ? error.message : String(error));
@@ -3160,7 +3287,9 @@ export class RuntimeManager {
     // Keep the pre-run listing only when the opt-in Oracle gate needs it. The
     // report artifact diff is more precise than a whole-repository git diff,
     // which could otherwise pick up a user's pre-existing workspace changes.
-    if (isOraclePostRunEnabled()) active.oracleStartListing = await listWorkspaceFiles(this.vm, userId);
+    if (isOraclePostRunEnabled() || userSettings.oraclePostRun === true) {
+      active.oracleStartListing = await listWorkspaceFiles(this.vm, userId);
+    }
 
     // Phase loop: each role switch continues the same conversation (--resume)
     // with the new role's phase. The provider failover loop runs per phase.
@@ -3194,6 +3323,7 @@ export class RuntimeManager {
           libraryMcpEntries(userId),
           active.runMode,
           active.toolAllowlist,
+          active.connectorEnableUrl,
         );
       } catch (error) {
         const message = redact(error instanceof Error ? error.message : String(error));
@@ -3226,19 +3356,29 @@ export class RuntimeManager {
     // finalizes (revoked in finalize). Local Docker runs have already passed
     // startup validation; other runtimes retain the legacy stdout gate when
     // no signing secret is configured.
-    let runToken: string | null = null;
-    if (llmBaseUrl || approvalBaseUrl) {
+    let runToken: string | null = active.runToken ?? null;
+    if (!runToken && (llmBaseUrl || approvalBaseUrl)) {
       try {
         runToken = signRunToken(userId, runId);
+        active.runToken = runToken;
       } catch {
         runToken = null;
+      }
+    }
+    if (runToken && !active.connectorEnableUrl) {
+      const connectorBase = approvalBaseUrl || llmBaseUrl;
+      if (connectorBase) {
+        active.connectorEnableUrl = `${connectorBase}/api/runtime/connectors/${runToken}/enable`;
       }
     }
     const hookBaseUrl = approvalBaseUrl && runToken ? approvalBaseUrl : null;
     const approvalEnv = hookBaseUrl && runToken ? approvalHookEnv(hookBaseUrl, runToken) : {};
     const approvalHook = Object.keys(approvalEnv).length > 0;
     const verificationEnabled = isShadowVerificationEnabled();
-    const postRunGateEnabled = verificationEnabled || isOraclePostRunEnabled();
+    // The Oracle gate runs when the env switch is on or the account opted in
+    // through Settings (oraclePostRun).
+    const oraclePostRun = isOraclePostRunEnabled() || readUserSettings(userId).oraclePostRun === true;
+    const postRunGateEnabled = verificationEnabled || oraclePostRun;
 
     if (isRunProviderPoolEnabled()) {
       if (!router) {
@@ -3483,6 +3623,7 @@ export class RuntimeManager {
     const { runId, userId } = active;
     while (true) {
       let finishEvent: Extract<HarnessEvent, { type: "run.finished" }> | null = null;
+      let finishReason: string | undefined;
       const errors: Extract<HarnessEvent, { type: "run.error" }>[] = [];
       let roleSwitch: RunOutcome["roleSwitch"];
       let aborted = false;
@@ -3510,7 +3651,9 @@ export class RuntimeManager {
           selection,
           phase,
           options.approvalHook,
-          options.verificationEnabled,
+          // Defer finalization when post-run gate is active or auto-continue
+          // is enabled (so a max-turns finish can resume instead of committing).
+          options.postRunGateEnabled || autoContinueEnabled(),
         );
         if (run.outcome.roleSwitch) {
           roleSwitch = run.outcome.roleSwitch;
@@ -3529,6 +3672,7 @@ export class RuntimeManager {
           return { status: "error", message: run.attemptError.message };
         }
         finishEvent = run.finishEvent;
+        finishReason = run.finishEvent?.reason;
         return { status: "done", sessionId: run.finishEvent?.sessionId };
       });
 
@@ -3555,7 +3699,29 @@ export class RuntimeManager {
         return { switched: false };
       }
       active.sessionId = result.sessionId ?? active.sessionId;
-      if (!options.postRunGateEnabled || !finishEvent) return { switched: false };
+      if (
+        shouldAutoContinue(finishReason) &&
+        (active.continuationPhases ?? 0) < MAX_CONTINUATION_PHASES &&
+        this.isStillActive(active)
+      ) {
+        active.continuationPhases = (active.continuationPhases ?? 0) + 1;
+        this.bus.publish(runId, {
+          type: "run.continued",
+          data: { phase: active.continuationPhases, reason: finishReason },
+        });
+        const optimizer = new TrajectoryOptimizer(active.prompt);
+        optimizer.recordTurn({
+          stepSummary: `Phase ${active.continuationPhases} ended at the turn ceiling; resuming with reduced context.`,
+        });
+        const packet = optimizer.buildContinuationPacket({ budget: CONTINUATION_PACKET_BUDGET });
+        active.prompt = `${active.prompt}\n\n${packet.prompt}`;
+        if (active.maxTurns !== undefined) active.maxTurns = active.maxTurns * 2;
+        continue;
+      }
+      if (!options.postRunGateEnabled || !finishEvent) {
+        if (finishEvent) this.finalizeFinished(active, finishEvent, undefined);
+        return { switched: false };
+      }
       const gate = await this.runPostRunGate(active, finishEvent, options.verificationEnabled);
       if (gate.outcome === "finalized") return { switched: false };
       active.prompt = bounceRemediationPrompt(gate.summary);
@@ -3629,7 +3795,7 @@ export class RuntimeManager {
   private async runPostRunOracle(
     active: ActiveRun,
   ): Promise<{ summary: ShadowVerificationSummary; rejected: boolean } | undefined> {
-    if (!isOraclePostRunEnabled()) return undefined;
+    if (!isOraclePostRunEnabled() && readUserSettings(active.userId).oraclePostRun !== true) return undefined;
     let isolatedRoot: string | undefined;
     let worktreeGitRoot: string | undefined;
     const exec = this.shadowExecFor(active.userId);
@@ -3741,6 +3907,89 @@ export class RuntimeManager {
     }
   }
 
+  /**
+   * Adversarial QA gate (master-plan PR 2.2), run just before a run would
+   * finalize. An independent QA role on a different model family probes
+   * the live app (HTTP traces + headed-browser screenshot) and judges it
+   * against the run's acceptance criteria — with no access to the
+   * builder's chat, diff, or run log.
+   *
+   * Returns undefined when the gate is disabled, no different-family
+   * provider is configured, or QA infrastructure failed: the run is never
+   * blocked by the QA gate itself, only by a QA verdict.
+   */
+  private async runPostRunQa(active: ActiveRun): Promise<AdversarialQaSummary | undefined> {
+    if (!adversarialQaEnabled()) return undefined;
+    const qa = createAdversarialQaCallLLM(active.userId, active.model, { signal: active.controller.signal });
+    if (!qa) return undefined;
+    const appUrl = adversarialQaAppUrl();
+    const log = (line: string) => {
+      try {
+        this.bus.publish(active.runId, { type: "log", data: line });
+      } catch {
+        // Swallowed: a logging failure is not a gate failure.
+      }
+    };
+    const fetchUrl = async (url: string): Promise<HttpTrace> => {
+      const started = Date.now();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), ADVERSARIAL_QA_PROBE_TIMEOUT_MS);
+      try {
+        const res = await fetch(url, { method: "GET", redirect: "follow", signal: controller.signal });
+        const bytes = await readBoundedProbeBody(res, ADVERSARIAL_QA_MAX_PROBE_BYTES);
+        return { label: "", url, method: "GET", status: res.status, ok: res.ok, latencyMs: Date.now() - started, bytes };
+      } catch (error) {
+        return {
+          label: "",
+          url,
+          method: "GET",
+          status: 0,
+          ok: false,
+          latencyMs: Date.now() - started,
+          bytes: 0,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    // Screenshot the live app in the run's headed browser. The navigation
+    // and frame publish to the run stream, so the screenshot is visible
+    // evidence in the run UI; the gate itself only keeps the label.
+    // Any failure degrades to traces-only QA, never blocks the run.
+    const screenshot = async (url: string): Promise<{ ok: true; label: string } | { ok: false; reason: string }> => {
+      try {
+        const browser = getBrowserManager();
+        const nav = await browser.navigate(active.runId, url);
+        if (!nav.ok) return { ok: false, reason: nav.reason };
+        const shot = await browser.screenshot(active.runId);
+        if (!shot.ok) return { ok: false, reason: shot.reason };
+        return { ok: true, label: `Live app screenshot (${shot.width}x${shot.height}, frame #${shot.frameId})` };
+      } catch (error) {
+        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+      }
+    };
+    try {
+      return await runAdversarialQa(
+        { callLLM: qa.callLLM, fetchUrl, screenshot, log },
+        {
+          acceptanceCriteria: active.prompt,
+          appUrl,
+          checks: [
+            { label: "app", url: appUrl },
+            { label: "health", url: `${appUrl}/api/health` },
+          ],
+          qaProvider: qa.provider,
+          qaModel: qa.model,
+          qaFamily: qa.family,
+          signal: active.controller.signal,
+        },
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
   private async runPostRunGate(
     active: ActiveRun,
     finishEvent: Extract<HarnessEvent, { type: "run.finished" }>,
@@ -3754,6 +4003,20 @@ export class RuntimeManager {
     // bounces: it finalizes with the fail badge.
     if (oracle && shouldBounceOnOracleRejection(oracle.rejected, active.shadowAttempts ?? 0)) {
       return { outcome: "bounce", summary: oracle.summary };
+    }
+    // Adversarial QA is the last gate before finalize: a QA failure
+    // bounces the run back with the findings + HTTP traces, bounded by
+    // the same round cap. A pass (or a skipped gate) merges into the
+    // verification badge the run finalizes with.
+    const qa = await this.runPostRunQa(active);
+    if (qa) {
+      if (shouldBounceOnQaFailure(!qa.passed, active.shadowAttempts ?? 0)) {
+        const summary = oracle?.summary ? mergeQaSummary(oracle.summary, qa) : qa;
+        return { outcome: "bounce", summary };
+      }
+      const summary = oracle?.summary ? mergeQaSummary(oracle.summary, qa) : qa;
+      this.finalizeFinished(active, finishEvent, summary);
+      return { outcome: "finalized" };
     }
     this.finalizeFinished(active, finishEvent, oracle?.summary);
     return { outcome: "finalized" };
@@ -3864,9 +4127,30 @@ export class RuntimeManager {
       } catch {
         // Gate plumbing failed — finalize with the passing shadow summary.
       }
+      const browserGateSummary = await runRepoBrowserGate(
+        deps.exec,
+        plan.repoRoot,
+        () => createBrowserControlBackend(getBrowserManager(), `${active.runId}-gate`),
+        process.env.SWARM_BROWSER_GATE_URL,
+      );
+      if (browserGateSummary) {
+        summary = mergeOracleSummary(summary, browserGateSummary);
+        if (!summary.passed && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS) {
+          return { outcome: "bounce", summary };
+        }
+      }
       const oracle = await this.runPostRunOracle(active);
       if (oracle) {
         summary = mergeOracleSummary(summary, oracle.summary);
+      }
+      // Adversarial QA is the last gate: a different-family QA role
+      // probes the live app and judges it against the acceptance
+      // criteria. A failure merges into the summary, and the existing
+      // bounded bounce check below sends the run back with the findings
+      // + HTTP traces. A skipped gate changes nothing.
+      const qa = await this.runPostRunQa(active);
+      if (qa) {
+        summary = mergeQaSummary(summary, qa);
       }
       if (!summary.passed && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS) {
         return { outcome: "bounce", summary };
@@ -4004,6 +4288,7 @@ export class RuntimeManager {
     const currentSettings = readUserSettings(userId);
     const systemPacker = systemPackerOptionsFor(currentSettings);
     const contextPacker = contextPackerModeFor(currentSettings);
+    const autoCondenseLogs = autoCondenseLogsFor(currentSettings);
     const useAtlas = atlasEnabled() || atlasEnabledForUser(currentSettings);
 
     // Wall-clock timeout (SWARM_RUN_TIMEOUT_SEC): aborting the controller
@@ -4044,6 +4329,7 @@ export class RuntimeManager {
           memoryContext: active.memoryContext,
           systemPacker,
           ...(contextPacker === "l1" ? { contextPacker: "l1" as const } : {}),
+          ...(autoCondenseLogs ? { autoCondenseLogs: true } : {}),
           ...(active.stateLedger ? { stateLedger: active.stateLedger } : {}),
           ...(l1Files ?? {}),
           sessionId,

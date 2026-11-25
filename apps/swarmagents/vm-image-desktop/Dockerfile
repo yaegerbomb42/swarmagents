@@ -41,11 +41,14 @@ LABEL org.opencontainers.image.title="swarm-vm:desktop" \
       org.opencontainers.image.description="Per-user desktop VM image for SwarmAgents (Docker VM driver)" \
       org.opencontainers.image.source="apps/swarmagents/vm-image-desktop"
 
-# The desktop runs on display :1 (the driver passes DISPLAY=:1); Chromium
-# needs its own user-data dir owned by the node user.
+# The desktop runs on display :1 (the driver passes DISPLAY=:1); Chromium's
+# user-data dir lives on the /workspace named volume so authenticated
+# sessions survive hibernation and container recreation. It must be owned
+# by the node user (see README: /workspace is node-owned, as in the
+# headless image).
 ENV DEBIAN_FRONTEND=noninteractive \
     DISPLAY=:1 \
-    CHROMIUM_USER_DATA_DIR=/home/node/.config/chromium
+    CHROMIUM_USER_DATA_DIR=/workspace/.swarm/browser-profile
 
 USER root
 

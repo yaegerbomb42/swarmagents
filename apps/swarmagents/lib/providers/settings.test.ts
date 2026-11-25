@@ -13,6 +13,7 @@ import { configureProviderStorePaths } from "./store";
 import {
   alwaysOn247For,
   DEFAULT_USER_SETTINGS,
+  bestOfNFor,
   isKeySelectionMode,
   isVmPersistenceMode,
   keySelectionModeFor,
@@ -102,6 +103,25 @@ test("keySelectionMode parses valid modes, drops invalid ones, and defaults to r
     keySelectionModeFor({ preferFreeProviders: true, keySelectionMode: "chaos" as never }),
     "round-robin",
   );
+});
+
+test("oraclePostRun and bestOfN parse, clamp to 1..4, and round-trip", () => {
+  assert.equal(parseUserSettings({}).oraclePostRun, undefined);
+  assert.equal(parseUserSettings({ oraclePostRun: true }).oraclePostRun, true);
+  assert.equal(parseUserSettings({ oraclePostRun: false }).oraclePostRun, false);
+  assert.equal(parseUserSettings({ oraclePostRun: "yes" }).oraclePostRun, undefined);
+
+  assert.equal(parseUserSettings({ bestOfN: 3 }).bestOfN, 3);
+  // Clamped, not rejected: out-of-range counts land on the nearest bound.
+  assert.equal(parseUserSettings({ bestOfN: 9 }).bestOfN, 4);
+  assert.equal(parseUserSettings({ bestOfN: 0 }).bestOfN, 1);
+  assert.equal(parseUserSettings({ bestOfN: 2.7 }).bestOfN, 2);
+  assert.equal(parseUserSettings({ bestOfN: "3" }).bestOfN, undefined);
+  assert.equal(bestOfNFor({ preferFreeProviders: true }), 1);
+  assert.equal(bestOfNFor({ preferFreeProviders: true, bestOfN: 4 }), 4);
+
+  updateUserSettings(U, { oraclePostRun: true, bestOfN: 2 });
+  assert.deepEqual(readUserSettings(U), { preferFreeProviders: true, oraclePostRun: true, bestOfN: 2 });
 });
 
 test("vmPersistenceMode parses valid modes, drops invalid ones, and defaults to persistent", () => {

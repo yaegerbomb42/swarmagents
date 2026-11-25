@@ -33,6 +33,7 @@ import type { AgentSession, PromptDisplay } from "../hooks/useAgentSession";
 import type { ThreadEntry } from "../../../lib/client/thread";
 import { describeRunFailure } from "../../../lib/client/thread";
 import { buildConversation } from "../../../lib/client/conversation";
+import { aggregateTokenBudget } from "../../../lib/client/tokenBudget";
 import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
 import { useStickToBottom } from "../../../lib/client/useStickToBottom";
 import {
@@ -52,11 +53,17 @@ import {
   type ToolEntry,
   type TurnBlock,
 } from "../../../lib/client/turns";
+import {
+  buildTraceTimeline,
+  type TimelineStretch,
+} from "../../../lib/client/traceTimeline";
 import { taskLinkForRun, type TaskRunLink, type TaskRunLinks } from "../../../lib/client/board";
 import { cn } from "../utils/cn";
 import { Button, Loading, Notice, StatusBadge } from "./ui";
+import { ContextMeterPill } from "./ContextMeterPill";
 import { EmptyState } from "./brand/EmptyState";
 import { RunReportCard } from "./RunReportCard";
+import { RunTraceTimeline } from "./RunTraceTimeline";
 import { HandoffCard } from "./dashboard/HandoffCard";
 
 export interface ConversationProps {
@@ -395,6 +402,7 @@ function Blocks({
   onAnswer,
   onHandBack,
   defaultOpen = false,
+  timeline,
 }: {
   blocks: TurnBlock[];
   truncated: boolean;
@@ -402,7 +410,14 @@ function Blocks({
   onHandBack: (id: string) => void;
   /** Start step blocks expanded (used when the user asked to see the steps). */
   defaultOpen?: boolean;
+  /** Trace stretches, one per steps block, in order (see traceTimeline). */
+  timeline?: TimelineStretch[];
 }) {
+  // Steps blocks and trace stretches split on the same boundaries (agent
+  // prose, questions, handoffs), so the k-th steps block pairs with the
+  // k-th stretch. A stretch with no tool steps (a status-only block) falls
+  // back to the legacy steps block.
+  let stretchIndex = 0;
   return (
     <>
       {truncated && (
@@ -410,7 +425,13 @@ function Blocks({
       )}
       {blocks.map((block) => {
         if (block.kind === "agent") return <Markdown key={block.key} text={block.entry.text} />;
-        if (block.kind === "steps") return <StepsBlock key={block.key} steps={block.steps} defaultOpen={defaultOpen} />;
+        if (block.kind === "steps") {
+          const stretch = timeline?.[stretchIndex++];
+          if (stretch && stretch.steps.length > 0) {
+            return <RunTraceTimeline key={block.key} steps={stretch.steps} defaultOpen={defaultOpen} />;
+          }
+          return <StepsBlock key={block.key} steps={block.steps} defaultOpen={defaultOpen} />;
+        }
         if (block.kind === "question") return <QuestionCard key={block.key} entry={block.entry} onAnswer={onAnswer} />;
         return <HandoffCard key={block.key} entry={block.entry} onHandBack={onHandBack} />;
       })}
@@ -430,6 +451,7 @@ function ReplayedSteps({
 }) {
   const stream = useRunStream(runId);
   const blocks = useMemo(() => buildTurnBlocks(closeOpenPrompts(buildConversation(stream.items))), [stream.items]);
+  const timeline = useMemo(() => buildTraceTimeline(stream.items), [stream.items]);
   if (blocks.length === 0) {
     return stream.status === "idle" ? (
       <p className="text-[13px] text-sa-fg3">No steps were recorded for this run.</p>
@@ -437,7 +459,16 @@ function ReplayedSteps({
       <Loading label="Loading steps" className="justify-start py-1" />
     );
   }
-  return <Blocks blocks={blocks} truncated={isReplayTruncated(stream.items)} onAnswer={onAnswer} onHandBack={onHandBack} defaultOpen />;
+  return (
+    <Blocks
+      blocks={blocks}
+      truncated={isReplayTruncated(stream.items)}
+      onAnswer={onAnswer}
+      onHandBack={onHandBack}
+      defaultOpen
+      timeline={timeline}
+    />
+  );
 }
 
 // ---- Turn ----
@@ -448,6 +479,8 @@ interface TurnProps {
   /** This is the run whose stream is attached: its blocks are live. */
   live: boolean;
   blocks?: TurnBlock[];
+  /** Trace stretches for the live run, one per steps block, in order. */
+  timeline?: TimelineStretch[];
   truncated: boolean;
   phase: RunPhase;
   activity?: string;
@@ -467,6 +500,7 @@ const Turn = React.memo(function Turn({
   prompt,
   live,
   blocks,
+  timeline,
   truncated,
   phase,
   activity,
@@ -484,6 +518,19 @@ const Turn = React.memo(function Turn({
   const meta = RUN_PHASE_META[phase];
   const failure = meta.active ? null : describeRunFailure(entry);
   const terminal = phase === "finished" || phase === "error" || phase === "cancelled";
+  // Per-turn token budget from the run's reported usage; the pill hides
+  // itself when the provider reported no usage.
+  const tokenBudget = useMemo(
+    () =>
+      aggregateTokenBudget([
+        {
+          inputTokens: entry.tokensIn,
+          outputTokens: entry.tokensOut,
+          cachedTokens: entry.tokensCached,
+        },
+      ]),
+    [entry.tokensIn, entry.tokensOut, entry.tokensCached],
+  );
   const duration =
     entry.finishedAt !== undefined && entry.finishedAt >= entry.createdAt
       ? formatDuration(entry.finishedAt - entry.createdAt)
@@ -495,7 +542,7 @@ const Turn = React.memo(function Turn({
 
       <div className="space-y-3">
         {live && blocks && blocks.length > 0 ? (
-          <Blocks blocks={blocks} truncated={truncated} onAnswer={onAnswer} onHandBack={onHandBack} />
+          <Blocks blocks={blocks} truncated={truncated} onAnswer={onAnswer} onHandBack={onHandBack} timeline={timeline} />
         ) : showSteps ? (
           <ReplayedSteps runId={entry.runId} onAnswer={onAnswer} onHandBack={onHandBack} />
         ) : (
@@ -538,6 +585,7 @@ const Turn = React.memo(function Turn({
             <span className="min-w-0 max-w-full flex-1 basis-40 truncate text-[13px] text-sa-fg2">{activity}</span>
           )}
           <span className="ml-auto flex items-center gap-1">
+            <ContextMeterPill budget={tokenBudget} />
             {!meta.active && (
               <span className="mr-1 hidden text-[12px] text-sa-fg3 sm:inline" title={`Run ${entry.runId}`}>
                 {formatClock(entry.createdAt)}
@@ -593,6 +641,7 @@ export function Conversation({
 }: ConversationProps) {
   const { turns, pending, liveRunId, liveEntries, liveItems, phase, activity, promptFor } = session;
   const liveBlocks = useMemo(() => buildTurnBlocks(liveEntries), [liveEntries]);
+  const liveTimeline = useMemo(() => buildTraceTimeline(liveItems), [liveItems]);
   // One prompt object per run, so unchanged turns skip re-rendering on each poll.
   const prompts = useMemo(() => new Map(turns.map((entry) => [entry.runId, promptFor(entry)])), [turns, promptFor]);
   const truncated = useMemo(() => isReplayTruncated(liveItems), [liveItems]);
@@ -667,6 +716,7 @@ export function Conversation({
                 prompt={prompts.get(entry.runId) ?? promptFor(entry)}
                 live={live}
                 blocks={live ? liveBlocks : undefined}
+                timeline={live ? liveTimeline : undefined}
                 truncated={live && truncated}
                 phase={turnPhase}
                 activity={live ? activity : undefined}

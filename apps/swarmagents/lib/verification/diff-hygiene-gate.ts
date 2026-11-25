@@ -222,6 +222,7 @@ export async function runDiffHygieneGate(
   const hygiene = checkDiffHygiene({
     diff: worktree.diff,
     changedFiles: worktree.files.map((f) => f.file),
+    changes: worktree.files.map((f) => ({ path: f.file, status: f.status })),
     baselineAssertionCount,
     readFile: (relPath) => worktree.contents.get(relPath),
     readHeadFile: (relPath) => worktree.headContents.get(relPath),

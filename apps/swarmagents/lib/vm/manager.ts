@@ -33,6 +33,15 @@ export { defaultDriverName } from "./driver-default";
 
 /** Where the user-writable data lives inside the VM; du measures this path. */
 export const VM_WORKSPACE_DISK_PATH = "/workspace";
+/**
+ * Persistent browser profile inside the VM workspace. The desktop Chromium
+ * and the headed Playwright MCP server share this user-data-dir, so
+ * authenticated browser sessions survive hibernation and container
+ * recreation: the /workspace named volume is kept by the driver.
+ * Never read or return anything under this path — it holds cookies and
+ * session tokens. Only existence + total size are ever exposed.
+ */
+export const VM_BROWSER_PROFILE_PATH = "/workspace/.swarm/browser-profile";
 /** How long a du measurement is reused before it is re-run. */
 export const DISK_USAGE_TTL_MS = 60_000;
 /** du -sk prints "<kilobytes>\t<path>". */
@@ -46,6 +55,17 @@ export interface VmDiskUsage {
   quotaMb: number;
   /** True when the quota is enabled and usedMb exceeds it. */
   overQuota: boolean;
+}
+
+/**
+ * Persistent browser-profile status for one user. Existence + total size
+ * only — never file names, let alone cookie or token contents.
+ */
+export interface VmBrowserProfileStatus {
+  /** True when the profile directory exists in the VM. */
+  exists: boolean;
+  /** Total profile size in MB (rounded up); 0 when missing. */
+  sizeMb: number;
 }
 
 interface DiskUsageCacheEntry {
@@ -122,6 +142,11 @@ function combineSignals(signals: (AbortSignal | undefined)[]): AbortSignal | und
  *   refused while a user is over SWARM_VM_DISK_QUOTA_MB.
  * - Tracks the last activity per user so idle VMs can be hibernated
  *   (stopped) by the idle sweeper and transparently restarted on next use.
+ * - 24/7 mode: a user flagged always-on (setAlwaysOn, or the
+ *   SWARM_VM_ALWAYS_ON_USERS env list) is never hibernated by the sweeper,
+ *   so very long trajectories and always-on desktops are never stopped
+ *   mid-run. The flag is a lifecycle preference, not VM state — it survives
+ *   hibernation, stop, and reset.
  */
 export class VmManager {
   readonly driver: VmDriver;
@@ -138,11 +163,17 @@ export class VmManager {
   private diskUsageCache = new Map<string, DiskUsageCacheEntry>();
   private readonly alwaysOnUsers: ReadonlySet<string>;
   private isAlwaysOnFn?: (userId: string) => boolean;
+  /** Users explicitly flagged always-on (24/7 mode). */
+  private alwaysOn = new Set<string>();
 
   constructor(opts?: VmManagerOptions) {
     this.driver = opts?.customDriver ?? resolveDriver(opts?.driver ?? process.env.SWARM_VM_DRIVER);
     this.quotas = resolveVmQuotas(opts?.quotas);
-    this.idle = resolveIdlePolicy({ idleMinutes: opts?.idle?.idleMinutes });
+    this.idle = resolveIdlePolicy({
+      idleMinutes: opts?.idle?.idleMinutes,
+      alwaysOnUsers: opts?.idle?.alwaysOnUsers,
+    });
+    this.alwaysOn = new Set(this.idle.alwaysOnUsers);
     this.now = opts?.now ?? Date.now;
     this.alwaysOnUsers = opts?.alwaysOnUsers ?? new Set<string>();
     this.isAlwaysOnFn = opts?.isAlwaysOn;
@@ -155,7 +186,7 @@ export class VmManager {
 
   /** Is this user in 24/7 always-on mode? */
   isAlwaysOnUser(userId: string): boolean {
-    return this.alwaysOnUsers.has(userId) || this.isAlwaysOnFn?.(userId) === true;
+    return this.alwaysOn.has(userId) || this.alwaysOnUsers.has(userId) || this.isAlwaysOnFn?.(userId) === true;
   }
 
   private lockFor(userId: string): RwLock {
@@ -237,10 +268,35 @@ export class VmManager {
 
   /** True when the user's VM has been idle for longer than the idle window. */
   isIdle(userId: string, now: number = this.now()): boolean {
+    // A 24/7 VM is never hibernated, so it is never "idle" for sweep
+    // purposes — callers (autopilot, status) must not treat it as a
+    // hibernation candidate.
+    if (this.isAlwaysOn(userId)) return false;
     if (this.idle.idleMs <= 0) return false;
     const rec = this.activity.get(userId);
     if (!rec) return false;
     return now - rec.at >= this.idle.idleMs;
+  }
+
+  /**
+   * Mark a user's VM always-on (24/7 mode): the idle sweeper will never
+   * stop it, however long it has been idle. Pass false to clear the flag
+   * and re-enable hibernation. The flag survives hibernation, stop, and
+   * reset — it is a lifecycle preference, not VM state.
+   */
+  setAlwaysOn(userId: string, on = true): void {
+    if (on) this.alwaysOn.add(userId);
+    else this.alwaysOn.delete(userId);
+  }
+
+  /** True when the user's VM is flagged always-on (24/7 mode). */
+  isAlwaysOn(userId: string): boolean {
+    return this.isAlwaysOnUser(userId);
+  }
+
+  /** User ids currently flagged always-on. */
+  alwaysOnUserIds(): string[] {
+    return [...new Set([...this.alwaysOn, ...this.alwaysOnUsers])];
   }
 
   /**
@@ -332,6 +388,72 @@ export class VmManager {
     const usedMb = this.diskUsageCache.get(userId)?.usedMb ?? 0;
     const quotaMb = this.quotas.diskQuotaMb;
     return { usedMb, quotaMb, overQuota: quotaMb > 0 && usedMb > quotaMb };
+  }
+
+  // -------------------------------------------------------------------------
+  // Persistent browser profile
+  // -------------------------------------------------------------------------
+
+  /**
+   * `du -sk` for one path inside the VM, in MB (rounded up). 0 when the
+   * path is missing or the measurement fails — fail-open, like the
+   * workspace disk measurement.
+   */
+  private async measurePathMb(userId: string, path: string): Promise<number> {
+    try {
+      return await this.withRead(userId, async () => {
+        const handle = await this.ensureLocked(userId);
+        let stdout = "";
+        await this.driver.exec(handle, ["du", "-sk", path], {
+          onStdout: (chunk) => {
+            stdout += chunk;
+          },
+        });
+        const kb = Number.parseInt(stdout.split("\t")[0].trim(), 10);
+        return Number.isFinite(kb) && kb >= 0 ? Math.ceil(kb / 1024) : 0;
+      });
+    } catch (error) {
+      console.error(`[vm] could not measure ${path} for ${userId}:`, error);
+      return 0;
+    }
+  }
+
+  /**
+   * Browser-profile status for a user: whether the persistent profile
+   * directory exists, and its total size. Only existence + size are ever
+   * returned — the profile holds cookies and session tokens, which must
+   * never be read out of the VM.
+   *
+   * May ensure (wake) a hibernated VM: measuring requires a live
+   * container. This is an on-demand user action (Settings / browser view),
+   * not a poll, so waking is acceptable.
+   */
+  async browserProfileStatus(userId: string): Promise<VmBrowserProfileStatus> {
+    try {
+      await this.stat(userId, VM_BROWSER_PROFILE_PATH);
+    } catch (error) {
+      if (error instanceof VmFileError && error.code === "not_found") {
+        return { exists: false, sizeMb: 0 };
+      }
+      throw error;
+    }
+    const sizeMb = await this.measurePathMb(userId, VM_BROWSER_PROFILE_PATH);
+    return { exists: true, sizeMb };
+  }
+
+  /**
+   * Delete the user's persistent browser profile (cookies, logins, session
+   * storage) from the workspace volume. The path is a fixed constant and
+   * the command runs inside the caller's own VM only — no caller input
+   * reaches it — so one user can never delete another's profile.
+   * Idempotent: removing a missing profile succeeds. Drops the cached disk
+   * measurement so the next status poll re-measures instead of reporting
+   * the deleted bytes.
+   */
+  async clearBrowserProfile(userId: string): Promise<VmBrowserProfileStatus> {
+    await this.exec(userId, ["rm", "-rf", "--", VM_BROWSER_PROFILE_PATH]);
+    this.clearDiskUsage(userId);
+    return { exists: false, sizeMb: 0 };
   }
 
   /**
@@ -878,9 +1000,11 @@ export class VmManager {
    * Stop every VM that has been idle for longer than the idle window and
    * return the ids of the users that were hibernated.
    *
-   * A VM with an exec in flight is never stopped. The stop happens under
-   * the per-user write lock and the activity record is re-checked there, so
-   * a VM that became busy while the sweep was waiting for the lock stays up.
+   * A VM with an exec in flight is never stopped, and neither is a VM
+   * flagged always-on (24/7 mode). The stop happens under the per-user
+   * write lock and the activity record is re-checked there, so a VM that
+   * became busy — or was flagged always-on — while the sweep was waiting
+   * for the lock stays up.
    *
    * The driver's stop() keeps the /workspace volume; the cached handle
    * promise is dropped so the next ensure() re-ensures (restarts) the VM.
@@ -919,6 +1043,7 @@ export class VmManager {
           // active (or started an exec) while we waited for the lock.
           const current = this.activity.get(userId);
           if (!current || current.seq !== record.seq) return false;
+          if (this.isAlwaysOn(userId)) return false;
           if (this.hasActiveExec(userId)) return false;
           const live = this.handles.get(userId);
           if (!live) return false;

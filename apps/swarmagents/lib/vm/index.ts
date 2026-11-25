@@ -104,6 +104,8 @@ export {
 export {
   DEFAULT_VM_IDLE_MIN,
   DEFAULT_VM_SWEEP_INTERVAL_SEC,
+  SWARM_VM_ALWAYS_ON_USERS_ENV,
+  parseAlwaysOnUsers,
   parseIdleMinutes,
   parseSweepIntervalSeconds,
   resolveIdlePolicy,

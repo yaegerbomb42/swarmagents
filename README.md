@@ -115,9 +115,7 @@ deploy.sh                    ./deploy.sh <action>: runs a whitelisted deploy act
 
 | Folder | What it is |
 | --- | --- |
-| `vendor/omnexx/` | Omnexx: autonomous coding agent CLI + VS Code extension |
-| `vendor/agl/` | AGL: S-expression agent language, runtime and primitive ledger |
-| `vendor/claude-code-mini/` | Claude Code Mini: stateless small-context coding agent with key pooling |
+| `vendor/omnexx/` | Omnexx: autonomous coding agent CLI + VS Code extension (remaining optional pieces) |
 | `vendor/swarmagents-repo/` | Leftovers from the earlier standalone repo: role registry, key clusters, racing engine, UI ideas |
 
 ## Self-hosting and deployment

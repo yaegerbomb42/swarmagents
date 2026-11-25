@@ -208,6 +208,36 @@ test("assertion count falling below the HEAD baseline is a violation", () => {
   assert.match(result.violations.join("\n"), /assertion count in changed tests fell 2 → 1/);
 });
 
+test("checkDiffHygiene catches multi-language skip and suppression markers in unified diffs", () => {
+  const diff = [
+    "+++ b/tests/test_api.py",
+    "+@pytest.mark.skip(reason='flaky')",
+    "+++ b/lib/foo.ts",
+    "+// @ts-ignore",
+  ].join("\n");
+  const result = checkDiffHygiene({
+    diff,
+    changedFiles: ["tests/test_api.py", "lib/foo.ts"],
+  });
+  assert.equal(result.clean, false);
+  assert.match(result.violations.join("\n"), /@pytest\.mark\.skip/);
+  assert.match(result.violations.join("\n"), /@ts-ignore/);
+});
+
+test("checkDiffHygiene rejects deleted tests and snapshot rewrites when changes are supplied", () => {
+  const result = checkDiffHygiene({
+    diff: "",
+    changedFiles: ["tests/old.test.ts", "tests/__snapshots__/card.snap"],
+    changes: [
+      { path: "tests/old.test.ts", status: "D" },
+      { path: "tests/__snapshots__/card.snap", status: "M" },
+    ],
+  });
+  assert.equal(result.clean, false);
+  assert.match(result.violations.join("\n"), /deleted-test/);
+  assert.match(result.violations.join("\n"), /snapshot-rewrite/);
+});
+
 // --- Stage 3: revert-test proof (fake exec) ----------------------------------
 
 /**

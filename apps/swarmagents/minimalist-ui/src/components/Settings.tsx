@@ -569,6 +569,8 @@ function Providers({
   const [alwaysOn247, setAlwaysOn247] = useState(false);
   const [injectCodebaseContext, setInjectCodebaseContext] = useState<boolean>(true);
   const [decisionBrainEnabled, setDecisionBrainEnabled] = useState<boolean | null>(null);
+  const [oraclePostRun, setOraclePostRun] = useState<boolean | null>(null);
+  const [bestOfN, setBestOfN] = useState<number | null>(null);
   const [gitAutoCommit, setGitAutoCommit] = useState<boolean | null>(null);
   const [autoTestVerification, setAutoTestVerification] = useState<boolean | null>(null);
   const [enableAtlas, setEnableAtlas] = useState<boolean>(true);
@@ -611,6 +613,8 @@ function Providers({
             keySelectionMode?: unknown;
             vmPersistenceMode?: unknown;
             alwaysOn247?: unknown;
+            oraclePostRun?: unknown;
+            bestOfN?: unknown;
           };
           if (typeof body.preferFreeProviders === 'boolean') setPreferFree(body.preferFreeProviders);
           if (typeof body.injectCodebaseContext === 'boolean') setInjectCodebaseContext(body.injectCodebaseContext);
@@ -671,6 +675,12 @@ function Providers({
           const alwaysOn = body.alwaysOn247 === true;
           setAlwaysOn247(alwaysOn);
           onAlwaysOn247Change?.(alwaysOn);
+          setOraclePostRun(body.oraclePostRun === true);
+          setBestOfN(
+            typeof body.bestOfN === 'number' && Number.isFinite(body.bestOfN)
+              ? Math.min(4, Math.max(1, Math.floor(body.bestOfN)))
+              : 1,
+          );
         }
       } catch {
         // offline / unsigned — leave the toggle hidden
@@ -835,6 +845,42 @@ function Providers({
       setDecisionBrainEnabled(v);
     } catch {
       setSettingsError('Could not save Decision Brain setting.');
+    }
+  };
+
+  const setOraclePostRunRemote = async (v: boolean) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ oraclePostRun: v }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not save Oracle gate setting.');
+        return;
+      }
+      setOraclePostRun(v);
+    } catch {
+      setSettingsError('Could not save Oracle gate setting.');
+    }
+  };
+
+  const setBestOfNRemote = async (v: number) => {
+    setSettingsError(null);
+    try {
+      const res = await fetch('/api/providers/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ bestOfN: v }),
+      });
+      if (!res.ok) {
+        setSettingsError('Could not save Best-of-N setting.');
+        return;
+      }
+      setBestOfN(v);
+    } catch {
+      setSettingsError('Could not save Best-of-N setting.');
     }
   };
 
@@ -1100,6 +1146,38 @@ function Providers({
                   </div>
                 </div>
                 <Toggle on={autoTestVerification} onChange={(v) => void setAutoTestVerificationRemote(v)} accent={accent} />
+              </div>
+            )}
+            {oraclePostRun !== null && (
+              <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+                <div>
+                  <div className="text-xs text-white/85">Oracle gate &amp; Best-of-N</div>
+                  <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                    After a successful run, check the changed files in a scratch copy with tsc and the affected tests, and keep only a candidate patch that passes cleanly. Best-of-N evaluates several candidates (one per model family) and lands the first that passes. Off by default.
+                  </div>
+                </div>
+                <Toggle on={oraclePostRun} onChange={(v) => void setOraclePostRunRemote(v)} accent={accent} />
+              </div>
+            )}
+            {oraclePostRun !== null && bestOfN !== null && (
+              <div className="flex items-center justify-between gap-3 border-t border-white/10 pt-2">
+                <div>
+                  <div className="text-xs text-white/85">Best-of-N candidates</div>
+                  <div className="mt-0.5 text-[10px] leading-relaxed text-white/35">
+                    Candidate patches the gate evaluates per run: 1 checks a single patch, up to 4 widens the search. Failed candidates never land.
+                  </div>
+                </div>
+                <select
+                  value={String(bestOfN)}
+                  onChange={(e) => void setBestOfNRemote(Number(e.target.value))}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  className="max-w-28 shrink-0 truncate rounded-lg bg-black/25 px-2 py-1 text-[10px] text-white/70 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
+                >
+                  <option value="1">1 (single)</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="4">4</option>
+                </select>
               </div>
             )}
             {settingsError && <div className="mt-2 text-[10px] text-red-300/80">{settingsError}</div>}

@@ -84,9 +84,15 @@ some setups; this container runs it as the unprivileged `node` user with the
 standard container-safe flags:
 
 ```text
-/usr/bin/chromium --no-first-run --no-default-browser-check \
+/usr/bin/chromium --user-data-dir=/workspace/.swarm/browser-profile \
+  --no-first-run --no-default-browser-check \
   --disable-features=TranslateUI --start-maximized
 ```
+
+The profile lives on the `/workspace` named volume, so logins and cookies
+survive VM hibernation and container recreation. The headed Playwright MCP
+server shares the same profile dir. Clear it from the browser view or via
+`DELETE /api/runtime/vm/browser-profile` (signs the VM browser out everywhere).
 
 The driver creates desktop containers with `--shm-size=1g`, so Chromium's
 shared-memory needs are covered — **no `--no-sandbox`** is used. If you ever

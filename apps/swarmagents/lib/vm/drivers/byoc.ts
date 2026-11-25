@@ -154,6 +154,8 @@ export class ByocVmDriver implements VmDriver {
 
   /** Run a command inside the node's sandbox, streaming its output. */
   async exec(handle: VmHandle, cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
+    // An already-aborted signal must not dispatch anything to the node.
+    if (opts?.signal?.aborted) return { exitCode: 130 };
     const deviceId = this.deviceOf(handle);
     const payload = {
       userId: handle.userId,
@@ -165,16 +167,15 @@ export class ByocVmDriver implements VmDriver {
     };
 
     let commandId: string | undefined;
+    const onAbort = () => {
+      if (commandId) this.hub.cancel(deviceId, commandId);
+      resolveAborted({ exitCode: 130 });
+    };
+    let resolveAborted: (result: ExecResult) => void = () => undefined;
     const aborted = new Promise<ExecResult>((resolve) => {
-      opts?.signal?.addEventListener(
-        "abort",
-        () => {
-          if (commandId) this.hub.cancel(deviceId, commandId);
-          resolve({ exitCode: 130 });
-        },
-        { once: true },
-      );
+      resolveAborted = resolve;
     });
+    opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
     const running = this.withResume(deviceId, () =>
       this.hub.dispatch(deviceId, "exec", payload, {
@@ -186,8 +187,12 @@ export class ByocVmDriver implements VmDriver {
       }),
     );
 
-    const result = await Promise.race([running, aborted]);
-    return { exitCode: readExitCode(result) };
+    try {
+      const result = await Promise.race([running, aborted]);
+      return { exitCode: readExitCode(result) };
+    } finally {
+      opts?.signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   /** Write a file inside the node's sandbox. */

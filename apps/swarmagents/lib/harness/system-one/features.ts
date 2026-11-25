@@ -138,6 +138,7 @@ const outsideRepo = (command: string, cwd: string, repoRoot: string): boolean =>
         (a) =>
           a.startsWith("/") &&
           !(a === tmpDir || a.startsWith(`${tmpDir}/`)) &&
+          !(a === "/tmp" || a.startsWith("/tmp/")) &&
           !(a === "/dev/null" || a.startsWith("/dev/null/")) &&
           !isInside(a, root),
       ),

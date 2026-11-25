@@ -20,7 +20,9 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import type { ConnectorCategory, ConnectorFieldSpec } from "../lib/connectors/catalog";
+import type { ConnectorCategory } from "../lib/connectors/categories";
+import { CONNECTOR_CATEGORIES } from "../lib/connectors/categories";
+import type { ConnectorFieldSpec } from "../lib/connectors/catalog";
 
 interface RegistryServerRow {
   id: string;
@@ -80,14 +82,14 @@ interface ConnectorsResponse {
 type FilterChip = "all" | "connected" | "one-click" | ConnectorCategory;
 type HubMode = "catalog" | "registry" | "custom";
 
+// Category chips track the catalog so new categories appear without a UI change.
 const CHIPS: ReadonlyArray<{ id: FilterChip; label: string }> = [
   { id: "all", label: "All" },
   { id: "connected", label: "Connected" },
   { id: "one-click", label: "1-Click Free" },
-  { id: "code-cloud", label: "Code & Cloud" },
-  { id: "search-data", label: "Search & Data" },
-  { id: "apps-productivity", label: "Apps & Productivity" },
-  { id: "design-files", label: "Design & Files" },
+  ...CONNECTOR_CATEGORIES.filter(
+    (category): category is { id: ConnectorCategory; label: string } => category.id !== "all",
+  ).map((category) => ({ id: category.id, label: category.label })),
 ];
 
 function initials(name: string): string {
@@ -842,6 +844,45 @@ export function ConnectorsPage() {
             <Wrench className="h-3.5 w-3.5" aria-hidden />
             Custom & Agent-Authored ({customRows?.length ?? 0})
           </button>
+        </div>
+        {/* Search + Filter pills */}
+        <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <label className="relative block w-full sm:max-w-xs">
+            <Search
+              className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
+              aria-hidden
+            />
+            <input
+              type="search"
+              aria-label="Search connectors"
+              placeholder="Search connectors, vendors, tools…"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              className="w-full rounded-xl border border-white/10 bg-[#111218] py-2 pl-9 pr-3 text-sm text-white placeholder:text-zinc-500 focus:border-cyan-400/50 focus:outline-none focus:ring-2 focus:ring-cyan-400/20"
+            />
+          </label>
+          <fieldset className="m-0 min-w-0 border-0 p-0">
+            <legend className="sr-only">Connector categories</legend>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {CHIPS.map((item) => {
+              const active = chip === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setChip(item.id)}
+                  className={
+                    active
+                      ? "rounded-full border border-cyan-400/40 bg-cyan-400/15 px-3 py-1.5 text-xs font-medium text-cyan-200"
+                      : "rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-zinc-400 transition hover:bg-white/[0.08] hover:text-white"
+                  }
+                >
+                  {item.label}
+                </button>
+              );
+            })}
+            </div>
+          </fieldset>
         </div>
 
         {hubMode === "catalog" && (

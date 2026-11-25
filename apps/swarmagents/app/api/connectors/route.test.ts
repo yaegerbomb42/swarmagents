@@ -208,6 +208,136 @@ test("reuses a key already saved in Providers in one click without re-typing", a
   assert.equal(body.connector.vaultConfigured, true);
 });
 
+test("zero-key connector (arxiv) connects in one click and seeds VM MCP config", async () => {
+  const res = await CONNECT_CONNECTOR(
+    req("/api/connectors", { method: "POST", body: { connectorId: "arxiv" } }),
+  );
+  assert.equal(res.status, 201);
+  const { connector } = (await res.json()) as { connector: { id: string; connected: boolean; mcpInstalled: boolean } };
+  assert.equal(connector.id, "arxiv");
+  assert.equal(connector.connected, true);
+  assert.equal(connector.mcpInstalled, true);
+
+  const mcp = libraryMcpEntries("alice") as Record<string, { type?: string; command?: string; args?: string[] }>;
+  const arxiv = mcp["lib-connector-arxiv"];
+  assert.ok(arxiv, "arXiv MCP server must be seeded into agent runs");
+  assert.equal(arxiv.type, "stdio");
+  assert.equal(arxiv.command, "uvx");
+  assert.ok(arxiv.args?.includes("arxiv-mcp-server"));
+
+  const del = await DELETE_CONNECTOR(
+    req("/api/connectors/arxiv", { method: "DELETE" }),
+    ctx("arxiv"),
+  );
+  assert.equal(del.status, 200);
+  assert.deepEqual(libraryMcpEntries("alice"), {});
+});
+
+test("oauth connector (notion) installs in one click with no credentials", async () => {
+  const res = await CONNECT_CONNECTOR(
+    req("/api/connectors", { method: "POST", body: { connectorId: "notion" } }),
+  );
+  assert.equal(res.status, 201);
+  const { connector } = (await res.json()) as { connector: { connected: boolean; mcpInstalled: boolean } };
+  assert.equal(connector.connected, true);
+  assert.equal(connector.mcpInstalled, true);
+
+  const mcp = libraryMcpEntries("alice") as Record<string, { type?: string; url?: string }>;
+  const notion = mcp["lib-connector-notion"];
+  assert.ok(notion, "Notion MCP server must be seeded into agent runs");
+  assert.equal(notion.type, "http");
+  assert.equal(notion.url, "https://mcp.notion.com/mcp");
+
+  const del = await DELETE_CONNECTOR(
+    req("/api/connectors/notion", { method: "DELETE" }),
+    ctx("notion"),
+  );
+  assert.equal(del.status, 200);
+  assert.deepEqual(libraryMcpEntries("alice"), {});
+});
+
+test("token stdio connector (postgres) seals its connection string into VM env", async () => {
+  const missing = await CONNECT_CONNECTOR(
+    req("/api/connectors", { method: "POST", body: { connectorId: "postgres", inputs: {} } }),
+  );
+  assert.equal(missing.status, 400);
+
+  const url = "postgresql://agent:secret@db.internal:5432/app";
+  const res = await CONNECT_CONNECTOR(
+    req("/api/connectors", {
+      method: "POST",
+      body: { connectorId: "postgres", inputs: { POSTGRES_URL: url } },
+    }),
+  );
+  assert.equal(res.status, 201);
+  const text = await res.text();
+  assert.equal(text.includes(url), false, "response must never expose the connection string");
+  const { connector } = JSON.parse(text) as { connector: { connected: boolean; mcpInstalled: boolean } };
+  assert.equal(connector.connected, true);
+  assert.equal(connector.mcpInstalled, true);
+
+  const mcp = libraryMcpEntries("alice") as Record<
+    string,
+    { type?: string; env?: Record<string, string>; args?: string[] }
+  >;
+  const pg = mcp["lib-connector-postgres"];
+  assert.ok(pg, "Postgres MCP server must be seeded into agent runs");
+  assert.equal(pg.type, "stdio");
+  assert.equal(pg.env?.POSTGRES_URL, url);
+  assert.ok(pg.args?.includes(url), "the $POSTGRES_URL arg must expand to the sealed value");
+
+  const del = await DELETE_CONNECTOR(
+    req("/api/connectors/postgres", { method: "DELETE" }),
+    ctx("postgres"),
+  );
+  assert.equal(del.status, 200);
+  assert.deepEqual(libraryMcpEntries("alice"), {});
+});
+
+test("discord connector requires bot token and config path, and seeds both", async () => {
+  const noConfig = await CONNECT_CONNECTOR(
+    req("/api/connectors", {
+      method: "POST",
+      body: { connectorId: "discord", inputs: { DISCORD_BOT_TOKEN: "Bot FAKE_TOKEN_123" } },
+    }),
+  );
+  assert.equal(noConfig.status, 400);
+
+  const res = await CONNECT_CONNECTOR(
+    req("/api/connectors", {
+      method: "POST",
+      body: {
+        connectorId: "discord",
+        inputs: {
+          DISCORD_BOT_TOKEN: "Bot FAKE_TOKEN_123",
+          DISCORD_MCP_CONFIG: "/workspace/discord-mcp.json",
+        },
+      },
+    }),
+  );
+  assert.equal(res.status, 201);
+  const { connector } = (await res.json()) as { connector: { connected: boolean; mcpInstalled: boolean } };
+  assert.equal(connector.connected, true);
+  assert.equal(connector.mcpInstalled, true);
+
+  const mcp = libraryMcpEntries("alice") as Record<
+    string,
+    { type?: string; env?: Record<string, string>; args?: string[] }
+  >;
+  const discord = mcp["lib-connector-discord"];
+  assert.ok(discord, "Discord MCP server must be seeded into agent runs");
+  assert.equal(discord.type, "stdio");
+  assert.equal(discord.env?.DISCORD_BOT_TOKEN, "Bot FAKE_TOKEN_123");
+  assert.ok(discord.args?.includes("/workspace/discord-mcp.json"));
+
+  const del = await DELETE_CONNECTOR(
+    req("/api/connectors/discord", { method: "DELETE" }),
+    ctx("discord"),
+  );
+  assert.equal(del.status, 200);
+  assert.deepEqual(libraryMcpEntries("alice"), {});
+});
+
 test("cloudflare optional accountId validates slug and sets Workers AI baseUrl; bad inputs return 400/404", async () => {
   const unknown = await CONNECT_CONNECTOR(
     req("/api/connectors", { method: "POST", body: { connectorId: "nope" } }),

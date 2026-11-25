@@ -6,7 +6,9 @@
  * under prefers-reduced-motion by tokens.css. `live` overrides the pulse:
  * a live `ok`/`warn` still breathes, a steady `running` (e.g. the human
  * holding the controls) does not. Labels render verbatim — no casing
- * transform, so "Live · 42 ms" stays "42 ms".
+ * transform, so "Live · 42 ms" stays "42 ms". The pill itself is glass
+ * (backdrop blur + soft shadow) so it reads over live pixels as well as
+ * over the chrome bar.
  */
 
 import type { ReactNode } from "react";
@@ -54,7 +56,7 @@ export function StatusPill({ status, children, live, testId, className }: Status
       data-status={status}
       data-testid={testId}
       className={cn(
-        "inline-flex shrink-0 items-center gap-1.5 rounded-[var(--brand-radius-full)] border px-2 py-[3px] text-[11px] font-semibold leading-none",
+        "inline-flex shrink-0 items-center gap-1.5 rounded-[var(--brand-radius-full)] border px-2 py-[3px] text-[11px] font-semibold leading-none backdrop-blur-sm shadow-[0_2px_12px_rgba(0,0,0,0.35)]",
         tone.pill,
         className,
       )}

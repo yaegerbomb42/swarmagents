@@ -8,6 +8,11 @@
  *
  *   - SURFACE      the stage background, the well inside it, the hairline
  *   - CHROME       the top bar and the status bar (same height, same border)
+ *   - GLASS        the neo-glassmorphic material: the frame's outer edge and
+ *                  every panel that floats over live pixels (booting card,
+ *                  LIVE badge, reconnect card). The bars are translucent
+ *                  graphite with backdrop blur; the stage itself stays pure
+ *                  black so the noVNC pixels are never tinted.
  *   - TONE         dot + word colors for every status the screen shows
  *   - VIEW_ACCENT  the one tint each view is allowed to use for *content*,
  *                  never for chrome: the chrome is always the same graphite
@@ -49,10 +54,14 @@ export const SURFACE = {
 export const CHROME = {
   /** The one top bar: view tabs, presence, controls. */
   bar: "flex h-9 shrink-0 items-center gap-2 border-b px-2",
-  barLook: "border-[#232329] bg-[#0d0d11]",
+  /** Translucent graphite + backdrop blur + inset hairline light: the bars
+      read as glass over the frame instead of a solid strip. The stage
+      behind them is opaque black, so the blur costs nothing and the inset
+      light is what the eye actually sees. */
+  barLook: "border-[#232329] glass-soft",
   /** The one status bar under the stage: VM, run, connection, presence. */
   statusBar: "flex h-8 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-t px-2.5 text-[11px]",
-  statusBarLook: "border-[#232329] bg-[#0d0d11]",
+  statusBarLook: "border-[#232329] glass-soft",
   /** The view switcher: one pill group, identical in every view. */
   tabGroup: "inline-flex h-7 shrink-0 items-center gap-0.5 rounded-lg border border-[#26262d] bg-black/40 p-0.5",
   tab: "inline-flex h-6 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sa-accent-fg/60",
@@ -61,6 +70,33 @@ export const CHROME = {
   /** Small icon-only control in the bar. */
   iconButton:
     "grid h-6 w-6 shrink-0 place-items-center rounded-md text-sa-fg3 transition-colors hover:bg-white/5 hover:text-sa-fg disabled:cursor-not-allowed disabled:opacity-40",
+} as const;
+
+/* ── Glass ───────────────────────────────────────────────────────────────── */
+
+/**
+ * The neo-glassmorphic material for the computer screen. `glass-soft` is the
+ * shared glass utility in app/globals.css (translucent white, 18px backdrop
+ * blur, inset hairline light); these tokens only add the frame-level shape
+ * around it. The desktop stage itself never takes glass — pure black, so
+ * the noVNC pixels are never tinted.
+ */
+export const GLASS = {
+  /**
+   * The screen's outer edge: a hairline ring over the border plus a soft
+   * drop shadow, so the computer floats off the page instead of sitting
+   * flat on it. Applied to VmFrame and to the ScreenFrame stage wrapper
+   * (which owns the visible edge in the main workspace, where VmFrame
+   * itself is borderless).
+   */
+  frame: "shadow-[0_24px_70px_rgba(0,0,0,0.55)] ring-1 ring-white/[0.07]",
+  /**
+   * A floating panel over live pixels: booting card, reconnect card,
+   * offline card. The glass material plus the card's own radius and depth.
+   */
+  panel: "glass-soft rounded-2xl shadow-2xl",
+  /** The LIVE badge over the desktop surface: glass pill, readable over any frame. */
+  liveBadge: "glass-soft rounded-full shadow-lg ring-1 ring-white/10",
 } as const;
 
 /* ── Status tones ────────────────────────────────────────────────────────── */

@@ -411,6 +411,7 @@ export function VmScreen({
               onControlChange={onControlChange}
               canControl={canControl}
               onConnection={onConnection}
+              vmErrorMessage={typeof vmErrorMessage === "string" ? vmErrorMessage : undefined}
             />
           </div>
         )}

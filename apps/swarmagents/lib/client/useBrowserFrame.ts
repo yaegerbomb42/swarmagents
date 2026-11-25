@@ -96,10 +96,31 @@ export interface BrowserFrameState {
   status: BrowserFrameStatus;
   /** Object URL of the latest frame; replaced on update, revoked on unmount. */
   frameUrl?: string;
+  /**
+   * Object URL of the frame the current one replaced. Kept alive (not
+   * revoked) so the view can crossfade between frames instead of flashing
+   * the empty stage on every changed frame; revoked when the next frame
+   * supersedes it. Never set when there is no current frame.
+   */
+  previousFrameUrl?: string;
   /** Epoch ms the frame bytes were last fetched. */
   fetchedAt?: number;
   /** Last fetch error message, when status === "error". */
   error?: string;
+}
+
+/**
+ * Pure rotation for the frame crossfade: the new frame becomes current, the
+ * just-superseded frame becomes previous (kept alive so the view can fade
+ * between them), and the older previous — if any — is the one to revoke.
+ * Only one stale object URL is ever kept alive.
+ */
+export function rotateFrameUrls(
+  current: string | undefined,
+  previous: string | undefined,
+  next: string,
+): { frameUrl: string; previousFrameUrl?: string; revoke?: string } {
+  return { frameUrl: next, previousFrameUrl: current, revoke: previous };
 }
 
 interface InternalState extends BrowserFrameState {
@@ -120,6 +141,8 @@ export function useBrowserFrame(runId?: string | null, options: BrowserFrameHook
   const stateRef = useRef(state);
   stateRef.current = state;
   const urlRef = useRef<string | undefined>(undefined);
+  /** The previous frame's object URL, kept alive for the crossfade. */
+  const prevUrlRef = useRef<string | undefined>(undefined);
   const prevRunIdRef = useRef<string | null | undefined>(null);
   /** Bumped to restart the loop immediately (manual refresh or refreshKey). */
   const [signal, setSignal] = useState(0);
@@ -154,6 +177,10 @@ export function useBrowserFrame(runId?: string | null, options: BrowserFrameHook
         URL.revokeObjectURL(urlRef.current);
         urlRef.current = undefined;
       }
+      if (prevUrlRef.current) {
+        URL.revokeObjectURL(prevUrlRef.current);
+        prevUrlRef.current = undefined;
+      }
       setState({ status: id ? "polling" : "idle" });
       if (!id) return;
     }
@@ -171,10 +198,18 @@ export function useBrowserFrame(runId?: string | null, options: BrowserFrameHook
     };
 
     const replaceFrame = (blob: Blob) => {
-      if (urlRef.current) URL.revokeObjectURL(urlRef.current);
-      const url = URL.createObjectURL(blob);
-      urlRef.current = url;
-      setState({ status: "polling", frameUrl: url, frameSize: blob.size, fetchedAt: Date.now() });
+      const next = URL.createObjectURL(blob);
+      const rotated = rotateFrameUrls(urlRef.current, prevUrlRef.current, next);
+      if (rotated.revoke) URL.revokeObjectURL(rotated.revoke);
+      prevUrlRef.current = rotated.previousFrameUrl;
+      urlRef.current = next;
+      setState({
+        status: "polling",
+        frameUrl: next,
+        previousFrameUrl: rotated.previousFrameUrl,
+        frameSize: blob.size,
+        fetchedAt: Date.now(),
+      });
     };
 
     const schedule = (delayMs: number) => {
@@ -216,6 +251,10 @@ export function useBrowserFrame(runId?: string | null, options: BrowserFrameHook
             URL.revokeObjectURL(urlRef.current);
             urlRef.current = undefined;
           }
+          if (prevUrlRef.current) {
+            URL.revokeObjectURL(prevUrlRef.current);
+            prevUrlRef.current = undefined;
+          }
           setState({ status: "empty" });
           schedule(nextBrowserPollDelayMs(pollState, { intervalMs, maxBackoffMs }));
         } else {
@@ -255,6 +294,10 @@ export function useBrowserFrame(runId?: string | null, options: BrowserFrameHook
       if (urlRef.current) {
         URL.revokeObjectURL(urlRef.current);
         urlRef.current = undefined;
+      }
+      if (prevUrlRef.current) {
+        URL.revokeObjectURL(prevUrlRef.current);
+        prevUrlRef.current = undefined;
       }
     };
   }, []);

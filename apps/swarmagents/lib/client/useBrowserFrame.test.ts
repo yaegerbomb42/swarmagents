@@ -15,6 +15,7 @@ import {
   initialBrowserPollState,
   nextBrowserPollDelayMs,
   recordBrowserPollOutcome,
+  rotateFrameUrls,
 } from "./useBrowserFrame";
 
 test("polls at the base interval while ticks succeed", () => {
@@ -96,6 +97,25 @@ test("browserFrameUrl encodes the run id", () => {
     browserFrameUrl("run with spaces"),
     "/api/runtime/browser/run%20with%20spaces/frame",
   );
+});
+
+test("rotateFrameUrls keeps one previous frame alive for the crossfade", () => {
+  assert.deepEqual(rotateFrameUrls(undefined, undefined, "blob:1"), {
+    frameUrl: "blob:1",
+    previousFrameUrl: undefined,
+    revoke: undefined,
+  });
+  assert.deepEqual(rotateFrameUrls("blob:1", undefined, "blob:2"), {
+    frameUrl: "blob:2",
+    previousFrameUrl: "blob:1",
+    revoke: undefined,
+  });
+  // The third frame revokes the first: at most one stale object URL is kept.
+  assert.deepEqual(rotateFrameUrls("blob:2", "blob:1", "blob:3"), {
+    frameUrl: "blob:3",
+    previousFrameUrl: "blob:2",
+    revoke: "blob:1",
+  });
 });
 
 /** First backoff delay from the base interval (one failure in the streak). */

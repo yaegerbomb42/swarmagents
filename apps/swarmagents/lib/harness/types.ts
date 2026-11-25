@@ -444,6 +444,12 @@ export interface RunRequest {
   sessionId?: string;
   model?: string;
   /**
+   * Filter/condense oversized `tool.result` output (> 4000 chars) via
+   * `filterObservation` (lib/harness/observation-filter.ts) before emitting/storing.
+   * Disabled by default; runtime fills this from the account's settings.
+   */
+  autoCondenseLogs?: boolean;
+  /**
    * Turn ceiling for this invocation, passed to claude as `--max-turns`.
    * The runner caps it at SWARM_MAX_TURNS (see resolveMaxTurns). Absent
    * means no flag — the CLI's own default applies, as today.

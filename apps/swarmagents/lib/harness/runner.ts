@@ -40,6 +40,7 @@ import type {
 } from "./types";
 import { isMetaTool } from "../self-manage/session";
 import { createStreamJsonParser } from "./stream-json";
+import { filterObservation } from "./observation-filter";
 import { GateQueue } from "./gate-queue";
 import { makeRedactor, redactValue } from "./redact";
 import { classifyToolCall } from "./risk";
@@ -213,6 +214,10 @@ export function isSignalKillExitCode(exitCode: number): boolean {
 
 /** Default cap for --max-turns when SWARM_MAX_TURNS is unset or invalid. */
 export const DEFAULT_SWARM_MAX_TURNS = 200;
+
+/** Threshold and inline ceiling (in chars) for filtering oversized tool.result logs. */
+export const AUTO_CONDENSE_THRESHOLD_CHARS = 4000;
+export const AUTO_CONDENSE_MAX_CHARS = 4000;
 
 /**
  * Effective --max-turns for one invocation: the requested ceiling,
@@ -424,6 +429,8 @@ export class ClaudeCodeRunner {
     /** ProgressWatchdog loop state: tool_use id -> tool name, turn count. */
     let watchdogTurnCount = 0;
     const watchdogToolNames = new Map<string, string>();
+    /** tool_use id -> Bash command (for observation-filter kind detection). */
+    const toolCallCommands = new Map<string, string>();
 
     // Role switching: a validated set_role call aborts this invocation (via an
     // internal signal the manager never sees) so the run can resume with the
@@ -606,7 +613,12 @@ export class ClaudeCodeRunner {
               const name = typeof block.name === "string" ? block.name : "";
               const input = block.input;
               const toolId = typeof block.id === "string" ? block.id : undefined;
-              if (toolId) watchdogToolNames.set(toolId, name);
+              if (toolId) {
+                watchdogToolNames.set(toolId, name);
+                if (name === "Bash" && isObject(input) && typeof input.command === "string") {
+                  toolCallCommands.set(toolId, input.command);
+                }
+              }
               emit({
                 type: "tool.call",
                 name,
@@ -900,11 +912,25 @@ export class ClaudeCodeRunner {
           const content = Array.isArray(message.content) ? message.content : [];
           for (const block of content) {
             if (!isObject(block) || block.type !== "tool_result") continue;
-            const output = renderToolOutput(block, redact);
+            const resultId = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined;
+            const command = resultId ? toolCallCommands.get(resultId) : undefined;
+            if (resultId) toolCallCommands.delete(resultId);
+            const rawOutput = renderToolOutput(block, redact);
+            const output =
+              request.autoCondenseLogs === true && rawOutput.length > AUTO_CONDENSE_THRESHOLD_CHARS
+                ? filterObservation({
+                    command,
+                    output: rawOutput,
+                    turnId: `turn-${watchdogTurnCount + 1}`,
+                    toolId: resultId,
+                    maxInlineChars: AUTO_CONDENSE_MAX_CHARS,
+                    allowSpill: false,
+                  }).text
+                : rawOutput;
             const ok = block.is_error !== true;
             emit({
               type: "tool.result",
-              id: typeof block.tool_use_id === "string" ? block.tool_use_id : undefined,
+              id: resultId,
               ok,
               truncated: isTruncated(block),
               output,

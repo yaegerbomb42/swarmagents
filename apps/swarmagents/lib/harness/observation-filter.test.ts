@@ -169,6 +169,14 @@ test("filterObservation never throws when the spill fails", () => {
   }
 });
 
+test("filterObservation never writes to disk when allowSpill is false", () => {
+  const output = "x".repeat(10_000);
+  const result = filterObservation({ output, maxInlineChars: 200, allowSpill: false });
+  assert.equal(result.spilledTo, undefined);
+  assert.ok(result.text.length <= 200);
+  assert.match(result.text, /inline cap 200 chars/);
+});
+
 test("filterObservation leaves a small log alone", () => {
   const result = filterObservation({ command: "echo hi", output: "hello\nworld\n" });
   assert.equal(result.kind, "generic");

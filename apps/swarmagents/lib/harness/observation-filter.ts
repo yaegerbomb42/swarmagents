@@ -58,6 +58,8 @@ export interface ObservationFilterInput {
   maxInlineChars?: number;
   /** Spill directory; default {@link DEFAULT_SPILL_DIR}. */
   spillDir?: string;
+  /** When false, omit disk spill (e.g. VM outputs filtered on host) and truncate inline. */
+  allowSpill?: boolean;
 }
 
 export interface ObservationFilterResult {
@@ -507,10 +509,10 @@ export function filterObservation(input: ObservationFilterInput): ObservationFil
     if (summaries.length) filtered = `${filtered}\n${summaries.join("\n")}`;
   }
 
-  // Spill: the raw output goes to disk, the inline text is head + tail of
-  // the filtered output plus a pointer to the full log.
+  // Spill: the raw output goes to disk (when allowed), the inline text is
+  // head + tail of the filtered output plus a pointer/truncation marker.
   if (filtered.length > maxInlineChars) {
-    const spilledTo = trySpill(spillDir, turnId, toolId, input.output);
+    const spilledTo = input.allowSpill === false ? undefined : trySpill(spillDir, turnId, toolId, input.output);
     const filteredLines = filtered.split("\n");
     const head = filteredLines.slice(0, SPILL_HEAD_LINES);
     const tail = filteredLines.slice(-SPILL_TAIL_LINES);
@@ -521,10 +523,17 @@ export function filterObservation(input: ObservationFilterInput): ObservationFil
     const linesOmitted = Math.max(0, filteredLines.length - shownLines.length);
     const pointer = spilledTo
       ? `[TRUNCATED: ${linesOmitted} lines omitted. Full raw output saved at ${spilledTo} - use read_file_range or grep to inspect.]`
-      : `[TRUNCATED: ${linesOmitted} lines omitted. Spill to ${spillDir ?? "the spill directory"} failed; full output unavailable.]`;
+      : input.allowSpill === false
+        ? `[TRUNCATED: ${linesOmitted} lines omitted (inline cap ${maxInlineChars} chars).]`
+        : `[TRUNCATED: ${linesOmitted} lines omitted. Spill to ${spillDir ?? "the spill directory"} failed; full output unavailable.]`;
+    let text = [...shownLines, pointer].join("\n");
+    if (input.allowSpill === false && text.length > maxInlineChars) {
+      const budget = Math.max(1, maxInlineChars - pointer.length - 1);
+      text = `${shownLines.join("\n").slice(0, budget)}\n${pointer}`;
+    }
     return {
       kind,
-      text: [...shownLines, pointer].join("\n"),
+      text,
       spilledTo,
       originalChars,
       filteredChars: filtered.length,

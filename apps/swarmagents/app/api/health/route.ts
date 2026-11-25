@@ -27,9 +27,11 @@ function isAdmin(req: NextRequest): boolean {
 
 /**
  * Public liveness/readiness probe for deploy checks; see middleware PUBLIC set.
- * - `GET /api/health` — liveness: board writable + version. `providersConfigured`
- *   counts the signed-in caller's own providers (`providersScope: "user"`), or
- *   host provider env keys when signed out (`providersScope: "host-env"`).
+ * - `GET /api/health` — liveness: board writable + version + non-secret
+ *   subsystem checks (`vmDriver`, `desktopEnabled`, `catalogConnectorCount`,
+ *   `atlasReady`, `toolForgeReady`). `providersConfigured` counts the
+ *   signed-in caller's own providers (`providersScope: "user"`), or host
+ *   provider env keys when signed out (`providersScope: "host-env"`).
  * - `GET /api/health?ready=1` — readiness: additionally checks the VM driver,
  *   SWARM_HOME writability and free disk; 503 with per-check results on any
  *   failure. Anonymous callers get booleans and stable reason codes only;

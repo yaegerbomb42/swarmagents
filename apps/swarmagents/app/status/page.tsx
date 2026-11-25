@@ -57,6 +57,16 @@ export default function StatusPage() {
       ok: health.vmDriver === "none" ? null : true,
     },
     {
+      label: "Desktop mode",
+      value: health.desktopEnabled ? "Enabled — desktop VM image" : "Off — headless VM image",
+      ok: health.desktopEnabled ? true : null,
+    },
+    {
+      label: "Connector catalog",
+      value: `${health.catalogConnectorCount} connector${health.catalogConnectorCount === 1 ? "" : "s"} available`,
+      ok: health.catalogConnectorCount > 0 ? true : null,
+    },
+    {
       label: "Providers configured",
       value:
         health.providersScope === "user"
@@ -65,6 +75,21 @@ export default function StatusPage() {
             ? `${health.providersConfigured} host key(s) present`
             : "None — configure a provider to run",
       ok: null,
+    },
+  ];
+
+  const subsystems: { label: string; value: string; ok: boolean; note: string }[] = [
+    {
+      label: "Capability atlas",
+      value: health.atlasReady ? "Ready" : "Off",
+      ok: health.atlasReady,
+      note: "Opt-in MCP server (SWARM_ATLAS_ENABLED=1)",
+    },
+    {
+      label: "Tool forge",
+      value: health.toolForgeReady ? "Ready" : "Unavailable",
+      ok: health.toolForgeReady,
+      note: "MCP tool library that assembles run tooling",
     },
   ];
 
@@ -103,6 +128,32 @@ export default function StatusPage() {
                   )}
                   <span>{row.value}</span>
                   {row.ok !== null && <span className="sr-only">{row.ok ? "OK" : "Needs attention"}</span>}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+
+        <div className="mt-6 overflow-hidden rounded-2xl ring-1 ring-white/10">
+          <div className="border-b border-white/5 bg-white/[0.03] px-5 py-3">
+            <h2 className="text-xs font-medium uppercase tracking-[0.2em] text-white/50">
+              Harness subsystems
+            </h2>
+          </div>
+          <dl className="divide-y divide-white/5 bg-white/[0.02]">
+            {subsystems.map((sub) => (
+              <div key={sub.label} className="flex items-baseline justify-between gap-4 px-5 py-3.5">
+                <dt>
+                  <span className="block text-xs uppercase tracking-widest text-white/40">{sub.label}</span>
+                  <span className="mt-0.5 block text-[11px] text-white/35">{sub.note}</span>
+                </dt>
+                <dd className="flex items-center justify-end gap-2 text-right text-sm text-white/85">
+                  <span
+                    aria-hidden="true"
+                    className={`h-2 w-2 shrink-0 rounded-full ${sub.ok ? "bg-emerald-400/70" : "bg-white/25"}`}
+                  />
+                  <span>{sub.value}</span>
+                  <span className="sr-only">{sub.ok ? "OK" : "Off"}</span>
                 </dd>
               </div>
             ))}

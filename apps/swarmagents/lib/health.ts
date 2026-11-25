@@ -5,9 +5,12 @@ import fs from "node:fs";
 import path from "node:path";
 import pkg from "../package.json";
 import { getStoragePaths } from "./board/store";
+import { CONNECTOR_CATALOG } from "./connectors/catalog";
+import { CONNECTORS } from "./library/catalog";
 import { PROVIDER_CATALOG } from "./providers/catalog";
 import { countUserProviders } from "./providers/store";
 import { defaultDriverName } from "./vm/driver-default";
+import { isDesktopModeEnabled } from "./vm/desktop";
 
 export interface HealthReport {
   ok: boolean;
@@ -27,6 +30,23 @@ export interface HealthReport {
    * only — never provider names or key material.
    */
   providersScope: "user" | "host-env";
+  /**
+   * Non-secret subsystem checks: booleans and counts only. None of these
+   * names a provider, a key, a path, or any credential.
+   */
+  /** Desktop VM image selected (SWARM_VM_DESKTOP=1); see lib/vm/desktop.ts. */
+  desktopEnabled: boolean;
+  /** Entries in the one-click connector catalog (lib/connectors/catalog.ts). */
+  catalogConnectorCount: number;
+  /** Capability-atlas MCP server enabled (SWARM_ATLAS_ENABLED=1). */
+  atlasReady: boolean;
+  /**
+   * MCP tool library ready: the verified connector catalog that assembles
+   * the MCP servers mounted into agent runs (lib/library/catalog.ts)
+   * loads non-empty. No dedicated "ToolForge" subsystem exists in the repo;
+   * this reports the readiness of the tool library that forges run tooling.
+   */
+  toolForgeReady: boolean;
 }
 
 /**
@@ -96,6 +116,17 @@ function asIsoTime(raw: string): string | null {
   return Number.isNaN(Date.parse(value)) ? null : value;
 }
 
+/**
+ * Whether the capability-atlas MCP server is on for this process
+ * (SWARM_ATLAS_ENABLED=1). Mirrors `atlasEnabled` in
+ * lib/harness/role-mcp.ts, kept local so the public health path does not
+ * import the whole harness/roles graph. Default off: the server is seeded
+ * and wired only when explicitly enabled.
+ */
+function atlasReady(env: NodeJS.ProcessEnv): boolean {
+  return env.SWARM_ATLAS_ENABLED === "1";
+}
+
 export function healthSnapshot(env: NodeJS.ProcessEnv = process.env, userId?: string | null): HealthReport {
   const scope: HealthReport["providersScope"] = userId ? "user" : "host-env";
   const providersConfigured = userId ? countUserProviders(userId) : hostProviderCount(env);
@@ -113,5 +144,9 @@ export function healthSnapshot(env: NodeJS.ProcessEnv = process.env, userId?: st
     vmDriver: (env.SWARM_VM_DRIVER ?? "").trim() || defaultDriverName(env),
     providersConfigured,
     providersScope: scope,
+    desktopEnabled: isDesktopModeEnabled(env),
+    catalogConnectorCount: CONNECTOR_CATALOG.length,
+    atlasReady: atlasReady(env),
+    toolForgeReady: CONNECTORS.length > 0,
   };
 }

@@ -2,20 +2,21 @@
  * The locator MCP server.
  *
  * The server is written into the user's VM next to the codebase server and
- * exposed to the agent as the `locator` MCP server. It exposes one tool:
+ * exposed to the agent as the `locator` MCP server. It exposes two tools:
  *
  *   - locate_code(query, limit?) — ripgrep-backed search over the live
  *     workspace tree: the agent describes a symbol, error message, or
  *     concept in plain words and gets back the top matching files with
  *     exact line numbers and snippets, ranked by relevance.
+ *   - dependency_radar(symbol, limit?) — scans downstream callers/importers
+ *     referencing a symbol (<120 tokens) so edits check ripple effects first.
  *
- * Ported from `vendor/claude-code-mini/src/autoLocator.ts`
- * (`AutoLocator.locate`): the query cleaning (strip quotes, keep word
- * chars/dot/hyphen, drop short words, keep at most three keywords) and the
- * ripgrep flags (`-n -i -m 5 --max-columns 120`, excluding node_modules,
- * .git, dist, .next) are the vendor's. The vendor version interpolates the
- * query into a shell command string; this port never does — ripgrep is
- * spawned with an argv array and no shell, so the query is always data.
+ * Ported from `vendor/claude-code-mini/src/autoLocator.ts` and
+ * `vendor/claude-code-mini/src/dependencyRadarTool.ts`: the query cleaning
+ * and ripgrep flags (`-n -i -m 5 --max-columns 120`, excluding node_modules,
+ * .git, dist, .next) match the vendor's, while replacing shell interpolation
+ * with `spawnSync('rg', [...], { shell: false })` so queries and symbols are
+ * always data, never shell text.
  *
  * The search runs inside the VM (where the workspace files are) and is
  * scoped to the workspace root: the server's cwd is the root and ripgrep
@@ -30,6 +31,9 @@ export const LOCATOR_MCP_SERVER_PATH = "/workspace/.swarm/locator-server.mjs";
 
 /** The tool the agent calls to locate code. */
 export const LOCATOR_TOOL = "locate_code";
+
+/** The tool the agent calls to inspect downstream symbol references. */
+export const DEPENDENCY_RADAR_TOOL = "dependency_radar";
 
 /** The server program, written verbatim into the VM. */
 export function locatorMcpServerSource(): string {
@@ -136,6 +140,53 @@ export function locatorMcpServerSource(): string {
     "  return { keywords: keywords, targets: targets.slice(0, limit) };",
     "}",
     "",
+    "function escapeRegExp(text) {",
+    "  return String(text || '').replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');",
+    "}",
+    "",
+    "function dependencyRadar(symbol, limit) {",
+    "  const cleanSymbol = String(symbol || '').trim();",
+    "  if (cleanSymbol.length < 3) return { symbol: cleanSymbol, dependents: [] };",
+    "  const root = workspaceRoot();",
+    "  const pattern = '\\\\b' + escapeRegExp(cleanSymbol) + '\\\\b';",
+    "  const result = spawnSync('rg', [",
+    "    '-n', '-m', '8', '--max-columns', '120', '--no-heading',",
+    "    '-g', '!node_modules', '-g', '!.git', '-g', '!dist', '-g', '!.next',",
+    "    '-e', pattern, '--', '.'",
+    "  ], {",
+    "    cwd: root,",
+    "    encoding: 'utf8',",
+    "    timeout: SEARCH_TIMEOUT_MS,",
+    "    maxBuffer: MAX_BUFFER_BYTES,",
+    "    shell: false",
+    "  });",
+    "  if (result.error) {",
+    "    if (result.error.code === 'ENOENT') return { error: 'ripgrep (rg) is not available in this VM image' };",
+    "    if (result.error.code === 'ETIMEDOUT') return { error: 'dependency_radar timed out after ' + SEARCH_TIMEOUT_MS + 'ms' };",
+    "    return { error: 'dependency_radar failed: ' + result.error.message };",
+    "  }",
+    "  if (result.status === 1) return { symbol: cleanSymbol, dependents: [] };",
+    "  if (result.status !== 0) {",
+    "    const detail = String(result.stderr || '').trim().slice(0, 200);",
+    "    return { error: 'ripgrep exited with status ' + result.status + (detail ? ': ' + detail : '') };",
+    "  }",
+    "  const lines = String(result.stdout || '').split('\\n').filter(Boolean).slice(0, MAX_PARSED_LINES);",
+    "  const dependents = [];",
+    "  for (const line of lines) {",
+    "    const parts = line.split(':');",
+    "    if (parts.length < 3) continue;",
+    "    const filePath = parts[0].replace(/^\\.\\//, '');",
+    "    const lineNum = parseInt(parts[1], 10);",
+    "    const snippet = parts.slice(2).join(':').trim().slice(0, 80);",
+    "    dependents.push({",
+    "      filePath: filePath,",
+    "      line: Number.isNaN(lineNum) ? 1 : lineNum,",
+    "      snippet: snippet",
+    "    });",
+    "  }",
+    "  return { symbol: cleanSymbol, dependents: dependents.slice(0, limit) };",
+    "}",
+    "",
     "const tools = [",
     "  {",
     "    name: 'locate_code',",
@@ -147,6 +198,18 @@ export function locatorMcpServerSource(): string {
     "        limit: { type: 'number', description: 'How many targets to return (default 3, max 10).' }",
     "      },",
     "      required: ['query']",
+    "    }",
+    "  },",
+    "  {",
+    "    name: 'dependency_radar',",
+    "    description: 'Scan downstream callers and importers referencing a symbol (<120 tokens) before editing shared code.',",
+    "    inputSchema: {",
+    "      type: 'object',",
+    "      properties: {",
+    "        symbol: { type: 'string', description: 'Exact symbol identifier to scan for references (min 3 chars).' },",
+    "        limit: { type: 'number', description: 'How many references to return (default 5, max 10).' }",
+    "      },",
+    "      required: ['symbol']",
     "    }",
     "  }",
     "];",
@@ -167,6 +230,17 @@ export function locatorMcpServerSource(): string {
     "}",
     "",
     "function callTool(name, args) {",
+    "  if (name === 'dependency_radar') {",
+    "    const symbol = typeof args.symbol === 'string' ? args.symbol : '';",
+    "    const rawLimit = Number(args.limit);",
+    "    const limit = Math.max(1, Math.min(MAX_LIMIT, Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 5));",
+    "    const found = dependencyRadar(symbol, limit);",
+    "    if (found.error) return toolResult({ ok: false, error: found.error }, true);",
+    "    const text = found.dependents.length === 0",
+    "      ? 'DEPENDENCY RADAR: No external references found for \\'' + found.symbol + '\\'. Safe to edit in isolation.'",
+    "      : 'DEPENDENCY RADAR (Ripple effects for \\'' + found.symbol + '\\'):\\n' + found.dependents.map((d) => '- ' + d.filePath + ':' + d.line + ' -> \"' + d.snippet.slice(0, 70) + '\"').join('\\n');",
+    "    return toolResult({ ok: true, symbol: found.symbol, dependents: found.dependents, text: text }, false);",
+    "  }",
     "  if (name !== 'locate_code') {",
     "    return toolResult({ ok: false, error: 'unknown tool: ' + name }, true);",
     "  }",

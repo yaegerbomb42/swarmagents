@@ -169,6 +169,7 @@ import {
   type ShadowVerificationSummary,
 } from "../verification/shadow-verifier";
 import { runDiffHygieneGate } from "../verification/diff-hygiene-gate";
+import { createBrowserControlBackend, runRepoBrowserGate } from "../verification/browser-gate";
 import { defaultOracleChecks, runOracleGate } from "../harness/oracle";
 import { deriveArtifactsFromEvents, diffWorkspaceLists, listWorkspaceFiles, mergeArtifacts } from "./run-report";
 import type { WorkspaceEntry } from "./run-report";
@@ -3963,6 +3964,18 @@ export class RuntimeManager {
         }
       } catch {
         // Gate plumbing failed — finalize with the passing shadow summary.
+      }
+      const browserGateSummary = await runRepoBrowserGate(
+        deps.exec,
+        plan.repoRoot,
+        () => createBrowserControlBackend(getBrowserManager(), `${active.runId}-gate`),
+        process.env.SWARM_BROWSER_GATE_URL,
+      );
+      if (browserGateSummary) {
+        summary = mergeOracleSummary(summary, browserGateSummary);
+        if (!summary.passed && attemptsUsed + 1 < SHADOW_VERIFIER_MAX_ROUNDS) {
+          return { outcome: "bounce", summary };
+        }
       }
       const oracle = await this.runPostRunOracle(active);
       if (oracle) {

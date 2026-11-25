@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  DEPENDENCY_RADAR_TOOL,
   LOCATOR_MCP_SERVER_NAME,
   LOCATOR_MCP_SERVER_PATH,
   LOCATOR_TOOL,
@@ -127,7 +128,7 @@ function payloadOf(replies: Rpc[], id: number): any {
   return JSON.parse(reply?.result?.content?.[0]?.text ?? "{}");
 }
 
-test("the locator MCP server lists locate_code", async () => {
+test("the locator MCP server lists locate_code and dependency_radar", async () => {
   const { replies, workspace } = await ask([
     { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
     { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
@@ -135,8 +136,34 @@ test("the locator MCP server lists locate_code", async () => {
   try {
     const list = replies.find((reply) => reply.id === 2);
     const names = (list?.result?.tools ?? []).map((tool: { name: string }) => tool.name);
-    assert.deepEqual(names, [LOCATOR_TOOL]);
+    assert.deepEqual(names, [LOCATOR_TOOL, DEPENDENCY_RADAR_TOOL]);
     assert.equal(LOCATOR_TOOL, "locate_code");
+    assert.equal(DEPENDENCY_RADAR_TOOL, "dependency_radar");
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("dependency_radar returns compact ripple-effect references and treats hostile input as data", { skip: rgSkip }, async () => {
+  const { replies, workspace } = await ask([
+    { jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "dependency_radar", arguments: { symbol: "verifySession" } } },
+    { jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "dependency_radar", arguments: { symbol: "ab" } } },
+    { jsonrpc: "2.0", id: 13, method: "tools/call", params: { name: "dependency_radar", arguments: { symbol: '"; rm -rf /tmp #' } } },
+  ]);
+  try {
+    const found = payloadOf(replies, 11);
+    assert.equal(found.ok, true);
+    assert.equal(found.dependents.length, 2);
+    assert.match(found.text, /DEPENDENCY RADAR \(Ripple effects for 'verifySession'\):/);
+    assert.match(found.text, /lib\/sessionStore\.ts:1/);
+
+    const shortSym = payloadOf(replies, 12);
+    assert.equal(shortSym.ok, true);
+    assert.deepEqual(shortSym.dependents, []);
+
+    const hostile = payloadOf(replies, 13);
+    assert.equal(hostile.ok, true);
+    assert.deepEqual(hostile.dependents, []);
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }

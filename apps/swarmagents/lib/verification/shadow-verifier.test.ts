@@ -167,3 +167,37 @@ test("isShadowVerificationEnabled defaults on and honours explicit off", () => {
 test("SHADOW_VERIFIER_MAX_ROUNDS bounds the loop at a named constant", () => {
   assert.equal(SHADOW_VERIFIER_MAX_ROUNDS, 3);
 });
+
+test("shadowVerifyRound includes compact failure digest on broken test runs and filters huge passing logs", async () => {
+  const failingOut = [
+    " FAIL  src/math.test.ts > adds",
+    " ❯ src/math.test.ts:12:5",
+    "   AssertionError: expected 2 to equal 3",
+    " Tests  1 failed | 9 passed (10)",
+  ].join("\n");
+  const failSummary = await shadowVerifyRound(
+    {
+      exec: makeExec({ "sh -c npx vitest run": { exitCode: 1, stdout: failingOut, stderr: "" } }),
+      callLLM: async () => passVerdict(),
+    },
+    { repoRoot: "/workspace/repo", testCommands: ["npx vitest run"], prompt: "Fix math", round: 1 },
+  );
+  assert.equal(failSummary.passed, false);
+  assert.match(failSummary.remediationPrompt ?? "", /Failure digest:/);
+  assert.match(failSummary.remediationPrompt ?? "", /src\/math\.test\.ts:12:5/);
+
+  let seenPromptLen = 0;
+  const hugePass = Array.from({ length: 300 }, (_, i) => `  ✓ test_${i} passed (1 ms)`).join("\n");
+  const passSummary = await shadowVerifyRound(
+    {
+      exec: makeExec({ "sh -c npx jest": { exitCode: 0, stdout: `${hugePass}\nTests: 300 passed, 300 total`, stderr: "" } }),
+      callLLM: async (prompt) => {
+        seenPromptLen = prompt.length;
+        return passVerdict(95);
+      },
+    },
+    { repoRoot: "/workspace/repo", testCommands: ["npx jest"], prompt: "Run tests", round: 1 },
+  );
+  assert.equal(passSummary.passed, true);
+  assert.ok(seenPromptLen < hugePass.length, "oversized passing test output must be compressed before LLM audit");
+});

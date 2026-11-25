@@ -143,8 +143,12 @@ export function describeToolCall(name: string, input: unknown): string {
     case "click":
       return target ? `Clicking ${short(target, 60)}` : "Clicking on screen";
     case "browser_type":
-    case "type":
-      return target ? `Typing ${short(target, 60)}` : "Typing on screen";
+    case "type": {
+      // Typed text is never rendered (it may be a password): name only the
+      // element being typed into, never the typed content itself.
+      const typeTarget = asString(record.target);
+      return typeTarget ? `Typing ${short(typeTarget, 60)}` : "Typing on screen";
+    }
     default:
       return `Calling tool: ${short(tool, 40)}`;
   }

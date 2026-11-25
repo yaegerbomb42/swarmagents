@@ -33,6 +33,7 @@ import type { AgentSession, PromptDisplay } from "../hooks/useAgentSession";
 import type { ThreadEntry } from "../../../lib/client/thread";
 import { describeRunFailure } from "../../../lib/client/thread";
 import { buildConversation } from "../../../lib/client/conversation";
+import { aggregateTokenBudget } from "../../../lib/client/tokenBudget";
 import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
 import { useStickToBottom } from "../../../lib/client/useStickToBottom";
 import {
@@ -55,6 +56,7 @@ import {
 import { taskLinkForRun, type TaskRunLink, type TaskRunLinks } from "../../../lib/client/board";
 import { cn } from "../utils/cn";
 import { Button, Loading, Notice, StatusBadge } from "./ui";
+import { ContextMeterPill } from "./ContextMeterPill";
 import { EmptyState } from "./brand/EmptyState";
 import { RunReportCard } from "./RunReportCard";
 import { HandoffCard } from "./dashboard/HandoffCard";
@@ -484,6 +486,19 @@ const Turn = React.memo(function Turn({
   const meta = RUN_PHASE_META[phase];
   const failure = meta.active ? null : describeRunFailure(entry);
   const terminal = phase === "finished" || phase === "error" || phase === "cancelled";
+  // Per-turn token budget from the run's reported usage; the pill hides
+  // itself when the provider reported no usage.
+  const tokenBudget = useMemo(
+    () =>
+      aggregateTokenBudget([
+        {
+          inputTokens: entry.tokensIn,
+          outputTokens: entry.tokensOut,
+          cachedTokens: entry.tokensCached,
+        },
+      ]),
+    [entry.tokensIn, entry.tokensOut, entry.tokensCached],
+  );
   const duration =
     entry.finishedAt !== undefined && entry.finishedAt >= entry.createdAt
       ? formatDuration(entry.finishedAt - entry.createdAt)
@@ -538,6 +553,7 @@ const Turn = React.memo(function Turn({
             <span className="min-w-0 max-w-full flex-1 basis-40 truncate text-[13px] text-sa-fg2">{activity}</span>
           )}
           <span className="ml-auto flex items-center gap-1">
+            <ContextMeterPill budget={tokenBudget} />
             {!meta.active && (
               <span className="mr-1 hidden text-[12px] text-sa-fg3 sm:inline" title={`Run ${entry.runId}`}>
                 {formatClock(entry.createdAt)}

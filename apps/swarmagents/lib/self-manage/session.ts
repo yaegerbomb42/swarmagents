@@ -131,7 +131,9 @@ export class SelfManageSession {
       for (const server of role.mcpServers) if (server in ROLE_MCP_SERVER_REGISTRY) mcp.add(server);
     }
     for (const id of opts.manifestMcpIds ?? []) {
-      if (id in ROLE_MCP_SERVER_REGISTRY) mcp.add(id);
+      if (id in ROLE_MCP_SERVER_REGISTRY || id.startsWith("lib-") || id.startsWith("custom-") || id === "tool-forge") {
+        mcp.add(id);
+      }
     }
     this.ceiling = ceiling;
     this.mcpAllowlist = mcp;
@@ -235,7 +237,10 @@ export class SelfManageSession {
 
   private connectMcp(serverId: string, why?: string): MetaResult {
     const id = serverId.trim();
-    if (!(id in ROLE_MCP_SERVER_REGISTRY)) return this.fail("connect_mcp", "unknown MCP server", why);
+    const knownDynamic = id.startsWith("lib-") || id.startsWith("custom-") || id === "tool-forge";
+    if (!(id in ROLE_MCP_SERVER_REGISTRY) && !knownDynamic) {
+      return this.fail("connect_mcp", "unknown MCP server", why);
+    }
     if (!this.mcpAllowlist.has(id)) return this.fail("connect_mcp", "MCP server is not allowlisted for this run", why);
     this.connectedMcp.add(id);
     if (!this.allowlist.includes(`mcp__${id}__*`)) this.allowlist = [...this.allowlist, `mcp__${id}__*`];

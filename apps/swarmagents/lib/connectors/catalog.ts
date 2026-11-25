@@ -1,6 +1,11 @@
+import { CONNECTORS, type ConnectorEntry } from "../library/catalog";
 import type { SecretKind } from "../secrets/allowlist";
 
-export type ConnectorCategory = "code-cloud" | "search-data";
+export type ConnectorCategory =
+  | "code-cloud"
+  | "search-data"
+  | "apps-productivity"
+  | "design-files";
 
 export interface ConnectorFieldSpec {
   key: string;
@@ -41,9 +46,11 @@ export const CONNECTOR_CATEGORIES: ReadonlyArray<{ id: "all" | ConnectorCategory
   { id: "all", label: "All" },
   { id: "code-cloud", label: "Code & Cloud" },
   { id: "search-data", label: "Search & Data" },
+  { id: "apps-productivity", label: "Apps & Productivity" },
+  { id: "design-files", label: "Design & Files" },
 ];
 
-export const CONNECTOR_CATALOG: readonly ConnectorCatalogEntry[] = [
+const CORE_CONNECTORS: readonly ConnectorCatalogEntry[] = [
   {
     id: "github",
     name: "GitHub",
@@ -255,6 +262,77 @@ export const CONNECTOR_CATALOG: readonly ConnectorCatalogEntry[] = [
     libraryConnectorId: "git",
     fields: [],
   },
+];
+
+const LIBRARY_CATEGORY_MAP: Record<string, ConnectorCategory> = {
+  dev: "code-cloud",
+  cloud: "code-cloud",
+  browser: "code-cloud",
+  search: "search-data",
+  data: "search-data",
+  communication: "apps-productivity",
+  productivity: "apps-productivity",
+  finance: "apps-productivity",
+  design: "design-files",
+  files: "design-files",
+};
+
+const CATEGORY_ACCENTS: Record<ConnectorCategory, string> = {
+  "code-cloud": "#38bdf8",
+  "search-data": "#818cf8",
+  "apps-productivity": "#f59e0b",
+  "design-files": "#ec4899",
+};
+
+function projectLibraryConnector(entry: ConnectorEntry): ConnectorCatalogEntry {
+  const category = LIBRARY_CATEGORY_MAP[entry.category] ?? "code-cloud";
+  const isZeroKey = entry.requiredFields.length === 0 && (entry.auth === "none" || !entry.auth);
+  const badges: string[] = ["MCP"];
+  if (isZeroKey) {
+    badges.push("1-Click", "Zero Key");
+  } else if (entry.auth === "oauth") {
+    badges.push("OAuth / Token");
+  }
+  if (entry.tools.length > 0) {
+    badges.push(`${entry.tools.length} Tools`);
+  }
+  const unlocks =
+    entry.tools.length > 0
+      ? `${entry.tools.slice(0, 6).join(", ")}${entry.tools.length > 6 ? `, +${entry.tools.length - 6} more` : ""} MCP tools inside agent VMs.`
+      : `${entry.name} (${entry.transport.toUpperCase()}) MCP tools seeded into agent VM runs.`;
+
+  return {
+    id: entry.id,
+    name: entry.name,
+    vendor: entry.category.charAt(0).toUpperCase() + entry.category.slice(1),
+    category,
+    description: entry.description || `${entry.name} MCP integration.`,
+    unlocks,
+    badges,
+    ...(isZeroKey ? { isFree: true } : {}),
+    accent: CATEGORY_ACCENTS[category],
+    docsUrl: entry.sourceUrl ?? "https://modelcontextprotocol.io/docs",
+    ...(entry.requiredFields[0]?.helpUrl ? { keyHelpUrl: entry.requiredFields[0].helpUrl } : {}),
+    libraryConnectorId: entry.id,
+    fields: entry.requiredFields.map((field) => ({
+      key: field.key,
+      label: field.label,
+      secret: field.secret,
+      required: true,
+      ...(field.helpUrl ? { helpUrl: field.helpUrl } : {}),
+    })),
+  };
+}
+
+const coveredIds = new Set<string>();
+for (const core of CORE_CONNECTORS) {
+  coveredIds.add(core.id);
+  if (core.libraryConnectorId) coveredIds.add(core.libraryConnectorId);
+}
+
+export const CONNECTOR_CATALOG: readonly ConnectorCatalogEntry[] = [
+  ...CORE_CONNECTORS,
+  ...CONNECTORS.filter((entry) => !coveredIds.has(entry.id)).map(projectLibraryConnector),
 ];
 
 export function findCatalogConnector(id: string): ConnectorCatalogEntry | null {

@@ -18,6 +18,11 @@ with that branch name. The board verifies the branch exists on origin before acc
 (set `SWARM_GIT_REMOTE_CHECK=0` on the server to skip the check). A submission naming an unpushed branch is
 rejected with a clear error; re-submit after pushing.
 
+> **Production note:** the server currently runs with `SWARM_GIT_REMOTE_CHECK=0` in `.env.v2`
+> (set 2026-11-24). The server's working directory is not a git checkout, so the remote check cannot
+> run — submission is `ok` even though the branch-name check is skipped, so it is still mandatory to push
+> before you submit. Workers must keep pushing the branch before `submit_task_work`.
+
 ## Grok Bot and Muse coordination
 - Every piece of work is a board task. Claim it before you start, so the two agents never pick up the same task.
 - Agent names: Grok Bot's workers use their own names; Muse claims as `Muse`.

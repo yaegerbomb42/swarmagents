@@ -1,14 +1,18 @@
 /**
  * In-VM Tool Forge MCP server (lib/harness/tool-forge-mcp.ts).
  *
- * Exposes four token-frugal tools inside every user VM:
+ * Exposes token-frugal tools inside every user VM:
  *   - search_mcp_catalog(query, limit) — searches the compact connector catalog
  *   - search_online_skills(query, source, limit) — searches 900+ online SKILL.md repos
  *   - install_online_skill(id) — installs an online SKILL.md into /workspace/.claude/skills
- *   - author_tool(id, name, description, runtime, code, testArgs) — writes,
- *     secret-scans, syntax-checks, smoke-tests, and registers custom tools/MCPs
- *   - list_my_tools() — lists custom tools and active VM MCP servers
- *   - manage_mcp(action, id) — inspect, enable, or disable custom MCP tools
+ *   - author_tool(id, name, description, runtime, code, testArgs, inputSchema, env) — writes,
+ *     secret-scans, syntax-checks, smoke-tests, and registers custom tools/MCPs, with
+ *     optional JSON Schema validation of call arguments and secret-safe env binding
+ *     (env names only — values are never read, stored, or echoed)
+ *   - register_mcp(id, name, description, transport, command, args, url) — registers an
+ *     existing stdio (npx/uvx/node) or remote HTTP MCP server in the VM's mcp.json
+ *   - list_my_tools() — lists custom tools, registered MCP servers, and active VM MCP servers
+ *   - manage_mcp(action, id) — inspect, enable, disable, unregister, or remove custom MCPs
  *
  * Dependency-free (Node builtins only) so it runs inside any VM container or host.
  */
@@ -61,6 +65,105 @@ function containsSecret(text) {
   return SECRET_PATTERNS.some((re) => re.test(text));
 }
 
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+const SCHEMA_PROP_TYPES = ["string", "number", "integer", "boolean", "array", "object"];
+const SCHEMA_PROP_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+const ENV_NAME_RE = /^[A-Z][A-Z0-9_]{1,63}$/;
+const BASE_ENV_NAMES = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER", "SHELL"];
+const MAX_SCHEMA_BYTES = 8 * 1024;
+
+// Validate a caller-supplied JSON Schema for a custom tool's inputs. Only the
+// safe object-shaped subset is accepted: type "object", a properties map of
+// primitive-typed props, and required ⊆ properties. Returns an error string
+// or null. The schema is never executed — it is only checked and stored.
+function validateInputSchema(schema) {
+  if (!isPlainObject(schema)) return "inputSchema must be a JSON object.";
+  if (Buffer.byteLength(JSON.stringify(schema), "utf8") > MAX_SCHEMA_BYTES) return "inputSchema must be <= 8 KB.";
+  const keys = Object.keys(schema);
+  for (const k of keys) {
+    if (!["type", "properties", "required", "description"].includes(k)) return "inputSchema: unsupported top-level key '" + k + "'.";
+  }
+  if (schema.type !== undefined && schema.type !== "object") return "inputSchema.type must be 'object'.";
+  if (schema.description !== undefined && typeof schema.description !== "string") return "inputSchema.description must be a string.";
+  const props = schema.properties === undefined ? {} : schema.properties;
+  if (!isPlainObject(props)) return "inputSchema.properties must be an object.";
+  for (const [name, prop] of Object.entries(props)) {
+    if (!SCHEMA_PROP_NAME_RE.test(name)) return "inputSchema: invalid property name '" + name + "'.";
+    if (!isPlainObject(prop)) return "inputSchema: property '" + name + "' must be an object.";
+    for (const pk of Object.keys(prop)) {
+      if (!["type", "description", "enum"].includes(pk)) return "inputSchema: property '" + name + "' has unsupported key '" + pk + "'.";
+    }
+    if (prop.type !== undefined && !SCHEMA_PROP_TYPES.includes(prop.type)) return "inputSchema: property '" + name + "' has unsupported type.";
+    if (prop.description !== undefined && typeof prop.description !== "string") return "inputSchema: property '" + name + "' description must be a string.";
+    if (prop.enum !== undefined) {
+      if (!Array.isArray(prop.enum) || prop.enum.length === 0 || prop.enum.length > 50) return "inputSchema: property '" + name + "' enum must be a non-empty array (<= 50).";
+      for (const v of prop.enum) {
+        if (v !== null && !["string", "number", "boolean"].includes(typeof v)) return "inputSchema: property '" + name + "' enum values must be string/number/boolean.";
+      }
+    }
+  }
+  if (schema.required !== undefined) {
+    if (!Array.isArray(schema.required)) return "inputSchema.required must be an array.";
+    for (const r of schema.required) {
+      if (typeof r !== "string" || !(r in props)) return "inputSchema.required must name declared properties.";
+    }
+  }
+  return null;
+}
+
+// Validate call arguments against a stored input schema. Returns an error
+// string or null. Unknown extra properties are allowed (MCP clients often
+// pass them); missing required props and wrong primitive types are rejected
+// before the tool script ever runs.
+function validateArgsAgainstSchema(schema, args) {
+  if (!schema) return null;
+  const props = isPlainObject(schema.properties) ? schema.properties : {};
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  for (const r of required) {
+    if (args[r] === undefined) return "Missing required argument '" + r + "'.";
+  }
+  for (const [name, value] of Object.entries(args)) {
+    const prop = props[name];
+    if (!prop || prop.type === undefined) continue;
+    const t = prop.type;
+    if (t === "string" && typeof value !== "string") return "Argument '" + name + "' must be a string.";
+    if (t === "number" && typeof value !== "number") return "Argument '" + name + "' must be a number.";
+    if (t === "integer" && (typeof value !== "number" || !Number.isInteger(value))) return "Argument '" + name + "' must be an integer.";
+    if (t === "boolean" && typeof value !== "boolean") return "Argument '" + name + "' must be a boolean.";
+    if (t === "array" && !Array.isArray(value)) return "Argument '" + name + "' must be an array.";
+    if (t === "object" && !isPlainObject(value)) return "Argument '" + name + "' must be an object.";
+    if (Array.isArray(prop.enum) && !prop.enum.includes(value)) return "Argument '" + name + "' must be one of: " + prop.enum.join(", ") + ".";
+  }
+  return null;
+}
+
+// Validate secret-safe env bindings: NAMES only, never values. The agent
+// declares which host env vars the tool may see; values are resolved at run
+// time from the wrapper's own process env and are never stored, logged, or
+// echoed. Returns an error string or null.
+function validateEnvNames(env) {
+  if (env === undefined) return null;
+  if (!Array.isArray(env)) return "env must be an array of variable names.";
+  if (env.length > 10) return "env may bind at most 10 variables.";
+  const seen = new Set();
+  for (const name of env) {
+    if (typeof name !== "string" || !ENV_NAME_RE.test(name)) return "env: invalid variable name '" + String(name) + "'.";
+    if (seen.has(name)) return "env: duplicate variable '" + name + "'.";
+    seen.add(name);
+  }
+  return null;
+}
+
+function removeAtlasEntry(entryId) {
+  const atlas = readJson(ATLAS_PATH, null);
+  if (!atlas || typeof atlas !== "object" || !Array.isArray(atlas.entries)) return;
+  const kept = atlas.entries.filter((e) => !e || e.id !== entryId);
+  if (kept.length !== atlas.entries.length) writeJsonAtomic(ATLAS_PATH, { ...atlas, entries: kept });
+}
+
 function scoreMatch(item, tokens) {
   const hay = (item.id + " " + item.name + " " + item.category + " " + item.summary).toLowerCase();
   let score = 0;
@@ -108,6 +211,8 @@ function runnerFor(runtime) {
 
 function buildWrapperSource(spec) {
   const runner = runnerFor(spec.runtime);
+  const schema = spec.inputSchema || { type: "object", properties: { input: { type: "string" } } };
+  const allowedEnv = Array.isArray(spec.env) ? spec.env : [];
   return [
     'import { execFileSync } from "node:child_process";',
     'import readline from "node:readline";',
@@ -115,8 +220,40 @@ function buildWrapperSource(spec) {
     "const TOOL_DESC = " + JSON.stringify(spec.description) + ";",
     "const RUNNER = " + JSON.stringify(runner) + ";",
     "const SCRIPT = " + JSON.stringify(spec.scriptPath) + ";",
-    'const TOOLS = [{ name: TOOL_NAME, description: TOOL_DESC, inputSchema: { type: "object", properties: { input: { type: "string" } } } }];',
-    'function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\n"); }',
+    "const INPUT_SCHEMA = " + JSON.stringify(schema) + ";",
+    "const ALLOWED_ENV = " + JSON.stringify(allowedEnv) + ";",
+    "const BASE_ENV = " + JSON.stringify(BASE_ENV_NAMES) + ";",
+    'const TOOLS = [{ name: TOOL_NAME, description: TOOL_DESC, inputSchema: INPUT_SCHEMA }];',
+    'function send(msg) { process.stdout.write(JSON.stringify(msg) + "\\\\n"); }',
+    "function isPlainObject(v) { return v !== null && typeof v === 'object' && !Array.isArray(v); }",
+    "function validateArgs(args) {",
+    "  const props = INPUT_SCHEMA && isPlainObject(INPUT_SCHEMA.properties) ? INPUT_SCHEMA.properties : {};",
+    "  const required = Array.isArray(INPUT_SCHEMA && INPUT_SCHEMA.required) ? INPUT_SCHEMA.required : [];",
+    "  for (const r of required) { if (args[r] === undefined) return 'Missing required argument ' + JSON.stringify(r) + '.'; }",
+    "  for (const [name, value] of Object.entries(args)) {",
+    "    const prop = props[name];",
+    "    if (!prop || prop.type === undefined) continue;",
+    "    const t = prop.type;",
+    "    if (t === 'string' && typeof value !== 'string') return 'Argument ' + JSON.stringify(name) + ' must be a string.';",
+    "    if (t === 'number' && typeof value !== 'number') return 'Argument ' + JSON.stringify(name) + ' must be a number.';",
+    "    if (t === 'integer' && (typeof value !== 'number' || !Number.isInteger(value))) return 'Argument ' + JSON.stringify(name) + ' must be an integer.';",
+    "    if (t === 'boolean' && typeof value !== 'boolean') return 'Argument ' + JSON.stringify(name) + ' must be a boolean.';",
+    "    if (t === 'array' && !Array.isArray(value)) return 'Argument ' + JSON.stringify(name) + ' must be an array.';",
+    "    if (t === 'object' && !isPlainObject(value)) return 'Argument ' + JSON.stringify(name) + ' must be an object.';",
+    "    if (Array.isArray(prop.enum) && !prop.enum.includes(value)) return 'Argument ' + JSON.stringify(name) + ' must be one of: ' + prop.enum.join(', ') + '.';",
+    "  }",
+    "  return null;",
+    "}",
+    "// Secret-safe env: the tool script sees ONLY the base set plus the",
+    "// explicitly bound names — never the wrapper's full process env, so a",
+    "// secret the agent did not bind cannot leak into a custom tool.",
+    "function childEnv(inputStr) {",
+    "  const env = { SWARM_TOOL_INPUT: inputStr };",
+    "  for (const name of [...BASE_ENV, ...ALLOWED_ENV]) {",
+    "    if (process.env[name] !== undefined) env[name] = process.env[name];",
+    "  }",
+    "  return env;",
+    "}",
     "function handle(msg) {",
     '  if (!msg || typeof msg.method !== "string") return;',
     "  const id = msg.id ?? null;",
@@ -126,9 +263,11 @@ function buildWrapperSource(spec) {
     '  if (msg.method !== "tools/call") { send({ jsonrpc: "2.0", id, error: { code: -32601, message: "method not found" } }); return; }',
     "  const params = msg.params && typeof msg.params === 'object' ? msg.params : {};",
     "  const args = params.arguments && typeof params.arguments === 'object' ? params.arguments : {};",
+    "  const argErr = validateArgs(args);",
+    '  if (argErr) { send({ jsonrpc: "2.0", id, error: { code: -32602, message: argErr } }); return; }',
     '  const inputStr = typeof args.input === "string" ? args.input : JSON.stringify(args);',
     "  try {",
-    '    const out = execFileSync(RUNNER, [SCRIPT, inputStr], { encoding: "utf8", timeout: 30000, maxBuffer: 512 * 1024, env: { ...process.env, SWARM_TOOL_INPUT: inputStr } });',
+    '    const out = execFileSync(RUNNER, [SCRIPT, inputStr], { encoding: "utf8", timeout: 30000, maxBuffer: 512 * 1024, env: childEnv(inputStr) });',
     '    send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: out || "(ok)" }] } });',
     "  } catch (err) {",
     '    send({ jsonrpc: "2.0", id, error: { code: -32000, message: String(err && err.message ? err.message : err).slice(0, 1500) } });',
@@ -179,6 +318,17 @@ function authorTool(args) {
   if (runtime !== "node" && runtime !== "python" && runtime !== "bash") return { ok: false, message: "Runtime must be node, python, or bash." };
   if (!code.trim() || Buffer.byteLength(code, "utf8") > MAX_CODE_BYTES) return { ok: false, message: "Code must be non-empty and <= 64 KB." };
   if (containsSecret(code)) return { ok: false, message: "Refusing code containing hardcoded secret credentials; read from process.env instead." };
+  const inputSchema = args.inputSchema === undefined ? null : args.inputSchema;
+  const schemaErr = inputSchema === null ? null : validateInputSchema(inputSchema);
+  if (schemaErr) return { ok: false, message: "Invalid inputSchema: " + schemaErr };
+  const envErr = validateEnvNames(args.env);
+  if (envErr) return { ok: false, message: "Invalid env binding: " + envErr };
+  const envNames = Array.isArray(args.env) ? [...args.env] : [];
+  const existingManifest = readJson(MANIFEST_PATH, { tools: [] });
+  const existingServers = Array.isArray(existingManifest.servers) ? existingManifest.servers : [];
+  if (existingServers.some((s) => s && s.id === id)) {
+    return { ok: false, message: "Id '" + id + "' is already registered as an MCP server; pick a different id or unregister it first." };
+  }
 
   const dir = path.join(CUSTOM_DIR, id);
   fs.mkdirSync(dir, { recursive: true });
@@ -205,14 +355,16 @@ function authorTool(args) {
     }
   }
 
-  fs.writeFileSync(wrapperPath, buildWrapperSource({ id, description, runtime, scriptPath }), "utf8");
+  fs.writeFileSync(wrapperPath, buildWrapperSource({ id, description, runtime, scriptPath, inputSchema, env: envNames }), "utf8");
 
   const manifest = readJson(MANIFEST_PATH, { tools: [] });
   const tools = Array.isArray(manifest.tools) ? manifest.tools.filter((t) => t && t.id !== id) : [];
   const serverName = "custom-" + id;
   const record = { id, name, description, runtime, scriptPath, wrapperPath, serverName, enabled: true, updatedAt: Date.now() };
+  if (inputSchema !== null) record.inputSchema = inputSchema;
+  if (envNames.length > 0) record.env = envNames;
   tools.push(record);
-  writeJsonAtomic(MANIFEST_PATH, { tools });
+  writeJsonAtomic(MANIFEST_PATH, { tools, servers: Array.isArray(manifest.servers) ? manifest.servers : [] });
 
   syncMcpEntry(serverName, { type: "stdio", command: "node", args: [wrapperPath] }, true);
   updateAtlasEntry({
@@ -226,18 +378,100 @@ function authorTool(args) {
 
   return {
     ok: true,
-    text: "Tool '" + id + "' authored, verified, and registered as MCP '" + serverName + "'." + (smokeOut ? " Smoke output: " + smokeOut : ""),
+    text: "Tool '" + id + "' authored, verified, and registered as MCP '" + serverName + "'." +
+      (inputSchema !== null ? " Input schema validated (" + Object.keys(inputSchema.properties || {}).length + " props)." : "") +
+      (envNames.length > 0 ? " Env bound (names only): " + envNames.join(", ") + "." : "") +
+      (smokeOut ? " Smoke output: " + smokeOut : ""),
   };
+}
+
+const MCP_COMMANDS = ["npx", "uvx", "node"];
+const PKG_RE = /^(@[a-z0-9][a-z0-9._-]*\\/)?[a-z0-9][a-z0-9._-]*(@[a-z0-9][a-z0-9._-]+)?$/;
+// NB: no raw backtick may appear inside this file's template literal (it
+// would terminate it, and the bundler unescapes hex/unicode backtick
+// escapes when emitting the chunk). The backtick is built via fromCharCode.
+const ARG_BAD_RE = /[\\r\\n;|&$\\\\]/;
+function argHasBadChar(a) {
+  return ARG_BAD_RE.test(a) || a.indexOf(String.fromCharCode(96)) !== -1;
+}
+
+function validHttpUrl(u) {
+  try {
+    const parsed = new URL(u);
+    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1"))) return false;
+    if (parsed.username || parsed.password) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Register an existing MCP server (a published npx/uvx package, a node script
+// under /workspace/.swarm, or a remote HTTPS endpoint) in the VM's mcp.json.
+// No secrets are accepted here: stdio servers inherit the host process env
+// and HTTP servers must carry no credentials in the URL. The server id shares
+// the custom-* namespace with authored tools, so collisions are rejected.
+function registerMcp(args) {
+  const id = String(args.id || "").trim().toLowerCase();
+  const name = String(args.name || "").trim();
+  const description = String(args.description || "").trim();
+  const transport = String(args.transport || "").trim().toLowerCase();
+  if (!SLUG_RE.test(id)) return { ok: false, message: "Invalid id (2-49 lowercase a-z0-9_-)." };
+  if (name.length < 2 || name.length > 80) return { ok: false, message: "Name must be 2-80 chars." };
+  if (description.length < 6 || description.length > 280) return { ok: false, message: "Description must be 6-280 chars." };
+  if (transport !== "stdio" && transport !== "http") return { ok: false, message: "transport must be stdio or http." };
+
+  let entry;
+  if (transport === "stdio") {
+    const command = String(args.command || "").trim();
+    const cmdArgs = args.args;
+    if (!MCP_COMMANDS.includes(command)) return { ok: false, message: "command must be npx, uvx, or node." };
+    if (!Array.isArray(cmdArgs) || cmdArgs.length === 0 || cmdArgs.length > 20) return { ok: false, message: "args must be a non-empty array (<= 20)." };
+    for (const a of cmdArgs) {
+      if (typeof a !== "string" || a.length === 0 || a.length > 256 || argHasBadChar(a)) return { ok: false, message: "args must be plain strings without shell metacharacters." };
+    }
+    if ((command === "npx" || command === "uvx") && !PKG_RE.test(cmdArgs[0])) return { ok: false, message: "First arg for npx/uvx must be a package name (optionally @scope/name@version)." };
+    if (command === "node" && !cmdArgs[0].startsWith("/workspace/.swarm/")) return { ok: false, message: "node servers must run a script under /workspace/.swarm/." };
+    entry = { type: "stdio", command, args: cmdArgs };
+  } else {
+    const url = String(args.url || "").trim();
+    if (!validHttpUrl(url)) return { ok: false, message: "url must be https (or http://localhost) with no embedded credentials." };
+    if (args.command !== undefined || args.args !== undefined) return { ok: false, message: "http servers take url only, not command/args." };
+    entry = { type: "http", url };
+  }
+
+  const manifest = readJson(MANIFEST_PATH, { tools: [] });
+  const tools = Array.isArray(manifest.tools) ? manifest.tools : [];
+  const servers = Array.isArray(manifest.servers) ? manifest.servers : [];
+  if (tools.some((t) => t && t.id === id)) return { ok: false, message: "Id '" + id + "' is already an authored tool; pick a different id." };
+  if (servers.some((s) => s && s.id === id)) return { ok: false, message: "MCP server '" + id + "' is already registered; unregister it first to replace it." };
+
+  const serverName = "custom-" + id;
+  const record = { id, name, description, transport, serverName, entry, enabled: true, updatedAt: Date.now() };
+  servers.push(record);
+  writeJsonAtomic(MANIFEST_PATH, { tools, servers });
+  syncMcpEntry(serverName, entry, true);
+  updateAtlasEntry({
+    id: "custom-mcp:" + id,
+    kind: "mcp_server",
+    name: name + " (" + id + ")",
+    summary: "[REGISTERED] " + description,
+    risk: transport === "http" ? "network" : "writes-files",
+    source: serverName,
+  });
+  return { ok: true, text: "MCP server '" + id + "' registered as '" + serverName + "' (" + transport + ")." };
 }
 
 function listMyTools() {
   const manifest = readJson(MANIFEST_PATH, { tools: [] });
   const custom = Array.isArray(manifest.tools) ? manifest.tools : [];
+  const servers = Array.isArray(manifest.servers) ? manifest.servers : [];
   const cfg = readJson(MCP_CONFIG_PATH, { mcpServers: {} });
   const activeServers = cfg && cfg.mcpServers ? Object.keys(cfg.mcpServers) : [];
   const lines = [
     "Active MCP servers (" + activeServers.length + "): " + activeServers.join(", "),
     "Authored custom tools (" + custom.length + "): " + (custom.length ? custom.map((t) => t.id + "[" + (t.enabled ? "on" : "off") + "]").join(", ") : "none"),
+    "Registered MCP servers (" + servers.length + "): " + (servers.length ? servers.map((s) => s.id + "[" + (s.enabled ? "on" : "off") + ":" + s.transport + "]").join(", ") : "none"),
   ];
   return lines.join("\\n");
 }
@@ -248,20 +482,46 @@ function manageMcp(args) {
   if (!id) return { ok: false, message: "id is required." };
   const manifest = readJson(MANIFEST_PATH, { tools: [] });
   const tools = Array.isArray(manifest.tools) ? manifest.tools : [];
-  const target = tools.find((t) => t && t.id === id);
-  if (!target) return { ok: false, message: "Custom tool '" + id + "' not found in manifest." };
+  const servers = Array.isArray(manifest.servers) ? manifest.servers : [];
+  const tool = tools.find((t) => t && t.id === id);
+  const server = servers.find((s) => s && s.id === id);
+  if (!tool && !server) return { ok: false, message: "Custom tool or MCP server '" + id + "' not found in manifest." };
   if (action === "inspect") {
-    return { ok: true, text: JSON.stringify(target, null, 2) };
+    return { ok: true, text: JSON.stringify(tool || server, null, 2) };
   }
   if (action === "enable" || action === "disable") {
     const enable = action === "enable";
-    target.enabled = enable;
-    target.updatedAt = Date.now();
-    writeJsonAtomic(MANIFEST_PATH, { tools });
-    syncMcpEntry(target.serverName, { type: "stdio", command: "node", args: [target.wrapperPath] }, enable);
-    return { ok: true, text: "Custom MCP '" + target.serverName + "' " + (enable ? "enabled" : "disabled") + "." };
+    if (tool) {
+      tool.enabled = enable;
+      tool.updatedAt = Date.now();
+      writeJsonAtomic(MANIFEST_PATH, { tools, servers });
+      syncMcpEntry(tool.serverName, { type: "stdio", command: "node", args: [tool.wrapperPath] }, enable);
+      return { ok: true, text: "Custom MCP '" + tool.serverName + "' " + (enable ? "enabled" : "disabled") + "." };
+    }
+    server.enabled = enable;
+    server.updatedAt = Date.now();
+    writeJsonAtomic(MANIFEST_PATH, { tools, servers });
+    syncMcpEntry(server.serverName, server.entry, enable);
+    return { ok: true, text: "Registered MCP '" + server.serverName + "' " + (enable ? "enabled" : "disabled") + "." };
   }
-  return { ok: false, message: "action must be inspect, enable, or disable." };
+  if (action === "unregister") {
+    if (!server) return { ok: false, message: "unregister applies to registered MCP servers; use remove for authored tools." };
+    writeJsonAtomic(MANIFEST_PATH, { tools, servers: servers.filter((s) => s && s.id !== id) });
+    syncMcpEntry(server.serverName, null, false);
+    removeAtlasEntry("custom-mcp:" + id);
+    return { ok: true, text: "Registered MCP '" + server.serverName + "' unregistered." };
+  }
+  if (action === "remove") {
+    if (!tool) return { ok: false, message: "remove applies to authored tools; use unregister for registered MCP servers." };
+    writeJsonAtomic(MANIFEST_PATH, { tools: tools.filter((t) => t && t.id !== id), servers });
+    syncMcpEntry(tool.serverName, null, false);
+    removeAtlasEntry("custom:" + id);
+    try {
+      fs.rmSync(path.dirname(tool.scriptPath), { recursive: true, force: true });
+    } catch {}
+    return { ok: true, text: "Custom tool '" + id + "' removed." };
+  }
+  return { ok: false, message: "action must be inspect, enable, disable, unregister, or remove." };
 }
 
 const TOOLS = [
@@ -303,7 +563,7 @@ const TOOLS = [
   },
   {
     name: "author_tool",
-    description: "Write, syntax-check, smoke-test, and register a custom Node/Python/Bash tool as a persistent stdio MCP server in /workspace/.swarm/custom-tools.",
+    description: "Write, syntax-check, smoke-test, and register a custom Node/Python/Bash tool as a persistent stdio MCP server in /workspace/.swarm/custom-tools. Optional inputSchema (JSON Schema object) is validated and enforced on every call; optional env (array of variable NAMES only, never values) binds host env vars secret-safely — the script sees only the base env plus bound names.",
     inputSchema: {
       type: "object",
       properties: {
@@ -313,22 +573,41 @@ const TOOLS = [
         runtime: { type: "string", enum: ["node", "python", "bash"] },
         code: { type: "string" },
         testArgs: { type: "string" },
+        inputSchema: { type: "object" },
+        env: { type: "array" },
       },
       required: ["id", "name", "description", "runtime", "code"],
     },
   },
   {
+    name: "register_mcp",
+    description: "Register an existing MCP server in the VM mcp.json: stdio via npx/uvx package or a node script under /workspace/.swarm, or a remote https (or http://localhost) endpoint. No credentials accepted — URLs must carry no userinfo and stdio servers inherit the host env.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        name: { type: "string" },
+        description: { type: "string" },
+        transport: { type: "string", enum: ["stdio", "http"] },
+        command: { type: "string", enum: ["npx", "uvx", "node"] },
+        args: { type: "array" },
+        url: { type: "string" },
+      },
+      required: ["id", "name", "description", "transport"],
+    },
+  },
+  {
     name: "list_my_tools",
-    description: "List active VM MCP servers and authored custom tools.",
+    description: "List active VM MCP servers, authored custom tools, and registered MCP servers.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "manage_mcp",
-    description: "Inspect, enable, or disable a custom authored MCP tool.",
+    description: "Inspect, enable, or disable a custom authored MCP tool or registered MCP server; unregister removes a registered server, remove deletes an authored tool.",
     inputSchema: {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["inspect", "enable", "disable"] },
+        action: { type: "string", enum: ["inspect", "enable", "disable", "unregister", "remove"] },
         id: { type: "string" },
       },
       required: ["action", "id"],
@@ -496,6 +775,12 @@ async function handleMessage(msg) {
   }
   if (params.name === "author_tool") {
     const out = authorTool(args);
+    if (out.ok) sendResult(id, out.text);
+    else sendError(id, -32602, out.message);
+    return;
+  }
+  if (params.name === "register_mcp") {
+    const out = registerMcp(args);
     if (out.ok) sendResult(id, out.text);
     else sendError(id, -32602, out.message);
     return;

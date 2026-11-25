@@ -57,6 +57,62 @@ test("KeyPool settles a lease only once", () => {
   assert.equal(stat.failures, 0);
 });
 
+test("acquireMany leases distinct keys in fallback mode", () => {
+  const pool = new KeyPool("prov", ["k1", "k2", "k3"], {
+    selectionMode: "fallback",
+    now: () => 0,
+  });
+  const leases = pool.acquireMany(2);
+  assert.deepEqual(
+    leases.map((lease) => lease.id),
+    ["prov:key-1", "prov:key-2"],
+  );
+  leases.forEach((lease) => lease.cancel());
+});
+
+test("acquireMany leases distinct keys in random mode", () => {
+  const pool = new KeyPool("prov", ["k1", "k2", "k3"], {
+    selectionMode: "random",
+    random: () => 0,
+    now: () => 0,
+  });
+  const leases = pool.acquireMany(3);
+  assert.deepEqual(
+    leases.map((lease) => lease.id),
+    ["prov:key-1", "prov:key-2", "prov:key-3"],
+  );
+  leases.forEach((lease) => lease.cancel());
+});
+
+test("acquireMany skips cooling keys and recovers after the cooldown", () => {
+  let now = 1_000;
+  const pool = new KeyPool("prov", ["k1", "k2"], { now: () => now });
+  const first = pool.acquire()!;
+  first.failure({ kind: "rate_limit", status: 429 });
+
+  const leases = pool.acquireMany(2);
+  assert.deepEqual(
+    leases.map((lease) => lease.id),
+    ["prov:key-2"],
+  );
+  leases.forEach((lease) => lease.cancel());
+
+  now += 60_000;
+  const recovered = pool.acquireMany(2);
+  assert.equal(recovered.length, 2, "both keys are usable once the cooldown passes");
+  recovered.forEach((lease) => lease.cancel());
+});
+
+test("acquireMany leases settle independently", () => {
+  const pool = new KeyPool("prov", ["k1", "k2"], { now: () => 0 });
+  const [first, second] = pool.acquireMany(2);
+  first!.failure({ kind: "rate_limit", status: 429 });
+  second!.success(50);
+  const stats = pool.stats();
+  assert.equal(stats[0].failures, 1);
+  assert.equal(stats[1].successes, 1);
+});
+
 test("KeyPool never exposes key material in stats, cooldown records, or errors", () => {
   const secret = "sk-test-secret-material-123";
   const pool = new KeyPool("prov", [secret], { now: () => 0 });

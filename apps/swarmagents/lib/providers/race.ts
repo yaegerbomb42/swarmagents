@@ -24,7 +24,7 @@
 
 import { buildRequest, parseResponse, resolveModel } from "./adapters";
 import { parseRetryAfter } from "./errors";
-import type { KeyLease, KeyPool } from "./key-pool";
+import type { KeyPool } from "./key-pool";
 import type { FetchLike, ProviderConfig, ProviderErrorKind } from "./types";
 
 /** The slice of Router the race needs (Router satisfies it structurally). */
@@ -138,21 +138,11 @@ export class ProviderRaceEngine {
     }
     const resolvedModel = model ?? resolveModel(config, {});
 
-    // Acquire up to `candidates` distinct key leases. acquire() returns the
-    // best available key each time (round-robin via lastUsedTick); dedupe
-    // by slot id in case the pool holds fewer keys than requested.
-    const leases: KeyLease[] = [];
-    const seen = new Set<string>();
-    for (let n = 0; n < candidates; n++) {
-      const lease = pool.acquire();
-      if (!lease) break;
-      if (seen.has(lease.id)) {
-        lease.cancel();
-        break;
-      }
-      seen.add(lease.id);
-      leases.push(lease);
-    }
+    // Lease up to `candidates` DISTINCT keys. acquireMany() is required
+    // here: plain acquire() returns the same key on every call in
+    // "fallback" mode (and can repeat a draw in "random" mode), so a race
+    // would silently run on one key.
+    const leases = pool.acquireMany(candidates);
     if (leases.length === 0) {
       const cooling = pool.stats().filter((s) => s.cooldownUntil !== undefined).length;
       return Promise.reject(

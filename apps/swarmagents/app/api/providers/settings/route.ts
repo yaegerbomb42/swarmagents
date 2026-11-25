@@ -14,12 +14,16 @@ import { JsonBodyError, readJsonBody } from "@/lib/http";
 import {
   alwaysOn247For,
   KEY_SELECTION_MODES,
+  MAX_BEST_OF_N,
   MAX_SEARCH_KEY_CHARS,
   MAX_SYSTEM_BUDGET_TOKENS,
+  MIN_BEST_OF_N,
   MIN_SYSTEM_BUDGET_TOKENS,
   VM_PERSISTENCE_MODES,
   atlasEnabledForUser,
   autoCondenseLogsFor,
+  bestOfNFor,
+  clampBestOfN,
   codebaseContextInjectionEnabled,
   contextPackerModeFor,
   isKeySelectionMode,
@@ -52,6 +56,8 @@ function publicSettings(settings: UserSettings): Record<string, unknown> {
     keySelectionMode: keySelectionModeFor(settings),
     vmPersistenceMode: vmPersistenceModeFor(settings),
     alwaysOn247: alwaysOn247For(settings),
+    oraclePostRun: settings.oraclePostRun === true,
+    bestOfN: bestOfNFor(settings),
   };
   if (settings.webSearch) {
     out.webSearch = {
@@ -369,6 +375,24 @@ export async function PUT(request: NextRequest) {
     // Merge over the stored brain settings so toggling `enabled` from the UI
     // does not wipe thresholds a user set through the API.
     patch.decisionBrain = { ...readUserSettings(owner).decisionBrain, ...brainPatch };
+  }
+
+  if ("oraclePostRun" in input) {
+    if (typeof input.oraclePostRun !== "boolean") {
+      return NextResponse.json({ error: "oraclePostRun must be a boolean." }, { status: 400 });
+    }
+    patch.oraclePostRun = input.oraclePostRun;
+  }
+  if ("bestOfN" in input) {
+    const value = input.bestOfN;
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      return NextResponse.json(
+        { error: `bestOfN must be a number between ${MIN_BEST_OF_N} and ${MAX_BEST_OF_N}.` },
+        { status: 400 },
+      );
+    }
+    // Clamp instead of rejecting: a client asking for 8 gets the ceiling.
+    patch.bestOfN = clampBestOfN(value);
   }
 
   if (Object.keys(patch).length === 0) {

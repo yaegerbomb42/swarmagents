@@ -82,6 +82,16 @@ export interface UserSettings {
    * search over 40+ connectors and custom VM tools). Absent = on.
    */
   enableAtlas?: boolean;
+  /**
+   * Run the post-run Oracle gate for this account, in addition to the
+   * SWARM_ORACLE_POST_RUN env switch. Absent = off.
+   */
+  oraclePostRun?: boolean;
+  /**
+   * Candidate patches evaluated per Best-of-N Oracle run, clamped to 1..4.
+   * Absent = 1 (a single candidate, the historical behavior).
+   */
+  bestOfN?: number;
 }
 
 /**
@@ -288,6 +298,24 @@ function parseBudget(value: unknown): number | null | undefined {
 
 export const DEFAULT_USER_SETTINGS: UserSettings = { preferFreeProviders: true };
 
+/** Bounds for the Best-of-N candidate count (one candidate per model family). */
+export const MIN_BEST_OF_N = 1;
+export const MAX_BEST_OF_N = 4;
+
+/** The Best-of-N candidate count when a user has not chosen one. */
+export const DEFAULT_BEST_OF_N = 1;
+
+/** Clamp a Best-of-N candidate count into 1..4; invalid values fall back to the default. */
+export function clampBestOfN(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_BEST_OF_N;
+  return Math.min(MAX_BEST_OF_N, Math.max(MIN_BEST_OF_N, Math.floor(value)));
+}
+
+/** The Best-of-N candidate count for one user's settings (absent = 1). */
+export function bestOfNFor(settings: UserSettings): number {
+  return clampBestOfN(settings.bestOfN);
+}
+
 /** Is the codebase context pack injected into this account's runs? */
 export function codebaseContextInjectionEnabled(settings: UserSettings): boolean {
   return settings.injectCodebaseContext !== false;
@@ -415,6 +443,8 @@ export function parseUserSettings(raw: unknown): UserSettings {
   const decisionBrain = parseDecisionBrain(raw.decisionBrain);
   if (decisionBrain !== undefined) out.decisionBrain = decisionBrain;
   if (typeof raw.enableAtlas === "boolean") out.enableAtlas = raw.enableAtlas;
+  if (typeof raw.oraclePostRun === "boolean") out.oraclePostRun = raw.oraclePostRun;
+  if (typeof raw.bestOfN === "number" && Number.isFinite(raw.bestOfN)) out.bestOfN = clampBestOfN(raw.bestOfN);
   return out;
 }
 

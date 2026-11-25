@@ -3238,7 +3238,10 @@ export class RuntimeManager {
     const approvalEnv = hookBaseUrl && runToken ? approvalHookEnv(hookBaseUrl, runToken) : {};
     const approvalHook = Object.keys(approvalEnv).length > 0;
     const verificationEnabled = isShadowVerificationEnabled();
-    const postRunGateEnabled = verificationEnabled || isOraclePostRunEnabled();
+    // The Oracle gate runs when the env switch is on or the account opted in
+    // through Settings (oraclePostRun).
+    const oraclePostRun = isOraclePostRunEnabled() || readUserSettings(userId).oraclePostRun === true;
+    const postRunGateEnabled = verificationEnabled || oraclePostRun;
 
     if (isRunProviderPoolEnabled()) {
       if (!router) {
@@ -3629,7 +3632,7 @@ export class RuntimeManager {
   private async runPostRunOracle(
     active: ActiveRun,
   ): Promise<{ summary: ShadowVerificationSummary; rejected: boolean } | undefined> {
-    if (!isOraclePostRunEnabled()) return undefined;
+    if (!isOraclePostRunEnabled() && readUserSettings(active.userId).oraclePostRun !== true) return undefined;
     let isolatedRoot: string | undefined;
     let worktreeGitRoot: string | undefined;
     const exec = this.shadowExecFor(active.userId);

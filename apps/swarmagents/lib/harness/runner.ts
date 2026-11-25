@@ -65,6 +65,7 @@ import {
   ContextGovernor,
   StateLedger,
   resolveContextPacker,
+  summarizeTurnResult,
   systemExtrasFrom,
   toPackedRunRequest,
   type ContextPackerMode,
@@ -97,9 +98,13 @@ export interface ClaudeCodeRunnerOptions {
    * request wins over this setting; a per-role default is used when neither is
    * set.
    *
-   * Honest limit: one run() is one CLI invocation and the turns happen inside
-   * the CLI, so the packer governs the invocation/resume prompt only — not
-   * turns inside the CLI.
+   * One run() is one L1 turn: the prompt is rebuilt fresh from the state
+   * ledger, the AST skeleton and the working set the caller supplies, and
+   * run() returns the updated ledger plus the files the turn edited in the
+   * outcome, so the next invocation packs from the accumulated state
+   * instead of appending history. Turns inside one CLI invocation are
+   * still the CLI's own: the packer governs the invocation prompt, and
+   * the ledger is what makes successive invocations cheap.
    */
   contextPacker?: ContextPackerMode;
   /**
@@ -138,6 +143,16 @@ export interface ClaudeCodeRunnerOptions {
 interface AppliedContextPacker {
   mode: ContextPackerMode;
   logLine: string;
+}
+
+/**
+ * L1 turn state handed back to run() so it can close the loop: the ledger
+ * this invocation packed from (mutated at the end of the run with the
+ * turn's step and error) and the turn number it packed as.
+ */
+interface AppliedL1Turn {
+  ledger: StateLedger;
+  turn: number;
 }
 
 /**
@@ -349,7 +364,11 @@ export class ClaudeCodeRunner {
    */
   async run(request: RunRequest, onEvent: (event: TelemetryEvent) => void): Promise<RunOutcome> {
     const redact = makeRedactor(request.env, request.redactSecrets);
-    const { argv, packer } = this.buildArgv(request);
+    const { argv, packer, l1 } = this.buildArgv(request);
+    /** Files this L1 turn edited (Edit/Write/NotebookEdit file paths). */
+    const editedFiles = new Set<string>();
+    /** Final `result` text of the stream, for the ledger step summary. */
+    let lastResultText: string | undefined;
     // System-1 is entirely inert when disabled: no hooks object, no await,
     // no events — the run path is byte-identical to the one without it.
     const systemOne =
@@ -475,6 +494,51 @@ export class ClaudeCodeRunner {
     };
 
     /**
+     * Close the L1 loop on this invocation's outcome: record the turn in
+     * the ledger (step summary from the final result text, last error on
+     * failure) and hand the snapshot plus the edited files back in the
+     * outcome, so the caller can pack the next turn from them. A non-L1
+     * invocation returns the outcome untouched. Runs at most once: every
+     * call site returns its result immediately.
+     */
+    const withL1 = (outcome: RunOutcome): RunOutcome => {
+      if (!l1) return outcome;
+      const { ledger, turn } = l1;
+      const failure =
+        firstErrorMessage ??
+        haltedReason ??
+        (finalMeta?.isError
+          ? `result reported an error${finalMeta.subtype ? ` (${finalMeta.subtype})` : ""}`
+          : undefined);
+      const summaryText = summarizeTurnResult(lastResultText ?? "");
+      const summary =
+        summaryText ||
+        (outcome.roleSwitch
+          ? `turn ${turn}: role switch to ${outcome.roleSwitch.toRoleId}`
+          : failure
+            ? `turn ${turn} failed: ${failure}`
+            : outcome.aborted
+              ? `turn ${turn} aborted by caller`
+              : `turn ${turn} finished (exit ${outcome.exitCode})`);
+      ledger.recordStep(turn, summary);
+      const error =
+        failure ??
+        (outcome.aborted
+          ? "run aborted by caller"
+          : outcome.exitCode !== 0
+            ? `claude exited with code ${outcome.exitCode}${
+                stderrTail.trim() ? `: ${redact(stderrTail.trim().slice(0, 500))}` : ""
+              }`
+            : undefined);
+      ledger.setError(error);
+      return {
+        ...outcome,
+        stateLedger: ledger.toJSON(),
+        ...(editedFiles.size > 0 ? { editedFiles: [...editedFiles] } : {}),
+      };
+    };
+
+    /**
      * Terminal success: the agent produced its final result. The run is
      * finished with its cost even if the process was then reaped (e.g. exit
      * 137) while a leftover background child kept stdout open — the kill of
@@ -490,7 +554,7 @@ export class ClaudeCodeRunner {
         durationMs: finalMeta?.durationMs,
         numTurns: finalMeta?.numTurns,
       });
-      return { exitCode: 0, aborted: false, malformedLines };
+      return withL1({ exitCode: 0, aborted: false, malformedLines });
     };
 
     const startRun = (init?: Record<string, unknown>) => {
@@ -549,6 +613,20 @@ export class ClaudeCodeRunner {
                 input: redactValue(input, redact),
                 id: toolId,
               });
+
+              // L1 packer: remember which files this turn edited so the
+              // caller can feed their contents back as the next turn's
+              // working set / skeleton. Only Edit, Write and NotebookEdit
+              // carry a file path; Bash edits are not tracked.
+              if (l1 && isObject(input)) {
+                const filePath =
+                  (name === "Edit" || name === "Write") && typeof input.file_path === "string"
+                    ? input.file_path
+                    : name === "NotebookEdit" && typeof input.notebook_path === "string"
+                      ? input.notebook_path
+                      : undefined;
+                if (filePath) editedFiles.add(filePath);
+              }
 
               // A Bash call that backgrounds its work will not stream output
               // into the terminal, and the run may end before the work
@@ -881,6 +959,9 @@ export class ClaudeCodeRunner {
           break;
         }
         case "result": {
+          // Keep the final result text: the L1 ledger records it as this
+          // turn's step summary (summarized by withL1 at the return site).
+          if (typeof raw.result === "string") lastResultText = raw.result;
           finalMeta = {
             sessionId: typeof raw.session_id === "string" ? raw.session_id : undefined,
             // Claude Code reports `total_cost_usd`; keep accepting the older `cost_usd`.
@@ -972,12 +1053,12 @@ export class ClaudeCodeRunner {
       // gates and return the same shape the non-throwing path returns.
       await gates.drain();
       if (pendingSwitch.phase) {
-        return {
+        return withL1({
           exitCode,
           aborted: false,
           malformedLines,
           roleSwitch: { toRoleId: pendingSwitch.phase.roleId, sessionId: lastSessionId ?? request.sessionId },
-        };
+        });
       }
       if (haltedReason !== null) {
         emit({
@@ -986,7 +1067,7 @@ export class ClaudeCodeRunner {
           exitCode,
           sessionId: lastSessionId,
         });
-        return { exitCode, aborted: false, malformedLines };
+        return withL1({ exitCode, aborted: false, malformedLines });
       }
       if (!request.signal?.aborted && finalMeta && resultSucceeded(finalMeta)) {
         return emitFinished();
@@ -998,7 +1079,7 @@ export class ClaudeCodeRunner {
         message: redact(cleaned ? cleaned : "claude exec failed"),
         sessionId: lastSessionId,
       });
-      return { exitCode, aborted: request.signal?.aborted === true, malformedLines };
+      return withL1({ exitCode, aborted: request.signal?.aborted === true, malformedLines });
     }
 
     // Flush the last partial line before gates run: a gated tool call or the
@@ -1011,17 +1092,17 @@ export class ClaudeCodeRunner {
     await gates.drain();
 
     if (pendingSwitch.phase) {
-      return {
+      return withL1({
         exitCode,
         aborted: false,
         malformedLines,
         roleSwitch: { toRoleId: pendingSwitch.phase.roleId, sessionId: lastSessionId ?? request.sessionId },
-      };
+      });
     }
 
     if (request.signal?.aborted) {
       emit({ type: "run.error", message: "Run aborted by caller.", exitCode, sessionId: lastSessionId });
-      return { exitCode, aborted: true, malformedLines };
+      return withL1({ exitCode, aborted: true, malformedLines });
     }
 
     if (haltedReason !== null) {
@@ -1031,7 +1112,7 @@ export class ClaudeCodeRunner {
         exitCode,
         sessionId: lastSessionId,
       });
-      return { exitCode, aborted: false, malformedLines };
+      return withL1({ exitCode, aborted: false, malformedLines });
     }
 
     // A trailing line without a newline is still a real line at EOF.
@@ -1056,7 +1137,7 @@ export class ClaudeCodeRunner {
         "so a successful final result could not be confirmed. Increase " +
         "SWARM_VM_AGENT_MAX_OUTPUT_BYTES or reduce tool output, then retry.";
       emit({ type: "run.error", message, exitCode, sessionId: lastSessionId });
-      return { exitCode, aborted: false, malformedLines };
+      return withL1({ exitCode, aborted: false, malformedLines });
     }
 
     if (exitCode !== 0) {
@@ -1074,7 +1155,7 @@ export class ClaudeCodeRunner {
         exitCode,
         sessionId: lastSessionId,
       });
-      return { exitCode, aborted: false, malformedLines };
+      return withL1({ exitCode, aborted: false, malformedLines });
     }
 
     if (!finalMeta) {
@@ -1084,7 +1165,7 @@ export class ClaudeCodeRunner {
         exitCode: 0,
         sessionId: lastSessionId,
       });
-      return { exitCode: 0, aborted: false, malformedLines };
+      return withL1({ exitCode: 0, aborted: false, malformedLines });
     }
 
     return emitFinished();
@@ -1233,28 +1314,33 @@ export class ClaudeCodeRunner {
     });
   }
 
-  private buildArgv(request: RunRequest): { argv: string[]; packer?: AppliedContextPacker } {
+  private buildArgv(request: RunRequest): { argv: string[]; packer?: AppliedContextPacker; l1?: AppliedL1Turn } {
     const mode = this.resolvePackerMode(request);
     let effective = request;
     let packer: AppliedContextPacker | undefined;
+    let l1: AppliedL1Turn | undefined;
     const systemPacker = request.systemPacker;
     const wantOrder = systemPacker?.cacheFriendlyOrder === true;
 
     if (mode === "l1") {
-      // One invocation, one prompt: the request prompt is the ledger goal and
-      // the agent card / role prompt / memory become the packed system header.
-      // When the caller passes a persisted snapshot (RunRequest.stateLedger),
-      // the ledger is hydrated from it so a resumed or retried run inherits
-      // its negative constraints instead of starting fresh. File windows and
-      // the AST skeleton are empty here because the runner has no filesystem
-      // view of the user's VM; a caller with file state can feed them in
-      // later. toPackedRunRequest also drops --resume: an L1 turn is
-      // stateless, so replaying the whole CLI session would defeat the budget.
+      // One invocation is one L1 turn: the prompt is rebuilt fresh from the
+      // ledger (hydrated from RunRequest.stateLedger when the caller passes
+      // a persisted snapshot, so a resumed or retried run inherits its
+      // negative constraints instead of starting fresh), the AST skeleton
+      // of the files in scope and the working set of the files being
+      // edited — all supplied by the caller, since the harness never reads
+      // files. run() records this turn into the ledger at the end of the
+      // invocation and returns the snapshot in the outcome, so the next
+      // invocation packs from the accumulated ledger. toPackedRunRequest
+      // also drops --resume: an L1 turn is stateless, so replaying the
+      // whole CLI session would defeat the budget.
+      const ledger = request.stateLedger ? StateLedger.fromJSON(request.stateLedger) : new StateLedger(request.prompt);
+      const turn = ledger.nextTurn();
       const packed = new ContextGovernor().pack({
-        turn: 0,
-        ledger: request.stateLedger ? StateLedger.fromJSON(request.stateLedger) : new StateLedger(request.prompt),
-        skeletonFiles: [],
-        workingSet: [],
+        turn,
+        ledger,
+        skeletonFiles: request.skeletonFiles ?? [],
+        workingSet: request.workingSet ?? [],
         systemExtras: wantOrder
           ? orderSystemSections(
               systemSectionsFrom({
@@ -1267,6 +1353,7 @@ export class ClaudeCodeRunner {
       });
       effective = toPackedRunRequest(request, packed);
       packer = { mode, logLine: packed.logLine };
+      l1 = { ledger, turn };
     }
 
     // Keep -p (print/non-interactive). Pass the prompt after `--` so values that
@@ -1293,7 +1380,7 @@ export class ClaudeCodeRunner {
     });
     if (appended) argv.push("--append-system-prompt", appended);
     argv.push("--", effective.prompt);
-    return { argv, packer };
+    return { argv, packer, l1 };
   }
 
   /**

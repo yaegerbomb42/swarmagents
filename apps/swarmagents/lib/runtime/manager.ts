@@ -25,6 +25,8 @@ import path from "node:path";
 import { vaultProxyEnv } from "../secrets/inject";
 import { revokeVaultToken } from "../secrets/token";
 import { ClaudeCodeRunner, isSignalKillExitCode } from "../harness/runner";
+import { contextPackerFromEnv, type StateLedgerSnapshot } from "../harness/context/contextGovernor";
+import type { SourceFile, WorkingSetItem } from "../harness/context/astSlicer";
 import { roleMaxTurns } from "../harness/role-clamps";
 import { makeRedactor } from "../harness/redact";
 import type { BrainEvent } from "../harness/decision-brain/index";
@@ -295,6 +297,13 @@ const TURN_CHECKPOINT_REASON = "turn boundary";
 /** Watchdog recoveries per stuck run before it is finalized as an error. */
 const DEFAULT_MAX_RECOVERY_ATTEMPTS = 2;
 /**
+ * L1 context packer: how many edited files the manager reads back from the
+ * VM to feed the next invocation's working set / skeleton (the governor's
+ * token budgets cap what is actually packed; these caps only bound VM I/O).
+ */
+const L1_WORKING_SET_MAX_FILES = 8;
+const L1_WORKING_SET_MAX_BYTES_PER_FILE = 64 * 1024;
+/**
  * Hard ceiling on watchdog recoveries per run, whatever the configured
  * option says: a run that keeps wedging must eventually error instead of
  * resurrecting forever.
@@ -458,6 +467,16 @@ interface ActiveRun {
    */
   memoryContext?: string;
   sessionId?: string;
+  /**
+   * L1 context packer state, carried across invocations of the same run:
+   * the accumulated state ledger (goal, steps, failures) and the files the
+   * last invocation edited. The runner returns both in its outcome;
+   * runOnce feeds them back on the next invocation so each turn packs
+   * fresh from a fixed budget instead of resuming unbounded history.
+   * In-memory only — a restored run starts fresh.
+   */
+  stateLedger?: StateLedgerSnapshot;
+  editedFiles?: string[];
   /** Provider serving the run, from the router selection. */
   provider?: string;
   model?: string;
@@ -1028,7 +1047,7 @@ export class RuntimeManager {
     this.bus = opts.bus ?? telemetryBus;
     this.reporter = opts.reporter ?? new RunReporter({ vm: this.vm, bus: this.bus });
     this.codebaseScanner = opts.codebaseScanner ?? createVmScanner(this.vm);
-    this.runner = opts.runner ?? new ClaudeCodeRunner();
+    this.runner = opts.runner ?? new ClaudeCodeRunner({ contextPacker: contextPackerFromEnv(process.env) });
     this.routerOverride = opts.router === undefined ? undefined : opts.router;
     this.maxQueuedOverride = opts.maxQueued;
     this.maxConcurrentVmsOverride = opts.maxConcurrentVms;
@@ -3863,6 +3882,35 @@ export class RuntimeManager {
   }
 
   /**
+   * L1 context packer inputs for the next invocation: the contents of the
+   * files the previous attempt edited, read from the VM (capped, fail-open).
+   * Returns undefined when L1 is not enabled or nothing was edited — the
+   * runner then packs with empty skeleton/working-set sections, as before.
+   * The same contents feed both the AST skeleton (outlines) and the working
+   * set (line windows); the governor budgets each section separately.
+   * A deleted, renamed or unreadable file is simply not in scope this turn;
+   * a read failure never fails the run.
+   */
+  private async readL1WorkingSet(
+    active: ActiveRun,
+  ): Promise<{ skeletonFiles: SourceFile[]; workingSet: WorkingSetItem[] } | undefined> {
+    if (contextPackerFromEnv(process.env) !== "l1") return undefined;
+    const paths = (active.editedFiles ?? []).slice(0, L1_WORKING_SET_MAX_FILES);
+    if (paths.length === 0) return undefined;
+    const files: SourceFile[] = [];
+    for (const filePath of paths) {
+      try {
+        const bytes = await this.vm.readFileBytes(active.userId, filePath, L1_WORKING_SET_MAX_BYTES_PER_FILE);
+        files.push({ path: filePath, content: bytes.content.toString("utf8") });
+      } catch {
+        // Not in scope this turn.
+      }
+    }
+    if (files.length === 0) return undefined;
+    return { skeletonFiles: files, workingSet: files.map((f) => ({ ...f })) };
+  }
+
+  /**
    * Run one claude invocation with the given provider env. The runner's stream
    * is forwarded to the bus; run.error is captured and returned so the caller
    * decides whether to fail over. run.finished finalizes the run here.
@@ -3983,6 +4031,10 @@ export class RuntimeManager {
         attemptError = null;
         finishEvent = null;
         sawProgress = false;
+        // L1 context packer: rebuild this invocation's prompt from the files
+        // the previous attempt edited (read from the VM) plus the accumulated
+        // ledger. First attempt: no file state yet, ledger starts fresh.
+        const l1Files = await this.readL1WorkingSet(active);
         const outcome = await this.runner.run(
         {
           // The project digest rides in front of the user's ask on a fresh
@@ -3992,6 +4044,8 @@ export class RuntimeManager {
           memoryContext: active.memoryContext,
           systemPacker,
           ...(contextPacker === "l1" ? { contextPacker: "l1" as const } : {}),
+          ...(active.stateLedger ? { stateLedger: active.stateLedger } : {}),
+          ...(l1Files ?? {}),
           sessionId,
           model: active.model,
           maxTurns: active.maxTurns,
@@ -4103,6 +4157,11 @@ export class RuntimeManager {
         },
         onAttemptEvent,
       );
+        // L1 packer: carry the updated ledger and the files this attempt
+        // edited into the next invocation, so each turn packs from
+        // accumulated state instead of resuming unbounded history.
+        if (outcome.stateLedger) active.stateLedger = outcome.stateLedger;
+        if (outcome.editedFiles) active.editedFiles = outcome.editedFiles;
         return { outcome, attemptError, finishEvent };
       };
 

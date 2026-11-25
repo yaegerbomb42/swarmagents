@@ -319,9 +319,9 @@ test("L1 context packer packs the invocation prompt and reports the budget line"
   assert.match(systemPrompt, /I am your engineer/);
   assert.match(systemPrompt, /remember the tests/);
 
-  // The user prompt is the packed ledger.
+  // The user prompt is the packed ledger (first L1 turn is turn 1).
   const prompt = cmd[cmd.length - 1];
-  assert.match(prompt, /## State ledger \(turn 0\)/);
+  assert.match(prompt, /## State ledger \(turn 1\)/);
   assert.match(prompt, /Goal: Inspect repo/);
 
   // The budget ledger line rides in telemetry.
@@ -331,7 +331,7 @@ test("L1 context packer packs the invocation prompt and reports the budget line"
   );
   assert.equal(budget.length, 1);
   assert.equal(budget[0].ok, true);
-  assert.match(budget[0].detail, /^context-packer\[l1\] turn=0 budget=8192 /);
+  assert.match(budget[0].detail, /^context-packer\[l1\] turn=1 budget=8192 /);
 });
 
 test("L1 packer hydrates the state ledger from the request snapshot", async () => {
@@ -360,6 +360,133 @@ test("L1 packer hydrates the state ledger from the request snapshot", async () =
   assert.match(prompt, /## Do not retry/);
   assert.match(prompt, /bumping the retry count in lib\/upload\/retry\.ts/);
   assert.doesNotMatch(prompt, /Ignored when a snapshot is present/);
+});
+
+test("L1 packer returns the updated ledger in the outcome and the next turn packs from it", async () => {
+  const runner = new ClaudeCodeRunner({ bin: "claude", contextPacker: "l1" });
+
+  const vm1 = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const first = await runner.run({ prompt: "Fix the upload", env: {}, vm: vm1 }, () => {});
+  assert.equal(first.exitCode, 0);
+  // The fixture's result text ("Done.") is the turn-1 step summary.
+  assert.ok(first.stateLedger, "L1 outcome must carry the updated ledger");
+  assert.equal(first.stateLedger?.goal, "Fix the upload");
+  assert.equal(first.stateLedger?.steps.length, 1);
+  assert.equal(first.stateLedger?.steps[0].turn, 1);
+  assert.equal(first.stateLedger?.steps[0].summary, "Done.");
+  assert.equal(first.stateLedger?.lastError, undefined);
+  assert.equal(first.editedFiles, undefined, "no Edit/Write calls in the fixture");
+
+  // Turn 2 packs from the accumulated ledger: heading says turn 2 and the
+  // previous step is visible in the prompt.
+  const vm2 = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const events: TelemetryEvent[] = [];
+  const second = await runner.run(
+    { prompt: "Fix the upload", stateLedger: first.stateLedger, env: {}, vm: vm2 },
+    (e) => events.push(e),
+  );
+  assert.equal(second.exitCode, 0);
+  const prompt2 = vm2.calls[0].cmd[vm2.calls[0].cmd.length - 1];
+  assert.match(prompt2, /## State ledger \(turn 2\)/);
+  assert.match(prompt2, /Steps so far:/);
+  assert.match(prompt2, /- t1: Done\./);
+  assert.equal(second.stateLedger?.steps.length, 2);
+  assert.equal(second.stateLedger?.steps[1].turn, 2);
+  const budget = events.filter(
+    (e): e is Extract<TelemetryEvent, { type: "capability.changed" }> =>
+      e.type === "capability.changed" && e.tool === "context",
+  );
+  assert.match(budget[0].detail, /^context-packer\[l1\] turn=2 budget=8192 /);
+});
+
+test("L1 packer tracks edited files and feeds skeleton + working set into the prompt", async () => {
+  const editFixture = [
+    INIT,
+    {
+      type: "assistant",
+      message: {
+        id: "e1",
+        content: [
+          { type: "tool_use", id: "toolu_1", name: "Edit", input: { file_path: "lib/foo.ts", old_string: "a", new_string: "b" } },
+          { type: "tool_use", id: "toolu_2", name: "Write", input: { file_path: "lib/bar.ts", content: "x" } },
+          { type: "tool_use", id: "toolu_3", name: "Edit", input: { file_path: "lib/foo.ts", old_string: "b", new_string: "c" } },
+          { type: "tool_use", id: "toolu_4", name: "Read", input: { file_path: "lib/other.ts" } },
+        ],
+      },
+    },
+    RESULT,
+  ]
+    .map((l) => JSON.stringify(l))
+    .join("\n");
+
+  const runner = new ClaudeCodeRunner({ bin: "claude", contextPacker: "l1" });
+  const vm = new ScriptedVm([{ chunks: [editFixture] }]);
+  const outcome = await runner.run(
+    {
+      prompt: "Edit the files",
+      skeletonFiles: [{ path: "lib/foo.ts", content: "export function foo() {\n  return 1;\n}\n" }],
+      workingSet: [{ path: "lib/foo.ts", content: "export function foo() {\n  return 1;\n}\n" }],
+      env: {},
+      vm,
+    },
+    () => {},
+  );
+  assert.equal(outcome.exitCode, 0);
+  // Edit/Write paths, deduped in first-seen order; Read is not an edit.
+  assert.deepEqual(outcome.editedFiles, ["lib/foo.ts", "lib/bar.ts"]);
+
+  const prompt = vm.calls[0].cmd[vm.calls[0].cmd.length - 1];
+  assert.match(prompt, /## Code skeleton/);
+  assert.match(prompt, /File: lib\/foo\.ts/);
+  assert.match(prompt, /L1: export function foo\(\) \{/);
+  assert.match(prompt, /## Working set/);
+  assert.match(prompt, /### lib\/foo\.ts/);
+  assert.match(prompt, /1 \| export function foo\(\) \{/);
+});
+
+test("L1 packer records a failed result in the ledger's last error", async () => {
+  const failedFixture = [
+    INIT,
+    {
+      type: "result",
+      subtype: "error_max_turns",
+      is_error: true,
+      result: "ran out of turns",
+      num_turns: 3,
+      session_id: "sess_demo_1",
+    },
+  ]
+    .map((l) => JSON.stringify(l))
+    .join("\n");
+
+  const runner = new ClaudeCodeRunner({ bin: "claude", contextPacker: "l1" });
+  const vm = new ScriptedVm([{ chunks: [failedFixture] }]);
+  const outcome = await runner.run({ prompt: "Do the thing", env: {}, vm }, () => {});
+  assert.ok(outcome.stateLedger, "L1 outcome must carry the ledger even on failure");
+  assert.equal(outcome.stateLedger?.steps[0].summary, "ran out of turns");
+  assert.match(outcome.stateLedger?.lastError ?? "", /error_max_turns/);
+
+  // The next turn still sees the failure in its prompt.
+  const vm2 = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const second = await runner.run(
+    { prompt: "Do the thing", stateLedger: outcome.stateLedger, env: {}, vm: vm2 },
+    () => {},
+  );
+  assert.equal(second.exitCode, 0);
+  const prompt2 = vm2.calls[0].cmd[vm2.calls[0].cmd.length - 1];
+  assert.match(prompt2, /Last error:/);
+  assert.match(prompt2, /error_max_turns/);
+  // A successful turn clears the stale error.
+  assert.equal(second.stateLedger?.lastError, undefined);
+});
+
+test("without the L1 packer the outcome carries no ledger or edited files", async () => {
+  const vm = new ScriptedVm([{ chunks: [FIXTURE] }]);
+  const runner = new ClaudeCodeRunner({ bin: "claude" });
+  const outcome = await runner.run({ prompt: "Inspect repo", env: {}, vm }, () => {});
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.stateLedger, undefined);
+  assert.equal(outcome.editedFiles, undefined);
 });
 
 test("without the packer the argv is byte-identical to today and no context telemetry is emitted", async () => {
@@ -425,7 +552,7 @@ test("a per-role packer default applies when neither the run nor the runner sets
 
   assert.equal(outcome.exitCode, 0);
   const { cmd } = vm.calls[0];
-  assert.match(cmd[cmd.length - 1], /## State ledger \(turn 0\)/);
+  assert.match(cmd[cmd.length - 1], /## State ledger \(turn 1\)/);
   // Packing keeps the role's tool allowlist and MCP config.
   assert.ok(cmd.includes("--allowedTools"));
   assert.ok(cmd.includes("/role.json"));

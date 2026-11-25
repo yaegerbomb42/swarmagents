@@ -13,6 +13,7 @@ import type { RunRequest } from "../types";
 import type { SourceFile } from "./astSlicer";
 import {
   ContextGovernor,
+  contextPackerFromEnv,
   DEFAULT_CONTEXT_PACKER,
   DEFAULT_L1_BUDGET,
   fitText,
@@ -23,6 +24,7 @@ import {
   resolveBudget,
   resolveContextPacker,
   StateLedger,
+  summarizeTurnResult,
   systemExtrasFrom,
   toPackedRunRequest,
 } from "./contextGovernor";
@@ -352,6 +354,30 @@ test("selection: ClaudeCodeRunner behaviour is the default; l1 is opt-in per run
   assert.equal(resolveContextPacker({ run: "claude-code", roleId: "coder", roles: { coder: "l1" } }), "claude-code");
   assert.equal(resolveContextPacker({ run: "l1" }), "l1");
   assert.equal(resolveContextPacker({ run: "mini-forced", roleId: "x", roles: { x: 42 } }), "claude-code");
+});
+
+test("contextPackerFromEnv: only SWARM_CONTEXT_PACKER=l1 enables L1", () => {
+  assert.equal(contextPackerFromEnv({ SWARM_CONTEXT_PACKER: "l1" }), "l1");
+  assert.equal(contextPackerFromEnv({ SWARM_CONTEXT_PACKER: "claude-code" }), undefined);
+  assert.equal(contextPackerFromEnv({ SWARM_CONTEXT_PACKER: "bogus" }), undefined);
+  assert.equal(contextPackerFromEnv({}), undefined);
+});
+
+test("summarizeTurnResult collapses whitespace and caps at 240 chars", () => {
+  assert.equal(summarizeTurnResult("  Done.\n  All green. "), "Done. All green.");
+  assert.equal(summarizeTurnResult(""), "");
+  const long = summarizeTurnResult("x ".repeat(300));
+  assert.ok(long.length <= 240, `capped summary must fit 240 chars, got ${long.length}`);
+  assert.ok(long.endsWith("…"));
+});
+
+test("StateLedger.nextTurn counts past the latest recorded step", () => {
+  const ledger = new StateLedger("goal");
+  assert.equal(ledger.nextTurn(), 1);
+  ledger.recordStep(1, "first turn done");
+  assert.equal(ledger.nextTurn(), 2);
+  ledger.recordStep(2, "second turn done");
+  assert.equal(ledger.nextTurn(), 3);
 });
 
 test("toPackedRunRequest swaps in the packed turn, drops --resume and keeps the role's tools", () => {

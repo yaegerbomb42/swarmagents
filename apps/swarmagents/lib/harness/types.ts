@@ -8,6 +8,7 @@
  */
 
 import type { StateLedgerSnapshot } from "./context/contextGovernor";
+import type { SourceFile, WorkingSetItem } from "./context/astSlicer";
 import type { RiskLevel } from "./risk";
 import type { DecisionBrainHooksOptions } from "./decision-brain/hooks";
 
@@ -396,6 +397,21 @@ export interface RunRequest {
    */
   stateLedger?: StateLedgerSnapshot;
   /**
+   * Files in scope for the L1 packer's AST skeleton, as `{ path, content }`
+   * (repo-relative paths). Only read when the "l1" packer is active; the
+   * harness never reads files itself, so the caller supplies the contents
+   * (read from the VM, the codebase store, or tests). Empty/absent means
+   * the skeleton section stays empty, as before.
+   */
+  skeletonFiles?: SourceFile[];
+  /**
+   * Files the agent is editing, for the L1 packer's working set (numbered
+   * line windows around `focus`, most important first). Same caller-owned
+   * rule as `skeletonFiles`: the harness renders what it is handed and
+   * never opens a file.
+   */
+  workingSet?: WorkingSetItem[];
+  /**
    * The agent card text — the user's own description of who the agent is and
    * what it should focus on. Passed to claude as `--append-system-prompt` so
    * it is treated as part of the system prompt, never as an instruction
@@ -524,4 +540,21 @@ export interface RunOutcome {
    * the caller should resume with the new role's phase and this session id.
    */
   roleSwitch?: { toRoleId: string; sessionId?: string };
+  /**
+   * L1 packer only: the state ledger after this invocation — the step just
+   * run recorded (and the last error set on failure). The caller owns
+   * persisting it next to the run and passing it back as
+   * `RunRequest.stateLedger` on the next invocation, so each turn packs
+   * from the accumulated ledger instead of starting fresh. Absent when
+   * the packer was not "l1".
+   */
+  stateLedger?: StateLedgerSnapshot;
+  /**
+   * L1 packer only: repo-relative paths of files this invocation edited
+   * (Edit/Write/NotebookEdit tool calls observed on the stream), in first-
+   * seen order, deduped. The caller reads their contents for the next
+   * invocation's `workingSet`/`skeletonFiles`. Absent (or empty) when the
+   * packer was not "l1" or nothing was edited.
+   */
+  editedFiles?: string[];
 }

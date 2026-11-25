@@ -28,6 +28,7 @@ import { ClaudeCodeRunner, isSignalKillExitCode } from "../harness/runner";
 import { contextPackerFromEnv, type StateLedgerSnapshot } from "../harness/context/contextGovernor";
 import type { SourceFile, WorkingSetItem } from "../harness/context/astSlicer";
 import { roleMaxTurns } from "../harness/role-clamps";
+import { TrajectoryOptimizer } from "../harness/context/trajectory-manager";
 import { makeRedactor } from "../harness/redact";
 import type { BrainEvent } from "../harness/decision-brain/index";
 import type {
@@ -208,6 +209,39 @@ export function isRunProviderPoolEnabled(env: Record<string, string | undefined>
 export function isOraclePostRunEnabled(env: Record<string, string | undefined> = process.env): boolean {
   const value = env.SWARM_ORACLE_POST_RUN?.trim().toLowerCase();
   return value === "1" || value === "true";
+}
+
+/** Max auto-resume phases for a max-turns run (bounded continuation). */
+export const MAX_CONTINUATION_PHASES = 5;
+
+/** Bounded L1 token budget for a continuation packet. */
+export const CONTINUATION_PACKET_BUDGET = {
+  total: 8192,
+  ledger: 2048,
+  skeleton: 1024,
+  workingSet: 2048,
+  reserve: 3072,
+  outputBuffer: 512,
+};
+
+/** True when the run should auto-continue after hitting max_turns. */
+export function shouldAutoContinue(
+  reason: string | undefined,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (reason !== "max_turns") return false;
+  return autoContinueEnabled(env);
+}
+
+/**
+ * True when auto-continuation is enabled via env (`SWARM_AUTO_CONTINUE`
+ * or `SWARM_ALWAYS_ON_247`). Used to decide whether run.finished is deferred
+ * so a max-turns finish can be auto-resumed cleanly.
+ */
+export function autoContinueEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const auto = env.SWARM_AUTO_CONTINUE?.trim().toLowerCase();
+  const on247 = env.SWARM_ALWAYS_ON_247?.trim().toLowerCase();
+  return auto === "1" || auto === "true" || on247 === "1" || on247 === "true";
 }
 
 export function mergeOracleSummary(
@@ -547,6 +581,8 @@ interface ActiveRun {
   turnCheckpointInFlight?: boolean;
   /** Watchdog recoveries already spent on this run (bounded; see maxRecoveryAttempts). */
   recoveryAttempts?: number;
+  /** Auto-continuation phases already run for this run (bounded, max MAX_CONTINUATION_PHASES). */
+  continuationPhases?: number;
   /**
    * Set only by the shutdown path for a run with a recorded resume point:
    * the exec is aborted so the process can exit, but the run must NOT be
@@ -3185,7 +3221,9 @@ export class RuntimeManager {
     // Keep the pre-run listing only when the opt-in Oracle gate needs it. The
     // report artifact diff is more precise than a whole-repository git diff,
     // which could otherwise pick up a user's pre-existing workspace changes.
-    if (isOraclePostRunEnabled()) active.oracleStartListing = await listWorkspaceFiles(this.vm, userId);
+    if (isOraclePostRunEnabled() || userSettings.oraclePostRun === true) {
+      active.oracleStartListing = await listWorkspaceFiles(this.vm, userId);
+    }
 
     // Phase loop: each role switch continues the same conversation (--resume)
     // with the new role's phase. The provider failover loop runs per phase.
@@ -3519,6 +3557,7 @@ export class RuntimeManager {
     const { runId, userId } = active;
     while (true) {
       let finishEvent: Extract<HarnessEvent, { type: "run.finished" }> | null = null;
+      let finishReason: string | undefined;
       const errors: Extract<HarnessEvent, { type: "run.error" }>[] = [];
       let roleSwitch: RunOutcome["roleSwitch"];
       let aborted = false;
@@ -3546,7 +3585,9 @@ export class RuntimeManager {
           selection,
           phase,
           options.approvalHook,
-          options.verificationEnabled,
+          // Defer finalization when post-run gate is active or auto-continue
+          // is enabled (so a max-turns finish can resume instead of committing).
+          options.postRunGateEnabled || autoContinueEnabled(),
         );
         if (run.outcome.roleSwitch) {
           roleSwitch = run.outcome.roleSwitch;
@@ -3565,6 +3606,7 @@ export class RuntimeManager {
           return { status: "error", message: run.attemptError.message };
         }
         finishEvent = run.finishEvent;
+        finishReason = run.finishEvent?.reason;
         return { status: "done", sessionId: run.finishEvent?.sessionId };
       });
 
@@ -3591,7 +3633,29 @@ export class RuntimeManager {
         return { switched: false };
       }
       active.sessionId = result.sessionId ?? active.sessionId;
-      if (!options.postRunGateEnabled || !finishEvent) return { switched: false };
+      if (
+        shouldAutoContinue(finishReason) &&
+        (active.continuationPhases ?? 0) < MAX_CONTINUATION_PHASES &&
+        this.isStillActive(active)
+      ) {
+        active.continuationPhases = (active.continuationPhases ?? 0) + 1;
+        this.bus.publish(runId, {
+          type: "run.continued",
+          data: { phase: active.continuationPhases, reason: finishReason },
+        });
+        const optimizer = new TrajectoryOptimizer(active.prompt);
+        optimizer.recordTurn({
+          stepSummary: `Phase ${active.continuationPhases} ended at the turn ceiling; resuming with reduced context.`,
+        });
+        const packet = optimizer.buildContinuationPacket({ budget: CONTINUATION_PACKET_BUDGET });
+        active.prompt = `${active.prompt}\n\n${packet.prompt}`;
+        if (active.maxTurns !== undefined) active.maxTurns = active.maxTurns * 2;
+        continue;
+      }
+      if (!options.postRunGateEnabled || !finishEvent) {
+        if (finishEvent) this.finalizeFinished(active, finishEvent, undefined);
+        return { switched: false };
+      }
       const gate = await this.runPostRunGate(active, finishEvent, options.verificationEnabled);
       if (gate.outcome === "finalized") return { switched: false };
       active.prompt = bounceRemediationPrompt(gate.summary);

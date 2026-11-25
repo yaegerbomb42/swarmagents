@@ -1,7 +1,7 @@
 /**
  * In-VM Tool Forge MCP server (lib/harness/tool-forge-mcp.ts).
  *
- * Exposes four token-frugal tools inside every user VM:
+ * Exposes seven token-frugal tools inside every user VM:
  *   - search_mcp_catalog(query, limit) — searches the compact connector catalog
  *   - search_online_skills(query, source, limit) — searches 900+ online SKILL.md repos
  *   - install_online_skill(id) — installs an online SKILL.md into /workspace/.claude/skills
@@ -9,6 +9,7 @@
  *     secret-scans, syntax-checks, smoke-tests, and registers custom tools/MCPs
  *   - list_my_tools() — lists custom tools and active VM MCP servers
  *   - manage_mcp(action, id) — inspect, enable, or disable custom MCP tools
+ *   - enable_connector(connectorId) — activates a zero-key catalog connector mid-run
  *
  * Dependency-free (Node builtins only) so it runs inside any VM container or host.
  */

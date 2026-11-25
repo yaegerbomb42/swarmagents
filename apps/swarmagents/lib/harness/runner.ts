@@ -272,6 +272,12 @@ function resultSucceeded(meta: FinalResultMeta): boolean {
   return meta.subtype === undefined || meta.subtype === "success";
 }
 
+/** Map a stream-json `result` subtype to a stable finish reason, or undefined. */
+function finalReasonFor(subtype: string | undefined): string | undefined {
+  if (subtype === "error_max_turns") return "max_turns";
+  return undefined;
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -553,6 +559,7 @@ export class ClaudeCodeRunner {
      */
     const emitFinished = (): RunOutcome => {
       emitResultUsage();
+      const reason = finalReasonFor(finalMeta?.subtype);
       emit({
         type: "run.finished",
         exitCode: 0,
@@ -560,6 +567,7 @@ export class ClaudeCodeRunner {
         costUsd: finalMeta?.costUsd,
         durationMs: finalMeta?.durationMs,
         numTurns: finalMeta?.numTurns,
+        ...(reason ? { reason } : {}),
       });
       return withL1({ exitCode: 0, aborted: false, malformedLines });
     };

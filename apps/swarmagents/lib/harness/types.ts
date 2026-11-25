@@ -62,7 +62,16 @@ export type TelemetryEvent =
   | { type: "tool.started"; name: string; id?: string }
   | { type: "tool.result"; id?: string; ok: boolean; truncated: boolean; output: string }
   | { type: "usage"; inputTokens: number; outputTokens: number; cachedTokens?: number; model?: string }
-  | { type: "run.finished"; exitCode: number; sessionId: string; costUsd?: number; durationMs?: number; numTurns?: number }
+  | {
+      type: "run.finished";
+      exitCode: number;
+      sessionId: string;
+      costUsd?: number;
+      durationMs?: number;
+      numTurns?: number;
+      /** Why the invocation ended (e.g. "max_turns" when the turn ceiling was hit). */
+      reason?: string;
+    }
   | { type: "run.error"; message: string; exitCode?: number; sessionId?: string }
   /**
    * Emitted when a tool call classifies as "ask": the run pauses until the

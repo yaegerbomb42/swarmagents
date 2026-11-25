@@ -237,6 +237,38 @@ export function sseResponse(
 
         if (closed) return;
         replayDone = true;
+        // Reconnect gap: the client's cursor predates the oldest event
+        // still available (bus eviction plus log rotation/pruning). The
+        // events between the cursor and the replay window are gone for
+        // good — say so up front with a run.snapshot instead of silently
+        // starting mid-run. A fresh connect (fromSeq 0) already gets its
+        // truncated-window snapshot from noteReplayWindow; this covers
+        // the reconnect case, where the cap is unbounded.
+        if (fromSeq > 0 && pending.size > 0) {
+          let firstSeq = Infinity;
+          let lastSeq = 0;
+          for (const event of pending.values()) {
+            if (event.seq > 0) {
+              firstSeq = Math.min(firstSeq, event.seq);
+              lastSeq = Math.max(lastSeq, event.seq);
+            }
+          }
+          if (firstSeq > fromSeq + 1) {
+            buffer({
+              seq: 0,
+              runId,
+              ts: Date.now(),
+              type: "run.snapshot",
+              data: {
+                truncated: true,
+                gap: true,
+                resumedFrom: fromSeq,
+                firstEventId: firstSeq,
+                lastEventId: lastSeq,
+              },
+            });
+          }
+        }
         const ordered = [...pending.values()].sort((a, b) => a.seq - b.seq);
         for (const event of ordered) {
           send(event);

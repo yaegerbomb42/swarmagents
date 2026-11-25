@@ -309,6 +309,55 @@ test("capped initial replay announces a run.snapshot before the newest tail", as
   }
 });
 
+test("reconnect with a cursor older than the oldest available event announces a run.snapshot gap", async () => {
+  // Capacity 3 keeps only the newest 3 events: seqs 10, 11, 12. A client
+  // reconnecting from seq 5 lost seqs 6-9 to eviction; the stream must say
+  // so up front instead of silently starting mid-run.
+  const bus = new TelemetryBus({ capacity: 3 });
+  for (let i = 1; i <= 12; i++) bus.publish("run_gap", { type: `e${i}` });
+
+  const ac = new AbortController();
+  const stream = sseResponse("run_gap", 5, ac.signal, { bus, keepAliveMs: 60_000, runsDir: null });
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  for (let i = 0; i < 100; i++) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+    if (text.includes("event: e12\n")) break;
+  }
+  ac.abort();
+  await reader.read().catch(() => {});
+
+  const frames = parseSse(text);
+  const parsed = frames.map((m) => JSON.parse(m.data) as { type: string; data?: Record<string, unknown> });
+  assert.equal(parsed[0].type, "run.snapshot");
+  assert.deepEqual(parsed[0].data, {
+    truncated: true,
+    gap: true,
+    resumedFrom: 5,
+    firstEventId: 10,
+    lastEventId: 12,
+  });
+  assert.deepEqual(
+    parsed.slice(1).map((e) => e.type),
+    ["e10", "e11", "e12"],
+  );
+  // The gap snapshot carries no id: it must not become a Last-Event-ID.
+  assert.equal(frames[0].id, undefined);
+});
+
+test("reconnect with a contiguous cursor announces no gap snapshot", async () => {
+  const bus = new TelemetryBus({ capacity: 3 });
+  for (let i = 1; i <= 12; i++) bus.publish("run_nogap", { type: `e${i}` });
+
+  const ac = new AbortController();
+  const stream = sseResponse("run_nogap", 9, ac.signal, { bus, keepAliveMs: 60_000, runsDir: null });
+  const types = await readUntil(stream, "e12", ac);
+  assert.deepEqual(types, ["e10", "e11", "e12"]);
+});
+
 // ---------------------------------------------------------------------------
 // b14: an abort must never close the stream silently — either the run's
 // terminal event is re-sent (if it finished) or an explicit stream.error is

@@ -140,6 +140,46 @@ export function shouldResetStreamCursor(
   return cursorRunId !== nextRunId;
 }
 
+/**
+ * Last-Event-ID cursor persisted per run in sessionStorage so a full page
+ * reload resumes the stream where it left off instead of replaying from
+ * seq 0 (which caps at the server's INITIAL_REPLAY_CAP and drops the head
+ * of a long trajectory). Tab-scoped: closing the tab drops the cursors, and
+ * a finished run's cursor is cleared when its terminal event arrives.
+ * All helpers tolerate a missing or blocked storage (SSR, private mode):
+ * the in-memory cursor still works for the lifetime of the page.
+ */
+export function sseCursorKey(runId: string): string {
+  return `swarm:sse-cursor:${runId}`;
+}
+
+export function readSseCursor(runId: string): string | undefined {
+  try {
+    if (typeof sessionStorage === "undefined") return undefined;
+    return sessionStorage.getItem(sseCursorKey(runId)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function writeSseCursor(runId: string, id: string): void {
+  try {
+    if (typeof sessionStorage === "undefined") return;
+    sessionStorage.setItem(sseCursorKey(runId), id);
+  } catch {
+    // Storage full or blocked: the in-memory cursor still works.
+  }
+}
+
+export function clearSseCursor(runId: string): void {
+  try {
+    if (typeof sessionStorage === "undefined") return;
+    sessionStorage.removeItem(sseCursorKey(runId));
+  } catch {
+    // ignore
+  }
+}
+
 export function useRunStream(runId?: string | null): RunStreamState {
   const [status, setStatus] = useState<RunStreamStatus>("idle");
   const [error, setError] = useState<string>();
@@ -166,6 +206,11 @@ export function useRunStream(runId?: string | null): RunStreamState {
       setError(undefined);
       setReconnectAttempt(0);
     }
+    // A full page reload loses the in-memory cursor but the run itself is
+    // restored from the server (same runId): resume from the persisted
+    // cursor so a long trajectory does not replay from seq 0. A run
+    // visited before in this tab resumes from its stored cursor too.
+    if (!lastIdRef.current && runId) lastIdRef.current = readSseCursor(runId);
 
     if (!runId) {
       setStatus("idle");
@@ -193,7 +238,10 @@ export function useRunStream(runId?: string | null): RunStreamState {
       if (next.length > MAX_LINES) next.splice(0, next.length - MAX_LINES);
       itemsRef.current = next;
       setItems(next);
-      if (parsed.id) lastIdRef.current = parsed.id;
+      if (parsed.id) {
+        lastIdRef.current = parsed.id;
+        if (runId) writeSseCursor(runId, parsed.id);
+      }
       attempt = 0; // any live traffic resets the backoff clock
     };
 
@@ -216,6 +264,7 @@ export function useRunStream(runId?: string | null): RunStreamState {
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let sawTerminal = false;
+        let terminalKind: string | undefined;
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -231,7 +280,10 @@ export function useRunStream(runId?: string | null): RunStreamState {
               }
             }
             pushItem(kind, data, m);
-            if (isTerminalRunEvent(kind)) sawTerminal = true;
+            if (isTerminalRunEvent(kind)) {
+              sawTerminal = true;
+              terminalKind = kind;
+            }
           }
           if (sawTerminal) {
             // The run is over: stop reading instead of waiting for a close
@@ -242,7 +294,13 @@ export function useRunStream(runId?: string | null): RunStreamState {
         }
         // A terminal run ends the stream cleanly; anything else is a dropped
         // connection (proxy timeout, server close) worth retrying.
-        if (sawTerminal) return;
+        if (sawTerminal) {
+          // The run is over: drop its persisted cursor so a later revisit
+          // replays the (capped) run from the start. A paused run keeps
+          // its cursor — it can resume and keep emitting.
+          if (runId && terminalKind !== "run.paused") clearSseCursor(runId);
+          return;
+        }
         throw new Error("stream closed");
       } catch (err) {
         if (!alive || outer.signal.aborted) return;

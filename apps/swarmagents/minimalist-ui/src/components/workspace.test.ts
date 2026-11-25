@@ -189,6 +189,7 @@ test("the header keeps the conversation, the views, the run and settings in one 
     onOpenSettings: noop,
     onOpenShortcuts: noop,
     settingsNeedsAttention: true,
+    me: null,
   };
 
   for (const wide of [true, false]) {

@@ -11,10 +11,11 @@
 
 import React from "react";
 import Link from "next/link";
-import { ChevronDown, HelpCircle, Plug, Settings as SettingsIcon, Square, SquarePen } from "lucide-react";
+import { ChevronDown, HelpCircle, LogIn, Plug, Settings as SettingsIcon, Square, SquarePen } from "lucide-react";
 import { MascotDock } from "../../../components/mascot/MascotDock";
 import type { MascotState } from "../../../components/mascot/frames";
 import { RUN_PHASE_META, formatDuration, type RunPhase, type StatusTone } from "../../../lib/client/runPhase";
+import type { Me } from "../hooks/useEnvironment";
 import { cn } from "../utils/cn";
 import { Elapsed } from "./Conversation";
 import { StatusPill, type PillTone } from "../design/primitives";
@@ -99,6 +100,58 @@ export interface HeaderProps {
   settingsNeedsAttention: boolean;
   /** Opens the keyboard-shortcuts help panel. */
   onOpenShortcuts: () => void;
+  /**
+   * The signed-in user (GET /api/me). Null when signed out, undefined while
+   * still loading — the pill renders nothing until the answer arrives, so a
+   * signed-in user never flashes a "Sign in" pill.
+   */
+  me: Me | null | undefined;
+}
+
+/** Display label for the account pill: the email's local part, or "Account" when there is no email. */
+export function accountLabel(me: Me): string {
+  const local = (me.email ?? "").split("@")[0]?.trim();
+  return local || "Account";
+}
+
+/**
+ * Sign in / Account pill. Visible at every width — including phones
+ * (<640px), where the shortcuts button tucks away instead to keep the
+ * top-right clean. Signed out it links to /login; signed in it opens
+ * Settings, where the account's providers and agent live.
+ */
+function AuthPill({ me, onOpenSettings }: { me: Me | null | undefined; onOpenSettings: () => void }) {
+  if (me === undefined) return null;
+  const pillClass =
+    "press flex h-9 min-w-0 items-center gap-1.5 rounded-xl hair bg-black/20 px-2.5 text-[13px] font-medium text-[var(--fg)] transition-colors hover:bg-white/[0.06]";
+  if (me === null) {
+    return (
+      <Link href="/login" data-testid="auth-pill" data-auth="signed-out" className={pillClass}>
+        <LogIn className="h-3.5 w-3.5 shrink-0 text-[var(--mute)]" aria-hidden />
+        <span>Sign in</span>
+      </Link>
+    );
+  }
+  const label = accountLabel(me);
+  return (
+    <button
+      type="button"
+      onClick={onOpenSettings}
+      data-testid="auth-pill"
+      data-auth="signed-in"
+      title={me.email ?? "Account"}
+      aria-label={`Account: ${label}`}
+      className={pillClass}
+    >
+      <span
+        aria-hidden
+        className="grid h-5 w-5 shrink-0 place-items-center rounded-full bg-[var(--brand-signal)] text-[11px] font-semibold text-[var(--brand-text-on-signal)]"
+      >
+        {label.slice(0, 1).toUpperCase()}
+      </span>
+      <span className="max-w-[72px] truncate sm:max-w-[140px]">{label}</span>
+    </button>
+  );
 }
 
 export function Header({
@@ -114,6 +167,7 @@ export function Header({
   onOpenSettings,
   settingsNeedsAttention,
   onOpenShortcuts,
+  me,
 }: HeaderProps) {
   return (
     <header className="glass shrink-0 hair-b relative z-30" data-testid="workspace-header">
@@ -184,10 +238,11 @@ export function Header({
             label="Keyboard shortcuts"
             onClick={onOpenShortcuts}
             data-testid="open-shortcuts"
-            className="rounded-xl hair bg-black/20 hover:bg-white/[0.06]"
+            className="hidden rounded-xl hair bg-black/20 hover:bg-white/[0.06] sm:grid"
           >
             <HelpCircle className="h-4 w-4" aria-hidden />
           </IconButton>
+          <AuthPill me={me} onOpenSettings={onOpenSettings} />
           <IconButton
             label="Settings"
             onClick={onOpenSettings}

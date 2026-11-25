@@ -35,6 +35,12 @@ test("the workspace opens on the computer above one composer", async () => {
   assert.ok(html.indexOf('data-testid="screen-frame"') < html.indexOf('data-testid="composer-input"'));
   assert.match(tagOf(html, "composer-input"), /aria-label="Message the agent"/);
   assert.match(tagOf(html, "open-settings"), /aria-label="Settings"/);
+  // Narrow-viewport clearance: the main keeps extra bottom padding below sm
+  // and the composer's action row keeps extra bottom padding inside the
+  // glass box, so the bottom-left Attach button never sits flush to the
+  // viewport edge (or anything anchored to it) on a phone.
+  assert.match(tagOf(html, "workspace-main"), /pb-5/);
+  assert.match(tagOf(html, "composer-actions"), /pb-2/);
 });
 
 test("run completion notices describe success duration and failures", async () => {

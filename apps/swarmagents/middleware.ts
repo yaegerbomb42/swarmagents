@@ -232,6 +232,14 @@ export function middleware(req: NextRequest) {
   if (PUBLIC.has(pathname) || PUBLIC_PREFIXES.some((prefix) => pathname.startsWith(prefix))) {
     return withSecurityHeaders(NextResponse.next({ request: { headers } }), nonce, headerOpts, rate);
   }
+  // Guest-optional landing (v2-worker-5): when SWARM_ALLOW_GUEST_UI=1, the
+  // landing page itself is public so a guest can see the workspace shell
+  // without signing in. Only an exact GET / is opened — every other path
+  // (and every /api/* mutation) still falls through to the user gate below
+  // and stays 401 without a session.
+  if (process.env.SWARM_ALLOW_GUEST_UI === "1" && req.method === "GET" && pathname === "/") {
+    return withSecurityHeaders(NextResponse.next({ request: { headers } }), nonce, headerOpts, rate);
+  }
   if (!user) {
     if (!serverMode()) return withSecurityHeaders(new NextResponse("forbidden", { status: 403 }), nonce, headerOpts, rate);
     if (pathname.startsWith("/api/")) {

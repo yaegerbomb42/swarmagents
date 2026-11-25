@@ -444,7 +444,11 @@ export default function App() {
         </Notice>
       )}
 
-      <main className="relative z-10 flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-3 sm:p-4" data-testid="workspace-main">
+      {/* The bottom padding grows below sm: the composer — and its
+          bottom-left Attach button — sits flush to the viewport edge on a
+          phone, where the browser chrome and any bottom-anchored badges
+          would otherwise crowd it. */}
+      <main className="relative z-10 flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-3 pb-5 sm:p-4" data-testid="workspace-main">
         {/* Component 2: the main area — the user's VM screen. */}
         <section className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-2 overflow-y-auto rounded-[28px] glass hair p-3 sm:p-5 shadow-[0_24px_80px_-28px_rgba(0,0,0,0.85)]" data-testid="stage">
           <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--mute)]" role="status" aria-live="polite" data-testid="workspace-activity">

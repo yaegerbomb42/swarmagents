@@ -30,6 +30,7 @@ test.afterEach(() => {
   delete process.env.SWARM_ALLOWED_HOSTS;
   delete process.env.SWARM_HARNESS_TOKEN;
   delete process.env.SWARM_SESSION_SECRET;
+  delete process.env.SWARM_ALLOW_GUEST_UI;
   resetBuckets();
 });
 
@@ -566,4 +567,40 @@ test("SWARM_ALLOW_GUEST_UI=1 allows unauthenticated GET / while keeping APIs 401
     if (prev === undefined) delete process.env.SWARM_ALLOW_GUEST_UI;
     else process.env.SWARM_ALLOW_GUEST_UI = prev;
   }
+});
+// Guest-optional landing (v2-worker-5): SWARM_ALLOW_GUEST_UI=1 opens an
+// unauthenticated GET / so guests can see the workspace shell. Nothing else
+// opens: other pages still redirect, other methods on / still redirect, and
+// every /api/* mutation stays 401 without a session.
+test("guest flag allows unauthenticated GET /", () => {
+  process.env.SWARM_ALLOW_GUEST_UI = "1";
+  const res = middleware(req("http://swarm.example.com/", { host: "swarm.example.com" }));
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("location"), null, "a guest landing must not redirect to /login");
+});
+
+test("guest flag keeps every unauthenticated API mutation at 401", async () => {
+  process.env.SWARM_ALLOW_GUEST_UI = "1";
+  for (const method of STATE_CHANGING) {
+    const res = middleware(
+      req("http://swarm.example.com/api/runs", { host: "swarm.example.com" }, method),
+    );
+    assert.equal(res.status, 401, `${method} /api/runs must stay 401 for a guest`);
+    assert.deepEqual(await res.json(), { error: "Sign in required." }, `${method} must return the 401 JSON error`);
+  }
+});
+
+test("guest flag opens nothing but an exact GET /", () => {
+  process.env.SWARM_ALLOW_GUEST_UI = "1";
+  const otherPage = middleware(req("http://swarm.example.com/runs", { host: "swarm.example.com" }));
+  assert.equal(otherPage.status, 303, "other pages still redirect a guest to /login");
+  assert.match(otherPage.headers.get("location") ?? "", /\/login\?next=/);
+  const postRoot = middleware(req("http://swarm.example.com/", { host: "swarm.example.com" }, "POST"));
+  assert.equal(postRoot.status, 303, "only GET / is opened; POST / still redirects");
+});
+
+test("GET / redirects to /login when the guest flag is off", () => {
+  const res = middleware(req("http://swarm.example.com/", { host: "swarm.example.com" }));
+  assert.equal(res.status, 303);
+  assert.match(res.headers.get("location") ?? "", /\/login\?next=%2F/);
 });

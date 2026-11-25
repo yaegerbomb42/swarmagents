@@ -294,7 +294,10 @@ export function Composer({
           </ul>
         )}
 
-        <div className="flex items-end gap-1 p-1.5">
+        {/* The action row carries a little extra bottom padding below sm so
+            the bottom-left Attach button never sits flush to the glass edge
+            (and to anything anchored to the viewport bottom) on a phone. */}
+        <div className="flex items-end gap-1 px-1.5 pb-2 pt-1.5 sm:p-1.5" data-testid="composer-actions">
           <input
             ref={fileRef}
             type="file"

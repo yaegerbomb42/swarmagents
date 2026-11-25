@@ -140,6 +140,12 @@ export function StreamRow({ item, live = false }: { item: RunStreamItem; live?: 
       // the raw event JSON, which carries the internal userId.
       return <SystemLine text={lifecycleEventLine(item.kind, payload) ?? "Queued"} tone="muted" />;
     }
+    case "log": {
+      // Harness log lines (e.g. the Oracle gate's "oracle: 1/2 candidates
+      // rejected" summary) render as muted system text, never raw JSON.
+      const text = typeof payload.data === "string" ? payload.data : "";
+      return <SystemLine text={text} tone="muted" />;
+    }
     case "assistant.text": {
       const text =
         typeof item.data === "string"

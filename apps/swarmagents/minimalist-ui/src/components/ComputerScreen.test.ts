@@ -115,3 +115,20 @@ test("computer startup status uses plain words", async () => {
   assert.match(markup, /Starting a separate Linux computer for this run/);
   assert.ok(!markup.includes("sandbox"));
 });
+
+test("log events render their text as a muted system line, never raw JSON", async () => {
+  const { StreamRow } = await load();
+  // Mirrors the SSE shape: the parsed data is the whole sequenced event.
+  const it = item(8, "log", {
+    type: "log",
+    data: "oracle: 1/2 candidates rejected; nothing landed",
+    seq: 8,
+    runId: "run_oracle",
+    ts: 0,
+  });
+  const markup = renderToStaticMarkup(h(StreamRow, { item: it }));
+  const head = headOf(markup);
+  assert.ok(head.includes("oracle: 1/2 candidates rejected; nothing landed"), "oracle line is visible");
+  assert.ok(!head.includes("run_oracle"), "no internal identifiers in the visible line");
+  assert.ok(!head.includes("{"), "no JSON object in the visible line");
+});

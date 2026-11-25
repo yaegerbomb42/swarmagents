@@ -33,7 +33,7 @@ import type { RunStreamStatus } from "../../../../lib/client/useRunStream";
 import type { StatusTone } from "../../../../lib/client/runPhase";
 import type { VmDisplay } from "../../../../lib/client/vmStatus";
 import { presenceLabel, presenceTone, type Presence } from "../../../../lib/client/presence";
-import { CHROME, MOTION, SURFACE, TONE, pluralize, shortPath } from "../../design/vm-tokens";
+import { CHROME, GLASS, MOTION, SURFACE, TONE, pluralize, shortPath } from "../../design/vm-tokens";
 import { cn } from "../../utils/cn";
 
 export type ComputerView = "desktop" | "terminal" | "browser" | "files";
@@ -396,6 +396,7 @@ export function VmFrame({
       className={cn(
         "flex min-h-0 w-full flex-col overflow-hidden rounded-xl border border-sa-line",
         SURFACE.stage,
+        GLASS.frame,
         className,
       )}
       data-testid={testId}

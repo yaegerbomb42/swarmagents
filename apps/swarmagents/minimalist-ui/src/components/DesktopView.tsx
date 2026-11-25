@@ -32,7 +32,7 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Expand, Hand, MousePointerClick, Play, RefreshCw, MonitorPlay } from "lucide-react";
+import { Expand, Hand, MousePointerClick, Play, RefreshCw } from "lucide-react";
 import RFB from "@novnc/novnc/lib/rfb";
 import {
   DESKTOP_SCREENSHOT_PATH,
@@ -52,6 +52,8 @@ import {
 import type { VmDisplayState } from "../../../lib/client/vmStatus";
 import { presenceHintRegion, type Presence } from "../../../lib/client/presence";
 import { DesktopFpsMeter } from "../utils/desktopFps";
+import { GLASS } from "../design/vm-tokens";
+import { cn } from "../utils/cn";
 
 /** Connection facts the ScreenFrame's LIVE pill needs. */
 export interface DesktopConnectionInfo {
@@ -99,12 +101,106 @@ export interface DesktopViewProps {
   presence?: Presence;
   /** The frame's Take over button controls interaction; shown on the overlay. */
   canControl?: boolean;
+  /** Detail from a vm.error event, for the booting overlay's error copy. */
+  vmErrorMessage?: string;
 }
 
 const PHASE_OVERLAY_TEXT: Record<string, string> = {
   starting: "Starting VM…",
   connecting: "Connecting to desktop…",
 };
+
+/**
+ * Copy for the booting overlay, by VM state and dial phase. The overlay used
+ * to say "Starting VM…" for every non-ready state — including a hibernated
+ * VM waking up and a VM that reported an error. The words now name the
+ * actual state, so a wake-up does not read as a first boot.
+ */
+export function bootingOverlayCopy(
+  vmState: VmDisplayState,
+  phase: DesktopPhase,
+  errorMessage?: string,
+): { title: string; detail: string } {
+  if (phase === "connecting") {
+    return { title: "Connecting to desktop", detail: "Dialing your computer's screen…" };
+  }
+  switch (vmState) {
+    case "hibernated":
+      return {
+        title: "Waking your computer",
+        detail: "Hibernated after being idle — starting it back up…",
+      };
+    case "error":
+      return {
+        title: "Computer error",
+        detail: errorMessage ?? "Something went wrong — try resetting the computer.",
+      };
+    case "starting":
+    case "ready":
+    default:
+      return { title: "Waking up your computer.", detail: PHASE_OVERLAY_TEXT.starting };
+  }
+}
+
+/**
+ * The booting state: a glass card over a dimmed stage with a skeleton of
+ * the desktop that is about to appear (menu bar + window), so the empty
+ * screen reads as "a computer is starting" instead of a black box. The
+ * shimmer is indeterminate — it never pretends to know a percentage.
+ * Shared by the embedded and standalone paths so the two cannot drift.
+ */
+export function DesktopBootingOverlay({
+  vmState,
+  phase,
+  errorMessage,
+}: {
+  vmState: VmDisplayState;
+  phase: DesktopPhase;
+  errorMessage?: string;
+}) {
+  const copy = bootingOverlayCopy(vmState, phase, errorMessage);
+  return (
+    <div
+      data-testid="desktop-overlay"
+      className="absolute inset-0 z-20 grid place-items-center bg-black/70 backdrop-blur-[2px]"
+    >
+      <div className={cn(GLASS.panel, "flex w-[min(320px,86%)] flex-col items-center gap-3 px-6 py-5 text-center")}>
+        <div
+          aria-hidden
+          data-testid="desktop-boot-skeleton"
+          className="w-40 animate-pulse rounded-xl border border-white/10 bg-white/[0.04] p-2"
+        >
+          <div className="flex items-center gap-1 border-b border-white/10 pb-1.5">
+            <span className="h-1.5 w-1.5 rounded-full bg-rose-400/60" />
+            <span className="h-1.5 w-1.5 rounded-full bg-amber-400/60" />
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400/60" />
+            <span className="ml-auto h-1.5 w-10 rounded-full bg-white/10" />
+          </div>
+          <div className="space-y-1.5 pt-2">
+            <div className="h-1.5 w-3/4 rounded-full bg-white/10" />
+            <div className="h-1.5 w-1/2 rounded-full bg-white/[0.07]" />
+          </div>
+        </div>
+        <div className="font-mono text-xs text-white/70">{copy.title}</div>
+        <div className="font-mono text-[11px] text-white/40">{copy.detail}</div>
+      </div>
+    </div>
+  );
+}
+
+/** A centered glass card over the stage, for the reconnecting/offline states. */
+function DesktopOverlayCard({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      data-testid="desktop-overlay"
+      className="absolute inset-0 z-20 grid place-items-center bg-black/60 backdrop-blur-[2px]"
+    >
+      <div className={cn(GLASS.panel, "flex w-[min(360px,86%)] flex-col items-center gap-2 px-6 py-5 text-center")}>
+        {children}
+      </div>
+    </div>
+  );
+}
 
 /**
  * The presence tint over the live desktop. The region comes from
@@ -153,6 +249,7 @@ export function DesktopView({
   onConnection,
   presence,
   canControl = true,
+  vmErrorMessage,
 }: DesktopViewProps) {
   const [conn, dispatch] = useReducer(reduceDesktopConn, INITIAL_DESKTOP_CONN);
   // Control is negotiated server-side: the user expresses INTENT (Take
@@ -494,7 +591,7 @@ export function DesktopView({
   if (embedded) {
     return (
       <div className="relative h-full w-full bg-black" data-testid="desktop-view">
-        <div ref={surfaceHolderRef} className="absolute inset-0" aria-hidden={!live} />
+        <div ref={surfaceHolderRef} className="absolute inset-0 transform-gpu" aria-hidden={!live} />
 
         {/* Presence: the agent is working here. A blurred tint over the
             region, fading with the run — it never covers the pixels it is
@@ -525,52 +622,40 @@ export function DesktopView({
         )}
 
         {(conn.phase === "starting" || conn.phase === "connecting") && (
-          <div data-testid="desktop-overlay" className="absolute inset-0 z-20 grid place-items-center bg-black">
-            <div className="flex flex-col items-center gap-2 text-center">
-              <img src="/brand/mark-dark.svg" alt="" width={48} height={48} />
-              <div className="font-mono text-xs text-white/60">Waking up your computer.</div>
-              <div className="font-mono text-[11px] text-white/35">
-                {PHASE_OVERLAY_TEXT[conn.phase] ?? describeDesktopPhase(conn.phase)}
-              </div>
-            </div>
-          </div>
+          <DesktopBootingOverlay vmState={vmState} phase={conn.phase} errorMessage={vmErrorMessage} />
         )}
 
         {conn.phase === "reconnecting" && (
-          <div data-testid="desktop-overlay" className="absolute inset-0 z-20 grid place-items-center bg-black/85">
-            <div className="flex flex-col items-center gap-2 text-center">
-              <RefreshCw className="h-5 w-5 animate-spin text-amber-300/80" />
-              <div className="font-mono text-xs text-white/70">
-                Reconnecting… retry in {Math.ceil(conn.retryInMs / 1000)}s
-                <span className="text-white/35"> (attempt {conn.attempt})</span>
-              </div>
-              <button
-                type="button"
-                onClick={onReconnect}
-                className="mt-1 rounded-full border border-white/15 bg-white/5 px-3 py-1 font-mono text-[11px] text-white/80 hover:bg-white/10"
-              >
-                Reconnect now
-              </button>
+          <DesktopOverlayCard>
+            <RefreshCw className="h-5 w-5 animate-spin text-amber-300/80" />
+            <div className="font-mono text-xs text-white/70">
+              Reconnecting… retry in {Math.ceil(conn.retryInMs / 1000)}s
+              <span className="text-white/35"> (attempt {conn.attempt})</span>
             </div>
-          </div>
+            <button
+              type="button"
+              onClick={onReconnect}
+              className="mt-1 rounded-full border border-white/15 bg-white/5 px-3 py-1 font-mono text-[11px] text-white/80 hover:bg-white/10"
+            >
+              Reconnect now
+            </button>
+          </DesktopOverlayCard>
         )}
 
         {conn.phase === "offline" && (
-          <div data-testid="desktop-overlay" className="absolute inset-0 z-20 grid place-items-center bg-black/85">
-            <div className="flex flex-col items-center gap-2 px-6 text-center">
-              <span className="font-mono text-xs text-white/60">Desktop offline</span>
-              <span className="max-w-[420px] font-mono text-[11px] text-white/35">
-                The terminal, browser and files views are unaffected. Take over again when the desktop reconnects.
-              </span>
-              <button
-                type="button"
-                onClick={onReconnect}
-                className="mt-1 rounded-full border border-white/15 bg-white/5 px-3 py-1 font-mono text-[11px] text-white/80 hover:bg-white/10"
-              >
-                Reconnect
-              </button>
-            </div>
-          </div>
+          <DesktopOverlayCard>
+            <span className="font-mono text-xs text-white/60">Desktop offline</span>
+            <span className="max-w-[420px] font-mono text-[11px] text-white/35">
+              The terminal, browser and files views are unaffected. Take over again when the desktop reconnects.
+            </span>
+            <button
+              type="button"
+              onClick={onReconnect}
+              className="mt-1 rounded-full border border-white/15 bg-white/5 px-3 py-1 font-mono text-[11px] text-white/80 hover:bg-white/10"
+            >
+              Reconnect
+            </button>
+          </DesktopOverlayCard>
         )}
       </div>
     );
@@ -616,7 +701,7 @@ export function DesktopView({
           style={{ aspectRatio: "16 / 9" }}
         >
           {/* noVNC surface (live) */}
-          <div ref={surfaceHolderRef} className="absolute inset-0" aria-hidden={!live} />
+          <div ref={surfaceHolderRef} className="absolute inset-0 transform-gpu" aria-hidden={!live} />
 
           {/* Offline fallback: latest screenshot frame */}
           {conn.phase === "offline" && conn.hasFrame && frameSrc && (
@@ -631,52 +716,38 @@ export function DesktopView({
 
           {/* Non-live overlays: starting / connecting / reconnecting / offline-empty */}
           {(conn.phase === "starting" || conn.phase === "connecting") && (
-            <div
-              data-testid="desktop-overlay"
-              className="absolute inset-0 grid place-items-center bg-[#08080c]"
-            >
-              <div className="flex flex-col items-center gap-3 text-center">
-                <MonitorPlay className="h-6 w-6 text-indigo-400/70 animate-pulse" />
-                <div className="text-xs font-mono text-white/60">
-                  {PHASE_OVERLAY_TEXT[conn.phase] ?? describeDesktopPhase(conn.phase)}
-                </div>
-              </div>
-            </div>
+            <DesktopBootingOverlay vmState={vmState} phase={conn.phase} errorMessage={vmErrorMessage} />
           )}
           {conn.phase === "reconnecting" && (
-            <div data-testid="desktop-overlay" className="absolute inset-0 grid place-items-center bg-[#08080c]/85">
-              <div className="flex flex-col items-center gap-2 text-center">
-                <RefreshCw className="h-5 w-5 animate-spin text-amber-300/80" />
-                <div className="text-xs font-mono text-white/70">
-                  Reconnecting… retry in {Math.ceil(conn.retryInMs / 1000)}s
-                  <span className="text-white/35"> (attempt {conn.attempt})</span>
-                </div>
-                <button
-                  type="button"
-                  onClick={onReconnect}
-                  className="mt-1 rounded-full border border-white/15 bg-white/5 px-3 py-1 text-[11px] font-mono text-white/80 hover:bg-white/10"
-                >
-                  Reconnect now
-                </button>
+            <DesktopOverlayCard>
+              <RefreshCw className="h-5 w-5 animate-spin text-amber-300/80" />
+              <div className="text-xs font-mono text-white/70">
+                Reconnecting… retry in {Math.ceil(conn.retryInMs / 1000)}s
+                <span className="text-white/35"> (attempt {conn.attempt})</span>
               </div>
-            </div>
+              <button
+                type="button"
+                onClick={onReconnect}
+                className="mt-1 rounded-full border border-white/15 bg-white/5 px-3 py-1 text-[11px] font-mono text-white/80 hover:bg-white/10"
+              >
+                Reconnect now
+              </button>
+            </DesktopOverlayCard>
           )}
           {conn.phase === "offline" && !conn.hasFrame && (
-            <div data-testid="desktop-overlay" className="absolute inset-0 grid place-items-center bg-[#08080c]">
-              <div className="flex flex-col items-center gap-2 px-6 text-center">
-                <span className="text-xs font-mono text-white/50">
-                  Desktop offline{mode === "control" ? "" : " · watch-only preview unavailable"}
-                </span>
-                <span className="text-[11px] font-mono text-white/30">
-                  Running with desktop mode off? The terminal, browser and files tabs are unaffected.
-                </span>
-              </div>
-            </div>
+            <DesktopOverlayCard>
+              <span className="text-xs font-mono text-white/50">
+                Desktop offline{mode === "control" ? "" : " · watch-only preview unavailable"}
+              </span>
+              <span className="text-[11px] font-mono text-white/30">
+                Running with desktop mode off? The terminal, browser and files tabs are unaffected.
+              </span>
+            </DesktopOverlayCard>
           )}
 
           {/* LIVE badge: red dot + fps while streaming */}
           {live && (
-            <div className="pointer-events-none absolute left-2 top-2 z-10 flex items-center gap-1.5 rounded-full bg-black/55 px-2 py-0.5 font-mono text-[10px] text-white/85">
+            <div className={cn(GLASS.liveBadge, "pointer-events-none absolute left-2 top-2 z-10 flex items-center gap-1.5 px-2 py-0.5 font-mono text-[10px] text-white/85")}>
               <span className="h-1.5 w-1.5 rounded-full bg-rose-500 animate-pulse" data-testid="desktop-live-dot" />
               LIVE
               <span className="text-white/45">{fps} fps</span>

@@ -20,6 +20,7 @@ import { ArrowRight, Globe, Lock, RotateCcw, ShieldAlert } from "lucide-react";
 import { useRunStream, type RunStreamItem } from "../../../lib/client/useRunStream";
 import { useBrowserFrame } from "../../../lib/client/useBrowserFrame";
 import type { Presence } from "../../../lib/client/presence";
+import { cn } from "../utils/cn";
 
 interface BrowserViewProps {
   /** Active runtime run id; when absent the view shows its idle state. */
@@ -105,6 +106,59 @@ export function BrowserLoadStatus({ fetching, stillWaiting }: BrowserLoadStatusP
     );
   }
   return null;
+}
+
+/**
+ * The live page image, crossfaded between frames: the previous frame stays
+ * painted underneath until the new one has loaded, then the new one fades
+ * in over 300ms. Without this the src swap flashes the empty stage on
+ * every changed frame (the poller replaces the object URL whenever the
+ * bytes change). The `complete` check covers a frame that decoded before
+ * React attached the load handler.
+ */
+export function BrowserFrameImage({
+  frameUrl,
+  previousFrameUrl,
+}: {
+  frameUrl: string;
+  previousFrameUrl?: string;
+}) {
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    setLoaded(false);
+  }, [frameUrl]);
+  const showPrevious = previousFrameUrl !== undefined && previousFrameUrl !== frameUrl;
+  const markLoaded = useCallback((el: HTMLImageElement | null) => {
+    if (el && el.complete && el.naturalWidth > 0) setLoaded(true);
+  }, []);
+  return (
+    <div className="relative h-full w-full">
+      {showPrevious && (
+        /* eslint-disable-next-line @next/next/no-img-element */
+        <img
+          src={previousFrameUrl}
+          alt=""
+          aria-hidden
+          draggable={false}
+          data-testid="browser-frame-previous"
+          className="absolute left-1/2 top-1/2 max-h-full max-w-full -translate-x-1/2 -translate-y-1/2 object-contain"
+        />
+      )}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        ref={markLoaded}
+        src={frameUrl}
+        alt="Live page"
+        draggable={false}
+        onLoad={() => setLoaded(true)}
+        data-testid="browser-frame-current"
+        className={cn(
+          "absolute left-1/2 top-1/2 max-h-full max-w-full -translate-x-1/2 -translate-y-1/2 rounded-lg border border-white/10 object-contain shadow-2xl transition-opacity duration-300 select-none",
+          loaded || !showPrevious ? "opacity-100" : "opacity-0",
+        )}
+      />
+    </div>
+  );
 }
 
 /** A run's frame-bearing SSE events carry their metadata under `data`. */
@@ -381,12 +435,7 @@ export function BrowserView({ runId, presence }: BrowserViewProps) {
       {/* Browser viewport */}
       <div className="flex-1 min-h-0 grid place-items-center bg-[#07070a] p-6 overflow-hidden">
         {frame.frameUrl ? (
-          <img
-            src={frame.frameUrl}
-            alt="Live page"
-            draggable={false}
-            className="max-w-full max-h-full w-auto h-auto object-contain rounded-lg shadow-2xl border border-white/10 select-none"
-          />
+          <BrowserFrameImage frameUrl={frame.frameUrl} previousFrameUrl={frame.previousFrameUrl} />
         ) : (
           <EmptyState hasRun={Boolean(runId)} error={frame.status === "error" ? frame.error : undefined} />
         )}

@@ -210,8 +210,11 @@ test("the screen reports its state in the same dot-and-word vocabulary as a run"
   const { screenStatus, screenPillStatus, fitStageScale } = await load();
   const desktop = { activeView: "desktop" as const, runActive: true, control: false };
 
-  assert.deepEqual(screenStatus({ ...desktop, phase: "live", latencyMs: 42 }), { label: "Live · 42 ms", tone: "ok", live: true });
-  assert.deepEqual(screenStatus({ ...desktop, phase: "live" }), { label: "Live", tone: "ok", live: true });
+  assert.deepEqual(screenStatus({ ...desktop, phase: "live", latencyMs: 42 }), { label: "Running · 42 ms", tone: "ok", live: true });
+  assert.deepEqual(screenStatus({ ...desktop, phase: "live" }), { label: "Running", tone: "ok", live: true });
+  // A live stream with no run is just "Live": the desktop is up, waiting.
+  assert.deepEqual(screenStatus({ ...desktop, phase: "live", runActive: false, latencyMs: 42 }), { label: "Live · 42 ms", tone: "ok", live: true });
+  assert.deepEqual(screenStatus({ ...desktop, phase: "live", runActive: false }), { label: "Live", tone: "ok", live: true });
   assert.deepEqual(screenStatus({ ...desktop, phase: "starting" }), { label: "Starting", tone: "warn", live: true });
   assert.deepEqual(screenStatus({ ...desktop }), { label: "Connecting", tone: "warn", live: true });
   assert.deepEqual(screenStatus({ ...desktop, phase: "reconnecting" }), { label: "Reconnecting", tone: "warn", live: true });
@@ -220,7 +223,7 @@ test("the screen reports its state in the same dot-and-word vocabulary as a run"
   // A requested takeover outranks the control flag: the agent still has the wheel.
   assert.deepEqual(screenStatus({ ...desktop, phase: "live", control: true, takeover: "requested" }), { label: "Waiting for safe point", tone: "warn", live: true });
   assert.deepEqual(screenStatus({ ...desktop, phase: "live", control: true, takeover: "control" }), { label: "You are in control", tone: "accent", live: false });
-  assert.deepEqual(screenStatus({ activeView: "terminal", runActive: true, control: false }), { label: "Live", tone: "ok", live: true });
+  assert.deepEqual(screenStatus({ activeView: "terminal", runActive: true, control: false }), { label: "Running", tone: "ok", live: true });
   assert.deepEqual(screenStatus({ activeView: "files", runActive: false, control: false }), { label: "Idle", tone: "muted", live: false });
 
   // The screen status maps onto the brand pill's five tones (spec 3g).
@@ -266,7 +269,7 @@ test("the screen frame shows its views, its status and the stage; Take over only
   }
   assert.match(tagOf(terminal, "screen-view-terminal"), /aria-selected="true"/);
   assert.match(terminal, /aria-label="Computer views"/);
-  assert.match(terminal, />Live</);
+  assert.match(terminal, />Running</);
   assert.equal(countOf(terminal, 'data-testid="take-over"'), 0);
   assert.match(tagOf(terminal, "screen-fullscreen"), /aria-label="Full screen"/);
 

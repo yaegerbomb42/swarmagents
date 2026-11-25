@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { countOf, installBrowserStubs } from "../testing/harness";
-import { BrowserLoadStatus, BrowserView, STILL_WAITING_MS, frameFetchInFlight, hasWaitedLongEnough } from "./BrowserView";
+import { countOf, installBrowserStubs, tagOf } from "../testing/harness";
+import { BrowserFrameImage, BrowserLoadStatus, BrowserView, STILL_WAITING_MS, frameFetchInFlight, hasWaitedLongEnough } from "./BrowserView";
 
 /**
  * The browser chrome's under-address-bar hint has two jobs that used to be
@@ -67,4 +67,27 @@ test("browser empty states explain what the user will see", () => {
   assert.match(idle, /The desktop frame appears once a run opens a page/);
   const afterRun = renderToStaticMarkup(h(BrowserView, { runId: "run_1" }));
   assert.match(afterRun, /The desktop frame appears once a run opens a page/);
+});
+
+test("the live page crossfades between frames instead of flashing", () => {
+  installBrowserStubs();
+  const h = React.createElement;
+
+  const first = renderToStaticMarkup(h(BrowserFrameImage, { frameUrl: "blob:frame-1" }));
+  assert.equal(countOf(first, 'data-testid="browser-frame-current"'), 1);
+  assert.equal(countOf(first, 'data-testid="browser-frame-previous"'), 0, "no previous frame on the first paint");
+  assert.match(tagOf(first, "browser-frame-current"), /opacity-100/, "the first frame is fully visible at once");
+
+  const swap = renderToStaticMarkup(
+    h(BrowserFrameImage, { frameUrl: "blob:frame-2", previousFrameUrl: "blob:frame-1" }),
+  );
+  assert.equal(countOf(swap, 'data-testid="browser-frame-previous"'), 1, "the old frame stays painted underneath");
+  assert.equal(countOf(swap, 'data-testid="browser-frame-current"'), 1);
+  assert.match(tagOf(swap, "browser-frame-current"), /opacity-0/, "the new frame starts transparent until it loads");
+  assert.match(tagOf(swap, "browser-frame-current"), /transition-opacity duration-300/, "the fade is a 300ms opacity transition");
+
+  const same = renderToStaticMarkup(
+    h(BrowserFrameImage, { frameUrl: "blob:frame-1", previousFrameUrl: "blob:frame-1" }),
+  );
+  assert.equal(countOf(same, 'data-testid="browser-frame-previous"'), 0, "an unchanged URL is not its own previous frame");
 });

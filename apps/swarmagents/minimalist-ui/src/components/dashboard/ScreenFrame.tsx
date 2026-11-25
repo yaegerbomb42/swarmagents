@@ -28,6 +28,7 @@ import type { DesktopControlMode } from "../../../../lib/client/desktopState";
 import type { StatusTone } from "../../../../lib/client/runPhase";
 import type { VmStatus } from "../../../../lib/vm/types";
 import { cn } from "../../utils/cn";
+import { GLASS } from "../../design/vm-tokens";
 import { Button, IconButton } from "../ui";
 import { StatusPill, TakeoverButton, type PillStatus } from "../brand";
 import { VmScreen, type ComputerView } from "../vm/VmScreen";
@@ -97,14 +98,18 @@ export function screenStatus(input: {
     const phase = input.phase ?? "connecting";
     if (phase === "live") {
       const latency = input.latencyMs !== undefined ? ` · ${input.latencyMs} ms` : "";
-      return { label: `Live${latency}`, tone: "ok", live: true };
+      // A live stream with a working run is "Running" — the agent is
+      // driving. A live stream with no run is just "Live": the desktop is
+      // up and waiting. The pill's three core states are idle / running /
+      // reconnecting; "Live" names the stream, not the run.
+      return { label: `${input.runActive ? "Running" : "Live"}${latency}`, tone: "ok", live: true };
     }
     if (phase === "starting") return { label: "Starting", tone: "warn", live: true };
     if (phase === "connecting") return { label: "Connecting", tone: "warn", live: true };
     if (phase === "reconnecting") return { label: "Reconnecting", tone: "warn", live: true };
     return { label: "Offline", tone: "err", live: false };
   }
-  if (input.runActive) return { label: "Live", tone: "ok", live: true };
+  if (input.runActive) return { label: "Running", tone: "ok", live: true };
   return { label: "Idle", tone: "muted", live: false };
 }
 
@@ -286,6 +291,7 @@ export function ScreenFrame({
       <div
         className={cn(
           "flex min-h-0 w-full flex-1 overflow-hidden rounded-xl border bg-black",
+          GLASS.frame,
           control ? "border-sa-accent shadow-[0_0_0_1px_var(--color-sa-accent)]" : "border-sa-line",
           !fitToHeight && !theater && "aspect-[16/10] flex-none",
         )}

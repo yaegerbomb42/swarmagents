@@ -52,8 +52,8 @@ const CORE_VM_CAPABILITIES: readonly CapabilityEntry[] = [
   {
     id: "mcp:tool-forge",
     kind: "mcp_tool",
-    name: "tool-forge (search_mcp_catalog, author_tool, list_my_tools, manage_mcp)",
-    summary: "Search 40+ MCP connectors, author & test custom Node/Python/Bash tools, and manage VM MCPs.",
+    name: "tool-forge (search_mcp_catalog, author_tool, register_mcp, list_my_tools, manage_mcp)",
+    summary: "Search 40+ MCP connectors, author & test custom Node/Python/Bash tools with schema validation and secret-safe env binding, register existing MCP servers, and manage VM MCPs.",
     risk: "writes-files",
     source: "tool-forge",
   },

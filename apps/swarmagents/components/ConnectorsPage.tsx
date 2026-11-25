@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import type { ConnectorCategory, ConnectorFieldSpec } from "../lib/connectors/catalog";
+import { CONNECTOR_CATEGORIES } from "../lib/connectors/catalog";
 
 interface ConnectorRow {
   id: string;
@@ -49,11 +50,13 @@ interface ConnectorsResponse {
 
 type FilterChip = "all" | "connected" | ConnectorCategory;
 
+// Category chips track the catalog so new categories appear without a UI change.
 const CHIPS: ReadonlyArray<{ id: FilterChip; label: string }> = [
   { id: "all", label: "All" },
   { id: "connected", label: "Connected" },
-  { id: "code-cloud", label: "Code & Cloud" },
-  { id: "search-data", label: "Search & Data" },
+  ...CONNECTOR_CATEGORIES.filter(
+    (category): category is { id: ConnectorCategory; label: string } => category.id !== "all",
+  ).map((category) => ({ id: category.id, label: category.label })),
 ];
 
 function initials(name: string): string {
@@ -661,7 +664,7 @@ export function ConnectorsPage() {
             <input
               type="search"
               aria-label="Search connectors"
-              placeholder="Search GitHub, Vercel, Exa…"
+              placeholder="Search connectors, vendors, tools…"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               className="w-full rounded-xl border border-white/10 bg-[#111218] py-2 pl-9 pr-3 text-sm text-white placeholder:text-zinc-500 focus:border-cyan-400/50 focus:outline-none focus:ring-2 focus:ring-cyan-400/20"

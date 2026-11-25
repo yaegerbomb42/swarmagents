@@ -241,13 +241,30 @@ function resolveLibraryPayload(entry: ConnectorCatalogEntry): LibraryPayload | n
   return { catalogEntry, payload };
 }
 
+/**
+ * Map the connector's collected inputs onto the MCP server's required fields.
+ * Field keys are the server's env/header names (e.g. BRAVE_API_KEY,
+ * POSTGRES_URL), so a collected value lands under exactly the name the
+ * server reads. The GitHub connector collects its token under `token`
+ * while the read-only MCP server expects an Authorization header.
+ */
 function librarySecretsFor(
-  entry: ConnectorCatalogEntry,
+  cleanedInputs: Record<string, string>,
+  library: LibraryPayload | null,
   primaryToken: string | undefined,
 ): Record<string, string> {
   const secrets: Record<string, string> = {};
-  if (entry.id === "github" && primaryToken) secrets.Authorization = `Bearer ${primaryToken}`;
-  if (entry.id === "brave-search" && primaryToken) secrets.BRAVE_API_KEY = primaryToken;
+  if (!library) return secrets;
+  for (const field of library.catalogEntry.requiredFields) {
+    const supplied = cleanedInputs[field.key];
+    if (supplied) {
+      secrets[field.key] = supplied;
+      continue;
+    }
+    if (field.key === "Authorization" && primaryToken) {
+      secrets.Authorization = `Bearer ${primaryToken}`;
+    }
+  }
   return secrets;
 }
 
@@ -262,6 +279,7 @@ function writeConnectorSideEffects(
   userId: string,
   entry: ConnectorCatalogEntry,
   opts: {
+    cleanedInputs: Record<string, string>;
     primaryToken: string | undefined;
     reusedProviderKey: boolean;
     cloudflareBaseUrl: string | undefined;
@@ -269,7 +287,7 @@ function writeConnectorSideEffects(
   },
   writes: WriteTracker,
 ): void {
-  const { primaryToken, reusedProviderKey, cloudflareBaseUrl, library } = opts;
+  const { cleanedInputs, primaryToken, reusedProviderKey, cloudflareBaseUrl, library } = opts;
 
   if (entry.providerId && primaryToken && !reusedProviderKey) {
     saveProvider(userId, {
@@ -293,7 +311,7 @@ function writeConnectorSideEffects(
       name: library.catalogEntry.name,
       description: library.catalogEntry.description,
       payload: library.payload,
-      secrets: librarySecretsFor(entry, primaryToken),
+      secrets: librarySecretsFor(cleanedInputs, library, primaryToken),
       origin: "user",
     });
     writes.wroteLibrary = true;
@@ -377,7 +395,7 @@ export function connectConnector(
   };
 
   try {
-    writeConnectorSideEffects(userId, entry, { primaryToken, reusedProviderKey, cloudflareBaseUrl, library }, writes);
+    writeConnectorSideEffects(userId, entry, { cleanedInputs, primaryToken, reusedProviderKey, cloudflareBaseUrl, library }, writes);
   } catch (err) {
     rollbackConnectorWrites(userId, entry, writes);
     if (err instanceof ConnectorError) throw err;

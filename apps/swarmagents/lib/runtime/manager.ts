@@ -53,6 +53,7 @@ import { routerProviders, userCooldownFilePath, userProvidersSignature } from ".
 import { isAnthropicStyle } from "../providers/adapters";
 import {
   atlasEnabledForUser,
+  autoCondenseLogsFor,
   contextPackerModeFor,
   keySelectionModeFor,
   readUserSettings,
@@ -477,6 +478,10 @@ interface ActiveRun {
    */
   stateLedger?: StateLedgerSnapshot;
   editedFiles?: string[];
+  /** Signed per-run token minted for VM-facing runtime endpoints. */
+  runToken?: string;
+  /** Signed per-run connector-enable URL for the in-VM tool-forge. */
+  connectorEnableUrl?: string;
   /** Provider serving the run, from the router selection. */
   provider?: string;
   model?: string;
@@ -1972,6 +1977,7 @@ export class RuntimeManager {
     initialPhase: RolePhase,
     extraMcpServers: Record<string, unknown>,
     mode?: RunModeInfo,
+    connectorEnableUrl?: string,
   ): Promise<void> {
     const gui = mode === undefined || mode.mode === "gui";
     const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
@@ -1993,6 +1999,7 @@ export class RuntimeManager {
       extraMcpServers,
       atlasEnabled: useAtlas,
       ...(useAtlas ? { atlasRegistryPath: VM_ATLAS_REGISTRY_PATH } : {}),
+      ...(connectorEnableUrl ? { connectorEnableUrl } : {}),
     })) {
       await this.vm.writeFile(userId, file.path, file.content);
     }
@@ -2015,6 +2022,7 @@ export class RuntimeManager {
     extraMcpServers: Record<string, unknown>,
     mode?: RunModeInfo,
     restrictTools?: readonly string[],
+    connectorEnableUrl?: string,
   ): Promise<void> {
     const gui = mode === undefined || mode.mode === "gui";
     const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
@@ -2029,6 +2037,7 @@ export class RuntimeManager {
         extraMcpServers,
         atlasEnabled: useAtlas,
         ...(useAtlas ? { atlasRegistryPath: VM_ATLAS_REGISTRY_PATH } : {}),
+        ...(connectorEnableUrl ? { connectorEnableUrl } : {}),
       }),
     );
   }
@@ -3129,6 +3138,21 @@ export class RuntimeManager {
     const initialPhase = active.role
       ? this.rolePhaseFor(active.role, libraryPermissions, active.runMode, active.toolAllowlist, useAtlas)
       : this.defaultRolePhase(libraryPermissions, active.runMode, active.toolAllowlist, useAtlas);
+    const llmBaseUrlForRun = resolveLlmBaseUrl();
+    const approvalBaseUrlForRun = resolveApprovalBaseUrl();
+    if ((llmBaseUrlForRun || approvalBaseUrlForRun) && !active.runToken) {
+      try {
+        active.runToken = signRunToken(userId, runId);
+      } catch {
+        active.runToken = undefined;
+      }
+    }
+    if (active.runToken) {
+      const connectorBase = approvalBaseUrlForRun || llmBaseUrlForRun;
+      if (connectorBase) {
+        active.connectorEnableUrl = `${connectorBase}/api/runtime/connectors/${active.runToken}/enable`;
+      }
+    }
     try {
       await this.seedRoleFiles(
         userId,
@@ -3137,6 +3161,7 @@ export class RuntimeManager {
         initialPhase,
         libraryServers,
         active.runMode,
+        active.connectorEnableUrl,
       );
     } catch (error) {
       const message = redact(error instanceof Error ? error.message : String(error));
@@ -3194,6 +3219,7 @@ export class RuntimeManager {
           libraryMcpEntries(userId),
           active.runMode,
           active.toolAllowlist,
+          active.connectorEnableUrl,
         );
       } catch (error) {
         const message = redact(error instanceof Error ? error.message : String(error));
@@ -3226,12 +3252,19 @@ export class RuntimeManager {
     // finalizes (revoked in finalize). Local Docker runs have already passed
     // startup validation; other runtimes retain the legacy stdout gate when
     // no signing secret is configured.
-    let runToken: string | null = null;
-    if (llmBaseUrl || approvalBaseUrl) {
+    let runToken: string | null = active.runToken ?? null;
+    if (!runToken && (llmBaseUrl || approvalBaseUrl)) {
       try {
         runToken = signRunToken(userId, runId);
+        active.runToken = runToken;
       } catch {
         runToken = null;
+      }
+    }
+    if (runToken && !active.connectorEnableUrl) {
+      const connectorBase = approvalBaseUrl || llmBaseUrl;
+      if (connectorBase) {
+        active.connectorEnableUrl = `${connectorBase}/api/runtime/connectors/${runToken}/enable`;
       }
     }
     const hookBaseUrl = approvalBaseUrl && runToken ? approvalBaseUrl : null;
@@ -4007,6 +4040,7 @@ export class RuntimeManager {
     const currentSettings = readUserSettings(userId);
     const systemPacker = systemPackerOptionsFor(currentSettings);
     const contextPacker = contextPackerModeFor(currentSettings);
+    const autoCondenseLogs = autoCondenseLogsFor(currentSettings);
     const useAtlas = atlasEnabled() || atlasEnabledForUser(currentSettings);
 
     // Wall-clock timeout (SWARM_RUN_TIMEOUT_SEC): aborting the controller
@@ -4047,6 +4081,7 @@ export class RuntimeManager {
           memoryContext: active.memoryContext,
           systemPacker,
           ...(contextPacker === "l1" ? { contextPacker: "l1" as const } : {}),
+          ...(autoCondenseLogs ? { autoCondenseLogs: true } : {}),
           ...(active.stateLedger ? { stateLedger: active.stateLedger } : {}),
           ...(l1Files ?? {}),
           sessionId,

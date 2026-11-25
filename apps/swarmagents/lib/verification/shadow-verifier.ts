@@ -18,6 +18,8 @@
  */
 
 import { verifyPhase, type LLMCaller, type VerificationResult } from "../verification";
+import { filterObservation } from "../harness/observation-filter";
+import { testDigest } from "../harness/test-digest";
 
 /** Max primary-agent attempts (initial + bounces) before a run is accepted as-is. */
 export const SHADOW_VERIFIER_MAX_ROUNDS = 3;
@@ -61,6 +63,8 @@ export interface TestSuiteExecution {
   output: string;
   /** The commands that exited non-zero (empty when ok). */
   failedCommands: string[];
+  /** Compact failure digests for failed test commands, when available. */
+  failedDigests?: string[];
 }
 
 export interface ShadowVerificationSummary {
@@ -105,15 +109,26 @@ export async function runTestSuite(
 ): Promise<TestSuiteExecution> {
   const parts: string[] = [];
   const failedCommands: string[] = [];
+  const failedDigests: string[] = [];
   for (const command of testCommands) {
     const result = await runTestCommand(exec, repoRoot, command);
-    parts.push(`$ ${command}\n${result.stdout}${result.stderr}`);
-    if (result.exitCode !== 0) failedCommands.push(command);
+    const combined = `${result.stdout}${result.stderr}`;
+    parts.push(`$ ${command}\n${combined}`);
+    if (result.exitCode !== 0) {
+      failedCommands.push(command);
+      const digest =
+        testDigest(command, combined) ??
+        (combined.trim().length > 400
+          ? filterObservation({ command, output: combined, maxInlineChars: 1500, allowSpill: false }).text
+          : "");
+      if (digest) failedDigests.push(digest);
+    }
   }
   return {
     ok: failedCommands.length === 0,
     output: parts.join("\n"),
     failedCommands,
+    ...(failedDigests.length > 0 ? { failedDigests } : {}),
   };
 }
 
@@ -166,11 +181,15 @@ export function buildShadowTarget(
 }
 
 /** Remediation prompt for a broken build (skips the LLM entirely). */
-export function synthesizeBuildRemediation(failedCommands: readonly string[]): string {
-  return (
+export function synthesizeBuildRemediation(
+  failedCommands: readonly string[],
+  failedDigests?: readonly string[],
+): string {
+  const base =
     "The repository's test suite failed (nonzero exit). Fix the failing commands so " +
-    `they exit 0 and re-run the tests before finishing: ${failedCommands.join("; ")}.`
-  );
+    `they exit 0 and re-run the tests before finishing: ${failedCommands.join("; ")}.`;
+  if (!failedDigests?.length) return base;
+  return `${base}\n\nFailure digest:\n${failedDigests.join("\n---\n")}`;
 }
 
 /** Summary when the build broke — a hard fail, no LLM round-trip. */
@@ -179,7 +198,7 @@ export function synthesizeBuildFailure(tests: TestSuiteExecution): ShadowVerific
     passed: false,
     score: 0,
     violations: [`Test suite failed: ${tests.failedCommands.join(", ")}`],
-    remediationPrompt: synthesizeBuildRemediation(tests.failedCommands),
+    remediationPrompt: synthesizeBuildRemediation(tests.failedCommands, tests.failedDigests),
     badge: "fail",
     testsRan: true,
     buildBroke: true,
@@ -198,7 +217,19 @@ export async function shadowVerifyRound(
   if (!tests.ok) return synthesizeBuildFailure(tests);
 
   const diffSummary = await inspectArtifactDiff(deps.exec, ctx.repoRoot);
-  const audit = await verifyPhase(buildShadowTarget(ctx, tests.output, diffSummary), deps.callLLM);
+  const testOutputForVerifier =
+    tests.output.length > 4000
+      ? filterObservation({
+          command: ctx.testCommands[0],
+          output: tests.output,
+          maxInlineChars: 4000,
+          allowSpill: false,
+        }).text
+      : tests.output;
+  const audit = await verifyPhase(
+    buildShadowTarget(ctx, testOutputForVerifier, diffSummary),
+    deps.callLLM,
+  );
 
   return {
     passed: audit.passed,

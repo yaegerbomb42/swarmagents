@@ -1564,7 +1564,16 @@ export class DockerVmDriver implements VmDriver {
       // created before the limits were configured cannot keep running
       // without a CPU / memory / PID ceiling.
       await this.applyLimits(name);
-      if (stateStatus === "exited" || stateStatus === "paused" || stateStatus === "dead") {
+      if (
+        stateStatus === "exited" ||
+        stateStatus === "paused" ||
+        stateStatus === "dead" ||
+        // "created" means the container was created but never started (e.g.
+        // a desktop-mode create whose start was interrupted): without this
+        // the handle below would point at a container that never runs and
+        // the next exec would fail instead of transparently restarting it.
+        stateStatus === "created"
+      ) {
         const s = await this.run(["start", name]);
         if (s.code !== 0) {
           throw new VmUnavailableError(

@@ -17,6 +17,8 @@
  * Modes:
  *   - "best" (default, best-of-N): evaluate every candidate, land the
  *     passing one with the smallest churn (ties: input order).
+ *   - "first-pass": evaluate every candidate concurrently and land the
+ *     first passing one in input order (runBestOfNOracle's mode).
  *   - "first": land the first passing candidate, skip the rest.
  *   - "all": candidates are sequential patches; each is evaluated on top
  *     of the ones already landed and lands if it passes.
@@ -94,7 +96,7 @@ export interface OracleGateOptions {
   /** Repo-relative project directory where checks run. Default ".". */
   projectDir?: string;
   checks?: OracleCheck[];
-  mode?: "best" | "first" | "all";
+  mode?: "best" | "first-pass" | "first" | "all";
   /** Candidate evaluations to run concurrently in best mode (clamped to 1–4). */
   bestConcurrency?: number;
   /** Repo-relative dirs symlinked into each scratch (e.g. node_modules). */
@@ -219,8 +221,8 @@ export class OracleGate {
     const landed: string[] = [];
     const passed: { candidate: OracleCandidate; id: string; diff: string; churn: number; verdictIndex: number }[] = [];
 
-    if (this.opts.mode === "best") {
-      for (const { candidate, verdict } of await this.evaluateBest(candidates)) {
+    if (this.opts.mode === "best" || this.opts.mode === "first-pass") {
+      for (const { candidate, verdict } of await this.evaluateConcurrent(candidates)) {
         verdicts.push(verdict);
         if (verdict.status === "passed") {
           passed.push({ candidate, id: candidate.id, diff: candidate.diff, churn: verdict.churn, verdictIndex: verdicts.length - 1 });
@@ -241,32 +243,8 @@ export class OracleGate {
       }
     }
 
-    if (this.opts.mode === "best" && passed.length > 0) {
-      // Try in churn order until one lands: a land conflict (the real tree
-      // moved, or a duplicate id) falls through to the next passing
-      // candidate instead of failing the whole gate. The winner is tracked
-      // by verdict index, so duplicate candidate ids cannot land twice.
-      const ranked = [...passed].sort((a, b) => a.churn - b.churn);
-      let landedId: string | undefined;
-      for (const candidate of ranked) {
-        const current = verdicts[candidate.verdictIndex];
-        if (current.status !== "passed") continue;
-        const result = await this.landOrConflict(candidate.candidate, current, landed);
-        verdicts[candidate.verdictIndex] = result;
-        if (result.status === "passed" && result.landed) {
-          landedId = candidate.id;
-          break;
-        }
-      }
-      for (const candidate of passed) {
-        const v = verdicts[candidate.verdictIndex];
-        if (v.status === "passed" && !v.landed) {
-          verdicts[candidate.verdictIndex] = {
-            ...v,
-            note: `passed but not landed: ${landedId ?? "another candidate"} has less churn`,
-          };
-        }
-      }
+    if ((this.opts.mode === "best" || this.opts.mode === "first-pass") && passed.length > 0) {
+      await this.landWinner(passed, verdicts, landed);
     }
 
     const rejected = verdicts.filter((v) => v.status === "rejected" || v.status === "error").length;
@@ -294,7 +272,45 @@ export class OracleGate {
     };
   }
 
-  private async evaluateBest(candidates: OracleCandidate[]): Promise<{ candidate: OracleCandidate; verdict: CandidateVerdict }[]> {
+  /**
+   * Land exactly one of the passing candidates. In "best" mode they are tried
+   * in churn order (the smallest change wins, ties in input order); in
+   * "first-pass" mode `passed` is already in input order, so the first one
+   * wins. A land conflict (the real tree moved, or a duplicate id) falls
+   * through to the next passing candidate instead of failing the whole gate.
+   * The winner is tracked by verdict index, so duplicate candidate ids cannot
+   * land twice.
+   */
+  private async landWinner(
+    passed: { candidate: OracleCandidate; id: string; diff: string; churn: number; verdictIndex: number }[],
+    verdicts: CandidateVerdict[],
+    landed: string[],
+  ): Promise<void> {
+    const ranked = this.opts.mode === "best" ? [...passed].sort((a, b) => a.churn - b.churn) : passed;
+    let landedId: string | undefined;
+    for (const candidate of ranked) {
+      const current = verdicts[candidate.verdictIndex];
+      if (current.status !== "passed") continue;
+      const result = await this.landOrConflict(candidate.candidate, current, landed);
+      verdicts[candidate.verdictIndex] = result;
+      if (result.status === "passed" && result.landed) {
+        landedId = candidate.id;
+        break;
+      }
+    }
+    const why = this.opts.mode === "best" ? "has less churn" : "passed first";
+    for (const candidate of passed) {
+      const v = verdicts[candidate.verdictIndex];
+      if (v.status === "passed" && !v.landed) {
+        verdicts[candidate.verdictIndex] = {
+          ...v,
+          note: `passed but not landed: ${landedId ?? "another candidate"} ${why}`,
+        };
+      }
+    }
+  }
+
+  private async evaluateConcurrent(candidates: OracleCandidate[]): Promise<{ candidate: OracleCandidate; verdict: CandidateVerdict }[]> {
     const requested = this.opts.bestConcurrency ?? 3;
     const concurrency = Math.max(1, Math.min(4, Number.isFinite(requested) ? Math.floor(requested) : 3));
     const outcomes = new Array<{ candidate: OracleCandidate; verdict: CandidateVerdict }>(candidates.length);
@@ -594,4 +610,36 @@ export function runOracleGate(
   options: OracleGateOptions,
 ): Promise<OracleReport> {
   return new OracleGate(exec, options).run(candidates);
+}
+
+/**
+ * Context for `runBestOfNOracle`: the exec channel plus the gate options.
+ * The mode is fixed by the helper (first passing candidate wins).
+ */
+export interface BestOfNOracleContext extends Omit<OracleGateOptions, "mode"> {
+  /** The exec channel the checks run through (the run's VM exec in production). */
+  exec: OracleExec;
+}
+
+/**
+ * Best-of-N across candidate patches (one per model family): evaluate every
+ * candidate in its own scratch copy with bounded concurrency, then land only
+ * the first one — in input order — that passes tsc and the affected tests
+ * cleanly. Rejected candidates never touch the real tree (they are evicted:
+ * nothing of them lands, and only their diagnostic survives in the report).
+ *
+ * Checks default to `defaultOracleChecks()` (tsc, lint on the changed files,
+ * the affected tests). Logs `oracle: <rejected>/<total> candidates rejected`
+ * through `ctx.log`.
+ */
+export function runBestOfNOracle(
+  candidates: OracleCandidate[],
+  ctx: BestOfNOracleContext,
+): Promise<OracleReport> {
+  const { exec, checks, ...options } = ctx;
+  return new OracleGate(exec, {
+    checks: checks ?? defaultOracleChecks(),
+    ...options,
+    mode: "first-pass",
+  }).run(candidates);
 }

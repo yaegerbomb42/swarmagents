@@ -7,6 +7,7 @@
 // network and no model.
 
 import { ClaudeCodeRunner } from "../harness/runner";
+import { contextPackerFromEnv } from "../harness/context/contextGovernor";
 import {
   MAX_ROLE_PHASES,
   ROLE_CATALOG_PATH,
@@ -304,7 +305,7 @@ export class VmTeamHarness implements TeamHarness {
 
   constructor(opts: VmTeamHarnessOptions = {}) {
     this.vm = opts.vm ?? vmManager;
-    this.runner = opts.runner ?? new ClaudeCodeRunner();
+    this.runner = opts.runner ?? new ClaudeCodeRunner({ contextPacker: contextPackerFromEnv(process.env) });
     this.routerForUser = opts.routerForUser ?? (() => null);
     this.agentCard = opts.agentCard;
     this.desktopMode = opts.desktopMode ?? false;

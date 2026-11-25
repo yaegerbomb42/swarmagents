@@ -278,6 +278,15 @@ export class StateLedger {
     return steps.length ? steps[steps.length - 1].turn : 0;
   }
 
+  /**
+   * Turn number of the most recent recorded step (0 when the ledger is
+   * empty). The runner packs the next turn as latestTurn() + 1, so a
+   * resumed run's steps keep increasing instead of every turn stamping 0.
+   */
+  nextTurn(): number {
+    return this.latestTurn() + 1;
+  }
+
   setError(error: string | undefined): void {
     this.snapshot.lastError = error?.trim() || undefined;
   }
@@ -549,6 +558,28 @@ export function resolveContextPacker(selection: ContextPackerSelection = {}): Co
   const roleMode = selection.roleId ? selection.roles?.[selection.roleId] : undefined;
   if (isContextPackerMode(roleMode)) return roleMode;
   return DEFAULT_CONTEXT_PACKER;
+}
+
+/**
+ * Opt-in switch for the L1 packer: `SWARM_CONTEXT_PACKER=l1` enables it
+ * wherever a runner is constructed without an explicit packer choice.
+ * Anything else (including "claude-code" and unknown values) returns
+ * undefined so the runner's default applies — the env var can only turn
+ * L1 on, never silently change another explicit choice.
+ */
+export function contextPackerFromEnv(env: Record<string, string | undefined> = process.env): ContextPackerMode | undefined {
+  return env.SWARM_CONTEXT_PACKER === "l1" ? "l1" : undefined;
+}
+
+/**
+ * One-line summary of a finished turn for the ledger: whitespace
+ * collapsed, capped at 240 characters so a verbose final result can
+ * never flood the 600-token ledger. Empty input yields "" (the caller
+ * substitutes a generic outcome line).
+ */
+export function summarizeTurnResult(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > 240 ? `${flat.slice(0, 237).trimEnd()}…` : flat;
 }
 
 /**

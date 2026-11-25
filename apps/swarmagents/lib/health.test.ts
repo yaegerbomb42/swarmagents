@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { deepHealthSnapshot, healthSnapshot } from "./health";
 import { configureStorePaths } from "./board/store";
+import { CONNECTOR_CATALOG } from "./connectors/catalog";
+import { CONNECTORS } from "./library/catalog";
 import { configureProviderStorePaths, saveProvider } from "./providers/store";
 
 function tmpDir(): string {
@@ -14,7 +16,21 @@ function tmpDir(): string {
 test("health snapshot exposes only the agreed fields, never secrets", () => {
   process.env.SWARM_KEYS_ANTHROPIC = "sk-test-anthropic";
   const snap = healthSnapshot();
-  assert.deepEqual(Object.keys(snap).sort(), ["board", "builtAt", "commit", "ok", "providersConfigured", "providersScope", "uptimeSec", "version", "vmDriver"]);
+  assert.deepEqual(Object.keys(snap).sort(), [
+    "atlasReady",
+    "board",
+    "builtAt",
+    "catalogConnectorCount",
+    "commit",
+    "desktopEnabled",
+    "ok",
+    "providersConfigured",
+    "providersScope",
+    "toolForgeReady",
+    "uptimeSec",
+    "version",
+    "vmDriver",
+  ]);
   assert.equal(typeof snap.ok, "boolean");
   assert.equal(snap.version, "2.0.0");
   assert.ok(snap.uptimeSec >= 0);
@@ -219,4 +235,48 @@ test("deepHealthSnapshot exposes non-secret subsystem diagnostics", () => {
   } finally {
     delete process.env.SWARM_KEYS_ANTHROPIC;
   }
+});
+test("subsystem checks default to off, with counts from the catalogs", () => {
+  // Explicit env so a stray SWARM_* var in the test runner cannot flip a flag.
+  const snap = healthSnapshot({ NODE_ENV: "test" });
+  assert.equal(snap.desktopEnabled, false);
+  assert.equal(snap.atlasReady, false);
+  assert.equal(snap.catalogConnectorCount, CONNECTOR_CATALOG.length);
+  assert.ok(CONNECTOR_CATALOG.length > 0, "connector catalog is non-empty");
+  assert.equal(snap.toolForgeReady, CONNECTORS.length > 0);
+  assert.ok(CONNECTORS.length > 0, "MCP tool library is non-empty");
+  // Booleans and counts only: no key material, provider names, or paths.
+  assert.equal(typeof snap.desktopEnabled, "boolean");
+  assert.equal(typeof snap.atlasReady, "boolean");
+  assert.equal(typeof snap.toolForgeReady, "boolean");
+  assert.equal(typeof snap.catalogConnectorCount, "number");
+});
+
+test("desktopEnabled follows SWARM_VM_DESKTOP", () => {
+  assert.equal(healthSnapshot({ NODE_ENV: "test", SWARM_VM_DESKTOP: "1" }).desktopEnabled, true);
+  assert.equal(healthSnapshot({ NODE_ENV: "test", SWARM_VM_DESKTOP: "0" }).desktopEnabled, false);
+  assert.equal(healthSnapshot({ NODE_ENV: "test", SWARM_VM_DESKTOP: "yes" }).desktopEnabled, false);
+  assert.equal(healthSnapshot({ NODE_ENV: "test" }).desktopEnabled, false);
+});
+
+test("atlasReady follows SWARM_ATLAS_ENABLED", () => {
+  assert.equal(healthSnapshot({ NODE_ENV: "test", SWARM_ATLAS_ENABLED: "1" }).atlasReady, true);
+  assert.equal(healthSnapshot({ NODE_ENV: "test", SWARM_ATLAS_ENABLED: "0" }).atlasReady, false);
+  assert.equal(healthSnapshot({ NODE_ENV: "test" }).atlasReady, false);
+});
+
+test("subsystem fields never leak env values, even with keys set", () => {
+  const snap = healthSnapshot({
+    NODE_ENV: "test",
+    SWARM_VM_DESKTOP: "1",
+    SWARM_ATLAS_ENABLED: "1",
+    SWARM_KEYS_ANTHROPIC: "sk-test-subsystem-secret",
+  });
+  assert.equal(snap.desktopEnabled, true);
+  assert.equal(snap.atlasReady, true);
+  const serialized = JSON.stringify(snap);
+  assert.equal(serialized.includes("sk-test-subsystem-secret"), false);
+  assert.equal(serialized.includes("SWARM_KEYS_ANTHROPIC"), false);
+  assert.equal(serialized.includes("SWARM_VM_DESKTOP"), false);
+  assert.equal(serialized.includes("SWARM_ATLAS_ENABLED"), false);
 });

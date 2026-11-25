@@ -667,26 +667,45 @@ export class Router {
         throw new RouterError("Request aborted.", "aborted", attempts);
       }
 
-      const controller = new AbortController();
-      const unlink = linkAbort(request.signal, controller);
-      try {
-        return await this.startStreamCandidate(
-          candidate,
-          request,
-          controller,
-          attempts,
-          unlink
-        );
-      } catch (err) {
-        if (err instanceof AbortError) {
-          unlink();
+      // Rotate through the provider's keys on retryable pre-token failures,
+      // mirroring tryProvider: a 429 benches one key, not the whole
+      // provider. Each key attempt gets a fresh controller — a failed
+      // attempt aborts its own controller, which must not poison the retry.
+      const keyAttempts = Math.max(1, candidate.pool.size);
+      for (let keyIndex = 0; keyIndex < keyAttempts; keyIndex += 1) {
+        if (request.signal?.aborted) {
           throw new RouterError("Request aborted.", "aborted", attempts);
         }
-        if (err instanceof RouterError) {
+        const controller = new AbortController();
+        const unlink = linkAbort(request.signal, controller);
+        try {
+          return await this.startStreamCandidate(
+            candidate,
+            request,
+            controller,
+            attempts,
+            unlink
+          );
+        } catch (err) {
           unlink();
-          throw err;
+          if (err instanceof AbortError) {
+            throw new RouterError("Request aborted.", "aborted", attempts);
+          }
+          if (err instanceof RouterError) {
+            throw err;
+          }
+          if (
+            err instanceof ProviderError &&
+            err.retryable &&
+            keyIndex + 1 < keyAttempts &&
+            candidate.pool.hasAvailable()
+          ) {
+            continue;
+          }
+          // No more usable keys (or a non-retryable failure): fail over to
+          // the next ranked provider.
+          break;
         }
-        // Keep failing over to the next ranked provider.
       }
     }
 

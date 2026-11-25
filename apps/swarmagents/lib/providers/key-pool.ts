@@ -142,8 +142,40 @@ export class KeyPool {
 
   /** Returns a lease on the best available key, or null if all are cooling. */
   acquire(): KeyLease | null {
+    const state = this.pick(new Set());
+    return state ? this.leaseFor(state) : null;
+  }
+
+  /**
+   * Lease up to `count` DISTINCT available keys, in selection order.
+   * Plain acquire() cannot do this: in "fallback" mode it returns the same
+   * first usable key on every call, and in "random" mode it can draw the
+   * same key twice, so a parallel race would silently run on one key.
+   * Returns fewer leases than requested when fewer keys are usable.
+   */
+  acquireMany(count: number): KeyLease[] {
+    const wanted = Math.max(0, Math.floor(count));
+    const excluded = new Set<string>();
+    const leases: KeyLease[] = [];
+    for (let n = 0; n < wanted; n += 1) {
+      const state = this.pick(excluded);
+      if (!state) break;
+      excluded.add(state.id);
+      leases.push(this.leaseFor(state));
+    }
+    return leases;
+  }
+
+  /**
+   * Pick the best usable key outside `exclude`, per the selection mode.
+   * Marks the pick as most-recently-used so the next pick in the same call
+   * (or the next acquire) moves on. Returns null when nothing is usable.
+   */
+  private pick(exclude: ReadonlySet<string>): KeyState | null {
     const now = this.now();
-    const available = this.states.filter((state) => state.cooldownUntil <= now);
+    const available = this.states.filter(
+      (state) => state.cooldownUntil <= now && !exclude.has(state.id),
+    );
     if (available.length === 0) return null;
 
     let chosen: KeyState;
@@ -187,7 +219,11 @@ export class KeyPool {
     }
 
     chosen.lastUsedTick = ++this.tick;
-    const state = chosen;
+    return chosen;
+  }
+
+  /** A settle-once lease on one key state. */
+  private leaseFor(state: KeyState): KeyLease {
     let settled = false;
 
     return {

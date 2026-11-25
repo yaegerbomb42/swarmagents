@@ -401,3 +401,41 @@ test("race: network error on one key does not stop the others", async () => {
   assert.equal(result.keyId, "groq:key-2");
   assert.equal(pool.stats()[0].failures, 1);
 });
+
+test("race: fallback selection mode still races distinct keys", async () => {
+  const pool = new KeyPool("groq", FAKE_KEYS, { selectionMode: "fallback" });
+  const seen = new Set<string>();
+  const inner = makeFetch(
+    new Map([
+      ...behaviorFor(FAKE_KEYS[0], {
+        delayMs: 50,
+        status: 200,
+        body: completionBody("slow answer"),
+      }),
+      ...behaviorFor(FAKE_KEYS[1], {
+        delayMs: 5,
+        status: 200,
+        body: completionBody("fast answer"),
+      }),
+    ]),
+  );
+  const fetchMock: FetchLike = (async (url, init) => {
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    const authKey = Object.keys(headers).find((k) => k.toLowerCase() === "authorization");
+    if (authKey) seen.add(headers[authKey]!.replace(/^Bearer\s+/i, ""));
+    return inner(url, init);
+  }) as FetchLike;
+  const engine = new ProviderRaceEngine({
+    router: makeRouter(pool, GROQ_CONFIG),
+    fetch: fetchMock,
+  });
+
+  const result = await engine.complete({ prompt: "hi", provider: "groq", candidates: 2 });
+  assert.equal(result.text, "fast answer");
+  assert.equal(result.keyId, "groq:key-2");
+  assert.deepEqual(
+    [...seen].sort(),
+    [FAKE_KEYS[0], FAKE_KEYS[1]],
+    "both keys must be raced, not just the fallback first key",
+  );
+});

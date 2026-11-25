@@ -300,3 +300,105 @@ test("a loser that errors mid-stream does not break the winner", async () => {
   const failedKey = router.stats().providers[0].keys[0];
   assert.equal(failedKey.failures, 1);
 });
+
+test("stream rotates to the next key of the same provider on a pre-token 429", async () => {
+  let clock = 1_000;
+  const secondKey = makeStream(anthropicStream(["second", " key"]));
+
+  const fetchMock: FetchLike = async (_url, init) => {
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    const key = headers["x-api-key"] ?? "";
+    if (key === "sk-ant-key-one") {
+      return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+        status: 429,
+        headers: { "retry-after": "1", "content-type": "application/json" },
+      });
+    }
+    return secondKey.response;
+  };
+
+  const router = new Router({
+    providers: [provider("anthropic", "anthropic", ["sk-ant-key-one", "sk-ant-key-two"], 0)],
+    fetch: fetchMock,
+    now: () => clock,
+  });
+
+  const events: StreamEvent[] = [];
+  for await (const event of router.stream({
+    messages: [userMessage],
+    tier: "balanced",
+  })) {
+    events.push(event);
+  }
+
+  const done = collect(events);
+  assert.equal(done.provider, "anthropic");
+  assert.equal(done.text, "second key");
+  assert.equal(done.keyId, "anthropic:key-2");
+
+  const keys = router.stats().providers[0].keys;
+  assert.equal(keys[0].failures, 1);
+  assert.equal(keys[0].available, false);
+  assert.equal(keys[0].cooldownUntil, 1_000 + 1_000, "Retry-After is honoured");
+  assert.equal(keys[0].lastStatus, 429);
+  assert.equal(keys[1].successes, 1);
+
+  const firstAttempt = done.attempts[0];
+  assert.equal(firstAttempt?.ok, false);
+  assert.equal(firstAttempt?.keyId, "anthropic:key-1");
+  assert.equal(firstAttempt?.status, 429);
+  assert.equal(done.attempts.at(-1)?.ok, true);
+  assert.equal(done.attempts.at(-1)?.keyId, "anthropic:key-2");
+
+  // Cooldown recovery: once the window passes, the rate-limited key is
+  // usable again instead of being stuck out of rotation.
+  clock = 2_500;
+  assert.equal(router.stats().providers[0].keys[0].available, true);
+});
+
+test("stream fails over to the next provider only after every key is exhausted", async () => {
+  const openai = makeStream(openaiStream(["after", " failover"]));
+  let anthropicCalls = 0;
+
+  const fetchMock: FetchLike = async (url, init) => {
+    if (url.includes("anthropic")) {
+      anthropicCalls += 1;
+      return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+        status: 429,
+        headers: { "retry-after": "1", "content-type": "application/json" },
+      });
+    }
+    return openai.response;
+  };
+
+  const router = new Router({
+    providers: [
+      provider("anthropic", "anthropic", ["sk-ant-key-one", "sk-ant-key-two"], 0),
+      provider("openai", "openai", ["sk-oai-failover"], 1),
+    ],
+    fetch: fetchMock,
+  });
+
+  const events: StreamEvent[] = [];
+  for await (const event of router.stream({
+    messages: [userMessage],
+    tier: "balanced",
+  })) {
+    events.push(event);
+  }
+
+  const done = collect(events);
+  assert.equal(done.provider, "openai");
+  assert.equal(done.text, "after failover");
+  assert.equal(anthropicCalls, 2, "both anthropic keys were tried before failover");
+
+  const keys = router.stats().providers[0].keys;
+  assert.deepEqual(
+    keys.map((key) => key.failures),
+    [1, 1],
+  );
+  assert.deepEqual(
+    done.attempts.map((attempt) => attempt.keyId),
+    ["anthropic:key-1", "anthropic:key-2", "openai:key-1"],
+  );
+});

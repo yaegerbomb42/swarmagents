@@ -1160,7 +1160,8 @@ test("sanitizeToolJsonSchema: caps recursion depth and passes plain values throu
   let depth = 0;
   let cursor: unknown = out;
   while (cursor !== null && typeof cursor === "object") {
-    cursor = (cursor as Record<string, unknown>).properties?.leaf;
+    const props = (cursor as Record<string, unknown>).properties;
+    cursor = (props as Record<string, unknown> | undefined)?.leaf;
     depth += 1;
   }
   assert.ok(depth <= 20, `depth should be bounded, got ${depth}`);

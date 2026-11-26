@@ -7,10 +7,12 @@
 
 import { NextResponse } from "next/server";
 import { canonicalProviderId } from "@/lib/providers/catalog";
+import { mergedModelCapabilities, runModeForCapabilities } from "@/lib/providers/capabilities";
 import { HealthChecker } from "@/lib/providers/health";
 import { routerProviders } from "@/lib/providers/store";
 import { providerOwner } from "@/lib/providers/owner";
 import { checkProviderProbeRateLimit } from "@/lib/rate-limit";
+import { isDesktopModeEnabled } from "@/lib/vm/desktop";
 
 export const dynamic = "force-dynamic";
 
@@ -41,11 +43,21 @@ export async function POST(request: Request, ctx: RouteContext) {
   const rawId = typeof params?.id === "string" ? params.id : "";
   const id = canonicalProviderId(rawId);
 
-  const checker = new HealthChecker({ providers: routerProviders(owner) });
+  const providers = routerProviders(owner);
+  const checker = new HealthChecker({ providers });
   const health = await checker.checkProvider(id);
   if (!health) {
     return NextResponse.json({ error: "Provider not found." }, { status: 404, headers: NO_STORE });
   }
 
-  return NextResponse.json({ test: health }, { headers: NO_STORE });
+  const saved = providers.find((c) => c.id === id);
+  const model = health.model ?? saved?.models?.balanced ?? saved?.models?.fast ?? saved?.models?.deep ?? "";
+  const capabilities = mergedModelCapabilities(saved ?? { id }, model);
+  const runMode = runModeForCapabilities(capabilities, {
+    desktopEnabled: isDesktopModeEnabled(),
+    provider: id,
+    ...(model ? { model } : {}),
+  });
+
+  return NextResponse.json({ test: health, runMode }, { headers: NO_STORE });
 }

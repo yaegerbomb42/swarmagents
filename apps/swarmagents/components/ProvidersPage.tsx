@@ -166,9 +166,23 @@ export function ProvidersPage() {
   const [confirmRemove, setConfirmRemove] = useState("");
   /** Provider ids with an in-flight mutation (a set so actions can overlap). */
   const [busy, setBusy] = useState<Set<string>>(() => new Set());
-  /** Per-provider test-connection result (testing flag, ok/latency/error). */
+  /** Per-provider test-connection result (testing flag, ok/latency/error/runMode). */
   const [testState, setTestState] = useState<
-    Record<string, { testing: boolean; ok?: boolean; latencyMs?: number; error?: string }>
+    Record<
+      string,
+      {
+        testing: boolean;
+        ok?: boolean;
+        latencyMs?: number;
+        error?: string;
+        runMode?: {
+          mode: string;
+          label: string;
+          reason: string;
+          capabilities?: { vision?: boolean; tools?: boolean };
+        };
+      }
+    >
   >({});
 
   const refresh = useCallback(async () => {
@@ -452,10 +466,22 @@ export function ProvidersPage() {
       }
       const body = (await res.json()) as {
         test: { ok: boolean; latencyMs: number; error?: string };
+        runMode?: {
+          mode: string;
+          label: string;
+          reason: string;
+          capabilities?: { vision?: boolean; tools?: boolean };
+        };
       };
       setTestState((prev) => ({
         ...prev,
-        [entry.id]: { testing: false, ok: body.test.ok, latencyMs: body.test.latencyMs, error: body.test.error },
+        [entry.id]: {
+          testing: false,
+          ok: body.test.ok,
+          latencyMs: body.test.latencyMs,
+          error: body.test.error,
+          runMode: body.runMode,
+        },
       }));
     } catch (err) {
       setTestState((prev) => ({
@@ -831,15 +857,27 @@ export function ProvidersPage() {
                       {testState[entry.id]?.testing ? "Testing…" : "Test connection"}
                     </button>
                     {testState[entry.id]?.testing === false && (
-                      <span
-                        className={`flex items-center gap-1.5 text-[11px] ${
-                          testState[entry.id]?.ok ? "text-emerald-300" : "text-red-300"
-                        }`}
-                      >
-                        {testState[entry.id]?.ok
-                          ? `OK · ${testState[entry.id]?.latencyMs}ms`
-                          : `Failed · ${testState[entry.id]?.error ?? "unknown error"}`}
-                      </span>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span
+                          className={`flex items-center gap-1.5 text-[11px] ${
+                            testState[entry.id]?.ok ? "text-emerald-300" : "text-red-300"
+                          }`}
+                        >
+                          {testState[entry.id]?.ok
+                            ? `OK · ${testState[entry.id]?.latencyMs}ms`
+                            : `Failed · ${testState[entry.id]?.error ?? "unknown error"}`}
+                        </span>
+                        {testState[entry.id]?.ok && testState[entry.id]?.runMode && (
+                          <span
+                            title={testState[entry.id]?.runMode?.reason}
+                            data-testid={`provider-runmode-${entry.id}`}
+                            className="rounded-full border border-white/15 bg-white/10 px-2 py-0.5 text-[10px] font-medium text-white/80"
+                          >
+                            {testState[entry.id]?.runMode?.label}
+                            {testState[entry.id]?.runMode?.capabilities?.vision ? " · Vision" : ""}
+                          </span>
+                        )}
+                      </div>
                     )}
                   </div>
                 )}

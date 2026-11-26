@@ -137,3 +137,26 @@ test("per-user probe rate limit trips at 30/min with 429, Retry-After and no-sto
   );
   assert.equal(other.status, 404);
 });
+
+test("POST returns resolved runMode & capabilities alongside probe result without leaking key", async () => {
+  saveProvider("local", { id: "openai", apiKey: KEY, models: ["gpt-4o"] });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => okResponse()) as typeof fetch;
+  try {
+    const res = await post("openai");
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.equal(text.includes(KEY), false, "response leaked the key");
+    const body = JSON.parse(text) as {
+      test: { ok: boolean };
+      runMode?: { mode: string; label: string; capabilities: { vision: boolean; tools: boolean } };
+    };
+    assert.equal(body.test.ok, true);
+    assert.ok(body.runMode, "expected runMode capability summary");
+    assert.equal(body.runMode?.capabilities.vision, true);
+    assert.equal(body.runMode?.capabilities.tools, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

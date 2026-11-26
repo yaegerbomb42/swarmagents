@@ -246,6 +246,20 @@ export interface RunAudit {
   createdAt: number;
 }
 
+/** Stored name of a run's frame-recorder replay inside its report directory. */
+export const DESKTOP_REPLAY_FILE = "replay.rfb";
+
+/** Metadata for the recorded desktop replay attached to a completed run. */
+export interface ReportReplayMeta {
+  /** Always DESKTOP_REPLAY_FILE; the route serves it, clients never see a path. */
+  file: string;
+  mime: string;
+  size: number;
+  /** Framebuffer geometry the recording's Raw/CopyRect rectangles use. */
+  width: number;
+  height: number;
+}
+
 /** The full per-run report document. */
 export interface RunReport {
   runId: string;
@@ -266,6 +280,8 @@ export interface RunReport {
   artifacts: ReportArtifact[];
   /** Screenshots taken at start, during, and at end of the run. */
   shots: ReportShotMeta[];
+  /** Frame-recorder replay, when a viewer watched this run's desktop. */
+  replay?: ReportReplayMeta;
   meta: ReportCardMeta;
   /**
    * Per-model token accounting folded from the run's llm.call / usage

@@ -437,6 +437,7 @@ async function makeProxy(opts: {
   resolvePreviewShare?: (token: string) => PreviewShareOwner | null;
   recordFrames?: boolean;
   recordingDir?: string;
+  isActiveRun?: (userId: string, runId: string) => boolean;
 } = {}): Promise<{
   proxy: DesktopProxy;
   port: number;
@@ -489,18 +490,24 @@ async function makeProxy(opts: {
     maxViewersPerUser: opts.maxViewers,
     recordFrames: opts.recordFrames,
     recordingDir: opts.recordingDir,
+    isActiveRun: opts.isActiveRun,
   });
   await proxy.listen();
   return { proxy, port: proxy.port, aliceVm, bobVm, aliceApp, bobApp };
 }
 
-function wsUrl(port: number, mode?: "view" | "control"): string {
-  const q = mode ? `?mode=${mode}` : "";
-  return `ws://127.0.0.1:${port}${DESKTOP_WS_PATH}${q}`;
+function wsUrl(port: number, mode?: "view" | "control", run?: string): string {
+  const query = [mode ? `mode=${mode}` : "", run ? `run=${encodeURIComponent(run)}` : ""].filter(Boolean);
+  return `ws://127.0.0.1:${port}${DESKTOP_WS_PATH}${query.length ? `?${query.join("&")}` : ""}`;
 }
 
-async function openDesktopSession(port: number, userId: string, mode?: "view" | "control"): Promise<TestWsClient> {
-  const client = await TestWsClient.connect(wsUrl(port, mode), { cookie: sessionFor(userId) });
+async function openDesktopSession(
+  port: number,
+  userId: string,
+  mode?: "view" | "control",
+  run?: string,
+): Promise<TestWsClient> {
+  const client = await TestWsClient.connect(wsUrl(port, mode, run), { cookie: sessionFor(userId) });
   await completeRfbClientHandshake(client);
   return client;
 }
@@ -1073,6 +1080,46 @@ test("desktop proxy: recordFrames + recordingDir writes upstream frames to a rec
     assert.ok(decoded[1].raw.equals(frameB), "second recorded frame exact");
 
     client.close();
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("desktop proxy: a run-tagged viewer writes a run-scoped recording", async () => {
+  const recordingDir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-run-recording-"));
+  const { proxy, port, aliceVm } = await makeProxy({
+    recordFrames: true,
+    recordingDir,
+    isActiveRun: (userId, runId) => userId === "alice" && runId === "run_1",
+  });
+  try {
+    const client = await openDesktopSession(port, "alice", "view", "run_1");
+    aliceVm.push(fbuRaw(2, 2, 0x33));
+    await sleep(50);
+    const files = fs.readdirSync(recordingDir).filter((f) => f.endsWith(".rfb"));
+    assert.equal(files.length, 1);
+    assert.match(files[0], /^frames-run_1-\d+\.rfb$/, "filename is keyed to the run, not the viewer");
+    client.close();
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("desktop proxy: a forged or stale run tag records nothing", async () => {
+  const recordingDir = fs.mkdtempSync(path.join(os.tmpdir(), "proxy-bad-run-tag-"));
+  const { proxy, port, aliceVm } = await makeProxy({
+    recordFrames: true,
+    recordingDir,
+    isActiveRun: (userId, runId) => userId === "alice" && runId === "run_1",
+  });
+  try {
+    const forged = await openDesktopSession(port, "alice", "view", "run_2");
+    const stale = await openDesktopSession(port, "bob", "view", "run_1");
+    aliceVm.push(fbuRaw(2, 2, 0x44));
+    await sleep(50);
+    assert.deepEqual(fs.readdirSync(recordingDir), [], "no recording for an unverified run tag");
+    forged.close();
+    stale.close();
   } finally {
     await proxy.close();
   }

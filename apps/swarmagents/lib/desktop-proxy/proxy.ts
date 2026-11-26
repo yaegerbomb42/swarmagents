@@ -71,6 +71,7 @@ import type { HandbackSummary } from "./takeover/types";
 import { FrameTap, type FrameTapOptions } from "./frame-tap";
 import type { CaptionFrame, KeyframeMeta } from "./takeover/types";
 import type { StoredKeyframe } from "./takeover/keyframe-store";
+import { desktopRecordingName } from "../runtime/desktop-replay";
 
 export const DESKTOP_WS_PATH = "/desktop/ws";
 export const DESKTOP_HTTP_PREFIX = "/desktop/";
@@ -89,6 +90,8 @@ export const PREVIEW_WS_PREFIX = "/preview/";
 const PREVIEW_SHARE_RE = /^\/preview\/share\/([^/]+)\/([^/]+)(\/.*)?$/;
 /** `/preview/<port>/...` — the session-gated preview mount. */
 const PREVIEW_SESSION_RE = /^\/preview\/([^/]+)(\/.*)?$/;
+/** Run tags are opaque ids; the same shape the run log store accepts. */
+const RUN_TAG_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 export const DEFAULT_PROXY_PORT = 3778;
 export const DEFAULT_PROXY_HOST = "127.0.0.1";
@@ -151,6 +154,12 @@ export interface DesktopProxyOptions {
   recordFrames?: boolean;
   /** Recording directory used when `recordFrames` is true. */
   recordingDir?: string;
+  /**
+   * Called with the run tag from the viewer's `?run=` query param. Recording
+   * happens only for a run the authenticated user still owns and that is
+   * active; a client-supplied tag is a hint, never an authorization decision.
+   */
+  isActiveRun?: (userId: string, runId: string) => boolean;
   /**
    * Takeover session manager (state machine + summarizer glue). Defaults
    * to a manager backed by the app's VM manager. Tests inject one with
@@ -859,6 +868,20 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
     const wantsControl =
       url.searchParams.get("mode") === "control" || url.searchParams.get("takeover") === "1";
 
+    // A viewer can tag its session with the run it is watching. The tag only
+    // names a recording file; ownership and activity are checked here, so a
+    // client cannot record frames into another user's run replay.
+    const requestedRun = url.searchParams.get("run");
+    let recordingRunId: string | undefined;
+    let recordSession = Boolean(opts.recordFrames && opts.recordingDir);
+    if (requestedRun) {
+      recordingRunId =
+        !guest && RUN_TAG_RE.test(requestedRun) && opts.isActiveRun?.(user.id, requestedRun)
+          ? requestedRun
+          : undefined;
+      recordSession = Boolean(recordingRunId);
+    }
+
     const endpoint = await resolveEndpointFor(user.id);
     if (!endpoint) return writeUpgradeRefusal(socket, 404, "No desktop VM for this user.");
 
@@ -970,8 +993,13 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
       // upstream side: VNCAuth with the server-side password) and then splices
       // the streams, applying view-mode input filtering.
       const recordingFile =
-        opts.recordFrames && opts.recordingDir
-          ? path.join(opts.recordingDir, `frames-${session.userId}-${session.id}.rfb`)
+        recordSession && opts.recordingDir
+          ? path.join(
+              opts.recordingDir,
+              recordingRunId
+                ? desktopRecordingName(recordingRunId, session.id)
+                : `frames-${session.userId}-${session.id}.rfb`,
+            )
           : undefined;
       const frameTap = opts.frameTap ? new FrameTap(opts.frameTap) : undefined;
       session.bridge = new DesktopBridge(socket, upSocket, {
@@ -981,7 +1009,7 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
         onClose: (reason) => closeSession(session, reason),
         clientHead: head,
         upstreamHead: upHead,
-        recordFrames: opts.recordFrames,
+        recordFrames: Boolean(recordingFile),
         recordingFile,
         // Decoded human input feeds the takeover summarizer (counted only
         // while this session is the controller; ignored otherwise).

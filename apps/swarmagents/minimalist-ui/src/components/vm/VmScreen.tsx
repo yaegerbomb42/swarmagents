@@ -422,6 +422,7 @@ export function VmScreen({
               vmState={vmDisplay.state}
               vmResetting={vmResetting}
               runActive={liveRun}
+              runId={runId}
               onStopRun={onStopRun}
               presence={effectivePresence}
               computerAction={effectiveComputerAction}

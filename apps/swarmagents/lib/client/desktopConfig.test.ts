@@ -26,6 +26,18 @@ test("plain http uses ws:// so local dev connects without TLS", () => {
   assert.equal(url, "ws://localhost:3000/desktop/ws?mode=control");
 });
 
+test("the viewer tags its session with the active run for replay", () => {
+  assert.equal(
+    desktopWsUrl("view", LOC, "client-1", "run_abc"),
+    "wss://swarmagents.codes/desktop/ws?mode=view&client=client-1&run=run_abc",
+  );
+  assert.equal(
+    desktopWsUrl("control", LOC, undefined, "../../etc/passwd"),
+    "wss://swarmagents.codes/desktop/ws?mode=control",
+    "invalid run ids are never sent to the proxy",
+  );
+});
+
 test("the proxy path constants match the d2 contract", () => {
   assert.equal(DESKTOP_WS_PATH, "/desktop/ws");
   assert.equal(DESKTOP_SCREENSHOT_PATH, "/api/runtime/vm/screenshot");

@@ -76,6 +76,8 @@ export interface DesktopViewProps {
   vmResetting?: boolean;
   /** True while an agent run is streaming (adds the takeover warning). */
   runActive?: boolean;
+  /** Run to tag this viewer's session with, so its frames can be replayed. */
+  runId?: string;
   /** Stop the live agent run from the control-mode banner (optional). */
   onStopRun?: () => void;
   /**
@@ -251,6 +253,7 @@ export function DesktopView({
   vmState,
   vmResetting = false,
   runActive = false,
+  runId,
   onStopRun,
   embedded = false,
   control,
@@ -286,6 +289,7 @@ export function DesktopView({
   const rfbRef = useRef<RFB | null>(null);
   const modeRef = useRef<DesktopControlMode>(mode);
   const intentRef = useRef(intentControl);
+  const replayRunRef = useRef(runId);
   // Stable takeover identity for this mount: the server keys control to it
   // across the reconnect-to-switch dials and the state poll.
   const clientIdRef = useRef("");
@@ -382,7 +386,7 @@ export function DesktopView({
       dialStartedRef.current = performance.now();
       rfb = new RFB(
         target,
-        desktopWsUrl(wantsControl ? "control" : "view", undefined, clientIdRef.current),
+        desktopWsUrl(wantsControl ? "control" : "view", undefined, clientIdRef.current, runId),
         { shared: true },
       );
     } catch {
@@ -515,6 +519,15 @@ export function DesktopView({
     teardown();
     dispatch({ type: "retry-now" });
   }, [intentControl, teardown]);
+
+  // A new run must not keep recording frames onto the previous run's replay:
+  // re-dial so the proxy sees the new `run` tag on the session.
+  useEffect(() => {
+    if (replayRunRef.current === runId) return;
+    replayRunRef.current = runId;
+    teardown();
+    dispatch({ type: "retry-now" });
+  }, [runId, teardown]);
 
   // Grant/handback on the live socket: flip noVNC's input gate in step
   // with the effective mode (the proxy enforces the same server-side).

@@ -42,6 +42,10 @@ export const DESKTOP_FRAME_HEIGHT = 900;
  * `clientId` is the takeover identity: the server keys control to it, so the
  * same id must be reused across reconnect-to-switch dials (and on the
  * takeover-state poll) for the session to keep its place in the machine.
+ *
+ * `runId` tags the viewer's session with the run it is watching, so the proxy
+ * can attach its frame recording to that run's report. The proxy validates the
+ * id and the caller's ownership; it never trusts this hint for authorization.
  */
 function desktopProxyHost(host: string): string {
   // In local Next.js dev (127.0.0.1:3777 / localhost:3777 without nginx),
@@ -55,10 +59,12 @@ export function desktopWsUrl(
   mode: DesktopMode,
   location: { protocol: string; host: string } = globalThis.location,
   clientId?: string,
+  runId?: string,
 ): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const client = clientId ? `&client=${encodeURIComponent(clientId)}` : "";
-  return `${proto}//${desktopProxyHost(location.host)}${DESKTOP_WS_PATH}?mode=${mode}${client}`;
+  const run = runId && /^[A-Za-z0-9_-]{1,64}$/.test(runId) ? `&run=${encodeURIComponent(runId)}` : "";
+  return `${proto}//${desktopProxyHost(location.host)}${DESKTOP_WS_PATH}?mode=${mode}${client}${run}`;
 }
 
 /** Build the takeover-state poll URL for a client id. */

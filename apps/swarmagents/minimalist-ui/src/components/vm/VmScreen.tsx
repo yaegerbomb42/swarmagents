@@ -32,6 +32,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Square } from "lucide-react";
 import type { VmStatus } from "../../../../lib/vm/types";
+import { fetchListeningPorts } from "../../../../lib/client/previewPorts";
 import {
   deriveComputerAction,
   derivePresence,
@@ -61,7 +62,7 @@ import { BrowserView } from "../BrowserView";
 import { DesktopView, type DesktopConnectionInfo } from "../DesktopView";
 import { FilesView } from "../FilesView";
 import { shortPath } from "../../design/vm-tokens";
-import { useIdleChrome, VM_VIEW_TABS, VmFrame, VmStatusBar, type ComputerView } from "./VmChrome";
+import { LiveAppPreviewPill, useIdleChrome, VM_VIEW_TABS, VmFrame, VmStatusBar, type ComputerView } from "./VmChrome";
 import { TerminalView } from "./TerminalView";
 
 export type { ComputerView } from "./VmChrome";
@@ -351,6 +352,29 @@ export function VmScreen({
   const connection = liveRun ? { status: stream.status, reconnecting: stream.status === "reconnecting" } : null;
   const streamBadge = liveRun ? getRunStreamBadge(stream) : null;
 
+  const [listeningPorts, setListeningPorts] = useState<number[]>([]);
+  const shouldPollPorts = vmDisplay.state === "ready" || (liveRun && vmDisplay.state !== "hibernated" && vmDisplay.state !== "error");
+
+  useEffect(() => {
+    if (!shouldPollPorts) {
+      setListeningPorts([]);
+      return;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+    const poll = async () => {
+      const result = await fetchListeningPorts(fetch, controller.signal);
+      if (!cancelled) setListeningPorts(result.running ? result.ports : []);
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 10_000);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [shouldPollPorts, runId]);
+
   // The status bar stays one line: the location slot names the agent on the
   // desktop, the page in the browser and the file the agent last wrote in
   // Files. Long values truncate (shortPath), never wrap.
@@ -379,6 +403,7 @@ export function VmScreen({
       className={className}
       controls={
         <>
+          <LiveAppPreviewPill ports={listeningPorts} />
           {streamBadge && liveRun && (
             <span
               data-testid="stream-status-badge"

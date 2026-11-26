@@ -15,18 +15,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { POST } from "./tasks/route";
-import { GET as streamGET } from "./stream/[runId]/route";
 import { RuntimeManager, setRuntimeManagerForTesting } from "../../../lib/runtime/manager";
 import { createRouter } from "../../../lib/providers";
 import { VmManager } from "../../../lib/vm/manager";
 import { FakeVmDriver } from "../../../lib/vm/fake-driver";
 import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
 import {
+  assertAgentExec,
   assertDispatchLifecycle,
   assertDispatchOrdering,
-  dispatchStreamRequest,
+  dispatchEvents,
   dispatchTaskRequest,
-  readUntil,
   recordedLines,
 } from "./dispatch-fixtures";
 
@@ -58,26 +57,11 @@ test("dispatch streams run.created..run.finished in order with gapless SSE ids",
   setRuntimeManagerForTesting(new RuntimeManager({ vm: new VmManager({ customDriver: driver }), router }));
 
   const post = await POST(dispatchTaskRequest("run the dispatch", USER));
-  assert.equal(post.status, 201);
-  const { runId } = (await post.json()) as { runId: string };
-  assert.match(runId, /^run_[A-Za-z0-9_-]+$/);
-
-  const res = await streamGET(dispatchStreamRequest(runId, USER), { params: Promise.resolve({ runId }) });
-  assert.equal(res.headers.get("content-type"), "text/event-stream; charset=utf-8");
-  const events = await readUntil(res, "run.finished");
+  const events = await dispatchEvents(post, USER);
 
   assertDispatchOrdering(events);
 
   assertDispatchLifecycle(events, "sess_unit_1");
 
-  // The driver received exactly one agent exec (the RunReporter's background
-  // workspace listing/screenshot execs are filtered out), with the prompt in
-  // argv, the harness contract flags in order, and provider keys kept out of
-  // argv.
-  const agentCalls = driver.calls.filter((call) => call.cmd[0] === "claude");
-  assert.equal(agentCalls.length, 1);
-  const cmd = agentCalls[0].cmd;
-  assert.deepEqual(cmd.slice(0, 5), ["claude", "-p", "--output-format", "stream-json", "--verbose"]);
-  assert.deepEqual(cmd.slice(-2), ["--", "run the dispatch"]);
-  assert.equal(cmd.some((arg) => arg.includes("sk-test-gw-key-0000")), false);
+  assertAgentExec(driver.calls, "claude", "run the dispatch", ["sk-test-gw-key-0000"]);
 });

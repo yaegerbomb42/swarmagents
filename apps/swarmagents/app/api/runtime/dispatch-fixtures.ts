@@ -116,3 +116,38 @@ export function assertDispatchLifecycle(events: DispatchEvent[], sessionId: stri
   assert.equal(finished?.exitCode, 0);
   assert.equal(finished?.sessionId, sessionId);
 }
+
+/**
+ * Drive one dispatch end to end and return the SSE events up to
+ * run.finished: assert the run was created, then read the stream for this
+ * user's run id with the SSE content-type the handler must set.
+ */
+export async function dispatchEvents(post: Response, user: string): Promise<DispatchEvent[]> {
+  assert.equal(post.status, 201);
+  const { runId } = (await post.json()) as { runId: string };
+  assert.match(runId, /^run_[A-Za-z0-9_-]+$/);
+  const { GET: streamGET } = await import("./stream/[runId]/route");
+  const res = await streamGET(dispatchStreamRequest(runId, user), { params: Promise.resolve({ runId }) });
+  assert.equal(res.headers.get("content-type"), "text/event-stream; charset=utf-8");
+  return readUntil(res, "run.finished");
+}
+
+/**
+ * The harness contract for the agent exec: exactly one claude invocation,
+ * stream-json argv shape, prompt after `--`, and provider keys never in argv.
+ */
+export function assertAgentExec(
+  calls: Array<{ cmd: string[] }>,
+  bin: string,
+  prompt: string,
+  secrets: readonly string[] = [],
+): void {
+  const agentCalls = calls.filter((call) => call.cmd[0] === bin);
+  assert.equal(agentCalls.length, 1);
+  const cmd = agentCalls[0].cmd;
+  assert.deepEqual(cmd.slice(0, 5), [bin, "-p", "--output-format", "stream-json", "--verbose"]);
+  assert.deepEqual(cmd.slice(-2), ["--", prompt]);
+  for (const secret of secrets) {
+    assert.equal(cmd.some((arg) => arg.includes(secret)), false);
+  }
+}

@@ -15,17 +15,16 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { POST } from "./tasks/route";
-import { GET as streamGET } from "./stream/[runId]/route";
 import { RuntimeManager, setRuntimeManagerForTesting } from "../../../lib/runtime/manager";
 import { VmManager } from "../../../lib/vm/manager";
 import { FakeVmDriver } from "../../../lib/vm/fake-driver";
 import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
 import {
+  assertAgentExec,
   assertDispatchLifecycle,
   assertDispatchOrdering,
-  dispatchStreamRequest,
+  dispatchEvents,
   dispatchTaskRequest,
-  readUntil,
   recordedLines,
 } from "./dispatch-fixtures";
 
@@ -116,13 +115,7 @@ test(
     setRuntimeManagerForTesting(new RuntimeManager({ vm: new VmManager({ customDriver: driver }) }));
 
     const post = await POST(dispatchTaskRequest("run the e2e dispatch", USER));
-    assert.equal(post.status, 201);
-    const { runId } = (await post.json()) as { runId: string };
-    assert.match(runId, /^run_[A-Za-z0-9_-]+$/);
-
-    const res = await streamGET(dispatchStreamRequest(runId, USER), { params: Promise.resolve({ runId }) });
-    assert.equal(res.headers.get("content-type"), "text/event-stream; charset=utf-8");
-    const events = await readUntil(res, "run.finished");
+    const events = await dispatchEvents(post, USER);
 
     assertDispatchOrdering(events);
 
@@ -132,14 +125,8 @@ test(
 
     assertDispatchLifecycle(events, "sess_e2e_1");
 
-    // The driver really invoked the fake binary (the RunReporter's background
-    // workspace listing/screenshot execs are filtered out), with the prompt in
-    // argv and provider keys kept out of argv.
-    const agentCalls = driver.calls.filter((call) => call.cmd[0] === claudeBin);
-    assert.equal(agentCalls.length, 1);
-    const cmd = agentCalls[0].cmd;
-    assert.deepEqual(cmd.slice(0, 5), [claudeBin, "-p", "--output-format", "stream-json", "--verbose"]);
-    assert.deepEqual(cmd.slice(-2), ["--", "run the e2e dispatch"]);
+    assertAgentExec(driver.calls, claudeBin, "run the e2e dispatch");
+
   } finally {
     if (previousBin === undefined) delete process.env.CLAUDE_BIN;
     else process.env.CLAUDE_BIN = previousBin;

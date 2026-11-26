@@ -28,7 +28,8 @@
  */
 
 import React, { useState } from "react";
-import { FileText, Globe, Loader2, MonitorPlay, Terminal } from "lucide-react";
+import { ExternalLink, FileText, Globe, Loader2, MonitorPlay, Terminal } from "lucide-react";
+import { pickPrimaryPreviewPort, previewHrefForPort } from "../../../../lib/client/previewPorts";
 import type { RunStreamStatus } from "../../../../lib/client/useRunStream";
 import type { StatusTone } from "../../../../lib/client/runPhase";
 import type { VmDisplay } from "../../../../lib/client/vmStatus";
@@ -131,6 +132,31 @@ export function ViewTabs({
         );
       })}
     </div>
+  );
+}
+
+/** Floating/chrome pill linking directly to /preview/<port>/ when a VM server is listening. */
+export function LiveAppPreviewPill({ ports }: { ports: readonly number[] }) {
+  const port = pickPrimaryPreviewPort(ports);
+  if (port === null) return null;
+  const href = previewHrefForPort(port);
+  const title =
+    ports.length > 1
+      ? `Open live app preview on port ${port} (listening: ${ports.join(", ")})`
+      : `Open live app preview on port ${port}`;
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      data-testid="live-app-preview-pill"
+      title={title}
+      className="inline-flex h-6 items-center gap-1.5 rounded-full border border-emerald-400/35 bg-emerald-500/10 px-2.5 font-mono text-[10px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/20"
+    >
+      <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-emerald-400 sa-dot-live" />
+      <span>Open App (:{port})</span>
+      <ExternalLink className="h-2.5 w-2.5" aria-hidden />
+    </a>
   );
 }
 

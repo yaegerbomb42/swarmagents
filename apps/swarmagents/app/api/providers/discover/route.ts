@@ -23,8 +23,8 @@ import { JsonBodyError, readJsonBody } from "@/lib/http";
 import {
   ProviderMutationError,
   routerProviders,
-  updateProviderSettings,
 } from "@/lib/providers/store";
+import { persistDiscoveredModels } from "@/lib/providers/discovery-persist";
 import { resolveOllamaBaseUrl } from "@/lib/providers/settings";
 import { assertResolvableProviderBaseUrl } from "@/lib/providers/url-safety";
 import { isApiStyle, isAuthScheme } from "@/lib/providers/types";
@@ -174,27 +174,12 @@ export async function POST(request: NextRequest) {
       force: input.force === true || input.refresh === true,
       fallbackModels: saved?.availableModels ?? catalogEntry(config.id)?.models?.popular,
     });
-    let persisted = false;
     // Only a live fetch may overwrite the saved list; a stale or fallback
     // result must never replace real data with older/static ids.
-    if (saved && input.save !== false && result.source === "live" && result.models.length > 0) {
-      const capabilities: Record<string, NonNullable<(typeof result.models)[number]["capabilities"]>> = {};
-      for (const model of result.models) {
-        if (model.capabilities) capabilities[model.id] = model.capabilities;
-      }
-      const currentModels = saved.models ? Object.values(saved.models).filter(Boolean) : [];
-      const ids = result.models.map((m) => m.id);
-      const tier =
-        currentModels.length > 0
-          ? undefined
-          : [ids[0], ids[Math.floor((ids.length - 1) / 2)] ?? ids[0], ids[ids.length - 1]];
-      await updateProviderSettings(owner, saved.id, {
-        availableModels: ids,
-        ...(Object.keys(capabilities).length > 0 ? { modelCapabilities: capabilities } : {}),
-        ...(tier ? { models: tier.filter((m): m is string => Boolean(m)) } : {}),
-      });
-      persisted = true;
-    }
+    const persisted =
+      saved && input.save !== false && result.source === "live"
+        ? await persistDiscoveredModels(owner, saved, result)
+        : false;
     return NextResponse.json(
       {
         ok: true,

@@ -56,18 +56,34 @@ export interface ProviderRunMetrics {
   wallClockMs: number;
 }
 
+/** Why a trial's agent run ended. Scripted runs always "completed". */
+export type ProviderRunExitReason = "completed" | "max_turns" | "timeout" | "error";
+
 export interface ProviderExecutorResult {
   /** Files the run left in the workspace (overlaid on the setup files). */
   files: Record<string, string>;
   /** Relative paths the run deleted from the workspace. */
   deleted?: string[];
   metrics: ProviderRunMetrics;
+  /** How the agent run ended (live runs). */
+  exitReason?: ProviderRunExitReason;
+  /** Short, redacted explanation for an "error" exit. */
+  exitDetail?: string;
 }
 
 export interface ProviderRunContext {
   providerId: string;
   model: string;
+  /**
+   * The trial's isolated workspace, already seeded with the setup files.
+   * Live executors work in it in place; scripted ones return a delta.
+   */
+  workspaceDir?: string;
+  trial?: number;
 }
+
+/** Whether a trial was a scripted replay or a real model run. */
+export type ProviderRunMode = "scripted" | "live";
 
 /** Executes one task end to end against a provider. */
 export interface ProviderExecutor {
@@ -84,6 +100,9 @@ export interface ProviderTrialResult {
   partialScore: number;
   metrics: ProviderRunMetrics;
   grading: { passed: number; failed: number; total: number };
+  mode?: ProviderRunMode;
+  exitReason?: ProviderRunExitReason;
+  exitDetail?: string;
 }
 
 export interface ProviderReportRow {
@@ -95,9 +114,14 @@ export interface ProviderReportRow {
   meanInputTokens: number;
   meanOutputTokens: number;
   meanWallClockMs: number;
+  mode?: ProviderRunMode;
+  /** Share of tasks whose first trial passed. */
+  passAt1?: number;
 }
 
 export interface ProviderEvalReport {
   rows: ProviderReportRow[];
   generatedAt: string;
+  /** Per-trial results (always written to the JSON report). */
+  trials?: ProviderTrialResult[];
 }

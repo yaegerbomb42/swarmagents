@@ -32,7 +32,8 @@
     "playtest:check": "node scripts/playtest.mjs check",
     "typecheck:tests": "tsc -p tsconfig.test.json --noEmit",
     "eval:dry-run": "tsx tools/eval-harness/run.ts --dry-run",
-    "eval:provider": "tsx tools/eval-provider/run.ts"
+    "eval:provider": "tsx tools/eval-provider/run.ts",
+    "eval:live": "tsx tools/eval-provider/run.ts --live"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.7",

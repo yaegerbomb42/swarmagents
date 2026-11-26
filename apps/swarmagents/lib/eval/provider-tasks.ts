@@ -104,7 +104,10 @@ test("a new window admits again", () => {
     title: "Implement a schema validator",
     description: "validate() is an unimplemented stub. Return every violation as a message list.",
     prompt:
-      "Implement validate(obj, schema) in src/validate.mjs. Check required fields, types, numeric ranges and string patterns. Return an array of every violation message.",
+      "Implement validate(obj, schema) in src/validate.mjs. The schema maps each field name to a rule " +
+      "{ required?: boolean, type?: \"string\" | \"number\", min?: number, max?: number, pattern?: RegExp }. " +
+      "Check required fields, types, numeric ranges (min/max) and string patterns. Return an array with one message per " +
+      "violation, each naming its field; once a field has the wrong type, report only that for it. A valid object returns [].",
     setupFiles: {
       "src/validate.mjs": `export function validate(obj, schema) {
   throw new Error("not implemented");
@@ -182,7 +185,8 @@ test("wrong types, out-of-range values and bad patterns are all reported", () =>
     title: "Add a contact section to the landing page",
     description: "The page has no contact section. Add a <section id=\"contact\"> with an anchor link.",
     prompt:
-      "Add a contact section to index.html: a <section id=\"contact\"> containing an <h2>Contact</h2> and an email link, and update the nav to include an anchor to #contact.",
+      "Add a contact section to index.html: a <section id=\"contact\"> containing an <h2>Contact</h2> and an email link " +
+      "to hello@acme.test (the link text is the address), and update the nav to include an anchor to #contact.",
     setupFiles: {
       "index.html": `<!doctype html>
 <html>
@@ -290,7 +294,7 @@ import { readFile } from "node:fs/promises";
 
 test("app.py imports tkinter and defines a counter window", async () => {
   const src = await readFile(new URL("../app.py", import.meta.url), "utf8");
-  assert.ok(src.includes("import tkinter"));
+  assert.match(src, /^\\s*(import tkinter|from tkinter import)/m);
   assert.ok(src.includes("Tk()"));
   assert.ok(src.includes('title("Counter")') || src.includes("title('Counter')"));
   assert.ok(src.includes("Button("));

@@ -16,6 +16,7 @@ import { HARD_PROVIDER_EVAL_TASKS, PROVIDER_EVAL_TASKS, STANDARD_PROVIDER_EVAL_T
 import { ScriptedProviderExecutor } from "./provider-executor";
 import { selectTasks } from "../../tools/eval-provider/run";
 import { DESKTOP_PROVIDER_EVAL_TASKS } from "./provider-tasks-desktop";
+import { DESKTOP_HARD_PROVIDER_EVAL_TASKS } from "./provider-tasks-desktop-hard";
 
 const spec: ProviderSpec = { providerId: "scripted", model: "model-x" };
 
@@ -36,7 +37,7 @@ test("task ids are unique and the hard set is part of the suite", () => {
   for (const task of HARD_PROVIDER_EVAL_TASKS) assert.equal(task.difficulty, "hard", task.id);
 });
 
-for (const task of [...PROVIDER_EVAL_TASKS, ...DESKTOP_PROVIDER_EVAL_TASKS]) {
+for (const task of [...PROVIDER_EVAL_TASKS, ...DESKTOP_PROVIDER_EVAL_TASKS, ...DESKTOP_HARD_PROVIDER_EVAL_TASKS]) {
   test(`${task.id}: the reference solution passes its verifier`, async (t) => {
     const { trial } = await (await runner(t, false)).runTrial(task, spec, 1);
     assert.equal(trial.resolved, true, JSON.stringify(trial.grading));
@@ -78,4 +79,26 @@ test("desktop tasks are opt-in: only --tasks desktop (or their ids) selects them
   );
   assert.equal(selectTasks(["hard", "standard"]).some((t) => t.desktop), false);
   assert.deepEqual(selectTasks(["desktop-read-code-from-screen"]).map((t) => t.id), ["desktop-read-code-from-screen"]);
+});
+
+test("desktop-hard is its own opt-in set: --tasks desktop keeps the core-36 three", () => {
+  assert.equal(DESKTOP_HARD_PROVIDER_EVAL_TASKS.length, 3);
+  for (const task of DESKTOP_HARD_PROVIDER_EVAL_TASKS) {
+    assert.ok(task.desktop, task.id);
+    assert.equal(task.difficulty, "hard", task.id);
+  }
+  assert.deepEqual(
+    selectTasks(["desktop-hard"]).map((t) => t.id),
+    DESKTOP_HARD_PROVIDER_EVAL_TASKS.map((t) => t.id),
+  );
+  assert.equal(selectTasks(["desktop"]).some((t) => t.difficulty === "hard"), false);
+  assert.equal(selectTasks(["hard"]).some((t) => t.desktop), false);
+  const ids = [...PROVIDER_EVAL_TASKS, ...DESKTOP_PROVIDER_EVAL_TASKS, ...DESKTOP_HARD_PROVIDER_EVAL_TASKS].map((t) => t.id);
+  assert.equal(new Set(ids).size, ids.length);
+});
+
+test("desktop-hard values are not written in the setup files", () => {
+  const browser = DESKTOP_HARD_PROVIDER_EVAL_TASKS.find((t) => t.id === "desktop-browser-rendered-value")!;
+  const total = browser.solution!.files!["total.txt"]!.trim();
+  assert.equal(Object.values(browser.setupFiles ?? {}).some((c) => c.includes(total)), false, "the total only exists after render");
 });

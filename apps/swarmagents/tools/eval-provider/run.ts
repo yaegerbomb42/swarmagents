@@ -26,6 +26,7 @@ import {
 import { LiveProviderExecutor, type LiveProviderConfig } from "../../lib/eval/live-executor";
 import { missingDesktopBinaries } from "../../lib/eval/desktop-session";
 import { DESKTOP_PROVIDER_EVAL_TASKS } from "../../lib/eval/provider-tasks-desktop";
+import { DESKTOP_HARD_PROVIDER_EVAL_TASKS } from "../../lib/eval/provider-tasks-desktop-hard";
 import type { ProviderKind } from "../../lib/providers/types";
 import { FakeVmDriver } from "../../lib/vm/fake-driver";
 
@@ -50,7 +51,7 @@ export interface CliOptions {
 }
 
 const USAGE =
-  "Usage: tsx tools/eval-provider/run.ts [--providers a,b] [--trials N] [--out DIR] [--vm none|fake|docker] [--tasks id,id|hard|standard|desktop]\n" +
+  "Usage: tsx tools/eval-provider/run.ts [--providers a,b] [--trials N] [--out DIR] [--vm none|fake|docker] [--tasks id,id|hard|standard|desktop|desktop-hard]\n" +
   "  live: --live --model M (--key-env VAR [--base-url URL] [--kind anthropic|openai|gemini] | --claude-bin WRAPPER)\n" +
   "        [--provider-id LABEL] [--max-turns N] [--timeout-s S] [--text-desktop]";
 
@@ -164,7 +165,7 @@ async function main(): Promise<number> {
     return 2;
   }
   if (opts.live && tasks.some((t) => t.desktop)) {
-    const missing = missingDesktopBinaries();
+    const missing = missingDesktopBinaries(tasks.flatMap((t) => t.desktop?.requires ?? []));
     if (missing.length > 0) {
       console.error(`desktop tasks need ${missing.join(", ")} on this host (apt install xvfb xdotool scrot imagemagick xterm)`);
       return 2;
@@ -218,15 +219,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 }
 
 /**
- * `--tasks` takes task ids and/or the set names "hard", "standard" and
- * "desktop". Desktop tasks need an X server, so only "desktop" or their ids
- * select them; "hard"/"standard" stay coding-only.
+ * `--tasks` takes task ids and/or the set names "hard", "standard",
+ * "desktop" and "desktop-hard". Desktop tasks need an X server, so only the
+ * desktop set names or their ids select them; "hard"/"standard" stay
+ * coding-only, and "desktop" keeps the original three so baselines compare.
  */
 export function selectTasks(names: string[]): typeof PROVIDER_EVAL_TASKS {
-  return [...PROVIDER_EVAL_TASKS, ...DESKTOP_PROVIDER_EVAL_TASKS].filter(
+  return [...PROVIDER_EVAL_TASKS, ...DESKTOP_PROVIDER_EVAL_TASKS, ...DESKTOP_HARD_PROVIDER_EVAL_TASKS].filter(
     (t) =>
       names.includes(t.id) ||
-      (names.includes("desktop") && t.desktop !== undefined) ||
+      (names.includes("desktop") && t.desktop !== undefined && t.difficulty !== "hard") ||
+      (names.includes("desktop-hard") && t.desktop !== undefined && t.difficulty === "hard") ||
       (t.desktop === undefined && names.includes("hard") && t.difficulty === "hard") ||
       (t.desktop === undefined && names.includes("standard") && t.difficulty !== "hard"),
   );

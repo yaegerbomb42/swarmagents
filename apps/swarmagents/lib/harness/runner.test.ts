@@ -7,7 +7,16 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ClaudeCodeRunner, isBackgroundedCommand, isSignalKillExitCode, raceAgainstAbort, resolveMaxTurns } from "./runner.js";
+import {
+  ClaudeCodeRunner,
+  assessDeliverableCheck,
+  isBackgroundedCommand,
+  isSignalKillExitCode,
+  isVerificationToolCall,
+  mutationFilePath,
+  raceAgainstAbort,
+  resolveMaxTurns,
+} from "./runner.js";
 import { StateLedger } from "./context/contextGovernor.js";
 import { localScorer } from "./system-one/index.js";
 import type { DecisionRouter } from "./decision-brain/index.js";
@@ -1248,6 +1257,92 @@ test("marks a run finished with cost when the result arrived before a 137 reap",
   for (const event of events) {
     assert.ok(!JSON.stringify(event).includes("unrecognized_model"), "benign warning must not appear anywhere");
   }
+});
+
+test("emits a deliverable-check reminder before finishing when files changed unverified", async () => {
+  const editThenDone = [
+    INIT,
+    {
+      type: "assistant",
+      message: {
+        id: "e1",
+        content: [{ type: "tool_use", id: "toolu_e1", name: "Write", input: { file_path: "out/report.md", content: "done" } }],
+      },
+    },
+    RESULT,
+  ]
+    .map((line) => JSON.stringify(line))
+    .join("\n");
+
+  const vm = new ScriptedVm([{ chunks: [editThenDone] }]);
+  const runner = new ClaudeCodeRunner();
+  const events: TelemetryEvent[] = [];
+
+  const outcome = await runner.run({ prompt: "Write the report", env: {}, vm }, (e) => events.push(e));
+
+  assert.equal(outcome.exitCode, 0);
+  const checks = events.filter(
+    (e): e is Extract<TelemetryEvent, { type: "run.deliverableCheck" }> => e.type === "run.deliverableCheck",
+  );
+  assert.equal(checks.length, 1);
+  assert.equal(checks[0].ok, false);
+  assert.deepEqual(checks[0].files, ["out/report.md"]);
+  assert.match(checks[0].message, /no verification ran/i);
+  // The reminder lands before the terminal event, and the run still finishes.
+  const checkIdx = events.findIndex((e) => e.type === "run.deliverableCheck");
+  const finishedIdx = events.findIndex((e) => e.type === "run.finished");
+  assert.ok(checkIdx !== -1 && finishedIdx !== -1 && checkIdx < finishedIdx);
+});
+
+test("does not emit the deliverable reminder when the change was verified", async () => {
+  const verified = [
+    INIT,
+    {
+      type: "assistant",
+      message: {
+        id: "v1",
+        content: [
+          { type: "tool_use", id: "toolu_v1", name: "Edit", input: { file_path: "lib/foo.ts", old_string: "a", new_string: "b" } },
+          { type: "tool_use", id: "toolu_v2", name: "Bash", input: { command: "npm test" } },
+        ],
+      },
+    },
+    RESULT,
+  ]
+    .map((line) => JSON.stringify(line))
+    .join("\n");
+
+  const vm = new ScriptedVm([{ chunks: [verified] }]);
+  const runner = new ClaudeCodeRunner();
+  const events: TelemetryEvent[] = [];
+
+  const outcome = await runner.run({ prompt: "Fix it", env: {}, vm }, (e) => events.push(e));
+
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(events.some((e) => e.type === "run.deliverableCheck"), false);
+});
+
+test("deliverable-check helpers recognize mutations and real verification", () => {
+  assert.equal(mutationFilePath("Edit", { file_path: "a.ts" }), "a.ts");
+  assert.equal(mutationFilePath("Write", { file_path: "b.md" }), "b.md");
+  assert.equal(mutationFilePath("NotebookEdit", { notebook_path: "c.ipynb" }), "c.ipynb");
+  assert.equal(mutationFilePath("Read", { file_path: "a.ts" }), null);
+  assert.equal(mutationFilePath("Bash", { command: "touch a.ts" }), null);
+
+  assert.equal(isVerificationToolCall("Read", { file_path: "a.ts" }), true);
+  assert.equal(isVerificationToolCall("Bash", { command: "npm run test:full" }), true);
+  assert.equal(isVerificationToolCall("Bash", { command: "pytest -q" }), true);
+  assert.equal(isVerificationToolCall("Bash", { command: "cat a.ts" }), false);
+  assert.equal(isVerificationToolCall("Bash", { command: "ls -la" }), false);
+  assert.equal(isVerificationToolCall("mcp__computer-mcp__describe_screen", {}), true);
+  assert.equal(isVerificationToolCall("mcp__computer-mcp__screenshot", {}), true);
+  assert.equal(isVerificationToolCall("mcp__computer-mcp__click", {}), false);
+
+  assert.equal(assessDeliverableCheck([], false), null);
+  assert.equal(assessDeliverableCheck(["a.ts"], true), null);
+  const missing = assessDeliverableCheck(["a.ts", "b.ts"], false);
+  assert.equal(missing?.ok, false);
+  assert.deepEqual(missing?.files, ["a.ts", "b.ts"]);
 });
 
 test("reports a SIGTERM kill with a clear reason, not a bare exit code", async () => {

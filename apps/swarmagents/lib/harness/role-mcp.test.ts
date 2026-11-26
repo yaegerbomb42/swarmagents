@@ -10,6 +10,7 @@ import {
   roleHasDesktopAccess,
 } from "../roles.js";
 import {
+  A1_OPERATING_GUIDANCE,
   BROWSER_MCP_SERVER_NAME,
   COMPUTER_MCP_SERVER_PATH,
   MAX_ROLE_PHASES,
@@ -387,6 +388,31 @@ test("rolePhase appends the tail even to a role without instructions", () => {
   };
   const phase = rolePhase(bare);
   assert.ok(phase.appendSystemPrompt?.includes("Long-running work stays visible"));
+});
+
+test("A1's prompt states its identity, desktop tool choice and deliverable check", () => {
+  const prompt = rolePhase(mainRole()).appendSystemPrompt ?? "";
+  assert.match(prompt, /You are A1/);
+  assert.match(prompt, /Identify yourself as A1/);
+  // Shell vs visible browser vs desktop apps.
+  assert.match(prompt, /Bash and the file tools/);
+  assert.match(prompt, /playwright-mcp/);
+  assert.match(prompt, /computer-mcp/);
+  // describe_screen is the cheap default; screenshot is for pixels only.
+  assert.match(prompt, /describe_screen first/);
+  assert.match(prompt, /take a screenshot only when/i);
+  // Self-verification before finishing.
+  assert.match(prompt, /Before you finish, verify the deliverable/i);
+  assert.match(prompt, /Never claim verification you did not perform/);
+});
+
+test("A1 operating guidance is not appended to specialist roles", () => {
+  const implementer = BUILTIN_ROLES.find((role) => role.id === "implementer")!;
+  const prompt = rolePhase(implementer).appendSystemPrompt ?? "";
+  assert.ok(!prompt.includes(A1_OPERATING_GUIDANCE));
+  assert.doesNotMatch(prompt, /describe_screen first/);
+  // The shared tails still ride with every role.
+  assert.match(prompt, /Long-running work stays visible/);
 });
 
 // ---- Capability-aware run modes (text / chat) ------------------------------

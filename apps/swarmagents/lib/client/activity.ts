@@ -206,6 +206,11 @@ export function toActivityLine(
       return line(item, "run.error", `Error · ${asString(data.message) ?? "unknown"}`, "error");
     }
 
+    case "run.deliverableCheck": {
+      const message = asString(data.message) ?? "Deliverable not verified";
+      return line(item, "run.deliverableCheck", `Deliverable check · ${truncate(message)}`, "error");
+    }
+
     case "run.cancelled": {
       const reason = asString(data.reason);
       return line(

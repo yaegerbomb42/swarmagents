@@ -927,10 +927,20 @@ async function routerSource(req: LlmRequest): Promise<AttemptSource> {
         publish(req, "route.decision", decisionEventData(decision, attemptIndex));
         const chosen = decision.chosen;
         if (chosen && stickyTarget && decision.failoverReason) {
+          const fromConfig = req.entries.find((entry) => entry.config.id === stickyTarget.providerId)?.config;
+          const toConfig = req.entries.find((entry) => entry.config.id === chosen.providerId)?.config;
           publish(req, "route.failover", {
             requestId,
-            from: { provider: stickyTarget.providerId, model: stickyTarget.modelId },
-            to: { provider: chosen.providerId, model: chosen.modelId },
+            from: {
+              provider: stickyTarget.providerId,
+              model: stickyTarget.modelId,
+              ...(fromConfig ? { apiStyle: apiStyleFor(fromConfig) } : {}),
+            },
+            to: {
+              provider: chosen.providerId,
+              model: chosen.modelId,
+              ...(toConfig ? { apiStyle: apiStyleFor(toConfig) } : {}),
+            },
             reason: decision.failoverReason,
           });
         }

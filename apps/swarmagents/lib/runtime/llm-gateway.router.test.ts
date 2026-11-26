@@ -180,6 +180,115 @@ test("a run stays on its provider (sticky) and a failure fails over with route.f
   assert.match(failovers[0]!.reason, /already_failed_this_request/);
 });
 
+test("a sticky Anthropic run fails over to OpenAI and retranslates the original request", async () => {
+  const u = owner();
+  const anthropic = provider("anthropic", {
+    kind: "anthropic",
+    apiStyle: "anthropic",
+    baseUrl: "https://anthropic.example",
+    models: { balanced: "claude-x" },
+    rank: 0,
+  });
+  const openai = provider("openai", {
+    baseUrl: "https://openai.example/v1",
+    models: { balanced: "gpt-test" },
+    rank: 1,
+  });
+  const anthropicResponse = {
+    id: "msg-anthropic",
+    type: "message",
+    role: "assistant",
+    model: "claude-x",
+    content: [{ type: "text", text: "first" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 5, output_tokens: 1 },
+  };
+  const openaiResponse = {
+    ...OK,
+    model: "gpt-test",
+    choices: [{ index: 0, message: { role: "assistant", content: "fallback" }, finish_reason: "stop" }],
+  };
+  const t = memoryBus();
+  const { fetchImpl, calls } = stubFetch({
+    anthropic: [() => json(anthropicResponse), () => json({ error: "rate limited" }, 429)],
+    openai: (init) => {
+      const translated = JSON.parse(String(init.body)) as Record<string, unknown>;
+      assert.equal(translated.model, "gpt-test");
+      assert.deepEqual(translated.messages, [{ role: "user", content: "very private prompt text" }]);
+      return json(openaiResponse);
+    },
+  });
+
+  await forwardLlmNonStreaming({
+    owner: u,
+    providers: [anthropic, openai],
+    body: REQ,
+    fetchImpl,
+    runId: "cross-format-openai",
+    bus: t.bus,
+  });
+  const result = await forwardLlmNonStreaming({
+    owner: u,
+    providers: [anthropic, openai],
+    body: REQ,
+    fetchImpl,
+    runId: "cross-format-openai",
+    bus: t.bus,
+  });
+
+  assert.equal(result.attempts.at(-1)!.provider, "openai");
+  assert.deepEqual(calls.map((c) => c.host), ["anthropic", "anthropic", "openai"]);
+  const failovers = t.of("route.failover") as Array<{ from: { provider: string; apiStyle?: string }; to: { provider: string; apiStyle?: string }; reason: string }>;
+  assert.equal(failovers.at(-1)!.from.provider, "anthropic");
+  assert.equal(failovers.at(-1)!.to.provider, "openai");
+  assert.equal(failovers.at(-1)!.from.apiStyle, "anthropic");
+  assert.equal(failovers.at(-1)!.to.apiStyle, "openai-chat");
+  assert.match(failovers.at(-1)!.reason, /already_failed_this_request/);
+});
+
+test("a sticky Anthropic run fails over to Gemini and retranslates the original request", async () => {
+  const u = owner();
+  const anthropic = provider("anthropic", {
+    kind: "anthropic",
+    apiStyle: "anthropic",
+    baseUrl: "https://anthropic.example",
+    models: { balanced: "claude-x" },
+    rank: 0,
+  });
+  const gemini = provider("gemini", {
+    kind: "gemini",
+    apiStyle: "gemini",
+    baseUrl: "https://gemini.example",
+    models: { balanced: "gemini-test" },
+    rank: 1,
+  });
+  const t = memoryBus();
+  const { fetchImpl, calls } = stubFetch({
+    anthropic: [() => json({ id: "msg", content: [{ type: "text", text: "first" }], usage: { input_tokens: 5, output_tokens: 1 } }), () => json({}, 429)],
+    gemini: (init) => {
+      const translated = JSON.parse(String(init.body)) as Record<string, unknown>;
+      assert.equal(translated.contents && (translated.contents as Array<Record<string, unknown>>)[0]?.role, "user");
+      assert.equal((translated.generationConfig as Record<string, unknown>).maxOutputTokens, 64);
+      return json({
+        candidates: [{ content: { parts: [{ text: "gemini fallback" }] }, finishReason: "STOP" }],
+        usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2 },
+        modelVersion: "gemini-test",
+      });
+    },
+  });
+
+  await forwardLlmNonStreaming({ owner: u, providers: [anthropic, gemini], body: REQ, fetchImpl, runId: "cross-format-gemini", bus: t.bus });
+  const result = await forwardLlmNonStreaming({ owner: u, providers: [anthropic, gemini], body: REQ, fetchImpl, runId: "cross-format-gemini", bus: t.bus });
+
+  assert.equal(result.attempts.at(-1)!.provider, "gemini");
+  assert.deepEqual(calls.map((c) => c.host), ["anthropic", "anthropic", "gemini"]);
+  const failovers = t.of("route.failover") as Array<{ from: { provider: string; apiStyle?: string }; to: { provider: string; apiStyle?: string } }>;
+  assert.equal(failovers.at(-1)!.from.provider, "anthropic");
+  assert.equal(failovers.at(-1)!.to.provider, "gemini");
+  assert.equal(failovers.at(-1)!.from.apiStyle, "anthropic");
+  assert.equal(failovers.at(-1)!.to.apiStyle, "gemini");
+});
+
 test("429 rotates to the provider's next key, honors Retry-After, then recovers", async () => {
   const u = owner();
   const k1 = key();

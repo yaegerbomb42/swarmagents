@@ -203,6 +203,7 @@ import { startMemoryBridge } from "../memory/bridge";
 import { AUTO_MEMORY_TOKEN_BUDGET, memoryRecallForPrompt } from "../memory/store";
 import { buildMemoryPrompt } from "../memory/prompt";
 import { runMemoryTool } from "../memory/tools";
+import { consumeLoopNudge, type PendingLoopNudge } from "../harness/loop-breaker";
 
 /**
  * Only the variables Claude Code needs are forwarded into a user's VM. The server env also holds
@@ -631,6 +632,11 @@ interface ActiveRun {
   fullAuto?: boolean;
   /** F14: exact tool names the PreToolUse hook may allow. */
   toolAllowlist?: readonly string[];
+  /**
+   * core-21: armed by a `watchdog.loop` nudge. The next hook call is denied
+   * with the nudge text if (and only if) it is the looping call; one-shot.
+   */
+  loopNudge?: PendingLoopNudge;
   /** F14 rule id, when this run was started by an ambient watcher. */
   ambientRuleId?: string;
   /** Completed shadow-verifier attempts (bounds the bounce-back loop). */
@@ -2618,6 +2624,18 @@ export class RuntimeManager {
         ...(this.userDrivingPollMs !== undefined ? { pollMs: this.userDrivingPollMs } : {}),
       });
       if (held) return held;
+    }
+
+    // core-21: the loop breaker armed a nudge after three identical calls
+    // with identical output. Deny a fourth try of that exact call (it never
+    // runs) and hand the model the nudge as the reason. One-shot.
+    if (active.loopNudge) {
+      const nudge = consumeLoopNudge(active.loopNudge, toolName, input);
+      active.loopNudge = undefined;
+      if (nudge) {
+        this.forwardEvent(active, { type: "tool.blocked", name: toolName, reason: nudge });
+        return { decision: "deny", reason: nudge };
+      }
     }
 
     return evaluateToolApproval({
@@ -4862,6 +4880,9 @@ export class RuntimeManager {
       } catch {
         /* recorder is fail-safe; this is belt-and-braces */
       }
+    }
+    if (event.type === "watchdog.loop" && event.action === "nudge") {
+      active.loopNudge = { fingerprint: event.fingerprint, message: event.reason };
     }
     if (event.type === "run.started") {
       const st = this.users.get(userId);

@@ -79,6 +79,7 @@ import {
   packSystemSections,
   systemSectionsFrom,
 } from "./context/system-packer";
+import { LoopBreaker } from "./loop-breaker";
 import {
   ProgressWatchdog,
   errorSignature,
@@ -450,9 +451,11 @@ export class ClaudeCodeRunner {
     let lastBrainToolResult: { ok: boolean; output: string } | null = null;
     let lastBrainError: string | null = null;
     const planTracker = createPlanTracker();
-    /** ProgressWatchdog loop state: tool_use id -> tool name, turn count. */
+    /** Tool-result bookkeeping: tool_use id -> tool name + input, watchdog turn count. */
     let watchdogTurnCount = 0;
-    const watchdogToolNames = new Map<string, string>();
+    const toolCallsById = new Map<string, { name: string; input: unknown }>();
+    /** core-21: always-on duplicate-action loop breaker (SWARM_LOOP_BREAKER=0 disables). */
+    const loopBreaker = process.env.SWARM_LOOP_BREAKER === "0" ? undefined : new LoopBreaker();
 
     // Role switching: a validated set_role call aborts this invocation (via an
     // internal signal the manager never sees) so the run can resume with the
@@ -657,7 +660,7 @@ export class ClaudeCodeRunner {
               const input = block.input;
               const toolId = typeof block.id === "string" ? block.id : undefined;
               if (toolId) {
-                watchdogToolNames.set(toolId, name);
+                toolCallsById.set(toolId, { name, input });
               }
               emit({
                 type: "tool.call",
@@ -1012,15 +1015,40 @@ export class ClaudeCodeRunner {
             // snapshots with a stale stream-json error from earlier in the run.
             if (ok) firstErrorMessage = undefined;
 
+            const callId = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined;
+            const callInfo = callId ? toolCallsById.get(callId) : undefined;
+            if (callId) toolCallsById.delete(callId);
+
+            // core-21 loop breaker: the third identical (action, output) arms a
+            // one-shot deny of that exact call at the PreToolUse hook (the
+            // manager consumes this event), so the model gets the nudge as a
+            // tool error instead of running it a fourth time. If it keeps
+            // repeating after the nudge, the run stops; nothing is rewound.
+            if (loopBreaker && callInfo) {
+              const loop = loopBreaker.observe({ toolName: callInfo.name, input: callInfo.input, output: rawOutput });
+              if (loop.kind !== "none") {
+                emit({
+                  type: "watchdog.loop",
+                  pathology: "duplicate-action",
+                  tool: callInfo.name,
+                  action: loop.kind,
+                  fingerprint: loop.fingerprint,
+                  reason: loop.message,
+                });
+                if (loop.kind === "escalate" && haltedReason === null) {
+                  emit({ type: "tool.blocked", name: callInfo.name, reason: loop.message });
+                  halt(loop.message);
+                }
+              }
+            }
+
             // ProgressWatchdog: observe the result synchronously (pure
             // detection, no I/O). A pathology halts the run with a rewind
             // marker for a manager-level re-drive — the runner cannot
             // rewind the CLI. Checkpointing is best-effort and async, so
             // it never blocks the stream.
             if (watchdog) {
-              const resultId = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined;
-              const toolName = resultId ? watchdogToolNames.get(resultId) : undefined;
-              if (resultId) watchdogToolNames.delete(resultId);
+              const toolName = callInfo?.name;
               watchdogTurnCount += 1;
               const signal: TurnSignal = {
                 turn: watchdogTurnCount,

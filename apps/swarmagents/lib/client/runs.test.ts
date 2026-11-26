@@ -77,11 +77,20 @@ test("buildRunRequest caps the instructions and names an attachments-only messag
   assert.equal(buildRunRequest({ prompt: "   ", fullAuto: true }).prompt, ATTACHMENTS_ONLY_PROMPT);
 });
 
-test("withUploadManifest lists uploaded files after the message", () => {
+test("withUploadManifest lists uploaded files with their exact sizes after the message", () => {
   assert.equal(withUploadManifest("Read this", []), "Read this");
   assert.equal(
-    withUploadManifest("Read this", ["/workspace/uploads/a.txt", "/workspace/uploads/b.png"]),
-    "Read this\n\nUploaded files (in /workspace/uploads/):\n- /workspace/uploads/a.txt\n- /workspace/uploads/b.png",
+    withUploadManifest("Read this", [
+      { path: "/workspace/uploads/a.txt", size: 12 },
+      { path: "/workspace/uploads/b.png", size: 2048 },
+    ]),
+    "Read this\n\nUploaded files (in /workspace/uploads/):\n" +
+      "- /workspace/uploads/a.txt (12 bytes)\n- /workspace/uploads/b.png (2048 bytes)",
+  );
+  // A file with a size of 0 is still listed (empty file, exact size).
+  assert.equal(
+    withUploadManifest("Read this", [{ path: "/workspace/uploads/empty", size: 0 }]),
+    "Read this\n\nUploaded files (in /workspace/uploads/):\n- /workspace/uploads/empty (0 bytes)",
   );
 });
 

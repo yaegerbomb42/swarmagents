@@ -56,12 +56,28 @@ test("conversation: tool name helpers strip the MCP wrapper", () => {
 });
 
 test("conversation: the upload manifest becomes attachment chips", () => {
-  const prompt = "build me a game\n\nUploaded files (in /workspace/uploads/):\n- /workspace/uploads/design.png\n- /workspace/uploads/clip.mp4\n- /workspace/uploads/notes.txt";
+  const prompt =
+    "build me a game\n\nUploaded files (in /workspace/uploads/):\n" +
+    "- /workspace/uploads/design.png (2048 bytes)\n" +
+    "- /workspace/uploads/clip.mp4 (12604 bytes)\n" +
+    "- /workspace/uploads/notes.txt (0 bytes)";
   assert.deepEqual(splitUploadedFiles(prompt), {
     text: "build me a game",
     attachments: ["design.png", "clip.mp4", "notes.txt"],
   });
   assert.deepEqual(splitUploadedFiles("plain prompt"), { text: "plain prompt", attachments: [] });
+});
+
+test("conversation: upload manifests written before sizes still become chips", () => {
+  // Older runs appended paths without a size suffix; the conversation must
+  // still render them as chips.
+  const prompt =
+    "build me a game\n\nUploaded files (in /workspace/uploads/):\n" +
+    "- /workspace/uploads/design.png\n- /workspace/uploads/clip.mp4";
+  assert.deepEqual(splitUploadedFiles(prompt), {
+    text: "build me a game",
+    attachments: ["design.png", "clip.mp4"],
+  });
 });
 
 test("conversation: user ask, agent message, tool call and paired result", () => {

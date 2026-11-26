@@ -21,9 +21,11 @@ import {
   ChevronUp,
   Copy,
   Download,
+  Eye,
   Loader2,
   Play,
   StopCircle,
+  X,
 } from "lucide-react";
 import { classifyCostProvenance } from "../../../lib/runtime/run-report-types";
 import type { ReportArtifact, ReportCardMeta, ReportStep, RunReport } from "../../../lib/runtime/run-report-types";
@@ -33,6 +35,166 @@ import { Card } from "./brand/Card";
 
 const POLL_MS = 2000;
 const MAX_POLLS = 10;
+
+// --- artifact previews ------------------------------------------------------
+
+/** Max characters shown in an artifact text preview. */
+export const ARTIFACT_PREVIEW_MAX_CHARS = 200_000;
+
+/** Max lines shown in an artifact text preview. */
+export const ARTIFACT_PREVIEW_MAX_LINES = 500;
+
+const IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "ico", "jpeg", "jpg", "png", "svg", "webp"]);
+const TEXT_EXTENSIONS = new Set([
+  "bat",
+  "c",
+  "cc",
+  "cfg",
+  "conf",
+  "cpp",
+  "css",
+  "csv",
+  "env",
+  "example",
+  "gitignore",
+  "h",
+  "hpp",
+  "htm",
+  "html",
+  "ini",
+  "java",
+  "js",
+  "json",
+  "log",
+  "mjs",
+  "md",
+  "markdown",
+  "php",
+  "pl",
+  "properties",
+  "py",
+  "rb",
+  "rs",
+  "scss",
+  "sh",
+  "sql",
+  "toml",
+  "ts",
+  "tsx",
+  "txt",
+  "vue",
+  "xml",
+  "yaml",
+  "yml",
+]);
+
+export type ArtifactPreviewKind = "image" | "text" | "none";
+
+/** What an artifact can be previewed as, by extension. */
+export function artifactPreviewKind(rel: string): ArtifactPreviewKind {
+  const dot = rel.lastIndexOf(".");
+  const ext = dot > 0 && dot < rel.length - 1 ? rel.slice(dot + 1).toLowerCase() : "";
+  if (IMAGE_EXTENSIONS.has(ext)) return "image";
+  if (TEXT_EXTENSIONS.has(ext)) return "text";
+  return "none";
+}
+
+/**
+ * Cap a text preview to maxChars/maxLines. Pure, so the chunking policy is
+ * unit-tested without a DOM.
+ */
+export function capPreviewText(
+  text: string,
+  maxChars: number = ARTIFACT_PREVIEW_MAX_CHARS,
+  maxLines: number = ARTIFACT_PREVIEW_MAX_LINES,
+): { text: string; truncated: boolean } {
+  let content = text;
+  let truncated = content.length > maxChars;
+  if (truncated) content = content.slice(0, maxChars);
+  const lines = content.split("\n");
+  if (lines.length > maxLines) {
+    truncated = true;
+    content = lines.slice(0, maxLines).join("\n");
+  }
+  return { text: content, truncated };
+}
+
+/** Preview state for one artifact, as loaded by the card. */
+export interface ArtifactPreviewState {
+  kind: ArtifactPreviewKind;
+  /** Object URL for image previews. */
+  url?: string;
+  /** Capped text for text previews. */
+  text?: string;
+  truncated?: boolean;
+  error?: string;
+}
+
+/** The preview block under the files list. Presentational — state comes from the card. */
+export function ArtifactPreviewPanel({
+  artifact,
+  reportRunId,
+  state,
+  onClose,
+}: {
+  artifact: ReportArtifact;
+  reportRunId: string;
+  state: ArtifactPreviewState;
+  onClose: () => void;
+}) {
+  const downloadHref = `/api/runtime/runs/${encodeURIComponent(reportRunId)}/report/artifacts?path=${encodeURIComponent(artifact.rel)}`;
+  return (
+    <div className="mt-2 rounded-lg border border-sa-line bg-sa-panel p-3" data-testid="artifact-preview">
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-sa-fg" title={artifact.rel}>
+          {artifact.rel}
+        </span>
+        <a
+          href={downloadHref}
+          download
+          aria-label={`Download ${artifact.rel}`}
+          title="Download file"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-sa-fg2 transition-colors hover:bg-sa-hover hover:text-sa-fg"
+        >
+          <Download className="h-3.5 w-3.5" aria-hidden />
+        </a>
+        <IconButton label="Close preview" onClick={onClose}>
+          <X className="h-3.5 w-3.5" aria-hidden />
+        </IconButton>
+      </div>
+      {state.error ? (
+        <p className="mt-2 text-[12px] text-sa-err" data-testid="artifact-preview-error">
+          {state.error}
+        </p>
+      ) : state.kind === "image" && state.url ? (
+        // eslint-disable-next-line @next/next/no-img-element -- an object URL preview is not optimizable
+        <img
+          src={state.url}
+          alt={`Preview of ${artifact.rel}`}
+          data-testid="artifact-preview-image"
+          className="mt-2 max-h-64 w-full rounded-md object-contain"
+          draggable={false}
+        />
+      ) : state.kind === "text" && state.text !== undefined ? (
+        <>
+          <pre
+            className="sa-scroll mt-2 max-h-64 overflow-y-auto whitespace-pre-wrap break-words rounded-md bg-sa-raised p-2 font-mono text-[11px] leading-relaxed text-sa-fg"
+            data-testid="artifact-preview-text"
+          >
+            {state.text}
+          </pre>
+          {state.truncated && (
+            <p className="mt-1 text-[11px] text-sa-fg3">Preview is truncated. Download the file to see the rest.</p>
+          )}
+        </>
+      ) : (
+        <p className="mt-2 text-[12px] text-sa-fg3" data-testid="artifact-preview-none">
+          No preview for this file type — download it to open it locally.
+        </p>
+      )}
+    </div>
+  );
+}
 
 export function formatReportDuration(ms?: number): string {
   if (ms === undefined || !Number.isFinite(ms)) return "—";
@@ -324,6 +486,10 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
   const [copied, setCopied] = useState(false);
   const [copyNotice, setCopyNotice] = useState(false);
   const copyTimer = useRef<number | undefined>(undefined);
+  const [previewArtifact, setPreviewArtifact] = useState<ReportArtifact | null>(null);
+  const [preview, setPreview] = useState<ArtifactPreviewState | undefined>();
+  const previewUrlRef = useRef<string | undefined>(undefined);
+  const previewTokenRef = useRef(0);
 
   const load = useCallback(
     async (signal?: AbortSignal) => {
@@ -366,6 +532,69 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
   }, [report]);
 
   useEffect(() => () => window.clearTimeout(copyTimer.current), []);
+
+  // Revoke object URLs for previewed images so they never leak.
+  useEffect(() => {
+    if (preview?.url && preview.url !== previewUrlRef.current) {
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+      previewUrlRef.current = preview.url;
+    }
+  }, [preview]);
+  useEffect(
+    () => () => {
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+    },
+    [],
+  );
+
+  // Fetch the artifact bytes for the preview panel. Each open bumps a token so
+  // a stale in-flight response can never overwrite a newer preview.
+  const openPreview = useCallback(
+    async (artifact: ReportArtifact) => {
+      const kind = artifactPreviewKind(artifact.rel);
+      const token = ++previewTokenRef.current;
+      setPreviewArtifact(artifact);
+      setPreview({ kind });
+      if (kind === "none") return;
+      try {
+        const res = await fetch(
+          `/api/runtime/runs/${encodeURIComponent(report?.runId ?? "")}/report/artifacts?path=${encodeURIComponent(artifact.rel)}`,
+          { cache: "no-store" },
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (token !== previewTokenRef.current) return;
+        if (kind === "image") {
+          const blob = await res.blob();
+          if (token !== previewTokenRef.current) return;
+          setPreview({ kind, url: URL.createObjectURL(blob) });
+        } else {
+          const text = await res.text();
+          const capped = capPreviewText(text);
+          if (token !== previewTokenRef.current) return;
+          setPreview({ kind: "text", text: capped.text, truncated: capped.truncated });
+        }
+      } catch {
+        if (token !== previewTokenRef.current) return;
+        setPreview({ kind, error: "Could not load the preview." });
+      }
+    },
+    [report],
+  );
+
+  const closePreview = useCallback(() => {
+    previewTokenRef.current += 1;
+    if (previewUrlRef.current) {
+      URL.revokeObjectURL(previewUrlRef.current);
+      previewUrlRef.current = undefined;
+    }
+    setPreviewArtifact(null);
+    setPreview(undefined);
+  }, []);
+
+  // A different run's report resets any open preview.
+  useEffect(() => {
+    closePreview();
+  }, [report, closePreview]);
 
   // The report may lag a finished run by a moment: poll briefly, then stop and
   // offer a retry.
@@ -614,26 +843,53 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
                 {report.artifacts.length === 0 ? (
                   <p className="text-[13px] text-sa-fg2">The run did not create or change any files in /workspace.</p>
                 ) : (
-                  <ul className="sa-scroll max-h-48 overflow-y-auto" data-testid="run-report-files">
-                    {report.artifacts.map((artifact) => (
-                      <li key={artifact.path} className="flex min-h-8 items-center gap-2">
-                        <span className="w-16 shrink-0 text-[12px] text-sa-fg3">{artifact.change}</span>
-                        <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-sa-fg" title={artifact.rel}>
-                          {artifact.rel}
-                        </span>
-                        <span className="sa-tabular shrink-0 text-[12px] text-sa-fg3">{formatBytes(artifact.size)}</span>
-                        <a
-                          href={`/api/runtime/runs/${encodeURIComponent(report.runId)}/report/artifacts?path=${encodeURIComponent(artifact.rel)}`}
-                          download
-                          aria-label={`Download ${artifact.rel}`}
-                          title={`Download ${artifact.rel}`}
-                          className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-sa-fg2 transition-colors hover:bg-sa-hover hover:text-sa-fg"
-                        >
-                          <Download className="h-3.5 w-3.5" aria-hidden />
-                        </a>
-                      </li>
-                    ))}
-                  </ul>
+                  <>
+                    <ul className="sa-scroll max-h-48 overflow-y-auto" data-testid="run-report-files">
+                      {report.artifacts.map((artifact) => {
+                        const previewing = previewArtifact?.rel === artifact.rel;
+                        return (
+                          <li key={artifact.path} className="flex min-h-8 items-center gap-2">
+                            <span className="w-16 shrink-0 text-[12px] text-sa-fg3">{artifact.change}</span>
+                            <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-sa-fg" title={artifact.rel}>
+                              {artifact.rel}
+                            </span>
+                            <span className="sa-tabular shrink-0 text-[12px] text-sa-fg3">{formatBytes(artifact.size)}</span>
+                            <button
+                              type="button"
+                              onClick={() => (previewing ? closePreview() : void openPreview(artifact))}
+                              aria-label={`Preview ${artifact.rel}`}
+                              title="Preview"
+                              data-testid="artifact-preview-toggle"
+                              className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg transition-colors ${
+                                previewing
+                                  ? "bg-sa-hover text-sa-fg"
+                                  : "text-sa-fg2 hover:bg-sa-hover hover:text-sa-fg"
+                              }`}
+                            >
+                              <Eye className="h-3.5 w-3.5" aria-hidden />
+                            </button>
+                            <a
+                              href={`/api/runtime/runs/${encodeURIComponent(report.runId)}/report/artifacts?path=${encodeURIComponent(artifact.rel)}`}
+                              download
+                              aria-label={`Download ${artifact.rel}`}
+                              title={`Download ${artifact.rel}`}
+                              className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-sa-fg2 transition-colors hover:bg-sa-hover hover:text-sa-fg"
+                            >
+                              <Download className="h-3.5 w-3.5" aria-hidden />
+                            </a>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                    {previewArtifact && preview && (
+                      <ArtifactPreviewPanel
+                        artifact={previewArtifact}
+                        reportRunId={report.runId}
+                        state={preview}
+                        onClose={closePreview}
+                      />
+                    )}
+                  </>
                 )}
               </div>
 

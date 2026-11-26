@@ -85,3 +85,10 @@ export function filterUiNodes(nodes: UiNode[], opts?: { query?: string; role?: s
 
 /** Render widgets as compact text lines with click(x, y) targets. */
 export function formatUiNodes(nodes: UiNode[]): string;
+
+/** Find the best OCR target matching `query` (exact match preferred). */
+export function findTextTarget(
+  targets: readonly OcrTarget[],
+  query: string,
+  options?: { exact?: boolean },
+): OcrTarget | null;

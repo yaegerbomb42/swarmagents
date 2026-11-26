@@ -14,6 +14,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   OPEN_APP_NAMES,
+  findTextTarget,
   parseTesseractTsv,
   parseToolArgs,
   parseWmctrlWindows,
@@ -22,6 +23,7 @@ import {
 import {
   classifyDesktopToolCall,
   classifyDesktopToolCallAsync,
+  computerActionEvent,
   describeDesktopAction,
   desktopMcpTool,
   isDesktopMcpCall,
@@ -349,6 +351,48 @@ test("describeDesktopAction summarizes computer-mcp calls readably", () => {
   assert.equal(describeDesktopAction("mcp__computer-mcp__screenshot", {}), "Taking a screenshot");
   assert.equal(describeDesktopAction("mcp__computer-mcp__scroll", { dx: 0, dy: 2 }), "Scrolling down");
   assert.equal(describeDesktopAction("mcp__computer-mcp__wait", { ms: 500 }), "Waiting 500ms");
+});
+
+test("compound desktop tools: validation, risk gate, findTextTarget, and telemetry", () => {
+  // click_text
+  assert.equal(parseToolArgs("click_text", { text: "Submit" }).ok, true);
+  assert.equal(parseToolArgs("click_text", { text: "" }).ok, false);
+  assert.equal(parseToolArgs("click_text", { text: "Submit", button: 9 }).ok, false);
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__click_text", { text: "Submit" })?.level, "allow");
+  assert.equal(describeDesktopAction("mcp__computer-mcp__click_text", { text: "Submit" }), 'Clicking "Submit"');
+  assert.equal(computerActionEvent("mcp__computer-mcp__click_text", { text: "Submit" }).target, "Submit");
+
+  // wait_for_text & wait_for_screen_change
+  assert.equal(parseToolArgs("wait_for_text", { text: "Done", timeoutMs: 5000, pollMs: 250 }).ok, true);
+  assert.equal(parseToolArgs("wait_for_text", { text: "Done", timeoutMs: 50 }).ok, false);
+  assert.equal(parseToolArgs("wait_for_screen_change", { timeoutMs: 3000 }).ok, true);
+  assert.equal(parseToolArgs("wait_for_screen_change", { pollMs: 50 }).ok, false);
+  assert.equal(describeDesktopAction("mcp__computer-mcp__wait_for_screen_change", {}), "Waiting for screen change");
+
+  // clipboard_get & clipboard_set (never leaks clipboard content into telemetry)
+  assert.equal(parseToolArgs("clipboard_get", { selection: "clipboard" }).ok, true);
+  assert.equal(parseToolArgs("clipboard_get", { selection: "invalid" }).ok, false);
+  assert.equal(parseToolArgs("clipboard_set", { text: "secret-token" }).ok, true);
+  assert.equal(parseToolArgs("clipboard_set", { text: "" }).ok, false);
+  assert.equal(describeDesktopAction("mcp__computer-mcp__clipboard_set", { text: "secret-token" }), "Setting clipboard (12 chars)");
+  const clipEv = computerActionEvent("mcp__computer-mcp__clipboard_set", { text: "secret-token" });
+  assert.equal(clipEv.text, undefined);
+  assert.ok(!JSON.stringify(clipEv).includes("secret-token"));
+
+  // focus_window
+  assert.equal(parseToolArgs("focus_window", { title: "Terminal" }).ok, true);
+  assert.deepEqual(parseToolArgs("focus_window", { title: "Terminal" }).cmds, [["-a", "Terminal"]]);
+  assert.equal(parseToolArgs("focus_window", { title: "" }).ok, false);
+  assert.equal(computerActionEvent("mcp__computer-mcp__focus_window", { title: "Terminal" }).target, "Terminal");
+
+  // findTextTarget prefers exact match, falls back to case-insensitive substring
+  const targets = [
+    { text: "Save As...", x: 0, y: 0, w: 40, h: 20, cx: 20, cy: 10 },
+    { text: "Save", x: 50, y: 0, w: 30, h: 20, cx: 65, cy: 10 },
+  ];
+  assert.equal(findTextTarget(targets, "save")?.text, "Save");
+  assert.equal(findTextTarget(targets, "as")?.text, "Save As...");
+  assert.equal(findTextTarget(targets, "as", { exact: true }), null);
 });
 
 test("describeDesktopAction summarizes playwright calls readably", () => {

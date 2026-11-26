@@ -65,6 +65,218 @@ function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/** Synthesize a stable, non-empty tool-call id for providers that omit one. */
+export function ensureToolCallId(id: unknown): string {
+  const value = asString(id);
+  return value !== undefined && value.length > 0 ? value : `call_${randomUUID().slice(0, 8)}`;
+}
+
+function isDigit(ch: string): boolean {
+  return ch >= "0" && ch <= "9";
+}
+
+function isHexDigit(ch: string): boolean {
+  return isDigit(ch) || (ch >= "a" && ch <= "f") || (ch >= "A" && ch <= "F");
+}
+
+function isWhitespace(ch: string): boolean {
+  return ch === " " || ch === "\n" || ch === "\r" || ch === "\t";
+}
+
+/**
+ * Return a suffix that turns `input` into a valid JSON document, or `null`
+ * when `input` cannot be completed by appending characters (it is not a valid
+ * JSON prefix). OpenAI-compatible providers sometimes truncate tool-call
+ * arguments mid-string; appending the returned suffix keeps the Anthropic
+ * SSE stream's tool input parseable instead of aborting `claude -p`.
+ *
+ * The scanner is deliberately lenient about *incomplete* values (a number
+ * without digits, a half-written escape, an open container) and strict about
+ * values that can never become valid (a stray character, a bad escape,
+ * trailing garbage after a complete document).
+ */
+export function jsonCompletionSuffix(input: string): string | null {
+  let start = 0;
+  while (start < input.length && isWhitespace(input[start]!)) start += 1;
+  if (start === input.length) return "{}";
+  let i = 0;
+  const n = input.length;
+  const ws = (): void => {
+    while (i < n && isWhitespace(input[i]!)) i += 1;
+  };
+
+  // Called with input[i] === '"'. Returns the suffix needed to close the
+  // string, or null for an invalid escape.
+  const stringSuffix = (): string | null => {
+    i += 1;
+    while (i < n) {
+      const ch = input[i++]!;
+      if (ch === '"') return "";
+      // Raw control characters are never legal inside a JSON string, even
+      // though the scanner would otherwise treat them as ordinary content.
+      if (ch.charCodeAt(0) < 0x20) return null;
+      if (ch === "\\") {
+        if (i >= n) return 'u0000"'; // dangling backslash: encode NUL, close
+        const esc = input[i++]!;
+        if (esc === "u") {
+          let digits = 0;
+          while (i < n && digits < 4 && isHexDigit(input[i]!)) {
+            i += 1;
+            digits += 1;
+          }
+          if (digits < 4) return "0".repeat(4 - digits) + '"';
+        } else if (!'"\\/bfnrt'.includes(esc)) {
+          return null;
+        }
+      }
+    }
+    return '"'; // unterminated string
+  };
+
+  const literalSuffix = (word: string): string | null => {
+    let k = 0;
+    while (i < n && k < word.length) {
+      if (input[i] !== word[k]) return null;
+      i += 1;
+      k += 1;
+    }
+    return word.slice(k);
+  };
+
+  const numberSuffix = (): string | null => {
+    if (input[i] === "-") {
+      i += 1;
+      if (i >= n) return "0";
+    }
+    if (i >= n || !isDigit(input[i]!)) return null;
+    if (input[i] === "0") i += 1;
+    else while (i < n && isDigit(input[i]!)) i += 1;
+    if (i < n && input[i] === ".") {
+      i += 1;
+      if (i >= n) return "0";
+      if (!isDigit(input[i]!)) return null;
+      while (i < n && isDigit(input[i]!)) i += 1;
+    }
+    if (i < n && (input[i] === "e" || input[i] === "E")) {
+      i += 1;
+      if (i < n && (input[i] === "+" || input[i] === "-")) i += 1;
+      if (i >= n) return "0";
+      if (!isDigit(input[i]!)) return null;
+      while (i < n && isDigit(input[i]!)) i += 1;
+    }
+    return "";
+  };
+
+  let valueSuffix: () => string | null;
+  let objectSuffix: () => string | null;
+  let arraySuffix: () => string | null;
+
+  objectSuffix = (): string | null => {
+    i += 1; // opening brace
+    ws();
+    if (i >= n) return "}";
+    if (input[i] === "}") {
+      i += 1;
+      return "";
+    }
+    for (;;) {
+      ws();
+      if (i >= n) return '"":null}'; // key not started yet
+      if (input[i] !== '"') return null;
+      const key = stringSuffix();
+      if (key !== "") return key + ":null}"; // unterminated key
+      ws();
+      if (i >= n) return ":null}";
+      if (input[i] !== ":") return null;
+      i += 1;
+      const value = valueSuffix();
+      if (value === null) return null;
+      if (value !== "") return value + "}";
+      ws();
+      if (i >= n) return "}";
+      if (input[i] === "}") {
+        i += 1;
+        return "";
+      }
+      if (input[i] !== ",") return null;
+      i += 1;
+      ws();
+      if (i >= n) return '"":null}'; // trailing comma
+    }
+  };
+
+  arraySuffix = (): string | null => {
+    i += 1; // opening bracket
+    ws();
+    if (i >= n) return "]";
+    if (input[i] === "]") {
+      i += 1;
+      return "";
+    }
+    for (;;) {
+      const value = valueSuffix();
+      if (value === null) return null;
+      if (value !== "") return value + "]";
+      ws();
+      if (i >= n) return "]";
+      if (input[i] === "]") {
+        i += 1;
+        return "";
+      }
+      if (input[i] !== ",") return null;
+      i += 1;
+      ws();
+      if (i >= n) return "null]"; // trailing comma
+    }
+  };
+
+  valueSuffix = (): string | null => {
+    ws();
+    if (i >= n) return "null";
+    const ch = input[i]!;
+    if (ch === '"') return stringSuffix();
+    if (ch === "{") return objectSuffix();
+    if (ch === "[") return arraySuffix();
+    if (ch === "t") return literalSuffix("true");
+    if (ch === "f") return literalSuffix("false");
+    if (ch === "n") return literalSuffix("null");
+    if (ch === "-" || isDigit(ch)) return numberSuffix();
+    return null;
+  };
+
+  const suffix = valueSuffix();
+  if (suffix === null) return null;
+  ws();
+  return i < n ? null : suffix;
+}
+
+/**
+ * Normalize a provider's tool arguments to a JSON string the Anthropic SDK
+ * can always parse. Valid strings pass through byte-identically; incomplete
+ * or malformed ones are completed when possible and otherwise fall back to
+ * `{}` — never a thrown exception in the middle of a stream.
+ */
+export function repairToolArguments(value: unknown): string {
+  if (typeof value !== "string") {
+    try {
+      return JSON.stringify(value ?? {});
+    } catch {
+      return "{}";
+    }
+  }
+  if (value.length === 0) return "{}";
+  const suffix = jsonCompletionSuffix(value);
+  if (suffix === null) return "{}";
+  if (suffix === "") return value;
+  const repaired = value + suffix;
+  try {
+    JSON.parse(repaired);
+    return repaired;
+  } catch {
+    return "{}";
+  }
+}
+
 /** Map an OpenAI finish_reason to an Anthropic stop_reason. */
 export function mapStopReason(finishReason: unknown): string | null {
   switch (finishReason) {
@@ -336,17 +548,14 @@ function openaiToolCallsToBlocks(toolCalls: unknown): Record<string, unknown>[] 
     const call = isRecord(raw) ? raw : {};
     const fn = isRecord(call.function) ? call.function : {};
     let input: unknown = {};
-    const args = asString(fn.arguments);
-    if (args !== undefined) {
-      try {
-        input = JSON.parse(args);
-      } catch {
-        input = {};
-      }
+    try {
+      input = JSON.parse(repairToolArguments(fn.arguments));
+    } catch {
+      input = {};
     }
     blocks.push({
       type: "tool_use",
-      id: asString(call.id) ?? `call_${randomUUID().slice(0, 8)}`,
+      id: ensureToolCallId(call.id),
       name: asString(fn.name) ?? "",
       input,
     });
@@ -479,8 +688,15 @@ export class OpenAIStreamTranslator {
   private done = false;
   private blockIndex = -1;
   private textIndex = -1;
-  /** OpenAI tool_call index -> Anthropic content block index. */
-  private readonly toolBlocks = new Map<number, number>();
+  /** OpenAI tool_call index -> stable per-block state. */
+  private readonly toolBlocks = new Map<
+    number,
+    { id: string; name: string; blockIndex: number; emitted: string; sawArgs: boolean }
+  >();
+  /** Stable indices for id-less tool_calls that carry no `index` of their own. */
+  private readonly toolIdIndex = new Map<string, number>();
+  /** -1 is reserved for entirely anonymous deltas; real indices are >= 0. */
+  private nextSyntheticToolIndex = -2;
   /** Input/cache totals from upstream usage chunks; undefined until seen. */
   private inputTokens?: number;
   private cacheReadTokens?: number;
@@ -529,8 +745,13 @@ export class OpenAIStreamTranslator {
       this.started = true;
     }
 
-    const choices = Array.isArray(root.choices) ? root.choices : [];
-    const first = isRecord(choices[0]) ? choices[0] : {};
+    // Some providers emit choices out of order, or pad them with nulls. The
+    // primary choice is index 0; fall back to the first object-like entry.
+    // An empty/absent choices array (usage-only chunk) yields an empty delta.
+    const choices: Record<string, unknown>[] = Array.isArray(root.choices)
+      ? root.choices.filter(isRecord)
+      : [];
+    const first = choices.find((choice) => asNumber(choice.index) === 0) ?? choices[0] ?? {};
     const delta = isRecord(first.delta) ? first.delta : {};
 
     const text = asString(delta.content);
@@ -560,11 +781,29 @@ export class OpenAIStreamTranslator {
     const toolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
     for (const raw of toolCalls) {
       const call = isRecord(raw) ? raw : {};
-      const oaiIndex = asNumber(call.index) ?? this.blockIndex + 1;
+      // A missing `index` must map to one stable block: deriving it from the
+      // moving blockIndex would split a single tool call across blocks. Use
+      // the call id when present, otherwise one bucket for anonymous deltas.
+      let oaiIndex = asNumber(call.index);
+      if (oaiIndex === undefined) {
+        const callId = asString(call.id);
+        if (callId !== undefined && callId.length > 0) {
+          const known = this.toolIdIndex.get(callId);
+          if (known !== undefined) {
+            oaiIndex = known;
+          } else {
+            oaiIndex = this.nextSyntheticToolIndex--;
+            this.toolIdIndex.set(callId, oaiIndex);
+          }
+        } else {
+          oaiIndex = -1;
+        }
+      }
       const fn = isRecord(call.function) ? call.function : {};
       const args = asString(fn.arguments);
 
-      if (!this.toolBlocks.has(oaiIndex)) {
+      let block = this.toolBlocks.get(oaiIndex);
+      if (!block) {
         // Close any open text block before starting a tool block: Anthropic
         // content blocks are sequential, text then tool_use.
         if (this.textIndex !== -1) {
@@ -575,41 +814,44 @@ export class OpenAIStreamTranslator {
           this.textIndex = -1;
         }
         this.blockIndex += 1;
-        this.toolBlocks.set(oaiIndex, this.blockIndex);
-        const blockIndex = this.blockIndex;
+        block = {
+          // Providers that omit the id still need a non-empty one: the
+          // Anthropic SDK keys tool_result blocks by it.
+          id: ensureToolCallId(call.id),
+          name: asString(fn.name) ?? "",
+          blockIndex: this.blockIndex,
+          emitted: "",
+          sawArgs: false,
+        };
+        this.toolBlocks.set(oaiIndex, block);
         lines.push({
           event: "content_block_start",
           data: JSON.stringify({
             type: "content_block_start",
-            index: blockIndex,
-            content_block: {
-              type: "tool_use",
-              id: asString(call.id) ?? "",
-              name: asString(fn.name) ?? "",
-              input: {},
-            },
+            index: block.blockIndex,
+            content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
           }),
         });
-        if (args !== undefined && args.length > 0) {
+      }
+
+      if (args !== undefined && args.length > 0) {
+        block.sawArgs = true;
+        // Relay a fragment only while the accumulated input is still a
+        // completable JSON prefix. Malformed fragments are dropped here and
+        // the finalizer closes the prefix, so the SDK always parses a valid
+        // document instead of aborting the run mid-stream.
+        const candidate = block.emitted + args;
+        if (jsonCompletionSuffix(candidate) !== null) {
+          block.emitted = candidate;
           lines.push({
             event: "content_block_delta",
             data: JSON.stringify({
               type: "content_block_delta",
-              index: blockIndex,
+              index: block.blockIndex,
               delta: { type: "input_json_delta", partial_json: args },
             }),
           });
         }
-      } else if (args !== undefined && args.length > 0) {
-        const blockIndex = this.toolBlocks.get(oaiIndex)!;
-        lines.push({
-          event: "content_block_delta",
-          data: JSON.stringify({
-            type: "content_block_delta",
-            index: blockIndex,
-            delta: { type: "input_json_delta", partial_json: args },
-          }),
-        });
       }
     }
 
@@ -641,16 +883,34 @@ export class OpenAIStreamTranslator {
       });
       this.textIndex = -1;
     }
-    // Close any open tool blocks in ascending content-block order.
-    const openBlocks = Array.from(this.toolBlocks.values()).sort((a, b) => a - b);
-    for (const index of openBlocks) {
-      if (!this.closedToolBlocks.has(index)) {
-        this.closedToolBlocks.add(index);
-        lines.push({
-          event: "content_block_stop",
-          data: JSON.stringify({ type: "content_block_stop", index }),
-        });
+    // Close any open tool blocks in ascending content-block order. This is
+    // also the last chance to make each tool's JSON input parseable: emit a
+    // completion suffix for a truncated prefix, or `{}` when the provider's
+    // fragments were wholly unusable.
+    const openBlocks = Array.from(this.toolBlocks.values()).sort((a, b) => a.blockIndex - b.blockIndex);
+    for (const block of openBlocks) {
+      if (this.closedToolBlocks.has(block.blockIndex)) continue;
+      this.closedToolBlocks.add(block.blockIndex);
+      if (block.emitted.length > 0 || block.sawArgs) {
+        const suffix = block.emitted.length > 0 ? jsonCompletionSuffix(block.emitted) : "{}";
+        // A non-null suffix is guaranteed for anything we relayed (we only
+        // emit completable prefixes); a null here simply skips the repair
+        // rather than throwing inside the SSE stream.
+        if (suffix !== null && suffix.length > 0) {
+          lines.push({
+            event: "content_block_delta",
+            data: JSON.stringify({
+              type: "content_block_delta",
+              index: block.blockIndex,
+              delta: { type: "input_json_delta", partial_json: suffix },
+            }),
+          });
+        }
       }
+      lines.push({
+        event: "content_block_stop",
+        data: JSON.stringify({ type: "content_block_stop", index: block.blockIndex }),
+      });
     }
     // Cumulative whole-message totals; only fields the upstream actually
     // reported are emitted. The Anthropic SDK overwrites message_start counts

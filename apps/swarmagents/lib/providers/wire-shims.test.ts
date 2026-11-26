@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { OpenAIStreamTranslator } from "./anthropic-bridge";
 import {
   anthropicToGemini,
   anthropicToOllama,
@@ -371,4 +372,88 @@ test("anthropicToGemini: is_error, tool_choice and max_tokens clamp map natively
   );
   const okResponse = okParts.find((p) => p.functionResponse)!.functionResponse as Record<string, unknown>;
   assert.deepEqual(okResponse.response, { result: "file.txt" });
+});
+
+test("Responses stream: out-of-order deltas, missing ids and malformed arguments stay streamable", () => {
+  const state = newResponsesStreamState("gpt-5");
+  // An argument delta can arrive before output_item.added; neither carries an
+  // id. Both must map to the same non-empty tool call.
+  const deltaChunks = responsesEventToChunks(
+    { type: "response.function_call_arguments.delta", delta: '{"cmd":"ls' },
+    state,
+  );
+  const addedChunks = responsesEventToChunks(
+    { type: "response.output_item.added", item: { type: "function_call", name: "shell" } },
+    state,
+  );
+  const translator = new OpenAIStreamTranslator();
+  const events = [
+    ...deltaChunks.flatMap((chunk) => translator.push(chunk)),
+    ...addedChunks.flatMap((chunk) => translator.push(chunk)),
+    ...translator.finish(),
+  ];
+  const starts = events.filter((event) => {
+    const data = JSON.parse(event.data) as Record<string, unknown>;
+    return data.type === "content_block_start";
+  });
+  assert.equal(starts.length, 1);
+  const block = (JSON.parse(starts[0]!.data) as { content_block: Record<string, unknown> }).content_block;
+  assert.ok(String(block.id).length > 0);
+  assert.equal(block.name, "shell");
+  const args = events
+    .map((event) => JSON.parse(event.data) as Record<string, unknown>)
+    .filter((data) => (data.delta as Record<string, unknown> | undefined)?.type === "input_json_delta")
+    .map((data) => String((data.delta as Record<string, unknown>).partial_json))
+    .join("");
+  assert.deepEqual(JSON.parse(args), { cmd: "ls" });
+
+  // A complete-but-malformed argument object at output_item.done is repaired.
+  const doneState = newResponsesStreamState("gpt-5");
+  const done = responsesEventToChunks(
+    {
+      type: "response.output_item.done",
+      item: { type: "function_call", call_id: "call_1", name: "shell", arguments: '{"cmd":1' },
+    },
+    doneState,
+  );
+  const call = (done[0]!.choices[0]!.delta.tool_calls as unknown[])[0] as Record<string, unknown>;
+  assert.equal(call.id, "call_1");
+  assert.deepEqual(JSON.parse(String((call.function as Record<string, unknown>).arguments)), { cmd: 1 });
+});
+
+test("Ollama and Gemini stream chunks synthesize ids and repair malformed tool arguments", () => {
+  const ollamaState = newOllamaStreamState("llama");
+  const ollama = ollamaLineToChunks(
+    {
+      message: { tool_calls: [{ function: { name: "shell", arguments: '{"cmd":' } }] },
+      done: false,
+    },
+    ollamaState,
+  );
+  const ollamaCall = (ollama[0]!.choices[0]!.delta.tool_calls as unknown[])[0] as Record<string, unknown>;
+  assert.ok(String(ollamaCall.id).length > 0);
+  assert.deepEqual(JSON.parse(String((ollamaCall.function as Record<string, unknown>).arguments)), {
+    cmd: null,
+  });
+
+  const geminiState = newGeminiStreamState("gemini");
+  const gemini = geminiChunkToChunks(
+    { candidates: [{ content: { parts: [{ functionCall: { name: "shell", args: "nope" } }] } }] },
+    geminiState,
+  );
+  const geminiCall = (gemini[0]!.choices[0]!.delta.tool_calls as unknown[])[0] as Record<string, unknown>;
+  assert.ok(String(geminiCall.id).length > 0);
+  assert.deepEqual(JSON.parse(String((geminiCall.function as Record<string, unknown>).arguments)), {});
+});
+
+test("Responses non-streaming body repairs arguments and synthesizes a missing call id", () => {
+  const out = responsesToOpenAIResponse(
+    { output: [{ type: "function_call", name: "shell", arguments: '{"cmd":1' }] },
+    "fallback",
+  );
+  const call = ((out.choices as Record<string, unknown>[])[0] as {
+    message: { tool_calls: Record<string, unknown>[] };
+  }).message.tool_calls[0]!;
+  assert.match(String(call.id), /^call_[0-9a-f-]+$/);
+  assert.deepEqual(JSON.parse(String((call.function as Record<string, unknown>).arguments)), { cmd: 1 });
 });

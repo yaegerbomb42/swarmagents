@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -7,11 +7,42 @@ import { deepHealthSnapshot, healthSnapshot } from "./health";
 import { configureStorePaths } from "./board/store";
 import { CONNECTOR_CATALOG } from "./connectors/catalog";
 import { CONNECTORS } from "./library/catalog";
+import { PROVIDER_CATALOG } from "./providers/catalog";
 import { configureProviderStorePaths, saveProvider } from "./providers/store";
 
 function tmpDir(): string {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "swarm-health-")));
 }
+
+// Every env var lib/health.ts reads for the host-env provider count. A dev
+// machine or CI runner may export any of these (e.g. SWARM_KEYS_OPENAI), so
+// each case must start from a clean slate and get its original values back.
+const HOST_KEY_VARS = [...new Set(PROVIDER_CATALOG.map((entry) => entry.envVar))];
+
+function stashHostKeyVars(): Record<string, string | undefined> {
+  const saved: Record<string, string | undefined> = {};
+  for (const name of HOST_KEY_VARS) saved[name] = process.env[name];
+  for (const name of HOST_KEY_VARS) delete process.env[name];
+  return saved;
+}
+
+function restoreHostKeyVars(saved: Record<string, string | undefined>): void {
+  for (const name of HOST_KEY_VARS) {
+    const value = saved[name];
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+}
+
+let savedHostKeyVars: Record<string, string | undefined>;
+
+beforeEach(() => {
+  savedHostKeyVars = stashHostKeyVars();
+});
+
+afterEach(() => {
+  restoreHostKeyVars(savedHostKeyVars);
+});
 
 test("health snapshot exposes only the agreed fields, never secrets", () => {
   process.env.SWARM_KEYS_ANTHROPIC = "sk-test-anthropic";
@@ -38,7 +69,6 @@ test("health snapshot exposes only the agreed fields, never secrets", () => {
   assert.equal(snap.providersScope, "host-env");
   // The raw key value must never leak into the report.
   assert.equal(JSON.stringify(snap).includes("sk-test-anthropic"), false);
-  delete process.env.SWARM_KEYS_ANTHROPIC;
 });
 
 test("commit and builtAt come from env or fall back to defaults", () => {
@@ -96,15 +126,9 @@ test("builtAt is an ISO string when SWARM_BUILD_TIME is set", () => {
 });
 
 test("providersConfigured counts host provider keys from the catalog (SWARM_KEYS_*)", () => {
-  const prevA = process.env.SWARM_KEYS_ANTHROPIC;
-  const prevO = process.env.SWARM_KEYS_OPENAI;
-  const prevN = process.env.SWARM_KEYS_NVIDIA_NIM;
   const prevStdA = process.env.ANTHROPIC_API_KEY;
   const prevStdO = process.env.OPENAI_API_KEY;
   try {
-    delete process.env.SWARM_KEYS_ANTHROPIC;
-    delete process.env.SWARM_KEYS_OPENAI;
-    delete process.env.SWARM_KEYS_NVIDIA_NIM;
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.OPENAI_API_KEY;
     assert.equal(healthSnapshot().providersConfigured, 0);
@@ -127,12 +151,6 @@ test("providersConfigured counts host provider keys from the catalog (SWARM_KEYS
     process.env.OPENAI_API_KEY = "sk-fake-standard-openai";
     assert.equal(healthSnapshot().providersConfigured, 0);
   } finally {
-    if (prevA !== undefined) process.env.SWARM_KEYS_ANTHROPIC = prevA;
-    else delete process.env.SWARM_KEYS_ANTHROPIC;
-    if (prevO !== undefined) process.env.SWARM_KEYS_OPENAI = prevO;
-    else delete process.env.SWARM_KEYS_OPENAI;
-    if (prevN !== undefined) process.env.SWARM_KEYS_NVIDIA_NIM = prevN;
-    else delete process.env.SWARM_KEYS_NVIDIA_NIM;
     if (prevStdA !== undefined) process.env.ANTHROPIC_API_KEY = prevStdA;
     else delete process.env.ANTHROPIC_API_KEY;
     if (prevStdO !== undefined) process.env.OPENAI_API_KEY = prevStdO;

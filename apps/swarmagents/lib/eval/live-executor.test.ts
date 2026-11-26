@@ -58,7 +58,7 @@ if (mcpAt >= 0) {
     mcp,
     allowedTools: argv[argv.indexOf("--allowedTools") + 1],
     settings: JSON.parse(fs.readFileSync(path.join(process.env.CLAUDE_CONFIG_DIR, "settings.json"), "utf8")),
-    betaWindow: spawnSync("xdotool", ["search", "--name", "^beta$"], { env: { ...process.env, DISPLAY: display } }).status === 0,
+    betaWindow: spawnSync("xdotool", ["search", "--name", "^beta$"], { env: { ...process.env, DISPLAY: display }, timeout: 5_000 }).status === 0,
   }));
   out({ type: "assistant", message: { id: "d1", model, content: [{ type: "tool_use", id: "c1", name: "mcp__computer-mcp__click", input: { x: 5, y: 5 } }], usage: usage(10, 1) } });
   out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "c1", content: "Clicked\neffect: NO visible change after 1.0s; focused window unchanged" }] } });

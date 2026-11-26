@@ -69,7 +69,7 @@ for (const task of DESKTOP_PROVIDER_EVAL_TASKS) {
     const env = { ...process.env, DISPLAY: session.display };
     try {
       for (const app of task.desktop!.apps) {
-        const found = spawnSync("xdotool", ["search", "--name", `^${app.waitForTitle}$`], { env });
+        const found = spawnSync("xdotool", ["search", "--name", `^${app.waitForTitle}$`], { env, timeout: 5_000 });
         assert.equal(found.status, 0, `window ${app.waitForTitle}`);
       }
     } finally {
@@ -89,7 +89,7 @@ test(
     try {
       const shot = path.join(dir, "shot.png");
       await new Promise((r) => setTimeout(r, 500));
-      assert.equal(spawnSync("scrot", ["-o", shot], { env: { ...process.env, DISPLAY: session.display } }).status, 0);
+      assert.equal(spawnSync("scrot", ["-o", shot], { env: { ...process.env, DISPLAY: session.display }, timeout: 10_000 }).status, 0);
       const ocr = spawnSync("tesseract", [shot, "-"], { encoding: "utf8" }).stdout.replace(/\s+/g, "");
       assert.ok(ocr.includes(DESKTOP_SECRET_CODE.replace(/\s+/g, "")), `OCR saw: ${ocr.slice(0, 200)}`);
     } finally {

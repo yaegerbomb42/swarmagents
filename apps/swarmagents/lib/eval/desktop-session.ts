@@ -116,7 +116,7 @@ export async function startDesktopSession(setup: DesktopSetup, workspaceDir: str
     const geometry = `${setup.width ?? 1280}x${setup.height ?? 800}x24`;
     procs.push(spawn("Xvfb", [display, "-screen", "0", geometry, "-nolisten", "tcp"], { stdio: "ignore", detached: true }));
     const env = xenv(display, workspaceDir);
-    await waitFor(() => spawnSync("xdotool", ["getmouselocation"], { env, stdio: "ignore" }).status === 0, 10_000, "Xvfb");
+    await waitFor(() => spawnSync("xdotool", ["getmouselocation"], { env, stdio: "ignore", timeout: 2_000 }).status === 0, 10_000, "Xvfb");
     // A window manager makes focus_window / windowactivate work like on the
     // real A1 image (xfce). Optional: bare Xvfb still runs, focus follows the pointer.
     if (setup.windowManager !== false && spawnSync("which", ["xfwm4"], { stdio: "ignore" }).status === 0) {
@@ -130,7 +130,7 @@ export async function startDesktopSession(setup: DesktopSetup, workspaceDir: str
       if (app.waitForTitle) {
         const title = app.waitForTitle;
         await waitFor(
-          () => spawnSync("xdotool", ["search", "--name", `^${title}$`], { env, stdio: "ignore" }).status === 0,
+          () => spawnSync("xdotool", ["search", "--name", `^${title}$`], { env, stdio: "ignore", timeout: 2_000 }).status === 0,
           10_000,
           `window "${title}"`,
         );

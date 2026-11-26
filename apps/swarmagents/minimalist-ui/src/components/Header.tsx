@@ -103,6 +103,8 @@ export interface HeaderProps {
   user?: { email?: string | null; name?: string | null } | null;
   /** The account's 24/7 always-on VM mode (shows the live badge when on). */
   alwaysOn247?: boolean;
+  /** Count of unread completed scheduled (cron) runs. */
+  unreadCronCount?: number;
 }
 
 export function Header({
@@ -120,6 +122,7 @@ export function Header({
   onOpenShortcuts,
   user,
   alwaysOn247 = false,
+  unreadCronCount = 0,
 }: HeaderProps) {
   return (
     <header className="glass shrink-0 hair-b relative z-30" data-testid="workspace-header">
@@ -149,6 +152,15 @@ export function Header({
             <span className="truncate" data-testid="thread-title">
               {title}
             </span>
+            {unreadCronCount > 0 && (
+              <span
+                data-testid="unread-cron-badge"
+                title={`${unreadCronCount} unread scheduled run${unreadCronCount === 1 ? "" : "s"}`}
+                className="inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-emerald-400/20 px-1 font-mono text-[10px] font-semibold text-emerald-300 ring-1 ring-emerald-400/35"
+              >
+                {unreadCronCount}
+              </span>
+            )}
             <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[var(--mute)]" aria-hidden />
           </button>
 

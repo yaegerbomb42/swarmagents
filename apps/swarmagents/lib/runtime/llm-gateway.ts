@@ -1192,23 +1192,41 @@ function bridgeOptionsFor(config: ProviderConfig, model: string): { maxOutputTok
   return { maxOutputTokens: mergedModelCapabilities(config, model).maxOutputTokens };
 }
 
+/**
+ * Tool names the client declared in the Anthropic request body. Used to
+ * repair case-mismatched tool calls returned by OpenAI-compatible upstreams
+ * (e.g. Ollama lowercases `Read` to `read`), which Claude Code would
+ * otherwise fail to match. Returns undefined when the request declares none.
+ */
+function declaredToolNames(body: unknown): ReadonlySet<string> | undefined {
+  const tools = (body as { tools?: unknown }).tools;
+  if (!Array.isArray(tools)) return undefined;
+  const names = new Set<string>();
+  for (const raw of tools) {
+    const name = (raw as { name?: unknown }).name;
+    if (typeof name === "string" && name.length > 0) names.add(name);
+  }
+  return names.size > 0 ? names : undefined;
+}
+
 /** Translate a provider's non-streaming body back to Anthropic Messages. */
 function anthropicResponse(
   config: ProviderConfig,
   json: unknown,
   model: string,
+  declared?: ReadonlySet<string>,
 ): unknown {
   switch (apiStyleFor(config)) {
     case "anthropic":
       return json;
     case "openai-responses":
-      return openAIToAnthropicResponse(responsesToOpenAIResponse(json, model), model);
+      return openAIToAnthropicResponse(responsesToOpenAIResponse(json, model), model, declared);
     case "ollama":
-      return openAIToAnthropicResponse(ollamaToOpenAIResponse(json, model), model);
+      return openAIToAnthropicResponse(ollamaToOpenAIResponse(json, model), model, declared);
     case "gemini":
-      return openAIToAnthropicResponse(geminiToOpenAIResponse(json, model), model);
+      return openAIToAnthropicResponse(geminiToOpenAIResponse(json, model), model, declared);
     default:
-      return openAIToAnthropicResponse(json, model);
+      return openAIToAnthropicResponse(json, model, declared);
   }
 }
 
@@ -1516,7 +1534,7 @@ export async function forwardLlmNonStreaming(options: LlmForwardOptions): Promis
         continue;
       }
 
-      const translated = anthropicResponse(config, json, handle.model);
+      const translated = anthropicResponse(config, json, handle.model, declaredToolNames(body));
       const usage = withReportedCost(usageOf(translated), config, json);
       const latencyMs = req.now() - startedAt;
       const content = contentOf(translated);
@@ -1859,7 +1877,7 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
           reader.releaseLock();
         }
       } else {
-        const translator = new OpenAIStreamTranslator();
+        const translator = new OpenAIStreamTranslator(declaredToolNames(body));
         const chunks = upstreamChunks(config, guardedBody, deadline.signal);
         // Pull the first chunk before announcing the provider (see above).
         let step: IteratorResult<OpenAIChunk>;

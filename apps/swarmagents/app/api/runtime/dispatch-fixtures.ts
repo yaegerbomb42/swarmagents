@@ -6,15 +6,59 @@
  * drifting apart between the two dispatch suites.
  */
 
+import test from "node:test";
 import assert from "node:assert/strict";
 import { NextRequest } from "next/server";
+import { createRouter } from "../../../lib/providers";
+import { RuntimeManager, setRuntimeManagerForTesting } from "../../../lib/runtime/manager";
 import type { SequencedEvent } from "../../../lib/telemetry/bus";
+import { FakeVmDriver } from "../../../lib/vm/fake-driver";
+import { VmManager } from "../../../lib/vm/manager";
+import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
 
 export interface DispatchEvent extends SequencedEvent {
   sessionId?: string;
   model?: string;
   text?: string;
   exitCode?: number;
+}
+
+/** The gateway router both dispatch suites run against. */
+export function gatewayRouter(): ReturnType<typeof createRouter> {
+  return createRouter({
+    providers: [
+      { id: "gw-a", kind: "anthropic", rank: 0, baseUrl: "http://gw", keys: ["sk-test-gw-key-0000"] },
+    ],
+  });
+}
+
+/**
+ * Base driver that records every exec call; a subclass serves the agent
+ * command itself (replaying a transcript or spawning a binary) and returns
+ * null for everything else, deferring to the base fake VM.
+ */
+export abstract class RecordingDispatchDriver extends FakeVmDriver {
+  calls: Array<{ cmd: string[]; opts: ExecOptions }> = [];
+
+  override async exec(handle: VmHandle, cmd: string[], opts: ExecOptions = {}): Promise<ExecResult> {
+    this.calls.push({ cmd, opts });
+    const agentResult = await this.execAgent(handle, cmd, opts);
+    return agentResult === null ? super.exec(handle, cmd, opts) : agentResult;
+  }
+
+  protected abstract execAgent(handle: VmHandle, cmd: string[], opts: ExecOptions): Promise<ExecResult | null>;
+}
+
+/** Point the runtime at a custom driver (and optional provider router). */
+export function installRuntime(driver: FakeVmDriver, router?: ReturnType<typeof createRouter>): void {
+  setRuntimeManagerForTesting(new RuntimeManager({ vm: new VmManager({ customDriver: driver }), router }));
+}
+
+/** Standard post-test runtime reset shared by both dispatch suites. */
+export function useRuntimeCleanup(): void {
+  test.afterEach(() => {
+    setRuntimeManagerForTesting(null);
+  });
 }
 
 /** A recorded stream-json transcript: init, assistant text + tool_use, tool result, final result. */
@@ -48,27 +92,28 @@ export async function readUntil(res: Response, terminal: string): Promise<Dispat
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   const events: DispatchEvent[] = [];
-  let buffer = "";
+  let carry = "";
+  // Parse one SSE frame; returns true when the terminal event has arrived.
+  const consumeFrame = (frame: string): boolean => {
+    const data = frame.split("\n").find((line) => line.startsWith("data: "));
+    if (!data) return false; // keep-alive comment
+    const event = JSON.parse(data.slice("data: ".length)) as DispatchEvent;
+    events.push(event);
+    if (event.type === "stream.error") {
+      // The server aborted before a terminal state; surface the reason
+      // instead of a cryptic "stream ended" timeout.
+      throw new Error(`SSE stream aborted with error: ${JSON.stringify(event.data)}`);
+    }
+    return event.type === terminal;
+  };
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let boundary: number;
-      while ((boundary = buffer.indexOf("\n\n")) !== -1) {
-        const frame = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const data = frame.split("\n").find((line) => line.startsWith("data: "));
-        if (!data) continue; // keep-alive comment
-        const event = JSON.parse(data.slice("data: ".length)) as DispatchEvent;
-        events.push(event);
-        if (event.type === "stream.error") {
-          // The server aborted before a terminal state; surface the reason
-          // instead of a cryptic "stream ended" timeout.
-          throw new Error(`SSE stream aborted with error: ${JSON.stringify(event.data)}`);
-        }
-        if (event.type === terminal) return events;
-      }
+      carry += decoder.decode(value, { stream: true });
+      const frames = carry.split("\n\n");
+      carry = frames.pop() ?? "";
+      if (frames.some(consumeFrame)) return events;
     }
   } finally {
     await reader.cancel().catch(() => {});
@@ -83,18 +128,22 @@ export async function readUntil(res: Response, terminal: string): Promise<Dispat
  * asserted by each suite.
  */
 export function assertDispatchOrdering(events: DispatchEvent[]): void {
-  const types = events.filter((event) => event.type !== "run.mode").map((event) => event.type);
+  const indexOf = (type: string) => events.findIndex((event) => event.type === type);
   // run.created is published synchronously by POST; the VM is brought up,
   // then the run lifecycle starts and finishes, in that order.
-  assert.equal(types[0], "run.created");
-  assert.equal(types[1], "vm.starting");
-  assert.equal(types[2], "vm.ready");
-  assert.equal(types[3], "run.started");
-  assert.equal(types[types.length - 1], "run.finished");
-  assert.ok(types.indexOf("run.started") < types.indexOf("assistant.text"));
-  assert.ok(types.indexOf("assistant.text") < types.indexOf("run.finished"));
-  assert.ok(!types.includes("run.error"));
-  assert.ok(!types.includes("vm.error"));
+  assert.equal(events[0]?.type, "run.created");
+  for (const [earlier, later] of [
+    ["run.created", "vm.starting"],
+    ["vm.starting", "vm.ready"],
+    ["vm.ready", "run.started"],
+    ["run.started", "assistant.text"],
+    ["assistant.text", "run.finished"],
+  ] as const) {
+    assert.ok(indexOf(earlier) < indexOf(later), `${earlier} must precede ${later}`);
+  }
+  assert.equal(events[events.length - 1]?.type, "run.finished");
+  assert.equal(indexOf("run.error"), -1, "run.error must not appear");
+  assert.equal(indexOf("vm.error"), -1, "vm.error must not appear");
   // SSE ids are monotonic and gapless for a fresh run.
   for (let i = 0; i < events.length; i++) assert.equal(events[i].seq, i + 1);
 }

@@ -15,18 +15,8 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { POST } from "./tasks/route";
-import { RuntimeManager, setRuntimeManagerForTesting } from "../../../lib/runtime/manager";
-import { VmManager } from "../../../lib/vm/manager";
-import { FakeVmDriver } from "../../../lib/vm/fake-driver";
 import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
-import {
-  assertAgentExec,
-  assertDispatchLifecycle,
-  assertDispatchOrdering,
-  dispatchEvents,
-  dispatchTaskRequest,
-  recordedLines,
-} from "./dispatch-fixtures";
+import * as fx from "./dispatch-fixtures";
 
 const USER = "e2e-dispatch";
 
@@ -38,18 +28,14 @@ const USER = "e2e-dispatch";
 const RUN_DISPATCH_E2E = process.env.SWARM_RUN_DISPATCH_E2E === "1";
 const DISPATCH_E2E_TIMEOUT_MS = 120_000;
 
-
 /** Fake VM driver that actually spawns the recorded fake claude binary. */
-class BinaryFakeVmDriver extends FakeVmDriver {
-  calls: Array<{ cmd: string[]; opts: ExecOptions }> = [];
-
+class BinaryFakeVmDriver extends fx.RecordingDispatchDriver {
   constructor(private readonly claudeBin: string) {
     super();
   }
 
-  override async exec(handle: VmHandle, cmd: string[], opts: ExecOptions = {}): Promise<ExecResult> {
-    this.calls.push({ cmd, opts });
-    if (cmd[0] !== this.claudeBin) return super.exec(handle, cmd, opts);
+  protected override async execAgent(_handle: VmHandle, cmd: string[], opts: ExecOptions): Promise<ExecResult | null> {
+    if (cmd[0] !== this.claudeBin) return null;
 
     return new Promise<ExecResult>((resolve) => {
       const child = spawn(cmd[0], cmd.slice(1), {
@@ -78,7 +64,7 @@ class BinaryFakeVmDriver extends FakeVmDriver {
 
 function makeFakeClaude(dir: string): string {
   const fixture = join(dir, "stream-json.fixture");
-  writeFileSync(fixture, `${recordedLines("sess_e2e_1").map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
+  writeFileSync(fixture, `${fx.recordedLines("sess_e2e_1").map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
   const bin = join(dir, "claude");
   // Read prompt from the argument after `--` (kept for harness contract parity).
   writeFileSync(
@@ -98,9 +84,7 @@ exec cat "${fixture}"
   return bin;
 }
 
-test.afterEach(() => {
-  setRuntimeManagerForTesting(null);
-});
+fx.useRuntimeCleanup();
 
 test(
   "POST dispatches to the fake claude binary and SSE streams started..finished in order",
@@ -112,20 +96,20 @@ test(
     const claudeBin = makeFakeClaude(dir);
     process.env.CLAUDE_BIN = claudeBin;
     const driver = new BinaryFakeVmDriver(claudeBin);
-    setRuntimeManagerForTesting(new RuntimeManager({ vm: new VmManager({ customDriver: driver }) }));
+    fx.installRuntime(driver);
 
-    const post = await POST(dispatchTaskRequest("run the e2e dispatch", USER));
-    const events = await dispatchEvents(post, USER);
+    const post = await POST(fx.dispatchTaskRequest("run the e2e dispatch", USER));
+    const events = await fx.dispatchEvents(post, USER);
 
-    assertDispatchOrdering(events);
+    fx.assertDispatchOrdering(events);
 
     const ready = events.find((event) => event.type === "vm.ready");
     const readyData = ready?.data as { ms?: number } | undefined;
     assert.equal(typeof readyData?.ms, "number");
 
-    assertDispatchLifecycle(events, "sess_e2e_1");
+    fx.assertDispatchLifecycle(events, "sess_e2e_1");
 
-    assertAgentExec(driver.calls, claudeBin, "run the e2e dispatch");
+    fx.assertAgentExec(driver.calls, claudeBin, "run the e2e dispatch");
 
   } finally {
     if (previousBin === undefined) delete process.env.CLAUDE_BIN;

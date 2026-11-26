@@ -14,54 +14,33 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { POST } from "./tasks/route";
-import { RuntimeManager, setRuntimeManagerForTesting } from "../../../lib/runtime/manager";
-import { createRouter } from "../../../lib/providers";
-import { VmManager } from "../../../lib/vm/manager";
-import { FakeVmDriver } from "../../../lib/vm/fake-driver";
 import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
-import {
-  assertAgentExec,
-  assertDispatchLifecycle,
-  assertDispatchOrdering,
-  dispatchEvents,
-  dispatchTaskRequest,
-  recordedLines,
-} from "./dispatch-fixtures";
+import { POST } from "./tasks/route";
+import * as fx from "./dispatch-fixtures";
 
 const USER = "dispatch-unit";
 
 /** Fake VM driver that replays the recorded transcript without spawning. */
-class ScriptedDispatchDriver extends FakeVmDriver {
-  calls: Array<{ cmd: string[]; opts: ExecOptions }> = [];
-
-  override async exec(handle: VmHandle, cmd: string[], opts: ExecOptions = {}): Promise<ExecResult> {
-    this.calls.push({ cmd, opts });
-    if (cmd[0] !== "claude") return super.exec(handle, cmd, opts);
-    for (const line of recordedLines("sess_unit_1")) opts.onStdout?.(`${JSON.stringify(line)}\n`);
+class ScriptedDispatchDriver extends fx.RecordingDispatchDriver {
+  protected override async execAgent(_handle: VmHandle, cmd: string[], opts: ExecOptions): Promise<ExecResult | null> {
+    if (cmd[0] !== "claude") return null;
+    for (const line of fx.recordedLines("sess_unit_1")) opts.onStdout?.(`${JSON.stringify(line)}\n`);
     return { exitCode: 0 };
   }
 }
 
-test.afterEach(() => {
-  setRuntimeManagerForTesting(null);
-});
+fx.useRuntimeCleanup();
 
 test("dispatch streams run.created..run.finished in order with gapless SSE ids", { timeout: 30_000 }, async () => {
-  const router = createRouter({
-    providers: [
-      { id: "gw-a", kind: "anthropic", baseUrl: "http://gw", rank: 0, keys: ["sk-test-gw-key-0000"] },
-    ],
-  });
   const driver = new ScriptedDispatchDriver();
-  setRuntimeManagerForTesting(new RuntimeManager({ vm: new VmManager({ customDriver: driver }), router }));
+  fx.installRuntime(driver, fx.gatewayRouter());
 
-  const post = await POST(dispatchTaskRequest("run the dispatch", USER));
-  const events = await dispatchEvents(post, USER);
+  const post = await POST(fx.dispatchTaskRequest("run the dispatch", USER));
+  const events = await fx.dispatchEvents(post, USER);
 
-  assertDispatchOrdering(events);
+  fx.assertDispatchOrdering(events);
 
-  assertDispatchLifecycle(events, "sess_unit_1");
+  fx.assertDispatchLifecycle(events, "sess_unit_1");
 
-  assertAgentExec(driver.calls, "claude", "run the dispatch", ["sk-test-gw-key-0000"]);
+  fx.assertAgentExec(driver.calls, "claude", "run the dispatch", ["sk-test-gw-key-0000"]);
 });

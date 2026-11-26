@@ -65,7 +65,7 @@ export interface LiveExecutorOptions {
   /** When set, each trial's redacted telemetry is written here as JSONL. */
   logDir?: string;
   /** Environment to read the key from (tests). Default process.env. */
-  env?: NodeJS.ProcessEnv;
+  env?: Record<string, string | undefined>;
 }
 
 /** Host env vars the agent process may inherit; everything else is dropped. HOME is replaced by the workspace. */

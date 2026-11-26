@@ -29,6 +29,7 @@ import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/c
 import { useAgentSession } from "./hooks/useAgentSession";
 import { useBoard } from "./hooks/useBoard";
 import { devModeFromSearch, resolveView } from "./devMode";
+import { forkPromptFromSearch } from "./fork-prompt";
 import { firstRunSetup, useIsWide, useMe, useProviderStatus } from "./hooks/useEnvironment";
 import { cn } from "./utils/cn";
 import { ApprovalGate } from "./components/ApprovalGate";
@@ -164,6 +165,17 @@ export default function App() {
   // linking reads it even while the view is hidden.
   const effectiveView = resolveView(view, devMode);
   const [draft, setDraft] = useSessionPersisted<string>("sa.draft", "");
+  // A share link's "Try this prompt" lands here with ?prompt=<text>: fill
+  // the composer once, then strip the parameter so a refresh keeps the
+  // visitor's own edits instead of re-injecting the forked prompt.
+  useEffect(() => {
+    const forked = forkPromptFromSearch(window.location.search);
+    if (forked === null) return;
+    setDraft(forked);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("prompt");
+    window.history.replaceState(null, "", url);
+  }, [setDraft]);
   const observedActiveRuns = useRef(new Set<string>());
   const notifiedRuns = useRef(new Set<string>());
 

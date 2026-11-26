@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { getSharedProject } from "../../../lib/projects/store";
+import { DesktopReplay } from "../../../minimalist-ui/src/components/DesktopReplay";
+import { SharedReportCard } from "../../../minimalist-ui/src/components/SharedReportCard";
 import { LiveRoomClient } from "./live-room-client";
 
 export const dynamic = "force-dynamic";
@@ -53,6 +55,36 @@ export default async function SharedProjectPage({ params }: { params: Promise<{ 
         </header>
 
         <LiveRoomClient token={token} />
+
+        {project.showcase && (
+          <section className="mb-4 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+            <h2 className="text-xs font-semibold uppercase tracking-wide text-white/50">Replay showcase</h2>
+            <p className="mt-1 text-sm text-white/50">
+              A finished run the owner chose to feature — scrub through the recorded desktop, then try the same
+              prompt in your own workspace.
+            </p>
+            <div className="mt-4 overflow-hidden rounded-xl border border-white/10 bg-black/40">
+              <DesktopReplay
+                runId={project.showcase.runId}
+                url={`/api/share/${encodeURIComponent(token)}/replay`}
+              />
+            </div>
+            <div className="mt-4">
+              <SharedReportCard showcase={project.showcase} />
+            </div>
+            <div className="mt-4">
+              <Link
+                href={`/?prompt=${encodeURIComponent(project.showcase.prompt)}`}
+                className="inline-flex items-center gap-2 rounded-full bg-cyan-500/90 px-4 py-2 text-sm font-medium text-black transition hover:bg-cyan-400"
+              >
+                Try this prompt →
+              </Link>
+              <p className="mt-2 text-[11px] text-white/30">
+                Opens SwarmAgents with the prompt pre-filled; it runs in your own account and VM, not the owner&apos;s.
+              </p>
+            </div>
+          </section>
+        )}
 
         <section className="mb-4 grid gap-3 sm:grid-cols-3">
           <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-3">

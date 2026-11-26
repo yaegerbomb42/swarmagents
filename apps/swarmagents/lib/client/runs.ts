@@ -41,13 +41,22 @@ export const ATTACHMENTS_ONLY_PROMPT = "(see attachments)";
 
 const UPLOAD_MANIFEST_HEADER = "Uploaded files (in /workspace/uploads/):";
 
+/** One attached file as it appears in the upload manifest. */
+export interface UploadManifestEntry {
+  path: string;
+  size: number;
+}
+
 /**
- * Append the upload manifest the agent reads to find attached files. The
- * conversation strips it back out (see splitUploadedFiles) and shows chips.
+ * Append the upload manifest the agent reads to find attached files. Each
+ * line names the exact workspace path and its byte size, so the agent can
+ * confirm a file arrived intact before reading it. The conversation strips
+ * it back out (see splitUploadedFiles) and shows chips.
  */
-export function withUploadManifest(text: string, paths: readonly string[]): string {
-  if (paths.length === 0) return text;
-  return `${text}\n\n${UPLOAD_MANIFEST_HEADER}\n${paths.map((path) => `- ${path}`).join("\n")}`;
+export function withUploadManifest(text: string, files: readonly UploadManifestEntry[]): string {
+  if (files.length === 0) return text;
+  const lines = files.map((file) => `- ${file.path} (${file.size} bytes)`);
+  return `${text}\n\n${UPLOAD_MANIFEST_HEADER}\n${lines.join("\n")}`;
 }
 
 /** The POST body for a new run. Mirrors the tasks route's accepted fields. */

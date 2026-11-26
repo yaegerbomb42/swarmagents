@@ -537,13 +537,15 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
         return { ok: false, error };
       };
 
-      let paths: string[] = [];
+      let uploadedFiles: Array<{ path: string; size: number }> = [];
       if (files.length > 0) {
         try {
           const upload = await uploadAttachments(
             files.map((file) => ({ name: file.name, size: file.size, type: file.type, file: file.file as File })),
           );
-          paths = upload.uploaded.map((uploaded) => uploaded.path);
+          // The manifest names each stored path with its exact byte size so the
+          // agent can find the files and verify they arrived intact.
+          uploadedFiles = upload.uploaded.map((uploaded) => ({ path: uploaded.path, size: uploaded.size }));
         } catch (err) {
           return fail(`Could not upload the attachments. ${err instanceof Error ? err.message : ""}`.trim());
         }
@@ -560,7 +562,7 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
         if (!cleared.ok) return fail(`Could not start a new chat. ${cleared.error ?? ""}`.trim());
       }
       const sessionId = freshChat ? undefined : sessionToContinue(view.turns);
-      const fullPrompt = withUploadManifest(prompt, paths);
+      const fullPrompt = withUploadManifest(prompt, uploadedFiles);
       const { agentCard, fullAuto, computeTarget } = optionsRef.current;
       const result = await startRun({ prompt: fullPrompt, sessionId, agentCard, fullAuto, computeTarget });
       if (!result.ok) return fail(result.error);

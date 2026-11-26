@@ -160,8 +160,14 @@ interface UploadedPrompt {
 }
 
 /**
+ * A manifest line's trailing size annotation, e.g. " (12604 bytes)".
+ * Stripped back out so the conversation chip shows the file name only.
+ */
+const UPLOAD_MANIFEST_SIZE_SUFFIX = /\s+\(\d+\s+bytes\)\s*$/;
+
+/**
  * Split the hidden upload manifest the composer appends to a prompt:
- * "\n\nUploaded files (in /workspace/uploads/):\n- /workspace/uploads/a.png".
+ * "\n\nUploaded files (in /workspace/uploads/):\n- /workspace/uploads/a.png (12604 bytes)".
  * The conversation shows the user's words plus attachment chips instead.
  */
 export function splitUploadedFiles(prompt: string): UploadedPrompt {
@@ -176,6 +182,8 @@ export function splitUploadedFiles(prompt: string): UploadedPrompt {
     .split("\n")
     .map((line) => line.replace(/^-\s*/, "").trim())
     .filter(Boolean)
+    // Older runs were written without sizes; a missing suffix is fine.
+    .map((path) => path.replace(UPLOAD_MANIFEST_SIZE_SUFFIX, ""))
     .map((path) => path.split("/").pop() ?? path);
   return { text, attachments };
 }

@@ -85,8 +85,47 @@ npx tsx tools/eval-provider/run.ts --providers anthropic --vm docker
   solved state — the "runnable against FakeVmDriver / Docker desktop VM"
   path.
 - A `ScriptedProviderExecutor` replays a deterministic solve per task for
-  stable CI/tests. A live executor can implement the same `ProviderExecutor`
-  interface against the real runtime.
+  stable CI/tests.
+- `LiveProviderExecutor` (`live-executor.ts`) runs the **real** Claude Code
+  CLI through the real `ClaudeCodeRunner` on each task, in the trial's
+  workspace, against a BYOK provider, then the same grader scores it.
+
+### Live runs (real model)
+
+```bash
+# Any Anthropic-compatible gateway (or --kind openai|gemini for the CLI's other wires).
+# The key is read from the NAMED env var; it is never printed or written.
+MY_KEY=... npm run eval:live -- --base-url https://gateway.example.com --model my-model \
+  --key-env MY_KEY --trials 1 --out eval-live
+# A wrapper script that sets its own provider env (e.g. a local LiteLLM proxy):
+npm run eval:live -- --claude-bin ./claude-wrapper --model my-model --provider-id local
+# Narrow it down while iterating:
+npm run eval:live -- ... --tasks coding-fix-rate-limiter,web-add-contact-section --max-turns 20 --timeout-s 300
+```
+
+Per trial it records pass/fail (tests passed/total), turns (the CLI's own
+count), input/output tokens (from stream-json usage, one count per
+message), seconds, and why the run ended (`completed`, `max_turns`,
+`timeout`, `error` with a short redacted reason). The markdown report adds
+a Mode column, a pass@1 line per provider/model, and a per-trial table;
+the JSON next to it carries every trial. Redacted per-trial telemetry goes
+to `<out>/logs/*.jsonl`.
+
+How a live trial is isolated:
+
+- the CLI runs with a throwaway `CLAUDE_CONFIG_DIR` (headless permissions
+  for the core tools, nothing from your own Claude login or history),
+- `HOME` is the trial workspace, so `~/Desktop/...` tasks land in the graded
+  directory and the agent never writes to your real home,
+- only `PATH`, `LANG`/`LC_ALL`, `TERM`, `TZ` and `NODE_OPTIONS` are
+  inherited from your shell — other keys in your env never reach the
+  agent,
+- the trial's wall-clock limit kills the CLI's whole process group,
+  including anything the agent started in the background.
+
+**There is no VM in this mode: the agent has shell access inside a temp
+directory on the machine you run it on.** Run live evals in a container
+or a throwaway box.
 
 ## Relation to the capability-atlas eval
 

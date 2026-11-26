@@ -9,6 +9,11 @@ function pct(x: number): string {
   return `${(x * 100).toFixed(1)}%`;
 }
 
+/** Keep a value inside one markdown table cell. */
+function cell(value: string): string {
+  return value.replace(/\|/g, "\\|").replace(/\s+/g, " ");
+}
+
 function fmtTokens(n: number): string {
   return Math.round(n).toLocaleString("en-US");
 }
@@ -19,14 +24,37 @@ export function renderProviderMarkdownTable(report: ProviderEvalReport): string 
   lines.push("");
   lines.push(`Generated ${report.generatedAt}`);
   lines.push("");
-  lines.push("| Provider | Model | Tasks | Completion | Mean turns | Mean input tok | Mean output tok | Mean wall-clock |");
-  lines.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+  lines.push("| Provider | Model | Mode | Tasks | Completion | pass@1 | Mean turns | Mean input tok | Mean output tok | Mean wall-clock |");
+  lines.push("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
   for (const row of report.rows) {
     lines.push(
-      `| ${row.providerId} | ${row.model} | ${row.tasksRun} | ${pct(row.completionRate)} | ` +
+      `| ${cell(row.providerId)} | ${cell(row.model)} | ${row.mode ?? "scripted"} | ${row.tasksRun} | ${pct(row.completionRate)} | ` +
+        `${row.passAt1 === undefined ? "—" : pct(row.passAt1)} | ` +
         `${row.meanTurns.toFixed(1)} | ${fmtTokens(row.meanInputTokens)} | ` +
         `${fmtTokens(row.meanOutputTokens)} | ${row.meanWallClockMs.toFixed(0)}ms |`,
     );
+  }
+  lines.push("");
+  for (const row of report.rows) {
+    if (row.passAt1 !== undefined) {
+      lines.push(`pass@1 ${cell(row.providerId)}/${cell(row.model)} (${row.mode ?? "scripted"}): ${pct(row.passAt1)} of ${row.tasksRun} tasks`);
+    }
+  }
+  const trials = report.trials ?? [];
+  if (trials.length > 0) {
+    lines.push("");
+    lines.push("## Trials");
+    lines.push("");
+    lines.push("| Task | Provider | Model | Trial | Result | Tests | Turns | Input tok | Output tok | Seconds | Exit |");
+    lines.push("| --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |");
+    for (const t of trials) {
+      const exit = t.exitReason ? `${t.exitReason}${t.exitDetail ? `: ${cell(t.exitDetail).slice(0, 80)}` : ""}` : "—";
+      lines.push(
+        `| ${t.taskId} | ${cell(t.providerId)} | ${cell(t.model)} | ${t.trial} | ${t.resolved ? "pass" : "FAIL"} | ` +
+          `${t.grading.passed}/${t.grading.total} | ${t.metrics.totalTurns} | ${fmtTokens(t.metrics.totalInputTokens)} | ` +
+          `${fmtTokens(t.metrics.totalOutputTokens)} | ${(t.metrics.wallClockMs / 1000).toFixed(1)} | ${exit} |`,
+      );
+    }
   }
   lines.push("");
   return lines.join("\n");

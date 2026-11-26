@@ -34,6 +34,32 @@ test("parseArgs defaults and flags", () => {
   assert.throws(() => parseArgs(["--vm", "bogus"]), /--vm must be one of/);
 });
 
+test("parseArgs live mode: key by env var name only, provider label from the host, VM off", () => {
+  const live = parseArgs([
+    "--live",
+    "--base-url", "https://gw.example.com/v1",
+    "--model", "nvidia/nemotron-x",
+    "--key-env", "MY_KEY",
+    "--kind", "openai",
+    "--max-turns", "20",
+    "--timeout-s", "300",
+    "--tasks", "coding-fix-rate-limiter",
+  ]);
+  assert.deepEqual(live.live?.provider, { kind: "openai", keyEnv: "MY_KEY", baseUrl: "https://gw.example.com/v1" });
+  assert.equal(live.live?.maxTurns, 20);
+  assert.equal(live.live?.timeoutS, 300);
+  assert.equal(live.vm, "none");
+  assert.deepEqual(live.providers, [{ providerId: "gw.example.com", model: "nvidia/nemotron-x" }]);
+  assert.deepEqual(live.tasks, ["coding-fix-rate-limiter"]);
+  // A pasted key is refused: the flag takes a variable name.
+  assert.throws(() => parseArgs(["--live", "--model", "m", "--key-env", "sk-abc-123"]), /variable NAME/);
+  assert.throws(() => parseArgs(["--live", "--key-env", "MY_KEY"]), /needs --model/);
+  assert.throws(() => parseArgs(["--live", "--model", "m"]), /needs --key-env/);
+  const wrapper = parseArgs(["--live", "--model", "m", "--claude-bin", "/opt/claude-wrapper"]);
+  assert.deepEqual(wrapper.live?.provider, { kind: "preconfigured" });
+  assert.equal(wrapper.live?.claudeBin, "/opt/claude-wrapper");
+});
+
 async function runCli(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
     const { stdout, stderr } = await execFileAsync(

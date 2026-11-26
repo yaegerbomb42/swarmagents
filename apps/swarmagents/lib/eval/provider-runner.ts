@@ -22,6 +22,7 @@ import type {
   ProviderReportRow,
   ProviderRunContext,
   ProviderRunMetrics,
+  ProviderRunMode,
   ProviderTrialResult,
 } from "./provider-types";
 
@@ -36,6 +37,8 @@ export const VM_EVAL_ROOT = "/workspace/.eval";
 export interface ProviderEvalRunnerOptions {
   isolation?: IsolationDriver;
   executor?: ProviderExecutor;
+  /** Labels trials and report rows; "live" when the executor drives a real model. Default "scripted". */
+  mode?: ProviderRunMode;
   /**
    * When provided, the runner also provisions each trial into the VM under
    * `${VM_EVAL_ROOT}/<taskId>/<trial>` (setup files, then the executor's
@@ -49,11 +52,13 @@ export class ProviderEvalRunner {
   private readonly isolation: IsolationDriver;
   private readonly executor: ProviderExecutor;
   private readonly vmDriver?: VmDriver;
+  private readonly mode: ProviderRunMode;
 
   constructor(options: ProviderEvalRunnerOptions = {}) {
     this.isolation = options.isolation ?? new LocalTempIsolation();
     this.executor = options.executor ?? new ScriptedProviderExecutor();
     this.vmDriver = options.vmDriver;
+    this.mode = options.mode ?? "scripted";
     if (this.vmDriver) {
       // Pre-flight: ensure the driver implements the file primitives the VM
       // provisioning relies on, so a misconfigured driver fails fast.
@@ -73,18 +78,23 @@ export class ProviderEvalRunner {
     const runDir = await this.isolation.create(`${task.id}-${provider.providerId}`, trial);
     let runError: unknown;
     let metrics: ProviderRunMetrics | undefined;
+    let exit: Pick<ProviderTrialResult, "exitReason" | "exitDetail"> = {};
     let grading: { passed: number; failed: number; total: number } | undefined;
 
     try {
       // 1. Seed the starting workspace.
       await this.writeFiles(runDir, task.setupFiles);
       // 2. Let the executor work in it (scripted: returns a delta).
-      const result = await this.executor.run(task, this.ctx(provider));
+      const result = await this.executor.run(task, { ...this.ctx(provider), workspaceDir: runDir, trial });
       // 3. Apply the executor's delta (write new/overwritten files, remove
       //    deleted paths).
       await this.writeFiles(runDir, result.files);
       await this.removeFiles(runDir, result.deleted ?? []);
       metrics = result.metrics;
+      exit = {
+        ...(result.exitReason ? { exitReason: result.exitReason } : {}),
+        ...(result.exitDetail ? { exitDetail: result.exitDetail } : {}),
+      };
       // 3b. When a VM driver is supplied, provision this trial into the VM
       //      and verify it ends in the solved state.
       if (this.vmDriver) {
@@ -127,6 +137,8 @@ export class ProviderEvalRunner {
         partialScore,
         metrics: metrics!,
         grading: grading!,
+        mode: this.mode,
+        ...exit,
       },
       grading: grading!,
     };
@@ -161,8 +173,9 @@ export class ProviderEvalRunner {
       byProvider.set(key, list);
     }
     const rows: ProviderReportRow[] = [];
-    for (const [key, group] of byProvider) {
-      const [providerId, model] = key.split("/");
+    for (const group of byProvider.values()) {
+      // Model ids may contain "/" (e.g. "nvidia/nemotron-…"): read them off the group.
+      const { providerId, model } = group[0];
       const tasksRun = new Set(group.map((r) => r.taskId)).size;
       const total = group.length;
       const completed = group.filter((r) => r.resolved).length;
@@ -175,10 +188,12 @@ export class ProviderEvalRunner {
         meanInputTokens: mean(group.map((r) => r.metrics.totalInputTokens)),
         meanOutputTokens: mean(group.map((r) => r.metrics.totalOutputTokens)),
         meanWallClockMs: mean(group.map((r) => r.metrics.wallClockMs)),
+        mode: group[0]?.mode ?? this.mode,
+        passAt1: passAt1(group),
       });
     }
     rows.sort((a, b) => a.providerId.localeCompare(b.providerId) || a.model.localeCompare(b.model));
-    return { rows, generatedAt: new Date().toISOString() };
+    return { rows, generatedAt: new Date().toISOString(), trials: results };
   }
 
   private ctx(provider: ProviderSpec): ProviderRunContext {
@@ -246,4 +261,15 @@ export class ProviderEvalRunner {
 function mean(values: number[]): number {
   if (values.length === 0) return 0;
   return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+/** Share of distinct tasks whose first trial resolved. */
+function passAt1(group: ProviderTrialResult[]): number {
+  const firstByTask = new Map<string, ProviderTrialResult>();
+  for (const r of group) {
+    const prev = firstByTask.get(r.taskId);
+    if (!prev || r.trial < prev.trial) firstByTask.set(r.taskId, r);
+  }
+  if (firstByTask.size === 0) return 0;
+  return [...firstByTask.values()].filter((r) => r.resolved).length / firstByTask.size;
 }

@@ -696,22 +696,29 @@ Ready-to-paste OpenAI-compatible entries for the two newer fleet providers:
 
 | Provider | Base URL | `apiStyle` | Key env | Suggested tiers |
 |----------|----------|------------|---------|-----------------|
-| IteraCompute | `https://api.iteracompute.com/v1` | `openai-chat` | `ITERACOMPUTE_API_KEY` | pick from the IteraCompute console; the free tier serves `qwen/qwen3.8-27b` |
+| IteraCompute | `https://api.iteracompute.com/v1` | `openai-chat` | `ITERACOMPUTE_API_KEY` | pick from the IteraCompute console |
 | EXAONE | `https://api.exaone.ai/v1` | `openai-chat` | `EXAONE_API_KEY` | default model `k-exaone_v2.5`; other tiers per the EXAONE model list |
 
 Copy `providers.example.json`, replace the `<...-model-id>` placeholders
 with exact model ids from the provider's console (exact ids are required at
-run time; the placeholders exist so no stale ids ship in the repo), export
-the matching env var, and point `SWARM_PROVIDERS_FILE` at the file:
+run time; the placeholders exist so no stale ids ship in the repo), flip
+`"enabled"` to `true` for the entries you filled in (the example ships them
+disabled so an unedited copy never routes to a placeholder id), and point
+`SWARM_PROVIDERS_FILE` at the file:
 
 ```bash
-export ITERACOMPUTE_API_KEY="..."   # or EXAONE_API_KEY
 export SWARM_PROVIDERS_FILE=/data/providers.json
 ```
 
-Never commit real keys: the example file ships with empty placeholders and
-`keys` arrays are omitted entirely — keys come from the environment or the
-sealed per-user store.
+**Keys:** migration drops `envKeys` — a migrated provider is a per-user
+provider and runs only use keys from the owner's sealed store
+(`lib/providers/migrate.ts`, `lib/providers/user-run-pool.ts`). So an
+exported `ITERACOMPUTE_API_KEY` / `EXAONE_API_KEY` is **not** used for runs;
+the migrated entries arrive keyless. After the first start, add the key in
+Settings → Providers (or `POST /api/providers`). The `envKeys` names in the
+table only feed the host health probe (`lib/providers/health.ts`).
+
+Never commit real keys: `keys` arrays are omitted from the example entirely.
 
 ## Desktop stream proxy
 

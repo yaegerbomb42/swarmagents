@@ -377,7 +377,10 @@ function formatMemoriesWithStats(
     const tags = memory.tags.length ? ` [${memory.tags.join(", ")}]` : "";
     const line = `- ${memory.fact}${tags}`;
     const cost = estimateTokens(line);
-    if (used + cost > budgetTokens) break;
+    // Skip a fact that doesn't fit and keep filling: at the 300-token
+    // auto-recall budget one long top hit (facts go up to MAX_FACT_CHARS,
+    // ~500 tokens) would otherwise block every smaller relevant fact.
+    if (used + cost > budgetTokens) continue;
     lines.push(line);
     used += cost;
     count += 1;

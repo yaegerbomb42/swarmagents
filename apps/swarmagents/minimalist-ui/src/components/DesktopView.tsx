@@ -110,6 +110,8 @@ export interface DesktopViewProps {
    * so it can never intercept a human takeover.
    */
   computerAction?: ComputerAction;
+  /** Epoch ms of the newest watchdog.loop nudge; flashes the action chip. */
+  loopNudgeAt?: number;
   /** The frame's Take over button controls interaction; shown on the overlay. */
   canControl?: boolean;
   /** Detail from a vm.error event, for the booting overlay's error copy. */
@@ -289,6 +291,7 @@ export function DesktopView({
   onConnection,
   presence,
   computerAction,
+  loopNudgeAt,
   canControl = true,
   vmErrorMessage,
 }: DesktopViewProps) {
@@ -698,7 +701,7 @@ export function DesktopView({
 
         {/* Computer-use action: click ripple / cursor reticle + HUD chip at
             the action's coordinates. Pointer-events-none throughout. */}
-        <ComputerActionOverlay action={computerAction} />
+        <ComputerActionOverlay action={computerAction} loopNudgeAt={loopNudgeAt} />
 
         {/* Watch mode, always visible in control: the one way out. While the
             takeover is only requested, the same button cancels the request. */}
@@ -810,7 +813,7 @@ export function DesktopView({
           <div ref={surfaceHolderRef} className="absolute inset-0 transform-gpu" aria-hidden={!live} />
 
           {/* Computer-use action overlay: ripple / reticle + HUD chip. */}
-          <ComputerActionOverlay action={computerAction} />
+          <ComputerActionOverlay action={computerAction} loopNudgeAt={loopNudgeAt} />
 
           {/* Offline fallback: latest screenshot frame */}
           {conn.phase === "offline" && conn.hasFrame && frameSrc && (

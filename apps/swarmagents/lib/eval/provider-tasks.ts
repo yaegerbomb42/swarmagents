@@ -10,12 +10,14 @@
 // which is exactly what a scripted suite can promise.
 
 import type { ProviderEvalTask } from "./provider-types";
+import { HARD_PROVIDER_EVAL_TASKS } from "./provider-tasks-hard";
 
 function task(t: ProviderEvalTask): ProviderEvalTask {
   return t;
 }
 
-export const PROVIDER_EVAL_TASKS: ProviderEvalTask[] = [
+/** The original six: smoke-level general tasks. */
+export const STANDARD_PROVIDER_EVAL_TASKS: ProviderEvalTask[] = [
   // ---- coding: single-file bug fix ----
   task({
     id: "coding-fix-rate-limiter",
@@ -366,3 +368,11 @@ Categories=Utility;TextEditor;
     },
   }),
 ];
+
+/** Every task: the standard six, then the discriminative hard set. */
+export const PROVIDER_EVAL_TASKS: ProviderEvalTask[] = [
+  ...STANDARD_PROVIDER_EVAL_TASKS,
+  ...HARD_PROVIDER_EVAL_TASKS,
+];
+
+export { HARD_PROVIDER_EVAL_TASKS };

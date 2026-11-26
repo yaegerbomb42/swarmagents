@@ -127,6 +127,36 @@ How a live trial is isolated:
 directory on the machine you run it on.** Run live evals in a container
 or a throwaway box.
 
+### Standard vs hard tasks
+
+`--tasks` takes ids or the set names `standard` and `hard`.
+
+- **standard** (6 tasks, `provider-tasks.ts`): smoke level. A free 30B
+  model clears all six at ~8 turns / ~10 s each, so they prove the stack
+  works but cannot rank providers.
+- **hard** (4 tasks, `provider-tasks-hard.ts`): a recursive-descent
+  expression evaluator with precedence/associativity traps, an invoice
+  total with two independent root causes across three modules, messy sales
+  data aggregated into JSON and checked against an independent
+  recomputation, and an LRU cache with interacting TTL/recency rules.
+
+Live baseline (2026-11-26, via the box's Claude Code wrappers):
+
+| Model | Set | pass@1 | Mean turns | Mean input tok | Mean seconds |
+| --- | --- | ---: | ---: | ---: | ---: |
+| nvidia/nemotron-3.5-lightning-30b-a3b | standard | 6/6 | 8.2 | 99,496 | 9.8 |
+| nvidia/nemotron-3.5-lightning-30b-a3b | hard | 3/4 | 21.3 | 369,203 | 145.6 |
+| mercury | standard | 6/6 | 4.0 | 45,858 | 5.1 |
+| mercury | hard | 4/4 | 6.8 | 75,825 | 15.5 |
+
+On the standard set both models score 6/6 (pass@1 can't tell them apart).
+On the hard set they separate on every axis: pass@1, turns (3.1x), input
+tokens (4.9x) and wall clock (9.4x).
+
+The hard miss was genuine: `-2^2` evaluated to 4 and `1 2` was accepted,
+both spelled out in the prompt. Every task's verifier must fail the
+untouched setup and pass the reference solution (`provider-tasks.test.ts`).
+
 ## Relation to the capability-atlas eval
 
 `lib/capability-atlas/eval` benchmarks capability *retrieval* accuracy

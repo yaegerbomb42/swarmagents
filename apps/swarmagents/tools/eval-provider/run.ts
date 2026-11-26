@@ -46,7 +46,7 @@ export interface CliOptions {
 }
 
 const USAGE =
-  "Usage: tsx tools/eval-provider/run.ts [--providers a,b] [--trials N] [--out DIR] [--vm none|fake|docker] [--tasks id,id]\n" +
+  "Usage: tsx tools/eval-provider/run.ts [--providers a,b] [--trials N] [--out DIR] [--vm none|fake|docker] [--tasks id,id|hard|standard]\n" +
   "  live: --live --model M (--key-env VAR [--base-url URL] [--kind anthropic|openai|gemini] | --claude-bin WRAPPER)\n" +
   "        [--provider-id LABEL] [--max-turns N] [--timeout-s S]";
 
@@ -150,7 +150,7 @@ async function main(): Promise<number> {
     console.error(`${err instanceof Error ? err.message : String(err)}\n${USAGE}`);
     return 2;
   }
-  const tasks = opts.tasks ? PROVIDER_EVAL_TASKS.filter((t) => opts.tasks!.includes(t.id)) : PROVIDER_EVAL_TASKS;
+  const tasks = opts.tasks ? selectTasks(opts.tasks) : PROVIDER_EVAL_TASKS;
   if (tasks.length === 0) {
     console.error(`--tasks matched nothing. Known: ${PROVIDER_EVAL_TASKS.map((t) => t.id).join(", ")}`);
     return 2;
@@ -199,4 +199,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       console.error(`eval-provider error: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(2);
     });
+}
+
+/** `--tasks` takes task ids and/or the set names "hard" and "standard". */
+export function selectTasks(names: string[]): typeof PROVIDER_EVAL_TASKS {
+  return PROVIDER_EVAL_TASKS.filter(
+    (t) =>
+      names.includes(t.id) ||
+      (names.includes("hard") && t.difficulty === "hard") ||
+      (names.includes("standard") && t.difficulty !== "hard"),
+  );
 }

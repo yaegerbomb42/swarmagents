@@ -62,3 +62,54 @@ export function writeClipboard({ spawnImpl, text, selection = "clipboard", env, 
     child.stdin?.end(String(text));
   });
 }
+
+/**
+ * Read the current contents of an X selection with xclip. Resolves
+ * `{ ok: true, text }` or `{ ok: false }` when the selection is unavailable.
+ * Never rejects.
+ */
+export function readClipboard({ spawnImpl, selection = "clipboard", env, timeoutMs = 5_000 }) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawnImpl("xclip", ["-o", "-selection", selection], {
+        env,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch {
+      resolve({ ok: false });
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      resolve({ ok: false });
+    }, timeoutMs);
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", () => settle({ ok: false }));
+    child.on("close", (code) => {
+      if (code === 0) settle({ ok: true, text: stdout });
+      else settle({ ok: false, error: stderr.trim() || `exit code ${code}` });
+    });
+  });
+}

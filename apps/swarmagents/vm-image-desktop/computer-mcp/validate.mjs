@@ -39,8 +39,11 @@ export const COMPUTER_TOOLS = Object.freeze([
 
 /** Screen dimension cap; anything beyond is rejected (not clamped). */
 const MAX_SCREEN_DIM = 4096;
-/** Typing cap, characters. */
+/** Typing cap, characters (keyboard `keys` mode). */
 const MAX_TYPE_LEN = 2000;
+/** Paste cap, characters (`paste` mode — a clipboard write is near-instant;
+ * aligns with the clipboard_set tool's MAX_CLIPBOARD_LEN). */
+const MAX_PASTE_LEN = 20_000;
 /** Clipboard write cap, characters. */
 const MAX_CLIPBOARD_LEN = 20_000;
 /** Query/title cap for click_text, wait_for_text, focus_window. */
@@ -145,13 +148,53 @@ function dragArgs(args) {
   ]);
 }
 
-/** Validate a `type` call. Newlines become Return key presses. */
+/** Modes the `type` tool accepts. Default "auto" picks paste above a
+ * threshold or for multiline / non-ASCII text — the cases where xdotool
+ * key-by-key typing is slow (long text), re-indents or auto-completes
+ * (Return per line), or drops/garbles characters (several keymaps). */
+export const TYPE_MODES = Object.freeze(["auto", "keys", "paste"]);
+
+/** The automatic mode switches to paste at this many characters. */
+const AUTOMATIC_PASTE_MIN_LEN = 200;
+/** Anything outside ASCII (emoji, accents, CJK...) forces paste in auto mode. */
+const NON_ASCII_RE = /[^\u0000-\u007f]/;
+
+/**
+ * Choose the input method for a `type` call. Returns null when `mode` is not
+ * one of "auto" | "keys" | "paste" (callers reject). In auto mode, paste is
+ * used when the text is longer than 200 chars, is multiline, or contains
+ * non-ASCII characters — otherwise keys (xdotool, exact same as before).
+ */
+export function chooseTypeMode(text, mode = "auto") {
+  const m = typeof mode === "string" ? mode : "";
+  if (!TYPE_MODES.includes(m)) return null;
+  if (m !== "auto") return m;
+  if (String(text).length > AUTOMATIC_PASTE_MIN_LEN) return "paste";
+  if (String(text).includes("\n")) return "paste";
+  if (NON_ASCII_RE.test(String(text))) return "paste";
+  return "keys";
+}
+
+/**
+ * Marker argv command for the paste path: the server spots it, puts the text
+ * on the clipboard, sends the paste chord (Ctrl+V, or Ctrl+Shift+V when the
+ * focused window is a terminal) and restores the previous clipboard. The text
+ * rides as a single argv element — never a shell string.
+ */
+export const TYPE_PASTE_MARKER = "@paste";
+
+/** Validate a `type` call. Newlines become Return key presses in keys mode. */
 function typeArgs(args) {
   const text = typeof args.text === "string" ? args.text : "";
-  if (text.length > MAX_TYPE_LEN) return invalid(`text too long (max ${MAX_TYPE_LEN} characters).`);
   if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)) {
     return invalid("text contains control characters that cannot be typed.");
   }
+  const mode = chooseTypeMode(text, args.mode);
+  if (mode === null) return invalid('mode must be one of "auto", "keys" or "paste".');
+  const cap = mode === "paste" ? MAX_PASTE_LEN : MAX_TYPE_LEN;
+  if (text.length > cap) return invalid(`text too long (max ${cap} characters).`);
+  if (text.length === 0) return invalid("text is empty.");
+  if (mode === "paste") return ok([[TYPE_PASTE_MARKER, text]]);
   const lines = text.split("\n");
   const cmds = [];
   for (let i = 0; i < lines.length; i++) {

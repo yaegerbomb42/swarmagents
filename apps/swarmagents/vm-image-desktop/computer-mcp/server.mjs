@@ -32,8 +32,10 @@ import {
   filterUiNodes,
   formatUiNodes,
   findTextTarget,
+  TYPE_PASTE_MARKER,
 } from "./validate.mjs";
 import { capClipboardText, writeClipboard } from "./clipboard.mjs";
+import { pasteText } from "./paste.mjs";
 
 const DISPLAY = process.env.SWARM_COMPUTER_DISPLAY || process.env.DISPLAY || ":1";
 // Text-desktop mode (non-vision model): `screenshot` answers with the
@@ -105,6 +107,25 @@ async function runAll(cmds, label) {
     }
   }
   return textResult(`${label} done`);
+}
+
+/**
+ * The `type` tool: keys mode runs xdotool argv (the classic per-line typing);
+ * paste mode puts the text on the clipboard, sends the paste chord (Ctrl+V,
+ * or Ctrl+Shift+V when the focused window is a terminal), and restores the
+ * previous clipboard best effort. Result line states the mode and count.
+ */
+async function typeTool(args, cmds) {
+  const [marker, payload] = cmds[0];
+  if (marker === TYPE_PASTE_MARKER) {
+    const res = await pasteText(payload, { env: CHILD_ENV });
+    if (!res.ok) return fail(`paste failed: ${res.error}`);
+    return textResult(`Pasted ${res.chars} chars via clipboard (${res.combo}) in ${res.ms}ms`);
+  }
+  const n = typeof args.text === "string" ? args.text.length : 0;
+  const res = await runAll(cmds, "type");
+  if (res.isError) return res;
+  return textResult(`Typed ${n} chars via keys`);
 }
 
 /** Measure the image width in pixels via `identify` ("" when unavailable). */
@@ -385,6 +406,8 @@ async function callTool(tool, args) {
       child.unref();
       return textResult(`Opening ${args.name}`);
     }
+    case "type":
+      return typeTool(args, parsed.cmds);
     default:
       return runAll(parsed.cmds, tool.replace("_", " "));
   }
@@ -461,8 +484,12 @@ function toolSpec(tool) {
       return { description: "Drag from (x1, y1) to (x2, y2) with the left button pressed.", shape: DRAG_SHAPE };
     case "type":
       return {
-        description: "Type text as keyboard input (newlines press Return).",
-        shape: { text: z.string().describe("Text to type (max 2000 chars).") },
+        description:
+          'Type text (mode "auto" pastes via clipboard for long/multiline/non-ASCII text, fast and exact; mode "keys" types per-line keyboard input).',
+        shape: {
+          text: z.string().describe('Text to type (max 2000 chars in "keys" mode, 20000 in "paste" mode).'),
+          mode: z.enum(["auto", "keys", "paste"]).optional().describe('"auto" (default) pastes when the text is >200 chars, multiline or non-ASCII; "keys" always types via keyboard; "paste" always uses the clipboard.'),
+        },
       };
     case "key":
       return {

@@ -12,7 +12,15 @@
  * It is pure: no I/O, no keys, no platform imports.
  */
 
-import { anthropicToOpenAI, clampMaxTokens, stripAnthropicImages, type BridgeOptions } from "./anthropic-bridge";
+import { randomUUID } from "node:crypto";
+import {
+  anthropicToOpenAI,
+  clampMaxTokens,
+  ensureToolCallId,
+  repairToolArguments,
+  stripAnthropicImages,
+  type BridgeOptions,
+} from "./anthropic-bridge";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -24,6 +32,22 @@ function asString(value: unknown): string | undefined {
 
 function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Responses gateways may omit `call_id`/`item.id` on tool events. A missing
+ * id falls back to the event's `output_index` (every Responses output event
+ * carries it), scoped to this stream, so the added / arguments.delta / done
+ * events of one call share a key while two parallel id-less calls stay two
+ * separate tool_use blocks. Only an event with neither an id nor an
+ * output_index lands on the shared sentinel.
+ */
+function responsesToolId(value: unknown, outputIndex: unknown, state: ResponsesStreamState): string {
+  const id = asString(value);
+  if (id && id.length > 0) return id;
+  const index = asNumber(outputIndex);
+  if (index !== undefined) return `call_${state.idSeed}_${index}`;
+  return `call_${state.idSeed}_unknown`;
 }
 
 function contentText(content: unknown): string {
@@ -231,9 +255,9 @@ export function responsesToOpenAIResponse(body: unknown, requestedModel: string)
       }
     } else if (item.type === "function_call") {
       toolCalls.push({
-        id: asString(item.call_id) ?? asString(item.id) ?? `call_${toolCalls.length}`,
+        id: ensureToolCallId(asString(item.call_id) ?? asString(item.id) ?? `call_${toolCalls.length}`),
         type: "function",
-        function: { name: asString(item.name) ?? "", arguments: jsonString(item.arguments) },
+        function: { name: asString(item.name) ?? "", arguments: repairToolArguments(item.arguments) },
       });
     }
   }
@@ -281,20 +305,36 @@ export interface ResponsesStreamState {
   toolIndex: Map<string, number>;
   nextToolIndex: number;
   emittedArgs: Set<string>;
+  /** Argument fragments that arrived before their output_item.added event. */
+  pendingArgs: Map<string, string[]>;
   sawTools: boolean;
   usage?: Record<string, number>;
   finished: boolean;
+  /** Per-stream prefix for ids synthesized from output_index. */
+  idSeed: string;
 }
 
 export function newResponsesStreamState(model: string): ResponsesStreamState {
   return {
     model,
+    idSeed: randomUUID().slice(0, 8),
     toolIndex: new Map(),
     nextToolIndex: 0,
     emittedArgs: new Set(),
+    pendingArgs: new Map(),
     sawTools: false,
     finished: false,
   };
+}
+
+/** Map a tool id to one stable chunk index, even when events arrive out of order. */
+function toolIndexFor(id: string, state: ResponsesStreamState): number {
+  let index = state.toolIndex.get(id);
+  if (index === undefined) {
+    index = state.nextToolIndex++;
+    state.toolIndex.set(id, index);
+  }
+  return index;
 }
 
 function toolChunk(
@@ -311,7 +351,10 @@ function toolChunk(
           tool_calls: [
             {
               index,
-              ...(call.id ? { id: call.id, type: "function" } : {}),
+              // Always emit a non-empty id and type: downstream translators
+              // cannot key a tool_result on an empty id.
+              id: ensureToolCallId(call.id),
+              type: "function",
               function: {
                 ...(call.name ? { name: call.name } : {}),
                 ...(call.arguments !== undefined ? { arguments: call.arguments } : {}),
@@ -344,33 +387,58 @@ export function responsesEventToChunks(event: unknown, state: ResponsesStreamSta
   if (type === "response.output_item.added") {
     const item = isRecord(root.item) ? root.item : {};
     if (item.type === "function_call") {
-      const id = asString(item.call_id) ?? asString(item.id) ?? `call_${state.nextToolIndex}`;
-      const index = state.nextToolIndex++;
-      state.toolIndex.set(id, index);
+      const id = responsesToolId(item.call_id ?? item.id, root.output_index, state);
+      // Reuse the index if an argument delta arrived before this event.
+      const index = toolIndexFor(id, state);
       state.sawTools = true;
       out.push(toolChunk(state.model, index, { id, name: asString(item.name) ?? "" }));
+      // Flush fragments buffered ahead of the added event now that the tool's
+      // name and id are known — a tool_use block's name cannot be changed
+      // after content_block_start has been emitted downstream.
+      for (const args of state.pendingArgs.get(id) ?? []) {
+        out.push(toolChunk(state.model, index, { id, arguments: args }));
+      }
+      state.pendingArgs.delete(id);
     }
     return out;
   }
 
   if (type === "response.function_call_arguments.delta") {
-    const id = asString(root.item_id) ?? asString(root.call_id) ?? "";
-    const index = state.toolIndex.get(id) ?? state.nextToolIndex++;
+    const id = responsesToolId(root.item_id ?? root.call_id, root.output_index, state);
     const delta = asString(root.delta) ?? "";
     state.emittedArgs.add(id);
-    if (delta) out.push(toolChunk(state.model, index, { arguments: delta }));
+    if (delta) {
+      if (!state.toolIndex.has(id)) {
+        const pending = state.pendingArgs.get(id) ?? [];
+        pending.push(delta);
+        state.pendingArgs.set(id, pending);
+      } else {
+        const index = toolIndexFor(id, state);
+        out.push(toolChunk(state.model, index, { id, arguments: delta }));
+      }
+    }
     return out;
   }
 
   if (type === "response.output_item.done") {
     const item = isRecord(root.item) ? root.item : {};
     if (item.type === "function_call") {
-      const id = asString(item.call_id) ?? asString(item.id) ?? "";
-      const index = state.toolIndex.get(id) ?? state.nextToolIndex++;
+      const id = responsesToolId(item.call_id ?? item.id, root.output_index, state);
+      const buffered = state.pendingArgs.get(id);
+      if (buffered) {
+        const index = toolIndexFor(id, state);
+        state.sawTools = true;
+        out.push(toolChunk(state.model, index, { id, name: asString(item.name) ?? "" }));
+        for (const args of buffered) out.push(toolChunk(state.model, index, { id, arguments: args }));
+        state.pendingArgs.delete(id);
+      }
+      const index = toolIndexFor(id, state);
       // Some gateways never stream argument deltas; emit the complete call.
+      // Repair truncated/malformed arguments here so the downstream
+      // Anthropic translator never sees broken JSON.
       if (!state.emittedArgs.has(id) && item.arguments !== undefined) {
         state.emittedArgs.add(id);
-        out.push(toolChunk(state.model, index, { arguments: jsonString(item.arguments) }));
+        out.push(toolChunk(state.model, index, { id, arguments: repairToolArguments(item.arguments) }));
       }
     }
     return out;
@@ -540,9 +608,9 @@ export function ollamaToOpenAIResponse(body: unknown, requestedModel: string): R
       const call = isRecord(raw) ? raw : {};
       const fn = isRecord(call.function) ? call.function : call;
       toolCalls.push({
-        id: `call_${index}`,
+        id: ensureToolCallId(asString(call.id) ?? `call_${index}`),
         type: "function",
-        function: { name: asString(fn.name) ?? "", arguments: jsonString(fn.arguments) },
+        function: { name: asString(fn.name) ?? "", arguments: repairToolArguments(fn.arguments) },
       });
     });
   }
@@ -596,9 +664,9 @@ export function ollamaLineToChunks(line: unknown, state: OllamaStreamState): Ope
       state.sawTools = true;
       out.push(
         toolChunk(state.model, index, {
-          id: `call_${index}`,
+          id: ensureToolCallId(asString(call.id) ?? `call_${index}`),
           name: asString(fn.name) ?? "",
-          arguments: jsonString(fn.arguments),
+          arguments: repairToolArguments(fn.arguments),
         }),
       );
     }
@@ -776,7 +844,7 @@ export function geminiToOpenAIResponse(body: unknown, requestedModel: string): R
       toolCalls.push({
         id: `call_${toolCalls.length}`,
         type: "function",
-        function: { name: asString(fn.name) ?? "", arguments: jsonString(fn.args) },
+        function: { name: asString(fn.name) ?? "", arguments: repairToolArguments(fn.args) },
       });
     }
   }
@@ -833,9 +901,9 @@ export function geminiChunkToChunks(chunk: unknown, state: GeminiStreamState): O
       state.sawTools = true;
       out.push(
         toolChunk(state.model, index, {
-          id: `call_${index}`,
+          id: ensureToolCallId(asString(part.functionCall.id) ?? `call_${index}`),
           name: asString(part.functionCall.name) ?? "",
-          arguments: jsonString(part.functionCall.args),
+          arguments: repairToolArguments(part.functionCall.args),
         }),
       );
     }

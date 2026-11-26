@@ -26,6 +26,7 @@ import { deriveComputerAction, derivePresence, lastLoopNudgeAt } from "../../lib
 import { reduceServingModel, formatServingModel } from "../../lib/client/servingModel";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm, type RunTier } from "../../lib/client/runs";
+import { fetchSchedules, unreadScheduledRuns, type ScheduleSummary } from "../../lib/client/schedules";
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
 import { useAgentSession } from "./hooks/useAgentSession";
 import { useBoard } from "./hooks/useBoard";
@@ -186,6 +187,44 @@ export default function App() {
   const board = useBoard(view === "board");
 
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [schedules, setSchedules] = useState<ScheduleSummary[]>([]);
+  const [seenScheduleRunIds, setSeenScheduleRunIds] = usePersisted<string[]>("sa.seenScheduleRunIds", []);
+  const unreadCronRuns = useMemo(
+    () => unreadScheduledRuns(schedules, seenScheduleRunIds),
+    [schedules, seenScheduleRunIds],
+  );
+  useEffect(() => {
+    if (session.signedOut) {
+      setSchedules([]);
+      return;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+    const load = async () => {
+      const res = await fetchSchedules(fetch, controller.signal);
+      if (!cancelled && res.ok) setSchedules(res.schedules);
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 30_000);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [session.signedOut]);
+  const markAllCronRunsRead = useCallback(() => {
+    const ids = unreadCronRuns.map((u) => u.runId);
+    if (ids.length === 0) return;
+    setSeenScheduleRunIds((prev) => Array.from(new Set([...prev, ...ids])).slice(-200));
+  }, [unreadCronRuns, setSeenScheduleRunIds]);
+  const jumpToCronRun = useCallback(
+    (runId: string) => {
+      setSeenScheduleRunIds((prev) => (prev.includes(runId) ? prev : [...prev, runId].slice(-200)));
+      session.selectThread(runId);
+      setView("chat");
+    },
+    [session, setSeenScheduleRunIds, setView],
+  );
   const [settings, setSettings] = useState<{ open: boolean; tab: SettingsTab }>({ open: false, tab: "providers" });
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [focusTaskId, setFocusTaskId] = useState<string>();
@@ -556,6 +595,7 @@ export default function App() {
         onOpenShortcuts={() => setShortcutsOpen(true)}
         user={me}
         alwaysOn247={alwaysOn247}
+        unreadCronCount={unreadCronRuns.length}
       />
 
       {session.offline && !session.signedOut && (
@@ -783,6 +823,9 @@ export default function App() {
         onNewChat={handleNewChat}
         newChatDisabled={busy}
         onRetry={session.refresh}
+        unreadCronRuns={unreadCronRuns}
+        onJumpToCronRun={jumpToCronRun}
+        onMarkCronRunsRead={markAllCronRunsRead}
       />
 
       {/* Slide-over Settings & Multi-Provider Sheet */}

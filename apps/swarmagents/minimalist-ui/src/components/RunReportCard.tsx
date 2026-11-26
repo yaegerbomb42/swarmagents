@@ -19,6 +19,7 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronUp,
+  Clock,
   Copy,
   Download,
   Eye,
@@ -30,6 +31,7 @@ import {
 import { classifyCostProvenance } from "../../../lib/runtime/run-report-types";
 import type { ReportArtifact, ReportCardMeta, ReportStep, RunReport } from "../../../lib/runtime/run-report-types";
 import type { ThreadEntry } from "../../../lib/client/thread";
+import { createScheduleFromRun } from "../../../lib/client/schedules";
 import { Button, IconButton, Loading, Notice } from "./ui";
 import { Card } from "./brand/Card";
 import { DesktopReplay } from "./DesktopReplay";
@@ -491,6 +493,33 @@ export function CopyTranscriptButton({ copied, onCopy }: { copied: boolean; onCo
   );
 }
 
+/** 1-click button to turn a finished run into an hourly recurring schedule. */
+export function ScheduleRunButton({
+  state,
+  onSchedule,
+}: {
+  state: "idle" | "saving" | "saved" | "error";
+  onSchedule: () => void;
+}) {
+  return (
+    <Button
+      size="sm"
+      loading={state === "saving"}
+      disabled={state === "saved"}
+      data-testid="schedule-from-run"
+      onClick={onSchedule}
+      title="Schedule this task to run every hour"
+    >
+      {state === "saved" ? (
+        <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" aria-hidden />
+      ) : (
+        <Clock className="h-3.5 w-3.5" aria-hidden />
+      )}
+      {state === "saved" ? "Scheduled (1h)" : state === "error" ? "Retry schedule" : "Schedule"}
+    </Button>
+  );
+}
+
 type VerdictTone = "ok" | "warn" | "err";
 
 const VERDICT_TEXT: Record<VerdictTone, string> = { ok: "text-sa-ok", warn: "text-sa-warn", err: "text-sa-err" };
@@ -670,6 +699,21 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
     setShotIndex(0);
   }, [expanded]);
 
+  const [scheduleState, setScheduleState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [scheduleError, setScheduleError] = useState<string>();
+  const onScheduleRun = useCallback(async () => {
+    if (!report?.prompt || scheduleState === "saving") return;
+    setScheduleState("saving");
+    setScheduleError(undefined);
+    const res = await createScheduleFromRun({ prompt: report.prompt, intervalMinutes: 60 });
+    if (res.ok) {
+      setScheduleState("saved");
+    } else {
+      setScheduleState("error");
+      setScheduleError(res.error);
+    }
+  }, [report?.prompt, scheduleState]);
+
   // Verify the stored receipt server-side once the report is loaded. The
   // badge only ever shows a pass after this endpoint confirms it, and only
   // when the shadow-verifier gate passed too.
@@ -768,8 +812,18 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
             <div className="space-y-4">
               <div className="flex items-center justify-between gap-2">
                 <SectionTitle>Transcript</SectionTitle>
-                <CopyTranscriptButton copied={copied} onCopy={() => void onCopy()} />
+                <div className="flex items-center gap-1.5">
+                  {report.prompt.trim().length > 0 && (
+                    <ScheduleRunButton state={scheduleState} onSchedule={() => void onScheduleRun()} />
+                  )}
+                  <CopyTranscriptButton copied={copied} onCopy={() => void onCopy()} />
+                </div>
               </div>
+              {scheduleError && (
+                <p className="text-[11px] text-sa-err" data-testid="schedule-from-run-error">
+                  {scheduleError}
+                </p>
+              )}
               {copyNotice && (
                 <Notice tone="info" title="Clipboard unavailable">
                   Select the transcript below and copy it manually.

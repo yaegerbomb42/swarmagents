@@ -753,6 +753,12 @@ interface AttemptHandle {
   fail(failure: AttemptFailure): Promise<void>;
   /** Not the provider's fault (400, client abort, invalid request): settle without a penalty. */
   release(): void;
+  /**
+   * First token of a streaming attempt reached the client: pin the run's
+   * sticky target now, before the stream completes, so a mid-stream death
+   * still keeps the run on this provider for prompt-cache reuse.
+   */
+  confirmFirstToken?(): void;
 }
 
 interface AttemptSource {
@@ -1005,6 +1011,12 @@ async function routerSource(req: LlmRequest): Promise<AttemptSource> {
               latencyMs: failure.latencyMs,
             });
             lastFailed = target;
+          },
+          confirmFirstToken() {
+            // The provider is speaking to the client: pin it for the run even
+            // though the attempt has not settled yet. Only reached pre-commit
+            // failures leave the sticky target untouched.
+            rememberStickyTarget(stickyKey, target);
           },
           release() {
             lease.release();
@@ -1891,6 +1903,9 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
           // first-read failure) can still fail over to the next provider.
           const first: Awaited<ReturnType<typeof reader.read>> = await reader.read();
           committed = true;
+          // First bytes are in hand and this provider owns the stream: pin
+          // the run's sticky target now (see AttemptHandle.confirmFirstToken).
+          handle.confirmFirstToken?.();
           // Committed: this provider owns the stream from here on. Announce
           // it as a leading SSE comment so the serving provider (which may
           // differ from the first ranked one after failover) is observable
@@ -1969,7 +1984,8 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
           yield encoder.encode(`event: error\ndata: ${body}\n\n`);
           return;
         }
-        // Committed (see above).
+        // Committed (see above): pin the run's sticky target now.
+        handle.confirmFirstToken?.();
         yield encoder.encode(`: provider=${config.id}\n\n`);
         try {
           while (true) {

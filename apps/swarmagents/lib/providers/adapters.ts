@@ -61,6 +61,29 @@ export function perplexityEffortFor(
   return isPerplexityEffort(config.effort) ? config.effort : undefined;
 }
 
+/**
+ * Whether the target preserves reasoning in its wire format, so the bridge
+ * may translate Anthropic `thinking` blocks into the provider's reasoning
+ * field instead of stripping them (see BridgeOptions.reasoningContent):
+ *
+ *   - DeepSeek, Qwen, Grok (xAI), GLM (Z.ai), Moonshot: their OpenAI-chat
+ *     wire accepts `reasoning_content` on assistant messages.
+ *   - Ollama: the native chat API carries prior reasoning in the
+ *     assistant message's `thinking` field (thinking models).
+ *
+ * Every other provider gets thinking blocks stripped, so a strict upstream
+ * never sees an unknown field. Gemini needs no flag: its `thought` parts
+ * are translated natively in anthropicToGemini.
+ */
+const REASONING_CONTENT_PROVIDERS = new Set(["deepseek", "qwen", "xai", "moonshot", "zai"]);
+
+export function reasoningContentFor(
+  config: Pick<ProviderConfig, "id" | "apiStyle" | "kind">,
+): boolean {
+  if (apiStyleFor(config) === "ollama") return true;
+  return REASONING_CONTENT_PROVIDERS.has(config.id);
+}
+
 /** Credential placement for a provider, defaulting sensibly per provider. */
 export function authFor(config: Pick<ProviderConfig, "kind" | "auth" | "id" | "apiStyle">): ProviderAuth {
   if (config.auth) return config.auth;

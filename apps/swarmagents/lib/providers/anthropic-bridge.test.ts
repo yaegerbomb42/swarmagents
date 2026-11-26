@@ -655,6 +655,328 @@ test("anthropicToOpenAI: tool_choice variants map to OpenAI shapes", () => {
   assert.equal("tool_choice" in noTools, false);
 });
 
+test("anthropicToOpenAI: thinking blocks and cache_control are stripped by default", () => {
+  const out = anthropicToOpenAI(
+    {
+      system: [
+        { type: "text", text: "Be terse.", cache_control: { type: "ephemeral" } },
+      ],
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "check the files first" },
+            { type: "redacted_thinking", data: "encrypted" },
+            { type: "text", text: "looking", cache_control: { type: "ephemeral" } },
+            { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_1",
+              content: [{ type: "text", text: "a.ts", cache_control: { type: "ephemeral" } }],
+            },
+          ],
+        },
+      ],
+      // Extended-thinking budget: an Anthropic-only request parameter.
+      thinking: { type: "enabled", budget_tokens: 1000 },
+    },
+    TARGET_MODEL,
+  );
+
+  const serialized = JSON.stringify(out);
+  assert.ok(!serialized.includes("thinking"), "no thinking anywhere in the payload");
+  assert.ok(!serialized.includes("cache_control"), "no cache_control anywhere in the payload");
+  assert.ok(!serialized.includes("redacted_thinking"), "no redacted_thinking anywhere");
+
+  const messages = out.messages as Array<Record<string, unknown>>;
+  assert.deepEqual(messages[0], { role: "system", content: "Be terse." });
+  assert.equal(messages[1].content, "looking");
+  assert.ok(Array.isArray(messages[1].tool_calls));
+  assert.deepEqual(messages[2], { role: "tool", tool_call_id: "toolu_1", content: "a.ts" });
+});
+
+test("anthropicToOpenAI: reasoningContent translates thinking blocks to reasoning_content", () => {
+  const body = {
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "list first, then summarize" },
+          { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls" } },
+        ],
+      },
+    ],
+  };
+  const out = anthropicToOpenAI(body, TARGET_MODEL, { reasoningContent: true });
+  const messages = out.messages as Array<Record<string, unknown>>;
+  assert.equal(messages[0].reasoning_content, "list first, then summarize");
+  assert.ok(Array.isArray(messages[0].tool_calls));
+
+  // Without the flag the same body strips the thinking block.
+  const stripped = anthropicToOpenAI(body, TARGET_MODEL);
+  assert.equal("reasoning_content" in (stripped.messages as Array<Record<string, unknown>>)[0], false);
+});
+
+test("anthropicToOpenAI: a thinking-only assistant message is dropped, not emptied", () => {
+  const out = anthropicToOpenAI(
+    {
+      messages: [
+        { role: "user", content: "go" },
+        {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "hmm" }],
+        },
+        { role: "user", content: "and then?" },
+      ],
+    },
+    TARGET_MODEL,
+  );
+  const messages = out.messages as Array<Record<string, unknown>>;
+  assert.deepEqual(
+    messages.map((m) => m.role),
+    ["user", "user"],
+    "the empty assistant message must not reach a strict upstream",
+  );
+  assert.ok(!JSON.stringify(out).includes("thinking"));
+});
+
+test("anthropicToOpenAI: a string-content assistant message still passes through", () => {
+  const out = anthropicToOpenAI(
+    {
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: "on it" },
+      ],
+    },
+    TARGET_MODEL,
+  );
+  const messages = out.messages as Array<Record<string, unknown>>;
+  assert.deepEqual(messages[1], { role: "assistant", content: "on it" });
+});
+
+test("openAIToAnthropicResponse: reasoning_content becomes a leading thinking block", () => {
+  const out = openAIToAnthropicResponse(
+    {
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "done",
+            reasoning_content: "checked the files",
+            tool_calls: [
+              { id: "call_1", type: "function", function: { name: "Bash", arguments: "{}" } },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: { prompt_tokens: 9, completion_tokens: 3 },
+    },
+    TARGET_MODEL,
+  );
+  assert.equal(out.stop_reason, "tool_use");
+  assert.deepEqual(out.content, [
+    { type: "thinking", thinking: "checked the files" },
+    { type: "text", text: "done" },
+    { type: "tool_use", id: "call_1", name: "Bash", input: {} },
+  ]);
+
+  // The `reasoning` field some gateways use maps the same way.
+  const viaReasoning = openAIToAnthropicResponse(
+    {
+      choices: [
+        { index: 0, message: { role: "assistant", content: "ok", reasoning: "why" }, finish_reason: "stop" },
+      ],
+    },
+    TARGET_MODEL,
+  );
+  assert.deepEqual(viaReasoning.content, [
+    { type: "thinking", thinking: "why" },
+    { type: "text", text: "ok" },
+  ]);
+
+  // Absent reasoning stays absent: no fabricated thinking block.
+  const plain = openAIToAnthropicResponse(
+    {
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+    },
+    TARGET_MODEL,
+  );
+  assert.deepEqual(plain.content, [{ type: "text", text: "ok" }]);
+});
+
+test("OpenAIStreamTranslator: reasoning_content deltas become thinking blocks and deltas", () => {
+  const translator = new OpenAIStreamTranslator();
+  const events: Array<{ event?: string; data: Record<string, unknown> }> = [];
+  const collect = (list: ReturnType<OpenAIStreamTranslator["push"]>) => {
+    for (const e of list) events.push({ event: e.event, data: JSON.parse(e.data) });
+  };
+
+  collect(
+    translator.push({
+      choices: [{ index: 0, delta: { reasoning_content: "first, list" } }],
+    }),
+  );
+  collect(
+    translator.push({
+      choices: [{ index: 0, delta: { reasoning_content: " the files" } }],
+    }),
+  );
+  collect(
+    translator.push({
+      choices: [{ index: 0, delta: { content: "checking" } }],
+    }),
+  );
+  collect(
+    translator.push({
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [{ index: 0, id: "call_a", function: { name: "Bash", arguments: "{}" } }],
+          },
+        },
+      ],
+    }),
+  );
+  collect(
+    translator.push({
+      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      usage: { prompt_tokens: 12, completion_tokens: 6 },
+    }),
+  );
+
+  const kinds = events.map((e) => e.event);
+  assert.deepEqual(kinds, [
+    "message_start",
+    "content_block_start", // thinking block 0
+    "content_block_delta",
+    "content_block_delta",
+    "content_block_stop", // thinking closes before text starts
+    "content_block_start", // text block 1
+    "content_block_delta",
+    "content_block_stop", // text closes before the tool block
+    "content_block_start", // tool_use block 2
+    "content_block_delta", // input_json_delta for the tool arguments
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+  ]);
+
+  const thinkStart = events[1].data as { content_block: Record<string, unknown> };
+  assert.equal(thinkStart.content_block.type, "thinking");
+  assert.equal((events[2].data as { delta: Record<string, unknown> }).delta.type, "thinking_delta");
+  assert.equal((events[2].data as { delta: Record<string, unknown> }).delta.thinking, "first, list");
+  assert.equal((events[3].data as { delta: Record<string, unknown> }).delta.thinking, " the files");
+  const delta = events.find((e) => e.event === "message_delta")!.data as {
+    delta: Record<string, unknown>;
+  };
+  assert.equal(delta.delta.stop_reason, "tool_use");
+});
+
+test("OpenAIStreamTranslator: reasoning arriving after text started is dropped, not misplaced", () => {
+  const translator = new OpenAIStreamTranslator();
+  const events: Array<{ event?: string; data: Record<string, unknown> }> = [];
+  const collect = (list: ReturnType<OpenAIStreamTranslator["push"]>) => {
+    for (const e of list) events.push({ event: e.event, data: JSON.parse(e.data) });
+  };
+
+  collect(translator.push({ choices: [{ index: 0, delta: { content: "hi" } }] }));
+  // Anthropic requires thinking blocks to precede all other blocks, so a
+  // late reasoning delta has no valid place in the message.
+  collect(translator.push({ choices: [{ index: 0, delta: { reasoning_content: "too late" } }] }));
+  collect(
+    translator.push({
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: { prompt_tokens: 3, completion_tokens: 2 },
+    }),
+  );
+
+  const serialized = JSON.stringify(events);
+  assert.ok(!serialized.includes("too late"), "late reasoning must not leak into the message");
+  assert.ok(!serialized.includes("thinking_delta"));
+  assert.equal(events[1].data.type, "content_block_start");
+  assert.equal((events[1].data as { content_block: Record<string, unknown> }).content_block.type, "text");
+});
+
+test("multi-turn tool loop: thinking survives the round trip when the provider preserves reasoning", () => {
+  // Turn 1 (streaming response from a reasoning provider): reasoning +
+  // tool call. The translator must surface both to Claude Code.
+  const translator = new OpenAIStreamTranslator();
+  const streamed: Array<{ event?: string; data: Record<string, unknown> }> = [];
+  for (const chunk of [
+    { choices: [{ index: 0, delta: { reasoning_content: "run ls" } }] },
+    { choices: [{ index: 0, delta: { content: "on it" } }] },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [{ index: 0, id: "call_1", function: { name: "Bash", arguments: '{"command":"ls"}' } }],
+          },
+        },
+      ],
+    },
+    {
+      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      usage: { prompt_tokens: 20, completion_tokens: 8 },
+    },
+  ]) {
+    for (const e of translator.push(chunk)) streamed.push({ event: e.event, data: JSON.parse(e.data) });
+  }
+  const thinkDelta = streamed.find(
+    (e) => (e.data as { delta?: Record<string, unknown> }).delta?.type === "thinking_delta",
+  );
+  assert.equal((thinkDelta!.data as { delta: Record<string, unknown> }).delta.thinking, "run ls");
+
+  // Turn 2 (request back to the same provider): Claude Code sends the
+  // thinking block it received plus the tool result. With reasoningContent
+  // the bridge carries the reasoning as reasoning_content; without it the
+  // block is stripped and the loop still works, just without the context.
+  const turn2 = {
+    messages: [
+      { role: "user", content: "list the files" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "run ls" },
+          { type: "text", text: "on it" },
+          { type: "tool_use", id: "call_1", name: "Bash", input: { command: "ls" } },
+        ],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "call_1", content: "a.ts\nb.ts" }],
+      },
+    ],
+  };
+  const preserved = anthropicToOpenAI(turn2, TARGET_MODEL, { reasoningContent: true });
+  const preservedMessages = preserved.messages as Array<Record<string, unknown>>;
+  assert.equal(preservedMessages[1].reasoning_content, "run ls");
+  assert.equal(preservedMessages[1].content, "on it");
+  assert.deepEqual(preservedMessages[2], {
+    role: "tool",
+    tool_call_id: "call_1",
+    content: "a.ts\nb.ts",
+  });
+
+  const stripped = anthropicToOpenAI(turn2, TARGET_MODEL);
+  const strippedMessages = stripped.messages as Array<Record<string, unknown>>;
+  assert.equal("reasoning_content" in strippedMessages[1], false);
+  assert.equal(strippedMessages[1].content, "on it");
+  assert.deepEqual(strippedMessages[2], {
+    role: "tool",
+    tool_call_id: "call_1",
+    content: "a.ts\nb.ts",
+  });
+});
+
 test("anthropicToOpenAI: max_tokens clamps to the model's output cap", () => {
   const body = { messages: [{ role: "user", content: "hi" }], max_tokens: 64_000 };
   // Above the cap: clamped. Below the cap: unchanged. No cap: unchanged.

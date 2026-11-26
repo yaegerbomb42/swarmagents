@@ -49,6 +49,7 @@ import {
   authHeadersFor,
   modelForTier,
   perplexityEffortFor,
+  reasoningContentFor,
   requestUrl,
 } from "../providers/adapters";
 import { mergedModelCapabilities } from "../providers/capabilities";
@@ -1233,10 +1234,17 @@ function providerPayload(
  * Bridge translation limits for a (provider, model): clamp Anthropic
  * max_tokens to the model's known output cap and pass vision capability
  * so non-vision models get text placeholders instead of raw image blocks.
+ * `reasoningContent` is set for providers whose wire format preserves
+ * reasoning (see reasoningContentFor), so thinking blocks survive multi-turn
+ * tool loops there and are stripped everywhere else.
  */
 function bridgeOptionsFor(config: ProviderConfig, model: string): BridgeOptions {
   const caps = mergedModelCapabilities(config, model);
-  return { maxOutputTokens: caps.maxOutputTokens, vision: caps.vision };
+  return {
+    maxOutputTokens: caps.maxOutputTokens,
+    vision: caps.vision,
+    reasoningContent: reasoningContentFor(config),
+  };
 }
 
 /**

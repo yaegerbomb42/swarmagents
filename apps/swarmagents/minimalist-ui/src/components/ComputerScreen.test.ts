@@ -75,13 +75,19 @@ test("tool.result shows ok, the first line and a byte count; the rest is inside 
   assert.ok(markup.includes("line three"), "full output is inside Details");
 });
 
-test("run.started shows no model string", async () => {
+test("run.started shows no model string when none is provided", async () => {
   const { StreamRow } = await load();
-  const it = item(4, "run.started", { sessionId: "s1", model: "claude-sonnet-4-5-20250929" });
+  const it = item(4, "run.started", { sessionId: "s1" });
   const markup = renderToStaticMarkup(h(StreamRow, { item: it }));
   assert.match(markup, /run started/);
-  assert.ok(!markup.includes("claude-sonnet-4-5-20250929"), "raw model string is gone");
   assert.ok(!markup.includes("claude"), "no model fallback either");
+});
+
+test("run.started shows provider and model when present", async () => {
+  const { StreamRow } = await load();
+  const it = item(4, "run.started", { sessionId: "s1", provider: "groq", model: "llama-3.3-70b" });
+  const markup = renderToStaticMarkup(h(StreamRow, { item: it }));
+  assert.match(markup, /run started · groq · llama-3.3-70b/);
 });
 
 test("internal kinds render human labels, never the raw kind", async () => {

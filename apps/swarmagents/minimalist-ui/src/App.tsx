@@ -23,6 +23,7 @@ import { usePersisted, useSessionPersisted } from "./store";
 import type { SwarmTask } from "../../lib/mcp-types";
 import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus, wakeVmStatus } from "../../lib/client/vmStatus";
 import { deriveComputerAction, derivePresence } from "../../lib/client/presence";
+import { reduceServingModel, formatServingModel } from "../../lib/client/servingModel";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm, type RunTier } from "../../lib/client/runs";
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
@@ -212,6 +213,7 @@ export default function App() {
   const { phase, busy, headRun, activeRun } = session;
   const phaseMeta = phase ? RUN_PHASE_META[phase] : undefined;
   const activitySuffix = workspaceActivitySuffix(session.activity, phaseMeta?.active, vmDisplay.label);
+  const servingModelLabel = useMemo(() => formatServingModel(reduceServingModel(session.liveItems)), [session.liveItems]);
   const needsAttention =
     phase === "approval" || phase === "question" || phase === "paused" || phase === "error" || vmDisplay.state === "error";
 
@@ -525,11 +527,12 @@ export default function App() {
           phase,
           since: headRun?.createdAt,
           durationMs: headDuration,
-          activity: session.activity,
-          stopping,
-          onStop: () => void handleStop(),
-          onShow: showRun,
-        }}
+           activity: session.activity,
+           servingModel: servingModelLabel,
+           stopping,
+           onStop: () => void handleStop(),
+           onShow: showRun,
+         }}
         onOpenSettings={() => openSettings("providers")}
         settingsNeedsAttention={providerStatus.state === "missing"}
         onOpenShortcuts={() => setShortcutsOpen(true)}

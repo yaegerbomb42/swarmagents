@@ -269,8 +269,25 @@ export function StreamRow({ item, live = false }: { item: RunStreamItem; live?: 
       );
     }
     case "run.started": {
-      // No model string: the raw provider model id is internal vocabulary.
-      return <SystemLine text="run started" />;
+      const d = payload as { provider?: string; model?: string };
+      const parts = [d.provider, d.model].filter((value): value is string => typeof value === "string" && value !== "");
+      return <SystemLine text={parts.length > 0 ? `run started · ${parts.join(" · ")}` : "run started"} />;
+    }
+    case "provider.pool": {
+      const d = payload as { type?: string; provider?: string; model?: string; reason?: string };
+      if (d.type === "pool.attempt" && d.reason === "failover") {
+        const parts = [d.provider, d.model].filter((value): value is string => typeof value === "string" && value !== "");
+        const label = parts.length > 0 ? parts.join(" · ") : "failover";
+        return <SystemLine text={`→ ${label} (failover)`} tone="muted" />;
+      }
+      if (d.type === "pool.failover") {
+        return <SystemLine text="failover" tone="muted" />;
+      }
+      if (d.type === "pool.family") {
+        const parts = [d.model].filter((value): value is string => typeof value === "string" && value !== "");
+        return <SystemLine text={parts.length > 0 ? `switched model · ${parts.join(" · ")}` : "switched model family"} tone="muted" />;
+      }
+      return null;
     }
     case "run.finished": {
       const d = payload as { exitCode?: number; costUsd?: number; durationMs?: number; numTurns?: number; truncated?: boolean };

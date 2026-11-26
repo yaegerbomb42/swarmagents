@@ -15,6 +15,8 @@ import { ChevronDown, HelpCircle, Plug, Settings as SettingsIcon, Square, Square
 import { MascotDock } from "../../../components/mascot/MascotDock";
 import type { MascotState } from "../../../components/mascot/frames";
 import { RUN_PHASE_META, formatDuration, type RunPhase, type StatusTone } from "../../../lib/client/runPhase";
+import { reduceServingModel, formatServingModel } from "../../../lib/client/servingModel";
+import type { RunStreamItem } from "../../../lib/client/useRunStream";
 import { cn } from "../utils/cn";
 import { Elapsed } from "./Conversation";
 import { StatusPill, type PillTone } from "../design/primitives";
@@ -42,11 +44,25 @@ export interface RunIndicatorProps {
   onStop: () => void;
   /** Go to the run (its screen while it runs, its result once it ends). */
   onShow: () => void;
+  /** Serving provider/model label or stream items to derive it from. */
+  servingModel?: string | Record<string, unknown>;
+  serving?: Record<string, unknown>;
+  items?: RunStreamItem[];
 }
 
-export function RunIndicator({ phase, since, durationMs, activity, stopping, onStop, onShow }: RunIndicatorProps) {
+export function RunIndicator({ phase, since, durationMs, activity, stopping, onStop, onShow, servingModel, serving, items }: RunIndicatorProps) {
   if (!phase) return null;
   const meta = RUN_PHASE_META[phase];
+  const servingLabel =
+    typeof servingModel === "string"
+      ? servingModel
+      : servingModel
+        ? formatServingModel(servingModel)
+        : serving
+          ? formatServingModel(serving)
+          : items
+            ? formatServingModel(reduceServingModel(items))
+            : undefined;
   return (
     <div className="flex min-w-0 items-center gap-1.5" data-testid="run-indicator" data-phase={phase}>
       <button
@@ -72,6 +88,11 @@ export function RunIndicator({ phase, since, durationMs, activity, stopping, onS
         {phase === "running" && activity && (
           <span className="hidden max-w-[220px] truncate text-[12px] text-[var(--mute)] xl:inline" data-testid="run-activity">
             {activity}
+          </span>
+        )}
+        {servingLabel && (
+          <span className="hidden max-w-[220px] truncate text-[12px] text-[var(--mute)] sm:inline" data-testid="serving-model">
+            {servingLabel}
           </span>
         )}
       </button>

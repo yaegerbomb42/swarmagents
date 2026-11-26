@@ -17,10 +17,15 @@ import { roleAllowedTools, roleMcpConfigJson, roleSeedFiles } from "./role-mcp";
 import { BUILTIN_ROLES } from "../roles";
 import type { RolePhase } from "./types";
 
-/** The request envelopes the in-VM server wrote (the directory may not exist yet). */
+/**
+ * The request envelopes the in-VM server wrote (the directory may not exist
+ * yet). Only finished envelopes match: the server's atomic write leaves a
+ * `req-*.json.tmp` sibling between create and rename, and reading it races
+ * the rename (ENOENT under load).
+ */
 function listRequests(dir: string): string[] {
   if (!existsSync(dir)) return [];
-  return readdirSync(dir).filter((name) => name.startsWith("req-"));
+  return readdirSync(dir).filter((name) => name.startsWith("req-") && name.endsWith(".json"));
 }
 
 test("the memory server is wired into the run's MCP config", () => {
@@ -105,8 +110,13 @@ async function waitForRequest(rpcDir: string): Promise<{ raw: Record<string, unk
     await wait(POLL_MS);
     const files = listRequests(rpcDir);
     if (!files.length) continue;
-    const raw = JSON.parse(readFileSync(join(rpcDir, files[0]), "utf8")) as Record<string, unknown>;
-    return { raw, id: files[0].replace(/^req-/, "").replace(/\.json$/, "") };
+    try {
+      const raw = JSON.parse(readFileSync(join(rpcDir, files[0]), "utf8")) as Record<string, unknown>;
+      return { raw, id: files[0].replace(/^req-/, "").replace(/\.json$/, "") };
+    } catch {
+      // The envelope vanished mid-read (atomic-write rename); poll again.
+      continue;
+    }
   }
   return null;
 }

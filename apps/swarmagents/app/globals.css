@@ -320,6 +320,15 @@
   outline-offset: 2px;
 }
 
+/* The login form is the only public page, so it cannot lean on anything
+   else showing keyboard position. !important keeps an inline
+   `outline: none` (the bug this guards against) from ever silencing the
+   ring on its controls. */
+.login-form :focus-visible {
+  outline: 2px solid var(--color-focus) !important;
+  outline-offset: 2px;
+}
+
 /* ── Shell ── */
 .app {
   display: flex;

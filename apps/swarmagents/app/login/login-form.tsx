@@ -7,7 +7,7 @@
  * failure the API's error is shown inline.
  */
 
-import { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
+import React, { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { Eye, EyeOff, Loader2 } from "lucide-react";
 import { safeNextPath } from "../../lib/safe-next";
 

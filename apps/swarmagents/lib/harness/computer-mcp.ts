@@ -136,6 +136,12 @@ function playwrightTarget(args: Record<string, unknown>): string {
  *   server already answered as text never halts the run.
  */
 const READ_ONLY_COMPUTER_TOOLS = new Set(["screenshot", "describe_screen", "inspect_ui"]);
+
+/** True for a computer-mcp call that changes the desktop (not screenshot/describe/inspect). */
+export function isMutatingComputerCall(name: string): boolean {
+  const info = parseMcpToolName(name);
+  return info !== null && info.server === COMPUTER_MCP_SERVER && !READ_ONLY_COMPUTER_TOOLS.has(info.tool);
+}
 const USER_DRIVING_DENY_REASON = "the user is controlling the desktop; wait or call describe_screen";
 
 export interface ClassifyDesktopOptions {

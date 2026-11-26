@@ -249,6 +249,14 @@ export function PresenceGlow({ presence }: { presence?: Presence }) {
   );
 }
 
+/** Keepalive spacing for the user-driving pause while the user keeps interacting. */
+export const USER_DRIVING_KEEPALIVE_MS = 60_000;
+
+/** True when a pause (first input) or a keepalive (a minute later) should go out. */
+export function shouldSendUserDrivingPause(lastSentAt: number, now: number): boolean {
+  return lastSentAt === 0 || now - lastSentAt >= USER_DRIVING_KEEPALIVE_MS;
+}
+
 export function UserDrivingBanner({ onHandBack }: { onHandBack: () => void }) {
   return (
     <div
@@ -628,18 +636,22 @@ export function DesktopView({
 
   const live = conn.phase === "live";
   const [userDrivingPaused, setUserDrivingPaused] = useState(false);
-  const pauseSentRef = useRef(false);
+  /** When the last pause/keepalive went out (0 = none this takeover). */
+  const pauseSentRef = useRef(0);
 
   useEffect(() => {
     if (!runActive || mode !== "control") {
       setUserDrivingPaused(false);
-      pauseSentRef.current = false;
+      pauseSentRef.current = 0;
     }
   }, [runActive, mode]);
 
   const notifyUserInput = useCallback(() => {
-    if (mode !== "control" || !runActive || !runId || pauseSentRef.current) return;
-    pauseSentRef.current = true;
+    if (mode !== "control" || !runActive || !runId) return;
+    // First input pauses A1; continued input re-sends at most once a minute
+    // so a long takeover never hits the server's 5-minute idle expiry.
+    if (!shouldSendUserDrivingPause(pauseSentRef.current, Date.now())) return;
+    pauseSentRef.current = Date.now();
     setUserDrivingPaused(true);
     void fetch(`/api/runtime/runs/${encodeURIComponent(runId)}/pause-input`, {
       method: "POST",
@@ -649,7 +661,7 @@ export function DesktopView({
   }, [mode, runActive, runId]);
 
   const handbackUserInput = useCallback(() => {
-    pauseSentRef.current = false;
+    pauseSentRef.current = 0;
     setUserDrivingPaused(false);
     if (runId) {
       void fetch(`/api/runtime/runs/${encodeURIComponent(runId)}/pause-input`, {

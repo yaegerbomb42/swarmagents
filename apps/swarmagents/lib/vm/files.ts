@@ -207,3 +207,74 @@ export function looksBinary(bytes: Uint8Array): boolean {
   }
   return control / limit > 0.3;
 }
+
+// ---------------------------------------------------------------------------
+// Recently-modified files (GET /api/runtime/vm/files?recent=1)
+// ---------------------------------------------------------------------------
+
+/** Hard cap on the files a recent-scan returns. */
+export const MAX_RECENT_FILES = 25;
+/** Hard cap on filesystem entries visited by one recent-scan walk. */
+export const MAX_RECENT_WALK_ENTRIES = 2_000;
+/** Hard cap on directory depth for the recent-scan walk. */
+export const MAX_RECENT_WALK_DEPTH = 4;
+/** Default look-back window for the recent scan (15 minutes of agent work). */
+export const DEFAULT_RECENT_WINDOW_MS = 15 * 60_000;
+/** Hard cap on the look-back window (one hour) — never a whole-workspace scan. */
+export const MAX_RECENT_WINDOW_MS = 60 * 60_000;
+
+/** One recently-modified workspace file as the recent-scan reports it. */
+export interface VmRecentFile {
+  name: string;
+  path: string;
+  size: number;
+  modifiedAt: number;
+  /** Inline-safe Content-Type for an <img>/preview render. */
+  contentType: string;
+}
+
+/**
+ * Fold one directory level into a recent-scan. Pure: takes the already-listed
+ * entries plus the running walk budget and returns the files that qualify
+ * (modified inside the window) and the subdirectories still to visit, without
+ * exceeding the entry budget. Directories carry no modifiedAt of their own.
+ */
+export function foldRecentDir(
+  entries: VmDirEntryLike[],
+  since: number,
+  budget: { visited: number },
+): { files: VmRecentFile[]; subdirs: string[] } {
+  const files: VmRecentFile[] = [];
+  const subdirs: string[] = [];
+  for (const entry of entries) {
+    budget.visited += 1;
+    if (entry.type === "directory") {
+      subdirs.push(entry.path);
+      continue;
+    }
+    if (typeof entry.modifiedAt !== "number" || !Number.isFinite(entry.modifiedAt)) continue;
+    if (entry.modifiedAt < since) continue;
+    files.push({
+      name: entry.name,
+      path: entry.path,
+      size: entry.size,
+      modifiedAt: entry.modifiedAt,
+      contentType: downloadContentType(entry.name),
+    });
+  }
+  return { files, subdirs };
+}
+
+/** Minimal entry shape the recent fold needs (subset of the driver's VmDirEntry). */
+export interface VmDirEntryLike {
+  name: string;
+  path: string;
+  type: string;
+  size: number;
+  modifiedAt?: number;
+}
+
+/** Sort candidates most-recent-first and keep the response cap. */
+export function rankRecentFiles(files: VmRecentFile[], limit: number): VmRecentFile[] {
+  return [...files].sort((a, b) => b.modifiedAt - a.modifiedAt || a.path.localeCompare(b.path)).slice(0, Math.max(1, limit));
+}

@@ -8,7 +8,16 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { describeBinaryPreview, describeTruncatedPreview, formatModified, FilesView } from "./FilesView";
+import {
+  CsvTable,
+  csvRows,
+  describeBinaryPreview,
+  describeTruncatedPreview,
+  formatModified,
+  FilesView,
+  previewVariantForPath,
+  relativeAge,
+} from "./FilesView";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { countOf, installBrowserStubs } from "../testing/harness";
@@ -51,4 +60,66 @@ test("files empty state explains workspace and first run", () => {
   // Before listing arrives it is in loading state
   assert.match(html, /Loading workspace/);
   assert.equal(countOf(html, 'data-testid="files-empty"'), 0);
+});
+
+// ---------------------------------------------------------------------------
+// CSV previews
+// ---------------------------------------------------------------------------
+
+test("csvRows parses quoted fields, doubled quotes, and CRLF", () => {
+  const { rows, hidden } = csvRows('a,b\n"1,5","he said ""hi"""\r\n2,3\n');
+  assert.deepEqual(rows, [
+    ["a", "b"],
+    ["1,5", 'he said "hi"'],
+    ["2", "3"],
+  ]);
+  assert.equal(hidden, 0);
+});
+
+test("csvRows caps rendered rows and counts the rest as hidden", () => {
+  const content = Array.from({ length: 12 }, (_, i) => `r${i},x`).join("\n");
+  const { rows, hidden } = csvRows(content, 10);
+  assert.equal(rows.length, 10);
+  assert.equal(hidden, 2);
+  assert.equal(rows[0][0], "r0");
+});
+
+test("csvRows treats an empty file as zero rows", () => {
+  assert.deepEqual(csvRows("").rows, []);
+  assert.deepEqual(csvRows("\n\n").rows, []);
+});
+
+test("CsvTable renders a header row and hides extra rows behind a footer", () => {
+  installBrowserStubs();
+  const content = Array.from({ length: 150 }, (_, i) => `col,row${i}`).join("\n");
+  const html = renderToStaticMarkup(React.createElement(CsvTable, { content }));
+  assert.match(html, /data-testid="files-csv-table"/);
+  assert.match(html, /col/);
+  assert.match(html, /50 more rows in the file/);
+});
+
+// ---------------------------------------------------------------------------
+// Image previews
+// ---------------------------------------------------------------------------
+
+test("previewVariantForPath classifies images and csv without an entry", () => {
+  assert.equal(previewVariantForPath("/workspace/photo.png"), "image");
+  assert.equal(previewVariantForPath("/workspace/a/b/data.csv"), "csv");
+  assert.equal(previewVariantForPath("/workspace/notes.tsv"), "csv");
+  assert.equal(previewVariantForPath("/workspace/main.go"), "code");
+  assert.equal(previewVariantForPath("/workspace/README.md"), "text");
+});
+
+// ---------------------------------------------------------------------------
+// Recent strip ages
+// ---------------------------------------------------------------------------
+
+test("relativeAge buckets ages into human labels", () => {
+  const now = 1_000_000_000_000;
+  assert.equal(relativeAge(now - 30_000, now), "just now");
+  assert.equal(relativeAge(now - 5 * 60_000, now), "5m ago");
+  assert.equal(relativeAge(now - 3 * 3_600_000, now), "3h ago");
+  assert.equal(relativeAge(undefined, now), "");
+  // A future timestamp never goes negative.
+  assert.equal(relativeAge(now + 60_000, now), "just now");
 });

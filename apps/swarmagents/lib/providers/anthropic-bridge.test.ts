@@ -16,6 +16,7 @@ import {
   mapStopReason,
   openAIToAnthropicResponse,
   OpenAIStreamTranslator,
+  stripUnsignedThinking,
   type AnthropicSseEvent,
 } from "./anthropic-bridge";
 
@@ -1377,4 +1378,70 @@ test("openAIToAnthropicResponse: malformed tool arguments fall back to objects, 
   // '{"a":' is truncated: neutralized rather than guessed as { a: null }.
   assert.deepEqual(tools[0].input, {});
   assert.deepEqual(tools[1].input, {});
+});
+
+test("reasoning_content is only carried for the current turn, never earlier turns", () => {
+  const body = {
+    messages: [
+      { role: "user", content: "first task" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "old reasoning" }, { type: "text", text: "done" }] },
+      { role: "user", content: "second task" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "current reasoning" },
+          { type: "tool_use", id: "call_9", name: "Bash", input: { command: "ls" } },
+        ],
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_9", content: "a.ts" }] },
+    ],
+  };
+  const out = anthropicToOpenAI(body, TARGET_MODEL, { reasoningContent: true });
+  const assistants = (out.messages as Array<Record<string, unknown>>).filter((m) => m.role === "assistant");
+  assert.equal("reasoning_content" in assistants[0], false, "earlier turn's reasoning is dropped");
+  assert.equal(assistants[1].reasoning_content, "current reasoning", "current tool loop keeps it");
+});
+
+test("stripUnsignedThinking: bridged (unsigned) thinking is dropped for the Anthropic wire, signed is kept", () => {
+  const body = {
+    messages: [
+      { role: "user", content: "go" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "from deepseek" },
+          { type: "tool_use", id: "c1", name: "Bash", input: { command: "ls" } },
+        ],
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "x" }] },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "genuine", signature: "sig-abc" }, { type: "text", text: "ok" }],
+      },
+      { role: "assistant", content: [{ type: "thinking", thinking: "only unsigned" }] },
+    ],
+  };
+  const out = stripUnsignedThinking(body) as { messages: Array<{ content: Array<Record<string, unknown>> }> };
+  assert.deepEqual(out.messages[1].content.map((b) => b.type), ["tool_use"]);
+  assert.deepEqual(out.messages[3].content.map((b) => b.type), ["thinking", "text"]);
+  assert.deepEqual(out.messages[4].content, [{ type: "text", text: "" }]);
+  // Nothing to drop -> same object back.
+  const clean = { messages: [{ role: "user", content: "hi" }] };
+  assert.equal(stripUnsignedThinking(clean), clean);
+});
+
+test("OpenAIStreamTranslator: reasoning after a tool block started never targets the closed thinking block", () => {
+  const translator = new OpenAIStreamTranslator();
+  const events: Array<Record<string, unknown>> = [];
+  for (const chunk of [
+    { choices: [{ index: 0, delta: { reasoning_content: "plan" } }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "Bash", arguments: "{}" } }] } }] },
+    { choices: [{ index: 0, delta: { reasoning_content: "late" } }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 1, completion_tokens: 1 } },
+  ]) {
+    for (const e of translator.push(chunk)) events.push(JSON.parse(e.data) as Record<string, unknown>);
+  }
+  const thinkingDeltas = events.filter((e) => (e.delta as { type?: string } | undefined)?.type === "thinking_delta");
+  assert.equal(thinkingDeltas.length, 1);
+  assert.equal((thinkingDeltas[0].delta as { thinking: string }).thinking, "plan");
 });

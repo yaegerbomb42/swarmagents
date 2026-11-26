@@ -78,6 +78,7 @@ import {
   openAIToAnthropicResponse,
   OpenAIStreamTranslator,
   stripAnthropicImages,
+  stripUnsignedThinking,
   type AnthropicSseEvent,
   type BridgeOptions,
 } from "../providers/anthropic-bridge";
@@ -1217,8 +1218,12 @@ function providerPayload(
 ): unknown {
   const style: ApiStyle = apiStyleFor(config);
   switch (style) {
-    case "anthropic":
-      return mergedModelCapabilities(config, model).vision ? body : stripAnthropicImages(body);
+    case "anthropic": {
+      // Unsigned thinking blocks were synthesized by the bridge from another
+      // provider's reasoning; the real Anthropic API rejects them (400).
+      const signedOnly = stripUnsignedThinking(body);
+      return mergedModelCapabilities(config, model).vision ? signedOnly : stripAnthropicImages(signedOnly);
+    }
     case "openai-responses":
       return anthropicToResponses(body, model, bridgeOptionsFor(config, model), perplexityEffortFor(config));
     case "ollama":

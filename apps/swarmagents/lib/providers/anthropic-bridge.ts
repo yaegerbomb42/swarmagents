@@ -100,6 +100,37 @@ function stripImagesFromBlocks(blocks: unknown[]): { blocks: unknown[]; changed:
  * images) with structured text placeholders for non-vision models.
  * Pure and non-mutating: returns `body` unchanged when no images are present.
  */
+/**
+ * Drop `thinking` blocks that carry no `signature` from assistant messages.
+ * The bridge synthesizes thinking blocks from other providers'
+ * reasoning_content without a signature; Claude Code echoes them back, and
+ * the real Anthropic API rejects unsigned thinking with HTTP 400 ("Invalid
+ * signature in thinking block") after a failover onto an Anthropic-wire
+ * provider. Signed blocks (genuine Anthropic thinking) and
+ * redacted_thinking are kept. Pure; returns `body` unchanged when nothing is
+ * dropped. An assistant message left empty gets an empty text block so the
+ * user/assistant alternation stays valid.
+ */
+export function stripUnsignedThinking(body: unknown): unknown {
+  if (!isRecord(body) || !Array.isArray(body.messages)) return body;
+  let changed = false;
+  const messages = body.messages.map((rawMsg) => {
+    if (!isRecord(rawMsg) || rawMsg.role !== "assistant" || !Array.isArray(rawMsg.content)) return rawMsg;
+    const kept = rawMsg.content.filter(
+      (b) =>
+        !(
+          isRecord(b) &&
+          b.type === "thinking" &&
+          (typeof b.signature !== "string" || b.signature.length === 0)
+        ),
+    );
+    if (kept.length === rawMsg.content.length) return rawMsg;
+    changed = true;
+    return { ...rawMsg, content: kept.length > 0 ? kept : [{ type: "text", text: "" }] };
+  });
+  return changed ? { ...body, messages } : body;
+}
+
 export function stripAnthropicImages(body: unknown): unknown {
   if (!isRecord(body) || !Array.isArray(body.messages)) return body;
   let changed = false;
@@ -569,6 +600,18 @@ function thinkingText(blocks: unknown[]): string {
   return out;
 }
 
+/** Index of the last user message that carries more than tool results (-1 if none). */
+function lastRealUserIndex(messages: unknown[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = isRecord(messages[i]) ? (messages[i] as Record<string, unknown>) : {};
+    if ((asString(m.role) ?? "user") !== "user") continue;
+    const content = m.content;
+    if (!Array.isArray(content)) return i;
+    if (content.some((b) => !(isRecord(b) && (b as Record<string, unknown>).type === "tool_result"))) return i;
+  }
+  return -1;
+}
+
 /** Anthropic assistant message -> OpenAI assistant message (with tool_calls).
  * Returns null when the message reduces to nothing downstream (a
  * thinking-only message with no text and no tool calls): emitting a bare
@@ -659,7 +702,15 @@ export function anthropicToOpenAI(
     messages.push({ role: "system", content: openaiUserContent(system) });
   }
 
-  for (const raw of rawMessages) {
+  // Reasoning is only carried back for the CURRENT agentic turn: the
+  // assistant messages after the last real user message (one that is not just
+  // tool results). DeepSeek thinking mode needs reasoning_content echoed back
+  // inside a tool-call loop but rejects or ignores it from earlier turns, and
+  // older turns' chain-of-thought is wasted input on every provider.
+  const turnStart = lastRealUserIndex(rawMessages);
+  const pastTurnOptions: BridgeOptions = { ...options, reasoningContent: false };
+
+  for (const [i, raw] of rawMessages.entries()) {
     const message = isRecord(raw) ? raw : {};
     const role = asString(message.role) ?? "user";
     if (role === "user") {
@@ -700,7 +751,7 @@ export function anthropicToOpenAI(
       // A thinking-only assistant message returns null and is dropped (see
       // anthropicAssistantMessage); everything else keeps its place so
       // tool_result ordering stays valid.
-      const translated = anthropicAssistantMessage(message, options);
+      const translated = anthropicAssistantMessage(message, i > turnStart ? options : pastTurnOptions);
       if (translated !== null) messages.push(translated);
     } else {
       messages.push({ role, content: message.content ?? "" });

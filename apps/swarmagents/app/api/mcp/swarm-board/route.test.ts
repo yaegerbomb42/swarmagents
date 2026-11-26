@@ -152,6 +152,34 @@ test("POST poll_tasks still works when storage is healthy", async () => {
   }
 });
 
+test("GET and poll_tasks expose returnReason whenever a task carries one", async () => {
+  const dir = tmpDir();
+  const dataFile = path.join(dir, "swarm_board.json");
+  seed(dataFile);
+  const raw = JSON.parse(fs.readFileSync(dataFile, "utf-8")) as { tasks: Array<Record<string, unknown>> };
+  raw.tasks[0].returnReason = "Tests did not cover the regression";
+  fs.writeFileSync(dataFile, JSON.stringify(raw), "utf-8");
+  configureStorePaths(dir, dataFile);
+  try {
+    const getRes = await GET(request("/api/mcp/swarm-board?status=open"));
+    assert.equal(getRes.status, 200);
+    const getBody = (await getRes.json()) as { tasks?: Array<{ id?: string; returnReason?: string }> };
+    const getTask = getBody.tasks?.find((t) => t.id === "task_1");
+    assert.equal(getTask?.returnReason, "Tests did not cover the regression");
+
+    const pollRes = await POST(rpc("tools/call", { name: "poll_tasks", arguments: { status: "open" } }));
+    assert.equal(pollRes.status, 200);
+    const pollBody = (await pollRes.json()) as { result?: { content?: Array<{ text?: string }> } };
+    const payload = JSON.parse(pollBody.result?.content?.[0]?.text ?? "{}") as {
+      tasks?: Array<{ id?: string; returnReason?: string }>;
+    };
+    const pollTask = payload.tasks?.find((t) => t.id === "task_1");
+    assert.equal(pollTask?.returnReason, "Tests did not cover the regression");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("POST with a JSON null body is an Invalid Request (-32600), not a 500", async () => {
   const res = await POST(
     new NextRequest("http://localhost/api/mcp/swarm-board", {

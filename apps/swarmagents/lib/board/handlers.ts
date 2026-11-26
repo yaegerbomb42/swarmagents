@@ -293,7 +293,7 @@ export function handleToolsList(id: unknown) {
         {
           name: "review_and_merge_task",
           description:
-            "Record a decision on a task in review. Approval completes the task on the board but does not run or verify a Git merge. Rejection renews the current owner's claim or returns the task to open. Records reviewer, reviewedAt, and a transition history entry.",
+            "Record a decision on a task in review. Approval completes the task on the board but does not run or verify a Git merge. Rejection renews the current owner's claim or returns the task to open, storing feedback as task.returnReason (cleared on the next successful claim or on approval). Records reviewer, reviewedAt, and a transition history entry.",
           inputSchema: {
             type: "object",
             properties: {
@@ -432,8 +432,12 @@ export async function handleClaimTask(
     return { error: invalidParams(`Task is not open (current status: ${task.status})`) };
   }
   const agentName = args.agentName as string;
+  // A fresh claim starts clean: a returnReason left by a previous review
+  // described the previous owner's work, not this claim's.
+  const unclaimed = clearAssignment(task);
+  delete unclaimed.returnReason;
   const claimed = transitionTask({
-    ...clearAssignment(task),
+    ...unclaimed,
     claimedBy: agentName,
   }, "claimed", agentName, now);
   const persistErr = await persistTask(store, claimed, index);
@@ -660,8 +664,22 @@ export async function handleReviewAndMergeTask(
     : task.claimedBy
       ? "claimed"
       : "open";
+  // The reviewer's feedback travels with the task as returnReason, so a sent-back
+  // task is never an unexplained rejection. returnReason survives the return
+  // (to owner or open pool) and a resubmission — that is who most needs to see
+  // it — and is cleared on the next successful claim and on approval.
+  const returned = (() => {
+    // Always copy: `task` is the store's own record, and a delete must never
+    // reach it before the persist succeeds.
+    const base = { ...(nextStatus === "open" ? clearAssignment(task) : task) };
+    if (args.approved) {
+      delete base.returnReason;
+      return base;
+    }
+    return { ...base, returnReason: args.feedback as string };
+  })();
   const reviewed = transitionTask({
-    ...(nextStatus === "open" ? clearAssignment(task) : task),
+    ...returned,
     reviewedBy: reviewer,
     reviewedAt: now,
   }, nextStatus, reviewer, now);

@@ -20,6 +20,7 @@ import { FakeVmDriver } from "./fake-driver";
 import { QuotaError, OutputCap, resolveVmQuotas, type OutputBudget, type VmQuotaOptions } from "./quotas";
 import { resolveIdlePolicy, type VmIdleOptions, type VmIdlePolicy } from "./idle";
 import { RwLock } from "./rw-lock";
+import { WarmPool, resolveWarmPoolSize } from "./warm-pool";
 import { defaultDriverName, type VmDriverName } from "./driver-default";
 import {
   VmFileError,
@@ -89,6 +90,12 @@ export interface VmManagerOptions {
   alwaysOnUsers?: ReadonlySet<string>;
   /** Dynamic form of alwaysOnUsers (e.g. backed by per-user settings). */
   isAlwaysOn?: (userId: string) => boolean;
+  /**
+   * Bounded pool of pre-booted VMs handed out on first ensure (env
+   * SWARM_VM_WARM_POOL_SIZE, default 0 = off). Drivers without the
+   * prewarm/adoptWarm capability never pool.
+   */
+  warmPoolSize?: number;
 }
 
 /** One activity record per user: when it happened and how many events so far. */
@@ -165,6 +172,10 @@ export class VmManager {
   private isAlwaysOnFn?: (userId: string) => boolean;
   /** Users explicitly flagged always-on (24/7 mode). */
   private alwaysOn = new Set<string>();
+  /** Bounded pool of pre-booted VMs, or null when disabled/unsupported. */
+  private readonly warmPool: WarmPool | null;
+  /** Configured warm-pool bound (0 = off). */
+  readonly warmPoolSize: number;
 
   constructor(opts?: VmManagerOptions) {
     this.driver = opts?.customDriver ?? resolveDriver(opts?.driver ?? process.env.SWARM_VM_DRIVER);
@@ -177,6 +188,9 @@ export class VmManager {
     this.now = opts?.now ?? Date.now;
     this.alwaysOnUsers = opts?.alwaysOnUsers ?? new Set<string>();
     this.isAlwaysOnFn = opts?.isAlwaysOn;
+    this.warmPoolSize = Math.max(0, opts?.warmPoolSize ?? resolveWarmPoolSize());
+    this.warmPool = this.warmPoolSize > 0 ? new WarmPool(this.driver, this.warmPoolSize) : null;
+    if (this.warmPool) this.warmPool.fill();
   }
 
   /** Wire the per-user 24/7 predicate (called when the runtime boots). */
@@ -543,6 +557,14 @@ export class VmManager {
   }
 
   /**
+   * Pre-booted VMs available right now (ready + in flight). 0 when the
+   * pool is off or the driver cannot pool. Diagnostics/tests only.
+   */
+  warmPoolDepth(): number {
+    return this.warmPool?.depth() ?? 0;
+  }
+
+  /**
    * Wake/recover the user's VM: if a cached handle's container stopped or
    * disappeared out-of-band (e.g. daemon restart / image upgrade), evict the
    * stale cache entry and re-ensure a live container.
@@ -567,6 +589,34 @@ export class VmManager {
   private async ensureLocked(userId: string): Promise<VmHandle> {
     const existing = this.cache.get(userId);
     if (existing) return existing;
+
+    // Warm pool fast path: adopt a pre-booted VM instead of cold-booting.
+    // The driver's adoptWarm guarantees a fresh workspace volume and a
+    // fresh VNC password, so the user never sees warm-phase state.
+    const warm = this.warmPool?.claim();
+    if (warm && this.warmPool) {
+      const adopted = this.warmPool.adopt(warm, userId);
+      adopted.then(
+        (handle) => {
+          this.handles.set(userId, handle);
+        },
+        () => {
+          // A half-adopted warm VM is never returned to the pool: destroy
+          // it so it cannot be handed to another user.
+          void this.driver.reset(warm).catch(() => {});
+        },
+      );
+      this.cache.set(userId, adopted);
+      try {
+        const handle = await adopted;
+        this.touch(userId);
+        this.warmPool.fill();
+        return handle;
+      } catch {
+        // Adoption failed; fall through to the cold path below.
+        this.cache.delete(userId);
+      }
+    }
 
     const p = this.driver.ensure(userId);
     this.cache.set(userId, p);

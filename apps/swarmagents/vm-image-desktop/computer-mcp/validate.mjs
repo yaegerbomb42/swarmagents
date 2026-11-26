@@ -170,7 +170,9 @@ export function chooseTypeMode(text, mode = "auto") {
   if (!TYPE_MODES.includes(m)) return null;
   if (m !== "auto") return m;
   if (String(text).length > AUTOMATIC_PASTE_MIN_LEN) return "paste";
-  if (String(text).includes("\n")) return "paste";
+  // A trailing newline means "press Return" (run the command, submit the
+  // form), not multiline content: "ls -la\n" stays on the keyboard path.
+  if (String(text).replace(/\n+$/, "").includes("\n")) return "paste";
   if (NON_ASCII_RE.test(String(text))) return "paste";
   return "keys";
 }
@@ -194,7 +196,16 @@ function typeArgs(args) {
   const cap = mode === "paste" ? MAX_PASTE_LEN : MAX_TYPE_LEN;
   if (text.length > cap) return invalid(`text too long (max ${cap} characters).`);
   if (text.length === 0) return invalid("text is empty.");
-  if (mode === "paste") return ok([[TYPE_PASTE_MARKER, text]]);
+  if (mode === "paste") {
+    // Trailing newlines are Return presses after the paste, so a pasted
+    // command still runs: terminals with bracketed paste (bash/readline,
+    // zsh) hold a pasted newline as text instead of executing it.
+    const body = text.replace(/\n+$/, "");
+    const returns = text.length - body.length;
+    const cmds = body.length > 0 ? [[TYPE_PASTE_MARKER, body]] : [];
+    for (let i = 0; i < returns; i++) cmds.push(["key", "Return"]);
+    return ok(cmds);
+  }
   const lines = text.split("\n");
   const cmds = [];
   for (let i = 0; i < lines.length; i++) {

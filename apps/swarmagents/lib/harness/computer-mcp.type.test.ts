@@ -36,6 +36,9 @@ test("chooseTypeMode: auto pastes long, multiline or non-ASCII text", () => {
   assert.equal(chooseTypeMode("x".repeat(200)), "keys");
   // Multiline pastes regardless of length.
   assert.equal(chooseTypeMode("a\nb"), "paste");
+  // A trailing newline is "press Return", not multiline: commands keep running.
+  assert.equal(chooseTypeMode("ls -la\n"), "keys");
+  assert.equal(chooseTypeMode("a\nb\n"), "paste");
   assert.equal(chooseTypeMode("a\nb", "auto"), "paste");
   // Non-ASCII (accents, emoji, CJK) pastes regardless of length.
   assert.equal(chooseTypeMode("café"), "paste");
@@ -287,3 +290,18 @@ test(
     }
   },
 );
+
+test("paste mode turns trailing newlines into Return presses after the paste", () => {
+  const multi = parseToolArgs("type", { text: "echo café\necho done\n" });
+  assert.equal(multi.ok, true);
+  assert.deepEqual(multi.cmds, [
+    ["@paste", "echo café\necho done"],
+    ["key", "Return"],
+  ]);
+  // Forced paste of a single command still submits it.
+  const forced = parseToolArgs("type", { text: "npm test\n\n", mode: "paste" });
+  assert.deepEqual(forced.cmds, [["@paste", "npm test"], ["key", "Return"], ["key", "Return"]]);
+  // A plain command with a trailing newline stays on the keyboard path.
+  const keys = parseToolArgs("type", { text: "ls -la\n" });
+  assert.deepEqual(keys.cmds, [["type", "--delay", "15", "ls -la"], ["key", "Return"]]);
+});

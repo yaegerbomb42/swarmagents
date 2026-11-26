@@ -120,7 +120,14 @@ async function typeTool(args, cmds) {
   if (marker === TYPE_PASTE_MARKER) {
     const res = await pasteText(payload, { env: CHILD_ENV });
     if (!res.ok) return fail(`paste failed: ${res.error}`);
-    return textResult(`Pasted ${res.chars} chars via clipboard (${res.combo}) in ${res.ms}ms`);
+    // Trailing newlines ride as Return presses after the paste.
+    const rest = cmds.slice(1);
+    if (rest.length > 0) {
+      const keys = await runAll(rest, "type");
+      if (keys.isError) return keys;
+    }
+    const enter = rest.length > 0 ? ` + Return${rest.length > 1 ? ` x${rest.length}` : ""}` : "";
+    return textResult(`Pasted ${res.chars} chars via clipboard (${res.combo})${enter} in ${res.ms}ms`);
   }
   const n = typeof args.text === "string" ? args.text.length : 0;
   const res = await runAll(cmds, "type");

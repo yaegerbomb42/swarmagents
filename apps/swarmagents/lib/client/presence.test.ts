@@ -9,6 +9,7 @@ import {
   deriveComputerAction,
   derivePresence,
   DESKTOP_FRAMEBUFFER,
+  lastLoopNudgeAt,
   parseComputerAction,
   pastTenseAction,
   presenceFromActivity,
@@ -408,5 +409,80 @@ describe("deriveComputerAction", () => {
     ]);
     assert.equal(action?.kind, "click");
     assert.equal(action?.x, 100);
+  });
+
+  it("attaches the parsed effect from the paired tool result", () => {
+    const action = deriveComputerAction([
+      item(1, "tool.call", {
+        id: "t1",
+        name: "mcp__computer-mcp__click",
+        input: { x: 640, y: 420 },
+      }),
+      item(2, "tool.result", {
+        id: "t1",
+        ok: true,
+        output: 'effect: screen changed near (640, 420); focus moved to "Save As"',
+      }),
+    ]);
+    assert.equal(action?.kind, "click");
+    assert.deepEqual(action?.effect, { changed: true, focus: "Save As" });
+  });
+
+  it("attaches a no-change effect when the paired result reports one", () => {
+    const action = deriveComputerAction([
+      item(1, "tool.call", {
+        id: "t1",
+        name: "mcp__computer-mcp__type",
+        input: { text: "hello" },
+      }),
+      item(2, "tool.result", {
+        id: "t1",
+        ok: true,
+        output: "effect: NO visible change after 1.5s; focused window unchanged",
+      }),
+    ]);
+    assert.equal(action?.kind, "type");
+    assert.deepEqual(action?.effect, { changed: false, elapsedS: 1.5 });
+  });
+
+  it("does not attach an effect when the result carries none", () => {
+    const action = deriveComputerAction([
+      item(1, "tool.call", {
+        id: "t1",
+        name: "mcp__computer-mcp__click",
+        input: { x: 640, y: 420 },
+      }),
+      item(2, "tool.result", { id: "t1", ok: true, output: "clicked" }),
+    ]);
+    assert.equal(action?.kind, "click");
+    assert.equal(action?.effect, undefined);
+  });
+
+  it("ignores tool results without a matching computer-use call", () => {
+    const action = deriveComputerAction([
+      item(1, "tool.call", { id: "t1", name: "Bash", input: { command: "ls" } }),
+      item(2, "tool.result", { id: "t1", ok: true, output: "effect: screen changed" }),
+    ]);
+    assert.equal(action, undefined);
+  });
+});
+
+describe("lastLoopNudgeAt", () => {
+  it("returns undefined for a stream without nudge events", () => {
+    assert.equal(lastLoopNudgeAt([]), undefined);
+    assert.equal(
+      lastLoopNudgeAt([item(1, "watchdog.loop", { action: "escalate", tool: "click" }, 200)]),
+      undefined,
+      "escalation halts the run and is not a nudge",
+    );
+  });
+
+  it("returns the newest nudge's timestamp, skipping escalated loops", () => {
+    const items = [
+      item(1, "watchdog.loop", { action: "nudge", tool: "mcp__computer__click" }, 100),
+      item(2, "watchdog.loop", { action: "escalate", tool: "mcp__computer__click" }, 200),
+      item(3, "watchdog.loop", { action: "nudge", tool: "mcp__computer__click" }, 300),
+    ];
+    assert.equal(lastLoopNudgeAt(items), 300);
   });
 });

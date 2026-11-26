@@ -106,3 +106,75 @@ test("no action renders nothing", async () => {
   assert.equal(renderToStaticMarkup(h(ComputerActionOverlay, {})), "");
   assert.equal(renderToStaticMarkup(h(ComputerActionOverlay, { action: undefined })), "");
 });
+
+test("a changed effect with a focus move suffixes the chip with the new title", async () => {
+  const { ComputerActionOverlay } = await load();
+  const markup = renderToStaticMarkup(
+    h(ComputerActionOverlay, {
+      action: action({
+        kind: "click",
+        x: 640,
+        y: 420,
+        effect: { changed: true, focus: "Save As" },
+      }),
+    }),
+  );
+  assert.ok(markup.includes('data-effect-changed="true"'), "effect change is marked");
+  assert.ok(markup.includes('data-effect-focus="Save As"'), "the focus title is marked");
+  assert.ok(markup.includes("focus → Save As"), "chip names the new focus");
+  assert.ok(markup.includes("Clicking (640, 420)"), "chip still names the action");
+  assert.ok(!markup.includes("no change"), "no change warning is absent");
+});
+
+test("a no-change effect warns on the chip without losing the action label", async () => {
+  const { ComputerActionOverlay } = await load();
+  const markup = renderToStaticMarkup(
+    h(ComputerActionOverlay, {
+      action: action({
+        kind: "type",
+        detail: "(12 chars)",
+        effect: { changed: false, elapsedS: 1.5 },
+      }),
+    }),
+  );
+  assert.ok(markup.includes('data-effect-changed="false"'), "effect no-change is marked");
+  assert.ok(markup.includes("no change"), "chip carries the no-change warning");
+  assert.ok(markup.includes("Typing (12 chars)"), "chip still names the typing");
+  assert.ok(markup.includes("bg-amber-400"), "the warning tone is amber");
+  assert.ok(!markup.includes("focus →"), "no focus suffix without a focus move");
+});
+
+test("a watchdog.loop nudge flashes the chip with the loop message", async () => {
+  const { ComputerActionOverlay } = await load();
+  const markup = renderToStaticMarkup(
+    h(ComputerActionOverlay, {
+      action: action({ kind: "click", x: 640, y: 420 }),
+      loopNudgeAt: Date.now(),
+    }),
+  );
+  assert.ok(markup.includes('data-loop-flash="true"'), "the loop flash is marked");
+  assert.ok(markup.includes("Loop caught — agent nudged"), "chip names the nudge");
+  assert.ok(markup.includes("animate-pulse"), "the chip pulses while flashing");
+  assert.ok(markup.includes("Clicking (640, 420)"), "chip still names the action");
+});
+
+test("a stale loop nudge does not flash the chip", async () => {
+  const { ComputerActionOverlay } = await load();
+  const markup = renderToStaticMarkup(
+    h(ComputerActionOverlay, {
+      action: action({ kind: "click", x: 640, y: 420 }),
+      loopNudgeAt: Date.now() - 60_000,
+    }),
+  );
+  assert.ok(!markup.includes("Loop caught — agent nudged"), "no flash for a stale nudge");
+});
+
+test("the loop flash renders the chip even when no action is fresh", async () => {
+  const { ComputerActionOverlay } = await load();
+  const markup = renderToStaticMarkup(
+    h(ComputerActionOverlay, { loopNudgeAt: Date.now() }),
+  );
+  assert.ok(markup.includes('data-loop-flash="true"'), "the loop flash is marked");
+  assert.ok(markup.includes("Loop caught — agent nudged"), "chip names the nudge");
+  assert.ok(!markup.includes("Clicking"), "no stale action label");
+});

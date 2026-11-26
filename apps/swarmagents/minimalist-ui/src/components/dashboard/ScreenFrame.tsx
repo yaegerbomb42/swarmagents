@@ -73,6 +73,8 @@ export interface ScreenFrameProps {
   presence?: Presence;
   /** The page's already-derived latest computer-use action. */
   computerAction?: ComputerAction;
+  /** The page's already-derived newest watchdog.loop nudge (epoch ms). */
+  loopNudgeAt?: number;
 }
 
 export interface ScreenStatus {
@@ -161,6 +163,7 @@ export function ScreenFrame({
   activity,
   presence,
   computerAction,
+  loopNudgeAt,
 }: ScreenFrameProps) {
   const [theater, setTheater] = useState(false);
   const [conn, setConn] = useState<DesktopConnectionInfo>();
@@ -321,6 +324,7 @@ export function ScreenFrame({
           activity={activity}
           presence={presence}
           computerAction={computerAction}
+          loopNudgeAt={loopNudgeAt}
           className="h-full rounded-none border-0"
         />
       </div>

@@ -22,7 +22,7 @@ import type { LogEvent } from "./engine";
 import { usePersisted, useSessionPersisted } from "./store";
 import type { SwarmTask } from "../../lib/mcp-types";
 import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus, wakeVmStatus } from "../../lib/client/vmStatus";
-import { deriveComputerAction, derivePresence } from "../../lib/client/presence";
+import { deriveComputerAction, derivePresence, lastLoopNudgeAt } from "../../lib/client/presence";
 import { reduceServingModel, formatServingModel } from "../../lib/client/servingModel";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm, type RunTier } from "../../lib/client/runs";
@@ -30,6 +30,7 @@ import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/c
 import { useAgentSession } from "./hooks/useAgentSession";
 import { useBoard } from "./hooks/useBoard";
 import { devModeFromSearch, resolveView } from "./devMode";
+import { forkPromptFromSearch } from "./fork-prompt";
 import { firstRunSetup, useIsWide, useMe, useProviderStatus } from "./hooks/useEnvironment";
 import { cn } from "./utils/cn";
 import { ApprovalGate } from "./components/ApprovalGate";
@@ -165,6 +166,17 @@ export default function App() {
   // linking reads it even while the view is hidden.
   const effectiveView = resolveView(view, devMode);
   const [draft, setDraft] = useSessionPersisted<string>("sa.draft", "");
+  // A share link's "Try this prompt" lands here with ?prompt=<text>: fill
+  // the composer once, then strip the parameter so a refresh keeps the
+  // visitor's own edits instead of re-injecting the forked prompt.
+  useEffect(() => {
+    const forked = forkPromptFromSearch(window.location.search);
+    if (forked === null) return;
+    setDraft(forked);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("prompt");
+    window.history.replaceState(null, "", url);
+  }, [setDraft]);
   const observedActiveRuns = useRef(new Set<string>());
   const notifiedRuns = useRef(new Set<string>());
 
@@ -248,6 +260,12 @@ export default function App() {
   // stream (the screen falls back to its own derivation when this is absent).
   const screenComputerAction = useMemo(
     () => deriveComputerAction(session.liveItems),
+    [session.liveItems],
+  );
+
+  // The newest loop nudge, for the overlay's "Loop caught" chip flash.
+  const screenLoopNudgeAt = useMemo(
+    () => lastLoopNudgeAt(session.liveItems),
     [session.liveItems],
   );
 
@@ -654,6 +672,7 @@ export default function App() {
               fitToHeight={wide}
               presence={screenPresence}
               computerAction={screenComputerAction}
+              loopNudgeAt={screenLoopNudgeAt}
               activity={session.activity ? [{ text: session.activity }] : undefined}
               className={wide ? "h-full" : undefined}
             />

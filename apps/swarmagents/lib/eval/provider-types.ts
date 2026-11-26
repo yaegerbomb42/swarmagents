@@ -19,7 +19,8 @@ export type ProviderTaskCategory =
   | "web"
   | "file-org"
   | "gui-app"
-  | "non-vision-desktop";
+  | "non-vision-desktop"
+  | "data";
 
 /**
  * One scripted general task. The starting workspace is materialised into an
@@ -29,6 +30,8 @@ export type ProviderTaskCategory =
 export interface ProviderEvalTask {
   id: string;
   category: ProviderTaskCategory;
+  /** "hard" tasks are the discriminative set (provider-tasks-hard.ts). */
+  difficulty?: "standard" | "hard";
   title: string;
   description: string;
   /** The user request handed to the agent. */

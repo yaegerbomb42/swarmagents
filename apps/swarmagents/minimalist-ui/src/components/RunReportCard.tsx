@@ -34,7 +34,17 @@ import { Button, IconButton, Loading, Notice } from "./ui";
 import { Card } from "./brand/Card";
 import { DesktopReplay } from "./DesktopReplay";
 import { PlanChecklist } from "./PlanChecklist";
+import {
+  InlinePdfPreview,
+  RichCsvTable,
+  SandboxedHtmlFrame,
+  artifactRichRenderer,
+  isPdfBytes,
+} from "./RichArtifactPreview";
 import { formatPlanSummary } from "../../../lib/run-plan";
+
+// Re-exported so the preview tests can import the guard from here.
+export { isPdfBytes } from "./RichArtifactPreview";
 
 const POLL_MS = 2000;
 const MAX_POLLS = 10;
@@ -146,12 +156,25 @@ export function ArtifactPreviewPanel({
   onClose: () => void;
 }) {
   const downloadHref = `/api/runtime/runs/${encodeURIComponent(reportRunId)}/report/artifacts?path=${encodeURIComponent(artifact.rel)}`;
+  const rich = artifactRichRenderer(artifact.rel);
+  const [rawMode, setRawMode] = useState(false);
+  const canToggleRaw = (rich === "html" || rich === "csv") && state.text !== undefined;
   return (
     <div className="mt-2 rounded-lg border border-sa-line bg-sa-panel p-3" data-testid="artifact-preview">
       <div className="flex items-center gap-2">
         <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-sa-fg" title={artifact.rel}>
           {artifact.rel}
         </span>
+        {canToggleRaw && (
+          <button
+            type="button"
+            onClick={() => setRawMode((prev) => !prev)}
+            data-testid="artifact-preview-toggle-raw"
+            className="shrink-0 cursor-pointer rounded-md border border-sa-line px-2 py-0.5 text-[11px] text-sa-fg2 transition-colors hover:bg-sa-hover hover:text-sa-fg"
+          >
+            {rawMode ? "Rich" : "Raw"}
+          </button>
+        )}
         <a
           href={downloadHref}
           download
@@ -169,6 +192,8 @@ export function ArtifactPreviewPanel({
         <p className="mt-2 text-[12px] text-sa-err" data-testid="artifact-preview-error">
           {state.error}
         </p>
+      ) : rich === "pdf" && state.url ? (
+        <InlinePdfPreview url={state.url} title={artifact.rel} />
       ) : state.kind === "image" && state.url ? (
         // eslint-disable-next-line @next/next/no-img-element -- an object URL preview is not optimizable
         <img
@@ -178,6 +203,10 @@ export function ArtifactPreviewPanel({
           className="mt-2 max-h-64 w-full rounded-md object-contain"
           draggable={false}
         />
+      ) : rich === "html" && state.text !== undefined && !rawMode ? (
+        <SandboxedHtmlFrame html={state.text} title={artifact.rel} />
+      ) : rich === "csv" && state.text !== undefined && !rawMode ? (
+        <RichCsvTable text={state.text} />
       ) : state.kind === "text" && state.text !== undefined ? (
         <>
           <pre
@@ -546,11 +575,13 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
 
   useEffect(() => () => window.clearTimeout(copyTimer.current), []);
 
-  // Revoke object URLs for previewed images so they never leak.
+  // Revoke object URLs for previewed images/PDFs so they never leak, including
+  // when a preview is closed or replaced by a non-URL state.
   useEffect(() => {
-    if (preview?.url && preview.url !== previewUrlRef.current) {
+    const nextUrl = preview?.url;
+    if (nextUrl !== previewUrlRef.current) {
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
-      previewUrlRef.current = preview.url;
+      previewUrlRef.current = nextUrl;
     }
   }, [preview]);
   useEffect(
@@ -565,10 +596,11 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
   const openPreview = useCallback(
     async (artifact: ReportArtifact) => {
       const kind = artifactPreviewKind(artifact.rel);
+      const rich = artifactRichRenderer(artifact.rel);
       const token = ++previewTokenRef.current;
       setPreviewArtifact(artifact);
       setPreview({ kind });
-      if (kind === "none") return;
+      if (kind === "none" && rich !== "pdf") return;
       try {
         const res = await fetch(
           `/api/runtime/runs/${encodeURIComponent(report?.runId ?? "")}/report/artifacts?path=${encodeURIComponent(artifact.rel)}`,
@@ -576,7 +608,19 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         if (token !== previewTokenRef.current) return;
-        if (kind === "image") {
+        if (rich === "pdf") {
+          const bytes = await res.arrayBuffer();
+          if (token !== previewTokenRef.current) return;
+          if (!isPdfBytes(bytes)) {
+            // Not a real PDF: fall back to the download link instead of
+            // handing untrusted bytes to the viewer.
+            setPreview({ kind: "none" });
+            return;
+          }
+          const blob = new Blob([bytes], { type: "application/pdf" });
+          if (token !== previewTokenRef.current) return;
+          setPreview({ kind, url: URL.createObjectURL(blob) });
+        } else if (kind === "image") {
           const blob = await res.blob();
           if (token !== previewTokenRef.current) return;
           setPreview({ kind, url: URL.createObjectURL(blob) });

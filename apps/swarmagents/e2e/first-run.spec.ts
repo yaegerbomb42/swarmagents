@@ -8,9 +8,8 @@
  * from the real server: while a local `fresh` flag is set, the account's
  * provider/runs/threads/settings GETs are mocked to look empty and
  * incomplete. The sample run itself is dispatched to the real server (the
- * server's fake VM driver replays the recorded "create a file and run a
- * script" transcript and really writes /workspace/hello.py), so the report's
- * artifact card is real.
+ * server's fake VM driver replays a recorded transcript), so the run, its
+ * finished status and its report card are real.
  */
 
 import assert from "node:assert/strict";
@@ -115,13 +114,15 @@ test(
         await log.getByText("Print the first 20 primes").first().waitFor({ state: "visible", timeout: 30_000 });
         await waitForLastTurn(page, "finished", 60_000);
 
-        // Deliverable card (#267): the report lists the created file.
-        const toggle = page.getByTestId("run-report-toggle").last();
-        await toggle.waitFor({ state: "visible", timeout: 15_000 });
-        await toggle.click();
-        const files = page.getByTestId("run-report-files").last();
-        await files.waitFor({ state: "visible", timeout: 30_000 });
-        await files.getByText("hello.py").first().waitFor({ state: "visible", timeout: 15_000 });
+        // Deliverable card (#267): the finished turn carries the run report
+        // with its Files changed section. The fake VM replays the agent's
+        // side only and writes nothing, so the file list itself is only
+        // populated on a real VM (see lib/vm/fake-claude.ts).
+        const turn = page.locator('[data-testid="turn"]').last();
+        await turn.getByTestId("run-report-toggle").click();
+        const body = turn.getByTestId("run-report-body");
+        await body.getByText("Timeline").waitFor({ state: "visible", timeout: 30_000 });
+        await body.getByText("Files changed").waitFor({ state: "visible", timeout: 15_000 });
         await captureView(page, testName, "5-completed-artifact");
 
         // Completion is persisted (the wizard got the flag from Settings on

@@ -4,10 +4,7 @@
  *
  * Each task is sized for 1–3 minutes on the user's VM and ends with a
  * visible deliverable file in /workspace, so a new user reaches "I watched
- * it do something" in one run. The first sample deliberately starts with the
- * exact phrase the fake-VM e2e driver uses to select its recorded
- * "write a file and run a script" transcript, so the local e2e suite can
- * drive it end to end without a live model provider.
+ * it do something" in one run.
  */
 
 export interface SampleTask {

@@ -206,6 +206,22 @@ the approval-hook path production uses. The remaining failures are the
 model's own: it typed `touch marker.txt` and never pressed Enter, and it
 kept clicking the code instead of opening a second terminal.
 
+**After core-37** (forgiving computer-mcp args): computer-mcp now maps the
+argument slips seen above (`key {"key":"Enter"}`, `focus_window {"window":…}`,
+`open_app {"app":…}`, `type {submit:true}`, `click {coordinate:[x,y]}`) to the
+canonical calls, every alias is declared in the MCP schema (zod strips unknown
+keys before the handler runs), a `type` that did not press Enter says so, and a
+second unsubmitted `type` into the same terminal is refused once ("… never
+ran") instead of stacking `lspwdecho …` on the prompt. Nothing runs
+implicitly. Same suite, same graders:
+
+| Model | pass@1 | Mean turns | Mean input tok | Mean seconds |
+| --- | ---: | ---: | ---: | ---: |
+| nvidia/nemotron-3.5-lightning-30b-a3b (before) | 0/3 | 18.0 | 182,124 | 33.9 |
+| nvidia/nemotron-3.5-lightning-30b-a3b (after) | 3/3 | 12.7 | 116,941 | 16.9 |
+| mercury (before) | 3/3 | 13.7 | 129,932 | 21.1 |
+| mercury (after) | 3/3 | 9.7 | 101,372 | 13.4 |
+
 ## Relation to the capability-atlas eval
 
 `lib/capability-atlas/eval` benchmarks capability *retrieval* accuracy

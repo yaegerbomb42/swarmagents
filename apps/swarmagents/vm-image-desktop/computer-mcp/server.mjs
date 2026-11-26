@@ -22,6 +22,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { fileURLToPath } from "node:url";
 import {
+  clearsTerminalLine,
+  normalizeToolArgs,
   parseToolArgs,
   summarizeTool,
   COMPUTER_TOOLS,
@@ -35,7 +37,7 @@ import {
   TYPE_PASTE_MARKER,
 } from "./validate.mjs";
 import { capClipboardText, writeClipboard } from "./clipboard.mjs";
-import { pasteText } from "./paste.mjs";
+import { activeWindowClass, isTerminalClass, pasteText } from "./paste.mjs";
 import {
   effectEnabled,
   captureFingerprint,
@@ -118,12 +120,61 @@ async function runAll(cmds, label) {
 }
 
 /**
+ * Said after every type that did not end in Return: the live desktop eval
+ * (core-36/37) showed cheap models typing a terminal command and declaring
+ * it done without ever running it.
+ */
+const NO_ENTER_NOTE = " (Enter NOT pressed: if this is a command or form, call key Return or type with submit:true)";
+
+/**
  * The `type` tool: keys mode runs xdotool argv (the classic per-line typing);
  * paste mode puts the text on the clipboard, sends the paste chord (Ctrl+V,
  * or Ctrl+Shift+V when the focused window is a terminal), and restores the
  * previous clipboard best effort. Result line states the mode and count.
  */
+/**
+ * Unsubmitted terminal input (core-37). Cheap models type `ls`, then `pwd`,
+ * then a real command into a terminal without ever pressing Enter, so the
+ * prompt fills with `lspwdecho ...` and nothing runs. When text is typed into
+ * a terminal without Return we remember it; the next type into the SAME
+ * terminal is refused once with a clear instruction. Nothing is ever run
+ * implicitly: the model still decides to press Return (or clear the line).
+ */
+let pendingTerminalLine = null; // { win: number, text: string }
+
+/** The focused window id and whether it is a terminal; never throws. */
+async function focusedTerminal() {
+  const act = await run("xdotool", ["getactivewindow"], { timeoutMs: 3_000 });
+  const win = act.code === 0 ? Number(act.stdout.trim().split(/\s+/)[0]) : NaN;
+  if (!Number.isFinite(win) || win <= 0) return { win: 0, terminal: false };
+  const klass = await activeWindowClass({ env: CHILD_ENV, timeoutMs: 3_000 });
+  return { win, terminal: isTerminalClass(klass) };
+}
+
+/** Called after a successful `key` call. */
+function noteKeyCombo(combo) {
+  if (clearsTerminalLine(combo)) pendingTerminalLine = null;
+}
+
 async function typeTool(args, cmds) {
+  const submits = typeof args.text === "string" && args.text.endsWith("\n");
+  const focus = await focusedTerminal();
+  if (focus.terminal && pendingTerminalLine && pendingTerminalLine.win === focus.win) {
+    const pending = pendingTerminalLine.text.slice(-80);
+    pendingTerminalLine = null; // refuse once, never deadlock
+    return fail(
+      `type refused: "${pending}" is still sitting on this terminal's prompt and never ran (Enter was not pressed). ` +
+        `Call key Return to run it, or key ctrl+u to clear it, then type again. Tip: type {text, submit:true} types and runs in one call.`,
+    );
+  }
+  const result = await typeInto(args, cmds);
+  if (!result.isError && focus.terminal) {
+    pendingTerminalLine = submits ? null : { win: focus.win, text: String(args.text ?? "") };
+  }
+  return result;
+}
+
+async function typeInto(args, cmds) {
   const [marker, payload] = cmds[0];
   if (marker === TYPE_PASTE_MARKER) {
     const res = await pasteText(payload, { env: CHILD_ENV });
@@ -134,13 +185,14 @@ async function typeTool(args, cmds) {
       const keys = await runAll(rest, "type");
       if (keys.isError) return keys;
     }
-    const enter = rest.length > 0 ? ` + Return${rest.length > 1 ? ` x${rest.length}` : ""}` : "";
+    const enter = rest.length > 0 ? ` + Return${rest.length > 1 ? ` x${rest.length}` : ""}` : NO_ENTER_NOTE;
     return textResult(`Pasted ${res.chars} chars via clipboard (${res.combo})${enter} in ${res.ms}ms`);
   }
   const n = typeof args.text === "string" ? args.text.length : 0;
   const res = await runAll(cmds, "type");
   if (res.isError) return res;
-  return textResult(`Typed ${n} chars via keys`);
+  const submitted = typeof args.text === "string" && args.text.endsWith("\n");
+  return textResult(`Typed ${n} chars via keys${submitted ? " + Return" : NO_ENTER_NOTE}`);
 }
 
 /** Measure the image width in pixels via `identify` ("" when unavailable). */
@@ -424,7 +476,11 @@ async function withEffect(tool, args, action) {
   return result;
 }
 
-async function callTool(tool, args) {
+async function callTool(tool, rawArgs) {
+  // Common argument slips (key {"key":"Enter"}, focus_window {"window_name"},
+  // open_app {"app_name"}, type {submit:true}) are mapped to the canonical
+  // names first, so every handler below sees one spelling (core-37).
+  const args = normalizeToolArgs(tool, rawArgs);
   // All input tools go through the shared validator, producing argv arrays.
   const parsed = parseToolArgs(tool, args);
   if (!parsed.ok) return fail(parsed.error);
@@ -471,6 +527,12 @@ async function callTool(tool, args) {
         return textResult(`Opening ${args.name}`);
       });
     }
+    case "key":
+      return withEffect("key", args, async () => {
+        const res = await runAll(parsed.cmds, "key");
+        if (!res.isError) noteKeyCombo(args.combo);
+        return res;
+      });
     default:
       return withEffect(tool, args, () => runAll(parsed.cmds, tool.replace("_", " ")));
   }
@@ -484,8 +546,9 @@ const server = new McpServer({ name: "swarm-computer", version: "1.0.0" });
 // in `callTool` by the shared `parseToolArgs` validator, the single source
 // of truth for ranges, charsets and argv construction.
 const XY_SHAPE = {
-  x: z.union([z.number(), z.string()]).describe("X coordinate on the desktop (0..4096)."),
-  y: z.union([z.number(), z.string()]).describe("Y coordinate on the desktop (0..4096)."),
+  x: z.union([z.number(), z.string()]).optional().describe("X coordinate on the desktop (0..4096)."),
+  y: z.union([z.number(), z.string()]).optional().describe("Y coordinate on the desktop (0..4096)."),
+  coordinate: z.array(z.union([z.number(), z.string()])).optional().describe("Alternative to x/y: [x, y]."),
   button: z.union([z.number(), z.string()]).optional().describe("Mouse button: 1 left, 2 middle, 3 right, 4..7 wheel."),
 };
 const DRAG_SHAPE = {
@@ -548,16 +611,26 @@ function toolSpec(tool) {
     case "type":
       return {
         description:
-          'Type text (mode "auto" pastes via clipboard for long/multiline/non-ASCII text, fast and exact; mode "keys" types per-line keyboard input).',
+          'Type text into the focused window. It does NOT press Enter: set submit:true (or end text with a newline) to run a command. Mode "auto" pastes via clipboard for long/multiline/non-ASCII text, fast and exact; mode "keys" types per-line keyboard input).',
         shape: {
-          text: z.string().describe('Text to type (max 2000 chars in "keys" mode, 20000 in "paste" mode).'),
+          text: z.string().optional().describe('Text to type (max 2000 chars in "keys" mode, 20000 in "paste" mode). A trailing newline presses Return.'),
+          submit: z.boolean().optional().describe("Press Return after typing (e.g. to run a terminal command). Without it, type never presses Enter."),
+          content: z.string().optional().describe("Alias of text."),
+          value: z.string().optional(),
+          enter: z.boolean().optional(),
+          press_enter: z.boolean().optional(),
           mode: z.enum(["auto", "keys", "paste"]).optional().describe('"auto" (default) pastes when the text is >200 chars, multiline or non-ASCII; "keys" always types via keyboard; "paste" always uses the clipboard.'),
         },
       };
     case "key":
       return {
         description: "Press a key or key combo, e.g. \"Return\", \"ctrl+l\", \"alt+Tab\".",
-        shape: { combo: z.string().describe("Keysym combo (max 64 chars).") },
+        shape: {
+          combo: z.string().optional().describe('Keysym combo (max 64 chars), e.g. "Return", "ctrl+c". "Enter"/"Esc" are accepted.'),
+          key: z.string().optional().describe("Alias of combo."),
+          keys: z.union([z.string(), z.array(z.string())]).optional().describe('Alias of combo; ["ctrl","l"] means "ctrl+l".'),
+          keysym: z.string().optional(),
+        },
       };
     case "scroll":
       return { description: "Scroll by wheel steps: positive dy scrolls down, negative up; dx scrolls right/left.", shape: AXIS_SHAPE };
@@ -565,12 +638,27 @@ function toolSpec(tool) {
       return {
         description:
           "Open a desktop application: browser (Chromium), terminal, files (Thunar), libreoffice (Writer), spreadsheet (LibreOffice Calc), gimp (image editing) or blender (3D).",
-        shape: { name: z.enum(OPEN_APP_NAMES) },
+        shape: {
+          name: z.string().optional().describe(`One of: ${OPEN_APP_NAMES.join(", ")}.`),
+          app: z.string().optional().describe("Alias of name."),
+          app_name: z.string().optional().describe("Alias of name."),
+          appName: z.string().optional(),
+          application: z.string().optional(),
+        },
       };
     case "focus_window":
       return {
         description: "Bring a desktop window whose title matches `title` to the foreground.",
-        shape: { title: z.string().describe("Window title substring (1..120 chars).") },
+        shape: {
+          title: z.string().optional().describe("Window title substring (1..120 chars)."),
+          window_title: z.string().optional().describe("Alias of title."),
+          window_name: z.string().optional().describe("Alias of title."),
+          // Undocumented spellings still seen live; declared so the MCP
+          // schema layer does not strip them before normalizeToolArgs.
+          window: z.string().optional(),
+          windowTitle: z.string().optional(),
+          name: z.string().optional(),
+        },
       };
     case "wait":
       return {

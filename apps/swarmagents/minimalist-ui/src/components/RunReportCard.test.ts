@@ -251,3 +251,11 @@ test("a totally unavailable clipboard reports failure so the user gets a manual 
     g.document = previousDoc;
   }
 });
+
+test("summary sentence ends with the plan progress when the run planned", () => {
+  assert.equal(
+    reportSummarySentence(meta({ artifacts: 1, plan: { done: 7, total: 7 } }), artifacts("modified")),
+    "Edited notes.md in 7s for $0.11. Plan: 7/7 completed.",
+  );
+  assert.equal(reportSummarySentence(meta({ artifacts: 1 }), artifacts("modified")), "Edited notes.md in 7s for $0.11.");
+});

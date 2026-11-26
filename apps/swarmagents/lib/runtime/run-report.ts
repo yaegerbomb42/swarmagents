@@ -25,6 +25,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { sha256Hex } from "../library/proof";
 import type { SequencedEvent } from "../telemetry/bus";
+import { latestPlanFromEvents, planProgress } from "../run-plan";
 import { getRunsDir } from "../telemetry/paths";
 import { aggregateRunTokenAccounting } from "../telemetry/run-token-accounting";
 import { DESKTOP_DISPLAY } from "../vm/docker-driver";
@@ -712,6 +713,13 @@ export function assembleReport(inputs: ReportInputs): RunReport {
     ...(inputs.vmImage ? { vmImage: inputs.vmImage } : {}),
   };
 
+  // The agent's own plan (TodoWrite), as it stood when the run ended.
+  const plan = latestPlanFromEvents(events);
+  if (plan) {
+    const { done, total } = planProgress(plan);
+    meta.plan = { done, total };
+  }
+
   // Per-model token accounting from the same event stream. Gateway
   // (llm.call) totals win for the card numbers; the harness stream's own
   // usage is the fallback for runs that never crossed the gateway.
@@ -761,6 +769,7 @@ export function assembleReport(inputs: ReportInputs): RunReport {
     shots: inputs.shots,
     ...(inputs.replay ? { replay: inputs.replay } : {}),
     meta,
+    ...(plan ? { plan: [...plan] } : {}),
     ...(tokenAccounting ? { tokenAccounting } : {}),
   };
 }

@@ -41,6 +41,7 @@ import type {
 import { isMetaTool } from "../self-manage/session";
 import { buildDomainPlaybook } from "../playbook/domain-playbooks";
 import { createStreamJsonParser } from "./stream-json";
+import { createPlanTracker } from "../run-plan";
 import { compactToolResultText } from "./context/turn-compaction";
 import { GateQueue } from "./gate-queue";
 import { makeRedactor, redactValue } from "./redact";
@@ -440,6 +441,7 @@ export class ClaudeCodeRunner {
     let brainTurnCount = 0;
     let lastBrainToolResult: { ok: boolean; output: string } | null = null;
     let lastBrainError: string | null = null;
+    const planTracker = createPlanTracker();
     /** ProgressWatchdog loop state: tool_use id -> tool name, turn count. */
     let watchdogTurnCount = 0;
     const watchdogToolNames = new Map<string, string>();
@@ -642,6 +644,11 @@ export class ClaudeCodeRunner {
                 input: redactValue(input, redact),
                 id: toolId,
               });
+
+              // The agent's own plan (TodoWrite / TaskCreate / TaskUpdate):
+              // one run.plan event per real change drives the live checklist.
+              const planUpdate = planTracker.onToolUse(name, redactValue(input, redact));
+              if (planUpdate) emit({ type: "run.plan", steps: [...planUpdate] });
 
               // Track file mutations for the deliverable check (every run) and
               // for the L1 packer's working set. A later real verification

@@ -63,6 +63,8 @@ import { Button, Loading, Notice, StatusBadge } from "./ui";
 import { ContextMeterPill } from "./ContextMeterPill";
 import { EmptyState } from "./brand/EmptyState";
 import { RunReportCard } from "./RunReportCard";
+import { PlanChecklist } from "./PlanChecklist";
+import { latestPlanFromEvents, type RunPlan } from "../../../lib/run-plan";
 import { RunTraceTimeline } from "./RunTraceTimeline";
 import { HandoffCard } from "./dashboard/HandoffCard";
 
@@ -452,6 +454,7 @@ function ReplayedSteps({
   const stream = useRunStream(runId);
   const blocks = useMemo(() => buildTurnBlocks(closeOpenPrompts(buildConversation(stream.items))), [stream.items]);
   const timeline = useMemo(() => buildTraceTimeline(stream.items), [stream.items]);
+  const plan = useMemo(() => latestPlanFromEvents(stream.items), [stream.items]);
   if (blocks.length === 0) {
     return stream.status === "idle" ? (
       <p className="text-[13px] text-sa-fg3">No steps were recorded for this run.</p>
@@ -460,14 +463,17 @@ function ReplayedSteps({
     );
   }
   return (
-    <Blocks
-      blocks={blocks}
-      truncated={isReplayTruncated(stream.items)}
-      onAnswer={onAnswer}
-      onHandBack={onHandBack}
-      defaultOpen
-      timeline={timeline}
-    />
+    <>
+      <PlanChecklist plan={plan} defaultOpen />
+      <Blocks
+        blocks={blocks}
+        truncated={isReplayTruncated(stream.items)}
+        onAnswer={onAnswer}
+        onHandBack={onHandBack}
+        defaultOpen
+        timeline={timeline}
+      />
+    </>
   );
 }
 
@@ -482,6 +488,8 @@ interface TurnProps {
   /** Trace stretches for the live run, one per steps block, in order. */
   timeline?: TimelineStretch[];
   truncated: boolean;
+  /** The live run's plan (TodoWrite), pinned above its steps. */
+  plan?: RunPlan | null;
   phase: RunPhase;
   activity?: string;
   task?: TaskRunLink;
@@ -502,6 +510,7 @@ const Turn = React.memo(function Turn({
   blocks,
   timeline,
   truncated,
+  plan,
   phase,
   activity,
   task,
@@ -541,6 +550,7 @@ const Turn = React.memo(function Turn({
       <UserMessage prompt={prompt} task={task} onOpenTask={onOpenTask} />
 
       <div className="space-y-3">
+        {live && <PlanChecklist plan={plan} live={meta.active} />}
         {live && blocks && blocks.length > 0 ? (
           <Blocks blocks={blocks} truncated={truncated} onAnswer={onAnswer} onHandBack={onHandBack} timeline={timeline} />
         ) : showSteps ? (
@@ -642,6 +652,7 @@ export function Conversation({
   const { turns, pending, liveRunId, liveEntries, liveItems, phase, activity, promptFor } = session;
   const liveBlocks = useMemo(() => buildTurnBlocks(liveEntries), [liveEntries]);
   const liveTimeline = useMemo(() => buildTraceTimeline(liveItems), [liveItems]);
+  const livePlan = useMemo(() => latestPlanFromEvents(liveItems), [liveItems]);
   // One prompt object per run, so unchanged turns skip re-rendering on each poll.
   const prompts = useMemo(() => new Map(turns.map((entry) => [entry.runId, promptFor(entry)])), [turns, promptFor]);
   const truncated = useMemo(() => isReplayTruncated(liveItems), [liveItems]);
@@ -718,6 +729,7 @@ export function Conversation({
                 blocks={live ? liveBlocks : undefined}
                 timeline={live ? liveTimeline : undefined}
                 truncated={live && truncated}
+                plan={live ? livePlan : undefined}
                 phase={turnPhase}
                 activity={live ? activity : undefined}
                 task={taskLinkForRun(taskLinks, entry.runId)}

@@ -42,6 +42,7 @@ export interface ReportShotMeta {
 }
 
 import type { RunReceipt } from "./run-receipt";
+import type { PlanStep } from "../run-plan";
 
 /** Token + cost totals for one provider/model pair within a run. */
 export interface ModelTokenAccounting {
@@ -208,6 +209,11 @@ export interface ReportCardMeta {
   vmImage?: string;
   /** Shadow-verifier gate result, when one ran for the run. */
   verification?: RunVerificationMeta;
+  /**
+   * The agent's final plan (TodoWrite) progress, when the run planned:
+   * the card's collapsed row says "Plan: 7/7 completed".
+   */
+  plan?: { done: number; total: number };
 }
 
 /** The shadow-verifier gate result for a run. */
@@ -283,6 +289,8 @@ export interface RunReport {
   /** Frame-recorder replay, when a viewer watched this run's desktop. */
   replay?: ReportReplayMeta;
   meta: ReportCardMeta;
+  /** The agent's final plan (see lib/run-plan.ts), when it kept one. */
+  plan?: PlanStep[];
   /**
    * Per-model token accounting folded from the run's llm.call / usage
    * telemetry. Absent on reports written before it existed, and on runs

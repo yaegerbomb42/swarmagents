@@ -19,4 +19,5 @@ exec /usr/bin/chromium \
   --no-default-browser-check \
   --disable-features=TranslateUI \
   --start-maximized \
+  --force-renderer-accessibility \
   "$@"

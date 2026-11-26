@@ -10,8 +10,8 @@
  * existing panels, unchanged.
  */
 
-import React, { useState } from "react";
-import { RotateCcw } from "lucide-react";
+import React, { useCallback, useEffect, useState } from "react";
+import { Globe, RotateCcw, Trash2 } from "lucide-react";
 import type { ProviderConfig } from "../data";
 import type { SampleTask } from "../lib/sampleTasks";
 import { DEFAULT_AGENT_CARD } from "../data";
@@ -57,6 +57,120 @@ const APPROVAL_MODES = [
     hint: "The run pauses and asks you to approve or deny each risky tool call.",
   },
 ] as const;
+
+export interface BrowserProfileStatus {
+  exists: boolean;
+  sizeMb: number;
+}
+
+export function BrowserSessionPanel({
+  status,
+  loading,
+  clearing,
+  error,
+  clearedNotice,
+  onClear,
+}: {
+  status: BrowserProfileStatus | null;
+  loading: boolean;
+  clearing: boolean;
+  error?: string;
+  clearedNotice?: boolean;
+  onClear: () => void;
+}) {
+  return (
+    <div className="space-y-2 rounded-xl border border-sa-line bg-sa-raised px-3 py-2.5" data-testid="settings-browser-session">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2 text-[13px] text-sa-fg">
+          <Globe className="h-4 w-4 shrink-0 text-sa-fg2" aria-hidden />
+          <span className="truncate" data-testid="settings-browser-status">
+            {loading
+              ? "Checking saved browser session…"
+              : status?.exists
+                ? `Saved session (${status.sizeMb} MB)`
+                : "No saved browser session"}
+          </span>
+        </div>
+        <Button
+          size="sm"
+          variant="ghost"
+          loading={clearing}
+          disabled={loading || !status?.exists}
+          onClick={onClear}
+          data-testid="settings-browser-profile-clear"
+        >
+          <Trash2 className="h-3.5 w-3.5" aria-hidden />
+          Clear session
+        </Button>
+      </div>
+      {error && (
+        <p className="text-[12px] text-sa-err" data-testid="settings-browser-error">
+          {error}
+        </p>
+      )}
+      {clearedNotice && <Notice title="Saved browser session cleared" />}
+    </div>
+  );
+}
+
+function BrowserSessionSection() {
+  const [status, setStatus] = useState<BrowserProfileStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [clearing, setClearing] = useState(false);
+  const [error, setError] = useState<string>();
+  const [clearedNotice, setClearedNotice] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(undefined);
+    try {
+      const res = await fetch("/api/runtime/vm/browser-profile", { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as BrowserProfileStatus;
+      setStatus({ exists: Boolean(data.exists), sizeMb: Number(data.sizeMb) || 0 });
+    } catch (err) {
+      setError(err instanceof Error && err.message ? err.message : "Could not check browser session.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const clear = useCallback(async () => {
+    setClearing(true);
+    setError(undefined);
+    setClearedNotice(false);
+    try {
+      const res = await fetch("/api/runtime/vm/browser-profile", { method: "DELETE" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setStatus({ exists: false, sizeMb: 0 });
+      setClearedNotice(true);
+    } catch (err) {
+      setError(err instanceof Error && err.message ? err.message : "Could not clear browser session.");
+    } finally {
+      setClearing(false);
+    }
+  }, []);
+
+  return (
+    <Section
+      title="Browser session"
+      hint="Persistent Chromium cookies and logins at /workspace/.swarm/browser-profile survive idle VM stops."
+    >
+      <BrowserSessionPanel
+        status={status}
+        loading={loading}
+        clearing={clearing}
+        error={error}
+        clearedNotice={clearedNotice}
+        onClear={() => void clear()}
+      />
+    </Section>
+  );
+}
 
 export function AgentSettings({
   fullAuto,
@@ -151,6 +265,7 @@ export function AgentSettings({
         </div>
       </Section>
 
+      <BrowserSessionSection />
       <SchedulesSection />
 
       <Section

@@ -43,6 +43,12 @@ export const VM_WORKSPACE_DISK_PATH = "/workspace";
  * session tokens. Only existence + total size are ever exposed.
  */
 export const VM_BROWSER_PROFILE_PATH = "/workspace/.swarm/browser-profile";
+/** Chromium singleton lock files left behind after an abrupt container stop. */
+export const CHROMIUM_SINGLETON_LOCKS = [
+  `${VM_BROWSER_PROFILE_PATH}/SingletonLock`,
+  `${VM_BROWSER_PROFILE_PATH}/SingletonCookie`,
+  `${VM_BROWSER_PROFILE_PATH}/SingletonSocket`,
+] as const;
 /** How long a du measurement is reused before it is re-run. */
 export const DISK_USAGE_TTL_MS = 60_000;
 /** du -sk prints "<kilobytes>\t<path>". */
@@ -580,6 +586,18 @@ export class VmManager {
       }
     }
     return this.ensure(userId);
+  }
+
+  /**
+   * Remove stale Chromium SingletonLock/Cookie/Socket files from the persistent
+   * browser profile without touching cookies or login state. Best-effort.
+   */
+  async cleanStaleBrowserLocks(userId: string): Promise<void> {
+    try {
+      await this.exec(userId, ["rm", "-f", "--", ...CHROMIUM_SINGLETON_LOCKS]);
+    } catch {
+      // Best-effort: a missing profile or non-POSIX fake driver must not fail.
+    }
   }
 
   /**

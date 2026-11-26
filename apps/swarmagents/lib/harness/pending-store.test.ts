@@ -118,7 +118,17 @@ test("pending store: restored pending items expire after a restart", async () =>
   const second = new TestStore({ filePath: file, ttlMs: 15, now: () => now });
   assert.deepEqual(second.listPending().map((i) => i.id), ["t-1"]);
   const waiter = second.waitFor("t-1");
-  assert.deepEqual(await waiter, { status: "expired" });
+  // The store's TTL timer is unref'd (it must never keep a server alive), so
+  // nothing else holds the event loop open while we wait for it; without a
+  // ref'd handle node:test can see an empty loop and fail the test with
+  // "Promise resolution is still pending but the event loop has already
+  // resolved" (and cancel the rest of the file).
+  const keepAlive = setTimeout(() => {}, 5_000);
+  try {
+    assert.deepEqual(await waiter, { status: "expired" });
+  } finally {
+    clearTimeout(keepAlive);
+  }
   assert.equal(second.get("t-1")?.status, "expired");
 });
 

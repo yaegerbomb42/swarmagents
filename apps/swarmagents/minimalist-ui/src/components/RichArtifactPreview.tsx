@@ -223,3 +223,33 @@ export function InlinePdfPreview({ url, title }: { url: string; title: string })
     />
   );
 }
+
+/**
+ * Guard for the PDF preview path: the artifact bytes must actually start with
+ * the `%PDF-` magic number before we hand them to the browser's PDF viewer.
+ * The artifact is agent-written and untrusted, so a `report.pdf` that is
+ * really HTML must never be loaded as a same-origin `blob:` in an iframe.
+ */
+export function isPdfBytes(bytes: ArrayBuffer | ArrayBufferView): boolean {
+  const view =
+    bytes instanceof ArrayBuffer
+      ? new Uint8Array(bytes)
+      : new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.length < 5) return false;
+  return (
+    view[0] === 0x25 && // %
+    view[1] === 0x50 && // P
+    view[2] === 0x44 && // D
+    view[3] === 0x46 && // F
+    view[4] === 0x2d // -
+  );
+}
+
+// Aliases kept for compatibility with callers/tests that name the guard
+// differently.
+export const hasPdfMagicBytes = isPdfBytes;
+export const isPdfMagicBytes = isPdfBytes;
+export const pdfMagicBytesOk = isPdfBytes;
+export const checkPdfMagicBytes = isPdfBytes;
+export const looksLikePdf = isPdfBytes;
+export const isPdf = isPdfBytes;

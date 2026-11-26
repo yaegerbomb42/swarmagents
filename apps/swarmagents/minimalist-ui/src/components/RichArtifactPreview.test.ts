@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   artifactRichRenderer,
   buildSandboxedHtmlSrcDoc,
+  isPdfBytes,
   parseCsvRows,
   sortCsvRows,
 } from "./RichArtifactPreview";
@@ -44,6 +45,13 @@ test("sortCsvRows sorts numerically when values are numbers and lexically otherw
     sortCsvRows(rows, 0, "asc").map((r) => r[0]),
     ["ada", "bob", "carl"],
   );
+});
+
+test("isPdfBytes rejects HTML bytes and accepts PDF magic bytes", () => {
+  const html = new TextEncoder().encode("<script>alert(1)</script>").buffer;
+  assert.equal(isPdfBytes(html), false);
+  assert.equal(isPdfBytes(new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31])), true);
+  assert.equal(isPdfBytes(new Uint8Array([0x25, 0x50])), false);
 });
 
 test("buildSandboxedHtmlSrcDoc injects strict CSP into head or fragment", () => {

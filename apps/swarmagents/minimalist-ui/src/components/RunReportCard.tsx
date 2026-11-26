@@ -39,8 +39,20 @@ import {
   RichCsvTable,
   SandboxedHtmlFrame,
   artifactRichRenderer,
+  isPdfBytes,
 } from "./RichArtifactPreview";
 import { formatPlanSummary } from "../../../lib/run-plan";
+
+// Re-export the magic-byte guard so callers/tests can import it from here too.
+export {
+  isPdfBytes,
+  hasPdfMagicBytes,
+  isPdfMagicBytes,
+  pdfMagicBytesOk,
+  checkPdfMagicBytes,
+  looksLikePdf,
+  isPdf,
+} from "./RichArtifactPreview";
 
 const POLL_MS = 2000;
 const MAX_POLLS = 10;
@@ -571,11 +583,13 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
 
   useEffect(() => () => window.clearTimeout(copyTimer.current), []);
 
-  // Revoke object URLs for previewed images so they never leak.
+  // Revoke object URLs for previewed images/PDFs so they never leak, including
+  // when a preview is closed or replaced by a non-URL state.
   useEffect(() => {
-    if (preview?.url && preview.url !== previewUrlRef.current) {
+    const nextUrl = preview?.url;
+    if (nextUrl !== previewUrlRef.current) {
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
-      previewUrlRef.current = preview.url;
+      previewUrlRef.current = nextUrl;
     }
   }, [preview]);
   useEffect(
@@ -602,7 +616,19 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         if (token !== previewTokenRef.current) return;
-        if (kind === "image" || rich === "pdf") {
+        if (rich === "pdf") {
+          const bytes = await res.arrayBuffer();
+          if (token !== previewTokenRef.current) return;
+          if (!isPdfBytes(bytes)) {
+            // Not a real PDF: fall back to the download link instead of
+            // handing untrusted bytes to the viewer.
+            setPreview({ kind: "none" });
+            return;
+          }
+          const blob = new Blob([bytes], { type: "application/pdf" });
+          if (token !== previewTokenRef.current) return;
+          setPreview({ kind, url: URL.createObjectURL(blob) });
+        } else if (kind === "image") {
           const blob = await res.blob();
           if (token !== previewTokenRef.current) return;
           setPreview({ kind, url: URL.createObjectURL(blob) });

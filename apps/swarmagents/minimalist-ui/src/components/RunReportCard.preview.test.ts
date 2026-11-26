@@ -14,6 +14,7 @@ import {
   ArtifactPreviewPanel,
   artifactPreviewKind,
   capPreviewText,
+  isPdfBytes,
 } from "./RunReportCard";
 import type { ReportArtifact } from "../../../lib/runtime/run-report-types";
 
@@ -162,4 +163,23 @@ test("preview panel renders PDF inline iframe when blob url is present", () => {
   );
   assert.ok(markup.includes('data-testid="artifact-preview-pdf"'), "PDF iframe renders");
   assert.ok(markup.includes("blob:http://localhost/pdf-1"), "blob URL is wired into iframe");
+});
+
+test("PDF magic-byte guard rejects HTML bytes", () => {
+  const html = "<script>alert(1)</script>";
+  const bytes = new TextEncoder().encode(html).buffer;
+  assert.equal(isPdfBytes(bytes), false, "HTML bytes are not a PDF");
+  assert.equal(isPdfBytes(new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d])), true, "PDF magic bytes pass");
+});
+
+test("HTML bytes in a .pdf must not produce an iframe", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(ArtifactPreviewPanel, {
+      artifact: artifact("report.pdf"),
+      reportRunId: "run_1",
+      state: { kind: "none" },
+      onClose: () => {},
+    }),
+  );
+  assert.ok(!markup.includes('data-testid="artifact-preview-pdf"'), "no PDF iframe renders");
 });

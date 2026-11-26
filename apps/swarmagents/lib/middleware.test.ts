@@ -352,6 +352,30 @@ test("loopback does not bypass the host gate for non-health paths", () => {
   }
 });
 
+test("the public health probe passes middleware signed out (liveness and readiness)", () => {
+  // Deploy checks, uptime monitors and the SiteFooter version fetch hit
+  // /api/health without a session, so it must reach the route on the public
+  // host: no 303 redirect to /login and no 401 JSON. The query string is not
+  // part of the pathname, so the readiness variant (?ready=1) matches the
+  // same PUBLIC entry — this host is not loopback, so the PUBLIC set (not the
+  // loopback bypass) is what lets the request through.
+  for (const url of ["http://swarm.example.com/api/health", "http://swarm.example.com/api/health?ready=1"]) {
+    const res = middleware(req(url, { host: "swarm.example.com" }));
+    assert.equal(res.status, 200, `${url} must pass middleware unauthenticated`);
+    assert.equal(res.headers.get("location"), null, `${url} must not redirect to /login`);
+  }
+});
+
+test("lookalike health paths stay behind the auth gate", async () => {
+  // Only the exact /api/health pathname is public; prefixed variants must
+  // still demand a session (401 JSON for API paths, never the route itself).
+  for (const path of ["/api/healthz", "/api/health/extra", "/api/health/snapshot"]) {
+    const res = middleware(req(`http://swarm.example.com${path}`, { host: "swarm.example.com" }));
+    assert.equal(res.status, 401, `${path} must not be public`);
+    assert.deepEqual(await res.json(), { error: "Sign in required." });
+  }
+});
+
 test("redirect origin never follows an untrusted X-Forwarded-Host", () => {
   // Not in the allowlist: ignored, fall back to the Host header.
   let res = middleware(

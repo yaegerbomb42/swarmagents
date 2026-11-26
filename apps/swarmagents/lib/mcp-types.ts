@@ -30,6 +30,8 @@ export interface SwarmTask {
   reviewedBy?: string;
   /** Epoch ms of the last review_and_merge_task decision. */
   reviewedAt?: number;
+  /** Agent names whose submitted work was rejected (one entry per review_and_merge_task approved=false). */
+  rejections?: string[];
   /**
    * Why review_and_merge_task sent the work back (the reviewer's feedback).
    * Set on rejection; cleared on the next successful claim and on approval,

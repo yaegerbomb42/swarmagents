@@ -28,6 +28,12 @@ export interface ArenaMatch {
   createdAt: number;
 }
 
+/** Per-agent quality signals for orchestrators, exposed by the board GET. */
+export type BoardAgentStats = Record<
+  string,
+  { claimed: number; inReview: number; completed: number; rejected: number }
+>;
+
 export interface BoardStore {
   tasks: SwarmTask[];
   proposals: TaskProposal[];

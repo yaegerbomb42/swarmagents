@@ -43,16 +43,8 @@ import {
 } from "./RichArtifactPreview";
 import { formatPlanSummary } from "../../../lib/run-plan";
 
-// Re-export the magic-byte guard so callers/tests can import it from here too.
-export {
-  isPdfBytes,
-  hasPdfMagicBytes,
-  isPdfMagicBytes,
-  pdfMagicBytesOk,
-  checkPdfMagicBytes,
-  looksLikePdf,
-  isPdf,
-} from "./RichArtifactPreview";
+// Re-exported so the preview tests can import the guard from here.
+export { isPdfBytes } from "./RichArtifactPreview";
 
 const POLL_MS = 2000;
 const MAX_POLLS = 10;

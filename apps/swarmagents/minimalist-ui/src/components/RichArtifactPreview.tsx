@@ -245,11 +245,3 @@ export function isPdfBytes(bytes: ArrayBuffer | ArrayBufferView): boolean {
   );
 }
 
-// Aliases kept for compatibility with callers/tests that name the guard
-// differently.
-export const hasPdfMagicBytes = isPdfBytes;
-export const isPdfMagicBytes = isPdfBytes;
-export const pdfMagicBytesOk = isPdfBytes;
-export const checkPdfMagicBytes = isPdfBytes;
-export const looksLikePdf = isPdfBytes;
-export const isPdf = isPdfBytes;

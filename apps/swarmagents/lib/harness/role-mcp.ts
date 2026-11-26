@@ -24,6 +24,7 @@ import type { RoleDefinition } from "../roles";
 import {
   BUILTIN_ROLES,
   BUILTIN_ROLE_IDS,
+  DEFAULT_ROLE_ID,
   DESKTOP_ROLE_MCP_SERVERS,
   LONG_RUNNING_WORK_TAIL,
   ROLE_SCHEMA,
@@ -98,6 +99,28 @@ export const ROLE_CATALOG_PATH = "/workspace/.swarm/role-catalog.json";
 
 /** Cap on role switches inside one run (guards against an infinite switch loop). */
 export const MAX_ROLE_PHASES = 8;
+
+/**
+ * A1's default operating guidance, appended to the A1 role prompt on every run.
+ *
+ * A1 is the generalist default, so these instructions have to be crisp and
+ * stable: identify as A1, pick the cheapest tool that can actually do the job
+ * (shell/file tools vs playwright-mcp vs computer-mcp), inspect the desktop
+ * without burning a vision turn when possible, and verify the deliverable
+ * before finishing. Kept here rather than in the role catalog so a fresh
+ * clone, an older saved role and a resumed session all get the same guidance
+ * without a migration.
+ */
+export const A1_OPERATING_GUIDANCE =
+  "You are A1, the default SwarmAgents agent. Identify yourself as A1 when asked who you are. " +
+  "Choose the cheapest tool that can actually do the job: use Bash and the file tools for code, files, commands " +
+  "and system work; use playwright-mcp to drive web pages (navigate, click, type, read the page); use computer-mcp " +
+  "for desktop apps and anything that is not a web page. On the desktop, call describe_screen first to read window " +
+  "bounds and OCR text coordinates without a vision round-trip; take a screenshot only when you need to judge pixels " +
+  "(layout, colors, images, canvas) or the user explicitly asked for one. Before you finish, verify the deliverable: " +
+  "confirm the requested file or artifact exists and works (open it, run it, or re-read it), run the real " +
+  "tests/build/lint for code you changed, and look at the screen after a UI change. Say what you verified and how; " +
+  "if something could not be verified, say so plainly. Never claim verification you did not perform.";
 
 /** Path (inside the VM) of the desktop computer-use MCP server source. */
 export const COMPUTER_MCP_SERVER_PATH = "/opt/swarm/computer-mcp/server.mjs";
@@ -508,7 +531,10 @@ export function rolePhase(
   // The long-running-work tail rides with every role's instructions (built-in
   // and custom alike) so the agent always runs user-visible work in the
   // foreground; a role without instructions still gets the tail on its own.
-  const appendSystemPrompt = [role.instructions, LONG_RUNNING_WORK_TAIL, SELF_MANAGE_TAIL]
+  // A1 also gets its default operating guidance (identity, tool choice,
+  // describe_screen vs screenshot, deliverable verification) on every run.
+  const a1Guidance = role.id === DEFAULT_ROLE_ID ? A1_OPERATING_GUIDANCE : "";
+  const appendSystemPrompt = [role.instructions, a1Guidance, LONG_RUNNING_WORK_TAIL, SELF_MANAGE_TAIL]
     .filter((part) => part.trim().length > 0)
     .join("\n\n");
   const toolsDisabled = opts.tools === false;

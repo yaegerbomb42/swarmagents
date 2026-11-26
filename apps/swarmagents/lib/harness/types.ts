@@ -74,6 +74,14 @@ export type TelemetryEvent =
     }
   | { type: "run.error"; message: string; exitCode?: number; sessionId?: string }
   /**
+   * Emitted just before `run.finished` when the run changed files but never
+   * ran a real verification (tests/build/lint, re-read the changed file, or
+   * inspected the resulting UI). Advisory only: the run still finishes, but
+   * the user sees that the deliverable check was skipped instead of trusting
+   * an unverified "done". `files` names the changed paths (redacted, capped).
+   */
+  | { type: "run.deliverableCheck"; ok: boolean; message: string; files?: string[] }
+  /**
    * Emitted when a tool call classifies as "ask": the run pauses until the
    * user resolves the approval (POST /api/runtime/approvals/{id}).
    */

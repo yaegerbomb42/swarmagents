@@ -435,6 +435,16 @@ export function buildConversation(items: readonly RunStreamItem[]): Conversation
         });
         break;
       }
+      case "run.deliverableCheck": {
+        entries.push({
+          kind: "status",
+          key: `deliverable:${item.seq}`,
+          ts: item.ts,
+          text: short(asString(data.message) ?? "Deliverable not verified", 240),
+          tone: "info",
+        });
+        break;
+      }
       case "run.cancelled": {
         settleRunningTools(toolByKey, "error");
         entries.push({ kind: "status", key: `cancelled:${item.seq}`, ts: item.ts, text: "Run stopped", tone: "info" });

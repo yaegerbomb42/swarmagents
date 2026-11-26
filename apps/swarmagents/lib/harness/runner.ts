@@ -378,6 +378,13 @@ export class ClaudeCodeRunner {
     const { argv, packer, l1 } = this.buildArgv(request);
     /** Files this L1 turn edited (Edit/Write/NotebookEdit file paths). */
     const editedFiles = new Set<string>();
+    /**
+     * Files this invocation wrote/edited, tracked for every run (not only L1)
+     * so the deliverable check can tell whether a "done" needs verification.
+     */
+    const changedFiles = new Set<string>();
+    /** True once a real verification ran after the most recent file change. */
+    let verifiedSinceChange = false;
     /** Final `result` text of the stream, for the ledger step summary. */
     let lastResultText: string | undefined;
     // System-1 is entirely inert when disabled: no hooks object, no await,
@@ -560,6 +567,12 @@ export class ClaudeCodeRunner {
     const emitFinished = (): RunOutcome => {
       emitResultUsage();
       const reason = finalReasonFor(finalMeta?.subtype);
+      // Lightweight deliverable gate: a run that changed files but never ran a
+      // real check gets an explicit reminder on the stream before it finishes.
+      // Advisory only — the run still finishes; the user just sees that the
+      // deliverable was not verified instead of trusting an unverified "done".
+      const check = assessDeliverableCheck([...changedFiles], verifiedSinceChange);
+      if (check) emit({ type: "run.deliverableCheck", ...check });
       emit({
         type: "run.finished",
         exitCode: 0,
@@ -634,19 +647,22 @@ export class ClaudeCodeRunner {
                 id: toolId,
               });
 
+              // Track file mutations for the deliverable check (every run) and
+              // for the L1 packer's working set. A later real verification
+              // (tests/build/lint, re-reading the file, inspecting the UI)
+              // clears the reminder; any new edit re-arms it.
+              const mutatedPath = mutationFilePath(name, input);
+              if (mutatedPath) {
+                changedFiles.add(mutatedPath);
+                verifiedSinceChange = false;
+              } else if (changedFiles.size > 0 && isVerificationToolCall(name, input)) {
+                verifiedSinceChange = true;
+              }
+
               // L1 packer: remember which files this turn edited so the
               // caller can feed their contents back as the next turn's
-              // working set / skeleton. Only Edit, Write and NotebookEdit
-              // carry a file path; Bash edits are not tracked.
-              if (l1 && isObject(input)) {
-                const filePath =
-                  (name === "Edit" || name === "Write") && typeof input.file_path === "string"
-                    ? input.file_path
-                    : name === "NotebookEdit" && typeof input.notebook_path === "string"
-                      ? input.notebook_path
-                      : undefined;
-                if (filePath) editedFiles.add(filePath);
-              }
+              // working set / skeleton.
+              if (l1 && mutatedPath) editedFiles.add(mutatedPath);
 
               // A Bash call that backgrounds its work will not stream output
               // into the terminal, and the run may end before the work
@@ -1501,6 +1517,71 @@ export function isBackgroundedCommand(command: string): boolean {
   if (typeof command !== "string" || command.trim() === "") return false;
   const unquoted = stripQuotedSegments(command);
   return BACKGROUND_PATTERNS.some((pattern) => pattern.test(unquoted));
+}
+
+/**
+ * The file a mutating tool call writes or edits, or null. Only Edit, Write and
+ * NotebookEdit carry a file path; Bash edits are deliberately not tracked
+ * (they cannot be attributed to one deliverable reliably).
+ */
+export function mutationFilePath(name: string, input: unknown): string | null {
+  if (!isObject(input)) return null;
+  if (name === "Edit" || name === "Write") {
+    return typeof input.file_path === "string" ? input.file_path : null;
+  }
+  if (name === "NotebookEdit") {
+    return typeof input.notebook_path === "string" ? input.notebook_path : null;
+  }
+  return null;
+}
+
+/** Commands that count as actually verifying code: test/build/lint/typecheck. */
+const VERIFICATION_COMMAND_RE =
+  /(?:^|[\s;&|])(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|tests|build|lint|typecheck|check|verify)\b|\b(?:pytest|vitest|jest|mocha|tsc|playwright|cypress)\b|\b(?:go|cargo|make)\s+(?:test|build|check|vet)\b|\bnode\s+\S*(?:verify|check)\S*/i;
+
+/** Desktop/browser tools that inspect the rendered result of a UI change. */
+const VERIFICATION_TOOL_NAMES = new Set([
+  "describe_screen",
+  "screenshot",
+  "browser_snapshot",
+  "browser_take_screenshot",
+]);
+
+/**
+ * Does a tool call actually verify the work? Re-reading a file, running the
+ * real tests/build/lint, or inspecting the desktop/browser output all count;
+ * `echo`, `ls` and `cat` do not. Heuristic for the deliverable reminder, not a
+ * security gate.
+ */
+export function isVerificationToolCall(name: string, input: unknown): boolean {
+  if (name === "Read") return true;
+  const parts = name.split("__");
+  const tool = parts[parts.length - 1];
+  if (VERIFICATION_TOOL_NAMES.has(tool)) return true;
+  if (name === "Bash" && isObject(input) && typeof input.command === "string") {
+    return VERIFICATION_COMMAND_RE.test(input.command);
+  }
+  return false;
+}
+
+/**
+ * The reminder emitted just before run.finished when files changed and no
+ * verification ran afterwards. Returns null when the check passed (or nothing
+ * changed), so a verified run finishes exactly as before.
+ */
+export function assessDeliverableCheck(
+  changedFiles: readonly string[],
+  verifiedSinceChange: boolean,
+): { ok: boolean; message: string; files?: string[] } | null {
+  if (changedFiles.length === 0 || verifiedSinceChange) return null;
+  const files = changedFiles.slice(0, 10);
+  return {
+    ok: false,
+    message:
+      "Files changed but no verification ran afterwards. Run the real tests/build/lint, re-read or open the " +
+      "deliverable, and say what you verified before calling this done.",
+    ...(files.length > 0 ? { files } : {}),
+  };
 }
 
 const BACKGROUND_PATTERNS: readonly RegExp[] = [

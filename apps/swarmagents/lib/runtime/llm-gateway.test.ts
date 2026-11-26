@@ -660,3 +660,59 @@ test("streaming forward: mid-stream failure (Anthropic passthrough) records the 
   assert.equal(d.attempt, 1);
   assert.equal(d.errorKind, "network");
 });
+
+test("forwardLlmNonStreaming: strips image blocks when routed model lacks vision", async () => {
+  const bus = memoryBus();
+  let capturedBody: Record<string, unknown> | undefined;
+  const { fetchImpl } = stubFetch([
+    {
+      prefix: "https://groq.example",
+      respond: (init) => {
+        capturedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        return new Response(
+          JSON.stringify({
+            id: "chatcmpl_1",
+            model: "llama-3.3-70b-versatile",
+            choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 10, completion_tokens: 2 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    },
+  ]);
+
+  const res = await forwardLlmNonStreaming({
+    owner: owner(),
+    runId: "run-nonvision-airlock",
+    bus: bus as unknown as TelemetryBus,
+    providers: [
+      provider({
+        id: "groq",
+        kind: "openai",
+        baseUrl: "https://groq.example",
+        models: { balanced: "llama-3.3-70b-versatile" },
+      }),
+    ],
+    body: {
+      model: "claude-sonnet-4-5",
+      max_tokens: 128,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+          ],
+        },
+      ],
+    },
+    fetchImpl: fetchImpl as unknown as typeof fetch,
+  });
+
+  assert.equal(res.attempts.length, 1);
+  assert.equal(res.attempts[0]?.provider, "groq");
+  const sentMessages = (capturedBody?.messages ?? []) as { role: string; content: unknown }[];
+  assert.equal(typeof sentMessages[0].content, "string");
+  assert.match(sentMessages[0].content as string, /\[image omitted: this model has no vision\]/);
+});

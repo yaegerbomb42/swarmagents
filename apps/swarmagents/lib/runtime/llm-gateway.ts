@@ -76,7 +76,9 @@ import {
   estimateInputTokens,
   openAIToAnthropicResponse,
   OpenAIStreamTranslator,
+  stripAnthropicImages,
   type AnthropicSseEvent,
+  type BridgeOptions,
 } from "../providers/anthropic-bridge";
 import {
   anthropicToGemini,
@@ -1169,7 +1171,7 @@ function providerPayload(
   const style: ApiStyle = apiStyleFor(config);
   switch (style) {
     case "anthropic":
-      return body;
+      return mergedModelCapabilities(config, model).vision ? body : stripAnthropicImages(body);
     case "openai-responses":
       return anthropicToResponses(body, model, bridgeOptionsFor(config, model), perplexityEffortFor(config));
     case "ollama":
@@ -1183,13 +1185,12 @@ function providerPayload(
 
 /**
  * Bridge translation limits for a (provider, model): clamp Anthropic
- * max_tokens to the model's known output cap (preset or user override via
- * modelCapabilities) so an oversized request is never rejected upstream.
- * Unknown cap = no clamp. Anthropic-wire providers bypass the bridge and
- * enforce their own limits natively.
+ * max_tokens to the model's known output cap and pass vision capability
+ * so non-vision models get text placeholders instead of raw image blocks.
  */
-function bridgeOptionsFor(config: ProviderConfig, model: string): { maxOutputTokens?: number } {
-  return { maxOutputTokens: mergedModelCapabilities(config, model).maxOutputTokens };
+function bridgeOptionsFor(config: ProviderConfig, model: string): BridgeOptions {
+  const caps = mergedModelCapabilities(config, model);
+  return { maxOutputTokens: caps.maxOutputTokens, vision: caps.vision };
 }
 
 /** Translate a provider's non-streaming body back to Anthropic Messages. */

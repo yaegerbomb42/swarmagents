@@ -40,6 +40,66 @@ export interface BridgeOptions {
    * non-finite = no clamp; the request value passes through unchanged.
    */
   maxOutputTokens?: number;
+  /**
+   * Whether the target model supports vision/image inputs. When explicitly
+   * `false`, raw image blocks (in user messages or tool_result payloads) are
+   * replaced with structured text placeholders before wire translation so
+   * text-only upstreams never reject the turn with HTTP 400.
+   */
+  vision?: boolean;
+}
+
+function imagePlaceholderText(block: Record<string, unknown>): string {
+  const source = isRecord(block.source) ? block.source : {};
+  const sourceType = asString(source.type) ?? "unknown";
+  if (sourceType === "base64") {
+    const mediaType = asString(source.media_type) ?? "image/png";
+    const data = asString(source.data) ?? "";
+    const approxBytes = Math.floor((data.length * 3) / 4);
+    return `[image omitted: model lacks vision; mediaType=${mediaType}; bytes=${approxBytes}]`;
+  }
+  if (sourceType === "url") {
+    return "[image omitted: model lacks vision; source=url]";
+  }
+  return `[image omitted: model lacks vision; source=${sourceType}]`;
+}
+
+function stripImagesFromBlocks(blocks: unknown[]): { blocks: unknown[]; changed: boolean } {
+  let changed = false;
+  const next = blocks.map((rawBlock) => {
+    if (!isRecord(rawBlock)) return rawBlock;
+    if (rawBlock.type === "image") {
+      changed = true;
+      return { type: "text", text: imagePlaceholderText(rawBlock) };
+    }
+    if (rawBlock.type === "tool_result" && Array.isArray(rawBlock.content)) {
+      const inner = stripImagesFromBlocks(rawBlock.content);
+      if (inner.changed) {
+        changed = true;
+        return { ...rawBlock, content: inner.blocks };
+      }
+    }
+    return rawBlock;
+  });
+  return changed ? { blocks: next, changed: true } : { blocks, changed: false };
+}
+
+/**
+ * Replace Anthropic `image` content blocks (including nested `tool_result`
+ * images) with structured text placeholders for non-vision models.
+ * Pure and non-mutating: returns `body` unchanged when no images are present.
+ */
+export function stripAnthropicImages(body: unknown): unknown {
+  if (!isRecord(body) || !Array.isArray(body.messages)) return body;
+  let changed = false;
+  const messages = body.messages.map((rawMsg) => {
+    if (!isRecord(rawMsg) || !Array.isArray(rawMsg.content)) return rawMsg;
+    const stripped = stripImagesFromBlocks(rawMsg.content);
+    if (!stripped.changed) return rawMsg;
+    changed = true;
+    return { ...rawMsg, content: stripped.blocks };
+  });
+  return changed ? { ...body, messages } : body;
 }
 
 /**
@@ -242,7 +302,8 @@ export function anthropicToOpenAI(
   targetModel: string,
   options: BridgeOptions = {},
 ): Record<string, unknown> {
-  const root = isRecord(body) ? body : {};
+  const normalized = options.vision === false ? stripAnthropicImages(body) : body;
+  const root = isRecord(normalized) ? normalized : {};
   const rawMessages = root.messages;
   if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
     throw new BridgeValidationError("messages must be a non-empty array.");

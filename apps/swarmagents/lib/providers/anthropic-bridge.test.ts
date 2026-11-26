@@ -587,3 +587,54 @@ test("anthropicToOpenAI: max_tokens clamps to the model's output cap", () => {
   });
   assert.equal("max_tokens" in noMax, false);
 });
+
+test("anthropicToOpenAI: vision=false replaces user and tool_result images with text placeholders", () => {
+  const b64 = "iVBORw0KGgo=";
+  const body = {
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Look at this:" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: b64 } },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call_1", name: "screenshot", input: {} }],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_1",
+            content: [
+              { type: "text", text: "Captured." },
+              { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  // Default / vision=true preserves image_url parts.
+  const withVision = anthropicToOpenAI(body, TARGET_MODEL) as {
+    messages: { role: string; content: unknown }[];
+  };
+  assert.ok(Array.isArray(withVision.messages[0].content));
+  assert.equal((withVision.messages[0].content as { type: string }[])[1].type, "image_url");
+
+  // vision=false strips both user images and tool_result images into text placeholders.
+  const withoutVision = anthropicToOpenAI(body, TARGET_MODEL, { vision: false }) as {
+    messages: { role: string; content: unknown }[];
+  };
+  assert.equal(typeof withoutVision.messages[0].content, "string");
+  assert.match(withoutVision.messages[0].content as string, /\[image omitted: model lacks vision; mediaType=image\/png; bytes=9\]/);
+  assert.equal(typeof withoutVision.messages[2].content, "string");
+  assert.match(withoutVision.messages[2].content as string, /Captured\./);
+  assert.match(withoutVision.messages[2].content as string, /mediaType=image\/jpeg/);
+  // Original input body was not mutated.
+  assert.equal((body.messages[0].content[1] as { type: string }).type, "image");
+});

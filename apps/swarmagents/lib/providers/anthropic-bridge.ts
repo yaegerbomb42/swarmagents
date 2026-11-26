@@ -47,6 +47,17 @@ export interface BridgeOptions {
    * text-only upstreams never reject the turn with HTTP 400.
    */
   vision?: boolean;
+  /**
+   * When true, Anthropic `thinking` blocks in assistant messages are
+   * translated to the OpenAI `reasoning_content` field on the assistant
+   * message instead of being dropped, so the model's reasoning survives
+   * across multi-turn tool loops. Only set for providers known to accept
+   * the field (DeepSeek, Qwen, Grok, GLM, Moonshot, and Ollama, whose
+   * shim maps it onto the native `thinking` field). Every other provider
+   * gets the blocks stripped, so a strict upstream never sees an unknown
+   * field. Default: strip.
+   */
+  reasoningContent?: boolean;
 }
 
 function imagePlaceholderText(block: Record<string, unknown>): string {
@@ -89,6 +100,37 @@ function stripImagesFromBlocks(blocks: unknown[]): { blocks: unknown[]; changed:
  * images) with structured text placeholders for non-vision models.
  * Pure and non-mutating: returns `body` unchanged when no images are present.
  */
+/**
+ * Drop `thinking` blocks that carry no `signature` from assistant messages.
+ * The bridge synthesizes thinking blocks from other providers'
+ * reasoning_content without a signature; Claude Code echoes them back, and
+ * the real Anthropic API rejects unsigned thinking with HTTP 400 ("Invalid
+ * signature in thinking block") after a failover onto an Anthropic-wire
+ * provider. Signed blocks (genuine Anthropic thinking) and
+ * redacted_thinking are kept. Pure; returns `body` unchanged when nothing is
+ * dropped. An assistant message left empty gets an empty text block so the
+ * user/assistant alternation stays valid.
+ */
+export function stripUnsignedThinking(body: unknown): unknown {
+  if (!isRecord(body) || !Array.isArray(body.messages)) return body;
+  let changed = false;
+  const messages = body.messages.map((rawMsg) => {
+    if (!isRecord(rawMsg) || rawMsg.role !== "assistant" || !Array.isArray(rawMsg.content)) return rawMsg;
+    const kept = rawMsg.content.filter(
+      (b) =>
+        !(
+          isRecord(b) &&
+          b.type === "thinking" &&
+          (typeof b.signature !== "string" || b.signature.length === 0)
+        ),
+    );
+    if (kept.length === rawMsg.content.length) return rawMsg;
+    changed = true;
+    return { ...rawMsg, content: kept.length > 0 ? kept : [{ type: "text", text: "" }] };
+  });
+  return changed ? { ...body, messages } : body;
+}
+
 export function stripAnthropicImages(body: unknown): unknown {
   if (!isRecord(body) || !Array.isArray(body.messages)) return body;
   let changed = false;
@@ -546,12 +588,47 @@ function anthropicToolChoiceToOpenAI(toolChoice: unknown): {
   }
 }
 
-/** Anthropic assistant message -> OpenAI assistant message (with tool_calls). */
-function anthropicAssistantMessage(message: Record<string, unknown>): Record<string, unknown> {
+/** Concatenated text of Anthropic `thinking` blocks in an assistant message.
+ * `redacted_thinking` blocks are opaque (encrypted reasoning) and are never
+ * carried: there is no text to preserve and no provider could use them. */
+function thinkingText(blocks: unknown[]): string {
+  let out = "";
+  for (const block of blocks) {
+    const b = isRecord(block) ? block : {};
+    if (b.type === "thinking" && typeof b.thinking === "string") out += b.thinking;
+  }
+  return out;
+}
+
+/** Index of the last user message that carries more than tool results (-1 if none). */
+function lastRealUserIndex(messages: unknown[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = isRecord(messages[i]) ? (messages[i] as Record<string, unknown>) : {};
+    if ((asString(m.role) ?? "user") !== "user") continue;
+    const content = m.content;
+    if (!Array.isArray(content)) return i;
+    if (content.some((b) => !(isRecord(b) && (b as Record<string, unknown>).type === "tool_result"))) return i;
+  }
+  return -1;
+}
+
+/** Anthropic assistant message -> OpenAI assistant message (with tool_calls).
+ * Returns null when the message reduces to nothing downstream (a
+ * thinking-only message with no text and no tool calls): emitting a bare
+ * `{role:"assistant"}` would be rejected by strict upstreams, and dropping
+ * it is safe because no tool message depends on it. */
+function anthropicAssistantMessage(
+  message: Record<string, unknown>,
+  options: BridgeOptions,
+): Record<string, unknown> | null {
   const content = message.content;
   const blocks = Array.isArray(content) ? content : [];
   const texts = blocks.filter((b) => isRecord(b) && (b as Record<string, unknown>).type === "text");
   const toolUses = blocks.filter((b) => isRecord(b) && (b as Record<string, unknown>).type === "tool_use");
+
+  if (texts.length === 0 && toolUses.length === 0 && !(typeof content === "string" && content.length > 0)) {
+    return null;
+  }
 
   const out: Record<string, unknown> = { role: "assistant" };
   if (texts.length > 0) {
@@ -559,6 +636,17 @@ function anthropicAssistantMessage(message: Record<string, unknown>): Record<str
     out.content = parts.length === 1 ? parts[0].text : parts;
   } else if (typeof content === "string" && content.length > 0) {
     out.content = content;
+  }
+
+  // `cache_control` markers on content blocks are Anthropic-only prompt
+  // caching hints: they are never copied onto the OpenAI message, so a
+  // provider that errors on unknown fields never sees them. Likewise the
+  // top-level `thinking` request parameter is dropped (see anthropicToOpenAI).
+  // The thinking *blocks* are translated only when the target is known to
+  // accept `reasoning_content`; otherwise they are stripped with them.
+  if (options.reasoningContent === true) {
+    const thinking = thinkingText(blocks);
+    if (thinking.length > 0) out.reasoning_content = thinking;
   }
 
   if (toolUses.length > 0) {
@@ -585,6 +673,15 @@ function anthropicAssistantMessage(message: Record<string, unknown>): Record<str
 /**
  * Translate an Anthropic Messages request into an OpenAI Chat Completions
  * request for `targetModel` (the provider's own model id).
+ *
+ * Anthropic-only request fields are stripped, never forwarded: `cache_control`
+ * markers on system/content blocks and the top-level `thinking` parameter
+ * (extended-thinking budget) have no OpenAI equivalent and would make
+ * strict upstreams reject the request. `thinking` content blocks are
+ * translated to `reasoning_content` only when
+ * `options.reasoningContent` is true (see BridgeOptions); otherwise they
+ * are stripped too, and a thinking-only assistant message is dropped
+ * entirely rather than emitted as an empty assistant message.
  */
 export function anthropicToOpenAI(
   body: unknown,
@@ -605,7 +702,15 @@ export function anthropicToOpenAI(
     messages.push({ role: "system", content: openaiUserContent(system) });
   }
 
-  for (const raw of rawMessages) {
+  // Reasoning is only carried back for the CURRENT agentic turn: the
+  // assistant messages after the last real user message (one that is not just
+  // tool results). DeepSeek thinking mode needs reasoning_content echoed back
+  // inside a tool-call loop but rejects or ignores it from earlier turns, and
+  // older turns' chain-of-thought is wasted input on every provider.
+  const turnStart = lastRealUserIndex(rawMessages);
+  const pastTurnOptions: BridgeOptions = { ...options, reasoningContent: false };
+
+  for (const [i, raw] of rawMessages.entries()) {
     const message = isRecord(raw) ? raw : {};
     const role = asString(message.role) ?? "user";
     if (role === "user") {
@@ -643,7 +748,11 @@ export function anthropicToOpenAI(
         messages.push({ role: "user", content: openaiUserContent(content) });
       }
     } else if (role === "assistant") {
-      messages.push(anthropicAssistantMessage(message));
+      // A thinking-only assistant message returns null and is dropped (see
+      // anthropicAssistantMessage); everything else keeps its place so
+      // tool_result ordering stays valid.
+      const translated = anthropicAssistantMessage(message, i > turnStart ? options : pastTurnOptions);
+      if (translated !== null) messages.push(translated);
     } else {
       messages.push({ role, content: message.content ?? "" });
     }
@@ -752,6 +861,15 @@ export function openAIToAnthropicResponse(
       const url = isRecord(p.image_url) ? asString(p.image_url.url) : undefined;
       if (url !== undefined) content.push({ type: "text", text: url });
     }
+  }
+  // Reasoning models report their chain-of-thought as `reasoning_content`
+  // (DeepSeek, Qwen, Grok, GLM, Moonshot) or `reasoning` (some gateways).
+  // Map it back to an Anthropic `thinking` block ahead of the text so
+  // Claude Code sees the reasoning and can send it back on the next turn,
+  // closing the multi-turn tool loop. Absent or empty = no block.
+  const reasoning = asString(message.reasoning_content) ?? asString(message.reasoning);
+  if (reasoning !== undefined && reasoning.length > 0) {
+    content.unshift({ type: "thinking", thinking: reasoning });
   }
   for (const block of openaiToolCallsToBlocks(message.tool_calls, declaredToolNames)) {
     content.push(block);
@@ -864,6 +982,10 @@ export class OpenAIStreamTranslator {
   private readonly toolIdIndex = new Map<string, number>();
   /** -1 is reserved for entirely anonymous deltas; real indices are >= 0. */
   private nextSyntheticToolIndex = -2;
+  /** Anthropic content-block index of the thinking block, once opened. */
+  private thinkingIndex = -1;
+  /** True once the thinking block's content_block_stop has been emitted. */
+  private thinkingClosed = false;
   /** Input/cache totals from upstream usage chunks; undefined until seen. */
   private inputTokens?: number;
   private cacheReadTokens?: number;
@@ -947,8 +1069,48 @@ export class OpenAIStreamTranslator {
     const first = choices.find((choice) => asNumber(choice.index) === 0) ?? choices[0] ?? {};
     const delta = isRecord(first.delta) ? first.delta : {};
 
+    // Reasoning models stream their chain-of-thought as `reasoning_content`
+    // (DeepSeek, Qwen, Grok, GLM, Moonshot) or `reasoning` (some gateways).
+    // Map it to an Anthropic `thinking` block with `thinking_delta` events
+    // so Claude Code sees the reasoning. Anthropic requires thinking blocks
+    // to precede every other content block: reasoning that arrives after
+    // the text (or a tool) block started cannot be emitted as thinking and is
+    // dropped.
+    const reasoning = asString(delta.reasoning_content) ?? asString(delta.reasoning);
+    if (
+      reasoning !== undefined &&
+      reasoning.length > 0 &&
+      this.textIndex === -1 &&
+      !this.thinkingClosed &&
+      this.toolBlocks.size === 0
+    ) {
+      if (this.thinkingIndex === -1) {
+        this.blockIndex += 1;
+        this.thinkingIndex = this.blockIndex;
+        lines.push({
+          event: "content_block_start",
+          data: JSON.stringify({
+            type: "content_block_start",
+            index: this.thinkingIndex,
+            content_block: { type: "thinking", thinking: "" },
+          }),
+        });
+      }
+      lines.push({
+        event: "content_block_delta",
+        data: JSON.stringify({
+          type: "content_block_delta",
+          index: this.thinkingIndex,
+          delta: { type: "thinking_delta", thinking: reasoning },
+        }),
+      });
+    }
+
     const text = asString(delta.content);
     if (text !== undefined && text.length > 0) {
+      // A thinking block must be closed before the text block starts:
+      // Anthropic content blocks are sequential.
+      this.closeThinking(lines);
       if (this.textIndex === -1) {
         this.blockIndex += 1;
         this.textIndex = this.blockIndex;
@@ -997,8 +1159,10 @@ export class OpenAIStreamTranslator {
 
       let block = this.toolBlocks.get(oaiIndex);
       if (!block) {
-        // Close any open text block before starting a tool block: Anthropic
-        // content blocks are sequential, text then tool_use.
+        // Close any open thinking/text block before starting a tool block:
+        // Anthropic content blocks are sequential, thinking then text then
+        // tool_use.
+        this.closeThinking(lines);
         if (this.textIndex !== -1) {
           lines.push({
             event: "content_block_stop",
@@ -1059,8 +1223,21 @@ export class OpenAIStreamTranslator {
     return this.finalize();
   }
 
+  /** Emit content_block_stop for the thinking block if it is still open. */
+  private closeThinking(lines: AnthropicSseEvent[]): void {
+    if (this.thinkingIndex !== -1 && !this.thinkingClosed) {
+      this.thinkingClosed = true;
+      lines.push({
+        event: "content_block_stop",
+        data: JSON.stringify({ type: "content_block_stop", index: this.thinkingIndex }),
+      });
+    }
+  }
+
   private finalize(): AnthropicSseEvent[] {
     const lines: AnthropicSseEvent[] = [];
+    // Close blocks in content order: thinking first, then text, then tools.
+    this.closeThinking(lines);
     if (this.textIndex !== -1) {
       lines.push({
         event: "content_block_stop",

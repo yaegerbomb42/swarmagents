@@ -49,6 +49,7 @@ import {
   authHeadersFor,
   modelForTier,
   perplexityEffortFor,
+  reasoningContentFor,
   requestUrl,
 } from "../providers/adapters";
 import { mergedModelCapabilities } from "../providers/capabilities";
@@ -77,6 +78,7 @@ import {
   openAIToAnthropicResponse,
   OpenAIStreamTranslator,
   stripAnthropicImages,
+  stripUnsignedThinking,
   type AnthropicSseEvent,
   type BridgeOptions,
 } from "../providers/anthropic-bridge";
@@ -1216,8 +1218,12 @@ function providerPayload(
 ): unknown {
   const style: ApiStyle = apiStyleFor(config);
   switch (style) {
-    case "anthropic":
-      return mergedModelCapabilities(config, model).vision ? body : stripAnthropicImages(body);
+    case "anthropic": {
+      // Unsigned thinking blocks were synthesized by the bridge from another
+      // provider's reasoning; the real Anthropic API rejects them (400).
+      const signedOnly = stripUnsignedThinking(body);
+      return mergedModelCapabilities(config, model).vision ? signedOnly : stripAnthropicImages(signedOnly);
+    }
     case "openai-responses":
       return anthropicToResponses(body, model, bridgeOptionsFor(config, model), perplexityEffortFor(config));
     case "ollama":
@@ -1233,10 +1239,17 @@ function providerPayload(
  * Bridge translation limits for a (provider, model): clamp Anthropic
  * max_tokens to the model's known output cap and pass vision capability
  * so non-vision models get text placeholders instead of raw image blocks.
+ * `reasoningContent` is set for providers whose wire format preserves
+ * reasoning (see reasoningContentFor), so thinking blocks survive multi-turn
+ * tool loops there and are stripped everywhere else.
  */
 function bridgeOptionsFor(config: ProviderConfig, model: string): BridgeOptions {
   const caps = mergedModelCapabilities(config, model);
-  return { maxOutputTokens: caps.maxOutputTokens, vision: caps.vision };
+  return {
+    maxOutputTokens: caps.maxOutputTokens,
+    vision: caps.vision,
+    reasoningContent: reasoningContentFor(config),
+  };
 }
 
 /**

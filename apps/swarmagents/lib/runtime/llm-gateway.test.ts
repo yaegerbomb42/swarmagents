@@ -788,6 +788,61 @@ test("forwardLlmNonStreaming: an unknown/future Claude on the Anthropic wire kee
   assert.equal(sent[0].content[1]?.type, "image", "the screenshot reaches the model");
 });
 
+test("failover onto the Anthropic wire drops unsigned (bridged) thinking blocks, keeps signed ones", async () => {
+  const bus = memoryBus();
+  let capturedBody: Record<string, unknown> | undefined;
+  const { fetchImpl } = stubFetch([
+    {
+      prefix: "https://anthropic.example",
+      respond: (init) => {
+        capturedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        return new Response(
+          JSON.stringify({
+            id: "msg_2",
+            type: "message",
+            role: "assistant",
+            model: "claude-opus-5",
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 10, output_tokens: 2 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    },
+  ]);
+
+  await forwardLlmNonStreaming({
+    owner: owner(),
+    runId: "run-thinking-failover",
+    bus: bus as unknown as TelemetryBus,
+    providers: [
+      provider({ id: "anthropic", kind: "anthropic", baseUrl: "https://anthropic.example", models: { balanced: "claude-opus-5" } }),
+    ],
+    body: {
+      model: "claude-opus-5",
+      max_tokens: 128,
+      messages: [
+        { role: "user", content: "list files" },
+        {
+          role: "assistant",
+          content: [
+            // Synthesized by the bridge from DeepSeek reasoning_content: no signature.
+            { type: "thinking", thinking: "run ls" },
+            { type: "tool_use", id: "call_1", name: "Bash", input: { command: "ls" } },
+          ],
+        },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "a.ts" }] },
+      ],
+    },
+    fetchImpl: fetchImpl as unknown as typeof fetch,
+  });
+
+  const sent = (capturedBody?.messages ?? []) as { content: { type: string }[] | string }[];
+  const assistant = sent[1].content as { type: string }[];
+  assert.deepEqual(assistant.map((b) => b.type), ["tool_use"], "unsigned thinking never reaches Anthropic");
+});
+
 /** A fat tool result: 2,000 passing lines plus two failures and an exit code. */
 function fatToolResult(): string {
   const out: string[] = [];

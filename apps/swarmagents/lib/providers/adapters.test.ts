@@ -6,6 +6,7 @@ import {
   authHeadersFor,
   buildRequest,
   parseResponse,
+  reasoningContentFor,
   requestUrl,
 } from "./adapters";
 import { CacheAwarePromptBuilder } from "./cache-aware-prompt";
@@ -374,4 +375,18 @@ test("parseResponse reads prompt-cache usage fields per provider", () => {
     "requested",
   );
   assert.equal(gemini.usage.cachedInputTokens, 900);
+});
+
+test("reasoningContentFor enables reasoning preservation only where the wire supports it", () => {
+  // OpenAI-chat providers whose wire accepts reasoning_content.
+  for (const id of ["deepseek", "qwen", "xai", "moonshot", "zai"]) {
+    assert.equal(reasoningContentFor(base({ id })), true, id);
+  }
+  // Providers with no reasoning field: thinking blocks are stripped.
+  for (const id of ["openai", "anthropic", "mistral", "cohere", "perplexity", "custom"]) {
+    assert.equal(reasoningContentFor(base({ id })), false, id);
+  }
+  // Ollama carries prior reasoning in the native `thinking` field.
+  // (Ollama is an apiStyle, not a ProviderKind.)
+  assert.equal(reasoningContentFor(base({ id: "custom", apiStyle: "ollama" })), true);
 });

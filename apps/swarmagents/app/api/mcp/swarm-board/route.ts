@@ -22,6 +22,7 @@ import {
   handleSyncArtifact,
   handleListArtifacts,
   viewBoardTask,
+  computeAgentStats,
 } from "@/lib/board/handlers";
 
 import { JsonBodyError, readJsonBody } from "@/lib/http";
@@ -150,6 +151,7 @@ export async function GET(req: NextRequest) {
       artifacts: store.artifacts?.length ?? 0,
     },
     artifacts: store.artifacts ?? [],
+    agents: computeAgentStats(effectiveTasks),
     tasks,
     proposals: store.proposals.map((p) => ({
       ...p,

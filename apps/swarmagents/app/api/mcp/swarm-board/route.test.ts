@@ -152,6 +152,50 @@ test("POST poll_tasks still works when storage is healthy", async () => {
   }
 });
 
+test("GET exposes per-agent stats computed from task state and rejections", async () => {
+  const dir = tmpDir();
+  const dataFile = path.join(dir, "swarm_board.json");
+  seed(dataFile);
+  const raw = JSON.parse(fs.readFileSync(dataFile, "utf-8")) as { tasks: Array<Record<string, unknown>> };
+  raw.tasks.push(
+    {
+      id: "task_2",
+      title: "In review",
+      description: "D",
+      difficulty: "easy",
+      constraints: [],
+      status: "in_review",
+      claimedBy: "Worker-1",
+      rejections: ["Worker-1"],
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "task_3",
+      title: "Claimed again",
+      description: "D",
+      difficulty: "easy",
+      constraints: [],
+      status: "claimed",
+      claimedBy: "Worker-1",
+      createdAt: 1,
+      updatedAt: Date.now(),
+    },
+  );
+  fs.writeFileSync(dataFile, JSON.stringify(raw), "utf-8");
+  configureStorePaths(dir, dataFile);
+  try {
+    const res = await GET(request("/api/mcp/swarm-board"));
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      agents?: Record<string, { claimed?: number; inReview?: number; completed?: number; rejected?: number }>;
+    };
+    assert.deepEqual(body.agents?.["Worker-1"], { claimed: 1, inReview: 1, completed: 0, rejected: 1 });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("POST with a JSON null body is an Invalid Request (-32600), not a 500", async () => {
   const res = await POST(
     new NextRequest("http://localhost/api/mcp/swarm-board", {

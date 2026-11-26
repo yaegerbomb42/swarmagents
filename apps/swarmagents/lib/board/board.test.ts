@@ -13,6 +13,7 @@ import {
   handlePing,
   handleToolsList,
   assertTransition,
+  computeAgentStats,
 } from "./handlers";
 import type { BoardStore } from "./types";
 import type { SwarmTask, TaskProposal } from "@/lib/mcp-types";
@@ -819,4 +820,75 @@ test("submit_task_work accepts a docs/ branch end to end", async () => {
   const parsed = payload(result);
   assert.equal(parsed.task.status, "in_review");
   assert.equal(parsed.task.gitBranch, "docs/board-push-rule");
+});
+
+test("computeAgentStats counts live statuses and recorded rejections per agent", () => {
+  const store = emptyStore();
+  store.tasks.push(
+    makeTask({ id: "t1", status: "claimed", claimedBy: "agent-a" }),
+    makeTask({ id: "t2", status: "in_review", claimedBy: "agent-a" }),
+    makeTask({ id: "t3", status: "completed", claimedBy: "agent-a" }),
+    makeTask({ id: "t4", status: "claimed", claimedBy: "agent-b", rejections: ["agent-b", "agent-c"] }),
+    makeTask({ id: "t5", status: "open", rejections: ["agent-b"] }),
+  );
+  assert.deepEqual(computeAgentStats(store.tasks), {
+    "agent-a": { claimed: 1, inReview: 1, completed: 1, rejected: 0 },
+    "agent-b": { claimed: 1, inReview: 0, completed: 0, rejected: 2 },
+    "agent-c": { claimed: 0, inReview: 0, completed: 0, rejected: 1 },
+  });
+  // An empty board yields no buckets.
+  assert.deepEqual(computeAgentStats([]), {});
+});
+
+test("review_and_merge_task rejection records the worker in task.rejections", async () => {
+  const store = emptyStore();
+  store.tasks.push(makeTask({ status: "in_review", claimedBy: "agent-a" }));
+  const result = await handleReviewAndMergeTask(store, {
+    taskId: "t1",
+    approved: false,
+    feedback: "tests missing",
+    reviewer: "Muse",
+  });
+  assert.ok("result" in result);
+  const parsed = payload(result);
+  assert.deepEqual(parsed.task.rejections, ["agent-a"]);
+  assert.equal(store.tasks[0].rejections?.[0], "agent-a");
+
+  // A revised resubmission, then approval, does not record a rejection.
+  await handleSubmitTaskWork(store, {
+    taskId: "t1",
+    agentName: "agent-a",
+    gitBranch: "feat/board-agent-stats",
+    summary: "revised",
+  });
+  const approved = await handleReviewAndMergeTask(store, {
+    taskId: "t1",
+    approved: true,
+    feedback: "lgtm",
+  });
+  assert.ok("result" in approved);
+  assert.deepEqual(payload(approved).task.rejections, ["agent-a"]);
+  assert.deepEqual(store.tasks[0].rejections, ["agent-a"]);
+});
+
+test("review_and_merge_task stacks one rejections entry per rejected review", async () => {
+  const store = emptyStore();
+  store.tasks.push(makeTask({ status: "in_review", claimedBy: "agent-a" }));
+  for (const feedback of ["first", "second"]) {
+    const res = await handleReviewAndMergeTask(store, {
+      taskId: "t1",
+      approved: false,
+      feedback,
+    });
+    assert.ok("result" in res);
+    // Rejection renews the owner's claim, so the next round can be submitted
+    // and reviewed again without re-claiming.
+    await handleSubmitTaskWork(store, {
+      taskId: "t1",
+      agentName: "agent-a",
+      gitBranch: "feat/board-agent-stats",
+      summary: "revised",
+    });
+  }
+  assert.deepEqual(store.tasks[0].rejections, ["agent-a", "agent-a"]);
 });

@@ -30,6 +30,8 @@ export interface SwarmTask {
   reviewedBy?: string;
   /** Epoch ms of the last review_and_merge_task decision. */
   reviewedAt?: number;
+  /** Agent names whose submitted work was rejected (one entry per review_and_merge_task approved=false). */
+  rejections?: string[];
   /** Append-only status transition log for audit. Older tasks may omit it. */
   history?: TaskTransition[];
   createdAt: number;

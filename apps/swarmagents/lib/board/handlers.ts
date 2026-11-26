@@ -1,4 +1,4 @@
-import type { BoardStore } from "./types";
+import type { BoardAgentStats, BoardStore } from "./types";
 import type {
   SwarmTask,
   TaskProposal,
@@ -134,6 +134,25 @@ function clearAssignment(task: SwarmTask): SwarmTask {
 export function viewBoardTask(task: SwarmTask, now: number): SwarmTask {
   if (!isClaimExpired(task, now)) return task;
   return transitionTask(clearAssignment(task), "open", "swarm-board", claimExpiry(task));
+}
+
+/**
+ * Per-agent quality signals for orchestrators. Live statuses (claimed,
+ * inReview, completed) come from each task's current state; rejections are
+ * the agent names recorded on tasks by review_and_merge_task rejections.
+ */
+export function computeAgentStats(tasks: SwarmTask[]): BoardAgentStats {
+  const stats: BoardAgentStats = {};
+  const bucket = (name: string) => (stats[name] ??= { claimed: 0, inReview: 0, completed: 0, rejected: 0 });
+  for (const task of tasks) {
+    if (task.claimedBy) {
+      if (task.status === "claimed") bucket(task.claimedBy).claimed += 1;
+      else if (task.status === "in_review") bucket(task.claimedBy).inReview += 1;
+      else if (task.status === "completed") bucket(task.claimedBy).completed += 1;
+    }
+    for (const name of task.rejections ?? []) bucket(name).rejected += 1;
+  }
+  return stats;
 }
 
 /**
@@ -660,8 +679,11 @@ export async function handleReviewAndMergeTask(
     : task.claimedBy
       ? "claimed"
       : "open";
+  // Track who was rejected so orchestrators see per-agent quality signals.
+  const rejection = !args.approved && task.claimedBy ? { rejections: [...(task.rejections ?? []), task.claimedBy] } : null;
   const reviewed = transitionTask({
     ...(nextStatus === "open" ? clearAssignment(task) : task),
+    ...rejection,
     reviewedBy: reviewer,
     reviewedAt: now,
   }, nextStatus, reviewer, now);

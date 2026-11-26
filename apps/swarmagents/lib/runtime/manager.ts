@@ -4898,7 +4898,7 @@ export class RuntimeManager {
         if (active.openToolCalls === 0) this.maybeTurnCheckpoint(active);
       }
     }
-    if (event.type === "usage" && (active.openToolCalls ?? 0) === 0) {
+    if (event.type === "usage" && event.final !== true && (active.openToolCalls ?? 0) === 0) {
       // Text-only turn: the usage event closes the assistant message and no
       // tool is pending, so the turn is complete. (A usage event after a
       // tool call arrives while the call is still open and does not fire.)

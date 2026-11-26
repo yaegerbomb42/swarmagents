@@ -500,3 +500,17 @@ test("the index exports the full telemetry surface", () => {
     );
   }
 });
+
+test("the final usage top-up adds to run totals but is not a model turn", () => {
+  const events = [
+    event("run_f", "run.created", { data: { userId: "alice" } }, T0),
+    event("run_f", "usage", { inputTokens: 1000, outputTokens: 1 }, T0 + 10),
+    event("run_f", "usage", { inputTokens: 1500, outputTokens: 1 }, T0 + 20),
+    event("run_f", "usage", { inputTokens: 0, outputTokens: 400, final: true }, T0 + 30),
+  ];
+  const adapted = adaptSequencedEventsToRunEvents(events);
+  const turns = adapted.filter((e) => e.type === "turn");
+  assert.equal(turns.length, 2);
+  const cost = aggregateRunCostLatency("run_f", events);
+  assert.equal(cost.tokensOut, 402);
+});

@@ -923,10 +923,109 @@ test("does not double count when both assistant and result usage are present", a
 
   await runner.run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
 
+  // The per-message snapshot goes out first; the result totals are the CLI's
+  // real cumulative numbers, so a final top-up makes the sum equal them —
+  // never the sum of both.
   const usages = events.filter((e): e is Extract<TelemetryEvent, { type: "usage" }> => e.type === "usage");
-  assert.equal(usages.length, 1);
+  assert.equal(usages.length, 2);
   assert.equal(usages[0].inputTokens, 12);
   assert.equal(usages[0].outputTokens, 9);
+  assert.equal(usages[1].final, true);
+  assert.equal(usages[0].inputTokens + usages[1].inputTokens, 999);
+  assert.equal(usages[0].outputTokens + usages[1].outputTokens, 999);
+});
+
+/** Real Claude Code shape: one assistant event per content block, same id and usage. */
+function blockEvents(id: string, usage: Record<string, number>, blocks: unknown[]): string[] {
+  return blocks.map((block) =>
+    JSON.stringify({ type: "assistant", message: { id, model: "m", content: [block], usage } }),
+  );
+}
+
+test("counts a message's usage once across its content blocks and reconciles to the result totals", async () => {
+  const lines = [
+    JSON.stringify(INIT),
+    ...blockEvents("msg_a", { input_tokens: 10000, output_tokens: 1 }, [
+      { type: "thinking", thinking: "plan" },
+      { type: "text", text: "Looking." },
+      { type: "tool_use", id: "tu_a", name: "Read", input: { file_path: "/x" } },
+    ]),
+    JSON.stringify({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_a", content: "ok" }] },
+    }),
+    ...blockEvents("msg_b", { input_tokens: 12000, output_tokens: 1, cache_read_input_tokens: 9000 }, [
+      { type: "text", text: "Done." },
+      { type: "tool_use", id: "tu_b", name: "Write", input: { file_path: "/y", content: "z" } },
+    ]),
+    JSON.stringify({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_b", content: "ok" }] },
+    }),
+    JSON.stringify({
+      ...RESULT,
+      usage: { input_tokens: 22000, output_tokens: 640, cache_read_input_tokens: 9000 },
+    }),
+  ];
+  const vm = new ScriptedVm([{ chunks: [`${lines.join("\n")}\n`] }]);
+  const events: TelemetryEvent[] = [];
+  await new ClaudeCodeRunner().run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+
+  const usages = events.filter((e): e is Extract<TelemetryEvent, { type: "usage" }> => e.type === "usage");
+  // One per message plus the final top-up — not one per content block (5).
+  assert.equal(usages.length, 3);
+  assert.deepEqual(
+    usages.map((u) => u.final === true),
+    [false, false, true],
+  );
+  const sum = (k: "inputTokens" | "outputTokens") => usages.reduce((n, u) => n + u[k], 0);
+  assert.equal(sum("inputTokens"), 22000);
+  assert.equal(sum("outputTokens"), 640);
+  assert.equal(usages.reduce((n, u) => n + (u.cachedTokens ?? 0), 0), 9000);
+  // The top-up carries only the missing output tokens.
+  assert.equal(usages[2].inputTokens, 0);
+  assert.equal(usages[2].outputTokens, 638);
+});
+
+test("a growing snapshot for the same message emits only the positive delta", async () => {
+  const lines = [
+    JSON.stringify(INIT),
+    ...blockEvents("msg_g", { input_tokens: 500, output_tokens: 3 }, [{ type: "text", text: "a" }]),
+    ...blockEvents("msg_g", { input_tokens: 500, output_tokens: 40 }, [{ type: "text", text: "b" }]),
+    ...blockEvents("msg_g", { input_tokens: 400, output_tokens: 10 }, [{ type: "text", text: "c" }]),
+    JSON.stringify({ ...RESULT, usage: { input_tokens: 500, output_tokens: 40 } }),
+  ];
+  const vm = new ScriptedVm([{ chunks: [`${lines.join("\n")}\n`] }]);
+  const events: TelemetryEvent[] = [];
+  await new ClaudeCodeRunner().run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+
+  const usages = events.filter((e): e is Extract<TelemetryEvent, { type: "usage" }> => e.type === "usage");
+  // 500/3, then +0/+37; the shrunken third snapshot adds nothing; the result
+  // already matches, so no top-up.
+  assert.deepEqual(
+    usages.map((u) => [u.inputTokens, u.outputTokens, u.final === true]),
+    [
+      [500, 3, false],
+      [0, 37, false],
+    ],
+  );
+});
+
+test("result totals below the emitted sum never produce a negative top-up", async () => {
+  const lines = [
+    JSON.stringify(INIT),
+    ...blockEvents("msg_n", { input_tokens: 800, output_tokens: 50 }, [{ type: "text", text: "a" }]),
+    JSON.stringify({ ...RESULT, usage: { input_tokens: 100, output_tokens: 70 } }),
+  ];
+  const vm = new ScriptedVm([{ chunks: [`${lines.join("\n")}\n`] }]);
+  const events: TelemetryEvent[] = [];
+  await new ClaudeCodeRunner().run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+
+  const usages = events.filter((e): e is Extract<TelemetryEvent, { type: "usage" }> => e.type === "usage");
+  assert.equal(usages.length, 2);
+  assert.equal(usages[1].final, true);
+  assert.equal(usages[1].inputTokens, 0);
+  assert.equal(usages[1].outputTokens, 20);
 });
 
 test("emits computer.action events for desktop MCP calls, with redacted summaries", async () => {

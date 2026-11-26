@@ -18,6 +18,7 @@ import {
   clampMaxTokens,
   ensureToolCallId,
   repairToolArguments,
+  sanitizeToolJsonSchema,
   stripAnthropicImages,
   type BridgeOptions,
 } from "./anthropic-bridge";
@@ -174,7 +175,9 @@ export function anthropicToResponses(
           type: "function",
           name: asString(fn.name) ?? "",
           ...(asString(fn.description) !== undefined ? { description: fn.description } : {}),
-          ...(fn.parameters !== undefined ? { parameters: fn.parameters } : {}),
+          ...(fn.parameters !== undefined
+            ? { parameters: sanitizeToolJsonSchema(fn.parameters, "openai-responses") }
+            : {}),
         };
       })
     : undefined;
@@ -576,7 +579,9 @@ export function anthropicToOllama(
           function: {
             name: asString(fn.name) ?? "",
             ...(asString(fn.description) !== undefined ? { description: fn.description } : {}),
-            ...(fn.parameters !== undefined ? { parameters: fn.parameters } : {}),
+            ...(fn.parameters !== undefined
+              ? { parameters: sanitizeToolJsonSchema(fn.parameters, "ollama") }
+              : {}),
           },
         };
       })
@@ -768,13 +773,17 @@ export function anthropicToGemini(
             return {
               name: asString(fn.name) ?? "",
               ...(asString(fn.description) !== undefined ? { description: fn.description } : {}),
-              ...(fn.parameters !== undefined ? { parameters: fn.parameters } : {}),
+              ...(fn.parameters !== undefined
+                ? { parameters: sanitizeToolJsonSchema(fn.parameters, "gemini") }
+                : {}),
             };
           }
           return {
             name: asString(tool.name) ?? "",
             ...(asString(tool.description) !== undefined ? { description: tool.description } : {}),
-            ...(tool.input_schema !== undefined ? { parameters: tool.input_schema } : {}),
+            ...(tool.input_schema !== undefined
+              ? { parameters: sanitizeToolJsonSchema(tool.input_schema, "gemini") }
+              : {}),
           };
         })
         .filter((fn) => fn.name)

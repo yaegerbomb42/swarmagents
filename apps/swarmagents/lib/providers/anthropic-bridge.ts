@@ -482,6 +482,200 @@ function openaiToolContent(content: unknown): string | Record<string, unknown>[]
   return openaiUserContent(content);
 }
 
+// ---------------------------------------------------------------------------
+// Tool JSON Schema sanitizer (per-target dialects)
+// ---------------------------------------------------------------------------
+
+/**
+ * Target wire dialect for {@link sanitizeToolJsonSchema}. Every style the
+ * gateway bridges to except `anthropic` (which needs no reshaping).
+ */
+export type SchemaDialect = "openai-chat" | "openai-responses" | "gemini" | "ollama";
+
+/**
+ * Meta keywords Claude Code emits that at least one upstream dialect rejects
+ * with HTTP 400. They carry no tool-argument semantics, so they are stripped
+ * for every dialect.
+ */
+const SCHEMA_META_KEYWORDS = [
+  "$schema",
+  "$id",
+  "$anchor",
+  "$comment",
+  "$defs",
+  "definitions",
+  "$recursiveRef",
+  "$dynamicRef",
+] as const;
+
+/** Keywords Gemini and Ollama/llama.cpp reject but OpenAI-wire APIs accept. */
+const SCHEMA_NONSTRICT_KEYWORDS = ["default", "examples"] as const;
+
+/** `format` values the OpenAI wire accepts; others are dropped. */
+const OPENAI_FORMATS = new Set([
+  "date-time",
+  "date",
+  "time",
+  "duration",
+  "email",
+  "hostname",
+  "ipv4",
+  "ipv6",
+  "uri",
+  "uuid",
+]);
+
+/** Gemini's documented `format` support for strings. */
+const GEMINI_FORMATS = new Set(["enum", "date-time"]);
+
+/** Long tool descriptions (Claude Code emits some >10k chars) hit provider limits. */
+const MAX_DESCRIPTION_CHARS = 500;
+
+/** Several strict dialects cap object property counts far below JSON Schema's. */
+const MAX_PROPERTIES = 64;
+
+/** Guard against pathologically nested schemas; deeper subtrees become `{}`. */
+const MAX_SCHEMA_DEPTH = 16;
+
+function isNullTypeSchema(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (value.type === "null") return true;
+  return Array.isArray(value.type) && value.type.length > 0 && value.type.every((t) => t === "null");
+}
+
+/** `type` widened to include null; undefined when it cannot be expressed. */
+function nullableType(type: unknown): unknown {
+  if (typeof type === "string" && type !== "") return [type, "null"];
+  if (Array.isArray(type) && type.length > 0) {
+    return type.includes("null") ? type : [...type, "null"];
+  }
+  return undefined;
+}
+
+function allowedFormats(dialect: SchemaDialect): Set<string> | undefined {
+  switch (dialect) {
+    case "gemini":
+      return GEMINI_FORMATS;
+    case "ollama":
+      return new Set();
+    case "openai-chat":
+    case "openai-responses":
+      return OPENAI_FORMATS;
+  }
+}
+
+/**
+ * Deterministically reshape one tool input schema for a target dialect.
+ *
+ * Claude Code's tool schemas are rich JSON Schemas ($schema, nested
+ * anyOf/oneOf nullable wrappers, exotic formats, long descriptions, huge
+ * property lists) that OpenAI strict mode, Gemini generateContent, Ollama,
+ * Groq and Mistral frequently reject with HTTP 400. The sanitizer:
+ *
+ *   - strips meta keywords ($schema, $id, ...) for every dialect;
+ *   - strips `default`/`examples` where unsupported (gemini, ollama);
+ *   - drops `format` values the dialect does not accept;
+ *   - flattens a trivial anyOf/oneOf nullable wrapper (exactly one
+ *     {"type":"null"} branch) into the dialect's null representation:
+ *     a `type` array on the OpenAI wire, `nullable: true` on Gemini, and a
+ *     dropped null variant on Ollama (whose grammar has no null);
+ *   - caps description length and object property count (first N win, and
+ *     `required` is filtered to the survivors);
+ *   - caps recursion depth; deeper subtrees become a permissive `{}`.
+ *
+ * Pure and non-mutating; best-effort by design — the output is always a
+ * usable schema-like object and never throws.
+ */
+export function sanitizeToolJsonSchema(schema: unknown, dialect: SchemaDialect): unknown {
+  return sanitizeSchemaNode(schema, dialect, 0);
+}
+
+function sanitizeSchemaNode(node: unknown, dialect: SchemaDialect, depth: number): unknown {
+  if (!isRecord(node)) return node;
+  if (depth > MAX_SCHEMA_DEPTH) return {};
+
+  const out: Record<string, unknown> = { ...node };
+  for (const key of SCHEMA_META_KEYWORDS) delete out[key];
+  if (dialect === "gemini" || dialect === "ollama") {
+    for (const key of SCHEMA_NONSTRICT_KEYWORDS) delete out[key];
+  }
+
+  const formats = allowedFormats(dialect);
+  if (formats !== undefined && !formats.has(String(out.format))) delete out.format;
+
+  // Type arrays: the OpenAI wire accepts them; Gemini and llama.cpp do not.
+  // Collapse deterministically to a single type and express null via
+  // `nullable` (Gemini) or by dropping the null variant (Ollama).
+  if (Array.isArray(out.type) && dialect !== "openai-chat" && dialect !== "openai-responses") {
+    const hadNull = out.type.includes("null");
+    const nonNull = out.type.filter((t) => t !== "null");
+    if (nonNull.length >= 1) {
+      out.type = nonNull[0];
+      if (dialect === "gemini" && hadNull) out.nullable = true;
+    }
+  }
+
+  if (typeof out.description === "string" && out.description.length > MAX_DESCRIPTION_CHARS) {
+    out.description = out.description.slice(0, MAX_DESCRIPTION_CHARS);
+  }
+
+  // Trivial nullable wrapper: exactly one null-type branch next to real ones.
+  for (const key of ["anyOf", "oneOf"] as const) {
+    const branches = out[key];
+    if (!Array.isArray(branches)) continue;
+    const records = branches.filter(isRecord);
+    const rest = records.filter((b) => !isNullTypeSchema(b));
+    if (records.length - rest.length !== 1 || rest.length === 0) continue;
+    const sanitizedRest = rest.map((b) => sanitizeSchemaNode(b, dialect, depth + 1));
+    delete out[key];
+    if (sanitizedRest.length === 1) {
+      Object.assign(out, sanitizedRest[0]);
+    } else {
+      out[key] = sanitizedRest;
+    }
+    if (dialect === "gemini") {
+      out.nullable = true;
+    } else if (dialect === "openai-chat" || dialect === "openai-responses") {
+      if (sanitizedRest.length === 1) {
+        const widened = nullableType(out.type);
+        if (widened !== undefined) out.type = widened;
+      }
+    }
+    // ollama: the null variant is simply dropped; its grammar cannot
+    // represent a null-typed argument.
+  }
+
+  const props = out.properties;
+  if (isRecord(props)) {
+    const kept: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(props)) {
+      if (Object.keys(kept).length >= MAX_PROPERTIES) break;
+      kept[key] = sanitizeSchemaNode(value, dialect, depth + 1);
+    }
+    out.properties = kept;
+    if (Object.keys(kept).length < Object.keys(props).length && Array.isArray(out.required)) {
+      const required = out.required.filter((r) => typeof r === "string" && r in kept);
+      if (required.length > 0) out.required = required;
+      else delete out.required;
+    }
+  }
+
+  if (out.items !== undefined) out.items = sanitizeSchemaNode(out.items, dialect, depth + 1);
+  if (Array.isArray(out.prefixItems)) {
+    out.prefixItems = out.prefixItems.map((b) => sanitizeSchemaNode(b, dialect, depth + 1));
+  }
+  if (isRecord(out.additionalProperties)) {
+    out.additionalProperties = sanitizeSchemaNode(out.additionalProperties, dialect, depth + 1);
+  }
+  if (Array.isArray(out.allOf)) {
+    out.allOf = out.allOf.map((b) => sanitizeSchemaNode(b, dialect, depth + 1));
+  }
+  if (isRecord(out.not)) out.not = sanitizeSchemaNode(out.not, dialect, depth + 1);
+  if (isRecord(out.contains)) out.contains = sanitizeSchemaNode(out.contains, dialect, depth + 1);
+
+  return out;
+}
+
 /** Anthropic tools array -> OpenAI tools (functions). */
 function anthropicToolsToOpenAI(tools: unknown): Record<string, unknown>[] | undefined {
   if (!Array.isArray(tools)) return undefined;
@@ -491,14 +685,20 @@ function anthropicToolsToOpenAI(tools: unknown): Record<string, unknown>[] | und
     // Anthropic tools: {name, description?, input_schema}. Custom providers may
     // already use the OpenAI shape {type:"function", function:{...}}.
     if (t.type === "function" && isRecord(t.function)) {
-      out.push(t);
+      const fn = { ...t.function };
+      if (fn.parameters !== undefined) {
+        fn.parameters = sanitizeToolJsonSchema(fn.parameters, "openai-chat");
+      }
+      out.push({ ...t, function: fn });
       continue;
     }
     const name = asString(t.name);
     if (!name) continue;
     const fn: Record<string, unknown> = { name };
     if (asString(t.description) !== undefined) fn.description = t.description;
-    if (t.input_schema !== undefined) fn.parameters = t.input_schema;
+    if (t.input_schema !== undefined) {
+      fn.parameters = sanitizeToolJsonSchema(t.input_schema, "openai-chat");
+    }
     out.push({ type: "function", function: fn });
   }
   return out.length > 0 ? out : undefined;

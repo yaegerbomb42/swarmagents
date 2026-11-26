@@ -483,3 +483,69 @@ test("Responses stream: two parallel id-less calls stay two tool_use blocks", ()
   assert.deepEqual(JSON.parse(inputs.get(starts[0].index as number)!), { file_path: "/a" });
   assert.deepEqual(JSON.parse(inputs.get(starts[1].index as number)!), { pattern: "*.ts" });
 });
+
+// ---------------------------------------------------------------------------
+// Tool schema sanitization per target ApiStyle (core-03)
+// ---------------------------------------------------------------------------
+
+/** Rich Claude-Code-shaped input_schema that strict upstreams reject raw. */
+const richClaudeSchema = () => ({
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  $id: "tool://read/input",
+  type: "object",
+  properties: {
+    path: { anyOf: [{ type: "string" }, { type: "null" }], description: "p".repeat(600) },
+    mode: { type: "string", format: "uint8", default: "text" },
+  },
+  required: ["path"],
+});
+
+const anthropicBodyWithRichTool = () => ({
+  model: "claude-test",
+  max_tokens: 128,
+  messages: [{ role: "user", content: "read it" }],
+  tools: [{ name: "Read", description: "Read a file.", input_schema: richClaudeSchema() }],
+});
+
+test("anthropicToResponses sanitizes tool parameters for the Responses wire", () => {
+  const out = anthropicToResponses(anthropicBodyWithRichTool(), "gpt-5");
+  const tools = out.tools as Array<Record<string, unknown>>;
+  const parameters = tools[0].parameters as Record<string, unknown>;
+  assert.equal("$schema" in parameters, false);
+  assert.equal("$id" in parameters, false);
+  const props = parameters.properties as Record<string, Record<string, unknown>>;
+  // Nullable wrapper becomes a type array; uint8 format dropped; default kept.
+  assert.equal(props.path.type instanceof Array, true);
+  assert.equal("format" in props.mode, false);
+  assert.equal(props.mode.default, "text");
+  assert.equal((props.path.description as string).length, 500);
+});
+
+test("anthropicToOllama sanitizes tool parameters for llama.cpp", () => {
+  const out = anthropicToOllama(anthropicBodyWithRichTool(), "llama3");
+  const tools = out.tools as Array<Record<string, unknown>>;
+  const fn = tools[0].function as Record<string, unknown>;
+  const parameters = fn.parameters as Record<string, unknown>;
+  assert.equal("$schema" in parameters, false);
+  const props = parameters.properties as Record<string, Record<string, unknown>>;
+  // Ollama: no null variant, no format, no default.
+  assert.deepEqual(props.path.type, "string");
+  assert.equal("format" in props.mode, false);
+  assert.equal("default" in props.mode, false);
+  assert.equal((props.path.description as string).length, 500);
+});
+
+test("anthropicToGemini sanitizes function declarations for generateContent", () => {
+  const out = anthropicToGemini(anthropicBodyWithRichTool(), "gemini-2.0-flash");
+  const tools = out.tools as Array<{ functionDeclarations: Array<Record<string, unknown>> }>;
+  const declaration = tools[0].functionDeclarations[0];
+  assert.equal(declaration.name, "Read");
+  const parameters = declaration.parameters as Record<string, unknown>;
+  assert.equal("$schema" in parameters, false);
+  const props = parameters.properties as Record<string, Record<string, unknown>>;
+  // Gemini: nullable marker instead of a null variant, formats limited to its
+  // documented set, default/examples stripped.
+  assert.deepEqual(props.path, { type: "string", nullable: true, description: "p".repeat(500) });
+  assert.equal("format" in props.mode, false);
+  assert.equal("default" in props.mode, false);
+});

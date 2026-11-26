@@ -140,13 +140,18 @@ or a throwaway box.
   data aggregated into JSON and checked against an independent
   recomputation, and an LRU cache with interacting TTL/recency rules.
 
-Live baseline (2026-11-26, free nemo wrapper,
-`nvidia/nemotron-3.5-lightning-30b-a3b`):
+Live baseline (2026-11-26, via the box's Claude Code wrappers):
 
-| Set | pass@1 | Mean turns | Mean seconds |
-| --- | ---: | ---: | ---: |
-| standard | 6/6 | 8.2 | 9.8 |
-| hard | 3/4 | 21.3 | 145.6 |
+| Model | Set | pass@1 | Mean turns | Mean input tok | Mean seconds |
+| --- | --- | ---: | ---: | ---: | ---: |
+| nvidia/nemotron-3.5-lightning-30b-a3b | standard | 6/6 | 8.2 | 99,496 | 9.8 |
+| nvidia/nemotron-3.5-lightning-30b-a3b | hard | 3/4 | 21.3 | 369,203 | 145.6 |
+| mercury | standard | 6/6 | 4.0 | 45,858 | 5.1 |
+| mercury | hard | 4/4 | 6.8 | 75,825 | 15.5 |
+
+On the standard set both models score 6/6 (pass@1 can't tell them apart).
+On the hard set they separate on every axis: pass@1, turns (3.1x), input
+tokens (4.9x) and wall clock (9.4x).
 
 The hard miss was genuine: `-2^2` evaluated to 4 and `1 2` was accepted,
 both spelled out in the prompt. Every task's verifier must fail the

@@ -118,3 +118,12 @@ test("UserDrivingBanner renders paused copy and Hand back button", async () => {
   assert.ok(markup.includes('data-testid="user-driving-handback"'));
   assert.ok(markup.includes("Hand back"));
 });
+
+test("user-driving pause: first input sends, then at most one keepalive per minute", async () => {
+  const { shouldSendUserDrivingPause, USER_DRIVING_KEEPALIVE_MS } = await load();
+  assert.equal(shouldSendUserDrivingPause(0, 1_000), true);
+  assert.equal(shouldSendUserDrivingPause(1_000, 1_000 + USER_DRIVING_KEEPALIVE_MS - 1), false);
+  assert.equal(shouldSendUserDrivingPause(1_000, 1_000 + USER_DRIVING_KEEPALIVE_MS), true);
+  // The keepalive beats the server's 5-minute idle expiry by a wide margin.
+  assert.ok(USER_DRIVING_KEEPALIVE_MS * 2 < 5 * 60 * 1000);
+});

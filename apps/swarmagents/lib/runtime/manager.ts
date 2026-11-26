@@ -86,6 +86,8 @@ import type {
 import { getApprovalStore } from "../harness/approvals";
 import { evaluateToolApproval, type ToolApprovalDecision } from "../harness/tool-approval";
 import { classifyToolCallAsync } from "../harness/risk";
+import { isMutatingComputerCall } from "../harness/computer-mcp";
+import { clearUserDriving, gateUserDriving } from "./user-driving";
 import {
   checkpointDisplayLabel,
   checkpointVmLabel,
@@ -1067,6 +1069,9 @@ export class RuntimeManager {
   private readonly silenceMs: number;
   private readonly toolSilenceMs: number;
   private readonly turnCheckpointMinIntervalMs: number;
+  /** Test seams for the user-takeover hold (see gateUserDriving). */
+  private readonly userDrivingMaxWaitMs?: number;
+  private readonly userDrivingPollMs?: number;
   private readonly maxRecoveryAttempts: number;
   private readonly watchdogSweepMs: number = 30_000;
   private readonly killGraceMs: number;
@@ -1125,6 +1130,9 @@ export class RuntimeManager {
      * conservative default (a snapshot per turn would be too costly).
      */
     turnCheckpointMinIntervalMs?: number;
+    /** How long a desktop action waits for the user's hand-back (default 240 s). */
+    userDrivingMaxWaitMs?: number;
+    userDrivingPollMs?: number;
     /**
      * Watchdog recoveries per stuck run before it is finalized as an error
      * (default 2; 0 disables recovery, restoring the finalize-on-stuck
@@ -1165,6 +1173,8 @@ export class RuntimeManager {
     this.toolSilenceMs = opts.toolSilenceMs ?? DEFAULT_TOOL_SILENCE_MS;
     this.turnCheckpointMinIntervalMs =
       opts.turnCheckpointMinIntervalMs ?? DEFAULT_TURN_CHECKPOINT_MIN_INTERVAL_MS;
+    this.userDrivingMaxWaitMs = opts.userDrivingMaxWaitMs;
+    this.userDrivingPollMs = opts.userDrivingPollMs;
     this.maxRecoveryAttempts = normalizeMaxRecoveryAttempts(opts.maxRecoveryAttempts);
     this.watchdogSweepMs = Math.max(20, opts.watchdogSweepMs ?? 30_000);
     this.killGraceMs = opts.killGraceMs ?? KILL_GRACE_MS;
@@ -2594,6 +2604,20 @@ export class RuntimeManager {
       const reason = `Blocked by ambient watcher allowlist: ${toolName} is not permitted`;
       this.forwardEvent(active, { type: "tool.blocked", name: toolName, reason });
       return { decision: "deny", reason };
+    }
+
+    // User takeover (core-25): while the user drives the live desktop, a
+    // mutating desktop action waits here — the hook holds the CLI — instead
+    // of racing the user's clicks. After hand-back the next one is answered
+    // once with the hand-back note so the model re-reads the screen first.
+    // This is the pre-execution path: a deny is a message, not a halt.
+    if (isMutatingComputerCall(toolName)) {
+      const held = await gateUserDriving(runId, {
+        signal: active.controller.signal,
+        ...(this.userDrivingMaxWaitMs !== undefined ? { maxWaitMs: this.userDrivingMaxWaitMs } : {}),
+        ...(this.userDrivingPollMs !== undefined ? { pollMs: this.userDrivingPollMs } : {}),
+      });
+      if (held) return held;
     }
 
     return evaluateToolApproval({
@@ -5007,6 +5031,7 @@ export class RuntimeManager {
         ...(patch.verification ? { verification: patch.verification } : {}),
       };
       st.active = null;
+      clearUserDriving(active.runId);
       // Deliberately NOT deleting the cancelling entry here: cancel paths
       // record it before finalize so startNext can reap the run's process
       // group before the successor spawns. Entries are drained by that

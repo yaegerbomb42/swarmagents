@@ -542,3 +542,10 @@ test("roleSeedFiles seeds the text-desktop flag into the initial config", () => 
   };
   assert.equal(config.mcpServers["computer-mcp"]?.env?.[TEXT_DESKTOP_ENV], "1");
 });
+
+test("TEXT_DESKTOP_TAIL names the real playwright-mcp tools", () => {
+  // @playwright/mcp exposes browser_snapshot (text) and browser_take_screenshot (image).
+  assert.match(TEXT_DESKTOP_TAIL, /browser_snapshot/);
+  assert.match(TEXT_DESKTOP_TAIL, /browser_take_screenshot/);
+  assert.doesNotMatch(TEXT_DESKTOP_TAIL, /browser_accessible_snapshot|browser_screenshot\b/);
+});

@@ -61,8 +61,17 @@ export function desktopMcpTool(name: string): string | null {
 /** Playwright MCP tools that navigate to a URL (target field for telemetry). */
 const PLAYWRIGHT_NAV_TOOLS = new Set(["browser_navigate"]);
 
-/** Playwright MCP tools that return a raw screenshot image. */
-const PLAYWRIGHT_SCREENSHOT_TOOLS = new Set(["browser_screenshot"]);
+/**
+ * Playwright MCP tools that return a raw screenshot image. The current
+ * @playwright/mcp name is `browser_take_screenshot`; `browser_screen_capture`
+ * is the vision-mode capture tool, and `browser_screenshot` covers older
+ * builds and the browser-mcp alias.
+ */
+const PLAYWRIGHT_SCREENSHOT_TOOLS = new Set([
+  "browser_take_screenshot",
+  "browser_screen_capture",
+  "browser_screenshot",
+]);
 
 /**
  * Deny reason for a raw screenshot call in text-desktop mode, telling the
@@ -80,7 +89,7 @@ function textDesktopScreenshotReason(server: string): string {
   }
   return (
     "screenshots are disabled in text-desktop mode (this model has no vision); " +
-    "call browser_snapshot or browser_accessible_snapshot instead"
+    "call browser_snapshot instead — it returns the page's accessibility tree as text"
   );
 }
 

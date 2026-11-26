@@ -266,6 +266,9 @@ test("classifyDesktopToolCallAsync runs DNS preflight (b9)", async () => {
 
 test("isRawScreenshotCall matches only the image-returning screenshot tools", () => {
   assert.equal(isRawScreenshotCall("mcp__computer-mcp__screenshot"), true);
+  // The real @playwright/mcp screenshot tool (catalog: connectors.json).
+  assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_take_screenshot"), true);
+  assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_screen_capture"), true);
   assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_screenshot"), true);
   assert.equal(isRawScreenshotCall("mcp__browser-mcp__browser_screenshot"), true);
   // The text inspection paths are not screenshots.
@@ -284,7 +287,7 @@ test("classifyDesktopToolCall denies raw screenshots in text-desktop mode", () =
   assert.match(shot.reason, /describe_screen/);
 
   const browserShot = classifyDesktopToolCall(
-    "mcp__playwright-mcp__browser_screenshot",
+    "mcp__playwright-mcp__browser_take_screenshot",
     {},
     textDesktop,
   )!;
@@ -307,7 +310,7 @@ test("classifyDesktopToolCall denies raw screenshots in text-desktop mode", () =
 
   // Without the flag nothing changes: screenshots are allowed as before.
   assert.equal(classifyDesktopToolCall("mcp__computer-mcp__screenshot", {})!.level, "allow");
-  assert.equal(classifyDesktopToolCall("mcp__playwright-mcp__browser_screenshot", {})!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__playwright-mcp__browser_take_screenshot", {})!.level, "allow");
 });
 
 test("classifyDesktopToolCallAsync denies raw screenshots in text-desktop mode", async () => {

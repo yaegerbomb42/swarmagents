@@ -141,8 +141,8 @@ export const TEXT_DESKTOP_ENV = "SWARM_TEXT_DESKTOP";
 export const TEXT_DESKTOP_TAIL =
   "You are running in text-desktop mode: you cannot see images. To inspect the desktop, call " +
   "describe_screen — it returns window bounds/centers and OCR text coordinates you can click. " +
-  "To inspect the browser, call browser_snapshot or browser_accessible_snapshot. " +
-  "Never call screenshot or browser_screenshot: they are disabled for this run. " +
+  "To inspect the browser, call browser_snapshot (the page's accessibility tree as text). " +
+  "Never call screenshot or browser_take_screenshot: they are disabled for this run. " +
   "click, type, key, scroll and open_app work with the coordinates describe_screen returns.";
 
 /** Is desktop mode on for this process? (SWARM_VM_DESKTOP=1) */

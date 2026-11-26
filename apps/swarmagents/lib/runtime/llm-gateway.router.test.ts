@@ -228,7 +228,7 @@ test("empty 200 responses emit route.demoted but still reach the agent", async (
   assert.deepEqual(calls.map((c) => c.host), ["a", "b"]);
 });
 
-test("streaming: observes the SSE for quality/usage and reports invalid tool JSON", async () => {
+test("streaming: repairs invalid tool JSON in the relay and still observes usage", async () => {
   const u = owner();
   const sse = (chunks: unknown[]) =>
     new Response(
@@ -252,10 +252,13 @@ test("streaming: observes the SSE for quality/usage and reports invalid tool JSO
   for await (const bytes of forwardLlmStreaming({ owner: u, providers: [provider("a")], body: { ...REQ, stream: true }, fetchImpl, runId: "run-st", bus: t.bus })) {
     out += new TextDecoder().decode(bytes);
   }
+  // The bridge repairs the unusable fragment instead of relaying broken JSON,
+  // so the client receives a parseable tool input and the provider is not
+  // demoted for a problem the gateway already fixed.
   assert.match(out, /input_json_delta/);
+  assert.match(out, /"partial_json":"\{\}"/);
   const demoted = t.of("route.demoted");
-  assert.equal(demoted.length, 1);
-  assert.match(String(demoted[0]!.reason), /invalid_tool_json/);
+  assert.equal(demoted.length, 0);
   const call = t.of("llm.call")[0]!;
   assert.equal(call.inputTokens, 9);
   assert.equal(call.outputTokens, 4);

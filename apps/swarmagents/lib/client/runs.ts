@@ -15,6 +15,8 @@ export const RUNS_ENDPOINT = "/api/runtime/runs";
 /** The server caps prompts at 200k chars and agent cards at 4k. */
 export const MAX_AGENT_CARD_LEN = 4000;
 
+export type RunTier = "fast" | "balanced" | "deep";
+
 export interface StartRunInput {
   prompt: string;
   /** Continue this harness session. Omit to continue the account's last one. */
@@ -25,6 +27,8 @@ export interface StartRunInput {
   fullAuto: boolean;
   /** "cloud" or "computer:<id>". Omit for the account default. */
   computeTarget?: string;
+  /** Optional model routing tier intent. */
+  tier?: RunTier;
 }
 
 export type StartRunResult =
@@ -70,6 +74,7 @@ export function buildRunRequest(input: StartRunInput): Record<string, unknown> {
     fullAuto: input.fullAuto,
     ...(input.sessionId ? { sessionId: input.sessionId } : {}),
     ...(input.computeTarget ? { computeTarget: input.computeTarget } : {}),
+    ...(input.tier ? { tier: input.tier } : {}),
   };
 }
 

@@ -106,6 +106,18 @@ test("startRun posts JSON to the tasks route and returns the run", async () => {
   assert.deepEqual(sentBody(calls[0]), { prompt: "Build a thing", autoApprove: true, fullAuto: true });
 });
 
+test("startRun forwards optional tier in the tasks payload", async () => {
+  const { fetchImpl, calls } = fakeFetch(() => json({ runId: "run_tier" }, 201));
+  const result = await startRun({ prompt: "Analyze", fullAuto: true, tier: "deep" }, { fetchImpl });
+  assert.deepEqual(result, { ok: true, runId: "run_tier", queued: false });
+  assert.deepEqual(sentBody(calls[0]), {
+    prompt: "Analyze",
+    autoApprove: true,
+    fullAuto: true,
+    tier: "deep",
+  });
+});
+
 test("startRun reports a queued run and its place in line", async () => {
   const { fetchImpl } = fakeFetch(() => json({ runId: "run_2", queued: true, position: 2 }, 202));
   assert.deepEqual(await startRun({ prompt: "Next", fullAuto: true }, { fetchImpl }), {

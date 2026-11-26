@@ -137,6 +137,20 @@ test("orderLlmCandidates with preferFree puts free providers first, keeping rank
   assert.deepEqual(byRankDefault.map((c) => c.config.id), ["paid-a", "free-a", "free-b", "paid-b"]);
 });
 
+test("orderLlmCandidates resolves tier alias requestedModel and options.tier to fast/balanced/deep", () => {
+  const providers: ProviderConfig[] = [
+    provider({
+      id: "multi",
+      rank: 0,
+      models: { fast: "mini-fast", balanced: "mid-bal", deep: "pro-deep" },
+    }),
+  ];
+  assert.equal(orderLlmCandidates(providers, "fast")[0].model, "mini-fast");
+  assert.equal(orderLlmCandidates(providers, "deep")[0].model, "pro-deep");
+  assert.equal(orderLlmCandidates(providers, undefined, { tier: "deep" })[0].model, "pro-deep");
+  assert.equal(orderLlmCandidates(providers, undefined)[0].model, "mid-bal");
+});
+
 /** In-memory bus spy: captures published events, never persists. */
 function memoryBus() {
   const events: Array<{ runId: string; event: { type: string; data?: unknown } }> = [];

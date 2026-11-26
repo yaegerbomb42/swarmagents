@@ -52,7 +52,7 @@ import {
   requestUrl,
 } from "../providers/adapters";
 import { mergedModelCapabilities } from "../providers/capabilities";
-import type { ApiStyle, ProviderConfig, ProviderErrorKind, TokenUsage } from "../providers/types";
+import { isModelTier, type ApiStyle, type ModelTier, type ProviderConfig, type ProviderErrorKind, type TokenUsage } from "../providers/types";
 import { CooldownStore, type PersistedCooldown } from "../providers/cooldown-store";
 import { routerProviders, userCooldownFilePath } from "../providers/store";
 import { readUserSettings, type UserSettings } from "../providers/settings";
@@ -188,6 +188,8 @@ export interface LlmOrderOptions {
    * rank inside each group. Defaults to false (plain rank order).
    */
   preferFree?: boolean;
+  /** Optional routing tier intent ("fast" | "balanced" | "deep"). */
+  tier?: ModelTier;
 }
 
 /**
@@ -196,12 +198,19 @@ export interface LlmOrderOptions {
  * preferred; otherwise plain rank order applies. Enabled providers only.
  * With `preferFree`, providers marked free are ordered before paid ones while
  * rank stays the ordering key inside each group.
+ *
+ * When `requestedModel` is a tier alias ("fast" | "balanced" | "deep") or
+ * `options.tier` is set, each provider selects `modelForTier(config, tier)`.
  */
 export function orderLlmCandidates(
   providers: ProviderConfig[],
   requestedModel?: string,
   options: LlmOrderOptions = {},
 ): LlmCandidate[] {
+  const tier: ModelTier =
+    options.tier ?? (requestedModel && isModelTier(requestedModel) ? requestedModel : "balanced");
+  const explicitModel =
+    requestedModel !== undefined && !isModelTier(requestedModel) ? requestedModel : undefined;
   const enabled = providers.filter((config) => config.enabled !== false);
   const byRank = [...enabled].sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0));
   let ordered = byRank;
@@ -211,15 +220,15 @@ export function orderLlmCandidates(
     ordered = [...free, ...paid];
   }
   const preferred = ordered.filter(
-    (config) => requestedModel !== undefined && modelsOf(config).includes(requestedModel),
+    (config) => explicitModel !== undefined && modelsOf(config).includes(explicitModel),
   );
   const rest = ordered.filter((config) => !preferred.includes(config));
   const finalOrder = [...preferred, ...rest];
   return finalOrder.map((config) => {
     const model =
-      requestedModel !== undefined && modelsOf(config).includes(requestedModel)
-        ? requestedModel
-        : modelForTier(config, "balanced");
+      explicitModel !== undefined && modelsOf(config).includes(explicitModel)
+        ? explicitModel
+        : modelForTier(config, tier);
     return { config, model };
   });
 }

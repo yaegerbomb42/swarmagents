@@ -123,6 +123,15 @@ export async function POST(req: NextRequest) {
       : undefined;
   const model =
     typeof body.model === "string" && body.model.trim() ? body.model.trim() : undefined;
+  const rawTier = body.tier;
+  let tier: "fast" | "balanced" | "deep" | undefined;
+  if (rawTier !== undefined) {
+    if (rawTier === "fast" || rawTier === "balanced" || rawTier === "deep") {
+      tier = rawTier;
+    } else {
+      return NextResponse.json({ error: "tier must be fast, balanced, or deep." }, { status: 400 });
+    }
+  }
   // Turn ceiling, passed to claude as --max-turns (capped by
   // SWARM_MAX_TURNS in the runner). Present-but-invalid is rejected so a
   // typo cannot silently run unbounded.
@@ -224,6 +233,9 @@ export async function POST(req: NextRequest) {
     agentCard,
     sessionId,
     model,
+    // Tier is routing intent, never a model id: keep it out of `model` so it
+    // can never reach `claude --model`. "balanced" is the default: omitted.
+    ...(tier && tier !== "balanced" ? { tier } : {}),
     ...(maxTurns ? { maxTurns } : {}),
     ...(roleId ? { roleId } : {}),
     ...(grantedRoleIds ? { grantedRoleIds } : {}),

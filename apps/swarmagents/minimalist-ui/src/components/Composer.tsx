@@ -16,6 +16,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from
 import { ArrowUp, FileText, Loader2, Paperclip, X } from "lucide-react";
 import type { Attachment } from "../data";
 import { uid } from "../data";
+import type { RunTier } from "../../../lib/client/runs";
 import { validateAttachment } from "../../../lib/client/upload";
 import { cn } from "../utils/cn";
 import { IconButton, Notice } from "./ui";
@@ -33,9 +34,18 @@ export interface ComposerProps {
   blockedReason?: string;
   /** The roomier first-message variant used before a conversation exists. */
   hero?: boolean;
+  /** Selected routing tier ("fast" | "balanced" | "deep"). */
+  tier?: RunTier;
+  onTierChange?: (tier: RunTier) => void;
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
   className?: string;
 }
+
+const TIER_OPTIONS: Array<{ id: RunTier; label: string; title: string }> = [
+  { id: "fast", label: "Fast", title: "Prefer fast / free models" },
+  { id: "balanced", label: "Balanced", title: "Default balanced routing" },
+  { id: "deep", label: "Deep", title: "Prefer reasoning / vision models" },
+];
 
 /** What a key press in the box means. IME composition never sends. */
 export function composerKeyAction(event: {
@@ -132,6 +142,8 @@ export function Composer({
   busy = false,
   blockedReason,
   hero = false,
+  tier = "balanced",
+  onTierChange,
   inputRef,
   className,
 }: ComposerProps) {
@@ -364,9 +376,41 @@ export function Composer({
           </button>
         </div>
       </div>
-      <p className="mt-1.5 hidden px-1 text-[12px] text-sa-fg3 sm:block">
-        Enter to send · Shift+Enter for a new line
-      </p>
+      <div className="mt-1.5 flex items-center justify-between gap-2 px-1">
+        <p className="hidden text-[12px] text-sa-fg3 sm:block">
+          Enter to send · Shift+Enter for a new line
+        </p>
+        {onTierChange && (
+          <div
+            role="group"
+            aria-label="Model tier"
+            data-testid="composer-tier-selector"
+            className="inline-flex items-center rounded-lg border border-white/[0.08] bg-white/[0.03] p-0.5 text-[11px]"
+          >
+            {TIER_OPTIONS.map((option) => {
+              const active = tier === option.id;
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  title={option.title}
+                  aria-pressed={active}
+                  data-testid={`composer-tier-${option.id}`}
+                  onClick={() => onTierChange(option.id)}
+                  className={cn(
+                    "cursor-pointer rounded-md px-2 py-0.5 font-medium transition-colors",
+                    active
+                      ? "bg-white/[0.12] text-sa-fg"
+                      : "text-sa-fg3 hover:text-sa-fg2",
+                  )}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

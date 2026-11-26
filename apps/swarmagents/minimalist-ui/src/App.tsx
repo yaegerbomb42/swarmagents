@@ -24,7 +24,7 @@ import type { SwarmTask } from "../../lib/mcp-types";
 import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus, wakeVmStatus } from "../../lib/client/vmStatus";
 import { deriveComputerAction, derivePresence } from "../../lib/client/presence";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
-import { resetVm } from "../../lib/client/runs";
+import { resetVm, type RunTier } from "../../lib/client/runs";
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
 import { useAgentSession } from "./hooks/useAgentSession";
 import { useBoard } from "./hooks/useBoard";
@@ -167,7 +167,8 @@ export default function App() {
   const observedActiveRuns = useRef(new Set<string>());
   const notifiedRuns = useRef(new Set<string>());
 
-  const session = useAgentSession({ agentCard, fullAuto, computeTarget: compute.target || undefined });
+  const [tier, setTier] = usePersisted<RunTier>("sa.tier", "balanced");
+  const session = useAgentSession({ agentCard, fullAuto, computeTarget: compute.target || undefined, tier });
   const { selectThread } = session;
   const board = useBoard(view === "board");
 
@@ -727,6 +728,8 @@ export default function App() {
             value={draft}
             onChange={setDraft}
             onSend={handleSend}
+            tier={tier}
+            onTierChange={setTier}
             blockedReason={
               session.signedOut ? "Sign in to send" : setup.needsProvider ? "Add a provider key to send" : undefined
             }

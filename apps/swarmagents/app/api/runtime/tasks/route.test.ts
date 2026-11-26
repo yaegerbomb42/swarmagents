@@ -264,6 +264,24 @@ test("POST forwards a requested model: GET lists it on the run", async () => {
   assert.equal(cmd[modelIdx + 1], "clarke-1.0");
 });
 
+for (const tier of ["deep", "balanced", "fast"] as const) {
+  test(`POST with tier "${tier}" and no router never puts a tier alias in --model`, async () => {
+    const driver = new ScriptedFakeVm();
+    install(driver);
+    const res = await postTask({ prompt: "Build it", tier });
+    assert.equal(res.status, 201);
+    await waitForRuns((r) => r.length === 1 && r[0].status !== "running");
+    const cmd = agentCalls(driver)[0].cmd;
+    assert.equal(cmd.indexOf("--model"), -1, `host-env fallback must not run claude --model ${tier}`);
+  });
+}
+
+test("POST rejects an unknown tier", async () => {
+  install(new ScriptedFakeVm());
+  const res = await postTask({ prompt: "Build it", tier: "turbo" });
+  assert.equal(res.status, 400);
+});
+
 test("router-selected provider/model reach the task list with no requested model", async () => {
   const driver = new ScriptedFakeVm();
   const selection = {

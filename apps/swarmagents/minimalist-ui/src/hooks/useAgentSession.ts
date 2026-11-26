@@ -46,6 +46,7 @@ import {
   startRun,
   stopRun,
   withUploadManifest,
+  type RunTier,
   type RunsResult,
 } from "../../../lib/client/runs";
 import {
@@ -79,6 +80,8 @@ export interface AgentSessionOptions {
   fullAuto: boolean;
   /** "cloud" or "computer:<id>"; undefined uses the account default. */
   computeTarget?: string;
+  /** Model routing tier intent ("fast" | "balanced" | "deep"). */
+  tier?: RunTier;
 }
 
 /** A message the user sent that the server has not accepted as a run yet. */
@@ -567,8 +570,8 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
       }
       const sessionId = freshChat ? undefined : sessionToContinue(view.turns);
       const fullPrompt = withUploadManifest(prompt, uploadedFiles);
-      const { agentCard, fullAuto, computeTarget } = optionsRef.current;
-      const result = await startRun({ prompt: fullPrompt, sessionId, agentCard, fullAuto, computeTarget });
+      const { agentCard, fullAuto, computeTarget, tier } = optionsRef.current;
+      const result = await startRun({ prompt: fullPrompt, sessionId, agentCard, fullAuto, computeTarget, tier });
       if (!result.ok) return fail(result.error);
 
       // Show the run at once; the next poll replaces this with the server's row.

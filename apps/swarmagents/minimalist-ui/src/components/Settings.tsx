@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
-  AlertTriangle, Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, KeyRound, Loader2, LogOut, Plug, Plus, Sparkles, Trash2, X, Zap,
+  AlertTriangle, Check, ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, KeyRound, Loader2, LogOut, Play, Plug, Plus, Sparkles, Trash2, X, Zap,
 } from 'lucide-react';
 import {
   type ActiveRole, type ApiFormat, MAX_ROLES, MIN_ROLES, PROVIDERS, type ProviderConfig, ROLES, uid,
 } from '../data';
 import { callProvider } from '../engine';
+import { SampleTaskPicker } from './FirstRunSetup';
+import type { SampleTask } from '../lib/sampleTasks';
 import { RoleIcon } from './RoleIcon';
 import { ComputersSettings } from './ComputersSettings';
 import { AutopilotIdle } from './AutopilotIdle';
@@ -55,6 +57,7 @@ export function Settings({
   initialTab,
   agentPanel,
   onAlwaysOn247Change,
+  onRunSample,
 }: {
   open: boolean;
   onClose: () => void;
@@ -79,6 +82,8 @@ export function Settings({
   agentPanel?: React.ReactNode;
   /** Notified when the 24/7 always-on toggle loads or changes (for the header badge). */
   onAlwaysOn247Change?: (value: boolean) => void;
+  /** Dispatch a sample task through the normal run path (Account tab replay). */
+  onRunSample?: (sample: SampleTask) => Promise<{ ok: boolean; error?: string }>;
 }) {
   const [tab, setTab] = useState<Tab>(initialTab ?? tabs[0] ?? 'general');
   const [accent, setAccent] = useState<Accent>('cyan');
@@ -152,7 +157,7 @@ export function Settings({
           {tab === 'agent' && agentPanel}
           {tab === 'computers' && <ComputersSettings />}
           {tab === 'appearance' && <Appearance accent={accent} setAccent={setAccent} showHelpers={showHelpers} setShowHelpers={setShowHelpers} />}
-          {tab === 'account' && <Account />}
+          {tab === 'account' && <Account onRunSample={onRunSample} />}
           {tab === 'memory' && <Memory />}
         </div>
       </aside>
@@ -2216,7 +2221,11 @@ export function validatePasswordChange(current: string, next: string, confirm: s
   return null;
 }
 
-function Account() {
+function Account({
+  onRunSample,
+}: {
+  onRunSample?: (sample: SampleTask) => Promise<{ ok: boolean; error?: string }>;
+}) {
   const [email, setEmail] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
@@ -2319,6 +2328,19 @@ function Account() {
     <div className="space-y-6">
       <section>
         <Label>Account</Label>
+        {onRunSample && (
+          <div className="rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10" data-testid="settings-sample-tasks">
+            <div className="flex items-center gap-2 text-xs font-medium text-white/85">
+              <Play className="h-3.5 w-3.5" /> Run a sample task
+            </div>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-white/40">
+              Replay a first-run task — each takes 1–3 minutes and leaves a deliverable file in your workspace.
+            </p>
+            <div className="mt-3">
+              <SampleTaskPicker onRunSample={onRunSample} testIdPrefix="settings-sample" />
+            </div>
+          </div>
+        )}
         <div className="rounded-2xl bg-white/[0.04] p-3 ring-1 ring-white/10">
           <div className="flex items-center justify-between gap-3">
             <div>

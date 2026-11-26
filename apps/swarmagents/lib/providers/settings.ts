@@ -92,6 +92,12 @@ export interface UserSettings {
    * Absent = 1 (a single candidate, the historical behavior).
    */
   bestOfN?: number;
+  /**
+   * The account finished its first-run onboarding (ran a sample task to
+   * completion). Absent = incomplete: a fresh account still sees the
+   * first-run setup wizard.
+   */
+  firstRunCompleted?: boolean;
 }
 
 /**
@@ -176,6 +182,11 @@ export function vmPersistenceModeFor(settings: UserSettings): VmPersistenceMode 
 /** Is 24/7 always-on VM mode enabled for this user? Absent = off. */
 export function alwaysOn247For(settings: UserSettings): boolean {
   return settings.alwaysOn247 === true;
+}
+
+/** Has this account completed the first-run onboarding sample? Absent = false. */
+export function firstRunCompletedFor(settings: UserSettings): boolean {
+  return settings.firstRunCompleted === true;
 }
 
 /** Per-user token-efficiency controls; all opt-in, all default off. */
@@ -445,6 +456,7 @@ export function parseUserSettings(raw: unknown): UserSettings {
   if (typeof raw.enableAtlas === "boolean") out.enableAtlas = raw.enableAtlas;
   if (typeof raw.oraclePostRun === "boolean") out.oraclePostRun = raw.oraclePostRun;
   if (typeof raw.bestOfN === "number" && Number.isFinite(raw.bestOfN)) out.bestOfN = clampBestOfN(raw.bestOfN);
+  if (typeof raw.firstRunCompleted === "boolean") out.firstRunCompleted = raw.firstRunCompleted;
   return out;
 }
 

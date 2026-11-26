@@ -13,6 +13,7 @@ import { assertResolvableProviderBaseUrl } from "@/lib/providers/url-safety";
 import { JsonBodyError, readJsonBody } from "@/lib/http";
 import {
   alwaysOn247For,
+  firstRunCompletedFor,
   KEY_SELECTION_MODES,
   MAX_BEST_OF_N,
   MAX_SEARCH_KEY_CHARS,
@@ -58,6 +59,7 @@ function publicSettings(settings: UserSettings): Record<string, unknown> {
     alwaysOn247: alwaysOn247For(settings),
     oraclePostRun: settings.oraclePostRun === true,
     bestOfN: bestOfNFor(settings),
+    firstRunCompleted: firstRunCompletedFor(settings),
   };
   if (settings.webSearch) {
     out.webSearch = {
@@ -382,6 +384,12 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: "oraclePostRun must be a boolean." }, { status: 400 });
     }
     patch.oraclePostRun = input.oraclePostRun;
+  }
+  if ("firstRunCompleted" in input) {
+    if (typeof input.firstRunCompleted !== "boolean") {
+      return NextResponse.json({ error: "firstRunCompleted must be a boolean." }, { status: 400 });
+    }
+    patch.firstRunCompleted = input.firstRunCompleted;
   }
   if ("bestOfN" in input) {
     const value = input.bestOfN;

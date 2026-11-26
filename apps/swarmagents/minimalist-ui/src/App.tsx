@@ -33,6 +33,8 @@ import { firstRunSetup, useIsWide, useMe, useProviderStatus } from "./hooks/useE
 import { cn } from "./utils/cn";
 import { ApprovalGate } from "./components/ApprovalGate";
 import { BoardPanel } from "./components/BoardPanel";
+import { FirstRunSetup } from "./components/FirstRunSetup";
+import type { SampleTask } from "./lib/sampleTasks";
 import { Composer, type ComposerSendResult } from "./components/Composer";
 import { useComputeOptions } from "./components/ComputePicker";
 import type { ComputerView } from "./components/ComputerScreen";
@@ -122,19 +124,24 @@ export default function App() {
   const me = useMe();
   const providerStatus = useProviderStatus();
   const compute = useComputeOptions(undefined);
-  // 24/7 badge in the header: read the account setting once on mount; the
-  // Settings toggle notifies us immediately when the user flips it.
+  // 24/7 badge in the header + the first-run completion flag: read the
+  // account settings once on mount; the Settings toggle notifies us
+  // immediately when the user flips always-on.
   const [alwaysOn247, setAlwaysOn247] = useState(false);
+  const [firstRunCompleted, setFirstRunCompleted] = useState(false);
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
         const res = await fetch('/api/providers/settings', { headers: { Accept: 'application/json' } });
         if (!res.ok) return;
-        const body = (await res.json()) as { alwaysOn247?: unknown };
-        if (!cancelled && typeof body.alwaysOn247 === 'boolean') setAlwaysOn247(body.alwaysOn247);
+        const body = (await res.json()) as { alwaysOn247?: unknown; firstRunCompleted?: unknown };
+        if (!cancelled) {
+          if (typeof body.alwaysOn247 === 'boolean') setAlwaysOn247(body.alwaysOn247);
+          if (typeof body.firstRunCompleted === 'boolean') setFirstRunCompleted(body.firstRunCompleted);
+        }
       } catch {
-        // offline / unsigned — the badge stays hidden
+        // offline / unsigned — badges stay hidden, first-run stays unknown
       }
     })();
     return () => { cancelled = true; };
@@ -285,6 +292,23 @@ export default function App() {
     [session, setView, wide],
   );
 
+  /**
+   * Dispatch a first-run sample task through the normal run path. The wizard
+   * (or the Settings replay entry) closes and the workspace lands on the live
+   * run; completion is persisted separately when the run finishes.
+   */
+  const handleSampleTask = useCallback(
+    async (sample: SampleTask): Promise<{ ok: boolean; error?: string }> => {
+      const result = await session.send(sample.prompt, [], { displayText: sample.title });
+      if (!result.ok) return { ok: false, error: result.error };
+      setSetupDismissed(true);
+      setSettings((current) => ({ ...current, open: false }));
+      if (wide) setView("screen");
+      return { ok: true };
+    },
+    [session, wide, setView],
+  );
+
   const handleStop = useCallback(async () => {
     stopDuringSendRef.current = true;
     setStopping(true);
@@ -433,9 +457,10 @@ export default function App() {
 
 
   // A zero-provider account cannot start a run. Instead of letting the first
-  // send fail, the workspace blocks the composer with the reason and (for a
-  // fresh account) routes straight to provider setup — once per visit, so
-  // closing Settings without adding a key does not reopen it.
+  // send fail, the workspace blocks the composer with the reason — and for a
+  // fresh account that has not completed onboarding, the first-run wizard
+  // (provider → key test → sample task) replaces the stage. "Set up later"
+  // hides the wizard for the visit; the composer notice takes over.
   const setup = firstRunSetup({
     providerState: providerStatus.state,
     signedOut: session.signedOut,
@@ -443,14 +468,29 @@ export default function App() {
     threadsReady: session.threadsState === "ready",
     turns: session.turns.length,
     threads: session.threads.length,
+    firstRunCompleted,
   });
-  const routedToSetup = useRef(false);
+  const [setupDismissed, setSetupDismissed] = useState(false);
+  const showFirstRun = setup.firstRun && !setupDismissed;
+
+  // Once a run finishes, the account has seen "I watched it do something":
+  // persist completion so the wizard never reappears (Settings keeps the
+  // "Run a sample task" replay entry).
   useEffect(() => {
-    if (!setup.firstRun || routedToSetup.current) return;
-    routedToSetup.current = true;
-    // Never yank a Settings sheet the user already opened themselves.
-    if (!settings.open) openSettings("providers");
-  }, [setup.firstRun, settings.open, openSettings]);
+    if (firstRunCompleted || phase !== "finished") return;
+    void (async () => {
+      try {
+        const res = await fetch("/api/providers/settings", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ firstRunCompleted: true }),
+        });
+        if (res.ok) setFirstRunCompleted(true);
+      } catch {
+        // offline — next finished run tries again
+      }
+    })();
+  }, [phase, firstRunCompleted]);
 
   const activeThreadId = activeRun ? (activeRun.sessionId ?? activeRun.runId) : undefined;
   const headDuration =
@@ -541,7 +581,14 @@ export default function App() {
               </button>
             )}
           </div>
-          {showHero && (
+          {showFirstRun ? (
+            <FirstRunSetup
+              onRunSample={handleSampleTask}
+              onLater={() => setSetupDismissed(true)}
+            />
+          ) : (
+            <>
+              {showHero && (
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 py-10 text-center" data-testid="workspace-hero">
               <div className="neo-pill mb-5 grid h-16 w-16 place-items-center rounded-[22px] p-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.22),0_0_32px_-8px_rgba(0,208,240,0.4)]">
                 <img src="/brand/mark-dark.svg" alt="" width={56} height={56} className="h-11 w-11" />
@@ -633,9 +680,14 @@ export default function App() {
               className="flex-1"
             />
           )}
+            </>
+          )}
         </section>
 
-        {/* Component 1: the bottom input bar — any attachment. */}
+        {/* Component 1: the bottom input bar — any attachment. Hidden while
+            the first-run wizard is up: the wizard owns that space, and the
+            provider notice would duplicate its "add a key" ask. */}
+        {!showFirstRun && (
         <section className="mx-auto w-full max-w-3xl shrink-0 pb-3 sm:pb-0" aria-label="Ask the agent">
           {session.signedOut ? (
             <Notice
@@ -681,6 +733,7 @@ export default function App() {
             inputRef={composerRef}
           />
         </section>
+        )}
       </main>
 
       {/* Floating Approval Gate for Risky Actions */}
@@ -723,6 +776,7 @@ export default function App() {
         busy={busy}
         onResetVm={handleResetVm}
         onAlwaysOn247Change={setAlwaysOn247}
+        onRunSample={handleSampleTask}
       />
 
       {/* Slide-over Keyboard Shortcuts Help */}

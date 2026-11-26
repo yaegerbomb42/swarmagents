@@ -94,6 +94,11 @@ export interface FirstRunSetupInput {
   turns: number;
   /** Conversations on the account. */
   threads: number;
+  /**
+   * The account already completed the first-run sample task; the wizard must
+   * never reappear.
+   */
+  firstRunCompleted?: boolean;
 }
 
 export interface FirstRunSetup {
@@ -113,15 +118,21 @@ export interface FirstRunSetup {
  * notice and blocked reason already say what to do.
  *
  * `firstRun` additionally requires a fresh account (no runs, no
- * conversations, both lists actually loaded): that is the just-signed-up
- * case the workspace routes straight to provider setup. An established
- * account that removed its only provider gets the blocked composer and
- * the notice, but is not yanked into Settings.
+ * conversations, both lists actually loaded) that has not already completed
+ * the onboarding sample: that is the just-signed-up case the workspace
+ * routes to the first-run wizard. An established account that removed its
+ * only provider gets the blocked composer and the notice, but is not yanked
+ * into setup.
  */
 export function firstRunSetup(input: FirstRunSetupInput): FirstRunSetup {
   const needsProvider = input.providerState === "missing" && !input.signedOut;
   const firstRun =
-    needsProvider && input.ready && input.threadsReady && input.turns === 0 && input.threads === 0;
+    needsProvider &&
+    input.ready &&
+    input.threadsReady &&
+    input.turns === 0 &&
+    input.threads === 0 &&
+    input.firstRunCompleted !== true;
   return { needsProvider, firstRun };
 }
 

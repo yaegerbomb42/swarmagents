@@ -1987,3 +1987,56 @@ test("autoCondenseLogs filters oversized tool.result logs via observation-filter
   assert.ok(!onResult.output.includes(SECRET_TOKEN));
   assert.ok(onResult.output.includes("[REDACTED]"));
 });
+
+test("tool.result event never carries raw screenshot base64 (image marker instead)", async () => {
+  // A screenshot tool result: a short text part plus a large base64 image
+  // block, exactly what the desktop computer-use tools return.
+  const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ".repeat(200);
+  const shotFixture = [
+    INIT,
+    {
+      type: "assistant",
+      message: {
+        id: "m-shot",
+        content: [{ type: "tool_use", id: "toolu_shot", name: "screenshot", input: {} }],
+      },
+    },
+    {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_shot",
+            content: [
+              { type: "text", text: "screenshot taken" },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: imageData } },
+            ],
+            is_error: false,
+          },
+        ],
+      },
+    },
+    { type: "assistant", message: { id: "m-done", content: [{ type: "text", text: "Done." }] } },
+    RESULT,
+  ]
+    .map((l) => JSON.stringify(l))
+    .join("\n") + "\n";
+
+  const vm = new ScriptedVm([{ chunks: [shotFixture] }]);
+  const runner = new ClaudeCodeRunner({ bin: "claude" });
+  const events: TelemetryEvent[] = [];
+  const outcome = await runner.run({ prompt: "Take a screenshot", env: envWithSecrets, vm }, (e) => events.push(e));
+  assert.equal(outcome.exitCode, 0);
+
+  const results = events.filter((e): e is Extract<TelemetryEvent, { type: "tool.result" }> => e.type === "tool.result");
+  assert.equal(results.length, 1);
+  assert.ok(results[0].output.includes("screenshot taken"), "text part survives");
+  assert.ok(
+    results[0].output.includes("[image output (image/png,"),
+    "image block is replaced by a short marker",
+  );
+  assert.ok(!results[0].output.includes(imageData), "raw base64 must not reach the event stream");
+  assert.ok(results[0].output.length < 1000, "event output stays small");
+});

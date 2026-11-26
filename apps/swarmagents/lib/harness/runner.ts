@@ -40,7 +40,7 @@ import type {
 } from "./types";
 import { isMetaTool } from "../self-manage/session";
 import { createStreamJsonParser } from "./stream-json";
-import { filterObservation } from "./observation-filter";
+import { compactToolResultText } from "./context/turn-compaction";
 import { GateQueue } from "./gate-queue";
 import { makeRedactor, redactValue } from "./redact";
 import { classifyToolCall } from "./risk";
@@ -435,8 +435,6 @@ export class ClaudeCodeRunner {
     /** ProgressWatchdog loop state: tool_use id -> tool name, turn count. */
     let watchdogTurnCount = 0;
     const watchdogToolNames = new Map<string, string>();
-    /** tool_use id -> Bash command (for observation-filter kind detection). */
-    const toolCallCommands = new Map<string, string>();
 
     // Role switching: a validated set_role call aborts this invocation (via an
     // internal signal the manager never sees) so the run can resume with the
@@ -623,9 +621,6 @@ export class ClaudeCodeRunner {
               const toolId = typeof block.id === "string" ? block.id : undefined;
               if (toolId) {
                 watchdogToolNames.set(toolId, name);
-                if (name === "Bash" && isObject(input) && typeof input.command === "string") {
-                  toolCallCommands.set(toolId, input.command);
-                }
               }
               emit({
                 type: "tool.call",
@@ -921,19 +916,17 @@ export class ClaudeCodeRunner {
           for (const block of content) {
             if (!isObject(block) || block.type !== "tool_result") continue;
             const resultId = typeof block.tool_use_id === "string" ? block.tool_use_id : undefined;
-            const command = resultId ? toolCallCommands.get(resultId) : undefined;
-            if (resultId) toolCallCommands.delete(resultId);
             const rawOutput = renderToolOutput(block, redact);
+            // Live turn compaction (core-07): the same shared helper the
+            // gateway applies to model-bound history, here for the harness
+            // event stream. Opt-in via request.autoCondenseLogs; the raw
+            // output is untouched when the switch is off.
             const output =
-              request.autoCondenseLogs === true && rawOutput.length > AUTO_CONDENSE_THRESHOLD_CHARS
-                ? filterObservation({
-                    command,
-                    output: rawOutput,
-                    turnId: `turn-${watchdogTurnCount + 1}`,
-                    toolId: resultId,
+              request.autoCondenseLogs === true
+                ? compactToolResultText(rawOutput, {
+                    thresholdChars: AUTO_CONDENSE_THRESHOLD_CHARS,
                     maxInlineChars: AUTO_CONDENSE_MAX_CHARS,
-                    allowSpill: false,
-                  }).text
+                  })
                 : rawOutput;
             const ok = block.is_error !== true;
             emit({
@@ -1531,6 +1524,20 @@ function describeAction(name: string, input: unknown): string {
   return name;
 }
 
+/**
+ * Render one tool_result block's content as the event-stream text.
+ * Image blocks are NOT inlined: a screenshot's base64 payload would flood
+ * the SSE stream (and every consumer) with megabytes per event. They are
+ * replaced by a short marker naming the media type and approximate size.
+ */
+function imageOutputMarker(item: Record<string, unknown>): string {
+  const source = isObject(item.source) ? item.source : {};
+  const mediaType = typeof source.media_type === "string" ? source.media_type : "image";
+  const data = typeof source.data === "string" ? source.data : "";
+  const approxBytes = Math.floor((data.length * 3) / 4);
+  return `[image output (${mediaType}, ~${approxBytes} bytes) omitted from event stream]`;
+}
+
 function renderToolOutput(block: Record<string, unknown>, redact: (text: string) => string): string {
   const content = block.content;
   if (typeof content === "string") return redact(content);
@@ -1540,6 +1547,7 @@ function renderToolOutput(block: Record<string, unknown>, redact: (text: string)
       if (typeof item === "string") parts.push(item);
       else if (isObject(item)) {
         if (item.type === "text" && typeof item.text === "string") parts.push(item.text);
+        else if (item.type === "image") parts.push(imageOutputMarker(item));
         else parts.push(JSON.stringify(item));
       }
     }

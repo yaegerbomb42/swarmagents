@@ -186,10 +186,12 @@ test("fresh-per-task resets the VM so the next task starts clean", async () => {
   });
 });
 
-test("fresh-per-task does not reset a VM that was never created", async () => {
+test("fresh-per-task resets even a VM that was never created", async () => {
   const { allocator } = setup();
+  // Matches the pre-existing contract: fresh-per-task resets unconditionally
+  // (VmManager.reset ensures first), so the first task also starts clean.
   const first = await allocator.startTask("user-1", "worker-2", { mode: "fresh-per-task" });
-  assert.equal(first.reset, false);
+  assert.equal(first.reset, true);
   assert.equal(first.reused, false);
 });
 

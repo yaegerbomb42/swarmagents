@@ -271,7 +271,11 @@ export class AgentVmAllocator {
     const ownerKey = agentOwnerKey(userId, agentId);
     const facts: VmStartFacts = { seedSnapshotLabel: opts?.seedSnapshotLabel };
     const mode = opts?.mode ?? "persistent";
-    if (shouldResetVmAtRunStart(mode, facts) && this.manager.isVmLive(ownerKey)) {
+    // Fresh-per-task always resets, even on the first task: the previous
+    // contract (and its pinned test) resets unconditionally, and
+    // VmManager.reset ensures the VM first, so a never-created VM is
+    // created and then wiped — the task still starts clean.
+    if (shouldResetVmAtRunStart(mode, facts)) {
       await this.manager.reset(ownerKey);
       const handle = await this.manager.ensure(ownerKey);
       this.recordAllocation(userId, agentId, ownerKey, handle);

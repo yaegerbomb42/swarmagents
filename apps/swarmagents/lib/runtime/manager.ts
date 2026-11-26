@@ -3323,7 +3323,15 @@ export class RuntimeManager {
       return;
     }
 
-    if (active.controller.signal.aborted) return;
+    // NOTE: no abort check here on purpose. A cancel that lands while the
+    // VM is starting must not silently drop the run before its agent ever
+    // spawns: whether the run reached the runner used to depend on whether
+    // the cancel landed before or after a ~10ms ensure, and the per-agent
+    // allocator widened that window until a just-started run reliably lost
+    // the race (its claude spawn never happened, breaking the new_thread
+    // contract). The harness owns aborting the spawn — the runner passes
+    // the aborted signal to the VM exec, which refuses promptly — so the
+    // run still finalizes as cancelled, just after reaching the runner.
     const ensureMs = Date.now() - ensureStartedAt;
     this.touchActivity(active);
     this.bus.publish(runId, { type: "vm.ready", data: { ms: ensureMs, durationMs: ensureMs } });

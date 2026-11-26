@@ -73,6 +73,12 @@ export interface TimelineStep {
   diff?: TracePreview;
   /** The workspace file the step is about (read or written), when known. */
   file?: string;
+  /**
+   * The auto-checkpoint snapshotted right before this call executed (F1);
+   * the Rewind button restores the VM to it. Present only for gate-time
+   * checkpoints — turn-boundary checkpoints guard no tool.
+   */
+  checkpoint?: { stepSeq: number; label: string };
 }
 
 /** One stretch of tool work between agent messages. */
@@ -305,6 +311,7 @@ export function buildTraceTimeline(items: readonly RunStreamItem[]): TimelineStr
   let steps: TimelineStep[] = [];
   let stretchCounter = 0;
   let callCounter = 0;
+  let pendingCheckpoint: { stepSeq: number; label: string } | undefined;
 
   const startStretch = () => {
     steps = [];
@@ -329,6 +336,22 @@ export function buildTraceTimeline(items: readonly RunStreamItem[]): TimelineStr
 
   for (const item of items) {
     const data = payloadOf(item);
+    // A gate-time checkpoint was taken for the tool call that follows it:
+    // hold it until that step exists, then pin it to the step card so the
+    // Rewind button has its restore point. Turn-boundary checkpoints carry
+    // no tool and guard no step, so they are skipped.
+    if (item.kind === "checkpoint.created") {
+      const tool = asString(data.tool);
+      const stepSeq = data.stepSeq;
+      const label = asString(data.label);
+      if (tool && typeof stepSeq === "number" && Number.isSafeInteger(stepSeq) && stepSeq > 0 && label) {
+        pendingCheckpoint = { stepSeq, label };
+      }
+      continue;
+    }
+    if (item.kind === "run.finished" || item.kind === "run.error" || item.kind === "run.cancelled") {
+      pendingCheckpoint = undefined;
+    }
     switch (item.kind) {
       case "assistant.text": {
         const text = typeof item.data === "string" ? item.data : asString(data.text);
@@ -394,7 +417,9 @@ export function buildTraceTimeline(items: readonly RunStreamItem[]): TimelineStr
           startedAt: item.ts,
           preview: label,
           ...(fileArg(data.input) ? { file: fileArg(data.input) } : {}),
+          ...(pendingCheckpoint ? { checkpoint: pendingCheckpoint } : {}),
         };
+        pendingCheckpoint = undefined;
         const diff = kind === "edit" ? buildEditDiff(name, data.input) : undefined;
         if (diff) step.diff = diff;
         currentSteps().push(step);

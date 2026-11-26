@@ -11,7 +11,7 @@
  */
 
 import React, { useMemo, useState } from "react";
-import { Check, ChevronRight, Clipboard, ClipboardCheck, Loader2, X } from "lucide-react";
+import { Check, ChevronRight, Clipboard, ClipboardCheck, History, Loader2, X } from "lucide-react";
 import {
   formatTraceDuration,
   summarizeTraceStretch,
@@ -97,7 +97,63 @@ function CopyButton({ text, label }: { text: string; label: string }) {
   );
 }
 
-function StepCard({ step }: { step: TimelineStep }) {
+/**
+ * core-17 Rewind: restore the user's VM to the checkpoint this step's call is
+ * guarded by. Self-contained: it knows the run from props and posts to the
+ * rewind API, showing its own progress and outcome inline.
+ */
+function RewindButton({ runId, stepSeq, label }: {
+  readonly runId: string;
+  readonly stepSeq: number;
+  readonly label: string;
+}) {
+  const [state, setState] = useState<"idle" | "rewinding" | "done" | "error">("idle");
+  const [error, setError] = useState<string>();
+  const rewind = async () => {
+    setState("rewinding");
+    setError(undefined);
+    try {
+      const res = await fetch(`/api/runtime/runs/${encodeURIComponent(runId)}/rewind`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ checkpointSeq: stepSeq }),
+      });
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      if (!res.ok) {
+        throw new Error(body?.error ?? `Rewind failed (${res.status}).`);
+      }
+      setState("done");
+    } catch (err) {
+      setState("error");
+      setError(err instanceof Error ? err.message : "Rewind failed.");
+    }
+  };
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1">
+      {state === "error" && <span className="text-[11px] text-sa-err">{error}</span>}
+      <button
+        type="button"
+        onClick={() => void rewind()}
+        disabled={state === "rewinding" || state === "done"}
+        title={`Restore the VM to ${label} — before this step ran`}
+        aria-label={`Rewind VM to ${label}`}
+        data-testid="trace-rewind"
+        className="inline-flex shrink-0 items-center gap-1 rounded-md border border-sa-line bg-sa-panel px-2 py-1 text-[11px] font-medium text-sa-fg2 transition-colors hover:bg-sa-hover hover:text-sa-fg disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {state === "rewinding" ? (
+          <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+        ) : state === "done" ? (
+          <Check className="h-3 w-3 text-sa-ok" aria-hidden />
+        ) : (
+          <History className="h-3 w-3" aria-hidden />
+        )}
+        {state === "done" ? "Rewound" : "Rewind"}
+      </button>
+    </span>
+  );
+}
+
+function StepCard({ step, runId }: { step: TimelineStep; runId?: string }) {
   const [open, setOpen] = useState(false);
   const hasBody = step.diff !== undefined;
   const showPreview = step.preview !== step.label;
@@ -127,6 +183,9 @@ function StepCard({ step }: { step: TimelineStep }) {
           {KIND_LABEL[step.kind]}
         </span>
         <span className="sa-mono min-w-0 flex-1 truncate text-[12.5px] text-sa-fg2">{step.label}</span>
+        {step.checkpoint && runId && (
+          <RewindButton runId={runId} stepSeq={step.checkpoint.stepSeq} label={step.checkpoint.label} />
+        )}
         {step.durationMs !== undefined && step.durationMs > 0 && step.status !== "running" && (
           <span className="sa-tabular shrink-0 text-[12px] text-sa-fg3">{formatTraceDuration(step.durationMs)}</span>
         )}
@@ -170,9 +229,12 @@ function StepCard({ step }: { step: TimelineStep }) {
  */
 export function RunTraceTimeline({
   steps,
+  runId,
   defaultOpen = false,
 }: {
   steps: readonly TimelineStep[];
+  /** The run whose VM the Rewind buttons restore into; omitted hides them. */
+  runId?: string;
   defaultOpen?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
@@ -211,7 +273,7 @@ export function RunTraceTimeline({
       {open && (
         <ol className="border-t border-sa-line py-1">
           {steps.map((step) => (
-            <StepCard key={step.id} step={step} />
+            <StepCard key={step.id} step={step} runId={runId} />
           ))}
         </ol>
       )}

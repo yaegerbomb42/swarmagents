@@ -2470,6 +2470,57 @@ export class RuntimeManager {
     return { ...started, sourceRunId: input.sourceRunId, checkpointLabel };
   }
 
+  /**
+   * core-17 rewind: restore one of a run's auto-checkpoints into the user's
+   * VM in place — the opposite of fork, which snapshots into a new run. The
+   * workspace rolls back to the checkpoint's known-good state; the run's
+   * telemetry, log, and report are untouched (history is not rewritten, the
+   * *machine* is).
+   *
+   * Refused while a run is active or queued for the user (including a live
+   * team run): a restore recreates the VM under the agent, which would clobber
+   * in-flight work — the same reason a fork queues its seed restore until it
+   * starts. A missing checkpoint is refused with the fork's exact phrasing so
+   * both surfaces behave the same.
+   */
+  async rewind(
+    userId: string,
+    input: {
+      runId: string;
+      /** Step seq (number) or display label ("auto-pre-step-12"). */
+      checkpoint: number | string;
+    },
+  ): Promise<
+    | { ok: true; runId: string; checkpointLabel: string; vmLabel: string; stepSeq: number; restoredAt: number }
+    | { ok: false; error: string }
+  > {
+    if (!this.ownsRun(userId, input.runId)) return { ok: false, error: "Run not found." };
+    const stepSeq = resolveCheckpointStepSeq(input.checkpoint);
+    if (stepSeq === null) {
+      return { ok: false, error: "checkpoint must be a step number or an auto-pre-step-<n> label" };
+    }
+    const st = this.users.get(userId);
+    if (st?.active || isTeamRunActive(input.runId)) {
+      return { ok: false, error: "A run is active on this VM. Stop it before rewinding." };
+    }
+    if ((st?.queue.length ?? 0) > 0) {
+      return { ok: false, error: "Runs are queued on this VM. Let them finish before rewinding." };
+    }
+    const checkpointLabel = checkpointDisplayLabel(stepSeq);
+    const vmLabel = checkpointVmLabel(input.runId, stepSeq);
+    let snapshots: { label: string }[];
+    try {
+      snapshots = await this.vm.listSnapshots(userId);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    if (!snapshots.some((snapshot) => snapshot.label === vmLabel)) {
+      return { ok: false, error: `Checkpoint ${checkpointLabel} not found for run ${input.runId}.` };
+    }
+    await this.vm.restore(userId, vmLabel);
+    return { ok: true, runId: input.runId, checkpointLabel, vmLabel, stepSeq, restoredAt: Date.now() };
+  }
+
   /** Move the next queued prompt into the active slot and execute it. */
   private startNext(userId: string): void {
     const st = this.users.get(userId);

@@ -527,12 +527,12 @@ export default function App() {
           phase,
           since: headRun?.createdAt,
           durationMs: headDuration,
-           activity: session.activity,
-           servingModel: servingModelLabel,
-           stopping,
-           onStop: () => void handleStop(),
-           onShow: showRun,
-         }}
+          activity: session.activity,
+          servingModel: servingModelLabel,
+          stopping,
+          onStop: () => void handleStop(),
+          onShow: showRun,
+        }}
         onOpenSettings={() => openSettings("providers")}
         settingsNeedsAttention={providerStatus.state === "missing"}
         onOpenShortcuts={() => setShortcutsOpen(true)}

@@ -15,8 +15,6 @@ import { ChevronDown, HelpCircle, Plug, Settings as SettingsIcon, Square, Square
 import { MascotDock } from "../../../components/mascot/MascotDock";
 import type { MascotState } from "../../../components/mascot/frames";
 import { RUN_PHASE_META, formatDuration, type RunPhase, type StatusTone } from "../../../lib/client/runPhase";
-import { reduceServingModel, formatServingModel } from "../../../lib/client/servingModel";
-import type { RunStreamItem } from "../../../lib/client/useRunStream";
 import { cn } from "../utils/cn";
 import { Elapsed } from "./Conversation";
 import { StatusPill, type PillTone } from "../design/primitives";
@@ -44,25 +42,14 @@ export interface RunIndicatorProps {
   onStop: () => void;
   /** Go to the run (its screen while it runs, its result once it ends). */
   onShow: () => void;
-  /** Serving provider/model label or stream items to derive it from. */
-  servingModel?: string | Record<string, unknown>;
-  serving?: Record<string, unknown>;
-  items?: RunStreamItem[];
+  /** "provider · model" actually serving the run (core-34). */
+  servingModel?: string;
 }
 
-export function RunIndicator({ phase, since, durationMs, activity, stopping, onStop, onShow, servingModel, serving, items }: RunIndicatorProps) {
+export function RunIndicator({ phase, since, durationMs, activity, stopping, onStop, onShow, servingModel }: RunIndicatorProps) {
   if (!phase) return null;
   const meta = RUN_PHASE_META[phase];
-  const servingLabel =
-    typeof servingModel === "string"
-      ? servingModel
-      : servingModel
-        ? formatServingModel(servingModel)
-        : serving
-          ? formatServingModel(serving)
-          : items
-            ? formatServingModel(reduceServingModel(items))
-            : undefined;
+  const servingLabel = servingModel;
   return (
     <div className="flex min-w-0 items-center gap-1.5" data-testid="run-indicator" data-phase={phase}>
       <button

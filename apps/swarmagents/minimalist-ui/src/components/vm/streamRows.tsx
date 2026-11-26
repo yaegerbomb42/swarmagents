@@ -25,6 +25,7 @@ import { AnsiRenderer } from "../../../../components/AnsiRenderer";
 import { useStickToBottom } from "../../../../lib/client/useStickToBottom";
 import { lifecycleEventLine, redactEventData } from "../../../../lib/client/runTimeline";
 import type { RunStreamItem, RunStreamState } from "../../../../lib/client/useRunStream";
+import { poolEventOf } from "../../../../lib/client/servingModel";
 import type { LogEvent } from "../../engine";
 import type { Presence } from "../../../../lib/client/presence";
 import { cn } from "../../utils/cn";
@@ -274,18 +275,15 @@ export function StreamRow({ item, live = false }: { item: RunStreamItem; live?: 
       return <SystemLine text={parts.length > 0 ? `run started · ${parts.join(" · ")}` : "run started"} />;
     }
     case "provider.pool": {
-      const d = payload as { type?: string; provider?: string; model?: string; reason?: string };
-      if (d.type === "pool.attempt" && d.reason === "failover") {
-        const parts = [d.provider, d.model].filter((value): value is string => typeof value === "string" && value !== "");
-        const label = parts.length > 0 ? parts.join(" · ") : "failover";
-        return <SystemLine text={`→ ${label} (failover)`} tone="muted" />;
-      }
-      if (d.type === "pool.failover") {
-        return <SystemLine text="failover" tone="muted" />;
+      // eventPayload lets the outer `type: "provider.pool"` win, so read the
+      // RunPoolEvent itself.
+      const d = (poolEventOf(item) ?? {}) as { type?: string; provider?: string; model?: string; reason?: string };
+      const parts = [d.provider, d.model].filter((value): value is string => typeof value === "string" && value !== "");
+      if (d.type === "pool.attempt" && (d.reason === "failover" || d.reason === "family-switch")) {
+        return <SystemLine text={`→ ${parts.length > 0 ? parts.join(" · ") : "next provider"} (failover)`} tone="muted" />;
       }
       if (d.type === "pool.family") {
-        const parts = [d.model].filter((value): value is string => typeof value === "string" && value !== "");
-        return <SystemLine text={parts.length > 0 ? `switched model · ${parts.join(" · ")}` : "switched model family"} tone="muted" />;
+        return <SystemLine text={d.model ? `switched model · ${d.model}` : "switched model family"} tone="muted" />;
       }
       return null;
     }

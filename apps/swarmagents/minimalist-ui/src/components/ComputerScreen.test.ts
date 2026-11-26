@@ -138,3 +138,10 @@ test("log events render their text as a muted system line, never raw JSON", asyn
   assert.ok(!head.includes("run_oracle"), "no internal identifiers in the visible line");
   assert.ok(!head.includes("{"), "no JSON object in the visible line");
 });
+
+test("provider.pool failover renders the new provider + model (bus-wrapped event)", async () => {
+  const { StreamRow } = await load();
+  const it = item(5, "provider.pool", { type: "provider.pool", data: { type: "pool.attempt", provider: "openrouter", model: "deepseek-v3", reason: "failover" } });
+  const markup = renderToStaticMarkup(h(StreamRow, { item: it }));
+  assert.match(markup, /→ openrouter · deepseek-v3 \(failover\)/);
+});

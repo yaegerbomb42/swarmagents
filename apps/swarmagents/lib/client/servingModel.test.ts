@@ -33,3 +33,19 @@ test("missing fields: does not crash and leaves state empty", () => {
   assert.equal(state.model, undefined);
   assert.equal(formatServingModel(state), undefined);
 });
+
+test("wrapped bus events and run.started after the first attempt keep the pool's real model", () => {
+  const state = reduceServingModel([
+    item("provider.pool", { type: "provider.pool", data: { type: "pool.attempt", provider: "nim", model: "nemotron-30b", reason: "initial" } }, 1),
+    item("run.started", { provider: "nim", model: "claude-sonnet-4-5" }, 2),
+  ]);
+  assert.equal(formatServingModel(state), "nim · nemotron-30b");
+});
+
+test("family switch marks failover and shows the new model", () => {
+  const state = reduceServingModel([
+    item("run.started", { provider: "groq", model: "llama-3.3-70b" }, 1),
+    item("provider.pool", { type: "pool.family", from: "llama", to: "qwen", model: "qwen3-32b" }, 2),
+  ]);
+  assert.equal(formatServingModel(state), "→ groq · qwen3-32b (failover)");
+});

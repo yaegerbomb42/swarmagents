@@ -4,6 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { userDirName } from "../providers/store";
+import { configureRunsDir } from "../telemetry/paths";
+import { assembleReport, writeRunReport } from "../runtime/run-report";
+import { DESKTOP_REPLAY_FILE } from "../runtime/run-report-types";
+import type { SequencedEvent } from "../telemetry/bus";
 import {
   MAX_COMMANDS,
   MAX_OPEN_FILES,
@@ -21,6 +25,7 @@ import {
   mutateProject,
   resolveShareOwner,
   revokeShareLink,
+  setShareShowcase,
   shareIndexEntryPath,
   updateProject,
   userProjectsFilePath,
@@ -372,5 +377,130 @@ test("projects store: the migration never indexes a revoked link", () => {
     assert.equal(ensureShareIndex(), 0);
     assert.equal(fs.existsSync(shareIndexEntryPath(token)), false);
     assert.equal(getSharedProject(token), null);
+  });
+});
+
+/* -------------------------------------------------------------------------- *
+ * Replay showcase (core-32)
+ * -------------------------------------------------------------------------- */
+
+const FRAMES = Buffer.from([0, 0, 0, 0, 1, 0, 0, 0]);
+
+function seedRun(
+  runsDir: string,
+  runId: string,
+  userId: string,
+  opts: { prompt?: string; withReplay?: boolean } = {},
+): void {
+  const withReplay = opts.withReplay ?? true;
+  const report = assembleReport({
+    runId,
+    userId,
+    events: [{ type: "run.finished", seq: 1, runId, ts: 2 }] as unknown as SequencedEvent[],
+    createdAt: 1,
+    finishedAt: 2,
+    artifacts: [],
+    shots: [],
+    prompt: opts.prompt ?? "Build a landing page",
+    replay: withReplay
+      ? { file: DESKTOP_REPLAY_FILE, mime: "application/octet-stream", size: FRAMES.length, width: 1600, height: 900 }
+      : undefined,
+  });
+  writeRunReport(runId, report, runsDir);
+  if (withReplay) {
+    const dir = path.join(runsDir, "reports", runId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, DESKTOP_REPLAY_FILE), FRAMES);
+  }
+}
+
+test("share showcase: curating a finished run exposes a redacted showcase publicly", () => {
+  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-showcase-"));
+  configureRunsDir(runsDir);
+  withStore(() => {
+    try {
+      const project = createProject("alice", { name: "Showcase" });
+      const share = createShareLink("alice", project.id);
+      seedRun(runsDir, "run_1", "alice", {
+        prompt: "Deploy with key sk-test-showcase-000 secret and finish",
+      });
+
+      const showcase = setShareShowcase("alice", project.id, "run_1");
+      assert.equal(showcase.runId, "run_1");
+      assert.equal(showcase.status, "finished");
+
+      const view = getSharedProject(share.token);
+      assert.ok(view?.showcase);
+      assert.equal(view.showcase.runId, "run_1");
+      // The prompt is public (it is what Fork Prompt copies), but credentials
+      // in it are redacted before the view ever leaves the account.
+      assert.equal(view.showcase.prompt.includes("sk-test-showcase-000"), false);
+      assert.ok(view.showcase.prompt.includes("[redacted]"));
+      assert.equal(JSON.stringify(view.showcase).includes("/workspace"), false);
+      assert.equal(JSON.stringify(view.showcase).includes("alice"), false);
+    } finally {
+      configureRunsDir(null);
+      fs.rmSync(runsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("share showcase: a project without one stays null on the public view", () => {
+  withStore(() => {
+    const project = createProject("alice", { name: "Plain" });
+    const share = createShareLink("alice", project.id);
+    assert.equal(getSharedProject(share.token)?.showcase, null);
+  });
+});
+
+test("share showcase: rejections are typed and fail closed", () => {
+  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-showcase-reject-"));
+  configureRunsDir(runsDir);
+  withStore(() => {
+    try {
+      const project = createProject("alice", { name: "Guards" });
+      seedRun(runsDir, "run_alice", "alice", { withReplay: true });
+      seedRun(runsDir, "run_bob", "bob", { withReplay: true });
+      seedRun(runsDir, "run_noreplay", "alice", { withReplay: false });
+
+      // No share link yet.
+      assert.throws(() => setShareShowcase("alice", project.id, "run_alice"), (err: ProjectError) => err.status === 409);
+      createShareLink("alice", project.id);
+
+      assert.throws(() => setShareShowcase("alice", project.id, "bad$id"), (err: ProjectError) => err.status === 400);
+      // Another account's run can never be showcased.
+      assert.throws(() => setShareShowcase("alice", project.id, "run_bob"), (err: ProjectError) => err.status === 404);
+      // A run without a stored replay cannot promise one.
+      assert.throws(() => setShareShowcase("alice", project.id, "run_noreplay"), (err: ProjectError) => err.status === 409);
+
+      // Revoking the link removes the showcase from the public view entirely.
+      setShareShowcase("alice", project.id, "run_alice");
+      revokeShareLink("alice", project.id);
+      assert.equal(getSharedProject("f".repeat(48)), null);
+    } finally {
+      configureRunsDir(null);
+      fs.rmSync(runsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("share showcase: rotating the link keeps the curated showcase", () => {
+  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-showcase-rotate-"));
+  configureRunsDir(runsDir);
+  withStore(() => {
+    try {
+      const project = createProject("alice", { name: "Rotate" });
+      const first = createShareLink("alice", project.id);
+      seedRun(runsDir, "run_1", "alice", { withReplay: true });
+      setShareShowcase("alice", project.id, "run_1");
+
+      const second = createShareLink("alice", project.id);
+      assert.notEqual(second.token, first.token);
+      assert.equal(getSharedProject(first.token), null, "the old token stops resolving");
+      assert.equal(getSharedProject(second.token)?.showcase?.runId, "run_1");
+    } finally {
+      configureRunsDir(null);
+      fs.rmSync(runsDir, { recursive: true, force: true });
+    }
   });
 });

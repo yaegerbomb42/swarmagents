@@ -12,6 +12,9 @@
 // shell string. Values (text, keys, coordinates) are always separate argv
 // elements, so metacharacters cannot be interpreted by a shell.
 
+/** Names accepted by open_app (keys of the fixed launch allowlist below). */
+export const OPEN_APP_NAMES = Object.freeze(["browser", "terminal", "files", "libreoffice", "spreadsheet", "gimp", "blender"]);
+
 /** Tools this server exposes. */
 export const COMPUTER_TOOLS = Object.freeze([
   "screenshot",
@@ -43,6 +46,7 @@ const OPEN_APPS = Object.freeze({
   terminal: Object.freeze(["xfce4-terminal"]),
   files: Object.freeze(["thunar"]),
   libreoffice: Object.freeze(["lowriter"]),
+  spreadsheet: Object.freeze(["localc"]),
   gimp: Object.freeze(["gimp"]),
   blender: Object.freeze(["blender"]),
 });
@@ -170,8 +174,9 @@ function scrollArgs(args) {
 /** Validate an `open_app` call; the name maps to a fixed launch argv. */
 function openAppArgs(args) {
   const name = typeof args.name === "string" ? args.name.trim() : "";
-  const launch = OPEN_APPS[name];
-  if (!launch) return invalid("name must be \"browser\", \"terminal\" or \"files\".");
+  // Own keys only: "toString"/"constructor" must not resolve through the prototype.
+  const launch = Object.prototype.hasOwnProperty.call(OPEN_APPS, name) ? OPEN_APPS[name] : undefined;
+  if (!launch) return invalid(`name must be one of: ${Object.keys(OPEN_APPS).join(", ")}.`);
   return ok([launch]);
 }
 
@@ -264,7 +269,7 @@ export function summarizeTool(tool, args) {
     }
     case "open_app": {
       const name = s(input.name);
-      const label = name === "browser" ? "browser" : name === "terminal" ? "terminal" : name === "files" ? "files" : "app";
+      const label = Object.prototype.hasOwnProperty.call(OPEN_APPS, name) ? name : "app";
       return `Opening ${label}`;
     }
     case "wait":

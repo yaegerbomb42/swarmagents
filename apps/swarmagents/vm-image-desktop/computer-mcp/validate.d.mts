@@ -13,6 +13,9 @@ export interface ParsedToolArgs {
   cmds: string[][];
 }
 
+/** App names open_app accepts (the fixed launch allowlist). */
+export const OPEN_APP_NAMES: readonly string[];
+
 /** All tool names the computer MCP server exposes. */
 export const COMPUTER_TOOLS: readonly string[];
 

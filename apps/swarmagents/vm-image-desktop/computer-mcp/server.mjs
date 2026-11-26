@@ -19,7 +19,7 @@ import fs from "node:fs";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { parseToolArgs, summarizeTool, COMPUTER_TOOLS, parseWmctrlWindows, parseTesseractTsv } from "./validate.mjs";
+import { parseToolArgs, summarizeTool, COMPUTER_TOOLS, OPEN_APP_NAMES, parseWmctrlWindows, parseTesseractTsv } from "./validate.mjs";
 
 const DISPLAY = process.env.SWARM_COMPUTER_DISPLAY || process.env.DISPLAY || ":1";
 // Constrain the tools' own child processes, never the server itself.
@@ -266,8 +266,9 @@ function toolSpec(tool) {
       return { description: "Scroll by wheel steps: positive dy scrolls down, negative up; dx scrolls right/left.", shape: AXIS_SHAPE };
     case "open_app":
       return {
-        description: "Open a desktop application: \"browser\", \"terminal\" or \"files\".",
-        shape: { name: z.enum(["browser", "terminal", "files"]) },
+        description:
+          "Open a desktop application: browser (Chromium), terminal, files (Thunar), libreoffice (Writer), spreadsheet (LibreOffice Calc), gimp (image editing) or blender (3D).",
+        shape: { name: z.enum(OPEN_APP_NAMES) },
       };
     case "wait":
       return {

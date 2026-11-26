@@ -1,0 +1,32 @@
+{
+  "providers": [
+    {
+      "id": "iteracompute",
+      "kind": "openai",
+      "apiStyle": "openai-chat",
+      "baseUrl": "https://api.iteracompute.com/v1",
+      "models": {
+        "fast": "<iteracompute-fast-model-id>",
+        "balanced": "<iteracompute-balanced-model-id>",
+        "deep": "<iteracompute-deep-model-id>"
+      },
+      "envKeys": "ITERACOMPUTE_API_KEY",
+      "rank": 50,
+      "enabled": true
+    },
+    {
+      "id": "exaone",
+      "kind": "openai",
+      "apiStyle": "openai-chat",
+      "baseUrl": "https://api.exaone.ai/v1",
+      "models": {
+        "fast": "<exaone-fast-model-id>",
+        "balanced": "k-exaone_v2.5",
+        "deep": "<exaone-deep-model-id>"
+      },
+      "envKeys": "EXAONE_API_KEY",
+      "rank": 51,
+      "enabled": true
+    }
+  ]
+}

@@ -105,3 +105,17 @@ export function findTextTarget(
   query: string,
   options?: { exact?: boolean },
 ): OcrTarget | null;
+
+/**
+ * Map common argument slips to canonical names (core-37): key {key|keys} ->
+ * combo ("Enter" -> "Return"), focus_window {window_title|window_name} ->
+ * title, open_app {app|app_name} -> name (+ everyday app names), type
+ * {submit:true} -> trailing newline, click {coordinate:[x,y]} -> x/y.
+ */
+export function normalizeToolArgs(tool: string, args: unknown): Record<string, unknown>;
+
+/** "Enter" -> "Return", "Control+L" -> "ctrl+L", ["ctrl","l"] -> "ctrl+l". */
+export function normalizeKeyCombo(value: unknown): unknown;
+
+/** Keys that run or discard a line typed at a terminal prompt (Return, KP_Enter, ctrl+u, ctrl+c). */
+export function clearsTerminalLine(combo: unknown): boolean;

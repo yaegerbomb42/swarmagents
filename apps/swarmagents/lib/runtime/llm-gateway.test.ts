@@ -878,3 +878,27 @@ test("turn compaction: a short history is forwarded byte-identical", async () =>
   const toolMessage = sent.messages.find((m) => m.role === "tool");
   assert.equal(toolMessage?.content, "ok");
 });
+
+test("turn compaction: a large-context model gets ~60k tokens of tool output verbatim (cache-safe)", async () => {
+  const { fetchImpl, calls } = stubFetch([
+    { prefix: "https://openai.example", respond: () => jsonResponse(OPENAI_RESPONSE) },
+  ]);
+  const messages: Array<Record<string, unknown>> = [{ role: "user", content: "fix the failing tests" }];
+  for (let turn = 1; turn <= 3; turn++) {
+    messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: `tu_${turn}`, content: fatToolResult() }] });
+    messages.push({ role: "assistant", content: [{ type: "text", text: `turn ${turn} done` }] });
+  }
+  await forwardLlmNonStreaming({
+    owner: owner(),
+    providers: [
+      provider({ id: "openai", baseUrl: "https://openai.example/v1", models: { balanced: "gpt-4o" }, keys: [mockKey()] }),
+    ],
+    body: { model: "claude-x", max_tokens: 64, messages },
+    requestedModel: "gpt-4o",
+    fetchImpl: fetchImpl as unknown as typeof fetch,
+  });
+  const sent = JSON.parse(String(calls[0].init.body)) as { messages: Array<{ role: string; content: unknown }> };
+  const tool = sent.messages.filter((m) => m.role === "tool");
+  assert.equal(tool.length, 3);
+  for (const m of tool) assert.equal(m.content, fatToolResult(), "under the 80k budget results are forwarded verbatim");
+});

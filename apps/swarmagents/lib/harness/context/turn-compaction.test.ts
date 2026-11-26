@@ -13,6 +13,8 @@ import {
   compactToolResultText,
   extractSignalLines,
   summarizeCompactedResult,
+  toolResultTokens,
+  turnCompactionOptionsFor,
 } from "./turn-compaction";
 
 function toolResultMessage(id: string, content: string): Record<string, unknown> {
@@ -238,13 +240,41 @@ test("short results pass through compactToolResultText unchanged", () => {
   assert.equal(compactToolResultText(""), "");
 });
 
-test("per-result cap condenses even the newest result", () => {
-  const messages = [toolResultMessage("tu_1", jestOutput())];
+test("under budget nothing is rewritten, not even an oversized newest result", () => {
+  // Regression: a 39 KB file Read on a short history used to be condensed to
+  // ~1.6 KB (losing the very function the agent asked to edit).
+  const source = Array.from({ length: 600 }, (_, n) => `export function fn${n}(a: number) { return a * ${n}; }`).join("\n");
+  const messages = [userMessage("refactor fn42"), toolResultMessage("tu_read", source)];
+  const result = compactAnthropicMessages(messages);
+  assert.equal(result.stats.resultsCompacted, 0);
+  assert.equal(result.messages[1], messages[1], "same reference: byte-identical");
+});
+
+test("over budget the newest window keeps verbatim results up to the recent cap", () => {
   const raw = jestOutput();
+  const rawTokens = estimateTokens(raw);
+  const messages = [
+    toolResultMessage("tu_old", domSnapshot()),
+    toolResultMessage("tu_new", raw),
+  ];
   const result = compactAnthropicMessages(messages, {
-    maxToolResultTokens: DEFAULT_TOOL_RESULT_TOKEN_BUDGET,
+    maxToolResultTokens: rawTokens + 200,
+    perResultTokenCap: 100,
+    keepRecentResults: 1,
+    recentResultTokenCap: rawTokens + 1,
+  });
+  assert.ok(result.stats.resultsCompacted >= 1, "the old DOM snapshot is compacted");
+  assert.equal(result.messages[1], messages[1], "the newest result is untouched");
+});
+
+test("over budget a newest result larger than the recent cap is condensed, diagnostics kept", () => {
+  const raw = jestOutput();
+  const messages = [toolResultMessage("tu_1", raw)];
+  const result = compactAnthropicMessages(messages, {
+    maxToolResultTokens: 200,
     perResultTokenCap: 100,
     keepRecentResults: DEFAULT_KEEP_RECENT_RESULTS,
+    recentResultTokenCap: 100,
   });
   assert.equal(result.stats.resultsCompacted, 1);
   const out = result.messages[0] as Record<string, unknown>;
@@ -252,4 +282,20 @@ test("per-result cap condenses even the newest result", () => {
   const text = typeof block.content === "string" ? block.content : "";
   assert.ok(text.length < raw.length, "result shrank");
   assert.ok(text.includes("exit code 1"), "exit code survives the per-result condensation");
+});
+
+test("turnCompactionOptionsFor sizes the budget to the model and honours the opt-out", () => {
+  assert.equal(turnCompactionOptionsFor(200_000, {})?.maxToolResultTokens, 80_000);
+  assert.equal(turnCompactionOptionsFor(1_000_000, {})?.maxToolResultTokens, 400_000);
+  assert.equal(turnCompactionOptionsFor(undefined, {})?.maxToolResultTokens, Math.floor(32_768 * 0.4));
+  assert.equal(turnCompactionOptionsFor(8_192, {})?.maxToolResultTokens, 8_192, "floor for tiny windows");
+  assert.equal(turnCompactionOptionsFor(200_000, {})?.perResultTokenCap, 10_000);
+  for (const off of ["off", "0", "false", "OFF"]) {
+    assert.equal(turnCompactionOptionsFor(200_000, { SWARM_TURN_COMPACTION: off }), null);
+  }
+});
+
+test("toolResultTokens counts only tool_result content", () => {
+  const messages = [userMessage("x".repeat(4000)), toolResultMessage("t", "y".repeat(4000))];
+  assert.equal(toolResultTokens(messages), estimateTokens("y".repeat(4000)));
 });

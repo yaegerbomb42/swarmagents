@@ -33,9 +33,9 @@
  *
  * Pure and deterministic: no I/O (the filter runs with spill disabled),
  * the input is never mutated, and histories under the budget come back
- * byte-identical. The gateway applies it in prepareRequest (the shared
- * choke point for streaming and non-streaming forwards); the runner
- * routes its auto-condense path through the same helper.
+ * byte-identical. The gateway applies it per attempt, sized to the routed
+ * model's context window (turnCompactionOptionsFor); the runner routes its
+ * auto-condense path through the same helper.
  */
 
 import { estimateTokens } from "../../codebase/tokens";
@@ -70,6 +70,61 @@ export interface CompactMessagesOptions {
   maxInlineChars?: number;
   /** Char threshold below which a result passes through (default 4,000). */
   thresholdChars?: number;
+  /**
+   * A result inside the newest `keepRecentResults` window is only condensed
+   * when it alone exceeds this many tokens (default: half the total
+   * budget). The agent usually acts on what it just read, so a fresh file
+   * Read or log is kept verbatim unless it could not fit at all.
+   */
+  recentResultTokenCap?: number;
+}
+
+/** Fraction of a model's context window tool results may occupy. */
+export const TOOL_RESULT_CONTEXT_SHARE = 0.4;
+/** Context assumed when the provider/model does not report one (local models). */
+export const DEFAULT_ASSUMED_CONTEXT_WINDOW = 32_768;
+
+/**
+ * Compaction options sized to the routed model's context window, or null
+ * when compaction is switched off (`SWARM_TURN_COMPACTION=off|0|false`).
+ *
+ * A 200k-token Claude gets an 80k tool-result budget, so ordinary runs are
+ * never touched (and its prompt cache is never broken); a 32k local model
+ * gets ~13k, which is where replaying fat DOM snapshots and logs actually
+ * overflows. The per-result cap scales with the budget (never below 4,096).
+ */
+export function turnCompactionOptionsFor(
+  contextWindow: number | undefined,
+  env: Record<string, string | undefined> = process.env,
+): CompactMessagesOptions | null {
+  const flag = (env.SWARM_TURN_COMPACTION ?? "").trim().toLowerCase();
+  if (flag === "off" || flag === "0" || flag === "false") return null;
+  const window =
+    typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0
+      ? contextWindow
+      : DEFAULT_ASSUMED_CONTEXT_WINDOW;
+  const maxToolResultTokens = Math.max(8_192, Math.floor(window * TOOL_RESULT_CONTEXT_SHARE));
+  return {
+    maxToolResultTokens,
+    perResultTokenCap: Math.max(DEFAULT_PER_RESULT_TOKEN_CAP, Math.floor(maxToolResultTokens / 8)),
+    recentResultTokenCap: Math.floor(maxToolResultTokens / 2),
+  };
+}
+
+/**
+ * Estimated tokens of all tool_result content in an Anthropic message list
+ * (same estimator the compactor budgets with).
+ */
+export function toolResultTokens(messages: unknown[]): number {
+  let total = 0;
+  for (const rawMessage of messages) {
+    const content = isRecord(rawMessage) && Array.isArray(rawMessage.content) ? rawMessage.content : null;
+    if (!content) continue;
+    for (const rawBlock of content) {
+      if (isRecord(rawBlock) && rawBlock.type === "tool_result") total += estimateTokens(toolResultText(rawBlock.content));
+    }
+  }
+  return total;
 }
 
 export interface CompactMessagesStats {
@@ -217,10 +272,11 @@ export function summarizeCompactedResult(text: string, tokens: number): string {
  *      where every result is already at the filter floor), the oldest
  *      results are replaced by one-line summaries until it holds.
  *
- * Guarantee: `tokensAfter <= maxToolResultTokens` whenever the newest
- * `keepRecentResults` window fits inside it — each window result is
- * capped at `perResultTokenCap` first, so with the defaults
- * (2 x 4,096 < 32,768) the bound always holds. Everything else — user
+ * Histories whose tool results already fit the budget are returned
+ * untouched (same references, byte-identical). Over budget, the bound
+ * `tokensAfter <= maxToolResultTokens` holds whenever the newest window fits
+ * inside it — each window result is capped at `recentResultTokenCap`
+ * (default: half the budget), so with keepRecentResults = 2 it always does. Everything else — user
  * text, assistant text, tool_use blocks, image blocks — passes through
  * untouched.
  *
@@ -238,6 +294,7 @@ export function compactAnthropicMessages(
   const keepRecent = Math.max(0, options.keepRecentResults ?? DEFAULT_KEEP_RECENT_RESULTS);
   const maxInlineChars = options.maxInlineChars ?? DEFAULT_TOOL_RESULT_INLINE_CHARS;
   const thresholdChars = options.thresholdChars ?? TOOL_RESULT_CHAR_THRESHOLD;
+  const recentCap = options.recentResultTokenCap ?? Math.floor(maxTotal / 2);
 
   // Index every tool_result block with its text and token cost.
   const refs: ToolResultRef[] = [];
@@ -260,7 +317,9 @@ export function compactAnthropicMessages(
     resultsSeen: refs.length,
     resultsCompacted: 0,
   };
-  if (refs.length === 0) return { messages, stats };
+  // Under budget: nothing is rewritten, so the request (and the provider's
+  // prompt-prefix cache) stays byte-identical.
+  if (refs.length === 0 || tokensBefore <= maxTotal) return { messages, stats };
 
   // Compacted text per (message, block), filled in below.
   const compacted = new Map<string, string>();
@@ -276,10 +335,14 @@ export function compactAnthropicMessages(
     return saved;
   };
 
-  // Step 1: per-result cap, oldest first (deterministic order).
+  // Step 1: per-result cap, oldest first (deterministic order). The newest
+  // window is held to the looser recent cap: the agent is about to act on
+  // those results (a file it just Read, the test log it must fix).
   let total = tokensBefore;
-  for (const ref of refs) {
-    if (ref.tokens > perResultCap) {
+  const recentStart = Math.max(0, refs.length - keepRecent);
+  for (const [position, ref] of refs.entries()) {
+    const cap = position >= recentStart ? Math.max(perResultCap, recentCap) : perResultCap;
+    if (ref.tokens > cap) {
       total -= replace(ref, compactToolResultText(ref.text, { thresholdChars, maxInlineChars }));
     }
   }

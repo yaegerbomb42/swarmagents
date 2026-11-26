@@ -80,7 +80,7 @@ import {
   type AnthropicSseEvent,
   type BridgeOptions,
 } from "../providers/anthropic-bridge";
-import { compactAnthropicMessages } from "../harness/context/turn-compaction";
+import { compactAnthropicMessages, toolResultTokens, turnCompactionOptionsFor } from "../harness/context/turn-compaction";
 import {
   anthropicToGemini,
   anthropicToOllama,
@@ -463,36 +463,11 @@ function prepareRequest(options: LlmRequestContext): LlmRequest | { error: LlmFa
       },
     };
   }
-  // Turn compaction (core-07): the VM's agent replays its whole session on
-  // every turn, so long runs accumulate oversized tool_result payloads (DOM
-  // snapshots, huge logs) that overflow smaller BYOK/local models. Compact
-  // them to the budget before any provider sees the request. Histories
-  // already under the budget pass through byte-identical, and only
-  // tool_result text is ever touched — user/assistant text, tool_use
-  // blocks and image blocks are never rewritten. The caller's body object
-  // is never mutated; a compacted copy is forwarded instead.
-  let effectiveBody = body;
-  if (
-    typeof body === "object" &&
-    body !== null &&
-    Array.isArray((body as { messages?: unknown }).messages)
-  ) {
-    const compacted = compactAnthropicMessages(
-      (body as { messages: unknown[] }).messages,
-    );
-    if (compacted.stats.resultsCompacted > 0) {
-      effectiveBody = { ...(body as Record<string, unknown>), messages: compacted.messages };
-      console.warn(
-        `[llm-gateway] turn compaction: ${compacted.stats.resultsCompacted} tool result(s) compacted, ` +
-          `${compacted.stats.tokensBefore} -> ${compacted.stats.tokensAfter} tool-result tokens`,
-      );
-    }
-  }
   return {
     owner,
     runId: options.runId,
     bus: options.bus,
-    body: effectiveBody,
+    body,
     requestedModel,
     now,
     startedAt: now(),
@@ -901,7 +876,7 @@ function routeFeatures(body: unknown): {
     }
   }
   return {
-    estimatedPromptTokens: estimateInputTokens(body),
+    estimatedPromptTokens: compactablePromptTokens(body, messages),
     maxOutputTokens: maxTokens,
     requiresTools,
     ...(promptSample !== undefined ? { promptSample: promptSample.slice(0, 2_000) } : {}),
@@ -1186,6 +1161,42 @@ async function upstreamFailure(req: LlmRequest, config: ProviderConfig, upstream
     retryAfterMs,
   );
   return { err, raw };
+}
+
+/**
+ * Turn compaction (core-07), per attempt: the VM's agent replays its whole
+ * session every turn, so oversized tool_result payloads (DOM snapshots, huge
+ * logs) eventually overflow smaller BYOK/local models. Compaction is sized
+ * to the routed model's context window, only runs once the tool results
+ * exceed that budget (requests under it are forwarded byte-identical, so a
+ * provider's prompt cache is never broken), and is switched off with
+ * SWARM_TURN_COMPACTION=off. Only tool_result text is ever rewritten.
+ */
+/**
+ * Prompt size the router should plan for. Turn compaction will shrink the
+ * tool results for whichever model is picked (to 40% of its window), so a
+ * long history must not disqualify every candidate on its raw size: count
+ * the tool results at most at the smallest (default) compaction budget.
+ */
+function compactablePromptTokens(body: unknown, messages: unknown[]): number {
+  const raw = estimateInputTokens(body);
+  const options = turnCompactionOptionsFor(undefined);
+  if (!options) return raw;
+  const tools = Math.min(raw, toolResultTokens(messages));
+  return raw - tools + Math.min(tools, options.maxToolResultTokens ?? tools);
+}
+
+function compactForModel(body: Record<string, unknown>, contextWindow: number | undefined): Record<string, unknown> {
+  const options = turnCompactionOptionsFor(contextWindow);
+  if (!options || !Array.isArray(body.messages)) return body;
+  const compacted = compactAnthropicMessages(body.messages, options);
+  if (compacted.stats.resultsCompacted === 0) return body;
+  console.warn(
+    `[llm-gateway] turn compaction: ${compacted.stats.resultsCompacted} tool result(s) compacted, ` +
+      `${compacted.stats.tokensBefore} -> ${compacted.stats.tokensAfter} tool-result tokens ` +
+      `(budget ${options.maxToolResultTokens})`,
+  );
+  return { ...body, messages: compacted.messages };
 }
 
 /** Translate an Anthropic Messages body into the provider's request shape. */
@@ -1487,7 +1498,7 @@ export async function forwardLlmNonStreaming(options: LlmForwardOptions): Promis
     const deadline = attemptDeadline(req, config, signal);
     try {
       const capabilities = mergedModelCapabilities(config, handle.model);
-      const gated = gateAnthropicRequestBody(body, capabilities);
+      const gated = compactForModel(gateAnthropicRequestBody(body, capabilities), capabilities.contextWindow);
       if (options.useRoutedModel) gated.model = handle.model;
       let payload: unknown;
       try {
@@ -1779,7 +1790,7 @@ export async function* forwardLlmStreaming(options: LlmForwardOptions): AsyncGen
     try {
       const style = apiStyleFor(config);
       const capabilities = mergedModelCapabilities(config, handle.model);
-      const gated = gateAnthropicRequestBody(body, capabilities);
+      const gated = compactForModel(gateAnthropicRequestBody(body, capabilities), capabilities.contextWindow);
       let payload: unknown;
       try {
         payload = providerPayload(config, handle.model, gated);

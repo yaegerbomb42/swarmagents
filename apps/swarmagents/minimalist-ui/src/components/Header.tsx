@@ -53,7 +53,7 @@ export function RunIndicator({ phase, since, durationMs, activity, stopping, onS
         type="button"
         onClick={onShow}
         title={meta.active ? "Show the run" : "Show the result"}
-        className="neo-pill flex h-8 min-w-0 items-center gap-1.5 sm:gap-2 rounded-xl px-2 sm:px-2.5"
+        className="neo-pill flex h-8 min-w-0 items-center gap-1.5 sm:gap-2 rounded-full border border-white/[0.12] bg-zinc-950/60 px-2.5 sm:px-3 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.12)] backdrop-blur-xl transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] hover:border-white/20"
       >
         <span role="status" className="flex min-w-0">
           <StatusPill tone={RUN_TONE_TO_PILL[meta.tone]} live={meta.active}>

@@ -54,7 +54,9 @@ test("foldDesktopTelemetry counts computer actions, no-change effects and loop n
 
 async function workspaceFor(t: { after: (fn: () => Promise<void>) => void }, files: Record<string, string>) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "swarm-desktop-session-test-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  // xfwm4's xfconfd (dbus-activated, outside our process group) can still be
+  // writing .config/xfce4 as the session stops: retry, and never fail on cleanup.
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => undefined));
   for (const [rel, content] of Object.entries(files)) {
     await mkdir(path.dirname(path.join(dir, rel)), { recursive: true });
     await writeFile(path.join(dir, rel), content);

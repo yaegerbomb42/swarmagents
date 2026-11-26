@@ -201,7 +201,7 @@ async function main(): Promise<number> {
     console.log(renderProviderMarkdownTable(report));
     console.log(`\nWrote ${jsonPath} and ${markdownPath}`);
   } finally {
-    await rm(isolationRoot, { recursive: true, force: true });
+    await rm(isolationRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => undefined);
   }
   return 0;
 }

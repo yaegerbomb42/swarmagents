@@ -67,6 +67,7 @@ import { RunProviderPool, runWithPool } from "../providers/run-pool";
 import type { AttemptOutcome, RunAttempt } from "../providers/run-pool";
 import {
   CONSERVATIVE_CAPABILITIES,
+  isDesktopRunMode,
   mergedModelCapabilities,
   runModeForCapabilities,
   type RunModeInfo,
@@ -84,6 +85,7 @@ import type {
 } from "../providers";
 import { getApprovalStore } from "../harness/approvals";
 import { evaluateToolApproval, type ToolApprovalDecision } from "../harness/tool-approval";
+import { classifyToolCallAsync } from "../harness/risk";
 import {
   checkpointDisplayLabel,
   checkpointVmLabel,
@@ -2005,9 +2007,10 @@ export class RuntimeManager {
     restrictTools?: readonly string[],
     useAtlas = atlasEnabled(),
   ): RolePhase {
-    const gui = mode === undefined || mode.mode === "gui";
+    const desktop = isDesktopRunMode(mode?.mode);
     const phase = rolePhase(role, {
-      desktopMode: desktopModeEnabled() && gui,
+      desktopMode: desktopModeEnabled() && desktop,
+      textDesktop: mode?.mode === "text-desktop",
       tools: mode === undefined || mode.mode !== "chat",
       atlasEnabled: useAtlas,
     });
@@ -2081,7 +2084,7 @@ export class RuntimeManager {
     mode?: RunModeInfo,
     connectorEnableUrl?: string,
   ): Promise<void> {
-    const gui = mode === undefined || mode.mode === "gui";
+    const desktop = isDesktopRunMode(mode?.mode);
     const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
     // A run aborted mid-question leaves its .pending.json behind; the new
     // run's question gateway would otherwise adopt the orphan as its own
@@ -2096,7 +2099,8 @@ export class RuntimeManager {
       // ignore: the gateway tolerates a leftover file via its seen set.
     }
     for (const file of roleSeedFiles(catalog, allowedRoleIds, initialPhase, {
-      desktopMode: desktopModeEnabled() && gui,
+      desktopMode: desktopModeEnabled() && desktop,
+      textDesktop: mode?.mode === "text-desktop",
       codebaseRepoRoot: WORKSPACE_ROOT,
       extraMcpServers,
       atlasEnabled: useAtlas,
@@ -2126,7 +2130,7 @@ export class RuntimeManager {
     restrictTools?: readonly string[],
     connectorEnableUrl?: string,
   ): Promise<void> {
-    const gui = mode === undefined || mode.mode === "gui";
+    const desktop = isDesktopRunMode(mode?.mode);
     const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
     await this.vm.writeFile(
       userId,
@@ -2134,7 +2138,8 @@ export class RuntimeManager {
       roleMcpConfigJson(this.rolePhaseFor(role, extraAllowedTools, mode, restrictTools, useAtlas), {
         allowedRoleIds,
         roleDef: role,
-        desktopMode: desktopModeEnabled() && gui,
+        desktopMode: desktopModeEnabled() && desktop,
+        textDesktop: mode?.mode === "text-desktop",
         codebaseRepoRoot: WORKSPACE_ROOT,
         extraMcpServers,
         atlasEnabled: useAtlas,
@@ -2591,6 +2596,15 @@ export class RuntimeManager {
       emit: (event) => this.forwardEvent(active, event),
       fullAuto: active.fullAuto === true,
       signal: active.controller.signal,
+      // Text-desktop runs deny raw screenshot calls at the hook (the
+      // pre-execution gate), so a model without vision never receives
+      // image bytes. The classifier is bound here — never in the runner's
+      // post-hoc re-checks, where a deny would halt a run whose call the
+      // server already answered as text.
+      classify: (name, callInput) =>
+        classifyToolCallAsync(name, callInput, undefined, {
+          textDesktop: active.runMode?.mode === "text-desktop",
+        }),
       // Pattern-based scrubbing only: the run's secret env lives in the
       // runner, not here, and the action text is still redacted for shapes.
       redact: makeRedactor({}),

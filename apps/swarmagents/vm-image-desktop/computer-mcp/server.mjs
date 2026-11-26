@@ -33,6 +33,11 @@ import {
 } from "./validate.mjs";
 
 const DISPLAY = process.env.SWARM_COMPUTER_DISPLAY || process.env.DISPLAY || ":1";
+// Text-desktop mode (non-vision model): `screenshot` answers with the
+// describe_screen text instead of PNG bytes. The harness sets this via the
+// --mcp-config env (SWARM_TEXT_DESKTOP=1); it is the fail-closed layer
+// under the approval-hook deny, covering runs without the hook.
+const TEXT_DESKTOP = process.env.SWARM_TEXT_DESKTOP === "1";
 // Constrain the tools' own child processes, never the server itself.
 const CHILD_ENV = { ...process.env, DISPLAY };
 const SCREENSHOT_DIR = os.tmpdir();
@@ -242,7 +247,9 @@ async function callTool(tool, args) {
 
   switch (tool) {
     case "screenshot":
-      return captureScreenshot();
+      // Text-desktop runs never produce image bytes: describe_screen text
+      // is the only screen reading a model without vision can use.
+      return TEXT_DESKTOP ? describeScreen(args) : captureScreenshot();
     case "describe_screen":
       return describeScreen(args);
     case "inspect_ui":
@@ -294,7 +301,12 @@ const AXIS_SHAPE = { dx: COMBO.describe("Horizontal wheel steps (≤200)."), dy:
 function toolSpec(tool) {
   switch (tool) {
     case "screenshot":
-      return { description: "Capture the desktop as a PNG, downscaled to at most 1280px wide (display :1).", shape: {} };
+      return {
+        description: TEXT_DESKTOP
+          ? "Describe the desktop as text (windows + OCR coordinates) — screenshots are disabled in text-desktop mode."
+          : "Capture the desktop as a PNG, downscaled to at most 1280px wide (display :1).",
+        shape: {},
+      };
     case "describe_screen":
       return {
         description: "Inspect display :1 without vision: returns screen geometry, window bounds/centers, AT-SPI2 UI elements (role, name, state, click center), and OCR clickable text coordinates (x, y).",

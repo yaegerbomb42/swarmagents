@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   CONSERVATIVE_CAPABILITIES,
+  isDesktopRunMode,
   mergedModelCapabilities,
   presetModelCapabilities,
   runModeForCapabilities,
@@ -74,20 +75,39 @@ test("run mode is text when the deployment desktop is off", () => {
   assert.match(info.reason, /desktop is off/i);
 });
 
-test("run mode is text for a model without vision or computer use", () => {
+test("run mode is text-desktop for a model without vision when the desktop is on", () => {
   const noVision = runModeForCapabilities(
     { vision: false, tools: true, computerUse: false },
     { desktopEnabled: true },
   );
-  assert.equal(noVision.mode, "text");
+  assert.equal(noVision.mode, "text-desktop");
+  assert.equal(noVision.label, "Text desktop mode");
   assert.match(noVision.reason, /no vision/i);
+  assert.match(noVision.reason, /describe_screen/i);
 
+  // Desktop off still means plain text, even without vision.
+  const desktopOff = runModeForCapabilities(
+    { vision: false, tools: true, computerUse: false },
+    { desktopEnabled: false },
+  );
+  assert.equal(desktopOff.mode, "text");
+});
+
+test("run mode is text for a vision model without computer use", () => {
   const noComputer = runModeForCapabilities(
     { vision: true, tools: true, computerUse: false },
     { desktopEnabled: true },
   );
   assert.equal(noComputer.mode, "text");
   assert.match(noComputer.reason, /cannot use computer tools/i);
+});
+
+test("isDesktopRunMode wires the desktop for gui and text-desktop only", () => {
+  assert.equal(isDesktopRunMode(undefined), true);
+  assert.equal(isDesktopRunMode("gui"), true);
+  assert.equal(isDesktopRunMode("text-desktop"), true);
+  assert.equal(isDesktopRunMode("text"), false);
+  assert.equal(isDesktopRunMode("chat"), false);
 });
 
 test("run mode is gui only when vision, tools and computer use are all present", () => {

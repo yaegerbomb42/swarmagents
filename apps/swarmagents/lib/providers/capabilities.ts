@@ -10,7 +10,9 @@
  *
  * A provider with no capability information is treated conservatively: it can
  * call tools (most OpenAI-compatible servers can), but it has no vision, so a
- * run starts in text mode and never wires the desktop/computer-use tools.
+ * run starts in text-desktop mode — the desktop is wired, but the model
+ * drives it through text (describe_screen + accessibility snapshots)
+ * instead of screenshots.
  */
 
 import type { ModelCapabilities, ProviderConfig, RunMode } from "./types";
@@ -206,8 +208,11 @@ export interface RunModeInfo {
  * Decide how a run should behave for the selected model.
  *
  * `desktopEnabled` is the deployment's desktop switch (SWARM_VM_DESKTOP=1).
- * Even with it on, a model without vision or computer-use support must not
- * get the desktop — it runs headless with shell/files/web/MCP tools.
+ * With it on, a model without vision gets text-desktop mode: the desktop
+ * MCP servers are wired, but the model drives them through text
+ * (describe_screen + accessibility snapshots) instead of screenshots. A
+ * model with vision but without computer-use support runs headless with
+ * shell/files/web/MCP tools.
  */
 export function runModeForCapabilities(
   capabilities: ModelCapabilities,
@@ -242,9 +247,11 @@ export function runModeForCapabilities(
   if (!capabilities.vision) {
     return {
       ...base,
-      mode: "text",
-      label: "Text mode",
-      reason: "Text mode: this model has no vision.",
+      mode: "text-desktop",
+      label: "Text desktop mode",
+      reason:
+        "Text desktop mode: this model has no vision, so it drives the desktop through text " +
+        "(describe_screen + accessibility snapshots) instead of screenshots.",
     };
   }
   if (!capabilities.computerUse) {
@@ -261,4 +268,14 @@ export function runModeForCapabilities(
     label: "Desktop mode",
     reason: "Desktop mode: vision and computer-use tools are enabled.",
   };
+}
+
+/**
+ * True when a run mode wires the desktop MCP servers. `undefined` is the
+ * legacy default (a run created before modes existed behaves like gui).
+ * Text-desktop wires the same servers as gui — the difference is how the
+ * model sees the screen (text, not screenshots), enforced downstream.
+ */
+export function isDesktopRunMode(mode: RunMode | undefined): boolean {
+  return mode === undefined || mode === "gui" || mode === "text-desktop";
 }

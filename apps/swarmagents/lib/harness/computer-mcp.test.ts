@@ -25,6 +25,7 @@ import {
   describeDesktopAction,
   desktopMcpTool,
   isDesktopMcpCall,
+  isRawScreenshotCall,
   parseMcpToolName,
 } from "./computer-mcp";
 import type { RiskDecision } from "./risk";
@@ -259,6 +260,77 @@ test("classifyDesktopToolCallAsync runs DNS preflight (b9)", async () => {
   assert.equal((await nav("http://127.0.0.1.nip.io/"))!.level, "deny");
   assert.equal((await nav("https://example.com"))!.level, "allow");
   assert.equal((await nav("http://127.0.0.1/"))!.level, "allow");
+});
+
+// ---- Text-desktop mode: raw screenshots are denied, text inspection is not -
+
+test("isRawScreenshotCall matches only the image-returning screenshot tools", () => {
+  assert.equal(isRawScreenshotCall("mcp__computer-mcp__screenshot"), true);
+  assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_screenshot"), true);
+  assert.equal(isRawScreenshotCall("mcp__browser-mcp__browser_screenshot"), true);
+  // The text inspection paths are not screenshots.
+  assert.equal(isRawScreenshotCall("mcp__computer-mcp__describe_screen"), false);
+  assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_snapshot"), false);
+  assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_accessible_snapshot"), false);
+  assert.equal(isRawScreenshotCall("mcp__computer-mcp__click"), false);
+  assert.equal(isRawScreenshotCall("mcp__roles__set_role"), false);
+  assert.equal(isRawScreenshotCall("Bash"), false);
+});
+
+test("classifyDesktopToolCall denies raw screenshots in text-desktop mode", () => {
+  const textDesktop = { textDesktop: true };
+  const shot = classifyDesktopToolCall("mcp__computer-mcp__screenshot", {}, textDesktop)!;
+  assert.equal(shot.level, "deny");
+  assert.match(shot.reason, /describe_screen/);
+
+  const browserShot = classifyDesktopToolCall(
+    "mcp__playwright-mcp__browser_screenshot",
+    {},
+    textDesktop,
+  )!;
+  assert.equal(browserShot.level, "deny");
+  assert.match(browserShot.reason, /browser_snapshot/);
+
+  // The text paths stay open in text-desktop mode: describe_screen, the
+  // accessibility snapshots, and the input tools.
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__describe_screen", {}, textDesktop)!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__playwright-mcp__browser_snapshot", {}, textDesktop)!.level, "allow");
+  assert.equal(
+    classifyDesktopToolCall("mcp__playwright-mcp__browser_accessible_snapshot", {}, textDesktop)!.level,
+    "allow",
+  );
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__click", { x: 1, y: 2 }, textDesktop)!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__type", { text: "hi" }, textDesktop)!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__key", { combo: "Return" }, textDesktop)!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__scroll", { dx: 0, dy: 3 }, textDesktop)!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__open_app", { name: "browser" }, textDesktop)!.level, "allow");
+
+  // Without the flag nothing changes: screenshots are allowed as before.
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__screenshot", {})!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__playwright-mcp__browser_screenshot", {})!.level, "allow");
+});
+
+test("classifyDesktopToolCallAsync denies raw screenshots in text-desktop mode", async () => {
+  const shot = await classifyDesktopToolCallAsync("mcp__computer-mcp__screenshot", {}, undefined, {
+    textDesktop: true,
+  });
+  assert.equal(shot!.level, "deny");
+  assert.match(shot!.reason, /describe_screen/);
+
+  const browserShot = await classifyDesktopToolCallAsync(
+    "mcp__browser-mcp__browser_screenshot",
+    {},
+    undefined,
+    { textDesktop: true },
+  );
+  assert.equal(browserShot!.level, "deny");
+  assert.match(browserShot!.reason, /browser_snapshot/);
+
+  // Text inspection still allowed through the async classifier.
+  const described = await classifyDesktopToolCallAsync("mcp__computer-mcp__describe_screen", {}, undefined, {
+    textDesktop: true,
+  });
+  assert.equal(described!.level, "allow");
 });
 
 // ---- Human-readable summaries (computer.action telemetry) -------------------

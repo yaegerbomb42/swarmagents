@@ -63,6 +63,14 @@ USER root
 #   - chromium: the browser. Launched with container-safe flags (see README).
 #   - supervisor: supervises the desktop stack inside the container.
 #   - dbus-x11, xauth, x11-xserver-utils: XFCE session plumbing.
+#   - general-purpose GUI apps for user tasks:
+#       - libreoffice: office suite (writer, calc, impress)
+#       - gimp: image editing
+#       - blender: 3D creation
+#       - poppler-utils: PDF tools (pdftotext, pdfimages)
+#       - ffmpeg: audio/video processing
+#       - python3-tk: Python with Tkinter GUI support
+#       - python3-matplotlib: Python plotting library
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         tigervnc-standalone-server \
@@ -86,6 +94,13 @@ RUN apt-get update \
         chromium \
         dbus-x11 \
         xauth \
+        libreoffice \
+        gimp \
+        blender \
+        poppler-utils \
+        ffmpeg \
+        python3-tk \
+        python3-matplotlib \
     && rm -rf /var/lib/apt/lists/*
 
 # Desktop init: reads the driver-seeded 0600 VNC password file (or the manual

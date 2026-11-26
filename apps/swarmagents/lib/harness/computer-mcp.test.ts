@@ -13,6 +13,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  OPEN_APP_NAMES,
   parseTesseractTsv,
   parseToolArgs,
   parseWmctrlWindows,
@@ -139,6 +140,28 @@ test("open_app only launches allowlisted apps", () => {
     ok: true,
     cmds: [["thunar"]],
   });
+  assert.deepEqual(parseToolArgs("open_app", { name: "libreoffice" }), {
+    ok: true,
+    cmds: [["lowriter"]],
+  });
+  assert.deepEqual(parseToolArgs("open_app", { name: "gimp" }), {
+    ok: true,
+    cmds: [["gimp"]],
+  });
+  assert.deepEqual(parseToolArgs("open_app", { name: "blender" }), {
+    ok: true,
+    cmds: [["blender"]],
+  });
+  assert.deepEqual(parseToolArgs("open_app", { name: "spreadsheet" }), {
+    ok: true,
+    cmds: [["localc"]],
+  });
+  // The exported name list (used for the server's zod enum) matches the allowlist exactly.
+  for (const name of OPEN_APP_NAMES) assert.equal(parseToolArgs("open_app", { name }).ok, true, name);
+  assert.equal(summarizeTool("open_app", { name: "gimp" }), "Opening gimp");
+  assert.equal(summarizeTool("open_app", { name: "toString" }), "Opening app");
+  assert.equal(parseToolArgs("open_app", { name: "toString" }).ok, false);
+  assert.equal(parseToolArgs("open_app", { name: "constructor" }).ok, false);
   assert.equal(parseToolArgs("open_app", { name: "bash" }).ok, false);
   assert.equal(parseToolArgs("open_app", { name: "../../bin/sh" }).ok, false);
   assert.equal(parseToolArgs("open_app", {}).ok, false);

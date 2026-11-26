@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { writeFileSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   loadProvidersFile,
   loadProvidersFromEnv,
@@ -164,4 +165,53 @@ test("loadProvidersFromEnv: loads from env var", () => {
   assert.ok(configs);
   assert.equal(configs!.length, 1);
   assert.equal(configs![0].id, "openai");
+});
+
+test("providers.example.json validates with redacted placeholder keys", () => {
+  const examplePath = fileURLToPath(new URL("../../providers.example.json", import.meta.url));
+  const raw = readFileSync(examplePath, "utf-8");
+  assert.equal(raw.includes("sk-"), false, "example must not ship key material");
+
+  const configs = loadProvidersFile(examplePath);
+  const byId = new Map(configs.map((config) => [config.id, config]));
+
+  const iteracompute = byId.get("iteracompute");
+  assert.ok(iteracompute, "iteracompute entry");
+  assert.equal(iteracompute.kind, "openai");
+  assert.equal(iteracompute.apiStyle, "openai-chat");
+  assert.equal(iteracompute.baseUrl, "https://api.iteracompute.com/v1");
+  assert.equal(iteracompute.envKeys, "ITERACOMPUTE_API_KEY");
+  assert.ok(iteracompute.models?.fast, "suggested fast tier placeholder");
+  assert.ok(iteracompute.models?.balanced, "suggested balanced tier placeholder");
+
+  const exaone = byId.get("exaone");
+  assert.ok(exaone, "exaone entry");
+  assert.equal(exaone.kind, "openai");
+  assert.equal(exaone.apiStyle, "openai-chat");
+  assert.equal(exaone.baseUrl, "https://api.exaone.ai/v1");
+  assert.equal(exaone.envKeys, "EXAONE_API_KEY");
+  assert.equal(exaone.models?.balanced, "k-exaone_v2.5");
+  for (const config of [iteracompute, exaone]) {
+    assert.equal(config.keys, undefined, `${config.id} must not carry inline keys`);
+  }
+});
+
+test("schema validation still rejects example entries missing required fields", () => {
+  const examplePath = fileURLToPath(new URL("../../providers.example.json", import.meta.url));
+  const example = JSON.parse(readFileSync(examplePath, "utf-8")) as { providers: unknown[] };
+
+  for (const missing of ["id", "kind"] as const) {
+    const broken = {
+      providers: example.providers.map((entry) => {
+        const clone = { ...(entry as Record<string, unknown>) };
+        delete clone[missing];
+        return clone;
+      }),
+    };
+    assert.throws(
+      () => loadProvidersFile(writeJson("broken-providers.json", broken)),
+      (err: unknown) => err instanceof ConfigValidationError && err.message.includes(missing),
+      `dropping ${missing} must fail validation`,
+    );
+  }
 });

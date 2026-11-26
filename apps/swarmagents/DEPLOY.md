@@ -679,6 +679,40 @@ capacity turns over on that cadence; a user whose VM is already live is
 never blocked by other users' VMs. Size it as host RAM ÷ per-VM ceiling,
 leaving headroom for the app itself.
 
+## Provider fleet config (SWARM_PROVIDERS_FILE)
+
+Server-wide provider entries can be declared without code changes via
+`SWARM_PROVIDERS_FILE` (a JSON file with a `providers` array; see
+`providers.example.json` in this directory). At startup the file is read
+once and its entries are migrated into the owner account's per-user
+provider store (`SWARM_OWNER_EMAIL`), then the file is renamed
+`providers.json.migrated` — so it seeds the initial fleet, after which keys
+are managed per account in the UI/API. Schema validation (`lib/providers/config-file.ts`)
+rejects entries with missing required fields (`id`, `kind`), unknown
+`kind`/`apiStyle`/tier names, or non-string model tiers before anything is
+migrated.
+
+Ready-to-paste OpenAI-compatible entries for the two newer fleet providers:
+
+| Provider | Base URL | `apiStyle` | Key env | Suggested tiers |
+|----------|----------|------------|---------|-----------------|
+| IteraCompute | `https://api.iteracompute.com/v1` | `openai-chat` | `ITERACOMPUTE_API_KEY` | pick from the IteraCompute console; the free tier serves `qwen/qwen3.8-27b` |
+| EXAONE | `https://api.exaone.ai/v1` | `openai-chat` | `EXAONE_API_KEY` | default model `k-exaone_v2.5`; other tiers per the EXAONE model list |
+
+Copy `providers.example.json`, replace the `<...-model-id>` placeholders
+with exact model ids from the provider's console (exact ids are required at
+run time; the placeholders exist so no stale ids ship in the repo), export
+the matching env var, and point `SWARM_PROVIDERS_FILE` at the file:
+
+```bash
+export ITERACOMPUTE_API_KEY="..."   # or EXAONE_API_KEY
+export SWARM_PROVIDERS_FILE=/data/providers.json
+```
+
+Never commit real keys: the example file ships with empty placeholders and
+`keys` arrays are omitted entirely — keys come from the environment or the
+sealed per-user store.
+
 ## Desktop stream proxy
 
 The user's live desktop must be reachable only through the app behind login,

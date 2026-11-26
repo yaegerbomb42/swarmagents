@@ -350,6 +350,8 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+export const AUTO_MEMORY_TOKEN_BUDGET = 300;
+
 /**
  * Render the memories as the block that is injected into a run's system
  * prompt. The block never exceeds the token budget: facts that would blow it
@@ -359,10 +361,18 @@ export function formatMemoriesForInjection(
   memories: MemorySearchResult[],
   budgetTokens = 1000,
 ): string {
-  if (memories.length === 0) return "";
+  return formatMemoriesWithStats(memories, budgetTokens).text;
+}
+
+function formatMemoriesWithStats(
+  memories: MemorySearchResult[],
+  budgetTokens = 1000,
+): { text: string; count: number; tokens: number } {
+  if (memories.length === 0) return { text: "", count: 0, tokens: 0 };
   const header = "Long-term memory for this account (stored outside the VM; it survives VM resets):";
   const lines: string[] = [header];
   let used = estimateTokens(header);
+  let count = 0;
   for (const memory of memories.slice(0, MAX_INJECTED_MEMORIES)) {
     const tags = memory.tags.length ? ` [${memory.tags.join(", ")}]` : "";
     const line = `- ${memory.fact}${tags}`;
@@ -370,20 +380,22 @@ export function formatMemoriesForInjection(
     if (used + cost > budgetTokens) break;
     lines.push(line);
     used += cost;
+    count += 1;
   }
-  if (lines.length === 1) return "";
-  return lines.join("\n");
+  if (lines.length === 1) return { text: "", count: 0, tokens: 0 };
+  const text = lines.join("\n");
+  return { text, count, tokens: estimateTokens(text) };
 }
 
 /**
- * The memory block for one run: the most relevant memories of the account,
- * ranked against the prompt and capped at the injection budget.
+ * Recall top-K memories for a prompt within `budgetTokens` (default 300) and
+ * return both the rendered text and safe count/token metadata for telemetry.
  */
-export async function memoryContextForPrompt(
+export async function memoryRecallForPrompt(
   userId: string,
   prompt: string,
-  options: DataDirOptions = {},
-): Promise<string> {
+  options: DataDirOptions & { budgetTokens?: number } = {},
+): Promise<{ text: string; count: number; tokens: number }> {
   try {
     let hits = await searchMemories(
       userId,
@@ -407,8 +419,21 @@ export async function memoryContextForPrompt(
           updatedAt: fact.updatedAt,
         }));
     }
-    return formatMemoriesForInjection(hits);
+    return formatMemoriesWithStats(hits, options.budgetTokens ?? 1000);
   } catch {
-    return "";
+    return { text: "", count: 0, tokens: 0 };
   }
+}
+
+/**
+ * The memory block for one run: the most relevant memories of the account,
+ * ranked against the prompt and capped at the injection budget.
+ */
+export async function memoryContextForPrompt(
+  userId: string,
+  prompt: string,
+  options: DataDirOptions & { budgetTokens?: number } = {},
+): Promise<string> {
+  const recalled = await memoryRecallForPrompt(userId, prompt, options);
+  return recalled.text;
 }

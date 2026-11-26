@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configureProviderStorePaths } from "../providers/store";
 import {
+  AUTO_MEMORY_TOKEN_BUDGET,
   clearMemories,
   forgetMemory,
   formatMemoriesForInjection,
   listMemories,
   memoryContextForPrompt,
+  memoryRecallForPrompt,
   readMemoryFile,
   searchMemories,
   userMemoryFilePath,
@@ -124,4 +126,19 @@ test("tags are normalized and bounded", async () => {
     tags: ["task-pattern", " task-pattern ", "x".repeat(200), 42, "preference"],
   });
   assert.deepEqual(memory.tags, ["task-pattern", "preference"]);
+});
+
+test("memoryRecallForPrompt caps auto-recall at AUTO_MEMORY_TOKEN_BUDGET (300 tokens) and returns count/tokens", async () => {
+  for (let i = 0; i < 6; i++) {
+    await writeMemory(ALICE, {
+      fact: `Preference ${i}: always use strict TypeScript and run affected tests before pushing ${"x".repeat(160)}`,
+      tags: ["preference"],
+    });
+  }
+  const recalled = await memoryRecallForPrompt(ALICE, "typescript tests", {
+    budgetTokens: AUTO_MEMORY_TOKEN_BUDGET,
+  });
+  assert.ok(recalled.count > 0);
+  assert.ok(recalled.tokens <= AUTO_MEMORY_TOKEN_BUDGET, `expected <= ${AUTO_MEMORY_TOKEN_BUDGET}, got ${recalled.tokens}`);
+  assert.ok(recalled.text.length > 0);
 });

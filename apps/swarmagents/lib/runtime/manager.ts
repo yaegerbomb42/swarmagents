@@ -198,7 +198,7 @@ import {
 } from "../library/run-seed";
 import { awaitRoleEscalation, createRoleEscalationApproval } from "../harness/role-escalation";
 import { startMemoryBridge } from "../memory/bridge";
-import { memoryContextForPrompt } from "../memory/store";
+import { AUTO_MEMORY_TOKEN_BUDGET, memoryRecallForPrompt } from "../memory/store";
 import { buildMemoryPrompt } from "../memory/prompt";
 import { runMemoryTool } from "../memory/tools";
 
@@ -2058,10 +2058,16 @@ export class RuntimeManager {
    * the prompt, rendered as the block that rides in the system prompt.
    * Returns an empty string when the account has no memory yet.
    */
-  private async memoryContextFor(userId: string, prompt: string): Promise<string> {
+  private async memoryContextFor(userId: string, prompt: string, runId?: string): Promise<string> {
     try {
-      const context = await memoryContextForPrompt(userId, prompt);
-      return buildMemoryPrompt(context);
+      const recalled = await memoryRecallForPrompt(userId, prompt, { budgetTokens: AUTO_MEMORY_TOKEN_BUDGET });
+      if (recalled.count > 0 && runId) {
+        this.bus.publish(runId, {
+          type: "memory.recalled",
+          data: { count: recalled.count, tokens: recalled.tokens },
+        });
+      }
+      return buildMemoryPrompt(recalled.text);
     } catch {
       // A memory lookup must never break a run.
       return "";
@@ -3296,7 +3302,7 @@ export class RuntimeManager {
     // facts most relevant to this prompt, capped at the injection budget.
     // The store lives on the host (in the per-user data dir), so the memory
     // survives a VM reset.
-    active.memoryContext = await this.memoryContextFor(userId, active.prompt);
+    active.memoryContext = await this.memoryContextFor(userId, active.prompt, active.runId);
 
     // Keep the pre-run listing only when the opt-in Oracle gate needs it. The
     // report artifact diff is more precise than a whole-repository git diff,

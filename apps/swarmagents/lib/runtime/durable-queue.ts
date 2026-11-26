@@ -25,6 +25,7 @@ import path from "node:path";
 import { getStoragePaths } from "../board/store";
 import type { RunCompute } from "../computers/compute";
 import type { RunModeInfo } from "../providers/capabilities";
+import { MODEL_TIERS, type ModelTier } from "../providers/types";
 import type { RoleDefinition, RunRolePolicy } from "../roles";
 import type { ResumePoint } from "./checkpoints";
 
@@ -48,6 +49,8 @@ export interface PersistedActiveRun {
   agentCard?: string;
   sessionId?: string;
   model?: string;
+  /** Routing tier intent (fast/balanced/deep); kept separate from `model`. */
+  tier?: ModelTier;
   role?: RoleDefinition;
   rolePolicy: RunRolePolicy;
   projectId?: string;
@@ -71,6 +74,8 @@ export interface PersistedQueuedRun {
   agentCard?: string;
   sessionId?: string;
   model?: string;
+  /** Routing tier intent (fast/balanced/deep); kept separate from `model`. */
+  tier?: ModelTier;
   role?: RoleDefinition;
   rolePolicy: RunRolePolicy;
   projectId?: string;
@@ -183,6 +188,7 @@ function normalizeCommon(record: Record<string, unknown>):
       | "agentCard"
       | "sessionId"
       | "model"
+      | "tier"
       | "role"
       | "rolePolicy"
       | "projectId"
@@ -211,6 +217,9 @@ function normalizeCommon(record: Record<string, unknown>):
     ...(str(record.agentCard, MAX_AGENT_CARD_LEN) ? { agentCard: str(record.agentCard, MAX_AGENT_CARD_LEN) } : {}),
     ...(str(record.sessionId, 256) ? { sessionId: str(record.sessionId, 256) } : {}),
     ...(str(record.model, 128) ? { model: str(record.model, 128) } : {}),
+    ...(typeof record.tier === "string" && (MODEL_TIERS as readonly string[]).includes(record.tier)
+      ? { tier: record.tier as ModelTier }
+      : {}),
     ...(role ? { role } : {}),
     rolePolicy,
     ...(str(record.projectId, 128) ? { projectId: str(record.projectId, 128) } : {}),

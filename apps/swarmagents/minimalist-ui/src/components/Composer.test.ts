@@ -18,5 +18,6 @@ test("Composer renders Fast / Balanced / Deep tier selector when onTierChange is
   assert.ok(markup.includes('data-testid="composer-tier-fast"'));
   assert.ok(markup.includes('data-testid="composer-tier-balanced"'));
   assert.ok(markup.includes('data-testid="composer-tier-deep"'));
-  assert.ok(markup.includes('data-testid="composer-tier-deep" aria-pressed="true"') || markup.includes('aria-pressed="true"'));
+  const pressed = [...markup.matchAll(/<button[^>]*aria-pressed="true"[^>]*data-testid="composer-tier-(\w+)"/g)].map((m) => m[1]);
+  assert.deepEqual(pressed, ["deep"], "only the selected tier is pressed");
 });

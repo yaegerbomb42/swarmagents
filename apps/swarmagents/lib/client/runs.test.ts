@@ -214,3 +214,9 @@ test("fetchRuns reads the runs route and reports why it could not", async () => 
   const malformed = fakeFetch(() => json({ nope: true }));
   assert.deepEqual(await fetchRuns("limit=20", { fetchImpl: malformed.fetchImpl }), { ok: true, runs: [] });
 });
+
+test("startRun omits the default balanced tier so default requests are unchanged", async () => {
+  const { fetchImpl, calls } = fakeFetch(() => json({ runId: "run_bal" }, 201));
+  await startRun({ prompt: "Analyze", fullAuto: true, tier: "balanced" }, { fetchImpl });
+  assert.deepEqual(sentBody(calls[0]), { prompt: "Analyze", autoApprove: true, fullAuto: true });
+});

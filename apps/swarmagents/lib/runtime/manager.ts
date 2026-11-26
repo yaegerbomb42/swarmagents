@@ -72,7 +72,7 @@ import {
   runModeForCapabilities,
   type RunModeInfo,
 } from "../providers/capabilities";
-import type { RunMode } from "../providers/types";
+import { isModelTier, type ModelTier, type RunMode } from "../providers/types";
 import { orderLlmCandidates } from "./llm-gateway";
 import { isTeamRunActive, ownsTeamRun } from "../team/store";
 import { serverMode } from "../auth";
@@ -471,6 +471,8 @@ interface QueuedRun {
   agentCard?: string;
   sessionId?: string;
   model?: string;
+  /** Routing tier intent (fast/balanced/deep); kept separate from `model`. */
+  tier?: ModelTier;
   /** The role driving this run (undefined = legacy un-role'd run). */
   role?: RoleDefinition;
   /**
@@ -590,6 +592,8 @@ interface ActiveRun {
   /** Provider serving the run, from the router selection. */
   provider?: string;
   model?: string;
+  /** Routing tier intent (fast/balanced/deep); kept separate from `model`. */
+  tier?: ModelTier;
   /**
    * Turn ceiling for this run, passed to claude as --max-turns (capped by
    * SWARM_MAX_TURNS in the runner). Absent means no flag — the CLI's own
@@ -897,6 +901,7 @@ export function directModeConfigurationError(
   vm: VmManager,
   userId: string,
   model?: string,
+  tier?: ModelTier,
 ): string | null {
   if (!(vm.driver instanceof DockerVmDriver)) return null;
   if (missingLlmProxyEnv().length === 0) return null;
@@ -904,6 +909,7 @@ export function directModeConfigurationError(
   try {
     const candidates = orderLlmCandidates(routerProviders(userId), model, {
       preferFree: readUserSettings(userId).preferFreeProviders,
+      ...(tier ? { tier } : {}),
     });
     // Mirror selectForClaude: providers without a usable key are skipped.
     const first = candidates.find((c) => (c.config.keys?.length ?? 0) > 0);
@@ -1405,6 +1411,7 @@ export class RuntimeManager {
       ...(active.agentCard ? { agentCard: active.agentCard } : {}),
       ...(active.sessionId ? { sessionId: active.sessionId } : {}),
       ...(active.model ? { model: active.model } : {}),
+      ...(active.tier ? { tier: active.tier } : {}),
       ...(active.role ? { role: active.role } : {}),
       rolePolicy: active.rolePolicy,
       ...(active.projectId ? { projectId: active.projectId } : {}),
@@ -1427,6 +1434,7 @@ export class RuntimeManager {
       ...(run.agentCard ? { agentCard: run.agentCard } : {}),
       ...(run.sessionId ? { sessionId: run.sessionId } : {}),
       ...(run.model ? { model: run.model } : {}),
+      ...(run.tier ? { tier: run.tier } : {}),
       ...(run.role ? { role: run.role } : {}),
       rolePolicy: run.rolePolicy,
       ...(run.projectId ? { projectId: run.projectId } : {}),
@@ -1506,6 +1514,7 @@ export class RuntimeManager {
           ...(queued.agentCard ? { agentCard: queued.agentCard } : {}),
           ...(queued.sessionId ? { sessionId: queued.sessionId } : {}),
           ...(queued.model ? { model: queued.model } : {}),
+          ...(queued.tier ? { tier: queued.tier } : {}),
           ...(queued.role ? { role: queued.role } : {}),
           rolePolicy: queued.rolePolicy,
           ...(queued.projectId ? { projectId: queued.projectId } : {}),
@@ -1926,7 +1935,7 @@ export class RuntimeManager {
    * conservative (text mode, no desktop tools) and the run will surface the
    * usual "no providers" error later.
    */
-  private modeFor(userId: string, model?: string): RunModeInfo {
+  private modeFor(userId: string, model?: string, tier?: ModelTier): RunModeInfo {
     let provider: string | undefined;
     let modelId: string | undefined = model;
     let capabilities = CONSERVATIVE_CAPABILITIES;
@@ -1934,6 +1943,7 @@ export class RuntimeManager {
       const settings = readUserSettings(userId);
       const candidates = orderLlmCandidates(routerProviders(userId), model, {
         preferFree: settings.preferFreeProviders,
+        ...(tier ? { tier } : {}),
       });
       const first = candidates[0];
       if (first) {
@@ -1995,7 +2005,7 @@ export class RuntimeManager {
    * each phase and republished when it changes.
    */
   private modeForSelection(active: ActiveRun, provider?: string, model?: string): RunModeInfo {
-    const fallback = active.runMode ?? this.modeFor(active.userId, active.model);
+    const fallback = active.runMode ?? this.modeFor(active.userId, active.model, active.tier);
     if (!provider || !model) return fallback;
     const config = routerProviders(active.userId).find((c) => c.id === provider);
     if (!config) return fallback;
@@ -2188,6 +2198,8 @@ export class RuntimeManager {
       agentCard?: string;
       sessionId?: string;
       model?: string;
+      /** Routing tier intent (fast/balanced/deep); kept separate from `model`. */
+      tier?: ModelTier;
       roleId?: string;
       /**
        * Roles the user explicitly pre-granted for this run (composer run
@@ -2244,7 +2256,7 @@ export class RuntimeManager {
         missingEnv: missingDockerApprovalEnv(this.vm),
       };
     }
-    const directModeError = directModeConfigurationError(this.vm, userId, input.model);
+    const directModeError = directModeConfigurationError(this.vm, userId, input.model, input.tier);
     if (directModeError) {
       return {
         accepted: false,
@@ -2280,7 +2292,7 @@ export class RuntimeManager {
     // In steady state the condition is unreachable (finalize drains).
     if (!st.active && st.queue.length > 0) this.startNext(userId);
     const fullAuto = input.fullAuto ?? process.env.SWARM_FULL_AUTO === "1";
-    const runMode = this.modeFor(userId, input.model);
+    const runMode = this.modeFor(userId, input.model, input.tier);
 
     let role: RoleDefinition | undefined;
     if (input.roleId !== undefined && input.roleId.trim() !== "") {
@@ -2328,6 +2340,7 @@ export class RuntimeManager {
         agentCard: input.agentCard,
         sessionId: input.sessionId,
         model: input.model,
+        tier: input.tier,
         role,
         rolePolicy,
         projectId: input.projectId,
@@ -2373,6 +2386,7 @@ export class RuntimeManager {
       agentCard: input.agentCard,
       sessionId,
       model: input.model,
+      tier: input.tier,
       role,
       rolePolicy,
       projectId: input.projectId,
@@ -2479,6 +2493,7 @@ export class RuntimeManager {
       agentCard: next.agentCard,
       sessionId,
       model: next.model,
+      tier: next.tier,
       role: next.role,
       rolePolicy: next.rolePolicy,
       projectId: next.projectId,
@@ -3462,7 +3477,7 @@ export class RuntimeManager {
 
     while (true) {
       const selection = router
-        ? router.selectForClaude({ model: active.model }, exhausted)
+        ? router.selectForClaude({ model: active.model, ...(active.tier ? { tier: active.tier } : {}) }, exhausted)
         : null;
 
       // No pool selection available. When providers were exhausted by
@@ -3691,6 +3706,7 @@ export class RuntimeManager {
       let aborted = false;
       const pool = new RunProviderPool(router, {
         model: active.model,
+        ...(active.tier ? { tier: active.tier } : {}),
         resumeSessionId: active.sessionId,
         onEvent: (event) => this.bus.publish(runId, { type: "provider.pool", data: event }),
       });
@@ -4395,7 +4411,10 @@ export class RuntimeManager {
           ...(active.stateLedger ? { stateLedger: active.stateLedger } : {}),
           ...(l1Files ?? {}),
           sessionId,
-          model: active.model,
+          // A tier alias is routing intent, never a CLI model id: the
+          // host-env fallback (no pool selection) would otherwise run
+          // `claude --model balanced` and fail at startup.
+          model: active.model && !isModelTier(active.model) ? active.model : undefined,
           maxTurns: active.maxTurns,
           provider: selection?.provider,
           env,

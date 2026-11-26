@@ -132,7 +132,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "tier must be fast, balanced, or deep." }, { status: 400 });
     }
   }
-  const effectiveModel = model ?? tier;
   // Turn ceiling, passed to claude as --max-turns (capped by
   // SWARM_MAX_TURNS in the runner). Present-but-invalid is rejected so a
   // typo cannot silently run unbounded.
@@ -233,7 +232,10 @@ export async function POST(req: NextRequest) {
     prompt,
     agentCard,
     sessionId,
-    model: effectiveModel,
+    model,
+    // Tier is routing intent, never a model id: keep it out of `model` so it
+    // can never reach `claude --model`. "balanced" is the default: omitted.
+    ...(tier && tier !== "balanced" ? { tier } : {}),
     ...(maxTurns ? { maxTurns } : {}),
     ...(roleId ? { roleId } : {}),
     ...(grantedRoleIds ? { grantedRoleIds } : {}),

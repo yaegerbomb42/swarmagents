@@ -74,7 +74,9 @@ export function buildRunRequest(input: StartRunInput): Record<string, unknown> {
     fullAuto: input.fullAuto,
     ...(input.sessionId ? { sessionId: input.sessionId } : {}),
     ...(input.computeTarget ? { computeTarget: input.computeTarget } : {}),
-    ...(input.tier ? { tier: input.tier } : {}),
+    // "balanced" is the server default: omit it so default requests stay
+    // byte-identical to before the tier selector existed.
+    ...(input.tier && input.tier !== "balanced" ? { tier: input.tier } : {}),
   };
 }
 

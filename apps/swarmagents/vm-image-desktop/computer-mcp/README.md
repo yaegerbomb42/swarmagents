@@ -22,6 +22,19 @@ Transport is **stdio only** — there is no network listener. The server is
 spawned by the role MCP wiring in the harness as
 `node /opt/swarm/computer-mcp/server.mjs`.
 
+## Action-effect feedback
+
+After `click`, `double_click`, `drag`, `type`, `key`, `scroll` and `open_app`
+the server waits up to 1.5 s (3 s for `open_app`) for the screen to settle and
+appends one line to the tool result, e.g.
+`effect: screen changed near (412, 300); focus moved to "Save As"` or
+`effect: NO visible change after 1.5s; focused window unchanged`. After three
+no-change actions in a row it adds a hint to re-read the screen
+(`describe_screen` / `inspect_ui`) or fix focus. The fingerprint hashes raw
+downscaled grayscale pixels (not PNG bytes, which carry timestamps) plus the
+focused window id and title; click actions hash only a 400x300 region around
+the click. `SWARM_EFFECT_FEEDBACK=0` turns it off. See `effect.mjs`.
+
 ## Security
 
 - Every input tool is implemented with xdotool via **argv arrays** — never
@@ -40,6 +53,7 @@ spawned by the role MCP wiring in the harness as
 - `server.mjs` — the MCP server (stdio transport, tool registration).
 - `validate.mjs` — shared argument validation + argv construction + summary
   strings (also imported by the harness's risk/telemetry layer for tests).
+- `effect.mjs` — action-effect fingerprint, settle loop and no-change hint.
 - `atspi_dump.py` — AT-SPI2 tree walker (python3-pyatspi) behind `inspect_ui`
   and the widget section of `describe_screen`. Bounded by node, depth and
   time caps; prints one JSON object. Finds the accessibility bus through the

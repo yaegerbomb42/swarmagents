@@ -36,6 +36,14 @@ import {
 } from "./validate.mjs";
 import { capClipboardText, writeClipboard } from "./clipboard.mjs";
 import { pasteText } from "./paste.mjs";
+import {
+  effectEnabled,
+  captureFingerprint,
+  settle,
+  effectPoint,
+  formatEffectLine,
+  noteEffectResult,
+} from "./effect.mjs";
 
 const DISPLAY = process.env.SWARM_COMPUTER_DISPLAY || process.env.DISPLAY || ":1";
 // Text-desktop mode (non-vision model): `screenshot` answers with the
@@ -370,6 +378,52 @@ async function focusWindow(args, cmdArgs) {
   return fail(`focus_window failed: ${(res.stderr || fallback.stderr || "window not found").trim()}`);
 }
 
+/**
+ * Tools whose purpose is to change what is on screen. `move` is deliberately
+ * not here: scrot does not capture the cursor, so a pointer move would always
+ * report "NO visible change" and push the agent toward the hint.
+ */
+const EFFECT_TOOLS = new Set([
+  "click",
+  "double_click",
+  "drag",
+  "type",
+  "key",
+  "scroll",
+  "open_app",
+]);
+
+/** settle window per input tool: app launch is slower than a click/type. */
+function effectSettleOpts(tool) {
+  return tool === "open_app"
+    ? { timeoutMs: 3000, intervalMs: 200, initialMs: 100 }
+    : { timeoutMs: 1500, intervalMs: 200, initialMs: 100 };
+}
+
+/**
+ * Run an input action with action-effect feedback: capture a fingerprint
+ * before, run the action, then settle on the screen and append an effect line
+ * (and, after repeated no-changes, a hint) to the tool result.
+ */
+async function withEffect(tool, args, action) {
+  if (!EFFECT_TOOLS.has(tool) || !effectEnabled()) return action();
+  // Fingerprint the region around the action point when there is one — a
+  // full-screen scrot per poll is costly — else the whole screen.
+  const point = effectPoint(args, tool);
+  const captureOpts = point ? { point, regionSize: { w: 400, h: 300 } } : {};
+  const before = await captureFingerprint(captureOpts);
+  if (before === null) return action();
+  const result = await action();
+  if (result?.isError) return result;
+  const settleRes = await settle(before, () => captureFingerprint(captureOpts), effectSettleOpts(tool));
+  const hint = noteEffectResult(settleRes.changed);
+  const line = formatEffectLine(settleRes, point);
+  if (result?.content?.[0]?.text) {
+    result.content[0].text = `${result.content[0].text}\n${line}${hint ? `\n${hint}` : ""}`;
+  }
+  return result;
+}
+
 async function callTool(tool, args) {
   // All input tools go through the shared validator, producing argv arrays.
   const parsed = parseToolArgs(tool, args);
@@ -401,22 +455,24 @@ async function callTool(tool, args) {
       await new Promise((resolve) => setTimeout(resolve, ms));
       return textResult(`Waited ${ms}ms`);
     }
+    case "type":
+      return withEffect("type", args, () => typeTool(args, parsed.cmds));
     case "open_app": {
       const [program] = parsed.cmds[0];
-      let child;
-      try {
-        child = spawn(program, parsed.cmds[0].slice(1), { env: CHILD_ENV, detached: true, stdio: "ignore" });
-      } catch (err) {
-        return fail(`open_app failed: ${String(err)}`);
-      }
-      child.on("error", () => { /* the app may fail to launch; the user sees it */ });
-      child.unref();
-      return textResult(`Opening ${args.name}`);
+      return withEffect("open_app", args, () => {
+        let child;
+        try {
+          child = spawn(program, parsed.cmds[0].slice(1), { env: CHILD_ENV, detached: true, stdio: "ignore" });
+        } catch (err) {
+          return fail(`open_app failed: ${String(err)}`);
+        }
+        child.on("error", () => { /* the app may fail to launch; the user sees it */ });
+        child.unref();
+        return textResult(`Opening ${args.name}`);
+      });
     }
-    case "type":
-      return typeTool(args, parsed.cmds);
     default:
-      return runAll(parsed.cmds, tool.replace("_", " "));
+      return withEffect(tool, args, () => runAll(parsed.cmds, tool.replace("_", " ")));
   }
 }
 

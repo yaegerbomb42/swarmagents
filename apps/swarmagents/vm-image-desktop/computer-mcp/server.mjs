@@ -13,13 +13,22 @@
 // as `node /opt/swarm/computer-mcp/server.mjs`.
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { parseToolArgs, summarizeTool, COMPUTER_TOOLS, OPEN_APP_NAMES, parseWmctrlWindows, parseTesseractTsv } from "./validate.mjs";
+import {
+  parseToolArgs,
+  summarizeTool,
+  COMPUTER_TOOLS,
+  OPEN_APP_NAMES,
+  parseWmctrlWindows,
+  parseTesseractTsv,
+  findTextTarget,
+} from "./validate.mjs";
 
 const DISPLAY = process.env.SWARM_COMPUTER_DISPLAY || process.env.DISPLAY || ":1";
 // Constrain the tools' own child processes, never the server itself.
@@ -124,6 +133,37 @@ async function captureScreenshot() {
   }
 }
 
+/** Capture OCR targets on display :1 using scrot + tesseract TSV. */
+async function captureOcrTargets(maxItems = 150) {
+  const file = path.join(SCREENSHOT_DIR, `swarm-ocr-${process.pid}-${Date.now()}.png`);
+  const shot = await run("scrot", ["-o", file], { timeoutMs: 12_000 });
+  try {
+    if (shot.code !== 0) {
+      return { ok: false, error: (shot.stderr || shot.stdout || "scrot failed").trim(), targets: [] };
+    }
+    const ocr = await run("tesseract", [file, "stdout", "--psm", "11", "tsv"], { timeoutMs: 15_000 });
+    if (ocr.code !== 0) {
+      return { ok: false, error: (ocr.stderr || "tesseract unavailable").trim().slice(0, 120), targets: [] };
+    }
+    return { ok: true, targets: parseTesseractTsv(ocr.stdout, maxItems) };
+  } finally {
+    fs.promises.unlink(file).catch(() => {});
+  }
+}
+
+/** Capture a SHA-256 hash of the current display :1 screenshot. */
+async function captureScreenHash() {
+  const file = path.join(SCREENSHOT_DIR, `swarm-hash-${process.pid}-${Date.now()}.png`);
+  const shot = await run("scrot", ["-o", file], { timeoutMs: 12_000 });
+  try {
+    if (shot.code !== 0) return null;
+    const buf = await fs.promises.readFile(file);
+    return crypto.createHash("sha256").update(buf).digest("hex");
+  } finally {
+    fs.promises.unlink(file).catch(() => {});
+  }
+}
+
 /**
  * Structured non-vision desktop inspection: screen dimensions, pointer location,
  * open windows with clickable center coordinates, and optional OCR text lines
@@ -153,29 +193,108 @@ async function describeScreen(args) {
   ];
 
   if (includeOcr) {
-    const file = path.join(SCREENSHOT_DIR, `swarm-ocr-${process.pid}-${Date.now()}.png`);
-    const shot = await run("scrot", ["-o", file], { timeoutMs: 12_000 });
-    try {
-      if (shot.code === 0) {
-        const ocr = await run("tesseract", [file, "stdout", "--psm", "11", "tsv"], { timeoutMs: 15_000 });
-        if (ocr.code === 0) {
-          const targets = parseTesseractTsv(ocr.stdout, maxItems);
-          lines.push(
-            targets.length > 0
-              ? `Clickable text targets (${targets.length}):\n` +
-                  targets.map((t) => `  "${t.text}" -> click(${t.cx}, ${t.cy}) [${t.x},${t.y} ${t.w}x${t.h}]`).join("\n")
-              : "Clickable text targets: none detected",
-          );
-        } else {
-          lines.push(`OCR skipped (${(ocr.stderr || "tesseract unavailable").trim().slice(0, 120)})`);
-        }
-      }
-    } finally {
-      fs.promises.unlink(file).catch(() => {});
+    const ocrRes = await captureOcrTargets(maxItems);
+    if (ocrRes.ok) {
+      lines.push(
+        ocrRes.targets.length > 0
+          ? `Clickable text targets (${ocrRes.targets.length}):\n` +
+              ocrRes.targets.map((t) => `  "${t.text}" -> click(${t.cx}, ${t.cy}) [${t.x},${t.y} ${t.w}x${t.h}]`).join("\n")
+          : "Clickable text targets: none detected",
+      );
+    } else {
+      lines.push(`OCR skipped (${ocrRes.error})`);
     }
   }
 
   return textResult(lines.join("\n"));
+}
+
+async function clickText(args) {
+  const ocrRes = await captureOcrTargets(150);
+  if (!ocrRes.ok) return fail(`click_text OCR failed: ${ocrRes.error}`);
+  const hit = findTextTarget(ocrRes.targets, args.text, { exact: args.exact === true });
+  if (!hit) return fail(`click_text: "${String(args.text).trim()}" not found on screen.`);
+  const clickTool = args.double === true ? "double_click" : "click";
+  const parsedClick = parseToolArgs(clickTool, { x: hit.cx, y: hit.cy, button: args.button });
+  if (!parsedClick.ok) return fail(parsedClick.error);
+  const res = await runAll(parsedClick.cmds, clickTool.replace("_", " "));
+  if (res.isError) return res;
+  return textResult(`Clicked "${hit.text}" at (${hit.cx}, ${hit.cy})`);
+}
+
+async function waitForText(args) {
+  const timeoutMs = Number(args.timeoutMs ?? 10_000);
+  const pollMs = Number(args.pollMs ?? 500);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const ocrRes = await captureOcrTargets(150);
+    if (ocrRes.ok) {
+      const hit = findTextTarget(ocrRes.targets, args.text);
+      if (hit) return textResult(`Found "${hit.text}" at (${hit.cx}, ${hit.cy})`);
+    }
+    if (Date.now() + pollMs > deadline) break;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  return fail(`wait_for_text timed out after ${timeoutMs}ms waiting for "${String(args.text).trim()}"`);
+}
+
+async function waitForScreenChange(args) {
+  const timeoutMs = Number(args.timeoutMs ?? 10_000);
+  const pollMs = Number(args.pollMs ?? 500);
+  const baseline = await captureScreenHash();
+  if (!baseline) return fail("wait_for_screen_change failed to capture baseline screenshot.");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    if (Date.now() + pollMs > deadline) break;
+    await new Promise((r) => setTimeout(r, pollMs));
+    const current = await captureScreenHash();
+    if (current && current !== baseline) {
+      return textResult("Screen changed.");
+    }
+  }
+  return fail(`wait_for_screen_change timed out after ${timeoutMs}ms`);
+}
+
+async function clipboardGet(args) {
+  const selection = args.selection === "primary" ? "primary" : "clipboard";
+  const res = await run("xclip", ["-o", "-selection", selection], { timeoutMs: 5_000 });
+  if (res.code !== 0) {
+    const detail = (res.stderr || res.stdout).trim();
+    if (/target STRING not available/i.test(detail)) return textResult("");
+    return fail(`clipboard_get failed: ${detail || `exit code ${res.code}`}`);
+  }
+  return textResult(res.stdout);
+}
+
+function clipboardSet(args) {
+  const selection = args.selection === "primary" ? "primary" : "clipboard";
+  return new Promise((resolve) => {
+    const child = spawn("xclip", ["-i", "-selection", selection], { env: CHILD_ENV, shell: false });
+    let stderr = "";
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      resolve(fail("clipboard_set timed out"));
+    }, 5_000);
+    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve(fail(`clipboard_set failed: ${String(err)}`));
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if ((code ?? 0) !== 0) resolve(fail(`clipboard_set failed: ${stderr.trim() || `exit code ${code}`}`));
+      else resolve(textResult(`Clipboard (${selection}) updated (${args.text.length} chars).`));
+    });
+    child.stdin.end(String(args.text));
+  });
+}
+
+async function focusWindow(args, cmdArgs) {
+  const res = await run("wmctrl", cmdArgs, { timeoutMs: 5_000 });
+  if (res.code === 0) return textResult(`Focused window matching "${args.title.trim()}"`);
+  const fallback = await run("xdotool", ["search", "--name", args.title.trim(), "windowactivate"], { timeoutMs: 5_000 });
+  if (fallback.code === 0) return textResult(`Focused window matching "${args.title.trim()}"`);
+  return fail(`focus_window failed: ${(res.stderr || fallback.stderr || "window not found").trim()}`);
 }
 
 async function callTool(tool, args) {
@@ -188,6 +307,18 @@ async function callTool(tool, args) {
       return captureScreenshot();
     case "describe_screen":
       return describeScreen(args);
+    case "click_text":
+      return clickText(args);
+    case "wait_for_text":
+      return waitForText(args);
+    case "wait_for_screen_change":
+      return waitForScreenChange(args);
+    case "clipboard_get":
+      return clipboardGet(args);
+    case "clipboard_set":
+      return clipboardSet(args);
+    case "focus_window":
+      return focusWindow(args, parsed.cmds[0]);
     case "wait": {
       const ms = Number(args?.ms ?? 0);
       await new Promise((resolve) => setTimeout(resolve, ms));
@@ -248,6 +379,16 @@ function toolSpec(tool) {
       return { description: "Move the pointer to (x, y) and click the given button.", shape: XY_SHAPE };
     case "double_click":
       return { description: "Move the pointer to (x, y) and double-click.", shape: XY_SHAPE };
+    case "click_text":
+      return {
+        description: "Find visible text on display :1 via OCR and click its center.",
+        shape: {
+          text: z.string().describe("Visible text label to click (1..120 chars)."),
+          button: z.union([z.number(), z.string()]).optional().describe("Mouse button 1..7 (default 1)."),
+          double: z.boolean().optional().describe("Double-click instead of single click."),
+          exact: z.boolean().optional().describe("Require exact text match instead of substring."),
+        },
+      };
     case "move":
       return { description: "Move the pointer to (x, y) without pressing any button.", shape: XY_SHAPE };
     case "drag":
@@ -270,10 +411,45 @@ function toolSpec(tool) {
           "Open a desktop application: browser (Chromium), terminal, files (Thunar), libreoffice (Writer), spreadsheet (LibreOffice Calc), gimp (image editing) or blender (3D).",
         shape: { name: z.enum(OPEN_APP_NAMES) },
       };
+    case "focus_window":
+      return {
+        description: "Bring a desktop window whose title matches `title` to the foreground.",
+        shape: { title: z.string().describe("Window title substring (1..120 chars).") },
+      };
     case "wait":
       return {
         description: "Wait for a number of milliseconds (max 300000).",
         shape: { ms: z.union([z.number(), z.string()]).describe("Milliseconds to wait.") },
+      };
+    case "wait_for_text":
+      return {
+        description: "Poll display :1 via OCR until `text` appears or timeout expires.",
+        shape: {
+          text: z.string().describe("Text to wait for (1..120 chars)."),
+          timeoutMs: z.union([z.number(), z.string()]).optional().describe("Timeout in ms (100..60000, default 10000)."),
+          pollMs: z.union([z.number(), z.string()]).optional().describe("Poll interval in ms (200..5000, default 500)."),
+        },
+      };
+    case "wait_for_screen_change":
+      return {
+        description: "Poll display :1 until the screen pixels change or timeout expires.",
+        shape: {
+          timeoutMs: z.union([z.number(), z.string()]).optional().describe("Timeout in ms (100..60000, default 10000)."),
+          pollMs: z.union([z.number(), z.string()]).optional().describe("Poll interval in ms (200..5000, default 500)."),
+        },
+      };
+    case "clipboard_get":
+      return {
+        description: "Read text from the X11 clipboard or primary selection.",
+        shape: { selection: z.enum(["clipboard", "primary"]).optional() },
+      };
+    case "clipboard_set":
+      return {
+        description: "Write text into the X11 clipboard or primary selection.",
+        shape: {
+          text: z.string().describe("Text to copy to clipboard (max 20000 chars)."),
+          selection: z.enum(["clipboard", "primary"]).optional(),
+        },
       };
     default:
       return { description: tool, shape: {} };

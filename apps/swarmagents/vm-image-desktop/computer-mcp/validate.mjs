@@ -21,25 +21,36 @@ export const COMPUTER_TOOLS = Object.freeze([
   "describe_screen",
   "click",
   "double_click",
+  "click_text",
   "move",
   "drag",
   "type",
   "key",
   "scroll",
   "open_app",
+  "focus_window",
   "wait",
+  "wait_for_text",
+  "wait_for_screen_change",
+  "clipboard_get",
+  "clipboard_set",
 ]);
 
 /** Screen dimension cap; anything beyond is rejected (not clamped). */
 const MAX_SCREEN_DIM = 4096;
 /** Typing cap, characters. */
 const MAX_TYPE_LEN = 2000;
+/** Clipboard write cap, characters. */
+const MAX_CLIPBOARD_LEN = 20_000;
+/** Query/title cap for click_text, wait_for_text, focus_window. */
+const MAX_QUERY_LEN = 120;
 /** Key-combo charset: printable keysym names plus modifiers, no shell chars. */
 const KEY_COMBO_RE = /^[A-Za-z0-9_+\-]+$/;
 const MAX_KEY_COMBO_LEN = 64;
 /** Caps for scroll steps (one wheel click per step) and wait. */
 const MAX_SCROLL_STEPS = 200;
 const MAX_WAIT_MS = 300 * 1000;
+const MAX_POLL_WAIT_MS = 60 * 1000;
 /** Apps the agent may open; the fixed mapping is the allowlist. */
 const OPEN_APPS = Object.freeze({
   browser: Object.freeze(["chromium", "--new-window"]),
@@ -189,6 +200,65 @@ function waitArgs(args) {
   return ok([]);
 }
 
+function queryTextArgs(args, field = "text") {
+  const raw = typeof args[field] === "string" ? args[field].trim() : "";
+  if (!raw || raw.length > MAX_QUERY_LEN) {
+    return invalid(`${field} must be a non-empty string (max ${MAX_QUERY_LEN} chars).`);
+  }
+  return { ok: true, value: raw };
+}
+
+function clickTextArgs(args) {
+  const q = queryTextArgs(args, "text");
+  if (!q.ok) return q;
+  const b = button(args.button);
+  if (b === null) return invalid("button must be an integer 1..7.");
+  return ok([]);
+}
+
+function waitPollArgs(args, { requireText }) {
+  if (requireText) {
+    const q = queryTextArgs(args, "text");
+    if (!q.ok) return q;
+  }
+  if (args.timeoutMs !== undefined) {
+    const t = toInt(args.timeoutMs);
+    if (t === null || t < 100 || t > MAX_POLL_WAIT_MS) {
+      return invalid(`timeoutMs must be an integer within [100, ${MAX_POLL_WAIT_MS}].`);
+    }
+  }
+  if (args.pollMs !== undefined) {
+    const p = toInt(args.pollMs);
+    if (p === null || p < 200 || p > 5000) {
+      return invalid("pollMs must be an integer within [200, 5000].");
+    }
+  }
+  return ok([]);
+}
+
+function clipboardGetArgs(args) {
+  if (args.selection !== undefined && args.selection !== "clipboard" && args.selection !== "primary") {
+    return invalid('selection must be "clipboard" or "primary".');
+  }
+  return ok([]);
+}
+
+function clipboardSetArgs(args) {
+  const sel = clipboardGetArgs(args);
+  if (!sel.ok) return sel;
+  const text = typeof args.text === "string" ? args.text : null;
+  if (text === null || text.length === 0 || text.length > MAX_CLIPBOARD_LEN) {
+    return invalid(`text must be a non-empty string (max ${MAX_CLIPBOARD_LEN} chars).`);
+  }
+  return ok([]);
+}
+
+function focusWindowArgs(args) {
+  const q = queryTextArgs(args, "title");
+  if (!q.ok) return q;
+  return ok([["-a", q.value]]);
+}
+
 /**
  * Validate a tool call. Returns `{ ok: true, cmds: string[][] }` where each
  * command is a full argv array for the tool's program (xdotool for input
@@ -206,6 +276,8 @@ export function parseToolArgs(tool, args) {
       return clickArgs(input, { double: false });
     case "double_click":
       return clickArgs(input, { double: true });
+    case "click_text":
+      return clickTextArgs(input);
     case "move":
       return moveArgs(input);
     case "drag":
@@ -218,8 +290,18 @@ export function parseToolArgs(tool, args) {
       return scrollArgs(input);
     case "open_app":
       return openAppArgs(input);
+    case "focus_window":
+      return focusWindowArgs(input);
     case "wait":
       return waitArgs(input);
+    case "wait_for_text":
+      return waitPollArgs(input, { requireText: true });
+    case "wait_for_screen_change":
+      return waitPollArgs(input, { requireText: false });
+    case "clipboard_get":
+      return clipboardGetArgs(input);
+    case "clipboard_set":
+      return clipboardSetArgs(input);
     default:
       return invalid(`unknown computer tool: ${tool}`);
   }
@@ -241,6 +323,8 @@ export function summarizeTool(tool, args) {
     }
     case "double_click":
       return `Double-clicking at (${s(input.x)}, ${s(input.y)})`;
+    case "click_text":
+      return `Clicking "${s(input.text).slice(0, 60)}"`;
     case "move":
       return `Moving pointer to (${s(input.x)}, ${s(input.y)})`;
     case "drag":
@@ -272,8 +356,20 @@ export function summarizeTool(tool, args) {
       const label = Object.prototype.hasOwnProperty.call(OPEN_APPS, name) ? name : "app";
       return `Opening ${label}`;
     }
+    case "focus_window":
+      return `Focusing window "${s(input.title).slice(0, 60)}"`;
     case "wait":
       return `Waiting ${s(input.ms) || "0"}ms`;
+    case "wait_for_text":
+      return `Waiting for "${s(input.text).slice(0, 60)}"`;
+    case "wait_for_screen_change":
+      return "Waiting for screen change";
+    case "clipboard_get":
+      return "Reading clipboard";
+    case "clipboard_set": {
+      const len = typeof input.text === "string" ? input.text.length : 0;
+      return `Setting clipboard (${len} chars)`;
+    }
     default:
       return `Desktop action (${tool})`;
   }
@@ -364,4 +460,17 @@ export function parseTesseractTsv(tsv, maxItems = 80) {
     if (out.length >= cap) break;
   }
   return out;
+}
+
+/**
+ * Find the best OCR target matching `query` (exact match preferred, then
+ * case-insensitive substring match). Returns null when nothing matches.
+ */
+export function findTextTarget(targets, query, { exact = false } = {}) {
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle || !Array.isArray(targets)) return null;
+  const exactHit = targets.find((t) => String(t?.text || "").trim().toLowerCase() === needle);
+  if (exactHit) return exactHit;
+  if (exact) return null;
+  return targets.find((t) => String(t?.text || "").toLowerCase().includes(needle)) ?? null;
 }

@@ -53,3 +53,10 @@ export function parseWmctrlWindows(stdout: string): WmctrlWindow[];
 
 /** Parse Tesseract TSV output into grouped clickable text coordinates. */
 export function parseTesseractTsv(tsv: string, maxItems?: number): OcrTarget[];
+
+/** Find the best OCR target matching `query` (exact match preferred). */
+export function findTextTarget(
+  targets: readonly OcrTarget[],
+  query: string,
+  options?: { exact?: boolean },
+): OcrTarget | null;

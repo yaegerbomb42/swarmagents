@@ -91,17 +91,24 @@ test("drag produces press-move-release argv", () => {
 });
 
 test("type produces argv with the text as a single element (newlines -> Return)", () => {
+  // Short ASCII text types via keys by default — unchanged behavior.
   assert.deepEqual(parseToolArgs("type", { text: "hello" }), {
     ok: true,
     cmds: [["type", "--delay", "15", "hello"]],
   });
-  const multiline = parseToolArgs("type", { text: "a\nb" });
-  assert.equal(multiline.ok, true);
-  assert.deepEqual(multiline.cmds, [
+  // Explicit keys keeps the classic per-line keyboard argv.
+  const multilineKeys = parseToolArgs("type", { text: "a\nb", mode: "keys" });
+  assert.equal(multilineKeys.ok, true);
+  assert.deepEqual(multilineKeys.cmds, [
     ["type", "--delay", "15", "a"],
     ["key", "Return"],
     ["type", "--delay", "15", "b"],
   ]);
+  // Auto mode routes multiline text to paste instead (see
+  // computer-mcp.type.test.ts for the full mode matrix).
+  const multiline = parseToolArgs("type", { text: "a\nb" });
+  assert.equal(multiline.ok, true);
+  assert.deepEqual(multiline.cmds, [["@paste", "a\nb"]]);
 });
 
 test("key produces argv; combos are charset-limited", () => {

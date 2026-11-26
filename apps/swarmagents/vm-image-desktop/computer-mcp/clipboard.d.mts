@@ -10,3 +10,10 @@ export function writeClipboard(options: {
   env?: Record<string, string | undefined>;
   timeoutMs?: number;
 }): Promise<{ ok: true } | { ok: false; error: string }>;
+
+export function readClipboard(options: {
+  spawnImpl: (command: string, args: string[], options: Record<string, unknown>) => unknown;
+  selection?: "clipboard" | "primary";
+  env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+}): Promise<{ ok: true; text: string } | { ok: false; error?: string }>;

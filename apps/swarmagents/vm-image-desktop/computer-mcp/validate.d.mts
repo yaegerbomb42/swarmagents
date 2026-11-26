@@ -22,6 +22,19 @@ export const COMPUTER_TOOLS: readonly string[];
 /** Validate a tool call; produces safe argv arrays (never a shell string). */
 export function parseToolArgs(tool: string, args: Record<string, unknown>): ParsedToolArgs;
 
+/** Modes the `type` tool accepts ("auto" | "keys" | "paste"). */
+export const TYPE_MODES: readonly string[];
+
+/**
+ * Choose the input method for a `type` call. Auto uses paste for text longer
+ * than 200 chars, multiline text, or non-ASCII text — else keys. Returns null
+ * (invalid) for any other `mode` value.
+ */
+export function chooseTypeMode(text: string, mode?: string): "keys" | "paste" | null;
+
+/** Marker argv command for the paste path (handled by the server, never spawned). */
+export const TYPE_PASTE_MARKER: string;
+
 /** Short human-readable summary of a tool call (for telemetry/activity strip). */
 export function summarizeTool(tool: string, args: Record<string, unknown>): string;
 

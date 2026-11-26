@@ -22,7 +22,7 @@ import type { LogEvent } from "./engine";
 import { usePersisted, useSessionPersisted } from "./store";
 import type { SwarmTask } from "../../lib/mcp-types";
 import { latestVmLifecycleEvent, resolveVmDisplayStatus, usePolledVmStatus, wakeVmStatus } from "../../lib/client/vmStatus";
-import { deriveComputerAction, derivePresence } from "../../lib/client/presence";
+import { deriveComputerAction, derivePresence, lastLoopNudgeAt } from "../../lib/client/presence";
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm, type RunTier } from "../../lib/client/runs";
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
@@ -246,6 +246,12 @@ export default function App() {
   // stream (the screen falls back to its own derivation when this is absent).
   const screenComputerAction = useMemo(
     () => deriveComputerAction(session.liveItems),
+    [session.liveItems],
+  );
+
+  // The newest loop nudge, for the overlay's "Loop caught" chip flash.
+  const screenLoopNudgeAt = useMemo(
+    () => lastLoopNudgeAt(session.liveItems),
     [session.liveItems],
   );
 
@@ -651,6 +657,7 @@ export default function App() {
               fitToHeight={wide}
               presence={screenPresence}
               computerAction={screenComputerAction}
+              loopNudgeAt={screenLoopNudgeAt}
               activity={session.activity ? [{ text: session.activity }] : undefined}
               className={wide ? "h-full" : undefined}
             />

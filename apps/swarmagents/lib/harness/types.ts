@@ -147,6 +147,10 @@ export type TelemetryEvent =
     }
   /** Emitted when a tool call classifies as "deny" and the run is halted. */
   | { type: "tool.blocked"; name: string; reason: string }
+  /** Emitted when a user clicks/types on the live desktop and pauses A1. */
+  | { type: "run.user_takeover"; startedAt: number }
+  /** Emitted when the user hands desktop control back to A1. */
+  | { type: "run.user_handback"; durationSec: number; note: string }
   /**
    * Emitted when an ask-classified tool call is cleared to execute and the
    * auto-checkpoint hook snapshotted the VM first (F1 time travel).

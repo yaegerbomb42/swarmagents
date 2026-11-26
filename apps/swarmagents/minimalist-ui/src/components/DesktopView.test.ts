@@ -109,3 +109,12 @@ test("the standalone view shares the same booting overlay", async () => {
   // The standalone path still renders its own controls row under the stage.
   assert.equal(countOf(markup, 'data-testid="desktop-fullscreen-button"'), 1);
 });
+
+test("UserDrivingBanner renders paused copy and Hand back button", async () => {
+  const { UserDrivingBanner } = await load();
+  const markup = renderToStaticMarkup(h(UserDrivingBanner, { onHandBack: () => {} }));
+  assert.ok(markup.includes('data-testid="user-driving-banner"'));
+  assert.ok(markup.includes("You&#x27;re driving: A1 is paused"));
+  assert.ok(markup.includes('data-testid="user-driving-handback"'));
+  assert.ok(markup.includes("Hand back"));
+});

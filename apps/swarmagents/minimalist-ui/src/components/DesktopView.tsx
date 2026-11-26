@@ -249,6 +249,26 @@ export function PresenceGlow({ presence }: { presence?: Presence }) {
   );
 }
 
+export function UserDrivingBanner({ onHandBack }: { onHandBack: () => void }) {
+  return (
+    <div
+      role="status"
+      data-testid="user-driving-banner"
+      className="flex flex-wrap items-center justify-between gap-2 border-b border-sky-400/35 bg-sky-500/15 px-4 py-2 text-[11px] font-mono text-sky-100"
+    >
+      <span>You&apos;re driving: A1 is paused</span>
+      <button
+        type="button"
+        data-testid="user-driving-handback"
+        onClick={onHandBack}
+        className="inline-flex items-center gap-1.5 rounded-lg bg-sky-400 px-2.5 py-1 text-[11px] font-semibold text-zinc-950 transition hover:bg-sky-300"
+      >
+        Hand back
+      </button>
+    </div>
+  );
+}
+
 export function DesktopView({
   vmState,
   vmResetting = false,
@@ -607,13 +627,56 @@ export function DesktopView({
   }, []);
 
   const live = conn.phase === "live";
+  const [userDrivingPaused, setUserDrivingPaused] = useState(false);
+  const pauseSentRef = useRef(false);
+
+  useEffect(() => {
+    if (!runActive || mode !== "control") {
+      setUserDrivingPaused(false);
+      pauseSentRef.current = false;
+    }
+  }, [runActive, mode]);
+
+  const notifyUserInput = useCallback(() => {
+    if (mode !== "control" || !runActive || !runId || pauseSentRef.current) return;
+    pauseSentRef.current = true;
+    setUserDrivingPaused(true);
+    void fetch(`/api/runtime/runs/${encodeURIComponent(runId)}/pause-input`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "pause" }),
+    }).catch(() => {});
+  }, [mode, runActive, runId]);
+
+  const handbackUserInput = useCallback(() => {
+    pauseSentRef.current = false;
+    setUserDrivingPaused(false);
+    if (runId) {
+      void fetch(`/api/runtime/runs/${encodeURIComponent(runId)}/pause-input`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "handback" }),
+      }).catch(() => {});
+    }
+    switchMode("watch");
+  }, [runId, switchMode]);
 
   // Embedded: fill the ScreenFrame's 16:10 stage with just the surface and
   // the connection-state overlays. The frame owns the pill, mode control,
   // fullscreen and control banner.
   if (embedded) {
     return (
-      <div className="relative h-full w-full bg-black" data-testid="desktop-view">
+      <div
+        className="relative h-full w-full bg-black"
+        data-testid="desktop-view"
+        onPointerDown={notifyUserInput}
+        onKeyDown={notifyUserInput}
+      >
+        {userDrivingPaused && (
+          <div className="absolute inset-x-0 top-0 z-20">
+            <UserDrivingBanner onHandBack={handbackUserInput} />
+          </div>
+        )}
         <div ref={surfaceHolderRef} className="absolute inset-0 transform-gpu" aria-hidden={!live} />
 
         {/* Presence: the agent is working here. A blurred tint over the
@@ -720,10 +783,14 @@ export function DesktopView({
         </div>
       )}
 
+      {userDrivingPaused && <UserDrivingBanner onHandBack={handbackUserInput} />}
+
       {/* 16:9 screen frame with the glass corner radius */}
       <div className="flex flex-1 items-start justify-center p-3 min-h-0">
         <div
           ref={frameRef}
+          onPointerDown={notifyUserInput}
+          onKeyDown={notifyUserInput}
           className="relative w-full max-w-[960px] overflow-hidden rounded-2xl border border-white/10 bg-black shadow-[0_10px_40px_rgba(0,0,0,0.6)]"
           style={{ aspectRatio: "16 / 9" }}
         >

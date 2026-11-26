@@ -22,6 +22,7 @@
 
 import { parseToolArgs, summarizeTool } from "../../vm-image-desktop/computer-mcp/validate.mjs";
 import { checkNavigation, checkNavigationAsync, isLoopbackHost, parseNavigationUrl, lookupAddresses } from "../browser/policy";
+import { isUserDriving } from "../runtime/user-driving";
 import type { RiskDecision } from "./risk";
 import type { TelemetryEvent } from "./types";
 
@@ -134,10 +135,24 @@ function playwrightTarget(args: Record<string, unknown>): string {
  *   the runner's post-hoc re-checks call this without it, so a call the
  *   server already answered as text never halts the run.
  */
+const READ_ONLY_COMPUTER_TOOLS = new Set(["screenshot", "describe_screen", "inspect_ui"]);
+const USER_DRIVING_DENY_REASON = "the user is controlling the desktop; wait or call describe_screen";
+
+export interface ClassifyDesktopOptions {
+  textDesktop?: boolean;
+  userDriving?: boolean;
+  runId?: string;
+}
+
+function isUserControllingDesktop(info: { server: string; tool: string }, opts: ClassifyDesktopOptions): boolean {
+  if (info.server !== COMPUTER_MCP_SERVER || READ_ONLY_COMPUTER_TOOLS.has(info.tool)) return false;
+  return opts.userDriving === true || (typeof opts.runId === "string" && isUserDriving(opts.runId));
+}
+
 export function classifyDesktopToolCall(
   name: string,
   input: unknown,
-  opts: { textDesktop?: boolean } = {},
+  opts: ClassifyDesktopOptions = {},
 ): RiskDecision | null {
   const info = parseMcpToolName(name);
   if (!info) return null;
@@ -145,6 +160,9 @@ export function classifyDesktopToolCall(
 
   if (opts.textDesktop && isRawScreenshotCall(name)) {
     return { level: "deny", reason: textDesktopScreenshotReason(info.server) };
+  }
+  if (isUserControllingDesktop(info, opts)) {
+    return { level: "deny", reason: USER_DRIVING_DENY_REASON };
   }
 
   if (info.server === COMPUTER_MCP_SERVER) {
@@ -183,7 +201,7 @@ export async function classifyDesktopToolCallAsync(
   name: string,
   input: unknown,
   lookup: (host: string) => Promise<string[]> = lookupAddresses,
-  opts: { textDesktop?: boolean } = {},
+  opts: ClassifyDesktopOptions = {},
 ): Promise<RiskDecision | null> {
   const info = parseMcpToolName(name);
   if (!info) return null;
@@ -191,6 +209,9 @@ export async function classifyDesktopToolCallAsync(
 
   if (opts.textDesktop && isRawScreenshotCall(name)) {
     return { level: "deny", reason: textDesktopScreenshotReason(info.server) };
+  }
+  if (isUserControllingDesktop(info, opts)) {
+    return { level: "deny", reason: USER_DRIVING_DENY_REASON };
   }
 
   if (info.server === COMPUTER_MCP_SERVER) {

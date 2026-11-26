@@ -395,6 +395,16 @@ test("compound desktop tools: validation, risk gate, findTextTarget, and telemet
   assert.equal(findTextTarget(targets, "as", { exact: true }), null);
 });
 
+test("classifyDesktopToolCall denies mutating desktop input when userDriving is active, keeping inspection tools allowed", () => {
+  const click = classifyDesktopToolCall("mcp__computer-mcp__click", { x: 100, y: 200 }, { userDriving: true });
+  assert.equal(click?.level, "deny");
+  assert.equal(click?.reason, "the user is controlling the desktop; wait or call describe_screen");
+
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__describe_screen", {}, { userDriving: true })?.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__screenshot", {}, { userDriving: true })?.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__inspect_ui", {}, { userDriving: true })?.level, "allow");
+});
+
 test("describeDesktopAction summarizes playwright calls readably", () => {
   assert.equal(
     describeDesktopAction("mcp__playwright-mcp__browser_navigate", { url: "https://github.com/foo" }),

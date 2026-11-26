@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import {
+  Activity,
   ArrowLeft,
   Check,
   ExternalLink,
@@ -77,6 +78,21 @@ interface ConnectorRow {
 
 interface ConnectorsResponse {
   connectors: ConnectorRow[];
+}
+
+interface ProbeResult {
+  ok: boolean;
+  latencyMs: number;
+  tools: Array<{ name: string; description: string }>;
+  error?: string;
+}
+
+interface ProbeState {
+  id: string;
+  name: string;
+  loading: boolean;
+  result: ProbeResult | null;
+  error: string;
 }
 
 type FilterChip = "all" | "connected" | "one-click" | ConnectorCategory;
@@ -212,12 +228,32 @@ interface ConnectorCardProps {
   onConnect: (entry: ConnectorRow) => void;
   onDisconnect: (entry: ConnectorRow) => void;
   onUpdate: (entry: ConnectorRow) => void;
+  onProbe: (entry: ConnectorRow) => void;
 }
 
-function ConnectorActions({ entry, busy, anyBusy, onConnect, onDisconnect, onUpdate }: ConnectorCardProps) {
+function ConnectorActions({
+  entry,
+  busy,
+  anyBusy,
+  onConnect,
+  onDisconnect,
+  onUpdate,
+  onProbe,
+}: ConnectorCardProps) {
   if (entry.connected) {
     return (
       <>
+        {entry.libraryConnectorId && (
+          <button
+            type="button"
+            disabled={anyBusy}
+            onClick={() => onProbe(entry)}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-300/35 bg-cyan-400/15 px-2.5 py-1.5 text-xs font-medium text-cyan-100 transition hover:bg-cyan-400/25 disabled:opacity-50"
+          >
+            <Activity className="h-3.5 w-3.5" aria-hidden />
+            Test &amp; Tools
+          </button>
+        )}
         <button
           type="button"
           disabled={anyBusy}
@@ -286,7 +322,7 @@ function ConnectorActions({ entry, busy, anyBusy, onConnect, onDisconnect, onUpd
   );
 }
 
-function ConnectorCard({ entry, busy, anyBusy, onConnect, onDisconnect, onUpdate }: ConnectorCardProps) {
+function ConnectorCard({ entry, busy, anyBusy, onConnect, onDisconnect, onUpdate, onProbe }: ConnectorCardProps) {
   return (
     <article
       data-testid={`connector-card-${entry.id}`}
@@ -346,6 +382,7 @@ function ConnectorCard({ entry, busy, anyBusy, onConnect, onDisconnect, onUpdate
             onConnect={onConnect}
             onDisconnect={onDisconnect}
             onUpdate={onUpdate}
+            onProbe={onProbe}
           />
         </div>
         <a
@@ -415,6 +452,7 @@ interface ContentViewProps {
   onConnect: (entry: ConnectorRow) => void;
   onDisconnect: (entry: ConnectorRow) => void;
   onUpdate: (entry: ConnectorRow) => void;
+  onProbe: (entry: ConnectorRow) => void;
 }
 
 function ContentView({
@@ -427,6 +465,7 @@ function ContentView({
   onConnect,
   onDisconnect,
   onUpdate,
+  onProbe,
 }: ContentViewProps) {
   if (loading) return <LoadingState />;
   if (loadError) return <ErrorState loadError={loadError} onRetry={onRetry} />;
@@ -445,6 +484,7 @@ function ContentView({
           onConnect={onConnect}
           onDisconnect={onDisconnect}
           onUpdate={onUpdate}
+          onProbe={onProbe}
         />
       ))}
     </section>
@@ -474,6 +514,7 @@ export function ConnectorsPage() {
     saving: boolean;
     error: string;
   } | null>(null);
+  const [probe, setProbe] = useState<ProbeState | null>(null);
 
   const loadCustom = useCallback(async () => {
     setCustomLoading(true);
@@ -736,6 +777,35 @@ export function ConnectorsPage() {
       setDraft((prev) =>
         prev ? { ...prev, saving: false, error: "Network error — could not connect." } : prev,
       );
+    }
+  };
+
+  const runProbe = async (id: string, name: string) => {
+    if (busyId) return;
+    setBusyId(id);
+    setNotice(null);
+    setActionError(null);
+    setProbe({ id, name, loading: true, result: null, error: "" });
+    try {
+      const res = await fetch("/api/connectors/probe", {
+        method: "POST",
+        cache: "no-store",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ connectorId: id }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { probe?: ProbeResult; error?: string };
+      if (!res.ok || !data.probe) {
+        const message = data.error ?? `Could not probe ${name}.`;
+        setProbe((prev) => (prev ? { ...prev, loading: false, error: message } : prev));
+        return;
+      }
+      setProbe((prev) => (prev ? { ...prev, loading: false, result: data.probe ?? null } : prev));
+    } catch {
+      setProbe((prev) =>
+        prev ? { ...prev, loading: false, error: "Network error while probing." } : prev,
+      );
+    } finally {
+      setBusyId(null);
     }
   };
 
@@ -1011,6 +1081,7 @@ export function ConnectorsPage() {
               onConnect={handleOneClickConnect}
               onDisconnect={handleDisconnect}
               onUpdate={openModal}
+              onProbe={(entry) => void runProbe(entry.id, entry.name)}
             />
             {!loading && !loadError && filtered.length > visibleCount && (
               <div className="mt-6 flex flex-col items-center gap-2">
@@ -1134,17 +1205,28 @@ export function ConnectorsPage() {
                       </div>
                       <p className="mt-2 text-xs leading-relaxed text-zinc-400">{item.description}</p>
                     </div>
-                    <div className="mt-4 flex items-center justify-between border-t border-white/[0.08] pt-3">
+                    <div className="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.08] pt-3">
                       <span className="font-mono text-[10px] text-zinc-500">{item.id}</span>
-                      <button
-                        type="button"
-                        disabled={Boolean(busyId)}
-                        onClick={() => void handleRemoveCustom(item)}
-                        className="inline-flex items-center gap-1 rounded-lg border border-red-400/30 bg-red-500/10 px-2.5 py-1 text-xs text-red-200 hover:bg-red-500/20 disabled:opacity-50"
-                      >
-                        <Trash2 className="h-3 w-3" aria-hidden />
-                        Remove
-                      </button>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={Boolean(busyId)}
+                          onClick={() => void runProbe(item.id, item.name)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-cyan-300/35 bg-cyan-400/15 px-2.5 py-1 text-xs font-medium text-cyan-100 hover:bg-cyan-400/25 disabled:opacity-50"
+                        >
+                          <Activity className="h-3 w-3" aria-hidden />
+                          Test &amp; Tools
+                        </button>
+                        <button
+                          type="button"
+                          disabled={Boolean(busyId)}
+                          onClick={() => void handleRemoveCustom(item)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-red-400/30 bg-red-500/10 px-2.5 py-1 text-xs text-red-200 hover:bg-red-500/20 disabled:opacity-50"
+                        >
+                          <Trash2 className="h-3 w-3" aria-hidden />
+                          Remove
+                        </button>
+                      </div>
                     </div>
                   </article>
                 ))}
@@ -1153,6 +1235,112 @@ export function ConnectorsPage() {
           </section>
         )}
       </div>
+
+      {/* Live MCP probe results */}
+      {probe && (
+        <Modal
+          labelledBy="connector-probe-title"
+          onClose={() => {
+            if (!probe.loading) setProbe(null);
+          }}
+        >
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-widest text-cyan-300">
+                Live MCP probe
+              </p>
+              <h2 id="connector-probe-title" className="mt-1 text-lg font-semibold text-white">
+                {probe.name}
+              </h2>
+            </div>
+            <button
+              type="button"
+              disabled={probe.loading}
+              onClick={() => setProbe(null)}
+              aria-label="Close modal"
+              className="rounded-lg p-1.5 text-zinc-400 hover:bg-white/10 hover:text-white disabled:opacity-50"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+
+          {probe.loading ? (
+            <output className="mt-5 flex items-center gap-2.5 text-sm text-zinc-300">
+              <Loader2 className="h-4 w-4 animate-spin text-cyan-300" aria-hidden />
+              Running initialize + tools/list…
+            </output>
+          ) : (
+            <>
+              {probe.error && (
+                <p role="alert" className="mt-4 rounded-lg border border-red-400/30 bg-red-950/40 px-3 py-2 text-xs text-red-200">
+                  {probe.error}
+                </p>
+              )}
+              {probe.result && (
+                <>
+                  <div className="mt-5 flex flex-wrap items-center gap-2">
+                    <span
+                      className={
+                        probe.result.ok
+                          ? "inline-flex items-center gap-1 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300"
+                          : "inline-flex items-center gap-1 rounded-full border border-red-400/30 bg-red-500/10 px-2.5 py-0.5 text-[11px] font-medium text-red-200"
+                      }
+                    >
+                      {probe.result.ok ? (
+                        <Check className="h-3 w-3" aria-hidden />
+                      ) : (
+                        <X className="h-3 w-3" aria-hidden />
+                      )}
+                      {probe.result.ok ? "Healthy" : "Unreachable"}
+                    </span>
+                    <span className="font-mono text-xs text-zinc-300">{probe.result.latencyMs} ms</span>
+                  </div>
+                  {probe.result.error && (
+                    <p role="alert" className="mt-3 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-zinc-300">
+                      {probe.result.error}
+                    </p>
+                  )}
+                  <div className="mt-5">
+                    <p className="text-[11px] font-semibold uppercase tracking-widest text-cyan-300">
+                      Discovered tools · {probe.result.tools.length}
+                    </p>
+                    {probe.result.tools.length === 0 ? (
+                      <p className="mt-3 text-xs text-zinc-500">
+                        This server did not advertise any tools.
+                      </p>
+                    ) : (
+                      <ul className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
+                        {probe.result.tools.map((tool, idx) => (
+                          <li
+                            key={`${tool.name}-${idx}`}
+                            className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2"
+                          >
+                            <p className="font-mono text-xs text-cyan-100">{tool.name}</p>
+                            {tool.description && (
+                              <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">
+                                {tool.description}
+                              </p>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </>
+              )}
+              <div className="mt-6 flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => setProbe(null)}
+                  className="rounded-xl border border-white/10 px-4 py-2 text-xs font-medium text-zinc-300 hover:bg-white/5"
+                >
+                  Close
+                </button>
+              </div>
+            </>
+          )}
+        </Modal>
+      )}
 
       {/* Credential connection dialog */}
       {draft && (

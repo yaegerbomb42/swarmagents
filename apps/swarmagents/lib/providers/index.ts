@@ -58,6 +58,7 @@ export type { SseFrame, StreamPiece } from "./stream";
 export type { ModelRequest } from "./adapters";
 export {
   buildClaudeEnv,
+  claudeModelEnv,
   classifyClaudeRunError,
   isClaudeFailoverEligible,
 } from "./claude-env";

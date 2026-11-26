@@ -24,6 +24,36 @@ export interface ClaudeSelectionInput {
 }
 
 /**
+ * Env that pins every Claude Code model tier to one concrete model and turns
+ * off non-essential phone-home traffic.
+ *
+ * Claude Code does not only call the main model. It issues background calls
+ * (conversation titles, quota/usage checks, the "small/fast" tier) and, for
+ * hard tasks, "opus-tier" calls — each with its own built-in Anthropic model
+ * name (e.g. `claude-haiku-4-5`, `claude-opus-4-1`). On a BYOK provider that
+ * serves a single model those names either misroute (the gateway falls back to
+ * the balanced tier) or are rejected outright by the upstream. Pinning
+ * `ANTHROPIC_MODEL`, the small/fast model and the per-tier defaults to the
+ * selected model makes Claude Code ask for exactly the model the user
+ * configured, on every provider — vision or not, Anthropic or not.
+ *
+ * The opt-outs stop telemetry, error reporting and other non-essential
+ * traffic from leaving the VM: a run only talks to the user's own provider
+ * (through the server-side gateway), never to Anthropic.
+ */
+export function claudeModelEnv(model: string): Record<string, string> {
+  return {
+    ANTHROPIC_SMALL_FAST_MODEL: model,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    DISABLE_TELEMETRY: "1",
+    DISABLE_ERROR_REPORTING: "1",
+  };
+}
+
+/**
  * Build the env map handed to Claude Code for one provider/key/model.
  *
  * Gateways (Anthropic-compatible proxies such as Mercury/Radium/LiteLLM) get
@@ -31,12 +61,17 @@ export interface ClaudeSelectionInput {
  * `Authorization: Bearer <token>`. The native Anthropic host gets
  * ANTHROPIC_API_KEY, which the CLI sends as `x-api-key`; sending a Bearer
  * token there would be rejected.
+ *
+ * Every tier is pinned to the selected model and non-essential traffic is
+ * disabled (see {@link claudeModelEnv}) so one user-supplied model powers the
+ * whole run on any provider.
  */
 export function buildClaudeEnv(selection: ClaudeSelectionInput): Record<string, string> {
   const baseUrl = selection.baseUrl ?? DEFAULT_BASE_URLS[selection.kind];
   const env: Record<string, string> = {
     ANTHROPIC_BASE_URL: baseUrl,
     ANTHROPIC_MODEL: selection.model,
+    ...claudeModelEnv(selection.model),
   };
   if (selection.kind === "anthropic" && baseUrl === DEFAULT_BASE_URLS.anthropic) {
     env.ANTHROPIC_API_KEY = selection.key;

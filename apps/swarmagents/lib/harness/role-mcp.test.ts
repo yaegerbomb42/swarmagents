@@ -20,6 +20,8 @@ import {
   ROLE_MCP_SERVER_NAME,
   ROLE_MCP_SERVER_PATH,
   ROLE_SET_ROLE_TOOL,
+  TEXT_DESKTOP_ENV,
+  TEXT_DESKTOP_TAIL,
   desktopMcpServerEntry,
   headlessBrowserMcpServerEntry,
   isRoleListTool,
@@ -465,4 +467,78 @@ test("chat mode (model cannot call tools) disables every tool and the MCP config
   assert.ok(!flags.includes("--allowedTools"), "no empty --allowedTools flag");
   assert.ok(!flags.includes("--mcp-config"), "no empty --mcp-config flag");
   assert.ok(!flags.join(" ").includes("mcp__"));
+});
+
+// ---- Text-desktop mode (non-vision models) --------------------------------
+
+test("desktopMcpServerEntry sets SWARM_TEXT_DESKTOP only in text-desktop mode", () => {
+  const gui = desktopMcpServerEntry("computer-mcp") as { env?: Record<string, unknown> };
+  assert.equal(gui.env?.[TEXT_DESKTOP_ENV], undefined, "gui mode gets no text-desktop flag");
+  assert.equal(gui.env?.DISPLAY, ":1");
+
+  const textDesktop = desktopMcpServerEntry("computer-mcp", { textDesktop: true }) as {
+    env?: Record<string, unknown>;
+  };
+  assert.equal(textDesktop.env?.[TEXT_DESKTOP_ENV], "1");
+  assert.equal(textDesktop.env?.DISPLAY, ":1");
+
+  // Playwright has no screenshot mapping to flag; its entry is unchanged.
+  const playwright = desktopMcpServerEntry("playwright-mcp", { textDesktop: true });
+  assert.ok(playwright);
+  assert.equal(desktopMcpServerEntry("unknown-server", { textDesktop: true }), null);
+});
+
+test("roleMcpConfigJson wires computer-mcp + playwright-mcp for text-desktop runs", () => {
+  const configFor = (desktopMode: boolean, textDesktop: boolean) => {
+    const role = desktopRole();
+    const phase = rolePhase(role, { desktopMode, textDesktop });
+    return JSON.parse(
+      roleMcpConfigJson(phase, { allowedRoleIds: new Set([role.id]), roleDef: role, desktopMode, textDesktop }),
+    ) as { mcpServers: Record<string, { env?: Record<string, unknown> }> };
+  };
+
+  const textDesktop = configFor(true, true);
+  assert.ok(textDesktop.mcpServers["computer-mcp"], "text-desktop gets computer-mcp");
+  assert.ok(textDesktop.mcpServers["playwright-mcp"], "text-desktop gets playwright-mcp snapshots");
+  assert.equal(textDesktop.mcpServers["computer-mcp"].env?.[TEXT_DESKTOP_ENV], "1");
+
+  // Gui mode wires the same servers without the flag.
+  const gui = configFor(true, false);
+  assert.ok(gui.mcpServers["computer-mcp"]);
+  assert.ok(gui.mcpServers["playwright-mcp"]);
+  assert.equal(gui.mcpServers["computer-mcp"].env?.[TEXT_DESKTOP_ENV], undefined);
+
+  // Desktop off + textDesktop is still headless: no desktop servers at all.
+  const headless = configFor(false, true);
+  assert.equal(headless.mcpServers["computer-mcp"], undefined);
+  assert.equal(headless.mcpServers["playwright-mcp"], undefined);
+  assert.ok(headless.mcpServers[BROWSER_MCP_SERVER_NAME], "headless browser remains");
+});
+
+test("rolePhase appends the text-desktop tail only in text-desktop mode", () => {
+  const role = desktopRole();
+  const guiPhase = rolePhase(role, { desktopMode: true });
+  assert.ok(!guiPhase.appendSystemPrompt?.includes(TEXT_DESKTOP_TAIL));
+  assert.ok(!guiPhase.appendSystemPrompt?.includes("text-desktop mode"));
+
+  const textPhase = rolePhase(role, { desktopMode: true, textDesktop: true });
+  assert.ok(textPhase.appendSystemPrompt?.includes(TEXT_DESKTOP_TAIL));
+  assert.ok(textPhase.appendSystemPrompt?.includes("describe_screen"));
+  assert.ok(textPhase.appendSystemPrompt?.includes("browser_snapshot"));
+  // Desktop servers stay granted in text-desktop mode (same as gui).
+  assert.ok(textPhase.allowedTools.includes("mcp__computer-mcp__*"));
+  assert.ok(textPhase.allowedTools.includes("mcp__playwright-mcp__*"));
+});
+
+test("roleSeedFiles seeds the text-desktop flag into the initial config", () => {
+  const catalog = BUILTIN_ROLES;
+  const files = roleSeedFiles(catalog, new Set(catalog.map((role) => role.id)), undefined, {
+    desktopMode: true,
+    textDesktop: true,
+  });
+  const byPath = new Map(files.map((file) => [file.path, file.content]));
+  const config = JSON.parse(byPath.get(ROLE_MCP_CONFIG_PATH)!) as {
+    mcpServers: Record<string, { env?: Record<string, unknown> }>;
+  };
+  assert.equal(config.mcpServers["computer-mcp"]?.env?.[TEXT_DESKTOP_ENV], "1");
 });

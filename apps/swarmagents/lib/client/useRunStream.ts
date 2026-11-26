@@ -63,7 +63,7 @@ function isTerminalEnd(item: RunStreamItem | undefined): boolean {
   );
 }
 
-export type RunMode = "gui" | "text" | "chat";
+export type RunMode = "gui" | "text" | "text-desktop" | "chat";
 
 export interface RunModeBadge {
   mode: RunMode;
@@ -72,7 +72,7 @@ export interface RunModeBadge {
 }
 
 function asRunMode(value: unknown): RunMode | null {
-  return value === "gui" || value === "text" || value === "chat" ? value : null;
+  return value === "gui" || value === "text" || value === "text-desktop" || value === "chat" ? value : null;
 }
 
 /**

@@ -276,6 +276,69 @@ test("openAIToAnthropicResponse: tool_calls become tool_use blocks", () => {
   ]);
 });
 
+test("openAIToAnthropicResponse: a lowercased tool name is repaired to the declared name", () => {
+  const inBody = {
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "call_l", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
+            { id: "call_r", type: "function", function: { name: "read", arguments: '{"file_path":"a.ts"}' } },
+          ],
+        },
+        finish_reason: "tool_calls",
+      },
+    ],
+  };
+  const declared = new Set(["Bash", "Read", "Write"]);
+  const out = openAIToAnthropicResponse(inBody, TARGET_MODEL, declared);
+  assert.deepEqual(out.content, [
+    { type: "tool_use", id: "call_l", name: "Bash", input: { command: "ls" } },
+    { type: "tool_use", id: "call_r", name: "Read", input: { file_path: "a.ts" } },
+  ]);
+});
+
+test("openAIToAnthropicResponse: an exact or unknown tool name is left untouched", () => {
+  const inBody = {
+    choices: [
+      {
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "a", type: "function", function: { name: "Bash", arguments: "{}" } },
+            { id: "b", type: "function", function: { name: "mystery_tool", arguments: "{}" } },
+          ],
+        },
+        finish_reason: "tool_calls",
+      },
+    ],
+  };
+  const out = openAIToAnthropicResponse(inBody, TARGET_MODEL, new Set(["Bash", "Read"]));
+  const names = (out.content as Array<{ name: string }>).map((b) => b.name);
+  assert.deepEqual(names, ["Bash", "mystery_tool"]);
+});
+
+test("openAIToAnthropicResponse: without declared tools the name is unchanged", () => {
+  const inBody = {
+    choices: [
+      {
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "x", type: "function", function: { name: "bash", arguments: "{}" } }],
+        },
+        finish_reason: "tool_calls",
+      },
+    ],
+  };
+  const out = openAIToAnthropicResponse(inBody, TARGET_MODEL);
+  assert.equal((out.content as Array<{ name: string }>)[0].name, "bash");
+});
+
 test("openAIToAnthropicResponse: length truncation maps to max_tokens", () => {
   const out = openAIToAnthropicResponse(
     {
@@ -396,6 +459,20 @@ test("OpenAIStreamTranslator: tool_call deltas become tool_use blocks with input
   assert.ok(kinds.includes("message_stop"));
   const stop = c4.find((e) => e.event === "message_delta")!;
   assert.equal(JSON.parse(stop.data).delta.stop_reason, "tool_use");
+});
+
+test("OpenAIStreamTranslator: a lowercased streamed tool name is repaired to the declared name", () => {
+  const translator = new OpenAIStreamTranslator(new Set(["Bash", "Read"]));
+  const c1 = translator.push({
+    choices: [
+      {
+        index: 0,
+        delta: { tool_calls: [{ index: 0, id: "call_a", function: { name: "bash", arguments: "" } }] },
+      },
+    ],
+  });
+  const start = c1.find((e) => e.event === "content_block_start")!;
+  assert.equal(JSON.parse(start.data).content_block.name, "Bash");
 });
 
 test("OpenAIStreamTranslator: usage-only trailing chunk still surfaces both token counts", () => {

@@ -389,8 +389,30 @@ export function anthropicToOpenAI(
   return out;
 }
 
+/**
+ * Rewrite a tool name the upstream returned so it matches the name the client
+ * declared, when the only difference is case. Some OpenAI-compatible servers
+ * (e.g. Ollama) lowercase tool names (`read`, `bash`); Claude Code declared
+ * `Read`, `Bash` and would not match the returned call, so the tool would be
+ * silently dropped. Repair only on an unambiguous case-insensitive match;
+ * otherwise leave the name untouched (a genuinely unknown tool is not ours to
+ * rename).
+ */
+export function repairToolName(name: string, declaredToolNames?: ReadonlySet<string>): string {
+  if (!declaredToolNames || declaredToolNames.size === 0 || name.length === 0) return name;
+  if (declaredToolNames.has(name)) return name;
+  const lower = name.toLowerCase();
+  for (const candidate of declaredToolNames) {
+    if (candidate.toLowerCase() === lower) return candidate;
+  }
+  return name;
+}
+
 /** OpenAI tool_calls -> Anthropic tool_use content blocks. */
-function openaiToolCallsToBlocks(toolCalls: unknown): Record<string, unknown>[] {
+function openaiToolCallsToBlocks(
+  toolCalls: unknown,
+  declaredToolNames?: ReadonlySet<string>,
+): Record<string, unknown>[] {
   if (!Array.isArray(toolCalls)) return [];
   const blocks: Record<string, unknown>[] = [];
   for (const raw of toolCalls) {
@@ -408,7 +430,7 @@ function openaiToolCallsToBlocks(toolCalls: unknown): Record<string, unknown>[] 
     blocks.push({
       type: "tool_use",
       id: asString(call.id) ?? `call_${randomUUID().slice(0, 8)}`,
-      name: asString(fn.name) ?? "",
+      name: repairToolName(asString(fn.name) ?? "", declaredToolNames),
       input,
     });
   }
@@ -419,7 +441,11 @@ function openaiToolCallsToBlocks(toolCalls: unknown): Record<string, unknown>[] 
  * Translate an OpenAI Chat Completions response into an Anthropic Messages
  * response.
  */
-export function openAIToAnthropicResponse(body: unknown, requestedModel: string): Record<string, unknown> {
+export function openAIToAnthropicResponse(
+  body: unknown,
+  requestedModel: string,
+  declaredToolNames?: ReadonlySet<string>,
+): Record<string, unknown> {
   const root = isRecord(body) ? body : {};
   if (root.error !== undefined) {
     throw new BridgeValidationError(`upstream provider error: ${JSON.stringify(root.error)}`);
@@ -441,7 +467,7 @@ export function openAIToAnthropicResponse(body: unknown, requestedModel: string)
       if (url !== undefined) content.push({ type: "text", text: url });
     }
   }
-  for (const block of openaiToolCallsToBlocks(message.tool_calls)) {
+  for (const block of openaiToolCallsToBlocks(message.tool_calls, declaredToolNames)) {
     content.push(block);
   }
 
@@ -550,9 +576,12 @@ export class OpenAIStreamTranslator {
   /** True once the upstream reported completion_tokens at least once. */
   private sawOutputTokens = false;
   private pendingStop: string | null = null;
+  /** Tool names the client declared, for case-repair of returned tool calls. */
+  private readonly declaredToolNames?: ReadonlySet<string>;
 
-  constructor() {
+  constructor(declaredToolNames?: ReadonlySet<string>) {
     this.id = `msg_${randomUUID()}`;
+    this.declaredToolNames = declaredToolNames;
   }
 
   /** Feed one parsed OpenAI stream chunk. Returns Anthropic event lines. */
@@ -646,7 +675,7 @@ export class OpenAIStreamTranslator {
             content_block: {
               type: "tool_use",
               id: asString(call.id) ?? "",
-              name: asString(fn.name) ?? "",
+              name: repairToolName(asString(fn.name) ?? "", this.declaredToolNames),
               input: {},
             },
           }),

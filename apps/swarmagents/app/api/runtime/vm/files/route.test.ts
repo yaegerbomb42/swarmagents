@@ -330,3 +330,105 @@ test("a symlink that stays inside /workspace is still readable", async () => {
   assert.equal(res.status, 200);
   assert.equal((await json(res)).content, "real content");
 });
+
+// ---------------------------------------------------------------------------
+// recent=1: the workspace's recently-touched files
+// ---------------------------------------------------------------------------
+
+/** Push a file's fake mtime back so it falls outside a fresh window. */
+function ageFile(driver: FakeVmDriver, user: string, path: string, ageMs: number): void {
+  const vms = (driver as unknown as { vms: Map<string, { mtimes: Map<string, number> }> }).vms;
+  const vm = vms.get(user);
+  assert.ok(vm, `fake vm for ${user} exists`);
+  vm.mtimes.set(path, Date.now() - ageMs);
+}
+
+test("recent=1 lists files across nested directories, most recent first", async () => {
+  const vm = install();
+  const driver = vm.driver as FakeVmDriver;
+  await vm.writeFile("alice", "/workspace/notes.md", "# hi");
+  await vm.writeFile("alice", "/workspace/src/app.ts", "export const x = 1;\n");
+  await vm.writeFile("alice", "/workspace/src/lib/deep.json", "{}");
+  ageFile(driver, "alice", "/workspace/notes.md", 30_000);
+  ageFile(driver, "alice", "/workspace/src/app.ts", 20_000);
+  ageFile(driver, "alice", "/workspace/src/lib/deep.json", 1_000);
+
+  const res = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1"));
+  assert.equal(res.status, 200);
+  const body = await json(res);
+  assert.equal(body.kind, "recent");
+  assert.equal(body.path, "/workspace");
+  assert.deepEqual(body.files.map((f: any) => f.path), [
+    "/workspace/src/lib/deep.json",
+    "/workspace/src/app.ts",
+    "/workspace/notes.md",
+  ]);
+  const first = body.files[0];
+  assert.equal(first.name, "deep.json");
+  assert.equal(first.size, 2);
+  assert.equal(typeof first.modifiedAt, "number");
+  assert.equal(first.contentType, "application/json");
+});
+
+test("recent=1 excludes files older than the window", async () => {
+  const vm = install();
+  const driver = vm.driver as FakeVmDriver;
+  await vm.writeFile("alice", "/workspace/fresh.txt", "new");
+  await vm.writeFile("alice", "/workspace/stale.txt", "old");
+  ageFile(driver, "alice", "/workspace/stale.txt", 30 * 60_000);
+
+  const res = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1"));
+  assert.equal(res.status, 200);
+  const body = await json(res);
+  assert.deepEqual(body.files.map((f: any) => f.path), ["/workspace/fresh.txt"]);
+});
+
+test("recent=1 clamps windowMs and limit", async () => {
+  const vm = install();
+  const driver = vm.driver as FakeVmDriver;
+  await vm.writeFile("alice", "/workspace/a.txt", "a");
+  await vm.writeFile("alice", "/workspace/b.txt", "b");
+  ageFile(driver, "alice", "/workspace/a.txt", 10_000);
+
+  const capped = await GET(
+    request("/api/runtime/vm/files?path=/workspace&recent=1&windowMs=999999999&limit=1"),
+  );
+  assert.equal(capped.status, 200);
+  const cappedBody = await json(capped);
+  assert.equal(cappedBody.windowMs, 60 * 60_000);
+  assert.deepEqual(cappedBody.files.map((f: any) => f.path), ["/workspace/b.txt"]);
+
+  const defaulted = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1"));
+  assert.equal((await json(defaulted)).windowMs, 15 * 60_000);
+
+  const floor = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1&limit=0"));
+  assert.equal((await json(floor)).files.length, 1);
+});
+
+test("recent=1 rejects unauthenticated requests and bad paths", async () => {
+  install();
+  const unauth = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1", null));
+  assert.equal(unauth.status, 401);
+
+  const missing = await GET(request("/api/runtime/vm/files?path=/workspace/nope&recent=1"));
+  assert.equal(missing.status, 404);
+
+  const traversal = await GET(
+    request(`/api/runtime/vm/files?path=${encodeURIComponent("/workspace/../etc")}&recent=1`),
+  );
+  assert.equal(traversal.status, 403);
+});
+
+test("recent=1 on a file path is a 400; users only see their own VM", async () => {
+  const vm = install();
+  await vm.writeFile("alice", "/workspace/a.txt", "a");
+  await vm.writeFile("bob", "/workspace/b.txt", "b");
+
+  const fileRes = await GET(request("/api/runtime/vm/files?path=/workspace/a.txt&recent=1"));
+  assert.equal(fileRes.status, 400);
+
+  const bobRes = await GET(request("/api/runtime/vm/files?path=/workspace&recent=1", "bob"));
+  assert.equal(bobRes.status, 200);
+  const bobBody = await json(bobRes);
+  assert.deepEqual(bobBody.files.map((f: any) => f.path), ["/workspace/b.txt"]);
+});

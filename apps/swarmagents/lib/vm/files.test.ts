@@ -8,7 +8,9 @@ import {
   downloadAttachmentFilename,
   downloadContentDisposition,
   downloadContentType,
+  foldRecentDir,
   looksBinary,
+  rankRecentFiles,
   parentPath,
   resolveWorkspacePath,
 } from "./files.js";
@@ -122,4 +124,41 @@ test("download attachment filenames are header-safe", () => {
   const disposition = downloadContentDisposition("/workspace/report.pdf");
   assert.match(disposition, /^attachment; filename="report\.pdf"/);
   assert.match(disposition, /filename\*=UTF-8''report\.pdf/);
+});
+
+// ---------------------------------------------------------------------------
+// recent-scan fold and ranking (GET ?recent=1 helpers)
+// ---------------------------------------------------------------------------
+
+test("foldRecentDir keeps in-window files with their content type and queues subdirs", () => {
+  const now = 1_000_000_000;
+  const budget = { visited: 0 };
+  const { files, subdirs } = foldRecentDir(
+    [
+      { name: "new.txt", path: "/workspace/new.txt", type: "file", size: 3, modifiedAt: now },
+      { name: "old.txt", path: "/workspace/old.txt", type: "file", size: 4, modifiedAt: now - 999_999 },
+      { name: "src", path: "/workspace/src", type: "directory", size: 0 },
+      { name: "nomtime.bin", path: "/workspace/nomtime.bin", type: "file", size: 9 },
+    ],
+    now - 60_000,
+    budget,
+  );
+  assert.deepEqual(files, [
+    { name: "new.txt", path: "/workspace/new.txt", size: 3, modifiedAt: now, contentType: "text/plain" },
+  ]);
+  assert.deepEqual(subdirs, ["/workspace/src"]);
+  assert.equal(budget.visited, 4);
+});
+
+test("rankRecentFiles sorts most-recent-first with a path tiebreak and caps the list", () => {
+  const ranked = rankRecentFiles(
+    [
+      { name: "a", path: "/workspace/b.txt", size: 1, modifiedAt: 100, contentType: "text/plain" },
+      { name: "b", path: "/workspace/c.txt", size: 1, modifiedAt: 300, contentType: "text/plain" },
+      { name: "c", path: "/workspace/a.txt", size: 1, modifiedAt: 200, contentType: "text/plain" },
+      { name: "d", path: "/workspace/aa.txt", size: 1, modifiedAt: 200, contentType: "text/plain" },
+    ],
+    2,
+  );
+  assert.deepEqual(ranked.map((f) => f.path), ["/workspace/c.txt", "/workspace/a.txt"]);
 });

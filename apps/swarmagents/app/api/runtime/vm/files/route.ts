@@ -19,16 +19,24 @@ import { NextResponse, type NextRequest } from "next/server";
 import { USER_HEADER } from "../../../../../lib/auth";
 import { getVmManager } from "../../../../../lib/vm/manager";
 import {
+  DEFAULT_RECENT_WINDOW_MS,
   MAX_FILE_DOWNLOAD_BYTES,
   MAX_FILE_READ_BYTES,
+  MAX_RECENT_FILES,
+  MAX_RECENT_WALK_DEPTH,
+  MAX_RECENT_WALK_ENTRIES,
+  MAX_RECENT_WINDOW_MS,
   VmFileError,
   VmPathError,
   WORKSPACE_ROOT,
   downloadContentDisposition,
   downloadContentType,
+  foldRecentDir,
   looksBinary,
   parentPath,
+  rankRecentFiles,
   resolveWorkspacePath,
+  type VmRecentFile,
 } from "../../../../../lib/vm/files";
 
 export const runtime = "nodejs";
@@ -47,11 +55,107 @@ function errorResponse(status: number, error: string, code: string, extra?: Reco
   return NextResponse.json({ error, code, ...extra }, { status });
 }
 
+function clampNumber(value: string | null, fallback: number, min: number, max: number): number {
+  const parsed = value === null ? NaN : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+/**
+ * Bounded workspace walk returning the files modified since `since`, most
+ * recent first. Depth- and entry-capped so a huge workspace can never turn a
+ * poll request into a scan; `budget.visited` is shared across the recursion.
+ */
+async function recentFiles(
+  vm: ReturnType<typeof getVmManager>,
+  user: string,
+  root: string,
+  since: number,
+  budget: { visited: number },
+  depth: number,
+): Promise<VmRecentFile[]> {
+  if (depth > MAX_RECENT_WALK_DEPTH || budget.visited >= MAX_RECENT_WALK_ENTRIES) return [];
+  let entries;
+  try {
+    entries = await vm.listDir(user, root);
+  } catch (err) {
+    // A vanished directory (or an unreadable one) just contributes nothing;
+    // real driver failures (unsupported) propagate to the caller.
+    if (err instanceof VmFileError && (err.code === "not_found" || err.code === "not_a_directory")) return [];
+    throw err;
+  }
+  const { files, subdirs } = foldRecentDir(entries, since, budget);
+  for (const subdir of subdirs) {
+    if (budget.visited >= MAX_RECENT_WALK_ENTRIES) break;
+    files.push(...(await recentFiles(vm, user, subdir, since, budget, depth + 1)));
+  }
+  return files;
+}
+
+/** GET with recent=1: the workspace's recently-touched files. */
+async function recentResponse(req: NextRequest, user: string, url: URL) {
+  let path: string;
+  try {
+    path = resolveWorkspacePath(url.searchParams.get("path"));
+  } catch (err) {
+    if (err instanceof VmPathError) {
+      const status = err.code === "outside_workspace" ? 403 : 400;
+      return errorResponse(status, err.message, err.code);
+    }
+    return errorResponse(400, "Invalid path.", "invalid_path");
+  }
+  const windowMs = clampNumber(
+    url.searchParams.get("windowMs"),
+    DEFAULT_RECENT_WINDOW_MS,
+    1,
+    MAX_RECENT_WINDOW_MS,
+  );
+  const limit = clampNumber(url.searchParams.get("limit"), MAX_RECENT_FILES, 1, MAX_RECENT_FILES);
+  const vm = getVmManager();
+  try {
+    const stat = await vm.stat(user, path);
+    if (stat.type !== "directory") {
+      return errorResponse(400, "Path is not a directory.", "not_a_directory");
+    }
+    const since = Date.now() - windowMs;
+    const found = await recentFiles(vm, user, path, since, { visited: 0 }, 0);
+    return NextResponse.json(
+      {
+        path,
+        kind: "recent",
+        since,
+        windowMs,
+        files: rankRecentFiles(found, limit),
+      },
+      { headers: { "cache-control": "no-store" } },
+    );
+  } catch (err) {
+    if (err instanceof VmPathError) {
+      const status = err.code === "outside_workspace" ? 403 : 400;
+      return errorResponse(status, err.message, err.code);
+    }
+    if (err instanceof VmFileError) {
+      switch (err.code) {
+        case "not_found":
+          return errorResponse(404, err.message, err.code);
+        case "not_a_directory":
+          return errorResponse(400, err.message, err.code);
+        default:
+          return errorResponse(501, err.message, err.code);
+      }
+    }
+    return errorResponse(500, "Could not read the VM filesystem.", "vm_error");
+  }
+}
+
 export async function GET(req: NextRequest) {
   const user = caller(req);
   if (!user) return unauthorized();
 
   const url = new URL(req.url);
+  if (url.searchParams.get("recent") === "1") {
+    return recentResponse(req, user, url);
+  }
   const rawPath = url.searchParams.get("path");
   const readParam = url.searchParams.get("read");
   const wantsRead = readParam !== null && readParam !== "0" && readParam !== "false";

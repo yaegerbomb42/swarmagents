@@ -119,3 +119,47 @@ test("preview panel surfaces a load error", () => {
   assert.ok(markup.includes('data-testid="artifact-preview-error"'), "error renders");
   assert.ok(markup.includes("Could not load the preview."), "the error message shows");
 });
+
+test("preview panel renders sandboxed HTML without allow-same-origin", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(ArtifactPreviewPanel, {
+      artifact: artifact("report.html"),
+      reportRunId: "run_1",
+      state: { kind: "text", text: "<h1>Hello</h1><script>console.log(1)</script>" },
+      onClose: () => {},
+    }),
+  );
+  assert.ok(markup.includes('data-testid="artifact-preview-html"'), "HTML sandbox iframe renders");
+  assert.ok(markup.includes('sandbox="allow-scripts"'), "sandbox allows scripts only");
+  assert.ok(!markup.includes("allow-same-origin"), "sandbox must never include allow-same-origin");
+  assert.ok(markup.includes("Content-Security-Policy"), "strict CSP meta tag is injected");
+  assert.ok(markup.includes('data-testid="artifact-preview-toggle-raw"'), "raw toggle renders");
+});
+
+test("preview panel renders CSV as a sortable table", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(ArtifactPreviewPanel, {
+      artifact: artifact("metrics.csv"),
+      reportRunId: "run_1",
+      state: { kind: "text", text: 'name,score\n"Alice, A",10\nBob,25\n' },
+      onClose: () => {},
+    }),
+  );
+  assert.ok(markup.includes('data-testid="artifact-preview-csv"'), "CSV table renders");
+  assert.ok(markup.includes("Alice, A"), "quoted comma field is parsed cleanly");
+  assert.ok(markup.includes("25"), "numeric cell renders");
+  assert.ok(markup.includes('data-testid="artifact-preview-toggle-raw"'), "raw toggle renders");
+});
+
+test("preview panel renders PDF inline iframe when blob url is present", () => {
+  const markup = renderToStaticMarkup(
+    React.createElement(ArtifactPreviewPanel, {
+      artifact: artifact("summary.pdf"),
+      reportRunId: "run_1",
+      state: { kind: "none", url: "blob:http://localhost/pdf-1" },
+      onClose: () => {},
+    }),
+  );
+  assert.ok(markup.includes('data-testid="artifact-preview-pdf"'), "PDF iframe renders");
+  assert.ok(markup.includes("blob:http://localhost/pdf-1"), "blob URL is wired into iframe");
+});

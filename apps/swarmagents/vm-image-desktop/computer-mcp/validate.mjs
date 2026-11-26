@@ -19,6 +19,7 @@ export const OPEN_APP_NAMES = Object.freeze(["browser", "terminal", "files", "li
 export const COMPUTER_TOOLS = Object.freeze([
   "screenshot",
   "describe_screen",
+  "inspect_ui",
   "click",
   "double_click",
   "move",
@@ -40,6 +41,12 @@ const MAX_KEY_COMBO_LEN = 64;
 /** Caps for scroll steps (one wheel click per step) and wait. */
 const MAX_SCROLL_STEPS = 200;
 const MAX_WAIT_MS = 300 * 1000;
+/** inspect_ui caps: returned elements, app/query filter length. */
+const MAX_UI_ITEMS = 300;
+const DEFAULT_UI_ITEMS = 120;
+const MAX_UI_FILTER_LEN = 64;
+/** Filter charset: letters, digits, space and a few punctuation marks (no shell/control chars). */
+const UI_FILTER_RE = /^[\p{L}\p{N} ._:()'&,\-]*$/u;
 /** Apps the agent may open; the fixed mapping is the allowlist. */
 const OPEN_APPS = Object.freeze({
   browser: Object.freeze(["chromium", "--new-window"]),
@@ -189,6 +196,41 @@ function waitArgs(args) {
   return ok([]);
 }
 
+/** Validate an optional inspect_ui text filter; returns "" when absent, null when invalid. */
+function uiFilter(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string") return null;
+  const v = value.trim();
+  // No leading "-": the value is a helper argv element and must never read as a flag.
+  if (v.length > MAX_UI_FILTER_LEN || !UI_FILTER_RE.test(v) || v.startsWith("-")) return null;
+  return v;
+}
+
+/**
+ * Validate an `inspect_ui` call. Produces the argument list for the AT-SPI2
+ * dump helper (atspi_dump.py; the server prepends `python3 <path>`). The
+ * `query`/`role` filters are applied to the parsed result, not passed on.
+ */
+function inspectUiArgs(args) {
+  const app = uiFilter(args.app);
+  if (app === null) return invalid(`app must be a plain name filter (max ${MAX_UI_FILTER_LEN} chars).`);
+  const query = uiFilter(args.query);
+  if (query === null) return invalid(`query must be plain text (max ${MAX_UI_FILTER_LEN} chars).`);
+  const role = uiFilter(args.role);
+  if (role === null) return invalid(`role must be a plain role name (max ${MAX_UI_FILTER_LEN} chars).`);
+  let max = DEFAULT_UI_ITEMS;
+  if (args.maxItems !== undefined && args.maxItems !== null) {
+    const n = toInt(args.maxItems);
+    if (n === null || n < 1 || n > MAX_UI_ITEMS) return invalid(`maxItems must be an integer within [1, ${MAX_UI_ITEMS}].`);
+    max = n;
+  }
+  // Filters narrow the result after the walk, so walk wider than we return.
+  const walkMax = query || role ? MAX_UI_ITEMS + 100 : max;
+  const argv = ["--max", String(walkMax)];
+  if (app) argv.push("--app", app);
+  return ok([argv]);
+}
+
 /**
  * Validate a tool call. Returns `{ ok: true, cmds: string[][] }` where each
  * command is a full argv array for the tool's program (xdotool for input
@@ -202,6 +244,8 @@ export function parseToolArgs(tool, args) {
       return ok([]);
     case "describe_screen":
       return ok([]);
+    case "inspect_ui":
+      return inspectUiArgs(input);
     case "click":
       return clickArgs(input, { double: false });
     case "double_click":
@@ -234,6 +278,12 @@ export function summarizeTool(tool, args) {
       return "Taking a screenshot";
     case "describe_screen":
       return "Reading screen layout and clickable text";
+    case "inspect_ui": {
+      const app = s(input.app);
+      const query = s(input.query);
+      const scope = [app && `in ${app.slice(0, 40)}`, query && `matching "${query.slice(0, 40)}"`].filter(Boolean).join(" ");
+      return `Inspecting UI elements${scope ? ` ${scope}` : ""}`;
+    }
     case "click": {
       const b = button(input.button);
       const label = b === 3 ? "right-clicking" : b === 2 ? "middle-clicking" : "clicking";
@@ -364,4 +414,119 @@ export function parseTesseractTsv(tsv, maxItems = 80) {
     if (out.length >= cap) break;
   }
   return out;
+}
+
+/** States surfaced for AT-SPI2 widgets (anything else from the helper is dropped). */
+const UI_STATES = new Set([
+  "focused",
+  "focusable",
+  "enabled",
+  "checked",
+  "pressed",
+  "selected",
+  "expanded",
+  "editable",
+  "modal",
+  "active",
+]);
+
+/** Strip control characters and cap a label from the accessibility tree. */
+function cleanLabel(value, max) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+/**
+ * Parse the JSON printed by atspi_dump.py into widget records with clickable
+ * center coordinates. Off-screen / zero-size / malformed nodes are dropped,
+ * labels are sanitized, and coordinates are clamped to the screen cap.
+ * Returns `{ ok, error?, apps, truncated, nodes }`; never throws.
+ */
+export function parseAtspiDump(stdout, maxItems = DEFAULT_UI_ITEMS) {
+  const cap = Math.min(Math.max(Number(maxItems) || DEFAULT_UI_ITEMS, 1), MAX_UI_ITEMS);
+  let data;
+  try {
+    const text = String(stdout || "").trim();
+    const line = text.split(/\r?\n/).filter((l) => l.trim().startsWith("{")).pop() || "";
+    data = JSON.parse(line);
+  } catch {
+    return { ok: false, error: "accessibility helper returned no JSON", apps: [], truncated: false, nodes: [] };
+  }
+  if (!data || typeof data !== "object") {
+    return { ok: false, error: "accessibility helper returned no JSON", apps: [], truncated: false, nodes: [] };
+  }
+  if (data.ok !== true) {
+    return { ok: false, error: cleanLabel(data.error || "accessibility tree unavailable", 200), apps: [], truncated: false, nodes: [] };
+  }
+  const apps = Array.isArray(data.apps) ? data.apps.slice(0, 50).map((a) => cleanLabel(a, 60)).filter(Boolean) : [];
+  const nodes = [];
+  for (const raw of Array.isArray(data.nodes) ? data.nodes : []) {
+    if (nodes.length >= cap) break;
+    if (!raw || typeof raw !== "object") continue;
+    const x = Number(raw.x);
+    const y = Number(raw.y);
+    const w = Number(raw.w);
+    const h = Number(raw.h);
+    if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) continue;
+    const cx = Math.round(x + w / 2);
+    const cy = Math.round(y + h / 2);
+    // The center must be a coordinate click() accepts.
+    if (cx < 0 || cy < 0 || cx > MAX_SCREEN_DIM || cy > MAX_SCREEN_DIM) continue;
+    const role = cleanLabel(raw.role, 40).toLowerCase() || "unknown";
+    const states = Array.isArray(raw.states)
+      ? [...new Set(raw.states.map((st) => String(st)).filter((st) => UI_STATES.has(st)))]
+      : [];
+    nodes.push({
+      app: cleanLabel(raw.app, 60),
+      role,
+      name: cleanLabel(raw.name, 120),
+      states,
+      x: Math.round(x),
+      y: Math.round(y),
+      w: Math.round(w),
+      h: Math.round(h),
+      cx,
+      cy,
+    });
+  }
+  return { ok: true, apps, truncated: data.truncated === true, nodes };
+}
+
+/**
+ * Narrow parsed widgets by a case-insensitive name `query` and/or `role`
+ * substring, then cap to `maxItems`.
+ */
+export function filterUiNodes(nodes, { query = "", role = "", maxItems = DEFAULT_UI_ITEMS } = {}) {
+  const q = String(query || "").trim().toLowerCase();
+  const r = String(role || "").trim().toLowerCase();
+  const cap = Math.min(Math.max(Number(maxItems) || DEFAULT_UI_ITEMS, 1), MAX_UI_ITEMS);
+  const out = [];
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    if (q && !node.name.toLowerCase().includes(q)) continue;
+    if (r && !node.role.includes(r)) continue;
+    out.push(node);
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
+/**
+ * Render widgets as compact lines for a text-only model, e.g.
+ *   [push button] "Save" (enabled, focused) -> click(812, 604) [780,592 64x24] @gedit
+ * Disabled widgets are flagged so the model does not click them.
+ */
+export function formatUiNodes(nodes) {
+  return (Array.isArray(nodes) ? nodes : [])
+    .map((n) => {
+      const flags = n.states.filter((st) => st !== "focusable" && st !== "enabled");
+      if (!n.states.includes("enabled")) flags.unshift("disabled");
+      const label = n.name ? ` "${n.name}"` : "";
+      const st = flags.length > 0 ? ` (${flags.join(", ")})` : "";
+      const app = n.app ? ` @${n.app}` : "";
+      return `  [${n.role}]${label}${st} -> click(${n.cx}, ${n.cy}) [${n.x},${n.y} ${n.w}x${n.h}]${app}`;
+    })
+    .join("\n");
 }

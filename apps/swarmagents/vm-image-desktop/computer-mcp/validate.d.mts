@@ -53,3 +53,35 @@ export function parseWmctrlWindows(stdout: string): WmctrlWindow[];
 
 /** Parse Tesseract TSV output into grouped clickable text coordinates. */
 export function parseTesseractTsv(tsv: string, maxItems?: number): OcrTarget[];
+
+/** One AT-SPI2 widget parsed from atspi_dump.py output, with a clickable center. */
+export interface UiNode {
+  app: string;
+  role: string;
+  name: string;
+  /** Subset of: focused, focusable, enabled, checked, pressed, selected, expanded, editable, modal, active. */
+  states: string[];
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  cx: number;
+  cy: number;
+}
+
+export interface AtspiDump {
+  ok: boolean;
+  error?: string;
+  apps: string[];
+  truncated: boolean;
+  nodes: UiNode[];
+}
+
+/** Parse atspi_dump.py JSON into sanitized widget records (never throws). */
+export function parseAtspiDump(stdout: string, maxItems?: number): AtspiDump;
+
+/** Narrow widgets by name query / role substring and cap the count. */
+export function filterUiNodes(nodes: UiNode[], opts?: { query?: string; role?: string; maxItems?: number }): UiNode[];
+
+/** Render widgets as compact text lines with click(x, y) targets. */
+export function formatUiNodes(nodes: UiNode[]): string;

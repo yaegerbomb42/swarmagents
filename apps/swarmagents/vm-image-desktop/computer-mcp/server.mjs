@@ -19,7 +19,18 @@ import fs from "node:fs";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { parseToolArgs, summarizeTool, COMPUTER_TOOLS, OPEN_APP_NAMES, parseWmctrlWindows, parseTesseractTsv } from "./validate.mjs";
+import { fileURLToPath } from "node:url";
+import {
+  parseToolArgs,
+  summarizeTool,
+  COMPUTER_TOOLS,
+  OPEN_APP_NAMES,
+  parseWmctrlWindows,
+  parseTesseractTsv,
+  parseAtspiDump,
+  filterUiNodes,
+  formatUiNodes,
+} from "./validate.mjs";
 
 const DISPLAY = process.env.SWARM_COMPUTER_DISPLAY || process.env.DISPLAY || ":1";
 // Constrain the tools' own child processes, never the server itself.
@@ -27,6 +38,10 @@ const CHILD_ENV = { ...process.env, DISPLAY };
 const SCREENSHOT_DIR = os.tmpdir();
 const MAX_SHOT_SIZE = 4 * 1024 * 1024;
 const SCREENSHOT_MAX_WIDTH = 1280;
+/** AT-SPI2 tree dump helper shipped next to this server (python3-pyatspi). */
+const ATSPI_HELPER = path.join(path.dirname(fileURLToPath(import.meta.url)), "atspi_dump.py");
+/** How many AT-SPI2 widgets describe_screen lists (inspect_ui can return more). */
+const DESCRIBE_UI_ITEMS = 60;
 
 function fail(message) {
   return { content: [{ type: "text", text: String(message) }], isError: true };
@@ -125,19 +140,51 @@ async function captureScreenshot() {
 }
 
 /**
+ * Walk the AT-SPI2 accessibility tree via the python helper. `helperArgs` is
+ * the validated argv tail from parseToolArgs("inspect_ui"). Resolves the
+ * parsed dump; never throws (an unavailable tree is `{ ok: false }`).
+ */
+async function readAccessibilityTree(helperArgs, maxItems) {
+  const res = await run("python3", [ATSPI_HELPER, ...helperArgs], { timeoutMs: 10_000 });
+  if (res.code !== 0 && !res.stdout.trim()) {
+    return { ok: false, error: (res.stderr || `exit code ${res.code}`).trim().slice(0, 160), apps: [], truncated: false, nodes: [] };
+  }
+  return parseAtspiDump(res.stdout, maxItems);
+}
+
+/** inspect_ui: semantic widgets (role, name, states, click center) from AT-SPI2. */
+async function inspectUi(args, helperArgs) {
+  const maxItems = Number(args?.maxItems) || 120;
+  const dump = await readAccessibilityTree(helperArgs, 400);
+  if (!dump.ok) {
+    return textResult(
+      `Accessibility tree unavailable (${dump.error}). Fall back to describe_screen (OCR text targets) or screenshot.`,
+    );
+  }
+  const nodes = filterUiNodes(dump.nodes, { query: args?.query, role: args?.role, maxItems });
+  const header = `UI elements (${nodes.length}${dump.truncated ? ", tree truncated" : ""}) from apps: ${dump.apps.join(", ") || "none"}`;
+  if (nodes.length === 0) {
+    return textResult(`${header}\nNo matching elements. Try without query/role, or use describe_screen for OCR text.`);
+  }
+  return textResult(`${header}\n${formatUiNodes(nodes)}`);
+}
+
+/**
  * Structured non-vision desktop inspection: screen dimensions, pointer location,
  * open windows with clickable center coordinates, and optional OCR text lines
  * with bounding boxes + center (x, y) coordinates for click/double_click.
  */
 async function describeScreen(args) {
   const includeOcr = args?.includeOcr !== false;
+  const includeUi = args?.includeUi !== false;
   const maxItems = Math.min(Math.max(Number(args?.maxItems) || 80, 1), 150);
 
-  const [geomRes, mouseRes, winRes, activeRes] = await Promise.all([
+  const [geomRes, mouseRes, winRes, activeRes, uiDump] = await Promise.all([
     run("xdotool", ["getdisplaygeometry"], { timeoutMs: 5_000 }),
     run("xdotool", ["getmouselocation"], { timeoutMs: 5_000 }),
     run("wmctrl", ["-lG"], { timeoutMs: 5_000 }),
     run("xdotool", ["getactivewindow", "getwindowname"], { timeoutMs: 5_000 }),
+    includeUi ? readAccessibilityTree(["--max", String(DESCRIBE_UI_ITEMS)], DESCRIBE_UI_ITEMS) : Promise.resolve(null),
   ]);
 
   const geom = geomRes.code === 0 ? geomRes.stdout.trim().replace(/\s+/g, "x") : "unknown";
@@ -151,6 +198,16 @@ async function describeScreen(args) {
       ? "Windows:\n" + windows.map((w) => `  [${w.id}] "${w.title}" @ (${w.x},${w.y} ${w.w}x${w.h}) center=(${w.cx},${w.cy})`).join("\n")
       : "Windows: none",
   ];
+
+  if (uiDump) {
+    lines.push(
+      uiDump.ok
+        ? uiDump.nodes.length > 0
+          ? `UI elements (AT-SPI2, ${uiDump.nodes.length}${uiDump.truncated ? ", more via inspect_ui" : ""}):\n${formatUiNodes(uiDump.nodes)}`
+          : "UI elements (AT-SPI2): none exposed"
+        : `UI elements (AT-SPI2) unavailable: ${uiDump.error}`,
+    );
+  }
 
   if (includeOcr) {
     const file = path.join(SCREENSHOT_DIR, `swarm-ocr-${process.pid}-${Date.now()}.png`);
@@ -188,6 +245,8 @@ async function callTool(tool, args) {
       return captureScreenshot();
     case "describe_screen":
       return describeScreen(args);
+    case "inspect_ui":
+      return inspectUi(args, parsed.cmds[0]);
     case "wait": {
       const ms = Number(args?.ms ?? 0);
       await new Promise((resolve) => setTimeout(resolve, ms));
@@ -238,10 +297,22 @@ function toolSpec(tool) {
       return { description: "Capture the desktop as a PNG, downscaled to at most 1280px wide (display :1).", shape: {} };
     case "describe_screen":
       return {
-        description: "Inspect display :1 without vision: returns screen geometry, window bounds/centers, and OCR clickable text coordinates (x, y).",
+        description: "Inspect display :1 without vision: returns screen geometry, window bounds/centers, AT-SPI2 UI elements (role, name, state, click center), and OCR clickable text coordinates (x, y).",
         shape: {
           includeOcr: z.boolean().optional().describe("Include OCR word/line coordinates (default true)."),
+          includeUi: z.boolean().optional().describe("Include AT-SPI2 accessibility widgets (default true)."),
           maxItems: z.number().optional().describe("Max OCR targets to return (1..150, default 80)."),
+        },
+      };
+    case "inspect_ui":
+      return {
+        description:
+          "List semantic UI widgets from the AT-SPI2 accessibility tree (buttons, menus, tabs, inputs, check boxes, scrollbars...) with role, name, states (focused/disabled/checked/selected/expanded) and the click(x, y) center. Works for GTK, Qt and Chromium/Electron apps; catches icon buttons and menus OCR misses.",
+        shape: {
+          app: z.string().optional().describe("Only this application (name substring, e.g. \"chromium\", \"thunar\")."),
+          query: z.string().optional().describe("Only widgets whose name contains this text (case-insensitive)."),
+          role: z.string().optional().describe("Only widgets whose role contains this, e.g. \"button\", \"menu item\", \"entry\"."),
+          maxItems: z.number().optional().describe("Max widgets to return (1..300, default 120)."),
         },
       };
     case "click":

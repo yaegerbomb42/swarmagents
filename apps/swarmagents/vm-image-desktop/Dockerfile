@@ -71,6 +71,9 @@ USER root
 #       - ffmpeg: audio/video processing
 #       - python3-tk: Python with Tkinter GUI support
 #       - python3-matplotlib: Python plotting library
+#   - at-spi2-core, libatk-adaptor, python3-pyatspi: the AT-SPI2 accessibility
+#     bus + GTK bridge + python bindings behind computer-mcp's inspect_ui and
+#     the widget section of describe_screen (roles, names, states, centers).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         tigervnc-standalone-server \
@@ -101,6 +104,9 @@ RUN apt-get update \
         ffmpeg \
         python3-tk \
         python3-matplotlib \
+        at-spi2-core \
+        libatk-adaptor \
+        python3-pyatspi \
     && rm -rf /var/lib/apt/lists/*
 
 # Desktop init: reads the driver-seeded 0600 VNC password file (or the manual

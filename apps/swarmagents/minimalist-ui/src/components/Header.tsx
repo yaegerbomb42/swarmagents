@@ -42,11 +42,14 @@ export interface RunIndicatorProps {
   onStop: () => void;
   /** Go to the run (its screen while it runs, its result once it ends). */
   onShow: () => void;
+  /** "provider · model" actually serving the run (core-34). */
+  servingModel?: string;
 }
 
-export function RunIndicator({ phase, since, durationMs, activity, stopping, onStop, onShow }: RunIndicatorProps) {
+export function RunIndicator({ phase, since, durationMs, activity, stopping, onStop, onShow, servingModel }: RunIndicatorProps) {
   if (!phase) return null;
   const meta = RUN_PHASE_META[phase];
+  const servingLabel = servingModel;
   return (
     <div className="flex min-w-0 items-center gap-1.5" data-testid="run-indicator" data-phase={phase}>
       <button
@@ -72,6 +75,11 @@ export function RunIndicator({ phase, since, durationMs, activity, stopping, onS
         {phase === "running" && activity && (
           <span className="hidden max-w-[220px] truncate text-[12px] text-[var(--mute)] xl:inline" data-testid="run-activity">
             {activity}
+          </span>
+        )}
+        {servingLabel && (
+          <span className="hidden max-w-[220px] truncate text-[12px] text-[var(--mute)] sm:inline" data-testid="serving-model">
+            {servingLabel}
           </span>
         )}
       </button>

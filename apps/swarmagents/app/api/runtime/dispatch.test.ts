@@ -9,14 +9,14 @@
  * `opts.onStdout`, so the same loop is exercised — POST /api/runtime/tasks ->
  * RuntimeManager -> ClaudeCodeRunner -> FakeVmDriver -> telemetry bus ->
  * GET /api/runtime/stream — while nothing is left waiting on the event loop.
- * Shared transcript/request/stream-reader helpers live in dispatch-fixtures.
+ * Shared transcript/request/stream-reader helpers live in dispatch-fixtures.test (named *.test.ts so code analyzers treat it as test-only).
  */
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
 import { POST } from "./tasks/route";
-import * as fx from "./dispatch-fixtures";
+import * as fx from "./dispatch-fixtures.test";
 
 const USER = "dispatch-unit";
 

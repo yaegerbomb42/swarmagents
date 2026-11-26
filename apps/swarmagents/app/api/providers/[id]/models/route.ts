@@ -42,8 +42,9 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
   if (!saved) {
     return NextResponse.json({ error: "Provider not found." }, { status: 404, headers: NO_STORE });
   }
-  const apiKey = saved.keys?.[0] ?? "";
-  if (!apiKey) {
+  const apiKey = saved.apiStyle === "ollama" ? "" : (saved.keys?.[0] ?? "");
+  // Ollama has no key; the /api/tags endpoint is unauthenticated.
+  if (saved.apiStyle !== "ollama" && !apiKey) {
     return NextResponse.json(
       { error: "No API key stored for this provider; add a key first." },
       { status: 400, headers: NO_STORE },
@@ -82,10 +83,16 @@ export async function POST(request: NextRequest, ctx: { params: Promise<{ id: st
       result.source === "live"
         ? await persistDiscoveredModels(owner, saved, result)
         : false;
+    const modelEntries = result.models.map((m) => {
+      const entry: Record<string, unknown> = { id: m.id };
+      if (m.capabilities) entry.capabilities = m.capabilities;
+      return entry;
+    });
+
     return NextResponse.json(
       {
         ok: true,
-        models: result.models.map((m) => m.id),
+        models: modelEntries,
         endpoint: result.endpoint,
         source: result.source,
         stale: result.stale,

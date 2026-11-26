@@ -1683,24 +1683,40 @@ function ServerEndpoints({
   // A saved provider's row refresh asks the server for that provider's live
   // model ids (10-minute server cache; ids only, keys never leave the server)
   // and offers them in the Add/Edit form.
-  const refreshRow = async (rowId: string, label = `discover:${rowId}`) => {
+  const refreshRow = async (rowId: string, label = `discover:${rowId}`, quiet = false) => {
     setBusy(label);
     setResult(null);
     try {
       const { ok, data } = await call(`/api/providers/${encodeURIComponent(rowId)}/models`, {});
       if (!ok) {
-        setResult({ ok: false, text: String(data.error ?? 'Model refresh failed.') });
+        if (!quiet) {
+          setResult({ ok: false, text: String(data.error ?? 'Model refresh failed.') });
+        }
         return;
       }
-      const ids = Array.isArray(data.models) ? (data.models as string[]) : [];
-      setDiscovered(ids.map((id) => ({ id })));
-      setResult({
-        ok: true,
-        text: `Found ${ids.length} model${ids.length === 1 ? '' : 's'}${data.persisted ? ' · saved' : ''}.`,
-      });
+      // The route returns {id, capabilities?} entries so the form keeps its
+      // vision/tools badges (older servers sent bare id strings).
+      const ids: DiscoveredModel[] = Array.isArray(data.models)
+        ? (data.models as unknown[]).flatMap((m): DiscoveredModel[] =>
+            typeof m === 'string'
+              ? [{ id: m }]
+              : m && typeof m === 'object' && typeof (m as DiscoveredModel).id === 'string'
+                ? [m as DiscoveredModel]
+                : [],
+          )
+        : [];
+      setDiscovered(ids);
+      if (!quiet || ids.length > 0) {
+        setResult({
+          ok: true,
+          text: `Found ${ids.length} model${ids.length === 1 ? '' : 's'}${data.persisted ? ' · saved' : ''}.`,
+        });
+      }
       if (data.persisted) onChanged();
     } catch {
-      setResult({ ok: false, text: 'Could not reach the model list endpoint.' });
+      if (!quiet) {
+        setResult({ ok: false, text: 'Could not reach the model list endpoint.' });
+      }
     } finally {
       setBusy(null);
     }
@@ -1716,7 +1732,7 @@ function ServerEndpoints({
     if (!row) return;
     autoDetected.current = true;
     if ((row.availableModels?.length ?? 0) > 0) return;
-    void refreshRow(row.id, `auto:${row.id}`);
+    void refreshRow(row.id, `auto:${row.id}`, true); // quiet: failures stay silent for auto-detect
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows]);
 

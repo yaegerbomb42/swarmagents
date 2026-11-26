@@ -12,36 +12,64 @@
 // shell string. Values (text, keys, coordinates) are always separate argv
 // elements, so metacharacters cannot be interpreted by a shell.
 
+/** Names accepted by open_app (keys of the fixed launch allowlist below). */
+export const OPEN_APP_NAMES = Object.freeze(["browser", "terminal", "files", "libreoffice", "spreadsheet", "gimp", "blender"]);
+
 /** Tools this server exposes. */
 export const COMPUTER_TOOLS = Object.freeze([
   "screenshot",
   "describe_screen",
+  "inspect_ui",
   "click",
   "double_click",
+  "click_text",
   "move",
   "drag",
   "type",
   "key",
   "scroll",
   "open_app",
+  "focus_window",
   "wait",
+  "wait_for_text",
+  "wait_for_screen_change",
+  "clipboard_get",
+  "clipboard_set",
 ]);
 
 /** Screen dimension cap; anything beyond is rejected (not clamped). */
 const MAX_SCREEN_DIM = 4096;
-/** Typing cap, characters. */
+/** Typing cap, characters (keyboard `keys` mode). */
 const MAX_TYPE_LEN = 2000;
+/** Paste cap, characters (`paste` mode — a clipboard write is near-instant;
+ * aligns with the clipboard_set tool's MAX_CLIPBOARD_LEN). */
+const MAX_PASTE_LEN = 20_000;
+/** Clipboard write cap, characters. */
+const MAX_CLIPBOARD_LEN = 20_000;
+/** Query/title cap for click_text, wait_for_text, focus_window. */
+const MAX_QUERY_LEN = 120;
 /** Key-combo charset: printable keysym names plus modifiers, no shell chars. */
 const KEY_COMBO_RE = /^[A-Za-z0-9_+\-]+$/;
 const MAX_KEY_COMBO_LEN = 64;
 /** Caps for scroll steps (one wheel click per step) and wait. */
 const MAX_SCROLL_STEPS = 200;
 const MAX_WAIT_MS = 300 * 1000;
+/** inspect_ui caps: returned elements, app/query filter length. */
+const MAX_UI_ITEMS = 300;
+const DEFAULT_UI_ITEMS = 120;
+const MAX_UI_FILTER_LEN = 64;
+/** Filter charset: letters, digits, space and a few punctuation marks (no shell/control chars). */
+const UI_FILTER_RE = /^[\p{L}\p{N} ._:()'&,\-]*$/u;
+const MAX_POLL_WAIT_MS = 60 * 1000;
 /** Apps the agent may open; the fixed mapping is the allowlist. */
 const OPEN_APPS = Object.freeze({
   browser: Object.freeze(["chromium", "--new-window"]),
   terminal: Object.freeze(["xfce4-terminal"]),
   files: Object.freeze(["thunar"]),
+  libreoffice: Object.freeze(["lowriter"]),
+  spreadsheet: Object.freeze(["localc"]),
+  gimp: Object.freeze(["gimp"]),
+  blender: Object.freeze(["blender"]),
 });
 
 /**
@@ -120,12 +148,63 @@ function dragArgs(args) {
   ]);
 }
 
-/** Validate a `type` call. Newlines become Return key presses. */
+/** Modes the `type` tool accepts. Default "auto" picks paste above a
+ * threshold or for multiline / non-ASCII text — the cases where xdotool
+ * key-by-key typing is slow (long text), re-indents or auto-completes
+ * (Return per line), or drops/garbles characters (several keymaps). */
+export const TYPE_MODES = Object.freeze(["auto", "keys", "paste"]);
+
+/** The automatic mode switches to paste at this many characters. */
+const AUTOMATIC_PASTE_MIN_LEN = 200;
+/** Anything outside ASCII (emoji, accents, CJK...) forces paste in auto mode. */
+const NON_ASCII_RE = /[^\u0000-\u007f]/;
+
+/**
+ * Choose the input method for a `type` call. Returns null when `mode` is not
+ * one of "auto" | "keys" | "paste" (callers reject). In auto mode, paste is
+ * used when the text is longer than 200 chars, is multiline, or contains
+ * non-ASCII characters — otherwise keys (xdotool, exact same as before).
+ */
+export function chooseTypeMode(text, mode = "auto") {
+  const m = typeof mode === "string" ? mode : "";
+  if (!TYPE_MODES.includes(m)) return null;
+  if (m !== "auto") return m;
+  if (String(text).length > AUTOMATIC_PASTE_MIN_LEN) return "paste";
+  // A trailing newline means "press Return" (run the command, submit the
+  // form), not multiline content: "ls -la\n" stays on the keyboard path.
+  if (String(text).replace(/\n+$/, "").includes("\n")) return "paste";
+  if (NON_ASCII_RE.test(String(text))) return "paste";
+  return "keys";
+}
+
+/**
+ * Marker argv command for the paste path: the server spots it, puts the text
+ * on the clipboard, sends the paste chord (Ctrl+V, or Ctrl+Shift+V when the
+ * focused window is a terminal) and restores the previous clipboard. The text
+ * rides as a single argv element — never a shell string.
+ */
+export const TYPE_PASTE_MARKER = "@paste";
+
+/** Validate a `type` call. Newlines become Return key presses in keys mode. */
 function typeArgs(args) {
   const text = typeof args.text === "string" ? args.text : "";
-  if (text.length > MAX_TYPE_LEN) return invalid(`text too long (max ${MAX_TYPE_LEN} characters).`);
   if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)) {
     return invalid("text contains control characters that cannot be typed.");
+  }
+  const mode = chooseTypeMode(text, args.mode);
+  if (mode === null) return invalid('mode must be one of "auto", "keys" or "paste".');
+  const cap = mode === "paste" ? MAX_PASTE_LEN : MAX_TYPE_LEN;
+  if (text.length > cap) return invalid(`text too long (max ${cap} characters).`);
+  if (text.length === 0) return invalid("text is empty.");
+  if (mode === "paste") {
+    // Trailing newlines are Return presses after the paste, so a pasted
+    // command still runs: terminals with bracketed paste (bash/readline,
+    // zsh) hold a pasted newline as text instead of executing it.
+    const body = text.replace(/\n+$/, "");
+    const returns = text.length - body.length;
+    const cmds = body.length > 0 ? [[TYPE_PASTE_MARKER, body]] : [];
+    for (let i = 0; i < returns; i++) cmds.push(["key", "Return"]);
+    return ok(cmds);
   }
   const lines = text.split("\n");
   const cmds = [];
@@ -167,8 +246,9 @@ function scrollArgs(args) {
 /** Validate an `open_app` call; the name maps to a fixed launch argv. */
 function openAppArgs(args) {
   const name = typeof args.name === "string" ? args.name.trim() : "";
-  const launch = OPEN_APPS[name];
-  if (!launch) return invalid("name must be \"browser\", \"terminal\" or \"files\".");
+  // Own keys only: "toString"/"constructor" must not resolve through the prototype.
+  const launch = Object.prototype.hasOwnProperty.call(OPEN_APPS, name) ? OPEN_APPS[name] : undefined;
+  if (!launch) return invalid(`name must be one of: ${Object.keys(OPEN_APPS).join(", ")}.`);
   return ok([launch]);
 }
 
@@ -179,6 +259,100 @@ function waitArgs(args) {
     return invalid(`ms must be an integer within [0, ${MAX_WAIT_MS}].`);
   }
   return ok([]);
+}
+
+/** Validate an optional inspect_ui text filter; returns "" when absent, null when invalid. */
+function uiFilter(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string") return null;
+  const v = value.trim();
+  // No leading "-": the value is a helper argv element and must never read as a flag.
+  if (v.length > MAX_UI_FILTER_LEN || !UI_FILTER_RE.test(v) || v.startsWith("-")) return null;
+  return v;
+}
+
+/**
+ * Validate an `inspect_ui` call. Produces the argument list for the AT-SPI2
+ * dump helper (atspi_dump.py; the server prepends `python3 <path>`). The
+ * `query`/`role` filters are applied to the parsed result, not passed on.
+ */
+function inspectUiArgs(args) {
+  const app = uiFilter(args.app);
+  if (app === null) return invalid(`app must be a plain name filter (max ${MAX_UI_FILTER_LEN} chars).`);
+  const query = uiFilter(args.query);
+  if (query === null) return invalid(`query must be plain text (max ${MAX_UI_FILTER_LEN} chars).`);
+  const role = uiFilter(args.role);
+  if (role === null) return invalid(`role must be a plain role name (max ${MAX_UI_FILTER_LEN} chars).`);
+  let max = DEFAULT_UI_ITEMS;
+  if (args.maxItems !== undefined && args.maxItems !== null) {
+    const n = toInt(args.maxItems);
+    if (n === null || n < 1 || n > MAX_UI_ITEMS) return invalid(`maxItems must be an integer within [1, ${MAX_UI_ITEMS}].`);
+    max = n;
+  }
+  // Filters narrow the result after the walk, so walk wider than we return.
+  const walkMax = query || role ? MAX_UI_ITEMS + 100 : max;
+  const argv = ["--max", String(walkMax)];
+  if (app) argv.push("--app", app);
+  return ok([argv]);
+}
+
+function queryTextArgs(args, field = "text") {
+  const raw = typeof args[field] === "string" ? args[field].trim() : "";
+  if (!raw || raw.length > MAX_QUERY_LEN) {
+    return invalid(`${field} must be a non-empty string (max ${MAX_QUERY_LEN} chars).`);
+  }
+  return { ok: true, value: raw };
+}
+
+function clickTextArgs(args) {
+  const q = queryTextArgs(args, "text");
+  if (!q.ok) return q;
+  const b = button(args.button);
+  if (b === null) return invalid("button must be an integer 1..7.");
+  return ok([]);
+}
+
+function waitPollArgs(args, { requireText }) {
+  if (requireText) {
+    const q = queryTextArgs(args, "text");
+    if (!q.ok) return q;
+  }
+  if (args.timeoutMs !== undefined) {
+    const t = toInt(args.timeoutMs);
+    if (t === null || t < 100 || t > MAX_POLL_WAIT_MS) {
+      return invalid(`timeoutMs must be an integer within [100, ${MAX_POLL_WAIT_MS}].`);
+    }
+  }
+  if (args.pollMs !== undefined) {
+    const p = toInt(args.pollMs);
+    if (p === null || p < 200 || p > 5000) {
+      return invalid("pollMs must be an integer within [200, 5000].");
+    }
+  }
+  return ok([]);
+}
+
+function clipboardGetArgs(args) {
+  if (args.selection !== undefined && args.selection !== "clipboard" && args.selection !== "primary") {
+    return invalid('selection must be "clipboard" or "primary".');
+  }
+  return ok([]);
+}
+
+function clipboardSetArgs(args) {
+  const sel = clipboardGetArgs(args);
+  if (!sel.ok) return sel;
+  const text = typeof args.text === "string" ? args.text : null;
+  if (text === null || text.length === 0 || text.length > MAX_CLIPBOARD_LEN) {
+    return invalid(`text must be a non-empty string (max ${MAX_CLIPBOARD_LEN} chars).`);
+  }
+  return ok([]);
+}
+
+function focusWindowArgs(args) {
+  const q = queryTextArgs(args, "title");
+  if (!q.ok) return q;
+  return ok([["-a", q.value]]);
 }
 
 /**
@@ -194,10 +368,14 @@ export function parseToolArgs(tool, args) {
       return ok([]);
     case "describe_screen":
       return ok([]);
+    case "inspect_ui":
+      return inspectUiArgs(input);
     case "click":
       return clickArgs(input, { double: false });
     case "double_click":
       return clickArgs(input, { double: true });
+    case "click_text":
+      return clickTextArgs(input);
     case "move":
       return moveArgs(input);
     case "drag":
@@ -210,8 +388,18 @@ export function parseToolArgs(tool, args) {
       return scrollArgs(input);
     case "open_app":
       return openAppArgs(input);
+    case "focus_window":
+      return focusWindowArgs(input);
     case "wait":
       return waitArgs(input);
+    case "wait_for_text":
+      return waitPollArgs(input, { requireText: true });
+    case "wait_for_screen_change":
+      return waitPollArgs(input, { requireText: false });
+    case "clipboard_get":
+      return clipboardGetArgs(input);
+    case "clipboard_set":
+      return clipboardSetArgs(input);
     default:
       return invalid(`unknown computer tool: ${tool}`);
   }
@@ -226,6 +414,12 @@ export function summarizeTool(tool, args) {
       return "Taking a screenshot";
     case "describe_screen":
       return "Reading screen layout and clickable text";
+    case "inspect_ui": {
+      const app = s(input.app);
+      const query = s(input.query);
+      const scope = [app && `in ${app.slice(0, 40)}`, query && `matching "${query.slice(0, 40)}"`].filter(Boolean).join(" ");
+      return `Inspecting UI elements${scope ? ` ${scope}` : ""}`;
+    }
     case "click": {
       const b = button(input.button);
       const label = b === 3 ? "right-clicking" : b === 2 ? "middle-clicking" : "clicking";
@@ -233,6 +427,8 @@ export function summarizeTool(tool, args) {
     }
     case "double_click":
       return `Double-clicking at (${s(input.x)}, ${s(input.y)})`;
+    case "click_text":
+      return `Clicking "${s(input.text).slice(0, 60)}"`;
     case "move":
       return `Moving pointer to (${s(input.x)}, ${s(input.y)})`;
     case "drag":
@@ -261,11 +457,23 @@ export function summarizeTool(tool, args) {
     }
     case "open_app": {
       const name = s(input.name);
-      const label = name === "browser" ? "browser" : name === "terminal" ? "terminal" : name === "files" ? "files" : "app";
+      const label = Object.prototype.hasOwnProperty.call(OPEN_APPS, name) ? name : "app";
       return `Opening ${label}`;
     }
+    case "focus_window":
+      return `Focusing window "${s(input.title).slice(0, 60)}"`;
     case "wait":
       return `Waiting ${s(input.ms) || "0"}ms`;
+    case "wait_for_text":
+      return `Waiting for "${s(input.text).slice(0, 60)}"`;
+    case "wait_for_screen_change":
+      return "Waiting for screen change";
+    case "clipboard_get":
+      return "Reading clipboard";
+    case "clipboard_set": {
+      const len = typeof input.text === "string" ? input.text.length : 0;
+      return `Setting clipboard (${len} chars)`;
+    }
     default:
       return `Desktop action (${tool})`;
   }
@@ -356,4 +564,132 @@ export function parseTesseractTsv(tsv, maxItems = 80) {
     if (out.length >= cap) break;
   }
   return out;
+}
+
+/** States surfaced for AT-SPI2 widgets (anything else from the helper is dropped). */
+const UI_STATES = new Set([
+  "focused",
+  "focusable",
+  "enabled",
+  "checked",
+  "pressed",
+  "selected",
+  "expanded",
+  "editable",
+  "modal",
+  "active",
+]);
+
+/** Strip control characters and cap a label from the accessibility tree. */
+function cleanLabel(value, max) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+/**
+ * Parse the JSON printed by atspi_dump.py into widget records with clickable
+ * center coordinates. Off-screen / zero-size / malformed nodes are dropped,
+ * labels are sanitized, and coordinates are clamped to the screen cap.
+ * Returns `{ ok, error?, apps, truncated, nodes }`; never throws.
+ */
+export function parseAtspiDump(stdout, maxItems = DEFAULT_UI_ITEMS) {
+  const cap = Math.min(Math.max(Number(maxItems) || DEFAULT_UI_ITEMS, 1), MAX_UI_ITEMS);
+  let data;
+  try {
+    const text = String(stdout || "").trim();
+    const line = text.split(/\r?\n/).filter((l) => l.trim().startsWith("{")).pop() || "";
+    data = JSON.parse(line);
+  } catch {
+    return { ok: false, error: "accessibility helper returned no JSON", apps: [], truncated: false, nodes: [] };
+  }
+  if (!data || typeof data !== "object") {
+    return { ok: false, error: "accessibility helper returned no JSON", apps: [], truncated: false, nodes: [] };
+  }
+  if (data.ok !== true) {
+    return { ok: false, error: cleanLabel(data.error || "accessibility tree unavailable", 200), apps: [], truncated: false, nodes: [] };
+  }
+  const apps = Array.isArray(data.apps) ? data.apps.slice(0, 50).map((a) => cleanLabel(a, 60)).filter(Boolean) : [];
+  const nodes = [];
+  for (const raw of Array.isArray(data.nodes) ? data.nodes : []) {
+    if (nodes.length >= cap) break;
+    if (!raw || typeof raw !== "object") continue;
+    const x = Number(raw.x);
+    const y = Number(raw.y);
+    const w = Number(raw.w);
+    const h = Number(raw.h);
+    if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) continue;
+    const cx = Math.round(x + w / 2);
+    const cy = Math.round(y + h / 2);
+    // The center must be a coordinate click() accepts.
+    if (cx < 0 || cy < 0 || cx > MAX_SCREEN_DIM || cy > MAX_SCREEN_DIM) continue;
+    const role = cleanLabel(raw.role, 40).toLowerCase() || "unknown";
+    const states = Array.isArray(raw.states)
+      ? [...new Set(raw.states.map((st) => String(st)).filter((st) => UI_STATES.has(st)))]
+      : [];
+    nodes.push({
+      app: cleanLabel(raw.app, 60),
+      role,
+      name: cleanLabel(raw.name, 120),
+      states,
+      x: Math.round(x),
+      y: Math.round(y),
+      w: Math.round(w),
+      h: Math.round(h),
+      cx,
+      cy,
+    });
+  }
+  return { ok: true, apps, truncated: data.truncated === true, nodes };
+}
+
+/**
+ * Narrow parsed widgets by a case-insensitive name `query` and/or `role`
+ * substring, then cap to `maxItems`.
+ */
+export function filterUiNodes(nodes, { query = "", role = "", maxItems = DEFAULT_UI_ITEMS } = {}) {
+  const q = String(query || "").trim().toLowerCase();
+  const r = String(role || "").trim().toLowerCase();
+  const cap = Math.min(Math.max(Number(maxItems) || DEFAULT_UI_ITEMS, 1), MAX_UI_ITEMS);
+  const out = [];
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    if (q && !node.name.toLowerCase().includes(q)) continue;
+    if (r && !node.role.includes(r)) continue;
+    out.push(node);
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
+/**
+ * Render widgets as compact lines for a text-only model, e.g.
+ *   [push button] "Save" (enabled, focused) -> click(812, 604) [780,592 64x24] @gedit
+ * Disabled widgets are flagged so the model does not click them.
+ */
+export function formatUiNodes(nodes) {
+  return (Array.isArray(nodes) ? nodes : [])
+    .map((n) => {
+      const flags = n.states.filter((st) => st !== "focusable" && st !== "enabled");
+      if (!n.states.includes("enabled")) flags.unshift("disabled");
+      const label = n.name ? ` "${n.name}"` : "";
+      const st = flags.length > 0 ? ` (${flags.join(", ")})` : "";
+      const app = n.app ? ` @${n.app}` : "";
+      return `  [${n.role}]${label}${st} -> click(${n.cx}, ${n.cy}) [${n.x},${n.y} ${n.w}x${n.h}]${app}`;
+    })
+    .join("\n");
+}
+
+/**
+ * Find the best OCR target matching `query` (exact match preferred, then
+ * case-insensitive substring match). Returns null when nothing matches.
+ */
+export function findTextTarget(targets, query, { exact = false } = {}) {
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle || !Array.isArray(targets)) return null;
+  const exactHit = targets.find((t) => String(t?.text || "").trim().toLowerCase() === needle);
+  if (exactHit) return exactHit;
+  if (exact) return null;
+  return targets.find((t) => String(t?.text || "").toLowerCase().includes(needle)) ?? null;
 }

@@ -27,7 +27,8 @@ import { telemetryBus } from "../telemetry/bus";
 import type { VmManager } from "../vm/manager";
 import { makeRedactor } from "../harness/redact";
 import { pinnedLensForRole, runAutoAudit } from "../lenses/audit";
-import type { RunReport } from "./run-report-types";
+import type { ReportReplayMeta, RunReport } from "./run-report-types";
+import { attachDesktopReplay } from "./desktop-replay";
 import {
   MAX_REPLAY_SHOTS,
   MAX_STEP_SHOTS,
@@ -302,6 +303,15 @@ export class RunReporter {
       }
     }
 
+    // A viewer's frame recording is attached to this report, never left in a
+    // shared temp dir. Best-effort: a failed read/copy only omits the replay.
+    let replay: ReportReplayMeta | undefined;
+    try {
+      replay = attachDesktopReplay(runId, runsDir);
+    } catch (error) {
+      console.error(`[run-report] replay attach failed for ${runId}:`, error);
+    }
+
     const report = assembleReport({
       runId,
       userId,
@@ -310,6 +320,7 @@ export class RunReporter {
       finishedAt,
       artifacts,
       shots: state.shots,
+      replay,
       finalText,
       // The run's actual VM image, so the proof bundle asserts what ran
       // instead of assuming the default. Undefined for image-less drivers.

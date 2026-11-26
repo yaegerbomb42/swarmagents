@@ -74,6 +74,7 @@ export function ComputerActionOverlay({ action }: { action?: ComputerAction }) {
           className="absolute transition-[left,top] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]"
           style={{ left, top, transform: "translate(-50%, -50%)" }}
           data-testid="computer-action-point"
+          data-a1-cursor={action.kind}
           data-x={action.x}
           data-y={action.y}
         >
@@ -116,8 +117,10 @@ export function ComputerActionOverlay({ action }: { action?: ComputerAction }) {
       <div
         className="absolute bottom-3 left-3 flex items-center gap-1.5 rounded-full border border-white/[0.14] bg-zinc-950/70 px-2.5 py-1 font-mono text-[11px] text-white/90 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.14),0_8px_24px_rgba(0,0,0,0.5)] backdrop-blur-xl"
         data-testid="computer-action-chip"
+        data-typing-badge={action.kind === "type" ? "true" : undefined}
       >
         <span className="sa-reticle-pulse h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400" />
+        <span className="text-white/50">A1</span>
         {computerActionLabel(action)}
       </div>
     </div>

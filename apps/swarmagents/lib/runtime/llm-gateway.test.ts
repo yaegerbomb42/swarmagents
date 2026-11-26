@@ -716,3 +716,189 @@ test("forwardLlmNonStreaming: strips image blocks when routed model lacks vision
   assert.equal(typeof sentMessages[0].content, "string");
   assert.match(sentMessages[0].content as string, /\[image omitted: this model has no vision\]/);
 });
+
+test("forwardLlmNonStreaming: an unknown/future Claude on the Anthropic wire keeps its images", async () => {
+  const bus = memoryBus();
+  let capturedBody: Record<string, unknown> | undefined;
+  const { fetchImpl } = stubFetch([
+    {
+      prefix: "https://anthropic.example",
+      respond: (init) => {
+        capturedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        return new Response(
+          JSON.stringify({
+            id: "msg_1",
+            type: "message",
+            role: "assistant",
+            model: "claude-opus-5",
+            content: [{ type: "text", text: "a cat" }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 10, output_tokens: 2 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    },
+  ]);
+
+  await forwardLlmNonStreaming({
+    owner: owner(),
+    runId: "run-future-claude-vision",
+    bus: bus as unknown as TelemetryBus,
+    providers: [
+      provider({
+        id: "anthropic",
+        kind: "anthropic",
+        baseUrl: "https://anthropic.example",
+        models: { balanced: "claude-opus-5" },
+      }),
+    ],
+    body: {
+      model: "claude-opus-5",
+      max_tokens: 128,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+          ],
+        },
+      ],
+    },
+    fetchImpl: fetchImpl as unknown as typeof fetch,
+  });
+
+  const sent = (capturedBody?.messages ?? []) as { content: { type: string }[] }[];
+  assert.ok(Array.isArray(sent[0]?.content), "content stays a block list");
+  assert.equal(sent[0].content[1]?.type, "image", "the screenshot reaches the model");
+});
+
+/** A fat tool result: 2,000 passing lines plus two failures and an exit code. */
+function fatToolResult(): string {
+  const out: string[] = [];
+  for (let i = 0; i < 2000; i++) out.push(`✓ renders row ${i} correctly (3ms)`);
+  out.push("FAIL src/components/DesktopView.test.tsx");
+  out.push("  ● DesktopView › shows the live desktop");
+  out.push("    Expected: live desktop visible");
+  out.push("    Received: blank screen");
+  out.push("      at Object.<anonymous> (src/components/DesktopView.test.tsx:42:15)");
+  out.push("Tests:       1 failed, 1999 passed, 2000 total");
+  out.push("error Command failed with exit code 1.");
+  return out.join("\n");
+}
+
+test("turn compaction: a long multi-turn history is compacted before any provider sees it", async () => {
+  const { fetchImpl, calls } = stubFetch([
+    { prefix: "https://openai.example", respond: () => jsonResponse(OPENAI_RESPONSE) },
+  ]);
+  const messages: Array<Record<string, unknown>> = [{ role: "user", content: "make the desktop work" }];
+  for (let turn = 1; turn <= 30; turn++) {
+    messages.push({
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: `tu_${turn}`, content: fatToolResult() }],
+    });
+    messages.push({ role: "assistant", content: [{ type: "text", text: `turn ${turn} done` }] });
+  }
+  const body = { model: "claude-x", max_tokens: 64, messages };
+  const snapshot = JSON.stringify(body);
+
+  const result = await forwardLlmNonStreaming({
+    owner: owner(),
+    providers: [
+      provider({
+        id: "openai",
+        baseUrl: "https://openai.example/v1",
+        models: { balanced: "mock-openai-model" },
+        keys: [mockKey()],
+      }),
+    ],
+    body,
+    requestedModel: "mock-openai-model",
+    fetchImpl: fetchImpl as unknown as typeof fetch,
+  });
+  assert.equal(result.attempts.length, 1);
+  assert.equal(calls.length, 1);
+
+  // The caller's body is never mutated by compaction.
+  assert.equal(JSON.stringify(body), snapshot);
+
+  // The forwarded OpenAI body carries bounded tool content: the raw
+  // history is ~30 x 60k chars of tool output, the forwarded one must be
+  // far smaller, and the newest result's diagnostics must survive.
+  const sent = JSON.parse(String(calls[0].init.body)) as {
+    messages: Array<{ role: string; content: unknown }>;
+  };
+  const toolContents = sent.messages
+    .filter((m) => m.role === "tool")
+    .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)));
+  const totalChars = toolContents.reduce((sum, c) => sum + c.length, 0);
+  assert.ok(totalChars < 200_000, `forwarded tool content ${totalChars} chars must be bounded`);
+  assert.ok(toolContents.length > 0, "tool results still forwarded");
+  const joined = toolContents.join("\n");
+  assert.ok(joined.includes("exit code 1"), "newest result keeps its exit code in the forwarded body");
+  assert.ok(
+    joined.includes("src/components/DesktopView.test.tsx:42"),
+    "newest result keeps its file:line in the forwarded body",
+  );
+});
+
+test("turn compaction: a short history is forwarded byte-identical", async () => {
+  const { fetchImpl, calls } = stubFetch([
+    { prefix: "https://openai.example", respond: () => jsonResponse(OPENAI_RESPONSE) },
+  ]);
+  const body = {
+    model: "claude-x",
+    max_tokens: 64,
+    messages: [
+      { role: "user", content: "ping" },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tu_1", content: "ok" }],
+      },
+    ],
+  };
+  await forwardLlmNonStreaming({
+    owner: owner(),
+    providers: [
+      provider({
+        id: "openai",
+        baseUrl: "https://openai.example/v1",
+        models: { balanced: "mock-openai-model" },
+        keys: [mockKey()],
+      }),
+    ],
+    body,
+    requestedModel: "mock-openai-model",
+    fetchImpl: fetchImpl as unknown as typeof fetch,
+  });
+  const sent = JSON.parse(String(calls[0].init.body)) as {
+    messages: Array<{ role: string; content: unknown }>;
+  };
+  const toolMessage = sent.messages.find((m) => m.role === "tool");
+  assert.equal(toolMessage?.content, "ok");
+});
+
+test("turn compaction: a large-context model gets ~60k tokens of tool output verbatim (cache-safe)", async () => {
+  const { fetchImpl, calls } = stubFetch([
+    { prefix: "https://openai.example", respond: () => jsonResponse(OPENAI_RESPONSE) },
+  ]);
+  const messages: Array<Record<string, unknown>> = [{ role: "user", content: "fix the failing tests" }];
+  for (let turn = 1; turn <= 3; turn++) {
+    messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: `tu_${turn}`, content: fatToolResult() }] });
+    messages.push({ role: "assistant", content: [{ type: "text", text: `turn ${turn} done` }] });
+  }
+  await forwardLlmNonStreaming({
+    owner: owner(),
+    providers: [
+      provider({ id: "openai", baseUrl: "https://openai.example/v1", models: { balanced: "gpt-4o" }, keys: [mockKey()] }),
+    ],
+    body: { model: "claude-x", max_tokens: 64, messages },
+    requestedModel: "gpt-4o",
+    fetchImpl: fetchImpl as unknown as typeof fetch,
+  });
+  const sent = JSON.parse(String(calls[0].init.body)) as { messages: Array<{ role: string; content: unknown }> };
+  const tool = sent.messages.filter((m) => m.role === "tool");
+  assert.equal(tool.length, 3);
+  for (const m of tool) assert.equal(m.content, fatToolResult(), "under the 80k budget results are forwarded verbatim");
+});

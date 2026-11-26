@@ -2082,3 +2082,116 @@ test("autoCondenseLogs filters oversized tool.result logs via observation-filter
   assert.ok(!onResult.output.includes(SECRET_TOKEN));
   assert.ok(onResult.output.includes("[REDACTED]"));
 });
+
+test("tool.result event never carries raw screenshot base64 (image marker instead)", async () => {
+  // A screenshot tool result: a short text part plus a large base64 image
+  // block, exactly what the desktop computer-use tools return.
+  const imageData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ".repeat(200);
+  const shotFixture = [
+    INIT,
+    {
+      type: "assistant",
+      message: {
+        id: "m-shot",
+        content: [{ type: "tool_use", id: "toolu_shot", name: "screenshot", input: {} }],
+      },
+    },
+    {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_shot",
+            content: [
+              { type: "text", text: "screenshot taken" },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: imageData } },
+            ],
+            is_error: false,
+          },
+        ],
+      },
+    },
+    { type: "assistant", message: { id: "m-done", content: [{ type: "text", text: "Done." }] } },
+    RESULT,
+  ]
+    .map((l) => JSON.stringify(l))
+    .join("\n") + "\n";
+
+  const vm = new ScriptedVm([{ chunks: [shotFixture] }]);
+  const runner = new ClaudeCodeRunner({ bin: "claude" });
+  const events: TelemetryEvent[] = [];
+  const outcome = await runner.run({ prompt: "Take a screenshot", env: envWithSecrets, vm }, (e) => events.push(e));
+  assert.equal(outcome.exitCode, 0);
+
+  const results = events.filter((e): e is Extract<TelemetryEvent, { type: "tool.result" }> => e.type === "tool.result");
+  assert.equal(results.length, 1);
+  assert.ok(results[0].output.includes("screenshot taken"), "text part survives");
+  assert.ok(
+    results[0].output.includes("[image output (image/png,"),
+    "image block is replaced by a short marker",
+  );
+  assert.ok(!results[0].output.includes(imageData), "raw base64 must not reach the event stream");
+  assert.ok(results[0].output.length < 1000, "event output stays small");
+});
+
+test("emits run.plan from TodoWrite, once per real change (live plan checklist)", async () => {
+  const todo = (id: string, todos: Array<{ content: string; status: string; activeForm: string }>) => ({
+    type: "assistant",
+    message: { id: `m_${id}`, content: [{ type: "tool_use", id, name: "TodoWrite", input: { todos } }] },
+  });
+  const result = (id: string) => ({
+    type: "user",
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: id, content: "Todos have been modified successfully.", is_error: false }],
+    },
+  });
+  const steps = [
+    { content: "Open the site", status: "in_progress", activeForm: "Opening the site" },
+    { content: "Fill the form", status: "pending", activeForm: "Filling the form" },
+  ];
+  const lines = [
+    INIT,
+    todo("t1", steps),
+    result("t1"),
+    // The model re-sends an identical list: no new event.
+    todo("t2", steps),
+    result("t2"),
+    todo("t3", [
+      { ...steps[0], status: "completed" },
+      { ...steps[1], status: "in_progress" },
+    ]),
+    result("t3"),
+    {
+      type: "result",
+      subtype: "success",
+      duration_ms: 500,
+      num_turns: 3,
+      result: "Done.",
+      session_id: "sess_plan",
+      total_cost_usd: 0.001,
+    },
+  ].map((l) => JSON.stringify(l));
+  const vm = new ScriptedVm([{ chunks: [lines.join("\n") + "\n"] }]);
+  const events: TelemetryEvent[] = [];
+  const outcome = await new ClaudeCodeRunner().run({ prompt: "Fill the form", env: {}, vm }, (e) => events.push(e));
+
+  assert.equal(outcome.exitCode, 0);
+  const plans = events.filter((e): e is Extract<TelemetryEvent, { type: "run.plan" }> => e.type === "run.plan");
+  assert.equal(plans.length, 2, "identical TodoWrite lists are deduplicated");
+  assert.deepEqual(
+    plans[0].steps.map((s) => [s.content, s.status, s.activeForm]),
+    [
+      ["Open the site", "in_progress", "Opening the site"],
+      ["Fill the form", "pending", "Filling the form"],
+    ],
+  );
+  assert.deepEqual(
+    plans[1].steps.map((s) => s.status),
+    ["completed", "in_progress"],
+  );
+  // The raw tool.call still streams (the conversation labels it).
+  assert.equal(events.filter((e) => e.type === "tool.call").length, 3);
+});

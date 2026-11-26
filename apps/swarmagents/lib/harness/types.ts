@@ -10,6 +10,7 @@
 import type { StateLedgerSnapshot } from "./context/contextGovernor";
 import type { SourceFile, WorkingSetItem } from "./context/astSlicer";
 import type { RiskLevel } from "./risk";
+import type { PlanStep } from "../run-plan";
 import type { DecisionBrainHooksOptions } from "./decision-brain/hooks";
 
 /** Minimal exec interface, modeled on VmDriver. Implementations manage the actual process tree. */
@@ -48,10 +49,16 @@ export interface VmExec {
  * "usage" events carry the latest snapshot seen from the stream; the final
  * cumulative cost arrives on run.finished.
  */
+
 export type TelemetryEvent =
   | { type: "run.started"; sessionId?: string; model?: string; provider?: string; startedAt: number }
   | { type: "assistant.text"; text: string }
   | { type: "tool.call"; name: string; input: unknown; id?: string }
+  /**
+   * The agent's plan changed (TodoWrite / TaskCreate / TaskUpdate folded
+   * by lib/run-plan.ts). Carries the whole list; emitted only on change.
+   */
+  | { type: "run.plan"; steps: PlanStep[] }
   /**
    * Emitted by the synchronous approval channel (the in-VM PreToolUse hook)
    * once a call is cleared to execute. It is deliberately distinct from
@@ -140,6 +147,10 @@ export type TelemetryEvent =
     }
   /** Emitted when a tool call classifies as "deny" and the run is halted. */
   | { type: "tool.blocked"; name: string; reason: string }
+  /** Emitted when a user clicks/types on the live desktop and pauses A1. */
+  | { type: "run.user_takeover"; startedAt: number }
+  /** Emitted when the user hands desktop control back to A1. */
+  | { type: "run.user_handback"; durationSec: number; note: string }
   /**
    * Emitted when an ask-classified tool call is cleared to execute and the
    * auto-checkpoint hook snapshotted the VM first (F1 time travel).

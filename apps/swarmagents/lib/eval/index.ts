@@ -4,3 +4,8 @@ export * from "./driver";
 export * from "./runner";
 export * from "./comparator";
 export * from "./report";
+export * from "./provider-types";
+export * from "./provider-tasks";
+export * from "./provider-executor";
+export * from "./provider-runner";
+export * from "./provider-report";

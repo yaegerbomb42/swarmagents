@@ -152,45 +152,29 @@ test("POST poll_tasks still works when storage is healthy", async () => {
   }
 });
 
-test("GET exposes per-agent stats computed from task state and rejections", async () => {
+test("GET and poll_tasks expose returnReason whenever a task carries one", async () => {
   const dir = tmpDir();
   const dataFile = path.join(dir, "swarm_board.json");
   seed(dataFile);
   const raw = JSON.parse(fs.readFileSync(dataFile, "utf-8")) as { tasks: Array<Record<string, unknown>> };
-  raw.tasks.push(
-    {
-      id: "task_2",
-      title: "In review",
-      description: "D",
-      difficulty: "easy",
-      constraints: [],
-      status: "in_review",
-      claimedBy: "Worker-1",
-      rejections: ["Worker-1"],
-      createdAt: 1,
-      updatedAt: 1,
-    },
-    {
-      id: "task_3",
-      title: "Claimed again",
-      description: "D",
-      difficulty: "easy",
-      constraints: [],
-      status: "claimed",
-      claimedBy: "Worker-1",
-      createdAt: 1,
-      updatedAt: Date.now(),
-    },
-  );
+  raw.tasks[0].returnReason = "Tests did not cover the regression";
   fs.writeFileSync(dataFile, JSON.stringify(raw), "utf-8");
   configureStorePaths(dir, dataFile);
   try {
-    const res = await GET(request("/api/mcp/swarm-board"));
-    assert.equal(res.status, 200);
-    const body = (await res.json()) as {
-      agents?: Record<string, { claimed?: number; inReview?: number; completed?: number; rejected?: number }>;
+    const getRes = await GET(request("/api/mcp/swarm-board?status=open"));
+    assert.equal(getRes.status, 200);
+    const getBody = (await getRes.json()) as { tasks?: Array<{ id?: string; returnReason?: string }> };
+    const getTask = getBody.tasks?.find((t) => t.id === "task_1");
+    assert.equal(getTask?.returnReason, "Tests did not cover the regression");
+
+    const pollRes = await POST(rpc("tools/call", { name: "poll_tasks", arguments: { status: "open" } }));
+    assert.equal(pollRes.status, 200);
+    const pollBody = (await pollRes.json()) as { result?: { content?: Array<{ text?: string }> } };
+    const payload = JSON.parse(pollBody.result?.content?.[0]?.text ?? "{}") as {
+      tasks?: Array<{ id?: string; returnReason?: string }>;
     };
-    assert.deepEqual(body.agents?.["Worker-1"], { claimed: 1, inReview: 1, completed: 0, rejected: 1 });
+    const pollTask = payload.tasks?.find((t) => t.id === "task_1");
+    assert.equal(pollTask?.returnReason, "Tests did not cover the regression");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -493,5 +477,48 @@ test("swarm-board MCP advertises and executes per-user VM tools with auth and is
     Buffer.from(shotAlice.result.content[1].data, "base64").toString("utf8"),
     "frame-alice",
   );
+});
+test("GET exposes per-agent stats computed from task state and rejections", async () => {
+  const dir = tmpDir();
+  const dataFile = path.join(dir, "swarm_board.json");
+  seed(dataFile);
+  const raw = JSON.parse(fs.readFileSync(dataFile, "utf-8")) as { tasks: Array<Record<string, unknown>> };
+  raw.tasks.push(
+    {
+      id: "task_2",
+      title: "In review",
+      description: "D",
+      difficulty: "easy",
+      constraints: [],
+      status: "in_review",
+      claimedBy: "Worker-1",
+      rejections: ["Worker-1"],
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    {
+      id: "task_3",
+      title: "Claimed again",
+      description: "D",
+      difficulty: "easy",
+      constraints: [],
+      status: "claimed",
+      claimedBy: "Worker-1",
+      createdAt: 1,
+      updatedAt: Date.now(),
+    },
+  );
+  fs.writeFileSync(dataFile, JSON.stringify(raw), "utf-8");
+  configureStorePaths(dir, dataFile);
+  try {
+    const res = await GET(request("/api/mcp/swarm-board"));
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      agents?: Record<string, { claimed?: number; inReview?: number; completed?: number; rejected?: number }>;
+    };
+    assert.deepEqual(body.agents?.["Worker-1"], { claimed: 1, inReview: 1, completed: 0, rejected: 1 });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 

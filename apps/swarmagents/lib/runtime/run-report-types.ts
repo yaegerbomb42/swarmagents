@@ -42,6 +42,7 @@ export interface ReportShotMeta {
 }
 
 import type { RunReceipt } from "./run-receipt";
+import type { PlanStep } from "../run-plan";
 
 /** Token + cost totals for one provider/model pair within a run. */
 export interface ModelTokenAccounting {
@@ -208,6 +209,11 @@ export interface ReportCardMeta {
   vmImage?: string;
   /** Shadow-verifier gate result, when one ran for the run. */
   verification?: RunVerificationMeta;
+  /**
+   * The agent's final plan (TodoWrite) progress, when the run planned:
+   * the card's collapsed row says "Plan: 7/7 completed".
+   */
+  plan?: { done: number; total: number };
 }
 
 /** The shadow-verifier gate result for a run. */
@@ -246,6 +252,20 @@ export interface RunAudit {
   createdAt: number;
 }
 
+/** Stored name of a run's frame-recorder replay inside its report directory. */
+export const DESKTOP_REPLAY_FILE = "replay.rfb";
+
+/** Metadata for the recorded desktop replay attached to a completed run. */
+export interface ReportReplayMeta {
+  /** Always DESKTOP_REPLAY_FILE; the route serves it, clients never see a path. */
+  file: string;
+  mime: string;
+  size: number;
+  /** Framebuffer geometry the recording's Raw/CopyRect rectangles use. */
+  width: number;
+  height: number;
+}
+
 /** The full per-run report document. */
 export interface RunReport {
   runId: string;
@@ -266,7 +286,11 @@ export interface RunReport {
   artifacts: ReportArtifact[];
   /** Screenshots taken at start, during, and at end of the run. */
   shots: ReportShotMeta[];
+  /** Frame-recorder replay, when a viewer watched this run's desktop. */
+  replay?: ReportReplayMeta;
   meta: ReportCardMeta;
+  /** The agent's final plan (see lib/run-plan.ts), when it kept one. */
+  plan?: PlanStep[];
   /**
    * Per-model token accounting folded from the run's llm.call / usage
    * telemetry. Absent on reports written before it existed, and on runs

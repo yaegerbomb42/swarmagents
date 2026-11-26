@@ -12,6 +12,7 @@ import { test } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { countOf, installBrowserStubs, tagOf } from "../testing/harness";
+import { DESKTOP_FRAMEBUFFER, type ComputerAction } from "../../../lib/client/presence";
 
 const h = React.createElement;
 
@@ -79,6 +80,24 @@ test("a hibernated VM wakes up instead of 'starting', and an error names itself"
   assert.match(failed, /VNC refused the connection/);
 });
 
+test("a live computer.action paints A1's cursor over the noVNC surface", async () => {
+  const { DesktopView } = await load();
+  const computerAction: ComputerAction = {
+    kind: "click",
+    x: 800,
+    y: 450,
+    at: Date.now(),
+    framebuffer: DESKTOP_FRAMEBUFFER,
+  };
+  const markup = renderToStaticMarkup(
+    h(DesktopView, { vmState: "ready", embedded: true, runId: "run_1", computerAction }),
+  );
+  assert.ok(markup.includes('data-testid="computer-action-overlay"'), "overlay sits over the desktop");
+  assert.ok(markup.includes('data-a1-cursor="click"'), "A1's cursor is marked");
+  assert.ok(markup.includes("sa-click-ripple"), "click ripple plays");
+  assert.ok(markup.includes("left:50%") && markup.includes("top:50%"), "coordinates map to the screen");
+});
+
 test("the standalone view shares the same booting overlay", async () => {
   const { DesktopView } = await load();
   const markup = renderToStaticMarkup(h(DesktopView, { vmState: "starting" }));
@@ -89,4 +108,13 @@ test("the standalone view shares the same booting overlay", async () => {
   assert.match(markup, /transform-gpu/);
   // The standalone path still renders its own controls row under the stage.
   assert.equal(countOf(markup, 'data-testid="desktop-fullscreen-button"'), 1);
+});
+
+test("UserDrivingBanner renders paused copy and Hand back button", async () => {
+  const { UserDrivingBanner } = await load();
+  const markup = renderToStaticMarkup(h(UserDrivingBanner, { onHandBack: () => {} }));
+  assert.ok(markup.includes('data-testid="user-driving-banner"'));
+  assert.ok(markup.includes("You&#x27;re driving: A1 is paused"));
+  assert.ok(markup.includes('data-testid="user-driving-handback"'));
+  assert.ok(markup.includes("Hand back"));
 });

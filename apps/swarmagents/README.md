@@ -549,6 +549,16 @@ share session/board state):
 npm run test:unit      # lib/**/*.test.ts and app/**/*.test.ts
 ```
 
+Runtime dispatch e2e (`app/api/runtime/dispatch.e2e.test.ts`) spawns a real
+fake-`claude` child and waits on the SSE stream, which can hang in sandboxed
+worker environments, so it is skipped by default and replaced by the unit-level
+`app/api/runtime/dispatch.test.ts` (same ordering invariants, no child
+process). Opt in with:
+
+```bash
+SWARM_RUN_DISPATCH_E2E=1 npm run test:unit
+```
+
 Run the whole gate in one command (typecheck → unit → build → boot the built
 app on a free port with `SWARM_VM_DRIVER=fake` and a temp `SWARM_HOME` → local
 e2e → shutdown; screenshots default into that temp home unless `SCREENSHOT_DIR`

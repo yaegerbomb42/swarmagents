@@ -45,7 +45,17 @@ export async function register(): Promise<void> {
     // in this same process on an internal port (default 127.0.0.1:3778).
     if (process.env.SWARM_DESKTOP_PROXY_DISABLED !== "1") {
       const { createDesktopProxy, setGlobalDesktopProxy } = await import("./lib/desktop-proxy/proxy");
-      const proxy = createDesktopProxy();
+      const { getRunsDir } = await import("./lib/telemetry/paths");
+      const { getRuntimeManager } = await import("./lib/runtime/manager");
+      const { desktopReplayDir } = await import("./lib/runtime/desktop-replay");
+      const runsDir = getRunsDir();
+      // Run-tagged viewer sessions feed the run's desktop replay. Recording is
+      // capped per session by FrameRecorder; SWARM_DESKTOP_REPLAY=0 turns it off.
+      const proxy = createDesktopProxy({
+        // Must match where attachDesktopReplay looks (<runsDir>/replays).
+        recordingDir: process.env.SWARM_DESKTOP_REPLAY === "0" || !runsDir ? undefined : desktopReplayDir(runsDir),
+        isActiveRun: (userId, runId) => getRuntimeManager().isActiveRun(userId, runId),
+      });
       // Expose the proxy to the runtime so desktop handoffs can force
       // view/control mode on the user's sessions.
       setGlobalDesktopProxy(proxy);

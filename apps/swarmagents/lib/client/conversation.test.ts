@@ -276,3 +276,17 @@ test("conversation: handles the real SSE wire shape (payload nested under data)"
   assert.equal(entries[2].label, "Writing game/index.html");
   assert.equal(entries[2].status, "done");
 });
+
+test("plan tool calls get a plain-language label instead of 'Calling tool'", () => {
+  assert.equal(
+    describeToolCall("TodoWrite", {
+      todos: [
+        { content: "a", status: "completed", activeForm: "A" },
+        { content: "b", status: "in_progress", activeForm: "B" },
+      ],
+    }),
+    "Updating the plan (1/2 done)",
+  );
+  assert.equal(describeToolCall("TaskCreate", { subject: "Run the tests" }), "Adding a step: Run the tests");
+  assert.equal(describeToolCall("TaskUpdate", { taskId: "1", status: "completed" }), "Updating a plan step");
+});

@@ -13,6 +13,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  OPEN_APP_NAMES,
+  findTextTarget,
   parseTesseractTsv,
   parseToolArgs,
   parseWmctrlWindows,
@@ -21,9 +23,11 @@ import {
 import {
   classifyDesktopToolCall,
   classifyDesktopToolCallAsync,
+  computerActionEvent,
   describeDesktopAction,
   desktopMcpTool,
   isDesktopMcpCall,
+  isRawScreenshotCall,
   parseMcpToolName,
 } from "./computer-mcp";
 import type { RiskDecision } from "./risk";
@@ -87,17 +91,24 @@ test("drag produces press-move-release argv", () => {
 });
 
 test("type produces argv with the text as a single element (newlines -> Return)", () => {
+  // Short ASCII text types via keys by default — unchanged behavior.
   assert.deepEqual(parseToolArgs("type", { text: "hello" }), {
     ok: true,
     cmds: [["type", "--delay", "15", "hello"]],
   });
-  const multiline = parseToolArgs("type", { text: "a\nb" });
-  assert.equal(multiline.ok, true);
-  assert.deepEqual(multiline.cmds, [
+  // Explicit keys keeps the classic per-line keyboard argv.
+  const multilineKeys = parseToolArgs("type", { text: "a\nb", mode: "keys" });
+  assert.equal(multilineKeys.ok, true);
+  assert.deepEqual(multilineKeys.cmds, [
     ["type", "--delay", "15", "a"],
     ["key", "Return"],
     ["type", "--delay", "15", "b"],
   ]);
+  // Auto mode routes multiline text to paste instead (see
+  // computer-mcp.type.test.ts for the full mode matrix).
+  const multiline = parseToolArgs("type", { text: "a\nb" });
+  assert.equal(multiline.ok, true);
+  assert.deepEqual(multiline.cmds, [["@paste", "a\nb"]]);
 });
 
 test("key produces argv; combos are charset-limited", () => {
@@ -139,6 +150,28 @@ test("open_app only launches allowlisted apps", () => {
     ok: true,
     cmds: [["thunar"]],
   });
+  assert.deepEqual(parseToolArgs("open_app", { name: "libreoffice" }), {
+    ok: true,
+    cmds: [["lowriter"]],
+  });
+  assert.deepEqual(parseToolArgs("open_app", { name: "gimp" }), {
+    ok: true,
+    cmds: [["gimp"]],
+  });
+  assert.deepEqual(parseToolArgs("open_app", { name: "blender" }), {
+    ok: true,
+    cmds: [["blender"]],
+  });
+  assert.deepEqual(parseToolArgs("open_app", { name: "spreadsheet" }), {
+    ok: true,
+    cmds: [["localc"]],
+  });
+  // The exported name list (used for the server's zod enum) matches the allowlist exactly.
+  for (const name of OPEN_APP_NAMES) assert.equal(parseToolArgs("open_app", { name }).ok, true, name);
+  assert.equal(summarizeTool("open_app", { name: "gimp" }), "Opening gimp");
+  assert.equal(summarizeTool("open_app", { name: "toString" }), "Opening app");
+  assert.equal(parseToolArgs("open_app", { name: "toString" }).ok, false);
+  assert.equal(parseToolArgs("open_app", { name: "constructor" }).ok, false);
   assert.equal(parseToolArgs("open_app", { name: "bash" }).ok, false);
   assert.equal(parseToolArgs("open_app", { name: "../../bin/sh" }).ok, false);
   assert.equal(parseToolArgs("open_app", {}).ok, false);
@@ -238,6 +271,80 @@ test("classifyDesktopToolCallAsync runs DNS preflight (b9)", async () => {
   assert.equal((await nav("http://127.0.0.1/"))!.level, "allow");
 });
 
+// ---- Text-desktop mode: raw screenshots are denied, text inspection is not -
+
+test("isRawScreenshotCall matches only the image-returning screenshot tools", () => {
+  assert.equal(isRawScreenshotCall("mcp__computer-mcp__screenshot"), true);
+  // The real @playwright/mcp screenshot tool (catalog: connectors.json).
+  assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_take_screenshot"), true);
+  assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_screen_capture"), true);
+  assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_screenshot"), true);
+  assert.equal(isRawScreenshotCall("mcp__browser-mcp__browser_screenshot"), true);
+  // The text inspection paths are not screenshots.
+  assert.equal(isRawScreenshotCall("mcp__computer-mcp__describe_screen"), false);
+  assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_snapshot"), false);
+  assert.equal(isRawScreenshotCall("mcp__playwright-mcp__browser_accessible_snapshot"), false);
+  assert.equal(isRawScreenshotCall("mcp__computer-mcp__click"), false);
+  assert.equal(isRawScreenshotCall("mcp__roles__set_role"), false);
+  assert.equal(isRawScreenshotCall("Bash"), false);
+});
+
+test("classifyDesktopToolCall denies raw screenshots in text-desktop mode", () => {
+  const textDesktop = { textDesktop: true };
+  const shot = classifyDesktopToolCall("mcp__computer-mcp__screenshot", {}, textDesktop)!;
+  assert.equal(shot.level, "deny");
+  assert.match(shot.reason, /describe_screen/);
+
+  const browserShot = classifyDesktopToolCall(
+    "mcp__playwright-mcp__browser_take_screenshot",
+    {},
+    textDesktop,
+  )!;
+  assert.equal(browserShot.level, "deny");
+  assert.match(browserShot.reason, /browser_snapshot/);
+
+  // The text paths stay open in text-desktop mode: describe_screen, the
+  // accessibility snapshots, and the input tools.
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__describe_screen", {}, textDesktop)!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__playwright-mcp__browser_snapshot", {}, textDesktop)!.level, "allow");
+  assert.equal(
+    classifyDesktopToolCall("mcp__playwright-mcp__browser_accessible_snapshot", {}, textDesktop)!.level,
+    "allow",
+  );
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__click", { x: 1, y: 2 }, textDesktop)!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__type", { text: "hi" }, textDesktop)!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__key", { combo: "Return" }, textDesktop)!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__scroll", { dx: 0, dy: 3 }, textDesktop)!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__open_app", { name: "browser" }, textDesktop)!.level, "allow");
+
+  // Without the flag nothing changes: screenshots are allowed as before.
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__screenshot", {})!.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__playwright-mcp__browser_take_screenshot", {})!.level, "allow");
+});
+
+test("classifyDesktopToolCallAsync denies raw screenshots in text-desktop mode", async () => {
+  const shot = await classifyDesktopToolCallAsync("mcp__computer-mcp__screenshot", {}, undefined, {
+    textDesktop: true,
+  });
+  assert.equal(shot!.level, "deny");
+  assert.match(shot!.reason, /describe_screen/);
+
+  const browserShot = await classifyDesktopToolCallAsync(
+    "mcp__browser-mcp__browser_screenshot",
+    {},
+    undefined,
+    { textDesktop: true },
+  );
+  assert.equal(browserShot!.level, "deny");
+  assert.match(browserShot!.reason, /browser_snapshot/);
+
+  // Text inspection still allowed through the async classifier.
+  const described = await classifyDesktopToolCallAsync("mcp__computer-mcp__describe_screen", {}, undefined, {
+    textDesktop: true,
+  });
+  assert.equal(described!.level, "allow");
+});
+
 // ---- Human-readable summaries (computer.action telemetry) -------------------
 
 test("describeDesktopAction summarizes computer-mcp calls readably", () => {
@@ -251,6 +358,58 @@ test("describeDesktopAction summarizes computer-mcp calls readably", () => {
   assert.equal(describeDesktopAction("mcp__computer-mcp__screenshot", {}), "Taking a screenshot");
   assert.equal(describeDesktopAction("mcp__computer-mcp__scroll", { dx: 0, dy: 2 }), "Scrolling down");
   assert.equal(describeDesktopAction("mcp__computer-mcp__wait", { ms: 500 }), "Waiting 500ms");
+});
+
+test("compound desktop tools: validation, risk gate, findTextTarget, and telemetry", () => {
+  // click_text
+  assert.equal(parseToolArgs("click_text", { text: "Submit" }).ok, true);
+  assert.equal(parseToolArgs("click_text", { text: "" }).ok, false);
+  assert.equal(parseToolArgs("click_text", { text: "Submit", button: 9 }).ok, false);
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__click_text", { text: "Submit" })?.level, "allow");
+  assert.equal(describeDesktopAction("mcp__computer-mcp__click_text", { text: "Submit" }), 'Clicking "Submit"');
+  assert.equal(computerActionEvent("mcp__computer-mcp__click_text", { text: "Submit" }).target, "Submit");
+
+  // wait_for_text & wait_for_screen_change
+  assert.equal(parseToolArgs("wait_for_text", { text: "Done", timeoutMs: 5000, pollMs: 250 }).ok, true);
+  assert.equal(parseToolArgs("wait_for_text", { text: "Done", timeoutMs: 50 }).ok, false);
+  assert.equal(parseToolArgs("wait_for_screen_change", { timeoutMs: 3000 }).ok, true);
+  assert.equal(parseToolArgs("wait_for_screen_change", { pollMs: 50 }).ok, false);
+  assert.equal(describeDesktopAction("mcp__computer-mcp__wait_for_screen_change", {}), "Waiting for screen change");
+
+  // clipboard_get & clipboard_set (never leaks clipboard content into telemetry)
+  assert.equal(parseToolArgs("clipboard_get", { selection: "clipboard" }).ok, true);
+  assert.equal(parseToolArgs("clipboard_get", { selection: "invalid" }).ok, false);
+  assert.equal(parseToolArgs("clipboard_set", { text: "secret-token" }).ok, true);
+  assert.equal(parseToolArgs("clipboard_set", { text: "" }).ok, false);
+  assert.equal(describeDesktopAction("mcp__computer-mcp__clipboard_set", { text: "secret-token" }), "Setting clipboard (12 chars)");
+  const clipEv = computerActionEvent("mcp__computer-mcp__clipboard_set", { text: "secret-token" });
+  assert.equal(clipEv.text, undefined);
+  assert.ok(!JSON.stringify(clipEv).includes("secret-token"));
+
+  // focus_window
+  assert.equal(parseToolArgs("focus_window", { title: "Terminal" }).ok, true);
+  assert.deepEqual(parseToolArgs("focus_window", { title: "Terminal" }).cmds, [["-a", "Terminal"]]);
+  assert.equal(parseToolArgs("focus_window", { title: "" }).ok, false);
+  assert.equal(computerActionEvent("mcp__computer-mcp__focus_window", { title: "Terminal" }).target, "Terminal");
+
+  // findTextTarget prefers exact match, falls back to case-insensitive substring
+  const targets = [
+    { text: "Save As...", x: 0, y: 0, w: 40, h: 20, cx: 20, cy: 10 },
+    { text: "Save", x: 50, y: 0, w: 30, h: 20, cx: 65, cy: 10 },
+  ];
+  assert.equal(findTextTarget(targets, "save")?.text, "Save");
+  assert.equal(findTextTarget(targets, "as")?.text, "Save As...");
+  assert.equal(findTextTarget(targets, "as", { exact: true }), null);
+});
+
+test("classifyDesktopToolCall denies mutating desktop input when userDriving is active, keeping inspection tools allowed", () => {
+  const click = classifyDesktopToolCall("mcp__computer-mcp__click", { x: 100, y: 200 }, { userDriving: true });
+  assert.equal(click?.level, "deny");
+  assert.equal(click?.reason, "the user is controlling the desktop; wait or call describe_screen");
+
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__describe_screen", {}, { userDriving: true })?.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__screenshot", {}, { userDriving: true })?.level, "allow");
+  assert.equal(classifyDesktopToolCall("mcp__computer-mcp__inspect_ui", {}, { userDriving: true })?.level, "allow");
 });
 
 test("describeDesktopAction summarizes playwright calls readably", () => {

@@ -32,6 +32,12 @@ export interface SwarmTask {
   reviewedAt?: number;
   /** Agent names whose submitted work was rejected (one entry per review_and_merge_task approved=false). */
   rejections?: string[];
+  /**
+   * Why review_and_merge_task sent the work back (the reviewer's feedback).
+   * Set on rejection; cleared on the next successful claim and on approval,
+   * so a return to the pool or to its owner is never unexplained.
+   */
+  returnReason?: string;
   /** Append-only status transition log for audit. Older tasks may omit it. */
   history?: TaskTransition[];
   createdAt: number;

@@ -163,7 +163,11 @@ function pathOf(input: Record<string, unknown>): string {
     : "";
 }
 
-function riskyToolCall(name: string, input: unknown): RiskDecision | null {
+function riskyToolCall(
+  name: string,
+  input: unknown,
+  opts: { textDesktop?: boolean } = {},
+): RiskDecision | null {
   if (name === "Bash" || name === "Terminal" || name === "Shell" || name === "cmd") {
     const command = input && typeof input === "object" && "command" in input && typeof (input as { command: unknown }).command === "string"
       ? (input as { command: string }).command
@@ -202,7 +206,8 @@ function riskyToolCall(name: string, input: unknown): RiskDecision | null {
 
   // Computer-use (desktop / headless browser MCP) tools have their own policy: the
   // computer-use validator's argument gates and the browser navigation rules.
-  const desktop = classifyDesktopToolCall(name, input);
+  // In text-desktop mode the same classifier denies raw screenshot calls.
+  const desktop = classifyDesktopToolCall(name, input, opts);
   if (desktop) return desktop;
 
   // Read-only inspection tools, search, tasks, MCP tools, and anything else we
@@ -212,14 +217,20 @@ function riskyToolCall(name: string, input: unknown): RiskDecision | null {
 
 /**
  * Classify a tool call by tool name + input. Pure: same inputs always yield the
- * same decision.
+ * same decision. `opts.textDesktop` denies raw screenshot calls (a model
+ * without vision cannot use image bytes); only pass it from a pre-execution
+ * gate — see classifyDesktopToolCall.
  */
-export function classifyToolCall(name: string, input: unknown): RiskDecision {
+export function classifyToolCall(
+  name: string,
+  input: unknown,
+  opts: { textDesktop?: boolean } = {},
+): RiskDecision {
   // VM-only boundary first: nothing below may downgrade a host-targeted call,
   // and nothing above it (auto-approve included) can upgrade it to allow.
   const hostTarget = classifyHostTarget(name, input);
   if (hostTarget) return hostTarget;
-  const toolSpecific = riskyToolCall(name, input);
+  const toolSpecific = riskyToolCall(name, input, opts);
   if (toolSpecific) return toolSpecific;
   return { level: "allow", reason: "benign tool call" };
 }
@@ -261,6 +272,7 @@ export async function classifyToolCallAsync(
   name: string,
   input: unknown,
   lookup?: (host: string) => Promise<string[]>,
+  opts: { textDesktop?: boolean } = {},
 ): Promise<RiskDecision> {
   const hostTarget = classifyHostTarget(name, input);
   if (hostTarget) return hostTarget;
@@ -268,8 +280,8 @@ export async function classifyToolCallAsync(
     const webFetch = await classifyWebFetchAsync(input, lookup);
     if (webFetch) return webFetch;
   }
-  if (!isDesktopMcpCall(name)) return classifyToolCall(name, input);
-  const desktop = await classifyDesktopToolCallAsync(name, input, lookup);
+  if (!isDesktopMcpCall(name)) return classifyToolCall(name, input, opts);
+  const desktop = await classifyDesktopToolCallAsync(name, input, lookup, opts);
   return desktop ?? { level: "allow", reason: "benign tool call" };
 }
 

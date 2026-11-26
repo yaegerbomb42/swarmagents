@@ -10,7 +10,9 @@
  *
  * A provider with no capability information is treated conservatively: it can
  * call tools (most OpenAI-compatible servers can), but it has no vision, so a
- * run starts in text mode and never wires the desktop/computer-use tools.
+ * run starts in text-desktop mode — the desktop is wired, but the model
+ * drives it through text (describe_screen + accessibility snapshots)
+ * instead of screenshots.
  */
 
 import type { ModelCapabilities, ProviderConfig, RunMode } from "./types";
@@ -26,8 +28,17 @@ export const CONSERVATIVE_CAPABILITIES: ModelCapabilities = {
 const VISION_NAME = /(?:^|[-_/.:])(vision|vl|llava|pixtral|internvl|minicpm-v|gemma3)(?:[-_/.:]|$)|(?:qwen2(?:\.5)?-vl)|(?:llama-?3\.2.*vision)|(?:llama-?4.*(?:scout|maverick))/i;
 const NO_TOOLS_NAME = /(?:^|[-_/])(?:embed|embedding|rerank|whisper|tts)(?:[-_/]|$)/i;
 
-const ANTHROPIC_VISION = /claude-(?:3|3\.5|3\.7|4|sonnet-4|opus-4|haiku-4)/i;
-const ANTHROPIC_COMPUTER = /claude-(?:3\.5|3\.7|4|sonnet-4|opus-4|haiku-4)/i;
+/** Claude generations that never accepted image input. */
+const ANTHROPIC_TEXT_ONLY = /claude-(?:1|2|instant)(?:[-.]|$)/i;
+/** Claude 3 Opus/Sonnet/Haiku predate the computer-use tool. */
+const ANTHROPIC_PRE_COMPUTER = /claude-3-(?:opus|sonnet|haiku)|claude-3$/i;
+/**
+ * Hosted frontier families that take images, recognised by name when they
+ * are served through a router (OpenRouter, LiteLLM, a custom Anthropic- or
+ * OpenAI-wire proxy) whose provider id we do not have a preset for.
+ */
+const ROUTED_VISION_FAMILY =
+  /(?:^|[/:])(?:anthropic\/)?claude-|gpt-4o|gpt-4\.1|gpt-5|gemini-(?:1\.5|2|2\.5|3)|grok-(?:2|3|4)/i;
 const OPENAI_VISION = /(?:gpt-4o|gpt-4\.1|gpt-5|o3|o4|chatgpt-4o)/i;
 const OPENAI_COMPUTER = /(?:gpt-4o|gpt-4\.1|gpt-5|computer-use)/i;
 const GEMINI_VISION = /gemini-(?:1\.5|2|2\.5|3)/i;
@@ -44,7 +55,10 @@ export function presetModelCapabilities(providerId: string, model: string): Mode
   const namedVision = VISION_NAME.test(m);
 
   if (id === "anthropic" || id === "radium") {
-    const vision = ANTHROPIC_VISION.test(m);
+    // Every Claude since the 3 family takes images. An unrecognised name on
+    // the native host (a new release such as claude-opus-5, or an alias) is
+    // "unknown", not "text-only": treat it as vision so it is never blinded.
+    const vision = !ANTHROPIC_TEXT_ONLY.test(m);
     // Documented Anthropic output caps: Claude 4 family 64k, 3.7 Sonnet 64k,
     // 3.5 family 8k, Claude 3 family 4k.
     const maxOutputTokens = /claude-(?:4|sonnet-4|opus-4|haiku-4)/.test(m)
@@ -57,7 +71,7 @@ export function presetModelCapabilities(providerId: string, model: string): Mode
     return {
       vision,
       tools: true,
-      computerUse: vision && ANTHROPIC_COMPUTER.test(m),
+      computerUse: vision && !ANTHROPIC_PRE_COMPUTER.test(m),
       contextWindow: 200_000,
       maxOutputTokens,
       source: "preset",
@@ -152,7 +166,7 @@ export function presetModelCapabilities(providerId: string, model: string): Mode
   // model name, and only for vision. Tool support is common but not universal;
   // Ollama discovery refines it from /api/show.
   return {
-    vision: namedVision,
+    vision: namedVision || (ROUTED_VISION_FAMILY.test(m) && !ANTHROPIC_TEXT_ONLY.test(m)),
     tools: true,
     computerUse: false,
     source: "preset",
@@ -194,8 +208,11 @@ export interface RunModeInfo {
  * Decide how a run should behave for the selected model.
  *
  * `desktopEnabled` is the deployment's desktop switch (SWARM_VM_DESKTOP=1).
- * Even with it on, a model without vision or computer-use support must not
- * get the desktop — it runs headless with shell/files/web/MCP tools.
+ * With it on, a model without vision gets text-desktop mode: the desktop
+ * MCP servers are wired, but the model drives them through text
+ * (describe_screen + accessibility snapshots) instead of screenshots. A
+ * model with vision but without computer-use support runs headless with
+ * shell/files/web/MCP tools.
  */
 export function runModeForCapabilities(
   capabilities: ModelCapabilities,
@@ -230,9 +247,11 @@ export function runModeForCapabilities(
   if (!capabilities.vision) {
     return {
       ...base,
-      mode: "text",
-      label: "Text mode",
-      reason: "Text mode: this model has no vision.",
+      mode: "text-desktop",
+      label: "Text desktop mode",
+      reason:
+        "Text desktop mode: this model has no vision, so it drives the desktop through text " +
+        "(describe_screen + accessibility snapshots) instead of screenshots.",
     };
   }
   if (!capabilities.computerUse) {
@@ -249,4 +268,14 @@ export function runModeForCapabilities(
     label: "Desktop mode",
     reason: "Desktop mode: vision and computer-use tools are enabled.",
   };
+}
+
+/**
+ * True when a run mode wires the desktop MCP servers. `undefined` is the
+ * legacy default (a run created before modes existed behaves like gui).
+ * Text-desktop wires the same servers as gui — the difference is how the
+ * model sees the screen (text, not screenshots), enforced downstream.
+ */
+export function isDesktopRunMode(mode: RunMode | undefined): boolean {
+  return mode === undefined || mode === "gui" || mode === "text-desktop";
 }

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  computeAgentStats,
   handleCreateTask,
   handlePollTasks,
   handleClaimTask,
@@ -13,7 +14,6 @@ import {
   handlePing,
   handleToolsList,
   assertTransition,
-  computeAgentStats,
 } from "./handlers";
 import type { BoardStore } from "./types";
 import type { SwarmTask, TaskProposal } from "@/lib/mcp-types";
@@ -820,6 +820,87 @@ test("submit_task_work accepts a docs/ branch end to end", async () => {
   const parsed = payload(result);
   assert.equal(parsed.task.status, "in_review");
   assert.equal(parsed.task.gitBranch, "docs/board-push-rule");
+});
+
+test("review_and_merge_task rejection stores the feedback as task.returnReason", async () => {
+  const store = emptyStore();
+  store.tasks.push(makeTask({ status: "in_review", claimedBy: "agent-a" }));
+  const result = await handleReviewAndMergeTask(store, {
+    taskId: "t1",
+    approved: false,
+    feedback: "rebased onto a stale main; rebase and re-run the gates",
+  });
+  assert.ok("result" in result);
+  const parsed = JSON.parse(result.result.content[0].text) as { task: SwarmTask };
+  assert.equal(parsed.task.returnReason, "rebased onto a stale main; rebase and re-run the gates");
+  assert.equal(store.tasks[0].returnReason, "rebased onto a stale main; rebase and re-run the gates");
+});
+
+test("review_and_merge_task rejection of an unowned task keeps returnReason visible to the pool", async () => {
+  const store = emptyStore();
+  store.tasks.push(makeTask({ status: "in_review" }));
+  const result = await handleReviewAndMergeTask(store, {
+    taskId: "t1",
+    approved: false,
+    feedback: "branch never pushed",
+  });
+  assert.ok("result" in result);
+  assert.equal(store.tasks[0].status, "open");
+  assert.equal(store.tasks[0].claimedBy, undefined);
+  assert.equal(store.tasks[0].returnReason, "branch never pushed");
+
+  // The open pool sees the reason in poll_tasks (never a silent rejection).
+  const polled = handlePollTasks(store, { status: "open" });
+  assert.ok("result" in polled);
+  const list = JSON.parse(polled.result.content[0].text) as { tasks: SwarmTask[] };
+  assert.equal(list.tasks[0]?.returnReason, "branch never pushed");
+});
+
+test("the next successful claim clears returnReason", async () => {
+  const store = emptyStore();
+  store.tasks.push(makeTask({ status: "open", returnReason: "sent back earlier" }));
+  const claim = await handleClaimTask(store, { taskId: "t1", agentName: "agent-b" });
+  assert.ok("result" in claim);
+  assert.equal(store.tasks[0].claimedBy, "agent-b");
+  assert.equal(store.tasks[0].returnReason, undefined);
+  assert.equal("returnReason" in store.tasks[0], false);
+});
+
+test("approval clears a stale returnReason and completion never carries one", async () => {
+  const store = emptyStore();
+  store.tasks.push(
+    makeTask({ status: "in_review", claimedBy: "agent-a", returnReason: "earlier round" })
+  );
+  const result = await handleReviewAndMergeTask(store, {
+    taskId: "t1",
+    approved: true,
+    feedback: "fixed, lgtm",
+  });
+  assert.ok("result" in result);
+  assert.equal(store.tasks[0].status, "completed");
+  assert.equal("returnReason" in store.tasks[0], false);
+});
+
+test("a resubmission preserves returnReason so the next review sees the history", async () => {
+  const store = emptyStore();
+  store.tasks.push(
+    makeTask({ status: "in_review", claimedBy: "agent-a", gitBranch: "feat/x", resultSummary: "v1" })
+  );
+  assert.ok(
+    "result" in
+      (await handleReviewAndMergeTask(store, { taskId: "t1", approved: false, feedback: "add tests" }))
+  );
+  assert.ok(
+    "result" in
+      (await handleSubmitTaskWork(store, {
+        taskId: "t1",
+        agentName: "agent-a",
+        gitBranch: "feat/x",
+        summary: "v2 with tests",
+      }))
+  );
+  assert.equal(store.tasks[0].status, "in_review");
+  assert.equal(store.tasks[0].returnReason, "add tests");
 });
 
 test("computeAgentStats counts live statuses and recorded rejections per agent", () => {

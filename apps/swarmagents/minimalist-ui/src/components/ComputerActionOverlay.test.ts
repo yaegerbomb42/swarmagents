@@ -39,8 +39,22 @@ test("a fresh click renders the ripple at the right framebuffer position", async
   assert.ok(markup.includes('data-testid="computer-action-point"'), "point renders");
   assert.ok(markup.includes(`left:${(640 / 1600) * 100}%`), "left is the x fraction of the framebuffer");
   assert.ok(markup.includes(`top:${(420 / 900) * 100}%`), "top is the y fraction of the framebuffer");
+  assert.ok(markup.includes('data-a1-cursor="click"'), "the point is marked as A1's cursor");
   assert.ok(markup.includes("sa-click-ripple"), "click plays the ripple");
+  assert.ok(markup.includes("A1"), "chip names the cursor's owner");
   assert.ok(markup.includes("Clicking (640, 420)"), "chip names the action and coordinates");
+});
+
+test("coordinates use the action's framebuffer, not a hardcoded screen size", async () => {
+  const { ComputerActionOverlay } = await load();
+  const framebuffer = { width: 1024, height: 768 };
+  const markup = renderToStaticMarkup(
+    h(ComputerActionOverlay, {
+      action: action({ kind: "click", x: 512, y: 192, framebuffer }),
+    }),
+  );
+  assert.ok(markup.includes("left:50%"), "x scales against the action's framebuffer width");
+  assert.ok(markup.includes("top:25%"), "y scales against the action's framebuffer height");
 });
 
 test("a move renders the reticle, not the ripple", async () => {
@@ -60,6 +74,7 @@ test("an action without coordinates renders only the HUD chip", async () => {
   );
   assert.ok(markup.includes('data-testid="computer-action-overlay"'), "overlay renders");
   assert.ok(!markup.includes('data-testid="computer-action-point"'), "no point without coordinates");
+  assert.ok(markup.includes('data-typing-badge="true"'), "typing renders a distinct badge");
   assert.ok(markup.includes("Typing (12 chars)"), "chip names the typing");
   assert.ok(!markup.includes("hunter2"), "chip never carries typed content");
 });

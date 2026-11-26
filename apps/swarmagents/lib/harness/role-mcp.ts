@@ -128,6 +128,22 @@ export const COMPUTER_MCP_SERVER_PATH = "/opt/swarm/computer-mcp/server.mjs";
 export const PLAYWRIGHT_MCP_COMMAND = "playwright-mcp";
 /** Headless, agent-controllable browser server (distinct from desktop Playwright). */
 export const BROWSER_MCP_SERVER_NAME = "browser-mcp";
+/** Env flag the computer-mcp server reads: screenshot returns describe_screen text. */
+export const TEXT_DESKTOP_ENV = "SWARM_TEXT_DESKTOP";
+
+/**
+ * System-prompt tail for text-desktop runs. A model without vision cannot
+ * see images, so it must inspect the screen as text: describe_screen for
+ * the desktop (windows + OCR coordinates) and the accessibility snapshots
+ * for the browser. Screenshot tools are disabled for these runs — calling
+ * them only wastes a turn.
+ */
+export const TEXT_DESKTOP_TAIL =
+  "You are running in text-desktop mode: you cannot see images. To inspect the desktop, call " +
+  "describe_screen — it returns window bounds/centers and OCR text coordinates you can click. " +
+  "To inspect the browser, call browser_snapshot (the page's accessibility tree as text). " +
+  "Never call screenshot or browser_take_screenshot: they are disabled for this run. " +
+  "click, type, key, scroll and open_app work with the coordinates describe_screen returns.";
 
 /** Is desktop mode on for this process? (SWARM_VM_DESKTOP=1) */
 export function desktopModeEnabled(env: Record<string, string | undefined> = process.env): boolean {
@@ -147,14 +163,20 @@ export function atlasEnabled(env: Record<string, string | undefined> = process.e
 /**
  * The concrete --mcp-config entry for a desktop MCP server. Returns null for
  * unknown ids so a role can never wire a server this harness does not ship.
+ * In text-desktop mode the computer-mcp entry carries SWARM_TEXT_DESKTOP=1,
+ * so the server answers `screenshot` with describe_screen text instead of
+ * image bytes (see vm-image-desktop/computer-mcp/server.mjs).
  */
-export function desktopMcpServerEntry(server: string): Record<string, unknown> | null {
+export function desktopMcpServerEntry(
+  server: string,
+  opts: { textDesktop?: boolean } = {},
+): Record<string, unknown> | null {
   if (server === "computer-mcp") {
     return {
       type: "stdio",
       command: "node",
       args: [COMPUTER_MCP_SERVER_PATH],
-      env: { DISPLAY: ":1" },
+      env: { DISPLAY: ":1", ...(opts.textDesktop ? { [TEXT_DESKTOP_ENV]: "1" } : {}) },
     };
   }
   if (server === "playwright-mcp") {
@@ -310,6 +332,12 @@ export function roleMcpConfigJson(
     serverPath?: string;
     catalogPath?: string;
     desktopMode?: boolean;
+    /**
+     * Text-desktop mode (non-vision model): the computer-mcp entry gets
+     * SWARM_TEXT_DESKTOP=1 so `screenshot` answers with describe_screen
+     * text instead of image bytes. Only applies when desktopMode is on.
+     */
+    textDesktop?: boolean;
     /** The catalog role definition backing this phase (custom roles need it). */
     roleDef?: RoleDefinition;
     codebaseRepoRoot?: string;
@@ -429,7 +457,7 @@ export function roleMcpConfigJson(
     const roleDef = opts.roleDef ?? roleDefinitionForId(role.roleId);
     if (roleDef && roleHasDesktopAccess(roleDef)) {
       for (const server of DESKTOP_ROLE_MCP_SERVERS) {
-        const entry = desktopMcpServerEntry(server);
+        const entry = desktopMcpServerEntry(server, { textDesktop: opts.textDesktop });
         if (entry) servers[server] = entry;
       }
     }
@@ -485,6 +513,8 @@ export function roleSeedFiles(
   initialPhase?: RolePhase,
   opts: {
     desktopMode?: boolean;
+    /** Text-desktop mode: prompt tail + SWARM_TEXT_DESKTOP=1 on computer-mcp. */
+    textDesktop?: boolean;
     codebaseRepoRoot?: string;
     extraMcpServers?: Record<string, unknown>;
     atlasEnabled?: boolean;
@@ -526,7 +556,14 @@ export function roleSeedFiles(
 /** Build the harness phase (argv config) for a role. */
 export function rolePhase(
   role: RoleDefinition,
-  opts: { desktopMode?: boolean; mcpConfigPath?: string; tools?: boolean; atlasEnabled?: boolean } = {},
+  opts: {
+    desktopMode?: boolean;
+    mcpConfigPath?: string;
+    tools?: boolean;
+    atlasEnabled?: boolean;
+    /** Text-desktop mode: append the no-vision desktop guidance to the prompt. */
+    textDesktop?: boolean;
+  } = {},
 ): RolePhase {
   // The long-running-work tail rides with every role's instructions (built-in
   // and custom alike) so the agent always runs user-visible work in the
@@ -534,7 +571,13 @@ export function rolePhase(
   // A1 also gets its default operating guidance (identity, tool choice,
   // describe_screen vs screenshot, deliverable verification) on every run.
   const a1Guidance = role.id === DEFAULT_ROLE_ID ? A1_OPERATING_GUIDANCE : "";
-  const appendSystemPrompt = [role.instructions, a1Guidance, LONG_RUNNING_WORK_TAIL, SELF_MANAGE_TAIL]
+  const appendSystemPrompt = [
+    role.instructions,
+    a1Guidance,
+    LONG_RUNNING_WORK_TAIL,
+    SELF_MANAGE_TAIL,
+    ...(opts.textDesktop ? [TEXT_DESKTOP_TAIL] : []),
+  ]
     .filter((part) => part.trim().length > 0)
     .join("\n\n");
   const toolsDisabled = opts.tools === false;

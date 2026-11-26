@@ -22,6 +22,7 @@
 
 import { parseToolArgs, summarizeTool } from "../../vm-image-desktop/computer-mcp/validate.mjs";
 import { checkNavigation, checkNavigationAsync, isLoopbackHost, parseNavigationUrl, lookupAddresses } from "../browser/policy";
+import { isUserDriving } from "../runtime/user-driving";
 import type { RiskDecision } from "./risk";
 import type { TelemetryEvent } from "./types";
 
@@ -62,6 +63,49 @@ export function desktopMcpTool(name: string): string | null {
 const PLAYWRIGHT_NAV_TOOLS = new Set(["browser_navigate"]);
 
 /**
+ * Playwright MCP tools that return a raw screenshot image. The current
+ * @playwright/mcp name is `browser_take_screenshot`; `browser_screen_capture`
+ * is the vision-mode capture tool, and `browser_screenshot` covers older
+ * builds and the browser-mcp alias.
+ */
+const PLAYWRIGHT_SCREENSHOT_TOOLS = new Set([
+  "browser_take_screenshot",
+  "browser_screen_capture",
+  "browser_screenshot",
+]);
+
+/**
+ * Deny reason for a raw screenshot call in text-desktop mode, telling the
+ * model which text inspection tool to use instead. The computer-mcp server
+ * itself maps `screenshot` to describe_screen text when SWARM_TEXT_DESKTOP=1,
+ * so this is the hook-path enforcement; the server mapping covers runs
+ * without the hook.
+ */
+function textDesktopScreenshotReason(server: string): string {
+  if (server === COMPUTER_MCP_SERVER) {
+    return (
+      "screenshots are disabled in text-desktop mode (this model has no vision); " +
+      "call describe_screen instead — it returns window bounds and OCR text coordinates"
+    );
+  }
+  return (
+    "screenshots are disabled in text-desktop mode (this model has no vision); " +
+    "call browser_snapshot instead — it returns the page's accessibility tree as text"
+  );
+}
+
+/** True when a tool-call name is a raw screenshot call (image bytes out). */
+export function isRawScreenshotCall(name: string): boolean {
+  const info = parseMcpToolName(name);
+  if (!info) return false;
+  if (info.server === COMPUTER_MCP_SERVER) return info.tool === "screenshot";
+  if (info.server === PLAYWRIGHT_MCP_SERVER || info.server === BROWSER_MCP_SERVER) {
+    return PLAYWRIGHT_SCREENSHOT_TOOLS.has(info.tool);
+  }
+  return false;
+}
+
+/**
  * Short display text for a playwright interaction target: the human-readable
  * `element` description when given, else the selector/ref, capped so a giant
  * snapshot cannot spill into a telemetry summary.
@@ -84,11 +128,42 @@ function playwrightTarget(args: Record<string, unknown>): string {
  *   servers inside the VM; other private/reserved destinations are denied.
  *   Public destinations go through the same checks in both modes. See
  *   `classifyDesktopToolCallAsync` for the DNS-aware variant.
+ * - Text-desktop mode (`opts.textDesktop`): raw screenshot calls are denied
+ *   — a model without vision cannot use image bytes, and the deny reason
+ *   points it at describe_screen / the accessibility snapshots instead.
+ *   Only pass `textDesktop` from a pre-execution gate (the approval hook):
+ *   the runner's post-hoc re-checks call this without it, so a call the
+ *   server already answered as text never halts the run.
  */
-export function classifyDesktopToolCall(name: string, input: unknown): RiskDecision | null {
+const READ_ONLY_COMPUTER_TOOLS = new Set(["screenshot", "describe_screen", "inspect_ui"]);
+const USER_DRIVING_DENY_REASON = "the user is controlling the desktop; wait or call describe_screen";
+
+export interface ClassifyDesktopOptions {
+  textDesktop?: boolean;
+  userDriving?: boolean;
+  runId?: string;
+}
+
+function isUserControllingDesktop(info: { server: string; tool: string }, opts: ClassifyDesktopOptions): boolean {
+  if (info.server !== COMPUTER_MCP_SERVER || READ_ONLY_COMPUTER_TOOLS.has(info.tool)) return false;
+  return opts.userDriving === true || (typeof opts.runId === "string" && isUserDriving(opts.runId));
+}
+
+export function classifyDesktopToolCall(
+  name: string,
+  input: unknown,
+  opts: ClassifyDesktopOptions = {},
+): RiskDecision | null {
   const info = parseMcpToolName(name);
   if (!info) return null;
   const args = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
+
+  if (opts.textDesktop && isRawScreenshotCall(name)) {
+    return { level: "deny", reason: textDesktopScreenshotReason(info.server) };
+  }
+  if (isUserControllingDesktop(info, opts)) {
+    return { level: "deny", reason: USER_DRIVING_DENY_REASON };
+  }
 
   if (info.server === COMPUTER_MCP_SERVER) {
     const parsed = parseToolArgs(info.tool, args);
@@ -126,10 +201,18 @@ export async function classifyDesktopToolCallAsync(
   name: string,
   input: unknown,
   lookup: (host: string) => Promise<string[]> = lookupAddresses,
+  opts: ClassifyDesktopOptions = {},
 ): Promise<RiskDecision | null> {
   const info = parseMcpToolName(name);
   if (!info) return null;
   const args = input && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
+
+  if (opts.textDesktop && isRawScreenshotCall(name)) {
+    return { level: "deny", reason: textDesktopScreenshotReason(info.server) };
+  }
+  if (isUserControllingDesktop(info, opts)) {
+    return { level: "deny", reason: USER_DRIVING_DENY_REASON };
+  }
 
   if (info.server === COMPUTER_MCP_SERVER) {
     const parsed = parseToolArgs(info.tool, args);
@@ -234,11 +317,19 @@ export function computerActionEvent(
     if (x !== undefined) event.x = x;
     if (y !== undefined) event.y = y;
     const text = s(obj.text);
-    if (text !== undefined) event.text = text;
+    // Never attach clipboard_set text to telemetry (may contain credentials);
+    // for click_text/wait_for_text it is a UI query target, not secret input.
+    if (text !== undefined && info.tool !== "clipboard_set") {
+      if (info.tool === "click_text" || info.tool === "wait_for_text") {
+        event.target = text.slice(0, 80);
+      } else {
+        event.text = text;
+      }
+    }
     const combo = s(obj.combo);
     if (combo !== undefined) event.text = combo;
-    const app = s(obj.name);
-    if (app !== undefined) event.target = app;
+    const app = s(obj.name) ?? s(obj.title);
+    if (app !== undefined) event.target = app.slice(0, 80);
     return event;
   }
 

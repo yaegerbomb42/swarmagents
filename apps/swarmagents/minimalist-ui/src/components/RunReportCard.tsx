@@ -5,9 +5,9 @@
  *
  * Collapsed, it is a single row led by one plain-language sentence (what
  * changed, how long it took, what it cost). Expanded, it loads the report
- * from the runtime API: the audit and verification verdicts, the screenshots,
- * the timeline, the files the run changed (each downloadable), and what the
- * agent could not do.
+ * from the runtime API: the audit and verification verdicts, a playable
+ * desktop replay when one was recorded, the screenshots, the timeline, the
+ * files the run changed (each downloadable), and what the agent could not do.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
@@ -32,6 +32,9 @@ import type { ReportArtifact, ReportCardMeta, ReportStep, RunReport } from "../.
 import type { ThreadEntry } from "../../../lib/client/thread";
 import { Button, IconButton, Loading, Notice } from "./ui";
 import { Card } from "./brand/Card";
+import { DesktopReplay } from "./DesktopReplay";
+import { PlanChecklist } from "./PlanChecklist";
+import { formatPlanSummary } from "../../../lib/run-plan";
 
 const POLL_MS = 2000;
 const MAX_POLLS = 10;
@@ -269,7 +272,8 @@ export function reportSummarySentence(meta: ReportCardMeta, artifacts?: ReportAr
   const body = parts.join(" ");
   const prefix = meta.status === "error" ? "Run failed \u2014 " : meta.status === "cancelled" ? "Run stopped \u2014 " : "";
   const sentence = prefix ? prefix + body.charAt(0).toLowerCase() + body.slice(1) : body;
-  return `${sentence}.`;
+  const plan = meta.plan && meta.plan.total > 0 ? ` ${formatPlanSummary(meta.plan)}.` : "";
+  return `${sentence}.${plan}`;
 }
 
 /** The outcome word shown beside a timeline step, mirroring the visible report. */
@@ -289,6 +293,15 @@ export function buildTranscriptMarkdown(report: RunReport): string {
   const lines: string[] = ["# Run transcript", ""];
   lines.push(`Status: ${report.status}`, "");
   lines.push("## Prompt", "", report.prompt, "");
+  if (report.plan && report.plan.length > 0) {
+    const done = report.plan.filter((step) => step.status === "completed").length;
+    lines.push(`## Plan (${done}/${report.plan.length} completed)`, "");
+    for (const step of report.plan) {
+      const box = step.status === "completed" ? "[x]" : step.status === "in_progress" ? "[~]" : "[ ]";
+      lines.push(`- ${box} ${step.content}`);
+    }
+    lines.push("");
+  }
   lines.push("## Timeline", "");
   if (report.steps.length === 0) {
     lines.push("_No steps recorded._");
@@ -795,6 +808,14 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
                 </div>
               )}
 
+              {report.replay && (
+                <DesktopReplay
+                  runId={report.runId}
+                  width={report.replay.width}
+                  height={report.replay.height}
+                />
+              )}
+
               {shots.length > 0 && (
                 <div>
                   <SectionTitle>Screenshots</SectionTitle>
@@ -892,6 +913,13 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
                   </>
                 )}
               </div>
+
+              {report.plan && report.plan.length > 0 && (
+                <div data-testid="run-report-plan">
+                  <SectionTitle>Plan</SectionTitle>
+                  <PlanChecklist plan={report.plan} defaultOpen />
+                </div>
+              )}
 
               <div>
                 <SectionTitle>Timeline</SectionTitle>

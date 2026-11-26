@@ -156,7 +156,7 @@ function normalizeJsonObject<T>(value: unknown): T | undefined {
 
 function normalizeRunMode(value: unknown): RunModeInfo | undefined {
   if (!isRecord(value)) return undefined;
-  if (value.mode !== "gui" && value.mode !== "text" && value.mode !== "chat") return undefined;
+  if (value.mode !== "gui" && value.mode !== "text" && value.mode !== "text-desktop" && value.mode !== "chat") return undefined;
   const label = typeof value.label === "string" ? value.label : value.mode;
   const reason = typeof value.reason === "string" ? value.reason : "";
   return { ...(value as unknown as RunModeInfo), mode: value.mode, label, reason };

@@ -160,3 +160,43 @@ test("anonymous liveness counts host-env providers without leaking names", async
   }
 });
 
+
+test("the public probe answers signed out with 200/503 JSON, never 401", async () => {
+  // Live, this route sat behind a stale auth layer and returned 401 to the
+  // deploy healthcheck. Both probe forms must be reachable with no session
+  // cookie and no USER_HEADER: liveness returns 200 JSON, readiness returns
+  // 200 or 503 JSON — anything in the 401 family is a regression.
+  process.env.SWARM_HOME = tempDir;
+
+  const live = await GET(liveness());
+  assert.equal(live.status, 200);
+  const liveBody = await live.json();
+  assert.equal(typeof liveBody, "object");
+  assert.equal(liveBody.error, undefined);
+  assert.equal(liveBody.ok, true);
+  assert.equal(liveBody.providersScope, "host-env");
+  assert.equal(typeof liveBody.version, "string");
+  assert.equal(JSON.stringify(liveBody).includes("Sign in required"), false);
+
+  const ready = await GET(request());
+  assert.equal(ready.status, 200);
+  const readyBody = await ready.json();
+  assert.equal(readyBody.ready, true);
+  assert.equal(readyBody.error, undefined);
+  assert.equal(JSON.stringify(readyBody).includes("Sign in required"), false);
+});
+
+test("an anonymous failing readiness probe still gets JSON 503, not 401", async () => {
+  // The degradation signal must survive a broken environment: an unauthenticated
+  // monitor still receives the redacted per-check payload with status 503.
+  const notADir = join(tempDir, "not-a-dir");
+  writeFileSync(notADir, "x");
+  process.env.SWARM_HOME = notADir;
+
+  const res = await GET(request());
+  assert.equal(res.status, 503);
+  assert.notEqual(res.status, 401);
+  const body = await res.json();
+  assert.equal(body.ready, false);
+  assert.equal(body.error, undefined);
+});

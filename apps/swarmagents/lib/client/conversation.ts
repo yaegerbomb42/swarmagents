@@ -8,6 +8,7 @@
  */
 
 import type { RunStreamItem } from "./useRunStream";
+import { applyPlanToolCall, planProgress } from "../run-plan";
 
 export type ConversationEntry =
   | {
@@ -149,6 +150,18 @@ export function describeToolCall(name: string, input: unknown): string {
       const typeTarget = asString(record.target);
       return typeTarget ? `Typing ${short(typeTarget, 60)}` : "Typing on screen";
     }
+    case "TodoWrite": {
+      const plan = applyPlanToolCall([], tool, input);
+      if (!plan || plan.length === 0) return "Updating the plan";
+      const { done, total } = planProgress(plan);
+      return `Updating the plan (${done}/${total} done)`;
+    }
+    case "TaskCreate": {
+      const subject = asString(record.subject);
+      return subject ? `Adding a step: ${short(subject, 60)}` : "Adding a plan step";
+    }
+    case "TaskUpdate":
+      return "Updating a plan step";
     default:
       return `Calling tool: ${short(tool, 40)}`;
   }

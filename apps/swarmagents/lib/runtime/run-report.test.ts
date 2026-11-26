@@ -424,3 +424,30 @@ test("writeShotFile + readShotBytes round-trip image bytes", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("assembleReport carries the agent's final plan and its progress", () => {
+  const steps = (statuses: string[]) =>
+    statuses.map((status, i) => ({ id: String(i + 1), content: `step ${i + 1}`, status }));
+  const events = [
+    seq({ type: "run.created", seq: 1, data: { prompt: "do it", userId: "alice" } }),
+    seq({ type: "run.plan", seq: 2, steps: steps(["in_progress", "pending", "pending"]) }),
+    seq({ type: "run.plan", seq: 3, steps: steps(["completed", "completed", "completed"]) }),
+    seq({ type: "run.finished", seq: 4, exitCode: 0 }),
+  ] as SequencedEvent[];
+  const report = assembleReport({ runId: "run_p", userId: "alice", events, createdAt: 0, finishedAt: 10, artifacts: [], shots: [] });
+  assert.deepEqual(report.meta.plan, { done: 3, total: 3 });
+  assert.equal(report.plan?.length, 3);
+
+  // A run that never planned carries no plan at all (nothing new on the card).
+  const plain = assembleReport({
+    runId: "run_q",
+    userId: "alice",
+    events: [seq({ type: "run.finished", seq: 1, exitCode: 0 })],
+    createdAt: 0,
+    finishedAt: 10,
+    artifacts: [],
+    shots: [],
+  });
+  assert.equal(plain.meta.plan, undefined);
+  assert.equal(plain.plan, undefined);
+});

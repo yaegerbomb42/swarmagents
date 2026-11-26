@@ -11,9 +11,12 @@ import {
   anthropicToOpenAI,
   BridgeValidationError,
   estimateInputTokens,
+  jsonCompletionSuffix,
+  normalizeToolArguments,
   mapStopReason,
   openAIToAnthropicResponse,
   OpenAIStreamTranslator,
+  type AnthropicSseEvent,
 } from "./anthropic-bridge";
 
 const TARGET_MODEL = "mock-openai-model";
@@ -438,8 +441,9 @@ test("OpenAIStreamTranslator: tool_call deltas become tool_use blocks with input
     ],
   });
   all.push(...c2.map((e) => e.event ?? "data"));
-  const deltaArgs = c2.find((e) => e.event === "content_block_delta")!;
-  assert.equal(JSON.parse(deltaArgs.data).delta.type, "input_json_delta");
+  // Arguments are buffered until the block closes: a prefix is never
+  // committed downstream before it is known to be complete.
+  assert.equal(c2.filter((e) => e.event === "content_block_delta").length, 0);
 
   const c3 = translator.push({
     choices: [
@@ -451,6 +455,9 @@ test("OpenAIStreamTranslator: tool_call deltas become tool_use blocks with input
     usage: { prompt_tokens: 10, completion_tokens: 4 },
   });
   const kinds = [...all, ...c3.map((e) => e.event ?? "data"), ...c4.map((e) => e.event ?? "data")];
+  const argDelta = c4.find((e) => e.event === "content_block_delta")!;
+  assert.equal(JSON.parse(argDelta.data).delta.type, "input_json_delta");
+  assert.deepEqual(JSON.parse(JSON.parse(argDelta.data).delta.partial_json), { command: "ls" });
   assert.ok(kinds.includes("message_start"));
   assert.ok(kinds.includes("content_block_start"));
   assert.ok(kinds.includes("content_block_delta"));
@@ -714,4 +721,338 @@ test("anthropicToOpenAI: vision=false replaces user and tool_result images with 
   assert.match(withoutVision.messages[2].content as string, /mediaType=image\/jpeg/);
   // Original input body was not mutated.
   assert.equal((body.messages[0].content[1] as { type: string }).type, "image");
+});
+
+// ---------------------------------------------------------------------------
+// Streaming tool-call repair (core-05): malformed/truncated JSON, missing ids,
+// out-of-order choices and arbitrary junk must never break the SSE stream.
+// ---------------------------------------------------------------------------
+
+interface CollectedTool {
+  id: string;
+  name: string;
+  json: string;
+}
+
+/** Replay the tool_use blocks a client would reconstruct from Anthropic SSE. */
+function toolBlocksFrom(events: AnthropicSseEvent[]): CollectedTool[] {
+  const byIndex = new Map<number, CollectedTool>();
+  for (const event of events) {
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(event.data) as Record<string, unknown>;
+    } catch {
+      assert.fail(`invalid SSE data: ${event.data}`);
+    }
+    const block = data.content_block as Record<string, unknown> | undefined;
+    if (data.type === "content_block_start" && block?.type === "tool_use") {
+      byIndex.set(data.index as number, {
+        id: String(block.id ?? ""),
+        name: String(block.name ?? ""),
+        json: "",
+      });
+    } else if (data.type === "content_block_delta") {
+      const delta = data.delta as Record<string, unknown> | undefined;
+      if (delta?.type === "input_json_delta") {
+        const tool = byIndex.get(data.index as number);
+        if (tool) tool.json += String(delta.partial_json ?? "");
+      }
+    }
+  }
+  return [...byIndex.values()];
+}
+
+function runStream(chunks: unknown[]): AnthropicSseEvent[] {
+  const translator = new OpenAIStreamTranslator();
+  const events: AnthropicSseEvent[] = [];
+  for (const chunk of chunks) events.push(...translator.push(chunk));
+  events.push(...translator.finish());
+  return events;
+}
+
+test("jsonCompletionSuffix completes truncated JSON and rejects garbage", () => {
+  assert.equal(jsonCompletionSuffix('{"a":1'), "}");
+  assert.equal(jsonCompletionSuffix('{"a":"bc'), '"}');
+  assert.equal(jsonCompletionSuffix("[1,2"), "]");
+  assert.equal(jsonCompletionSuffix('{"a":'), "null}");
+  assert.equal(jsonCompletionSuffix(""), "{}");
+  assert.equal(jsonCompletionSuffix("not json"), null);
+  assert.equal(jsonCompletionSuffix('{"a":1} trailing'), null);
+  for (const prefix of ['{"a":"bc', '{"a":1', "[1,2", '{"a":', "", '{"a": tru', '{"x\\"y":"z', "1e", "-"]) {
+    const suffix = jsonCompletionSuffix(prefix);
+    assert.notEqual(suffix, null, `no suffix for ${JSON.stringify(prefix)}`);
+    assert.doesNotThrow(() => JSON.parse(prefix + suffix), `${prefix} + ${suffix} is not JSON`);
+  }
+});
+
+test("OpenAIStreamTranslator synthesizes stable ids and indices for missing tool_call fields", () => {
+  const events = runStream([
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [{ function: { name: "Bash", arguments: '{"a"' } }],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [{ function: { arguments: ":1}" } }],
+          },
+        },
+      ],
+    },
+  ]);
+  const tools = toolBlocksFrom(events);
+  assert.equal(tools.length, 1, "fragments without index must form one tool block");
+  assert.match(tools[0].id, /^call_[0-9a-f-]+$/);
+  assert.equal(tools[0].name, "Bash");
+  assert.deepEqual(JSON.parse(tools[0].json), { a: 1 });
+});
+
+test("OpenAIStreamTranslator picks the primary choice and ignores padding", () => {
+  const events = runStream([
+    {
+      choices: [
+        { index: 1, delta: { content: "wrong" } },
+        { index: 0, delta: { content: "right" } },
+      ],
+    },
+    { choices: [null, { delta: { content: " - second" } }] },
+    { choices: [] }, // usage-only chunk
+  ]);
+  const texts = events
+    .map((event) => JSON.parse(event.data) as Record<string, unknown>)
+    .filter((data) => {
+      const delta = data.delta as Record<string, unknown> | undefined;
+      return data.type === "content_block_delta" && delta?.type === "text_delta";
+    })
+    .map((data) => String((data.delta as Record<string, unknown>).text));
+  assert.deepEqual(texts, ["right", " - second"]);
+  assert.equal(events.filter((e) => JSON.parse(e.data).type === "message_stop").length, 1);
+});
+
+test("OpenAIStreamTranslator survives empty and malformed chunks without throwing", () => {
+  let events: AnthropicSseEvent[] = [];
+  assert.doesNotThrow(() => {
+    events = runStream([
+      null,
+      42,
+      [],
+      {},
+      { choices: null },
+      { choices: [null] },
+      { choices: [{ delta: null }] },
+      { choices: [{ delta: { tool_calls: [null, 7] } }] },
+    ]);
+  });
+  const kinds = events.map((event) => JSON.parse(event.data).type);
+  assert.ok(kinds.includes("message_start"));
+  assert.ok(kinds.includes("message_stop"));
+  for (const tool of toolBlocksFrom(events)) {
+    assert.ok(tool.id.length > 0, "synthesized tool ids are never empty");
+    // A tool with no arguments keeps the `{}` input from content_block_start.
+    if (tool.json.length > 0) assert.doesNotThrow(() => JSON.parse(tool.json));
+  }
+});
+
+/** The text the model sees in-band (notices about neutralized calls). */
+function textFrom(events: AnthropicSseEvent[]): string {
+  return events
+    .map((event) => JSON.parse(event.data) as Record<string, unknown>)
+    .filter((data) => (data.delta as Record<string, unknown> | undefined)?.type === "text_delta")
+    .map((data) => String((data.delta as Record<string, unknown>).text))
+    .join("");
+}
+
+test("OpenAIStreamTranslator never runs a tool with a truncated string argument", () => {
+  // A stream cut off by the length cap mid-command must not become a
+  // different, shorter command.
+  const events = runStream([
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              { index: 0, id: "call_rm", function: { name: "Bash", arguments: '{"command":"rm -rf /home/user/old-bu' } },
+            ],
+          },
+        },
+      ],
+    },
+    { choices: [{ index: 0, delta: {}, finish_reason: "length" }], usage: { prompt_tokens: 5, completion_tokens: 9 } },
+  ]);
+  const tools = toolBlocksFrom(events);
+  assert.equal(tools[0].id, "call_rm");
+  assert.deepEqual(JSON.parse(tools[0].json), {}, "truncated input is neutralized, not completed");
+  assert.match(textFrom(events), /Bash \(call_rm\) was not run with its arguments: the provider cut the arguments off/);
+  const stop = events.map((e) => JSON.parse(e.data)).find((d) => d.type === "message_delta");
+  assert.equal(stop.delta.stop_reason, "max_tokens");
+});
+
+test("OpenAIStreamTranslator neutralizes a Write whose content was cut off", () => {
+  const events = runStream([
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              { index: 0, id: "call_1", function: { name: "Write", arguments: '{"path":"/tmp/a","content":"hi' } },
+            ],
+          },
+        },
+      ],
+    },
+  ]);
+  const tools = toolBlocksFrom(events);
+  assert.deepEqual(JSON.parse(tools[0].json), {});
+  assert.match(textFrom(events), /Write \(call_1\)/);
+});
+
+test("OpenAIStreamTranslator closes a prefix that only lacks closing braces", () => {
+  const events = runStream([
+    {
+      choices: [
+        {
+          index: 0,
+          delta: { tool_calls: [{ index: 0, id: "c", function: { name: "Read", arguments: '{"file_path":"/a.ts","opts":{"x":true}' } }] },
+        },
+      ],
+    },
+  ]);
+  assert.deepEqual(JSON.parse(toolBlocksFrom(events)[0].json), { file_path: "/a.ts", opts: { x: true } });
+  assert.equal(textFrom(events), "", "a lossless repair needs no notice");
+});
+
+test("OpenAIStreamTranslator escapes raw newlines inside strings losslessly", () => {
+  const events = runStream([
+    {
+      choices: [
+        { index: 0, delta: { tool_calls: [{ index: 0, id: "c", function: { name: "Write", arguments: '{"content":"a\nb"}' } }] } },
+      ],
+    },
+  ]);
+  assert.deepEqual(JSON.parse(toolBlocksFrom(events)[0].json), { content: "a\nb" });
+});
+
+test("normalizeToolArguments: only lossless repairs are applied", () => {
+  assert.deepEqual(normalizeToolArguments('{"a":1}'), { json: '{"a":1}' });
+  assert.deepEqual(normalizeToolArguments('{"a":[1,2]'), { json: '{"a":[1,2]}' });
+  assert.deepEqual(normalizeToolArguments('{"a":"x"'), { json: '{"a":"x"}' });
+  assert.deepEqual(normalizeToolArguments('{"timeout":12'), { json: "{}", problem: "truncated" });
+  assert.deepEqual(normalizeToolArguments('{"a":"bc'), { json: "{}", problem: "truncated" });
+  assert.deepEqual(normalizeToolArguments('{"a": tru'), { json: "{}", problem: "truncated" });
+  assert.deepEqual(normalizeToolArguments('{"a":'), { json: "{}", problem: "truncated" });
+  assert.deepEqual(normalizeToolArguments("garbage"), { json: "{}", problem: "malformed" });
+  assert.deepEqual(normalizeToolArguments(""), { json: "{}" });
+  assert.deepEqual(normalizeToolArguments({ a: 1 }), { json: '{"a":1}' });
+});
+
+test("OpenAIStreamTranslator emits a ping while a long tool call is buffered", () => {
+  const translator = new OpenAIStreamTranslator();
+  translator.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "w", function: { name: "Write", arguments: "" } }] } }] });
+  (translator as unknown as { lastEventAt: number }).lastEventAt = 0;
+  const quiet = translator.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"content":"' } }] } }] });
+  assert.deepEqual(quiet.map((e) => e.event), ["ping"]);
+  const next = translator.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "more" } }] } }] });
+  assert.deepEqual(next, [], "pings are paced, not sent per chunk");
+});
+
+test("OpenAIStreamTranslator falls back to safe JSON for unusable tool arguments", () => {
+  const events = runStream([
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              { index: 0, id: "call_2", function: { name: "Bash", arguments: "not json at all" } },
+            ],
+          },
+        },
+      ],
+    },
+  ]);
+  const tools = toolBlocksFrom(events);
+  assert.deepEqual(JSON.parse(tools[0].json), {});
+});
+
+test("OpenAIStreamTranslator fuzz: random tool argument fragments always yield parseable SSE", () => {
+  let seed = 0x2f6e2b1;
+  const rand = (): number => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed;
+  };
+  const alphabet = ["{", "}", "[", "]", '"', ":", ",", "\\", "a", "1", " ", "t", "r", "u", "e", "n", "f", "/", "x", "\n"];
+  for (let run = 0; run < 250; run += 1) {
+    const translator = new OpenAIStreamTranslator();
+    const events: AnthropicSseEvent[] = [];
+    const fragments: string[] = [];
+    const count = 1 + (rand() % 4);
+    for (let k = 0; k < count; k += 1) {
+      let fragment = "";
+      const length = 1 + (rand() % 12);
+      for (let j = 0; j < length; j += 1) fragment += alphabet[rand() % alphabet.length]!;
+      fragments.push(fragment);
+      events.push(
+        ...translator.push({
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  { index: 0, id: "call_fuzz", function: { name: "Fuzz", arguments: fragment } },
+                ],
+              },
+            },
+          ],
+        }),
+      );
+    }
+    events.push(...translator.finish());
+    for (const event of events) {
+      assert.doesNotThrow(() => JSON.parse(event.data), `invalid SSE data: ${event.data}`);
+    }
+    const tools = toolBlocksFrom(events);
+    assert.equal(tools.length, 1, `run ${run}: expected one tool block`);
+    assert.equal(tools[0].id, "call_fuzz");
+    assert.doesNotThrow(
+      () => JSON.parse(tools[0].json),
+      `run ${run}: bad args ${JSON.stringify(fragments)} -> ${tools[0].json}`,
+    );
+  }
+});
+
+test("openAIToAnthropicResponse: malformed tool arguments fall back to objects, missing ids are synthesized", () => {
+  const out = openAIToAnthropicResponse(
+    {
+      choices: [
+        {
+          index: 0,
+          message: {
+            content: null,
+            tool_calls: [
+              { function: { name: "Bash", arguments: '{"a":' } },
+              { id: "call_z", function: { name: "Read", arguments: "garbage" } },
+            ],
+          },
+        },
+      ],
+    },
+    TARGET_MODEL,
+  );
+  const tools = (out.content as Record<string, unknown>[]).filter((block) => block.type === "tool_use");
+  assert.equal(tools.length, 2);
+  assert.match(tools[0].id as string, /^call_[0-9a-f-]+$/);
+  assert.equal(tools[1].id, "call_z");
+  // '{"a":' is truncated: neutralized rather than guessed as { a: null }.
+  assert.deepEqual(tools[0].input, {});
+  assert.deepEqual(tools[1].input, {});
 });

@@ -43,6 +43,7 @@ import type { SettingsTab } from "./components/Settings";
 import { SettingsSheet } from "./components/SettingsSheet";
 import { ShortcutsHelp } from "./components/ShortcutsHelp";
 import { useToasts } from "./components/Toasts";
+import { HandoffBanner } from "./components/dashboard/HandoffBanner";
 import { ScreenFrame } from "./components/dashboard/ScreenFrame";
 import { Button, Loading, Notice, type SegmentOption } from "./components/ui";
 import type { Attachment } from "./data";
@@ -316,6 +317,33 @@ export default function App() {
     }
   }, [session.signedOut, openSettings, setView]);
 
+  // Desktop handoff (ask_human_desktop): the run is paused and the user must
+  // act on the VM desktop. The banner lives above the workspace in every
+  // view — the handoff card in the chat stream can scroll out of reach, and
+  // the agent waiting is invisible from the board or the chat otherwise.
+  const pendingHandoff = session.handoffs[0];
+  const [handingBack, setHandingBack] = useState(false);
+
+  const handleHandoffTakeControl = useCallback(() => {
+    if (session.signedOut) {
+      openSettings("account");
+      return;
+    }
+    // The runtime paused the agent for the handoff, so a control-mode takeover
+    // grants immediately (the takeover session treats a paused agent as a safe
+    // point); if the VM is asleep the wake path runs first and the takeover
+    // request is re-asserted once the screen is live.
+    void handleOpenLiveDesktop().then(() => setTakingOver(true));
+  }, [session.signedOut, openSettings, handleOpenLiveDesktop]);
+
+  const handleHandoffHandBack = useCallback(async () => {
+    if (!pendingHandoff || handingBack) return;
+    setHandingBack(true);
+    const ok = await session.handBack(pendingHandoff.id);
+    setHandingBack(false);
+    if (!ok) pushToast({ tone: "error", message: "Could not hand the desktop back. Try again." });
+  }, [pendingHandoff, handingBack, session, pushToast]);
+
   const handleResetVm = useCallback(async (): Promise<string | undefined> => {
     setVmResetting(true);
     const result = await resetVm();
@@ -472,6 +500,18 @@ export default function App() {
         <Notice tone="warn" title="Cannot reach the server" className="mx-3 mt-3 z-20" testId="offline-notice">
           Retrying. Anything already running keeps going.
         </Notice>
+      )}
+
+      {pendingHandoff && !session.signedOut && (
+        <div className="mx-3 mt-3 z-20 sm:mx-4">
+          <HandoffBanner
+            handoff={pendingHandoff}
+            total={session.handoffs.length}
+            handingBack={handingBack}
+            onTakeControl={handleHandoffTakeControl}
+            onHandBack={() => void handleHandoffHandBack()}
+          />
+        </div>
       )}
 
       {/* The bottom padding grows below sm: the composer — and its

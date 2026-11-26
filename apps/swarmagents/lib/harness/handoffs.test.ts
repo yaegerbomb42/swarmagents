@@ -159,3 +159,21 @@ test("handoffs: decided handoffs older than the retention bound are pruned from 
   store.create({ runId: "r2", userId: "u2", reason: "new" });
   assert.equal(store.get(old.id), undefined);
 });
+
+test("handoffs: create adopts the VM server's handoff id so the resolution reaches the same rendezvous file", () => {
+  const store = makeStore();
+  const vmId = "h_0c9aa2e0-1111-4222-8333-444455556666";
+  const h = store.create({ id: vmId, runId: "r1", userId: "u1", reason: "SSO redirect loop" });
+  assert.equal(h.id, vmId, "the VM desktop-handoff server polls <id>.answer.json by this id");
+  const resolved = store.resolve(vmId);
+  assert.equal(resolved?.status, "answered");
+  assert.equal(store.get(vmId)?.status, "answered");
+});
+
+test("handoffs: a per-handoff TTL override bounds the wait independently of the default", () => {
+  const store = makeStore(() => 2_000_000);
+  const short = store.create({ runId: "r1", userId: "u1", reason: "quick", ttlMs: 60_000 });
+  assert.equal(short.expiresAt, 2_060_000);
+  const long = store.create({ runId: "r1", userId: "u1", reason: "slow" });
+  assert.equal(long.expiresAt, 2_000_000 + 30 * 60 * 1000, "no override keeps the 30-minute default");
+});

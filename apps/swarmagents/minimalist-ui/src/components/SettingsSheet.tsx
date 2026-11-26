@@ -11,7 +11,8 @@
  */
 
 import React, { useCallback, useEffect, useState } from "react";
-import { Globe, RotateCcw, Trash2 } from "lucide-react";
+import Link from "next/link";
+import { ClipboardList, Globe, Keyboard, Plug, RotateCcw, Trash2 } from "lucide-react";
 import type { ProviderConfig } from "../data";
 import type { SampleTask } from "../lib/sampleTasks";
 import { DEFAULT_AGENT_CARD } from "../data";
@@ -309,6 +310,9 @@ export function AgentSettings({
 
 const TABS: SettingsTab[] = ["providers", "agent", "computers", "memory", "account"];
 
+const FOOTER_ROW =
+  "flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left text-[13px] font-medium text-sa-fg2 transition-colors hover:bg-sa-hover hover:text-sa-fg";
+
 export interface SettingsSheetProps extends AgentSettingsProps {
   open: boolean;
   onClose: () => void;
@@ -321,6 +325,14 @@ export interface SettingsSheetProps extends AgentSettingsProps {
   onAlwaysOn247Change?: (value: boolean) => void;
   /** Dispatch a sample task through the normal run path (Account tab replay). */
   onRunSample?: (sample: SampleTask) => Promise<{ ok: boolean; error?: string }>;
+  /** Dev mode is on: the board row appears in the footer. */
+  devMode?: boolean;
+  /** Open tasks waiting on the board (shown next to the board row). */
+  boardOpenCount?: number;
+  /** Open the board slide-over (dev mode only). */
+  onOpenBoard?: () => void;
+  /** Open the keyboard-shortcuts help panel. */
+  onOpenShortcuts?: () => void;
 }
 
 export function SettingsSheet({
@@ -332,6 +344,10 @@ export function SettingsSheet({
   serverProviderCount,
   onAlwaysOn247Change,
   onRunSample,
+  devMode = false,
+  boardOpenCount,
+  onOpenBoard,
+  onOpenShortcuts,
   ...agent
 }: SettingsSheetProps) {
   return (
@@ -350,6 +366,45 @@ export function SettingsSheet({
         serverProviderCount={serverProviderCount}
         onAlwaysOn247Change={onAlwaysOn247Change}
         onRunSample={onRunSample}
+        footer={
+          <div className="space-y-0.5" data-testid="settings-more">
+            <button
+              type="button"
+              data-testid="settings-shortcuts"
+              onClick={() => {
+                onClose();
+                onOpenShortcuts?.();
+              }}
+              className={FOOTER_ROW}
+            >
+              <Keyboard className="h-4 w-4 shrink-0" aria-hidden />
+              Keyboard shortcuts
+            </button>
+            <Link href="/connectors" data-testid="settings-connectors" className={FOOTER_ROW}>
+              <Plug className="h-4 w-4 shrink-0" aria-hidden />
+              Connectors
+            </Link>
+            {devMode && (
+              <button
+                type="button"
+                data-testid="settings-board"
+                onClick={() => {
+                  onClose();
+                  onOpenBoard?.();
+                }}
+                className={FOOTER_ROW}
+              >
+                <ClipboardList className="h-4 w-4 shrink-0" aria-hidden />
+                Board
+                {boardOpenCount !== undefined && (
+                  <span className="ml-auto text-[12px] font-normal text-sa-fg3">
+                    {boardOpenCount} open
+                  </span>
+                )}
+              </button>
+            )}
+          </div>
+        }
       />
     </Sheet>
   );

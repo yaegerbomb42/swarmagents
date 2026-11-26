@@ -8,7 +8,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { RUN_PHASE_META, type RunPhase } from "../../../lib/client/runPhase";
 import type { ConversationEntry } from "../../../lib/client/conversation";
 import type { ToolEntry } from "../../../lib/client/turns";
 import { countOf, installBrowserStubs, makeBoard, makeEntry, makeSession, makeTask, tagOf } from "../testing/harness";
@@ -19,9 +18,8 @@ const noop = () => {};
 /** Components are imported after the browser stubs are in place. */
 async function load() {
   installBrowserStubs();
-  const [composer, header, conversation, board, history, settings, screen, brandPill] = await Promise.all([
+  const [composer, conversation, board, history, settings, screen, brandPill] = await Promise.all([
     import("./Composer"),
-    import("./Header"),
     import("./Conversation"),
     import("./BoardPanel"),
     import("./HistoryPanel"),
@@ -29,7 +27,7 @@ async function load() {
     import("./dashboard/ScreenFrame"),
     import("./brand/StatusPill"),
   ]);
-  return { ...composer, ...header, ...conversation, ...board, ...history, ...settings, ...screen, ...brandPill };
+  return { ...composer, ...conversation, ...board, ...history, ...settings, ...screen, ...brandPill };
 }
 
 // ---- Flow B: the composer ----
@@ -138,73 +136,7 @@ test("the composer is labelled and offers Send only when there is something to s
   assert.match(tagOf(signedOut, "attach-button"), /disabled=""/);
 });
 
-// ---- Flow A: run status, Stop, and the screen ----
-
-test("the run indicator names every phase, and offers Stop exactly while the agent is busy", async () => {
-  const { RunIndicator, RUN_TONE_TO_PILL } = await load();
-  const render = (phase: RunPhase | null) =>
-    renderToStaticMarkup(
-      h(RunIndicator, { phase, since: Date.now() - 5000, activity: "Running npm test", stopping: false, onStop: noop, onShow: noop }),
-    );
-
-  assert.equal(render(null), "", "no run, no indicator");
-  for (const phase of Object.keys(RUN_PHASE_META) as RunPhase[]) {
-    const html = render(phase);
-    const meta = RUN_PHASE_META[phase];
-    assert.match(tagOf(html, "run-indicator"), new RegExp(`data-phase="${phase}"`));
-    assert.ok(html.includes(`>${meta.label}<`) || html.includes(`${meta.label}</span>`), `${phase} shows "${meta.label}"`);
-    assert.match(html, new RegExp(`data-tone="${RUN_TONE_TO_PILL[meta.tone]}"`));
-    // The brand pill pulses while the agent is busy, and sits still once done.
-    assert.equal(html.includes("animate-pulse"), meta.active, `live pulse for ${phase}`);
-    assert.equal(countOf(html, 'data-testid="stop-run"'), meta.active ? 1 : 0, `Stop for ${phase}`);
-    // What the agent is doing is said while it works; the other phases already say what is going on.
-    assert.equal(countOf(html, 'data-testid="run-activity"'), phase === "running" ? 1 : 0, `activity for ${phase}`);
-  }
-  assert.match(render("running"), /role="status"/);
-});
-
-test("Stop shows it is working while the request is in flight", async () => {
-  const { RunIndicator } = await load();
-  const html = renderToStaticMarkup(h(RunIndicator, { phase: "running", stopping: true, onStop: noop, onShow: noop }));
-  assert.match(tagOf(html, "stop-run"), /disabled=""/);
-  assert.match(tagOf(html, "stop-run"), /aria-busy="true"/);
-});
-
-test("the header keeps the conversation, the views, the run and settings in one row", async () => {
-  const { Header } = await load();
-  const views = [
-    { id: "chat" as const, label: "Chat" },
-    { id: "screen" as const, label: "Screen" },
-    { id: "board" as const, label: "Board", count: 3 },
-  ];
-  const props = {
-    title: "Fix the login redirect",
-    onOpenHistory: noop,
-    onNewChat: noop,
-    newChatDisabled: false,
-    views,
-    view: "screen" as const,
-    onView: noop,
-    run: { phase: "approval" as const, since: Date.now(), stopping: false, onStop: noop, onShow: noop },
-    onOpenSettings: noop,
-    onOpenShortcuts: noop,
-    settingsNeedsAttention: true,
-  };
-
-  for (const wide of [true, false]) {
-    const html = renderToStaticMarkup(h(Header, { ...props, wide }));
-    assert.match(html, /Fix the login redirect/);
-    for (const view of views) assert.equal(countOf(html, `data-testid="view-${view.id}"`), 1, `${view.id} (wide: ${wide})`);
-    assert.match(tagOf(html, "view-screen"), /aria-selected="true"/);
-    assert.match(html, /aria-label="3 open"/, "the board tab counts open tasks");
-    assert.match(html, /Needs approval/);
-    assert.equal(countOf(html, 'data-testid="stop-run"'), 1, "Stop stays in the header in every view");
-    assert.equal(countOf(html, 'data-testid="open-settings"'), 1);
-  }
-
-  const busy = renderToStaticMarkup(h(Header, { ...props, wide: true, newChatDisabled: true }));
-  assert.match(tagOf(busy, "new-chat"), /disabled=""/);
-});
+// ---- Flow A: run status and the screen ----
 
 test("the screen reports its state in the same dot-and-word vocabulary as a run", async () => {
   const { screenStatus, screenPillStatus, fitStageScale } = await load();
@@ -830,4 +762,46 @@ test("settings open on providers, with the agent's run settings one tab away", a
   assert.match(tagOf(asking, "reset-vm"), /disabled=""/, "the VM cannot be reset under a running agent");
 
   assert.equal(renderToStaticMarkup(h(SettingsSheet, { ...props, open: false, initialTab: "agent" as const })), "");
+});
+
+test("settings carries shortcuts, connectors and (in dev mode) the board in its footer", async () => {
+  const { SettingsSheet } = await load();
+  const props = {
+    open: true,
+    onClose: noop,
+    providers: [],
+    setProviders: noop,
+    serverProviderCount: 0,
+    fullAuto: true,
+    onFullAutoChange: noop,
+    agentCard: "Be brief.",
+    onAgentCardChange: noop,
+    compute: {
+      loaded: true,
+      computers: [],
+      cloud: { capacity: 1, inUse: 0, full: false },
+      freeTier: false,
+      defaultTarget: "cloud",
+      target: "cloud",
+      setTarget: noop,
+      byocDefault: false,
+    },
+    busy: false,
+    onResetVm: async () => undefined,
+    onOpenBoard: noop,
+    onOpenShortcuts: noop,
+  };
+
+  const plain = renderToStaticMarkup(h(SettingsSheet, { ...props, initialTab: "providers" as const }));
+  assert.equal(countOf(plain, 'data-testid="settings-more"'), 1);
+  assert.equal(countOf(plain, 'data-testid="settings-shortcuts"'), 1);
+  assert.equal(countOf(plain, 'data-testid="settings-connectors"'), 1);
+  assert.match(plain, /href="\/connectors"/, "connectors links out to the catalog");
+  assert.equal(countOf(plain, 'data-testid="settings-board"'), 0, "no board row without dev mode");
+
+  const dev = renderToStaticMarkup(
+    h(SettingsSheet, { ...props, initialTab: "providers" as const, devMode: true, boardOpenCount: 3 }),
+  );
+  assert.equal(countOf(dev, 'data-testid="settings-board"'), 1, "the board row appears in dev mode");
+  assert.match(dev, /3 open/, "the board row counts open tasks");
 });

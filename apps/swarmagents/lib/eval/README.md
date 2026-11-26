@@ -60,6 +60,34 @@ a grading `test` (node:test, run with `node --test` in the run dir), the
 the starting code, passes on the solution, and fails on the broken
 variant — a task that does not satisfy all three is rejected by the test.
 
+## Multi-provider real-task desktop eval
+
+`provider-tasks.ts` / `provider-runner.ts` / `provider-report.ts` are a
+separate eval aimed at the core product loop: *Claude Code + SwarmAgents
+solving general tasks across user-supplied providers*. While `suite.ts`
+benchmarks **harness configurations** (A/B, scripted transcripts), the
+provider eval benchmarks **tasks** (coding, web, file organization, GUI
+apps, non-vision desktop) and records completion rate, turns, tokens, and
+wall-clock **per provider**.
+
+```bash
+# CI-safe deterministic run (scripted executors), provisions a FakeVmDriver:
+npx tsx tools/eval-provider/run.ts --providers anthropic,openai --vm fake --out eval-out
+# Local/manual: use a real Docker desktop VM (not available in CI):
+npx tsx tools/eval-provider/run.ts --providers anthropic --vm docker
+```
+
+- The runner isolates every trial in a fresh temp dir (same `LocalTempIsolation`
+  contract as the harness A/B eval) and grades with the same `node --test`
+  grading step, so the metric pipeline is identical.
+- Providing a `VmDriver` (FakeVmDriver in CI, DockerVmDriver locally) makes the
+  runner also provision each trial into the VM and verify the VM ends in the
+  solved state — the "runnable against FakeVmDriver / Docker desktop VM"
+  path.
+- A `ScriptedProviderExecutor` replays a deterministic solve per task for
+  stable CI/tests. A live executor can implement the same `ProviderExecutor`
+  interface against the real runtime.
+
 ## Relation to the capability-atlas eval
 
 `lib/capability-atlas/eval` benchmarks capability *retrieval* accuracy

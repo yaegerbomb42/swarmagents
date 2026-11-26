@@ -219,6 +219,8 @@ implicitly. Same suite, same graders:
 | --- | ---: | ---: | ---: | ---: |
 | nvidia/nemotron-3.5-lightning-30b-a3b (before) | 0/3 | 18.0 | 182,124 | 33.9 |
 | nvidia/nemotron-3.5-lightning-30b-a3b (after) | 3/3 | 12.7 | 116,941 | 16.9 |
+| mercury (before) | 3/3 | 13.7 | 129,932 | 21.1 |
+| mercury (after) | 3/3 | 9.7 | 101,372 | 13.4 |
 
 ## Relation to the capability-atlas eval
 

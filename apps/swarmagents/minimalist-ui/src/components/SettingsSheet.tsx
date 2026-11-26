@@ -13,6 +13,7 @@
 import React, { useState } from "react";
 import { RotateCcw } from "lucide-react";
 import type { ProviderConfig } from "../data";
+import type { SampleTask } from "../lib/sampleTasks";
 import { DEFAULT_AGENT_CARD } from "../data";
 import { MAX_AGENT_CARD_LEN } from "../../../lib/client/runs";
 import { cn } from "../utils/cn";
@@ -203,6 +204,8 @@ export interface SettingsSheetProps extends AgentSettingsProps {
   serverProviderCount: number;
   /** Notified when the 24/7 always-on toggle loads or changes (header badge). */
   onAlwaysOn247Change?: (value: boolean) => void;
+  /** Dispatch a sample task through the normal run path (Account tab replay). */
+  onRunSample?: (sample: SampleTask) => Promise<{ ok: boolean; error?: string }>;
 }
 
 export function SettingsSheet({
@@ -213,6 +216,7 @@ export function SettingsSheet({
   setProviders,
   serverProviderCount,
   onAlwaysOn247Change,
+  onRunSample,
   ...agent
 }: SettingsSheetProps) {
   return (
@@ -230,6 +234,7 @@ export function SettingsSheet({
         setProviders={setProviders}
         serverProviderCount={serverProviderCount}
         onAlwaysOn247Change={onAlwaysOn247Change}
+        onRunSample={onRunSample}
       />
     </Sheet>
   );

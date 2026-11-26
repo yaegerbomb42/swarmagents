@@ -164,6 +164,13 @@ test("a fresh zero-provider account is routed to provider setup (FIX-43)", () =>
 
   // Signed out has its own notice and blocked reason; setup never stacks on it.
   assert.deepEqual(firstRunSetup({ ...fresh, signedOut: true }), { needsProvider: false, firstRun: false });
+
+  // The account already completed the onboarding sample: the wizard never
+  // reappears (Settings keeps the replay entry instead).
+  assert.deepEqual(firstRunSetup({ ...fresh, firstRunCompleted: true }), {
+    needsProvider: true,
+    firstRun: false,
+  });
 });
 
 test("an established zero-provider account is blocked but not routed (FIX-43)", () => {

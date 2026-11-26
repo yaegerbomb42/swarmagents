@@ -716,3 +716,60 @@ test("forwardLlmNonStreaming: strips image blocks when routed model lacks vision
   assert.equal(typeof sentMessages[0].content, "string");
   assert.match(sentMessages[0].content as string, /\[image omitted: this model has no vision\]/);
 });
+
+test("forwardLlmNonStreaming: an unknown/future Claude on the Anthropic wire keeps its images", async () => {
+  const bus = memoryBus();
+  let capturedBody: Record<string, unknown> | undefined;
+  const { fetchImpl } = stubFetch([
+    {
+      prefix: "https://anthropic.example",
+      respond: (init) => {
+        capturedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        return new Response(
+          JSON.stringify({
+            id: "msg_1",
+            type: "message",
+            role: "assistant",
+            model: "claude-opus-5",
+            content: [{ type: "text", text: "a cat" }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 10, output_tokens: 2 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    },
+  ]);
+
+  await forwardLlmNonStreaming({
+    owner: owner(),
+    runId: "run-future-claude-vision",
+    bus: bus as unknown as TelemetryBus,
+    providers: [
+      provider({
+        id: "anthropic",
+        kind: "anthropic",
+        baseUrl: "https://anthropic.example",
+        models: { balanced: "claude-opus-5" },
+      }),
+    ],
+    body: {
+      model: "claude-opus-5",
+      max_tokens: 128,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+          ],
+        },
+      ],
+    },
+    fetchImpl: fetchImpl as unknown as typeof fetch,
+  });
+
+  const sent = (capturedBody?.messages ?? []) as { content: { type: string }[] }[];
+  assert.ok(Array.isArray(sent[0]?.content), "content stays a block list");
+  assert.equal(sent[0].content[1]?.type, "image", "the screenshot reaches the model");
+});

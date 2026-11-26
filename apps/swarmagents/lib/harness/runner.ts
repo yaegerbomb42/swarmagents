@@ -63,6 +63,7 @@ import {
 import { isRoleListTool, isRoleSwitchTool } from "./role-mcp";
 import { isAskUserTool, parseAskUserArguments } from "./ask-mcp";
 import { isDesktopHandoffTool, parseDesktopHandoffArguments } from "./desktop-handoff-mcp";
+import { isFanOutWorkersTool, parseFanOutArguments } from "./fanout-mcp";
 import { classifyDesktopToolCallAsync, computerActionEvent, isDesktopMcpCall } from "./computer-mcp";
 import {
   ContextGovernor,
@@ -905,6 +906,17 @@ export class ClaudeCodeRunner {
                   void gates.enqueue(async () => {
                     if (haltedReason !== null) return;
                     await this.gateHandoff(request, handoff, emit, redact);
+                  }, { onError: haltOnGateError });
+                }
+              }
+
+              if (isFanOutWorkersTool(name) && request.fanOutGateway && haltedReason === null) {
+                const fanOut = parseFanOutArguments(input);
+                const gateway = request.fanOutGateway;
+                if (fanOut) {
+                  void gates.enqueue(async () => {
+                    if (haltedReason !== null) return;
+                    await gateway(fanOut);
                   }, { onError: haltOnGateError });
                 }
               }

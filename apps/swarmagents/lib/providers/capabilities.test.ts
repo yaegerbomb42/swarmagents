@@ -136,3 +136,26 @@ test("a saved maxOutputTokens override wins over the preset", () => {
   );
   assert.equal(merged.maxOutputTokens, 2_048);
 });
+
+test("anthropic preset: unknown or future Claude names keep vision; legacy text-only ones do not", () => {
+  for (const model of ["claude-opus-5", "claude-sonnet-5-20270101", "claude-x", "claude-5-haiku"]) {
+    const caps = presetModelCapabilities("anthropic", model);
+    assert.equal(caps.vision, true, `${model} must not be blinded`);
+    assert.equal(caps.computerUse, true, `${model} keeps computer use`);
+  }
+  assert.equal(presetModelCapabilities("anthropic", "claude-3-5-sonnet-20241022").computerUse, true);
+  assert.equal(presetModelCapabilities("anthropic", "claude-3-opus-20240229").vision, true);
+  assert.equal(presetModelCapabilities("anthropic", "claude-3-opus-20240229").computerUse, false);
+  for (const model of ["claude-2.1", "claude-instant-1.2", "claude-2"]) {
+    assert.equal(presetModelCapabilities("anthropic", model).vision, false, `${model} is text-only`);
+  }
+});
+
+test("router preset: hosted vision families keep vision behind an unknown provider id", () => {
+  for (const model of ["anthropic/claude-sonnet-4.5", "claude-opus-5", "openai/gpt-4o", "gpt-5-mini", "google/gemini-2.5-pro"]) {
+    assert.equal(presetModelCapabilities("openrouter", model).vision, true, model);
+  }
+  for (const model of ["deepseek/deepseek-chat", "qwen/qwen3-coder", "anthropic/claude-2.1", "meta-llama/llama-3.1-70b"]) {
+    assert.equal(presetModelCapabilities("openrouter", model).vision, false, model);
+  }
+});

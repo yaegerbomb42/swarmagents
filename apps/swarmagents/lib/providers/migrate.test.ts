@@ -97,3 +97,21 @@ test("an invalid legacy file is reported and left alone", async () => {
   assert.equal(migrateLegacyProviders({ env: {} }).status, "invalid-file");
   assert.equal(fs.existsSync(legacyFile), true);
 });
+
+test("providers.example.json migrates keyless and disabled, exactly as DEPLOY.md says", async () => {
+  await signupLocalUser(OWNER, "a-long-password-1");
+  const example = fs.readFileSync(new URL("../../providers.example.json", import.meta.url), "utf-8");
+  fs.writeFileSync(legacyFile, example);
+  const result = migrateLegacyProviders({ env: { ITERACOMPUTE_API_KEY: "sk-env-not-used", EXAONE_API_KEY: "sk-env-not-used" } });
+  assert.equal(result.status, "migrated");
+  const owner = readConfiguredProviders(OWNER_ID);
+  assert.deepEqual(owner.map((p) => p.id), ["iteracompute", "exaone"]);
+  for (const entry of owner) {
+    // envKeys are dropped and env keys are never copied in: the owner adds
+    // the key per account after migration.
+    assert.deepEqual(entry.keys, [], `${entry.id} arrives keyless`);
+    assert.equal(entry.envKeys, undefined, `${entry.id} carries no envKeys`);
+    // Shipped disabled so an unedited copy never routes to a placeholder id.
+    assert.equal(entry.enabled, false, `${entry.id} ships disabled`);
+  }
+});

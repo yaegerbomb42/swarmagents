@@ -142,3 +142,17 @@ test("memoryRecallForPrompt caps auto-recall at AUTO_MEMORY_TOKEN_BUDGET (300 to
   assert.ok(recalled.tokens <= AUTO_MEMORY_TOKEN_BUDGET, `expected <= ${AUTO_MEMORY_TOKEN_BUDGET}, got ${recalled.tokens}`);
   assert.ok(recalled.text.length > 0);
 });
+
+test("auto-recall skips a fact too long for the budget and keeps filling with smaller ones", async () => {
+  // Ranked first (the query term dominates it) but ~400 tokens on its own.
+  await writeMemory(ALICE, { fact: `TypeScript ${"typescript ".repeat(150)}`, tags: ["preference"] });
+  await writeMemory(ALICE, { fact: "Prefers TypeScript strict mode", tags: ["preference"] });
+  await writeMemory(ALICE, { fact: "Runs TypeScript tests before pushing", tags: ["preference"] });
+  const hits = await searchMemories(ALICE, "typescript");
+  assert.ok(hits[0].fact.length > 1200, "the oversized fact is the top hit");
+  const recalled = await memoryRecallForPrompt(ALICE, "typescript", { budgetTokens: AUTO_MEMORY_TOKEN_BUDGET });
+  assert.ok(recalled.tokens <= AUTO_MEMORY_TOKEN_BUDGET);
+  assert.equal(recalled.count, 2, "both short facts are injected despite the oversized one");
+  assert.match(recalled.text, /strict mode/);
+  assert.match(recalled.text, /tests before pushing/);
+});

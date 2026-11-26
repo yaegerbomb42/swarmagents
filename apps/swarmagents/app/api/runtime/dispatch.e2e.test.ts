@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { POST } from "./tasks/route";
 import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
-import * as fx from "./dispatch-fixtures";
+import * as fx from "./dispatch-fixtures.test";
 
 const USER = "e2e-dispatch";
 

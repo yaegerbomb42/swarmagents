@@ -91,8 +91,12 @@ export interface ModelCapabilities {
   source?: "preset" | "discovery" | "override";
 }
 
-/** GUI = desktop + computer tools, text = headless sandbox tools, chat = no tools. */
-export type RunMode = "gui" | "text" | "chat";
+/**
+ * GUI = desktop + computer tools, text = headless sandbox tools,
+ * text-desktop = desktop tools driven through text (describe_screen +
+ * accessibility snapshots) for models without vision, chat = no tools.
+ */
+export type RunMode = "gui" | "text" | "text-desktop" | "chat";
 
 /**
  * How multiple racing providers are started.

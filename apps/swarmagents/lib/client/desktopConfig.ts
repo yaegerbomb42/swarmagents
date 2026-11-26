@@ -1,3 +1,5 @@
+import { DEFAULT_AGENT_ID, isValidAgentId } from "../vm/agent-keys";
+
 /**
  * desktopConfig.ts — the single place the browser's live-desktop endpoint
  * paths live.
@@ -46,6 +48,10 @@ export const DESKTOP_FRAME_HEIGHT = 900;
  * `runId` tags the viewer's session with the run it is watching, so the proxy
  * can attach its frame recording to that run's report. The proxy validates the
  * id and the caller's ownership; it never trusts this hint for authorization.
+ *
+ * `agentId` selects which agent's desktop to watch: the proxy serves that
+ * agent's own VM. The default agent (A1) is the omission — its desktop is
+ * the per-user VM, so no param is sent for it.
  */
 function desktopProxyHost(host: string): string {
   // In local Next.js dev (127.0.0.1:3777 / localhost:3777 without nginx),
@@ -60,11 +66,16 @@ export function desktopWsUrl(
   location: { protocol: string; host: string } = globalThis.location,
   clientId?: string,
   runId?: string,
+  agentId?: string,
 ): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const client = clientId ? `&client=${encodeURIComponent(clientId)}` : "";
   const run = runId && /^[A-Za-z0-9_-]{1,64}$/.test(runId) ? `&run=${encodeURIComponent(runId)}` : "";
-  return `${proto}//${desktopProxyHost(location.host)}${DESKTOP_WS_PATH}?mode=${mode}${client}${run}`;
+  const agent =
+    agentId && agentId !== DEFAULT_AGENT_ID && isValidAgentId(agentId)
+      ? `&agent=${encodeURIComponent(agentId)}`
+      : "";
+  return `${proto}//${desktopProxyHost(location.host)}${DESKTOP_WS_PATH}?mode=${mode}${client}${run}${agent}`;
 }
 
 /** Build the takeover-state poll URL for a client id. */

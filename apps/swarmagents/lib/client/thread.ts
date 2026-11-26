@@ -14,6 +14,8 @@ export interface ThreadRunInput {
   prompt?: string;
   finalText?: string;
   status?: string;
+  /** The agent this run belongs to (default "a1"); the UI dials its desktop. */
+  agentId?: string;
   /** Where the run executed (cloud pool or a paired computer). */
   compute?: ThreadRunCompute;
   /** Why the run is paused (currently only when its computer went offline). */
@@ -39,6 +41,8 @@ export interface ThreadEntry {
   runId: string;
   prompt: string;
   finalText?: string;
+  /** The agent this run belongs to (default "a1"); the UI dials its desktop. */
+  agentId?: string;
   status: ThreadStatus;
   compute?: ThreadRunCompute;
   pausedReason?: "computer_offline" | "user";
@@ -135,6 +139,7 @@ export function mergeThreadEntries(
       runId,
       prompt: nonEmpty(run.prompt) ?? prev?.prompt ?? "",
       finalText: nonEmpty(run.finalText) ?? prev?.finalText,
+      agentId: nonEmpty(run.agentId) ?? prev?.agentId,
       status: asStatus(run.status ?? prev?.status),
       compute: run.compute ?? prev?.compute,
       pausedReason: run.pausedReason ?? prev?.pausedReason,

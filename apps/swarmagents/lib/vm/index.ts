@@ -161,3 +161,22 @@ export {
   type VmManagerOptions,
   type VmDiskUsage,
 } from "./manager";
+export {
+  AgentVmAllocator,
+  AgentVmCapError,
+  DEFAULT_AGENT_ID,
+  SWARM_VM_MAX_AGENT_VMS_ENV,
+  SWARM_VM_AGENT_IDLE_MIN_ENV,
+  AGENT_ID_RE,
+  agentOwnerKey,
+  containerNameForAgent,
+  isDefaultAgent,
+  isValidAgentId,
+  resolveAgentVmConfig,
+  validateAgentId,
+  type AgentVmAllocation,
+  type AgentVmAllocateResult,
+  type AgentVmAllocatorOptions,
+  type AgentVmConfig,
+  type AgentVmStartTaskResult,
+} from "./agent-allocation";

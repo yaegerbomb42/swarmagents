@@ -698,6 +698,7 @@ export default function App() {
               showDesktop={polledVm.desktop}
               logs={NO_LOGS}
               runId={session.liveRunId}
+              agentId={activeRun?.agentId}
               runActive={Boolean(phaseMeta?.active && activeRun)}
               vmState={vmDisplay.state}
               vmResetting={vmResetting}

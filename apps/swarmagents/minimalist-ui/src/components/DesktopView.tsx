@@ -78,6 +78,11 @@ export interface DesktopViewProps {
   runActive?: boolean;
   /** Run to tag this viewer's session with, so its frames can be replayed. */
   runId?: string;
+  /**
+   * The agent whose desktop this view shows (default "a1"). The proxy dials
+   * that agent's own VM; omit for A1's desktop (the per-user VM).
+   */
+  agentId?: string;
   /** Stop the live agent run from the control-mode banner (optional). */
   onStopRun?: () => void;
   /**
@@ -284,6 +289,7 @@ export function DesktopView({
   vmResetting = false,
   runActive = false,
   runId,
+  agentId,
   onStopRun,
   embedded = false,
   control,
@@ -321,6 +327,7 @@ export function DesktopView({
   const modeRef = useRef<DesktopControlMode>(mode);
   const intentRef = useRef(intentControl);
   const replayRunRef = useRef(runId);
+  const agentRef = useRef(agentId);
   // Stable takeover identity for this mount: the server keys control to it
   // across the reconnect-to-switch dials and the state poll.
   const clientIdRef = useRef("");
@@ -417,7 +424,7 @@ export function DesktopView({
       dialStartedRef.current = performance.now();
       rfb = new RFB(
         target,
-        desktopWsUrl(wantsControl ? "control" : "view", undefined, clientIdRef.current, runId),
+        desktopWsUrl(wantsControl ? "control" : "view", undefined, clientIdRef.current, runId, agentId),
         { shared: true },
       );
     } catch {
@@ -559,6 +566,15 @@ export function DesktopView({
     teardown();
     dispatch({ type: "retry-now" });
   }, [runId, teardown]);
+
+  // A different agent means a different desktop: re-dial so the proxy
+  // serves the new agent's VM.
+  useEffect(() => {
+    if (agentRef.current === agentId) return;
+    agentRef.current = agentId;
+    teardown();
+    dispatch({ type: "retry-now" });
+  }, [agentId, teardown]);
 
   // Grant/handback on the live socket: flip noVNC's input gate in step
   // with the effective mode (the proxy enforces the same server-side).

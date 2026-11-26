@@ -40,6 +40,11 @@ export interface ScreenFrameProps {
   showDesktop: boolean;
   logs: LogEvent[];
   runId?: string;
+  /**
+   * The agent whose desktop the screen shows (default "a1"). The proxy
+   * dials that agent's own VM; omit for A1's desktop.
+   */
+  agentId?: string;
   runActive: boolean;
   /** VM display state (kept for callers that already computed it). */
   vmState?: string;
@@ -145,6 +150,7 @@ export function ScreenFrame({
   showDesktop,
   logs,
   runId,
+  agentId,
   runActive,
   vmState: _vmState,
   vmResetting,
@@ -306,6 +312,7 @@ export function ScreenFrame({
         <VmScreen
           logs={logs}
           runId={runId}
+          agentId={agentId}
           activeView={activeView}
           onToggleView={onToggleView}
           onResetVm={() => undefined}

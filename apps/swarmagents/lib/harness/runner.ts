@@ -429,6 +429,14 @@ export class ClaudeCodeRunner {
     /** Cumulative usage from the final `result` event, used when no assistant usage arrived. */
     let resultUsage: UsageTotals | null = null;
     let sawAssistantUsage = false;
+    /**
+     * Claude Code streams one assistant event per content block, each
+     * repeating its message's usage. Usage is emitted once per message id
+     * (later blocks add only a positive delta), and `emittedUsage` tracks
+     * what went out so the final result totals can reconcile the sum.
+     */
+    const usageByMessage = new Map<string, UsageTotals>();
+    const emittedUsage: UsageTotals = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
     let malformedLines = 0;
     let streamTruncated = false;
     let stderrTail = "";
@@ -509,8 +517,21 @@ export class ClaudeCodeRunner {
       if (resultUsageEmitted) return;
       resultUsageEmitted = true;
       const finalUsage = resultUsage as UsageTotals | null;
-      if (finalUsage && !sawAssistantUsage) {
+      if (!finalUsage) return;
+      if (!sawAssistantUsage) {
         emit({ type: "usage", ...finalUsage });
+        return;
+      }
+      // Per-message usage is a streaming snapshot (output often 0 or 1);
+      // the result line holds the CLI's real cumulative totals. Top the
+      // emitted sum up to them so summaries add up to the CLI's numbers.
+      const delta: UsageTotals = {
+        inputTokens: Math.max(0, finalUsage.inputTokens - emittedUsage.inputTokens),
+        outputTokens: Math.max(0, finalUsage.outputTokens - emittedUsage.outputTokens),
+        cachedTokens: Math.max(0, finalUsage.cachedTokens - emittedUsage.cachedTokens),
+      };
+      if (delta.inputTokens + delta.outputTokens + delta.cachedTokens > 0) {
+        emit({ type: "usage", ...delta, final: true });
       }
     };
 
@@ -922,9 +943,31 @@ export class ClaudeCodeRunner {
               }
             }
           }
-          const usage = parseUsage(message.usage);
-          if (usage) {
-            sawAssistantUsage = true;
+          const parsedUsage = parseUsage(message.usage);
+          // A later content block of an already-counted message adds only
+          // what grew since its last snapshot (usually nothing).
+          const messageId = typeof message.id === "string" && message.id ? message.id : undefined;
+          const previous = messageId ? usageByMessage.get(messageId) : undefined;
+          if (messageId && parsedUsage) {
+            usageByMessage.set(messageId, {
+              inputTokens: Math.max(parsedUsage.inputTokens, previous?.inputTokens ?? 0),
+              outputTokens: Math.max(parsedUsage.outputTokens, previous?.outputTokens ?? 0),
+              cachedTokens: Math.max(parsedUsage.cachedTokens, previous?.cachedTokens ?? 0),
+            });
+          }
+          const usage: UsageTotals | null =
+            parsedUsage && previous
+              ? {
+                  inputTokens: Math.max(0, parsedUsage.inputTokens - previous.inputTokens),
+                  outputTokens: Math.max(0, parsedUsage.outputTokens - previous.outputTokens),
+                  cachedTokens: Math.max(0, parsedUsage.cachedTokens - previous.cachedTokens),
+                }
+              : parsedUsage;
+          if (parsedUsage) sawAssistantUsage = true;
+          if (usage && usage.inputTokens + usage.outputTokens + usage.cachedTokens > 0) {
+            emittedUsage.inputTokens += usage.inputTokens;
+            emittedUsage.outputTokens += usage.outputTokens;
+            emittedUsage.cachedTokens += usage.cachedTokens;
             // The assistant message names the model actually generating; carry
             // it on the usage event so summaries can fill a model gap left by
             // a run.started that arrived without one.

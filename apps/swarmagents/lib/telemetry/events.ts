@@ -327,6 +327,8 @@ export function adaptSequencedEventsToRunEvents(
 
     switch (event.type) {
       case "usage": {
+        // The end-of-run top-up to the CLI's totals is accounting, not a turn.
+        if (field(event, "final") === true) break;
         turn += 1;
         const usage = readUsage(event);
         const ms =

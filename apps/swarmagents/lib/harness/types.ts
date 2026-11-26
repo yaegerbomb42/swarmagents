@@ -68,7 +68,11 @@ export type TelemetryEvent =
    */
   | { type: "tool.started"; name: string; id?: string }
   | { type: "tool.result"; id?: string; ok: boolean; truncated: boolean; output: string }
-  | { type: "usage"; inputTokens: number; outputTokens: number; cachedTokens?: number; model?: string }
+  /**
+   * Token usage. Normally one per assistant message. `final: true` marks the
+   * end-of-run top-up to the CLI's result totals (not a model turn).
+   */
+  | { type: "usage"; inputTokens: number; outputTokens: number; cachedTokens?: number; model?: string; final?: boolean }
   | {
       type: "run.finished";
       exitCode: number;

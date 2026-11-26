@@ -5,9 +5,9 @@
  *
  * Collapsed, it is a single row led by one plain-language sentence (what
  * changed, how long it took, what it cost). Expanded, it loads the report
- * from the runtime API: the audit and verification verdicts, the screenshots,
- * the timeline, the files the run changed (each downloadable), and what the
- * agent could not do.
+ * from the runtime API: the audit and verification verdicts, a playable
+ * desktop replay when one was recorded, the screenshots, the timeline, the
+ * files the run changed (each downloadable), and what the agent could not do.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
@@ -32,6 +32,7 @@ import type { ReportArtifact, ReportCardMeta, ReportStep, RunReport } from "../.
 import type { ThreadEntry } from "../../../lib/client/thread";
 import { Button, IconButton, Loading, Notice } from "./ui";
 import { Card } from "./brand/Card";
+import { DesktopReplay } from "./DesktopReplay";
 
 const POLL_MS = 2000;
 const MAX_POLLS = 10;
@@ -793,6 +794,14 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
                     )}
                   </div>
                 </div>
+              )}
+
+              {report.replay && (
+                <DesktopReplay
+                  runId={report.runId}
+                  width={report.replay.width}
+                  height={report.replay.height}
+                />
               )}
 
               {shots.length > 0 && (

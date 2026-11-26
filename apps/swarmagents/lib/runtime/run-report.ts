@@ -31,10 +31,11 @@ import { DESKTOP_DISPLAY } from "../vm/docker-driver";
 import { WORKSPACE_ROOT } from "../vm/files";
 import type { VmManager } from "../vm/manager";
 import type { BrowserControl } from "../browser/manager";
-import { classifyCostProvenance } from "./run-report-types";
+import { classifyCostProvenance, DESKTOP_REPLAY_FILE } from "./run-report-types";
 import type {
   ReportArtifact,
   ReportCardMeta,
+  ReportReplayMeta,
   ReportShotMeta,
   ReportStatus,
   ReportStep,
@@ -620,6 +621,8 @@ export interface ReportInputs {
   finishedAt: number;
   artifacts: ReportArtifact[];
   shots: ReportShotMeta[];
+  /** Frame-recorder replay attached at finalize time, when one exists. */
+  replay?: ReportReplayMeta;
   /** Best-effort extras (can be omitted; defaults derive from events). */
   prompt?: string;
   finalText?: string;
@@ -756,6 +759,7 @@ export function assembleReport(inputs: ReportInputs): RunReport {
     steps: steps ?? buildReportSteps(events),
     artifacts: inputs.artifacts,
     shots: inputs.shots,
+    ...(inputs.replay ? { replay: inputs.replay } : {}),
     meta,
     ...(tokenAccounting ? { tokenAccounting } : {}),
   };
@@ -839,6 +843,20 @@ export function readShotBytes(
   try {
     const bytes = fs.readFileSync(path.join(shotsDir(runsDir!, runId), shot.file));
     return { bytes, mime: shot.mime, name: shot.file };
+  } catch {
+    return null;
+  }
+}
+
+/** Read a run's stored desktop replay bytes, or null when it has none. */
+export function readReplayBytes(
+  runId: string,
+  runsDir: string | null = getRunsDir(),
+): Buffer | null {
+  const report = readRunReport(runId, runsDir);
+  if (!report?.replay || report.replay.file !== DESKTOP_REPLAY_FILE || !runsDir) return null;
+  try {
+    return fs.readFileSync(path.join(reportDir(runsDir, runId), DESKTOP_REPLAY_FILE));
   } catch {
     return null;
   }

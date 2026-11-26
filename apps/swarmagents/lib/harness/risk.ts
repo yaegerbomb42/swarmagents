@@ -33,6 +33,13 @@ export interface RiskDecision {
   level: RiskLevel;
   /** Short human-readable reason the level was chosen (for the approval UI). */
   reason: string;
+  /**
+   * The deny is only about malformed arguments that the tool itself rejects
+   * (computer-mcp validates with the same parser), so nothing would run.
+   * The post-hoc gate must not halt the run on it: the model sees the tool's
+   * error and corrects the call, as it does through the approval hook.
+   */
+  malformed?: true;
 }
 
 /** Hosts the agent is trusted to talk to without asking. */

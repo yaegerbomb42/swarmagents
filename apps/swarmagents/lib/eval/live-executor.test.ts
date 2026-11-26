@@ -13,6 +13,9 @@ import { LiveProviderExecutor, LocalProcessExec, buildLiveEnv, foldLiveTelemetry
 import { ProviderEvalRunner } from "./provider-runner";
 import { LocalTempIsolation } from "./runner";
 import { PROVIDER_EVAL_TASKS } from "./provider-tasks";
+import { xtermApp } from "./provider-tasks-desktop";
+import { missingDesktopBinaries } from "./desktop-session";
+import { existsSync } from "node:fs";
 import { renderProviderMarkdownTable } from "./provider-report";
 
 const KEY = "sk-live-eval-test-key-9f8e7d6c5b4a";
@@ -30,7 +33,7 @@ const TASK = PROVIDER_EVAL_TASKS.find((t) => t.id === "coding-fix-rate-limiter")
 const FAKE_CLAUDE = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const argv = process.argv.slice(2);
 const model = argv[argv.indexOf("--model") + 1];
 const solution = JSON.parse(fs.readFileSync(path.join(__dirname, "solution.json"), "utf8"));
@@ -46,6 +49,20 @@ fs.writeFileSync(path.join(__dirname, "last-env.json"), JSON.stringify({
   leakedHostVar: process.env.SWARM_EVAL_HOST_SECRET !== undefined,
   maxTurns: argv[argv.indexOf("--max-turns") + 1],
 }));
+// Desktop runs: record the wiring and prove the task's windows are up.
+const mcpAt = argv.indexOf("--mcp-config");
+if (mcpAt >= 0) {
+  const mcp = JSON.parse(fs.readFileSync(argv[mcpAt + 1], "utf8"));
+  const display = mcp.mcpServers["computer-mcp"].env.DISPLAY;
+  fs.writeFileSync(path.join(__dirname, "last-desktop.json"), JSON.stringify({
+    mcp,
+    allowedTools: argv[argv.indexOf("--allowedTools") + 1],
+    settings: JSON.parse(fs.readFileSync(path.join(process.env.CLAUDE_CONFIG_DIR, "settings.json"), "utf8")),
+    betaWindow: spawnSync("xdotool", ["search", "--name", "^beta$"], { env: { ...process.env, DISPLAY: display } }).status === 0,
+  }));
+  out({ type: "assistant", message: { id: "d1", model, content: [{ type: "tool_use", id: "c1", name: "mcp__computer-mcp__click", input: { x: 5, y: 5 } }], usage: usage(10, 1) } });
+  out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "c1", content: "Clicked\neffect: NO visible change after 1.0s; focused window unchanged" }] } });
+}
 out({ type: "system", subtype: "init", session_id: "s1", model });
 out({ type: "assistant", message: { id: "m1", model, content: [{ type: "text", text: "My key is " + (process.env.ANTHROPIC_AUTH_TOKEN || "") }], usage: usage(1000, 50) } });
 if (model === "fake-crash") { process.stderr.write("boom: provider said no\n"); process.exit(3); }
@@ -213,3 +230,30 @@ test("LocalProcessExec returns the exit code and streams stdout", async () => {
   assert.equal(res.exitCode, 7);
   assert.equal(out, "hi");
 });
+
+test(
+  "a desktop task boots Xvfb with its windows, wires only computer-mcp, folds desktop metrics, and tears down",
+  { skip: missingDesktopBinaries().length > 0 ? `needs ${missingDesktopBinaries().join(", ")}` : false },
+  async (t) => {
+    const { dir, bin, isoRoot, logDir } = await setup(t);
+    const task = { ...TASK, id: "desktop-wiring", desktop: { apps: [xtermApp("beta", undefined, "40x5+0+0")] } };
+    const runner = new ProviderEvalRunner({ isolation: new LocalTempIsolation(isoRoot), executor: executor(bin, logDir), mode: "live" });
+    const [trial] = await runner.runSuite([{ providerId: "gw", model: "fake-pass" }], { tasks: [task] });
+    assert.equal(trial.resolved, true, JSON.stringify(trial));
+
+    const seen = JSON.parse(await readFile(path.join(dir, "last-desktop.json"), "utf8"));
+    assert.equal(seen.betaWindow, true, "the task's window exists while the agent runs");
+    assert.equal(seen.allowedTools, "mcp__computer-mcp");
+    const server = seen.mcp.mcpServers["computer-mcp"];
+    assert.match(server.args[0], /vm-image-desktop\/computer-mcp\/server\.mjs$/);
+    assert.match(server.env.DISPLAY, /^:\d+$/);
+    assert.deepEqual(seen.settings.permissions.allow, ["mcp__computer-mcp"]);
+    for (const tool of ["Bash", "Write", "Edit", "Read"]) assert.ok(seen.settings.permissions.deny.includes(tool), tool);
+    assert.notEqual(seen.settings.permissions.defaultMode, "acceptEdits");
+
+    assert.deepEqual(trial.desktop, { computerActions: 1, noChangeEffects: 1, loopNudges: 0 });
+    const n = server.env.DISPLAY.slice(1);
+    for (let i = 0; i < 30 && existsSync(`/tmp/.X${n}-lock`); i++) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(existsSync(`/tmp/.X${n}-lock`), false, "Xvfb is gone after the trial");
+  },
+);

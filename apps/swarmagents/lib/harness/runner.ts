@@ -783,6 +783,10 @@ export class ClaudeCodeRunner {
                       halt(verdict === "expired" ? "approval timed out" : "approval denied by user");
                     }
                   }, { onError: haltOnGateError });
+                } else if (decision.level === "deny" && decision.malformed) {
+                  // Malformed computer-mcp arguments: the server rejects the
+                  // call with the same validator and the model retries. Halting
+                  // here ended live desktop evals on one typo (core-36).
                 } else if (decision.level === "deny" && haltedReason === null) {
                   halt(decision.reason);
                   emit({ type: "tool.blocked", name, reason: decision.reason });

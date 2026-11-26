@@ -15,6 +15,7 @@ import { LocalTempIsolation } from "./runner";
 import { HARD_PROVIDER_EVAL_TASKS, PROVIDER_EVAL_TASKS, STANDARD_PROVIDER_EVAL_TASKS } from "./provider-tasks";
 import { ScriptedProviderExecutor } from "./provider-executor";
 import { selectTasks } from "../../tools/eval-provider/run";
+import { DESKTOP_PROVIDER_EVAL_TASKS } from "./provider-tasks-desktop";
 
 const spec: ProviderSpec = { providerId: "scripted", model: "model-x" };
 
@@ -35,7 +36,7 @@ test("task ids are unique and the hard set is part of the suite", () => {
   for (const task of HARD_PROVIDER_EVAL_TASKS) assert.equal(task.difficulty, "hard", task.id);
 });
 
-for (const task of PROVIDER_EVAL_TASKS) {
+for (const task of [...PROVIDER_EVAL_TASKS, ...DESKTOP_PROVIDER_EVAL_TASKS]) {
   test(`${task.id}: the reference solution passes its verifier`, async (t) => {
     const { trial } = await (await runner(t, false)).runTrial(task, spec, 1);
     assert.equal(trial.resolved, true, JSON.stringify(trial.grading));
@@ -65,4 +66,16 @@ test("--tasks accepts the set names hard and standard alongside ids", () => {
     selectTasks(["coding-fix-rate-limiter", "coding-lru-ttl-cache"]).map((t) => t.id),
     ["coding-fix-rate-limiter", "coding-lru-ttl-cache"],
   );
+});
+
+test("desktop tasks are opt-in: only --tasks desktop (or their ids) selects them", () => {
+  assert.equal(DESKTOP_PROVIDER_EVAL_TASKS.length, 3);
+  for (const task of DESKTOP_PROVIDER_EVAL_TASKS) assert.ok(task.desktop, task.id);
+  assert.equal(PROVIDER_EVAL_TASKS.some((t) => t.desktop), false, "never in the default suite");
+  assert.deepEqual(
+    selectTasks(["desktop"]).map((t) => t.id),
+    DESKTOP_PROVIDER_EVAL_TASKS.map((t) => t.id),
+  );
+  assert.equal(selectTasks(["hard", "standard"]).some((t) => t.desktop), false);
+  assert.deepEqual(selectTasks(["desktop-read-code-from-screen"]).map((t) => t.id), ["desktop-read-code-from-screen"]);
 });

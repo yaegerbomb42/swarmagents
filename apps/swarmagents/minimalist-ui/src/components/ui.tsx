@@ -303,7 +303,7 @@ export function Sheet({
   return (
     <div className="fixed inset-0 z-50 flex" data-testid={testId}>
       <div
-        className="sa-fade absolute inset-0 bg-black/60"
+        className="sa-fade absolute inset-0 bg-black/55 backdrop-blur-sm"
         onClick={onClose}
         aria-hidden
         data-testid={testId ? `${testId}-backdrop` : undefined}
@@ -314,7 +314,7 @@ export function Sheet({
         aria-modal="true"
         aria-label={title}
         className={cn(
-          "relative flex h-full w-full flex-col border-sa-line bg-sa-panel shadow-2xl outline-none",
+          "relative flex h-full w-full flex-col border-white/[0.12] bg-zinc-950/80 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.14),0_24px_64px_rgba(0,0,0,0.65)] backdrop-blur-2xl backdrop-saturate-150 outline-none",
           widthClass,
           side === "right" ? "sa-sheet-right ml-auto sm:border-l" : "sa-sheet-left mr-auto sm:border-r",
         )}

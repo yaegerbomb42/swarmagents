@@ -256,9 +256,9 @@ export function Composer({
         onDrop={onDrop}
         data-testid="composer-drop-zone"
           className={cn(
-            "glass-2 composer-ring rounded-[24px] transition-all",
-            dragging ? "border-[var(--brand-signal)] shadow-[0_0_24px_rgba(0,208,240,0.25)]" : "",
-            hero && "shadow-[0_24px_64px_-18px_rgba(0,0,0,0.9)]",
+            "glass-2 composer-ring rounded-[22px] border border-white/[0.12] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.14),0_20px_50px_rgba(0,0,0,0.55)] backdrop-blur-2xl transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] focus-within:border-white/25 focus-within:ring-1 focus-within:ring-white/10",
+            dragging ? "border-sky-300/50 ring-2 ring-sky-300/25 shadow-[0_0_24px_rgba(56,189,248,0.25)]" : "",
+            hero && "shadow-[inset_0_1px_0_0_rgba(255,255,255,0.16),0_24px_64px_-18px_rgba(0,0,0,0.9)]",
           )}
       >
         {attachments.length > 0 && (
@@ -267,7 +267,7 @@ export function Composer({
               <li
                 key={attachment.id}
                 data-testid="attachment-chip"
-                className="flex max-w-full items-center gap-2 rounded-lg border border-sa-line bg-sa-raised py-1 pl-1 pr-1"
+                className="flex max-w-full items-center gap-2 rounded-xl border border-white/[0.12] bg-white/[0.06] py-1 pl-1 pr-1.5 backdrop-blur-xl"
               >
                 {attachment.kind === "image" && attachment.url ? (
                   // eslint-disable-next-line @next/next/no-img-element
@@ -317,25 +317,36 @@ export function Composer({
           >
             <Paperclip className="h-4 w-4" aria-hidden />
           </IconButton>
-          <textarea
-            ref={textRef}
-            data-testid="composer-input"
-            value={draft}
-            onChange={(event) => {
-              setDraft(event.target.value);
-              if (error) setError(undefined);
-            }}
-            onKeyDown={onKeyDown}
-            onPaste={onPaste}
-            rows={hero ? 2 : 1}
-            readOnly={sending}
-            disabled={blocked}
-            aria-label="Message the agent"
-            aria-busy={sending || undefined}
-            placeholder={placeholder}
-            enterKeyHint="send"
-            className="sa-scroll sa-framed-field min-h-9 flex-1 resize-none bg-transparent px-1.5 py-2 text-base leading-5 text-sa-fg placeholder:text-sa-fg3 disabled:cursor-not-allowed sm:text-sm"
-          />
+          <div className="relative flex-1">
+            <textarea
+              ref={textRef}
+              data-testid="composer-input"
+              value={draft}
+              onChange={(event) => {
+                setDraft(event.target.value);
+                if (error) setError(undefined);
+              }}
+              onKeyDown={onKeyDown}
+              onPaste={onPaste}
+              rows={hero ? 2 : 1}
+              readOnly={sending}
+              disabled={blocked}
+              aria-label="Message the agent"
+              aria-busy={sending || undefined}
+              placeholder={placeholder}
+              enterKeyHint="send"
+              className="sa-scroll sa-framed-field block min-h-9 w-full resize-none bg-transparent px-1.5 py-2 text-base leading-5 text-sa-fg placeholder:text-sa-fg3 disabled:cursor-not-allowed sm:text-sm"
+            />
+            {draft.length === 0 && !busy && !blocked && (
+              <span
+                aria-hidden
+                className="pointer-events-none hidden sm:inline-flex items-center gap-[3px] absolute right-2 top-2 font-mono text-[10.5px] text-white/30"
+              >
+                <kbd className="rounded-[4px] border border-white/[0.1] bg-white/[0.04] px-1 py-[1px]">⌘</kbd>
+                <kbd className="rounded-[4px] border border-white/[0.1] bg-white/[0.04] px-1 py-[1px]">↵</kbd>
+              </span>
+            )}
+          </div>
           <button
             type="button"
             data-testid="composer-send"

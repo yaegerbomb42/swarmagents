@@ -24,6 +24,8 @@ import {
   type ProviderSpec,
 } from "../../lib/eval/index";
 import { LiveProviderExecutor, type LiveProviderConfig } from "../../lib/eval/live-executor";
+import { missingDesktopBinaries } from "../../lib/eval/desktop-session";
+import { DESKTOP_PROVIDER_EVAL_TASKS } from "../../lib/eval/provider-tasks-desktop";
 import type { ProviderKind } from "../../lib/providers/types";
 import { FakeVmDriver } from "../../lib/vm/fake-driver";
 
@@ -33,6 +35,8 @@ export interface LiveCliOptions {
   claudeBin?: string;
   maxTurns: number;
   timeoutS: number;
+  /** Desktop tasks: computer-mcp screenshot returns text (non-vision models). */
+  textDesktop?: boolean;
 }
 
 export interface CliOptions {
@@ -46,9 +50,9 @@ export interface CliOptions {
 }
 
 const USAGE =
-  "Usage: tsx tools/eval-provider/run.ts [--providers a,b] [--trials N] [--out DIR] [--vm none|fake|docker] [--tasks id,id|hard|standard]\n" +
+  "Usage: tsx tools/eval-provider/run.ts [--providers a,b] [--trials N] [--out DIR] [--vm none|fake|docker] [--tasks id,id|hard|standard|desktop]\n" +
   "  live: --live --model M (--key-env VAR [--base-url URL] [--kind anthropic|openai|gemini] | --claude-bin WRAPPER)\n" +
-  "        [--provider-id LABEL] [--max-turns N] [--timeout-s S]";
+  "        [--provider-id LABEL] [--max-turns N] [--timeout-s S] [--text-desktop]";
 
 const KINDS: readonly ProviderKind[] = ["anthropic", "openai", "gemini"];
 
@@ -68,6 +72,7 @@ export function parseArgs(argv: string[]): CliOptions {
   let providerId: string | undefined;
   let maxTurns = 30;
   let timeoutS = 600;
+  let textDesktop = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const next = argv[i + 1];
@@ -90,6 +95,9 @@ export function parseArgs(argv: string[]): CliOptions {
       opts.tasks = next.split(",").map((s) => s.trim()).filter(Boolean);
     } else if (arg === "--live") {
       live = true;
+      continue;
+    } else if (arg === "--text-desktop") {
+      textDesktop = true;
       continue;
     } else if (arg === "--base-url" && next) {
       baseUrl = next;
@@ -122,7 +130,7 @@ export function parseArgs(argv: string[]): CliOptions {
     const provider: LiveProviderConfig = keyEnv
       ? { kind, keyEnv, ...(baseUrl ? { baseUrl } : {}) }
       : { kind: "preconfigured" };
-    opts.live = { provider, model, maxTurns, timeoutS, ...(claudeBin ? { claudeBin } : {}) };
+    opts.live = { provider, model, maxTurns, timeoutS, ...(claudeBin ? { claudeBin } : {}), ...(textDesktop ? { textDesktop } : {}) };
     opts.vm = "none";
     opts.providers = [{ providerId: providerId ?? hostLabel(baseUrl) ?? (keyEnv ? kind : "wrapper"), model }];
   }
@@ -155,6 +163,13 @@ async function main(): Promise<number> {
     console.error(`--tasks matched nothing. Known: ${PROVIDER_EVAL_TASKS.map((t) => t.id).join(", ")}`);
     return 2;
   }
+  if (opts.live && tasks.some((t) => t.desktop)) {
+    const missing = missingDesktopBinaries();
+    if (missing.length > 0) {
+      console.error(`desktop tasks need ${missing.join(", ")} on this host (apt install xvfb xdotool scrot imagemagick xterm)`);
+      return 2;
+    }
+  }
   const isolationRoot = await mkdtemp(path.join(os.tmpdir(), "swarm-eval-provider-cli-"));
   let vmDriver;
   if (opts.vm === "fake") {
@@ -170,6 +185,7 @@ async function main(): Promise<number> {
         maxTurns: opts.live.maxTurns,
         timeoutMs: opts.live.timeoutS * 1000,
         logDir: path.join(opts.outDir, "logs"),
+        ...(opts.live.textDesktop ? { textDesktop: true } : {}),
         ...(opts.live.claudeBin ? { claudeBin: opts.live.claudeBin } : {}),
       })
     : undefined;
@@ -185,7 +201,7 @@ async function main(): Promise<number> {
     console.log(renderProviderMarkdownTable(report));
     console.log(`\nWrote ${jsonPath} and ${markdownPath}`);
   } finally {
-    await rm(isolationRoot, { recursive: true, force: true });
+    await rm(isolationRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => undefined);
   }
   return 0;
 }
@@ -201,12 +217,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     });
 }
 
-/** `--tasks` takes task ids and/or the set names "hard" and "standard". */
+/**
+ * `--tasks` takes task ids and/or the set names "hard", "standard" and
+ * "desktop". Desktop tasks need an X server, so only "desktop" or their ids
+ * select them; "hard"/"standard" stay coding-only.
+ */
 export function selectTasks(names: string[]): typeof PROVIDER_EVAL_TASKS {
-  return PROVIDER_EVAL_TASKS.filter(
+  return [...PROVIDER_EVAL_TASKS, ...DESKTOP_PROVIDER_EVAL_TASKS].filter(
     (t) =>
       names.includes(t.id) ||
-      (names.includes("hard") && t.difficulty === "hard") ||
-      (names.includes("standard") && t.difficulty !== "hard"),
+      (names.includes("desktop") && t.desktop !== undefined) ||
+      (t.desktop === undefined && names.includes("hard") && t.difficulty === "hard") ||
+      (t.desktop === undefined && names.includes("standard") && t.difficulty !== "hard"),
   );
 }

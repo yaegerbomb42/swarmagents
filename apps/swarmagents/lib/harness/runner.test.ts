@@ -2342,3 +2342,34 @@ test("loop breaker: repeating after the nudge halts the run", async () => {
   assert.match(String(err?.message), /loop breaker/);
   assert.notEqual(outcome.exitCode, 0);
 });
+
+test("a malformed computer-mcp call does not halt the run: the tool's error goes back to the model (core-36)", async () => {
+  const call = (id: string, name: string, input: unknown) => ({
+    type: "assistant",
+    message: { id: `m_${id}`, content: [{ type: "tool_use", id, name, input }] },
+  });
+  const result = (id: string, content: string, isError: boolean) => ({
+    type: "user",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, is_error: isError }] },
+  });
+  const lines = [
+    INIT,
+    // Empty text and a bad key combo: what a weak model really sent in the live desktop eval.
+    call("tu_bad1", "mcp__computer-mcp__type", { text: "" }),
+    result("tu_bad1", "Invalid arguments: text is empty.", true),
+    call("tu_bad2", "mcp__computer-mcp__key", { combo: "type hello" }),
+    result("tu_bad2", "Invalid arguments: combo must be a keysym combo", true),
+    call("tu_ok", "mcp__computer-mcp__type", { text: "echo hi" }),
+    result("tu_ok", "Typed", false),
+    M6,
+    RESULT,
+  ].map((l) => JSON.stringify(l));
+  const vm = new ScriptedVm([{ chunks: [lines.join("\n") + "\n"] }]);
+  const events: TelemetryEvent[] = [];
+  const outcome = await new ClaudeCodeRunner().run({ prompt: "drive the desktop", env: {}, vm }, (e) => events.push(e));
+
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(events.some((e) => e.type === "run.error"), false, JSON.stringify(events.filter((e) => e.type === "run.error")));
+  assert.equal(events.some((e) => e.type === "tool.blocked"), false);
+  assert.ok(events.some((e) => e.type === "run.finished"), "the run completes");
+});

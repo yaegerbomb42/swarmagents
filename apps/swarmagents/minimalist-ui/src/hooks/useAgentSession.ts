@@ -148,11 +148,15 @@ export interface AgentSession {
   reconnecting: boolean;
   /** Approvals waiting on the user for the active run. */
   approvals: ApprovalEntry[];
+  /** Desktop handoffs (ask_human_desktop) still waiting on the user. */
+  handoffs: OpenHandoff[];
 
   send: (text: string, attachments?: Attachment[], options?: SendOptions) => Promise<SendResult>;
   stop: (runId?: string) => Promise<ActionResult>;
   resume: (runId: string) => Promise<ActionResult>;
   answerQuestion: (id: string, answer: string) => Promise<boolean>;
+  /** Resolve a pending desktop handoff (the user handed the desktop back). */
+  handBack: (id: string) => Promise<boolean>;
   markHandedBack: (id: string) => void;
   showActiveRun: () => void;
   refresh: () => void;
@@ -654,6 +658,21 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
     setHandoffs((prev) => prev.filter((handoff) => handoff.id !== id));
   }, []);
 
+  const handBack = useCallback(async (id: string): Promise<boolean> => {
+    try {
+      const res = await fetch("/api/runtime/handoffs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id }),
+      });
+      if (!res.ok) return false;
+    } catch {
+      return false;
+    }
+    markHandedBack(id);
+    return true;
+  }, [markHandedBack]);
+
   const openThread = useCallback(
     (id: string) => {
       setLocalRunIds([]);
@@ -717,10 +736,12 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
     liveEntries,
     reconnecting: stream.status === "reconnecting",
     approvals,
+    handoffs,
     send,
     stop,
     resume,
     answerQuestion,
+    handBack,
     markHandedBack,
     showActiveRun,
     refresh,

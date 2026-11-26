@@ -250,3 +250,37 @@ test("takeover session: forceHandback ends a drive and cancels a request", async
   assert.ok(manager.getLastSummary("alice"));
   manager.disposeAll();
 });
+
+test("takeover session: the handoff loop repeats while the run stays paused", async () => {
+  const { manager, transitions } = makeManager({ titles: ["Sign-in \u2014 2FA"] });
+  // The runtime marks the run paused on ask_human_desktop before the user
+  // dials in; every takeover from then on grants instantly.
+  manager.setAgentPaused("alice", true);
+  assert.equal(manager.getState("alice").agentPaused, true);
+
+  manager.requestTakeover("alice", "client-1");
+  await sleep(15);
+  manager.recordInput("alice", "client-1", click);
+  const summary = await manager.handback("alice", "client-1");
+  assert.ok(summary, "handback records the summary");
+  assert.equal(manager.getState("alice").state, "AGENT_DRIVING");
+  // The run is still paused (the runtime has not resumed it yet), so a
+  // second wall on the same run grants again without a safe point wait.
+  assert.equal(manager.getState("alice").agentPaused, true);
+  manager.requestTakeover("alice", "client-2");
+  assert.equal(manager.getState("alice").state, "HUMAN_DRIVING");
+  assert.equal(manager.canAcceptInput("alice", "client-2"), true);
+  assert.ok(transitions.filter((t) => t === "AGENT_DRIVING->HUMAN_REQUESTED").length === 2);
+  manager.disposeAll();
+});
+
+test("takeover session: resuming the run stops instant grants", () => {
+  const { manager } = makeManager();
+  manager.setAgentPaused("alice", true);
+  manager.setAgentPaused("alice", false);
+  assert.equal(manager.getState("alice").agentPaused, false);
+  manager.requestTakeover("alice", "client-1");
+  assert.equal(manager.getState("alice").state, "HUMAN_REQUESTED");
+  assert.equal(manager.canAcceptInput("alice", "client-1"), false, "input stays filtered until a safe point");
+  manager.disposeAll();
+});

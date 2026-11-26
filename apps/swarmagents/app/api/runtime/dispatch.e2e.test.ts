@@ -21,6 +21,7 @@ import { VmManager } from "../../../lib/vm/manager";
 import { FakeVmDriver } from "../../../lib/vm/fake-driver";
 import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
 import {
+  assertDispatchLifecycle,
   assertDispatchOrdering,
   dispatchStreamRequest,
   dispatchTaskRequest,
@@ -125,20 +126,11 @@ test(
 
     assertDispatchOrdering(events);
 
-  const ready = events.find((event) => event.type === "vm.ready");
+    const ready = events.find((event) => event.type === "vm.ready");
     const readyData = ready?.data as { ms?: number } | undefined;
     assert.equal(typeof readyData?.ms, "number");
 
-    const started = events.find((event) => event.type === "run.started");
-    assert.equal(started?.sessionId, "sess_e2e_1");
-    assert.equal(started?.model, "claude-sonnet-5-5");
-
-    const text = events.find((event) => event.type === "assistant.text");
-    assert.equal(text?.text, "checking the repo");
-
-    const finished = events.find((event) => event.type === "run.finished");
-    assert.equal(finished?.exitCode, 0);
-    assert.equal(finished?.sessionId, "sess_e2e_1");
+    assertDispatchLifecycle(events, "sess_e2e_1");
 
     // The driver really invoked the fake binary (the RunReporter's background
     // workspace listing/screenshot execs are filtered out), with the prompt in

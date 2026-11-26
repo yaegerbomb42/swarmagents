@@ -98,3 +98,21 @@ export function assertDispatchOrdering(events: DispatchEvent[]): void {
   // SSE ids are monotonic and gapless for a fresh run.
   for (let i = 0; i < events.length; i++) assert.equal(events[i].seq, i + 1);
 }
+
+/**
+ * Fixture-level lifecycle details both dispatch suites assert: the harness
+ * session and model arrive with run.started, the assistant text is relayed,
+ * and run.finished carries the exit code and session.
+ */
+export function assertDispatchLifecycle(events: DispatchEvent[], sessionId: string): void {
+  const started = events.find((event) => event.type === "run.started");
+  assert.equal(started?.sessionId, sessionId);
+  assert.equal(started?.model, "claude-sonnet-5-5");
+
+  const text = events.find((event) => event.type === "assistant.text");
+  assert.equal(text?.text, "checking the repo");
+
+  const finished = events.find((event) => event.type === "run.finished");
+  assert.equal(finished?.exitCode, 0);
+  assert.equal(finished?.sessionId, sessionId);
+}

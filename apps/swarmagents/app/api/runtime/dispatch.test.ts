@@ -22,6 +22,7 @@ import { VmManager } from "../../../lib/vm/manager";
 import { FakeVmDriver } from "../../../lib/vm/fake-driver";
 import type { ExecOptions, ExecResult, VmHandle } from "../../../lib/vm/types";
 import {
+  assertDispatchLifecycle,
   assertDispatchOrdering,
   dispatchStreamRequest,
   dispatchTaskRequest,
@@ -67,16 +68,7 @@ test("dispatch streams run.created..run.finished in order with gapless SSE ids",
 
   assertDispatchOrdering(events);
 
-  const started = events.find((event) => event.type === "run.started");
-  assert.equal(started?.sessionId, "sess_unit_1");
-  assert.equal(started?.model, "claude-sonnet-5-5");
-
-  const text = events.find((event) => event.type === "assistant.text");
-  assert.equal(text?.text, "checking the repo");
-
-  const finished = events.find((event) => event.type === "run.finished");
-  assert.equal(finished?.exitCode, 0);
-  assert.equal(finished?.sessionId, "sess_unit_1");
+  assertDispatchLifecycle(events, "sess_unit_1");
 
   // The driver received exactly one agent exec (the RunReporter's background
   // workspace listing/screenshot execs are filtered out), with the prompt in

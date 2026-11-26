@@ -39,6 +39,7 @@ import type {
   VmExecOpts,
 } from "./types";
 import { isMetaTool } from "../self-manage/session";
+import { buildDomainPlaybook } from "../playbook/domain-playbooks";
 import { createStreamJsonParser } from "./stream-json";
 import { filterObservation } from "./observation-filter";
 import { GateQueue } from "./gate-queue";
@@ -1449,7 +1450,8 @@ export class ClaudeCodeRunner {
     mode: ContextPackerMode,
     onApplied: (applied: AppliedContextPacker) => void,
   ): string {
-    const legacy = [effective.agentCard, rolePrompt, effective.memoryContext]
+    const playbook = buildDomainPlaybook(effective.prompt);
+    const legacy = [effective.agentCard, rolePrompt, effective.memoryContext, playbook.text]
       .filter(Boolean)
       .join("\n\n");
     const options = effective.systemPacker;
@@ -1457,10 +1459,11 @@ export class ClaudeCodeRunner {
       return legacy;
     }
     try {
+      const memoryWithPlaybook = [effective.memoryContext, playbook.text].filter(Boolean).join("\n\n") || undefined;
       const sections = systemSectionsFrom({
         agentCard: effective.agentCard,
         rolePrompt,
-        memoryContext: effective.memoryContext,
+        memoryContext: memoryWithPlaybook,
       });
       const ordered = options.cacheFriendlyOrder === true ? orderSystemSections(sections) : sections;
       if (options.pack === true) {

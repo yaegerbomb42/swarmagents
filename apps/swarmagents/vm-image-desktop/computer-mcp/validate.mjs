@@ -42,6 +42,9 @@ const OPEN_APPS = Object.freeze({
   browser: Object.freeze(["chromium", "--new-window"]),
   terminal: Object.freeze(["xfce4-terminal"]),
   files: Object.freeze(["thunar"]),
+  libreoffice: Object.freeze(["lowriter"]),
+  gimp: Object.freeze(["gimp"]),
+  blender: Object.freeze(["blender"]),
 });
 
 /**

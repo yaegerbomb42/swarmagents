@@ -139,6 +139,18 @@ test("open_app only launches allowlisted apps", () => {
     ok: true,
     cmds: [["thunar"]],
   });
+  assert.deepEqual(parseToolArgs("open_app", { name: "libreoffice" }), {
+    ok: true,
+    cmds: [["lowriter"]],
+  });
+  assert.deepEqual(parseToolArgs("open_app", { name: "gimp" }), {
+    ok: true,
+    cmds: [["gimp"]],
+  });
+  assert.deepEqual(parseToolArgs("open_app", { name: "blender" }), {
+    ok: true,
+    cmds: [["blender"]],
+  });
   assert.equal(parseToolArgs("open_app", { name: "bash" }).ok, false);
   assert.equal(parseToolArgs("open_app", { name: "../../bin/sh" }).ok, false);
   assert.equal(parseToolArgs("open_app", {}).ok, false);

@@ -55,6 +55,7 @@ instead of pulling a third-party desktop-in-a-container base
 | Automation | `xdotool`, `xclip`, `scrot`, `wmctrl`, ImageMagick (`identify`/`convert`) |
 | Fonts | Noto, Noto CJK, Noto Color Emoji |
 | Supervisor | `supervisord` runs Xvnc, XFCE and websockify; restart-on-failure |
+| GUI apps | `libreoffice` — office suite (writer, calc, impress); `gimp` — image editing; `blender` — 3D creation; `poppler-utils` — PDF tools (`pdftotext`, `pdfimages`); `ffmpeg` — audio/video processing; `python3-tk` — Python with Tkinter GUI support; `python3-matplotlib` — Python plotting library |
 
 All services run as the unprivileged `node` user (uid 1000). `/workspace`
 is owned by that user, as in the headless image.

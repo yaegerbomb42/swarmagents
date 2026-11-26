@@ -12,7 +12,7 @@
  * It is pure: no I/O, no keys, no platform imports.
  */
 
-import { anthropicToOpenAI, clampMaxTokens, type BridgeOptions } from "./anthropic-bridge";
+import { anthropicToOpenAI, clampMaxTokens, stripAnthropicImages, type BridgeOptions } from "./anthropic-bridge";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -636,7 +636,8 @@ export function anthropicToGemini(
   options: BridgeOptions = {},
 ): Record<string, unknown> {
   void targetModel;
-  const root = isRecord(body) ? body : {};
+  const normalized = options.vision === false ? stripAnthropicImages(body) : body;
+  const root = isRecord(normalized) ? normalized : {};
   const rawMessages = Array.isArray(root.messages) ? root.messages : [];
   const contents: Record<string, unknown>[] = [];
   const toolNames = new Map<string, string>();

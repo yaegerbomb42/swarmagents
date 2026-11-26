@@ -520,10 +520,13 @@ export function extractCompletionText(body: unknown): string {
 
 function recentCommitsBestEffort(limit = MAX_DIGEST_ITEMS): string[] {
   try {
+    // Fixed PATH (system dirs only): spawning `git` by bare name with an
+    // inherited PATH would let a writable PATH entry shadow the binary.
     const out = execFileSync("git", ["log", `--oneline`, `-${limit}`], {
       encoding: "utf8",
       timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, PATH: "/usr/local/bin:/usr/bin:/bin" },
     });
     return out
       .split("\n")

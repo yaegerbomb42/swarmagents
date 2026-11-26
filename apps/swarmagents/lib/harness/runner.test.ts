@@ -2294,3 +2294,51 @@ test("emits run.plan from TodoWrite, once per real change (live plan checklist)"
   // The raw tool.call still streams (the conversation labels it).
   assert.equal(events.filter((e) => e.type === "tool.call").length, 3);
 });
+
+// --- core-21 loop breaker ---
+
+function repeatedCalls(name: string, input: unknown, output: string, n: number, prefix: string): unknown[] {
+  const out: unknown[] = [];
+  for (let i = 0; i < n; i++) {
+    out.push(
+      { type: "assistant", message: { id: `${prefix}${i}`, content: [{ type: "tool_use", id: `tu_${prefix}${i}`, name, input }] } },
+      { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: `tu_${prefix}${i}`, content: output, is_error: false }] } },
+    );
+  }
+  return out;
+}
+
+test("loop breaker: the same click x3 with the same output emits a nudge without halting", async () => {
+  const lines = [INIT, ...repeatedCalls("mcp__computer__click", { x: 5, y: 9 }, "click done", 3, "c"), M6, RESULT].map((l) => JSON.stringify(l));
+  const vm = new ScriptedVm([{ chunks: [lines.join("\n") + "\n"] }]);
+  const events: TelemetryEvent[] = [];
+  const outcome = await new ClaudeCodeRunner().run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+  const loops = events.filter((e): e is Extract<TelemetryEvent, { type: "watchdog.loop" }> => e.type === "watchdog.loop");
+  assert.equal(loops.length, 1);
+  assert.equal(loops[0].action, "nudge");
+  assert.equal(loops[0].tool, "mcp__computer__click");
+  assert.match(loops[0].reason, /Do NOT repeat that same call/);
+  assert.equal(events.some((e) => e.type === "tool.blocked"), false, "a nudge is not a block");
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(events.some((e) => e.type === "run.error"), false);
+});
+
+test("loop breaker: scrolling x5 with the same output emits nothing", async () => {
+  const lines = [INIT, ...repeatedCalls("mcp__computer__scroll", { dy: 3 }, "scroll done", 5, "s"), M6, RESULT].map((l) => JSON.stringify(l));
+  const vm = new ScriptedVm([{ chunks: [lines.join("\n") + "\n"] }]);
+  const events: TelemetryEvent[] = [];
+  await new ClaudeCodeRunner().run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+  assert.equal(events.some((e) => e.type === "watchdog.loop"), false);
+});
+
+test("loop breaker: repeating after the nudge halts the run", async () => {
+  const lines = [INIT, ...repeatedCalls("mcp__computer__click", { x: 5, y: 9 }, "click done", 6, "e"), M6, RESULT].map((l) => JSON.stringify(l));
+  const vm = new ScriptedVm([{ chunks: [lines.join("\n") + "\n"] }]);
+  const events: TelemetryEvent[] = [];
+  const outcome = await new ClaudeCodeRunner().run({ prompt: "x", env: {}, vm }, (e) => events.push(e));
+  const loops = events.filter((e): e is Extract<TelemetryEvent, { type: "watchdog.loop" }> => e.type === "watchdog.loop");
+  assert.deepEqual(loops.map((l) => l.action), ["nudge", "escalate"]);
+  const err = events.find((e): e is Extract<TelemetryEvent, { type: "run.error" }> => e.type === "run.error");
+  assert.match(String(err?.message), /loop breaker/);
+  assert.notEqual(outcome.exitCode, 0);
+});

@@ -151,6 +151,19 @@ export type TelemetryEvent =
     }
   /** Emitted when a tool call classifies as "deny" and the run is halted. */
   | { type: "tool.blocked"; name: string; reason: string }
+  /**
+   * core-21 loop breaker: the agent repeated the same call with the same
+   * output. "nudge" arms a one-shot deny of that exact call at the hook;
+   * "escalate" halts the run.
+   */
+  | {
+      type: "watchdog.loop";
+      pathology: "duplicate-action";
+      tool: string;
+      action: "nudge" | "escalate";
+      fingerprint: string;
+      reason: string;
+    }
   /** Emitted when a user clicks/types on the live desktop and pauses A1. */
   | { type: "run.user_takeover"; startedAt: number }
   /** Emitted when the user hands desktop control back to A1. */

@@ -290,3 +290,18 @@ test("plan tool calls get a plain-language label instead of 'Calling tool'", () 
   assert.equal(describeToolCall("TaskCreate", { subject: "Run the tests" }), "Adding a step: Run the tests");
   assert.equal(describeToolCall("TaskUpdate", { taskId: "1", status: "completed" }), "Updating a plan step");
 });
+
+test("conversation: loop-breaker nudge and escalation become status lines", () => {
+  const entries = buildConversation([
+    item("watchdog.loop", { pathology: "duplicate-action", tool: "mcp__computer__click", action: "nudge", fingerprint: "f", reason: "x" }),
+    item("watchdog.loop", { pathology: "duplicate-action", tool: "mcp__computer__click", action: "escalate", fingerprint: "f", reason: "y" }),
+  ]);
+  const statuses = entries.filter(
+    (e): e is Extract<(typeof entries)[number], { kind: "status" }> => e.kind === "status",
+  );
+  assert.equal(statuses.length, 2);
+  assert.match(statuses[0].text, /Loop caught: the same click ran 3 times/);
+  assert.equal(statuses[0].tone, "info");
+  assert.match(statuses[1].text, /Stopped: the agent kept repeating the same click/);
+  assert.equal(statuses[1].tone, "error");
+});

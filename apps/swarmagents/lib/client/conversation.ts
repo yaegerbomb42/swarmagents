@@ -386,6 +386,21 @@ export function buildConversation(items: readonly RunStreamItem[]): Conversation
         }
         break;
       }
+      case "watchdog.loop": {
+        // core-21: the agent repeated the same call with the same result.
+        const tool = (asString(data.tool) ?? "tool").split("__").pop() ?? "tool";
+        const escalated = data.action === "escalate";
+        entries.push({
+          kind: "status",
+          key: `loop:${item.seq}`,
+          ts: item.ts,
+          text: escalated
+            ? `Stopped: the agent kept repeating the same ${tool} after a nudge`
+            : `Loop caught: the same ${tool} ran 3 times with no change. Nudged the agent to try something else`,
+          tone: escalated ? "error" : "info",
+        });
+        break;
+      }
       case "tool.blocked": {
         const name = asString(data.name) ?? "tool";
         const reason = asString(data.reason);

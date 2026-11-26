@@ -296,11 +296,19 @@ export function computerActionEvent(
     if (x !== undefined) event.x = x;
     if (y !== undefined) event.y = y;
     const text = s(obj.text);
-    if (text !== undefined) event.text = text;
+    // Never attach clipboard_set text to telemetry (may contain credentials);
+    // for click_text/wait_for_text it is a UI query target, not secret input.
+    if (text !== undefined && info.tool !== "clipboard_set") {
+      if (info.tool === "click_text" || info.tool === "wait_for_text") {
+        event.target = text.slice(0, 80);
+      } else {
+        event.text = text;
+      }
+    }
     const combo = s(obj.combo);
     if (combo !== undefined) event.text = combo;
-    const app = s(obj.name);
-    if (app !== undefined) event.target = app;
+    const app = s(obj.name) ?? s(obj.title);
+    if (app !== undefined) event.target = app.slice(0, 80);
     return event;
   }
 

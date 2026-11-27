@@ -17,6 +17,8 @@ import { resolveOllamaBaseUrl } from "@/lib/providers/settings";
 import { assertResolvableProviderBaseUrl } from "@/lib/providers/url-safety";
 import { isApiStyle, isAuthScheme } from "@/lib/providers/types";
 import type { ApiStyle, ProviderAuth, ProviderConfig } from "@/lib/providers/types";
+import { mergedModelCapabilities, runModeForCapabilities } from "@/lib/providers/capabilities";
+import { isDesktopModeEnabled } from "@/lib/vm/desktop";
 
 export const dynamic = "force-dynamic";
 
@@ -132,13 +134,20 @@ export async function POST(request: NextRequest) {
   const apiKey = providedKey || saved?.keys?.[0] || "";
   const model = typeof input.model === "string" ? input.model : undefined;
 
-  const startedAt = Date.now();
+   const startedAt = Date.now();
   try {
     const result = await testProviderConnection(config, apiKey, {
       ...(model ? { model } : {}),
       timeoutMs: 20_000,
     });
-    return NextResponse.json({ ...result, status: 200 }, { headers: NO_STORE });
+    const resolvedModel = result.model ?? model ?? saved?.models?.balanced ?? saved?.models?.fast ?? saved?.models?.deep ?? "";
+    const capabilities = mergedModelCapabilities(config, resolvedModel);
+    const runMode = runModeForCapabilities(capabilities, {
+      desktopEnabled: isDesktopModeEnabled(),
+      provider: id,
+      ...(resolvedModel ? { model: resolvedModel } : {}),
+    });
+    return NextResponse.json({ ...result, runMode, status: 200 }, { headers: NO_STORE });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // Structured failure the UI can render precisely: coarse class

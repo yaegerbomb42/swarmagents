@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { countConfiguredProviders, validatePasswordChange } from './Settings';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { countConfiguredProviders, validatePasswordChange, RunModeBadge } from './Settings';
 import { parseBudgetInput } from '../utils/budget';
 
 // The Settings tab count must reflect the user's own configured providers:
@@ -44,4 +46,24 @@ test('validatePasswordChange mirrors the server password policy', () => {
   // Boundary lengths are accepted.
   assert.equal(validatePasswordChange('old password', '12345678', '12345678'), null);
   assert.equal(validatePasswordChange('old password', 'x'.repeat(1024), 'x'.repeat(1024)), null);
+});
+
+// Settings markup: a tested key shows a compact run-mode badge.
+test('Settings shows a vision run-mode badge after a test response', () => {
+  const html = renderToStaticMarkup(
+    React.createElement(RunModeBadge, { runMode: { mode: 'gui', capabilities: { vision: true }, reason: 'vision' } }),
+  );
+  assert.ok(html.includes('Vision desktop'), 'vision badge renders');
+});
+
+test('Settings shows a text-desktop (no vision) badge', () => {
+  const html = renderToStaticMarkup(
+    React.createElement(RunModeBadge, { runMode: { mode: 'text-desktop', reason: 'no vision' } }),
+  );
+  assert.ok(html.includes('Text desktop (no vision)'), 'text-desktop badge renders');
+});
+
+test('Settings shows nothing when runMode is missing', () => {
+  const html = renderToStaticMarkup(React.createElement(RunModeBadge, { runMode: undefined }));
+  assert.equal(html, '', 'no badge without runMode');
 });

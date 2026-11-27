@@ -235,9 +235,9 @@ test("ocrPrepArgs: inverts dark crops, keeps light ones, always grayscale + 2x",
 // ---- Real Xvfb readback test ------------------------------------------------
 
 /** Run a program with argv; resolves {code, stdout, stderr} — same contract as server.mjs. */
-function run(program: string, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}) {
+function run(program: string, args: string[], opts: { timeoutMs?: number; env?: Record<string, string | undefined> } = {}) {
   return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
-    const child = spawn(program, args, { env: opts.env ?? process.env, shell: false });
+    const child = spawn(program, args, { env: (opts.env ?? process.env) as NodeJS.ProcessEnv, shell: false });
     let stdout = "";
     let stderr = "";
     let settled = false;

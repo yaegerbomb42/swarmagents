@@ -28,13 +28,20 @@ export interface DesktopSetup {
   height?: number;
   /** Start xfwm4 when installed (default true). */
   windowManager?: boolean;
+  /** Extra host binaries this task needs beyond DESKTOP_BINARIES (e.g. soffice). */
+  requires?: string[];
 }
 
 /** Binaries a desktop task needs on the host. */
 export const DESKTOP_BINARIES = ["Xvfb", "xdotool", "scrot", "convert", "xterm"] as const;
 
-export function missingDesktopBinaries(): string[] {
-  return DESKTOP_BINARIES.filter((b) => spawnSync("which", [b], { stdio: "ignore" }).status !== 0);
+export function missingDesktopBinaries(extra: readonly string[] = []): string[] {
+  return [...new Set([...DESKTOP_BINARIES, ...extra])].filter((b) => spawnSync("which", [b], { stdio: "ignore" }).status !== 0);
+}
+
+/** First of `candidates` on PATH (the A1 image ships chromium; dev hosts often only google-chrome). */
+export function firstOnPath(candidates: readonly string[]): string | undefined {
+  return candidates.find((b) => spawnSync("which", [b], { stdio: "ignore" }).status === 0);
 }
 
 /** Absolute path of the repo's computer-mcp server. */

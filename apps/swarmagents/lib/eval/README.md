@@ -222,6 +222,39 @@ implicitly. Same suite, same graders:
 | mercury (before) | 3/3 | 13.7 | 129,932 | 21.1 |
 | mercury (after) | 3/3 | 9.7 | 101,372 | 13.4 |
 
+### Harder desktop tasks (`--tasks desktop-hard`)
+
+After core-37 both models solve the three tasks above, so `desktop-hard`
+(`provider-tasks-desktop-hard.ts`) adds real GUI work. `--tasks desktop`
+still selects only the original three, so the baselines above stay
+comparable.
+
+| Task | What it needs |
+| --- | --- |
+| `desktop-browser-rendered-value` | a Chromium app window whose total is computed by JavaScript (not in the HTML); read it off the screen |
+| `desktop-find-error-log` | four logs, one with an ERROR line (chosen per run); search in a terminal and read the output |
+| `desktop-spreadsheet-total` | `sales.csv` opening in LibreOffice Calc behind its Text Import dialog; add a SUM row, save as CSV through Keep Current Format |
+
+Tasks declare extra host binaries in `desktop.requires` (`soffice`,
+`chromium`/`google-chrome`); the CLI checks only the selected tasks.
+
+```bash
+npm run eval:live -- --claude-bin /path/to/wrapper --model M --tasks desktop-hard --text-desktop
+```
+
+Live baseline (2026-11-26, text-desktop, 1 trial, 30 max turns):
+
+| Model | pass@1 | browser | error log | spreadsheet | Mean turns | Mean input tok |
+| --- | ---: | --- | --- | --- | ---: | ---: |
+| mercury | 2/3 | pass (9 turns) | FAIL (max turns) | pass | 23.7 | 371,474 |
+| nvidia/nemotron-3.5-lightning-30b-a3b | 1/3 | pass (31) | FAIL (max turns) | FAIL (1/2) | 31.0 | 429,626 |
+
+The error-log misses come from the same cause for both models: they ran the
+right `grep`, but describe_screen's OCR reads a dark terminal as fragments
+(`"charlie. log"`, `"lbox@grok-bot -vm…:~/logss ff"`), so a text-only model
+cannot see the command's output. core-38 (`read_window_text`) targets
+exactly this.
+
 ## Relation to the capability-atlas eval
 
 `lib/capability-atlas/eval` benchmarks capability *retrieval* accuracy

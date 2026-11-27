@@ -45,7 +45,19 @@ export function loadGardener(): GardenerFile {
     // A truncated or hand-edited gardener.json must not break every gardener
     // API call and tick for all users until manually deleted. Match the
     // ambient/computers stores: fall back to empty state and log corruption.
-    console.error(`[swarm-gardener] gardener file is corrupt (${file}):`, err instanceof Error ? err.message : err);
+    // Keep the bad bytes: the next save would overwrite gardener.json with the
+    // empty fallback and silently destroy every user's proposals and pins.
+    let backup = "";
+    try {
+      backup = `${file}.corrupt-${Date.now()}`;
+      fs.copyFileSync(file, backup);
+    } catch {
+      backup = "";
+    }
+    console.error(
+      `[swarm-gardener] gardener file is corrupt (${file})${backup ? `; backed up to ${backup}` : ""}:`,
+      err instanceof Error ? err.message : err,
+    );
     return emptyFile();
   }
 }

@@ -4,6 +4,7 @@
  * POST  {prompt, sessionId?}        -> starts or queues a run -> {runId, queued, position?, capacity?}
  * POST  {action:"wipe_vm"}          -> resets the user's VM
  * POST  {action:"new_thread"}       -> cancels active/queued runs and clears the persisted session
+ * POST  {action:"steer", prompt}    -> interrupts the active run and continues its session -> {runId, steeredFrom, queued}
  * GET                               -> {runs: RunSummary[]} for the caller
  * DELETE ?runId=<id> (or omit)      -> cancels the active/requested run or removes a queued prompt
  *
@@ -107,6 +108,26 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: resumed.error ?? "Could not resume." }, { status: resumed.status ?? 409 });
     }
     return NextResponse.json({ ok: true, runId: resumed.runId, resumedFrom: runId }, { status: 202 });
+  }
+
+  // l9 — steer mid-run: interrupt the active run and continue the same
+  // Claude session with new instructions (see RuntimeManager.steer).
+  if (body.action === "steer") {
+    const steerPrompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
+    if (!steerPrompt) {
+      return NextResponse.json({ error: "prompt is required." }, { status: 400 });
+    }
+    if (steerPrompt.length > MAX_PROMPT_LEN) {
+      return NextResponse.json({ error: "prompt too long." }, { status: 400 });
+    }
+    const steered = getRuntimeManager().steer(user, steerPrompt);
+    if (!steered.ok) {
+      return NextResponse.json({ error: steered.error }, { status: 409 });
+    }
+    return NextResponse.json(
+      { runId: steered.runId, steeredFrom: steered.steeredFrom, queued: steered.queued },
+      { status: steered.queued ? 202 : 201 },
+    );
   }
 
   const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";

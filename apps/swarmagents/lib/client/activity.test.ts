@@ -276,3 +276,9 @@ test("checkpoint.restored: fork provenance reads as a branch line", () => {
   assert.equal(mapped?.text, "Forked from auto-pre-step-4");
   assert.equal(mapped?.tone, "accent");
 });
+
+test("run.steered surfaces as an accent line", () => {
+  const mapped = toActivityLine(item("run.steered", { fromRunId: "run_old", toRunId: "run_new" }));
+  assert.equal(mapped?.text, "Steered · continuing the previous run");
+  assert.equal(mapped?.tone, "accent");
+});

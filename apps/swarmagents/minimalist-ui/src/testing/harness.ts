@@ -148,6 +148,7 @@ export function makeSession(overrides: Partial<AgentSession> = {}): AgentSession
     approvals: [],
     handoffs: [],
     send: async () => ({ ok: false, error: "send is not wired in this test" }),
+    steer: async () => ({ ok: false, error: "steer is not wired in this test" }),
     stop: async () => ({ ok: true }),
     resume: async () => ({ ok: true }),
     answerQuestion: async () => true,

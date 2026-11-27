@@ -35,6 +35,8 @@ export interface ThreadRunInput {
   costUsd?: number;
   /** Compact report card counts, present once the run's report exists. */
   report?: ReportCardMeta;
+  /** l9: the run this run steered from, when it replaced a live run mid-flight. */
+  steeredFrom?: string;
 }
 
 export interface ThreadEntry {

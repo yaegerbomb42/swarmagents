@@ -192,3 +192,34 @@ export async function resumeRun(runId: string, fetchImpl: typeof fetch = fetch):
   }
   return { ok: true, runId: body.runId, queued: true };
 }
+
+export type SteerRunResult =
+  | { ok: true; runId: string; steeredFrom: string; queued: boolean }
+  | { ok: false; error: string; status?: number };
+
+/**
+ * l9 — steer mid-run: interrupt the active run and continue its session
+ * with new instructions. Never throws: failures come back as `ok: false`.
+ * A 409 means no run is active to steer.
+ */
+export async function steerRun(
+  prompt: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<SteerRunResult> {
+  let res: Response;
+  try {
+    res = await fetchImpl(TASKS_ENDPOINT, jsonPost({ action: "steer", prompt }));
+  } catch (err) {
+    return { ok: false, error: networkError(err) };
+  }
+  if (!res.ok) return { ok: false, error: await readError(res), status: res.status };
+  const body = (await res.json().catch(() => null)) as {
+    runId?: unknown;
+    steeredFrom?: unknown;
+    queued?: unknown;
+  } | null;
+  if (typeof body?.runId !== "string" || !body.runId || typeof body?.steeredFrom !== "string") {
+    return { ok: false, error: "The server did not return the steered run.", status: res.status };
+  }
+  return { ok: true, runId: body.runId, steeredFrom: body.steeredFrom, queued: body.queued === true };
+}

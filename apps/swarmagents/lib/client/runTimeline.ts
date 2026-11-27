@@ -84,6 +84,8 @@ export interface RunSummary {
   /** Message from run.error, if the run failed. */
   error?: string;
   cancelledReason?: string;
+  /** l9: the run this run steered from, when it replaced a live run mid-flight. */
+  steeredFrom?: string;
   /** Summed across every usage event (per-message snapshots). */
   tokensIn: number;
   tokensOut: number;
@@ -361,6 +363,11 @@ export function reduceRunTimeline(items: readonly RunStreamItem[]): RunTimeline 
       case "run.cancelled": {
         summary.finishedAt = summary.finishedAt ?? item.ts;
         summary.cancelledReason = asString(data.reason);
+        break;
+      }
+
+      case "run.steered": {
+        summary.steeredFrom = asString(data.fromRunId) ?? summary.steeredFrom;
         break;
       }
 

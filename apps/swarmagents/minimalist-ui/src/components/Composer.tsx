@@ -28,6 +28,12 @@ export interface ComposerProps {
   value: string;
   onChange: (value: string) => void;
   onSend: (text: string, attachments: Attachment[]) => Promise<ComposerSendResult>;
+  /**
+   * l9 — steer mid-run. When set and a run is busy, Enter opens the steer /
+   * queue choice instead of queueing at once; confirming steers the live run
+   * (interrupt + continue its session) instead of sending normally.
+   */
+  onSteer?: (text: string, attachments: Attachment[]) => Promise<ComposerSendResult>;
   /** A run is active, so a message sent now is queued behind it. */
   busy?: boolean;
   /** When set, sending is off and this says why (e.g. signed out). */
@@ -62,6 +68,77 @@ export function composerKeyAction(event: {
 export function canSend(input: { text: string; attachments: number; sending: boolean; blocked?: boolean }): boolean {
   if (input.sending || input.blocked) return false;
   return input.text.trim().length > 0 || input.attachments > 0;
+}
+
+/**
+ * l9 — what a key press means while the steer choice is open. Enter confirms
+ * the default (Steer now); Escape closes the choice and keeps the draft.
+ * Kept pure so it is tested without a DOM.
+ */
+export function steerChoiceKeyAction(event: {
+  key: string;
+  shiftKey: boolean;
+  isComposing?: boolean;
+}): "steer" | "cancel" | null {
+  if (event.isComposing) return null;
+  if (event.key === "Enter" && !event.shiftKey) return "steer";
+  if (event.key === "Escape") return "cancel";
+  return null;
+}
+
+/**
+ * l9 — the steer / queue choice shown while a run is active. Steer now is
+ * the default: it interrupts the live run and continues its session with
+ * the draft. Queue after sends normally (the message runs when the live
+ * run finishes). Rendered on its own so it is tested without a DOM.
+ */
+export function SteerChoiceChip({
+  onSteer,
+  onQueue,
+  onCancel,
+}: {
+  onSteer: () => void;
+  onQueue: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      role="group"
+      aria-label="Steer the running agent or queue behind it"
+      data-testid="composer-steer-chip"
+      className="sa-enter mb-2 flex flex-wrap items-center gap-2 rounded-xl border border-white/[0.12] bg-white/[0.06] px-3 py-2 backdrop-blur-xl"
+    >
+      <span className="text-[13px] text-sa-fg">A run is active — interrupt it with this message, or queue behind it?</span>
+      <span className="ml-auto flex items-center gap-1.5">
+        <button
+          type="button"
+          data-testid="composer-steer-now"
+          onClick={onSteer}
+          className="cursor-pointer rounded-lg bg-[var(--brand-signal)] px-2.5 py-1 text-[12px] font-medium text-[var(--brand-text-on-signal)]"
+        >
+          Steer now
+        </button>
+        <button
+          type="button"
+          data-testid="composer-steer-queue"
+          onClick={onQueue}
+          className="cursor-pointer rounded-lg border border-white/[0.12] bg-white/[0.04] px-2.5 py-1 text-[12px] font-medium text-sa-fg2 hover:text-sa-fg"
+        >
+          Queue after
+        </button>
+        <button
+          type="button"
+          data-testid="composer-steer-cancel"
+          onClick={onCancel}
+          aria-label="Cancel, keep editing"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-sa-fg3 transition-colors hover:bg-sa-hover hover:text-sa-fg"
+        >
+          <X className="h-3.5 w-3.5" aria-hidden />
+        </button>
+      </span>
+      <span className="w-full text-[11px] text-sa-fg3">Enter steers · Esc keeps editing</span>
+    </div>
+  );
 }
 
 /**
@@ -139,6 +216,7 @@ export function Composer({
   value: draft,
   onChange: setDraft,
   onSend,
+  onSteer,
   busy = false,
   blockedReason,
   hero = false,
@@ -151,6 +229,8 @@ export function Composer({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string>();
   const [dragging, setDragging] = useState(false);
+  /** l9: the steer / queue choice is open (busy + Enter, or the send button). */
+  const [steerOpen, setSteerOpen] = useState(false);
   const ownRef = useRef<HTMLTextAreaElement | null>(null);
   const textRef = inputRef ?? ownRef;
   const fileRef = useRef<HTMLInputElement>(null);
@@ -167,6 +247,11 @@ export function Composer({
 
   // Object URLs for previews are released when the composer goes away.
   useEffect(() => () => release(attachmentsRef.current), []);
+
+  // The run finished while the choice was open: steering is moot, close it.
+  useEffect(() => {
+    if (!busy) setSteerOpen(false);
+  }, [busy]);
 
   const addFiles = useCallback((files: readonly File[]) => {
     if (files.length === 0) return;
@@ -196,28 +281,66 @@ export function Composer({
 
   const blocked = Boolean(blockedReason);
   const sendable = canSend({ text: draft, attachments: attachments.length, sending, blocked });
+  /** Steering is possible only while a run is busy and the workspace wired it. */
+  const canSteer = busy && onSteer !== undefined;
 
-  const submit = useCallback(async () => {
-    if (!canSend({ text: draft, attachments: attachments.length, sending, blocked })) return;
-    const files = attachments;
-    const sent = await sendDraft(
-      { text: draft, files },
-      {
-        onSend,
-        setText: setDraft,
-        setFiles: (next) => {
-          attachmentsRef.current = next;
-          setAttachments(next);
+  const submit = useCallback(
+    async (mode: "send" | "steer" = "send") => {
+      if (!canSend({ text: draft, attachments: attachments.length, sending, blocked })) return;
+      setSteerOpen(false);
+      const files = attachments;
+      const handler = mode === "steer" && onSteer ? onSteer : onSend;
+      const sent = await sendDraft(
+        { text: draft, files },
+        {
+          onSend: handler,
+          setText: setDraft,
+          setFiles: (next) => {
+            attachmentsRef.current = next;
+            setAttachments(next);
+          },
+          setError,
+          setSending,
         },
-        setError,
-        setSending,
-      },
-    );
-    if (sent) release(files);
-    textRef.current?.focus();
-  }, [draft, attachments, sending, blocked, onSend, setDraft, textRef]);
+      );
+      if (sent) release(files);
+      textRef.current?.focus();
+    },
+    [draft, attachments, sending, blocked, onSend, onSteer, setDraft, textRef],
+  );
+
+  /**
+   * l9: Enter while busy opens the steer / queue choice instead of queueing
+   * at once; the send button does the same. Steer is the default.
+   */
+  const requestSend = useCallback(() => {
+    if (!sendable) return;
+    if (canSteer && !steerOpen) {
+      setSteerOpen(true);
+      return;
+    }
+    void submit(steerOpen ? "steer" : "send");
+  }, [sendable, canSteer, steerOpen, submit]);
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (steerOpen) {
+      const choice = steerChoiceKeyAction({
+        key: event.key,
+        shiftKey: event.shiftKey,
+        isComposing: event.nativeEvent.isComposing,
+      });
+      if (choice === "steer") {
+        event.preventDefault();
+        void submit("steer");
+        return;
+      }
+      if (choice === "cancel") {
+        event.preventDefault();
+        setSteerOpen(false);
+        return;
+      }
+      return;
+    }
     const action = composerKeyAction({
       key: event.key,
       shiftKey: event.shiftKey,
@@ -225,7 +348,7 @@ export function Composer({
     });
     if (action !== "send") return;
     event.preventDefault();
-    void submit();
+    requestSend();
   };
 
   const onPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -257,6 +380,13 @@ export function Composer({
         <Notice tone="err" title="That did not send" className="sa-enter mb-2" testId="composer-error">
           {error}
         </Notice>
+      )}
+      {steerOpen && (
+        <SteerChoiceChip
+          onSteer={() => void submit("steer")}
+          onQueue={() => void submit("send")}
+          onCancel={() => setSteerOpen(false)}
+        />
       )}
       <div
         onDragOver={(event) => {
@@ -362,10 +492,10 @@ export function Composer({
           <button
             type="button"
             data-testid="composer-send"
-            onClick={() => void submit()}
+            onClick={() => requestSend()}
             disabled={!sendable}
-            aria-label={busy ? "Queue message" : "Send message"}
-            title={busy ? "Queue message (Enter)" : "Send (Enter)"}
+            aria-label={steerOpen ? "Steer the running agent" : busy ? "Queue message" : "Send message"}
+            title={steerOpen ? "Steer now (Enter)" : busy ? "Queue message (Enter)" : "Send (Enter)"}
             className="press grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[var(--brand-signal)] text-[var(--brand-text-on-signal)] transition-transform hover:scale-105 disabled:cursor-not-allowed disabled:bg-white/[0.08] disabled:text-[var(--mute)] disabled:hover:scale-100"
           >
             {sending ? (
@@ -378,7 +508,7 @@ export function Composer({
       </div>
       <div className="mt-1.5 flex items-center justify-between gap-2 px-1">
         <p className="hidden text-[12px] text-sa-fg3 sm:block">
-          Enter to send · Shift+Enter for a new line
+          {canSteer ? "Enter to steer · Shift+Enter for a new line" : "Enter to send · Shift+Enter for a new line"}
         </p>
         {onTierChange && (
           <div

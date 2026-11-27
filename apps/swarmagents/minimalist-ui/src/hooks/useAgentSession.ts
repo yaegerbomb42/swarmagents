@@ -44,6 +44,7 @@ import {
   resumeRun,
   startNewThread,
   startRun,
+  steerRun,
   stopRun,
   withUploadManifest,
   type RunTier,
@@ -155,6 +156,8 @@ export interface AgentSession {
   handoffs: OpenHandoff[];
 
   send: (text: string, attachments?: Attachment[], options?: SendOptions) => Promise<SendResult>;
+  /** l9: interrupt the active run and continue its session with new instructions. */
+  steer: (text: string, attachments?: Attachment[]) => Promise<SendResult>;
   stop: (runId?: string) => Promise<ActionResult>;
   resume: (runId: string) => Promise<ActionResult>;
   answerQuestion: (id: string, answer: string) => Promise<boolean>;
@@ -517,20 +520,32 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
   const viewRef = useRef({ turns, localRunIds, activeRunId });
   viewRef.current = { turns, localRunIds, activeRunId };
 
-  const dispatchRun = useCallback(
-    async (rawText: string, attachments: Attachment[] = [], sendOptions: SendOptions = {}): Promise<SendResult> => {
+  // Shared send preamble: trim, filter file attachments, show the optimistic
+  // pending turn, upload attachments. Used by both dispatchRun (send) and
+  // steer, which previously duplicated this block verbatim (Sonar S4144).
+  // The empty check runs on the raw text: a /tests rewrite only ever adds
+  // content, so it cannot turn an empty message into a non-empty one.
+  const prepareDispatch = useCallback(
+    async (
+      rawText: string,
+      attachments: Attachment[],
+      displayText?: string,
+    ): Promise<
+      | { ok: false; error: string }
+      | {
+          ok: true;
+          typed: string;
+          display: PromptDisplay;
+          pendingId: string;
+          fail: (error: string) => { ok: false; error: string };
+          uploadedFiles: Array<{ path: string; size: number }>;
+        }
+    > => {
       const typed = rawText.trim();
-      let prompt = typed;
-      const slash = parseSlashCommand(typed);
-      if (slash?.kind === "tests") {
-        if (!slash.target) return { ok: false, error: "Usage: /tests <path> [--max=N]" };
-        prompt = formatTestsPrompt(slash.target, slash.maxIterations ?? 3);
-      }
       const files = attachments.filter((attachment) => attachment.file);
-      if (!prompt && files.length === 0) return { ok: false, error: "Type a message first." };
-
+      if (!typed && files.length === 0) return { ok: false, error: "Type a message first." };
       const display: PromptDisplay = {
-        text: sendOptions.displayText ?? typed,
+        text: displayText ?? typed,
         attachments: files.map((file) => file.name),
       };
       const pendingId = uid();
@@ -538,7 +553,7 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
       setDispatching(true);
       // A failed send never becomes a turn: the caller keeps the draft and
       // shows the error where the user typed it.
-      const fail = (error: string): SendResult => {
+      const fail = (error: string): { ok: false; error: string } => {
         setPending((prev) => (prev?.id === pendingId ? undefined : prev));
         setDispatching(false);
         return { ok: false, error };
@@ -557,6 +572,23 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
           return fail(`Could not upload the attachments. ${err instanceof Error ? err.message : ""}`.trim());
         }
       }
+      return { ok: true, typed, display, pendingId, fail, uploadedFiles };
+    },
+    [],
+  );
+
+  const dispatchRun = useCallback(
+    async (rawText: string, attachments: Attachment[] = [], sendOptions: SendOptions = {}): Promise<SendResult> => {
+      const typed = rawText.trim();
+      let prompt = typed;
+      const slash = parseSlashCommand(typed);
+      if (slash?.kind === "tests") {
+        if (!slash.target) return { ok: false, error: "Usage: /tests <path> [--max=N]" };
+        prompt = formatTestsPrompt(slash.target, slash.maxIterations ?? 3);
+      }
+      const prep = await prepareDispatch(rawText, attachments, sendOptions.displayText);
+      if (!prep.ok) return prep;
+      const { display, pendingId, fail, uploadedFiles } = prep;
 
       const view = viewRef.current;
       const key = threadKeyRef.current;
@@ -592,7 +624,7 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
       refresh();
       return { ok: true, runId: result.runId, queued: result.queued };
     },
-    [refresh, setPromptCache, setStoredKey],
+    [prepareDispatch, refresh, setPromptCache, setStoredKey],
   );
 
   // The send in flight, if any. Stop is on screen from the moment a message
@@ -640,6 +672,45 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
       return { ok: true };
     },
     [refresh],
+  );
+
+  // l9 — steer: same upload + optimistic-turn flow as a send, but the server
+  // interrupts the active run and continues its session instead of queueing
+  // behind it. The superseded run is marked cancelled locally at once; the
+  // new run continues the same session, so the thread key does not change.
+  const steer = useCallback(
+    async (rawText: string, attachments: Attachment[] = []): Promise<SendResult> => {
+      const prep = await prepareDispatch(rawText, attachments);
+      if (!prep.ok) return prep;
+      const { typed, display, pendingId, fail, uploadedFiles } = prep;
+      const fullPrompt = withUploadManifest(typed, uploadedFiles);
+      const result = await steerRun(fullPrompt);
+      if (!result.ok) return fail(result.error);
+      const stopped: ThreadRunInput = {
+        runId: result.steeredFrom,
+        status: "cancelled",
+        finishedAt: Date.now(),
+      };
+      const started: ThreadRunInput = {
+        runId: result.runId,
+        prompt: fullPrompt,
+        status: result.queued ? "queued" : "running",
+        createdAt: Date.now(),
+        steeredFrom: result.steeredFrom,
+      };
+      dispatch({ type: "merge", runs: [stopped, started], limit: STORE_LIMIT });
+      setAccountRuns((prev) => [
+        started,
+        ...prev.map((run) => (run.runId === result.steeredFrom ? { ...run, ...stopped } : run)),
+      ]);
+      setLocalRunIds((prev) => [...prev, result.runId]);
+      setPromptCache((prev) => rememberPrompt(prev, result.runId, display));
+      setPending((prev) => (prev?.id === pendingId ? undefined : prev));
+      setDispatching(false);
+      refresh();
+      return { ok: true, runId: result.runId, queued: result.queued };
+    },
+    [prepareDispatch, refresh, setPromptCache],
   );
 
   const answerQuestion = useCallback(async (id: string, answer: string): Promise<boolean> => {
@@ -743,6 +814,7 @@ export function useAgentSession(options: AgentSessionOptions): AgentSession {
     approvals,
     handoffs,
     send,
+    steer,
     stop,
     resume,
     answerQuestion,

@@ -11,6 +11,7 @@ import {
   resumeRun,
   startNewThread,
   startRun,
+  steerRun,
   stopRun,
   withUploadManifest,
 } from "./runs";
@@ -219,4 +220,31 @@ test("startRun omits the default balanced tier so default requests are unchanged
   const { fetchImpl, calls } = fakeFetch(() => json({ runId: "run_bal" }, 201));
   await startRun({ prompt: "Analyze", fullAuto: true, tier: "balanced" }, { fetchImpl });
   assert.deepEqual(sentBody(calls[0]), { prompt: "Analyze", autoApprove: true, fullAuto: true });
+});
+
+test("steerRun posts the steer action and returns the steered run", async () => {
+  const ok = fakeFetch(() => json({ runId: "run_new", steeredFrom: "run_old", queued: false }, 201));
+  assert.deepEqual(await steerRun("use python instead", ok.fetchImpl), {
+    ok: true,
+    runId: "run_new",
+    steeredFrom: "run_old",
+    queued: false,
+  });
+  assert.deepEqual(sentBody(ok.calls[0]), { action: "steer", prompt: "use python instead" });
+  assert.equal(ok.calls[0].url, TASKS_ENDPOINT);
+
+  const queued = fakeFetch(() => json({ runId: "run_q", steeredFrom: "run_old", queued: true }, 202));
+  assert.deepEqual(await steerRun("change of plan", queued.fetchImpl), {
+    ok: true,
+    runId: "run_q",
+    steeredFrom: "run_old",
+    queued: true,
+  });
+
+  const failed = fakeFetch(() => json({ error: "No active run to steer." }, 409));
+  assert.deepEqual(await steerRun("do it", failed.fetchImpl), {
+    ok: false,
+    error: "No active run to steer.",
+    status: 409,
+  });
 });

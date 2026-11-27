@@ -20,6 +20,7 @@ import type { RunTier } from "../../../lib/client/runs";
 import { validateAttachment } from "../../../lib/client/upload";
 import { cn } from "../utils/cn";
 import { IconButton, Notice } from "./ui";
+import { VoiceInput, isVoiceInputSupported } from "./VoiceInput";
 
 export type ComposerSendResult = { ok: true } | { ok: false; error: string };
 
@@ -151,6 +152,11 @@ export function Composer({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string>();
   const [dragging, setDragging] = useState(false);
+  /** Incremented to stop dictation when a message sends. */
+  const [voiceStopSignal, setVoiceStopSignal] = useState(0);
+  /** Runtime voice notice (mic blocked, no mic, …); null clears it. */
+  const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
+  const voiceSupported = isVoiceInputSupported();
   const ownRef = useRef<HTMLTextAreaElement | null>(null);
   const textRef = inputRef ?? ownRef;
   const fileRef = useRef<HTMLInputElement>(null);
@@ -199,6 +205,8 @@ export function Composer({
 
   const submit = useCallback(async () => {
     if (!canSend({ text: draft, attachments: attachments.length, sending, blocked })) return;
+    // Dictation stops when the message goes out.
+    setVoiceStopSignal((signal) => signal + 1);
     const files = attachments;
     const sent = await sendDraft(
       { text: draft, files },
@@ -359,6 +367,13 @@ export function Composer({
               </span>
             )}
           </div>
+          <VoiceInput
+            value={draft}
+            onChange={setDraft}
+            stopSignal={voiceStopSignal}
+            disabled={blocked || sending}
+            onNotice={setVoiceNotice}
+          />
           <button
             type="button"
             data-testid="composer-send"
@@ -377,9 +392,20 @@ export function Composer({
         </div>
       </div>
       <div className="mt-1.5 flex items-center justify-between gap-2 px-1">
-        <p className="hidden text-[12px] text-sa-fg3 sm:block">
-          Enter to send · Shift+Enter for a new line
-        </p>
+        <div className="min-w-0">
+          <p className="hidden text-[12px] text-sa-fg3 sm:block" data-testid="composer-hint">
+            Enter to send · Shift+Enter for a new line
+          </p>
+          {voiceNotice ? (
+            <p className="text-[12px] text-sa-fg3" data-testid="composer-voice-notice">
+              {voiceNotice}
+            </p>
+          ) : !voiceSupported ? (
+            <p className="text-[12px] text-sa-fg3" data-testid="composer-voice-notice">
+              Voice input isn&apos;t supported in this browser — try Chrome or Edge to dictate.
+            </p>
+          ) : null}
+        </div>
         {onTierChange && (
           <div
             role="group"

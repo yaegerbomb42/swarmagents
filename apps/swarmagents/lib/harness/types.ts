@@ -542,6 +542,10 @@ export interface RunRequest {
    */
   handoffGateway?: HandoffGateway;
   /**
+   * Optional bounded parallel sub-worker fan-out executor for `fan_out_workers`.
+   */
+  fanOutGateway?: (args: import("./fanout-mcp").FanOutArguments) => Promise<import("./fanout-executor").FanOutAggregateResult>;
+  /**
    * Per-run Decision Brain loop control. When set (and its settings enable
    * it), the runner evaluates each risk-allowed tool call through the brain
    * before it proceeds: `ask` pauses via the approval gateway, `stop` halts,

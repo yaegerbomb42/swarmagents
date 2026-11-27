@@ -86,6 +86,12 @@ import {
   TOOL_FORGE_MCP_SERVER_PATH,
   toolForgeMcpServerSource,
 } from "./tool-forge-mcp";
+import {
+  FANOUT_DIR,
+  FANOUT_MCP_SERVER_NAME,
+  FANOUT_MCP_SERVER_PATH,
+  FANOUT_MCP_SERVER_SOURCE,
+} from "./fanout-mcp";
 import { compactConnectorCatalog } from "../self-manage/tool-author";
 
 /** Name of the stdio MCP server exposing set_role/list_roles. */
@@ -272,6 +278,7 @@ export function roleAllowedTools(
   // with tools, gated like ask_user: it only pauses the run for a human.
   out.add(`mcp__${DESKTOP_HANDOFF_MCP_SERVER_NAME}__*`);
   out.add(`mcp__${TOOL_FORGE_MCP_SERVER_NAME}__*`);
+  out.add(`mcp__${FANOUT_MCP_SERVER_NAME}__*`);
   // The capability-atlas server is opt-in (SWARM_ATLAS_ENABLED=1): grant its
   // tools only when it is wired, so a default run gets exactly today's toolset.
   if (opts.atlasEnabled) out.add(`mcp__${ATLAS_MCP_SERVER_NAME}__*`);
@@ -415,6 +422,12 @@ export function roleMcpConfigJson(
       args: [DESKTOP_HANDOFF_MCP_SERVER_PATH],
       env: { SWARM_DESKTOP_HANDOFF_DIR: DESKTOP_HANDOFF_DIR },
     },
+    [FANOUT_MCP_SERVER_NAME]: {
+      type: "stdio",
+      command: "node",
+      args: [FANOUT_MCP_SERVER_PATH],
+      env: { SWARM_FANOUT_DIR: FANOUT_DIR },
+    },
     [TOOL_FORGE_MCP_SERVER_NAME]: {
       type: "stdio",
       command: "node",
@@ -543,6 +556,7 @@ export function roleSeedFiles(
     { path: MEMORY_MCP_SERVER_PATH, content: MEMORY_MCP_SERVER_SOURCE },
     { path: ASK_MCP_SERVER_PATH, content: ASK_MCP_SERVER_SOURCE },
     { path: DESKTOP_HANDOFF_MCP_SERVER_PATH, content: DESKTOP_HANDOFF_MCP_SERVER_SOURCE },
+    { path: FANOUT_MCP_SERVER_PATH, content: FANOUT_MCP_SERVER_SOURCE },
     { path: PLAYWRIGHT_POLICY_PATH, content: PLAYWRIGHT_POLICY_SOURCE },
     { path: PLAYWRIGHT_PROXY_PATH, content: PLAYWRIGHT_PROXY_SOURCE },
     { path: PLAYWRIGHT_LAUNCHER_PATH, content: PLAYWRIGHT_LAUNCHER_SOURCE },

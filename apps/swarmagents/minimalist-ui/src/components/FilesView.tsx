@@ -12,7 +12,13 @@
  *      the run is still streaming (not only at run.finished), and marked with
  *      a short amber flash the moment it changes (`changedPath`/`changedAt`
  *      from lib/client/presence). If nothing is open, the first file the agent
- *      touches is opened for you.
+ *      touches is opened for you. Every write in the run stream is also
+ *      folded into a touched set (lib/client/files `deriveFileActivity`):
+ *      each touched file gets an emerald "edited Ns ago" dot that fades
+ *      after 60s, its directory re-reads on a 500ms debounce, a shell
+ *      command triggers a full refresh on a 2s debounce, and an "Agent
+ *      activity" filter shows only the files touched this run. A file open
+ *      in the reading pane reloads and briefly highlights its changed lines.
  *   3. A reading pane that keeps the file's identity: a small path header,
  *      a line-numbered monospace body, and an honest footer for truncated or
  *      binary files.
@@ -46,13 +52,22 @@ import {
 } from "lucide-react";
 import {
   WORKSPACE_ROOT,
+  DebouncedTrigger,
   describeFilesError,
+  deriveFileActivity,
   fetchRecentWorkspaceFiles,
   fetchWorkspaceFile,
   fetchWorkspaceListing,
   formatBytes,
+  formatEditedAgo,
+  highlightRangeForEdit,
   joinWorkspacePath,
+  mergeTouchedFiles,
   parentWorkspacePath,
+  pruneTouchedFiles,
+  TOUCHED_DOT_TTL_MS,
+  type ChangedLineRange,
+  type TouchedFile,
   type WorkspaceEntry,
   type WorkspaceFile,
   type WorkspaceListing,
@@ -60,6 +75,7 @@ import {
   workspaceFileDownloadUrl,
 } from "../../../lib/client/files";
 import type { Presence } from "../../../lib/client/presence";
+import type { RunStreamItem } from "../../../lib/client/useRunStream";
 import { cn } from "../utils/cn";
 
 interface FilesViewProps {
@@ -86,6 +102,13 @@ interface FilesViewProps {
   readonly changedAt?: number;
   /** The full presence summary, for the rail's "agent wrote this" marker. */
   readonly presence?: Presence;
+  /**
+   * The run stream items (the same array useRunStream keeps). FilesView
+   * folds them into file activity — which files the agent just wrote, and
+   * whether a shell command just ran — so the tree lights up while the run
+   * is still streaming. VmScreen passes the array it already owns.
+   */
+  readonly streamItems?: readonly RunStreamItem[];
 }
 
 type FileKind = "code" | "image" | "text" | "binary" | "csv";
@@ -233,19 +256,38 @@ function RowChevron({ isDir, isOpen }: { readonly isDir: boolean; readonly isOpe
   return isOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />;
 }
 
-/** The badges after a rail entry's name: updated, just-changed, and the folder affordance. */
+/** The badges after a rail entry's name: updated, just-changed, touched-this-run, and the folder affordance. */
 function RowBadges({
   isDir,
   isUpdated,
   isChanged,
+  touchedLabel,
+  touchedOpacity,
 }: {
   readonly isDir: boolean;
   readonly isUpdated: boolean;
   readonly isChanged: boolean;
+  /** "edited 12s ago" — the emerald dot for a file the agent touched this run. */
+  readonly touchedLabel?: string;
+  /** Fades toward 0 as the dot ages out (60s). */
+  readonly touchedOpacity?: number;
 }) {
   return (
     <>
-      {isUpdated && <span className="shrink-0 text-[10px] text-emerald-300">Updated</span>}
+      {isUpdated && !touchedLabel && <span className="shrink-0 text-[10px] text-emerald-300">Updated</span>}
+      {touchedLabel && (
+        <span
+          className="flex shrink-0 items-center gap-1 text-[10px] text-emerald-300"
+          style={{ opacity: touchedOpacity ?? 1 }}
+        >
+          <span
+            className="h-1.5 w-1.5 rounded-full bg-emerald-400"
+            title="The agent edited this file"
+            aria-label={touchedLabel}
+          />
+          {touchedLabel}
+        </span>
+      )}
       {isChanged && (
         <span
           className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-300"
@@ -268,14 +310,18 @@ function DirChildren({
   dirState,
   depth,
   renderEntry,
+  filter,
 }: {
   readonly isOpen: boolean;
   readonly dirState?: DirState;
   readonly depth: number;
   readonly renderEntry: (entry: WorkspaceEntry, depth: number) => React.ReactNode;
+  /** When set (the "Agent activity" filter), only matching children render. */
+  readonly filter?: (entry: WorkspaceEntry) => boolean;
 }) {
   if (!isOpen) return null;
-  if (dirState?.loading) {
+  const visible = dirState?.entries?.filter((entry) => filter?.(entry) ?? true);
+  if (dirState?.loading && !visible?.length) {
     return (
       <div className="ml-2 border-l border-white/5 pl-1">
         <div className="flex items-center gap-1.5 px-2 py-1 font-mono text-[10px] text-white/30">
@@ -291,7 +337,7 @@ function DirChildren({
       </div>
     );
   }
-  if (dirState?.entries?.length === 0) {
+  if (!visible?.length) {
     return (
       <div className="ml-2 border-l border-white/5 pl-1">
         <div className="px-2 py-1 font-mono text-[10px] text-white/25">empty</div>
@@ -300,7 +346,7 @@ function DirChildren({
   }
   return (
     <div className="ml-2 border-l border-white/5 pl-1">
-      {dirState?.entries?.map((child) => renderEntry(child, depth + 1))}
+      {visible.map((child) => renderEntry(child, depth + 1))}
     </div>
   );
 }
@@ -319,9 +365,14 @@ function WorkspaceRail({
   selected,
   changedPath,
   changed,
+  touched,
+  now,
+  activityOnly,
+  dirReloads,
   onOpenFile,
   onOpenFolder,
   onRetry,
+  onToggleActivityOnly,
 }: {
   readonly path: string;
   readonly entries?: WorkspaceEntry[];
@@ -331,49 +382,100 @@ function WorkspaceRail({
   readonly changedPath?: string;
   /** Entries that changed between polls while the run is live. */
   readonly changed?: string[];
+  /** Files the agent touched this run (emerald dot + "Agent activity" filter). */
+  readonly touched: TouchedFile[];
+  /** Clock for the "edited Ns ago" labels. */
+  readonly now: number;
+  /** When true, the rail shows only files touched this run. */
+  readonly activityOnly: boolean;
+  /** Per-directory refresh tokens, bumped when the agent writes into that folder. */
+  readonly dirReloads: Record<string, number>;
   readonly onOpenFile: (entry: WorkspaceEntry) => void;
   readonly onOpenFolder: (entry: WorkspaceEntry) => void;
   readonly onRetry: () => void;
+  readonly onToggleActivityOnly: () => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [dirs, setDirs] = useState<Record<string, DirState>>({});
+
+  const loadDir = useCallback((dir: string) => {
+    setDirs((current) => ({
+      ...current,
+      [dir]: { loading: true, entries: current[dir]?.entries },
+    }));
+    fetchWorkspaceListing(dir)
+      .then((data) => {
+        setDirs((current) => ({ ...current, [dir]: { loading: false, entries: data.entries } }));
+      })
+      .catch((err) => {
+        setDirs((current) => ({
+          ...current,
+          [dir]: { loading: false, entries: current[dir]?.entries, error: describeFilesError(err) },
+        }));
+      });
+  }, []);
 
   const toggle = useCallback(
     (entry: WorkspaceEntry) => {
       const isOpen = expanded[entry.path];
       setExpanded((current) => ({ ...current, [entry.path]: !isOpen }));
       if (isOpen || dirs[entry.path]) return;
-      setDirs((current) => ({ ...current, [entry.path]: { loading: true } }));
-      fetchWorkspaceListing(entry.path)
-        .then((data) => {
-          setDirs((current) => ({ ...current, [entry.path]: { loading: false, entries: data.entries } }));
-        })
-        .catch((err) => {
-          setDirs((current) => ({
-            ...current,
-            [entry.path]: { loading: false, error: describeFilesError(err) },
-          }));
-        });
+      loadDir(entry.path);
     },
-    [dirs, expanded],
+    [dirs, expanded, loadDir],
+  );
+
+  // A write into an expanded folder re-reads just that folder, on its token.
+  // Tokens for collapsed folders stay pending until the folder opens.
+  const appliedDirReloads = useRef<Record<string, number>>({});
+  useEffect(() => {
+    for (const [dir, token] of Object.entries(dirReloads)) {
+      if (token === (appliedDirReloads.current[dir] ?? 0)) continue;
+      if (!expanded[dir]) continue;
+      appliedDirReloads.current[dir] = token;
+      loadDir(dir);
+    }
+  }, [dirReloads, expanded, loadDir]);
+
+  const touchedByPath = useMemo(
+    () => new Map(touched.map((entry) => [entry.path, entry])),
+    [touched],
+  );
+
+  /** A row stays visible under the activity filter when it is touched itself or holds touched files. */
+  const isActivityVisible = useCallback(
+    (entry: WorkspaceEntry): boolean => {
+      if (touchedByPath.has(entry.path)) return true;
+      if (entry.type !== "directory") return false;
+      const prefix = `${entry.path}/`;
+      for (const touchedPath of touchedByPath.keys()) {
+        if (touchedPath.startsWith(prefix)) return true;
+      }
+      return false;
+    },
+    [touchedByPath],
   );
 
   const sorted = useMemo(() => {
     if (!entries) return [];
     // Folders first, then files; alphabetical within each, like a tree view.
-    return [...entries].sort((a, b) => {
+    const ordered = [...entries].sort((a, b) => {
       const dir = Number(b.type === "directory") - Number(a.type === "directory");
       return dir !== 0 ? dir : a.name.localeCompare(b.name);
     });
-  }, [entries]);
+    return activityOnly ? ordered.filter(isActivityVisible) : ordered;
+  }, [entries, activityOnly, isActivityVisible]);
 
   const renderEntry = (entry: WorkspaceEntry, depth: number): React.ReactNode => {
     const isDir = entry.type === "directory";
     const isOpen = Boolean(expanded[entry.path]);
     const isSelected = selected === entry.path;
     const isChanged = changedPath === entry.path;
-    const isUpdated = !isChanged && (changed?.includes(entry.path) ?? false);
+    const touchedEntry = touchedByPath.get(entry.path);
+    const isTouched = touchedEntry !== undefined;
+    const isUpdated = !isChanged && ((changed?.includes(entry.path) ?? false) || isTouched);
     const dirState = dirs[entry.path];
+    const touchedAge = isTouched ? Math.max(0, now - touchedEntry.at) : 0;
     return (
       <div key={entry.path}>
         <button
@@ -393,10 +495,22 @@ function WorkspaceRail({
           </span>
           {entryIcon(entry, isOpen)}
           <span className="min-w-0 flex-1 truncate">{entry.name}</span>
-          <RowBadges isDir={isDir} isUpdated={isUpdated} isChanged={isChanged} />
+          <RowBadges
+            isDir={isDir}
+            isUpdated={isUpdated}
+            isChanged={isChanged}
+            touchedLabel={isTouched ? formatEditedAgo(touchedEntry.at, now) : undefined}
+            touchedOpacity={isTouched ? Math.max(0.3, 1 - touchedAge / TOUCHED_DOT_TTL_MS) : undefined}
+          />
         </button>
         {isDir && (
-          <DirChildren isOpen={isOpen} dirState={dirState} depth={depth} renderEntry={renderEntry} />
+          <DirChildren
+            isOpen={isOpen}
+            dirState={dirState}
+            depth={depth}
+            renderEntry={renderEntry}
+            filter={activityOnly ? isActivityVisible : undefined}
+          />
         )}
       </div>
     );
@@ -407,7 +521,25 @@ function WorkspaceRail({
       <div className="flex h-7 shrink-0 items-center gap-1.5 border-b border-white/[0.07] px-2.5 font-mono text-[10px] uppercase tracking-wider text-white/35">
         <Folder className="h-3 w-3 text-amber-300/70" />
         Workspace
-        {entries && <span className="ml-auto tabular-nums text-white/25">{entries.length}</span>}
+        {entries && <span className="tabular-nums text-white/25">{entries.length}</span>}
+        <button
+          type="button"
+          onClick={onToggleActivityOnly}
+          disabled={touched.length === 0 && !activityOnly}
+          title="Show only files the agent touched this run"
+          aria-pressed={activityOnly}
+          aria-label="Agent activity filter"
+          className={cn(
+            "ml-auto flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 normal-case tracking-normal transition-colors disabled:cursor-not-allowed disabled:opacity-30",
+            activityOnly
+              ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
+              : "border-white/10 text-white/50 hover:bg-white/10 hover:text-white",
+          )}
+        >
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+          Agent activity
+          {touched.length > 0 && <span className="tabular-nums">{touched.length}</span>}
+        </button>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-1.5 scrollbar-thin">
         {error ? (
@@ -427,11 +559,19 @@ function WorkspaceRail({
             <Loader2 className="h-3 w-3 animate-spin" /> Loading workspace…
           </div>
         ) : sorted.length === 0 ? (
-          <div className="px-2 py-3 font-mono text-[10px] leading-relaxed text-white/30" data-testid="files-empty">
-            This workspace is empty.
-            <br />
-            The first run fills it with project files.
-          </div>
+          activityOnly ? (
+            <div className="px-2 py-3 font-mono text-[10px] leading-relaxed text-white/30" data-testid="files-activity-empty">
+              No files touched yet this run.
+              <br />
+              The agent&apos;s edits will appear here as it works.
+            </div>
+          ) : (
+            <div className="px-2 py-3 font-mono text-[10px] leading-relaxed text-white/30" data-testid="files-empty">
+              This workspace is empty.
+              <br />
+              The first run fills it with project files.
+            </div>
+          )
         ) : (
           sorted.map((entry) => renderEntry(entry, 0))
         )}
@@ -442,7 +582,14 @@ function WorkspaceRail({
 
 /* ── The reading pane ────────────────────────────────────────────────────── */
 
-function CodeBody({ content }: { readonly content: string }) {
+function CodeBody({
+  content,
+  highlightRange,
+}: {
+  readonly content: string;
+  /** Lines the agent just changed — shown briefly in emerald. */
+  readonly highlightRange?: ChangedLineRange;
+}) {
   const [limit, setLimit] = useState(FILE_RENDER_CHUNK);
   const { lines, hidden } = useMemo(() => visibleSlice(content, limit), [content, limit]);
   // A new file starts at the first chunk again.
@@ -459,14 +606,21 @@ function CodeBody({ content }: { readonly content: string }) {
       <div className="min-h-0 flex-1 overflow-auto scrollbar-thin">
         <table className="w-full border-separate border-spacing-0 font-mono text-[11px] leading-[1.55]">
           <tbody>
-            {lines.map((line, index) => (
-              <tr key={index}>
-                <td className="w-10 select-none border-r border-white/[0.05] pr-2 text-right align-top text-white/20">
-                  {index + 1}
-                </td>
-                <td className="whitespace-pre-wrap break-words pl-3 pr-4 align-top text-white/80">{line || " "}</td>
-              </tr>
-            ))}
+            {lines.map((line, index) => {
+              const lineNo = index + 1;
+              const isHighlighted =
+                highlightRange !== undefined &&
+                lineNo >= highlightRange.startLine &&
+                lineNo <= highlightRange.endLine;
+              return (
+                <tr key={index} className={isHighlighted ? "bg-emerald-400/10" : undefined}>
+                  <td className="w-10 select-none border-r border-white/[0.05] pr-2 text-right align-top text-white/20">
+                    {lineNo}
+                  </td>
+                  <td className="whitespace-pre-wrap break-words pl-3 pr-4 align-top text-white/80">{line || " "}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -627,6 +781,13 @@ export function relativeAge(modifiedAt: number | undefined, now: number): string
 /** Recent-files poll interval while a run streams (one in-VM find per tick). */
 export const RECENT_POLL_MS = 8_000;
 
+/** Debounce for refreshing a directory after the agent writes into it. */
+export const FILE_EDIT_REFRESH_MS = 500;
+/** Debounce for a full refresh after a shell command (it may touch anything). */
+export const BASH_REFRESH_MS = 2_000;
+/** How long a changed-line highlight stays in the reading pane. */
+export const HIGHLIGHT_HOLD_MS = 6_000;
+
 /** Recently touched files across the whole workspace, polled while the run streams. */
 function RecentStrip({ live, refreshToken, onOpen }: {
   readonly live: boolean;
@@ -726,11 +887,13 @@ function PreviewBody({
   file,
   fileLoading,
   fileError,
+  highlightRange,
 }: {
   readonly variant: PreviewVariant;
   readonly file?: WorkspaceFile;
   readonly fileLoading: boolean;
   readonly fileError?: string;
+  readonly highlightRange?: ChangedLineRange;
 }) {
   if (fileLoading && !file) {
     return (
@@ -776,7 +939,7 @@ function PreviewBody({
   }
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <CodeBody content={file?.content ?? ""} />
+      <CodeBody content={file?.content ?? ""} highlightRange={highlightRange} />
       {file?.truncated && (
         <div className="flex items-center gap-1.5 border-t border-amber-400/20 bg-amber-400/10 px-3 py-1.5 text-[10px] text-amber-200/80">
           <AlertTriangle className="h-3 w-3 shrink-0" />
@@ -797,6 +960,7 @@ function FilePreview({
   file,
   fileLoading,
   fileError,
+  highlightRange,
   canCopy,
   copied,
   onCopy,
@@ -810,6 +974,7 @@ function FilePreview({
   readonly file?: WorkspaceFile;
   readonly fileLoading: boolean;
   readonly fileError?: string;
+  readonly highlightRange?: ChangedLineRange;
   readonly canCopy: boolean;
   readonly copied: boolean;
   readonly onCopy: () => void;
@@ -874,12 +1039,26 @@ function FilePreview({
         </span>
       </div>
 
-      <PreviewBody variant={variant} file={file} fileLoading={fileLoading} fileError={fileError} />
+      <PreviewBody
+        variant={variant}
+        file={file}
+        fileLoading={fileLoading}
+        fileError={fileError}
+        highlightRange={highlightRange}
+      />
     </>
   );
 }
 
-export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, presence, live = false }: FilesViewProps) {
+export function FilesView({
+  refreshToken = 0,
+  openPath,
+  changedPath,
+  changedAt,
+  presence,
+  live = false,
+  streamItems,
+}: FilesViewProps) {
   const [path, setPath] = useState(WORKSPACE_ROOT);
   const [listing, setListing] = useState<WorkspaceListing>();
   const [loading, setLoading] = useState(true);
@@ -887,6 +1066,22 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
   const [reload, setReload] = useState(0);
   const previousListing = useRef<WorkspaceListing | undefined>(undefined);
   const [changed, setChanged] = useState<string[]>([]);
+
+  // Live file changes (l8): files the agent touched this run, folded from
+  // the run stream. `touched` drives the emerald dots and the activity
+  // filter; `dirReload`/`fileReload`/`dirReloads` are the debounced
+  // re-reads those edits trigger.
+  const [touched, setTouched] = useState<TouchedFile[]>([]);
+  const [now, setNow] = useState(() => Date.now());
+  const [activityOnly, setActivityOnly] = useState(false);
+  const [dirReload, setDirReload] = useState(0);
+  const [fileReload, setFileReload] = useState(0);
+  const [dirReloads, setDirReloads] = useState<Record<string, number>>({});
+  const [highlight, setHighlight] = useState<{
+    path: string;
+    range: ChangedLineRange;
+    key: number;
+  }>();
 
   useEffect(() => {
     if (!live) return;
@@ -899,6 +1094,92 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState<string>();
   const [copied, setCopied] = useState(false);
+
+  // Latest-value refs for the stream effect below (it runs on the folded
+  // activity, not on every path/selection change).
+  const pathRef = useRef(path);
+  pathRef.current = path;
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const lastHandledSeq = useRef(0);
+  const pendingDirsRef = useRef(new Set<string>());
+  const pendingHighlightRef = useRef<{ path: string; newTexts: string[] } | undefined>(undefined);
+  const dirTriggerRef = useRef<DebouncedTrigger | undefined>(undefined);
+  const fileTriggerRef = useRef<DebouncedTrigger | undefined>(undefined);
+  const bashTriggerRef = useRef<DebouncedTrigger | undefined>(undefined);
+  const getTrigger = (ref: React.MutableRefObject<DebouncedTrigger | undefined>): DebouncedTrigger => {
+    if (!ref.current) ref.current = new DebouncedTrigger();
+    return ref.current;
+  };
+
+  const activity = useMemo(() => deriveFileActivity(streamItems ?? []), [streamItems]);
+
+  // Fold new stream events into touched files and debounced re-reads. A
+  // burst of writes refreshes once: the affected directories re-read after
+  // 500ms, the open preview reloads with them, and a shell command
+  // re-reads the whole view after 2s (it may touch anything).
+  useEffect(() => {
+    const nowMs = Date.now();
+    const fresh = activity.edits.filter(
+      (edit) => edit.seq > lastHandledSeq.current && nowMs - edit.at < TOUCHED_DOT_TTL_MS,
+    );
+    const freshBash =
+      activity.bashSeq !== undefined && activity.bashSeq > lastHandledSeq.current;
+    lastHandledSeq.current = Math.max(lastHandledSeq.current, activity.seq);
+    if (fresh.length === 0 && !freshBash) return;
+    if (fresh.length > 0) {
+      setTouched((prev) => pruneTouchedFiles(mergeTouchedFiles(prev, fresh), nowMs));
+      for (const edit of fresh) {
+        const dir = parentWorkspacePath(edit.path) ?? WORKSPACE_ROOT;
+        pendingDirsRef.current.add(dir);
+        if (edit.path === selectedRef.current) {
+          pendingHighlightRef.current = { path: edit.path, newTexts: edit.newTexts };
+        }
+      }
+      getTrigger(dirTriggerRef).trigger(() => {
+        const dirs = [...pendingDirsRef.current];
+        pendingDirsRef.current.clear();
+        let refreshCurrent = false;
+        const subdirs: string[] = [];
+        for (const dir of dirs) {
+          if (dir === pathRef.current) refreshCurrent = true;
+          else subdirs.push(dir);
+        }
+        if (refreshCurrent) setDirReload((n) => n + 1);
+        if (subdirs.length > 0) {
+          setDirReloads((prev) => {
+            const next = { ...prev };
+            for (const dir of subdirs) next[dir] = (next[dir] ?? 0) + 1;
+            return next;
+          });
+        }
+        if (pendingHighlightRef.current) setFileReload((n) => n + 1);
+      }, FILE_EDIT_REFRESH_MS);
+    }
+    if (freshBash) {
+      getTrigger(bashTriggerRef).trigger(() => setReload((n) => n + 1), BASH_REFRESH_MS);
+    }
+  }, [activity]);
+
+  // The "edited Ns ago" clock: tick while any dot is alive, pruning dots
+  // that aged past the TTL.
+  const hasTouched = touched.length > 0;
+  useEffect(() => {
+    if (!hasTouched) return;
+    const timer = window.setInterval(() => {
+      const at = Date.now();
+      setNow(at);
+      setTouched((prev) => pruneTouchedFiles(prev, at));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [hasTouched]);
+
+  // A changed-line highlight is brief: it clears a few seconds after it lands.
+  useEffect(() => {
+    if (!highlight) return;
+    const timer = window.setTimeout(() => setHighlight(undefined), HIGHLIGHT_HOLD_MS);
+    return () => window.clearTimeout(timer);
+  }, [highlight]);
 
   // A file picked elsewhere (the Codebase treemap) opens here: show its
   // folder and select it.
@@ -923,8 +1204,8 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
     setSelected(changedPath);
   }, [changedPath, changedAt]);
 
-  // Directory listing (also reloads when a run finishes, the agent writes, or
-  // the user refreshes).
+  // Directory listing (also reloads when a run finishes, the agent writes
+  // into this directory — debounced, via dirReload — or the user refreshes).
   useEffect(() => {
     const ctrl = new AbortController();
     // Stale-while-revalidate: a refresh (a streaming run finishes a tool, the
@@ -948,24 +1229,42 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
         if (!ctrl.signal.aborted) setLoading(false);
       });
     return () => ctrl.abort();
-  }, [path, refreshToken, reload, changedAt]);
+  }, [path, refreshToken, reload, dirReload]);
 
-  // Open file preview (re-read on refresh, and on the agent's write, so the
-  // latest bytes show while the run is still streaming).
+  // Open file preview (re-read on refresh, and on the agent's write to this
+  // file — debounced, via fileReload — so the latest bytes show while the
+  // run is still streaming). When the reload follows an edit, the changed
+  // lines are highlighted: from the edit's new text when it matches, else
+  // by diffing the previous bytes against the new ones.
+  const fileContentRef = useRef<string | undefined>(undefined);
   useEffect(() => {
+    // A highlight is only for the file it was recorded for: navigating away
+    // drops it instead of highlighting stale lines later.
+    if (pendingHighlightRef.current?.path !== selected) {
+      pendingHighlightRef.current = undefined;
+    }
     if (!selected) {
       setFile(undefined);
       setFileError(undefined);
       setFileLoading(false);
+      fileContentRef.current = undefined;
       return;
     }
     const ctrl = new AbortController();
+    const before = fileContentRef.current;
     setFileLoading(true);
     setFileError(undefined);
     fetchWorkspaceFile(selected, { signal: ctrl.signal })
       .then((data) => {
         if (ctrl.signal.aborted) return;
         setFile(data);
+        fileContentRef.current = data.content;
+        const pending = pendingHighlightRef.current;
+        if (pending && pending.path === selected) {
+          pendingHighlightRef.current = undefined;
+          const range = highlightRangeForEdit(before, data.content ?? "", pending.newTexts);
+          if (range) setHighlight({ path: selected, range, key: Date.now() });
+        }
       })
       .catch((err) => {
         if (isAbort(err) || ctrl.signal.aborted) return;
@@ -976,7 +1275,7 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
         if (!ctrl.signal.aborted) setFileLoading(false);
       });
     return () => ctrl.abort();
-  }, [selected, refreshToken, reload, changedAt]);
+  }, [selected, refreshToken, reload, fileReload]);
 
   useEffect(() => {
     setCopied(false);
@@ -1087,9 +1386,14 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
           selected={selected}
           changedPath={changedPath}
           changed={changed}
+          touched={touched}
+          now={now}
+          activityOnly={activityOnly}
+          dirReloads={dirReloads}
           onOpenFile={openEntry}
           onOpenFolder={openEntry}
           onRetry={() => setReload((n) => n + 1)}
+          onToggleActivityOnly={() => setActivityOnly((current) => !current)}
         />
 
         {/* Reading pane */}
@@ -1124,6 +1428,7 @@ export function FilesView({ refreshToken = 0, openPath, changedPath, changedAt, 
               file={file}
               fileLoading={fileLoading}
               fileError={fileError}
+              highlightRange={highlight?.path === selected ? highlight.range : undefined}
               canCopy={canCopy}
               copied={copied}
               onCopy={copyContent}

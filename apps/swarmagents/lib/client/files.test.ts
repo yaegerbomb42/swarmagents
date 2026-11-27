@@ -1,7 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  changedLineRange,
+  DebouncedTrigger,
+  deriveFileActivity,
   FileBrowserError,
+  formatEditedAgo,
+  highlightRangeForEdit,
+  locateTextRange,
+  mergeTouchedFiles,
+  pruneTouchedFiles,
+  TOUCHED_DOT_TTL_MS,
   WORKSPACE_ROOT,
   describeFilesError,
   fetchRecentWorkspaceFiles,
@@ -12,8 +21,12 @@ import {
   normalizeWorkspacePath,
   parentWorkspacePath,
   workspaceFileDownloadUrl,
+  type DebounceClock,
   type FetchLike,
+  type FileEditEvent,
+  type TouchedFile,
 } from "./files";
+import type { RunStreamItem } from "./useRunStream";
 
 function fakeFetch(body: unknown, init?: ResponseInit & { raw?: string }): FetchLike {
   return async () =>
@@ -258,4 +271,251 @@ test("fetchRecentWorkspaceFiles maps errors and malformed payloads", async () =>
     fetchRecentWorkspaceFiles({ fetchImpl }),
     (err: unknown) => err instanceof FileBrowserError && err.kind === "network",
   );
+});
+
+/* ── Live file changes (l8) ────────────────────────────────────────────── */
+
+/** One stream item, with the fields the fold reads. */
+function streamItem(
+  seq: number,
+  kind: string,
+  payload: Record<string, unknown> = {},
+  ts = 1_000 + seq,
+): RunStreamItem {
+  return { seq, kind, data: payload, ts, runId: "run_test" } as unknown as RunStreamItem;
+}
+
+function toolCall(
+  seq: number,
+  name: string,
+  input: Record<string, unknown>,
+  id?: string,
+): RunStreamItem {
+  const payload: Record<string, unknown> = { name, input };
+  if (id !== undefined) payload.id = id;
+  return streamItem(seq, "tool.call", payload);
+}
+
+function toolResult(seq: number, ok = true, id?: string): RunStreamItem {
+  const payload: Record<string, unknown> = { ok };
+  if (id !== undefined) payload.id = id;
+  return streamItem(seq, "tool.result", payload);
+}
+
+test("deriveFileActivity maps write tool results to workspace paths", () => {
+  const activity = deriveFileActivity([
+    streamItem(1, "run.started"),
+    toolCall(2, "Write", { file_path: "/workspace/hello.py" }),
+    toolResult(3),
+    toolCall(4, "Edit", { file_path: "src/app.ts", old_string: "a", new_string: "b" }),
+    toolResult(5),
+    toolCall(6, "MultiEdit", {
+      file_path: "/workspace/notes.md",
+      edits: [{ old_string: "x", new_string: "y" }, { old_string: "p", new_string: "q" }],
+    }),
+    toolResult(7),
+    toolCall(8, "NotebookEdit", { notebook_path: "/workspace/analysis.ipynb", new_source: "print(1)" }),
+    toolResult(9),
+  ]);
+  assert.equal(activity.edits.length, 4);
+  assert.equal(activity.edits[0].path, "/workspace/hello.py");
+  assert.equal(activity.edits[0].tool, "Write");
+  assert.deepEqual(activity.edits[0].newTexts, []);
+  assert.equal(activity.edits[1].path, "/workspace/src/app.ts");
+  assert.deepEqual(activity.edits[1].newTexts, ["b"]);
+  assert.deepEqual(activity.edits[2].newTexts, ["y", "q"]);
+  assert.equal(activity.edits[3].path, "/workspace/analysis.ipynb");
+  assert.deepEqual(activity.edits[3].newTexts, ["print(1)"]);
+  assert.equal(activity.seq, 9);
+});
+
+test("deriveFileActivity accepts MCP-prefixed names and alternate path keys", () => {
+  const activity = deriveFileActivity([
+    toolCall(1, "mcp__fs__write", { path: "/workspace/a.txt" }),
+    toolResult(2),
+    toolCall(3, "str_replace_editor", { file: "/workspace/b.txt" }),
+    toolResult(4),
+  ]);
+  assert.deepEqual(
+    activity.edits.map((edit) => edit.path),
+    ["/workspace/a.txt", "/workspace/b.txt"],
+  );
+});
+
+test("deriveFileActivity ignores failed, blocked, and unmatched results", () => {
+  const activity = deriveFileActivity([
+    toolCall(1, "Write", { file_path: "/workspace/failed.py" }),
+    toolResult(2, false),
+    toolCall(3, "Write", { file_path: "/workspace/blocked.py" }),
+    streamItem(4, "tool.blocked", { name: "Write" }),
+    toolResult(5),
+    toolResult(6),
+    toolCall(7, "Read", { file_path: "/workspace/read.py" }),
+    toolResult(8),
+  ]);
+  assert.deepEqual(activity.edits, []);
+  assert.equal(activity.bashAt, undefined);
+});
+
+test("deriveFileActivity pairs results by id, else by most recent open call", () => {
+  const activity = deriveFileActivity([
+    toolCall(1, "Write", { file_path: "/workspace/a.py" }, "call-a"),
+    toolCall(2, "Bash", { command: "npm test" }, "call-b"),
+    toolResult(3, true, "call-a"),
+    toolResult(4, true, "call-b"),
+  ]);
+  assert.equal(activity.edits.length, 1);
+  assert.equal(activity.edits[0].path, "/workspace/a.py");
+  assert.equal(activity.bashAt, 1_004);
+  assert.equal(activity.bashSeq, 4);
+
+  const idLess = deriveFileActivity([
+    toolCall(1, "Write", { file_path: "/workspace/a.py" }),
+    toolCall(2, "Write", { file_path: "/workspace/b.py" }),
+    toolResult(3),
+  ]);
+  assert.deepEqual(
+    idLess.edits.map((edit) => edit.path),
+    ["/workspace/b.py"],
+  );
+});
+
+test("deriveFileActivity reads nested payloads and skips paths outside the workspace", () => {
+  const activity = deriveFileActivity([
+    streamItem(1, "tool.call", {
+      data: { name: "Write", input: { file_path: "/workspace/nested.py" } },
+    }),
+    streamItem(2, "tool.result", { data: { ok: true } }),
+    toolCall(3, "Write", { file_path: "/tmp/outside.txt" }),
+    toolResult(4),
+  ]);
+  assert.deepEqual(
+    activity.edits.map((edit) => edit.path),
+    ["/workspace/nested.py"],
+  );
+});
+
+test("deriveFileActivity drops calls orphaned by a new run", () => {
+  const activity = deriveFileActivity([
+    toolCall(1, "Write", { file_path: "/workspace/stale.py" }),
+    streamItem(2, "run.started"),
+    toolResult(3),
+  ]);
+  assert.deepEqual(activity.edits, []);
+});
+
+test("locateTextRange spans single and multi-line needles", () => {
+  const content = "one\ntwo\nthree\nfour\n";
+  assert.deepEqual(locateTextRange(content, "two"), { startLine: 2, endLine: 2 });
+  assert.deepEqual(locateTextRange(content, "two\nthree"), { startLine: 2, endLine: 3 });
+  assert.equal(locateTextRange(content, "five"), null);
+  assert.equal(locateTextRange(content, ""), null);
+});
+
+test("changedLineRange diffs by common prefix and suffix", () => {
+  assert.deepEqual(changedLineRange("a\nb\nc\n", "a\nB\nc\n"), { startLine: 2, endLine: 2 });
+  assert.deepEqual(changedLineRange("a\nb\n", "a\nb\nc\nd\n"), { startLine: 3, endLine: 4 });
+  assert.equal(changedLineRange("a\nb\n", "a\nb\n"), null);
+  assert.deepEqual(changedLineRange("", "x\ny\n"), { startLine: 1, endLine: 2 });
+  assert.equal(changedLineRange("x\ny\n", ""), null);
+});
+
+test("highlightRangeForEdit prefers the new text, else diffs the bytes", () => {
+  assert.deepEqual(
+    highlightRangeForEdit("a\nb\nc\n", "a\nB\nc\n", ["B"]),
+    { startLine: 2, endLine: 2 },
+  );
+  assert.deepEqual(
+    highlightRangeForEdit("a\nb\nc\n", "a\nB\nc\n", ["gone"]),
+    { startLine: 2, endLine: 2 },
+  );
+  assert.equal(highlightRangeForEdit(undefined, "a\nb\n", []), null);
+});
+
+/** A clock the test drives by hand. */
+class FakeClock implements DebounceClock {
+  private nextId = 0;
+  private readonly timers = new Map<unknown, () => void>();
+
+  setTimeout(fn: () => void): unknown {
+    const id = ++this.nextId;
+    this.timers.set(id, fn);
+    return id;
+  }
+
+  clearTimeout(id: unknown): void {
+    this.timers.delete(id);
+  }
+
+  get pendingCount(): number {
+    return this.timers.size;
+  }
+
+  fireAll(): void {
+    const pending = [...this.timers.values()];
+    this.timers.clear();
+    for (const fn of pending) fn();
+  }
+}
+
+test("DebouncedTrigger fires only the latest call, once", () => {
+  const clock = new FakeClock();
+  const trigger = new DebouncedTrigger(clock);
+  const fired: string[] = [];
+  trigger.trigger(() => fired.push("first"), 500);
+  assert.equal(trigger.isPending, true);
+  trigger.trigger(() => fired.push("second"), 500);
+  trigger.trigger(() => fired.push("third"), 500);
+  assert.equal(clock.pendingCount, 1);
+  clock.fireAll();
+  assert.deepEqual(fired, ["third"]);
+  assert.equal(trigger.isPending, false);
+});
+
+test("DebouncedTrigger cancel drops the pending call", () => {
+  const clock = new FakeClock();
+  const trigger = new DebouncedTrigger(clock);
+  let fired = false;
+  trigger.trigger(() => {
+    fired = true;
+  }, 500);
+  trigger.cancel();
+  assert.equal(trigger.isPending, false);
+  clock.fireAll();
+  assert.equal(fired, false);
+});
+
+test("formatEditedAgo labels fresh and aged writes", () => {
+  const now = 1_000_000;
+  assert.equal(formatEditedAgo(now - 1_000, now), "edited just now");
+  assert.equal(formatEditedAgo(now - 12_000, now), "edited 12s ago");
+  assert.equal(formatEditedAgo(now + 60_000, now), "edited just now");
+});
+
+test("pruneTouchedFiles drops dots past the TTL", () => {
+  const now = 1_000_000;
+  const touched: TouchedFile[] = [
+    { path: "/workspace/fresh.py", at: now - 59_000, tool: "Write", newTexts: [] },
+    { path: "/workspace/stale.py", at: now - TOUCHED_DOT_TTL_MS - 1, tool: "Edit", newTexts: [] },
+  ];
+  assert.deepEqual(
+    pruneTouchedFiles(touched, now).map((entry) => entry.path),
+    ["/workspace/fresh.py"],
+  );
+});
+
+test("mergeTouchedFiles keeps one entry per path with the newest write", () => {
+  const base: TouchedFile[] = [
+    { path: "/workspace/a.py", at: 1_000, tool: "Write", newTexts: [] },
+  ];
+  const edits: FileEditEvent[] = [
+    { path: "/workspace/b.py", at: 2_000, tool: "Edit", newTexts: ["x"], seq: 2 },
+    { path: "/workspace/a.py", at: 3_000, tool: "Edit", newTexts: ["y"], seq: 3 },
+  ];
+  const merged = mergeTouchedFiles(base, edits);
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].path, "/workspace/a.py");
+  assert.equal(merged[0].at, 3_000);
+  assert.deepEqual(merged[0].newTexts, ["y"]);
+  assert.equal(merged[1].path, "/workspace/b.py");
 });

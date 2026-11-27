@@ -37,6 +37,8 @@ export interface ComposerProps {
   /** Selected routing tier ("fast" | "balanced" | "deep"). */
   tier?: RunTier;
   onTierChange?: (tier: RunTier) => void;
+  /** When set, the input bar shows a ⌘K button that opens the command palette. */
+  onOpenPalette?: () => void;
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
   className?: string;
 }
@@ -144,6 +146,7 @@ export function Composer({
   hero = false,
   tier = "balanced",
   onTierChange,
+  onOpenPalette,
   inputRef,
   className,
 }: ComposerProps) {
@@ -359,6 +362,18 @@ export function Composer({
               </span>
             )}
           </div>
+          {onOpenPalette && (
+            <button
+              type="button"
+              data-testid="composer-open-palette"
+              onClick={onOpenPalette}
+              aria-label="Open command palette"
+              title="Commands (⌘K)"
+              className="grid h-9 shrink-0 cursor-pointer place-items-center rounded-xl px-2 text-sa-fg3 transition-colors hover:bg-sa-hover hover:text-sa-fg"
+            >
+              <span className="font-mono text-[11px] font-medium">⌘K</span>
+            </button>
+          )}
           <button
             type="button"
             data-testid="composer-send"
@@ -378,7 +393,7 @@ export function Composer({
       </div>
       <div className="mt-1.5 flex items-center justify-between gap-2 px-1">
         <p className="hidden text-[12px] text-sa-fg3 sm:block">
-          Enter to send · Shift+Enter for a new line
+          Enter to send · Shift+Enter for a new line · ⌘K for commands
         </p>
         {onTierChange && (
           <div

@@ -6,8 +6,8 @@
  *
  * The open '?' button in the header opens this small sheet. It lists exactly
  * the shortcuts the console actually supports, verified against the code:
- * the global chords in App.tsx (⌘/Ctrl+K, ⌘/Ctrl+Shift+O, Esc for dialogs),
- * the composer's Enter/Shift+Enter, the approval prompt's A/D/Shift+A, and
+ * the global chords in App.tsx (⌘/Ctrl+K opens the command palette,
+ * ⌘/Ctrl+Shift+O starts a new chat, Esc for dialogs), the composer's
  * the computer terminal's Ctrl+C cancel. If a shortcut is ever removed or
  * remapped, update SHORTCUT_GROUPS here to keep the panel truthful.
  */
@@ -33,7 +33,7 @@ export const SHORTCUT_GROUPS: readonly ShortcutGroup[] = [
   {
     title: "Chat",
     entries: [
-      { keys: ["⌘/Ctrl", "K"], description: "Focus the composer from any view" },
+      { keys: ["⌘/Ctrl", "K"], description: "Open the command palette" },
       { keys: ["⌘/Ctrl", "Shift", "O"], description: "Start a new chat" },
       { keys: ["Enter"], description: "Send the message (in the composer)" },
       { keys: ["Shift", "Enter"], description: "Add a new line (in the composer)" },

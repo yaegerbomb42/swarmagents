@@ -149,11 +149,19 @@ test("the header has a keyboard-shortcuts help button; the panel starts closed",
   assert.equal(countOf(html, 'data-testid="shortcuts-help"'), 0, "the help panel is closed by default");
 });
 
-test("workspace chords map to focus and new chat, never bare keys", async () => {
+test("the command palette starts closed, with a ⌘K hint in the input bar", async () => {
+  const html = await renderApp();
+  assert.equal(countOf(html, 'data-testid="command-palette"'), 0, "the palette is closed by default");
+  assert.equal(countOf(html, 'data-testid="composer-open-palette"'), 1, "one ⌘K button in the composer");
+  assert.match(tagOf(html, "composer-open-palette"), /aria-label="Open command palette"/);
+  assert.match(html, /⌘K for commands/, "the footer names the palette chord");
+});
+
+test("workspace chords map to the palette and new chat, never bare keys", async () => {
   const { workspaceChordAction } = await import("./App");
 
-  assert.deepEqual(workspaceChordAction({ key: "k", metaKey: true }), "focusComposer");
-  assert.deepEqual(workspaceChordAction({ key: "K", ctrlKey: true }), "focusComposer");
+  assert.deepEqual(workspaceChordAction({ key: "k", metaKey: true }), "openPalette");
+  assert.deepEqual(workspaceChordAction({ key: "K", ctrlKey: true }), "openPalette");
   assert.deepEqual(workspaceChordAction({ key: "o", metaKey: true, shiftKey: true }), "newChat");
   assert.deepEqual(workspaceChordAction({ key: "O", ctrlKey: true, shiftKey: true }), "newChat");
 

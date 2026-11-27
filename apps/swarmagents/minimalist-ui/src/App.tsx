@@ -15,7 +15,7 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ClipboardList, MessageSquare, MonitorPlay } from "lucide-react";
+import { BookOpen, CalendarClock, ClipboardList, History, Keyboard, KeyRound, MessageSquare, MonitorPlay, Plus, Settings } from "lucide-react";
 import type { ProviderConfig } from "./data";
 import { DEFAULT_AGENT_CARD } from "./data";
 import type { LogEvent } from "./engine";
@@ -27,6 +27,7 @@ import { reduceServingModel, formatServingModel } from "../../lib/client/serving
 import { formatDuration, RUN_PHASE_META, type RunPhase } from "../../lib/client/runPhase";
 import { resetVm, type RunTier } from "../../lib/client/runs";
 import { fetchSchedules, unreadScheduledRuns, type ScheduleSummary } from "../../lib/client/schedules";
+import { formatRelativeTime } from "../../lib/client/thread";
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
 import { useAgentSession } from "./hooks/useAgentSession";
 import { useBoard } from "./hooks/useBoard";
@@ -38,6 +39,7 @@ import { ApprovalGate } from "./components/ApprovalGate";
 import { BoardPanel } from "./components/BoardPanel";
 import { FirstRunSetup } from "./components/FirstRunSetup";
 import type { SampleTask } from "./lib/sampleTasks";
+import { CommandPalette, type PaletteItem } from "./components/CommandPalette";
 import { Composer, type ComposerSendResult } from "./components/Composer";
 import { useComputeOptions } from "./components/ComputePicker";
 import type { ComputerView } from "./components/ComputerScreen";
@@ -90,13 +92,14 @@ export function shouldToastRunCompletion(input: {
   );
 }
 
-export type WorkspaceChord = "focusComposer" | "newChat";
+export type WorkspaceChord = "openPalette" | "newChat";
 
 /**
  * The workspace's modifier-chord shortcuts, kept pure so tests can pin the
- * mapping without a DOM. Cmd/Ctrl+K focuses the composer; Cmd/Ctrl+Shift+O
- * starts a new chat. Plain Cmd/Ctrl+O is left alone (it is the browser's
- * "open file"). Bare keys never map here — typing must be unaffected.
+ * mapping without a DOM. Cmd/Ctrl+K opens the command palette;
+ * Cmd/Ctrl+Shift+O starts a new chat. Plain Cmd/Ctrl+O is left alone (it is
+ * the browser's "open file"). Bare keys never map here — typing must be
+ * unaffected.
  */
 export function workspaceChordAction(event: {
   key: string;
@@ -106,7 +109,7 @@ export function workspaceChordAction(event: {
 }): WorkspaceChord | null {
   if (!(event.metaKey || event.ctrlKey)) return null;
   const key = event.key.toLowerCase();
-  if (key === "k") return "focusComposer";
+  if (key === "k") return "openPalette";
   if (key === "o" && event.shiftKey) return "newChat";
   return null;
 }
@@ -233,6 +236,7 @@ export default function App() {
   );
   const [settings, setSettings] = useState<{ open: boolean; tab: SettingsTab }>({ open: false, tab: "providers" });
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const [focusTaskId, setFocusTaskId] = useState<string>();
   const [stopping, setStopping] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -390,6 +394,143 @@ export default function App() {
     focusComposer();
   }, [session, setView, focusComposer]);
 
+  // The command palette's rows: the workspace's actions plus the recent
+  // runs, so "go to run" is a real jump, not a detour through history.
+  // Every row closes the palette before it acts; the library is a separate
+  // Next.js page, so that one navigates away.
+  const paletteItems = useMemo<PaletteItem[]>(() => {
+    const closePalette = () => setPaletteOpen(false);
+    const actions: PaletteItem[] = [
+      {
+        id: "new-thread",
+        group: "Actions",
+        label: "New thread",
+        hint: "Start a fresh conversation",
+        shortcut: ["⌘/Ctrl", "Shift", "O"],
+        icon: <Plus className="h-4 w-4" aria-hidden />,
+        disabled: busy,
+        run: () => {
+          closePalette();
+          handleNewChat();
+        },
+      },
+      {
+        id: "go-to-run",
+        group: "Actions",
+        label: "Go to run…",
+        hint: "Browse all runs",
+        icon: <History className="h-4 w-4" aria-hidden />,
+        run: () => {
+          closePalette();
+          setHistoryOpen(true);
+        },
+      },
+      {
+        id: "open-settings",
+        group: "Actions",
+        label: "Open Settings",
+        hint: "Providers, agent, computers…",
+        icon: <Settings className="h-4 w-4" aria-hidden />,
+        run: () => {
+          closePalette();
+          openSettings("providers");
+        },
+      },
+      {
+        id: "open-library",
+        group: "Actions",
+        label: "Open Library",
+        hint: "Skills, connectors, and saved items",
+        icon: <BookOpen className="h-4 w-4" aria-hidden />,
+        run: () => {
+          window.location.assign("/library");
+        },
+      },
+      {
+        id: "toggle-vm-screen",
+        group: "Actions",
+        label: "Toggle VM screen",
+        hint:
+          effectiveView === "screen"
+            ? "Showing the computer — switch to chat"
+            : "Showing chat — switch to the computer",
+        icon: <MonitorPlay className="h-4 w-4" aria-hidden />,
+        run: () => {
+          closePalette();
+          setView(effectiveView === "screen" ? "chat" : "screen");
+        },
+      },
+      {
+        id: "switch-provider",
+        group: "Actions",
+        label: "Switch provider…",
+        hint: "Settings · Providers",
+        icon: <KeyRound className="h-4 w-4" aria-hidden />,
+        run: () => {
+          closePalette();
+          openSettings("providers");
+        },
+      },
+      {
+        id: "view-schedules",
+        group: "Actions",
+        label: "View schedules",
+        hint: "Settings · Agent",
+        icon: <CalendarClock className="h-4 w-4" aria-hidden />,
+        run: () => {
+          closePalette();
+          openSettings("agent");
+        },
+      },
+      {
+        id: "show-shortcuts",
+        group: "Actions",
+        label: "Show shortcuts",
+        hint: "Every keyboard shortcut",
+        icon: <Keyboard className="h-4 w-4" aria-hidden />,
+        run: () => {
+          closePalette();
+          setShortcutsOpen(true);
+        },
+      },
+      {
+        id: "focus-composer",
+        group: "Actions",
+        label: "Focus the composer",
+        hint: "Jump back to the input bar",
+        icon: <MessageSquare className="h-4 w-4" aria-hidden />,
+        run: () => {
+          closePalette();
+          if (!wide) setView((current) => (current === "board" ? "chat" : current));
+          focusComposer();
+        },
+      },
+    ];
+    const runs: PaletteItem[] = session.threads.slice(0, 6).map((thread) => ({
+      id: `run:${thread.id}`,
+      group: "Recent runs",
+      label: thread.title || "Untitled run",
+      hint: `${formatRelativeTime(thread.updatedAt)} · ${thread.runCount} run${thread.runCount === 1 ? "" : "s"}`,
+      icon: <History className="h-4 w-4" aria-hidden />,
+      run: () => {
+        closePalette();
+        session.selectThread(thread.id);
+        if (!wide) setView("chat");
+      },
+    }));
+    return [...actions, ...runs];
+  }, [
+    busy,
+    handleNewChat,
+    effectiveView,
+    setView,
+    openSettings,
+    setShortcutsOpen,
+    focusComposer,
+    wide,
+    session,
+  ]);
+
   const handleOpenLiveDesktop = useCallback(async () => {
     if (session.signedOut) {
       openSettings("account");
@@ -482,34 +623,36 @@ export default function App() {
     [setView],
   );
 
-  // Cmd/Ctrl+K focus (unchanged), Cmd/Ctrl+Shift+O new chat. Esc closes the
-  // console's own overlays — history, settings, the shortcuts help — the way
-  // every other overlay in the app closes (the Sheet component handles its own
-  // Esc; this fallback covers the ones App owns). Bare keys are never handled
-  // here, so typing in the composer is unaffected.
+  // Cmd/Ctrl+K toggles the command palette, Cmd/Ctrl+Shift+O starts a new
+  // chat. Esc closes the console's own overlays — palette first, then
+  // history, settings, the shortcuts help — the way every other overlay in
+  // the app closes (the Sheet component handles its own Esc; this fallback
+  // covers the ones App owns). While the palette is open, new-chat stays
+  // off: the palette owns the keyboard until it closes. Bare keys are never
+  // handled here, so typing in the composer is unaffected.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const action = workspaceChordAction(event);
-      if (action === "focusComposer") {
+      if (action === "openPalette") {
         event.preventDefault();
-        if (!wide) setView((current) => (current === "board" ? "chat" : current));
-        focusComposer();
+        setPaletteOpen((current) => !current);
         return;
       }
       if (action === "newChat") {
-        if (busy) return;
+        if (busy || paletteOpen) return;
         event.preventDefault();
         handleNewChat();
         return;
       }
       if (event.key !== "Escape") return;
-      if (shortcutsOpen) setShortcutsOpen(false);
+      if (paletteOpen) setPaletteOpen(false);
+      else if (shortcutsOpen) setShortcutsOpen(false);
       else if (settings.open) closeSettings();
       else if (historyOpen) setHistoryOpen(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [wide, setView, focusComposer, handleNewChat, busy, shortcutsOpen, settings.open, closeSettings, historyOpen]);
+  }, [wide, setView, focusComposer, handleNewChat, busy, paletteOpen, shortcutsOpen, settings.open, closeSettings, historyOpen]);
 
   // ---- Layout configuration ----
 
@@ -799,6 +942,7 @@ export default function App() {
             onSend={handleSend}
             tier={tier}
             onTierChange={setTier}
+            onOpenPalette={() => setPaletteOpen(true)}
             blockedReason={
               session.signedOut ? "Sign in to send" : setup.needsProvider ? "Add a provider key to send" : undefined
             }
@@ -856,6 +1000,9 @@ export default function App() {
 
       {/* Slide-over Keyboard Shortcuts Help */}
       <ShortcutsHelp open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+
+      {/* Cmd/Ctrl+K command palette */}
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} items={paletteItems} />
     </div>
   );
 }

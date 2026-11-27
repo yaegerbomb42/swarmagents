@@ -2,28 +2,47 @@
  * idle-loop.ts — Always-on A1: LLM-proposed creative work loop (24/7, never idle).
  *
  * Today an agent run ends when its task ends and A1 sits idle. This loop
- * keeps A1 working on its own: when there is no user run active and no open
- * board task A1 can claim, it asks the configured LLM for ONE concrete
- * creative improvement (a UI polish, a piece of content, a small feature, a
- * real fix), grounded in a short repo digest, validates the proposal against
- * an allowlist/denylist, turns it into a board task, dispatches an
- * implementation run, and loops again.
+ * keeps A1 working on its own: when the user has no run active, it asks the
+ * router-chosen fast model for ONE concrete creative improvement (a UI
+ * polish, a piece of content, a small feature, a real fix), grounded in a
+ * short repo digest, validates the proposal against an allowlist/denylist,
+ * and turns it into a board task for a human or worker to pick up.
+ *
+ * Propose-only MVP (James's redesign, 2026-11-26): the loop NEVER dispatches
+ * an implementation run by default. Dispatch is a follow-up behind its own
+ * flag (SWARM_A1_IDLE_LOOP_DISPATCH=1) and goes through the normal approval
+ * gateway (fullAuto: false), never fullAuto: true — so irreversible steps
+ * still need a human.
  *
  * Safety, by design:
  * - OFF by default. The loop only runs when SWARM_A1_IDLE_LOOP=1 is set
  *   explicitly. There is no implicit enablement in tests or dev.
  * - Kill-switch: setting SWARM_A1_IDLE_LOOP=0 (or calling stop()) stops the
- *   loop within one iteration — the flag is re-checked before any
- *   implementation is dispatched, so a loop that is killed mid-iteration
- *   never starts new work.
+ *   loop within one iteration — the flag is re-checked before any board
+ *   task is created and again before any dispatch, so a loop that is
+ *   killed mid-iteration never starts new work.
  * - Board pause signal: any open board task whose title contains
  *   "[a1-loop-pause]" pauses the loop until the task is closed.
  * - Denylist: proposals touching billing, deploy, secrets/credentials,
  *   auth, user data, or destructive ops are rejected, never executed.
+ *   The denylist is a backstop, not the defence: because the loop only
+ *   proposes, a proposal that slips past it still lands as a board task
+ *   a human reviews — it is never executed automatically.
  * - Token budget: one bounded LLM call per iteration, capped by
- *   HARD_CAP_TOKENS_PER_ITERATION.
- * - Concurrency: an iteration never overlaps another; a second caller gets
- *   an "already-running" result.
+ *   HARD_CAP_TOKENS_PER_ITERATION, on the router's fast tier (never a
+ *   hard-coded paid model) with the user's preferFreeProviders respected.
+ * - Daily cap: at most SWARM_A1_IDLE_LOOP_DAILY_CAP (default 2) loop
+ *   outputs per user per day, persisted to disk so a restart does not
+ *   reset it. A failed or refused dispatch latches the loop off for the
+ *   rest of the day instead of retrying every 5 minutes.
+ * - Concurrency: one loop object per user at module level, so the
+ *   "never two iterations concurrently" guard is real across ticks.
+ * - Idleness is scoped to the user's own runs (active exec, active or
+ *   queued run) — never to the shared board, which always has open tasks.
+ *   A dispatched run claims the task it was created for.
+ * - Per-user scoping: loop-created tasks carry a per-user marker, and
+ *   the loop dedupes against its own user's open proposals, so two
+ *   always-on users never duplicate each other's proposals.
  * - No real LLM calls in tests: the LLM call is an injected dependency.
  *
  * The engine is dependency-injected (same pattern as lib/runtime/schedules):
@@ -33,14 +52,22 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
 import { handleCreateTask } from "../board/handlers";
-import { loadStore } from "../board/store";
+import { getStoragePaths, loadStore } from "../board/store";
 import { forwardLlmNonStreaming } from "../runtime/llm-gateway";
 import { getRuntimeManager } from "../runtime/manager";
 import { parseAlwaysOnUsers } from "../vm/idle";
 
 /** Env flag for the kill-switch. The loop only runs when this is exactly "1". */
 export const A1_IDLE_LOOP_ENV = "SWARM_A1_IDLE_LOOP";
+
+/** Second flag: only when this is exactly "1" may the loop dispatch an implementation run. Default: propose-only. */
+export const A1_IDLE_LOOP_DISPATCH_ENV = "SWARM_A1_IDLE_LOOP_DISPATCH";
+
+/** Env flag for the hard daily cap (loop outputs per user per day). */
+export const A1_IDLE_LOOP_DAILY_CAP_ENV = "SWARM_A1_IDLE_LOOP_DAILY_CAP";
 
 /** Open board task title marker that pauses the loop until the task closes. */
 export const A1_IDLE_LOOP_PAUSE_MARKER = "[a1-loop-pause]";
@@ -49,6 +76,17 @@ export const A1_IDLE_LOOP_PAUSE_MARKER = "[a1-loop-pause]";
 export const DEFAULT_MAX_TOKENS_PER_ITERATION = 2000;
 /** Hard cap: no iteration may ask the LLM for more than this. */
 export const HARD_CAP_TOKENS_PER_ITERATION = 4000;
+
+/** Default hard daily cap: at most this many loop outputs per user per day. */
+export const DEFAULT_DAILY_CAP = 2;
+/** Upper bound for the daily cap env override (a larger value is clamped). */
+export const MAX_DAILY_CAP = 10;
+
+/** Router tier for the proposal call: cheap and fast; the router picks the provider (respecting preferFreeProviders). */
+export const IDLE_LOOP_MODEL_TIER = "fast" as const;
+
+/** Persisted daily-budget file, under the storage dir (same pattern as handoffs.json). */
+export const IDLE_LOOP_BUDGET_FILENAME = "idle-loop-budget.json";
 
 /** Repo digest bounds: at most this many items per section, this many chars total. */
 export const MAX_DIGEST_ITEMS = 10;
@@ -130,6 +168,159 @@ export function isIdleLoopPaused(
   openTasks: Array<{ title: string }>,
 ): boolean {
   return openTasks.some((task) => task.title.includes(A1_IDLE_LOOP_PAUSE_MARKER));
+}
+
+/** Dispatch is opt-in behind a second flag. Default: propose-only. */
+export function isDispatchEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env[A1_IDLE_LOOP_DISPATCH_ENV] === "1";
+}
+
+/** Clamp the daily-cap env override to 0..MAX_DAILY_CAP (default 2). */
+export function resolveDailyCap(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = Number(env[A1_IDLE_LOOP_DAILY_CAP_ENV]);
+  if (!Number.isFinite(raw)) return DEFAULT_DAILY_CAP;
+  return Math.max(0, Math.min(Math.floor(raw), MAX_DAILY_CAP));
+}
+
+/**
+ * Per-user marker stamped into every loop-created board task description.
+ * The board is global, so the marker is how one user's loop recognises its
+ * own proposals (for dedupe) without touching another user's.
+ */
+export function idleLoopUserMarker(userId: string): string {
+  return `[a1-loop user:${userId}]`;
+}
+
+/** One day of loop budget for one user. `failed` latches the loop off for the rest of the day. */
+export interface IdleLoopBudgetState {
+  date: string;
+  actions: number;
+  failed: boolean;
+}
+
+export interface IdleLoopBudgetStore {
+  load(userId: string): IdleLoopBudgetState;
+  recordAction(userId: string): void;
+  recordFailure(userId: string): void;
+}
+
+function utcToday(today?: () => string): string {
+  return today ? today() : new Date().toISOString().slice(0, 10);
+}
+
+function freshBudgetState(date: string): IdleLoopBudgetState {
+  return { date, actions: 0, failed: false };
+}
+
+function isBudgetState(value: unknown): value is IdleLoopBudgetState {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Partial<IdleLoopBudgetState>;
+  return (
+    typeof v.date === "string" &&
+    typeof v.actions === "number" &&
+    typeof v.failed === "boolean"
+  );
+}
+
+/** In-memory budget store (tests, and any caller that does not need persistence). */
+export function createMemoryBudgetStore(
+  today?: () => string,
+): IdleLoopBudgetStore {
+  const states = new Map<string, IdleLoopBudgetState>();
+  const current = (userId: string): IdleLoopBudgetState => {
+    const date = utcToday(today);
+    const stored = states.get(userId);
+    if (stored && stored.date === date) return stored;
+    const fresh = freshBudgetState(date);
+    states.set(userId, fresh);
+    return fresh;
+  };
+  return {
+    load(userId) {
+      return { ...current(userId) };
+    },
+    recordAction(userId) {
+      current(userId).actions += 1;
+    },
+    recordFailure(userId) {
+      current(userId).failed = true;
+    },
+  };
+}
+
+function defaultBudgetFilePath(): string {
+  return path.join(getStoragePaths().STORAGE_DIR, IDLE_LOOP_BUDGET_FILENAME);
+}
+
+/**
+ * File-backed budget store: the daily cap survives a restart because the
+ * count lives on disk, not in process memory. Reads are fresh on every
+ * load (so two loops sharing the file see each other's writes); writes
+ * are synchronous read-modify-write, so they cannot interleave.
+ * A missing or corrupt file behaves as an empty store.
+ */
+export function createFileBudgetStore(options: {
+  filePath?: string;
+  today?: () => string;
+} = {}): IdleLoopBudgetStore {
+  const filePath = options.filePath ?? defaultBudgetFilePath();
+  const todayFn = options.today;
+  const readAll = (): Record<string, IdleLoopBudgetState> => {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(filePath, "utf8"));
+      if (typeof parsed !== "object" || parsed === null) return {};
+      const out: Record<string, IdleLoopBudgetState> = {};
+      for (const [userId, state] of Object.entries(parsed)) {
+        if (isBudgetState(state)) out[userId] = state;
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  };
+  const writeAll = (all: Record<string, IdleLoopBudgetState>): void => {
+    try {
+      mkdirSync(path.dirname(filePath), { recursive: true });
+      writeFileSync(filePath, JSON.stringify(all, null, 2), "utf8");
+    } catch {
+      // Budget persistence is best-effort: a failed write must not break the loop.
+    }
+  };
+  const current = (all: Record<string, IdleLoopBudgetState>, userId: string): IdleLoopBudgetState => {
+    const date = utcToday(todayFn);
+    const stored = all[userId];
+    if (stored && stored.date === date) return stored;
+    const fresh = freshBudgetState(date);
+    all[userId] = fresh;
+    return fresh;
+  };
+  return {
+    load(userId) {
+      return { ...current(readAll(), userId) };
+    },
+    recordAction(userId) {
+      const all = readAll();
+      current(all, userId).actions += 1;
+      writeAll(all);
+    },
+    recordFailure(userId) {
+      const all = readAll();
+      current(all, userId).failed = true;
+      writeAll(all);
+    },
+  };
+}
+
+let sharedBudgetStore: IdleLoopBudgetStore | null = null;
+
+/** Process-wide budget store (one file, shared by every user's loop). */
+export function getIdleLoopBudgetStore(): IdleLoopBudgetStore {
+  if (!sharedBudgetStore) sharedBudgetStore = createFileBudgetStore();
+  return sharedBudgetStore;
 }
 
 /** Clamp a requested per-iteration token budget to the hard cap. */
@@ -297,19 +488,25 @@ export interface IdleLoopDeps {
   env?: Record<string, string | undefined>;
   isIdle: () => boolean | Promise<boolean>;
   gatherDigest: () => RepoDigestInput | Promise<RepoDigestInput>;
-  listOpenTasks: () => Array<{ id: string; title: string }> | Promise<Array<{ id: string; title: string }>>;
+  /** Open tasks (description included so the loop can recognise its own per-user proposals). */
+  listOpenTasks: () => Array<{ id: string; title: string; description?: string }> | Promise<Array<{ id: string; title: string; description?: string }>>;
   llmCall: (prompt: string, opts: { maxTokens: number }) => Promise<LlmCallResult>;
   createBoardTask: (proposal: CreativeProposal) => Promise<{ id: string }>;
   implementTask: (args: {
     taskId: string;
     proposal: CreativeProposal;
   }) => Promise<{ branch?: string; prUrl?: string; runId?: string }>;
+  /** Persisted daily budget (cap + failure latch). Shared across ticks and restarts. */
+  budget: IdleLoopBudgetStore;
   emit?: (event: IdleLoopEvent) => void;
   maxTokensPerIteration?: number;
 }
 
 export type IdleIterationStatus =
   | "done"
+  | "proposed"
+  | "capped"
+  | "duplicate"
   | "rejected"
   | "not-idle"
   | "disabled"
@@ -338,9 +535,14 @@ function emit(deps: IdleLoopDeps, event: IdleLoopEvent): void {
 
 /**
  * Run ONE idle iteration. Pure w.r.t. the loop's own state: the caller owns
- * the concurrency guard (see createIdleLoop). Steps: enabled? paused?
- * idle? propose (one bounded LLM call) -> validate -> create board task ->
- * re-check the kill-switch -> dispatch implementation -> loop again next tick.
+ * the concurrency guard (see createIdleLoop, one handle per user).
+ *
+ * Steps: enabled? paused? failure latch? idle? daily cap? propose (one
+ * bounded LLM call) -> validate -> dedupe against this user's own open
+ * proposals -> kill-switch re-check -> create board task -> STOP (propose-only
+ * default) or, only with SWARM_A1_IDLE_LOOP_DISPATCH=1, dispatch through the
+ * normal approval gateway (fullAuto: false). A failed or refused dispatch
+ * latches the loop off for the rest of the day.
  */
 export async function runIdleIteration(
   deps: IdleLoopDeps,
@@ -356,9 +558,28 @@ export async function runIdleIteration(
     emit(deps, { type: "idle-loop.skipped", userId, reason: "paused" });
     return { status: "paused", reason: `open task carries ${A1_IDLE_LOOP_PAUSE_MARKER}` };
   }
+  // Failure latch: a dispatch that failed or was refused earlier today stops
+  // the loop until tomorrow instead of retrying every 5 minutes.
+  const budget = deps.budget.load(userId);
+  if (budget.failed) {
+    emit(deps, { type: "idle-loop.skipped", userId, reason: "failed-earlier-today" });
+    return {
+      status: "stopped",
+      reason: "an implementation dispatch failed or was refused earlier today",
+    };
+  }
   if (!(await deps.isIdle())) {
     emit(deps, { type: "idle-loop.skipped", userId, reason: "not-idle" });
-    return { status: "not-idle", reason: "a user run is active or a board task is queued" };
+    return { status: "not-idle", reason: "the user has an active or queued run" };
+  }
+  // Hard daily cap, checked before spending LLM tokens on a proposal.
+  const dailyCap = resolveDailyCap(env);
+  if (budget.actions >= dailyCap) {
+    emit(deps, { type: "idle-loop.skipped", userId, reason: "capped" });
+    return {
+      status: "capped",
+      reason: `daily cap reached (${budget.actions}/${dailyCap} loop outputs today)`,
+    };
   }
   const digest = buildRepoDigest(await deps.gatherDigest());
   const maxTokens = resolveTokenBudget(deps.maxTokensPerIteration);
@@ -374,16 +595,67 @@ export async function runIdleIteration(
     return { status: "rejected", reason: parsed.reason, tokensUsed: llm.tokensUsed };
   }
   const proposal = parsed.proposal;
+  // Per-user dedupe: the board is shared, so only this user's own open
+  // loop proposals (stamped with the per-user marker) count.
+  const marker = idleLoopUserMarker(userId);
+  const duplicate = openTasks.some(
+    (task) =>
+      task.description?.includes(marker) &&
+      task.title.trim().toLowerCase() === proposal.title.trim().toLowerCase(),
+  );
+  if (duplicate) {
+    emit(deps, {
+      type: "idle-loop.skipped",
+      userId,
+      reason: "duplicate",
+      proposal,
+      tokensUsed: llm.tokensUsed,
+    });
+    return {
+      status: "duplicate",
+      reason: "an open loop task for this user already proposes this",
+      proposal,
+      tokensUsed: llm.tokensUsed,
+    };
+  }
   emit(deps, {
     type: "idle-loop.proposed",
     userId,
     proposal,
     tokensUsed: llm.tokensUsed,
   });
-  const task = await deps.createBoardTask(proposal);
-  // Kill-switch re-check: the flag may have flipped while we were working.
-  // A loop killed mid-iteration never starts new work.
+  // Kill-switch re-check BEFORE creating the board task: a loop killed
+  // mid-iteration creates nothing new.
   if (!isIdleLoopEnabled(env)) {
+    emit(deps, {
+      type: "idle-loop.skipped",
+      userId,
+      reason: "stopped",
+      proposal,
+      tokensUsed: llm.tokensUsed,
+    });
+    return {
+      status: "stopped",
+      reason: "kill-switch flipped mid-iteration; no task created",
+      proposal,
+      tokensUsed: llm.tokensUsed,
+    };
+  }
+  const task = await deps.createBoardTask(proposal);
+  // Propose-only by default: the board task is the output. Stop here unless
+  // dispatch is explicitly enabled with its own flag.
+  if (!isDispatchEnabled(env)) {
+    deps.budget.recordAction(userId);
+    return {
+      status: "proposed",
+      proposal,
+      taskId: task.id,
+      tokensUsed: llm.tokensUsed,
+    };
+  }
+  // Dispatch path (opt-in only): kill-switch re-check, then dispatch.
+  if (!isIdleLoopEnabled(env)) {
+    deps.budget.recordAction(userId);
     emit(deps, {
       type: "idle-loop.skipped",
       userId,
@@ -394,13 +666,35 @@ export async function runIdleIteration(
     });
     return {
       status: "stopped",
-      reason: "kill-switch flipped mid-iteration; task left open for a worker",
+      reason: "kill-switch flipped before dispatch; task left open for a worker",
       proposal,
       taskId: task.id,
       tokensUsed: llm.tokensUsed,
     };
   }
-  const implemented = await deps.implementTask({ taskId: task.id, proposal });
+  let implemented: { branch?: string; prUrl?: string; runId?: string };
+  try {
+    implemented = await deps.implementTask({ taskId: task.id, proposal });
+  } catch (error) {
+    // First failed or refused dispatch latches the loop off for the day.
+    deps.budget.recordFailure(userId);
+    emit(deps, {
+      type: "idle-loop.skipped",
+      userId,
+      reason: "dispatch-failed",
+      proposal,
+      taskId: task.id,
+      tokensUsed: llm.tokensUsed,
+    });
+    return {
+      status: "stopped",
+      reason: `implementation dispatch failed: ${error instanceof Error ? error.message : String(error)}`,
+      proposal,
+      taskId: task.id,
+      tokensUsed: llm.tokensUsed,
+    };
+  }
+  deps.budget.recordAction(userId);
   if (implemented.prUrl) {
     emit(deps, {
       type: "idle-loop.pr",
@@ -494,6 +788,70 @@ export function createIdleLoop(
   };
 }
 
+/** Minimal runtime surface the idle check needs (structural: RuntimeManager satisfies it). */
+export interface IdleLoopRuntime {
+  list(userId: string): Array<{ status: string }>;
+  vmManager: { hasActiveExec(userId: string): boolean };
+}
+
+/**
+ * Is the user idle? Only the user's own runs count: an active exec on
+ * their VM, or an active/queued run (a run that `runtime.start` accepted
+ * is in the queue or active immediately, even before the exec starts).
+ * The shared board is deliberately NOT consulted — it always has open
+ * tasks, and other people's tasks say nothing about this user's idleness.
+ * Finished/error/cancelled history does not count as busy.
+ */
+export function isUserIdle(
+  runtime: IdleLoopRuntime,
+  userId: string,
+): boolean {
+  try {
+    if (runtime.vmManager.hasActiveExec(userId)) return false;
+  } catch {
+    return false;
+  }
+  try {
+    return !runtime
+      .list(userId)
+      .some((run) => run.status === "running" || run.status === "queued");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The proposal LLM call's forward options. No hard-coded model: the body
+ * carries no model id at all, `requestedModel: "fast"` asks each provider
+ * for its fast-tier model, and `useRoutedModel` puts the router-selected
+ * model into the request body. The router orders providers by the user's
+ * settings, so preferFreeProviders is respected and the call never bills
+ * the owner's key for a model the user did not choose.
+ */
+export function buildIdleLoopLlmOptions(
+  userId: string,
+  prompt: string,
+  maxTokens: number,
+): {
+  owner: string;
+  requestedModel: string;
+  useRoutedModel: boolean;
+  runId: string;
+  body: { messages: Array<{ role: "user"; content: string }>; max_tokens: number; stream: boolean };
+} {
+  return {
+    owner: userId,
+    requestedModel: IDLE_LOOP_MODEL_TIER,
+    useRoutedModel: true,
+    runId: `idle-loop-${userId}`,
+    body: {
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens,
+      stream: false,
+    },
+  };
+}
+
 // ---- production wiring ----
 
 /** Extract plain text from an LLM completion body (Anthropic or OpenAI shape). */
@@ -539,29 +897,20 @@ function recentCommitsBestEffort(limit = MAX_DIGEST_ITEMS): string[] {
 
 /**
  * Production deps for one user: idle = no active exec on their VM and no
- * open board task to claim; the proposal LLM call goes through the gateway
- * on the user's configured providers; proposals become board tasks via the
- * board store; implementation is dispatched as a full-auto run whose prompt
- * carries the board task (the run itself branches, gates, opens the PR and
- * submits, like any worker).
+ * active or queued run of theirs (the shared board is not consulted);
+ * the proposal LLM call goes through the gateway on the router-chosen fast
+ * model (the user's preferFreeProviders respected); proposals become board
+ * tasks stamped with this user's marker, for a human or worker to pick up;
+ * implementation is dispatched ONLY when SWARM_A1_IDLE_LOOP_DISPATCH=1, as
+ * a normal (non-full-auto) run through the approval gateway, whose prompt
+ * tells it to claim the task it was created for first.
  */
 export function productionIdleLoopDeps(userId: string): IdleLoopDeps {
   const runtime = getRuntimeManager();
   return {
     userId,
     env: process.env,
-    isIdle: () => {
-      try {
-        if (runtime.vmManager.hasActiveExec(userId)) return false;
-      } catch {
-        return false;
-      }
-      try {
-        return !loadStore().tasks.some((task) => task.status === "open");
-      } catch {
-        return false;
-      }
-    },
+    isIdle: () => isUserIdle(runtime, userId),
     gatherDigest: async () => {
       let openTasks: Array<{ id: string; title: string }> = [];
       try {
@@ -577,21 +926,19 @@ export function productionIdleLoopDeps(userId: string): IdleLoopDeps {
       try {
         return loadStore()
           .tasks.filter((task) => task.status === "open")
-          .map((task) => ({ id: task.id, title: task.title }));
+          .map((task) => ({
+            id: task.id,
+            title: task.title,
+            description: task.description,
+          }));
       } catch {
         return [];
       }
     },
     llmCall: async (prompt, { maxTokens }) => {
-      const completion = await forwardLlmNonStreaming({
-        owner: userId,
-        body: {
-          model: "claude-sonnet-4-5",
-          max_tokens: maxTokens,
-          messages: [{ role: "user", content: prompt }],
-        },
-        runId: `idle-loop-${userId}`,
-      });
+      const completion = await forwardLlmNonStreaming(
+        buildIdleLoopLlmOptions(userId, prompt, maxTokens),
+      );
       const text = extractCompletionText(completion.body);
       const usage = completion.usage as { inputTokens?: number; outputTokens?: number };
       const tokensUsed =
@@ -605,7 +952,7 @@ export function productionIdleLoopDeps(userId: string): IdleLoopDeps {
         store,
         {
           title: proposal.title,
-          description: `${proposal.description}\n\nProposed by the A1 idle loop (area: ${proposal.area}).`,
+          description: `${proposal.description}\n\nProposed by the A1 idle loop ${idleLoopUserMarker(userId)} (area: ${proposal.area}).`,
           difficulty: "medium",
           constraints: [
             "apps/swarmagents/ only",
@@ -626,19 +973,23 @@ export function productionIdleLoopDeps(userId: string): IdleLoopDeps {
     },
     implementTask: async ({ taskId, proposal }) => {
       await runtime.vmManager.ensure(userId);
+      // Normal approval gateway, never fullAuto: the run's irreversible
+      // steps ask a human first. fullAuto: false is explicit so a server
+      // SWARM_FULL_AUTO=1 cannot silently re-enable it.
       const started = runtime.start(userId, {
         prompt: [
           `Implement board task ${taskId}: ${proposal.title}`,
           proposal.description,
-          "Work on a branch, run the gates (typecheck, test:fast, lint, build), open a PR, and submit your work on the board. Then stop.",
+          `First, claim board task ${taskId} on the swarm board, so other workers know it is taken. Then implement it on a branch, run the gates (typecheck, test:fast, lint, build), open a PR, and submit your work on the board. Then stop.`,
         ].join("\n\n"),
-        fullAuto: true,
+        fullAuto: false,
       });
       if (!started.accepted) {
         throw new Error(started.error ?? "run refused");
       }
       return { runId: started.runId };
     },
+    budget: getIdleLoopBudgetStore(),
     emit: (event) => {
       console.info("[idle-loop]", JSON.stringify(event));
     },
@@ -646,6 +997,47 @@ export function productionIdleLoopDeps(userId: string): IdleLoopDeps {
 }
 
 let idleLoopTimers: Array<ReturnType<typeof setInterval>> = [];
+
+/**
+ * One loop object per user, kept at module level. This is what makes the
+ * "never two iterations concurrently" guard real: a fresh loop per tick
+ * would never see the previous iteration. Loops for users who leave the
+ * always-on list are stopped and dropped.
+ */
+const idleLoopsByUser = new Map<string, IdleLoopHandle>();
+
+/**
+ * One tick for a set of users, reusing each user's loop object. Exported
+ * so tests can drive overlapping ticks without waiting on the real timer.
+ * Returns one result per user, in the order given.
+ */
+export async function tickIdleLoops(
+  depsForUser: (userId: string) => IdleLoopDeps,
+  userIds: string[],
+): Promise<IdleIterationResult[]> {
+  const wanted = new Set(userIds);
+  for (const [userId, loop] of [...idleLoopsByUser]) {
+    if (!wanted.has(userId)) {
+      loop.stop();
+      idleLoopsByUser.delete(userId);
+    }
+  }
+  const results: IdleIterationResult[] = [];
+  for (const userId of userIds) {
+    let loop = idleLoopsByUser.get(userId);
+    if (!loop) {
+      loop = createIdleLoop(depsForUser(userId));
+      idleLoopsByUser.set(userId, loop);
+    }
+    results.push(await loop.runOnce());
+  }
+  return results;
+}
+
+/** For tests: how many per-user loop objects are currently held. */
+export function idleLoopCountForTesting(): number {
+  return idleLoopsByUser.size;
+}
 
 /**
  * Poll every always-on user for idle time in the background (module-level
@@ -661,10 +1053,10 @@ export function startIdleLoopTicks(
   if (idleLoopTimers.length > 0) return;
   const tick = () => {
     if (!isIdleLoopEnabled(process.env)) return;
-    for (const userId of parseAlwaysOnUsers(process.env.SWARM_VM_ALWAYS_ON_USERS)) {
-      const loop = createIdleLoop(productionIdleLoopDeps(userId));
-      void loop.runOnce().catch((error) => console.error("[idle-loop] tick", error));
-    }
+    const userIds = parseAlwaysOnUsers(process.env.SWARM_VM_ALWAYS_ON_USERS);
+    void tickIdleLoops(productionIdleLoopDeps, userIds).catch((error) =>
+      console.error("[idle-loop] tick", error),
+    );
   };
   const timer = setInterval(tick, intervalMs);
   timer.unref?.();
@@ -674,4 +1066,6 @@ export function startIdleLoopTicks(
 export function stopIdleLoopTicksForTesting(): void {
   for (const timer of idleLoopTimers) clearInterval(timer);
   idleLoopTimers = [];
+  for (const loop of idleLoopsByUser.values()) loop.stop();
+  idleLoopsByUser.clear();
 }

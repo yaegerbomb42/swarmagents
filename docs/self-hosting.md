@@ -142,6 +142,8 @@ acceptable for closed sign-ups, not for open ones.
 | `SWARM_VM_DRIVER` | `docker` (real containers) or `fake` (in-process, tests/demo). Defaults: `fake` outside production, `docker` in production. |
 | `SWARM_VM_MEMORY` / `SWARM_VM_CPUS` / `SWARM_VM_PIDS` | Per-VM hard ceilings (defaults `2g` / `2` / `512`), validated before reaching Docker and re-applied to existing containers. |
 | `SWARM_VM_IDLE_MIN` | Minutes of inactivity before the idle sweeper stops a VM (workspace volume survives). |
+| `SWARM_VM_MAX_AGENT_VMS` | Cap on concurrent per-agent VMs beyond A1's own (default: `SWARM_MAX_CONCURRENT_VMS`, else 4). A1's VM is governed by the global cap and never counts here; a run that would exceed the cap is refused at admission. |
+| `SWARM_VM_AGENT_IDLE_MIN` | Minutes of inactivity before the reaper stops an idle per-agent VM (default: `SWARM_VM_IDLE_MIN`, else 30). `0` disables reaping for agent VMs. A1's VM is never reaped by this timer; always-on users are exempt. |
 | `SWARM_VM_RUNTIME` | Optional allowlisted container runtime (e.g. `runsc` for gVisor) for extra isolation. An unregistered runtime fails VM creation loudly instead of falling back silently. |
 | `SWARM_VM_NETWORK` | Optional dedicated Docker network for VM containers, so egress rules cannot affect the host. |
 | `SWARM_MAX_QUEUED` | Prompts queued behind the one active run per user (default 3). |

@@ -75,6 +75,11 @@ export interface VmScreenProps {
    * instead of the simulated `logs`, and presence follows the agent.
    */
   runId?: string;
+  /**
+   * The agent whose desktop the Desktop tab shows (default "a1"). The
+   * proxy dials that agent's own VM; omit for A1's desktop.
+   */
+  agentId?: string;
   activeView: ComputerView;
   onToggleView: (view: ComputerView) => void;
   onResetVm: () => void;
@@ -148,6 +153,7 @@ interface DesktopConnInfo {
 export function VmScreen({
   logs,
   runId,
+  agentId,
   activeView,
   onToggleView,
   onResetVm,
@@ -464,6 +470,7 @@ export function VmScreen({
               vmResetting={vmResetting}
               runActive={liveRun}
               runId={runId}
+              agentId={agentId}
               onStopRun={onStopRun}
               presence={effectivePresence}
               computerAction={effectiveComputerAction}

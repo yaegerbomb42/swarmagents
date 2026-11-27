@@ -62,7 +62,12 @@ import {
   vmPersistenceModeFor,
 } from "../providers/settings";
 import { VM_ATLAS_REGISTRY_PATH, serializeUserVmAtlasRegistry } from "../capability-atlas/vm-registry";
-import { shouldResetVmAtRunStart, shouldStopVmAtRunEnd } from "./vm-persistence";
+import {
+  AgentVmAllocator,
+  DEFAULT_AGENT_ID,
+  agentOwnerKey,
+  validateAgentId,
+} from "../vm/agent-allocation";
 import { RunProviderPool, runWithPool } from "../providers/run-pool";
 import type { AttemptOutcome, RunAttempt } from "../providers/run-pool";
 import {
@@ -426,6 +431,8 @@ export type RunStatus = "queued" | "running" | "finished" | "error" | "cancelled
 export interface RunSummary {
   runId: string;
   userId: string;
+  /** The agent this run belongs to (default "a1"); the UI dials its desktop. */
+  agentId?: string;
   status: RunStatus;
   prompt: string;
   sessionId?: string;
@@ -467,6 +474,12 @@ interface QueuedRun {
   runId: string;
   userId: string;
   prompt: string;
+  /**
+   * The agent this run belongs to (default "a1"). The run's VM is the
+   * agent's own desktop (see lib/vm/agent-allocation.ts): the default
+   * agent's VM is the per-user VM, a named agent gets a VM of its own.
+   */
+  agentId?: string;
   /** The user's agent card text (appended system prompt), per-run snapshot. */
   agentCard?: string;
   sessionId?: string;
@@ -551,6 +564,11 @@ export interface StartResult {
 interface ActiveRun {
   runId: string;
   userId: string;
+  /**
+   * The agent this run belongs to (default "a1"); its VM is the agent's
+   * own desktop — see QueuedRun.agentId.
+   */
+  agentId?: string;
   controller: AbortController;
   prompt: string;
   /**
@@ -1087,6 +1105,8 @@ export class RuntimeManager {
   private readonly routers = new Map<string, { signature: string; router: Router }>();
   private readonly maxQueuedOverride: number | undefined;
   private readonly maxConcurrentVmsOverride: number | undefined;
+  /** Per-agent VM allocation (this.vm keyed by agent owner key). */
+  private readonly agentVms: AgentVmAllocator;
   /** Set by cancelAll("shutdown"): capacity drains must not start runs while the process exits. */
   private shuttingDown = false;
   private readonly startGraceMs: number;
@@ -1113,7 +1133,7 @@ export class RuntimeManager {
    * queued), the grace timer in recordCancelling (no successor), or
    * execute()'s finally (clean unwind). Never holds a slot.
    */
-  private readonly cancelling = new Map<string, { userId: string; pgidFile?: string }>();
+  private readonly cancelling = new Map<string, { userId: string; agentId?: string; pgidFile?: string }>();
   /**
    * Users whose restored queue is waiting for its first drain. Restore runs
    * in the constructor, but starting a run there is a reentrancy hazard:
@@ -1192,6 +1212,7 @@ export class RuntimeManager {
     this.routerOverride = opts.router === undefined ? undefined : opts.router;
     this.maxQueuedOverride = opts.maxQueued;
     this.maxConcurrentVmsOverride = opts.maxConcurrentVms;
+    this.agentVms = new AgentVmAllocator(this.vm, { maxAgentVms: this.maxConcurrentVmsOverride });
     this.startGraceMs = opts.startGraceMs ?? DEFAULT_START_GRACE_MS;
     this.silenceMs = opts.silenceMs ?? DEFAULT_SILENCE_MS;
     this.toolSilenceMs = opts.toolSilenceMs ?? DEFAULT_TOOL_SILENCE_MS;
@@ -1339,21 +1360,21 @@ export class RuntimeManager {
   private committedVmUserIds(): Set<string> {
     const ids = new Set<string>(this.vm.liveVmUserIds());
     for (const [userId, st] of this.users) {
-      if (st.active) ids.add(userId);
+      if (st.active) ids.add(agentOwnerKey(userId, st.active.agentId ?? DEFAULT_AGENT_ID));
     }
     return ids;
   }
 
   /**
    * True when starting a run for `userId` stays within the global VM cap.
-   * A user whose VM is already live needs no new slot — their run reuses
+   * A user whose agent VM is already live needs no new slot — their run reuses
    * the container that is already counted — so they are never blocked by
    * other users' VMs. A disabled cap (<= 0) always allows.
    */
-  private vmSlotAvailable(userId: string): boolean {
+  private vmSlotAvailable(userId: string, agentId?: string): boolean {
     const cap = this.maxConcurrentVms();
     if (cap <= 0) return true;
-    if (this.vm.isVmLive(userId)) return true;
+    if (this.vm.isVmLive(agentOwnerKey(userId, agentId ?? DEFAULT_AGENT_ID))) return true;
     return this.committedVmUserIds().size < cap;
   }
 
@@ -1367,7 +1388,7 @@ export class RuntimeManager {
     const heads: Array<{ userId: string; createdAt: number }> = [];
     for (const [uid, st] of this.users) {
       if (st.active || st.queue.length === 0) continue;
-      if (this.vm.isVmLive(uid)) continue;
+      if (this.vm.isVmLive(agentOwnerKey(uid, st.queue[0].agentId ?? DEFAULT_AGENT_ID))) continue;
       heads.push({ userId: uid, createdAt: st.queue[0].createdAt });
     }
     heads.sort(
@@ -1397,7 +1418,7 @@ export class RuntimeManager {
       let best: { userId: string; createdAt: number } | null = null;
       for (const [userId, st] of this.users) {
         if (st.active || st.queue.length === 0) continue;
-        if (!this.vmSlotAvailable(userId)) continue;
+        if (!this.vmSlotAvailable(userId, st.queue[0].agentId)) continue;
         const createdAt = st.queue[0].createdAt;
         if (
           !best ||
@@ -1420,6 +1441,7 @@ export class RuntimeManager {
       runId: active.runId,
       userId: active.userId,
       prompt: active.prompt,
+      ...(active.agentId ? { agentId: active.agentId } : {}),
       ...(active.agentCard ? { agentCard: active.agentCard } : {}),
       ...(active.sessionId ? { sessionId: active.sessionId } : {}),
       ...(active.model ? { model: active.model } : {}),
@@ -1443,6 +1465,7 @@ export class RuntimeManager {
       runId: run.runId,
       userId: run.userId,
       prompt: run.prompt,
+      ...(run.agentId ? { agentId: run.agentId } : {}),
       ...(run.agentCard ? { agentCard: run.agentCard } : {}),
       ...(run.sessionId ? { sessionId: run.sessionId } : {}),
       ...(run.model ? { model: run.model } : {}),
@@ -1523,6 +1546,7 @@ export class RuntimeManager {
           runId: queued.runId,
           userId,
           prompt: queued.prompt,
+          ...(queued.agentId ? { agentId: queued.agentId } : {}),
           ...(queued.agentCard ? { agentCard: queued.agentCard } : {}),
           ...(queued.sessionId ? { sessionId: queued.sessionId } : {}),
           ...(queued.model ? { model: queued.model } : {}),
@@ -1570,6 +1594,7 @@ export class RuntimeManager {
               runId: row.active.runId,
               userId,
               prompt: row.active.prompt,
+              ...(row.active.agentId ? { agentId: row.active.agentId } : {}),
               ...(row.active.agentCard ? { agentCard: row.active.agentCard } : {}),
               sessionId: resumePoint.sessionId,
               ...(row.active.model ? { model: row.active.model } : {}),
@@ -1739,7 +1764,7 @@ export class RuntimeManager {
       this.bus.publish(active.runId, errorEvent);
       // Record before finalize so a successor draining out of finalize can
       // reap this run's process group before its harness spawns.
-      this.recordCancelling(userId, active.runId, active.pgidFile);
+      this.recordCancelling(userId, active.runId, active.pgidFile, active.agentId);
       this.finalize(active.runId, { status: "error", error: reason });
       active.controller.abort();
     }
@@ -1796,6 +1821,7 @@ export class RuntimeManager {
       ...(active.runMode ? { runMode: active.runMode } : {}),
       ...(active.toolAllowlist ? { toolAllowlist: active.toolAllowlist } : {}),
       ...(active.ambientRuleId ? { ambientRuleId: active.ambientRuleId } : {}),
+      ...(active.agentId ? { agentId: active.agentId } : {}),
       seedSnapshotLabel: checkpointVmLabel(active.runId, resumePoint.stepSeq),
       resumePoint,
       recoveryAttempts: attempt,
@@ -1806,7 +1832,7 @@ export class RuntimeManager {
     // superseded ActiveRun (identity check in isStillActive), so they
     // cannot finalize the resumed run.
     active.controller.abort();
-    this.recordCancelling(userId, active.runId, pgidFile);
+    this.recordCancelling(userId, active.runId, pgidFile, active.agentId);
     this.persistState();
     this.startNext(userId);
   }
@@ -1825,13 +1851,13 @@ export class RuntimeManager {
    * Callers record BEFORE finalize() so the entry exists when finalize
    * drains the queue into startNext.
    */
-  private recordCancelling(userId: string, runId: string, pgidFile?: string): void {
-    this.cancelling.set(runId, { userId, pgidFile });
+  private recordCancelling(userId: string, runId: string, pgidFile?: string, agentId?: string): void {
+    this.cancelling.set(runId, { userId, agentId, pgidFile });
     const timer = setTimeout(() => {
       const entry = this.cancelling.get(runId);
       if (!entry) return;
       this.cancelling.delete(runId);
-      void this.killRunTree(entry.userId, entry.pgidFile);
+      void this.killRunTree(entry.userId, entry.pgidFile, entry.agentId);
     }, this.killGraceMs);
     timer.unref();
   }
@@ -1854,18 +1880,21 @@ export class RuntimeManager {
    * path (reapCancelling, run from startNext before the abort fires) reads
    * the marker first, so that race does not apply there.
    */
-  private async killRunTree(userId: string, pgidFile?: string): Promise<void> {
+  private async killRunTree(userId: string, pgidFile?: string, agentId?: string): Promise<void> {
     // No recorded group: there is nothing safe to target, so do nothing
     // rather than fall back to a broad kill.
     if (!pgidFile) return;
+    // The dying run's processes live in its own agent's VM, not the
+    // per-user one — reap exactly that container's group.
+    const vmOwner = agentOwnerKey(userId, agentId ?? DEFAULT_AGENT_ID);
     // If the VM is no longer live (stopped/evicted to free capacity), its
     // process group is already gone — there is nothing to reap, and
     // re-ensuring it would re-commit a VM slot and block a queued successor
     // forever. Only ensure the VM when it is still running.
-    if (!this.vm.liveVmUserIds().includes(userId)) return;
+    if (!this.vm.liveVmUserIds().includes(vmOwner)) return;
     try {
-      await this.vm.ensure(userId);
-      await this.vm.exec(userId, buildPgidKillCommand(pgidFile), {
+      await this.vm.ensure(vmOwner);
+      await this.vm.exec(vmOwner, buildPgidKillCommand(pgidFile), {
         timeoutMs: KILL_TIMEOUT_MS,
         signal: AbortSignal.timeout(KILL_TIMEOUT_MS),
         // The kill must not be starved by the exec-slot limit: the dying
@@ -1895,7 +1924,7 @@ export class RuntimeManager {
       this.cancelling.delete(runId);
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timedOut = await Promise.race([
-        this.killRunTree(entry.userId, entry.pgidFile).then(
+        this.killRunTree(entry.userId, entry.pgidFile, entry.agentId).then(
           () => false,
           () => false,
         ),
@@ -2127,6 +2156,12 @@ export class RuntimeManager {
     extraMcpServers: Record<string, unknown>,
     mode?: RunModeInfo,
     connectorEnableUrl?: string,
+    /**
+     * VM manager key for the run's agent (agent owner key). Defaults to the
+     * userId — the default agent's VM. Settings/library lookups above still
+     * use the real userId; only the VM writes go to the agent's VM.
+     */
+    vmOwner: string = userId,
   ): Promise<void> {
     const desktop = isDesktopRunMode(mode?.mode);
     const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
@@ -2136,7 +2171,7 @@ export class RuntimeManager {
     // them first. Best-effort: a missing dir already means "nothing to do"
     // (rm -f exits 0), and a failure here must never block the run.
     try {
-      await this.vm.exec(userId, ["sh", "-c", `rm -f ${ASK_QUESTIONS_DIR}/*.pending.json`], {
+      await this.vm.exec(vmOwner, ["sh", "-c", `rm -f ${ASK_QUESTIONS_DIR}/*.pending.json`], {
         timeoutMs: 10_000,
       });
     } catch {
@@ -2151,15 +2186,15 @@ export class RuntimeManager {
       ...(useAtlas ? { atlasRegistryPath: VM_ATLAS_REGISTRY_PATH } : {}),
       ...(connectorEnableUrl ? { connectorEnableUrl } : {}),
     })) {
-      await this.vm.writeFile(userId, file.path, file.content);
+      await this.vm.writeFile(vmOwner, file.path, file.content);
     }
     if (useAtlas) {
-      await this.vm.writeFile(userId, VM_ATLAS_REGISTRY_PATH, serializeUserVmAtlasRegistry(userId));
+      await this.vm.writeFile(vmOwner, VM_ATLAS_REGISTRY_PATH, serializeUserVmAtlasRegistry(userId));
     }
     const libraryFiles = librarySeedFiles(userId);
-    await cleanupLibrarySeedFiles(this.vm, userId, libraryFiles);
+    await cleanupLibrarySeedFiles(this.vm, vmOwner, libraryFiles);
     for (const file of libraryFiles) {
-      await this.vm.writeFile(userId, file.path, file.content);
+      await this.vm.writeFile(vmOwner, file.path, file.content);
     }
   }
 
@@ -2173,11 +2208,13 @@ export class RuntimeManager {
     mode?: RunModeInfo,
     restrictTools?: readonly string[],
     connectorEnableUrl?: string,
+    /** VM manager key for the run's agent (agent owner key; defaults to the userId). */
+    vmOwner: string = userId,
   ): Promise<void> {
     const desktop = isDesktopRunMode(mode?.mode);
     const useAtlas = atlasEnabled() || atlasEnabledForUser(readUserSettings(userId));
     await this.vm.writeFile(
-      userId,
+      vmOwner,
       ROLE_MCP_CONFIG_PATH,
       roleMcpConfigJson(this.rolePhaseFor(role, extraAllowedTools, mode, restrictTools, useAtlas), {
         allowedRoleIds,
@@ -2207,6 +2244,12 @@ export class RuntimeManager {
     userId: string,
     input: {
       prompt: string;
+      /**
+       * The agent this run belongs to (default "a1"). The run executes in
+       * that agent's own desktop VM (see lib/vm/agent-allocation.ts); the
+       * default agent's VM is the per-user VM.
+       */
+      agentId?: string;
       agentCard?: string;
       sessionId?: string;
       model?: string;
@@ -2297,6 +2340,21 @@ export class RuntimeManager {
     }
     const runId = `run_${randomUUID()}`;
     const st = this.state(userId);
+    // An invalid agent id is refused at admission: the id reaches docker
+    // resource names (via the owner-key hash) and must be a clean token.
+    let agentId: string | undefined;
+    if (input.agentId !== undefined) {
+      try {
+        agentId = validateAgentId(input.agentId);
+      } catch (error) {
+        return {
+          accepted: false,
+          runId: "",
+          queued: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
     // A restored queue drains on a deferred tick after construction (see
     // scheduleRestoredStarts). If a fresh prompt lands in that window,
     // start the restored head first so FIFO order matches the old
@@ -2337,9 +2395,9 @@ export class RuntimeManager {
 
     // A run queues when the user already has an active run (the per-user
     // invariant) or when starting it would exceed the global VM cap and
-    // the user's VM is not already live. Both waits share the same
+    // the user's agent VM is not already live. Both waits share the same
     // per-user queue and depth limit; only the reported reason differs.
-    const capacityWait = !st.active && !this.vmSlotAvailable(userId);
+    const capacityWait = !st.active && !this.vmSlotAvailable(userId, agentId);
     if (st.active || capacityWait || this.rewinding.has(userId)) {
       const limit = this.maxQueued();
       if (st.queue.length >= limit) {
@@ -2349,6 +2407,7 @@ export class RuntimeManager {
         runId,
         userId,
         prompt: input.prompt,
+        ...(agentId ? { agentId } : {}),
         agentCard: input.agentCard,
         sessionId: input.sessionId,
         model: input.model,
@@ -2391,6 +2450,7 @@ export class RuntimeManager {
     const active: ActiveRun = {
       runId,
       userId,
+      ...(agentId ? { agentId } : {}),
       controller: new AbortController(),
       prompt: input.prompt,
       pgidFile: execPgidPath(runId),
@@ -2428,6 +2488,21 @@ export class RuntimeManager {
   }
 
   /**
+   * The agent a run belongs to (default "a1"): look through the user's live
+   * state, queue, and history. Forks and cancels use it so a named agent's
+   * checkpoints and process groups resolve to its own VM.
+   */
+  private agentIdForRun(userId: string, runId: string): string {
+    const st = this.users.get(userId);
+    if (st?.active?.runId === runId) return st.active.agentId ?? DEFAULT_AGENT_ID;
+    const queued = st?.queue.find((run) => run.runId === runId);
+    if (queued?.agentId) return queued.agentId;
+    const historic = st?.history.find((run) => run.runId === runId);
+    if (historic?.agentId) return historic.agentId;
+    return DEFAULT_AGENT_ID;
+  }
+
+  /**
    * F1 "Fork Run from Here": spawn a new run seeded from one of
    * `sourceRunId`'s auto-checkpoints (`auto-pre-step-<seq>`).
    *
@@ -2461,9 +2536,12 @@ export class RuntimeManager {
     }
     const checkpointLabel = checkpointDisplayLabel(stepSeq);
     const vmLabel = checkpointVmLabel(input.sourceRunId, stepSeq);
+    // The checkpoint lives in the source run's agent VM, not the per-user one.
+    const sourceAgentId = this.agentIdForRun(userId, input.sourceRunId);
+    const sourceVmOwner = agentOwnerKey(userId, sourceAgentId);
     let snapshots: { label: string }[];
     try {
-      snapshots = await this.vm.listSnapshots(userId);
+      snapshots = await this.vm.listSnapshots(sourceVmOwner);
     } catch (error) {
       return refused(error instanceof Error ? error.message : String(error));
     }
@@ -2472,6 +2550,7 @@ export class RuntimeManager {
     }
     const started = this.start(userId, {
       prompt: input.prompt,
+      agentId: sourceAgentId,
       model: input.model,
       fullAuto: input.fullAuto,
       seedSnapshotLabel: vmLabel,
@@ -2532,6 +2611,8 @@ export class RuntimeManager {
     }
     const checkpointLabel = checkpointDisplayLabel(stepSeq);
     const vmLabel = checkpointVmLabel(input.runId, stepSeq);
+    // The checkpoint lives in the run's own agent VM (same as fork).
+    const vmOwner = agentOwnerKey(userId, this.agentIdForRun(userId, input.runId));
     // Hold the VM for the whole restore: a run submitted meanwhile queues
     // (submit/startNext check this set) instead of starting under a VM that
     // is about to be recreated. Set synchronously, before the first await.
@@ -2539,7 +2620,7 @@ export class RuntimeManager {
     try {
       let snapshots: { label: string }[];
       try {
-        snapshots = await this.vm.listSnapshots(userId);
+        snapshots = await this.vm.listSnapshots(vmOwner);
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
       }
@@ -2550,7 +2631,7 @@ export class RuntimeManager {
       // machine first. No undo point, no rewind: never destroy work silently.
       const undoLabel = rewindUndoLabel(input.runId, Date.now());
       try {
-        await this.vm.snapshot(userId, undoLabel);
+        await this.vm.snapshot(vmOwner, undoLabel);
       } catch (error) {
         return {
           ok: false,
@@ -2558,7 +2639,7 @@ export class RuntimeManager {
         };
       }
       try {
-        await this.vm.restore(userId, vmLabel);
+        await this.vm.restore(vmOwner, vmLabel);
       } catch (error) {
         return {
           ok: false,
@@ -2578,9 +2659,10 @@ export class RuntimeManager {
     const st = this.users.get(userId);
     if (!st || st.active || this.rewinding.has(userId)) return;
     // Global VM cap: a queued run that needs a fresh VM stays queued until
-    // a slot frees (drainCapacityQueue retries it then). A user whose VM
-    // is already live is never blocked.
-    if (st.queue.length === 0 || !this.vmSlotAvailable(userId)) return;
+    // a slot frees (drainCapacityQueue retries it then). A user whose agent
+    // VM is already live is never blocked.
+    const head = st.queue[0];
+    if (!head || !this.vmSlotAvailable(userId, head.agentId)) return;
     const next = st.queue.shift();
     if (!next) return;
     const persistedSession =
@@ -2589,6 +2671,7 @@ export class RuntimeManager {
     const active: ActiveRun = {
       runId: next.runId,
       userId,
+      ...(next.agentId ? { agentId: next.agentId } : {}),
       controller: new AbortController(),
       prompt: next.prompt,
       pgidFile: execPgidPath(next.runId),
@@ -2634,6 +2717,7 @@ export class RuntimeManager {
       out.push({
         runId: run.runId,
         userId,
+        ...(run.agentId ? { agentId: run.agentId } : {}),
         status: "queued",
         prompt: run.prompt,
         sessionId: run.sessionId,
@@ -2927,7 +3011,7 @@ export class RuntimeManager {
       const pgidFile = target.pgidFile;
       // Record before finalize so a successor draining out of finalize can
       // reap this run's process group before its harness spawns.
-      this.recordCancelling(userId, target.runId, pgidFile);
+      this.recordCancelling(userId, target.runId, pgidFile, target.agentId);
       this.finalize(target.runId, { status: "cancelled", cancelledReason: reason });
       target.controller.abort();
       return { ok: true, runId: target.runId };
@@ -2940,7 +3024,7 @@ export class RuntimeManager {
       const pgidFile = st.active.pgidFile;
       // Record before finalize so the successor draining out of finalize
       // reaps this run's process group before its harness spawns.
-      this.recordCancelling(userId, runId, pgidFile);
+      this.recordCancelling(userId, runId, pgidFile, st.active?.agentId);
       this.finalize(runId, { status: "cancelled", cancelledReason: reason });
       controller.abort();
       return { ok: true, runId };
@@ -2967,6 +3051,7 @@ export class RuntimeManager {
     const summary: RunSummary = {
       runId: run.runId,
       userId,
+      ...(run.agentId ? { agentId: run.agentId } : {}),
       status: patch.status,
       prompt: run.prompt,
       sessionId: run.sessionId,
@@ -3035,14 +3120,14 @@ export class RuntimeManager {
           // so no cancelled/error event or approval expiry is recorded.
           target.suspendForResume = true;
           target.controller.abort();
-          this.recordCancelling(userId, target.runId, target.pgidFile);
+          this.recordCancelling(userId, target.runId, target.pgidFile, target.agentId);
           this.persistState();
           cancelled.push(target.runId);
           continue;
         }
         this.finalize(target.runId, { status: "cancelled", cancelledReason: "shutdown" }, false);
         target.controller.abort();
-        this.recordCancelling(userId, target.runId, target.pgidFile);
+        this.recordCancelling(userId, target.runId, target.pgidFile, target.agentId);
         cancelled.push(target.runId);
         continue;
       }
@@ -3227,6 +3312,7 @@ export class RuntimeManager {
     return {
       runId: a.runId,
       userId: a.userId,
+      ...(a.agentId ? { agentId: a.agentId } : {}),
       status: "running",
       // The original ask, not the role-continuation prompt a switch wrote
       // into `prompt` mid-run.
@@ -3313,25 +3399,26 @@ export class RuntimeManager {
     this.reporter.attach(runId, userId, active.role?.id);
     attachRunTrajectory(runId, userId, this.bus);
 
-    this.bus.publish(runId, { type: "vm.starting", data: { userId } });
+    this.bus.publish(runId, {
+      type: "vm.starting",
+      data: { userId, agentId: active.agentId ?? DEFAULT_AGENT_ID },
+    });
     this.touchActivity(active);
     const ensureStartedAt = Date.now();
+    // The run executes in its own agent's VM (the default agent's VM is
+    // the per-user VM). The allocator applies the persistence toggle:
+    // "fresh-per-task" resets the VM before the task starts; fork seeds
+    // keep their checkpoint workspace — see shouldResetVmAtRunStart.
+    const vmOwner = agentOwnerKey(userId, active.agentId ?? DEFAULT_AGENT_ID);
     try {
-      // VM persistence toggle (spec 3d): "fresh-per-task" resets the VM
-      // (destroy + wipe volume) before each task starts. Fork seeds keep
-      // their checkpoint workspace — see shouldResetVmAtRunStart.
-      if (
-        shouldResetVmAtRunStart(vmPersistenceModeFor(readUserSettings(userId)), {
-          seedSnapshotLabel: active.seedSnapshotLabel,
-        })
-      ) {
-        await this.vm.reset(userId);
-      }
-      await this.vm.ensure(userId);
+      await this.agentVms.startTask(userId, active.agentId ?? DEFAULT_AGENT_ID, {
+        mode: vmPersistenceModeFor(readUserSettings(userId)),
+        seedSnapshotLabel: active.seedSnapshotLabel,
+      });
       // Refuse new runs while the user is over their workspace disk quota
       // (SWARM_VM_DISK_QUOTA_MB): a run that fills the host disk is a
       // cross-user hazard, so the check happens before any agent work.
-      if (this.vm.quotas.diskQuotaMb > 0) await this.vm.assertDiskQuota(userId);
+      if (this.vm.quotas.diskQuotaMb > 0) await this.vm.assertDiskQuota(vmOwner);
     } catch (error) {
       const message = redact(error instanceof Error ? error.message : String(error));
       this.bus.publish(runId, { type: "vm.error", data: { message } });
@@ -3341,7 +3428,15 @@ export class RuntimeManager {
       return;
     }
 
-    if (active.controller.signal.aborted) return;
+    // NOTE: no abort check here on purpose. A cancel that lands while the
+    // VM is starting must not silently drop the run before its agent ever
+    // spawns: whether the run reached the runner used to depend on whether
+    // the cancel landed before or after a ~10ms ensure, and the per-agent
+    // allocator widened that window until a just-started run reliably lost
+    // the race (its claude spawn never happened, breaking the new_thread
+    // contract). The harness owns aborting the spawn — the runner passes
+    // the aborted signal to the VM exec, which refuses promptly — so the
+    // run still finalizes as cancelled, just after reaching the runner.
     const ensureMs = Date.now() - ensureStartedAt;
     this.touchActivity(active);
     this.bus.publish(runId, { type: "vm.ready", data: { ms: ensureMs, durationMs: ensureMs } });
@@ -3351,17 +3446,19 @@ export class RuntimeManager {
     // checkpoint; a warm failure never fails the run.
     if (!active.seedSnapshotLabel && !active.controller.signal.aborted) {
       try {
-        const repo = await selectedCodebaseRepo(userId, this.codebaseScanner);
+        // The codebase map lives in the run's own VM: a named agent reads
+        // its own repo selection, never the per-user VM's.
+        const repo = await selectedCodebaseRepo(vmOwner, this.codebaseScanner);
         let hotspots: HotspotHint[] = [];
         if (repo) {
-          const rows = await getCodebaseHotspots(userId, this.codebaseScanner, repo, 40);
+          const rows = await getCodebaseHotspots(vmOwner, this.codebaseScanner, repo, 40);
           hotspots = rows.map((row) => ({
             path: row.path,
             churn90d: row.churn90d,
             fanIn: row.fanIn,
           }));
         }
-        await applyWarmGoldenSnapshot(this.vm, userId, hotspots);
+        await applyWarmGoldenSnapshot(this.vm, vmOwner, hotspots);
       } catch {
         // A warm-snapshot failure must not fail the run. The agent continues
         // on the VM ensure() already started.
@@ -3377,7 +3474,7 @@ export class RuntimeManager {
     // would silently do the wrong work.
     if (active.seedSnapshotLabel) {
       try {
-        await this.vm.restore(userId, active.seedSnapshotLabel);
+        await this.vm.restore(vmOwner, active.seedSnapshotLabel);
       } catch (error) {
         const message = redact(error instanceof Error ? error.message : String(error));
         this.bus.publish(runId, { type: "vm.error", data: { message } });
@@ -3444,6 +3541,7 @@ export class RuntimeManager {
         libraryServers,
         active.runMode,
         active.connectorEnableUrl,
+        vmOwner,
       );
     } catch (error) {
       const message = redact(error instanceof Error ? error.message : String(error));
@@ -3468,7 +3566,7 @@ export class RuntimeManager {
     // report artifact diff is more precise than a whole-repository git diff,
     // which could otherwise pick up a user's pre-existing workspace changes.
     if (isOraclePostRunEnabled() || userSettings.oraclePostRun === true) {
-      active.oracleStartListing = await listWorkspaceFiles(this.vm, userId);
+      active.oracleStartListing = await listWorkspaceFiles(this.vm, vmOwner);
     }
 
     // Phase loop: each role switch continues the same conversation (--resume)
@@ -3504,6 +3602,7 @@ export class RuntimeManager {
           active.runMode,
           active.toolAllowlist,
           active.connectorEnableUrl,
+          vmOwner,
         );
       } catch (error) {
         const message = redact(error instanceof Error ? error.message : String(error));
@@ -3928,11 +4027,13 @@ export class RuntimeManager {
   private async resolveVerificationPlan(
     active: ActiveRun,
   ): Promise<{ repoRoot: string; testCommands: string[] } | null> {
-    const { userId } = active;
+    // The repo map lives in the run's own VM, so the verifier reads the
+    // agent's repo selection, not the per-user VM's.
+    const vmOwner = agentOwnerKey(active.userId, active.agentId);
     try {
-      const selected = await selectedCodebaseRepo(userId, this.codebaseScanner);
+      const selected = await selectedCodebaseRepo(vmOwner, this.codebaseScanner);
       if (!selected) return null;
-      const map = await this.codebaseScanner.readMap(userId, selected);
+      const map = await this.codebaseScanner.readMap(vmOwner, selected);
       const testCommands = (map?.testCommands ?? []).filter((cmd) => cmd.trim().length > 0);
       if (testCommands.length === 0) return null;
       return { repoRoot: selected, testCommands };
@@ -3979,9 +4080,11 @@ export class RuntimeManager {
     if (!isOraclePostRunEnabled() && readUserSettings(active.userId).oraclePostRun !== true) return undefined;
     let isolatedRoot: string | undefined;
     let worktreeGitRoot: string | undefined;
-    const exec = this.shadowExecFor(active.userId);
+    // The oracle audits the run's own VM: its repo, its workspace diff.
+    const vmOwner = agentOwnerKey(active.userId, active.agentId);
+    const exec = this.shadowExecFor(vmOwner);
     try {
-      const repoRoot = await selectedCodebaseRepo(active.userId, this.codebaseScanner);
+      const repoRoot = await selectedCodebaseRepo(vmOwner, this.codebaseScanner);
       if (!repoRoot) return undefined;
       const rootResult = await exec(["git", "rev-parse", "--show-toplevel"], { cwd: repoRoot });
       if (rootResult.exitCode !== 0) throw new Error("could not locate repository root");
@@ -3990,7 +4093,7 @@ export class RuntimeManager {
       const projectDir = path.posix.relative(gitRoot, repoRoot) || ".";
       const runsDir = getRunsDir();
       const events = runsDir ? readRunEvents(active.runId, runsDir) : [];
-      const after = await listWorkspaceFiles(this.vm, active.userId);
+      const after = await listWorkspaceFiles(this.vm, vmOwner);
       const artifacts = mergeArtifacts(
         diffWorkspaceLists(active.oracleStartListing ?? null, after),
         deriveArtifactsFromEvents(events, after, active.oracleStartListing ?? null),
@@ -4271,7 +4374,7 @@ export class RuntimeManager {
         return { outcome: "finalized" };
       }
       const deps: ShadowVerifierDeps = {
-        exec: this.shadowExecFor(userId),
+        exec: this.shadowExecFor(agentOwnerKey(active.userId, active.agentId)),
         callLLM,
       };
       let summary = await shadowVerifyRound(deps, {
@@ -4365,7 +4468,11 @@ export class RuntimeManager {
     const files: SourceFile[] = [];
     for (const filePath of paths) {
       try {
-        const bytes = await this.vm.readFileBytes(active.userId, filePath, L1_WORKING_SET_MAX_BYTES_PER_FILE);
+          const bytes = await this.vm.readFileBytes(
+          agentOwnerKey(active.userId, active.agentId ?? DEFAULT_AGENT_ID),
+          filePath,
+          L1_WORKING_SET_MAX_BYTES_PER_FILE,
+        );
         files.push({ path: filePath, content: bytes.content.toString("utf8") });
       } catch {
         // Not in scope this turn.
@@ -4524,7 +4631,7 @@ export class RuntimeManager {
           // Stable per-run pgid marker: the cancel backstop kills exactly
           // this run's process group (never PID 1's children).
           pgidFile: active.pgidFile,
-          vm: bindExec(this.vm, userId),
+          vm: bindExec(this.vm, agentOwnerKey(active.userId, active.agentId)),
           signal: active.controller.signal,
           cwd: "/workspace",
           redactSecrets: selection?.secrets,
@@ -4718,8 +4825,10 @@ export class RuntimeManager {
    */
   private questionGatewayFor(active: ActiveRun, seen: Set<string>): QuestionGateway {
     const { runId, userId } = active;
+    // The rendezvous files live in the run's agent VM, not the per-user one.
+    const vmOwner = agentOwnerKey(userId, active.agentId ?? DEFAULT_AGENT_ID);
     return async (ask: QuestionRequest) => {
-      const pending = await this.waitForPendingQuestion(userId, seen, ask);
+      const pending = await this.waitForPendingQuestion(vmOwner, seen, ask);
       const store = getQuestionStore();
       const question = store.create({
         ...(pending?.id ? { id: pending.id } : {}),
@@ -4738,7 +4847,7 @@ export class RuntimeManager {
         allowFreeText: question.allowFreeText,
         expiresAt: question.expiresAt,
         outcome: settled.then(async (result) => {
-          await this.writeQuestionAnswer(userId, question.id, result);
+          await this.writeQuestionAnswer(vmOwner, question.id, result);
           return result;
         }),
       };
@@ -4769,7 +4878,7 @@ export class RuntimeManager {
    * Returns null when nothing lands within 5s.
    */
   private async pollPendingFile<T>(
-    userId: string,
+    vmOwner: string,
     dir: string,
     seen: Set<string>,
     map: (parsed: Record<string, unknown>, id: string) => T,
@@ -4777,7 +4886,7 @@ export class RuntimeManager {
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
       try {
-        const entries = await this.vm.listDir(userId, dir);
+        const entries = await this.vm.listDir(vmOwner, dir);
         const candidates = entries
           .filter((entry) => entry.type === "file" && entry.name.endsWith(".pending.json"))
           .map((entry) => ({ entry, id: entry.name.slice(0, -".pending.json".length) }))
@@ -4786,7 +4895,7 @@ export class RuntimeManager {
         for (const { entry, id } of candidates) {
           let parsed: Record<string, unknown>;
           try {
-            parsed = JSON.parse(await this.vm.readFile(userId, entry.path)) as Record<string, unknown>;
+            parsed = JSON.parse(await this.vm.readFile(vmOwner, entry.path)) as Record<string, unknown>;
           } catch {
             continue; // partially written; retry on the next poll
           }
@@ -4809,11 +4918,11 @@ export class RuntimeManager {
    * tool call itself will time out in the VM).
    */
   private async waitForPendingQuestion(
-    userId: string,
+    vmOwner: string,
     seen: Set<string>,
     ask: QuestionRequest,
   ): Promise<{ id: string; question: string; options: string[]; allowFreeText: boolean } | null> {
-    return this.pollPendingFile(userId, ASK_QUESTIONS_DIR, seen, (parsed, id) => ({
+    return this.pollPendingFile(vmOwner, ASK_QUESTIONS_DIR, seen, (parsed, id) => ({
       id,
       question: typeof parsed.question === "string" ? parsed.question : ask.question,
       options: Array.isArray(parsed.options)
@@ -4825,7 +4934,7 @@ export class RuntimeManager {
 
   /** Write the answer (or cancellation) file the VM ask server is polling. */
   private async writeQuestionAnswer(
-    userId: string,
+    vmOwner: string,
     id: string,
     outcome: QuestionOutcome,
   ): Promise<void> {
@@ -4834,7 +4943,7 @@ export class RuntimeManager {
         ? { status: "answered", answer: outcome.answer, answeredAt: Date.now() }
         : { status: outcome.status, answeredAt: Date.now() };
     try {
-      await this.vm.writeFile(userId, questionPaths(id).answer, JSON.stringify(payload));
+      await this.vm.writeFile(vmOwner, questionPaths(id).answer, JSON.stringify(payload));
     } catch {
       // The run is already finalized or the VM is gone; nothing to resume.
     }
@@ -4853,8 +4962,10 @@ export class RuntimeManager {
    */
   private handoffGatewayFor(active: ActiveRun, seen: Set<string>): HandoffGateway {
     const { runId, userId } = active;
+    // The rendezvous files live in the run's agent VM, not the per-user one.
+    const vmOwner = agentOwnerKey(userId, active.agentId ?? DEFAULT_AGENT_ID);
     return async (request: HandoffRequest) => {
-      const pending = await this.waitForPendingHandoff(userId, seen, request);
+      const pending = await this.waitForPendingHandoff(vmOwner, seen, request);
       const store = getHandoffStore();
       const handoff = store.create({
         ...(pending?.id ? { id: pending.id } : {}),
@@ -4878,7 +4989,7 @@ export class RuntimeManager {
         description: handoff.description,
         expiresAt: handoff.expiresAt,
         outcome: settled.then(async (result) => {
-          await this.writeHandoffResolution(userId, handoff.id, request, result);
+          await this.writeHandoffResolution(userId, vmOwner, handoff.id, request, result);
           return result;
         }),
       };
@@ -4907,11 +5018,11 @@ export class RuntimeManager {
    * card is still shown; the tool call itself will time out in the VM).
    */
   private async waitForPendingHandoff(
-    userId: string,
+    vmOwner: string,
     seen: Set<string>,
     request: HandoffRequest,
   ): Promise<{ id: string; reason: string; description: string } | null> {
-    return this.pollPendingFile(userId, DESKTOP_HANDOFF_DIR, seen, (parsed, id) => ({
+    return this.pollPendingFile(vmOwner, DESKTOP_HANDOFF_DIR, seen, (parsed, id) => ({
       id,
       reason: typeof parsed.reason === "string" ? parsed.reason : request.reason,
       description: typeof parsed.description === "string" ? parsed.description : request.description,
@@ -4926,6 +5037,7 @@ export class RuntimeManager {
    */
   private async writeHandoffResolution(
     userId: string,
+    vmOwner: string,
     id: string,
     request: DesktopHandoffArguments,
     outcome: HandoffOutcome,
@@ -4940,7 +5052,7 @@ export class RuntimeManager {
       this.takeoverSignal(userId, (proxy) => proxy.setAgentPaused(userId, false));
       const resolvedAt = Date.now();
       const startedAt = getHandoffStore().get(id)?.createdAt ?? resolvedAt;
-      const shot = await captureDesktopScreenshot(this.vm, userId);
+      const shot = await captureDesktopScreenshot(this.vm, vmOwner);
       const takeoverSummary = (() => {
         try {
           return getGlobalDesktopProxy()?.getTakeoverSummary(userId) ?? null;
@@ -4960,7 +5072,7 @@ export class RuntimeManager {
       payload = { status: outcome.status, resolvedAt: Date.now() };
     }
     try {
-      await this.vm.writeFile(userId, handoffPaths(id).answer, JSON.stringify(payload));
+      await this.vm.writeFile(vmOwner, handoffPaths(id).answer, JSON.stringify(payload));
     } catch {
       // The run is already finalized or the VM is gone; nothing to resume.
     }
@@ -5050,9 +5162,11 @@ export class RuntimeManager {
       this.noteToolCall(active, event.id);
       active.openToolCalls = (active.openToolCalls ?? 0) + 1;
       // Remember which files the agent worked on: the heatmap weighs them.
+      // The heatmap lives in the run's own VM, so touches are recorded
+      // against the agent's map, never the per-user VM's.
       const touched = extractTouchedPaths((event as { input?: unknown }).input);
       if (touched.length > 0) {
-        void this.recordCodebaseTouches(userId, touched);
+        void this.recordCodebaseTouches(agentOwnerKey(userId, active.agentId), touched);
       }
     }
     if (event.type === "tool.result") {
@@ -5104,6 +5218,7 @@ export class RuntimeManager {
         active.userId,
         this.codebaseScanner,
         WORKSPACE_ROOT,
+        agentOwnerKey(active.userId, active.agentId),
       );
       if (!result.injected || !result.text) return;
       const wrapped = wrapCodebasePack(result.text, { repoHash: result.repoHash });
@@ -5143,6 +5258,7 @@ export class RuntimeManager {
     // The run's browser (if any) must not outlive it.
     void getBrowserManager().close(runId).catch(() => {});
     let nextUserId: string | undefined;
+    let finishedAgentId: string | undefined;
     for (const [userId, st] of this.users) {
       if (st.active?.runId !== runId) continue;
       const active = st.active;
@@ -5188,6 +5304,7 @@ export class RuntimeManager {
       st.history.unshift(summary);
       if (st.history.length > HISTORY_LIMIT) st.history.length = HISTORY_LIMIT;
       nextUserId = userId;
+      finishedAgentId = active.agentId;
       break;
     }
     // Persist the cleared slot and the still-queued prompts before possibly
@@ -5198,19 +5315,27 @@ export class RuntimeManager {
       if (nextUserId !== undefined) {
         this.startNext(nextUserId);
         // VM persistence toggle (spec 3d): "terminate-at-project-end" stops
-        // the VM as soon as the user's last run finishes and nothing is
-        // queued behind it, instead of waiting for the idle sweeper. The
-        // volume is kept; the next task re-ensures. Shutdown finalizes pass
-        // drainQueue=false and never stop the VM (a deploy must not kill a
-        // VM a resumed run still needs).
+        // the finished run's agent VM as soon as that agent has no work
+        // left, instead of waiting for the idle sweeper. "No work left"
+        // is per-agent: another agent's active or queued run must not keep
+        // this agent's VM alive (and vice versa). The volume is kept; the
+        // next task re-ensures. Shutdown finalizes pass drainQueue=false
+        // and never stop the VM (a deploy must not kill a VM a resumed run
+        // still needs).
         const st = this.users.get(nextUserId);
-        if (
-          st &&
-          shouldStopVmAtRunEnd(vmPersistenceModeFor(readUserSettings(nextUserId)), {
-            hasRemainingWork: st.active !== null || st.queue.length > 0 || st.shellRuns.size > 0,
-          })
-        ) {
-          void this.vm.stop(nextUserId).catch(() => {});
+        const finishedAgent = finishedAgentId ?? DEFAULT_AGENT_ID;
+        const agentHasRemainingWork =
+          !!st &&
+          ((st.active !== null && (st.active.agentId ?? DEFAULT_AGENT_ID) === finishedAgent) ||
+            st.queue.some((run) => (run.agentId ?? DEFAULT_AGENT_ID) === finishedAgent) ||
+            (finishedAgent === DEFAULT_AGENT_ID && st.shellRuns.size > 0));
+        if (st) {
+          void this.agentVms
+            .endTask(nextUserId, finishedAgent, {
+              mode: vmPersistenceModeFor(readUserSettings(nextUserId)),
+              hasRemainingWork: agentHasRemainingWork,
+            })
+            .catch(() => {});
         }
       }
       // A freed slot may also unblock another user's capacity-queued run.

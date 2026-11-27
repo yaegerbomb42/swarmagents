@@ -55,6 +55,7 @@ import {
 } from "../auth";
 import { recordAudit } from "../audit";
 import { getVmManager } from "../vm/manager";
+import { DEFAULT_AGENT_ID, agentOwnerKey, validateAgentId } from "../vm/agent-keys";
 import type { VmDesktopEndpoint } from "../vm/types";
 import { handlePreviewUpgrade, type PreviewTarget } from "../preview/proxy";
 import { parsePreviewPort, resolvePreviewTarget } from "../preview/target";
@@ -482,6 +483,25 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
     return endpoint;
   }
 
+  /**
+   * The VM owner key for the desktop a viewer asked for. `?agent=<id>`
+   * selects a named agent's desktop; absent or invalid falls back to the
+   * default agent (A1). Guests always get the default agent — a share
+   * token never grants another agent's desktop. The id is validated, and
+   * the key is derived from the authenticated user's own id, so it can
+   * never escape to another user's VM.
+   */
+  function ownerKeyForViewer(userId: string, url: URL, guest: boolean): string {
+    if (guest) return agentOwnerKey(userId, DEFAULT_AGENT_ID);
+    const requested = url.searchParams.get("agent");
+    if (!requested) return agentOwnerKey(userId, DEFAULT_AGENT_ID);
+    try {
+      return agentOwnerKey(userId, validateAgentId(requested));
+    } catch {
+      return agentOwnerKey(userId, DEFAULT_AGENT_ID);
+    }
+  }
+
   // --- HTTP asset proxying (GET/HEAD under /desktop/) -------------------------
 
   function mapDeskPath(rawPath: string): string | null {
@@ -669,7 +689,7 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
     const mapped = mapDeskPath(url.pathname);
     if (mapped === null) return safeError(res, 404, "Not found.");
 
-    const endpoint = await resolveEndpointFor(user.id);
+    const endpoint = await resolveEndpointFor(ownerKeyForViewer(user.id, url, false));
     if (!endpoint) return safeError(res, 404, "No desktop VM for this user.");
 
     // Only the driver-resolved host/port is ever dialed. Client-supplied
@@ -882,7 +902,7 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
       recordSession = Boolean(recordingRunId);
     }
 
-    const endpoint = await resolveEndpointFor(user.id);
+    const endpoint = await resolveEndpointFor(ownerKeyForViewer(user.id, url, guest));
     if (!endpoint) return writeUpgradeRefusal(socket, 404, "No desktop VM for this user.");
 
     const active = sessionsFor(user.id);

@@ -422,6 +422,8 @@ interface HarnessEndpoints {
   alice: VmDesktopEndpoint;
   bob: VmDesktopEndpoint;
   carol: VmDesktopEndpoint | null;
+  /** Agent desktops, keyed by agent owner key (`agent:<id>:<userId>`). */
+  [ownerKey: string]: VmDesktopEndpoint | null;
 }
 
 const GUEST_TOKEN = "guest-token";
@@ -431,7 +433,8 @@ const PREVIEW_SHARE_TOKEN = "a".repeat(48);
 async function makeProxy(opts: {
   idleMs?: number;
   maxViewers?: number;
-  endpoints?: HarnessEndpoints;
+  // Partial: makeProxy fills alice/bob/carol defaults; callers only override what they need.
+  endpoints?: Partial<HarnessEndpoints>;
   resolveGuest?: (token: string) => Promise<string | null>;
   resolvePreviewTarget?: (userId: string, port: number) => Promise<PreviewTarget | null>;
   resolvePreviewShare?: (token: string) => PreviewShareOwner | null;
@@ -454,10 +457,11 @@ async function makeProxy(opts: {
   const bobApp = new FakeWsApp();
   await aliceApp.listen();
   await bobApp.listen();
-  const endpoints: HarnessEndpoints = opts.endpoints ?? {
+  const endpoints: HarnessEndpoints = {
     alice: { host: "127.0.0.1", port: aliceVm.port, password: "alice-vnc-password" },
     bob: { host: "127.0.0.1", port: bobVm.port, password: "bob-vnc-password" },
     carol: null,
+    ...(opts.endpoints ?? {}),
   };
   const resolveEndpoint = async (userId: string): Promise<VmDesktopEndpoint | null> =>
     endpoints[userId as keyof HarnessEndpoints] ?? null;
@@ -570,6 +574,100 @@ test("desktop proxy: HTTP assets are proxied from the user's own container", asy
     });
     assert.equal(png.status, 200);
     assert.equal(await png.text(), "PNGDATA");
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("desktop proxy: ?agent= dials the agent's own desktop, never another's", async () => {
+  const workerVm = new FakeVncServer("worker-2-vnc-password");
+  await workerVm.listen();
+  const { proxy, port, aliceVm } = await makeProxy({
+    endpoints: {
+      "agent:worker-2:alice": {
+        host: "127.0.0.1",
+        port: workerVm.port,
+        password: "worker-2-vnc-password",
+      },
+    },
+  });
+  try {
+    const client = await TestWsClient.connect(
+      `ws://127.0.0.1:${port}${DESKTOP_WS_PATH}?mode=view&agent=worker-2`,
+      { cookie: sessionFor("alice") },
+    );
+    await completeRfbClientHandshake(client);
+    assert.ok(
+      workerVm.urls.some((u) => u.startsWith("WS /websockify")),
+      "the named agent's VNC server received the dial",
+    );
+    assert.ok(
+      !aliceVm.urls.some((u) => u.startsWith("WS ")),
+      "the default agent's desktop was not dialed for ?agent=worker-2",
+    );
+    client.close();
+
+    const workerHits = workerVm.urls.length;
+    const aliceHits = aliceVm.urls.length;
+    const unknown = await TestWsClient.connect(
+      `ws://127.0.0.1:${port}${DESKTOP_WS_PATH}?mode=view&agent=worker-9`,
+      { cookie: sessionFor("alice") },
+    ).catch((e: Error) => e);
+    assert.ok(unknown instanceof Error, "an agent with no desktop is refused");
+    assert.match(unknown.message, /HTTP 404/);
+    assert.equal(workerVm.urls.length, workerHits, "no upstream was dialed for the unknown agent");
+    assert.equal(aliceVm.urls.length, aliceHits, "no upstream was dialed for the unknown agent");
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("desktop proxy: invalid ?agent= falls back to the default agent's desktop", async () => {
+  const { proxy, port, aliceVm } = await makeProxy();
+  try {
+    const client = await TestWsClient.connect(
+      `ws://127.0.0.1:${port}${DESKTOP_WS_PATH}?mode=view&agent=..%2Fescape`,
+      { cookie: sessionFor("alice") },
+    );
+    await completeRfbClientHandshake(client);
+    assert.ok(
+      aliceVm.urls.some((u) => u.startsWith("WS /websockify")),
+      "an invalid agent id falls back to A1's desktop, never an escape",
+    );
+    client.close();
+  } finally {
+    await proxy.close();
+  }
+});
+
+test("desktop proxy: guests cannot request another agent's desktop", async () => {
+  const workerVm = new FakeVncServer("worker-2-vnc-password");
+  await workerVm.listen();
+  const { proxy, port, aliceVm } = await makeProxy({
+    endpoints: {
+      "agent:worker-2:alice": {
+        host: "127.0.0.1",
+        port: workerVm.port,
+        password: "worker-2-vnc-password",
+      },
+    },
+  });
+  try {
+    // A guest dials with the share token (no session): even with
+    // ?agent=worker-2 it must land on the owner's default desktop.
+    const guest = await TestWsClient.connect(
+      `ws://127.0.0.1:${port}${DESKTOP_WS_PATH}?mode=view&token=${GUEST_TOKEN}&agent=worker-2`,
+    );
+    await completeRfbClientHandshake(guest);
+    assert.ok(
+      aliceVm.urls.some((u) => u.startsWith("WS /websockify")),
+      "the guest landed on the owner's default desktop",
+    );
+    assert.ok(
+      !workerVm.urls.some((u) => u.startsWith("WS ")),
+      "the guest never reached the named agent's desktop",
+    );
+    guest.close();
   } finally {
     await proxy.close();
   }

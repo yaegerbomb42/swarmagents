@@ -23,6 +23,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getStoragePaths } from "../board/store";
+import { isValidAgentId } from "../vm/agent-allocation";
 import type { RunCompute } from "../computers/compute";
 import type { RunModeInfo } from "../providers/capabilities";
 import { MODEL_TIERS, type ModelTier } from "../providers/types";
@@ -46,6 +47,8 @@ export interface PersistedActiveRun {
   runId: string;
   userId: string;
   prompt: string;
+  /** The agent this run belongs to (default "a1"); its VM is the agent's own desktop. */
+  agentId?: string;
   agentCard?: string;
   sessionId?: string;
   model?: string;
@@ -71,6 +74,8 @@ export interface PersistedQueuedRun {
   runId: string;
   userId: string;
   prompt: string;
+  /** The agent this run belongs to (default "a1"); its VM is the agent's own desktop. */
+  agentId?: string;
   agentCard?: string;
   sessionId?: string;
   model?: string;
@@ -185,6 +190,7 @@ function normalizeCommon(record: Record<string, unknown>):
       | "runId"
       | "userId"
       | "prompt"
+      | "agentId"
       | "agentCard"
       | "sessionId"
       | "model"
@@ -214,6 +220,7 @@ function normalizeCommon(record: Record<string, unknown>):
     runId,
     userId,
     prompt,
+    ...(isValidAgentId(record.agentId) ? { agentId: record.agentId } : {}),
     ...(str(record.agentCard, MAX_AGENT_CARD_LEN) ? { agentCard: str(record.agentCard, MAX_AGENT_CARD_LEN) } : {}),
     ...(str(record.sessionId, 256) ? { sessionId: str(record.sessionId, 256) } : {}),
     ...(str(record.model, 128) ? { model: str(record.model, 128) } : {}),

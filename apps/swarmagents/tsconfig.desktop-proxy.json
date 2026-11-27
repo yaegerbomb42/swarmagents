@@ -26,6 +26,7 @@
     "lib/safe-next.ts",
     "lib/audit.ts",
     "lib/vm/types.ts",
+    "lib/vm/agent-keys.ts",
     "lib/vm/docker-driver.ts",
     "lib/vm/limits.ts",
     "lib/vm/files.ts",

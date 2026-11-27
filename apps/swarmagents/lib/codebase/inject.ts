@@ -44,18 +44,24 @@ export async function resolveCodebaseInjection(
   userId: string,
   scanner: CodebaseScanner,
   fallbackRepoRoot: string,
+  /**
+   * VM owner key the repo selection and map are read from. Defaults to the
+   * userId (A1's per-user VM); a named agent's run passes its agent owner
+   * key so the map comes from its own VM. Settings stay on the userId.
+   */
+  vmOwner: string = userId,
 ): Promise<CodebaseInjectionResult> {
   try {
     const settings = readUserSettings(userId);
     if (!codebaseContextInjectionEnabled(settings)) {
       return { enabled: false, injected: false, repoRoot: fallbackRepoRoot, reason: "disabled" };
     }
-    const selected = await selectedCodebaseRepo(userId, scanner);
+    const selected = await selectedCodebaseRepo(vmOwner, scanner);
     if (!selected) {
       return { enabled: true, injected: false, repoRoot: fallbackRepoRoot, reason: "no-repo-picked" };
     }
-    await maybeRefreshCodebaseMapOnGitChange(userId, scanner, selected).catch(() => undefined);
-    const map = await ensureCodebaseMap(userId, scanner, { repoRoot: selected });
+    await maybeRefreshCodebaseMapOnGitChange(vmOwner, scanner, selected).catch(() => undefined);
+    const map = await ensureCodebaseMap(vmOwner, scanner, { repoRoot: selected });
     if (!map?.contextPack?.text?.trim()) {
       return { enabled: true, injected: false, repoRoot: selected, reason: "no-map" };
     }

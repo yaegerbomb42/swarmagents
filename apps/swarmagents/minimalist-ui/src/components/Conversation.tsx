@@ -405,6 +405,7 @@ function Blocks({
   onHandBack,
   defaultOpen = false,
   timeline,
+  runId,
 }: {
   blocks: TurnBlock[];
   truncated: boolean;
@@ -414,6 +415,8 @@ function Blocks({
   defaultOpen?: boolean;
   /** Trace stretches, one per steps block, in order (see traceTimeline). */
   timeline?: TimelineStretch[];
+  /** The run the timeline's Rewind buttons restore into. */
+  runId?: string;
 }) {
   // Steps blocks and trace stretches split on the same boundaries (agent
   // prose, questions, handoffs), so the k-th steps block pairs with the
@@ -430,7 +433,7 @@ function Blocks({
         if (block.kind === "steps") {
           const stretch = timeline?.[stretchIndex++];
           if (stretch && stretch.steps.length > 0) {
-            return <RunTraceTimeline key={block.key} steps={stretch.steps} defaultOpen={defaultOpen} />;
+            return <RunTraceTimeline key={block.key} steps={stretch.steps} runId={runId} defaultOpen={defaultOpen} />;
           }
           return <StepsBlock key={block.key} steps={block.steps} defaultOpen={defaultOpen} />;
         }
@@ -472,6 +475,7 @@ function ReplayedSteps({
         onHandBack={onHandBack}
         defaultOpen
         timeline={timeline}
+        runId={runId}
       />
     </>
   );
@@ -552,7 +556,14 @@ const Turn = React.memo(function Turn({
       <div className="space-y-3">
         {live && <PlanChecklist plan={plan} live={meta.active} />}
         {live && blocks && blocks.length > 0 ? (
-          <Blocks blocks={blocks} truncated={truncated} onAnswer={onAnswer} onHandBack={onHandBack} timeline={timeline} />
+          <Blocks
+            blocks={blocks}
+            truncated={truncated}
+            onAnswer={onAnswer}
+            onHandBack={onHandBack}
+            timeline={timeline}
+            runId={entry.runId}
+          />
         ) : showSteps ? (
           <ReplayedSteps runId={entry.runId} onAnswer={onAnswer} onHandBack={onHandBack} />
         ) : (

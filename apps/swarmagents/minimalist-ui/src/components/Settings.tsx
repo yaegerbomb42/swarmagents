@@ -56,6 +56,7 @@ export function Settings({
   tabs = DEFAULT_TABS,
   initialTab,
   agentPanel,
+  footer,
   onAlwaysOn247Change,
   onRunSample,
 }: {
@@ -80,6 +81,11 @@ export function Settings({
   initialTab?: Tab;
   /** Content of the 'agent' tab: the run settings the workspace supplies. */
   agentPanel?: React.ReactNode;
+  /**
+   * Quiet rows under the tabs: shortcuts, connectors, the dev board. The
+   * workspace passes the things that used to live in its header here.
+   */
+  footer?: React.ReactNode;
   /** Notified when the 24/7 always-on toggle loads or changes (for the header badge). */
   onAlwaysOn247Change?: (value: boolean) => void;
   /** Dispatch a sample task through the normal run path (Account tab replay). */
@@ -160,6 +166,9 @@ export function Settings({
           {tab === 'account' && <Account onRunSample={onRunSample} />}
           {tab === 'memory' && <Memory />}
         </div>
+        {footer && (
+          <div className="shrink-0 border-t border-sa-line px-5 py-3">{footer}</div>
+        )}
       </aside>
   );
 

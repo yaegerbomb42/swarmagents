@@ -21,8 +21,14 @@
 import { useEffect, useRef, useState } from "react";
 import { backoffDelayMs } from "./backoff";
 import { SseParser, type SseMessage } from "./sse";
+import { clearSessionValue, readSessionValue, writeSessionValue } from "./storage";
 
 export type RunStreamStatus = "idle" | "connecting" | "connected" | "reconnecting";
+
+/** Server-minted run ids: 1-64 alphanumerics, `_` or `-`. Twin of the
+ * server-side RUN_ID_RE in lib/telemetry/paths.ts (kept separate: that
+ * module imports node builtins, which client code must not pull in). */
+export const RUN_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 export interface RunStreamItem {
   /** Monotonic display order (mirrors the server seq when ids are numeric). */
@@ -241,30 +247,15 @@ export function sseCursorKey(runId: string): string {
 }
 
 export function readSseCursor(runId: string): string | undefined {
-  try {
-    if (typeof sessionStorage === "undefined") return undefined;
-    return sessionStorage.getItem(sseCursorKey(runId)) ?? undefined;
-  } catch {
-    return undefined;
-  }
+  return readSessionValue(sseCursorKey(runId));
 }
 
 export function writeSseCursor(runId: string, id: string): void {
-  try {
-    if (typeof sessionStorage === "undefined") return;
-    sessionStorage.setItem(sseCursorKey(runId), id);
-  } catch {
-    // Storage full or blocked: the in-memory cursor still works.
-  }
+  writeSessionValue(sseCursorKey(runId), id);
 }
 
 export function clearSseCursor(runId: string): void {
-  try {
-    if (typeof sessionStorage === "undefined") return;
-    sessionStorage.removeItem(sseCursorKey(runId));
-  } catch {
-    // ignore
-  }
+  clearSessionValue(sseCursorKey(runId));
 }
 
 export function useRunStream(runId?: string | null): RunStreamState {
@@ -303,6 +294,15 @@ export function useRunStream(runId?: string | null): RunStreamState {
     if (!lastIdRef.current && runId) lastIdRef.current = readSseCursor(runId);
 
     if (!runId) {
+      setStatus("idle");
+      return;
+    }
+
+    // The run id lands in the stream URL, so only a server-minted shape may
+    // reach the fetch: anything else (e.g. a poisoned storage hint) is
+    // refused instead of being interpolated into a request (Sonar S8476).
+    if (!RUN_ID_RE.test(runId)) {
+      setError("Invalid run id.");
       setStatus("idle");
       return;
     }

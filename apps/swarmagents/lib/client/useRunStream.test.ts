@@ -7,6 +7,7 @@ import {
   parseRunLogNdjson,
   shouldResetStreamCursor,
   snapshotTruncation,
+  RUN_ID_RE,
   clearSseCursor,
   readSseCursor,
   writeSseCursor,
@@ -113,6 +114,15 @@ test("SSE cursor helpers tolerate missing or blocked storage", () => {
   writeSseCursor("run_a", "42"); // must not throw
   clearSseCursor("run_a"); // must not throw
   assert.equal(readSseCursor("run_a"), undefined);
+});
+
+test("RUN_ID_RE: only server-minted run ids may reach the stream URL", () => {
+  assert.equal(RUN_ID_RE.test("run_11111111-2222-3333-4444-555555555555"), true);
+  assert.equal(RUN_ID_RE.test("run_a"), true);
+  assert.equal(RUN_ID_RE.test('"><script>alert(1)</script>'), false);
+  assert.equal(RUN_ID_RE.test("run_../../etc/passwd"), false);
+  assert.equal(RUN_ID_RE.test(""), false);
+  assert.equal(RUN_ID_RE.test("a".repeat(65)), false);
 });
 
 test("snapshotTruncation: reads the first event id from a truncated snapshot", () => {

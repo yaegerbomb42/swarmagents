@@ -22,6 +22,7 @@
 import { useEffect, useState } from "react";
 import { fetchRuns } from "./runs";
 import { pickRunToRestore, type RestorableRun } from "./restoreRun";
+import { clearSessionValue, readSessionValue, writeSessionValue } from "./storage";
 import type { ThreadRunInput } from "./thread";
 
 /** How long after a run finishes it still counts as "the run to show". */
@@ -44,32 +45,17 @@ export function isValidRunHintId(runId: string): boolean {
 }
 
 export function readLastRunHint(): string | undefined {
-  try {
-    if (typeof sessionStorage === "undefined") return undefined;
-    const stored = sessionStorage.getItem(LAST_RUN_HINT_KEY) ?? undefined;
-    return stored !== undefined && isValidRunHintId(stored) ? stored : undefined;
-  } catch {
-    return undefined;
-  }
+  const stored = readSessionValue(LAST_RUN_HINT_KEY);
+  return stored !== undefined && isValidRunHintId(stored) ? stored : undefined;
 }
 
 export function writeLastRunHint(runId: string): void {
-  try {
-    if (typeof sessionStorage === "undefined") return;
-    if (!isValidRunHintId(runId)) return;
-    sessionStorage.setItem(LAST_RUN_HINT_KEY, runId);
-  } catch {
-    // Storage full or blocked: the poll still finds the run.
-  }
+  if (!isValidRunHintId(runId)) return;
+  writeSessionValue(LAST_RUN_HINT_KEY, runId);
 }
 
 export function clearLastRunHint(): void {
-  try {
-    if (typeof sessionStorage === "undefined") return;
-    sessionStorage.removeItem(LAST_RUN_HINT_KEY);
-  } catch {
-    // ignore
-  }
+  clearSessionValue(LAST_RUN_HINT_KEY);
 }
 
 export interface ActiveRunSelection {

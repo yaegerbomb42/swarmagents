@@ -21,6 +21,7 @@
  *   - allow: everything else (read-only inspection, local builds, tests, ...).
  */
 
+import path from "node:path";
 import { classifyDesktopToolCall, classifyDesktopToolCallAsync, isDesktopMcpCall } from "./computer-mcp";
 import { checkNavigation, checkNavigationAsync, lookupAddresses } from "../browser/policy";
 import { classifyHostTarget } from "./vm-only";
@@ -69,9 +70,6 @@ const SYSTEM_CREDENTIAL_PATHS =
 
 /** User-level credential files — any read or write needs approval. */
 const CREDENTIAL_PATH = /(\.ssh|\.aws|\.gnupg|\.docker|\.kube|kubeconfig|id_rsa|id_ed25519|id_ecdsa|id_dsa|\.pem|\.key\b|\.env\b|credentials|\.npmrc|\.netrc|\.pgpass|\.my\.cnf|\.git-credentials|\.bash_history|\.zsh_history)/i;
-
-/** Command verbs that print/stream the value of an env var to stdout. */
-const DISCLOSURE_VERB = /(^|[|&;]\s*)(cat|echo|printf|printenv|env|grep|sed|awk|head|tail|less|more|strings|cut|paste|tr|sort|uniq|base64|xxd|od|python|python3|node|ruby|perl|php)\b/i;
 
 /** A variable reference that appears inside a disclosure context (printing it). */
 function disclosedSecretVar(command: string): string | undefined {
@@ -129,17 +127,30 @@ function systemPackageMutation(command: string): boolean {
   return false;
 }
 
+function parseUrlHostname(rawUrl: string): string | undefined {
+  const cleaned = rawUrl.trim().replace(/^['"`(]+|['"`),;]+$/g, "");
+  try {
+    const parsed = new URL(cleaned);
+    return parsed.hostname ? parsed.hostname.toLowerCase() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function networkHostOf(command: string): string | undefined {
-  const m = /https?:\/\/([^/\s]+)/.exec(command);
-  return m ? m[1].toLowerCase() : undefined;
+  const m = /https?:\/\/[^\s'"]+/.exec(command);
+  return m ? parseUrlHostname(m[0]) : undefined;
 }
 
 /** Every https?:// host in a command — a downloader check must see all of them, not just the first. */
 function networkHostsOf(command: string): string[] {
   const hosts: string[] = [];
-  const re = /https?:\/\/([^/\s]+)/g;
+  const re = /https?:\/\/[^\s'"]+/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(command)) !== null) hosts.push(m[1].toLowerCase());
+  while ((m = re.exec(command)) !== null) {
+    // Empty string ensures a malformed URL is treated as an unknown host rather than skipped.
+    hosts.push(parseUrlHostname(m[0]) ?? "");
+  }
   return hosts;
 }
 
@@ -152,12 +163,13 @@ function downloaderToUnknownHost(command: string): boolean {
 }
 
 /** Classify a path string by whether it names credential material. */
-function classifyPath(path: string): RiskDecision | null {
-  if (!path) return null;
-  if (SYSTEM_CREDENTIAL_PATHS.test(path)) {
+function classifyPath(filePath: string): RiskDecision | null {
+  if (!filePath) return null;
+  const normalized = path.posix.normalize(filePath.replace(/\/+/g, "/"));
+  if (SYSTEM_CREDENTIAL_PATHS.test(normalized) || SYSTEM_CREDENTIAL_PATHS.test(filePath)) {
     return { level: "deny", reason: "system credential files are off-limits" };
   }
-  if (CREDENTIAL_PATH.test(path)) {
+  if (CREDENTIAL_PATH.test(normalized) || CREDENTIAL_PATH.test(filePath)) {
     return { level: "ask", reason: "credential file access requires approval" };
   }
   return null;
@@ -356,7 +368,7 @@ export function classifyCommandAst(raw: string): RiskDecision {
     if (categories.has("fork_bomb") || (categories.has("secrets") && categories.has("network_exfil"))) {
       return { level: "deny", reason };
     }
-    if ([...categories].every((c) => AST_BLOCK_IGNORED.has(c))) {
+    if (categories.size > 0 && [...categories].every((c) => AST_BLOCK_IGNORED.has(c))) {
       return { level: "allow", reason: "benign command" };
     }
     return { level: "ask", reason: `${reason} — requires approval` };
@@ -383,6 +395,9 @@ function classifyCommandPatterns(raw: string): RiskDecision {
   if (hasSecretEnvRef(command) && /(echo|printf|printenv|env|cat|grep|sed|awk|head|tail)\b/.test(command)) {
     return { level: "deny", reason: "referencing a secret environment variable is not allowed" };
   }
+  if (/(^|[|&;]\s*)(printenv|env)\s*($|[|&;])|(^|[|&;]\s*)(export|declare)\s+-[a-zA-Z]*p\b/i.test(command)) {
+    return { level: "deny", reason: "dumping environment variables would exfiltrate secrets" };
+  }
   // Cloud instance metadata endpoints are a classic credential-exfiltration vector.
   if (/(169\.254\.169\.254|metadata\.(google|azure|amazonaws)\.internal|100\.100\.100\.200)/.test(command)) {
     return { level: "deny", reason: "cloud instance metadata is off-limits" };
@@ -391,9 +406,16 @@ function classifyCommandPatterns(raw: string): RiskDecision {
   // --- ask: risky but legitimate with human approval ---
 
   // rm -rf / (and other destructive root deletions).
-  if (/\brm\b/.test(command) && /-\S*[rf]\S*/.test(command)) {
-    const args = command.slice(command.indexOf("rm") + 2).trim();
-    const targets = args.split(/\s+/).filter((a) => !a.startsWith("-") && a !== "rm");
+  const rmRe = /\brm\b/g;
+  let rmMatch: RegExpExecArray | null;
+  while ((rmMatch = rmRe.exec(command)) !== null) {
+    const tail = command.slice(rmMatch.index + 2).split(/\s*(?:&&|\|\||[;|\n])\s*/)[0] ?? "";
+    if (!/-\S*[rf]\S*/.test(tail)) continue;
+    const targets = tail
+      .trim()
+      .split(/\s+/)
+      .map((a) => a.replace(/^['"]|['"]$/g, ""))
+      .filter((a) => a.length > 0 && !a.startsWith("-"));
     if (targets.some(isRootDestructiveTarget)) {
       return { level: "ask", reason: "destructive root deletion requires approval" };
     }

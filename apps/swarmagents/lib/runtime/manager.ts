@@ -127,6 +127,7 @@ import { DockerVmDriver, buildPgidKillCommand, execPgidPath } from "../vm/docker
 import { startVmIdleSweeper } from "../vm/idle-sweeper";
 import { startTestDriveSweeper } from "../library/test-drive-sweeper";
 import { getRun, recoverOrphanedRuns, recoverRunOnRestart } from "./run-store";
+import { killOrphanedAgentProcessesOnce } from "./recovery";
 import {
   RunStateStore,
   type PersistedActiveRun,
@@ -1148,6 +1149,8 @@ export class RuntimeManager {
   private readonly pendingRestoredStarts = new Set<string>();
   /** Latch: the deferred restored-start microtask is queued at most once. */
   private restoredStartScheduled = false;
+  /** Users whose VM has already been swept for orphaned `claude -p` processes this boot. */
+  private readonly sweptAgentUsers = new Set<string>();
 
   constructor(opts: {
     vm?: VmManager;
@@ -4608,6 +4611,7 @@ export class RuntimeManager {
         // the previous attempt edited (read from the VM) plus the accumulated
         // ledger. First attempt: no file state yet, ledger starts fresh.
         const l1Files = await this.readL1WorkingSet(active);
+        await killOrphanedAgentProcessesOnce(this.vm, active.userId, this.sweptAgentUsers);
         const outcome = await this.runner.run(
         {
           // The project digest rides in front of the user's ask on a fresh

@@ -35,7 +35,7 @@ export function proposalsFromAnalysis(input: {
     const coverage =
       file.coveragePct == null ? "no coverage artifact" : `${file.coveragePct}% lines`;
     out.push({
-      id: `prop_${input.now.toString(36)}_${out.length}_test`,
+      id,
       userId: input.userId,
       kind: "unit-test",
       title: `Missing unit tests: ${file.path}`,
@@ -52,7 +52,7 @@ export function proposalsFromAnalysis(input: {
     const id = proposalId(["pr", input.repoRoot, top.path, ""]);
     if (!taken.has(id)) {
       out.push({
-        id: `prop_${input.now.toString(36)}_${out.length}_pr`,
+        id,
         userId: input.userId,
         kind: "pr",
         title: `Review hotspot: ${top.path}`,
@@ -80,7 +80,7 @@ export function proposalsFromBoard(input: {
   for (const task of input.tasks) {
     if (taken.has(task.id)) continue;
     out.push({
-      id: `prop_${input.now.toString(36)}_${out.length}_board`,
+      id: proposalId(["board-task", "", "", task.id]),
       userId: input.userId,
       kind: "board-task",
       title: task.title,

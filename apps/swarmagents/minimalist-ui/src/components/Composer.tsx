@@ -19,6 +19,7 @@ import { uid } from "../data";
 import type { RunTier } from "../../../lib/client/runs";
 import { validateAttachment } from "../../../lib/client/upload";
 import { cn } from "../utils/cn";
+import { GLASS, LIFT_LG, RIM, SPECULAR } from "../design/glass";
 import { IconButton, Notice } from "./ui";
 
 export type ComposerSendResult = { ok: true } | { ok: false; error: string };
@@ -267,12 +268,16 @@ export function Composer({
         onDragLeave={() => setDragging(false)}
         onDrop={onDrop}
         data-testid="composer-drop-zone"
-          className={cn(
-            "glass-2 composer-ring rounded-[22px] border border-white/[0.12] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.14),0_20px_50px_rgba(0,0,0,0.55)] backdrop-blur-2xl transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] focus-within:border-white/25 focus-within:ring-1 focus-within:ring-white/10",
-            dragging ? "border-sky-300/50 ring-2 ring-sky-300/25 shadow-[0_0_24px_rgba(56,189,248,0.25)]" : "",
-            hero && "shadow-[inset_0_1px_0_0_rgba(255,255,255,0.16),0_24px_64px_-18px_rgba(0,0,0,0.9)]",
-          )}
+        className={cn(
+          "composer-ring relative overflow-hidden rounded-[22px] transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] focus-within:border-white/25 focus-within:ring-1 focus-within:ring-white/10",
+          GLASS,
+          RIM,
+          LIFT_LG,
+          dragging ? "border-sky-300/50 ring-2 ring-sky-300/25 shadow-[0_0_24px_rgba(56,189,248,0.25)]" : "",
+          hero && "shadow-[inset_0_1px_0_0_rgba(255,255,255,0.16),0_24px_64px_-18px_rgba(0,0,0,0.9)]",
+        )}
       >
+        <span aria-hidden="true" className={SPECULAR} />
         {attachments.length > 0 && (
           <ul className="flex flex-wrap gap-2 px-3 pt-3" aria-label="Attached files" data-testid="composer-attachments">
             {attachments.map((attachment) => (

@@ -35,10 +35,10 @@ export interface AgentSettingsProps {
 
 function Section({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
   return (
-    <section className="space-y-2">
-      <div>
-        <h3 className="text-sm font-medium text-sa-fg">{title}</h3>
-        {hint && <p className="mt-0.5 text-[13px] leading-relaxed text-sa-fg2">{hint}</p>}
+    <section className="space-y-2.5">
+      <div className="px-0.5">
+        <h3 className="text-[11px] font-medium uppercase tracking-[0.09em] text-sa-fg3">{title}</h3>
+        {hint && <p className="mt-1 text-[12.5px] leading-relaxed text-sa-fg2">{hint}</p>}
       </div>
       {children}
     </section>
@@ -198,8 +198,8 @@ export function AgentSettings({
   };
 
   return (
-    <div className="sa-app space-y-8 bg-transparent" data-testid="agent-settings">
-      <Section title="Approvals" hint="Applies to the next run you start.">
+    <div className="sa-app space-y-6 bg-transparent" data-testid="agent-settings">
+      <Section title="Autonomy & Safety" hint="Applies to the next run you start.">
         <div role="radiogroup" aria-label="Approvals" className="space-y-2">
           {APPROVAL_MODES.map((mode) => {
             const selected = mode.fullAuto === fullAuto;

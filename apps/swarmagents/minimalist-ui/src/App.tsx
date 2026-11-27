@@ -30,6 +30,7 @@ import { fetchSchedules, unreadScheduledRuns, type ScheduleSummary } from "../..
 import { agentNameForUser, buildTaskPrompt, type TaskRunLink } from "../../lib/client/board";
 import { useAgentSession } from "./hooks/useAgentSession";
 import { useBoard } from "./hooks/useBoard";
+import { GLASS, LIFT_LG, RIM, SPECULAR, TAKEOVER_HAIRLINE } from "./design/glass";
 import { devModeFromSearch, resolveView } from "./devMode";
 import { forkPromptFromSearch } from "./fork-prompt";
 import { firstRunSetup, useIsWide, useMe, useProviderStatus } from "./hooks/useEnvironment";
@@ -631,13 +632,29 @@ export default function App() {
         </div>
       )}
 
+      <div
+        aria-hidden="true"
+        data-testid="takeover-hairline"
+        className={cn(TAKEOVER_HAIRLINE, takingOver ? "opacity-100" : "opacity-0")}
+      />
+
       {/* The bottom padding grows below sm: the composer — and its
           bottom-left Attach button — sits flush to the viewport edge on a
           phone, where the browser chrome and any bottom-anchored badges
           would otherwise crowd it. */}
-      <main className="relative z-10 flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-3 pb-5 sm:p-4" data-testid="workspace-main">
-        {/* Component 2: the main area — the user's VM screen. */}
-        <section className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col gap-2 overflow-y-auto rounded-[28px] glass hair p-3 sm:p-5 shadow-[0_24px_80px_-28px_rgba(0,0,0,0.85)]" data-testid="stage">
+      <main className="relative z-10 flex min-h-0 flex-1 flex-col gap-2.5 overflow-hidden p-2 pb-5 sm:p-3" data-testid="workspace-main">
+        {/* Component 2: the main area — the user's live Linux VM desktop. */}
+        <section
+          className={cn(
+            "relative mx-auto flex min-h-0 w-full flex-1 flex-col gap-2 overflow-y-auto rounded-[24px] p-2.5 sm:p-4",
+            effectiveView === "screen" ? "max-w-none" : "max-w-6xl",
+            GLASS,
+            RIM,
+            LIFT_LG,
+          )}
+          data-testid="stage"
+        >
+          <span aria-hidden="true" className={SPECULAR} />
           <div className="flex min-w-0 items-center gap-2 text-xs text-[var(--mute)]" role="status" aria-live="polite" data-testid="workspace-activity">
             <span className={cn("h-2 w-2 shrink-0 rounded-full", phaseMeta?.active ? "bg-emerald-400 animate-pulse" : "bg-white/30")} />
             <span className="truncate">{phaseMeta?.label ?? vmDisplay.label}{activitySuffix}</span>
@@ -767,7 +784,7 @@ export default function App() {
             the first-run wizard is up: the wizard owns that space, and the
             provider notice would duplicate its "add a key" ask. */}
         {!showFirstRun && (
-        <section className="mx-auto w-full max-w-3xl shrink-0 pb-3 sm:pb-0" aria-label="Ask the agent">
+        <section className="relative z-20 mx-auto w-full max-w-[760px] shrink-0 pb-3 sm:pb-0" aria-label="Ask the agent">
           {session.signedOut ? (
             <Notice
               tone="warn"

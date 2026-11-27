@@ -132,45 +132,76 @@ export function LiveRoomClient({ token }: { token: string }) {
     const target = surfaceRef.current;
     if (!target) return;
     let disposed = false;
-    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${proto}//${window.location.host}${DESKTOP_WS_PATH}?mode=view&token=${encodeURIComponent(token)}`;
 
     setDesktopPhase("connecting");
-    let rfb: RFB;
-    try {
-      rfb = new RFB(target, wsUrl, { shared: true });
-    } catch {
-      setDesktopPhase("error");
-      return;
-    }
-    rfbRef.current = rfb;
-    rfb.scaleViewport = true;
-    rfb.resizeSession = false;
-    rfb.showDotCursor = false;
-    rfb.viewOnly = true; // belt-and-suspenders; the proxy also enforces view.
+    setDesktopError(null);
 
-    rfb.addEventListener("connect", () => {
+    void (async () => {
+      let ticket: string;
+      try {
+        const res = await fetch(`/api/share/${encodeURIComponent(token)}/ws-ticket`, {
+          method: "POST",
+          cache: "no-store",
+        });
+        if (!res.ok) {
+          if (!disposed) {
+            setDesktopPhase("error");
+            setDesktopError("Could not authorize desktop stream.");
+          }
+          return;
+        }
+        const data = (await res.json()) as { ticket?: string };
+        if (!data.ticket) throw new Error("missing ticket");
+        ticket = data.ticket;
+      } catch {
+        if (!disposed) {
+          setDesktopPhase("error");
+          setDesktopError("Could not authorize desktop stream.");
+        }
+        return;
+      }
       if (disposed) return;
-      openedRef.current = true;
-      setDesktopPhase("live");
-      setDesktopError(null);
-    });
-    rfb.addEventListener("disconnect", () => {
-      if (disposed) return;
-      setDesktopPhase(openedRef.current ? "error" : "idle");
-      if (openedRef.current) setDesktopError("Desktop stream disconnected.");
-    });
-    rfb.addEventListener("credentialsrequired", () => {
-      if (disposed) return;
-      setDesktopPhase("error");
-      setDesktopError("Desktop authentication failed.");
-    });
+
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${proto}//${window.location.host}${DESKTOP_WS_PATH}?mode=view&ticket=${encodeURIComponent(ticket)}`;
+
+      let rfb: RFB;
+      try {
+        rfb = new RFB(target, wsUrl, { shared: true });
+      } catch {
+        if (!disposed) setDesktopPhase("error");
+        return;
+      }
+      rfbRef.current = rfb;
+      rfb.scaleViewport = true;
+      rfb.resizeSession = false;
+      rfb.showDotCursor = false;
+      rfb.viewOnly = true; // belt-and-suspenders; the proxy also enforces view.
+
+      rfb.addEventListener("connect", () => {
+        if (disposed) return;
+        openedRef.current = true;
+        setDesktopPhase("live");
+        setDesktopError(null);
+      });
+      rfb.addEventListener("disconnect", () => {
+        if (disposed) return;
+        setDesktopPhase(openedRef.current ? "error" : "idle");
+        if (openedRef.current) setDesktopError("Desktop stream disconnected.");
+      });
+      rfb.addEventListener("credentialsrequired", () => {
+        if (disposed) return;
+        setDesktopPhase("error");
+        setDesktopError("Desktop authentication failed.");
+      });
+    })();
 
     return () => {
       disposed = true;
+      const current = rfbRef.current;
       rfbRef.current = null;
-      rfb.blur();
-      rfb.disconnect();
+      current?.blur();
+      current?.disconnect();
       if (target) target.replaceChildren();
     };
   }, [room?.live, token]);

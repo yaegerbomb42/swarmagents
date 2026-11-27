@@ -61,6 +61,7 @@ import { handlePreviewUpgrade, type PreviewTarget } from "../preview/proxy";
 import { parsePreviewPort, resolvePreviewTarget } from "../preview/target";
 import { resolvePreviewShare, type PreviewShareOwner } from "../preview/tokens";
 import { resolveShareOwner } from "../projects/store";
+import { verifyAndConsumeWsTicket } from "../rooms/ws-ticket";
 import { DesktopBridge } from "./bridge";
 import type { RfbFilterMode } from "./rfb-filter";
 import {
@@ -379,6 +380,7 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
     opts.resolvePreviewShare ?? ((token: string) => resolvePreviewShare(token));
 
   const sessionsByUser = new Map<string, Set<ProxySession>>();
+  const consumedTickets = new Map<string, number>();
   let nextSessionId = 1;
 
   // Takeover negotiation: one state machine per user decides who may send
@@ -873,8 +875,16 @@ export function createDesktopProxy(opts: DesktopProxyOptions = {}): DesktopProxy
 
     let user = requestUser(requestLike(req));
     let guest = false;
+    const guestTicket = url.searchParams.get("ticket");
+    if (!user && guestTicket) {
+      const verified = verifyAndConsumeWsTicket(guestTicket, consumedTickets, now());
+      if (verified) {
+        user = { id: verified.ownerId, email: "" };
+        guest = true;
+      }
+    }
     const guestToken = url.searchParams.get("token");
-    if (!user && guestToken) {
+    if (!user && !guestTicket && guestToken) {
       const ownerId = await resolveGuest(guestToken);
       if (ownerId) {
         user = { id: ownerId, email: "" };

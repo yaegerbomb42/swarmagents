@@ -38,6 +38,7 @@ import {
 } from "./validate.mjs";
 import { capClipboardText, writeClipboard } from "./clipboard.mjs";
 import { activeWindowClass, isTerminalClass, pasteText } from "./paste.mjs";
+import { captureWindowText, activeWindowTextSection } from "./window-text.mjs";
 import {
   effectEnabled,
   captureFingerprint,
@@ -348,6 +349,12 @@ async function describeScreen(args) {
     } else {
       lines.push(`OCR skipped (${ocrRes.error})`);
     }
+
+    // Ordered text of the focused window, produced by the same pipeline as
+    // read_window_text — a text-only model can read cat/compiler output
+    // without the word-level click targets.
+    const winText = await activeWindowTextSection({ run, env: CHILD_ENV });
+    if (winText) lines.push(winText);
   }
 
   return textResult(lines.join("\n"));
@@ -492,6 +499,17 @@ async function callTool(tool, rawArgs) {
       return TEXT_DESKTOP ? describeScreen(args) : captureScreenshot();
     case "describe_screen":
       return describeScreen(args);
+    case "read_window_text": {
+      const res = await captureWindowText({ run, title: args?.title, maxLines: args?.maxLines, env: CHILD_ENV });
+      if (!res.ok) return fail(`read_window_text failed: ${res.error}`);
+      const lines = res.lines;
+      const tail = res.truncated
+        ? `\n[showing last ${lines.length} lines; ${res.title} has more]`
+        : "";
+      return textResult(
+        `Window "${res.title}" @ (${res.geometry}) text:\n${lines.length > 0 ? lines.join("\n") : "(no text detected)"}${tail}`,
+      );
+    }
     case "inspect_ui":
       return inspectUi(args, parsed.cmds[0]);
     case "click_text":
@@ -572,11 +590,20 @@ function toolSpec(tool) {
       };
     case "describe_screen":
       return {
-        description: "Inspect display :1 without vision: returns screen geometry, window bounds/centers, AT-SPI2 UI elements (role, name, state, click center), and OCR clickable text coordinates (x, y).",
+        description: "Inspect display :1 without vision: returns screen geometry, window bounds/centers, AT-SPI2 UI elements (role, name, state, click center), OCR clickable text coordinates (x, y), and the ordered text of the active window (last 15 lines).",
         shape: {
-          includeOcr: z.boolean().optional().describe("Include OCR word/line coordinates (default true)."),
+          includeOcr: z.boolean().optional().describe("Include OCR word/line coordinates and active-window text (default true)."),
           includeUi: z.boolean().optional().describe("Include AT-SPI2 accessibility widgets (default true)."),
           maxItems: z.number().optional().describe("Max OCR targets to return (1..150, default 80)."),
+        },
+      };
+    case "read_window_text":
+      return {
+        description:
+          'Read the ordered text displayed in a window: crops the active window (or the first window whose title contains `title`) via its wmctrl geometry, OCRs it with tesseract --psm 6 (uniform block), and returns the last maxLines lines (terminal output appears at the bottom), plus the window title and geometry. Use it to read command output, errors, or codes a non-vision model cannot see in a screenshot.',
+        shape: {
+          title: z.string().optional().describe("Window title substring to match (1..120 chars); defaults to the active window."),
+          maxLines: z.union([z.number(), z.string()]).optional().describe("Max lines to return (1..200, default 60)."),
         },
       };
     case "inspect_ui":

@@ -38,6 +38,24 @@ export const TYPE_PASTE_MARKER: string;
 /** Short human-readable summary of a tool call (for telemetry/activity strip). */
 export function summarizeTool(tool: string, args: Record<string, unknown>): string;
 
+/** Default max lines returned by read_window_text (last lines = newest). */
+export const DEFAULT_WINDOW_TEXT_LINES: number;
+/** Hard cap for read_window_text maxLines. */
+export const MAX_WINDOW_TEXT_LINES: number;
+
+/**
+ * Parse Tesseract plain-text stdout (`tesseract <img> stdout --psm 6`) into
+ * an ordered list of non-empty lines, right-trimmed.
+ */
+export function parseTesseractText(stdout: unknown): string[];
+
+/**
+ * Keep the last `maxLines` lines of an ordered text array (terminal/app output
+ * sits at the bottom of a window, so the newest lines are the tail). The cap
+ * is clamped to [1, 200] (default 60); lines are returned in order.
+ */
+export function selectLastLines(lines: readonly string[], maxLines?: number): string[];
+
 /** Window entry parsed from wmctrl -lG for non-vision LLM targeting. */
 export interface WmctrlWindow {
   id: string;

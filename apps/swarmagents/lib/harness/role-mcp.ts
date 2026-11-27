@@ -116,7 +116,8 @@ export const A1_OPERATING_GUIDANCE =
   "Choose the cheapest tool that can actually do the job: use Bash and the file tools for code, files, commands " +
   "and system work; use playwright-mcp to drive web pages (navigate, click, type, read the page); use computer-mcp " +
   "for desktop apps and anything that is not a web page. On the desktop, call describe_screen first to read window " +
-  "bounds and OCR text coordinates without a vision round-trip; take a screenshot only when you need to judge pixels " +
+  "bounds, OCR text coordinates and active-window text without a vision round-trip; call read_window_text to read " +
+  "full command or app output (ordered text of a window). Take a screenshot only when you need to judge pixels " +
   "(layout, colors, images, canvas) or the user explicitly asked for one. Before you finish, verify the deliverable: " +
   "confirm the requested file or artifact exists and works (open it, run it, or re-read it), run the real " +
   "tests/build/lint for code you changed, and look at the screen after a UI change. Say what you verified and how; " +
@@ -140,7 +141,10 @@ export const TEXT_DESKTOP_ENV = "SWARM_TEXT_DESKTOP";
  */
 export const TEXT_DESKTOP_TAIL =
   "You are running in text-desktop mode: you cannot see images. To inspect the desktop, call " +
-  "describe_screen — it returns window bounds/centers and OCR text coordinates you can click. " +
+  "describe_screen — it returns window bounds/centers, OCR text coordinates you can click, " +
+  "and the ordered text of the active window (last 15 lines). " +
+  "To read full command/app output (cat results, errors, codes), call read_window_text " +
+  "- it returns the last lines of a window's text. " +
   "To inspect the browser, call browser_snapshot (the page's accessibility tree as text). " +
   "Never call screenshot or browser_take_screenshot: they are disabled for this run. " +
   "click, type, key, scroll and open_app work with the coordinates describe_screen returns.";

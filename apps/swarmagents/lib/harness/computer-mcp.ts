@@ -85,7 +85,8 @@ function textDesktopScreenshotReason(server: string): string {
   if (server === COMPUTER_MCP_SERVER) {
     return (
       "screenshots are disabled in text-desktop mode (this model has no vision); " +
-      "call describe_screen instead — it returns window bounds and OCR text coordinates"
+      "call describe_screen (window bounds, OCR text coordinates, active-window text) or " +
+      "read_window_text (ordered text of a window) instead"
     );
   }
   return (
@@ -135,7 +136,7 @@ function playwrightTarget(args: Record<string, unknown>): string {
  *   the runner's post-hoc re-checks call this without it, so a call the
  *   server already answered as text never halts the run.
  */
-const READ_ONLY_COMPUTER_TOOLS = new Set(["screenshot", "describe_screen", "inspect_ui"]);
+const READ_ONLY_COMPUTER_TOOLS = new Set(["screenshot", "describe_screen", "read_window_text", "inspect_ui"]);
 
 /** True for a computer-mcp call that changes the desktop (not screenshot/describe/inspect). */
 export function isMutatingComputerCall(name: string): boolean {

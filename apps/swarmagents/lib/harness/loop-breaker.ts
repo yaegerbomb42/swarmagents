@@ -31,6 +31,7 @@ export const LOOP_EXEMPT_TOOLS = new Set([
   "wait",
   "screenshot",
   "describe_screen",
+  "read_window_text",
   "inspect_ui",
   "wait_for_ui",
   "wait_for_text",

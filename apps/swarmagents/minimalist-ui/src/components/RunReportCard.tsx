@@ -493,14 +493,69 @@ export function CopyTranscriptButton({ copied, onCopy }: { copied: boolean; onCo
   );
 }
 
-/** 1-click button to turn a finished run into an hourly recurring schedule. */
+/**
+ * Intervals offered when scheduling a finished run. Daily is the default:
+ * every scheduled run spends the user's own provider key, so the cheapest
+ * cadence is pre-selected and nothing recurs until the user confirms.
+ */
+export const SCHEDULE_INTERVAL_OPTIONS: ReadonlyArray<{ minutes: number; label: string }> = [
+  { minutes: 1440, label: "daily" },
+  { minutes: 360, label: "every 6h" },
+  { minutes: 60, label: "hourly" },
+];
+
+export type ScheduleButtonState = "idle" | "confirm" | "saving" | "saved" | "error";
+
+function intervalLabel(minutes: number): string {
+  return SCHEDULE_INTERVAL_OPTIONS.find((o) => o.minutes === minutes)?.label ?? `every ${minutes}m`;
+}
+
+/**
+ * Turn a finished run into a recurring schedule. Two steps: the first click
+ * only opens a confirm row (interval picker + a note that each run uses the
+ * user's key); the schedule is created on Confirm.
+ */
 export function ScheduleRunButton({
   state,
+  intervalMinutes = SCHEDULE_INTERVAL_OPTIONS[0].minutes,
   onSchedule,
+  onIntervalChange,
+  onConfirm,
+  onCancel,
 }: {
-  state: "idle" | "saving" | "saved" | "error";
+  state: ScheduleButtonState;
+  intervalMinutes?: number;
   onSchedule: () => void;
+  onIntervalChange?: (minutes: number) => void;
+  onConfirm?: () => void;
+  onCancel?: () => void;
 }) {
+  if (state === "confirm") {
+    return (
+      <div className="flex items-center gap-1.5" data-testid="schedule-confirm">
+        <select
+          aria-label="Repeat"
+          data-testid="schedule-interval"
+          value={intervalMinutes}
+          onChange={(e) => onIntervalChange?.(Number(e.target.value))}
+          className="h-8 rounded-md border border-white/10 bg-black/40 px-1.5 text-xs text-white/80"
+        >
+          {SCHEDULE_INTERVAL_OPTIONS.map((o) => (
+            <option key={o.minutes} value={o.minutes}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        <span className="text-[11px] text-white/45">each run uses your key</span>
+        <Button size="sm" data-testid="schedule-confirm-button" onClick={onConfirm}>
+          Confirm
+        </Button>
+        <Button size="sm" variant="ghost" data-testid="schedule-cancel" onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    );
+  }
   return (
     <Button
       size="sm"
@@ -508,14 +563,14 @@ export function ScheduleRunButton({
       disabled={state === "saved"}
       data-testid="schedule-from-run"
       onClick={onSchedule}
-      title="Schedule this task to run every hour"
+      title="Run this task again on a schedule"
     >
       {state === "saved" ? (
         <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" aria-hidden />
       ) : (
         <Clock className="h-3.5 w-3.5" aria-hidden />
       )}
-      {state === "saved" ? "Scheduled (1h)" : state === "error" ? "Retry schedule" : "Schedule"}
+      {state === "saved" ? `Scheduled (${intervalLabel(intervalMinutes)})` : state === "error" ? "Retry schedule" : "Schedule"}
     </Button>
   );
 }
@@ -699,20 +754,21 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
     setShotIndex(0);
   }, [expanded]);
 
-  const [scheduleState, setScheduleState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [scheduleState, setScheduleState] = useState<ScheduleButtonState>("idle");
+  const [scheduleInterval, setScheduleInterval] = useState<number>(SCHEDULE_INTERVAL_OPTIONS[0].minutes);
   const [scheduleError, setScheduleError] = useState<string>();
-  const onScheduleRun = useCallback(async () => {
+  const onConfirmSchedule = useCallback(async () => {
     if (!report?.prompt || scheduleState === "saving") return;
     setScheduleState("saving");
     setScheduleError(undefined);
-    const res = await createScheduleFromRun({ prompt: report.prompt, intervalMinutes: 60 });
+    const res = await createScheduleFromRun({ prompt: report.prompt, intervalMinutes: scheduleInterval });
     if (res.ok) {
       setScheduleState("saved");
     } else {
       setScheduleState("error");
       setScheduleError(res.error);
     }
-  }, [report?.prompt, scheduleState]);
+  }, [report?.prompt, scheduleState, scheduleInterval]);
 
   // Verify the stored receipt server-side once the report is loaded. The
   // badge only ever shows a pass after this endpoint confirms it, and only
@@ -814,7 +870,14 @@ export function RunReportCard({ entry }: { entry: ThreadEntry }) {
                 <SectionTitle>Transcript</SectionTitle>
                 <div className="flex items-center gap-1.5">
                   {report.prompt.trim().length > 0 && (
-                    <ScheduleRunButton state={scheduleState} onSchedule={() => void onScheduleRun()} />
+                    <ScheduleRunButton
+                      state={scheduleState}
+                      intervalMinutes={scheduleInterval}
+                      onSchedule={() => setScheduleState("confirm")}
+                      onIntervalChange={setScheduleInterval}
+                      onConfirm={() => void onConfirmSchedule()}
+                      onCancel={() => setScheduleState("idle")}
+                    />
                   )}
                   <CopyTranscriptButton copied={copied} onCopy={() => void onCopy()} />
                 </div>

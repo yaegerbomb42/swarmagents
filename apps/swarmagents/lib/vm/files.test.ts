@@ -162,3 +162,51 @@ test("rankRecentFiles sorts most-recent-first with a path tiebreak and caps the 
   );
   assert.deepEqual(ranked.map((f) => f.path), ["/workspace/c.txt", "/workspace/a.txt"]);
 });
+
+// ---- recent scan: single find exec (review follow-up for #321) -------------
+
+test("recentFindArgv: one pruned, depth-capped find; argv only", async () => {
+  const { recentFindArgv, RECENT_SCAN_PRUNE_DIRS, MAX_RECENT_WALK_DEPTH } = await import("./files");
+  const argv = recentFindArgv("/workspace", 15 * 60_000);
+  assert.equal(argv[0], "find");
+  assert.equal(argv[1], "/workspace");
+  assert.equal(argv[argv.indexOf("-maxdepth") + 1], String(MAX_RECENT_WALK_DEPTH + 1));
+  assert.equal(argv[argv.indexOf("-mmin") + 1], "-15");
+  for (const dir of RECENT_SCAN_PRUNE_DIRS) assert.ok(argv.includes(dir), `prunes ${dir}`);
+  assert.ok(argv.indexOf("-prune") < argv.indexOf("-type"));
+  assert.equal(recentFindArgv("/workspace", 1)[recentFindArgv("/workspace", 1).indexOf("-mmin") + 1], "-1");
+});
+
+test("parseRecentFind: parses mtime/size/path, drops stale and malformed lines", async () => {
+  const { parseRecentFind } = await import("./files");
+  const now = Date.now();
+  const fresh = (now - 5_000) / 1000;
+  const stale = (now - 3_600_000) / 1000;
+  const out = [
+    `${fresh.toFixed(6)}\t12\t/workspace/out/chart.png`,
+    `${stale.toFixed(6)}\t3\t/workspace/old.txt`,
+    "garbage line",
+    `${fresh.toFixed(6)}\t7\t/workspace/dir with space/a b.csv`,
+    "",
+  ].join("\n");
+  const files = parseRecentFind(out, now - 60_000);
+  assert.deepEqual(files.map((f) => f.path), ["/workspace/out/chart.png", "/workspace/dir with space/a b.csv"]);
+  assert.equal(files[0].name, "chart.png");
+  assert.equal(files[0].size, 12);
+  assert.equal(files[0].contentType, "image/png");
+  assert.ok(Math.abs(files[0].modifiedAt - (now - 5_000)) < 5);
+});
+
+test("foldRecentDir: never descends into node_modules/.git", async () => {
+  const { foldRecentDir } = await import("./files");
+  const res = foldRecentDir(
+    [
+      { name: "node_modules", path: "/workspace/node_modules", type: "directory", size: 0 },
+      { name: ".git", path: "/workspace/.git", type: "directory", size: 0 },
+      { name: "src", path: "/workspace/src", type: "directory", size: 0 },
+    ],
+    0,
+    { visited: 0 },
+  );
+  assert.deepEqual(res.subdirs, ["/workspace/src"]);
+});

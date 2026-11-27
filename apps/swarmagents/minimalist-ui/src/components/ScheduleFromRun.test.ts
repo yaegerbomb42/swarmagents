@@ -13,11 +13,30 @@ test("ScheduleRunButton renders idle, saving, saved, and error states", () => {
   assert.ok(idle.includes("Schedule"));
 
   const saved = renderToStaticMarkup(React.createElement(ScheduleRunButton, { state: "saved", onSchedule: () => {} }));
-  assert.ok(saved.includes("Scheduled (1h)"));
+  assert.ok(saved.includes("Scheduled (daily)"), "daily is the default cadence");
   assert.ok(saved.includes("disabled"));
 
   const err = renderToStaticMarkup(React.createElement(ScheduleRunButton, { state: "error", onSchedule: () => {} }));
   assert.ok(err.includes("Retry schedule"));
+
+  const hourly = renderToStaticMarkup(
+    React.createElement(ScheduleRunButton, { state: "saved", intervalMinutes: 60, onSchedule: () => {} }),
+  );
+  assert.ok(hourly.includes("Scheduled (hourly)"));
+});
+
+test("ScheduleRunButton: first click only opens a confirm row (interval + key-spend note), no schedule yet", () => {
+  const confirm = renderToStaticMarkup(
+    React.createElement(ScheduleRunButton, { state: "confirm", onSchedule: () => {} }),
+  );
+  assert.ok(confirm.includes('data-testid="schedule-confirm"'));
+  assert.ok(confirm.includes('data-testid="schedule-interval"'));
+  assert.ok(confirm.includes("each run uses your key"));
+  assert.ok(confirm.includes('data-testid="schedule-confirm-button"'));
+  assert.ok(confirm.includes('data-testid="schedule-cancel"'));
+  // Daily is pre-selected; hourly is an explicit choice.
+  assert.match(confirm, /<option value="1440" selected="">daily<\/option>/);
+  assert.ok(!confirm.includes('data-testid="schedule-from-run"'));
 });
 
 test("HistoryPanel renders unread scheduled runs with jump and mark-read actions", () => {

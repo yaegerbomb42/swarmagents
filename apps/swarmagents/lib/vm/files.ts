@@ -249,7 +249,7 @@ export function foldRecentDir(
   for (const entry of entries) {
     budget.visited += 1;
     if (entry.type === "directory") {
-      subdirs.push(entry.path);
+      if (!RECENT_SCAN_PRUNE_DIRS.includes(entry.name)) subdirs.push(entry.path);
       continue;
     }
     if (typeof entry.modifiedAt !== "number" || !Number.isFinite(entry.modifiedAt)) continue;
@@ -272,6 +272,80 @@ export interface VmDirEntryLike {
   type: string;
   size: number;
   modifiedAt?: number;
+}
+
+/** Directory names a recent-scan never descends into (dependency / VCS / cache trees). */
+export const RECENT_SCAN_PRUNE_DIRS = Object.freeze([
+  "node_modules",
+  ".git",
+  ".cache",
+  ".next",
+  "__pycache__",
+  ".venv",
+]);
+
+/**
+ * argv for ONE in-VM `find` that returns the files under `root` modified in
+ * the last `windowMs`, as `<mtime>\t<size>\t<path>` lines. Replaces the
+ * per-directory listDir walk (one docker exec per folder, every poll) with a
+ * single exec; heavy trees are pruned, depth is capped. argv only, no shell.
+ */
+export function recentFindArgv(root: string, windowMs: number): string[] {
+  const minutes = Math.max(1, Math.ceil(windowMs / 60_000));
+  const prune: string[] = [];
+  RECENT_SCAN_PRUNE_DIRS.forEach((name, i) => {
+    if (i > 0) prune.push("-o");
+    prune.push("-name", name);
+  });
+  return [
+    "find",
+    root,
+    "-maxdepth",
+    String(MAX_RECENT_WALK_DEPTH + 1),
+    "-mindepth",
+    "1",
+    "(",
+    ...prune,
+    ")",
+    "-prune",
+    "-o",
+    "-type",
+    "f",
+    "-mmin",
+    `-${minutes}`,
+    "-printf",
+    "%T@\\t%s\\t%p\\n",
+  ];
+}
+
+/**
+ * Parse `recentFindArgv` output into recent files modified at or after
+ * `since`. Malformed lines are skipped; at most MAX_RECENT_WALK_ENTRIES
+ * lines are considered so a pathological workspace stays bounded.
+ */
+export function parseRecentFind(stdout: string, since: number): VmRecentFile[] {
+  const files: VmRecentFile[] = [];
+  const lines = stdout.split("\n");
+  for (let i = 0; i < lines.length && i < MAX_RECENT_WALK_ENTRIES; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    const first = line.indexOf("\t");
+    const second = first < 0 ? -1 : line.indexOf("\t", first + 1);
+    if (first < 0 || second < 0) continue;
+    const modifiedAt = Math.round(Number(line.slice(0, first)) * 1000);
+    const size = Number(line.slice(first + 1, second));
+    const path = line.slice(second + 1);
+    if (!Number.isFinite(modifiedAt) || !path || modifiedAt < since) continue;
+    const name = path.slice(path.lastIndexOf("/") + 1);
+    files.push({
+      name,
+      path,
+      size: Number.isFinite(size) ? size : 0,
+      modifiedAt,
+      contentType: downloadContentType(name),
+    });
+  }
+  return files;
 }
 
 /** Sort candidates most-recent-first and keep the response cap. */

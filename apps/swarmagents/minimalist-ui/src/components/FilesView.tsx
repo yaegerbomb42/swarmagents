@@ -624,6 +624,9 @@ export function relativeAge(modifiedAt: number | undefined, now: number): string
   return `${hours}h ago`;
 }
 
+/** Recent-files poll interval while a run streams (one in-VM find per tick). */
+export const RECENT_POLL_MS = 8_000;
+
 /** Recently touched files across the whole workspace, polled while the run streams. */
 function RecentStrip({ live, refreshToken, onOpen }: {
   readonly live: boolean;
@@ -650,7 +653,10 @@ function RecentStrip({ live, refreshToken, onOpen }: {
   useEffect(() => {
     if (!live) return;
     const poll = () => {
-      inFlight.current?.abort();
+      setNow(Date.now());
+      // Never stack scans: a slow scan finishes instead of being aborted and
+      // re-issued every tick. Skip while the tab is hidden.
+      if (inFlight.current || document.hidden) return;
       const ctrl = new AbortController();
       inFlight.current = ctrl;
       fetchRecentWorkspaceFiles({ limit: 8, signal: ctrl.signal })
@@ -659,16 +665,19 @@ function RecentStrip({ live, refreshToken, onOpen }: {
         })
         .catch(() => {
           if (!ctrl.signal.aborted) setRecent(undefined);
+        })
+        .finally(() => {
+          if (inFlight.current === ctrl) inFlight.current = undefined;
         });
-      setNow(Date.now());
     };
     poll();
-    const timer = window.setInterval(poll, 3000);
+    const timer = window.setInterval(poll, RECENT_POLL_MS);
     const clock = window.setInterval(() => setNow(Date.now()), 30000);
     return () => {
       window.clearInterval(timer);
       window.clearInterval(clock);
       inFlight.current?.abort();
+      inFlight.current = undefined;
     };
   }, [live]);
 

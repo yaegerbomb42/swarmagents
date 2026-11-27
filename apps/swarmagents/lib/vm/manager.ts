@@ -20,7 +20,7 @@ import { FakeVmDriver } from "./fake-driver";
 import { QuotaError, OutputCap, resolveVmQuotas, type OutputBudget, type VmQuotaOptions } from "./quotas";
 import { resolveIdlePolicy, type VmIdleOptions, type VmIdlePolicy } from "./idle";
 import { RwLock } from "./rw-lock";
-import { WarmPool, resolveWarmPoolSize } from "./warm-pool";
+import { SWARM_VM_WARM_POOL_SIZE_ENV, WarmPool, resolveWarmPoolSize } from "./warm-pool";
 import { defaultDriverName, type VmDriverName } from "./driver-default";
 import {
   VmFileError,
@@ -195,8 +195,23 @@ export class VmManager {
     this.alwaysOnUsers = opts?.alwaysOnUsers ?? new Set<string>();
     this.isAlwaysOnFn = opts?.isAlwaysOn;
     this.warmPoolSize = Math.max(0, opts?.warmPoolSize ?? resolveWarmPoolSize());
-    this.warmPool = this.warmPoolSize > 0 ? new WarmPool(this.driver, this.warmPoolSize) : null;
+    const pool = this.warmPoolSize > 0 ? new WarmPool(this.driver, this.warmPoolSize) : null;
+    if (pool && !pool.available) {
+      // Configured but inert (the docker/BYOC drivers do not implement
+      // prewarm/adoptWarm yet): say so once at boot instead of silently
+      // cold-booting every first run while the operator believes it is warm.
+      console.warn(
+        `[vm] ${SWARM_VM_WARM_POOL_SIZE_ENV}=${this.warmPoolSize} is ignored: the "${this.driver.constructor?.name ?? "current"}" ` +
+          "VM driver does not support a warm pool (prewarm/adoptWarm); first runs cold-boot.",
+      );
+    }
+    this.warmPool = pool?.available ? pool : null;
     if (this.warmPool) this.warmPool.fill();
+  }
+
+  /** True only when a warm pool is configured AND the driver can actually pool. */
+  get warmPoolActive(): boolean {
+    return this.warmPool !== null;
   }
 
   /** Wire the per-user 24/7 predicate (called when the runtime boots). */

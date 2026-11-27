@@ -6,7 +6,8 @@ VM real control of the on-screen desktop (X display `:1` by default):
 | Tool | What it does |
 | --- | --- |
 | `screenshot` | Capture the desktop as PNG (downscaled to ≤1280 px wide) |
-| `describe_screen(includeOcr?, includeUi?, maxItems?)` | Text-only view: geometry, windows, AT-SPI2 widgets and OCR text targets with click centers |
+| `describe_screen(includeOcr?, includeUi?, maxItems?)` | Text-only view: geometry, windows, AT-SPI2 widgets, OCR text targets with click centers, and the active window's ordered text (last 15 lines) |
+| `read_window_text(title?, maxLines?)` | OCR the active (or title-matched) window with tesseract `--psm 6` and return its ordered text — the last `maxLines` lines (1–200, default 60) plus window title and geometry. Read command/app output without vision |
 | `inspect_ui(app?, query?, role?, maxItems?)` | AT-SPI2 accessibility tree: widget role, name, states (focused/disabled/checked/selected/expanded) and `click(x, y)` center |
 | `click(x, y, button?)` | Move the pointer and click (1 left, 2 middle, 3 right, 4–7 wheel) |
 | `double_click(x, y, button?)` | Double-click |
@@ -14,6 +15,7 @@ VM real control of the on-screen desktop (X display `:1` by default):
 | `drag(x1, y1, x2, y2)` | Left-button drag |
 | `type(text)` | Type text (newlines press Return) |
 | `key(combo)` | Press a key combo, e.g. `ctrl+l`, `Return` |
+| `run_in_terminal(command, title?, timeoutS?)` | One-call terminal command: focus the terminal (title match, else the focused window if it is a terminal), type the command (paste mode for long/unicode), press Return, wait for the screen to settle, and return the new lines |
 | `scroll(dx, dy)` | Scroll by wheel steps (dy>0 down, dx>0 right) |
 | `open_app(name)` | Open `browser` / `terminal` / `files` |
 | `wait(ms)` | Sleep |
@@ -53,6 +55,11 @@ the click. `SWARM_EFFECT_FEEDBACK=0` turns it off. See `effect.mjs`.
 - `server.mjs` — the MCP server (stdio transport, tool registration).
 - `validate.mjs` — shared argument validation + argv construction + summary
   strings (also imported by the harness's risk/telemetry layer for tests).
+- `window-text.mjs` — ordered in-window text capture for `read_window_text`
+  and describe_screen's active-window section (wmctrl geometry + scrot +
+  ImageMagick crop + tesseract `--psm 6`).
+- `run-terminal.mjs` — pure diff/settle helpers for `run_in_terminal`
+  (what lines are new, and when two consecutive OCR reads are identical).
 - `effect.mjs` — action-effect fingerprint, settle loop and no-change hint.
 - `atspi_dump.py` — AT-SPI2 tree walker (python3-pyatspi) behind `inspect_ui`
   and the widget section of `describe_screen`. Bounded by node, depth and

@@ -19,6 +19,7 @@ export const OPEN_APP_NAMES = Object.freeze(["browser", "terminal", "files", "li
 export const COMPUTER_TOOLS = Object.freeze([
   "screenshot",
   "describe_screen",
+  "read_window_text",
   "inspect_ui",
   "click",
   "double_click",
@@ -27,6 +28,7 @@ export const COMPUTER_TOOLS = Object.freeze([
   "drag",
   "type",
   "key",
+  "run_in_terminal",
   "scroll",
   "open_app",
   "focus_window",
@@ -48,6 +50,16 @@ const MAX_PASTE_LEN = 20_000;
 const MAX_CLIPBOARD_LEN = 20_000;
 /** Query/title cap for click_text, wait_for_text, focus_window. */
 const MAX_QUERY_LEN = 120;
+/** Lines returned by read_window_text by default (terminal output sits at the bottom). */
+export const DEFAULT_WINDOW_TEXT_LINES = 60;
+/** Hard cap for read_window_text maxLines. */
+export const MAX_WINDOW_TEXT_LINES = 200;
+/** Default settle timeout for run_in_terminal, seconds. */
+export const DEFAULT_RUN_IN_TERMINAL_TIMEOUT_S = 10;
+/** Hard cap for run_in_terminal timeoutS. */
+export const MAX_RUN_IN_TERMINAL_TIMEOUT_S = 60;
+/** Command length cap for run_in_terminal (paste mode handles up to the paste cap). */
+const MAX_RUN_COMMAND_LEN = MAX_PASTE_LEN;
 /** Key-combo charset: printable keysym names plus modifiers, no shell chars. */
 const KEY_COMBO_RE = /^[A-Za-z0-9_+\-]+$/;
 const MAX_KEY_COMBO_LEN = 64;
@@ -482,10 +494,81 @@ export function normalizeToolArgs(tool, args) {
       }
       break;
     }
+    case "run_in_terminal": {
+      // A trailing newline is a Return press; strip it so the command is
+      // validated/typed exactly once (the tool always presses Return).
+      if (typeof a.command === "string") a.command = a.command.replace(/\n+$/, "");
+      const title = firstDefined(a.title, a.window_title, a.window_name, a.windowTitle, a.window, a.name);
+      delete a.window_title;
+      delete a.window_name;
+      delete a.windowTitle;
+      delete a.window;
+      delete a.name;
+      if (title !== undefined) a.title = title;
+      // `timeout` is a common spelling of timeoutS; accept both.
+      if (a.timeoutS === undefined && a.timeout !== undefined) a.timeoutS = a.timeout;
+      delete a.timeout;
+      break;
+    }
     default:
       break;
   }
   return a;
+}
+
+/**
+ * Validate a `read_window_text` call. `title` is optional and validated like
+ * focus_window's (charset/length via queryTextArgs); `maxLines` clamps the
+ * returned OCR lines to [1, 200], default 60. The server resolves the window
+ * itself, so no argv commands are produced.
+ */
+function readWindowTextArgs(args) {
+  if (args.title !== undefined && args.title !== null) {
+    const q = queryTextArgs(args, "title");
+    if (!q.ok) return q;
+  }
+  let maxLines = DEFAULT_WINDOW_TEXT_LINES;
+  if (args.maxLines !== undefined && args.maxLines !== null) {
+    const n = toInt(args.maxLines);
+    if (n === null || n < 1 || n > MAX_WINDOW_TEXT_LINES) {
+      return invalid(`maxLines must be an integer within [1, ${MAX_WINDOW_TEXT_LINES}].`);
+    }
+    maxLines = n;
+  }
+  return ok([]);
+}
+
+/**
+ * Validate a `run_in_terminal` call. `command` is required (non-empty, no
+ * control characters, capped at the paste cap — the type path pastes long/
+ * unicode commands); `title` is optional and validated like focus_window's;
+ * `timeoutS` clamps the settle window to [1, 60], default 10. The server
+ * orchestrates focus/type/poll itself, so no argv commands are produced.
+ */
+function runInTerminalArgs(args) {
+  const command = typeof args.command === "string" ? args.command : null;
+  if (command === null || command.trim().length === 0) {
+    return invalid("command must be a non-empty string.");
+  }
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(command)) {
+    return invalid("command contains control characters that cannot be typed.");
+  }
+  if (command.length > MAX_RUN_COMMAND_LEN) {
+    return invalid(`command too long (max ${MAX_RUN_COMMAND_LEN} characters).`);
+  }
+  if (args.title !== undefined && args.title !== null) {
+    const q = queryTextArgs(args, "title");
+    if (!q.ok) return q;
+  }
+  let timeoutS = DEFAULT_RUN_IN_TERMINAL_TIMEOUT_S;
+  if (args.timeoutS !== undefined && args.timeoutS !== null) {
+    const t = toInt(args.timeoutS);
+    if (t === null || t < 1 || t > MAX_RUN_IN_TERMINAL_TIMEOUT_S) {
+      return invalid(`timeoutS must be an integer within [1, ${MAX_RUN_IN_TERMINAL_TIMEOUT_S}].`);
+    }
+    timeoutS = t;
+  }
+  return ok([]);
 }
 
 /**
@@ -501,6 +584,10 @@ export function parseToolArgs(tool, args) {
       return ok([]);
     case "describe_screen":
       return ok([]);
+    case "read_window_text":
+      return readWindowTextArgs(input);
+    case "run_in_terminal":
+      return runInTerminalArgs(input);
     case "inspect_ui":
       return inspectUiArgs(input);
     case "click":
@@ -547,6 +634,11 @@ export function summarizeTool(tool, args) {
       return "Taking a screenshot";
     case "describe_screen":
       return "Reading screen layout and clickable text";
+    case "read_window_text": {
+      const title = s(input.title);
+      const maxLines = toInt(input.maxLines) ?? DEFAULT_WINDOW_TEXT_LINES;
+      return `Reading window text${title ? ` of "${title.slice(0, 60)}"` : ""} (last ${maxLines} lines)`;
+    }
     case "inspect_ui": {
       const app = s(input.app);
       const query = s(input.query);
@@ -578,6 +670,12 @@ export function summarizeTool(tool, args) {
     }
     case "key":
       return `Pressing ${s(input.combo) || "key"}`;
+    case "run_in_terminal": {
+      // Length only, never command content (the same redaction rule as type):
+      // a command can carry credentials the agent was given.
+      const title = s(input.title);
+      return `Running a command in the terminal${title ? ` "${title.slice(0, 60)}"` : ""}`;
+    }
     case "scroll": {
       const dx = toInt(input.dx) ?? 0;
       const dy = toInt(input.dy) ?? 0;
@@ -697,6 +795,31 @@ export function parseTesseractTsv(tsv, maxItems = 80) {
     if (out.length >= cap) break;
   }
   return out;
+}
+
+/**
+ * Parse Tesseract plain-text stdout (`tesseract <img> stdout --psm 6`) into
+ * an ordered list of non-empty lines, right-trimmed. Tesseract separates
+ * blocks with blank lines; those are dropped so the returned array is exactly
+ * the visible text lines in reading order.
+ */
+export function parseTesseractText(stdout) {
+  return String(stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+$/, ""))
+    .filter((line) => line.length > 0);
+}
+
+/**
+ * Keep the last `maxLines` lines of an ordered text array — terminal/app
+ * output sits at the bottom of a window, so the newest lines are the tail.
+ * The cap is clamped to [1, 200] (default 60); lines are returned in order.
+ */
+export function selectLastLines(lines, maxLines = DEFAULT_WINDOW_TEXT_LINES) {
+  const arr = Array.isArray(lines) ? lines : [];
+  const cap = Math.min(Math.max(Number(maxLines) || DEFAULT_WINDOW_TEXT_LINES, 1), MAX_WINDOW_TEXT_LINES);
+  if (arr.length <= cap) return arr.slice();
+  return arr.slice(arr.length - cap);
 }
 
 /** States surfaced for AT-SPI2 widgets (anything else from the helper is dropped). */

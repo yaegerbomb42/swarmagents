@@ -85,7 +85,8 @@ function textDesktopScreenshotReason(server: string): string {
   if (server === COMPUTER_MCP_SERVER) {
     return (
       "screenshots are disabled in text-desktop mode (this model has no vision); " +
-      "call describe_screen instead — it returns window bounds and OCR text coordinates"
+      "call describe_screen (window bounds, OCR text coordinates, active-window text) or " +
+      "read_window_text (ordered text of a window) instead"
     );
   }
   return (
@@ -135,9 +136,14 @@ function playwrightTarget(args: Record<string, unknown>): string {
  *   the runner's post-hoc re-checks call this without it, so a call the
  *   server already answered as text never halts the run.
  */
-const READ_ONLY_COMPUTER_TOOLS = new Set(["screenshot", "describe_screen", "inspect_ui"]);
+const READ_ONLY_COMPUTER_TOOLS = new Set(["screenshot", "describe_screen", "read_window_text", "inspect_ui"]);
 
-/** True for a computer-mcp call that changes the desktop (not screenshot/describe/inspect). */
+/**
+ * True for a computer-mcp call that changes the desktop (not
+ * screenshot/describe/inspect). `run_in_terminal` is deliberately NOT in the
+ * read-only set: it runs a command on the desktop, so it is treated exactly
+ * like `type` + `key Return` (allowed, denied while the user drives).
+ */
 export function isMutatingComputerCall(name: string): boolean {
   const info = parseMcpToolName(name);
   return info !== null && info.server === COMPUTER_MCP_SERVER && !READ_ONLY_COMPUTER_TOOLS.has(info.tool);
@@ -334,6 +340,10 @@ export function computerActionEvent(
     }
     const combo = s(obj.combo);
     if (combo !== undefined) event.text = combo;
+    // run_in_terminal carries the command in `command` (like `type` text — the
+    // runner redacts the event before this runs, so no secret reaches it).
+    const cmd = s(obj.command);
+    if (cmd !== undefined && info.tool === "run_in_terminal") event.text = cmd;
     const app = s(obj.name) ?? s(obj.title);
     if (app !== undefined) event.target = app.slice(0, 80);
     return event;

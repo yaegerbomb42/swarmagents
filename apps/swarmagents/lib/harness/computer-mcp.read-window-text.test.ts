@@ -328,7 +328,14 @@ test(
     // Ensure the xterm is the active window (focus it; harmless if not needed).
     spawnSync("xdotool", ["search", "--name", "readback", "windowfocus"], { env: displayEnv });
 
-    const res = await captureWindowText({ run, title: "readback", env: displayEnv });
+    // The shell prints asynchronously after the window maps (slow under a
+    // loaded test:full): retry the capture briefly until the marker lands.
+    const MARKER = /SWARM[\s-]*READBACK[\s-]*42/i;
+    let res = await captureWindowText({ run, title: "readback", env: displayEnv });
+    for (let i = 0; i < 20 && !(res.ok && MARKER.test(res.lines.join("\n"))); i++) {
+      await new Promise((r) => setTimeout(r, 300));
+      res = await captureWindowText({ run, title: "readback", env: displayEnv });
+    }
     assert.equal(res.ok, true, res.ok ? "" : (res as { error: string }).error);
     if (res.ok) {
       assert.equal(res.title, "readback");
